@@ -1,0 +1,144 @@
+nvme-pci: remove the inline scatterlist optimization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit d43f1ccfad053dbefba1d15443cdc36ca60958f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/d43f1ccf.failed
+
+We'll have a better way to optimize for small I/O that doesn't
+require it soon, so remove the existing inline_sg case to make that
+optimization easier to implement.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+(cherry picked from commit d43f1ccfad053dbefba1d15443cdc36ca60958f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index d488d280480d,bd7e4209ab36..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -228,14 -221,44 +228,13 @@@ struct nvme_iod 
+  	int npages;		/* In the PRP list. 0 means small pool in use */
+  	int nents;		/* Used in scatterlist */
+  	dma_addr_t first_dma;
+ -	dma_addr_t meta_dma;
+ +	struct scatterlist meta_sg; /* metadata requires single contiguous buffer */
+  	struct scatterlist *sg;
+- 	struct scatterlist inline_sg[0];
+  };
+  
+ -/*
+ - * Check we didin't inadvertently grow the command struct
+ - */
+ -static inline void _nvme_check_size(void)
+ -{
+ -	BUILD_BUG_ON(sizeof(struct nvme_rw_command) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_create_cq) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_create_sq) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_delete_queue) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_features) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_format_cmd) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_abort_cmd) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_command) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_id_ctrl) != NVME_IDENTIFY_DATA_SIZE);
+ -	BUILD_BUG_ON(sizeof(struct nvme_id_ns) != NVME_IDENTIFY_DATA_SIZE);
+ -	BUILD_BUG_ON(sizeof(struct nvme_lba_range_type) != 64);
+ -	BUILD_BUG_ON(sizeof(struct nvme_smart_log) != 512);
+ -	BUILD_BUG_ON(sizeof(struct nvme_dbbuf) != 64);
+ -}
+ -
+ -static unsigned int max_io_queues(void)
+ -{
+ -	return num_possible_cpus() + write_queues + poll_queues;
+ -}
+ -
+ -static unsigned int max_queue_count(void)
+ -{
+ -	/* IO queues + admin queue */
+ -	return 1 + max_io_queues();
+ -}
+ -
+ -static inline unsigned int nvme_dbbuf_size(u32 stride)
+ +static inline unsigned int nvme_dbbuf_size(struct nvme_dev *dev)
+  {
+ -	return (max_queue_count() * 8 * stride);
+ +	return dev->nr_allocated_queues * 8 * dev->db_stride;
+  }
+  
+  static int nvme_dbbuf_dma_alloc(struct nvme_dev *dev)
+@@@ -769,20 -799,20 +752,15 @@@ static blk_status_t nvme_map_data(struc
+  		struct nvme_command *cmnd)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ -	struct request_queue *q = req->q;
+ -	enum dma_data_direction dma_dir = rq_data_dir(req) ?
+ -			DMA_TO_DEVICE : DMA_FROM_DEVICE;
+ -	blk_status_t ret = BLK_STS_IOERR;
+ +	blk_status_t ret = BLK_STS_RESOURCE;
+  	int nr_mapped;
+  
+- 	if (blk_rq_payload_bytes(req) > NVME_INT_BYTES(dev) ||
+- 	    blk_rq_nr_phys_segments(req) > NVME_INT_PAGES) {
+- 		iod->sg = mempool_alloc(dev->iod_mempool, GFP_ATOMIC);
+- 		if (!iod->sg)
+- 			return BLK_STS_RESOURCE;
+- 	} else {
+- 		iod->sg = iod->inline_sg;
+- 	}
++ 	iod->sg = mempool_alloc(dev->iod_mempool, GFP_ATOMIC);
++ 	if (!iod->sg)
++ 		return BLK_STS_RESOURCE;
+  
+ -	iod->use_sgl = nvme_pci_use_sgls(dev, req);
+ -
+  	sg_init_table(iod->sg, blk_rq_nr_phys_segments(req));
+ -	iod->nents = blk_rq_map_sg(q, req, iod->sg);
+ +	iod->nents = blk_rq_map_sg(req->q, req, iod->sg);
+  	if (!iod->nents)
+  		goto out;
+  
+@@@ -1559,8 -1589,8 +1537,13 @@@ static int nvme_alloc_admin_tags(struc
+  
+  		dev->admin_tagset.queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+  		dev->admin_tagset.timeout = ADMIN_TIMEOUT;
+++<<<<<<< HEAD
+ +		dev->admin_tagset.numa_node = dev->ctrl.numa_node;
+ +		dev->admin_tagset.cmd_size = nvme_pci_cmd_size(dev, false);
+++=======
++ 		dev->admin_tagset.numa_node = dev_to_node(dev->dev);
++ 		dev->admin_tagset.cmd_size = sizeof(struct nvme_iod);
+++>>>>>>> d43f1ccfad05 (nvme-pci: remove the inline scatterlist optimization)
+  		dev->admin_tagset.flags = BLK_MQ_F_NO_SCHED;
+  		dev->admin_tagset.driver_data = dev;
+  
+@@@ -2225,14 -2232,10 +2208,21 @@@ static void nvme_dev_add(struct nvme_de
+  		if (dev->io_queues[HCTX_TYPE_POLL])
+  			dev->tagset.nr_maps++;
+  		dev->tagset.timeout = NVME_IO_TIMEOUT;
+++<<<<<<< HEAD
+ +		dev->tagset.numa_node = dev->ctrl.numa_node;
+ +		dev->tagset.queue_depth = min_t(unsigned int, dev->q_depth,
+ +						BLK_MQ_MAX_DEPTH) - 1;
+ +		dev->tagset.cmd_size = nvme_pci_cmd_size(dev, false);
+ +		if ((dev->ctrl.sgls & ((1 << 0) | (1 << 1))) && sgl_threshold) {
+ +			dev->tagset.cmd_size = max(dev->tagset.cmd_size,
+ +					nvme_pci_cmd_size(dev, true));
+ +		}
+++=======
++ 		dev->tagset.numa_node = dev_to_node(dev->dev);
++ 		dev->tagset.queue_depth =
++ 				min_t(int, dev->q_depth, BLK_MQ_MAX_DEPTH) - 1;
++ 		dev->tagset.cmd_size = sizeof(struct nvme_iod);
+++>>>>>>> d43f1ccfad05 (nvme-pci: remove the inline scatterlist optimization)
+  		dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
+  		dev->tagset.driver_data = dev;
+  
+* Unmerged path drivers/nvme/host/pci.c
