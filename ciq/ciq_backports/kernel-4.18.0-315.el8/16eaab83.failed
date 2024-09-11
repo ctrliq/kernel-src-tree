@@ -1,0 +1,175 @@
+xfs: introduce in-core global counter of allocbt blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Brian Foster <bfoster@redhat.com>
+commit 16eaab839a9273ed156ebfccbd40c15d1e72f3d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/16eaab83.failed
+
+Introduce an in-core counter to track the sum of all allocbt blocks
+used by the filesystem. This value is currently tracked per-ag via
+the ->agf_btreeblks field in the AGF, which also happens to include
+rmapbt blocks. A global, in-core count of allocbt blocks is required
+to identify the subset of global ->m_fdblocks that consists of
+unavailable blocks currently used for allocation btrees. To support
+this calculation at block reservation time, construct a similar
+global counter for allocbt blocks, populate it on first read of each
+AGF and update it as allocbt blocks are used and released.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+	Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 16eaab839a9273ed156ebfccbd40c15d1e72f3d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_alloc_btree.c
+#	fs/xfs/xfs_mount.h
+diff --cc fs/xfs/libxfs/xfs_alloc_btree.c
+index 279694d73e4e,a43e4c50e69b..000000000000
+--- a/fs/xfs/libxfs/xfs_alloc_btree.c
++++ b/fs/xfs/libxfs/xfs_alloc_btree.c
+@@@ -72,9 -71,9 +72,14 @@@ xfs_allocbt_alloc_block
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	xfs_extent_busy_reuse(cur->bc_mp, cur->bc_private.a.agno, bno, 1, false);
+++=======
++ 	atomic64_inc(&cur->bc_mp->m_allocbt_blks);
++ 	xfs_extent_busy_reuse(cur->bc_mp, cur->bc_ag.agno, bno, 1, false);
+++>>>>>>> 16eaab839a92 (xfs: introduce in-core global counter of allocbt blocks)
+  
+ +	xfs_trans_agbtree_delta(cur->bc_tp, 1);
+  	new->s = cpu_to_be32(bno);
+  
+  	*stat = 1;
+@@@ -96,9 -95,9 +101,10 @@@ xfs_allocbt_free_block
+  	if (error)
+  		return error;
+  
++ 	atomic64_dec(&cur->bc_mp->m_allocbt_blks);
+  	xfs_extent_busy_insert(cur->bc_tp, be32_to_cpu(agf->agf_seqno), bno, 1,
+  			      XFS_EXTENT_BUSY_SKIP_DISCARD);
+ +	xfs_trans_agbtree_delta(cur->bc_tp, -1);
+  	return 0;
+  }
+  
+diff --cc fs/xfs/xfs_mount.h
+index b5fc8ac62aa1,bb67274ee23f..000000000000
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@@ -138,14 -119,66 +138,75 @@@ typedef struct xfs_mount 
+  	xfs_extlen_t		m_ag_prealloc_blocks; /* reserved ag blocks */
+  	uint			m_alloc_set_aside; /* space we can't use */
+  	uint			m_ag_max_usable; /* max space per AG */
+++<<<<<<< HEAD
+++=======
++ 	int			m_dalign;	/* stripe unit */
++ 	int			m_swidth;	/* stripe width */
++ 	xfs_agnumber_t		m_maxagi;	/* highest inode alloc group */
++ 	uint			m_allocsize_log;/* min write size log bytes */
++ 	uint			m_allocsize_blocks; /* min write size blocks */
++ 	int			m_logbufs;	/* number of log buffers */
++ 	int			m_logbsize;	/* size of each log buffer */
++ 	uint			m_rsumlevels;	/* rt summary levels */
++ 	uint			m_rsumsize;	/* size of rt summary, bytes */
++ 	int			m_fixedfsid[2];	/* unchanged for life of FS */
++ 	uint			m_qflags;	/* quota status flags */
++ 	uint64_t		m_flags;	/* global mount flags */
++ 	int64_t			m_low_space[XFS_LOWSP_MAX];
++ 	struct xfs_ino_geometry	m_ino_geo;	/* inode geometry */
++ 	struct xfs_trans_resv	m_resv;		/* precomputed res values */
++ 						/* low free space thresholds */
++ 	bool			m_always_cow;
++ 	bool			m_fail_unmount;
++ 	bool			m_finobt_nores; /* no per-AG finobt resv. */
++ 	bool			m_update_sb;	/* sb needs update in mount */
++ 
++ 	/*
++ 	 * Bitsets of per-fs metadata that have been checked and/or are sick.
++ 	 * Callers must hold m_sb_lock to access these two fields.
++ 	 */
++ 	uint8_t			m_fs_checked;
++ 	uint8_t			m_fs_sick;
++ 	/*
++ 	 * Bitsets of rt metadata that have been checked and/or are sick.
++ 	 * Callers must hold m_sb_lock to access this field.
++ 	 */
++ 	uint8_t			m_rt_checked;
++ 	uint8_t			m_rt_sick;
++ 
++ 	/*
++ 	 * End of read-mostly variables. Frequently written variables and locks
++ 	 * should be placed below this comment from now on. The first variable
++ 	 * here is marked as cacheline aligned so they it is separated from
++ 	 * the read-mostly variables.
++ 	 */
++ 
++ 	spinlock_t ____cacheline_aligned m_sb_lock; /* sb counter lock */
++ 	struct percpu_counter	m_icount;	/* allocated inodes counter */
++ 	struct percpu_counter	m_ifree;	/* free inodes counter */
++ 	struct percpu_counter	m_fdblocks;	/* free block counter */
++ 	/*
++ 	 * Count of data device blocks reserved for delayed allocations,
++ 	 * including indlen blocks.  Does not include allocated CoW staging
++ 	 * extents or anything related to the rt device.
++ 	 */
++ 	struct percpu_counter	m_delalloc_blks;
++ 	/*
++ 	 * Global count of allocation btree blocks in use across all AGs. Only
++ 	 * used when perag reservation is enabled. Helps prevent block
++ 	 * reservation from attempting to reserve allocation btree blocks.
++ 	 */
++ 	atomic64_t		m_allocbt_blks;
++ 
+++>>>>>>> 16eaab839a92 (xfs: introduce in-core global counter of allocbt blocks)
+  	struct radix_tree_root	m_perag_tree;	/* per-ag accounting info */
+  	spinlock_t		m_perag_lock;	/* lock for m_perag_tree */
+ +	struct mutex		m_growlock;	/* growfs mutex */
+ +	int			m_fixedfsid[2];	/* unchanged for life of FS */
+ +	uint64_t		m_flags;	/* global mount flags */
+ +	bool			m_finobt_nores; /* no per-AG finobt resv. */
+ +	uint			m_qflags;	/* quota status flags */
+ +	struct xfs_trans_resv	m_resv;		/* precomputed res values */
+  	uint64_t		m_resblks;	/* total reserved blocks */
+  	uint64_t		m_resblks_avail;/* available reserved blocks */
+  	uint64_t		m_resblks_save;	/* reserved blks @ remount,ro */
+diff --git a/fs/xfs/libxfs/xfs_alloc.c b/fs/xfs/libxfs/xfs_alloc.c
+index 0ebf4098a156..ed63749b632c 100644
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@ -2996,6 +2996,7 @@ xfs_alloc_read_agf(
+ 	struct xfs_agf		*agf;		/* ag freelist header */
+ 	struct xfs_perag	*pag;		/* per allocation group data */
+ 	int			error;
++	int			allocbt_blks;
+ 
+ 	trace_xfs_alloc_read_agf(mp, agno);
+ 
+@@ -3026,6 +3027,19 @@ xfs_alloc_read_agf(
+ 		pag->pagf_refcount_level = be32_to_cpu(agf->agf_refcount_level);
+ 		pag->pagf_init = 1;
+ 		pag->pagf_agflreset = xfs_agfl_needs_reset(mp, agf);
++
++		/*
++		 * Update the in-core allocbt counter. Filter out the rmapbt
++		 * subset of the btreeblks counter because the rmapbt is managed
++		 * by perag reservation. Subtract one for the rmapbt root block
++		 * because the rmap counter includes it while the btreeblks
++		 * counter only tracks non-root blocks.
++		 */
++		allocbt_blks = pag->pagf_btreeblks;
++		if (xfs_sb_version_hasrmapbt(&mp->m_sb))
++			allocbt_blks -= be32_to_cpu(agf->agf_rmap_blocks) - 1;
++		if (allocbt_blks > 0)
++			atomic64_add(allocbt_blks, &mp->m_allocbt_blks);
+ 	}
+ #ifdef DEBUG
+ 	else if (!XFS_FORCED_SHUTDOWN(mp)) {
+* Unmerged path fs/xfs/libxfs/xfs_alloc_btree.c
+* Unmerged path fs/xfs/xfs_mount.h
