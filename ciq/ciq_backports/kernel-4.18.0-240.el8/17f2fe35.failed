@@ -1,0 +1,105 @@
+io_uring: add support for IORING_OP_ACCEPT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 17f2fe35d080d8f64e86a60cdcd3a97edcbc213b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/17f2fe35.failed
+
+This allows an application to call accept4() in an async fashion. Like
+other opcodes, we first try a non-blocking accept, then punt to async
+context if we have to.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 17f2fe35d080d8f64e86a60cdcd3a97edcbc213b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/io_uring.h
+diff --cc include/uapi/linux/io_uring.h
+index ee8693aec163,f82d90e617a6..000000000000
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@@ -28,6 -31,8 +31,11 @@@ struct io_uring_sqe 
+  		__u16		poll_events;
+  		__u32		sync_range_flags;
+  		__u32		msg_flags;
+++<<<<<<< HEAD
+++=======
++ 		__u32		timeout_flags;
++ 		__u32		accept_flags;
+++>>>>>>> 17f2fe35d080 (io_uring: add support for IORING_OP_ACCEPT)
+  	};
+  	__u64	user_data;	/* data to be passed back at completion time */
+  	union {
+@@@ -62,6 -67,9 +70,12 @@@
+  #define IORING_OP_SYNC_FILE_RANGE	8
+  #define IORING_OP_SENDMSG	9
+  #define IORING_OP_RECVMSG	10
+++<<<<<<< HEAD
+++=======
++ #define IORING_OP_TIMEOUT	11
++ #define IORING_OP_TIMEOUT_REMOVE	12
++ #define IORING_OP_ACCEPT	13
+++>>>>>>> 17f2fe35d080 (io_uring: add support for IORING_OP_ACCEPT)
+  
+  /*
+   * sqe->fsync_flags
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 7f974c7eddcc..31efe0131955 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -1620,6 +1620,40 @@ static int io_recvmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ #endif
+ }
+ 
++static int io_accept(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++		     struct io_kiocb **nxt, bool force_nonblock)
++{
++#if defined(CONFIG_NET)
++	struct sockaddr __user *addr;
++	int __user *addr_len;
++	unsigned file_flags;
++	int flags, ret;
++
++	if (unlikely(req->ctx->flags & (IORING_SETUP_IOPOLL|IORING_SETUP_SQPOLL)))
++		return -EINVAL;
++	if (sqe->ioprio || sqe->off || sqe->len || sqe->buf_index)
++		return -EINVAL;
++
++	addr = (struct sockaddr __user *) (unsigned long) READ_ONCE(sqe->addr);
++	addr_len = (int __user *) (unsigned long) READ_ONCE(sqe->addr2);
++	flags = READ_ONCE(sqe->accept_flags);
++	file_flags = force_nonblock ? O_NONBLOCK : 0;
++
++	ret = __sys_accept4_file(req->file, file_flags, addr, addr_len, flags);
++	if (ret == -EAGAIN && force_nonblock) {
++		req->work.flags |= IO_WQ_WORK_NEEDS_FILES;
++		return -EAGAIN;
++	}
++	if (ret < 0 && (req->flags & REQ_F_LINK))
++		req->flags |= REQ_F_FAIL_LINK;
++	io_cqring_add_event(req->ctx, sqe->user_data, ret);
++	io_put_req(req, nxt);
++	return 0;
++#else
++	return -EOPNOTSUPP;
++#endif
++}
++
+ static void io_poll_remove_one(struct io_kiocb *req)
+ {
+ 	struct io_poll_iocb *poll = &req->poll;
+@@ -1911,6 +1945,9 @@ static int __io_submit_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ 	case IORING_OP_RECVMSG:
+ 		ret = io_recvmsg(req, s->sqe, force_nonblock);
+ 		break;
++	case IORING_OP_ACCEPT:
++		ret = io_accept(req, s->sqe, nxt, force_nonblock);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+* Unmerged path include/uapi/linux/io_uring.h
