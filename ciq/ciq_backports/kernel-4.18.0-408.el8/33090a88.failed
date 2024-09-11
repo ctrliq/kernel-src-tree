@@ -1,0 +1,126 @@
+KVM: selftests: add shared hugetlbfs backing source type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Axel Rasmussen <axelrasmussen@google.com>
+commit 33090a884da5e9760f11441ac269f754375f80f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/33090a88.failed
+
+This lets us run the demand paging test on top of a shared
+hugetlbfs-backed area. The "shared" is key, as this allows us to
+exercise userfaultfd minor faults on hugetlbfs.
+
+	Signed-off-by: Axel Rasmussen <axelrasmussen@google.com>
+Message-Id: <20210519200339.829146-11-axelrasmussen@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 33090a884da5e9760f11441ac269f754375f80f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/demand_paging_test.c
+diff --cc tools/testing/selftests/kvm/demand_paging_test.c
+index 52bd44288de9,b74704305835..000000000000
+--- a/tools/testing/selftests/kvm/demand_paging_test.c
++++ b/tools/testing/selftests/kvm/demand_paging_test.c
+@@@ -439,6 -484,11 +439,14 @@@ int main(int argc, char *argv[]
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (p.uffd_mode == UFFDIO_REGISTER_MODE_MINOR &&
++ 	    !backing_src_is_shared(p.src_type)) {
++ 		TEST_FAIL("userfaultfd MINOR mode requires shared memory; pick a different -t");
++ 	}
++ 
+++>>>>>>> 33090a884da5 (KVM: selftests: add shared hugetlbfs backing source type)
+  	for_each_guest_mode(run_test, &p);
+  
+  	return 0;
+* Unmerged path tools/testing/selftests/kvm/demand_paging_test.c
+diff --git a/tools/testing/selftests/kvm/include/test_util.h b/tools/testing/selftests/kvm/include/test_util.h
+index 00cc42e301aa..605695edf215 100644
+--- a/tools/testing/selftests/kvm/include/test_util.h
++++ b/tools/testing/selftests/kvm/include/test_util.h
+@@ -17,6 +17,7 @@
+ #include <errno.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <sys/mman.h>
+ #include "kselftest.h"
+ 
+ static inline int _no_printf(const char *format, ...) { return 0; }
+@@ -85,6 +86,7 @@ enum vm_mem_backing_src_type {
+ 	VM_MEM_SRC_ANONYMOUS_HUGETLB_2GB,
+ 	VM_MEM_SRC_ANONYMOUS_HUGETLB_16GB,
+ 	VM_MEM_SRC_SHMEM,
++	VM_MEM_SRC_SHARED_HUGETLB,
+ 	NUM_SRC_TYPES,
+ };
+ 
+@@ -107,4 +109,13 @@ void backing_src_help(const char *flag);
+ enum vm_mem_backing_src_type parse_backing_src_type(const char *type_name);
+ long get_run_delay(void);
+ 
++/*
++ * Whether or not the given source type is shared memory (as opposed to
++ * anonymous).
++ */
++static inline bool backing_src_is_shared(enum vm_mem_backing_src_type t)
++{
++	return vm_mem_backing_src_alias(t)->flag & MAP_SHARED;
++}
++
+ #endif /* SELFTEST_KVM_TEST_UTIL_H */
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util.c b/tools/testing/selftests/kvm/lib/kvm_util.c
+index 45da81b45746..36dc14dd70f7 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@ -955,8 +955,13 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
+ 		region->mmap_size += alignment;
+ 
+ 	region->fd = -1;
+-	if (src_type == VM_MEM_SRC_SHMEM) {
+-		region->fd = memfd_create("kvm_selftest", MFD_CLOEXEC);
++	if (backing_src_is_shared(src_type)) {
++		int memfd_flags = MFD_CLOEXEC;
++
++		if (src_type == VM_MEM_SRC_SHARED_HUGETLB)
++			memfd_flags |= MFD_HUGETLB;
++
++		region->fd = memfd_create("kvm_selftest", memfd_flags);
+ 		TEST_ASSERT(region->fd != -1,
+ 			    "memfd_create failed, errno: %i", errno);
+ 
+diff --git a/tools/testing/selftests/kvm/lib/test_util.c b/tools/testing/selftests/kvm/lib/test_util.c
+index 67bc3cefcb77..6d23878bbfe1 100644
+--- a/tools/testing/selftests/kvm/lib/test_util.c
++++ b/tools/testing/selftests/kvm/lib/test_util.c
+@@ -244,6 +244,16 @@ const struct vm_mem_backing_src_alias *vm_mem_backing_src_alias(uint32_t i)
+ 			.name = "shmem",
+ 			.flag = MAP_SHARED,
+ 		},
++		[VM_MEM_SRC_SHARED_HUGETLB] = {
++			.name = "shared_hugetlb",
++			/*
++			 * No MAP_HUGETLB, we use MFD_HUGETLB instead. Since
++			 * we're using "file backed" memory, we need to specify
++			 * this when the FD is created, not when the area is
++			 * mapped.
++			 */
++			.flag = MAP_SHARED,
++		},
+ 	};
+ 	_Static_assert(ARRAY_SIZE(aliases) == NUM_SRC_TYPES,
+ 		       "Missing new backing src types?");
+@@ -266,6 +276,7 @@ size_t get_backing_src_pagesz(uint32_t i)
+ 	case VM_MEM_SRC_ANONYMOUS_THP:
+ 		return get_trans_hugepagesz();
+ 	case VM_MEM_SRC_ANONYMOUS_HUGETLB:
++	case VM_MEM_SRC_SHARED_HUGETLB:
+ 		return get_def_hugetlb_pagesz();
+ 	default:
+ 		return MAP_HUGE_PAGE_SIZE(flag);
