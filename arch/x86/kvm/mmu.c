@@ -5446,7 +5446,9 @@ slot_handle_level_range(struct kvm *kvm, struct kvm_memory_slot *memslot,
 
 		if (need_resched() || spin_needbreak(&kvm->mmu_lock)) {
 			if (flush && lock_flush_tlb) {
-				kvm_flush_remote_tlbs(kvm);
+				kvm_flush_remote_tlbs_with_address(kvm,
+						start_gfn,
+						iterator.gfn - start_gfn + 1);
 				flush = false;
 			}
 			cond_resched_lock(&kvm->mmu_lock);
@@ -5454,7 +5456,8 @@ slot_handle_level_range(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	}
 
 	if (flush && lock_flush_tlb) {
-		kvm_flush_remote_tlbs(kvm);
+		kvm_flush_remote_tlbs_with_address(kvm, start_gfn,
+						   end_gfn - start_gfn + 1);
 		flush = false;
 	}
 
