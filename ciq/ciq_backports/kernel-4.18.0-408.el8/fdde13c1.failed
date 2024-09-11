@@ -1,0 +1,134 @@
+KVM: Remove unnecessary export of kvm_{inc,dec}_notifier_count()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit fdde13c13f9012b22e1b3a1df8a108d147842f6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/fdde13c1.failed
+
+Don't export KVM's MMU notifier count helpers, under no circumstance
+should any downstream module, including x86's vendor code, have a
+legitimate reason to piggyback KVM's MMU notifier logic.  E.g in the x86
+case, only KVM's MMU should be elevating the notifier count, and that
+code is always built into the core kvm.ko module.
+
+Fixes: edb298c663fc ("KVM: x86/mmu: bump mmu notifier count in kvm_zap_gfn_range")
+	Cc: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20210902175951.1387989-1-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit fdde13c13f9012b22e1b3a1df8a108d147842f6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,140c7d311021..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -546,23 -637,44 +546,27 @@@ static void kvm_mmu_notifier_invalidate
+  		kvm->mmu_notifier_range_end =
+  			max(kvm->mmu_notifier_range_end, end);
+  	}
+++<<<<<<< HEAD
+ +	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end, 0);
+ +	/* we've to flush the tlb before the pages can be freed */
+ +	if (need_tlb_flush || kvm->tlbs_dirty)
+ +		kvm_flush_remote_tlbs(kvm);
+++=======
++ }
+++>>>>>>> fdde13c13f90 (KVM: Remove unnecessary export of kvm_{inc,dec}_notifier_count())
+  
+ -static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ -					const struct mmu_notifier_range *range)
+ -{
+ -	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ -	const struct kvm_hva_range hva_range = {
+ -		.start		= range->start,
+ -		.end		= range->end,
+ -		.pte		= __pte(0),
+ -		.handler	= kvm_unmap_gfn_range,
+ -		.on_lock	= kvm_inc_notifier_count,
+ -		.flush_on_ret	= true,
+ -		.may_block	= mmu_notifier_range_blockable(range),
+ -	};
+ -
+ -	trace_kvm_unmap_hva_range(range->start, range->end);
+ -
+ -	/*
+ -	 * Prevent memslot modification between range_start() and range_end()
+ -	 * so that conditionally locking provides the same result in both
+ -	 * functions.  Without that guarantee, the mmu_notifier_count
+ -	 * adjustments will be imbalanced.
+ -	 *
+ -	 * Pairs with the decrement in range_end().
+ -	 */
+ -	spin_lock(&kvm->mn_invalidate_lock);
+ -	kvm->mn_active_invalidate_count++;
+ -	spin_unlock(&kvm->mn_invalidate_lock);
+ -
+ -	__kvm_handle_hva_range(kvm, &hva_range);
+ -
+ -	return 0;
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+ -void kvm_dec_notifier_count(struct kvm *kvm, unsigned long start,
+ -				   unsigned long end)
+ +static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+ +						  struct mm_struct *mm,
+ +						  unsigned long start,
+ +						  unsigned long end)
+  {
+ +	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ +
+ +	KVM_MMU_LOCK(kvm);
+  	/*
+  	 * This sequence increase will notify the kvm page fault that
+  	 * the page that is going to be mapped in the spte could have
+@@@ -576,7 -688,36 +580,40 @@@
+  	 * in conjunction with the smp_rmb in mmu_notifier_retry().
+  	 */
+  	kvm->mmu_notifier_count--;
+++<<<<<<< HEAD
+ +	KVM_MMU_UNLOCK(kvm);
+++=======
++ }
++ 
++ static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
++ 					const struct mmu_notifier_range *range)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range hva_range = {
++ 		.start		= range->start,
++ 		.end		= range->end,
++ 		.pte		= __pte(0),
++ 		.handler	= (void *)kvm_null_fn,
++ 		.on_lock	= kvm_dec_notifier_count,
++ 		.flush_on_ret	= false,
++ 		.may_block	= mmu_notifier_range_blockable(range),
++ 	};
++ 	bool wake;
++ 
++ 	__kvm_handle_hva_range(kvm, &hva_range);
++ 
++ 	/* Pairs with the increment in range_start(). */
++ 	spin_lock(&kvm->mn_invalidate_lock);
++ 	wake = (--kvm->mn_active_invalidate_count == 0);
++ 	spin_unlock(&kvm->mn_invalidate_lock);
++ 
++ 	/*
++ 	 * There can only be one waiter, since the wait happens under
++ 	 * slots_lock.
++ 	 */
++ 	if (wake)
++ 		rcuwait_wake_up(&kvm->mn_memslots_update_rcuwait);
+++>>>>>>> fdde13c13f90 (KVM: Remove unnecessary export of kvm_{inc,dec}_notifier_count())
+  
+  	BUG_ON(kvm->mmu_notifier_count < 0);
+  }
+* Unmerged path virt/kvm/kvm_main.c
