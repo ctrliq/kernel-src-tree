@@ -1,0 +1,192 @@
+mm, slub: use migrate_disable() on PREEMPT_RT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit 25c00c506e8176d03f9ad821cc349230dfb5dc1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/25c00c50.failed
+
+We currently use preempt_disable() (directly or via get_cpu_ptr()) to stabilize
+the pointer to kmem_cache_cpu. On PREEMPT_RT this would be incompatible with
+the list_lock spinlock. We can use migrate_disable() instead, but that
+increases overhead on !PREEMPT_RT as it's an unconditional function call.
+
+In order to get the best available mechanism on both PREEMPT_RT and
+!PREEMPT_RT, introduce private slub_get_cpu_ptr() and slub_put_cpu_ptr()
+wrappers and use them.
+
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+(cherry picked from commit 25c00c506e8176d03f9ad821cc349230dfb5dc1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 89494fc5a481,38d4cc51e880..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2693,12 -2869,15 +2713,23 @@@ redo
+  	 * PFMEMALLOC but right now, we are losing the pfmemalloc
+  	 * information when the page leaves the per-cpu allocator
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(!pfmemalloc_match(page, gfpflags))) {
+ +		deactivate_slab(s, page, c->freelist, c);
+ +		goto new_slab;
+++=======
++ 	if (unlikely(!pfmemalloc_match_unsafe(page, gfpflags)))
++ 		goto deactivate_slab;
++ 
++ 	/* must check again c->page in case we got preempted and it changed */
++ 	local_irq_save(flags);
++ 	if (unlikely(page != c->page)) {
++ 		local_irq_restore(flags);
++ 		goto reread_page;
+++>>>>>>> 25c00c506e81 (mm, slub: use migrate_disable() on PREEMPT_RT)
+  	}
+ +
+ +	/* must check again c->freelist in case of cpu migration or IRQ */
+  	freelist = c->freelist;
+  	if (freelist)
+  		goto load_freelist;
+@@@ -2727,19 -2911,46 +2758,39 @@@ load_freelist
+  new_slab:
+  
+  	if (slub_percpu_partial(c)) {
+++<<<<<<< HEAD
+++=======
++ 		local_irq_save(flags);
++ 		if (unlikely(c->page)) {
++ 			local_irq_restore(flags);
++ 			goto reread_page;
++ 		}
++ 		if (unlikely(!slub_percpu_partial(c))) {
++ 			local_irq_restore(flags);
++ 			/* we were preempted and partial list got empty */
++ 			goto new_objects;
++ 		}
++ 
+++>>>>>>> 25c00c506e81 (mm, slub: use migrate_disable() on PREEMPT_RT)
+  		page = c->page = slub_percpu_partial(c);
+  		slub_set_percpu_partial(c, page);
+ -		local_irq_restore(flags);
+  		stat(s, CPU_PARTIAL_ALLOC);
+  		goto redo;
+  	}
+  
+ -new_objects:
+ -
+  	freelist = get_partial(s, gfpflags, node, &page);
+ -	if (freelist)
+ +	if (freelist) {
+ +		c->page = page;
+  		goto check_new_page;
+ +	}
+  
+++<<<<<<< HEAD
+++	page = new_slab(s, gfpflags, node);
+++=======
++ 	slub_put_cpu_ptr(s->cpu_slab);
+  	page = new_slab(s, gfpflags, node);
++ 	c = slub_get_cpu_ptr(s->cpu_slab);
+++>>>>>>> 25c00c506e81 (mm, slub: use migrate_disable() on PREEMPT_RT)
+  
+  	if (unlikely(!page)) {
+  		slab_out_of_memory(s, gfpflags, node);
+@@@ -2797,20 -3026,20 +2848,30 @@@ static void *__slab_alloc(struct kmem_c
+  			  unsigned long addr, struct kmem_cache_cpu *c)
+  {
+  	void *p;
+ +	unsigned long flags;
+  
+ -#ifdef CONFIG_PREEMPT_COUNT
+ +	local_irq_save(flags);
+ +#ifdef CONFIG_PREEMPTION
+  	/*
+  	 * We may have been preempted and rescheduled on a different
+ -	 * cpu before disabling preemption. Need to reload cpu area
+ +	 * cpu before disabling interrupts. Need to reload cpu area
+  	 * pointer.
+  	 */
+++<<<<<<< HEAD
+ +	c = this_cpu_ptr(s->cpu_slab);
+ +#endif
+ +
+ +	p = ___slab_alloc(s, gfpflags, node, addr, c);
+ +	local_irq_restore(flags);
+++=======
++ 	c = slub_get_cpu_ptr(s->cpu_slab);
++ #endif
++ 
++ 	p = ___slab_alloc(s, gfpflags, node, addr, c);
++ #ifdef CONFIG_PREEMPT_COUNT
++ 	slub_put_cpu_ptr(s->cpu_slab);
++ #endif
+++>>>>>>> 25c00c506e81 (mm, slub: use migrate_disable() on PREEMPT_RT)
+  	return p;
+  }
+  
+@@@ -3326,12 -3567,18 +3387,16 @@@ int kmem_cache_alloc_bulk(struct kmem_c
+  	 * IRQs, which protects against PREEMPT and interrupts
+  	 * handlers invoking normal fastpath.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	c = slub_get_cpu_ptr(s->cpu_slab);
+++>>>>>>> 25c00c506e81 (mm, slub: use migrate_disable() on PREEMPT_RT)
+  	local_irq_disable();
+ +	c = this_cpu_ptr(s->cpu_slab);
+  
+  	for (i = 0; i < size; i++) {
+ -		void *object = kfence_alloc(s, s->object_size, flags);
+ -
+ -		if (unlikely(object)) {
+ -			p[i] = object;
+ -			continue;
+ -		}
+ +		void *object = c->freelist;
+  
+ -		object = c->freelist;
+  		if (unlikely(!object)) {
+  			/*
+  			 * We may have removed an object from c->freelist using
+@@@ -3362,21 -3613,18 +3427,30 @@@
+  	}
+  	c->tid = next_tid(c->tid);
+  	local_irq_enable();
+++<<<<<<< HEAD
+++=======
++ 	slub_put_cpu_ptr(s->cpu_slab);
+++>>>>>>> 25c00c506e81 (mm, slub: use migrate_disable() on PREEMPT_RT)
+  
+ -	/*
+ -	 * memcg and kmem_cache debug support and memory initialization.
+ -	 * Done outside of the IRQ disabled fastpath loop.
+ -	 */
+ -	slab_post_alloc_hook(s, objcg, flags, size, p,
+ -				slab_want_init_on_alloc(flags, s));
+ +	/* Clear memory outside IRQ disabled fastpath loop */
+ +	if (unlikely(slab_want_init_on_alloc(flags, s))) {
+ +		int j;
+ +
+ +		for (j = 0; j < i; j++)
+ +			memset(p[j], 0, s->object_size);
+ +	}
+ +
+ +	/* memcg and kmem_cache debug support */
+ +	slab_post_alloc_hook(s, objcg, flags, size, p);
+  	return i;
+  error:
+++<<<<<<< HEAD
+ +	local_irq_enable();
+ +	slab_post_alloc_hook(s, objcg, flags, i, p);
+++=======
++ 	slub_put_cpu_ptr(s->cpu_slab);
++ 	slab_post_alloc_hook(s, objcg, flags, i, p, false);
+++>>>>>>> 25c00c506e81 (mm, slub: use migrate_disable() on PREEMPT_RT)
+  	__kmem_cache_free_bulk(s, i, p);
+  	return 0;
+  }
+* Unmerged path mm/slub.c
