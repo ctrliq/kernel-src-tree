@@ -256,7 +256,7 @@ static int mlx5e_fec_admin_field(u32 *pplm,
 	case 40000:
 		if (!write)
 			*fec_policy = MLX5_GET(pplm_reg, pplm,
-					       fec_override_cap_10g_40g);
+					       fec_override_admin_10g_40g);
 		else
 			MLX5_SET(pplm_reg, pplm,
 				 fec_override_admin_10g_40g, *fec_policy);
@@ -308,7 +308,7 @@ static int mlx5e_get_fec_cap_field(u32 *pplm,
 	case 10000:
 	case 40000:
 		*fec_cap = MLX5_GET(pplm_reg, pplm,
-				    fec_override_admin_10g_40g);
+				    fec_override_cap_10g_40g);
 		break;
 	case 25000:
 		*fec_cap = MLX5_GET(pplm_reg, pplm,
