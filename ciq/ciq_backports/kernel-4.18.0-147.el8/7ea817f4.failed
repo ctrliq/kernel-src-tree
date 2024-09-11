@@ -1,0 +1,116 @@
+tipc: check session number before accepting link protocol messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jon Maloy <jon.maloy@ericsson.com>
+commit 7ea817f4e8322fa27fb860d15025bf72f68b179f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7ea817f4.failed
+
+In some virtual environments we observe a significant higher number of
+packet reordering and delays than we have been used to traditionally.
+
+This makes it necessary with stricter checks on incoming link protocol
+messages' session number, which until now only has been validated for
+RESET messages.
+
+Since the other two message types, ACTIVATE and STATE messages also
+carry this number, it is easy to extend the validation check to those
+messages.
+
+We also introduce a flag indicating if a link has a valid peer session
+number or not. This eliminates the mixing of 32- and 16-bit arithmethics
+we are currently using to achieve this.
+
+	Acked-by: Ying Xue <ying.xue@windriver.com>
+	Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7ea817f4e8322fa27fb860d15025bf72f68b179f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+diff --cc net/tipc/link.c
+index 7821d6e7ea86,df763be38541..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -483,11 -474,9 +479,11 @@@ bool tipc_link_create(struct net *net, 
+  	l->addr = peer;
+  	l->peer_caps = peer_caps;
+  	l->net = net;
+- 	l->peer_session = ANY_SESSION;
++ 	l->in_session = false;
+  	l->bearer_id = bearer_id;
+  	l->tolerance = tolerance;
+ +	if (bc_rcvlink)
+ +		bc_rcvlink->tolerance = tolerance;
+  	l->net_plane = net_plane;
+  	l->advertised_mtu = mtu;
+  	l->mtu = mtu;
+@@@ -854,24 -843,12 +850,28 @@@ void link_prepare_wakeup(struct tipc_li
+  
+  void tipc_link_reset(struct tipc_link *l)
+  {
+++<<<<<<< HEAD
+ +	struct sk_buff_head list;
+ +
+ +	__skb_queue_head_init(&list);
+ +
+ +	l->peer_session = ANY_SESSION;
+++=======
++ 	l->in_session = false;
+++>>>>>>> 7ea817f4e832 (tipc: check session number before accepting link protocol messages)
+  	l->session++;
+  	l->mtu = l->advertised_mtu;
+ +
+ +	spin_lock_bh(&l->wakeupq.lock);
+ +	skb_queue_splice_init(&l->wakeupq, &list);
+ +	spin_unlock_bh(&l->wakeupq.lock);
+ +
+ +	spin_lock_bh(&l->inputq->lock);
+ +	skb_queue_splice_init(&list, l->inputq);
+ +	spin_unlock_bh(&l->inputq->lock);
+ +
+  	__skb_queue_purge(&l->transmq);
+  	__skb_queue_purge(&l->deferdq);
+ -	skb_queue_splice_init(&l->wakeupq, l->inputq);
+  	__skb_queue_purge(&l->backlogq);
+  	l->backlog[TIPC_LOW_IMPORTANCE].len = 0;
+  	l->backlog[TIPC_MEDIUM_IMPORTANCE].len = 0;
+* Unmerged path net/tipc/link.c
+diff --git a/net/tipc/link.h b/net/tipc/link.h
+index 52add306aa2d..90488c538a4e 100644
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@ -114,6 +114,7 @@ char tipc_link_plane(struct tipc_link *l);
+ int tipc_link_prio(struct tipc_link *l);
+ int tipc_link_window(struct tipc_link *l);
+ void tipc_link_update_caps(struct tipc_link *l, u16 capabilities);
++bool tipc_link_validate_msg(struct tipc_link *l, struct tipc_msg *hdr);
+ unsigned long tipc_link_tolerance(struct tipc_link *l);
+ void tipc_link_set_tolerance(struct tipc_link *l, u32 tol,
+ 			     struct sk_buff_head *xmitq);
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 3e99e590eeba..d7d4b4499282 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -1547,7 +1547,7 @@ static void tipc_node_bc_rcv(struct net *net, struct sk_buff *skb, int bearer_id
+  * tipc_node_check_state - check and if necessary update node state
+  * @skb: TIPC packet
+  * @bearer_id: identity of bearer delivering the packet
+- * Returns true if state is ok, otherwise consumes buffer and returns false
++ * Returns true if state and msg are ok, otherwise false
+  */
+ static bool tipc_node_check_state(struct tipc_node *n, struct sk_buff *skb,
+ 				  int bearer_id, struct sk_buff_head *xmitq)
+@@ -1581,6 +1581,9 @@ static bool tipc_node_check_state(struct tipc_node *n, struct sk_buff *skb,
+ 		}
+ 	}
+ 
++	if (!tipc_link_validate_msg(l, hdr))
++		return false;
++
+ 	/* Check and update node accesibility if applicable */
+ 	if (state == SELF_UP_PEER_COMING) {
+ 		if (!tipc_link_is_up(l))
