@@ -1,0 +1,158 @@
+block: remove deadline __deadline manipulation helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 079076b3416e78ba2bb3ce38e05e320c388c3120
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/079076b3.failed
+
+No users left since the removal of the legacy request interface, we can
+remove all the magic bit stealing now and make it a normal field.
+
+But use WRITE_ONCE/READ_ONCE on the new deadline field, given that we
+don't seem to have any mechanism to guarantee a new value actually
+gets seen by other threads.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 079076b3416e78ba2bb3ce38e05e320c388c3120)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-timeout.c
+#	block/blk.h
+diff --cc block/blk-timeout.c
+index f2cfd56e1606,3b0179fbdd6a..000000000000
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@@ -153,20 -79,13 +153,30 @@@ void blk_timeout_work(struct work_struc
+   */
+  void blk_abort_request(struct request *req)
+  {
+++<<<<<<< HEAD
+ +	if (req->q->mq_ops) {
+ +		/*
+ +		 * All we need to ensure is that timeout scan takes place
+ +		 * immediately and that scan sees the new timeout value.
+ +		 * No need for fancy synchronizations.
+ +		 */
+ +		blk_rq_set_deadline(req, jiffies);
+ +		kblockd_schedule_work(&req->q->timeout_work);
+ +	} else {
+ +		if (blk_mark_rq_complete(req))
+ +			return;
+ +		blk_delete_timer(req);
+ +		blk_rq_timed_out(req);
+ +	}
+++=======
++ 	/*
++ 	 * All we need to ensure is that timeout scan takes place
++ 	 * immediately and that scan sees the new timeout value.
++ 	 * No need for fancy synchronizations.
++ 	 */
++ 	WRITE_ONCE(req->deadline, jiffies);
++ 	kblockd_schedule_work(&req->q->timeout_work);
+++>>>>>>> 079076b3416e (block: remove deadline __deadline manipulation helpers)
+  }
+  EXPORT_SYMBOL_GPL(blk_abort_request);
+  
+@@@ -211,15 -121,10 +221,17 @@@ void blk_add_timer(struct request *req
+  		req->timeout = q->rq_timeout;
+  
+  	req->rq_flags &= ~RQF_TIMED_OUT;
+- 	blk_rq_set_deadline(req, jiffies + req->timeout);
++ 
++ 	expiry = jiffies + req->timeout;
++ 	WRITE_ONCE(req->deadline, expiry);
+  
+ +	/*
+ +	 * Only the non-mq case needs to add the request to a protected list.
+ +	 * For the mq case we simply scan the tag map.
+ +	 */
+ +	if (!q->mq_ops)
+ +		list_add_tail(&req->timeout_list, &req->q->timeout_list);
+ +
+  	/*
+  	 * If the timer isn't already pending or this timeout is earlier
+  	 * than an existing one, modify the timer. Round up to next nearest
+diff --cc block/blk.h
+index fc4461de2d5b,08a5845b03ba..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -378,31 -303,6 +358,34 @@@ static inline void req_set_nomerge(stru
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Steal a bit from this field for legacy IO path atomic IO marking. Note that
+ + * setting the deadline clears the bottom bit, potentially clearing the
+ + * completed bit. The user has to be OK with this (current ones are fine).
+ + */
+ +static inline void blk_rq_set_deadline(struct request *rq, unsigned long time)
+ +{
+ +	rq->__deadline = time & ~0x1UL;
+ +}
+ +
+ +static inline unsigned long blk_rq_deadline(struct request *rq)
+ +{
+ +	return rq->__deadline & ~0x1UL;
+ +}
+ +
+ +/*
+ + * The max size one bio can handle is UINT_MAX becasue bvec_iter.bi_size
+ + * is defined as 'unsigned int', meantime it has to aligned to with logical
+ + * block size which is the minimum accepted unit by hardware.
+ + */
+ +static inline unsigned int bio_allowed_max_sectors(struct request_queue *q)
+ +{
+ +	return round_down(UINT_MAX, queue_logical_block_size(q)) >> 9;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 079076b3416e (block: remove deadline __deadline manipulation helpers)
+   * Internal io_context interface
+   */
+  void get_io_context(struct io_context *ioc);
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2538b6d2cf10..8663d49158bc 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -320,7 +320,7 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
+ 	rq->special = NULL;
+ 	/* tag was already set */
+ 	rq->extra_len = 0;
+-	rq->__deadline = 0;
++	WRITE_ONCE(rq->deadline, 0);
+ 
+ 	INIT_LIST_HEAD(&rq->timeout_list);
+ 	rq->timeout = 0;
+@@ -834,7 +834,7 @@ static bool blk_mq_req_expired(struct request *rq, unsigned long *next)
+ 	if (rq->rq_flags & RQF_TIMED_OUT)
+ 		return false;
+ 
+-	deadline = blk_rq_deadline(rq);
++	deadline = READ_ONCE(rq->deadline);
+ 	if (time_after_eq(jiffies, deadline))
+ 		return true;
+ 
+* Unmerged path block/blk-timeout.c
+* Unmerged path block/blk.h
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 674c5ca2bded..53f3edda0ad2 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -242,9 +242,7 @@ struct request {
+ 	refcount_t ref;
+ 
+ 	unsigned int timeout;
+-
+-	/* access through blk_rq_set_deadline, blk_rq_deadline */
+-	unsigned long __deadline;
++	unsigned long deadline;
+ 
+ 	struct list_head timeout_list;
+ 
