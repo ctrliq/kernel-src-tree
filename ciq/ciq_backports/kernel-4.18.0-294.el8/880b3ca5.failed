@@ -1,0 +1,113 @@
+net: aquantia: vlan offloads logic in datapath
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Igor Russkikh <Igor.Russkikh@aquantia.com>
+commit 880b3ca5043d16c887cc8ad22eb6831cace048b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/880b3ca5.failed
+
+Update datapath by adding logic related to hardware assisted
+vlan strip/insert behaviour.
+
+	Tested-by: Nikita Danilov <ndanilov@aquantia.com>
+	Signed-off-by: Igor Russkikh <igor.russkikh@aquantia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 880b3ca5043d16c887cc8ad22eb6831cace048b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index 919d23727702,746f85e6de13..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -437,15 -440,23 +441,28 @@@ static unsigned int aq_nic_map_skb(stru
+  		dx_buff->len_l2 = ETH_HLEN;
+  		dx_buff->len_l3 = ip_hdrlen(skb);
+  		dx_buff->len_l4 = tcp_hdrlen(skb);
+++<<<<<<< HEAD
+ +		dx_buff->mss = skb_shinfo(skb)->gso_size;
+ +		dx_buff->is_txc = 1U;
+++=======
+++>>>>>>> 880b3ca5043d (net: aquantia: vlan offloads logic in datapath)
+  		dx_buff->eop_index = 0xffffU;
+- 
+  		dx_buff->is_ipv6 =
+  			(ip_hdr(skb)->version == 6) ? 1U : 0U;
++ 		need_context_tag = true;
++ 	}
+  
++ 	if (self->aq_nic_cfg.is_vlan_tx_insert && skb_vlan_tag_present(skb)) {
++ 		dx_buff->vlan_tx_tag = skb_vlan_tag_get(skb);
++ 		dx_buff->len_pkt = skb->len;
++ 		dx_buff->is_vlan = 1U;
++ 		need_context_tag = true;
++ 	}
++ 
++ 	if (need_context_tag) {
+  		dx = aq_ring_next_dx(ring, dx);
+  		dx_buff = &ring->buff_ring[dx];
++ 		dx_buff->flags = 0U;
+  		++ret;
+  	}
+  
+@@@ -538,7 -548,7 +554,11 @@@ mapping_error
+  	     --ret, dx = aq_ring_next_dx(ring, dx)) {
+  		dx_buff = &ring->buff_ring[dx];
+  
+++<<<<<<< HEAD
+ +		if (!dx_buff->is_txc && dx_buff->pa) {
+++=======
++ 		if (!dx_buff->is_gso && !dx_buff->is_vlan && dx_buff->pa) {
+++>>>>>>> 880b3ca5043d (net: aquantia: vlan offloads logic in datapath)
+  			if (unlikely(dx_buff->is_sop)) {
+  				dma_unmap_single(aq_nic_get_dev(self),
+  						 dx_buff->pa,
+diff --cc drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+index 1cb5db0fc951,1d216757bb9d..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+@@@ -504,14 -507,13 +508,17 @@@ static int hw_atl_b0_hw_ring_tx_xmit(st
+  
+  		buff = &ring->buff_ring[ring->sw_tail];
+  
+++<<<<<<< HEAD
+ +		if (buff->is_txc) {
+++=======
++ 		if (buff->is_gso) {
++ 			txd->ctl |= HW_ATL_B0_TXD_CTL_CMD_TCP;
++ 			txd->ctl |= HW_ATL_B0_TXD_CTL_DESC_TYPE_TXC;
+++>>>>>>> 880b3ca5043d (net: aquantia: vlan offloads logic in datapath)
+  			txd->ctl |= (buff->len_l3 << 31) |
+- 				(buff->len_l2 << 24) |
+- 				HW_ATL_B0_TXD_CTL_CMD_TCP |
+- 				HW_ATL_B0_TXD_CTL_DESC_TYPE_TXC;
+- 			txd->ctl2 |= (buff->mss << 16) |
+- 				(buff->len_l4 << 8) |
+- 				(buff->len_l3 >> 1);
++ 				    (buff->len_l2 << 24);
++ 			txd->ctl2 |= (buff->mss << 16);
++ 			is_gso = true;
+  
+  			pkt_len -= (buff->len_l4 +
+  				    buff->len_l3 +
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_ring.c b/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+index 941b0beb87ef..2641b0386f8b 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+@@ -412,6 +412,10 @@ int aq_ring_rx_clean(struct aq_ring_s *self,
+ 			}
+ 		}
+ 
++		if (buff->is_vlan)
++			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
++					       buff->vlan_rx_tag);
++
+ 		skb->protocol = eth_type_trans(skb, ndev);
+ 
+ 		aq_rx_checksum(self, buff, skb);
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
