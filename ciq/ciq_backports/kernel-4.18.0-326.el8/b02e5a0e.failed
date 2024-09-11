@@ -1,0 +1,676 @@
+xsk: Propagate napi_id to XDP socket Rx path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit b02e5a0ebb172c8276cea3151942aac681f7a4a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/b02e5a0e.failed
+
+Add napi_id to the xdp_rxq_info structure, and make sure the XDP
+socket pick up the napi_id in the Rx path. The napi_id is used to find
+the corresponding NAPI structure for socket busy polling.
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://lore.kernel.org/bpf/20201130185205.196029-7-bjorn.topel@gmail.com
+(cherry picked from commit b02e5a0ebb172c8276cea3151942aac681f7a4a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+#	drivers/net/ethernet/marvell/mvneta.c
+#	drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+#	drivers/net/ethernet/socionext/netsec.c
+#	drivers/net/ethernet/ti/cpsw_priv.c
+#	drivers/net/xen-netfront.c
+#	include/net/xdp.h
+diff --cc drivers/net/ethernet/marvell/mvneta.c
+index aa243112d05c,ba6dcb19bb1d..000000000000
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@@ -2754,6 -3204,48 +2754,51 @@@ static int mvneta_poll(struct napi_stru
+  	return rx_done;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mvneta_create_page_pool(struct mvneta_port *pp,
++ 				   struct mvneta_rx_queue *rxq, int size)
++ {
++ 	struct bpf_prog *xdp_prog = READ_ONCE(pp->xdp_prog);
++ 	struct page_pool_params pp_params = {
++ 		.order = 0,
++ 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
++ 		.pool_size = size,
++ 		.nid = NUMA_NO_NODE,
++ 		.dev = pp->dev->dev.parent,
++ 		.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE,
++ 		.offset = pp->rx_offset_correction,
++ 		.max_len = MVNETA_MAX_RX_BUF_SIZE,
++ 	};
++ 	int err;
++ 
++ 	rxq->page_pool = page_pool_create(&pp_params);
++ 	if (IS_ERR(rxq->page_pool)) {
++ 		err = PTR_ERR(rxq->page_pool);
++ 		rxq->page_pool = NULL;
++ 		return err;
++ 	}
++ 
++ 	err = xdp_rxq_info_reg(&rxq->xdp_rxq, pp->dev, rxq->id, 0);
++ 	if (err < 0)
++ 		goto err_free_pp;
++ 
++ 	err = xdp_rxq_info_reg_mem_model(&rxq->xdp_rxq, MEM_TYPE_PAGE_POOL,
++ 					 rxq->page_pool);
++ 	if (err)
++ 		goto err_unregister_rxq;
++ 
++ 	return 0;
++ 
++ err_unregister_rxq:
++ 	xdp_rxq_info_unreg(&rxq->xdp_rxq);
++ err_free_pp:
++ 	page_pool_destroy(rxq->page_pool);
++ 	rxq->page_pool = NULL;
++ 	return err;
++ }
++ 
+++>>>>>>> b02e5a0ebb17 (xsk: Propagate napi_id to XDP socket Rx path)
+  /* Handle rxq fill: allocates rxq skbs; called when initializing a port */
+  static int mvneta_rxq_fill(struct mvneta_port *pp, struct mvneta_rx_queue *rxq,
+  			   int num)
+diff --cc drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index e29e898961a0,5504cbc24970..000000000000
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@@ -2098,7 -2613,43 +2098,34 @@@ static int mvpp2_rxq_init(struct mvpp2_
+  	/* Add number of descriptors ready for receiving packets */
+  	mvpp2_rxq_status_update(port, rxq->id, 0, rxq->size);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (priv->percpu_pools) {
++ 		err = xdp_rxq_info_reg(&rxq->xdp_rxq_short, port->dev, rxq->id, 0);
++ 		if (err < 0)
++ 			goto err_free_dma;
++ 
++ 		err = xdp_rxq_info_reg(&rxq->xdp_rxq_long, port->dev, rxq->id, 0);
++ 		if (err < 0)
++ 			goto err_unregister_rxq_short;
++ 
++ 		/* Every RXQ has a pool for short and another for long packets */
++ 		err = xdp_rxq_info_reg_mem_model(&rxq->xdp_rxq_short,
++ 						 MEM_TYPE_PAGE_POOL,
++ 						 priv->page_pool[rxq->logic_rxq]);
++ 		if (err < 0)
++ 			goto err_unregister_rxq_long;
++ 
++ 		err = xdp_rxq_info_reg_mem_model(&rxq->xdp_rxq_long,
++ 						 MEM_TYPE_PAGE_POOL,
++ 						 priv->page_pool[rxq->logic_rxq +
++ 								 port->nrxqs]);
++ 		if (err < 0)
++ 			goto err_unregister_mem_rxq_short;
++ 	}
++ 
+++>>>>>>> b02e5a0ebb17 (xsk: Propagate napi_id to XDP socket Rx path)
+  	return 0;
+ -
+ -err_unregister_mem_rxq_short:
+ -	xdp_rxq_info_unreg_mem_model(&rxq->xdp_rxq_short);
+ -err_unregister_rxq_long:
+ -	xdp_rxq_info_unreg(&rxq->xdp_rxq_long);
+ -err_unregister_rxq_short:
+ -	xdp_rxq_info_unreg(&rxq->xdp_rxq_short);
+ -err_free_dma:
+ -	dma_free_coherent(port->dev->dev.parent,
+ -			  rxq->size * MVPP2_DESC_ALIGNED_SIZE,
+ -			  rxq->descs, rxq->descs_dma);
+ -	return err;
+  }
+  
+  /* Push packets received by the RXQ to BM pool */
+diff --cc drivers/net/ethernet/socionext/netsec.c
+index e080d3e7c582,27d3c9d9210e..000000000000
+--- a/drivers/net/ethernet/socionext/netsec.c
++++ b/drivers/net/ethernet/socionext/netsec.c
+@@@ -989,22 -1283,60 +989,45 @@@ err
+  static int netsec_setup_rx_dring(struct netsec_priv *priv)
+  {
+  	struct netsec_desc_ring *dring = &priv->desc_ring[NETSEC_RING_RX];
+ -	struct bpf_prog *xdp_prog = READ_ONCE(priv->xdp_prog);
+ -	struct page_pool_params pp_params = {
+ -		.order = 0,
+ -		/* internal DMA mapping in page_pool */
+ -		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+ -		.pool_size = DESC_NUM,
+ -		.nid = NUMA_NO_NODE,
+ -		.dev = priv->dev,
+ -		.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE,
+ -		.offset = NETSEC_RXBUF_HEADROOM,
+ -		.max_len = NETSEC_RX_BUF_SIZE,
+ -	};
+ -	int i, err;
+ -
+ -	dring->page_pool = page_pool_create(&pp_params);
+ -	if (IS_ERR(dring->page_pool)) {
+ -		err = PTR_ERR(dring->page_pool);
+ -		dring->page_pool = NULL;
+ -		goto err_out;
+ -	}
+ -
+ +	struct netsec_desc desc;
+ +	struct sk_buff *skb;
+ +	int n;
+ +
+ +	desc.len = priv->ndev->mtu + 22;
+ +
+++<<<<<<< HEAD
+ +	for (n = 0; n < DESC_NUM; n++) {
+ +		skb = netsec_alloc_skb(priv, &desc);
+ +		if (!skb) {
+ +			netsec_uninit_pkt_dring(priv, NETSEC_RING_RX);
+ +			return -ENOMEM;
+++=======
++ 	err = xdp_rxq_info_reg(&dring->xdp_rxq, priv->ndev, 0, priv->napi.napi_id);
++ 	if (err)
++ 		goto err_out;
++ 
++ 	err = xdp_rxq_info_reg_mem_model(&dring->xdp_rxq, MEM_TYPE_PAGE_POOL,
++ 					 dring->page_pool);
++ 	if (err)
++ 		goto err_out;
++ 
++ 	for (i = 0; i < DESC_NUM; i++) {
++ 		struct netsec_desc *desc = &dring->desc[i];
++ 		dma_addr_t dma_handle;
++ 		void *buf;
++ 		u16 len;
++ 
++ 		buf = netsec_alloc_rx_data(priv, &dma_handle, &len);
++ 
++ 		if (!buf) {
++ 			err = -ENOMEM;
++ 			goto err_out;
+++>>>>>>> b02e5a0ebb17 (xsk: Propagate napi_id to XDP socket Rx path)
+  		}
+ -		desc->dma_addr = dma_handle;
+ -		desc->addr = buf;
+ -		desc->len = len;
+ +		netsec_set_rx_de(priv, dring, n, &desc, skb);
+  	}
+  
+ -	netsec_rx_fill(priv, 0, DESC_NUM);
+ -
+  	return 0;
+ -
+ -err_out:
+ -	netsec_uninit_pkt_dring(priv, NETSEC_RING_RX);
+ -	return err;
+  }
+  
+  static int netsec_netdev_load_ucode_region(struct netsec_priv *priv, u32 reg,
+diff --cc drivers/net/xen-netfront.c
+index c9ad8431e87a,b01848ef4649..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -1750,6 -1991,51 +1750,54 @@@ static void xennet_destroy_queues(struc
+  	info->queues = NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ 
++ static int xennet_create_page_pool(struct netfront_queue *queue)
++ {
++ 	int err;
++ 	struct page_pool_params pp_params = {
++ 		.order = 0,
++ 		.flags = 0,
++ 		.pool_size = NET_RX_RING_SIZE,
++ 		.nid = NUMA_NO_NODE,
++ 		.dev = &queue->info->netdev->dev,
++ 		.offset = XDP_PACKET_HEADROOM,
++ 		.max_len = XEN_PAGE_SIZE - XDP_PACKET_HEADROOM,
++ 	};
++ 
++ 	queue->page_pool = page_pool_create(&pp_params);
++ 	if (IS_ERR(queue->page_pool)) {
++ 		err = PTR_ERR(queue->page_pool);
++ 		queue->page_pool = NULL;
++ 		return err;
++ 	}
++ 
++ 	err = xdp_rxq_info_reg(&queue->xdp_rxq, queue->info->netdev,
++ 			       queue->id, 0);
++ 	if (err) {
++ 		netdev_err(queue->info->netdev, "xdp_rxq_info_reg failed\n");
++ 		goto err_free_pp;
++ 	}
++ 
++ 	err = xdp_rxq_info_reg_mem_model(&queue->xdp_rxq,
++ 					 MEM_TYPE_PAGE_POOL, queue->page_pool);
++ 	if (err) {
++ 		netdev_err(queue->info->netdev, "xdp_rxq_info_reg_mem_model failed\n");
++ 		goto err_unregister_rxq;
++ 	}
++ 	return 0;
++ 
++ err_unregister_rxq:
++ 	xdp_rxq_info_unreg(&queue->xdp_rxq);
++ err_free_pp:
++ 	page_pool_destroy(queue->page_pool);
++ 	queue->page_pool = NULL;
++ 	return err;
++ }
++ 
+++>>>>>>> b02e5a0ebb17 (xsk: Propagate napi_id to XDP socket Rx path)
+  static int xennet_create_queues(struct netfront_info *info,
+  				unsigned int *num_queues)
+  {
+diff --cc include/net/xdp.h
+index e770a6f111b9,700ad5db7f5d..000000000000
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@@ -61,20 -59,7 +61,24 @@@ struct xdp_rxq_info 
+  	u32 queue_index;
+  	u32 reg_state;
+  	struct xdp_mem_info mem;
+++<<<<<<< HEAD
+ +	/* RHEL: This structure is not considered part of the kABI
+ +	 * whitelist. However, it is embedded in struct netdev_rx_queue
+ +	 * which is referenced from struct net_device::_rx as an array.
+ +	 * Therefore, we need to protect the size of struct xdp_rxq_info. */
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	/* Note that there is more space available after the reserved fields
+ +	 * due to the cache alignment of this structure. Be sure to verify
+ +	 * the result with pahole on all supported archs before using the
+ +	 * padding, though. */
+++=======
++ 	unsigned int napi_id;
+++>>>>>>> b02e5a0ebb17 (xsk: Propagate napi_id to XDP socket Rx path)
+  } ____cacheline_aligned; /* perf critical, avoid false-sharing */
+  
+  struct xdp_txq_info {
+@@@ -225,12 -226,8 +229,12 @@@ static inline void xdp_release_frame(st
+  		__xdp_release_frame(xdpf->data, mem);
+  }
+  
+ +/* RHEL: increase the version of xdp_rxq_info_reg kABI whenever XDP is
+ + * changed in a kABI incompatible way. That includes changes to ndo_xdp* and
+ + * ndo_bpf ops, inline function changes and XDP struct changes. */
+ +RH_KABI_FORCE_CHANGE(2)
+  int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+- 		     struct net_device *dev, u32 queue_index);
++ 		     struct net_device *dev, u32 queue_index, unsigned int napi_id);
+  void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq);
+  void xdp_rxq_info_unused(struct xdp_rxq_info *xdp_rxq);
+  bool xdp_rxq_info_is_reg(struct xdp_rxq_info *xdp_rxq);
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+diff --git a/drivers/net/ethernet/amazon/ena/ena_netdev.c b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+index 5ee576a69ed9..5c8ded6592fe 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@ -493,7 +493,7 @@ static int ena_xdp_register_rxq_info(struct ena_ring *rx_ring)
+ {
+ 	int rc;
+ 
+-	rc = xdp_rxq_info_reg(&rx_ring->xdp_rxq, rx_ring->netdev, rx_ring->qid);
++	rc = xdp_rxq_info_reg(&rx_ring->xdp_rxq, rx_ring->netdev, rx_ring->qid, 0);
+ 
+ 	if (rc) {
+ 		netif_err(rx_ring->adapter, ifup, rx_ring->netdev,
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index b1a89941180e..172640117f26 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -2845,7 +2845,7 @@ static int bnxt_alloc_rx_rings(struct bnxt *bp)
+ 		if (rc)
+ 			return rc;
+ 
+-		rc = xdp_rxq_info_reg(&rxr->xdp_rxq, bp->dev, i);
++		rc = xdp_rxq_info_reg(&rxr->xdp_rxq, bp->dev, i, 0);
+ 		if (rc < 0)
+ 			return rc;
+ 
+diff --git a/drivers/net/ethernet/cavium/thunder/nicvf_queues.c b/drivers/net/ethernet/cavium/thunder/nicvf_queues.c
+index 9a4cfa61ed93..3ddd60e3bfd3 100644
+--- a/drivers/net/ethernet/cavium/thunder/nicvf_queues.c
++++ b/drivers/net/ethernet/cavium/thunder/nicvf_queues.c
+@@ -773,7 +773,7 @@ static void nicvf_rcv_queue_config(struct nicvf *nic, struct queue_set *qs,
+ 	rq->caching = 1;
+ 
+ 	/* Driver have no proper error path for failed XDP RX-queue info reg */
+-	WARN_ON(xdp_rxq_info_reg(&rq->xdp_rxq, nic->netdev, qidx) < 0);
++	WARN_ON(xdp_rxq_info_reg(&rq->xdp_rxq, nic->netdev, qidx, 0) < 0);
+ 
+ 	/* Send a mailbox msg to PF to config RQ */
+ 	mbx.rq.msg = NIC_MBOX_MSG_RQ_CFG;
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.c b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 90a821e48a48..ee7691cae1b4 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -1436,7 +1436,7 @@ int i40e_setup_rx_descriptors(struct i40e_ring *rx_ring)
+ 	/* XDP RX-queue info only needed for RX rings exposed to XDP */
+ 	if (rx_ring->vsi->type == I40E_VSI_MAIN) {
+ 		err = xdp_rxq_info_reg(&rx_ring->xdp_rxq, rx_ring->netdev,
+-				       rx_ring->queue_index);
++				       rx_ring->queue_index, rx_ring->q_vector->napi.napi_id);
+ 		if (err < 0)
+ 			return err;
+ 	}
+diff --git a/drivers/net/ethernet/intel/ice/ice_base.c b/drivers/net/ethernet/intel/ice/ice_base.c
+index fe4320e2d1f2..3124a3bf519a 100644
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@ -306,7 +306,7 @@ int ice_setup_rx_ctx(struct ice_ring *ring)
+ 		if (!xdp_rxq_info_is_reg(&ring->xdp_rxq))
+ 			/* coverity[check_return] */
+ 			xdp_rxq_info_reg(&ring->xdp_rxq, ring->netdev,
+-					 ring->q_index);
++					 ring->q_index, ring->q_vector->napi.napi_id);
+ 
+ 		ring->xsk_pool = ice_xsk_pool(ring);
+ 		if (ring->xsk_pool) {
+@@ -333,7 +333,7 @@ int ice_setup_rx_ctx(struct ice_ring *ring)
+ 				/* coverity[check_return] */
+ 				xdp_rxq_info_reg(&ring->xdp_rxq,
+ 						 ring->netdev,
+-						 ring->q_index);
++						 ring->q_index, ring->q_vector->napi.napi_id);
+ 
+ 			err = xdp_rxq_info_reg_mem_model(&ring->xdp_rxq,
+ 							 MEM_TYPE_PAGE_SHARED,
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index 6afa2c3ad618..0cbaa44139d2 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -483,7 +483,7 @@ int ice_setup_rx_ring(struct ice_ring *rx_ring)
+ 	if (rx_ring->vsi->type == ICE_VSI_PF &&
+ 	    !xdp_rxq_info_is_reg(&rx_ring->xdp_rxq))
+ 		if (xdp_rxq_info_reg(&rx_ring->xdp_rxq, rx_ring->netdev,
+-				     rx_ring->q_index))
++				     rx_ring->q_index, rx_ring->q_vector->napi.napi_id))
+ 			goto err;
+ 	return 0;
+ 
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index f7cc16dd5775..77a62ecca4d4 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -4363,7 +4363,7 @@ int igb_setup_rx_resources(struct igb_ring *rx_ring)
+ 
+ 	/* XDP RX-queue info */
+ 	if (xdp_rxq_info_reg(&rx_ring->xdp_rxq, rx_ring->netdev,
+-			     rx_ring->queue_index) < 0)
++			     rx_ring->queue_index, 0) < 0)
+ 		goto err;
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index aacfc1731e44..c8afd7f05061 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -6574,7 +6574,7 @@ int ixgbe_setup_rx_resources(struct ixgbe_adapter *adapter,
+ 
+ 	/* XDP RX-queue info */
+ 	if (xdp_rxq_info_reg(&rx_ring->xdp_rxq, adapter->netdev,
+-			     rx_ring->queue_index) < 0)
++			     rx_ring->queue_index, rx_ring->q_vector->napi.napi_id) < 0)
+ 		goto err;
+ 
+ 	rx_ring->xdp_prog = adapter->xdp_prog;
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+index 95c027fe5b18..2a1831357de5 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -3490,7 +3490,7 @@ int ixgbevf_setup_rx_resources(struct ixgbevf_adapter *adapter,
+ 
+ 	/* XDP RX-queue info */
+ 	if (xdp_rxq_info_reg(&rx_ring->xdp_rxq, adapter->netdev,
+-			     rx_ring->queue_index) < 0)
++			     rx_ring->queue_index, 0) < 0)
+ 		goto err;
+ 
+ 	rx_ring->xdp_prog = adapter->xdp_prog;
+* Unmerged path drivers/net/ethernet/marvell/mvneta.c
+* Unmerged path drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index d71b88c5dd14..487ace6a5313 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -284,7 +284,7 @@ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
+ 	ring->log_stride = ffs(ring->stride) - 1;
+ 	ring->buf_size = ring->size * ring->stride + TXBB_SIZE;
+ 
+-	if (xdp_rxq_info_reg(&ring->xdp_rxq, priv->dev, queue_index) < 0)
++	if (xdp_rxq_info_reg(&ring->xdp_rxq, priv->dev, queue_index, 0) < 0)
+ 		goto err_ring;
+ 
+ 	tmp = size * roundup_pow_of_two(MLX4_EN_MAX_RX_FRAGS *
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 237d6c6a22d1..db6a5f088596 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -433,7 +433,7 @@ static int mlx5e_alloc_rq(struct mlx5e_channel *c,
+ 	rq_xdp_ix = rq->ix;
+ 	if (xsk)
+ 		rq_xdp_ix += params->num_channels * MLX5E_RQ_GROUP_XSK;
+-	err = xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq_xdp_ix);
++	err = xdp_rxq_info_reg(&rq->xdp_rxq, rq->netdev, rq_xdp_ix, 0);
+ 	if (err < 0)
+ 		goto err_rq_xdp_prog;
+ 
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 4ea6ed031a4d..97a3ab6880b7 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -2534,7 +2534,7 @@ nfp_net_rx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring)
+ 
+ 	if (dp->netdev) {
+ 		err = xdp_rxq_info_reg(&rx_ring->xdp_rxq, dp->netdev,
+-				       rx_ring->idx);
++				       rx_ring->idx, rx_ring->r_vec->napi.napi_id);
+ 		if (err < 0)
+ 			return err;
+ 	}
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index 88b6b66b801e..206c10288733 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -1744,7 +1744,7 @@ static void qede_init_fp(struct qede_dev *edev)
+ 
+ 			/* Driver have no error path from here */
+ 			WARN_ON(xdp_rxq_info_reg(&fp->rxq->xdp_rxq, edev->ndev,
+-						 fp->rxq->rxq_id) < 0);
++						 fp->rxq->rxq_id, 0) < 0);
+ 
+ 			if (xdp_rxq_info_reg_mem_model(&fp->rxq->xdp_rxq,
+ 						       MEM_TYPE_PAGE_ORDER0,
+diff --git a/drivers/net/ethernet/sfc/rx_common.c b/drivers/net/ethernet/sfc/rx_common.c
+index 19cf7cac1e6e..68fc7d317693 100644
+--- a/drivers/net/ethernet/sfc/rx_common.c
++++ b/drivers/net/ethernet/sfc/rx_common.c
+@@ -262,7 +262,7 @@ void efx_init_rx_queue(struct efx_rx_queue *rx_queue)
+ 
+ 	/* Initialise XDP queue information */
+ 	rc = xdp_rxq_info_reg(&rx_queue->xdp_rxq_info, efx->net_dev,
+-			      rx_queue->core_index);
++			      rx_queue->core_index, 0);
+ 
+ 	if (rc) {
+ 		netif_err(efx, rx_err, efx->net_dev,
+* Unmerged path drivers/net/ethernet/socionext/netsec.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 4d6c5ebf8385..c5693cb5d2bf 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -1639,7 +1639,7 @@ struct netvsc_device *netvsc_device_add(struct hv_device *device,
+ 		u64_stats_init(&nvchan->tx_stats.syncp);
+ 		u64_stats_init(&nvchan->rx_stats.syncp);
+ 
+-		ret = xdp_rxq_info_reg(&nvchan->xdp_rxq, ndev, i);
++		ret = xdp_rxq_info_reg(&nvchan->xdp_rxq, ndev, i, 0);
+ 
+ 		if (ret) {
+ 			netdev_err(ndev, "xdp_rxq_info_reg fail: %d\n", ret);
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index 8b001f4b07a2..0d643c7375dc 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -831,7 +831,7 @@ static int tun_attach(struct tun_struct *tun, struct file *file,
+ 	} else {
+ 		/* Setup XDP RX-queue info, for new tfile getting attached */
+ 		err = xdp_rxq_info_reg(&tfile->xdp_rxq,
+-				       tun->dev, tfile->queue_index);
++				       tun->dev, tfile->queue_index, 0);
+ 		if (err < 0)
+ 			goto out;
+ 		err = xdp_rxq_info_reg_mem_model(&tfile->xdp_rxq,
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index 7b27c11eb428..2231e9f7d56d 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -904,7 +904,6 @@ static int veth_napi_add(struct net_device *dev)
+ 	for (i = 0; i < dev->real_num_rx_queues; i++) {
+ 		struct veth_rq *rq = &priv->rq[i];
+ 
+-		netif_napi_add(dev, &rq->xdp_napi, veth_poll, NAPI_POLL_WEIGHT);
+ 		napi_enable(&rq->xdp_napi);
+ 	}
+ 
+@@ -946,7 +945,8 @@ static int veth_enable_xdp(struct net_device *dev)
+ 		for (i = 0; i < dev->real_num_rx_queues; i++) {
+ 			struct veth_rq *rq = &priv->rq[i];
+ 
+-			err = xdp_rxq_info_reg(&rq->xdp_rxq, dev, i);
++			netif_napi_add(dev, &rq->xdp_napi, veth_poll, NAPI_POLL_WEIGHT);
++			err = xdp_rxq_info_reg(&rq->xdp_rxq, dev, i, rq->xdp_napi.napi_id);
+ 			if (err < 0)
+ 				goto err_rxq_reg;
+ 
+@@ -972,8 +972,12 @@ static int veth_enable_xdp(struct net_device *dev)
+ err_reg_mem:
+ 	xdp_rxq_info_unreg(&priv->rq[i].xdp_rxq);
+ err_rxq_reg:
+-	for (i--; i >= 0; i--)
+-		xdp_rxq_info_unreg(&priv->rq[i].xdp_rxq);
++	for (i--; i >= 0; i--) {
++		struct veth_rq *rq = &priv->rq[i];
++
++		xdp_rxq_info_unreg(&rq->xdp_rxq);
++		netif_napi_del(&rq->xdp_napi);
++	}
+ 
+ 	return err;
+ }
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 3b12580221bf..654aba3ff8f3 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -1475,7 +1475,7 @@ static int virtnet_open(struct net_device *dev)
+ 			if (!try_fill_recv(vi, &vi->rq[i], GFP_KERNEL))
+ 				schedule_delayed_work(&vi->refill, 0);
+ 
+-		err = xdp_rxq_info_reg(&vi->rq[i].xdp_rxq, dev, i);
++		err = xdp_rxq_info_reg(&vi->rq[i].xdp_rxq, dev, i, vi->rq[i].napi.napi_id);
+ 		if (err < 0)
+ 			return err;
+ 
+* Unmerged path drivers/net/xen-netfront.c
+diff --git a/include/net/busy_poll.h b/include/net/busy_poll.h
+index 60f8490ed317..a9c556076598 100644
+--- a/include/net/busy_poll.h
++++ b/include/net/busy_poll.h
+@@ -154,14 +154,25 @@ static inline void sk_mark_napi_id(struct sock *sk, const struct sk_buff *skb)
+ 	sk_rx_queue_set(sk, skb);
+ }
+ 
+-/* variant used for unconnected sockets */
+-static inline void sk_mark_napi_id_once(struct sock *sk,
+-					const struct sk_buff *skb)
++static inline void __sk_mark_napi_id_once_xdp(struct sock *sk, unsigned int napi_id)
+ {
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 	if (!READ_ONCE(sk->sk_napi_id))
+-		WRITE_ONCE(sk->sk_napi_id, skb->napi_id);
++		WRITE_ONCE(sk->sk_napi_id, napi_id);
+ #endif
+ }
+ 
++/* variant used for unconnected sockets */
++static inline void sk_mark_napi_id_once(struct sock *sk,
++					const struct sk_buff *skb)
++{
++	__sk_mark_napi_id_once_xdp(sk, skb->napi_id);
++}
++
++static inline void sk_mark_napi_id_once_xdp(struct sock *sk,
++					    const struct xdp_buff *xdp)
++{
++	__sk_mark_napi_id_once_xdp(sk, xdp->rxq->napi_id);
++}
++
+ #endif /* _LINUX_NET_BUSY_POLL_H */
+* Unmerged path include/net/xdp.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 1e7b7a3fd02e..4fb3e43d9c73 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -9415,7 +9415,7 @@ static int netif_alloc_rx_queues(struct net_device *dev)
+ 		rx[i].dev = dev;
+ 
+ 		/* XDP RX-queue setup */
+-		err = xdp_rxq_info_reg(&rx[i].xdp_rxq, dev, i);
++		err = xdp_rxq_info_reg(&rx[i].xdp_rxq, dev, i, 0);
+ 		if (err < 0)
+ 			goto err_rxq_info;
+ 	}
+diff --git a/net/core/xdp.c b/net/core/xdp.c
+index aae9619d8ff9..aad31abc07f3 100644
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -158,7 +158,7 @@ static void xdp_rxq_info_init(struct xdp_rxq_info *xdp_rxq)
+ 
+ /* Returns 0 on success, negative on failure */
+ int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+-		     struct net_device *dev, u32 queue_index)
++		     struct net_device *dev, u32 queue_index, unsigned int napi_id)
+ {
+ 	if (xdp_rxq->reg_state == REG_STATE_UNUSED) {
+ 		WARN(1, "Driver promised not to register this");
+@@ -179,6 +179,7 @@ int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+ 	xdp_rxq_info_init(xdp_rxq);
+ 	xdp_rxq->dev = dev;
+ 	xdp_rxq->queue_index = queue_index;
++	xdp_rxq->napi_id = napi_id;
+ 
+ 	xdp_rxq->reg_state = REG_STATE_REGISTERED;
+ 	return 0;
+diff --git a/net/xdp/xsk.c b/net/xdp/xsk.c
+index 528fbcc77382..a53fbf38b2be 100644
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -243,6 +243,7 @@ static int xsk_rcv(struct xdp_sock *xs, struct xdp_buff *xdp,
+ 	if (xs->dev != xdp->rxq->dev || xs->queue_id != xdp->rxq->queue_index)
+ 		return -EINVAL;
+ 
++	sk_mark_napi_id_once_xdp(&xs->sk, xdp);
+ 	len = xdp->data_end - xdp->data;
+ 
+ 	return xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL ?
