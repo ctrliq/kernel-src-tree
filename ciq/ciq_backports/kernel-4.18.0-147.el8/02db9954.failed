@@ -1,0 +1,180 @@
+nvmet: fix building bvec from sg list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 02db99548d3608a625cf481cff2bb7b626829b3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/02db9954.failed
+
+There are two mistakes for building bvec from sg list for file
+backed ns:
+
+- use request data length to compute number of io vector, this way
+doesn't consider sg->offset, and the result may be smaller than required
+io vectors
+
+- bvec->bv_len isn't capped by sg->length
+
+This patch fixes this issue by building bvec from sg directly, given
+the whole IO stack is ready for multi-page bvec.
+
+	Reported-by: Yi Zhang <yi.zhang@redhat.com>
+Fixes: 3a85a5de29ea ("nvme-loop: add a NVMe loopback host driver")
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 02db99548d3608a625cf481cff2bb7b626829b3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/io-cmd-file.c
+diff --cc drivers/nvme/target/io-cmd-file.c
+index 1500690046b1,bc6ebb51b0bf..000000000000
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@@ -121,24 -121,24 +121,31 @@@ static void nvmet_file_io_done(struct k
+  			mempool_free(req->f.bvec, req->ns->bvec_pool);
+  	}
+  
+ -	if (unlikely(ret != req->data_len))
+ -		status = errno_to_nvme_status(req, ret);
+ -	nvmet_req_complete(req, status);
+ +	nvmet_req_complete(req, ret != req->data_len ?
+ +			NVME_SC_INTERNAL | NVME_SC_DNR : 0);
+  }
+  
+ -static bool nvmet_file_execute_io(struct nvmet_req *req, int ki_flags)
+ +static void nvmet_file_execute_rw(struct nvmet_req *req)
+  {
+- 	ssize_t nr_bvec = DIV_ROUND_UP(req->data_len, PAGE_SIZE);
+- 	struct sg_page_iter sg_pg_iter;
++ 	ssize_t nr_bvec = req->sg_cnt;
+  	unsigned long bv_cnt = 0;
+  	bool is_sync = false;
+  	size_t len = 0, total_len = 0;
+  	ssize_t ret = 0;
+  	loff_t pos;
+++<<<<<<< HEAD
+ +
+ +	if (!req->sg_cnt || !nr_bvec) {
+ +		nvmet_req_complete(req, 0);
+ +		return;
+ +	}
+++=======
++ 	int i;
++ 	struct scatterlist *sg;
++ 
++ 	if (req->f.mpool_alloc && nr_bvec > NVMET_MAX_MPOOL_BVEC)
++ 		is_sync = true;
+++>>>>>>> 02db99548d36 (nvmet: fix building bvec from sg list)
+  
+  	pos = le64_to_cpu(req->cmd->rw.slba) << req->ns->blksize_shift;
+  	if (unlikely(pos + req->data_len > req->ns->size)) {
+@@@ -182,15 -168,95 +189,77 @@@
+  		nr_bvec--;
+  	}
+  
+ -	if (WARN_ON_ONCE(total_len != req->data_len)) {
+ +	if (WARN_ON_ONCE(total_len != req->data_len))
+  		ret = -EIO;
+++<<<<<<< HEAD
+ +out:
+ +	if (unlikely(is_sync || ret)) {
+ +		nvmet_file_io_done(&req->f.iocb, ret < 0 ? ret : total_len, 0);
+++=======
++ 		goto complete;
++ 	}
++ 
++ 	if (unlikely(is_sync)) {
++ 		ret = total_len;
++ 		goto complete;
++ 	}
++ 
++ 	/*
++ 	 * A NULL ki_complete ask for synchronous execution, which we want
++ 	 * for the IOCB_NOWAIT case.
++ 	 */
++ 	if (!(ki_flags & IOCB_NOWAIT))
++ 		req->f.iocb.ki_complete = nvmet_file_io_done;
++ 
++ 	ret = nvmet_file_submit_bvec(req, pos, bv_cnt, total_len, ki_flags);
++ 
++ 	switch (ret) {
++ 	case -EIOCBQUEUED:
++ 		return true;
++ 	case -EAGAIN:
++ 		if (WARN_ON_ONCE(!(ki_flags & IOCB_NOWAIT)))
++ 			goto complete;
++ 		return false;
++ 	case -EOPNOTSUPP:
++ 		/*
++ 		 * For file systems returning error -EOPNOTSUPP, handle
++ 		 * IOCB_NOWAIT error case separately and retry without
++ 		 * IOCB_NOWAIT.
++ 		 */
++ 		if ((ki_flags & IOCB_NOWAIT))
++ 			return false;
++ 		break;
++ 	}
++ 
++ complete:
++ 	nvmet_file_io_done(&req->f.iocb, ret, 0);
++ 	return true;
++ }
++ 
++ static void nvmet_file_buffered_io_work(struct work_struct *w)
++ {
++ 	struct nvmet_req *req = container_of(w, struct nvmet_req, f.work);
++ 
++ 	nvmet_file_execute_io(req, 0);
++ }
++ 
++ static void nvmet_file_submit_buffered_io(struct nvmet_req *req)
++ {
++ 	INIT_WORK(&req->f.work, nvmet_file_buffered_io_work);
++ 	queue_work(buffered_io_wq, &req->f.work);
++ }
++ 
++ static void nvmet_file_execute_rw(struct nvmet_req *req)
++ {
++ 	ssize_t nr_bvec = req->sg_cnt;
++ 
++ 	if (!req->sg_cnt || !nr_bvec) {
++ 		nvmet_req_complete(req, 0);
+++>>>>>>> 02db99548d36 (nvmet: fix building bvec from sg list)
+  		return;
+  	}
+ -
+ -	if (nr_bvec > NVMET_MAX_INLINE_BIOVEC)
+ -		req->f.bvec = kmalloc_array(nr_bvec, sizeof(struct bio_vec),
+ -				GFP_KERNEL);
+ -	else
+ -		req->f.bvec = req->inline_bvec;
+ -
+ -	if (unlikely(!req->f.bvec)) {
+ -		/* fallback under memory pressure */
+ -		req->f.bvec = mempool_alloc(req->ns->bvec_pool, GFP_KERNEL);
+ -		req->f.mpool_alloc = true;
+ -	} else
+ -		req->f.mpool_alloc = false;
+ -
+ -	if (req->ns->buffered_io) {
+ -		if (likely(!req->f.mpool_alloc) &&
+ -				nvmet_file_execute_io(req, IOCB_NOWAIT))
+ -			return;
+ -		nvmet_file_submit_buffered_io(req);
+ -	} else
+ -		nvmet_file_execute_io(req, 0);
+ -}
+ -
+ -u16 nvmet_file_flush(struct nvmet_req *req)
+ -{
+ -	return errno_to_nvme_status(req, vfs_fsync(req->ns->file, 1));
+ +	req->f.iocb.ki_complete = nvmet_file_io_done;
+ +	nvmet_file_submit_bvec(req, pos, bv_cnt, total_len);
+  }
+  
+  static void nvmet_file_flush_work(struct work_struct *w)
+* Unmerged path drivers/nvme/target/io-cmd-file.c
