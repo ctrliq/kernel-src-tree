@@ -33,6 +33,8 @@ void rxe_dealloc(struct ib_device *ib_dev)
 	rxe_pool_cleanup(&rxe->mc_grp_pool);
 	rxe_pool_cleanup(&rxe->mc_elem_pool);
 
+	WARN_ON(!RB_EMPTY_ROOT(&rxe->mcg_tree));
+
 	if (rxe->tfm)
 		crypto_free_shash(rxe->tfm);
 }
