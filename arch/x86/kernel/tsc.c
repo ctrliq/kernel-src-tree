@@ -26,6 +26,7 @@
 #include <asm/apic.h>
 #include <asm/intel-family.h>
 #include <asm/i8259.h>
+#include <asm/uv/uv.h>
 
 unsigned int __read_mostly cpu_khz;	/* TSC clocks / usec, not used here */
 EXPORT_SYMBOL(cpu_khz);
@@ -1410,6 +1411,9 @@ static unsigned long __init get_loops_per_jiffy(void)
 void __init tsc_early_init(void)
 {
 	if (!boot_cpu_has(X86_FEATURE_TSC))
+		return;
+	/* Don't change UV TSC multi-chassis synchronization */
+	if (is_early_uv_system())
 		return;
 	if (!determine_cpu_tsc_frequencies(true))
 		return;
