@@ -1,0 +1,201 @@
+net/mlx5e: Add support for hw decapsulation of MPLS over UDP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eli Cohen <eli@mellanox.com>
+commit 14e6b038afa014ac2288a2f3d692697f708ba344
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/14e6b038.failed
+
+MPLS over UDP is supported in hardware by using a packet reformat object
+with reformat type equal L3_TUNNEL_TO_L2 which both decapsulates the
+outer L3, L4 and MPLS headers, and allows for setting the L2 headers of
+the resulting decapsulated packet. For the hardware to operate
+correctly, the configuration of the firmware must have
+FLEX_PARSER_PROFILE_ENABLE = 1.
+
+Example tc rule:
+  tc filter add dev bareudp0 protocol all prio 1 root flower enc_dst_port \
+      6635 enc_src_ip 8.8.8.23 action mpls pop protocol ip pipe \
+      action pedit ex munge eth dst set 00:11:22:33:44:21 pipe action \
+      mirred egress redirect dev enp59s0f0_0
+
+We use pedit to set the correct destination MAC.
+
+For MPLS over UDP decapsulation to take place, the driver logic requires
+the following:
+
+1. flower filter added on bareudp device.
+2. action mpls pop
+3. zero or more pedit munge actions
+4. one redirect action
+
+Current implementation supports only IPv4 and no VLAN.
+
+tc filter show output looks like this:
+   filter protocol all pref 1 flower chain 0
+   filter protocol all pref 1 flower chain 0 handle 0x1
+     enc_src_ip 8.8.8.24
+     enc_dst_port 6635
+     in_hw in_hw_count 1
+            action order 1: mpls  pop protocol ip pipe
+             index 2 ref 1 bind 1
+
+            action order 2:  pedit action pipe keys 2
+             index 1 ref 1 bind 1
+             key #0  at eth+0: val 00112233 mask 00000000
+             key #1  at eth+4: val 44210000 mask 0000ffff
+
+            action order 3: mirred (Egress Redirect to device enp59s0f0_0) stolen
+            index 2 ref 1 bind 1
+
+	Signed-off-by: Eli Cohen <eli@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Reviewed-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Paul Blakey <paulb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 14e6b038afa014ac2288a2f3d692697f708ba344)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 7dfe692d1c4d,a6b18f0444e7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -3233,8 -3369,12 +3311,12 @@@ static inline int hash_encap_info(struc
+  		     key->tc_tunnel->tunnel_type);
+  }
+  
++ static inline int hash_decap_info(struct mlx5e_decap_key *key)
++ {
++ 	return jhash(&key->key, sizeof(key->key), 0);
++ }
+  
+ -static bool is_merged_eswitch_dev(struct mlx5e_priv *priv,
+ +static bool is_merged_eswitch_vfs(struct mlx5e_priv *priv,
+  				  struct net_device *peer_netdev)
+  {
+  	struct mlx5e_priv *peer_priv;
+@@@ -4050,7 -4297,9 +4258,8 @@@ mlx5e_alloc_flow(struct mlx5e_priv *pri
+  	flow->priv = priv;
+  	for (out_index = 0; out_index < MLX5_MAX_FLOW_FWD_VPORTS; out_index++)
+  		INIT_LIST_HEAD(&flow->encaps[out_index].list);
+ -	INIT_LIST_HEAD(&flow->mod_hdr);
+  	INIT_LIST_HEAD(&flow->hairpin);
++ 	INIT_LIST_HEAD(&flow->l3_to_l2_reformat);
+  	refcount_set(&flow->refcnt, 1);
+  	init_completion(&flow->init_done);
+  
+@@@ -4120,9 -4369,7 +4329,13 @@@ __mlx5e_add_fdb_flow(struct mlx5e_priv 
+  	if (err)
+  		goto err_free;
+  
+++<<<<<<< HEAD
+ +	/* actions validation depends on parsing the ct matches first */
+ +	err = mlx5_tc_ct_match_add(priv, &parse_attr->spec, f,
+ +				   &flow->esw_attr->ct_attr, extack);
+++=======
++ 	err = parse_tc_fdb_actions(priv, &rule->action, flow, extack, filter_dev);
+++>>>>>>> 14e6b038afa0 (net/mlx5e: Add support for hw decapsulation of MPLS over UDP)
+  	if (err)
+  		goto err_free;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 5ad4c0400fe4,ac79b7c9aeb3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1739,7 -2260,10 +1739,14 @@@ int mlx5_eswitch_init(struct mlx5_core_
+  
+  	mutex_init(&esw->offloads.encap_tbl_lock);
+  	hash_init(esw->offloads.encap_tbl);
+++<<<<<<< HEAD
+ +	mlx5e_mod_hdr_tbl_init(&esw->offloads.mod_hdr);
+++=======
++ 	mutex_init(&esw->offloads.mod_hdr.lock);
++ 	hash_init(esw->offloads.mod_hdr.hlist);
++ 	mutex_init(&esw->offloads.decap_tbl_lock);
++ 	hash_init(esw->offloads.decap_tbl);
+++>>>>>>> 14e6b038afa0 (net/mlx5e: Add support for hw decapsulation of MPLS over UDP)
+  	atomic64_set(&esw->offloads.num_flows, 0);
+  	mutex_init(&esw->state_lock);
+  	mutex_init(&esw->mode_lock);
+@@@ -1779,8 -2303,9 +1786,9 @@@ void mlx5_eswitch_cleanup(struct mlx5_e
+  	esw_offloads_cleanup_reps(esw);
+  	mutex_destroy(&esw->mode_lock);
+  	mutex_destroy(&esw->state_lock);
+ -	mutex_destroy(&esw->offloads.mod_hdr.lock);
+ +	mlx5e_mod_hdr_tbl_destroy(&esw->offloads.mod_hdr);
+  	mutex_destroy(&esw->offloads.encap_tbl_lock);
++ 	mutex_destroy(&esw->offloads.decap_tbl_lock);
+  	kfree(esw->vports);
+  	kfree(esw);
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 0126f9ae08c8..b53f58657490 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -147,6 +147,22 @@ struct mlx5e_neigh_hash_entry {
+ enum {
+ 	/* set when the encap entry is successfully offloaded into HW */
+ 	MLX5_ENCAP_ENTRY_VALID     = BIT(0),
++	MLX5_REFORMAT_DECAP        = BIT(1),
++};
++
++struct mlx5e_decap_key {
++	struct ethhdr key;
++};
++
++struct mlx5e_decap_entry {
++	struct mlx5e_decap_key key;
++	struct list_head flows;
++	struct hlist_node hlist;
++	refcount_t refcnt;
++	struct completion res_ready;
++	int compl_result;
++	struct mlx5_pkt_reformat *pkt_reformat;
++	struct rcu_head rcu;
+ };
+ 
+ struct mlx5e_encap_entry {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 37fd3b624e06..ee8ee284ba41 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -205,6 +205,8 @@ struct mlx5_esw_offload {
+ 	struct mutex peer_mutex;
+ 	struct mutex encap_tbl_lock; /* protects encap_tbl */
+ 	DECLARE_HASHTABLE(encap_tbl, 8);
++	struct mutex decap_tbl_lock; /* protects decap_tbl */
++	DECLARE_HASHTABLE(decap_tbl, 8);
+ 	struct mod_hdr_tbl mod_hdr;
+ 	DECLARE_HASHTABLE(termtbl_tbl, 8);
+ 	struct mutex termtbl_mutex; /* protects termtbl hash */
+@@ -419,6 +421,7 @@ struct mlx5_esw_flow_attr {
+ 	struct mlx5_flow_table *fdb;
+ 	struct mlx5_flow_table *dest_ft;
+ 	struct mlx5_ct_attr ct_attr;
++	struct mlx5_pkt_reformat *decap_pkt_reformat;
+ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
+ };
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index afb4bff4a4e1..dc11da9bbfe8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -363,6 +363,10 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
+ 			}
+ 		}
+ 	}
++
++	if (attr->decap_pkt_reformat)
++		flow_act.pkt_reformat = attr->decap_pkt_reformat;
++
+ 	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_COUNT) {
+ 		dest[i].type = MLX5_FLOW_DESTINATION_TYPE_COUNTER;
+ 		dest[i].counter_id = mlx5_fc_id(attr->counter);
