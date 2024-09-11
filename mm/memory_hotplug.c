@@ -1561,7 +1561,6 @@ static int __ref __offline_pages(unsigned long start_pfn,
 
 			cond_resched();
 			lru_add_drain_all();
-			drain_all_pages(zone);
 
 			pfn = scan_movable_pages(pfn, end_pfn);
 			if (pfn) {
