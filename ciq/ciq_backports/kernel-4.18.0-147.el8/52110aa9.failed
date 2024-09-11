@@ -1,0 +1,194 @@
+KVM: arm64/sve: Make register ioctl access errors more consistent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Martin <Dave.Martin@arm.com>
+commit 52110aa95948deba724739fc9933070c3e2c7239
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/52110aa9.failed
+
+Currently, the way error codes are generated when processing the
+SVE register access ioctls in a bit haphazard.
+
+This patch refactors the code so that the behaviour is more
+consistent: now, -EINVAL should be returned only for unrecognised
+register IDs or when some other runtime error occurs.  -ENOENT is
+returned for register IDs that are recognised, but whose
+corresponding register (or slice) does not exist for the vcpu.
+
+To this end, in {get,set}_sve_reg() we now delegate the
+vcpu_has_sve() check down into {get,set}_sve_vls() and
+sve_reg_to_region().  The KVM_REG_ARM64_SVE_VLS special case is
+picked off first, then sve_reg_to_region() plays the role of
+exhaustively validating or rejecting the register ID and (where
+accepted) computing the applicable register region as before.
+
+sve_reg_to_region() is rearranged so that -ENOENT or -EPERM is not
+returned prematurely, before checking whether reg->id is in a
+recognised range.
+
+-EPERM is now only returned when an attempt is made to access an
+actually existing register slice on an unfinalized vcpu.
+
+Fixes: e1c9c98345b3 ("KVM: arm64/sve: Add SVE support to register access ioctl interface")
+Fixes: 9033bba4b535 ("KVM: arm64/sve: Add pseudo-register for the guest's vector lengths")
+	Suggested-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Dave Martin <Dave.Martin@arm.com>
+	Reviewed-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 52110aa95948deba724739fc9933070c3e2c7239)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/guest.c
+diff --cc arch/arm64/kvm/guest.c
+index 61e28cc5ed6d,e45a042c0628..000000000000
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@@ -206,6 -206,79 +206,82 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define vq_word(vq) (((vq) - SVE_VQ_MIN) / 64)
++ #define vq_mask(vq) ((u64)1 << ((vq) - SVE_VQ_MIN) % 64)
++ 
++ static bool vq_present(
++ 	const u64 (*const vqs)[DIV_ROUND_UP(SVE_VQ_MAX - SVE_VQ_MIN + 1, 64)],
++ 	unsigned int vq)
++ {
++ 	return (*vqs)[vq_word(vq)] & vq_mask(vq);
++ }
++ 
++ static int get_sve_vls(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
++ {
++ 	unsigned int max_vq, vq;
++ 	u64 vqs[DIV_ROUND_UP(SVE_VQ_MAX - SVE_VQ_MIN + 1, 64)];
++ 
++ 	if (!vcpu_has_sve(vcpu))
++ 		return -ENOENT;
++ 
++ 	if (WARN_ON(!sve_vl_valid(vcpu->arch.sve_max_vl)))
++ 		return -EINVAL;
++ 
++ 	memset(vqs, 0, sizeof(vqs));
++ 
++ 	max_vq = sve_vq_from_vl(vcpu->arch.sve_max_vl);
++ 	for (vq = SVE_VQ_MIN; vq <= max_vq; ++vq)
++ 		if (sve_vq_available(vq))
++ 			vqs[vq_word(vq)] |= vq_mask(vq);
++ 
++ 	if (copy_to_user((void __user *)reg->addr, vqs, sizeof(vqs)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int set_sve_vls(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg)
++ {
++ 	unsigned int max_vq, vq;
++ 	u64 vqs[DIV_ROUND_UP(SVE_VQ_MAX - SVE_VQ_MIN + 1, 64)];
++ 
++ 	if (!vcpu_has_sve(vcpu))
++ 		return -ENOENT;
++ 
++ 	if (kvm_arm_vcpu_sve_finalized(vcpu))
++ 		return -EPERM; /* too late! */
++ 
++ 	if (WARN_ON(vcpu->arch.sve_state))
++ 		return -EINVAL;
++ 
++ 	if (copy_from_user(vqs, (const void __user *)reg->addr, sizeof(vqs)))
++ 		return -EFAULT;
++ 
++ 	max_vq = 0;
++ 	for (vq = SVE_VQ_MIN; vq <= SVE_VQ_MAX; ++vq)
++ 		if (vq_present(&vqs, vq))
++ 			max_vq = vq;
++ 
++ 	if (max_vq > sve_vq_from_vl(kvm_sve_max_vl))
++ 		return -EINVAL;
++ 
++ 	for (vq = SVE_VQ_MIN; vq <= max_vq; ++vq)
++ 		if (vq_present(&vqs, vq) != sve_vq_available(vq))
++ 			return -EINVAL;
++ 
++ 	/* Can't run with no vector lengths at all: */
++ 	if (max_vq < SVE_VQ_MIN)
++ 		return -EINVAL;
++ 
++ 	/* vcpu->arch.sve_state will be alloc'd by kvm_vcpu_finalize_sve() */
++ 	vcpu->arch.sve_max_vl = sve_vl_from_vq(max_vq);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 52110aa95948 (KVM: arm64/sve: Make register ioctl access errors more consistent)
+  #define SVE_REG_SLICE_SHIFT	0
+  #define SVE_REG_SLICE_BITS	5
+  #define SVE_REG_ID_SHIFT	(SVE_REG_SLICE_SHIFT + SVE_REG_SLICE_BITS)
+@@@ -267,12 -344,6 +346,15 @@@ static int sve_reg_to_region(struct sve
+  	/* Verify that we match the UAPI header: */
+  	BUILD_BUG_ON(SVE_NUM_SLICES != KVM_ARM64_SVE_MAX_SLICES);
+  
+++<<<<<<< HEAD
+ +	/* Only the first slice ever exists, for now: */
+ +	if ((reg->id & SVE_REG_SLICE_MASK) != 0)
+ +		return -ENOENT;
+ +
+ +	vq = sve_vq_from_vl(vcpu->arch.sve_max_vl);
+ +
+++=======
+++>>>>>>> 52110aa95948 (KVM: arm64/sve: Make register ioctl access errors more consistent)
+  	reg_num = (reg->id & SVE_REG_ID_MASK) >> SVE_REG_ID_SHIFT;
+  
+  	if (reg->id >= zreg_id_min && reg->id <= zreg_id_max) {
+@@@ -305,8 -387,17 +398,22 @@@ static int get_sve_reg(struct kvm_vcpu 
+  	struct sve_state_reg_region region;
+  	char __user *uptr = (char __user *)reg->addr;
+  
+++<<<<<<< HEAD
+ +	if (!vcpu_has_sve(vcpu) || sve_reg_to_region(&region, vcpu, reg))
+ +		return -ENOENT;
+++=======
++ 	/* Handle the KVM_REG_ARM64_SVE_VLS pseudo-reg as a special case: */
++ 	if (reg->id == KVM_REG_ARM64_SVE_VLS)
++ 		return get_sve_vls(vcpu, reg);
++ 
++ 	/* Try to interpret reg ID as an architectural SVE register... */
++ 	ret = sve_reg_to_region(&region, vcpu, reg);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!kvm_arm_vcpu_sve_finalized(vcpu))
++ 		return -EPERM;
+++>>>>>>> 52110aa95948 (KVM: arm64/sve: Make register ioctl access errors more consistent)
+  
+  	if (copy_to_user(uptr, vcpu->arch.sve_state + region.koffset,
+  			 region.klen) ||
+@@@ -321,8 -413,17 +429,22 @@@ static int set_sve_reg(struct kvm_vcpu 
+  	struct sve_state_reg_region region;
+  	const char __user *uptr = (const char __user *)reg->addr;
+  
+++<<<<<<< HEAD
+ +	if (!vcpu_has_sve(vcpu) || sve_reg_to_region(&region, vcpu, reg))
+ +		return -ENOENT;
+++=======
++ 	/* Handle the KVM_REG_ARM64_SVE_VLS pseudo-reg as a special case: */
++ 	if (reg->id == KVM_REG_ARM64_SVE_VLS)
++ 		return set_sve_vls(vcpu, reg);
++ 
++ 	/* Try to interpret reg ID as an architectural SVE register... */
++ 	ret = sve_reg_to_region(&region, vcpu, reg);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!kvm_arm_vcpu_sve_finalized(vcpu))
++ 		return -EPERM;
+++>>>>>>> 52110aa95948 (KVM: arm64/sve: Make register ioctl access errors more consistent)
+  
+  	if (copy_from_user(vcpu->arch.sve_state + region.koffset, uptr,
+  			   region.klen))
+* Unmerged path arch/arm64/kvm/guest.c
