@@ -1369,6 +1369,16 @@ int setup_profiling_timer(unsigned int multiplier)
 	return 0;
 }
 
+static void fixup_topology(void)
+{
+#ifdef CONFIG_SCHED_SMT
+	if (has_big_cores) {
+		pr_info("Big cores detected but using small core scheduling\n");
+		powerpc_topology[0].mask = smallcore_smt_mask;
+	}
+#endif
+}
+
 void __init smp_cpus_done(unsigned int max_cpus)
 {
 	/*
@@ -1387,12 +1397,7 @@ void __init smp_cpus_done(unsigned int max_cpus)
 	shared_proc_topology_init();
 	dump_numa_cpu_topology();
 
-#ifdef CONFIG_SCHED_SMT
-	if (has_big_cores) {
-		pr_info("Big cores detected but using small core scheduling\n");
-		powerpc_topology[0].mask = smallcore_smt_mask;
-	}
-#endif
+	fixup_topology();
 	set_sched_topology(powerpc_topology);
 }
 
