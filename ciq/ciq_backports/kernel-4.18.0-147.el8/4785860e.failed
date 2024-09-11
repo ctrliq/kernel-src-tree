@@ -1,0 +1,979 @@
+RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 4785860e04bc8d7e244b25257168e1cf8a5529ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4785860e.failed
+
+Now that the handlers do not process their own udata we can make a
+sensible ioctl that wrappers them. The ioctl follows the same format as
+the write_ex() and has the user explicitly specify the core and driver
+in/out opaque structures and a command number.
+
+This works for all forms of write commands.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 4785860e04bc8d7e244b25257168e1cf8a5529ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/Makefile
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs.h
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	drivers/infiniband/core/uverbs_std_types.c
+#	drivers/infiniband/core/uverbs_uapi.c
+diff --cc drivers/infiniband/core/Makefile
+index 61667705d746,69dee36e0e89..000000000000
+--- a/drivers/infiniband/core/Makefile
++++ b/drivers/infiniband/core/Makefile
+@@@ -35,6 -35,7 +35,11 @@@ ib_ucm-y :=			ucm.
+  
+  ib_uverbs-y :=			uverbs_main.o uverbs_cmd.o uverbs_marshall.o \
+  				rdma_core.o uverbs_std_types.o uverbs_ioctl.o \
+ -				uverbs_std_types_cq.o \
+ +				uverbs_ioctl_merge.o uverbs_std_types_cq.o \
+  				uverbs_std_types_flow_action.o uverbs_std_types_dm.o \
+++<<<<<<< HEAD
+ +				uverbs_std_types_mr.o uverbs_std_types_counters.o
+++=======
++ 				uverbs_std_types_mr.o uverbs_std_types_counters.o \
++ 				uverbs_uapi.o uverbs_std_types_device.o
+++>>>>>>> 4785860e04bc (RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers)
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,be6b8e1257d0..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -113,4 -106,117 +113,120 @@@ int uverbs_finalize_object(struct ib_uo
+  			   enum uverbs_obj_access access,
+  			   bool commit);
+  
+++<<<<<<< HEAD
+++=======
++ void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ 
++ /*
++  * This is the runtime description of the uverbs API, used by the syscall
++  * machinery to validate and dispatch calls.
++  */
++ 
++ /*
++  * Depending on ID the slot pointer in the radix tree points at one of these
++  * structs.
++  */
++ 
++ struct uverbs_api_ioctl_method {
++ 	int(__rcu *handler)(struct uverbs_attr_bundle *attrs);
++ 	DECLARE_BITMAP(attr_mandatory, UVERBS_API_ATTR_BKEY_LEN);
++ 	u16 bundle_size;
++ 	u8 use_stack:1;
++ 	u8 driver_method:1;
++ 	u8 disabled:1;
++ 	u8 has_udata:1;
++ 	u8 key_bitmap_len;
++ 	u8 destroy_bkey;
++ };
++ 
++ struct uverbs_api_write_method {
++ 	int (*handler)(struct uverbs_attr_bundle *attrs);
++ 	u8 disabled:1;
++ 	u8 is_ex:1;
++ 	u8 has_udata:1;
++ 	u8 has_resp:1;
++ 	u8 req_size;
++ 	u8 resp_size;
++ };
++ 
++ struct uverbs_api_attr {
++ 	struct uverbs_attr_spec spec;
++ };
++ 
++ struct uverbs_api {
++ 	/* radix tree contains struct uverbs_api_* pointers */
++ 	struct radix_tree_root radix;
++ 	enum rdma_driver_id driver_id;
++ 
++ 	unsigned int num_write;
++ 	unsigned int num_write_ex;
++ 	struct uverbs_api_write_method notsupp_method;
++ 	const struct uverbs_api_write_method **write_methods;
++ 	const struct uverbs_api_write_method **write_ex_methods;
++ };
++ 
++ /*
++  * Get an uverbs_api_object that corresponds to the given object_id.
++  * Note:
++  * -ENOMSG means that any object is allowed to match during lookup.
++  */
++ static inline const struct uverbs_api_object *
++ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
++ {
++ 	const struct uverbs_api_object *res;
++ 
++ 	if (object_id == UVERBS_IDR_ANY_OBJECT)
++ 		return ERR_PTR(-ENOMSG);
++ 
++ 	res = radix_tree_lookup(&uapi->radix, uapi_key_obj(object_id));
++ 	if (!res)
++ 		return ERR_PTR(-ENOENT);
++ 
++ 	return res;
++ }
++ 
++ char *uapi_key_format(char *S, unsigned int key);
++ struct uverbs_api *uverbs_alloc_api(struct ib_device *ibdev);
++ void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev);
++ void uverbs_disassociate_api(struct uverbs_api *uapi);
++ void uverbs_destroy_api(struct uverbs_api *uapi);
++ void uapi_compute_bundle_size(struct uverbs_api_ioctl_method *method_elm,
++ 			      unsigned int num_attrs);
++ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile);
++ 
++ extern const struct uapi_definition uverbs_def_obj_counters[];
++ extern const struct uapi_definition uverbs_def_obj_cq[];
++ extern const struct uapi_definition uverbs_def_obj_device[];
++ extern const struct uapi_definition uverbs_def_obj_dm[];
++ extern const struct uapi_definition uverbs_def_obj_flow_action[];
++ extern const struct uapi_definition uverbs_def_obj_intf[];
++ extern const struct uapi_definition uverbs_def_obj_mr[];
++ extern const struct uapi_definition uverbs_def_write_intf[];
++ 
++ static inline const struct uverbs_api_write_method *
++ uapi_get_method(const struct uverbs_api *uapi, u32 command)
++ {
++ 	u32 cmd_idx = command & IB_USER_VERBS_CMD_COMMAND_MASK;
++ 
++ 	if (command & ~(u32)(IB_USER_VERBS_CMD_FLAG_EXTENDED |
++ 			     IB_USER_VERBS_CMD_COMMAND_MASK))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (command & IB_USER_VERBS_CMD_FLAG_EXTENDED) {
++ 		if (cmd_idx >= uapi->num_write_ex)
++ 			return ERR_PTR(-EOPNOTSUPP);
++ 		return uapi->write_ex_methods[cmd_idx];
++ 	}
++ 
++ 	if (cmd_idx >= uapi->num_write)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	return uapi->write_methods[cmd_idx];
++ }
++ 
++ void uverbs_fill_udata(struct uverbs_attr_bundle *bundle,
++ 		       struct ib_udata *udata, unsigned int attr_in,
++ 		       unsigned int attr_out);
++ 
+++>>>>>>> 4785860e04bc (RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers)
+  #endif /* RDMA_CORE_H */
+diff --cc drivers/infiniband/core/uverbs.h
+index 55f338e6340d,88029f3b6853..000000000000
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@@ -235,13 -246,7 +235,16 @@@ int uverbs_dealloc_mw(struct ib_mw *mw)
+  void ib_uverbs_detach_umcast(struct ib_qp *qp,
+  			     struct ib_uqp_object *uobj);
+  
+++<<<<<<< HEAD
+ +void create_udata(struct uverbs_attr_bundle *ctx, struct ib_udata *udata);
+ +extern const struct uverbs_attr_def uverbs_uhw_compat_in;
+ +extern const struct uverbs_attr_def uverbs_uhw_compat_out;
+++=======
+++>>>>>>> 4785860e04bc (RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers)
+  long ib_uverbs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+ +int uverbs_destroy_def_handler(struct ib_device *ib_dev,
+ +			       struct ib_uverbs_file *file,
+ +			       struct uverbs_attr_bundle *attrs);
+  
+  struct ib_uverbs_flow_spec {
+  	union {
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index 03065bad8dae,3cc46447240e..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -312,182 -401,353 +312,330 @@@ static int uverbs_validate_kernel_manda
+  	return 0;
+  }
+  
+ -static int ib_uverbs_run_method(struct bundle_priv *pbundle,
+ -				unsigned int num_attrs)
+ +static int uverbs_handle_method(struct ib_uverbs_attr __user *uattr_ptr,
+ +				const struct ib_uverbs_attr *uattrs,
+ +				size_t num_uattrs,
+ +				struct ib_device *ibdev,
+ +				struct ib_uverbs_file *ufile,
+ +				const struct uverbs_method_spec *method_spec,
+ +				struct uverbs_attr_bundle *attr_bundle)
+  {
+ -	int (*handler)(struct uverbs_attr_bundle *attrs);
+ -	size_t uattrs_size = array_size(sizeof(*pbundle->uattrs), num_attrs);
+ -	unsigned int destroy_bkey = pbundle->method_elm->destroy_bkey;
+ -	unsigned int i;
+  	int ret;
+ +	int finalize_ret;
+ +	int num_given_buckets;
+  
+ -	/* See uverbs_disassociate_api() */
+ -	handler = srcu_dereference(
+ -		pbundle->method_elm->handler,
+ -		&pbundle->bundle.ufile->device->disassociate_srcu);
+ -	if (!handler)
+ -		return -EIO;
+ -
+ -	pbundle->uattrs = uverbs_alloc(&pbundle->bundle, uattrs_size);
+ -	if (IS_ERR(pbundle->uattrs))
+ -		return PTR_ERR(pbundle->uattrs);
+ -	if (copy_from_user(pbundle->uattrs, pbundle->user_attrs, uattrs_size))
+ -		return -EFAULT;
+ -
+ -	for (i = 0; i != num_attrs; i++) {
+ -		ret = uverbs_set_attr(pbundle, &pbundle->uattrs[i]);
+ -		if (unlikely(ret))
+ -			return ret;
+ -	}
+ -
+ -	/* User space did not provide all the mandatory attributes */
+ -	if (unlikely(!bitmap_subset(pbundle->method_elm->attr_mandatory,
+ -				    pbundle->bundle.attr_present,
+ -				    pbundle->method_elm->key_bitmap_len)))
+ +	num_given_buckets = uverbs_uattrs_process(ibdev, ufile->ucontext, uattrs,
+ +						  num_uattrs, method_spec,
+ +						  attr_bundle, uattr_ptr);
+ +	if (num_given_buckets <= 0)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	attr_bundle->num_buckets = num_given_buckets;
+ +	ret = uverbs_validate_kernel_mandatory(method_spec, attr_bundle);
+ +	if (ret)
+ +		goto cleanup;
+++=======
++ 	if (pbundle->method_elm->has_udata)
++ 		uverbs_fill_udata(&pbundle->bundle,
++ 				  &pbundle->bundle.driver_udata,
++ 				  UVERBS_ATTR_UHW_IN, UVERBS_ATTR_UHW_OUT);
+++>>>>>>> 4785860e04bc (RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers)
+  
+ -	if (destroy_bkey != UVERBS_API_ATTR_BKEY_LEN) {
+ -		struct uverbs_obj_attr *destroy_attr =
+ -			&pbundle->bundle.attrs[destroy_bkey].obj_attr;
+ -
+ -		ret = uobj_destroy(destroy_attr->uobject);
+ -		if (ret)
+ -			return ret;
+ -		__clear_bit(destroy_bkey, pbundle->uobj_finalize);
+ +	ret = method_spec->handler(ibdev, ufile, attr_bundle);
+ +cleanup:
+ +	finalize_ret = uverbs_finalize_attrs(attr_bundle,
+ +					     method_spec->attr_buckets,
+ +					     attr_bundle->num_buckets,
+ +					     !ret);
+  
+ -		ret = handler(&pbundle->bundle);
+ -		uobj_put_destroy(destroy_attr->uobject);
+ -	} else {
+ -		ret = handler(&pbundle->bundle);
+ -	}
+ -
+ -	/*
+ -	 * EPROTONOSUPPORT is ONLY to be returned if the ioctl framework can
+ -	 * not invoke the method because the request is not supported.  No
+ -	 * other cases should return this code.
+ -	 */
+ -	if (WARN_ON_ONCE(ret == -EPROTONOSUPPORT))
+ -		return -EINVAL;
+ -
+ -	return ret;
+ +	return ret ? ret : finalize_ret;
+  }
+  
+ -static int bundle_destroy(struct bundle_priv *pbundle, bool commit)
+ +#define UVERBS_OPTIMIZE_USING_STACK_SZ  256
+ +static long ib_uverbs_cmd_verbs(struct ib_device *ib_dev,
+ +				struct ib_uverbs_file *file,
+ +				struct ib_uverbs_ioctl_hdr *hdr,
+ +				void __user *buf)
+  {
+ -	unsigned int key_bitmap_len = pbundle->method_elm->key_bitmap_len;
+ -	struct bundle_alloc_head *memblock;
+ +	const struct uverbs_object_spec *object_spec;
+ +	const struct uverbs_method_spec *method_spec;
+ +	long err = 0;
+  	unsigned int i;
+ -	int ret = 0;
+ -
+ -	/* fast path for simple uobjects */
+ -	i = -1;
+ -	while ((i = find_next_bit(pbundle->uobj_finalize, key_bitmap_len,
+ -				  i + 1)) < key_bitmap_len) {
+ -		struct uverbs_attr *attr = &pbundle->bundle.attrs[i];
+ -		int current_ret;
+ -
+ -		current_ret = uverbs_finalize_object(
+ -			attr->obj_attr.uobject,
+ -			attr->obj_attr.attr_elm->spec.u.obj.access, commit);
+ -		if (!ret)
+ -			ret = current_ret;
+ -	}
+ +	struct {
+ +		struct ib_uverbs_attr		*uattrs;
+ +		struct uverbs_attr_bundle	*uverbs_attr_bundle;
+ +	} *ctx = NULL;
+ +	struct uverbs_attr *curr_attr;
+ +	unsigned long *curr_bitmap;
+ +	size_t ctx_size;
+ +	uintptr_t data[UVERBS_OPTIMIZE_USING_STACK_SZ / sizeof(uintptr_t)];
+ +
+ +	if (hdr->driver_id != ib_dev->driver_id)
+ +		return -EINVAL;
+  
+ -	i = -1;
+ -	while ((i = find_next_bit(pbundle->spec_finalize, key_bitmap_len,
+ -				  i + 1)) < key_bitmap_len) {
+ -		struct uverbs_attr *attr = &pbundle->bundle.attrs[i];
+ -		const struct uverbs_api_attr *attr_uapi;
+ -		void __rcu **slot;
+ -		int current_ret;
+ -
+ -		slot = uapi_get_attr_for_method(
+ -			pbundle,
+ -			pbundle->method_key | uapi_bkey_to_key_attr(i));
+ -		if (WARN_ON(!slot))
+ -			continue;
+ +	object_spec = uverbs_get_object(ib_dev, hdr->object_id);
+ +	if (!object_spec)
+ +		return -EPROTONOSUPPORT;
+  
+ -		attr_uapi = rcu_dereference_protected(*slot, true);
+ +	method_spec = uverbs_get_method(object_spec, hdr->method_id);
+ +	if (!method_spec)
+ +		return -EPROTONOSUPPORT;
+  
+ -		if (attr_uapi->spec.type == UVERBS_ATTR_TYPE_IDRS_ARRAY) {
+ -			current_ret = uverbs_free_idrs_array(
+ -				attr_uapi, &attr->objs_arr_attr, commit);
+ -			if (!ret)
+ -				ret = current_ret;
+ -		}
+ -	}
+ +	if ((method_spec->flags & UVERBS_ACTION_FLAG_CREATE_ROOT) ^ !file->ucontext)
+ +		return -EINVAL;
+  
+ -	for (memblock = pbundle->allocated_mem; memblock;) {
+ -		struct bundle_alloc_head *tmp = memblock;
+ +	ctx_size = sizeof(*ctx) +
+ +		   sizeof(struct uverbs_attr_bundle) +
+ +		   sizeof(struct uverbs_attr_bundle_hash) * method_spec->num_buckets +
+ +		   sizeof(*ctx->uattrs) * hdr->num_attrs +
+ +		   sizeof(*ctx->uverbs_attr_bundle->hash[0].attrs) *
+ +		   method_spec->num_child_attrs +
+ +		   sizeof(*ctx->uverbs_attr_bundle->hash[0].valid_bitmap) *
+ +			(method_spec->num_child_attrs / BITS_PER_LONG +
+ +			 method_spec->num_buckets);
+ +
+ +	if (ctx_size <= UVERBS_OPTIMIZE_USING_STACK_SZ)
+ +		ctx = (void *)data;
+ +	if (!ctx)
+ +		ctx = kmalloc(ctx_size, GFP_KERNEL);
+ +	if (!ctx)
+ +		return -ENOMEM;
+ +
+ +	ctx->uverbs_attr_bundle = (void *)ctx + sizeof(*ctx);
+ +	ctx->uattrs = (void *)(ctx->uverbs_attr_bundle + 1) +
+ +			      (sizeof(ctx->uverbs_attr_bundle->hash[0]) *
+ +			       method_spec->num_buckets);
+ +	curr_attr = (void *)(ctx->uattrs + hdr->num_attrs);
+ +	curr_bitmap = (void *)(curr_attr + method_spec->num_child_attrs);
+  
+ -		memblock = memblock->next;
+ -		kvfree(tmp);
+ -	}
+ +	/*
+ +	 * We just fill the pointers and num_attrs here. The data itself will be
+ +	 * filled at a later stage (uverbs_process_attr)
+ +	 */
+ +	for (i = 0; i < method_spec->num_buckets; i++) {
+ +		unsigned int curr_num_attrs;
+  
+ -	return ret;
+ -}
+ +		if (!method_spec->attr_buckets[i])
+ +			continue;
+  
+ -static int ib_uverbs_cmd_verbs(struct ib_uverbs_file *ufile,
+ -			       struct ib_uverbs_ioctl_hdr *hdr,
+ -			       struct ib_uverbs_attr __user *user_attrs)
+ -{
+ -	const struct uverbs_api_ioctl_method *method_elm;
+ -	struct uverbs_api *uapi = ufile->device->uapi;
+ -	struct radix_tree_iter attrs_iter;
+ -	struct bundle_priv *pbundle;
+ -	struct bundle_priv onstack;
+ -	void __rcu **slot;
+ -	int destroy_ret;
+ -	int ret;
+ +		curr_num_attrs = method_spec->attr_buckets[i]->num_attrs;
+  
+ -	if (unlikely(hdr->driver_id != uapi->driver_id))
+ -		return -EINVAL;
+ +		ctx->uverbs_attr_bundle->hash[i].attrs = curr_attr;
+ +		curr_attr += curr_num_attrs;
+ +		ctx->uverbs_attr_bundle->hash[i].num_attrs = curr_num_attrs;
+ +		ctx->uverbs_attr_bundle->hash[i].valid_bitmap = curr_bitmap;
+ +		bitmap_zero(curr_bitmap, curr_num_attrs);
+ +		curr_bitmap += BITS_TO_LONGS(curr_num_attrs);
+ +	}
+  
+ -	slot = radix_tree_iter_lookup(
+ -		&uapi->radix, &attrs_iter,
+ -		uapi_key_obj(hdr->object_id) |
+ -			uapi_key_ioctl_method(hdr->method_id));
+ -	if (unlikely(!slot))
+ -		return -EPROTONOSUPPORT;
+ -	method_elm = rcu_dereference_protected(*slot, true);
+ -
+ -	if (!method_elm->use_stack) {
+ -		pbundle = kmalloc(method_elm->bundle_size, GFP_KERNEL);
+ -		if (!pbundle)
+ -			return -ENOMEM;
+ -		pbundle->internal_avail =
+ -			method_elm->bundle_size -
+ -			offsetof(struct bundle_priv, internal_buffer);
+ -		pbundle->alloc_head.next = NULL;
+ -		pbundle->allocated_mem = &pbundle->alloc_head;
+ -	} else {
+ -		pbundle = &onstack;
+ -		pbundle->internal_avail = sizeof(pbundle->internal_buffer);
+ -		pbundle->allocated_mem = NULL;
+ +	err = copy_from_user(ctx->uattrs, buf,
+ +			     sizeof(*ctx->uattrs) * hdr->num_attrs);
+ +	if (err) {
+ +		err = -EFAULT;
+ +		goto out;
+  	}
+  
+ -	/* Space for the pbundle->bundle.attrs flex array */
+ -	pbundle->method_elm = method_elm;
+ -	pbundle->method_key = attrs_iter.index;
+ -	pbundle->bundle.ufile = ufile;
+ -	pbundle->radix = &uapi->radix;
+ -	pbundle->radix_slots = slot;
+ -	pbundle->radix_slots_len = radix_tree_chunk_size(&attrs_iter);
+ -	pbundle->user_attrs = user_attrs;
+ -
+ -	pbundle->internal_used = ALIGN(pbundle->method_elm->key_bitmap_len *
+ -					       sizeof(*pbundle->bundle.attrs),
+ -				       sizeof(*pbundle->internal_buffer));
+ -	memset(pbundle->bundle.attr_present, 0,
+ -	       sizeof(pbundle->bundle.attr_present));
+ -	memset(pbundle->uobj_finalize, 0, sizeof(pbundle->uobj_finalize));
+ -	memset(pbundle->spec_finalize, 0, sizeof(pbundle->spec_finalize));
+ -
+ -	ret = ib_uverbs_run_method(pbundle, hdr->num_attrs);
+ -	destroy_ret = bundle_destroy(pbundle, ret == 0);
+ -	if (unlikely(destroy_ret && !ret))
+ -		return destroy_ret;
+ +	err = uverbs_handle_method(buf, ctx->uattrs, hdr->num_attrs, ib_dev,
+ +				   file, method_spec, ctx->uverbs_attr_bundle);
+  
+ -	return ret;
+ +	/*
+ +	 * EPROTONOSUPPORT is ONLY to be returned if the ioctl framework can
+ +	 * not invoke the method because the request is not supported.  No
+ +	 * other cases should return this code.
+ +	*/
+ +	if (unlikely(err == -EPROTONOSUPPORT)) {
+ +		WARN_ON_ONCE(err == -EPROTONOSUPPORT);
+ +		err = -EINVAL;
+ +	}
+ +out:
+ +	if (ctx != (void *)data)
+ +		kfree(ctx);
+ +	return err;
+  }
+  
+ +#define IB_UVERBS_MAX_CMD_SZ 4096
+ +
+  long ib_uverbs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+  {
+  	struct ib_uverbs_file *file = filp->private_data;
+  	struct ib_uverbs_ioctl_hdr __user *user_hdr =
+  		(struct ib_uverbs_ioctl_hdr __user *)arg;
+  	struct ib_uverbs_ioctl_hdr hdr;
+ +	struct ib_device *ib_dev;
+  	int srcu_key;
+ -	int err;
+ +	long err;
+  
+ -	if (unlikely(cmd != RDMA_VERBS_IOCTL))
+ -		return -ENOIOCTLCMD;
+ +	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ +	ib_dev = srcu_dereference(file->device->ib_dev,
+ +				  &file->device->disassociate_srcu);
+ +	if (!ib_dev) {
+ +		err = -EIO;
+ +		goto out;
+ +	}
+  
+ -	err = copy_from_user(&hdr, user_hdr, sizeof(hdr));
+ -	if (err)
+ -		return -EFAULT;
+ +	if (cmd == RDMA_VERBS_IOCTL) {
+ +		err = copy_from_user(&hdr, user_hdr, sizeof(hdr));
+  
+ -	if (hdr.length > PAGE_SIZE ||
+ -	    hdr.length != struct_size(&hdr, attrs, hdr.num_attrs))
+ -		return -EINVAL;
+ +		if (err || hdr.length > IB_UVERBS_MAX_CMD_SZ ||
+ +		    hdr.length != sizeof(hdr) + hdr.num_attrs * sizeof(struct ib_uverbs_attr)) {
+ +			err = -EINVAL;
+ +			goto out;
+ +		}
+  
+ -	if (hdr.reserved1 || hdr.reserved2)
+ -		return -EPROTONOSUPPORT;
+ +		if (hdr.reserved1 || hdr.reserved2) {
+ +			err = -EPROTONOSUPPORT;
+ +			goto out;
+ +		}
+  
+ -	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ -	err = ib_uverbs_cmd_verbs(file, &hdr, user_hdr->attrs);
+ +		err = ib_uverbs_cmd_verbs(ib_dev, file, &hdr,
+ +					  (__user void *)arg + sizeof(hdr));
+ +	} else {
+ +		err = -ENOIOCTLCMD;
+ +	}
+ +out:
+  	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+ +
+  	return err;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	const struct uverbs_attr *attr;
++ 	u64 flags;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	/* Missing attribute means 0 flags */
++ 	if (IS_ERR(attr)) {
++ 		*to = 0;
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * New userspace code should use 8 bytes to pass flags, but we
++ 	 * transparently support old userspaces that were using 4 bytes as
++ 	 * well.
++ 	 */
++ 	if (attr->ptr_attr.len == 8)
++ 		flags = attr->ptr_attr.data;
++ 	else if (attr->ptr_attr.len == 4)
++ 		flags = *(u32 *)&attr->ptr_attr.data;
++ 	else
++ 		return -EINVAL;
++ 
++ 	if (flags & ~allowed_bits)
++ 		return -EINVAL;
++ 
++ 	*to = flags;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags64);
++ 
++ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	u64 flags;
++ 	int ret;
++ 
++ 	ret = uverbs_get_flags64(&flags, attrs_bundle, idx, allowed_bits);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (flags > U32_MAX)
++ 		return -EINVAL;
++ 	*to = flags;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags32);
++ 
++ /*
++  * Fill a ib_udata struct (core or uhw) using the given attribute IDs.
++  * This is primarily used to convert the UVERBS_ATTR_UHW() into the
++  * ib_udata format used by the drivers.
++  */
++ void uverbs_fill_udata(struct uverbs_attr_bundle *bundle,
++ 		       struct ib_udata *udata, unsigned int attr_in,
++ 		       unsigned int attr_out)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	const struct uverbs_attr *in =
++ 		uverbs_attr_get(&pbundle->bundle, attr_in);
++ 	const struct uverbs_attr *out =
++ 		uverbs_attr_get(&pbundle->bundle, attr_out);
++ 
++ 	if (!IS_ERR(in)) {
++ 		udata->inlen = in->ptr_attr.len;
++ 		if (uverbs_attr_ptr_is_inline(in))
++ 			udata->inbuf =
++ 				&pbundle->user_attrs[in->ptr_attr.uattr_idx]
++ 					 .data;
++ 		else
++ 			udata->inbuf = u64_to_user_ptr(in->ptr_attr.data);
++ 	} else {
++ 		udata->inbuf = NULL;
++ 		udata->inlen = 0;
++ 	}
++ 
++ 	if (!IS_ERR(out)) {
++ 		udata->outbuf = u64_to_user_ptr(out->ptr_attr.data);
++ 		udata->outlen = out->ptr_attr.len;
++ 	} else {
++ 		udata->outbuf = NULL;
++ 		udata->outlen = 0;
++ 	}
++ }
++ 
++ int uverbs_copy_to(const struct uverbs_attr_bundle *bundle, size_t idx,
++ 		   const void *from, size_t size)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	const struct uverbs_attr *attr = uverbs_attr_get(bundle, idx);
++ 	u16 flags;
++ 	size_t min_size;
++ 
++ 	if (IS_ERR(attr))
++ 		return PTR_ERR(attr);
++ 
++ 	min_size = min_t(size_t, attr->ptr_attr.len, size);
++ 	if (copy_to_user(u64_to_user_ptr(attr->ptr_attr.data), from, min_size))
++ 		return -EFAULT;
++ 
++ 	flags = pbundle->uattrs[attr->ptr_attr.uattr_idx].flags |
++ 		UVERBS_ATTR_F_VALID_OUTPUT;
++ 	if (put_user(flags,
++ 		     &pbundle->user_attrs[attr->ptr_attr.uattr_idx].flags))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_copy_to);
++ 
++ int _uverbs_get_const(s64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		      size_t idx, s64 lower_bound, u64 upper_bound,
++ 		      s64  *def_val)
++ {
++ 	const struct uverbs_attr *attr;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	if (IS_ERR(attr)) {
++ 		if ((PTR_ERR(attr) != -ENOENT) || !def_val)
++ 			return PTR_ERR(attr);
++ 
++ 		*to = *def_val;
++ 	} else {
++ 		*to = attr->ptr_attr.data;
++ 	}
++ 
++ 	if (*to < lower_bound || (*to > 0 && (u64)*to > upper_bound))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(_uverbs_get_const);
+++>>>>>>> 4785860e04bc (RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers)
+diff --cc drivers/infiniband/core/uverbs_std_types.c
+index 06085446ffc0,e3df1e342e2f..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@@ -204,113 -214,72 +204,140 @@@ int uverbs_destroy_def_handler(struct i
+  {
+  	return 0;
+  }
+ -EXPORT_SYMBOL(uverbs_destroy_def_handler);
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_COMP_CHANNEL,
+ -	UVERBS_TYPE_ALLOC_FD(sizeof(struct ib_uverbs_completion_event_file),
+ -			     uverbs_hot_unplug_completion_event_file,
+ -			     &uverbs_event_fops,
+ -			     "[infinibandevent]",
+ -			     O_RDONLY));
+ +/*
+ + * This spec is used in order to pass information to the hardware driver in a
+ + * legacy way. Every verb that could get driver specific data should get this
+ + * spec.
+ + */
+ +const struct uverbs_attr_def uverbs_uhw_compat_in =
+ +	UVERBS_ATTR_PTR_IN_SZ(UVERBS_ATTR_UHW_IN, UVERBS_ATTR_MIN_SIZE(0),
+ +			      UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
+ +const struct uverbs_attr_def uverbs_uhw_compat_out =
+ +	UVERBS_ATTR_PTR_OUT_SZ(UVERBS_ATTR_UHW_OUT, UVERBS_ATTR_MIN_SIZE(0),
+ +			       UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
+ +
+ +void create_udata(struct uverbs_attr_bundle *ctx, struct ib_udata *udata)
+ +{
+ +	/*
+ +	 * This is for ease of conversion. The purpose is to convert all drivers
+ +	 * to use uverbs_attr_bundle instead of ib_udata.
+ +	 * Assume attr == 0 is input and attr == 1 is output.
+ +	 */
+ +	const struct uverbs_attr *uhw_in =
+ +		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_IN);
+ +	const struct uverbs_attr *uhw_out =
+ +		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_OUT);
+ +
+ +	if (!IS_ERR(uhw_in)) {
+ +		udata->inlen = uhw_in->ptr_attr.len;
+ +		if (uverbs_attr_ptr_is_inline(uhw_in))
+ +			udata->inbuf = &uhw_in->uattr->data;
+ +		else
+ +			udata->inbuf = u64_to_user_ptr(uhw_in->ptr_attr.data);
+ +	} else {
+ +		udata->inbuf = NULL;
+ +		udata->inlen = 0;
+ +	}
+ +
+ +	if (!IS_ERR(uhw_out)) {
+ +		udata->outbuf = u64_to_user_ptr(uhw_out->ptr_attr.data);
+ +		udata->outlen = uhw_out->ptr_attr.len;
+ +	} else {
+ +		udata->outbuf = NULL;
+ +		udata->outlen = 0;
+ +	}
+ +}
+ +
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_COMP_CHANNEL,
+ +			    &UVERBS_TYPE_ALLOC_FD(0,
+ +						  sizeof(struct ib_uverbs_completion_event_file),
+ +						  uverbs_hot_unplug_completion_event_file,
+ +						  &uverbs_event_fops,
+ +						  "[infinibandevent]", O_RDONLY));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_QP,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object), uverbs_free_qp));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_QP,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object), 0,
+ +						      uverbs_free_qp));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_MW,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_mw));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_mw));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_SRQ,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object),
+ -				 uverbs_free_srq));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_SRQ,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object), 0,
+ +						      uverbs_free_srq));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_AH,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_ah));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_ah));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_FLOW,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
+ -				 uverbs_free_flow));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_FLOW,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
+ +						      0, uverbs_free_flow));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_WQ,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), uverbs_free_wq));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_WQ,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), 0,
+ +						      uverbs_free_wq));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_rwq_ind_tbl));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_rwq_ind_tbl));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_XRCD,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object),
+ -				 uverbs_free_xrcd));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_XRCD,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object), 0,
+ +						      uverbs_free_xrcd));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_PD,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_pd));
+ -
+ +			    /* 2 is used in order to free the PD after MRs */
+ +			    &UVERBS_TYPE_ALLOC_IDR(2, uverbs_free_pd));
+ +
+++<<<<<<< HEAD
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_DEVICE, NULL);
+ +
+ +static DECLARE_UVERBS_OBJECT_TREE(uverbs_default_objects,
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_DEVICE),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_PD),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_MR),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_COMP_CHANNEL),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_CQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_QP),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_AH),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_MW),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_SRQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_FLOW),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_WQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_XRCD),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_FLOW_ACTION),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_DM),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_COUNTERS));
+ +
+ +const struct uverbs_object_tree_def *uverbs_default_get_objects(void)
+ +{
+ +	return &uverbs_default_objects;
+ +}
+ +EXPORT_SYMBOL_GPL(uverbs_default_get_objects);
+++=======
++ const struct uapi_definition uverbs_def_obj_intf[] = {
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_PD,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_pd)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_COMP_CHANNEL,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_pd)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_QP,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_qp)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_AH,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_ah)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_MW,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_mw)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_SRQ,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_srq)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_FLOW,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_flow)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_WQ,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(destroy_wq)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(
++ 		UVERBS_OBJECT_RWQ_IND_TBL,
++ 		UAPI_DEF_OBJ_NEEDS_FN(destroy_rwq_ind_table)),
++ 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_XRCD,
++ 				      UAPI_DEF_OBJ_NEEDS_FN(dealloc_xrcd)),
++ 	{}
++ };
+++>>>>>>> 4785860e04bc (RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers)
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+* Unmerged path drivers/infiniband/core/Makefile
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs.h
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types.c
+diff --git a/drivers/infiniband/core/uverbs_std_types_device.c b/drivers/infiniband/core/uverbs_std_types_device.c
+new file mode 100644
+index 000000000000..aafb251b7d37
+--- /dev/null
++++ b/drivers/infiniband/core/uverbs_std_types_device.c
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/*
++ * Copyright (c) 2018, Mellanox Technologies inc.  All rights reserved.
++ */
++
++#include <rdma/uverbs_std_types.h>
++#include "rdma_core.h"
++#include "uverbs.h"
++
++/*
++ * This ioctl method allows calling any defined write or write_ex
++ * handler. This essentially replaces the hdr/ex_hdr system with the ioctl
++ * marshalling, and brings the non-ex path into the same marshalling as the ex
++ * path.
++ */
++static int UVERBS_HANDLER(UVERBS_METHOD_INVOKE_WRITE)(
++	struct uverbs_attr_bundle *attrs)
++{
++	struct uverbs_api *uapi = attrs->ufile->device->uapi;
++	const struct uverbs_api_write_method *method_elm;
++	u32 cmd;
++	int rc;
++
++	rc = uverbs_get_const(&cmd, attrs, UVERBS_ATTR_WRITE_CMD);
++	if (rc)
++		return rc;
++
++	method_elm = uapi_get_method(uapi, cmd);
++	if (IS_ERR(method_elm))
++		return PTR_ERR(method_elm);
++
++	uverbs_fill_udata(attrs, &attrs->ucore, UVERBS_ATTR_CORE_IN,
++			  UVERBS_ATTR_CORE_OUT);
++
++	if (attrs->ucore.inlen < method_elm->req_size ||
++	    attrs->ucore.outlen < method_elm->resp_size)
++		return -ENOSPC;
++
++	return method_elm->handler(attrs);
++}
++
++DECLARE_UVERBS_NAMED_METHOD(UVERBS_METHOD_INVOKE_WRITE,
++			    UVERBS_ATTR_CONST_IN(UVERBS_ATTR_WRITE_CMD,
++						 enum ib_uverbs_write_cmds,
++						 UA_MANDATORY),
++			    UVERBS_ATTR_PTR_IN(UVERBS_ATTR_CORE_IN,
++					       UVERBS_ATTR_MIN_SIZE(sizeof(u32)),
++					       UA_OPTIONAL),
++			    UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_CORE_OUT,
++						UVERBS_ATTR_MIN_SIZE(0),
++						UA_OPTIONAL),
++			    UVERBS_ATTR_UHW());
++
++DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_DEVICE,
++			      &UVERBS_METHOD(UVERBS_METHOD_INVOKE_WRITE));
++
++const struct uapi_definition uverbs_def_obj_device[] = {
++	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_DEVICE),
++	{},
++};
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+diff --git a/include/uapi/rdma/ib_user_ioctl_cmds.h b/include/uapi/rdma/ib_user_ioctl_cmds.h
+index 2c881aaf05c2..34e71994f4a5 100644
+--- a/include/uapi/rdma/ib_user_ioctl_cmds.h
++++ b/include/uapi/rdma/ib_user_ioctl_cmds.h
+@@ -63,6 +63,16 @@ enum {
+ 	UVERBS_ATTR_UHW_OUT,
+ };
+ 
++enum uverbs_methods_device {
++	UVERBS_METHOD_INVOKE_WRITE,
++};
++
++enum uverbs_attrs_invoke_write_cmd_attr_ids {
++	UVERBS_ATTR_CORE_IN,
++	UVERBS_ATTR_CORE_OUT,
++	UVERBS_ATTR_WRITE_CMD,
++};
++
+ enum uverbs_attrs_create_cq_cmd_attr_ids {
+ 	UVERBS_ATTR_CREATE_CQ_HANDLE,
+ 	UVERBS_ATTR_CREATE_CQ_CQE,
+diff --git a/include/uapi/rdma/ib_user_verbs.h b/include/uapi/rdma/ib_user_verbs.h
+index c586fc43739c..480d9a60b68e 100644
+--- a/include/uapi/rdma/ib_user_verbs.h
++++ b/include/uapi/rdma/ib_user_verbs.h
+@@ -46,7 +46,7 @@
+ #define IB_USER_VERBS_ABI_VERSION	6
+ #define IB_USER_VERBS_CMD_THRESHOLD    50
+ 
+-enum {
++enum ib_uverbs_write_cmds {
+ 	IB_USER_VERBS_CMD_GET_CONTEXT,
+ 	IB_USER_VERBS_CMD_QUERY_DEVICE,
+ 	IB_USER_VERBS_CMD_QUERY_PORT,
