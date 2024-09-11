@@ -1,0 +1,122 @@
+Revert "mm: use early_pfn_to_nid in page_ext_init"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Qian Cai <cai@lca.pw>
+commit 2f1ee0913ce58efe7f18fbd518bd54c598559b89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/2f1ee091.failed
+
+This reverts commit fe53ca54270a ("mm: use early_pfn_to_nid in
+page_ext_init").
+
+When booting a system with "page_owner=on",
+
+start_kernel
+  page_ext_init
+    invoke_init_callbacks
+      init_section_page_ext
+        init_page_owner
+          init_early_allocated_pages
+            init_zones_in_node
+              init_pages_in_zone
+                lookup_page_ext
+                  page_to_nid
+
+The issue here is that page_to_nid() will not work since some page flags
+have no node information until later in page_alloc_init_late() due to
+DEFERRED_STRUCT_PAGE_INIT.  Hence, it could trigger an out-of-bounds
+access with an invalid nid.
+
+  UBSAN: Undefined behaviour in ./include/linux/mm.h:1104:50
+  index 7 is out of range for type 'zone [5]'
+
+Also, kernel will panic since flags were poisoned earlier with,
+
+CONFIG_DEBUG_VM_PGFLAGS=y
+CONFIG_NODE_NOT_IN_PAGE_FLAGS=n
+
+start_kernel
+  setup_arch
+    pagetable_init
+      paging_init
+        sparse_init
+          sparse_init_nid
+            memblock_alloc_try_nid_raw
+
+It did not handle it well in init_pages_in_zone() which ends up calling
+page_to_nid().
+
+  page:ffffea0004200000 is uninitialized and poisoned
+  raw: ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff
+  raw: ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff
+  page dumped because: VM_BUG_ON_PAGE(PagePoisoned(p))
+  page_owner info is not active (free page?)
+  kernel BUG at include/linux/mm.h:990!
+  RIP: 0010:init_page_owner+0x486/0x520
+
+This means that assumptions behind commit fe53ca54270a ("mm: use
+early_pfn_to_nid in page_ext_init") are incomplete.  Therefore, revert
+the commit for now.  A proper way to move the page_owner initialization
+to sooner is to hook into memmap initialization.
+
+Link: http://lkml.kernel.org/r/20190115202812.75820-1-cai@lca.pw
+	Signed-off-by: Qian Cai <cai@lca.pw>
+	Acked-by: Michal Hocko <mhocko@kernel.org>
+	Cc: Pasha Tatashin <Pavel.Tatashin@microsoft.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Yang Shi <yang.shi@linaro.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2f1ee0913ce58efe7f18fbd518bd54c598559b89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	init/main.c
+diff --cc init/main.c
+index 4f2854d0c203,c86a1c8f19f4..000000000000
+--- a/init/main.c
++++ b/init/main.c
+@@@ -711,8 -695,7 +711,12 @@@ asmlinkage __visible void __init start_
+  		initrd_start = 0;
+  	}
+  #endif
+++<<<<<<< HEAD
+ +	page_ext_init();
+ +	debug_objects_mem_init();
+++=======
++ 	kmemleak_init();
+++>>>>>>> 2f1ee0913ce5 (Revert "mm: use early_pfn_to_nid in page_ext_init")
+  	setup_per_cpu_pageset();
+  	numa_policy_init();
+  	acpi_early_init();
+@@@ -1165,8 -1129,9 +1169,10 @@@ static noinline void __init kernel_init
+  	smp_init();
+  	sched_init_smp();
+  
+ +	padata_init();
+  	page_alloc_init_late();
++ 	/* Initialize page ext after all struct pages are initialized. */
++ 	page_ext_init();
+  
+  	do_basic_setup();
+  
+* Unmerged path init/main.c
+diff --git a/mm/page_ext.c b/mm/page_ext.c
+index e93274f35239..56d2f1c1ce4f 100644
+--- a/mm/page_ext.c
++++ b/mm/page_ext.c
+@@ -388,10 +388,8 @@ void __init page_ext_init(void)
+ 			 * We know some arch can have a nodes layout such as
+ 			 * -------------pfn-------------->
+ 			 * N0 | N1 | N2 | N0 | N1 | N2|....
+-			 *
+-			 * Take into account DEFERRED_STRUCT_PAGE_INIT.
+ 			 */
+-			if (early_pfn_to_nid(pfn) != nid)
++			if (pfn_to_nid(pfn) != nid)
+ 				continue;
+ 			if (init_section_page_ext(pfn, nid))
+ 				goto oom;
