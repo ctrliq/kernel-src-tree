@@ -1,0 +1,125 @@
+KVM: x86: Fold CPUID 0x7 masking back into __do_cpuid_func()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 09f628a0b49cf489faada00254569813a2143894
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/09f628a0.failed
+
+Move the CPUID 0x7 masking back into __do_cpuid_func() now that the
+size of the code has been trimmed down significantly.
+
+Tweak the WARN case, which is impossible to hit unless the CPU is
+completely broken, to break the loop before creating the bogus entry.
+
+Opportunustically reorder the cpuid_entry_set() calls and shorten the
+comment about emulation to further reduce the footprint of CPUID 0x7.
+
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 09f628a0b49cf489faada00254569813a2143894)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.c
+diff --cc arch/x86/kvm/cpuid.c
+index d4472786ed92,f6d3121656cc..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -366,89 -459,6 +366,92 @@@ static int __do_cpuid_func_emulated(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void do_cpuid_7_mask(struct kvm_cpuid_entry2 *entry)
+ +{
+ +	unsigned f_invpcid = kvm_x86_ops->invpcid_supported() ? F(INVPCID) : 0;
+ +	unsigned f_mpx = kvm_mpx_supported() ? F(MPX) : 0;
+ +	unsigned f_umip = kvm_x86_ops->umip_emulated() ? F(UMIP) : 0;
+ +	unsigned f_intel_pt = kvm_x86_ops->pt_supported() ? F(INTEL_PT) : 0;
+ +	unsigned f_la57;
+ +	unsigned f_pku = kvm_x86_ops->pku_supported() ? F(PKU) : 0;
+ +
+ +	/* cpuid 7.0.ebx */
+ +	const u32 kvm_cpuid_7_0_ebx_x86_features =
+ +		F(FSGSBASE) | F(BMI1) | F(HLE) | F(AVX2) | F(SMEP) |
+ +		F(BMI2) | F(ERMS) | f_invpcid | F(RTM) | f_mpx | F(RDSEED) |
+ +		F(ADX) | F(SMAP) | F(AVX512IFMA) | F(AVX512F) | F(AVX512PF) |
+ +		F(AVX512ER) | F(AVX512CD) | F(CLFLUSHOPT) | F(CLWB) | F(AVX512DQ) |
+ +		F(SHA_NI) | F(AVX512BW) | F(AVX512VL) | f_intel_pt;
+ +
+ +	/* cpuid 7.0.ecx*/
+ +	const u32 kvm_cpuid_7_0_ecx_x86_features =
+ +		F(AVX512VBMI) | F(LA57) | 0 /*PKU*/ | 0 /*OSPKE*/ |
+ +		F(AVX512_VPOPCNTDQ) | F(UMIP) | F(AVX512_VBMI2) | F(GFNI) |
+ +		F(VAES) | F(VPCLMULQDQ) | F(AVX512_VNNI) | F(AVX512_BITALG) |
+ +		F(CLDEMOTE) | F(MOVDIRI) | F(MOVDIR64B) | 0 /*WAITPKG*/;
+ +
+ +	/* cpuid 7.0.edx*/
+ +	const u32 kvm_cpuid_7_0_edx_x86_features =
+ +		F(AVX512_4VNNIW) | F(AVX512_4FMAPS) | F(SPEC_CTRL) |
+ +		F(SPEC_CTRL_SSBD) | F(ARCH_CAPABILITIES) | F(INTEL_STIBP) |
+ +		F(MD_CLEAR);
+ +
+ +	/* cpuid 7.1.eax */
+ +	const u32 kvm_cpuid_7_1_eax_x86_features =
+ +		F(AVX512_BF16);
+ +
+ +	switch (entry->index) {
+ +	case 0:
+ +		entry->eax = min(entry->eax, 1u);
+ +		entry->ebx &= kvm_cpuid_7_0_ebx_x86_features;
+ +		cpuid_mask(&entry->ebx, CPUID_7_0_EBX);
+ +		/* TSC_ADJUST is emulated */
+ +		entry->ebx |= F(TSC_ADJUST);
+ +
+ +		entry->ecx &= kvm_cpuid_7_0_ecx_x86_features;
+ +		f_la57 = cpuid_entry_get(entry, X86_FEATURE_LA57);
+ +		cpuid_mask(&entry->ecx, CPUID_7_ECX);
+ +		/* Set LA57 based on hardware capability. */
+ +		entry->ecx |= f_la57;
+ +		entry->ecx |= f_umip;
+ +		entry->ecx |= f_pku;
+ +		/* PKU is not yet implemented for shadow paging. */
+ +		if (!tdp_enabled || !boot_cpu_has(X86_FEATURE_OSPKE))
+ +			entry->ecx &= ~F(PKU);
+ +
+ +		entry->edx &= kvm_cpuid_7_0_edx_x86_features;
+ +		cpuid_mask(&entry->edx, CPUID_7_EDX);
+ +		if (boot_cpu_has(X86_FEATURE_IBPB) && boot_cpu_has(X86_FEATURE_IBRS))
+ +			entry->edx |= F(SPEC_CTRL);
+ +		if (boot_cpu_has(X86_FEATURE_STIBP))
+ +			entry->edx |= F(INTEL_STIBP);
+ +		if (boot_cpu_has(X86_FEATURE_AMD_SSBD))
+ +			entry->edx |= F(SPEC_CTRL_SSBD);
+ +		/*
+ +		 * We emulate ARCH_CAPABILITIES in software even
+ +		 * if the host doesn't support it.
+ +		 */
+ +		entry->edx |= F(ARCH_CAPABILITIES);
+ +		break;
+ +	case 1:
+ +		entry->eax &= kvm_cpuid_7_1_eax_x86_features;
+ +		entry->ebx = 0;
+ +		entry->ecx = 0;
+ +		entry->edx = 0;
+ +		break;
+ +	default:
+ +		WARN_ON_ONCE(1);
+ +		entry->eax = 0;
+ +		entry->ebx = 0;
+ +		entry->ecx = 0;
+ +		entry->edx = 0;
+ +		break;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 09f628a0b49c (KVM: x86: Fold CPUID 0x7 masking back into __do_cpuid_func())
+  static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+  {
+  	struct kvm_cpuid_entry2 *entry;
+* Unmerged path arch/x86/kvm/cpuid.c
