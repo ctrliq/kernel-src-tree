@@ -1,0 +1,262 @@
+selftests/net: add txring_overwrite
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Willem de Bruijn <willemb@google.com>
+commit 358be656406dce296fafeac7a913ba33e9a66971
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/358be656.failed
+
+Packet sockets with PACKET_TX_RING send skbs with user data in frags.
+
+Before commit 5cd8d46ea156 ("packet: copy user buffers before orphan
+or clone") ring slots could be released prematurely, possibly allowing
+a process to overwrite data still in flight.
+
+This test opens two packet sockets, one to send and one to read.
+The sender has a tx ring of one slot. It sends two packets with
+different payload, then reads both and verifies their payload.
+
+Before the above commit, both receive calls return the same data as
+the send calls use the same buffer. From the commit, the clone
+needed for looping onto a packet socket triggers an skb_copy_ubufs
+to create a private copy. The separate sends each arrive correctly.
+
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 358be656406dce296fafeac7a913ba33e9a66971)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/net/.gitignore
+diff --cc tools/testing/selftests/net/.gitignore
+index 78b24cf76f40,7f57b916e6b2..000000000000
+--- a/tools/testing/selftests/net/.gitignore
++++ b/tools/testing/selftests/net/.gitignore
+@@@ -14,3 -14,5 +14,8 @@@ udpgso_bench_r
+  udpgso_bench_tx
+  tcp_inq
+  tls
+++<<<<<<< HEAD
+++=======
++ txring_overwrite
++ ip_defrag
+++>>>>>>> 358be656406d (selftests/net: add txring_overwrite)
+* Unmerged path tools/testing/selftests/net/.gitignore
+diff --git a/tools/testing/selftests/net/Makefile b/tools/testing/selftests/net/Makefile
+index 56950087cb06..c2b0c1037666 100644
+--- a/tools/testing/selftests/net/Makefile
++++ b/tools/testing/selftests/net/Makefile
+@@ -12,7 +12,7 @@ TEST_PROGS += test_vxlan_fdb_changelink.sh
+ TEST_PROGS_EXTENDED := in_netns.sh
+ TEST_GEN_FILES =  socket
+ TEST_GEN_FILES += psock_fanout psock_tpacket msg_zerocopy
+-TEST_GEN_FILES += tcp_mmap tcp_inq psock_snd
++TEST_GEN_FILES += tcp_mmap tcp_inq psock_snd txring_overwrite
+ TEST_GEN_FILES += udpgso udpgso_bench_tx udpgso_bench_rx ip_defrag
+ TEST_GEN_PROGS = reuseport_bpf reuseport_bpf_cpu reuseport_bpf_numa
+ TEST_GEN_PROGS += reuseport_dualstack reuseaddr_conflict tls
+diff --git a/tools/testing/selftests/net/run_afpackettests b/tools/testing/selftests/net/run_afpackettests
+index bea079edc278..2dc95fda7ef7 100755
+--- a/tools/testing/selftests/net/run_afpackettests
++++ b/tools/testing/selftests/net/run_afpackettests
+@@ -25,3 +25,13 @@ if [ $? -ne 0 ]; then
+ else
+ 	echo "[PASS]"
+ fi
++
++echo "--------------------"
++echo "running txring_overwrite test"
++echo "--------------------"
++./in_netns.sh ./txring_overwrite
++if [ $? -ne 0 ]; then
++	echo "[FAIL]"
++else
++	echo "[PASS]"
++fi
+diff --git a/tools/testing/selftests/net/txring_overwrite.c b/tools/testing/selftests/net/txring_overwrite.c
+new file mode 100644
+index 000000000000..fd8b1c663c39
+--- /dev/null
++++ b/tools/testing/selftests/net/txring_overwrite.c
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Verify that consecutive sends over packet tx_ring are mirrored
++ * with their original content intact.
++ */
++
++#define _GNU_SOURCE
++
++#include <arpa/inet.h>
++#include <assert.h>
++#include <error.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/filter.h>
++#include <linux/if_packet.h>
++#include <net/ethernet.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <netinet/ip.h>
++#include <netinet/udp.h>
++#include <poll.h>
++#include <pthread.h>
++#include <sched.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <sys/utsname.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++const int eth_off = TPACKET_HDRLEN - sizeof(struct sockaddr_ll);
++const int cfg_frame_size = 1000;
++
++static void build_packet(void *buffer, size_t blen, char payload_char)
++{
++	struct udphdr *udph;
++	struct ethhdr *eth;
++	struct iphdr *iph;
++	size_t off = 0;
++
++	memset(buffer, 0, blen);
++
++	eth = buffer;
++	eth->h_proto = htons(ETH_P_IP);
++
++	off += sizeof(*eth);
++	iph = buffer + off;
++	iph->ttl	= 8;
++	iph->ihl	= 5;
++	iph->version	= 4;
++	iph->saddr	= htonl(INADDR_LOOPBACK);
++	iph->daddr	= htonl(INADDR_LOOPBACK + 1);
++	iph->protocol	= IPPROTO_UDP;
++	iph->tot_len	= htons(blen - off);
++	iph->check	= 0;
++
++	off += sizeof(*iph);
++	udph = buffer + off;
++	udph->dest	= htons(8000);
++	udph->source	= htons(8001);
++	udph->len	= htons(blen - off);
++	udph->check	= 0;
++
++	off += sizeof(*udph);
++	memset(buffer + off, payload_char, blen - off);
++}
++
++static int setup_rx(void)
++{
++	int fdr;
++
++	fdr = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP));
++	if (fdr == -1)
++		error(1, errno, "socket r");
++
++	return fdr;
++}
++
++static int setup_tx(char **ring)
++{
++	struct sockaddr_ll laddr = {};
++	struct tpacket_req req = {};
++	int fdt;
++
++	fdt = socket(PF_PACKET, SOCK_RAW, 0);
++	if (fdt == -1)
++		error(1, errno, "socket t");
++
++	laddr.sll_family = AF_PACKET;
++	laddr.sll_protocol = htons(0);
++	laddr.sll_ifindex = if_nametoindex("lo");
++	if (!laddr.sll_ifindex)
++		error(1, errno, "if_nametoindex");
++
++	if (bind(fdt, (void *)&laddr, sizeof(laddr)))
++		error(1, errno, "bind fdt");
++
++	req.tp_block_size = getpagesize();
++	req.tp_block_nr   = 1;
++	req.tp_frame_size = getpagesize();
++	req.tp_frame_nr   = 1;
++
++	if (setsockopt(fdt, SOL_PACKET, PACKET_TX_RING,
++		       (void *)&req, sizeof(req)))
++		error(1, errno, "setsockopt ring");
++
++	*ring = mmap(0, req.tp_block_size * req.tp_block_nr,
++		     PROT_READ | PROT_WRITE, MAP_SHARED, fdt, 0);
++	if (!*ring)
++		error(1, errno, "mmap");
++
++	return fdt;
++}
++
++static void send_pkt(int fdt, void *slot, char payload_char)
++{
++	struct tpacket_hdr *header = slot;
++	int ret;
++
++	while (header->tp_status != TP_STATUS_AVAILABLE)
++		usleep(1000);
++
++	build_packet(slot + eth_off, cfg_frame_size, payload_char);
++
++	header->tp_len = cfg_frame_size;
++	header->tp_status = TP_STATUS_SEND_REQUEST;
++
++	ret = sendto(fdt, NULL, 0, 0, NULL, 0);
++	if (ret == -1)
++		error(1, errno, "kick tx");
++}
++
++static int read_verify_pkt(int fdr, char payload_char)
++{
++	char buf[100];
++	int ret;
++
++	ret = read(fdr, buf, sizeof(buf));
++	if (ret != sizeof(buf))
++		error(1, errno, "read");
++
++	if (buf[60] != payload_char) {
++		printf("wrong pattern: 0x%x != 0x%x\n", buf[60], payload_char);
++		return 1;
++	}
++
++	printf("read: %c (0x%x)\n", buf[60], buf[60]);
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	const char payload_patterns[] = "ab";
++	char *ring;
++	int fdr, fdt, ret = 0;
++
++	fdr = setup_rx();
++	fdt = setup_tx(&ring);
++
++	send_pkt(fdt, ring, payload_patterns[0]);
++	send_pkt(fdt, ring, payload_patterns[1]);
++
++	ret |= read_verify_pkt(fdr, payload_patterns[0]);
++	ret |= read_verify_pkt(fdr, payload_patterns[1]);
++
++	if (close(fdt))
++		error(1, errno, "close t");
++	if (close(fdr))
++		error(1, errno, "close r");
++
++	return ret;
++}
