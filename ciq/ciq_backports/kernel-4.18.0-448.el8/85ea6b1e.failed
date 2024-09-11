@@ -1,0 +1,122 @@
+KVM: arm64: Inject exception on out-of-IPA-range translation fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 85ea6b1ec915c9dd90caf3674b203999d8c7e062
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/85ea6b1e.failed
+
+When taking a translation fault for an IPA that is outside of
+the range defined by the hypervisor (between the HW PARange and
+the IPA range), we stupidly treat it as an IO and forward the access
+to userspace. Of course, userspace can't do much with it, and things
+end badly.
+
+Arguably, the guest is braindead, but we should at least catch the
+case and inject an exception.
+
+Check the faulting IPA against:
+- the sanitised PARange: inject an address size fault
+- the IPA size: inject an abort
+
+	Reported-by: Christoffer Dall <christoffer.dall@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 85ea6b1ec915c9dd90caf3674b203999d8c7e062)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_emulate.h
+diff --cc arch/arm64/include/asm/kvm_emulate.h
+index 83111f8afe45,f71358271b71..000000000000
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@@ -43,10 -40,11 +43,14 @@@ void kvm_inject_undefined(struct kvm_vc
+  void kvm_inject_vabt(struct kvm_vcpu *vcpu);
+  void kvm_inject_dabt(struct kvm_vcpu *vcpu, unsigned long addr);
+  void kvm_inject_pabt(struct kvm_vcpu *vcpu, unsigned long addr);
+++<<<<<<< HEAD
+ +void kvm_inject_undef32(struct kvm_vcpu *vcpu);
+ +void kvm_inject_dabt32(struct kvm_vcpu *vcpu, unsigned long addr);
+ +void kvm_inject_pabt32(struct kvm_vcpu *vcpu, unsigned long addr);
+++=======
++ void kvm_inject_size_fault(struct kvm_vcpu *vcpu);
+++>>>>>>> 85ea6b1ec915 (KVM: arm64: Inject exception on out-of-IPA-range translation fault)
+  
+ -void kvm_vcpu_wfi(struct kvm_vcpu *vcpu);
+ -
+ -#if defined(__KVM_VHE_HYPERVISOR__) || defined(__KVM_NVHE_HYPERVISOR__)
+  static __always_inline bool vcpu_el1_is_32bit(struct kvm_vcpu *vcpu)
+  {
+  	return !(vcpu->arch.hcr_el2 & HCR_RW);
+* Unmerged path arch/arm64/include/asm/kvm_emulate.h
+diff --git a/arch/arm64/kvm/inject_fault.c b/arch/arm64/kvm/inject_fault.c
+index 5468e4817e5d..554ee465e4bd 100644
+--- a/arch/arm64/kvm/inject_fault.c
++++ b/arch/arm64/kvm/inject_fault.c
+@@ -211,6 +211,34 @@ void kvm_inject_pabt(struct kvm_vcpu *vcpu, unsigned long addr)
+ 		inject_abt64(vcpu, true, addr);
+ }
+ 
++void kvm_inject_size_fault(struct kvm_vcpu *vcpu)
++{
++	unsigned long addr, esr;
++
++	addr  = kvm_vcpu_get_fault_ipa(vcpu);
++	addr |= kvm_vcpu_get_hfar(vcpu) & GENMASK(11, 0);
++
++	if (kvm_vcpu_trap_is_iabt(vcpu))
++		kvm_inject_pabt(vcpu, addr);
++	else
++		kvm_inject_dabt(vcpu, addr);
++
++	/*
++	 * If AArch64 or LPAE, set FSC to 0 to indicate an Address
++	 * Size Fault at level 0, as if exceeding PARange.
++	 *
++	 * Non-LPAE guests will only get the external abort, as there
++	 * is no way to to describe the ASF.
++	 */
++	if (vcpu_el1_is_32bit(vcpu) &&
++	    !(vcpu_read_sys_reg(vcpu, TCR_EL1) & TTBCR_EAE))
++		return;
++
++	esr = vcpu_read_sys_reg(vcpu, ESR_EL1);
++	esr &= ~GENMASK_ULL(5, 0);
++	vcpu_write_sys_reg(vcpu, esr, ESR_EL1);
++}
++
+ /**
+  * kvm_inject_undefined - inject an undefined instruction into the guest
+  *
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index d63d23a48d48..25c8f32ee56b 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -1921,6 +1921,25 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
+ 	fault_ipa = kvm_vcpu_get_fault_ipa(vcpu);
+ 	is_iabt = kvm_vcpu_trap_is_iabt(vcpu);
+ 
++	if (fault_status == FSC_FAULT) {
++		/* Beyond sanitised PARange (which is the IPA limit) */
++		if (fault_ipa >= BIT_ULL(get_kvm_ipa_limit())) {
++			kvm_inject_size_fault(vcpu);
++			return 1;
++		}
++
++		/* Falls between the IPA range and the PARange? */
++		if (fault_ipa >= BIT_ULL(vcpu->arch.hw_mmu->pgt->ia_bits)) {
++			fault_ipa |= kvm_vcpu_get_hfar(vcpu) & GENMASK(11, 0);
++
++			if (is_iabt)
++				kvm_inject_pabt(vcpu, fault_ipa);
++			else
++				kvm_inject_dabt(vcpu, fault_ipa);
++			return 1;
++		}
++	}
++
+ 	/* Synchronous External Abort? */
+ 	if (kvm_vcpu_abt_issea(vcpu)) {
+ 		/*
