@@ -1,0 +1,167 @@
+selftests: fix headers_install circular dependency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Shuah Khan <skhan@linuxfoundation.org>
+commit 8ce72dc32578f16942997f041f62759b4c693b6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8ce72dc3.failed
+
+"make kselftest" fails with "Circular Makefile.o <- prepare dependency
+dropped." error, when lib.mk invokes "make headers_install".
+
+Make level 0: Main make calls selftests run_tests target
+...
+Make level n: selftests lib.mk invokes main make's headers_install
+
+The secondary level make inherits builtin-rules which will use the rule
+to generate Makefile.o  and runs into "Circular Makefile.o <- prepare
+dependency dropped." error, and kselftest compile fails.
+
+Invoke headers_install target with --no-builtin-rules to avoid circular
+error.
+
+In addition, lib.mk installs headers in the default HDR_PATH, even when
+build relocation is requested with O= or export KBUILD_OUTPUT. Fix the
+problem by passing in INSTALL_HDR_PATH. The headers are installed under
+the specified output "dir/usr".
+
+	Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+(cherry picked from commit 8ce72dc32578f16942997f041f62759b4c693b6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/Makefile
+diff --cc tools/testing/selftests/Makefile
+index 2142c52cecc0,b43c5f41fb3e..000000000000
+--- a/tools/testing/selftests/Makefile
++++ b/tools/testing/selftests/Makefile
+@@@ -71,16 -75,58 +71,61 @@@ ifneq ($(KBUILD_SRC),
+  override LDFLAGS =
+  endif
+  
+- BUILD := $(O)
+- ifndef BUILD
+-   BUILD := $(KBUILD_OUTPUT)
+- endif
+- ifndef BUILD
+-   BUILD := $(shell pwd)
++ ifneq ($(O),)
++ 	BUILD := $(O)
++ else
++ 	ifneq ($(KBUILD_OUTPUT),)
++ 		BUILD := $(KBUILD_OUTPUT)
++ 	else
++ 		BUILD := $(shell pwd)
++ 		DEFAULT_INSTALL_HDR_PATH := 1
++ 	endif
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ # KSFT_TAP_LEVEL is used from KSFT framework to prevent nested TAP header
++ # printing from tests. Applicable to run_tests case where run_tests adds
++ # TAP header prior running tests and when a test program invokes another
++ # with system() call. Export it here to cover override RUN_TESTS defines.
++ export KSFT_TAP_LEVEL=`echo 1`
++ 
++ # Prepare for headers install
++ top_srcdir ?= ../../..
++ include $(top_srcdir)/scripts/subarch.include
++ ARCH           ?= $(SUBARCH)
++ export KSFT_KHDR_INSTALL_DONE := 1
+++>>>>>>> 8ce72dc32578 (selftests: fix headers_install circular dependency)
+  export BUILD
+- all:
++ 
++ # set default goal to all, so make without a target runs all, even when
++ # all isn't the first target in the file.
++ .DEFAULT_GOAL := all
++ 
++ # Install headers here once for all tests. KSFT_KHDR_INSTALL_DONE
++ # is used to avoid running headers_install from lib.mk.
++ # Invoke headers install with --no-builtin-rules to avoid circular
++ # dependency in "make kselftest" case. In this case, second level
++ # make inherits builtin-rules which will use the rule generate
++ # Makefile.o and runs into
++ # "Circular Makefile.o <- prepare dependency dropped."
++ # and headers_install fails and test compile fails.
++ #
++ # O= KBUILD_OUTPUT cases don't run into this error, since main Makefile
++ # invokes them as sub-makes and --no-builtin-rules is not necessary,
++ # but doesn't cause any failures. Keep it simple and use the same
++ # flags in both cases.
++ # Local build cases: "make kselftest", "make -C" - headers are installed
++ # in the default INSTALL_HDR_PATH usr/include.
++ khdr:
++ ifeq (1,$(DEFAULT_INSTALL_HDR_PATH))
++ 	make --no-builtin-rules ARCH=$(ARCH) -C $(top_srcdir) headers_install
++ else
++ 	make --no-builtin-rules INSTALL_HDR_PATH=$$BUILD/usr \
++ 		ARCH=$(ARCH) -C $(top_srcdir) headers_install
++ endif
++ 
++ all: khdr
+  	@for TARGET in $(TARGETS); do		\
+  		BUILD_TARGET=$$BUILD/$$TARGET;	\
+  		mkdir $$BUILD_TARGET  -p;	\
+* Unmerged path tools/testing/selftests/Makefile
+diff --git a/tools/testing/selftests/lib.mk b/tools/testing/selftests/lib.mk
+index 9618ef73d149..16330a33370c 100644
+--- a/tools/testing/selftests/lib.mk
++++ b/tools/testing/selftests/lib.mk
+@@ -3,7 +3,16 @@
+ CC := $(CROSS_COMPILE)gcc
+ 
+ ifeq (0,$(MAKELEVEL))
+-OUTPUT := $(shell pwd)
++    ifneq ($(O),)
++	OUTPUT := $(O)
++    else
++	ifneq ($(KBUILD_OUTPUT),)
++		OUTPUT := $(KBUILD_OUTPUT)
++	else
++		OUTPUT := $(shell pwd)
++		DEFAULT_INSTALL_HDR_PATH := 1
++	endif
++    endif
+ endif
+ selfdir = $(realpath $(dir $(filter %/lib.mk,$(MAKEFILE_LIST))))
+ 
+@@ -22,9 +31,34 @@ top_srcdir ?= ../../../..
+ include $(top_srcdir)/scripts/subarch.include
+ ARCH		?= $(SUBARCH)
+ 
++# set default goal to all, so make without a target runs all, even when
++# all isn't the first target in the file.
++.DEFAULT_GOAL := all
++
++# Invoke headers install with --no-builtin-rules to avoid circular
++# dependency in "make kselftest" case. In this case, second level
++# make inherits builtin-rules which will use the rule generate
++# Makefile.o and runs into
++# "Circular Makefile.o <- prepare dependency dropped."
++# and headers_install fails and test compile fails.
++# O= KBUILD_OUTPUT cases don't run into this error, since main Makefile
++# invokes them as sub-makes and --no-builtin-rules is not necessary,
++# but doesn't cause any failures. Keep it simple and use the same
++# flags in both cases.
++# Note that the support to install headers from lib.mk is necessary
++# when test Makefile is run directly with "make -C".
++# When local build is done, headers are installed in the default
++# INSTALL_HDR_PATH usr/include.
+ .PHONY: khdr
+ khdr:
+-	make ARCH=$(ARCH) -C $(top_srcdir) headers_install
++ifndef KSFT_KHDR_INSTALL_DONE
++ifeq (1,$(DEFAULT_INSTALL_HDR_PATH))
++	make --no-builtin-rules ARCH=$(ARCH) -C $(top_srcdir) headers_install
++else
++	make --no-builtin-rules INSTALL_HDR_PATH=$$OUTPUT/usr \
++		ARCH=$(ARCH) -C $(top_srcdir) headers_install
++endif
++endif
+ 
+ all: khdr $(TEST_GEN_PROGS) $(TEST_GEN_PROGS_EXTENDED) $(TEST_GEN_FILES)
+ else
