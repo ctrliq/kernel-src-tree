@@ -1,0 +1,244 @@
+RDMA/hns: Support flush cqe for hip08 in kernel space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Yixian Liu <liuyixian@huawei.com>
+commit 0425e3e6e0c7f92f2c2a396d902871b7a81da0eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0425e3e6.failed
+
+According to IB protocol, there are some cases that work requests must
+return the flush error completion status through the completion queue. Due
+to hardware limitation, the driver needs to assist the flush process.
+
+This patch adds the support of flush cqe for hip08 in the cases that
+needed, such as poll cqe, post send, post recv and aeqe handle.
+
+The patch also considered the compatibility between kernel and user space.
+
+	Signed-off-by: Yixian Liu <liuyixian@huawei.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0425e3e6e0c7f92f2c2a396d902871b7a81da0eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+diff --cc drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index eb4d2122b67e,0218c0f8c2a7..000000000000
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@@ -165,8 -165,14 +165,19 @@@ static int set_rwqe_data_seg(struct ib_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int hns_roce_v2_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ +				 struct ib_send_wr **bad_wr)
+++=======
++ static int hns_roce_v2_modify_qp(struct ib_qp *ibqp,
++ 				 const struct ib_qp_attr *attr,
++ 				 int attr_mask, enum ib_qp_state cur_state,
++ 				 enum ib_qp_state new_state);
++ 
++ static int hns_roce_v2_post_send(struct ib_qp *ibqp,
++ 				 const struct ib_send_wr *wr,
++ 				 const struct ib_send_wr **bad_wr)
+++>>>>>>> 0425e3e6e0c7 (RDMA/hns: Support flush cqe for hip08 in kernel space)
+  {
+  	struct hns_roce_dev *hr_dev = to_hr_dev(ibqp->device);
+  	struct hns_roce_ah *ah = to_hr_ah(ud_wr(wr)->ah);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_db.c b/drivers/infiniband/hw/hns/hns_roce_db.c
+index ebee2782a573..e2f93c1ce86a 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_db.c
++++ b/drivers/infiniband/hw/hns/hns_roce_db.c
+@@ -41,6 +41,8 @@ int hns_roce_db_map_user(struct hns_roce_ucontext *context, unsigned long virt,
+ found:
+ 	db->dma = sg_dma_address(page->umem->sg_head.sgl) +
+ 		  (virt & ~PAGE_MASK);
++	page->umem->sg_head.sgl->offset = virt & ~PAGE_MASK;
++	db->virt_addr = sg_virt(page->umem->sg_head.sgl);
+ 	db->u.user_page = page;
+ 	refcount_inc(&page->refcount);
+ 
+diff --git a/drivers/infiniband/hw/hns/hns_roce_device.h b/drivers/infiniband/hw/hns/hns_roce_device.h
+index dddf1b89c3b6..146eb2b876b4 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -110,6 +110,7 @@
+ 
+ enum {
+ 	HNS_ROCE_SUPPORT_RQ_RECORD_DB = 1 << 0,
++	HNS_ROCE_SUPPORT_SQ_RECORD_DB = 1 << 1,
+ };
+ 
+ enum {
+@@ -190,7 +191,8 @@ enum {
+ 	HNS_ROCE_CAP_FLAG_REREG_MR		= BIT(0),
+ 	HNS_ROCE_CAP_FLAG_ROCE_V1_V2		= BIT(1),
+ 	HNS_ROCE_CAP_FLAG_RQ_INLINE		= BIT(2),
+-	HNS_ROCE_CAP_FLAG_RECORD_DB		= BIT(3)
++	HNS_ROCE_CAP_FLAG_RECORD_DB		= BIT(3),
++	HNS_ROCE_CAP_FLAG_SQ_RECORD_DB		= BIT(4),
+ };
+ 
+ enum hns_roce_mtt_type {
+@@ -385,6 +387,7 @@ struct hns_roce_db {
+ 		struct hns_roce_user_db_page *user_page;
+ 	} u;
+ 	dma_addr_t	dma;
++	void		*virt_addr;
+ 	int		index;
+ 	int		order;
+ };
+@@ -524,7 +527,9 @@ struct hns_roce_qp {
+ 	struct hns_roce_buf	hr_buf;
+ 	struct hns_roce_wq	rq;
+ 	struct hns_roce_db	rdb;
++	struct hns_roce_db	sdb;
+ 	u8			rdb_en;
++	u8			sdb_en;
+ 	u32			doorbell_qpn;
+ 	__le32			sq_signal_bits;
+ 	u32			sq_next_wqe;
+@@ -641,6 +646,8 @@ struct hns_roce_eq {
+ 	int				shift;
+ 	dma_addr_t			cur_eqe_ba;
+ 	dma_addr_t			nxt_eqe_ba;
++	int				event_type;
++	int				sub_type;
+ };
+ 
+ struct hns_roce_eq_table {
+@@ -727,6 +734,14 @@ struct hns_roce_caps {
+ 	u64		flags;
+ };
+ 
++struct hns_roce_work {
++	struct hns_roce_dev *hr_dev;
++	struct work_struct work;
++	u32 qpn;
++	int event_type;
++	int sub_type;
++};
++
+ struct hns_roce_hw {
+ 	int (*reset)(struct hns_roce_dev *hr_dev, bool enable);
+ 	int (*cmq_init)(struct hns_roce_dev *hr_dev);
+@@ -819,6 +834,7 @@ struct hns_roce_dev {
+ 	u32			tptr_size; /*only for hw v1*/
+ 	const struct hns_roce_hw *hw;
+ 	void			*priv;
++	struct workqueue_struct *irq_workq;
+ };
+ 
+ static inline struct hns_roce_dev *to_hr_dev(struct ib_device *ib_dev)
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+diff --git a/drivers/infiniband/hw/hns/hns_roce_qp.c b/drivers/infiniband/hw/hns/hns_roce_qp.c
+index baaf906f7c2e..c1dbddcd58c9 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -489,6 +489,14 @@ static int hns_roce_set_kernel_sq_size(struct hns_roce_dev *hr_dev,
+ 	return 0;
+ }
+ 
++static int hns_roce_qp_has_sq(struct ib_qp_init_attr *attr)
++{
++	if (attr->qp_type == IB_QPT_XRC_TGT)
++		return 0;
++
++	return 1;
++}
++
+ static int hns_roce_qp_has_rq(struct ib_qp_init_attr *attr)
+ {
+ 	if (attr->qp_type == IB_QPT_XRC_INI ||
+@@ -613,6 +621,23 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
+ 			goto err_mtt;
+ 		}
+ 
++		if ((hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_SQ_RECORD_DB) &&
++		    (udata->inlen >= sizeof(ucmd)) &&
++		    (udata->outlen >= sizeof(resp)) &&
++		    hns_roce_qp_has_sq(init_attr)) {
++			ret = hns_roce_db_map_user(
++					to_hr_ucontext(ib_pd->uobject->context),
++					ucmd.sdb_addr, &hr_qp->sdb);
++			if (ret) {
++				dev_err(dev, "sq record doorbell map failed!\n");
++				goto err_mtt;
++			}
++
++			/* indicate kernel supports sq record db */
++			resp.cap_flags |= HNS_ROCE_SUPPORT_SQ_RECORD_DB;
++			hr_qp->sdb_en = 1;
++		}
++
+ 		if ((hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RECORD_DB) &&
+ 		    (udata->outlen >= sizeof(resp)) &&
+ 		    hns_roce_qp_has_rq(init_attr)) {
+@@ -621,7 +646,7 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
+ 					ucmd.db_addr, &hr_qp->rdb);
+ 			if (ret) {
+ 				dev_err(dev, "rq record doorbell map failed!\n");
+-				goto err_mtt;
++				goto err_sq_dbmap;
+ 			}
+ 		}
+ 	} else {
+@@ -734,7 +759,7 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
+ 	if (ib_pd->uobject && (udata->outlen >= sizeof(resp)) &&
+ 		(hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RECORD_DB)) {
+ 
+-		/* indicate kernel supports record db */
++		/* indicate kernel supports rq record db */
+ 		resp.cap_flags |= HNS_ROCE_SUPPORT_RQ_RECORD_DB;
+ 		ret = ib_copy_to_udata(udata, &resp, sizeof(resp));
+ 		if (ret)
+@@ -770,6 +795,16 @@ static int hns_roce_create_qp_common(struct hns_roce_dev *hr_dev,
+ 		kfree(hr_qp->rq.wrid);
+ 	}
+ 
++err_sq_dbmap:
++	if (ib_pd->uobject)
++		if ((hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_SQ_RECORD_DB) &&
++		    (udata->inlen >= sizeof(ucmd)) &&
++		    (udata->outlen >= sizeof(resp)) &&
++		    hns_roce_qp_has_sq(init_attr))
++			hns_roce_db_unmap_user(
++					to_hr_ucontext(ib_pd->uobject->context),
++					&hr_qp->sdb);
++
+ err_mtt:
+ 	hns_roce_mtt_cleanup(hr_dev, &hr_qp->mtt);
+ 
+@@ -903,6 +938,17 @@ int hns_roce_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 	new_state = attr_mask & IB_QP_STATE ?
+ 		    attr->qp_state : cur_state;
+ 
++	if (ibqp->uobject &&
++	    (attr_mask & IB_QP_STATE) && new_state == IB_QPS_ERR) {
++		if (hr_qp->sdb_en == 1) {
++			hr_qp->sq.head = *(int *)(hr_qp->sdb.virt_addr);
++			hr_qp->rq.head = *(int *)(hr_qp->rdb.virt_addr);
++		} else {
++			dev_warn(dev, "flush cqe is not supported in userspace!\n");
++			goto out;
++		}
++	}
++
+ 	if (!ib_modify_qp_is_ok(cur_state, new_state, ibqp->qp_type, attr_mask,
+ 				IB_LINK_LAYER_ETHERNET)) {
+ 		dev_err(dev, "ib_modify_qp_is_ok failed\n");
+diff --git a/include/uapi/rdma/hns-abi.h b/include/uapi/rdma/hns-abi.h
+index 78613b609fa8..c1f87735514f 100644
+--- a/include/uapi/rdma/hns-abi.h
++++ b/include/uapi/rdma/hns-abi.h
+@@ -53,6 +53,7 @@ struct hns_roce_ib_create_qp {
+ 	__u8    log_sq_stride;
+ 	__u8    sq_no_prefetch;
+ 	__u8    reserved[5];
++	__aligned_u64 sdb_addr;
+ };
+ 
+ struct hns_roce_ib_create_qp_resp {
