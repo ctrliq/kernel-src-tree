@@ -1,0 +1,384 @@
+gfs2: Rework the log space allocation logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit fe3e397668775e20ad0962459733158838b926af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/fe3e3976.failed
+
+The current log space allocation logic is hard to understand or extend.
+The principle it that when the log is flushed, we may or may not have a
+transaction active that has space allocated in the log.  To deal with
+that, we set aside a magical number of blocks to be used in case we
+don't have an active transaction.  It isn't clear that the pool will
+always be big enough.  In addition, we can't return unused log space at
+the end of a transaction, so the number of blocks allocated must exactly
+match the number of blocks used.
+
+Simplify this as follows:
+ * When transactions are allocated or merged, always reserve enough
+   blocks to flush the transaction (err on the safe side).
+ * In gfs2_log_flush, return any allocated blocks that haven't been used.
+ * Maintain a pool of spare blocks big enough to do one log flush, as
+   before.
+ * In gfs2_log_flush, when we have no active transaction, allocate a
+   suitable number of blocks.  For that, use the spare pool when
+   called from logd, and leave the pool alone otherwise.  This means
+   that when the log is almost full, logd will still be able to do one
+   more log flush, which will result in more log space becoming
+   available.
+
+This will make the log space allocator code easier to work with in
+the future.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit fe3e397668775e20ad0962459733158838b926af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/log.c
+index 87ab5db19785,913150e60f52..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -395,64 -489,48 +422,86 @@@ static bool __gfs2_log_try_reserve(stru
+   * with queued waiters, we use an exclusive wait. This means that when we
+   * get woken with enough journal space to get our reservation, we need to
+   * wake the next waiter on the list.
+ + *
+ + * Returns: errno
+   */
+  
+++<<<<<<< HEAD
+ +int gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks)
+ +{
+ +	int ret = 0;
+ +	unsigned reserved_blks = 7 * (4096 / sdp->sd_vfs->s_blocksize);
+ +	unsigned wanted = blks + reserved_blks;
+ +	DEFINE_WAIT(wait);
+ +	int did_wait = 0;
+ +	unsigned int free_blocks;
+ +
+ +	if (gfs2_assert_warn(sdp, blks) ||
+ +	    gfs2_assert_warn(sdp, blks <= sdp->sd_jdesc->jd_blocks))
+ +		return -EINVAL;
+++=======
++ static void __gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks,
++ 			       unsigned int taboo_blks)
++ {
++ 	unsigned wanted = blks + taboo_blks;
++ 	unsigned int free_blocks;
++ 
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  	atomic_add(blks, &sdp->sd_log_blks_needed);
+ -	for (;;) {
+ -		if (current != sdp->sd_logd_process)
+ -			wake_up(&sdp->sd_logd_waitq);
+ -		io_wait_event(sdp->sd_log_waitq,
+ -			(free_blocks = atomic_read(&sdp->sd_log_blks_free),
+ -			 free_blocks >= wanted));
+ +retry:
+ +	free_blocks = atomic_read(&sdp->sd_log_blks_free);
+ +	if (unlikely(free_blocks <= wanted)) {
+  		do {
+ -			if (atomic_try_cmpxchg(&sdp->sd_log_blks_free,
+ -					       &free_blocks,
+ -					       free_blocks - blks))
+ -				goto reserved;
+ -		} while (free_blocks >= wanted);
+ +			prepare_to_wait_exclusive(&sdp->sd_log_waitq, &wait,
+ +					TASK_UNINTERRUPTIBLE);
+ +			wake_up(&sdp->sd_logd_waitq);
+ +			did_wait = 1;
+ +			if (atomic_read(&sdp->sd_log_blks_free) <= wanted)
+ +				io_schedule();
+ +			free_blocks = atomic_read(&sdp->sd_log_blks_free);
+ +		} while(free_blocks <= wanted);
+ +		finish_wait(&sdp->sd_log_waitq, &wait);
+  	}
+ -
+ -reserved:
+ +	atomic_inc(&sdp->sd_reserving_log);
+ +	if (atomic_cmpxchg(&sdp->sd_log_blks_free, free_blocks,
+ +				free_blocks - blks) != free_blocks) {
+ +		if (atomic_dec_and_test(&sdp->sd_reserving_log))
+ +			wake_up(&sdp->sd_reserving_log_wait);
+ +		goto retry;
+ +	}
+ +	atomic_sub(blks, &sdp->sd_log_blks_needed);
+  	trace_gfs2_log_blocks(sdp, -blks);
+ -	if (atomic_sub_return(blks, &sdp->sd_log_blks_needed))
+ +
+ +	/*
+ +	 * If we waited, then so might others, wake them up _after_ we get
+ +	 * our share of the log.
+ +	 */
+ +	if (unlikely(did_wait))
+  		wake_up(&sdp->sd_log_waitq);
+ +
+ +	down_read(&sdp->sd_log_flush_lock);
+ +	if (unlikely(!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))) {
+ +		gfs2_log_release(sdp, blks);
+ +		ret = -EROFS;
+ +	}
+ +	if (atomic_dec_and_test(&sdp->sd_reserving_log))
+ +		wake_up(&sdp->sd_reserving_log_wait);
+ +	return ret;
+  }
+  
++ /**
++  * gfs2_log_reserve - Make a log reservation
++  * @sdp: The GFS2 superblock
++  * @blks: The number of blocks to reserve
++  */
++ 
++ void gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks)
++ {
++ 	if (__gfs2_log_try_reserve(sdp, blks, GFS2_LOG_FLUSH_MIN_BLOCKS))
++ 		return;
++ 	__gfs2_log_reserve(sdp, blks, GFS2_LOG_FLUSH_MIN_BLOCKS);
++ }
++ 
+  /**
+   * log_distance - Compute distance between two journal blocks
+   * @sdp: The GFS2 superblock
+@@@ -516,11 -590,7 +565,15 @@@ static unsigned int calc_reserved(struc
+  	}
+  
+  	if (sdp->sd_log_committed_revoke > 0)
+++<<<<<<< HEAD
+ +		reserved += gfs2_struct2blk(sdp, sdp->sd_log_committed_revoke,
+ +					  sizeof(u64));
+ +	/* One for the overall header */
+ +	if (reserved)
+ +		reserved++;
+++=======
++ 		reserved += gfs2_struct2blk(sdp, sdp->sd_log_committed_revoke) - 1;
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  	return reserved;
+  }
+  
+@@@ -819,13 -845,14 +851,19 @@@ static void log_write_header(struct gfs
+  		log_flush_wait(sdp);
+  		op_flags = REQ_SYNC | REQ_META | REQ_PRIO;
+  	}
+ -	sdp->sd_log_idle = (sdp->sd_log_flush_tail == sdp->sd_log_flush_head);
+ -	gfs2_write_log_header(sdp, sdp->sd_jdesc, sdp->sd_log_sequence++,
+ -			      sdp->sd_log_flush_tail, sdp->sd_log_flush_head,
+ -			      flags, op_flags);
+ +	sdp->sd_log_idle = (tail == sdp->sd_log_flush_head);
+ +	gfs2_write_log_header(sdp, sdp->sd_jdesc, sdp->sd_log_sequence++, tail,
+ +			      sdp->sd_log_flush_head, flags, op_flags);
+  	gfs2_log_incr_head(sdp);
+++<<<<<<< HEAD
+ +
+ +	if (sdp->sd_log_tail != tail)
+ +		log_pull_tail(sdp, tail);
+++=======
++ 	log_flush_wait(sdp);
++ 	log_pull_tail(sdp);
++ 	gfs2_log_update_head(sdp);
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  }
+  
+  /**
+@@@ -926,19 -1005,6 +998,22 @@@ repeat
+  	if (flags & GFS2_LOG_HEAD_FLUSH_SHUTDOWN)
+  		clear_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags);
+  
+++<<<<<<< HEAD
+ +	sdp->sd_log_flush_head = sdp->sd_log_head;
+ +	tr = sdp->sd_log_tr;
+ +	if (tr) {
+ +		sdp->sd_log_tr = NULL;
+ +		INIT_LIST_HEAD(&tr->tr_ail1_list);
+ +		INIT_LIST_HEAD(&tr->tr_ail2_list);
+ +		tr->tr_first = sdp->sd_log_flush_head;
+ +		if (unlikely (state == SFS_FROZEN))
+ +			if (gfs2_assert_withdraw_delayed(sdp,
+ +			       !tr->tr_num_buf_new && !tr->tr_num_databuf_new))
+ +				goto out_withdraw;
+ +	}
+ +
+++=======
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  	if (unlikely(state == SFS_FROZEN))
+  		if (gfs2_assert_withdraw_delayed(sdp, !sdp->sd_log_num_revoke))
+  			goto out_withdraw;
+@@@ -957,10 -1023,9 +1032,14 @@@
+  		goto out_withdraw;
+  
+  	if (sdp->sd_log_head != sdp->sd_log_flush_head) {
+ -		log_flush_wait(sdp);
+  		log_write_header(sdp, flags);
+++<<<<<<< HEAD
+ +	} else if (sdp->sd_log_tail != current_tail(sdp) && !sdp->sd_log_idle){
+ +		atomic_dec(&sdp->sd_log_blks_free); /* Adjust for unreserved buffer */
+ +		trace_gfs2_log_blocks(sdp, -1);
+++=======
++ 	} else if (sdp->sd_log_tail != sdp->sd_log_flush_tail && !sdp->sd_log_idle) {
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  		log_write_header(sdp, flags);
+  	}
+  	if (gfs2_withdrawn(sdp))
+@@@ -968,7 -1033,6 +1047,10 @@@
+  	lops_after_commit(sdp, tr);
+  
+  	gfs2_log_lock(sdp);
+++<<<<<<< HEAD
+ +	sdp->sd_log_head = sdp->sd_log_flush_head;
+++=======
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  	sdp->sd_log_blks_reserved = 0;
+  	sdp->sd_log_committed_revoke = 0;
+  
+@@@ -982,18 -1046,10 +1064,19 @@@
+  
+  	if (!(flags & GFS2_LOG_HEAD_FLUSH_NORMAL)) {
+  		if (!sdp->sd_log_idle) {
+ -			empty_ail1_list(sdp);
+ +			for (;;) {
+ +				gfs2_ail1_start(sdp);
+ +				gfs2_ail1_wait(sdp);
+ +				if (gfs2_ail1_empty(sdp, 0))
+ +					break;
+ +			}
+  			if (gfs2_withdrawn(sdp))
+  				goto out_withdraw;
+- 			atomic_dec(&sdp->sd_log_blks_free); /* Adjust for unreserved buffer */
+- 			trace_gfs2_log_blocks(sdp, -1);
+  			log_write_header(sdp, flags);
+++<<<<<<< HEAD
+ +			sdp->sd_log_head = sdp->sd_log_flush_head;
+++=======
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  		}
+  		if (flags & (GFS2_LOG_HEAD_FLUSH_SHUTDOWN |
+  			     GFS2_LOG_HEAD_FLUSH_FREEZE))
+@@@ -1003,12 -1059,17 +1086,17 @@@
+  	}
+  
+  out_end:
+- 	trace_gfs2_log_flush(sdp, 0, flags);
++ 	used_blocks = log_distance(sdp, sdp->sd_log_flush_head, first_log_head);
++ 	if (gfs2_assert_withdraw_delayed(sdp, used_blocks <= reserved_blocks))
++ 		goto out;
+  out:
++ 	if (used_blocks != reserved_blocks)
++ 		gfs2_log_release(sdp, reserved_blocks - used_blocks);
+  	up_write(&sdp->sd_log_flush_lock);
+ -	gfs2_trans_free(sdp, tr);
+ +	kfree(tr);
+  	if (gfs2_withdrawing(sdp))
+  		gfs2_withdraw(sdp);
++ 	trace_gfs2_log_flush(sdp, 0, flags);
+  	return;
+  
+  out_withdraw:
+@@@ -1129,9 -1187,6 +1216,12 @@@ static void gfs2_log_shutdown(struct gf
+  
+  	gfs2_assert_warn(sdp, sdp->sd_log_head == sdp->sd_log_tail);
+  	gfs2_assert_warn(sdp, list_empty(&sdp->sd_ail2_list));
+++<<<<<<< HEAD
+ +
+ +	sdp->sd_log_head = sdp->sd_log_flush_head;
+ +	sdp->sd_log_tail = sdp->sd_log_head;
+++=======
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  }
+  
+  static inline int gfs2_jrnl_flush_reqd(struct gfs2_sbd *sdp)
+@@@ -1188,8 -1241,7 +1278,12 @@@ int gfs2_logd(void *data
+  		if (gfs2_jrnl_flush_reqd(sdp) || t == 0) {
+  			gfs2_ail1_empty(sdp, 0);
+  			gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
+++<<<<<<< HEAD
+ +				       GFS2_LFC_LOGD_JFLUSH_REQD);
+ +			did_flush = true;
+++=======
++ 						  GFS2_LFC_LOGD_JFLUSH_REQD);
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  		}
+  
+  		if (gfs2_ail_flush_reqd(sdp)) {
+@@@ -1197,13 -1249,9 +1291,17 @@@
+  			gfs2_ail1_wait(sdp);
+  			gfs2_ail1_empty(sdp, 0);
+  			gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
+++<<<<<<< HEAD
+ +				       GFS2_LFC_LOGD_AIL_FLUSH_REQD);
+ +			did_flush = true;
+++=======
++ 						  GFS2_LFC_LOGD_AIL_FLUSH_REQD);
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  		}
+  
+ +		if (!gfs2_ail_flush_reqd(sdp) || did_flush)
+ +			wake_up(&sdp->sd_log_waitq);
+ +
+  		t = gfs2_tune_get(sdp, gt_logd_secs) * HZ;
+  
+  		try_to_freeze();
+diff --cc fs/gfs2/trans.c
+index 35084a676633,231ca1a41a73..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -55,20 -50,20 +55,34 @@@ int gfs2_trans_begin(struct gfs2_sbd *s
+  	if (!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))
+  		return -EROFS;
+  
+ -	tr->tr_ip = ip;
+ +	tr = kzalloc(sizeof(struct gfs2_trans), GFP_NOFS);
+ +	if (!tr)
+ +		return -ENOMEM;
+ +
+ +	tr->tr_ip = _RET_IP_;
+  	tr->tr_blocks = blocks;
+  	tr->tr_revokes = revokes;
+++<<<<<<< HEAD
+ +	tr->tr_reserved = 1;
+ +	set_bit(TR_ALLOCED, &tr->tr_flags);
+ +	if (blocks)
+ +		tr->tr_reserved += 6 + blocks;
+ +	if (revokes)
+ +		tr->tr_reserved += gfs2_struct2blk(sdp, revokes,
+ +						   sizeof(u64));
+++=======
++ 	tr->tr_reserved = GFS2_LOG_FLUSH_MIN_BLOCKS;
++ 	if (blocks) {
++ 		/*
++ 		 * The reserved blocks are either used for data or metadata.
++ 		 * We can have mixed data and metadata, each with its own log
++ 		 * descriptor block; see calc_reserved().
++ 		 */
++ 		tr->tr_reserved += blocks + 1 + DIV_ROUND_UP(blocks - 1, databuf_limit(sdp));
++ 	}
++ 	if (revokes)
++ 		tr->tr_reserved += gfs2_struct2blk(sdp, revokes) - 1;
+++>>>>>>> fe3e39766877 (gfs2: Rework the log space allocation logic)
+  	INIT_LIST_HEAD(&tr->tr_databuf);
+  	INIT_LIST_HEAD(&tr->tr_buf);
+  	INIT_LIST_HEAD(&tr->tr_list);
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index 0fb59261f18d..64ada125de72 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -16,6 +16,13 @@
+ #include "incore.h"
+ #include "inode.h"
+ 
++/*
++ * The minimum amount of log space required for a log flush is one block for
++ * revokes and one block for the log header.  Log flushes other than
++ * GFS2_LOG_HEAD_FLUSH_NORMAL may write one or two more log headers.
++ */
++#define GFS2_LOG_FLUSH_MIN_BLOCKS 4
++
+ /**
+  * gfs2_log_lock - acquire the right to mess with the log manager
+  * @sdp: the filesystem
+* Unmerged path fs/gfs2/trans.c
