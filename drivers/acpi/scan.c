@@ -1939,6 +1939,8 @@ static void acpi_scan_dep_init(struct acpi_device *adev)
 	mutex_unlock(&acpi_dep_list_lock);
 }
 
+static bool acpi_bus_scan_second_pass;
+
 static acpi_status acpi_bus_check_add(acpi_handle handle, bool check_dep,
 				      struct acpi_device **adev_p)
 {
@@ -1963,8 +1965,10 @@ static acpi_status acpi_bus_check_add(acpi_handle handle, bool check_dep,
 	if (type == ACPI_BUS_TYPE_DEVICE && check_dep) {
 		u32 count = acpi_scan_check_dep(handle);
 		/* Bail out if the number of recorded dependencies is not 0. */
-		if (count > 0)
+		if (count > 0) {
+			acpi_bus_scan_second_pass = true;
 			return AE_CTRL_DEPTH;
+		}
 	}
 
 	acpi_add_single_object(&device, handle, type, sta);
@@ -2165,6 +2169,8 @@ int acpi_bus_scan(acpi_handle handle)
 {
 	struct acpi_device *device = NULL;
 
+	acpi_bus_scan_second_pass = false;
+
 	/* Pass 1: Avoid enumerating devices with missing dependencies. */
 
 	if (ACPI_SUCCESS(acpi_bus_check_add(handle, true, &device)))
@@ -2176,6 +2182,9 @@ int acpi_bus_scan(acpi_handle handle)
 		return -ENODEV;
 
 	acpi_bus_attach(device, true);
+
+	if (!acpi_bus_scan_second_pass)
+		return 0;
 
 	/* Pass 2: Enumerate all of the remaining devices. */
 
