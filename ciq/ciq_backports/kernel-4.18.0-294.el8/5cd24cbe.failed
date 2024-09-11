@@ -1,0 +1,163 @@
+bonding: deal with xfrm state in all modes and add more error-checking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jarod Wilson <jarod@redhat.com>
+commit 5cd24cbe7dca62089ac6228f1dd14729d7da6ed8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5cd24cbe.failed
+
+It's possible that device removal happens when the bond is in non-AB mode,
+and addition happens in AB mode, so bond_ipsec_del_sa() never gets called,
+which leaves security associations in an odd state if bond_ipsec_add_sa()
+then gets called after switching the bond into AB. Just call add and
+delete universally for all modes to keep things consistent.
+
+However, it's also possible that this code gets called when the system is
+shutting down, and the xfrm subsystem has already been disconnected from
+the bond device, so we need to do some error-checking and bail, lest we
+hit a null ptr deref.
+
+Fixes: a3b658cfb664 ("bonding: allow xfrm offload setup post-module-load")
+CC: Huy Nguyen <huyn@mellanox.com>
+CC: Saeed Mahameed <saeedm@mellanox.com>
+CC: Jay Vosburgh <j.vosburgh@gmail.com>
+CC: Veaceslav Falico <vfalico@gmail.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+CC: Jakub Kicinski <kuba@kernel.org>
+CC: Steffen Klassert <steffen.klassert@secunet.com>
+CC: Herbert Xu <herbert@gondor.apana.org.au>
+CC: netdev@vger.kernel.org
+CC: intel-wired-lan@lists.osuosl.org
+	Signed-off-by: Jarod Wilson <jarod@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5cd24cbe7dca62089ac6228f1dd14729d7da6ed8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index 704bda02a80a,f886d97c4359..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -372,6 -373,98 +372,101 @@@ static int bond_vlan_rx_kill_vid(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*---------------------------------- XFRM -----------------------------------*/
++ 
++ #ifdef CONFIG_XFRM_OFFLOAD
++ /**
++  * bond_ipsec_add_sa - program device with a security association
++  * @xs: pointer to transformer state struct
++  **/
++ static int bond_ipsec_add_sa(struct xfrm_state *xs)
++ {
++ 	struct net_device *bond_dev = xs->xso.dev;
++ 	struct bonding *bond;
++ 	struct slave *slave;
++ 
++ 	if (!bond_dev)
++ 		return -EINVAL;
++ 
++ 	bond = netdev_priv(bond_dev);
++ 	slave = rtnl_dereference(bond->curr_active_slave);
++ 	xs->xso.real_dev = slave->dev;
++ 	bond->xs = xs;
++ 
++ 	if (!(slave->dev->xfrmdev_ops
++ 	      && slave->dev->xfrmdev_ops->xdo_dev_state_add)) {
++ 		slave_warn(bond_dev, slave->dev, "Slave does not support ipsec offload\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return slave->dev->xfrmdev_ops->xdo_dev_state_add(xs);
++ }
++ 
++ /**
++  * bond_ipsec_del_sa - clear out this specific SA
++  * @xs: pointer to transformer state struct
++  **/
++ static void bond_ipsec_del_sa(struct xfrm_state *xs)
++ {
++ 	struct net_device *bond_dev = xs->xso.dev;
++ 	struct bonding *bond;
++ 	struct slave *slave;
++ 
++ 	if (!bond_dev)
++ 		return;
++ 
++ 	bond = netdev_priv(bond_dev);
++ 	slave = rtnl_dereference(bond->curr_active_slave);
++ 
++ 	if (!slave)
++ 		return;
++ 
++ 	xs->xso.real_dev = slave->dev;
++ 
++ 	if (!(slave->dev->xfrmdev_ops
++ 	      && slave->dev->xfrmdev_ops->xdo_dev_state_delete)) {
++ 		slave_warn(bond_dev, slave->dev, "%s: no slave xdo_dev_state_delete\n", __func__);
++ 		return;
++ 	}
++ 
++ 	slave->dev->xfrmdev_ops->xdo_dev_state_delete(xs);
++ }
++ 
++ /**
++  * bond_ipsec_offload_ok - can this packet use the xfrm hw offload
++  * @skb: current data packet
++  * @xs: pointer to transformer state struct
++  **/
++ static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
++ {
++ 	struct net_device *bond_dev = xs->xso.dev;
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct slave *curr_active = rtnl_dereference(bond->curr_active_slave);
++ 	struct net_device *slave_dev = curr_active->dev;
++ 
++ 	if (BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)
++ 		return true;
++ 
++ 	if (!(slave_dev->xfrmdev_ops
++ 	      && slave_dev->xfrmdev_ops->xdo_dev_offload_ok)) {
++ 		slave_warn(bond_dev, slave_dev, "%s: no slave xdo_dev_offload_ok\n", __func__);
++ 		return false;
++ 	}
++ 
++ 	xs->xso.real_dev = slave_dev;
++ 	return slave_dev->xfrmdev_ops->xdo_dev_offload_ok(skb, xs);
++ }
++ 
++ static const struct xfrmdev_ops bond_xfrmdev_ops = {
++ 	.xdo_dev_state_add = bond_ipsec_add_sa,
++ 	.xdo_dev_state_delete = bond_ipsec_del_sa,
++ 	.xdo_dev_offload_ok = bond_ipsec_offload_ok,
++ };
++ #endif /* CONFIG_XFRM_OFFLOAD */
++ 
+++>>>>>>> 5cd24cbe7dca (bonding: deal with xfrm state in all modes and add more error-checking)
+  /*------------------------------- Link status -------------------------------*/
+  
+  /* Set the carrier state for the master according to the state of its
+@@@ -878,6 -971,11 +973,14 @@@ void bond_change_active_slave(struct bo
+  	if (old_active == new_active)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_XFRM_OFFLOAD
++ 	if (old_active && bond->xs)
++ 		bond_ipsec_del_sa(bond->xs);
++ #endif /* CONFIG_XFRM_OFFLOAD */
++ 
+++>>>>>>> 5cd24cbe7dca (bonding: deal with xfrm state in all modes and add more error-checking)
+  	if (new_active) {
+  		new_active->last_link_up = jiffies;
+  
+* Unmerged path drivers/net/bonding/bond_main.c
