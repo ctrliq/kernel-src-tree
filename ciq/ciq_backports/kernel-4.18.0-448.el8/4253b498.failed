@@ -1,0 +1,269 @@
+ipv4: Add custom multipath hash policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ido Schimmel <idosch@OSS.NVIDIA.COM>
+commit 4253b4986f98da4bfcb6a24d3fc6ff19f28e8420
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/4253b498.failed
+
+Add a new multipath hash policy where the packet fields used for hash
+calculation are determined by user space via the
+fib_multipath_hash_fields sysctl that was introduced in the previous
+patch.
+
+The current set of available packet fields includes both outer and inner
+fields, which requires two invocations of the flow dissector. Avoid
+unnecessary dissection of the outer or inner flows by skipping
+dissection if none of the outer or inner fields are required.
+
+In accordance with the existing policies, when an skb is not available,
+packet fields are extracted from the provided flow key. In which case,
+only outer fields are considered.
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4253b4986f98da4bfcb6a24d3fc6ff19f28e8420)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ip-sysctl.txt
+#	net/ipv4/sysctl_net_ipv4.c
+diff --cc Documentation/networking/ip-sysctl.txt
+index e84d1a075b75,afdcdc0691d6..000000000000
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@@ -76,10 -91,49 +76,52 @@@ fib_multipath_use_neigh - BOOLEA
+  fib_multipath_hash_policy - INTEGER
+  	Controls which hash policy to use for multipath routes. Only valid
+  	for kernels built with CONFIG_IP_ROUTE_MULTIPATH enabled.
+ -
+  	Default: 0 (Layer 3)
+ -
+  	Possible values:
+++<<<<<<< HEAD:Documentation/networking/ip-sysctl.txt
+ +	0 - Layer 3
+ +	1 - Layer 4
+++=======
++ 
++ 	- 0 - Layer 3
++ 	- 1 - Layer 4
++ 	- 2 - Layer 3 or inner Layer 3 if present
++ 	- 3 - Custom multipath hash. Fields used for multipath hash calculation
++ 	  are determined by fib_multipath_hash_fields sysctl
++ 
++ fib_multipath_hash_fields - UNSIGNED INTEGER
++ 	When fib_multipath_hash_policy is set to 3 (custom multipath hash), the
++ 	fields used for multipath hash calculation are determined by this
++ 	sysctl.
++ 
++ 	This value is a bitmask which enables various fields for multipath hash
++ 	calculation.
++ 
++ 	Possible fields are:
++ 
++ 	====== ============================
++ 	0x0001 Source IP address
++ 	0x0002 Destination IP address
++ 	0x0004 IP protocol
++ 	0x0008 Unused (Flow Label)
++ 	0x0010 Source port
++ 	0x0020 Destination port
++ 	0x0040 Inner source IP address
++ 	0x0080 Inner destination IP address
++ 	0x0100 Inner IP protocol
++ 	0x0200 Inner Flow Label
++ 	0x0400 Inner source port
++ 	0x0800 Inner destination port
++ 	====== ============================
++ 
++ 	Default: 0x0007 (source IP, destination IP and IP protocol)
++ 
++ fib_sync_mem - UNSIGNED INTEGER
++ 	Amount of dirty memory from fib entries that can be backlogged before
++ 	synchronize_rcu is forced.
++ 
++ 	Default: 512kB   Minimum: 64kB   Maximum: 64MB
+++>>>>>>> 4253b4986f98 (ipv4: Add custom multipath hash policy):Documentation/networking/ip-sysctl.rst
+  
+  ip_forward_update_priority - INTEGER
+  	Whether to update SKB priority from "TOS" field in IPv4 header after it
+diff --cc net/ipv4/sysctl_net_ipv4.c
+index 73ccfaaa3e67,ffb38ea06841..000000000000
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@@ -29,9 -30,9 +29,10 @@@
+  #include <net/netevent.h>
+  
+  static int two = 2;
++ static int three __maybe_unused = 3;
+  static int four = 4;
+  static int thousand = 1000;
+ +static int gso_max_segs = GSO_MAX_SEGS;
+  static int tcp_retr1_max = 255;
+  static int ip_local_port_range_min[] = { 1, 1 };
+  static int ip_local_port_range_max[] = { 65535, 65535 };
+@@@ -956,7 -1054,16 +957,20 @@@ static struct ctl_table ipv4_net_table[
+  		.mode		= 0644,
+  		.proc_handler	= proc_fib_multipath_hash_policy,
+  		.extra1		= SYSCTL_ZERO,
+++<<<<<<< HEAD
+ +		.extra2		= SYSCTL_ONE,
+++=======
++ 		.extra2		= &three,
++ 	},
++ 	{
++ 		.procname	= "fib_multipath_hash_fields",
++ 		.data		= &init_net.ipv4.sysctl_fib_multipath_hash_fields,
++ 		.maxlen		= sizeof(u32),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_douintvec_minmax,
++ 		.extra1		= SYSCTL_ONE,
++ 		.extra2		= &fib_multipath_hash_fields_all_mask,
+++>>>>>>> 4253b4986f98 (ipv4: Add custom multipath hash policy)
+  	},
+  #endif
+  	{
+* Unmerged path Documentation/networking/ip-sysctl.txt
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 5ad19572d74a..d4cb34c62dd9 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1894,6 +1894,121 @@ static void ip_multipath_l3_keys(const struct sk_buff *skb,
+ 	hash_keys->addrs.v4addrs.dst = key_iph->daddr;
+ }
+ 
++static u32 fib_multipath_custom_hash_outer(const struct net *net,
++					   const struct sk_buff *skb,
++					   bool *p_has_inner)
++{
++	u32 hash_fields = net->ipv4.sysctl_fib_multipath_hash_fields;
++	struct flow_keys keys, hash_keys;
++
++	if (!(hash_fields & FIB_MULTIPATH_HASH_FIELD_OUTER_MASK))
++		return 0;
++
++	memset(&hash_keys, 0, sizeof(hash_keys));
++	skb_flow_dissect_flow_keys(skb, &keys, FLOW_DISSECTOR_F_STOP_AT_ENCAP);
++
++	hash_keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_SRC_IP)
++		hash_keys.addrs.v4addrs.src = keys.addrs.v4addrs.src;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_DST_IP)
++		hash_keys.addrs.v4addrs.dst = keys.addrs.v4addrs.dst;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_IP_PROTO)
++		hash_keys.basic.ip_proto = keys.basic.ip_proto;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_SRC_PORT)
++		hash_keys.ports.src = keys.ports.src;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_DST_PORT)
++		hash_keys.ports.dst = keys.ports.dst;
++
++	*p_has_inner = !!(keys.control.flags & FLOW_DIS_ENCAPSULATION);
++	return flow_hash_from_keys(&hash_keys);
++}
++
++static u32 fib_multipath_custom_hash_inner(const struct net *net,
++					   const struct sk_buff *skb,
++					   bool has_inner)
++{
++	u32 hash_fields = net->ipv4.sysctl_fib_multipath_hash_fields;
++	struct flow_keys keys, hash_keys;
++
++	/* We assume the packet carries an encapsulation, but if none was
++	 * encountered during dissection of the outer flow, then there is no
++	 * point in calling the flow dissector again.
++	 */
++	if (!has_inner)
++		return 0;
++
++	if (!(hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_MASK))
++		return 0;
++
++	memset(&hash_keys, 0, sizeof(hash_keys));
++	skb_flow_dissect_flow_keys(skb, &keys, 0);
++
++	if (!(keys.control.flags & FLOW_DIS_ENCAPSULATION))
++		return 0;
++
++	if (keys.control.addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
++		hash_keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++		if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_SRC_IP)
++			hash_keys.addrs.v4addrs.src = keys.addrs.v4addrs.src;
++		if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_DST_IP)
++			hash_keys.addrs.v4addrs.dst = keys.addrs.v4addrs.dst;
++	} else if (keys.control.addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++		hash_keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
++		if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_SRC_IP)
++			hash_keys.addrs.v6addrs.src = keys.addrs.v6addrs.src;
++		if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_DST_IP)
++			hash_keys.addrs.v6addrs.dst = keys.addrs.v6addrs.dst;
++		if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_FLOWLABEL)
++			hash_keys.tags.flow_label = keys.tags.flow_label;
++	}
++
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_IP_PROTO)
++		hash_keys.basic.ip_proto = keys.basic.ip_proto;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_SRC_PORT)
++		hash_keys.ports.src = keys.ports.src;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_INNER_DST_PORT)
++		hash_keys.ports.dst = keys.ports.dst;
++
++	return flow_hash_from_keys(&hash_keys);
++}
++
++static u32 fib_multipath_custom_hash_skb(const struct net *net,
++					 const struct sk_buff *skb)
++{
++	u32 mhash, mhash_inner;
++	bool has_inner = true;
++
++	mhash = fib_multipath_custom_hash_outer(net, skb, &has_inner);
++	mhash_inner = fib_multipath_custom_hash_inner(net, skb, has_inner);
++
++	return jhash_2words(mhash, mhash_inner, 0);
++}
++
++static u32 fib_multipath_custom_hash_fl4(const struct net *net,
++					 const struct flowi4 *fl4)
++{
++	u32 hash_fields = net->ipv4.sysctl_fib_multipath_hash_fields;
++	struct flow_keys hash_keys;
++
++	if (!(hash_fields & FIB_MULTIPATH_HASH_FIELD_OUTER_MASK))
++		return 0;
++
++	memset(&hash_keys, 0, sizeof(hash_keys));
++	hash_keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_SRC_IP)
++		hash_keys.addrs.v4addrs.src = fl4->saddr;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_DST_IP)
++		hash_keys.addrs.v4addrs.dst = fl4->daddr;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_IP_PROTO)
++		hash_keys.basic.ip_proto = fl4->flowi4_proto;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_SRC_PORT)
++		hash_keys.ports.src = fl4->fl4_sport;
++	if (hash_fields & FIB_MULTIPATH_HASH_FIELD_DST_PORT)
++		hash_keys.ports.dst = fl4->fl4_dport;
++
++	return flow_hash_from_keys(&hash_keys);
++}
++
+ /* if skb is set it will be used and fl4 can be NULL */
+ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
+ 		       const struct sk_buff *skb, struct flow_keys *flkeys)
+@@ -1945,6 +2060,12 @@ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
+ 			hash_keys.basic.ip_proto = fl4->flowi4_proto;
+ 		}
+ 		break;
++	case 3:
++		if (skb)
++			mhash = fib_multipath_custom_hash_skb(net, skb);
++		else
++			mhash = fib_multipath_custom_hash_fl4(net, fl4);
++		break;
+ 	}
+ 	mhash = flow_hash_from_keys(&hash_keys);
+ 
+* Unmerged path net/ipv4/sysctl_net_ipv4.c
