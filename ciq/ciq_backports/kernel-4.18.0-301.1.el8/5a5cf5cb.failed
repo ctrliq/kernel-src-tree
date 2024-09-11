@@ -1,0 +1,153 @@
+cgroup: refactor fork helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Christian Brauner <christian.brauner@ubuntu.com>
+commit 5a5cf5cb30d7815c01035fde4b84edef85d11c68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/5a5cf5cb.failed
+
+This refactors the fork helpers so they can be easily modified in the
+next patches. The patch just moves the cgroup threadgroup rwsem grab and
+release into the helpers. They don't need to be directly exposed in fork.c.
+
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: cgroups@vger.kernel.org
+	Acked-by: Michal Koutný <mkoutny@suse.com>
+	Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 5a5cf5cb30d7815c01035fde4b84edef85d11c68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+diff --cc kernel/fork.c
+index 106b6a264fef,9245b6e53f55..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -2026,7 -2182,7 +2025,11 @@@ static __latent_entropy struct task_str
+  	 */
+  	retval = cgroup_can_fork(p);
+  	if (retval)
+++<<<<<<< HEAD
+ +		goto bad_fork_free_pid;
+++=======
++ 		goto bad_fork_put_pidfd;
+++>>>>>>> 5a5cf5cb30d7 (cgroup: refactor fork helpers)
+  
+  	/*
+  	 * From this point on we must avoid any synchronous user-space
+@@@ -2143,8 -2299,12 +2145,16 @@@ bad_fork_cancel_cgroup
+  	spin_unlock(&current->sighand->siglock);
+  	write_unlock_irq(&tasklist_lock);
+  	cgroup_cancel_fork(p);
+++<<<<<<< HEAD
+++=======
++ bad_fork_put_pidfd:
++ 	if (clone_flags & CLONE_PIDFD) {
++ 		fput(pidfile);
++ 		put_unused_fd(pidfd);
++ 	}
+++>>>>>>> 5a5cf5cb30d7 (cgroup: refactor fork helpers)
+  bad_fork_free_pid:
+ +	cgroup_threadgroup_change_end(current);
+  	if (pid != &init_struct_pid)
+  		free_pid(pid);
+  bad_fork_cleanup_thread:
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index d0d3a4c623b7..a442268459e4 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -5913,17 +5913,20 @@ static struct cgroup *cgroup_get_from_file(struct file *f)
+ 
+ /**
+  * cgroup_can_fork - called on a new task before the process is exposed
+- * @child: the task in question.
++ * @child: the child process
+  *
+- * This calls the subsystem can_fork() callbacks. If the can_fork() callback
+- * returns an error, the fork aborts with that error code. This allows for
+- * a cgroup subsystem to conditionally allow or deny new forks.
++ * This calls the subsystem can_fork() callbacks. If the cgroup_can_fork()
++ * callback returns an error, the fork aborts with that error code. This
++ * allows for a cgroup subsystem to conditionally allow or deny new forks.
+  */
+ int cgroup_can_fork(struct task_struct *child)
++	__acquires(&cgroup_threadgroup_rwsem) __releases(&cgroup_threadgroup_rwsem)
+ {
+ 	struct cgroup_subsys *ss;
+ 	int i, j, ret;
+ 
++	cgroup_threadgroup_change_begin(current);
++
+ 	do_each_subsys_mask(ss, i, have_canfork_callback) {
+ 		ret = ss->can_fork(child);
+ 		if (ret)
+@@ -5940,17 +5943,20 @@ int cgroup_can_fork(struct task_struct *child)
+ 			ss->cancel_fork(child);
+ 	}
+ 
++	cgroup_threadgroup_change_end(current);
++
+ 	return ret;
+ }
+ 
+ /**
+- * cgroup_cancel_fork - called if a fork failed after cgroup_can_fork()
+- * @child: the task in question
+- *
+- * This calls the cancel_fork() callbacks if a fork failed *after*
+- * cgroup_can_fork() succeded.
+- */
++  * cgroup_cancel_fork - called if a fork failed after cgroup_can_fork()
++  * @child: the child process
++  *
++  * This calls the cancel_fork() callbacks if a fork failed *after*
++  * cgroup_can_fork() succeded.
++  */
+ void cgroup_cancel_fork(struct task_struct *child)
++	__releases(&cgroup_threadgroup_rwsem)
+ {
+ 	struct cgroup_subsys *ss;
+ 	int i;
+@@ -5958,19 +5964,19 @@ void cgroup_cancel_fork(struct task_struct *child)
+ 	for_each_subsys(ss, i)
+ 		if (ss->cancel_fork)
+ 			ss->cancel_fork(child);
++
++	cgroup_threadgroup_change_end(current);
+ }
+ 
+ /**
+- * cgroup_post_fork - called on a new task after adding it to the task list
+- * @child: the task in question
+- *
+- * Adds the task to the list running through its css_set if necessary and
+- * call the subsystem fork() callbacks.  Has to be after the task is
+- * visible on the task list in case we race with the first call to
+- * cgroup_task_iter_start() - to guarantee that the new task ends up on its
+- * list.
++ * cgroup_post_fork - finalize cgroup setup for the child process
++ * @child: the child process
++ *
++ * Attach the child process to its css_set calling the subsystem fork()
++ * callbacks.
+  */
+ void cgroup_post_fork(struct task_struct *child)
++	__releases(&cgroup_threadgroup_rwsem)
+ {
+ 	struct cgroup_subsys *ss;
+ 	struct css_set *cset;
+@@ -6016,6 +6022,8 @@ void cgroup_post_fork(struct task_struct *child)
+ 	do_each_subsys_mask(ss, i, have_fork_callback) {
+ 		ss->fork(child);
+ 	} while_each_subsys_mask();
++
++	cgroup_threadgroup_change_end(current);
+ }
+ 
+ /**
+* Unmerged path kernel/fork.c
