@@ -1,0 +1,198 @@
+nvme: implement multiple I/O Command Set support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Niklas Cassel <niklas.cassel@wdc.com>
+commit 71010c30945425203da8d069a10fa45a05a00f96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/71010c30.failed
+
+Implements support for multiple I/O Command Sets.  NVMe TP 4056
+introduces a method to enumerate multiple command sets per namespace. If
+the command set is exposed, this method for enumeration will be used
+instead of the traditional method that uses the CC.CSS register command
+set register for command set identification.
+
+For namespaces where the Command Set Identifier is not supported or
+recognized, the specific namespace will not be created.
+
+	Reviewed-by: Javier González <javier.gonz@samsung.com>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Reviewed-by: Matias Bjørling <matias.bjorling@wdc.com>
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Niklas Cassel <niklas.cassel@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 71010c30945425203da8d069a10fa45a05a00f96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index a417265f32b1,892291dbee64..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1153,14 -1111,10 +1167,13 @@@ static int nvme_identify_ns_descs(struc
+  		struct nvme_ns_ids *ids)
+  {
+  	struct nvme_command c = { };
+- 	int status;
++ 	bool csi_seen = false;
++ 	int status, pos, len;
+  	void *data;
+- 	int pos;
+- 	int len;
+  
+ +	if (ctrl->quirks & NVME_QUIRK_NO_NS_DESC_LIST)
+ +		return 0;
+ +
+  	c.identify.opcode = nvme_admin_identify;
+  	c.identify.nsid = cpu_to_le32(nsid);
+  	c.identify.cns = NVME_ID_CNS_NS_DESC_LIST;
+@@@ -1174,6 -1128,18 +1187,21 @@@
+  	if (status) {
+  		dev_warn(ctrl->device,
+  			"Identify Descriptors failed (%d)\n", status);
+++<<<<<<< HEAD
+++=======
++ 		 /*
++ 		  * Don't treat non-retryable errors as fatal, as we potentially
++ 		  * already have a NGUID or EUI-64.  If we failed with DNR set,
++ 		  * we want to silently ignore the error as we can still
++ 		  * identify the device, but if the status has DNR set, we want
++ 		  * to propagate the error back specifically for the disk
++ 		  * revalidation flow to make sure we don't abandon the
++ 		  * device just because of a temporal retry-able error (such
++ 		  * as path of transport errors).
++ 		  */
++ 		if (status > 0 && (status & NVME_SC_DNR) && !nvme_multi_css(ctrl))
++ 			status = 0;
+++>>>>>>> 71010c309454 (nvme: implement multiple I/O Command Set support)
+  		goto free_data;
+  	}
+  
+@@@ -1965,9 -1957,18 +2001,24 @@@ static void __nvme_revalidate_disk(stru
+  	if (ns->lba_shift == 0)
+  		ns->lba_shift = 9;
+  
+++<<<<<<< HEAD
+ +	if ((ns->ctrl->quirks & NVME_QUIRK_STRIPE_SIZE) &&
+ +	    is_power_of_2(ns->ctrl->max_hw_sectors))
+ +		iob = ns->ctrl->max_hw_sectors;
+++=======
++ 	switch (ns->head->ids.csi) {
++ 	case NVME_CSI_NVM:
++ 		break;
++ 	default:
++ 		dev_warn(ctrl->device, "unknown csi:%d ns:%d\n",
++ 			ns->head->ids.csi, ns->head->ns_id);
++ 		return -ENODEV;
++ 	}
++ 
++ 	if ((ctrl->quirks & NVME_QUIRK_STRIPE_SIZE) &&
++ 	    is_power_of_2(ctrl->max_hw_sectors))
++ 		iob = ctrl->max_hw_sectors;
+++>>>>>>> 71010c309454 (nvme: implement multiple I/O Command Set support)
+  	else
+  		iob = nvme_lba_to_sect(ns, le16_to_cpu(id->noiob));
+  
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 96ebbf481c43..9dee38fe4a67 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -348,6 +348,7 @@ struct nvme_ns_ids {
+ 	u8	eui64[8];
+ 	u8	nguid[16];
+ 	uuid_t	uuid;
++	u8	csi;
+ };
+ 
+ /*
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index dfd2caceacec..05c970ebff06 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -140,6 +140,7 @@ enum {
+ #define NVME_CAP_TIMEOUT(cap)	(((cap) >> 24) & 0xff)
+ #define NVME_CAP_STRIDE(cap)	(((cap) >> 32) & 0xf)
+ #define NVME_CAP_NSSRC(cap)	(((cap) >> 36) & 0x1)
++#define NVME_CAP_CSS(cap)	(((cap) >> 37) & 0xff)
+ #define NVME_CAP_MPSMIN(cap)	(((cap) >> 48) & 0xf)
+ #define NVME_CAP_MPSMAX(cap)	(((cap) >> 52) & 0xf)
+ 
+@@ -170,7 +171,6 @@ enum {
+ 
+ enum {
+ 	NVME_CC_ENABLE		= 1 << 0,
+-	NVME_CC_CSS_NVM		= 0 << 4,
+ 	NVME_CC_EN_SHIFT	= 0,
+ 	NVME_CC_CSS_SHIFT	= 4,
+ 	NVME_CC_MPS_SHIFT	= 7,
+@@ -178,6 +178,9 @@ enum {
+ 	NVME_CC_SHN_SHIFT	= 14,
+ 	NVME_CC_IOSQES_SHIFT	= 16,
+ 	NVME_CC_IOCQES_SHIFT	= 20,
++	NVME_CC_CSS_NVM		= 0 << NVME_CC_CSS_SHIFT,
++	NVME_CC_CSS_CSI		= 6 << NVME_CC_CSS_SHIFT,
++	NVME_CC_CSS_MASK	= 7 << NVME_CC_CSS_SHIFT,
+ 	NVME_CC_AMS_RR		= 0 << NVME_CC_AMS_SHIFT,
+ 	NVME_CC_AMS_WRRU	= 1 << NVME_CC_AMS_SHIFT,
+ 	NVME_CC_AMS_VS		= 7 << NVME_CC_AMS_SHIFT,
+@@ -187,6 +190,8 @@ enum {
+ 	NVME_CC_SHN_MASK	= 3 << NVME_CC_SHN_SHIFT,
+ 	NVME_CC_IOSQES		= NVME_NVM_IOSQES << NVME_CC_IOSQES_SHIFT,
+ 	NVME_CC_IOCQES		= NVME_NVM_IOCQES << NVME_CC_IOCQES_SHIFT,
++	NVME_CAP_CSS_NVM	= 1 << 0,
++	NVME_CAP_CSS_CSI	= 1 << 6,
+ 	NVME_CSTS_RDY		= 1 << 0,
+ 	NVME_CSTS_CFS		= 1 << 1,
+ 	NVME_CSTS_NSSRO		= 1 << 4,
+@@ -380,6 +385,8 @@ enum {
+ 	NVME_ID_CNS_CTRL		= 0x01,
+ 	NVME_ID_CNS_NS_ACTIVE_LIST	= 0x02,
+ 	NVME_ID_CNS_NS_DESC_LIST	= 0x03,
++	NVME_ID_CNS_CS_NS		= 0x05,
++	NVME_ID_CNS_CS_CTRL		= 0x06,
+ 	NVME_ID_CNS_NS_PRESENT_LIST	= 0x10,
+ 	NVME_ID_CNS_NS_PRESENT		= 0x11,
+ 	NVME_ID_CNS_CTRL_NS_LIST	= 0x12,
+@@ -389,6 +396,10 @@ enum {
+ 	NVME_ID_CNS_UUID_LIST		= 0x17,
+ };
+ 
++enum {
++	NVME_CSI_NVM			= 0,
++};
++
+ enum {
+ 	NVME_DIR_IDENTIFY		= 0x00,
+ 	NVME_DIR_STREAMS		= 0x01,
+@@ -437,11 +448,13 @@ struct nvme_ns_id_desc {
+ #define NVME_NIDT_EUI64_LEN	8
+ #define NVME_NIDT_NGUID_LEN	16
+ #define NVME_NIDT_UUID_LEN	16
++#define NVME_NIDT_CSI_LEN	1
+ 
+ enum {
+ 	NVME_NIDT_EUI64		= 0x01,
+ 	NVME_NIDT_NGUID		= 0x02,
+ 	NVME_NIDT_UUID		= 0x03,
++	NVME_NIDT_CSI		= 0x04,
+ };
+ 
+ struct nvme_smart_log {
+@@ -968,7 +981,9 @@ struct nvme_identify {
+ 	__u8			cns;
+ 	__u8			rsvd3;
+ 	__le16			ctrlid;
+-	__u32			rsvd11[5];
++	__u8			rsvd11[3];
++	__u8			csi;
++	__u32			rsvd12[4];
+ };
+ 
+ #define NVME_IDENTIFY_DATA_SIZE 4096
