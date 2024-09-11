@@ -1,0 +1,88 @@
+NFS: Fix up commit deadlocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 133a48abf6ecc535d7eddc6da1c3e4c972445882
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/133a48ab.failed
+
+If O_DIRECT bumps the commit_info rpcs_out field, then that could lead
+to fsync() hangs. The fix is to ensure that O_DIRECT calls
+nfs_commit_end().
+
+Fixes: 723c921e7dfc ("sched/wait, fs/nfs: Convert wait_on_atomic_t() usage to the new wait_var_event() API")
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 133a48abf6ecc535d7eddc6da1c3e4c972445882)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/write.c
+diff --cc fs/nfs/write.c
+index d0419f83fb2f,465220f47142..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -1812,9 -1826,11 +1816,14 @@@ nfs_commit_list(struct inode *inode, st
+  
+  	/* Set up the argument struct */
+  	nfs_init_commit(data, head, NULL, cinfo);
+++<<<<<<< HEAD
+ +	atomic_inc(&cinfo->mds->rpcs_out);
+++=======
++ 	if (NFS_SERVER(inode)->nfs_client->cl_minorversion)
++ 		task_flags = RPC_TASK_MOVEABLE;
+++>>>>>>> 133a48abf6ec (NFS: Fix up commit deadlocks)
+  	return nfs_initiate_commit(NFS_CLIENT(inode), data, NFS_PROTO(inode),
+ -				   data->mds_ops, how,
+ -				   RPC_TASK_CRED_NOREF | task_flags);
+ +				   data->mds_ops, how, RPC_TASK_CRED_NOREF);
+  }
+  
+  /*
+diff --git a/fs/nfs/direct.c b/fs/nfs/direct.c
+index aaf50032e215..16806076bdb3 100644
+--- a/fs/nfs/direct.c
++++ b/fs/nfs/direct.c
+@@ -619,7 +619,7 @@ static void nfs_direct_commit_complete(struct nfs_commit_data *data)
+ 		nfs_unlock_and_release_request(req);
+ 	}
+ 
+-	if (atomic_dec_and_test(&cinfo.mds->rpcs_out))
++	if (nfs_commit_end(cinfo.mds))
+ 		nfs_direct_write_complete(dreq);
+ }
+ 
+diff --git a/fs/nfs/pnfs_nfs.c b/fs/nfs/pnfs_nfs.c
+index 02442a367733..808ef2c7b070 100644
+--- a/fs/nfs/pnfs_nfs.c
++++ b/fs/nfs/pnfs_nfs.c
+@@ -467,7 +467,6 @@ pnfs_bucket_alloc_ds_commits(struct list_head *list,
+ 				goto out_error;
+ 			data->ds_commit_index = i;
+ 			list_add_tail(&data->list, list);
+-			atomic_inc(&cinfo->mds->rpcs_out);
+ 			nreq++;
+ 		}
+ 		mutex_unlock(&NFS_I(cinfo->inode)->commit_mutex);
+@@ -519,7 +518,6 @@ pnfs_generic_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
+ 		data->ds_commit_index = -1;
+ 		list_splice_init(mds_pages, &data->pages);
+ 		list_add_tail(&data->list, &list);
+-		atomic_inc(&cinfo->mds->rpcs_out);
+ 		nreq++;
+ 	}
+ 
+* Unmerged path fs/nfs/write.c
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 40db094f5150..4c573be6cd50 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -556,6 +556,7 @@ extern int nfs_wb_page_cancel(struct inode *inode, struct page* page);
+ extern int  nfs_commit_inode(struct inode *, int);
+ extern struct nfs_commit_data *nfs_commitdata_alloc(bool never_fail);
+ extern void nfs_commit_free(struct nfs_commit_data *data);
++bool nfs_commit_end(struct nfs_mds_commit_info *cinfo);
+ 
+ static inline int
+ nfs_have_writebacks(struct inode *inode)
