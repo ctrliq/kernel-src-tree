@@ -1,0 +1,239 @@
+KVM: SVM: Add support for SEV-ES capability in KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 916391a2d1dc225bfb68624352b1495ec529444e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/916391a2.failed
+
+Add support to KVM for determining if a system is capable of supporting
+SEV-ES as well as determining if a guest is an SEV-ES guest.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Message-Id: <e66792323982c822350e40c7a1cf67ea2978a70b.1607620209.git.thomas.lendacky@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 916391a2d1dc225bfb68624352b1495ec529444e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/Kconfig
+diff --cc arch/x86/kvm/Kconfig
+index 548366f40372,7ac592664c52..000000000000
+--- a/arch/x86/kvm/Kconfig
++++ b/arch/x86/kvm/Kconfig
+@@@ -98,8 -99,9 +98,14 @@@ config KVM_AMD_SE
+  	bool "AMD Secure Encrypted Virtualization (SEV) support"
+  	depends on KVM_AMD && X86_64
+  	depends on CRYPTO_DEV_SP_PSP && !(KVM_AMD=y && CRYPTO_DEV_CCP_DD=m)
+++<<<<<<< HEAD
+ +	---help---
+ +	Provides support for launching Encrypted VMs on AMD processors.
+++=======
++ 	help
++ 	  Provides support for launching Encrypted VMs (SEV) and Encrypted VMs
++ 	  with Encrypted State (SEV-ES) on AMD processors.
+++>>>>>>> 916391a2d1dc (KVM: SVM: Add support for SEV-ES capability in KVM)
+  
+  config KVM_MMU_AUDIT
+  	bool "Audit KVM MMU"
+* Unmerged path arch/x86/kvm/Kconfig
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index e32b3ec356a9..928dafc6fa04 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -933,7 +933,7 @@ int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
+ 	struct kvm_sev_cmd sev_cmd;
+ 	int r;
+ 
+-	if (!svm_sev_enabled())
++	if (!svm_sev_enabled() || !sev)
+ 		return -ENOTTY;
+ 
+ 	if (!argp)
+@@ -1126,29 +1126,58 @@ void sev_vm_destroy(struct kvm *kvm)
+ 	sev_asid_free(sev->asid);
+ }
+ 
+-int __init sev_hardware_setup(void)
++void __init sev_hardware_setup(void)
+ {
++	unsigned int eax, ebx, ecx, edx;
++	bool sev_es_supported = false;
++	bool sev_supported = false;
++
++	/* Does the CPU support SEV? */
++	if (!boot_cpu_has(X86_FEATURE_SEV))
++		goto out;
++
++	/* Retrieve SEV CPUID information */
++	cpuid(0x8000001f, &eax, &ebx, &ecx, &edx);
++
+ 	/* Maximum number of encrypted guests supported simultaneously */
+-	max_sev_asid = cpuid_ecx(0x8000001F);
++	max_sev_asid = ecx;
+ 
+ 	if (!svm_sev_enabled())
+-		return 1;
++		goto out;
+ 
+ 	/* Minimum ASID value that should be used for SEV guest */
+-	min_sev_asid = cpuid_edx(0x8000001F);
++	min_sev_asid = edx;
+ 
+ 	/* Initialize SEV ASID bitmaps */
+ 	sev_asid_bitmap = bitmap_zalloc(max_sev_asid, GFP_KERNEL);
+ 	if (!sev_asid_bitmap)
+-		return 1;
++		goto out;
+ 
+ 	sev_reclaim_asid_bitmap = bitmap_zalloc(max_sev_asid, GFP_KERNEL);
+ 	if (!sev_reclaim_asid_bitmap)
+-		return 1;
++		goto out;
+ 
+-	pr_info("SEV supported\n");
++	pr_info("SEV supported: %u ASIDs\n", max_sev_asid - min_sev_asid + 1);
++	sev_supported = true;
+ 
+-	return 0;
++	/* SEV-ES support requested? */
++	if (!sev_es)
++		goto out;
++
++	/* Does the CPU support SEV-ES? */
++	if (!boot_cpu_has(X86_FEATURE_SEV_ES))
++		goto out;
++
++	/* Has the system been allocated ASIDs for SEV-ES? */
++	if (min_sev_asid == 1)
++		goto out;
++
++	pr_info("SEV-ES supported: %u ASIDs\n", min_sev_asid - 1);
++	sev_es_supported = true;
++
++out:
++	sev = sev_supported;
++	sev_es = sev_es_supported;
+ }
+ 
+ void sev_hardware_teardown(void)
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index f5e539ff1fc8..a930e79044ca 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -187,9 +187,13 @@ static int vgif = true;
+ module_param(vgif, int, 0444);
+ 
+ /* enable/disable SEV support */
+-static int sev = IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT_ACTIVE_BY_DEFAULT);
++int sev = IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT_ACTIVE_BY_DEFAULT);
+ module_param(sev, int, 0444);
+ 
++/* enable/disable SEV-ES support */
++int sev_es = IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT_ACTIVE_BY_DEFAULT);
++module_param(sev_es, int, 0444);
++
+ static bool __read_mostly dump_invalid_vmcb = 0;
+ module_param(dump_invalid_vmcb, bool, 0644);
+ 
+@@ -973,15 +977,11 @@ static __init int svm_hardware_setup(void)
+ 		kvm_enable_efer_bits(EFER_SVME | EFER_LMSLE);
+ 	}
+ 
+-	if (sev) {
+-		if (boot_cpu_has(X86_FEATURE_SEV) &&
+-		    IS_ENABLED(CONFIG_KVM_AMD_SEV)) {
+-			r = sev_hardware_setup();
+-			if (r)
+-				sev = false;
+-		} else {
+-			sev = false;
+-		}
++	if (IS_ENABLED(CONFIG_KVM_AMD_SEV) && sev) {
++		sev_hardware_setup();
++	} else {
++		sev = false;
++		sev_es = false;
+ 	}
+ 
+ 	svm_adjust_mmio_mask();
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index fdff76eb6ceb..ef0f0dfabc69 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -61,6 +61,7 @@ enum {
+ 
+ struct kvm_sev_info {
+ 	bool active;		/* SEV enabled guest */
++	bool es_active;		/* SEV-ES enabled guest */
+ 	unsigned int asid;	/* ASID used for this guest */
+ 	unsigned int handle;	/* SEV firmware handle */
+ 	int fd;			/* SEV device fd */
+@@ -194,6 +195,28 @@ static inline struct kvm_svm *to_kvm_svm(struct kvm *kvm)
+ 	return container_of(kvm, struct kvm_svm, kvm);
+ }
+ 
++static inline bool sev_guest(struct kvm *kvm)
++{
++#ifdef CONFIG_KVM_AMD_SEV
++	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
++
++	return sev->active;
++#else
++	return false;
++#endif
++}
++
++static inline bool sev_es_guest(struct kvm *kvm)
++{
++#ifdef CONFIG_KVM_AMD_SEV
++	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
++
++	return sev_guest(kvm) && sev->es_active;
++#else
++	return false;
++#endif
++}
++
+ static inline void vmcb_mark_all_dirty(struct vmcb *vmcb)
+ {
+ 	vmcb->control.clean = 0;
+@@ -352,6 +375,9 @@ static inline bool gif_set(struct vcpu_svm *svm)
+ #define MSR_CR3_LONG_MBZ_MASK			0xfff0000000000000U
+ #define MSR_INVALID				0xffffffffU
+ 
++extern int sev;
++extern int sev_es;
++
+ u32 svm_msrpm_offset(u32 msr);
+ u32 *svm_vcpu_alloc_msrpm(void);
+ void svm_vcpu_init_msrpm(struct kvm_vcpu *vcpu, u32 *msrpm);
+@@ -473,17 +499,6 @@ void svm_vcpu_unblocking(struct kvm_vcpu *vcpu);
+ 
+ extern unsigned int max_sev_asid;
+ 
+-static inline bool sev_guest(struct kvm *kvm)
+-{
+-#ifdef CONFIG_KVM_AMD_SEV
+-	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+-
+-	return sev->active;
+-#else
+-	return false;
+-#endif
+-}
+-
+ static inline bool svm_sev_enabled(void)
+ {
+ 	return IS_ENABLED(CONFIG_KVM_AMD_SEV) ? max_sev_asid : 0;
+@@ -496,7 +511,7 @@ int svm_register_enc_region(struct kvm *kvm,
+ int svm_unregister_enc_region(struct kvm *kvm,
+ 			      struct kvm_enc_region *range);
+ void pre_sev_run(struct vcpu_svm *svm, int cpu);
+-int __init sev_hardware_setup(void);
++void __init sev_hardware_setup(void);
+ void sev_hardware_teardown(void);
+ 
+ #endif
