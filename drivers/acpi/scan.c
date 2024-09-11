@@ -612,6 +612,7 @@ struct acpi_device *acpi_bus_get_acpi_device(acpi_handle handle)
 	acpi_get_device_data(handle, &adev, get_acpi_device);
 	return adev;
 }
+EXPORT_SYMBOL_GPL(acpi_bus_get_acpi_device);
 
 static struct acpi_device_bus_id *acpi_device_bus_id_match(const char *dev_id)
 {
