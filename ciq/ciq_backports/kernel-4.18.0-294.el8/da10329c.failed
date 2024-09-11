@@ -1,0 +1,185 @@
+virtio-balloon: switch back to OOM handler for VIRTIO_BALLOON_F_DEFLATE_ON_OOM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit da10329cb057e49be7f099eb7864d16f7705f798
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/da10329c.failed
+
+Commit 71994620bb25 ("virtio_balloon: replace oom notifier with shrinker")
+changed the behavior when deflation happens automatically.  Instead of
+deflating when called by the OOM handler, the shrinker is used.
+
+However, the balloon is not simply some other slab cache that should be
+shrunk when under memory pressure.  The shrinker does not have a concept
+of priorities yet, so this behavior cannot be configured.  Eventually once
+that is in place, we might want to switch back after doing proper testing.
+
+There was a report that this results in undesired side effects when
+inflating the balloon to shrink the page cache. [1]
+	"When inflating the balloon against page cache (i.e. no free memory
+	 remains) vmscan.c will both shrink page cache, but also invoke the
+	 shrinkers -- including the balloon's shrinker. So the balloon
+	 driver allocates memory which requires reclaim, vmscan gets this
+	 memory by shrinking the balloon, and then the driver adds the
+	 memory back to the balloon. Basically a busy no-op."
+
+The name "deflate on OOM" makes it pretty clear when deflation should
+happen - after other approaches to reclaim memory failed, not while
+reclaiming. This allows to minimize the footprint of a guest - memory
+will only be taken out of the balloon when really needed.
+
+Keep using the shrinker for VIRTIO_BALLOON_F_FREE_PAGE_HINT, because
+this has no such side effects. Always register the shrinker with
+VIRTIO_BALLOON_F_FREE_PAGE_HINT now. We are always allowed to reuse free
+pages that are still to be processed by the guest. The hypervisor takes
+care of identifying and resolving possible races between processing a
+hinting request and the guest reusing a page.
+
+In contrast to pre commit 71994620bb25 ("virtio_balloon: replace oom
+notifier with shrinker"), don't add a module parameter to configure the
+number of pages to deflate on OOM. Can be re-added if really needed.
+Also, pay attention that leak_balloon() returns the number of 4k pages -
+convert it properly in virtio_balloon_oom_notify().
+
+Testing done by Tyler for future reference:
+  Test setup: VM with 16 CPU, 64GB RAM. Running Debian 10. We have a 42
+  GB file full of random bytes that we continually cat to /dev/null.
+  This fills the page cache as the file is read. Meanwhile, we trigger
+  the balloon to inflate, with a target size of 53 GB. This setup causes
+  the balloon inflation to pressure the page cache as the page cache is
+  also trying to grow. Afterwards we shrink the balloon back to zero (so
+  total deflate == total inflate).
+
+  Without this patch (kernel 4.19.0-5):
+  Inflation never reaches the target until we stop the "cat file >
+  /dev/null" process. Total inflation time was 542 seconds. The longest
+  period that made no net forward progress was 315 seconds.
+    Result of "grep balloon /proc/vmstat" after the test:
+    balloon_inflate 154828377
+    balloon_deflate 154828377
+
+  With this patch (kernel 5.6.0-rc4+):
+  Total inflation duration was 63 seconds. No deflate-queue activity
+  occurs when pressuring the page-cache.
+    Result of "grep balloon /proc/vmstat" after the test:
+    balloon_inflate 12968539
+    balloon_deflate 12968539
+
+  Conclusion: This patch fixes the issue.  In the test it reduced
+  inflate/deflate activity by 12x, and reduced inflation time by 8.6x.
+  But more importantly, if we hadn't killed the "cat file > /dev/null"
+  process then, without the patch, the inflation process would never reach
+  the target.
+
+[1] https://www.spinics.net/lists/linux-virtualization/msg40863.html
+
+Link: http://lkml.kernel.org/r/20200311135523.18512-2-david@redhat.com
+Fixes: 71994620bb25 ("virtio_balloon: replace oom notifier with shrinker")
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Reported-by: Tyler Sanderson <tysand@google.com>
+	Tested-by: Tyler Sanderson <tysand@google.com>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Wei Wang <wei.w.wang@intel.com>
+	Cc: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Nadav Amit <namit@vmware.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit da10329cb057e49be7f099eb7864d16f7705f798)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/virtio/virtio_balloon.c
+diff --cc drivers/virtio/virtio_balloon.c
+index b554d8e684d2,0ef16566c3f3..000000000000
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@@ -124,8 -117,15 +127,18 @@@ struct virtio_balloon 
+  	/* Memory statistics */
+  	struct virtio_balloon_stat stats[VIRTIO_BALLOON_S_NR];
+  
+- 	/* To register a shrinker to shrink memory upon memory pressure */
++ 	/* Shrinker to return free pages - VIRTIO_BALLOON_F_FREE_PAGE_HINT */
+  	struct shrinker shrinker;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* OOM notifier to deflate on OOM - VIRTIO_BALLOON_F_DEFLATE_ON_OOM */
++ 	struct notifier_block oom_nb;
++ 
++ 	/* Free page reporting device */
++ 	struct virtqueue *reporting_vq;
++ 	struct page_reporting_dev_info pr_dev_info;
+++>>>>>>> da10329cb057 (virtio-balloon: switch back to OOM handler for VIRTIO_BALLOON_F_DEFLATE_ON_OOM)
+  };
+  
+  static struct virtio_device_id id_table[] = {
+@@@ -958,21 -981,34 +960,49 @@@ static int virtballoon_probe(struct vir
+  		virtio_cwrite(vb->vdev, struct virtio_balloon_config,
+  			      poison_val, &poison_val);
+  	}
+++<<<<<<< HEAD
+ +	/*
+ +	 * We continue to use VIRTIO_BALLOON_F_DEFLATE_ON_OOM to decide if a
+ +	 * shrinker needs to be registered to relieve memory pressure.
+ +	 */
+ +	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM)) {
+ +		err = virtio_balloon_register_shrinker(vb);
+ +		if (err)
+ +			goto out_del_balloon_wq;
+ +	}
+++=======
++ 
++ 	vb->pr_dev_info.report = virtballoon_free_page_report;
++ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_REPORTING)) {
++ 		unsigned int capacity;
++ 
++ 		capacity = virtqueue_get_vring_size(vb->reporting_vq);
++ 		if (capacity < PAGE_REPORTING_CAPACITY) {
++ 			err = -ENOSPC;
++ 			goto out_unregister_oom;
++ 		}
++ 
++ 		err = page_reporting_register(&vb->pr_dev_info);
++ 		if (err)
++ 			goto out_unregister_oom;
++ 	}
++ 
+++>>>>>>> da10329cb057 (virtio-balloon: switch back to OOM handler for VIRTIO_BALLOON_F_DEFLATE_ON_OOM)
+  	virtio_device_ready(vdev);
+  
+  	if (towards_target(vb))
+  		virtballoon_changed(vdev);
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ out_unregister_oom:
++ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
++ 		unregister_oom_notifier(&vb->oom_nb);
++ out_unregister_shrinker:
++ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
++ 		virtio_balloon_unregister_shrinker(vb);
+++>>>>>>> da10329cb057 (virtio-balloon: switch back to OOM handler for VIRTIO_BALLOON_F_DEFLATE_ON_OOM)
+  out_del_balloon_wq:
+  	if (virtio_has_feature(vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
+  		destroy_workqueue(vb->balloon_wq);
+@@@ -1011,7 -1047,11 +1041,9 @@@ static void virtballoon_remove(struct v
+  {
+  	struct virtio_balloon *vb = vdev->priv;
+  
+ -	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_REPORTING))
+ -		page_reporting_unregister(&vb->pr_dev_info);
+  	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
++ 		unregister_oom_notifier(&vb->oom_nb);
++ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
+  		virtio_balloon_unregister_shrinker(vb);
+  	spin_lock_irq(&vb->stop_update_lock);
+  	vb->stop_update = true;
+* Unmerged path drivers/virtio/virtio_balloon.c
