@@ -1662,7 +1662,7 @@ static int __init intel_idle_init(void)
 		return retval;
 
 	intel_idle_cpuidle_devices = alloc_percpu(struct cpuidle_device);
-	if (intel_idle_cpuidle_devices == NULL)
+	if (!intel_idle_cpuidle_devices)
 		return -ENOMEM;
 
 	intel_idle_cpuidle_driver_init();
