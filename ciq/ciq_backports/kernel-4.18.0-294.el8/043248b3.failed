@@ -1,0 +1,264 @@
+KVM: VMX: Forbid userspace MSR filters for x2APIC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 043248b3280cefe286113525672327a4ddfecd3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/043248b3.failed
+
+Allowing userspace to intercept reads to x2APIC MSRs when APICV is
+fully enabled for the guest simply can't work.   But more in general,
+the LAPIC could be set to in-kernel after the MSR filter is setup
+and allowing accesses by userspace would be very confusing.
+
+We could in principle allow userspace to intercept reads and writes to TPR,
+and writes to EOI and SELF_IPI, but while that could be made it work, it
+would still be silly.
+
+	Cc: Alexander Graf <graf@amazon.com>
+	Cc: Aaron Lewis <aaronlewis@google.com>
+	Cc: Peter Xu <peterx@redhat.com>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 043248b3280cefe286113525672327a4ddfecd3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virt/kvm/api.rst
+#	arch/x86/kvm/x86.c
+diff --cc Documentation/virt/kvm/api.rst
+index 235a1db41e51,9ece9a827a58..000000000000
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@@ -4701,6 -4707,106 +4701,109 @@@ KVM_PV_VM_VERIF
+    Verify the integrity of the unpacked image. Only if this succeeds,
+    KVM is allowed to start protected VCPUs.
+  
+++<<<<<<< HEAD
+++=======
++ 4.126 KVM_X86_SET_MSR_FILTER
++ ----------------------------
++ 
++ :Capability: KVM_X86_SET_MSR_FILTER
++ :Architectures: x86
++ :Type: vm ioctl
++ :Parameters: struct kvm_msr_filter
++ :Returns: 0 on success, < 0 on error
++ 
++ ::
++ 
++   struct kvm_msr_filter_range {
++   #define KVM_MSR_FILTER_READ  (1 << 0)
++   #define KVM_MSR_FILTER_WRITE (1 << 1)
++ 	__u32 flags;
++ 	__u32 nmsrs; /* number of msrs in bitmap */
++ 	__u32 base;  /* MSR index the bitmap starts at */
++ 	__u8 *bitmap; /* a 1 bit allows the operations in flags, 0 denies */
++   };
++ 
++   #define KVM_MSR_FILTER_MAX_RANGES 16
++   struct kvm_msr_filter {
++   #define KVM_MSR_FILTER_DEFAULT_ALLOW (0 << 0)
++   #define KVM_MSR_FILTER_DEFAULT_DENY  (1 << 0)
++ 	__u32 flags;
++ 	struct kvm_msr_filter_range ranges[KVM_MSR_FILTER_MAX_RANGES];
++   };
++ 
++ flags values for ``struct kvm_msr_filter_range``:
++ 
++ ``KVM_MSR_FILTER_READ``
++ 
++   Filter read accesses to MSRs using the given bitmap. A 0 in the bitmap
++   indicates that a read should immediately fail, while a 1 indicates that
++   a read for a particular MSR should be handled regardless of the default
++   filter action.
++ 
++ ``KVM_MSR_FILTER_WRITE``
++ 
++   Filter write accesses to MSRs using the given bitmap. A 0 in the bitmap
++   indicates that a write should immediately fail, while a 1 indicates that
++   a write for a particular MSR should be handled regardless of the default
++   filter action.
++ 
++ ``KVM_MSR_FILTER_READ | KVM_MSR_FILTER_WRITE``
++ 
++   Filter both read and write accesses to MSRs using the given bitmap. A 0
++   in the bitmap indicates that both reads and writes should immediately fail,
++   while a 1 indicates that reads and writes for a particular MSR are not
++   filtered by this range.
++ 
++ flags values for ``struct kvm_msr_filter``:
++ 
++ ``KVM_MSR_FILTER_DEFAULT_ALLOW``
++ 
++   If no filter range matches an MSR index that is getting accessed, KVM will
++   fall back to allowing access to the MSR.
++ 
++ ``KVM_MSR_FILTER_DEFAULT_DENY``
++ 
++   If no filter range matches an MSR index that is getting accessed, KVM will
++   fall back to rejecting access to the MSR. In this mode, all MSRs that should
++   be processed by KVM need to explicitly be marked as allowed in the bitmaps.
++ 
++ This ioctl allows user space to define up to 16 bitmaps of MSR ranges to
++ specify whether a certain MSR access should be explicitly filtered for or not.
++ 
++ If this ioctl has never been invoked, MSR accesses are not guarded and the
++ default KVM in-kernel emulation behavior is fully preserved.
++ 
++ Calling this ioctl with an empty set of ranges (all nmsrs == 0) disables MSR
++ filtering. In that mode, ``KVM_MSR_FILTER_DEFAULT_DENY`` is invalid and causes
++ an error.
++ 
++ As soon as the filtering is in place, every MSR access is processed through
++ the filtering except for accesses to the x2APIC MSRs (from 0x800 to 0x8ff);
++ x2APIC MSRs are always allowed, independent of the ``default_allow`` setting,
++ and their behavior depends on the ``X2APIC_ENABLE`` bit of the APIC base
++ register.
++ 
++ If a bit is within one of the defined ranges, read and write accesses are
++ guarded by the bitmap's value for the MSR index if the kind of access
++ is included in the ``struct kvm_msr_filter_range`` flags.  If no range
++ cover this particular access, the behavior is determined by the flags
++ field in the kvm_msr_filter struct: ``KVM_MSR_FILTER_DEFAULT_ALLOW``
++ and ``KVM_MSR_FILTER_DEFAULT_DENY``.
++ 
++ Each bitmap range specifies a range of MSRs to potentially allow access on.
++ The range goes from MSR index [base .. base+nmsrs]. The flags field
++ indicates whether reads, writes or both reads and writes are filtered
++ by setting a 1 bit in the bitmap for the corresponding MSR index.
++ 
++ If an MSR access is not permitted through the filtering, it generates a
++ #GP inside the guest. When combined with KVM_CAP_X86_USER_SPACE_MSR, that
++ allows user space to deflect and potentially handle various MSR accesses
++ into user space.
++ 
++ If a vCPU is in running state while this ioctl is invoked, the vCPU may
++ experience inconsistent filtering behavior on MSR accesses.
++ 
+++>>>>>>> 043248b3280c (KVM: VMX: Forbid userspace MSR filters for x2APIC)
+  
+  5. The kvm_run structure
+  ========================
+diff --cc arch/x86/kvm/x86.c
+index 29982f9947ef,0f02d0fe3abb..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -4996,6 -5182,110 +4996,113 @@@ split_irqchip_unlock
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kvm_clear_msr_filter(struct kvm *kvm)
++ {
++ 	u32 i;
++ 	u32 count = kvm->arch.msr_filter.count;
++ 	struct msr_bitmap_range ranges[16];
++ 
++ 	mutex_lock(&kvm->lock);
++ 	kvm->arch.msr_filter.count = 0;
++ 	memcpy(ranges, kvm->arch.msr_filter.ranges, count * sizeof(ranges[0]));
++ 	mutex_unlock(&kvm->lock);
++ 	synchronize_srcu(&kvm->srcu);
++ 
++ 	for (i = 0; i < count; i++)
++ 		kfree(ranges[i].bitmap);
++ }
++ 
++ static int kvm_add_msr_filter(struct kvm *kvm, struct kvm_msr_filter_range *user_range)
++ {
++ 	struct msr_bitmap_range *ranges = kvm->arch.msr_filter.ranges;
++ 	struct msr_bitmap_range range;
++ 	unsigned long *bitmap = NULL;
++ 	size_t bitmap_size;
++ 	int r;
++ 
++ 	if (!user_range->nmsrs)
++ 		return 0;
++ 
++ 	bitmap_size = BITS_TO_LONGS(user_range->nmsrs) * sizeof(long);
++ 	if (!bitmap_size || bitmap_size > KVM_MSR_FILTER_MAX_BITMAP_SIZE)
++ 		return -EINVAL;
++ 
++ 	bitmap = memdup_user((__user u8*)user_range->bitmap, bitmap_size);
++ 	if (IS_ERR(bitmap))
++ 		return PTR_ERR(bitmap);
++ 
++ 	range = (struct msr_bitmap_range) {
++ 		.flags = user_range->flags,
++ 		.base = user_range->base,
++ 		.nmsrs = user_range->nmsrs,
++ 		.bitmap = bitmap,
++ 	};
++ 
++ 	if (range.flags & ~(KVM_MSR_FILTER_READ | KVM_MSR_FILTER_WRITE)) {
++ 		r = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	if (!range.flags) {
++ 		r = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	/* Everything ok, add this range identifier to our global pool */
++ 	ranges[kvm->arch.msr_filter.count] = range;
++ 	/* Make sure we filled the array before we tell anyone to walk it */
++ 	smp_wmb();
++ 	kvm->arch.msr_filter.count++;
++ 
++ 	return 0;
++ err:
++ 	kfree(bitmap);
++ 	return r;
++ }
++ 
++ static int kvm_vm_ioctl_set_msr_filter(struct kvm *kvm, void __user *argp)
++ {
++ 	struct kvm_msr_filter __user *user_msr_filter = argp;
++ 	struct kvm_msr_filter filter;
++ 	bool default_allow;
++ 	int r = 0;
++ 	bool empty = true;
++ 	u32 i;
++ 
++ 	if (copy_from_user(&filter, user_msr_filter, sizeof(filter)))
++ 		return -EFAULT;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(filter.ranges); i++)
++ 		empty &= !filter.ranges[i].nmsrs;
++ 
++ 	default_allow = !(filter.flags & KVM_MSR_FILTER_DEFAULT_DENY);
++ 	if (empty && !default_allow)
++ 		return -EINVAL;
++ 
++ 	kvm_clear_msr_filter(kvm);
++ 
++ 	kvm->arch.msr_filter.default_allow = default_allow;
++ 
++ 	/*
++ 	 * Protect from concurrent calls to this function that could trigger
++ 	 * a TOCTOU violation on kvm->arch.msr_filter.count.
++ 	 */
++ 	mutex_lock(&kvm->lock);
++ 	for (i = 0; i < ARRAY_SIZE(filter.ranges); i++) {
++ 		r = kvm_add_msr_filter(kvm, &filter.ranges[i]);
++ 		if (r)
++ 			break;
++ 	}
++ 
++ 	kvm_make_all_cpus_request(kvm, KVM_REQ_MSR_FILTER_CHANGED);
++ 	mutex_unlock(&kvm->lock);
++ 
++ 	return r;
++ }
++ 
+++>>>>>>> 043248b3280c (KVM: VMX: Forbid userspace MSR filters for x2APIC)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+* Unmerged path Documentation/virt/kvm/api.rst
+* Unmerged path arch/x86/kvm/x86.c
