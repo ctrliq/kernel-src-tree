@@ -1,0 +1,178 @@
+KVM: x86: only allocate gfn_track when necessary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Stevens <stevensd@chromium.org>
+commit deae4a10f16649d9c8bfb89f38b61930fb938284
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/deae4a10.failed
+
+Avoid allocating the gfn_track arrays if nothing needs them. If there
+are no external to KVM users of the API (i.e. no GVT-g), then page
+tracking is only needed for shadow page tables. This means that when tdp
+is enabled and there are no external users, then the gfn_track arrays
+can be lazily allocated when the shadow MMU is actually used. This avoid
+allocations equal to .05% of guest memory when nested virtualization is
+not used, if the kernel is compiled without GVT-g.
+
+	Signed-off-by: David Stevens <stevensd@chromium.org>
+Message-Id: <20210922045859.2011227-3-stevensd@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit deae4a10f16649d9c8bfb89f38b61930fb938284)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_page_track.h
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/page_track.c
+diff --cc arch/x86/include/asm/kvm_page_track.h
+index 9cd9230e5cc8,79d84a94f8eb..000000000000
+--- a/arch/x86/include/asm/kvm_page_track.h
++++ b/arch/x86/include/asm/kvm_page_track.h
+@@@ -59,9 -62,8 +62,14 @@@ void kvm_slot_page_track_add_page(struc
+  void kvm_slot_page_track_remove_page(struct kvm *kvm,
+  				     struct kvm_memory_slot *slot, gfn_t gfn,
+  				     enum kvm_page_track_mode mode);
+++<<<<<<< HEAD
+ +bool kvm_page_track_is_active(struct kvm_vcpu *vcpu, gfn_t gfn,
+ +			      enum kvm_page_track_mode mode);
+ +bool kvm_slot_page_track_is_active(struct kvm_memory_slot *slot, gfn_t gfn,
+++=======
++ bool kvm_slot_page_track_is_active(struct kvm_vcpu *vcpu,
++ 				   struct kvm_memory_slot *slot, gfn_t gfn,
+++>>>>>>> deae4a10f166 (KVM: x86: only allocate gfn_track when necessary)
+  				   enum kvm_page_track_mode mode);
+  
+  void
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,24a9f4c3f5e7..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2590,7 -2583,7 +2590,11 @@@ int mmu_try_to_unsync_pages(struct kvm_
+  	 * track machinery is used to write-protect upper-level shadow pages,
+  	 * i.e. this guards the role.level == 4K assertion below!
+  	 */
+++<<<<<<< HEAD
+ +	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_WRITE))
+++=======
++ 	if (kvm_slot_page_track_is_active(vcpu, slot, gfn, KVM_PAGE_TRACK_WRITE))
+++>>>>>>> deae4a10f166 (KVM: x86: only allocate gfn_track when necessary)
+  		return -EPERM;
+  
+  	/*
+@@@ -3462,6 -3427,14 +3466,17 @@@ static int mmu_alloc_shadow_roots(struc
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	r = alloc_all_memslots_rmaps(vcpu->kvm);
++ 	if (r)
++ 		return r;
++ 
++ 	r = kvm_page_track_enable_mmu_write_tracking(vcpu->kvm);
++ 	if (r)
++ 		return r;
++ 
+++>>>>>>> deae4a10f166 (KVM: x86: only allocate gfn_track when necessary)
+  	write_lock(&vcpu->kvm->mmu_lock);
+  	r = make_mmu_pages_available(vcpu);
+  	if (r < 0)
+@@@ -5632,10 -5601,19 +5647,13 @@@ void kvm_mmu_init_vm(struct kvm *kvm
+  {
+  	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
+  
+ -	spin_lock_init(&kvm->arch.mmu_unsync_pages_lock);
+ +	kvm_mmu_init_tdp_mmu(kvm);
+  
+ -	if (!kvm_mmu_init_tdp_mmu(kvm))
+ -		/*
+ -		 * No smp_load/store wrappers needed here as we are in
+ -		 * VM init and there cannot be any memslots / other threads
+ -		 * accessing this struct kvm yet.
+ -		 */
+ -		kvm->arch.memslots_have_rmaps = true;
+ +	kvm->arch.memslots_have_rmaps = true;
+  
++ 	if (!tdp_enabled)
++ 		kvm->arch.memslots_mmu_write_tracking = true;
++ 
+  	node->track_write = kvm_mmu_pte_write;
+  	node->track_flush_slot = kvm_mmu_invalidate_zap_pages_in_memslot;
+  	kvm_page_track_register_notifier(kvm, node);
+diff --cc arch/x86/kvm/mmu/page_track.c
+index 58985087b096,bb5d60bd4dbf..000000000000
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@@ -16,8 -16,19 +16,18 @@@
+  
+  #include <asm/kvm_page_track.h>
+  
+ -#include "mmu.h"
+  #include "mmu_internal.h"
+  
++ static bool write_tracking_enabled(struct kvm *kvm)
++ {
++ 	/*
++ 	 * Read memslots_mmu_write_tracking before gfn_track pointers. Pairs
++ 	 * with smp_store_release in kvm_page_track_enable_mmu_write_tracking.
++ 	 */
++ 	return IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING) ||
++ 	       smp_load_acquire(&kvm->arch.memslots_mmu_write_tracking);
++ }
++ 
+  void kvm_page_track_free_memslot(struct kvm_memory_slot *slot)
+  {
+  	int i;
+@@@ -135,7 -198,11 +197,15 @@@ void kvm_slot_page_track_remove_page(st
+  }
+  EXPORT_SYMBOL_GPL(kvm_slot_page_track_remove_page);
+  
+++<<<<<<< HEAD
+ +bool kvm_slot_page_track_is_active(struct kvm_memory_slot *slot, gfn_t gfn,
+++=======
++ /*
++  * check if the corresponding access on the specified guest page is tracked.
++  */
++ bool kvm_slot_page_track_is_active(struct kvm_vcpu *vcpu,
++ 				   struct kvm_memory_slot *slot, gfn_t gfn,
+++>>>>>>> deae4a10f166 (KVM: x86: only allocate gfn_track when necessary)
+  				   enum kvm_page_track_mode mode)
+  {
+  	int index;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 45d5ce5def55..5a2a7a05d4ee 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1206,6 +1206,14 @@ struct kvm_arch {
+ 	 */
+ 	bool memslots_have_rmaps;
+ 
++	/*
++	 * Set when the KVM mmu needs guest write access page tracking. If
++	 * set, the necessary gfn_track arrays have been allocated for
++	 * all memslots and should be allocated for any newly created or
++	 * modified memslots.
++	 */
++	bool memslots_mmu_write_tracking;
++
+ #if IS_ENABLED(CONFIG_HYPERV)
+ 	hpa_t	hv_root_tdp;
+ 	spinlock_t hv_root_tdp_lock;
+* Unmerged path arch/x86/include/asm/kvm_page_track.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/page_track.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 1b1a9834002b..e7d682acc6ff 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11626,7 +11626,7 @@ static int kvm_alloc_memslot_metadata(struct kvm *kvm,
+ 		}
+ 	}
+ 
+-	if (kvm_page_track_create_memslot(slot, npages))
++	if (kvm_page_track_create_memslot(kvm, slot, npages))
+ 		goto out_free;
+ 
+ 	return 0;
