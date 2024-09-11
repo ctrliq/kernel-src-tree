@@ -564,6 +564,7 @@ static int u32_replace_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n,
 	cls_u32.knode.mask = 0;
 #endif
 	cls_u32.knode.sel = &n->sel;
+	cls_u32.knode.res = &n->res;
 	cls_u32.knode.exts = &n->exts;
 	if (n->ht_down)
 		cls_u32.knode.link_handle = ht->handle;
@@ -1251,6 +1252,7 @@ static int u32_reoffload_knode(struct tcf_proto *tp, struct tc_u_knode *n,
 		cls_u32.knode.mask = 0;
 #endif
 		cls_u32.knode.sel = &n->sel;
+		cls_u32.knode.res = &n->res;
 		cls_u32.knode.exts = &n->exts;
 		if (n->ht_down)
 			cls_u32.knode.link_handle = ht->handle;
