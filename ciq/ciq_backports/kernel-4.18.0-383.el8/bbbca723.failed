@@ -1,0 +1,247 @@
+powerpc/papr_scm: Implement initial support for injecting smart errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Vaibhav Jain <vaibhav@linux.ibm.com>
+commit bbbca72352bb9484bc057c91a408332b35ee8f4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/bbbca723.failed
+
+Presently PAPR doesn't support injecting smart errors on an
+NVDIMM. This makes testing the NVDIMM health reporting functionality
+difficult as simulating NVDIMM health related events need a hacked up
+qemu version.
+
+To solve this problem this patch proposes simulating certain set of
+NVDIMM health related events in papr_scm. Specifically 'fatal' health
+state and 'dirty' shutdown state. These error can be injected via the
+user-space 'ndctl-inject-smart(1)' command. With the proposed patch and
+corresponding ndctl patches following command flow is expected:
+
+$ sudo ndctl list -DH -d nmem0
+...
+      "health_state":"ok",
+      "shutdown_state":"clean",
+...
+ # inject unsafe shutdown and fatal health error
+$ sudo ndctl inject-smart nmem0 -Uf
+...
+      "health_state":"fatal",
+      "shutdown_state":"dirty",
+...
+ # uninject all errors
+$ sudo ndctl inject-smart nmem0 -N
+...
+      "health_state":"ok",
+      "shutdown_state":"clean",
+...
+
+The patch adds a new member 'health_bitmap_inject_mask' inside struct
+papr_scm_priv which is then bitwise ANDed to the health bitmap fetched from the
+hypervisor. The value for 'health_bitmap_inject_mask' is accessible from sysfs
+at nmemX/papr/health_bitmap_inject.
+
+A new PDSM named 'SMART_INJECT' is proposed that accepts newly
+introduced 'struct nd_papr_pdsm_smart_inject' as payload thats
+exchanged between libndctl and papr_scm to indicate the requested
+smart-error states.
+
+When the processing the PDSM 'SMART_INJECT', papr_pdsm_smart_inject()
+constructs a pair or 'inject_mask' and 'clear_mask' bitmaps from the payload
+and bit-blt it to the 'health_bitmap_inject_mask'. This ensures the after being
+fetched from the hypervisor, the health_bitmap reflects requested smart-error
+states.
+
+	Signed-off-by: Vaibhav Jain <vaibhav@linux.ibm.com>
+	Signed-off-by: Shivaprasad G Bhat <sbhat@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20220124202204.1488346-1-vaibhav@linux.ibm.com
+
+(cherry picked from commit bbbca72352bb9484bc057c91a408332b35ee8f4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/ABI/testing/sysfs-bus-papr-pmem
+#	arch/powerpc/platforms/pseries/papr_scm.c
+diff --cc Documentation/ABI/testing/sysfs-bus-papr-pmem
+index c1a67275c43f,4ac0673901e7..000000000000
+--- a/Documentation/ABI/testing/sysfs-bus-papr-pmem
++++ b/Documentation/ABI/testing/sysfs-bus-papr-pmem
+@@@ -51,4 -60,16 +51,20 @@@ Description
+  		* "MedWDur " : Media Write Duration
+  		* "CchRHCnt" : Cache Read Hit Count
+  		* "CchWHCnt" : Cache Write Hit Count
+- 		* "FastWCnt" : Fast Write Count
+++<<<<<<< HEAD
+++		* "FastWCnt" : Fast Write Count
+++=======
++ 		* "FastWCnt" : Fast Write Count
++ 
++ What:		/sys/bus/nd/devices/nmemX/papr/health_bitmap_inject
++ Date:		Jan, 2022
++ KernelVersion:	v5.17
++ Contact:	linuxppc-dev <linuxppc-dev@lists.ozlabs.org>, nvdimm@lists.linux.dev,
++ Description:
++ 		(RO) Reports the health bitmap inject bitmap that is applied to
++ 		bitmap received from PowerVM via the H_SCM_HEALTH. This is used
++ 		to forcibly set specific bits returned from Hcall. These is then
++ 		used to simulate various health or shutdown states for an nvdimm
++ 		and are set by user-space tools like ndctl by issuing a PAPR DSM.
++ 
+++>>>>>>> bbbca72352bb (powerpc/papr_scm: Implement initial support for injecting smart errors)
+diff --cc arch/powerpc/platforms/pseries/papr_scm.c
+index 673b76b00cfb,20aafd387840..000000000000
+--- a/arch/powerpc/platforms/pseries/papr_scm.c
++++ b/arch/powerpc/platforms/pseries/papr_scm.c
+@@@ -111,10 -115,52 +111,14 @@@ struct papr_scm_priv 
+  	/* Health information for the dimm */
+  	u64 health_bitmap;
+  
+ -	/* Holds the last known dirty shutdown counter value */
+ -	u64 dirty_shutdown_counter;
+ -
+  	/* length of the stat buffer as expected by phyp */
+  	size_t stat_buffer_len;
++ 
++ 	/* The bits which needs to be overridden */
++ 	u64 health_bitmap_inject_mask;
++ 
+  };
+  
+ -static int papr_scm_pmem_flush(struct nd_region *nd_region,
+ -			       struct bio *bio __maybe_unused)
+ -{
+ -	struct papr_scm_priv *p = nd_region_provider_data(nd_region);
+ -	unsigned long ret_buf[PLPAR_HCALL_BUFSIZE], token = 0;
+ -	long rc;
+ -
+ -	dev_dbg(&p->pdev->dev, "flush drc 0x%x", p->drc_index);
+ -
+ -	do {
+ -		rc = plpar_hcall(H_SCM_FLUSH, ret_buf, p->drc_index, token);
+ -		token = ret_buf[0];
+ -
+ -		/* Check if we are stalled for some time */
+ -		if (H_IS_LONG_BUSY(rc)) {
+ -			msleep(get_longbusy_msecs(rc));
+ -			rc = H_BUSY;
+ -		} else if (rc == H_BUSY) {
+ -			cond_resched();
+ -		}
+ -	} while (rc == H_BUSY);
+ -
+ -	if (rc) {
+ -		dev_err(&p->pdev->dev, "flush error: %ld", rc);
+ -		rc = -EIO;
+ -	} else {
+ -		dev_dbg(&p->pdev->dev, "flush drc 0x%x complete", p->drc_index);
+ -	}
+ -
+ -	return rc;
+ -}
+ -
+ -static LIST_HEAD(papr_nd_regions);
+ -static DEFINE_MUTEX(papr_ndr_lock);
+ -
+  static int drc_pmem_bind(struct papr_scm_priv *p)
+  {
+  	unsigned long ret[PLPAR_HCALL_BUFSIZE];
+@@@ -782,25 -908,19 +852,41 @@@ int papr_scm_ndctl(struct nvdimm_bus_de
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int papr_scm_node(int node)
+ +{
+ +	int min_dist = INT_MAX, dist;
+ +	int nid, min_node;
+ +
+ +	if ((node == NUMA_NO_NODE) || node_online(node))
+ +		return node;
+ +
+ +	min_node = first_online_node;
+ +	for_each_online_node(nid) {
+ +		dist = node_distance(node, nid);
+ +		if (dist < min_dist) {
+ +			min_dist = dist;
+ +			min_node = nid;
+ +		}
+ +	}
+ +	return min_node;
+ +}
+ +
+++=======
++ static ssize_t health_bitmap_inject_show(struct device *dev,
++ 					 struct device_attribute *attr,
++ 					 char *buf)
++ {
++ 	struct nvdimm *dimm = to_nvdimm(dev);
++ 	struct papr_scm_priv *p = nvdimm_provider_data(dimm);
++ 
++ 	return sprintf(buf, "%#llx\n",
++ 		       READ_ONCE(p->health_bitmap_inject_mask));
++ }
++ 
++ static DEVICE_ATTR_ADMIN_RO(health_bitmap_inject);
++ 
+++>>>>>>> bbbca72352bb (powerpc/papr_scm: Implement initial support for injecting smart errors)
+  static ssize_t perf_stats_show(struct device *dev,
+  			       struct device_attribute *attr, char *buf)
+  {
+@@@ -890,6 -1034,8 +976,11 @@@ DEVICE_ATTR_RO(flags)
+  static struct attribute *papr_nd_attributes[] = {
+  	&dev_attr_flags.attr,
+  	&dev_attr_perf_stats.attr,
+++<<<<<<< HEAD
+++=======
++ 	&dev_attr_dirty_shutdown.attr,
++ 	&dev_attr_health_bitmap_inject.attr,
+++>>>>>>> bbbca72352bb (powerpc/papr_scm: Implement initial support for injecting smart errors)
+  	NULL,
+  };
+  
+* Unmerged path Documentation/ABI/testing/sysfs-bus-papr-pmem
+diff --git a/arch/powerpc/include/uapi/asm/papr_pdsm.h b/arch/powerpc/include/uapi/asm/papr_pdsm.h
+index 50ef95e2f5b1..9b7ff224fd29 100644
+--- a/arch/powerpc/include/uapi/asm/papr_pdsm.h
++++ b/arch/powerpc/include/uapi/asm/papr_pdsm.h
+@@ -110,6 +110,22 @@ struct nd_papr_pdsm_health {
+ 	};
+ };
+ 
++/* Flags for injecting specific smart errors */
++#define PDSM_SMART_INJECT_HEALTH_FATAL		(1 << 0)
++#define PDSM_SMART_INJECT_BAD_SHUTDOWN		(1 << 1)
++
++struct nd_papr_pdsm_smart_inject {
++	union {
++		struct {
++			/* One or more of PDSM_SMART_INJECT_ */
++			__u32 flags;
++			__u8 fatal_enable;
++			__u8 unsafe_shutdown_enable;
++		};
++		__u8 buf[ND_PDSM_PAYLOAD_MAX_SIZE];
++	};
++};
++
+ /*
+  * Methods to be embedded in ND_CMD_CALL request. These are sent to the kernel
+  * via 'nd_cmd_pkg.nd_command' member of the ioctl struct
+@@ -117,12 +133,14 @@ struct nd_papr_pdsm_health {
+ enum papr_pdsm {
+ 	PAPR_PDSM_MIN = 0x0,
+ 	PAPR_PDSM_HEALTH,
++	PAPR_PDSM_SMART_INJECT,
+ 	PAPR_PDSM_MAX,
+ };
+ 
+ /* Maximal union that can hold all possible payload types */
+ union nd_pdsm_payload {
+ 	struct nd_papr_pdsm_health health;
++	struct nd_papr_pdsm_smart_inject smart_inject;
+ 	__u8 buf[ND_PDSM_PAYLOAD_MAX_SIZE];
+ } __packed;
+ 
+* Unmerged path arch/powerpc/platforms/pseries/papr_scm.c
