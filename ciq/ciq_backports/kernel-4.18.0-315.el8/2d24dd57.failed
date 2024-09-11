@@ -1,0 +1,640 @@
+rbtree: Add generic add and find helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 2d24dd5798d0474d9bf705bfca8725e7d20f9d54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/2d24dd57.failed
+
+I've always been bothered by the endless (fragile) boilerplate for
+rbtree, and I recently wrote some rbtree helpers for objtool and
+figured I should lift them into the kernel and use them more widely.
+
+Provide:
+
+partial-order; less() based:
+ - rb_add(): add a new entry to the rbtree
+ - rb_add_cached(): like rb_add(), but for a rb_root_cached
+
+total-order; cmp() based:
+ - rb_find(): find an entry in an rbtree
+ - rb_find_add(): find an entry, and add if not found
+
+ - rb_find_first(): find the first (leftmost) matching entry
+ - rb_next_match(): continue from rb_find_first()
+ - rb_for_each(): iterate a sub-tree using the previous two
+
+Inlining and constant propagation should see the compiler inline the
+whole thing, including the various compare functions.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Michel Lespinasse <walken@google.com>
+	Acked-by: Davidlohr Bueso <dbueso@suse.de>
+(cherry picked from commit 2d24dd5798d0474d9bf705bfca8725e7d20f9d54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/objtool/elf.c
+diff --cc tools/objtool/elf.c
+index 5074163adf63,e85988ce04f1..000000000000
+--- a/tools/objtool/elf.c
++++ b/tools/objtool/elf.c
+@@@ -31,7 -20,63 +31,67 @@@
+  #include "elf.h"
+  #include "warn.h"
+  
+++<<<<<<< HEAD
+ +struct section *find_section_by_name(struct elf *elf, const char *name)
+++=======
++ #define MAX_NAME_LEN 128
++ 
++ static inline u32 str_hash(const char *str)
++ {
++ 	return jhash(str, strlen(str), 0);
++ }
++ 
++ static inline int elf_hash_bits(void)
++ {
++ 	return vmlinux ? ELF_HASH_BITS : 16;
++ }
++ 
++ #define elf_hash_add(hashtable, node, key) \
++ 	hlist_add_head(node, &hashtable[hash_min(key, elf_hash_bits())])
++ 
++ static void elf_hash_init(struct hlist_head *table)
++ {
++ 	__hash_init(table, 1U << elf_hash_bits());
++ }
++ 
++ #define elf_hash_for_each_possible(name, obj, member, key)			\
++ 	hlist_for_each_entry(obj, &name[hash_min(key, elf_hash_bits())], member)
++ 
++ static bool symbol_to_offset(struct rb_node *a, const struct rb_node *b)
++ {
++ 	struct symbol *sa = rb_entry(a, struct symbol, node);
++ 	struct symbol *sb = rb_entry(b, struct symbol, node);
++ 
++ 	if (sa->offset < sb->offset)
++ 		return true;
++ 	if (sa->offset > sb->offset)
++ 		return false;
++ 
++ 	if (sa->len < sb->len)
++ 		return true;
++ 	if (sa->len > sb->len)
++ 		return false;
++ 
++ 	sa->alias = sb;
++ 
++ 	return false;
++ }
++ 
++ static int symbol_by_offset(const void *key, const struct rb_node *node)
++ {
++ 	const struct symbol *s = rb_entry(node, struct symbol, node);
++ 	const unsigned long *o = key;
++ 
++ 	if (*o < s->offset)
++ 		return -1;
++ 	if (*o >= s->offset + s->len)
++ 		return 1;
++ 
++ 	return 0;
++ }
++ 
++ struct section *find_section_by_name(const struct elf *elf, const char *name)
+++>>>>>>> 2d24dd5798d0 (rbtree: Add generic add and find helpers)
+  {
+  	struct section *sec;
+  
+@@@ -69,11 -112,66 +129,70 @@@ static struct symbol *find_symbol_by_in
+  
+  struct symbol *find_symbol_by_offset(struct section *sec, unsigned long offset)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct rb_node *node;
++ 
++ 	rb_for_each(node, &offset, &sec->symbol_tree, symbol_by_offset) {
++ 		struct symbol *s = rb_entry(node, struct symbol, node);
++ 
++ 		if (s->offset == offset && s->type != STT_SECTION)
++ 			return s;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ struct symbol *find_func_by_offset(struct section *sec, unsigned long offset)
++ {
++ 	struct rb_node *node;
++ 
++ 	rb_for_each(node, &offset, &sec->symbol_tree, symbol_by_offset) {
++ 		struct symbol *s = rb_entry(node, struct symbol, node);
++ 
++ 		if (s->offset == offset && s->type == STT_FUNC)
++ 			return s;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ struct symbol *find_symbol_containing(const struct section *sec, unsigned long offset)
++ {
++ 	struct rb_node *node;
++ 
++ 	rb_for_each(node, &offset, &sec->symbol_tree, symbol_by_offset) {
++ 		struct symbol *s = rb_entry(node, struct symbol, node);
++ 
++ 		if (s->type != STT_SECTION)
++ 			return s;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ struct symbol *find_func_containing(struct section *sec, unsigned long offset)
++ {
++ 	struct rb_node *node;
++ 
++ 	rb_for_each(node, &offset, &sec->symbol_tree, symbol_by_offset) {
++ 		struct symbol *s = rb_entry(node, struct symbol, node);
++ 
++ 		if (s->type == STT_FUNC)
++ 			return s;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ struct symbol *find_symbol_by_name(const struct elf *elf, const char *name)
++ {
+++>>>>>>> 2d24dd5798d0 (rbtree: Add generic add and find helpers)
+  	struct symbol *sym;
+  
+ -	elf_hash_for_each_possible(elf->symbol_name_hash, sym, name_hash, str_hash(name))
+ -		if (!strcmp(sym->name, name))
+ +	list_for_each_entry(sym, &sec->symbol_list, list)
+ +		if (sym->type != STT_SECTION &&
+ +		    sym->offset == offset)
+  			return sym;
+  
+  	return NULL;
+@@@ -275,33 -391,27 +394,42 @@@ static int read_symbols(struct elf *elf
+  		sym->offset = sym->sym.st_value;
+  		sym->len = sym->sym.st_size;
+  
+++<<<<<<< HEAD
+ +		/* sorted insert into a per-section list */
+ +		entry = &sym->sec->symbol_list;
+ +		list_for_each_prev(tmp, &sym->sec->symbol_list) {
+ +			struct symbol *s;
+ +
+ +			s = list_entry(tmp, struct symbol, list);
+ +
+ +			if (sym->offset > s->offset) {
+ +				entry = tmp;
+ +				break;
+ +			}
+ +
+ +			if (sym->offset == s->offset) {
+ +				if (sym->len == s->len && alias == sym)
+ +					alias = s;
+ +
+ +				if (sym->len >= s->len) {
+ +					entry = tmp;
+ +					break;
+ +				}
+ +			}
+ +		}
+ +		sym->alias = alias;
+++=======
++ 		rb_add(&sym->node, &sym->sec->symbol_tree, symbol_to_offset);
++ 		pnode = rb_prev(&sym->node);
++ 		if (pnode)
++ 			entry = &rb_entry(pnode, struct symbol, node)->list;
++ 		else
++ 			entry = &sym->sec->symbol_list;
+++>>>>>>> 2d24dd5798d0 (rbtree: Add generic add and find helpers)
+  		list_add(&sym->list, entry);
+ -		elf_hash_add(elf->symbol_hash, &sym->hash, sym->idx);
+ -		elf_hash_add(elf->symbol_name_hash, &sym->name_hash, str_hash(sym->name));
+ -
+ -		/*
+ -		 * Don't store empty STT_NOTYPE symbols in the rbtree.  They
+ -		 * can exist within a function, confusing the sorting.
+ -		 */
+ -		if (!sym->len)
+ -			rb_erase(&sym->node, &sym->sec->symbol_tree);
+ +		hash_add(sym->sec->symbol_hash, &sym->hash, sym->idx);
+  	}
+  
+ -	if (stats)
+ -		printf("nr_symbols: %lu\n", (unsigned long)symbols_nr);
+ -
+  	/* Create parent/child links for any cold subfunctions */
+  	list_for_each_entry(sec, &elf->sections, list) {
+  		list_for_each_entry(sym, &sec->symbol_list, list) {
+diff --git a/include/linux/rbtree.h b/include/linux/rbtree.h
+index d39ea256ce50..5dce939338c5 100644
+--- a/include/linux/rbtree.h
++++ b/include/linux/rbtree.h
+@@ -170,4 +170,194 @@ static inline void rb_replace_node_cached(struct rb_node *victim,
+ 	rb_replace_node(victim, new, &root->rb_root);
+ }
+ 
++/*
++ * The below helper functions use 2 operators with 3 different
++ * calling conventions. The operators are related like:
++ *
++ *	comp(a->key,b) < 0  := less(a,b)
++ *	comp(a->key,b) > 0  := less(b,a)
++ *	comp(a->key,b) == 0 := !less(a,b) && !less(b,a)
++ *
++ * If these operators define a partial order on the elements we make no
++ * guarantee on which of the elements matching the key is found. See
++ * rb_find().
++ *
++ * The reason for this is to allow the find() interface without requiring an
++ * on-stack dummy object, which might not be feasible due to object size.
++ */
++
++/**
++ * rb_add_cached() - insert @node into the leftmost cached tree @tree
++ * @node: node to insert
++ * @tree: leftmost cached tree to insert @node into
++ * @less: operator defining the (partial) node order
++ */
++static __always_inline void
++rb_add_cached(struct rb_node *node, struct rb_root_cached *tree,
++	      bool (*less)(struct rb_node *, const struct rb_node *))
++{
++	struct rb_node **link = &tree->rb_root.rb_node;
++	struct rb_node *parent = NULL;
++	bool leftmost = true;
++
++	while (*link) {
++		parent = *link;
++		if (less(node, parent)) {
++			link = &parent->rb_left;
++		} else {
++			link = &parent->rb_right;
++			leftmost = false;
++		}
++	}
++
++	rb_link_node(node, parent, link);
++	rb_insert_color_cached(node, tree, leftmost);
++}
++
++/**
++ * rb_add() - insert @node into @tree
++ * @node: node to insert
++ * @tree: tree to insert @node into
++ * @less: operator defining the (partial) node order
++ */
++static __always_inline void
++rb_add(struct rb_node *node, struct rb_root *tree,
++       bool (*less)(struct rb_node *, const struct rb_node *))
++{
++	struct rb_node **link = &tree->rb_node;
++	struct rb_node *parent = NULL;
++
++	while (*link) {
++		parent = *link;
++		if (less(node, parent))
++			link = &parent->rb_left;
++		else
++			link = &parent->rb_right;
++	}
++
++	rb_link_node(node, parent, link);
++	rb_insert_color(node, tree);
++}
++
++/**
++ * rb_find_add() - find equivalent @node in @tree, or add @node
++ * @node: node to look-for / insert
++ * @tree: tree to search / modify
++ * @cmp: operator defining the node order
++ *
++ * Returns the rb_node matching @node, or NULL when no match is found and @node
++ * is inserted.
++ */
++static __always_inline struct rb_node *
++rb_find_add(struct rb_node *node, struct rb_root *tree,
++	    int (*cmp)(struct rb_node *, const struct rb_node *))
++{
++	struct rb_node **link = &tree->rb_node;
++	struct rb_node *parent = NULL;
++	int c;
++
++	while (*link) {
++		parent = *link;
++		c = cmp(node, parent);
++
++		if (c < 0)
++			link = &parent->rb_left;
++		else if (c > 0)
++			link = &parent->rb_right;
++		else
++			return parent;
++	}
++
++	rb_link_node(node, parent, link);
++	rb_insert_color(node, tree);
++	return NULL;
++}
++
++/**
++ * rb_find() - find @key in tree @tree
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining the node order
++ *
++ * Returns the rb_node matching @key or NULL.
++ */
++static __always_inline struct rb_node *
++rb_find(const void *key, const struct rb_root *tree,
++	int (*cmp)(const void *key, const struct rb_node *))
++{
++	struct rb_node *node = tree->rb_node;
++
++	while (node) {
++		int c = cmp(key, node);
++
++		if (c < 0)
++			node = node->rb_left;
++		else if (c > 0)
++			node = node->rb_right;
++		else
++			return node;
++	}
++
++	return NULL;
++}
++
++/**
++ * rb_find_first() - find the first @key in @tree
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining node order
++ *
++ * Returns the leftmost node matching @key, or NULL.
++ */
++static __always_inline struct rb_node *
++rb_find_first(const void *key, const struct rb_root *tree,
++	      int (*cmp)(const void *key, const struct rb_node *))
++{
++	struct rb_node *node = tree->rb_node;
++	struct rb_node *match = NULL;
++
++	while (node) {
++		int c = cmp(key, node);
++
++		if (c <= 0) {
++			if (!c)
++				match = node;
++			node = node->rb_left;
++		} else if (c > 0) {
++			node = node->rb_right;
++		}
++	}
++
++	return match;
++}
++
++/**
++ * rb_next_match() - find the next @key in @tree
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining node order
++ *
++ * Returns the next node matching @key, or NULL.
++ */
++static __always_inline struct rb_node *
++rb_next_match(const void *key, struct rb_node *node,
++	      int (*cmp)(const void *key, const struct rb_node *))
++{
++	node = rb_next(node);
++	if (node && cmp(key, node))
++		node = NULL;
++	return node;
++}
++
++/**
++ * rb_for_each() - iterates a subtree matching @key
++ * @node: iterator
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining node order
++ */
++#define rb_for_each(node, key, tree, cmp) \
++	for ((node) = rb_find_first((key), (tree), (cmp)); \
++	     (node); (node) = rb_next_match((key), (node), (cmp)))
++
+ #endif	/* _LINUX_RBTREE_H */
+diff --git a/tools/include/linux/rbtree.h b/tools/include/linux/rbtree.h
+index 2d8f35f308ed..af5d380bf4ad 100644
+--- a/tools/include/linux/rbtree.h
++++ b/tools/include/linux/rbtree.h
+@@ -164,4 +164,194 @@ static inline void rb_replace_node_cached(struct rb_node *victim,
+ 	rb_replace_node(victim, new, &root->rb_root);
+ }
+ 
+-#endif /* __TOOLS_LINUX_PERF_RBTREE_H */
++/*
++ * The below helper functions use 2 operators with 3 different
++ * calling conventions. The operators are related like:
++ *
++ *	comp(a->key,b) < 0  := less(a,b)
++ *	comp(a->key,b) > 0  := less(b,a)
++ *	comp(a->key,b) == 0 := !less(a,b) && !less(b,a)
++ *
++ * If these operators define a partial order on the elements we make no
++ * guarantee on which of the elements matching the key is found. See
++ * rb_find().
++ *
++ * The reason for this is to allow the find() interface without requiring an
++ * on-stack dummy object, which might not be feasible due to object size.
++ */
++
++/**
++ * rb_add_cached() - insert @node into the leftmost cached tree @tree
++ * @node: node to insert
++ * @tree: leftmost cached tree to insert @node into
++ * @less: operator defining the (partial) node order
++ */
++static __always_inline void
++rb_add_cached(struct rb_node *node, struct rb_root_cached *tree,
++	      bool (*less)(struct rb_node *, const struct rb_node *))
++{
++	struct rb_node **link = &tree->rb_root.rb_node;
++	struct rb_node *parent = NULL;
++	bool leftmost = true;
++
++	while (*link) {
++		parent = *link;
++		if (less(node, parent)) {
++			link = &parent->rb_left;
++		} else {
++			link = &parent->rb_right;
++			leftmost = false;
++		}
++	}
++
++	rb_link_node(node, parent, link);
++	rb_insert_color_cached(node, tree, leftmost);
++}
++
++/**
++ * rb_add() - insert @node into @tree
++ * @node: node to insert
++ * @tree: tree to insert @node into
++ * @less: operator defining the (partial) node order
++ */
++static __always_inline void
++rb_add(struct rb_node *node, struct rb_root *tree,
++       bool (*less)(struct rb_node *, const struct rb_node *))
++{
++	struct rb_node **link = &tree->rb_node;
++	struct rb_node *parent = NULL;
++
++	while (*link) {
++		parent = *link;
++		if (less(node, parent))
++			link = &parent->rb_left;
++		else
++			link = &parent->rb_right;
++	}
++
++	rb_link_node(node, parent, link);
++	rb_insert_color(node, tree);
++}
++
++/**
++ * rb_find_add() - find equivalent @node in @tree, or add @node
++ * @node: node to look-for / insert
++ * @tree: tree to search / modify
++ * @cmp: operator defining the node order
++ *
++ * Returns the rb_node matching @node, or NULL when no match is found and @node
++ * is inserted.
++ */
++static __always_inline struct rb_node *
++rb_find_add(struct rb_node *node, struct rb_root *tree,
++	    int (*cmp)(struct rb_node *, const struct rb_node *))
++{
++	struct rb_node **link = &tree->rb_node;
++	struct rb_node *parent = NULL;
++	int c;
++
++	while (*link) {
++		parent = *link;
++		c = cmp(node, parent);
++
++		if (c < 0)
++			link = &parent->rb_left;
++		else if (c > 0)
++			link = &parent->rb_right;
++		else
++			return parent;
++	}
++
++	rb_link_node(node, parent, link);
++	rb_insert_color(node, tree);
++	return NULL;
++}
++
++/**
++ * rb_find() - find @key in tree @tree
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining the node order
++ *
++ * Returns the rb_node matching @key or NULL.
++ */
++static __always_inline struct rb_node *
++rb_find(const void *key, const struct rb_root *tree,
++	int (*cmp)(const void *key, const struct rb_node *))
++{
++	struct rb_node *node = tree->rb_node;
++
++	while (node) {
++		int c = cmp(key, node);
++
++		if (c < 0)
++			node = node->rb_left;
++		else if (c > 0)
++			node = node->rb_right;
++		else
++			return node;
++	}
++
++	return NULL;
++}
++
++/**
++ * rb_find_first() - find the first @key in @tree
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining node order
++ *
++ * Returns the leftmost node matching @key, or NULL.
++ */
++static __always_inline struct rb_node *
++rb_find_first(const void *key, const struct rb_root *tree,
++	      int (*cmp)(const void *key, const struct rb_node *))
++{
++	struct rb_node *node = tree->rb_node;
++	struct rb_node *match = NULL;
++
++	while (node) {
++		int c = cmp(key, node);
++
++		if (c <= 0) {
++			if (!c)
++				match = node;
++			node = node->rb_left;
++		} else if (c > 0) {
++			node = node->rb_right;
++		}
++	}
++
++	return match;
++}
++
++/**
++ * rb_next_match() - find the next @key in @tree
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining node order
++ *
++ * Returns the next node matching @key, or NULL.
++ */
++static __always_inline struct rb_node *
++rb_next_match(const void *key, struct rb_node *node,
++	      int (*cmp)(const void *key, const struct rb_node *))
++{
++	node = rb_next(node);
++	if (node && cmp(key, node))
++		node = NULL;
++	return node;
++}
++
++/**
++ * rb_for_each() - iterates a subtree matching @key
++ * @node: iterator
++ * @key: key to match
++ * @tree: tree to search
++ * @cmp: operator defining node order
++ */
++#define rb_for_each(node, key, tree, cmp) \
++	for ((node) = rb_find_first((key), (tree), (cmp)); \
++	     (node); (node) = rb_next_match((key), (node), (cmp)))
++
++#endif	/* __TOOLS_LINUX_PERF_RBTREE_H */
+* Unmerged path tools/objtool/elf.c
