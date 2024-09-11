@@ -1,0 +1,118 @@
+rcu/nocb: Don't deoffload an offline CPU with pending work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Frederic Weisbecker <frederic@kernel.org>
+commit ef005345e6e49859e225f549c88c985e79477bb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ef005345.failed
+
+Offloaded CPUs do not migrate their callbacks, instead relying on
+their rcuo kthread to invoke them.  But if the CPU is offline, it
+will be running neither its RCU_SOFTIRQ handler nor its rcuc kthread.
+This means that de-offloading an offline CPU that still has pending
+callbacks will strand those callbacks.  This commit therefore refuses
+to toggle offline CPUs having pending callbacks.
+
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+	Cc: Joel Fernandes <joel@joelfernandes.org>
+	Cc: Neeraj Upadhyay <neeraju@codeaurora.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Suggested-by: Paul E. McKenney <paulmck@kernel.org>
+	Tested-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit ef005345e6e49859e225f549c88c985e79477bb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree_plugin.h
+diff --cc kernel/rcu/tree_plugin.h
+index 10e9e427ecfe,b70cc91a7831..000000000000
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@@ -2187,6 -2218,76 +2187,79 @@@ static void do_nocb_deferred_wakeup(str
+  		do_nocb_deferred_wakeup_common(rdp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __rcu_nocb_rdp_deoffload(struct rcu_data *rdp)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	bool wake_cb = false;
++ 	unsigned long flags;
++ 
++ 	printk("De-offloading %d\n", rdp->cpu);
++ 
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	/*
++ 	 * If there are still pending work offloaded, the offline
++ 	 * CPU won't help much handling them.
++ 	 */
++ 	if (cpu_is_offline(rdp->cpu) && !rcu_segcblist_empty(&rdp->cblist)) {
++ 		rcu_nocb_unlock_irqrestore(rdp, flags);
++ 		return -EBUSY;
++ 	}
++ 
++ 	rcu_segcblist_offload(cblist, false);
++ 
++ 	if (rdp->nocb_cb_sleep) {
++ 		rdp->nocb_cb_sleep = false;
++ 		wake_cb = true;
++ 	}
++ 	rcu_nocb_unlock_irqrestore(rdp, flags);
++ 
++ 	if (wake_cb)
++ 		swake_up_one(&rdp->nocb_cb_wq);
++ 
++ 	swait_event_exclusive(rdp->nocb_state_wq,
++ 			      !rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB));
++ 
++ 	return 0;
++ }
++ 
++ static long rcu_nocb_rdp_deoffload(void *arg)
++ {
++ 	struct rcu_data *rdp = arg;
++ 
++ 	WARN_ON_ONCE(rdp->cpu != raw_smp_processor_id());
++ 	return __rcu_nocb_rdp_deoffload(rdp);
++ }
++ 
++ int rcu_nocb_cpu_deoffload(int cpu)
++ {
++ 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
++ 	int ret = 0;
++ 
++ 	if (rdp == rdp->nocb_gp_rdp) {
++ 		pr_info("Can't deoffload an rdp GP leader (yet)\n");
++ 		return -EINVAL;
++ 	}
++ 	mutex_lock(&rcu_state.barrier_mutex);
++ 	cpus_read_lock();
++ 	if (rcu_segcblist_is_offloaded(&rdp->cblist)) {
++ 		if (cpu_online(cpu)) {
++ 			ret = work_on_cpu(cpu, rcu_nocb_rdp_deoffload, rdp);
++ 		} else {
++ 			ret = __rcu_nocb_rdp_deoffload(rdp);
++ 		}
++ 		if (!ret)
++ 			cpumask_clear_cpu(cpu, rcu_nocb_mask);
++ 	}
++ 	cpus_read_unlock();
++ 	mutex_unlock(&rcu_state.barrier_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(rcu_nocb_cpu_deoffload);
++ 
+++>>>>>>> ef005345e6e4 (rcu/nocb: Don't deoffload an offline CPU with pending work)
+  void __init rcu_init_nohz(void)
+  {
+  	int cpu;
+* Unmerged path kernel/rcu/tree_plugin.h
