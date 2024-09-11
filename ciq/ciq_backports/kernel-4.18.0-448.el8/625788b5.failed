@@ -1,0 +1,524 @@
+net: add per-cpu storage and net->core_stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit 625788b5844511cf4c30cffa7fa0bc3a69cebc82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/625788b5.failed
+
+Before adding yet another possibly contended atomic_long_t,
+it is time to add per-cpu storage for existing ones:
+ dev->tx_dropped, dev->rx_dropped, and dev->rx_nohandler
+
+Because many devices do not have to increment such counters,
+allocate the per-cpu storage on demand, so that dev_get_stats()
+does not have to spend considerable time folding zero counters.
+
+Note that some drivers have abused these counters which
+were supposed to be only used by core networking stack.
+
+v4: should use per_cpu_ptr() in dev_get_stats() (Jakub)
+v3: added a READ_ONCE() in netdev_core_stats_alloc() (Paolo)
+v2: add a missing include (reported by kernel test robot <lkp@intel.com>)
+    Change in netdev_core_stats_alloc() (Jakub)
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: jeffreyji <jeffreyji@google.com>
+	Reviewed-by: Brian Vazquez <brianvv@google.com>
+	Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/20220311051420.2608812-1-eric.dumazet@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 625788b5844511cf4c30cffa7fa0bc3a69cebc82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qualcomm/rmnet/rmnet_handlers.c
+#	drivers/net/tun.c
+#	drivers/net/vxlan.c
+#	net/core/dev.c
+#	net/hsr/hsr_device.c
+diff --cc drivers/net/ethernet/qualcomm/rmnet/rmnet_handlers.c
+index 7fd86d40a337,a313242a762e..000000000000
+--- a/drivers/net/ethernet/qualcomm/rmnet/rmnet_handlers.c
++++ b/drivers/net/ethernet/qualcomm/rmnet/rmnet_handlers.c
+@@@ -189,8 -196,21 +189,17 @@@ rx_handler_result_t rmnet_rx_handler(st
+  	if (!skb)
+  		goto done;
+  
+ -	if (skb_linearize(skb)) {
+ -		kfree_skb(skb);
+ -		goto done;
+ -	}
+ -
+ -	if (skb->pkt_type == PACKET_LOOPBACK)
+ -		return RX_HANDLER_PASS;
+ -
+  	dev = skb->dev;
+++<<<<<<< HEAD
+ +	port = rmnet_get_port(dev);
+++=======
++ 	port = rmnet_get_port_rcu(dev);
++ 	if (unlikely(!port)) {
++ 		dev_core_stats_rx_nohandler_inc(skb->dev);
++ 		kfree_skb(skb);
++ 		goto done;
++ 	}
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  
+  	switch (port->rmnet_mode) {
+  	case RMNET_EPMODE_VND:
+diff --cc drivers/net/tun.c
+index 4e0d05222f02,276a0e42ca8e..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -1116,9 -1135,9 +1116,13 @@@ static netdev_tx_t tun_net_xmit(struct 
+  	return NETDEV_TX_OK;
+  
+  drop:
+++<<<<<<< HEAD
+ +	this_cpu_inc(tun->pcpu_stats->tx_dropped);
+++=======
++ 	dev_core_stats_tx_dropped_inc(dev);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  	skb_tx_error(skb);
+ -	kfree_skb_reason(skb, drop_reason);
+ +	kfree_skb(skb);
+  	rcu_read_unlock();
+  	return NET_XMIT_DROP;
+  }
+@@@ -1334,7 -1291,7 +1338,11 @@@ resample
+  		void *frame = tun_xdp_to_ptr(xdp);
+  
+  		if (__ptr_ring_produce(&tfile->tx_ring, frame)) {
+++<<<<<<< HEAD
+ +			this_cpu_inc(tun->pcpu_stats->tx_dropped);
+++=======
++ 			dev_core_stats_tx_dropped_inc(dev);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  			break;
+  		}
+  		nxmit++;
+@@@ -1667,12 -1621,12 +1675,16 @@@ static int tun_xdp_act(struct tun_struc
+  		break;
+  	default:
+  		bpf_warn_invalid_xdp_action(tun->dev, xdp_prog, act);
+ -		fallthrough;
+ +		/* fall through */
+  	case XDP_ABORTED:
+  		trace_xdp_exception(tun->dev, xdp_prog, act);
+ -		fallthrough;
+ +		/* fall through */
+  	case XDP_DROP:
+++<<<<<<< HEAD
+ +		this_cpu_inc(tun->pcpu_stats->rx_dropped);
+++=======
++ 		dev_core_stats_rx_dropped_inc(tun->dev);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  		break;
+  	}
+  
+@@@ -1843,7 -1797,7 +1855,11 @@@ static ssize_t tun_get_user(struct tun_
+  		 */
+  		skb = tun_build_skb(tun, tfile, from, &gso, len, &skb_xdp);
+  		if (IS_ERR(skb)) {
+++<<<<<<< HEAD
+ +			this_cpu_inc(tun->pcpu_stats->rx_dropped);
+++=======
++ 			dev_core_stats_rx_dropped_inc(tun->dev);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  			return PTR_ERR(skb);
+  		}
+  		if (!skb)
+@@@ -1872,7 -1826,7 +1888,11 @@@
+  
+  		if (IS_ERR(skb)) {
+  			if (PTR_ERR(skb) != -EAGAIN)
+++<<<<<<< HEAD
+ +				this_cpu_inc(tun->pcpu_stats->rx_dropped);
+++=======
++ 				dev_core_stats_rx_dropped_inc(tun->dev);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  			if (frags)
+  				mutex_unlock(&tfile->napi_mutex);
+  			return PTR_ERR(skb);
+@@@ -1885,9 -1839,10 +1905,14 @@@
+  
+  		if (err) {
+  			err = -EFAULT;
+ -			drop_reason = SKB_DROP_REASON_SKB_UCOPY_FAULT;
+  drop:
+++<<<<<<< HEAD
+ +			this_cpu_inc(tun->pcpu_stats->rx_dropped);
+ +			kfree_skb(skb);
+++=======
++ 			dev_core_stats_rx_dropped_inc(tun->dev);
++ 			kfree_skb_reason(skb, drop_reason);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  			if (frags) {
+  				tfile->napi.skb = NULL;
+  				mutex_unlock(&tfile->napi_mutex);
+@@@ -1921,7 -1876,7 +1946,11 @@@
+  				pi.proto = htons(ETH_P_IPV6);
+  				break;
+  			default:
+++<<<<<<< HEAD
+ +				this_cpu_inc(tun->pcpu_stats->rx_dropped);
+++=======
++ 				dev_core_stats_rx_dropped_inc(tun->dev);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  				kfree_skb(skb);
+  				return -EINVAL;
+  			}
+@@@ -2000,7 -1956,7 +2029,11 @@@
+  					  skb_headlen(skb));
+  
+  		if (unlikely(headlen > skb_headlen(skb))) {
+++<<<<<<< HEAD
+ +			this_cpu_inc(tun->pcpu_stats->rx_dropped);
+++=======
++ 			dev_core_stats_rx_dropped_inc(tun->dev);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  			napi_free_frags(&tfile->napi);
+  			rcu_read_unlock();
+  			mutex_unlock(&tfile->napi_mutex);
+diff --cc drivers/net/vxlan.c
+index 7f8ab1ffcbaa,de97ff98d36e..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1750,7 -1760,9 +1750,13 @@@ static int vxlan_rcv(struct sock *sk, s
+  
+  	if (unlikely(!(vxlan->dev->flags & IFF_UP))) {
+  		rcu_read_unlock();
+++<<<<<<< HEAD:drivers/net/vxlan.c
+ +		atomic_long_inc(&vxlan->dev->rx_dropped);
+++=======
++ 		dev_core_stats_rx_dropped_inc(vxlan->dev);
++ 		vxlan_vnifilter_count(vxlan, vni, vninode,
++ 				      VXLAN_VNI_STATS_RX_DROPS, 0);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats):drivers/net/vxlan/vxlan_core.c
+  		goto drop;
+  	}
+  
+diff --cc net/core/dev.c
+index 60f0f5f733c1,8d25ec5b3af7..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4680,12 -4599,11 +4680,17 @@@ enqueue
+  
+  drop:
+  	sd->dropped++;
+ -	rps_unlock_irq_restore(sd, &flags);
+ +	rps_unlock(sd);
+ +
+ +	local_irq_restore(flags);
+  
+++<<<<<<< HEAD
+ +	atomic_long_inc(&skb->dev->rx_dropped);
+ +	kfree_skb(skb);
+++=======
++ 	dev_core_stats_rx_dropped_inc(skb->dev);
++ 	kfree_skb_reason(skb, reason);
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  	return NET_RX_DROP;
+  }
+  
+@@@ -5383,17 -5353,16 +5388,27 @@@ skip_classify
+  	if (pt_prev) {
+  		if (unlikely(skb_orphan_frags_rx(skb, GFP_ATOMIC)))
+  			goto drop;
+ -		*ppt_prev = pt_prev;
+ +		else
+ +			ret = INDIRECT_CALL_INET(pt_prev->func, ipv6_rcv,
+ +						 ip_rcv, skb, skb->dev, pt_prev,
+ +						 orig_dev);
+  	} else {
+  drop:
+++<<<<<<< HEAD
+ +		if (!deliver_exact)
+ +			atomic_long_inc(&skb->dev->rx_dropped);
+ +		else
+ +			atomic_long_inc(&skb->dev->rx_nohandler);
+ +		kfree_skb(skb);
+++=======
++ 		if (!deliver_exact) {
++ 			dev_core_stats_rx_dropped_inc(skb->dev);
++ 			kfree_skb_reason(skb, SKB_DROP_REASON_PTYPE_ABSENT);
++ 		} else {
++ 			dev_core_stats_rx_nohandler_inc(skb->dev);
++ 			kfree_skb(skb);
++ 		}
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  		/* Jamal, now you will not able to escape explaining
+  		 * me how you were going to use this. :-)
+  		 */
+@@@ -10685,8 -10593,13 +10731,14 @@@ void free_netdev(struct net_device *dev
+  	list_for_each_entry_safe(p, n, &dev->napi_list, dev_list)
+  		netif_napi_del(p);
+  
+ -	ref_tracker_dir_exit(&dev->refcnt_tracker);
+ -#ifdef CONFIG_PCPU_DEV_REFCNT
+  	free_percpu(dev->pcpu_refcnt);
+  	dev->pcpu_refcnt = NULL;
+++<<<<<<< HEAD
+++=======
++ #endif
++ 	free_percpu(dev->core_stats);
++ 	dev->core_stats = NULL;
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  	free_percpu(dev->xdp_bulkq);
+  	dev->xdp_bulkq = NULL;
+  
+diff --cc net/hsr/hsr_device.c
+index b8cd43c9ed5b,6ffef47e9be5..000000000000
+--- a/net/hsr/hsr_device.c
++++ b/net/hsr/hsr_device.c
+@@@ -239,9 -215,15 +239,21 @@@ static int hsr_dev_xmit(struct sk_buff 
+  	struct hsr_port *master;
+  
+  	master = hsr_port_get_hsr(hsr, HSR_PT_MASTER);
+++<<<<<<< HEAD
+ +	skb->dev = master->dev;
+ +	hsr_forward_skb(skb, master);
+ +
+++=======
++ 	if (master) {
++ 		skb->dev = master->dev;
++ 		skb_reset_mac_header(skb);
++ 		skb_reset_mac_len(skb);
++ 		hsr_forward_skb(skb, master);
++ 	} else {
++ 		dev_core_stats_tx_dropped_inc(dev);
++ 		dev_kfree_skb_any(skb);
++ 	}
+++>>>>>>> 625788b58445 (net: add per-cpu storage and net->core_stats)
+  	return NETDEV_TX_OK;
+  }
+  
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index b7708222dfa4..e2f217a1c385 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -4678,7 +4678,7 @@ static netdev_tx_t bond_xmit_broadcast(struct sk_buff *skb,
+ 	if (xmit_suc)
+ 		return NETDEV_TX_OK;
+ 
+-	atomic_long_inc(&bond_dev->tx_dropped);
++	dev_core_stats_tx_dropped_inc(bond_dev);
+ 	return NET_XMIT_DROP;
+ }
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index a6470f5695e0..f8d17eb18875 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -370,7 +370,7 @@ static netdev_tx_t bnxt_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	i = skb_get_queue_mapping(skb);
+ 	if (unlikely(i >= bp->tx_nr_rings)) {
+ 		dev_kfree_skb_any(skb);
+-		atomic_long_inc(&dev->tx_dropped);
++		dev_core_stats_tx_dropped_inc(dev);
+ 		return NETDEV_TX_OK;
+ 	}
+ 
+@@ -646,7 +646,7 @@ static netdev_tx_t bnxt_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	if (txr->kick_pending)
+ 		bnxt_txr_db_kick(bp, txr, txr->tx_prod);
+ 	txr->tx_buf_ring[txr->tx_prod].skb = NULL;
+-	atomic_long_inc(&dev->tx_dropped);
++	dev_core_stats_tx_dropped_inc(dev);
+ 	return NETDEV_TX_OK;
+ }
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c b/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c
+index 1d3699c2a825..75d8b31d354a 100644
+--- a/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c
++++ b/drivers/net/ethernet/hisilicon/hns/hns_ethtool.c
+@@ -884,8 +884,8 @@ static void hns_get_ethtool_stats(struct net_device *netdev,
+ 	p[21] = net_stats->rx_compressed;
+ 	p[22] = net_stats->tx_compressed;
+ 
+-	p[23] = netdev->rx_dropped.counter;
+-	p[24] = netdev->tx_dropped.counter;
++	p[23] = 0; /* was netdev->rx_dropped.counter */
++	p[24] = 0; /* was netdev->tx_dropped.counter */
+ 
+ 	p[25] = priv->tx_timeout_count;
+ 
+* Unmerged path drivers/net/ethernet/qualcomm/rmnet/rmnet_handlers.c
+diff --git a/drivers/net/ipvlan/ipvlan_core.c b/drivers/net/ipvlan/ipvlan_core.c
+index 63f0226b0a70..62c73a8ed0c3 100644
+--- a/drivers/net/ipvlan/ipvlan_core.c
++++ b/drivers/net/ipvlan/ipvlan_core.c
+@@ -563,7 +563,7 @@ static void ipvlan_multicast_enqueue(struct ipvl_port *port,
+ 		schedule_work(&port->wq);
+ 	} else {
+ 		spin_unlock(&port->backlog.lock);
+-		atomic_long_inc(&skb->dev->rx_dropped);
++		dev_core_stats_rx_dropped_inc(skb->dev);
+ 		kfree_skb(skb);
+ 	}
+ }
+diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
+index 1332eafc331a..dfa916434e2c 100644
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@ -374,7 +374,7 @@ static void macvlan_broadcast_enqueue(struct macvlan_port *port,
+ free_nskb:
+ 	kfree_skb(nskb);
+ err:
+-	atomic_long_inc(&skb->dev->rx_dropped);
++	dev_core_stats_rx_dropped_inc(skb->dev);
+ }
+ 
+ static void macvlan_flush_sources(struct macvlan_port *port,
+diff --git a/drivers/net/net_failover.c b/drivers/net/net_failover.c
+index 545d4c396c27..2a1c24dc9da3 100644
+--- a/drivers/net/net_failover.c
++++ b/drivers/net/net_failover.c
+@@ -89,7 +89,7 @@ static int net_failover_close(struct net_device *dev)
+ static netdev_tx_t net_failover_drop_xmit(struct sk_buff *skb,
+ 					  struct net_device *dev)
+ {
+-	atomic_long_inc(&dev->tx_dropped);
++	dev_core_stats_tx_dropped_inc(dev);
+ 	dev_kfree_skb_any(skb);
+ 	return NETDEV_TX_OK;
+ }
+* Unmerged path drivers/net/tun.c
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 379d8bad852d..a990f050df79 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -32,6 +32,7 @@
+ #include <linux/prefetch.h>
+ #include <asm/cache.h>
+ #include <asm/byteorder.h>
++#include <asm/local.h>
+ 
+ #include <linux/percpu.h>
+ #include <linux/rculist.h>
+@@ -195,6 +196,14 @@ struct net_device_stats {
+ 	unsigned long	tx_compressed;
+ };
+ 
++/* per-cpu stats, allocated on demand.
++ * Try to fit them in a single cache line, for dev_get_stats() sake.
++ */
++struct net_device_core_stats {
++	local_t		rx_dropped;
++	local_t		tx_dropped;
++	local_t		rx_nohandler;
++} __aligned(4 * sizeof(local_t));
+ 
+ #include <linux/cache.h>
+ #include <linux/skbuff.h>
+@@ -1765,12 +1774,8 @@ struct net_device_extended_rh {
+  *	@stats:		Statistics struct, which was left as a legacy, use
+  *			rtnl_link_stats64 instead
+  *
+- *	@rx_dropped:	Dropped packets by core network,
+- *			do not use this in drivers
+- *	@tx_dropped:	Dropped packets by core network,
++ *	@core_stats:	core networking counters,
+  *			do not use this in drivers
+- *	@rx_nohandler:	nohandler dropped packets by core network on
+- *			inactive devices, do not use this in drivers
+  *	@carrier_up_count:	Number of times the carrier has been up
+  *	@carrier_down_count:	Number of times the carrier has been down
+  *
+@@ -1996,9 +2001,7 @@ struct net_device {
+ 
+ 	struct net_device_stats	stats;
+ 
+-	atomic_long_t		rx_dropped;
+-	atomic_long_t		tx_dropped;
+-	atomic_long_t		rx_nohandler;
++	struct net_device_core_stats __percpu *core_stats;
+ 
+ 	/* Stats to monitor link on/off, flapping */
+ 	atomic_t		carrier_up_count;
+@@ -4077,13 +4080,38 @@ static __always_inline bool __is_skb_forwardable(const struct net_device *dev,
+ 	return false;
+ }
+ 
++struct net_device_core_stats *netdev_core_stats_alloc(struct net_device *dev);
++
++static inline struct net_device_core_stats *dev_core_stats(struct net_device *dev)
++{
++	/* This READ_ONCE() pairs with the write in netdev_core_stats_alloc() */
++	struct net_device_core_stats __percpu *p = READ_ONCE(dev->core_stats);
++
++	if (likely(p))
++		return this_cpu_ptr(p);
++
++	return netdev_core_stats_alloc(dev);
++}
++
++#define DEV_CORE_STATS_INC(FIELD)						\
++static inline void dev_core_stats_##FIELD##_inc(struct net_device *dev)		\
++{										\
++	struct net_device_core_stats *p = dev_core_stats(dev);			\
++										\
++	if (p)									\
++		local_inc(&p->FIELD);						\
++}
++DEV_CORE_STATS_INC(rx_dropped)
++DEV_CORE_STATS_INC(tx_dropped)
++DEV_CORE_STATS_INC(rx_nohandler)
++
+ static __always_inline int ____dev_forward_skb(struct net_device *dev,
+ 					       struct sk_buff *skb,
+ 					       const bool check_mtu)
+ {
+ 	if (skb_orphan_frags(skb, GFP_ATOMIC) ||
+ 	    unlikely(!__is_skb_forwardable(dev, skb, check_mtu))) {
+-		atomic_long_inc(&dev->rx_dropped);
++		dev_core_stats_rx_dropped_inc(dev);
+ 		kfree_skb(skb);
+ 		return NET_RX_DROP;
+ 	}
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 402eb2b137e0..f7c0e7f5ea0f 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -770,7 +770,7 @@ extern const struct sysfs_ops slave_sysfs_ops;
+ 
+ static inline netdev_tx_t bond_tx_drop(struct net_device *dev, struct sk_buff *skb)
+ {
+-	atomic_long_inc(&dev->tx_dropped);
++	dev_core_stats_tx_dropped_inc(dev);
+ 	dev_kfree_skb_any(skb);
+ 	return NET_XMIT_DROP;
+ }
+* Unmerged path net/core/dev.c
+diff --git a/net/core/gro_cells.c b/net/core/gro_cells.c
+index 6eb2e5ec2c50..95c8352cb283 100644
+--- a/net/core/gro_cells.c
++++ b/net/core/gro_cells.c
+@@ -28,7 +28,7 @@ int gro_cells_receive(struct gro_cells *gcells, struct sk_buff *skb)
+ 
+ 	if (skb_queue_len(&cell->napi_skbs) > netdev_max_backlog) {
+ drop:
+-		atomic_long_inc(&dev->rx_dropped);
++		dev_core_stats_rx_dropped_inc(dev);
+ 		kfree_skb(skb);
+ 		res = NET_RX_DROP;
+ 		goto unlock;
+* Unmerged path net/hsr/hsr_device.c
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index cfa52a1abc36..6dbf82dafd39 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -145,7 +145,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 		segs = skb_gso_segment(skb, esp_features);
+ 		if (IS_ERR(segs)) {
+ 			kfree_skb(skb);
+-			atomic_long_inc(&dev->tx_dropped);
++			dev_core_stats_tx_dropped_inc(dev);
+ 			return NULL;
+ 		} else {
+ 			consume_skb(skb);
