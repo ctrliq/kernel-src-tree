@@ -899,6 +899,10 @@ struct task_struct {
 	/* Stalled due to lack of memory */
 	RH_KABI_FILL_HOLE(unsigned	in_memstall:1)
 #endif
+#ifdef CONFIG_PAGE_OWNER
+	/* Used by page_owner=on to detect recursion in page tracking. */
+	unsigned			in_page_owner:1;
+#endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
