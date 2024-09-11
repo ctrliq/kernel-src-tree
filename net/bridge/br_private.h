@@ -884,7 +884,8 @@ static inline bool br_multicast_is_router(struct net_bridge *br)
 }
 
 static inline bool br_multicast_querier_exists(struct net_bridge *br,
-					       struct ethhdr *eth)
+					       struct ethhdr *eth,
+					       const struct net_bridge_mdb_entry *mdb)
 {
 	return false;
 }
