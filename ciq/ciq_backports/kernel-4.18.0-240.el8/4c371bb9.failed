@@ -1,0 +1,156 @@
+Bluetooth: Workaround directed advertising bug in Broadcom controllers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Szymon Janc <szymon.janc@codecoup.pl>
+commit 4c371bb95cf06ded80df0e6139fdd77cee1d9a94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4c371bb9.failed
+
+It appears that some Broadcom controllers (eg BCM20702A0) reject LE Set
+Advertising Parameters command if advertising intervals provided are not
+within range for undirected and low duty directed advertising.
+
+Workaround this bug by populating min and max intervals with 'valid'
+values.
+
+< HCI Command: LE Set Advertising Parameters (0x08|0x0006) plen 15
+        Min advertising interval: 0.000 msec (0x0000)
+        Max advertising interval: 0.000 msec (0x0000)
+        Type: Connectable directed - ADV_DIRECT_IND (high duty cycle) (0x01)
+        Own address type: Public (0x00)
+        Direct address type: Random (0x01)
+        Direct address: E2:F0:7B:9F:DC:F4 (Static)
+        Channel map: 37, 38, 39 (0x07)
+        Filter policy: Allow Scan Request from Any, Allow Connect Request from Any (0x00)
+> HCI Event: Command Complete (0x0e) plen 4
+      LE Set Advertising Parameters (0x08|0x0006) ncmd 1
+        Status: Invalid HCI Command Parameters (0x12)
+
+	Signed-off-by: Szymon Janc <szymon.janc@codecoup.pl>
+	Tested-by: Sören Beye <linux@hypfer.de>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 4c371bb95cf06ded80df0e6139fdd77cee1d9a94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_conn.c
+diff --cc net/bluetooth/hci_conn.c
+index d9f10411f95f,7ff92dd4c53c..000000000000
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@@ -807,31 -874,86 +807,90 @@@ static void hci_req_directed_advertisin
+  	u8 own_addr_type;
+  	u8 enable;
+  
+ -	if (ext_adv_capable(hdev)) {
+ -		struct hci_cp_le_set_ext_adv_params cp;
+ -		bdaddr_t random_addr;
+ -
+ -		/* Set require_privacy to false so that the remote device has a
+ -		 * chance of identifying us.
+ -		 */
+ -		if (hci_get_random_address(hdev, false, conn_use_rpa(conn), NULL,
+ -					   &own_addr_type, &random_addr) < 0)
+ -			return;
+ -
+ -		memset(&cp, 0, sizeof(cp));
+ +	/* Clear the HCI_LE_ADV bit temporarily so that the
+ +	 * hci_update_random_address knows that it's safe to go ahead
+ +	 * and write a new random address. The flag will be set back on
+ +	 * as soon as the SET_ADV_ENABLE HCI command completes.
+ +	 */
+ +	hci_dev_clear_flag(hdev, HCI_LE_ADV);
+  
+ -		cp.evt_properties = cpu_to_le16(LE_LEGACY_ADV_DIRECT_IND);
+ -		cp.own_addr_type = own_addr_type;
+ -		cp.channel_map = hdev->le_adv_channel_map;
+ -		cp.tx_power = HCI_TX_POWER_INVALID;
+ -		cp.primary_phy = HCI_ADV_PHY_1M;
+ -		cp.secondary_phy = HCI_ADV_PHY_1M;
+ -		cp.handle = 0; /* Use instance 0 for directed adv */
+ -		cp.own_addr_type = own_addr_type;
+ -		cp.peer_addr_type = conn->dst_type;
+ -		bacpy(&cp.peer_addr, &conn->dst);
+ +	/* Set require_privacy to false so that the remote device has a
+ +	 * chance of identifying us.
+ +	 */
+ +	if (hci_update_random_address(req, false, conn_use_rpa(conn),
+ +				      &own_addr_type) < 0)
+ +		return;
+  
+ +	memset(&cp, 0, sizeof(cp));
+ +	cp.type = LE_ADV_DIRECT_IND;
+ +	cp.own_address_type = own_addr_type;
+ +	cp.direct_addr_type = conn->dst_type;
+ +	bacpy(&cp.direct_addr, &conn->dst);
+ +	cp.channel_map = hdev->le_adv_channel_map;
+ +
+ +	hci_req_add(req, HCI_OP_LE_SET_ADV_PARAM, sizeof(cp), &cp);
+ +
+++<<<<<<< HEAD
+ +	enable = 0x01;
+ +	hci_req_add(req, HCI_OP_LE_SET_ADV_ENABLE, sizeof(enable), &enable);
+++=======
++ 		hci_req_add(req, HCI_OP_LE_SET_EXT_ADV_PARAMS, sizeof(cp), &cp);
++ 
++ 		if (own_addr_type == ADDR_LE_DEV_RANDOM &&
++ 		    bacmp(&random_addr, BDADDR_ANY) &&
++ 		    bacmp(&random_addr, &hdev->random_addr)) {
++ 			struct hci_cp_le_set_adv_set_rand_addr cp;
++ 
++ 			memset(&cp, 0, sizeof(cp));
++ 
++ 			cp.handle = 0;
++ 			bacpy(&cp.bdaddr, &random_addr);
++ 
++ 			hci_req_add(req,
++ 				    HCI_OP_LE_SET_ADV_SET_RAND_ADDR,
++ 				    sizeof(cp), &cp);
++ 		}
++ 
++ 		__hci_req_enable_ext_advertising(req, 0x00);
++ 	} else {
++ 		struct hci_cp_le_set_adv_param cp;
++ 
++ 		/* Clear the HCI_LE_ADV bit temporarily so that the
++ 		 * hci_update_random_address knows that it's safe to go ahead
++ 		 * and write a new random address. The flag will be set back on
++ 		 * as soon as the SET_ADV_ENABLE HCI command completes.
++ 		 */
++ 		hci_dev_clear_flag(hdev, HCI_LE_ADV);
++ 
++ 		/* Set require_privacy to false so that the remote device has a
++ 		 * chance of identifying us.
++ 		 */
++ 		if (hci_update_random_address(req, false, conn_use_rpa(conn),
++ 					      &own_addr_type) < 0)
++ 			return;
++ 
++ 		memset(&cp, 0, sizeof(cp));
++ 
++ 		/* Some controllers might reject command if intervals are not
++ 		 * within range for undirected advertising.
++ 		 * BCM20702A0 is known to be affected by this.
++ 		 */
++ 		cp.min_interval = cpu_to_le16(0x0020);
++ 		cp.max_interval = cpu_to_le16(0x0020);
++ 
++ 		cp.type = LE_ADV_DIRECT_IND;
++ 		cp.own_address_type = own_addr_type;
++ 		cp.direct_addr_type = conn->dst_type;
++ 		bacpy(&cp.direct_addr, &conn->dst);
++ 		cp.channel_map = hdev->le_adv_channel_map;
++ 
++ 		hci_req_add(req, HCI_OP_LE_SET_ADV_PARAM, sizeof(cp), &cp);
++ 
++ 		enable = 0x01;
++ 		hci_req_add(req, HCI_OP_LE_SET_ADV_ENABLE, sizeof(enable),
++ 			    &enable);
++ 	}
+++>>>>>>> 4c371bb95cf0 (Bluetooth: Workaround directed advertising bug in Broadcom controllers)
+  
+  	conn->state = BT_CONNECT;
+  }
+* Unmerged path net/bluetooth/hci_conn.c
