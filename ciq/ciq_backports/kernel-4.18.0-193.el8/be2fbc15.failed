@@ -1,0 +1,174 @@
+net/tls: clean up the number of #ifdefs for CONFIG_TLS_DEVICE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] tls: clean up the number of #ifdefs for CONFIG_TLS_DEVICE (Sabrina Dubroca) [1760375]
+Rebuild_FUZZ: 96.61%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit be2fbc155fc8c0ff6e499753354d965cd9cf1bb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/be2fbc15.failed
+
+TLS code has a number of #ifdefs which make the code a little
+harder to follow. Recent fixes removed the ifdef around the
+TLS_HW define, so we can switch to the often used pattern
+of defining tls_device functions as empty static inlines
+in the header when CONFIG_TLS_DEVICE=n.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit be2fbc155fc8c0ff6e499753354d965cd9cf1bb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls.h
+#	net/tls/tls_sw.c
+diff --cc include/net/tls.h
+index c12ffebfa2b4,c664e6dba0d1..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -585,9 -657,40 +580,44 @@@ int tls_sw_fallback_init(struct sock *s
+  			 struct tls_offload_context_tx *offload_ctx,
+  			 struct tls_crypto_info *crypto_info);
+  
++ #ifdef CONFIG_TLS_DEVICE
++ void tls_device_init(void);
++ void tls_device_cleanup(void);
++ int tls_set_device_offload(struct sock *sk, struct tls_context *ctx);
++ void tls_device_free_resources_tx(struct sock *sk);
+  int tls_set_device_offload_rx(struct sock *sk, struct tls_context *ctx);
+- 
+  void tls_device_offload_cleanup_rx(struct sock *sk);
+++<<<<<<< HEAD
+ +void handle_device_resync(struct sock *sk, u32 seq, u64 rcd_sn);
+++=======
++ void tls_device_rx_resync_new_rec(struct sock *sk, u32 rcd_len, u32 seq);
++ int tls_device_decrypted(struct sock *sk, struct sk_buff *skb);
++ #else
++ static inline void tls_device_init(void) {}
++ static inline void tls_device_cleanup(void) {}
+++>>>>>>> be2fbc155fc8 (net/tls: clean up the number of #ifdefs for CONFIG_TLS_DEVICE)
+  
++ static inline int
++ tls_set_device_offload(struct sock *sk, struct tls_context *ctx)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline void tls_device_free_resources_tx(struct sock *sk) {}
++ 
++ static inline int
++ tls_set_device_offload_rx(struct sock *sk, struct tls_context *ctx)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline void tls_device_offload_cleanup_rx(struct sock *sk) {}
++ static inline void
++ tls_device_rx_resync_new_rec(struct sock *sk, u32 rcd_len, u32 seq) {}
++ 
++ static inline int tls_device_decrypted(struct sock *sk, struct sk_buff *skb)
++ {
++ 	return 0;
++ }
++ #endif
+  #endif /* _TLS_OFFLOAD_H */
+diff --cc net/tls/tls_sw.c
+index 26afa87873b7,c2b5e0d2ba1a..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -2014,10 -2013,9 +2013,16 @@@ static int tls_read_size(struct strpars
+  		ret = -EINVAL;
+  		goto read_failure;
+  	}
+++<<<<<<< HEAD
+ +#ifdef CONFIG_TLS_DEVICE
+ +	handle_device_resync(strp->sk, TCP_SKB_CB(skb)->seq + rxm->offset,
+ +			     *(u64*)tls_ctx->rx.rec_seq);
+ +#endif
+++=======
++ 
++ 	tls_device_rx_resync_new_rec(strp->sk, data_len + TLS_HEADER_SIZE,
++ 				     TCP_SKB_CB(skb)->seq + rxm->offset);
+++>>>>>>> be2fbc155fc8 (net/tls: clean up the number of #ifdefs for CONFIG_TLS_DEVICE)
+  	return data_len + TLS_HEADER_SIZE;
+  
+  read_failure:
+* Unmerged path include/net/tls.h
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index 797e39e87f9c..c83be0a55825 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -273,19 +273,14 @@ static void tls_sk_proto_cleanup(struct sock *sk,
+ 		kfree(ctx->tx.rec_seq);
+ 		kfree(ctx->tx.iv);
+ 		tls_sw_release_resources_tx(sk);
+-#ifdef CONFIG_TLS_DEVICE
+ 	} else if (ctx->tx_conf == TLS_HW) {
+ 		tls_device_free_resources_tx(sk);
+-#endif
+ 	}
+ 
+ 	if (ctx->rx_conf == TLS_SW)
+ 		tls_sw_release_resources_rx(sk);
+-
+-#ifdef CONFIG_TLS_DEVICE
+-	if (ctx->rx_conf == TLS_HW)
++	else if (ctx->rx_conf == TLS_HW)
+ 		tls_device_offload_cleanup_rx(sk);
+-#endif
+ }
+ 
+ static void tls_sk_proto_close(struct sock *sk, long timeout)
+@@ -517,26 +512,18 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ 	}
+ 
+ 	if (tx) {
+-#ifdef CONFIG_TLS_DEVICE
+ 		rc = tls_set_device_offload(sk, ctx);
+ 		conf = TLS_HW;
+ 		if (rc) {
+-#else
+-		{
+-#endif
+ 			rc = tls_set_sw_offload(sk, ctx, 1);
+ 			if (rc)
+ 				goto err_crypto_info;
+ 			conf = TLS_SW;
+ 		}
+ 	} else {
+-#ifdef CONFIG_TLS_DEVICE
+ 		rc = tls_set_device_offload_rx(sk, ctx);
+ 		conf = TLS_HW;
+ 		if (rc) {
+-#else
+-		{
+-#endif
+ 			rc = tls_set_sw_offload(sk, ctx, 0);
+ 			if (rc)
+ 				goto err_crypto_info;
+@@ -825,9 +812,7 @@ static int __init tls_register(void)
+ 	tls_sw_proto_ops = inet_stream_ops;
+ 	tls_sw_proto_ops.splice_read = tls_sw_splice_read;
+ 
+-#ifdef CONFIG_TLS_DEVICE
+ 	tls_device_init();
+-#endif
+ 	tcp_register_ulp(&tcp_tls_ulp_ops);
+ 
+ 	mark_tech_preview("kTLS", THIS_MODULE);
+@@ -837,9 +822,7 @@ static int __init tls_register(void)
+ static void __exit tls_unregister(void)
+ {
+ 	tcp_unregister_ulp(&tcp_tls_ulp_ops);
+-#ifdef CONFIG_TLS_DEVICE
+ 	tls_device_cleanup();
+-#endif
+ }
+ 
+ module_init(tls_register);
+* Unmerged path net/tls/tls_sw.c
