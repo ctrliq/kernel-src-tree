@@ -1,0 +1,307 @@
+drm/i915: Disable pipe gamma when C8 pixel format is used
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 02c52f1ed20aba171f2098b8dc03747a60456603
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/02c52f1e.failed
+
+Planes scanning out C8 will want to use the legacy lut as
+their palette. That means the LUT content are unlikely to
+be useful for gamma correction on other planes. Thus we
+should disable pipe gamma for all the other planes. And
+we should reject any non legacy LUT configurations when
+C8 planes are present.
+
+Fixes the appearance of the hw cursor when running
+X -depth 8.
+
+Note that CHV with it's independent CGM degamma/gamma LUTs
+could probably use the CGM for gamma correction even when
+the legacy LUT is used for C8. But that would require a
+new uapi for configuring the legacy LUT and CGM LUTs at
+the same time. Totally not worth it.
+
+v2: Fix typo (Uma)
+    Rebase
+
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Reviewed-by: Uma Shankar <uma.shankar@intel.com>
+	Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190207202146.26423-7-ville.syrjala@linux.intel.com
+(cherry picked from commit 02c52f1ed20aba171f2098b8dc03747a60456603)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_atomic_plane.c
+#	drivers/gpu/drm/i915/intel_color.c
+diff --cc drivers/gpu/drm/i915/intel_atomic_plane.c
+index 6d068786eb41,1c3c1eeafd1a..000000000000
+--- a/drivers/gpu/drm/i915/intel_atomic_plane.c
++++ b/drivers/gpu/drm/i915/intel_atomic_plane.c
+@@@ -108,95 -110,44 +108,117 @@@ intel_plane_destroy_state(struct drm_pl
+  }
+  
+  int intel_plane_atomic_check_with_state(const struct intel_crtc_state *old_crtc_state,
+ -					struct intel_crtc_state *new_crtc_state,
+ +					struct intel_crtc_state *crtc_state,
+  					const struct intel_plane_state *old_plane_state,
+ -					struct intel_plane_state *new_plane_state)
+ +					struct intel_plane_state *intel_state)
+  {
+ -	struct intel_plane *plane = to_intel_plane(new_plane_state->base.plane);
+ +	struct drm_plane *plane = intel_state->base.plane;
+ +	struct drm_i915_private *dev_priv = to_i915(plane->dev);
+ +	struct drm_plane_state *state = &intel_state->base;
+ +	struct intel_plane *intel_plane = to_intel_plane(plane);
+ +	const struct drm_display_mode *adjusted_mode =
+ +		&crtc_state->base.adjusted_mode;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Both crtc and plane->crtc could be NULL if we're updating a
+ +	 * property while the plane is disabled.  We don't actually have
+ +	 * anything driver-specific we need to test in that case, so
+ +	 * just return success.
+ +	 */
+ +	if (!intel_state->base.crtc && !old_plane_state->base.crtc)
+++=======
++ 	new_crtc_state->active_planes &= ~BIT(plane->id);
++ 	new_crtc_state->nv12_planes &= ~BIT(plane->id);
++ 	new_crtc_state->c8_planes &= ~BIT(plane->id);
++ 	new_plane_state->base.visible = false;
++ 
++ 	if (!new_plane_state->base.crtc && !old_plane_state->base.crtc)
+++>>>>>>> 02c52f1ed20a (drm/i915: Disable pipe gamma when C8 pixel format is used)
+  		return 0;
+  
+ -	ret = plane->check_plane(new_crtc_state, new_plane_state);
+ +	if (state->fb && drm_rotation_90_or_270(state->rotation)) {
+ +		struct drm_format_name_buf format_name;
+ +
+ +		if (state->fb->modifier != I915_FORMAT_MOD_Y_TILED &&
+ +		    state->fb->modifier != I915_FORMAT_MOD_Yf_TILED) {
+ +			DRM_DEBUG_KMS("Y/Yf tiling required for 90/270!\n");
+ +			return -EINVAL;
+ +		}
+ +
+ +		/*
+ +		 * 90/270 is not allowed with RGB64 16:16:16:16,
+ +		 * RGB 16-bit 5:6:5, and Indexed 8-bit.
+ +		 * TBD: Add RGB64 case once its added in supported format list.
+ +		 */
+ +		switch (state->fb->format->format) {
+ +		case DRM_FORMAT_C8:
+ +		case DRM_FORMAT_RGB565:
+ +			DRM_DEBUG_KMS("Unsupported pixel format %s for 90/270!\n",
+ +			              drm_get_format_name(state->fb->format->format,
+ +			                                  &format_name));
+ +			return -EINVAL;
+ +
+ +		default:
+ +			break;
+ +		}
+ +	}
+ +
+ +	/* CHV ignores the mirror bit when the rotate bit is set :( */
+ +	if (IS_CHERRYVIEW(dev_priv) &&
+ +	    state->rotation & DRM_MODE_ROTATE_180 &&
+ +	    state->rotation & DRM_MODE_REFLECT_X) {
+ +		DRM_DEBUG_KMS("Cannot rotate and reflect at the same time\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	intel_state->base.visible = false;
+ +	ret = intel_plane->check_plane(intel_plane, crtc_state, intel_state);
+  	if (ret)
+  		return ret;
+  
+ -	/* FIXME pre-g4x don't work like this */
+ -	if (new_plane_state->base.visible)
+ -		new_crtc_state->active_planes |= BIT(plane->id);
+ +	/*
+ +	 * Y-tiling is not supported in IF-ID Interlace mode in
+ +	 * GEN9 and above.
+ +	 */
+ +	if (state->fb && INTEL_GEN(dev_priv) >= 9 && crtc_state->base.enable &&
+ +	    adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE) {
+ +		if (state->fb->modifier == I915_FORMAT_MOD_Y_TILED ||
+ +		    state->fb->modifier == I915_FORMAT_MOD_Yf_TILED) {
+ +			DRM_DEBUG_KMS("Y/Yf tiling not supported in IF-ID mode\n");
+ +			return -EINVAL;
+ +		}
+ +	}
+  
+ +	/* FIXME pre-g4x don't work like this */
+ +	if (state->visible)
+ +		crtc_state->active_planes |= BIT(intel_plane->id);
+ +	else
+ +		crtc_state->active_planes &= ~BIT(intel_plane->id);
+ +
+++<<<<<<< HEAD
+ +	if (state->visible && state->fb->format->format == DRM_FORMAT_NV12)
+ +		crtc_state->nv12_planes |= BIT(intel_plane->id);
+ +	else
+ +		crtc_state->nv12_planes &= ~BIT(intel_plane->id);
+++=======
++ 	if (new_plane_state->base.visible &&
++ 	    new_plane_state->base.fb->format->format == DRM_FORMAT_NV12)
++ 		new_crtc_state->nv12_planes |= BIT(plane->id);
++ 
++ 	if (new_plane_state->base.visible &&
++ 	    new_plane_state->base.fb->format->format == DRM_FORMAT_C8)
++ 		new_crtc_state->c8_planes |= BIT(plane->id);
++ 
++ 	if (new_plane_state->base.visible || old_plane_state->base.visible)
++ 		new_crtc_state->update_planes |= BIT(plane->id);
+++>>>>>>> 02c52f1ed20a (drm/i915: Disable pipe gamma when C8 pixel format is used)
+  
+  	return intel_plane_atomic_calc_changes(old_crtc_state,
+ -					       &new_crtc_state->base,
+ +					       &crtc_state->base,
+  					       old_plane_state,
+ -					       &new_plane_state->base);
+ +					       state);
+  }
+  
+  static int intel_plane_atomic_check(struct drm_plane *plane,
+diff --cc drivers/gpu/drm/i915/intel_color.c
+index c6a7beabd58d,09888cc2c134..000000000000
+--- a/drivers/gpu/drm/i915/intel_color.c
++++ b/drivers/gpu/drm/i915/intel_color.c
+@@@ -621,48 -712,81 +621,75 @@@ int intel_color_check(struct drm_crtc *
+  
+  	degamma_length = INTEL_INFO(dev_priv)->color.degamma_lut_size;
+  	gamma_length = INTEL_INFO(dev_priv)->color.gamma_lut_size;
+ -	degamma_tests = INTEL_INFO(dev_priv)->color.degamma_lut_tests;
+ -	gamma_tests = INTEL_INFO(dev_priv)->color.gamma_lut_tests;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We allow both degamma & gamma luts at the right size or
+ +	 * NULL.
+ +	 */
+ +	if ((!crtc_state->degamma_lut ||
+ +	     drm_color_lut_size(crtc_state->degamma_lut) == degamma_length) &&
+ +	    (!crtc_state->gamma_lut ||
+ +	     drm_color_lut_size(crtc_state->gamma_lut) == gamma_length))
+++=======
++ 	/* C8 needs the legacy LUT all to itself */
++ 	if (crtc_state->c8_planes &&
++ 	    !crtc_state_is_legacy_gamma(crtc_state))
++ 		return -EINVAL;
++ 
++ 	crtc_state->gamma_enable = (gamma_lut || degamma_lut) &&
++ 		!crtc_state->c8_planes;
++ 
++ 	if (INTEL_GEN(dev_priv) >= 9 ||
++ 	    IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
++ 		limited_color_range = crtc_state->limited_color_range;
++ 
++ 	crtc_state->csc_enable =
++ 		crtc_state->output_format != INTEL_OUTPUT_FORMAT_RGB ||
++ 		crtc_state->base.ctm || limited_color_range;
++ 
++ 	ret = intel_color_add_affected_planes(crtc_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Always allow legacy gamma LUT with no further checking. */
++ 	if (!crtc_state->gamma_enable ||
++ 	    crtc_state_is_legacy_gamma(crtc_state)) {
++ 		crtc_state->gamma_mode = GAMMA_MODE_MODE_8BIT;
+++>>>>>>> 02c52f1ed20a (drm/i915: Disable pipe gamma when C8 pixel format is used)
+  		return 0;
+ -	}
+ -
+ -	if (check_lut_size(degamma_lut, degamma_length) ||
+ -	    check_lut_size(gamma_lut, gamma_length))
+ -		return -EINVAL;
+ -
+ -	if (drm_color_lut_check(degamma_lut, degamma_tests) ||
+ -	    drm_color_lut_check(gamma_lut, gamma_tests))
+ -		return -EINVAL;
+  
+ -	if (INTEL_GEN(dev_priv) >= 10 || IS_GEMINILAKE(dev_priv))
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_10BIT;
+ -	else if (INTEL_GEN(dev_priv) >= 9 || IS_BROADWELL(dev_priv))
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_SPLIT;
+ -	else
+ -		crtc_state->gamma_mode = GAMMA_MODE_MODE_8BIT;
+ +	/*
+ +	 * We also allow no degamma lut/ctm and a gamma lut at the legacy
+ +	 * size (256 entries).
+ +	 */
+ +	if (crtc_state_is_legacy_gamma(crtc_state))
+ +		return 0;
+  
+ -	return 0;
+ +	return -EINVAL;
+  }
+  
+ -void intel_color_init(struct intel_crtc *crtc)
+ +void intel_color_init(struct drm_crtc *crtc)
+  {
+ -	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ -
+ -	drm_mode_crtc_set_gamma_size(&crtc->base, 256);
+ -
+ -	if (HAS_GMCH(dev_priv)) {
+ -		if (IS_CHERRYVIEW(dev_priv))
+ -			dev_priv->display.load_luts = cherryview_load_luts;
+ -		else
+ -			dev_priv->display.load_luts = i9xx_load_luts;
+ -
+ -		dev_priv->display.color_commit = i9xx_color_commit;
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->dev);
+ +
+ +	drm_mode_crtc_set_gamma_size(crtc, 256);
+ +
+ +	if (IS_CHERRYVIEW(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = cherryview_load_csc_matrix;
+ +		dev_priv->display.load_luts = cherryview_load_luts;
+ +	} else if (IS_HASWELL(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = haswell_load_luts;
+ +	} else if (IS_BROADWELL(dev_priv) || IS_GEN9_BC(dev_priv) ||
+ +		   IS_BROXTON(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = broadwell_load_luts;
+ +	} else if (IS_GEMINILAKE(dev_priv) || IS_CANNONLAKE(dev_priv)) {
+ +		dev_priv->display.load_csc_matrix = ilk_load_csc_matrix;
+ +		dev_priv->display.load_luts = glk_load_luts;
+  	} else {
+ -		if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv))
+ -			dev_priv->display.load_luts = glk_load_luts;
+ -		else if (INTEL_GEN(dev_priv) >= 9 || IS_BROADWELL(dev_priv))
+ -			dev_priv->display.load_luts = broadwell_load_luts;
+ -		else
+ -			dev_priv->display.load_luts = i9xx_load_luts;
+ -
+ -		if (INTEL_GEN(dev_priv) >= 9)
+ -			dev_priv->display.color_commit = skl_color_commit;
+ -		else if (IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
+ -			dev_priv->display.color_commit = hsw_color_commit;
+ -		else
+ -			dev_priv->display.color_commit = ilk_color_commit;
+ +		dev_priv->display.load_luts = i9xx_load_luts;
+  	}
+  
+  	/* Enable color management support when we have degamma & gamma LUTs. */
+* Unmerged path drivers/gpu/drm/i915/intel_atomic_plane.c
+* Unmerged path drivers/gpu/drm/i915/intel_color.c
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index b8eefbffc77d..7434ba947a76 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -890,6 +890,7 @@ struct intel_crtc_state {
+ 	/* bitmask of visible planes (enum plane_id) */
+ 	u8 active_planes;
+ 	u8 nv12_planes;
++	u8 c8_planes;
+ 
+ 	/* HDMI scrambling status */
+ 	bool hdmi_scrambling;
