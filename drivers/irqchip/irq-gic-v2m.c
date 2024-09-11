@@ -495,7 +495,7 @@ static bool acpi_check_amazon_graviton_quirks(void)
 }
 
 static int __init
-acpi_parse_madt_msi(struct acpi_subtable_header *header,
+acpi_parse_madt_msi(union acpi_subtable_headers *header,
 		    const unsigned long end)
 {
 	int ret;
