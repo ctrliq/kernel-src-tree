@@ -657,7 +657,7 @@ nfs_setattr(struct dentry *dentry, struct iattr *attr)
 	if (S_ISREG(inode->i_mode))
 		nfs_sync_inode(inode);
 
-	fattr = nfs_alloc_fattr();
+	fattr = nfs_alloc_fattr_with_label(NFS_SERVER(inode));
 	if (fattr == NULL) {
 		error = -ENOMEM;
 		goto out;
