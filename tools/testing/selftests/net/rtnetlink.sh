@@ -735,9 +735,9 @@ kci_test_ipsec_offload()
 	algo="aead rfc4106(gcm(aes)) 0x3132333435363738393031323334353664636261 128"
 	srcip=192.168.123.3
 	dstip=192.168.123.4
-	dev=simx1
 	sysfsd=/sys/kernel/debug/netdevsim/netdevsim0/ports/0/
 	sysfsf=$sysfsd/ipsec
+	sysfsnet=/sys/bus/netdevsim/devices/netdevsim0/net/
 
 	# setup netdevsim since dummydev doesn't have offload support
 	modprobe netdevsim
@@ -747,7 +747,11 @@ kci_test_ipsec_offload()
 		return 1
 	fi
 
-	ip link add $dev type netdevsim
+	echo "0" > /sys/bus/netdevsim/new_device
+	while [ ! -d $sysfsnet ] ; do :; done
+	udevadm settle
+	dev=`ls $sysfsnet`
+
 	ip addr add $srcip dev $dev
 	ip link set $dev up
 	if [ ! -d $sysfsd ] ; then
@@ -820,7 +824,6 @@ EOF
 	fi
 
 	# clean up any leftovers
-	ip link del $dev
 	rmmod netdevsim
 
 	if [ $ret -ne 0 ]; then
