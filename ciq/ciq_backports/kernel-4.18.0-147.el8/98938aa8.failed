@@ -1,0 +1,113 @@
+KVM: validate userspace input in kvm_clear_dirty_log_protect()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Tomas Bortoli <tomasbortoli@gmail.com>
+commit 98938aa8edd66dc95024d7c936a4bc315f6615ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/98938aa8.failed
+
+The function at issue does not fully validate the content of the
+structure pointed by the log parameter, though its content has just been
+copied from userspace and lacks validation. Fix that.
+
+Moreover, change the type of n to unsigned long as that is the type
+returned by kvm_dirty_bitmap_bytes().
+
+	Signed-off-by: Tomas Bortoli <tomasbortoli@gmail.com>
+	Reported-by: syzbot+028366e52c9ace67deb3@syzkaller.appspotmail.com
+[Squashed the fix from Paolo. - Radim.]
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 98938aa8edd66dc95024d7c936a4bc315f6615ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 3fc38377f30d,5ecea812cb6a..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1206,6 -1215,78 +1206,81 @@@ int kvm_get_dirty_log_protect(struct kv
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(kvm_get_dirty_log_protect);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * kvm_clear_dirty_log_protect - clear dirty bits in the bitmap
++  *	and reenable dirty page tracking for the corresponding pages.
++  * @kvm:	pointer to kvm instance
++  * @log:	slot id and address from which to fetch the bitmap of dirty pages
++  */
++ int kvm_clear_dirty_log_protect(struct kvm *kvm,
++ 				struct kvm_clear_dirty_log *log, bool *flush)
++ {
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memory_slot *memslot;
++ 	int as_id, id;
++ 	gfn_t offset;
++ 	unsigned long i, n;
++ 	unsigned long *dirty_bitmap;
++ 	unsigned long *dirty_bitmap_buffer;
++ 
++ 	as_id = log->slot >> 16;
++ 	id = (u16)log->slot;
++ 	if (as_id >= KVM_ADDRESS_SPACE_NUM || id >= KVM_USER_MEM_SLOTS)
++ 		return -EINVAL;
++ 
++ 	if ((log->first_page & 63) || (log->num_pages & 63))
++ 		return -EINVAL;
++ 
++ 	slots = __kvm_memslots(kvm, as_id);
++ 	memslot = id_to_memslot(slots, id);
++ 
++ 	dirty_bitmap = memslot->dirty_bitmap;
++ 	if (!dirty_bitmap)
++ 		return -ENOENT;
++ 
++ 	n = kvm_dirty_bitmap_bytes(memslot);
++ 
++ 	if (log->first_page > memslot->npages ||
++ 	    log->num_pages > memslot->npages - log->first_page)
++ 			return -EINVAL;
++ 
++ 	*flush = false;
++ 	dirty_bitmap_buffer = kvm_second_dirty_bitmap(memslot);
++ 	if (copy_from_user(dirty_bitmap_buffer, log->dirty_bitmap, n))
++ 		return -EFAULT;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	for (offset = log->first_page,
++ 	     i = offset / BITS_PER_LONG, n = log->num_pages / BITS_PER_LONG; n--;
++ 	     i++, offset += BITS_PER_LONG) {
++ 		unsigned long mask = *dirty_bitmap_buffer++;
++ 		atomic_long_t *p = (atomic_long_t *) &dirty_bitmap[i];
++ 		if (!mask)
++ 			continue;
++ 
++ 		mask &= atomic_long_fetch_andnot(mask, p);
++ 
++ 		/*
++ 		 * mask contains the bits that really have been cleared.  This
++ 		 * never includes any bits beyond the length of the memslot (if
++ 		 * the length is not aligned to 64 pages), therefore it is not
++ 		 * a problem if userspace sets them in log->dirty_bitmap.
++ 		*/
++ 		if (mask) {
++ 			*flush = true;
++ 			kvm_arch_mmu_enable_log_dirty_pt_masked(kvm, memslot,
++ 								offset, mask);
++ 		}
++ 	}
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(kvm_clear_dirty_log_protect);
+++>>>>>>> 98938aa8edd6 (KVM: validate userspace input in kvm_clear_dirty_log_protect())
+  #endif
+  
+  bool kvm_largepages_enabled(void)
+* Unmerged path virt/kvm/kvm_main.c
