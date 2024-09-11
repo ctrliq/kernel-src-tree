@@ -12,9 +12,9 @@
 #include "mt7615.h"
 
 static const struct pci_device_id mt7615_pci_device_table[] = {
-	{ PCI_DEVICE(0x14c3, 0x7615) },
-	{ PCI_DEVICE(0x14c3, 0x7663) },
-	{ PCI_DEVICE(0x14c3, 0x7611) },
+	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7615) },
+	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7663) },
+	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x7611) },
 	{ },
 };
 
