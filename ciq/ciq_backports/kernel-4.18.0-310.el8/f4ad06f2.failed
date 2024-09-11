@@ -1,0 +1,145 @@
+block: rename bd_invalidated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit f4ad06f2bb8476548b08f89919ee65abc4e40212
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/f4ad06f2.failed
+
+Replace bd_invalidate with a new BDEV_NEED_PART_SCAN flag in a bd_flags
+variable to better describe the condition.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f4ad06f2bb8476548b08f89919ee65abc4e40212)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+#	include/linux/blk_types.h
+diff --cc fs/block_dev.c
+index f19cc879b480,1e6441dbe840..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -912,9 -879,9 +912,9 @@@ struct block_device *bdget(dev_t dev
+  		bdev->bd_contains = NULL;
+  		bdev->bd_super = NULL;
+  		bdev->bd_inode = inode;
+ +		bdev->bd_block_size = i_blocksize(inode);
+  		bdev->bd_part_count = 0;
+- 		bdev->bd_invalidated = 0;
++ 		bdev->bd_flags = 0;
+  		inode->i_mode = S_IFBLK;
+  		inode->i_rdev = dev;
+  		inode->i_bdev = bdev;
+@@@ -1489,6 -1390,8 +1489,11 @@@ int bdev_disk_changed(struct block_devi
+  
+  	lockdep_assert_held(&bdev->bd_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ 	clear_bit(BDEV_NEED_PART_SCAN, &bdev->bd_flags);
++ 
+++>>>>>>> f4ad06f2bb84 (block: rename bd_invalidated)
+  rescan:
+  	ret = blk_drop_partitions(bdev);
+  	if (ret)
+diff --cc include/linux/blk_types.h
+index 01eb143dd5ae,6ffa783e1633..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -19,6 -17,38 +19,41 @@@ struct block_device
+  struct io_context;
+  struct cgroup_subsys_state;
+  typedef void (bio_end_io_t) (struct bio *);
+++<<<<<<< HEAD
+++=======
++ struct bio_crypt_ctx;
++ 
++ #define BDEV_NEED_PART_SCAN		0
++ 
++ struct block_device {
++ 	dev_t			bd_dev;
++ 	int			bd_openers;
++ 	struct inode *		bd_inode;	/* will die */
++ 	struct super_block *	bd_super;
++ 	struct mutex		bd_mutex;	/* open/close mutex */
++ 	void *			bd_claiming;
++ 	void *			bd_holder;
++ 	int			bd_holders;
++ 	bool			bd_write_holder;
++ #ifdef CONFIG_SYSFS
++ 	struct list_head	bd_holder_disks;
++ #endif
++ 	struct block_device *	bd_contains;
++ 	u8			bd_partno;
++ 	struct hd_struct *	bd_part;
++ 	/* number of times partitions within this device have been opened. */
++ 	unsigned		bd_part_count;
++ 	unsigned long		bd_flags;
++ 	spinlock_t		bd_size_lock; /* for bd_inode->i_size updates */
++ 	struct gendisk *	bd_disk;
++ 	struct backing_dev_info *bd_bdi;
++ 
++ 	/* The counter of freeze processes */
++ 	int			bd_fsfreeze_count;
++ 	/* Mutex for freeze */
++ 	struct mutex		bd_fsfreeze_mutex;
++ } __randomize_layout;
+++>>>>>>> f4ad06f2bb84 (block: rename bd_invalidated)
+  
+  /*
+   * Block error status values.  See block/blk-core:blk_errors for the details.
+diff --git a/block/genhd.c b/block/genhd.c
+index e5a406eac921..9dd5b49662e1 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -736,7 +736,7 @@ static void register_disk(struct device *parent, struct gendisk *disk,
+ 	if (!bdev)
+ 		goto exit;
+ 
+-	bdev->bd_invalidated = 1;
++	set_bit(BDEV_NEED_PART_SCAN, &bdev->bd_flags);
+ 	err = blkdev_get(bdev, FMODE_READ, NULL);
+ 	if (err < 0)
+ 		goto exit;
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index d393d6149779..215d5d9cbfce 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -313,7 +313,7 @@ static void nbd_size_update(struct nbd_device *nbd, bool start)
+ 			if (start)
+ 				set_blocksize(bdev, config->blksize);
+ 		} else
+-			bdev->bd_invalidated = 1;
++			set_bit(BDEV_NEED_PART_SCAN, &bdev->bd_flags);
+ 		bdput(bdev);
+ 	}
+ 	kobject_uevent(&nbd_to_dev(nbd)->kobj, KOBJ_CHANGE);
+@@ -1335,7 +1335,7 @@ static int nbd_start_device_ioctl(struct nbd_device *nbd, struct block_device *b
+ 		return ret;
+ 
+ 	if (max_part)
+-		bdev->bd_invalidated = 1;
++		set_bit(BDEV_NEED_PART_SCAN, &bdev->bd_flags);
+ 	mutex_unlock(&nbd->config_lock);
+ 	ret = wait_event_interruptible(config->recv_wq,
+ 					 atomic_read(&config->recv_threads) == 0);
+@@ -1513,9 +1513,9 @@ static int nbd_open(struct block_device *bdev, fmode_t mode)
+ 		refcount_set(&nbd->config_refs, 1);
+ 		refcount_inc(&nbd->refs);
+ 		mutex_unlock(&nbd->config_lock);
+-		bdev->bd_invalidated = 1;
++		set_bit(BDEV_NEED_PART_SCAN, &bdev->bd_flags);
+ 	} else if (nbd_disconnected(nbd->config)) {
+-		bdev->bd_invalidated = 1;
++		set_bit(BDEV_NEED_PART_SCAN, &bdev->bd_flags);
+ 	}
+ out:
+ 	mutex_unlock(&nbd_index_mutex);
+* Unmerged path fs/block_dev.c
+* Unmerged path include/linux/blk_types.h
