@@ -75,7 +75,7 @@ unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct,
  *
  */
 
-static void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
+void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
 {
 	bd->bd_tr = NULL;
 	list_del_init(&bd->bd_ail_st_list);
@@ -94,7 +94,7 @@ static void gfs2_remove_from_ail(struct gfs2_bufdata *bd)
 
 static int gfs2_ail1_start_one(struct gfs2_sbd *sdp,
 			       struct writeback_control *wbc,
-			       struct gfs2_trans *tr)
+			       struct gfs2_trans *tr, struct blk_plug *plug)
 __releases(&sdp->sd_ail_lock)
 __acquires(&sdp->sd_ail_lock)
 {
@@ -136,6 +136,11 @@ __acquires(&sdp->sd_ail_lock)
 			continue;
 		spin_unlock(&sdp->sd_ail_lock);
 		ret = generic_writepages(mapping, wbc);
+		if (need_resched()) {
+			blk_finish_plug(plug);
+			cond_resched();
+			blk_start_plug(plug);
+		}
 		spin_lock(&sdp->sd_ail_lock);
 		if (ret == -ENODATA) /* if a jdata write into a new hole */
 			ret = 0; /* ignore it */
@@ -172,7 +177,7 @@ restart:
 	list_for_each_entry_reverse(tr, head, tr_list) {
 		if (wbc->nr_to_write <= 0)
 			break;
-		ret = gfs2_ail1_start_one(sdp, wbc, tr);
+		ret = gfs2_ail1_start_one(sdp, wbc, tr, &plug);
 		if (ret) {
 			if (ret == -EBUSY)
 				goto restart;

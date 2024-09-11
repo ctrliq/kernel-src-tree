@@ -3746,10 +3746,8 @@ static void raid_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	 * RAID1/4/5/6 don't and process large discard bios properly.
 	 */
 	if (rs_is_raid0(rs) || rs_is_raid10(rs)) {
-		limits->discard_granularity = max(chunk_size_bytes,
-						  limits->discard_granularity);
-		limits->max_discard_sectors = min_not_zero((unsigned)rs->md.chunk_sectors,
-							   limits->max_discard_sectors);
+		limits->discard_granularity = chunk_size_bytes;
+		limits->max_discard_sectors = rs->md.chunk_sectors;
 	}
 }
 

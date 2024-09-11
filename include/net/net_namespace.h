@@ -177,6 +177,7 @@ struct net {
 	RH_KABI_EXTEND(struct list_head        xfrm_inexact_bins)
 	RH_KABI_EXTEND(struct raw_notifier_head	netdev_chain)
 	RH_KABI_EXTEND(struct list_head		nft_module_list)
+	RH_KABI_EXTEND(struct list_head		nft_notify_list)
 	RH_KABI_EXTEND(struct mutex		nft_commit_mutex)
 #ifdef CONFIG_NF_CT_PROTO_GRE
 	RH_KABI_EXTEND(struct nf_gre_net	nf_ct_gre)

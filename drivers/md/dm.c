@@ -1478,8 +1478,7 @@ static int __send_changing_extent_only(struct clone_info *ci, struct dm_target *
 		len = min_t(sector_t, ci->sector_count,
 			    max_io_len_target_boundary(ti, dm_target_offset(ti, ci->sector)));
 	else
-		len = min_t(sector_t, ci->sector_count,
-			    max_io_len(ti, dm_target_offset(ti, ci->sector)));
+		len = min_t(sector_t, ci->sector_count, max_io_len(ti, ci->sector));
 
 	__send_duplicate_bios(ci, ti, num_bios, &len);
 

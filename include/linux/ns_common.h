@@ -10,7 +10,7 @@ struct ns_common {
 	atomic_long_t stashed;
 	const struct proc_ns_operations *ops;
 	unsigned int inum;
-	refcount_t count;
+	RH_KABI_FILL_HOLE(refcount_t count)
 };
 
 #endif

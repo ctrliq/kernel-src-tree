@@ -479,7 +479,7 @@ static void qat_alg_xts_reverse_key(const u8 *key_forward, unsigned int keylen,
 	int nrounds;
 	u8 *key;
 
-	aes_expandkey(&aes_expanded, key_forward, keylen);
+	crypto_aes_expand_key(&aes_expanded, key_forward, keylen);
 	if (keylen == AES_KEYSIZE_128) {
 		nrounds = 10;
 		key = (u8 *)aes_expanded.key_enc + (AES_BLOCK_SIZE * nrounds);

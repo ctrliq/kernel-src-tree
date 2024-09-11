@@ -1924,11 +1924,14 @@ void mlx5e_tc_set_ethertype(struct mlx5_core_dev *mdev,
 {
 	bool ip_version_cap;
 
+#if 0
 	ip_version_cap = outer ?
 		MLX5_CAP_FLOWTABLE_NIC_RX(mdev,
 					  ft_field_support.outer_ip_version) :
 		MLX5_CAP_FLOWTABLE_NIC_RX(mdev,
 					  ft_field_support.inner_ip_version);
+#endif
+	ip_version_cap = false;
 
 	if (ip_version_cap && match->mask->n_proto == htons(0xFFFF) &&
 	    (match->key->n_proto == htons(ETH_P_IP) ||
@@ -4806,7 +4809,7 @@ static int apply_police_params(struct mlx5e_priv *priv, u64 rate,
 	 */
 	if (rate) {
 		rate = (rate * BITS_PER_BYTE) + 500000;
-		rate_mbps = max_t(u32, do_div(rate, 1000000), 1);
+		rate_mbps = max_t(u64, do_div(rate, 1000000), 1);
 	}
 
 	err = mlx5_esw_modify_vport_rate(esw, vport_num, rate_mbps);

@@ -1961,7 +1961,7 @@ static int intcapxt_irqdomain_activate(struct irq_domain *domain,
 	union intcapxt xt;
 
 	xt.capxt = 0ULL;
-	xt.dest_mode_logical = apic->dest_mode_logical;
+	xt.dest_mode_logical = apic->irq_dest_mode;
 	xt.vector = cfg->vector;
 	xt.destid_0_23 = cfg->dest_apicid & GENMASK(23, 0);
 	xt.destid_24_31 = cfg->dest_apicid >> 24;

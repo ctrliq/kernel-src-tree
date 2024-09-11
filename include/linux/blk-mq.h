@@ -77,10 +77,7 @@ struct blk_mq_hw_ctx {
 	/** @cpuhp_online: List to store request if CPU is going to die */
 	RH_KABI_USE(3, 4, struct hlist_node	cpuhp_online)
 
-	/**
-	 * @elevator_queued: Number of queued requests on hctx.
-	 */
-	RH_KABI_USE(5, atomic_t                elevator_queued)
+	RH_KABI_RESERVE(5)
 
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)

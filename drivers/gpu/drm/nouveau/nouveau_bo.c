@@ -540,7 +540,7 @@ nouveau_bo_sync_for_device(struct nouveau_bo *nvbo)
 {
 	struct nouveau_drm *drm = nouveau_bdev(nvbo->bo.bdev);
 	struct ttm_dma_tt *ttm_dma = (struct ttm_dma_tt *)nvbo->bo.ttm;
-	int i;
+	int i, j;
 
 	if (!ttm_dma)
 		return;
@@ -549,10 +549,21 @@ nouveau_bo_sync_for_device(struct nouveau_bo *nvbo)
 	if (nvbo->force_coherent)
 		return;
 
-	for (i = 0; i < ttm_dma->ttm.num_pages; i++)
+	for (i = 0; i < ttm_dma->ttm.num_pages; ++i) {
+		struct page *p = ttm_dma->ttm.pages[i];
+		size_t num_pages = 1;
+
+		for (j = i + 1; j < ttm_dma->ttm.num_pages; ++j) {
+			if (++p != ttm_dma->ttm.pages[j])
+				break;
+
+			++num_pages;
+		}
 		dma_sync_single_for_device(drm->dev->dev,
 					   ttm_dma->dma_address[i],
-					   PAGE_SIZE, DMA_TO_DEVICE);
+					   num_pages * PAGE_SIZE, DMA_TO_DEVICE);
+		i += num_pages;
+	}
 }
 
 void
@@ -560,7 +571,7 @@ nouveau_bo_sync_for_cpu(struct nouveau_bo *nvbo)
 {
 	struct nouveau_drm *drm = nouveau_bdev(nvbo->bo.bdev);
 	struct ttm_dma_tt *ttm_dma = (struct ttm_dma_tt *)nvbo->bo.ttm;
-	int i;
+	int i, j;
 
 	if (!ttm_dma)
 		return;
@@ -569,9 +580,21 @@ nouveau_bo_sync_for_cpu(struct nouveau_bo *nvbo)
 	if (nvbo->force_coherent)
 		return;
 
-	for (i = 0; i < ttm_dma->ttm.num_pages; i++)
+	for (i = 0; i < ttm_dma->ttm.num_pages; ++i) {
+		struct page *p = ttm_dma->ttm.pages[i];
+		size_t num_pages = 1;
+
+		for (j = i + 1; j < ttm_dma->ttm.num_pages; ++j) {
+			if (++p != ttm_dma->ttm.pages[j])
+				break;
+
+			++num_pages;
+		}
+
 		dma_sync_single_for_cpu(drm->dev->dev, ttm_dma->dma_address[i],
-					PAGE_SIZE, DMA_FROM_DEVICE);
+					num_pages * PAGE_SIZE, DMA_FROM_DEVICE);
+		i += num_pages;
+	}
 }
 
 int

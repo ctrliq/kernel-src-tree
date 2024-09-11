@@ -310,7 +310,7 @@ void intel_psr_init_dpcd(struct intel_dp *intel_dp)
 	drm_dbg_kms(&dev_priv->drm, "eDP panel supports PSR version %x\n",
 		    intel_dp->psr_dpcd[0]);
 
-	if (drm_dp_has_quirk(&intel_dp->desc, 0, DP_DPCD_QUIRK_NO_PSR)) {
+	if (drm_dp_has_quirk(&intel_dp->desc, DP_DPCD_QUIRK_NO_PSR)) {
 		drm_dbg_kms(&dev_priv->drm,
 			    "PSR support not currently available for this panel\n");
 		return;
@@ -1500,9 +1500,16 @@ void intel_psr_init(struct drm_i915_private *dev_priv)
 		 */
 		dev_priv->hsw_psr_mmio_adjust = _SRD_CTL_EDP - _HSW_EDP_PSR_BASE;
 
-	if (dev_priv->params.enable_psr == -1)
-		if (INTEL_GEN(dev_priv) < 9 || !dev_priv->vbt.psr.enable)
+	if (dev_priv->params.enable_psr == -1) {
+		if (INTEL_GEN(dev_priv) < 9 || !dev_priv->vbt.psr.enable) {
 			dev_priv->params.enable_psr = 0;
+		} else if (INTEL_GEN(dev_priv) == 12) {
+			/* Lyude: PSR2 is broken on TGL and we don't have time to fix it, shut it
+			 * off for now like we've done in previous generations
+			 */
+			dev_priv->params.enable_psr = 0;
+		}
+	}
 
 	/* Set link_standby x link_off defaults */
 	if (IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))

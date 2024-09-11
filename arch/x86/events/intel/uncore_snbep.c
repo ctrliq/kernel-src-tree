@@ -1406,7 +1406,7 @@ static int snbep_pci2phy_map_init(int devid, int nodeid_loc, int idmap_loc, bool
 				struct cpuinfo_x86 *c = &cpu_data(cpu);
 
 				if (c->initialized && cpu_to_node(cpu) == node) {
-					map->pbus_to_dieid[bus] = die_id = c->logical_die_id;
+					map->pbus_to_dieid[bus] = die_id = c->_rh.logical_die_id;
 					break;
 				}
 			}

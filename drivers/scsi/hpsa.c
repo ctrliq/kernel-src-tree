@@ -5576,7 +5576,7 @@ static int hpsa_ioaccel_submit(struct ctlr_info *h,
 		c->scsi_cmd = cmd;
 		c->device = dev;
 		if (retry) /* Resubmit but do not increment device->commands_outstanding. */
-			c->retry_pending = true;
+			c->retry_pending = 1;
 		rc = hpsa_scsi_ioaccel_raid_map(h, c);
 		if (rc < 0)     /* scsi_dma_map failed. */
 			rc = SCSI_MLQUEUE_HOST_BUSY;
@@ -5586,7 +5586,7 @@ static int hpsa_ioaccel_submit(struct ctlr_info *h,
 		c->scsi_cmd = cmd;
 		c->device = dev;
 		if (retry) /* Resubmit but do not increment device->commands_outstanding. */
-			c->retry_pending = true;
+			c->retry_pending = 1;
 		rc = hpsa_scsi_ioaccel_direct_map(h, c);
 		if (rc < 0)     /* scsi_dma_map failed. */
 			rc = SCSI_MLQUEUE_HOST_BUSY;
@@ -5644,7 +5644,7 @@ static void hpsa_command_resubmit_worker(struct work_struct *work)
 	 * Note: hpsa_ciss_submit does not zero out the command fields like
 	 *       ioaccel submit does.
 	 */
-	c->retry_pending = true;
+	c->retry_pending = 1;
 	if (hpsa_ciss_submit(c->h, c, cmd, dev)) {
 		/*
 		 * If we get here, it means dma mapping failed. Try
@@ -6152,7 +6152,7 @@ static struct CommandList *cmd_tagged_alloc(struct ctlr_info *h,
 	 * This is a new command obtained from queue_command so
 	 * there have not been any driver initiated retry attempts.
 	 */
-	c->retry_pending = false;
+	c->retry_pending = 0;
 
 	return c;
 }
@@ -6226,7 +6226,7 @@ static struct CommandList *cmd_alloc(struct ctlr_info *h)
 	 * cmd_alloc is for "internal" commands and they are never
 	 * retried.
 	 */
-	c->retry_pending = false;
+	c->retry_pending = 0;
 
 	return c;
 }

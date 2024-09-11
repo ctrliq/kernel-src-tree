@@ -771,6 +771,16 @@ static void section_misc(const char *define_prefix, __u32 ifindex)
 #define capability_msg(a, i) a[i].set ? "" : a[i].name, a[i].set ? "" : ", "
 #endif
 
+/*
+ * RHEL8.4 specific change BZ#1921542
+ *
+ * While CAP_BPF is defined in kernel uapi header,
+ * libcap is still not aware of it, which makes
+ * following code fail. Undef CAP_BPF for now, so
+ * we have working feature command.
+ */
+#undef CAP_BPF
+
 static int handle_perms(void)
 {
 #ifdef USE_LIBCAP
