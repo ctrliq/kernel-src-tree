@@ -1,0 +1,97 @@
+powerpc/pseries/cmm: Switch to balloon_page_alloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit e8decafefb67794ba30fddf7d9e90a247b5aa172
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e8decafe.failed
+
+balloon_page_alloc() will use GFP_HIGHUSER_MOVABLE in case we have
+CONFIG_BALLOON_COMPACTION. This is now possible, as balloon pages are
+movable with CONFIG_BALLOON_COMPACTION. Without
+CONFIG_BALLOON_COMPACTION, GFP_HIGHUSER is used.
+
+Note that apart from that, balloon_page_alloc() uses the following
+flags:
+    __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN
+And current code used:
+    GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY | __GFP_NOMEMALLOC
+
+GFP_HIGHUSER/GFP_HIGHUSER_MOVABLE include
+    __GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_HARDWALL | __GFP_HIGHMEM
+
+GFP_NOIO is __GFP_RECLAIM.
+
+With CONFIG_BALLOON_COMPACTION, we essentially add:
+    __GFP_IO | __GFP_FS | __GFP_HARDWALL | __GFP_HIGHMEM | __GFP_MOVABLE
+
+Without CONFIG_BALLOON_COMPACTION, we essentially add:
+    __GFP_IO | __GFP_FS | __GFP_HARDWALL | __GFP_HIGHMEM
+
+I assume this is fine, as this is what all other balloon compaction
+users use. If it turns out to be a problem, we could add __GFP_MOVABLE
+manually if we have CONFIG_BALLOON_COMPACTION.
+
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20191031142933.10779-10-david@redhat.com
+(cherry picked from commit e8decafefb67794ba30fddf7d9e90a247b5aa172)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/cmm.c
+diff --cc arch/powerpc/platforms/pseries/cmm.c
+index 317181692fcb,86eb845b4737..000000000000
+--- a/arch/powerpc/platforms/pseries/cmm.c
++++ b/arch/powerpc/platforms/pseries/cmm.c
+@@@ -170,39 -147,13 +170,44 @@@ static long cmm_alloc_pages(long nr
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		addr = __get_free_page(GFP_NOIO | __GFP_NOWARN |
+ +				       __GFP_NORETRY | __GFP_NOMEMALLOC);
+ +		if (!addr)
+++=======
++ 		page = balloon_page_alloc();
++ 		if (!page)
+++>>>>>>> e8decafefb67 (powerpc/pseries/cmm: Switch to balloon_page_alloc())
+  			break;
+ -		rc = plpar_page_set_loaned(page);
+ -		if (rc) {
+ +		spin_lock(&cmm_lock);
+ +		pa = cmm_page_list;
+ +		if (!pa || pa->index >= CMM_NR_PAGES) {
+ +			/* Need a new page for the page list. */
+ +			spin_unlock(&cmm_lock);
+ +			npa = (struct cmm_page_array *)__get_free_page(
+ +					GFP_NOIO | __GFP_NOWARN |
+ +					__GFP_NORETRY | __GFP_NOMEMALLOC);
+ +			if (!npa) {
+ +				pr_info("%s: Can not allocate new page list\n", __func__);
+ +				free_page(addr);
+ +				break;
+ +			}
+ +			spin_lock(&cmm_lock);
+ +			pa = cmm_page_list;
+ +
+ +			if (!pa || pa->index >= CMM_NR_PAGES) {
+ +				npa->next = pa;
+ +				npa->index = 0;
+ +				pa = npa;
+ +				cmm_page_list = pa;
+ +			} else
+ +				free_page((unsigned long) npa);
+ +		}
+ +
+ +		if ((rc = plpar_page_set_loaned(__pa(addr)))) {
+  			pr_err("%s: Can not set page to loaned. rc=%ld\n", __func__, rc);
+ -			__free_page(page);
+ +			spin_unlock(&cmm_lock);
+ +			free_page(addr);
+  			break;
+  		}
+  
+* Unmerged path arch/powerpc/platforms/pseries/cmm.c
