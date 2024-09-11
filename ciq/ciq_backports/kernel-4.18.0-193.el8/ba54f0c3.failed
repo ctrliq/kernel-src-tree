@@ -1,0 +1,171 @@
+x86/jump_label: Batch jump label updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [x86] jump_label: Batch jump label updates (Daniel Bristot de Oliveira) [1731860]
+Rebuild_FUZZ: 94.74%
+commit-author Daniel Bristot de Oliveira <bristot@redhat.com>
+commit ba54f0c3f7c400a392c413d8ca21d3ada35f2584
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ba54f0c3.failed
+
+Currently, the jump label of a static key is transformed via the arch
+specific function:
+
+    void arch_jump_label_transform(struct jump_entry *entry,
+                                   enum jump_label_type type)
+
+The new approach (batch mode) uses two arch functions, the first has the
+same arguments of the arch_jump_label_transform(), and is the function:
+
+    bool arch_jump_label_transform_queue(struct jump_entry *entry,
+                                         enum jump_label_type type)
+
+Rather than transforming the code, it adds the jump_entry in a queue of
+entries to be updated. This functions returns true in the case of a
+successful enqueue of an entry. If it returns false, the caller must to
+apply the queue and then try to queue again, for instance, because the
+queue is full.
+
+This function expects the caller to sort the entries by the address before
+enqueueuing then. This is already done by the arch independent code, though.
+
+After queuing all jump_entries, the function:
+
+    void arch_jump_label_transform_apply(void)
+
+Applies the changes in the queue.
+
+	Signed-off-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Chris von Recklinghausen <crecklin@redhat.com>
+	Cc: Clark Williams <williams@redhat.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jason Baron <jbaron@akamai.com>
+	Cc: Jiri Kosina <jkosina@suse.cz>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Scott Wood <swood@redhat.com>
+	Cc: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/57b4caa654bad7e3b066301c9a9ae233dea065b5.1560325897.git.bristot@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ba54f0c3f7c400a392c413d8ca21d3ada35f2584)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/jump_label.h
+diff --cc arch/x86/include/asm/jump_label.h
+index 8c0de4282659,06c3cc22a058..000000000000
+--- a/arch/x86/include/asm/jump_label.h
++++ b/arch/x86/include/asm/jump_label.h
+@@@ -2,18 -2,7 +2,22 @@@
+  #ifndef _ASM_X86_JUMP_LABEL_H
+  #define _ASM_X86_JUMP_LABEL_H
+  
+++<<<<<<< HEAD
+ +#ifndef HAVE_JUMP_LABEL
+ +/*
+ + * For better or for worse, if jump labels (the gcc extension) are missing,
+ + * then the entire static branch patching infrastructure is compiled out.
+ + * If that happens, the code in here will malfunction.  Raise a compiler
+ + * error instead.
+ + *
+ + * In theory, jump labels and the static branch patching infrastructure
+ + * could be decoupled to fix this.
+ + */
+ +#error asm/jump_label.h included on a non-jump-label kernel
+ +#endif
+++=======
++ #define HAVE_JUMP_LABEL_BATCH
+++>>>>>>> ba54f0c3f7c4 (x86/jump_label: Batch jump label updates)
+  
+  #define JUMP_LABEL_NOP_SIZE 5
+  
+* Unmerged path arch/x86/include/asm/jump_label.h
+diff --git a/arch/x86/kernel/jump_label.c b/arch/x86/kernel/jump_label.c
+index 29e6648a2d8f..d7eff1200d46 100644
+--- a/arch/x86/kernel/jump_label.c
++++ b/arch/x86/kernel/jump_label.c
+@@ -103,6 +103,75 @@ void arch_jump_label_transform(struct jump_entry *entry,
+ 	mutex_unlock(&text_mutex);
+ }
+ 
++#define TP_VEC_MAX (PAGE_SIZE / sizeof(struct text_poke_loc))
++static struct text_poke_loc tp_vec[TP_VEC_MAX];
++int tp_vec_nr = 0;
++
++bool arch_jump_label_transform_queue(struct jump_entry *entry,
++				     enum jump_label_type type)
++{
++	struct text_poke_loc *tp;
++	void *entry_code;
++
++	if (system_state == SYSTEM_BOOTING) {
++		/*
++		 * Fallback to the non-batching mode.
++		 */
++		arch_jump_label_transform(entry, type);
++		return true;
++	}
++
++	/*
++	 * No more space in the vector, tell upper layer to apply
++	 * the queue before continuing.
++	 */
++	if (tp_vec_nr == TP_VEC_MAX)
++		return false;
++
++	tp = &tp_vec[tp_vec_nr];
++
++	entry_code = (void *)jump_entry_code(entry);
++
++	/*
++	 * The INT3 handler will do a bsearch in the queue, so we need entries
++	 * to be sorted. We can survive an unsorted list by rejecting the entry,
++	 * forcing the generic jump_label code to apply the queue. Warning once,
++	 * to raise the attention to the case of an unsorted entry that is
++	 * better not happen, because, in the worst case we will perform in the
++	 * same way as we do without batching - with some more overhead.
++	 */
++	if (tp_vec_nr > 0) {
++		int prev = tp_vec_nr - 1;
++		struct text_poke_loc *prev_tp = &tp_vec[prev];
++
++		if (WARN_ON_ONCE(prev_tp->addr > entry_code))
++			return false;
++	}
++
++	__jump_label_set_jump_code(entry, type,
++				   (union jump_code_union *) &tp->opcode, 0);
++
++	tp->addr = entry_code;
++	tp->detour = entry_code + JUMP_LABEL_NOP_SIZE;
++	tp->len = JUMP_LABEL_NOP_SIZE;
++
++	tp_vec_nr++;
++
++	return true;
++}
++
++void arch_jump_label_transform_apply(void)
++{
++	if (!tp_vec_nr)
++		return;
++
++	mutex_lock(&text_mutex);
++	text_poke_bp_batch(tp_vec, tp_vec_nr);
++	mutex_unlock(&text_mutex);
++
++	tp_vec_nr = 0;
++}
++
+ static enum {
+ 	JL_STATE_START,
+ 	JL_STATE_NO_UPDATE,
