@@ -1,0 +1,338 @@
+io_uring: support for generic async request cancel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 62755e35dfb2b113c52b81cd96d01c20971c8e02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/62755e35.failed
+
+This adds support for IORING_OP_ASYNC_CANCEL, which will attempt to
+cancel requests that have been punted to async context and are now
+in-flight. This works for regular read/write requests to files, as
+long as they haven't been started yet. For socket based IO (or things
+like accept4(2)), we can cancel work that is already running as well.
+
+To cancel a request, the sqe must have ->addr set to the user_data of
+the request it wishes to cancel. If the request is cancelled
+successfully, the original request is completed with -ECANCELED
+and the cancel request is completed with a result of 0. If the
+request was already running, the original may or may not complete
+in error. The cancel request will complete with -EALREADY for that
+case. And finally, if the request to cancel wasn't found, the cancel
+request is completed with -ENOENT.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 62755e35dfb2b113c52b81cd96d01c20971c8e02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io-wq.c
+#	fs/io-wq.h
+#	fs/io_uring.c
+#	include/uapi/linux/io_uring.h
+diff --cc fs/io_uring.c
+index fca9cdc96d77,76d653085987..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1838,6 -1952,229 +1838,232 @@@ static int io_poll_add(struct io_kiocb 
+  	return ipt.error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum hrtimer_restart io_timeout_fn(struct hrtimer *timer)
++ {
++ 	struct io_ring_ctx *ctx;
++ 	struct io_kiocb *req;
++ 	unsigned long flags;
++ 
++ 	req = container_of(timer, struct io_kiocb, timeout.timer);
++ 	ctx = req->ctx;
++ 	atomic_inc(&ctx->cq_timeouts);
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 	/*
++ 	 * We could be racing with timeout deletion. If the list is empty,
++ 	 * then timeout lookup already found it and will be handling it.
++ 	 */
++ 	if (!list_empty(&req->list)) {
++ 		struct io_kiocb *prev;
++ 
++ 		/*
++ 		 * Adjust the reqs sequence before the current one because it
++ 		 * will consume a slot in the cq_ring and the the cq_tail
++ 		 * pointer will be increased, otherwise other timeout reqs may
++ 		 * return in advance without waiting for enough wait_nr.
++ 		 */
++ 		prev = req;
++ 		list_for_each_entry_continue_reverse(prev, &ctx->timeout_list, list)
++ 			prev->sequence++;
++ 		list_del_init(&req->list);
++ 	}
++ 
++ 	io_cqring_fill_event(ctx, req->user_data, -ETIME);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 	io_cqring_ev_posted(ctx);
++ 	io_put_req(req, NULL);
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ /*
++  * Remove or update an existing timeout command
++  */
++ static int io_timeout_remove(struct io_kiocb *req,
++ 			     const struct io_uring_sqe *sqe)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_kiocb *treq;
++ 	int ret = -ENOENT;
++ 	__u64 user_data;
++ 	unsigned flags;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->len)
++ 		return -EINVAL;
++ 	flags = READ_ONCE(sqe->timeout_flags);
++ 	if (flags)
++ 		return -EINVAL;
++ 
++ 	user_data = READ_ONCE(sqe->addr);
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_entry(treq, &ctx->timeout_list, list) {
++ 		if (user_data == treq->user_data) {
++ 			list_del_init(&treq->list);
++ 			ret = 0;
++ 			break;
++ 		}
++ 	}
++ 
++ 	/* didn't find timeout */
++ 	if (ret) {
++ fill_ev:
++ 		io_cqring_fill_event(ctx, req->user_data, ret);
++ 		io_commit_cqring(ctx);
++ 		spin_unlock_irq(&ctx->completion_lock);
++ 		io_cqring_ev_posted(ctx);
++ 		io_put_req(req, NULL);
++ 		return 0;
++ 	}
++ 
++ 	ret = hrtimer_try_to_cancel(&treq->timeout.timer);
++ 	if (ret == -1) {
++ 		ret = -EBUSY;
++ 		goto fill_ev;
++ 	}
++ 
++ 	io_cqring_fill_event(ctx, req->user_data, 0);
++ 	io_cqring_fill_event(ctx, treq->user_data, -ECANCELED);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	io_put_req(treq, NULL);
++ 	io_put_req(req, NULL);
++ 	return 0;
++ }
++ 
++ static int io_timeout(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	unsigned count;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct list_head *entry;
++ 	enum hrtimer_mode mode;
++ 	struct timespec64 ts;
++ 	unsigned span = 0;
++ 	unsigned flags;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->len != 1)
++ 		return -EINVAL;
++ 	flags = READ_ONCE(sqe->timeout_flags);
++ 	if (flags & ~IORING_TIMEOUT_ABS)
++ 		return -EINVAL;
++ 
++ 	if (get_timespec64(&ts, u64_to_user_ptr(sqe->addr)))
++ 		return -EFAULT;
++ 
++ 	if (flags & IORING_TIMEOUT_ABS)
++ 		mode = HRTIMER_MODE_ABS;
++ 	else
++ 		mode = HRTIMER_MODE_REL;
++ 
++ 	hrtimer_init(&req->timeout.timer, CLOCK_MONOTONIC, mode);
++ 
++ 	/*
++ 	 * sqe->off holds how many events that need to occur for this
++ 	 * timeout event to be satisfied.
++ 	 */
++ 	count = READ_ONCE(sqe->off);
++ 	if (!count)
++ 		count = 1;
++ 
++ 	req->sequence = ctx->cached_sq_head + count - 1;
++ 	/* reuse it to store the count */
++ 	req->submit.sequence = count;
++ 	req->flags |= REQ_F_TIMEOUT;
++ 
++ 	/*
++ 	 * Insertion sort, ensuring the first entry in the list is always
++ 	 * the one we need first.
++ 	 */
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_prev(entry, &ctx->timeout_list) {
++ 		struct io_kiocb *nxt = list_entry(entry, struct io_kiocb, list);
++ 		unsigned nxt_sq_head;
++ 		long long tmp, tmp_nxt;
++ 
++ 		/*
++ 		 * Since cached_sq_head + count - 1 can overflow, use type long
++ 		 * long to store it.
++ 		 */
++ 		tmp = (long long)ctx->cached_sq_head + count - 1;
++ 		nxt_sq_head = nxt->sequence - nxt->submit.sequence + 1;
++ 		tmp_nxt = (long long)nxt_sq_head + nxt->submit.sequence - 1;
++ 
++ 		/*
++ 		 * cached_sq_head may overflow, and it will never overflow twice
++ 		 * once there is some timeout req still be valid.
++ 		 */
++ 		if (ctx->cached_sq_head < nxt_sq_head)
++ 			tmp += UINT_MAX;
++ 
++ 		if (tmp > tmp_nxt)
++ 			break;
++ 
++ 		/*
++ 		 * Sequence of reqs after the insert one and itself should
++ 		 * be adjusted because each timeout req consumes a slot.
++ 		 */
++ 		span++;
++ 		nxt->sequence++;
++ 	}
++ 	req->sequence -= span;
++ 	list_add(&req->list, entry);
++ 	req->timeout.timer.function = io_timeout_fn;
++ 	hrtimer_start(&req->timeout.timer, timespec64_to_ktime(ts), mode);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 	return 0;
++ }
++ 
++ static bool io_cancel_cb(struct io_wq_work *work, void *data)
++ {
++ 	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
++ 
++ 	return req->user_data == (unsigned long) data;
++ }
++ 
++ static int io_async_cancel(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 			   struct io_kiocb **nxt)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	enum io_wq_cancel cancel_ret;
++ 	void *sqe_addr;
++ 	int ret = 0;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->off || sqe->len ||
++ 	    sqe->cancel_flags)
++ 		return -EINVAL;
++ 
++ 	sqe_addr = (void *) (unsigned long) READ_ONCE(sqe->addr);
++ 	cancel_ret = io_wq_cancel_cb(ctx->io_wq, io_cancel_cb, sqe_addr);
++ 	switch (cancel_ret) {
++ 	case IO_WQ_CANCEL_OK:
++ 		ret = 0;
++ 		break;
++ 	case IO_WQ_CANCEL_RUNNING:
++ 		ret = -EALREADY;
++ 		break;
++ 	case IO_WQ_CANCEL_NOTFOUND:
++ 		ret = -ENOENT;
++ 		break;
++ 	}
++ 
++ 	if (ret < 0 && (req->flags & REQ_F_LINK))
++ 		req->flags |= REQ_F_FAIL_LINK;
++ 	io_cqring_add_event(req->ctx, sqe->user_data, ret);
++ 	io_put_req(req, nxt);
++ 	return 0;
++ }
++ 
+++>>>>>>> 62755e35dfb2 (io_uring: support for generic async request cancel)
+  static int io_req_defer(struct io_ring_ctx *ctx, struct io_kiocb *req,
+  			const struct io_uring_sqe *sqe)
+  {
+@@@ -1904,14 -2242,26 +2130,17 @@@ static int __io_submit_sqe(struct io_ri
+  		ret = io_poll_remove(req, s->sqe);
+  		break;
+  	case IORING_OP_SYNC_FILE_RANGE:
+ -		ret = io_sync_file_range(req, s->sqe, nxt, force_nonblock);
+ +		ret = io_sync_file_range(req, s->sqe, force_nonblock);
+  		break;
+  	case IORING_OP_SENDMSG:
+ -		ret = io_sendmsg(req, s->sqe, nxt, force_nonblock);
+ +		ret = io_sendmsg(req, s->sqe, force_nonblock);
+  		break;
+  	case IORING_OP_RECVMSG:
+ -		ret = io_recvmsg(req, s->sqe, nxt, force_nonblock);
+ -		break;
+ -	case IORING_OP_TIMEOUT:
+ -		ret = io_timeout(req, s->sqe);
+ -		break;
+ -	case IORING_OP_TIMEOUT_REMOVE:
+ -		ret = io_timeout_remove(req, s->sqe);
+ -		break;
+ -	case IORING_OP_ACCEPT:
+ -		ret = io_accept(req, s->sqe, nxt, force_nonblock);
+ +		ret = io_recvmsg(req, s->sqe, force_nonblock);
+  		break;
++ 	case IORING_OP_ASYNC_CANCEL:
++ 		ret = io_async_cancel(req, s->sqe, nxt);
++ 		break;
+  	default:
+  		ret = -EINVAL;
+  		break;
+diff --cc include/uapi/linux/io_uring.h
+index ee8693aec163,6877cf8894db..000000000000
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@@ -28,6 -31,9 +28,12 @@@ struct io_uring_sqe 
+  		__u16		poll_events;
+  		__u32		sync_range_flags;
+  		__u32		msg_flags;
+++<<<<<<< HEAD
+++=======
++ 		__u32		timeout_flags;
++ 		__u32		accept_flags;
++ 		__u32		cancel_flags;
+++>>>>>>> 62755e35dfb2 (io_uring: support for generic async request cancel)
+  	};
+  	__u64	user_data;	/* data to be passed back at completion time */
+  	union {
+@@@ -62,6 -68,10 +68,13 @@@
+  #define IORING_OP_SYNC_FILE_RANGE	8
+  #define IORING_OP_SENDMSG	9
+  #define IORING_OP_RECVMSG	10
+++<<<<<<< HEAD
+++=======
++ #define IORING_OP_TIMEOUT	11
++ #define IORING_OP_TIMEOUT_REMOVE	12
++ #define IORING_OP_ACCEPT	13
++ #define IORING_OP_ASYNC_CANCEL	14
+++>>>>>>> 62755e35dfb2 (io_uring: support for generic async request cancel)
+  
+  /*
+   * sqe->fsync_flags
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io_uring.c
+* Unmerged path include/uapi/linux/io_uring.h
