@@ -1,0 +1,250 @@
+mm: memcg/slab: use mem_cgroup_from_obj()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 4f103c6363c3fe88182037acf4a50f295bde19da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4f103c63.failed
+
+Sometimes we need to get a memcg pointer from a charged kernel object.
+The right way to get it depends on whether it's a proper slab object or
+it's backed by raw pages (e.g.  it's a vmalloc alloction).  In the first
+case the kmem_cache->memcg_params.memcg indirection should be used; in
+other cases it's just page->mem_cgroup.
+
+To simplify this task and hide the implementation details let's use the
+mem_cgroup_from_obj() helper, which takes a pointer to any kernel object
+and returns a valid memcg pointer or NULL.
+
+Passing a kernel address rather than a pointer to a page will allow to use
+this helper for per-object (rather than per-page) tracked objects in the
+future.
+
+The caller is still responsible to ensure that the returned memcg isn't
+going away underneath: take the rcu read lock, cgroup mutex etc; depending
+on the context.
+
+mem_cgroup_from_kmem() defined in mm/list_lru.c is now obsolete and can be
+removed.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Yafang Shao <laoar.shao@gmail.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Link: http://lkml.kernel.org/r/20200117203609.3146239-1-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4f103c6363c3fe88182037acf4a50f295bde19da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 68d7aa35e9d9,c1aa24a57e55..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -683,10 -673,163 +683,162 @@@ mem_cgroup_largest_soft_limit_node(stru
+  	return mz;
+  }
+  
+ -/**
+ - * __mod_memcg_state - update cgroup memory statistics
+ - * @memcg: the memory cgroup
+ - * @idx: the stat item - can be enum memcg_stat_item or enum node_stat_item
+ - * @val: delta to add to the counter, can be negative
+ - */
+ -void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val)
+ +static unsigned long memcg_sum_events(struct mem_cgroup *memcg,
+ +				      int event)
+  {
+++<<<<<<< HEAD
+ +	return atomic_long_read(&memcg->events[event]);
+++=======
++ 	long x;
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	x = val + __this_cpu_read(memcg->vmstats_percpu->stat[idx]);
++ 	if (unlikely(abs(x) > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup *mi;
++ 
++ 		/*
++ 		 * Batch local counters to keep them in sync with
++ 		 * the hierarchical ones.
++ 		 */
++ 		__this_cpu_add(memcg->vmstats_local->stat[idx], x);
++ 		for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
++ 			atomic_long_add(x, &mi->vmstats[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(memcg->vmstats_percpu->stat[idx], x);
++ }
++ 
++ static struct mem_cgroup_per_node *
++ parent_nodeinfo(struct mem_cgroup_per_node *pn, int nid)
++ {
++ 	struct mem_cgroup *parent;
++ 
++ 	parent = parent_mem_cgroup(pn->memcg);
++ 	if (!parent)
++ 		return NULL;
++ 	return mem_cgroup_nodeinfo(parent, nid);
++ }
++ 
++ /**
++  * __mod_lruvec_state - update lruvec memory statistics
++  * @lruvec: the lruvec
++  * @idx: the stat item
++  * @val: delta to add to the counter, can be negative
++  *
++  * The lruvec is the intersection of the NUMA node and a cgroup. This
++  * function updates the all three counters that are affected by a
++  * change of state at this level: per-node, per-cgroup, per-lruvec.
++  */
++ void __mod_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
++ 			int val)
++ {
++ 	pg_data_t *pgdat = lruvec_pgdat(lruvec);
++ 	struct mem_cgroup_per_node *pn;
++ 	struct mem_cgroup *memcg;
++ 	long x;
++ 
++ 	/* Update node */
++ 	__mod_node_page_state(pgdat, idx, val);
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
++ 	memcg = pn->memcg;
++ 
++ 	/* Update memcg */
++ 	__mod_memcg_state(memcg, idx, val);
++ 
++ 	/* Update lruvec */
++ 	__this_cpu_add(pn->lruvec_stat_local->count[idx], val);
++ 
++ 	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
++ 	if (unlikely(abs(x) > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup_per_node *pi;
++ 
++ 		for (pi = pn; pi; pi = parent_nodeinfo(pi, pgdat->node_id))
++ 			atomic_long_add(x, &pi->lruvec_stat[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
++ }
++ 
++ void __mod_lruvec_slab_state(void *p, enum node_stat_item idx, int val)
++ {
++ 	pg_data_t *pgdat = page_pgdat(virt_to_page(p));
++ 	struct mem_cgroup *memcg;
++ 	struct lruvec *lruvec;
++ 
++ 	rcu_read_lock();
++ 	memcg = mem_cgroup_from_obj(p);
++ 
++ 	/* Untracked pages have no memcg, no lruvec. Update only the node */
++ 	if (!memcg || memcg == root_mem_cgroup) {
++ 		__mod_node_page_state(pgdat, idx, val);
++ 	} else {
++ 		lruvec = mem_cgroup_lruvec(memcg, pgdat);
++ 		__mod_lruvec_state(lruvec, idx, val);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
++ void mod_memcg_obj_state(void *p, int idx, int val)
++ {
++ 	struct mem_cgroup *memcg;
++ 
++ 	rcu_read_lock();
++ 	memcg = mem_cgroup_from_obj(p);
++ 	if (memcg)
++ 		mod_memcg_state(memcg, idx, val);
++ 	rcu_read_unlock();
++ }
++ 
++ /**
++  * __count_memcg_events - account VM events in a cgroup
++  * @memcg: the memory cgroup
++  * @idx: the event item
++  * @count: the number of events that occured
++  */
++ void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
++ 			  unsigned long count)
++ {
++ 	unsigned long x;
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	x = count + __this_cpu_read(memcg->vmstats_percpu->events[idx]);
++ 	if (unlikely(x > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup *mi;
++ 
++ 		/*
++ 		 * Batch local counters to keep them in sync with
++ 		 * the hierarchical ones.
++ 		 */
++ 		__this_cpu_add(memcg->vmstats_local->events[idx], x);
++ 		for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
++ 			atomic_long_add(x, &mi->vmevents[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(memcg->vmstats_percpu->events[idx], x);
++ }
++ 
++ static unsigned long memcg_events(struct mem_cgroup *memcg, int event)
++ {
++ 	return atomic_long_read(&memcg->vmevents[event]);
++ }
++ 
++ static unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
++ {
++ 	long x = 0;
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu)
++ 		x += per_cpu(memcg->vmstats_local->events[event], cpu);
++ 	return x;
+++>>>>>>> 4f103c6363c3 (mm: memcg/slab: use mem_cgroup_from_obj())
+  }
+  
+  static void mem_cgroup_charge_statistics(struct mem_cgroup *memcg,
+diff --git a/mm/list_lru.c b/mm/list_lru.c
+index 19828ba88c48..addcf5c1dcd9 100644
+--- a/mm/list_lru.c
++++ b/mm/list_lru.c
+@@ -56,16 +56,6 @@ list_lru_from_memcg_idx(struct list_lru_node *nlru, int idx)
+ 	return &nlru->lru;
+ }
+ 
+-static __always_inline struct mem_cgroup *mem_cgroup_from_kmem(void *ptr)
+-{
+-	struct page *page;
+-
+-	if (!memcg_kmem_enabled())
+-		return NULL;
+-	page = virt_to_head_page(ptr);
+-	return memcg_from_slab_page(page);
+-}
+-
+ static inline struct list_lru_one *
+ list_lru_from_kmem(struct list_lru_node *nlru, void *ptr,
+ 		   struct mem_cgroup **memcg_ptr)
+@@ -76,7 +66,7 @@ list_lru_from_kmem(struct list_lru_node *nlru, void *ptr,
+ 	if (!nlru->memcg_lrus)
+ 		goto out;
+ 
+-	memcg = mem_cgroup_from_kmem(ptr);
++	memcg = mem_cgroup_from_obj(ptr);
+ 	if (!memcg)
+ 		goto out;
+ 
+* Unmerged path mm/memcontrol.c
