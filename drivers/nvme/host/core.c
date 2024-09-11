@@ -946,8 +946,10 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
 {
 	blk_status_t ret = BLK_STS_OK;
 
-	if (!(req->rq_flags & RQF_DONTPREP))
+	if (!(req->rq_flags & RQF_DONTPREP)) {
 		nvme_clear_nvme_request(req);
+		memset(cmd, 0, sizeof(*cmd));
+	}
 
 	memset(cmd, 0, sizeof(*cmd));
 	switch (req_op(req)) {
