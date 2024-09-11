@@ -1,0 +1,237 @@
+mm/hmm: Simplify hmm_get_or_create and make it reliable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] hmm: Simplify hmm_get_or_create and make it reliable (Jerome Glisse) [1498655 1597758]
+Rebuild_FUZZ: 97.20%
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 8a9320b7ec5d879884c547fb73c35ac411a0b977
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8a9320b7.failed
+
+As coded this function can false-fail in various racy situations. Make it
+reliable and simpler by running under the write side of the mmap_sem and
+avoiding the false-failing compare/exchange pattern. Due to the mmap_sem
+this no longer has to avoid racing with a 2nd parallel
+hmm_get_or_create().
+
+Unfortunately this still has to use the page_table_lock as the
+non-sleeping lock protecting mm->hmm, since the contexts where we free the
+hmm are incompatible with mmap_sem.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Philip Yang <Philip.Yang@amd.com>
+(cherry picked from commit 8a9320b7ec5d879884c547fb73c35ac411a0b977)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hmm.c
+diff --cc mm/hmm.c
+index bc98da945c75,0423f4ca3a7e..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -38,122 -31,89 +38,169 @@@
+  #if IS_ENABLED(CONFIG_HMM_MIRROR)
+  static const struct mmu_notifier_ops hmm_mmu_notifier_ops;
+  
+++<<<<<<< HEAD
+ +/*
+ + * struct hmm - HMM per mm struct
+ + *
+ + * @mm: mm struct this HMM struct is bound to
+ + * @lock: lock protecting ranges list
+ + * @sequence: we track updates to the CPU page table with a sequence number
+ + * @ranges: list of range being snapshotted
+ + * @mirrors: list of mirrors for this mm
+ + * @mmu_notifier: mmu notifier to track updates to CPU page table
+ + * @mirrors_sem: read/write semaphore protecting the mirrors list
+ + */
+ +struct hmm {
+ +	struct mm_struct	*mm;
+ +	spinlock_t		lock;
+ +	atomic_t		sequence;
+ +	struct list_head	ranges;
+ +	struct list_head	mirrors;
+ +	struct mmu_notifier	mmu_notifier;
+ +	struct rw_semaphore	mirrors_sem;
+ +};
+ +
+ +/*
+ + * hmm_register - register HMM against an mm (HMM internal)
+++=======
++ /**
++  * hmm_get_or_create - register HMM against an mm (HMM internal)
+++>>>>>>> 8a9320b7ec5d (mm/hmm: Simplify hmm_get_or_create and make it reliable)
+   *
+   * @mm: mm struct to attach to
+ - * Returns: returns an HMM object, either by referencing the existing
+ - *          (per-process) object, or by creating a new one.
+   *
+ - * This is not intended to be used directly by device drivers. If mm already
+ - * has an HMM struct then it get a reference on it and returns it. Otherwise
+ - * it allocates an HMM struct, initializes it, associate it with the mm and
+ - * returns it.
+ + * This is not intended to be used directly by device drivers. It allocates an
+ + * HMM struct if mm does not have one, and initializes it.
+   */
+ -static struct hmm *hmm_get_or_create(struct mm_struct *mm)
+ +static struct hmm *hmm_register(struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	struct hmm *hmm = READ_ONCE(mm->hmm);
+ +	bool cleanup = false;
+ +
+ +	/*
+ +	 * The hmm struct can only be freed once the mm_struct goes away,
+ +	 * hence we should always have pre-allocated an new hmm struct
+ +	 * above.
+ +	 */
+ +	if (hmm)
+ +		return hmm;
+++=======
++ 	struct hmm *hmm;
++ 
++ 	lockdep_assert_held_exclusive(&mm->mmap_sem);
++ 
++ 	/* Abuse the page_table_lock to also protect mm->hmm. */
++ 	spin_lock(&mm->page_table_lock);
++ 	hmm = mm->hmm;
++ 	if (mm->hmm && kref_get_unless_zero(&mm->hmm->kref))
++ 		goto out_unlock;
++ 	spin_unlock(&mm->page_table_lock);
+++>>>>>>> 8a9320b7ec5d (mm/hmm: Simplify hmm_get_or_create and make it reliable)
+  
+  	hmm = kmalloc(sizeof(*hmm), GFP_KERNEL);
+  	if (!hmm)
+  		return NULL;
+ -	init_waitqueue_head(&hmm->wq);
+  	INIT_LIST_HEAD(&hmm->mirrors);
+  	init_rwsem(&hmm->mirrors_sem);
+ +	atomic_set(&hmm->sequence, 0);
+  	hmm->mmu_notifier.ops = NULL;
+  	INIT_LIST_HEAD(&hmm->ranges);
+ -	mutex_init(&hmm->lock);
+ -	kref_init(&hmm->kref);
+ -	hmm->notifiers = 0;
+ -	hmm->dead = false;
+ +	spin_lock_init(&hmm->lock);
+  	hmm->mm = mm;
+++<<<<<<< HEAD
+++=======
+  
+- 	spin_lock(&mm->page_table_lock);
+- 	if (!mm->hmm)
+- 		mm->hmm = hmm;
+- 	else
+- 		cleanup = true;
+- 	spin_unlock(&mm->page_table_lock);
++ 	hmm->mmu_notifier.ops = &hmm_mmu_notifier_ops;
++ 	if (__mmu_notifier_register(&hmm->mmu_notifier, mm)) {
++ 		kfree(hmm);
++ 		return NULL;
++ 	}
+  
+- 	if (cleanup)
+- 		goto error;
++ 	mmgrab(hmm->mm);
+++>>>>>>> 8a9320b7ec5d (mm/hmm: Simplify hmm_get_or_create and make it reliable)
+  
+  	/*
+- 	 * We should only get here if hold the mmap_sem in write mode ie on
+- 	 * registration of first mirror through hmm_mirror_register()
++ 	 * We hold the exclusive mmap_sem here so we know that mm->hmm is
++ 	 * still NULL or 0 kref, and is safe to update.
+  	 */
+++<<<<<<< HEAD
+ +	hmm->mmu_notifier.ops = &hmm_mmu_notifier_ops;
+ +	if (__mmu_notifier_register(&hmm->mmu_notifier, mm))
+ +		goto error_mm;
+ +
+ +	return mm->hmm;
+ +
+ +error_mm:
+++=======
+++>>>>>>> 8a9320b7ec5d (mm/hmm: Simplify hmm_get_or_create and make it reliable)
+  	spin_lock(&mm->page_table_lock);
+- 	if (mm->hmm == hmm)
+- 		mm->hmm = NULL;
++ 	mm->hmm = hmm;
++ 
++ out_unlock:
+  	spin_unlock(&mm->page_table_lock);
+++<<<<<<< HEAD
+ +error:
+ +	kfree(hmm);
+ +	return NULL;
+++=======
++ 	return hmm;
+++>>>>>>> 8a9320b7ec5d (mm/hmm: Simplify hmm_get_or_create and make it reliable)
+  }
+  
+ -static void hmm_free_rcu(struct rcu_head *rcu)
+ +void hmm_mm_destroy(struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	kfree(mm->hmm);
+++=======
++ 	struct hmm *hmm = container_of(rcu, struct hmm, rcu);
++ 
++ 	mmdrop(hmm->mm);
++ 	kfree(hmm);
+++>>>>>>> 8a9320b7ec5d (mm/hmm: Simplify hmm_get_or_create and make it reliable)
+  }
+  
+ -static void hmm_free(struct kref *kref)
+ +static int hmm_invalidate_range(struct hmm *hmm,
+ +				const struct hmm_update *update)
+  {
+++<<<<<<< HEAD
+ +	struct hmm_mirror *mirror;
+ +	struct hmm_range *range;
+ +
+ +	spin_lock(&hmm->lock);
+ +	list_for_each_entry(range, &hmm->ranges, list) {
+ +		if (update->end < range->start || update->start >= range->end)
+ +			continue;
+ +
+ +		range->valid = false;
+ +	}
+ +	spin_unlock(&hmm->lock);
+ +
+ +	down_read(&hmm->mirrors_sem);
+ +	list_for_each_entry(mirror, &hmm->mirrors, list) {
+ +		int ret;
+++=======
++ 	struct hmm *hmm = container_of(kref, struct hmm, kref);
++ 
++ 	spin_lock(&hmm->mm->page_table_lock);
++ 	if (hmm->mm->hmm == hmm)
++ 		hmm->mm->hmm = NULL;
++ 	spin_unlock(&hmm->mm->page_table_lock);
++ 
++ 	mmu_notifier_unregister_no_release(&hmm->mmu_notifier, hmm->mm);
++ 	mmu_notifier_call_srcu(&hmm->rcu, hmm_free_rcu);
++ }
+++>>>>>>> 8a9320b7ec5d (mm/hmm: Simplify hmm_get_or_create and make it reliable)
+  
+ -static inline void hmm_put(struct hmm *hmm)
+ -{
+ -	kref_put(&hmm->kref, hmm_free);
+ +		ret = mirror->ops->sync_cpu_device_pagetables(mirror, update);
+ +		if (!update->blockable && ret == -EAGAIN) {
+ +			up_read(&hmm->mirrors_sem);
+ +			return -EAGAIN;
+ +		}
+ +	}
+ +	up_read(&hmm->mirrors_sem);
+ +
+ +	return 0;
+  }
+  
+  static void hmm_release(struct mmu_notifier *mn, struct mm_struct *mm)
+* Unmerged path mm/hmm.c
