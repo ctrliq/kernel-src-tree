@@ -1,0 +1,130 @@
+mm: slub: implement SLUB version of obj_to_index()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 4138fdfc8b5db5a7a4b9b50c69d475fb2ac351b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4138fdfc.failed
+
+This commit implements SLUB version of the obj_to_index() function, which
+will be required to calculate the offset of obj_cgroup in the obj_cgroups
+vector to store/obtain the objcg ownership data.
+
+To make it faster, let's repeat the SLAB's trick introduced by commit
+6a2d7a955d8d ("SLAB: use a multiply instead of a divide in
+obj_to_index()") and avoid an expensive division.
+
+Vlastimil Babka noticed, that SLUB does have already a similar function
+called slab_index(), which is defined only if SLUB_DEBUG is enabled.  The
+function does a similar math, but with a division, and it also takes a
+page address instead of a page pointer.
+
+Let's remove slab_index() and replace it with the new helper
+__obj_to_index(), which takes a page address.  obj_to_index() will be a
+simple wrapper taking a page pointer and passing page_address(page) into
+__obj_to_index().
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/r/20200623174037.3951353-5-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4138fdfc8b5db5a7a4b9b50c69d475fb2ac351b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/slub_def.h
+diff --cc include/linux/slub_def.h
+index 3a1a1dbc6f49,30e91c83d401..000000000000
+--- a/include/linux/slub_def.h
++++ b/include/linux/slub_def.h
+@@@ -81,12 -82,13 +82,19 @@@ struct kmem_cache_order_objects 
+   */
+  struct kmem_cache {
+  	struct kmem_cache_cpu __percpu *cpu_slab;
+ -	/* Used for retrieving partial slabs, etc. */
+ +	/* Used for retriving partial slabs etc */
+  	slab_flags_t flags;
+  	unsigned long min_partial;
+++<<<<<<< HEAD
+ +	unsigned int size;	/* The size of an object including meta data */
+ +	unsigned int object_size;/* The size of an object without meta data */
+ +	unsigned int offset;	/* Free pointer offset. */
+++=======
++ 	unsigned int size;	/* The size of an object including metadata */
++ 	unsigned int object_size;/* The size of an object without metadata */
++ 	struct reciprocal_value reciprocal_size;
++ 	unsigned int offset;	/* Free pointer offset */
+++>>>>>>> 4138fdfc8b5d (mm: slub: implement SLUB version of obj_to_index())
+  #ifdef CONFIG_SLUB_CPU_PARTIAL
+  	/* Number of per cpu partial objects to keep around */
+  	unsigned int cpu_partial;
+* Unmerged path include/linux/slub_def.h
+diff --git a/mm/slub.c b/mm/slub.c
+index 135072f4c635..6473086067a0 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -313,12 +313,6 @@ static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
+ 		__p < (__addr) + (__objects) * (__s)->size; \
+ 		__p += (__s)->size)
+ 
+-/* Determine object index from a given position */
+-static inline unsigned int slab_index(void *p, struct kmem_cache *s, void *addr)
+-{
+-	return (kasan_reset_tag(p) - addr) / s->size;
+-}
+-
+ static inline unsigned int order_objects(unsigned int order, unsigned int size)
+ {
+ 	return ((unsigned int)PAGE_SIZE << order) / size;
+@@ -460,7 +454,7 @@ static unsigned long *get_map(struct kmem_cache *s, struct page *page)
+ 	bitmap_zero(object_map, page->objects);
+ 
+ 	for (p = page->freelist; p; p = get_freepointer(s, p))
+-		set_bit(slab_index(p, s, addr), object_map);
++		set_bit(__obj_to_index(s, addr, p), object_map);
+ 
+ 	return object_map;
+ }
+@@ -3719,6 +3713,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
+ 	 */
+ 	size = ALIGN(size, s->align);
+ 	s->size = size;
++	s->reciprocal_size = reciprocal_value(size);
+ 	if (forced_order >= 0)
+ 		order = forced_order;
+ 	else
+@@ -3829,7 +3824,7 @@ static void list_slab_objects(struct kmem_cache *s, struct page *page,
+ 	map = get_map(s, page);
+ 	for_each_object(p, s, addr, page->objects) {
+ 
+-		if (!test_bit(slab_index(p, s, addr), map)) {
++		if (!test_bit(__obj_to_index(s, addr, p), map)) {
+ 			pr_err("INFO: Object 0x%p @offset=%tu\n", p, p - addr);
+ 			print_tracking(s, p);
+ 		}
+@@ -4564,7 +4559,7 @@ static void validate_slab(struct kmem_cache *s, struct page *page)
+ 	/* Now we know that a valid freelist exists */
+ 	map = get_map(s, page);
+ 	for_each_object(p, s, addr, page->objects) {
+-		u8 val = test_bit(slab_index(p, s, addr), map) ?
++		u8 val = test_bit(__obj_to_index(s, addr, p), map) ?
+ 			 SLUB_RED_INACTIVE : SLUB_RED_ACTIVE;
+ 
+ 		if (!check_object(s, page, p, val))
+@@ -4755,7 +4750,7 @@ static void process_slab(struct loc_track *t, struct kmem_cache *s,
+ 
+ 	map = get_map(s, page);
+ 	for_each_object(p, s, addr, page->objects)
+-		if (!test_bit(slab_index(p, s, addr), map))
++		if (!test_bit(__obj_to_index(s, addr, p), map))
+ 			add_location(t, s, get_track(s, p, alloc));
+ 	put_map(map);
+ }
