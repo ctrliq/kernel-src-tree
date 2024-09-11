@@ -4241,10 +4241,7 @@ static int sctp_setsockopt_reconfig_supported(struct sock *sk,
 	    sctp_style(sk, UDP))
 		goto out;
 
-	if (asoc)
-		asoc->reconf_enable = !!params.assoc_value;
-	else
-		sctp_sk(sk)->ep->reconf_enable = !!params.assoc_value;
+	sctp_sk(sk)->ep->reconf_enable = !!params.assoc_value;
 
 	retval = 0;
 
@@ -7551,7 +7548,7 @@ static int sctp_getsockopt_reconfig_supported(struct sock *sk, int len,
 		goto out;
 	}
 
-	params.assoc_value = asoc ? asoc->reconf_enable
+	params.assoc_value = asoc ? asoc->peer.reconf_capable
 				  : sctp_sk(sk)->ep->reconf_enable;
 
 	if (put_user(len, optlen))
