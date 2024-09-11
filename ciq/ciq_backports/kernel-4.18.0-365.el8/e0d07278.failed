@@ -1,0 +1,965 @@
+dma-mapping: introduce DMA range map, supplanting dma_pfn_offset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jim Quinlan <james.quinlan@broadcom.com>
+commit e0d072782c734d27f5af062c62266f2598f68542
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/e0d07278.failed
+
+The new field 'dma_range_map' in struct device is used to facilitate the
+use of single or multiple offsets between mapping regions of cpu addrs and
+dma addrs.  It subsumes the role of "dev->dma_pfn_offset" which was only
+capable of holding a single uniform offset and had no region bounds
+checking.
+
+The function of_dma_get_range() has been modified so that it takes a single
+argument -- the device node -- and returns a map, NULL, or an error code.
+The map is an array that holds the information regarding the DMA regions.
+Each range entry contains the address offset, the cpu_start address, the
+dma_start address, and the size of the region.
+
+of_dma_configure() is the typical manner to set range offsets but there are
+a number of ad hoc assignments to "dev->dma_pfn_offset" in the kernel
+driver code.  These cases now invoke the function
+dma_direct_set_offset(dev, cpu_addr, dma_addr, size).
+
+	Signed-off-by: Jim Quinlan <james.quinlan@broadcom.com>
+[hch: various interface cleanups]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Tested-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Tested-by: Nathan Chancellor <natechancellor@gmail.com>
+(cherry picked from commit e0d072782c734d27f5af062c62266f2598f68542)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/dma-direct.h
+#	arch/arm/mach-keystone/keystone.c
+#	arch/x86/pci/sta2x11-fixup.c
+#	drivers/gpu/drm/sun4i/sun4i_backend.c
+#	drivers/media/platform/sunxi/sun4i-csi/sun4i_csi.c
+#	drivers/media/platform/sunxi/sun6i-csi/sun6i_csi.c
+#	drivers/of/address.c
+#	drivers/of/device.c
+#	drivers/of/of_private.h
+#	drivers/of/unittest.c
+#	drivers/remoteproc/remoteproc_core.c
+#	drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+#	include/linux/device.h
+diff --cc arch/arm/include/asm/dma-direct.h
+index b67e5fc1fe43,436544aeb834..000000000000
+--- a/arch/arm/include/asm/dma-direct.h
++++ b/arch/arm/include/asm/dma-direct.h
+@@@ -2,7 -2,56 +2,60 @@@
+  #ifndef ASM_ARM_DMA_DIRECT_H
+  #define ASM_ARM_DMA_DIRECT_H 1
+  
+++<<<<<<< HEAD
+ +static inline dma_addr_t __phys_to_dma(struct device *dev, phys_addr_t paddr)
+++=======
++ #include <asm/memory.h>
++ 
++ /*
++  * dma_to_pfn/pfn_to_dma/virt_to_dma are architecture private
++  * functions used internally by the DMA-mapping API to provide DMA
++  * addresses. They must not be used by drivers.
++  */
++ #ifndef __arch_pfn_to_dma
++ static inline dma_addr_t pfn_to_dma(struct device *dev, unsigned long pfn)
++ {
++ 	if (dev && dev->dma_range_map)
++ 		pfn = PFN_DOWN(translate_phys_to_dma(dev, PFN_PHYS(pfn)));
++ 	return (dma_addr_t)__pfn_to_bus(pfn);
++ }
++ 
++ static inline unsigned long dma_to_pfn(struct device *dev, dma_addr_t addr)
++ {
++ 	unsigned long pfn = __bus_to_pfn(addr);
++ 
++ 	if (dev && dev->dma_range_map)
++ 		pfn = PFN_DOWN(translate_dma_to_phys(dev, PFN_PHYS(pfn)));
++ 	return pfn;
++ }
++ 
++ static inline dma_addr_t virt_to_dma(struct device *dev, void *addr)
++ {
++ 	if (dev)
++ 		return pfn_to_dma(dev, virt_to_pfn(addr));
++ 
++ 	return (dma_addr_t)__virt_to_bus((unsigned long)(addr));
++ }
++ 
++ #else
++ static inline dma_addr_t pfn_to_dma(struct device *dev, unsigned long pfn)
++ {
++ 	return __arch_pfn_to_dma(dev, pfn);
++ }
++ 
++ static inline unsigned long dma_to_pfn(struct device *dev, dma_addr_t addr)
++ {
++ 	return __arch_dma_to_pfn(dev, addr);
++ }
++ 
++ static inline dma_addr_t virt_to_dma(struct device *dev, void *addr)
++ {
++ 	return __arch_virt_to_dma(dev, addr);
++ }
++ #endif
++ 
++ static inline dma_addr_t phys_to_dma(struct device *dev, phys_addr_t paddr)
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  {
+  	unsigned int offset = paddr & ~PAGE_MASK;
+  	return pfn_to_dma(dev, __phys_to_pfn(paddr)) + offset;
+diff --cc arch/arm/mach-keystone/keystone.c
+index 84613abf35a3,09a65c2dfd73..000000000000
+--- a/arch/arm/mach-keystone/keystone.c
++++ b/arch/arm/mach-keystone/keystone.c
+@@@ -27,8 -25,7 +28,12 @@@
+  
+  #include "keystone.h"
+  
+++<<<<<<< HEAD
+ +static unsigned long keystone_dma_pfn_offset __read_mostly;
+ +
+++=======
++ #ifdef CONFIG_ARM_LPAE
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  static int keystone_platform_notifier(struct notifier_block *nb,
+  				      unsigned long event, void *data)
+  {
+@@@ -54,11 -54,11 +62,18 @@@ static struct notifier_block platform_n
+  
+  static void __init keystone_init(void)
+  {
+++<<<<<<< HEAD
+ +	if (PHYS_OFFSET >= KEYSTONE_HIGH_PHYS_START) {
+ +		keystone_dma_pfn_offset = PFN_DOWN(KEYSTONE_HIGH_PHYS_START -
+ +						   KEYSTONE_LOW_PHYS_START);
+ +		bus_register_notifier(&platform_bus_type, &platform_nb);
+ +	}
+++=======
++ #ifdef CONFIG_ARM_LPAE
++ 	if (PHYS_OFFSET >= KEYSTONE_HIGH_PHYS_START)
++ 		bus_register_notifier(&platform_bus_type, &platform_nb);
++ #endif
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  	keystone_pm_runtime_init();
+  }
+  
+diff --cc arch/x86/pci/sta2x11-fixup.c
+index 289b14fe2cba,324a207f9995..000000000000
+--- a/arch/x86/pci/sta2x11-fixup.c
++++ b/arch/x86/pci/sta2x11-fixup.c
+@@@ -249,12 -130,24 +249,33 @@@ phys_addr_t __dma_to_phys(struct devic
+  /* At probe time, enable mapping for each endpoint, using the pdev */
+  static void sta2x11_map_ep(struct pci_dev *pdev)
+  {
+++<<<<<<< HEAD
+ +	struct sta2x11_mapping *map = sta2x11_pdev_to_mapping(pdev);
+ +	int i;
+++=======
++ 	struct sta2x11_instance *instance = sta2x11_pdev_to_instance(pdev);
++ 	struct device *dev = &pdev->dev;
++ 	u32 amba_base, max_amba_addr;
++ 	int i, ret;
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  
+ -	if (!instance)
+ +	if (!map)
+  		return;
+++<<<<<<< HEAD
+ +	pci_read_config_dword(pdev, AHB_BASE(0), &map->amba_base);
+++=======
++ 
++ 	pci_read_config_dword(pdev, AHB_BASE(0), &amba_base);
++ 	max_amba_addr = amba_base + STA2X11_AMBA_SIZE - 1;
++ 
++ 	ret = dma_direct_set_offset(dev, 0, amba_base, STA2X11_AMBA_SIZE);
++ 	if (ret)
++ 		dev_err(dev, "sta2x11: could not set DMA offset\n");
++ 
++ 	dev->bus_dma_limit = max_amba_addr;
++ 	pci_set_consistent_dma_mask(pdev, max_amba_addr);
++ 	pci_set_dma_mask(pdev, max_amba_addr);
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  
+  	/* Configure AHB mapping */
+  	pci_write_config_dword(pdev, AHB_PEXLBASE(0), 0);
+diff --cc drivers/gpu/drm/sun4i/sun4i_backend.c
+index de0a76dfa1a2,05e9f0d28196..000000000000
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@@ -3,14 -4,17 +3,26 @@@
+   * Copyright (C) 2015 NextThing Co
+   *
+   * Maxime Ripard <maxime.ripard@free-electrons.com>
+ + *
+ + * This program is free software; you can redistribute it and/or
+ + * modify it under the terms of the GNU General Public License as
+ + * published by the Free Software Foundation; either version 2 of
+ + * the License, or (at your option) any later version.
+   */
+  
+++<<<<<<< HEAD
+ +#include <drm/drmP.h>
+++=======
++ #include <linux/component.h>
++ #include <linux/list.h>
++ #include <linux/module.h>
++ #include <linux/of_device.h>
++ #include <linux/of_graph.h>
++ #include <linux/dma-mapping.h>
++ #include <linux/platform_device.h>
++ #include <linux/reset.h>
++ 
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  #include <drm/drm_atomic.h>
+  #include <drm/drm_atomic_helper.h>
+  #include <drm/drm_crtc.h>
+@@@ -772,6 -795,32 +784,35 @@@ static int sun4i_backend_bind(struct de
+  	dev_set_drvdata(dev, backend);
+  	spin_lock_init(&backend->frontend_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (of_find_property(dev->of_node, "interconnects", NULL)) {
++ 		/*
++ 		 * This assume we have the same DMA constraints for all our the
++ 		 * devices in our pipeline (all the backends, but also the
++ 		 * frontends). This sounds bad, but it has always been the case
++ 		 * for us, and DRM doesn't do per-device allocation either, so
++ 		 * we would need to fix DRM first...
++ 		 */
++ 		ret = of_dma_configure(drm->dev, dev->of_node, true);
++ 		if (ret)
++ 			return ret;
++ 	} else {
++ 		/*
++ 		 * If we don't have the interconnect property, most likely
++ 		 * because of an old DT, we need to set the DMA offset by hand
++ 		 * on our device since the RAM mapping is at 0 for the DMA bus,
++ 		 * unlike the CPU.
++ 		 *
++ 		 * XXX(hch): this has no business in a driver and needs to move
++ 		 * to the device tree.
++ 		 */
++ 		ret = dma_direct_set_offset(drm->dev, PHYS_OFFSET, 0, SZ_4G);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  	backend->engine.node = dev->of_node;
+  	backend->engine.ops = &sun4i_backend_engine_ops;
+  	backend->engine.id = sun4i_backend_of_get_id(dev->of_node);
+diff --cc drivers/of/address.c
+index 482c392891a1,eb9ab4f1e80b..000000000000
+--- a/drivers/of/address.c
++++ b/drivers/of/address.c
+@@@ -13,7 -13,10 +13,8 @@@
+  #include <linux/sizes.h>
+  #include <linux/slab.h>
+  #include <linux/string.h>
++ #include <linux/dma-direct.h> /* for bus_dma_region */
+  
+ -#include "of_private.h"
+ -
+  /* Max address size we deal with */
+  #define OF_MAX_ADDR_CELLS	4
+  #define OF_CHECK_ADDR_COUNT(na)	((na) > 0 && (na) <= OF_MAX_ADDR_CELLS)
+@@@ -898,20 -959,14 +899,29 @@@ int of_dma_get_range(struct device_nod
+  {
+  	struct device_node *node = of_node_get(np);
+  	const __be32 *ranges = NULL;
+++<<<<<<< HEAD
+ +	int len, naddr, nsize, pna;
+ +	int ret = 0;
+ +	u64 dmaaddr;
+ +
+ +	if (!node)
+ +		return -EINVAL;
+ +
+ +	while (1) {
+ +		naddr = of_n_addr_cells(node);
+ +		nsize = of_n_size_cells(node);
+ +		node = of_get_next_parent(node);
+ +		if (!node)
+ +			break;
+++=======
++ 	bool found_dma_ranges = false;
++ 	struct of_range_parser parser;
++ 	struct of_range range;
++ 	struct bus_dma_region *r;
++ 	int len, num_ranges = 0;
++ 	int ret = 0;
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  
+ -	while (node) {
+  		ranges = of_get_property(node, "dma-ranges", &len);
+  
+  		/* Ignore empty ranges, they imply no translation required */
+@@@ -932,35 -989,40 +942,67 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	len /= sizeof(u32);
+ +
+ +	pna = of_n_addr_cells(node);
+ +
+ +	/* dma-ranges format:
+ +	 * DMA addr	: naddr cells
+ +	 * CPU addr	: pna cells
+ +	 * size		: nsize cells
+ +	 */
+ +	dmaaddr = of_read_number(ranges, naddr);
+ +	*paddr = of_translate_dma_address(np, ranges);
+ +	if (*paddr == OF_BAD_ADDR) {
+ +		pr_err("translation of DMA address(%pad) to CPU address failed node(%pOF)\n",
+ +		       dma_addr, np);
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +	*dma_addr = dmaaddr;
+ +
+ +	*size = of_read_number(ranges + naddr + pna, nsize);
+ +
+ +	pr_debug("dma_addr(%llx) cpu_addr(%llx) size(%llx)\n",
+ +		 *dma_addr, *paddr, *size);
+ +
+++=======
++ 	of_dma_range_parser_init(&parser, node);
++ 	for_each_of_range(&parser, &range)
++ 		num_ranges++;
++ 
++ 	r = kcalloc(num_ranges + 1, sizeof(*r), GFP_KERNEL);
++ 	if (!r) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Record all info in the generic DMA ranges array for struct device.
++ 	 */
++ 	*map = r;
++ 	of_dma_range_parser_init(&parser, node);
++ 	for_each_of_range(&parser, &range) {
++ 		pr_debug("dma_addr(%llx) cpu_addr(%llx) size(%llx)\n",
++ 			 range.bus_addr, range.cpu_addr, range.size);
++ 		if (range.cpu_addr == OF_BAD_ADDR) {
++ 			pr_err("translation of DMA address(%llx) to CPU address failed node(%pOF)\n",
++ 			       range.bus_addr, node);
++ 			continue;
++ 		}
++ 		r->cpu_start = range.cpu_addr;
++ 		r->dma_start = range.bus_addr;
++ 		r->size = range.size;
++ 		r->offset = range.cpu_addr - range.bus_addr;
++ 		r++;
++ 	}
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  out:
+  	of_node_put(node);
+- 
+  	return ret;
+  }
++ #endif /* CONFIG_HAS_DMA */
+  
+  /**
+   * of_dma_is_coherent - Check if device is coherent
+diff --cc drivers/of/device.c
+index f137835e2a84,6e3ae7ebc33e..000000000000
+--- a/drivers/of/device.c
++++ b/drivers/of/device.c
+@@@ -162,10 -169,11 +169,16 @@@ int of_dma_configure_id(struct device *
+  	dev_dbg(dev, "device is%sdma coherent\n",
+  		coherent ? " " : " not ");
+  
+ +
+  	iommu = of_iommu_configure(dev, np, id);
+++<<<<<<< HEAD
+ +	if (IS_ERR(iommu) && PTR_ERR(iommu) == -EPROBE_DEFER)
+++=======
++ 	if (PTR_ERR(iommu) == -EPROBE_DEFER) {
++ 		kfree(map);
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  		return -EPROBE_DEFER;
++ 	}
+  
+  	dev_dbg(dev, "device is%sbehind an iommu\n",
+  		iommu ? " " : " not ");
+diff --cc drivers/of/of_private.h
+index 5384b9d94e43,d9e6a324de0a..000000000000
+--- a/drivers/of/of_private.h
++++ b/drivers/of/of_private.h
+@@@ -150,12 -154,16 +150,22 @@@ extern void __of_sysfs_remove_bin_file(
+  #define for_each_transaction_entry_reverse(_oft, _te) \
+  	list_for_each_entry_reverse(_te, &(_oft)->te_list, node)
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_OF_ADDRESS
+ +extern int of_dma_get_range(struct device_node *np, u64 *dma_addr,
+ +			    u64 *paddr, u64 *size);
+++=======
++ extern int of_bus_n_addr_cells(struct device_node *np);
++ extern int of_bus_n_size_cells(struct device_node *np);
++ 
++ struct bus_dma_region;
++ #if defined(CONFIG_OF_ADDRESS) && defined(CONFIG_HAS_DMA)
++ int of_dma_get_range(struct device_node *np,
++ 		const struct bus_dma_region **map);
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  #else
+- static inline int of_dma_get_range(struct device_node *np, u64 *dma_addr,
+- 				   u64 *paddr, u64 *size)
++ static inline int of_dma_get_range(struct device_node *np,
++ 		const struct bus_dma_region **map)
+  {
+  	return -ENODEV;
+  }
+diff --cc drivers/of/unittest.c
+index 1ff70171661e,06cc988faf78..000000000000
+--- a/drivers/of/unittest.c
++++ b/drivers/of/unittest.c
+@@@ -939,6 -865,112 +940,111 @@@ static void __init of_unittest_changese
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __init of_unittest_dma_ranges_one(const char *path,
++ 		u64 expect_dma_addr, u64 expect_paddr)
++ {
++ #ifdef CONFIG_HAS_DMA
++ 	struct device_node *np;
++ 	const struct bus_dma_region *map = NULL;
++ 	int rc;
++ 
++ 	np = of_find_node_by_path(path);
++ 	if (!np) {
++ 		pr_err("missing testcase data\n");
++ 		return;
++ 	}
++ 
++ 	rc = of_dma_get_range(np, &map);
++ 
++ 	unittest(!rc, "of_dma_get_range failed on node %pOF rc=%i\n", np, rc);
++ 
++ 	if (!rc) {
++ 		phys_addr_t	paddr;
++ 		dma_addr_t	dma_addr;
++ 		struct device	dev_bogus;
++ 
++ 		dev_bogus.dma_range_map = map;
++ 		paddr = dma_to_phys(&dev_bogus, expect_dma_addr);
++ 		dma_addr = phys_to_dma(&dev_bogus, expect_paddr);
++ 
++ 		unittest(paddr == expect_paddr,
++ 			 "of_dma_get_range: wrong phys addr %pap (expecting %llx) on node %pOF\n",
++ 			 &paddr, expect_paddr, np);
++ 		unittest(dma_addr == expect_dma_addr,
++ 			 "of_dma_get_range: wrong DMA addr %pad (expecting %llx) on node %pOF\n",
++ 			 &dma_addr, expect_dma_addr, np);
++ 
++ 		kfree(map);
++ 	}
++ 	of_node_put(np);
++ #endif
++ }
++ 
++ static void __init of_unittest_parse_dma_ranges(void)
++ {
++ 	of_unittest_dma_ranges_one("/testcase-data/address-tests/device@70000000",
++ 		0x0, 0x20000000);
++ 	of_unittest_dma_ranges_one("/testcase-data/address-tests/bus@80000000/device@1000",
++ 		0x100000000, 0x20000000);
++ 	of_unittest_dma_ranges_one("/testcase-data/address-tests/pci@90000000",
++ 		0x80000000, 0x20000000);
++ }
++ 
++ static void __init of_unittest_pci_dma_ranges(void)
++ {
++ 	struct device_node *np;
++ 	struct of_pci_range range;
++ 	struct of_pci_range_parser parser;
++ 	int i = 0;
++ 
++ 	if (!IS_ENABLED(CONFIG_PCI))
++ 		return;
++ 
++ 	np = of_find_node_by_path("/testcase-data/address-tests/pci@90000000");
++ 	if (!np) {
++ 		pr_err("missing testcase data\n");
++ 		return;
++ 	}
++ 
++ 	if (of_pci_dma_range_parser_init(&parser, np)) {
++ 		pr_err("missing dma-ranges property\n");
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Get the dma-ranges from the device tree
++ 	 */
++ 	for_each_of_pci_range(&parser, &range) {
++ 		if (!i) {
++ 			unittest(range.size == 0x10000000,
++ 				 "for_each_of_pci_range wrong size on node %pOF size=%llx\n",
++ 				 np, range.size);
++ 			unittest(range.cpu_addr == 0x20000000,
++ 				 "for_each_of_pci_range wrong CPU addr (%llx) on node %pOF",
++ 				 range.cpu_addr, np);
++ 			unittest(range.pci_addr == 0x80000000,
++ 				 "for_each_of_pci_range wrong DMA addr (%llx) on node %pOF",
++ 				 range.pci_addr, np);
++ 		} else {
++ 			unittest(range.size == 0x10000000,
++ 				 "for_each_of_pci_range wrong size on node %pOF size=%llx\n",
++ 				 np, range.size);
++ 			unittest(range.cpu_addr == 0x40000000,
++ 				 "for_each_of_pci_range wrong CPU addr (%llx) on node %pOF",
++ 				 range.cpu_addr, np);
++ 			unittest(range.pci_addr == 0xc0000000,
++ 				 "for_each_of_pci_range wrong DMA addr (%llx) on node %pOF",
++ 				 range.pci_addr, np);
++ 		}
++ 		i++;
++ 	}
++ 
++ 	of_node_put(np);
++ }
++ 
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  static void __init of_unittest_parse_interrupts(void)
+  {
+  	struct device_node *np;
+diff --cc drivers/remoteproc/remoteproc_core.c
+index a9609d971f7f,8157dd491d28..000000000000
+--- a/drivers/remoteproc/remoteproc_core.c
++++ b/drivers/remoteproc/remoteproc_core.c
+@@@ -308,13 -435,49 +309,32 @@@ static int rproc_vdev_do_probe(struct r
+  	return rproc_add_virtio_dev(rvdev, rvdev->id);
+  }
+  
+ -static void rproc_vdev_do_stop(struct rproc_subdev *subdev, bool crashed)
+ +static void rproc_vdev_do_remove(struct rproc_subdev *subdev, bool crashed)
+  {
+  	struct rproc_vdev *rvdev = container_of(subdev, struct rproc_vdev, subdev);
+ -	int ret;
+ -
+ -	ret = device_for_each_child(&rvdev->dev, NULL, rproc_remove_virtio_dev);
+ -	if (ret)
+ -		dev_warn(&rvdev->dev, "can't remove vdev child device: %d\n", ret);
+ -}
+ -
+ -/**
+ - * rproc_rvdev_release() - release the existence of a rvdev
+ - *
+ - * @dev: the subdevice's dev
+ - */
+ -static void rproc_rvdev_release(struct device *dev)
+ -{
+ -	struct rproc_vdev *rvdev = container_of(dev, struct rproc_vdev, dev);
+  
+ -	of_reserved_mem_device_release(dev);
+ -
+ -	kfree(rvdev);
+ +	rproc_remove_virtio_dev(rvdev);
+  }
+  
++ static int copy_dma_range_map(struct device *to, struct device *from)
++ {
++ 	const struct bus_dma_region *map = from->dma_range_map, *new_map, *r;
++ 	int num_ranges = 0;
++ 
++ 	if (!map)
++ 		return 0;
++ 
++ 	for (r = map; r->size; r++)
++ 		num_ranges++;
++ 
++ 	new_map = kmemdup(map, array_size(num_ranges + 1, sizeof(*map)),
++ 			  GFP_KERNEL);
++ 	if (!new_map)
++ 		return -ENOMEM;
++ 	to->dma_range_map = new_map;
++ 	return 0;
++ }
++ 
+  /**
+   * rproc_handle_vdev() - handle a vdev fw resource
+   * @rproc: the remote processor
+@@@ -379,6 -544,33 +399,36 @@@ static int rproc_handle_vdev(struct rpr
+  
+  	rvdev->id = rsc->id;
+  	rvdev->rproc = rproc;
+++<<<<<<< HEAD
+++=======
++ 	rvdev->index = rproc->nb_vdev++;
++ 
++ 	/* Initialise vdev subdevice */
++ 	snprintf(name, sizeof(name), "vdev%dbuffer", rvdev->index);
++ 	rvdev->dev.parent = &rproc->dev;
++ 	ret = copy_dma_range_map(&rvdev->dev, rproc->dev.parent);
++ 	if (ret)
++ 		return ret;
++ 	rvdev->dev.release = rproc_rvdev_release;
++ 	dev_set_name(&rvdev->dev, "%s#%s", dev_name(rvdev->dev.parent), name);
++ 	dev_set_drvdata(&rvdev->dev, rvdev);
++ 
++ 	ret = device_register(&rvdev->dev);
++ 	if (ret) {
++ 		put_device(&rvdev->dev);
++ 		return ret;
++ 	}
++ 	/* Make device dma capable by inheriting from parent's capabilities */
++ 	set_dma_ops(&rvdev->dev, get_dma_ops(rproc->dev.parent));
++ 
++ 	ret = dma_coerce_mask_and_coherent(&rvdev->dev,
++ 					   dma_get_mask(rproc->dev.parent));
++ 	if (ret) {
++ 		dev_warn(dev,
++ 			 "Failed to set DMA mask %llx. Trying to continue... %x\n",
++ 			 dma_get_mask(rproc->dev.parent), ret);
++ 	}
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  
+  	/* parse the vrings */
+  	for (i = 0; i < rsc->num_of_vrings; i++) {
+diff --cc include/linux/device.h
+index 08956d517202,1c78621fc3c0..000000000000
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@@ -1244,9 -560,8 +1244,14 @@@ struct device 
+  					     not all hardware supports
+  					     64 bit addresses for consistent
+  					     allocations such descriptors. */
+++<<<<<<< HEAD
+ +	u64		RH_KABI_RENAME(bus_dma_mask,
+ +					bus_dma_limit); /* upstream dma constraint */
+ +	unsigned long	dma_pfn_offset;
+++=======
++ 	u64		bus_dma_limit;	/* upstream dma constraint */
++ 	const struct bus_dma_region *dma_range_map;
+++>>>>>>> e0d072782c73 (dma-mapping: introduce DMA range map, supplanting dma_pfn_offset)
+  
+  	struct device_dma_parameters *dma_parms;
+  
+* Unmerged path drivers/media/platform/sunxi/sun4i-csi/sun4i_csi.c
+* Unmerged path drivers/media/platform/sunxi/sun6i-csi/sun6i_csi.c
+* Unmerged path drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+* Unmerged path arch/arm/include/asm/dma-direct.h
+* Unmerged path arch/arm/mach-keystone/keystone.c
+diff --git a/arch/sh/drivers/pci/pcie-sh7786.c b/arch/sh/drivers/pci/pcie-sh7786.c
+index 3d81a8b80942..2698017c0d33 100644
+--- a/arch/sh/drivers/pci/pcie-sh7786.c
++++ b/arch/sh/drivers/pci/pcie-sh7786.c
+@@ -15,6 +15,7 @@
+ #include <linux/io.h>
+ #include <linux/async.h>
+ #include <linux/delay.h>
++#include <linux/dma-mapping.h>
+ #include <linux/slab.h>
+ #include <linux/clk.h>
+ #include <linux/sh_clk.h>
+@@ -34,6 +35,8 @@ struct sh7786_pcie_port {
+ static struct sh7786_pcie_port *sh7786_pcie_ports;
+ static unsigned int nr_ports;
+ static unsigned long dma_pfn_offset;
++size_t memsize;
++u64 memstart;
+ 
+ static struct sh7786_pcie_hwops {
+ 	int (*core_init)(void);
+@@ -304,7 +307,6 @@ static int __init pcie_init(struct sh7786_pcie_port *port)
+ 	struct pci_channel *chan = port->hose;
+ 	unsigned int data;
+ 	phys_addr_t memstart, memend;
+-	size_t memsize;
+ 	int ret, i, win;
+ 
+ 	/* Begin initialization */
+@@ -371,8 +373,6 @@ static int __init pcie_init(struct sh7786_pcie_port *port)
+ 	memstart = ALIGN_DOWN(memstart, memsize);
+ 	memsize = roundup_pow_of_two(memend - memstart);
+ 
+-	dma_pfn_offset = memstart >> PAGE_SHIFT;
+-
+ 	/*
+ 	 * If there's more than 512MB of memory, we need to roll over to
+ 	 * LAR1/LAMR1.
+@@ -490,7 +490,8 @@ int pcibios_map_platform_irq(const struct pci_dev *pdev, u8 slot, u8 pin)
+ 
+ void pcibios_bus_add_device(struct pci_dev *pdev)
+ {
+-	pdev->dev.dma_pfn_offset = dma_pfn_offset;
++	dma_direct_set_offset(&pdev->dev, __pa(memory_start),
++			      __pa(memory_start) - memstart, memsize);
+ }
+ 
+ static int __init sh7786_pcie_core_init(void)
+* Unmerged path arch/x86/pci/sta2x11-fixup.c
+diff --git a/drivers/acpi/arm64/iort.c b/drivers/acpi/arm64/iort.c
+index 5db705e2b54d..cd990e593786 100644
+--- a/drivers/acpi/arm64/iort.c
++++ b/drivers/acpi/arm64/iort.c
+@@ -26,6 +26,7 @@
+ #include <linux/pci.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/dma-mapping.h>
+ 
+ #define IORT_TYPE_MASK(type)	(1 << (type))
+ #define IORT_MSI_TYPE		(1 << ACPI_IORT_NODE_ITS_GROUP)
+@@ -1201,8 +1202,9 @@ void iort_dma_setup(struct device *dev, u64 *dma_addr, u64 *dma_size)
+ 	*dma_addr = dmaaddr;
+ 	*dma_size = size;
+ 
+-	dev->dma_pfn_offset = PFN_DOWN(offset);
+-	dev_dbg(dev, "dma_pfn_offset(%#08llx)\n", offset);
++	ret = dma_direct_set_offset(dev, dmaaddr + offset, dmaaddr, size);
++
++	dev_dbg(dev, "dma_offset(%#08llx)%s\n", offset, ret ? " failed!" : "");
+ }
+ 
+ static void __init acpi_iort_register_irq(int hwirq, const char *name,
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 88a9aafab2f4..265d891eabfd 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -1952,6 +1952,8 @@ static void device_release(struct kobject *kobj)
+ 	 */
+ 	devres_release_all(dev);
+ 
++	kfree(dev->dma_range_map);
++
+ 	if (dev->release)
+ 		dev->release(dev);
+ 	else if (dev->type && dev->type->release)
+* Unmerged path drivers/gpu/drm/sun4i/sun4i_backend.c
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index a095e3f9acc4..44ed95c1662f 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -802,7 +802,7 @@ arm_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg)
+ 	if (cfg->oas > ARM_LPAE_MAX_ADDR_BITS)
+ 		return NULL;
+ 
+-	if (!selftest_running && cfg->iommu_dev->dma_pfn_offset) {
++	if (!selftest_running && cfg->iommu_dev->dma_range_map) {
+ 		dev_err(cfg->iommu_dev, "Cannot accommodate DMA offset for IOMMU page tables\n");
+ 		return NULL;
+ 	}
+* Unmerged path drivers/media/platform/sunxi/sun4i-csi/sun4i_csi.c
+* Unmerged path drivers/media/platform/sunxi/sun6i-csi/sun6i_csi.c
+* Unmerged path drivers/of/address.c
+* Unmerged path drivers/of/device.c
+* Unmerged path drivers/of/of_private.h
+* Unmerged path drivers/of/unittest.c
+* Unmerged path drivers/remoteproc/remoteproc_core.c
+* Unmerged path drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+* Unmerged path include/linux/device.h
+diff --git a/include/linux/dma-direct.h b/include/linux/dma-direct.h
+index 28fdd6ebdd10..4bf62ce3f489 100644
+--- a/include/linux/dma-direct.h
++++ b/include/linux/dma-direct.h
+@@ -14,6 +14,41 @@
+ 
+ extern unsigned int zone_dma_bits;
+ 
++/*
++ * Record the mapping of CPU physical to DMA addresses for a given region.
++ */
++struct bus_dma_region {
++	phys_addr_t	cpu_start;
++	dma_addr_t	dma_start;
++	u64		size;
++	u64		offset;
++};
++
++static inline dma_addr_t translate_phys_to_dma(struct device *dev,
++		phys_addr_t paddr)
++{
++	const struct bus_dma_region *m;
++
++	for (m = dev->dma_range_map; m->size; m++)
++		if (paddr >= m->cpu_start && paddr - m->cpu_start < m->size)
++			return (dma_addr_t)paddr - m->offset;
++
++	/* make sure dma_capable fails when no translation is available */
++	return DMA_MAPPING_ERROR;
++}
++
++static inline phys_addr_t translate_dma_to_phys(struct device *dev,
++		dma_addr_t dma_addr)
++{
++	const struct bus_dma_region *m;
++
++	for (m = dev->dma_range_map; m->size; m++)
++		if (dma_addr >= m->dma_start && dma_addr - m->dma_start < m->size)
++			return (phys_addr_t)dma_addr + m->offset;
++
++	return (phys_addr_t)-1;
++}
++
+ #ifdef CONFIG_ARCH_HAS_PHYS_TO_DMA
+ #include <asm/dma-direct.h>
+ #ifndef phys_to_dma_unencrypted
+@@ -23,9 +58,9 @@ extern unsigned int zone_dma_bits;
+ static inline dma_addr_t phys_to_dma_unencrypted(struct device *dev,
+ 		phys_addr_t paddr)
+ {
+-	dma_addr_t dev_addr = (dma_addr_t)paddr;
+-
+-	return dev_addr - ((dma_addr_t)dev->dma_pfn_offset << PAGE_SHIFT);
++	if (dev->dma_range_map)
++		return translate_phys_to_dma(dev, paddr);
++	return paddr;
+ }
+ 
+ /*
+@@ -39,10 +74,14 @@ static inline dma_addr_t phys_to_dma(struct device *dev, phys_addr_t paddr)
+ 	return __sme_set(phys_to_dma_unencrypted(dev, paddr));
+ }
+ 
+-static inline phys_addr_t dma_to_phys(struct device *dev, dma_addr_t dev_addr)
++static inline phys_addr_t dma_to_phys(struct device *dev, dma_addr_t dma_addr)
+ {
+-	phys_addr_t paddr = (phys_addr_t)dev_addr +
+-		((phys_addr_t)dev->dma_pfn_offset << PAGE_SHIFT);
++	phys_addr_t paddr;
++
++	if (dev->dma_range_map)
++		paddr = translate_dma_to_phys(dev, dma_addr);
++	else
++		paddr = dma_addr;
+ 
+ 	return __sme_clr(paddr);
+ }
+@@ -62,6 +101,8 @@ static inline bool dma_capable(struct device *dev, dma_addr_t addr, size_t size,
+ {
+ 	dma_addr_t end = addr + size - 1;
+ 
++	if (addr == DMA_MAPPING_ERROR)
++		return false;
+ 	if (is_ram && !IS_ENABLED(CONFIG_ARCH_DMA_ADDR_T_64BIT) &&
+ 	    min(addr, end) < phys_to_dma(dev, PFN_PHYS(min_low_pfn)))
+ 		return false;
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index 5c32cbab4717..6bdd0bf9de0a 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -825,4 +825,11 @@ static inline int dma_mmap_wc(struct device *dev,
+ #define dma_unmap_len_set(PTR, LEN_NAME, VAL)    do { } while (0)
+ #endif
+ 
+-#endif
++/*
++ * Legacy interface to set up the dma offset map.  Drivers really should not
++ * actually use it, but we have a few legacy cases left.
++ */
++int dma_direct_set_offset(struct device *dev, phys_addr_t cpu_start,
++		dma_addr_t dma_start, u64 size);
++
++#endif /* _LINUX_DMA_MAPPING_H */
+diff --git a/kernel/dma/coherent.c b/kernel/dma/coherent.c
+index 0d92e92edbda..149550aa2777 100644
+--- a/kernel/dma/coherent.c
++++ b/kernel/dma/coherent.c
+@@ -7,7 +7,7 @@
+ #include <linux/slab.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+-#include <linux/dma-mapping.h>
++#include <linux/dma-direct.h>
+ 
+ struct dma_coherent_mem {
+ 	void		*virt_base;
+@@ -32,9 +32,8 @@ static inline dma_addr_t dma_get_device_base(struct device *dev,
+ 					     struct dma_coherent_mem * mem)
+ {
+ 	if (mem->use_dev_dma_pfn_offset)
+-		return (mem->pfn_base - dev->dma_pfn_offset) << PAGE_SHIFT;
+-	else
+-		return mem->device_base;
++		return phys_to_dma(dev, PFN_PHYS(mem->pfn_base));
++	return mem->device_base;
+ }
+ 
+ static int dma_init_coherent_memory(phys_addr_t phys_addr,
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index 7d488b64b9de..0f6d9ab86892 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -13,6 +13,7 @@
+ #include <linux/pfn.h>
+ #include <linux/vmalloc.h>
+ #include <linux/set_memory.h>
++#include <linux/slab.h>
+ 
+ /*
+  * Most architectures use ZONE_DMA for the first 16 Megabytes, but some use it
+@@ -66,8 +67,12 @@ static gfp_t dma_direct_optimal_gfp_mask(struct device *dev, u64 dma_mask,
+ 
+ static bool dma_coherent_ok(struct device *dev, phys_addr_t phys, size_t size)
+ {
+-	return phys_to_dma_direct(dev, phys) + size - 1 <=
+-			min_not_zero(dev->coherent_dma_mask, dev->bus_dma_limit);
++	dma_addr_t dma_addr = phys_to_dma_direct(dev, phys);
++
++	if (dma_addr == DMA_MAPPING_ERROR)
++		return false;
++	return dma_addr + size - 1 <=
++		min_not_zero(dev->coherent_dma_mask, dev->bus_dma_limit);
+ }
+ 
+ static struct page *__dma_direct_alloc_pages(struct device *dev, size_t size,
+@@ -498,3 +503,45 @@ bool dma_direct_need_sync(struct device *dev, dma_addr_t dma_addr)
+ 	return !dev_is_dma_coherent(dev) ||
+ 		is_swiotlb_buffer(dma_to_phys(dev, dma_addr));
+ }
++
++/**
++ * dma_direct_set_offset - Assign scalar offset for a single DMA range.
++ * @dev:	device pointer; needed to "own" the alloced memory.
++ * @cpu_start:  beginning of memory region covered by this offset.
++ * @dma_start:  beginning of DMA/PCI region covered by this offset.
++ * @size:	size of the region.
++ *
++ * This is for the simple case of a uniform offset which cannot
++ * be discovered by "dma-ranges".
++ *
++ * It returns -ENOMEM if out of memory, -EINVAL if a map
++ * already exists, 0 otherwise.
++ *
++ * Note: any call to this from a driver is a bug.  The mapping needs
++ * to be described by the device tree or other firmware interfaces.
++ */
++int dma_direct_set_offset(struct device *dev, phys_addr_t cpu_start,
++			 dma_addr_t dma_start, u64 size)
++{
++	struct bus_dma_region *map;
++	u64 offset = (u64)cpu_start - (u64)dma_start;
++
++	if (dev->dma_range_map) {
++		dev_err(dev, "attempt to add DMA range to existing map\n");
++		return -EINVAL;
++	}
++
++	if (!offset)
++		return 0;
++
++	map = kcalloc(2, sizeof(*map), GFP_KERNEL);
++	if (!map)
++		return -ENOMEM;
++	map[0].cpu_start = cpu_start;
++	map[0].dma_start = dma_start;
++	map[0].offset = offset;
++	map[0].size = size;
++	dev->dma_range_map = map;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(dma_direct_set_offset);
