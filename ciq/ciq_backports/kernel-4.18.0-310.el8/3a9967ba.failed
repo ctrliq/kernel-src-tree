@@ -1,0 +1,148 @@
+nvme: revalidate zone bitmaps in nvme_update_ns_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 3a9967ba7ace91153f9caa8e60a55c7668c7b946
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/3a9967ba.failed
+
+Consolidate the two calls into a single place.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+(cherry picked from commit 3a9967ba7ace91153f9caa8e60a55c7668c7b946)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index c9e0d12e2c04,9c137d8819f7..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2092,50 -2127,44 +2092,59 @@@ static int __nvme_revalidate_disk(struc
+  	switch (ns->head->ids.csi) {
+  	case NVME_CSI_NVM:
+  		break;
+ -	case NVME_CSI_ZNS:
+ -		ret = nvme_update_zone_info(ns, lbaf);
+ -		if (ret) {
+ -			dev_warn(ctrl->device,
+ -				"failed to add zoned namespace:%u ret:%d\n",
+ -				ns->head->ns_id, ret);
+ -			goto out_unfreeze;
+ -		}
+ -		break;
+  	default:
+ -		dev_warn(ctrl->device, "unknown csi:%u ns:%u\n",
+ +		dev_warn(ctrl->device, "unknown csi:%d ns:%d\n",
+  			ns->head->ids.csi, ns->head->ns_id);
+ -		ret = -ENODEV;
+ -		goto out_unfreeze;
+ +		return -ENODEV;
+  	}
+  
+ -	ret = nvme_configure_metadata(ns, id);
+ -	if (ret)
+ -		goto out_unfreeze;
+ -	nvme_set_chunk_sectors(ns, id);
+ -	nvme_update_disk_info(ns->disk, ns, id);
+ -	blk_mq_unfreeze_queue(ns->disk->queue);
+ +	ns->features = 0;
+ +	ns->ms = le16_to_cpu(id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ms);
+ +	/* the PI implementation requires metadata equal t10 pi tuple size */
+ +	if (ns->ms == sizeof(struct t10_pi_tuple))
+ +		ns->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
+ +	else
+ +		ns->pi_type = 0;
+  
+++<<<<<<< HEAD
+ +	if (ns->ms) {
+ +		/*
+ +		 * For PCIe only the separate metadata pointer is supported,
+ +		 * as the block layer supplies metadata in a separate bio_vec
+ +		 * chain. For Fabrics, only metadata as part of extended data
+ +		 * LBA is supported on the wire per the Fabrics specification,
+ +		 * but the HBA/HCA will do the remapping from the separate
+ +		 * metadata buffers for us.
+ +		 */
+ +		if (id->flbas & NVME_NS_FLBAS_META_EXT) {
+ +			ns->features |= NVME_NS_EXT_LBAS;
+ +			if ((ctrl->ops->flags & NVME_F_FABRICS) &&
+ +			    (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED) &&
+ +			    ctrl->max_integrity_segments)
+ +				ns->features |= NVME_NS_METADATA_SUPPORTED;
+ +		} else {
+ +			if (WARN_ON_ONCE(ctrl->ops->flags & NVME_F_FABRICS))
+ +				return -EINVAL;
+ +			if (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED)
+ +				ns->features |= NVME_NS_METADATA_SUPPORTED;
+ +		}
+ +	}
+ +
+ +	nvme_set_chunk_sectors(ns, id);
+ +	nvme_update_disk_info(disk, ns, id);
+++=======
++ 	if (blk_queue_is_zoned(ns->queue)) {
++ 		ret = nvme_revalidate_zones(ns);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
+++>>>>>>> 3a9967ba7ace (nvme: revalidate zone bitmaps in nvme_update_ns_info)
+  #ifdef CONFIG_NVME_MULTIPATH
+  	if (ns->head->disk) {
+ -		blk_mq_freeze_queue(ns->head->disk->queue);
+  		nvme_update_disk_info(ns->head->disk, ns, id);
+ -		blk_stack_limits(&ns->head->disk->queue->limits,
+ -				 &ns->queue->limits, 0);
+ -		blk_queue_update_readahead(ns->head->disk->queue);
+ -		nvme_update_bdev_size(ns->head->disk);
+ -		blk_mq_unfreeze_queue(ns->head->disk->queue);
+ +		blk_queue_stack_limits(ns->head->disk->queue, ns->queue);
+ +		nvme_mpath_update_disk_size(ns->head->disk);
+  	}
+  #endif
+  	return 0;
+@@@ -3937,7 -3919,7 +3946,11 @@@ static void nvme_alloc_ns(struct nvme_c
+  	memcpy(disk->disk_name, disk_name, DISK_NAME_LEN);
+  	ns->disk = disk;
+  
+++<<<<<<< HEAD
+ +	if (__nvme_revalidate_disk(disk, id))
+++=======
++ 	if (nvme_update_ns_info(ns, id))
+++>>>>>>> 3a9967ba7ace (nvme: revalidate zone bitmaps in nvme_update_ns_info)
+  		goto out_put_disk;
+  
+  	if ((ctrl->quirks & NVME_QUIRK_LIGHTNVM) && id->vs[0] == 0x1) {
+@@@ -4025,14 -4007,19 +4038,25 @@@ static void nvme_ns_remove_by_nsid(stru
+  static void nvme_validate_or_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+  {
+  	struct nvme_ns *ns;
+ -	int ret;
+  
+  	ns = nvme_find_get_ns(ctrl, nsid);
+ -	if (!ns) {
+ +	if (ns) {
+ +		if (revalidate_disk(ns->disk))
+ +			nvme_ns_remove(ns);
+ +		nvme_put_ns(ns);
+ +	} else
+  		nvme_alloc_ns(ctrl, nsid);
+++<<<<<<< HEAD
+++=======
++ 		return;
++ 	}
++ 
++ 	ret = nvme_validate_ns(ns);
++ 	revalidate_disk_size(ns->disk, ret == 0);
++ 	if (ret)
++ 		nvme_ns_remove(ns);
++ 	nvme_put_ns(ns);
+++>>>>>>> 3a9967ba7ace (nvme: revalidate zone bitmaps in nvme_update_ns_info)
+  }
+  
+  static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
+* Unmerged path drivers/nvme/host/core.c
