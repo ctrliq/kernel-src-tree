@@ -2648,9 +2648,9 @@ static void qlt_load_cont_data_segments(struct qla_tgt_prm *prm)
 		    cnt < QLA_TGT_DATASEGS_PER_CONT_24XX && prm->seg_cnt;
 		    cnt++, prm->seg_cnt--) {
 			*dword_ptr++ =
-			    cpu_to_le32(pci_dma_lo32
+			    cpu_to_le32(lower_32_bits
 				(sg_dma_address(prm->sg)));
-			*dword_ptr++ = cpu_to_le32(pci_dma_hi32
+			*dword_ptr++ = cpu_to_le32(upper_32_bits
 			    (sg_dma_address(prm->sg)));
 			*dword_ptr++ = cpu_to_le32(sg_dma_len(prm->sg));
 
@@ -2692,9 +2692,9 @@ static void qlt_load_data_segments(struct qla_tgt_prm *prm)
 	    (cnt < QLA_TGT_DATASEGS_PER_CMD_24XX) && prm->seg_cnt;
 	    cnt++, prm->seg_cnt--) {
 		*dword_ptr++ =
-		    cpu_to_le32(pci_dma_lo32(sg_dma_address(prm->sg)));
+		    cpu_to_le32(lower_32_bits(sg_dma_address(prm->sg)));
 
-		*dword_ptr++ = cpu_to_le32(pci_dma_hi32(
+		*dword_ptr++ = cpu_to_le32(upper_32_bits(
 			sg_dma_address(prm->sg)));
 
 		*dword_ptr++ = cpu_to_le32(sg_dma_len(prm->sg));
