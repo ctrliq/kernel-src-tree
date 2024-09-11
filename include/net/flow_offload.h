@@ -9,6 +9,10 @@ struct flow_match {
 	void			*key;
 };
 
+struct flow_match_meta {
+	struct flow_dissector_key_meta *key, *mask;
+};
+
 struct flow_match_basic {
 	struct flow_dissector_key_basic *key, *mask;
 };
@@ -63,6 +67,8 @@ struct flow_match_enc_opts {
 
 struct flow_rule;
 
+void flow_rule_match_meta(const struct flow_rule *rule,
+			  struct flow_match_meta *out);
 void flow_rule_match_basic(const struct flow_rule *rule,
 			   struct flow_match_basic *out);
 void flow_rule_match_control(const struct flow_rule *rule,
