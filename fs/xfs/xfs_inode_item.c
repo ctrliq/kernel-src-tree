@@ -723,7 +723,7 @@ xfs_iflush_finish(
  * as completing the flush and unlocking the inode.
  */
 void
-xfs_iflush_done(
+xfs_buf_inode_iodone(
 	struct xfs_buf		*bp)
 {
 	struct xfs_log_item	*lip, *n;
@@ -760,6 +760,16 @@ xfs_iflush_done(
 	xfs_iflush_finish(bp, &flushed_inodes);
 	if (!list_empty(&flushed_inodes))
 		list_splice_tail(&flushed_inodes, &bp->b_li_list);
+}
+
+void
+xfs_buf_inode_io_fail(
+	struct xfs_buf		*bp)
+{
+	struct xfs_log_item	*lip;
+
+	list_for_each_entry(lip, &bp->b_li_list, li_bio_list)
+		set_bit(XFS_LI_FAILED, &lip->li_flags);
 }
 
 /*
