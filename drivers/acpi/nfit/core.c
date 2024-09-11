@@ -25,7 +25,6 @@
 #include <asm/cacheflush.h>
 #include <acpi/nfit.h>
 #include "nfit.h"
-#include "intel.h"
 
 /*
  * For readq() and writeq() on 32-bit builds, the hi-lo, lo-hi order is
