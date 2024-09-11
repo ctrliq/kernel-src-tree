@@ -1,0 +1,137 @@
+RDMA/core: Add signature attrs element for ib_mr structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 7c717d3aeeaabbfddd0fe949b501595a2e3469e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7c717d3a.failed
+
+This element will describe the needed characteristics for the signature
+operation per signature enabled memory region (type IB_MR_TYPE_INTEGRITY).
+Also add meta_length attribute to ib_sig_attrs structure for saving the
+mapped metadata length (needed for the new API implementation).
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Israel Rukshin <israelr@mellanox.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 7c717d3aeeaabbfddd0fe949b501595a2e3469e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+diff --cc drivers/infiniband/core/verbs.c
+index 93994714b1cd,399c0d17b2b9..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -2006,7 -2032,59 +2009,63 @@@ struct ib_mr *ib_alloc_mr(struct ib_pd 
+  
+  	return mr;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(ib_alloc_mr);
+++=======
++ EXPORT_SYMBOL(ib_alloc_mr_user);
++ 
++ /**
++  * ib_alloc_mr_integrity() - Allocates an integrity memory region
++  * @pd:                      protection domain associated with the region
++  * @max_num_data_sg:         maximum data sg entries available for registration
++  * @max_num_meta_sg:         maximum metadata sg entries available for
++  *                           registration
++  *
++  * Notes:
++  * Memory registration page/sg lists must not exceed max_num_sg,
++  * also the integrity page/sg lists must not exceed max_num_meta_sg.
++  *
++  */
++ struct ib_mr *ib_alloc_mr_integrity(struct ib_pd *pd,
++ 				    u32 max_num_data_sg,
++ 				    u32 max_num_meta_sg)
++ {
++ 	struct ib_mr *mr;
++ 	struct ib_sig_attrs *sig_attrs;
++ 
++ 	if (!pd->device->ops.alloc_mr_integrity ||
++ 	    !pd->device->ops.map_mr_sg_pi)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (!max_num_meta_sg)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	sig_attrs = kzalloc(sizeof(struct ib_sig_attrs), GFP_KERNEL);
++ 	if (!sig_attrs)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	mr = pd->device->ops.alloc_mr_integrity(pd, max_num_data_sg,
++ 						max_num_meta_sg);
++ 	if (IS_ERR(mr)) {
++ 		kfree(sig_attrs);
++ 		return mr;
++ 	}
++ 
++ 	mr->device = pd->device;
++ 	mr->pd = pd;
++ 	mr->dm = NULL;
++ 	mr->uobject = NULL;
++ 	atomic_inc(&pd->usecnt);
++ 	mr->need_inval = false;
++ 	mr->res.type = RDMA_RESTRACK_MR;
++ 	rdma_restrack_kadd(&mr->res);
++ 	mr->type = IB_MR_TYPE_INTEGRITY;
++ 	mr->sig_attrs = sig_attrs;
++ 
++ 	return mr;
++ }
++ EXPORT_SYMBOL(ib_alloc_mr_integrity);
+++>>>>>>> 7c717d3aeeaa (RDMA/core: Add signature attrs element for ib_mr structure)
+  
+  /* "Fast" memory regions */
+  
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index df9074b482a9..54156f981911 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -736,6 +736,7 @@ static int ib_uverbs_reg_mr(struct uverbs_attr_bundle *attrs)
+ 	mr->pd      = pd;
+ 	mr->type    = IB_MR_TYPE_USER;
+ 	mr->dm	    = NULL;
++	mr->sig_attrs = NULL;
+ 	mr->uobject = uobj;
+ 	atomic_inc(&pd->usecnt);
+ 	mr->res.type = RDMA_RESTRACK_MR;
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index c2e75b869e71..5550e27efd42 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1705,7 +1705,7 @@ struct ib_mr {
+ 	};
+ 
+ 	struct ib_dm      *dm;
+-
++	struct ib_sig_attrs *sig_attrs; /* only for IB_MR_TYPE_INTEGRITY MRs */
+ 	/*
+ 	 * Implementation details of the RDMA core, don't use in drivers:
+ 	 */
+diff --git a/include/rdma/signature.h b/include/rdma/signature.h
+index 5998fe94dfd4..f24cc2a1d3c5 100644
+--- a/include/rdma/signature.h
++++ b/include/rdma/signature.h
+@@ -80,11 +80,13 @@ struct ib_sig_domain {
+  * @check_mask: bitmask for signature byte check (8 bytes)
+  * @mem: memory domain layout descriptor.
+  * @wire: wire domain layout descriptor.
++ * @meta_length: metadata length
+  */
+ struct ib_sig_attrs {
+ 	u8			check_mask;
+ 	struct ib_sig_domain	mem;
+ 	struct ib_sig_domain	wire;
++	int			meta_length;
+ };
+ 
+ enum ib_sig_err_type {
