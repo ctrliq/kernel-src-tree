@@ -1,0 +1,340 @@
+dm integrity: remove sector type casts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 7649194a1636ab5876e7c18337d7ddd63e1d4376
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7649194a.failed
+
+Since the commit 72deb455b5ec619ff043c30bc90025aa3de3cdda ("block:
+remove CONFIG_LBDAF") sector_t is always defined as unsigned long
+long.
+
+Delete the needless type casts in printk and avoids some warnings if
+DEBUG_PRINT is defined.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 7649194a1636ab5876e7c18337d7ddd63e1d4376)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-integrity.c
+diff --cc drivers/md/dm-integrity.c
+index 2d94f9c6f7ab,8ce69355b8dc..000000000000
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@@ -447,6 -494,140 +447,140 @@@ static int sync_rw_sb(struct dm_integri
+  	return dm_io(&io_req, 1, &io_loc, NULL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define BITMAP_OP_TEST_ALL_SET		0
++ #define BITMAP_OP_TEST_ALL_CLEAR	1
++ #define BITMAP_OP_SET			2
++ #define BITMAP_OP_CLEAR			3
++ 
++ static bool block_bitmap_op(struct dm_integrity_c *ic, struct page_list *bitmap,
++ 			    sector_t sector, sector_t n_sectors, int mode)
++ {
++ 	unsigned long bit, end_bit, this_end_bit, page, end_page;
++ 	unsigned long *data;
++ 
++ 	if (unlikely(((sector | n_sectors) & ((1 << ic->sb->log2_sectors_per_block) - 1)) != 0)) {
++ 		DMCRIT("invalid bitmap access (%llx,%llx,%d,%d,%d)",
++ 			sector,
++ 			n_sectors,
++ 			ic->sb->log2_sectors_per_block,
++ 			ic->log2_blocks_per_bitmap_bit,
++ 			mode);
++ 		BUG();
++ 	}
++ 
++ 	if (unlikely(!n_sectors))
++ 		return true;
++ 
++ 	bit = sector >> (ic->sb->log2_sectors_per_block + ic->log2_blocks_per_bitmap_bit);
++ 	end_bit = (sector + n_sectors - 1) >>
++ 		(ic->sb->log2_sectors_per_block + ic->log2_blocks_per_bitmap_bit);
++ 
++ 	page = bit / (PAGE_SIZE * 8);
++ 	bit %= PAGE_SIZE * 8;
++ 
++ 	end_page = end_bit / (PAGE_SIZE * 8);
++ 	end_bit %= PAGE_SIZE * 8;
++ 
++ repeat:
++ 	if (page < end_page) {
++ 		this_end_bit = PAGE_SIZE * 8 - 1;
++ 	} else {
++ 		this_end_bit = end_bit;
++ 	}
++ 
++ 	data = lowmem_page_address(bitmap[page].page);
++ 
++ 	if (mode == BITMAP_OP_TEST_ALL_SET) {
++ 		while (bit <= this_end_bit) {
++ 			if (!(bit % BITS_PER_LONG) && this_end_bit >= bit + BITS_PER_LONG - 1) {
++ 				do {
++ 					if (data[bit / BITS_PER_LONG] != -1)
++ 						return false;
++ 					bit += BITS_PER_LONG;
++ 				} while (this_end_bit >= bit + BITS_PER_LONG - 1);
++ 				continue;
++ 			}
++ 			if (!test_bit(bit, data))
++ 				return false;
++ 			bit++;
++ 		}
++ 	} else if (mode == BITMAP_OP_TEST_ALL_CLEAR) {
++ 		while (bit <= this_end_bit) {
++ 			if (!(bit % BITS_PER_LONG) && this_end_bit >= bit + BITS_PER_LONG - 1) {
++ 				do {
++ 					if (data[bit / BITS_PER_LONG] != 0)
++ 						return false;
++ 					bit += BITS_PER_LONG;
++ 				} while (this_end_bit >= bit + BITS_PER_LONG - 1);
++ 				continue;
++ 			}
++ 			if (test_bit(bit, data))
++ 				return false;
++ 			bit++;
++ 		}
++ 	} else if (mode == BITMAP_OP_SET) {
++ 		while (bit <= this_end_bit) {
++ 			if (!(bit % BITS_PER_LONG) && this_end_bit >= bit + BITS_PER_LONG - 1) {
++ 				do {
++ 					data[bit / BITS_PER_LONG] = -1;
++ 					bit += BITS_PER_LONG;
++ 				} while (this_end_bit >= bit + BITS_PER_LONG - 1);
++ 				continue;
++ 			}
++ 			__set_bit(bit, data);
++ 			bit++;
++ 		}
++ 	} else if (mode == BITMAP_OP_CLEAR) {
++ 		if (!bit && this_end_bit == PAGE_SIZE * 8 - 1)
++ 			clear_page(data);
++ 		else while (bit <= this_end_bit) {
++ 			if (!(bit % BITS_PER_LONG) && this_end_bit >= bit + BITS_PER_LONG - 1) {
++ 				do {
++ 					data[bit / BITS_PER_LONG] = 0;
++ 					bit += BITS_PER_LONG;
++ 				} while (this_end_bit >= bit + BITS_PER_LONG - 1);
++ 				continue;
++ 			}
++ 			__clear_bit(bit, data);
++ 			bit++;
++ 		}
++ 	} else {
++ 		BUG();
++ 	}
++ 
++ 	if (unlikely(page < end_page)) {
++ 		bit = 0;
++ 		page++;
++ 		goto repeat;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static void block_bitmap_copy(struct dm_integrity_c *ic, struct page_list *dst, struct page_list *src)
++ {
++ 	unsigned n_bitmap_pages = DIV_ROUND_UP(ic->n_bitmap_blocks, PAGE_SIZE / BITMAP_BLOCK_SIZE);
++ 	unsigned i;
++ 
++ 	for (i = 0; i < n_bitmap_pages; i++) {
++ 		unsigned long *dst_data = lowmem_page_address(dst[i].page);
++ 		unsigned long *src_data = lowmem_page_address(src[i].page);
++ 		copy_page(dst_data, src_data);
++ 	}
++ }
++ 
++ static struct bitmap_block_status *sector_to_bitmap_block(struct dm_integrity_c *ic, sector_t sector)
++ {
++ 	unsigned bit = sector >> (ic->sb->log2_sectors_per_block + ic->log2_blocks_per_bitmap_bit);
++ 	unsigned bitmap_block = bit / (BITMAP_BLOCK_SIZE * 8);
++ 
++ 	BUG_ON(bitmap_block >= ic->n_bitmap_blocks);
++ 	return &ic->bbs[bitmap_block];
++ }
++ 
+++>>>>>>> 7649194a1636 (dm integrity: remove sector type casts)
+  static void access_journal_check(struct dm_integrity_c *ic, unsigned section, unsigned offset,
+  				 bool e, const char *function)
+  {
+@@@ -2142,12 -2380,32 +2276,37 @@@ next_chunk
+  	get_area_and_offset(ic, range.logical_sector, &area, &offset);
+  	range.n_sectors = min((sector_t)RECALC_SECTORS, ic->provided_data_sectors - range.logical_sector);
+  	if (!ic->meta_dev)
+ -		range.n_sectors = min(range.n_sectors, ((sector_t)1U << ic->sb->log2_interleave_sectors) - (unsigned)offset);
+ +		range.n_sectors = min(range.n_sectors, (1U << ic->sb->log2_interleave_sectors) - (unsigned)offset);
+ +
+ +	if (unlikely(!add_new_range(ic, &range, true)))
+ +		wait_and_add_new_range(ic, &range);
+  
+ -	add_new_range_and_wait(ic, &range);
+  	spin_unlock_irq(&ic->endio_wait.lock);
+++<<<<<<< HEAD
+++=======
++ 	logical_sector = range.logical_sector;
++ 	n_sectors = range.n_sectors;
++ 
++ 	if (ic->mode == 'B') {
++ 		if (block_bitmap_op(ic, ic->recalc_bitmap, logical_sector, n_sectors, BITMAP_OP_TEST_ALL_CLEAR)) {
++ 			goto advance_and_next;
++ 		}
++ 		while (block_bitmap_op(ic, ic->recalc_bitmap, logical_sector,
++ 				       ic->sectors_per_block, BITMAP_OP_TEST_ALL_CLEAR)) {
++ 			logical_sector += ic->sectors_per_block;
++ 			n_sectors -= ic->sectors_per_block;
++ 			cond_resched();
++ 		}
++ 		while (block_bitmap_op(ic, ic->recalc_bitmap, logical_sector + n_sectors - ic->sectors_per_block,
++ 				       ic->sectors_per_block, BITMAP_OP_TEST_ALL_CLEAR)) {
++ 			n_sectors -= ic->sectors_per_block;
++ 			cond_resched();
++ 		}
++ 		get_area_and_offset(ic, logical_sector, &area, &offset);
++ 	}
++ 
++ 	DEBUG_print("recalculating: %llx, %llx\n", logical_sector, n_sectors);
+++>>>>>>> 7649194a1636 (dm integrity: remove sector type casts)
+  
+  	if (unlikely(++super_counter == RECALC_WRITE_SUPER)) {
+  		recalc_write_super(ic);
+@@@ -2429,11 -2829,77 +2588,15 @@@ static void dm_integrity_postsuspend(st
+  static void dm_integrity_resume(struct dm_target *ti)
+  {
+  	struct dm_integrity_c *ic = (struct dm_integrity_c *)ti->private;
+ -	int r;
+ -	DEBUG_print("resume\n");
+  
+ -	if (ic->sb->flags & cpu_to_le32(SB_FLAG_DIRTY_BITMAP)) {
+ -		DEBUG_print("resume dirty_bitmap\n");
+ -		rw_journal_sectors(ic, REQ_OP_READ, 0, 0,
+ -				   ic->n_bitmap_blocks * (BITMAP_BLOCK_SIZE >> SECTOR_SHIFT), NULL);
+ -		if (ic->mode == 'B') {
+ -			if (ic->sb->log2_blocks_per_bitmap_bit == ic->log2_blocks_per_bitmap_bit) {
+ -				block_bitmap_copy(ic, ic->recalc_bitmap, ic->journal);
+ -				block_bitmap_copy(ic, ic->may_write_bitmap, ic->journal);
+ -				if (!block_bitmap_op(ic, ic->journal, 0, ic->provided_data_sectors,
+ -						     BITMAP_OP_TEST_ALL_CLEAR)) {
+ -					ic->sb->flags |= cpu_to_le32(SB_FLAG_RECALCULATING);
+ -					ic->sb->recalc_sector = cpu_to_le64(0);
+ -				}
+ -			} else {
+ -				DEBUG_print("non-matching blocks_per_bitmap_bit: %u, %u\n",
+ -					    ic->sb->log2_blocks_per_bitmap_bit, ic->log2_blocks_per_bitmap_bit);
+ -				ic->sb->log2_blocks_per_bitmap_bit = ic->log2_blocks_per_bitmap_bit;
+ -				block_bitmap_op(ic, ic->recalc_bitmap, 0, ic->provided_data_sectors, BITMAP_OP_SET);
+ -				block_bitmap_op(ic, ic->may_write_bitmap, 0, ic->provided_data_sectors, BITMAP_OP_SET);
+ -				block_bitmap_op(ic, ic->journal, 0, ic->provided_data_sectors, BITMAP_OP_SET);
+ -				rw_journal_sectors(ic, REQ_OP_WRITE, REQ_FUA | REQ_SYNC, 0,
+ -						   ic->n_bitmap_blocks * (BITMAP_BLOCK_SIZE >> SECTOR_SHIFT), NULL);
+ -				ic->sb->flags |= cpu_to_le32(SB_FLAG_RECALCULATING);
+ -				ic->sb->recalc_sector = cpu_to_le64(0);
+ -			}
+ -		} else {
+ -			if (!(ic->sb->log2_blocks_per_bitmap_bit == ic->log2_blocks_per_bitmap_bit &&
+ -			      block_bitmap_op(ic, ic->journal, 0, ic->provided_data_sectors, BITMAP_OP_TEST_ALL_CLEAR))) {
+ -				ic->sb->flags |= cpu_to_le32(SB_FLAG_RECALCULATING);
+ -				ic->sb->recalc_sector = cpu_to_le64(0);
+ -			}
+ -			init_journal(ic, 0, ic->journal_sections, 0);
+ -			replay_journal(ic);
+ -			ic->sb->flags &= ~cpu_to_le32(SB_FLAG_DIRTY_BITMAP);
+ -		}
+ -		r = sync_rw_sb(ic, REQ_OP_WRITE, REQ_FUA);
+ -		if (unlikely(r))
+ -			dm_integrity_io_error(ic, "writing superblock", r);
+ -	} else {
+ -		replay_journal(ic);
+ -		if (ic->mode == 'B') {
+ -			ic->sb->flags |= cpu_to_le32(SB_FLAG_DIRTY_BITMAP);
+ -			ic->sb->log2_blocks_per_bitmap_bit = ic->log2_blocks_per_bitmap_bit;
+ -			r = sync_rw_sb(ic, REQ_OP_WRITE, REQ_FUA);
+ -			if (unlikely(r))
+ -				dm_integrity_io_error(ic, "writing superblock", r);
+ -
+ -			block_bitmap_op(ic, ic->journal, 0, ic->provided_data_sectors, BITMAP_OP_CLEAR);
+ -			block_bitmap_op(ic, ic->recalc_bitmap, 0, ic->provided_data_sectors, BITMAP_OP_CLEAR);
+ -			block_bitmap_op(ic, ic->may_write_bitmap, 0, ic->provided_data_sectors, BITMAP_OP_CLEAR);
+ -			if (ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING) &&
+ -			    le64_to_cpu(ic->sb->recalc_sector) < ic->provided_data_sectors) {
+ -				block_bitmap_op(ic, ic->journal, le64_to_cpu(ic->sb->recalc_sector),
+ -						ic->provided_data_sectors - le64_to_cpu(ic->sb->recalc_sector), BITMAP_OP_SET);
+ -				block_bitmap_op(ic, ic->recalc_bitmap, le64_to_cpu(ic->sb->recalc_sector),
+ -						ic->provided_data_sectors - le64_to_cpu(ic->sb->recalc_sector), BITMAP_OP_SET);
+ -				block_bitmap_op(ic, ic->may_write_bitmap, le64_to_cpu(ic->sb->recalc_sector),
+ -						ic->provided_data_sectors - le64_to_cpu(ic->sb->recalc_sector), BITMAP_OP_SET);
+ -			}
+ -			rw_journal_sectors(ic, REQ_OP_WRITE, REQ_FUA | REQ_SYNC, 0,
+ -					   ic->n_bitmap_blocks * (BITMAP_BLOCK_SIZE >> SECTOR_SHIFT), NULL);
+ -		}
+ -	}
+ +	replay_journal(ic);
+  
+ -	DEBUG_print("testing recalc: %x\n", ic->sb->flags);
+ -	if (ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING)) {
+ +	if (ic->recalc_wq && ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING)) {
+  		__u64 recalc_pos = le64_to_cpu(ic->sb->recalc_sector);
+++<<<<<<< HEAD
+++=======
++ 		DEBUG_print("recalc pos: %llx / %llx\n", recalc_pos, ic->provided_data_sectors);
+++>>>>>>> 7649194a1636 (dm integrity: remove sector type casts)
+  		if (recalc_pos < ic->provided_data_sectors) {
+  			queue_work(ic->recalc_wq, &ic->recalc_work);
+  		} else if (recalc_pos > ic->provided_data_sectors) {
+@@@ -2474,7 -2950,10 +2637,12 @@@ static void dm_integrity_status(struct 
+  		arg_count += !!ic->internal_hash_alg.alg_string;
+  		arg_count += !!ic->journal_crypt_alg.alg_string;
+  		arg_count += !!ic->journal_mac_alg.alg_string;
+++<<<<<<< HEAD
+ +		DMEMIT("%s %llu %u %c %u", ic->dev->name, (unsigned long long)ic->start,
+++=======
++ 		arg_count += (ic->sb->flags & cpu_to_le32(SB_FLAG_FIXED_PADDING)) != 0;
++ 		DMEMIT("%s %llu %u %c %u", ic->dev->name, ic->start,
+++>>>>>>> 7649194a1636 (dm integrity: remove sector type casts)
+  		       ic->tag_size, ic->mode, arg_count);
+  		if (ic->meta_dev)
+  			DMEMIT(" meta_device:%s", ic->meta_dev->name);
+@@@ -2489,6 -2968,12 +2657,15 @@@
+  			DMEMIT(" journal_watermark:%u", (unsigned)watermark_percentage);
+  			DMEMIT(" commit_time:%u", ic->autocommit_msec);
+  		}
+++<<<<<<< HEAD
+++=======
++ 		if (ic->mode == 'B') {
++ 			DMEMIT(" sectors_per_bit:%llu", (sector_t)ic->sectors_per_block << ic->log2_blocks_per_bitmap_bit);
++ 			DMEMIT(" bitmap_flush_interval:%u", jiffies_to_msecs(ic->bitmap_flush_interval));
++ 		}
++ 		if ((ic->sb->flags & cpu_to_le32(SB_FLAG_FIXED_PADDING)) != 0)
++ 			DMEMIT(" fix_padding");
+++>>>>>>> 7649194a1636 (dm integrity: remove sector type casts)
+  
+  #define EMIT_ALG(a, n)							\
+  		do {							\
+@@@ -3446,11 -3995,11 +3623,14 @@@ try_smaller_buffer
+  	DEBUG_print("	initial_sectors 0x%x\n", ic->initial_sectors);
+  	DEBUG_print("	metadata_run 0x%x\n", ic->metadata_run);
+  	DEBUG_print("	log2_metadata_run %d\n", ic->log2_metadata_run);
+- 	DEBUG_print("	provided_data_sectors 0x%llx (%llu)\n", (unsigned long long)ic->provided_data_sectors,
+- 		    (unsigned long long)ic->provided_data_sectors);
++ 	DEBUG_print("	provided_data_sectors 0x%llx (%llu)\n", ic->provided_data_sectors, ic->provided_data_sectors);
+  	DEBUG_print("	log2_buffer_sectors %u\n", ic->log2_buffer_sectors);
+++<<<<<<< HEAD
+++=======
++ 	DEBUG_print("	bits_in_journal %llu\n", bits_in_journal);
+++>>>>>>> 7649194a1636 (dm integrity: remove sector type casts)
+  
+ -	if (ic->recalculate_flag && !(ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING))) {
+ +	if (recalculate && !(ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING))) {
+  		ic->sb->flags |= cpu_to_le32(SB_FLAG_RECALCULATING);
+  		ic->sb->recalc_sector = cpu_to_le64(0);
+  	}
+* Unmerged path drivers/md/dm-integrity.c
