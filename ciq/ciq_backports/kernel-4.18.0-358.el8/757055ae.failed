@@ -1,0 +1,183 @@
+init/console: Use ttynull as a fallback when there is no console
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Petr Mladek <pmladek@suse.com>
+commit 757055ae8dedf5333af17b3b5b4b70ba9bc9da4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/757055ae.failed
+
+stdin, stdout, and stderr standard I/O stream are created for the init
+process. They are not available when there is no console registered
+for /dev/console. It might lead to a crash when the init process
+tries to use them, see the commit 48021f98130880dd742 ("printk: handle
+blank console arguments passed in.").
+
+Normally, ttySX and ttyX consoles are used as a fallback when no consoles
+are defined via the command line, device tree, or SPCR. But there
+will be no console registered when an invalid console name is configured
+or when the configured consoles do not exist on the system.
+
+Users even try to avoid the console intentionally, for example,
+by using console="" or console=null. It is used on production
+systems where the serial port or terminal are not visible to
+users. Pushing messages to these consoles would just unnecessary
+slowdown the system.
+
+Make sure that stdin, stdout, stderr, and /dev/console are always
+available by a fallback to the existing ttynull driver. It has
+been implemented for exactly this purpose but it was used only
+when explicitly configured.
+
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Guenter Roeck <linux@roeck-us.net>
+	Tested-by: Guenter Roeck <linux@roeck-us.net>
+	Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20201111135450.11214-2-pmladek@suse.com
+(cherry picked from commit 757055ae8dedf5333af17b3b5b4b70ba9bc9da4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/Kconfig
+diff --cc drivers/tty/Kconfig
+index c6847ba27049,ca359bbd62f5..000000000000
+--- a/drivers/tty/Kconfig
++++ b/drivers/tty/Kconfig
+@@@ -450,6 -428,36 +450,39 @@@ config MIPS_EJTAG_FDC_KGDB_CHA
+  	help
+  	  FDC channel number to use for KGDB.
+  
+++<<<<<<< HEAD
+++=======
++ config TRACE_ROUTER
++ 	tristate "Trace data router for MIPI P1149.7 cJTAG standard"
++ 	depends on TRACE_SINK
++ 	help
++ 	  The trace router uses the Linux tty line discipline framework to
++ 	  route trace data coming from a tty port (say UART for example) to
++ 	  the trace sink line discipline driver and to another tty port (say
++ 	  USB). This is part of a solution for the MIPI P1149.7, compact JTAG,
++ 	  standard, which is for debugging mobile devices. The PTI driver in
++ 	  drivers/misc/pti.c defines the majority of this MIPI solution.
++ 
++ 	  You should select this driver if the target kernel is meant for
++ 	  a mobile device containing a modem.  Then you will need to select
++ 	  "Trace data sink for MIPI P1149.7 cJTAG standard" line discipline
++ 	  driver.
++ 
++ config TRACE_SINK
++ 	tristate "Trace data sink for MIPI P1149.7 cJTAG standard"
++ 	help
++ 	  The trace sink uses the Linux line discipline framework to receive
++ 	  trace data coming from the trace router line discipline driver
++ 	  to a user-defined tty port target, like USB.
++ 	  This is to provide a way to extract modem trace data on
++ 	  devices that do not have a PTI HW module, or just need modem
++ 	  trace data to come out of a different HW output port.
++ 	  This is part of a solution for the P1149.7, compact JTAG, standard.
++ 
++ 	  If you select this option, you need to select
++ 	  "Trace data router for MIPI P1149.7 cJTAG standard".
++ 
+++>>>>>>> 757055ae8ded (init/console: Use ttynull as a fallback when there is no console)
+  config VCC
+  	tristate "Sun Virtual Console Concentrator"
+  	depends on SUN_LDOMS
+* Unmerged path drivers/tty/Kconfig
+diff --git a/drivers/tty/Makefile b/drivers/tty/Makefile
+index 020b1cd9294f..f6b6bee0422d 100644
+--- a/drivers/tty/Makefile
++++ b/drivers/tty/Makefile
+@@ -2,7 +2,7 @@
+ obj-$(CONFIG_TTY)		+= tty_io.o n_tty.o tty_ioctl.o tty_ldisc.o \
+ 				   tty_buffer.o tty_port.o tty_mutex.o \
+ 				   tty_ldsem.o tty_baudrate.o tty_jobctrl.o \
+-				   n_null.o
++				   n_null.o ttynull.o
+ obj-$(CONFIG_LEGACY_PTYS)	+= pty.o
+ obj-$(CONFIG_UNIX98_PTYS)	+= pty.o
+ obj-$(CONFIG_AUDIT)		+= tty_audit.o
+@@ -25,7 +25,6 @@ obj-$(CONFIG_ISI)		+= isicom.o
+ obj-$(CONFIG_MOXA_INTELLIO)	+= moxa.o
+ obj-$(CONFIG_MOXA_SMARTIO)	+= mxser.o
+ obj-$(CONFIG_NOZOMI)		+= nozomi.o
+-obj-$(CONFIG_NULL_TTY)	        += ttynull.o
+ obj-$(CONFIG_ROCKETPORT)	+= rocket.o
+ obj-$(CONFIG_SYNCLINK_GT)	+= synclink_gt.o
+ obj-$(CONFIG_SYNCLINKMP)	+= synclinkmp.o
+diff --git a/drivers/tty/ttynull.c b/drivers/tty/ttynull.c
+index 17f05b7eb6d3..eced70ec54e1 100644
+--- a/drivers/tty/ttynull.c
++++ b/drivers/tty/ttynull.c
+@@ -2,6 +2,13 @@
+ /*
+  * Copyright (C) 2019 Axis Communications AB
+  *
++ * The console is useful for userspace applications which expect a console
++ * device to work without modifications even when no console is available
++ * or desired.
++ *
++ * In order to use this driver, you should redirect the console to this
++ * TTY, or boot the kernel with console=ttynull.
++ *
+  * Based on ttyprintk.c:
+  *  Copyright (C) 2010 Samo Pogacnik
+  */
+@@ -59,6 +66,17 @@ static struct console ttynull_console = {
+ 	.device = ttynull_device,
+ };
+ 
++void __init register_ttynull_console(void)
++{
++	if (!ttynull_driver)
++		return;
++
++	if (add_preferred_console(ttynull_console.name, 0, NULL))
++		return;
++
++	register_console(&ttynull_console);
++}
++
+ static int __init ttynull_init(void)
+ {
+ 	struct tty_driver *driver;
+diff --git a/include/linux/console.h b/include/linux/console.h
+index 72141f71c014..f448171041e4 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -190,9 +190,12 @@ extern int braille_register_console(struct console *, int index,
+ extern int braille_unregister_console(struct console *);
+ #ifdef CONFIG_TTY
+ extern void console_sysfs_notify(void);
++extern void register_ttynull_console(void);
+ #else
+ static inline void console_sysfs_notify(void)
+ { }
++static inline void register_ttynull_console(void)
++{ }
+ #endif
+ extern bool console_suspend_enabled;
+ 
+diff --git a/init/main.c b/init/main.c
+index 4b5df336efd2..b361336cf010 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1125,8 +1125,14 @@ void console_on_rootfs(void)
+ 	struct file *file = filp_open("/dev/console", O_RDWR, 0);
+ 
+ 	if (IS_ERR(file)) {
+-		pr_err("Warning: unable to open an initial console.\n");
+-		return;
++		pr_err("Warning: unable to open an initial console. Fallback to ttynull.\n");
++		register_ttynull_console();
++
++		file = filp_open("/dev/console", O_RDWR, 0);
++		if (IS_ERR(file)) {
++			pr_err("Warning: Failed to add ttynull console. No stdin, stdout, and stderr for the init process!\n");
++			return;
++		}
+ 	}
+ 	get_file_rcu_many(file, 2);
+ 	fd_install(get_unused_fd_flags(0), file);
