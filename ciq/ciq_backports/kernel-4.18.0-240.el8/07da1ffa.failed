@@ -1,0 +1,254 @@
+KVM: arm64: Remove host_cpu_context member from vcpu structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 07da1ffaa1373f99331712faa67a00b5b807dfe8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/07da1ffa.failed
+
+For very long, we have kept this pointer back to the per-cpu
+host state, despite having working per-cpu accessors at EL2
+for some time now.
+
+Recent investigations have shown that this pointer is easy
+to abuse in preemptible context, which is a sure sign that
+it would better be gone. Not to mention that a per-cpu
+pointer is faster to access at all times.
+
+	Reported-by: Andrew Scull <ascull@google.com>
+	Acked-by: Mark Rutland <mark.rutland@arm.com
+	Reviewed-by: Andrew Scull <ascull@google.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 07da1ffaa1373f99331712faa67a00b5b807dfe8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/hyp/switch.c
+diff --cc arch/arm64/kvm/hyp/switch.c
+index 03e90f8448bf,1853c1788e0c..000000000000
+--- a/arch/arm64/kvm/hyp/switch.c
++++ b/arch/arm64/kvm/hyp/switch.c
+@@@ -489,6 -490,64 +489,67 @@@ static bool __hyp_text handle_tx2_tvm(s
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __hyp_text esr_is_ptrauth_trap(u32 esr)
++ {
++ 	u32 ec = ESR_ELx_EC(esr);
++ 
++ 	if (ec == ESR_ELx_EC_PAC)
++ 		return true;
++ 
++ 	if (ec != ESR_ELx_EC_SYS64)
++ 		return false;
++ 
++ 	switch (esr_sys64_to_sysreg(esr)) {
++ 	case SYS_APIAKEYLO_EL1:
++ 	case SYS_APIAKEYHI_EL1:
++ 	case SYS_APIBKEYLO_EL1:
++ 	case SYS_APIBKEYHI_EL1:
++ 	case SYS_APDAKEYLO_EL1:
++ 	case SYS_APDAKEYHI_EL1:
++ 	case SYS_APDBKEYLO_EL1:
++ 	case SYS_APDBKEYHI_EL1:
++ 	case SYS_APGAKEYLO_EL1:
++ 	case SYS_APGAKEYHI_EL1:
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ #define __ptrauth_save_key(regs, key)						\
++ ({										\
++ 	regs[key ## KEYLO_EL1] = read_sysreg_s(SYS_ ## key ## KEYLO_EL1);	\
++ 	regs[key ## KEYHI_EL1] = read_sysreg_s(SYS_ ## key ## KEYHI_EL1);	\
++ })
++ 
++ static bool __hyp_text __hyp_handle_ptrauth(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_cpu_context *ctxt;
++ 	u64 val;
++ 
++ 	if (!vcpu_has_ptrauth(vcpu) ||
++ 	    !esr_is_ptrauth_trap(kvm_vcpu_get_hsr(vcpu)))
++ 		return false;
++ 
++ 	ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
++ 	__ptrauth_save_key(ctxt->sys_regs, APIA);
++ 	__ptrauth_save_key(ctxt->sys_regs, APIB);
++ 	__ptrauth_save_key(ctxt->sys_regs, APDA);
++ 	__ptrauth_save_key(ctxt->sys_regs, APDB);
++ 	__ptrauth_save_key(ctxt->sys_regs, APGA);
++ 
++ 	vcpu_ptrauth_enable(vcpu);
++ 
++ 	val = read_sysreg(hcr_el2);
++ 	val |= (HCR_API | HCR_APK);
++ 	write_sysreg(val, hcr_el2);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 07da1ffaa137 (KVM: arm64: Remove host_cpu_context member from vcpu structure)
+  /*
+   * Return true when we were able to fixup the guest exit and should return to
+   * the guest, false when we should restore the host state and return to the
+@@@ -698,9 -795,20 +759,9 @@@ int __hyp_text __kvm_vcpu_run_nvhe(stru
+  	bool pmu_switch_needed;
+  	u64 exit_code;
+  
+ -	/*
+ -	 * Having IRQs masked via PMR when entering the guest means the GIC
+ -	 * will not signal the CPU of interrupts of lower priority, and the
+ -	 * only way to get out will be via guest exceptions.
+ -	 * Naturally, we want to avoid this.
+ -	 */
+ -	if (system_uses_irq_prio_masking()) {
+ -		gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
+ -		pmr_sync();
+ -	}
+ -
+  	vcpu = kern_hyp_va(vcpu);
+  
+- 	host_ctxt = kern_hyp_va(vcpu->arch.host_cpu_context);
++ 	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
+  	host_ctxt->__hyp_running_vcpu = vcpu;
+  	guest_ctxt = &vcpu->arch.ctxt;
+  
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 0862c7d8cb64..689e9f505c55 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -293,9 +293,6 @@ struct kvm_vcpu_arch {
+ 	struct kvm_guest_debug_arch vcpu_debug_state;
+ 	struct kvm_guest_debug_arch external_debug_state;
+ 
+-	/* Pointer to host CPU context */
+-	struct kvm_cpu_context *host_cpu_context;
+-
+ 	struct thread_info *host_thread_info;	/* hyp VA */
+ 	struct user_fpsimd_state *host_fpsimd_state;	/* hyp VA */
+ 
+diff --git a/arch/arm64/kvm/hyp/debug-sr.c b/arch/arm64/kvm/hyp/debug-sr.c
+index 444e7fd66c24..d825b78b3f10 100644
+--- a/arch/arm64/kvm/hyp/debug-sr.c
++++ b/arch/arm64/kvm/hyp/debug-sr.c
+@@ -196,7 +196,7 @@ void __hyp_text __debug_switch_to_guest(struct kvm_vcpu *vcpu)
+ 	if (!(vcpu->arch.flags & KVM_ARM64_DEBUG_DIRTY))
+ 		return;
+ 
+-	host_ctxt = kern_hyp_va(vcpu->arch.host_cpu_context);
++	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
+ 	guest_ctxt = &vcpu->arch.ctxt;
+ 	host_dbg = &vcpu->arch.host_debug_state.regs;
+ 	guest_dbg = kern_hyp_va(vcpu->arch.debug_ptr);
+@@ -218,7 +218,7 @@ void __hyp_text __debug_switch_to_host(struct kvm_vcpu *vcpu)
+ 	if (!(vcpu->arch.flags & KVM_ARM64_DEBUG_DIRTY))
+ 		return;
+ 
+-	host_ctxt = kern_hyp_va(vcpu->arch.host_cpu_context);
++	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
+ 	guest_ctxt = &vcpu->arch.ctxt;
+ 	host_dbg = &vcpu->arch.host_debug_state.regs;
+ 	guest_dbg = kern_hyp_va(vcpu->arch.debug_ptr);
+* Unmerged path arch/arm64/kvm/hyp/switch.c
+diff --git a/arch/arm64/kvm/hyp/sysreg-sr.c b/arch/arm64/kvm/hyp/sysreg-sr.c
+index a2ecf149e9c5..f0eb63fdf5d0 100644
+--- a/arch/arm64/kvm/hyp/sysreg-sr.c
++++ b/arch/arm64/kvm/hyp/sysreg-sr.c
+@@ -274,12 +274,13 @@ void __hyp_text __sysreg32_restore_state(struct kvm_vcpu *vcpu)
+  */
+ void kvm_vcpu_load_sysregs(struct kvm_vcpu *vcpu)
+ {
+-	struct kvm_cpu_context *host_ctxt = vcpu->arch.host_cpu_context;
+ 	struct kvm_cpu_context *guest_ctxt = &vcpu->arch.ctxt;
++	struct kvm_cpu_context *host_ctxt;
+ 
+ 	if (!has_vhe())
+ 		return;
+ 
++	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
+ 	__sysreg_save_user_state(host_ctxt);
+ 
+ 	/*
+@@ -310,12 +311,13 @@ void kvm_vcpu_load_sysregs(struct kvm_vcpu *vcpu)
+  */
+ void kvm_vcpu_put_sysregs(struct kvm_vcpu *vcpu)
+ {
+-	struct kvm_cpu_context *host_ctxt = vcpu->arch.host_cpu_context;
+ 	struct kvm_cpu_context *guest_ctxt = &vcpu->arch.ctxt;
++	struct kvm_cpu_context *host_ctxt;
+ 
+ 	if (!has_vhe())
+ 		return;
+ 
++	host_ctxt = &__hyp_this_cpu_ptr(kvm_host_data)->host_ctxt;
+ 	deactivate_traps_vhe_put();
+ 
+ 	__sysreg_save_el1_state(guest_ctxt);
+diff --git a/arch/arm64/kvm/pmu.c b/arch/arm64/kvm/pmu.c
+index e71d00bb5271..b5ae3a5d509e 100644
+--- a/arch/arm64/kvm/pmu.c
++++ b/arch/arm64/kvm/pmu.c
+@@ -163,15 +163,13 @@ static void kvm_vcpu_pmu_disable_el0(unsigned long events)
+  */
+ void kvm_vcpu_pmu_restore_guest(struct kvm_vcpu *vcpu)
+ {
+-	struct kvm_cpu_context *host_ctxt;
+ 	struct kvm_host_data *host;
+ 	u32 events_guest, events_host;
+ 
+ 	if (!has_vhe())
+ 		return;
+ 
+-	host_ctxt = vcpu->arch.host_cpu_context;
+-	host = container_of(host_ctxt, struct kvm_host_data, host_ctxt);
++	host = this_cpu_ptr(&kvm_host_data);
+ 	events_guest = host->pmu_events.events_guest;
+ 	events_host = host->pmu_events.events_host;
+ 
+@@ -184,15 +182,13 @@ void kvm_vcpu_pmu_restore_guest(struct kvm_vcpu *vcpu)
+  */
+ void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu)
+ {
+-	struct kvm_cpu_context *host_ctxt;
+ 	struct kvm_host_data *host;
+ 	u32 events_guest, events_host;
+ 
+ 	if (!has_vhe())
+ 		return;
+ 
+-	host_ctxt = vcpu->arch.host_cpu_context;
+-	host = container_of(host_ctxt, struct kvm_host_data, host_ctxt);
++	host = this_cpu_ptr(&kvm_host_data);
+ 	events_guest = host->pmu_events.events_guest;
+ 	events_host = host->pmu_events.events_host;
+ 
+diff --git a/virt/kvm/arm/arm.c b/virt/kvm/arm/arm.c
+index c7748896c963..89c575d319c4 100644
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@ -362,10 +362,8 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ {
+ 	int *last_ran;
+-	kvm_host_data_t *cpu_data;
+ 
+ 	last_ran = this_cpu_ptr(vcpu->kvm->arch.last_vcpu_ran);
+-	cpu_data = this_cpu_ptr(&kvm_host_data);
+ 
+ 	/*
+ 	 * We might get preempted before the vCPU actually runs, but
+@@ -377,7 +375,6 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	}
+ 
+ 	vcpu->cpu = cpu;
+-	vcpu->arch.host_cpu_context = &cpu_data->host_ctxt;
+ 
+ 	kvm_vgic_load(vcpu);
+ 	kvm_timer_vcpu_load(vcpu);
