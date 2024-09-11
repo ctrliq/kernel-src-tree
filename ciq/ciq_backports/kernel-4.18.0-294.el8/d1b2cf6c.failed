@@ -1,0 +1,488 @@
+mm: memcg/slab: uncharge during kmem_cache_free_bulk()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Bharata B Rao <bharata@linux.ibm.com>
+commit d1b2cf6cb84a9bd0de6f151512648dd1af82f80f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d1b2cf6c.failed
+
+Object cgroup charging is done for all the objects during allocation, but
+during freeing, uncharging ends up happening for only one object in the
+case of bulk allocation/freeing.
+
+Fix this by having a separate call to uncharge all the objects from
+kmem_cache_free_bulk() and by modifying memcg_slab_free_hook() to take
+care of bulk uncharging.
+
+Fixes: 964d4bd370d5 ("mm: memcg/slab: save obj_cgroup for non-root slab objects"
+	Signed-off-by: Bharata B Rao <bharata@linux.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: <stable@vger.kernel.org>
+Link: https://lkml.kernel.org/r/20201009060423.390479-1-bharata@linux.ibm.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d1b2cf6cb84a9bd0de6f151512648dd1af82f80f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.c
+#	mm/slab.h
+#	mm/slub.c
+diff --cc mm/slab.c
+index 30f99e328ad8,399a9d185b0f..000000000000
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@@ -3505,8 -3434,11 +3505,12 @@@ void ___cache_free(struct kmem_cache *c
+  	struct array_cache *ac = cpu_cache_get(cachep);
+  
+  	check_irq_off();
+ -	if (unlikely(slab_want_init_on_free(cachep)))
+ -		memset(objp, 0, cachep->object_size);
+  	kmemleak_free_recursive(objp, cachep->flags);
+  	objp = cache_free_debugcheck(cachep, objp, caller);
+++<<<<<<< HEAD
+++=======
++ 	memcg_slab_free_hook(cachep, &objp, 1);
+++>>>>>>> d1b2cf6cb84a (mm: memcg/slab: uncharge during kmem_cache_free_bulk())
+  
+  	/*
+  	 * Skip calling cache_free_alien() when the platform is not numa.
+diff --cc mm/slab.h
+index 45ad57de9d88,6dd4b702888a..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -210,224 -208,248 +210,269 @@@ int __kmem_cache_alloc_bulk(struct kmem
+  static inline int cache_vmstat_idx(struct kmem_cache *s)
+  {
+  	return (s->flags & SLAB_RECLAIM_ACCOUNT) ?
+ -		NR_SLAB_RECLAIMABLE_B : NR_SLAB_UNRECLAIMABLE_B;
+ +		NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE;
+  }
+  
+ -#ifdef CONFIG_SLUB_DEBUG
+ -#ifdef CONFIG_SLUB_DEBUG_ON
+ -DECLARE_STATIC_KEY_TRUE(slub_debug_enabled);
+ -#else
+ -DECLARE_STATIC_KEY_FALSE(slub_debug_enabled);
+ -#endif
+ -extern void print_tracking(struct kmem_cache *s, void *object);
+ -#else
+ -static inline void print_tracking(struct kmem_cache *s, void *object)
+ -{
+ -}
+ -#endif
+ +#ifdef CONFIG_MEMCG_KMEM
+ +
+ +/* List of all root caches. */
+ +extern struct list_head		slab_root_caches;
+ +#define root_caches_node	memcg_params.__root_caches_node
+  
+  /*
+ - * Returns true if any of the specified slub_debug flags is enabled for the
+ - * cache. Use only for flags parsed by setup_slub_debug() as it also enables
+ - * the static key.
+ + * Iterate over all memcg caches of the given root cache. The caller must hold
+ + * slab_mutex.
+   */
+ -static inline bool kmem_cache_debug_flags(struct kmem_cache *s, slab_flags_t flags)
+ -{
+ -#ifdef CONFIG_SLUB_DEBUG
+ -	VM_WARN_ON_ONCE(!(flags & SLAB_DEBUG_FLAGS));
+ -	if (static_branch_unlikely(&slub_debug_enabled))
+ -		return s->flags & flags;
+ -#endif
+ -	return false;
+ -}
+ +#define for_each_memcg_cache(iter, root) \
+ +	list_for_each_entry(iter, &(root)->memcg_params.children, \
+ +			    memcg_params.children_node)
+  
+ -#ifdef CONFIG_MEMCG_KMEM
+ -static inline struct obj_cgroup **page_obj_cgroups(struct page *page)
+ +static inline bool is_root_cache(struct kmem_cache *s)
+  {
+ -	/*
+ -	 * page->mem_cgroup and page->obj_cgroups are sharing the same
+ -	 * space. To distinguish between them in case we don't know for sure
+ -	 * that the page is a slab page (e.g. page_cgroup_ino()), let's
+ -	 * always set the lowest bit of obj_cgroups.
+ -	 */
+ -	return (struct obj_cgroup **)
+ -		((unsigned long)page->obj_cgroups & ~0x1UL);
+ +	return !s->memcg_params.root_cache;
+  }
+  
+ -static inline bool page_has_obj_cgroups(struct page *page)
+ +static inline bool slab_equal_or_root(struct kmem_cache *s,
+ +				      struct kmem_cache *p)
+  {
+ -	return ((unsigned long)page->obj_cgroups & 0x1UL);
+ +	return p == s || p == s->memcg_params.root_cache;
+  }
+  
+ -int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
+ -				 gfp_t gfp);
+ -
+ -static inline void memcg_free_page_obj_cgroups(struct page *page)
+ +/*
+ + * We use suffixes to the name in memcg because we can't have caches
+ + * created in the system with the same name. But when we print them
+ + * locally, better refer to them with the base name
+ + */
+ +static inline const char *cache_name(struct kmem_cache *s)
+  {
+ -	kfree(page_obj_cgroups(page));
+ -	page->obj_cgroups = NULL;
+ +	if (!is_root_cache(s))
+ +		s = s->memcg_params.root_cache;
+ +	return s->name;
+  }
+  
+ -static inline size_t obj_full_size(struct kmem_cache *s)
+ +static inline struct kmem_cache *memcg_root_cache(struct kmem_cache *s)
+  {
+ -	/*
+ -	 * For each accounted object there is an extra space which is used
+ -	 * to store obj_cgroup membership. Charge it too.
+ -	 */
+ -	return s->size + sizeof(struct obj_cgroup *);
+ +	if (is_root_cache(s))
+ +		return s;
+ +	return s->memcg_params.root_cache;
+  }
+  
+ -static inline struct obj_cgroup *memcg_slab_pre_alloc_hook(struct kmem_cache *s,
+ -							   size_t objects,
+ -							   gfp_t flags)
+ +/*
+ + * Expects a pointer to a slab page. Please note, that PageSlab() check
+ + * isn't sufficient, as it returns true also for tail compound slab pages,
+ + * which do not have slab_cache pointer set.
+ + * So this function assumes that the page can pass PageSlab() && !PageTail()
+ + * check.
+ + *
+ + * The kmem_cache can be reparented asynchronously. The caller must ensure
+ + * the memcg lifetime, e.g. by taking rcu_read_lock() or cgroup_mutex.
+ + */
+ +static inline struct mem_cgroup *memcg_from_slab_page(struct page *page)
+  {
+ -	struct obj_cgroup *objcg;
+ -
+ -	if (memcg_kmem_bypass())
+ -		return NULL;
+ -
+ -	objcg = get_obj_cgroup_from_current();
+ -	if (!objcg)
+ -		return NULL;
+ +	struct kmem_cache *s;
+  
+ -	if (obj_cgroup_charge(objcg, flags, objects * obj_full_size(s))) {
+ -		obj_cgroup_put(objcg);
+ -		return NULL;
+ -	}
+ +	s = READ_ONCE(page->slab_cache);
+ +	if (s && !is_root_cache(s))
+ +		return READ_ONCE(s->memcg_params.memcg);
+  
+ -	return objcg;
+ +	return NULL;
+  }
+  
+ -static inline void mod_objcg_state(struct obj_cgroup *objcg,
+ -				   struct pglist_data *pgdat,
+ -				   int idx, int nr)
+ +/*
+ + * Charge the slab page belonging to the non-root kmem_cache.
+ + * Can be called for non-root kmem_caches only.
+ + */
+ +static __always_inline int memcg_charge_slab(struct page *page,
+ +					     gfp_t gfp, int order,
+ +					     struct kmem_cache *s)
+  {
+ +	int nr_pages = 1 << order;
+  	struct mem_cgroup *memcg;
+  	struct lruvec *lruvec;
+ +	int ret;
+  
+  	rcu_read_lock();
+ -	memcg = obj_cgroup_memcg(objcg);
+ -	lruvec = mem_cgroup_lruvec(memcg, pgdat);
+ -	mod_memcg_lruvec_state(lruvec, idx, nr);
+ +	memcg = READ_ONCE(s->memcg_params.memcg);
+ +	while (memcg && !css_tryget_online(&memcg->css))
+ +		memcg = parent_mem_cgroup(memcg);
+  	rcu_read_unlock();
+ +
+ +	if (unlikely(!memcg || mem_cgroup_is_root(memcg))) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    nr_pages);
+ +		percpu_ref_get_many(&s->memcg_params.refcnt, nr_pages);
+ +		return 0;
+ +	}
+ +
+ +	ret = memcg_kmem_charge(memcg, gfp, nr_pages);
+ +	if (ret)
+ +		goto out;
+ +
+ +	lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ +	mod_lruvec_state(lruvec, cache_vmstat_idx(s), nr_pages);
+ +
+ +	/* transer try_charge() page references to kmem_cache */
+ +	percpu_ref_get_many(&s->memcg_params.refcnt, nr_pages);
+ +	css_put_many(&memcg->css, nr_pages);
+ +out:
+ +	css_put(&memcg->css);
+ +	return ret;
+  }
+  
+ -static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
+ -					      struct obj_cgroup *objcg,
+ -					      gfp_t flags, size_t size,
+ -					      void **p)
+ +/*
+ + * Uncharge a slab page belonging to a non-root kmem_cache.
+ + * Can be called for non-root kmem_caches only.
+ + */
+ +static __always_inline void memcg_uncharge_slab(struct page *page, int order,
+ +						struct kmem_cache *s)
+  {
+ -	struct page *page;
+ -	unsigned long off;
+ -	size_t i;
+ -
+ -	if (!objcg)
+ -		return;
+ +	int nr_pages = 1 << order;
+ +	struct mem_cgroup *memcg;
+ +	struct lruvec *lruvec;
+  
+ -	flags &= ~__GFP_ACCOUNT;
+ -	for (i = 0; i < size; i++) {
+ -		if (likely(p[i])) {
+ -			page = virt_to_head_page(p[i]);
+ -
+ -			if (!page_has_obj_cgroups(page) &&
+ -			    memcg_alloc_page_obj_cgroups(page, s, flags)) {
+ -				obj_cgroup_uncharge(objcg, obj_full_size(s));
+ -				continue;
+ -			}
+ -
+ -			off = obj_to_index(s, page, p[i]);
+ -			obj_cgroup_get(objcg);
+ -			page_obj_cgroups(page)[off] = objcg;
+ -			mod_objcg_state(objcg, page_pgdat(page),
+ -					cache_vmstat_idx(s), obj_full_size(s));
+ -		} else {
+ -			obj_cgroup_uncharge(objcg, obj_full_size(s));
+ -		}
+ +	rcu_read_lock();
+ +	memcg = READ_ONCE(s->memcg_params.memcg);
+ +	if (likely(!mem_cgroup_is_root(memcg))) {
+ +		lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ +		mod_lruvec_state(lruvec, cache_vmstat_idx(s), -nr_pages);
+ +		memcg_kmem_uncharge(memcg, nr_pages);
+ +	} else {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    -nr_pages);
+  	}
+ -	obj_cgroup_put(objcg);
+ +	rcu_read_unlock();
+ +
+ +	percpu_ref_put_many(&s->memcg_params.refcnt, nr_pages);
+  }
+  
+++<<<<<<< HEAD
+ +extern void slab_init_memcg_params(struct kmem_cache *);
+ +extern void memcg_link_cache(struct kmem_cache *s, struct mem_cgroup *memcg);
+++=======
++ static inline void memcg_slab_free_hook(struct kmem_cache *s_orig,
++ 					void **p, int objects)
++ {
++ 	struct kmem_cache *s;
++ 	struct obj_cgroup *objcg;
++ 	struct page *page;
++ 	unsigned int off;
++ 	int i;
++ 
++ 	if (!memcg_kmem_enabled())
++ 		return;
++ 
++ 	for (i = 0; i < objects; i++) {
++ 		if (unlikely(!p[i]))
++ 			continue;
++ 
++ 		page = virt_to_head_page(p[i]);
++ 		if (!page_has_obj_cgroups(page))
++ 			continue;
++ 
++ 		if (!s_orig)
++ 			s = page->slab_cache;
++ 		else
++ 			s = s_orig;
++ 
++ 		off = obj_to_index(s, page, p[i]);
++ 		objcg = page_obj_cgroups(page)[off];
++ 		if (!objcg)
++ 			continue;
++ 
++ 		page_obj_cgroups(page)[off] = NULL;
++ 		obj_cgroup_uncharge(objcg, obj_full_size(s));
++ 		mod_objcg_state(objcg, page_pgdat(page), cache_vmstat_idx(s),
++ 				-obj_full_size(s));
++ 		obj_cgroup_put(objcg);
++ 	}
++ }
+++>>>>>>> d1b2cf6cb84a (mm: memcg/slab: uncharge during kmem_cache_free_bulk())
+  
+  #else /* CONFIG_MEMCG_KMEM */
+ -static inline bool page_has_obj_cgroups(struct page *page)
+ +
+ +/* If !memcg, all caches are root. */
+ +#define slab_root_caches	slab_caches
+ +#define root_caches_node	list
+ +
+ +#define for_each_memcg_cache(iter, root) \
+ +	for ((void)(iter), (void)(root); 0; )
+ +
+ +static inline bool is_root_cache(struct kmem_cache *s)
+  {
+ -	return false;
+ +	return true;
+  }
+  
+ -static inline struct mem_cgroup *memcg_from_slab_obj(void *ptr)
+ +static inline bool slab_equal_or_root(struct kmem_cache *s,
+ +				      struct kmem_cache *p)
+  {
+ -	return NULL;
+ +	return s == p;
+  }
+  
+ -static inline int memcg_alloc_page_obj_cgroups(struct page *page,
+ -					       struct kmem_cache *s, gfp_t gfp)
+ +static inline const char *cache_name(struct kmem_cache *s)
+  {
+ -	return 0;
+ +	return s->name;
+  }
+  
+ -static inline void memcg_free_page_obj_cgroups(struct page *page)
+ +static inline struct kmem_cache *memcg_root_cache(struct kmem_cache *s)
+  {
+ +	return s;
+  }
+  
+ -static inline struct obj_cgroup *memcg_slab_pre_alloc_hook(struct kmem_cache *s,
+ -							   size_t objects,
+ -							   gfp_t flags)
+ +static inline struct mem_cgroup *memcg_from_slab_page(struct page *page)
+  {
+  	return NULL;
+  }
+  
+ -static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
+ -					      struct obj_cgroup *objcg,
+ -					      gfp_t flags, size_t size,
+ -					      void **p)
+ +static inline int memcg_charge_slab(struct page *page, gfp_t gfp, int order,
+ +				    struct kmem_cache *s)
+  {
+ +	return 0;
+  }
+  
+ -static inline void memcg_slab_free_hook(struct kmem_cache *s,
+ -					void **p, int objects)
+ +static inline void memcg_uncharge_slab(struct page *page, int order,
+ +				       struct kmem_cache *s)
+  {
+  }
+ -#endif /* CONFIG_MEMCG_KMEM */
+  
+ -static inline struct kmem_cache *virt_to_cache(const void *obj)
+ +static inline void slab_init_memcg_params(struct kmem_cache *s)
+  {
+ -	struct page *page;
+ +}
+  
+ -	page = virt_to_head_page(obj);
+ -	if (WARN_ONCE(!PageSlab(page), "%s: Object is not a Slab page!\n",
+ -					__func__))
+ -		return NULL;
+ -	return page->slab_cache;
+++<<<<<<< HEAD
+ +static inline void memcg_link_cache(struct kmem_cache *s,
+ +				    struct mem_cgroup *memcg)
+++=======
+++static inline void memcg_slab_free_hook(struct kmem_cache *s,
+++					void **p, int objects)
+++>>>>>>> d1b2cf6cb84a (mm: memcg/slab: uncharge during kmem_cache_free_bulk())
+ +{
+  }
+  
+ -static __always_inline void account_slab_page(struct page *page, int order,
+ -					      struct kmem_cache *s)
+ +#endif /* CONFIG_MEMCG_KMEM */
+ +
+ +static __always_inline int charge_slab_page(struct page *page,
+ +					    gfp_t gfp, int order,
+ +					    struct kmem_cache *s)
+  {
+ -	mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ -			    PAGE_SIZE << order);
+ +	if (is_root_cache(s)) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    1 << order);
+ +		return 0;
+ +	}
+ +
+ +	return memcg_charge_slab(page, gfp, order, s);
+  }
+  
+ -static __always_inline void unaccount_slab_page(struct page *page, int order,
+ -						struct kmem_cache *s)
+ +static __always_inline void uncharge_slab_page(struct page *page, int order,
+ +					       struct kmem_cache *s)
+  {
+ -	if (memcg_kmem_enabled())
+ -		memcg_free_page_obj_cgroups(page);
+ +	if (is_root_cache(s)) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    -(1 << order));
+ +		return;
+ +	}
+  
+ -	mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ -			    -(PAGE_SIZE << order));
+ +	memcg_uncharge_slab(page, order, s);
+  }
+  
+  static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
+diff --cc mm/slub.c
+index 42c9659b52eb,61d0d2968413..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -3069,6 -3094,8 +3069,11 @@@ static __always_inline void do_slab_fre
+  	void *tail_obj = tail ? : head;
+  	struct kmem_cache_cpu *c;
+  	unsigned long tid;
+++<<<<<<< HEAD
+++=======
++ 
++ 	memcg_slab_free_hook(s, &head, 1);
+++>>>>>>> d1b2cf6cb84a (mm: memcg/slab: uncharge during kmem_cache_free_bulk())
+  redo:
+  	/*
+  	 * Determine the currently cpus per cpu slab.
+* Unmerged path mm/slab.c
+* Unmerged path mm/slab.h
+* Unmerged path mm/slub.c
