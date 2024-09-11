@@ -59,6 +59,13 @@ TARGETS += zram
 TARGETS_HOTPLUG = cpu-hotplug
 TARGETS_HOTPLUG += memory-hotplug
 
+# User can optionally provide a TARGETS skiplist.
+SKIP_TARGETS ?=
+ifneq ($(SKIP_TARGETS),)
+	TMP := $(filter-out $(SKIP_TARGETS), $(TARGETS))
+	override TARGETS := $(TMP)
+endif
+
 # Clear LDFLAGS and MAKEFLAGS if called from main
 # Makefile to avoid test build failures when test
 # Makefile doesn't have explicit build rules.
