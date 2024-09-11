@@ -1,0 +1,684 @@
+selftests: KVM: Add test for KVM_{GET,SET}_CLOCK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Oliver Upton <oupton@google.com>
+commit 61fb1c54853dda9a95b785f36220fa8ff39bac20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/61fb1c54.failed
+
+Add a selftest for the new KVM clock UAPI that was introduced. Ensure
+that the KVM clock is consistent between userspace and the guest, and
+that the difference in realtime will only ever cause the KVM clock to
+advance forward.
+
+	Cc: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Oliver Upton <oupton@google.com>
+Message-Id: <20210916181555.973085-3-oupton@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 61fb1c54853dda9a95b785f36220fa8ff39bac20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/.gitignore
+#	tools/testing/selftests/kvm/include/kvm_util.h
+diff --cc tools/testing/selftests/kvm/.gitignore
+index 875fd0bd2081,4bcff9c1a524..000000000000
+--- a/tools/testing/selftests/kvm/.gitignore
++++ b/tools/testing/selftests/kvm/.gitignore
+@@@ -1,10 -1,26 +1,17 @@@
+  /x86_64/cr4_cpuid_sync_test
+  /x86_64/debug_regs
+  /x86_64/evmcs_test
+++<<<<<<< HEAD
+++=======
++ /x86_64/emulator_error_test
++ /x86_64/get_cpuid_test
++ /x86_64/get_msr_index_features
++ /x86_64/kvm_clock_test
+++>>>>>>> 61fb1c54853d (selftests: KVM: Add test for KVM_{GET,SET}_CLOCK)
+  /x86_64/kvm_pv_test
+ -/x86_64/hyperv_clock
+  /x86_64/hyperv_cpuid
+ -/x86_64/hyperv_features
+ -/x86_64/mmio_warning_test
+ -/x86_64/mmu_role_test
+  /x86_64/platform_info_test
+ -/x86_64/set_boot_cpu_id
+ +/x86_64/set_memory_region_test
+  /x86_64/set_sregs_test
+  /x86_64/smm_test
+  /x86_64/state_test
+diff --cc tools/testing/selftests/kvm/include/kvm_util.h
+index c9286811a4cb,a8ac5d52e17b..000000000000
+--- a/tools/testing/selftests/kvm/include/kvm_util.h
++++ b/tools/testing/selftests/kvm/include/kvm_util.h
+@@@ -7,7 -7,399 +7,404 @@@
+  #ifndef SELFTEST_KVM_UTIL_H
+  #define SELFTEST_KVM_UTIL_H
+  
+++<<<<<<< HEAD
+ +#include "kvm_util_base.h"
+ +#include "ucall_common.h"
+++=======
++ #include "test_util.h"
++ 
++ #include "asm/kvm.h"
++ #include "linux/list.h"
++ #include "linux/kvm.h"
++ #include <sys/ioctl.h>
++ 
++ #include "sparsebit.h"
++ 
++ #define KVM_DEV_PATH "/dev/kvm"
++ #define KVM_MAX_VCPUS 512
++ 
++ #define NSEC_PER_SEC 1000000000L
++ 
++ /*
++  * Callers of kvm_util only have an incomplete/opaque description of the
++  * structure kvm_util is using to maintain the state of a VM.
++  */
++ struct kvm_vm;
++ 
++ typedef uint64_t vm_paddr_t; /* Virtual Machine (Guest) physical address */
++ typedef uint64_t vm_vaddr_t; /* Virtual Machine (Guest) virtual address */
++ 
++ /* Minimum allocated guest virtual and physical addresses */
++ #define KVM_UTIL_MIN_VADDR		0x2000
++ #define KVM_GUEST_PAGE_TABLE_MIN_PADDR	0x180000
++ 
++ #define DEFAULT_GUEST_PHY_PAGES		512
++ #define DEFAULT_GUEST_STACK_VADDR_MIN	0xab6000
++ #define DEFAULT_STACK_PGS		5
++ 
++ enum vm_guest_mode {
++ 	VM_MODE_P52V48_4K,
++ 	VM_MODE_P52V48_64K,
++ 	VM_MODE_P48V48_4K,
++ 	VM_MODE_P48V48_64K,
++ 	VM_MODE_P40V48_4K,
++ 	VM_MODE_P40V48_64K,
++ 	VM_MODE_PXXV48_4K,	/* For 48bits VA but ANY bits PA */
++ 	VM_MODE_P47V64_4K,
++ 	VM_MODE_P44V64_4K,
++ 	NUM_VM_MODES,
++ };
++ 
++ #if defined(__aarch64__)
++ 
++ #define VM_MODE_DEFAULT			VM_MODE_P40V48_4K
++ #define MIN_PAGE_SHIFT			12U
++ #define ptes_per_page(page_size)	((page_size) / 8)
++ 
++ #elif defined(__x86_64__)
++ 
++ #define VM_MODE_DEFAULT			VM_MODE_PXXV48_4K
++ #define MIN_PAGE_SHIFT			12U
++ #define ptes_per_page(page_size)	((page_size) / 8)
++ 
++ #elif defined(__s390x__)
++ 
++ #define VM_MODE_DEFAULT			VM_MODE_P44V64_4K
++ #define MIN_PAGE_SHIFT			12U
++ #define ptes_per_page(page_size)	((page_size) / 16)
++ 
++ #endif
++ 
++ #define MIN_PAGE_SIZE		(1U << MIN_PAGE_SHIFT)
++ #define PTES_PER_MIN_PAGE	ptes_per_page(MIN_PAGE_SIZE)
++ 
++ struct vm_guest_mode_params {
++ 	unsigned int pa_bits;
++ 	unsigned int va_bits;
++ 	unsigned int page_size;
++ 	unsigned int page_shift;
++ };
++ extern const struct vm_guest_mode_params vm_guest_mode_params[];
++ 
++ int open_kvm_dev_path_or_exit(void);
++ int kvm_check_cap(long cap);
++ int vm_enable_cap(struct kvm_vm *vm, struct kvm_enable_cap *cap);
++ int vcpu_enable_cap(struct kvm_vm *vm, uint32_t vcpu_id,
++ 		    struct kvm_enable_cap *cap);
++ void vm_enable_dirty_ring(struct kvm_vm *vm, uint32_t ring_size);
++ const char *vm_guest_mode_string(uint32_t i);
++ 
++ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm);
++ void kvm_vm_free(struct kvm_vm *vmp);
++ void kvm_vm_restart(struct kvm_vm *vmp, int perm);
++ void kvm_vm_release(struct kvm_vm *vmp);
++ void kvm_vm_get_dirty_log(struct kvm_vm *vm, int slot, void *log);
++ void kvm_vm_clear_dirty_log(struct kvm_vm *vm, int slot, void *log,
++ 			    uint64_t first_page, uint32_t num_pages);
++ uint32_t kvm_vm_reset_dirty_ring(struct kvm_vm *vm);
++ 
++ int kvm_memcmp_hva_gva(void *hva, struct kvm_vm *vm, const vm_vaddr_t gva,
++ 		       size_t len);
++ 
++ void kvm_vm_elf_load(struct kvm_vm *vm, const char *filename);
++ 
++ void vm_dump(FILE *stream, struct kvm_vm *vm, uint8_t indent);
++ 
++ /*
++  * VM VCPU Dump
++  *
++  * Input Args:
++  *   stream - Output FILE stream
++  *   vm     - Virtual Machine
++  *   vcpuid - VCPU ID
++  *   indent - Left margin indent amount
++  *
++  * Output Args: None
++  *
++  * Return: None
++  *
++  * Dumps the current state of the VCPU specified by @vcpuid, within the VM
++  * given by @vm, to the FILE stream given by @stream.
++  */
++ void vcpu_dump(FILE *stream, struct kvm_vm *vm, uint32_t vcpuid,
++ 	       uint8_t indent);
++ 
++ void vm_create_irqchip(struct kvm_vm *vm);
++ 
++ void vm_userspace_mem_region_add(struct kvm_vm *vm,
++ 	enum vm_mem_backing_src_type src_type,
++ 	uint64_t guest_paddr, uint32_t slot, uint64_t npages,
++ 	uint32_t flags);
++ 
++ void vcpu_ioctl(struct kvm_vm *vm, uint32_t vcpuid, unsigned long ioctl,
++ 		void *arg);
++ int _vcpu_ioctl(struct kvm_vm *vm, uint32_t vcpuid, unsigned long ioctl,
++ 		void *arg);
++ void vm_ioctl(struct kvm_vm *vm, unsigned long ioctl, void *arg);
++ int _vm_ioctl(struct kvm_vm *vm, unsigned long cmd, void *arg);
++ void kvm_ioctl(struct kvm_vm *vm, unsigned long ioctl, void *arg);
++ int _kvm_ioctl(struct kvm_vm *vm, unsigned long ioctl, void *arg);
++ void vm_mem_region_set_flags(struct kvm_vm *vm, uint32_t slot, uint32_t flags);
++ void vm_mem_region_move(struct kvm_vm *vm, uint32_t slot, uint64_t new_gpa);
++ void vm_mem_region_delete(struct kvm_vm *vm, uint32_t slot);
++ void vm_vcpu_add(struct kvm_vm *vm, uint32_t vcpuid);
++ vm_vaddr_t vm_vaddr_alloc(struct kvm_vm *vm, size_t sz, vm_vaddr_t vaddr_min);
++ vm_vaddr_t vm_vaddr_alloc_pages(struct kvm_vm *vm, int nr_pages);
++ vm_vaddr_t vm_vaddr_alloc_page(struct kvm_vm *vm);
++ 
++ void virt_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr,
++ 	      unsigned int npages);
++ void *addr_gpa2hva(struct kvm_vm *vm, vm_paddr_t gpa);
++ void *addr_gva2hva(struct kvm_vm *vm, vm_vaddr_t gva);
++ vm_paddr_t addr_hva2gpa(struct kvm_vm *vm, void *hva);
++ void *addr_gpa2alias(struct kvm_vm *vm, vm_paddr_t gpa);
++ 
++ /*
++  * Address Guest Virtual to Guest Physical
++  *
++  * Input Args:
++  *   vm - Virtual Machine
++  *   gva - VM virtual address
++  *
++  * Output Args: None
++  *
++  * Return:
++  *   Equivalent VM physical address
++  *
++  * Returns the VM physical address of the translated VM virtual
++  * address given by @gva.
++  */
++ vm_paddr_t addr_gva2gpa(struct kvm_vm *vm, vm_vaddr_t gva);
++ 
++ struct kvm_run *vcpu_state(struct kvm_vm *vm, uint32_t vcpuid);
++ void vcpu_run(struct kvm_vm *vm, uint32_t vcpuid);
++ int _vcpu_run(struct kvm_vm *vm, uint32_t vcpuid);
++ int vcpu_get_fd(struct kvm_vm *vm, uint32_t vcpuid);
++ void vcpu_run_complete_io(struct kvm_vm *vm, uint32_t vcpuid);
++ void vcpu_set_guest_debug(struct kvm_vm *vm, uint32_t vcpuid,
++ 			  struct kvm_guest_debug *debug);
++ void vcpu_set_mp_state(struct kvm_vm *vm, uint32_t vcpuid,
++ 		       struct kvm_mp_state *mp_state);
++ struct kvm_reg_list *vcpu_get_reg_list(struct kvm_vm *vm, uint32_t vcpuid);
++ void vcpu_regs_get(struct kvm_vm *vm, uint32_t vcpuid, struct kvm_regs *regs);
++ void vcpu_regs_set(struct kvm_vm *vm, uint32_t vcpuid, struct kvm_regs *regs);
++ 
++ /*
++  * VM VCPU Args Set
++  *
++  * Input Args:
++  *   vm - Virtual Machine
++  *   vcpuid - VCPU ID
++  *   num - number of arguments
++  *   ... - arguments, each of type uint64_t
++  *
++  * Output Args: None
++  *
++  * Return: None
++  *
++  * Sets the first @num function input registers of the VCPU with @vcpuid,
++  * per the C calling convention of the architecture, to the values given
++  * as variable args. Each of the variable args is expected to be of type
++  * uint64_t. The maximum @num can be is specific to the architecture.
++  */
++ void vcpu_args_set(struct kvm_vm *vm, uint32_t vcpuid, unsigned int num, ...);
++ 
++ void vcpu_sregs_get(struct kvm_vm *vm, uint32_t vcpuid,
++ 		    struct kvm_sregs *sregs);
++ void vcpu_sregs_set(struct kvm_vm *vm, uint32_t vcpuid,
++ 		    struct kvm_sregs *sregs);
++ int _vcpu_sregs_set(struct kvm_vm *vm, uint32_t vcpuid,
++ 		    struct kvm_sregs *sregs);
++ void vcpu_fpu_get(struct kvm_vm *vm, uint32_t vcpuid,
++ 		  struct kvm_fpu *fpu);
++ void vcpu_fpu_set(struct kvm_vm *vm, uint32_t vcpuid,
++ 		  struct kvm_fpu *fpu);
++ void vcpu_get_reg(struct kvm_vm *vm, uint32_t vcpuid, struct kvm_one_reg *reg);
++ void vcpu_set_reg(struct kvm_vm *vm, uint32_t vcpuid, struct kvm_one_reg *reg);
++ #ifdef __KVM_HAVE_VCPU_EVENTS
++ void vcpu_events_get(struct kvm_vm *vm, uint32_t vcpuid,
++ 		     struct kvm_vcpu_events *events);
++ void vcpu_events_set(struct kvm_vm *vm, uint32_t vcpuid,
++ 		     struct kvm_vcpu_events *events);
++ #endif
++ #ifdef __x86_64__
++ void vcpu_nested_state_get(struct kvm_vm *vm, uint32_t vcpuid,
++ 			   struct kvm_nested_state *state);
++ int vcpu_nested_state_set(struct kvm_vm *vm, uint32_t vcpuid,
++ 			  struct kvm_nested_state *state, bool ignore_error);
++ #endif
++ void *vcpu_map_dirty_ring(struct kvm_vm *vm, uint32_t vcpuid);
++ 
++ int _kvm_device_check_attr(int dev_fd, uint32_t group, uint64_t attr);
++ int kvm_device_check_attr(int dev_fd, uint32_t group, uint64_t attr);
++ int _kvm_create_device(struct kvm_vm *vm, uint64_t type, bool test, int *fd);
++ int kvm_create_device(struct kvm_vm *vm, uint64_t type, bool test);
++ int _kvm_device_access(int dev_fd, uint32_t group, uint64_t attr,
++ 		       void *val, bool write);
++ int kvm_device_access(int dev_fd, uint32_t group, uint64_t attr,
++ 		      void *val, bool write);
++ 
++ const char *exit_reason_str(unsigned int exit_reason);
++ 
++ void virt_pgd_alloc(struct kvm_vm *vm);
++ 
++ /*
++  * VM Virtual Page Map
++  *
++  * Input Args:
++  *   vm - Virtual Machine
++  *   vaddr - VM Virtual Address
++  *   paddr - VM Physical Address
++  *   memslot - Memory region slot for new virtual translation tables
++  *
++  * Output Args: None
++  *
++  * Return: None
++  *
++  * Within @vm, creates a virtual translation for the page starting
++  * at @vaddr to the page starting at @paddr.
++  */
++ void virt_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr);
++ 
++ vm_paddr_t vm_phy_page_alloc(struct kvm_vm *vm, vm_paddr_t paddr_min,
++ 			     uint32_t memslot);
++ vm_paddr_t vm_phy_pages_alloc(struct kvm_vm *vm, size_t num,
++ 			      vm_paddr_t paddr_min, uint32_t memslot);
++ vm_paddr_t vm_alloc_page_table(struct kvm_vm *vm);
++ 
++ /*
++  * Create a VM with reasonable defaults
++  *
++  * Input Args:
++  *   vcpuid - The id of the single VCPU to add to the VM.
++  *   extra_mem_pages - The number of extra pages to add (this will
++  *                     decide how much extra space we will need to
++  *                     setup the page tables using memslot 0)
++  *   guest_code - The vCPU's entry point
++  *
++  * Output Args: None
++  *
++  * Return:
++  *   Pointer to opaque structure that describes the created VM.
++  */
++ struct kvm_vm *vm_create_default(uint32_t vcpuid, uint64_t extra_mem_pages,
++ 				 void *guest_code);
++ 
++ /* Same as vm_create_default, but can be used for more than one vcpu */
++ struct kvm_vm *vm_create_default_with_vcpus(uint32_t nr_vcpus, uint64_t extra_mem_pages,
++ 					    uint32_t num_percpu_pages, void *guest_code,
++ 					    uint32_t vcpuids[]);
++ 
++ /* Like vm_create_default_with_vcpus, but accepts mode and slot0 memory as a parameter */
++ struct kvm_vm *vm_create_with_vcpus(enum vm_guest_mode mode, uint32_t nr_vcpus,
++ 				    uint64_t slot0_mem_pages, uint64_t extra_mem_pages,
++ 				    uint32_t num_percpu_pages, void *guest_code,
++ 				    uint32_t vcpuids[]);
++ 
++ /*
++  * Adds a vCPU with reasonable defaults (e.g. a stack)
++  *
++  * Input Args:
++  *   vm - Virtual Machine
++  *   vcpuid - The id of the VCPU to add to the VM.
++  *   guest_code - The vCPU's entry point
++  */
++ void vm_vcpu_add_default(struct kvm_vm *vm, uint32_t vcpuid, void *guest_code);
++ 
++ bool vm_is_unrestricted_guest(struct kvm_vm *vm);
++ 
++ unsigned int vm_get_page_size(struct kvm_vm *vm);
++ unsigned int vm_get_page_shift(struct kvm_vm *vm);
++ uint64_t vm_get_max_gfn(struct kvm_vm *vm);
++ int vm_get_fd(struct kvm_vm *vm);
++ 
++ unsigned int vm_calc_num_guest_pages(enum vm_guest_mode mode, size_t size);
++ unsigned int vm_num_host_pages(enum vm_guest_mode mode, unsigned int num_guest_pages);
++ unsigned int vm_num_guest_pages(enum vm_guest_mode mode, unsigned int num_host_pages);
++ static inline unsigned int
++ vm_adjust_num_guest_pages(enum vm_guest_mode mode, unsigned int num_guest_pages)
++ {
++ 	unsigned int n;
++ 	n = vm_num_guest_pages(mode, vm_num_host_pages(mode, num_guest_pages));
++ #ifdef __s390x__
++ 	/* s390 requires 1M aligned guest sizes */
++ 	n = (n + 255) & ~255;
++ #endif
++ 	return n;
++ }
++ 
++ struct kvm_userspace_memory_region *
++ kvm_userspace_memory_region_find(struct kvm_vm *vm, uint64_t start,
++ 				 uint64_t end);
++ 
++ struct kvm_dirty_log *
++ allocate_kvm_dirty_log(struct kvm_userspace_memory_region *region);
++ 
++ int vm_create_device(struct kvm_vm *vm, struct kvm_create_device *cd);
++ 
++ #define sync_global_to_guest(vm, g) ({				\
++ 	typeof(g) *_p = addr_gva2hva(vm, (vm_vaddr_t)&(g));	\
++ 	memcpy(_p, &(g), sizeof(g));				\
++ })
++ 
++ #define sync_global_from_guest(vm, g) ({			\
++ 	typeof(g) *_p = addr_gva2hva(vm, (vm_vaddr_t)&(g));	\
++ 	memcpy(&(g), _p, sizeof(g));				\
++ })
++ 
++ void assert_on_unhandled_exception(struct kvm_vm *vm, uint32_t vcpuid);
++ 
++ /* Common ucalls */
++ enum {
++ 	UCALL_NONE,
++ 	UCALL_SYNC,
++ 	UCALL_ABORT,
++ 	UCALL_DONE,
++ 	UCALL_UNHANDLED,
++ };
++ 
++ #define UCALL_MAX_ARGS 6
++ 
++ struct ucall {
++ 	uint64_t cmd;
++ 	uint64_t args[UCALL_MAX_ARGS];
++ };
++ 
++ void ucall_init(struct kvm_vm *vm, void *arg);
++ void ucall_uninit(struct kvm_vm *vm);
++ void ucall(uint64_t cmd, int nargs, ...);
++ uint64_t get_ucall(struct kvm_vm *vm, uint32_t vcpu_id, struct ucall *uc);
++ 
++ #define GUEST_SYNC_ARGS(stage, arg1, arg2, arg3, arg4)	\
++ 				ucall(UCALL_SYNC, 6, "hello", stage, arg1, arg2, arg3, arg4)
++ #define GUEST_SYNC(stage)	ucall(UCALL_SYNC, 2, "hello", stage)
++ #define GUEST_DONE()		ucall(UCALL_DONE, 0)
++ #define __GUEST_ASSERT(_condition, _condstr, _nargs, _args...) do {    \
++ 	if (!(_condition))                                              \
++ 		ucall(UCALL_ABORT, 2 + _nargs,                          \
++ 			"Failed guest assert: "                         \
++ 			_condstr, __LINE__, _args);                     \
++ } while (0)
++ 
++ #define GUEST_ASSERT(_condition) \
++ 	__GUEST_ASSERT(_condition, #_condition, 0, 0)
++ 
++ #define GUEST_ASSERT_1(_condition, arg1) \
++ 	__GUEST_ASSERT(_condition, #_condition, 1, (arg1))
++ 
++ #define GUEST_ASSERT_2(_condition, arg1, arg2) \
++ 	__GUEST_ASSERT(_condition, #_condition, 2, (arg1), (arg2))
++ 
++ #define GUEST_ASSERT_3(_condition, arg1, arg2, arg3) \
++ 	__GUEST_ASSERT(_condition, #_condition, 3, (arg1), (arg2), (arg3))
++ 
++ #define GUEST_ASSERT_4(_condition, arg1, arg2, arg3, arg4) \
++ 	__GUEST_ASSERT(_condition, #_condition, 4, (arg1), (arg2), (arg3), (arg4))
++ 
++ #define GUEST_ASSERT_EQ(a, b) __GUEST_ASSERT((a) == (b), #a " == " #b, 2, a, b)
++ 
++ int vm_get_stats_fd(struct kvm_vm *vm);
++ int vcpu_get_stats_fd(struct kvm_vm *vm, uint32_t vcpuid);
+++>>>>>>> 61fb1c54853d (selftests: KVM: Add test for KVM_{GET,SET}_CLOCK)
+  
+  #endif /* SELFTEST_KVM_UTIL_H */
+* Unmerged path tools/testing/selftests/kvm/.gitignore
+diff --git a/tools/testing/selftests/kvm/Makefile b/tools/testing/selftests/kvm/Makefile
+index 89c308b6d33f..c07fe1fb55c5 100644
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@ -46,6 +46,7 @@ TEST_GEN_PROGS_x86_64 += x86_64/get_cpuid_test
+ TEST_GEN_PROGS_x86_64 += x86_64/hyperv_clock
+ TEST_GEN_PROGS_x86_64 += x86_64/hyperv_cpuid
+ TEST_GEN_PROGS_x86_64 += x86_64/hyperv_features
++TEST_GEN_PROGS_x86_64 += x86_64/kvm_clock_test
+ TEST_GEN_PROGS_x86_64 += x86_64/kvm_pv_test
+ TEST_GEN_PROGS_x86_64 += x86_64/mmio_warning_test
+ TEST_GEN_PROGS_x86_64 += x86_64/mmu_role_test
+* Unmerged path tools/testing/selftests/kvm/include/kvm_util.h
+diff --git a/tools/testing/selftests/kvm/x86_64/kvm_clock_test.c b/tools/testing/selftests/kvm/x86_64/kvm_clock_test.c
+new file mode 100644
+index 000000000000..97731454f3f3
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/kvm_clock_test.c
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2021, Google LLC.
++ *
++ * Tests for adjusting the KVM clock from userspace
++ */
++#include <asm/kvm_para.h>
++#include <asm/pvclock.h>
++#include <asm/pvclock-abi.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++
++#define VCPU_ID 0
++
++struct test_case {
++	uint64_t kvmclock_base;
++	int64_t realtime_offset;
++};
++
++static struct test_case test_cases[] = {
++	{ .kvmclock_base = 0 },
++	{ .kvmclock_base = 180 * NSEC_PER_SEC },
++	{ .kvmclock_base = 0, .realtime_offset = -180 * NSEC_PER_SEC },
++	{ .kvmclock_base = 0, .realtime_offset = 180 * NSEC_PER_SEC },
++};
++
++#define GUEST_SYNC_CLOCK(__stage, __val)			\
++		GUEST_SYNC_ARGS(__stage, __val, 0, 0, 0)
++
++static void guest_main(vm_paddr_t pvti_pa, struct pvclock_vcpu_time_info *pvti)
++{
++	int i;
++
++	wrmsr(MSR_KVM_SYSTEM_TIME_NEW, pvti_pa | KVM_MSR_ENABLED);
++	for (i = 0; i < ARRAY_SIZE(test_cases); i++)
++		GUEST_SYNC_CLOCK(i, __pvclock_read_cycles(pvti, rdtsc()));
++}
++
++#define EXPECTED_FLAGS (KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC)
++
++static inline void assert_flags(struct kvm_clock_data *data)
++{
++	TEST_ASSERT((data->flags & EXPECTED_FLAGS) == EXPECTED_FLAGS,
++		    "unexpected clock data flags: %x (want set: %x)",
++		    data->flags, EXPECTED_FLAGS);
++}
++
++static void handle_sync(struct ucall *uc, struct kvm_clock_data *start,
++			struct kvm_clock_data *end)
++{
++	uint64_t obs, exp_lo, exp_hi;
++
++	obs = uc->args[2];
++	exp_lo = start->clock;
++	exp_hi = end->clock;
++
++	assert_flags(start);
++	assert_flags(end);
++
++	TEST_ASSERT(exp_lo <= obs && obs <= exp_hi,
++		    "unexpected kvm-clock value: %"PRIu64" expected range: [%"PRIu64", %"PRIu64"]",
++		    obs, exp_lo, exp_hi);
++
++	pr_info("kvm-clock value: %"PRIu64" expected range [%"PRIu64", %"PRIu64"]\n",
++		obs, exp_lo, exp_hi);
++}
++
++static void handle_abort(struct ucall *uc)
++{
++	TEST_FAIL("%s at %s:%ld", (const char *)uc->args[0],
++		  __FILE__, uc->args[1]);
++}
++
++static void setup_clock(struct kvm_vm *vm, struct test_case *test_case)
++{
++	struct kvm_clock_data data;
++
++	memset(&data, 0, sizeof(data));
++
++	data.clock = test_case->kvmclock_base;
++	if (test_case->realtime_offset) {
++		struct timespec ts;
++		int r;
++
++		data.flags |= KVM_CLOCK_REALTIME;
++		do {
++			r = clock_gettime(CLOCK_REALTIME, &ts);
++			if (!r)
++				break;
++		} while (errno == EINTR);
++
++		TEST_ASSERT(!r, "clock_gettime() failed: %d\n", r);
++
++		data.realtime = ts.tv_sec * NSEC_PER_SEC;
++		data.realtime += ts.tv_nsec;
++		data.realtime += test_case->realtime_offset;
++	}
++
++	vm_ioctl(vm, KVM_SET_CLOCK, &data);
++}
++
++static void enter_guest(struct kvm_vm *vm)
++{
++	struct kvm_clock_data start, end;
++	struct kvm_run *run;
++	struct ucall uc;
++	int i, r;
++
++	run = vcpu_state(vm, VCPU_ID);
++
++	for (i = 0; i < ARRAY_SIZE(test_cases); i++) {
++		setup_clock(vm, &test_cases[i]);
++
++		vm_ioctl(vm, KVM_GET_CLOCK, &start);
++
++		r = _vcpu_run(vm, VCPU_ID);
++		vm_ioctl(vm, KVM_GET_CLOCK, &end);
++
++		TEST_ASSERT(!r, "vcpu_run failed: %d\n", r);
++		TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
++			    "unexpected exit reason: %u (%s)",
++			    run->exit_reason, exit_reason_str(run->exit_reason));
++
++		switch (get_ucall(vm, VCPU_ID, &uc)) {
++		case UCALL_SYNC:
++			handle_sync(&uc, &start, &end);
++			break;
++		case UCALL_ABORT:
++			handle_abort(&uc);
++			return;
++		default:
++			TEST_ASSERT(0, "unhandled ucall: %ld\n", uc.cmd);
++		}
++	}
++}
++
++#define CLOCKSOURCE_PATH "/sys/devices/system/clocksource/clocksource0/current_clocksource"
++
++static void check_clocksource(void)
++{
++	char *clk_name;
++	struct stat st;
++	FILE *fp;
++
++	fp = fopen(CLOCKSOURCE_PATH, "r");
++	if (!fp) {
++		pr_info("failed to open clocksource file: %d; assuming TSC.\n",
++			errno);
++		return;
++	}
++
++	if (fstat(fileno(fp), &st)) {
++		pr_info("failed to stat clocksource file: %d; assuming TSC.\n",
++			errno);
++		goto out;
++	}
++
++	clk_name = malloc(st.st_size);
++	TEST_ASSERT(clk_name, "failed to allocate buffer to read file\n");
++
++	if (!fgets(clk_name, st.st_size, fp)) {
++		pr_info("failed to read clocksource file: %d; assuming TSC.\n",
++			ferror(fp));
++		goto out;
++	}
++
++	TEST_ASSERT(!strncmp(clk_name, "tsc\n", st.st_size),
++		    "clocksource not supported: %s", clk_name);
++out:
++	fclose(fp);
++}
++
++int main(void)
++{
++	vm_vaddr_t pvti_gva;
++	vm_paddr_t pvti_gpa;
++	struct kvm_vm *vm;
++	int flags;
++
++	flags = kvm_check_cap(KVM_CAP_ADJUST_CLOCK);
++	if (!(flags & KVM_CLOCK_REALTIME)) {
++		print_skip("KVM_CLOCK_REALTIME not supported; flags: %x",
++			   flags);
++		exit(KSFT_SKIP);
++	}
++
++	check_clocksource();
++
++	vm = vm_create_default(VCPU_ID, 0, guest_main);
++
++	pvti_gva = vm_vaddr_alloc(vm, getpagesize(), 0x10000);
++	pvti_gpa = addr_gva2gpa(vm, pvti_gva);
++	vcpu_args_set(vm, VCPU_ID, 2, pvti_gpa, pvti_gva);
++
++	enter_guest(vm);
++	kvm_vm_free(vm);
++}
