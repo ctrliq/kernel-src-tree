@@ -1,0 +1,101 @@
+tcp: fix zerocopy and notsent_lowat issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit 4f661542a40217713f2cee0bb6678fbb30d9d367
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4f661542.failed
+
+My recent patch had at least three problems :
+
+1) TX zerocopy wants notification when skb is acknowledged,
+   thus we need to call skb_zcopy_clear() if the skb is
+   cached into sk->sk_tx_skb_cache
+
+2) Some applications might expect precise EPOLLOUT
+   notifications, so we need to update sk->sk_wmem_queued
+   and call sk_mem_uncharge() from sk_wmem_free_skb()
+   in all cases. The SOCK_QUEUE_SHRUNK flag must also be set.
+
+3) Reuse of saved skb should have used skb_cloned() instead
+  of simply checking if the fast clone has been freed.
+
+Fixes: 472c2e07eef0 ("tcp: add one skb cache for tx")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Willem de Bruijn <willemb@google.com>
+	Cc: Soheil Hassas Yeganeh <soheil@google.com>
+	Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+	Tested-by: Holger Hoffstätte <holger@applied-asynchrony.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f661542a40217713f2cee0bb6678fbb30d9d367)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+#	net/ipv4/tcp.c
+diff --cc include/net/sock.h
+index 50c624432ded,7fa223278522..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -1538,8 -1465,14 +1538,18 @@@ static inline void sk_mem_uncharge(stru
+  
+  static inline void sk_wmem_free_skb(struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	sk_wmem_queued_add(sk, -skb->truesize);
+++=======
++ 	sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
++ 	sk->sk_wmem_queued -= skb->truesize;
+++>>>>>>> 4f661542a402 (tcp: fix zerocopy and notsent_lowat issues)
+  	sk_mem_uncharge(sk, skb->truesize);
++ 	if (!sk->sk_tx_skb_cache) {
++ 		skb_zcopy_clear(skb, true);
++ 		sk->sk_tx_skb_cache = skb;
++ 		return;
++ 	}
+  	__kfree_skb(skb);
+  }
+  
+diff --cc net/ipv4/tcp.c
+index 93a220a78f1b,82bd707c0347..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -867,6 -865,16 +867,19 @@@ struct sk_buff *sk_stream_alloc_skb(str
+  {
+  	struct sk_buff *skb;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (likely(!size)) {
++ 		skb = sk->sk_tx_skb_cache;
++ 		if (skb && !skb_cloned(skb)) {
++ 			skb->truesize -= skb->data_len;
++ 			sk->sk_tx_skb_cache = NULL;
++ 			pskb_trim(skb, 0);
++ 			INIT_LIST_HEAD(&skb->tcp_tsorted_anchor);
++ 			return skb;
++ 		}
++ 	}
+++>>>>>>> 4f661542a402 (tcp: fix zerocopy and notsent_lowat issues)
+  	/* The TCP header must be at least 32-bit aligned.  */
+  	size = ALIGN(size, 4);
+  
+@@@ -2545,6 -2536,11 +2558,14 @@@ void tcp_write_queue_purge(struct sock 
+  		sk_wmem_free_skb(sk, skb);
+  	}
+  	tcp_rtx_queue_purge(sk);
+++<<<<<<< HEAD
+++=======
++ 	skb = sk->sk_tx_skb_cache;
++ 	if (skb) {
++ 		__kfree_skb(skb);
++ 		sk->sk_tx_skb_cache = NULL;
++ 	}
+++>>>>>>> 4f661542a402 (tcp: fix zerocopy and notsent_lowat issues)
+  	INIT_LIST_HEAD(&tcp_sk(sk)->tsorted_sent_queue);
+  	sk_mem_reclaim(sk);
+  	tcp_clear_all_retrans_hints(tcp_sk(sk));
+* Unmerged path include/net/sock.h
+* Unmerged path net/ipv4/tcp.c
