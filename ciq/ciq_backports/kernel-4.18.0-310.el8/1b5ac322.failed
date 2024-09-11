@@ -1,0 +1,125 @@
+KVM: vmx/pmu: Pass-through LBR msrs when the guest LBR event is ACTIVE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Like Xu <like.xu@linux.intel.com>
+commit 1b5ac3226a1aa071135fe0ee5d1055d9e88b717c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/1b5ac322.failed
+
+In addition to DEBUGCTLMSR_LBR, any KVM trap caused by LBR msrs access
+will result in a creation of guest LBR event per-vcpu.
+
+If the guest LBR event is scheduled on with the corresponding vcpu context,
+KVM will pass-through all LBR records msrs to the guest. The LBR callstack
+mechanism implemented in the host could help save/restore the guest LBR
+records during the event context switches, which reduces a lot of overhead
+if we save/restore tens of LBR msrs (e.g. 32 LBR records entries) in the
+much more frequent VMX transitions.
+
+To avoid reclaiming LBR resources from any higher priority event on host,
+KVM would always check the exist of guest LBR event and its state before
+vm-entry as late as possible. A negative result would cancel the
+pass-through state, and it also prevents real registers accesses and
+potential data leakage. If host reclaims the LBR between two checks, the
+interception state and LBR records can be safely preserved due to native
+save/restore support from guest LBR event.
+
+The KVM emits a pr_warn() when the LBR hardware is unavailable to the
+guest LBR event. The administer is supposed to reminder users that the
+guest result may be inaccurate if someone is using LBR to record
+hypervisor on the host side.
+
+	Suggested-by: Andi Kleen <ak@linux.intel.com>
+Co-developed-by: Wei Wang <wei.w.wang@intel.com>
+	Signed-off-by: Wei Wang <wei.w.wang@intel.com>
+	Signed-off-by: Like Xu <like.xu@linux.intel.com>
+	Reviewed-by: Andi Kleen <ak@linux.intel.com>
+Message-Id: <20210201051039.255478-7-like.xu@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1b5ac3226a1aa071135fe0ee5d1055d9e88b717c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/pmu_intel.c
+diff --cc arch/x86/kvm/vmx/pmu_intel.c
+index 48690db4db6a,c7dbaaccbcaa..000000000000
+--- a/arch/x86/kvm/vmx/pmu_intel.c
++++ b/arch/x86/kvm/vmx/pmu_intel.c
+@@@ -183,6 -183,31 +183,34 @@@ bool intel_pmu_lbr_is_compatible(struc
+  	return boot_cpu_data.x86_model == guest_cpuid_model(vcpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool intel_pmu_lbr_is_enabled(struct kvm_vcpu *vcpu)
++ {
++ 	struct x86_pmu_lbr *lbr = vcpu_to_lbr_records(vcpu);
++ 
++ 	return lbr->nr && (vcpu_get_perf_capabilities(vcpu) & PMU_CAP_LBR_FMT);
++ }
++ 
++ static bool intel_pmu_is_valid_lbr_msr(struct kvm_vcpu *vcpu, u32 index)
++ {
++ 	struct x86_pmu_lbr *records = vcpu_to_lbr_records(vcpu);
++ 	bool ret = false;
++ 
++ 	if (!intel_pmu_lbr_is_enabled(vcpu))
++ 		return ret;
++ 
++ 	ret = (index == MSR_LBR_SELECT) || (index == MSR_LBR_TOS) ||
++ 		(index >= records->from && index < records->from + records->nr) ||
++ 		(index >= records->to && index < records->to + records->nr);
++ 
++ 	if (!ret && records->info)
++ 		ret = (index >= records->info && index < records->info + records->nr);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 1b5ac3226a1a (KVM: vmx/pmu: Pass-through LBR msrs when the guest LBR event is ACTIVE)
+  static bool intel_is_valid_msr(struct kvm_vcpu *vcpu, u32 msr)
+  {
+  	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
+* Unmerged path arch/x86/kvm/vmx/pmu_intel.c
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 08cdc15857f3..007896bce66c 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -658,6 +658,14 @@ static bool is_valid_passthrough_msr(u32 msr)
+ 	case MSR_IA32_RTIT_CR3_MATCH:
+ 	case MSR_IA32_RTIT_ADDR0_A ... MSR_IA32_RTIT_ADDR3_B:
+ 		/* PT MSRs. These are handled in pt_update_intercept_for_msr() */
++	case MSR_LBR_SELECT:
++	case MSR_LBR_TOS:
++	case MSR_LBR_INFO_0 ... MSR_LBR_INFO_0 + 31:
++	case MSR_LBR_NHM_FROM ... MSR_LBR_NHM_FROM + 31:
++	case MSR_LBR_NHM_TO ... MSR_LBR_NHM_TO + 31:
++	case MSR_LBR_CORE_FROM ... MSR_LBR_CORE_FROM + 8:
++	case MSR_LBR_CORE_TO ... MSR_LBR_CORE_TO + 8:
++		/* LBR MSRs. These are handled in vmx_update_intercept_for_lbr_msrs() */
+ 		return true;
+ 	}
+ 
+@@ -6692,6 +6700,8 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	pt_guest_enter(vmx);
+ 
+ 	atomic_switch_perf_msrs(vmx);
++	if (intel_pmu_lbr_is_enabled(vcpu))
++		vmx_passthrough_lbr_msrs(vcpu);
+ 
+ 	if (enable_preemption_timer)
+ 		vmx_update_hv_timer(vcpu);
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 6d7ed00160a2..e8ae2fbe65aa 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -99,6 +99,7 @@ union vmx_exit_reason {
+ bool intel_pmu_lbr_is_compatible(struct kvm_vcpu *vcpu);
+ 
+ int intel_pmu_create_guest_lbr_event(struct kvm_vcpu *vcpu);
++void vmx_passthrough_lbr_msrs(struct kvm_vcpu *vcpu);
+ 
+ struct lbr_desc {
+ 	/* Basic info about guest LBR records. */
