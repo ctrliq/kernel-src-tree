@@ -2545,6 +2545,7 @@ static int sctp_apply_peer_addr_params(struct sctp_paddrparams *params,
 				sctp_transport_pmtu(trans, sctp_opt2sk(sp));
 				sctp_assoc_sync_pmtu(asoc);
 			}
+			sctp_transport_pl_reset(trans);
 		} else if (asoc) {
 			asoc->param_flags =
 				(asoc->param_flags & ~SPP_PMTUD) | pmtud_change;
@@ -4754,6 +4755,7 @@ static int sctp_setsockopt_probe_interval(struct sock *sk,
 			return -EINVAL;
 
 		t->probe_interval = msecs_to_jiffies(probe_interval);
+		sctp_transport_pl_reset(t);
 		return 0;
 	}
 
@@ -4770,8 +4772,10 @@ static int sctp_setsockopt_probe_interval(struct sock *sk,
 	 * each transport.
 	 */
 	if (asoc) {
-		list_for_each_entry(t, &asoc->peer.transport_addr_list, transports)
+		list_for_each_entry(t, &asoc->peer.transport_addr_list, transports) {
 			t->probe_interval = msecs_to_jiffies(probe_interval);
+			sctp_transport_pl_reset(t);
+		}
 
 		asoc->probe_interval = msecs_to_jiffies(probe_interval);
 		return 0;

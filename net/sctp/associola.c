@@ -730,6 +730,8 @@ struct sctp_transport *sctp_assoc_add_peer(struct sctp_association *asoc,
 		return NULL;
 	}
 
+	sctp_transport_pl_reset(peer);
+
 	/* Attach the remote transport to our asoc.  */
 	list_add_tail_rcu(&peer->transports, &asoc->peer.transport_addr_list);
 	asoc->peer.transport_count++;
@@ -828,6 +830,7 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
 			spc_state = SCTP_ADDR_CONFIRMED;
 
 		transport->state = SCTP_ACTIVE;
+		sctp_transport_pl_reset(transport);
 		break;
 
 	case SCTP_TRANSPORT_DOWN:
@@ -837,6 +840,7 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
 		 */
 		if (transport->state != SCTP_UNCONFIRMED) {
 			transport->state = SCTP_INACTIVE;
+			sctp_transport_pl_reset(transport);
 			spc_state = SCTP_ADDR_UNREACHABLE;
 		} else {
 			sctp_transport_dst_release(transport);
