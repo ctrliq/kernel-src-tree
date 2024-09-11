@@ -1,0 +1,194 @@
+flow_dissector: handle no-skb use case
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit 9b52e3f267a6835efd50ed9002d530666d16a411
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9b52e3f2.failed
+
+When called without skb, gather all required data from the
+__skb_flow_dissect's arguments and use recently introduces
+no-skb mode of bpf flow dissector.
+
+Note: WARN_ON_ONCE(!net) will now trigger for eth_get_headlen users.
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 9b52e3f267a6835efd50ed9002d530666d16a411)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/flow_dissector.c
+diff --cc include/linux/skbuff.h
+index 9f40de2e11fc,998256c2820b..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -1266,7 -1275,12 +1266,16 @@@ static inline int skb_flow_dissector_bp
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +bool __skb_flow_dissect(const struct sk_buff *skb,
+++=======
++ struct bpf_flow_dissector;
++ bool bpf_flow_dissect(struct bpf_prog *prog, struct bpf_flow_dissector *ctx,
++ 		      __be16 proto, int nhoff, int hlen);
++ 
++ bool __skb_flow_dissect(const struct net *net,
++ 			const struct sk_buff *skb,
+++>>>>>>> 9b52e3f267a6 (flow_dissector: handle no-skb use case)
+  			struct flow_dissector *flow_dissector,
+  			void *target_container,
+  			void *data, __be16 proto, int nhoff, int hlen,
+diff --cc net/core/flow_dissector.c
+index 2a5c7afc694d,fac712cee9d5..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -782,8 -683,30 +782,32 @@@ static void __skb_flow_bpf_to_target(co
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool bpf_flow_dissect(struct bpf_prog *prog, struct bpf_flow_dissector *ctx,
++ 		      __be16 proto, int nhoff, int hlen)
++ {
++ 	struct bpf_flow_keys *flow_keys = ctx->flow_keys;
++ 	u32 result;
++ 
++ 	/* Pass parameters to the BPF program */
++ 	memset(flow_keys, 0, sizeof(*flow_keys));
++ 	flow_keys->n_proto = proto;
++ 	flow_keys->nhoff = nhoff;
++ 	flow_keys->thoff = flow_keys->nhoff;
++ 
++ 	result = BPF_PROG_RUN(prog, ctx);
++ 
++ 	flow_keys->nhoff = clamp_t(u16, flow_keys->nhoff, nhoff, hlen);
++ 	flow_keys->thoff = clamp_t(u16, flow_keys->thoff,
++ 				   flow_keys->nhoff, hlen);
++ 
++ 	return result == BPF_OK;
++ }
++ 
+++>>>>>>> 9b52e3f267a6 (flow_dissector: handle no-skb use case)
+  /**
+   * __skb_flow_dissect - extract the flow_keys struct and return it
+ - * @net: associated network namespace, derived from @skb if NULL
+   * @skb: sk_buff to extract the flow from, can be NULL if the rest are specified
+   * @flow_dissector: list of keys to dissect
+   * @target_container: target structure to put dissected values into
+@@@ -813,9 -737,9 +837,10 @@@ bool __skb_flow_dissect(const struct sk
+  	struct flow_dissector_key_icmp *key_icmp;
+  	struct flow_dissector_key_tags *key_tags;
+  	struct flow_dissector_key_vlan *key_vlan;
++ 	struct bpf_prog *attached = NULL;
+  	enum flow_dissect_ret fdret;
+  	enum flow_dissector_key_id dissector_vlan = FLOW_DISSECTOR_KEY_MAX;
+ +	struct bpf_prog *attached = NULL;
+  	int num_hdrs = 0;
+  	u8 ip_proto = 0;
+  	bool ret;
+@@@ -855,55 -779,47 +880,97 @@@
+  					      FLOW_DISSECTOR_KEY_BASIC,
+  					      target_container);
+  
+ +	rcu_read_lock();
+  	if (skb) {
+++<<<<<<< HEAD
+ +		if (skb->dev)
+ +			attached = rcu_dereference(dev_net(skb->dev)->flow_dissector_prog);
+ +		else if (skb->sk)
+ +			attached = rcu_dereference(sock_net(skb->sk)->flow_dissector_prog);
+ +		else
+ +			WARN_ON_ONCE(1);
+++=======
++ 		if (!net) {
++ 			if (skb->dev)
++ 				net = dev_net(skb->dev);
++ 			else if (skb->sk)
++ 				net = sock_net(skb->sk);
++ 		}
++ 	}
++ 
++ 	WARN_ON_ONCE(!net);
++ 	if (net) {
++ 		rcu_read_lock();
++ 		attached = rcu_dereference(net->flow_dissector_prog);
++ 
++ 		if (attached) {
++ 			struct bpf_flow_keys flow_keys;
++ 			struct bpf_flow_dissector ctx = {
++ 				.flow_keys = &flow_keys,
++ 				.data = data,
++ 				.data_end = data + hlen,
++ 			};
++ 			__be16 n_proto = proto;
++ 
++ 			if (skb) {
++ 				ctx.skb = skb;
++ 				/* we can't use 'proto' in the skb case
++ 				 * because it might be set to skb->vlan_proto
++ 				 * which has been pulled from the data
++ 				 */
++ 				n_proto = skb->protocol;
++ 			}
++ 
++ 			ret = bpf_flow_dissect(attached, &ctx, n_proto, nhoff,
++ 					       hlen);
++ 			__skb_flow_bpf_to_target(&flow_keys, flow_dissector,
++ 						 target_container);
++ 			rcu_read_unlock();
++ 			return ret;
++ 		}
++ 		rcu_read_unlock();
+++>>>>>>> 9b52e3f267a6 (flow_dissector: handle no-skb use case)
+ +	}
+ +	if (attached) {
+ +		/* Note that even though the const qualifier is discarded
+ +		 * throughout the execution of the BPF program, all changes(the
+ +		 * control block) are reverted after the BPF program returns.
+ +		 * Therefore, __skb_flow_dissect does not alter the skb.
+ +		 */
+ +		struct bpf_flow_keys flow_keys = {};
+ +		struct bpf_skb_data_end cb_saved;
+ +		struct bpf_skb_data_end *cb;
+ +		u32 result;
+ +
+ +		cb = (struct bpf_skb_data_end *)skb->cb;
+ +
+ +		/* Save Control Block */
+ +		memcpy(&cb_saved, cb, sizeof(cb_saved));
+ +		memset(cb, 0, sizeof(cb_saved));
+ +
+ +		/* Pass parameters to the BPF program */
+ +		cb->qdisc_cb.flow_keys = &flow_keys;
+ +		flow_keys.nhoff = nhoff;
+ +		flow_keys.thoff = nhoff;
+ +
+ +		bpf_compute_data_pointers((struct sk_buff *)skb);
+ +		preempt_disable();
+ +		result = BPF_PROG_RUN(attached, skb);
+ +		preempt_enable();
+ +
+ +		/* Restore state */
+ +		memcpy(cb, &cb_saved, sizeof(cb_saved));
+ +
+ +		flow_keys.nhoff = clamp_t(u16, flow_keys.nhoff, 0, skb->len);
+ +		flow_keys.thoff = clamp_t(u16, flow_keys.thoff,
+ +					  flow_keys.nhoff, skb->len);
+ +
+ +		__skb_flow_bpf_to_target(&flow_keys, flow_dissector,
+ +					 target_container);
+ +		rcu_read_unlock();
+ +		return result == BPF_OK;
+  	}
+ +	rcu_read_unlock();
+  
+  	if (dissector_uses_key(flow_dissector,
+  			       FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/flow_dissector.c
