@@ -1,0 +1,88 @@
+io_uring: Fix leaking linked timeouts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 09fbb0a83ec6ab5a4037766261c031151985fff6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/09fbb0a8.failed
+
+let have a dependant link: REQ -> LINK_TIMEOUT -> LINK_TIMEOUT
+
+1. submission stage: submission references for REQ and LINK_TIMEOUT
+are dropped. So, references respectively (1,1,2)
+
+2. io_put(REQ) + FAIL_LINKS stage: calls io_fail_links(), which for all
+linked timeouts will call cancel_timeout() and drop 1 reference.
+So, references after: (0,0,1). That's a leak.
+
+Make it treat only the first linked timeout as such, and pass others
+through __io_double_put_req().
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 09fbb0a83ec6ab5a4037766261c031151985fff6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 79a564f6a100,f88e12b971c7..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -660,19 -922,46 +660,36 @@@ static void io_req_link_next(struct io_
+   */
+  static void io_fail_links(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+  	struct io_kiocb *link;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&ctx->completion_lock, flags);
+  
+  	while (!list_empty(&req->link_list)) {
+ -		const struct io_uring_sqe *sqe_to_free = NULL;
+ -
+  		link = list_first_entry(&req->link_list, struct io_kiocb, list);
+ -		list_del_init(&link->list);
+ +		list_del(&link->list);
+  
+++<<<<<<< HEAD
+ +		io_cqring_add_event(req->ctx, link->user_data, -ECANCELED);
+ +		__io_free_req(link);
+++=======
++ 		trace_io_uring_fail_link(req, link);
++ 
++ 		if (link->flags & REQ_F_FREE_SQE)
++ 			sqe_to_free = link->submit.sqe;
++ 
++ 		if ((req->flags & REQ_F_LINK_TIMEOUT) &&
++ 		    link->submit.sqe->opcode == IORING_OP_LINK_TIMEOUT) {
++ 			io_link_cancel_timeout(link);
++ 			req->flags &= ~REQ_F_LINK_TIMEOUT;
++ 		} else {
++ 			io_cqring_fill_event(link, -ECANCELED);
++ 			__io_double_put_req(link);
++ 		}
++ 		kfree(sqe_to_free);
+++>>>>>>> 09fbb0a83ec6 (io_uring: Fix leaking linked timeouts)
+  	}
+ -
+ -	io_commit_cqring(ctx);
+ -	spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -	io_cqring_ev_posted(ctx);
+  }
+  
+ -static void io_free_req_find_next(struct io_kiocb *req, struct io_kiocb **nxt)
+ +static void io_free_req(struct io_kiocb *req)
+  {
+ -	if (likely(!(req->flags & REQ_F_LINK))) {
+ -		__io_free_req(req);
+ -		return;
+ -	}
+ -
+  	/*
+  	 * If LINK is set, we have dependent requests in this chain. If we
+  	 * didn't fail this request, queue the first one up, moving any other
+* Unmerged path fs/io_uring.c
