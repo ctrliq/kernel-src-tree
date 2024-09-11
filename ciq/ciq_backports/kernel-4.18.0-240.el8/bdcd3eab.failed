@@ -1,0 +1,219 @@
+io_uring: fix poll_list race for SETUP_IOPOLL|SETUP_SQPOLL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit bdcd3eab2a9ae0ac93f27275b6895dd95e5bf360
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bdcd3eab.failed
+
+After making ext4 support iopoll method:
+  let ext4_file_operations's iopoll method be iomap_dio_iopoll(),
+we found fio can easily hang in fio_ioring_getevents() with below fio
+job:
+    rm -f testfile; sync;
+    sudo fio -name=fiotest -filename=testfile -iodepth=128 -thread
+-rw=write -ioengine=io_uring  -hipri=1 -sqthread_poll=1 -direct=1
+-bs=4k -size=10G -numjobs=8 -runtime=2000 -group_reporting
+with IORING_SETUP_SQPOLL and IORING_SETUP_IOPOLL enabled.
+
+There are two issues that results in this hang, one reason is that
+when IORING_SETUP_SQPOLL and IORING_SETUP_IOPOLL are enabled, fio
+does not use io_uring_enter to get completed events, it relies on
+kernel io_sq_thread to poll for completed events.
+
+Another reason is that there is a race: when io_submit_sqes() in
+io_sq_thread() submits a batch of sqes, variable 'inflight' will
+record the number of submitted reqs, then io_sq_thread will poll for
+reqs which have been added to poll_list. But note, if some previous
+reqs have been punted to io worker, these reqs will won't be in
+poll_list timely. io_sq_thread() will only poll for a part of previous
+submitted reqs, and then find poll_list is empty, reset variable
+'inflight' to be zero. If app just waits these deferred reqs and does
+not wake up io_sq_thread again, then hang happens.
+
+For app that entirely relies on io_sq_thread to poll completed requests,
+let io_iopoll_req_issued() wake up io_sq_thread properly when adding new
+element to poll_list, and when io_sq_thread prepares to sleep, check
+whether poll_list is empty again, if not empty, continue to poll.
+
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bdcd3eab2a9ae0ac93f27275b6895dd95e5bf360)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index b545f09e7576,ffd9bfa84d86..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2472,56 -5085,42 +2476,43 @@@ out
+  
+  static int io_sq_thread(void *data)
+  {
+ +	struct sqe_submit sqes[IO_IOPOLL_BATCH];
+  	struct io_ring_ctx *ctx = data;
+  	struct mm_struct *cur_mm = NULL;
+ -	const struct cred *old_cred;
+  	mm_segment_t old_fs;
+  	DEFINE_WAIT(wait);
+- 	unsigned inflight;
+  	unsigned long timeout;
+++<<<<<<< HEAD
+++=======
++ 	int ret = 0;
+++>>>>>>> bdcd3eab2a9a (io_uring: fix poll_list race for SETUP_IOPOLL|SETUP_SQPOLL)
+  
+ -	complete(&ctx->completions[1]);
+ +	complete(&ctx->sqo_thread_started);
+  
+  	old_fs = get_fs();
+  	set_fs(USER_DS);
+ -	old_cred = override_creds(ctx->creds);
+  
+++<<<<<<< HEAD
+ +	timeout = inflight = 0;
+++=======
++ 	timeout = jiffies + ctx->sq_thread_idle;
+++>>>>>>> bdcd3eab2a9a (io_uring: fix poll_list race for SETUP_IOPOLL|SETUP_SQPOLL)
+  	while (!kthread_should_park()) {
+ -		unsigned int to_submit;
+ +		bool all_fixed, mm_fault = false;
+ +		int i;
+  
+- 		if (inflight) {
++ 		if (!list_empty(&ctx->poll_list)) {
+  			unsigned nr_events = 0;
+  
+- 			if (ctx->flags & IORING_SETUP_IOPOLL) {
+- 				/*
+- 				 * inflight is the count of the maximum possible
+- 				 * entries we submitted, but it can be smaller
+- 				 * if we dropped some of them. If we don't have
+- 				 * poll entries available, then we know that we
+- 				 * have nothing left to poll for. Reset the
+- 				 * inflight count to zero in that case.
+- 				 */
+- 				mutex_lock(&ctx->uring_lock);
+- 				if (!list_empty(&ctx->poll_list))
+- 					io_iopoll_getevents(ctx, &nr_events, 0);
+- 				else
+- 					inflight = 0;
+- 				mutex_unlock(&ctx->uring_lock);
+- 			} else {
+- 				/*
+- 				 * Normal IO, just pretend everything completed.
+- 				 * We don't have to poll completions for that.
+- 				 */
+- 				nr_events = inflight;
+- 			}
+- 
+- 			inflight -= nr_events;
+- 			if (!inflight)
++ 			mutex_lock(&ctx->uring_lock);
++ 			if (!list_empty(&ctx->poll_list))
++ 				io_iopoll_getevents(ctx, &nr_events, 0);
++ 			else
+  				timeout = jiffies + ctx->sq_thread_idle;
++ 			mutex_unlock(&ctx->uring_lock);
+  		}
+  
+ -		to_submit = io_sqring_entries(ctx);
+ -
+ -		/*
+ -		 * If submit got -EBUSY, flag us as needing the application
+ -		 * to enter the kernel to reap and flush events.
+ -		 */
+ -		if (!to_submit || ret == -EBUSY) {
+ +		if (!io_get_sqring(ctx, &sqes[0])) {
+  			/*
+  			 * Drop cur_mm before scheduling, we can't hold it for
+  			 * long periods (or over schedule()). Do this before
+@@@ -2537,9 -5136,13 +2528,15 @@@
+  			/*
+  			 * We're polling. If we're within the defined idle
+  			 * period, then let us spin without work before going
+ -			 * to sleep. The exception is if we got EBUSY doing
+ -			 * more IO, we should wait for the application to
+ -			 * reap events and wake us up.
+ +			 * to sleep.
+  			 */
+++<<<<<<< HEAD
+ +			if (inflight || !time_after(jiffies, timeout)) {
+++=======
++ 			if (!list_empty(&ctx->poll_list) ||
++ 			    (!time_after(jiffies, timeout) && ret != -EBUSY &&
++ 			    !percpu_ref_is_dying(&ctx->refs))) {
+++>>>>>>> bdcd3eab2a9a (io_uring: fix poll_list race for SETUP_IOPOLL|SETUP_SQPOLL)
+  				cond_resched();
+  				continue;
+  			}
+@@@ -2547,8 -5150,21 +2544,21 @@@
+  			prepare_to_wait(&ctx->sqo_wait, &wait,
+  						TASK_INTERRUPTIBLE);
+  
++ 			/*
++ 			 * While doing polled IO, before going to sleep, we need
++ 			 * to check if there are new reqs added to poll_list, it
++ 			 * is because reqs may have been punted to io worker and
++ 			 * will be added to poll_list later, hence check the
++ 			 * poll_list again.
++ 			 */
++ 			if ((ctx->flags & IORING_SETUP_IOPOLL) &&
++ 			    !list_empty_careful(&ctx->poll_list)) {
++ 				finish_wait(&ctx->sqo_wait, &wait);
++ 				continue;
++ 			}
++ 
+  			/* Tell userspace we may need a wakeup call */
+ -			ctx->rings->sq_flags |= IORING_SQ_NEED_WAKEUP;
+ +			ctx->sq_ring->flags |= IORING_SQ_NEED_WAKEUP;
+  			/* make sure to read SQ tail after writing flags */
+  			smp_mb();
+  
+@@@ -2567,34 -5184,13 +2577,41 @@@
+  			}
+  			finish_wait(&ctx->sqo_wait, &wait);
+  
+ -			ctx->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
+ +			ctx->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+ +		}
+ +
+++<<<<<<< HEAD
+ +		i = 0;
+ +		all_fixed = true;
+ +		do {
+ +			if (all_fixed && io_sqe_needs_user(sqes[i].sqe))
+ +				all_fixed = false;
+ +
+ +			i++;
+ +			if (i == ARRAY_SIZE(sqes))
+ +				break;
+ +		} while (io_get_sqring(ctx, &sqes[i]));
+ +
+ +		/* Unless all new commands are FIXED regions, grab mm */
+ +		if (!all_fixed && !cur_mm) {
+ +			mm_fault = !mmget_not_zero(ctx->sqo_mm);
+ +			if (!mm_fault) {
+ +				use_mm(ctx->sqo_mm);
+ +				cur_mm = ctx->sqo_mm;
+ +			}
+  		}
+  
+ +		inflight += io_submit_sqes(ctx, sqes, i, cur_mm != NULL,
+ +						mm_fault);
+ +
+ +		/* Commit SQ ring head once we've consumed all SQEs */
+ +		io_commit_sqring(ctx);
+++=======
++ 		mutex_lock(&ctx->uring_lock);
++ 		ret = io_submit_sqes(ctx, to_submit, NULL, -1, &cur_mm, true);
++ 		mutex_unlock(&ctx->uring_lock);
++ 		timeout = jiffies + ctx->sq_thread_idle;
+++>>>>>>> bdcd3eab2a9a (io_uring: fix poll_list race for SETUP_IOPOLL|SETUP_SQPOLL)
+  	}
+  
+  	set_fs(old_fs);
+* Unmerged path fs/io_uring.c
