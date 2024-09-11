@@ -1,0 +1,196 @@
+nvdimm: Use namespace index data to reduce number of label reads needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Alexander Duyck <alexander.h.duyck@linux.intel.com>
+commit 7d47aad4570e5e6e9a8162bb417ca9b74132f27c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/7d47aad4.failed
+
+This patch adds logic that is meant to make use of the namespace index data
+to reduce the number of reads that are needed to initialize a given
+namespace. The general idea is that once we have enough data to validate
+the namespace index we do so and then proceed to fetch only those labels
+that are not listed as being "free". By doing this I am seeing a total time
+reduction from about 4-5 seconds to 2-3 seconds for 24 NVDIMM modules each
+with 128K of label config area.
+
+	Reviewed-by: Toshi Kani <toshi.kani@hpe.com>
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 7d47aad4570e5e6e9a8162bb417ca9b74132f27c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/label.c
+#	drivers/nvdimm/label.h
+diff --cc drivers/nvdimm/label.c
+index 43bad0d5bdb6,7f03d117824f..000000000000
+--- a/drivers/nvdimm/label.c
++++ b/drivers/nvdimm/label.c
+@@@ -417,6 -418,126 +418,129 @@@ int nd_label_reserve_dpa(struct nvdimm_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int nd_label_data_init(struct nvdimm_drvdata *ndd)
++ {
++ 	size_t config_size, read_size, max_xfer, offset;
++ 	struct nd_namespace_index *nsindex;
++ 	unsigned int i;
++ 	int rc = 0;
++ 
++ 	if (ndd->data)
++ 		return 0;
++ 
++ 	if (ndd->nsarea.status || ndd->nsarea.max_xfer == 0) {
++ 		dev_dbg(ndd->dev, "failed to init config data area: (%u:%u)\n",
++ 			ndd->nsarea.max_xfer, ndd->nsarea.config_size);
++ 		return -ENXIO;
++ 	}
++ 
++ 	/*
++ 	 * We need to determine the maximum index area as this is the section
++ 	 * we must read and validate before we can start processing labels.
++ 	 *
++ 	 * If the area is too small to contain the two indexes and 2 labels
++ 	 * then we abort.
++ 	 *
++ 	 * Start at a label size of 128 as this should result in the largest
++ 	 * possible namespace index size.
++ 	 */
++ 	ndd->nslabel_size = 128;
++ 	read_size = sizeof_namespace_index(ndd) * 2;
++ 	if (!read_size)
++ 		return -ENXIO;
++ 
++ 	/* Allocate config data */
++ 	config_size = ndd->nsarea.config_size;
++ 	ndd->data = kvzalloc(config_size, GFP_KERNEL);
++ 	if (!ndd->data)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * We want to guarantee as few reads as possible while conserving
++ 	 * memory. To do that we figure out how much unused space will be left
++ 	 * in the last read, divide that by the total number of reads it is
++ 	 * going to take given our maximum transfer size, and then reduce our
++ 	 * maximum transfer size based on that result.
++ 	 */
++ 	max_xfer = min_t(size_t, ndd->nsarea.max_xfer, config_size);
++ 	if (read_size < max_xfer) {
++ 		/* trim waste */
++ 		max_xfer -= ((max_xfer - 1) - (config_size - 1) % max_xfer) /
++ 			    DIV_ROUND_UP(config_size, max_xfer);
++ 		/* make certain we read indexes in exactly 1 read */
++ 		if (max_xfer < read_size)
++ 			max_xfer = read_size;
++ 	}
++ 
++ 	/* Make our initial read size a multiple of max_xfer size */
++ 	read_size = min(DIV_ROUND_UP(read_size, max_xfer) * max_xfer,
++ 			config_size);
++ 
++ 	/* Read the index data */
++ 	rc = nvdimm_get_config_data(ndd, ndd->data, 0, read_size);
++ 	if (rc)
++ 		goto out_err;
++ 
++ 	/* Validate index data, if not valid assume all labels are invalid */
++ 	ndd->ns_current = nd_label_validate(ndd);
++ 	if (ndd->ns_current < 0)
++ 		return 0;
++ 
++ 	/* Record our index values */
++ 	ndd->ns_next = nd_label_next_nsindex(ndd->ns_current);
++ 
++ 	/* Copy "current" index on top of the "next" index */
++ 	nsindex = to_current_namespace_index(ndd);
++ 	nd_label_copy(ndd, to_next_namespace_index(ndd), nsindex);
++ 
++ 	/* Determine starting offset for label data */
++ 	offset = __le64_to_cpu(nsindex->labeloff);
++ 
++ 	/* Loop through the free list pulling in any active labels */
++ 	for (i = 0; i < nsindex->nslot; i++, offset += ndd->nslabel_size) {
++ 		size_t label_read_size;
++ 
++ 		/* zero out the unused labels */
++ 		if (test_bit_le(i, nsindex->free)) {
++ 			memset(ndd->data + offset, 0, ndd->nslabel_size);
++ 			continue;
++ 		}
++ 
++ 		/* if we already read past here then just continue */
++ 		if (offset + ndd->nslabel_size <= read_size)
++ 			continue;
++ 
++ 		/* if we haven't read in a while reset our read_size offset */
++ 		if (read_size < offset)
++ 			read_size = offset;
++ 
++ 		/* determine how much more will be read after this next call. */
++ 		label_read_size = offset + ndd->nslabel_size - read_size;
++ 		label_read_size = DIV_ROUND_UP(label_read_size, max_xfer) *
++ 				  max_xfer;
++ 
++ 		/* truncate last read if needed */
++ 		if (read_size + label_read_size > config_size)
++ 			label_read_size = config_size - read_size;
++ 
++ 		/* Read the label data */
++ 		rc = nvdimm_get_config_data(ndd, ndd->data + read_size,
++ 					    read_size, label_read_size);
++ 		if (rc)
++ 			goto out_err;
++ 
++ 		/* push read_size to next read offset */
++ 		read_size += label_read_size;
++ 	}
++ 
++ 	dev_dbg(ndd->dev, "len: %zu rc: %d\n", offset, rc);
++ out_err:
++ 	return rc;
++ }
++ 
+++>>>>>>> 7d47aad4570e (nvdimm: Use namespace index data to reduce number of label reads needed)
+  int nd_label_active_count(struct nvdimm_drvdata *ndd)
+  {
+  	struct nd_namespace_index *nsindex;
+diff --cc drivers/nvdimm/label.h
+index 18bbe183b3a9,e9a2ad3c2150..000000000000
+--- a/drivers/nvdimm/label.h
++++ b/drivers/nvdimm/label.h
+@@@ -138,9 -138,7 +138,13 @@@ static inline int nd_label_next_nsindex
+  }
+  
+  struct nvdimm_drvdata;
+++<<<<<<< HEAD
+ +int nd_label_validate(struct nvdimm_drvdata *ndd);
+ +void nd_label_copy(struct nvdimm_drvdata *ndd, struct nd_namespace_index *dst,
+ +		struct nd_namespace_index *src);
+++=======
++ int nd_label_data_init(struct nvdimm_drvdata *ndd);
+++>>>>>>> 7d47aad4570e (nvdimm: Use namespace index data to reduce number of label reads needed)
+  size_t sizeof_namespace_index(struct nvdimm_drvdata *ndd);
+  int nd_label_active_count(struct nvdimm_drvdata *ndd);
+  struct nd_namespace_label *nd_label_active(struct nvdimm_drvdata *ndd, int n);
+diff --git a/drivers/nvdimm/dimm.c b/drivers/nvdimm/dimm.c
+index 233907889f96..eb0b38eddab8 100644
+--- a/drivers/nvdimm/dimm.c
++++ b/drivers/nvdimm/dimm.c
+@@ -63,10 +63,6 @@ static int nvdimm_probe(struct device *dev)
+ 	dev_dbg(dev, "config data size: %d\n", ndd->nsarea.config_size);
+ 
+ 	nvdimm_bus_lock(dev);
+-	ndd->ns_current = nd_label_validate(ndd);
+-	ndd->ns_next = nd_label_next_nsindex(ndd->ns_current);
+-	nd_label_copy(ndd, to_next_namespace_index(ndd),
+-			to_current_namespace_index(ndd));
+ 	if (ndd->ns_current >= 0) {
+ 		rc = nd_label_reserve_dpa(ndd);
+ 		if (rc == 0)
+* Unmerged path drivers/nvdimm/label.c
+* Unmerged path drivers/nvdimm/label.h
