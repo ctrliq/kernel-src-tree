@@ -1,0 +1,118 @@
+cpuidle: Select polling interval based on a c-state with a longer target residency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 7a25759eaa04b8c0ecb3db134922d6641ab2e6d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/7a25759e.failed
+
+It was noted that a few workloads that idle rapidly regressed when commit
+36fcb4292473 ("cpuidle: use first valid target residency as poll time")
+was merged. The workloads in question were heavy communicators that idle
+rapidly and were impacted by the c-state exit latency as the active CPUs
+were not polling at the time of wakeup. As they were not particularly
+realistic workloads, it was not considered to be a major problem.
+
+Unfortunately, a bug was reported for a real workload in a production
+environment that relied on large numbers of threads operating in a worker
+pool pattern. These threads would idle for periods of time longer than the
+C1 target residency and so incurred the c-state exit latency penalty. The
+application is very sensitive to wakeup latency and indirectly relying
+on behaviour prior to commit on a37b969a61c1 ("cpuidle: poll_state: Add
+time limit to poll_idle()") to poll for long enough to avoid the exit
+latency cost.
+
+The target residency of C1 is typically very short. On some x86 machines,
+it can be as low as 2 microseconds. In poll_idle(), the clock is checked
+every POLL_IDLE_RELAX_COUNT interations of cpu_relax() and even one
+iteration of that loop can be over 1 microsecond so the polling interval is
+very close to the granularity of what poll_idle() can detect. Furthermore,
+a basic ping pong workload like perf bench pipe has a longer round-trip
+time than the 2 microseconds meaning that the CPU will almost certainly
+not be polling when the ping-pong completes.
+
+This patch selects a polling interval based on an enabled c-state that
+has an target residency longer than 10usec. If there is no enabled-cstate
+then polling will be up to a TICK_NSEC/16 similar to what it was up until
+kernel 4.20. Polling for a full tick is unlikely (rescheduling event)
+and is much longer than the existing target residencies for a deep c-state.
+
+As an example, consider a CPU with the following c-state information from
+an Intel CPU;
+
+	residency	exit_latency
+C1	2		2
+C1E	20		10
+C3	100		33
+C6	400		133
+
+The polling interval selected is 20usec. If booted with
+intel_idle.max_cstate=1 then the polling interval is 250usec as the deeper
+c-states were not available.
+
+On an AMD EPYC machine, the c-state information is more limited and
+looks like
+
+	residency	exit_latency
+C1	2		1
+C2	800		400
+
+The polling interval selected is 250usec. While C2 was considered, the
+polling interval was clamped by CPUIDLE_POLL_MAX.
+
+Note that it is not expected that polling will be a universal win. As
+well as potentially trading power for performance, the performance is not
+guaranteed if the extra polling prevented a turbo state being reached.
+Making it a tunable was considered but it's driver-specific, may be
+overridden by a governor and is not a guaranteed polling interval making
+it difficult to describe without knowledge of the implementation.
+
+tbench4
+			     vanilla		    polling
+Hmean     1        497.89 (   0.00%)      543.15 *   9.09%*
+Hmean     2        975.88 (   0.00%)     1059.73 *   8.59%*
+Hmean     4       1953.97 (   0.00%)     2081.37 *   6.52%*
+Hmean     8       3645.76 (   0.00%)     4052.95 *  11.17%*
+Hmean     16      6882.21 (   0.00%)     6995.93 *   1.65%*
+Hmean     32     10752.20 (   0.00%)    10731.53 *  -0.19%*
+Hmean     64     12875.08 (   0.00%)    12478.13 *  -3.08%*
+Hmean     128    21500.54 (   0.00%)    21098.60 *  -1.87%*
+Hmean     256    21253.70 (   0.00%)    21027.18 *  -1.07%*
+Hmean     320    20813.50 (   0.00%)    20580.64 *  -1.12%*
+
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 7a25759eaa04b8c0ecb3db134922d6641ab2e6d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpuidle/cpuidle.c
+diff --cc drivers/cpuidle/cpuidle.c
+index c3cf7631753d,ef2ea1b12cd8..000000000000
+--- a/drivers/cpuidle/cpuidle.c
++++ b/drivers/cpuidle/cpuidle.c
+@@@ -381,11 -395,15 +394,20 @@@ u64 cpuidle_poll_time(struct cpuidle_dr
+  	int i;
+  	u64 limit_ns;
+  
+++<<<<<<< HEAD
+ +	if (dev->rh_cpuidle_dev.poll_limit_ns)
+ +		return dev->rh_cpuidle_dev.poll_limit_ns;
+++=======
++ 	BUILD_BUG_ON(CPUIDLE_POLL_MIN > CPUIDLE_POLL_MAX);
+  
+- 	limit_ns = TICK_NSEC;
++ 	if (dev->poll_limit_ns)
++ 		return dev->poll_limit_ns;
+++>>>>>>> 7a25759eaa04 (cpuidle: Select polling interval based on a c-state with a longer target residency)
++ 
++ 	limit_ns = CPUIDLE_POLL_MAX;
+  	for (i = 1; i < drv->state_count; i++) {
++ 		u64 state_limit;
++ 
+  		if (dev->states_usage[i].disable)
+  			continue;
+  
+* Unmerged path drivers/cpuidle/cpuidle.c
