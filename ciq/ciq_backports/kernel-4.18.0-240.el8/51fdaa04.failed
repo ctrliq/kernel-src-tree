@@ -1,0 +1,116 @@
+scsi: sd_sbc: Fix sd_zbc_report_zones()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit 51fdaa0490241e8cd41b40cbf43a336d1a014460
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/51fdaa04.failed
+
+The block layer generic blk_revalidate_disk_zones() checks the validity of
+zone descriptors reported by a disk using the blk_revalidate_zone_cb()
+callback function executed for each zone descriptor. If a ZBC disk reports
+invalid zone descriptors, blk_revalidate_disk_zones() returns an error and
+sd_zbc_read_zones() changes the disk capacity to 0, which in turn results
+in the gendisk structure capacity to be set to 0. This all works well for
+the first revalidate pass on a disk and the block layer detects the
+capactiy change.
+
+On the second revalidate pass, blk_revalidate_disk_zones() is called again
+and sd_zbc_report_zones() executed to check the zones a second time.
+However, for this second pass, the gendisk capacity is now 0, which results
+in sd_zbc_report_zones() to do nothing and to report success and no
+zones. blk_revalidate_disk_zones() in turn returns success and sets the
+disk queue chunk_sectors limit with zero as no zones were checked, causing
+a oops to trigger on the BUG_ON(!is_power_of_2(chunk_sectors)) in
+blk_queue_chunk_sectors().
+
+Fix this by using the sdkp capacity field rather than the gendisk capacity
+for the report zones loop in sd_zbc_report_zones(). Also add a check to
+return immediately an error if the sdkp capacity is 0.  With this fix,
+invalid/buggy ZBC disk scan does not trigger a oops and are exposed with a
+0 capacity. This change also preserve the chance for the disk to be
+correctly revalidated on the second revalidate pass as the scsi disk
+structure capacity field is always set to the disk reported value when
+sd_zbc_report_zones() is called.
+
+Link: https://lore.kernel.org/r/20200219063800.880834-1-damien.lemoal@wdc.com
+Fixes: d41003513e61 ("block: rework zone reporting")
+	Cc: Cc: <stable@vger.kernel.org> # v5.5
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 51fdaa0490241e8cd41b40cbf43a336d1a014460)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd_zbc.c
+index 3707ee36b4d8,f45c22b09726..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -167,6 -157,58 +167,61 @@@ static inline sector_t sd_zbc_zone_sect
+  	return logical_to_sectors(sdkp->device, sdkp->zone_blocks);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
++ 			unsigned int nr_zones, report_zones_cb cb, void *data)
++ {
++ 	struct scsi_disk *sdkp = scsi_disk(disk);
++ 	sector_t capacity = logical_to_sectors(sdkp->device, sdkp->capacity);
++ 	unsigned int nr, i;
++ 	unsigned char *buf;
++ 	size_t offset, buflen = 0;
++ 	int zone_idx = 0;
++ 	int ret;
++ 
++ 	if (!sd_is_zoned(sdkp))
++ 		/* Not a zoned device */
++ 		return -EOPNOTSUPP;
++ 
++ 	if (!capacity)
++ 		/* Device gone or invalid */
++ 		return -ENODEV;
++ 
++ 	buf = sd_zbc_alloc_report_buffer(sdkp, nr_zones, &buflen);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	while (zone_idx < nr_zones && sector < capacity) {
++ 		ret = sd_zbc_do_report_zones(sdkp, buf, buflen,
++ 				sectors_to_logical(sdkp->device, sector), true);
++ 		if (ret)
++ 			goto out;
++ 
++ 		offset = 0;
++ 		nr = min(nr_zones, get_unaligned_be32(&buf[0]) / 64);
++ 		if (!nr)
++ 			break;
++ 
++ 		for (i = 0; i < nr && zone_idx < nr_zones; i++) {
++ 			offset += 64;
++ 			ret = sd_zbc_parse_report(sdkp, buf + offset, zone_idx,
++ 						  cb, data);
++ 			if (ret)
++ 				goto out;
++ 			zone_idx++;
++ 		}
++ 
++ 		sector += sd_zbc_zone_sectors(sdkp) * i;
++ 	}
++ 
++ 	ret = zone_idx;
++ out:
++ 	kvfree(buf);
++ 	return ret;
++ }
++ 
+++>>>>>>> 51fdaa049024 (scsi: sd_sbc: Fix sd_zbc_report_zones())
+  /**
+   * sd_zbc_setup_zone_mgmt_cmnd - Prepare a zone ZBC_OUT command. The operations
+   *			can be RESET WRITE POINTER, OPEN, CLOSE or FINISH.
+* Unmerged path drivers/scsi/sd_zbc.c
