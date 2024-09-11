@@ -1,0 +1,148 @@
+x86/kvm: Teardown PV features on boot CPU as well
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 8b79feffeca28c5459458fe78676b081e87c93a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/8b79feff.failed
+
+Various PV features (Async PF, PV EOI, steal time) work through memory
+shared with hypervisor and when we restore from hibernation we must
+properly teardown all these features to make sure hypervisor doesn't
+write to stale locations after we jump to the previously hibernated kernel
+(which can try to place anything there). For secondary CPUs the job is
+already done by kvm_cpu_down_prepare(), register syscore ops to do
+the same for boot CPU.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20210414123544.1060604-3-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8b79feffeca28c5459458fe78676b081e87c93a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kvm.c
+diff --cc arch/x86/kernel/kvm.c
+index 1a02ea5c1ffd,9d5f96321c7f..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -460,6 -452,29 +461,32 @@@ static void __init sev_map_percpu_data(
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void kvm_guest_cpu_offline(void)
++ {
++ 	kvm_disable_steal_time();
++ 	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
++ 		wrmsrl(MSR_KVM_PV_EOI_EN, 0);
++ 	kvm_pv_disable_apf();
++ 	apf_task_wake_all();
++ }
++ 
++ static int kvm_cpu_online(unsigned int cpu)
++ {
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	kvm_guest_cpu_init();
++ 	local_irq_restore(flags);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_SMP
++ 
++ static DEFINE_PER_CPU(cpumask_var_t, __pv_cpu_mask);
++ 
+++>>>>>>> 8b79feffeca2 (x86/kvm: Teardown PV features on boot CPU as well)
+  static bool pv_tlb_flush_supported(void)
+  {
+  	return (kvm_para_has_feature(KVM_FEATURE_PV_TLB_FLUSH) &&
+@@@ -596,58 -655,35 +623,63 @@@ static void __init kvm_smp_prepare_boot
+  	kvm_spinlock_init();
+  }
+  
+- static void kvm_guest_cpu_offline(void)
+- {
+- 	kvm_disable_steal_time();
+- 	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
+- 		wrmsrl(MSR_KVM_PV_EOI_EN, 0);
+- 	kvm_pv_disable_apf();
+- 	apf_task_wake_all();
+- }
+- 
+- static int kvm_cpu_online(unsigned int cpu)
+- {
+- 	local_irq_disable();
+- 	kvm_guest_cpu_init();
+- 	local_irq_enable();
+- 	return 0;
+- }
+- 
+  static int kvm_cpu_down_prepare(unsigned int cpu)
+  {
+- 	local_irq_disable();
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
+  	kvm_guest_cpu_offline();
+- 	local_irq_enable();
++ 	local_irq_restore(flags);
+  	return 0;
+  }
+ -
+  #endif
+  
+++<<<<<<< HEAD
+ +static void kvm_flush_tlb_others(const struct cpumask *cpumask,
+ +			const struct flush_tlb_info *info)
+ +{
+ +	u8 state;
+ +	int cpu;
+ +	struct kvm_steal_time *src;
+ +	struct cpumask *flushmask = this_cpu_cpumask_var_ptr(__pv_cpu_mask);
+ +
+ +	cpumask_copy(flushmask, cpumask);
+ +	/*
+ +	 * We have to call flush only on online vCPUs. And
+ +	 * queue flush_on_enter for pre-empted vCPUs
+ +	 */
+ +	for_each_cpu(cpu, flushmask) {
+ +		src = &per_cpu(steal_time, cpu);
+ +		state = READ_ONCE(src->preempted);
+ +		if ((state & KVM_VCPU_PREEMPTED)) {
+ +			if (try_cmpxchg(&src->preempted, &state,
+ +					state | KVM_VCPU_FLUSH_TLB))
+ +				__cpumask_clear_cpu(cpu, flushmask);
+ +		}
+ +	}
+ +
+ +	native_flush_tlb_others(flushmask, info);
+ +}
+ +
+++=======
++ static int kvm_suspend(void)
++ {
++ 	kvm_guest_cpu_offline();
++ 
++ 	return 0;
++ }
++ 
++ static void kvm_resume(void)
++ {
++ 	kvm_cpu_online(raw_smp_processor_id());
++ }
++ 
++ static struct syscore_ops kvm_syscore_ops = {
++ 	.suspend	= kvm_suspend,
++ 	.resume		= kvm_resume,
++ };
++ 
+++>>>>>>> 8b79feffeca2 (x86/kvm: Teardown PV features on boot CPU as well)
+  static void __init kvm_guest_init(void)
+  {
+  	int i;
+* Unmerged path arch/x86/kernel/kvm.c
