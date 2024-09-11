@@ -11,7 +11,6 @@
 #include <net/sock.h>
 #include <uapi/linux/sock_diag.h>
 #include <uapi/linux/btf.h>
-#include <linux/btf_ids.h>
 
 #define SK_STORAGE_CREATE_FLAG_MASK					\
 	(BPF_F_NO_PREALLOC | BPF_F_CLONE)
