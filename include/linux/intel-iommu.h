@@ -717,9 +717,9 @@ static inline bool dma_pte_superpage(struct dma_pte *pte)
 	return (pte->val & DMA_PTE_LARGE_PAGE);
 }
 
-static inline int first_pte_in_page(struct dma_pte *pte)
+static inline bool first_pte_in_page(struct dma_pte *pte)
 {
-	return !((unsigned long)pte & ~VTD_PAGE_MASK);
+	return IS_ALIGNED((unsigned long)pte, VTD_PAGE_SIZE);
 }
 
 static inline int nr_pte_to_next_page(struct dma_pte *pte)
