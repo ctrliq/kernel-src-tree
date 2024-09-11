@@ -1,0 +1,323 @@
+x86/Hyper-V: Support for free page reporting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sunil Muthuswamy <sunilmut@microsoft.com>
+commit 6dc2a774cb4fdb524b7eb0b8db74198a1b4815ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/6dc2a774.failed
+
+Linux has support for free page reporting now (36e66c554b5c) for
+virtualized environment. On Hyper-V when virtually backed VMs are
+configured, Hyper-V will advertise cold memory discard capability,
+when supported. This patch adds the support to hook into the free
+page reporting infrastructure and leverage the Hyper-V cold memory
+discard hint hypercall to report/free these pages back to the host.
+
+	Signed-off-by: Sunil Muthuswamy <sunilmut@microsoft.com>
+	Tested-by: Matheus Castello <matheus@castello.eng.br>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Tested-by: Nathan Chancellor <nathan@kernel.org>
+Link: https://lore.kernel.org/r/SN4PR2101MB0880121FA4E2FEC67F35C1DCC0649@SN4PR2101MB0880.namprd21.prod.outlook.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 6dc2a774cb4fdb524b7eb0b8db74198a1b4815ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+#	include/asm-generic/hyperv-tlfs.h
+diff --cc arch/x86/hyperv/hv_init.c
+index 73c835ac92d5,7c9da3f65afa..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -461,6 -482,24 +461,27 @@@ void __init hyperv_init(void
+  
+  	register_syscore_ops(&hv_syscore_ops);
+  
+++<<<<<<< HEAD
+++=======
++ 	hyperv_init_cpuhp = cpuhp;
++ 
++ 	if (cpuid_ebx(HYPERV_CPUID_FEATURES) & HV_ACCESS_PARTITION_ID)
++ 		hv_get_partition_id();
++ 
++ 	BUG_ON(hv_root_partition && hv_current_partition_id == ~0ull);
++ 
++ #ifdef CONFIG_PCI_MSI
++ 	/*
++ 	 * If we're running as root, we want to create our own PCI MSI domain.
++ 	 * We can't set this in hv_pci_init because that would be too late.
++ 	 */
++ 	if (hv_root_partition)
++ 		x86_init.irqs.create_pci_msi_domain = hv_create_pci_msi_domain;
++ #endif
++ 
++ 	/* Query the VMs extended capability once, so that it can be cached. */
++ 	hv_query_ext_cap(0);
+++>>>>>>> 6dc2a774cb4f (x86/Hyper-V: Support for free page reporting)
+  	return;
+  
+  remove_cpuhp_state:
+diff --cc include/asm-generic/hyperv-tlfs.h
+index 27c80a6429f5,515c3fb06ab3..000000000000
+--- a/include/asm-generic/hyperv-tlfs.h
++++ b/include/asm-generic/hyperv-tlfs.h
+@@@ -609,4 -755,54 +624,57 @@@ union hv_device_id 
+  	} acpi;
+  } __packed;
+  
+++<<<<<<< HEAD
+++=======
++ enum hv_interrupt_trigger_mode {
++ 	HV_INTERRUPT_TRIGGER_MODE_EDGE = 0,
++ 	HV_INTERRUPT_TRIGGER_MODE_LEVEL = 1,
++ };
++ 
++ struct hv_device_interrupt_descriptor {
++ 	u32 interrupt_type;
++ 	u32 trigger_mode;
++ 	u32 vector_count;
++ 	u32 reserved;
++ 	struct hv_device_interrupt_target target;
++ } __packed;
++ 
++ struct hv_input_map_device_interrupt {
++ 	u64 partition_id;
++ 	u64 device_id;
++ 	u64 flags;
++ 	struct hv_interrupt_entry logical_interrupt_entry;
++ 	struct hv_device_interrupt_descriptor interrupt_descriptor;
++ } __packed;
++ 
++ struct hv_output_map_device_interrupt {
++ 	struct hv_interrupt_entry interrupt_entry;
++ } __packed;
++ 
++ struct hv_input_unmap_device_interrupt {
++ 	u64 partition_id;
++ 	u64 device_id;
++ 	struct hv_interrupt_entry interrupt_entry;
++ } __packed;
++ 
++ #define HV_SOURCE_SHADOW_NONE               0x0
++ #define HV_SOURCE_SHADOW_BRIDGE_BUS_RANGE   0x1
++ 
++ /*
++  * The whole argument should fit in a page to be able to pass to the hypervisor
++  * in one hypercall.
++  */
++ #define HV_MEMORY_HINT_MAX_GPA_PAGE_RANGES  \
++ 	((HV_HYP_PAGE_SIZE - sizeof(struct hv_memory_hint)) / \
++ 		sizeof(union hv_gpa_page_range))
++ 
++ /* HvExtCallMemoryHeatHint hypercall */
++ #define HV_EXT_MEMORY_HEAT_HINT_TYPE_COLD_DISCARD	2
++ struct hv_memory_hint {
++ 	u64 type:2;
++ 	u64 reserved:62;
++ 	union hv_gpa_page_range ranges[];
++ } __packed;
++ 
+++>>>>>>> 6dc2a774cb4f (x86/Hyper-V: Support for free page reporting)
+  #endif
+* Unmerged path arch/x86/hyperv/hv_init.c
+diff --git a/arch/x86/kernel/cpu/mshyperv.c b/arch/x86/kernel/cpu/mshyperv.c
+index d6de01e9a6cf..b52eed95c481 100644
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -232,12 +232,13 @@ static void __init ms_hyperv_init_platform(void)
+ 	 * Extract the features and hints
+ 	 */
+ 	ms_hyperv.features = cpuid_eax(HYPERV_CPUID_FEATURES);
+-	ms_hyperv.features_b = cpuid_ebx(HYPERV_CPUID_FEATURES);
++	ms_hyperv.priv_high = cpuid_ebx(HYPERV_CPUID_FEATURES);
+ 	ms_hyperv.misc_features = cpuid_edx(HYPERV_CPUID_FEATURES);
+ 	ms_hyperv.hints    = cpuid_eax(HYPERV_CPUID_ENLIGHTMENT_INFO);
+ 
+-	pr_info("Hyper-V: features 0x%x, hints 0x%x, misc 0x%x\n",
+-		ms_hyperv.features, ms_hyperv.hints, ms_hyperv.misc_features);
++	pr_info("Hyper-V: privilege flags low 0x%x, high 0x%x, hints 0x%x, misc 0x%x\n",
++		ms_hyperv.features, ms_hyperv.priv_high, ms_hyperv.hints,
++		ms_hyperv.misc_features);
+ 
+ 	ms_hyperv.max_vp_index = cpuid_eax(HYPERV_CPUID_IMPLEMENT_LIMITS);
+ 	ms_hyperv.max_lp_index = cpuid_ebx(HYPERV_CPUID_IMPLEMENT_LIMITS);
+@@ -283,7 +284,7 @@ static void __init ms_hyperv_init_platform(void)
+ 		x86_platform.calibrate_cpu = hv_get_tsc_khz;
+ 	}
+ 
+-	if (ms_hyperv.features_b & HV_ISOLATION) {
++	if (ms_hyperv.priv_high & HV_ISOLATION) {
+ 		ms_hyperv.isolation_config_a = cpuid_eax(HYPERV_CPUID_ISOLATION_CONFIG);
+ 		ms_hyperv.isolation_config_b = cpuid_ebx(HYPERV_CPUID_ISOLATION_CONFIG);
+ 
+diff --git a/drivers/hv/Kconfig b/drivers/hv/Kconfig
+index ad9a3a5a1064..806abb2e7266 100644
+--- a/drivers/hv/Kconfig
++++ b/drivers/hv/Kconfig
+@@ -22,6 +22,7 @@ config HYPERV_UTILS
+ config HYPERV_BALLOON
+ 	tristate "Microsoft Hyper-V Balloon driver"
+ 	depends on HYPERV
++	select PAGE_REPORTING
+ 	help
+ 	  Select this option to enable Hyper-V Balloon driver.
+ 
+diff --git a/drivers/hv/hv_balloon.c b/drivers/hv/hv_balloon.c
+index 64c79c8c6105..cf2fef85e61d 100644
+--- a/drivers/hv/hv_balloon.c
++++ b/drivers/hv/hv_balloon.c
+@@ -31,6 +31,7 @@
+ #include <linux/memory.h>
+ #include <linux/notifier.h>
+ #include <linux/percpu_counter.h>
++#include <linux/page_reporting.h>
+ 
+ #include <linux/hyperv.h>
+ #include <asm/hyperv-tlfs.h>
+@@ -573,6 +574,8 @@ struct hv_dynmem_device {
+ 	 * The negotiated version agreed by host.
+ 	 */
+ 	__u32 version;
++
++	struct page_reporting_dev_info pr_dev_info;
+ };
+ 
+ static struct hv_dynmem_device dm_device;
+@@ -1578,6 +1581,89 @@ static void balloon_onchannelcallback(void *context)
+ 
+ }
+ 
++/* Hyper-V only supports reporting 2MB pages or higher */
++#define HV_MIN_PAGE_REPORTING_ORDER	9
++#define HV_MIN_PAGE_REPORTING_LEN (HV_HYP_PAGE_SIZE << HV_MIN_PAGE_REPORTING_ORDER)
++static int hv_free_page_report(struct page_reporting_dev_info *pr_dev_info,
++		    struct scatterlist *sgl, unsigned int nents)
++{
++	unsigned long flags;
++	struct hv_memory_hint *hint;
++	int i;
++	u64 status;
++	struct scatterlist *sg;
++
++	WARN_ON_ONCE(nents > HV_MEMORY_HINT_MAX_GPA_PAGE_RANGES);
++	WARN_ON_ONCE(sgl->length < HV_MIN_PAGE_REPORTING_LEN);
++	local_irq_save(flags);
++	hint = *(struct hv_memory_hint **)this_cpu_ptr(hyperv_pcpu_input_arg);
++	if (!hint) {
++		local_irq_restore(flags);
++		return -ENOSPC;
++	}
++
++	hint->type = HV_EXT_MEMORY_HEAT_HINT_TYPE_COLD_DISCARD;
++	hint->reserved = 0;
++	for_each_sg(sgl, sg, nents, i) {
++		union hv_gpa_page_range *range;
++
++		range = &hint->ranges[i];
++		range->address_space = 0;
++		/* page reporting only reports 2MB pages or higher */
++		range->page.largepage = 1;
++		range->page.additional_pages =
++			(sg->length / HV_MIN_PAGE_REPORTING_LEN) - 1;
++		range->page_size = HV_GPA_PAGE_RANGE_PAGE_SIZE_2MB;
++		range->base_large_pfn =
++			page_to_hvpfn(sg_page(sg)) >> HV_MIN_PAGE_REPORTING_ORDER;
++	}
++
++	status = hv_do_rep_hypercall(HV_EXT_CALL_MEMORY_HEAT_HINT, nents, 0,
++				     hint, NULL);
++	local_irq_restore(flags);
++	if ((status & HV_HYPERCALL_RESULT_MASK) != HV_STATUS_SUCCESS) {
++		pr_err("Cold memory discard hypercall failed with status %llx\n",
++			status);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void enable_page_reporting(void)
++{
++	int ret;
++
++	/* Essentially, validating 'PAGE_REPORTING_MIN_ORDER' is big enough. */
++	if (pageblock_order < HV_MIN_PAGE_REPORTING_ORDER) {
++		pr_debug("Cold memory discard is only supported on 2MB pages and above\n");
++		return;
++	}
++
++	if (!hv_query_ext_cap(HV_EXT_CAPABILITY_MEMORY_COLD_DISCARD_HINT)) {
++		pr_debug("Cold memory discard hint not supported by Hyper-V\n");
++		return;
++	}
++
++	BUILD_BUG_ON(PAGE_REPORTING_CAPACITY > HV_MEMORY_HINT_MAX_GPA_PAGE_RANGES);
++	dm_device.pr_dev_info.report = hv_free_page_report;
++	ret = page_reporting_register(&dm_device.pr_dev_info);
++	if (ret < 0) {
++		dm_device.pr_dev_info.report = NULL;
++		pr_err("Failed to enable cold memory discard: %d\n", ret);
++	} else {
++		pr_info("Cold memory discard hint enabled\n");
++	}
++}
++
++static void disable_page_reporting(void)
++{
++	if (dm_device.pr_dev_info.report) {
++		page_reporting_unregister(&dm_device.pr_dev_info);
++		dm_device.pr_dev_info.report = NULL;
++	}
++}
++
+ static int balloon_connect_vsp(struct hv_device *dev)
+ {
+ 	struct dm_version_request version_req;
+@@ -1723,6 +1809,7 @@ static int balloon_probe(struct hv_device *dev,
+ 	if (ret != 0)
+ 		return ret;
+ 
++	enable_page_reporting();
+ 	dm_device.state = DM_INITIALIZED;
+ 
+ 	dm_device.thread =
+@@ -1737,6 +1824,7 @@ static int balloon_probe(struct hv_device *dev,
+ probe_error:
+ 	dm_device.state = DM_INIT_ERROR;
+ 	dm_device.thread  = NULL;
++	disable_page_reporting();
+ 	vmbus_close(dev->channel);
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ 	unregister_memory_notifier(&hv_memory_nb);
+@@ -1759,6 +1847,7 @@ static int balloon_remove(struct hv_device *dev)
+ 	cancel_work_sync(&dm->ha_wrk.wrk);
+ 
+ 	kthread_stop(dm->thread);
++	disable_page_reporting();
+ 	vmbus_close(dev->channel);
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ 	unregister_memory_notifier(&hv_memory_nb);
+* Unmerged path include/asm-generic/hyperv-tlfs.h
+diff --git a/include/asm-generic/mshyperv.h b/include/asm-generic/mshyperv.h
+index c841bf288ef1..0bcf940daff2 100644
+--- a/include/asm-generic/mshyperv.h
++++ b/include/asm-generic/mshyperv.h
+@@ -27,7 +27,7 @@
+ 
+ struct ms_hyperv_info {
+ 	u32 features;
+-	u32 features_b;
++	u32 priv_high;
+ 	u32 misc_features;
+ 	u32 hints;
+ 	u32 nested_features;
+@@ -173,6 +173,7 @@ bool hv_is_hibernation_supported(void);
+ enum hv_isolation_type hv_get_isolation_type(void);
+ bool hv_is_isolation_supported(void);
+ void hyperv_cleanup(void);
++bool hv_query_ext_cap(u64 cap_query);
+ #else /* CONFIG_HYPERV */
+ static inline bool hv_is_hyperv_initialized(void) { return false; }
+ static inline bool hv_is_hibernation_supported(void) { return false; }
