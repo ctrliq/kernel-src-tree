@@ -1,0 +1,270 @@
+irq_work: Cleanup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 7a9f50a05843fee8366bd3a65addbebaa7cf7f07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/7a9f50a0.failed
+
+Get rid of the __call_single_node union and clean up the API a little
+to avoid external code relying on the structure layout as much.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+(cherry picked from commit 7a9f50a05843fee8366bd3a65addbebaa7cf7f07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irq_work.h
+#	kernel/irq_work.c
+diff --cc include/linux/irq_work.h
+index 52859a85ce23,ec2a47a81e42..000000000000
+--- a/include/linux/irq_work.h
++++ b/include/linux/irq_work.h
+@@@ -14,19 -13,8 +14,23 @@@
+   * busy      NULL, 2 -> {free, claimed} : callback in progress, can be claimed
+   */
+  
+ +#define IRQ_WORK_PENDING	BIT(0)
+ +#define IRQ_WORK_BUSY		BIT(1)
+ +
+ +/* Doesn't want IPI, wait for tick: */
+ +#define IRQ_WORK_LAZY		BIT(2)
+ +/* Run hard IRQ context, even on RT */
+ +#define IRQ_WORK_HARD_IRQ	BIT(3)
+ +
+ +#define IRQ_WORK_CLAIMED	(IRQ_WORK_PENDING | IRQ_WORK_BUSY)
+ +
+  struct irq_work {
+++<<<<<<< HEAD
+ +	RH_KABI_REPLACE(unsigned long flags, atomic_t flags)
+ +	struct llist_node llnode;
+++=======
++ 	struct __call_single_node node;
+++>>>>>>> 7a9f50a05843 (irq_work: Cleanup)
+  	void (*func)(struct irq_work *);
+  };
+  
+diff --cc kernel/irq_work.c
+index fc8d175a5d09,fbff25adb574..000000000000
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@@ -30,7 -31,7 +30,11 @@@ static bool irq_work_claim(struct irq_w
+  {
+  	int oflags;
+  
+++<<<<<<< HEAD
+ +	oflags = atomic_fetch_or(IRQ_WORK_CLAIMED, &work->flags);
+++=======
++ 	oflags = atomic_fetch_or(IRQ_WORK_CLAIMED | CSD_TYPE_IRQ_WORK, &work->node.a_flags);
+++>>>>>>> 7a9f50a05843 (irq_work: Cleanup)
+  	/*
+  	 * If the work is already pending, no need to raise the IPI.
+  	 * The pairing atomic_fetch_andnot() in irq_work_run() makes sure
+@@@ -101,8 -102,7 +105,12 @@@ bool irq_work_queue_on(struct irq_work 
+  	if (cpu != smp_processor_id()) {
+  		/* Arch remote IPI send/receive backend aren't NMI safe */
+  		WARN_ON_ONCE(in_nmi());
+++<<<<<<< HEAD
+ +		if (llist_add(&work->llnode, &per_cpu(raised_list, cpu)))
+ +			arch_send_call_function_single_ipi(cpu);
+++=======
++ 		__smp_call_single_queue(cpu, &work->node.llist);
+++>>>>>>> 7a9f50a05843 (irq_work: Cleanup)
+  	} else {
+  		__irq_work_queue_local(work);
+  	}
+@@@ -130,6 -130,31 +138,34 @@@ bool irq_work_needs_cpu(void
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void irq_work_single(void *arg)
++ {
++ 	struct irq_work *work = arg;
++ 	int flags;
++ 
++ 	/*
++ 	 * Clear the PENDING bit, after this point the @work
++ 	 * can be re-used.
++ 	 * Make it immediately visible so that other CPUs trying
++ 	 * to claim that work don't rely on us to handle their data
++ 	 * while we are in the middle of the func.
++ 	 */
++ 	flags = atomic_fetch_andnot(IRQ_WORK_PENDING, &work->node.a_flags);
++ 
++ 	lockdep_irq_work_enter(work);
++ 	work->func(work);
++ 	lockdep_irq_work_exit(work);
++ 	/*
++ 	 * Clear the BUSY bit and return to the free state if
++ 	 * no-one else claimed it meanwhile.
++ 	 */
++ 	flags &= ~IRQ_WORK_PENDING;
++ 	(void)atomic_cmpxchg(&work->node.a_flags, flags, flags & ~IRQ_WORK_BUSY);
++ }
++ 
+++>>>>>>> 7a9f50a05843 (irq_work: Cleanup)
+  static void irq_work_run_list(struct llist_head *list)
+  {
+  	struct irq_work *work, *tmp;
+@@@ -141,27 -166,8 +177,32 @@@
+  		return;
+  
+  	llnode = llist_del_all(list);
+++<<<<<<< HEAD
+ +	llist_for_each_entry_safe(work, tmp, llnode, llnode) {
+ +		int flags;
+ +		/*
+ +		 * Clear the PENDING bit, after this point the @work
+ +		 * can be re-used.
+ +		 * Make it immediately visible so that other CPUs trying
+ +		 * to claim that work don't rely on us to handle their data
+ +		 * while we are in the middle of the func.
+ +		 */
+ +		flags = atomic_fetch_andnot(IRQ_WORK_PENDING, &work->flags);
+ +
+ +		lockdep_irq_work_enter(work);
+ +		work->func(work);
+ +		lockdep_irq_work_exit(work);
+ +		/*
+ +		 * Clear the BUSY bit and return to the free state if
+ +		 * no-one else claimed it meanwhile.
+ +		 */
+ +		flags &= ~IRQ_WORK_PENDING;
+ +		(void)atomic_cmpxchg(&work->flags, flags, flags & ~IRQ_WORK_BUSY);
+ +	}
+++=======
++ 	llist_for_each_entry_safe(work, tmp, llnode, node.llist)
++ 		irq_work_single(work);
+++>>>>>>> 7a9f50a05843 (irq_work: Cleanup)
+  }
+  
+  /*
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index 87dbd906c3e6..7db972fa7024 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -201,7 +201,7 @@ __notify_execute_cb(struct i915_request *rq, bool (*fn)(struct irq_work *wrk))
+ 
+ 	llist_for_each_entry_safe(cb, cn,
+ 				  llist_del_all(&rq->execute_cb),
+-				  work.llnode)
++				  work.node.llist)
+ 		fn(&cb->work);
+ }
+ 
+@@ -556,7 +556,7 @@ __await_execution(struct i915_request *rq,
+ 	 * callback first, then checking the ACTIVE bit, we serialise with
+ 	 * the completed/retired request.
+ 	 */
+-	if (llist_add(&cb->work.llnode, &signal->execute_cb)) {
++	if (llist_add(&cb->work.node.llist, &signal->execute_cb)) {
+ 		if (i915_request_is_active(signal) ||
+ 		    __request_in_flight(signal))
+ 			__notify_execute_cb_imm(signal);
+* Unmerged path include/linux/irq_work.h
+diff --git a/include/linux/irqflags.h b/include/linux/irqflags.h
+index 8acc5e479416..1c650678611b 100644
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@ -109,12 +109,12 @@ do {						\
+ 
+ # define lockdep_irq_work_enter(__work)					\
+ 	  do {								\
+-		  if (!(atomic_read(&__work->flags) & IRQ_WORK_HARD_IRQ))\
++		  if (!(atomic_read(&__work->node.a_flags) & IRQ_WORK_HARD_IRQ))\
+ 			current->irq_config = 1;			\
+ 	  } while (0)
+ # define lockdep_irq_work_exit(__work)					\
+ 	  do {								\
+-		  if (!(atomic_read(&__work->flags) & IRQ_WORK_HARD_IRQ))\
++		  if (!(atomic_read(&__work->node.a_flags) & IRQ_WORK_HARD_IRQ))\
+ 			current->irq_config = 0;			\
+ 	  } while (0)
+ 
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index 2f8bf10ba18c..2553caf4f74a 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -156,7 +156,7 @@ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
+ 	if (irqs_disabled()) {
+ 		if (!IS_ENABLED(CONFIG_PREEMPT_RT)) {
+ 			work = this_cpu_ptr(&up_read_work);
+-			if (atomic_read(&work->irq_work.flags) & IRQ_WORK_BUSY) {
++			if (irq_work_is_busy(&work->irq_work)) {
+ 				/* cannot queue more up_read, fallback */
+ 				irq_work_busy = true;
+ 			}
+* Unmerged path kernel/irq_work.c
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index 39d1c8692f26..d0b73c532785 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -3177,10 +3177,8 @@ static void wake_up_klogd_work_func(struct irq_work *irq_work)
+ 		wake_up_interruptible(&log_wait);
+ }
+ 
+-static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) = {
+-	.func = wake_up_klogd_work_func,
+-	.flags = ATOMIC_INIT(IRQ_WORK_LAZY),
+-};
++static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) =
++	IRQ_WORK_INIT_LAZY(wake_up_klogd_work_func);
+ 
+ void wake_up_klogd(void)
+ {
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index a698ea30e8ce..453e12a2b6a4 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -1278,8 +1278,6 @@ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp)
+ 		if (IS_ENABLED(CONFIG_IRQ_WORK) &&
+ 		    !rdp->rcu_iw_pending && rdp->rcu_iw_gp_seq != rnp->gp_seq &&
+ 		    (rnp->ffmask & rdp->grpmask)) {
+-			init_irq_work(&rdp->rcu_iw, rcu_iw_handler);
+-			atomic_set(&rdp->rcu_iw.flags, IRQ_WORK_HARD_IRQ);
+ 			rdp->rcu_iw_pending = true;
+ 			rdp->rcu_iw_gp_seq = rnp->gp_seq;
+ 			irq_work_queue_on(&rdp->rcu_iw, rdp->cpu);
+@@ -4015,6 +4013,7 @@ int rcutree_prepare_cpu(unsigned int cpu)
+ 	rdp->cpu_no_qs.b.norm = true;
+ 	rdp->core_needs_qs = false;
+ 	rdp->rcu_iw_pending = false;
++	rdp->rcu_iw = IRQ_WORK_INIT_HARD(rcu_iw_handler);
+ 	rdp->rcu_iw_gp_seq = rdp->gp_seq - 1;
+ 	trace_rcu_grace_period(rcu_state.name, rdp->gp_seq, TPS("cpuonl"));
+ 	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index ed1fd55fc55b..48d87e4b422a 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -296,10 +296,8 @@ static void nohz_full_kick_func(struct irq_work *work)
+ 	/* Empty, the tick restart happens on tick_nohz_irq_exit() */
+ }
+ 
+-static DEFINE_PER_CPU(struct irq_work, nohz_full_kick_work) = {
+-	.func = nohz_full_kick_func,
+-	.flags = ATOMIC_INIT(IRQ_WORK_HARD_IRQ),
+-};
++static DEFINE_PER_CPU(struct irq_work, nohz_full_kick_work) =
++	IRQ_WORK_INIT_HARD(nohz_full_kick_func);
+ 
+ /*
+  * Kick this CPU if it's full dynticks in order to force it to
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 403220415cff..62a4de79ab45 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -789,7 +789,7 @@ static int bpf_send_signal_common(u32 sig, enum pid_type type)
+ 			return -EINVAL;
+ 
+ 		work = this_cpu_ptr(&send_signal_work);
+-		if (atomic_read(&work->irq_work.flags) & IRQ_WORK_BUSY)
++		if (irq_work_is_busy(&work->irq_work))
+ 			return -EBUSY;
+ 
+ 		/* Add the current task, which is the target of sending signal,
