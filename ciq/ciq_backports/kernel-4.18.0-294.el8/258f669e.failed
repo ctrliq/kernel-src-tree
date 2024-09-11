@@ -1,0 +1,218 @@
+mm: /proc/pid/smaps_rollup: convert to single value seq_file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit 258f669e7e88c18edbc23fe5ce00a476b924551f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/258f669e.failed
+
+The /proc/pid/smaps_rollup file is currently implemented via the
+m_start/m_next/m_stop seq_file iterators shared with the other maps files,
+that iterate over vma's.  However, the rollup file doesn't print anything
+for each vma, only accumulate the stats.
+
+There are some issues with the current code as reported in [1] - the
+accumulated stats can get skewed if seq_file start()/stop() op is called
+multiple times, if show() is called multiple times, and after seeks to
+non-zero position.
+
+Patch [1] fixed those within existing design, but I believe it is
+fundamentally wrong to expose the vma iterators to the seq_file mechanism
+when smaps_rollup shows logically a single set of values for the whole
+address space.
+
+This patch thus refactors the code to provide a single "value" at offset
+0, with vma iteration to gather the stats done internally.  This fixes the
+situations where results are skewed, and simplifies the code, especially
+in show_smap(), at the expense of somewhat less code reuse.
+
+[1] https://marc.info/?l=linux-mm&m=151927723128134&w=2
+
+[vbabka@suse.c: use seq_file infrastructure]
+  Link: http://lkml.kernel.org/r/bf4525b0-fd5b-4c4c-2cb3-adee3dd95a48@suse.cz
+Link: http://lkml.kernel.org/r/20180723111933.15443-5-vbabka@suse.cz
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Reported-by: Daniel Colascione <dancol@google.com>
+	Reviewed-by: Alexey Dobriyan <adobriyan@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 258f669e7e88c18edbc23fe5ce00a476b924551f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+diff --cc fs/proc/task_mmu.c
+index 7f3f589c8638,5ea1d64cb0b4..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -747,89 -772,75 +744,119 @@@ static void __show_smap(struct seq_fil
+  
+  static int show_smap(struct seq_file *m, void *v)
+  {
+- 	struct proc_maps_private *priv = m->private;
+  	struct vm_area_struct *vma = v;
+++<<<<<<< HEAD
+ +	struct mem_size_stats mss_stack;
+ +	struct mem_size_stats *mss;
+ +	int ret = 0;
+ +	bool rollup_mode;
+ +	bool last_vma;
+ +	bool walking = false;
+++=======
++ 	struct mem_size_stats mss;
+++>>>>>>> 258f669e7e88 (mm: /proc/pid/smaps_rollup: convert to single value seq_file)
+  
+- 	if (priv->rollup) {
+- 		rollup_mode = true;
+- 		mss = priv->rollup;
+- 		if (mss->first) {
+- 			mss->first_vma_start = vma->vm_start;
+- 			mss->first = false;
+- 		}
+- 		last_vma = !m_next_vma(priv, vma);
+- 	} else {
+- 		rollup_mode = false;
+- 		memset(&mss_stack, 0, sizeof(mss_stack));
+- 		mss = &mss_stack;
+- 	}
++ 	memset(&mss, 0, sizeof(mss));
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SHMEM
+ +	/* In case of smaps_rollup, reset the value from previous vma */
+ +	mss->check_shmem_swap = false;
+ +	if (vma->vm_file && shmem_mapping(vma->vm_file->f_mapping)) {
+ +		/*
+ +		 * For shared or readonly shmem mappings we know that all
+ +		 * swapped out pages belong to the shmem object, and we can
+ +		 * obtain the swap value much more efficiently. For private
+ +		 * writable mappings, we might have COW pages that are
+ +		 * not affected by the parent swapped out pages of the shmem
+ +		 * object, so we have to distinguish them during the page walk.
+ +		 * Unless we know that the shmem object (or the part mapped by
+ +		 * our VMA) has no swapped out pages at all.
+ +		 */
+ +		unsigned long shmem_swapped = shmem_swap_usage(vma);
+ +
+ +		if (!shmem_swapped || (vma->vm_flags & VM_SHARED) ||
+ +					!(vma->vm_flags & VM_WRITE)) {
+ +			mss->swap += shmem_swapped;
+ +		} else {
+ +			mss->check_shmem_swap = true;
+ +			walk_page_vma(vma, &smaps_shmem_walk_ops, mss);
+ +			walking = true;
+ +		}
+ +	}
+ +#endif
+ +
+ +	/* mmap_sem is held in m_start */
+ +	if (!walking)
+ +		walk_page_vma(vma, &smaps_walk_ops, mss);
+ +	if (vma->vm_flags & VM_LOCKED)
+ +		mss->pss_locked += mss->pss;
+++=======
++ 	smap_gather_stats(vma, &mss);
+++>>>>>>> 258f669e7e88 (mm: /proc/pid/smaps_rollup: convert to single value seq_file)
+  
+- 	if (!rollup_mode) {
+- 		show_map_vma(m, vma);
+- 	} else if (last_vma) {
+- 		show_vma_header_prefix(
+- 			m, mss->first_vma_start, vma->vm_end, 0, 0, 0, 0);
+- 		seq_pad(m, ' ');
+- 		seq_puts(m, "[rollup]\n");
+- 	} else {
+- 		ret = SEQ_SKIP;
+- 	}
++ 	show_map_vma(m, vma);
++ 
++ 	SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
++ 	SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
++ 	SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
++ 	seq_puts(m, " kB\n");
++ 
++ 	__show_smap(m, &mss);
+  
+- 	if (!rollup_mode) {
+- 		SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
+- 		SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
+- 		SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
+- 		seq_puts(m, " kB\n");
++ 	if (arch_pkeys_enabled())
++ 		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
++ 	show_smap_vma_flags(m, vma);
++ 
++ 	m_cache_vma(m, vma);
++ 
++ 	return 0;
++ }
++ 
++ static int show_smaps_rollup(struct seq_file *m, void *v)
++ {
++ 	struct proc_maps_private *priv = m->private;
++ 	struct mem_size_stats mss;
++ 	struct mm_struct *mm;
++ 	struct vm_area_struct *vma;
++ 	unsigned long last_vma_end = 0;
++ 	int ret = 0;
++ 
++ 	priv->task = get_proc_task(priv->inode);
++ 	if (!priv->task)
++ 		return -ESRCH;
++ 
++ 	mm = priv->mm;
++ 	if (!mm || !mmget_not_zero(mm)) {
++ 		ret = -ESRCH;
++ 		goto out_put_task;
+  	}
+  
+- 	if (!rollup_mode || last_vma)
+- 		__show_smap(m, mss);
++ 	memset(&mss, 0, sizeof(mss));
+  
+- 	if (!rollup_mode) {
+- 		if (arch_pkeys_enabled())
+- 			seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
+- 		show_smap_vma_flags(m, vma);
++ 	down_read(&mm->mmap_sem);
++ 	hold_task_mempolicy(priv);
++ 
++ 	for (vma = priv->mm->mmap; vma; vma = vma->vm_next) {
++ 		smap_gather_stats(vma, &mss);
++ 		last_vma_end = vma->vm_end;
+  	}
+- 	m_cache_vma(m, vma);
++ 
++ 	show_vma_header_prefix(m, priv->mm->mmap->vm_start,
++ 			       last_vma_end, 0, 0, 0, 0);
++ 	seq_pad(m, ' ');
++ 	seq_puts(m, "[rollup]\n");
++ 
++ 	__show_smap(m, &mss);
++ 
++ 	release_task_mempolicy(priv);
++ 	up_read(&mm->mmap_sem);
++ 	mmput(mm);
++ 
++ out_put_task:
++ 	put_task_struct(priv->task);
++ 	priv->task = NULL;
++ 
+  	return ret;
+  }
+  #undef SEQ_PUT_DEC
+diff --git a/fs/proc/internal.h b/fs/proc/internal.h
+index 86d659904123..3aa63d1fe438 100644
+--- a/fs/proc/internal.h
++++ b/fs/proc/internal.h
+@@ -286,7 +286,6 @@ struct proc_maps_private {
+ 	struct inode *inode;
+ 	struct task_struct *task;
+ 	struct mm_struct *mm;
+-	struct mem_size_stats *rollup;
+ #ifdef CONFIG_MMU
+ 	struct vm_area_struct *tail_vma;
+ #endif
+* Unmerged path fs/proc/task_mmu.c
