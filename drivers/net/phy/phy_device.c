@@ -2717,7 +2717,7 @@ EXPORT_SYMBOL(phy_get_pause);
 
 static bool phy_drv_supports_irq(struct phy_driver *phydrv)
 {
-	return phydrv->config_intr && phydrv->ack_interrupt;
+	return phydrv->config_intr && (phydrv->ack_interrupt || phydrv->handle_interrupt);
 }
 
 /**
