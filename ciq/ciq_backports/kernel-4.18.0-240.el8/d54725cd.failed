@@ -1,0 +1,318 @@
+netfilter: nf_tables: support for multiple devices per netdev hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit d54725cd11a57c30f650260cfb0a92c268bdc3e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d54725cd.failed
+
+This patch allows you to register one netdev basechain to multiple
+devices. This adds a new NFTA_HOOK_DEVS netlink attribute to specify
+the list of netdevices. Basechains store a list of hooks.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit d54725cd11a57c30f650260cfb0a92c268bdc3e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nf_tables_offload.c
+diff --cc include/net/netfilter/nf_tables.h
+index 63231fdc08ac,5bf569e1173b..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -977,7 -978,7 +978,11 @@@ struct nft_hook 
+   *	@policy: default policy
+   *	@stats: per-cpu chain stats
+   *	@chain: the chain
+++<<<<<<< HEAD
+ + *	@dev_name: device name that this base chain is attached to (if any)
+++=======
++  *	@flow_block: flow block (for hardware offload)
+++>>>>>>> d54725cd11a5 (netfilter: nf_tables: support for multiple devices per netdev hook)
+   */
+  struct nft_base_chain {
+  	struct nf_hook_ops		ops;
+@@@ -986,7 -988,7 +992,11 @@@
+  	u8				flags;
+  	struct nft_stats __percpu	*stats;
+  	struct nft_chain		chain;
+++<<<<<<< HEAD
+ +	char 				dev_name[IFNAMSIZ];
+++=======
++ 	struct flow_block		flow_block;
+++>>>>>>> d54725cd11a5 (netfilter: nf_tables: support for multiple devices per netdev hook)
+  };
+  
+  static inline struct nft_base_chain *nft_base_chain(const struct nft_chain *chain)
+diff --cc net/netfilter/nf_tables_api.c
+index 3949c819cc35,13f09412cc6a..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -1237,20 -1349,10 +1333,15 @@@ static int nf_tables_fill_chain_info(st
+  
+  	if (nft_is_base_chain(chain)) {
+  		const struct nft_base_chain *basechain = nft_base_chain(chain);
+++<<<<<<< HEAD
+ +		const struct nf_hook_ops *ops = &basechain->ops;
+ +		struct nlattr *nest;
+++=======
++ 		struct nft_stats __percpu *stats;
+++>>>>>>> d54725cd11a5 (netfilter: nf_tables: support for multiple devices per netdev hook)
+  
+- 		nest = nla_nest_start_noflag(skb, NFTA_CHAIN_HOOK);
+- 		if (nest == NULL)
+- 			goto nla_put_failure;
+- 		if (nla_put_be32(skb, NFTA_HOOK_HOOKNUM, htonl(ops->hooknum)))
++ 		if (nft_dump_basechain_hook(skb, family, basechain))
+  			goto nla_put_failure;
+- 		if (nla_put_be32(skb, NFTA_HOOK_PRIORITY, htonl(ops->priority)))
+- 			goto nla_put_failure;
+- 		if (basechain->dev_name[0] &&
+- 		    nla_put_string(skb, NFTA_HOOK_DEV, basechain->dev_name))
+- 			goto nla_put_failure;
+- 		nla_nest_end(skb, nest);
+  
+  		if (nla_put_be32(skb, NFTA_CHAIN_POLICY,
+  				 htonl(basechain->policy)))
+@@@ -1481,10 -1581,18 +1573,17 @@@ static void nf_tables_chain_destroy(str
+  	if (nft_is_base_chain(chain)) {
+  		struct nft_base_chain *basechain = nft_base_chain(chain);
+  
++ 		if (ctx->family == NFPROTO_NETDEV) {
++ 			list_for_each_entry_safe(hook, next,
++ 						 &basechain->hook_list, list) {
++ 				list_del_rcu(&hook->list);
++ 				kfree_rcu(hook, rcu);
++ 			}
++ 		}
+  		module_put(basechain->type->owner);
+ -		if (rcu_access_pointer(basechain->stats)) {
+ +		free_percpu(basechain->stats);
+ +		if (basechain->stats)
+  			static_branch_dec(&nft_counters_enabled);
+ -			free_percpu(rcu_dereference_raw(basechain->stats));
+ -		}
+  		kfree(chain->name);
+  		kfree(basechain);
+  	} else {
+@@@ -1594,9 -1727,11 +1718,8 @@@ static int nft_chain_parse_hook(struct 
+  {
+  	struct nlattr *ha[NFTA_HOOK_MAX + 1];
+  	const struct nft_chain_type *type;
+- 	struct net_device *dev;
+  	int err;
+  
+ -	lockdep_assert_held(&net->nft.commit_mutex);
+ -	lockdep_nfnl_nft_mutex_not_held();
+ -
+  	err = nla_parse_nested_deprecated(ha, NFTA_HOOK_MAX,
+  					  nla[NFTA_CHAIN_HOOK],
+  					  nft_hook_policy, NULL);
+@@@ -1682,8 -1811,51 +1802,51 @@@ static struct nft_rule **nf_tables_chai
+  	return kvmalloc(alloc, GFP_KERNEL);
+  }
+  
++ static void nft_basechain_hook_init(struct nf_hook_ops *ops, u8 family,
++ 				    const struct nft_chain_hook *hook,
++ 				    struct nft_chain *chain)
++ {
++ 	ops->pf		= family;
++ 	ops->hooknum	= hook->num;
++ 	ops->priority	= hook->priority;
++ 	ops->priv	= chain;
++ 	ops->hook	= hook->type->hooks[ops->hooknum];
++ }
++ 
++ static int nft_basechain_init(struct nft_base_chain *basechain, u8 family,
++ 			      struct nft_chain_hook *hook, u32 flags)
++ {
++ 	struct nft_chain *chain;
++ 	struct nft_hook *h;
++ 
++ 	basechain->type = hook->type;
++ 	INIT_LIST_HEAD(&basechain->hook_list);
++ 	chain = &basechain->chain;
++ 
++ 	if (family == NFPROTO_NETDEV) {
++ 		list_splice_init(&hook->list, &basechain->hook_list);
++ 		list_for_each_entry(h, &basechain->hook_list, list)
++ 			nft_basechain_hook_init(&h->ops, family, hook, chain);
++ 
++ 		basechain->ops.hooknum	= hook->num;
++ 		basechain->ops.priority	= hook->priority;
++ 	} else {
++ 		nft_basechain_hook_init(&basechain->ops, family, hook, chain);
++ 	}
++ 
++ 	chain->flags |= NFT_BASE_CHAIN | flags;
++ 	basechain->policy = NF_ACCEPT;
++ 	if (chain->flags & NFT_CHAIN_HW_OFFLOAD &&
++ 	    nft_chain_offload_priority(basechain) < 0)
++ 		return -EOPNOTSUPP;
++ 
++ 	flow_block_init(&basechain->flow_block);
++ 
++ 	return 0;
++ }
++ 
+  static int nf_tables_addchain(struct nft_ctx *ctx, u8 family, u8 genmask,
+ -			      u8 policy, u32 flags)
+ +			      u8 policy, bool create)
+  {
+  	const struct nlattr * const *nla = ctx->nla;
+  	struct nft_table *table = ctx->table;
+@@@ -1700,9 -1872,8 +1863,8 @@@
+  
+  	if (nla[NFTA_CHAIN_HOOK]) {
+  		struct nft_chain_hook hook;
+- 		struct nf_hook_ops *ops;
+  
+ -		err = nft_chain_parse_hook(net, nla, &hook, family, true);
+ +		err = nft_chain_parse_hook(net, nla, &hook, family, create);
+  		if (err < 0)
+  			return err;
+  
+@@@ -1726,19 -1895,12 +1886,28 @@@
+  			static_branch_inc(&nft_counters_enabled);
+  		}
+  
+++<<<<<<< HEAD
+ +		basechain->type = hook.type;
+ +		chain = &basechain->chain;
+ +
+ +		ops		= &basechain->ops;
+ +		ops->pf		= family;
+ +		ops->hooknum	= hook.num;
+ +		ops->priority	= hook.priority;
+ +		ops->priv	= chain;
+ +		ops->hook	= hook.type->hooks[ops->hooknum];
+ +		ops->dev	= hook.dev;
+ +
+ +		chain->flags |= NFT_BASE_CHAIN;
+ +		basechain->policy = NF_ACCEPT;
+++=======
++ 		err = nft_basechain_init(basechain, family, &hook, flags);
++ 		if (err < 0) {
++ 			nft_chain_release_hook(&hook);
++ 			kfree(basechain);
++ 			return err;
++ 		}
+++>>>>>>> d54725cd11a5 (netfilter: nf_tables: support for multiple devices per netdev hook)
+  	} else {
+  		chain = kzalloc(sizeof(*chain), GFP_KERNEL);
+  		if (chain == NULL)
+@@@ -1798,8 -1960,27 +1967,27 @@@ err1
+  	return err;
+  }
+  
++ static bool nft_hook_list_equal(struct list_head *hook_list1,
++ 				struct list_head *hook_list2)
++ {
++ 	struct nft_hook *hook;
++ 	int n = 0, m = 0;
++ 
++ 	n = 0;
++ 	list_for_each_entry(hook, hook_list2, list) {
++ 		if (!nft_hook_list_find(hook_list1, hook))
++ 			return false;
++ 
++ 		n++;
++ 	}
++ 	list_for_each_entry(hook, hook_list1, list)
++ 		m++;
++ 
++ 	return n == m;
++ }
++ 
+  static int nf_tables_updchain(struct nft_ctx *ctx, u8 genmask, u8 policy,
+ -			      u32 flags)
+ +			      bool create)
+  {
+  	const struct nlattr * const *nla = ctx->nla;
+  	struct nft_table *table = ctx->table;
+* Unmerged path net/netfilter/nf_tables_offload.c
+* Unmerged path include/net/netfilter/nf_tables.h
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index 8a0bf59999aa..235e94b3cdc7 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -144,12 +144,14 @@ enum nft_list_attributes {
+  * @NFTA_HOOK_HOOKNUM: netfilter hook number (NLA_U32)
+  * @NFTA_HOOK_PRIORITY: netfilter hook priority (NLA_U32)
+  * @NFTA_HOOK_DEV: netdevice name (NLA_STRING)
++ * @NFTA_HOOK_DEVS: list of netdevices (NLA_NESTED)
+  */
+ enum nft_hook_attributes {
+ 	NFTA_HOOK_UNSPEC,
+ 	NFTA_HOOK_HOOKNUM,
+ 	NFTA_HOOK_PRIORITY,
+ 	NFTA_HOOK_DEV,
++	NFTA_HOOK_DEVS,
+ 	__NFTA_HOOK_MAX
+ };
+ #define NFTA_HOOK_MAX		(__NFTA_HOOK_MAX - 1)
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nf_tables_offload.c
+diff --git a/net/netfilter/nft_chain_filter.c b/net/netfilter/nft_chain_filter.c
+index 85666c974c62..209fd023b9c8 100644
+--- a/net/netfilter/nft_chain_filter.c
++++ b/net/netfilter/nft_chain_filter.c
+@@ -287,28 +287,35 @@ static void nft_netdev_event(unsigned long event, struct net_device *dev,
+ 			     struct nft_ctx *ctx)
+ {
+ 	struct nft_base_chain *basechain = nft_base_chain(ctx->chain);
++	struct nft_hook *hook, *found = NULL;
++	int n = 0;
+ 
+-	switch (event) {
+-	case NETDEV_UNREGISTER:
+-		if (strcmp(basechain->dev_name, dev->name) != 0)
+-			return;
+-
+-		/* UNREGISTER events are also happpening on netns exit.
+-		 *
+-		 * Altough nf_tables core releases all tables/chains, only
+-		 * this event handler provides guarantee that
+-		 * basechain.ops->dev is still accessible, so we cannot
+-		 * skip exiting net namespaces.
+-		 */
+-		__nft_release_basechain(ctx);
+-		break;
+-	case NETDEV_CHANGENAME:
+-		if (dev->ifindex != basechain->ops.dev->ifindex)
+-			return;
++	if (event != NETDEV_UNREGISTER)
++		return;
+ 
+-		strncpy(basechain->dev_name, dev->name, IFNAMSIZ);
+-		break;
++	list_for_each_entry(hook, &basechain->hook_list, list) {
++		if (hook->ops.dev == dev)
++			found = hook;
++
++		n++;
+ 	}
++	if (!found)
++		return;
++
++	if (n > 1) {
++		nf_unregister_net_hook(ctx->net, &found->ops);
++		list_del_rcu(&found->list);
++		kfree_rcu(found, rcu);
++		return;
++	}
++
++	/* UNREGISTER events are also happening on netns exit.
++	 *
++	 * Although nf_tables core releases all tables/chains, only this event
++	 * handler provides guarantee that hook->ops.dev is still accessible,
++	 * so we cannot skip exiting net namespaces.
++	 */
++	__nft_release_basechain(ctx);
+ }
+ 
+ static int nf_tables_netdev_event(struct notifier_block *this,
