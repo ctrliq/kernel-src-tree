@@ -1,0 +1,235 @@
+drop_monitor: Convert to using devlink tracepoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 8ee2267ad33e0ba021e9dd9b437f773906cd99d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/8ee2267a.failed
+
+Convert drop monitor to use the recently introduced
+'devlink_trap_report' tracepoint instead of having devlink call into
+drop monitor.
+
+This is both consistent with software originated drops ('kfree_skb'
+tracepoint) and also allows drop monitor to be built as a module and
+still report hardware originated drops.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8ee2267ad33e0ba021e9dd9b437f773906cd99d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	MAINTAINERS
+#	include/net/drop_monitor.h
+diff --cc MAINTAINERS
+index e4ec93b44e67,c1e946606dce..000000000000
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@@ -10085,9 -12065,8 +10085,13 @@@ M:	Neil Horman <nhorman@tuxdriver.com
+  L:	netdev@vger.kernel.org
+  S:	Maintained
+  W:	https://fedorahosted.org/dropwatch/
+++<<<<<<< HEAD
+++=======
++ F:	include/uapi/linux/net_dropmon.h
+++>>>>>>> 8ee2267ad33e (drop_monitor: Convert to using devlink tracepoint)
+  F:	net/core/drop_monitor.c
+ +F:	include/uapi/linux/net_dropmon.h
+ +F:	include/net/drop_monitor.h
+  
+  NETWORKING DRIVERS
+  M:	"David S. Miller" <davem@davemloft.net>
+* Unmerged path include/net/drop_monitor.h
+* Unmerged path MAINTAINERS
+* Unmerged path include/net/drop_monitor.h
+diff --git a/net/Kconfig b/net/Kconfig
+index 310055a736b2..1c78d2fcf6b2 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -435,7 +435,6 @@ config NET_SOCK_MSG
+ config NET_DEVLINK
+ 	bool
+ 	default n
+-	imply NET_DROP_MONITOR
+ 
+ config PAGE_POOL
+        bool
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index 9643e59cc6c1..5dac6777abdd 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -31,7 +31,6 @@
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+ #include <net/devlink.h>
+-#include <net/drop_monitor.h>
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/devlink.h>
+ 
+@@ -9269,24 +9268,6 @@ devlink_trap_stats_update(struct devlink_stats __percpu *trap_stats,
+ 	u64_stats_update_end(&stats->syncp);
+ }
+ 
+-static void
+-devlink_trap_report_metadata_fill(struct net_dm_hw_metadata *hw_metadata,
+-				  const struct devlink_trap_item *trap_item,
+-				  struct devlink_port *in_devlink_port,
+-				  const struct flow_action_cookie *fa_cookie)
+-{
+-	struct devlink_trap_group_item *group_item = trap_item->group_item;
+-
+-	hw_metadata->trap_group_name = group_item->group->name;
+-	hw_metadata->trap_name = trap_item->trap->name;
+-	hw_metadata->fa_cookie = fa_cookie;
+-
+-	spin_lock(&in_devlink_port->type_lock);
+-	if (in_devlink_port->type == DEVLINK_PORT_TYPE_ETH)
+-		hw_metadata->input_dev = in_devlink_port->type_dev;
+-	spin_unlock(&in_devlink_port->type_lock);
+-}
+-
+ static void
+ devlink_trap_report_metadata_set(struct devlink_trap_metadata *metadata,
+ 				 const struct devlink_trap_item *trap_item,
+@@ -9317,7 +9298,6 @@ void devlink_trap_report(struct devlink *devlink, struct sk_buff *skb,
+ 
+ {
+ 	struct devlink_trap_item *trap_item = trap_ctx;
+-	struct net_dm_hw_metadata hw_metadata = {};
+ 
+ 	devlink_trap_stats_update(trap_item->stats, skb->len);
+ 	devlink_trap_stats_update(trap_item->group_item->stats, skb->len);
+@@ -9329,10 +9309,6 @@ void devlink_trap_report(struct devlink *devlink, struct sk_buff *skb,
+ 	if (trap_item->trap->type == DEVLINK_TRAP_TYPE_CONTROL)
+ 		return;
+ 
+-	devlink_trap_report_metadata_fill(&hw_metadata, trap_item,
+-					  in_devlink_port, fa_cookie);
+-	net_dm_hw_report(skb, &hw_metadata);
+-
+ 	if (trace_devlink_trap_report_enabled()) {
+ 		struct devlink_trap_metadata metadata = {};
+ 
+diff --git a/net/core/drop_monitor.c b/net/core/drop_monitor.c
+index 41d1da15d1d0..09c780dd8f28 100644
+--- a/net/core/drop_monitor.c
++++ b/net/core/drop_monitor.c
+@@ -25,7 +25,6 @@
+ #include <linux/bitops.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
+-#include <net/drop_monitor.h>
+ #include <net/genetlink.h>
+ #include <net/netevent.h>
+ #include <net/flow_offload.h>
+@@ -33,6 +32,7 @@
+ 
+ #include <trace/events/skb.h>
+ #include <trace/events/napi.h>
++#include <trace/events/devlink.h>
+ 
+ #include <asm/unaligned.h>
+ 
+@@ -107,6 +107,13 @@ static enum net_dm_alert_mode net_dm_alert_mode = NET_DM_ALERT_MODE_SUMMARY;
+ static u32 net_dm_trunc_len;
+ static u32 net_dm_queue_len = 1000;
+ 
++struct net_dm_hw_metadata {
++	const char *trap_group_name;
++	const char *trap_name;
++	struct net_device *input_dev;
++	const struct flow_action_cookie *fa_cookie;
++};
++
+ struct net_dm_alert_ops {
+ 	void (*kfree_skb_probe)(void *ignore, struct sk_buff *skb,
+ 				void *location);
+@@ -1125,25 +1132,32 @@ static const struct net_dm_alert_ops *net_dm_alert_ops_arr[] = {
+ 	[NET_DM_ALERT_MODE_PACKET]	= &net_dm_alert_packet_ops,
+ };
+ 
+-void net_dm_hw_report(struct sk_buff *skb,
+-		      const struct net_dm_hw_metadata *hw_metadata)
++#if IS_ENABLED(CONFIG_NET_DEVLINK)
++static int net_dm_hw_probe_register(const struct net_dm_alert_ops *ops)
+ {
+-	rcu_read_lock();
+-
+-	if (!monitor_hw)
+-		goto out;
++	return register_trace_devlink_trap_report(ops->hw_trap_probe, NULL);
++}
+ 
+-	net_dm_alert_ops_arr[net_dm_alert_mode]->hw_probe(skb, hw_metadata);
++static void net_dm_hw_probe_unregister(const struct net_dm_alert_ops *ops)
++{
++	unregister_trace_devlink_trap_report(ops->hw_trap_probe, NULL);
++	tracepoint_synchronize_unregister();
++}
++#else
++static int net_dm_hw_probe_register(const struct net_dm_alert_ops *ops)
++{
++	return -EOPNOTSUPP;
++}
+ 
+-out:
+-	rcu_read_unlock();
++static void net_dm_hw_probe_unregister(const struct net_dm_alert_ops *ops)
++{
+ }
+-EXPORT_SYMBOL_GPL(net_dm_hw_report);
++#endif
+ 
+ static int net_dm_hw_monitor_start(struct netlink_ext_ack *extack)
+ {
+ 	const struct net_dm_alert_ops *ops;
+-	int cpu;
++	int cpu, rc;
+ 
+ 	if (monitor_hw) {
+ 		NL_SET_ERR_MSG_MOD(extack, "Hardware monitoring already enabled");
+@@ -1167,13 +1181,24 @@ static int net_dm_hw_monitor_start(struct netlink_ext_ack *extack)
+ 		kfree(hw_entries);
+ 	}
+ 
++	rc = net_dm_hw_probe_register(ops);
++	if (rc) {
++		NL_SET_ERR_MSG_MOD(extack, "Failed to connect probe to devlink_trap_probe() tracepoint");
++		goto err_module_put;
++	}
++
+ 	monitor_hw = true;
+ 
+ 	return 0;
++
++err_module_put:
++	module_put(THIS_MODULE);
++	return rc;
+ }
+ 
+ static void net_dm_hw_monitor_stop(struct netlink_ext_ack *extack)
+ {
++	const struct net_dm_alert_ops *ops;
+ 	int cpu;
+ 
+ 	if (!monitor_hw) {
+@@ -1181,12 +1206,11 @@ static void net_dm_hw_monitor_stop(struct netlink_ext_ack *extack)
+ 		return;
+ 	}
+ 
++	ops = net_dm_alert_ops_arr[net_dm_alert_mode];
++
+ 	monitor_hw = false;
+ 
+-	/* After this call returns we are guaranteed that no CPU is processing
+-	 * any hardware drops.
+-	 */
+-	synchronize_rcu();
++	net_dm_hw_probe_unregister(ops);
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		struct per_cpu_dm_data *hw_data = &per_cpu(dm_hw_cpu_data, cpu);
