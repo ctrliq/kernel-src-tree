@@ -1,0 +1,232 @@
+nvme: use return value from blk_execute_rq()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Keith Busch <kbusch@kernel.org>
+commit ae5e6886b4f8d62a9d01fea4221a854e541a1cd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ae5e6886.failed
+
+We don't have an nvme status to report if the driver's .queue_rq()
+returns an error without dispatching the requested nvme command. Check
+the return value from blk_execute_rq() for all passthrough commands so
+the caller may know their command was not successful.
+
+If the command is from the target passthrough interface and fails to
+dispatch, synthesize the response back to the host as a internal target
+error.
+
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Link: https://lore.kernel.org/r/20210610214437.641245-5-kbusch@kernel.org
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit ae5e6886b4f8d62a9d01fea4221a854e541a1cd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/ioctl.c
+diff --cc drivers/nvme/host/core.c
+index e310c0f15679,11779be42186..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1022,31 -1032,25 +1023,50 @@@ blk_status_t nvme_setup_cmd(struct nvme
+  }
+  EXPORT_SYMBOL_GPL(nvme_setup_cmd);
+  
+ +static void nvme_end_sync_rq(struct request *rq, blk_status_t error)
+ +{
+ +	struct completion *waiting = rq->end_io_data;
+ +
+ +	rq->end_io_data = NULL;
+ +	complete(waiting);
+ +}
+ +
+ +static void nvme_execute_rq_polled(struct request_queue *q,
+ +		struct gendisk *bd_disk, struct request *rq, int at_head)
+ +{
+ +	DECLARE_COMPLETION_ONSTACK(wait);
+ +
+ +	WARN_ON_ONCE(!test_bit(QUEUE_FLAG_POLL, &q->queue_flags));
+ +
+ +	rq->cmd_flags |= REQ_HIPRI;
+ +	rq->end_io_data = &wait;
+ +	blk_execute_rq_nowait(q, bd_disk, rq, at_head, nvme_end_sync_rq);
+ +
+ +	while (!completion_done(&wait)) {
+ +		blk_poll(q, request_to_qc_t(rq->mq_hctx, rq), true);
+ +		cond_resched();
+ +	}
+ +}
+ +
++ /*
++  * Return values:
++  * 0:  success
++  * >0: nvme controller's cqe status response
++  * <0: kernel error in lieu of controller response
++  */
++ static int nvme_execute_rq(struct gendisk *disk, struct request *rq,
++ 		bool at_head)
++ {
++ 	blk_status_t status;
++ 
++ 	status = blk_execute_rq(disk, rq, at_head);
++ 	if (nvme_req(rq)->flags & NVME_REQ_CANCELLED)
++ 		return -EINTR;
++ 	if (nvme_req(rq)->status)
++ 		return nvme_req(rq)->status;
++ 	return blk_status_to_errno(status);
++ }
++ 
+  /*
+   * Returns 0 on success.  If the result is negative, it's a Linux error code;
+   * if the result is positive, it's an NVM Express status code
+@@@ -1075,16 -1079,9 +1095,17 @@@ int __nvme_submit_sync_cmd(struct reque
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (poll)
+ +		nvme_execute_rq_polled(req->q, NULL, req, at_head);
+ +	else
+ +		blk_execute_rq(req->q, NULL, req, at_head);
+ +	if (result)
+++=======
++ 	ret = nvme_execute_rq(NULL, req, at_head);
++ 	if (result && ret >= 0)
+++>>>>>>> ae5e6886b4f8 (nvme: use return value from blk_execute_rq())
+  		*result = nvme_req(req)->result;
+- 	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
+- 		ret = -EINTR;
+- 	else
+- 		ret = nvme_req(req)->status;
+   out:
+  	blk_mq_free_request(req);
+  	return ret;
+@@@ -1213,71 -1176,16 +1234,79 @@@ int nvme_execute_passthru_rq(struct req
+  	struct nvme_ns *ns = rq->q->queuedata;
+  	struct gendisk *disk = ns ? ns->disk : NULL;
+  	u32 effects;
++ 	int  ret;
+  
+  	effects = nvme_passthru_start(ctrl, ns, cmd->common.opcode);
+++<<<<<<< HEAD
+ +	blk_execute_rq(rq->q, disk, rq, 0);
+ +	nvme_passthru_end(ctrl, effects);
+ +}
+ +EXPORT_SYMBOL_GPL(nvme_execute_passthru_rq);
+ +
+ +static int nvme_submit_user_cmd(struct request_queue *q,
+ +		struct nvme_command *cmd, void __user *ubuffer,
+ +		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+ +		u32 meta_seed, u64 *result, unsigned timeout)
+ +{
+ +	bool write = nvme_is_write(cmd);
+ +	struct nvme_ns *ns = q->queuedata;
+ +	struct gendisk *disk = ns ? ns->disk : NULL;
+ +	struct request *req;
+ +	struct bio *bio = NULL;
+ +	void *meta = NULL;
+ +	int ret;
+ +
+ +	req = nvme_alloc_request(q, cmd, 0);
+ +	if (IS_ERR(req))
+ +		return PTR_ERR(req);
+ +
+ +	if (timeout)
+ +		req->timeout = timeout;
+ +	nvme_req(req)->flags |= NVME_REQ_USERCMD;
+ +
+ +	if (ubuffer && bufflen) {
+ +		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
+ +				GFP_KERNEL);
+ +		if (ret)
+ +			goto out;
+ +		bio = req->bio;
+ +		bio->bi_disk = disk;
+ +		if (disk && meta_buffer && meta_len) {
+ +			meta = nvme_add_user_metadata(bio, meta_buffer, meta_len,
+ +					meta_seed, write);
+ +			if (IS_ERR(meta)) {
+ +				ret = PTR_ERR(meta);
+ +				goto out_unmap;
+ +			}
+ +			req->cmd_flags |= REQ_INTEGRITY;
+ +		}
+ +	}
+ +
+ +	nvme_execute_passthru_rq(req);
+ +	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
+ +		ret = -EINTR;
+ +	else
+ +		ret = nvme_req(req)->status;
+ +	if (result)
+ +		*result = le64_to_cpu(nvme_req(req)->result.u64);
+ +	if (meta && !ret && !write) {
+ +		if (copy_to_user(meta_buffer, meta, meta_len))
+ +			ret = -EFAULT;
+ +	}
+ +	kfree(meta);
+ + out_unmap:
+ +	if (bio)
+ +		blk_rq_unmap_user(bio);
+ + out:
+ +	blk_mq_free_request(req);
+++=======
++ 	ret = nvme_execute_rq(disk, rq, false);
++ 	if (effects) /* nothing to be done for zero cmd effects */
++ 		nvme_passthru_end(ctrl, effects);
++ 
+++>>>>>>> ae5e6886b4f8 (nvme: use return value from blk_execute_rq())
+  	return ret;
+  }
+ -EXPORT_SYMBOL_NS_GPL(nvme_execute_passthru_rq, NVME_TARGET_PASSTHRU);
+  
+  /*
+   * Recommended frequency for KATO commands per NVMe 1.4 section 7.12.1:
+* Unmerged path drivers/nvme/host/ioctl.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/ioctl.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 71a90ae628be..25ee2d5f029a 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -842,7 +842,7 @@ static inline bool nvme_ctrl_sgl_supported(struct nvme_ctrl *ctrl)
+ 
+ u32 nvme_command_effects(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 			 u8 opcode);
+-void nvme_execute_passthru_rq(struct request *rq);
++int nvme_execute_passthru_rq(struct request *rq);
+ struct nvme_ctrl *nvme_ctrl_from_file(struct file *file);
+ struct nvme_ns *nvme_find_get_ns(struct nvme_ctrl *ctrl, unsigned nsid);
+ void nvme_put_ns(struct nvme_ns *ns);
+diff --git a/drivers/nvme/target/passthru.c b/drivers/nvme/target/passthru.c
+index 6c2656642724..768ac97e7479 100644
+--- a/drivers/nvme/target/passthru.c
++++ b/drivers/nvme/target/passthru.c
+@@ -153,11 +153,10 @@ static void nvmet_passthru_execute_cmd_work(struct work_struct *w)
+ {
+ 	struct nvmet_req *req = container_of(w, struct nvmet_req, p.work);
+ 	struct request *rq = req->p.rq;
+-	u16 status;
++	int status;
+ 
+-	nvme_execute_passthru_rq(rq);
++	status = nvme_execute_passthru_rq(rq);
+ 
+-	status = nvme_req(rq)->status;
+ 	if (status == NVME_SC_SUCCESS &&
+ 	    req->cmd->common.opcode == nvme_admin_identify) {
+ 		switch (req->cmd->identify.cns) {
+@@ -168,7 +167,8 @@ static void nvmet_passthru_execute_cmd_work(struct work_struct *w)
+ 			nvmet_passthru_override_id_ns(req);
+ 			break;
+ 		}
+-	}
++	} else if (status < 0)
++		status = NVME_SC_INTERNAL;
+ 
+ 	req->cqe->result = nvme_req(rq)->result;
+ 	nvmet_req_complete(req, status);
