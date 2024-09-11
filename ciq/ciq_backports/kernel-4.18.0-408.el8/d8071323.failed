@@ -1,0 +1,148 @@
+dmaengine: idxd: fix setting up priv mode for dwq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit d8071323c5632bdf0a8ef9b9e5662fac43649f9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/d8071323.failed
+
+DSA spec says WQ priv bit is 0 if the Privileged Mode Enable field of the
+PCI Express PASID capability is 0 and pasid is enabled. Make sure that the
+WQCFG priv field is set correctly according to usage type. Reject config if
+setting up kernel WQ type and no support. Also add the correct priv setup
+for a descriptor.
+
+Fixes: 484f910e93b4 ("dmaengine: idxd: fix wq config registers offset programming")
+	Cc: Ramesh Thomas <ramesh.thomas@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/162939084657.903168.14160019185148244596.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit d8071323c5632bdf0a8ef9b9e5662fac43649f9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/idxd.h
+diff --cc include/uapi/linux/idxd.h
+index 236d437947bc,c750eac09fc9..000000000000
+--- a/include/uapi/linux/idxd.h
++++ b/include/uapi/linux/idxd.h
+@@@ -9,6 -9,30 +9,33 @@@
+  #include <stdint.h>
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* Driver command error status */
++ enum idxd_scmd_stat {
++ 	IDXD_SCMD_DEV_ENABLED = 0x80000010,
++ 	IDXD_SCMD_DEV_NOT_ENABLED = 0x80000020,
++ 	IDXD_SCMD_WQ_ENABLED = 0x80000021,
++ 	IDXD_SCMD_DEV_DMA_ERR = 0x80020000,
++ 	IDXD_SCMD_WQ_NO_GRP = 0x80030000,
++ 	IDXD_SCMD_WQ_NO_NAME = 0x80040000,
++ 	IDXD_SCMD_WQ_NO_SVM = 0x80050000,
++ 	IDXD_SCMD_WQ_NO_THRESH = 0x80060000,
++ 	IDXD_SCMD_WQ_PORTAL_ERR = 0x80070000,
++ 	IDXD_SCMD_WQ_RES_ALLOC_ERR = 0x80080000,
++ 	IDXD_SCMD_PERCPU_ERR = 0x80090000,
++ 	IDXD_SCMD_DMA_CHAN_ERR = 0x800a0000,
++ 	IDXD_SCMD_CDEV_ERR = 0x800b0000,
++ 	IDXD_SCMD_WQ_NO_SWQ_SUPPORT = 0x800c0000,
++ 	IDXD_SCMD_WQ_NONE_CONFIGURED = 0x800d0000,
++ 	IDXD_SCMD_WQ_NO_SIZE = 0x800e0000,
++ 	IDXD_SCMD_WQ_NO_PRIV = 0x800f0000,
++ };
++ 
++ #define IDXD_SCMD_SOFTERR_MASK	0x80000000
++ #define IDXD_SCMD_SOFTERR_SHIFT	16
++ 
+++>>>>>>> d8071323c563 (dmaengine: idxd: fix setting up priv mode for dwq)
+  /* Descriptor flags */
+  #define IDXD_OP_FLAG_FENCE	0x0001
+  #define IDXD_OP_FLAG_BOF	0x0002
+diff --git a/drivers/dma/Kconfig b/drivers/dma/Kconfig
+index f70e6a229c06..ee739f1f5337 100644
+--- a/drivers/dma/Kconfig
++++ b/drivers/dma/Kconfig
+@@ -267,6 +267,7 @@ config INTEL_IDXD
+ 	tristate "Intel Data Accelerators support"
+ 	depends on PCI && X86_64 && !UML
+ 	depends on PCI_MSI
++	depends on PCI_PASID
+ 	depends on SBITMAP
+ 	select DMA_ENGINE
+ 	help
+diff --git a/drivers/dma/idxd/device.c b/drivers/dma/idxd/device.c
+index b0316a9c0bbd..f5c666f9bbb5 100644
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@ -818,6 +818,15 @@ static int idxd_groups_config_write(struct idxd_device *idxd)
+ 	return 0;
+ }
+ 
++static bool idxd_device_pasid_priv_enabled(struct idxd_device *idxd)
++{
++	struct pci_dev *pdev = idxd->pdev;
++
++	if (pdev->pasid_enabled && (pdev->pasid_features & PCI_PASID_CAP_PRIV))
++		return true;
++	return false;
++}
++
+ static int idxd_wq_config_write(struct idxd_wq *wq)
+ {
+ 	struct idxd_device *idxd = wq->idxd;
+@@ -849,7 +858,6 @@ static int idxd_wq_config_write(struct idxd_wq *wq)
+ 	wq->wqcfg->wq_thresh = wq->threshold;
+ 
+ 	/* byte 8-11 */
+-	wq->wqcfg->priv = !!(wq->type == IDXD_WQT_KERNEL);
+ 	if (wq_dedicated(wq))
+ 		wq->wqcfg->mode = 1;
+ 
+@@ -859,6 +867,25 @@ static int idxd_wq_config_write(struct idxd_wq *wq)
+ 			wq->wqcfg->pasid = idxd->pasid;
+ 	}
+ 
++	/*
++	 * Here the priv bit is set depending on the WQ type. priv = 1 if the
++	 * WQ type is kernel to indicate privileged access. This setting only
++	 * matters for dedicated WQ. According to the DSA spec:
++	 * If the WQ is in dedicated mode, WQ PASID Enable is 1, and the
++	 * Privileged Mode Enable field of the PCI Express PASID capability
++	 * is 0, this field must be 0.
++	 *
++	 * In the case of a dedicated kernel WQ that is not able to support
++	 * the PASID cap, then the configuration will be rejected.
++	 */
++	wq->wqcfg->priv = !!(wq->type == IDXD_WQT_KERNEL);
++	if (wq_dedicated(wq) && wq->wqcfg->pasid_en &&
++	    !idxd_device_pasid_priv_enabled(idxd) &&
++	    wq->type == IDXD_WQT_KERNEL) {
++		idxd->cmd_status = IDXD_SCMD_WQ_NO_PRIV;
++		return -EOPNOTSUPP;
++	}
++
+ 	wq->wqcfg->priority = wq->priority;
+ 
+ 	if (idxd->hw.gen_cap.block_on_fault &&
+diff --git a/drivers/dma/idxd/dma.c b/drivers/dma/idxd/dma.c
+index 77439b645044..5501632f98c4 100644
+--- a/drivers/dma/idxd/dma.c
++++ b/drivers/dma/idxd/dma.c
+@@ -69,7 +69,11 @@ static inline void idxd_prep_desc_common(struct idxd_wq *wq,
+ 	hw->src_addr = addr_f1;
+ 	hw->dst_addr = addr_f2;
+ 	hw->xfer_size = len;
+-	hw->priv = !!(wq->type == IDXD_WQT_KERNEL);
++	/*
++	 * For dedicated WQ, this field is ignored and HW will use the WQCFG.priv
++	 * field instead. This field should be set to 1 for kernel descriptors.
++	 */
++	hw->priv = 1;
+ 	hw->completion_addr = compl;
+ }
+ 
+* Unmerged path include/uapi/linux/idxd.h
