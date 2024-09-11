@@ -1,0 +1,171 @@
+skmsg: Teach sk_psock_verdict_apply() to return errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit 1581a6c1c3291a8320b080f4411345f60229976d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/1581a6c1.failed
+
+Currently sk_psock_verdict_apply() is void, but it handles some
+error conditions too. Its caller is impossible to learn whether
+it succeeds or fails, especially sk_psock_verdict_recv().
+
+Make it return int to indicate error cases and propagate errors
+to callers properly.
+
+Fixes: ef5659280eb1 ("bpf, sockmap: Allow skipping sk_skb parser program")
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+Link: https://lore.kernel.org/bpf/20210615021342.7416-7-xiyou.wangcong@gmail.com
+(cherry picked from commit 1581a6c1c3291a8320b080f4411345f60229976d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skmsg.c
+diff --cc net/core/skmsg.c
+index cfa6fc7cc1e0,e3d210811db4..000000000000
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@@ -744,21 -824,7 +744,25 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(sk_psock_msg_verdict);
+  
+++<<<<<<< HEAD
+ +static int sk_psock_bpf_run(struct sk_psock *psock, struct bpf_prog *prog,
+ +			    struct sk_buff *skb)
+ +{
+ +	return bpf_prog_run_pin_on_cpu(prog, skb);
+ +}
+ +
+ +static struct sk_psock *sk_psock_from_strp(struct strparser *strp)
+ +{
+ +	struct sk_psock_parser *parser;
+ +
+ +	parser = container_of(strp, struct sk_psock_parser, strp);
+ +	return container_of(parser, struct sk_psock, parser);
+ +}
+ +
+ +static void sk_psock_skb_redirect(struct sk_buff *skb)
+++=======
++ static int sk_psock_skb_redirect(struct sk_buff *skb)
+++>>>>>>> 1581a6c1c329 (skmsg: Teach sk_psock_verdict_apply() to return errors)
+  {
+  	struct sk_psock *psock_other;
+  	struct sock *sk_other;
+@@@ -776,14 -842,23 +780,31 @@@
+  	 * error that caused the pipe to break. We can't send a packet on
+  	 * a socket that is in this state so we drop the skb.
+  	 */
+++<<<<<<< HEAD
+ +	if (!psock_other || sock_flag(sk_other, SOCK_DEAD) ||
+ +	    !sk_psock_test_state(psock_other, SK_PSOCK_TX_ENABLED)) {
+++=======
++ 	if (!psock_other || sock_flag(sk_other, SOCK_DEAD)) {
++ 		skb_bpf_redirect_clear(skb);
+  		kfree_skb(skb);
+- 		return;
++ 		return -EIO;
++ 	}
++ 	spin_lock_bh(&psock_other->ingress_lock);
++ 	if (!sk_psock_test_state(psock_other, SK_PSOCK_TX_ENABLED)) {
++ 		spin_unlock_bh(&psock_other->ingress_lock);
++ 		skb_bpf_redirect_clear(skb);
+++>>>>>>> 1581a6c1c329 (skmsg: Teach sk_psock_verdict_apply() to return errors)
++ 		kfree_skb(skb);
++ 		return -EIO;
+  	}
+  
+  	skb_queue_tail(&psock_other->ingress_skb, skb);
+  	schedule_work(&psock_other->work);
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_bh(&psock_other->ingress_lock);
++ 	return 0;
+++>>>>>>> 1581a6c1c329 (skmsg: Teach sk_psock_verdict_apply() to return errors)
+  }
+  
+  static void sk_psock_tls_verdict_apply(struct sk_buff *skb, struct sock *sk, int verdict)
+@@@ -819,12 -895,11 +840,12 @@@ int sk_psock_tls_strp_read(struct sk_ps
+  }
+  EXPORT_SYMBOL_GPL(sk_psock_tls_strp_read);
+  
+- static void sk_psock_verdict_apply(struct sk_psock *psock,
+- 				   struct sk_buff *skb, int verdict)
++ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
++ 				  int verdict)
+  {
+ +	struct tcp_skb_cb *tcp;
+  	struct sock *sk_other;
+- 	int err = -EIO;
++ 	int err = 0;
+  
+  	switch (verdict) {
+  	case __SK_PASS:
+@@@ -852,16 -936,35 +874,18 @@@
+  		}
+  		break;
+  	case __SK_REDIRECT:
+- 		sk_psock_skb_redirect(skb);
++ 		err = sk_psock_skb_redirect(skb);
+  		break;
+  	case __SK_DROP:
+ +		/* fall-through */
+  	default:
+  out_free:
+  		kfree_skb(skb);
+  	}
++ 
++ 	return err;
+  }
+  
+ -static void sk_psock_write_space(struct sock *sk)
+ -{
+ -	struct sk_psock *psock;
+ -	void (*write_space)(struct sock *sk) = NULL;
+ -
+ -	rcu_read_lock();
+ -	psock = sk_psock(sk);
+ -	if (likely(psock)) {
+ -		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
+ -			schedule_work(&psock->work);
+ -		write_space = psock->saved_write_space;
+ -	}
+ -	rcu_read_unlock();
+ -	if (write_space)
+ -		write_space(sk);
+ -}
+ -
+ -#if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
+  static void sk_psock_strp_read(struct strparser *strp, struct sk_buff *skb)
+  {
+  	struct sk_psock *psock;
+@@@ -953,15 -1100,19 +977,16 @@@ static int sk_psock_verdict_recv(read_d
+  		kfree_skb(skb);
+  		goto out;
+  	}
+ -	prog = READ_ONCE(psock->progs.stream_verdict);
+ -	if (!prog)
+ -		prog = READ_ONCE(psock->progs.skb_verdict);
+ +	prog = READ_ONCE(psock->progs.skb_verdict);
+  	if (likely(prog)) {
+  		skb->sk = sk;
+ -		skb_dst_drop(skb);
+ -		skb_bpf_redirect_clear(skb);
+ -		ret = bpf_prog_run_pin_on_cpu(prog, skb);
+ -		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
+ +		tcp_skb_bpf_redirect_clear(skb);
+ +		ret = sk_psock_bpf_run(psock, prog, skb);
+ +		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
+  		skb->sk = NULL;
+  	}
+- 	sk_psock_verdict_apply(psock, skb, ret);
++ 	if (sk_psock_verdict_apply(psock, skb, ret) < 0)
++ 		len = 0;
+  out:
+  	rcu_read_unlock();
+  	return len;
+* Unmerged path net/core/skmsg.c
