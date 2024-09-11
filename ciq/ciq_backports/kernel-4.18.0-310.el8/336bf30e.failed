@@ -1,0 +1,220 @@
+hugetlbfs: fix anon huge page migration race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 336bf30eb76580b579dc711ded5d599d905c0217
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/336bf30e.failed
+
+Qian Cai reported the following BUG in [1]
+
+  LTP: starting move_pages12
+  BUG: unable to handle page fault for address: ffffffffffffffe0
+  ...
+  RIP: 0010:anon_vma_interval_tree_iter_first+0xa2/0x170 avc_start_pgoff at mm/interval_tree.c:63
+  Call Trace:
+    rmap_walk_anon+0x141/0xa30 rmap_walk_anon at mm/rmap.c:1864
+    try_to_unmap+0x209/0x2d0 try_to_unmap at mm/rmap.c:1763
+    migrate_pages+0x1005/0x1fb0
+    move_pages_and_store_status.isra.47+0xd7/0x1a0
+    __x64_sys_move_pages+0xa5c/0x1100
+    do_syscall_64+0x5f/0x310
+    entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Hugh Dickins diagnosed this as a migration bug caused by code introduced
+to use i_mmap_rwsem for pmd sharing synchronization.  Specifically, the
+routine unmap_and_move_huge_page() is always passing the TTU_RMAP_LOCKED
+flag to try_to_unmap() while holding i_mmap_rwsem.  This is wrong for
+anon pages as the anon_vma_lock should be held in this case.  Further
+analysis suggested that i_mmap_rwsem was not required to he held at all
+when calling try_to_unmap for anon pages as an anon page could never be
+part of a shared pmd mapping.
+
+Discussion also revealed that the hack in hugetlb_page_mapping_lock_write
+to drop page lock and acquire i_mmap_rwsem is wrong.  There is no way to
+keep mapping valid while dropping page lock.
+
+This patch does the following:
+
+ - Do not take i_mmap_rwsem and set TTU_RMAP_LOCKED for anon pages when
+   calling try_to_unmap.
+
+ - Remove the hacky code in hugetlb_page_mapping_lock_write. The routine
+   will now simply do a 'trylock' while still holding the page lock. If
+   the trylock fails, it will return NULL. This could impact the
+   callers:
+
+    - migration calling code will receive -EAGAIN and retry up to the
+      hard coded limit (10).
+
+    - memory error code will treat the page as BUSY. This will force
+      killing (SIGKILL) instead of SIGBUS any mapping tasks.
+
+   Do note that this change in behavior only happens when there is a
+   race. None of the standard kernel testing suites actually hit this
+   race, but it is possible.
+
+[1] https://lore.kernel.org/lkml/20200708012044.GC992@lca.pw/
+[2] https://lore.kernel.org/linux-mm/alpine.LSU.2.11.2010071833100.2214@eggly.anvils/
+
+Fixes: c0d0381ade79 ("hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization")
+	Reported-by: Qian Cai <cai@lca.pw>
+	Suggested-by: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+	Cc: <stable@vger.kernel.org>
+Link: https://lkml.kernel.org/r/20201105195058.78401-1-mike.kravetz@oracle.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 336bf30eb76580b579dc711ded5d599d905c0217)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+#	mm/memory-failure.c
+#	mm/migrate.c
+#	mm/rmap.c
+diff --cc mm/hugetlb.c
+index 5899c1f83920,37f15c3c24dc..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1404,6 -1567,26 +1404,29 @@@ int PageHeadHuge(struct page *page_head
+  	return page_head[1].compound_dtor == HUGETLB_PAGE_DTOR;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Find and lock address space (mapping) in write mode.
++  *
++  * Upon entry, the page is locked which means that page_mapping() is
++  * stable.  Due to locking order, we can only trylock_write.  If we can
++  * not get the lock, simply return NULL to caller.
++  */
++ struct address_space *hugetlb_page_mapping_lock_write(struct page *hpage)
++ {
++ 	struct address_space *mapping = page_mapping(hpage);
++ 
++ 	if (!mapping)
++ 		return mapping;
++ 
++ 	if (i_mmap_trylock_write(mapping))
++ 		return mapping;
++ 
++ 	return NULL;
++ }
++ 
+++>>>>>>> 336bf30eb765 (hugetlbfs: fix anon huge page migration race)
+  pgoff_t __basepage_index(struct page *page)
+  {
+  	struct page *page_head = compound_head(page);
+diff --cc mm/memory-failure.c
+index 1eb364eceed0,5d880d4eb9a2..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -1055,7 -1054,30 +1055,34 @@@ static bool hwpoison_user_mappings(stru
+  	if (kill)
+  		collect_procs(hpage, &tokill, flags & MF_ACTION_REQUIRED);
+  
+++<<<<<<< HEAD
+ +	unmap_success = try_to_unmap(hpage, ttu);
+++=======
++ 	if (!PageHuge(hpage)) {
++ 		unmap_success = try_to_unmap(hpage, ttu);
++ 	} else {
++ 		if (!PageAnon(hpage)) {
++ 			/*
++ 			 * For hugetlb pages in shared mappings, try_to_unmap
++ 			 * could potentially call huge_pmd_unshare.  Because of
++ 			 * this, take semaphore in write mode here and set
++ 			 * TTU_RMAP_LOCKED to indicate we have taken the lock
++ 			 * at this higer level.
++ 			 */
++ 			mapping = hugetlb_page_mapping_lock_write(hpage);
++ 			if (mapping) {
++ 				unmap_success = try_to_unmap(hpage,
++ 						     ttu|TTU_RMAP_LOCKED);
++ 				i_mmap_unlock_write(mapping);
++ 			} else {
++ 				pr_info("Memory failure: %#lx: could not lock mapping for mapped huge page\n", pfn);
++ 				unmap_success = false;
++ 			}
++ 		} else {
++ 			unmap_success = try_to_unmap(hpage, ttu);
++ 		}
++ 	}
+++>>>>>>> 336bf30eb765 (hugetlbfs: fix anon huge page migration race)
+  	if (!unmap_success)
+  		pr_err("Memory failure: %#lx: failed to unmap page (mapcount=%d)\n",
+  		       pfn, page_mapcount(hpage));
+diff --cc mm/migrate.c
+index f9092c22e9d0,5795cb82e27c..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1332,9 -1328,30 +1332,36 @@@ static int unmap_and_move_huge_page(new
+  		goto put_anon;
+  
+  	if (page_mapped(hpage)) {
+++<<<<<<< HEAD
+ +		try_to_unmap(hpage,
+ +			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
+ +		page_was_mapped = 1;
+++=======
++ 		bool mapping_locked = false;
++ 		enum ttu_flags ttu = TTU_MIGRATION|TTU_IGNORE_MLOCK|
++ 					TTU_IGNORE_ACCESS;
++ 
++ 		if (!PageAnon(hpage)) {
++ 			/*
++ 			 * In shared mappings, try_to_unmap could potentially
++ 			 * call huge_pmd_unshare.  Because of this, take
++ 			 * semaphore in write mode here and set TTU_RMAP_LOCKED
++ 			 * to let lower levels know we have taken the lock.
++ 			 */
++ 			mapping = hugetlb_page_mapping_lock_write(hpage);
++ 			if (unlikely(!mapping))
++ 				goto unlock_put_anon;
++ 
++ 			mapping_locked = true;
++ 			ttu |= TTU_RMAP_LOCKED;
++ 		}
++ 
++ 		try_to_unmap(hpage, ttu);
++ 		page_was_mapped = 1;
++ 
++ 		if (mapping_locked)
++ 			i_mmap_unlock_write(mapping);
+++>>>>>>> 336bf30eb765 (hugetlbfs: fix anon huge page migration race)
+  	}
+  
+  	if (!page_mapped(hpage))
+diff --cc mm/rmap.c
+index 9650908547de,31b29321adfe..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1453,8 -1459,14 +1453,19 @@@ static bool try_to_unmap_one(struct pag
+  		subpage = page - page_to_pfn(page) + pte_pfn(*pvmw.pte);
+  		address = pvmw.address;
+  
+++<<<<<<< HEAD
+ +		if (PageHuge(page)) {
+ +			if (huge_pmd_unshare(mm, &address, pvmw.pte)) {
+++=======
++ 		if (PageHuge(page) && !PageAnon(page)) {
++ 			/*
++ 			 * To call huge_pmd_unshare, i_mmap_rwsem must be
++ 			 * held in write mode.  Caller needs to explicitly
++ 			 * do this outside rmap routines.
++ 			 */
++ 			VM_BUG_ON(!(flags & TTU_RMAP_LOCKED));
++ 			if (huge_pmd_unshare(mm, vma, &address, pvmw.pte)) {
+++>>>>>>> 336bf30eb765 (hugetlbfs: fix anon huge page migration race)
+  				/*
+  				 * huge_pmd_unshare unmapped an entire PMD
+  				 * page.  There is no way of knowing exactly
+* Unmerged path mm/hugetlb.c
+* Unmerged path mm/memory-failure.c
+* Unmerged path mm/migrate.c
+* Unmerged path mm/rmap.c
