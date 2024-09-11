@@ -1,0 +1,149 @@
+ext4, jbd2: ensure panic by fix a race between jbd2 abort and ext4 error handlers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author zhangyi (F) <yi.zhang@huawei.com>
+commit 7b97d868b7ab2448859668de9222b8af43f76e78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7b97d868.failed
+
+In the ext4 filesystem with errors=panic, if one process is recording
+errno in the superblock when invoking jbd2_journal_abort() due to some
+error cases, it could be raced by another __ext4_abort() which is
+setting the SB_RDONLY flag but missing panic because errno has not been
+recorded.
+
+jbd2_journal_commit_transaction()
+ jbd2_journal_abort()
+  journal->j_flags |= JBD2_ABORT;
+  jbd2_journal_update_sb_errno()
+                                    | ext4_journal_check_start()
+                                    |  __ext4_abort()
+                                    |   sb->s_flags |= SB_RDONLY;
+                                    |   if (!JBD2_REC_ERR)
+                                    |        return;
+  journal->j_flags |= JBD2_REC_ERR;
+
+Finally, it will no longer trigger panic because the filesystem has
+already been set read-only. Fix this by introduce j_abort_mutex to make
+sure journal abort is completed before panic, and remove JBD2_REC_ERR
+flag.
+
+Fixes: 4327ba52afd03 ("ext4, jbd2: ensure entering into panic after recording an error in superblock")
+	Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20200609073540.3810702-1-yi.zhang@huawei.com
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 7b97d868b7ab2448859668de9222b8af43f76e78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/super.c
+diff --cc fs/ext4/super.c
+index 0b924fdb8e4c,2660a7e47eef..000000000000
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@@ -695,16 -733,9 +695,15 @@@ void __ext4_abort(struct super_block *s
+  		 */
+  		smp_wmb();
+  		sb->s_flags |= SB_RDONLY;
+++<<<<<<< HEAD
+ +		if (EXT4_SB(sb)->s_journal)
+ +			jbd2_journal_abort(EXT4_SB(sb)->s_journal, -EIO);
+ +		save_error_info(sb, function, line);
+++=======
+++>>>>>>> 7b97d868b7ab (ext4, jbd2: ensure panic by fix a race between jbd2 abort and ext4 error handlers)
+  	}
+- 	if (test_opt(sb, ERRORS_PANIC) && !system_going_down()) {
+- 		if (EXT4_SB(sb)->s_journal &&
+- 		  !(EXT4_SB(sb)->s_journal->j_flags & JBD2_REC_ERR))
+- 			return;
++ 	if (test_opt(sb, ERRORS_PANIC) && !system_going_down())
+  		panic("EXT4-fs panic from previous error\n");
+- 	}
+  }
+  
+  void __ext4_msg(struct super_block *sb,
+* Unmerged path fs/ext4/super.c
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index 3a2d4dc72a07..4b4eb6d7871d 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -1131,6 +1131,7 @@ static journal_t *journal_init_common(struct block_device *bdev,
+ 	init_waitqueue_head(&journal->j_wait_commit);
+ 	init_waitqueue_head(&journal->j_wait_updates);
+ 	init_waitqueue_head(&journal->j_wait_reserved);
++	mutex_init(&journal->j_abort_mutex);
+ 	mutex_init(&journal->j_barrier);
+ 	mutex_init(&journal->j_checkpoint_mutex);
+ 	spin_lock_init(&journal->j_revoke_lock);
+@@ -1389,7 +1390,8 @@ static int jbd2_write_superblock(journal_t *journal, int write_flags)
+ 		printk(KERN_ERR "JBD2: Error %d detected when updating "
+ 		       "journal superblock for %s.\n", ret,
+ 		       journal->j_devname);
+-		jbd2_journal_abort(journal, ret);
++		if (!is_journal_aborted(journal))
++			jbd2_journal_abort(journal, ret);
+ 	}
+ 
+ 	return ret;
+@@ -2119,6 +2121,13 @@ void jbd2_journal_abort(journal_t *journal, int errno)
+ {
+ 	transaction_t *transaction;
+ 
++	/*
++	 * Lock the aborting procedure until everything is done, this avoid
++	 * races between filesystem's error handling flow (e.g. ext4_abort()),
++	 * ensure panic after the error info is written into journal's
++	 * superblock.
++	 */
++	mutex_lock(&journal->j_abort_mutex);
+ 	/*
+ 	 * ESHUTDOWN always takes precedence because a file system check
+ 	 * caused by any other journal abort error is not required after
+@@ -2133,6 +2142,7 @@ void jbd2_journal_abort(journal_t *journal, int errno)
+ 			journal->j_errno = errno;
+ 			jbd2_journal_update_sb_errno(journal);
+ 		}
++		mutex_unlock(&journal->j_abort_mutex);
+ 		return;
+ 	}
+ 
+@@ -2154,10 +2164,7 @@ void jbd2_journal_abort(journal_t *journal, int errno)
+ 	 * layer could realise that a filesystem check is needed.
+ 	 */
+ 	jbd2_journal_update_sb_errno(journal);
+-
+-	write_lock(&journal->j_state_lock);
+-	journal->j_flags |= JBD2_REC_ERR;
+-	write_unlock(&journal->j_state_lock);
++	mutex_unlock(&journal->j_abort_mutex);
+ }
+ 
+ /**
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index a787739ceda4..8ee0e3f601ca 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -776,6 +776,11 @@ struct journal_s
+ 	 */
+ 	int			j_errno;
+ 
++	/**
++	 * @j_abort_mutex: Lock the whole aborting procedure.
++	 */
++	struct mutex		j_abort_mutex;
++
+ 	/**
+ 	 * @j_sb_buffer: The first part of the superblock buffer.
+ 	 */
+@@ -1251,7 +1256,6 @@ JBD2_FEATURE_INCOMPAT_FUNCS(csum3,		CSUM_V3)
+ #define JBD2_ABORT_ON_SYNCDATA_ERR	0x040	/* Abort the journal on file
+ 						 * data write error in ordered
+ 						 * mode */
+-#define JBD2_REC_ERR	0x080	/* The errno in the sb has been recorded */
+ 
+ /*
+  * Function declarations for the journaling transaction and buffer
