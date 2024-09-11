@@ -1,0 +1,136 @@
+arm64: entry-common: don't touch daif before bp-hardening
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author James Morse <james.morse@arm.com>
+commit bfe298745afc9548ad9344a9a3f26c81fd1a76c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/bfe29874.failed
+
+The previous patches mechanically transformed the assembly version of
+entry.S to entry-common.c for synchronous exceptions.
+
+The C version of local_daif_restore() doesn't quite do the same thing
+as the assembly versions if pseudo-NMI is in use. In particular,
+| local_daif_restore(DAIF_PROCCTX_NOIRQ)
+will still allow pNMI to be delivered. This is not the behaviour
+do_el0_ia_bp_hardening() and do_sp_pc_abort() want as it should not
+be possible for the PMU handler to run as an NMI until the bp-hardening
+sequence has run.
+
+The bp-hardening calls were placed where they are because this was the
+first C code to run after the relevant exceptions. As we've now moved
+that point earlier, move the checks and calls earlier too.
+
+This makes it clearer that this stuff runs before any kind of exception,
+and saves modifying PSTATE twice.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Julien Thierry <julien.thierry.kdev@gmail.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit bfe298745afc9548ad9344a9a3f26c81fd1a76c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry-common.c
+#	arch/arm64/mm/fault.c
+diff --cc arch/arm64/mm/fault.c
+index a1fbfca74da1,1bb2e3737e51..000000000000
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@@ -43,7 -32,8 +43,12 @@@
+  #include <asm/daifflags.h>
+  #include <asm/debug-monitors.h>
+  #include <asm/esr.h>
+++<<<<<<< HEAD
+ +#include <asm/kasan.h>
+++=======
++ #include <asm/kprobes.h>
++ #include <asm/processor.h>
+++>>>>>>> bfe298745afc (arm64: entry-common: don't touch daif before bp-hardening)
+  #include <asm/sysreg.h>
+  #include <asm/system_misc.h>
+  #include <asm/pgtable.h>
+@@@ -784,34 -744,10 +777,32 @@@ asmlinkage void __exception do_el0_irq_
+  	/* PC has already been checked in entry.S */
+  	arm64_apply_bp_hardening();
+  }
+ -NOKPROBE_SYMBOL(do_el0_irq_bp_hardening);
+  
+++<<<<<<< HEAD
+ +asmlinkage void __exception do_el0_ia_bp_hardening(unsigned long addr,
+ +						   unsigned int esr,
+ +						   struct pt_regs *regs)
+ +{
+ +	/*
+ +	 * We've taken an instruction abort from userspace and not yet
+ +	 * re-enabled IRQs. If the address is a kernel address, apply
+ +	 * BP hardening prior to enabling IRQs and pre-emption.
+ +	 */
+ +	if (!is_ttbr0_addr(addr))
+ +		arm64_apply_bp_hardening();
+ +
+ +	local_daif_restore(DAIF_PROCCTX);
+ +	do_mem_abort(addr, esr, regs);
+ +}
+ +
+ +
+ +asmlinkage void __exception do_sp_pc_abort(unsigned long addr,
+ +					   unsigned int esr,
+ +					   struct pt_regs *regs)
+++=======
++ void do_sp_pc_abort(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+++>>>>>>> bfe298745afc (arm64: entry-common: don't touch daif before bp-hardening)
+  {
+- 	if (user_mode(regs)) {
+- 		if (!is_ttbr0_addr(instruction_pointer(regs)))
+- 			arm64_apply_bp_hardening();
+- 		local_daif_restore(DAIF_PROCCTX);
+- 	}
+- 
+  	arm64_notify_die("SP/PC alignment exception", regs,
+  			 SIGBUS, BUS_ADRALN, (void __user *)addr, esr);
+  }
+* Unmerged path arch/arm64/kernel/entry-common.c
+diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+index 74c421a18b2c..620cc192ed62 100644
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -45,12 +45,14 @@
+ #include <linux/init.h>
+ #include <linux/stddef.h>
+ #include <linux/string.h>
++#include <linux/thread_info.h>
+ 
+ #include <vdso/processor.h>
+ 
+ #include <asm/alternative.h>
+ #include <asm/cpufeature.h>
+ #include <asm/hw_breakpoint.h>
++#include <asm/kasan.h>
+ #include <asm/lse.h>
+ #include <asm/pgtable-hwdef.h>
+ #include <asm/pointer_auth.h>
+@@ -235,6 +237,18 @@ static inline void start_thread(struct pt_regs *regs, unsigned long pc,
+ 	regs->sp = sp;
+ }
+ 
++static inline bool is_ttbr0_addr(unsigned long addr)
++{
++	/* entry assembly clears tags for TTBR0 addrs */
++	return addr < TASK_SIZE;
++}
++
++static inline bool is_ttbr1_addr(unsigned long addr)
++{
++	/* TTBR1 addresses may have a tag if KASAN_SW_TAGS is in use */
++	return arch_kasan_reset_tag(addr) >= PAGE_OFFSET;
++}
++
+ #ifdef CONFIG_COMPAT
+ static inline void compat_start_thread(struct pt_regs *regs, unsigned long pc,
+ 				       unsigned long sp)
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/mm/fault.c
