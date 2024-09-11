@@ -1,0 +1,138 @@
+x86/sev: Use CC_ATTR attribute to generalize string I/O unroll
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+commit 8260b9820f7050461b8969305bbd8cb5654f0c74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/8260b982.failed
+
+INS/OUTS are not supported in TDX guests and cause #UD. Kernel has to
+avoid them when running in TDX guest. To support existing usage, string
+I/O operations are unrolled using IN/OUT instructions.
+
+AMD SEV platform implements this support by adding unroll
+logic in ins#bwl()/outs#bwl() macros with SEV-specific checks.
+Since TDX VM guests will also need similar support, use
+CC_ATTR_GUEST_UNROLL_STRING_IO and generic cc_platform_has() API to
+implement it.
+
+String I/O helpers were the last users of sev_key_active() interface and
+sev_enable_key static key. Remove them.
+
+ [ bp: Move comment too and do not delete it. ]
+
+	Suggested-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Tested-by: Tom Lendacky <thomas.lendacky@amd.com>
+Link: https://lkml.kernel.org/r/20211206135505.75045-2-kirill.shutemov@linux.intel.com
+(cherry picked from commit 8260b9820f7050461b8969305bbd8cb5654f0c74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cc_platform.c
+#	arch/x86/mm/mem_encrypt.c
+#	include/linux/cc_platform.h
+diff --cc arch/x86/mm/mem_encrypt.c
+index d16a12ec26d9,b520021a7e7b..000000000000
+--- a/arch/x86/mm/mem_encrypt.c
++++ b/arch/x86/mm/mem_encrypt.c
+@@@ -40,15 -39,13 +40,13 @@@
+   * reside in the .data section so as not to be zeroed out when the .bss
+   * section is later cleared.
+   */
+ -u64 sme_me_mask __section(".data") = 0;
+ -u64 sev_status __section(".data") = 0;
+ -u64 sev_check_data __section(".data") = 0;
+ +u64 sme_me_mask __section(.data) = 0;
+ +u64 sev_status __section(.data) = 0;
+ +u64 sev_check_data __section(.data) = 0;
+  EXPORT_SYMBOL(sme_me_mask);
+- DEFINE_STATIC_KEY_FALSE(sev_enable_key);
+- EXPORT_SYMBOL_GPL(sev_enable_key);
+  
+  /* Buffer used for early in-place encryption by BSP, no locking needed */
+ -static char sme_early_buffer[PAGE_SIZE] __initdata __aligned(PAGE_SIZE);
+ +static char sme_early_buffer[PAGE_SIZE] __aligned(PAGE_SIZE);
+  
+  /*
+   * This routine does not change the underlying encryption setting of the
+@@@ -476,13 -497,6 +474,16 @@@ void __init mem_encrypt_init(void
+  	/* Call into SWIOTLB to update the SWIOTLB DMA buffers */
+  	swiotlb_update_mem_attributes();
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * With SEV, we need to unroll the rep string I/O instructions,
+ +	 * but SEV-ES supports them through the #VC handler.
+ +	 */
+ +	if (sev_active() && !sev_es_active())
+ +		static_branch_enable(&sev_enable_key);
+ +
+++=======
+++>>>>>>> 8260b9820f70 (x86/sev: Use CC_ATTR attribute to generalize string I/O unroll)
+  	print_mem_encrypt_feature_info();
+  }
+  
+* Unmerged path arch/x86/kernel/cc_platform.c
+* Unmerged path include/linux/cc_platform.h
+diff --git a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
+index a4d10afc6bcd..e1a95471ad18 100644
+--- a/arch/x86/include/asm/io.h
++++ b/arch/x86/include/asm/io.h
+@@ -40,6 +40,7 @@
+ 
+ #include <linux/string.h>
+ #include <linux/compiler.h>
++#include <linux/cc_platform.h>
+ #include <asm/page.h>
+ #include <asm/early_ioremap.h>
+ #include <asm/pgtable_types.h>
+@@ -254,21 +255,6 @@ static inline void slow_down_io(void)
+ 
+ #endif
+ 
+-#ifdef CONFIG_AMD_MEM_ENCRYPT
+-#include <linux/jump_label.h>
+-
+-extern struct static_key_false sev_enable_key;
+-static inline bool sev_key_active(void)
+-{
+-	return static_branch_unlikely(&sev_enable_key);
+-}
+-
+-#else /* !CONFIG_AMD_MEM_ENCRYPT */
+-
+-static inline bool sev_key_active(void) { return false; }
+-
+-#endif /* CONFIG_AMD_MEM_ENCRYPT */
+-
+ #define BUILDIO(bwl, bw, type)						\
+ static inline void out##bwl(unsigned type value, int port)		\
+ {									\
+@@ -299,7 +285,7 @@ static inline unsigned type in##bwl##_p(int port)			\
+ 									\
+ static inline void outs##bwl(int port, const void *addr, unsigned long count) \
+ {									\
+-	if (sev_key_active()) {						\
++	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
+ 		unsigned type *value = (unsigned type *)addr;		\
+ 		while (count) {						\
+ 			out##bwl(*value, port);				\
+@@ -315,7 +301,7 @@ static inline void outs##bwl(int port, const void *addr, unsigned long count) \
+ 									\
+ static inline void ins##bwl(int port, void *addr, unsigned long count)	\
+ {									\
+-	if (sev_key_active()) {						\
++	if (cc_platform_has(CC_ATTR_GUEST_UNROLL_STRING_IO)) {		\
+ 		unsigned type *value = (unsigned type *)addr;		\
+ 		while (count) {						\
+ 			*value = in##bwl(port);				\
+* Unmerged path arch/x86/kernel/cc_platform.c
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path include/linux/cc_platform.h
