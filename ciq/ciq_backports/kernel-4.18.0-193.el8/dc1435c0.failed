@@ -1,0 +1,227 @@
+RDMA/srp: Rename SRP sysfs name after IB device rename trigger
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit dc1435c00fcd102c9803cd6120701ba5547138d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/dc1435c0.failed
+
+SRP logic used device name and port index as symlink to relevant
+kobject. If the IB device is renamed then the prior name will be re-used
+by the next device plugged in and sysfs will panic as SRP will try to
+re-use the same name.
+
+ mlx5_ib: Mellanox Connect-IB Infiniband driver v5.0-0
+ sysfs: cannot create duplicate filename '/class/infiniband_srp/srp-mlx5_0-1'
+ CPU: 3 PID: 1107 Comm: modprobe Not tainted 5.1.0-for-upstream-perf-2019-05-12_15-09-52-87 #1
+ Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1ubuntu1 04/01/2014
+ Call Trace:
+  dump_stack+0x5a/0x73
+  sysfs_warn_dup+0x58/0x70
+  sysfs_do_create_link_sd.isra.2+0xa3/0xb0
+  device_add+0x33f/0x660
+  srp_add_one+0x301/0x4f0 [ib_srp]
+  add_client_context+0x99/0xe0 [ib_core]
+  enable_device_and_get+0xd1/0x1b0 [ib_core]
+  ib_register_device+0x533/0x710 [ib_core]
+  ? mutex_lock+0xe/0x30
+  __mlx5_ib_add+0x23/0x70 [mlx5_ib]
+  mlx5_add_device+0x4e/0xd0 [mlx5_core]
+  mlx5_register_interface+0x85/0xc0 [mlx5_core]
+  ? 0xffffffffa0791000
+  do_one_initcall+0x4b/0x1cb
+  ? kmem_cache_alloc_trace+0xc6/0x1d0
+  ? do_init_module+0x22/0x21f
+  do_init_module+0x5a/0x21f
+  load_module+0x17f2/0x1ca0
+  ? m_show+0x1c0/0x1c0
+  __do_sys_finit_module+0x94/0xe0
+  do_syscall_64+0x48/0x120
+  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+ RIP: 0033:0x7f157cce10d9
+
+The module load/unload sequence was used to trigger such kernel panic:
+ sudo modprobe ib_srp
+ sudo modprobe -r mlx5_ib
+ sudo modprobe -r mlx5_core
+ sudo modprobe mlx5_core
+
+Have SRP track the name of the core device so that it can't have a name
+collision.
+
+Fixes: d21943dd19b5 ("RDMA/core: Implement IB device rename function")
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit dc1435c00fcd102c9803cd6120701ba5547138d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index ec96a7b1c811,cd6b679badfe..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -189,14 -359,64 +189,16 @@@ static struct ib_device *__ib_device_ge
+  	return NULL;
+  }
+  
+ -/**
+ - * ib_device_get_by_name - Find an IB device by name
+ - * @name: The name to look for
+ - * @driver_id: The driver ID that must match (RDMA_DRIVER_UNKNOWN matches all)
+ - *
+ - * Find and hold an ib_device by its name. The caller must call
+ - * ib_device_put() on the returned pointer.
+ - */
+ -struct ib_device *ib_device_get_by_name(const char *name,
+ -					enum rdma_driver_id driver_id)
+ -{
+ -	struct ib_device *device;
+ -
+ -	down_read(&devices_rwsem);
+ -	device = __ib_device_get_by_name(name);
+ -	if (device && driver_id != RDMA_DRIVER_UNKNOWN &&
+ -	    device->driver_id != driver_id)
+ -		device = NULL;
+ -
+ -	if (device) {
+ -		if (!ib_device_try_get(device))
+ -			device = NULL;
+ -	}
+ -	up_read(&devices_rwsem);
+ -	return device;
+ -}
+ -EXPORT_SYMBOL(ib_device_get_by_name);
+ -
+ -static int rename_compat_devs(struct ib_device *device)
+ -{
+ -	struct ib_core_device *cdev;
+ -	unsigned long index;
+ -	int ret = 0;
+ -
+ -	mutex_lock(&device->compat_devs_mutex);
+ -	xa_for_each (&device->compat_devs, index, cdev) {
+ -		ret = device_rename(&cdev->dev, dev_name(&device->dev));
+ -		if (ret) {
+ -			dev_warn(&cdev->dev,
+ -				 "Fail to rename compatdev to new name %s\n",
+ -				 dev_name(&device->dev));
+ -			break;
+ -		}
+ -	}
+ -	mutex_unlock(&device->compat_devs_mutex);
+ -	return ret;
+ -}
+ -
+  int ib_device_rename(struct ib_device *ibdev, const char *name)
+  {
++ 	unsigned long index;
++ 	void *client_data;
+  	int ret;
+  
+ -	down_write(&devices_rwsem);
+ +	mutex_lock(&device_mutex);
+  	if (!strcmp(name, dev_name(&ibdev->dev))) {
+- 		ret = 0;
+- 		goto out;
++ 		up_write(&devices_rwsem);
++ 		return 0;
+  	}
+  
+  	if (__ib_device_get_by_name(name)) {
+@@@ -205,12 -425,28 +207,34 @@@
+  	}
+  
+  	ret = device_rename(&ibdev->dev, name);
+- 	if (ret)
+- 		goto out;
++ 	if (ret) {
++ 		up_write(&devices_rwsem);
++ 		return ret;
++ 	}
++ 
+  	strlcpy(ibdev->name, name, IB_DEVICE_NAME_MAX);
+++<<<<<<< HEAD
+ +out:
+ +	mutex_unlock(&device_mutex);
+ +	return ret;
+++=======
++ 	ret = rename_compat_devs(ibdev);
++ 
++ 	downgrade_write(&devices_rwsem);
++ 	down_read(&ibdev->client_data_rwsem);
++ 	xan_for_each_marked(&ibdev->client_data, index, client_data,
++ 			    CLIENT_DATA_REGISTERED) {
++ 		struct ib_client *client = xa_load(&clients, index);
++ 
++ 		if (!client || !client->rename)
++ 			continue;
++ 
++ 		client->rename(ibdev, client_data);
++ 	}
++ 	up_read(&ibdev->client_data_rwsem);
++ 	up_read(&devices_rwsem);
++ 	return 0;
+++>>>>>>> dc1435c00fcd (RDMA/srp: Rename SRP sysfs name after IB device rename trigger)
+  }
+  
+  static int alloc_name(struct ib_device *ibdev, const char *name)
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/ulp/srp/ib_srp.c b/drivers/infiniband/ulp/srp/ib_srp.c
+index 2e9fb3fb8eeb..39e2cad6c699 100644
+--- a/drivers/infiniband/ulp/srp/ib_srp.c
++++ b/drivers/infiniband/ulp/srp/ib_srp.c
+@@ -148,6 +148,7 @@ MODULE_PARM_DESC(ch_count,
+ 
+ static void srp_add_one(struct ib_device *device);
+ static void srp_remove_one(struct ib_device *device, void *client_data);
++static void srp_rename_dev(struct ib_device *device, void *client_data);
+ static void srp_recv_done(struct ib_cq *cq, struct ib_wc *wc);
+ static void srp_handle_qp_err(struct ib_cq *cq, struct ib_wc *wc,
+ 		const char *opname);
+@@ -162,7 +163,8 @@ static struct workqueue_struct *srp_remove_wq;
+ static struct ib_client srp_client = {
+ 	.name   = "srp",
+ 	.add    = srp_add_one,
+-	.remove = srp_remove_one
++	.remove = srp_remove_one,
++	.rename = srp_rename_dev
+ };
+ 
+ static struct ib_sa_client srp_sa_client;
+@@ -4112,6 +4114,20 @@ static struct srp_host *srp_add_port(struct srp_device *device, u8 port)
+ 	return NULL;
+ }
+ 
++static void srp_rename_dev(struct ib_device *device, void *client_data)
++{
++	struct srp_device *srp_dev = client_data;
++	struct srp_host *host, *tmp_host;
++
++	list_for_each_entry_safe(host, tmp_host, &srp_dev->dev_list, list) {
++		char name[IB_DEVICE_NAME_MAX + 8];
++
++		snprintf(name, sizeof(name), "srp-%s-%d",
++			 dev_name(&device->dev), host->port);
++		device_rename(&host->dev, name);
++	}
++}
++
+ static void srp_add_one(struct ib_device *device)
+ {
+ 	struct srp_device *srp_dev;
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 4fdff229596d..ddbf8da95f24 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2612,6 +2612,7 @@ struct ib_client {
+ 	const char *name;
+ 	void (*add)   (struct ib_device *);
+ 	void (*remove)(struct ib_device *, void *client_data);
++	void (*rename)(struct ib_device *dev, void *client_data);
+ 
+ 	/* Returns the net_dev belonging to this ib_client and matching the
+ 	 * given parameters.
