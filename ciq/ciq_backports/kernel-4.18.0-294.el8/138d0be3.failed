@@ -1,0 +1,269 @@
+net: bpf: Add netlink and ipv6_route bpf_iter targets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] bpf: Add netlink and ipv6_route bpf_iter targets (Jiri Benc) [1882708]
+Rebuild_FUZZ: 95.05%
+commit-author Yonghong Song <yhs@fb.com>
+commit 138d0be35b141e09f6b267c6ae4094318d4e4491
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/138d0be3.failed
+
+This patch added netlink and ipv6_route targets, using
+the same seq_ops (except show() and minor changes for stop())
+for /proc/net/{netlink,ipv6_route}.
+
+The net namespace for these targets are the current net
+namespace at file open stage, similar to
+/proc/net/{netlink,ipv6_route} reference counting
+the net namespace at seq_file open stage.
+
+Since module is not supported for now, ipv6_route is
+supported only if the IPV6 is built-in, i.e., not compiled
+as a module. The restriction can be lifted once module
+is properly supported for bpf_iter.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200509175910.2476329-1-yhs@fb.com
+(cherry picked from commit 138d0be35b141e09f6b267c6ae4094318d4e4491)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/proc_fs.h
+#	net/netlink/af_netlink.c
+diff --cc include/linux/proc_fs.h
+index 626fc65c4336,03953c59807d..000000000000
+--- a/include/linux/proc_fs.h
++++ b/include/linux/proc_fs.h
+@@@ -73,6 -103,19 +73,22 @@@ struct proc_dir_entry *proc_create_net_
+  						    int (*show)(struct seq_file *, void *),
+  						    proc_write_t write,
+  						    void *data);
+++<<<<<<< HEAD
+++=======
++ extern struct pid *tgid_pidfd_to_pid(const struct file *file);
++ 
++ extern int bpf_iter_init_seq_net(void *priv_data);
++ extern void bpf_iter_fini_seq_net(void *priv_data);
++ 
++ #ifdef CONFIG_PROC_PID_ARCH_STATUS
++ /*
++  * The architecture which selects CONFIG_PROC_PID_ARCH_STATUS must
++  * provide proc_pid_arch_status() definition.
++  */
++ int proc_pid_arch_status(struct seq_file *m, struct pid_namespace *ns,
++ 			struct pid *pid, struct task_struct *task);
++ #endif /* CONFIG_PROC_PID_ARCH_STATUS */
+++>>>>>>> 138d0be35b14 (net: bpf: Add netlink and ipv6_route bpf_iter targets)
+  
+  #else /* CONFIG_PROC_FS */
+  
+diff --cc net/netlink/af_netlink.c
+index 9b0e55efc3d6,33cda9baa979..000000000000
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@@ -2753,7 -2825,13 +2830,17 @@@ static int __init netlink_proto_init(vo
+  	if (err != 0)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	BUILD_BUG_ON(sizeof(struct netlink_skb_parms) > FIELD_SIZEOF(struct sk_buff, cb));
+++=======
++ #if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_PROC_FS)
++ 	err = bpf_iter_register();
++ 	if (err)
++ 		goto out;
++ #endif
++ 
++ 	BUILD_BUG_ON(sizeof(struct netlink_skb_parms) > sizeof_field(struct sk_buff, cb));
+++>>>>>>> 138d0be35b14 (net: bpf: Add netlink and ipv6_route bpf_iter targets)
+  
+  	nl_table = kcalloc(MAX_LINKS, sizeof(*nl_table), GFP_KERNEL);
+  	if (!nl_table)
+diff --git a/fs/proc/proc_net.c b/fs/proc/proc_net.c
+index a7b12435519e..957bc8ccf7a1 100644
+--- a/fs/proc/proc_net.c
++++ b/fs/proc/proc_net.c
+@@ -97,6 +97,25 @@ static const struct file_operations proc_net_seq_fops = {
+ 	.release	= seq_release_net,
+ };
+ 
++int bpf_iter_init_seq_net(void *priv_data)
++{
++#ifdef CONFIG_NET_NS
++	struct seq_net_private *p = priv_data;
++
++	p->net = get_net(current->nsproxy->net_ns);
++#endif
++	return 0;
++}
++
++void bpf_iter_fini_seq_net(void *priv_data)
++{
++#ifdef CONFIG_NET_NS
++	struct seq_net_private *p = priv_data;
++
++	put_net(p->net);
++#endif
++}
++
+ struct proc_dir_entry *proc_create_net_data(const char *name, umode_t mode,
+ 		struct proc_dir_entry *parent, const struct seq_operations *ops,
+ 		unsigned int state_size, void *data)
+* Unmerged path include/linux/proc_fs.h
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index 971d9d79307f..be93a73925ad 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -2438,7 +2438,7 @@ void fib6_gc_cleanup(void)
+ }
+ 
+ #ifdef CONFIG_PROC_FS
+-static int ipv6_route_seq_show(struct seq_file *seq, void *v)
++static int ipv6_route_native_seq_show(struct seq_file *seq, void *v)
+ {
+ 	struct fib6_info *rt = v;
+ 	struct ipv6_route_iter *iter = seq->private;
+@@ -2592,7 +2592,7 @@ static bool ipv6_route_iter_active(struct ipv6_route_iter *iter)
+ 	return w->node && !(w->state == FWS_U && w->node == w->root);
+ }
+ 
+-static void ipv6_route_seq_stop(struct seq_file *seq, void *v)
++static void ipv6_route_native_seq_stop(struct seq_file *seq, void *v)
+ 	__releases(RCU_BH)
+ {
+ 	struct net *net = seq_file_net(seq);
+@@ -2604,6 +2604,67 @@ static void ipv6_route_seq_stop(struct seq_file *seq, void *v)
+ 	rcu_read_unlock_bh();
+ }
+ 
++#if IS_BUILTIN(CONFIG_IPV6) && defined(CONFIG_BPF_SYSCALL)
++struct bpf_iter__ipv6_route {
++	__bpf_md_ptr(struct bpf_iter_meta *, meta);
++	__bpf_md_ptr(struct fib6_info *, rt);
++};
++
++static int ipv6_route_prog_seq_show(struct bpf_prog *prog,
++				    struct bpf_iter_meta *meta,
++				    void *v)
++{
++	struct bpf_iter__ipv6_route ctx;
++
++	ctx.meta = meta;
++	ctx.rt = v;
++	return bpf_iter_run_prog(prog, &ctx);
++}
++
++static int ipv6_route_seq_show(struct seq_file *seq, void *v)
++{
++	struct ipv6_route_iter *iter = seq->private;
++	struct bpf_iter_meta meta;
++	struct bpf_prog *prog;
++	int ret;
++
++	meta.seq = seq;
++	prog = bpf_iter_get_info(&meta, false);
++	if (!prog)
++		return ipv6_route_native_seq_show(seq, v);
++
++	ret = ipv6_route_prog_seq_show(prog, &meta, v);
++	iter->w.leaf = NULL;
++
++	return ret;
++}
++
++static void ipv6_route_seq_stop(struct seq_file *seq, void *v)
++{
++	struct bpf_iter_meta meta;
++	struct bpf_prog *prog;
++
++	if (!v) {
++		meta.seq = seq;
++		prog = bpf_iter_get_info(&meta, true);
++		if (prog)
++			(void)ipv6_route_prog_seq_show(prog, &meta, v);
++	}
++
++	ipv6_route_native_seq_stop(seq, v);
++}
++#else
++static int ipv6_route_seq_show(struct seq_file *seq, void *v)
++{
++	return ipv6_route_native_seq_show(seq, v);
++}
++
++static void ipv6_route_seq_stop(struct seq_file *seq, void *v)
++{
++	ipv6_route_native_seq_stop(seq, v);
++}
++#endif
++
+ const struct seq_operations ipv6_route_seq_ops = {
+ 	.start	= ipv6_route_seq_start,
+ 	.next	= ipv6_route_seq_next,
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 089b773d7497..8e79cbafe3a6 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -5694,6 +5694,30 @@ void __init ip6_route_init_special_entries(void)
+   #endif
+ }
+ 
++#if IS_BUILTIN(CONFIG_IPV6)
++#if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_PROC_FS)
++DEFINE_BPF_ITER_FUNC(ipv6_route, struct bpf_iter_meta *meta, struct fib6_info *rt)
++
++static int __init bpf_iter_register(void)
++{
++	struct bpf_iter_reg reg_info = {
++		.target			= "ipv6_route",
++		.seq_ops		= &ipv6_route_seq_ops,
++		.init_seq_private	= bpf_iter_init_seq_net,
++		.fini_seq_private	= bpf_iter_fini_seq_net,
++		.seq_priv_size		= sizeof(struct ipv6_route_iter),
++	};
++
++	return bpf_iter_reg_target(&reg_info);
++}
++
++static void bpf_iter_unregister(void)
++{
++	bpf_iter_unreg_target("ipv6_route");
++}
++#endif
++#endif
++
+ int __init ip6_route_init(void)
+ {
+ 	int ret;
+@@ -5756,6 +5780,14 @@ int __init ip6_route_init(void)
+ 	if (ret)
+ 		goto out_register_late_subsys;
+ 
++#if IS_BUILTIN(CONFIG_IPV6)
++#if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_PROC_FS)
++	ret = bpf_iter_register();
++	if (ret)
++		goto out_register_late_subsys;
++#endif
++#endif
++
+ 	for_each_possible_cpu(cpu) {
+ 		struct uncached_list *ul = per_cpu_ptr(&rt6_uncached_list, cpu);
+ 
+@@ -5788,6 +5820,11 @@ int __init ip6_route_init(void)
+ 
+ void ip6_route_cleanup(void)
+ {
++#if IS_BUILTIN(CONFIG_IPV6)
++#if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_PROC_FS)
++	bpf_iter_unregister();
++#endif
++#endif
+ 	unregister_netdevice_notifier(&ip6_route_dev_notifier);
+ 	unregister_pernet_subsys(&ip6_route_net_late_ops);
+ 	fib6_rules_cleanup();
+* Unmerged path net/netlink/af_netlink.c
