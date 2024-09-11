@@ -1,0 +1,397 @@
+sched/topology: Remove unused 'sd' parameter from arch_scale_cpu_capacity()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Vincent Guittot <vincent.guittot@linaro.org>
+commit 8ec59c0f5f4966f89f4e3e3cab81710c7fa959d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8ec59c0f.failed
+
+The 'struct sched_domain *sd' parameter to arch_scale_cpu_capacity() is
+unused since commit:
+
+  765d0af19f5f ("sched/topology: Remove the ::smt_gain field from 'struct sched_domain'")
+
+Remove it.
+
+	Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Reviewed-by: Valentin Schneider <valentin.schneider@arm.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: gregkh@linuxfoundation.org
+	Cc: linux@armlinux.org.uk
+	Cc: quentin.perret@arm.com
+	Cc: rafael@kernel.org
+Link: https://lkml.kernel.org/r/1560783617-5827-1-git-send-email-vincent.guittot@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8ec59c0f5f4966f89f4e3e3cab81710c7fa959d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/pelt.c
+#	kernel/sched/pelt.h
+diff --cc kernel/sched/pelt.c
+index 90fb5bc12ad4,42ea66b07b1d..000000000000
+--- a/kernel/sched/pelt.c
++++ b/kernel/sched/pelt.c
+@@@ -365,6 -359,15 +365,18 @@@ int update_dl_rq_load_avg(u64 now, stru
+  int update_irq_load_avg(struct rq *rq, u64 running)
+  {
+  	int ret = 0;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * We can't use clock_pelt because irq time is not accounted in
++ 	 * clock_task. Instead we directly scale the running time to
++ 	 * reflect the real amount of computation
++ 	 */
++ 	running = cap_scale(running, arch_scale_freq_capacity(cpu_of(rq)));
++ 	running = cap_scale(running, arch_scale_cpu_capacity(cpu_of(rq)));
++ 
+++>>>>>>> 8ec59c0f5f49 (sched/topology: Remove unused 'sd' parameter from arch_scale_cpu_capacity())
+  	/*
+  	 * We know the time that has been used by interrupt since last update
+  	 * but we don't when. Let be pessimistic and assume that interrupt has
+diff --cc kernel/sched/pelt.h
+index 7e56b489ff32,afff644da065..000000000000
+--- a/kernel/sched/pelt.h
++++ b/kernel/sched/pelt.h
+@@@ -42,6 -43,101 +42,104 @@@ static inline void cfs_se_util_change(s
+  	WRITE_ONCE(avg->util_est.enqueued, enqueued);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The clock_pelt scales the time to reflect the effective amount of
++  * computation done during the running delta time but then sync back to
++  * clock_task when rq is idle.
++  *
++  *
++  * absolute time   | 1| 2| 3| 4| 5| 6| 7| 8| 9|10|11|12|13|14|15|16
++  * @ max capacity  ------******---------------******---------------
++  * @ half capacity ------************---------************---------
++  * clock pelt      | 1| 2|    3|    4| 7| 8| 9|   10|   11|14|15|16
++  *
++  */
++ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
++ {
++ 	if (unlikely(is_idle_task(rq->curr))) {
++ 		/* The rq is idle, we can sync to clock_task */
++ 		rq->clock_pelt  = rq_clock_task(rq);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * When a rq runs at a lower compute capacity, it will need
++ 	 * more time to do the same amount of work than at max
++ 	 * capacity. In order to be invariant, we scale the delta to
++ 	 * reflect how much work has been really done.
++ 	 * Running longer results in stealing idle time that will
++ 	 * disturb the load signal compared to max capacity. This
++ 	 * stolen idle time will be automatically reflected when the
++ 	 * rq will be idle and the clock will be synced with
++ 	 * rq_clock_task.
++ 	 */
++ 
++ 	/*
++ 	 * Scale the elapsed time to reflect the real amount of
++ 	 * computation
++ 	 */
++ 	delta = cap_scale(delta, arch_scale_cpu_capacity(cpu_of(rq)));
++ 	delta = cap_scale(delta, arch_scale_freq_capacity(cpu_of(rq)));
++ 
++ 	rq->clock_pelt += delta;
++ }
++ 
++ /*
++  * When rq becomes idle, we have to check if it has lost idle time
++  * because it was fully busy. A rq is fully used when the /Sum util_sum
++  * is greater or equal to:
++  * (LOAD_AVG_MAX - 1024 + rq->cfs.avg.period_contrib) << SCHED_CAPACITY_SHIFT;
++  * For optimization and computing rounding purpose, we don't take into account
++  * the position in the current window (period_contrib) and we use the higher
++  * bound of util_sum to decide.
++  */
++ static inline void update_idle_rq_clock_pelt(struct rq *rq)
++ {
++ 	u32 divider = ((LOAD_AVG_MAX - 1024) << SCHED_CAPACITY_SHIFT) - LOAD_AVG_MAX;
++ 	u32 util_sum = rq->cfs.avg.util_sum;
++ 	util_sum += rq->avg_rt.util_sum;
++ 	util_sum += rq->avg_dl.util_sum;
++ 
++ 	/*
++ 	 * Reflecting stolen time makes sense only if the idle
++ 	 * phase would be present at max capacity. As soon as the
++ 	 * utilization of a rq has reached the maximum value, it is
++ 	 * considered as an always runnig rq without idle time to
++ 	 * steal. This potential idle time is considered as lost in
++ 	 * this case. We keep track of this lost idle time compare to
++ 	 * rq's clock_task.
++ 	 */
++ 	if (util_sum >= divider)
++ 		rq->lost_idle_time += rq_clock_task(rq) - rq->clock_pelt;
++ }
++ 
++ static inline u64 rq_clock_pelt(struct rq *rq)
++ {
++ 	lockdep_assert_held(&rq->lock);
++ 	assert_clock_updated(rq);
++ 
++ 	return rq->clock_pelt - rq->lost_idle_time;
++ }
++ 
++ #ifdef CONFIG_CFS_BANDWIDTH
++ /* rq->task_clock normalized against any time this cfs_rq has spent throttled */
++ static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
++ {
++ 	if (unlikely(cfs_rq->throttle_count))
++ 		return cfs_rq->throttled_clock_task - cfs_rq->throttled_clock_task_time;
++ 
++ 	return rq_clock_pelt(rq_of(cfs_rq)) - cfs_rq->throttled_clock_task_time;
++ }
++ #else
++ static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
++ {
++ 	return rq_clock_pelt(rq_of(cfs_rq));
++ }
++ #endif
++ 
+++>>>>>>> 8ec59c0f5f49 (sched/topology: Remove unused 'sd' parameter from arch_scale_cpu_capacity())
+  #else
+  
+  static inline int
+diff --git a/arch/arm/kernel/topology.c b/arch/arm/kernel/topology.c
+index 24ac3cab411d..d3d75c58832c 100644
+--- a/arch/arm/kernel/topology.c
++++ b/arch/arm/kernel/topology.c
+@@ -175,7 +175,7 @@ static void update_cpu_capacity(unsigned int cpu)
+ 	topology_set_cpu_scale(cpu, cpu_capacity(cpu) / middle_capacity);
+ 
+ 	pr_info("CPU%u: update cpu_capacity %lu\n",
+-		cpu, topology_get_cpu_scale(NULL, cpu));
++		cpu, topology_get_cpu_scale(cpu));
+ }
+ 
+ #else
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index 1739d7e1952a..9b09e31ae82f 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -43,7 +43,7 @@ static ssize_t cpu_capacity_show(struct device *dev,
+ {
+ 	struct cpu *cpu = container_of(dev, struct cpu, dev);
+ 
+-	return sprintf(buf, "%lu\n", topology_get_cpu_scale(NULL, cpu->dev.id));
++	return sprintf(buf, "%lu\n", topology_get_cpu_scale(cpu->dev.id));
+ }
+ 
+ static void update_topology_flags_workfn(struct work_struct *work);
+@@ -116,7 +116,7 @@ void topology_normalize_cpu_scale(void)
+ 			/ capacity_scale;
+ 		topology_set_cpu_scale(cpu, capacity);
+ 		pr_debug("cpu_capacity: CPU%d cpu_capacity=%lu\n",
+-			cpu, topology_get_cpu_scale(NULL, cpu));
++			cpu, topology_get_cpu_scale(cpu));
+ 	}
+ }
+ 
+@@ -185,7 +185,7 @@ init_cpu_capacity_callback(struct notifier_block *nb,
+ 	cpumask_andnot(cpus_to_visit, cpus_to_visit, policy->related_cpus);
+ 
+ 	for_each_cpu(cpu, policy->related_cpus) {
+-		raw_capacity[cpu] = topology_get_cpu_scale(NULL, cpu) *
++		raw_capacity[cpu] = topology_get_cpu_scale(cpu) *
+ 				    policy->cpuinfo.max_freq / 1000UL;
+ 		capacity_scale = max(raw_capacity[cpu], capacity_scale);
+ 	}
+diff --git a/include/linux/arch_topology.h b/include/linux/arch_topology.h
+index d9bdc1a7f4e7..1cfe05ea1d89 100644
+--- a/include/linux/arch_topology.h
++++ b/include/linux/arch_topology.h
+@@ -18,7 +18,7 @@ DECLARE_PER_CPU(unsigned long, cpu_scale);
+ 
+ struct sched_domain;
+ static inline
+-unsigned long topology_get_cpu_scale(struct sched_domain *sd, int cpu)
++unsigned long topology_get_cpu_scale(int cpu)
+ {
+ 	return per_cpu(cpu_scale, cpu);
+ }
+diff --git a/include/linux/energy_model.h b/include/linux/energy_model.h
+index aa027f7bcb3e..73f8c3cb9588 100644
+--- a/include/linux/energy_model.h
++++ b/include/linux/energy_model.h
+@@ -89,7 +89,7 @@ static inline unsigned long em_pd_energy(struct em_perf_domain *pd,
+ 	 * like schedutil.
+ 	 */
+ 	cpu = cpumask_first(to_cpumask(pd->cpus));
+-	scale_cpu = arch_scale_cpu_capacity(NULL, cpu);
++	scale_cpu = arch_scale_cpu_capacity(cpu);
+ 	cs = &pd->table[pd->nr_cap_states - 1];
+ 	freq = map_util_freq(max_util, cs->frequency, scale_cpu);
+ 
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 9d32564e8785..936c8aa541bf 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -202,14 +202,6 @@ extern void set_sched_topology(struct sched_domain_topology_level *tl);
+ # define SD_INIT_NAME(type)
+ #endif
+ 
+-#ifndef arch_scale_cpu_capacity
+-static __always_inline
+-unsigned long arch_scale_cpu_capacity(struct sched_domain *sd, int cpu)
+-{
+-	return SCHED_CAPACITY_SCALE;
+-}
+-#endif
+-
+ #else /* CONFIG_SMP */
+ 
+ struct sched_domain_attr;
+@@ -225,16 +217,16 @@ static inline bool cpus_share_cache(int this_cpu, int that_cpu)
+ 	return true;
+ }
+ 
++#endif	/* !CONFIG_SMP */
++
+ #ifndef arch_scale_cpu_capacity
+ static __always_inline
+-unsigned long arch_scale_cpu_capacity(void __always_unused *sd, int cpu)
++unsigned long arch_scale_cpu_capacity(int cpu)
+ {
+ 	return SCHED_CAPACITY_SCALE;
+ }
+ #endif
+ 
+-#endif	/* !CONFIG_SMP */
+-
+ static inline int task_node(const struct task_struct *p)
+ {
+ 	return cpu_to_node(task_cpu(p));
+diff --git a/kernel/power/energy_model.c b/kernel/power/energy_model.c
+index d9dc2c38764a..10c76b281e4a 100644
+--- a/kernel/power/energy_model.c
++++ b/kernel/power/energy_model.c
+@@ -166,7 +166,7 @@ int em_register_perf_domain(cpumask_t *span, unsigned int nr_states,
+ 		 * All CPUs of a domain must have the same micro-architecture
+ 		 * since they all share the same table.
+ 		 */
+-		cap = arch_scale_cpu_capacity(NULL, cpu);
++		cap = arch_scale_cpu_capacity(cpu);
+ 		if (prev_cap && prev_cap != cap) {
+ 			pr_err("CPUs of %*pbl must have the same capacity\n",
+ 							cpumask_pr_args(span));
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 4e6e5383d85c..1b0790109aac 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -278,7 +278,7 @@ static unsigned long sugov_get_util(struct sugov_cpu *sg_cpu)
+ {
+ 	struct rq *rq = cpu_rq(sg_cpu->cpu);
+ 	unsigned long util = cpu_util_cfs(rq);
+-	unsigned long max = arch_scale_cpu_capacity(NULL, sg_cpu->cpu);
++	unsigned long max = arch_scale_cpu_capacity(sg_cpu->cpu);
+ 
+ 	sg_cpu->max = max;
+ 	sg_cpu->bw_dl = cpu_bw_dl(rq);
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 72c07059ef37..15bce1880a2e 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1195,7 +1195,7 @@ static void update_curr_dl(struct rq *rq)
+ 						 &curr->dl);
+ 	} else {
+ 		unsigned long scale_freq = arch_scale_freq_capacity(cpu);
+-		unsigned long scale_cpu = arch_scale_cpu_capacity(NULL, cpu);
++		unsigned long scale_cpu = arch_scale_cpu_capacity(cpu);
+ 
+ 		scaled_delta_exec = cap_scale(delta_exec, scale_freq);
+ 		scaled_delta_exec = cap_scale(scaled_delta_exec, scale_cpu);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 304e6f44708c..b7200632b9a9 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -752,7 +752,7 @@ void post_init_entity_util_avg(struct sched_entity *se)
+ {
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+ 	struct sched_avg *sa = &se->avg;
+-	long cpu_scale = arch_scale_cpu_capacity(NULL, cpu_of(rq_of(cfs_rq)));
++	long cpu_scale = arch_scale_cpu_capacity(cpu_of(rq_of(cfs_rq)));
+ 	long cap = (long)(cpu_scale - cfs_rq->avg.util_avg) / 2;
+ 
+ 	if (cap > 0) {
+@@ -7661,7 +7661,7 @@ static inline int get_sd_load_idx(struct sched_domain *sd,
+ static unsigned long scale_rt_capacity(struct sched_domain *sd, int cpu)
+ {
+ 	struct rq *rq = cpu_rq(cpu);
+-	unsigned long max = arch_scale_cpu_capacity(sd, cpu);
++	unsigned long max = arch_scale_cpu_capacity(cpu);
+ 	unsigned long used, free;
+ 	unsigned long irq;
+ 
+@@ -7686,7 +7686,7 @@ static void update_cpu_capacity(struct sched_domain *sd, int cpu)
+ 	unsigned long capacity = scale_rt_capacity(sd, cpu);
+ 	struct sched_group *sdg = sd->groups;
+ 
+-	cpu_rq(cpu)->cpu_capacity_orig = arch_scale_cpu_capacity(sd, cpu);
++	cpu_rq(cpu)->cpu_capacity_orig = arch_scale_cpu_capacity(cpu);
+ 
+ 	if (!capacity)
+ 		capacity = 1;
+* Unmerged path kernel/sched/pelt.c
+* Unmerged path kernel/sched/pelt.h
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 04ad2fa044a2..c19791de4554 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2249,7 +2249,7 @@ unsigned long schedutil_freq_util(int cpu, unsigned long util_cfs,
+ 
+ static inline unsigned long schedutil_energy_util(int cpu, unsigned long cfs)
+ {
+-	unsigned long max = arch_scale_cpu_capacity(NULL, cpu);
++	unsigned long max = arch_scale_cpu_capacity(cpu);
+ 
+ 	return schedutil_freq_util(cpu, cfs, max, ENERGY_UTIL);
+ }
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 73540cc658a6..eab1c0e319f1 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1655,10 +1655,10 @@ static struct sched_domain_topology_level
+ 	unsigned long cap;
+ 
+ 	/* Is there any asymmetry? */
+-	cap = arch_scale_cpu_capacity(NULL, cpumask_first(cpu_map));
++	cap = arch_scale_cpu_capacity(cpumask_first(cpu_map));
+ 
+ 	for_each_cpu(i, cpu_map) {
+-		if (arch_scale_cpu_capacity(NULL, i) != cap) {
++		if (arch_scale_cpu_capacity(i) != cap) {
+ 			asym = true;
+ 			break;
+ 		}
+@@ -1673,7 +1673,7 @@ static struct sched_domain_topology_level
+ 	 * to everyone.
+ 	 */
+ 	for_each_cpu(i, cpu_map) {
+-		unsigned long max_capacity = arch_scale_cpu_capacity(NULL, i);
++		unsigned long max_capacity = arch_scale_cpu_capacity(i);
+ 		int tl_id = 0;
+ 
+ 		for_each_sd_topology(tl) {
+@@ -1683,7 +1683,7 @@ static struct sched_domain_topology_level
+ 			for_each_cpu_and(j, tl->mask(i), cpu_map) {
+ 				unsigned long capacity;
+ 
+-				capacity = arch_scale_cpu_capacity(NULL, j);
++				capacity = arch_scale_cpu_capacity(j);
+ 
+ 				if (capacity <= max_capacity)
+ 					continue;
