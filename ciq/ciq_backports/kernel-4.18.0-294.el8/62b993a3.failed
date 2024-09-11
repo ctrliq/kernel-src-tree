@@ -1,0 +1,274 @@
+iommu/arm-smmu: Add reset implementation hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 62b993a36e4c2d60669beb3d1afe038ed44a41ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/62b993a3.failed
+
+Reset is an activity rife with implementation-defined poking. Add a
+corresponding hook, and use it to encapsulate the existing MMU-500
+details.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 62b993a36e4c2d60669beb3d1afe038ed44a41ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu-impl.c
+#	drivers/iommu/arm-smmu.c
+#	drivers/iommu/arm-smmu.h
+diff --cc drivers/iommu/arm-smmu.c
+index c913cdd695bd,fc98992d120d..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -1771,13 -1567,12 +1765,13 @@@ static struct iommu_ops arm_smmu_ops = 
+  
+  static void arm_smmu_device_reset(struct arm_smmu_device *smmu)
+  {
+ +	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
+  	int i;
+- 	u32 reg, major;
++ 	u32 reg;
+  
+  	/* clear global FSR */
+ -	reg = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSR);
+ -	arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sGFSR, reg);
+ +	reg = readl_relaxed(ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sGFSR);
+ +	writel(reg, ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sGFSR);
+  
+  	/*
+  	 * Reset stream mapping groups: Initial values mark all SMRn as
+@@@ -1786,40 -1581,10 +1780,47 @@@
+  	for (i = 0; i < smmu->num_mapping_groups; ++i)
+  		arm_smmu_write_sme(smmu, i);
+  
+++<<<<<<< HEAD
+ +	if (smmu->model == ARM_MMU500) {
+ +		/*
+ +		 * Before clearing ARM_MMU500_ACTLR_CPRE, need to
+ +		 * clear CACHE_LOCK bit of ACR first. And, CACHE_LOCK
+ +		 * bit is only present in MMU-500r2 onwards.
+ +		 */
+ +		reg = readl_relaxed(gr0_base + ARM_SMMU_GR0_ID7);
+ +		major = (reg >> ID7_MAJOR_SHIFT) & ID7_MAJOR_MASK;
+ +		reg = readl_relaxed(gr0_base + ARM_SMMU_GR0_sACR);
+ +		if (major >= 2)
+ +			reg &= ~ARM_MMU500_ACR_CACHE_LOCK;
+ +		/*
+ +		 * Allow unmatched Stream IDs to allocate bypass
+ +		 * TLB entries for reduced latency.
+ +		 */
+ +		reg |= ARM_MMU500_ACR_SMTNMB_TLBEN | ARM_MMU500_ACR_S2CRB_TLBEN;
+ +		writel_relaxed(reg, gr0_base + ARM_SMMU_GR0_sACR);
+ +	}
+ +
+++=======
+++>>>>>>> 62b993a36e4c (iommu/arm-smmu: Add reset implementation hook)
+  	/* Make sure all context banks are disabled and clear CB_FSR  */
+  	for (i = 0; i < smmu->num_context_banks; ++i) {
+ +		void __iomem *cb_base = ARM_SMMU_CB(smmu, i);
+ +
+  		arm_smmu_write_context_bank(smmu, i);
+++<<<<<<< HEAD
+ +		writel_relaxed(FSR_FAULT, cb_base + ARM_SMMU_CB_FSR);
+ +		/*
+ +		 * Disable MMU-500's not-particularly-beneficial next-page
+ +		 * prefetcher for the sake of errata #841119 and #826419.
+ +		 */
+ +		if (smmu->model == ARM_MMU500) {
+ +			reg = readl_relaxed(cb_base + ARM_SMMU_CB_ACTLR);
+ +			reg &= ~ARM_MMU500_ACTLR_CPRE;
+ +			writel_relaxed(reg, cb_base + ARM_SMMU_CB_ACTLR);
+ +		}
+++=======
++ 		arm_smmu_cb_write(smmu, i, ARM_SMMU_CB_FSR, FSR_FAULT);
+++>>>>>>> 62b993a36e4c (iommu/arm-smmu: Add reset implementation hook)
+  	}
+  
+  	/* Invalidate the TLB, just in case */
+@@@ -1853,9 -1618,12 +1854,12 @@@
+  	if (smmu->features & ARM_SMMU_FEAT_EXIDS)
+  		reg |= sCR0_EXIDENABLE;
+  
++ 	if (smmu->impl && smmu->impl->reset)
++ 		smmu->impl->reset(smmu);
++ 
+  	/* Push the button */
+  	arm_smmu_tlb_sync_global(smmu);
+ -	arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sCR0, reg);
+ +	writel(reg, ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sCR0);
+  }
+  
+  static int arm_smmu_id_size_to_bits(int size)
+diff --cc drivers/iommu/arm-smmu.h
+index 671b3a337fea,ddafe872a396..000000000000
+--- a/drivers/iommu/arm-smmu.h
++++ b/drivers/iommu/arm-smmu.h
+@@@ -216,4 -201,156 +216,159 @@@ enum arm_smmu_cbar_type 
+  #define ARM_SMMU_CB_ATSR		0x8f0
+  #define ATSR_ACTIVE			BIT(0)
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /* Maximum number of context banks per SMMU */
++ #define ARM_SMMU_MAX_CBS		128
++ 
++ 
++ /* Shared driver definitions */
++ enum arm_smmu_arch_version {
++ 	ARM_SMMU_V1,
++ 	ARM_SMMU_V1_64K,
++ 	ARM_SMMU_V2,
++ };
++ 
++ enum arm_smmu_implementation {
++ 	GENERIC_SMMU,
++ 	ARM_MMU500,
++ 	CAVIUM_SMMUV2,
++ 	QCOM_SMMUV2,
++ };
++ 
++ struct arm_smmu_device {
++ 	struct device			*dev;
++ 
++ 	void __iomem			*base;
++ 	unsigned int			numpage;
++ 	unsigned int			pgshift;
++ 
++ #define ARM_SMMU_FEAT_COHERENT_WALK	(1 << 0)
++ #define ARM_SMMU_FEAT_STREAM_MATCH	(1 << 1)
++ #define ARM_SMMU_FEAT_TRANS_S1		(1 << 2)
++ #define ARM_SMMU_FEAT_TRANS_S2		(1 << 3)
++ #define ARM_SMMU_FEAT_TRANS_NESTED	(1 << 4)
++ #define ARM_SMMU_FEAT_TRANS_OPS		(1 << 5)
++ #define ARM_SMMU_FEAT_VMID16		(1 << 6)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_4K	(1 << 7)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_16K	(1 << 8)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_64K	(1 << 9)
++ #define ARM_SMMU_FEAT_FMT_AARCH32_L	(1 << 10)
++ #define ARM_SMMU_FEAT_FMT_AARCH32_S	(1 << 11)
++ #define ARM_SMMU_FEAT_EXIDS		(1 << 12)
++ 	u32				features;
++ 
++ 	enum arm_smmu_arch_version	version;
++ 	enum arm_smmu_implementation	model;
++ 	const struct arm_smmu_impl	*impl;
++ 
++ 	u32				num_context_banks;
++ 	u32				num_s2_context_banks;
++ 	DECLARE_BITMAP(context_map, ARM_SMMU_MAX_CBS);
++ 	struct arm_smmu_cb		*cbs;
++ 	atomic_t			irptndx;
++ 
++ 	u32				num_mapping_groups;
++ 	u16				streamid_mask;
++ 	u16				smr_mask_mask;
++ 	struct arm_smmu_smr		*smrs;
++ 	struct arm_smmu_s2cr		*s2crs;
++ 	struct mutex			stream_map_mutex;
++ 
++ 	unsigned long			va_size;
++ 	unsigned long			ipa_size;
++ 	unsigned long			pa_size;
++ 	unsigned long			pgsize_bitmap;
++ 
++ 	u32				num_global_irqs;
++ 	u32				num_context_irqs;
++ 	unsigned int			*irqs;
++ 	struct clk_bulk_data		*clks;
++ 	int				num_clks;
++ 
++ 	u32				cavium_id_base; /* Specific to Cavium */
++ 
++ 	spinlock_t			global_sync_lock;
++ 
++ 	/* IOMMU core code handle */
++ 	struct iommu_device		iommu;
++ };
++ 
++ 
++ /* Implementation details, yay! */
++ struct arm_smmu_impl {
++ 	u32 (*read_reg)(struct arm_smmu_device *smmu, int page, int offset);
++ 	void (*write_reg)(struct arm_smmu_device *smmu, int page, int offset,
++ 			  u32 val);
++ 	u64 (*read_reg64)(struct arm_smmu_device *smmu, int page, int offset);
++ 	void (*write_reg64)(struct arm_smmu_device *smmu, int page, int offset,
++ 			    u64 val);
++ 	int (*cfg_probe)(struct arm_smmu_device *smmu);
++ 	int (*reset)(struct arm_smmu_device *smmu);
++ };
++ 
++ static inline void __iomem *arm_smmu_page(struct arm_smmu_device *smmu, int n)
++ {
++ 	return smmu->base + (n << smmu->pgshift);
++ }
++ 
++ static inline u32 arm_smmu_readl(struct arm_smmu_device *smmu, int page, int offset)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->read_reg))
++ 		return smmu->impl->read_reg(smmu, page, offset);
++ 	return readl_relaxed(arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline void arm_smmu_writel(struct arm_smmu_device *smmu, int page,
++ 				   int offset, u32 val)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->write_reg))
++ 		smmu->impl->write_reg(smmu, page, offset, val);
++ 	else
++ 		writel_relaxed(val, arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline u64 arm_smmu_readq(struct arm_smmu_device *smmu, int page, int offset)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->read_reg64))
++ 		return smmu->impl->read_reg64(smmu, page, offset);
++ 	return readq_relaxed(arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline void arm_smmu_writeq(struct arm_smmu_device *smmu, int page,
++ 				   int offset, u64 val)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->write_reg64))
++ 		smmu->impl->write_reg64(smmu, page, offset, val);
++ 	else
++ 		writeq_relaxed(val, arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ #define ARM_SMMU_GR0		0
++ #define ARM_SMMU_GR1		1
++ #define ARM_SMMU_CB(s, n)	((s)->numpage + (n))
++ 
++ #define arm_smmu_gr0_read(s, o)		\
++ 	arm_smmu_readl((s), ARM_SMMU_GR0, (o))
++ #define arm_smmu_gr0_write(s, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_GR0, (o), (v))
++ 
++ #define arm_smmu_gr1_read(s, o)		\
++ 	arm_smmu_readl((s), ARM_SMMU_GR1, (o))
++ #define arm_smmu_gr1_write(s, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_GR1, (o), (v))
++ 
++ #define arm_smmu_cb_read(s, n, o)	\
++ 	arm_smmu_readl((s), ARM_SMMU_CB((s), (n)), (o))
++ #define arm_smmu_cb_write(s, n, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_CB((s), (n)), (o), (v))
++ #define arm_smmu_cb_readq(s, n, o)	\
++ 	arm_smmu_readq((s), ARM_SMMU_CB((s), (n)), (o))
++ #define arm_smmu_cb_writeq(s, n, o, v)	\
++ 	arm_smmu_writeq((s), ARM_SMMU_CB((s), (n)), (o), (v))
++ 
++ struct arm_smmu_device *arm_smmu_impl_init(struct arm_smmu_device *smmu);
++ 
+++>>>>>>> 62b993a36e4c (iommu/arm-smmu: Add reset implementation hook)
+  #endif /* _ARM_SMMU_H */
+* Unmerged path drivers/iommu/arm-smmu-impl.c
+* Unmerged path drivers/iommu/arm-smmu-impl.c
+* Unmerged path drivers/iommu/arm-smmu.c
+* Unmerged path drivers/iommu/arm-smmu.h
