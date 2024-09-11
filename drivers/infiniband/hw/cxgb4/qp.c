@@ -382,7 +382,7 @@ free_sq_qid:
 }
 
 static int build_immd(struct t4_sq *sq, struct fw_ri_immd *immdp,
-		      struct ib_send_wr *wr, int max, u32 *plenp)
+		      const struct ib_send_wr *wr, int max, u32 *plenp)
 {
 	u8 *dstp, *srcp;
 	u32 plen = 0;
@@ -452,7 +452,7 @@ static int build_isgl(__be64 *queue_start, __be64 *queue_end,
 }
 
 static int build_rdma_send(struct t4_sq *sq, union t4_wr *wqe,
-			   struct ib_send_wr *wr, u8 *len16)
+			   const struct ib_send_wr *wr, u8 *len16)
 {
 	u32 plen;
 	int size;
@@ -519,7 +519,7 @@ static int build_rdma_send(struct t4_sq *sq, union t4_wr *wqe,
 }
 
 static int build_rdma_write(struct t4_sq *sq, union t4_wr *wqe,
-			    struct ib_send_wr *wr, u8 *len16)
+			    const struct ib_send_wr *wr, u8 *len16)
 {
 	u32 plen;
 	int size;
@@ -561,7 +561,8 @@ static int build_rdma_write(struct t4_sq *sq, union t4_wr *wqe,
 	return 0;
 }
 
-static int build_rdma_read(union t4_wr *wqe, struct ib_send_wr *wr, u8 *len16)
+static int build_rdma_read(union t4_wr *wqe, const struct ib_send_wr *wr,
+			   u8 *len16)
 {
 	if (wr->num_sge > 1)
 		return -EINVAL;
@@ -606,7 +607,7 @@ static int build_rdma_recv(struct c4iw_qp *qhp, union t4_recv_wr *wqe,
 }
 
 static void build_tpte_memreg(struct fw_ri_fr_nsmr_tpte_wr *fr,
-			      struct ib_reg_wr *wr, struct c4iw_mr *mhp,
+			      const struct ib_reg_wr *wr, struct c4iw_mr *mhp,
 			      u8 *len16)
 {
 	__be64 *p = (__be64 *)fr->pbl;
@@ -638,8 +639,8 @@ static void build_tpte_memreg(struct fw_ri_fr_nsmr_tpte_wr *fr,
 }
 
 static int build_memreg(struct t4_sq *sq, union t4_wr *wqe,
-			struct ib_reg_wr *wr, struct c4iw_mr *mhp, u8 *len16,
-			bool dsgl_supported)
+			const struct ib_reg_wr *wr, struct c4iw_mr *mhp,
+			u8 *len16, bool dsgl_supported)
 {
 	struct fw_ri_immd *imdp;
 	__be64 *p;
@@ -701,7 +702,8 @@ static int build_memreg(struct t4_sq *sq, union t4_wr *wqe,
 	return 0;
 }
 
-static int build_inv_stag(union t4_wr *wqe, struct ib_send_wr *wr, u8 *len16)
+static int build_inv_stag(union t4_wr *wqe, const struct ib_send_wr *wr,
+			  u8 *len16)
 {
 	wqe->inv.stag_inv = cpu_to_be32(wr->ex.invalidate_rkey);
 	wqe->inv.r2 = 0;
@@ -820,7 +822,8 @@ static int ib_to_fw_opcode(int ib_opcode)
 	return opcode;
 }
 
-static int complete_sq_drain_wr(struct c4iw_qp *qhp, struct ib_send_wr *wr)
+static int complete_sq_drain_wr(struct c4iw_qp *qhp,
+				const struct ib_send_wr *wr)
 {
 	struct t4_cqe cqe = {};
 	struct c4iw_cq *schp;
