@@ -1,0 +1,171 @@
+block: add a bdev_check_media_change helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 95f6f3a46fc4ee1a2b216a6b46bdf2b450f1877f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/95f6f3a4.failed
+
+Like check_disk_changed, except that it does not call ->revalidate_disk
+but leaves that to the caller.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 95f6f3a46fc4ee1a2b216a6b46bdf2b450f1877f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+#	include/linux/genhd.h
+diff --cc fs/block_dev.c
+index f19cc879b480,c6ac0bd22eca..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -1452,21 -1379,10 +1452,20 @@@ EXPORT_SYMBOL(revalidate_disk)
+   */
+  int check_disk_change(struct block_device *bdev)
+  {
+- 	struct gendisk *disk = bdev->bd_disk;
+- 	const struct block_device_operations *bdops = disk->fops;
+- 	unsigned int events;
+- 
+- 	events = disk_clear_events(disk, DISK_EVENT_MEDIA_CHANGE |
+- 				   DISK_EVENT_EJECT_REQUEST);
+- 	if (!(events & DISK_EVENT_MEDIA_CHANGE))
++ 	if (!bdev_check_media_change(bdev))
+  		return 0;
+++<<<<<<< HEAD
+ +
+ +	if (__invalidate_device(bdev, true))
+ +		pr_warn("VFS: busy inodes on changed media %s\n",
+ +			disk->disk_name);
+ +	bdev->bd_invalidated = 1;
+ +	if (bdops->revalidate_disk)
+ +		bdops->revalidate_disk(bdev->bd_disk);
+++=======
++ 	if (bdev->bd_disk->fops->revalidate_disk)
++ 		bdev->bd_disk->fops->revalidate_disk(bdev->bd_disk);
+++>>>>>>> 95f6f3a46fc4 (block: add a bdev_check_media_change helper)
+  	return 1;
+  }
+  
+diff --cc include/linux/genhd.h
+index 0fcca343e13b,322d48a20772..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -441,9 -313,8 +441,14 @@@ static inline int get_disk_ro(struct ge
+  extern void disk_block_events(struct gendisk *disk);
+  extern void disk_unblock_events(struct gendisk *disk);
+  extern void disk_flush_events(struct gendisk *disk, unsigned int mask);
+++<<<<<<< HEAD
+ +extern bool set_capacity_revalidate_and_notify(struct gendisk *disk,
+ +			sector_t size, bool revalidate);
+ +extern unsigned int disk_clear_events(struct gendisk *disk, unsigned int mask);
+++=======
++ void set_capacity_revalidate_and_notify(struct gendisk *disk, sector_t size,
++ 		bool update_bdev);
+++>>>>>>> 95f6f3a46fc4 (block: add a bdev_check_media_change helper)
+  
+  /* drivers/char/random.c */
+  extern void add_disk_randomness(struct gendisk *disk) __latent_entropy;
+@@@ -498,10 -366,41 +503,44 @@@ extern void blk_unregister_region(dev_
+  
+  #define alloc_disk(minors) alloc_disk_node(minors, NUMA_NO_NODE)
+  
+++<<<<<<< HEAD
+++=======
++ int register_blkdev(unsigned int major, const char *name);
++ void unregister_blkdev(unsigned int major, const char *name);
++ 
++ void revalidate_disk_size(struct gendisk *disk, bool verbose);
++ int check_disk_change(struct block_device *bdev);
++ bool bdev_check_media_change(struct block_device *bdev);
++ int __invalidate_device(struct block_device *bdev, bool kill_dirty);
++ void bd_set_nr_sectors(struct block_device *bdev, sector_t sectors);
++ 
++ /* for drivers/char/raw.c: */
++ int blkdev_ioctl(struct block_device *, fmode_t, unsigned, unsigned long);
++ long compat_blkdev_ioctl(struct file *, unsigned, unsigned long);
++ 
++ #ifdef CONFIG_SYSFS
++ int bd_link_disk_holder(struct block_device *bdev, struct gendisk *disk);
++ void bd_unlink_disk_holder(struct block_device *bdev, struct gendisk *disk);
++ #else
++ static inline int bd_link_disk_holder(struct block_device *bdev,
++ 				      struct gendisk *disk)
++ {
++ 	return 0;
++ }
++ static inline void bd_unlink_disk_holder(struct block_device *bdev,
++ 					 struct gendisk *disk)
++ {
++ }
++ #endif /* CONFIG_SYSFS */
++ 
++ #ifdef CONFIG_BLOCK
++ void printk_all_partitions(void);
++ dev_t blk_lookup_devt(const char *name, int partno);
+++>>>>>>> 95f6f3a46fc4 (block: add a bdev_check_media_change helper)
+  #else /* CONFIG_BLOCK */
+ -static inline void printk_all_partitions(void)
+ -{
+ -}
+ +
+ +static inline void printk_all_partitions(void) { }
+ +
+  static inline dev_t blk_lookup_devt(const char *name, int partno)
+  {
+  	dev_t devt = MKDEV(0, 0);
+diff --git a/block/genhd.c b/block/genhd.c
+index e5a406eac921..5d8b1686250f 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -2045,7 +2045,7 @@ void disk_flush_events(struct gendisk *disk, unsigned int mask)
+  * CONTEXT:
+  * Might sleep.
+  */
+-unsigned int disk_clear_events(struct gendisk *disk, unsigned int mask)
++static unsigned int disk_clear_events(struct gendisk *disk, unsigned int mask)
+ {
+ 	const struct block_device_operations *bdops = disk->fops;
+ 	struct disk_events *ev = disk->ev;
+@@ -2089,6 +2089,33 @@ unsigned int disk_clear_events(struct gendisk *disk, unsigned int mask)
+ 	return pending;
+ }
+ 
++/**
++ * bdev_check_media_change - check if a removable media has been changed
++ * @bdev: block device to check
++ *
++ * Check whether a removable media has been changed, and attempt to free all
++ * dentries and inodes and invalidates all block device page cache entries in
++ * that case.
++ *
++ * Returns %true if the block device changed, or %false if not.
++ */
++bool bdev_check_media_change(struct block_device *bdev)
++{
++	unsigned int events;
++
++	events = disk_clear_events(bdev->bd_disk, DISK_EVENT_MEDIA_CHANGE |
++				   DISK_EVENT_EJECT_REQUEST);
++	if (!(events & DISK_EVENT_MEDIA_CHANGE))
++		return false;
++
++	if (__invalidate_device(bdev, true))
++		pr_warn("VFS: busy inodes on changed media %s\n",
++			bdev->bd_disk->disk_name);
++	set_bit(BDEV_NEED_PART_SCAN, &bdev->bd_flags);
++	return true;
++}
++EXPORT_SYMBOL(bdev_check_media_change);
++
+ /*
+  * Separate this part out so that a different pointer for clearing_ptr can be
+  * passed in for disk_clear_events.
+* Unmerged path fs/block_dev.c
+* Unmerged path include/linux/genhd.h
