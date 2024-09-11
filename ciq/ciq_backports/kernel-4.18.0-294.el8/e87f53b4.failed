@@ -1,0 +1,154 @@
+selftests: add some benchmark for UDP GRO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit e87f53b4fab72f95952c17f672088e082e8e79ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e87f53b4.failed
+
+Run on top of veth pair, using a dummy XDP program to enable the GRO.
+
+ rfc v3 -> v1:
+  - use ip route to attach the xdp helper to the veth
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e87f53b4fab72f95952c17f672088e082e8e79ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/net/Makefile
+diff --cc tools/testing/selftests/net/Makefile
+index b3df8c622e5e,b1bba2f60467..000000000000
+--- a/tools/testing/selftests/net/Makefile
++++ b/tools/testing/selftests/net/Makefile
+@@@ -4,20 -4,15 +4,24 @@@
+  CFLAGS =  -Wall -Wl,--no-as-needed -O2 -g
+  CFLAGS += -I../../../../usr/include/
+  
+ -TEST_PROGS := run_netsocktests run_afpackettests test_bpf.sh netdevice.sh rtnetlink.sh
+ +TEST_PROGS := run_netsocktests run_afpackettests test_bpf.sh netdevice.sh \
+ +	      rtnetlink.sh xfrm_policy.sh
+  TEST_PROGS += fib_tests.sh fib-onlink-tests.sh pmtu.sh udpgso.sh ip_defrag.sh
+  TEST_PROGS += udpgso_bench.sh fib_rule_tests.sh msg_zerocopy.sh psock_snd.sh
+++<<<<<<< HEAD
+ +TEST_PROGS += test_vxlan_fdb_changelink.sh so_txtime.sh ipv6_flowlabel.sh
+ +TEST_PROGS += fcnal-test.sh l2tp.sh traceroute.sh
+ +TEST_PROGS += vrf-xfrm-tests.sh
+ +TEST_PROGS += rxtimestamp.sh
+++=======
++ TEST_PROGS += udpgro_bench.sh
+++>>>>>>> e87f53b4fab7 (selftests: add some benchmark for UDP GRO)
+  TEST_PROGS_EXTENDED := in_netns.sh
+ -TEST_GEN_FILES =  socket
+ +TEST_GEN_FILES =  socket nettest
+  TEST_GEN_FILES += psock_fanout psock_tpacket msg_zerocopy
+ -TEST_GEN_FILES += tcp_mmap tcp_inq psock_snd
+ +TEST_GEN_FILES += tcp_mmap tcp_inq psock_snd txring_overwrite
+  TEST_GEN_FILES += udpgso udpgso_bench_tx udpgso_bench_rx ip_defrag
+ +TEST_GEN_FILES += so_txtime ipv6_flowlabel ipv6_flowlabel_mgr
+  TEST_GEN_PROGS = reuseport_bpf reuseport_bpf_cpu reuseport_bpf_numa
+  TEST_GEN_PROGS += reuseport_dualstack reuseaddr_conflict tls
+  
+* Unmerged path tools/testing/selftests/net/Makefile
+diff --git a/tools/testing/selftests/net/udpgro_bench.sh b/tools/testing/selftests/net/udpgro_bench.sh
+new file mode 100755
+index 000000000000..9ef4b1ee0f76
+--- /dev/null
++++ b/tools/testing/selftests/net/udpgro_bench.sh
+@@ -0,0 +1,93 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++#
++# Run a series of udpgro benchmarks
++
++readonly PEER_NS="ns-peer-$(mktemp -u XXXXXX)"
++
++cleanup() {
++	local -r jobs="$(jobs -p)"
++	local -r ns="$(ip netns list|grep $PEER_NS)"
++
++	[ -n "${jobs}" ] && kill -INT ${jobs} 2>/dev/null
++	[ -n "$ns" ] && ip netns del $ns 2>/dev/null
++}
++trap cleanup EXIT
++
++run_one() {
++	# use 'rx' as separator between sender args and receiver args
++	local -r all="$@"
++	local -r tx_args=${all%rx*}
++	local -r rx_args=${all#*rx}
++
++	ip netns add "${PEER_NS}"
++	ip -netns "${PEER_NS}" link set lo up
++	ip link add type veth
++	ip link set dev veth0 up
++	ip addr add dev veth0 192.168.1.2/24
++	ip addr add dev veth0 2001:db8::2/64 nodad
++
++	ip link set dev veth1 netns "${PEER_NS}"
++	ip -netns "${PEER_NS}" addr add dev veth1 192.168.1.1/24
++	ip -netns "${PEER_NS}" addr add dev veth1 2001:db8::1/64 nodad
++	ip -netns "${PEER_NS}" link set dev veth1 up
++
++	ip -n "${PEER_NS}" link set veth1 xdp object ../bpf/xdp_dummy.o section xdp_dummy
++	ip netns exec "${PEER_NS}" ./udpgso_bench_rx ${rx_args} -r &
++	ip netns exec "${PEER_NS}" ./udpgso_bench_rx -t ${rx_args} -r &
++
++	# Hack: let bg programs complete the startup
++	sleep 0.1
++	./udpgso_bench_tx ${tx_args}
++}
++
++run_in_netns() {
++	local -r args=$@
++
++	./in_netns.sh $0 __subprocess ${args}
++}
++
++run_udp() {
++	local -r args=$@
++
++	echo "udp gso - over veth touching data"
++	run_in_netns ${args} -S rx
++
++	echo "udp gso and gro - over veth touching data"
++	run_in_netns ${args} -S rx -G
++}
++
++run_tcp() {
++	local -r args=$@
++
++	echo "tcp - over veth touching data"
++	run_in_netns ${args} -t rx
++}
++
++run_all() {
++	local -r core_args="-l 4"
++	local -r ipv4_args="${core_args} -4 -D 192.168.1.1"
++	local -r ipv6_args="${core_args} -6 -D 2001:db8::1"
++
++	echo "ipv4"
++	run_tcp "${ipv4_args}"
++	run_udp "${ipv4_args}"
++
++	echo "ipv6"
++	run_tcp "${ipv4_args}"
++	run_udp "${ipv6_args}"
++}
++
++if [ ! -f ../bpf/xdp_dummy.o ]; then
++	echo "Missing xdp_dummy helper. Build bpf selftest first"
++	exit -1
++fi
++
++if [[ $# -eq 0 ]]; then
++	run_all
++elif [[ $1 == "__subprocess" ]]; then
++	shift
++	run_one $@
++else
++	run_in_netns $@
++fi
