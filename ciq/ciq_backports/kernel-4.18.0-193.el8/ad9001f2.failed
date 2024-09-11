@@ -1,0 +1,288 @@
+PCI/PM: Add missing link delays required by the PCIe spec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit ad9001f2f41198784b0423646450ba2cb24793a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ad9001f2.failed
+
+Currently Linux does not follow PCIe spec regarding the required delays
+after reset. A concrete example is a Thunderbolt add-in-card that consists
+of a PCIe switch and two PCIe endpoints:
+
+  +-1b.0-[01-6b]----00.0-[02-6b]--+-00.0-[03]----00.0 TBT controller
+                                  +-01.0-[04-36]-- DS hotplug port
+                                  +-02.0-[37]----00.0 xHCI controller
+                                  \-04.0-[38-6b]-- DS hotplug port
+
+The root port (1b.0) and the PCIe switch downstream ports are all PCIe Gen3
+so they support 8GT/s link speeds.
+
+We wait for the PCIe hierarchy to enter D3cold (runtime):
+
+  pcieport 0000:00:1b.0: power state changed by ACPI to D3cold
+
+When it wakes up from D3cold, according to the PCIe 5.0 section 5.8 the
+PCIe switch is put to reset and its power is re-applied. This means that we
+must follow the rules in PCIe 5.0 section 6.6.1.
+
+For the PCIe Gen3 ports we are dealing with here, the following applies:
+
+  With a Downstream Port that supports Link speeds greater than 5.0 GT/s,
+  software must wait a minimum of 100 ms after Link training completes
+  before sending a Configuration Request to the device immediately below
+  that Port. Software can determine when Link training completes by polling
+  the Data Link Layer Link Active bit or by setting up an associated
+  interrupt (see Section 6.7.3.3).
+
+Translating this into the above topology we would need to do this (DLLLA
+stands for Data Link Layer Link Active):
+
+  0000:00:1b.0: wait for 100 ms after DLLLA is set before access to 0000:01:00.0
+  0000:02:00.0: wait for 100 ms after DLLLA is set before access to 0000:03:00.0
+  0000:02:02.0: wait for 100 ms after DLLLA is set before access to 0000:37:00.0
+
+I've instrumented the kernel with some additional logging so we can see the
+actual delays performed:
+
+  pcieport 0000:00:1b.0: power state changed by ACPI to D0
+  pcieport 0000:00:1b.0: waiting for D3cold delay of 100 ms
+  pcieport 0000:00:1b.0: waiting for D3hot delay of 10 ms
+  pcieport 0000:02:01.0: waiting for D3hot delay of 10 ms
+  pcieport 0000:02:04.0: waiting for D3hot delay of 10 ms
+
+For the switch upstream port (01:00.0 reachable through 00:1b.0 root port)
+we wait for 100 ms but not taking into account the DLLLA requirement. We
+then wait 10 ms for D3hot -> D0 transition of the root port and the two
+downstream hotplug ports. This means that we deviate from what the spec
+requires.
+
+Performing the same check for system sleep (s2idle) transitions it turns
+out to be even worse. None of the mandatory delays are performed. If this
+would be S3 instead of s2idle then according to PCI FW spec 3.2 section
+4.6.8. there is a specific _DSM that allows the OS to skip the delays but
+this platform does not provide the _DSM and does not go to S3 anyway so no
+firmware is involved that could already handle these delays.
+
+On this particular platform these delays are not actually needed because
+there is an additional delay as part of the ACPI power resource that is
+used to turn on power to the hierarchy but since that additional delay is
+not required by any of standards (PCIe, ACPI) it is not present in the
+Intel Ice Lake, for example where missing the mandatory delays causes
+pciehp to start tearing down the stack too early (links are not yet
+trained). Below is an example how it looks like when this happens:
+
+  pcieport 0000:83:04.0: pciehp: Slot(4): Card not present
+  pcieport 0000:87:04.0: PME# disabled
+  pcieport 0000:83:04.0: pciehp: pciehp_unconfigure_device: domain:bus:dev = 0000:86:00
+  pcieport 0000:86:00.0: Refused to change power state, currently in D3
+  pcieport 0000:86:00.0: restoring config space at offset 0x3c (was 0xffffffff, writing 0x201ff)
+  pcieport 0000:86:00.0: restoring config space at offset 0x38 (was 0xffffffff, writing 0x0)
+  ...
+
+There is also one reported case (see the bugzilla link below) where the
+missing delay causes xHCI on a Titan Ridge controller fail to runtime
+resume when USB-C dock is plugged. This does not involve pciehp but instead
+the PCI core fails to runtime resume the xHCI device:
+
+  pcieport 0000:04:02.0: restoring config space at offset 0xc (was 0x10000, writing 0x10020)
+  pcieport 0000:04:02.0: restoring config space at offset 0x4 (was 0x100000, writing 0x100406)
+  xhci_hcd 0000:39:00.0: Refused to change power state, currently in D3
+  xhci_hcd 0000:39:00.0: restoring config space at offset 0x3c (was 0xffffffff, writing 0x1ff)
+  xhci_hcd 0000:39:00.0: restoring config space at offset 0x38 (was 0xffffffff, writing 0x0)
+  ...
+
+Add a new function pci_bridge_wait_for_secondary_bus() that is called on
+PCI core resume and runtime resume paths accordingly if the bridge entered
+D3cold (and thus went through reset).
+
+This is second attempt to add the missing delays. The previous solution in
+c2bf1fc212f7 ("PCI: Add missing link delays required by the PCIe spec") was
+reverted because of two issues it caused:
+
+  1. One system become unresponsive after S3 resume due to PME service
+     spinning in pcie_pme_work_fn(). The root port in question reports that
+     the xHCI sent PME but the xHCI device itself does not have PME status
+     set. The PME status bit is never cleared in the root port resulting
+     the indefinite loop in pcie_pme_work_fn().
+
+  2. Slows down resume if the root/downstream port does not support Data
+     Link Layer Active Reporting because pcie_wait_for_link_delay() waits
+     1100 ms in that case.
+
+This version should avoid the above issues because we restrict the delay to
+happen only if the port went into D3cold.
+
+Link: https://lore.kernel.org/linux-pci/SL2P216MB01878BBCD75F21D882AEEA2880C60@SL2P216MB0187.KORP216.PROD.OUTLOOK.COM/
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=203885
+Link: https://lore.kernel.org/r/20191112091617.70282-3-mika.westerberg@linux.intel.com
+	Reported-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Tested-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit ad9001f2f41198784b0423646450ba2cb24793a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci-driver.c
+#	drivers/pci/pci.c
+diff --cc drivers/pci/pci-driver.c
+index 71d752a62b55,0454ca0e4e3f..000000000000
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@@ -934,8 -889,9 +934,14 @@@ Fixup
+  static int pci_pm_resume_noirq(struct device *dev)
+  {
+  	struct pci_dev *pci_dev = to_pci_dev(dev);
+++<<<<<<< HEAD
+ +	struct device_driver *drv = dev->driver;
+ +	int error = 0;
+++=======
++ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
++ 	pci_power_t prev_state = pci_dev->current_state;
++ 	bool skip_bus_pm = pci_dev->skip_bus_pm;
+++>>>>>>> ad9001f2f411 (PCI/PM: Add missing link delays required by the PCIe spec)
+  
+  	if (dev_pm_may_skip_resume(dev))
+  		return 0;
+@@@ -948,17 -904,28 +954,34 @@@
+  	if (dev_pm_smart_suspend_and_suspended(dev))
+  		pm_runtime_set_active(dev);
+  
+++<<<<<<< HEAD
+ +	pci_pm_default_resume_early(pci_dev);
+++=======
++ 	/*
++ 	 * In the suspend-to-idle case, devices left in D0 during suspend will
++ 	 * stay in D0, so it is not necessary to restore or update their
++ 	 * configuration here and attempting to put them into D0 again is
++ 	 * pointless, so avoid doing that.
++ 	 */
++ 	if (!(skip_bus_pm && pm_suspend_no_platform()))
++ 		pci_pm_default_resume_early(pci_dev);
++ 
++ 	pci_fixup_device(pci_fixup_resume_early, pci_dev);
++ 	pcie_pme_root_status_cleanup(pci_dev);
+++>>>>>>> ad9001f2f411 (PCI/PM: Add missing link delays required by the PCIe spec)
++ 
++ 	if (!skip_bus_pm && prev_state == PCI_D3cold)
++ 		pci_bridge_wait_for_secondary_bus(pci_dev);
+  
+  	if (pci_has_legacy_pm_support(pci_dev))
+ -		return 0;
+ +		return pci_legacy_resume_early(dev);
+  
+ -	if (pm && pm->resume_noirq)
+ -		return pm->resume_noirq(dev);
+ +	pcie_pme_root_status_cleanup(pci_dev);
+  
+ -	return 0;
+ +	if (drv && drv->pm && drv->pm->resume_noirq)
+ +		error = drv->pm->resume_noirq(dev);
+ +
+ +	return error;
+  }
+  
+  static int pci_pm_resume(struct device *dev)
+@@@ -1337,9 -1302,10 +1360,14 @@@ static int pci_pm_runtime_suspend(struc
+  
+  static int pci_pm_runtime_resume(struct device *dev)
+  {
+ +	int rc = 0;
+  	struct pci_dev *pci_dev = to_pci_dev(dev);
+  	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+++<<<<<<< HEAD
+++=======
++ 	pci_power_t prev_state = pci_dev->current_state;
++ 	int error = 0;
+++>>>>>>> ad9001f2f411 (PCI/PM: Add missing link delays required by the PCIe spec)
+  
+  	/*
+  	 * Restoring config space is necessary even if the device is not bound
+@@@ -1354,8 -1320,11 +1382,11 @@@
+  	pci_fixup_device(pci_fixup_resume_early, pci_dev);
+  	pci_pm_default_resume(pci_dev);
+  
++ 	if (prev_state == PCI_D3cold)
++ 		pci_bridge_wait_for_secondary_bus(pci_dev);
++ 
+  	if (pm && pm->runtime_resume)
+ -		error = pm->runtime_resume(dev);
+ +		rc = pm->runtime_resume(dev);
+  
+  	pci_dev->runtime_d3cold = false;
+  
+diff --cc drivers/pci/pci.c
+index 05133fd5ea0e,b9d91370856a..000000000000
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@@ -1005,33 -1013,28 +1005,44 @@@ void pci_wakeup_bus(struct pci_bus *bus
+  }
+  
+  /**
+ - * pci_power_up - Put the given device into D0
+ - * @dev: PCI device to power up
+ + * __pci_start_power_transition - Start power transition of a PCI device
+ + * @dev: PCI device to handle.
+ + * @state: State to put the device into.
+   */
+ -int pci_power_up(struct pci_dev *dev)
+ +static void __pci_start_power_transition(struct pci_dev *dev, pci_power_t state)
+  {
+++<<<<<<< HEAD
+ +	if (state == PCI_D0) {
+ +		pci_platform_power_transition(dev, PCI_D0);
+++=======
++ 	pci_platform_power_transition(dev, PCI_D0);
++ 
++ 	/*
++ 	 * Mandatory power management transition delays are handled in
++ 	 * pci_pm_resume_noirq() and pci_pm_runtime_resume() of the
++ 	 * corresponding bridge.
++ 	 */
++ 	if (dev->runtime_d3cold) {
+++>>>>>>> ad9001f2f411 (PCI/PM: Add missing link delays required by the PCIe spec)
+  		/*
+ -		 * When powering on a bridge from D3cold, the whole hierarchy
+ -		 * may be powered on into D0uninitialized state, resume them to
+ -		 * give them a chance to suspend again
+ +		 * Mandatory power management transition delays, see
+ +		 * PCI Express Base Specification Revision 2.0 Section
+ +		 * 6.6.1: Conventional Reset.  Do not delay for
+ +		 * devices powered on/off by corresponding bridge,
+ +		 * because have already delayed for the bridge.
+  		 */
+ -		pci_wakeup_bus(dev->subordinate);
+ +		if (dev->runtime_d3cold) {
+ +			if (dev->d3cold_delay && !dev->imm_ready)
+ +				msleep(dev->d3cold_delay);
+ +			/*
+ +			 * When powering on a bridge from D3cold, the
+ +			 * whole hierarchy may be powered on into
+ +			 * D0uninitialized state, resume them to give
+ +			 * them a chance to suspend again
+ +			 */
+ +			pci_wakeup_bus(dev->subordinate);
+ +		}
+  	}
+ -
+ -	return pci_raw_set_power_state(dev, PCI_D0);
+  }
+  
+  /**
+* Unmerged path drivers/pci/pci-driver.c
+* Unmerged path drivers/pci/pci.c
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index af1ee66b6d1f..702a684b31a6 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -97,6 +97,7 @@ void pci_allocate_cap_save_buffers(struct pci_dev *dev);
+ void pci_free_cap_save_buffers(struct pci_dev *dev);
+ bool pci_bridge_d3_possible(struct pci_dev *dev);
+ void pci_bridge_d3_update(struct pci_dev *dev);
++void pci_bridge_wait_for_secondary_bus(struct pci_dev *dev);
+ 
+ static inline void pci_wakeup_event(struct pci_dev *dev)
+ {
