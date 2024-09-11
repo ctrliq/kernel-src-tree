@@ -162,7 +162,7 @@ static void scrub_page(struct page *page)
 }
 
 /* balloon_append: add the given page to the balloon. */
-static void __balloon_append(struct page *page)
+static void balloon_append(struct page *page)
 {
 	/* Lowmem is re-populated first, so highmem pages go at list tail. */
 	if (PageHighMem(page)) {
@@ -173,11 +173,6 @@ static void __balloon_append(struct page *page)
 		balloon_stats.balloon_low++;
 	}
 	wake_up(&balloon_wq);
-}
-
-static void balloon_append(struct page *page)
-{
-	__balloon_append(page);
 }
 
 /* balloon_retrieve: rescue a page from the balloon, if it is not empty. */
@@ -429,7 +424,7 @@ static void xen_online_page(struct page *page, unsigned int order)
 		p = pfn_to_page(start_pfn + i);
 		__online_page_set_limits(p);
 		__SetPageOffline(p);
-		__balloon_append(p);
+		balloon_append(p);
 	}
 	mutex_unlock(&balloon_mutex);
 }
@@ -787,7 +782,7 @@ static void __init balloon_add_region(unsigned long start_pfn,
 		   include the boot-time balloon extension, so
 		   don't subtract from it. */
 		__SetPageOffline(page);
-		__balloon_append(page);
+		balloon_append(page);
 	}
 
 	balloon_stats.total_pages += extra_pfn_end - start_pfn;
