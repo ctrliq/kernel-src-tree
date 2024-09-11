@@ -1,0 +1,407 @@
+bpf: Enable bpf_skc_to_* sock casting helper to networking prog type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 1df8f55a37bd286a3d40192980050bc3d7d78887
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/1df8f55a.failed
+
+There is a constant need to add more fields into the bpf_tcp_sock
+for the bpf programs running at tc, sock_ops...etc.
+
+A current workaround could be to use bpf_probe_read_kernel().  However,
+other than making another helper call for reading each field and missing
+CO-RE, it is also not as intuitive to use as directly reading
+"tp->lsndtime" for example.  While already having perfmon cap to do
+bpf_probe_read_kernel(), it will be much easier if the bpf prog can
+directly read from the tcp_sock.
+
+This patch tries to do that by using the existing casting-helpers
+bpf_skc_to_*() whose func_proto returns a btf_id.  For example, the
+func_proto of bpf_skc_to_tcp_sock returns the btf_id of the
+kernel "struct tcp_sock".
+
+These helpers are also added to is_ptr_cast_function().
+It ensures the returning reg (BPF_REF_0) will also carries the ref_obj_id.
+That will keep the ref-tracking works properly.
+
+The bpf_skc_to_* helpers are made available to most of the bpf prog
+types in filter.c. The bpf_skc_to_* helpers will be limited by
+perfmon cap.
+
+This patch adds a ARG_PTR_TO_BTF_ID_SOCK_COMMON.  The helper accepting
+this arg can accept a btf-id-ptr (PTR_TO_BTF_ID + &btf_sock_ids[BTF_SOCK_TYPE_SOCK_COMMON])
+or a legacy-ctx-convert-skc-ptr (PTR_TO_SOCK_COMMON).  The bpf_skc_to_*()
+helpers are changed to take ARG_PTR_TO_BTF_ID_SOCK_COMMON such that
+they will accept pointer obtained from skb->sk.
+
+Instead of specifying both arg_type and arg_btf_id in the same func_proto
+which is how the current ARG_PTR_TO_BTF_ID does, the arg_btf_id of
+the new ARG_PTR_TO_BTF_ID_SOCK_COMMON is specified in the
+compatible_reg_types[] in verifier.c.  The reason is the arg_btf_id is
+always the same.  Discussion in this thread:
+https://lore.kernel.org/bpf/20200922070422.1917351-1-kafai@fb.com/
+
+The ARG_PTR_TO_BTF_ID_ part gives a clear expectation that the helper is
+expecting a PTR_TO_BTF_ID which could be NULL.  This is the same
+behavior as the existing helper taking ARG_PTR_TO_BTF_ID.
+
+The _SOCK_COMMON part means the helper is also expecting the legacy
+SOCK_COMMON pointer.
+
+By excluding the _OR_NULL part, the bpf prog cannot call helper
+with a literal NULL which doesn't make sense in most cases.
+e.g. bpf_skc_to_tcp_sock(NULL) will be rejected.  All PTR_TO_*_OR_NULL
+reg has to do a NULL check first before passing into the helper or else
+the bpf prog will be rejected.  This behavior is nothing new and
+consistent with the current expectation during bpf-prog-load.
+
+[ ARG_PTR_TO_BTF_ID_SOCK_COMMON will be used to replace
+  ARG_PTR_TO_SOCK* of other existing helpers later such that
+  those existing helpers can take the PTR_TO_BTF_ID returned by
+  the bpf_skc_to_*() helpers.
+
+  The only special case is bpf_sk_lookup_assign() which can accept a
+  literal NULL ptr.  It has to be handled specially in another follow
+  up patch if there is a need (e.g. by renaming ARG_PTR_TO_SOCKET_OR_NULL
+  to ARG_PTR_TO_BTF_ID_SOCK_COMMON_OR_NULL). ]
+
+[ When converting the older helpers that take ARG_PTR_TO_SOCK* in
+  the later patch, if the kernel does not support BTF,
+  ARG_PTR_TO_BTF_ID_SOCK_COMMON will behave like ARG_PTR_TO_SOCK_COMMON
+  because no reg->type could have PTR_TO_BTF_ID in this case.
+
+  It is not a concern for the newer-btf-only helper like the bpf_skc_to_*()
+  here though because these helpers must require BTF vmlinux to begin
+  with. ]
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200925000350.3855720-1-kafai@fb.com
+(cherry picked from commit 1df8f55a37bd286a3d40192980050bc3d7d78887)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/verifier.c
+#	net/core/filter.c
+diff --cc include/linux/bpf.h
+index 2d012bf2e765,d0937f1d2980..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -278,6 -292,8 +278,11 @@@ enum bpf_arg_type 
+  	ARG_PTR_TO_ALLOC_MEM,	/* pointer to dynamically allocated memory */
+  	ARG_PTR_TO_ALLOC_MEM_OR_NULL,	/* pointer to dynamically allocated memory or NULL */
+  	ARG_CONST_ALLOC_SIZE_OR_ZERO,	/* number of allocated bytes requested */
+++<<<<<<< HEAD
+++=======
++ 	ARG_PTR_TO_BTF_ID_SOCK_COMMON,	/* pointer to in-kernel sock_common or bpf-mirrored bpf_sock */
++ 	__BPF_ARG_TYPE_MAX,
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  };
+  
+  /* type of values returned from helper functions */
+diff --cc kernel/bpf/verifier.c
+index 41ae364d39c2,d4ba29fb17a6..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -3937,6 -3956,153 +3942,156 @@@ static int resolve_map_arg_type(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_reg_types {
++ 	const enum bpf_reg_type types[10];
++ 	u32 *btf_id;
++ };
++ 
++ static const struct bpf_reg_types map_key_value_types = {
++ 	.types = {
++ 		PTR_TO_STACK,
++ 		PTR_TO_PACKET,
++ 		PTR_TO_PACKET_META,
++ 		PTR_TO_MAP_VALUE,
++ 	},
++ };
++ 
++ static const struct bpf_reg_types sock_types = {
++ 	.types = {
++ 		PTR_TO_SOCK_COMMON,
++ 		PTR_TO_SOCKET,
++ 		PTR_TO_TCP_SOCK,
++ 		PTR_TO_XDP_SOCK,
++ 	},
++ };
++ 
++ static const struct bpf_reg_types btf_id_sock_common_types = {
++ 	.types = {
++ 		PTR_TO_SOCK_COMMON,
++ 		PTR_TO_SOCKET,
++ 		PTR_TO_TCP_SOCK,
++ 		PTR_TO_XDP_SOCK,
++ 		PTR_TO_BTF_ID,
++ 	},
++ 	.btf_id = &btf_sock_ids[BTF_SOCK_TYPE_SOCK_COMMON],
++ };
++ 
++ static const struct bpf_reg_types mem_types = {
++ 	.types = {
++ 		PTR_TO_STACK,
++ 		PTR_TO_PACKET,
++ 		PTR_TO_PACKET_META,
++ 		PTR_TO_MAP_VALUE,
++ 		PTR_TO_MEM,
++ 		PTR_TO_RDONLY_BUF,
++ 		PTR_TO_RDWR_BUF,
++ 	},
++ };
++ 
++ static const struct bpf_reg_types int_ptr_types = {
++ 	.types = {
++ 		PTR_TO_STACK,
++ 		PTR_TO_PACKET,
++ 		PTR_TO_PACKET_META,
++ 		PTR_TO_MAP_VALUE,
++ 	},
++ };
++ 
++ static const struct bpf_reg_types fullsock_types = { .types = { PTR_TO_SOCKET } };
++ static const struct bpf_reg_types scalar_types = { .types = { SCALAR_VALUE } };
++ static const struct bpf_reg_types context_types = { .types = { PTR_TO_CTX } };
++ static const struct bpf_reg_types alloc_mem_types = { .types = { PTR_TO_MEM } };
++ static const struct bpf_reg_types const_map_ptr_types = { .types = { CONST_PTR_TO_MAP } };
++ static const struct bpf_reg_types btf_ptr_types = { .types = { PTR_TO_BTF_ID } };
++ static const struct bpf_reg_types spin_lock_types = { .types = { PTR_TO_MAP_VALUE } };
++ 
++ static const struct bpf_reg_types *compatible_reg_types[__BPF_ARG_TYPE_MAX] = {
++ 	[ARG_PTR_TO_MAP_KEY]		= &map_key_value_types,
++ 	[ARG_PTR_TO_MAP_VALUE]		= &map_key_value_types,
++ 	[ARG_PTR_TO_UNINIT_MAP_VALUE]	= &map_key_value_types,
++ 	[ARG_PTR_TO_MAP_VALUE_OR_NULL]	= &map_key_value_types,
++ 	[ARG_CONST_SIZE]		= &scalar_types,
++ 	[ARG_CONST_SIZE_OR_ZERO]	= &scalar_types,
++ 	[ARG_CONST_ALLOC_SIZE_OR_ZERO]	= &scalar_types,
++ 	[ARG_CONST_MAP_PTR]		= &const_map_ptr_types,
++ 	[ARG_PTR_TO_CTX]		= &context_types,
++ 	[ARG_PTR_TO_CTX_OR_NULL]	= &context_types,
++ 	[ARG_PTR_TO_SOCK_COMMON]	= &sock_types,
++ 	[ARG_PTR_TO_BTF_ID_SOCK_COMMON]	= &btf_id_sock_common_types,
++ 	[ARG_PTR_TO_SOCKET]		= &fullsock_types,
++ 	[ARG_PTR_TO_SOCKET_OR_NULL]	= &fullsock_types,
++ 	[ARG_PTR_TO_BTF_ID]		= &btf_ptr_types,
++ 	[ARG_PTR_TO_SPIN_LOCK]		= &spin_lock_types,
++ 	[ARG_PTR_TO_MEM]		= &mem_types,
++ 	[ARG_PTR_TO_MEM_OR_NULL]	= &mem_types,
++ 	[ARG_PTR_TO_UNINIT_MEM]		= &mem_types,
++ 	[ARG_PTR_TO_ALLOC_MEM]		= &alloc_mem_types,
++ 	[ARG_PTR_TO_ALLOC_MEM_OR_NULL]	= &alloc_mem_types,
++ 	[ARG_PTR_TO_INT]		= &int_ptr_types,
++ 	[ARG_PTR_TO_LONG]		= &int_ptr_types,
++ };
++ 
++ static int check_reg_type(struct bpf_verifier_env *env, u32 regno,
++ 			  enum bpf_arg_type arg_type,
++ 			  const u32 *arg_btf_id)
++ {
++ 	struct bpf_reg_state *regs = cur_regs(env), *reg = &regs[regno];
++ 	enum bpf_reg_type expected, type = reg->type;
++ 	const struct bpf_reg_types *compatible;
++ 	int i, j;
++ 
++ 	compatible = compatible_reg_types[arg_type];
++ 	if (!compatible) {
++ 		verbose(env, "verifier internal error: unsupported arg type %d\n", arg_type);
++ 		return -EFAULT;
++ 	}
++ 
++ 	for (i = 0; i < ARRAY_SIZE(compatible->types); i++) {
++ 		expected = compatible->types[i];
++ 		if (expected == NOT_INIT)
++ 			break;
++ 
++ 		if (type == expected)
++ 			goto found;
++ 	}
++ 
++ 	verbose(env, "R%d type=%s expected=", regno, reg_type_str[type]);
++ 	for (j = 0; j + 1 < i; j++)
++ 		verbose(env, "%s, ", reg_type_str[compatible->types[j]]);
++ 	verbose(env, "%s\n", reg_type_str[compatible->types[j]]);
++ 	return -EACCES;
++ 
++ found:
++ 	if (type == PTR_TO_BTF_ID) {
++ 		if (!arg_btf_id) {
++ 			if (!compatible->btf_id) {
++ 				verbose(env, "verifier internal error: missing arg compatible BTF ID\n");
++ 				return -EFAULT;
++ 			}
++ 			arg_btf_id = compatible->btf_id;
++ 		}
++ 
++ 		if (!btf_struct_ids_match(&env->log, reg->off, reg->btf_id,
++ 					  *arg_btf_id)) {
++ 			verbose(env, "R%d is of type %s but %s is expected\n",
++ 				regno, kernel_type_name(reg->btf_id),
++ 				kernel_type_name(*arg_btf_id));
++ 			return -EACCES;
++ 		}
++ 
++ 		if (!tnum_is_const(reg->var_off) || reg->var_off.value) {
++ 			verbose(env, "R%d is a pointer to in-kernel struct with non-zero offset\n",
++ 				regno);
++ 			return -EACCES;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  static int check_func_arg(struct bpf_verifier_env *env, u32 arg,
+  			  struct bpf_call_arg_meta *meta,
+  			  const struct bpf_func_proto *fn)
+@@@ -4527,6 -4597,21 +4682,24 @@@ static bool check_refcount_ok(const str
+  	return count <= 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool check_btf_id_ok(const struct bpf_func_proto *fn)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(fn->arg_type); i++) {
++ 		if (fn->arg_type[i] == ARG_PTR_TO_BTF_ID && !fn->arg_btf_id[i])
++ 			return false;
++ 
++ 		if (fn->arg_type[i] != ARG_PTR_TO_BTF_ID && fn->arg_btf_id[i])
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  static int check_func_proto(const struct bpf_func_proto *fn, int func_id)
+  {
+  	return check_raw_mode_ok(fn) &&
+diff --cc net/core/filter.c
+index 86ad2ec2c55f,6d1864f2bd51..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -80,7 -77,8 +80,12 @@@
+  #include <net/transp_v6.h>
+  #include <linux/btf_ids.h>
+  
+++<<<<<<< HEAD
+ +#include <linux/rh_features.h>
+++=======
++ static const struct bpf_func_proto *
++ bpf_sk_base_func_proto(enum bpf_func_id func_id);
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  
+  int copy_bpf_fprog_from_user(struct sock_fprog *dst, sockptr_t src, int len)
+  {
+@@@ -9542,8 -9916,7 +9547,12 @@@ const struct bpf_func_proto bpf_skc_to_
+  	.func			= bpf_skc_to_tcp6_sock,
+  	.gpl_only		= false,
+  	.ret_type		= RET_PTR_TO_BTF_ID_OR_NULL,
+++<<<<<<< HEAD
+ +	.arg1_type		= ARG_PTR_TO_BTF_ID,
+ +	.check_btf_id		= check_arg_btf_id,
+++=======
++ 	.arg1_type		= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  	.ret_btf_id		= &btf_sock_ids[BTF_SOCK_TYPE_TCP6],
+  };
+  
+@@@ -9559,8 -9932,7 +9568,12 @@@ const struct bpf_func_proto bpf_skc_to_
+  	.func			= bpf_skc_to_tcp_sock,
+  	.gpl_only		= false,
+  	.ret_type		= RET_PTR_TO_BTF_ID_OR_NULL,
+++<<<<<<< HEAD
+ +	.arg1_type		= ARG_PTR_TO_BTF_ID,
+ +	.check_btf_id		= check_arg_btf_id,
+++=======
++ 	.arg1_type		= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  	.ret_btf_id		= &btf_sock_ids[BTF_SOCK_TYPE_TCP],
+  };
+  
+@@@ -9589,8 -9955,7 +9602,12 @@@ const struct bpf_func_proto bpf_skc_to_
+  	.func			= bpf_skc_to_tcp_timewait_sock,
+  	.gpl_only		= false,
+  	.ret_type		= RET_PTR_TO_BTF_ID_OR_NULL,
+++<<<<<<< HEAD
+ +	.arg1_type		= ARG_PTR_TO_BTF_ID,
+ +	.check_btf_id		= check_arg_btf_id,
+++=======
++ 	.arg1_type		= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  	.ret_btf_id		= &btf_sock_ids[BTF_SOCK_TYPE_TCP_TW],
+  };
+  
+@@@ -9613,8 -9978,7 +9630,12 @@@ const struct bpf_func_proto bpf_skc_to_
+  	.func			= bpf_skc_to_tcp_request_sock,
+  	.gpl_only		= false,
+  	.ret_type		= RET_PTR_TO_BTF_ID_OR_NULL,
+++<<<<<<< HEAD
+ +	.arg1_type		= ARG_PTR_TO_BTF_ID,
+ +	.check_btf_id		= check_arg_btf_id,
+++=======
++ 	.arg1_type		= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  	.ret_btf_id		= &btf_sock_ids[BTF_SOCK_TYPE_TCP_REQ],
+  };
+  
+@@@ -9635,7 -9999,37 +9656,42 @@@ const struct bpf_func_proto bpf_skc_to_
+  	.func			= bpf_skc_to_udp6_sock,
+  	.gpl_only		= false,
+  	.ret_type		= RET_PTR_TO_BTF_ID_OR_NULL,
+++<<<<<<< HEAD
+ +	.arg1_type		= ARG_PTR_TO_BTF_ID,
+ +	.check_btf_id		= check_arg_btf_id,
+++=======
++ 	.arg1_type		= ARG_PTR_TO_BTF_ID_SOCK_COMMON,
+++>>>>>>> 1df8f55a37bd (bpf: Enable bpf_skc_to_* sock casting helper to networking prog type)
+  	.ret_btf_id		= &btf_sock_ids[BTF_SOCK_TYPE_UDP6],
+  };
++ 
++ static const struct bpf_func_proto *
++ bpf_sk_base_func_proto(enum bpf_func_id func_id)
++ {
++ 	const struct bpf_func_proto *func;
++ 
++ 	switch (func_id) {
++ 	case BPF_FUNC_skc_to_tcp6_sock:
++ 		func = &bpf_skc_to_tcp6_sock_proto;
++ 		break;
++ 	case BPF_FUNC_skc_to_tcp_sock:
++ 		func = &bpf_skc_to_tcp_sock_proto;
++ 		break;
++ 	case BPF_FUNC_skc_to_tcp_timewait_sock:
++ 		func = &bpf_skc_to_tcp_timewait_sock_proto;
++ 		break;
++ 	case BPF_FUNC_skc_to_tcp_request_sock:
++ 		func = &bpf_skc_to_tcp_request_sock_proto;
++ 		break;
++ 	case BPF_FUNC_skc_to_udp6_sock:
++ 		func = &bpf_skc_to_udp6_sock_proto;
++ 		break;
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ 
++ 	if (!perfmon_capable())
++ 		return NULL;
++ 
++ 	return func;
++ }
+* Unmerged path include/linux/bpf.h
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path net/core/filter.c
