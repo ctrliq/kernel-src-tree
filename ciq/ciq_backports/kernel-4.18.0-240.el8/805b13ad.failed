@@ -1,0 +1,136 @@
+io_uring: ensure RCU callback ordering with rcu_barrier()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 805b13adde3964c78cba125a15527e88c19f87b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/805b13ad.failed
+
+After more careful studying, Paul informs me that we cannot rely on
+ordering of RCU callbacks in the way that the the tagged commit did.
+The current construct looks like this:
+
+	void C(struct rcu_head *rhp)
+	{
+		do_something(rhp);
+		call_rcu(&p->rh, B);
+	}
+
+	call_rcu(&p->rh, A);
+	call_rcu(&p->rh, C);
+
+and we're relying on ordering between A and B, which isn't guaranteed.
+Make this explicit instead, and have a work item issue the rcu_barrier()
+to ensure that A has run before we manually execute B.
+
+While thorough testing never showed this issue, it's dependent on the
+per-cpu load in terms of RCU callbacks. The updated method simplifies
+the code as well, and eliminates the need to maintain an rcu_head in
+the fileset data.
+
+Fixes: c1e2148f8ecb ("io_uring: free fixed_file_data after RCU grace period")
+	Reported-by: Paul E. McKenney <paulmck@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 805b13adde3964c78cba125a15527e88c19f87b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,1b2517291b78..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -197,14 -179,18 +197,25 @@@ struct io_mapped_ubuf 
+  	unsigned int	nr_bvecs;
+  };
+  
+ -struct fixed_file_table {
+ -	struct file		**files;
+ -};
+ +struct async_list {
+ +	spinlock_t		lock;
+ +	atomic_t		cnt;
+ +	struct list_head	list;
+  
+++<<<<<<< HEAD
+ +	struct file		*file;
+ +	off_t			io_start;
+ +	size_t			io_len;
+++=======
++ struct fixed_file_data {
++ 	struct fixed_file_table		*table;
++ 	struct io_ring_ctx		*ctx;
++ 
++ 	struct percpu_ref		refs;
++ 	struct llist_head		put_llist;
++ 	struct work_struct		ref_work;
++ 	struct completion		done;
+++>>>>>>> 805b13adde39 (io_uring: ensure RCU callback ordering with rcu_barrier())
+  };
+  
+  struct io_ring_ctx {
+@@@ -2740,14 -5322,52 +2751,52 @@@ static void __io_sqe_files_unregister(s
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void io_file_ref_kill(struct percpu_ref *ref)
++ {
++ 	struct fixed_file_data *data;
++ 
++ 	data = container_of(ref, struct fixed_file_data, refs);
++ 	complete(&data->done);
++ }
++ 
++ static void io_file_ref_exit_and_free(struct work_struct *work)
++ {
++ 	struct fixed_file_data *data;
++ 
++ 	data = container_of(work, struct fixed_file_data, ref_work);
++ 
++ 	/*
++ 	 * Ensure any percpu-ref atomic switch callback has run, it could have
++ 	 * been in progress when the files were being unregistered. Once
++ 	 * that's done, we can safely exit and free the ref and containing
++ 	 * data structure.
++ 	 */
++ 	rcu_barrier();
++ 	percpu_ref_exit(&data->refs);
++ 	kfree(data);
++ }
++ 
+++>>>>>>> 805b13adde39 (io_uring: ensure RCU callback ordering with rcu_barrier())
+  static int io_sqe_files_unregister(struct io_ring_ctx *ctx)
+  {
+ -	struct fixed_file_data *data = ctx->file_data;
+ -	unsigned nr_tables, i;
+ -
+ -	if (!data)
+ +	if (!ctx->user_files)
+  		return -ENXIO;
+  
+ -	percpu_ref_kill_and_confirm(&data->refs, io_file_ref_kill);
+ -	flush_work(&data->ref_work);
+ -	wait_for_completion(&data->done);
+ -	io_ring_file_ref_flush(data);
+ -
+  	__io_sqe_files_unregister(ctx);
+++<<<<<<< HEAD
+ +	kfree(ctx->user_files);
+ +	ctx->user_files = NULL;
+++=======
++ 	nr_tables = DIV_ROUND_UP(ctx->nr_user_files, IORING_MAX_FILES_TABLE);
++ 	for (i = 0; i < nr_tables; i++)
++ 		kfree(data->table[i].files);
++ 	kfree(data->table);
++ 	INIT_WORK(&data->ref_work, io_file_ref_exit_and_free);
++ 	queue_work(system_wq, &data->ref_work);
++ 	ctx->file_data = NULL;
+++>>>>>>> 805b13adde39 (io_uring: ensure RCU callback ordering with rcu_barrier())
+  	ctx->nr_user_files = 0;
+  	return 0;
+  }
+* Unmerged path fs/io_uring.c
