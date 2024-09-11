@@ -76,7 +76,6 @@ struct smbd_connection {
 	bool negotiate_done;
 
 	struct work_struct disconnect_work;
-	struct work_struct recv_done_work;
 	struct work_struct post_send_credits_work;
 
 	spinlock_t lock_new_credits_offered;
