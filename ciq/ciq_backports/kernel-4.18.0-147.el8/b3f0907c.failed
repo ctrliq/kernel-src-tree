@@ -1,0 +1,260 @@
+x86/mm: Add .bss..decrypted section to hold shared variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Brijesh Singh <brijesh.singh@amd.com>
+commit b3f0907c71e006e12fde74ea9a745b6096b6f90f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b3f0907c.failed
+
+kvmclock defines few static variables which are shared with the
+hypervisor during the kvmclock initialization.
+
+When SEV is active, memory is encrypted with a guest-specific key, and
+if the guest OS wants to share the memory region with the hypervisor
+then it must clear the C-bit before sharing it.
+
+Currently, we use kernel_physical_mapping_init() to split large pages
+before clearing the C-bit on shared pages. But it fails when called from
+the kvmclock initialization (mainly because the memblock allocator is
+not ready that early during boot).
+
+Add a __bss_decrypted section attribute which can be used when defining
+such shared variable. The so-defined variables will be placed in the
+.bss..decrypted section. This section will be mapped with C=0 early
+during boot.
+
+The .bss..decrypted section has a big chunk of memory that may be unused
+when memory encryption is not active, free it when memory encryption is
+not active.
+
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: Radim Krčmář<rkrcmar@redhat.com>
+	Cc: kvm@vger.kernel.org
+Link: https://lkml.kernel.org/r/1536932759-12905-2-git-send-email-brijesh.singh@amd.com
+
+(cherry picked from commit b3f0907c71e006e12fde74ea9a745b6096b6f90f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/init.c
+diff --cc arch/x86/mm/init.c
+index aa58ff4d1031,faca978ebf9d..000000000000
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@@ -775,13 -782,48 +775,57 @@@ void free_init_pages(char *what, unsign
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * begin/end can be in the direct map or the "high kernel mapping"
++  * used for the kernel image only.  free_init_pages() will do the
++  * right thing for either kind of address.
++  */
++ void free_kernel_image_pages(void *begin, void *end)
++ {
++ 	unsigned long begin_ul = (unsigned long)begin;
++ 	unsigned long end_ul = (unsigned long)end;
++ 	unsigned long len_pages = (end_ul - begin_ul) >> PAGE_SHIFT;
++ 
++ 
++ 	free_init_pages("unused kernel image", begin_ul, end_ul);
++ 
++ 	/*
++ 	 * PTI maps some of the kernel into userspace.  For performance,
++ 	 * this includes some kernel areas that do not contain secrets.
++ 	 * Those areas might be adjacent to the parts of the kernel image
++ 	 * being freed, which may contain secrets.  Remove the "high kernel
++ 	 * image mapping" for these freed areas, ensuring they are not even
++ 	 * potentially vulnerable to Meltdown regardless of the specific
++ 	 * optimizations PTI is currently using.
++ 	 *
++ 	 * The "noalias" prevents unmapping the direct map alias which is
++ 	 * needed to access the freed pages.
++ 	 *
++ 	 * This is only valid for 64bit kernels. 32bit has only one mapping
++ 	 * which can't be treated in this way for obvious reasons.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_X86_64) && cpu_feature_enabled(X86_FEATURE_PTI))
++ 		set_memory_np_noalias(begin_ul, len_pages);
++ }
++ 
++ void __weak mem_encrypt_free_decrypted_mem(void) { }
++ 
+++>>>>>>> b3f0907c71e0 (x86/mm: Add .bss..decrypted section to hold shared variables)
+  void __ref free_initmem(void)
+  {
+  	e820__reallocate_tables();
+  
+++<<<<<<< HEAD
+ +	free_init_pages("unused kernel",
+ +			(unsigned long)(&__init_begin),
+ +			(unsigned long)(&__init_end));
+++=======
++ 	mem_encrypt_free_decrypted_mem();
++ 
++ 	free_kernel_image_pages(&__init_begin, &__init_end);
+++>>>>>>> b3f0907c71e0 (x86/mm: Add .bss..decrypted section to hold shared variables)
+  }
+  
+  #ifdef CONFIG_BLK_DEV_INITRD
+diff --git a/arch/x86/include/asm/mem_encrypt.h b/arch/x86/include/asm/mem_encrypt.h
+index c0643831706e..616f8e637bc3 100644
+--- a/arch/x86/include/asm/mem_encrypt.h
++++ b/arch/x86/include/asm/mem_encrypt.h
+@@ -48,10 +48,13 @@ int __init early_set_memory_encrypted(unsigned long vaddr, unsigned long size);
+ 
+ /* Architecture __weak replacement functions */
+ void __init mem_encrypt_init(void);
++void __init mem_encrypt_free_decrypted_mem(void);
+ 
+ bool sme_active(void);
+ bool sev_active(void);
+ 
++#define __bss_decrypted __attribute__((__section__(".bss..decrypted")))
++
+ #else	/* !CONFIG_AMD_MEM_ENCRYPT */
+ 
+ #define sme_me_mask	0ULL
+@@ -77,6 +80,8 @@ early_set_memory_decrypted(unsigned long vaddr, unsigned long size) { return 0;
+ static inline int __init
+ early_set_memory_encrypted(unsigned long vaddr, unsigned long size) { return 0; }
+ 
++#define __bss_decrypted
++
+ #endif	/* CONFIG_AMD_MEM_ENCRYPT */
+ 
+ /*
+@@ -88,6 +93,8 @@ early_set_memory_encrypted(unsigned long vaddr, unsigned long size) { return 0;
+ #define __sme_pa(x)		(__pa(x) | sme_me_mask)
+ #define __sme_pa_nodebug(x)	(__pa_nodebug(x) | sme_me_mask)
+ 
++extern char __start_bss_decrypted[], __end_bss_decrypted[], __start_bss_decrypted_unused[];
++
+ #endif	/* __ASSEMBLY__ */
+ 
+ #endif	/* __X86_MEM_ENCRYPT_H__ */
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index 7749840f81ca..16b1cbd3a61e 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -113,6 +113,7 @@ static bool __head check_la57_support(unsigned long physaddr)
+ unsigned long __head __startup_64(unsigned long physaddr,
+ 				  struct boot_params *bp)
+ {
++	unsigned long vaddr, vaddr_end;
+ 	unsigned long load_delta, *p;
+ 	unsigned long pgtable_flags;
+ 	pgdval_t *pgd;
+@@ -236,6 +237,21 @@ unsigned long __head __startup_64(unsigned long physaddr,
+ 	/* Encrypt the kernel and related (if SME is active) */
+ 	sme_encrypt_kernel(bp);
+ 
++	/*
++	 * Clear the memory encryption mask from the .bss..decrypted section.
++	 * The bss section will be memset to zero later in the initialization so
++	 * there is no need to zero it after changing the memory encryption
++	 * attribute.
++	 */
++	if (mem_encrypt_active()) {
++		vaddr = (unsigned long)__start_bss_decrypted;
++		vaddr_end = (unsigned long)__end_bss_decrypted;
++		for (; vaddr < vaddr_end; vaddr += PMD_SIZE) {
++			i = pmd_index(vaddr);
++			pmd[i] -= sme_get_me_mask();
++		}
++	}
++
+ 	/*
+ 	 * Return the SME encryption mask (if SME is active) to be used as a
+ 	 * modifier for the initial pgdir entry programmed into CR3.
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index ba5e7d896eca..4ce1b3877a18 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -64,6 +64,23 @@ jiffies_64 = jiffies;
+ #define ALIGN_ENTRY_TEXT_BEGIN	. = ALIGN(PMD_SIZE);
+ #define ALIGN_ENTRY_TEXT_END	. = ALIGN(PMD_SIZE);
+ 
++/*
++ * This section contains data which will be mapped as decrypted. Memory
++ * encryption operates on a page basis. Make this section PMD-aligned
++ * to avoid splitting the pages while mapping the section early.
++ *
++ * Note: We use a separate section so that only this section gets
++ * decrypted to avoid exposing more than we wish.
++ */
++#define BSS_DECRYPTED						\
++	. = ALIGN(PMD_SIZE);					\
++	__start_bss_decrypted = .;				\
++	*(.bss..decrypted);					\
++	. = ALIGN(PAGE_SIZE);					\
++	__start_bss_decrypted_unused = .;			\
++	. = ALIGN(PMD_SIZE);					\
++	__end_bss_decrypted = .;				\
++
+ #else
+ 
+ #define X64_ALIGN_RODATA_BEGIN
+@@ -71,6 +88,7 @@ jiffies_64 = jiffies;
+ 
+ #define ALIGN_ENTRY_TEXT_BEGIN
+ #define ALIGN_ENTRY_TEXT_END
++#define BSS_DECRYPTED
+ 
+ #endif
+ 
+@@ -342,6 +360,7 @@ SECTIONS
+ 		__bss_start = .;
+ 		*(.bss..page_aligned)
+ 		*(.bss)
++		BSS_DECRYPTED
+ 		. = ALIGN(PAGE_SIZE);
+ 		__bss_stop = .;
+ 	}
+* Unmerged path arch/x86/mm/init.c
+diff --git a/arch/x86/mm/mem_encrypt.c b/arch/x86/mm/mem_encrypt.c
+index d7a7ed6dceb3..385afa2b9e17 100644
+--- a/arch/x86/mm/mem_encrypt.c
++++ b/arch/x86/mm/mem_encrypt.c
+@@ -348,6 +348,30 @@ bool sev_active(void)
+ EXPORT_SYMBOL(sev_active);
+ 
+ /* Architecture __weak replacement functions */
++void __init mem_encrypt_free_decrypted_mem(void)
++{
++	unsigned long vaddr, vaddr_end, npages;
++	int r;
++
++	vaddr = (unsigned long)__start_bss_decrypted_unused;
++	vaddr_end = (unsigned long)__end_bss_decrypted;
++	npages = (vaddr_end - vaddr) >> PAGE_SHIFT;
++
++	/*
++	 * The unused memory range was mapped decrypted, change the encryption
++	 * attribute from decrypted to encrypted before freeing it.
++	 */
++	if (mem_encrypt_active()) {
++		r = set_memory_encrypted(vaddr, npages);
++		if (r) {
++			pr_warn("failed to free unused decrypted pages\n");
++			return;
++		}
++	}
++
++	free_init_pages("unused decrypted", vaddr, vaddr_end);
++}
++
+ void __init mem_encrypt_init(void)
+ {
+ 	if (!sme_me_mask)
