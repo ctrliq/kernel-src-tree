@@ -1,0 +1,205 @@
+drm/qxl: rework cursor plane
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Gerd Hoffmann <kraxel@redhat.com>
+commit b4b27f08f9f96d98040b37905bd9caf6b48b1430
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/b4b27f08.failed
+
+Add helper functions to create and move the cursor.
+Create the cursor_bo in prepare_fb callback, in the
+atomic_commit callback we only send the update command
+to the host.
+
+	Signed-off-by: Gerd Hoffmann <kraxel@redhat.com>
+	Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+Link: http://patchwork.freedesktop.org/patch/msgid/20210217123213.2199186-11-kraxel@redhat.com
+(cherry picked from commit b4b27f08f9f96d98040b37905bd9caf6b48b1430)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/qxl/qxl_display.c
+diff --cc drivers/gpu/drm/qxl/qxl_display.c
+index 59ef1f0c985d,4a3d272e8d6c..000000000000
+--- a/drivers/gpu/drm/qxl/qxl_display.c
++++ b/drivers/gpu/drm/qxl/qxl_display.c
+@@@ -571,111 -680,14 +677,113 @@@ static void qxl_primary_atomic_disable(
+  static void qxl_cursor_atomic_update(struct drm_plane *plane,
+  				     struct drm_plane_state *old_state)
+  {
+- 	struct drm_device *dev = plane->dev;
+- 	struct qxl_device *qdev = to_qxl(dev);
++ 	struct qxl_device *qdev = to_qxl(plane->dev);
+  	struct drm_framebuffer *fb = plane->state->fb;
+++<<<<<<< HEAD
+ +	struct qxl_crtc *qcrtc = to_qxl_crtc(plane->state->crtc);
+ +	struct qxl_release *release;
+ +	struct qxl_cursor_cmd *cmd;
+ +	struct qxl_cursor *cursor;
+ +	struct drm_gem_object *obj;
+ +	struct qxl_bo *cursor_bo = NULL, *user_bo = NULL, *old_cursor_bo = NULL;
+ +	int ret;
+ +	void *user_ptr;
+ +	int size = 64*64*4;
+ +
+ +	ret = qxl_alloc_release_reserved(qdev, sizeof(*cmd),
+ +					 QXL_RELEASE_CURSOR_CMD,
+ +					 &release, NULL);
+ +	if (ret)
+ +		return;
+ +
+ +	if (fb != old_state->fb) {
+ +		obj = fb->obj[0];
+ +		user_bo = gem_to_qxl_bo(obj);
+ +
+ +		/* pinning is done in the prepare/cleanup framevbuffer */
+ +		ret = qxl_bo_kmap(user_bo, &user_ptr);
+ +		if (ret)
+ +			goto out_free_release;
+ +
+ +		ret = qxl_alloc_bo_reserved(qdev, release,
+ +					    sizeof(struct qxl_cursor) + size,
+ +					    &cursor_bo);
+ +		if (ret)
+ +			goto out_kunmap;
+ +
+ +		ret = qxl_bo_pin(cursor_bo);
+ +		if (ret)
+ +			goto out_free_bo;
+ +
+ +		ret = qxl_release_reserve_list(release, true);
+ +		if (ret)
+ +			goto out_unpin;
+ +
+ +		ret = qxl_bo_kmap(cursor_bo, (void **)&cursor);
+ +		if (ret)
+ +			goto out_backoff;
+ +
+ +		cursor->header.unique = 0;
+ +		cursor->header.type = SPICE_CURSOR_TYPE_ALPHA;
+ +		cursor->header.width = 64;
+ +		cursor->header.height = 64;
+ +		cursor->header.hot_spot_x = fb->hot_x;
+ +		cursor->header.hot_spot_y = fb->hot_y;
+ +		cursor->data_size = size;
+ +		cursor->chunk.next_chunk = 0;
+ +		cursor->chunk.prev_chunk = 0;
+ +		cursor->chunk.data_size = size;
+ +		memcpy(cursor->chunk.data, user_ptr, size);
+ +		qxl_bo_kunmap(cursor_bo);
+ +		qxl_bo_kunmap(user_bo);
+ +
+ +		cmd = (struct qxl_cursor_cmd *) qxl_release_map(qdev, release);
+ +		cmd->u.set.visible = 1;
+ +		cmd->u.set.shape = qxl_bo_physical_address(qdev,
+ +							   cursor_bo, 0);
+ +		cmd->type = QXL_CURSOR_SET;
+ +
+ +		old_cursor_bo = qcrtc->cursor_bo;
+ +		qcrtc->cursor_bo = cursor_bo;
+ +		cursor_bo = NULL;
+- 	} else {
+++=======
+  
+- 		ret = qxl_release_reserve_list(release, true);
+- 		if (ret)
+- 			goto out_free_release;
+- 
+- 		cmd = (struct qxl_cursor_cmd *) qxl_release_map(qdev, release);
+- 		cmd->type = QXL_CURSOR_MOVE;
++ 	if (fb != old_state->fb) {
++ 		qxl_primary_apply_cursor(qdev, plane->state);
+++>>>>>>> b4b27f08f9f9 (drm/qxl: rework cursor plane)
++ 	} else {
++ 		qxl_primary_move_cursor(qdev, plane->state);
+  	}
+++<<<<<<< HEAD
+ +
+ +	cmd->u.position.x = plane->state->crtc_x + fb->hot_x;
+ +	cmd->u.position.y = plane->state->crtc_y + fb->hot_y;
+ +
+ +	qxl_release_unmap(qdev, release, &cmd->release_info);
+ +	qxl_release_fence_buffer_objects(release);
+ +	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
+ +
+ +	if (old_cursor_bo != NULL)
+ +		qxl_bo_unpin(old_cursor_bo);
+ +	qxl_bo_unref(&old_cursor_bo);
+ +	qxl_bo_unref(&cursor_bo);
+ +
+ +	return;
+ +
+ +out_backoff:
+ +	qxl_release_backoff_reserve_list(release);
+ +out_unpin:
+ +	qxl_bo_unpin(cursor_bo);
+ +out_free_bo:
+ +	qxl_bo_unref(&cursor_bo);
+ +out_kunmap:
+ +	qxl_bo_kunmap(user_bo);
+ +out_free_release:
+ +	qxl_release_free(qdev, release);
+ +	return;
+ +
+++=======
+++>>>>>>> b4b27f08f9f9 (drm/qxl: rework cursor plane)
+  }
+  
+  static void qxl_cursor_atomic_disable(struct drm_plane *plane,
+@@@ -778,37 -826,21 +891,52 @@@ static int qxl_plane_prepare_fb(struct 
+  
+  	if (plane->type == DRM_PLANE_TYPE_PRIMARY &&
+  	    user_bo->is_dumb) {
+ -		qxl_prepare_shadow(qdev, user_bo, new_state->crtc->index);
+ +		qxl_update_dumb_head(qdev, new_state->crtc->index,
+ +				     user_bo);
+ +		qxl_calc_dumb_shadow(qdev, &surf);
+ +		if (!qdev->dumb_shadow_bo ||
+ +		    qdev->dumb_shadow_bo->surf.width  != surf.width ||
+ +		    qdev->dumb_shadow_bo->surf.height != surf.height) {
+ +			if (qdev->dumb_shadow_bo) {
+ +				drm_gem_object_put
+ +					(&qdev->dumb_shadow_bo->tbo.base);
+ +				qdev->dumb_shadow_bo = NULL;
+ +			}
+ +			qxl_bo_create(qdev, surf.height * surf.stride,
+ +				      true, true, QXL_GEM_DOMAIN_SURFACE, &surf,
+ +				      &qdev->dumb_shadow_bo);
+ +		}
+ +		if (user_bo->shadow != qdev->dumb_shadow_bo) {
+ +			if (user_bo->shadow) {
+ +				drm_gem_object_put
+ +					(&user_bo->shadow->tbo.base);
+ +				user_bo->shadow = NULL;
+ +			}
+ +			drm_gem_object_get(&qdev->dumb_shadow_bo->tbo.base);
+ +			user_bo->shadow = qdev->dumb_shadow_bo;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = qxl_bo_pin(user_bo);
+ +	if (ret)
+ +		return ret;
+ +
+ +	return 0;
+++=======
++ 	if (plane->type == DRM_PLANE_TYPE_CURSOR &&
++ 	    plane->state->fb != new_state->fb) {
++ 		struct qxl_crtc *qcrtc = to_qxl_crtc(new_state->crtc);
++ 		struct qxl_bo *old_cursor_bo = qcrtc->cursor_bo;
++ 
++ 		qcrtc->cursor_bo = qxl_create_cursor(qdev, user_bo,
++ 						     new_state->fb->hot_x,
++ 						     new_state->fb->hot_y);
++ 		qxl_free_cursor(old_cursor_bo);
++ 	}
++ 
++ 	return qxl_bo_pin(user_bo);
+++>>>>>>> b4b27f08f9f9 (drm/qxl: rework cursor plane)
+  }
+  
+  static void qxl_plane_cleanup_fb(struct drm_plane *plane,
+* Unmerged path drivers/gpu/drm/qxl/qxl_display.c
