@@ -1,0 +1,178 @@
+bpf: Refactor btf_check_func_arg_match
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 34747c4120418143097d4343312a0ca96c986d86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/34747c41.failed
+
+This patch moved the subprog specific logic from
+btf_check_func_arg_match() to the new btf_check_subprog_arg_match().
+The core logic is left in btf_check_func_arg_match() which
+will be reused later to check the kernel function call.
+
+The "if (!btf_type_is_ptr(t))" is checked first to improve the
+indentation which will be useful for a later patch.
+
+Some of the "btf_kind_str[]" usages is replaced with the shortcut
+"btf_type_str(t)".
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210325015136.1544504-1-kafai@fb.com
+(cherry picked from commit 34747c4120418143097d4343312a0ca96c986d86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/btf.c
+diff --cc kernel/bpf/btf.c
+index 9c8a2e36b8dd,3c489adacf3b..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -5390,86 -5481,9 +5480,35 @@@ int btf_check_subprog_arg_match(struct 
+  	if (prog->aux->func_info_aux[subprog].unreliable)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	t = btf_type_by_id(btf, btf_id);
+ +	if (!t || !btf_type_is_func(t)) {
+ +		/* These checks were already done by the verifier while loading
+ +		 * struct bpf_func_info
+ +		 */
+ +		bpf_log(log, "BTF of func#%d doesn't point to KIND_FUNC\n",
+ +			subprog);
+ +		return -EFAULT;
+ +	}
+ +	tname = btf_name_by_offset(btf, t->name_off);
+ +
+ +	t = btf_type_by_id(btf, t->type);
+ +	if (!t || !btf_type_is_func_proto(t)) {
+ +		bpf_log(log, "Invalid BTF of func %s\n", tname);
+ +		return -EFAULT;
+ +	}
+ +	args = (const struct btf_param *)(t + 1);
+ +	nargs = btf_type_vlen(t);
+ +	if (nargs > 5) {
+ +		bpf_log(log, "Function %s has %d > 5 args\n", tname, nargs);
+ +		goto out;
+ +	}
+ +
+++=======
+++>>>>>>> 34747c412041 (bpf: Refactor btf_check_func_arg_match)
+  	is_global = prog->aux->func_info_aux[subprog].linkage == BTF_FUNC_GLOBAL;
+- 	/* check that BTF function arguments match actual types that the
+- 	 * verifier sees.
+- 	 */
+- 	for (i = 0; i < nargs; i++) {
+- 		struct bpf_reg_state *reg = &regs[i + 1];
++ 	err = btf_check_func_arg_match(env, btf, btf_id, regs, is_global);
+  
+- 		t = btf_type_by_id(btf, args[i].type);
+- 		while (btf_type_is_modifier(t))
+- 			t = btf_type_by_id(btf, t->type);
+- 		if (btf_type_is_int(t) || btf_type_is_enum(t)) {
+- 			if (reg->type == SCALAR_VALUE)
+- 				continue;
+- 			bpf_log(log, "R%d is not a scalar\n", i + 1);
+- 			goto out;
+- 		}
+- 		if (btf_type_is_ptr(t)) {
+- 			/* If function expects ctx type in BTF check that caller
+- 			 * is passing PTR_TO_CTX.
+- 			 */
+- 			if (btf_get_prog_ctx_type(log, btf, t, prog->type, i)) {
+- 				if (reg->type != PTR_TO_CTX) {
+- 					bpf_log(log,
+- 						"arg#%d expected pointer to ctx, but got %s\n",
+- 						i, btf_kind_str[BTF_INFO_KIND(t->info)]);
+- 					goto out;
+- 				}
+- 				if (check_ctx_reg(env, reg, i + 1))
+- 					goto out;
+- 				continue;
+- 			}
+- 
+- 			if (!is_global)
+- 				goto out;
+- 
+- 			t = btf_type_skip_modifiers(btf, t->type, NULL);
+- 
+- 			ref_t = btf_resolve_size(btf, t, &type_size);
+- 			if (IS_ERR(ref_t)) {
+- 				bpf_log(log,
+- 				    "arg#%d reference type('%s %s') size cannot be determined: %ld\n",
+- 				    i, btf_type_str(t), btf_name_by_offset(btf, t->name_off),
+- 					PTR_ERR(ref_t));
+- 				goto out;
+- 			}
+- 
+- 			if (check_mem_reg(env, reg, i + 1, type_size))
+- 				goto out;
+- 
+- 			continue;
+- 		}
+- 		bpf_log(log, "Unrecognized arg#%d type %s\n",
+- 			i, btf_kind_str[BTF_INFO_KIND(t->info)]);
+- 		goto out;
+- 	}
+- 	return 0;
+- out:
+  	/* Compiler optimizations can remove arguments from static functions
+  	 * or mismatched type can be passed into a global function.
+  	 * In such cases mark the function as unreliable from BTF point of view.
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 9232230ec903..ccdf6c1b1fcf 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1543,8 +1543,8 @@ int btf_distill_func_proto(struct bpf_verifier_log *log,
+ 			   struct btf_func_model *m);
+ 
+ struct bpf_reg_state;
+-int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
+-			     struct bpf_reg_state *regs);
++int btf_check_subprog_arg_match(struct bpf_verifier_env *env, int subprog,
++				struct bpf_reg_state *regs);
+ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
+ 			  struct bpf_reg_state *reg);
+ int btf_check_type_match(struct bpf_verifier_log *log, const struct bpf_prog *prog,
+diff --git a/include/linux/btf.h b/include/linux/btf.h
+index 9c1b52738bbe..8a05687a4ee2 100644
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@ -141,6 +141,11 @@ static inline bool btf_type_is_enum(const struct btf_type *t)
+ 	return BTF_INFO_KIND(t->info) == BTF_KIND_ENUM;
+ }
+ 
++static inline bool btf_type_is_scalar(const struct btf_type *t)
++{
++	return btf_type_is_int(t) || btf_type_is_enum(t);
++}
++
+ static inline bool btf_type_is_typedef(const struct btf_type *t)
+ {
+ 	return BTF_INFO_KIND(t->info) == BTF_KIND_TYPEDEF;
+* Unmerged path kernel/bpf/btf.c
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index b1498684b49b..4ee0f9173130 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5281,7 +5281,7 @@ static int __check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ 	func_info_aux = env->prog->aux->func_info_aux;
+ 	if (func_info_aux)
+ 		is_global = func_info_aux[subprog].linkage == BTF_FUNC_GLOBAL;
+-	err = btf_check_func_arg_match(env, subprog, caller->regs);
++	err = btf_check_subprog_arg_match(env, subprog, caller->regs);
+ 	if (err == -EFAULT)
+ 		return err;
+ 	if (is_global) {
+@@ -12188,7 +12188,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 		/* 1st arg to a function */
+ 		regs[BPF_REG_1].type = PTR_TO_CTX;
+ 		mark_reg_known_zero(env, regs, BPF_REG_1);
+-		ret = btf_check_func_arg_match(env, subprog, regs);
++		ret = btf_check_subprog_arg_match(env, subprog, regs);
+ 		if (ret == -EFAULT)
+ 			/* unlikely verifier bug. abort.
+ 			 * ret == 0 and ret < 0 are sadly acceptable for
