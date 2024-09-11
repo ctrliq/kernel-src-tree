@@ -1,0 +1,269 @@
+net: sched: flower: track rtnl lock state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: flower: track rtnl lock state (Ivan Vecera) [1751856]
+Rebuild_FUZZ: 93.51%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit c24e43d83b7aedb3effef54627448253e22a0140
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c24e43d8.failed
+
+Use 'rtnl_held' flag to track if caller holds rtnl lock. Propagate the flag
+to internal functions that need to know rtnl lock state. Take rtnl lock
+before calling tcf APIs that require it (hw offload, bind filter, etc.).
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Stefano Brivio <sbrivio@redhat.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c24e43d83b7aedb3effef54627448253e22a0140)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index ffd0c5b3e320,68bac808cf35..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -377,7 -387,12 +380,14 @@@ static void fl_hw_destroy_filter(struc
+  	cls_flower.cookie = (unsigned long) f;
+  
+  	tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, false);
+ -	spin_lock(&tp->lock);
+  	tcf_block_offload_dec(block, &f->flags);
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock(&tp->lock);
++ 
++ 	if (!rtnl_held)
++ 		rtnl_unlock();
+++>>>>>>> c24e43d83b7a (net: sched: flower: track rtnl lock state)
+  }
+  
+  static int fl_hw_replace_filter(struct tcf_proto *tp,
+@@@ -415,20 -435,30 +430,32 @@@
+  	kfree(cls_flower.rule);
+  
+  	if (err < 0) {
+- 		fl_hw_destroy_filter(tp, f, NULL);
+- 		return err;
++ 		fl_hw_destroy_filter(tp, f, true, NULL);
++ 		goto errout;
+  	} else if (err > 0) {
+  		f->in_hw_count = err;
+++<<<<<<< HEAD
+++=======
++ 		err = 0;
++ 		spin_lock(&tp->lock);
+++>>>>>>> c24e43d83b7a (net: sched: flower: track rtnl lock state)
+  		tcf_block_offload_inc(block, &f->flags);
+ -		spin_unlock(&tp->lock);
+  	}
+  
+- 	if (skip_sw && !(f->flags & TCA_CLS_FLAGS_IN_HW))
+- 		return -EINVAL;
++ 	if (skip_sw && !(f->flags & TCA_CLS_FLAGS_IN_HW)) {
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
+  
+- 	return 0;
++ errout:
++ 	if (!rtnl_held)
++ 		rtnl_unlock();
++ 
++ 	return err;
+  }
+  
+- static void fl_hw_update_stats(struct tcf_proto *tp, struct cls_fl_filter *f)
++ static void fl_hw_update_stats(struct tcf_proto *tp, struct cls_fl_filter *f,
++ 			       bool rtnl_held)
+  {
+  	struct tc_cls_flower_offload cls_flower = {};
+  	struct tcf_block *block = tp->chain->block;
+@@@ -455,25 -491,79 +488,75 @@@ static struct cls_fl_head *fl_head_dere
+  	return rcu_dereference_raw(tp->root);
+  }
+  
+++<<<<<<< HEAD
+ +static bool __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
+ +			struct netlink_ext_ack *extack)
+++=======
++ static void __fl_put(struct cls_fl_filter *f)
++ {
++ 	if (!refcount_dec_and_test(&f->refcnt))
++ 		return;
++ 
++ 	WARN_ON(!f->deleted);
++ 
++ 	if (tcf_exts_get_net(&f->exts))
++ 		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
++ 	else
++ 		__fl_destroy_filter(f);
++ }
++ 
++ static struct cls_fl_filter *__fl_get(struct cls_fl_head *head, u32 handle)
++ {
++ 	struct cls_fl_filter *f;
++ 
++ 	rcu_read_lock();
++ 	f = idr_find(&head->handle_idr, handle);
++ 	if (f && !refcount_inc_not_zero(&f->refcnt))
++ 		f = NULL;
++ 	rcu_read_unlock();
++ 
++ 	return f;
++ }
++ 
++ static struct cls_fl_filter *fl_get_next_filter(struct tcf_proto *tp,
++ 						unsigned long *handle)
++ {
++ 	struct cls_fl_head *head = fl_head_dereference(tp);
++ 	struct cls_fl_filter *f;
++ 
++ 	rcu_read_lock();
++ 	while ((f = idr_get_next_ul(&head->handle_idr, handle))) {
++ 		/* don't return filters that are being deleted */
++ 		if (refcount_inc_not_zero(&f->refcnt))
++ 			break;
++ 		++(*handle);
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return f;
++ }
++ 
++ static int __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
++ 		       bool *last, bool rtnl_held,
++ 		       struct netlink_ext_ack *extack)
+++>>>>>>> c24e43d83b7a (net: sched: flower: track rtnl lock state)
+  {
+  	struct cls_fl_head *head = fl_head_dereference(tp);
+  	bool async = tcf_exts_get_net(&f->exts);
+ +	bool last;
+  
+ -	*last = false;
+ -
+ -	spin_lock(&tp->lock);
+ -	if (f->deleted) {
+ -		spin_unlock(&tp->lock);
+ -		return -ENOENT;
+ -	}
+ -
+ -	f->deleted = true;
+ -	rhashtable_remove_fast(&f->mask->ht, &f->ht_node,
+ -			       f->mask->filter_ht_params);
+  	idr_remove(&head->handle_idr, f->handle);
+  	list_del_rcu(&f->list);
+ -	spin_unlock(&tp->lock);
+ -
+ -	*last = fl_mask_put(head, f->mask, async);
+ +	last = fl_mask_put(head, f->mask, async);
+  	if (!tc_skip_hw(f->flags))
+- 		fl_hw_destroy_filter(tp, f, extack);
++ 		fl_hw_destroy_filter(tp, f, rtnl_held, extack);
+  	tcf_unbind_filter(tp, &f->res);
+ -	__fl_put(f);
+ +	if (async)
+ +		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
+ +	else
+ +		__fl_destroy_filter(f);
+  
+ -	return 0;
+ +	return last;
+  }
+  
+  static void fl_destroy_sleepable(struct work_struct *work)
+@@@ -496,7 -586,9 +579,12 @@@ static void fl_destroy(struct tcf_prot
+  
+  	list_for_each_entry_safe(mask, next_mask, &head->masks, list) {
+  		list_for_each_entry_safe(f, next, &mask->filters, list) {
+++<<<<<<< HEAD
+ +			if (__fl_delete(tp, f, extack))
+++=======
++ 			__fl_delete(tp, f, &last, rtnl_held, extack);
++ 			if (last)
+++>>>>>>> c24e43d83b7a (net: sched: flower: track rtnl lock state)
+  				break;
+  		}
+  	}
+@@@ -1447,10 -1572,17 +1539,10 @@@ static int fl_change(struct net *net, s
+  
+  		fl_mask_put(head, fold->mask, true);
+  		if (!tc_skip_hw(fold->flags))
+- 			fl_hw_destroy_filter(tp, fold, NULL);
++ 			fl_hw_destroy_filter(tp, fold, rtnl_held, NULL);
+  		tcf_unbind_filter(tp, &fold->res);
+  		tcf_exts_get_net(&fold->exts);
+ -		/* Caller holds reference to fold, so refcnt is always > 0
+ -		 * after this.
+ -		 */
+ -		refcount_dec(&fold->refcnt);
+ -		__fl_put(fold);
+ +		tcf_queue_work(&fold->rwork, fl_destroy_filter_work);
+  	} else {
+  		if (__fl_lookup(fnew->mask, &fnew->mkey)) {
+  			err = -EEXIST;
+@@@ -1497,8 -1630,9 +1589,8 @@@
+  errout_idr:
+  	idr_remove(&head->handle_idr, fnew->handle);
+  errout_hw:
+ -	spin_unlock(&tp->lock);
+  	if (!tc_skip_hw(fnew->flags))
+- 		fl_hw_destroy_filter(tp, fnew, NULL);
++ 		fl_hw_destroy_filter(tp, fnew, rtnl_held, NULL);
+  errout_mask:
+  	fl_mask_put(head, fnew->mask, true);
+  errout:
+@@@ -1516,12 -1653,14 +1608,16 @@@ static int fl_delete(struct tcf_proto *
+  {
+  	struct cls_fl_head *head = fl_head_dereference(tp);
+  	struct cls_fl_filter *f = arg;
+ -	bool last_on_mask;
+ -	int err = 0;
+  
+++<<<<<<< HEAD
+ +	rhashtable_remove_fast(&f->mask->ht, &f->ht_node,
+ +			       f->mask->filter_ht_params);
+ +	__fl_delete(tp, f, extack);
+++=======
++ 	err = __fl_delete(tp, f, &last_on_mask, rtnl_held, extack);
+++>>>>>>> c24e43d83b7a (net: sched: flower: track rtnl lock state)
+  	*last = list_empty(&head->masks);
+ -	__fl_put(f);
+ -
+ -	return err;
+ +	return 0;
+  }
+  
+  static void fl_walk(struct tcf_proto *tp, struct tcf_walker *arg,
+@@@ -2145,15 -2289,18 +2241,24 @@@ static int fl_dump(struct net *net, str
+  
+  	key = &f->key;
+  	mask = &f->mask->key;
+ -	skip_hw = tc_skip_hw(f->flags);
+  
+  	if (fl_dump_key(skb, net, key, mask))
+ -		goto nla_put_failure_locked;
+ +		goto nla_put_failure;
+ +
+ +	if (!tc_skip_hw(f->flags))
+ +		fl_hw_update_stats(tp, f);
+  
+  	if (f->flags && nla_put_u32(skb, TCA_FLOWER_FLAGS, f->flags))
+++<<<<<<< HEAD
+ +		goto nla_put_failure;
+++=======
++ 		goto nla_put_failure_locked;
++ 
++ 	spin_unlock(&tp->lock);
++ 
++ 	if (!skip_hw)
++ 		fl_hw_update_stats(tp, f, rtnl_held);
+++>>>>>>> c24e43d83b7a (net: sched: flower: track rtnl lock state)
+  
+  	if (nla_put_u32(skb, TCA_FLOWER_IN_HW_COUNT, f->in_hw_count))
+  		goto nla_put_failure;
+* Unmerged path net/sched/cls_flower.c
