@@ -1,0 +1,160 @@
+selftests/bpf: Move test_tcppbf_user into test_progs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Alexander Duyck <alexanderduyck@fb.com>
+commit aaf376bddf68d0afe5f4b5f25fc555da358e2287
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/aaf376bd.failed
+
+Recently a bug was missed due to the fact that test_tcpbpf_user is not a
+part of test_progs. In order to prevent similar issues in the future move
+the test functionality into test_progs. By doing this we can make certain
+that it is a part of standard testing and will not be overlooked.
+
+As a part of moving the functionality into test_progs it is necessary to
+integrate with the test_progs framework and to drop any redundant code.
+This patch:
+1. Cleans up the include headers
+2. Dropped a duplicate definition of bpf_find_map
+3. Switched over to using test_progs specific cgroup functions
+4. Renamed main to test_tcpbpf_user
+5. Dropped return value in favor of CHECK_FAIL to check for errors
+
+The general idea is that I wanted to keep the changes as small as possible
+while moving the file into the test_progs framework. The follow-on patches
+are meant to clean up the remaining issues such as the use of CHECK_FAIL.
+
+	Signed-off-by: Alexander Duyck <alexanderduyck@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/160443928881.1086697.17661359319919165370.stgit@localhost.localdomain
+(cherry picked from commit aaf376bddf68d0afe5f4b5f25fc555da358e2287)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/.gitignore
+diff --cc tools/testing/selftests/bpf/.gitignore
+index 14c6839c400b,395ae040ce1f..000000000000
+--- a/tools/testing/selftests/bpf/.gitignore
++++ b/tools/testing/selftests/bpf/.gitignore
+@@@ -6,8 -7,7 +6,12 @@@ test_ta
+  FEATURE-DUMP.libbpf
+  fixdep
+  test_dev_cgroup
+++<<<<<<< HEAD
+ +test_progs
+ +test_tcpbpf_user
+++=======
++ /test_progs*
+++>>>>>>> aaf376bddf68 (selftests/bpf: Move test_tcppbf_user into test_progs)
+  test_verifier_log
+  feature
+  test_sock
+* Unmerged path tools/testing/selftests/bpf/.gitignore
+diff --git a/tools/testing/selftests/bpf/Makefile b/tools/testing/selftests/bpf/Makefile
+index 7402bf23a285..7d59d1487466 100644
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -32,7 +32,7 @@ LDLIBS += -lcap -lelf -lz -lrt -lpthread
+ 
+ # Order correspond to 'make run_tests' order
+ TEST_GEN_PROGS = test_verifier test_tag test_maps test_lru_map test_lpm_map test_progs \
+-	test_verifier_log test_dev_cgroup test_tcpbpf_user \
++	test_verifier_log test_dev_cgroup \
+ 	test_sock test_sockmap get_cgroup_id_user test_socket_cookie \
+ 	test_cgroup_storage \
+ 	test_netcnt test_tcpnotify_user test_sysctl \
+@@ -163,7 +163,6 @@ $(OUTPUT)/test_sock: cgroup_helpers.c
+ $(OUTPUT)/test_sock_addr: cgroup_helpers.c
+ $(OUTPUT)/test_socket_cookie: cgroup_helpers.c
+ $(OUTPUT)/test_sockmap: cgroup_helpers.c
+-$(OUTPUT)/test_tcpbpf_user: cgroup_helpers.c
+ $(OUTPUT)/test_tcpnotify_user: cgroup_helpers.c trace_helpers.c
+ $(OUTPUT)/get_cgroup_id_user: cgroup_helpers.c
+ $(OUTPUT)/test_cgroup_storage: cgroup_helpers.c
+diff --git a/tools/testing/selftests/bpf/test_tcpbpf_user.c b/tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+similarity index 81%
+rename from tools/testing/selftests/bpf/test_tcpbpf_user.c
+rename to tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+index 74a9e49988b6..caa8d3adec8a 100644
+--- a/tools/testing/selftests/bpf/test_tcpbpf_user.c
++++ b/tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+@@ -1,21 +1,11 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <inttypes.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <unistd.h>
+-#include <errno.h>
+-#include <string.h>
+-#include <linux/bpf.h>
+-#include <sys/types.h>
+-#include <bpf/bpf.h>
+-#include <bpf/libbpf.h>
+-
+-#include "bpf_rlimit.h"
+-#include "bpf_util.h"
+-#include "cgroup_helpers.h"
++#include <test_progs.h>
+ 
+ #include "test_tcpbpf.h"
+ 
++#define CG_NAME "/tcpbpf-user-test"
++
+ /* 3 comes from one listening socket + both ends of the connection */
+ #define EXPECTED_CLOSE_EVENTS		3
+ 
+@@ -76,25 +66,11 @@ int verify_sockopt_result(int sock_map_fd)
+ 	return ret;
+ }
+ 
+-static int bpf_find_map(const char *test, struct bpf_object *obj,
+-			const char *name)
+-{
+-	struct bpf_map *map;
+-
+-	map = bpf_object__find_map_by_name(obj, name);
+-	if (!map) {
+-		printf("%s:FAIL:map '%s' not found\n", test, name);
+-		return -1;
+-	}
+-	return bpf_map__fd(map);
+-}
+-
+-int main(int argc, char **argv)
++void test_tcpbpf_user(void)
+ {
+ 	const char *file = "test_tcpbpf_kern.o";
+ 	int prog_fd, map_fd, sock_map_fd;
+ 	struct tcpbpf_globals g = {0};
+-	const char *cg_path = "/foo";
+ 	int error = EXIT_FAILURE;
+ 	struct bpf_object *obj;
+ 	int cg_fd = -1;
+@@ -102,7 +78,7 @@ int main(int argc, char **argv)
+ 	__u32 key = 0;
+ 	int rv;
+ 
+-	cg_fd = cgroup_setup_and_join(cg_path);
++	cg_fd = test__join_cgroup(CG_NAME);
+ 	if (cg_fd < 0)
+ 		goto err;
+ 
+@@ -155,11 +131,11 @@ int main(int argc, char **argv)
+ 		goto err;
+ 	}
+ 
+-	printf("PASSED!\n");
+ 	error = 0;
+ err:
+ 	bpf_prog_detach(cg_fd, BPF_CGROUP_SOCK_OPS);
+-	close(cg_fd);
+-	cleanup_cgroup_environment();
+-	return error;
++	if (cg_fd != -1)
++		close(cg_fd);
++
++	CHECK_FAIL(error);
+ }
