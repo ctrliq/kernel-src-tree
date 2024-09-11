@@ -1,0 +1,147 @@
+xprtrdma: Remove fr_state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 847568942f93e0af77e4bb8a098899f310cb3a88
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/84756894.failed
+
+Now that both the Send and Receive completions are handled in
+process context, it is safe to DMA unmap and return MRs to the
+free or recycle lists directly in the completion handlers.
+
+Doing this means rpcrdma_frwr no longer needs to track the state of
+each MR, meaning that a VALID or FLUSHED MR can no longer appear on
+an xprt's MR free list. Thus there is no longer a need to track the
+MR's registration state in rpcrdma_frwr.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 847568942f93e0af77e4bb8a098899f310cb3a88)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 4f4311900f93,5c480bc13075..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -388,16 -324,9 +327,22 @@@ struct rpcrdma_mr_seg *frwr_map(struct 
+  	int i, n;
+  	u8 key;
+  
+++<<<<<<< HEAD
+ +	mr = NULL;
+ +	do {
+ +		if (mr)
+ +			rpcrdma_mr_recycle(mr);
+ +		mr = rpcrdma_mr_get(r_xprt);
+ +		if (!mr)
+ +			return ERR_PTR(-EAGAIN);
+ +	} while (mr->frwr.fr_state != FRWR_IS_INVALID);
+ +	frwr = &mr->frwr;
+ +	frwr->fr_state = FRWR_IS_VALID;
+++=======
++ 	mr = rpcrdma_mr_get(r_xprt);
++ 	if (!mr)
++ 		goto out_getmr_err;
+++>>>>>>> 847568942f93 (xprtrdma: Remove fr_state)
+  
+  	if (nsegs > ia->ri_max_frwr_depth)
+  		nsegs = ia->ri_max_frwr_depth;
+diff --git a/include/trace/events/rpcrdma.h b/include/trace/events/rpcrdma.h
+index bfa903f6b855..2972b05eb17b 100644
+--- a/include/trace/events/rpcrdma.h
++++ b/include/trace/events/rpcrdma.h
+@@ -181,18 +181,6 @@ DECLARE_EVENT_CLASS(xprtrdma_wrch_event,
+ 				),					\
+ 				TP_ARGS(task, mr, nsegs))
+ 
+-TRACE_DEFINE_ENUM(FRWR_IS_INVALID);
+-TRACE_DEFINE_ENUM(FRWR_IS_VALID);
+-TRACE_DEFINE_ENUM(FRWR_FLUSHED_FR);
+-TRACE_DEFINE_ENUM(FRWR_FLUSHED_LI);
+-
+-#define xprtrdma_show_frwr_state(x)					\
+-		__print_symbolic(x,					\
+-				{ FRWR_IS_INVALID, "INVALID" },		\
+-				{ FRWR_IS_VALID, "VALID" },		\
+-				{ FRWR_FLUSHED_FR, "FLUSHED_FR" },	\
+-				{ FRWR_FLUSHED_LI, "FLUSHED_LI" })
+-
+ DECLARE_EVENT_CLASS(xprtrdma_frwr_done,
+ 	TP_PROTO(
+ 		const struct ib_wc *wc,
+@@ -203,22 +191,19 @@ DECLARE_EVENT_CLASS(xprtrdma_frwr_done,
+ 
+ 	TP_STRUCT__entry(
+ 		__field(const void *, mr)
+-		__field(unsigned int, state)
+ 		__field(unsigned int, status)
+ 		__field(unsigned int, vendor_err)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		__entry->mr = container_of(frwr, struct rpcrdma_mr, frwr);
+-		__entry->state = frwr->fr_state;
+ 		__entry->status = wc->status;
+ 		__entry->vendor_err = __entry->status ? wc->vendor_err : 0;
+ 	),
+ 
+ 	TP_printk(
+-		"mr=%p state=%s: %s (%u/0x%x)",
+-		__entry->mr, xprtrdma_show_frwr_state(__entry->state),
+-		rdma_show_wc_status(__entry->status),
++		"mr=%p: %s (%u/0x%x)",
++		__entry->mr, rdma_show_wc_status(__entry->status),
+ 		__entry->status, __entry->vendor_err
+ 	)
+ );
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index 2469b4d91dbb..1621068872da 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -1274,7 +1274,7 @@ void rpcrdma_release_rqst(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
+ 	 * RPC has relinquished all its Send Queue entries.
+ 	 */
+ 	if (!list_empty(&req->rl_registered))
+-		frwr_unmap_sync(r_xprt, &req->rl_registered);
++		frwr_unmap_sync(r_xprt, req);
+ 
+ 	/* Ensure that any DMA mapped pages associated with
+ 	 * the Send of the RPC Call have been unmapped before
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index cc5a576b0242..81e0401b9b09 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -237,17 +237,9 @@ struct rpcrdma_sendctx {
+  * An external memory region is any buffer or page that is registered
+  * on the fly (ie, not pre-registered).
+  */
+-enum rpcrdma_frwr_state {
+-	FRWR_IS_INVALID,	/* ready to be used */
+-	FRWR_IS_VALID,		/* in use */
+-	FRWR_FLUSHED_FR,	/* flushed FASTREG WR */
+-	FRWR_FLUSHED_LI,	/* flushed LOCALINV WR */
+-};
+-
+ struct rpcrdma_frwr {
+ 	struct ib_mr			*fr_mr;
+ 	struct ib_cqe			fr_cqe;
+-	enum rpcrdma_frwr_state		fr_state;
+ 	struct completion		fr_linv_done;
+ 	union {
+ 		struct ib_reg_wr	fr_regwr;
+@@ -586,8 +578,7 @@ struct rpcrdma_mr_seg *frwr_map(struct rpcrdma_xprt *r_xprt,
+ 				struct rpcrdma_mr **mr);
+ int frwr_send(struct rpcrdma_ia *ia, struct rpcrdma_req *req);
+ void frwr_reminv(struct rpcrdma_rep *rep, struct list_head *mrs);
+-void frwr_unmap_sync(struct rpcrdma_xprt *r_xprt,
+-		     struct list_head *mrs);
++void frwr_unmap_sync(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req);
+ 
+ /*
+  * RPC/RDMA protocol calls - xprtrdma/rpc_rdma.c
