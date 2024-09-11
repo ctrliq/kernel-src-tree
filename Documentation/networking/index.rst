@@ -7,6 +7,7 @@ Contents:
    :maxdepth: 2
 
    af_xdp
+   bareudp
    batman-adv
    can
    can_ucan_protocol
