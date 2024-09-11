@@ -1,0 +1,250 @@
+RDMA/core: Simplify how the gid_attrs sysfs is created
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit a4676388e2e21215b32f33b42ac5725e315a6680
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a4676388.failed
+
+Instead of having an whole bunch of different allocations to create the
+gid_attr kobjects reduce it to three, one for the kobj struct plus the
+attributes, and one for the attribute list for each of the two
+groups.
+
+Move the freeing of all allocations to the release function.
+
+Reorder the operations so all the allocations happen first then the
+kobject & sysfs operations are last.
+
+This removes the majority of the complicated error unwind since the
+release function will always undo all the memory allocations. Freeing the
+memory is also much simpler since there is a lot less of it.
+
+Consolidate creating the "group of array indexes" pattern into one helper
+function. Ensure kobject_del is used.
+
+Link: https://lore.kernel.org/r/f4149d379db7178d37d11d75e3026bf550f818a1.1623427137.git.leonro@nvidia.com
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit a4676388e2e21215b32f33b42ac5725e315a6680)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/sysfs.c
+diff --cc drivers/infiniband/core/sysfs.c
+index 1ae9eecb09be,006bf759e890..000000000000
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@@ -47,24 -47,6 +47,27 @@@
+  
+  struct ib_port;
+  
+++<<<<<<< HEAD
+ +struct gid_attr_group {
+ +	struct ib_port		*port;
+ +	struct kobject		kobj;
+ +	struct attribute_group	ndev;
+ +	struct attribute_group	type;
+ +};
+ +struct ib_port {
+ +	struct kobject         kobj;
+ +	struct ib_device      *ibdev;
+ +	struct gid_attr_group *gid_attr_group;
+ +	struct attribute_group gid_group;
+ +	struct attribute_group *pkey_group;
+ +	const struct attribute_group *pma_table;
+ +	struct attribute_group *hw_stats_ag;
+ +	struct rdma_hw_stats   *hw_stats;
+ +	u8                     port_num;
+ +};
+ +
+++=======
+++>>>>>>> a4676388e2e2 (RDMA/core: Simplify how the gid_attrs sysfs is created)
+  struct port_attribute {
+  	struct attribute attr;
+  	ssize_t (*show)(struct ib_port *, struct port_attribute *, char *buf);
+@@@ -85,16 -67,54 +88,67 @@@ struct port_table_attribute 
+  	__be16			attr_id;
+  };
+  
+++<<<<<<< HEAD
+ +struct hw_stats_attribute {
+ +	struct attribute	attr;
+ +	ssize_t			(*show)(struct kobject *kobj,
+ +					struct attribute *attr, char *buf);
+ +	ssize_t			(*store)(struct kobject *kobj,
+ +					 struct attribute *attr,
+ +					 const char *buf,
+ +					 size_t count);
+ +	int			index;
+ +	u8			port_num;
+++=======
++ struct gid_attr_group {
++ 	struct ib_port *port;
++ 	struct kobject kobj;
++ 	struct attribute_group groups[2];
++ 	const struct attribute_group *groups_list[3];
++ 	struct port_table_attribute attrs_list[];
++ };
++ 
++ struct ib_port {
++ 	struct kobject kobj;
++ 	struct ib_device *ibdev;
++ 	struct gid_attr_group *gid_attr_group;
++ 	struct attribute_group gid_group;
++ 	struct attribute_group *pkey_group;
++ 	const struct attribute_group *pma_table;
++ 	struct hw_stats_port_data *hw_stats_data;
++ 	u32 port_num;
++ };
++ 
++ struct hw_stats_device_attribute {
++ 	struct device_attribute attr;
++ 	ssize_t (*show)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			unsigned int index, unsigned int port_num, char *buf);
++ 	ssize_t (*store)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			 unsigned int index, unsigned int port_num,
++ 			 const char *buf, size_t count);
++ };
++ 
++ struct hw_stats_port_attribute {
++ 	struct port_attribute attr;
++ 	ssize_t (*show)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			unsigned int index, unsigned int port_num, char *buf);
++ 	ssize_t (*store)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			 unsigned int index, unsigned int port_num,
++ 			 const char *buf, size_t count);
++ };
++ 
++ struct hw_stats_device_data {
++ 	struct attribute_group group;
++ 	const struct attribute_group *groups[2];
++ 	struct rdma_hw_stats *stats;
++ 	struct hw_stats_device_attribute attrs[];
++ };
++ 
++ struct hw_stats_port_data {
++ 	struct attribute_group group;
++ 	struct rdma_hw_stats *stats;
++ 	struct hw_stats_port_attribute attrs[];
+++>>>>>>> a4676388e2e2 (RDMA/core: Simplify how the gid_attrs sysfs is created)
+  };
+  
+  static ssize_t port_attr_show(struct kobject *kobj,
+@@@ -1044,9 -1161,108 +1085,111 @@@ err_free_stats
+  struct rdma_hw_stats *ib_get_hw_stats_port(struct ib_device *ibdev,
+  					   u32 port_num)
+  {
+ -	if (!ibdev->port_data || !rdma_is_port_valid(ibdev, port_num) ||
+ -	    !ibdev->port_data[port_num].sysfs->hw_stats_data)
+ +	if (!ibdev->port_data || !rdma_is_port_valid(ibdev, port_num))
+  		return NULL;
+++<<<<<<< HEAD
+ +	return ibdev->port_data[port_num].sysfs->hw_stats;
+++=======
++ 	return ibdev->port_data[port_num].sysfs->hw_stats_data->stats;
++ }
++ 
++ static int alloc_port_table_group(
++ 	const char *name, struct attribute_group *group,
++ 	struct port_table_attribute *attrs, size_t num,
++ 	ssize_t (*show)(struct ib_port *, struct port_attribute *, char *buf))
++ {
++ 	struct attribute **attr_list;
++ 	int i;
++ 
++ 	attr_list = kcalloc(num + 1, sizeof(*attr_list), GFP_KERNEL);
++ 	if (!attr_list)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < num; i++) {
++ 		struct port_table_attribute *element = &attrs[i];
++ 
++ 		if (snprintf(element->name, sizeof(element->name), "%d", i) >=
++ 		    sizeof(element->name))
++ 			goto err;
++ 
++ 		sysfs_attr_init(&element->attr.attr);
++ 		element->attr.attr.name = element->name;
++ 		element->attr.attr.mode = 0444;
++ 		element->attr.show = show;
++ 		element->index = i;
++ 
++ 		attr_list[i] = &element->attr.attr;
++ 	}
++ 	group->name = name;
++ 	group->attrs = attr_list;
++ 	return 0;
++ err:
++ 	kfree(attr_list);
++ 	return -EINVAL;
++ }
++ 
++ /*
++  * Create the sysfs:
++  *  ibp0s9/ports/XX/gid_attrs/{ndevs,types}/YYY
++  * YYY is the gid table index in decimal
++  */
++ static int setup_gid_attrs(struct ib_port *port,
++ 			   const struct ib_port_attr *attr)
++ {
++ 	struct gid_attr_group *gid_attr_group;
++ 	int ret;
++ 
++ 	gid_attr_group = kzalloc(struct_size(gid_attr_group, attrs_list,
++ 					     attr->gid_tbl_len * 2),
++ 				 GFP_KERNEL);
++ 	if (!gid_attr_group)
++ 		return -ENOMEM;
++ 	gid_attr_group->port = port;
++ 	kobject_init(&gid_attr_group->kobj, &gid_attr_type);
++ 
++ 	ret = alloc_port_table_group("ndevs", &gid_attr_group->groups[0],
++ 				     gid_attr_group->attrs_list,
++ 				     attr->gid_tbl_len,
++ 				     show_port_gid_attr_ndev);
++ 	if (ret)
++ 		goto err_put;
++ 	gid_attr_group->groups_list[0] = &gid_attr_group->groups[0];
++ 
++ 	ret = alloc_port_table_group(
++ 		"types", &gid_attr_group->groups[1],
++ 		gid_attr_group->attrs_list + attr->gid_tbl_len,
++ 		attr->gid_tbl_len, show_port_gid_attr_gid_type);
++ 	if (ret)
++ 		goto err_put;
++ 	gid_attr_group->groups_list[1] = &gid_attr_group->groups[1];
++ 
++ 	ret = kobject_add(&gid_attr_group->kobj, &port->kobj, "gid_attrs");
++ 	if (ret)
++ 		goto err_put;
++ 	ret = sysfs_create_groups(&gid_attr_group->kobj,
++ 				  gid_attr_group->groups_list);
++ 	if (ret)
++ 		goto err_del;
++ 	port->gid_attr_group = gid_attr_group;
++ 	return 0;
++ 
++ err_del:
++ 	kobject_del(&gid_attr_group->kobj);
++ err_put:
++ 	kobject_put(&gid_attr_group->kobj);
++ 	return ret;
++ }
++ 
++ static void destroy_gid_attrs(struct ib_port *port)
++ {
++ 	struct gid_attr_group *gid_attr_group = port->gid_attr_group;
++ 
++ 	if (!gid_attr_group)
++ 		return;
++ 	sysfs_remove_groups(&gid_attr_group->kobj, gid_attr_group->groups_list);
++ 	kobject_del(&gid_attr_group->kobj);
++ 	kobject_put(&gid_attr_group->kobj);
+++>>>>>>> a4676388e2e2 (RDMA/core: Simplify how the gid_attrs sysfs is created)
+  }
+  
+  static int add_port(struct ib_core_device *coredev, int port_num)
+* Unmerged path drivers/infiniband/core/sysfs.c
