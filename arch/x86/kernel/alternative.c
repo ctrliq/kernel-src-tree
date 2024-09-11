@@ -919,8 +919,14 @@ void text_poke_bp_batch(struct text_poke_loc *tp, unsigned int nr_entries)
 	 * sync_core() implies an smp_mb() and orders this store against
 	 * the writing of the new instruction.
 	 */
-	bp_patching.vec = NULL;
 	bp_patching.nr_entries = 0;
+	/*
+	 * This sync_core () call ensures that all INT3 handlers in progress
+	 * have finished. This allows poke_int3_handler() after this to
+	 * avoid touching bp_paching.vec by checking nr_entries == 0.
+	 */
+	text_poke_sync();
+	bp_patching.vec = NULL;
 }
 
 /**
