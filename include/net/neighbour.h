@@ -151,6 +151,7 @@ struct neighbour {
 	__u8			nud_state;
 	__u8			type;
 	__u8			dead;
+	u8			protocol;
 	seqlock_t		ha_lock;
 	unsigned char		ha[ALIGN(MAX_ADDR_LEN, sizeof(unsigned long))];
 	struct hh_cache		hh;
@@ -177,6 +178,7 @@ struct pneigh_entry {
 	possible_net_t		net;
 	struct net_device	*dev;
 	u8			flags;
+	u8			protocol;
 	u8			key[0];
 };
 
