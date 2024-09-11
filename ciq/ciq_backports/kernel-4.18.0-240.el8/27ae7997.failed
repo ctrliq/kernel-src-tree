@@ -1,0 +1,684 @@
+bpf: Introduce BPF_PROG_TYPE_STRUCT_OPS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 27ae7997a66174cb8afd6a75b3989f5e0c1b9e5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/27ae7997.failed
+
+This patch allows the kernel's struct ops (i.e. func ptr) to be
+implemented in BPF.  The first use case in this series is the
+"struct tcp_congestion_ops" which will be introduced in a
+latter patch.
+
+This patch introduces a new prog type BPF_PROG_TYPE_STRUCT_OPS.
+The BPF_PROG_TYPE_STRUCT_OPS prog is verified against a particular
+func ptr of a kernel struct.  The attr->attach_btf_id is the btf id
+of a kernel struct.  The attr->expected_attach_type is the member
+"index" of that kernel struct.  The first member of a struct starts
+with member index 0.  That will avoid ambiguity when a kernel struct
+has multiple func ptrs with the same func signature.
+
+For example, a BPF_PROG_TYPE_STRUCT_OPS prog is written
+to implement the "init" func ptr of the "struct tcp_congestion_ops".
+The attr->attach_btf_id is the btf id of the "struct tcp_congestion_ops"
+of the _running_ kernel.  The attr->expected_attach_type is 3.
+
+The ctx of BPF_PROG_TYPE_STRUCT_OPS is an array of u64 args saved
+by arch_prepare_bpf_trampoline that will be done in the next
+patch when introducing BPF_MAP_TYPE_STRUCT_OPS.
+
+"struct bpf_struct_ops" is introduced as a common interface for the kernel
+struct that supports BPF_PROG_TYPE_STRUCT_OPS prog.  The supporting kernel
+struct will need to implement an instance of the "struct bpf_struct_ops".
+
+The supporting kernel struct also needs to implement a bpf_verifier_ops.
+During BPF_PROG_LOAD, bpf_struct_ops_find() will find the right
+bpf_verifier_ops by searching the attr->attach_btf_id.
+
+A new "btf_struct_access" is also added to the bpf_verifier_ops such
+that the supporting kernel struct can optionally provide its own specific
+check on accessing the func arg (e.g. provide limited write access).
+
+After btf_vmlinux is parsed, the new bpf_struct_ops_init() is called
+to initialize some values (e.g. the btf id of the supporting kernel
+struct) and it can only be done once the btf_vmlinux is available.
+
+The R0 checks at BPF_EXIT is excluded for the BPF_PROG_TYPE_STRUCT_OPS prog
+if the return type of the prog->aux->attach_func_proto is "void".
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20200109003503.3855825-1-kafai@fb.com
+(cherry picked from commit 27ae7997a66174cb8afd6a75b3989f5e0c1b9e5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/btf.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/btf.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/btf.h
+index 55d43bc856be,f74a09a7120b..000000000000
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@@ -52,7 -53,71 +52,74 @@@ bool btf_member_is_reg_int(const struc
+  			   u32 expected_offset, u32 expected_size);
+  int btf_find_spin_lock(const struct btf *btf, const struct btf_type *t);
+  bool btf_type_is_void(const struct btf_type *t);
++ s32 btf_find_by_name_kind(const struct btf *btf, const char *name, u8 kind);
++ const struct btf_type *btf_type_skip_modifiers(const struct btf *btf,
++ 					       u32 id, u32 *res_id);
++ const struct btf_type *btf_type_resolve_ptr(const struct btf *btf,
++ 					    u32 id, u32 *res_id);
++ const struct btf_type *btf_type_resolve_func_ptr(const struct btf *btf,
++ 						 u32 id, u32 *res_id);
+  
++ #define for_each_member(i, struct_type, member)			\
++ 	for (i = 0, member = btf_type_member(struct_type);	\
++ 	     i < btf_type_vlen(struct_type);			\
++ 	     i++, member++)
++ 
+++<<<<<<< HEAD
+++=======
++ static inline bool btf_type_is_ptr(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_PTR;
++ }
++ 
++ static inline bool btf_type_is_int(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_INT;
++ }
++ 
++ static inline bool btf_type_is_enum(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_ENUM;
++ }
++ 
++ static inline bool btf_type_is_typedef(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_TYPEDEF;
++ }
++ 
++ static inline bool btf_type_is_func(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_FUNC;
++ }
++ 
++ static inline bool btf_type_is_func_proto(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_FUNC_PROTO;
++ }
++ 
++ static inline u16 btf_type_vlen(const struct btf_type *t)
++ {
++ 	return BTF_INFO_VLEN(t->info);
++ }
++ 
++ static inline bool btf_type_kflag(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KFLAG(t->info);
++ }
++ 
++ static inline u32 btf_member_bitfield_size(const struct btf_type *struct_type,
++ 					   const struct btf_member *member)
++ {
++ 	return btf_type_kflag(struct_type) ? BTF_MEMBER_BITFIELD_SIZE(member->offset)
++ 					   : 0;
++ }
++ 
++ static inline const struct btf_member *btf_type_member(const struct btf_type *t)
++ {
++ 	return (const struct btf_member *)(t + 1);
++ }
++ 
+++>>>>>>> 27ae7997a661 (bpf: Introduce BPF_PROG_TYPE_STRUCT_OPS)
+  #ifdef CONFIG_BPF_SYSCALL
+  const struct btf_type *btf_type_by_id(const struct btf *btf, u32 type_id);
+  const char *btf_name_by_offset(const struct btf *btf, u32 offset);
+diff --cc include/uapi/linux/bpf.h
+index f26f93a554f1,c1eeb3e0e116..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -175,7 -173,8 +175,12 @@@ enum bpf_prog_type 
+  	BPF_PROG_TYPE_CGROUP_SYSCTL,
+  	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
+  	BPF_PROG_TYPE_CGROUP_SOCKOPT,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_PROG_TYPE_TRACING,
++ 	BPF_PROG_TYPE_STRUCT_OPS,
+++>>>>>>> 27ae7997a661 (bpf: Introduce BPF_PROG_TYPE_STRUCT_OPS)
+  };
+  
+  enum bpf_attach_type {
+diff --cc kernel/bpf/btf.c
+index fef5ecb3622e,12af4a1bb1a4..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -3499,6 -3617,28 +3531,31 @@@ struct btf *btf_parse_vmlinux(void
+  	if (err)
+  		goto errout;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* find struct bpf_ctx_convert for type checking later */
++ 	for (i = 1; i <= btf->nr_types; i++) {
++ 		const struct btf_type *t;
++ 		const char *tname;
++ 
++ 		t = btf_type_by_id(btf, i);
++ 		if (!__btf_type_is_struct(t))
++ 			continue;
++ 		tname = __btf_name_by_offset(btf, t->name_off);
++ 		if (!strcmp(tname, "bpf_ctx_convert")) {
++ 			/* btf_parse_vmlinux() runs under bpf_verifier_lock */
++ 			bpf_ctx_convert.t = t;
++ 			break;
++ 		}
++ 	}
++ 	if (i > btf->nr_types) {
++ 		err = -ENOENT;
++ 		goto errout;
++ 	}
++ 
++ 	bpf_struct_ops_init(btf);
++ 
+++>>>>>>> 27ae7997a661 (bpf: Introduce BPF_PROG_TYPE_STRUCT_OPS)
+  	btf_verifier_env_free(env);
+  	refcount_set(&btf->refcnt, 1);
+  	return btf;
+diff --cc kernel/bpf/syscall.c
+index 4aa6a47aa4b8,03a02ef4c496..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1632,20 -1668,26 +1632,35 @@@ static void bpf_prog_load_fixup_attach_
+  }
+  
+  static int
+ -bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ -			   enum bpf_attach_type expected_attach_type,
+ -			   u32 btf_id, u32 prog_fd)
+ +bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
+ +				enum bpf_attach_type expected_attach_type)
+  {
+++<<<<<<< HEAD
+ +	switch (prog_type) {
+ +	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+ +		if (btf_id > BTF_MAX_TYPE)
+ +			return -EINVAL;
+ +		break;
+ +	default:
+ +		if (btf_id)
+++=======
++ 	if (btf_id) {
++ 		if (btf_id > BTF_MAX_TYPE)
+  			return -EINVAL;
+- 		break;
++ 
++ 		switch (prog_type) {
++ 		case BPF_PROG_TYPE_TRACING:
++ 		case BPF_PROG_TYPE_STRUCT_OPS:
++ 			break;
++ 		default:
+++>>>>>>> 27ae7997a661 (bpf: Introduce BPF_PROG_TYPE_STRUCT_OPS)
++ 			return -EINVAL;
++ 		}
+  	}
+  
++ 	if (prog_fd && prog_type != BPF_PROG_TYPE_TRACING)
++ 		return -EINVAL;
++ 
+  	switch (prog_type) {
+  	case BPF_PROG_TYPE_CGROUP_SOCK:
+  		switch (expected_attach_type) {
+diff --cc kernel/bpf/verifier.c
+index a2c1dcade9ad,586ed3c94b80..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -9533,6 -9521,219 +9552,222 @@@ static void print_verification_stats(st
+  		env->peak_states, env->longest_mark_read_walk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
++ {
++ 	const struct btf_type *t, *func_proto;
++ 	const struct bpf_struct_ops *st_ops;
++ 	const struct btf_member *member;
++ 	struct bpf_prog *prog = env->prog;
++ 	u32 btf_id, member_idx;
++ 	const char *mname;
++ 
++ 	btf_id = prog->aux->attach_btf_id;
++ 	st_ops = bpf_struct_ops_find(btf_id);
++ 	if (!st_ops) {
++ 		verbose(env, "attach_btf_id %u is not a supported struct\n",
++ 			btf_id);
++ 		return -ENOTSUPP;
++ 	}
++ 
++ 	t = st_ops->type;
++ 	member_idx = prog->expected_attach_type;
++ 	if (member_idx >= btf_type_vlen(t)) {
++ 		verbose(env, "attach to invalid member idx %u of struct %s\n",
++ 			member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	member = &btf_type_member(t)[member_idx];
++ 	mname = btf_name_by_offset(btf_vmlinux, member->name_off);
++ 	func_proto = btf_type_resolve_func_ptr(btf_vmlinux, member->type,
++ 					       NULL);
++ 	if (!func_proto) {
++ 		verbose(env, "attach to invalid member %s(@idx %u) of struct %s\n",
++ 			mname, member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (st_ops->check_member) {
++ 		int err = st_ops->check_member(t, member);
++ 
++ 		if (err) {
++ 			verbose(env, "attach to unsupported member %s of struct %s\n",
++ 				mname, st_ops->name);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	prog->aux->attach_func_proto = func_proto;
++ 	prog->aux->attach_func_name = mname;
++ 	env->ops = st_ops->verifier_ops;
++ 
++ 	return 0;
++ }
++ 
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
++ 	u32 btf_id = prog->aux->attach_btf_id;
++ 	const char prefix[] = "btf_trace_";
++ 	int ret = 0, subprog = -1, i;
++ 	struct bpf_trampoline *tr;
++ 	const struct btf_type *t;
++ 	bool conservative = true;
++ 	const char *tname;
++ 	struct btf *btf;
++ 	long addr;
++ 	u64 key;
++ 
++ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
++ 		return check_struct_ops_btf_id(env);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING)
++ 		return 0;
++ 
++ 	if (!btf_id) {
++ 		verbose(env, "Tracing programs must provide btf_id\n");
++ 		return -EINVAL;
++ 	}
++ 	btf = bpf_prog_get_target_btf(prog);
++ 	if (!btf) {
++ 		verbose(env,
++ 			"FENTRY/FEXIT program can only be attached to another program annotated with BTF\n");
++ 		return -EINVAL;
++ 	}
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t) {
++ 		verbose(env, "attach_btf_id %u is invalid\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 	if (!tname) {
++ 		verbose(env, "attach_btf_id %u doesn't have a name\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	if (tgt_prog) {
++ 		struct bpf_prog_aux *aux = tgt_prog->aux;
++ 
++ 		for (i = 0; i < aux->func_info_cnt; i++)
++ 			if (aux->func_info[i].type_id == btf_id) {
++ 				subprog = i;
++ 				break;
++ 			}
++ 		if (subprog == -1) {
++ 			verbose(env, "Subprog %s doesn't exist\n", tname);
++ 			return -EINVAL;
++ 		}
++ 		conservative = aux->func_info_aux[subprog].unreliable;
++ 		key = ((u64)aux->id) << 32 | btf_id;
++ 	} else {
++ 		key = btf_id;
++ 	}
++ 
++ 	switch (prog->expected_attach_type) {
++ 	case BPF_TRACE_RAW_TP:
++ 		if (tgt_prog) {
++ 			verbose(env,
++ 				"Only FENTRY/FEXIT progs are attachable to another BPF prog\n");
++ 			return -EINVAL;
++ 		}
++ 		if (!btf_type_is_typedef(t)) {
++ 			verbose(env, "attach_btf_id %u is not a typedef\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (strncmp(prefix, tname, sizeof(prefix) - 1)) {
++ 			verbose(env, "attach_btf_id %u points to wrong type name %s\n",
++ 				btf_id, tname);
++ 			return -EINVAL;
++ 		}
++ 		tname += sizeof(prefix) - 1;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_ptr(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 
++ 		/* remember two read only pointers that are valid for
++ 		 * the life time of the kernel
++ 		 */
++ 		prog->aux->attach_func_name = tname;
++ 		prog->aux->attach_func_proto = t;
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	case BPF_TRACE_FENTRY:
++ 	case BPF_TRACE_FEXIT:
++ 		if (!btf_type_is_func(t)) {
++ 			verbose(env, "attach_btf_id %u is not a function\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			return -EINVAL;
++ 		tr = bpf_trampoline_lookup(key);
++ 		if (!tr)
++ 			return -ENOMEM;
++ 		prog->aux->attach_func_name = tname;
++ 		/* t is either vmlinux type or another program's type */
++ 		prog->aux->attach_func_proto = t;
++ 		mutex_lock(&tr->mutex);
++ 		if (tr->func.addr) {
++ 			prog->aux->trampoline = tr;
++ 			goto out;
++ 		}
++ 		if (tgt_prog && conservative) {
++ 			prog->aux->attach_func_proto = NULL;
++ 			t = NULL;
++ 		}
++ 		ret = btf_distill_func_proto(&env->log, btf, t,
++ 					     tname, &tr->func.model);
++ 		if (ret < 0)
++ 			goto out;
++ 		if (tgt_prog) {
++ 			if (!tgt_prog->jited) {
++ 				/* for now */
++ 				verbose(env, "Can trace only JITed BPF progs\n");
++ 				ret = -EINVAL;
++ 				goto out;
++ 			}
++ 			if (tgt_prog->type == BPF_PROG_TYPE_TRACING) {
++ 				/* prevent cycles */
++ 				verbose(env, "Cannot recursively attach\n");
++ 				ret = -EINVAL;
++ 				goto out;
++ 			}
++ 			if (subprog == 0)
++ 				addr = (long) tgt_prog->bpf_func;
++ 			else
++ 				addr = (long) tgt_prog->aux->func[subprog]->bpf_func;
++ 		} else {
++ 			addr = kallsyms_lookup_name(tname);
++ 			if (!addr) {
++ 				verbose(env,
++ 					"The address of function %s cannot be found\n",
++ 					tname);
++ 				ret = -ENOENT;
++ 				goto out;
++ 			}
++ 		}
++ 		tr->func.addr = (void *)addr;
++ 		prog->aux->trampoline = tr;
++ out:
++ 		mutex_unlock(&tr->mutex);
++ 		if (ret)
++ 			bpf_trampoline_put(tr);
++ 		return ret;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 27ae7997a661 (bpf: Introduce BPF_PROG_TYPE_STRUCT_OPS)
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+  	      union bpf_attr __user *uattr)
+  {
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 602dd6841705..5ef12553305e 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -343,6 +343,10 @@ struct bpf_verifier_ops {
+ 				  const struct bpf_insn *src,
+ 				  struct bpf_insn *dst,
+ 				  struct bpf_prog *prog, u32 *target_size);
++	int (*btf_struct_access)(struct bpf_verifier_log *log,
++				 const struct btf_type *t, int off, int size,
++				 enum bpf_access_type atype,
++				 u32 *next_btf_id);
+ };
+ 
+ struct bpf_prog_offload_ops {
+@@ -462,6 +466,32 @@ struct bpf_array_aux {
+ 	bool jited;
+ };
+ 
++struct btf_type;
++struct btf_member;
++
++#define BPF_STRUCT_OPS_MAX_NR_MEMBERS 64
++struct bpf_struct_ops {
++	const struct bpf_verifier_ops *verifier_ops;
++	int (*init)(struct btf *btf);
++	int (*check_member)(const struct btf_type *t,
++			    const struct btf_member *member);
++	const struct btf_type *type;
++	const char *name;
++	struct btf_func_model func_models[BPF_STRUCT_OPS_MAX_NR_MEMBERS];
++	u32 type_id;
++};
++
++#if defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_SYSCALL)
++const struct bpf_struct_ops *bpf_struct_ops_find(u32 type_id);
++void bpf_struct_ops_init(struct btf *btf);
++#else
++static inline const struct bpf_struct_ops *bpf_struct_ops_find(u32 type_id)
++{
++	return NULL;
++}
++static inline void bpf_struct_ops_init(struct btf *btf) { }
++#endif
++
+ struct bpf_array {
+ 	struct bpf_map map;
+ 	u32 elem_size;
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index eec5aeeeaf92..c13cd748f406 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -38,6 +38,10 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LIRC_MODE2, lirc_mode2)
+ #ifdef CONFIG_INET
+ BPF_PROG_TYPE(BPF_PROG_TYPE_SK_REUSEPORT, sk_reuseport)
+ #endif
++#if defined(CONFIG_BPF_JIT)
++BPF_PROG_TYPE(BPF_PROG_TYPE_STRUCT_OPS, bpf_struct_ops,
++	      void *, void *)
++#endif
+ 
+ BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
+* Unmerged path include/linux/btf.h
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index e1d9adb212f9..99e4f31d9727 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -25,3 +25,6 @@ endif
+ ifeq ($(CONFIG_SYSFS),y)
+ obj-$(CONFIG_DEBUG_INFO_BTF) += sysfs_btf.o
+ endif
++ifeq ($(CONFIG_BPF_JIT),y)
++obj-$(CONFIG_BPF_SYSCALL) += bpf_struct_ops.o
++endif
+diff --git a/kernel/bpf/bpf_struct_ops.c b/kernel/bpf/bpf_struct_ops.c
+new file mode 100644
+index 000000000000..2ea68fe34c33
+--- /dev/null
++++ b/kernel/bpf/bpf_struct_ops.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (c) 2019 Facebook */
++
++#include <linux/bpf.h>
++#include <linux/bpf_verifier.h>
++#include <linux/btf.h>
++#include <linux/filter.h>
++#include <linux/slab.h>
++#include <linux/numa.h>
++#include <linux/seq_file.h>
++#include <linux/refcount.h>
++
++#define BPF_STRUCT_OPS_TYPE(_name)				\
++extern struct bpf_struct_ops bpf_##_name;
++#include "bpf_struct_ops_types.h"
++#undef BPF_STRUCT_OPS_TYPE
++
++enum {
++#define BPF_STRUCT_OPS_TYPE(_name) BPF_STRUCT_OPS_TYPE_##_name,
++#include "bpf_struct_ops_types.h"
++#undef BPF_STRUCT_OPS_TYPE
++	__NR_BPF_STRUCT_OPS_TYPE,
++};
++
++static struct bpf_struct_ops * const bpf_struct_ops[] = {
++#define BPF_STRUCT_OPS_TYPE(_name)				\
++	[BPF_STRUCT_OPS_TYPE_##_name] = &bpf_##_name,
++#include "bpf_struct_ops_types.h"
++#undef BPF_STRUCT_OPS_TYPE
++};
++
++const struct bpf_verifier_ops bpf_struct_ops_verifier_ops = {
++};
++
++const struct bpf_prog_ops bpf_struct_ops_prog_ops = {
++};
++
++void bpf_struct_ops_init(struct btf *btf)
++{
++	const struct btf_member *member;
++	struct bpf_struct_ops *st_ops;
++	struct bpf_verifier_log log = {};
++	const struct btf_type *t;
++	const char *mname;
++	s32 type_id;
++	u32 i, j;
++
++	for (i = 0; i < ARRAY_SIZE(bpf_struct_ops); i++) {
++		st_ops = bpf_struct_ops[i];
++
++		type_id = btf_find_by_name_kind(btf, st_ops->name,
++						BTF_KIND_STRUCT);
++		if (type_id < 0) {
++			pr_warn("Cannot find struct %s in btf_vmlinux\n",
++				st_ops->name);
++			continue;
++		}
++		t = btf_type_by_id(btf, type_id);
++		if (btf_type_vlen(t) > BPF_STRUCT_OPS_MAX_NR_MEMBERS) {
++			pr_warn("Cannot support #%u members in struct %s\n",
++				btf_type_vlen(t), st_ops->name);
++			continue;
++		}
++
++		for_each_member(j, t, member) {
++			const struct btf_type *func_proto;
++
++			mname = btf_name_by_offset(btf, member->name_off);
++			if (!*mname) {
++				pr_warn("anon member in struct %s is not supported\n",
++					st_ops->name);
++				break;
++			}
++
++			if (btf_member_bitfield_size(t, member)) {
++				pr_warn("bit field member %s in struct %s is not supported\n",
++					mname, st_ops->name);
++				break;
++			}
++
++			func_proto = btf_type_resolve_func_ptr(btf,
++							       member->type,
++							       NULL);
++			if (func_proto &&
++			    btf_distill_func_proto(&log, btf,
++						   func_proto, mname,
++						   &st_ops->func_models[j])) {
++				pr_warn("Error in parsing func ptr %s in struct %s\n",
++					mname, st_ops->name);
++				break;
++			}
++		}
++
++		if (j == btf_type_vlen(t)) {
++			if (st_ops->init(btf)) {
++				pr_warn("Error in init bpf_struct_ops %s\n",
++					st_ops->name);
++			} else {
++				st_ops->type_id = type_id;
++				st_ops->type = t;
++			}
++		}
++	}
++}
++
++extern struct btf *btf_vmlinux;
++
++const struct bpf_struct_ops *bpf_struct_ops_find(u32 type_id)
++{
++	unsigned int i;
++
++	if (!type_id || !btf_vmlinux)
++		return NULL;
++
++	for (i = 0; i < ARRAY_SIZE(bpf_struct_ops); i++) {
++		if (bpf_struct_ops[i]->type_id == type_id)
++			return bpf_struct_ops[i];
++	}
++
++	return NULL;
++}
+diff --git a/kernel/bpf/bpf_struct_ops_types.h b/kernel/bpf/bpf_struct_ops_types.h
+new file mode 100644
+index 000000000000..7bb13ff49ec2
+--- /dev/null
++++ b/kernel/bpf/bpf_struct_ops_types.h
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* internal file - do not include directly */
++
++/* To be filled in a later patch */
+* Unmerged path kernel/bpf/btf.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
