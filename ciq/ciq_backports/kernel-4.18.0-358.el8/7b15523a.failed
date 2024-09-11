@@ -1,0 +1,633 @@
+bpf: Add a bpf_snprintf helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Florent Revest <revest@chromium.org>
+commit 7b15523a989b63927c2bb08e9b5b0bbc10b58bef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/7b15523a.failed
+
+The implementation takes inspiration from the existing bpf_trace_printk
+helper but there are a few differences:
+
+To allow for a large number of format-specifiers, parameters are
+provided in an array, like in bpf_seq_printf.
+
+Because the output string takes two arguments and the array of
+parameters also takes two arguments, the format string needs to fit in
+one argument. Thankfully, ARG_PTR_TO_CONST_STR is guaranteed to point to
+a zero-terminated read-only map so we don't need a format string length
+arg.
+
+Because the format-string is known at verification time, we also do
+a first pass of format string validation in the verifier logic. This
+makes debugging easier.
+
+	Signed-off-by: Florent Revest <revest@chromium.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210419155243.1632274-4-revest@chromium.org
+(cherry picked from commit 7b15523a989b63927c2bb08e9b5b0bbc10b58bef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/helpers.c
+#	kernel/bpf/verifier.c
+#	kernel/trace/bpf_trace.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index e93d175f6d86,ec6d85a81744..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -4683,6 -4680,61 +4683,64 @@@ union bpf_attr 
+   *		* **BPF_MTU_CHK_RET_FRAG_NEEDED**
+   *		* **BPF_MTU_CHK_RET_SEGS_TOOBIG**
+   *
+++<<<<<<< HEAD
+++=======
++  * long bpf_for_each_map_elem(struct bpf_map *map, void *callback_fn, void *callback_ctx, u64 flags)
++  *	Description
++  *		For each element in **map**, call **callback_fn** function with
++  *		**map**, **callback_ctx** and other map-specific parameters.
++  *		The **callback_fn** should be a static function and
++  *		the **callback_ctx** should be a pointer to the stack.
++  *		The **flags** is used to control certain aspects of the helper.
++  *		Currently, the **flags** must be 0.
++  *
++  *		The following are a list of supported map types and their
++  *		respective expected callback signatures:
++  *
++  *		BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_HASH,
++  *		BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_LRU_PERCPU_HASH,
++  *		BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY
++  *
++  *		long (\*callback_fn)(struct bpf_map \*map, const void \*key, void \*value, void \*ctx);
++  *
++  *		For per_cpu maps, the map_value is the value on the cpu where the
++  *		bpf_prog is running.
++  *
++  *		If **callback_fn** return 0, the helper will continue to the next
++  *		element. If return value is 1, the helper will skip the rest of
++  *		elements and return. Other return values are not used now.
++  *
++  *	Return
++  *		The number of traversed map elements for success, **-EINVAL** for
++  *		invalid **flags**.
++  *
++  * long bpf_snprintf(char *str, u32 str_size, const char *fmt, u64 *data, u32 data_len)
++  *	Description
++  *		Outputs a string into the **str** buffer of size **str_size**
++  *		based on a format string stored in a read-only map pointed by
++  *		**fmt**.
++  *
++  *		Each format specifier in **fmt** corresponds to one u64 element
++  *		in the **data** array. For strings and pointers where pointees
++  *		are accessed, only the pointer values are stored in the *data*
++  *		array. The *data_len* is the size of *data* in bytes.
++  *
++  *		Formats **%s** and **%p{i,I}{4,6}** require to read kernel
++  *		memory. Reading kernel memory may fail due to either invalid
++  *		address or valid address but requiring a major memory fault. If
++  *		reading kernel memory fails, the string for **%s** will be an
++  *		empty string, and the ip address for **%p{i,I}{4,6}** will be 0.
++  *		Not returning error to bpf program is consistent with what
++  *		**bpf_trace_printk**\ () does for now.
++  *
++  *	Return
++  *		The strictly positive length of the formatted string, including
++  *		the trailing zero character. If the return value is greater than
++  *		**str_size**, **str** contains a truncated string, guaranteed to
++  *		be zero-terminated except when **str_size** is 0.
++  *
++  *		Or **-EBUSY** if the per-CPU memory copy buffer is busy.
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -4849,6 -4901,8 +4907,11 @@@
+  	FN(ima_inode_hash),		\
+  	FN(sock_from_file),		\
+  	FN(check_mtu),			\
+++<<<<<<< HEAD
+++=======
++ 	FN(for_each_map_elem),		\
++ 	FN(snprintf),			\
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+  	/* */
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --cc kernel/bpf/helpers.c
+index cc97656102f8,85b26ca5aacd..000000000000
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@@ -670,6 -669,310 +670,313 @@@ const struct bpf_func_proto bpf_this_cp
+  	.arg1_type	= ARG_PTR_TO_PERCPU_BTF_ID,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int bpf_trace_copy_string(char *buf, void *unsafe_ptr, char fmt_ptype,
++ 		size_t bufsz)
++ {
++ 	void __user *user_ptr = (__force void __user *)unsafe_ptr;
++ 
++ 	buf[0] = 0;
++ 
++ 	switch (fmt_ptype) {
++ 	case 's':
++ #ifdef CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
++ 		if ((unsigned long)unsafe_ptr < TASK_SIZE)
++ 			return strncpy_from_user_nofault(buf, user_ptr, bufsz);
++ 		fallthrough;
++ #endif
++ 	case 'k':
++ 		return strncpy_from_kernel_nofault(buf, unsafe_ptr, bufsz);
++ 	case 'u':
++ 		return strncpy_from_user_nofault(buf, user_ptr, bufsz);
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ /* Per-cpu temp buffers which can be used by printf-like helpers for %s or %p
++  */
++ #define MAX_PRINTF_BUF_LEN	512
++ 
++ struct bpf_printf_buf {
++ 	char tmp_buf[MAX_PRINTF_BUF_LEN];
++ };
++ static DEFINE_PER_CPU(struct bpf_printf_buf, bpf_printf_buf);
++ static DEFINE_PER_CPU(int, bpf_printf_buf_used);
++ 
++ static int try_get_fmt_tmp_buf(char **tmp_buf)
++ {
++ 	struct bpf_printf_buf *bufs;
++ 	int used;
++ 
++ 	if (*tmp_buf)
++ 		return 0;
++ 
++ 	preempt_disable();
++ 	used = this_cpu_inc_return(bpf_printf_buf_used);
++ 	if (WARN_ON_ONCE(used > 1)) {
++ 		this_cpu_dec(bpf_printf_buf_used);
++ 		preempt_enable();
++ 		return -EBUSY;
++ 	}
++ 	bufs = this_cpu_ptr(&bpf_printf_buf);
++ 	*tmp_buf = bufs->tmp_buf;
++ 
++ 	return 0;
++ }
++ 
++ void bpf_printf_cleanup(void)
++ {
++ 	if (this_cpu_read(bpf_printf_buf_used)) {
++ 		this_cpu_dec(bpf_printf_buf_used);
++ 		preempt_enable();
++ 	}
++ }
++ 
++ /*
++  * bpf_parse_fmt_str - Generic pass on format strings for printf-like helpers
++  *
++  * Returns a negative value if fmt is an invalid format string or 0 otherwise.
++  *
++  * This can be used in two ways:
++  * - Format string verification only: when final_args and mod are NULL
++  * - Arguments preparation: in addition to the above verification, it writes in
++  *   final_args a copy of raw_args where pointers from BPF have been sanitized
++  *   into pointers safe to use by snprintf. This also writes in the mod array
++  *   the size requirement of each argument, usable by BPF_CAST_FMT_ARG for ex.
++  *
++  * In argument preparation mode, if 0 is returned, safe temporary buffers are
++  * allocated and bpf_printf_cleanup should be called to free them after use.
++  */
++ int bpf_printf_prepare(char *fmt, u32 fmt_size, const u64 *raw_args,
++ 			u64 *final_args, enum bpf_printf_mod_type *mod,
++ 			u32 num_args)
++ {
++ 	char *unsafe_ptr = NULL, *tmp_buf = NULL, *fmt_end;
++ 	size_t tmp_buf_len = MAX_PRINTF_BUF_LEN;
++ 	int err, i, num_spec = 0, copy_size;
++ 	enum bpf_printf_mod_type cur_mod;
++ 	u64 cur_arg;
++ 	char fmt_ptype;
++ 
++ 	if (!!final_args != !!mod)
++ 		return -EINVAL;
++ 
++ 	fmt_end = strnchr(fmt, fmt_size, 0);
++ 	if (!fmt_end)
++ 		return -EINVAL;
++ 	fmt_size = fmt_end - fmt;
++ 
++ 	for (i = 0; i < fmt_size; i++) {
++ 		if ((!isprint(fmt[i]) && !isspace(fmt[i])) || !isascii(fmt[i])) {
++ 			err = -EINVAL;
++ 			goto cleanup;
++ 		}
++ 
++ 		if (fmt[i] != '%')
++ 			continue;
++ 
++ 		if (fmt[i + 1] == '%') {
++ 			i++;
++ 			continue;
++ 		}
++ 
++ 		if (num_spec >= num_args) {
++ 			err = -EINVAL;
++ 			goto cleanup;
++ 		}
++ 
++ 		/* The string is zero-terminated so if fmt[i] != 0, we can
++ 		 * always access fmt[i + 1], in the worst case it will be a 0
++ 		 */
++ 		i++;
++ 
++ 		/* skip optional "[0 +-][num]" width formatting field */
++ 		while (fmt[i] == '0' || fmt[i] == '+'  || fmt[i] == '-' ||
++ 		       fmt[i] == ' ')
++ 			i++;
++ 		if (fmt[i] >= '1' && fmt[i] <= '9') {
++ 			i++;
++ 			while (fmt[i] >= '0' && fmt[i] <= '9')
++ 				i++;
++ 		}
++ 
++ 		if (fmt[i] == 'p') {
++ 			cur_mod = BPF_PRINTF_LONG;
++ 
++ 			if ((fmt[i + 1] == 'k' || fmt[i + 1] == 'u') &&
++ 			    fmt[i + 2] == 's') {
++ 				fmt_ptype = fmt[i + 1];
++ 				i += 2;
++ 				goto fmt_str;
++ 			}
++ 
++ 			if (fmt[i + 1] == 0 || isspace(fmt[i + 1]) ||
++ 			    ispunct(fmt[i + 1]) || fmt[i + 1] == 'K' ||
++ 			    fmt[i + 1] == 'x' || fmt[i + 1] == 'B' ||
++ 			    fmt[i + 1] == 's' || fmt[i + 1] == 'S') {
++ 				/* just kernel pointers */
++ 				if (final_args)
++ 					cur_arg = raw_args[num_spec];
++ 				goto fmt_next;
++ 			}
++ 
++ 			/* only support "%pI4", "%pi4", "%pI6" and "%pi6". */
++ 			if ((fmt[i + 1] != 'i' && fmt[i + 1] != 'I') ||
++ 			    (fmt[i + 2] != '4' && fmt[i + 2] != '6')) {
++ 				err = -EINVAL;
++ 				goto cleanup;
++ 			}
++ 
++ 			i += 2;
++ 			if (!final_args)
++ 				goto fmt_next;
++ 
++ 			if (try_get_fmt_tmp_buf(&tmp_buf)) {
++ 				err = -EBUSY;
++ 				goto out;
++ 			}
++ 
++ 			copy_size = (fmt[i + 2] == '4') ? 4 : 16;
++ 			if (tmp_buf_len < copy_size) {
++ 				err = -ENOSPC;
++ 				goto cleanup;
++ 			}
++ 
++ 			unsafe_ptr = (char *)(long)raw_args[num_spec];
++ 			err = copy_from_kernel_nofault(tmp_buf, unsafe_ptr,
++ 						       copy_size);
++ 			if (err < 0)
++ 				memset(tmp_buf, 0, copy_size);
++ 			cur_arg = (u64)(long)tmp_buf;
++ 			tmp_buf += copy_size;
++ 			tmp_buf_len -= copy_size;
++ 
++ 			goto fmt_next;
++ 		} else if (fmt[i] == 's') {
++ 			cur_mod = BPF_PRINTF_LONG;
++ 			fmt_ptype = fmt[i];
++ fmt_str:
++ 			if (fmt[i + 1] != 0 &&
++ 			    !isspace(fmt[i + 1]) &&
++ 			    !ispunct(fmt[i + 1])) {
++ 				err = -EINVAL;
++ 				goto cleanup;
++ 			}
++ 
++ 			if (!final_args)
++ 				goto fmt_next;
++ 
++ 			if (try_get_fmt_tmp_buf(&tmp_buf)) {
++ 				err = -EBUSY;
++ 				goto out;
++ 			}
++ 
++ 			if (!tmp_buf_len) {
++ 				err = -ENOSPC;
++ 				goto cleanup;
++ 			}
++ 
++ 			unsafe_ptr = (char *)(long)raw_args[num_spec];
++ 			err = bpf_trace_copy_string(tmp_buf, unsafe_ptr,
++ 						    fmt_ptype, tmp_buf_len);
++ 			if (err < 0) {
++ 				tmp_buf[0] = '\0';
++ 				err = 1;
++ 			}
++ 
++ 			cur_arg = (u64)(long)tmp_buf;
++ 			tmp_buf += err;
++ 			tmp_buf_len -= err;
++ 
++ 			goto fmt_next;
++ 		}
++ 
++ 		cur_mod = BPF_PRINTF_INT;
++ 
++ 		if (fmt[i] == 'l') {
++ 			cur_mod = BPF_PRINTF_LONG;
++ 			i++;
++ 		}
++ 		if (fmt[i] == 'l') {
++ 			cur_mod = BPF_PRINTF_LONG_LONG;
++ 			i++;
++ 		}
++ 
++ 		if (fmt[i] != 'i' && fmt[i] != 'd' && fmt[i] != 'u' &&
++ 		    fmt[i] != 'x' && fmt[i] != 'X') {
++ 			err = -EINVAL;
++ 			goto cleanup;
++ 		}
++ 
++ 		if (final_args)
++ 			cur_arg = raw_args[num_spec];
++ fmt_next:
++ 		if (final_args) {
++ 			mod[num_spec] = cur_mod;
++ 			final_args[num_spec] = cur_arg;
++ 		}
++ 		num_spec++;
++ 	}
++ 
++ 	err = 0;
++ cleanup:
++ 	if (err)
++ 		bpf_printf_cleanup();
++ out:
++ 	return err;
++ }
++ 
++ #define MAX_SNPRINTF_VARARGS		12
++ 
++ BPF_CALL_5(bpf_snprintf, char *, str, u32, str_size, char *, fmt,
++ 	   const void *, data, u32, data_len)
++ {
++ 	enum bpf_printf_mod_type mod[MAX_SNPRINTF_VARARGS];
++ 	u64 args[MAX_SNPRINTF_VARARGS];
++ 	int err, num_args;
++ 
++ 	if (data_len % 8 || data_len > MAX_SNPRINTF_VARARGS * 8 ||
++ 	    (data_len && !data))
++ 		return -EINVAL;
++ 	num_args = data_len / 8;
++ 
++ 	/* ARG_PTR_TO_CONST_STR guarantees that fmt is zero-terminated so we
++ 	 * can safely give an unbounded size.
++ 	 */
++ 	err = bpf_printf_prepare(fmt, UINT_MAX, data, args, mod, num_args);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	/* Maximumly we can have MAX_SNPRINTF_VARARGS parameters, just give
++ 	 * all of them to snprintf().
++ 	 */
++ 	err = snprintf(str, str_size, fmt, BPF_CAST_FMT_ARG(0, args, mod),
++ 		BPF_CAST_FMT_ARG(1, args, mod), BPF_CAST_FMT_ARG(2, args, mod),
++ 		BPF_CAST_FMT_ARG(3, args, mod), BPF_CAST_FMT_ARG(4, args, mod),
++ 		BPF_CAST_FMT_ARG(5, args, mod), BPF_CAST_FMT_ARG(6, args, mod),
++ 		BPF_CAST_FMT_ARG(7, args, mod), BPF_CAST_FMT_ARG(8, args, mod),
++ 		BPF_CAST_FMT_ARG(9, args, mod), BPF_CAST_FMT_ARG(10, args, mod),
++ 		BPF_CAST_FMT_ARG(11, args, mod));
++ 
++ 	bpf_printf_cleanup();
++ 
++ 	return err + 1;
++ }
++ 
++ const struct bpf_func_proto bpf_snprintf_proto = {
++ 	.func		= bpf_snprintf,
++ 	.gpl_only	= true,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_MEM_OR_NULL,
++ 	.arg2_type	= ARG_CONST_SIZE_OR_ZERO,
++ 	.arg3_type	= ARG_PTR_TO_CONST_STR,
++ 	.arg4_type	= ARG_PTR_TO_MEM_OR_NULL,
++ 	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
++ };
++ 
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+  const struct bpf_func_proto bpf_get_current_task_proto __weak;
+  const struct bpf_func_proto bpf_probe_read_user_proto __weak;
+  const struct bpf_func_proto bpf_probe_read_user_str_proto __weak;
+diff --cc kernel/bpf/verifier.c
+index 3c2ee850da6c,994ef36c5f60..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -5563,7 -5918,43 +5563,47 @@@ static int check_reference_leak(struct 
+  	return state->acquired_refs ? -EINVAL : 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn_idx)
+++=======
++ static int check_bpf_snprintf_call(struct bpf_verifier_env *env,
++ 				   struct bpf_reg_state *regs)
++ {
++ 	struct bpf_reg_state *fmt_reg = &regs[BPF_REG_3];
++ 	struct bpf_reg_state *data_len_reg = &regs[BPF_REG_5];
++ 	struct bpf_map *fmt_map = fmt_reg->map_ptr;
++ 	int err, fmt_map_off, num_args;
++ 	u64 fmt_addr;
++ 	char *fmt;
++ 
++ 	/* data must be an array of u64 */
++ 	if (data_len_reg->var_off.value % 8)
++ 		return -EINVAL;
++ 	num_args = data_len_reg->var_off.value / 8;
++ 
++ 	/* fmt being ARG_PTR_TO_CONST_STR guarantees that var_off is const
++ 	 * and map_direct_value_addr is set.
++ 	 */
++ 	fmt_map_off = fmt_reg->off + fmt_reg->var_off.value;
++ 	err = fmt_map->ops->map_direct_value_addr(fmt_map, &fmt_addr,
++ 						  fmt_map_off);
++ 	if (err)
++ 		return err;
++ 	fmt = (char *)(long)fmt_addr + fmt_map_off;
++ 
++ 	/* We are also guaranteed that fmt+fmt_map_off is NULL terminated, we
++ 	 * can focus on validating the format specifiers.
++ 	 */
++ 	err = bpf_printf_prepare(fmt, UINT_MAX, NULL, NULL, NULL, num_args);
++ 	if (err < 0)
++ 		verbose(env, "Invalid format string\n");
++ 
++ 	return err;
++ }
++ 
++ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
++ 			     int *insn_idx_p)
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+  {
+  	const struct bpf_func_proto *fn = NULL;
+  	struct bpf_reg_state *regs;
+@@@ -5667,6 -6060,19 +5707,22 @@@
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (func_id == BPF_FUNC_for_each_map_elem) {
++ 		err = __check_func_call(env, insn, insn_idx_p, meta.subprogno,
++ 					set_map_elem_callback_state);
++ 		if (err < 0)
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (func_id == BPF_FUNC_snprintf) {
++ 		err = check_bpf_snprintf_call(env, regs);
++ 		if (err < 0)
++ 			return err;
++ 	}
++ 
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+  	/* reset caller saved regs */
+  	for (i = 0; i < CALLER_SAVED_REGS; i++) {
+  		mark_reg_not_init(env, regs, caller_saved[i]);
+diff --cc kernel/trace/bpf_trace.c
+index 235070f4b98b,2a8bcdc927c7..000000000000
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@@ -1355,6 -1070,14 +1355,17 @@@ bpf_tracing_func_proto(enum bpf_func_i
+  		return &bpf_per_cpu_ptr_proto;
+  	case BPF_FUNC_this_cpu_ptr:
+  		return &bpf_this_cpu_ptr_proto;
+++<<<<<<< HEAD
+++=======
++ 	case BPF_FUNC_task_storage_get:
++ 		return &bpf_task_storage_get_proto;
++ 	case BPF_FUNC_task_storage_delete:
++ 		return &bpf_task_storage_delete_proto;
++ 	case BPF_FUNC_for_each_map_elem:
++ 		return &bpf_for_each_map_elem_proto;
++ 	case BPF_FUNC_snprintf:
++ 		return &bpf_snprintf_proto;
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+  	default:
+  		return NULL;
+  	}
+diff --cc tools/include/uapi/linux/bpf.h
+index 16191dba6988,ec6d85a81744..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -4663,6 -4680,61 +4663,64 @@@ union bpf_attr 
+   *		* **BPF_MTU_CHK_RET_FRAG_NEEDED**
+   *		* **BPF_MTU_CHK_RET_SEGS_TOOBIG**
+   *
+++<<<<<<< HEAD
+++=======
++  * long bpf_for_each_map_elem(struct bpf_map *map, void *callback_fn, void *callback_ctx, u64 flags)
++  *	Description
++  *		For each element in **map**, call **callback_fn** function with
++  *		**map**, **callback_ctx** and other map-specific parameters.
++  *		The **callback_fn** should be a static function and
++  *		the **callback_ctx** should be a pointer to the stack.
++  *		The **flags** is used to control certain aspects of the helper.
++  *		Currently, the **flags** must be 0.
++  *
++  *		The following are a list of supported map types and their
++  *		respective expected callback signatures:
++  *
++  *		BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_HASH,
++  *		BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_LRU_PERCPU_HASH,
++  *		BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY
++  *
++  *		long (\*callback_fn)(struct bpf_map \*map, const void \*key, void \*value, void \*ctx);
++  *
++  *		For per_cpu maps, the map_value is the value on the cpu where the
++  *		bpf_prog is running.
++  *
++  *		If **callback_fn** return 0, the helper will continue to the next
++  *		element. If return value is 1, the helper will skip the rest of
++  *		elements and return. Other return values are not used now.
++  *
++  *	Return
++  *		The number of traversed map elements for success, **-EINVAL** for
++  *		invalid **flags**.
++  *
++  * long bpf_snprintf(char *str, u32 str_size, const char *fmt, u64 *data, u32 data_len)
++  *	Description
++  *		Outputs a string into the **str** buffer of size **str_size**
++  *		based on a format string stored in a read-only map pointed by
++  *		**fmt**.
++  *
++  *		Each format specifier in **fmt** corresponds to one u64 element
++  *		in the **data** array. For strings and pointers where pointees
++  *		are accessed, only the pointer values are stored in the *data*
++  *		array. The *data_len* is the size of *data* in bytes.
++  *
++  *		Formats **%s** and **%p{i,I}{4,6}** require to read kernel
++  *		memory. Reading kernel memory may fail due to either invalid
++  *		address or valid address but requiring a major memory fault. If
++  *		reading kernel memory fails, the string for **%s** will be an
++  *		empty string, and the ip address for **%p{i,I}{4,6}** will be 0.
++  *		Not returning error to bpf program is consistent with what
++  *		**bpf_trace_printk**\ () does for now.
++  *
++  *	Return
++  *		The strictly positive length of the formatted string, including
++  *		the trailing zero character. If the return value is greater than
++  *		**str_size**, **str** contains a truncated string, guaranteed to
++  *		be zero-terminated except when **str_size** is 0.
++  *
++  *		Or **-EBUSY** if the per-CPU memory copy buffer is busy.
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -4829,6 -4901,8 +4887,11 @@@
+  	FN(ima_inode_hash),		\
+  	FN(sock_from_file),		\
+  	FN(check_mtu),			\
+++<<<<<<< HEAD
+++=======
++ 	FN(for_each_map_elem),		\
++ 	FN(snprintf),			\
+++>>>>>>> 7b15523a989b (bpf: Add a bpf_snprintf helper)
+  	/* */
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 95b950412549..e0d615280f3b 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1948,6 +1948,7 @@ extern const struct bpf_func_proto bpf_skc_to_tcp_request_sock_proto;
+ extern const struct bpf_func_proto bpf_skc_to_udp6_sock_proto;
+ extern const struct bpf_func_proto bpf_copy_from_user_proto;
+ extern const struct bpf_func_proto bpf_snprintf_btf_proto;
++extern const struct bpf_func_proto bpf_snprintf_proto;
+ extern const struct bpf_func_proto bpf_per_cpu_ptr_proto;
+ extern const struct bpf_func_proto bpf_this_cpu_ptr_proto;
+ extern const struct bpf_func_proto bpf_ktime_get_coarse_ns_proto;
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/helpers.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path kernel/trace/bpf_trace.c
+* Unmerged path tools/include/uapi/linux/bpf.h
