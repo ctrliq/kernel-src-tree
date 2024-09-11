@@ -1,0 +1,169 @@
+flow_offload: add statistics retrieval infrastructure and use it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 3b1903ef97c080a80ead3a6a2305f55108e08269
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/3b1903ef.failed
+
+This patch provides the flow_stats structure that acts as container for
+tc_cls_flower_offload, then we can use to restore the statistics on the
+existing TC actions. Hence, tcf_exts_stats_update() is not used from
+drivers anymore.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3b1903ef97c080a80ead3a6a2305f55108e08269)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	include/net/flow_offload.h
+#	include/net/pkt_cls.h
+#	net/sched/cls_flower.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 1a38c9a292e1,c4c6bbcafc68..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2868,7 -3050,28 +2868,32 @@@ int mlx5e_stats_flower(struct mlx5e_pri
+  
+  	mlx5_fc_query_cached(counter, &bytes, &packets, &lastuse);
+  
+++<<<<<<< HEAD
+ +	tcf_exts_stats_update(f->exts, bytes, packets, lastuse);
+++=======
++ 	peer_esw = mlx5_devcom_get_peer_data(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
++ 	if (!peer_esw)
++ 		goto out;
++ 
++ 	if ((flow->flags & MLX5E_TC_FLOW_DUP) &&
++ 	    (flow->peer_flow->flags & MLX5E_TC_FLOW_OFFLOADED)) {
++ 		u64 bytes2;
++ 		u64 packets2;
++ 		u64 lastuse2;
++ 
++ 		counter = mlx5e_tc_get_counter(flow->peer_flow);
++ 		mlx5_fc_query_cached(counter, &bytes2, &packets2, &lastuse2);
++ 
++ 		bytes += bytes2;
++ 		packets += packets2;
++ 		lastuse = max_t(u64, lastuse, lastuse2);
++ 	}
++ 
++ 	mlx5_devcom_release_peer_data(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
++ 
++ out:
++ 	flow_stats_update(&f->stats, bytes, packets, lastuse);
+++>>>>>>> 3b1903ef97c0 (flow_offload: add statistics retrieval infrastructure and use it)
+  
+  	return 0;
+  }
+diff --cc include/net/pkt_cls.h
+index 222c878d3994,bea1b1c3ea9b..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -773,9 -764,8 +773,14 @@@ struct tc_cls_flower_offload 
+  	struct tc_cls_common_offload common;
+  	enum tc_fl_command command;
+  	unsigned long cookie;
+++<<<<<<< HEAD
+ +	struct flow_dissector *dissector;
+ +	struct fl_flow_key *mask;
+ +	struct fl_flow_key *key;
+++=======
++ 	struct flow_rule *rule;
++ 	struct flow_stats stats;
+++>>>>>>> 3b1903ef97c0 (flow_offload: add statistics retrieval infrastructure and use it)
+  	struct tcf_exts *exts;
+  	u32 classid;
+  };
+diff --cc net/sched/cls_flower.c
+index d984c61e0ed5,8ec85056aa0d..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -339,8 -428,11 +339,16 @@@ static void fl_hw_update_stats(struct t
+  	cls_flower.exts = &f->exts;
+  	cls_flower.classid = f->res.classid;
+  
+++<<<<<<< HEAD
+ +	tc_setup_cb_call(block, &f->exts, TC_SETUP_CLSFLOWER,
+ +			 &cls_flower, false);
+++=======
++ 	tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, false);
++ 
++ 	tcf_exts_stats_update(&f->exts, cls_flower.stats.bytes,
++ 			      cls_flower.stats.pkts,
++ 			      cls_flower.stats.lastused);
+++>>>>>>> 3b1903ef97c0 (flow_offload: add statistics retrieval infrastructure and use it)
+  }
+  
+  static bool __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
+* Unmerged path include/net/flow_offload.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+index b9cdc8e05c8a..f4360668af77 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+@@ -1422,8 +1422,8 @@ static int bnxt_tc_get_flow_stats(struct bnxt *bp,
+ 	lastused = flow->lastused;
+ 	spin_unlock(&flow->stats_lock);
+ 
+-	tcf_exts_stats_update(tc_flow_cmd->exts, stats.bytes, stats.packets,
+-			      lastused);
++	flow_stats_update(&tc_flow_cmd->stats, stats.bytes, stats.packets,
++			  lastused);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+index 59386c13be23..bfca50de531e 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+@@ -840,9 +840,9 @@ int cxgb4_tc_flower_stats(struct net_device *dev,
+ 	if (ofld_stats->packet_count != packets) {
+ 		if (ofld_stats->prev_packet_count != packets)
+ 			ofld_stats->last_used = jiffies;
+-		tcf_exts_stats_update(cls->exts, bytes - ofld_stats->byte_count,
+-				      packets - ofld_stats->packet_count,
+-				      ofld_stats->last_used);
++		flow_stats_update(&cls->stats, bytes - ofld_stats->byte_count,
++				  packets - ofld_stats->packet_count,
++				  ofld_stats->last_used);
+ 
+ 		ofld_stats->packet_count = packets;
+ 		ofld_stats->byte_count = bytes;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+index 3a6e943fdfdc..ad8665e32ee5 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+@@ -482,7 +482,7 @@ int mlxsw_sp_flower_stats(struct mlxsw_sp *mlxsw_sp,
+ 	if (err)
+ 		goto err_rule_get_stats;
+ 
+-	tcf_exts_stats_update(f->exts, bytes, packets, lastuse);
++	flow_stats_update(&f->stats, bytes, packets, lastuse);
+ 
+ 	mlxsw_sp_acl_ruleset_put(mlxsw_sp, ruleset);
+ 	return 0;
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/offload.c b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 2106c1e4333e..649725f07a76 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@ -617,9 +617,8 @@ nfp_flower_get_stats(struct nfp_app *app, struct net_device *netdev,
+ 	ctx_id = be32_to_cpu(nfp_flow->meta.host_ctx_id);
+ 
+ 	spin_lock_bh(&priv->stats_lock);
+-	tcf_exts_stats_update(flow->exts, priv->stats[ctx_id].bytes,
+-			      priv->stats[ctx_id].pkts,
+-			      priv->stats[ctx_id].used);
++	flow_stats_update(&flow->stats, priv->stats[ctx_id].bytes,
++			  priv->stats[ctx_id].pkts, priv->stats[ctx_id].used);
+ 
+ 	priv->stats[ctx_id].pkts = 0;
+ 	priv->stats[ctx_id].bytes = 0;
+* Unmerged path include/net/flow_offload.h
+* Unmerged path include/net/pkt_cls.h
+* Unmerged path net/sched/cls_flower.c
