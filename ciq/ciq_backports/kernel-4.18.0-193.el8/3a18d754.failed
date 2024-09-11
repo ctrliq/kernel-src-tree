@@ -1,0 +1,344 @@
+s390/qeth: add TX multiqueue support for IQD devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 3a18d75400ff14cf3518637579974e22aa0113bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3a18d754.failed
+
+qeth has been supporting multiple HW Output Queues for a long time. But
+rather than exposing those queues to the stack, it uses its own queue
+selection logic in .ndo_start_xmit... with all the drawbacks that
+entails.
+Start off by switching IQD devices over to a proper mqs net_device,
+and converting all the netdev_queue management code.
+
+One oddity with IQD devices is the requirement to place all mcast
+traffic on the _highest_ established HW queue. Doing so via
+.ndo_select_queue seems straight-forward - but that won't work if only
+some of the HW queues are active
+(ie. when dev->real_num_tx_queues < dev->num_tx_queues), since
+netdev_cap_txqueue() will not allow us to put skbs on the higher queues.
+
+To make this work, we
+1. let .ndo_select_queue() map all mcast traffic to netdev_queue 0, and
+2. later re-map the netdev_queue and HW queue indices in
+   .ndo_start_xmit and the TX completion handler.
+
+With this patch we default to a fixed set of 1 ucast and 1 mcast queue.
+Support for dynamic reconfiguration is added at a later time.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3a18d75400ff14cf3518637579974e22aa0113bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_l2_main.c
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_core.h
+index 3f448d239de7,836cde67f367..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -1008,6 -1031,9 +1018,12 @@@ netdev_features_t qeth_fix_features(str
+  netdev_features_t qeth_features_check(struct sk_buff *skb,
+  				      struct net_device *dev,
+  				      netdev_features_t features);
+++<<<<<<< HEAD
+++=======
++ void qeth_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats);
++ u16 qeth_iqd_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 			  u8 cast_type, struct net_device *sb_dev);
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  int qeth_open(struct net_device *dev);
+  int qeth_stop(struct net_device *dev);
+  
+diff --cc drivers/s390/net/qeth_core_main.c
+index 67e5e3d26068,68f6043f033a..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -6211,6 -6184,40 +6217,43 @@@ netdev_features_t qeth_features_check(s
+  }
+  EXPORT_SYMBOL_GPL(qeth_features_check);
+  
+++<<<<<<< HEAD
+++=======
++ void qeth_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 	struct qeth_qdio_out_q *queue;
++ 	unsigned int i;
++ 
++ 	QETH_CARD_TEXT(card, 5, "getstat");
++ 
++ 	stats->rx_packets = card->stats.rx_packets;
++ 	stats->rx_bytes = card->stats.rx_bytes;
++ 	stats->rx_errors = card->stats.rx_errors;
++ 	stats->rx_dropped = card->stats.rx_dropped;
++ 	stats->multicast = card->stats.rx_multicast;
++ 
++ 	for (i = 0; i < card->qdio.no_out_queues; i++) {
++ 		queue = card->qdio.out_qs[i];
++ 
++ 		stats->tx_packets += queue->stats.tx_packets;
++ 		stats->tx_bytes += queue->stats.tx_bytes;
++ 		stats->tx_errors += queue->stats.tx_errors;
++ 		stats->tx_dropped += queue->stats.tx_dropped;
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(qeth_get_stats64);
++ 
++ u16 qeth_iqd_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 			  u8 cast_type, struct net_device *sb_dev)
++ {
++ 	if (cast_type != RTN_UNICAST)
++ 		return QETH_IQD_MCAST_TXQ;
++ 	return QETH_IQD_MIN_UCAST_TXQ;
++ }
++ EXPORT_SYMBOL_GPL(qeth_iqd_select_queue);
++ 
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  int qeth_open(struct net_device *dev)
+  {
+  	struct qeth_card *card = dev->ml_priv;
+@@@ -6225,8 -6228,7 +6268,12 @@@
+  		return -EIO;
+  
+  	card->data.state = CH_STATE_UP;
+++<<<<<<< HEAD
+ +	card->state = CARD_STATE_UP;
+ +	netif_start_queue(dev);
+++=======
++ 	netif_tx_start_all_queues(dev);
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  
+  	napi_enable(&card->napi);
+  	local_bh_disable();
+diff --cc drivers/s390/net/qeth_l2_main.c
+index ce5ce6ebbf1e,1491281600c2..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -160,13 -159,10 +160,11 @@@ static void qeth_l2_del_all_macs(struc
+  		hash_del(&mac->hnode);
+  		kfree(mac);
+  	}
+ +	spin_unlock_bh(&card->mclock);
+  }
+  
+- static int qeth_l2_get_cast_type(struct qeth_card *card, struct sk_buff *skb)
++ static int qeth_l2_get_cast_type(struct sk_buff *skb)
+  {
+- 	if (card->info.type == QETH_CARD_TYPE_OSN)
+- 		return RTN_UNICAST;
+  	if (is_broadcast_ether_addr(skb->data))
+  		return RTN_BROADCAST;
+  	if (is_multicast_ether_addr(skb->data))
+@@@ -613,33 -607,31 +611,48 @@@ static netdev_tx_t qeth_l2_hard_start_x
+  	int tx_bytes = skb->len;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (card->state != CARD_STATE_UP) {
+ +		card->stats.tx_carrier_errors++;
+ +		goto tx_drop;
+ +	}
+ +
+ +	queue = qeth_get_tx_queue(card, skb, ipv, cast_type);
+ +	netif_stop_queue(dev);
+++=======
++ 	if (IS_IQD(card))
++ 		queue = card->qdio.out_qs[qeth_iqd_translate_txq(dev, txq)];
++ 	else
++ 		queue = qeth_get_tx_queue(card, skb, ipv);
++ 
++ 	netif_stop_subqueue(dev, txq);
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  
+  	if (IS_OSN(card))
+  		rc = qeth_l2_xmit_osn(card, skb, queue);
+  	else
+- 		rc = qeth_xmit(card, skb, queue, ipv, cast_type,
+- 			       qeth_l2_fill_header);
++ 		rc = qeth_xmit(card, skb, queue, ipv,
++ 			       qeth_l2_get_cast_type(skb), qeth_l2_fill_header);
+  
+  	if (!rc) {
+++<<<<<<< HEAD
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		netif_wake_queue(dev);
+++=======
++ 		QETH_TXQ_STAT_INC(queue, tx_packets);
++ 		QETH_TXQ_STAT_ADD(queue, tx_bytes, tx_bytes);
++ 		netif_wake_subqueue(dev, txq);
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  		return NETDEV_TX_OK;
+  	} else if (rc == -EBUSY) {
+  		return NETDEV_TX_BUSY;
+  	} /* else fall through */
+  
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ +tx_drop:
+ +	card->stats.tx_dropped++;
+  	kfree_skb(skb);
+- 	netif_wake_queue(dev);
++ 	netif_wake_subqueue(dev, txq);
+  	return NETDEV_TX_OK;
+  }
+  
+@@@ -685,9 -685,17 +705,10 @@@ static void qeth_l2_remove_device(struc
+  static const struct net_device_ops qeth_l2_netdev_ops = {
+  	.ndo_open		= qeth_open,
+  	.ndo_stop		= qeth_stop,
+ -	.ndo_get_stats64	= qeth_get_stats64,
+ +	.ndo_get_stats		= qeth_get_stats,
+  	.ndo_start_xmit		= qeth_l2_hard_start_xmit,
+  	.ndo_features_check	= qeth_features_check,
++ 	.ndo_select_queue	= qeth_l2_select_queue,
+  	.ndo_validate_addr	= qeth_l2_validate_addr,
+  	.ndo_set_rx_mode	= qeth_l2_set_rx_mode,
+  	.ndo_do_ioctl		= qeth_do_ioctl,
+diff --cc drivers/s390/net/qeth_l3_main.c
+index f13c93b498de,120193e90adb..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -2064,27 -2067,31 +2064,45 @@@ static netdev_tx_t qeth_l3_hard_start_x
+  	int ipv = qeth_get_ip_version(skb);
+  	struct qeth_qdio_out_q *queue;
+  	int tx_bytes = skb->len;
+++<<<<<<< HEAD
+ +	int rc;
+++=======
++ 	int cast_type, rc;
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  
+  	if (IS_IQD(card)) {
++ 		queue = card->qdio.out_qs[qeth_iqd_translate_txq(dev, txq)];
++ 
+  		if (card->options.sniffer)
+  			goto tx_drop;
+  		if ((card->options.cq != QETH_CQ_ENABLED && !ipv) ||
+  		    (card->options.cq == QETH_CQ_ENABLED &&
+  		     skb->protocol != htons(ETH_P_AF_IUCV)))
+  			goto tx_drop;
++ 
++ 		if (txq == QETH_IQD_MCAST_TXQ)
++ 			cast_type = qeth_l3_get_cast_type(skb);
++ 		else
++ 			cast_type = RTN_UNICAST;
++ 	} else {
++ 		queue = qeth_get_tx_queue(card, skb, ipv);
++ 		cast_type = qeth_l3_get_cast_type(skb);
+  	}
+  
+ +	if (card->state != CARD_STATE_UP) {
+ +		card->stats.tx_carrier_errors++;
+ +		goto tx_drop;
+ +	}
+ +
+  	if (cast_type == RTN_BROADCAST && !card->info.broadcast_capable)
+  		goto tx_drop;
+  
+++<<<<<<< HEAD
+ +	queue = qeth_get_tx_queue(card, skb, ipv, cast_type);
+ +	netif_stop_queue(dev);
+++=======
++ 	netif_stop_subqueue(dev, txq);
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  
+  	if (ipv == 4 || IS_IQD(card))
+  		rc = qeth_l3_xmit(card, skb, queue, ipv, cast_type);
+@@@ -2093,18 -2100,18 +2111,24 @@@
+  			       qeth_l3_fill_header);
+  
+  	if (!rc) {
+++<<<<<<< HEAD
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		netif_wake_queue(dev);
+++=======
++ 		QETH_TXQ_STAT_INC(queue, tx_packets);
++ 		QETH_TXQ_STAT_ADD(queue, tx_bytes, tx_bytes);
++ 		netif_wake_subqueue(dev, txq);
+++>>>>>>> 3a18d75400ff (s390/qeth: add TX multiqueue support for IQD devices)
+  		return NETDEV_TX_OK;
+  	} else if (rc == -EBUSY) {
+  		return NETDEV_TX_BUSY;
+  	} /* else fall through */
+  
+  tx_drop:
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ +	card->stats.tx_dropped++;
+  	kfree_skb(skb);
+- 	netif_wake_queue(dev);
++ 	netif_wake_subqueue(dev, txq);
+  	return NETDEV_TX_OK;
+  }
+  
+@@@ -2144,8 -2165,9 +2175,9 @@@ static u16 qeth_l3_iqd_select_queue(str
+  static const struct net_device_ops qeth_l3_netdev_ops = {
+  	.ndo_open		= qeth_open,
+  	.ndo_stop		= qeth_stop,
+ -	.ndo_get_stats64	= qeth_get_stats64,
+ +	.ndo_get_stats		= qeth_get_stats,
+  	.ndo_start_xmit		= qeth_l3_hard_start_xmit,
++ 	.ndo_select_queue	= qeth_l3_iqd_select_queue,
+  	.ndo_validate_addr	= eth_validate_addr,
+  	.ndo_set_rx_mode	= qeth_l3_set_rx_mode,
+  	.ndo_do_ioctl		= qeth_do_ioctl,
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/net/qeth_core_sys.c b/drivers/s390/net/qeth_core_sys.c
+index 6e11082e0a41..4c792c6f9e79 100644
+--- a/drivers/s390/net/qeth_core_sys.c
++++ b/drivers/s390/net/qeth_core_sys.c
+@@ -198,6 +198,9 @@ static ssize_t qeth_dev_prioqing_store(struct device *dev,
+ 	if (!card)
+ 		return -EINVAL;
+ 
++	if (IS_IQD(card))
++		return -EOPNOTSUPP;
++
+ 	mutex_lock(&card->conf_mutex);
+ 	if (card->state != CARD_STATE_DOWN) {
+ 		rc = -EPERM;
+diff --git a/drivers/s390/net/qeth_ethtool.c b/drivers/s390/net/qeth_ethtool.c
+index 31474f66f6bf..53eed165c2cc 100644
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@ -134,6 +134,21 @@ static void qeth_get_drvinfo(struct net_device *dev,
+ 		 CARD_RDEV_ID(card), CARD_WDEV_ID(card), CARD_DDEV_ID(card));
+ }
+ 
++static void qeth_get_channels(struct net_device *dev,
++			      struct ethtool_channels *channels)
++{
++	struct qeth_card *card = dev->ml_priv;
++
++	channels->max_rx = dev->num_rx_queues;
++	channels->max_tx = card->qdio.no_out_queues;
++	channels->max_other = 0;
++	channels->max_combined = 0;
++	channels->rx_count = dev->real_num_rx_queues;
++	channels->tx_count = dev->real_num_tx_queues;
++	channels->other_count = 0;
++	channels->combined_count = 0;
++}
++
+ /* Helper function to fill 'advertising' and 'supported' which are the same. */
+ /* Autoneg and full-duplex are supported and advertised unconditionally.     */
+ /* Always advertise and support all speeds up to specified, and only one     */
+@@ -339,6 +354,7 @@ const struct ethtool_ops qeth_ethtool_ops = {
+ 	.get_ethtool_stats = qeth_get_ethtool_stats,
+ 	.get_sset_count = qeth_get_sset_count,
+ 	.get_drvinfo = qeth_get_drvinfo,
++	.get_channels = qeth_get_channels,
+ 	.get_link_ksettings = qeth_get_link_ksettings,
+ };
+ 
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+* Unmerged path drivers/s390/net/qeth_l3_main.c
