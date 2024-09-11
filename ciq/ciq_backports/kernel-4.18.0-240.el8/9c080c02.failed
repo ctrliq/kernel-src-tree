@@ -1,0 +1,251 @@
+perf mmap: Declare type for cpu mask of arbitrary length
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alexey Budankov <alexey.budankov@linux.intel.com>
+commit 9c080c0279a80057cad3dfc05d09fb283ddf72f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9c080c02.failed
+
+Declare a dedicated struct map_cpu_mask type for cpu masks of arbitrary
+length.
+
+The mask is available thru bits pointer and the mask length is kept in
+nbits field. MMAP_CPU_MASK_BYTES() macro returns mask storage size in
+bytes.
+
+The mmap_cpu_mask__scnprintf() function can be used to log text
+representation of the mask.
+
+Committer notes:
+
+To print the 'nbits' struct member we must use %zd, since it is a
+size_t, this fixes the build in some toolchains/arches.
+
+	Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@redhat.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/0fd2454f-477f-d15a-f4ee-79bcbd2585ff@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 9c080c0279a80057cad3dfc05d09fb283ddf72f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/mmap.c
+#	tools/perf/util/mmap.h
+diff --cc tools/perf/util/mmap.c
+index 850493205040,2ee4faacca21..000000000000
+--- a/tools/perf/util/mmap.c
++++ b/tools/perf/util/mmap.c
+@@@ -17,118 -20,25 +17,135 @@@
+  #include "debug.h"
+  #include "event.h"
+  #include "mmap.h"
+++<<<<<<< HEAD
+ +#include "util.h" /* page_size */
+++=======
++ #include "../perf.h"
++ #include <internal/lib.h> /* page_size */
++ #include <linux/bitmap.h>
++ 
++ #define MASK_SIZE 1023
++ void mmap_cpu_mask__scnprintf(struct mmap_cpu_mask *mask, const char *tag)
++ {
++ 	char buf[MASK_SIZE + 1];
++ 	size_t len;
++ 
++ 	len = bitmap_scnprintf(mask->bits, mask->nbits, buf, MASK_SIZE);
++ 	buf[len] = '\0';
++ 	pr_debug("%p: %s mask[%zd]: %s\n", mask, tag, mask->nbits, buf);
++ }
+++>>>>>>> 9c080c0279a8 (perf mmap: Declare type for cpu mask of arbitrary length)
+ +
+ +size_t perf_mmap__mmap_len(struct perf_mmap *map)
+ +{
+ +	return map->mask + 1 + page_size;
+ +}
+ +
+ +/* When check_messup is true, 'end' must points to a good entry */
+ +static union perf_event *perf_mmap__read(struct perf_mmap *map,
+ +					 u64 *startp, u64 end)
+ +{
+ +	unsigned char *data = map->base + page_size;
+ +	union perf_event *event = NULL;
+ +	int diff = end - *startp;
+ +
+ +	if (diff >= (int)sizeof(event->header)) {
+ +		size_t size;
+ +
+ +		event = (union perf_event *)&data[*startp & map->mask];
+ +		size = event->header.size;
+ +
+ +		if (size < sizeof(event->header) || diff < (int)size)
+ +			return NULL;
+ +
+ +		/*
+ +		 * Event straddles the mmap boundary -- header should always
+ +		 * be inside due to u64 alignment of output.
+ +		 */
+ +		if ((*startp & map->mask) + size != ((*startp + size) & map->mask)) {
+ +			unsigned int offset = *startp;
+ +			unsigned int len = min(sizeof(*event), size), cpy;
+ +			void *dst = map->event_copy;
+ +
+ +			do {
+ +				cpy = min(map->mask + 1 - (offset & map->mask), len);
+ +				memcpy(dst, &data[offset & map->mask], cpy);
+ +				offset += cpy;
+ +				dst += cpy;
+ +				len -= cpy;
+ +			} while (len);
+ +
+ +			event = (union perf_event *)map->event_copy;
+ +		}
+ +
+ +		*startp += size;
+ +	}
+ +
+ +	return event;
+ +}
+ +
+ +/*
+ + * Read event from ring buffer one by one.
+ + * Return one event for each call.
+ + *
+ + * Usage:
+ + * perf_mmap__read_init()
+ + * while(event = perf_mmap__read_event()) {
+ + *	//process the event
+ + *	perf_mmap__consume()
+ + * }
+ + * perf_mmap__read_done()
+ + */
+ +union perf_event *perf_mmap__read_event(struct perf_mmap *map)
+ +{
+ +	union perf_event *event;
+ +
+ +	/*
+ +	 * Check if event was unmapped due to a POLLHUP/POLLERR.
+ +	 */
+ +	if (!refcount_read(&map->refcnt))
+ +		return NULL;
+ +
+ +	/* non-overwirte doesn't pause the ringbuffer */
+ +	if (!map->overwrite)
+ +		map->end = perf_mmap__read_head(map);
+ +
+ +	event = perf_mmap__read(map, &map->start, map->end);
+ +
+ +	if (!map->overwrite)
+ +		map->prev = map->start;
+ +
+ +	return event;
+ +}
+ +
+ +static bool perf_mmap__empty(struct perf_mmap *map)
+ +{
+ +	return perf_mmap__read_head(map) == map->prev && !map->auxtrace_mmap.base;
+ +}
+ +
+ +void perf_mmap__get(struct perf_mmap *map)
+ +{
+ +	refcount_inc(&map->refcnt);
+ +}
+  
+ -size_t mmap__mmap_len(struct mmap *map)
+ +void perf_mmap__put(struct perf_mmap *map)
+  {
+ -	return perf_mmap__mmap_len(&map->core);
+ +	BUG_ON(map->base && refcount_read(&map->refcnt) == 0);
+ +
+ +	if (refcount_dec_and_test(&map->refcnt))
+ +		perf_mmap__munmap(map);
+ +}
+ +
+ +void perf_mmap__consume(struct perf_mmap *map)
+ +{
+ +	if (!map->overwrite) {
+ +		u64 old = map->prev;
+ +
+ +		perf_mmap__write_tail(map, old);
+ +	}
+ +
+ +	if (refcount_read(&map->refcnt) == 1 && perf_mmap__empty(map))
+ +		perf_mmap__put(map);
+  }
+  
+  int __weak auxtrace_mmap__mmap(struct auxtrace_mmap *mm __maybe_unused,
+diff --cc tools/perf/util/mmap.h
+index 274ce389cd84,ef51667fabcb..000000000000
+--- a/tools/perf/util/mmap.h
++++ b/tools/perf/util/mmap.h
+@@@ -13,8 -15,17 +13,17 @@@
+  #include "event.h"
+  
+  struct aiocb;
++ 
++ struct mmap_cpu_mask {
++ 	unsigned long *bits;
++ 	size_t nbits;
++ };
++ 
++ #define MMAP_CPU_MASK_BYTES(m) \
++ 	(BITS_TO_LONGS(((struct mmap_cpu_mask *)m)->nbits) * sizeof(unsigned long))
++ 
+  /**
+ - * struct mmap - perf's ring buffer mmap details
+ + * struct perf_mmap - perf's ring buffer mmap details
+   *
+   * @refcnt - e.g. code using PERF_EVENT_IOC_SET_OUTPUT to share this
+   */
+@@@ -77,33 -51,16 +86,38 @@@ struct mmap_params 
+  	struct auxtrace_mmap_params auxtrace_mp;
+  };
+  
+ -int mmap__mmap(struct mmap *map, struct mmap_params *mp, int fd, int cpu);
+ -void mmap__munmap(struct mmap *map);
+ +int perf_mmap__mmap(struct perf_mmap *map, struct mmap_params *mp, int fd, int cpu);
+ +void perf_mmap__munmap(struct perf_mmap *map);
+ +
+ +void perf_mmap__get(struct perf_mmap *map);
+ +void perf_mmap__put(struct perf_mmap *map);
+ +
+ +void perf_mmap__consume(struct perf_mmap *map);
+ +
+ +static inline u64 perf_mmap__read_head(struct perf_mmap *mm)
+ +{
+ +	return ring_buffer_read_head(mm->base);
+ +}
+ +
+++<<<<<<< HEAD
+ +static inline void perf_mmap__write_tail(struct perf_mmap *md, u64 tail)
+ +{
+ +	ring_buffer_write_tail(md->base, tail);
+ +}
+ +
+ +union perf_event *perf_mmap__read_forward(struct perf_mmap *map);
+  
+ -union perf_event *perf_mmap__read_forward(struct mmap *map);
+ +union perf_event *perf_mmap__read_event(struct perf_mmap *map);
+  
+ -int perf_mmap__push(struct mmap *md, void *to,
+ -		    int push(struct mmap *map, void *to, void *buf, size_t size));
+ +int perf_mmap__push(struct perf_mmap *md, void *to,
+ +		    int push(struct perf_mmap *map, void *to, void *buf, size_t size));
+  
+ -size_t mmap__mmap_len(struct mmap *map);
+ +size_t perf_mmap__mmap_len(struct perf_mmap *map);
+  
+ +int perf_mmap__read_init(struct perf_mmap *md);
+ +void perf_mmap__read_done(struct perf_mmap *map);
+++=======
++ void mmap_cpu_mask__scnprintf(struct mmap_cpu_mask *mask, const char *tag);
++ 
+++>>>>>>> 9c080c0279a8 (perf mmap: Declare type for cpu mask of arbitrary length)
+  #endif /*__PERF_MMAP_H */
+* Unmerged path tools/perf/util/mmap.c
+* Unmerged path tools/perf/util/mmap.h
