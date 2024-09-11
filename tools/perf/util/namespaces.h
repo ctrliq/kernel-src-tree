@@ -35,6 +35,7 @@ struct nsinfo {
 	pid_t			tgid;
 	pid_t			nstgid;
 	bool			need_setns;
+	bool			in_pidns;
 	char			*mntns_path;
 	refcount_t		refcnt;
 };
