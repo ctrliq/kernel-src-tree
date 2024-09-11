@@ -1,0 +1,1183 @@
+RDMA/rxe: Use standard names for ref counting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit 3197706abd053275d2a561cfb7dc8f6cfaf7d02c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/3197706a.failed
+
+Rename rxe_add_ref() to rxe_get() and rxe_drop_ref() to rxe_put().
+Significantly improves readability for new readers.
+
+Link: https://lore.kernel.org/r/20220304000808.225811-10-rpearsonhpe@gmail.com
+	Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 3197706abd053275d2a561cfb7dc8f6cfaf7d02c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_mcast.c
+#	drivers/infiniband/sw/rxe/rxe_mr.c
+#	drivers/infiniband/sw/rxe/rxe_pool.h
+#	drivers/infiniband/sw/rxe/rxe_verbs.c
+diff --cc drivers/infiniband/sw/rxe/rxe_mcast.c
+index 5f1c72c1473c,ae8f11cb704a..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_mcast.c
++++ b/drivers/infiniband/sw/rxe/rxe_mcast.c
+@@@ -25,60 -53,277 +25,77 @@@ static int rxe_mcast_delete(struct rxe_
+  	return dev_mc_del(rxe->ndev, ll_addr);
+  }
+  
+ -/**
+ - * __rxe_insert_mcg - insert an mcg into red-black tree (rxe->mcg_tree)
+ - * @mcg: mcg object with an embedded red-black tree node
+ - *
+ - * Context: caller must hold a reference to mcg and rxe->mcg_lock and
+ - * is responsible to avoid adding the same mcg twice to the tree.
+ - */
+ -static void __rxe_insert_mcg(struct rxe_mcg *mcg)
+ -{
+ -	struct rb_root *tree = &mcg->rxe->mcg_tree;
+ -	struct rb_node **link = &tree->rb_node;
+ -	struct rb_node *node = NULL;
+ -	struct rxe_mcg *tmp;
+ -	int cmp;
+ -
+ -	while (*link) {
+ -		node = *link;
+ -		tmp = rb_entry(node, struct rxe_mcg, node);
+ -
+ -		cmp = memcmp(&tmp->mgid, &mcg->mgid, sizeof(mcg->mgid));
+ -		if (cmp > 0)
+ -			link = &(*link)->rb_left;
+ -		else
+ -			link = &(*link)->rb_right;
+ -	}
+ -
+ -	rb_link_node(&mcg->node, node, link);
+ -	rb_insert_color(&mcg->node, tree);
+ -}
+ -
+ -/**
+ - * __rxe_remove_mcg - remove an mcg from red-black tree holding lock
+ - * @mcg: mcast group object with an embedded red-black tree node
+ - *
+ - * Context: caller must hold a reference to mcg and rxe->mcg_lock
+ - */
+ -static void __rxe_remove_mcg(struct rxe_mcg *mcg)
+ -{
+ -	rb_erase(&mcg->node, &mcg->rxe->mcg_tree);
+ -}
+ -
+ -/**
+ - * __rxe_lookup_mcg - lookup mcg in rxe->mcg_tree while holding lock
+ - * @rxe: rxe device object
+ - * @mgid: multicast IP address
+ - *
+ - * Context: caller must hold rxe->mcg_lock
+ - * Returns: mcg on success and takes a ref to mcg else NULL
+ - */
+ -static struct rxe_mcg *__rxe_lookup_mcg(struct rxe_dev *rxe,
+ -					union ib_gid *mgid)
+ -{
+ -	struct rb_root *tree = &rxe->mcg_tree;
+ -	struct rxe_mcg *mcg;
+ -	struct rb_node *node;
+ -	int cmp;
+ -
+ -	node = tree->rb_node;
+ -
+ -	while (node) {
+ -		mcg = rb_entry(node, struct rxe_mcg, node);
+ -
+ -		cmp = memcmp(&mcg->mgid, mgid, sizeof(*mgid));
+ -
+ -		if (cmp > 0)
+ -			node = node->rb_left;
+ -		else if (cmp < 0)
+ -			node = node->rb_right;
+ -		else
+ -			break;
+ -	}
+ -
+ -	if (node) {
+ -		kref_get(&mcg->ref_cnt);
+ -		return mcg;
+ -	}
+ -
+ -	return NULL;
+ -}
+ -
+ -/**
+ - * rxe_lookup_mcg - lookup up mcg in red-back tree
+ - * @rxe: rxe device object
+ - * @mgid: multicast IP address
+ - *
+ - * Returns: mcg if found else NULL
+ - */
+ -struct rxe_mcg *rxe_lookup_mcg(struct rxe_dev *rxe, union ib_gid *mgid)
+ -{
+ -	struct rxe_mcg *mcg;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&rxe->mcg_lock, flags);
+ -	mcg = __rxe_lookup_mcg(rxe, mgid);
+ -	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+ -
+ -	return mcg;
+ -}
+ -
+ -/**
+ - * __rxe_init_mcg - initialize a new mcg
+ - * @rxe: rxe device
+ - * @mgid: multicast address as a gid
+ - * @mcg: new mcg object
+ - *
+ - * Context: caller should hold rxe->mcg lock
+ - * Returns: 0 on success else an error
+ - */
+ -static int __rxe_init_mcg(struct rxe_dev *rxe, union ib_gid *mgid,
+ -			  struct rxe_mcg *mcg)
+ +/* caller should hold mc_grp_pool->pool_lock */
+ +static struct rxe_mc_grp *create_grp(struct rxe_dev *rxe,
+ +				     struct rxe_pool *pool,
+ +				     union ib_gid *mgid)
+  {
+  	int err;
+ +	struct rxe_mc_grp *grp;
+  
+ -	err = rxe_mcast_add(rxe, mgid);
+ -	if (unlikely(err))
+ -		return err;
+ -
+ -	kref_init(&mcg->ref_cnt);
+ -	memcpy(&mcg->mgid, mgid, sizeof(mcg->mgid));
+ -	INIT_LIST_HEAD(&mcg->qp_list);
+ -	mcg->rxe = rxe;
+ -
+ -	/* caller holds a ref on mcg but that will be
+ -	 * dropped when mcg goes out of scope. We need to take a ref
+ -	 * on the pointer that will be saved in the red-black tree
+ -	 * by __rxe_insert_mcg and used to lookup mcg from mgid later.
+ -	 * Inserting mcg makes it visible to outside so this should
+ -	 * be done last after the object is ready.
+ -	 */
+ -	kref_get(&mcg->ref_cnt);
+ -	__rxe_insert_mcg(mcg);
+ -
+ -	return 0;
+ -}
+ -
+ -/**
+ - * rxe_get_mcg - lookup or allocate a mcg
+ - * @rxe: rxe device object
+ - * @mgid: multicast IP address as a gid
+ - *
+ - * Returns: mcg on success else ERR_PTR(error)
+ - */
+ -static struct rxe_mcg *rxe_get_mcg(struct rxe_dev *rxe, union ib_gid *mgid)
+ -{
+ -	struct rxe_mcg *mcg, *tmp;
+ -	unsigned long flags;
+ -	int err;
+ -
+ -	if (rxe->attr.max_mcast_grp == 0)
+ -		return ERR_PTR(-EINVAL);
+ -
+ -	/* check to see if mcg already exists */
+ -	mcg = rxe_lookup_mcg(rxe, mgid);
+ -	if (mcg)
+ -		return mcg;
+ -
+ -	/* speculative alloc of new mcg */
+ -	mcg = kzalloc(sizeof(*mcg), GFP_KERNEL);
+ -	if (!mcg)
+ +	grp = rxe_alloc_locked(&rxe->mc_grp_pool);
+ +	if (!grp)
+  		return ERR_PTR(-ENOMEM);
+  
+ -	spin_lock_irqsave(&rxe->mcg_lock, flags);
+ -	/* re-check to see if someone else just added it */
+ -	tmp = __rxe_lookup_mcg(rxe, mgid);
+ -	if (tmp) {
+ -		kfree(mcg);
+ -		mcg = tmp;
+ -		goto out;
+ -	}
+ +	INIT_LIST_HEAD(&grp->qp_list);
+ +	spin_lock_init(&grp->mcg_lock);
+ +	grp->rxe = rxe;
+ +	rxe_add_key_locked(grp, mgid);
+  
+ -	if (atomic_inc_return(&rxe->mcg_num) > rxe->attr.max_mcast_grp) {
+ -		err = -ENOMEM;
+ -		goto err_dec;
+ +	err = rxe_mcast_add(rxe, mgid);
+ +	if (unlikely(err)) {
+ +		rxe_drop_key_locked(grp);
+ +		rxe_drop_ref(grp);
+ +		return ERR_PTR(err);
+  	}
+  
+ -	err = __rxe_init_mcg(rxe, mgid, mcg);
+ -	if (err)
+ -		goto err_dec;
+ -out:
+ -	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+ -	return mcg;
+ -
+ -err_dec:
+ -	atomic_dec(&rxe->mcg_num);
+ -	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+ -	kfree(mcg);
+ -	return ERR_PTR(err);
+ +	return grp;
+  }
+  
+ -/**
+ - * rxe_cleanup_mcg - cleanup mcg for kref_put
+ - * @kref: struct kref embnedded in mcg
+ - */
+ -void rxe_cleanup_mcg(struct kref *kref)
+ -{
+ -	struct rxe_mcg *mcg = container_of(kref, typeof(*mcg), ref_cnt);
+ -
+ -	kfree(mcg);
+ -}
+ -
+ -/**
+ - * __rxe_destroy_mcg - destroy mcg object holding rxe->mcg_lock
+ - * @mcg: the mcg object
+ - *
+ - * Context: caller is holding rxe->mcg_lock
+ - * no qp's are attached to mcg
+ - */
+ -static void __rxe_destroy_mcg(struct rxe_mcg *mcg)
+ -{
+ -	struct rxe_dev *rxe = mcg->rxe;
+ -
+ -	/* remove mcg from red-black tree then drop ref */
+ -	__rxe_remove_mcg(mcg);
+ -	kref_put(&mcg->ref_cnt, rxe_cleanup_mcg);
+ -
+ -	rxe_mcast_delete(mcg->rxe, &mcg->mgid);
+ -	atomic_dec(&rxe->mcg_num);
+ -}
+ -
+ -/**
+ - * rxe_destroy_mcg - destroy mcg object
+ - * @mcg: the mcg object
+ - *
+ - * Context: no qp's are attached to mcg
+ - */
+ -static void rxe_destroy_mcg(struct rxe_mcg *mcg)
+ +int rxe_mcast_get_grp(struct rxe_dev *rxe, union ib_gid *mgid,
+ +		      struct rxe_mc_grp **grp_p)
+  {
+ +	int err;
+ +	struct rxe_mc_grp *grp;
+ +	struct rxe_pool *pool = &rxe->mc_grp_pool;
+  	unsigned long flags;
+  
+ -	spin_lock_irqsave(&mcg->rxe->mcg_lock, flags);
+ -	__rxe_destroy_mcg(mcg);
+ -	spin_unlock_irqrestore(&mcg->rxe->mcg_lock, flags);
+ -}
+ +	if (rxe->attr.max_mcast_qp_attach == 0)
+ +		return -EINVAL;
+  
+ -/**
+ - * __rxe_init_mca - initialize a new mca holding lock
+ - * @qp: qp object
+ - * @mcg: mcg object
+ - * @mca: empty space for new mca
+ - *
+ - * Context: caller must hold references on qp and mcg, rxe->mcg_lock
+ - * and pass memory for new mca
+ - *
+ - * Returns: 0 on success else an error
+ - */
+ -static int __rxe_init_mca(struct rxe_qp *qp, struct rxe_mcg *mcg,
+ -			  struct rxe_mca *mca)
+ -{
+ -	struct rxe_dev *rxe = to_rdev(qp->ibqp.device);
+ -	int n;
+ +	write_lock_irqsave(&pool->pool_lock, flags);
+  
+ -	n = atomic_inc_return(&rxe->mcg_attach);
+ -	if (n > rxe->attr.max_total_mcast_qp_attach) {
+ -		atomic_dec(&rxe->mcg_attach);
+ -		return -ENOMEM;
+ +	grp = rxe_pool_get_key_locked(pool, mgid);
+ +	if (grp)
+ +		goto done;
+ +
+ +	grp = create_grp(rxe, pool, mgid);
+ +	if (IS_ERR(grp)) {
+ +		write_unlock_irqrestore(&pool->pool_lock, flags);
+ +		err = PTR_ERR(grp);
+ +		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +done:
+ +	write_unlock_irqrestore(&pool->pool_lock, flags);
+ +	*grp_p = grp;
+++=======
++ 	n = atomic_inc_return(&mcg->qp_num);
++ 	if (n > rxe->attr.max_mcast_qp_attach) {
++ 		atomic_dec(&mcg->qp_num);
++ 		atomic_dec(&rxe->mcg_attach);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	atomic_inc(&qp->mcg_num);
++ 
++ 	rxe_get(qp);
++ 	mca->qp = qp;
++ 
++ 	list_add_tail(&mca->qp_list, &mcg->qp_list);
++ 
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  	return 0;
+  }
+  
+@@@ -126,30 -375,53 +143,37 @@@ out
+  	return err;
+  }
+  
+ -/**
+ - * __rxe_cleanup_mca - cleanup mca object holding lock
+ - * @mca: mca object
+ - * @mcg: mcg object
+ - *
+ - * Context: caller must hold a reference to mcg and rxe->mcg_lock
+ - */
+ -static void __rxe_cleanup_mca(struct rxe_mca *mca, struct rxe_mcg *mcg)
+ +int rxe_mcast_drop_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ +			    union ib_gid *mgid)
+  {
+ -	list_del(&mca->qp_list);
+ +	struct rxe_mc_grp *grp;
+ +	struct rxe_mc_elem *elem, *tmp;
+  
+++<<<<<<< HEAD
+ +	grp = rxe_pool_get_key(&rxe->mc_grp_pool, mgid);
+ +	if (!grp)
+ +		goto err1;
+++=======
++ 	atomic_dec(&mcg->qp_num);
++ 	atomic_dec(&mcg->rxe->mcg_attach);
++ 	atomic_dec(&mca->qp->mcg_num);
++ 	rxe_put(mca->qp);
+ -
+ -	kfree(mca);
+ -}
+ -
+ -/**
+ - * rxe_detach_mcg - detach qp from mcg
+ - * @mcg: mcg object
+ - * @qp: qp object
+ - *
+ - * Returns: 0 on success else an error if qp is not attached.
+ - */
+ -static int rxe_detach_mcg(struct rxe_mcg *mcg, struct rxe_qp *qp)
+ -{
+ -	struct rxe_dev *rxe = mcg->rxe;
+ -	struct rxe_mca *mca, *tmp;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&rxe->mcg_lock, flags);
+ -	list_for_each_entry_safe(mca, tmp, &mcg->qp_list, qp_list) {
+ -		if (mca->qp == qp) {
+ -			__rxe_cleanup_mca(mca, mcg);
+ -
+ -			/* if the number of qp's attached to the
+ -			 * mcast group falls to zero go ahead and
+ -			 * tear it down. This will not free the
+ -			 * object since we are still holding a ref
+ -			 * from the caller
+ -			 */
+ -			if (atomic_read(&mcg->qp_num) <= 0)
+ -				__rxe_destroy_mcg(mcg);
+ -
+ -			spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+ +
+ +	spin_lock_bh(&qp->grp_lock);
+ +	spin_lock_bh(&grp->mcg_lock);
+ +
+ +	list_for_each_entry_safe(elem, tmp, &grp->qp_list, qp_list) {
+ +		if (elem->qp == qp) {
+ +			list_del(&elem->qp_list);
+ +			list_del(&elem->grp_list);
+ +			grp->num_qp--;
+ +
+ +			spin_unlock_bh(&grp->mcg_lock);
+ +			spin_unlock_bh(&qp->grp_lock);
+ +			rxe_drop_ref(elem);
+ +			rxe_drop_ref(grp);	/* ref held by QP */
+ +			rxe_drop_ref(grp);	/* ref from get_key */
+  			return 0;
+  		}
+  	}
+diff --cc drivers/infiniband/sw/rxe/rxe_mr.c
+index 8d20900dbfc6,60a31b718774..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_mr.c
++++ b/drivers/infiniband/sw/rxe/rxe_mr.c
+@@@ -690,9 -690,8 +690,14 @@@ int rxe_dereg_mr(struct ib_mr *ibmr, st
+  	}
+  
+  	mr->state = RXE_MR_STATE_INVALID;
+++<<<<<<< HEAD
+ +	rxe_drop_ref(mr_pd(mr));
+ +	rxe_drop_index(mr);
+ +	rxe_drop_ref(mr);
+++=======
++ 	rxe_put(mr_pd(mr));
++ 	rxe_put(mr);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  
+  	return 0;
+  }
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.h
+index 837585fdbc34,24bcc786c1b3..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.h
++++ b/drivers/infiniband/sw/rxe/rxe_pool.h
+@@@ -86,73 -62,21 +86,85 @@@ void *rxe_alloc_locked(struct rxe_pool 
+  void *rxe_alloc(struct rxe_pool *pool);
+  
+  /* connect already allocated object to pool */
+ -int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_elem *elem);
+ +int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_entry *elem);
+ +
+ +#define rxe_add_to_pool(pool, obj) __rxe_add_to_pool(pool, &(obj)->pelem)
+ +
+ +/* assign an index to an indexed object and insert object into
+ + *  pool's rb tree holding and not holding the pool_lock
+ + */
+ +int __rxe_add_index_locked(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_add_index_locked(obj) __rxe_add_index_locked(&(obj)->pelem)
+ +
+ +int __rxe_add_index(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_add_index(obj) __rxe_add_index(&(obj)->pelem)
+ +
+ +/* drop an index and remove object from rb tree
+ + * holding and not holding the pool_lock
+ + */
+ +void __rxe_drop_index_locked(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_drop_index_locked(obj) __rxe_drop_index_locked(&(obj)->pelem)
+ +
+ +void __rxe_drop_index(struct rxe_pool_entry *elem);
+  
+ -#define rxe_add_to_pool(pool, obj) __rxe_add_to_pool(pool, &(obj)->elem)
+ +#define rxe_drop_index(obj) __rxe_drop_index(&(obj)->pelem)
+ +
+ +/* assign a key to a keyed object and insert object into
+ + * pool's rb tree holding and not holding pool_lock
+ + */
+ +int __rxe_add_key_locked(struct rxe_pool_entry *elem, void *key);
+ +
+ +#define rxe_add_key_locked(obj, key) __rxe_add_key_locked(&(obj)->pelem, key)
+ +
+ +int __rxe_add_key(struct rxe_pool_entry *elem, void *key);
+ +
+ +#define rxe_add_key(obj, key) __rxe_add_key(&(obj)->pelem, key)
+ +
+ +/* remove elem from rb tree holding and not holding the pool_lock */
+ +void __rxe_drop_key_locked(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_drop_key_locked(obj) __rxe_drop_key_locked(&(obj)->pelem)
+ +
+ +void __rxe_drop_key(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_drop_key(obj) __rxe_drop_key(&(obj)->pelem)
+ +
+ +/* lookup an indexed object from index holding and not holding the pool_lock.
+ + * takes a reference on object
+ + */
+ +void *rxe_pool_get_index_locked(struct rxe_pool *pool, u32 index);
+  
+ -/* lookup an indexed object from index. takes a reference on object */
+  void *rxe_pool_get_index(struct rxe_pool *pool, u32 index);
+  
+++<<<<<<< HEAD
+ +/* lookup keyed object from key holding and not holding the pool_lock.
+ + * takes a reference on the objecti
+ + */
+ +void *rxe_pool_get_key_locked(struct rxe_pool *pool, void *key);
+ +
+ +void *rxe_pool_get_key(struct rxe_pool *pool, void *key);
+ +
+ +/* cleanup an object when all references are dropped */
+ +void rxe_elem_release(struct kref *kref);
+ +
+ +/* take a reference on an object */
+ +#define rxe_add_ref(elem) kref_get(&(elem)->pelem.ref_cnt)
+ +
+ +/* drop a reference on an object */
+ +#define rxe_drop_ref(elem) kref_put(&(elem)->pelem.ref_cnt, rxe_elem_release)
+++=======
++ int __rxe_get(struct rxe_pool_elem *elem);
++ 
++ #define rxe_get(obj) __rxe_get(&(obj)->elem)
++ 
++ int __rxe_put(struct rxe_pool_elem *elem);
++ 
++ #define rxe_put(obj) __rxe_put(&(obj)->elem)
++ 
++ #define rxe_read(obj) kref_read(&(obj)->elem.ref_cnt)
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  
+  #endif /* RXE_POOL_H */
+diff --cc drivers/infiniband/sw/rxe/rxe_verbs.c
+index e2250e9584ce,67184b0281a0..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@@ -189,8 -188,7 +189,12 @@@ static int rxe_create_ah(struct ib_ah *
+  		err = copy_to_user(&uresp->ah_num, &ah->ah_num,
+  					 sizeof(uresp->ah_num));
+  		if (err) {
+++<<<<<<< HEAD
+ +			rxe_drop_index(ah);
+ +			rxe_drop_ref(ah);
+++=======
++ 			rxe_put(ah);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  			return -EFAULT;
+  		}
+  	} else if (ah->is_user) {
+@@@ -230,8 -228,7 +234,12 @@@ static int rxe_destroy_ah(struct ib_ah 
+  {
+  	struct rxe_ah *ah = to_rah(ibah);
+  
+++<<<<<<< HEAD
+ +	rxe_drop_index(ah);
+ +	rxe_drop_ref(ah);
+++=======
++ 	rxe_put(ah);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  	return 0;
+  }
+  
+@@@ -453,20 -431,19 +461,28 @@@ static struct ib_qp *rxe_create_qp(stru
+  		qp->is_user = false;
+  	}
+  
+ -	err = rxe_add_to_pool(&rxe->qp_pool, qp);
+ -	if (err)
+ -		return err;
+ +	rxe_add_index(qp);
+  
+ -	err = rxe_qp_from_init(rxe, qp, pd, init, uresp, ibqp->pd, udata);
+ +	err = rxe_qp_from_init(rxe, qp, pd, init, uresp, ibpd, udata);
+  	if (err)
+ -		goto qp_init;
+ +		goto err3;
+ +
+ +	return &qp->ibqp;
+  
+++<<<<<<< HEAD
+ +err3:
+ +	rxe_drop_index(qp);
+ +err2:
+ +	rxe_drop_ref(qp);
+ +err1:
+ +	return ERR_PTR(err);
+++=======
++ 	return 0;
++ 
++ qp_init:
++ 	rxe_put(qp);
++ 	return err;
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  }
+  
+  static int rxe_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+@@@ -512,10 -489,14 +528,14 @@@ static int rxe_query_qp(struct ib_qp *i
+  static int rxe_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
+  {
+  	struct rxe_qp *qp = to_rqp(ibqp);
+ -	int ret;
+ -
+ -	ret = rxe_qp_chk_destroy(qp);
+ -	if (ret)
+ -		return ret;
+  
+  	rxe_qp_destroy(qp);
+++<<<<<<< HEAD
+ +	rxe_drop_index(qp);
+ +	rxe_drop_ref(qp);
+++=======
++ 	rxe_put(qp);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  	return 0;
+  }
+  
+@@@ -943,8 -902,7 +963,12 @@@ static struct ib_mr *rxe_get_dma_mr(str
+  	if (!mr)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	rxe_add_index(mr);
+ +	rxe_add_ref(pd);
+++=======
++ 	rxe_get(pd);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  	rxe_mr_init_dma(pd, access, mr);
+  
+  	return &mr->ibmr;
+@@@ -967,20 -925,18 +991,25 @@@ static struct ib_mr *rxe_reg_user_mr(st
+  		goto err2;
+  	}
+  
+ +	rxe_add_index(mr);
+  
+- 	rxe_add_ref(pd);
++ 	rxe_get(pd);
+  
+ -	err = rxe_mr_init_user(pd, start, length, iova, access, mr);
+ +	err = rxe_mr_init_user(pd, start, length, iova, access, udata, mr);
+  	if (err)
+  		goto err3;
+  
+  	return &mr->ibmr;
+  
+  err3:
+++<<<<<<< HEAD
+ +	rxe_drop_ref(pd);
+ +	rxe_drop_index(mr);
+ +	rxe_drop_ref(mr);
+++=======
++ 	rxe_put(pd);
++ 	rxe_put(mr);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  err2:
+  	return ERR_PTR(err);
+  }
+@@@ -1002,9 -958,7 +1031,13 @@@ static struct ib_mr *rxe_alloc_mr(struc
+  		goto err1;
+  	}
+  
+++<<<<<<< HEAD
+ +	rxe_add_index(mr);
+ +
+ +	rxe_add_ref(pd);
+++=======
++ 	rxe_get(pd);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  
+  	err = rxe_mr_init_fast(pd, max_num_sg, mr);
+  	if (err)
+@@@ -1013,9 -967,8 +1046,14 @@@
+  	return &mr->ibmr;
+  
+  err2:
+++<<<<<<< HEAD
+ +	rxe_drop_ref(pd);
+ +	rxe_drop_index(mr);
+ +	rxe_drop_ref(mr);
+++=======
++ 	rxe_put(pd);
++ 	rxe_put(mr);
+++>>>>>>> 3197706abd05 (RDMA/rxe: Use standard names for ref counting)
+  err1:
+  	return ERR_PTR(err);
+  }
+diff --git a/drivers/infiniband/sw/rxe/rxe_av.c b/drivers/infiniband/sw/rxe/rxe_av.c
+index 360a567159fe..3b05314ca739 100644
+--- a/drivers/infiniband/sw/rxe/rxe_av.c
++++ b/drivers/infiniband/sw/rxe/rxe_av.c
+@@ -127,14 +127,14 @@ struct rxe_av *rxe_get_av(struct rxe_pkt_info *pkt, struct rxe_ah **ahp)
+ 
+ 		if (rxe_ah_pd(ah) != pkt->qp->pd) {
+ 			pr_warn("PDs don't match for AH and QP\n");
+-			rxe_drop_ref(ah);
++			rxe_put(ah);
+ 			return NULL;
+ 		}
+ 
+ 		if (ahp)
+ 			*ahp = ah;
+ 		else
+-			rxe_drop_ref(ah);
++			rxe_put(ah);
+ 
+ 		return &ah->av;
+ 	}
+diff --git a/drivers/infiniband/sw/rxe/rxe_comp.c b/drivers/infiniband/sw/rxe/rxe_comp.c
+index ead9305d9c3a..594b24175422 100644
+--- a/drivers/infiniband/sw/rxe/rxe_comp.c
++++ b/drivers/infiniband/sw/rxe/rxe_comp.c
+@@ -534,7 +534,7 @@ static void rxe_drain_resp_pkts(struct rxe_qp *qp, bool notify)
+ 	struct rxe_queue *q = qp->sq.queue;
+ 
+ 	while ((skb = skb_dequeue(&qp->resp_pkts))) {
+-		rxe_drop_ref(qp);
++		rxe_put(qp);
+ 		kfree_skb(skb);
+ 		ib_device_put(qp->ibqp.device);
+ 	}
+@@ -556,7 +556,7 @@ static void free_pkt(struct rxe_pkt_info *pkt)
+ 	struct ib_device *dev = qp->ibqp.device;
+ 
+ 	kfree_skb(skb);
+-	rxe_drop_ref(qp);
++	rxe_put(qp);
+ 	ib_device_put(dev);
+ }
+ 
+@@ -570,7 +570,7 @@ int rxe_completer(void *arg)
+ 	enum comp_state state;
+ 	int ret = 0;
+ 
+-	rxe_add_ref(qp);
++	rxe_get(qp);
+ 
+ 	if (!qp->valid || qp->req.state == QP_STATE_ERROR ||
+ 	    qp->req.state == QP_STATE_RESET) {
+@@ -769,7 +769,7 @@ int rxe_completer(void *arg)
+ done:
+ 	if (pkt)
+ 		free_pkt(pkt);
+-	rxe_drop_ref(qp);
++	rxe_put(qp);
+ 
+ 	return ret;
+ }
+* Unmerged path drivers/infiniband/sw/rxe/rxe_mcast.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe_mr.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_mw.c b/drivers/infiniband/sw/rxe/rxe_mw.c
+index 9534a7fe1a98..ca5f51c39544 100644
+--- a/drivers/infiniband/sw/rxe/rxe_mw.c
++++ b/drivers/infiniband/sw/rxe/rxe_mw.c
+@@ -12,11 +12,11 @@ int rxe_alloc_mw(struct ib_mw *ibmw, struct ib_udata *udata)
+ 	struct rxe_dev *rxe = to_rdev(ibmw->device);
+ 	int ret;
+ 
+-	rxe_add_ref(pd);
++	rxe_get(pd);
+ 
+ 	ret = rxe_add_to_pool(&rxe->mw_pool, mw);
+ 	if (ret) {
+-		rxe_drop_ref(pd);
++		rxe_put(pd);
+ 		return ret;
+ 	}
+ 
+@@ -36,14 +36,14 @@ static void rxe_do_dealloc_mw(struct rxe_mw *mw)
+ 
+ 		mw->mr = NULL;
+ 		atomic_dec(&mr->num_mw);
+-		rxe_drop_ref(mr);
++		rxe_put(mr);
+ 	}
+ 
+ 	if (mw->qp) {
+ 		struct rxe_qp *qp = mw->qp;
+ 
+ 		mw->qp = NULL;
+-		rxe_drop_ref(qp);
++		rxe_put(qp);
+ 	}
+ 
+ 	mw->access = 0;
+@@ -62,8 +62,8 @@ int rxe_dealloc_mw(struct ib_mw *ibmw)
+ 	rxe_do_dealloc_mw(mw);
+ 	spin_unlock_irqrestore(&mw->lock, flags);
+ 
+-	rxe_drop_ref(mw);
+-	rxe_drop_ref(pd);
++	rxe_put(mw);
++	rxe_put(pd);
+ 
+ 	return 0;
+ }
+@@ -172,7 +172,7 @@ static void rxe_do_bind_mw(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
+ 	mw->length = wqe->wr.wr.mw.length;
+ 
+ 	if (mw->mr) {
+-		rxe_drop_ref(mw->mr);
++		rxe_put(mw->mr);
+ 		atomic_dec(&mw->mr->num_mw);
+ 		mw->mr = NULL;
+ 	}
+@@ -180,11 +180,11 @@ static void rxe_do_bind_mw(struct rxe_qp *qp, struct rxe_send_wqe *wqe,
+ 	if (mw->length) {
+ 		mw->mr = mr;
+ 		atomic_inc(&mr->num_mw);
+-		rxe_add_ref(mr);
++		rxe_get(mr);
+ 	}
+ 
+ 	if (mw->ibmw.type == IB_MW_TYPE_2) {
+-		rxe_add_ref(qp);
++		rxe_get(qp);
+ 		mw->qp = qp;
+ 	}
+ }
+@@ -236,9 +236,9 @@ int rxe_bind_mw(struct rxe_qp *qp, struct rxe_send_wqe *wqe)
+ 	spin_unlock_irqrestore(&mw->lock, flags);
+ err_drop_mr:
+ 	if (mr)
+-		rxe_drop_ref(mr);
++		rxe_put(mr);
+ err_drop_mw:
+-	rxe_drop_ref(mw);
++	rxe_put(mw);
+ err:
+ 	return ret;
+ }
+@@ -263,13 +263,13 @@ static void rxe_do_invalidate_mw(struct rxe_mw *mw)
+ 	/* valid type 2 MW will always have a QP pointer */
+ 	qp = mw->qp;
+ 	mw->qp = NULL;
+-	rxe_drop_ref(qp);
++	rxe_put(qp);
+ 
+ 	/* valid type 2 MW will always have an MR pointer */
+ 	mr = mw->mr;
+ 	mw->mr = NULL;
+ 	atomic_dec(&mr->num_mw);
+-	rxe_drop_ref(mr);
++	rxe_put(mr);
+ 
+ 	mw->access = 0;
+ 	mw->addr = 0;
+@@ -305,7 +305,7 @@ int rxe_invalidate_mw(struct rxe_qp *qp, u32 rkey)
+ err_unlock:
+ 	spin_unlock_irqrestore(&mw->lock, flags);
+ err_drop_ref:
+-	rxe_drop_ref(mw);
++	rxe_put(mw);
+ err:
+ 	return ret;
+ }
+@@ -326,7 +326,7 @@ struct rxe_mw *rxe_lookup_mw(struct rxe_qp *qp, int access, u32 rkey)
+ 		     (mw->length == 0) ||
+ 		     (access && !(access & mw->access)) ||
+ 		     mw->state != RXE_MW_STATE_VALID)) {
+-		rxe_drop_ref(mw);
++		rxe_put(mw);
+ 		return NULL;
+ 	}
+ 
+diff --git a/drivers/infiniband/sw/rxe/rxe_net.c b/drivers/infiniband/sw/rxe/rxe_net.c
+index b06f22ffc5a8..c53f4529f098 100644
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@ -348,7 +348,7 @@ static void rxe_skb_tx_dtor(struct sk_buff *skb)
+ 		     skb_out < RXE_INFLIGHT_SKBS_PER_QP_LOW))
+ 		rxe_run_task(&qp->req.task, 1);
+ 
+-	rxe_drop_ref(qp);
++	rxe_put(qp);
+ }
+ 
+ static int rxe_send(struct sk_buff *skb, struct rxe_pkt_info *pkt)
+@@ -358,7 +358,7 @@ static int rxe_send(struct sk_buff *skb, struct rxe_pkt_info *pkt)
+ 	skb->destructor = rxe_skb_tx_dtor;
+ 	skb->sk = pkt->qp->sk->sk;
+ 
+-	rxe_add_ref(pkt->qp);
++	rxe_get(pkt->qp);
+ 	atomic_inc(&pkt->qp->skb_out);
+ 
+ 	if (skb->protocol == htons(ETH_P_IP)) {
+@@ -368,7 +368,7 @@ static int rxe_send(struct sk_buff *skb, struct rxe_pkt_info *pkt)
+ 	} else {
+ 		pr_err("Unknown layer 3 protocol: %d\n", skb->protocol);
+ 		atomic_dec(&pkt->qp->skb_out);
+-		rxe_drop_ref(pkt->qp);
++		rxe_put(pkt->qp);
+ 		kfree_skb(skb);
+ 		return -EINVAL;
+ 	}
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.h
+diff --git a/drivers/infiniband/sw/rxe/rxe_qp.c b/drivers/infiniband/sw/rxe/rxe_qp.c
+index 0c190f87442c..8b2b5ff3eb1b 100644
+--- a/drivers/infiniband/sw/rxe/rxe_qp.c
++++ b/drivers/infiniband/sw/rxe/rxe_qp.c
+@@ -333,11 +333,11 @@ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
+ 	struct rxe_cq *scq = to_rcq(init->send_cq);
+ 	struct rxe_srq *srq = init->srq ? to_rsrq(init->srq) : NULL;
+ 
+-	rxe_add_ref(pd);
+-	rxe_add_ref(rcq);
+-	rxe_add_ref(scq);
++	rxe_get(pd);
++	rxe_get(rcq);
++	rxe_get(scq);
+ 	if (srq)
+-		rxe_add_ref(srq);
++		rxe_get(srq);
+ 
+ 	qp->pd			= pd;
+ 	qp->rcq			= rcq;
+@@ -369,10 +369,10 @@ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
+ 	qp->srq = NULL;
+ 
+ 	if (srq)
+-		rxe_drop_ref(srq);
+-	rxe_drop_ref(scq);
+-	rxe_drop_ref(rcq);
+-	rxe_drop_ref(pd);
++		rxe_put(srq);
++	rxe_put(scq);
++	rxe_put(rcq);
++	rxe_put(pd);
+ 
+ 	return err;
+ }
+@@ -531,7 +531,7 @@ static void rxe_qp_reset(struct rxe_qp *qp)
+ 	qp->resp.sent_psn_nak = 0;
+ 
+ 	if (qp->resp.mr) {
+-		rxe_drop_ref(qp->resp.mr);
++		rxe_put(qp->resp.mr);
+ 		qp->resp.mr = NULL;
+ 	}
+ 
+@@ -807,20 +807,20 @@ static void rxe_qp_do_cleanup(struct work_struct *work)
+ 		rxe_queue_cleanup(qp->sq.queue);
+ 
+ 	if (qp->srq)
+-		rxe_drop_ref(qp->srq);
++		rxe_put(qp->srq);
+ 
+ 	if (qp->rq.queue)
+ 		rxe_queue_cleanup(qp->rq.queue);
+ 
+ 	if (qp->scq)
+-		rxe_drop_ref(qp->scq);
++		rxe_put(qp->scq);
+ 	if (qp->rcq)
+-		rxe_drop_ref(qp->rcq);
++		rxe_put(qp->rcq);
+ 	if (qp->pd)
+-		rxe_drop_ref(qp->pd);
++		rxe_put(qp->pd);
+ 
+ 	if (qp->resp.mr)
+-		rxe_drop_ref(qp->resp.mr);
++		rxe_put(qp->resp.mr);
+ 
+ 	if (qp_type(qp) == IB_QPT_RC)
+ 		sk_dst_reset(qp->sk->sk);
+diff --git a/drivers/infiniband/sw/rxe/rxe_recv.c b/drivers/infiniband/sw/rxe/rxe_recv.c
+index 6a6cc1fa90e4..37aac3d8e70c 100644
+--- a/drivers/infiniband/sw/rxe/rxe_recv.c
++++ b/drivers/infiniband/sw/rxe/rxe_recv.c
+@@ -217,7 +217,7 @@ static int hdr_check(struct rxe_pkt_info *pkt)
+ 	return 0;
+ 
+ err2:
+-	rxe_drop_ref(qp);
++	rxe_put(qp);
+ err1:
+ 	return -EINVAL;
+ }
+@@ -288,11 +288,11 @@ static void rxe_rcv_mcast_pkt(struct rxe_dev *rxe, struct sk_buff *skb)
+ 
+ 			cpkt = SKB_TO_PKT(cskb);
+ 			cpkt->qp = qp;
+-			rxe_add_ref(qp);
++			rxe_get(qp);
+ 			rxe_rcv_pkt(cpkt, cskb);
+ 		} else {
+ 			pkt->qp = qp;
+-			rxe_add_ref(qp);
++			rxe_get(qp);
+ 			rxe_rcv_pkt(pkt, skb);
+ 			skb = NULL;	/* mark consumed */
+ 		}
+@@ -397,7 +397,7 @@ void rxe_rcv(struct sk_buff *skb)
+ 
+ drop:
+ 	if (pkt->qp)
+-		rxe_drop_ref(pkt->qp);
++		rxe_put(pkt->qp);
+ 
+ 	kfree_skb(skb);
+ 	ib_device_put(&rxe->ib_dev);
+diff --git a/drivers/infiniband/sw/rxe/rxe_req.c b/drivers/infiniband/sw/rxe/rxe_req.c
+index 3de1d7227b69..884ecf964e14 100644
+--- a/drivers/infiniband/sw/rxe/rxe_req.c
++++ b/drivers/infiniband/sw/rxe/rxe_req.c
+@@ -624,7 +624,7 @@ int rxe_requester(void *arg)
+ 	struct rxe_ah *ah;
+ 	struct rxe_av *av;
+ 
+-	rxe_add_ref(qp);
++	rxe_get(qp);
+ 
+ next_wqe:
+ 	if (unlikely(!qp->valid || qp->req.state == QP_STATE_ERROR))
+@@ -702,7 +702,7 @@ int rxe_requester(void *arg)
+ 			wqe->state = wqe_state_done;
+ 			wqe->status = IB_WC_SUCCESS;
+ 			__rxe_do_task(&qp->comp.task);
+-			rxe_drop_ref(qp);
++			rxe_put(qp);
+ 			return 0;
+ 		}
+ 		payload = mtu;
+@@ -741,7 +741,7 @@ int rxe_requester(void *arg)
+ 	}
+ 
+ 	if (ah)
+-		rxe_drop_ref(ah);
++		rxe_put(ah);
+ 
+ 	/*
+ 	 * To prevent a race on wqe access between requester and completer,
+@@ -773,12 +773,12 @@ int rxe_requester(void *arg)
+ 
+ err_drop_ah:
+ 	if (ah)
+-		rxe_drop_ref(ah);
++		rxe_put(ah);
+ err:
+ 	wqe->state = wqe_state_error;
+ 	__rxe_do_task(&qp->comp.task);
+ 
+ exit:
+-	rxe_drop_ref(qp);
++	rxe_put(qp);
+ 	return -EAGAIN;
+ }
+diff --git a/drivers/infiniband/sw/rxe/rxe_resp.c b/drivers/infiniband/sw/rxe/rxe_resp.c
+index 70a32033b7cc..0c5798af657f 100644
+--- a/drivers/infiniband/sw/rxe/rxe_resp.c
++++ b/drivers/infiniband/sw/rxe/rxe_resp.c
+@@ -99,7 +99,7 @@ static inline enum resp_states get_req(struct rxe_qp *qp,
+ 
+ 	if (qp->resp.state == QP_STATE_ERROR) {
+ 		while ((skb = skb_dequeue(&qp->req_pkts))) {
+-			rxe_drop_ref(qp);
++			rxe_put(qp);
+ 			kfree_skb(skb);
+ 			ib_device_put(qp->ibqp.device);
+ 		}
+@@ -479,8 +479,8 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
+ 		if (mw->access & IB_ZERO_BASED)
+ 			qp->resp.offset = mw->addr;
+ 
+-		rxe_drop_ref(mw);
+-		rxe_add_ref(mr);
++		rxe_put(mw);
++		rxe_get(mr);
+ 	} else {
+ 		mr = lookup_mr(qp->pd, access, rkey, RXE_LOOKUP_REMOTE);
+ 		if (!mr) {
+@@ -523,9 +523,9 @@ static enum resp_states check_rkey(struct rxe_qp *qp,
+ 
+ err:
+ 	if (mr)
+-		rxe_drop_ref(mr);
++		rxe_put(mr);
+ 	if (mw)
+-		rxe_drop_ref(mw);
++		rxe_put(mw);
+ 
+ 	return state;
+ }
+@@ -709,12 +709,12 @@ static struct rxe_mr *rxe_recheck_mr(struct rxe_qp *qp, u32 rkey)
+ 			return NULL;
+ 
+ 		if (mw->state != RXE_MW_STATE_VALID) {
+-			rxe_drop_ref(mw);
++			rxe_put(mw);
+ 			return NULL;
+ 		}
+ 
+ 		mr = mw->mr;
+-		rxe_drop_ref(mw);
++		rxe_put(mw);
+ 	} else {
+ 		mr = rxe_pool_get_index(&rxe->mr_pool, rkey >> 8);
+ 		if (!mr || mr->rkey != rkey)
+@@ -722,7 +722,7 @@ static struct rxe_mr *rxe_recheck_mr(struct rxe_qp *qp, u32 rkey)
+ 	}
+ 
+ 	if (mr->state != RXE_MR_STATE_VALID) {
+-		rxe_drop_ref(mr);
++		rxe_put(mr);
+ 		return NULL;
+ 	}
+ 
+@@ -783,7 +783,7 @@ static enum resp_states read_reply(struct rxe_qp *qp,
+ 	if (err)
+ 		pr_err("Failed copying memory\n");
+ 	if (mr)
+-		rxe_drop_ref(mr);
++		rxe_put(mr);
+ 
+ 	if (bth_pad(&ack_pkt)) {
+ 		u8 *pad = payload_addr(&ack_pkt) + payload;
+@@ -1056,7 +1056,7 @@ static int send_atomic_ack(struct rxe_qp *qp, struct rxe_pkt_info *pkt,
+ 	rc = rxe_xmit_packet(qp, &ack_pkt, skb);
+ 	if (rc) {
+ 		pr_err_ratelimited("Failed sending ack\n");
+-		rxe_drop_ref(qp);
++		rxe_put(qp);
+ 	}
+ out:
+ 	return rc;
+@@ -1085,13 +1085,13 @@ static enum resp_states cleanup(struct rxe_qp *qp,
+ 
+ 	if (pkt) {
+ 		skb = skb_dequeue(&qp->req_pkts);
+-		rxe_drop_ref(qp);
++		rxe_put(qp);
+ 		kfree_skb(skb);
+ 		ib_device_put(qp->ibqp.device);
+ 	}
+ 
+ 	if (qp->resp.mr) {
+-		rxe_drop_ref(qp->resp.mr);
++		rxe_put(qp->resp.mr);
+ 		qp->resp.mr = NULL;
+ 	}
+ 
+@@ -1235,7 +1235,7 @@ static enum resp_states do_class_d1e_error(struct rxe_qp *qp)
+ 		}
+ 
+ 		if (qp->resp.mr) {
+-			rxe_drop_ref(qp->resp.mr);
++			rxe_put(qp->resp.mr);
+ 			qp->resp.mr = NULL;
+ 		}
+ 
+@@ -1249,7 +1249,7 @@ static void rxe_drain_req_pkts(struct rxe_qp *qp, bool notify)
+ 	struct rxe_queue *q = qp->rq.queue;
+ 
+ 	while ((skb = skb_dequeue(&qp->req_pkts))) {
+-		rxe_drop_ref(qp);
++		rxe_put(qp);
+ 		kfree_skb(skb);
+ 		ib_device_put(qp->ibqp.device);
+ 	}
+@@ -1269,7 +1269,7 @@ int rxe_responder(void *arg)
+ 	struct rxe_pkt_info *pkt = NULL;
+ 	int ret = 0;
+ 
+-	rxe_add_ref(qp);
++	rxe_get(qp);
+ 
+ 	qp->resp.aeth_syndrome = AETH_ACK_UNLIMITED;
+ 
+@@ -1456,6 +1456,6 @@ int rxe_responder(void *arg)
+ exit:
+ 	ret = -EAGAIN;
+ done:
+-	rxe_drop_ref(qp);
++	rxe_put(qp);
+ 	return ret;
+ }
+* Unmerged path drivers/infiniband/sw/rxe/rxe_verbs.c
