@@ -605,6 +605,23 @@ static int acpi_data_get_property_array(const struct acpi_device_data *data,
 	return 0;
 }
 
+static struct fwnode_handle *
+acpi_fwnode_get_named_child_node(const struct fwnode_handle *fwnode,
+				 const char *childname)
+{
+	struct fwnode_handle *child;
+
+	/*
+	 * Find first matching named child node of this fwnode.
+	 * For ACPI this will be a data only sub-node.
+	 */
+	fwnode_for_each_child_node(fwnode, child)
+		if (acpi_data_node_match(child, childname))
+			return child;
+
+	return NULL;
+}
+
 /**
  * __acpi_node_get_property_reference - returns handle to the referenced object
  * @fwnode: Firmware node to get the property from
@@ -696,6 +713,8 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 		u32 nargs, i;
 
 		if (element->type == ACPI_TYPE_LOCAL_REFERENCE) {
+			struct fwnode_handle *ref_fwnode;
+
 			ret = acpi_bus_get_device(element->reference.handle,
 						  &device);
 			if (ret)
@@ -703,6 +722,19 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 
 			nargs = 0;
 			element++;
+
+			/*
+			 * Find the referred data extension node under the
+			 * referred device node.
+			 */
+			for (ref_fwnode = acpi_fwnode_handle(device);
+			     element < end && element->type == ACPI_TYPE_STRING;
+			     element++) {
+				ref_fwnode = acpi_fwnode_get_named_child_node(
+					ref_fwnode, element->string.pointer);
+				if (!ref_fwnode)
+					return -EINVAL;
+			}
 
 			/* assume following integer elements are all args */
 			for (i = 0; element + i < end && i < num_args; i++) {
@@ -720,7 +752,7 @@ int __acpi_node_get_property_reference(const struct fwnode_handle *fwnode,
 				return -EINVAL;
 
 			if (idx == index) {
-				args->fwnode = acpi_fwnode_handle(device);
+				args->fwnode = ref_fwnode;
 				args->nargs = nargs;
 				for (i = 0; i < nargs; i++)
 					args->args[i] = element[i].integer.value;
@@ -1251,23 +1283,6 @@ acpi_fwnode_property_read_string_array(const struct fwnode_handle *fwnode,
 {
 	return acpi_node_prop_read(fwnode, propname, DEV_PROP_STRING,
 				   val, nval);
-}
-
-static struct fwnode_handle *
-acpi_fwnode_get_named_child_node(const struct fwnode_handle *fwnode,
-				 const char *childname)
-{
-	struct fwnode_handle *child;
-
-	/*
-	 * Find first matching named child node of this fwnode.
-	 * For ACPI this will be a data only sub-node.
-	 */
-	fwnode_for_each_child_node(fwnode, child)
-		if (acpi_data_node_match(child, childname))
-			return child;
-
-	return NULL;
 }
 
 static int
