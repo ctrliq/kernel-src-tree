@@ -1,0 +1,244 @@
+iommu/iova: Squash entry_dtor abstraction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit d5c383f2c98ac58c210b266cdaf7b86bc32d1ad1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d5c383f2.failed
+
+All flush queues are driven by iommu-dma now, so there is no need to
+abstract entry_dtor or its data any more. Squash the now-canonical
+implementation directly into the IOVA code to get it out of the way.
+
+	Reviewed-by: John Garry <john.garry@huawei.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Link: https://lore.kernel.org/r/2260f8de00ab5e0f9d2a1cf8978e6ae7cd4f182c.1639753638.git.robin.murphy@arm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit d5c383f2c98ac58c210b266cdaf7b86bc32d1ad1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+diff --cc drivers/iommu/dma-iommu.c
+index 223a46c79116,6691f3cd768f..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -327,6 -303,29 +315,32 @@@ static bool dev_use_swiotlb(struct devi
+  	return IS_ENABLED(CONFIG_SWIOTLB) && dev_is_untrusted(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* sysfs updates are serialised by the mutex of the group owning @domain */
++ int iommu_dma_init_fq(struct iommu_domain *domain)
++ {
++ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
++ 	int ret;
++ 
++ 	if (cookie->fq_domain)
++ 		return 0;
++ 
++ 	ret = init_iova_flush_queue(&cookie->iovad, iommu_dma_flush_iotlb_all);
++ 	if (ret) {
++ 		pr_warn("iova flush queue initialization failed\n");
++ 		return ret;
++ 	}
++ 	/*
++ 	 * Prevent incomplete iovad->fq being observable. Pairs with path from
++ 	 * __iommu_dma_unmap() through iommu_dma_free_iova() to queue_iova()
++ 	 */
++ 	smp_wmb();
++ 	WRITE_ONCE(cookie->fq_domain, domain);
++ 	return 0;
++ }
++ 
+++>>>>>>> d5c383f2c98a (iommu/iova: Squash entry_dtor abstraction)
+  /**
+   * iommu_dma_init_domain - Initialise a DMA mapping domain
+   * @domain: IOMMU domain previously prepared by iommu_get_dma_cookie()
+@@@ -469,10 -455,10 +483,14 @@@ static void iommu_dma_free_iova(struct 
+  	/* The MSI case is only ever cleaning up its most recent allocation */
+  	if (cookie->type == IOMMU_DMA_MSI_COOKIE)
+  		cookie->msi_iova -= size;
+ -	else if (gather && gather->queued)
+ +	else if (cookie->fq_domain)	/* non-strict mode */
+  		queue_iova(iovad, iova_pfn(iovad, iova),
+  				size >> iova_shift(iovad),
+++<<<<<<< HEAD
+ +				(unsigned long)freelist);
+++=======
++ 				gather->freelist);
+++>>>>>>> d5c383f2c98a (iommu/iova: Squash entry_dtor abstraction)
+  	else
+  		free_iova_fast(iovad, iova_pfn(iovad, iova),
+  				size >> iova_shift(iovad));
+* Unmerged path drivers/iommu/dma-iommu.c
+diff --git a/drivers/iommu/iova.c b/drivers/iommu/iova.c
+index 1c18cdc4d102..41732707c750 100644
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@ -103,11 +103,9 @@ static void free_iova_flush_queue(struct iova_domain *iovad)
+ 
+ 	iovad->fq         = NULL;
+ 	iovad->flush_cb   = NULL;
+-	iovad->entry_dtor = NULL;
+ }
+ 
+-int init_iova_flush_queue(struct iova_domain *iovad,
+-			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor)
++int init_iova_flush_queue(struct iova_domain *iovad, iova_flush_cb flush_cb)
+ {
+ 	struct iova_fq __percpu *queue;
+ 	int cpu;
+@@ -120,7 +118,6 @@ int init_iova_flush_queue(struct iova_domain *iovad,
+ 		return -ENOMEM;
+ 
+ 	iovad->flush_cb   = flush_cb;
+-	iovad->entry_dtor = entry_dtor;
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		struct iova_fq *fq;
+@@ -552,6 +549,16 @@ free_iova_fast(struct iova_domain *iovad, unsigned long pfn, unsigned long size)
+ }
+ EXPORT_SYMBOL_GPL(free_iova_fast);
+ 
++static void fq_entry_dtor(struct page *freelist)
++{
++	while (freelist) {
++		unsigned long p = (unsigned long)page_address(freelist);
++
++		freelist = freelist->freelist;
++		free_page(p);
++	}
++}
++
+ #define fq_ring_for_each(i, fq) \
+ 	for ((i) = (fq)->head; (i) != (fq)->tail; (i) = ((i) + 1) % IOVA_FQ_SIZE)
+ 
+@@ -584,9 +591,7 @@ static void fq_ring_free(struct iova_domain *iovad, struct iova_fq *fq)
+ 		if (fq->entries[idx].counter >= counter)
+ 			break;
+ 
+-		if (iovad->entry_dtor)
+-			iovad->entry_dtor(fq->entries[idx].data);
+-
++		fq_entry_dtor(fq->entries[idx].freelist);
+ 		free_iova_fast(iovad,
+ 			       fq->entries[idx].iova_pfn,
+ 			       fq->entries[idx].pages);
+@@ -611,15 +616,12 @@ static void fq_destroy_all_entries(struct iova_domain *iovad)
+ 	 * bother to free iovas, just call the entry_dtor on all remaining
+ 	 * entries.
+ 	 */
+-	if (!iovad->entry_dtor)
+-		return;
+-
+ 	for_each_possible_cpu(cpu) {
+ 		struct iova_fq *fq = per_cpu_ptr(iovad->fq, cpu);
+ 		int idx;
+ 
+ 		fq_ring_for_each(idx, fq)
+-			iovad->entry_dtor(fq->entries[idx].data);
++			fq_entry_dtor(fq->entries[idx].freelist);
+ 	}
+ }
+ 
+@@ -644,7 +646,7 @@ static void fq_flush_timeout(struct timer_list *t)
+ 
+ void queue_iova(struct iova_domain *iovad,
+ 		unsigned long pfn, unsigned long pages,
+-		unsigned long data)
++		struct page *freelist)
+ {
+ 	struct iova_fq *fq = raw_cpu_ptr(iovad->fq);
+ 	unsigned long flags;
+@@ -675,7 +677,7 @@ void queue_iova(struct iova_domain *iovad,
+ 
+ 	fq->entries[idx].iova_pfn = pfn;
+ 	fq->entries[idx].pages    = pages;
+-	fq->entries[idx].data     = data;
++	fq->entries[idx].freelist = freelist;
+ 	fq->entries[idx].counter  = atomic64_read(&iovad->fq_flush_start_cnt);
+ 
+ 	spin_unlock_irqrestore(&fq->lock, flags);
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index 4512ea4f00b8..55560bfec5b7 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -42,9 +42,6 @@ struct iova_domain;
+ /* Call-Back from IOVA code into IOMMU drivers */
+ typedef void (* iova_flush_cb)(struct iova_domain *domain);
+ 
+-/* Destructor for per-entry data */
+-typedef void (* iova_entry_dtor)(unsigned long data);
+-
+ /* Number of entries per Flush Queue */
+ #define IOVA_FQ_SIZE	256
+ 
+@@ -55,7 +52,7 @@ typedef void (* iova_entry_dtor)(unsigned long data);
+ struct iova_fq_entry {
+ 	unsigned long iova_pfn;
+ 	unsigned long pages;
+-	unsigned long data;
++	struct page *freelist;
+ 	u64 counter; /* Flush counter when this entrie was added */
+ };
+ 
+@@ -90,9 +87,6 @@ struct iova_domain {
+ 	iova_flush_cb	flush_cb;	/* Call-Back function to flush IOMMU
+ 					   TLBs */
+ 
+-	iova_entry_dtor entry_dtor;	/* IOMMU driver specific destructor for
+-					   iova entry */
+-
+ 	struct timer_list fq_timer;		/* Timer to regularily empty the
+ 						   flush-queues */
+ 	atomic_t fq_timer_on;			/* 1 when timer is active, 0
+@@ -148,15 +142,14 @@ void free_iova_fast(struct iova_domain *iovad, unsigned long pfn,
+ 		    unsigned long size);
+ void queue_iova(struct iova_domain *iovad,
+ 		unsigned long pfn, unsigned long pages,
+-		unsigned long data);
++		struct page *freelist);
+ unsigned long alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
+ 			      unsigned long limit_pfn, bool flush_rcache);
+ struct iova *reserve_iova(struct iova_domain *iovad, unsigned long pfn_lo,
+ 	unsigned long pfn_hi);
+ void init_iova_domain(struct iova_domain *iovad, unsigned long granule,
+ 	unsigned long start_pfn);
+-int init_iova_flush_queue(struct iova_domain *iovad,
+-			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor);
++int init_iova_flush_queue(struct iova_domain *iovad, iova_flush_cb flush_cb);
+ struct iova *find_iova(struct iova_domain *iovad, unsigned long pfn);
+ void put_iova_domain(struct iova_domain *iovad);
+ #else
+@@ -191,12 +184,6 @@ static inline void free_iova_fast(struct iova_domain *iovad,
+ {
+ }
+ 
+-static inline void queue_iova(struct iova_domain *iovad,
+-			      unsigned long pfn, unsigned long pages,
+-			      unsigned long data)
+-{
+-}
+-
+ static inline unsigned long alloc_iova_fast(struct iova_domain *iovad,
+ 					    unsigned long size,
+ 					    unsigned long limit_pfn,
+@@ -218,13 +205,6 @@ static inline void init_iova_domain(struct iova_domain *iovad,
+ {
+ }
+ 
+-static inline int init_iova_flush_queue(struct iova_domain *iovad,
+-					iova_flush_cb flush_cb,
+-					iova_entry_dtor entry_dtor)
+-{
+-	return -ENODEV;
+-}
+-
+ static inline struct iova *find_iova(struct iova_domain *iovad,
+ 				     unsigned long pfn)
+ {
