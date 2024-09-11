@@ -1,0 +1,211 @@
+bpf: Introduce fd_idx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 387544bfa291a22383d60b40f887360e2b931ec6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/387544bf.failed
+
+Typical program loading sequence involves creating bpf maps and applying
+map FDs into bpf instructions in various places in the bpf program.
+This job is done by libbpf that is using compiler generated ELF relocations
+to patch certain instruction after maps are created and BTFs are loaded.
+The goal of fd_idx is to allow bpf instructions to stay immutable
+after compilation. At load time the libbpf would still create maps as usual,
+but it wouldn't need to patch instructions. It would store map_fds into
+__u32 fd_array[] and would pass that pointer to sys_bpf(BPF_PROG_LOAD).
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210514003623.28033-9-alexei.starovoitov@gmail.com
+(cherry picked from commit 387544bfa291a22383d60b40f887360e2b931ec6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index d613063f6429,de58a714ed36..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -1325,7 -1319,8 +1329,12 @@@ union bpf_attr 
+  			/* or valid module BTF object fd or 0 to attach to vmlinux */
+  			__u32		attach_btf_obj_fd;
+  		};
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 		__u32		:32;		/* pad */
++ 		__aligned_u64	fd_array;	/* array of FDs */
+++>>>>>>> 387544bfa291 (bpf: Introduce fd_idx)
+  	};
+  
+  	struct { /* anonymous struct used by BPF_OBJ_* commands */
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 6b6b201b75bf..828d08afeee0 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -451,6 +451,7 @@ struct bpf_verifier_env {
+ 	u32 peak_states;
+ 	/* longest register parentage chain walked for liveness marking */
+ 	u32 longest_mark_read_walk;
++	bpfptr_t fd_array;
+ };
+ 
+ __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 7aed15cc139e..d3f3cc5c688e 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2099,7 +2099,7 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
+ }
+ 
+ /* last field in 'union bpf_attr' used by this command */
+-#define	BPF_PROG_LOAD_LAST_FIELD attach_prog_fd
++#define	BPF_PROG_LOAD_LAST_FIELD fd_array
+ 
+ static int bpf_prog_load(union bpf_attr *attr, union bpf_attr __user *uattr)
+ {
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 8c36b59459d3..11c612c29873 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -8941,12 +8941,14 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 	mark_reg_known_zero(env, regs, insn->dst_reg);
+ 	dst_reg->map_ptr = map;
+ 
+-	if (insn->src_reg == BPF_PSEUDO_MAP_VALUE) {
++	if (insn->src_reg == BPF_PSEUDO_MAP_VALUE ||
++	    insn->src_reg == BPF_PSEUDO_MAP_IDX_VALUE) {
+ 		dst_reg->type = PTR_TO_MAP_VALUE;
+ 		dst_reg->off = aux->map_off;
+ 		if (map_value_has_spin_lock(map))
+ 			dst_reg->id = ++env->id_gen;
+-	} else if (insn->src_reg == BPF_PSEUDO_MAP_FD) {
++	} else if (insn->src_reg == BPF_PSEUDO_MAP_FD ||
++		   insn->src_reg == BPF_PSEUDO_MAP_IDX) {
+ 		dst_reg->type = CONST_PTR_TO_MAP;
+ 	} else {
+ 		verbose(env, "bpf verifier is misconfigured\n");
+@@ -11197,6 +11199,7 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
+ 			struct bpf_map *map;
+ 			struct fd f;
+ 			u64 addr;
++			u32 fd;
+ 
+ 			if (i == insn_cnt - 1 || insn[1].code != 0 ||
+ 			    insn[1].dst_reg != 0 || insn[1].src_reg != 0 ||
+@@ -11226,16 +11229,38 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
+ 			/* In final convert_pseudo_ld_imm64() step, this is
+ 			 * converted into regular 64-bit imm load insn.
+ 			 */
+-			if ((insn[0].src_reg != BPF_PSEUDO_MAP_FD &&
+-			     insn[0].src_reg != BPF_PSEUDO_MAP_VALUE) ||
+-			    (insn[0].src_reg == BPF_PSEUDO_MAP_FD &&
+-			     insn[1].imm != 0)) {
+-				verbose(env,
+-					"unrecognized bpf_ld_imm64 insn\n");
++			switch (insn[0].src_reg) {
++			case BPF_PSEUDO_MAP_VALUE:
++			case BPF_PSEUDO_MAP_IDX_VALUE:
++				break;
++			case BPF_PSEUDO_MAP_FD:
++			case BPF_PSEUDO_MAP_IDX:
++				if (insn[1].imm == 0)
++					break;
++				fallthrough;
++			default:
++				verbose(env, "unrecognized bpf_ld_imm64 insn\n");
+ 				return -EINVAL;
+ 			}
+ 
+-			f = fdget(insn[0].imm);
++			switch (insn[0].src_reg) {
++			case BPF_PSEUDO_MAP_IDX_VALUE:
++			case BPF_PSEUDO_MAP_IDX:
++				if (bpfptr_is_null(env->fd_array)) {
++					verbose(env, "fd_idx without fd_array is invalid\n");
++					return -EPROTO;
++				}
++				if (copy_from_bpfptr_offset(&fd, env->fd_array,
++							    insn[0].imm * sizeof(fd),
++							    sizeof(fd)))
++					return -EFAULT;
++				break;
++			default:
++				fd = insn[0].imm;
++				break;
++			}
++
++			f = fdget(fd);
+ 			map = __bpf_map_get(f);
+ 			if (IS_ERR(map)) {
+ 				verbose(env, "fd %d is not pointing to valid bpf_map\n",
+@@ -11250,7 +11275,8 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
+ 			}
+ 
+ 			aux = &env->insn_aux_data[i];
+-			if (insn->src_reg == BPF_PSEUDO_MAP_FD) {
++			if (insn[0].src_reg == BPF_PSEUDO_MAP_FD ||
++			    insn[0].src_reg == BPF_PSEUDO_MAP_IDX) {
+ 				addr = (unsigned long)map;
+ 			} else {
+ 				u32 off = insn[1].imm;
+@@ -13297,6 +13323,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+ 		env->insn_aux_data[i].orig_idx = i;
+ 	env->prog = *prog;
+ 	env->ops = bpf_verifier_ops[env->prog->type];
++	env->fd_array = make_bpfptr(attr->fd_array, uattr.is_kernel);
+ 	is_priv = bpf_capable();
+ 
+ 	bpf_get_btf_vmlinux();
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index ed06cd84257e..6e235d755770 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -1097,8 +1097,8 @@ enum bpf_link_type {
+ /* When BPF ldimm64's insn[0].src_reg != 0 then this can have
+  * the following extensions:
+  *
+- * insn[0].src_reg:  BPF_PSEUDO_MAP_FD
+- * insn[0].imm:      map fd
++ * insn[0].src_reg:  BPF_PSEUDO_MAP_[FD|IDX]
++ * insn[0].imm:      map fd or fd_idx
+  * insn[1].imm:      0
+  * insn[0].off:      0
+  * insn[1].off:      0
+@@ -1106,15 +1106,19 @@ enum bpf_link_type {
+  * verifier type:    CONST_PTR_TO_MAP
+  */
+ #define BPF_PSEUDO_MAP_FD	1
+-/* insn[0].src_reg:  BPF_PSEUDO_MAP_VALUE
+- * insn[0].imm:      map fd
++#define BPF_PSEUDO_MAP_IDX	5
++
++/* insn[0].src_reg:  BPF_PSEUDO_MAP_[IDX_]VALUE
++ * insn[0].imm:      map fd or fd_idx
+  * insn[1].imm:      offset into value
+  * insn[0].off:      0
+  * insn[1].off:      0
+  * ldimm64 rewrite:  address of map[0]+offset
+  * verifier type:    PTR_TO_MAP_VALUE
+  */
+-#define BPF_PSEUDO_MAP_VALUE	2
++#define BPF_PSEUDO_MAP_VALUE		2
++#define BPF_PSEUDO_MAP_IDX_VALUE	6
++
+ /* insn[0].src_reg:  BPF_PSEUDO_BTF_ID
+  * insn[0].imm:      kernel btd id of VAR
+  * insn[1].imm:      0
+@@ -1314,6 +1318,8 @@ union bpf_attr {
+ 			/* or valid module BTF object fd or 0 to attach to vmlinux */
+ 			__u32		attach_btf_obj_fd;
+ 		};
++		__u32		:32;		/* pad */
++		__aligned_u64	fd_array;	/* array of FDs */
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_OBJ_* commands */
