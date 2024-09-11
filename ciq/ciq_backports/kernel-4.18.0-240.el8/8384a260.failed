@@ -1,0 +1,260 @@
+perf record: Adapt affinity to machines with #CPUs > 1K
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alexey Budankov <alexey.budankov@linux.intel.com>
+commit 8384a2600c7ddfc875f64e160d8b423aca4e203a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8384a260.failed
+
+Use struct mmap_cpu_mask type for the tool's thread and mmap data
+buffers to overcome current 1024 CPUs mask size limitation of cpu_set_t
+type.
+
+Currently glibc's cpu_set_t type has an internal mask size limit of 1024
+CPUs.
+
+Moving to the 'struct mmap_cpu_mask' type allows overcoming that limit.
+
+The tools bitmap API is used to manipulate objects of 'struct mmap_cpu_mask'
+type.
+
+Committer notes:
+
+To print the 'nbits' struct member we must use %zd, since it is a
+size_t, this fixes the build in some toolchains/arches.
+
+	Reported-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@redhat.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/96d7e2ff-ce8b-c1e0-d52c-aa59ea96f0ea@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 8384a2600c7ddfc875f64e160d8b423aca4e203a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-record.c
+#	tools/perf/util/mmap.c
+#	tools/perf/util/mmap.h
+diff --cc tools/perf/builtin-record.c
+index 8d9bbe9f78ab,4c301466101b..000000000000
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@@ -52,9 -55,14 +52,10 @@@
+  #include <signal.h>
+  #include <sys/mman.h>
+  #include <sys/wait.h>
+ -#include <sys/types.h>
+ -#include <sys/stat.h>
+ -#include <fcntl.h>
+  #include <linux/err.h>
+ -#include <linux/string.h>
+  #include <linux/time64.h>
+  #include <linux/zalloc.h>
++ #include <linux/bitmap.h>
+  
+  struct switch_output {
+  	bool		 enabled;
+@@@ -86,9 -94,12 +87,14 @@@ struct record 
+  	bool			timestamp_boundary;
+  	struct switch_output	switch_output;
+  	unsigned long long	samples;
+++<<<<<<< HEAD
+ +	cpu_set_t		affinity_mask;
+++=======
++ 	struct mmap_cpu_mask	affinity_mask;
++ 	unsigned long		output_max_size;	/* = 0: unlimited */
+++>>>>>>> 8384a2600c7d (perf record: Adapt affinity to machines with #CPUs > 1K)
+  };
+  
+ -static volatile int done;
+ -
+  static volatile int auxtrace_record__snapshot_started;
+  static DEFINE_TRIGGER(auxtrace_snapshot_trigger);
+  static DEFINE_TRIGGER(switch_output_trigger);
+@@@ -905,13 -959,18 +911,18 @@@ static struct perf_event_header finishe
+  	.type = PERF_RECORD_FINISHED_ROUND,
+  };
+  
+ -static void record__adjust_affinity(struct record *rec, struct mmap *map)
+ +static void record__adjust_affinity(struct record *rec, struct perf_mmap *map)
+  {
+  	if (rec->opts.affinity != PERF_AFFINITY_SYS &&
+- 	    !CPU_EQUAL(&rec->affinity_mask, &map->affinity_mask)) {
+- 		CPU_ZERO(&rec->affinity_mask);
+- 		CPU_OR(&rec->affinity_mask, &rec->affinity_mask, &map->affinity_mask);
+- 		sched_setaffinity(0, sizeof(rec->affinity_mask), &rec->affinity_mask);
++ 	    !bitmap_equal(rec->affinity_mask.bits, map->affinity_mask.bits,
++ 			  rec->affinity_mask.nbits)) {
++ 		bitmap_zero(rec->affinity_mask.bits, rec->affinity_mask.nbits);
++ 		bitmap_or(rec->affinity_mask.bits, rec->affinity_mask.bits,
++ 			  map->affinity_mask.bits, rec->affinity_mask.nbits);
++ 		sched_setaffinity(0, MMAP_CPU_MASK_BYTES(&rec->affinity_mask),
++ 				  (cpu_set_t *)rec->affinity_mask.bits);
++ 		if (verbose == 2)
++ 			mmap_cpu_mask__scnprintf(&rec->affinity_mask, "thread");
+  	}
+  }
+  
+@@@ -2345,10 -2439,9 +2356,9 @@@ int cmd_record(int argc, const char **a
+  # undef REASON
+  #endif
+  
+- 	CPU_ZERO(&rec->affinity_mask);
+  	rec->opts.affinity = PERF_AFFINITY_SYS;
+  
+ -	rec->evlist = evlist__new();
+ +	rec->evlist = perf_evlist__new();
+  	if (rec->evlist == NULL)
+  		return -ENOMEM;
+  
+@@@ -2522,7 -2628,8 +2542,12 @@@
+  
+  	err = __cmd_record(&record, argc, argv);
+  out:
+++<<<<<<< HEAD
+ +	perf_evlist__delete(rec->evlist);
+++=======
++ 	bitmap_free(rec->affinity_mask.bits);
++ 	evlist__delete(rec->evlist);
+++>>>>>>> 8384a2600c7d (perf record: Adapt affinity to machines with #CPUs > 1K)
+  	symbol__exit();
+  	auxtrace_record__free(rec->itr);
+  	return err;
+diff --cc tools/perf/util/mmap.c
+index 850493205040,3b664fa673a6..000000000000
+--- a/tools/perf/util/mmap.c
++++ b/tools/perf/util/mmap.c
+@@@ -307,26 -217,22 +307,28 @@@ static void perf_mmap__aio_munmap(struc
+  }
+  #endif
+  
+ -void mmap__munmap(struct mmap *map)
+ +void perf_mmap__munmap(struct perf_mmap *map)
+  {
++ 	bitmap_free(map->affinity_mask.bits);
++ 
+  	perf_mmap__aio_munmap(map);
+  	if (map->data != NULL) {
+ -		munmap(map->data, mmap__mmap_len(map));
+ +		munmap(map->data, perf_mmap__mmap_len(map));
+  		map->data = NULL;
+  	}
+ +	if (map->base != NULL) {
+ +		munmap(map->base, perf_mmap__mmap_len(map));
+ +		map->base = NULL;
+ +		map->fd = -1;
+ +		refcount_set(&map->refcnt, 0);
+ +	}
+  	auxtrace_mmap__munmap(&map->auxtrace_mmap);
+  }
+  
+- static void build_node_mask(int node, cpu_set_t *mask)
++ static void build_node_mask(int node, struct mmap_cpu_mask *mask)
+  {
+  	int c, cpu, nr_cpus;
+ -	const struct perf_cpu_map *cpu_map = NULL;
+ +	const struct cpu_map *cpu_map = NULL;
+  
+  	cpu_map = cpu_map__online();
+  	if (!cpu_map)
+@@@ -340,47 -246,40 +342,69 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void perf_mmap__setup_affinity_mask(struct perf_mmap *map, struct mmap_params *mp)
+++=======
++ static int perf_mmap__setup_affinity_mask(struct mmap *map, struct mmap_params *mp)
+++>>>>>>> 8384a2600c7d (perf record: Adapt affinity to machines with #CPUs > 1K)
+  {
+- 	CPU_ZERO(&map->affinity_mask);
++ 	map->affinity_mask.nbits = cpu__max_cpu();
++ 	map->affinity_mask.bits = bitmap_alloc(map->affinity_mask.nbits);
++ 	if (!map->affinity_mask.bits)
++ 		return -1;
++ 
+  	if (mp->affinity == PERF_AFFINITY_NODE && cpu__max_node() > 1)
+ -		build_node_mask(cpu__get_node(map->core.cpu), &map->affinity_mask);
+ +		build_node_mask(cpu__get_node(map->cpu), &map->affinity_mask);
+  	else if (mp->affinity == PERF_AFFINITY_CPU)
+++<<<<<<< HEAD
+ +		CPU_SET(map->cpu, &map->affinity_mask);
+++=======
++ 		set_bit(map->core.cpu, map->affinity_mask.bits);
++ 
++ 	return 0;
+++>>>>>>> 8384a2600c7d (perf record: Adapt affinity to machines with #CPUs > 1K)
+  }
+  
+ -int mmap__mmap(struct mmap *map, struct mmap_params *mp, int fd, int cpu)
+ +int perf_mmap__mmap(struct perf_mmap *map, struct mmap_params *mp, int fd, int cpu)
+  {
+ -	if (perf_mmap__mmap(&map->core, &mp->core, fd, cpu)) {
+ +	/*
+ +	 * The last one will be done at perf_mmap__consume(), so that we
+ +	 * make sure we don't prevent tools from consuming every last event in
+ +	 * the ring buffer.
+ +	 *
+ +	 * I.e. we can get the POLLHUP meaning that the fd doesn't exist
+ +	 * anymore, but the last events for it are still in the ring buffer,
+ +	 * waiting to be consumed.
+ +	 *
+ +	 * Tools can chose to ignore this at their own discretion, but the
+ +	 * evlist layer can't just drop it when filtering events in
+ +	 * perf_evlist__filter_pollfd().
+ +	 */
+ +	refcount_set(&map->refcnt, 2);
+ +	map->prev = 0;
+ +	map->mask = mp->mask;
+ +	map->base = mmap(NULL, perf_mmap__mmap_len(map), mp->prot,
+ +			 MAP_SHARED, fd, 0);
+ +	if (map->base == MAP_FAILED) {
+  		pr_debug2("failed to mmap perf event ring buffer, error %d\n",
+  			  errno);
+ +		map->base = NULL;
+  		return -1;
+  	}
+ +	map->fd = fd;
+ +	map->cpu = cpu;
+  
+- 	perf_mmap__setup_affinity_mask(map, mp);
++ 	if (mp->affinity != PERF_AFFINITY_SYS &&
++ 		perf_mmap__setup_affinity_mask(map, mp)) {
++ 		pr_debug2("failed to alloc mmap affinity mask, error %d\n",
++ 			  errno);
++ 		return -1;
++ 	}
++ 
++ 	if (verbose == 2)
++ 		mmap_cpu_mask__scnprintf(&map->affinity_mask, "mmap");
+  
+ -	map->core.flush = mp->flush;
+ +	map->flush = mp->flush;
+  
+  	map->comp_level = mp->comp_level;
+  
+diff --cc tools/perf/util/mmap.h
+index 274ce389cd84,9d5f589f02ae..000000000000
+--- a/tools/perf/util/mmap.h
++++ b/tools/perf/util/mmap.h
+@@@ -38,8 -40,7 +38,12 @@@ struct perf_mmap 
+  		int		 nr_cblocks;
+  	} aio;
+  #endif
+++<<<<<<< HEAD
+ +	cpu_set_t	affinity_mask;
+ +	u64		flush;
+++=======
++ 	struct mmap_cpu_mask	affinity_mask;
+++>>>>>>> 8384a2600c7d (perf record: Adapt affinity to machines with #CPUs > 1K)
+  	void		*data;
+  	int		comp_level;
+  };
+* Unmerged path tools/perf/builtin-record.c
+* Unmerged path tools/perf/util/mmap.c
+* Unmerged path tools/perf/util/mmap.h
