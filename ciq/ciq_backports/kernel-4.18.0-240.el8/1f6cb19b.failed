@@ -1,0 +1,117 @@
+bpf: Prevent re-mmap()'ing BPF map as writable for initially r/o mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 1f6cb19be2e231fe092f40decb71f066eba090d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1f6cb19b.failed
+
+VM_MAYWRITE flag during initial memory mapping determines if already mmap()'ed
+pages can be later remapped as writable ones through mprotect() call. To
+prevent user application to rewrite contents of memory-mapped as read-only and
+subsequently frozen BPF map, remove VM_MAYWRITE flag completely on initially
+read-only mapping.
+
+Alternatively, we could treat any memory-mapping on unfrozen map as writable
+and bump writecnt instead. But there is little legitimate reason to map
+BPF map as read-only and then re-mmap() it as writable through mprotect(),
+instead of just mmap()'ing it as read/write from the very beginning.
+
+Also, at the suggestion of Jann Horn, drop unnecessary refcounting in mmap
+operations. We can just rely on VMA holding reference to BPF map's file
+properly.
+
+Fixes: fc9702273e2e ("bpf: Add mmap() support for BPF_MAP_TYPE_ARRAY")
+	Reported-by: Jann Horn <jannh@google.com>
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Jann Horn <jannh@google.com>
+Link: https://lore.kernel.org/bpf/20200410202613.3679837-1-andriin@fb.com
+(cherry picked from commit 1f6cb19be2e231fe092f40decb71f066eba090d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/syscall.c
+diff --cc kernel/bpf/syscall.c
+index 4aa6a47aa4b8,d85f37239540..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -453,6 -581,72 +453,75 @@@ static ssize_t bpf_dummy_write(struct f
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* called for any extra memory-mapped regions (except initial) */
++ static void bpf_map_mmap_open(struct vm_area_struct *vma)
++ {
++ 	struct bpf_map *map = vma->vm_file->private_data;
++ 
++ 	if (vma->vm_flags & VM_MAYWRITE) {
++ 		mutex_lock(&map->freeze_mutex);
++ 		map->writecnt++;
++ 		mutex_unlock(&map->freeze_mutex);
++ 	}
++ }
++ 
++ /* called for all unmapped memory region (including initial) */
++ static void bpf_map_mmap_close(struct vm_area_struct *vma)
++ {
++ 	struct bpf_map *map = vma->vm_file->private_data;
++ 
++ 	if (vma->vm_flags & VM_MAYWRITE) {
++ 		mutex_lock(&map->freeze_mutex);
++ 		map->writecnt--;
++ 		mutex_unlock(&map->freeze_mutex);
++ 	}
++ }
++ 
++ static const struct vm_operations_struct bpf_map_default_vmops = {
++ 	.open		= bpf_map_mmap_open,
++ 	.close		= bpf_map_mmap_close,
++ };
++ 
++ static int bpf_map_mmap(struct file *filp, struct vm_area_struct *vma)
++ {
++ 	struct bpf_map *map = filp->private_data;
++ 	int err;
++ 
++ 	if (!map->ops->map_mmap || map_value_has_spin_lock(map))
++ 		return -ENOTSUPP;
++ 
++ 	if (!(vma->vm_flags & VM_SHARED))
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&map->freeze_mutex);
++ 
++ 	if ((vma->vm_flags & VM_WRITE) && map->frozen) {
++ 		err = -EPERM;
++ 		goto out;
++ 	}
++ 
++ 	/* set default open/close callbacks */
++ 	vma->vm_ops = &bpf_map_default_vmops;
++ 	vma->vm_private_data = map;
++ 	vma->vm_flags &= ~VM_MAYEXEC;
++ 	if (!(vma->vm_flags & VM_WRITE))
++ 		/* disallow re-mapping with PROT_WRITE */
++ 		vma->vm_flags &= ~VM_MAYWRITE;
++ 
++ 	err = map->ops->map_mmap(map, vma);
++ 	if (err)
++ 		goto out;
++ 
++ 	if (vma->vm_flags & VM_MAYWRITE)
++ 		map->writecnt++;
++ out:
++ 	mutex_unlock(&map->freeze_mutex);
++ 	return err;
++ }
++ 
+++>>>>>>> 1f6cb19be2e2 (bpf: Prevent re-mmap()'ing BPF map as writable for initially r/o mapping)
+  const struct file_operations bpf_map_fops = {
+  #ifdef CONFIG_PROC_FS
+  	.show_fdinfo	= bpf_map_show_fdinfo,
+* Unmerged path kernel/bpf/syscall.c
