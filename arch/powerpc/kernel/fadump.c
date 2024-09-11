@@ -246,7 +246,7 @@ static bool is_fadump_mem_area_contiguous(u64 d_start, u64 d_end)
  * Returns true, if there are no holes in boot memory area,
  * false otherwise.
  */
-static bool is_boot_memory_area_contiguous(void)
+bool is_fadump_boot_mem_contiguous(void)
 {
 	return is_fadump_mem_area_contiguous(0, fw_dump.boot_memory_size);
 }
@@ -255,7 +255,7 @@ static bool is_boot_memory_area_contiguous(void)
  * Returns true, if there are no holes in reserved memory area,
  * false otherwise.
  */
-static bool is_reserved_memory_area_contiguous(void)
+bool is_fadump_reserved_mem_contiguous(void)
 {
 	u64 d_start, d_end;
 
@@ -629,9 +629,9 @@ static int register_fw_dump(struct fadump_mem_struct *fdm)
 			" dump. Hardware Error(%d).\n", rc);
 		break;
 	case -3:
-		if (!is_boot_memory_area_contiguous())
+		if (!is_fadump_boot_mem_contiguous())
 			pr_err("Can't have holes in boot memory area while registering fadump\n");
-		else if (!is_reserved_memory_area_contiguous())
+		else if (!is_fadump_reserved_mem_contiguous())
 			pr_err("Can't have holes in reserved memory area while"
 			       " registering fadump\n");
 
@@ -761,7 +761,7 @@ fadump_read_registers(struct fadump_reg_entry *reg_entry, struct pt_regs *regs)
 	return reg_entry;
 }
 
-static u32 *fadump_regs_to_elf_notes(u32 *buf, struct pt_regs *regs)
+u32 *fadump_regs_to_elf_notes(u32 *buf, struct pt_regs *regs)
 {
 	struct elf_prstatus prstatus;
 
@@ -776,7 +776,7 @@ static u32 *fadump_regs_to_elf_notes(u32 *buf, struct pt_regs *regs)
 	return buf;
 }
 
-static void fadump_update_elfcore_header(char *bufp)
+void fadump_update_elfcore_header(char *bufp)
 {
 	struct elfhdr *elf;
 	struct elf_phdr *phdr;
@@ -827,7 +827,7 @@ static void fadump_free_buffer(unsigned long vaddr, unsigned long size)
 	__free_pages(page, order);
 }
 
-static s32 fadump_setup_cpu_notes_buf(u32 num_cpus)
+s32 fadump_setup_cpu_notes_buf(u32 num_cpus)
 {
 	/* Allocate buffer to hold cpu crash notes. */
 	fw_dump.cpu_notes_buf_size = num_cpus * sizeof(note_buf_t);
@@ -846,7 +846,7 @@ static s32 fadump_setup_cpu_notes_buf(u32 num_cpus)
 	return 0;
 }
 
-static void fadump_free_cpu_notes_buf(void)
+void fadump_free_cpu_notes_buf(void)
 {
 	if (!fw_dump.cpu_notes_buf_vaddr)
 		return;
