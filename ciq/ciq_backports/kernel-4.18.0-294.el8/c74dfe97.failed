@@ -1,0 +1,183 @@
+NFS: Add mount option 'softreval'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Trond Myklebust <trondmy@gmail.com>
+commit c74dfe97c104bda5144bfa8193d8e5ea67d5da7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c74dfe97.failed
+
+Add a mount option 'softreval' that allows attribute revalidation 'getattr'
+calls to time out, and causes them to fall back to using the cached
+attributes.
+The use case for this option is for ensuring that we can still (slowly)
+traverse paths and use cached information even when the server is down.
+Once the server comes back up again, the getattr calls start succeeding,
+and the caches will revalidate as usual.
+
+The 'softreval' mount option is automatically enabled if you have
+specified 'softerr'.  It can be turned off using the options
+'nosoftreval', or 'hard'.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit c74dfe97c104bda5144bfa8193d8e5ea67d5da7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/fs_context.c
+* Unmerged path fs/nfs/fs_context.c
+* Unmerged path fs/nfs/fs_context.c
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index 0c07687e5465..43959c075a28 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -1155,7 +1155,13 @@ __nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ 		dfprintk(PAGECACHE, "nfs_revalidate_inode: (%s/%Lu) getattr failed, error=%d\n",
+ 			 inode->i_sb->s_id,
+ 			 (unsigned long long)NFS_FILEID(inode), status);
+-		if (status == -ESTALE) {
++		switch (status) {
++		case -ETIMEDOUT:
++			/* A soft timeout occurred. Use cached information? */
++			if (server->flags & NFS_MOUNT_SOFTREVAL)
++				status = 0;
++			break;
++		case -ESTALE:
+ 			nfs_zap_caches(inode);
+ 			if (!S_ISDIR(inode->i_mode))
+ 				set_bit(NFS_INO_STALE, &NFS_I(inode)->flags);
+diff --git a/fs/nfs/nfs3proc.c b/fs/nfs/nfs3proc.c
+index 9446eff223cd..7cc560e72bb2 100644
+--- a/fs/nfs/nfs3proc.c
++++ b/fs/nfs/nfs3proc.c
+@@ -110,10 +110,15 @@ nfs3_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+ 		.rpc_resp	= fattr,
+ 	};
+ 	int	status;
++	unsigned short task_flags = 0;
++
++	/* Is this is an attribute revalidation, subject to softreval? */
++	if (inode && (server->flags & NFS_MOUNT_SOFTREVAL))
++		task_flags |= RPC_TASK_TIMEOUT;
+ 
+ 	dprintk("NFS call  getattr\n");
+ 	nfs_fattr_init(fattr);
+-	status = rpc_call_sync(server->client, &msg, 0);
++	status = rpc_call_sync(server->client, &msg, task_flags);
+ 	dprintk("NFS reply getattr: %d\n", status);
+ 	return status;
+ }
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index b3556eac3d7b..15e1675f857b 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -1097,11 +1097,12 @@ static int nfs4_call_sync_custom(struct rpc_task_setup *task_setup)
+ 	return ret;
+ }
+ 
+-static int nfs4_call_sync_sequence(struct rpc_clnt *clnt,
+-				   struct nfs_server *server,
+-				   struct rpc_message *msg,
+-				   struct nfs4_sequence_args *args,
+-				   struct nfs4_sequence_res *res)
++static int nfs4_do_call_sync(struct rpc_clnt *clnt,
++			     struct nfs_server *server,
++			     struct rpc_message *msg,
++			     struct nfs4_sequence_args *args,
++			     struct nfs4_sequence_res *res,
++			     unsigned short task_flags)
+ {
+ 	struct nfs_client *clp = server->nfs_client;
+ 	struct nfs4_call_sync_data data = {
+@@ -1113,12 +1114,23 @@ static int nfs4_call_sync_sequence(struct rpc_clnt *clnt,
+ 		.rpc_client = clnt,
+ 		.rpc_message = msg,
+ 		.callback_ops = clp->cl_mvops->call_sync_ops,
+-		.callback_data = &data
++		.callback_data = &data,
++		.flags = task_flags,
+ 	};
+ 
+ 	return nfs4_call_sync_custom(&task_setup);
+ }
+ 
++static int nfs4_call_sync_sequence(struct rpc_clnt *clnt,
++				   struct nfs_server *server,
++				   struct rpc_message *msg,
++				   struct nfs4_sequence_args *args,
++				   struct nfs4_sequence_res *res)
++{
++	return nfs4_do_call_sync(clnt, server, msg, args, res, 0);
++}
++
++
+ int nfs4_call_sync(struct rpc_clnt *clnt,
+ 		   struct nfs_server *server,
+ 		   struct rpc_message *msg,
+@@ -4011,11 +4023,18 @@ static int _nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+ 		.rpc_argp = &args,
+ 		.rpc_resp = &res,
+ 	};
++	unsigned short task_flags = 0;
++
++	/* Is this is an attribute revalidation, subject to softreval? */
++	if (inode && (server->flags & NFS_MOUNT_SOFTREVAL))
++		task_flags |= RPC_TASK_TIMEOUT;
+ 
+ 	nfs4_bitmap_copy_adjust(bitmask, nfs4_bitmask(server, label), inode);
+ 
+ 	nfs_fattr_init(fattr);
+-	return nfs4_call_sync(server->client, server, &msg, &args.seq_args, &res.seq_res, 0);
++	nfs4_init_sequence(&args.seq_args, &res.seq_res, 0, 0);
++	return nfs4_do_call_sync(server->client, server, &msg,
++			&args.seq_args, &res.seq_res, task_flags);
+ }
+ 
+ static int nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+diff --git a/fs/nfs/proc.c b/fs/nfs/proc.c
+index 0f7288b94633..488349f25e0f 100644
+--- a/fs/nfs/proc.c
++++ b/fs/nfs/proc.c
+@@ -108,10 +108,15 @@ nfs_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+ 		.rpc_resp	= fattr,
+ 	};
+ 	int	status;
++	unsigned short task_flags = 0;
++
++	/* Is this is an attribute revalidation, subject to softreval? */
++	if (inode && (server->flags & NFS_MOUNT_SOFTREVAL))
++		task_flags |= RPC_TASK_TIMEOUT;
+ 
+ 	dprintk("NFS call  getattr\n");
+ 	nfs_fattr_init(fattr);
+-	status = rpc_call_sync(server->client, &msg, 0);
++	status = rpc_call_sync(server->client, &msg, task_flags);
+ 	dprintk("NFS reply getattr: %d\n", status);
+ 	return status;
+ }
+diff --git a/fs/nfs/super.c b/fs/nfs/super.c
+index 4db202dbe2ec..db9004696927 100644
+--- a/fs/nfs/super.c
++++ b/fs/nfs/super.c
+@@ -670,6 +670,7 @@ static void nfs_show_mount_options(struct seq_file *m, struct nfs_server *nfss,
+ 	} nfs_info[] = {
+ 		{ NFS_MOUNT_SOFT, ",soft", "" },
+ 		{ NFS_MOUNT_SOFTERR, ",softerr", "" },
++		{ NFS_MOUNT_SOFTREVAL, ",softreval", "" },
+ 		{ NFS_MOUNT_POSIX, ",posix", "" },
+ 		{ NFS_MOUNT_NOCTO, ",nocto", "" },
+ 		{ NFS_MOUNT_NOAC, ",noac", "" },
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index df61ff8981e8..77be43911a38 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -152,6 +152,7 @@ struct nfs_server {
+ #define NFS_MOUNT_LOCAL_FLOCK		0x100000
+ #define NFS_MOUNT_LOCAL_FCNTL		0x200000
+ #define NFS_MOUNT_SOFTERR		0x400000
++#define NFS_MOUNT_SOFTREVAL		0x800000
+ 
+ 	unsigned int		caps;		/* server capabilities */
+ 	unsigned int		rsize;		/* read size */
