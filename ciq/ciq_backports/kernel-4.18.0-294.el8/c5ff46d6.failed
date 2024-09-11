@@ -1,0 +1,184 @@
+powerpc: Add ppc_inst_next()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit c5ff46d69c410f7fac173e4fde3eea484b4b4eda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c5ff46d6.failed
+
+In a few places we want to calculate the address of the next
+instruction. Previously that was simple, we just added 4 bytes, or if
+using a u32 * we incremented that pointer by 1.
+
+But prefixed instructions make it more complicated, we need to advance
+by either 4 or 8 bytes depending on the actual instruction. We also
+can't do pointer arithmetic using struct ppc_inst, because it is
+always 8 bytes in size on 64-bit, even though we might only need to
+advance by 4 bytes.
+
+So add a ppc_inst_next() helper which calculates the location of the
+next instruction, if the given instruction was located at the given
+address. Note the instruction doesn't need to actually be at the
+address in memory.
+
+Although it would seem natural for the value to be passed by value,
+that makes it too easy to write a loop that will read off the end of a
+page, eg:
+
+	for (; src < end; src = ppc_inst_next(src, *src),
+			  dest = ppc_inst_next(dest, *dest))
+
+As noticed by Christophe and Jordan, if end is the exact end of a
+page, and the next page is not mapped, this will fault, because *dest
+will read 8 bytes, 4 bytes into the next page.
+
+So value is passed by reference, so the helper can be careful to use
+ppc_inst_read() on it.
+
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+	Reviewed-by: Jordan Niethe <jniethe5@gmail.com>
+Link: https://lore.kernel.org/r/20200522133318.1681406-1-mpe@ellerman.id.au
+(cherry picked from commit c5ff46d69c410f7fac173e4fde3eea484b4b4eda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/inst.h
+#	arch/powerpc/kernel/uprobes.c
+#	arch/powerpc/lib/feature-fixups.c
+#	arch/powerpc/xmon/xmon.c
+diff --cc arch/powerpc/kernel/uprobes.c
+index 5d105b8eeece,d200e7df7167..000000000000
+--- a/arch/powerpc/kernel/uprobes.c
++++ b/arch/powerpc/kernel/uprobes.c
+@@@ -124,7 -112,7 +124,11 @@@ int arch_uprobe_post_xol(struct arch_up
+  	 * support doesn't exist and have to fix-up the next instruction
+  	 * to be executed.
+  	 */
+++<<<<<<< HEAD
+ +	regs->nip = utask->vaddr + MAX_UINSN_BYTES;
+++=======
++ 	regs->nip = (unsigned long)ppc_inst_next((void *)utask->vaddr, &auprobe->insn);
+++>>>>>>> c5ff46d69c41 (powerpc: Add ppc_inst_next())
+  
+  	user_disable_single_step(current);
+  	return 0;
+diff --cc arch/powerpc/lib/feature-fixups.c
+index e613b02bb2f0,4c0a7ee9fa00..000000000000
+--- a/arch/powerpc/lib/feature-fixups.c
++++ b/arch/powerpc/lib/feature-fixups.c
+@@@ -70,7 -68,7 +70,11 @@@ static int patch_alt_instruction(unsign
+  
+  static int patch_feature_section(unsigned long value, struct fixup_entry *fcur)
+  {
+++<<<<<<< HEAD
+ +	unsigned int *start, *end, *alt_start, *alt_end, *src, *dest;
+++=======
++ 	struct ppc_inst *start, *end, *alt_start, *alt_end, *src, *dest, nop;
+++>>>>>>> c5ff46d69c41 (powerpc: Add ppc_inst_next())
+  
+  	start = calc_addr(fcur, fcur->start_off);
+  	end = calc_addr(fcur, fcur->end_off);
+@@@ -86,13 -84,15 +90,24 @@@
+  	src = alt_start;
+  	dest = start;
+  
+++<<<<<<< HEAD
+ +	for (; src < alt_end; src++, dest++) {
+++=======
++ 	for (; src < alt_end; src = ppc_inst_next(src, src),
++ 			      dest = ppc_inst_next(dest, dest)) {
+++>>>>>>> c5ff46d69c41 (powerpc: Add ppc_inst_next())
+  		if (patch_alt_instruction(src, dest, alt_start, alt_end))
+  			return 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (; dest < end; dest++)
+ +		raw_patch_instruction(dest, PPC_INST_NOP);
+++=======
++ 	nop = ppc_inst(PPC_INST_NOP);
++ 	for (; dest < end; dest = ppc_inst_next(dest, &nop))
++ 		raw_patch_instruction(dest, nop);
+++>>>>>>> c5ff46d69c41 (powerpc: Add ppc_inst_next())
+  
+  	return 0;
+  }
+@@@ -375,14 -399,15 +390,22 @@@ static void do_final_fixups(void
+  	if (PHYSICAL_START == 0)
+  		return;
+  
+ -	src = (struct ppc_inst *)(KERNELBASE + PHYSICAL_START);
+ -	dest = (struct ppc_inst *)KERNELBASE;
+ -	end = (void *)src + (__end_interrupts - _stext);
+ +	src = (int *)(KERNELBASE + PHYSICAL_START);
+ +	dest = (int *)KERNELBASE;
+ +	length = (__end_interrupts - _stext) / sizeof(int);
+  
+++<<<<<<< HEAD
+ +	while (length--) {
+ +		raw_patch_instruction(dest, *src);
+ +		src++;
+ +		dest++;
+++=======
++ 	while (src < end) {
++ 		inst = ppc_inst_read(src);
++ 		raw_patch_instruction(dest, inst);
++ 		src = ppc_inst_next(src, src);
++ 		dest = ppc_inst_next(dest, dest);
+++>>>>>>> c5ff46d69c41 (powerpc: Add ppc_inst_next())
+  	}
+  #endif
+  }
+diff --cc arch/powerpc/xmon/xmon.c
+index 3ba3f8df7d8d,16ee6639a60c..000000000000
+--- a/arch/powerpc/xmon/xmon.c
++++ b/arch/powerpc/xmon/xmon.c
+@@@ -852,11 -915,36 +852,16 @@@ static void insert_bpts(void
+  			bp->enabled = 0;
+  			continue;
+  		}
+ -		/*
+ -		 * Check the address is not a suffix by looking for a prefix in
+ -		 * front of it.
+ -		 */
+ -		if (mread_instr(bp->address - 4, &instr2) == 8) {
+ -			printf("Breakpoint at %lx is on the second word of a prefixed instruction, disabling it\n",
+ -			       bp->address);
+ -			bp->enabled = 0;
+ -			continue;
+ -		}
+ -		/*
+ -		 * We might still be a suffix - if the prefix has already been
+ -		 * replaced by a breakpoint we won't catch it with the above
+ -		 * test.
+ -		 */
+ -		bp2 = at_breakpoint(bp->address - 4);
+ -		if (bp2 && ppc_inst_prefixed(ppc_inst_read(bp2->instr))) {
+ -			printf("Breakpoint at %lx is on the second word of a prefixed instruction, disabling it\n",
+ -			       bp->address);
+ -			bp->enabled = 0;
+ -			continue;
+ -		}
+ -
+  		patch_instruction(bp->instr, instr);
+++<<<<<<< HEAD
+++=======
++ 		patch_instruction(ppc_inst_next(bp->instr, &instr),
++ 				  ppc_inst(bpinstr));
+++>>>>>>> c5ff46d69c41 (powerpc: Add ppc_inst_next())
+  		if (bp->enabled & BP_CIABR)
+  			continue;
+ -		if (patch_instruction((struct ppc_inst *)bp->address,
+ -				      ppc_inst(bpinstr)) != 0) {
+ +		if (patch_instruction((unsigned int *)bp->address,
+ +							bpinstr) != 0) {
+  			printf("Couldn't write instruction at %lx, "
+  			       "disabling breakpoint there\n", bp->address);
+  			bp->enabled &= ~BP_TRAP;
+* Unmerged path arch/powerpc/include/asm/inst.h
+* Unmerged path arch/powerpc/include/asm/inst.h
+* Unmerged path arch/powerpc/kernel/uprobes.c
+* Unmerged path arch/powerpc/lib/feature-fixups.c
+* Unmerged path arch/powerpc/xmon/xmon.c
