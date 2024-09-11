@@ -1,0 +1,119 @@
+mm/hugetlb: defer freeing of huge pages if in non-task context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Waiman Long <longman@redhat.com>
+commit c77c0a8ac4c522638a8242fcb9de9496e3cdbb2d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c77c0a8a.failed
+
+The following lockdep splat was observed when a certain hugetlbfs test
+was run:
+
+  ================================
+  WARNING: inconsistent lock state
+  4.18.0-159.el8.x86_64+debug #1 Tainted: G        W --------- -  -
+  --------------------------------
+  inconsistent {SOFTIRQ-ON-W} -> {IN-SOFTIRQ-W} usage.
+  swapper/30/0 [HC0[0]:SC1[1]:HE1:SE0] takes:
+  ffffffff9acdc038 (hugetlb_lock){+.?.}, at: free_huge_page+0x36f/0xaa0
+  {SOFTIRQ-ON-W} state was registered at:
+    lock_acquire+0x14f/0x3b0
+    _raw_spin_lock+0x30/0x70
+    __nr_hugepages_store_common+0x11b/0xb30
+    hugetlb_sysctl_handler_common+0x209/0x2d0
+    proc_sys_call_handler+0x37f/0x450
+    vfs_write+0x157/0x460
+    ksys_write+0xb8/0x170
+    do_syscall_64+0xa5/0x4d0
+    entry_SYSCALL_64_after_hwframe+0x6a/0xdf
+  irq event stamp: 691296
+  hardirqs last  enabled at (691296): [<ffffffff99bb034b>] _raw_spin_unlock_irqrestore+0x4b/0x60
+  hardirqs last disabled at (691295): [<ffffffff99bb0ad2>] _raw_spin_lock_irqsave+0x22/0x81
+  softirqs last  enabled at (691284): [<ffffffff97ff0c63>] irq_enter+0xc3/0xe0
+  softirqs last disabled at (691285): [<ffffffff97ff0ebe>] irq_exit+0x23e/0x2b0
+
+  other info that might help us debug this:
+   Possible unsafe locking scenario:
+
+         CPU0
+         ----
+    lock(hugetlb_lock);
+    <Interrupt>
+      lock(hugetlb_lock);
+
+   *** DEADLOCK ***
+      :
+  Call Trace:
+   <IRQ>
+   __lock_acquire+0x146b/0x48c0
+   lock_acquire+0x14f/0x3b0
+   _raw_spin_lock+0x30/0x70
+   free_huge_page+0x36f/0xaa0
+   bio_check_pages_dirty+0x2fc/0x5c0
+   clone_endio+0x17f/0x670 [dm_mod]
+   blk_update_request+0x276/0xe50
+   scsi_end_request+0x7b/0x6a0
+   scsi_io_completion+0x1c6/0x1570
+   blk_done_softirq+0x22e/0x350
+   __do_softirq+0x23d/0xad8
+   irq_exit+0x23e/0x2b0
+   do_IRQ+0x11a/0x200
+   common_interrupt+0xf/0xf
+   </IRQ>
+
+Both the hugetbl_lock and the subpool lock can be acquired in
+free_huge_page().  One way to solve the problem is to make both locks
+irq-safe.  However, Mike Kravetz had learned that the hugetlb_lock is
+held for a linear scan of ALL hugetlb pages during a cgroup reparentling
+operation.  So it is just too long to have irq disabled unless we can
+break hugetbl_lock down into finer-grained locks with shorter lock hold
+times.
+
+Another alternative is to defer the freeing to a workqueue job.  This
+patch implements the deferred freeing by adding a free_hpage_workfn()
+work function to do the actual freeing.  The free_huge_page() call in a
+non-task context saves the page to be freed in the hpage_freelist linked
+list in a lockless manner using the llist APIs.
+
+The generic workqueue is used to process the work, but a dedicated
+workqueue can be used instead if it is desirable to have the huge page
+freed ASAP.
+
+Thanks to Kirill Tkhai <ktkhai@virtuozzo.com> for suggesting the use of
+llist APIs which simplfy the code.
+
+Link: http://lkml.kernel.org/r/20191217170331.30893-1-longman@redhat.com
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Acked-by: Davidlohr Bueso <dbueso@suse.de>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Reviewed-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c77c0a8ac4c522638a8242fcb9de9496e3cdbb2d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index bfa9dc1ae4d4,dd8737a94bec..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -25,6 -26,8 +25,11 @@@
+  #include <linux/swap.h>
+  #include <linux/swapops.h>
+  #include <linux/jhash.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/numa.h>
++ #include <linux/llist.h>
+++>>>>>>> c77c0a8ac4c5 (mm/hugetlb: defer freeing of huge pages if in non-task context)
+  
+  #include <asm/page.h>
+  #include <asm/pgtable.h>
+* Unmerged path mm/hugetlb.c
