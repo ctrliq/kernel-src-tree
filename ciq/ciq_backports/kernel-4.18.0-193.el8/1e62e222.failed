@@ -1,0 +1,156 @@
+net/mlx5: E-Switch, Use vport metadata matching only when mandatory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Majd Dibbiny <majd@mellanox.com>
+commit 1e62e222db2e0dc7af0a89c225311d319c5d1c4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1e62e222.failed
+
+Multi-port RoCE mode requires tagging traffic that passes through the
+vport.
+This matching can cause performance degradation, therefore disable it
+and use the legacy matching on vhca_id and source_port when possible.
+
+Fixes: 92ab1eb392c6 ("net/mlx5: E-Switch, Enable vport metadata matching if firmware supports it")
+	Signed-off-by: Majd Dibbiny <majd@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 1e62e222db2e0dc7af0a89c225311d319c5d1c4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index cfa5607ee8ba,bd26a1891b42..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1486,38 -1987,97 +1486,109 @@@ static int esw_vport_egress_prio_tag_co
+  	esw_debug(esw->dev,
+  		  "vport[%d] configure prio tag egress rules\n", vport->vport);
+  
+++<<<<<<< HEAD
+ +	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ +	if (!spec) {
+ +		err = -ENOMEM;
+ +		goto out_no_mem;
+++=======
++ 	/* prio tag vlan rule - pop it so VF receives untagged packets */
++ 	err = mlx5_esw_create_vport_egress_acl_vlan(esw, vport, 0,
++ 						    MLX5_FLOW_CONTEXT_ACTION_VLAN_POP |
++ 						    MLX5_FLOW_CONTEXT_ACTION_ALLOW);
++ 	if (err)
++ 		esw_vport_disable_egress_acl(esw, vport);
++ 
++ 	return err;
++ }
++ 
++ static bool
++ esw_check_vport_match_metadata_supported(const struct mlx5_eswitch *esw)
++ {
++ 	if (!MLX5_CAP_ESW(esw->dev, esw_uplink_ingress_acl))
++ 		return false;
++ 
++ 	if (!(MLX5_CAP_ESW_FLOWTABLE(esw->dev, fdb_to_vport_reg_c_id) &
++ 	      MLX5_FDB_TO_VPORT_REG_C_0))
++ 		return false;
++ 
++ 	if (!MLX5_CAP_ESW_FLOWTABLE(esw->dev, flow_source))
++ 		return false;
++ 
++ 	if (mlx5_core_is_ecpf_esw_manager(esw->dev) ||
++ 	    mlx5_ecpf_vport_exists(esw->dev))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static bool
++ esw_check_vport_match_metadata_mandatory(const struct mlx5_eswitch *esw)
++ {
++ 	return mlx5_core_mp_enabled(esw->dev);
++ }
++ 
++ static bool esw_use_vport_metadata(const struct mlx5_eswitch *esw)
++ {
++ 	return esw_check_vport_match_metadata_mandatory(esw) &&
++ 	       esw_check_vport_match_metadata_supported(esw);
++ }
++ 
++ int
++ esw_vport_create_offloads_acl_tables(struct mlx5_eswitch *esw,
++ 				     struct mlx5_vport *vport)
++ {
++ 	int err;
++ 
++ 	err = esw_vport_ingress_config(esw, vport);
++ 	if (err)
++ 		return err;
++ 
++ 	if (mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
++ 		err = esw_vport_egress_config(esw, vport);
++ 		if (err) {
++ 			esw_vport_cleanup_ingress_rules(esw, vport);
++ 			esw_vport_del_ingress_acl_modify_metadata(esw, vport);
++ 			esw_vport_destroy_ingress_acl_group(vport);
++ 			esw_vport_destroy_ingress_acl_table(vport);
++ 		}
+++>>>>>>> 1e62e222db2e (net/mlx5: E-Switch, Use vport metadata matching only when mandatory)
+  	}
+ -	return err;
+ -}
+  
+ -void
+ -esw_vport_destroy_offloads_acl_tables(struct mlx5_eswitch *esw,
+ -				      struct mlx5_vport *vport)
+ -{
+ -	esw_vport_disable_egress_acl(esw, vport);
+ -	esw_vport_cleanup_ingress_rules(esw, vport);
+ -	esw_vport_del_ingress_acl_modify_metadata(esw, vport);
+ -	esw_vport_destroy_ingress_acl_group(vport);
+ -	esw_vport_destroy_ingress_acl_table(vport);
+ -}
+ +	/* prio tag vlan rule - pop it so VF receives untagged packets */
+ +	MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, outer_headers.cvlan_tag);
+ +	MLX5_SET_TO_ONES(fte_match_param, spec->match_value, outer_headers.cvlan_tag);
+ +	MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, outer_headers.first_vid);
+ +	MLX5_SET(fte_match_param, spec->match_value, outer_headers.first_vid, 0);
+  
+ -static int esw_create_uplink_offloads_acl_tables(struct mlx5_eswitch *esw)
+ -{
+ -	struct mlx5_vport *vport;
+ -	int err;
+ +	spec->match_criteria_enable = MLX5_MATCH_OUTER_HEADERS;
+ +	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_VLAN_POP |
+ +			  MLX5_FLOW_CONTEXT_ACTION_ALLOW;
+ +	vport->egress.allowed_vlan =
+ +		mlx5_add_flow_rules(vport->egress.acl, spec,
+ +				    &flow_act, NULL, 0);
+ +	if (IS_ERR(vport->egress.allowed_vlan)) {
+ +		err = PTR_ERR(vport->egress.allowed_vlan);
+ +		esw_warn(esw->dev,
+ +			 "vport[%d] configure egress pop prio tag vlan rule failed, err(%d)\n",
+ +			 vport->vport, err);
+ +		vport->egress.allowed_vlan = NULL;
+ +		goto out;
+ +	}
+  
+++<<<<<<< HEAD
+ +out:
+ +	kvfree(spec);
+ +out_no_mem:
+++=======
++ 	if (esw_use_vport_metadata(esw))
++ 		esw->flags |= MLX5_ESWITCH_VPORT_MATCH_METADATA;
++ 
++ 	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_UPLINK);
++ 	err = esw_vport_create_offloads_acl_tables(esw, vport);
+++>>>>>>> 1e62e222db2e (net/mlx5: E-Switch, Use vport metadata matching only when mandatory)
+  	if (err)
+ -		esw->flags &= ~MLX5_ESWITCH_VPORT_MATCH_METADATA;
+ +		esw_vport_cleanup_egress_rules(esw, vport);
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
