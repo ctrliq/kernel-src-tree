@@ -1,0 +1,122 @@
+mm, page_alloc: do not wake kswapd with zone lock held
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 73444bc4d8f92e46a20cb6bd3342fc2ea75c6787
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/73444bc4.failed
+
+syzbot reported the following regression in the latest merge window and
+it was confirmed by Qian Cai that a similar bug was visible from a
+different context.
+
+  ======================================================
+  WARNING: possible circular locking dependency detected
+  4.20.0+ #297 Not tainted
+  ------------------------------------------------------
+  syz-executor0/8529 is trying to acquire lock:
+  000000005e7fb829 (&pgdat->kswapd_wait){....}, at:
+  __wake_up_common_lock+0x19e/0x330 kernel/sched/wait.c:120
+
+  but task is already holding lock:
+  000000009bb7bae0 (&(&zone->lock)->rlock){-.-.}, at: spin_lock
+  include/linux/spinlock.h:329 [inline]
+  000000009bb7bae0 (&(&zone->lock)->rlock){-.-.}, at: rmqueue_bulk
+  mm/page_alloc.c:2548 [inline]
+  000000009bb7bae0 (&(&zone->lock)->rlock){-.-.}, at: __rmqueue_pcplist
+  mm/page_alloc.c:3021 [inline]
+  000000009bb7bae0 (&(&zone->lock)->rlock){-.-.}, at: rmqueue_pcplist
+  mm/page_alloc.c:3050 [inline]
+  000000009bb7bae0 (&(&zone->lock)->rlock){-.-.}, at: rmqueue
+  mm/page_alloc.c:3072 [inline]
+  000000009bb7bae0 (&(&zone->lock)->rlock){-.-.}, at:
+  get_page_from_freelist+0x1bae/0x52a0 mm/page_alloc.c:3491
+
+It appears to be a false positive in that the only way the lock ordering
+should be inverted is if kswapd is waking itself and the wakeup
+allocates debugging objects which should already be allocated if it's
+kswapd doing the waking.  Nevertheless, the possibility exists and so
+it's best to avoid the problem.
+
+This patch flags a zone as needing a kswapd using the, surprisingly,
+unused zone flag field.  The flag is read without the lock held to do
+the wakeup.  It's possible that the flag setting context is not the same
+as the flag clearing context or for small races to occur.  However, each
+race possibility is harmless and there is no visible degredation in
+fragmentation treatment.
+
+While zone->flag could have continued to be unused, there is potential
+for moving some existing fields into the flags field instead.
+Particularly read-mostly ones like zone->initialized and
+zone->contiguous.
+
+Link: http://lkml.kernel.org/r/20190103225712.GJ31517@techsingularity.net
+Fixes: 1c30844d2dfe ("mm: reclaim small amounts of memory when an external fragmentation event occurs")
+	Reported-by: syzbot+93d94a001cfbce9e60e1@syzkaller.appspotmail.com
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Tested-by: Qian Cai <cai@lca.pw>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 73444bc4d8f92e46a20cb6bd3342fc2ea75c6787)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+diff --cc include/linux/mmzone.h
+index c7d5827d7de4,842f9189537b..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -606,6 -520,17 +606,20 @@@ enum pgdat_flags 
+  	PGDAT_RECLAIM_LOCKED,		/* prevents concurrent reclaim */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum zone_flags {
++ 	ZONE_BOOSTED_WATERMARK,		/* zone recently boosted watermarks.
++ 					 * Cleared when kswapd is woken.
++ 					 */
++ };
++ 
++ static inline unsigned long zone_managed_pages(struct zone *zone)
++ {
++ 	return (unsigned long)atomic_long_read(&zone->managed_pages);
++ }
++ 
+++>>>>>>> 73444bc4d8f9 (mm, page_alloc: do not wake kswapd with zone lock held)
+  static inline unsigned long zone_end_pfn(const struct zone *zone)
+  {
+  	return zone->zone_start_pfn + zone->spanned_pages;
+* Unmerged path include/linux/mmzone.h
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 42877c2f5840..43b5d4e85322 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2269,7 +2269,7 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
+ 	 */
+ 	boost_watermark(zone);
+ 	if (alloc_flags & ALLOC_KSWAPD)
+-		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
++		set_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+ 
+ 	/* We are not allowed to try stealing from the whole block */
+ 	if (!whole_block)
+@@ -3148,6 +3148,12 @@ struct page *rmqueue(struct zone *preferred_zone,
+ 	local_irq_restore(flags);
+ 
+ out:
++	/* Separate test+clear to avoid unnecessary atomics */
++	if (test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags)) {
++		clear_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
++		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
++	}
++
+ 	VM_BUG_ON_PAGE(page && bad_range(zone, page), page);
+ 	return page;
+ 
