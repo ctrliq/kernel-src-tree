@@ -14,7 +14,6 @@
 
 static char noop_bdi_dev_name[BDI_DEV_NAME_LEN];
 struct backing_dev_info noop_backing_dev_info = {
-	.name		= "noop",
 	.capabilities	= BDI_CAP_NO_ACCT_AND_WRITEBACK,
 	.dev_name	= noop_bdi_dev_name,
 };
