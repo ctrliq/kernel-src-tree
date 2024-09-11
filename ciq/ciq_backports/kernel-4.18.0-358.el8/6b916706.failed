@@ -1,0 +1,308 @@
+printk: inline log_output(),log_store() in vprintk_store()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 6b916706f8f09348cfa4fdd3642ebf87d6a2a26b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/6b916706.failed
+
+In preparation for removing logbuf_lock, inline log_output()
+and log_store() into vprintk_store(). This will simplify dealing
+with the various code branches and fallbacks that are possible.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20201209004453.17720-2-john.ogness@linutronix.de
+(cherry picked from commit 6b916706f8f09348cfa4fdd3642ebf87d6a2a26b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index c1fedccb5ed4,150bfde41ba1..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -602,78 -479,18 +602,81 @@@ static u32 truncate_msg(u16 *text_len, 
+  	 * get removed too soon.
+  	 */
+  	u32 max_text_len = log_buf_len / MAX_LOG_TAKE_PART;
+ -
+  	if (*text_len > max_text_len)
+  		*text_len = max_text_len;
+ -
+ -	/* enable the warning message (if there is room) */
+ +	/* enable the warning message */
+  	*trunc_msg_len = strlen(trunc_msg);
+ -	if (*text_len >= *trunc_msg_len)
+ -		*text_len -= *trunc_msg_len;
+ +	/* disable the "dict" completely */
+ +	*dict_len = 0;
+ +	/* compute the size again, count also the warning message */
+ +	return msg_used_size(*text_len + *trunc_msg_len, 0, pad_len);
+ +}
+ +
+++<<<<<<< HEAD
+ +/* insert record into the buffer, discard old ones, update heads */
+ +static int log_store(u32 caller_id, int facility, int level,
+ +		     enum log_flags flags, u64 ts_nsec,
+ +		     const char *dict, u16 dict_len,
+ +		     const char *text, u16 text_len)
+ +{
+ +	struct printk_log *msg;
+ +	u32 size, pad_len;
+ +	u16 trunc_msg_len = 0;
+ +
+ +	/* number of '\0' padding bytes to next message */
+ +	size = msg_used_size(text_len, dict_len, &pad_len);
+ +
+ +	if (log_make_free_space(size)) {
+ +		/* truncate the message if it is too long for empty buffer */
+ +		size = truncate_msg(&text_len, &trunc_msg_len,
+ +				    &dict_len, &pad_len);
+ +		/* survive when the log buffer is too small for trunc_msg */
+ +		if (log_make_free_space(size))
+ +			return 0;
+ +	}
+ +
+ +	if (log_next_idx + size + sizeof(struct printk_log) > log_buf_len) {
+ +		/*
+ +		 * This message + an additional empty header does not fit
+ +		 * at the end of the buffer. Add an empty header with len == 0
+ +		 * to signify a wrap around.
+ +		 */
+ +		memset(log_buf + log_next_idx, 0, sizeof(struct printk_log));
+ +		log_next_idx = 0;
+ +	}
+ +
+ +	/* fill message */
+ +	msg = (struct printk_log *)(log_buf + log_next_idx);
+ +	memcpy(log_text(msg), text, text_len);
+ +	msg->text_len = text_len;
+ +	if (trunc_msg_len) {
+ +		memcpy(log_text(msg) + text_len, trunc_msg, trunc_msg_len);
+ +		msg->text_len += trunc_msg_len;
+ +	}
+ +	memcpy(log_dict(msg), dict, dict_len);
+ +	msg->dict_len = dict_len;
+ +	msg->facility = facility;
+ +	msg->level = level & 7;
+ +	msg->flags = flags & 0x1f;
+ +	if (ts_nsec > 0)
+ +		msg->ts_nsec = ts_nsec;
+  	else
+ -		*trunc_msg_len = 0;
+ +		msg->ts_nsec = local_clock();
+ +#ifdef CONFIG_PRINTK_CALLER
+ +	msg->caller_id = caller_id;
+ +#endif
+ +	memset(log_dict(msg) + dict_len, 0, pad_len);
+ +	msg->len = size;
+ +
+ +	/* insert message */
+ +	log_next_idx += msg->len;
+ +	log_next_seq++;
+ +
+ +	return msg->text_len;
+  }
+  
+++=======
+++>>>>>>> 6b916706f8f0 (printk: inline log_output(),log_store() in vprintk_store())
+  int dmesg_restrict = IS_ENABLED(CONFIG_SECURITY_DMESG_RESTRICT);
+  
+  static int syslog_action_restricted(int type)
+@@@ -1847,103 -1861,28 +1850,119 @@@ static inline u32 printk_caller_id(void
+  		0x80000000 + raw_smp_processor_id();
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Continuation lines are buffered, and not committed to the record buffer
+ + * until the line is complete, or a race forces it. The line fragments
+ + * though, are printed immediately to the consoles to ensure everything has
+ + * reached the console in case of a kernel crash.
+ + */
+ +static struct cont {
+ +	char buf[LOG_LINE_MAX];
+ +	size_t len;			/* length == 0 means unused buffer */
+ +	u32 caller_id;			/* printk_caller_id() of first print */
+ +	u64 ts_nsec;			/* time of first print */
+ +	u8 level;			/* log level of first message */
+ +	u8 facility;			/* log facility of first message */
+ +	enum log_flags flags;		/* prefix, newline flags */
+ +} cont;
+ +
+ +static void cont_flush(void)
+ +{
+ +	if (cont.len == 0)
+ +		return;
+ +
+ +	log_store(cont.caller_id, cont.facility, cont.level, cont.flags,
+ +		  cont.ts_nsec, NULL, 0, cont.buf, cont.len);
+ +	cont.len = 0;
+ +}
+ +
+ +static bool cont_add(u32 caller_id, int facility, int level,
+ +		     enum log_flags flags, const char *text, size_t len)
+ +{
+ +	/* If the line gets too long, split it up in separate records. */
+ +	if (cont.len + len > sizeof(cont.buf)) {
+ +		cont_flush();
+ +		return false;
+ +	}
+ +
+ +	if (!cont.len) {
+ +		cont.facility = facility;
+ +		cont.level = level;
+ +		cont.caller_id = caller_id;
+ +		cont.ts_nsec = local_clock();
+ +		cont.flags = flags;
+ +	}
+ +
+ +	memcpy(cont.buf + cont.len, text, len);
+ +	cont.len += len;
+ +
+ +	// The original flags come from the first line,
+ +	// but later continuations can add a newline.
+ +	if (flags & LOG_NEWLINE) {
+ +		cont.flags |= LOG_NEWLINE;
+ +		cont_flush();
+ +	}
+ +
+ +	return true;
+ +}
+ +
+ +static size_t log_output(int facility, int level, enum log_flags lflags, const char *dict, size_t dictlen, char *text, size_t text_len)
+ +{
+ +	const u32 caller_id = printk_caller_id();
+ +
+ +	/*
+ +	 * If an earlier line was buffered, and we're a continuation
+ +	 * write from the same context, try to add it to the buffer.
+ +	 */
+ +	if (cont.len) {
+ +		if (cont.caller_id == caller_id && (lflags & LOG_CONT)) {
+ +			if (cont_add(caller_id, facility, level, lflags, text, text_len))
+ +				return text_len;
+ +		}
+ +		/* Otherwise, make sure it's flushed */
+ +		cont_flush();
+ +	}
+ +
+ +	/* Skip empty continuation lines that couldn't be added - they just flush */
+ +	if (!text_len && (lflags & LOG_CONT))
+ +		return 0;
+ +
+ +	/* If it doesn't end in a newline, try to buffer the current line */
+ +	if (!(lflags & LOG_NEWLINE)) {
+ +		if (cont_add(caller_id, facility, level, lflags, text, text_len))
+ +			return text_len;
+ +	}
+ +
+ +	/* Store it in the record log */
+ +	return log_store(caller_id, facility, level, lflags, 0,
+ +			 dict, dictlen, text, text_len);
+ +}
+ +
+++=======
+++>>>>>>> 6b916706f8f0 (printk: inline log_output(),log_store() in vprintk_store())
+  /* Must be called under logbuf_lock. */
+  int vprintk_store(int facility, int level,
+ -		  const struct dev_printk_info *dev_info,
+ +		  const char *dict, size_t dictlen,
+  		  const char *fmt, va_list args)
+  {
++ 	const u32 caller_id = printk_caller_id();
+  	static char textbuf[LOG_LINE_MAX];
+- 	char *text = textbuf;
+- 	size_t text_len;
++ 	struct prb_reserved_entry e;
+  	enum log_flags lflags = 0;
++ 	struct printk_record r;
++ 	u16 trunc_msg_len = 0;
++ 	char *text = textbuf;
++ 	u16 text_len;
++ 	u64 ts_nsec;
++ 
++ 	/*
++ 	 * Since the duration of printk() can vary depending on the message
++ 	 * and state of the ringbuffer, grab the timestamp now so that it is
++ 	 * close to the call of printk(). This provides a more deterministic
++ 	 * timestamp with respect to the caller.
++ 	 */
++ 	ts_nsec = local_clock();
+  
+  	/*
+  	 * The printf needs to come first; we need the syslog
+@@@ -1979,11 -1918,61 +1998,66 @@@
+  	if (level == LOGLEVEL_DEFAULT)
+  		level = default_message_loglevel;
+  
+ -	if (dev_info)
+ +	if (dict)
+  		lflags |= LOG_NEWLINE;
+  
+++<<<<<<< HEAD
+ +	return log_output(facility, level, lflags,
+ +			  dict, dictlen, text, text_len);
+++=======
++ 	if (lflags & LOG_CONT) {
++ 		prb_rec_init_wr(&r, text_len);
++ 		if (prb_reserve_in_last(&e, prb, &r, caller_id, LOG_LINE_MAX)) {
++ 			memcpy(&r.text_buf[r.info->text_len], text, text_len);
++ 			r.info->text_len += text_len;
++ 
++ 			if (lflags & LOG_NEWLINE) {
++ 				r.info->flags |= LOG_NEWLINE;
++ 				prb_final_commit(&e);
++ 			} else {
++ 				prb_commit(&e);
++ 			}
++ 
++ 			return text_len;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Explicitly initialize the record before every prb_reserve() call.
++ 	 * prb_reserve_in_last() and prb_reserve() purposely invalidate the
++ 	 * structure when they fail.
++ 	 */
++ 	prb_rec_init_wr(&r, text_len);
++ 	if (!prb_reserve(&e, prb, &r)) {
++ 		/* truncate the message if it is too long for empty buffer */
++ 		truncate_msg(&text_len, &trunc_msg_len);
++ 
++ 		prb_rec_init_wr(&r, text_len + trunc_msg_len);
++ 		if (!prb_reserve(&e, prb, &r))
++ 			return 0;
++ 	}
++ 
++ 	/* fill message */
++ 	memcpy(&r.text_buf[0], text, text_len);
++ 	if (trunc_msg_len)
++ 		memcpy(&r.text_buf[text_len], trunc_msg, trunc_msg_len);
++ 	r.info->text_len = text_len + trunc_msg_len;
++ 	r.info->facility = facility;
++ 	r.info->level = level & 7;
++ 	r.info->flags = lflags & 0x1f;
++ 	r.info->ts_nsec = ts_nsec;
++ 	r.info->caller_id = caller_id;
++ 	if (dev_info)
++ 		memcpy(&r.info->dev_info, dev_info, sizeof(r.info->dev_info));
++ 
++ 	/* A message without a trailing newline can be continued. */
++ 	if (!(lflags & LOG_NEWLINE))
++ 		prb_commit(&e);
++ 	else
++ 		prb_final_commit(&e);
++ 
++ 	return (text_len + trunc_msg_len);
+++>>>>>>> 6b916706f8f0 (printk: inline log_output(),log_store() in vprintk_store())
+  }
+  
+  asmlinkage int vprintk_emit(int facility, int level,
+* Unmerged path kernel/printk/printk.c
