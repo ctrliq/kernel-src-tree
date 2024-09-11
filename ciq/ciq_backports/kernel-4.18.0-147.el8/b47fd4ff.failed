@@ -1,0 +1,273 @@
+RDMA/mlx5: Add NIC TX namespace when getting a flow table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Mark Bloch <markb@mellanox.com>
+commit b47fd4ffe2d6422a986f19d47563d72c79ebbc21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b47fd4ff.failed
+
+Add the ability to get a NIC TX flow table when using _get_flow_table().
+This will allow to create a matcher and a flow rule on the NIC TX path.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b47fd4ffe2d6422a986f19d47563d72c79ebbc21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/flow.c
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 9a6f3991a7ec,e311b6f8e1ee..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3688,6 -3719,210 +3688,213 @@@ free_ucmd
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mlx5_ib_flow_prio *
++ _get_flow_table(struct mlx5_ib_dev *dev,
++ 		struct mlx5_ib_flow_matcher *fs_matcher,
++ 		bool mcast)
++ {
++ 	struct mlx5_flow_namespace *ns = NULL;
++ 	struct mlx5_ib_flow_prio *prio;
++ 	int max_table_size;
++ 	u32 flags = 0;
++ 	int priority;
++ 
++ 	if (fs_matcher->ns_type == MLX5_FLOW_NAMESPACE_BYPASS) {
++ 		max_table_size = BIT(MLX5_CAP_FLOWTABLE_NIC_RX(dev->mdev,
++ 					log_max_ft_size));
++ 		if (MLX5_CAP_FLOWTABLE_NIC_RX(dev->mdev, decap))
++ 			flags |= MLX5_FLOW_TABLE_TUNNEL_EN_DECAP;
++ 		if (MLX5_CAP_FLOWTABLE_NIC_RX(dev->mdev,
++ 					      reformat_l3_tunnel_to_l2))
++ 			flags |= MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT;
++ 	} else { /* Can only be MLX5_FLOW_NAMESPACE_EGRESS */
++ 		max_table_size = BIT(MLX5_CAP_FLOWTABLE_NIC_TX(dev->mdev,
++ 					log_max_ft_size));
++ 		if (MLX5_CAP_FLOWTABLE_NIC_TX(dev->mdev, reformat))
++ 			flags |= MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT;
++ 	}
++ 
++ 	if (max_table_size < MLX5_FS_MAX_ENTRIES)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (mcast)
++ 		priority = MLX5_IB_FLOW_MCAST_PRIO;
++ 	else
++ 		priority = ib_prio_to_core_prio(fs_matcher->priority, false);
++ 
++ 	ns = mlx5_get_flow_namespace(dev->mdev, fs_matcher->ns_type);
++ 	if (!ns)
++ 		return ERR_PTR(-ENOTSUPP);
++ 
++ 	if (fs_matcher->ns_type == MLX5_FLOW_NAMESPACE_BYPASS)
++ 		prio = &dev->flow_db->prios[priority];
++ 	else
++ 		prio = &dev->flow_db->egress_prios[priority];
++ 
++ 	if (prio->flow_table)
++ 		return prio;
++ 
++ 	return _get_prio(ns, prio, priority, MLX5_FS_MAX_ENTRIES,
++ 			 MLX5_FS_MAX_TYPES, flags);
++ }
++ 
++ static struct mlx5_ib_flow_handler *
++ _create_raw_flow_rule(struct mlx5_ib_dev *dev,
++ 		      struct mlx5_ib_flow_prio *ft_prio,
++ 		      struct mlx5_flow_destination *dst,
++ 		      struct mlx5_ib_flow_matcher  *fs_matcher,
++ 		      struct mlx5_flow_act *flow_act,
++ 		      void *cmd_in, int inlen)
++ {
++ 	struct mlx5_ib_flow_handler *handler;
++ 	struct mlx5_flow_spec *spec;
++ 	struct mlx5_flow_table *ft = ft_prio->flow_table;
++ 	int err = 0;
++ 
++ 	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++ 	handler = kzalloc(sizeof(*handler), GFP_KERNEL);
++ 	if (!handler || !spec) {
++ 		err = -ENOMEM;
++ 		goto free;
++ 	}
++ 
++ 	INIT_LIST_HEAD(&handler->list);
++ 
++ 	memcpy(spec->match_value, cmd_in, inlen);
++ 	memcpy(spec->match_criteria, fs_matcher->matcher_mask.match_params,
++ 	       fs_matcher->mask_len);
++ 	spec->match_criteria_enable = fs_matcher->match_criteria_enable;
++ 
++ 	handler->rule = mlx5_add_flow_rules(ft, spec,
++ 					    flow_act, dst, 1);
++ 
++ 	if (IS_ERR(handler->rule)) {
++ 		err = PTR_ERR(handler->rule);
++ 		goto free;
++ 	}
++ 
++ 	ft_prio->refcount++;
++ 	handler->prio = ft_prio;
++ 	handler->dev = dev;
++ 	ft_prio->flow_table = ft;
++ 
++ free:
++ 	if (err)
++ 		kfree(handler);
++ 	kvfree(spec);
++ 	return err ? ERR_PTR(err) : handler;
++ }
++ 
++ static bool raw_fs_is_multicast(struct mlx5_ib_flow_matcher *fs_matcher,
++ 				void *match_v)
++ {
++ 	void *match_c;
++ 	void *match_v_set_lyr_2_4, *match_c_set_lyr_2_4;
++ 	void *dmac, *dmac_mask;
++ 	void *ipv4, *ipv4_mask;
++ 
++ 	if (!(fs_matcher->match_criteria_enable &
++ 	      (1 << MATCH_CRITERIA_ENABLE_OUTER_BIT)))
++ 		return false;
++ 
++ 	match_c = fs_matcher->matcher_mask.match_params;
++ 	match_v_set_lyr_2_4 = MLX5_ADDR_OF(fte_match_param, match_v,
++ 					   outer_headers);
++ 	match_c_set_lyr_2_4 = MLX5_ADDR_OF(fte_match_param, match_c,
++ 					   outer_headers);
++ 
++ 	dmac = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_v_set_lyr_2_4,
++ 			    dmac_47_16);
++ 	dmac_mask = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_c_set_lyr_2_4,
++ 				 dmac_47_16);
++ 
++ 	if (is_multicast_ether_addr(dmac) &&
++ 	    is_multicast_ether_addr(dmac_mask))
++ 		return true;
++ 
++ 	ipv4 = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_v_set_lyr_2_4,
++ 			    dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++ 
++ 	ipv4_mask = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_c_set_lyr_2_4,
++ 				 dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++ 
++ 	if (ipv4_is_multicast(*(__be32 *)(ipv4)) &&
++ 	    ipv4_is_multicast(*(__be32 *)(ipv4_mask)))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ struct mlx5_ib_flow_handler *
++ mlx5_ib_raw_fs_rule_add(struct mlx5_ib_dev *dev,
++ 			struct mlx5_ib_flow_matcher *fs_matcher,
++ 			struct mlx5_flow_act *flow_act,
++ 			void *cmd_in, int inlen, int dest_id,
++ 			int dest_type)
++ {
++ 	struct mlx5_flow_destination *dst;
++ 	struct mlx5_ib_flow_prio *ft_prio;
++ 	struct mlx5_ib_flow_handler *handler;
++ 	bool mcast;
++ 	int err;
++ 
++ 	if (fs_matcher->flow_type != MLX5_IB_FLOW_TYPE_NORMAL)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (fs_matcher->priority > MLX5_IB_FLOW_LAST_PRIO)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	dst = kzalloc(sizeof(*dst), GFP_KERNEL);
++ 	if (!dst)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	mcast = raw_fs_is_multicast(fs_matcher, cmd_in);
++ 	mutex_lock(&dev->flow_db->lock);
++ 
++ 	ft_prio = _get_flow_table(dev, fs_matcher, mcast);
++ 	if (IS_ERR(ft_prio)) {
++ 		err = PTR_ERR(ft_prio);
++ 		goto unlock;
++ 	}
++ 
++ 	if (dest_type == MLX5_FLOW_DESTINATION_TYPE_TIR) {
++ 		dst->type = dest_type;
++ 		dst->tir_num = dest_id;
++ 		flow_act->action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 	} else {
++ 		dst->type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE_NUM;
++ 		dst->ft_num = dest_id;
++ 		flow_act->action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 	}
++ 
++ 	handler = _create_raw_flow_rule(dev, ft_prio, dst, fs_matcher, flow_act,
++ 					cmd_in, inlen);
++ 
++ 	if (IS_ERR(handler)) {
++ 		err = PTR_ERR(handler);
++ 		goto destroy_ft;
++ 	}
++ 
++ 	mutex_unlock(&dev->flow_db->lock);
++ 	atomic_inc(&fs_matcher->usecnt);
++ 	handler->flow_matcher = fs_matcher;
++ 
++ 	kfree(dst);
++ 
++ 	return handler;
++ 
++ destroy_ft:
++ 	put_flow_table(dev, ft_prio, false);
++ unlock:
++ 	mutex_unlock(&dev->flow_db->lock);
++ 	kfree(dst);
++ 
++ 	return ERR_PTR(err);
++ }
++ 
+++>>>>>>> b47fd4ffe2d6 (RDMA/mlx5: Add NIC TX namespace when getting a flow table)
+  static u32 mlx5_ib_flow_action_flags_to_accel_xfrm_flags(u32 mlx5_flags)
+  {
+  	u32 flags = 0;
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 8e3518691d4a,6c57872fdc4e..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -174,6 -182,19 +174,22 @@@ struct mlx5_ib_flow_handler 
+  	struct mlx5_ib_flow_prio	*prio;
+  	struct mlx5_flow_handle		*rule;
+  	struct ib_counters		*ibcounters;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_ib_dev		*dev;
++ 	struct mlx5_ib_flow_matcher	*flow_matcher;
++ };
++ 
++ struct mlx5_ib_flow_matcher {
++ 	struct mlx5_ib_match_params matcher_mask;
++ 	int			mask_len;
++ 	enum mlx5_ib_flow_type	flow_type;
++ 	enum mlx5_flow_namespace_type ns_type;
++ 	u16			priority;
++ 	struct mlx5_core_dev	*mdev;
++ 	atomic_t		usecnt;
++ 	u8			match_criteria_enable;
+++>>>>>>> b47fd4ffe2d6 (RDMA/mlx5: Add NIC TX namespace when getting a flow table)
+  };
+  
+  struct mlx5_ib_flow_db {
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
