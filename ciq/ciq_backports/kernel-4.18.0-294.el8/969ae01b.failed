@@ -1,0 +1,138 @@
+s390/pci: Fix zpci_alloc_domain() over allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 969ae01bab2fe938b4c8324836038b5ac1c78fac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/969ae01b.failed
+
+Until now zpci_alloc_domain() only prevented more than
+CONFIG_PCI_NR_FUNCTIONS from being added when using automatic domain
+allocation. When explicit UIDs were defined UIDs above
+CONFIG_PCI_NR_FUNCTIONS were not counted at all.
+When more PCI functions are added this could lead to various errors
+including under sized IRQ vectors and similar issues.
+
+Fix this by explicitly tracking the number of allocated domains.
+
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 969ae01bab2fe938b4c8324836038b5ac1c78fac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index a6bd6f355af0,2b90a90aa81d..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -606,59 -608,22 +607,63 @@@ void pcibios_disable_device(struct pci_
+  	zpci_debug_exit_device(zdev);
+  }
+  
+ +#ifdef CONFIG_HIBERNATE_CALLBACKS
+ +static int zpci_restore(struct device *dev)
+ +{
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	struct zpci_dev *zdev = to_zpci(pdev);
+ +	int ret = 0;
+ +
+ +	if (zdev->state != ZPCI_FN_STATE_ONLINE)
+ +		goto out;
+ +
+ +	ret = clp_enable_fh(zdev, ZPCI_NR_DMA_SPACES);
+ +	if (ret)
+ +		goto out;
+ +
+ +	zpci_map_resources(pdev);
+ +	zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+ +			   (u64) zdev->dma_table);
+ +
+ +out:
+ +	return ret;
+ +}
+ +
+ +static int zpci_freeze(struct device *dev)
+ +{
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	struct zpci_dev *zdev = to_zpci(pdev);
+ +
+ +	if (zdev->state != ZPCI_FN_STATE_ONLINE)
+ +		return 0;
+ +
+ +	zpci_unregister_ioat(zdev, 0);
+ +	zpci_unmap_resources(pdev);
+ +	return clp_disable_fh(zdev);
+ +}
+ +
+ +struct dev_pm_ops pcibios_pm_ops = {
+ +	.thaw_noirq = zpci_restore,
+ +	.freeze_noirq = zpci_freeze,
+ +	.restore_noirq = zpci_restore,
+ +	.poweroff_noirq = zpci_freeze,
+ +};
+ +#endif /* CONFIG_HIBERNATE_CALLBACKS */
+ +
+  static int zpci_alloc_domain(struct zpci_dev *zdev)
+  {
++ 	spin_lock(&zpci_domain_lock);
++ 	if (zpci_num_domains_allocated > (ZPCI_NR_DEVICES - 1)) {
++ 		spin_unlock(&zpci_domain_lock);
++ 		pr_err("Adding PCI function %08x failed because the configured limit of %d is reached\n",
++ 			zdev->fid, ZPCI_NR_DEVICES);
++ 		return -ENOSPC;
++ 	}
++ 
+  	if (zpci_unique_uid) {
+  		zdev->domain = (u16) zdev->uid;
+- 		if (zdev->domain >= ZPCI_NR_DEVICES)
+- 			return 0;
+- 
+- 		spin_lock(&zpci_domain_lock);
+  		if (test_bit(zdev->domain, zpci_domain)) {
+  			spin_unlock(&zpci_domain_lock);
+ -			pr_err("Adding PCI function %08x failed because domain %04x is already assigned\n",
+ -				zdev->fid, zdev->domain);
+  			return -EEXIST;
+  		}
+  		set_bit(zdev->domain, zpci_domain);
+@@@ -665,14 -631,14 +671,21 @@@
+  		spin_unlock(&zpci_domain_lock);
+  		return 0;
+  	}
+- 
+- 	spin_lock(&zpci_domain_lock);
++ 	/*
++ 	 * We can always auto allocate domains below ZPCI_NR_DEVICES.
++ 	 * There is either a free domain or we have reached the maximum in
++ 	 * which case we would have bailed earlier.
++ 	 */
+  	zdev->domain = find_first_zero_bit(zpci_domain, ZPCI_NR_DEVICES);
+++<<<<<<< HEAD
+ +	if (zdev->domain == ZPCI_NR_DEVICES) {
+ +		spin_unlock(&zpci_domain_lock);
+ +		return -ENOSPC;
+ +	}
+++=======
+++>>>>>>> 969ae01bab2f (s390/pci: Fix zpci_alloc_domain() over allocation)
+  	set_bit(zdev->domain, zpci_domain);
++ 	zpci_num_domains_allocated++;
+  	spin_unlock(&zpci_domain_lock);
+  	return 0;
+  }
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 54a96d9ffef0..c2a4acc328b3 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -25,6 +25,7 @@ int pci_proc_domain(struct pci_bus *);
+ 
+ #define ZPCI_NR_DMA_SPACES		1
+ #define ZPCI_NR_DEVICES			CONFIG_PCI_NR_FUNCTIONS
++#define ZPCI_DOMAIN_BITMAP_SIZE		(1 << 16)
+ 
+ /* PCI Function Controls */
+ #define ZPCI_FC_FN_ENABLED		0x80
+* Unmerged path arch/s390/pci/pci.c
