@@ -1,0 +1,185 @@
+nvme: set the queue limits in nvme_update_ns_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 658d9f7c2c7044f9978623e7f429b85bbb7553a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/658d9f7c.failed
+
+Only set the queue limits once we have the real block size.  This also
+updates the limits on a rescan if needed.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Reviewed-by: Damien Le Moal <damien.lemoal@wdc.com>
+(cherry picked from commit 658d9f7c2c7044f9978623e7f429b85bbb7553a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 7c2cc9e85e5d,bb630d5fcb96..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1962,6 -1966,70 +1962,73 @@@ static int nvme_setup_streams_ns(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nvme_configure_metadata(struct nvme_ns *ns, struct nvme_id_ns *id)
++ {
++ 	struct nvme_ctrl *ctrl = ns->ctrl;
++ 
++ 	/*
++ 	 * The PI implementation requires the metadata size to be equal to the
++ 	 * t10 pi tuple size.
++ 	 */
++ 	ns->ms = le16_to_cpu(id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ms);
++ 	if (ns->ms == sizeof(struct t10_pi_tuple))
++ 		ns->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
++ 	else
++ 		ns->pi_type = 0;
++ 
++ 	ns->features &= ~(NVME_NS_METADATA_SUPPORTED | NVME_NS_EXT_LBAS);
++ 	if (!ns->ms || !(ctrl->ops->flags & NVME_F_METADATA_SUPPORTED))
++ 		return 0;
++ 	if (ctrl->ops->flags & NVME_F_FABRICS) {
++ 		/*
++ 		 * The NVMe over Fabrics specification only supports metadata as
++ 		 * part of the extended data LBA.  We rely on HCA/HBA support to
++ 		 * remap the separate metadata buffer from the block layer.
++ 		 */
++ 		if (WARN_ON_ONCE(!(id->flbas & NVME_NS_FLBAS_META_EXT)))
++ 			return -EINVAL;
++ 		if (ctrl->max_integrity_segments)
++ 			ns->features |=
++ 				(NVME_NS_METADATA_SUPPORTED | NVME_NS_EXT_LBAS);
++ 	} else {
++ 		/*
++ 		 * For PCIe controllers, we can't easily remap the separate
++ 		 * metadata buffer from the block layer and thus require a
++ 		 * separate metadata buffer for block layer metadata/PI support.
++ 		 * We allow extended LBAs for the passthrough interface, though.
++ 		 */
++ 		if (id->flbas & NVME_NS_FLBAS_META_EXT)
++ 			ns->features |= NVME_NS_EXT_LBAS;
++ 		else
++ 			ns->features |= NVME_NS_METADATA_SUPPORTED;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
++ 		struct request_queue *q)
++ {
++ 	bool vwc = false;
++ 
++ 	if (ctrl->max_hw_sectors) {
++ 		u32 max_segments =
++ 			(ctrl->max_hw_sectors / (NVME_CTRL_PAGE_SIZE >> 9)) + 1;
++ 
++ 		max_segments = min_not_zero(max_segments, ctrl->max_segments);
++ 		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
++ 		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
++ 	}
++ 	blk_queue_virt_boundary(q, NVME_CTRL_PAGE_SIZE - 1);
++ 	blk_queue_dma_alignment(q, 7);
++ 	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
++ 		vwc = true;
++ 	blk_queue_write_cache(q, vwc, vwc);
++ }
++ 
+++>>>>>>> 658d9f7c2c70 (nvme: set the queue limits in nvme_update_ns_info)
+  static void nvme_update_disk_info(struct gendisk *disk,
+  		struct nvme_ns *ns, struct nvme_id_ns *id)
+  {
+@@@ -2076,18 -2142,15 +2143,24 @@@ static void nvme_set_chunk_sectors(stru
+  	blk_queue_chunk_sectors(ns->queue, iob);
+  }
+  
+ -static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
+ +static int __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
+  {
+ -	unsigned lbaf = id->flbas & NVME_NS_FLBAS_LBA_MASK;
+ +	struct nvme_ns *ns = disk->private_data;
+  	struct nvme_ctrl *ctrl = ns->ctrl;
+ -	int ret;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If identify namespace failed, use default 512 byte block size so
+ +	 * block layer can use before failing read/write for 0 capacity.
+ +	 */
+ +	ns->lba_shift = id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ds;
+ +	if (ns->lba_shift == 0)
+ +		ns->lba_shift = 9;
+++=======
++ 	blk_mq_freeze_queue(ns->disk->queue);
++ 	ns->lba_shift = id->lbaf[lbaf].ds;
++ 	nvme_set_queue_limits(ctrl, ns->queue);
+++>>>>>>> 658d9f7c2c70 (nvme: set the queue limits in nvme_update_ns_info)
+  
+  	switch (ns->head->ids.csi) {
+  	case NVME_CSI_NVM:
+@@@ -2467,29 -2516,6 +2540,32 @@@ int nvme_shutdown_ctrl(struct nvme_ctr
+  }
+  EXPORT_SYMBOL_GPL(nvme_shutdown_ctrl);
+  
+++<<<<<<< HEAD
+ +static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
+ +		struct request_queue *q)
+ +{
+ +	bool vwc = false;
+ +
+ +	if (ctrl->segment_boundary)
+ +		blk_queue_segment_boundary(q, ctrl->segment_boundary);
+ +
+ +	if (ctrl->max_hw_sectors) {
+ +		u32 max_segments =
+ +			(ctrl->max_hw_sectors / (ctrl->page_size >> 9)) + 1;
+ +
+ +		max_segments = min_not_zero(max_segments, ctrl->max_segments);
+ +		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
+ +		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
+ +	}
+ +	blk_queue_virt_boundary(q, ctrl->page_size - 1);
+ +	blk_queue_dma_alignment(q, 7);
+ +	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
+ +		vwc = true;
+ +	blk_queue_write_cache(q, vwc, vwc);
+ +}
+ +
+++=======
+++>>>>>>> 658d9f7c2c70 (nvme: set the queue limits in nvme_update_ns_info)
+  static int nvme_configure_timestamp(struct nvme_ctrl *ctrl)
+  {
+  	__le64 ts;
+@@@ -3911,20 -3923,11 +3987,15 @@@ static void nvme_alloc_ns(struct nvme_c
+  
+  	ns->queue->queuedata = ns;
+  	ns->ctrl = ctrl;
+- 
+  	kref_init(&ns->kref);
+- 	ns->lba_shift = 9; /* set to a default value for 512 until disk is validated */
+- 
+- 	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+- 	nvme_set_queue_limits(ctrl, ns->queue);
+  
+ -	ret = nvme_init_ns_head(ns, nsid, id);
+ +	ret = nvme_identify_ns(ctrl, nsid, &id);
+  	if (ret)
+  		goto out_free_queue;
+ +
+ +	ret = nvme_init_ns_head(ns, nsid, id);
+ +	if (ret)
+ +		goto out_free_id;
+  	nvme_set_disk_name(disk_name, ns, ctrl, &flags);
+  
+  	disk = alloc_disk_node(0, node);
+* Unmerged path drivers/nvme/host/core.c
