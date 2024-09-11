@@ -1,0 +1,152 @@
+xfrm: do pskb_pull properly in __xfrm_transport_prep
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 06a0afcfe2f551ff755849ea2549b0d8409fd9a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/06a0afcf.failed
+
+For transport mode, when ipv6 nexthdr is set, the packet format might
+be like:
+
+    ----------------------------------------------------
+    |        | dest |     |     |      |  ESP    | ESP |
+    | IP6 hdr| opts.| ESP | TCP | Data | Trailer | ICV |
+    ----------------------------------------------------
+
+and in __xfrm_transport_prep():
+
+  pskb_pull(skb, skb->mac_len + sizeof(ip6hdr) + x->props.header_len);
+
+it will pull the data pointer to the wrong position, as it missed the
+nexthdrs/dest opts.
+
+This patch is to fix it by using:
+
+  pskb_pull(skb, skb_transport_offset(skb) + x->props.header_len);
+
+as we can be sure transport_header points to ESP header at that moment.
+
+It also fixes a panic when packets with ipv6 nexthdr are sent over
+esp6 transport mode:
+
+  [  100.473845] kernel BUG at net/core/skbuff.c:4325!
+  [  100.478517] RIP: 0010:__skb_to_sgvec+0x252/0x260
+  [  100.494355] Call Trace:
+  [  100.494829]  skb_to_sgvec+0x11/0x40
+  [  100.495492]  esp6_output_tail+0x12e/0x550 [esp6]
+  [  100.496358]  esp6_xmit+0x1d5/0x260 [esp6_offload]
+  [  100.498029]  validate_xmit_xfrm+0x22f/0x2e0
+  [  100.499604]  __dev_queue_xmit+0x589/0x910
+  [  100.502928]  ip6_finish_output2+0x2a5/0x5a0
+  [  100.503718]  ip6_output+0x6c/0x120
+  [  100.505198]  xfrm_output_resume+0x4bf/0x530
+  [  100.508683]  xfrm6_output+0x3a/0xc0
+  [  100.513446]  inet6_csk_xmit+0xa1/0xf0
+  [  100.517335]  tcp_sendmsg+0x27/0x40
+  [  100.517977]  sock_sendmsg+0x3e/0x60
+  [  100.518648]  __sys_sendto+0xee/0x160
+
+Fixes: c35fe4106b92 ("xfrm: Add mode handlers for IPsec on layer 2")
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 06a0afcfe2f551ff755849ea2549b0d8409fd9a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_device.c
+diff --cc net/xfrm/xfrm_device.c
+index 456be7c7cd0f,f50d1f97cf8e..000000000000
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@@ -23,6 -19,84 +23,87 @@@
+  #include <linux/notifier.h>
+  
+  #ifdef CONFIG_XFRM_OFFLOAD
+++<<<<<<< HEAD
+++=======
++ static void __xfrm_transport_prep(struct xfrm_state *x, struct sk_buff *skb,
++ 				  unsigned int hsize)
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 
++ 	skb_reset_mac_len(skb);
++ 	if (xo->flags & XFRM_GSO_SEGMENT)
++ 		skb->transport_header -= x->props.header_len;
++ 
++ 	pskb_pull(skb, skb_transport_offset(skb) + x->props.header_len);
++ }
++ 
++ static void __xfrm_mode_tunnel_prep(struct xfrm_state *x, struct sk_buff *skb,
++ 				    unsigned int hsize)
++ 
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 
++ 	if (xo->flags & XFRM_GSO_SEGMENT)
++ 		skb->transport_header = skb->network_header + hsize;
++ 
++ 	skb_reset_mac_len(skb);
++ 	pskb_pull(skb, skb->mac_len + x->props.header_len);
++ }
++ 
++ static void __xfrm_mode_beet_prep(struct xfrm_state *x, struct sk_buff *skb,
++ 				  unsigned int hsize)
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 	int phlen = 0;
++ 
++ 	if (xo->flags & XFRM_GSO_SEGMENT)
++ 		skb->transport_header = skb->network_header + hsize;
++ 
++ 	skb_reset_mac_len(skb);
++ 	if (x->sel.family != AF_INET6) {
++ 		phlen = IPV4_BEET_PHMAXLEN;
++ 		if (x->outer_mode.family == AF_INET6)
++ 			phlen += sizeof(struct ipv6hdr) - sizeof(struct iphdr);
++ 	}
++ 
++ 	pskb_pull(skb, skb->mac_len + hsize + (x->props.header_len - phlen));
++ }
++ 
++ /* Adjust pointers into the packet when IPsec is done at layer2 */
++ static void xfrm_outer_mode_prep(struct xfrm_state *x, struct sk_buff *skb)
++ {
++ 	switch (x->outer_mode.encap) {
++ 	case XFRM_MODE_TUNNEL:
++ 		if (x->outer_mode.family == AF_INET)
++ 			return __xfrm_mode_tunnel_prep(x, skb,
++ 						       sizeof(struct iphdr));
++ 		if (x->outer_mode.family == AF_INET6)
++ 			return __xfrm_mode_tunnel_prep(x, skb,
++ 						       sizeof(struct ipv6hdr));
++ 		break;
++ 	case XFRM_MODE_TRANSPORT:
++ 		if (x->outer_mode.family == AF_INET)
++ 			return __xfrm_transport_prep(x, skb,
++ 						     sizeof(struct iphdr));
++ 		if (x->outer_mode.family == AF_INET6)
++ 			return __xfrm_transport_prep(x, skb,
++ 						     sizeof(struct ipv6hdr));
++ 		break;
++ 	case XFRM_MODE_BEET:
++ 		if (x->outer_mode.family == AF_INET)
++ 			return __xfrm_mode_beet_prep(x, skb,
++ 						     sizeof(struct iphdr));
++ 		if (x->outer_mode.family == AF_INET6)
++ 			return __xfrm_mode_beet_prep(x, skb,
++ 						     sizeof(struct ipv6hdr));
++ 		break;
++ 	case XFRM_MODE_ROUTEOPTIMIZATION:
++ 	case XFRM_MODE_IN_TRIGGER:
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> 06a0afcfe2f5 (xfrm: do pskb_pull properly in __xfrm_transport_prep)
+  struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again)
+  {
+  	int err;
+* Unmerged path net/xfrm/xfrm_device.c
