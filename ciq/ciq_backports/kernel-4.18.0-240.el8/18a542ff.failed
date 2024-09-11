@@ -1,0 +1,114 @@
+io_uring: Fix ->data corruption on re-enqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 18a542ff19ad149fac9e5a36a4012e3cac7b3b3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/18a542ff.failed
+
+work->data and work->list are shared in union. io_wq_assign_next() sets
+->data if a req having a linked_timeout, but then io-wq may want to use
+work->list, e.g. to do re-enqueue of a request, so corrupting ->data.
+
+->data is not necessary, just remove it and extract linked_timeout
+through @link_list.
+
+Fixes: 60cf46ae6054 ("io-wq: hash dependent work")
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 18a542ff19ad149fac9e5a36a4012e3cac7b3b3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io-wq.h
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,1f61ea9c87fd..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -677,14 -1534,72 +677,57 @@@ static void io_free_req(struct io_kioc
+  	 * dependencies to the next request. In case of failure, fail the rest
+  	 * of the chain.
+  	 */
+ -	if (req->flags & REQ_F_FAIL_LINK) {
+ -		io_fail_links(req);
+ -	} else if ((req->flags & (REQ_F_LINK_TIMEOUT | REQ_F_COMP_LOCKED)) ==
+ -			REQ_F_LINK_TIMEOUT) {
+ -		struct io_ring_ctx *ctx = req->ctx;
+ -		unsigned long flags;
+ -
+ -		/*
+ -		 * If this is a timeout link, we could be racing with the
+ -		 * timeout timer. Grab the completion lock for this case to
+ -		 * protect against that.
+ -		 */
+ -		spin_lock_irqsave(&ctx->completion_lock, flags);
+ -		io_req_link_next(req, nxt);
+ -		spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -	} else {
+ -		io_req_link_next(req, nxt);
+ +	if (req->flags & REQ_F_LINK) {
+ +		if (req->flags & REQ_F_FAIL_LINK)
+ +			io_fail_links(req);
+ +		else
+ +			io_req_link_next(req);
+  	}
+ -}
+  
+ -static void io_free_req(struct io_kiocb *req)
+ -{
+ -	struct io_kiocb *nxt = NULL;
+ -
+ -	io_req_find_next(req, &nxt);
+  	__io_free_req(req);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (nxt)
++ 		io_queue_async_work(nxt);
++ }
++ 
++ static void io_link_work_cb(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 	struct io_kiocb *link;
++ 
++ 	link = list_first_entry(&req->link_list, struct io_kiocb, link_list);
++ 	io_queue_linked_timeout(link);
++ 	io_wq_submit_work(workptr);
++ }
++ 
++ static void io_wq_assign_next(struct io_wq_work **workptr, struct io_kiocb *nxt)
++ {
++ 	struct io_kiocb *link;
++ 	const struct io_op_def *def = &io_op_defs[nxt->opcode];
++ 
++ 	if ((nxt->flags & REQ_F_ISREG) && def->hash_reg_file)
++ 		io_wq_hash_work(&nxt->work, file_inode(nxt->file));
++ 
++ 	*workptr = &nxt->work;
++ 	link = io_prep_linked_timeout(nxt);
++ 	if (link)
++ 		nxt->work.func = io_link_work_cb;
++ }
++ 
++ /*
++  * Drop reference to request, return next in chain (if there is one) if this
++  * was the last reference to this request.
++  */
++ __attribute__((nonnull))
++ static void io_put_req_find_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
++ {
++ 	if (refcount_dec_and_test(&req->refs)) {
++ 		io_req_find_next(req, nxtptr);
++ 		__io_free_req(req);
++ 	}
+++>>>>>>> 18a542ff19ad (io_uring: Fix ->data corruption on re-enqueue)
+  }
+  
+  static void io_put_req(struct io_kiocb *req)
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io_uring.c
