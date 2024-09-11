@@ -1,0 +1,212 @@
+KVM: arm64: Ensure I-cache isolation between vcpus of a same VM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 01dc9262ff5797b675c32c0c6bc682777d23de05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/01dc9262.failed
+
+It recently became apparent that the ARMv8 architecture has interesting
+rules regarding attributes being used when fetching instructions
+if the MMU is off at Stage-1.
+
+In this situation, the CPU is allowed to fetch from the PoC and
+allocate into the I-cache (unless the memory is mapped with
+the XN attribute at Stage-2).
+
+If we transpose this to vcpus sharing a single physical CPU,
+it is possible for a vcpu running with its MMU off to influence
+another vcpu running with its MMU on, as the latter is expected to
+fetch from the PoU (and self-patching code doesn't flush below that
+level).
+
+In order to solve this, reuse the vcpu-private TLB invalidation
+code to apply the same policy to the I-cache, nuking it every time
+the vcpu runs on a physical CPU that ran another vcpu of the same
+VM in the past.
+
+This involve renaming __kvm_tlb_flush_local_vmid() to
+__kvm_flush_cpu_context(), and inserting a local i-cache invalidation
+there.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+	Acked-by: Will Deacon <will@kernel.org>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+Link: https://lore.kernel.org/r/20210303164505.68492-1-maz@kernel.org
+(cherry picked from commit 01dc9262ff5797b675c32c0c6bc682777d23de05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_asm.h
+#	arch/arm64/kvm/arm.c
+#	arch/arm64/kvm/hyp/nvhe/hyp-main.c
+#	arch/arm64/kvm/hyp/nvhe/tlb.c
+#	arch/arm64/kvm/hyp/vhe/tlb.c
+diff --cc arch/arm64/include/asm/kvm_asm.h
+index d35628abb113,a7ab84f781f7..000000000000
+--- a/arch/arm64/include/asm/kvm_asm.h
++++ b/arch/arm64/include/asm/kvm_asm.h
+@@@ -47,7 -34,29 +47,33 @@@
+   */
+  #define KVM_VECTOR_PREAMBLE	(2 * AARCH64_INSN_SIZE)
+  
+++<<<<<<< HEAD
+ +#define __SMCCC_WORKAROUND_1_SMC_SZ 36
+++=======
++ #define KVM_HOST_SMCCC_ID(id)						\
++ 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
++ 			   ARM_SMCCC_SMC_64,				\
++ 			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
++ 			   (id))
++ 
++ #define KVM_HOST_SMCCC_FUNC(name) KVM_HOST_SMCCC_ID(__KVM_HOST_SMCCC_FUNC_##name)
++ 
++ #define __KVM_HOST_SMCCC_FUNC___kvm_hyp_init			0
++ #define __KVM_HOST_SMCCC_FUNC___kvm_vcpu_run			1
++ #define __KVM_HOST_SMCCC_FUNC___kvm_flush_vm_context		2
++ #define __KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid_ipa		3
++ #define __KVM_HOST_SMCCC_FUNC___kvm_tlb_flush_vmid		4
++ #define __KVM_HOST_SMCCC_FUNC___kvm_flush_cpu_context		5
++ #define __KVM_HOST_SMCCC_FUNC___kvm_timer_set_cntvoff		6
++ #define __KVM_HOST_SMCCC_FUNC___kvm_enable_ssbs			7
++ #define __KVM_HOST_SMCCC_FUNC___vgic_v3_get_gic_config		8
++ #define __KVM_HOST_SMCCC_FUNC___vgic_v3_read_vmcr		9
++ #define __KVM_HOST_SMCCC_FUNC___vgic_v3_write_vmcr		10
++ #define __KVM_HOST_SMCCC_FUNC___vgic_v3_init_lrs		11
++ #define __KVM_HOST_SMCCC_FUNC___kvm_get_mdcr_el2		12
++ #define __KVM_HOST_SMCCC_FUNC___vgic_v3_save_aprs		13
++ #define __KVM_HOST_SMCCC_FUNC___vgic_v3_restore_aprs		14
+++>>>>>>> 01dc9262ff57 (KVM: arm64: Ensure I-cache isolation between vcpus of a same VM)
+  
+  #ifndef __ASSEMBLY__
+  
+@@@ -112,16 -175,18 +138,23 @@@ DECLARE_KVM_HYP_SYM(__kvm_hyp_vector)
+  #define __kvm_hyp_init		CHOOSE_NVHE_SYM(__kvm_hyp_init)
+  #define __kvm_hyp_vector	CHOOSE_HYP_SYM(__kvm_hyp_vector)
+  
+ -extern unsigned long kvm_arm_hyp_percpu_base[NR_CPUS];
+ -DECLARE_KVM_NVHE_SYM(__per_cpu_start);
+ -DECLARE_KVM_NVHE_SYM(__per_cpu_end);
+ -
+ +#ifdef CONFIG_KVM_INDIRECT_VECTORS
+ +extern atomic_t arm64_el2_vector_last_slot;
+  DECLARE_KVM_HYP_SYM(__bp_harden_hyp_vecs);
+  #define __bp_harden_hyp_vecs	CHOOSE_HYP_SYM(__bp_harden_hyp_vecs)
+ +#endif
+  
+  extern void __kvm_flush_vm_context(void);
+++<<<<<<< HEAD
+ +extern void __kvm_tlb_flush_vmid_ipa(struct kvm *kvm, phys_addr_t ipa);
+ +extern void __kvm_tlb_flush_vmid(struct kvm *kvm);
+ +extern void __kvm_tlb_flush_local_vmid(struct kvm_vcpu *vcpu);
+++=======
++ extern void __kvm_flush_cpu_context(struct kvm_s2_mmu *mmu);
++ extern void __kvm_tlb_flush_vmid_ipa(struct kvm_s2_mmu *mmu, phys_addr_t ipa,
++ 				     int level);
++ extern void __kvm_tlb_flush_vmid(struct kvm_s2_mmu *mmu);
+++>>>>>>> 01dc9262ff57 (KVM: arm64: Ensure I-cache isolation between vcpus of a same VM)
+  
+  extern void __kvm_timer_set_cntvoff(u64 cntvoff);
+  
+diff --cc arch/arm64/kvm/arm.c
+index 40b4557ef7cb,a391b984dd05..000000000000
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@@ -351,16 -378,23 +351,25 @@@ void kvm_arch_vcpu_unblocking(struct kv
+  
+  void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  {
+ -	struct kvm_s2_mmu *mmu;
+  	int *last_ran;
+  
+ -	mmu = vcpu->arch.hw_mmu;
+ -	last_ran = this_cpu_ptr(mmu->last_vcpu_ran);
+ +	last_ran = this_cpu_ptr(vcpu->kvm->arch.last_vcpu_ran);
+  
+  	/*
++ 	 * We guarantee that both TLBs and I-cache are private to each
++ 	 * vcpu. If detecting that a vcpu from the same VM has
++ 	 * previously run on the same physical CPU, call into the
++ 	 * hypervisor code to nuke the relevant contexts.
++ 	 *
+  	 * We might get preempted before the vCPU actually runs, but
+  	 * over-invalidation doesn't affect correctness.
+  	 */
+  	if (*last_ran != vcpu->vcpu_id) {
+++<<<<<<< HEAD
+ +		kvm_call_hyp(__kvm_tlb_flush_local_vmid, vcpu);
+++=======
++ 		kvm_call_hyp(__kvm_flush_cpu_context, mmu);
+++>>>>>>> 01dc9262ff57 (KVM: arm64: Ensure I-cache isolation between vcpus of a same VM)
+  		*last_ran = vcpu->vcpu_id;
+  	}
+  
+diff --cc arch/arm64/kvm/hyp/nvhe/tlb.c
+index 8db4c4ae1da1,229b06748c20..000000000000
+--- a/arch/arm64/kvm/hyp/nvhe/tlb.c
++++ b/arch/arm64/kvm/hyp/nvhe/tlb.c
+@@@ -126,18 -120,18 +126,23 @@@ void __kvm_tlb_flush_vmid(struct kvm *k
+  	dsb(ish);
+  	isb();
+  
+ -	__tlb_switch_to_host(&cxt);
+ +	__tlb_switch_to_host(kvm, &cxt);
+  }
+  
+++<<<<<<< HEAD
+ +void __kvm_tlb_flush_local_vmid(struct kvm_vcpu *vcpu)
+++=======
++ void __kvm_flush_cpu_context(struct kvm_s2_mmu *mmu)
+++>>>>>>> 01dc9262ff57 (KVM: arm64: Ensure I-cache isolation between vcpus of a same VM)
+  {
+ +	struct kvm *kvm = kern_hyp_va(kern_hyp_va(vcpu)->kvm);
+  	struct tlb_inv_context cxt;
+  
+  	/* Switch to requested VMID */
+ -	__tlb_switch_to_guest(mmu, &cxt);
+ +	__tlb_switch_to_guest(kvm, &cxt);
+  
+  	__tlbi(vmalle1);
++ 	asm volatile("ic iallu");
+  	dsb(nsh);
+  	isb();
+  
+diff --cc arch/arm64/kvm/hyp/vhe/tlb.c
+index b275101e9c9c,66f17349f0c3..000000000000
+--- a/arch/arm64/kvm/hyp/vhe/tlb.c
++++ b/arch/arm64/kvm/hyp/vhe/tlb.c
+@@@ -122,18 -124,18 +122,23 @@@ void __kvm_tlb_flush_vmid(struct kvm *k
+  	dsb(ish);
+  	isb();
+  
+ -	__tlb_switch_to_host(&cxt);
+ +	__tlb_switch_to_host(kvm, &cxt);
+  }
+  
+++<<<<<<< HEAD
+ +void __kvm_tlb_flush_local_vmid(struct kvm_vcpu *vcpu)
+++=======
++ void __kvm_flush_cpu_context(struct kvm_s2_mmu *mmu)
+++>>>>>>> 01dc9262ff57 (KVM: arm64: Ensure I-cache isolation between vcpus of a same VM)
+  {
+ +	struct kvm *kvm = vcpu->kvm;
+  	struct tlb_inv_context cxt;
+  
+  	/* Switch to requested VMID */
+ -	__tlb_switch_to_guest(mmu, &cxt);
+ +	__tlb_switch_to_guest(kvm, &cxt);
+  
+  	__tlbi(vmalle1);
++ 	asm volatile("ic iallu");
+  	dsb(nsh);
+  	isb();
+  
+* Unmerged path arch/arm64/kvm/hyp/nvhe/hyp-main.c
+* Unmerged path arch/arm64/include/asm/kvm_asm.h
+* Unmerged path arch/arm64/kvm/arm.c
+* Unmerged path arch/arm64/kvm/hyp/nvhe/hyp-main.c
+* Unmerged path arch/arm64/kvm/hyp/nvhe/tlb.c
+* Unmerged path arch/arm64/kvm/hyp/vhe/tlb.c
