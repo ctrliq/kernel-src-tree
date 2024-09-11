@@ -360,7 +360,7 @@ static void add_to_kill(struct task_struct *tsk, struct page *p,
 	if (is_zone_device_page(p))
 		tk->size_shift = dev_pagemap_mapping_shift(p, vma);
 	else
-		tk->size_shift = compound_order(compound_head(p)) + PAGE_SHIFT;
+		tk->size_shift = page_shift(compound_head(p));
 
 	/*
 	 * In theory we don't have to kill when the page was
