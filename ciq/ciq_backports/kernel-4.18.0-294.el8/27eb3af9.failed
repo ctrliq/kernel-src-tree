@@ -1,0 +1,166 @@
+block: don't hold part0's refcount in IO path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 27eb3af9a37a85ca35f82830a8fc29753700058a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/27eb3af9.failed
+
+gendisk can't be gone when there is IO activity, so not hold
+part0's refcount in IO path.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@infradead.org>
+	Cc: Yufen Yu <yuyufen@huawei.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Hou Tao <houtao1@huawei.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 27eb3af9a37a85ca35f82830a8fc29753700058a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+diff --cc block/blk.h
+index 3849dabe650b,8c3f557dd898..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -322,10 -355,105 +322,114 @@@ void blk_queue_free_zone_bitmaps(struc
+  static inline void blk_queue_free_zone_bitmaps(struct request_queue *q) {}
+  #endif
+  
+++<<<<<<< HEAD
+ +/* internal helper for accessing request_aux  */
+ +static inline struct request_aux *rq_aux(const struct request *rq)
+ +{
+ +	return (struct request_aux *)((void *)rq - sizeof(struct request_aux));
+ +}
+ +
+++=======
++ void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
++ void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
++ void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
++ struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector);
++ 
++ int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
++ void blk_free_devt(dev_t devt);
++ void blk_invalidate_devt(dev_t devt);
++ char *disk_name(struct gendisk *hd, int partno, char *buf);
++ #define ADDPART_FLAG_NONE	0
++ #define ADDPART_FLAG_RAID	1
++ #define ADDPART_FLAG_WHOLEDISK	2
++ void delete_partition(struct gendisk *disk, struct hd_struct *part);
++ int bdev_add_partition(struct block_device *bdev, int partno,
++ 		sector_t start, sector_t length);
++ int bdev_del_partition(struct block_device *bdev, int partno);
++ int bdev_resize_partition(struct block_device *bdev, int partno,
++ 		sector_t start, sector_t length);
++ int disk_expand_part_tbl(struct gendisk *disk, int target);
++ int hd_ref_init(struct hd_struct *part);
++ 
++ /* no need to get/put refcount of part0 */
++ static inline int hd_struct_try_get(struct hd_struct *part)
++ {
++ 	if (part->partno)
++ 		return percpu_ref_tryget_live(&part->ref);
++ 	return 1;
++ }
++ 
++ static inline void hd_struct_put(struct hd_struct *part)
++ {
++ 	if (part->partno)
++ 		percpu_ref_put(&part->ref);
++ }
++ 
++ static inline void hd_free_part(struct hd_struct *part)
++ {
++ 	free_part_stats(part);
++ 	kfree(part->info);
++ 	percpu_ref_exit(&part->ref);
++ }
++ 
++ /*
++  * Any access of part->nr_sects which is not protected by partition
++  * bd_mutex or gendisk bdev bd_mutex, should be done using this
++  * accessor function.
++  *
++  * Code written along the lines of i_size_read() and i_size_write().
++  * CONFIG_PREEMPTION case optimizes the case of UP kernel with preemption
++  * on.
++  */
++ static inline sector_t part_nr_sects_read(struct hd_struct *part)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	sector_t nr_sects;
++ 	unsigned seq;
++ 	do {
++ 		seq = read_seqcount_begin(&part->nr_sects_seq);
++ 		nr_sects = part->nr_sects;
++ 	} while (read_seqcount_retry(&part->nr_sects_seq, seq));
++ 	return nr_sects;
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	sector_t nr_sects;
++ 
++ 	preempt_disable();
++ 	nr_sects = part->nr_sects;
++ 	preempt_enable();
++ 	return nr_sects;
++ #else
++ 	return part->nr_sects;
++ #endif
++ }
++ 
++ /*
++  * Should be called with mutex lock held (typically bd_mutex) of partition
++  * to provide mutual exlusion among writers otherwise seqcount might be
++  * left in wrong state leaving the readers spinning infinitely.
++  */
++ static inline void part_nr_sects_write(struct hd_struct *part, sector_t size)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	write_seqcount_begin(&part->nr_sects_seq);
++ 	part->nr_sects = size;
++ 	write_seqcount_end(&part->nr_sects_seq);
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	preempt_disable();
++ 	part->nr_sects = size;
++ 	preempt_enable();
++ #else
++ 	part->nr_sects = size;
++ #endif
++ }
++ 
++ struct request_queue *__blk_alloc_queue(int node_id);
++ 
++ int __bio_add_pc_page(struct request_queue *q, struct bio *bio,
++ 		struct page *page, unsigned int len, unsigned int offset,
++ 		bool *same_page);
++ 
+++>>>>>>> 27eb3af9a37a (block: don't hold part0's refcount in IO path)
+  #endif /* BLK_INTERNAL_H */
+* Unmerged path block/blk.h
+diff --git a/block/genhd.c b/block/genhd.c
+index a40c6bd653e9..8cca7894d8e2 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -295,7 +295,8 @@ static inline int sector_in_part(struct hd_struct *part, sector_t sector)
+  *
+  * CONTEXT:
+  * RCU read locked.  The returned partition pointer is always valid
+- * because its refcount is grabbed.
++ * because its refcount is grabbed except for part0, which lifetime
++ * is same with the disk.
+  *
+  * RETURNS:
+  * Found partition on success, part0 is returned if no partition matches
+@@ -328,7 +329,6 @@ struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector)
+ 			return part;
+ 		}
+ 	}
+-	hd_struct_get(&disk->part0);
+ 	return &disk->part0;
+ }
+ 
