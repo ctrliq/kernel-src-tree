@@ -1,0 +1,345 @@
+net: phy: aquantia: report PHY details like firmware version
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] phy: aquantia: report PHY details like firmware version (Petr Oros) [1772010]
+Rebuild_FUZZ: 95.65%
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit 43429a0353af8586fe6f3a56c3931284ff5ede83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/43429a03.failed
+
+Add reporting firmware details. These details are available only once
+the firmware has finished initializing the chip. This can take some
+time and we need to poll for init completion.
+
+v2:
+- Propagate timeout in aqr107_wait_reset_complete(). Don't bail out
+  completely on timeout because chip may be functional even w/o
+  firmware image.
+
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 43429a0353af8586fe6f3a56c3931284ff5ede83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/aquantia_main.c
+diff --cc drivers/net/phy/aquantia_main.c
+index 3d4b30e24149,9f20e9bf647b..000000000000
+--- a/drivers/net/phy/aquantia_main.c
++++ b/drivers/net/phy/aquantia_main.c
+@@@ -42,8 -58,26 +42,16 @@@
+  #define MDIO_AN_RX_LP_STAT1			0xe820
+  #define MDIO_AN_RX_LP_STAT1_1000BASET_FULL	BIT(15)
+  #define MDIO_AN_RX_LP_STAT1_1000BASET_HALF	BIT(14)
+ -#define MDIO_AN_RX_LP_STAT1_SHORT_REACH		BIT(13)
+ -#define MDIO_AN_RX_LP_STAT1_AQRATE_DOWNSHIFT	BIT(12)
+ -#define MDIO_AN_RX_LP_STAT1_AQ_PHY		BIT(2)
+ -
+ -#define MDIO_AN_RX_LP_STAT4			0xe823
+ -#define MDIO_AN_RX_LP_STAT4_FW_MAJOR		GENMASK(15, 8)
+ -#define MDIO_AN_RX_LP_STAT4_FW_MINOR		GENMASK(7, 0)
+ -
+ -#define MDIO_AN_RX_VEND_STAT3			0xe832
+ -#define MDIO_AN_RX_VEND_STAT3_AFR		BIT(0)
+  
+  /* Vendor specific 1, MDIO_MMD_VEND1 */
++ #define VEND1_GLOBAL_FW_ID			0x0020
++ #define VEND1_GLOBAL_FW_ID_MAJOR		GENMASK(15, 8)
++ #define VEND1_GLOBAL_FW_ID_MINOR		GENMASK(7, 0)
++ 
++ #define VEND1_GLOBAL_RSVD_STAT1			0xc885
++ #define VEND1_GLOBAL_RSVD_STAT1_FW_BUILD_ID	GENMASK(7, 4)
++ #define VEND1_GLOBAL_RSVD_STAT1_PROV_ID		GENMASK(3, 0)
++ 
+  #define VEND1_GLOBAL_INT_STD_STATUS		0xfc00
+  #define VEND1_GLOBAL_INT_VEND_STATUS		0xfc01
+  
+@@@ -157,6 -191,281 +165,284 @@@ static int aqr_read_status(struct phy_d
+  	return genphy_c45_read_status(phydev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int aqr107_read_downshift_event(struct phy_device *phydev)
++ {
++ 	int val;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_TX_VEND_INT_STATUS1);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	return !!(val & MDIO_AN_TX_VEND_INT_STATUS1_DOWNSHIFT);
++ }
++ 
++ static int aqr107_read_rate(struct phy_device *phydev)
++ {
++ 	int val;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_TX_VEND_STATUS1);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	switch (FIELD_GET(MDIO_AN_TX_VEND_STATUS1_RATE_MASK, val)) {
++ 	case MDIO_AN_TX_VEND_STATUS1_10BASET:
++ 		phydev->speed = SPEED_10;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_100BASETX:
++ 		phydev->speed = SPEED_100;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_1000BASET:
++ 		phydev->speed = SPEED_1000;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_2500BASET:
++ 		phydev->speed = SPEED_2500;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_5000BASET:
++ 		phydev->speed = SPEED_5000;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_10GBASET:
++ 		phydev->speed = SPEED_10000;
++ 		break;
++ 	default:
++ 		phydev->speed = SPEED_UNKNOWN;
++ 		break;
++ 	}
++ 
++ 	if (val & MDIO_AN_TX_VEND_STATUS1_FULL_DUPLEX)
++ 		phydev->duplex = DUPLEX_FULL;
++ 	else
++ 		phydev->duplex = DUPLEX_HALF;
++ 
++ 	return 0;
++ }
++ 
++ static int aqr107_read_status(struct phy_device *phydev)
++ {
++ 	int val, ret;
++ 
++ 	ret = aqr_read_status(phydev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!phydev->link || phydev->autoneg == AUTONEG_DISABLE)
++ 		return 0;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_PHYXS, MDIO_PHYXS_VEND_IF_STATUS);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	switch (FIELD_GET(MDIO_PHYXS_VEND_IF_STATUS_TYPE_MASK, val)) {
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_KR:
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_XFI:
++ 		phydev->interface = PHY_INTERFACE_MODE_10GKR;
++ 		break;
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_SGMII:
++ 		phydev->interface = PHY_INTERFACE_MODE_SGMII;
++ 		break;
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_OCSGMII:
++ 		phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
++ 		break;
++ 	default:
++ 		phydev->interface = PHY_INTERFACE_MODE_NA;
++ 		break;
++ 	}
++ 
++ 	val = aqr107_read_downshift_event(phydev);
++ 	if (val <= 0)
++ 		return val;
++ 
++ 	phydev_warn(phydev, "Downshift occurred! Cabling may be defective.\n");
++ 
++ 	/* Read downshifted rate from vendor register */
++ 	return aqr107_read_rate(phydev);
++ }
++ 
++ static int aqr107_get_downshift(struct phy_device *phydev, u8 *data)
++ {
++ 	int val, cnt, enable;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_VEND_PROV);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	enable = FIELD_GET(MDIO_AN_VEND_PROV_DOWNSHIFT_EN, val);
++ 	cnt = FIELD_GET(MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, val);
++ 
++ 	*data = enable && cnt ? cnt : DOWNSHIFT_DEV_DISABLE;
++ 
++ 	return 0;
++ }
++ 
++ static int aqr107_set_downshift(struct phy_device *phydev, u8 cnt)
++ {
++ 	int val = 0;
++ 
++ 	if (!FIELD_FIT(MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, cnt))
++ 		return -E2BIG;
++ 
++ 	if (cnt != DOWNSHIFT_DEV_DISABLE) {
++ 		val = MDIO_AN_VEND_PROV_DOWNSHIFT_EN;
++ 		val |= FIELD_PREP(MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, cnt);
++ 	}
++ 
++ 	return phy_modify_mmd(phydev, MDIO_MMD_AN, MDIO_AN_VEND_PROV,
++ 			      MDIO_AN_VEND_PROV_DOWNSHIFT_EN |
++ 			      MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, val);
++ }
++ 
++ static int aqr107_get_tunable(struct phy_device *phydev,
++ 			      struct ethtool_tunable *tuna, void *data)
++ {
++ 	switch (tuna->id) {
++ 	case ETHTOOL_PHY_DOWNSHIFT:
++ 		return aqr107_get_downshift(phydev, data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int aqr107_set_tunable(struct phy_device *phydev,
++ 			      struct ethtool_tunable *tuna, const void *data)
++ {
++ 	switch (tuna->id) {
++ 	case ETHTOOL_PHY_DOWNSHIFT:
++ 		return aqr107_set_downshift(phydev, *(const u8 *)data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ /* If we configure settings whilst firmware is still initializing the chip,
++  * then these settings may be overwritten. Therefore make sure chip
++  * initialization has completed. Use presence of the firmware ID as
++  * indicator for initialization having completed.
++  * The chip also provides a "reset completed" bit, but it's cleared after
++  * read. Therefore function would time out if called again.
++  */
++ static int aqr107_wait_reset_complete(struct phy_device *phydev)
++ {
++ 	int val, retries = 100;
++ 
++ 	do {
++ 		val = phy_read_mmd(phydev, MDIO_MMD_VEND1, VEND1_GLOBAL_FW_ID);
++ 		if (val < 0)
++ 			return val;
++ 		msleep(20);
++ 	} while (!val && --retries);
++ 
++ 	return val ? 0 : -ETIMEDOUT;
++ }
++ 
++ static void aqr107_chip_info(struct phy_device *phydev)
++ {
++ 	u8 fw_major, fw_minor, build_id, prov_id;
++ 	int val;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_VEND1, VEND1_GLOBAL_FW_ID);
++ 	if (val < 0)
++ 		return;
++ 
++ 	fw_major = FIELD_GET(VEND1_GLOBAL_FW_ID_MAJOR, val);
++ 	fw_minor = FIELD_GET(VEND1_GLOBAL_FW_ID_MINOR, val);
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_VEND1, VEND1_GLOBAL_RSVD_STAT1);
++ 	if (val < 0)
++ 		return;
++ 
++ 	build_id = FIELD_GET(VEND1_GLOBAL_RSVD_STAT1_FW_BUILD_ID, val);
++ 	prov_id = FIELD_GET(VEND1_GLOBAL_RSVD_STAT1_PROV_ID, val);
++ 
++ 	phydev_dbg(phydev, "FW %u.%u, Build %u, Provisioning %u\n",
++ 		   fw_major, fw_minor, build_id, prov_id);
++ }
++ 
++ static int aqr107_config_init(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	/* Check that the PHY interface type is compatible */
++ 	if (phydev->interface != PHY_INTERFACE_MODE_SGMII &&
++ 	    phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
++ 	    phydev->interface != PHY_INTERFACE_MODE_10GKR)
++ 		return -ENODEV;
++ 
++ 	ret = aqr107_wait_reset_complete(phydev);
++ 	if (!ret)
++ 		aqr107_chip_info(phydev);
++ 
++ 	/* ensure that a latched downshift event is cleared */
++ 	aqr107_read_downshift_event(phydev);
++ 
++ 	return aqr107_set_downshift(phydev, MDIO_AN_VEND_PROV_DOWNSHIFT_DFLT);
++ }
++ 
++ static int aqcs109_config_init(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	/* Check that the PHY interface type is compatible */
++ 	if (phydev->interface != PHY_INTERFACE_MODE_SGMII &&
++ 	    phydev->interface != PHY_INTERFACE_MODE_2500BASEX)
++ 		return -ENODEV;
++ 
++ 	ret = aqr107_wait_reset_complete(phydev);
++ 	if (!ret)
++ 		aqr107_chip_info(phydev);
++ 
++ 	/* AQCS109 belongs to a chip family partially supporting 10G and 5G.
++ 	 * PMA speed ability bits are the same for all members of the family,
++ 	 * AQCS109 however supports speeds up to 2.5G only.
++ 	 */
++ 	ret = phy_set_max_speed(phydev, SPEED_2500);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* ensure that a latched downshift event is cleared */
++ 	aqr107_read_downshift_event(phydev);
++ 
++ 	return aqr107_set_downshift(phydev, MDIO_AN_VEND_PROV_DOWNSHIFT_DFLT);
++ }
++ 
++ static void aqr107_link_change_notify(struct phy_device *phydev)
++ {
++ 	u8 fw_major, fw_minor;
++ 	bool downshift, short_reach, afr;
++ 	int val;
++ 
++ 	if (phydev->state != PHY_RUNNING || phydev->autoneg == AUTONEG_DISABLE)
++ 		return;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_RX_LP_STAT1);
++ 	/* call failed or link partner is no Aquantia PHY */
++ 	if (val < 0 || !(val & MDIO_AN_RX_LP_STAT1_AQ_PHY))
++ 		return;
++ 
++ 	short_reach = val & MDIO_AN_RX_LP_STAT1_SHORT_REACH;
++ 	downshift = val & MDIO_AN_RX_LP_STAT1_AQRATE_DOWNSHIFT;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_RX_LP_STAT4);
++ 	if (val < 0)
++ 		return;
++ 
++ 	fw_major = FIELD_GET(MDIO_AN_RX_LP_STAT4_FW_MAJOR, val);
++ 	fw_minor = FIELD_GET(MDIO_AN_RX_LP_STAT4_FW_MINOR, val);
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_RX_VEND_STAT3);
++ 	if (val < 0)
++ 		return;
++ 
++ 	afr = val & MDIO_AN_RX_VEND_STAT3_AFR;
++ 
++ 	phydev_dbg(phydev, "Link partner is Aquantia PHY, FW %u.%u%s%s%s\n",
++ 		   fw_major, fw_minor,
++ 		   short_reach ? ", short reach mode" : "",
++ 		   downshift ? ", fast-retrain downshift advertised" : "",
++ 		   afr ? ", fast reframe advertised" : "");
++ }
++ 
+++>>>>>>> 43429a0353af (net: phy: aquantia: report PHY details like firmware version)
+  static struct phy_driver aqr_driver[] = {
+  {
+  	PHY_ID_MATCH_MODEL(PHY_ID_AQ1202),
+* Unmerged path drivers/net/phy/aquantia_main.c
