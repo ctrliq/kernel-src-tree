@@ -1,0 +1,239 @@
+net/mlx5e: Protect tc flows hashtable with rcu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Protect tc flows hashtable with rcu (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 95.45%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit c5d326b29603bad4e5342801414b7302ba010209
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c5d326b2.failed
+
+In order to remove dependency on rtnl lock, access to tc flows hashtable
+must be explicitly protected from concurrent flows removal.
+
+Extend tc flow structure with rcu to allow concurrent parallel access. Use
+rcu read lock to safely lookup flow in tc flows hash table, and take
+reference to it. Use rcu free for flow deletion to accommodate concurrent
+stats requests.
+
+Add new DELETED flow flag. Imlement new flow_flag_test_and_set() helper
+that is used to set a flag and return its previous value. Use it to
+atomically set the flag in mlx5e_delete_flower() to guarantee that flow can
+only be deleted once, even when same flow is deleted concurrently by
+multiple tasks.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit c5d326b29603bad4e5342801414b7302ba010209)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index f8b0a7e3a895,a39f8a07de0a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -66,19 -66,20 +66,33 @@@ struct mlx5_nic_flow_attr 
+  	struct mlx5_fc		*counter;
+  };
+  
+ -#define MLX5E_TC_FLOW_BASE (MLX5E_TC_FLAG_LAST_EXPORTED_BIT + 1)
+ +#define MLX5E_TC_FLOW_BASE (MLX5E_TC_LAST_EXPORTED_BIT + 1)
+  
+  enum {
+++<<<<<<< HEAD
+ +	MLX5E_TC_FLOW_INGRESS	= MLX5E_TC_INGRESS,
+ +	MLX5E_TC_FLOW_EGRESS	= MLX5E_TC_EGRESS,
+ +	MLX5E_TC_FLOW_ESWITCH	= MLX5E_TC_ESW_OFFLOAD,
+ +	MLX5E_TC_FLOW_NIC	= MLX5E_TC_NIC_OFFLOAD,
+ +	MLX5E_TC_FLOW_OFFLOADED	= BIT(MLX5E_TC_FLOW_BASE),
+ +	MLX5E_TC_FLOW_HAIRPIN	= BIT(MLX5E_TC_FLOW_BASE + 1),
+ +	MLX5E_TC_FLOW_HAIRPIN_RSS = BIT(MLX5E_TC_FLOW_BASE + 2),
+ +	MLX5E_TC_FLOW_SLOW	  = BIT(MLX5E_TC_FLOW_BASE + 3),
+ +	MLX5E_TC_FLOW_DUP         = BIT(MLX5E_TC_FLOW_BASE + 4),
+ +	MLX5E_TC_FLOW_NOT_READY   = BIT(MLX5E_TC_FLOW_BASE + 5),
+++=======
++ 	MLX5E_TC_FLOW_FLAG_INGRESS	= MLX5E_TC_FLAG_INGRESS_BIT,
++ 	MLX5E_TC_FLOW_FLAG_EGRESS	= MLX5E_TC_FLAG_EGRESS_BIT,
++ 	MLX5E_TC_FLOW_FLAG_ESWITCH	= MLX5E_TC_FLAG_ESW_OFFLOAD_BIT,
++ 	MLX5E_TC_FLOW_FLAG_NIC		= MLX5E_TC_FLAG_NIC_OFFLOAD_BIT,
++ 	MLX5E_TC_FLOW_FLAG_OFFLOADED	= MLX5E_TC_FLOW_BASE,
++ 	MLX5E_TC_FLOW_FLAG_HAIRPIN	= MLX5E_TC_FLOW_BASE + 1,
++ 	MLX5E_TC_FLOW_FLAG_HAIRPIN_RSS	= MLX5E_TC_FLOW_BASE + 2,
++ 	MLX5E_TC_FLOW_FLAG_SLOW		= MLX5E_TC_FLOW_BASE + 3,
++ 	MLX5E_TC_FLOW_FLAG_DUP		= MLX5E_TC_FLOW_BASE + 4,
++ 	MLX5E_TC_FLOW_FLAG_NOT_READY	= MLX5E_TC_FLOW_BASE + 5,
++ 	MLX5E_TC_FLOW_FLAG_DELETED	= MLX5E_TC_FLOW_BASE + 6,
+++>>>>>>> c5d326b29603 (net/mlx5e: Protect tc flows hashtable with rcu)
+  };
+  
+  #define MLX5E_TC_MAX_SPLITS 1
+@@@ -121,6 -122,8 +135,11 @@@ struct mlx5e_tc_flow 
+  	struct list_head	hairpin; /* flows sharing the same hairpin */
+  	struct list_head	peer;    /* flows with peer flow */
+  	struct list_head	unready; /* flows not ready to be offloaded (e.g due to missing route) */
+++<<<<<<< HEAD
+++=======
++ 	refcount_t		refcnt;
++ 	struct rcu_head		rcu_head;
+++>>>>>>> c5d326b29603 (net/mlx5e: Protect tc flows hashtable with rcu)
+  	union {
+  		struct mlx5_esw_flow_attr esw_attr[0];
+  		struct mlx5_nic_flow_attr nic_attr[0];
+@@@ -185,6 -188,77 +204,80 @@@ struct mlx5e_mod_hdr_entry 
+  
+  #define MLX5_MH_ACT_SZ MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto)
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_tc_del_flow(struct mlx5e_priv *priv,
++ 			      struct mlx5e_tc_flow *flow);
++ 
++ static struct mlx5e_tc_flow *mlx5e_flow_get(struct mlx5e_tc_flow *flow)
++ {
++ 	if (!flow || !refcount_inc_not_zero(&flow->refcnt))
++ 		return ERR_PTR(-EINVAL);
++ 	return flow;
++ }
++ 
++ static void mlx5e_flow_put(struct mlx5e_priv *priv,
++ 			   struct mlx5e_tc_flow *flow)
++ {
++ 	if (refcount_dec_and_test(&flow->refcnt)) {
++ 		mlx5e_tc_del_flow(priv, flow);
++ 		kfree_rcu(flow, rcu_head);
++ 	}
++ }
++ 
++ static void __flow_flag_set(struct mlx5e_tc_flow *flow, unsigned long flag)
++ {
++ 	/* Complete all memory stores before setting bit. */
++ 	smp_mb__before_atomic();
++ 	set_bit(flag, &flow->flags);
++ }
++ 
++ #define flow_flag_set(flow, flag) __flow_flag_set(flow, MLX5E_TC_FLOW_FLAG_##flag)
++ 
++ static bool __flow_flag_test_and_set(struct mlx5e_tc_flow *flow,
++ 				     unsigned long flag)
++ {
++ 	/* test_and_set_bit() provides all necessary barriers */
++ 	return test_and_set_bit(flag, &flow->flags);
++ }
++ 
++ #define flow_flag_test_and_set(flow, flag)			\
++ 	__flow_flag_test_and_set(flow,				\
++ 				 MLX5E_TC_FLOW_FLAG_##flag)
++ 
++ static void __flow_flag_clear(struct mlx5e_tc_flow *flow, unsigned long flag)
++ {
++ 	/* Complete all memory stores before clearing bit. */
++ 	smp_mb__before_atomic();
++ 	clear_bit(flag, &flow->flags);
++ }
++ 
++ #define flow_flag_clear(flow, flag) __flow_flag_clear(flow, \
++ 						      MLX5E_TC_FLOW_FLAG_##flag)
++ 
++ static bool __flow_flag_test(struct mlx5e_tc_flow *flow, unsigned long flag)
++ {
++ 	bool ret = test_bit(flag, &flow->flags);
++ 
++ 	/* Read fields of flow structure only after checking flags. */
++ 	smp_mb__after_atomic();
++ 	return ret;
++ }
++ 
++ #define flow_flag_test(flow, flag) __flow_flag_test(flow, \
++ 						    MLX5E_TC_FLOW_FLAG_##flag)
++ 
++ static bool mlx5e_is_eswitch_flow(struct mlx5e_tc_flow *flow)
++ {
++ 	return flow_flag_test(flow, ESWITCH);
++ }
++ 
++ static bool mlx5e_is_offloaded_flow(struct mlx5e_tc_flow *flow)
++ {
++ 	return flow_flag_test(flow, OFFLOADED);
++ }
++ 
+++>>>>>>> c5d326b29603 (net/mlx5e: Protect tc flows hashtable with rcu)
+  static inline u32 hash_mod_hdr_info(struct mod_hdr_key *key)
+  {
+  	return jhash(key->actions,
+@@@ -3336,18 -3507,32 +3431,34 @@@ int mlx5e_delete_flower(struct net_devi
+  {
+  	struct rhashtable *tc_ht = get_tc_ht(priv, flags);
+  	struct mlx5e_tc_flow *flow;
++ 	int err;
+  
++ 	rcu_read_lock();
+  	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
+- 	if (!flow || !same_flow_direction(flow, flags))
+- 		return -EINVAL;
++ 	if (!flow || !same_flow_direction(flow, flags)) {
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
+  
++ 	/* Only delete the flow if it doesn't have MLX5E_TC_FLOW_DELETED flag
++ 	 * set.
++ 	 */
++ 	if (flow_flag_test_and_set(flow, DELETED)) {
++ 		err = -EINVAL;
++ 		goto errout;
++ 	}
+  	rhashtable_remove_fast(tc_ht, &flow->node, tc_ht_params);
++ 	rcu_read_unlock();
+  
+ -	mlx5e_flow_put(priv, flow);
+ +	mlx5e_tc_del_flow(priv, flow);
+ +
+ +	kfree(flow);
+  
+  	return 0;
++ 
++ errout:
++ 	rcu_read_unlock();
++ 	return err;
+  }
+  
+  int mlx5e_stats_flower(struct net_device *dev, struct mlx5e_priv *priv,
+@@@ -3361,15 -3546,24 +3472,24 @@@
+  	u64 lastuse = 0;
+  	u64 packets = 0;
+  	u64 bytes = 0;
+ -	int err = 0;
+  
+++<<<<<<< HEAD
+ +	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
+ +	if (!flow || !same_flow_direction(flow, flags))
+ +		return -EINVAL;
+++=======
++ 	rcu_read_lock();
++ 	flow = mlx5e_flow_get(rhashtable_lookup(tc_ht, &f->cookie,
++ 						tc_ht_params));
++ 	rcu_read_unlock();
++ 	if (IS_ERR(flow))
++ 		return PTR_ERR(flow);
+++>>>>>>> c5d326b29603 (net/mlx5e: Protect tc flows hashtable with rcu)
+  
+ -	if (!same_flow_direction(flow, flags)) {
+ -		err = -EINVAL;
+ -		goto errout;
+ -	}
+ -
+ -	if (mlx5e_is_offloaded_flow(flow)) {
+ +	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+  		counter = mlx5e_tc_get_counter(flow);
+  		if (!counter)
+ -			goto errout;
+ +			return 0;
+  
+  		mlx5_fc_query_cached(counter, &bytes, &packets, &lastuse);
+  	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
