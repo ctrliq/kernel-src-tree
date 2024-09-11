@@ -1,0 +1,102 @@
+net/smc: unique reason code for exceeded max dmb count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 72b7f6c48708e4524765a2f1316063207d8e0cd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/72b7f6c4.failed
+
+When the maximum dmb buffer limit for an ism device is reached no more
+dmb buffers can be registered. When this happens the reason code is set
+to SMC_CLC_DECL_MEM indicating out-of-memory. This is the same reason
+code that is used when no memory could be allocated for the new dmb
+buffer.
+This is confusing for users when they see this error but there is more
+memory available. To solve this set a separate new reason code when the
+maximum dmb limit exceeded.
+
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 72b7f6c48708e4524765a2f1316063207d8e0cd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_clc.h
+diff --cc net/smc/smc_clc.h
+index 4f2e150a2be1,cf7b45306f4e..000000000000
+--- a/net/smc/smc_clc.h
++++ b/net/smc/smc_clc.h
+@@@ -45,6 -46,9 +45,12 @@@
+  #define SMC_CLC_DECL_GETVLANERR	0x03080000  /* err to get vlan id of ip device*/
+  #define SMC_CLC_DECL_ISMVLANERR	0x03090000  /* err to reg vlan id on ism dev  */
+  #define SMC_CLC_DECL_NOACTLINK	0x030a0000  /* no active smc-r link in lgr    */
+++<<<<<<< HEAD
+++=======
++ #define SMC_CLC_DECL_NOSRVLINK	0x030b0000  /* SMC-R link from srv not found  */
++ #define SMC_CLC_DECL_VERSMISMAT	0x030c0000  /* SMC version mismatch	      */
++ #define SMC_CLC_DECL_MAX_DMB	0x030d0000  /* SMC-D DMB limit exceeded       */
+++>>>>>>> 72b7f6c48708 (net/smc: unique reason code for exceeded max dmb count)
+  #define SMC_CLC_DECL_SYNCERR	0x04000000  /* synchronization error          */
+  #define SMC_CLC_DECL_PEERDECL	0x05000000  /* peer declined during handshake */
+  #define SMC_CLC_DECL_INTERR	0x09990000  /* internal error		      */
+diff --git a/net/smc/af_smc.c b/net/smc/af_smc.c
+index fa839aa9084c..a5f07251d4bd 100644
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -702,8 +702,11 @@ static int smc_connect_ism(struct smc_sock *smc,
+ 	}
+ 
+ 	/* Create send and receive buffers */
+-	if (smc_buf_create(smc, true))
+-		return smc_connect_abort(smc, SMC_CLC_DECL_MEM,
++	rc = smc_buf_create(smc, true);
++	if (rc)
++		return smc_connect_abort(smc, (rc == -ENOSPC) ?
++					      SMC_CLC_DECL_MAX_DMB :
++					      SMC_CLC_DECL_MEM,
+ 					 ini->cln_first_contact);
+ 
+ 	smc_conn_save_peer_info(smc, aclc);
+@@ -1195,12 +1198,14 @@ static int smc_listen_ism_init(struct smc_sock *new_smc,
+ 	}
+ 
+ 	/* Create send and receive buffers */
+-	if (smc_buf_create(new_smc, true)) {
++	rc = smc_buf_create(new_smc, true);
++	if (rc) {
+ 		if (ini->cln_first_contact == SMC_FIRST_CONTACT)
+ 			smc_lgr_cleanup_early(&new_smc->conn);
+ 		else
+ 			smc_conn_free(&new_smc->conn);
+-		return SMC_CLC_DECL_MEM;
++		return (rc == -ENOSPC) ? SMC_CLC_DECL_MAX_DMB :
++					 SMC_CLC_DECL_MEM;
+ 	}
+ 
+ 	return 0;
+* Unmerged path net/smc/smc_clc.h
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index d2311634616c..1770090edfe7 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -1321,7 +1321,7 @@ static struct smc_buf_desc *smcd_new_buf_create(struct smc_link_group *lgr,
+ 		rc = smc_ism_register_dmb(lgr, bufsize, buf_desc);
+ 		if (rc) {
+ 			kfree(buf_desc);
+-			return ERR_PTR(-EAGAIN);
++			return (rc == -ENOMEM) ? ERR_PTR(-EAGAIN) : ERR_PTR(rc);
+ 		}
+ 		buf_desc->pages = virt_to_page(buf_desc->cpu_addr);
+ 		/* CDC header stored in buf. So, pretend it was smaller */
+@@ -1395,7 +1395,7 @@ static int __smc_buf_create(struct smc_sock *smc, bool is_smcd, bool is_rmb)
+ 	}
+ 
+ 	if (IS_ERR(buf_desc))
+-		return -ENOMEM;
++		return PTR_ERR(buf_desc);
+ 
+ 	if (!is_smcd) {
+ 		if (smcr_buf_map_usable_links(lgr, buf_desc, is_rmb)) {
