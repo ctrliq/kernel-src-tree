@@ -1,0 +1,128 @@
+kasan, arm64: print report from tag fault handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 4291e9ee618956eeae02b17f35b272193a6cda5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/4291e9ee.failed
+
+Add error reporting for hardware tag-based KASAN.  When
+CONFIG_KASAN_HW_TAGS is enabled, print KASAN report from the arm64 tag
+fault handler.
+
+SAS bits aren't set in ESR for all faults reported in EL1, so it's
+impossible to find out the size of the access the caused the fault.  Adapt
+KASAN reporting code to handle this case.
+
+Link: https://lkml.kernel.org/r/b559c82b6a969afedf53b4694b475f0234067a1a.1606161801.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Co-developed-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Signed-off-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Reviewed-by: Alexander Potapenko <glider@google.com>
+	Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Marco Elver <elver@google.com>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4291e9ee618956eeae02b17f35b272193a6cda5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/fault.c
+diff --cc arch/arm64/mm/fault.c
+index 9216265c0f74,3c40da479899..000000000000
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@@ -291,6 -298,57 +292,60 @@@ static void die_kernel_fault(const cha
+  	do_exit(SIGKILL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KASAN_HW_TAGS
++ static void report_tag_fault(unsigned long addr, unsigned int esr,
++ 			     struct pt_regs *regs)
++ {
++ 	bool is_write  = ((esr & ESR_ELx_WNR) >> ESR_ELx_WNR_SHIFT) != 0;
++ 
++ 	/*
++ 	 * SAS bits aren't set for all faults reported in EL1, so we can't
++ 	 * find out access size.
++ 	 */
++ 	kasan_report(addr, 0, is_write, regs->pc);
++ }
++ #else
++ /* Tag faults aren't enabled without CONFIG_KASAN_HW_TAGS. */
++ static inline void report_tag_fault(unsigned long addr, unsigned int esr,
++ 				    struct pt_regs *regs) { }
++ #endif
++ 
++ static void do_tag_recovery(unsigned long addr, unsigned int esr,
++ 			   struct pt_regs *regs)
++ {
++ 	static bool reported;
++ 
++ 	if (!READ_ONCE(reported)) {
++ 		report_tag_fault(addr, esr, regs);
++ 		WRITE_ONCE(reported, true);
++ 	}
++ 
++ 	/*
++ 	 * Disable MTE Tag Checking on the local CPU for the current EL.
++ 	 * It will be done lazily on the other CPUs when they will hit a
++ 	 * tag fault.
++ 	 */
++ 	sysreg_clear_set(sctlr_el1, SCTLR_ELx_TCF_MASK, SCTLR_ELx_TCF_NONE);
++ 	isb();
++ }
++ 
++ static bool is_el1_mte_sync_tag_check_fault(unsigned int esr)
++ {
++ 	unsigned int ec = ESR_ELx_EC(esr);
++ 	unsigned int fsc = esr & ESR_ELx_FSC;
++ 
++ 	if (ec != ESR_ELx_EC_DABT_CUR)
++ 		return false;
++ 
++ 	if (fsc == ESR_ELx_FSC_MTE)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 4291e9ee6189 (kasan, arm64: print report from tag fault handler)
+  static void __do_kernel_fault(unsigned long addr, unsigned int esr,
+  			      struct pt_regs *regs)
+  {
+* Unmerged path arch/arm64/mm/fault.c
+diff --git a/mm/kasan/report.c b/mm/kasan/report.c
+index a0772fe304d1..bf191a6fd2d3 100644
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@ -65,9 +65,14 @@ static void print_error_description(struct kasan_access_info *info)
+ {
+ 	pr_err("BUG: KASAN: %s in %pS\n",
+ 		get_bug_type(info), (void *)info->ip);
+-	pr_err("%s of size %zu at addr %px by task %s/%d\n",
+-		info->is_write ? "Write" : "Read", info->access_size,
+-		info->access_addr, current->comm, task_pid_nr(current));
++	if (info->access_size)
++		pr_err("%s of size %zu at addr %px by task %s/%d\n",
++			info->is_write ? "Write" : "Read", info->access_size,
++			info->access_addr, current->comm, task_pid_nr(current));
++	else
++		pr_err("%s at addr %px by task %s/%d\n",
++			info->is_write ? "Write" : "Read",
++			info->access_addr, current->comm, task_pid_nr(current));
+ }
+ 
+ static DEFINE_SPINLOCK(report_lock);
