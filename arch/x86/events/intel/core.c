@@ -3968,6 +3968,8 @@ static __initconst const struct x86_pmu core_pmu = {
 
 	.lbr_reset		= intel_pmu_lbr_reset_64,
 	.lbr_read		= intel_pmu_lbr_read_64,
+	.lbr_save		= intel_pmu_lbr_save,
+	.lbr_restore		= intel_pmu_lbr_restore,
 };
 
 static __initconst const struct x86_pmu intel_pmu = {
@@ -4016,6 +4018,8 @@ static __initconst const struct x86_pmu intel_pmu = {
 
 	.lbr_reset		= intel_pmu_lbr_reset_64,
 	.lbr_read		= intel_pmu_lbr_read_64,
+	.lbr_save		= intel_pmu_lbr_save,
+	.lbr_restore		= intel_pmu_lbr_restore,
 };
 
 static __init void intel_clovertown_quirk(void)
