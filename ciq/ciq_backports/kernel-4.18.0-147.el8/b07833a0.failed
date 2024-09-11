@@ -1,0 +1,648 @@
+ice: Add reg_idx variable in ice_q_vector structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Brett Creeley <brett.creeley@intel.com>
+commit b07833a00d70fb731bb3aba8876a56e37b549f3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b07833a0.failed
+
+Every time we want to re-enable interrupts and/or write to a register
+that requires an interrupt vector's hardware index we do the following:
+
+vsi->hw_base_vector + q_vector->v_idx
+
+This is a wasteful operation, especially in the hot path. Fix this by
+adding a u16 reg_idx member to the ice_q_vector structure and make the
+necessary changes to make this work.
+
+	Signed-off-by: Brett Creeley <brett.creeley@intel.com>
+	Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit b07833a00d70fb731bb3aba8876a56e37b549f3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice.h
+#	drivers/net/ethernet/intel/ice/ice_lib.c
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+diff --cc drivers/net/ethernet/intel/ice/ice.h
+index 109d42df49ad,d66aad49bfd4..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@@ -274,15 -295,12 +274,20 @@@ struct ice_vsi 
+  /* struct that defines an interrupt vector */
+  struct ice_q_vector {
+  	struct ice_vsi *vsi;
+ -
+ +	cpumask_t affinity_mask;
+ +	struct napi_struct napi;
+ +	struct ice_ring_container rx;
+ +	struct ice_ring_container tx;
+ +	struct irq_affinity_notify affinity_notify;
+  	u16 v_idx;			/* index in the vsi->q_vector array. */
+++<<<<<<< HEAD
+++=======
++ 	u16 reg_idx;
++ 	u8 num_ring_rx;			/* total number of Rx rings in vector */
+++>>>>>>> b07833a00d70 (ice: Add reg_idx variable in ice_q_vector structure)
+  	u8 num_ring_tx;			/* total number of Tx rings in vector */
+ -	u8 itr_countdown;		/* when 0 should adjust adaptive ITR */
+ +	u8 num_ring_rx;			/* total number of Rx rings in vector */
+ +	char name[ICE_INT_NAME_STR_LEN];
+  	/* in usecs, need to use ice_intrl_to_usecs_reg() before writing this
+  	 * value to the device
+  	 */
+@@@ -365,14 -396,15 +370,14 @@@ struct ice_netdev_priv 
+  
+  /**
+   * ice_irq_dynamic_ena - Enable default interrupt generation settings
+ - * @hw: pointer to HW struct
+ - * @vsi: pointer to VSI struct, can be NULL
+ + * @hw: pointer to hw struct
+ + * @vsi: pointer to vsi struct, can be NULL
+   * @q_vector: pointer to q_vector, can be NULL
+   */
+ -static inline void
+ -ice_irq_dynamic_ena(struct ice_hw *hw, struct ice_vsi *vsi,
+ -		    struct ice_q_vector *q_vector)
+ +static inline void ice_irq_dynamic_ena(struct ice_hw *hw, struct ice_vsi *vsi,
+ +				       struct ice_q_vector *q_vector)
+  {
+- 	u32 vector = (vsi && q_vector) ? vsi->hw_base_vector + q_vector->v_idx :
++ 	u32 vector = (vsi && q_vector) ? q_vector->reg_idx :
+  				((struct ice_pf *)hw->back)->hw_oicr_idx;
+  	int itr = ICE_ITR_NONE;
+  	u32 val;
+diff --cc drivers/net/ethernet/intel/ice/ice_lib.c
+index 6fbf0ede9536,399905396134..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@@ -1770,24 -1810,36 +1769,48 @@@ static u32 ice_intrl_usec_to_reg(u8 int
+   * associated with the interrupt vector passed in.
+   */
+  static void
+- ice_cfg_itr(struct ice_hw *hw, struct ice_q_vector *q_vector, u16 vector)
++ ice_cfg_itr(struct ice_hw *hw, struct ice_q_vector *q_vector)
+  {
+ -	ice_cfg_itr_gran(hw);
+ +	u8 itr_gran = hw->itr_gran;
+  
+  	if (q_vector->num_ring_rx) {
+  		struct ice_ring_container *rc = &q_vector->rx;
+  
+++<<<<<<< HEAD
+ +		rc->itr = ITR_TO_REG(ICE_DFLT_RX_ITR, itr_gran);
+ +		rc->latency_range = ICE_LOW_LATENCY;
+ +		wr32(hw, GLINT_ITR(rc->itr_idx, vector), rc->itr);
+++=======
++ 		/* if this value is set then don't overwrite with default */
++ 		if (!rc->itr_setting)
++ 			rc->itr_setting = ICE_DFLT_RX_ITR;
++ 
++ 		rc->target_itr = ITR_TO_REG(rc->itr_setting);
++ 		rc->next_update = jiffies + 1;
++ 		rc->current_itr = rc->target_itr;
++ 		wr32(hw, GLINT_ITR(rc->itr_idx, q_vector->reg_idx),
++ 		     ITR_REG_ALIGN(rc->current_itr) >> ICE_ITR_GRAN_S);
+++>>>>>>> b07833a00d70 (ice: Add reg_idx variable in ice_q_vector structure)
+  	}
+  
+  	if (q_vector->num_ring_tx) {
+  		struct ice_ring_container *rc = &q_vector->tx;
+  
+++<<<<<<< HEAD
+ +		rc->itr = ITR_TO_REG(ICE_DFLT_TX_ITR, itr_gran);
+ +		rc->latency_range = ICE_LOW_LATENCY;
+ +		wr32(hw, GLINT_ITR(rc->itr_idx, vector), rc->itr);
+++=======
++ 		/* if this value is set then don't overwrite with default */
++ 		if (!rc->itr_setting)
++ 			rc->itr_setting = ICE_DFLT_TX_ITR;
++ 
++ 		rc->target_itr = ITR_TO_REG(rc->itr_setting);
++ 		rc->next_update = jiffies + 1;
++ 		rc->current_itr = rc->target_itr;
++ 		wr32(hw, GLINT_ITR(rc->itr_idx, q_vector->reg_idx),
++ 		     ITR_REG_ALIGN(rc->current_itr) >> ICE_ITR_GRAN_S);
+++>>>>>>> b07833a00d70 (ice: Add reg_idx variable in ice_q_vector structure)
+  	}
+  }
+  
+@@@ -1999,47 -2051,63 +2022,81 @@@ ice_vsi_stop_tx_rings(struct ice_vsi *v
+  		goto err_alloc_q_ids;
+  	}
+  
+ -	q_handles = devm_kcalloc(&pf->pdev->dev, vsi->num_txq,
+ -				 sizeof(*q_handles), GFP_KERNEL);
+ -	if (!q_handles) {
+ -		err = -ENOMEM;
+ -		goto err_alloc_q_handles;
+ -	}
+ +	/* set up the Tx queue list to be disabled */
+ +	ice_for_each_txq(vsi, i) {
+ +		u16 v_idx;
+  
+++<<<<<<< HEAD
+ +		if (!rings || !rings[i] || !rings[i]->q_vector) {
+ +			err = -EINVAL;
+ +			goto err_out;
+++=======
++ 	/* set up the Tx queue list to be disabled for each enabled TC */
++ 	ice_for_each_traffic_class(tc) {
++ 		if (!(vsi->tc_cfg.ena_tc & BIT(tc)))
++ 			break;
++ 
++ 		for (i = 0; i < vsi->tc_cfg.tc_info[tc].qcount_tx; i++) {
++ 			if (!rings || !rings[q_idx] ||
++ 			    !rings[q_idx]->q_vector) {
++ 				err = -EINVAL;
++ 				goto err_out;
++ 			}
++ 
++ 			q_ids[i] = vsi->txq_map[q_idx + offset];
++ 			q_teids[i] = rings[q_idx]->txq_teid;
++ 			q_handles[i] = i;
++ 
++ 			/* clear cause_ena bit for disabled queues */
++ 			val = rd32(hw, QINT_TQCTL(rings[i]->reg_idx));
++ 			val &= ~QINT_TQCTL_CAUSE_ENA_M;
++ 			wr32(hw, QINT_TQCTL(rings[i]->reg_idx), val);
++ 
++ 			/* software is expected to wait for 100 ns */
++ 			ndelay(100);
++ 
++ 			/* trigger a software interrupt for the vector
++ 			 * associated to the queue to schedule NAPI handler
++ 			 */
++ 			wr32(hw, GLINT_DYN_CTL(rings[i]->q_vector->reg_idx),
++ 			     GLINT_DYN_CTL_SWINT_TRIG_M |
++ 			     GLINT_DYN_CTL_INTENA_MSK_M);
++ 			q_idx++;
+++>>>>>>> b07833a00d70 (ice: Add reg_idx variable in ice_q_vector structure)
+  		}
+ -		status = ice_dis_vsi_txq(vsi->port_info, vsi->idx, tc,
+ -					 vsi->num_txq, q_handles, q_ids,
+ -					 q_teids, rst_src, rel_vmvf_num, NULL);
+ -
+ -		/* if the disable queue command was exercised during an active
+ -		 * reset flow, ICE_ERR_RESET_ONGOING is returned. This is not
+ -		 * an error as the reset operation disables queues at the
+ -		 * hardware level anyway.
+ +
+ +		q_ids[i] = vsi->txq_map[i + offset];
+ +		q_teids[i] = rings[i]->txq_teid;
+ +
+ +		/* clear cause_ena bit for disabled queues */
+ +		val = rd32(hw, QINT_TQCTL(rings[i]->reg_idx));
+ +		val &= ~QINT_TQCTL_CAUSE_ENA_M;
+ +		wr32(hw, QINT_TQCTL(rings[i]->reg_idx), val);
+ +
+ +		/* software is expected to wait for 100 ns */
+ +		ndelay(100);
+ +
+ +		/* trigger a software interrupt for the vector associated to
+ +		 * the queue to schedule NAPI handler
+  		 */
+ -		if (status == ICE_ERR_RESET_ONGOING) {
+ -			dev_dbg(&pf->pdev->dev,
+ -				"Reset in progress. LAN Tx queues already disabled\n");
+ -		} else if (status) {
+ -			dev_err(&pf->pdev->dev,
+ -				"Failed to disable LAN Tx queues, error: %d\n",
+ -				status);
+ -			err = -ENODEV;
+ -		}
+ +		v_idx = rings[i]->q_vector->v_idx;
+ +		wr32(hw, GLINT_DYN_CTL(vsi->hw_base_vector + v_idx),
+ +		     GLINT_DYN_CTL_SWINT_TRIG_M | GLINT_DYN_CTL_INTENA_MSK_M);
+ +	}
+ +	status = ice_dis_vsi_txq(vsi->port_info, vsi->num_txq, q_ids, q_teids,
+ +				 rst_src, rel_vmvf_num, NULL);
+ +	/* if the disable queue command was exercised during an active reset
+ +	 * flow, ICE_ERR_RESET_ONGOING is returned. This is not an error as
+ +	 * the reset operation disables queues at the hardware level anyway.
+ +	 */
+ +	if (status == ICE_ERR_RESET_ONGOING) {
+ +		dev_info(&pf->pdev->dev,
+ +			 "Reset in progress. LAN Tx queues already disabled\n");
+ +	} else if (status) {
+ +		dev_err(&pf->pdev->dev,
+ +			"Failed to disable LAN Tx queues, error: %d\n",
+ +			status);
+ +		err = -ENODEV;
+  	}
+  
+  err_out:
+@@@ -2121,6 -2196,52 +2178,44 @@@ err_out
+  	return -EIO;
+  }
+  
+ -static void ice_vsi_set_tc_cfg(struct ice_vsi *vsi)
+ -{
+ -	struct ice_dcbx_cfg *cfg = &vsi->port_info->local_dcbx_cfg;
+ -
+ -	vsi->tc_cfg.ena_tc = ice_dcb_get_ena_tc(cfg);
+ -	vsi->tc_cfg.numtc = ice_dcb_get_num_tc(cfg);
+ -}
+ -
++ /**
++  * ice_vsi_set_q_vectors_reg_idx - set the HW register index for all q_vectors
++  * @vsi: VSI to set the q_vectors register index on
++  */
++ static int
++ ice_vsi_set_q_vectors_reg_idx(struct ice_vsi *vsi)
++ {
++ 	u16 i;
++ 
++ 	if (!vsi || !vsi->q_vectors)
++ 		return -EINVAL;
++ 
++ 	ice_for_each_q_vector(vsi, i) {
++ 		struct ice_q_vector *q_vector = vsi->q_vectors[i];
++ 
++ 		if (!q_vector) {
++ 			dev_err(&vsi->back->pdev->dev,
++ 				"Failed to set reg_idx on q_vector %d VSI %d\n",
++ 				i, vsi->vsi_num);
++ 			goto clear_reg_idx;
++ 		}
++ 
++ 		q_vector->reg_idx = q_vector->v_idx + vsi->hw_base_vector;
++ 	}
++ 
++ 	return 0;
++ 
++ clear_reg_idx:
++ 	ice_for_each_q_vector(vsi, i) {
++ 		struct ice_q_vector *q_vector = vsi->q_vectors[i];
++ 
++ 		if (q_vector)
++ 			q_vector->reg_idx = 0;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
+  /**
+   * ice_vsi_setup - Set up a VSI by a given type
+   * @pf: board private structure
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index ae825ac64b04,51af6b9a7ea2..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -1456,6 -1590,32 +1456,35 @@@ static void ice_free_irq_msix_misc(stru
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_ena_ctrlq_interrupts - enable control queue interrupts
++  * @hw: pointer to HW structure
++  * @reg_idx: HW vector index to associate the control queue interrupts with
++  */
++ static void ice_ena_ctrlq_interrupts(struct ice_hw *hw, u16 reg_idx)
++ {
++ 	u32 val;
++ 
++ 	val = ((reg_idx & PFINT_OICR_CTL_MSIX_INDX_M) |
++ 	       PFINT_OICR_CTL_CAUSE_ENA_M);
++ 	wr32(hw, PFINT_OICR_CTL, val);
++ 
++ 	/* enable Admin queue Interrupt causes */
++ 	val = ((reg_idx & PFINT_FW_CTL_MSIX_INDX_M) |
++ 	       PFINT_FW_CTL_CAUSE_ENA_M);
++ 	wr32(hw, PFINT_FW_CTL, val);
++ 
++ 	/* enable Mailbox queue Interrupt causes */
++ 	val = ((reg_idx & PFINT_MBX_CTL_MSIX_INDX_M) |
++ 	       PFINT_MBX_CTL_CAUSE_ENA_M);
++ 	wr32(hw, PFINT_MBX_CTL, val);
++ 
++ 	ice_flush(hw);
++ }
++ 
++ /**
+++>>>>>>> b07833a00d70 (ice: Add reg_idx variable in ice_q_vector structure)
+   * ice_req_irq_msix_misc - Setup the misc vector to handle non queue events
+   * @pf: board private structure
+   *
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index 5f3cb4f21bbe,e5af775a3fd9..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -1048,6 -1098,304 +1048,307 @@@ static int ice_clean_rx_irq(struct ice_
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_adjust_itr_by_size_and_speed - Adjust ITR based on current traffic
++  * @port_info: port_info structure containing the current link speed
++  * @avg_pkt_size: average size of Tx or Rx packets based on clean routine
++  * @itr: itr value to update
++  *
++  * Calculate how big of an increment should be applied to the ITR value passed
++  * in based on wmem_default, SKB overhead, Ethernet overhead, and the current
++  * link speed.
++  *
++  * The following is a calculation derived from:
++  *  wmem_default / (size + overhead) = desired_pkts_per_int
++  *  rate / bits_per_byte / (size + Ethernet overhead) = pkt_rate
++  *  (desired_pkt_rate / pkt_rate) * usecs_per_sec = ITR value
++  *
++  * Assuming wmem_default is 212992 and overhead is 640 bytes per
++  * packet, (256 skb, 64 headroom, 320 shared info), we can reduce the
++  * formula down to:
++  *
++  *	 wmem_default * bits_per_byte * usecs_per_sec   pkt_size + 24
++  * ITR = -------------------------------------------- * --------------
++  *			     rate			pkt_size + 640
++  */
++ static unsigned int
++ ice_adjust_itr_by_size_and_speed(struct ice_port_info *port_info,
++ 				 unsigned int avg_pkt_size,
++ 				 unsigned int itr)
++ {
++ 	switch (port_info->phy.link_info.link_speed) {
++ 	case ICE_AQ_LINK_SPEED_100GB:
++ 		itr += DIV_ROUND_UP(17 * (avg_pkt_size + 24),
++ 				    avg_pkt_size + 640);
++ 		break;
++ 	case ICE_AQ_LINK_SPEED_50GB:
++ 		itr += DIV_ROUND_UP(34 * (avg_pkt_size + 24),
++ 				    avg_pkt_size + 640);
++ 		break;
++ 	case ICE_AQ_LINK_SPEED_40GB:
++ 		itr += DIV_ROUND_UP(43 * (avg_pkt_size + 24),
++ 				    avg_pkt_size + 640);
++ 		break;
++ 	case ICE_AQ_LINK_SPEED_25GB:
++ 		itr += DIV_ROUND_UP(68 * (avg_pkt_size + 24),
++ 				    avg_pkt_size + 640);
++ 		break;
++ 	case ICE_AQ_LINK_SPEED_20GB:
++ 		itr += DIV_ROUND_UP(85 * (avg_pkt_size + 24),
++ 				    avg_pkt_size + 640);
++ 		break;
++ 	case ICE_AQ_LINK_SPEED_10GB:
++ 		/* fall through */
++ 	default:
++ 		itr += DIV_ROUND_UP(170 * (avg_pkt_size + 24),
++ 				    avg_pkt_size + 640);
++ 		break;
++ 	}
++ 
++ 	if ((itr & ICE_ITR_MASK) > ICE_ITR_ADAPTIVE_MAX_USECS) {
++ 		itr &= ICE_ITR_ADAPTIVE_LATENCY;
++ 		itr += ICE_ITR_ADAPTIVE_MAX_USECS;
++ 	}
++ 
++ 	return itr;
++ }
++ 
++ /**
++  * ice_update_itr - update the adaptive ITR value based on statistics
++  * @q_vector: structure containing interrupt and ring information
++  * @rc: structure containing ring performance data
++  *
++  * Stores a new ITR value based on packets and byte
++  * counts during the last interrupt.  The advantage of per interrupt
++  * computation is faster updates and more accurate ITR for the current
++  * traffic pattern.  Constants in this function were computed
++  * based on theoretical maximum wire speed and thresholds were set based
++  * on testing data as well as attempting to minimize response time
++  * while increasing bulk throughput.
++  */
++ static void
++ ice_update_itr(struct ice_q_vector *q_vector, struct ice_ring_container *rc)
++ {
++ 	unsigned long next_update = jiffies;
++ 	unsigned int packets, bytes, itr;
++ 	bool container_is_rx;
++ 
++ 	if (!rc->ring || !ITR_IS_DYNAMIC(rc->itr_setting))
++ 		return;
++ 
++ 	/* If itr_countdown is set it means we programmed an ITR within
++ 	 * the last 4 interrupt cycles. This has a side effect of us
++ 	 * potentially firing an early interrupt. In order to work around
++ 	 * this we need to throw out any data received for a few
++ 	 * interrupts following the update.
++ 	 */
++ 	if (q_vector->itr_countdown) {
++ 		itr = rc->target_itr;
++ 		goto clear_counts;
++ 	}
++ 
++ 	container_is_rx = (&q_vector->rx == rc);
++ 	/* For Rx we want to push the delay up and default to low latency.
++ 	 * for Tx we want to pull the delay down and default to high latency.
++ 	 */
++ 	itr = container_is_rx ?
++ 		ICE_ITR_ADAPTIVE_MIN_USECS | ICE_ITR_ADAPTIVE_LATENCY :
++ 		ICE_ITR_ADAPTIVE_MAX_USECS | ICE_ITR_ADAPTIVE_LATENCY;
++ 
++ 	/* If we didn't update within up to 1 - 2 jiffies we can assume
++ 	 * that either packets are coming in so slow there hasn't been
++ 	 * any work, or that there is so much work that NAPI is dealing
++ 	 * with interrupt moderation and we don't need to do anything.
++ 	 */
++ 	if (time_after(next_update, rc->next_update))
++ 		goto clear_counts;
++ 
++ 	packets = rc->total_pkts;
++ 	bytes = rc->total_bytes;
++ 
++ 	if (container_is_rx) {
++ 		/* If Rx there are 1 to 4 packets and bytes are less than
++ 		 * 9000 assume insufficient data to use bulk rate limiting
++ 		 * approach unless Tx is already in bulk rate limiting. We
++ 		 * are likely latency driven.
++ 		 */
++ 		if (packets && packets < 4 && bytes < 9000 &&
++ 		    (q_vector->tx.target_itr & ICE_ITR_ADAPTIVE_LATENCY)) {
++ 			itr = ICE_ITR_ADAPTIVE_LATENCY;
++ 			goto adjust_by_size_and_speed;
++ 		}
++ 	} else if (packets < 4) {
++ 		/* If we have Tx and Rx ITR maxed and Tx ITR is running in
++ 		 * bulk mode and we are receiving 4 or fewer packets just
++ 		 * reset the ITR_ADAPTIVE_LATENCY bit for latency mode so
++ 		 * that the Rx can relax.
++ 		 */
++ 		if (rc->target_itr == ICE_ITR_ADAPTIVE_MAX_USECS &&
++ 		    (q_vector->rx.target_itr & ICE_ITR_MASK) ==
++ 		    ICE_ITR_ADAPTIVE_MAX_USECS)
++ 			goto clear_counts;
++ 	} else if (packets > 32) {
++ 		/* If we have processed over 32 packets in a single interrupt
++ 		 * for Tx assume we need to switch over to "bulk" mode.
++ 		 */
++ 		rc->target_itr &= ~ICE_ITR_ADAPTIVE_LATENCY;
++ 	}
++ 
++ 	/* We have no packets to actually measure against. This means
++ 	 * either one of the other queues on this vector is active or
++ 	 * we are a Tx queue doing TSO with too high of an interrupt rate.
++ 	 *
++ 	 * Between 4 and 56 we can assume that our current interrupt delay
++ 	 * is only slightly too low. As such we should increase it by a small
++ 	 * fixed amount.
++ 	 */
++ 	if (packets < 56) {
++ 		itr = rc->target_itr + ICE_ITR_ADAPTIVE_MIN_INC;
++ 		if ((itr & ICE_ITR_MASK) > ICE_ITR_ADAPTIVE_MAX_USECS) {
++ 			itr &= ICE_ITR_ADAPTIVE_LATENCY;
++ 			itr += ICE_ITR_ADAPTIVE_MAX_USECS;
++ 		}
++ 		goto clear_counts;
++ 	}
++ 
++ 	if (packets <= 256) {
++ 		itr = min(q_vector->tx.current_itr, q_vector->rx.current_itr);
++ 		itr &= ICE_ITR_MASK;
++ 
++ 		/* Between 56 and 112 is our "goldilocks" zone where we are
++ 		 * working out "just right". Just report that our current
++ 		 * ITR is good for us.
++ 		 */
++ 		if (packets <= 112)
++ 			goto clear_counts;
++ 
++ 		/* If packet count is 128 or greater we are likely looking
++ 		 * at a slight overrun of the delay we want. Try halving
++ 		 * our delay to see if that will cut the number of packets
++ 		 * in half per interrupt.
++ 		 */
++ 		itr >>= 1;
++ 		itr &= ICE_ITR_MASK;
++ 		if (itr < ICE_ITR_ADAPTIVE_MIN_USECS)
++ 			itr = ICE_ITR_ADAPTIVE_MIN_USECS;
++ 
++ 		goto clear_counts;
++ 	}
++ 
++ 	/* The paths below assume we are dealing with a bulk ITR since
++ 	 * number of packets is greater than 256. We are just going to have
++ 	 * to compute a value and try to bring the count under control,
++ 	 * though for smaller packet sizes there isn't much we can do as
++ 	 * NAPI polling will likely be kicking in sooner rather than later.
++ 	 */
++ 	itr = ICE_ITR_ADAPTIVE_BULK;
++ 
++ adjust_by_size_and_speed:
++ 
++ 	/* based on checks above packets cannot be 0 so division is safe */
++ 	itr = ice_adjust_itr_by_size_and_speed(q_vector->vsi->port_info,
++ 					       bytes / packets, itr);
++ 
++ clear_counts:
++ 	/* write back value */
++ 	rc->target_itr = itr;
++ 
++ 	/* next update should occur within next jiffy */
++ 	rc->next_update = next_update + 1;
++ 
++ 	rc->total_bytes = 0;
++ 	rc->total_pkts = 0;
++ }
++ 
++ /**
++  * ice_buildreg_itr - build value for writing to the GLINT_DYN_CTL register
++  * @itr_idx: interrupt throttling index
++  * @itr: interrupt throttling value in usecs
++  */
++ static u32 ice_buildreg_itr(u16 itr_idx, u16 itr)
++ {
++ 	/* The itr value is reported in microseconds, and the register value is
++ 	 * recorded in 2 microsecond units. For this reason we only need to
++ 	 * shift by the GLINT_DYN_CTL_INTERVAL_S - ICE_ITR_GRAN_S to apply this
++ 	 * granularity as a shift instead of division. The mask makes sure the
++ 	 * ITR value is never odd so we don't accidentally write into the field
++ 	 * prior to the ITR field.
++ 	 */
++ 	itr &= ICE_ITR_MASK;
++ 
++ 	return GLINT_DYN_CTL_INTENA_M | GLINT_DYN_CTL_CLEARPBA_M |
++ 		(itr_idx << GLINT_DYN_CTL_ITR_INDX_S) |
++ 		(itr << (GLINT_DYN_CTL_INTERVAL_S - ICE_ITR_GRAN_S));
++ }
++ 
++ /* The act of updating the ITR will cause it to immediately trigger. In order
++  * to prevent this from throwing off adaptive update statistics we defer the
++  * update so that it can only happen so often. So after either Tx or Rx are
++  * updated we make the adaptive scheme wait until either the ITR completely
++  * expires via the next_update expiration or we have been through at least
++  * 3 interrupts.
++  */
++ #define ITR_COUNTDOWN_START 3
++ 
++ /**
++  * ice_update_ena_itr - Update ITR and re-enable MSIX interrupt
++  * @vsi: the VSI associated with the q_vector
++  * @q_vector: q_vector for which ITR is being updated and interrupt enabled
++  */
++ static void
++ ice_update_ena_itr(struct ice_vsi *vsi, struct ice_q_vector *q_vector)
++ {
++ 	struct ice_ring_container *tx = &q_vector->tx;
++ 	struct ice_ring_container *rx = &q_vector->rx;
++ 	u32 itr_val;
++ 
++ 	/* This will do nothing if dynamic updates are not enabled */
++ 	ice_update_itr(q_vector, tx);
++ 	ice_update_itr(q_vector, rx);
++ 
++ 	/* This block of logic allows us to get away with only updating
++ 	 * one ITR value with each interrupt. The idea is to perform a
++ 	 * pseudo-lazy update with the following criteria.
++ 	 *
++ 	 * 1. Rx is given higher priority than Tx if both are in same state
++ 	 * 2. If we must reduce an ITR that is given highest priority.
++ 	 * 3. We then give priority to increasing ITR based on amount.
++ 	 */
++ 	if (rx->target_itr < rx->current_itr) {
++ 		/* Rx ITR needs to be reduced, this is highest priority */
++ 		itr_val = ice_buildreg_itr(rx->itr_idx, rx->target_itr);
++ 		rx->current_itr = rx->target_itr;
++ 		q_vector->itr_countdown = ITR_COUNTDOWN_START;
++ 	} else if ((tx->target_itr < tx->current_itr) ||
++ 		   ((rx->target_itr - rx->current_itr) <
++ 		    (tx->target_itr - tx->current_itr))) {
++ 		/* Tx ITR needs to be reduced, this is second priority
++ 		 * Tx ITR needs to be increased more than Rx, fourth priority
++ 		 */
++ 		itr_val = ice_buildreg_itr(tx->itr_idx, tx->target_itr);
++ 		tx->current_itr = tx->target_itr;
++ 		q_vector->itr_countdown = ITR_COUNTDOWN_START;
++ 	} else if (rx->current_itr != rx->target_itr) {
++ 		/* Rx ITR needs to be increased, third priority */
++ 		itr_val = ice_buildreg_itr(rx->itr_idx, rx->target_itr);
++ 		rx->current_itr = rx->target_itr;
++ 		q_vector->itr_countdown = ITR_COUNTDOWN_START;
++ 	} else {
++ 		/* Still have to re-enable the interrupts */
++ 		itr_val = ice_buildreg_itr(ICE_ITR_NONE, 0);
++ 		if (q_vector->itr_countdown)
++ 			q_vector->itr_countdown--;
++ 	}
++ 
++ 	if (!test_bit(__ICE_DOWN, vsi->state))
++ 		wr32(&vsi->back->hw,
++ 		     GLINT_DYN_CTL(q_vector->reg_idx),
++ 		     itr_val);
++ }
++ 
++ /**
+++>>>>>>> b07833a00d70 (ice: Add reg_idx variable in ice_q_vector structure)
+   * ice_napi_poll - NAPI polling Rx/Tx cleanup routine
+   * @napi: napi struct with our devices info in it
+   * @budget: amount of work driver is allowed to do this pass, in packets
+* Unmerged path drivers/net/ethernet/intel/ice/ice.h
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lib.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
