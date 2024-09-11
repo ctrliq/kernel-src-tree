@@ -1,0 +1,188 @@
+net/mlx5e: Fix TXQ indices to be sequential
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit c55d8b108caa2ec1ae8dddd02cb9d3a740f7c838
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c55d8b10.failed
+
+Cited patch changed (channel index, tc) => (TXQ index) mapping to be a
+static one, in order to keep indices consistent when changing number of
+channels or TCs.
+
+For 32 channels (OOB) and 8 TCs, real num of TXQs is 256.
+When reducing the amount of channels to 8, the real num of TXQs will be
+changed to 64.
+This indices method is buggy:
+- Channel #0, TC 3, the TXQ index is 96.
+- Index 8 is not valid, as there is no such TXQ from driver perspective
+  (As it represents channel #8, TC 0, which is not valid with the above
+  configuration).
+
+As part of driver's select queue, it calls netdev_pick_tx which returns an
+index in the range of real number of TXQs. Depends on the return value,
+with the examples above, driver could have returned index larger than the
+real number of tx queues, or crash the kernel as it tries to read invalid
+address of SQ which was not allocated.
+
+Fix that by allocating sequential TXQ indices, and hold a new mapping
+between (channel index, tc) => (real TXQ index). This mapping will be
+updated as part of priv channels activation, and is used in
+mlx5e_select_queue to find the selected queue index.
+
+The existing indices mapping (channel_tc2txq) is no longer needed, as it
+is used only for statistics structures and can be calculated on run time.
+Delete its definintion and updates.
+
+Fixes: 8bfaf07f7806 ("net/mlx5e: Present SW stats when state is not opened")
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit c55d8b108caa2ec1ae8dddd02cb9d3a740f7c838)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a71021978d58,4980e80a5e85..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1642,13 -1691,12 +1642,20 @@@ static int mlx5e_open_sqs(struct mlx5e_
+  			  struct mlx5e_params *params,
+  			  struct mlx5e_channel_param *cparam)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5e_priv *priv = c->priv;
+ +	int err, tc, max_nch = mlx5e_get_netdev_max_channels(priv->netdev);
+ +
+ +	for (tc = 0; tc < params->num_tc; tc++) {
+ +		int txq_ix = c->ix + tc * max_nch;
+++=======
++ 	int err, tc;
++ 
++ 	for (tc = 0; tc < params->num_tc; tc++) {
++ 		int txq_ix = c->ix + tc * params->num_channels;
+++>>>>>>> c55d8b108caa (net/mlx5e: Fix TXQ indices to be sequential)
+  
+ -		err = mlx5e_open_txqsq(c, c->priv->tisn[c->lag_port][tc], txq_ix,
+ +		err = mlx5e_open_txqsq(c, c->priv->tisn[tc], txq_ix,
+  				       params, &cparam->sq, &c->sq[tc], tc);
+  		if (err)
+  			goto err_close_sqs;
+@@@ -2769,27 -2875,21 +2776,31 @@@ static void mlx5e_netdev_set_tcs(struc
+  		netdev_set_tc_queue(netdev, tc, nch, 0);
+  }
+  
+- static void mlx5e_build_tc2txq_maps(struct mlx5e_priv *priv)
++ static void mlx5e_build_txq_maps(struct mlx5e_priv *priv)
+  {
+++<<<<<<< HEAD
+ +	int max_nch = mlx5e_get_netdev_max_channels(priv->netdev);
+ +	int i, tc;
+ +
+ +	for (i = 0; i < max_nch; i++)
+ +		for (tc = 0; tc < priv->profile->max_tc; tc++)
+ +			priv->channel_tc2txq[i][tc] = i + tc * max_nch;
+ +}
+++=======
++ 	int i, ch;
+  
+- static void mlx5e_build_tx2sq_maps(struct mlx5e_priv *priv)
+- {
+- 	struct mlx5e_channel *c;
+- 	struct mlx5e_txqsq *sq;
+- 	int i, tc;
++ 	ch = priv->channels.num;
+++>>>>>>> c55d8b108caa (net/mlx5e: Fix TXQ indices to be sequential)
++ 
++ 	for (i = 0; i < ch; i++) {
++ 		int tc;
++ 
++ 		for (tc = 0; tc < priv->channels.params.num_tc; tc++) {
++ 			struct mlx5e_channel *c = priv->channels.c[i];
++ 			struct mlx5e_txqsq *sq = &c->sq[tc];
+  
+- 	for (i = 0; i < priv->channels.num; i++) {
+- 		c = priv->channels.c[i];
+- 		for (tc = 0; tc < c->num_tc; tc++) {
+- 			sq = &c->sq[tc];
+  			priv->txq2sq[sq->txq_ix] = sq;
++ 			priv->channel_tc2realtxq[i][tc] = i + tc * ch;
+  		}
+  	}
+  }
+@@@ -2801,9 -2902,9 +2812,9 @@@ void mlx5e_activate_priv_channels(struc
+  
+  	mlx5e_netdev_set_tcs(netdev);
+  	netif_set_real_num_tx_queues(netdev, num_txqs);
+ -	netif_set_real_num_rx_queues(netdev, num_rxqs);
+ +	netif_set_real_num_rx_queues(netdev, priv->channels.num);
+  
+- 	mlx5e_build_tx2sq_maps(priv);
++ 	mlx5e_build_txq_maps(priv);
+  	mlx5e_activate_channels(&priv->channels);
+  	mlx5e_xdp_tx_enable(priv);
+  	netif_tx_start_all_queues(priv->netdev);
+@@@ -4794,7 -5015,7 +4805,11 @@@ static int mlx5e_nic_init(struct mlx5_c
+  	if (err)
+  		mlx5_core_err(mdev, "TLS initialization failed, %d\n", err);
+  	mlx5e_build_nic_netdev(netdev);
+++<<<<<<< HEAD
+ +	mlx5e_build_tc2txq_maps(priv);
+++=======
++ 	mlx5e_health_create_reporters(priv);
+++>>>>>>> c55d8b108caa (net/mlx5e: Fix TXQ indices to be sequential)
+  
+  	return 0;
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 1f010051a09a,2565ba8692d9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -90,10 -90,10 +90,14 @@@ u16 mlx5e_select_queue(struct net_devic
+  	 * dev->num_real_tx_queues = num_channels * num_tc
+  	 */
+  	num_channels = priv->channels.params.num_channels;
+ -	if (txq_ix >= num_channels)
+ -		txq_ix = priv->txq2sq[txq_ix]->ch_ix;
+ +	if (channel_ix >= num_channels)
+ +		channel_ix = reciprocal_scale(channel_ix, num_channels);
+  
+++<<<<<<< HEAD
+ +	return priv->channel_tc2txq[channel_ix][up];
+++=======
++ 	return priv->channel_tc2realtxq[txq_ix][up];
+++>>>>>>> c55d8b108caa (net/mlx5e: Fix TXQ indices to be sequential)
+  }
+  
+  static inline int mlx5e_skb_l2_header_offset(struct sk_buff *skb)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 1599dd95552b..e4ae5fc8e0fd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -738,7 +738,7 @@ struct mlx5e_modify_sq_param {
+ struct mlx5e_priv {
+ 	/* priv data path fields - start */
+ 	struct mlx5e_txqsq *txq2sq[MLX5E_MAX_NUM_CHANNELS * MLX5E_MAX_NUM_TC];
+-	int channel_tc2txq[MLX5E_MAX_NUM_CHANNELS][MLX5E_MAX_NUM_TC];
++	int channel_tc2realtxq[MLX5E_MAX_NUM_CHANNELS][MLX5E_MAX_NUM_TC];
+ #ifdef CONFIG_MLX5_CORE_EN_DCB
+ 	struct mlx5e_dcbx_dp       dcbx_dp;
+ #endif
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 280a467764e5..a868711a7262 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -1328,7 +1328,7 @@ static int mlx5e_grp_channels_fill_strings(struct mlx5e_priv *priv, u8 *data,
+ 			for (j = 0; j < NUM_SQ_STATS; j++)
+ 				sprintf(data + (idx++) * ETH_GSTRING_LEN,
+ 					sq_stats_desc[j].format,
+-					priv->channel_tc2txq[i][tc]);
++					i + tc * max_nch);
+ 
+ 	for (i = 0; i < max_nch; i++)
+ 		for (j = 0; j < NUM_XDPSQ_STATS; j++)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
