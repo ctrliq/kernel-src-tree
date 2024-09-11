@@ -1,0 +1,245 @@
+netfilter: Export nf_ct_{set,destroy}_timeout()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] netfilter: Export nf_ct_{set, destroy}_timeout() (Patrlck Talbert) [1765587]
+Rebuild_FUZZ: 98.95%
+commit-author Yi-Hung Wei <yihung.wei@gmail.com>
+commit 717700d183d65bd2e6511566aa6d32395419d158
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/717700d1.failed
+
+This patch exports nf_ct_set_timeout() and nf_ct_destroy_timeout().
+The two functions are derived from xt_ct_destroy_timeout() and
+xt_ct_set_timeout() in xt_CT.c, and moved to nf_conntrack_timeout.c
+without any functional change.
+It would be useful for other users (i.e. OVS) that utilizes the
+finer-grain conntrack timeout feature.
+
+CC: Pablo Neira Ayuso <pablo@netfilter.org>
+CC: Pravin Shelar <pshelar@ovn.org>
+	Signed-off-by: Yi-Hung Wei <yihung.wei@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 717700d183d65bd2e6511566aa6d32395419d158)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/xt_CT.c
+diff --cc net/netfilter/xt_CT.c
+index 9b47dc5deeba,d59cb4730fac..000000000000
+--- a/net/netfilter/xt_CT.c
++++ b/net/netfilter/xt_CT.c
+@@@ -119,69 -108,19 +108,52 @@@ xt_ct_set_timeout(struct nf_conn *ct, c
+  		  const char *timeout_name)
+  {
+  #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
+- 	typeof(nf_ct_timeout_find_get_hook) timeout_find_get;
+  	const struct nf_conntrack_l4proto *l4proto;
+- 	struct nf_ct_timeout *timeout;
+- 	struct nf_conn_timeout *timeout_ext;
+- 	const char *errmsg = NULL;
+- 	int ret = 0;
+  	u8 proto;
+  
+- 	rcu_read_lock();
+- 	timeout_find_get = rcu_dereference(nf_ct_timeout_find_get_hook);
+- 	if (timeout_find_get == NULL) {
+- 		ret = -ENOENT;
+- 		errmsg = "Timeout policy base is empty";
+- 		goto out;
+- 	}
+- 
+  	proto = xt_ct_find_proto(par);
+  	if (!proto) {
+- 		ret = -EINVAL;
+- 		errmsg = "You must specify a L4 protocol and not use inversions on it";
+- 		goto out;
++ 		pr_info_ratelimited("You must specify a L4 protocol and not "
++ 				    "use inversions on it");
++ 		return -EINVAL;
+  	}
+++<<<<<<< HEAD
+ +
+ +	timeout = timeout_find_get(par->net, timeout_name);
+ +	if (timeout == NULL) {
+ +		ret = -ENOENT;
+ +		pr_info_ratelimited("No such timeout policy \"%s\"\n",
+ +				    timeout_name);
+ +		goto out;
+ +	}
+ +
+ +	if (timeout->l3num != par->family) {
+ +		ret = -EINVAL;
+ +		pr_info_ratelimited("Timeout policy `%s' can only be used by L%d protocol number %d\n",
+ +				    timeout_name, 3, timeout->l3num);
+ +		goto err_put_timeout;
+ +	}
+ +	/* Make sure the timeout policy matches any existing protocol tracker,
+ +	 * otherwise default to generic.
+ +	 */
+ +	l4proto = __nf_ct_l4proto_find(par->family, proto);
+ +	if (timeout->l4proto->l4proto != l4proto->l4proto) {
+ +		ret = -EINVAL;
+ +		pr_info_ratelimited("Timeout policy `%s' can only be used by L%d protocol number %d\n",
+ +				    timeout_name, 4, timeout->l4proto->l4proto);
+ +		goto err_put_timeout;
+ +	}
+ +	timeout_ext = nf_ct_timeout_ext_add(ct, timeout, GFP_ATOMIC);
+ +	if (!timeout_ext) {
+ +		ret = -ENOMEM;
+ +		goto err_put_timeout;
+ +	}
+++=======
++ 	l4proto = nf_ct_l4proto_find(proto);
++ 	return nf_ct_set_timeout(par->net, ct, par->family, l4proto->l4proto,
++ 				 timeout_name);
+++>>>>>>> 717700d183d6 (netfilter: Export nf_ct_{set,destroy}_timeout())
+  
+- 	rcu_read_unlock();
+- 	return ret;
+- 
+- err_put_timeout:
+- 	__xt_ct_tg_timeout_put(timeout);
+- out:
+- 	rcu_read_unlock();
+- 	if (errmsg)
+- 		pr_info_ratelimited("%s\n", errmsg);
+- 	return ret;
+  #else
+  	return -EOPNOTSUPP;
+  #endif
+diff --git a/include/net/netfilter/nf_conntrack_timeout.h b/include/net/netfilter/nf_conntrack_timeout.h
+index 119e451e4ce1..9216f94acb27 100644
+--- a/include/net/netfilter/nf_conntrack_timeout.h
++++ b/include/net/netfilter/nf_conntrack_timeout.h
+@@ -98,6 +98,9 @@ nf_ct_timeout_lookup(struct net *net, struct nf_conn *ct,
+ int nf_conntrack_timeout_init(void);
+ void nf_conntrack_timeout_fini(void);
+ void nf_ct_untimeout(struct net *net, struct nf_ct_timeout *timeout);
++int nf_ct_set_timeout(struct net *net, struct nf_conn *ct, u8 l3num, u8 l4num,
++		      const char *timeout_name);
++void nf_ct_destroy_timeout(struct nf_conn *ct);
+ #else
+ static inline int nf_conntrack_timeout_init(void)
+ {
+@@ -108,6 +111,18 @@ static inline void nf_conntrack_timeout_fini(void)
+ {
+         return;
+ }
++
++static inline int nf_ct_set_timeout(struct net *net, struct nf_conn *ct,
++				    u8 l3num, u8 l4num,
++				    const char *timeout_name)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void nf_ct_destroy_timeout(struct nf_conn *ct)
++{
++	return;
++}
+ #endif /* CONFIG_NF_CONNTRACK_TIMEOUT */
+ 
+ #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
+diff --git a/net/netfilter/nf_conntrack_timeout.c b/net/netfilter/nf_conntrack_timeout.c
+index 91fbd183da2d..edac8ea4436d 100644
+--- a/net/netfilter/nf_conntrack_timeout.c
++++ b/net/netfilter/nf_conntrack_timeout.c
+@@ -48,6 +48,95 @@ void nf_ct_untimeout(struct net *net, struct nf_ct_timeout *timeout)
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_untimeout);
+ 
++static void __nf_ct_timeout_put(struct nf_ct_timeout *timeout)
++{
++	typeof(nf_ct_timeout_put_hook) timeout_put;
++
++	timeout_put = rcu_dereference(nf_ct_timeout_put_hook);
++	if (timeout_put)
++		timeout_put(timeout);
++}
++
++int nf_ct_set_timeout(struct net *net, struct nf_conn *ct,
++		      u8 l3num, u8 l4num, const char *timeout_name)
++{
++	typeof(nf_ct_timeout_find_get_hook) timeout_find_get;
++	struct nf_ct_timeout *timeout;
++	struct nf_conn_timeout *timeout_ext;
++	const char *errmsg = NULL;
++	int ret = 0;
++
++	rcu_read_lock();
++	timeout_find_get = rcu_dereference(nf_ct_timeout_find_get_hook);
++	if (!timeout_find_get) {
++		ret = -ENOENT;
++		errmsg = "Timeout policy base is empty";
++		goto out;
++	}
++
++	timeout = timeout_find_get(net, timeout_name);
++	if (!timeout) {
++		ret = -ENOENT;
++		pr_info_ratelimited("No such timeout policy \"%s\"\n",
++				    timeout_name);
++		goto out;
++	}
++
++	if (timeout->l3num != l3num) {
++		ret = -EINVAL;
++		pr_info_ratelimited("Timeout policy `%s' can only be used by "
++				    "L%d protocol number %d\n",
++				    timeout_name, 3, timeout->l3num);
++		goto err_put_timeout;
++	}
++	/* Make sure the timeout policy matches any existing protocol tracker,
++	 * otherwise default to generic.
++	 */
++	if (timeout->l4proto->l4proto != l4num) {
++		ret = -EINVAL;
++		pr_info_ratelimited("Timeout policy `%s' can only be used by "
++				    "L%d protocol number %d\n",
++				    timeout_name, 4, timeout->l4proto->l4proto);
++		goto err_put_timeout;
++	}
++	timeout_ext = nf_ct_timeout_ext_add(ct, timeout, GFP_ATOMIC);
++	if (!timeout_ext) {
++		ret = -ENOMEM;
++		goto err_put_timeout;
++	}
++
++	rcu_read_unlock();
++	return ret;
++
++err_put_timeout:
++	__nf_ct_timeout_put(timeout);
++out:
++	rcu_read_unlock();
++	if (errmsg)
++		pr_info_ratelimited("%s\n", errmsg);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(nf_ct_set_timeout);
++
++void nf_ct_destroy_timeout(struct nf_conn *ct)
++{
++	struct nf_conn_timeout *timeout_ext;
++	typeof(nf_ct_timeout_put_hook) timeout_put;
++
++	rcu_read_lock();
++	timeout_put = rcu_dereference(nf_ct_timeout_put_hook);
++
++	if (timeout_put) {
++		timeout_ext = nf_ct_timeout_find(ct);
++		if (timeout_ext) {
++			timeout_put(timeout_ext->timeout);
++			RCU_INIT_POINTER(timeout_ext->timeout, NULL);
++		}
++	}
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(nf_ct_destroy_timeout);
++
+ static const struct nf_ct_ext_type timeout_extend = {
+ 	.len	= sizeof(struct nf_conn_timeout),
+ 	.align	= __alignof__(struct nf_conn_timeout),
+* Unmerged path net/netfilter/xt_CT.c
