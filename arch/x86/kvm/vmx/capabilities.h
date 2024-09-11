@@ -197,7 +197,7 @@ static inline bool cpu_has_vmx_ple(void)
 		SECONDARY_EXEC_PAUSE_LOOP_EXITING;
 }
 
-static inline bool vmx_rdrand_supported(void)
+static inline bool cpu_has_vmx_rdrand(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
 		SECONDARY_EXEC_RDRAND_EXITING;
@@ -234,7 +234,7 @@ static inline bool cpu_has_vmx_encls_vmexit(void)
 		SECONDARY_EXEC_ENCLS_EXITING;
 }
 
-static inline bool vmx_rdseed_supported(void)
+static inline bool cpu_has_vmx_rdseed(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
 		SECONDARY_EXEC_RDSEED_EXITING;
@@ -245,13 +245,13 @@ static inline bool cpu_has_vmx_pml(void)
 	return vmcs_config.cpu_based_2nd_exec_ctrl & SECONDARY_EXEC_ENABLE_PML;
 }
 
-static inline bool vmx_xsaves_supported(void)
+static inline bool cpu_has_vmx_xsaves(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
 		SECONDARY_EXEC_XSAVES;
 }
 
-static inline bool vmx_waitpkg_supported(void)
+static inline bool cpu_has_vmx_waitpkg(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
 		SECONDARY_EXEC_ENABLE_USR_WAIT_PAUSE;
