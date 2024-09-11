@@ -190,6 +190,7 @@ struct ath11k_hw_params {
 	bool supports_dynamic_smps_6ghz;
 	bool wakeup_mhi;
 	bool supports_rssi_stats;
+	bool fw_wmi_diag_event;
 };
 
 struct ath11k_hw_ops {
