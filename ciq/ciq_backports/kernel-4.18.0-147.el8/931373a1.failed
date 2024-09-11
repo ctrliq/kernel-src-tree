@@ -1,0 +1,345 @@
+RDMA/uverbs: Get rid of the 'callback' scheme in the compat path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 931373a118acce816561f04dc9832b85172e65b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/931373a1.failed
+
+There is no reason for this. For response processing we simply need to
+copy, truncate, and zero fill the response into whatever output buffer
+was provided. Add a function uverbs_response() that does this
+consistently.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 931373a118acce816561f04dc9832b85172e65b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,6c9486f730fd..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -47,12 -47,40 +47,41 @@@
+  #include "uverbs.h"
+  #include "core_priv.h"
+  
++ /*
++  * Copy a response to userspace. If the provided 'resp' is larger than the
++  * user buffer it is silently truncated. If the user provided a larger buffer
++  * then the trailing portion is zero filled.
++  *
++  * These semantics are intended to support future extension of the output
++  * structures.
++  */
++ static int uverbs_response(struct uverbs_attr_bundle *attrs, const void *resp,
++ 			   size_t resp_len)
++ {
++ 	u8 __user *cur = attrs->ucore.outbuf + resp_len;
++ 	u8 __user *end = attrs->ucore.outbuf + attrs->ucore.outlen;
++ 	int ret;
++ 
++ 	if (copy_to_user(attrs->ucore.outbuf, resp,
++ 			 min(attrs->ucore.outlen, resp_len)))
++ 		return -EFAULT;
++ 
++ 	/* Zero fill any extra memory that user space might have provided */
++ 	for (; cur < end; cur++) {
++ 		ret = put_user(0, cur);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+  static struct ib_uverbs_completion_event_file *
+ -_ib_uverbs_lookup_comp_file(s32 fd, const struct uverbs_attr_bundle *attrs)
+ +ib_uverbs_lookup_comp_file(int fd, struct ib_ucontext *context)
+  {
+ -	struct ib_uobject *uobj = ufd_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ -					       fd, attrs);
+ +	struct ib_uobject *uobj = uobj_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ +						fd, context);
+ +	struct ib_uobject_file *uobj_file;
+  
+  	if (IS_ERR(uobj))
+  		return (void *)uobj;
+@@@ -956,22 -916,12 +985,26 @@@ ssize_t ib_uverbs_create_comp_channel(s
+  		return -EFAULT;
+  	}
+  
+ -	return uobj_alloc_commit(uobj);
+ +	uobj_alloc_commit(uobj);
+ +	return in_len;
+  }
+  
+ -static struct ib_ucq_object *create_cq(struct uverbs_attr_bundle *attrs,
+ +static struct ib_ucq_object *create_cq(struct ib_uverbs_file *file,
+ +					struct ib_device *ib_dev,
+ +				       struct ib_udata *ucore,
+ +				       struct ib_udata *uhw,
+  				       struct ib_uverbs_ex_create_cq *cmd,
+++<<<<<<< HEAD
+ +				       size_t cmd_sz,
+ +				       int (*cb)(struct ib_uverbs_file *file,
+ +						 struct ib_ucq_object *obj,
+ +						 struct ib_uverbs_ex_create_cq_resp *resp,
+ +						 struct ib_udata *udata,
+ +						 void *context),
+ +				       void *context)
+++=======
++ 				       size_t cmd_sz)
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  {
+  	struct ib_ucq_object           *obj;
+  	struct ib_uverbs_completion_event_file    *ev_file = NULL;
+@@@ -1036,7 -982,7 +1067,11 @@@
+  	cq->res.type = RDMA_RESTRACK_CQ;
+  	rdma_restrack_add(&cq->res);
+  
+++<<<<<<< HEAD
+ +	ret = cb(file, obj, &resp, ucore, context);
+++=======
++ 	ret = uverbs_response(attrs, &resp, sizeof(resp));
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  	if (ret)
+  		goto err_cb;
+  
+@@@ -1056,21 -1004,8 +1091,26 @@@ err
+  	return ERR_PTR(ret);
+  }
+  
+++<<<<<<< HEAD
+ +static int ib_uverbs_create_cq_cb(struct ib_uverbs_file *file,
+ +				  struct ib_ucq_object *obj,
+ +				  struct ib_uverbs_ex_create_cq_resp *resp,
+ +				  struct ib_udata *ucore, void *context)
+ +{
+ +	if (ib_copy_to_udata(ucore, &resp->base, sizeof(resp->base)))
+ +		return -EFAULT;
+ +
+ +	return 0;
+ +}
+ +
+ +ssize_t ib_uverbs_create_cq(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+++=======
++ static int ib_uverbs_create_cq(struct uverbs_attr_bundle *attrs,
++ 			       const char __user *buf, int in_len, int out_len)
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  {
+  	struct ib_uverbs_create_cq      cmd;
+  	struct ib_uverbs_ex_create_cq	cmd_ex;
+@@@ -1099,32 -1020,14 +1139,41 @@@
+  	cmd_ex.comp_vector = cmd.comp_vector;
+  	cmd_ex.comp_channel = cmd.comp_channel;
+  
+ -	obj = create_cq(attrs, &cmd_ex,
+ +	obj = create_cq(file, ib_dev, &ucore, &uhw, &cmd_ex,
+  			offsetof(typeof(cmd_ex), comp_channel) +
+++<<<<<<< HEAD
+ +			sizeof(cmd.comp_channel), ib_uverbs_create_cq_cb,
+ +			NULL);
+ +
+ +	if (IS_ERR(obj))
+ +		return PTR_ERR(obj);
+ +
+ +	return in_len;
+ +}
+ +
+ +static int ib_uverbs_ex_create_cq_cb(struct ib_uverbs_file *file,
+ +				     struct ib_ucq_object *obj,
+ +				     struct ib_uverbs_ex_create_cq_resp *resp,
+ +				     struct ib_udata *ucore, void *context)
+ +{
+ +	if (ib_copy_to_udata(ucore, resp, resp->response_length))
+ +		return -EFAULT;
+ +
+ +	return 0;
+ +}
+ +
+ +int ib_uverbs_ex_create_cq(struct ib_uverbs_file *file,
+ +			 struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ 				sizeof(cmd.comp_channel));
++ 	return PTR_ERR_OR_ZERO(obj);
++ }
++ 
++ static int ib_uverbs_ex_create_cq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore)
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  {
+  	struct ib_uverbs_ex_create_cq_resp resp;
+  	struct ib_uverbs_ex_create_cq  cmd;
+@@@ -1148,10 -1051,7 +1197,14 @@@
+  			     sizeof(resp.response_length)))
+  		return -ENOSPC;
+  
+++<<<<<<< HEAD
+ +	obj = create_cq(file, ib_dev, ucore, uhw, &cmd,
+ +			min(ucore->inlen, sizeof(cmd)),
+ +			ib_uverbs_ex_create_cq_cb, NULL);
+ +
+++=======
++ 	obj = create_cq(attrs, &cmd, min(ucore->inlen, sizeof(cmd)));
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  	return PTR_ERR_OR_ZERO(obj);
+  }
+  
+@@@ -1341,18 -1212,11 +1394,23 @@@ ssize_t ib_uverbs_destroy_cq(struct ib_
+  	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof resp))
+  		return -EFAULT;
+  
+ -	return 0;
+ +	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +static int create_qp(struct ib_uverbs_file *file,
+ +		     struct ib_udata *ucore,
+ +		     struct ib_udata *uhw,
+ +		     struct ib_uverbs_ex_create_qp *cmd,
+ +		     size_t cmd_sz,
+ +		     int (*cb)(struct ib_uverbs_file *file,
+ +			       struct ib_uverbs_ex_create_qp_resp *resp,
+ +			       struct ib_udata *udata),
+ +		     void *context)
+++=======
++ static int create_qp(struct uverbs_attr_bundle *attrs,
++ 		     struct ib_uverbs_ex_create_qp *cmd, size_t cmd_sz)
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  {
+  	struct ib_uqp_object		*obj;
+  	struct ib_device		*device;
+@@@ -1569,11 -1436,9 +1627,16 @@@
+  	resp.base.max_recv_wr     = attr.cap.max_recv_wr;
+  	resp.base.max_send_wr     = attr.cap.max_send_wr;
+  	resp.base.max_inline_data = attr.cap.max_inline_data;
++ 	resp.response_length = sizeof(resp);
+  
+++<<<<<<< HEAD
+ +	resp.response_length = offsetof(typeof(resp), response_length) +
+ +			       sizeof(resp.response_length);
+ +
+ +	ret = cb(file, &resp, ucore);
+++=======
++ 	ret = uverbs_response(attrs, &resp, sizeof(resp));
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  	if (ret)
+  		goto err_cb;
+  
+@@@ -1619,30 -1482,11 +1682,38 @@@ err_put
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int ib_uverbs_create_qp_cb(struct ib_uverbs_file *file,
+ +				  struct ib_uverbs_ex_create_qp_resp *resp,
+ +				  struct ib_udata *ucore)
+ +{
+ +	if (ib_copy_to_udata(ucore, &resp->base, sizeof(resp->base)))
+ +		return -EFAULT;
+ +
+ +	return 0;
+ +}
+ +
+ +ssize_t ib_uverbs_create_qp(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+ +{
+ +	struct ib_uverbs_create_qp      cmd;
+ +	struct ib_uverbs_ex_create_qp	cmd_ex;
+ +	struct ib_udata			ucore;
+ +	struct ib_udata			uhw;
+ +	ssize_t resp_size = sizeof(struct ib_uverbs_create_qp_resp);
+ +	int				err;
+++=======
++ static int ib_uverbs_create_qp(struct uverbs_attr_bundle *attrs,
++ 			       const char __user *buf, int in_len, int out_len)
++ {
++ 	struct ib_uverbs_create_qp      cmd;
++ 	struct ib_uverbs_ex_create_qp	cmd_ex;
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+ +
+ +	if (out_len < resp_size)
+ +		return -ENOSPC;
+  
+  	if (copy_from_user(&cmd, buf, sizeof(cmd)))
+  		return -EFAULT;
+@@@ -1669,31 -1506,12 +1740,36 @@@
+  	cmd_ex.qp_type = cmd.qp_type;
+  	cmd_ex.is_srq = cmd.is_srq;
+  
+++<<<<<<< HEAD
+ +	err = create_qp(file, &ucore, &uhw, &cmd_ex,
+ +			offsetof(typeof(cmd_ex), is_srq) +
+ +			sizeof(cmd.is_srq), ib_uverbs_create_qp_cb,
+ +			NULL);
+ +
+ +	if (err)
+ +		return err;
+ +
+ +	return in_len;
+ +}
+ +
+ +static int ib_uverbs_ex_create_qp_cb(struct ib_uverbs_file *file,
+ +				     struct ib_uverbs_ex_create_qp_resp *resp,
+ +				     struct ib_udata *ucore)
+ +{
+ +	if (ib_copy_to_udata(ucore, resp, resp->response_length))
+ +		return -EFAULT;
+ +
+ +	return 0;
+++=======
++ 	return create_qp(attrs, &cmd_ex,
++ 			 offsetof(typeof(cmd_ex), is_srq) + sizeof(cmd.is_srq));
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  }
+  
+ -static int ib_uverbs_ex_create_qp(struct uverbs_attr_bundle *attrs,
+ -				  struct ib_udata *ucore)
+ +int ib_uverbs_ex_create_qp(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+  {
+  	struct ib_uverbs_ex_create_qp_resp resp;
+  	struct ib_uverbs_ex_create_qp cmd = {0};
+@@@ -1717,19 -1535,11 +1793,23 @@@
+  			     sizeof(resp.response_length)))
+  		return -ENOSPC;
+  
+++<<<<<<< HEAD
+ +	err = create_qp(file, ucore, uhw, &cmd,
+ +			min(ucore->inlen, sizeof(cmd)),
+ +			ib_uverbs_ex_create_qp_cb, NULL);
+ +
+ +	if (err)
+ +		return err;
+ +
+ +	return 0;
+++=======
++ 	return create_qp(attrs, &cmd, min(ucore->inlen, sizeof(cmd)));
+++>>>>>>> 931373a118ac (RDMA/uverbs: Get rid of the 'callback' scheme in the compat path)
+  }
+  
+ -static int ib_uverbs_open_qp(struct uverbs_attr_bundle *attrs,
+ -			     const char __user *buf, int in_len, int out_len)
+ +ssize_t ib_uverbs_open_qp(struct ib_uverbs_file *file,
+ +			  struct ib_device *ib_dev,
+ +			  const char __user *buf, int in_len, int out_len)
+  {
+  	struct ib_uverbs_open_qp        cmd;
+  	struct ib_uverbs_create_qp_resp resp;
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
