@@ -1,0 +1,117 @@
+io_uring: fix mismatched finish_wait() calls in io_uring_cancel_files()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit d8f1b9716cfd1a1f74c0fedad40c5f65a25aa208
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d8f1b971.failed
+
+The prepare_to_wait() and finish_wait() calls in io_uring_cancel_files()
+are mismatched. Currently I don't see any issues related this bug, just
+find it by learning codes.
+
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d8f1b9716cfd1a1f74c0fedad40c5f65a25aa208)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,6d52ff98279d..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -3586,12 -7357,83 +3586,73 @@@ static int io_uring_release(struct inod
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+++=======
++ static void io_uring_cancel_files(struct io_ring_ctx *ctx,
++ 				  struct files_struct *files)
++ {
++ 	while (!list_empty_careful(&ctx->inflight_list)) {
++ 		struct io_kiocb *cancel_req = NULL, *req;
++ 		DEFINE_WAIT(wait);
++ 
++ 		spin_lock_irq(&ctx->inflight_lock);
++ 		list_for_each_entry(req, &ctx->inflight_list, inflight_entry) {
++ 			if (req->work.files != files)
++ 				continue;
++ 			/* req is being completed, ignore */
++ 			if (!refcount_inc_not_zero(&req->refs))
++ 				continue;
++ 			cancel_req = req;
++ 			break;
++ 		}
++ 		if (cancel_req)
++ 			prepare_to_wait(&ctx->inflight_wait, &wait,
++ 						TASK_UNINTERRUPTIBLE);
++ 		spin_unlock_irq(&ctx->inflight_lock);
++ 
++ 		/* We need to keep going until we don't find a matching req */
++ 		if (!cancel_req)
++ 			break;
++ 
++ 		if (cancel_req->flags & REQ_F_OVERFLOW) {
++ 			spin_lock_irq(&ctx->completion_lock);
++ 			list_del(&cancel_req->list);
++ 			cancel_req->flags &= ~REQ_F_OVERFLOW;
++ 			if (list_empty(&ctx->cq_overflow_list)) {
++ 				clear_bit(0, &ctx->sq_check_overflow);
++ 				clear_bit(0, &ctx->cq_check_overflow);
++ 			}
++ 			spin_unlock_irq(&ctx->completion_lock);
++ 
++ 			WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 
++ 			/*
++ 			 * Put inflight ref and overflow ref. If that's
++ 			 * all we had, then we're done with this request.
++ 			 */
++ 			if (refcount_sub_and_test(2, &cancel_req->refs)) {
++ 				io_put_req(cancel_req);
++ 				finish_wait(&ctx->inflight_wait, &wait);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		io_wq_cancel_work(ctx->io_wq, &cancel_req->work);
++ 		io_put_req(cancel_req);
++ 		schedule();
++ 		finish_wait(&ctx->inflight_wait, &wait);
++ 	}
++ }
++ 
++ static int io_uring_flush(struct file *file, void *data)
+++>>>>>>> d8f1b9716cfd (io_uring: fix mismatched finish_wait() calls in io_uring_cancel_files())
+  {
+ +	loff_t offset = (loff_t) vma->vm_pgoff << PAGE_SHIFT;
+ +	unsigned long sz = vma->vm_end - vma->vm_start;
+  	struct io_ring_ctx *ctx = file->private_data;
+ -
+ -	io_uring_cancel_files(ctx, data);
+ -
+ -	/*
+ -	 * If the task is going away, cancel work it may have pending
+ -	 */
+ -	if (fatal_signal_pending(current) || (current->flags & PF_EXITING))
+ -		io_wq_cancel_pid(ctx->io_wq, task_pid_vnr(current));
+ -
+ -	return 0;
+ -}
+ -
+ -static void *io_uring_validate_mmap_request(struct file *file,
+ -					    loff_t pgoff, size_t sz)
+ -{
+ -	struct io_ring_ctx *ctx = file->private_data;
+ -	loff_t offset = pgoff << PAGE_SHIFT;
+ +	unsigned long pfn;
+  	struct page *page;
+  	void *ptr;
+  
+* Unmerged path fs/io_uring.c
