@@ -1,0 +1,196 @@
+bpf: Introduce bpf_sk_{, ancestor_}cgroup_id helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit f307fa2cb4c935f7f1ff0aeb880c7b44fb9a642b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f307fa2c.failed
+
+With having ability to lookup sockets in cgroup skb programs it becomes
+useful to access cgroup id of retrieved sockets so that policies can be
+implemented based on origin cgroup of such socket.
+
+For example, a container running in a cgroup can have cgroup skb ingress
+program that can lookup peer socket that is sending packets to a process
+inside the container and decide whether those packets should be allowed
+or denied based on cgroup id of the peer.
+
+More specifically such ingress program can implement intra-host policy
+"allow incoming packets only from this same container and not from any
+other container on same host" w/o relying on source IP addresses since
+quite often it can be the case that containers share same IP address on
+the host.
+
+Introduce two new helpers for this use-case: bpf_sk_cgroup_id() and
+bpf_sk_ancestor_cgroup_id().
+
+These helpers are similar to existing bpf_skb_{,ancestor_}cgroup_id
+helpers with the only difference that sk is used to get cgroup id
+instead of skb, and share code with them.
+
+See documentation in UAPI for more details.
+
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/f5884981249ce911f63e9b57ecd5d7d19154ff39.1589486450.git.rdna@fb.com
+(cherry picked from commit f307fa2cb4c935f7f1ff0aeb880c7b44fb9a642b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/filter.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc net/core/filter.c
+index 4691953cabb8,5815902bb617..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -4023,8 -4018,7 +4030,12 @@@ BPF_CALL_1(bpf_skb_cgroup_id, const str
+  	if (!sk || !sk_fullsock(sk))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
+ +	return cgrp->kn->id.id;
+++=======
++ 	return __bpf_sk_cgroup_id(sk);
+++>>>>>>> f307fa2cb4c9 (bpf: Introduce bpf_sk_{, ancestor_}cgroup_id helpers)
+  }
+  
+  static const struct bpf_func_proto bpf_skb_cgroup_id_proto = {
+@@@ -4049,9 -4039,20 +4056,20 @@@ static inline u64 __bpf_sk_ancestor_cgr
+  	if (!ancestor)
+  		return 0;
+  
+ -	return cgroup_id(ancestor);
+ +	return ancestor->kn->id.id;
+  }
+  
++ BPF_CALL_2(bpf_skb_ancestor_cgroup_id, const struct sk_buff *, skb, int,
++ 	   ancestor_level)
++ {
++ 	struct sock *sk = skb_to_full_sk(skb);
++ 
++ 	if (!sk || !sk_fullsock(sk))
++ 		return 0;
++ 
++ 	return __bpf_sk_ancestor_cgroup_id(sk, ancestor_level);
++ }
++ 
+  static const struct bpf_func_proto bpf_skb_ancestor_cgroup_id_proto = {
+  	.func           = bpf_skb_ancestor_cgroup_id,
+  	.gpl_only       = false,
+diff --cc tools/include/uapi/linux/bpf.h
+index 6a179535d9e4,146c742f1d49..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -3086,13 -3114,45 +3086,49 @@@ union bpf_attr 
+   *
+   * int bpf_seq_write(struct seq_file *m, const void *data, u32 len)
+   * 	Description
+ - * 		**bpf_seq_write**\ () uses seq_file **seq_write**\ () to write the data.
+ + * 		seq_write uses seq_file seq_write() to write the data.
+   * 		The *m* represents the seq_file. The *data* and *len* represent the
+ - * 		data to write in bytes.
+ + *		data to write in bytes.
+   * 	Return
+ - * 		0 on success, or a negative error in case of failure:
+ + * 		0 on success, or a negative errno in case of failure.
+   *
+++<<<<<<< HEAD
+ + *		* **-EOVERFLOW**	Overflow happens, the same object will be tried again.
+++=======
++  *		**-EOVERFLOW** if an overflow happened: The same object will be tried again.
++  *
++  * u64 bpf_sk_cgroup_id(struct bpf_sock *sk)
++  *	Description
++  *		Return the cgroup v2 id of the socket *sk*.
++  *
++  *		*sk* must be a non-**NULL** pointer to a full socket, e.g. one
++  *		returned from **bpf_sk_lookup_xxx**\ (),
++  *		**bpf_sk_fullsock**\ (), etc. The format of returned id is
++  *		same as in **bpf_skb_cgroup_id**\ ().
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		the **CONFIG_SOCK_CGROUP_DATA** configuration option.
++  *	Return
++  *		The id is returned or 0 in case the id could not be retrieved.
++  *
++  * u64 bpf_sk_ancestor_cgroup_id(struct bpf_sock *sk, int ancestor_level)
++  *	Description
++  *		Return id of cgroup v2 that is ancestor of cgroup associated
++  *		with the *sk* at the *ancestor_level*.  The root cgroup is at
++  *		*ancestor_level* zero and each step down the hierarchy
++  *		increments the level. If *ancestor_level* == level of cgroup
++  *		associated with *sk*, then return value will be same as that
++  *		of **bpf_sk_cgroup_id**\ ().
++  *
++  *		The helper is useful to implement policies based on cgroups
++  *		that are upper in hierarchy than immediate cgroup associated
++  *		with *sk*.
++  *
++  *		The format of returned id and helper limitations are same as in
++  *		**bpf_sk_cgroup_id**\ ().
++  *	Return
++  *		The id is returned or 0 in case the id could not be retrieved.
+++>>>>>>> f307fa2cb4c9 (bpf: Introduce bpf_sk_{, ancestor_}cgroup_id helpers)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index a32d03b32735..f0fe2a66840a 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -3120,6 +3120,38 @@ union bpf_attr {
+  * 		0 on success, or a negative error in case of failure:
+  *
+  *		**-EOVERFLOW** if an overflow happened: The same object will be tried again.
++ *
++ * u64 bpf_sk_cgroup_id(struct bpf_sock *sk)
++ *	Description
++ *		Return the cgroup v2 id of the socket *sk*.
++ *
++ *		*sk* must be a non-**NULL** pointer to a full socket, e.g. one
++ *		returned from **bpf_sk_lookup_xxx**\ (),
++ *		**bpf_sk_fullsock**\ (), etc. The format of returned id is
++ *		same as in **bpf_skb_cgroup_id**\ ().
++ *
++ *		This helper is available only if the kernel was compiled with
++ *		the **CONFIG_SOCK_CGROUP_DATA** configuration option.
++ *	Return
++ *		The id is returned or 0 in case the id could not be retrieved.
++ *
++ * u64 bpf_sk_ancestor_cgroup_id(struct bpf_sock *sk, int ancestor_level)
++ *	Description
++ *		Return id of cgroup v2 that is ancestor of cgroup associated
++ *		with the *sk* at the *ancestor_level*.  The root cgroup is at
++ *		*ancestor_level* zero and each step down the hierarchy
++ *		increments the level. If *ancestor_level* == level of cgroup
++ *		associated with *sk*, then return value will be same as that
++ *		of **bpf_sk_cgroup_id**\ ().
++ *
++ *		The helper is useful to implement policies based on cgroups
++ *		that are upper in hierarchy than immediate cgroup associated
++ *		with *sk*.
++ *
++ *		The format of returned id and helper limitations are same as in
++ *		**bpf_sk_cgroup_id**\ ().
++ *	Return
++ *		The id is returned or 0 in case the id could not be retrieved.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -3249,7 +3281,9 @@ union bpf_attr {
+ 	FN(sk_assign),			\
+ 	FN(ktime_get_boot_ns),		\
+ 	FN(seq_printf),			\
+-	FN(seq_write),
++	FN(seq_write),			\
++	FN(sk_cgroup_id),		\
++	FN(sk_ancestor_cgroup_id),
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+  * function eBPF program intends to call
+* Unmerged path net/core/filter.c
+* Unmerged path tools/include/uapi/linux/bpf.h
