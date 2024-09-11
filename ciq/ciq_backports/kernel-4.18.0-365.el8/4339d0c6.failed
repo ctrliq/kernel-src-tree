@@ -1,0 +1,101 @@
+x86/fpu/signal: Clarify exception handling in restore_fpregs_from_user()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 4339d0c63c2d5bea1fe6de4091ee2fe9eeea09a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/4339d0c6.failed
+
+FPU restore from a signal frame can trigger various exceptions. The
+exceptions are caught with an exception table entry. The handler of this
+entry stores the trap number in EAX. The FPU specific fixup negates that
+trap number to convert it into an negative error code.
+
+Any other exception than #PF is fatal and recovery is not possible. This
+relies on the fact that the #PF exception number is the same as EFAULT, but
+that's not really obvious.
+
+Remove the negation from the exception fixup as it really has no value and
+check for X86_TRAP_PF at the call site.
+
+There is still confusion due to the return code conversion for the error
+case which will be cleaned up separately.
+
+	Suggested-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210908132525.506192488@linutronix.de
+(cherry picked from commit 4339d0c63c2d5bea1fe6de4091ee2fe9eeea09a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/internal.h
+diff --cc arch/x86/include/asm/fpu/internal.h
+index eba0dbf57176,4cfd40dc3cb5..000000000000
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@@ -95,11 -98,10 +98,15 @@@ extern void save_fpregs_to_fpstate(stru
+  	asm volatile(ASM_STAC "\n"					\
+  		     "1: " #insn "\n"					\
+  		     "2: " ASM_CLAC "\n"				\
+++<<<<<<< HEAD
+ +		     ".section .fixup,\"ax\"\n"				\
+ +		     "3:  negl %%eax\n"					\
+ +		     "    jmp  2b\n"					\
+ +		     ".previous\n"					\
+ +		     _ASM_EXTABLE_FAULT(1b, 3b)				\
+++=======
++ 		     _ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_FAULT_MCE_SAFE)	\
+++>>>>>>> 4339d0c63c2d (x86/fpu/signal: Clarify exception handling in restore_fpregs_from_user())
+  		     : [err] "=a" (err), output				\
+  		     : "0"(0), input);					\
+  	err;								\
+@@@ -201,11 -204,7 +208,15 @@@ static inline void fxsave(struct fxregs
+  	asm volatile("1:" op "\n\t"					\
+  		     "xor %[err], %[err]\n"				\
+  		     "2:\n\t"						\
+++<<<<<<< HEAD
+ +		     ".pushsection .fixup,\"ax\"\n\t"			\
+ +		     "3: negl %%eax\n\t"				\
+ +		     "jmp 2b\n\t"					\
+ +		     ".popsection\n\t"					\
+ +		     _ASM_EXTABLE_FAULT(1b, 3b)				\
+++=======
++ 		     _ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_FAULT_MCE_SAFE)	\
+++>>>>>>> 4339d0c63c2d (x86/fpu/signal: Clarify exception handling in restore_fpregs_from_user())
+  		     : [err] "=a" (err)					\
+  		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
+  		     : "memory")
+* Unmerged path arch/x86/include/asm/fpu/internal.h
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 445c57c9c539..9bfffdb64c0d 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -13,6 +13,7 @@
+ #include <asm/fpu/xstate.h>
+ 
+ #include <asm/sigframe.h>
++#include <asm/trapnr.h>
+ #include <asm/trace/fpu.h>
+ 
+ static struct _fpx_sw_bytes fx_sw_reserved __ro_after_init;
+@@ -275,7 +276,7 @@ static int restore_fpregs_from_user(void __user *buf, u64 xrestore,
+ 		fpregs_unlock();
+ 
+ 		/* Try to handle #PF, but anything else is fatal. */
+-		if (ret != -EFAULT)
++		if (ret != X86_TRAP_PF)
+ 			return -EINVAL;
+ 
+ 		ret = fault_in_pages_readable(buf, size);
+@@ -405,7 +406,7 @@ static int __fpu_restore_sig(void __user *buf, void __user *buf_fx,
+ 		u64 mask = user_xfeatures | xfeatures_mask_supervisor();
+ 
+ 		fpu->state.xsave.header.xfeatures &= mask;
+-		ret = os_xrstor_safe(&fpu->state.xsave, xfeatures_mask_all);
++		ret = os_xrstor_safe(&fpu->state.xsave, xfeatures_mask_all) ? -EINVAL : 0;
+ 	} else {
+ 		ret = fxrstor_safe(&fpu->state.fxsave);
+ 	}
