@@ -1,0 +1,784 @@
+s390/vfio-ap: handle config changed and scan complete notification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit eeb386aeb5b7c8d2dae6a3ba49255d8a97803182
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/eeb386ae.failed
+
+This patch implements two new AP driver callbacks:
+
+void (*on_config_changed)(struct ap_config_info *new_config_info,
+                  struct ap_config_info *old_config_info);
+
+void (*on_scan_complete)(struct ap_config_info *new_config_info,
+                 struct ap_config_info *old_config_info);
+
+The on_config_changed callback is invoked at the start of the AP bus scan
+function when it determines that the host AP configuration information
+has changed since the previous scan.
+
+The vfio_ap device driver registers a callback function for this callback
+that performs the following operations:
+
+1. Unplugs the adapters, domains and control domains removed from the
+host's AP configuration from the guests to which they are
+assigned in a single operation.
+
+2. Stores bitmaps identifying the adapters, domains and control domains
+added to the host's AP configuration with the structure representing
+the mediated device. When the vfio_ap device driver's probe callback is
+subsequently invoked, the probe function will recognize that the
+queue is being probed due to a change in the host's AP configuration
+and the plugging of the queue into the guest will be bypassed.
+
+The on_scan_complete callback is invoked after the ap bus scan is
+completed if the host AP configuration data has changed. The vfio_ap
+device driver registers a callback function for this callback that hot
+plugs each queue and control domain added to the AP configuration for each
+guest using them in a single hot plug operation.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit eeb386aeb5b7c8d2dae6a3ba49255d8a97803182)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_drv.c
+#	drivers/s390/crypto/vfio_ap_ops.c
+#	drivers/s390/crypto/vfio_ap_private.h
+diff --cc drivers/s390/crypto/vfio_ap_drv.c
+index f3c2a490a1b5,f43cfeabd2cc..000000000000
+--- a/drivers/s390/crypto/vfio_ap_drv.c
++++ b/drivers/s390/crypto/vfio_ap_drv.c
+@@@ -44,122 -43,12 +44,130 @@@ static struct ap_device_id ap_queue_ids
+  	{ /* end of sibling */ },
+  };
+  
+ +MODULE_DEVICE_TABLE(vfio_ap, ap_queue_ids);
+ +
+ +static struct ap_matrix_mdev *vfio_ap_mdev_for_queue(struct vfio_ap_queue *q)
+ +{
+ +	struct ap_matrix_mdev *matrix_mdev;
+ +	unsigned long apid = AP_QID_CARD(q->apqn);
+ +	unsigned long apqi = AP_QID_QUEUE(q->apqn);
+ +
+ +	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
+ +		if (test_bit_inv(apid, matrix_mdev->matrix.apm) &&
+ +		    test_bit_inv(apqi, matrix_mdev->matrix.aqm))
+ +			return matrix_mdev;
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+ +static ssize_t status_show(struct device *dev,
+ +			   struct device_attribute *attr,
+ +			   char *buf)
+ +{
+ +	ssize_t nchars = 0;
+ +	struct vfio_ap_queue *q;
+ +	struct ap_matrix_mdev *matrix_mdev;
+ +	struct ap_device *apdev = to_ap_dev(dev);
+ +
+ +	mutex_lock(&matrix_dev->lock);
+ +	q = dev_get_drvdata(&apdev->device);
+ +	matrix_mdev = vfio_ap_mdev_for_queue(q);
+ +
+ +	if (matrix_mdev) {
+ +		if (matrix_mdev->kvm)
+ +			nchars = scnprintf(buf, PAGE_SIZE, "%s\n",
+ +					   AP_QUEUE_IN_USE);
+ +		else
+ +			nchars = scnprintf(buf, PAGE_SIZE, "%s\n",
+ +					   AP_QUEUE_ASSIGNED);
+ +	} else {
+ +		nchars = scnprintf(buf, PAGE_SIZE, "%s\n",
+ +				   AP_QUEUE_UNASSIGNED);
+ +	}
+ +
+ +	mutex_unlock(&matrix_dev->lock);
+ +
+ +	return nchars;
+ +}
+ +
+ +static DEVICE_ATTR_RO(status);
+ +
+ +static struct attribute *vfio_queue_attrs[] = {
+ +	&dev_attr_status.attr,
+ +	NULL,
+ +};
+ +
+ +static const struct attribute_group vfio_queue_attr_group = {
+ +	.attrs = vfio_queue_attrs,
+ +};
+ +
+ +/**
+ + * vfio_ap_queue_dev_probe: Allocate a vfio_ap_queue structure and associate it
+ + *			    with the device as driver_data.
+ + *
+ + * @apdev: the AP device being probed
+ + *
+ + * Return: returns 0 if the probe succeeded; otherwise, returns an error if
+ + *	   storage could not be allocated for a vfio_ap_queue object or the
+ + *	   sysfs 'status' attribute could not be created for the queue device.
+ + */
+ +static int vfio_ap_queue_dev_probe(struct ap_device *apdev)
+ +{
+ +	int ret;
+ +	struct vfio_ap_queue *q;
+ +
+ +	q = kzalloc(sizeof(*q), GFP_KERNEL);
+ +	if (!q)
+ +		return -ENOMEM;
+ +
+ +	mutex_lock(&matrix_dev->lock);
+ +	dev_set_drvdata(&apdev->device, q);
+ +	q->apqn = to_ap_queue(&apdev->device)->qid;
+ +	q->saved_isc = VFIO_AP_ISC_INVALID;
+ +
+ +	ret = sysfs_create_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ +	if (ret) {
+ +		dev_set_drvdata(&apdev->device, NULL);
+ +		kfree(q);
+ +	}
+ +
+ +	mutex_unlock(&matrix_dev->lock);
+ +
+ +	return ret;
+ +}
+ +
+ +/**
+ + * vfio_ap_queue_dev_remove: Free the associated vfio_ap_queue structure.
+ + *
+ + * @apdev: the AP device being removed
+ + *
+ + * Takes the matrix lock to avoid actions on this device while doing the remove.
+ + */
+ +static void vfio_ap_queue_dev_remove(struct ap_device *apdev)
+ +{
+ +	struct vfio_ap_queue *q;
+ +
+ +	mutex_lock(&matrix_dev->lock);
+ +	sysfs_remove_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ +	q = dev_get_drvdata(&apdev->device);
+ +	vfio_ap_mdev_reset_queue(q, 1);
+ +	dev_set_drvdata(&apdev->device, NULL);
+ +	kfree(q);
+ +	mutex_unlock(&matrix_dev->lock);
+ +}
+ +
+  static struct ap_driver vfio_ap_drv = {
+++<<<<<<< HEAD
+ +	.probe = vfio_ap_queue_dev_probe,
+ +	.remove = vfio_ap_queue_dev_remove,
+++=======
++ 	.probe = vfio_ap_mdev_probe_queue,
++ 	.remove = vfio_ap_mdev_remove_queue,
++ 	.in_use = vfio_ap_mdev_resource_in_use,
++ 	.on_config_changed = vfio_ap_on_cfg_changed,
++ 	.on_scan_complete = vfio_ap_on_scan_complete,
+++>>>>>>> eeb386aeb5b7 (s390/vfio-ap: handle config changed and scan complete notification)
+  	.ids = ap_queue_ids,
+  };
+  
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index 69b05ef08538,729a44d8955f..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -322,9 -606,95 +322,98 @@@ static void vfio_ap_matrix_init(struct 
+  	matrix->adm_max = info->apxa ? info->Nd : 15;
+  }
+  
+++<<<<<<< HEAD
+ +static int vfio_ap_mdev_create(struct kobject *kobj, struct mdev_device *mdev)
+++=======
++ static void vfio_ap_mdev_update_guest_apcb(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	if (matrix_mdev->kvm)
++ 		kvm_arch_crypto_set_masks(matrix_mdev->kvm,
++ 					  matrix_mdev->shadow_apcb.apm,
++ 					  matrix_mdev->shadow_apcb.aqm,
++ 					  matrix_mdev->shadow_apcb.adm);
++ }
++ 
++ static bool vfio_ap_mdev_filter_cdoms(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	DECLARE_BITMAP(prev_shadow_adm, AP_DOMAINS);
++ 
++ 	bitmap_copy(prev_shadow_adm, matrix_mdev->shadow_apcb.adm, AP_DOMAINS);
++ 	bitmap_and(matrix_mdev->shadow_apcb.adm, matrix_mdev->matrix.adm,
++ 		   (unsigned long *)matrix_dev->info.adm, AP_DOMAINS);
++ 
++ 	return !bitmap_equal(prev_shadow_adm, matrix_mdev->shadow_apcb.adm,
++ 			     AP_DOMAINS);
++ }
++ 
++ /*
++  * vfio_ap_mdev_filter_matrix - filter the APQNs assigned to the matrix mdev
++  *				to ensure no queue devices are passed through to
++  *				the guest that are not bound to the vfio_ap
++  *				device driver.
++  *
++  * @matrix_mdev: the matrix mdev whose matrix is to be filtered.
++  *
++  * Note: If an APQN referencing a queue device that is not bound to the vfio_ap
++  *	 driver, its APID will be filtered from the guest's APCB. The matrix
++  *	 structure precludes filtering an individual APQN, so its APID will be
++  *	 filtered.
++  *
++  * Return: a boolean value indicating whether the KVM guest's APCB was changed
++  *	   by the filtering or not.
++  */
++ static bool vfio_ap_mdev_filter_matrix(unsigned long *apm, unsigned long *aqm,
++ 				       struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	unsigned long apid, apqi, apqn;
++ 	DECLARE_BITMAP(prev_shadow_apm, AP_DEVICES);
++ 	DECLARE_BITMAP(prev_shadow_aqm, AP_DOMAINS);
++ 	struct vfio_ap_queue *q;
++ 
++ 	bitmap_copy(prev_shadow_apm, matrix_mdev->shadow_apcb.apm, AP_DEVICES);
++ 	bitmap_copy(prev_shadow_aqm, matrix_mdev->shadow_apcb.aqm, AP_DOMAINS);
++ 	vfio_ap_matrix_init(&matrix_dev->info, &matrix_mdev->shadow_apcb);
++ 
++ 	/*
++ 	 * Copy the adapters, domains and control domains to the shadow_apcb
++ 	 * from the matrix mdev, but only those that are assigned to the host's
++ 	 * AP configuration.
++ 	 */
++ 	bitmap_and(matrix_mdev->shadow_apcb.apm, matrix_mdev->matrix.apm,
++ 		   (unsigned long *)matrix_dev->info.apm, AP_DEVICES);
++ 	bitmap_and(matrix_mdev->shadow_apcb.aqm, matrix_mdev->matrix.aqm,
++ 		   (unsigned long *)matrix_dev->info.aqm, AP_DOMAINS);
++ 
++ 	for_each_set_bit_inv(apid, apm, AP_DEVICES) {
++ 		for_each_set_bit_inv(apqi, aqm, AP_DOMAINS) {
++ 			/*
++ 			 * If the APQN is not bound to the vfio_ap device
++ 			 * driver, then we can't assign it to the guest's
++ 			 * AP configuration. The AP architecture won't
++ 			 * allow filtering of a single APQN, so let's filter
++ 			 * the APID since an adapter represents a physical
++ 			 * hardware device.
++ 			 */
++ 			apqn = AP_MKQID(apid, apqi);
++ 			q = vfio_ap_mdev_get_queue(matrix_mdev, apqn);
++ 			if (!q || q->reset_rc) {
++ 				clear_bit_inv(apid,
++ 					      matrix_mdev->shadow_apcb.apm);
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	return !bitmap_equal(prev_shadow_apm, matrix_mdev->shadow_apcb.apm,
++ 			     AP_DEVICES) ||
++ 	       !bitmap_equal(prev_shadow_aqm, matrix_mdev->shadow_apcb.aqm,
++ 			     AP_DOMAINS);
++ }
++ 
++ static int vfio_ap_mdev_probe(struct mdev_device *mdev)
+++>>>>>>> eeb386aeb5b7 (s390/vfio-ap: handle config changed and scan complete notification)
+  {
+  	struct ap_matrix_mdev *matrix_mdev;
+ -	int ret;
+  
+  	if ((atomic_dec_if_positive(&matrix_dev->available_instances) < 0))
+  		return -EPERM;
+@@@ -1383,4 -1880,434 +1472,340 @@@ int vfio_ap_mdev_register(void
+  void vfio_ap_mdev_unregister(void)
+  {
+  	mdev_unregister_device(&matrix_dev->device);
+ -	mdev_unregister_driver(&vfio_ap_matrix_driver);
+ -}
+ -
+ -int vfio_ap_mdev_probe_queue(struct ap_device *apdev)
+ -{
+ -	int ret;
+ -	struct vfio_ap_queue *q;
+ -	struct ap_matrix_mdev *matrix_mdev;
+ -
+ -	ret = sysfs_create_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ -	if (ret)
+ -		return ret;
+ -
+ -	q = kzalloc(sizeof(*q), GFP_KERNEL);
+ -	if (!q)
+ -		return -ENOMEM;
+ -
+ -	q->apqn = to_ap_queue(&apdev->device)->qid;
+ -	q->saved_isc = VFIO_AP_ISC_INVALID;
+ -	matrix_mdev = get_update_locks_by_apqn(q->apqn);
+ -
+ -	if (matrix_mdev) {
+ -		vfio_ap_mdev_link_queue(matrix_mdev, q);
+ -
+ -		if (vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm,
+ -					       matrix_mdev->matrix.aqm,
+ -					       matrix_mdev))
+ -			vfio_ap_mdev_update_guest_apcb(matrix_mdev);
+ -	}
+ -	dev_set_drvdata(&apdev->device, q);
+ -	release_update_locks_for_mdev(matrix_mdev);
+ -
+ -	return 0;
+ -}
+ -
+ -void vfio_ap_mdev_remove_queue(struct ap_device *apdev)
+ -{
+ -	unsigned long apid, apqi;
+ -	struct vfio_ap_queue *q;
+ -	struct ap_matrix_mdev *matrix_mdev;
+ -
+ -	sysfs_remove_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ -	q = dev_get_drvdata(&apdev->device);
+ -	get_update_locks_for_queue(q);
+ -	matrix_mdev = q->matrix_mdev;
+ -
+ -	if (matrix_mdev) {
+ -		vfio_ap_unlink_queue_fr_mdev(q);
+ -
+ -		apid = AP_QID_CARD(q->apqn);
+ -		apqi = AP_QID_QUEUE(q->apqn);
+ -
+ -		/*
+ -		 * If the queue is assigned to the guest's APCB, then remove
+ -		 * the adapter's APID from the APCB and hot it into the guest.
+ -		 */
+ -		if (test_bit_inv(apid, matrix_mdev->shadow_apcb.apm) &&
+ -		    test_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm)) {
+ -			clear_bit_inv(apid, matrix_mdev->shadow_apcb.apm);
+ -			vfio_ap_mdev_update_guest_apcb(matrix_mdev);
+ -		}
+ -	}
+ -
+ -	vfio_ap_mdev_reset_queue(q, 1);
+ -	dev_set_drvdata(&apdev->device, NULL);
+ -	kfree(q);
+ -	release_update_locks_for_mdev(matrix_mdev);
+ -}
+ -
+ -/**
+ - * vfio_ap_mdev_resource_in_use: check whether any of a set of APQNs is
+ - *				 assigned to a mediated device under the control
+ - *				 of the vfio_ap device driver.
+ - *
+ - * @apm: a bitmap specifying a set of APIDs comprising the APQNs to check.
+ - * @aqm: a bitmap specifying a set of APQIs comprising the APQNs to check.
+ - *
+ - * Return:
+ - *	* -EADDRINUSE if one or more of the APQNs specified via @apm/@aqm are
+ - *	  assigned to a mediated device under the control of the vfio_ap
+ - *	  device driver.
+ - *	* Otherwise, return 0.
+ - */
+ -int vfio_ap_mdev_resource_in_use(unsigned long *apm, unsigned long *aqm)
+ -{
+ -	int ret;
+ -
+ -	mutex_lock(&matrix_dev->guests_lock);
+ -	mutex_lock(&matrix_dev->mdevs_lock);
+ -	ret = vfio_ap_mdev_verify_no_sharing(apm, aqm);
+ -	mutex_unlock(&matrix_dev->mdevs_lock);
+ -	mutex_unlock(&matrix_dev->guests_lock);
+ -
+ -	return ret;
+  }
++ 
++ /**
++  * vfio_ap_mdev_hot_unplug_cfg - hot unplug the adapters, domains and control
++  *				 domains that have been removed from the host's
++  *				 AP configuration from a guest.
++  *
++  * @matrix_mdev: an ap_matrix_mdev object attached to a KVM guest.
++  * @aprem: the adapters that have been removed from the host's AP configuration
++  * @aqrem: the domains that have been removed from the host's AP configuration
++  * @cdrem: the control domains that have been removed from the host's AP
++  *	   configuration.
++  */
++ static void vfio_ap_mdev_hot_unplug_cfg(struct ap_matrix_mdev *matrix_mdev,
++ 					unsigned long *aprem,
++ 					unsigned long *aqrem,
++ 					unsigned long *cdrem)
++ {
++ 	int do_hotplug = 0;
++ 
++ 	if (!bitmap_empty(aprem, AP_DEVICES)) {
++ 		do_hotplug |= bitmap_andnot(matrix_mdev->shadow_apcb.apm,
++ 					    matrix_mdev->shadow_apcb.apm,
++ 					    aprem, AP_DEVICES);
++ 	}
++ 
++ 	if (!bitmap_empty(aqrem, AP_DOMAINS)) {
++ 		do_hotplug |= bitmap_andnot(matrix_mdev->shadow_apcb.aqm,
++ 					    matrix_mdev->shadow_apcb.aqm,
++ 					    aqrem, AP_DEVICES);
++ 	}
++ 
++ 	if (!bitmap_empty(cdrem, AP_DOMAINS))
++ 		do_hotplug |= bitmap_andnot(matrix_mdev->shadow_apcb.adm,
++ 					    matrix_mdev->shadow_apcb.adm,
++ 					    cdrem, AP_DOMAINS);
++ 
++ 	if (do_hotplug)
++ 		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
++ }
++ 
++ /**
++  * vfio_ap_mdev_cfg_remove - determines which guests are using the adapters,
++  *			     domains and control domains that have been removed
++  *			     from the host AP configuration and unplugs them
++  *			     from those guests.
++  *
++  * @ap_remove:	bitmap specifying which adapters have been removed from the host
++  *		config.
++  * @aq_remove:	bitmap specifying which domains have been removed from the host
++  *		config.
++  * @cd_remove:	bitmap specifying which control domains have been removed from
++  *		the host config.
++  */
++ static void vfio_ap_mdev_cfg_remove(unsigned long *ap_remove,
++ 				    unsigned long *aq_remove,
++ 				    unsigned long *cd_remove)
++ {
++ 	struct ap_matrix_mdev *matrix_mdev;
++ 	DECLARE_BITMAP(aprem, AP_DEVICES);
++ 	DECLARE_BITMAP(aqrem, AP_DOMAINS);
++ 	DECLARE_BITMAP(cdrem, AP_DOMAINS);
++ 	int do_remove = 0;
++ 
++ 	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
++ 		mutex_lock(&matrix_mdev->kvm->lock);
++ 		mutex_lock(&matrix_dev->mdevs_lock);
++ 
++ 		do_remove |= bitmap_and(aprem, ap_remove,
++ 					  matrix_mdev->matrix.apm,
++ 					  AP_DEVICES);
++ 		do_remove |= bitmap_and(aqrem, aq_remove,
++ 					  matrix_mdev->matrix.aqm,
++ 					  AP_DOMAINS);
++ 		do_remove |= bitmap_andnot(cdrem, cd_remove,
++ 					     matrix_mdev->matrix.adm,
++ 					     AP_DOMAINS);
++ 
++ 		if (do_remove)
++ 			vfio_ap_mdev_hot_unplug_cfg(matrix_mdev, aprem, aqrem,
++ 						    cdrem);
++ 
++ 		mutex_unlock(&matrix_dev->mdevs_lock);
++ 		mutex_unlock(&matrix_mdev->kvm->lock);
++ 	}
++ }
++ 
++ /**
++  * vfio_ap_mdev_on_cfg_remove - responds to the removal of adapters, domains and
++  *				control domains from the host AP configuration
++  *				by unplugging them from the guests that are
++  *				using them.
++  * @cur_config_info: the current host AP configuration information
++  * @prev_config_info: the previous host AP configuration information
++  */
++ static void vfio_ap_mdev_on_cfg_remove(struct ap_config_info *cur_config_info,
++ 				       struct ap_config_info *prev_config_info)
++ {
++ 	int do_remove;
++ 	DECLARE_BITMAP(aprem, AP_DEVICES);
++ 	DECLARE_BITMAP(aqrem, AP_DOMAINS);
++ 	DECLARE_BITMAP(cdrem, AP_DOMAINS);
++ 
++ 	do_remove = bitmap_andnot(aprem,
++ 				  (unsigned long *)prev_config_info->apm,
++ 				  (unsigned long *)cur_config_info->apm,
++ 				  AP_DEVICES);
++ 	do_remove |= bitmap_andnot(aqrem,
++ 				   (unsigned long *)prev_config_info->aqm,
++ 				   (unsigned long *)cur_config_info->aqm,
++ 				   AP_DEVICES);
++ 	do_remove |= bitmap_andnot(cdrem,
++ 				   (unsigned long *)prev_config_info->adm,
++ 				   (unsigned long *)cur_config_info->adm,
++ 				   AP_DEVICES);
++ 
++ 	if (do_remove)
++ 		vfio_ap_mdev_cfg_remove(aprem, aqrem, cdrem);
++ }
++ 
++ /**
++  * vfio_ap_filter_apid_by_qtype: filter APIDs from an AP mask for adapters that
++  *				 are older than AP type 10 (CEX4).
++  * @apm: a bitmap of the APIDs to examine
++  * @aqm: a bitmap of the APQIs of the queues to query for the AP type.
++  */
++ static void vfio_ap_filter_apid_by_qtype(unsigned long *apm, unsigned long *aqm)
++ {
++ 	bool apid_cleared;
++ 	struct ap_queue_status status;
++ 	unsigned long apid, apqi, info;
++ 	int qtype, qtype_mask = 0xff000000;
++ 
++ 	for_each_set_bit_inv(apid, apm, AP_DEVICES) {
++ 		apid_cleared = false;
++ 
++ 		for_each_set_bit_inv(apqi, aqm, AP_DOMAINS) {
++ 			status = ap_test_queue(AP_MKQID(apid, apqi), 1, &info);
++ 			switch (status.response_code) {
++ 			/*
++ 			 * According to the architecture in each case
++ 			 * below, the queue's info should be filled.
++ 			 */
++ 			case AP_RESPONSE_NORMAL:
++ 			case AP_RESPONSE_RESET_IN_PROGRESS:
++ 			case AP_RESPONSE_DECONFIGURED:
++ 			case AP_RESPONSE_CHECKSTOPPED:
++ 			case AP_RESPONSE_BUSY:
++ 				qtype = info & qtype_mask;
++ 
++ 				/*
++ 				 * The vfio_ap device driver only
++ 				 * supports CEX4 and newer adapters, so
++ 				 * remove the APID if the adapter is
++ 				 * older than a CEX4.
++ 				 */
++ 				if (qtype < AP_DEVICE_TYPE_CEX4) {
++ 					clear_bit_inv(apid, apm);
++ 					apid_cleared = true;
++ 				}
++ 
++ 				break;
++ 
++ 			default:
++ 				/*
++ 				 * If we don't know the adapter type,
++ 				 * clear its APID since it can't be
++ 				 * determined whether the vfio_ap
++ 				 * device driver supports it.
++ 				 */
++ 				clear_bit_inv(apid, apm);
++ 				apid_cleared = true;
++ 				break;
++ 			}
++ 
++ 			/*
++ 			 * If we've already cleared the APID from the apm, there
++ 			 * is no need to continue examining the remainin AP
++ 			 * queues to determine the type of the adapter.
++ 			 */
++ 			if (apid_cleared)
++ 				continue;
++ 		}
++ 	}
++ }
++ 
++ /**
++  * vfio_ap_mdev_cfg_add - store bitmaps specifying the adapters, domains and
++  *			  control domains that have been added to the host's
++  *			  AP configuration for each matrix mdev to which they
++  *			  are assigned.
++  *
++  * @apm_add: a bitmap specifying the adapters that have been added to the AP
++  *	     configuration.
++  * @aqm_add: a bitmap specifying the domains that have been added to the AP
++  *	     configuration.
++  * @adm_add: a bitmap specifying the control domains that have been added to the
++  *	     AP configuration.
++  */
++ static void vfio_ap_mdev_cfg_add(unsigned long *apm_add, unsigned long *aqm_add,
++ 				 unsigned long *adm_add)
++ {
++ 	struct ap_matrix_mdev *matrix_mdev;
++ 
++ 	if (list_empty(&matrix_dev->mdev_list))
++ 		return;
++ 
++ 	vfio_ap_filter_apid_by_qtype(apm_add, aqm_add);
++ 
++ 	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
++ 		bitmap_and(matrix_mdev->apm_add,
++ 			   matrix_mdev->matrix.apm, apm_add, AP_DEVICES);
++ 		bitmap_and(matrix_mdev->aqm_add,
++ 			   matrix_mdev->matrix.aqm, aqm_add, AP_DOMAINS);
++ 		bitmap_and(matrix_mdev->adm_add,
++ 			   matrix_mdev->matrix.adm, adm_add, AP_DEVICES);
++ 	}
++ }
++ 
++ /**
++  * vfio_ap_mdev_on_cfg_add - responds to the addition of adapters, domains and
++  *			     control domains to the host AP configuration
++  *			     by updating the bitmaps that specify what adapters,
++  *			     domains and control domains have been added so they
++  *			     can be hot plugged into the guest when the AP bus
++  *			     scan completes (see vfio_ap_on_scan_complete
++  *			     function).
++  * @cur_config_info: the current AP configuration information
++  * @prev_config_info: the previous AP configuration information
++  */
++ static void vfio_ap_mdev_on_cfg_add(struct ap_config_info *cur_config_info,
++ 				    struct ap_config_info *prev_config_info)
++ {
++ 	bool do_add;
++ 	DECLARE_BITMAP(apm_add, AP_DEVICES);
++ 	DECLARE_BITMAP(aqm_add, AP_DOMAINS);
++ 	DECLARE_BITMAP(adm_add, AP_DOMAINS);
++ 
++ 	do_add = bitmap_andnot(apm_add,
++ 			       (unsigned long *)cur_config_info->apm,
++ 			       (unsigned long *)prev_config_info->apm,
++ 			       AP_DEVICES);
++ 	do_add |= bitmap_andnot(aqm_add,
++ 				(unsigned long *)cur_config_info->aqm,
++ 				(unsigned long *)prev_config_info->aqm,
++ 				AP_DOMAINS);
++ 	do_add |= bitmap_andnot(adm_add,
++ 				(unsigned long *)cur_config_info->adm,
++ 				(unsigned long *)prev_config_info->adm,
++ 				AP_DOMAINS);
++ 
++ 	if (do_add)
++ 		vfio_ap_mdev_cfg_add(apm_add, aqm_add, adm_add);
++ }
++ 
++ /**
++  * vfio_ap_on_cfg_changed - handles notification of changes to the host AP
++  *			    configuration.
++  *
++  * @cur_cfg_info: the current host AP configuration
++  * @prev_cfg_info: the previous host AP configuration
++  */
++ void vfio_ap_on_cfg_changed(struct ap_config_info *cur_cfg_info,
++ 			    struct ap_config_info *prev_cfg_info)
++ {
++ 	if (!cur_cfg_info || !prev_cfg_info)
++ 		return;
++ 
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 
++ 	vfio_ap_mdev_on_cfg_remove(cur_cfg_info, prev_cfg_info);
++ 	vfio_ap_mdev_on_cfg_add(cur_cfg_info, prev_cfg_info);
++ 	memcpy(&matrix_dev->info, cur_cfg_info, sizeof(*cur_cfg_info));
++ 
++ 	mutex_unlock(&matrix_dev->guests_lock);
++ }
++ 
++ static void vfio_ap_mdev_hot_plug_cfg(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	bool do_hotplug = false;
++ 	int filter_domains = 0;
++ 	int filter_adapters = 0;
++ 	DECLARE_BITMAP(apm, AP_DEVICES);
++ 	DECLARE_BITMAP(aqm, AP_DOMAINS);
++ 
++ 	mutex_lock(&matrix_mdev->kvm->lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ 
++ 	filter_adapters = bitmap_and(apm, matrix_mdev->matrix.apm,
++ 				     matrix_mdev->apm_add, AP_DEVICES);
++ 	filter_domains = bitmap_and(aqm, matrix_mdev->matrix.aqm,
++ 				    matrix_mdev->aqm_add, AP_DOMAINS);
++ 
++ 	if (filter_adapters && filter_domains)
++ 		do_hotplug |= vfio_ap_mdev_filter_matrix(apm, aqm, matrix_mdev);
++ 	else if (filter_adapters)
++ 		do_hotplug |=
++ 			vfio_ap_mdev_filter_matrix(apm,
++ 						   matrix_mdev->shadow_apcb.aqm,
++ 						   matrix_mdev);
++ 	else
++ 		do_hotplug |=
++ 			vfio_ap_mdev_filter_matrix(matrix_mdev->shadow_apcb.apm,
++ 						   aqm, matrix_mdev);
++ 
++ 	if (bitmap_intersects(matrix_mdev->matrix.adm, matrix_mdev->adm_add,
++ 			      AP_DOMAINS))
++ 		do_hotplug |= vfio_ap_mdev_filter_cdoms(matrix_mdev);
++ 
++ 	if (do_hotplug)
++ 		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
++ 
++ 	mutex_unlock(&matrix_dev->mdevs_lock);
++ 	mutex_unlock(&matrix_mdev->kvm->lock);
++ }
++ 
++ void vfio_ap_on_scan_complete(struct ap_config_info *new_config_info,
++ 			      struct ap_config_info *old_config_info)
++ {
++ 	struct ap_matrix_mdev *matrix_mdev;
++ 
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 
++ 	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
++ 		if (bitmap_empty(matrix_mdev->apm_add, AP_DEVICES) &&
++ 		    bitmap_empty(matrix_mdev->aqm_add, AP_DOMAINS) &&
++ 		    bitmap_empty(matrix_mdev->adm_add, AP_DOMAINS))
++ 			continue;
++ 
++ 		vfio_ap_mdev_hot_plug_cfg(matrix_mdev);
++ 		bitmap_clear(matrix_mdev->apm_add, 0, AP_DEVICES);
++ 		bitmap_clear(matrix_mdev->aqm_add, 0, AP_DOMAINS);
++ 		bitmap_clear(matrix_mdev->adm_add, 0, AP_DOMAINS);
++ 	}
++ 
++ 	mutex_unlock(&matrix_dev->guests_lock);
++ }
+diff --cc drivers/s390/crypto/vfio_ap_private.h
+index 104c59398001,2d03871597bf..000000000000
+--- a/drivers/s390/crypto/vfio_ap_private.h
++++ b/drivers/s390/crypto/vfio_ap_private.h
+@@@ -94,15 -104,25 +94,30 @@@ struct ap_matrix 
+   * @pqap_hook:	the function pointer to the interception handler for the
+   *		PQAP(AQIC) instruction.
+   * @mdev:	the mediated device
+++<<<<<<< HEAD
+++=======
++  * @qtable:	table of queues (struct vfio_ap_queue) assigned to the mdev
++  * @apm_add:	bitmap of APIDs added to the host's AP configuration
++  * @aqm_add:	bitmap of APQIs added to the host's AP configuration
++  * @adm_add:	bitmap of control domain numbers added to the host's AP
++  *		configuration
+++>>>>>>> eeb386aeb5b7 (s390/vfio-ap: handle config changed and scan complete notification)
+   */
+  struct ap_matrix_mdev {
+ -	struct vfio_device vdev;
+  	struct list_head node;
+  	struct ap_matrix matrix;
+ -	struct ap_matrix shadow_apcb;
+ +	struct notifier_block group_notifier;
+  	struct notifier_block iommu_notifier;
+  	struct kvm *kvm;
+  	crypto_hook pqap_hook;
+  	struct mdev_device *mdev;
+++<<<<<<< HEAD
+++=======
++ 	struct ap_queue_table qtable;
++ 	DECLARE_BITMAP(apm_add, AP_DEVICES);
++ 	DECLARE_BITMAP(aqm_add, AP_DOMAINS);
++ 	DECLARE_BITMAP(adm_add, AP_DOMAINS);
+++>>>>>>> eeb386aeb5b7 (s390/vfio-ap: handle config changed and scan complete notification)
+  };
+  
+  /**
+@@@ -123,7 -147,15 +138,12 @@@ struct vfio_ap_queue 
+  
+  int vfio_ap_mdev_register(void);
+  void vfio_ap_mdev_unregister(void);
+ -
+ -int vfio_ap_mdev_probe_queue(struct ap_device *queue);
+ -void vfio_ap_mdev_remove_queue(struct ap_device *queue);
+ -
+ -int vfio_ap_mdev_resource_in_use(unsigned long *apm, unsigned long *aqm);
+ +int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q,
+ +			     unsigned int retry);
+  
++ void vfio_ap_on_cfg_changed(struct ap_config_info *new_config_info,
++ 			    struct ap_config_info *old_config_info);
++ void vfio_ap_on_scan_complete(struct ap_config_info *new_config_info,
++ 			      struct ap_config_info *old_config_info);
++ 
+  #endif /* _VFIO_AP_PRIVATE_H_ */
+* Unmerged path drivers/s390/crypto/vfio_ap_drv.c
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
+* Unmerged path drivers/s390/crypto/vfio_ap_private.h
