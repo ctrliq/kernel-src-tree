@@ -1,0 +1,369 @@
+mptcp: avoid a few atomic ops in the rx path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 7439d687b79cbbd971c6a170be9aefda4a564be4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7439d687.failed
+
+Extending the data_lock scope in mptcp_incoming_option
+we can use that to protect both snd_una and wnd_end.
+In the typical case, we will have a single atomic op instead of 2
+
+	Acked-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7439d687b79cbbd971c6a170be9aefda4a564be4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/options.c
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/options.c
+index cfc2e1d06a18,3986454a0340..000000000000
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@@ -756,11 -829,15 +756,19 @@@ static u64 expand_ack(u64 old_ack, u64 
+  	return cur_ack;
+  }
+  
+ -static void ack_update_msk(struct mptcp_sock *msk,
+ -			   const struct sock *ssk,
+ -			   struct mptcp_options_received *mp_opt)
+ +static void update_una(struct mptcp_sock *msk,
+ +		       struct mptcp_options_received *mp_opt)
+  {
+++<<<<<<< HEAD
+ +	u64 new_snd_una, snd_una, old_snd_una = atomic64_read(&msk->snd_una);
+ +	u64 snd_nxt = READ_ONCE(msk->snd_nxt);
+++=======
++ 	u64 new_wnd_end, new_snd_una, snd_nxt = READ_ONCE(msk->snd_nxt);
++ 	struct sock *sk = (struct sock *)msk;
++ 	u64 old_snd_una;
++ 
++ 	mptcp_data_lock(sk);
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  
+  	/* avoid ack expansion on update conflict, to reduce the risk of
+  	 * wrongly expanding to a future ack sequence number, which is way
+@@@ -772,15 -850,19 +781,30 @@@
+  	if (after64(new_snd_una, snd_nxt))
+  		new_snd_una = old_snd_una;
+  
+++<<<<<<< HEAD
+ +	while (after64(new_snd_una, old_snd_una)) {
+ +		snd_una = old_snd_una;
+ +		old_snd_una = atomic64_cmpxchg(&msk->snd_una, snd_una,
+ +					       new_snd_una);
+ +		if (old_snd_una == snd_una) {
+ +			mptcp_data_acked((struct sock *)msk);
+ +			break;
+ +		}
+++=======
++ 	new_wnd_end = new_snd_una + tcp_sk(ssk)->snd_wnd;
++ 
++ 	if (after64(new_wnd_end, msk->wnd_end)) {
++ 		msk->wnd_end = new_wnd_end;
++ 		if (mptcp_send_head(sk))
++ 			mptcp_schedule_work(sk);
++ 	}
++ 
++ 	if (after64(new_snd_una, old_snd_una)) {
++ 		msk->snd_una = new_snd_una;
++ 		__mptcp_data_acked(sk);
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  	}
++ 	mptcp_data_unlock(sk);
+  }
+  
+  bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool use_64bit)
+diff --cc net/mptcp/protocol.c
+index 75ee5f9fd199,51f92f3096bf..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -51,6 -57,12 +51,15 @@@ static struct socket *__mptcp_nmpc_sock
+  	return msk->subflow;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Returns end sequence number of the receiver's advertised window */
++ static u64 mptcp_wnd_end(const struct mptcp_sock *msk)
++ {
++ 	return READ_ONCE(msk->wnd_end);
++ }
++ 
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  static bool mptcp_is_tcpsk(struct sock *sk)
+  {
+  	struct socket *sock = sk->sk_socket;
+@@@ -502,7 -751,20 +511,24 @@@ static void mptcp_reset_timer(struct so
+  	sk_reset_timer(sk, &icsk->icsk_retransmit_timer, jiffies + tout);
+  }
+  
+++<<<<<<< HEAD
+ +void mptcp_data_acked(struct sock *sk)
+++=======
++ bool mptcp_schedule_work(struct sock *sk)
++ {
++ 	if (inet_sk_state_load(sk) != TCP_CLOSE &&
++ 	    schedule_work(&mptcp_sk(sk)->work)) {
++ 		/* each subflow already holds a reference to the sk, and the
++ 		 * workqueue is invoked by a subflow, so sk can't go away here.
++ 		 */
++ 		sock_hold(sk);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ void __mptcp_data_acked(struct sock *sk)
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  {
+  	mptcp_reset_timer(sk);
+  
+@@@ -629,9 -997,11 +655,17 @@@ static void mptcp_clean_una(struct soc
+  	 * plain TCP
+  	 */
+  	if (__mptcp_check_fallback(msk))
+++<<<<<<< HEAD
+ +		atomic64_set(&msk->snd_una, msk->snd_nxt);
+ +	snd_una = atomic64_read(&msk->snd_una);
+ +
+++=======
++ 		msk->snd_una = READ_ONCE(msk->snd_nxt);
++ 
++ 
++ 	mptcp_data_lock(sk);
++ 	snd_una = msk->snd_una;
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  	list_for_each_entry_safe(dfrag, dtmp, &msk->rtx_queue, list) {
+  		if (after64(dfrag->data_seq + dfrag->data_len, snd_una))
+  			break;
+@@@ -770,43 -1276,28 +804,56 @@@ static int mptcp_sendmsg_frag(struct so
+  		if (!can_collapse)
+  			TCP_SKB_CB(skb)->eor = 1;
+  		else
+ -			avail_size = info->size_goal - skb->len;
+ +			avail_size = size_goal - skb->len;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!retransmission) {
+ +		/* reuse tail pfrag, if possible, or carve a new one from the
+ +		 * page allocator
+ +		 */
+ +		dfrag = mptcp_rtx_tail(sk);
+ +		offset = pfrag->offset;
+ +		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
+ +		if (!dfrag_collapsed) {
+ +			dfrag = mptcp_carve_data_frag(msk, pfrag, offset);
+ +			offset = dfrag->offset;
+ +			frag_truesize = dfrag->overhead;
+ +		}
+ +		psize = min_t(size_t, pfrag->size - offset, avail_size);
+ +
+ +		/* Copy to page */
+ +		pr_debug("left=%zu", msg_data_left(msg));
+ +		psize = copy_page_from_iter(pfrag->page, offset,
+ +					    min_t(size_t, msg_data_left(msg),
+ +						  psize),
+ +					    &msg->msg_iter);
+ +		pr_debug("left=%zu", msg_data_left(msg));
+ +		if (!psize)
+ +			return -EINVAL;
+ +
+ +		if (!sk_wmem_schedule(sk, psize + dfrag->overhead)) {
+ +			iov_iter_revert(&msg->msg_iter, psize);
+ +			return -ENOMEM;
+ +		}
+ +	} else {
+ +		offset = dfrag->offset;
+ +		psize = min_t(size_t, dfrag->data_len, avail_size);
+++=======
++ 	/* Zero window and all data acked? Probe. */
++ 	avail_size = mptcp_check_allowed_size(msk, data_seq, avail_size);
++ 	if (avail_size == 0) {
++ 		u64 snd_una = READ_ONCE(msk->snd_una);
++ 
++ 		if (skb || snd_una != msk->snd_nxt)
++ 			return 0;
++ 		zero_window_probe = true;
++ 		data_seq = snd_una - 1;
++ 		avail_size = 1;
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  	}
+  
+ -	if (WARN_ON_ONCE(info->sent > info->limit ||
+ -			 info->limit > dfrag->data_len))
+ -		return 0;
+ -
+ -	ret = info->limit - info->sent;
+ -	tail = tcp_build_frag(ssk, avail_size, info->flags, dfrag->page,
+ -			      dfrag->offset + info->sent, &ret);
+ +	tail = tcp_build_frag(ssk, psize, msg->msg_flags, page, offset, &psize);
+  	if (!tail) {
+  		tcp_remove_empty_skb(sk, tcp_write_queue_tail(ssk));
+  		return -ENOMEM;
+@@@ -1333,13 -1996,8 +1380,18 @@@ static void mptcp_retransmit_handler(st
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+  
+++<<<<<<< HEAD
+ +	if (atomic64_read(&msk->snd_una) == READ_ONCE(msk->snd_nxt)) {
+ +		mptcp_stop_timer(sk);
+ +	} else {
+ +		set_bit(MPTCP_WORK_RTX, &msk->flags);
+ +		if (schedule_work(&msk->work))
+ +			sock_hold(sk);
+ +	}
+++=======
++ 	set_bit(MPTCP_WORK_RTX, &msk->flags);
++ 	mptcp_schedule_work(sk);
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  }
+  
+  static void mptcp_retransmit_timer(struct timer_list *t)
+@@@ -1755,23 -2617,11 +1807,29 @@@ struct sock *mptcp_sk_clone(const struc
+  	msk->subflow = NULL;
+  	WRITE_ONCE(msk->fully_established, false);
+  
+ +	if (unlikely(mptcp_token_new_accept(subflow_req->token, nsk))) {
+ +		nsk->sk_state = TCP_CLOSE;
+ +		bh_unlock_sock(nsk);
+ +
+ +		/* we can't call into mptcp_close() here - possible BH context
+ +		 * free the sock directly.
+ +		 * sk_clone_lock() sets nsk refcnt to two, hence call sk_free()
+ +		 * too.
+ +		 */
+ +		sk_common_release(nsk);
+ +		sk_free(nsk);
+ +		return NULL;
+ +	}
+ +
+  	msk->write_seq = subflow_req->idsn + 1;
+  	msk->snd_nxt = msk->write_seq;
+++<<<<<<< HEAD
+ +	atomic64_set(&msk->snd_una, msk->write_seq);
+++=======
++ 	msk->snd_una = msk->write_seq;
++ 	msk->wnd_end = msk->snd_nxt + req->rsk_rcv_wnd;
++ 
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  	if (mp_opt->mp_capable) {
+  		msk->can_ack = true;
+  		msk->remote_key = mp_opt->sndr_key;
+@@@ -1804,6 -2655,8 +1862,11 @@@ void mptcp_rcv_space_init(struct mptcp_
+  				      TCP_INIT_CWND * tp->advmss);
+  	if (msk->rcvq_space.space == 0)
+  		msk->rcvq_space.space = TCP_INIT_CWND * TCP_MSS_DEFAULT;
+++<<<<<<< HEAD
+++=======
++ 
++ 	WRITE_ONCE(msk->wnd_end, msk->snd_nxt + tcp_sk(ssk)->snd_wnd);
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  }
+  
+  static struct sock *mptcp_accept(struct sock *sk, int flags, int *err,
+@@@ -2061,8 -2914,9 +2124,8 @@@ void mptcp_finish_connect(struct sock *
+  	WRITE_ONCE(msk->write_seq, subflow->idsn + 1);
+  	WRITE_ONCE(msk->snd_nxt, msk->write_seq);
+  	WRITE_ONCE(msk->ack_seq, ack_seq);
+ -	WRITE_ONCE(msk->rcv_wnd_sent, ack_seq);
+  	WRITE_ONCE(msk->can_ack, 1);
+- 	atomic64_set(&msk->snd_una, msk->write_seq);
++ 	WRITE_ONCE(msk->snd_una, msk->write_seq);
+  
+  	mptcp_pm_new_connection(msk, 0);
+  
+diff --cc net/mptcp/protocol.h
+index 1a9f8aa19c92,3c07aafde10e..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -203,10 -216,18 +203,19 @@@ struct mptcp_sock 
+  	u64		write_seq;
+  	u64		snd_nxt;
+  	u64		ack_seq;
+ -	u64		rcv_wnd_sent;
+  	u64		rcv_data_fin_seq;
+++<<<<<<< HEAD
+ +	atomic64_t	snd_una;
+++=======
++ 	int		wmem_reserved;
++ 	struct sock	*last_snd;
++ 	int		snd_burst;
++ 	int		old_wspace;
++ 	u64		snd_una;
++ 	u64		wnd_end;
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  	unsigned long	timer_ival;
+  	u32		token;
+ -	int		rmem_pending;
+ -	int		rmem_released;
+  	unsigned long	flags;
+  	bool		can_ack;
+  	bool		fully_established;
+@@@ -412,16 -494,35 +421,21 @@@ static inline bool mptcp_is_fully_estab
+  void mptcp_rcv_space_init(struct mptcp_sock *msk, const struct sock *ssk);
+  void mptcp_data_ready(struct sock *sk, struct sock *ssk);
+  bool mptcp_finish_join(struct sock *sk);
+++<<<<<<< HEAD
+ +void mptcp_data_acked(struct sock *sk);
+++=======
++ bool mptcp_schedule_work(struct sock *sk);
++ void __mptcp_data_acked(struct sock *sk);
+++>>>>>>> 7439d687b79c (mptcp: avoid a few atomic ops in the rx path)
+  void mptcp_subflow_eof(struct sock *sk);
+  bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool use_64bit);
+ -void __mptcp_flush_join_list(struct mptcp_sock *msk);
+ -static inline bool mptcp_data_fin_enabled(const struct mptcp_sock *msk)
+ -{
+ -	return READ_ONCE(msk->snd_data_fin_enable) &&
+ -	       READ_ONCE(msk->write_seq) == READ_ONCE(msk->snd_nxt);
+ -}
+ -
+ -void mptcp_destroy_common(struct mptcp_sock *msk);
+ -
+ -void __init mptcp_token_init(void);
+ -static inline void mptcp_token_init_request(struct request_sock *req)
+ -{
+ -	mptcp_subflow_rsk(req)->token_node.pprev = NULL;
+ -}
+  
+  int mptcp_token_new_request(struct request_sock *req);
+ -void mptcp_token_destroy_request(struct request_sock *req);
+ +void mptcp_token_destroy_request(u32 token);
+  int mptcp_token_new_connect(struct sock *sk);
+ -void mptcp_token_accept(struct mptcp_subflow_request_sock *r,
+ -			struct mptcp_sock *msk);
+ -bool mptcp_token_exists(u32 token);
+ +int mptcp_token_new_accept(u32 token, struct sock *conn);
+  struct mptcp_sock *mptcp_token_get_sock(u32 token);
+ -struct mptcp_sock *mptcp_token_iter_next(const struct net *net, long *s_slot,
+ -					 long *s_num);
+ -void mptcp_token_destroy(struct mptcp_sock *msk);
+ +void mptcp_token_destroy(u32 token);
+  
+  void mptcp_crypto_key_sha(u64 key, u32 *token, u64 *idsn);
+  
+diff --git a/net/mptcp/mptcp_diag.c b/net/mptcp/mptcp_diag.c
+index 5f390a97f556..b70ae4ba3000 100644
+--- a/net/mptcp/mptcp_diag.c
++++ b/net/mptcp/mptcp_diag.c
+@@ -140,7 +140,7 @@ static void mptcp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
+ 	info->mptcpi_flags = flags;
+ 	info->mptcpi_token = READ_ONCE(msk->token);
+ 	info->mptcpi_write_seq = READ_ONCE(msk->write_seq);
+-	info->mptcpi_snd_una = atomic64_read(&msk->snd_una);
++	info->mptcpi_snd_una = READ_ONCE(msk->snd_una);
+ 	info->mptcpi_rcv_nxt = READ_ONCE(msk->ack_seq);
+ 	unlock_sock_fast(sk, slow);
+ }
+* Unmerged path net/mptcp/options.c
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
