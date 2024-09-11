@@ -1,0 +1,564 @@
+net: bridge: switchdev: allow the TX data plane forwarding to be offloaded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Tobias Waldekranz <tobias@waldekranz.com>
+commit 472111920f1c5fbe103022a4b05bfb37128a2a29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/47211192.failed
+
+Allow switchdevs to forward frames from the CPU in accordance with the
+bridge configuration in the same way as is done between bridge
+ports. This means that the bridge will only send a single skb towards
+one of the ports under the switchdev's control, and expects the driver
+to deliver the packet to all eligible ports in its domain.
+
+Primarily this improves the performance of multicast flows with
+multiple subscribers, as it allows the hardware to perform the frame
+replication.
+
+The basic flow between the driver and the bridge is as follows:
+
+- When joining a bridge port, the switchdev driver calls
+  switchdev_bridge_port_offload() with tx_fwd_offload = true.
+
+- The bridge sends offloadable skbs to one of the ports under the
+  switchdev's control using skb->offload_fwd_mark = true.
+
+- The switchdev driver checks the skb->offload_fwd_mark field and lets
+  its FDB lookup select the destination port mask for this packet.
+
+v1->v2:
+- convert br_input_skb_cb::fwd_hwdoms to a plain unsigned long
+- introduce a static key "br_switchdev_fwd_offload_used" to minimize the
+  impact of the newly introduced feature on all the setups which don't
+  have hardware that can make use of it
+- introduce a check for nbp->flags & BR_FWD_OFFLOAD to optimize cache
+  line access
+- reorder nbp_switchdev_frame_mark_accel() and br_handle_vlan() in
+  __br_forward()
+- do not strip VLAN on egress if forwarding offload on VLAN-aware bridge
+  is being used
+- propagate errors from .ndo_dfwd_add_station() if not EOPNOTSUPP
+
+v2->v3:
+- replace the solution based on .ndo_dfwd_add_station with a solution
+  based on switchdev_bridge_port_offload
+- rename BR_FWD_OFFLOAD to BR_TX_FWD_OFFLOAD
+v3->v4: rebase
+v4->v5:
+- make sure the static key is decremented on bridge port unoffload
+- more function and variable renaming and comments for them:
+  br_switchdev_fwd_offload_used to br_switchdev_tx_fwd_offload
+  br_switchdev_accels_skb to br_switchdev_frame_uses_tx_fwd_offload
+  nbp_switchdev_frame_mark_tx_fwd to nbp_switchdev_frame_mark_tx_fwd_to_hwdom
+  nbp_switchdev_frame_mark_accel to nbp_switchdev_frame_mark_tx_fwd_offload
+  fwd_accel to tx_fwd_offload
+
+	Signed-off-by: Tobias Waldekranz <tobias@waldekranz.com>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 472111920f1c5fbe103022a4b05bfb37128a2a29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+#	drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+#	drivers/net/ethernet/mscc/ocelot_net.c
+#	drivers/net/ethernet/rocker/rocker_ofdpa.c
+#	drivers/net/ethernet/ti/am65-cpsw-nuss.c
+#	drivers/net/ethernet/ti/cpsw_new.c
+#	include/linux/if_bridge.h
+#	net/bridge/br_switchdev.c
+#	net/dsa/port.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 14ce372c3f85,f5d0d392efbf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@@ -359,7 -361,17 +359,15 @@@ mlxsw_sp_bridge_port_create(struct mlxs
+  	list_add(&bridge_port->list, &bridge_device->ports_list);
+  	bridge_port->ref_count = 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = switchdev_bridge_port_offload(brport_dev, mlxsw_sp_port->dev,
++ 					    NULL, NULL, NULL, false, extack);
++ 	if (err)
++ 		goto err_switchdev_offload;
++ 
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+  	return bridge_port;
+ -
+ -err_switchdev_offload:
+ -	list_del(&bridge_port->list);
+ -	kfree(bridge_port);
+ -	return ERR_PTR(err);
+  }
+  
+  static void
+diff --cc drivers/net/ethernet/rocker/rocker_ofdpa.c
+index fa296a7c255d,b82e169b7836..000000000000
+--- a/drivers/net/ethernet/rocker/rocker_ofdpa.c
++++ b/drivers/net/ethernet/rocker/rocker_ofdpa.c
+@@@ -2618,7 -2594,12 +2618,16 @@@ static int ofdpa_port_bridge_join(struc
+  
+  	ofdpa_port->bridge_dev = bridge;
+  
+++<<<<<<< HEAD
+ +	return ofdpa_port_vlan_add(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
+++=======
++ 	err = ofdpa_port_vlan_add(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
++ 	if (err)
++ 		return err;
++ 
++ 	return switchdev_bridge_port_offload(dev, dev, NULL, NULL, NULL,
++ 					     false, extack);
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+  }
+  
+  static int ofdpa_port_bridge_leave(struct ofdpa_port *ofdpa_port)
+diff --cc include/linux/if_bridge.h
+index f87c7c990fb6,f0b4ffbd8582..000000000000
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@@ -59,6 -56,8 +59,11 @@@ struct br_ip_list 
+  #define BR_ISOLATED		BIT(16)
+  #define BR_MRP_AWARE		BIT(17)
+  #define BR_MRP_LOST_CONT	BIT(18)
+++<<<<<<< HEAD
+++=======
++ #define BR_MRP_LOST_IN_CONT	BIT(19)
++ #define BR_TX_FWD_OFFLOAD	BIT(20)
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+  
+  #define BR_DEFAULT_AGEING_TIME	(300 * HZ)
+  
+@@@ -191,12 -175,40 +196,46 @@@ static inline clock_t br_get_ageing_tim
+  {
+  	return 0;
+  }
+ -#endif
+  
+++<<<<<<< HEAD
+ +static inline int br_fdb_replay(struct net_device *br_dev,
+ +				struct net_device *dev,
+ +				struct notifier_block *nb)
+++=======
++ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
++ 
++ int switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 				  struct net_device *dev, const void *ctx,
++ 				  struct notifier_block *atomic_nb,
++ 				  struct notifier_block *blocking_nb,
++ 				  bool tx_fwd_offload,
++ 				  struct netlink_ext_ack *extack);
++ void switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				     const void *ctx,
++ 				     struct notifier_block *atomic_nb,
++ 				     struct notifier_block *blocking_nb);
++ 
++ #else
++ 
++ static inline int
++ switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 			      struct net_device *dev, const void *ctx,
++ 			      struct notifier_block *atomic_nb,
++ 			      struct notifier_block *blocking_nb,
++ 			      bool tx_fwd_offload,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static inline void
++ switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				const void *ctx,
++ 				struct notifier_block *atomic_nb,
++ 				struct notifier_block *blocking_nb)
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+  {
+ +	return -EOPNOTSUPP;
+  }
+  #endif
+  
+diff --cc net/bridge/br_switchdev.c
+index be7535fa5f0e,96ce069d0c8c..000000000000
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@@ -162,27 -204,172 +204,180 @@@ static void nbp_switchdev_hwdom_put(str
+  	clear_bit(leaving->hwdom, &br->busy_hwdoms);
+  }
+  
+++<<<<<<< HEAD
+ +int nbp_switchdev_add(struct net_bridge_port *p)
+ +{
+ +	struct netdev_phys_item_id ppid = { };
+ +	int err;
+++=======
++ static int nbp_switchdev_add(struct net_bridge_port *p,
++ 			     struct netdev_phys_item_id ppid,
++ 			     bool tx_fwd_offload,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	if (p->offload_count) {
++ 		/* Prevent unsupported configurations such as a bridge port
++ 		 * which is a bonding interface, and the member ports are from
++ 		 * different hardware switches.
++ 		 */
++ 		if (!netdev_phys_item_id_same(&p->ppid, &ppid)) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "Same bridge port cannot be offloaded by two physical switches");
++ 			return -EBUSY;
++ 		}
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+  
+ -		/* Tolerate drivers that call switchdev_bridge_port_offload()
+ -		 * more than once for the same bridge port, such as when the
+ -		 * bridge port is an offloaded bonding/team interface.
+ -		 */
+ -		p->offload_count++;
+ +	ASSERT_RTNL();
+  
+ -		return 0;
+ +	err = dev_get_port_parent_id(p->dev, &ppid, true);
+ +	if (err) {
+ +		if (err == -EOPNOTSUPP)
+ +			return 0;
+ +		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	return nbp_switchdev_hwdom_set(p);
+++=======
++ 	p->ppid = ppid;
++ 	p->offload_count = 1;
++ 
++ 	err = nbp_switchdev_hwdom_set(p);
++ 	if (err)
++ 		return err;
++ 
++ 	if (tx_fwd_offload) {
++ 		p->flags |= BR_TX_FWD_OFFLOAD;
++ 		static_branch_inc(&br_switchdev_tx_fwd_offload);
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+  }
+  
+ -static void nbp_switchdev_del(struct net_bridge_port *p)
+ +void nbp_switchdev_del(struct net_bridge_port *p)
+  {
+ -	if (WARN_ON(!p->offload_count))
+ -		return;
+ -
+ -	p->offload_count--;
+ -
+ -	if (p->offload_count)
+ -		return;
+ +	ASSERT_RTNL();
+  
+  	if (p->hwdom)
+  		nbp_switchdev_hwdom_put(p);
++ 
++ 	if (p->flags & BR_TX_FWD_OFFLOAD) {
++ 		p->flags &= ~BR_TX_FWD_OFFLOAD;
++ 		static_branch_dec(&br_switchdev_tx_fwd_offload);
++ 	}
++ }
+++<<<<<<< HEAD
+++=======
++ 
++ static int nbp_switchdev_sync_objs(struct net_bridge_port *p, const void *ctx,
++ 				   struct notifier_block *atomic_nb,
++ 				   struct notifier_block *blocking_nb,
++ 				   struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *br_dev = p->br->dev;
++ 	struct net_device *dev = p->dev;
++ 	int err;
++ 
++ 	err = br_vlan_replay(br_dev, dev, ctx, true, blocking_nb, extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	err = br_mdb_replay(br_dev, dev, ctx, true, blocking_nb, extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	/* Forwarding and termination FDB entries on the port */
++ 	err = br_fdb_replay(br_dev, dev, ctx, true, atomic_nb);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	/* Termination FDB entries on the bridge itself */
++ 	err = br_fdb_replay(br_dev, br_dev, ctx, true, atomic_nb);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static void nbp_switchdev_unsync_objs(struct net_bridge_port *p,
++ 				      const void *ctx,
++ 				      struct notifier_block *atomic_nb,
++ 				      struct notifier_block *blocking_nb)
++ {
++ 	struct net_device *br_dev = p->br->dev;
++ 	struct net_device *dev = p->dev;
++ 
++ 	br_vlan_replay(br_dev, dev, ctx, false, blocking_nb, NULL);
++ 
++ 	br_mdb_replay(br_dev, dev, ctx, false, blocking_nb, NULL);
++ 
++ 	/* Forwarding and termination FDB entries on the port */
++ 	br_fdb_replay(br_dev, dev, ctx, false, atomic_nb);
++ 
++ 	/* Termination FDB entries on the bridge itself */
++ 	br_fdb_replay(br_dev, br_dev, ctx, false, atomic_nb);
++ }
++ 
++ /* Let the bridge know that this port is offloaded, so that it can assign a
++  * switchdev hardware domain to it.
++  */
++ int switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 				  struct net_device *dev, const void *ctx,
++ 				  struct notifier_block *atomic_nb,
++ 				  struct notifier_block *blocking_nb,
++ 				  bool tx_fwd_offload,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	struct netdev_phys_item_id ppid;
++ 	struct net_bridge_port *p;
++ 	int err;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	p = br_port_get_rtnl(brport_dev);
++ 	if (!p)
++ 		return -ENODEV;
++ 
++ 	err = dev_get_port_parent_id(dev, &ppid, false);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nbp_switchdev_add(p, ppid, tx_fwd_offload, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nbp_switchdev_sync_objs(p, ctx, atomic_nb, blocking_nb, extack);
++ 	if (err)
++ 		goto out_switchdev_del;
++ 
++ 	return 0;
++ 
++ out_switchdev_del:
++ 	nbp_switchdev_del(p);
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(switchdev_bridge_port_offload);
++ 
++ void switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				     const void *ctx,
++ 				     struct notifier_block *atomic_nb,
++ 				     struct notifier_block *blocking_nb)
++ {
++ 	struct net_bridge_port *p;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	p = br_port_get_rtnl(brport_dev);
++ 	if (!p)
++ 		return;
++ 
++ 	nbp_switchdev_unsync_objs(p, ctx, atomic_nb, blocking_nb);
++ 
++ 	nbp_switchdev_del(p);
+  }
++ EXPORT_SYMBOL_GPL(switchdev_bridge_port_unoffload);
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+diff --cc net/dsa/port.c
+index 2d7e01b23572,f2704f101ccf..000000000000
+--- a/net/dsa/port.c
++++ b/net/dsa/port.c
+@@@ -110,12 -248,33 +110,36 @@@ int dsa_port_bridge_join(struct dsa_por
+  	 */
+  	dp->bridge_dev = br;
+  
+ -	brport_dev = dsa_port_to_bridge_port(dp);
+ +	err = dsa_port_notify(dp, DSA_NOTIFIER_BRIDGE_JOIN, &info);
+  
+ -	err = dsa_broadcast(DSA_NOTIFIER_BRIDGE_JOIN, &info);
+ +	/* The bridging is rolled back on error */
+  	if (err)
+ -		goto out_rollback;
+ +		dp->bridge_dev = NULL;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = switchdev_bridge_port_offload(brport_dev, dev, dp,
++ 					    &dsa_slave_switchdev_notifier,
++ 					    &dsa_slave_switchdev_blocking_notifier,
++ 					    false, extack);
++ 	if (err)
++ 		goto out_rollback_unbridge;
++ 
++ 	err = dsa_port_switchdev_sync_attrs(dp, extack);
++ 	if (err)
++ 		goto out_rollback_unoffload;
++ 
++ 	return 0;
++ 
++ out_rollback_unoffload:
++ 	switchdev_bridge_port_unoffload(brport_dev, dp,
++ 					&dsa_slave_switchdev_notifier,
++ 					&dsa_slave_switchdev_blocking_notifier);
++ out_rollback_unbridge:
++ 	dsa_broadcast(DSA_NOTIFIER_BRIDGE_LEAVE, &info);
++ out_rollback:
++ 	dp->bridge_dev = NULL;
+++>>>>>>> 472111920f1c (net: bridge: switchdev: allow the TX data plane forwarding to be offloaded)
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/rocker/rocker_ofdpa.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path include/linux/if_bridge.h
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+index f7e843fb9dc4..6ee897290048 100644
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -52,6 +52,8 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
+ 		skb_set_network_header(skb, depth);
+ 	}
+ 
++	skb->offload_fwd_mark = br_switchdev_frame_uses_tx_fwd_offload(skb);
++
+ 	dev_queue_xmit(skb);
+ 
+ 	return 0;
+@@ -80,6 +82,11 @@ static void __br_forward(const struct net_bridge_port *to,
+ 	struct net *net;
+ 	int br_hook;
+ 
++	/* Mark the skb for forwarding offload early so that br_handle_vlan()
++	 * can know whether to pop the VLAN header on egress or keep it.
++	 */
++	nbp_switchdev_frame_mark_tx_fwd_offload(to, skb);
++
+ 	vg = nbp_vlan_group_rcu(to);
+ 	skb = br_handle_vlan(to->br, to, vg, skb);
+ 	if (!skb)
+@@ -178,6 +185,8 @@ static struct net_bridge_port *maybe_deliver(
+ 	if (!should_deliver(p, skb))
+ 		return prev;
+ 
++	nbp_switchdev_frame_mark_tx_fwd_to_hwdom(p, skb);
++
+ 	if (!prev)
+ 		goto out;
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 30e07225bc94..6967e9fc50c2 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -494,12 +494,20 @@ struct br_input_skb_cb {
+ #endif
+ 
+ #ifdef CONFIG_NET_SWITCHDEV
++	/* Set if TX data plane offloading is used towards at least one
++	 * hardware domain.
++	 */
++	u8 tx_fwd_offload:1;
+ 	/* The switchdev hardware domain from which this packet was received.
+ 	 * If skb->offload_fwd_mark was set, then this packet was already
+ 	 * forwarded by hardware to the other ports in the source hardware
+ 	 * domain, otherwise it wasn't.
+ 	 */
+ 	int src_hwdom;
++	/* Bit mask of hardware domains towards this packet has already been
++	 * transmitted using the TX data plane offload.
++	 */
++	unsigned long fwd_hwdoms;
+ #endif
+ };
+ 
+@@ -1465,6 +1473,12 @@ static inline void br_sysfs_delbr(struct net_device *dev) { return; }
+ 
+ /* br_switchdev.c */
+ #ifdef CONFIG_NET_SWITCHDEV
++bool br_switchdev_frame_uses_tx_fwd_offload(struct sk_buff *skb);
++
++void nbp_switchdev_frame_mark_tx_fwd_offload(const struct net_bridge_port *p,
++					     struct sk_buff *skb);
++void nbp_switchdev_frame_mark_tx_fwd_to_hwdom(const struct net_bridge_port *p,
++					      struct sk_buff *skb);
+ void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
+ 			      struct sk_buff *skb);
+ bool nbp_switchdev_allowed_egress(const struct net_bridge_port *p,
+@@ -1487,6 +1501,23 @@ static inline void br_switchdev_frame_unmark(struct sk_buff *skb)
+ 	skb->offload_fwd_mark = 0;
+ }
+ #else
++static inline bool br_switchdev_frame_uses_tx_fwd_offload(struct sk_buff *skb)
++{
++	return false;
++}
++
++static inline void
++nbp_switchdev_frame_mark_tx_fwd_offload(const struct net_bridge_port *p,
++					struct sk_buff *skb)
++{
++}
++
++static inline void
++nbp_switchdev_frame_mark_tx_fwd_to_hwdom(const struct net_bridge_port *p,
++					 struct sk_buff *skb)
++{
++}
++
+ static inline void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
+ 					    struct sk_buff *skb)
+ {
+* Unmerged path net/bridge/br_switchdev.c
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index b985e572c168..8830134bca7b 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -435,7 +435,15 @@ struct sk_buff *br_handle_vlan(struct net_bridge *br,
+ 		u64_stats_update_end(&stats->syncp);
+ 	}
+ 
+-	if (v->flags & BRIDGE_VLAN_INFO_UNTAGGED)
++	/* If the skb will be sent using forwarding offload, the assumption is
++	 * that the switchdev will inject the packet into hardware together
++	 * with the bridge VLAN, so that it can be forwarded according to that
++	 * VLAN. The switchdev should deal with popping the VLAN header in
++	 * hardware on each egress port as appropriate. So only strip the VLAN
++	 * header if forwarding offload is not being used.
++	 */
++	if (v->flags & BRIDGE_VLAN_INFO_UNTAGGED &&
++	    !br_switchdev_frame_uses_tx_fwd_offload(skb))
+ 		__vlan_hwaccel_clear_tag(skb);
+ 
+ 	if (p && (p->flags & BR_VLAN_TUNNEL) &&
+* Unmerged path net/dsa/port.c
