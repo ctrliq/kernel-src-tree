@@ -1,0 +1,139 @@
+ceph: fix potential bad pointer deref in async dirops cb's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jeff Layton <jlayton@kernel.org>
+commit 2a575f138d003fff0f4930b5cfae4a1c46343b8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2a575f13.failed
+
+The new async dirops callback routines can pass ERR_PTR values to
+ceph_mdsc_free_path, which could cause an oops. Make ceph_mdsc_free_path
+ignore ERR_PTR values. Also, ensure that the pr_warn messages look sane
+even if ceph_mdsc_build_path fails.
+
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Jeff Layton <jlayton@kernel.org>
+	Reviewed-by: Ilya Dryomov <idryomov@gmail.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 2a575f138d003fff0f4930b5cfae4a1c46343b8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+diff --cc fs/ceph/dir.c
+index eebf40d59e6f,4c4202c93b71..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -1040,6 -1040,78 +1040,81 @@@ static int ceph_link(struct dentry *old
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ceph_async_unlink_cb(struct ceph_mds_client *mdsc,
++ 				 struct ceph_mds_request *req)
++ {
++ 	int result = req->r_err ? req->r_err :
++ 			le32_to_cpu(req->r_reply_info.head->result);
++ 
++ 	if (result == -EJUKEBOX)
++ 		goto out;
++ 
++ 	/* If op failed, mark everyone involved for errors */
++ 	if (result) {
++ 		int pathlen = 0;
++ 		u64 base = 0;
++ 		char *path = ceph_mdsc_build_path(req->r_dentry, &pathlen,
++ 						  &base, 0);
++ 
++ 		/* mark error on parent + clear complete */
++ 		mapping_set_error(req->r_parent->i_mapping, result);
++ 		ceph_dir_clear_complete(req->r_parent);
++ 
++ 		/* drop the dentry -- we don't know its status */
++ 		if (!d_unhashed(req->r_dentry))
++ 			d_drop(req->r_dentry);
++ 
++ 		/* mark inode itself for an error (since metadata is bogus) */
++ 		mapping_set_error(req->r_old_inode->i_mapping, result);
++ 
++ 		pr_warn("ceph: async unlink failure path=(%llx)%s result=%d!\n",
++ 			base, IS_ERR(path) ? "<<bad>>" : path, result);
++ 		ceph_mdsc_free_path(path, pathlen);
++ 	}
++ out:
++ 	iput(req->r_old_inode);
++ 	ceph_mdsc_release_dir_caps(req);
++ }
++ 
++ static int get_caps_for_async_unlink(struct inode *dir, struct dentry *dentry)
++ {
++ 	struct ceph_inode_info *ci = ceph_inode(dir);
++ 	struct ceph_dentry_info *di;
++ 	int got = 0, want = CEPH_CAP_FILE_EXCL | CEPH_CAP_DIR_UNLINK;
++ 
++ 	spin_lock(&ci->i_ceph_lock);
++ 	if ((__ceph_caps_issued(ci, NULL) & want) == want) {
++ 		ceph_take_cap_refs(ci, want, false);
++ 		got = want;
++ 	}
++ 	spin_unlock(&ci->i_ceph_lock);
++ 
++ 	/* If we didn't get anything, return 0 */
++ 	if (!got)
++ 		return 0;
++ 
++         spin_lock(&dentry->d_lock);
++         di = ceph_dentry(dentry);
++ 	/*
++ 	 * - We are holding Fx, which implies Fs caps.
++ 	 * - Only support async unlink for primary linkage
++ 	 */
++ 	if (atomic_read(&ci->i_shared_gen) != di->lease_shared_gen ||
++ 	    !(di->flags & CEPH_DENTRY_PRIMARY_LINK))
++ 		want = 0;
++         spin_unlock(&dentry->d_lock);
++ 
++ 	/* Do we still want what we've got? */
++ 	if (want == got)
++ 		return got;
++ 
++ 	ceph_put_cap_refs(ci, got);
++ 	return 0;
++ }
++ 
+++>>>>>>> 2a575f138d00 (ceph: fix potential bad pointer deref in async dirops cb's)
+  /*
+   * rmdir and unlink are differ only by the metadata op code
+   */
+* Unmerged path fs/ceph/dir.c
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 7ba1123096b2..9ef22589768f 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -510,8 +510,8 @@ static void ceph_async_create_cb(struct ceph_mds_client *mdsc,
+ 
+ 	if (result) {
+ 		struct dentry *dentry = req->r_dentry;
+-		int pathlen;
+-		u64 base;
++		int pathlen = 0;
++		u64 base = 0;
+ 		char *path = ceph_mdsc_build_path(req->r_dentry, &pathlen,
+ 						  &base, 0);
+ 
+diff --git a/fs/ceph/mds_client.h b/fs/ceph/mds_client.h
+index 4e5be79bf080..903d9edfd4bf 100644
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -521,7 +521,7 @@ extern void ceph_mdsc_pre_umount(struct ceph_mds_client *mdsc);
+ 
+ static inline void ceph_mdsc_free_path(char *path, int len)
+ {
+-	if (path)
++	if (!IS_ERR_OR_NULL(path))
+ 		__putname(path - (PATH_MAX - 1 - len));
+ }
+ 
