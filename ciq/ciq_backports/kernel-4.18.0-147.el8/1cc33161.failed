@@ -1,0 +1,237 @@
+uprobes: Support SDT markers having reference count (semaphore)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit 1cc33161a83d20b5462b1e93f95d3ce6388079ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/1cc33161.failed
+
+Userspace Statically Defined Tracepoints[1] are dtrace style markers
+inside userspace applications. Applications like PostgreSQL, MySQL,
+Pthread, Perl, Python, Java, Ruby, Node.js, libvirt, QEMU, glib etc
+have these markers embedded in them. These markers are added by developer
+at important places in the code. Each marker source expands to a single
+nop instruction in the compiled code but there may be additional
+overhead for computing the marker arguments which expands to couple of
+instructions. In case the overhead is more, execution of it can be
+omitted by runtime if() condition when no one is tracing on the marker:
+
+    if (reference_counter > 0) {
+        Execute marker instructions;
+    }
+
+Default value of reference counter is 0. Tracer has to increment the
+reference counter before tracing on a marker and decrement it when
+done with the tracing.
+
+Implement the reference counter logic in core uprobe. User will be
+able to use it from trace_uprobe as well as from kernel module. New
+trace_uprobe definition with reference counter will now be:
+
+    <path>:<offset>[(ref_ctr_offset)]
+
+where ref_ctr_offset is an optional field. For kernel module, new
+variant of uprobe_register() has been introduced:
+
+    uprobe_register_refctr(inode, offset, ref_ctr_offset, consumer)
+
+No new variant for uprobe_unregister() because it's assumed to have
+only one reference counter for one uprobe.
+
+[1] https://sourceware.org/systemtap/wiki/UserSpaceProbeImplementation
+
+Note: 'reference counter' is called as 'semaphore' in original Dtrace
+(or Systemtap, bcc and even in ELF) documentation and code. But the
+term 'semaphore' is misleading in this context. This is just a counter
+used to hold number of tracers tracing on a marker. This is not really
+used for any synchronization. So we are calling it a 'reference counter'
+in kernel / perf code.
+
+Link: http://lkml.kernel.org/r/20180820044250.11659-2-ravi.bangoria@linux.ibm.com
+
+	Reviewed-by: Masami Hiramatsu <mhiramat@kernel.org>
+[Only trace_uprobe.c]
+	Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Song Liu <songliubraving@fb.com>
+	Tested-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit 1cc33161a83d20b5462b1e93f95d3ce6388079ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/uprobes.c
+diff --cc kernel/events/uprobes.c
+index 85aea4cff4cb,934feb39f6be..000000000000
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@@ -878,7 -1091,8 +1075,12 @@@ static void __uprobe_unregister(struct 
+   * Return errno if it cannot successully install probes
+   * else return 0 (success)
+   */
+++<<<<<<< HEAD
+ +int uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *uc)
+++=======
++ static int __uprobe_register(struct inode *inode, loff_t offset,
++ 			     loff_t ref_ctr_offset, struct uprobe_consumer *uc)
+++>>>>>>> 1cc33161a83d (uprobes: Support SDT markers having reference count (semaphore))
+  {
+  	struct uprobe *uprobe;
+  	int ret;
+@@@ -916,8 -1131,21 +1118,24 @@@
+  		goto retry;
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int uprobe_register(struct inode *inode, loff_t offset,
++ 		    struct uprobe_consumer *uc)
++ {
++ 	return __uprobe_register(inode, offset, 0, uc);
++ }
+++>>>>>>> 1cc33161a83d (uprobes: Support SDT markers having reference count (semaphore))
+  EXPORT_SYMBOL_GPL(uprobe_register);
+  
++ int uprobe_register_refctr(struct inode *inode, loff_t offset,
++ 			   loff_t ref_ctr_offset, struct uprobe_consumer *uc)
++ {
++ 	return __uprobe_register(inode, offset, ref_ctr_offset, uc);
++ }
++ EXPORT_SYMBOL_GPL(uprobe_register_refctr);
++ 
+  /*
+   * uprobe_apply - unregister an already registered probe.
+   * @inode: the file in which the probe has to be removed.
+diff --git a/include/linux/uprobes.h b/include/linux/uprobes.h
+index bb9d2084af03..103a48a48872 100644
+--- a/include/linux/uprobes.h
++++ b/include/linux/uprobes.h
+@@ -123,6 +123,7 @@ extern unsigned long uprobe_get_swbp_addr(struct pt_regs *regs);
+ extern unsigned long uprobe_get_trap_addr(struct pt_regs *regs);
+ extern int uprobe_write_opcode(struct arch_uprobe *auprobe, struct mm_struct *mm, unsigned long vaddr, uprobe_opcode_t);
+ extern int uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *uc);
++extern int uprobe_register_refctr(struct inode *inode, loff_t offset, loff_t ref_ctr_offset, struct uprobe_consumer *uc);
+ extern int uprobe_apply(struct inode *inode, loff_t offset, struct uprobe_consumer *uc, bool);
+ extern void uprobe_unregister(struct inode *inode, loff_t offset, struct uprobe_consumer *uc);
+ extern int uprobe_mmap(struct vm_area_struct *vma);
+@@ -160,6 +161,10 @@ uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *uc)
+ {
+ 	return -ENOSYS;
+ }
++static inline int uprobe_register_refctr(struct inode *inode, loff_t offset, loff_t ref_ctr_offset, struct uprobe_consumer *uc)
++{
++	return -ENOSYS;
++}
+ static inline int
+ uprobe_apply(struct inode *inode, loff_t offset, struct uprobe_consumer *uc, bool add)
+ {
+* Unmerged path kernel/events/uprobes.c
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 2378bb4f1442..1236485b8232 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -4620,7 +4620,7 @@ static const char readme_msg[] =
+   "place (kretprobe): [<module>:]<symbol>[+<offset>]|<memaddr>\n"
+ #endif
+ #ifdef CONFIG_UPROBE_EVENTS
+-	"\t    place: <path>:<offset>\n"
++  "   place (uprobe): <path>:<offset>[(ref_ctr_offset)]\n"
+ #endif
+ 	"\t     args: <name>=fetcharg[:type]\n"
+ 	"\t fetcharg: %<register>, @<address>, @<symbol>[+|-<offset>],\n"
+diff --git a/kernel/trace/trace_uprobe.c b/kernel/trace/trace_uprobe.c
+index bf89a51e740d..bf2be098eb08 100644
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@ -59,6 +59,7 @@ struct trace_uprobe {
+ 	struct inode			*inode;
+ 	char				*filename;
+ 	unsigned long			offset;
++	unsigned long			ref_ctr_offset;
+ 	unsigned long			nhit;
+ 	struct trace_probe		tp;
+ };
+@@ -364,10 +365,10 @@ static int register_trace_uprobe(struct trace_uprobe *tu)
+ static int create_trace_uprobe(int argc, char **argv)
+ {
+ 	struct trace_uprobe *tu;
+-	char *arg, *event, *group, *filename;
++	char *arg, *event, *group, *filename, *rctr, *rctr_end;
+ 	char buf[MAX_EVENT_NAME_LEN];
+ 	struct path path;
+-	unsigned long offset;
++	unsigned long offset, ref_ctr_offset;
+ 	bool is_delete, is_return;
+ 	int i, ret;
+ 
+@@ -376,6 +377,7 @@ static int create_trace_uprobe(int argc, char **argv)
+ 	is_return = false;
+ 	event = NULL;
+ 	group = NULL;
++	ref_ctr_offset = 0;
+ 
+ 	/* argc must be >= 1 */
+ 	if (argv[0][0] == '-')
+@@ -450,6 +452,26 @@ static int create_trace_uprobe(int argc, char **argv)
+ 		goto fail_address_parse;
+ 	}
+ 
++	/* Parse reference counter offset if specified. */
++	rctr = strchr(arg, '(');
++	if (rctr) {
++		rctr_end = strchr(rctr, ')');
++		if (rctr > rctr_end || *(rctr_end + 1) != 0) {
++			ret = -EINVAL;
++			pr_info("Invalid reference counter offset.\n");
++			goto fail_address_parse;
++		}
++
++		*rctr++ = '\0';
++		*rctr_end = '\0';
++		ret = kstrtoul(rctr, 0, &ref_ctr_offset);
++		if (ret) {
++			pr_info("Invalid reference counter offset.\n");
++			goto fail_address_parse;
++		}
++	}
++
++	/* Parse uprobe offset. */
+ 	ret = kstrtoul(arg, 0, &offset);
+ 	if (ret)
+ 		goto fail_address_parse;
+@@ -484,6 +506,7 @@ static int create_trace_uprobe(int argc, char **argv)
+ 		goto fail_address_parse;
+ 	}
+ 	tu->offset = offset;
++	tu->ref_ctr_offset = ref_ctr_offset;
+ 	tu->path = path;
+ 	tu->filename = kstrdup(filename, GFP_KERNEL);
+ 
+@@ -602,6 +625,9 @@ static int probes_seq_show(struct seq_file *m, void *v)
+ 			trace_event_name(&tu->tp.call), tu->filename,
+ 			(int)(sizeof(void *) * 2), tu->offset);
+ 
++	if (tu->ref_ctr_offset)
++		seq_printf(m, "(0x%lx)", tu->ref_ctr_offset);
++
+ 	for (i = 0; i < tu->tp.nr_args; i++)
+ 		seq_printf(m, " %s=%s", tu->tp.args[i].name, tu->tp.args[i].comm);
+ 
+@@ -917,7 +943,13 @@ probe_event_enable(struct trace_uprobe *tu, struct trace_event_file *file,
+ 
+ 	tu->consumer.filter = filter;
+ 	tu->inode = d_real_inode(tu->path.dentry);
+-	ret = uprobe_register(tu->inode, tu->offset, &tu->consumer);
++	if (tu->ref_ctr_offset) {
++		ret = uprobe_register_refctr(tu->inode, tu->offset,
++				tu->ref_ctr_offset, &tu->consumer);
++	} else {
++		ret = uprobe_register(tu->inode, tu->offset, &tu->consumer);
++	}
++
+ 	if (ret)
+ 		goto err_buffer;
+ 
