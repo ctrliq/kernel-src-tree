@@ -1,0 +1,534 @@
+IB/rdmavt: Fracture single lock used for posting and processing RWQEs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Kamenee Arumugam <kamenee.arumugam@intel.com>
+commit f592ae3c999fbe4faeeb90dfde8ff7da49ee4ae6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f592ae3c.failed
+
+Usage of single lock prevents fetching posted and processing receive work
+queue entries from progressing simultaneously and impacts overall
+performance.
+
+Fracture the single lock used for posting and processing Receive Work
+Queue Entries (RWQEs) to allow the circular buffer to be filled and
+emptied at the same time. Two new spinlocks - one for the producers and
+one for the consumers used for posting and processing RWQEs simultaneously
+and the two indices are define on two different cache lines. The threshold
+count is used to avoid reading other index in different cache line every
+time.
+
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Kamenee Arumugam <kamenee.arumugam@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit f592ae3c999fbe4faeeb90dfde8ff7da49ee4ae6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/qp.c
+#	drivers/infiniband/sw/rdmavt/rc.c
+#	include/rdma/rdmavt_qp.h
+diff --cc drivers/infiniband/sw/rdmavt/qp.c
+index 3db1c30a9837,200b292be63e..000000000000
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@@ -802,6 -805,47 +804,50 @@@ static void rvt_remove_qp(struct rvt_de
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * rvt_alloc_rq - allocate memory for user or kernel buffer
++  * @rq: receive queue data structure
++  * @size: number of request queue entries
++  * @node: The NUMA node
++  * @udata: True if user data is available or not false
++  *
++  * Return: If memory allocation failed, return -ENONEM
++  * This function is used by both shared receive
++  * queues and non-shared receive queues to allocate
++  * memory.
++  */
++ int rvt_alloc_rq(struct rvt_rq *rq, u32 size, int node,
++ 		 struct ib_udata *udata)
++ {
++ 	if (udata) {
++ 		rq->wq = vmalloc_user(sizeof(struct rvt_rwq) + size);
++ 		if (!rq->wq)
++ 			goto bail;
++ 		/* need kwq with no buffers */
++ 		rq->kwq = kzalloc_node(sizeof(*rq->kwq), GFP_KERNEL, node);
++ 		if (!rq->kwq)
++ 			goto bail;
++ 		rq->kwq->curr_wq = rq->wq->wq;
++ 	} else {
++ 		/* need kwq with buffers */
++ 		rq->kwq =
++ 			vzalloc_node(sizeof(struct rvt_krwq) + size, node);
++ 		if (!rq->kwq)
++ 			goto bail;
++ 		rq->kwq->curr_wq = rq->kwq->wq;
++ 	}
++ 
++ 	spin_lock_init(&rq->kwq->p_lock);
++ 	spin_lock_init(&rq->kwq->c_lock);
++ 	return 0;
++ bail:
++ 	rvt_free_rq(rq);
++ 	return -ENOMEM;
++ }
++ 
++ /**
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+   * rvt_init_qp - initialize the QP state to the reset state
+   * @qp: the QP to init or reinit
+   * @type: the QP type
+@@@ -851,10 -895,8 +897,15 @@@ static void rvt_init_qp(struct rvt_dev_
+  	qp->s_tail_ack_queue = 0;
+  	qp->s_acked_ack_queue = 0;
+  	qp->s_num_rd_atomic = 0;
+++<<<<<<< HEAD
+ +	if (qp->r_rq.wq) {
+ +		qp->r_rq.wq->head = 0;
+ +		qp->r_rq.wq->tail = 0;
+ +	}
+++=======
++ 	if (qp->r_rq.kwq)
++ 		qp->r_rq.kwq->count = qp->r_rq.size;
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  	qp->r_sge.num_sge = 0;
+  	atomic_set(&qp->s_reserved_used, 0);
+  }
+@@@ -1269,19 -1303,26 +1319,33 @@@ int rvt_error_qp(struct rvt_qp *qp, enu
+  	}
+  	wc.status = IB_WC_WR_FLUSH_ERR;
+  
+ -	if (qp->r_rq.kwq) {
+ +	if (qp->r_rq.wq) {
+ +		struct rvt_rwq *wq;
+  		u32 head;
+  		u32 tail;
+ -		struct rvt_rwq *wq = NULL;
+ -		struct rvt_krwq *kwq = NULL;
+  
+++<<<<<<< HEAD
+ +		spin_lock(&qp->r_rq.lock);
+ +
+++=======
++ 		spin_lock(&qp->r_rq.kwq->c_lock);
++ 		/* qp->ip used to validate if there is a  user buffer mmaped */
++ 		if (qp->ip) {
++ 			wq = qp->r_rq.wq;
++ 			head = RDMA_READ_UAPI_ATOMIC(wq->head);
++ 			tail = RDMA_READ_UAPI_ATOMIC(wq->tail);
++ 		} else {
++ 			kwq = qp->r_rq.kwq;
++ 			head = kwq->head;
++ 			tail = kwq->tail;
++ 		}
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  		/* sanity check pointers before trusting them */
+ +		wq = qp->r_rq.wq;
+ +		head = wq->head;
+  		if (head >= qp->r_rq.size)
+  			head = 0;
+ +		tail = wq->tail;
+  		if (tail >= qp->r_rq.size)
+  			tail = 0;
+  		while (tail != head) {
+@@@ -1290,9 -1331,11 +1354,17 @@@
+  				tail = 0;
+  			rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc, 1);
+  		}
+++<<<<<<< HEAD
+ +		wq->tail = tail;
+ +
+ +		spin_unlock(&qp->r_rq.lock);
+++=======
++ 		if (qp->ip)
++ 			RDMA_WRITE_UAPI_ATOMIC(wq->tail, tail);
++ 		else
++ 			kwq->tail = tail;
++ 		spin_unlock(&qp->r_rq.kwq->c_lock);
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  	} else if (qp->ibqp.event_handler) {
+  		ret = 1;
+  	}
+@@@ -1746,8 -1788,8 +1818,13 @@@ int rvt_post_recv(struct ib_qp *ibqp, c
+  		next = wq->head + 1;
+  		if (next >= qp->r_rq.size)
+  			next = 0;
+++<<<<<<< HEAD
+ +		if (next == wq->tail) {
+ +			spin_unlock_irqrestore(&qp->r_rq.lock, flags);
+++=======
++ 		if (next == READ_ONCE(wq->tail)) {
++ 			spin_unlock_irqrestore(&qp->r_rq.kwq->p_lock, flags);
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  			*bad_wr = wr;
+  			return -ENOMEM;
+  		}
+@@@ -1770,10 -1812,9 +1847,10 @@@
+  			 * Make sure queue entry is written
+  			 * before the head index.
+  			 */
+ -			smp_store_release(&wq->head, next);
+ +			smp_wmb();
+ +			wq->head = next;
+  		}
+- 		spin_unlock_irqrestore(&qp->r_rq.lock, flags);
++ 		spin_unlock_irqrestore(&qp->r_rq.kwq->p_lock, flags);
+  	}
+  	return 0;
+  }
+@@@ -2154,13 -2195,13 +2231,23 @@@ int rvt_post_srq_recv(struct ib_srq *ib
+  			return -EINVAL;
+  		}
+  
+++<<<<<<< HEAD
+ +		spin_lock_irqsave(&srq->rq.lock, flags);
+ +		wq = srq->rq.wq;
+ +		next = wq->head + 1;
+ +		if (next >= srq->rq.size)
+ +			next = 0;
+ +		if (next == wq->tail) {
+ +			spin_unlock_irqrestore(&srq->rq.lock, flags);
+++=======
++ 		spin_lock_irqsave(&srq->rq.kwq->p_lock, flags);
++ 		wq = srq->rq.kwq;
++ 		next = wq->head + 1;
++ 		if (next >= srq->rq.size)
++ 			next = 0;
++ 		if (next == READ_ONCE(wq->tail)) {
++ 			spin_unlock_irqrestore(&srq->rq.kwq->p_lock, flags);
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  			*bad_wr = wr;
+  			return -ENOMEM;
+  		}
+@@@ -2171,9 -2212,8 +2258,14 @@@
+  		for (i = 0; i < wr->num_sge; i++)
+  			wqe->sg_list[i] = wr->sg_list[i];
+  		/* Make sure queue entry is written before the head index. */
+++<<<<<<< HEAD
+ +		smp_wmb();
+ +		wq->head = next;
+ +		spin_unlock_irqrestore(&srq->rq.lock, flags);
+++=======
++ 		smp_store_release(&wq->head, next);
++ 		spin_unlock_irqrestore(&srq->rq.kwq->p_lock, flags);
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  	}
+  	return 0;
+  }
+@@@ -2230,6 -2270,50 +2322,53 @@@ bad_lkey
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * get_count - count numbers of request work queue entries
++  * in circular buffer
++  * @rq: data structure for request queue entry
++  * @tail: tail indices of the circular buffer
++  * @head: head indices of the circular buffer
++  *
++  * Return - total number of entries in the circular buffer
++  */
++ static u32 get_count(struct rvt_rq *rq, u32 tail, u32 head)
++ {
++ 	u32 count;
++ 
++ 	count = head;
++ 
++ 	if (count >= rq->size)
++ 		count = 0;
++ 	if (count < tail)
++ 		count += rq->size - tail;
++ 	else
++ 		count -= tail;
++ 
++ 	return count;
++ }
++ 
++ /**
++  * get_rvt_head - get head indices of the circular buffer
++  * @rq: data structure for request queue entry
++  * @ip: the QP
++  *
++  * Return - head index value
++  */
++ static inline u32 get_rvt_head(struct rvt_rq *rq, void *ip)
++ {
++ 	u32 head;
++ 
++ 	if (ip)
++ 		head = RDMA_READ_UAPI_ATOMIC(rq->wq->head);
++ 	else
++ 		head = rq->kwq->head;
++ 
++ 	return head;
++ }
++ 
++ /**
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+   * rvt_get_rwqe - copy the next RWQE into the QP's RWQE
+   * @qp: the QP
+   * @wr_id_only: update qp->r_wr_id only, not qp->r_sge
+@@@ -2243,6 -2327,7 +2382,10 @@@ int rvt_get_rwqe(struct rvt_qp *qp, boo
+  {
+  	unsigned long flags;
+  	struct rvt_rq *rq;
+++<<<<<<< HEAD
+++=======
++ 	struct rvt_krwq *kwq = NULL;
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  	struct rvt_rwq *wq;
+  	struct rvt_srq *srq;
+  	struct rvt_rwqe *wqe;
+@@@ -2258,20 -2346,31 +2401,39 @@@
+  		srq = NULL;
+  		handler = NULL;
+  		rq = &qp->r_rq;
+ -		ip = qp->ip;
+  	}
+  
+- 	spin_lock_irqsave(&rq->lock, flags);
++ 	spin_lock_irqsave(&rq->kwq->c_lock, flags);
+  	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK)) {
+  		ret = 0;
+  		goto unlock;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	kwq = rq->kwq;
++ 	if (ip) {
++ 		wq = rq->wq;
++ 		tail = RDMA_READ_UAPI_ATOMIC(wq->tail);
++ 	} else {
++ 		tail = kwq->tail;
++ 	}
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  
+ +	wq = rq->wq;
+ +	tail = wq->tail;
+  	/* Validate tail before using it since it is user writable. */
+  	if (tail >= rq->size)
+  		tail = 0;
+++<<<<<<< HEAD
+ +	if (unlikely(tail == wq->head)) {
+++=======
++ 
++ 	if (kwq->count < RVT_RWQ_COUNT_THRESHOLD) {
++ 		head = get_rvt_head(rq, ip);
++ 		kwq->count = get_count(rq, tail, head);
++ 	}
++ 	if (unlikely(kwq->count == 0)) {
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  		ret = 0;
+  		goto unlock;
+  	}
+@@@ -2301,23 -2402,19 +2462,31 @@@
+  		 * Validate head pointer value and compute
+  		 * the number of remaining WQEs.
+  		 */
+++<<<<<<< HEAD
+ +		n = wq->head;
+ +		if (n >= rq->size)
+ +			n = 0;
+ +		if (n < tail)
+ +			n += rq->size - tail;
+ +		else
+ +			n -= tail;
+ +		if (n < srq->limit) {
+ +			struct ib_event ev;
+- 
+- 			srq->limit = 0;
+- 			spin_unlock_irqrestore(&rq->lock, flags);
+- 			ev.device = qp->ibqp.device;
+- 			ev.element.srq = qp->ibqp.srq;
+- 			ev.event = IB_EVENT_SRQ_LIMIT_REACHED;
+- 			handler(&ev, srq->ibsrq.srq_context);
+- 			goto bail;
+++=======
++ 		if (kwq->count < srq->limit) {
++ 			kwq->count = get_count(rq, tail, get_rvt_head(rq, ip));
++ 			if (kwq->count < srq->limit) {
++ 				struct ib_event ev;
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
++ 
++ 				srq->limit = 0;
++ 				spin_unlock_irqrestore(&rq->kwq->c_lock, flags);
++ 				ev.device = qp->ibqp.device;
++ 				ev.element.srq = qp->ibqp.srq;
++ 				ev.event = IB_EVENT_SRQ_LIMIT_REACHED;
++ 				handler(&ev, srq->ibsrq.srq_context);
++ 				goto bail;
++ 			}
+  		}
+  	}
+  unlock:
+diff --cc drivers/infiniband/sw/rdmavt/rc.c
+index 09f0cf538be6,890d7b760d2e..000000000000
+--- a/drivers/infiniband/sw/rdmavt/rc.c
++++ b/drivers/infiniband/sw/rdmavt/rc.c
+@@@ -108,22 -107,30 +108,49 @@@ __be32 rvt_compute_aeth(struct rvt_qp *
+  		u32 head;
+  		u32 tail;
+  
+++<<<<<<< HEAD
+ +		/* sanity check pointers before trusting them */
+ +		head = wq->head;
+ +		if (head >= qp->r_rq.size)
+ +			head = 0;
+ +		tail = wq->tail;
+ +		if (tail >= qp->r_rq.size)
+ +			tail = 0;
+ +		/*
+ +		 * Compute the number of credits available (RWQEs).
+ +		 * There is a small chance that the pair of reads are
+ +		 * not atomic, which is OK, since the fuzziness is
+ +		 * resolved as further ACKs go out.
+ +		 */
+ +		credits = head - tail;
+ +		if ((int)credits < 0)
+ +			credits += qp->r_rq.size;
+++=======
++ 		credits = READ_ONCE(qp->r_rq.kwq->count);
++ 		if (credits == 0) {
++ 			/* sanity check pointers before trusting them */
++ 			if (qp->ip) {
++ 				head = RDMA_READ_UAPI_ATOMIC(qp->r_rq.wq->head);
++ 				tail = RDMA_READ_UAPI_ATOMIC(qp->r_rq.wq->tail);
++ 			} else {
++ 				head = READ_ONCE(qp->r_rq.kwq->head);
++ 				tail = READ_ONCE(qp->r_rq.kwq->tail);
++ 			}
++ 			if (head >= qp->r_rq.size)
++ 				head = 0;
++ 			if (tail >= qp->r_rq.size)
++ 				tail = 0;
++ 			/*
++ 			 * Compute the number of credits available (RWQEs).
++ 			 * There is a small chance that the pair of reads are
++ 			 * not atomic, which is OK, since the fuzziness is
++ 			 * resolved as further ACKs go out.
++ 			 */
++ 			credits = head - tail;
++ 			if ((int)credits < 0)
++ 				credits += qp->r_rq.size;
++ 		}
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  		/*
+  		 * Binary search the credit table to find the code to
+  		 * use.
+diff --cc include/rdma/rdmavt_qp.h
+index 84d0f36afc2f,de5915b244be..000000000000
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@@ -177,29 -178,29 +177,56 @@@ struct rvt_swqe 
+  	struct rvt_sge sg_list[0];
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + * Receive work request queue entry.
+ + * The size of the sg_list is determined when the QP (or SRQ) is created
+ + * and stored in qp->r_rq.max_sge (or srq->rq.max_sge).
+ + */
+ +struct rvt_rwqe {
+ +	u64 wr_id;
+ +	u8 num_sge;
+ +	struct ib_sge sg_list[0];
+ +};
+ +
+ +/*
+ + * This structure is used to contain the head pointer, tail pointer,
+ + * and receive work queue entries as a single memory allocation so
+ + * it can be mmap'ed into user space.
+ + * Note that the wq array elements are variable size so you can't
+ + * just index into the array to get the N'th element;
+ + * use get_rwqe_ptr() instead.
+ + */
+ +struct rvt_rwq {
+++=======
++ /**
++  * struct rvt_krwq - kernel struct receive work request
++  * @p_lock: lock to protect producer of the kernel buffer
++  * @head: index of next entry to fill
++  * @c_lock:lock to protect consumer of the kernel buffer
++  * @tail: index of next entry to pull
++  * @count: count is aproximate of total receive enteries posted
++  * @rvt_rwqe: struct of receive work request queue entry
++  *
++  * This structure is used to contain the head pointer,
++  * tail pointer and receive work queue entries for kernel
++  * mode user.
++  */
++ struct rvt_krwq {
++ 	spinlock_t p_lock;	/* protect producer */
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  	u32 head;               /* new work requests posted to the head */
++ 
++ 	/* protect consumer */
++ 	spinlock_t c_lock ____cacheline_aligned_in_smp;
+  	u32 tail;               /* receives pull requests from here. */
+++<<<<<<< HEAD
+ +	struct rvt_rwqe wq[0];
+++=======
++ 	u32 count;		/* approx count of receive entries posted */
++ 	struct rvt_rwqe *curr_wq;
++ 	struct rvt_rwqe wq[];
+++>>>>>>> f592ae3c999f (IB/rdmavt: Fracture single lock used for posting and processing RWQEs)
+  };
+  
+  struct rvt_rq {
+* Unmerged path drivers/infiniband/sw/rdmavt/qp.c
+* Unmerged path drivers/infiniband/sw/rdmavt/rc.c
+diff --git a/drivers/infiniband/sw/rdmavt/srq.c b/drivers/infiniband/sw/rdmavt/srq.c
+index 78e06fc456c5..913657121513 100644
+--- a/drivers/infiniband/sw/rdmavt/srq.c
++++ b/drivers/infiniband/sw/rdmavt/srq.c
+@@ -223,7 +223,7 @@ int rvt_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 				goto bail_free;
+ 		}
+ 
+-		spin_lock_irq(&srq->rq.lock);
++		spin_lock_irq(&srq->rq.kwq->c_lock);
+ 		/*
+ 		 * validate head and tail pointer values and compute
+ 		 * the number of remaining WQEs.
+@@ -266,7 +266,7 @@ int rvt_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 		wq->tail = 0;
+ 		if (attr_mask & IB_SRQ_LIMIT)
+ 			srq->limit = attr->srq_limit;
+-		spin_unlock_irq(&srq->rq.lock);
++		spin_unlock_irq(&srq->rq.kwq->c_lock);
+ 
+ 		vfree(owq);
+ 
+@@ -299,17 +299,17 @@ int rvt_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 			spin_unlock_irq(&dev->pending_lock);
+ 		}
+ 	} else if (attr_mask & IB_SRQ_LIMIT) {
+-		spin_lock_irq(&srq->rq.lock);
++		spin_lock_irq(&srq->rq.kwq->c_lock);
+ 		if (attr->srq_limit >= srq->rq.size)
+ 			ret = -EINVAL;
+ 		else
+ 			srq->limit = attr->srq_limit;
+-		spin_unlock_irq(&srq->rq.lock);
++		spin_unlock_irq(&srq->rq.kwq->c_lock);
+ 	}
+ 	return ret;
+ 
+ bail_unlock:
+-	spin_unlock_irq(&srq->rq.lock);
++	spin_unlock_irq(&srq->rq.kwq->c_lock);
+ bail_free:
+ 	vfree(wq);
+ 	return ret;
+* Unmerged path include/rdma/rdmavt_qp.h
