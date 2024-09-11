@@ -1,0 +1,103 @@
+io_uring: fix error clear of ->file_table in io_sqe_files_register()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 46568e9be70ff8211d986685f08d919376c32998
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/46568e9b.failed
+
+syzbot reports that when using failslab and friends, we can get a double
+free in io_sqe_files_unregister():
+
+BUG: KASAN: double-free or invalid-free in
+io_sqe_files_unregister+0x20b/0x300 fs/io_uring.c:3185
+
+CPU: 1 PID: 8819 Comm: syz-executor452 Not tainted 5.4.0-rc6-next-20191108
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+Google 01/01/2011
+Call Trace:
+  __dump_stack lib/dump_stack.c:77 [inline]
+  dump_stack+0x197/0x210 lib/dump_stack.c:118
+  print_address_description.constprop.0.cold+0xd4/0x30b mm/kasan/report.c:374
+  kasan_report_invalid_free+0x65/0xa0 mm/kasan/report.c:468
+  __kasan_slab_free+0x13a/0x150 mm/kasan/common.c:450
+  kasan_slab_free+0xe/0x10 mm/kasan/common.c:480
+  __cache_free mm/slab.c:3426 [inline]
+  kfree+0x10a/0x2c0 mm/slab.c:3757
+  io_sqe_files_unregister+0x20b/0x300 fs/io_uring.c:3185
+  io_ring_ctx_free fs/io_uring.c:3998 [inline]
+  io_ring_ctx_wait_and_kill+0x348/0x700 fs/io_uring.c:4060
+  io_uring_release+0x42/0x50 fs/io_uring.c:4068
+  __fput+0x2ff/0x890 fs/file_table.c:280
+  ____fput+0x16/0x20 fs/file_table.c:313
+  task_work_run+0x145/0x1c0 kernel/task_work.c:113
+  exit_task_work include/linux/task_work.h:22 [inline]
+  do_exit+0x904/0x2e60 kernel/exit.c:817
+  do_group_exit+0x135/0x360 kernel/exit.c:921
+  __do_sys_exit_group kernel/exit.c:932 [inline]
+  __se_sys_exit_group kernel/exit.c:930 [inline]
+  __x64_sys_exit_group+0x44/0x50 kernel/exit.c:930
+  do_syscall_64+0xfa/0x760 arch/x86/entry/common.c:290
+  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+RIP: 0033:0x43f2c8
+Code: 31 b8 c5 f7 ff ff 48 8b 5c 24 28 48 8b 6c 24 30 4c 8b 64 24 38 4c 8b
+6c 24 40 4c 8b 74 24 48 4c 8b 7c 24 50 48 83 c4 58 c3 66 <0f> 1f 84 00 00
+00 00 00 48 8d 35 59 ca 00 00 0f b6 d2 48 89 fb 48
+RSP: 002b:00007ffd5b976008 EFLAGS: 00000246 ORIG_RAX: 00000000000000e7
+RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 000000000043f2c8
+RDX: 0000000000000000 RSI: 000000000000003c RDI: 0000000000000000
+RBP: 00000000004bf0a8 R08: 00000000000000e7 R09: ffffffffffffffd0
+R10: 0000000000000001 R11: 0000000000000246 R12: 0000000000000001
+R13: 00000000006d1180 R14: 0000000000000000 R15: 0000000000000000
+
+This happens if we fail allocating the file tables. For that case we do
+free the file table correctly, but we forget to set it to NULL. This
+means that ring teardown will see it as being non-NULL, and attempt to
+free it again.
+
+Fix this by clearing the file_table pointer if we free the table.
+
+	Reported-by: syzbot+3254bc44113ae1e331ee@syzkaller.appspotmail.com
+Fixes: 65e19f54d29c ("io_uring: support for larger fixed file sets")
+	Reviewed-by: Bob Liu <bob.liu@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 46568e9be70ff8211d986685f08d919376c32998)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index fca9cdc96d77,737c311c6da5..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2904,11 -3480,22 +2904,20 @@@ static int io_sqe_files_register(struc
+  	if (nr_args > IORING_MAX_FIXED_FILES)
+  		return -EMFILE;
+  
+ -	nr_tables = DIV_ROUND_UP(nr_args, IORING_MAX_FILES_TABLE);
+ -	ctx->file_table = kcalloc(nr_tables, sizeof(struct fixed_file_table),
+ -					GFP_KERNEL);
+ -	if (!ctx->file_table)
+ +	ctx->user_files = kcalloc(nr_args, sizeof(struct file *), GFP_KERNEL);
+ +	if (!ctx->user_files)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (io_sqe_alloc_file_tables(ctx, nr_tables, nr_args)) {
++ 		kfree(ctx->file_table);
++ 		ctx->file_table = NULL;
++ 		return -ENOMEM;
++ 	}
++ 
+++>>>>>>> 46568e9be70f (io_uring: fix error clear of ->file_table in io_sqe_files_register())
+  	for (i = 0; i < nr_args; i++, ctx->nr_user_files++) {
+ -		struct fixed_file_table *table;
+ -		unsigned index;
+ -
+  		ret = -EFAULT;
+  		if (copy_from_user(&fd, &fds[i], sizeof(fd)))
+  			break;
+* Unmerged path fs/io_uring.c
