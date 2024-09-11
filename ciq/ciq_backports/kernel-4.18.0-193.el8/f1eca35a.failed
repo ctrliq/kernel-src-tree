@@ -1,0 +1,333 @@
+mm/sparsemem: introduce struct mem_section_usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] sparsemem: introduce struct mem_section_usage (Baoquan He) [1724969]
+Rebuild_FUZZ: 96.77%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit f1eca35a0dc7cb3cdb00c88c8c5e5138a65face0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f1eca35a.failed
+
+Patch series "mm: Sub-section memory hotplug support", v10.
+
+The memory hotplug section is an arbitrary / convenient unit for memory
+hotplug.  'Section-size' units have bled into the user interface
+('memblock' sysfs) and can not be changed without breaking existing
+userspace.  The section-size constraint, while mostly benign for typical
+memory hotplug, has and continues to wreak havoc with 'device-memory'
+use cases, persistent memory (pmem) in particular.  Recall that pmem
+uses devm_memremap_pages(), and subsequently arch_add_memory(), to
+allocate a 'struct page' memmap for pmem.  However, it does not use the
+'bottom half' of memory hotplug, i.e.  never marks pmem pages online and
+never exposes the userspace memblock interface for pmem.  This leaves an
+opening to redress the section-size constraint.
+
+To date, the libnvdimm subsystem has attempted to inject padding to
+satisfy the internal constraints of arch_add_memory().  Beyond
+complicating the code, leading to bugs [2], wasting memory, and limiting
+configuration flexibility, the padding hack is broken when the platform
+changes this physical memory alignment of pmem from one boot to the
+next.  Device failure (intermittent or permanent) and physical
+reconfiguration are events that can cause the platform firmware to
+change the physical placement of pmem on a subsequent boot, and device
+failure is an everyday event in a data-center.
+
+It turns out that sections are only a hard requirement of the
+user-facing interface for memory hotplug and with a bit more
+infrastructure sub-section arch_add_memory() support can be added for
+kernel internal usages like devm_memremap_pages().  Here is an analysis
+of the current design assumptions in the current code and how they are
+addressed in the new implementation:
+
+Current design assumptions:
+
+ - Sections that describe boot memory (early sections) are never
+   unplugged / removed.
+
+ - pfn_valid(), in the CONFIG_SPARSEMEM_VMEMMAP=y, case devolves to a
+   valid_section() check
+
+ - __add_pages() and helper routines assume all operations occur in
+   PAGES_PER_SECTION units.
+
+ - The memblock sysfs interface only comprehends full sections
+
+New design assumptions:
+
+ - Sections are instrumented with a sub-section bitmask to track (on
+   x86) individual 2MB sub-divisions of a 128MB section.
+
+ - Partially populated early sections can be extended with additional
+   sub-sections, and those sub-sections can be removed with
+   arch_remove_memory(). With this in place we no longer lose usable
+   memory capacity to padding.
+
+ - pfn_valid() is updated to look deeper than valid_section() to also
+   check the active-sub-section mask. This indication is in the same
+   cacheline as the valid_section() so the performance impact is
+   expected to be negligible. So far the lkp robot has not reported any
+   regressions.
+
+ - Outside of the core vmemmap population routines which are replaced,
+   other helper routines like shrink_{zone,pgdat}_span() are updated to
+   handle the smaller granularity. Core memory hotplug routines that
+   deal with online memory are not touched.
+
+ - The existing memblock sysfs user api guarantees / assumptions are not
+   touched since this capability is limited to !online
+   !memblock-sysfs-accessible sections.
+
+Meanwhile the issue reports continue to roll in from users that do not
+understand when and how the 128MB constraint will bite them.  The current
+implementation relied on being able to support at least one misaligned
+namespace, but that immediately falls over on any moderately complex
+namespace creation attempt.  Beyond the initial problem of 'System RAM'
+colliding with pmem, and the unsolvable problem of physical alignment
+changes, Linux is now being exposed to platforms that collide pmem ranges
+with other pmem ranges by default [3].  In short, devm_memremap_pages()
+has pushed the venerable section-size constraint past the breaking point,
+and the simplicity of section-aligned arch_add_memory() is no longer
+tenable.
+
+These patches are exposed to the kbuild robot on a subsection-v10 branch
+[4], and a preview of the unit test for this functionality is available
+on the 'subsection-pending' branch of ndctl [5].
+
+[2]: https://lore.kernel.org/r/155000671719.348031.2347363160141119237.stgit@dwillia2-desk3.amr.corp.intel.com
+[3]: https://github.com/pmem/ndctl/issues/76
+[4]: https://git.kernel.org/pub/scm/linux/kernel/git/djbw/nvdimm.git/log/?h=subsection-v10
+[5]: https://github.com/pmem/ndctl/commit/7c59b4867e1c
+
+This patch (of 13):
+
+Towards enabling memory hotplug to track partial population of a section,
+introduce 'struct mem_section_usage'.
+
+A pointer to a 'struct mem_section_usage' instance replaces the existing
+pointer to a 'pageblock_flags' bitmap.  Effectively it adds one more
+'unsigned long' beyond the 'pageblock_flags' (usemap) allocation to house
+a new 'subsection_map' bitmap.  The new bitmap enables the memory
+hot{plug,remove} implementation to act on incremental sub-divisions of a
+section.
+
+SUBSECTION_SHIFT is defined as global constant instead of per-architecture
+value like SECTION_SIZE_BITS in order to allow cross-arch compatibility of
+subsection users.  Specifically a common subsection size allows for the
+possibility that persistent memory namespace configurations be made
+compatible across architectures.
+
+The primary motivation for this functionality is to support platforms that
+mix "System RAM" and "Persistent Memory" within a single section, or
+multiple PMEM ranges with different mapping lifetimes within a single
+section.  The section restriction for hotplug has caused an ongoing saga
+of hacks and bugs for devm_memremap_pages() users.
+
+Beyond the fixups to teach existing paths how to retrieve the 'usemap'
+from a section, and updates to usemap allocation path, there are no
+expected behavior changes.
+
+Link: http://lkml.kernel.org/r/156092349845.979959.73333291612799019.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Reviewed-by: Wei Yang <richardw.yang@linux.intel.com>
+	Tested-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>	[ppc64]
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Logan Gunthorpe <logang@deltatee.com>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Jane Chu <jane.chu@oracle.com>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Qian Cai <cai@lca.pw>
+	Cc: Logan Gunthorpe <logang@deltatee.com>
+	Cc: Toshi Kani <toshi.kani@hpe.com>
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f1eca35a0dc7cb3cdb00c88c8c5e5138a65face0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/sparse.c
+diff --cc mm/sparse.c
+index 02b5de3161a3,41bef8e1f65c..000000000000
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@@ -306,10 -328,8 +304,15 @@@ sparse_early_usemaps_alloc_pgdat_sectio
+  	limit = goal + (1UL << PA_SECTION_SHIFT);
+  	nid = early_pfn_to_nid(goal >> PAGE_SHIFT);
+  again:
+++<<<<<<< HEAD
+ +	p = memblock_virt_alloc_try_nid_nopanic(size,
+ +						SMP_CACHE_BYTES, goal, limit,
+ +						nid);
+ +	if (!p && limit) {
+++=======
++ 	usage = memblock_alloc_try_nid(size, SMP_CACHE_BYTES, goal, limit, nid);
++ 	if (!usage && limit) {
+++>>>>>>> f1eca35a0dc7 (mm/sparsemem: introduce struct mem_section_usage)
+  		limit = 0;
+  		goto again;
+  	}
+@@@ -362,10 -383,11 +366,11 @@@ static struct mem_section_usage * __ini
+  sparse_early_usemaps_alloc_pgdat_section(struct pglist_data *pgdat,
+  					 unsigned long size)
+  {
+ -	return memblock_alloc_node(size, SMP_CACHE_BYTES, pgdat->node_id);
+ +	return memblock_virt_alloc_node_nopanic(size, pgdat->node_id);
+  }
+  
+- static void __init check_usemap_section_nr(int nid, unsigned long *usemap)
++ static void __init check_usemap_section_nr(int nid,
++ 		struct mem_section_usage *usage)
+  {
+  }
+  #endif /* CONFIG_MEMORY_HOTREMOVE */
+@@@ -785,7 -816,6 +789,7 @@@ void sparse_remove_one_section(struct m
+  
+  	clear_hwpoisoned_pages(memmap + map_offset,
+  			PAGES_PER_SECTION - map_offset);
+- 	free_section_usemap(memmap, usemap, altmap);
++ 	free_section_usage(memmap, usage, altmap);
+  }
+ +#endif /* CONFIG_MEMORY_HOTREMOVE */
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 34d200212014..0f954ec55461 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -1124,6 +1124,24 @@ static inline unsigned long section_nr_to_pfn(unsigned long sec)
+ #define SECTION_ALIGN_UP(pfn)	(((pfn) + PAGES_PER_SECTION - 1) & PAGE_SECTION_MASK)
+ #define SECTION_ALIGN_DOWN(pfn)	((pfn) & PAGE_SECTION_MASK)
+ 
++#define SUBSECTION_SHIFT 21
++
++#define PFN_SUBSECTION_SHIFT (SUBSECTION_SHIFT - PAGE_SHIFT)
++#define PAGES_PER_SUBSECTION (1UL << PFN_SUBSECTION_SHIFT)
++#define PAGE_SUBSECTION_MASK (~(PAGES_PER_SUBSECTION-1))
++
++#if SUBSECTION_SHIFT > SECTION_SIZE_BITS
++#error Subsection size exceeds section size
++#else
++#define SUBSECTIONS_PER_SECTION (1UL << (SECTION_SIZE_BITS - SUBSECTION_SHIFT))
++#endif
++
++struct mem_section_usage {
++	DECLARE_BITMAP(subsection_map, SUBSECTIONS_PER_SECTION);
++	/* See declaration of similar field in struct zone */
++	unsigned long pageblock_flags[0];
++};
++
+ struct page;
+ struct page_ext;
+ struct mem_section {
+@@ -1141,8 +1159,7 @@ struct mem_section {
+ 	 */
+ 	unsigned long section_mem_map;
+ 
+-	/* See declaration of similar field in struct zone */
+-	unsigned long *pageblock_flags;
++	struct mem_section_usage *usage;
+ #ifdef CONFIG_PAGE_EXTENSION
+ 	/*
+ 	 * If SPARSEMEM, pgdat doesn't have page_ext pointer. We use
+@@ -1173,6 +1190,11 @@ extern struct mem_section **mem_section;
+ extern struct mem_section mem_section[NR_SECTION_ROOTS][SECTIONS_PER_ROOT];
+ #endif
+ 
++static inline unsigned long *section_to_usemap(struct mem_section *ms)
++{
++	return ms->usage->pageblock_flags;
++}
++
+ static inline struct mem_section *__nr_to_section(unsigned long nr)
+ {
+ #ifdef CONFIG_SPARSEMEM_EXTREME
+@@ -1184,7 +1206,7 @@ static inline struct mem_section *__nr_to_section(unsigned long nr)
+ 	return &mem_section[SECTION_NR_TO_ROOT(nr)][nr & SECTION_ROOT_MASK];
+ }
+ extern unsigned long __section_nr(struct mem_section *ms);
+-extern unsigned long usemap_size(void);
++extern size_t mem_section_usage_size(void);
+ 
+ /*
+  * We use the lower bits of the mem_map pointer to store
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 4bea0a4014ee..cdbc846b9281 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -169,9 +169,10 @@ void put_page_bootmem(struct page *page)
+ #ifndef CONFIG_SPARSEMEM_VMEMMAP
+ static void register_page_bootmem_info_section(unsigned long start_pfn)
+ {
+-	unsigned long *usemap, mapsize, section_nr, i;
++	unsigned long mapsize, section_nr, i;
+ 	struct mem_section *ms;
+ 	struct page *page, *memmap;
++	struct mem_section_usage *usage;
+ 
+ 	section_nr = pfn_to_section_nr(start_pfn);
+ 	ms = __nr_to_section(section_nr);
+@@ -191,10 +192,10 @@ static void register_page_bootmem_info_section(unsigned long start_pfn)
+ 	for (i = 0; i < mapsize; i++, page++)
+ 		get_page_bootmem(section_nr, page, SECTION_INFO);
+ 
+-	usemap = ms->pageblock_flags;
+-	page = virt_to_page(usemap);
++	usage = ms->usage;
++	page = virt_to_page(usage);
+ 
+-	mapsize = PAGE_ALIGN(usemap_size()) >> PAGE_SHIFT;
++	mapsize = PAGE_ALIGN(mem_section_usage_size()) >> PAGE_SHIFT;
+ 
+ 	for (i = 0; i < mapsize; i++, page++)
+ 		get_page_bootmem(section_nr, page, MIX_SECTION_INFO);
+@@ -203,9 +204,10 @@ static void register_page_bootmem_info_section(unsigned long start_pfn)
+ #else /* CONFIG_SPARSEMEM_VMEMMAP */
+ static void register_page_bootmem_info_section(unsigned long start_pfn)
+ {
+-	unsigned long *usemap, mapsize, section_nr, i;
++	unsigned long mapsize, section_nr, i;
+ 	struct mem_section *ms;
+ 	struct page *page, *memmap;
++	struct mem_section_usage *usage;
+ 
+ 	section_nr = pfn_to_section_nr(start_pfn);
+ 	ms = __nr_to_section(section_nr);
+@@ -214,10 +216,10 @@ static void register_page_bootmem_info_section(unsigned long start_pfn)
+ 
+ 	register_page_bootmem_memmap(section_nr, memmap, PAGES_PER_SECTION);
+ 
+-	usemap = ms->pageblock_flags;
+-	page = virt_to_page(usemap);
++	usage = ms->usage;
++	page = virt_to_page(usage);
+ 
+-	mapsize = PAGE_ALIGN(usemap_size()) >> PAGE_SHIFT;
++	mapsize = PAGE_ALIGN(mem_section_usage_size()) >> PAGE_SHIFT;
+ 
+ 	for (i = 0; i < mapsize; i++, page++)
+ 		get_page_bootmem(section_nr, page, MIX_SECTION_INFO);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 90f3a46ef509..74af78d15986 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -373,7 +373,7 @@ static inline unsigned long *get_pageblock_bitmap(struct page *page,
+ 							unsigned long pfn)
+ {
+ #ifdef CONFIG_SPARSEMEM
+-	return __pfn_to_section(pfn)->pageblock_flags;
++	return section_to_usemap(__pfn_to_section(pfn));
+ #else
+ 	return page_zone(page)->pageblock_flags;
+ #endif /* CONFIG_SPARSEMEM */
+* Unmerged path mm/sparse.c
