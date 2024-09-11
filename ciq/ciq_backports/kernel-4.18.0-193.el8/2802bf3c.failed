@@ -1,0 +1,208 @@
+sched/fair: Add over-utilization/tipping point indicator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Morten Rasmussen <morten.rasmussen@arm.com>
+commit 2802bf3cd936fe2c8033a696d375a4d9d3974de4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2802bf3c.failed
+
+Energy-aware scheduling is only meant to be active while the system is
+_not_ over-utilized. That is, there are spare cycles available to shift
+tasks around based on their actual utilization to get a more
+energy-efficient task distribution without depriving any tasks. When
+above the tipping point task placement is done the traditional way based
+on load_avg, spreading the tasks across as many cpus as possible based
+on priority scaled load to preserve smp_nice. Below the tipping point we
+want to use util_avg instead. We need to define a criteria for when we
+make the switch.
+
+The util_avg for each cpu converges towards 100% regardless of how many
+additional tasks we may put on it. If we define over-utilized as:
+
+sum_{cpus}(rq.cfs.avg.util_avg) + margin > sum_{cpus}(rq.capacity)
+
+some individual cpus may be over-utilized running multiple tasks even
+when the above condition is false. That should be okay as long as we try
+to spread the tasks out to avoid per-cpu over-utilization as much as
+possible and if all tasks have the _same_ priority. If the latter isn't
+true, we have to consider priority to preserve smp_nice.
+
+For example, we could have n_cpus nice=-10 util_avg=55% tasks and
+n_cpus/2 nice=0 util_avg=60% tasks. Balancing based on util_avg we are
+likely to end up with nice=-10 tasks sharing cpus and nice=0 tasks
+getting their own as we 1.5*n_cpus tasks in total and 55%+55% is less
+over-utilized than 55%+60% for those cpus that have to be shared. The
+system utilization is only 85% of the system capacity, but we are
+breaking smp_nice.
+
+To be sure not to break smp_nice, we have defined over-utilization
+conservatively as when any cpu in the system is fully utilized at its
+highest frequency instead:
+
+cpu_rq(any).cfs.avg.util_avg + margin > cpu_rq(any).capacity
+
+IOW, as soon as one cpu is (nearly) 100% utilized, we switch to load_avg
+to factor in priority to preserve smp_nice.
+
+With this definition, we can skip periodic load-balance as no cpu has an
+always-running task when the system is not over-utilized. All tasks will
+be periodic and we can balance them at wake-up. This conservative
+condition does however mean that some scenarios that could benefit from
+energy-aware decisions even if one cpu is fully utilized would not get
+those benefits.
+
+For systems where some cpus might have reduced capacity on some cpus
+(RT-pressure and/or big.LITTLE), we want periodic load-balance checks as
+soon a just a single cpu is fully utilized as it might one of those with
+reduced capacity and in that case we want to migrate it.
+
+[ peterz: Added a comment explaining why new tasks are not accounted during
+          overutilization detection. ]
+
+	Signed-off-by: Morten Rasmussen <morten.rasmussen@arm.com>
+	Signed-off-by: Quentin Perret <quentin.perret@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: adharmap@codeaurora.org
+	Cc: chris.redpath@arm.com
+	Cc: currojerez@riseup.net
+	Cc: dietmar.eggemann@arm.com
+	Cc: edubezval@gmail.com
+	Cc: gregkh@linuxfoundation.org
+	Cc: javi.merino@kernel.org
+	Cc: joel@joelfernandes.org
+	Cc: juri.lelli@redhat.com
+	Cc: patrick.bellasi@arm.com
+	Cc: pkondeti@codeaurora.org
+	Cc: rjw@rjwysocki.net
+	Cc: skannan@codeaurora.org
+	Cc: smuckle@google.com
+	Cc: srinivas.pandruvada@linux.intel.com
+	Cc: thara.gopinath@linaro.org
+	Cc: tkjos@google.com
+	Cc: valentin.schneider@arm.com
+	Cc: vincent.guittot@linaro.org
+	Cc: viresh.kumar@linaro.org
+Link: https://lkml.kernel.org/r/20181203095628.11858-13-quentin.perret@arm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2802bf3cd936fe2c8033a696d375a4d9d3974de4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/fair.c
+index 64d8aacf573c,767e7675774b..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -5181,26 -5157,27 +5199,44 @@@ enqueue_task_fair(struct rq *rq, struc
+  		update_cfs_group(se);
+  	}
+  
+- 	if (!se)
++ 	if (!se) {
+  		add_nr_running(rq, 1);
++ 		/*
++ 		 * Since new tasks are assigned an initial util_avg equal to
++ 		 * half of the spare capacity of their CPU, tiny tasks have the
++ 		 * ability to cross the overutilized threshold, which will
++ 		 * result in the load balancer ruining all the task placement
++ 		 * done by EAS. As a way to mitigate that effect, do not account
++ 		 * for the first enqueue operation of new tasks during the
++ 		 * overutilized flag detection.
++ 		 *
++ 		 * A better way of solving this problem would be to wait for
++ 		 * the PELT signals of tasks to converge before taking them
++ 		 * into account, but that is not straightforward to implement,
++ 		 * and the following generally works well enough in practice.
++ 		 */
++ 		if (flags & ENQUEUE_WAKEUP)
++ 			update_overutilized_status(rq);
++ 
++ 	}
+  
+ +	if (cfs_bandwidth_used()) {
+ +		/*
+ +		 * When bandwidth control is enabled; the cfs_rq_throttled()
+ +		 * breaks in the above iteration can result in incomplete
+ +		 * leaf list maintenance, resulting in triggering the assertion
+ +		 * below.
+ +		 */
+ +		for_each_sched_entity(se) {
+ +			cfs_rq = cfs_rq_of(se);
+ +
+ +			if (list_add_leaf_cfs_rq(cfs_rq))
+ +				break;
+ +		}
+ +	}
+ +
+ +	assert_list_leaf_cfs_rq(rq);
+ +
+  	hrtick_update(rq);
+  }
+  
+@@@ -7999,8 -7974,11 +8035,11 @@@ static inline void update_sg_lb_stats(s
+  
+  		nr_running = rq->nr_running;
+  		if (nr_running > 1)
+ -			*sg_status |= SG_OVERLOAD;
+ +			*overload = true;
+  
++ 		if (cpu_overutilized(i))
++ 			*sg_status |= SG_OVERUTILIZED;
++ 
+  #ifdef CONFIG_NUMA_BALANCING
+  		sgs->nr_numa_running += rq->nr_numa_running;
+  		sgs->nr_preferred_running += rq->nr_preferred_running;
+@@@ -8235,9 -8209,15 +8274,20 @@@ next_group
+  		env->fbq_type = fbq_classify_group(&sds->busiest_stat);
+  
+  	if (!env->sd->parent) {
++ 		struct root_domain *rd = env->dst_rq->rd;
++ 
+  		/* update overload indicator if we are at root domain */
+++<<<<<<< HEAD
+ +		if (READ_ONCE(env->dst_rq->rd->overload) != overload)
+ +			WRITE_ONCE(env->dst_rq->rd->overload, overload);
+++=======
++ 		WRITE_ONCE(rd->overload, sg_status & SG_OVERLOAD);
++ 
++ 		/* Update over-utilization (tipping point, U >= 0) indicator */
++ 		WRITE_ONCE(rd->overutilized, sg_status & SG_OVERUTILIZED);
++ 	} else if (sg_status & SG_OVERUTILIZED) {
++ 		WRITE_ONCE(env->dst_rq->rd->overutilized, SG_OVERUTILIZED);
+++>>>>>>> 2802bf3cd936 (sched/fair: Add over-utilization/tipping point indicator)
+  	}
+  }
+  
+diff --cc kernel/sched/sched.h
+index 2f0ee3f2ef1e,0ba08924e017..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -712,6 -710,16 +712,19 @@@ static inline bool sched_asym_prefer(in
+  	return arch_asym_cpu_priority(a) > arch_asym_cpu_priority(b);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct perf_domain {
++ 	struct em_perf_domain *em_pd;
++ 	struct perf_domain *next;
++ 	struct rcu_head rcu;
++ };
++ 
++ /* Scheduling group status flags */
++ #define SG_OVERLOAD		0x1 /* More than one runnable task on a CPU. */
++ #define SG_OVERUTILIZED		0x2 /* One or more CPUs are over-utilized. */
++ 
+++>>>>>>> 2802bf3cd936 (sched/fair: Add over-utilization/tipping point indicator)
+  /*
+   * We add the notion of a root-domain which will be used to define per-domain
+   * variables. Each exclusive cpuset essentially defines an island domain by
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/sched.h
