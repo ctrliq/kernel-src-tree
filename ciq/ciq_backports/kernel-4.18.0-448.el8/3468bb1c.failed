@@ -1,0 +1,224 @@
+xfs: remove need_start_rec parameter from xlog_write()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 3468bb1ca6e8840789e13c7b9d8b0c556b4fbe79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/3468bb1c.failed
+
+The CIL push is the only call to xlog_write that sets this variable
+to true. The other callers don't need a start rec, and they tell
+xlog_write what to do by passing the type of ophdr they need written
+in the flags field. The need_start_rec parameter essentially tells
+xlog_write to to write an extra ophdr with a XLOG_START_TRANS type,
+so get rid of the variable to do this and pass XLOG_START_TRANS as
+the flag value into xlog_write() from the CIL push.
+
+$ size fs/xfs/xfs_log.o*
+  text	   data	    bss	    dec	    hex	filename
+ 27595	    560	      8	  28163	   6e03	fs/xfs/xfs_log.o.orig
+ 27454	    560	      8	  28022	   6d76	fs/xfs/xfs_log.o.patched
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 3468bb1ca6e8840789e13c7b9d8b0c556b4fbe79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log_cil.c
+diff --cc fs/xfs/xfs_log_cil.c
+index cd5c04dabe2e,172bb3551d6b..000000000000
+--- a/fs/xfs/xfs_log_cil.c
++++ b/fs/xfs/xfs_log_cil.c
+@@@ -811,7 -817,14 +811,18 @@@ xlog_cil_push_work
+  	lvhdr.lv_iovecp = &lhdr;
+  	lvhdr.lv_next = ctx->lv_chain;
+  
+++<<<<<<< HEAD
+ +	error = xlog_write(log, &lvhdr, tic, &ctx->start_lsn, NULL, 0, true);
+++=======
++ 	/*
++ 	 * Before we format and submit the first iclog, we have to ensure that
++ 	 * the metadata writeback ordering cache flush is complete.
++ 	 */
++ 	wait_for_completion(&bdev_flush);
++ 
++ 	error = xlog_write(log, &lvhdr, tic, &ctx->start_lsn, NULL,
++ 				XLOG_START_TRANS);
+++>>>>>>> 3468bb1ca6e8 (xfs: remove need_start_rec parameter from xlog_write())
+  	if (error)
+  		goto out_abort_free_ticket;
+  
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 146a1de0c546..ae9554243e28 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -818,9 +818,7 @@ xlog_wait_on_iclog(
+ static int
+ xlog_write_unmount_record(
+ 	struct xlog		*log,
+-	struct xlog_ticket	*ticket,
+-	xfs_lsn_t		*lsn,
+-	uint			flags)
++	struct xlog_ticket	*ticket)
+ {
+ 	struct xfs_unmount_log_format ulf = {
+ 		.magic = XLOG_UNMOUNT_TYPE,
+@@ -837,7 +835,7 @@ xlog_write_unmount_record(
+ 
+ 	/* account for space used by record data */
+ 	ticket->t_curr_res -= sizeof(ulf);
+-	return xlog_write(log, &vec, ticket, lsn, NULL, flags, false);
++	return xlog_write(log, &vec, ticket, NULL, NULL, XLOG_UNMOUNT_TRANS);
+ }
+ 
+ /*
+@@ -851,15 +849,13 @@ xlog_unmount_write(
+ 	struct xfs_mount	*mp = log->l_mp;
+ 	struct xlog_in_core	*iclog;
+ 	struct xlog_ticket	*tic = NULL;
+-	xfs_lsn_t		lsn;
+-	uint			flags = XLOG_UNMOUNT_TRANS;
+ 	int			error;
+ 
+ 	error = xfs_log_reserve(mp, 600, 1, &tic, XFS_LOG, 0);
+ 	if (error)
+ 		goto out_err;
+ 
+-	error = xlog_write_unmount_record(log, tic, &lsn, flags);
++	error = xlog_write_unmount_record(log, tic);
+ 	/*
+ 	 * At this point, we're umounting anyway, so there's no point in
+ 	 * transitioning log state to IOERROR. Just continue...
+@@ -1551,8 +1547,7 @@ xlog_commit_record(
+ 	if (XLOG_FORCED_SHUTDOWN(log))
+ 		return -EIO;
+ 
+-	error = xlog_write(log, &vec, ticket, lsn, iclog, XLOG_COMMIT_TRANS,
+-			   false);
++	error = xlog_write(log, &vec, ticket, lsn, iclog, XLOG_COMMIT_TRANS);
+ 	if (error)
+ 		xfs_force_shutdown(log->l_mp, SHUTDOWN_LOG_IO_ERROR);
+ 	return error;
+@@ -2149,13 +2144,16 @@ static int
+ xlog_write_calc_vec_length(
+ 	struct xlog_ticket	*ticket,
+ 	struct xfs_log_vec	*log_vector,
+-	bool			need_start_rec)
++	uint			optype)
+ {
+ 	struct xfs_log_vec	*lv;
+-	int			headers = need_start_rec ? 1 : 0;
++	int			headers = 0;
+ 	int			len = 0;
+ 	int			i;
+ 
++	if (optype & XLOG_START_TRANS)
++		headers++;
++
+ 	for (lv = log_vector; lv; lv = lv->lv_next) {
+ 		/* we don't write ordered log vectors */
+ 		if (lv->lv_buf_len == XFS_LOG_VEC_ORDERED)
+@@ -2375,8 +2373,7 @@ xlog_write(
+ 	struct xlog_ticket	*ticket,
+ 	xfs_lsn_t		*start_lsn,
+ 	struct xlog_in_core	**commit_iclog,
+-	uint			flags,
+-	bool			need_start_rec)
++	uint			optype)
+ {
+ 	struct xlog_in_core	*iclog = NULL;
+ 	struct xfs_log_vec	*lv = log_vector;
+@@ -2404,8 +2401,9 @@ xlog_write(
+ 		xfs_force_shutdown(log->l_mp, SHUTDOWN_LOG_IO_ERROR);
+ 	}
+ 
+-	len = xlog_write_calc_vec_length(ticket, log_vector, need_start_rec);
+-	*start_lsn = 0;
++	len = xlog_write_calc_vec_length(ticket, log_vector, optype);
++	if (start_lsn)
++		*start_lsn = 0;
+ 	while (lv && (!lv->lv_niovecs || index < lv->lv_niovecs)) {
+ 		void		*ptr;
+ 		int		log_offset;
+@@ -2419,7 +2417,7 @@ xlog_write(
+ 		ptr = iclog->ic_datap + log_offset;
+ 
+ 		/* start_lsn is the first lsn written to. That's all we need. */
+-		if (!*start_lsn)
++		if (start_lsn && !*start_lsn)
+ 			*start_lsn = be64_to_cpu(iclog->ic_header.h_lsn);
+ 
+ 		/*
+@@ -2432,6 +2430,7 @@ xlog_write(
+ 			int			copy_len;
+ 			int			copy_off;
+ 			bool			ordered = false;
++			bool			wrote_start_rec = false;
+ 
+ 			/* ordered log vectors have no regions to write */
+ 			if (lv->lv_buf_len == XFS_LOG_VEC_ORDERED) {
+@@ -2449,13 +2448,15 @@ xlog_write(
+ 			 * write a start record. Only do this for the first
+ 			 * iclog we write to.
+ 			 */
+-			if (need_start_rec) {
++			if (optype & XLOG_START_TRANS) {
+ 				xlog_write_start_rec(ptr, ticket);
+ 				xlog_write_adv_cnt(&ptr, &len, &log_offset,
+ 						sizeof(struct xlog_op_header));
++				optype &= ~XLOG_START_TRANS;
++				wrote_start_rec = true;
+ 			}
+ 
+-			ophdr = xlog_write_setup_ophdr(log, ptr, ticket, flags);
++			ophdr = xlog_write_setup_ophdr(log, ptr, ticket, optype);
+ 			if (!ophdr)
+ 				return -EIO;
+ 
+@@ -2486,14 +2487,13 @@ xlog_write(
+ 			}
+ 			copy_len += sizeof(struct xlog_op_header);
+ 			record_cnt++;
+-			if (need_start_rec) {
++			if (wrote_start_rec) {
+ 				copy_len += sizeof(struct xlog_op_header);
+ 				record_cnt++;
+-				need_start_rec = false;
+ 			}
+ 			data_cnt += contwr ? copy_len : 0;
+ 
+-			error = xlog_write_copy_finish(log, iclog, flags,
++			error = xlog_write_copy_finish(log, iclog, optype,
+ 						       &record_cnt, &data_cnt,
+ 						       &partial_copy,
+ 						       &partial_copy_len,
+@@ -2537,7 +2537,7 @@ xlog_write(
+ 	spin_lock(&log->l_icloglock);
+ 	xlog_state_finish_copy(log, iclog, record_cnt, data_cnt);
+ 	if (commit_iclog) {
+-		ASSERT(flags & XLOG_COMMIT_TRANS);
++		ASSERT(optype & XLOG_COMMIT_TRANS);
+ 		*commit_iclog = iclog;
+ 	} else {
+ 		error = xlog_state_release_iclog(log, iclog);
+* Unmerged path fs/xfs/xfs_log_cil.c
+diff --git a/fs/xfs/xfs_log_priv.h b/fs/xfs/xfs_log_priv.h
+index 037950cf1061..8f3ad50ce4a6 100644
+--- a/fs/xfs/xfs_log_priv.h
++++ b/fs/xfs/xfs_log_priv.h
+@@ -480,8 +480,7 @@ void	xlog_print_tic_res(struct xfs_mount *mp, struct xlog_ticket *ticket);
+ void	xlog_print_trans(struct xfs_trans *);
+ int	xlog_write(struct xlog *log, struct xfs_log_vec *log_vector,
+ 		struct xlog_ticket *tic, xfs_lsn_t *start_lsn,
+-		struct xlog_in_core **commit_iclog, uint flags,
+-		bool need_start_rec);
++		struct xlog_in_core **commit_iclog, uint optype);
+ int	xlog_commit_record(struct xlog *log, struct xlog_ticket *ticket,
+ 		struct xlog_in_core **iclog, xfs_lsn_t *lsn);
+ void	xfs_log_ticket_ungrant(struct xlog *log, struct xlog_ticket *ticket);
