@@ -1,0 +1,126 @@
+drm: Don't free jobs in wait_event_interruptible()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Steven Price <steven.price@arm.com>
+commit 588b9828f0744ca13555c4a35cd0251ac8ad8ad2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/588b9828.failed
+
+drm_sched_cleanup_jobs() attempts to free finished jobs, however because
+it is called as the condition of wait_event_interruptible() it must not
+sleep. Unfortunately some free callbacks (notably for Panfrost) do sleep.
+
+Instead let's rename drm_sched_cleanup_jobs() to
+drm_sched_get_cleanup_job() and simply return a job for processing if
+there is one. The caller can then call the free_job() callback outside
+the wait_event_interruptible() where sleeping is possible before
+re-checking and returning to sleep if necessary.
+
+	Tested-by: Christian Gmeiner <christian.gmeiner@gmail.com>
+Fixes: 5918045c4ed4 ("drm/scheduler: rework job destruction")
+	Signed-off-by: Steven Price <steven.price@arm.com>
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Christian König <christian.koenig@amd.com>
+Link: https://patchwork.freedesktop.org/patch/337652/
+(cherry picked from commit 588b9828f0744ca13555c4a35cd0251ac8ad8ad2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/scheduler/sched_main.c
+diff --cc drivers/gpu/drm/scheduler/sched_main.c
+index a1bec2779e76,d4cc7289147e..000000000000
+--- a/drivers/gpu/drm/scheduler/sched_main.c
++++ b/drivers/gpu/drm/scheduler/sched_main.c
+@@@ -603,17 -615,48 +603,62 @@@ static void drm_sched_process_job(struc
+  	atomic_dec(&sched->hw_rq_count);
+  	atomic_dec(&sched->num_jobs);
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&sched->job_list_lock, flags);
+ +	/* remove job from ring_mirror_list */
+ +	list_del_init(&s_job->node);
+ +	spin_unlock_irqrestore(&sched->job_list_lock, flags);
+ +
+ +	drm_sched_fence_finished(s_fence);
+ +
+ +	trace_drm_sched_process_job(s_fence);
+ +	wake_up_interruptible(&sched->wake_up_worker);
+ +
+ +	schedule_work(&s_job->finish_work);
+++=======
++ 	trace_drm_sched_process_job(s_fence);
++ 
++ 	drm_sched_fence_finished(s_fence);
++ 	wake_up_interruptible(&sched->wake_up_worker);
++ }
++ 
++ /**
++  * drm_sched_get_cleanup_job - fetch the next finished job to be destroyed
++  *
++  * @sched: scheduler instance
++  *
++  * Returns the next finished job from the mirror list (if there is one)
++  * ready for it to be destroyed.
++  */
++ static struct drm_sched_job *
++ drm_sched_get_cleanup_job(struct drm_gpu_scheduler *sched)
++ {
++ 	struct drm_sched_job *job;
++ 	unsigned long flags;
++ 
++ 	/* Don't destroy jobs while the timeout worker is running */
++ 	if (sched->timeout != MAX_SCHEDULE_TIMEOUT &&
++ 	    !cancel_delayed_work(&sched->work_tdr))
++ 		return NULL;
++ 
++ 	spin_lock_irqsave(&sched->job_list_lock, flags);
++ 
++ 	job = list_first_entry_or_null(&sched->ring_mirror_list,
++ 				       struct drm_sched_job, node);
++ 
++ 	if (job && dma_fence_is_signaled(&job->s_fence->finished)) {
++ 		/* remove job from ring_mirror_list */
++ 		list_del_init(&job->node);
++ 	} else {
++ 		job = NULL;
++ 		/* queue timeout for next job */
++ 		drm_sched_start_timeout(sched);
++ 	}
++ 
++ 	spin_unlock_irqrestore(&sched->job_list_lock, flags);
++ 
++ 	return job;
+++>>>>>>> 588b9828f074 (drm: Don't free jobs in wait_event_interruptible())
+  }
+  
+  /**
+@@@ -653,12 -696,20 +698,26 @@@ static int drm_sched_main(void *param
+  		struct drm_sched_fence *s_fence;
+  		struct drm_sched_job *sched_job;
+  		struct dma_fence *fence;
++ 		struct drm_sched_job *cleanup_job = NULL;
+  
+  		wait_event_interruptible(sched->wake_up_worker,
+++<<<<<<< HEAD
+++					 (!drm_sched_blocked(sched) &&
+++					  (entity = drm_sched_select_entity(sched))) ||
+++					 kthread_should_stop());
+++=======
++ 					 (cleanup_job = drm_sched_get_cleanup_job(sched)) ||
+  					 (!drm_sched_blocked(sched) &&
+  					  (entity = drm_sched_select_entity(sched))) ||
+  					 kthread_should_stop());
+  
++ 		if (cleanup_job) {
++ 			sched->ops->free_job(cleanup_job);
++ 			/* queue timeout for next job */
++ 			drm_sched_start_timeout(sched);
++ 		}
+++>>>>>>> 588b9828f074 (drm: Don't free jobs in wait_event_interruptible())
++ 
+  		if (!entity)
+  			continue;
+  
+* Unmerged path drivers/gpu/drm/scheduler/sched_main.c
