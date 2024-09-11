@@ -1,0 +1,113 @@
+bpf: Enforce id generation for all may-be-null register type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 93c230e3f5bd6e1d2b2759d582fdfe9c2731473b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/93c230e3.failed
+
+The commit af7ec1383361 ("bpf: Add bpf_skc_to_tcp6_sock() helper")
+introduces RET_PTR_TO_BTF_ID_OR_NULL and
+the commit eaa6bcb71ef6 ("bpf: Introduce bpf_per_cpu_ptr()")
+introduces RET_PTR_TO_MEM_OR_BTF_ID_OR_NULL.
+Note that for RET_PTR_TO_MEM_OR_BTF_ID_OR_NULL, the reg0->type
+could become PTR_TO_MEM_OR_NULL which is not covered by
+BPF_PROBE_MEM.
+
+The BPF_REG_0 will then hold a _OR_NULL pointer type. This _OR_NULL
+pointer type requires the bpf program to explicitly do a NULL check first.
+After NULL check, the verifier will mark all registers having
+the same reg->id as safe to use.  However, the reg->id
+is not set for those new _OR_NULL return types.  One of the ways
+that may be wrong is, checking NULL for one btf_id typed pointer will
+end up validating all other btf_id typed pointers because
+all of them have id == 0.  The later tests will exercise
+this path.
+
+To fix it and also avoid similar issue in the future, this patch
+moves the id generation logic out of each individual RET type
+test in check_helper_call().  Instead, it does one
+reg_type_may_be_null() test and then do the id generation
+if needed.
+
+This patch also adds a WARN_ON_ONCE in mark_ptr_or_null_reg()
+to catch future breakage.
+
+The _OR_NULL pointer usage in the bpf_iter_reg.ctx_arg_info is
+fine because it just happens that the existing id generation after
+check_ctx_access() has covered it.  It is also using the
+reg_type_may_be_null() to decide if id generation is needed or not.
+
+Fixes: af7ec1383361 ("bpf: Add bpf_skc_to_tcp6_sock() helper")
+Fixes: eaa6bcb71ef6 ("bpf: Introduce bpf_per_cpu_ptr()")
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201019194212.1050855-1-kafai@fb.com
+(cherry picked from commit 93c230e3f5bd6e1d2b2759d582fdfe9c2731473b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index fcf9a1bb7134,6200519582a6..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -4664,8 -5143,51 +4662,55 @@@ static int check_helper_call(struct bpf
+  	} else if (fn->ret_type == RET_PTR_TO_TCP_SOCK_OR_NULL) {
+  		mark_reg_known_zero(env, regs, BPF_REG_0);
+  		regs[BPF_REG_0].type = PTR_TO_TCP_SOCK_OR_NULL;
+++<<<<<<< HEAD
+ +		regs[BPF_REG_0].id = ++env->id_gen;
+++=======
++ 	} else if (fn->ret_type == RET_PTR_TO_ALLOC_MEM_OR_NULL) {
++ 		mark_reg_known_zero(env, regs, BPF_REG_0);
++ 		regs[BPF_REG_0].type = PTR_TO_MEM_OR_NULL;
++ 		regs[BPF_REG_0].mem_size = meta.mem_size;
++ 	} else if (fn->ret_type == RET_PTR_TO_MEM_OR_BTF_ID_OR_NULL ||
++ 		   fn->ret_type == RET_PTR_TO_MEM_OR_BTF_ID) {
++ 		const struct btf_type *t;
++ 
++ 		mark_reg_known_zero(env, regs, BPF_REG_0);
++ 		t = btf_type_skip_modifiers(btf_vmlinux, meta.ret_btf_id, NULL);
++ 		if (!btf_type_is_struct(t)) {
++ 			u32 tsize;
++ 			const struct btf_type *ret;
++ 			const char *tname;
++ 
++ 			/* resolve the type size of ksym. */
++ 			ret = btf_resolve_size(btf_vmlinux, t, &tsize);
++ 			if (IS_ERR(ret)) {
++ 				tname = btf_name_by_offset(btf_vmlinux, t->name_off);
++ 				verbose(env, "unable to resolve the size of type '%s': %ld\n",
++ 					tname, PTR_ERR(ret));
++ 				return -EINVAL;
++ 			}
++ 			regs[BPF_REG_0].type =
++ 				fn->ret_type == RET_PTR_TO_MEM_OR_BTF_ID ?
++ 				PTR_TO_MEM : PTR_TO_MEM_OR_NULL;
++ 			regs[BPF_REG_0].mem_size = tsize;
++ 		} else {
++ 			regs[BPF_REG_0].type =
++ 				fn->ret_type == RET_PTR_TO_MEM_OR_BTF_ID ?
++ 				PTR_TO_BTF_ID : PTR_TO_BTF_ID_OR_NULL;
++ 			regs[BPF_REG_0].btf_id = meta.ret_btf_id;
++ 		}
++ 	} else if (fn->ret_type == RET_PTR_TO_BTF_ID_OR_NULL) {
++ 		int ret_btf_id;
++ 
++ 		mark_reg_known_zero(env, regs, BPF_REG_0);
++ 		regs[BPF_REG_0].type = PTR_TO_BTF_ID_OR_NULL;
++ 		ret_btf_id = *fn->ret_btf_id;
++ 		if (ret_btf_id == 0) {
++ 			verbose(env, "invalid return type %d of func %s#%d\n",
++ 				fn->ret_type, func_id_name(func_id), func_id);
++ 			return -EINVAL;
++ 		}
++ 		regs[BPF_REG_0].btf_id = ret_btf_id;
+++>>>>>>> 93c230e3f5bd (bpf: Enforce id generation for all may-be-null register type)
+  	} else {
+  		verbose(env, "unknown return type %d of func %s#%d\n",
+  			fn->ret_type, func_id_name(func_id), func_id);
+* Unmerged path kernel/bpf/verifier.c
