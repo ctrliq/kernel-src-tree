@@ -1,0 +1,362 @@
+iommu/fsl_pamu: enable the liodn when attaching a device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7d61cb6ff0122a017ae907aed62478a4db9c5991
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/7d61cb6f.failed
+
+Instead of a separate call to enable all devices from the list, just
+enable the liodn once the device is attached to the iommu domain.
+
+This also remove the DOMAIN_ATTR_FSL_PAMU_ENABLE iommu_attr.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Will Deacon <will@kernel.org>
+	Acked-by: Li Yang <leoyang.li@nxp.com>
+Link: https://lore.kernel.org/r/20210401155256.298656-11-hch@lst.de
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 7d61cb6ff0122a017ae907aed62478a4db9c5991)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/fsl_pamu_domain.c
+#	drivers/iommu/fsl_pamu_domain.h
+#	drivers/soc/fsl/qbman/qman_portal.c
+#	include/linux/iommu.h
+diff --cc drivers/iommu/fsl_pamu_domain.c
+index a377b877dcab,c2e7e17570e7..000000000000
+--- a/drivers/iommu/fsl_pamu_domain.c
++++ b/drivers/iommu/fsl_pamu_domain.c
+@@@ -411,10 -195,6 +411,13 @@@ static void fsl_pamu_domain_free(struc
+  
+  	/* remove all the devices from the device list */
+  	detach_device(NULL, dma_domain);
+++<<<<<<< HEAD
+ +
+ +	dma_domain->enabled = 0;
+ +	dma_domain->mapped = 0;
+ +
+++=======
+++>>>>>>> 7d61cb6ff012 (iommu/fsl_pamu: enable the liodn when attaching a device)
+  	kmem_cache_free(fsl_pamu_domain_cache, dma_domain);
+  }
+  
+@@@ -635,14 -263,30 +638,36 @@@ static int fsl_pamu_attach_device(struc
+  	}
+  
+  	liodn = of_get_property(dev->of_node, "fsl,liodn", &len);
+ -	if (!liodn) {
+ +	if (liodn) {
+ +		liodn_cnt = len / sizeof(u32);
+ +		ret = handle_attach_device(dma_domain, dev, liodn, liodn_cnt);
+ +	} else {
+  		pr_debug("missing fsl,liodn property at %pOF\n", dev->of_node);
+ -		return -EINVAL;
+ +		ret = -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	spin_lock_irqsave(&dma_domain->domain_lock, flags);
++ 	for (i = 0; i < len / sizeof(u32); i++) {
++ 		/* Ensure that LIODN value is valid */
++ 		if (liodn[i] >= PAACE_NUMBER_ENTRIES) {
++ 			pr_debug("Invalid liodn %d, attach device failed for %pOF\n",
++ 				 liodn[i], dev->of_node);
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 
++ 		attach_device(dma_domain, liodn[i], dev);
++ 		ret = pamu_set_liodn(dma_domain, dev, liodn[i]);
++ 		if (ret)
++ 			break;
++ 		ret = pamu_enable_liodn(liodn[i]);
++ 		if (ret)
++ 			break;
++ 	}
++ 	spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+++>>>>>>> 7d61cb6ff012 (iommu/fsl_pamu: enable the liodn when attaching a device)
+  	return ret;
+  }
+  
+@@@ -731,148 -335,12 +756,151 @@@ static int configure_domain_stash(struc
+  		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+  		return -EINVAL;
+  	}
+ +
+  	ret = update_domain_stash(dma_domain, dma_domain->stash_id);
+ +
+ +	spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ +
+ +	return ret;
+ +}
+ +
+++<<<<<<< HEAD
+ +/* Configure domain dma state i.e. enable/disable DMA */
+ +static int configure_domain_dma_state(struct fsl_dma_domain *dma_domain, bool enable)
+ +{
+ +	struct device_domain_info *info;
+ +	unsigned long flags;
+ +	int ret;
+ +
+ +	spin_lock_irqsave(&dma_domain->domain_lock, flags);
+ +
+ +	if (enable && !dma_domain->mapped) {
+ +		pr_debug("Can't enable DMA domain without valid mapping\n");
+ +		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ +		return -ENODEV;
+ +	}
+ +
+ +	dma_domain->enabled = enable;
+ +	list_for_each_entry(info, &dma_domain->devices, link) {
+ +		ret = (enable) ? pamu_enable_liodn(info->liodn) :
+ +			pamu_disable_liodn(info->liodn);
+ +		if (ret)
+ +			pr_debug("Unable to set dma state for liodn %d",
+ +				 info->liodn);
+ +	}
+ +	spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ +
+ +	return 0;
+ +}
+ +
+ +static int fsl_pamu_set_windows(struct iommu_domain *domain, u32 w_count)
+ +{
+ +	struct fsl_dma_domain *dma_domain = to_fsl_dma_domain(domain);
+ +	unsigned long flags;
+ +	int ret;
+ +
+ +	spin_lock_irqsave(&dma_domain->domain_lock, flags);
+ +	/* Ensure domain is inactive i.e. DMA should be disabled for the domain */
+ +	if (dma_domain->enabled) {
+ +		pr_debug("Can't set geometry attributes as domain is active\n");
+ +		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ +		return  -EBUSY;
+ +	}
+ +
+ +	/* Ensure that the geometry has been set for the domain */
+ +	if (!dma_domain->geom_size) {
+ +		pr_debug("Please configure geometry before setting the number of windows\n");
+ +		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ +		return -EINVAL;
+ +	}
+ +
+ +	/*
+ +	 * Ensure we have valid window count i.e. it should be less than
+ +	 * maximum permissible limit and should be a power of two.
+ +	 */
+ +	if (w_count > pamu_get_max_subwin_cnt() || !is_power_of_2(w_count)) {
+ +		pr_debug("Invalid window count\n");
+ +		spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ +		return -EINVAL;
+ +	}
+ +
+ +	ret = pamu_set_domain_geometry(dma_domain, &domain->geometry,
+ +				       w_count > 1 ? w_count : 0);
+ +	if (!ret) {
+ +		kfree(dma_domain->win_arr);
+ +		dma_domain->win_arr = kcalloc(w_count,
+ +					      sizeof(*dma_domain->win_arr),
+ +					      GFP_ATOMIC);
+ +		if (!dma_domain->win_arr) {
+ +			spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+ +			return -ENOMEM;
+ +		}
+ +		dma_domain->win_cnt = w_count;
+ +	}
+  	spin_unlock_irqrestore(&dma_domain->domain_lock, flags);
+  
+  	return ret;
+  }
+  
+ +static int fsl_pamu_set_domain_attr(struct iommu_domain *domain,
+ +				    enum iommu_attr attr_type, void *data)
+ +{
+ +	struct fsl_dma_domain *dma_domain = to_fsl_dma_domain(domain);
+ +	int ret = 0;
+ +
+ +	switch (attr_type) {
+ +	case DOMAIN_ATTR_GEOMETRY:
+ +		ret = configure_domain_geometry(domain, data);
+ +		break;
+ +	case DOMAIN_ATTR_FSL_PAMU_STASH:
+ +		ret = configure_domain_stash(dma_domain, data);
+ +		break;
+ +	case DOMAIN_ATTR_FSL_PAMU_ENABLE:
+ +		ret = configure_domain_dma_state(dma_domain, *(int *)data);
+ +		break;
+ +	case DOMAIN_ATTR_WINDOWS:
+ +		ret = fsl_pamu_set_windows(domain, *(u32 *)data);
+ +		break;
+ +	default:
+ +		pr_debug("Unsupported attribute type\n");
+ +		ret = -EINVAL;
+ +		break;
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+ +static int fsl_pamu_get_domain_attr(struct iommu_domain *domain,
+ +				    enum iommu_attr attr_type, void *data)
+ +{
+ +	struct fsl_dma_domain *dma_domain = to_fsl_dma_domain(domain);
+ +	int ret = 0;
+ +
+ +	switch (attr_type) {
+ +	case DOMAIN_ATTR_FSL_PAMU_STASH:
+ +		memcpy(data, &dma_domain->dma_stash,
+ +		       sizeof(struct pamu_stash_attribute));
+ +		break;
+ +	case DOMAIN_ATTR_FSL_PAMU_ENABLE:
+ +		*(int *)data = dma_domain->enabled;
+ +		break;
+ +	case DOMAIN_ATTR_FSL_PAMUV1:
+ +		*(int *)data = DOMAIN_ATTR_FSL_PAMUV1;
+ +		break;
+ +	case DOMAIN_ATTR_WINDOWS:
+ +		*(u32 *)data = dma_domain->win_cnt;
+ +		break;
+ +	default:
+ +		pr_debug("Unsupported attribute type\n");
+ +		ret = -EINVAL;
+ +		break;
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 7d61cb6ff012 (iommu/fsl_pamu: enable the liodn when attaching a device)
+  static struct iommu_group *get_device_iommu_group(struct device *dev)
+  {
+  	struct iommu_group *group;
+@@@ -1008,12 -464,9 +1036,17 @@@ static const struct iommu_ops fsl_pamu_
+  	.domain_free    = fsl_pamu_domain_free,
+  	.attach_dev	= fsl_pamu_attach_device,
+  	.detach_dev	= fsl_pamu_detach_device,
+ +	.domain_window_enable = fsl_pamu_window_enable,
+  	.iova_to_phys	= fsl_pamu_iova_to_phys,
+++<<<<<<< HEAD
+ +	.domain_set_attr = fsl_pamu_set_domain_attr,
+ +	.domain_get_attr = fsl_pamu_get_domain_attr,
+ +	.add_device	= fsl_pamu_add_device,
+ +	.remove_device	= fsl_pamu_remove_device,
+++=======
++ 	.probe_device	= fsl_pamu_probe_device,
++ 	.release_device	= fsl_pamu_release_device,
+++>>>>>>> 7d61cb6ff012 (iommu/fsl_pamu: enable the liodn when attaching a device)
+  	.device_group   = fsl_pamu_device_group,
+  };
+  
+diff --cc drivers/iommu/fsl_pamu_domain.h
+index f2b0f741d3de,5f4ed253f61b..000000000000
+--- a/drivers/iommu/fsl_pamu_domain.h
++++ b/drivers/iommu/fsl_pamu_domain.h
+@@@ -21,55 -9,10 +21,58 @@@
+  
+  #include "fsl_pamu.h"
+  
+ +struct dma_window {
+ +	phys_addr_t paddr;
+ +	u64 size;
+ +	int valid;
+ +	int prot;
+ +};
+ +
+  struct fsl_dma_domain {
+ +	/*
+ +	 * Indicates the geometry size for the domain.
+ +	 * This would be set when the geometry is
+ +	 * configured for the domain.
+ +	 */
+ +	dma_addr_t			geom_size;
+ +	/*
+ +	 * Number of windows assocaited with this domain.
+ +	 * During domain initialization, it is set to the
+ +	 * the maximum number of subwindows allowed for a LIODN.
+ +	 * Minimum value for this is 1 indicating a single PAMU
+ +	 * window, without any sub windows. Value can be set/
+ +	 * queried by set_attr/get_attr API for DOMAIN_ATTR_WINDOWS.
+ +	 * Value can only be set once the geometry has been configured.
+ +	 */
+ +	u32				win_cnt;
+ +	/*
+ +	 * win_arr contains information of the configured
+ +	 * windows for a domain. This is allocated only
+ +	 * when the number of windows for the domain are
+ +	 * set.
+ +	 */
+ +	struct dma_window		*win_arr;
+  	/* list of devices associated with the domain */
+  	struct list_head		devices;
+++<<<<<<< HEAD
+ +	/* dma_domain states:
+ +	 * mapped - A particular mapping has been created
+ +	 * within the configured geometry.
+ +	 * enabled - DMA has been enabled for the given
+ +	 * domain. This translates to setting of the
+ +	 * valid bit for the primary PAACE in the PAMU
+ +	 * PAACT table. Domain geometry should be set and
+ +	 * it must have a valid mapping before DMA can be
+ +	 * enabled for it.
+ +	 *
+ +	 */
+ +	int				mapped;
+ +	int				enabled;
+ +	/* stash_id obtained from the stash attribute details */
+++=======
+++>>>>>>> 7d61cb6ff012 (iommu/fsl_pamu: enable the liodn when attaching a device)
+  	u32				stash_id;
+ +	struct pamu_stash_attribute	dma_stash;
+  	u32				snoop_id;
+  	struct iommu_domain		iommu_domain;
+  	spinlock_t			domain_lock;
+diff --cc drivers/soc/fsl/qbman/qman_portal.c
+index a120002b630e,bf38eb0042ed..000000000000
+--- a/drivers/soc/fsl/qbman/qman_portal.c
++++ b/drivers/soc/fsl/qbman/qman_portal.c
+@@@ -45,9 -46,6 +45,12 @@@ static void portal_set_cpu(struct qm_po
+  {
+  #ifdef CONFIG_FSL_PAMU
+  	struct device *dev = pcfg->dev;
+++<<<<<<< HEAD
+ +	int window_count = 1;
+ +	struct iommu_domain_geometry geom_attr;
+ +	struct pamu_stash_attribute stash_attr;
+++=======
+++>>>>>>> 7d61cb6ff012 (iommu/fsl_pamu: enable the liodn when attaching a device)
+  	int ret;
+  
+  	pcfg->iommu_domain = iommu_domain_alloc(&platform_bus_type);
+diff --cc include/linux/iommu.h
+index 1d738c608f7d,f5caaa8d39be..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -125,15 -109,9 +125,18 @@@ enum iommu_cap 
+  enum iommu_attr {
+  	DOMAIN_ATTR_GEOMETRY,
+  	DOMAIN_ATTR_PAGING,
+++<<<<<<< HEAD
+ +	DOMAIN_ATTR_WINDOWS,
+ +	DOMAIN_ATTR_FSL_PAMU_STASH,
+ +	DOMAIN_ATTR_FSL_PAMU_ENABLE,
+ +	DOMAIN_ATTR_FSL_PAMUV1,
+++=======
+++>>>>>>> 7d61cb6ff012 (iommu/fsl_pamu: enable the liodn when attaching a device)
+  	DOMAIN_ATTR_NESTING,	/* two stages of translation */
+  	DOMAIN_ATTR_DMA_USE_FLUSH_QUEUE,
+ +#ifndef __GENKSYMS__
+  	DOMAIN_ATTR_IO_PGTABLE_CFG,
+ +#endif
+  	DOMAIN_ATTR_MAX,
+  };
+  
+* Unmerged path drivers/iommu/fsl_pamu_domain.c
+* Unmerged path drivers/iommu/fsl_pamu_domain.h
+* Unmerged path drivers/soc/fsl/qbman/qman_portal.c
+* Unmerged path include/linux/iommu.h
