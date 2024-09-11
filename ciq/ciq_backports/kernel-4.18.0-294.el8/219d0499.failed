@@ -1,0 +1,208 @@
+mptcp: push pending frames when subflow has free space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 219d04992b689e0498ece02d2a451f2b6e2563a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/219d0499.failed
+
+When multiple subflows are active, we can receive a
+window update on subflow with no write space available.
+MPTCP will try to push frames on such subflow and will
+fail. Pending frames will be pushed only after receiving
+a window update on a subflow with some wspace available.
+
+Overall the above could lead to suboptimal aggregate
+bandwidth usage.
+
+Instead, we should try to push pending frames as soon as
+the subflow reaches both conditions mentioned above.
+
+We can finally enable self-tests with asymmetric links,
+as the above makes them finally pass.
+
+Fixes: 6f8a612a33e4 ("mptcp: keep track of advertised windows right edge")
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 219d04992b689e0498ece02d2a451f2b6e2563a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/options.c
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/options.c
+index af3f2e566740,e0d21c0607e5..000000000000
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@@ -772,15 -873,21 +772,33 @@@ static void update_una(struct mptcp_soc
+  	if (after64(new_snd_una, snd_nxt))
+  		new_snd_una = old_snd_una;
+  
+++<<<<<<< HEAD
+ +	while (after64(new_snd_una, old_snd_una)) {
+ +		snd_una = old_snd_una;
+ +		old_snd_una = atomic64_cmpxchg(&msk->snd_una, snd_una,
+ +					       new_snd_una);
+ +		if (old_snd_una == snd_una) {
+ +			mptcp_data_acked((struct sock *)msk);
+ +			break;
+ +		}
+ +	}
+++=======
++ 	new_wnd_end = new_snd_una + tcp_sk(ssk)->snd_wnd;
++ 
++ 	if (after64(new_wnd_end, msk->wnd_end))
++ 		msk->wnd_end = new_wnd_end;
++ 
++ 	/* this assumes mptcp_incoming_options() is invoked after tcp_ack() */
++ 	if (after64(msk->wnd_end, READ_ONCE(msk->snd_nxt)) &&
++ 	    sk_stream_memory_free(ssk))
++ 		__mptcp_check_push(sk, ssk);
++ 
++ 	if (after64(new_snd_una, old_snd_una)) {
++ 		msk->snd_una = new_snd_una;
++ 		__mptcp_data_acked(sk);
++ 	}
++ 	mptcp_data_unlock(sk);
+++>>>>>>> 219d04992b68 (mptcp: push pending frames when subflow has free space)
+  }
+  
+  bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool use_64bit)
+@@@ -833,8 -940,19 +851,22 @@@ void mptcp_incoming_options(struct soc
+  	struct mptcp_options_received mp_opt;
+  	struct mptcp_ext *mpext;
+  
+++<<<<<<< HEAD
+ +	if (__mptcp_check_fallback(msk))
+++=======
++ 	if (__mptcp_check_fallback(msk)) {
++ 		/* Keep it simple and unconditionally trigger send data cleanup and
++ 		 * pending queue spooling. We will need to acquire the data lock
++ 		 * for more accurate checks, and once the lock is acquired, such
++ 		 * helpers are cheap.
++ 		 */
++ 		mptcp_data_lock(subflow->conn);
++ 		if (sk_stream_memory_free(sk))
++ 			__mptcp_check_push(subflow->conn, sk);
++ 		__mptcp_data_acked(subflow->conn);
++ 		mptcp_data_unlock(subflow->conn);
+++>>>>>>> 219d04992b68 (mptcp: push pending frames when subflow has free space)
+  		return;
+ -	}
+  
+  	mptcp_get_options(skb, &mp_opt);
+  	if (!check_fully_established(msk, sk, subflow, skb, &mp_opt))
+diff --cc net/mptcp/protocol.c
+index 509aa48ee70d,b53a91801a6c..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1989,12 -2904,31 +1989,33 @@@ static int mptcp_getsockopt(struct soc
+  	return -EOPNOTSUPP;
+  }
+  
+ -void __mptcp_data_acked(struct sock *sk)
+ -{
+ -	if (!sock_owned_by_user(sk))
+ -		__mptcp_clean_una(sk);
+ -	else
+ -		set_bit(MPTCP_CLEAN_UNA, &mptcp_sk(sk)->flags);
+ +#define MPTCP_DEFERRED_ALL (TCPF_DELACK_TIMER_DEFERRED | \
+ +			    TCPF_WRITE_TIMER_DEFERRED)
+  
+++<<<<<<< HEAD
+ +/* this is very alike tcp_release_cb() but we must handle differently a
+ + * different set of events
+ + */
+++=======
++ 	if (mptcp_pending_data_fin_ack(sk))
++ 		mptcp_schedule_work(sk);
++ }
++ 
++ void __mptcp_check_push(struct sock *sk, struct sock *ssk)
++ {
++ 	if (!mptcp_send_head(sk))
++ 		return;
++ 
++ 	if (!sock_owned_by_user(sk))
++ 		__mptcp_subflow_push_pending(sk, ssk);
++ 	else
++ 		set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->flags);
++ }
++ 
++ #define MPTCP_DEFERRED_ALL (TCPF_WRITE_TIMER_DEFERRED)
++ 
++ /* processes deferred events and flush wmem */
+++>>>>>>> 219d04992b68 (mptcp: push pending frames when subflow has free space)
+  static void mptcp_release_cb(struct sock *sk)
+  {
+  	unsigned long flags, nflags;
+diff --cc net/mptcp/protocol.h
+index 46bdc749922f,d67de793d363..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -412,16 -502,36 +412,22 @@@ static inline bool mptcp_is_fully_estab
+  void mptcp_rcv_space_init(struct mptcp_sock *msk, const struct sock *ssk);
+  void mptcp_data_ready(struct sock *sk, struct sock *ssk);
+  bool mptcp_finish_join(struct sock *sk);
+++<<<<<<< HEAD
+ +void mptcp_data_acked(struct sock *sk);
+++=======
++ bool mptcp_schedule_work(struct sock *sk);
++ void __mptcp_check_push(struct sock *sk, struct sock *ssk);
++ void __mptcp_data_acked(struct sock *sk);
+++>>>>>>> 219d04992b68 (mptcp: push pending frames when subflow has free space)
+  void mptcp_subflow_eof(struct sock *sk);
+  bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool use_64bit);
+ -void __mptcp_flush_join_list(struct mptcp_sock *msk);
+ -static inline bool mptcp_data_fin_enabled(const struct mptcp_sock *msk)
+ -{
+ -	return READ_ONCE(msk->snd_data_fin_enable) &&
+ -	       READ_ONCE(msk->write_seq) == READ_ONCE(msk->snd_nxt);
+ -}
+ -
+ -void mptcp_destroy_common(struct mptcp_sock *msk);
+ -
+ -void __init mptcp_token_init(void);
+ -static inline void mptcp_token_init_request(struct request_sock *req)
+ -{
+ -	mptcp_subflow_rsk(req)->token_node.pprev = NULL;
+ -}
+  
+  int mptcp_token_new_request(struct request_sock *req);
+ -void mptcp_token_destroy_request(struct request_sock *req);
+ +void mptcp_token_destroy_request(u32 token);
+  int mptcp_token_new_connect(struct sock *sk);
+ -void mptcp_token_accept(struct mptcp_subflow_request_sock *r,
+ -			struct mptcp_sock *msk);
+ -bool mptcp_token_exists(u32 token);
+ +int mptcp_token_new_accept(u32 token, struct sock *conn);
+  struct mptcp_sock *mptcp_token_get_sock(u32 token);
+ -struct mptcp_sock *mptcp_token_iter_next(const struct net *net, long *s_slot,
+ -					 long *s_num);
+ -void mptcp_token_destroy(struct mptcp_sock *msk);
+ +void mptcp_token_destroy(u32 token);
+  
+  void mptcp_crypto_key_sha(u64 key, u32 *token, u64 *idsn);
+  
+* Unmerged path net/mptcp/options.c
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
+diff --git a/tools/testing/selftests/net/mptcp/simult_flows.sh b/tools/testing/selftests/net/mptcp/simult_flows.sh
+index 0d88225daa02..d7313124c875 100755
+--- a/tools/testing/selftests/net/mptcp/simult_flows.sh
++++ b/tools/testing/selftests/net/mptcp/simult_flows.sh
+@@ -287,7 +287,7 @@ run_test 10 10 0 0 "balanced bwidth"
+ run_test 10 10 1 50 "balanced bwidth with unbalanced delay"
+ 
+ # we still need some additional infrastructure to pass the following test-cases
+-# run_test 30 10 0 0 "unbalanced bwidth"
+-# run_test 30 10 1 50 "unbalanced bwidth with unbalanced delay"
+-# run_test 30 10 50 1 "unbalanced bwidth with opposed, unbalanced delay"
++run_test 30 10 0 0 "unbalanced bwidth"
++run_test 30 10 1 50 "unbalanced bwidth with unbalanced delay"
++run_test 30 10 50 1 "unbalanced bwidth with opposed, unbalanced delay"
+ exit $ret
