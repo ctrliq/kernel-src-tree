@@ -1,0 +1,162 @@
+RDMA/uverbs: Simplify ib_uverbs_ex_query_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 7eebced1bae034e11a86c454383b24715eb087b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7eebced1.failed
+
+We truncate the response structure if there is not enough room in the
+user buffer so there is no reason to have all the mess with finely managing
+response_length. Just fully fill the attrs and truncate on copy.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 7eebced1bae034e11a86c454383b24715eb087b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,3cc746639c7b..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -4021,44 -3649,30 +4021,41 @@@ ssize_t ib_uverbs_destroy_srq(struct ib
+  		return PTR_ERR(uobj);
+  
+  	obj = container_of(uobj, struct ib_uevent_object, uobject);
+ +	/*
+ +	 * Make sure we don't free the memory in remove_commit as we still
+ +	 * needs the uobject memory to create the response.
+ +	 */
+ +	uverbs_uobject_get(uobj);
+ +
+  	memset(&resp, 0, sizeof(resp));
+ -	resp.events_reported = obj->events_reported;
+  
+ -	uobj_put_destroy(uobj);
+ +	ret = uobj_remove_commit(uobj);
+ +	if (ret) {
+ +		uverbs_uobject_put(uobj);
+ +		return ret;
+ +	}
+ +	resp.events_reported = obj->events_reported;
+ +	uverbs_uobject_put(uobj);
+ +	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof(resp)))
+ +		return -EFAULT;
+  
+ -	return uverbs_response(attrs, &resp, sizeof(resp));
+ +	return in_len;
+  }
+  
+ -static int ib_uverbs_ex_query_device(struct uverbs_attr_bundle *attrs,
+ -				     struct ib_udata *ucore)
+ +int ib_uverbs_ex_query_device(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      struct ib_udata *ucore,
+ +			      struct ib_udata *uhw)
+  {
+- 	struct ib_uverbs_ex_query_device_resp resp = { {0} };
++ 	struct ib_uverbs_ex_query_device_resp resp = {};
+  	struct ib_uverbs_ex_query_device  cmd;
+  	struct ib_device_attr attr = {0};
+ -	struct ib_ucontext *ucontext;
+ -	struct ib_device *ib_dev;
+  	int err;
+  
+ -	ucontext = ib_uverbs_get_ucontext(attrs);
+ -	if (IS_ERR(ucontext))
+ -		return PTR_ERR(ucontext);
+ -	ib_dev = ucontext->device;
+ +	if (!ib_dev->query_device)
+ +		return -EOPNOTSUPP;
+  
+- 	if (ucore->inlen < sizeof(cmd))
+- 		return -EINVAL;
+- 
+- 	err = ib_copy_from_udata(&cmd, ucore, sizeof(cmd));
++ 	err = uverbs_request(attrs, &cmd, sizeof(cmd));
+  	if (err)
+  		return err;
+  
+@@@ -4068,20 -3682,12 +4065,21 @@@
+  	if (cmd.reserved)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	resp.response_length = offsetof(typeof(resp), odp_caps);
+ +
+ +	if (ucore->outlen < resp.response_length)
+ +		return -ENOSPC;
+ +
+ +	err = ib_dev->query_device(ib_dev, &attr, uhw);
+++=======
++ 	err = ib_dev->query_device(ib_dev, &attr, &attrs->driver_udata);
+++>>>>>>> 7eebced1bae0 (RDMA/uverbs: Simplify ib_uverbs_ex_query_device)
+  	if (err)
+  		return err;
+  
+ -	copy_query_dev_fields(ucontext, &resp.base, &attr);
+ +	copy_query_dev_fields(file, ib_dev, &resp.base, &attr);
+  
+- 	if (ucore->outlen < resp.response_length + sizeof(resp.odp_caps))
+- 		goto end;
+- 
+  #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+  	resp.odp_caps.general_caps = attr.odp_caps.general_caps;
+  	resp.odp_caps.per_transport_caps.rc_odp_caps =
+@@@ -4151,40 -3717,20 +4109,41 @@@
+  		attr.cq_caps.max_cq_moderation_count;
+  	resp.cq_moderation_caps.max_cq_moderation_period =
+  		attr.cq_caps.max_cq_moderation_period;
+- 	resp.response_length += sizeof(resp.cq_moderation_caps);
+- 
+- 	if (ucore->outlen < resp.response_length + sizeof(resp.max_dm_size))
+- 		goto end;
+- 
+  	resp.max_dm_size = attr.max_dm_size;
+++<<<<<<< HEAD
+ +	resp.response_length += sizeof(resp.max_dm_size);
+ +end:
+ +	err = ib_copy_to_udata(ucore, &resp, resp.response_length);
+ +	return err;
+++=======
++ 	resp.response_length = uverbs_response_length(attrs, sizeof(resp));
++ 
++ 	return uverbs_response(attrs, &resp, sizeof(resp));
+++>>>>>>> 7eebced1bae0 (RDMA/uverbs: Simplify ib_uverbs_ex_query_device)
+  }
+  
+ -static int ib_uverbs_ex_modify_cq(struct uverbs_attr_bundle *attrs,
+ -				  struct ib_udata *ucore)
+ +int ib_uverbs_ex_modify_cq(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+  {
+ -	struct ib_uverbs_ex_modify_cq cmd;
+ +	struct ib_uverbs_ex_modify_cq cmd = {};
+  	struct ib_cq *cq;
+ +	size_t required_cmd_sz;
+  	int ret;
+  
+ -	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ +	required_cmd_sz = offsetof(typeof(cmd), reserved) +
+ +				sizeof(cmd.reserved);
+ +	if (ucore->inlen < required_cmd_sz)
+ +		return -EINVAL;
+ +
+ +	/* sanity checks */
+ +	if (ucore->inlen > sizeof(cmd) &&
+ +	    !ib_is_udata_cleared(ucore, sizeof(cmd),
+ +				 ucore->inlen - sizeof(cmd)))
+ +		return -EOPNOTSUPP;
+ +
+ +	ret = ib_copy_from_udata(&cmd, ucore, min(sizeof(cmd), ucore->inlen));
+  	if (ret)
+  		return ret;
+  
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
