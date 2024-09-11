@@ -3455,6 +3455,24 @@ actions_prepare_mod_hdr_actions(struct mlx5e_priv *priv,
 }
 
 static int
+flow_action_supported(struct flow_action *flow_action,
+		      struct netlink_ext_ack *extack)
+{
+	if (!flow_action_has_entries(flow_action)) {
+		NL_SET_ERR_MSG_MOD(extack, "Flow action doesn't have any entries");
+		return -EINVAL;
+	}
+
+	if (!flow_action_hw_stats_check(flow_action, extack,
+					FLOW_ACTION_HW_STATS_DELAYED_BIT)) {
+		NL_SET_ERR_MSG_MOD(extack, "Flow action HW stats type is not supported");
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int
 parse_tc_nic_actions(struct mlx5e_priv *priv,
 		     struct flow_action *flow_action,
 		     struct mlx5e_tc_flow *flow,
@@ -3469,16 +3487,9 @@ parse_tc_nic_actions(struct mlx5e_priv *priv,
 	u32 action = 0;
 	int err, i;
 
-	if (!flow_action_has_entries(flow_action)) {
-		NL_SET_ERR_MSG_MOD(extack, "Flow action doesn't have any entries");
-		return -EINVAL;
-	}
-
-	if (!flow_action_hw_stats_check(flow_action, extack,
-					FLOW_ACTION_HW_STATS_DELAYED_BIT)) {
-		NL_SET_ERR_MSG_MOD(extack, "Flow action HW stats type is not supported");
-		return -EOPNOTSUPP;
-	}
+	err = flow_action_supported(flow_action, extack);
+	if (err)
+		return err;
 
 	nic_attr = attr->nic_attr;
 	nic_attr->flow_tag = MLX5_FS_DEFAULT_FLOW_TAG;
@@ -3904,16 +3915,9 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv,
 	bool mpls_push = false;
 	bool clear_action;
 
-	if (!flow_action_has_entries(flow_action)) {
-		NL_SET_ERR_MSG_MOD(extack, "Flow action doesn't have any entries");
-		return -EINVAL;
-	}
-
-	if (!flow_action_hw_stats_check(flow_action, extack,
-					FLOW_ACTION_HW_STATS_DELAYED_BIT)) {
-		NL_SET_ERR_MSG_MOD(extack, "Flow action HW stats type is not supported");
-		return -EOPNOTSUPP;
-	}
+	err = flow_action_supported(flow_action, extack);
+	if (err)
+		return err;
 
 	esw_attr = attr->esw_attr;
 	parse_attr = attr->parse_attr;
