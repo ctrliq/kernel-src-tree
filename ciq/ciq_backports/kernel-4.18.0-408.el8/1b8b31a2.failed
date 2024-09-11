@@ -1,0 +1,944 @@
+selinux: convert policy read-write lock to RCU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Stephen Smalley <stephen.smalley.work@gmail.com>
+commit 1b8b31a2e6120b7b2bc99137c0ba1ae3e45dbd7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1b8b31a2.failed
+
+Convert the policy read-write lock to RCU.  This is significantly
+simplified by the earlier work to encapsulate the policy data
+structures and refactor the policy load and boolean setting logic.
+Move the latest_granting sequence number into the selinux_policy
+structure so that it can be updated atomically with the policy.
+Since removing the policy rwlock and moving latest_granting reduces
+the selinux_ss structure to nothing more than a wrapper around the
+selinux_policy pointer, get rid of the extra layer of indirection.
+
+At present this change merely passes a hardcoded 1 to
+rcu_dereference_check() in the cases where we know we do not need to
+take rcu_read_lock(), with the preceding comment explaining why.
+Alternatively we could pass fsi->mutex down from selinuxfs and
+apply a lockdep check on it instead.
+
+Based in part on earlier attempts to convert the policy rwlock
+to RCU by Kaigai Kohei [1] and by Peter Enderborg [2].
+
+[1] https://lore.kernel.org/selinux/6e2f9128-e191-ebb3-0e87-74bfccb0767f@tycho.nsa.gov/
+[2] https://lore.kernel.org/selinux/20180530141104.28569-1-peter.enderborg@sony.com/
+
+	Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+	Reviewed-by: Ondrej Mosnacek <omosnace@redhat.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 1b8b31a2e6120b7b2bc99137c0ba1ae3e45dbd7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/ss/services.c
+diff --cc security/selinux/ss/services.c
+index 45cded883bbc,838161462756..000000000000
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@@ -67,25 -64,8 +67,17 @@@
+  #include "xfrm.h"
+  #include "ebitmap.h"
+  #include "audit.h"
+ -#include "policycap_names.h"
+ +
+ +/* Policy capability names */
+ +const char *selinux_policycap_names[__POLICYDB_CAPABILITY_MAX] = {
+ +	"network_peer_controls",
+ +	"open_perms",
+ +	"extended_socket_class",
+ +	"always_check_network",
+ +	"cgroup_seclabel",
+ +	"nnp_nosuid_transition"
+ +};
+  
+- static struct selinux_ss selinux_ss;
+- 
+- void selinux_ss_init(struct selinux_ss **ss)
+- {
+- 	rwlock_init(&selinux_ss.policy_rwlock);
+- 	*ss = &selinux_ss;
+- }
+- 
+  /* Forward declaration. */
+  static int context_struct_to_string(struct policydb *policydb,
+  				    struct context *context,
+@@@ -727,13 -711,14 +721,19 @@@ static void context_struct_compute_av(s
+  }
+  
+  static int security_validtrans_handle_fail(struct selinux_state *state,
+- 					   struct sidtab_entry *oentry,
+- 					   struct sidtab_entry *nentry,
+- 					   struct sidtab_entry *tentry,
+- 					   u16 tclass)
++ 					struct selinux_policy *policy,
++ 					struct sidtab_entry *oentry,
++ 					struct sidtab_entry *nentry,
++ 					struct sidtab_entry *tentry,
++ 					u16 tclass)
+  {
+++<<<<<<< HEAD
+ +	struct policydb *p = &state->ss->policy->policydb;
+ +	struct sidtab *sidtab = &state->ss->policy->sidtab;
+++=======
++ 	struct policydb *p = &policy->policydb;
++ 	struct sidtab *sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	char *o = NULL, *n = NULL, *t = NULL;
+  	u32 olen, nlen, tlen;
+  
+@@@ -775,13 -761,14 +776,19 @@@ static int security_compute_validatetra
+  	if (!selinux_initialized(state))
+  		return 0;
+  
+- 	read_lock(&state->ss->policy_rwlock);
++ 	rcu_read_lock();
+  
+++<<<<<<< HEAD
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	if (!user)
+- 		tclass = unmap_class(&state->ss->policy->map, orig_tclass);
++ 		tclass = unmap_class(&policy->map, orig_tclass);
+  	else
+  		tclass = orig_tclass;
+  
+@@@ -876,10 -865,10 +885,17 @@@ int security_bounded_transition(struct 
+  	if (!selinux_initialized(state))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	rc = -EINVAL;
+  	old_entry = sidtab_search_entry(sidtab, old_sid);
+@@@ -1035,8 -1028,9 +1055,14 @@@ void security_compute_xperms_decision(s
+  	if (!selinux_initialized(state))
+  		goto allow;
+  
+++<<<<<<< HEAD
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	scontext = sidtab_search(sidtab, ssid);
+  	if (!scontext) {
+@@@ -1120,8 -1116,8 +1148,13 @@@ void security_compute_av(struct selinux
+  	if (!selinux_initialized(state))
+  		goto allow;
+  
+++<<<<<<< HEAD
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	scontext = sidtab_search(sidtab, ssid);
+  	if (!scontext) {
+@@@ -1174,8 -1172,8 +1209,13 @@@ void security_compute_av_user(struct se
+  	if (!selinux_initialized(state))
+  		goto allow;
+  
+++<<<<<<< HEAD
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	scontext = sidtab_search(sidtab, ssid);
+  	if (!scontext) {
+@@@ -1297,9 -1296,10 +1338,16 @@@ int security_sidtab_hash_stats(struct s
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	rc = sidtab_hash_stats(&state->ss->policy->sidtab, page);
+ +	read_unlock(&state->ss->policy_rwlock);
+++=======
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	rc = sidtab_hash_stats(policy->sidtab, page);
++ 	rcu_read_unlock();
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	return rc;
+  }
+@@@ -1345,9 -1346,10 +1394,16 @@@ static int security_sid_to_context_core
+  		       "load_policy on unknown SID %d\n", __func__, sid);
+  		return -EINVAL;
+  	}
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	if (force)
+  		entry = sidtab_search_entry_force(sidtab, sid);
+@@@ -1539,9 -1542,10 +1596,16 @@@ static int security_context_to_sid_core
+  		if (!str)
+  			goto out;
+  	}
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	rc = string_to_context_struct(policydb, sidtab, scontext2,
+  				      &context, def_sid);
+  	if (rc == -EINVAL && force) {
+@@@ -1628,8 -1633,8 +1693,13 @@@ static int compute_sid_handle_invalid_c
+  	u16 tclass,
+  	struct context *newcontext)
+  {
+++<<<<<<< HEAD
+ +	struct policydb *policydb = &state->ss->policy->policydb;
+ +	struct sidtab *sidtab = &state->ss->policy->sidtab;
+++=======
++ 	struct policydb *policydb = &policy->policydb;
++ 	struct sidtab *sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	char *s = NULL, *t = NULL, *n = NULL;
+  	u32 slen, tlen, nlen;
+  	struct audit_buffer *ab;
+@@@ -1733,8 -1741,8 +1806,13 @@@ static int security_compute_sid(struct 
+  							  tclass));
+  	}
+  
+++<<<<<<< HEAD
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	sentry = sidtab_search_entry(sidtab, ssid);
+  	if (!sentry) {
+@@@ -2108,13 -2120,10 +2190,11 @@@ static void security_load_policycaps(st
+  	unsigned int i;
+  	struct ebitmap_node *node;
+  
+- 	read_lock(&state->ss->policy_rwlock);
+- 
+- 	p = &state->ss->policy->policydb;
++ 	p = &policy->policydb;
+  
+  	for (i = 0; i < ARRAY_SIZE(state->policycap); i++)
+ -		state->policycap[i] = ebitmap_get_bit(&p->policycaps, i);
+ +		WRITE_ONCE(state->policycap[i],
+ +			ebitmap_get_bit(&p->policycaps, i));
+  
+  	for (i = 0; i < ARRAY_SIZE(selinux_policycap_names); i++)
+  		pr_info("SELinux:  policy capability %s=%d\n",
+@@@ -2147,9 -2161,29 +2231,25 @@@ static void selinux_policy_cond_free(st
+  void selinux_policy_cancel(struct selinux_state *state,
+  			struct selinux_policy *policy)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct selinux_policy *oldpolicy;
++ 
++ 	/*
++ 	 * NOTE: We do not need to take the rcu read lock
++ 	 * around the code below because other policy-modifying
++ 	 * operations are already excluded by selinuxfs via
++ 	 * fsi->mutex.
++ 	 */
++ 	oldpolicy = rcu_dereference_check(state->policy, 1);
++ 
++ 	sidtab_cancel_convert(oldpolicy->sidtab);
++ 	selinux_policy_free(policy);
++ }
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+ -static void selinux_notify_policy_change(struct selinux_state *state,
+ -					u32 seqno)
+ -{
+ -	/* Flush external caches and notify userspace of policy load */
+ -	avc_ss_reset(state->avc, seqno);
+ -	selnl_notify_policyload(seqno);
+ -	selinux_status_update_policyload(state, seqno);
+ -	selinux_netlbl_cache_invalidate();
+ -	selinux_xfrm_notify_policyload();
+ +	sidtab_cancel_convert(&state->ss->policy->sidtab);
+ +	selinux_policy_free(policy);
+  }
+  
+  void selinux_policy_commit(struct selinux_state *state,
+@@@ -2194,14 -2232,11 +2298,15 @@@
+  	}
+  
+  	/* Free the old policy */
++ 	synchronize_rcu();
+  	selinux_policy_free(oldpolicy);
+  
+ -	/* Notify others of the policy change */
+ -	selinux_notify_policy_change(state, seqno);
+ +	/* Flush external caches and notify userspace of policy load */
+ +	avc_ss_reset(state->avc, seqno);
+ +	selnl_notify_policyload(seqno);
+ +	selinux_status_update_policyload(state, seqno);
+ +	selinux_netlbl_cache_invalidate();
+ +	selinux_xfrm_notify_policyload();
+  }
+  
+  /**
+@@@ -2272,9 -2314,9 +2380,13 @@@ int security_load_policy(struct selinux
+  
+  	convert_params.func = convert_context;
+  	convert_params.args = &args;
+ -	convert_params.target = newpolicy->sidtab;
+ +	convert_params.target = &newpolicy->sidtab;
+  
+++<<<<<<< HEAD
+ +	rc = sidtab_convert(&state->ss->policy->sidtab, &convert_params);
+++=======
++ 	rc = sidtab_convert(oldpolicy->sidtab, &convert_params);
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	if (rc) {
+  		pr_err("SELinux:  unable to convert the internal"
+  			" representation of contexts in the new SID"
+@@@ -2291,11 -2333,16 +2403,22 @@@ err
+  
+  size_t security_policydb_len(struct selinux_state *state)
+  {
++ 	struct selinux_policy *policy;
+  	size_t len;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	len = state->ss->policy->policydb.len;
+ +	read_unlock(&state->ss->policy_rwlock);
+++=======
++ 	if (!selinux_initialized(state))
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	len = policy->policydb.len;
++ 	rcu_read_unlock();
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	return len;
+  }
+@@@ -2314,10 -2362,15 +2438,22 @@@ int security_port_sid(struct selinux_st
+  	struct ocontext *c;
+  	int rc = 0;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	if (!selinux_initialized(state)) {
++ 		*out_sid = SECINITSID_PORT;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	c = policydb->ocontexts[OCON_PORT];
+  	while (c) {
+@@@ -2359,10 -2413,15 +2496,22 @@@ int security_ib_pkey_sid(struct selinux
+  	struct ocontext *c;
+  	int rc = 0;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	if (!selinux_initialized(state)) {
++ 		*out_sid = SECINITSID_UNLABELED;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	c = policydb->ocontexts[OCON_IBPKEY];
+  	while (c) {
+@@@ -2405,10 -2465,15 +2555,22 @@@ int security_ib_endport_sid(struct seli
+  	struct ocontext *c;
+  	int rc = 0;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	if (!selinux_initialized(state)) {
++ 		*out_sid = SECINITSID_UNLABELED;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	c = policydb->ocontexts[OCON_IBENDPORT];
+  	while (c) {
+@@@ -2450,10 -2516,15 +2613,22 @@@ int security_netif_sid(struct selinux_s
+  	int rc = 0;
+  	struct ocontext *c;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	if (!selinux_initialized(state)) {
++ 		*if_sid = SECINITSID_NETIF;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	c = policydb->ocontexts[OCON_NETIF];
+  	while (c) {
+@@@ -2513,10 -2585,15 +2689,22 @@@ int security_node_sid(struct selinux_st
+  	int rc;
+  	struct ocontext *c;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	if (!selinux_initialized(state)) {
++ 		*out_sid = SECINITSID_NODE;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	switch (domain) {
+  	case AF_INET: {
+@@@ -2613,10 -2691,10 +2802,17 @@@ int security_get_user_sids(struct selin
+  	if (!selinux_initialized(state))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	context_init(&usercon);
+  
+@@@ -2778,12 -2856,19 +2974,24 @@@ int security_genfs_sid(struct selinux_s
+  		       u16 orig_sclass,
+  		       u32 *sid)
+  {
++ 	struct selinux_policy *policy;
+  	int retval;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	retval = __security_genfs_sid(state->ss->policy,
+++=======
++ 	if (!selinux_initialized(state)) {
++ 		*sid = SECINITSID_UNLABELED;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	retval = __security_genfs_sid(policy,
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  				fstype, path, orig_sclass, sid);
+- 	read_unlock(&state->ss->policy_rwlock);
++ 	rcu_read_unlock();
+  	return retval;
+  }
+  
+@@@ -2807,13 -2893,19 +3016,26 @@@ int security_fs_use(struct selinux_stat
+  	struct sidtab *sidtab;
+  	int rc = 0;
+  	struct ocontext *c;
+ -	struct superblock_security_struct *sbsec = sb->s_security;
+ +	struct superblock_security_struct *sbsec = selinux_superblock(sb);
+  	const char *fstype = sb->s_type->name;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	if (!selinux_initialized(state)) {
++ 		sbsec->behavior = SECURITY_FS_USE_NONE;
++ 		sbsec->sid = SECINITSID_UNLABELED;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	c = policydb->ocontexts[OCON_FSUSE];
+  	while (c) {
+@@@ -2902,65 -2994,79 +3124,137 @@@ err
+  
+  int security_set_bools(struct selinux_state *state, u32 len, int *values)
+  {
+ -	struct selinux_policy *newpolicy, *oldpolicy;
+ +	struct policydb *policydb;
+  	int rc;
+ -	u32 i, seqno = 0;
+ +	u32 i, lenp, seqno = 0;
+ +	char **changed_names;
+ +
+++<<<<<<< HEAD
+ +	changed_names = kcalloc(len, sizeof(*changed_names), GFP_KERNEL);
+ +	if (!changed_names)
+ +		return -ENOMEM;
+ +
+ +	write_lock_irq(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +
+ +	rc = -EFAULT;
+ +	lenp = policydb->p_bools.nprim;
+ +	if (len != lenp)
+ +		goto out;
+ +
+ +	for (i = 0; i < len; i++) {
+ +		if (!!values[i] != policydb->bool_val_to_struct[i]->state) {
+ +			changed_names[i] = kstrdup(sym_name(policydb, SYM_BOOLS, i),
+ +						   GFP_ATOMIC);
+ +			if (!changed_names[i]) {
+ +				rc = -ENOMEM;
+ +				goto out;
+ +			}
+ +		}
+ +		if (values[i])
+ +			policydb->bool_val_to_struct[i]->state = 1;
+ +		else
+ +			policydb->bool_val_to_struct[i]->state = 0;
+ +	}
+  
+ +	evaluate_cond_nodes(policydb);
+ +
+ +	seqno = ++state->ss->latest_granting;
+ +	rc = 0;
+ +out:
+ +	write_unlock_irq(&state->ss->policy_rwlock);
+ +	if (!rc) {
+ +		for (i = 0; i < len; i++) {
+ +			if (changed_names[i]) {
+ +				audit_log(audit_context(), GFP_KERNEL,
+ +					AUDIT_MAC_CONFIG_CHANGE,
+ +					"bool=%s val=%d old_val=%d auid=%u ses=%u",
+ +					changed_names[i], !!values[i], !values[i],
+ +					from_kuid(&init_user_ns, audit_get_loginuid(current)),
+ +					audit_get_sessionid(current));
+ +			}
+ +		}
+ +		avc_ss_reset(state->avc, seqno);
+ +		selnl_notify_policyload(seqno);
+ +		selinux_status_update_policyload(state, seqno);
+ +		selinux_xfrm_notify_policyload();
+ +	}
+ +	for (i = 0; i < len; i++)
+ +		kfree(changed_names[i]);
+ +	kfree(changed_names);
+ +	return rc;
+++=======
++ 	if (!selinux_initialized(state))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * NOTE: We do not need to take the rcu read lock
++ 	 * around the code below because other policy-modifying
++ 	 * operations are already excluded by selinuxfs via
++ 	 * fsi->mutex.
++ 	 */
++ 
++ 	oldpolicy = rcu_dereference_check(state->policy, 1);
++ 
++ 	/* Consistency check on number of booleans, should never fail */
++ 	if (WARN_ON(len != oldpolicy->policydb.p_bools.nprim))
++ 		return -EINVAL;
++ 
++ 	newpolicy = kmemdup(oldpolicy, sizeof(*newpolicy), GFP_KERNEL);
++ 	if (!newpolicy)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * Deep copy only the parts of the policydb that might be
++ 	 * modified as a result of changing booleans.
++ 	 */
++ 	rc = cond_policydb_dup(&newpolicy->policydb, &oldpolicy->policydb);
++ 	if (rc) {
++ 		kfree(newpolicy);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* Update the boolean states in the copy */
++ 	for (i = 0; i < len; i++) {
++ 		int new_state = !!values[i];
++ 		int old_state = newpolicy->policydb.bool_val_to_struct[i]->state;
++ 
++ 		if (new_state != old_state) {
++ 			audit_log(audit_context(), GFP_ATOMIC,
++ 				AUDIT_MAC_CONFIG_CHANGE,
++ 				"bool=%s val=%d old_val=%d auid=%u ses=%u",
++ 				sym_name(&newpolicy->policydb, SYM_BOOLS, i),
++ 				new_state,
++ 				old_state,
++ 				from_kuid(&init_user_ns, audit_get_loginuid(current)),
++ 				audit_get_sessionid(current));
++ 			newpolicy->policydb.bool_val_to_struct[i]->state = new_state;
++ 		}
++ 	}
++ 
++ 	/* Re-evaluate the conditional rules in the copy */
++ 	evaluate_cond_nodes(&newpolicy->policydb);
++ 
++ 	/* Set latest granting seqno for new policy */
++ 	newpolicy->latest_granting = oldpolicy->latest_granting + 1;
++ 	seqno = newpolicy->latest_granting;
++ 
++ 	/* Install the new policy */
++ 	rcu_assign_pointer(state->policy, newpolicy);
++ 
++ 	/*
++ 	 * Free the conditional portions of the old policydb
++ 	 * that were copied for the new policy, and the oldpolicy
++ 	 * structure itself but not what it references.
++ 	 */
++ 	synchronize_rcu();
++ 	selinux_policy_cond_free(oldpolicy);
++ 
++ 	/* Notify others of the policy change */
++ 	selinux_notify_policy_change(state, seqno);
++ 	return 0;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  }
+  
+  int security_get_bool_value(struct selinux_state *state,
+@@@ -2970,9 -3077,12 +3265,18 @@@
+  	int rc;
+  	u32 len;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+++=======
++ 	if (!selinux_initialized(state))
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	rc = -EFAULT;
+  	len = policydb->p_bools.nprim;
+@@@ -3039,10 -3149,10 +3343,17 @@@ int security_sid_mls_copy(struct selinu
+  
+  	context_init(&newcon);
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	if (!policydb->mls_enabled) {
+  		*new_sid = sid;
+@@@ -3149,10 -3261,13 +3462,20 @@@ int security_net_peersid_resolve(struc
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	if (!selinux_initialized(state))
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	/*
+  	 * We don't need to check initialized here since the only way both
+@@@ -3293,21 -3408,31 +3616,43 @@@ err
+  
+  int security_get_reject_unknown(struct selinux_state *state)
+  {
++ 	struct selinux_policy *policy;
+  	int value;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	value = state->ss->policy->policydb.reject_unknown;
+ +	read_unlock(&state->ss->policy_rwlock);
+++=======
++ 	if (!selinux_initialized(state))
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	value = policy->policydb.reject_unknown;
++ 	rcu_read_unlock();
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	return value;
+  }
+  
+  int security_get_allow_unknown(struct selinux_state *state)
+  {
++ 	struct selinux_policy *policy;
+  	int value;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	value = state->ss->policy->policydb.allow_unknown;
+ +	read_unlock(&state->ss->policy_rwlock);
+++=======
++ 	if (!selinux_initialized(state))
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	value = policy->policydb.allow_unknown;
++ 	rcu_read_unlock();
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	return value;
+  }
+  
+@@@ -3324,11 -3449,16 +3669,22 @@@
+  int security_policycap_supported(struct selinux_state *state,
+  				 unsigned int req_cap)
+  {
++ 	struct selinux_policy *policy;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +	rc = ebitmap_get_bit(&state->ss->policy->policydb.policycaps, req_cap);
+ +	read_unlock(&state->ss->policy_rwlock);
+++=======
++ 	if (!selinux_initialized(state))
++ 		return 0;
++ 
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	rc = ebitmap_get_bit(&policy->policydb.policycaps, req_cap);
++ 	rcu_read_unlock();
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	return rc;
+  }
+@@@ -3487,14 -3619,19 +3845,27 @@@ int selinux_audit_rule_match(u32 sid, u
+  		return -ENOENT;
+  	}
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+++=======
++ 	if (!selinux_initialized(state))
++ 		return 0;
++ 
++ 	rcu_read_lock();
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
++ 
++ 	policy = rcu_dereference(state->policy);
+  
+- 	if (rule->au_seqno < state->ss->latest_granting) {
++ 	if (rule->au_seqno < policy->latest_granting) {
+  		match = -ESTALE;
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	ctxt = sidtab_search(&state->ss->policy->sidtab, sid);
+++=======
++ 	ctxt = sidtab_search(policy->sidtab, sid);
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	if (unlikely(!ctxt)) {
+  		WARN_ONCE(1, "selinux_audit_rule_match: unrecognized SID %d\n",
+  			  sid);
+@@@ -3663,10 -3805,10 +4035,17 @@@ int security_netlbl_secattr_to_sid(stru
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	read_lock(&state->ss->policy_rwlock);
+ +
+ +	policydb = &state->ss->policy->policydb;
+ +	sidtab = &state->ss->policy->sidtab;
+++=======
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
++ 	sidtab = policy->sidtab;
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  
+  	if (secattr->flags & NETLBL_SECATTR_CACHE)
+  		*sid = *(u32 *)secattr->cache->data;
+@@@ -3731,12 -3874,12 +4111,16 @@@ int security_netlbl_sid_to_secattr(stru
+  	if (!selinux_initialized(state))
+  		return 0;
+  
+- 	read_lock(&state->ss->policy_rwlock);
+- 
+- 	policydb = &state->ss->policy->policydb;
++ 	rcu_read_lock();
++ 	policy = rcu_dereference(state->policy);
++ 	policydb = &policy->policydb;
+  
+  	rc = -ENOENT;
+++<<<<<<< HEAD
+ +	ctx = sidtab_search(&state->ss->policy->sidtab, sid);
+++=======
++ 	ctx = sidtab_search(policy->sidtab, sid);
+++>>>>>>> 1b8b31a2e612 (selinux: convert policy read-write lock to RCU)
+  	if (ctx == NULL)
+  		goto out;
+  
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 523d4e774f87..da738bbd865f 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -7227,7 +7227,6 @@ static __init int selinux_init(void)
+ 	memset(&selinux_state, 0, sizeof(selinux_state));
+ 	enforcing_set(&selinux_state, selinux_enforcing_boot);
+ 	selinux_state.checkreqprot = selinux_checkreqprot_boot;
+-	selinux_ss_init(&selinux_state.ss);
+ 	selinux_avc_init(&selinux_state.avc);
+ 	mutex_init(&selinux_state.status_lock);
+ 
+diff --git a/security/selinux/include/security.h b/security/selinux/include/security.h
+index aedc0702f5dd..9116b6589441 100644
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -13,6 +13,7 @@
+ #include <linux/dcache.h>
+ #include <linux/magic.h>
+ #include <linux/types.h>
++#include <linux/rcupdate.h>
+ #include <linux/refcount.h>
+ #include <linux/workqueue.h>
+ #include "flask.h"
+@@ -100,7 +101,6 @@ extern const char *selinux_policycap_names[__POLICYDB_CAPABILITY_MAX];
+ #define POLICYDB_BOUNDS_MAXDEPTH	4
+ 
+ struct selinux_avc;
+-struct selinux_ss;
+ struct selinux_policy;
+ 
+ struct selinux_state {
+@@ -118,10 +118,9 @@ struct selinux_state {
+ 	struct mutex status_lock;
+ 
+ 	struct selinux_avc *avc;
+-	struct selinux_ss *ss;
++	struct selinux_policy __rcu *policy;
+ } __randomize_layout;
+ 
+-void selinux_ss_init(struct selinux_ss **ss);
+ void selinux_avc_init(struct selinux_avc **avc);
+ 
+ extern struct selinux_state selinux_state;
+* Unmerged path security/selinux/ss/services.c
+diff --git a/security/selinux/ss/services.h b/security/selinux/ss/services.h
+index c36933c1c363..a262687c15a3 100644
+--- a/security/selinux/ss/services.h
++++ b/security/selinux/ss/services.h
+@@ -26,12 +26,7 @@ struct selinux_policy {
+ 	struct sidtab sidtab;
+ 	struct policydb policydb;
+ 	struct selinux_map map;
+-};
+-
+-struct selinux_ss {
+-	rwlock_t policy_rwlock;
+ 	u32 latest_granting;
+-	struct selinux_policy *policy;
+ } __randomize_layout;
+ 
+ void services_compute_xperms_drivers(struct extended_perms *xperms,
