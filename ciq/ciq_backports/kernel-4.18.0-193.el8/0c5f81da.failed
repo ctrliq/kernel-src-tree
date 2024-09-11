@@ -1,0 +1,195 @@
+KVM: LAPIC: Inject timer interrupt via posted interrupt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Wanpeng Li <wanpengli@tencent.com>
+commit 0c5f81dad46c90792e6c3c4797131323c9e96dcd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0c5f81da.failed
+
+Dedicated instances are currently disturbed by unnecessary jitter due
+to the emulated lapic timers firing on the same pCPUs where the
+vCPUs reside.  There is no hardware virtual timer on Intel for guest
+like ARM, so both programming timer in guest and the emulated timer fires
+incur vmexits.  This patch tries to avoid vmexit when the emulated timer
+fires, at least in dedicated instance scenario when nohz_full is enabled.
+
+In that case, the emulated timers can be offload to the nearest busy
+housekeeping cpus since APICv has been found for several years in server
+processors. The guest timer interrupt can then be injected via posted interrupts,
+which are delivered by the housekeeping cpu once the emulated timer fires.
+
+The host should tuned so that vCPUs are placed on isolated physical
+processors, and with several pCPUs surplus for busy housekeeping.
+If disabled mwait/hlt/pause vmexits keep the vCPUs in non-root mode,
+~3% redis performance benefit can be observed on Skylake server, and the
+number of external interrupt vmexits drops substantially.  Without patch
+
+            VM-EXIT  Samples  Samples%  Time%   Min Time  Max Time   Avg time
+EXTERNAL_INTERRUPT    42916    49.43%   39.30%   0.47us   106.09us   0.71us ( +-   1.09% )
+
+While with patch:
+
+            VM-EXIT  Samples  Samples%  Time%   Min Time  Max Time         Avg time
+EXTERNAL_INTERRUPT    6871     9.29%     2.96%   0.44us    57.88us   0.72us ( +-   4.02% )
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Signed-off-by: Wanpeng Li <wanpengli@tencent.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0c5f81dad46c90792e6c3c4797131323c9e96dcd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+diff --cc arch/x86/kvm/lapic.c
+index f5e7241ea740,0aa158657f20..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1428,29 -1432,6 +1439,32 @@@ static void apic_update_lvtt(struct kvm
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void apic_timer_expired(struct kvm_lapic *apic)
+ +{
+ +	struct kvm_vcpu *vcpu = apic->vcpu;
+ +	struct swait_queue_head *q = &vcpu->wq;
+ +	struct kvm_timer *ktimer = &apic->lapic_timer;
+ +
+ +	if (atomic_read(&apic->lapic_timer.pending))
+ +		return;
+ +
+ +	atomic_inc(&apic->lapic_timer.pending);
+ +	kvm_set_pending_timer(vcpu);
+ +
+ +	/*
+ +	 * For x86, the atomic_inc() is serialized, thus
+ +	 * using swait_active() is safe.
+ +	 */
+ +	if (swait_active(q))
+ +		swake_up(q);
+ +
+ +	if (apic_lvtt_tscdeadline(apic) || ktimer->hv_timer_in_use)
+ +		ktimer->expired_tscdeadline = ktimer->tscdeadline;
+ +}
+ +
+++=======
+++>>>>>>> 0c5f81dad46c (KVM: LAPIC: Inject timer interrupt via posted interrupt)
+  /*
+   * On APICv, this test will cause a busy wait
+   * during a higher-priority task.
+* Unmerged path arch/x86/kvm/lapic.c
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index 36747174e4a8..50053d2b8b7b 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -236,6 +236,7 @@ void kvm_lapic_switch_to_hv_timer(struct kvm_vcpu *vcpu);
+ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu);
+ bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu);
+ void kvm_lapic_restart_hv_timer(struct kvm_vcpu *vcpu);
++bool kvm_can_post_timer_interrupt(struct kvm_vcpu *vcpu);
+ 
+ static inline enum lapic_mode kvm_apic_mode(u64 apic_base)
+ {
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 532822e32783..08ae7411b1d9 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7072,7 +7072,8 @@ static int vmx_set_hv_timer(struct kvm_vcpu *vcpu, u64 guest_deadline_tsc,
+ 	u64 tscl, guest_tscl, delta_tsc, lapic_timer_advance_cycles;
+ 	struct kvm_timer *ktimer = &vcpu->arch.apic->lapic_timer;
+ 
+-	if (kvm_mwait_in_guest(vcpu->kvm))
++	if (kvm_mwait_in_guest(vcpu->kvm) ||
++		kvm_can_post_timer_interrupt(vcpu))
+ 		return -EOPNOTSUPP;
+ 
+ 	vmx = to_vmx(vcpu);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 217dcadb3de0..3d0868e0b33b 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -54,6 +54,7 @@
+ #include <linux/kvm_irqfd.h>
+ #include <linux/irqbypass.h>
+ #include <linux/sched/stat.h>
++#include <linux/sched/isolation.h>
+ #include <linux/mem_encrypt.h>
+ 
+ #include <trace/events/kvm.h>
+@@ -155,6 +156,9 @@ EXPORT_SYMBOL_GPL(enable_vmware_backdoor);
+ static bool __read_mostly force_emulation_prefix = false;
+ module_param(force_emulation_prefix, bool, S_IRUGO);
+ 
++int __read_mostly pi_inject_timer = -1;
++module_param(pi_inject_timer, bint, S_IRUGO | S_IWUSR);
++
+ #define KVM_NR_SHARED_MSRS 16
+ 
+ struct kvm_shared_msrs_global {
+@@ -7047,6 +7051,8 @@ int kvm_arch_init(void *opaque)
+ 		host_xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
+ 
+ 	kvm_lapic_init();
++	if (pi_inject_timer == -1)
++		pi_inject_timer = housekeeping_enabled(HK_FLAG_TIMER);
+ #ifdef CONFIG_X86_64
+ 	pvclock_gtod_register_notifier(&pvclock_gtod_notifier);
+ 
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index e08a12892e8b..6594020c0691 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -301,6 +301,8 @@ extern unsigned int min_timer_period_us;
+ 
+ extern bool enable_vmware_backdoor;
+ 
++extern int pi_inject_timer;
++
+ extern struct static_key kvm_no_apic_vcpu;
+ 
+ static inline u64 nsec_to_cycles(struct kvm_vcpu *vcpu, u64 nsec)
+diff --git a/include/linux/sched/isolation.h b/include/linux/sched/isolation.h
+index 4a6582c27dea..541c8e500448 100644
+--- a/include/linux/sched/isolation.h
++++ b/include/linux/sched/isolation.h
+@@ -19,6 +19,7 @@ enum hk_flags {
+ DECLARE_STATIC_KEY_FALSE(housekeeping_overriden);
+ extern int housekeeping_any_cpu(enum hk_flags flags);
+ extern const struct cpumask *housekeeping_cpumask(enum hk_flags flags);
++extern bool housekeeping_enabled(enum hk_flags flags);
+ extern void housekeeping_affine(struct task_struct *t, enum hk_flags flags);
+ extern bool housekeeping_test_cpu(int cpu, enum hk_flags flags);
+ extern void __init housekeeping_init(void);
+@@ -35,6 +36,11 @@ static inline const struct cpumask *housekeeping_cpumask(enum hk_flags flags)
+ 	return cpu_possible_mask;
+ }
+ 
++static inline bool housekeeping_enabled(enum hk_flags flags)
++{
++	return false;
++}
++
+ static inline void housekeeping_affine(struct task_struct *t,
+ 				       enum hk_flags flags) { }
+ static inline void housekeeping_init(void) { }
+diff --git a/kernel/sched/isolation.c b/kernel/sched/isolation.c
+index 2e5cbf08ccd8..f31b82710ffa 100644
+--- a/kernel/sched/isolation.c
++++ b/kernel/sched/isolation.c
+@@ -13,6 +13,12 @@ EXPORT_SYMBOL_GPL(housekeeping_overriden);
+ static cpumask_var_t housekeeping_mask;
+ static unsigned int housekeeping_flags;
+ 
++bool housekeeping_enabled(enum hk_flags flags)
++{
++	return !!(housekeeping_flags & flags);
++}
++EXPORT_SYMBOL_GPL(housekeeping_enabled);
++
+ int housekeeping_any_cpu(enum hk_flags flags)
+ {
+ 	if (static_branch_unlikely(&housekeeping_overriden))
