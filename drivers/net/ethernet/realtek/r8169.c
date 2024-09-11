@@ -6200,8 +6200,6 @@ static void rtl8169_pcierr_interrupt(struct net_device *dev)
 		dev->features &= ~NETIF_F_HIGHDMA;
 	}
 
-	rtl8169_hw_reset(tp);
-
 	rtl_schedule_task(tp, RTL_FLAG_TASK_RESET_PENDING);
 }
 
