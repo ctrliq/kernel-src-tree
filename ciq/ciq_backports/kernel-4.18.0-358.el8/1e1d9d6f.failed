@@ -1,0 +1,122 @@
+mptcp: handle pending data on closed subflow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 1e1d9d6f119c55c05e8ea78ed3e49046690abffd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/1e1d9d6f.failed
+
+The PM can close active subflow, e.g. due to ingress RM_ADDR
+option. Such subflow could carry data still unacked at the
+MPTCP-level, both in the write and the rtx_queue, which has
+never reached the other peer.
+
+Currently the mptcp-level retransmission will deliver such data,
+but at a very low rate (at most 1 DSM for each MPTCP rtx interval).
+
+We can speed-up the recovery a lot, moving all the unacked in the
+tcp write_queue, so that it will be pushed again via other
+subflows, at the speed allowed by them.
+
+Also make available the new helper for later patches.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/207
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1e1d9d6f119c55c05e8ea78ed3e49046690abffd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 11b37cc5a34e,5fafa7a4cd69..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1088,11 -1089,19 +1100,15 @@@ static void __mptcp_clean_una(struct so
+  		cleaned = true;
+  	}
+  
++ 	/* all retransmitted data acked, recovery completed */
++ 	if (unlikely(msk->recovery) && after64(msk->snd_una, msk->recovery_snd_nxt))
++ 		msk->recovery = false;
++ 
+  out:
+ -	if (cleaned) {
+ -		if (tcp_under_memory_pressure(sk)) {
+ -			__mptcp_update_wmem(sk);
+ -			sk_mem_reclaim_partial(sk);
+ -		}
+ -	}
+ +	if (cleaned && tcp_under_memory_pressure(sk))
+ +		__mptcp_mem_reclaim_partial(sk);
+  
+- 	if (snd_una == READ_ONCE(msk->snd_nxt)) {
++ 	if (snd_una == READ_ONCE(msk->snd_nxt) && !msk->recovery) {
+  		if (mptcp_timer_pending(sk) && !mptcp_data_fin_enabled(msk))
+  			mptcp_stop_timer(sk);
+  	} else {
+@@@ -2361,6 -2474,8 +2426,11 @@@ static int __mptcp_init_sock(struct soc
+  
+  	msk->first = NULL;
+  	inet_csk(sk)->icsk_sync_mss = mptcp_sync_mss;
+++<<<<<<< HEAD
+++=======
++ 	WRITE_ONCE(msk->csum_enabled, mptcp_is_checksum_enabled(sock_net(sk)));
++ 	msk->recovery = false;
+++>>>>>>> 1e1d9d6f119c (mptcp: handle pending data on closed subflow)
+  
+  	mptcp_pm_data_init(msk);
+  
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index 1377816711e0..e041d9c55d25 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -926,9 +926,11 @@ static void ack_update_msk(struct mptcp_sock *msk,
+ 	old_snd_una = msk->snd_una;
+ 	new_snd_una = mptcp_expand_seq(old_snd_una, mp_opt->data_ack, mp_opt->ack64);
+ 
+-	/* ACK for data not even sent yet? Ignore. */
+-	if (after64(new_snd_una, snd_nxt))
+-		new_snd_una = old_snd_una;
++	/* ACK for data not even sent yet and even above recovery bound? Ignore.*/
++	if (unlikely(after64(new_snd_una, snd_nxt))) {
++		if (!msk->recovery || after64(new_snd_una, msk->recovery_snd_nxt))
++			new_snd_una = old_snd_una;
++	}
+ 
+ 	new_wnd_end = new_snd_una + tcp_sk(ssk)->snd_wnd;
+ 
+* Unmerged path net/mptcp/protocol.c
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 5c8dbbab0f7e..2546e4b677c1 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -223,12 +223,17 @@ struct mptcp_sock {
+ 	struct sock	*last_snd;
+ 	int		snd_burst;
+ 	int		old_wspace;
++	u64		recovery_snd_nxt;	/* in recovery mode accept up to this seq;
++						 * recovery related fields are under data_lock
++						 * protection
++						 */
+ 	u64		snd_una;
+ 	u64		wnd_end;
+ 	unsigned long	timer_ival;
+ 	u32		token;
+ 	int		rmem_released;
+ 	unsigned long	flags;
++	bool		recovery;		/* closing subflow write queue reinjected */
+ 	bool		can_ack;
+ 	bool		fully_established;
+ 	bool		rcv_data_fin;
+@@ -534,6 +539,7 @@ int mptcp_is_enabled(struct net *net);
+ unsigned int mptcp_get_add_addr_timeout(struct net *net);
+ void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
+ 				     struct mptcp_options_received *mp_opt);
++bool __mptcp_retransmit_pending_data(struct sock *sk);
+ bool mptcp_subflow_data_available(struct sock *sk);
+ void __init mptcp_subflow_init(void);
+ void mptcp_subflow_shutdown(struct sock *sk, struct sock *ssk, int how);
