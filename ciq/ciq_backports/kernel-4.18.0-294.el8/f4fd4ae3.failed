@@ -1,0 +1,169 @@
+virtiofs: get rid of no_mount_options
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit f4fd4ae354ba23c948afb0ee3386182acb96d481
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f4fd4ae3.failed
+
+This option was introduced so that for virtio_fs we don't show any mounts
+options fuse_show_options(). Because we don't offer any of these options
+to be controlled by mounter.
+
+Very soon we are planning to introduce option "dax" which mounter should
+be able to specify. And no_mount_options does not work anymore.
+
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit f4fd4ae354ba23c948afb0ee3386182acb96d481)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/inode.c
+diff --cc fs/fuse/inode.c
+index 10b75246113a,bdae765b2d42..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -1178,18 -1193,18 +1179,30 @@@ int fuse_fill_super_common(struct super
+  		fc->dont_mask = 1;
+  	sb->s_flags |= SB_POSIXACL;
+  
+++<<<<<<< HEAD
+ +	fc->default_permissions = d->default_permissions;
+ +	fc->allow_other = d->allow_other;
+ +	fc->user_id = d->user_id;
+ +	fc->group_id = d->group_id;
+ +	fc->max_read = max_t(unsigned, 4096, d->max_read);
+ +	fc->destroy = d->destroy;
+ +	fc->no_control = d->no_control;
+ +	fc->no_force_umount = d->no_force_umount;
+ +	fc->no_mount_options = d->no_mount_options;
+++=======
++ 	fc->default_permissions = ctx->default_permissions;
++ 	fc->allow_other = ctx->allow_other;
++ 	fc->user_id = ctx->user_id;
++ 	fc->group_id = ctx->group_id;
++ 	fc->legacy_opts_show = ctx->legacy_opts_show;
++ 	fc->max_read = max_t(unsigned, 4096, ctx->max_read);
++ 	fc->destroy = ctx->destroy;
++ 	fc->no_control = ctx->no_control;
++ 	fc->no_force_umount = ctx->no_force_umount;
+++>>>>>>> f4fd4ae354ba (virtiofs: get rid of no_mount_options)
+  
+  	err = -ENOMEM;
+ -	root = fuse_get_root_inode(sb, ctx->rootmode);
+ +	root = fuse_get_root_inode(sb, d->rootmode);
+  	sb->s_d_op = &fuse_root_dentry_operations;
+  	root_dentry = d_make_root(root);
+  	if (!root_dentry)
+@@@ -1280,11 -1290,54 +1293,60 @@@ static int fuse_fill_super(struct super
+  	return err;
+  }
+  
+ -static int fuse_get_tree(struct fs_context *fc)
+ +static struct dentry *fuse_mount(struct file_system_type *fs_type,
+ +		       int flags, const char *dev_name,
+ +		       void *raw_data)
+  {
+++<<<<<<< HEAD
+ +	return mount_nodev(fs_type, flags, raw_data, fuse_fill_super);
+++=======
++ 	struct fuse_fs_context *ctx = fc->fs_private;
++ 
++ 	if (!ctx->fd_present || !ctx->rootmode_present ||
++ 	    !ctx->user_id_present || !ctx->group_id_present)
++ 		return -EINVAL;
++ 
++ #ifdef CONFIG_BLOCK
++ 	if (ctx->is_bdev)
++ 		return get_tree_bdev(fc, fuse_fill_super);
++ #endif
++ 
++ 	return get_tree_nodev(fc, fuse_fill_super);
++ }
++ 
++ static const struct fs_context_operations fuse_context_ops = {
++ 	.free		= fuse_free_fc,
++ 	.parse_param	= fuse_parse_param,
++ 	.reconfigure	= fuse_reconfigure,
++ 	.get_tree	= fuse_get_tree,
++ };
++ 
++ /*
++  * Set up the filesystem mount context.
++  */
++ static int fuse_init_fs_context(struct fs_context *fc)
++ {
++ 	struct fuse_fs_context *ctx;
++ 
++ 	ctx = kzalloc(sizeof(struct fuse_fs_context), GFP_KERNEL);
++ 	if (!ctx)
++ 		return -ENOMEM;
++ 
++ 	ctx->max_read = ~0;
++ 	ctx->blksize = FUSE_DEFAULT_BLKSIZE;
++ 	ctx->legacy_opts_show = true;
++ 
++ #ifdef CONFIG_BLOCK
++ 	if (fc->fs_type == &fuseblk_fs_type) {
++ 		ctx->is_bdev = true;
++ 		ctx->destroy = true;
++ 	}
++ #endif
++ 
++ 	fc->fs_private = ctx;
++ 	fc->ops = &fuse_context_ops;
++ 	return 0;
+++>>>>>>> f4fd4ae354ba (virtiofs: get rid of no_mount_options)
+  }
+  
+  static void fuse_sb_destroy(struct super_block *sb)
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 50415774dba0..7e0732373fff 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -482,7 +482,7 @@ struct fuse_fs_context {
+ 	bool destroy:1;
+ 	bool no_control:1;
+ 	bool no_force_umount:1;
+-	bool no_mount_options:1;
++	bool legacy_opts_show:1;
+ 	unsigned int max_read;
+ 	unsigned int blksize;
+ 
+@@ -609,6 +609,9 @@ struct fuse_conn {
+ 	/** cache READLINK responses in page cache */
+ 	unsigned cache_symlinks:1;
+ 
++	/* show legacy mount options */
++	unsigned int legacy_opts_show:1;
++
+ 	/*
+ 	 * The following bitfields are only for optimization purposes
+ 	 * and hence races in setting them will not cause malfunction
+@@ -716,9 +719,6 @@ struct fuse_conn {
+ 	/** Do not allow MNT_FORCE umount */
+ 	unsigned int no_force_umount:1;
+ 
+-	/* Do not show mount options */
+-	unsigned int no_mount_options:1;
+-
+ 	/** The number of requests waiting for completion */
+ 	atomic_t num_waiting;
+ 
+* Unmerged path fs/fuse/inode.c
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index 353c92071511..d714130f221b 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1095,7 +1095,6 @@ static int virtio_fs_fill_super(struct super_block *sb)
+ 		.destroy = true,
+ 		.no_control = true,
+ 		.no_force_umount = true,
+-		.no_mount_options = true,
+ 	};
+ 
+ 	mutex_lock(&virtio_fs_mutex);
