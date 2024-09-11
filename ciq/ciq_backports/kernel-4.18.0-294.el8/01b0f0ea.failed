@@ -1,0 +1,149 @@
+powerpc/64s: Trim offlined CPUs from mm_cpumasks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit 01b0f0eae0812e80efeee4ee17687e5386335e08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/01b0f0ea.failed
+
+When offlining a CPU, powerpc/64s does not flush TLBs, rather it just
+leaves the CPU set in mm_cpumasks, so it continues to receive TLBIEs
+to manage its TLBs.
+
+However the exit_flush_lazy_tlbs() function expects that after
+returning, all CPUs (except self) have flushed TLBs for that mm, in
+which case TLBIEL can be used for this flush. This breaks for offline
+CPUs because they don't get the IPI to flush their TLB. This can lead
+to stale translations.
+
+Fix this by clearing the CPU from mm_cpumasks, then flushing all TLBs
+before going offline.
+
+These offlined CPU bits stuck in the cpumask also prevents the cpumask
+from being trimmed back to local mode, which means continual broadcast
+IPIs or TLBIEs are needed for TLB flushing. This patch prevents that
+situation too.
+
+A cast of many were involved in working this out, but in particular
+Milton, Aneesh, Paul made key discoveries.
+
+Fixes: 0cef77c7798a7 ("powerpc/64s/radix: flush remote CPUs out of single-threaded mm_cpumask")
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Debugged-by: Milton Miller <miltonm@us.ibm.com>
+	Debugged-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Debugged-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20201126102530.691335-5-npiggin@gmail.com
+(cherry picked from commit 01b0f0eae0812e80efeee4ee17687e5386335e08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/book3s/64/mmu.h
+diff --cc arch/powerpc/include/asm/book3s/64/mmu.h
+index ef9857030db5,750918451dd2..000000000000
+--- a/arch/powerpc/include/asm/book3s/64/mmu.h
++++ b/arch/powerpc/include/asm/book3s/64/mmu.h
+@@@ -208,7 -242,19 +208,23 @@@ extern void radix_init_pseries(void)
+  static inline void radix_init_pseries(void) { };
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline int get_ea_context(mm_context_t *ctx, unsigned long ea)
+++=======
++ #ifdef CONFIG_HOTPLUG_CPU
++ #define arch_clear_mm_cpumask_cpu(cpu, mm)				\
++ 	do {								\
++ 		if (cpumask_test_cpu(cpu, mm_cpumask(mm))) {		\
++ 			atomic_dec(&(mm)->context.active_cpus);		\
++ 			cpumask_clear_cpu(cpu, mm_cpumask(mm));		\
++ 		}							\
++ 	} while (0)
++ 
++ void cleanup_cpu_mmu_context(void);
++ #endif
++ 
++ static inline int get_user_context(mm_context_t *ctx, unsigned long ea)
+++>>>>>>> 01b0f0eae081 (powerpc/64s: Trim offlined CPUs from mm_cpumasks)
+  {
+  	int index = ea >> MAX_EA_BITS_PER_CONTEXT;
+  
+* Unmerged path arch/powerpc/include/asm/book3s/64/mmu.h
+diff --git a/arch/powerpc/mm/book3s64/mmu_context.c b/arch/powerpc/mm/book3s64/mmu_context.c
+index 928baa4f83ce..89843f428013 100644
+--- a/arch/powerpc/mm/book3s64/mmu_context.c
++++ b/arch/powerpc/mm/book3s64/mmu_context.c
+@@ -22,6 +22,7 @@
+ #include <linux/export.h>
+ #include <linux/gfp.h>
+ #include <linux/slab.h>
++#include <linux/cpu.h>
+ 
+ #include <asm/mmu_context.h>
+ #include <asm/pgalloc.h>
+@@ -292,3 +293,22 @@ void radix__switch_mmu_context(struct mm_struct *prev, struct mm_struct *next)
+ 	isync();
+ }
+ #endif
++
++/**
++ * cleanup_cpu_mmu_context - Clean up MMU details for this CPU (newly offlined)
++ *
++ * This clears the CPU from mm_cpumask for all processes, and then flushes the
++ * local TLB to ensure TLB coherency in case the CPU is onlined again.
++ *
++ * KVM guest translations are not necessarily flushed here. If KVM started
++ * using mm_cpumask or the Linux APIs which do, this would have to be resolved.
++ */
++#ifdef CONFIG_HOTPLUG_CPU
++void cleanup_cpu_mmu_context(void)
++{
++	int cpu = smp_processor_id();
++
++	clear_tasks_mm_cpumask(cpu);
++	tlbiel_all();
++}
++#endif
+diff --git a/arch/powerpc/platforms/powermac/smp.c b/arch/powerpc/platforms/powermac/smp.c
+index 35be6e0b886d..477077b7ffb1 100644
+--- a/arch/powerpc/platforms/powermac/smp.c
++++ b/arch/powerpc/platforms/powermac/smp.c
+@@ -920,6 +920,8 @@ static int smp_core99_cpu_disable(void)
+ 
+ 	mpic_cpu_set_priority(0xf);
+ 
++	cleanup_cpu_mmu_context();
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/powerpc/platforms/powernv/smp.c b/arch/powerpc/platforms/powernv/smp.c
+index 07448d39642e..b84bd2a6030f 100644
+--- a/arch/powerpc/platforms/powernv/smp.c
++++ b/arch/powerpc/platforms/powernv/smp.c
+@@ -147,6 +147,9 @@ static int pnv_smp_cpu_disable(void)
+ 		xive_smp_disable_cpu();
+ 	else
+ 		xics_migrate_irqs_away();
++
++	cleanup_cpu_mmu_context();
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/powerpc/platforms/pseries/hotplug-cpu.c b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+index ab8ecd5fda49..30d71e4479dc 100644
+--- a/arch/powerpc/platforms/pseries/hotplug-cpu.c
++++ b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+@@ -183,6 +183,9 @@ static int pseries_cpu_disable(void)
+ 		xive_smp_disable_cpu();
+ 	else
+ 		xics_migrate_irqs_away();
++
++	cleanup_cpu_mmu_context();
++
+ 	return 0;
+ }
+ 
