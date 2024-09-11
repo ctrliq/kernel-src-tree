@@ -1,0 +1,172 @@
+kvm: selftests: aarch64: dirty_log_test: support greater than 40-bit IPAs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Andrew Jones <drjones@redhat.com>
+commit 8cee58161efffcb5ba691c33fe4de3eb75cf46cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8cee5816.failed
+
+When KVM has KVM_CAP_ARM_VM_IPA_SIZE we can test with > 40-bit IPAs by
+using the 'type' field of KVM_CREATE_VM.
+
+	Signed-off-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 8cee58161efffcb5ba691c33fe4de3eb75cf46cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/dirty_log_test.c
+diff --cc tools/testing/selftests/kvm/dirty_log_test.c
+index a2e86fdacc19,4715cfba20dc..000000000000
+--- a/tools/testing/selftests/kvm/dirty_log_test.c
++++ b/tools/testing/selftests/kvm/dirty_log_test.c
+@@@ -283,8 -306,16 +298,8 @@@ static void run_test(enum vm_guest_mod
+  	bmap = bitmap_alloc(host_num_pages);
+  	host_bmap_track = bitmap_alloc(host_num_pages);
+  
+- 	vm = create_vm(mode, VCPU_ID, guest_num_pages, guest_code);
++ 	vm = create_vm(mode, VCPU_ID, guest_num_pages, guest_code, type);
+  
+ -#ifdef USE_CLEAR_DIRTY_LOG
+ -	struct kvm_enable_cap cap = {};
+ -
+ -	cap.cap = KVM_CAP_MANUAL_DIRTY_LOG_PROTECT;
+ -	cap.args[0] = 1;
+ -	vm_enable_cap(vm, &cap);
+ -#endif
+ -
+  	/* Add an extra memory slot for testing dirty logging */
+  	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+  				    guest_test_phys_mem,
+@@@ -398,11 -422,34 +413,42 @@@ int main(int argc, char *argv[]
+  	unsigned long iterations = TEST_HOST_LOOP_N;
+  	unsigned long interval = TEST_HOST_LOOP_INTERVAL;
+  	bool mode_selected = false;
+++<<<<<<< HEAD
+ +	bool top_offset = false;
+ +	unsigned int mode;
+ +	int opt, i;
+ +
+ +	while ((opt = getopt(argc, argv, "hi:I:o:tm:")) != -1) {
+++=======
++ 	uint64_t phys_offset = 0;
++ 	unsigned int mode, host_ipa_limit;
++ 	int opt, i;
++ 
++ #ifdef USE_CLEAR_DIRTY_LOG
++ 	if (!kvm_check_cap(KVM_CAP_MANUAL_DIRTY_LOG_PROTECT)) {
++ 		fprintf(stderr, "KVM_CLEAR_DIRTY_LOG not available, skipping tests\n");
++ 		exit(KSFT_SKIP);
++ 	}
++ #endif
++ 
++ #ifdef __x86_64__
++ 	vm_guest_mode_params_init(VM_MODE_P52V48_4K, true, true);
++ #endif
++ #ifdef __aarch64__
++ 	vm_guest_mode_params_init(VM_MODE_P40V48_4K, true, true);
++ 	vm_guest_mode_params_init(VM_MODE_P40V48_64K, true, true);
++ 
++ 	host_ipa_limit = kvm_check_cap(KVM_CAP_ARM_VM_IPA_SIZE);
++ 	if (host_ipa_limit >= 52)
++ 		vm_guest_mode_params_init(VM_MODE_P52V48_64K, true, true);
++ 	if (host_ipa_limit >= 48) {
++ 		vm_guest_mode_params_init(VM_MODE_P48V48_4K, true, true);
++ 		vm_guest_mode_params_init(VM_MODE_P48V48_64K, true, true);
++ 	}
++ #endif
++ 
++ 	while ((opt = getopt(argc, argv, "hi:I:p:m:")) != -1) {
+++>>>>>>> 8cee58161eff (kvm: selftests: aarch64: dirty_log_test: support greater than 40-bit IPAs)
+  		switch (opt) {
+  		case 'i':
+  			iterations = strtol(optarg, NULL, 10);
+* Unmerged path tools/testing/selftests/kvm/dirty_log_test.c
+diff --git a/tools/testing/selftests/kvm/include/kvm_util.h b/tools/testing/selftests/kvm/include/kvm_util.h
+index c607d4acb3c2..bf5b2fe508c2 100644
+--- a/tools/testing/selftests/kvm/include/kvm_util.h
++++ b/tools/testing/selftests/kvm/include/kvm_util.h
+@@ -56,6 +56,8 @@ int kvm_check_cap(long cap);
+ int vm_enable_cap(struct kvm_vm *vm, struct kvm_enable_cap *cap);
+ 
+ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm);
++struct kvm_vm *_vm_create(enum vm_guest_mode mode, uint64_t phy_pages,
++			  int perm, unsigned long type);
+ void kvm_vm_free(struct kvm_vm *vmp);
+ void kvm_vm_restart(struct kvm_vm *vmp, int perm);
+ void kvm_vm_release(struct kvm_vm *vmp);
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util.c b/tools/testing/selftests/kvm/lib/kvm_util.c
+index df27a3fd0374..1722177659df 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@ -85,13 +85,13 @@ int vm_enable_cap(struct kvm_vm *vm, struct kvm_enable_cap *cap)
+ 	return ret;
+ }
+ 
+-static void vm_open(struct kvm_vm *vm, int perm)
++static void vm_open(struct kvm_vm *vm, int perm, unsigned long type)
+ {
+ 	vm->kvm_fd = open(KVM_DEV_PATH, perm);
+ 	if (vm->kvm_fd < 0)
+ 		exit(KSFT_SKIP);
+ 
+-	vm->fd = ioctl(vm->kvm_fd, KVM_CREATE_VM, NULL);
++	vm->fd = ioctl(vm->kvm_fd, KVM_CREATE_VM, type);
+ 	TEST_ASSERT(vm->fd >= 0, "KVM_CREATE_VM ioctl failed, "
+ 		"rc: %i errno: %i", vm->fd, errno);
+ }
+@@ -126,7 +126,8 @@ _Static_assert(sizeof(vm_guest_mode_string)/sizeof(char *) == NUM_VM_MODES,
+  * descriptor to control the created VM is created with the permissions
+  * given by perm (e.g. O_RDWR).
+  */
+-struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
++struct kvm_vm *_vm_create(enum vm_guest_mode mode, uint64_t phy_pages,
++			  int perm, unsigned long type)
+ {
+ 	struct kvm_vm *vm;
+ 	int kvm_fd;
+@@ -135,7 +136,8 @@ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
+ 	TEST_ASSERT(vm != NULL, "Insufficient Memory");
+ 
+ 	vm->mode = mode;
+-	vm_open(vm, perm);
++	vm->type = type;
++	vm_open(vm, perm, type);
+ 
+ 	/* Setup mode specific traits. */
+ 	switch (vm->mode) {
+@@ -205,6 +207,11 @@ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
+ 	return vm;
+ }
+ 
++struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
++{
++	return _vm_create(mode, phy_pages, perm, 0);
++}
++
+ /*
+  * VM Restart
+  *
+@@ -222,7 +229,7 @@ void kvm_vm_restart(struct kvm_vm *vmp, int perm)
+ {
+ 	struct userspace_mem_region *region;
+ 
+-	vm_open(vmp, perm);
++	vm_open(vmp, perm, vmp->type);
+ 	if (vmp->has_irqchip)
+ 		vm_create_irqchip(vmp);
+ 
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util_internal.h b/tools/testing/selftests/kvm/lib/kvm_util_internal.h
+index 52701db0f253..4595e42c6e29 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util_internal.h
++++ b/tools/testing/selftests/kvm/lib/kvm_util_internal.h
+@@ -44,6 +44,7 @@ struct vcpu {
+ 
+ struct kvm_vm {
+ 	int mode;
++	unsigned long type;
+ 	int kvm_fd;
+ 	int fd;
+ 	unsigned int pgtable_levels;
