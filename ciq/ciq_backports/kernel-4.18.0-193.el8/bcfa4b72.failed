@@ -1,0 +1,141 @@
+memremap: Convert to XArray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit bcfa4b72111c9a4d483024cb1f877803b354aa11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/bcfa4b72.failed
+
+Use the new xa_store_range function instead of the radix tree.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit bcfa4b72111c9a4d483024cb1f877803b354aa11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/memremap.c
+diff --cc kernel/memremap.c
+index b76a29ae0c9e,e842fab9f184..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -17,33 -16,8 +16,8 @@@ static DEFINE_XARRAY(pgmap_array)
+  #define SECTION_MASK ~((1UL << PA_SECTION_SHIFT) - 1)
+  #define SECTION_SIZE (1UL << PA_SECTION_SHIFT)
+  
+- static unsigned long order_at(struct resource *res, unsigned long pgoff)
+- {
+- 	unsigned long phys_pgoff = PHYS_PFN(res->start) + pgoff;
+- 	unsigned long nr_pages, mask;
+- 
+- 	nr_pages = PHYS_PFN(resource_size(res));
+- 	if (nr_pages == pgoff)
+- 		return ULONG_MAX;
+- 
+- 	/*
+- 	 * What is the largest aligned power-of-2 range available from
+- 	 * this resource pgoff to the end of the resource range,
+- 	 * considering the alignment of the current pgoff?
+- 	 */
+- 	mask = phys_pgoff | rounddown_pow_of_two(nr_pages - pgoff);
+- 	if (!mask)
+- 		return ULONG_MAX;
+- 
+- 	return find_first_bit(&mask, BITS_PER_LONG);
+- }
+- 
+- #define foreach_order_pgoff(res, order, pgoff) \
+- 	for (pgoff = 0, order = order_at((res), pgoff); order < ULONG_MAX; \
+- 			pgoff += 1UL << order, order = order_at((res), pgoff))
+- 
+  #if IS_ENABLED(CONFIG_DEVICE_PRIVATE)
+ -vm_fault_t device_private_entry_fault(struct vm_area_struct *vma,
+ +int device_private_entry_fault(struct vm_area_struct *vma,
+  		       unsigned long addr,
+  		       swp_entry_t entry,
+  		       unsigned int flags,
+@@@ -174,13 -141,10 +140,19 @@@ void *devm_memremap_pages(struct devic
+  	struct vmem_altmap *altmap = pgmap->altmap_valid ?
+  			&pgmap->altmap : NULL;
+  	struct resource *res = &pgmap->res;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long pfn;
++ 	pgprot_t pgprot = PAGE_KERNEL;
++ 	int error, nid, is_ram;
+++>>>>>>> bcfa4b72111c (memremap: Convert to XArray)
+  	struct dev_pagemap *conflict_pgmap;
+ +	pgprot_t pgprot = PAGE_KERNEL;
+ +	unsigned long pgoff, order;
+ +	int error, nid, is_ram;
+ +
+ +	if (!pgmap->ref || !pgmap->kill)
+ +		return ERR_PTR(-EINVAL);
+  
+  	align_start = res->start & ~(SECTION_SIZE - 1);
+  	align_size = ALIGN(res->start + resource_size(res), SECTION_SIZE)
+@@@ -204,29 -168,24 +176,19 @@@
+  	is_ram = region_intersects(align_start, align_size,
+  		IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE);
+  
+ -	if (is_ram == REGION_MIXED) {
+ -		WARN_ONCE(1, "%s attempted on mixed region %pr\n",
+ -				__func__, res);
+ -		return ERR_PTR(-ENXIO);
+ +	if (is_ram != REGION_DISJOINT) {
+ +		WARN_ONCE(1, "%s attempted on %s region %pr\n", __func__,
+ +				is_ram == REGION_MIXED ? "mixed" : "ram", res);
+ +		error = -ENXIO;
+ +		goto err_pgmap;
+  	}
+  
+ -	if (is_ram == REGION_INTERSECTS)
+ -		return __va(res->start);
+ -
+ -	if (!pgmap->ref)
+ -		return ERR_PTR(-EINVAL);
+ -
+  	pgmap->dev = dev;
+  
+- 	mutex_lock(&pgmap_lock);
+- 	error = 0;
+- 
+- 	foreach_order_pgoff(res, order, pgoff) {
+- 		error = __radix_tree_insert(&pgmap_radix,
+- 				PHYS_PFN(res->start) + pgoff, order, pgmap);
+- 		if (error) {
+- 			dev_err(dev, "%s: failed: %d\n", __func__, error);
+- 			break;
+- 		}
+- 	}
+- 	mutex_unlock(&pgmap_lock);
++ 	error = xa_err(xa_store_range(&pgmap_array, PHYS_PFN(res->start),
++ 				PHYS_PFN(res->end), pgmap, GFP_KERNEL));
+  	if (error)
+- 		goto err_radix;
++ 		goto err_array;
+  
+  	nid = dev_to_node(dev);
+  	if (nid < 0)
+@@@ -297,13 -235,11 +259,18 @@@
+   err_kasan:
+  	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
+   err_pfn_remap:
+++<<<<<<< HEAD
+ + err_radix:
+ +	pgmap_radix_release(res, pgoff);
+ + err_pgmap:
+ +	pgmap->kill(pgmap->ref);
+++=======
++ 	pgmap_array_delete(res);
++  err_array:
+++>>>>>>> bcfa4b72111c (memremap: Convert to XArray)
+  	return ERR_PTR(error);
+  }
+ -EXPORT_SYMBOL(devm_memremap_pages);
+ +EXPORT_SYMBOL_GPL(devm_memremap_pages);
+  
+  unsigned long vmem_altmap_offset(struct vmem_altmap *altmap)
+  {
+* Unmerged path kernel/memremap.c
