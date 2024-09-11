@@ -757,6 +757,7 @@ static inline unsigned int get_vmid_bits(u64 mmfr1)
 
 u32 get_kvm_ipa_limit(void);
 
+extern int do_emulate_mrs(struct pt_regs *regs, u32 sys_reg, u32 rt);
 #endif /* __ASSEMBLY__ */
 
 #endif
