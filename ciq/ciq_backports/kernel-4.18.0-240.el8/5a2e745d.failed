@@ -1,0 +1,160 @@
+io_uring: buffer registration infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 5a2e745d4d430c4dbeeeb448c3d5c0c3109e511e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5a2e745d.failed
+
+This just prepares the ring for having lists of buffers associated with
+it, that the application can provide for SQEs to consume instead of
+providing their own.
+
+The buffers are organized by group ID.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5a2e745d4d430c4dbeeeb448c3d5c0c3109e511e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,1f3ae208f6a6..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -197,16 -181,27 +197,23 @@@ struct io_mapped_ubuf 
+  	unsigned int	nr_bvecs;
+  };
+  
+ -struct fixed_file_table {
+ -	struct file		**files;
+ -};
+ -
+ -struct fixed_file_data {
+ -	struct fixed_file_table		*table;
+ -	struct io_ring_ctx		*ctx;
+ +struct async_list {
+ +	spinlock_t		lock;
+ +	atomic_t		cnt;
+ +	struct list_head	list;
+  
+ -	struct percpu_ref		refs;
+ -	struct llist_head		put_llist;
+ -	struct work_struct		ref_work;
+ -	struct completion		done;
+ +	struct file		*file;
+ +	off_t			io_start;
+ +	size_t			io_len;
+  };
+  
++ struct io_buffer {
++ 	struct list_head list;
++ 	__u64 addr;
++ 	__s32 len;
++ 	__u16 bid;
++ };
++ 
+  struct io_ring_ctx {
+  	struct {
+  		struct percpu_ref	refs;
+@@@ -260,7 -267,32 +267,36 @@@
+  
+  	struct user_struct	*user;
+  
+++<<<<<<< HEAD
+ +	struct completion	ctx_done;
+++=======
++ 	const struct cred	*creds;
++ 
++ 	/* 0 is for ctx quiesce/reinit/free, 1 is for sqo_thread started */
++ 	struct completion	*completions;
++ 
++ 	/* if all else fails... */
++ 	struct io_kiocb		*fallback_req;
++ 
++ #if defined(CONFIG_UNIX)
++ 	struct socket		*ring_sock;
++ #endif
++ 
++ 	struct idr		io_buffer_idr;
++ 
++ 	struct idr		personality_idr;
++ 
++ 	struct {
++ 		unsigned		cached_cq_tail;
++ 		unsigned		cq_entries;
++ 		unsigned		cq_mask;
++ 		atomic_t		cq_timeouts;
++ 		unsigned long		cq_check_overflow;
++ 		struct wait_queue_head	cq_wait;
++ 		struct fasync_struct	*cq_fasync;
++ 		struct eventfd_ctx	*cq_ev_fd;
++ 	} ____cacheline_aligned_in_smp;
+++>>>>>>> 5a2e745d4d43 (io_uring: buffer registration infrastructure)
+  
+  	struct {
+  		struct mutex		uring_lock;
+@@@ -410,29 -881,44 +446,37 @@@ static struct io_ring_ctx *io_ring_ctx_
+  
+  	ctx->flags = p->flags;
+  	init_waitqueue_head(&ctx->cq_wait);
+++<<<<<<< HEAD
+ +	init_completion(&ctx->ctx_done);
+ +	init_completion(&ctx->sqo_thread_started);
+++=======
++ 	INIT_LIST_HEAD(&ctx->cq_overflow_list);
++ 	init_completion(&ctx->completions[0]);
++ 	init_completion(&ctx->completions[1]);
++ 	idr_init(&ctx->io_buffer_idr);
++ 	idr_init(&ctx->personality_idr);
+++>>>>>>> 5a2e745d4d43 (io_uring: buffer registration infrastructure)
+  	mutex_init(&ctx->uring_lock);
+  	init_waitqueue_head(&ctx->wait);
+ +	for (i = 0; i < ARRAY_SIZE(ctx->pending_async); i++) {
+ +		spin_lock_init(&ctx->pending_async[i].lock);
+ +		INIT_LIST_HEAD(&ctx->pending_async[i].list);
+ +		atomic_set(&ctx->pending_async[i].cnt, 0);
+ +	}
+  	spin_lock_init(&ctx->completion_lock);
+  	INIT_LIST_HEAD(&ctx->poll_list);
+ +	INIT_LIST_HEAD(&ctx->cancel_list);
+  	INIT_LIST_HEAD(&ctx->defer_list);
+ -	INIT_LIST_HEAD(&ctx->timeout_list);
+ -	init_waitqueue_head(&ctx->inflight_wait);
+ -	spin_lock_init(&ctx->inflight_lock);
+ -	INIT_LIST_HEAD(&ctx->inflight_list);
+  	return ctx;
+ -err:
+ -	if (ctx->fallback_req)
+ -		kmem_cache_free(req_cachep, ctx->fallback_req);
+ -	kfree(ctx->completions);
+ -	kfree(ctx->cancel_hash);
+ -	kfree(ctx);
+ -	return NULL;
+ -}
+ -
+ -static inline bool __req_need_defer(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -
+ -	return req->sequence != ctx->cached_cq_tail + ctx->cached_sq_dropped
+ -					+ atomic_read(&ctx->cached_cq_overflow);
+  }
+  
+ -static inline bool req_need_defer(struct io_kiocb *req)
+ +static inline bool io_sequence_defer(struct io_ring_ctx *ctx,
+ +				     struct io_kiocb *req)
+  {
+ -	if (unlikely(req->flags & REQ_F_IO_DRAIN))
+ -		return __req_need_defer(req);
+ +	if ((req->flags & (REQ_F_IO_DRAIN|REQ_F_IO_DRAINED)) != REQ_F_IO_DRAIN)
+ +		return false;
+  
+ -	return false;
+ +	return req->sequence != ctx->cached_cq_tail + ctx->sq_ring->dropped;
+  }
+  
+  static struct io_kiocb *io_get_deferred_req(struct io_ring_ctx *ctx)
+* Unmerged path fs/io_uring.c
