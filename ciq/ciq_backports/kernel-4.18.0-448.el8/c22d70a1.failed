@@ -1,0 +1,342 @@
+writeback, cgroup: release dying cgwbs by switching attached inodes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit c22d70a162d3cc177282c4487be4d54876ca55c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/c22d70a1.failed
+
+Asynchronously try to release dying cgwbs by switching attached inodes to
+the nearest living ancestor wb.  It helps to get rid of per-cgroup
+writeback structures themselves and of pinned memory and block cgroups,
+which are significantly larger structures (mostly due to large per-cpu
+statistics data).  This prevents memory waste and helps to avoid different
+scalability problems caused by large piles of dying cgroups.
+
+Reuse the existing mechanism of inode switching used for foreign inode
+detection.  To speed things up batch up to 115 inode switching in a single
+operation (the maximum number is selected so that the resulting struct
+inode_switch_wbs_context can fit into 1024 bytes).  Because every
+switching consists of two steps divided by an RCU grace period, it would
+be too slow without batching.  Please note that the whole batch counts as
+a single operation (when increasing/decreasing isw_nr_in_flight).  This
+allows to keep umounting working (flush the switching queue), however
+prevents cleanups from consuming the whole switching quota and effectively
+blocking the frn switching.
+
+A cgwb cleanup operation can fail due to different reasons (e.g.  not
+enough memory, the cgwb has an in-flight/pending io, an attached inode in
+a wrong state, etc).  In this case the next scheduled cleanup will make a
+new attempt.  An attempt is made each time a new cgwb is offlined (in
+other words a memcg and/or a blkcg is deleted by a user).  In the future
+an additional attempt scheduled by a timer can be implemented.
+
+[guro@fb.com: replace open-coded "115" with arithmetic]
+  Link: https://lkml.kernel.org/r/YMEcSBcq/VXMiPPO@carbon.dhcp.thefacebook.com
+[guro@fb.com: add smp_mb() to inode_prepare_wbs_switch()]
+  Link: https://lkml.kernel.org/r/YMFa+guFw7OFjf3X@carbon.dhcp.thefacebook.com
+[willy@infradead.org: fix documentation]
+  Link: https://lkml.kernel.org/r/20210615200242.1716568-2-willy@infradead.org
+
+Link: https://lkml.kernel.org/r/20210608230225.2078447-9-guro@fb.com
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Dennis Zhou <dennis@kernel.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Dave Chinner <dchinner@redhat.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c22d70a162d3cc177282c4487be4d54876ca55c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/backing-dev.c
+diff --cc mm/backing-dev.c
+index e679bdf20251,271f2ca862c8..000000000000
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@@ -417,98 -371,15 +417,109 @@@ static void wb_exit(struct bdi_writebac
+  #include <linux/memcontrol.h>
+  
+  /*
+++<<<<<<< HEAD
+ + * cgwb_lock protects bdi->cgwb_tree, bdi->cgwb_congested_tree,
+ + * blkcg->cgwb_list, and memcg->cgwb_list.  bdi->cgwb_tree is also RCU
+ + * protected.
+++=======
++  * cgwb_lock protects bdi->cgwb_tree, blkcg->cgwb_list, offline_cgwbs and
++  * memcg->cgwb_list.  bdi->cgwb_tree is also RCU protected.
+++>>>>>>> c22d70a162d3 (writeback, cgroup: release dying cgwbs by switching attached inodes)
+   */
+  static DEFINE_SPINLOCK(cgwb_lock);
+  static struct workqueue_struct *cgwb_release_wq;
+  
+++<<<<<<< HEAD
+ +/**
+ + * wb_congested_get_create - get or create a wb_congested
+ + * @bdi: associated bdi
+ + * @blkcg_id: ID of the associated blkcg
+ + * @gfp: allocation mask
+ + *
+ + * Look up the wb_congested for @blkcg_id on @bdi.  If missing, create one.
+ + * The returned wb_congested has its reference count incremented.  Returns
+ + * NULL on failure.
+ + */
+ +struct bdi_writeback_congested *
+ +wb_congested_get_create(struct backing_dev_info *bdi, int blkcg_id, gfp_t gfp)
+ +{
+ +	struct bdi_writeback_congested *new_congested = NULL, *congested;
+ +	struct rb_node **node, *parent;
+ +	unsigned long flags;
+ +retry:
+ +	spin_lock_irqsave(&cgwb_lock, flags);
+ +
+ +	node = &bdi->cgwb_congested_tree.rb_node;
+ +	parent = NULL;
+ +
+ +	while (*node != NULL) {
+ +		parent = *node;
+ +		congested = rb_entry(parent, struct bdi_writeback_congested,
+ +				     rb_node);
+ +		if (congested->blkcg_id < blkcg_id)
+ +			node = &parent->rb_left;
+ +		else if (congested->blkcg_id > blkcg_id)
+ +			node = &parent->rb_right;
+ +		else
+ +			goto found;
+ +	}
+ +
+ +	if (new_congested) {
+ +		/* !found and storage for new one already allocated, insert */
+ +		congested = new_congested;
+ +		rb_link_node(&congested->rb_node, parent, node);
+ +		rb_insert_color(&congested->rb_node, &bdi->cgwb_congested_tree);
+ +		spin_unlock_irqrestore(&cgwb_lock, flags);
+ +		return congested;
+ +	}
+ +
+ +	spin_unlock_irqrestore(&cgwb_lock, flags);
+ +
+ +	/* allocate storage for new one and retry */
+ +	new_congested = kzalloc(sizeof(*new_congested), gfp);
+ +	if (!new_congested)
+ +		return NULL;
+ +
+ +	refcount_set(&new_congested->refcnt, 1);
+ +	new_congested->__bdi = bdi;
+ +	new_congested->blkcg_id = blkcg_id;
+ +	goto retry;
+ +
+ +found:
+ +	refcount_inc(&congested->refcnt);
+ +	spin_unlock_irqrestore(&cgwb_lock, flags);
+ +	kfree(new_congested);
+ +	return congested;
+ +}
+ +
+ +/**
+ + * wb_congested_put - put a wb_congested
+ + * @congested: wb_congested to put
+ + *
+ + * Put @congested and destroy it if the refcnt reaches zero.
+ + */
+ +void wb_congested_put(struct bdi_writeback_congested *congested)
+ +{
+ +	unsigned long flags;
+ +
+ +	if (!refcount_dec_and_lock_irqsave(&congested->refcnt, &cgwb_lock, &flags))
+ +		return;
+ +
+ +	/* bdi might already have been destroyed leaving @congested unlinked */
+ +	if (congested->__bdi) {
+ +		rb_erase(&congested->rb_node,
+ +			 &congested->__bdi->cgwb_congested_tree);
+ +		congested->__bdi = NULL;
+ +	}
+ +
+ +	spin_unlock_irqrestore(&cgwb_lock, flags);
+ +	kfree(congested);
+ +}
+++=======
++ static LIST_HEAD(offline_cgwbs);
++ static void cleanup_offline_cgwbs_workfn(struct work_struct *work);
++ static DECLARE_WORK(cleanup_offline_cgwbs_work, cleanup_offline_cgwbs_workfn);
+++>>>>>>> c22d70a162d3 (writeback, cgroup: release dying cgwbs by switching attached inodes)
+  
+  static void cgwb_release_workfn(struct work_struct *work)
+  {
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 56770ec54b07..74ea64ff367a 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -224,6 +224,13 @@ void wb_wait_for_completion(struct wb_completion *done)
+ 					/* one round can affect upto 5 slots */
+ #define WB_FRN_MAX_IN_FLIGHT	1024	/* don't queue too many concurrently */
+ 
++/*
++ * Maximum inodes per isw.  A specific value has been chosen to make
++ * struct inode_switch_wbs_context fit into 1024 bytes kmalloc.
++ */
++#define WB_MAX_INODES_PER_ISW  ((1024UL - sizeof(struct inode_switch_wbs_context)) \
++                                / sizeof(struct inode *))
++
+ static atomic_t isw_nr_in_flight = ATOMIC_INIT(0);
+ static struct workqueue_struct *isw_wq;
+ 
+@@ -485,6 +492,32 @@ static void inode_switch_wbs_work_fn(struct work_struct *work)
+ 	atomic_dec(&isw_nr_in_flight);
+ }
+ 
++static bool inode_prepare_wbs_switch(struct inode *inode,
++				     struct bdi_writeback *new_wb)
++{
++	/*
++	 * Paired with smp_mb() in cgroup_writeback_umount().
++	 * isw_nr_in_flight must be increased before checking SB_ACTIVE and
++	 * grabbing an inode, otherwise isw_nr_in_flight can be observed as 0
++	 * in cgroup_writeback_umount() and the isw_wq will be not flushed.
++	 */
++	smp_mb();
++
++	/* while holding I_WB_SWITCH, no one else can update the association */
++	spin_lock(&inode->i_lock);
++	if (!(inode->i_sb->s_flags & SB_ACTIVE) ||
++	    inode->i_state & (I_WB_SWITCH | I_FREEING | I_WILL_FREE) ||
++	    inode_to_wb(inode) == new_wb) {
++		spin_unlock(&inode->i_lock);
++		return false;
++	}
++	inode->i_state |= I_WB_SWITCH;
++	__iget(inode);
++	spin_unlock(&inode->i_lock);
++
++	return true;
++}
++
+ /**
+  * inode_switch_wbs - change the wb association of an inode
+  * @inode: target inode
+@@ -522,17 +555,8 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
+ 	if (!isw->new_wb)
+ 		goto out_free;
+ 
+-	/* while holding I_WB_SWITCH, no one else can update the association */
+-	spin_lock(&inode->i_lock);
+-	if (!(inode->i_sb->s_flags & SB_ACTIVE) ||
+-	    inode->i_state & (I_WB_SWITCH | I_FREEING | I_WILL_FREE) ||
+-	    inode_to_wb(inode) == isw->new_wb) {
+-		spin_unlock(&inode->i_lock);
++	if (!inode_prepare_wbs_switch(inode, isw->new_wb))
+ 		goto out_free;
+-	}
+-	inode->i_state |= I_WB_SWITCH;
+-	__iget(inode);
+-	spin_unlock(&inode->i_lock);
+ 
+ 	isw->inode = inode;
+ 
+@@ -555,6 +579,73 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
+ 	kfree(isw);
+ }
+ 
++/**
++ * cleanup_offline_cgwb - detach associated inodes
++ * @wb: target wb
++ *
++ * Switch all inodes attached to @wb to a nearest living ancestor's wb in order
++ * to eventually release the dying @wb.  Returns %true if not all inodes were
++ * switched and the function has to be restarted.
++ */
++bool cleanup_offline_cgwb(struct bdi_writeback *wb)
++{
++	struct cgroup_subsys_state *memcg_css;
++	struct inode_switch_wbs_context *isw;
++	struct inode *inode;
++	int nr;
++	bool restart = false;
++
++	isw = kzalloc(sizeof(*isw) + WB_MAX_INODES_PER_ISW *
++		      sizeof(struct inode *), GFP_KERNEL);
++	if (!isw)
++		return restart;
++
++	atomic_inc(&isw_nr_in_flight);
++
++	for (memcg_css = wb->memcg_css->parent; memcg_css;
++	     memcg_css = memcg_css->parent) {
++		isw->new_wb = wb_get_create(wb->bdi, memcg_css, GFP_KERNEL);
++		if (isw->new_wb)
++			break;
++	}
++	if (unlikely(!isw->new_wb))
++		isw->new_wb = &wb->bdi->wb; /* wb_get() is noop for bdi's wb */
++
++	nr = 0;
++	spin_lock(&wb->list_lock);
++	list_for_each_entry(inode, &wb->b_attached, i_io_list) {
++		if (!inode_prepare_wbs_switch(inode, isw->new_wb))
++			continue;
++
++		isw->inodes[nr++] = inode;
++
++		if (nr >= WB_MAX_INODES_PER_ISW - 1) {
++			restart = true;
++			break;
++		}
++	}
++	spin_unlock(&wb->list_lock);
++
++	/* no attached inodes? bail out */
++	if (nr == 0) {
++		atomic_dec(&isw_nr_in_flight);
++		wb_put(isw->new_wb);
++		kfree(isw);
++		return restart;
++	}
++
++	/*
++	 * In addition to synchronizing among switchers, I_WB_SWITCH tells
++	 * the RCU protected stat update paths to grab the i_page
++	 * lock so that stat transfer can synchronize against them.
++	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
++	 */
++	INIT_RCU_WORK(&isw->work, inode_switch_wbs_work_fn);
++	queue_rcu_work(isw_wq, &isw->work);
++
++	return restart;
++}
++
+ /**
+  * wbc_attach_and_unlock_inode - associate wbc with target inode and unlock it
+  * @wbc: writeback_control of interest
+diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+index 6cd2738b9494..3e004ecfbb1b 100644
+--- a/include/linux/backing-dev-defs.h
++++ b/include/linux/backing-dev-defs.h
+@@ -184,6 +184,7 @@ struct bdi_writeback {
+ 	struct list_head memcg_node;	/* anchored at memcg->cgwb_list */
+ 	struct list_head blkcg_node;	/* anchored at blkcg->cgwb_list */
+ 	struct list_head b_attached;	/* attached inodes, protected by list_lock */
++	struct list_head offline_node;	/* anchored at offline_cgwbs */
+ 
+ 	union {
+ 		struct work_struct release_work;
+diff --git a/include/linux/writeback.h b/include/linux/writeback.h
+index 9f65dab3b3f7..ea92c43d6396 100644
+--- a/include/linux/writeback.h
++++ b/include/linux/writeback.h
+@@ -224,6 +224,7 @@ void wbc_account_cgroup_owner(struct writeback_control *wbc, struct page *page,
+ int cgroup_writeback_by_id(u64 bdi_id, int memcg_id, unsigned long nr_pages,
+ 			   enum wb_reason reason, struct wb_completion *done);
+ void cgroup_writeback_umount(void);
++bool cleanup_offline_cgwb(struct bdi_writeback *wb);
+ 
+ /**
+  * inode_attach_wb - associate an inode with its wb
+* Unmerged path mm/backing-dev.c
