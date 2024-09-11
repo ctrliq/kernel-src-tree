@@ -1,0 +1,188 @@
+xprtrdma: Wake RPCs directly in rpcrdma_wc_send path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 0ab115237025f5e379620bbcd56a02697d07b002
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0ab11523.failed
+
+Eliminate a context switch in the path that handles RPC wake-ups
+when a Receive completion has to wait for a Send completion.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 0ab115237025f5e379620bbcd56a02697d07b002)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 2469b4d91dbb,caf0b1950d76..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -700,16 -719,19 +711,16 @@@ rpcrdma_prepare_send_sges(struct rpcrdm
+  	req->rl_sendctx->sc_wr.num_sge = 0;
+  	req->rl_sendctx->sc_unmap_count = 0;
+  	req->rl_sendctx->sc_req = req;
+- 	__clear_bit(RPCRDMA_REQ_F_TX_RESOURCES, &req->rl_flags);
++ 	kref_init(&req->rl_kref);
+  
+ -	ret = -EIO;
+  	if (!rpcrdma_prepare_hdr_sge(r_xprt, req, hdrlen))
+ -		goto err;
+ +		return -EIO;
+ +
+  	if (rtype != rpcrdma_areadch)
+  		if (!rpcrdma_prepare_msg_sges(r_xprt, req, xdr, rtype))
+ -			goto err;
+ -	return 0;
+ +			return -EIO;
+  
+ -err:
+ -	trace_xprtrdma_prepsend_failed(&req->rl_slot, ret);
+ -	return ret;
+ +	return 0;
+  }
+  
+  /**
+@@@ -1264,51 -1279,17 +1275,60 @@@ out_badheader
+  	goto out;
+  }
+  
+++<<<<<<< HEAD
+ +void rpcrdma_release_rqst(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
+ +{
+ +	/* Invalidate and unmap the data payloads before waking
+ +	 * the waiting application. This guarantees the memory
+ +	 * regions are properly fenced from the server before the
+ +	 * application accesses the data. It also ensures proper
+ +	 * send flow control: waking the next RPC waits until this
+ +	 * RPC has relinquished all its Send Queue entries.
+ +	 */
+ +	if (!list_empty(&req->rl_registered))
+ +		frwr_unmap_sync(r_xprt, &req->rl_registered);
+ +
+ +	/* Ensure that any DMA mapped pages associated with
+ +	 * the Send of the RPC Call have been unmapped before
+ +	 * allowing the RPC to complete. This protects argument
+ +	 * memory not controlled by the RPC client from being
+ +	 * re-used before we're done with it.
+ +	 */
+ +	if (test_bit(RPCRDMA_REQ_F_TX_RESOURCES, &req->rl_flags)) {
+ +		r_xprt->rx_stats.reply_waits_for_send++;
+ +		out_of_line_wait_on_bit(&req->rl_flags,
+ +					RPCRDMA_REQ_F_TX_RESOURCES,
+ +					bit_wait,
+ +					TASK_UNINTERRUPTIBLE);
+ +	}
+ +}
+ +
+ +/* Reply handling runs in the poll worker thread. Anything that
+ + * might wait is deferred to a separate workqueue.
+ + */
+ +void rpcrdma_deferred_completion(struct work_struct *work)
+ +{
+ +	struct rpcrdma_rep *rep =
+ +			container_of(work, struct rpcrdma_rep, rr_work);
+ +	struct rpcrdma_req *req = rpcr_to_rdmar(rep->rr_rqst);
+ +	struct rpcrdma_xprt *r_xprt = rep->rr_rxprt;
+ +
+ +	trace_xprtrdma_defer_cmp(rep);
+ +	if (rep->rr_wc_flags & IB_WC_WITH_INVALIDATE)
+ +		frwr_reminv(rep, &req->rl_registered);
+ +	rpcrdma_release_rqst(r_xprt, req);
+ +	rpcrdma_complete_rqst(rep);
+++=======
++ static void rpcrdma_reply_done(struct kref *kref)
++ {
++ 	struct rpcrdma_req *req =
++ 		container_of(kref, struct rpcrdma_req, rl_kref);
++ 
++ 	rpcrdma_complete_rqst(req->rl_reply);
+++>>>>>>> 0ab115237025 (xprtrdma: Wake RPCs directly in rpcrdma_wc_send path)
+  }
+  
+ -/**
+ - * rpcrdma_reply_handler - Process received RPC/RDMA messages
+ - * @rep: Incoming rpcrdma_rep object to process
+ +/* Process received RPC/RDMA messages.
+   *
+   * Errors must result in the RPC task either being awakened, or
+   * allowed to timeout, to discover the errors at that time.
+@@@ -1370,7 -1351,14 +1390,18 @@@ void rpcrdma_reply_handler(struct rpcrd
+  	rep->rr_rqst = rqst;
+  
+  	trace_xprtrdma_reply(rqst->rq_task, rep, req, credits);
+++<<<<<<< HEAD
+ +	queue_work(buf->rb_completion_wq, &rep->rr_work);
+++=======
++ 
++ 	if (rep->rr_wc_flags & IB_WC_WITH_INVALIDATE)
++ 		frwr_reminv(rep, &req->rl_registered);
++ 	if (!list_empty(&req->rl_registered))
++ 		frwr_unmap_async(r_xprt, req);
++ 		/* LocalInv completion will complete the RPC */
++ 	else
++ 		kref_put(&req->rl_kref, rpcrdma_reply_done);
+++>>>>>>> 0ab115237025 (xprtrdma: Wake RPCs directly in rpcrdma_wc_send path)
+  	return;
+  
+  out_badversion:
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index cc5a576b0242,5475f0dff22a..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -610,9 -580,6 +606,12 @@@ int rpcrdma_marshal_req(struct rpcrdma_
+  void rpcrdma_set_max_header_sizes(struct rpcrdma_xprt *);
+  void rpcrdma_complete_rqst(struct rpcrdma_rep *rep);
+  void rpcrdma_reply_handler(struct rpcrdma_rep *rep);
+++<<<<<<< HEAD
+ +void rpcrdma_release_rqst(struct rpcrdma_xprt *r_xprt,
+ +			  struct rpcrdma_req *req);
+ +void rpcrdma_deferred_completion(struct work_struct *work);
+++=======
+++>>>>>>> 0ab115237025 (xprtrdma: Wake RPCs directly in rpcrdma_wc_send path)
+  
+  static inline void rpcrdma_set_xdrlen(struct xdr_buf *xdr, size_t len)
+  {
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 67bd90da5ad8..598301d26848 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -639,8 +639,16 @@ xprt_rdma_free(struct rpc_task *task)
+ 	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
+ 	struct rpcrdma_req *req = rpcr_to_rdmar(rqst);
+ 
+-	rpcrdma_release_rqst(r_xprt, req);
+ 	trace_xprtrdma_op_free(task, req);
++
++	if (!list_empty(&req->rl_registered))
++		frwr_unmap_sync(r_xprt, req);
++
++	/* XXX: If the RPC is completing because of a signal and
++	 * not because a reply was received, we ought to ensure
++	 * that the Send completion has fired, so that memory
++	 * involved with the Send is not still visible to the NIC.
++	 */
+ }
+ 
+ /**
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index a585b191fe98..8d79ad07d416 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -1473,8 +1473,7 @@ rpcrdma_ep_post(struct rpcrdma_ia *ia,
+ 	struct ib_send_wr *send_wr = &req->rl_sendctx->sc_wr;
+ 	int rc;
+ 
+-	if (!ep->rep_send_count ||
+-	    test_bit(RPCRDMA_REQ_F_TX_RESOURCES, &req->rl_flags)) {
++	if (!ep->rep_send_count || kref_read(&req->rl_kref) > 1) {
+ 		send_wr->send_flags |= IB_SEND_SIGNALED;
+ 		ep->rep_send_count = ep->rep_send_batch;
+ 	} else {
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
