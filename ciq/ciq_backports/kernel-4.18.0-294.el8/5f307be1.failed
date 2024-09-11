@@ -1,0 +1,170 @@
+asm-generic/tlb, arch: Provide generic tlb_flush() based on flush_tlb_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 5f307be18b32aeff7bbad540c0d3897ecedbeb56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5f307be1.failed
+
+Provide a generic tlb_flush() implementation that relies on
+flush_tlb_range(). This is a little awkward because flush_tlb_range()
+assumes a VMA for range invalidation, but we no longer have one.
+
+Audit of all flush_tlb_range() implementations shows only vma->vm_mm
+and vma->vm_flags are used, and of the latter only VM_EXEC (I-TLB
+invalidates) and VM_HUGETLB (large TLB invalidate) are used.
+
+Therefore, track VM_EXEC and VM_HUGETLB in two more bits, and create a
+'fake' VMA.
+
+This allows architectures that have a reasonably efficient
+flush_tlb_range() to not require any additional effort.
+
+No change in behavior intended.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Nick Piggin <npiggin@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 5f307be18b32aeff7bbad540c0d3897ecedbeb56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/riscv/include/asm/tlb.h
+#	include/asm-generic/tlb.h
+diff --cc arch/riscv/include/asm/tlb.h
+index c229509288ea,1ad8d093c58b..000000000000
+--- a/arch/riscv/include/asm/tlb.h
++++ b/arch/riscv/include/asm/tlb.h
+@@@ -14,6 -14,11 +14,14 @@@
+  #ifndef _ASM_RISCV_TLB_H
+  #define _ASM_RISCV_TLB_H
+  
+++<<<<<<< HEAD
+++=======
++ struct mmu_gather;
++ 
++ static void tlb_flush(struct mmu_gather *tlb);
++ 
++ #define tlb_flush tlb_flush
+++>>>>>>> 5f307be18b32 (asm-generic/tlb, arch: Provide generic tlb_flush() based on flush_tlb_range())
+  #include <asm-generic/tlb.h>
+  
+  static inline void tlb_flush(struct mmu_gather *tlb)
+diff --cc include/asm-generic/tlb.h
+index 7ff197a1e7a9,e6a4c407be6c..000000000000
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@@ -248,6 -248,14 +251,17 @@@ struct mmu_gather 
+  	unsigned int		cleared_puds : 1;
+  	unsigned int		cleared_p4ds : 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * tracks VM_EXEC | VM_HUGETLB in tlb_start_vma
++ 	 */
++ 	unsigned int		vma_exec : 1;
++ 	unsigned int		vma_huge : 1;
++ 
++ 	unsigned int		batch_count;
++ 
+++>>>>>>> 5f307be18b32 (asm-generic/tlb, arch: Provide generic tlb_flush() based on flush_tlb_range())
+  	struct mmu_gather_batch *active;
+  	struct mmu_gather_batch	local;
+  	struct page		*__pages[MMU_GATHER_BUNDLE];
+@@@ -358,17 -417,30 +423,44 @@@ static inline unsigned long tlb_get_unm
+   * the vmas are adjusted to only cover the region to be torn down.
+   */
+  #ifndef tlb_start_vma
+++<<<<<<< HEAD
+ +#define tlb_start_vma(tlb, vma) do { } while (0)
+++=======
++ static inline void tlb_start_vma(struct mmu_gather *tlb, struct vm_area_struct *vma)
++ {
++ 	if (tlb->fullmm)
++ 		return;
++ 
++ 	tlb_update_vma_flags(tlb, vma);
++ 	flush_cache_range(vma, vma->vm_start, vma->vm_end);
++ }
+++>>>>>>> 5f307be18b32 (asm-generic/tlb, arch: Provide generic tlb_flush() based on flush_tlb_range())
+  #endif
+  
+ +#define __tlb_end_vma(tlb, vma)					\
+ +	do {							\
+ +		if (!(tlb)->fullmm)				\
+ +			tlb_flush_mmu_tlbonly(tlb);		\
+ +	} while (0)
+ +
+  #ifndef tlb_end_vma
+++<<<<<<< HEAD
+ +#define tlb_end_vma	__tlb_end_vma
+++=======
++ static inline void tlb_end_vma(struct mmu_gather *tlb, struct vm_area_struct *vma)
++ {
++ 	if (tlb->fullmm)
++ 		return;
++ 
++ 	/*
++ 	 * Do a TLB flush and reset the range at VMA boundaries; this avoids
++ 	 * the ranges growing with the unused space between consecutive VMAs,
++ 	 * but also the mmu_gather::vma_* flags from tlb_start_vma() rely on
++ 	 * this.
++ 	 */
++ 	tlb_flush_mmu_tlbonly(tlb);
++ }
+++>>>>>>> 5f307be18b32 (asm-generic/tlb, arch: Provide generic tlb_flush() based on flush_tlb_range())
+  #endif
+  
+  #ifndef __tlb_remove_tlb_entry
+diff --git a/arch/arm64/include/asm/tlb.h b/arch/arm64/include/asm/tlb.h
+index bd00017d529a..536db7475e42 100644
+--- a/arch/arm64/include/asm/tlb.h
++++ b/arch/arm64/include/asm/tlb.h
+@@ -27,6 +27,7 @@ static inline void __tlb_remove_table(void *_table)
+ 	free_page_and_swap_cache((struct page *)_table);
+ }
+ 
++#define tlb_flush tlb_flush
+ static void tlb_flush(struct mmu_gather *tlb);
+ 
+ #include <asm-generic/tlb.h>
+diff --git a/arch/powerpc/include/asm/tlb.h b/arch/powerpc/include/asm/tlb.h
+index 4f07f175c7f8..a503d8ef6d8a 100644
+--- a/arch/powerpc/include/asm/tlb.h
++++ b/arch/powerpc/include/asm/tlb.h
+@@ -30,6 +30,7 @@
+ #define __tlb_remove_tlb_entry	__tlb_remove_tlb_entry
+ #define tlb_remove_check_page_size_change tlb_remove_check_page_size_change
+ 
++#define tlb_flush tlb_flush
+ extern void tlb_flush(struct mmu_gather *tlb);
+ 
+ /* Get the generic bits... */
+* Unmerged path arch/riscv/include/asm/tlb.h
+diff --git a/arch/x86/include/asm/tlb.h b/arch/x86/include/asm/tlb.h
+index afbe7d1e68cf..cded520757b7 100644
+--- a/arch/x86/include/asm/tlb.h
++++ b/arch/x86/include/asm/tlb.h
+@@ -6,6 +6,7 @@
+ #define tlb_end_vma(tlb, vma) do { } while (0)
+ #define __tlb_remove_tlb_entry(tlb, ptep, address) do { } while (0)
+ 
++#define tlb_flush tlb_flush
+ static inline void tlb_flush(struct mmu_gather *tlb);
+ 
+ #include <asm-generic/tlb.h>
+* Unmerged path include/asm-generic/tlb.h
