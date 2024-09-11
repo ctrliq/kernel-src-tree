@@ -1,0 +1,211 @@
+hfi1: Convert hfi1_unit_table to XArray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 03b92789e5cfdac66805c1a98f1ec67336199d56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/03b92789.failed
+
+Also remove hfi1_devs_list.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 03b92789e5cfdac66805c1a98f1ec67336199d56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/init.c
+diff --cc drivers/infiniband/hw/hfi1/init.c
+index 60371bf3a170,e4c2ae4f1cb3..000000000000
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@@ -1307,21 -1289,10 +1289,24 @@@ static struct hfi1_devdata *hfi1_alloc_
+  	dd->pport = (struct hfi1_pportdata *)(dd + 1);
+  	dd->pcidev = pdev;
+  	pci_set_drvdata(pdev, dd);
+++<<<<<<< HEAD
+ +
+ +	INIT_LIST_HEAD(&dd->list);
+ +	idr_preload(GFP_KERNEL);
+ +	spin_lock_irqsave(&hfi1_devs_lock, flags);
+ +
+ +	ret = idr_alloc(&hfi1_unit_table, dd, 0, 0, GFP_NOWAIT);
+ +	if (ret >= 0) {
+ +		dd->unit = ret;
+ +		list_add(&dd->list, &hfi1_dev_list);
+ +	}
+ +	dd->node = -1;
+++=======
++ 	dd->node = NUMA_NO_NODE;
+++>>>>>>> 03b92789e5cf (hfi1: Convert hfi1_unit_table to XArray)
+  
+- 	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+- 	idr_preload_end();
+- 
++ 	ret = xa_alloc_irq(&hfi1_dev_table, &dd->unit, dd, xa_limit_32b,
++ 			GFP_KERNEL);
+  	if (ret < 0) {
+  		dev_err(&pdev->dev,
+  			"Could not allocate unit ID: error %d\n", -ret);
+diff --git a/drivers/infiniband/hw/hfi1/chip.c b/drivers/infiniband/hw/hfi1/chip.c
+index 16861d9ba1b7..229d5d4cafe8 100644
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -14675,8 +14675,8 @@ void hfi1_start_cleanup(struct hfi1_devdata *dd)
+  */
+ static int init_asic_data(struct hfi1_devdata *dd)
+ {
+-	unsigned long flags;
+-	struct hfi1_devdata *tmp, *peer = NULL;
++	unsigned long index;
++	struct hfi1_devdata *peer;
+ 	struct hfi1_asic_data *asic_data;
+ 	int ret = 0;
+ 
+@@ -14685,14 +14685,12 @@ static int init_asic_data(struct hfi1_devdata *dd)
+ 	if (!asic_data)
+ 		return -ENOMEM;
+ 
+-	spin_lock_irqsave(&hfi1_devs_lock, flags);
++	xa_lock_irq(&hfi1_dev_table);
+ 	/* Find our peer device */
+-	list_for_each_entry(tmp, &hfi1_dev_list, list) {
+-		if ((HFI_BASE_GUID(dd) == HFI_BASE_GUID(tmp)) &&
+-		    dd->unit != tmp->unit) {
+-			peer = tmp;
++	xa_for_each(&hfi1_dev_table, index, peer) {
++		if ((HFI_BASE_GUID(dd) == HFI_BASE_GUID(peer)) &&
++		    dd->unit != peer->unit)
+ 			break;
+-		}
+ 	}
+ 
+ 	if (peer) {
+@@ -14704,7 +14702,7 @@ static int init_asic_data(struct hfi1_devdata *dd)
+ 		mutex_init(&dd->asic_data->asic_resource_mutex);
+ 	}
+ 	dd->asic_data->dds[dd->hfi1_id] = dd; /* self back-pointer */
+-	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
++	xa_unlock_irq(&hfi1_dev_table);
+ 
+ 	/* first one through - set up i2c devices */
+ 	if (!peer)
+diff --git a/drivers/infiniband/hw/hfi1/debugfs.c b/drivers/infiniband/hw/hfi1/debugfs.c
+index 427ba0ce74a5..057bb82c664f 100644
+--- a/drivers/infiniband/hw/hfi1/debugfs.c
++++ b/drivers/infiniband/hw/hfi1/debugfs.c
+@@ -1302,15 +1302,15 @@ static void _driver_stats_seq_stop(struct seq_file *s, void *v)
+ 
+ static u64 hfi1_sps_ints(void)
+ {
+-	unsigned long flags;
++	unsigned long index, flags;
+ 	struct hfi1_devdata *dd;
+ 	u64 sps_ints = 0;
+ 
+-	spin_lock_irqsave(&hfi1_devs_lock, flags);
+-	list_for_each_entry(dd, &hfi1_dev_list, list) {
++	xa_lock_irqsave(&hfi1_dev_table, flags);
++	xa_for_each(&hfi1_dev_table, index, dd) {
+ 		sps_ints += get_all_cpu_total(dd->int_counter);
+ 	}
+-	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
++	xa_unlock_irqrestore(&hfi1_dev_table, flags);
+ 	return sps_ints;
+ }
+ 
+diff --git a/drivers/infiniband/hw/hfi1/driver.c b/drivers/infiniband/hw/hfi1/driver.c
+index 1f4fe0269b51..129e48ec9ee0 100644
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@ -72,8 +72,6 @@
+  */
+ const char ib_hfi1_version[] = HFI1_DRIVER_VERSION "\n";
+ 
+-DEFINE_SPINLOCK(hfi1_devs_lock);
+-LIST_HEAD(hfi1_dev_list);
+ DEFINE_MUTEX(hfi1_mutex);	/* general driver use */
+ 
+ unsigned int hfi1_max_mtu = HFI1_DEFAULT_MAX_MTU;
+@@ -175,11 +173,11 @@ int hfi1_count_active_units(void)
+ {
+ 	struct hfi1_devdata *dd;
+ 	struct hfi1_pportdata *ppd;
+-	unsigned long flags;
++	unsigned long index, flags;
+ 	int pidx, nunits_active = 0;
+ 
+-	spin_lock_irqsave(&hfi1_devs_lock, flags);
+-	list_for_each_entry(dd, &hfi1_dev_list, list) {
++	xa_lock_irqsave(&hfi1_dev_table, flags);
++	xa_for_each(&hfi1_dev_table, index, dd) {
+ 		if (!(dd->flags & HFI1_PRESENT) || !dd->kregbase1)
+ 			continue;
+ 		for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+@@ -190,7 +188,7 @@ int hfi1_count_active_units(void)
+ 			}
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
++	xa_unlock_irqrestore(&hfi1_dev_table, flags);
+ 	return nunits_active;
+ }
+ 
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index aafd8c377dd3..b458c218842b 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -64,6 +64,7 @@
+ #include <linux/kthread.h>
+ #include <linux/i2c.h>
+ #include <linux/i2c-algo-bit.h>
++#include <linux/xarray.h>
+ #include <rdma/ib_hdrs.h>
+ #include <rdma/opa_addr.h>
+ #include <linux/rhashtable.h>
+@@ -1040,7 +1041,6 @@ struct sdma_vl_map;
+ typedef int (*send_routine)(struct rvt_qp *, struct hfi1_pkt_state *, u64);
+ struct hfi1_devdata {
+ 	struct hfi1_ibdev verbs_dev;     /* must be first */
+-	struct list_head list;
+ 	/* pointers to related structs for this device */
+ 	/* pci access data structure */
+ 	struct pci_dev *pcidev;
+@@ -1425,8 +1425,7 @@ struct hfi1_filedata {
+ 	struct mm_struct *mm;
+ };
+ 
+-extern struct list_head hfi1_dev_list;
+-extern spinlock_t hfi1_devs_lock;
++extern struct xarray hfi1_dev_table;
+ struct hfi1_devdata *hfi1_lookup(int unit);
+ 
+ static inline unsigned long uctxt_offset(struct hfi1_ctxtdata *uctxt)
+* Unmerged path drivers/infiniband/hw/hfi1/init.c
+diff --git a/drivers/infiniband/hw/hfi1/verbs.c b/drivers/infiniband/hw/hfi1/verbs.c
+index acac0aa353dd..08383be16c0e 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -1740,15 +1740,15 @@ static struct rdma_hw_stats *alloc_hw_stats(struct ib_device *ibdev,
+ 
+ static u64 hfi1_sps_ints(void)
+ {
+-	unsigned long flags;
++	unsigned long index, flags;
+ 	struct hfi1_devdata *dd;
+ 	u64 sps_ints = 0;
+ 
+-	spin_lock_irqsave(&hfi1_devs_lock, flags);
+-	list_for_each_entry(dd, &hfi1_dev_list, list) {
++	xa_lock_irqsave(&hfi1_dev_table, flags);
++	xa_for_each(&hfi1_dev_table, index, dd) {
+ 		sps_ints += get_all_cpu_total(dd->int_counter);
+ 	}
+-	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
++	xa_unlock_irqrestore(&hfi1_dev_table, flags);
+ 	return sps_ints;
+ }
+ 
