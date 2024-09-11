@@ -158,6 +158,7 @@ struct neighbour {
 	struct hh_cache		hh;
 	int			(*output)(struct neighbour *, struct sk_buff *);
 	const struct neigh_ops	*ops;
+	struct list_head	gc_list;
 	struct rcu_head		rcu;
 	struct net_device	*dev;
 
@@ -223,6 +224,8 @@ struct neigh_table {
 	struct timer_list 	proxy_timer;
 	struct sk_buff_head	proxy_queue;
 	atomic_t		entries;
+	atomic_t		gc_entries;
+	struct list_head	gc_list;
 	rwlock_t		lock;
 	unsigned long		last_rand;
 	struct neigh_statistics	__percpu *stats;
