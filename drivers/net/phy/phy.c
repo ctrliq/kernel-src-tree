@@ -543,7 +543,7 @@ int phy_start_aneg(struct phy_device *phydev)
 	if (err < 0)
 		goto out_unlock;
 
-	if (__phy_is_started(phydev)) {
+	if (phy_is_started(phydev)) {
 		if (phydev->autoneg == AUTONEG_ENABLE) {
 			err = phy_check_link_status(phydev);
 		} else {
@@ -699,7 +699,7 @@ void phy_stop_machine(struct phy_device *phydev)
 	cancel_delayed_work_sync(&phydev->state_queue);
 
 	mutex_lock(&phydev->lock);
-	if (__phy_is_started(phydev))
+	if (phy_is_started(phydev))
 		phydev->state = PHY_UP;
 	mutex_unlock(&phydev->lock);
 }
@@ -810,14 +810,13 @@ EXPORT_SYMBOL(phy_request_interrupt);
  */
 void phy_stop(struct phy_device *phydev)
 {
-	mutex_lock(&phydev->lock);
-
-	if (!__phy_is_started(phydev)) {
+	if (!phy_is_started(phydev)) {
 		WARN(1, "called from state %s\n",
 		     phy_state_to_str(phydev->state));
-		mutex_unlock(&phydev->lock);
 		return;
 	}
+
+	mutex_lock(&phydev->lock);
 
 	if (phy_interrupt_is_valid(phydev))
 		phy_disable_interrupts(phydev);

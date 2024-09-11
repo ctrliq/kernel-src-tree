@@ -698,26 +698,13 @@ size_t phy_speeds(unsigned int *speeds, size_t size,
 		  unsigned long *mask);
 void of_set_phy_supported(struct phy_device *phydev);
 
-static inline bool __phy_is_started(struct phy_device *phydev)
-{
-	WARN_ON(!mutex_is_locked(&phydev->lock));
-
-	return phydev->state >= PHY_UP;
-}
-
 /**
  * phy_is_started - Convenience function to check whether PHY is started
  * @phydev: The phy_device struct
  */
 static inline bool phy_is_started(struct phy_device *phydev)
 {
-	bool started;
-
-	mutex_lock(&phydev->lock);
-	started = __phy_is_started(phydev);
-	mutex_unlock(&phydev->lock);
-
-	return started;
+	return phydev->state >= PHY_UP;
 }
 
 void phy_resolve_aneg_linkmode(struct phy_device *phydev);
