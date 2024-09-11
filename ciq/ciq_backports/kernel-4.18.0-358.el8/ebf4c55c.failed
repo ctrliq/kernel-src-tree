@@ -1,0 +1,141 @@
+locking/mutex: Make mutex::wait_lock raw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit ebf4c55c1ddbabaea120fe8d48ce25b4f5da93a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ebf4c55c.failed
+
+The wait_lock of mutex is really a low level lock. Convert it to a
+raw_spinlock like the wait_lock of rtmutex.
+
+[ mingo: backmerged the test_lockup.c build fix by bigeasy. ]
+
+Co-developed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20210815211304.166863404@linutronix.de
+(cherry picked from commit ebf4c55c1ddbabaea120fe8d48ce25b4f5da93a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/test_lockup.c
+* Unmerged path lib/test_lockup.c
+diff --git a/include/linux/mutex.h b/include/linux/mutex.h
+index 3c6c110bd142..39d0c37871e5 100644
+--- a/include/linux/mutex.h
++++ b/include/linux/mutex.h
+@@ -50,7 +50,7 @@
+  */
+ struct mutex {
+ 	atomic_long_t		owner;
+-	spinlock_t		wait_lock;
++	raw_spinlock_t		wait_lock;
+ #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+ 	struct optimistic_spin_queue osq; /* Spinner MCS lock */
+ #endif
+@@ -105,7 +105,7 @@ do {									\
+ 
+ #define __MUTEX_INITIALIZER(lockname) \
+ 		{ .owner = ATOMIC_LONG_INIT(0) \
+-		, .wait_lock = __SPIN_LOCK_UNLOCKED(lockname.wait_lock) \
++		, .wait_lock = __RAW_SPIN_LOCK_UNLOCKED(lockname.wait_lock) \
+ 		, .wait_list = LIST_HEAD_INIT(lockname.wait_list) \
+ 		__DEBUG_MUTEX_INITIALIZER(lockname) \
+ 		__DEP_MAP_MUTEX_INITIALIZER(lockname) }
+diff --git a/kernel/locking/mutex.c b/kernel/locking/mutex.c
+index a2bdb5dfc2f6..7ea82c2b0f0e 100644
+--- a/kernel/locking/mutex.c
++++ b/kernel/locking/mutex.c
+@@ -41,7 +41,7 @@ void
+ __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
+ {
+ 	atomic_long_set(&lock->owner, 0);
+-	spin_lock_init(&lock->wait_lock);
++	raw_spin_lock_init(&lock->wait_lock);
+ 	INIT_LIST_HEAD(&lock->wait_list);
+ #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+ 	osq_lock_init(&lock->osq);
+@@ -495,9 +495,9 @@ ww_mutex_set_context_fastpath(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
+ 	 * Uh oh, we raced in fastpath, check if any of the waiters need to
+ 	 * die or wound us.
+ 	 */
+-	spin_lock(&lock->base.wait_lock);
++	raw_spin_lock(&lock->base.wait_lock);
+ 	__ww_mutex_check_waiters(&lock->base, ctx);
+-	spin_unlock(&lock->base.wait_lock);
++	raw_spin_unlock(&lock->base.wait_lock);
+ }
+ 
+ #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+@@ -975,7 +975,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
+ 		return 0;
+ 	}
+ 
+-	spin_lock(&lock->wait_lock);
++	raw_spin_lock(&lock->wait_lock);
+ 	/*
+ 	 * After waiting to acquire the wait_lock, try again.
+ 	 */
+@@ -1041,7 +1041,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
+ 				goto err;
+ 		}
+ 
+-		spin_unlock(&lock->wait_lock);
++		raw_spin_unlock(&lock->wait_lock);
+ 		schedule_preempt_disabled();
+ 
+ 		first = __mutex_waiter_is_first(lock, &waiter);
+@@ -1056,9 +1056,9 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
+ 		    (first && mutex_optimistic_spin(lock, ww_ctx, &waiter)))
+ 			break;
+ 
+-		spin_lock(&lock->wait_lock);
++		raw_spin_lock(&lock->wait_lock);
+ 	}
+-	spin_lock(&lock->wait_lock);
++	raw_spin_lock(&lock->wait_lock);
+ acquired:
+ 	__set_current_state(TASK_RUNNING);
+ 
+@@ -1083,7 +1083,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
+ 	if (ww_ctx)
+ 		ww_mutex_lock_acquired(ww, ww_ctx);
+ 
+-	spin_unlock(&lock->wait_lock);
++	raw_spin_unlock(&lock->wait_lock);
+ 	preempt_enable();
+ 	return 0;
+ 
+@@ -1091,7 +1091,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
+ 	__set_current_state(TASK_RUNNING);
+ 	__mutex_remove_waiter(lock, &waiter);
+ err_early_kill:
+-	spin_unlock(&lock->wait_lock);
++	raw_spin_unlock(&lock->wait_lock);
+ 	debug_mutex_free_waiter(&waiter);
+ 	mutex_release(&lock->dep_map, ip);
+ 	preempt_enable();
+@@ -1252,7 +1252,7 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
+ 		}
+ 	}
+ 
+-	spin_lock(&lock->wait_lock);
++	raw_spin_lock(&lock->wait_lock);
+ 	debug_mutex_unlock(lock);
+ 	if (!list_empty(&lock->wait_list)) {
+ 		/* get the first entry from the wait-list: */
+@@ -1269,7 +1269,7 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
+ 	if (owner & MUTEX_FLAG_HANDOFF)
+ 		__mutex_handoff(lock, next);
+ 
+-	spin_unlock(&lock->wait_lock);
++	raw_spin_unlock(&lock->wait_lock);
+ 
+ 	wake_up_q(&wake_q);
+ }
+* Unmerged path lib/test_lockup.c
