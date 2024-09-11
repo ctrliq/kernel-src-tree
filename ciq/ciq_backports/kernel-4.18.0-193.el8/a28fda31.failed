@@ -1,0 +1,222 @@
+drm/amdgpu: Avoid accidental thread reactivation.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [drm] drm/amdgpu: Avoid accidental thread reactivation (Lyude Paul) [1792565]
+Rebuild_FUZZ: 98.97%
+commit-author Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+commit a28fda312a9fabdf0e5f5652449d6197c9fb0a90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a28fda31.failed
+
+Problem:
+During GPU reset we call the GPU scheduler to suspend it's
+thread, those two functions in amdgpu also suspend and resume
+the sceduler for their needs but this can collide with GPU
+reset in progress and accidently restart a suspended thread
+before time.
+
+Fix:
+Serialize with GPU reset.
+
+	Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit a28fda312a9fabdf0e5f5652449d6197c9fb0a90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+index 4ae3ff9a1d4c,8e6726e0d035..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+@@@ -921,8 -929,183 +926,177 @@@ static const struct drm_info_list amdgp
+  	{"amdgpu_evict_gtt", &amdgpu_debugfs_evict_gtt},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void amdgpu_ib_preempt_fences_swap(struct amdgpu_ring *ring,
++ 					  struct dma_fence **fences)
++ {
++ 	struct amdgpu_fence_driver *drv = &ring->fence_drv;
++ 	uint32_t sync_seq, last_seq;
++ 
++ 	last_seq = atomic_read(&ring->fence_drv.last_seq);
++ 	sync_seq = ring->fence_drv.sync_seq;
++ 
++ 	last_seq &= drv->num_fences_mask;
++ 	sync_seq &= drv->num_fences_mask;
++ 
++ 	do {
++ 		struct dma_fence *fence, **ptr;
++ 
++ 		++last_seq;
++ 		last_seq &= drv->num_fences_mask;
++ 		ptr = &drv->fences[last_seq];
++ 
++ 		fence = rcu_dereference_protected(*ptr, 1);
++ 		RCU_INIT_POINTER(*ptr, NULL);
++ 
++ 		if (!fence)
++ 			continue;
++ 
++ 		fences[last_seq] = fence;
++ 
++ 	} while (last_seq != sync_seq);
++ }
++ 
++ static void amdgpu_ib_preempt_signal_fences(struct dma_fence **fences,
++ 					    int length)
++ {
++ 	int i;
++ 	struct dma_fence *fence;
++ 
++ 	for (i = 0; i < length; i++) {
++ 		fence = fences[i];
++ 		if (!fence)
++ 			continue;
++ 		dma_fence_signal(fence);
++ 		dma_fence_put(fence);
++ 	}
++ }
++ 
++ static void amdgpu_ib_preempt_job_recovery(struct drm_gpu_scheduler *sched)
++ {
++ 	struct drm_sched_job *s_job;
++ 	struct dma_fence *fence;
++ 
++ 	spin_lock(&sched->job_list_lock);
++ 	list_for_each_entry(s_job, &sched->ring_mirror_list, node) {
++ 		fence = sched->ops->run_job(s_job);
++ 		dma_fence_put(fence);
++ 	}
++ 	spin_unlock(&sched->job_list_lock);
++ }
++ 
++ static void amdgpu_ib_preempt_mark_partial_job(struct amdgpu_ring *ring)
++ {
++ 	struct amdgpu_job *job;
++ 	struct drm_sched_job *s_job;
++ 	uint32_t preempt_seq;
++ 	struct dma_fence *fence, **ptr;
++ 	struct amdgpu_fence_driver *drv = &ring->fence_drv;
++ 	struct drm_gpu_scheduler *sched = &ring->sched;
++ 
++ 	if (ring->funcs->type != AMDGPU_RING_TYPE_GFX)
++ 		return;
++ 
++ 	preempt_seq = le32_to_cpu(*(drv->cpu_addr + 2));
++ 	if (preempt_seq <= atomic_read(&drv->last_seq))
++ 		return;
++ 
++ 	preempt_seq &= drv->num_fences_mask;
++ 	ptr = &drv->fences[preempt_seq];
++ 	fence = rcu_dereference_protected(*ptr, 1);
++ 
++ 	spin_lock(&sched->job_list_lock);
++ 	list_for_each_entry(s_job, &sched->ring_mirror_list, node) {
++ 		job = to_amdgpu_job(s_job);
++ 		if (job->fence == fence)
++ 			/* mark the job as preempted */
++ 			job->preemption_status |= AMDGPU_IB_PREEMPTED;
++ 	}
++ 	spin_unlock(&sched->job_list_lock);
++ }
++ 
++ static int amdgpu_debugfs_ib_preempt(void *data, u64 val)
++ {
++ 	int r, resched, length;
++ 	struct amdgpu_ring *ring;
++ 	struct dma_fence **fences = NULL;
++ 	struct amdgpu_device *adev = (struct amdgpu_device *)data;
++ 
++ 	if (val >= AMDGPU_MAX_RINGS)
++ 		return -EINVAL;
++ 
++ 	ring = adev->rings[val];
++ 
++ 	if (!ring || !ring->funcs->preempt_ib || !ring->sched.thread)
++ 		return -EINVAL;
++ 
++ 	/* the last preemption failed */
++ 	if (ring->trail_seq != le32_to_cpu(*ring->trail_fence_cpu_addr))
++ 		return -EBUSY;
++ 
++ 	length = ring->fence_drv.num_fences_mask + 1;
++ 	fences = kcalloc(length, sizeof(void *), GFP_KERNEL);
++ 	if (!fences)
++ 		return -ENOMEM;
++ 
++ 	/* Avoid accidently unparking the sched thread during GPU reset */
++ 	mutex_lock(&adev->lock_reset);
++ 
++ 	/* stop the scheduler */
++ 	kthread_park(ring->sched.thread);
++ 
++ 	resched = ttm_bo_lock_delayed_workqueue(&adev->mman.bdev);
++ 
++ 	/* preempt the IB */
++ 	r = amdgpu_ring_preempt_ib(ring);
++ 	if (r) {
++ 		DRM_WARN("failed to preempt ring %d\n", ring->idx);
++ 		goto failure;
++ 	}
++ 
++ 	amdgpu_fence_process(ring);
++ 
++ 	if (atomic_read(&ring->fence_drv.last_seq) !=
++ 	    ring->fence_drv.sync_seq) {
++ 		DRM_INFO("ring %d was preempted\n", ring->idx);
++ 
++ 		amdgpu_ib_preempt_mark_partial_job(ring);
++ 
++ 		/* swap out the old fences */
++ 		amdgpu_ib_preempt_fences_swap(ring, fences);
++ 
++ 		amdgpu_fence_driver_force_completion(ring);
++ 
++ 		/* resubmit unfinished jobs */
++ 		amdgpu_ib_preempt_job_recovery(&ring->sched);
++ 
++ 		/* wait for jobs finished */
++ 		amdgpu_fence_wait_empty(ring);
++ 
++ 		/* signal the old fences */
++ 		amdgpu_ib_preempt_signal_fences(fences, length);
++ 	}
++ 
++ failure:
++ 	/* restart the scheduler */
++ 	kthread_unpark(ring->sched.thread);
++ 
++ 	mutex_unlock(&adev->lock_reset);
++ 
++ 	ttm_bo_unlock_delayed_workqueue(&adev->mman.bdev, resched);
++ 
++ 	kfree(fences);
++ 
++ 	return 0;
++ }
++ 
++ DEFINE_SIMPLE_ATTRIBUTE(fops_ib_preempt, NULL,
++ 			amdgpu_debugfs_ib_preempt, "%llu\n");
++ 
+++>>>>>>> a28fda312a9f (drm/amdgpu: Avoid accidental thread reactivation.)
+  int amdgpu_debugfs_init(struct amdgpu_device *adev)
+  {
+ -	adev->debugfs_preempt =
+ -		debugfs_create_file("amdgpu_preempt_ib", 0600,
+ -				    adev->ddev->primary->debugfs_root, adev,
+ -				    &fops_ib_preempt);
+ -	if (!(adev->debugfs_preempt)) {
+ -		DRM_ERROR("unable to create amdgpu_preempt_ib debugsfs file\n");
+ -		return -EIO;
+ -	}
+ -
+  	return amdgpu_debugfs_add_files(adev, amdgpu_debugfs_list,
+  					ARRAY_SIZE(amdgpu_debugfs_list));
+  }
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
