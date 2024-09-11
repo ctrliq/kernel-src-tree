@@ -1,0 +1,291 @@
+net: ipv6_stub: use ip6_dst_lookup_flow instead of ip6_dst_lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] ipv6_stub: use ip6_dst_lookup_flow instead of ip6_dst_lookup (Sabrina Dubroca) [1774440]
+Rebuild_FUZZ: 96.00%
+commit-author Sabrina Dubroca <sd@queasysnail.net>
+commit 6c8991f41546c3c472503dff1ea9daaddf9331c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6c8991f4.failed
+
+ipv6_stub uses the ip6_dst_lookup function to allow other modules to
+perform IPv6 lookups. However, this function skips the XFRM layer
+entirely.
+
+All users of ipv6_stub->ip6_dst_lookup use ip_route_output_flow (via the
+ip_route_output_key and ip_route_output helpers) for their IPv4 lookups,
+which calls xfrm_lookup_route(). This patch fixes this inconsistent
+behavior by switching the stub to ip6_dst_lookup_flow, which also calls
+xfrm_lookup_route().
+
+This requires some changes in all the callers, as these two functions
+take different arguments and have different return types.
+
+Fixes: 5f81bd2e5d80 ("ipv6: export a stub for IPv6 symbols used by vxlan")
+	Reported-by: Xiumei Mu <xmu@redhat.com>
+	Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6c8991f41546c3c472503dff1ea9daaddf9331c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+index 64810c571012,c754987278a9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+@@@ -320,6 -283,43 +320,46 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_INET) && IS_ENABLED(CONFIG_IPV6)
++ static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
++ 				   struct net_device *mirred_dev,
++ 				   struct net_device **out_dev,
++ 				   struct net_device **route_dev,
++ 				   struct flowi6 *fl6,
++ 				   struct neighbour **out_n,
++ 				   u8 *out_ttl)
++ {
++ 	struct dst_entry *dst;
++ 	struct neighbour *n;
++ 
++ 	int ret;
++ 
++ 	dst = ipv6_stub->ipv6_dst_lookup_flow(dev_net(mirred_dev), NULL, fl6,
++ 					      NULL);
++ 	if (IS_ERR(dst))
++ 		return PTR_ERR(dst);
++ 
++ 	if (!(*out_ttl))
++ 		*out_ttl = ip6_dst_hoplimit(dst);
++ 
++ 	ret = get_route_and_out_devs(priv, dst->dev, route_dev, out_dev);
++ 	if (ret < 0) {
++ 		dst_release(dst);
++ 		return ret;
++ 	}
++ 
++ 	n = dst_neigh_lookup(dst, &fl6->daddr);
++ 	dst_release(dst);
++ 	if (!n)
++ 		return -ENOMEM;
++ 
++ 	*out_n = n;
++ 	return 0;
++ }
++ 
+++>>>>>>> 6c8991f41546 (net: ipv6_stub: use ip6_dst_lookup_flow instead of ip6_dst_lookup)
+  int mlx5e_tc_tun_create_header_ipv6(struct mlx5e_priv *priv,
+  				    struct net_device *mirred_dev,
+  				    struct mlx5e_encap_entry *e)
+diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
+index b417367e4414..93b5fa7d3063 100644
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -420,16 +420,15 @@ static int addr6_resolve(struct sockaddr *src_sock,
+ 				(const struct sockaddr_in6 *)dst_sock;
+ 	struct flowi6 fl6;
+ 	struct dst_entry *dst;
+-	int ret;
+ 
+ 	memset(&fl6, 0, sizeof fl6);
+ 	fl6.daddr = dst_in->sin6_addr;
+ 	fl6.saddr = src_in->sin6_addr;
+ 	fl6.flowi6_oif = addr->bound_dev_if;
+ 
+-	ret = ipv6_stub->ipv6_dst_lookup(addr->net, NULL, &dst, &fl6);
+-	if (ret < 0)
+-		return ret;
++	dst = ipv6_stub->ipv6_dst_lookup_flow(addr->net, NULL, &fl6, NULL);
++	if (IS_ERR(dst))
++		return PTR_ERR(dst);
+ 
+ 	if (ipv6_addr_any(&src_in->sin6_addr))
+ 		src_in->sin6_addr = fl6.saddr;
+diff --git a/drivers/infiniband/sw/rxe/rxe_net.c b/drivers/infiniband/sw/rxe/rxe_net.c
+index 25b3b37b318b..4af700da7911 100644
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@ -136,10 +136,12 @@ static struct dst_entry *rxe_find_route6(struct net_device *ndev,
+ 	memcpy(&fl6.daddr, daddr, sizeof(*daddr));
+ 	fl6.flowi6_proto = IPPROTO_UDP;
+ 
+-	if (unlikely(ipv6_stub->ipv6_dst_lookup(sock_net(recv_sockets.sk6->sk),
+-						recv_sockets.sk6->sk, &ndst, &fl6))) {
++	ndst = ipv6_stub->ipv6_dst_lookup_flow(sock_net(recv_sockets.sk6->sk),
++					       recv_sockets.sk6->sk, &fl6,
++					       NULL);
++	if (unlikely(IS_ERR(ndst))) {
+ 		pr_err_ratelimited("no route to %pI6\n", daddr);
+-		goto put;
++		return NULL;
+ 	}
+ 
+ 	if (unlikely(ndst->error)) {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
+index 784245749969..56df05adb742 100644
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -854,7 +854,9 @@ static struct dst_entry *geneve_get_v6_dst(struct sk_buff *skb,
+ 		if (dst)
+ 			return dst;
+ 	}
+-	if (ipv6_stub->ipv6_dst_lookup(geneve->net, gs6->sock->sk, &dst, fl6)) {
++	dst = ipv6_stub->ipv6_dst_lookup_flow(geneve->net, gs6->sock->sk, fl6,
++					      NULL);
++	if (IS_ERR(dst)) {
+ 		netdev_dbg(dev, "no route to %pI6\n", &fl6->daddr);
+ 		return ERR_PTR(-ENETUNREACH);
+ 	}
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 4fceba640f33..b5e4c39e4c74 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -2263,7 +2263,6 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
+ 	bool use_cache = ip_tunnel_dst_cache_usable(skb, info);
+ 	struct dst_entry *ndst;
+ 	struct flowi6 fl6;
+-	int err;
+ 
+ 	if (!sock6)
+ 		return ERR_PTR(-EIO);
+@@ -2286,10 +2285,9 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
+ 	fl6.fl6_dport = dport;
+ 	fl6.fl6_sport = sport;
+ 
+-	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
+-					 sock6->sock->sk,
+-					 &ndst, &fl6);
+-	if (unlikely(err < 0)) {
++	ndst = ipv6_stub->ipv6_dst_lookup_flow(vxlan->net, sock6->sock->sk,
++					       &fl6, NULL);
++	if (unlikely(IS_ERR(ndst))) {
+ 		netdev_dbg(dev, "no route to %pI6\n", daddr);
+ 		return ERR_PTR(-ENETUNREACH);
+ 	}
+diff --git a/include/net/ipv6_stubs.h b/include/net/ipv6_stubs.h
+index d8d9c0b0e8c0..44a56078b6fb 100644
+--- a/include/net/ipv6_stubs.h
++++ b/include/net/ipv6_stubs.h
+@@ -21,8 +21,10 @@ struct ipv6_stub {
+ 				 const struct in6_addr *addr);
+ 	int (*ipv6_sock_mc_drop)(struct sock *sk, int ifindex,
+ 				 const struct in6_addr *addr);
+-	int (*ipv6_dst_lookup)(struct net *net, struct sock *sk,
+-			       struct dst_entry **dst, struct flowi6 *fl6);
++	struct dst_entry *(*ipv6_dst_lookup_flow)(struct net *net,
++						  const struct sock *sk,
++						  struct flowi6 *fl6,
++						  const struct in6_addr *final_dst);
+ 	int (*ipv6_route_input)(struct sk_buff *skb);
+ 
+ 	struct fib6_table *(*fib6_get_table)(struct net *net, u32 id);
+diff --git a/net/core/lwt_bpf.c b/net/core/lwt_bpf.c
+index 7de9c446b3e2..9d90f12ac406 100644
+--- a/net/core/lwt_bpf.c
++++ b/net/core/lwt_bpf.c
+@@ -232,9 +232,7 @@ static int bpf_lwt_xmit_reroute(struct sk_buff *skb)
+ 		fl6.daddr = iph6->daddr;
+ 		fl6.saddr = iph6->saddr;
+ 
+-		err = ipv6_stub->ipv6_dst_lookup(net, skb->sk, &dst, &fl6);
+-		if (unlikely(err))
+-			goto err;
++		dst = ipv6_stub->ipv6_dst_lookup_flow(net, skb->sk, &fl6, NULL);
+ 		if (IS_ERR(dst)) {
+ 			err = PTR_ERR(dst);
+ 			goto err;
+diff --git a/net/ipv6/addrconf_core.c b/net/ipv6/addrconf_core.c
+index 945b66e3008f..5cdf0c4becab 100644
+--- a/net/ipv6/addrconf_core.c
++++ b/net/ipv6/addrconf_core.c
+@@ -127,11 +127,12 @@ int inet6addr_validator_notifier_call_chain(unsigned long val, void *v)
+ }
+ EXPORT_SYMBOL(inet6addr_validator_notifier_call_chain);
+ 
+-static int eafnosupport_ipv6_dst_lookup(struct net *net, struct sock *u1,
+-					struct dst_entry **u2,
+-					struct flowi6 *u3)
++static struct dst_entry *eafnosupport_ipv6_dst_lookup_flow(struct net *net,
++							   const struct sock *sk,
++							   struct flowi6 *fl6,
++							   const struct in6_addr *final_dst)
+ {
+-	return -EAFNOSUPPORT;
++	return ERR_PTR(-EAFNOSUPPORT);
+ }
+ 
+ static int eafnosupport_ipv6_route_input(struct sk_buff *skb)
+@@ -174,7 +175,7 @@ eafnosupport_ip6_mtu_from_fib6(struct fib6_info *f6i, struct in6_addr *daddr,
+ }
+ 
+ const struct ipv6_stub *ipv6_stub __read_mostly = &(struct ipv6_stub) {
+-	.ipv6_dst_lookup   = eafnosupport_ipv6_dst_lookup,
++	.ipv6_dst_lookup_flow = eafnosupport_ipv6_dst_lookup_flow,
+ 	.ipv6_route_input  = eafnosupport_ipv6_route_input,
+ 	.fib6_get_table    = eafnosupport_fib6_get_table,
+ 	.fib6_table_lookup = eafnosupport_fib6_table_lookup,
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index 1add86c16b26..40b7087fe6d1 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -911,7 +911,7 @@ static int ipv6_route_input(struct sk_buff *skb)
+ static const struct ipv6_stub ipv6_stub_impl = {
+ 	.ipv6_sock_mc_join = ipv6_sock_mc_join,
+ 	.ipv6_sock_mc_drop = ipv6_sock_mc_drop,
+-	.ipv6_dst_lookup   = ip6_dst_lookup,
++	.ipv6_dst_lookup_flow = ip6_dst_lookup_flow,
+ 	.ipv6_route_input  = ipv6_route_input,
+ 	.fib6_get_table	   = fib6_get_table,
+ 	.fib6_table_lookup = fib6_table_lookup,
+diff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c
+index dd6573c92d5a..39d7a11d159f 100644
+--- a/net/mpls/af_mpls.c
++++ b/net/mpls/af_mpls.c
+@@ -618,16 +618,15 @@ static struct net_device *inet6_fib_lookup_dev(struct net *net,
+ 	struct net_device *dev;
+ 	struct dst_entry *dst;
+ 	struct flowi6 fl6;
+-	int err;
+ 
+ 	if (!ipv6_stub)
+ 		return ERR_PTR(-EAFNOSUPPORT);
+ 
+ 	memset(&fl6, 0, sizeof(fl6));
+ 	memcpy(&fl6.daddr, addr, sizeof(struct in6_addr));
+-	err = ipv6_stub->ipv6_dst_lookup(net, NULL, &dst, &fl6);
+-	if (err)
+-		return ERR_PTR(err);
++	dst = ipv6_stub->ipv6_dst_lookup_flow(net, NULL, &fl6, NULL);
++	if (IS_ERR(dst))
++		return ERR_CAST(dst);
+ 
+ 	dev = dst->dev;
+ 	dev_hold(dev);
+diff --git a/net/tipc/udp_media.c b/net/tipc/udp_media.c
+index b35f12cd66df..be8462032803 100644
+--- a/net/tipc/udp_media.c
++++ b/net/tipc/udp_media.c
+@@ -195,10 +195,13 @@ static int tipc_udp_xmit(struct net *net, struct sk_buff *skb,
+ 				.saddr = src->ipv6,
+ 				.flowi6_proto = IPPROTO_UDP
+ 			};
+-			err = ipv6_stub->ipv6_dst_lookup(net, ub->ubsock->sk,
+-							 &ndst, &fl6);
+-			if (err)
++			ndst = ipv6_stub->ipv6_dst_lookup_flow(net,
++							       ub->ubsock->sk,
++							       &fl6, NULL);
++			if (IS_ERR(ndst)) {
++				err = PTR_ERR(ndst);
+ 				goto tx_error;
++			}
+ 			dst_cache_set_ip6(cache, ndst, &fl6.saddr);
+ 		}
+ 		ttl = ip6_dst_hoplimit(ndst);
