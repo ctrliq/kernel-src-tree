@@ -1,0 +1,181 @@
+KVM: x86/mmu: Move shadow-present check out of spte_has_volatile_bits()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 54eb3ef56f36827aad90915df33387d4c2b5df5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/54eb3ef5.failed
+
+Move the is_shadow_present_pte() check out of spte_has_volatile_bits()
+and into its callers.  Well, caller, since only one of its two callers
+doesn't already do the shadow-present check.
+
+Opportunistically move the helper to spte.c/h so that it can be used by
+the TDP MMU, which is also the primary motivation for the shadow-present
+change.  Unlike the legacy MMU, the TDP MMU uses a single path for clear
+leaf and non-leaf SPTEs, and to avoid unnecessary atomic updates, the TDP
+MMU will need to check is_last_spte() prior to calling
+spte_has_volatile_bits(), and calling is_last_spte() without first
+calling is_shadow_present_spte() is at best odd, and at worst a violation
+of KVM's loosely defines SPTE rules.
+
+Note, mmu_spte_clear_track_bits() could likely skip the write entirely
+for SPTEs that are not shadow-present.  Leave that cleanup for a future
+patch to avoid introducing a functional change, and because the
+shadow-present check can likely be moved further up the stack, e.g.
+drop_large_spte() appears to be the only path that doesn't already
+explicitly check for a shadow-present SPTE.
+
+No functional change intended.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220423034752.1161007-3-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 54eb3ef56f36827aad90915df33387d4c2b5df5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/spte.c
+#	arch/x86/kvm/mmu/spte.h
+diff --cc arch/x86/kvm/mmu/spte.c
+index 31a0e0981b05,e5c0b6db6f2c..000000000000
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@@ -89,15 -90,45 +89,51 @@@ static bool kvm_is_mmio_pfn(kvm_pfn_t p
+  				     E820_TYPE_RAM);
+  }
+  
+++<<<<<<< HEAD
+ +int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ +		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+ +		     bool can_unsync, bool host_writable, bool ad_disabled,
+ +		     u64 *new_spte)
+++=======
++ /*
++  * Returns true if the SPTE has bits that may be set without holding mmu_lock.
++  * The caller is responsible for checking if the SPTE is shadow-present, and
++  * for determining whether or not the caller cares about non-leaf SPTEs.
++  */
++ bool spte_has_volatile_bits(u64 spte)
++ {
++ 	/*
++ 	 * Always atomically update spte if it can be updated
++ 	 * out of mmu-lock, it can ensure dirty bit is not lost,
++ 	 * also, it can help us to get a stable is_writable_pte()
++ 	 * to ensure tlb flush is not missed.
++ 	 */
++ 	if (!is_writable_pte(spte) && is_mmu_writable_spte(spte))
++ 		return true;
++ 
++ 	if (is_access_track_spte(spte))
++ 		return true;
++ 
++ 	if (spte_ad_enabled(spte)) {
++ 		if (!(spte & shadow_accessed_mask) ||
++ 		    (is_writable_pte(spte) && !(spte & shadow_dirty_mask)))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
++ 	       const struct kvm_memory_slot *slot,
++ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
++ 	       u64 old_spte, bool prefetch, bool can_unsync,
++ 	       bool host_writable, u64 *new_spte)
+++>>>>>>> 54eb3ef56f36 (KVM: x86/mmu: Move shadow-present check out of spte_has_volatile_bits())
+  {
+ -	int level = sp->role.level;
+  	u64 spte = SPTE_MMU_PRESENT_MASK;
+ -	bool wrprot = false;
+ +	int ret = 0;
+  
+ -	if (sp->role.ad_disabled)
+ +	if (ad_disabled)
+  		spte |= SPTE_TDP_AD_DISABLED_MASK;
+  	else if (kvm_mmu_page_ad_need_write_protect(sp))
+  		spte |= SPTE_TDP_AD_WRPROT_ONLY_MASK;
+diff --cc arch/x86/kvm/mmu/spte.h
+index 337d56ae4453,80ab0f5cff01..000000000000
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@@ -403,15 -404,14 +403,26 @@@ static inline u64 get_mmio_spte_generat
+  	return gen;
+  }
+  
+++<<<<<<< HEAD
+ +/* Bits which may be returned by set_spte() */
+ +#define SET_SPTE_WRITE_PROTECTED_PT    BIT(0)
+ +#define SET_SPTE_NEED_REMOTE_TLB_FLUSH BIT(1)
+ +#define SET_SPTE_SPURIOUS              BIT(2)
+ +
+ +int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ +		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+ +		     bool can_unsync, bool host_writable, bool ad_disabled,
+ +		     u64 *new_spte);
+++=======
++ bool spte_has_volatile_bits(u64 spte);
++ 
++ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
++ 	       const struct kvm_memory_slot *slot,
++ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
++ 	       u64 old_spte, bool prefetch, bool can_unsync,
++ 	       bool host_writable, u64 *new_spte);
++ u64 make_huge_page_split_spte(u64 huge_spte, int huge_level, int index);
+++>>>>>>> 54eb3ef56f36 (KVM: x86/mmu: Move shadow-present check out of spte_has_volatile_bits())
+  u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled);
+  u64 make_mmio_spte(struct kvm_vcpu *vcpu, u64 gfn, unsigned int access);
+  u64 mark_spte_for_access_track(u64 spte);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 07c739b8b1c2..ed4660c75b3c 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -490,32 +490,6 @@ static u64 __get_spte_lockless(u64 *sptep)
+ }
+ #endif
+ 
+-static bool spte_has_volatile_bits(u64 spte)
+-{
+-	if (!is_shadow_present_pte(spte))
+-		return false;
+-
+-	/*
+-	 * Always atomically update spte if it can be updated
+-	 * out of mmu-lock, it can ensure dirty bit is not lost,
+-	 * also, it can help us to get a stable is_writable_pte()
+-	 * to ensure tlb flush is not missed.
+-	 */
+-	if (!is_writable_pte(spte) && is_mmu_writable_spte(spte))
+-		return true;
+-
+-	if (is_access_track_spte(spte))
+-		return true;
+-
+-	if (spte_ad_enabled(spte)) {
+-		if (!(spte & shadow_accessed_mask) ||
+-		    (is_writable_pte(spte) && !(spte & shadow_dirty_mask)))
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+ /* Rules for using mmu_spte_set:
+  * Set the sptep from nonpresent to present.
+  * Note: the sptep being assigned *must* be either not present
+@@ -611,7 +585,8 @@ static u64 mmu_spte_clear_track_bits(u64 *sptep)
+ 	kvm_pfn_t pfn;
+ 	u64 old_spte = *sptep;
+ 
+-	if (!spte_has_volatile_bits(old_spte))
++	if (!is_shadow_present_pte(old_spte) ||
++	    !spte_has_volatile_bits(old_spte))
+ 		__update_clear_spte_fast(sptep, 0ull);
+ 	else
+ 		old_spte = __update_clear_spte_slow(sptep, 0ull);
+* Unmerged path arch/x86/kvm/mmu/spte.c
+* Unmerged path arch/x86/kvm/mmu/spte.h
