@@ -1,0 +1,204 @@
+nvme: split nvme_report_zones
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8b4fb0f968ffe73f619c06cb4040ecaa60327098
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/8b4fb0f9.failed
+
+Split multipath support out of nvme_report_zones into a separate helper
+and simplify the non-multipath version as a result.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit 8b4fb0f968ffe73f619c06cb4040ecaa60327098)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/multipath.c
+diff --cc drivers/nvme/host/multipath.c
+index c4c5d694fcd4,127a17b4c13d..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -350,6 -337,90 +350,93 @@@ static blk_qc_t nvme_ns_head_make_reque
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nvme_ns_head_open(struct block_device *bdev, fmode_t mode)
++ {
++ 	if (!nvme_tryget_ns_head(bdev->bd_disk->private_data))
++ 		return -ENXIO;
++ 	return 0;
++ }
++ 
++ static void nvme_ns_head_release(struct gendisk *disk, fmode_t mode)
++ {
++ 	nvme_put_ns_head(disk->private_data);
++ }
++ 
++ #ifdef CONFIG_BLK_DEV_ZONED
++ static int nvme_ns_head_report_zones(struct gendisk *disk, sector_t sector,
++ 		unsigned int nr_zones, report_zones_cb cb, void *data)
++ {
++ 	struct nvme_ns_head *head = disk->private_data;
++ 	struct nvme_ns *ns;
++ 	int srcu_idx, ret = -EWOULDBLOCK;
++ 
++ 	srcu_idx = srcu_read_lock(&head->srcu);
++ 	ns = nvme_find_path(head);
++ 	if (ns)
++ 		ret = nvme_ns_report_zones(ns, sector, nr_zones, cb, data);
++ 	srcu_read_unlock(&head->srcu, srcu_idx);
++ 	return ret;
++ }
++ #else
++ #define nvme_ns_head_report_zones	NULL
++ #endif /* CONFIG_BLK_DEV_ZONED */
++ 
++ const struct block_device_operations nvme_ns_head_ops = {
++ 	.owner		= THIS_MODULE,
++ 	.submit_bio	= nvme_ns_head_submit_bio,
++ 	.open		= nvme_ns_head_open,
++ 	.release	= nvme_ns_head_release,
++ 	.ioctl		= nvme_ns_head_ioctl,
++ 	.getgeo		= nvme_getgeo,
++ 	.report_zones	= nvme_ns_head_report_zones,
++ 	.pr_ops		= &nvme_pr_ops,
++ };
++ 
++ static inline struct nvme_ns_head *cdev_to_ns_head(struct cdev *cdev)
++ {
++ 	return container_of(cdev, struct nvme_ns_head, cdev);
++ }
++ 
++ static int nvme_ns_head_chr_open(struct inode *inode, struct file *file)
++ {
++ 	if (!nvme_tryget_ns_head(cdev_to_ns_head(inode->i_cdev)))
++ 		return -ENXIO;
++ 	return 0;
++ }
++ 
++ static int nvme_ns_head_chr_release(struct inode *inode, struct file *file)
++ {
++ 	nvme_put_ns_head(cdev_to_ns_head(inode->i_cdev));
++ 	return 0;
++ }
++ 
++ static const struct file_operations nvme_ns_head_chr_fops = {
++ 	.owner		= THIS_MODULE,
++ 	.open		= nvme_ns_head_chr_open,
++ 	.release	= nvme_ns_head_chr_release,
++ 	.unlocked_ioctl	= nvme_ns_head_chr_ioctl,
++ 	.compat_ioctl	= compat_ptr_ioctl,
++ };
++ 
++ static int nvme_add_ns_head_cdev(struct nvme_ns_head *head)
++ {
++ 	int ret;
++ 
++ 	head->cdev_device.parent = &head->subsys->dev;
++ 	ret = dev_set_name(&head->cdev_device, "ng%dn%d",
++ 			   head->subsys->instance, head->instance);
++ 	if (ret)
++ 		return ret;
++ 	ret = nvme_cdev_add(&head->cdev, &head->cdev_device,
++ 			    &nvme_ns_head_chr_fops, THIS_MODULE);
++ 	if (ret)
++ 		kfree_const(head->cdev_device.kobj.name);
++ 	return ret;
++ }
++ 
+++>>>>>>> 8b4fb0f968ff (nvme: split nvme_report_zones)
+  static void nvme_requeue_work(struct work_struct *work)
+  {
+  	struct nvme_ns_head *head =
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 228052b88c83..7551ed987b6c 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -2475,6 +2475,17 @@ int nvme_sec_submit(void *data, u16 spsp, u8 secp, void *buffer, size_t len,
+ EXPORT_SYMBOL_GPL(nvme_sec_submit);
+ #endif /* CONFIG_BLK_SED_OPAL */
+ 
++#ifdef CONFIG_BLK_DEV_ZONED
++static int nvme_report_zones(struct gendisk *disk, sector_t sector,
++		unsigned int nr_zones, report_zones_cb cb, void *data)
++{
++	return nvme_ns_report_zones(disk->private_data, sector, nr_zones, cb,
++			data);
++}
++#else
++#define nvme_report_zones	NULL
++#endif /* CONFIG_BLK_DEV_ZONED */
++
+ static const struct block_device_operations nvme_bdev_ops = {
+ 	.owner		= THIS_MODULE,
+ 	.ioctl		= nvme_ioctl,
+* Unmerged path drivers/nvme/host/multipath.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 7d87bfacb56d..ec2b90895146 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -770,17 +770,14 @@ static inline void nvme_mpath_start_freeze(struct nvme_subsystem *subsys)
+ #endif /* CONFIG_NVME_MULTIPATH */
+ 
+ int nvme_revalidate_zones(struct nvme_ns *ns);
++int nvme_ns_report_zones(struct nvme_ns *ns, sector_t sector,
++		unsigned int nr_zones, report_zones_cb cb, void *data);
+ #ifdef CONFIG_BLK_DEV_ZONED
+ int nvme_update_zone_info(struct nvme_ns *ns, unsigned lbaf);
+-int nvme_report_zones(struct gendisk *disk, sector_t sector,
+-		      unsigned int nr_zones, report_zones_cb cb, void *data);
+-
+ blk_status_t nvme_setup_zone_mgmt_send(struct nvme_ns *ns, struct request *req,
+ 				       struct nvme_command *cmnd,
+ 				       enum nvme_zone_mgmt_action action);
+ #else
+-#define nvme_report_zones NULL
+-
+ static inline blk_status_t nvme_setup_zone_mgmt_send(struct nvme_ns *ns,
+ 		struct request *req, struct nvme_command *cmnd,
+ 		enum nvme_zone_mgmt_action action)
+diff --git a/drivers/nvme/host/zns.c b/drivers/nvme/host/zns.c
+index 0f193c6cffe2..2c38cce84f22 100644
+--- a/drivers/nvme/host/zns.c
++++ b/drivers/nvme/host/zns.c
+@@ -169,8 +169,8 @@ static int nvme_zone_parse_entry(struct nvme_ns *ns,
+ 	return cb(&zone, idx, data);
+ }
+ 
+-static int nvme_ns_report_zones(struct nvme_ns *ns, sector_t sector,
+-			unsigned int nr_zones, report_zones_cb cb, void *data)
++int nvme_ns_report_zones(struct nvme_ns *ns, sector_t sector,
++		unsigned int nr_zones, report_zones_cb cb, void *data)
+ {
+ 	struct nvme_zone_report *report;
+ 	struct nvme_command c = { };
+@@ -228,22 +228,6 @@ static int nvme_ns_report_zones(struct nvme_ns *ns, sector_t sector,
+ 	return ret;
+ }
+ 
+-int nvme_report_zones(struct gendisk *disk, sector_t sector,
+-		      unsigned int nr_zones, report_zones_cb cb, void *data)
+-{
+-	struct nvme_ns_head *head = NULL;
+-	struct nvme_ns *ns;
+-	int srcu_idx, ret;
+-
+-	ns = nvme_get_ns_from_disk(disk, &head, &srcu_idx);
+-	if (unlikely(!ns))
+-		return -EWOULDBLOCK;
+-	ret = nvme_ns_report_zones(ns, sector, nr_zones, cb, data);
+-	nvme_put_ns_from_disk(head, srcu_idx);
+-
+-	return ret;
+-}
+-
+ blk_status_t nvme_setup_zone_mgmt_send(struct nvme_ns *ns, struct request *req,
+ 		struct nvme_command *c, enum nvme_zone_mgmt_action action)
+ {
