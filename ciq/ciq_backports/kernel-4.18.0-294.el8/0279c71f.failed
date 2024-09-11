@@ -1,0 +1,188 @@
+xfs: remove redundant assignment to variable error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Colin Ian King <colin.king@canonical.com>
+commit 0279c71fe0d14c510001e9a7dd1ce2e0c77dd06c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0279c71f.failed
+
+Variable error is being initialized with a value that is never read
+and is being re-assigned a couple of statements later on. The
+assignment is redundant and hence can be removed.
+
+	Signed-off-by: Colin Ian King <colin.king@canonical.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 0279c71fe0d14c510001e9a7dd1ce2e0c77dd06c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_super.c
+diff --cc fs/xfs/xfs_super.c
+index 9024b0a4c895,2302f67d1a18..000000000000
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@@ -1475,114 -1311,62 +1475,118 @@@ xfs_finish_flags
+  		return -EINVAL;
+  	}
+  
+ -	if ((mp->m_dalign && !mp->m_swidth) ||
+ -	    (!mp->m_dalign && mp->m_swidth)) {
+ -		xfs_warn(mp, "sunit and swidth must be specified together");
+ -		return -EINVAL;
+ -	}
+ +	return 0;
+ +}
+  
+ -	if (mp->m_dalign && (mp->m_swidth % mp->m_dalign != 0)) {
+ -		xfs_warn(mp,
+ -	"stripe width (%d) must be a multiple of the stripe unit (%d)",
+ -			mp->m_swidth, mp->m_dalign);
+ -		return -EINVAL;
+ -	}
+ +static int
+ +xfs_init_percpu_counters(
+ +	struct xfs_mount	*mp)
+ +{
+ +	int		error;
+  
+ -	if (mp->m_logbufs != -1 &&
+ -	    mp->m_logbufs != 0 &&
+ -	    (mp->m_logbufs < XLOG_MIN_ICLOGS ||
+ -	     mp->m_logbufs > XLOG_MAX_ICLOGS)) {
+ -		xfs_warn(mp, "invalid logbufs value: %d [not %d-%d]",
+ -			mp->m_logbufs, XLOG_MIN_ICLOGS, XLOG_MAX_ICLOGS);
+ -		return -EINVAL;
+ -	}
+ +	error = percpu_counter_init(&mp->m_icount, 0, GFP_KERNEL);
+ +	if (error)
+ +		return -ENOMEM;
+  
+ -	if (mp->m_logbsize != -1 &&
+ -	    mp->m_logbsize !=  0 &&
+ -	    (mp->m_logbsize < XLOG_MIN_RECORD_BSIZE ||
+ -	     mp->m_logbsize > XLOG_MAX_RECORD_BSIZE ||
+ -	     !is_power_of_2(mp->m_logbsize))) {
+ -		xfs_warn(mp,
+ -			"invalid logbufsize: %d [not 16k,32k,64k,128k or 256k]",
+ -			mp->m_logbsize);
+ -		return -EINVAL;
+ -	}
+ +	error = percpu_counter_init(&mp->m_ifree, 0, GFP_KERNEL);
+ +	if (error)
+ +		goto free_icount;
+ +
+ +	error = percpu_counter_init(&mp->m_fdblocks, 0, GFP_KERNEL);
+ +	if (error)
+ +		goto free_ifree;
+ +
+ +	error = percpu_counter_init(&mp->m_delalloc_blks, 0, GFP_KERNEL);
+ +	if (error)
+ +		goto free_fdblocks;
+ +
+ +	return 0;
+ +
+ +free_fdblocks:
+ +	percpu_counter_destroy(&mp->m_fdblocks);
+ +free_ifree:
+ +	percpu_counter_destroy(&mp->m_ifree);
+ +free_icount:
+ +	percpu_counter_destroy(&mp->m_icount);
+ +	return -ENOMEM;
+ +}
+ +
+ +void
+ +xfs_reinit_percpu_counters(
+ +	struct xfs_mount	*mp)
+ +{
+ +	percpu_counter_set(&mp->m_icount, mp->m_sb.sb_icount);
+ +	percpu_counter_set(&mp->m_ifree, mp->m_sb.sb_ifree);
+ +	percpu_counter_set(&mp->m_fdblocks, mp->m_sb.sb_fdblocks);
+ +}
+ +
+ +static void
+ +xfs_destroy_percpu_counters(
+ +	struct xfs_mount	*mp)
+ +{
+ +	percpu_counter_destroy(&mp->m_icount);
+ +	percpu_counter_destroy(&mp->m_ifree);
+ +	percpu_counter_destroy(&mp->m_fdblocks);
+ +	ASSERT(XFS_FORCED_SHUTDOWN(mp) ||
+ +	       percpu_counter_sum(&mp->m_delalloc_blks) == 0);
+ +	percpu_counter_destroy(&mp->m_delalloc_blks);
+ +}
+  
+ -	if ((mp->m_flags & XFS_MOUNT_ALLOCSIZE) &&
+ -	    (mp->m_allocsize_log > XFS_MAX_IO_LOG ||
+ -	     mp->m_allocsize_log < XFS_MIN_IO_LOG)) {
+ -		xfs_warn(mp, "invalid log iosize: %d [not %d-%d]",
+ -			mp->m_allocsize_log, XFS_MIN_IO_LOG, XFS_MAX_IO_LOG);
+ -		return -EINVAL;
+ -	}
+ +static struct xfs_mount *
+ +xfs_mount_alloc(void)
+ +{
+ +	struct xfs_mount	*mp;
+  
+ -	return 0;
+ +	mp = kmem_alloc(sizeof(struct xfs_mount), KM_ZERO);
+ +	if (!mp)
+ +		return NULL;
+ +
+ +	spin_lock_init(&mp->m_sb_lock);
+ +	spin_lock_init(&mp->m_agirotor_lock);
+ +	INIT_RADIX_TREE(&mp->m_perag_tree, GFP_ATOMIC);
+ +	spin_lock_init(&mp->m_perag_lock);
+ +	mutex_init(&mp->m_growlock);
+ +	atomic_set(&mp->m_active_trans, 0);
+ +	INIT_DELAYED_WORK(&mp->m_reclaim_work, xfs_reclaim_worker);
+ +	INIT_DELAYED_WORK(&mp->m_eofblocks_work, xfs_eofblocks_worker);
+ +	INIT_DELAYED_WORK(&mp->m_cowblocks_work, xfs_cowblocks_worker);
+ +	mp->m_kobj.kobject.kset = xfs_kset;
+ +	/*
+ +	 * We don't create the finobt per-ag space reservation until after log
+ +	 * recovery, so we must set this to true so that an ifree transaction
+ +	 * started during log recovery will not depend on space reservations
+ +	 * for finobt expansion.
+ +	 */
+ +	mp->m_finobt_nores = true;
+ +	return mp;
+  }
+  
+ -static int
+ -xfs_fc_fill_super(
+ +
+ +STATIC int
+ +xfs_fs_fill_super(
+  	struct super_block	*sb,
+ -	struct fs_context	*fc)
+ +	void			*data,
+ +	int			silent)
+  {
+ -	struct xfs_mount	*mp = sb->s_fs_info;
+  	struct inode		*root;
+++<<<<<<< HEAD
+ +	struct xfs_mount	*mp = NULL;
+ +	int			flags = 0, error = -ENOMEM;
+++=======
++ 	int			flags = 0, error;
+++>>>>>>> 0279c71fe0d1 (xfs: remove redundant assignment to variable error)
+  
+ +	/*
+ +	 * allocate mp and do all low-level struct initializations before we
+ +	 * attach it to the super
+ +	 */
+ +	mp = xfs_mount_alloc();
+ +	if (!mp)
+ +		goto out;
+  	mp->m_super = sb;
+ +	sb->s_fs_info = mp;
+  
+ -	error = xfs_fc_validate_params(mp);
+ +	error = xfs_parseargs(mp, (char *)data);
+  	if (error)
+  		goto out_free_names;
+  
+* Unmerged path fs/xfs/xfs_super.c
