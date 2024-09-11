@@ -151,17 +151,13 @@ int ahci_platform_enable_regulators(struct ahci_host_priv *hpriv)
 {
 	int rc, i;
 
-	if (hpriv->ahci_regulator) {
-		rc = regulator_enable(hpriv->ahci_regulator);
-		if (rc)
-			return rc;
-	}
+	rc = regulator_enable(hpriv->ahci_regulator);
+	if (rc)
+		return rc;
 
-	if (hpriv->phy_regulator) {
-		rc = regulator_enable(hpriv->phy_regulator);
-		if (rc)
-			goto disable_ahci_pwrs;
-	}
+	rc = regulator_enable(hpriv->phy_regulator);
+	if (rc)
+		goto disable_ahci_pwrs;
 
 	for (i = 0; i < hpriv->nports; i++) {
 		if (!hpriv->target_pwrs[i])
@@ -179,11 +175,9 @@ disable_target_pwrs:
 		if (hpriv->target_pwrs[i])
 			regulator_disable(hpriv->target_pwrs[i]);
 
-	if (hpriv->phy_regulator)
-		regulator_disable(hpriv->phy_regulator);
+	regulator_disable(hpriv->phy_regulator);
 disable_ahci_pwrs:
-	if (hpriv->ahci_regulator)
-		regulator_disable(hpriv->ahci_regulator);
+	regulator_disable(hpriv->ahci_regulator);
 	return rc;
 }
 EXPORT_SYMBOL_GPL(ahci_platform_enable_regulators);
@@ -205,10 +199,8 @@ void ahci_platform_disable_regulators(struct ahci_host_priv *hpriv)
 		regulator_disable(hpriv->target_pwrs[i]);
 	}
 
-	if (hpriv->ahci_regulator)
-		regulator_disable(hpriv->ahci_regulator);
-	if (hpriv->phy_regulator)
-		regulator_disable(hpriv->phy_regulator);
+	regulator_disable(hpriv->ahci_regulator);
+	regulator_disable(hpriv->phy_regulator);
 }
 EXPORT_SYMBOL_GPL(ahci_platform_disable_regulators);
 /**
@@ -357,7 +349,7 @@ static int ahci_platform_get_regulator(struct ahci_host_priv *hpriv, u32 port,
 	struct regulator *target_pwr;
 	int rc = 0;
 
-	target_pwr = regulator_get_optional(dev, "target");
+	target_pwr = regulator_get(dev, "target");
 
 	if (!IS_ERR(target_pwr))
 		hpriv->target_pwrs[port] = target_pwr;
@@ -434,16 +426,14 @@ struct ahci_host_priv *ahci_platform_get_resources(struct platform_device *pdev,
 		hpriv->clks[i] = clk;
 	}
 
-	hpriv->ahci_regulator = devm_regulator_get_optional(dev, "ahci");
+	hpriv->ahci_regulator = devm_regulator_get(dev, "ahci");
 	if (IS_ERR(hpriv->ahci_regulator)) {
 		rc = PTR_ERR(hpriv->ahci_regulator);
-		if (rc == -EPROBE_DEFER)
+		if (rc != 0)
 			goto err_out;
-		rc = 0;
-		hpriv->ahci_regulator = NULL;
 	}
 
-	hpriv->phy_regulator = devm_regulator_get_optional(dev, "phy");
+	hpriv->phy_regulator = devm_regulator_get(dev, "phy");
 	if (IS_ERR(hpriv->phy_regulator)) {
 		rc = PTR_ERR(hpriv->phy_regulator);
 		if (rc == -EPROBE_DEFER)
