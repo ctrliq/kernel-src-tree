@@ -1,0 +1,291 @@
+RDMA/mlx5: Reduce locking in implicit_mr_get_data()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 3389baa831b6a09e3c96e2a6283a1b952be2f0cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3389baa8.failed
+
+Now that the child MRs are stored in an xarray we can rely on the SRCU
+lock to protect the xa_load and use xa_cmpxchg on the slow allocation path
+to resolve races with concurrent page fault.
+
+This reduces the scope of the critical section of umem_mutex for implicit
+MRs to only cover mlx5_ib_update_xlt, and avoids taking a lock at all if
+the child MR is already in the xarray. This makes it consistent with the
+normal ODP MR critical section for umem_lock, and the locking approach
+used for destroying an unusued implicit child MR.
+
+The MLX5_IB_UPD_XLT_ATOMIC is no longer needed in implicit_get_child_mr()
+since it is no longer called with any locks.
+
+Link: https://lore.kernel.org/r/20191009160934.3143-11-jgg@ziepe.ca
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 3389baa831b6a09e3c96e2a6283a1b952be2f0cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index df3038ca913b,00e14b6acd98..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -421,134 -342,142 +421,201 @@@ static void mlx5_ib_page_fault_resume(s
+  			    wq_num, err);
+  }
+  
+ -static struct mlx5_ib_mr *implicit_get_child_mr(struct mlx5_ib_mr *imr,
+ -						unsigned long idx)
+ +static struct mlx5_ib_mr *implicit_mr_alloc(struct ib_pd *pd,
+ +					    struct ib_umem *umem,
+ +					    bool ksm, int access_flags)
+  {
+ -	struct ib_umem_odp *odp;
+ +	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+  	struct mlx5_ib_mr *mr;
+ -	struct mlx5_ib_mr *ret;
+  	int err;
+  
+ -	odp = ib_umem_odp_alloc_child(to_ib_umem_odp(imr->umem),
+ -				      idx * MLX5_IMR_MTT_SIZE,
+ -				      MLX5_IMR_MTT_SIZE);
+ -	if (IS_ERR(odp))
+ -		return ERR_CAST(odp);
+ +	mr = mlx5_mr_cache_alloc(dev, ksm ? MLX5_IMR_KSM_CACHE_ENTRY :
+ +					    MLX5_IMR_MTT_CACHE_ENTRY);
+  
+ -	ret = mr = mlx5_mr_cache_alloc(imr->dev, MLX5_IMR_MTT_CACHE_ENTRY);
+  	if (IS_ERR(mr))
+ -		goto out_umem;
+ +		return mr;
+  
+ -	err = xa_reserve(&imr->dev->odp_mkeys, mlx5_base_mkey(mr->mmkey.key),
+ -			 GFP_KERNEL);
+ -	if (err) {
+ -		ret = ERR_PTR(err);
+ -		goto out_mr;
+ +	mr->ibmr.pd = pd;
+ +
+ +	mr->dev = dev;
+ +	mr->access_flags = access_flags;
+ +	mr->mmkey.iova = 0;
+ +	mr->umem = umem;
+ +
+ +	if (ksm) {
+ +		err = mlx5_ib_update_xlt(mr, 0,
+ +					 mlx5_imr_ksm_entries,
+ +					 MLX5_KSM_PAGE_SHIFT,
+ +					 MLX5_IB_UPD_XLT_INDIRECT |
+ +					 MLX5_IB_UPD_XLT_ZAP |
+ +					 MLX5_IB_UPD_XLT_ENABLE);
+ +
+ +	} else {
+ +		err = mlx5_ib_update_xlt(mr, 0,
+ +					 MLX5_IMR_MTT_ENTRIES,
+ +					 PAGE_SHIFT,
+ +					 MLX5_IB_UPD_XLT_ZAP |
+ +					 MLX5_IB_UPD_XLT_ENABLE |
+ +					 MLX5_IB_UPD_XLT_ATOMIC);
+  	}
+  
+ -	mr->ibmr.pd = imr->ibmr.pd;
+ -	mr->access_flags = imr->access_flags;
+ -	mr->umem = &odp->umem;
+ +	if (err)
+ +		goto fail;
+ +
+  	mr->ibmr.lkey = mr->mmkey.key;
+  	mr->ibmr.rkey = mr->mmkey.key;
+ -	mr->mmkey.iova = idx * MLX5_IMR_MTT_SIZE;
+ -	mr->parent = imr;
+ -	odp->private = mr;
+ -	INIT_WORK(&odp->work, mr_leaf_free_action);
+  
+++<<<<<<< HEAD
+ +	mr->live = 1;
+ +
+ +	mlx5_ib_dbg(dev, "key %x dev %p mr %p\n",
+ +		    mr->mmkey.key, dev->mdev, mr);
+++=======
++ 	err = mlx5_ib_update_xlt(mr, 0,
++ 				 MLX5_IMR_MTT_ENTRIES,
++ 				 PAGE_SHIFT,
++ 				 MLX5_IB_UPD_XLT_ZAP |
++ 				 MLX5_IB_UPD_XLT_ENABLE);
++ 	if (err) {
++ 		ret = ERR_PTR(err);
++ 		goto out_release;
++ 	}
++ 
++ 	/*
++ 	 * Once the store to either xarray completes any error unwind has to
++ 	 * use synchronize_srcu(). Avoid this with xa_reserve()
++ 	 */
++ 	ret = xa_cmpxchg(&imr->implicit_children, idx, NULL, mr, GFP_KERNEL);
++ 	if (unlikely(ret)) {
++ 		if (xa_is_err(ret)) {
++ 			ret = ERR_PTR(xa_err(ret));
++ 			goto out_release;
++ 		}
++ 		/*
++ 		 * Another thread beat us to creating the child mr, use
++ 		 * theirs.
++ 		 */
++ 		goto out_release;
++ 	}
+++>>>>>>> 3389baa831b6 (RDMA/mlx5: Reduce locking in implicit_mr_get_data())
+  
+ -	xa_store(&imr->dev->odp_mkeys, mlx5_base_mkey(mr->mmkey.key),
+ -		 &mr->mmkey, GFP_ATOMIC);
+ -
+ -	mlx5_ib_dbg(imr->dev, "key %x mr %p\n", mr->mmkey.key, mr);
+  	return mr;
+  
+ -out_release:
+ -	xa_release(&imr->dev->odp_mkeys, mlx5_base_mkey(mr->mmkey.key));
+ -out_mr:
+ -	mlx5_mr_cache_free(imr->dev, mr);
+ -out_umem:
+ -	ib_umem_odp_release(odp);
+ -	return ret;
+ +fail:
+ +	mlx5_ib_err(dev, "Failed to register MKEY %d\n", err);
+ +	mlx5_mr_cache_free(dev, mr);
+ +
+ +	return ERR_PTR(err);
+  }
+  
+ -static struct mlx5_ib_mr *implicit_mr_get_data(struct mlx5_ib_mr *imr,
+ +static struct ib_umem_odp *implicit_mr_get_data(struct mlx5_ib_mr *mr,
+  						u64 io_virt, size_t bcnt)
+  {
+ -	struct ib_umem_odp *odp_imr = to_ib_umem_odp(imr->umem);
+ -	unsigned long end_idx = (io_virt + bcnt - 1) >> MLX5_IMR_MTT_SHIFT;
+ -	unsigned long idx = io_virt >> MLX5_IMR_MTT_SHIFT;
+ -	unsigned long inv_start_idx = end_idx + 1;
+ -	unsigned long inv_len = 0;
+ -	struct mlx5_ib_mr *result = NULL;
+ -	int ret;
+ +	struct mlx5_ib_dev *dev = to_mdev(mr->ibmr.pd->device);
+ +	struct ib_umem_odp *odp, *result = NULL;
+ +	struct ib_umem_odp *odp_mr = to_ib_umem_odp(mr->umem);
+ +	u64 addr = io_virt & MLX5_IMR_MTT_MASK;
+ +	int nentries = 0, start_idx = 0, ret;
+ +	struct mlx5_ib_mr *mtt;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&odp_mr->umem_mutex);
+ +	odp = odp_lookup(addr, 1, mr);
+++=======
++ 	lockdep_assert_held(&imr->dev->odp_srcu);
++ 
++ 	for (idx = idx; idx <= end_idx; idx++) {
++ 		struct mlx5_ib_mr *mtt = xa_load(&imr->implicit_children, idx);
+++>>>>>>> 3389baa831b6 (RDMA/mlx5: Reduce locking in implicit_mr_get_data())
+  
+ -		if (unlikely(!mtt)) {
+ -			mtt = implicit_get_child_mr(imr, idx);
+ -			if (IS_ERR(mtt)) {
+ -				result = mtt;
+ -				goto out;
+ -			}
+ -			inv_start_idx = min(inv_start_idx, idx);
+ -			inv_len = idx - inv_start_idx + 1;
+ +	mlx5_ib_dbg(dev, "io_virt:%llx bcnt:%zx addr:%llx odp:%p\n",
+ +		    io_virt, bcnt, addr, odp);
+ +
+ +next_mr:
+ +	if (likely(odp)) {
+ +		if (nentries)
+ +			nentries++;
+ +	} else {
+ +		odp = ib_alloc_odp_umem(odp_mr, addr,
+ +					MLX5_IMR_MTT_SIZE);
+ +		if (IS_ERR(odp)) {
+ +			mutex_unlock(&odp_mr->umem_mutex);
+ +			return ERR_CAST(odp);
+  		}
+  
+ -		/* Return first odp if region not covered by single one */
+ -		if (likely(!result))
+ -			result = mtt;
+ +		mtt = implicit_mr_alloc(mr->ibmr.pd, &odp->umem, 0,
+ +					mr->access_flags);
+ +		if (IS_ERR(mtt)) {
+ +			mutex_unlock(&odp_mr->umem_mutex);
+ +			ib_umem_release(&odp->umem);
+ +			return ERR_CAST(mtt);
+ +		}
+ +
+ +		odp->private = mtt;
+ +		mtt->umem = &odp->umem;
+ +		mtt->mmkey.iova = addr;
+ +		mtt->parent = mr;
+ +		INIT_WORK(&odp->work, mr_leaf_free_action);
+ +
+ +		if (!nentries)
+ +			start_idx = addr >> MLX5_IMR_MTT_SHIFT;
+ +		nentries++;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Return first odp if region not covered by single one */
+ +	if (likely(!result))
+ +		result = odp;
+ +
+ +	addr += MLX5_IMR_MTT_SIZE;
+ +	if (unlikely(addr < io_virt + bcnt)) {
+ +		odp = odp_next(odp);
+ +		if (odp && ib_umem_start(odp) != addr)
+ +			odp = NULL;
+ +		goto next_mr;
+ +	}
+ +
+ +	if (unlikely(nentries)) {
+ +		ret = mlx5_ib_update_xlt(mr, start_idx, nentries, 0,
+ +					 MLX5_IB_UPD_XLT_INDIRECT |
+ +					 MLX5_IB_UPD_XLT_ATOMIC);
+ +		if (ret) {
+ +			mlx5_ib_err(dev, "Failed to update PAS\n");
+ +			result = ERR_PTR(ret);
+ +		}
+ +	}
+ +
+ +	mutex_unlock(&odp_mr->umem_mutex);
+++=======
++ 	/*
++ 	 * Any time the implicit_children are changed we must perform an
++ 	 * update of the xlt before exiting to ensure the HW and the
++ 	 * implicit_children remains synchronized.
++ 	 */
++ out:
++ 	if (likely(!inv_len))
++ 		return result;
++ 
++ 	/*
++ 	 * Notice this is not strictly ordered right, the KSM is updated after
++ 	 * the implicit_leaves is updated, so a parallel page fault could see
++ 	 * a MR that is not yet visible in the KSM.  This is similar to a
++ 	 * parallel page fault seeing a MR that is being concurrently removed
++ 	 * from the KSM. Both of these improbable situations are resolved
++ 	 * safely by resuming the HW and then taking another page fault. The
++ 	 * next pagefault handler will see the new information.
++ 	 */
++ 	mutex_lock(&odp_imr->umem_mutex);
++ 	ret = mlx5_ib_update_xlt(imr, inv_start_idx, inv_len, 0,
++ 				 MLX5_IB_UPD_XLT_INDIRECT |
++ 					 MLX5_IB_UPD_XLT_ATOMIC);
++ 	mutex_unlock(&odp_imr->umem_mutex);
++ 	if (ret) {
++ 		mlx5_ib_err(to_mdev(imr->ibmr.pd->device),
++ 			    "Failed to update PAS\n");
++ 		return ERR_PTR(ret);
++ 	}
+++>>>>>>> 3389baa831b6 (RDMA/mlx5: Reduce locking in implicit_mr_get_data())
+  	return result;
+  }
+  
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
