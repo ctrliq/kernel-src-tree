@@ -1301,7 +1301,6 @@ static int context_is_writeable_or_written(struct inode *inode,
 
 /**
  * ceph_find_incompatible - find an incompatible context and return it
- * @inode: inode associated with page
  * @page: page being dirtied
  *
  * We are only allowed to write into/dirty a page if the page is
@@ -1312,8 +1311,9 @@ static int context_is_writeable_or_written(struct inode *inode,
  * Must be called with page lock held.
  */
 static struct ceph_snap_context *
-ceph_find_incompatible(struct inode *inode, struct page *page)
+ceph_find_incompatible(struct page *page)
 {
+	struct inode *inode = page->mapping->host;
 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
 	struct ceph_inode_info *ci = ceph_inode(inode);
 
@@ -1377,7 +1377,7 @@ static int ceph_update_writeable_page(struct file *file,
 	int r;
 
 retry_locked:
-	snapc = ceph_find_incompatible(inode, page);
+	snapc = ceph_find_incompatible(page);
 	if (snapc) {
 		if (IS_ERR(snapc)) {
 			r = PTR_ERR(snapc);
@@ -1690,6 +1690,8 @@ static vm_fault_t ceph_page_mkwrite(struct vm_fault *vmf)
 	inode_inc_iversion_raw(inode);
 
 	do {
+		struct ceph_snap_context *snapc;
+
 		lock_page(page);
 
 		if ((off > size) || (page->mapping != inode->i_mapping)) {
@@ -1698,13 +1700,26 @@ static vm_fault_t ceph_page_mkwrite(struct vm_fault *vmf)
 			break;
 		}
 
-		err = ceph_update_writeable_page(vma->vm_file, off, len, page);
-		if (err >= 0) {
+		snapc = ceph_find_incompatible(page);
+		if (!snapc) {
 			/* success.  we'll keep the page locked. */
 			set_page_dirty(page);
 			ret = VM_FAULT_LOCKED;
+			break;
 		}
-	} while (err == -EAGAIN);
+
+		unlock_page(page);
+
+		if (IS_ERR(snapc)) {
+			ret = VM_FAULT_SIGBUS;
+			break;
+		}
+
+		ceph_queue_writeback(inode);
+		err = wait_event_killable(ci->i_cap_wq,
+				context_is_writeable_or_written(inode, snapc));
+		ceph_put_snap_context(snapc);
+	} while (err == 0);
 
 	if (ret == VM_FAULT_LOCKED ||
 	    ci->i_inline_version != CEPH_INLINE_NONE) {
