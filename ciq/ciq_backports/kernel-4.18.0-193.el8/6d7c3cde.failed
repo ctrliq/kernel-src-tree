@@ -1,0 +1,315 @@
+mm/hmm: fix use after free with struct hmm in the mmu notifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] hmm: fix use after free with struct hmm in the mmu notifiers (Jerome Glisse) [1498655 1597758]
+Rebuild_FUZZ: 97.56%
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 6d7c3cde93c1d9ac0b37f78ec3f2ff052159a242
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6d7c3cde.failed
+
+mmu_notifier_unregister_no_release() is not a fence and the mmu_notifier
+system will continue to reference hmm->mn until the srcu grace period
+expires.
+
+Resulting in use after free races like this:
+
+         CPU0                                     CPU1
+                                               __mmu_notifier_invalidate_range_start()
+                                                 srcu_read_lock
+                                                 hlist_for_each ()
+                                                   // mn == hmm->mn
+hmm_mirror_unregister()
+  hmm_put()
+    hmm_free()
+      mmu_notifier_unregister_no_release()
+         hlist_del_init_rcu(hmm-mn->list)
+			                           mn->ops->invalidate_range_start(mn, range);
+					             mm_get_hmm()
+      mm->hmm = NULL;
+      kfree(hmm)
+                                                     mutex_lock(&hmm->lock);
+
+Use SRCU to kfree the hmm memory so that the notifiers can rely on hmm
+existing. Get the now-safe hmm struct through container_of and directly
+check kref_get_unless_zero to lock it against free.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Philip Yang <Philip.Yang@amd.com>
+(cherry picked from commit 6d7c3cde93c1d9ac0b37f78ec3f2ff052159a242)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hmm.h
+#	mm/hmm.c
+diff --cc include/linux/hmm.h
+index 2f68a486cc0d,cb01cf1fa3c0..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -76,8 -68,35 +76,38 @@@
+  #include <linux/migrate.h>
+  #include <linux/memremap.h>
+  #include <linux/completion.h>
+ -#include <linux/mmu_notifier.h>
+  
+++<<<<<<< HEAD
+ +struct hmm;
+++=======
++ 
++ /*
++  * struct hmm - HMM per mm struct
++  *
++  * @mm: mm struct this HMM struct is bound to
++  * @lock: lock protecting ranges list
++  * @ranges: list of range being snapshotted
++  * @mirrors: list of mirrors for this mm
++  * @mmu_notifier: mmu notifier to track updates to CPU page table
++  * @mirrors_sem: read/write semaphore protecting the mirrors list
++  * @wq: wait queue for user waiting on a range invalidation
++  * @notifiers: count of active mmu notifiers
++  * @dead: is the mm dead ?
++  */
++ struct hmm {
++ 	struct mm_struct	*mm;
++ 	struct kref		kref;
++ 	struct mutex		lock;
++ 	struct list_head	ranges;
++ 	struct list_head	mirrors;
++ 	struct mmu_notifier	mmu_notifier;
++ 	struct rw_semaphore	mirrors_sem;
++ 	wait_queue_head_t	wq;
++ 	struct rcu_head		rcu;
++ 	long			notifiers;
++ 	bool			dead;
++ };
+++>>>>>>> 6d7c3cde93c1 (mm/hmm: fix use after free with struct hmm in the mmu notifiers)
+  
+  /*
+   * hmm_pfn_flag_e - HMM flag enums
+diff --cc mm/hmm.c
+index bc98da945c75,f6956d78e3cb..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -121,45 -104,68 +121,93 @@@ error
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hmm_free_rcu(struct rcu_head *rcu)
++ {
++ 	kfree(container_of(rcu, struct hmm, rcu));
++ }
++ 
++ static void hmm_free(struct kref *kref)
++ {
++ 	struct hmm *hmm = container_of(kref, struct hmm, kref);
++ 	struct mm_struct *mm = hmm->mm;
++ 
++ 	mmu_notifier_unregister_no_release(&hmm->mmu_notifier, mm);
++ 
++ 	spin_lock(&mm->page_table_lock);
++ 	if (mm->hmm == hmm)
++ 		mm->hmm = NULL;
++ 	spin_unlock(&mm->page_table_lock);
++ 
++ 	mmu_notifier_call_srcu(&hmm->rcu, hmm_free_rcu);
++ }
++ 
++ static inline void hmm_put(struct hmm *hmm)
++ {
++ 	kref_put(&hmm->kref, hmm_free);
++ }
++ 
+++>>>>>>> 6d7c3cde93c1 (mm/hmm: fix use after free with struct hmm in the mmu notifiers)
+  void hmm_mm_destroy(struct mm_struct *mm)
+  {
+ -	struct hmm *hmm;
+ +	kfree(mm->hmm);
+ +}
+  
+ -	spin_lock(&mm->page_table_lock);
+ -	hmm = mm_get_hmm(mm);
+ -	mm->hmm = NULL;
+ -	if (hmm) {
+ -		hmm->mm = NULL;
+ -		hmm->dead = true;
+ -		spin_unlock(&mm->page_table_lock);
+ -		hmm_put(hmm);
+ -		return;
+ +static int hmm_invalidate_range(struct hmm *hmm,
+ +				const struct hmm_update *update)
+ +{
+ +	struct hmm_mirror *mirror;
+ +	struct hmm_range *range;
+ +
+ +	spin_lock(&hmm->lock);
+ +	list_for_each_entry(range, &hmm->ranges, list) {
+ +		if (update->end < range->start || update->start >= range->end)
+ +			continue;
+ +
+ +		range->valid = false;
+  	}
+ +	spin_unlock(&hmm->lock);
+  
+ -	spin_unlock(&mm->page_table_lock);
+ +	down_read(&hmm->mirrors_sem);
+ +	list_for_each_entry(mirror, &hmm->mirrors, list) {
+ +		int ret;
+ +
+ +		ret = mirror->ops->sync_cpu_device_pagetables(mirror, update);
+ +		if (!update->blockable && ret == -EAGAIN) {
+ +			up_read(&hmm->mirrors_sem);
+ +			return -EAGAIN;
+ +		}
+ +	}
+ +	up_read(&hmm->mirrors_sem);
+ +
+ +	return 0;
+  }
+  
+  static void hmm_release(struct mmu_notifier *mn, struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	struct hmm_mirror *mirror;
+ +	struct hmm *hmm = mm->hmm;
+++=======
++ 	struct hmm *hmm = container_of(mn, struct hmm, mmu_notifier);
++ 	struct hmm_mirror *mirror;
++ 	struct hmm_range *range;
++ 
++ 	/* Bail out if hmm is in the process of being freed */
++ 	if (!kref_get_unless_zero(&hmm->kref))
++ 		return;
++ 
++ 	/* Report this HMM as dying. */
++ 	hmm->dead = true;
++ 
++ 	/* Wake-up everyone waiting on any range. */
++ 	mutex_lock(&hmm->lock);
++ 	list_for_each_entry(range, &hmm->ranges, list)
++ 		range->valid = false;
++ 	wake_up_all(&hmm->wq);
++ 	mutex_unlock(&hmm->lock);
+++>>>>>>> 6d7c3cde93c1 (mm/hmm: fix use after free with struct hmm in the mmu notifiers)
+  
+  	down_write(&hmm->mirrors_sem);
+  	mirror = list_first_entry_or_null(&hmm->mirrors, struct hmm_mirror,
+@@@ -180,35 -187,85 +228,49 @@@
+  						  struct hmm_mirror, list);
+  	}
+  	up_write(&hmm->mirrors_sem);
+ -
+ -	hmm_put(hmm);
+  }
+  
+ -static int hmm_invalidate_range_start(struct mmu_notifier *mn,
+ -			const struct mmu_notifier_range *nrange)
+ +static void hmm_invalidate_range_start(struct mmu_notifier *mn,
+ +				       struct mm_struct *mm,
+ +				       unsigned long start,
+ +				       unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	struct hmm *hmm = mm->hmm;
+++=======
++ 	struct hmm *hmm = container_of(mn, struct hmm, mmu_notifier);
++ 	struct hmm_mirror *mirror;
++ 	struct hmm_update update;
++ 	struct hmm_range *range;
++ 	int ret = 0;
+++>>>>>>> 6d7c3cde93c1 (mm/hmm: fix use after free with struct hmm in the mmu notifiers)
+  
+- 	VM_BUG_ON(!hmm);
++ 	if (!kref_get_unless_zero(&hmm->kref))
++ 		return 0;
+  
+ -	update.start = nrange->start;
+ -	update.end = nrange->end;
+ -	update.event = HMM_UPDATE_INVALIDATE;
+ -	update.blockable = mmu_notifier_range_blockable(nrange);
+ -
+ -	if (mmu_notifier_range_blockable(nrange))
+ -		mutex_lock(&hmm->lock);
+ -	else if (!mutex_trylock(&hmm->lock)) {
+ -		ret = -EAGAIN;
+ -		goto out;
+ -	}
+ -	hmm->notifiers++;
+ -	list_for_each_entry(range, &hmm->ranges, list) {
+ -		if (update.end < range->start || update.start >= range->end)
+ -			continue;
+ -
+ -		range->valid = false;
+ -	}
+ -	mutex_unlock(&hmm->lock);
+ -
+ -	if (mmu_notifier_range_blockable(nrange))
+ -		down_read(&hmm->mirrors_sem);
+ -	else if (!down_read_trylock(&hmm->mirrors_sem)) {
+ -		ret = -EAGAIN;
+ -		goto out;
+ -	}
+ -	list_for_each_entry(mirror, &hmm->mirrors, list) {
+ -		int ret;
+ -
+ -		ret = mirror->ops->sync_cpu_device_pagetables(mirror, &update);
+ -		if (!update.blockable && ret == -EAGAIN)
+ -			break;
+ -	}
+ -	up_read(&hmm->mirrors_sem);
+ -
+ -out:
+ -	hmm_put(hmm);
+ -	return ret;
+ +	atomic_inc(&hmm->sequence);
+  }
+  
+  static void hmm_invalidate_range_end(struct mmu_notifier *mn,
+ -			const struct mmu_notifier_range *nrange)
+ +				     struct mm_struct *mm,
+ +				     unsigned long start,
+ +				     unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	struct hmm_update update;
+ +	struct hmm *hmm = mm->hmm;
+++=======
++ 	struct hmm *hmm = container_of(mn, struct hmm, mmu_notifier);
+++>>>>>>> 6d7c3cde93c1 (mm/hmm: fix use after free with struct hmm in the mmu notifiers)
+  
+- 	VM_BUG_ON(!hmm);
++ 	if (!kref_get_unless_zero(&hmm->kref))
++ 		return;
+  
+ -	mutex_lock(&hmm->lock);
+ -	hmm->notifiers--;
+ -	if (!hmm->notifiers) {
+ -		struct hmm_range *range;
+ -
+ -		list_for_each_entry(range, &hmm->ranges, list) {
+ -			if (range->valid)
+ -				continue;
+ -			range->valid = true;
+ -		}
+ -		wake_up_all(&hmm->wq);
+ -	}
+ -	mutex_unlock(&hmm->lock);
+ -
+ -	hmm_put(hmm);
+ +	update.start = start;
+ +	update.end = end;
+ +	update.event = HMM_UPDATE_INVALIDATE;
+ +	update.blockable = true;
+ +	hmm_invalidate_range(hmm, &update);
+  }
+  
+  static const struct mmu_notifier_ops hmm_mmu_notifier_ops = {
+* Unmerged path include/linux/hmm.h
+* Unmerged path mm/hmm.c
