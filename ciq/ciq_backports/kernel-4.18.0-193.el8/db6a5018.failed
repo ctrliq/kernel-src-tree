@@ -1,0 +1,137 @@
+bpf, sockmap: Don't sleep while holding RCU lock on tear-down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit db6a5018b6e008c1d69c6628cdaa9541b8e70940
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/db6a5018.failed
+
+rcu_read_lock is needed to protect access to psock inside sock_map_unref
+when tearing down the map. However, we can't afford to sleep in lock_sock
+while in RCU read-side critical section. Grab the RCU lock only after we
+have locked the socket.
+
+This fixes RCU warnings triggerable on a VM with 1 vCPU when free'ing a
+sockmap/sockhash that contains at least one socket:
+
+| =============================
+| WARNING: suspicious RCU usage
+| 5.5.0-04005-g8fc91b972b73 #450 Not tainted
+| -----------------------------
+| include/linux/rcupdate.h:272 Illegal context switch in RCU read-side critical section!
+|
+| other info that might help us debug this:
+|
+|
+| rcu_scheduler_active = 2, debug_locks = 1
+| 4 locks held by kworker/0:1/62:
+|  #0: ffff88813b019748 ((wq_completion)events){+.+.}, at: process_one_work+0x1d7/0x5e0
+|  #1: ffffc900000abe50 ((work_completion)(&map->work)){+.+.}, at: process_one_work+0x1d7/0x5e0
+|  #2: ffffffff82065d20 (rcu_read_lock){....}, at: sock_map_free+0x5/0x170
+|  #3: ffff8881368c5df8 (&stab->lock){+...}, at: sock_map_free+0x64/0x170
+|
+| stack backtrace:
+| CPU: 0 PID: 62 Comm: kworker/0:1 Not tainted 5.5.0-04005-g8fc91b972b73 #450
+| Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20190727_073836-buildvm-ppc64le-16.ppc.fedoraproject.org-3.fc31 04/01/2014
+| Workqueue: events bpf_map_free_deferred
+| Call Trace:
+|  dump_stack+0x71/0xa0
+|  ___might_sleep+0x105/0x190
+|  lock_sock_nested+0x28/0x90
+|  sock_map_free+0x95/0x170
+|  bpf_map_free_deferred+0x58/0x80
+|  process_one_work+0x260/0x5e0
+|  worker_thread+0x4d/0x3e0
+|  kthread+0x108/0x140
+|  ? process_one_work+0x5e0/0x5e0
+|  ? kthread_park+0x90/0x90
+|  ret_from_fork+0x3a/0x50
+
+| =============================
+| WARNING: suspicious RCU usage
+| 5.5.0-04005-g8fc91b972b73-dirty #452 Not tainted
+| -----------------------------
+| include/linux/rcupdate.h:272 Illegal context switch in RCU read-side critical section!
+|
+| other info that might help us debug this:
+|
+|
+| rcu_scheduler_active = 2, debug_locks = 1
+| 4 locks held by kworker/0:1/62:
+|  #0: ffff88813b019748 ((wq_completion)events){+.+.}, at: process_one_work+0x1d7/0x5e0
+|  #1: ffffc900000abe50 ((work_completion)(&map->work)){+.+.}, at: process_one_work+0x1d7/0x5e0
+|  #2: ffffffff82065d20 (rcu_read_lock){....}, at: sock_hash_free+0x5/0x1d0
+|  #3: ffff888139966e00 (&htab->buckets[i].lock){+...}, at: sock_hash_free+0x92/0x1d0
+|
+| stack backtrace:
+| CPU: 0 PID: 62 Comm: kworker/0:1 Not tainted 5.5.0-04005-g8fc91b972b73-dirty #452
+| Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20190727_073836-buildvm-ppc64le-16.ppc.fedoraproject.org-3.fc31 04/01/2014
+| Workqueue: events bpf_map_free_deferred
+| Call Trace:
+|  dump_stack+0x71/0xa0
+|  ___might_sleep+0x105/0x190
+|  lock_sock_nested+0x28/0x90
+|  sock_hash_free+0xec/0x1d0
+|  bpf_map_free_deferred+0x58/0x80
+|  process_one_work+0x260/0x5e0
+|  worker_thread+0x4d/0x3e0
+|  kthread+0x108/0x140
+|  ? process_one_work+0x5e0/0x5e0
+|  ? kthread_park+0x90/0x90
+|  ret_from_fork+0x3a/0x50
+
+Fixes: 7e81a3530206 ("bpf: Sockmap, ensure sock lock held during tear down")
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200206111652.694507-2-jakub@cloudflare.com
+(cherry picked from commit db6a5018b6e008c1d69c6628cdaa9541b8e70940)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sock_map.c
+diff --cc net/core/sock_map.c
+index 5880835bf4bf,992504478e68..000000000000
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@@ -250,11 -240,15 +249,20 @@@ static void sock_map_free(struct bpf_ma
+  		struct sock *sk;
+  
+  		sk = xchg(psk, NULL);
+++<<<<<<< HEAD
+ +		if (sk)
+ +			sock_map_unref(sk, psk);
+++=======
++ 		if (sk) {
++ 			lock_sock(sk);
++ 			rcu_read_lock();
++ 			sock_map_unref(sk, psk);
++ 			rcu_read_unlock();
++ 			release_sock(sk);
++ 		}
+++>>>>>>> db6a5018b6e0 (bpf, sockmap: Don't sleep while holding RCU lock on tear-down)
+  	}
+  	raw_spin_unlock_bh(&stab->lock);
+- 	rcu_read_unlock();
+  
+  	synchronize_rcu();
+  
+@@@ -871,7 -868,11 +878,15 @@@ static void sock_hash_free(struct bpf_m
+  		raw_spin_lock_bh(&bucket->lock);
+  		hlist_for_each_entry_safe(elem, node, &bucket->head, node) {
+  			hlist_del_rcu(&elem->node);
+++<<<<<<< HEAD
+++			sock_map_unref(elem->sk, elem);
+++=======
++ 			lock_sock(elem->sk);
++ 			rcu_read_lock();
+  			sock_map_unref(elem->sk, elem);
++ 			rcu_read_unlock();
++ 			release_sock(elem->sk);
+++>>>>>>> db6a5018b6e0 (bpf, sockmap: Don't sleep while holding RCU lock on tear-down)
+  		}
+  		raw_spin_unlock_bh(&bucket->lock);
+  	}
+* Unmerged path net/core/sock_map.c
