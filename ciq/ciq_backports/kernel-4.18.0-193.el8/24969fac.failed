@@ -1,0 +1,139 @@
+xfrm: policy: store inexact policies in an rhashtable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 24969facd704a5f0dd8e08da86bf32a9ce972bee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/24969fac.failed
+
+Switch packet-path lookups for inexact policies to rhashtable.
+
+In this initial version, we now no longer need to search policies with
+non-matching address family and type.
+
+Next patch will add the if_id as well so lookups from the xfrm interface
+driver only need to search inexact policies for that device.
+
+Future patches will augment the hlist in each rhash bucket with a tree
+and pre-sort policies according to daddr/prefix.
+
+A single rhashtable is used.  In order to avoid a full rhashtable walk on
+netns exit, the bins get placed on a pernet list, i.e. we add almost no
+cost for network namespaces that had no xfrm policies.
+
+The inexact lists are kept in place, and policies are added to both the
+per-rhash-inexact list and a pernet one.
+
+The latter is needed for the control plane to handle migrate -- these
+requests do not consider the if_id, so if we'd remove the inexact_list
+now we would have to search all hash buckets and then figure
+out which matching policy candidate is the most recent one -- this appears
+a bit harder than just keeping the 'old' inexact list for this purpose.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Acked-by: David S. Miller <davem@davemloft.net>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 24969facd704a5f0dd8e08da86bf32a9ce972bee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_policy.c
+diff --cc net/xfrm/xfrm_policy.c
+index 6b43f9247a17,5c7e7399323f..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -588,9 -725,46 +722,47 @@@ static void xfrm_hash_rebuild(struct wo
+  	} while (read_seqretry(&net->xfrm.policy_hthresh.lock, seq));
+  
+  	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
+ +	write_seqcount_begin(&xfrm_policy_hash_generation);
+  
++ 	/* make sure that we can insert the indirect policies again before
++ 	 * we start with destructive action.
++ 	 */
++ 	list_for_each_entry(policy, &net->xfrm.policy_all, walk.all) {
++ 		u8 dbits, sbits;
++ 
++ 		dir = xfrm_policy_id2dir(policy->index);
++ 		if (policy->walk.dead || dir >= XFRM_POLICY_MAX)
++ 			continue;
++ 
++ 		if ((dir & XFRM_POLICY_MASK) == XFRM_POLICY_OUT) {
++ 			if (policy->family == AF_INET) {
++ 				dbits = rbits4;
++ 				sbits = lbits4;
++ 			} else {
++ 				dbits = rbits6;
++ 				sbits = lbits6;
++ 			}
++ 		} else {
++ 			if (policy->family == AF_INET) {
++ 				dbits = lbits4;
++ 				sbits = rbits4;
++ 			} else {
++ 				dbits = lbits6;
++ 				sbits = rbits6;
++ 			}
++ 		}
++ 
++ 		if (policy->selector.prefixlen_d < dbits ||
++ 		    policy->selector.prefixlen_s < sbits)
++ 			continue;
++ 
++ 		if (!xfrm_policy_inexact_alloc_bin(policy, dir))
++ 			goto out_unlock;
++ 	}
++ 
+  	/* reset the bydst and inexact table in all directions */
++ 	xfrm_hash_reset_inexact_table(net);
++ 
+  	for (dir = 0; dir < XFRM_POLICY_MAX; dir++) {
+  		INIT_HLIST_HEAD(&net->xfrm.policy_inexact[dir]);
+  		hmask = net->xfrm.policy_bydst[dir].hmask;
+@@@ -637,7 -816,7 +814,11 @@@
+  			hlist_add_head_rcu(&policy->bydst, chain);
+  	}
+  
+++<<<<<<< HEAD
+ +	write_seqcount_end(&xfrm_policy_hash_generation);
+++=======
++ out_unlock:
+++>>>>>>> 24969facd704 (xfrm: policy: store inexact policies in an rhashtable)
+  	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+  
+  	mutex_unlock(&hash_resize_mutex);
+diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
+index 9991e5ef52cc..59f45b1e9dac 100644
+--- a/include/net/netns/xfrm.h
++++ b/include/net/netns/xfrm.h
+@@ -5,6 +5,7 @@
+ #include <linux/list.h>
+ #include <linux/wait.h>
+ #include <linux/workqueue.h>
++#include <linux/rhashtable-types.h>
+ #include <linux/xfrm.h>
+ #include <net/dst_ops.h>
+ 
+@@ -53,6 +54,7 @@ struct netns_xfrm {
+ 	unsigned int		policy_count[XFRM_POLICY_MAX * 2];
+ 	struct work_struct	policy_hash_work;
+ 	struct xfrm_policy_hthresh policy_hthresh;
++	struct list_head	inexact_bins;
+ 
+ 
+ 	struct sock		*nlsk;
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index f1d2173cbfda..001d6cf8fc8f 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -607,6 +607,7 @@ struct xfrm_policy {
+ 	u16			family;
+ 	struct xfrm_sec_ctx	*security;
+ 	struct xfrm_tmpl       	xfrm_vec[XFRM_MAX_DEPTH];
++	struct hlist_node	bydst_inexact_list;
+ 	struct rcu_head		rcu;
+ 	RH_KABI_EXTEND(u32	if_id)
+ };
+* Unmerged path net/xfrm/xfrm_policy.c
