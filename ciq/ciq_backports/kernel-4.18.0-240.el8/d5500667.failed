@@ -1,0 +1,492 @@
+net/smc: mutex to protect the lgr against parallel reconfigurations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit d550066776aae3bb31e0240cab24f62e33c47fd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d5500667.failed
+
+Introduce llc_conf_mutex in the link group which is used to protect the
+buffers and lgr states against parallel link reconfiguration.
+This ensures that new connections do not start to register buffers with
+the links of a link group when link creation or termination is running.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d550066776aae3bb31e0240cab24f62e33c47fd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/af_smc.c
+#	net/smc/smc_core.c
+#	net/smc/smc_core.h
+#	net/smc/smc_llc.c
+diff --cc net/smc/af_smc.c
+index 61adbee56cf2,6663a63be9e4..000000000000
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@@ -335,46 -337,39 +335,68 @@@ static void smc_copy_sock_settings_to_s
+  	smc_copy_sock_settings(&smc->sk, smc->clcsock->sk, SK_FLAGS_CLC_TO_SMC);
+  }
+  
+ +/* register a new rmb, send confirm_rkey msg to register with peer */
+ +static int smcr_link_reg_rmb(struct smc_link *link,
+ +			     struct smc_buf_desc *rmb_desc, bool conf_rkey)
+ +{
+ +	if (!rmb_desc->is_reg_mr[link->link_idx]) {
+ +		/* register memory region for new rmb */
+ +		if (smc_wr_reg_send(link, rmb_desc->mr_rx[link->link_idx])) {
+ +			rmb_desc->is_reg_err = true;
+ +			return -EFAULT;
+ +		}
+ +		rmb_desc->is_reg_mr[link->link_idx] = true;
+ +	}
+ +	if (!conf_rkey)
+ +		return 0;
+ +
+ +	/* exchange confirm_rkey msg with peer */
+ +	if (!rmb_desc->is_conf_rkey) {
+ +		if (smc_llc_do_confirm_rkey(link, rmb_desc)) {
+ +			rmb_desc->is_reg_err = true;
+ +			return -EFAULT;
+ +		}
+ +		rmb_desc->is_conf_rkey = true;
+ +	}
+ +	return 0;
+ +}
+ +
+  /* register the new rmb on all links */
+ -static int smcr_lgr_reg_rmbs(struct smc_link *link,
+ +static int smcr_lgr_reg_rmbs(struct smc_link_group *lgr,
+  			     struct smc_buf_desc *rmb_desc)
+  {
+ -	struct smc_link_group *lgr = link->lgr;
+ -	int i, rc = 0;
+ +	int i, rc;
+  
++ 	rc = smc_llc_flow_initiate(lgr, SMC_LLC_FLOW_RKEY);
++ 	if (rc)
++ 		return rc;
++ 	/* protect against parallel smc_llc_cli_rkey_exchange() and
++ 	 * parallel smcr_link_reg_rmb()
++ 	 */
++ 	mutex_lock(&lgr->llc_conf_mutex);
+  	for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
+  		if (lgr->lnk[i].state != SMC_LNK_ACTIVE)
+  			continue;
+ -		rc = smcr_link_reg_rmb(&lgr->lnk[i], rmb_desc);
+ +		rc = smcr_link_reg_rmb(&lgr->lnk[i], rmb_desc, true);
+  		if (rc)
+ -			goto out;
+ +			return rc;
+  	}
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 
++ 	/* exchange confirm_rkey msg with peer */
++ 	rc = smc_llc_do_confirm_rkey(link, rmb_desc);
++ 	if (rc) {
++ 		rc = -EFAULT;
++ 		goto out;
++ 	}
++ 	rmb_desc->is_conf_rkey = true;
++ out:
++ 	mutex_unlock(&lgr->llc_conf_mutex);
++ 	smc_llc_flow_stop(lgr, &lgr->llc_flow_lcl);
++ 	return rc;
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  }
+  
+  static int smcr_clnt_conf_first_link(struct smc_sock *smc)
+diff --cc net/smc/smc_core.c
+index 8d7f08e469be,4c3af05d76a5..000000000000
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@@ -441,15 -446,23 +441,32 @@@ out
+  }
+  
+  static void smcr_buf_unuse(struct smc_buf_desc *rmb_desc,
+ -			   struct smc_link_group *lgr)
+ +			   struct smc_link *lnk)
+  {
+++<<<<<<< HEAD
+ +	struct smc_link_group *lgr = lnk->lgr;
+ +
+ +	if (rmb_desc->is_conf_rkey && !list_empty(&lgr->list)) {
+ +		/* unregister rmb with peer */
+ +		smc_llc_do_delete_rkey(lnk, rmb_desc);
+ +		rmb_desc->is_conf_rkey = false;
+++=======
++ 	int rc;
++ 
++ 	if (rmb_desc->is_conf_rkey && !list_empty(&lgr->list)) {
++ 		/* unregister rmb with peer */
++ 		rc = smc_llc_flow_initiate(lgr, SMC_LLC_FLOW_RKEY);
++ 		if (!rc) {
++ 			/* protect against smc_llc_cli_rkey_exchange() */
++ 			mutex_lock(&lgr->llc_conf_mutex);
++ 			smc_llc_do_delete_rkey(lgr, rmb_desc);
++ 			rmb_desc->is_conf_rkey = false;
++ 			mutex_unlock(&lgr->llc_conf_mutex);
++ 			smc_llc_flow_stop(lgr, &lgr->llc_flow_lcl);
++ 		}
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  	}
++ 
+  	if (rmb_desc->is_reg_err) {
+  		/* buf registration failed, reuse not possible */
+  		mutex_lock(&lgr->rmbs_lock);
+@@@ -496,9 -509,65 +513,67 @@@ void smc_conn_free(struct smc_connectio
+  		smc_lgr_schedule_free_work(lgr);
+  }
+  
+ -/* unregister a link from a buf_desc */
+ -static void smcr_buf_unmap_link(struct smc_buf_desc *buf_desc, bool is_rmb,
+ -				struct smc_link *lnk)
+ +static void smcr_link_clear(struct smc_link *lnk)
+  {
+++<<<<<<< HEAD
+ +	if (lnk->peer_qpn == 0)
+++=======
++ 	if (is_rmb)
++ 		buf_desc->is_reg_mr[lnk->link_idx] = false;
++ 	if (!buf_desc->is_map_ib[lnk->link_idx])
++ 		return;
++ 	if (is_rmb) {
++ 		if (buf_desc->mr_rx[lnk->link_idx]) {
++ 			smc_ib_put_memory_region(
++ 					buf_desc->mr_rx[lnk->link_idx]);
++ 			buf_desc->mr_rx[lnk->link_idx] = NULL;
++ 		}
++ 		smc_ib_buf_unmap_sg(lnk, buf_desc, DMA_FROM_DEVICE);
++ 	} else {
++ 		smc_ib_buf_unmap_sg(lnk, buf_desc, DMA_TO_DEVICE);
++ 	}
++ 	sg_free_table(&buf_desc->sgt[lnk->link_idx]);
++ 	buf_desc->is_map_ib[lnk->link_idx] = false;
++ }
++ 
++ /* unmap all buffers of lgr for a deleted link */
++ static void smcr_buf_unmap_lgr(struct smc_link *lnk)
++ {
++ 	struct smc_link_group *lgr = lnk->lgr;
++ 	struct smc_buf_desc *buf_desc, *bf;
++ 	int i;
++ 
++ 	for (i = 0; i < SMC_RMBE_SIZES; i++) {
++ 		mutex_lock(&lgr->rmbs_lock);
++ 		list_for_each_entry_safe(buf_desc, bf, &lgr->rmbs[i], list)
++ 			smcr_buf_unmap_link(buf_desc, true, lnk);
++ 		mutex_unlock(&lgr->rmbs_lock);
++ 		mutex_lock(&lgr->sndbufs_lock);
++ 		list_for_each_entry_safe(buf_desc, bf, &lgr->sndbufs[i],
++ 					 list)
++ 			smcr_buf_unmap_link(buf_desc, false, lnk);
++ 		mutex_unlock(&lgr->sndbufs_lock);
++ 	}
++ }
++ 
++ static void smcr_rtoken_clear_link(struct smc_link *lnk)
++ {
++ 	struct smc_link_group *lgr = lnk->lgr;
++ 	int i;
++ 
++ 	for (i = 0; i < SMC_RMBS_PER_LGR_MAX; i++) {
++ 		lgr->rtokens[i][lnk->link_idx].rkey = 0;
++ 		lgr->rtokens[i][lnk->link_idx].dma_addr = 0;
++ 	}
++ }
++ 
++ /* must be called under lgr->llc_conf_mutex lock */
++ void smcr_link_clear(struct smc_link *lnk)
++ {
++ 	struct smc_ib_device *smcibdev;
++ 
++ 	if (!lnk->lgr || lnk->state == SMC_LNK_UNUSED)
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  		return;
+  	lnk->peer_qpn = 0;
+  	smc_llc_link_clear(lnk);
+@@@ -1126,6 -1181,86 +1201,89 @@@ free_table
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* register a new rmb on IB device,
++  * must be called under lgr->llc_conf_mutex lock
++  */
++ int smcr_link_reg_rmb(struct smc_link *link, struct smc_buf_desc *rmb_desc)
++ {
++ 	if (list_empty(&link->lgr->list))
++ 		return -ENOLINK;
++ 	if (!rmb_desc->is_reg_mr[link->link_idx]) {
++ 		/* register memory region for new rmb */
++ 		if (smc_wr_reg_send(link, rmb_desc->mr_rx[link->link_idx])) {
++ 			rmb_desc->is_reg_err = true;
++ 			return -EFAULT;
++ 		}
++ 		rmb_desc->is_reg_mr[link->link_idx] = true;
++ 	}
++ 	return 0;
++ }
++ 
++ static int _smcr_buf_map_lgr(struct smc_link *lnk, struct mutex *lock,
++ 			     struct list_head *lst, bool is_rmb)
++ {
++ 	struct smc_buf_desc *buf_desc, *bf;
++ 	int rc = 0;
++ 
++ 	mutex_lock(lock);
++ 	list_for_each_entry_safe(buf_desc, bf, lst, list) {
++ 		if (!buf_desc->used)
++ 			continue;
++ 		rc = smcr_buf_map_link(buf_desc, is_rmb, lnk);
++ 		if (rc)
++ 			goto out;
++ 	}
++ out:
++ 	mutex_unlock(lock);
++ 	return rc;
++ }
++ 
++ /* map all used buffers of lgr for a new link */
++ int smcr_buf_map_lgr(struct smc_link *lnk)
++ {
++ 	struct smc_link_group *lgr = lnk->lgr;
++ 	int i, rc = 0;
++ 
++ 	for (i = 0; i < SMC_RMBE_SIZES; i++) {
++ 		rc = _smcr_buf_map_lgr(lnk, &lgr->rmbs_lock,
++ 				       &lgr->rmbs[i], true);
++ 		if (rc)
++ 			return rc;
++ 		rc = _smcr_buf_map_lgr(lnk, &lgr->sndbufs_lock,
++ 				       &lgr->sndbufs[i], false);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	return 0;
++ }
++ 
++ /* register all used buffers of lgr for a new link,
++  * must be called under lgr->llc_conf_mutex lock
++  */
++ int smcr_buf_reg_lgr(struct smc_link *lnk)
++ {
++ 	struct smc_link_group *lgr = lnk->lgr;
++ 	struct smc_buf_desc *buf_desc, *bf;
++ 	int i, rc = 0;
++ 
++ 	mutex_lock(&lgr->rmbs_lock);
++ 	for (i = 0; i < SMC_RMBE_SIZES; i++) {
++ 		list_for_each_entry_safe(buf_desc, bf, &lgr->rmbs[i], list) {
++ 			if (!buf_desc->used)
++ 				continue;
++ 			rc = smcr_link_reg_rmb(lnk, buf_desc);
++ 			if (rc)
++ 				goto out;
++ 		}
++ 	}
++ out:
++ 	mutex_unlock(&lgr->rmbs_lock);
++ 	return rc;
++ }
++ 
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  static struct smc_buf_desc *smcr_new_buf_create(struct smc_link_group *lgr,
+  						bool is_rmb, int bufsize)
+  {
+diff --cc net/smc/smc_core.h
+index dbb7446cbf6a,aa198dd0f0e4..000000000000
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@@ -232,6 -242,28 +232,31 @@@ struct smc_link_group 
+  			DECLARE_BITMAP(rtokens_used_mask, SMC_RMBS_PER_LGR_MAX);
+  						/* used rtoken elements */
+  			u8			next_link_id;
+++<<<<<<< HEAD
+++=======
++ 			enum smc_lgr_type	type;
++ 						/* redundancy state */
++ 			struct list_head	llc_event_q;
++ 						/* queue for llc events */
++ 			spinlock_t		llc_event_q_lock;
++ 						/* protects llc_event_q */
++ 			struct mutex		llc_conf_mutex;
++ 						/* protects lgr reconfig. */
++ 			struct work_struct	llc_event_work;
++ 						/* llc event worker */
++ 			wait_queue_head_t	llc_waiter;
++ 						/* w4 next llc event */
++ 			struct smc_llc_flow	llc_flow_lcl;
++ 						/* llc local control field */
++ 			struct smc_llc_flow	llc_flow_rmt;
++ 						/* llc remote control field */
++ 			struct smc_llc_qentry	*delayed_event;
++ 						/* arrived when flow active */
++ 			spinlock_t		llc_flow_lock;
++ 						/* protects llc flow */
++ 			int			llc_testlink_time;
++ 						/* link keep alive time */
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  		};
+  		struct { /* SMC-D */
+  			u64			peer_gid;
+diff --cc net/smc/smc_llc.c
+index 4119cdb6b6bf,ceed3c89926f..000000000000
+--- a/net/smc/smc_llc.c
++++ b/net/smc/smc_llc.c
+@@@ -624,21 -839,33 +624,49 @@@ out
+  	schedule_delayed_work(&link->llc_testlink_wrk, next_interval);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void smc_llc_lgr_init(struct smc_link_group *lgr, struct smc_sock *smc)
++ {
++ 	struct net *net = sock_net(smc->clcsock->sk);
++ 
++ 	INIT_WORK(&lgr->llc_event_work, smc_llc_event_work);
++ 	INIT_LIST_HEAD(&lgr->llc_event_q);
++ 	spin_lock_init(&lgr->llc_event_q_lock);
++ 	spin_lock_init(&lgr->llc_flow_lock);
++ 	init_waitqueue_head(&lgr->llc_waiter);
++ 	mutex_init(&lgr->llc_conf_mutex);
++ 	lgr->llc_testlink_time = net->ipv4.sysctl_tcp_keepalive_time;
++ }
++ 
++ /* called after lgr was removed from lgr_list */
++ void smc_llc_lgr_clear(struct smc_link_group *lgr)
++ {
++ 	smc_llc_event_flush(lgr);
++ 	wake_up_interruptible_all(&lgr->llc_waiter);
++ 	cancel_work_sync(&lgr->llc_event_work);
++ 	if (lgr->delayed_event) {
++ 		kfree(lgr->delayed_event);
++ 		lgr->delayed_event = NULL;
++ 	}
++ }
++ 
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  int smc_llc_link_init(struct smc_link *link)
+  {
+ +	struct smc_link_group *lgr = smc_get_lgr(link);
+ +	link->llc_wq = alloc_ordered_workqueue("llc_wq-%x:%x)", WQ_MEM_RECLAIM,
+ +					       *((u32 *)lgr->id),
+ +					       link->link_id);
+ +	if (!link->llc_wq)
+ +		return -ENOMEM;
+ +	init_completion(&link->llc_confirm);
+ +	init_completion(&link->llc_confirm_resp);
+ +	init_completion(&link->llc_add);
+ +	init_completion(&link->llc_add_resp);
+ +	init_completion(&link->llc_confirm_rkey);
+ +	init_completion(&link->llc_delete_rkey);
+ +	mutex_init(&link->llc_delete_rkey_mutex);
+  	init_completion(&link->llc_testlink_resp);
+  	INIT_DELAYED_WORK(&link->llc_testlink_wrk, smc_llc_testlink_work);
+  	return 0;
+@@@ -671,54 -890,52 +699,83 @@@ void smc_llc_link_inactive(struct smc_l
+  	smc_wr_wakeup_tx_wait(link);
+  }
+  
+ -/* register a new rtoken at the remote peer (for all links) */
+ -int smc_llc_do_confirm_rkey(struct smc_link *send_link,
+ +/* called in worker context */
+ +void smc_llc_link_clear(struct smc_link *link)
+ +{
+ +	flush_workqueue(link->llc_wq);
+ +	destroy_workqueue(link->llc_wq);
+ +}
+ +
+ +/* register a new rtoken at the remote peer */
+ +int smc_llc_do_confirm_rkey(struct smc_link *link,
+  			    struct smc_buf_desc *rmb_desc)
+  {
+ -	struct smc_link_group *lgr = send_link->lgr;
+ -	struct smc_llc_qentry *qentry = NULL;
+ -	int rc = 0;
+ +	int rc;
+  
+++<<<<<<< HEAD
+ +	/* protected by mutex smc_create_lgr_pending */
+ +	reinit_completion(&link->llc_confirm_rkey);
+ +	rc = smc_llc_send_confirm_rkey(link, rmb_desc);
+ +	if (rc)
+ +		return rc;
+ +	/* receive CONFIRM RKEY response from server over RoCE fabric */
+ +	rc = wait_for_completion_interruptible_timeout(&link->llc_confirm_rkey,
+ +						       SMC_LLC_WAIT_TIME);
+ +	if (rc <= 0 || link->llc_confirm_rkey_rc)
+ +		return -EFAULT;
+ +	return 0;
+++=======
++ 	rc = smc_llc_send_confirm_rkey(send_link, rmb_desc);
++ 	if (rc)
++ 		goto out;
++ 	/* receive CONFIRM RKEY response from server over RoCE fabric */
++ 	qentry = smc_llc_wait(lgr, send_link, SMC_LLC_WAIT_TIME,
++ 			      SMC_LLC_CONFIRM_RKEY);
++ 	if (!qentry || (qentry->msg.raw.hdr.flags & SMC_LLC_FLAG_RKEY_NEG))
++ 		rc = -EFAULT;
++ out:
++ 	if (qentry)
++ 		smc_llc_flow_qentry_del(&lgr->llc_flow_lcl);
++ 	return rc;
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  }
+  
+  /* unregister an rtoken at the remote peer */
+ -int smc_llc_do_delete_rkey(struct smc_link_group *lgr,
+ +int smc_llc_do_delete_rkey(struct smc_link *link,
+  			   struct smc_buf_desc *rmb_desc)
+  {
+ -	struct smc_llc_qentry *qentry = NULL;
+ -	struct smc_link *send_link;
+  	int rc = 0;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&link->llc_delete_rkey_mutex);
+ +	if (link->state != SMC_LNK_ACTIVE)
+ +		goto out;
+ +	reinit_completion(&link->llc_delete_rkey);
+ +	rc = smc_llc_send_delete_rkey(link, rmb_desc);
+++=======
++ 	send_link = smc_llc_usable_link(lgr);
++ 	if (!send_link)
++ 		return -ENOLINK;
++ 
++ 	/* protected by llc_flow control */
++ 	rc = smc_llc_send_delete_rkey(send_link, rmb_desc);
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  	if (rc)
+  		goto out;
+  	/* receive DELETE RKEY response from server over RoCE fabric */
+ -	qentry = smc_llc_wait(lgr, send_link, SMC_LLC_WAIT_TIME,
+ -			      SMC_LLC_DELETE_RKEY);
+ -	if (!qentry || (qentry->msg.raw.hdr.flags & SMC_LLC_FLAG_RKEY_NEG))
+ +	rc = wait_for_completion_interruptible_timeout(&link->llc_delete_rkey,
+ +						       SMC_LLC_WAIT_TIME);
+ +	if (rc <= 0 || link->llc_delete_rkey_rc)
+  		rc = -EFAULT;
+ +	else
+ +		rc = 0;
+  out:
+++<<<<<<< HEAD
+ +	mutex_unlock(&link->llc_delete_rkey_mutex);
+++=======
++ 	if (qentry)
++ 		smc_llc_flow_qentry_del(&lgr->llc_flow_lcl);
+++>>>>>>> d550066776aa (net/smc: mutex to protect the lgr against parallel reconfigurations)
+  	return rc;
+  }
+  
+* Unmerged path net/smc/af_smc.c
+* Unmerged path net/smc/smc_core.c
+* Unmerged path net/smc/smc_core.h
+* Unmerged path net/smc/smc_llc.c
