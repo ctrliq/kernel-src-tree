@@ -1,0 +1,196 @@
+net: hns3: Enable promisc mode when mac vlan table is full
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jian Shen <shenjian15@huawei.com>
+commit c60edc17df391e33c9c3cd6e319eb1f32ce26730
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/c60edc17.failed
+
+Currently, the driver does nothing when mac vlan table is full.
+In this case, the packet with new mac address will be dropped
+by hardware. This patch adds check for the result of sync mac
+address, and enable promisc mode when mac vlan table is full.
+Furtherly, disable vlan filter when enable promisc by user
+command.
+
+Fixes: 46a3df9f9718 ("net: hns3: Add HNS3 Acceleration Engine & Compatibility Layer Support")
+	Signed-off-by: Jian Shen <shenjian15@huawei.com>
+	Signed-off-by: Salil Mehta <salil.mehta@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c60edc17df391e33c9c3cd6e319eb1f32ce26730)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+diff --cc drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+index 44006e062a76,bbd6197799f0..000000000000
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+@@@ -442,23 -477,63 +457,74 @@@ static u8 hns3_get_netdev_flags(struct 
+  static void hns3_nic_set_rx_mode(struct net_device *netdev)
+  {
+  	struct hnae3_handle *h = hns3_get_handle(netdev);
++ 	u8 new_flags;
++ 	int ret;
++ 
++ 	new_flags = hns3_get_netdev_flags(netdev);
++ 
++ 	ret = __dev_uc_sync(netdev, hns3_nic_uc_sync, hns3_nic_uc_unsync);
++ 	if (ret) {
++ 		netdev_err(netdev, "sync uc address fail\n");
++ 		if (ret == -ENOSPC)
++ 			new_flags |= HNAE3_OVERFLOW_UPE;
++ 	}
++ 
++ 	if (netdev->flags & IFF_MULTICAST) {
++ 		ret = __dev_mc_sync(netdev, hns3_nic_mc_sync,
++ 				    hns3_nic_mc_unsync);
++ 		if (ret) {
++ 			netdev_err(netdev, "sync mc address fail\n");
++ 			if (ret == -ENOSPC)
++ 				new_flags |= HNAE3_OVERFLOW_MPE;
++ 		}
++ 	}
++ 
++ 	hns3_update_promisc_mode(netdev, new_flags);
++ 	/* User mode Promisc mode enable and vlan filtering is disabled to
++ 	 * let all packets in. MAC-VLAN Table overflow Promisc enabled and
++ 	 * vlan fitering is enabled
++ 	 */
++ 	hns3_enable_vlan_filter(netdev, new_flags & HNAE3_VLAN_FLTR);
++ 	h->netdev_flags = new_flags;
++ }
++ 
++ void hns3_update_promisc_mode(struct net_device *netdev, u8 promisc_flags)
++ {
++ 	struct hns3_nic_priv *priv = netdev_priv(netdev);
++ 	struct hnae3_handle *h = priv->ae_handle;
+  
+  	if (h->ae_algo->ops->set_promisc_mode) {
+- 		if (netdev->flags & IFF_PROMISC)
+- 			h->ae_algo->ops->set_promisc_mode(h, true, true);
+- 		else if (netdev->flags & IFF_ALLMULTI)
+- 			h->ae_algo->ops->set_promisc_mode(h, false, true);
+- 		else
+- 			h->ae_algo->ops->set_promisc_mode(h, false, false);
++ 		h->ae_algo->ops->set_promisc_mode(h,
++ 						  promisc_flags & HNAE3_UPE,
++ 						  promisc_flags & HNAE3_MPE);
+  	}
+++<<<<<<< HEAD
+ +	if (__dev_uc_sync(netdev, hns3_nic_uc_sync, hns3_nic_uc_unsync))
+ +		netdev_err(netdev, "sync uc address fail\n");
+ +	if (netdev->flags & IFF_MULTICAST) {
+ +		if (__dev_mc_sync(netdev, hns3_nic_mc_sync, hns3_nic_mc_unsync))
+ +			netdev_err(netdev, "sync mc address fail\n");
+ +
+ +		if (h->ae_algo->ops->update_mta_status)
+ +			h->ae_algo->ops->update_mta_status(h);
+++=======
++ }
++ 
++ void hns3_enable_vlan_filter(struct net_device *netdev, bool enable)
++ {
++ 	struct hns3_nic_priv *priv = netdev_priv(netdev);
++ 	struct hnae3_handle *h = priv->ae_handle;
++ 	bool last_state;
++ 
++ 	if (h->pdev->revision >= 0x21 && h->ae_algo->ops->enable_vlan_filter) {
++ 		last_state = h->netdev_flags & HNAE3_VLAN_FLTR ? true : false;
++ 		if (enable != last_state) {
++ 			netdev_info(netdev,
++ 				    "%s vlan filter\n",
++ 				    enable ? "enable" : "disable");
++ 			h->ae_algo->ops->enable_vlan_filter(h, enable);
++ 		}
+++>>>>>>> c60edc17df39 (net: hns3: Enable promisc mode when mac vlan table is full)
+  	}
+  }
+  
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hnae3.h b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+index 1f61c9416faf..e517d479778e 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -490,6 +490,15 @@ struct hnae3_unic_private_info {
+ #define HNAE3_SUPPORT_SERDES_LOOPBACK BIT(2)
+ #define HNAE3_SUPPORT_VF	      BIT(3)
+ 
++#define HNAE3_USER_UPE		BIT(0)	/* unicast promisc enabled by user */
++#define HNAE3_USER_MPE		BIT(1)	/* mulitcast promisc enabled by user */
++#define HNAE3_BPE		BIT(2)	/* broadcast promisc enable */
++#define HNAE3_OVERFLOW_UPE	BIT(3)	/* unicast mac vlan overflow */
++#define HNAE3_OVERFLOW_MPE	BIT(4)	/* multicast mac vlan overflow */
++#define HNAE3_VLAN_FLTR		BIT(5)	/* enable vlan filter */
++#define HNAE3_UPE		(HNAE3_USER_UPE | HNAE3_OVERFLOW_UPE)
++#define HNAE3_MPE		(HNAE3_USER_MPE | HNAE3_OVERFLOW_MPE)
++
+ struct hnae3_handle {
+ 	struct hnae3_client *client;
+ 	struct pci_dev *pdev;
+@@ -508,6 +517,8 @@ struct hnae3_handle {
+ 	};
+ 
+ 	u32 numa_node_mask;	/* for multi-chip support */
++
++	u8 netdev_flags;
+ };
+ 
+ #define hnae_set_field(origin, mask, shift, val) \
+* Unmerged path drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
+index d24e05398518..9911604b71c3 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
+@@ -638,6 +638,9 @@ void hns3_set_vector_coalesce_tx_gl(struct hns3_enet_tqp_vector *tqp_vector,
+ void hns3_set_vector_coalesce_rl(struct hns3_enet_tqp_vector *tqp_vector,
+ 				 u32 rl_value);
+ 
++void hns3_enable_vlan_filter(struct net_device *netdev, bool enable);
++void hns3_update_promisc_mode(struct net_device *netdev, u8 promisc_flags);
++
+ #ifdef CONFIG_HNS3_DCB
+ void hns3_dcbnl_setup(struct hnae3_handle *handle);
+ #else
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+index d1a3309a49e2..80fa0368400c 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -4353,6 +4353,10 @@ static void hclge_enable_vlan_filter(struct hnae3_handle *handle, bool enable)
+ 		hclge_set_vlan_filter_ctrl(hdev, HCLGE_FILTER_TYPE_VF,
+ 					   HCLGE_FILTER_FE_EGRESS_V1_B, enable);
+ 	}
++	if (enable)
++		handle->netdev_flags |= HNAE3_VLAN_FLTR;
++	else
++		handle->netdev_flags &= ~HNAE3_VLAN_FLTR;
+ }
+ 
+ static int hclge_set_vf_vlan_common(struct hclge_dev *hdev, int vfid,
+@@ -4649,7 +4653,7 @@ static int hclge_init_vlan_config(struct hclge_dev *hdev)
+ {
+ #define HCLGE_DEF_VLAN_TYPE		0x8100
+ 
+-	struct hnae3_handle *handle;
++	struct hnae3_handle *handle = &hdev->vport[0].nic;
+ 	struct hclge_vport *vport;
+ 	int ret;
+ 	int i;
+@@ -4672,6 +4676,8 @@ static int hclge_init_vlan_config(struct hclge_dev *hdev)
+ 			return ret;
+ 	}
+ 
++	handle->netdev_flags |= HNAE3_VLAN_FLTR;
++
+ 	hdev->vlan_type_cfg.rx_in_fst_vlan_type = HCLGE_DEF_VLAN_TYPE;
+ 	hdev->vlan_type_cfg.rx_in_sec_vlan_type = HCLGE_DEF_VLAN_TYPE;
+ 	hdev->vlan_type_cfg.rx_ot_fst_vlan_type = HCLGE_DEF_VLAN_TYPE;
+@@ -4716,7 +4722,6 @@ static int hclge_init_vlan_config(struct hclge_dev *hdev)
+ 			return ret;
+ 	}
+ 
+-	handle = &hdev->vport[0].nic;
+ 	return hclge_set_vlan_filter(handle, htons(ETH_P_8021Q), 0, false);
+ }
+ 
