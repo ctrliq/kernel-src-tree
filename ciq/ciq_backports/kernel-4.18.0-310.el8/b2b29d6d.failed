@@ -1,0 +1,152 @@
+mm: account PMD tables like PTE tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit b2b29d6d01194404dfef4eafa026959be301705b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b2b29d6d.failed
+
+We account the PTE level of the page tables to the process in order to
+make smarter OOM decisions and help diagnose why memory is fragmented.
+For these same reasons, we should account pages allocated for PMDs.  With
+larger process address spaces and ASLR, the number of PMDs in use is
+higher than it used to be so the inaccuracy is starting to matter.
+
+[rppt@linux.ibm.com: arm: __pmd_free_tlb(): call page table destructor]
+  Link: https://lkml.kernel.org/r/20200825111303.GB69694@linux.ibm.com
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Abdul Haleem <abdhalee@linux.vnet.ibm.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Max Filippov <jcmvbkbc@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Satheesh Rajendran <sathnaga@linux.vnet.ibm.com>
+	Cc: Stafford Horne <shorne@gmail.com>
+	Cc: Naresh Kamboju <naresh.kamboju@linaro.org>
+	Cc: Anders Roxell <anders.roxell@linaro.org>
+Link: http://lkml.kernel.org/r/20200627184642.GF25039@casper.infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b2b29d6d01194404dfef4eafa026959be301705b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/tlb.h
+diff --cc arch/arm/include/asm/tlb.h
+index 27d6bf4347d5,b8cbe03ad260..000000000000
+--- a/arch/arm/include/asm/tlb.h
++++ b/arch/arm/include/asm/tlb.h
+@@@ -257,38 -46,22 +257,44 @@@ static inline void __pte_free_tlb(struc
+  	 * With the classic ARM MMU, a pte page has two corresponding pmd
+  	 * entries, each covering 1MB.
+  	 */
+ -	addr = (addr & PMD_MASK) + SZ_1M;
+ -	__tlb_adjust_range(tlb, addr - PAGE_SIZE, 2 * PAGE_SIZE);
+ +	addr &= PMD_MASK;
+ +	tlb_add_flush(tlb, addr + SZ_1M - PAGE_SIZE);
+ +	tlb_add_flush(tlb, addr + SZ_1M);
+  #endif
+  
+ -	tlb_remove_table(tlb, pte);
+ +	tlb_remove_entry(tlb, pte);
+  }
+  
+ -static inline void
+ -__pmd_free_tlb(struct mmu_gather *tlb, pmd_t *pmdp, unsigned long addr)
+ +static inline void __pmd_free_tlb(struct mmu_gather *tlb, pmd_t *pmdp,
+ +				  unsigned long addr)
+  {
+  #ifdef CONFIG_ARM_LPAE
+ -	struct page *page = virt_to_page(pmdp);
+ +	tlb_add_flush(tlb, addr);
+ +	tlb_remove_entry(tlb, virt_to_page(pmdp));
+ +#endif
+ +}
+ +
+ +static inline void
+ +tlb_remove_pmd_tlb_entry(struct mmu_gather *tlb, pmd_t *pmdp, unsigned long addr)
+ +{
+ +	tlb_add_flush(tlb, addr);
+ +}
+ +
+++<<<<<<< HEAD
+ +#define pte_free_tlb(tlb, ptep, addr)	__pte_free_tlb(tlb, ptep, addr)
+ +#define pmd_free_tlb(tlb, pmdp, addr)	__pmd_free_tlb(tlb, pmdp, addr)
+ +#define pud_free_tlb(tlb, pudp, addr)	pud_free((tlb)->mm, pudp)
+  
+ +#define tlb_migrate_finish(mm)		do { } while (0)
+ +
+ +static inline void tlb_change_page_size(struct mmu_gather *tlb,
+ +						     unsigned int page_size)
+ +{
+++=======
++ 	pgtable_pmd_page_dtor(page);
++ 	tlb_remove_table(tlb, page);
++ #endif
+++>>>>>>> b2b29d6d0119 (mm: account PMD tables like PTE tables)
+  }
+  
+  #endif /* CONFIG_MMU */
+* Unmerged path arch/arm/include/asm/tlb.h
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 32403a098175..ef290c376c32 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2092,7 +2092,7 @@ static inline spinlock_t *pmd_lockptr(struct mm_struct *mm, pmd_t *pmd)
+ 	return ptlock_ptr(pmd_to_page(pmd));
+ }
+ 
+-static inline bool pgtable_pmd_page_ctor(struct page *page)
++static inline bool pmd_ptlock_init(struct page *page)
+ {
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	page->pmd_huge_pte = NULL;
+@@ -2100,7 +2100,7 @@ static inline bool pgtable_pmd_page_ctor(struct page *page)
+ 	return ptlock_init(page);
+ }
+ 
+-static inline void pgtable_pmd_page_dtor(struct page *page)
++static inline void pmd_ptlock_free(struct page *page)
+ {
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	VM_BUG_ON_PAGE(page->pmd_huge_pte, page);
+@@ -2117,8 +2117,8 @@ static inline spinlock_t *pmd_lockptr(struct mm_struct *mm, pmd_t *pmd)
+ 	return &mm->page_table_lock;
+ }
+ 
+-static inline bool pgtable_pmd_page_ctor(struct page *page) { return true; }
+-static inline void pgtable_pmd_page_dtor(struct page *page) {}
++static inline bool pmd_ptlock_init(struct page *page) { return true; }
++static inline void pmd_ptlock_free(struct page *page) {}
+ 
+ #define pmd_huge_pte(mm, pmd) ((mm)->pmd_huge_pte)
+ 
+@@ -2131,6 +2131,22 @@ static inline spinlock_t *pmd_lock(struct mm_struct *mm, pmd_t *pmd)
+ 	return ptl;
+ }
+ 
++static inline bool pgtable_pmd_page_ctor(struct page *page)
++{
++	if (!pmd_ptlock_init(page))
++		return false;
++	__SetPageTable(page);
++	inc_zone_page_state(page, NR_PAGETABLE);
++	return true;
++}
++
++static inline void pgtable_pmd_page_dtor(struct page *page)
++{
++	pmd_ptlock_free(page);
++	__ClearPageTable(page);
++	dec_zone_page_state(page, NR_PAGETABLE);
++}
++
+ /*
+  * No scalability reason to split PUD locks yet, but follow the same pattern
+  * as the PMD locks to make it easier if we decide to.  The VM should not be
