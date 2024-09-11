@@ -1,0 +1,200 @@
+iommu/vt-d: debugfs: Add support to show inv queue internals
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 4c0fa5bfca7eba479002f0a1ecd1bf7631b2f5da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4c0fa5bf.failed
+
+Export invalidation queue internals of each iommu device through the
+debugfs.
+
+Example of such dump on a Skylake machine:
+
+$ sudo cat /sys/kernel/debug/iommu/intel/invalidation_queue
+Invalidation queue on IOMMU: dmar1
+ Base: 0x1672c9000      Head: 80        Tail: 80
+Index           qw0                     qw1                     status
+    0   0000000000000004        0000000000000000        0000000000000000
+    1   0000000200000025        00000001672be804        0000000000000000
+    2   0000000000000011        0000000000000000        0000000000000000
+    3   0000000200000025        00000001672be80c        0000000000000000
+    4   00000000000000d2        0000000000000000        0000000000000000
+    5   0000000200000025        00000001672be814        0000000000000000
+    6   0000000000000014        0000000000000000        0000000000000000
+    7   0000000200000025        00000001672be81c        0000000000000000
+    8   0000000000000014        0000000000000000        0000000000000000
+    9   0000000200000025        00000001672be824        0000000000000000
+
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Link: https://lore.kernel.org/r/20200516062101.29541-14-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 4c0fa5bfca7eba479002f0a1ecd1bf7631b2f5da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu-debugfs.c
+diff --cc drivers/iommu/intel-iommu-debugfs.c
+index bdf095e9dbe0,cf1ebb98e418..000000000000
+--- a/drivers/iommu/intel-iommu-debugfs.c
++++ b/drivers/iommu/intel-iommu-debugfs.c
+@@@ -300,6 -301,137 +300,140 @@@ static int dmar_translation_struct_show
+  }
+  DEFINE_SHOW_ATTRIBUTE(dmar_translation_struct);
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned long level_to_directory_size(int level)
++ {
++ 	return BIT_ULL(VTD_PAGE_SHIFT + VTD_STRIDE_SHIFT * (level - 1));
++ }
++ 
++ static inline void
++ dump_page_info(struct seq_file *m, unsigned long iova, u64 *path)
++ {
++ 	seq_printf(m, "0x%013lx |\t0x%016llx\t0x%016llx\t0x%016llx\t0x%016llx\t0x%016llx\n",
++ 		   iova >> VTD_PAGE_SHIFT, path[5], path[4],
++ 		   path[3], path[2], path[1]);
++ }
++ 
++ static void pgtable_walk_level(struct seq_file *m, struct dma_pte *pde,
++ 			       int level, unsigned long start,
++ 			       u64 *path)
++ {
++ 	int i;
++ 
++ 	if (level > 5 || level < 1)
++ 		return;
++ 
++ 	for (i = 0; i < BIT_ULL(VTD_STRIDE_SHIFT);
++ 			i++, pde++, start += level_to_directory_size(level)) {
++ 		if (!dma_pte_present(pde))
++ 			continue;
++ 
++ 		path[level] = pde->val;
++ 		if (dma_pte_superpage(pde) || level == 1)
++ 			dump_page_info(m, start, path);
++ 		else
++ 			pgtable_walk_level(m, phys_to_virt(dma_pte_addr(pde)),
++ 					   level - 1, start, path);
++ 		path[level] = 0;
++ 	}
++ }
++ 
++ static int show_device_domain_translation(struct device *dev, void *data)
++ {
++ 	struct dmar_domain *domain = find_domain(dev);
++ 	struct seq_file *m = data;
++ 	u64 path[6] = { 0 };
++ 
++ 	if (!domain)
++ 		return 0;
++ 
++ 	seq_printf(m, "Device %s with pasid %d @0x%llx\n",
++ 		   dev_name(dev), domain->default_pasid,
++ 		   (u64)virt_to_phys(domain->pgd));
++ 	seq_puts(m, "IOVA_PFN\t\tPML5E\t\t\tPML4E\t\t\tPDPE\t\t\tPDE\t\t\tPTE\n");
++ 
++ 	pgtable_walk_level(m, domain->pgd, domain->agaw + 2, 0, path);
++ 	seq_putc(m, '\n');
++ 
++ 	return 0;
++ }
++ 
++ static int domain_translation_struct_show(struct seq_file *m, void *unused)
++ {
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	spin_lock_irqsave(&device_domain_lock, flags);
++ 	ret = bus_for_each_dev(&pci_bus_type, NULL, m,
++ 			       show_device_domain_translation);
++ 	spin_unlock_irqrestore(&device_domain_lock, flags);
++ 
++ 	return ret;
++ }
++ DEFINE_SHOW_ATTRIBUTE(domain_translation_struct);
++ 
++ static void invalidation_queue_entry_show(struct seq_file *m,
++ 					  struct intel_iommu *iommu)
++ {
++ 	int index, shift = qi_shift(iommu);
++ 	struct qi_desc *desc;
++ 	int offset;
++ 
++ 	if (ecap_smts(iommu->ecap))
++ 		seq_puts(m, "Index\t\tqw0\t\t\tqw1\t\t\tqw2\t\t\tqw3\t\t\tstatus\n");
++ 	else
++ 		seq_puts(m, "Index\t\tqw0\t\t\tqw1\t\t\tstatus\n");
++ 
++ 	for (index = 0; index < QI_LENGTH; index++) {
++ 		offset = index << shift;
++ 		desc = iommu->qi->desc + offset;
++ 		if (ecap_smts(iommu->ecap))
++ 			seq_printf(m, "%5d\t%016llx\t%016llx\t%016llx\t%016llx\t%016x\n",
++ 				   index, desc->qw0, desc->qw1,
++ 				   desc->qw2, desc->qw3,
++ 				   iommu->qi->desc_status[index]);
++ 		else
++ 			seq_printf(m, "%5d\t%016llx\t%016llx\t%016x\n",
++ 				   index, desc->qw0, desc->qw1,
++ 				   iommu->qi->desc_status[index]);
++ 	}
++ }
++ 
++ static int invalidation_queue_show(struct seq_file *m, void *unused)
++ {
++ 	struct dmar_drhd_unit *drhd;
++ 	struct intel_iommu *iommu;
++ 	unsigned long flags;
++ 	struct q_inval *qi;
++ 	int shift;
++ 
++ 	rcu_read_lock();
++ 	for_each_active_iommu(iommu, drhd) {
++ 		qi = iommu->qi;
++ 		shift = qi_shift(iommu);
++ 
++ 		if (!qi || !ecap_qis(iommu->ecap))
++ 			continue;
++ 
++ 		seq_printf(m, "Invalidation queue on IOMMU: %s\n", iommu->name);
++ 
++ 		raw_spin_lock_irqsave(&qi->q_lock, flags);
++ 		seq_printf(m, " Base: 0x%llx\tHead: %lld\tTail: %lld\n",
++ 			   (u64)virt_to_phys(qi->desc),
++ 			   dmar_readq(iommu->reg + DMAR_IQH_REG) >> shift,
++ 			   dmar_readq(iommu->reg + DMAR_IQT_REG) >> shift);
++ 		invalidation_queue_entry_show(m, iommu);
++ 		raw_spin_unlock_irqrestore(&qi->q_lock, flags);
++ 		seq_putc(m, '\n');
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return 0;
++ }
++ DEFINE_SHOW_ATTRIBUTE(invalidation_queue);
++ 
+++>>>>>>> 4c0fa5bfca7e (iommu/vt-d: debugfs: Add support to show inv queue internals)
+  #ifdef CONFIG_IRQ_REMAP
+  static void ir_tbl_remap_entry_show(struct seq_file *m,
+  				    struct intel_iommu *iommu)
+@@@ -415,6 -547,11 +549,14 @@@ void __init intel_iommu_debugfs_init(vo
+  			    &iommu_regset_fops);
+  	debugfs_create_file("dmar_translation_struct", 0444, intel_iommu_debug,
+  			    NULL, &dmar_translation_struct_fops);
+++<<<<<<< HEAD
+++=======
++ 	debugfs_create_file("domain_translation_struct", 0444,
++ 			    intel_iommu_debug, NULL,
++ 			    &domain_translation_struct_fops);
++ 	debugfs_create_file("invalidation_queue", 0444, intel_iommu_debug,
++ 			    NULL, &invalidation_queue_fops);
+++>>>>>>> 4c0fa5bfca7e (iommu/vt-d: debugfs: Add support to show inv queue internals)
+  #ifdef CONFIG_IRQ_REMAP
+  	debugfs_create_file("ir_translation_struct", 0444, intel_iommu_debug,
+  			    NULL, &ir_translation_struct_fops);
+* Unmerged path drivers/iommu/intel-iommu-debugfs.c
