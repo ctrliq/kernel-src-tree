@@ -1,0 +1,345 @@
+RDMA/mlx5: Set lag tx affinity according to slave
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit cfc1a89e449c02207952c72a4c0394691fdedf43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cfc1a89e.failed
+
+The patch sets the lag tx affinity of the data QPs and the GSI QPs
+according to the LAG xmit slave.
+
+For GSI QPs, in case the link layer is Ethenet (RoCE) we create two GSI
+QPs, one for each physical port. When the driver selects the GSI QP, it
+will consider the port affinity result.  For connected QPs, the driver
+sets the affinity of the xmit slave.
+
+The above, ensures that RC QP and it's corresponding GSI QP will transmit
+from the same physical port.
+
+Link: https://lore.kernel.org/r/20200430192146.12863-17-maorg@mellanox.com
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit cfc1a89e449c02207952c72a4c0394691fdedf43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 08f1eef60c1f,810bbd52daec..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -3388,26 -3593,63 +3394,77 @@@ static unsigned int get_tx_affinity(str
+  {
+  	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
+  		udata, struct mlx5_ib_ucontext, ibucontext);
+ -	u8 port_num = mlx5_core_native_port_num(dev->mdev) - 1;
+ -	atomic_t *tx_port_affinity;
+ -
+ +	unsigned int tx_port_affinity;
+ +
+++<<<<<<< HEAD
+ +	if (ucontext) {
+ +		tx_port_affinity = (unsigned int)atomic_add_return(
+ +					   1, &ucontext->tx_port_affinity) %
+ +					   MLX5_MAX_PORTS +
+ +				   1;
+++=======
++ 	if (ucontext)
++ 		tx_port_affinity = &ucontext->tx_port_affinity;
++ 	else
++ 		tx_port_affinity = &dev->port[port_num].roce.tx_port_affinity;
++ 
++ 	return (unsigned int)atomic_add_return(1, tx_port_affinity) %
++ 		MLX5_MAX_PORTS + 1;
++ }
++ 
++ static bool qp_supports_affinity(struct ib_qp *qp)
++ {
++ 	if ((qp->qp_type == IB_QPT_RC) ||
++ 	    (qp->qp_type == IB_QPT_UD) ||
++ 	    (qp->qp_type == IB_QPT_UC) ||
++ 	    (qp->qp_type == IB_QPT_RAW_PACKET) ||
++ 	    (qp->qp_type == IB_QPT_XRC_INI) ||
++ 	    (qp->qp_type == IB_QPT_XRC_TGT))
++ 		return true;
++ 	return false;
++ }
++ 
++ static unsigned int get_tx_affinity(struct ib_qp *qp,
++ 				    const struct ib_qp_attr *attr,
++ 				    int attr_mask, u8 init,
++ 				    struct ib_udata *udata)
++ {
++ 	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
++ 		udata, struct mlx5_ib_ucontext, ibucontext);
++ 	struct mlx5_ib_dev *dev = to_mdev(qp->device);
++ 	struct mlx5_ib_qp *mqp = to_mqp(qp);
++ 	struct mlx5_ib_qp_base *qp_base;
++ 	unsigned int tx_affinity;
++ 
++ 	if (!(dev->lag_active && qp_supports_affinity(qp)))
++ 		return 0;
++ 
++ 	if (mqp->flags & MLX5_IB_QP_CREATE_SQPN_QP1)
++ 		tx_affinity = mqp->gsi_lag_port;
++ 	else if (init)
++ 		tx_affinity = get_tx_affinity_rr(dev, udata);
++ 	else if ((attr_mask & IB_QP_AV) && attr->xmit_slave)
++ 		tx_affinity =
++ 			mlx5_lag_get_slave_port(dev->mdev, attr->xmit_slave);
++ 	else
++ 		return 0;
++ 
++ 	qp_base = &mqp->trans_qp.base;
++ 	if (ucontext)
+++>>>>>>> cfc1a89e449c (RDMA/mlx5: Set lag tx affinity according to slave)
+  		mlx5_ib_dbg(dev, "Set tx affinity 0x%x to qpn 0x%x ucontext %p\n",
+ -			    tx_affinity, qp_base->mqp.qpn, ucontext);
+ -	else
+ +				tx_port_affinity, qp_base->mqp.qpn, ucontext);
+ +	} else {
+ +		tx_port_affinity =
+ +			(unsigned int)atomic_add_return(
+ +				1, &dev->port[port_num].roce.tx_port_affinity) %
+ +				MLX5_MAX_PORTS +
+ +			1;
+  		mlx5_ib_dbg(dev, "Set tx affinity 0x%x to qpn 0x%x\n",
+ -			    tx_affinity, qp_base->mqp.qpn);
+ -	return tx_affinity;
+ +				tx_port_affinity, qp_base->mqp.qpn);
+ +	}
+ +
+ +	return tx_port_affinity;
+  }
+  
+  static int __mlx5_ib_qp_set_counter(struct ib_qp *qp,
+@@@ -3518,21 -3759,14 +3575,32 @@@ static int __mlx5_ib_modify_qp(struct i
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if ((cur_state == IB_QPS_RESET) && (new_state == IB_QPS_INIT)) {
+ +		if ((ibqp->qp_type == IB_QPT_RC) ||
+ +		    (ibqp->qp_type == IB_QPT_UD &&
+ +		     !(qp->flags & MLX5_IB_QP_SQPN_QP1)) ||
+ +		    (ibqp->qp_type == IB_QPT_UC) ||
+ +		    (ibqp->qp_type == IB_QPT_RAW_PACKET) ||
+ +		    (ibqp->qp_type == IB_QPT_XRC_INI) ||
+ +		    (ibqp->qp_type == IB_QPT_XRC_TGT)) {
+ +			if (dev->lag_active) {
+ +				u8 p = mlx5_core_native_port_num(dev->mdev) - 1;
+ +				tx_affinity = get_tx_affinity(dev, pd, base, p,
+ +							      udata);
+ +				context->flags |= cpu_to_be32(tx_affinity << 24);
+ +			}
+ +		}
+++=======
++ 	tx_affinity = get_tx_affinity(ibqp, attr, attr_mask,
++ 				      cur_state == IB_QPS_RESET &&
++ 				      new_state == IB_QPS_INIT, udata);
++ 	if (tx_affinity) {
++ 		context->flags |= cpu_to_be32(tx_affinity << 24);
++ 		if (new_state == IB_QPS_RTR &&
++ 		    MLX5_CAP_GEN(dev->mdev, init2_lag_tx_port_affinity))
++ 			optpar |= MLX5_QP_OPTPAR_LAG_TX_AFF;
+++>>>>>>> cfc1a89e449c (RDMA/mlx5: Set lag tx affinity according to slave)
+  	}
+  
+  	if (is_sqp(ibqp->qp_type)) {
+diff --git a/drivers/infiniband/hw/mlx5/ah.c b/drivers/infiniband/hw/mlx5/ah.c
+index 80642dd359bc..e425a2bffe40 100644
+--- a/drivers/infiniband/hw/mlx5/ah.c
++++ b/drivers/infiniband/hw/mlx5/ah.c
+@@ -33,8 +33,9 @@
+ #include "mlx5_ib.h"
+ 
+ static void create_ib_ah(struct mlx5_ib_dev *dev, struct mlx5_ib_ah *ah,
+-			 struct rdma_ah_attr *ah_attr)
++			 struct rdma_ah_init_attr *init_attr)
+ {
++	struct rdma_ah_attr *ah_attr = init_attr->ah_attr;
+ 	enum ib_gid_type gid_type;
+ 
+ 	if (rdma_ah_get_ah_flags(ah_attr) & IB_AH_GRH) {
+@@ -51,6 +52,10 @@ static void create_ib_ah(struct mlx5_ib_dev *dev, struct mlx5_ib_ah *ah,
+ 	ah->av.stat_rate_sl = (rdma_ah_get_static_rate(ah_attr) << 4);
+ 
+ 	if (ah_attr->type == RDMA_AH_ATTR_TYPE_ROCE) {
++		if (init_attr->xmit_slave)
++			ah->xmit_port =
++				mlx5_lag_get_slave_port(dev->mdev,
++							init_attr->xmit_slave);
+ 		gid_type = ah_attr->grh.sgid_attr->gid_type;
+ 
+ 		memcpy(ah->av.rmac, ah_attr->roce.dmac,
+@@ -97,7 +102,7 @@ int mlx5_ib_create_ah(struct ib_ah *ibah, struct rdma_ah_attr *ah_attr,
+ 			return err;
+ 	}
+ 
+-	create_ib_ah(dev, ah, ah_attr);
++	create_ib_ah(dev, ah, init_attr);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/infiniband/hw/mlx5/gsi.c b/drivers/infiniband/hw/mlx5/gsi.c
+index 1afbf03d1a98..40d418153891 100644
+--- a/drivers/infiniband/hw/mlx5/gsi.c
++++ b/drivers/infiniband/hw/mlx5/gsi.c
+@@ -119,10 +119,17 @@ struct ib_qp *mlx5_ib_gsi_create_qp(struct ib_pd *pd,
+ 	struct mlx5_ib_gsi_qp *gsi;
+ 	struct ib_qp_init_attr hw_init_attr = *init_attr;
+ 	const u8 port_num = init_attr->port_num;
+-	const int num_pkeys = pd->device->attrs.max_pkeys;
+-	const int num_qps = mlx5_ib_deth_sqpn_cap(dev) ? num_pkeys : 0;
++	int num_qps = 0;
+ 	int ret;
+ 
++	if (mlx5_ib_deth_sqpn_cap(dev)) {
++		if (MLX5_CAP_GEN(dev->mdev,
++				 port_type) == MLX5_CAP_PORT_TYPE_IB)
++			num_qps = pd->device->attrs.max_pkeys;
++		else if (dev->lag_active)
++			num_qps = MLX5_MAX_PORTS;
++	}
++
+ 	gsi = kzalloc(sizeof(*gsi), GFP_KERNEL);
+ 	if (!gsi)
+ 		return ERR_PTR(-ENOMEM);
+@@ -261,7 +268,7 @@ static struct ib_qp *create_gsi_ud_qp(struct mlx5_ib_gsi_qp *gsi)
+ }
+ 
+ static int modify_to_rts(struct mlx5_ib_gsi_qp *gsi, struct ib_qp *qp,
+-			 u16 qp_index)
++			 u16 pkey_index)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(qp->device);
+ 	struct ib_qp_attr attr;
+@@ -270,7 +277,7 @@ static int modify_to_rts(struct mlx5_ib_gsi_qp *gsi, struct ib_qp *qp,
+ 
+ 	mask = IB_QP_STATE | IB_QP_PKEY_INDEX | IB_QP_QKEY | IB_QP_PORT;
+ 	attr.qp_state = IB_QPS_INIT;
+-	attr.pkey_index = qp_index;
++	attr.pkey_index = pkey_index;
+ 	attr.qkey = IB_QP1_QKEY;
+ 	attr.port_num = gsi->port_num;
+ 	ret = ib_modify_qp(qp, &attr, mask);
+@@ -304,12 +311,17 @@ static void setup_qp(struct mlx5_ib_gsi_qp *gsi, u16 qp_index)
+ {
+ 	struct ib_device *device = gsi->rx_qp->device;
+ 	struct mlx5_ib_dev *dev = to_mdev(device);
++	int pkey_index = qp_index;
++	struct mlx5_ib_qp *mqp;
+ 	struct ib_qp *qp;
+ 	unsigned long flags;
+ 	u16 pkey;
+ 	int ret;
+ 
+-	ret = ib_query_pkey(device, gsi->port_num, qp_index, &pkey);
++	if (MLX5_CAP_GEN(dev->mdev,  port_type) != MLX5_CAP_PORT_TYPE_IB)
++		pkey_index = 0;
++
++	ret = ib_query_pkey(device, gsi->port_num, pkey_index, &pkey);
+ 	if (ret) {
+ 		mlx5_ib_warn(dev, "unable to read P_Key at port %d, index %d\n",
+ 			     gsi->port_num, qp_index);
+@@ -338,7 +350,10 @@ static void setup_qp(struct mlx5_ib_gsi_qp *gsi, u16 qp_index)
+ 		return;
+ 	}
+ 
+-	ret = modify_to_rts(gsi, qp, qp_index);
++	mqp = to_mqp(qp);
++	if (dev->lag_active)
++		mqp->gsi_lag_port = qp_index + 1;
++	ret = modify_to_rts(gsi, qp, pkey_index);
+ 	if (ret)
+ 		goto err_destroy_qp;
+ 
+@@ -457,11 +472,15 @@ static int mlx5_ib_gsi_silent_drop(struct mlx5_ib_gsi_qp *gsi,
+ static struct ib_qp *get_tx_qp(struct mlx5_ib_gsi_qp *gsi, struct ib_ud_wr *wr)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(gsi->rx_qp->device);
++	struct mlx5_ib_ah *ah = to_mah(wr->ah);
+ 	int qp_index = wr->pkey_index;
+ 
+-	if (!mlx5_ib_deth_sqpn_cap(dev))
++	if (!gsi->num_qps)
+ 		return gsi->rx_qp;
+ 
++	if (dev->lag_active && ah->xmit_port)
++		qp_index = ah->xmit_port - 1;
++
+ 	if (qp_index >= gsi->num_qps)
+ 		return NULL;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 27d39c72d342..b4e1ab747ca5 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -56,6 +56,7 @@
+ #include <linux/list.h>
+ #include <rdma/ib_smi.h>
+ #include <rdma/ib_umem.h>
++#include <rdma/lag.h>
+ #include <linux/in.h>
+ #include <linux/etherdevice.h>
+ #include "mlx5_ib.h"
+@@ -6560,6 +6561,7 @@ static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+ 	dev->ib_dev.phys_port_cnt	= dev->num_ports;
+ 	dev->ib_dev.num_comp_vectors    = mlx5_comp_vectors_count(mdev);
+ 	dev->ib_dev.dev.parent		= mdev->device;
++	dev->ib_dev.lag_flags		= RDMA_LAG_FLAGS_HASH_ALL_SLAVES;
+ 
+ 	mutex_init(&dev->cap_mask_mutex);
+ 	INIT_LIST_HEAD(&dev->qp_list);
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index aeb1ba589e09..50bdfe5228d6 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -439,6 +439,7 @@ struct mlx5_ib_qp {
+ 	 * but not take effective
+ 	 */
+ 	u32                     counter_pending;
++	u16			gsi_lag_port;
+ };
+ 
+ struct mlx5_ib_cq_buf {
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
+diff --git a/include/linux/mlx5/mlx5_ifc.h b/include/linux/mlx5/mlx5_ifc.h
+index a90701facb29..cbec2b37e2a3 100644
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@ -1321,7 +1321,9 @@ struct mlx5_ifc_cmd_hca_cap_bits {
+ 	u8         stat_rate_support[0x10];
+ 	u8         reserved_at_1f0[0x1];
+ 	u8         pci_sync_for_fw_update_event[0x1];
+-	u8         reserved_at_1f2[0xa];
++	u8         reserved_at_1f2[0x6];
++	u8         init2_lag_tx_port_affinity[0x1];
++	u8         reserved_at_1fa[0x3];
+ 	u8         cqe_version[0x4];
+ 
+ 	u8         compact_address_vector[0x1];
+diff --git a/include/linux/mlx5/qp.h b/include/linux/mlx5/qp.h
+index f23eb18526fe..b9facdb9b9bd 100644
+--- a/include/linux/mlx5/qp.h
++++ b/include/linux/mlx5/qp.h
+@@ -66,6 +66,7 @@ enum mlx5_qp_optpar {
+ 	MLX5_QP_OPTPAR_RETRY_COUNT		= 1 << 12,
+ 	MLX5_QP_OPTPAR_RNR_RETRY		= 1 << 13,
+ 	MLX5_QP_OPTPAR_ACK_TIMEOUT		= 1 << 14,
++	MLX5_QP_OPTPAR_LAG_TX_AFF		= 1 << 15,
+ 	MLX5_QP_OPTPAR_PRI_PORT			= 1 << 16,
+ 	MLX5_QP_OPTPAR_SRQN			= 1 << 18,
+ 	MLX5_QP_OPTPAR_CQN_RCV			= 1 << 19,
+@@ -321,6 +322,7 @@ struct mlx5_av {
+ struct mlx5_ib_ah {
+ 	struct ib_ah		ibah;
+ 	struct mlx5_av		av;
++	u8			xmit_port;
+ };
+ 
+ static inline struct mlx5_ib_ah *to_mah(struct ib_ah *ibah)
