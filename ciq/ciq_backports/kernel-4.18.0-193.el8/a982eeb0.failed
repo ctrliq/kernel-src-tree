@@ -1,0 +1,156 @@
+io_uring: fix an issue when IOSQE_IO_LINK is inserted into defer list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jackie Liu <liuyun01@kylinos.cn>
+commit a982eeb09b6030e567b8b815277c8c9197168040
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a982eeb0.failed
+
+This patch may fix two issues:
+
+First, when IOSQE_IO_DRAIN set, the next IOs need to be inserted into
+defer list to delay execution, but link io will be actively scheduled to
+run by calling io_queue_sqe.
+
+Second, when multiple LINK_IOs are inserted together with defer_list,
+the LINK_IO is no longer keep order.
+
+   |-------------|
+   |   LINK_IO   |      ----> insert to defer_list  -----------
+   |-------------|                                            |
+   |   LINK_IO   |      ----> insert to defer_list  ----------|
+   |-------------|                                            |
+   |   LINK_IO   |      ----> insert to defer_list  ----------|
+   |-------------|                                            |
+   |   NORMAL_IO |      ----> insert to defer_list  ----------|
+   |-------------|                                            |
+                                                              |
+                              queue_work at same time   <-----|
+
+Fixes: 9e645e1105c ("io_uring: add support for sqe links")
+	Signed-off-by: Jackie Liu <liuyun01@kylinos.cn>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a982eeb09b6030e567b8b815277c8c9197168040)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 04d84e0c97fb,24bbe3cb7ad4..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1922,29 -2018,18 +1922,39 @@@ static int io_req_set_file(struct io_ri
+  	return 0;
+  }
+  
+ -static int io_queue_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ -			struct sqe_submit *s)
+ +static int io_submit_sqe(struct io_ring_ctx *ctx, struct sqe_submit *s,
+ +			 struct io_submit_state *state)
+  {
+ +	struct io_kiocb *req;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	/* enforce forwards compatibility on users */
+ +	if (unlikely(s->sqe->flags & ~(IOSQE_FIXED_FILE | IOSQE_IO_DRAIN)))
+ +		return -EINVAL;
+ +
+ +	req = io_get_req(ctx, state);
+ +	if (unlikely(!req))
+ +		return -EAGAIN;
+ +
+ +	ret = io_req_set_file(ctx, s, state, req);
+ +	if (unlikely(ret))
+ +		goto out;
+ +
+ +	ret = io_req_defer(ctx, req, s->sqe);
+ +	if (ret) {
+ +		if (ret == -EIOCBQUEUED)
+ +			ret = 0;
+ +		return ret;
+++=======
++ 	ret = io_req_defer(ctx, req, s->sqe);
++ 	if (ret) {
++ 		if (ret != -EIOCBQUEUED) {
++ 			io_free_req(req);
++ 			io_cqring_add_event(ctx, s->sqe->user_data, ret);
++ 		}
++ 		return 0;
+++>>>>>>> a982eeb09b60 (io_uring: fix an issue when IOSQE_IO_LINK is inserted into defer list)
+  	}
+  
+  	ret = __io_submit_sqe(ctx, req, s, true);
+@@@ -1987,6 -2074,66 +1997,69 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK)
++ 
++ static void io_submit_sqe(struct io_ring_ctx *ctx, struct sqe_submit *s,
++ 			  struct io_submit_state *state, struct io_kiocb **link)
++ {
++ 	struct io_uring_sqe *sqe_copy;
++ 	struct io_kiocb *req;
++ 	int ret;
++ 
++ 	/* enforce forwards compatibility on users */
++ 	if (unlikely(s->sqe->flags & ~SQE_VALID_FLAGS)) {
++ 		ret = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	req = io_get_req(ctx, state);
++ 	if (unlikely(!req)) {
++ 		ret = -EAGAIN;
++ 		goto err;
++ 	}
++ 
++ 	ret = io_req_set_file(ctx, s, state, req);
++ 	if (unlikely(ret)) {
++ err_req:
++ 		io_free_req(req);
++ err:
++ 		io_cqring_add_event(ctx, s->sqe->user_data, ret);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * If we already have a head request, queue this one for async
++ 	 * submittal once the head completes. If we don't have a head but
++ 	 * IOSQE_IO_LINK is set in the sqe, start a new head. This one will be
++ 	 * submitted sync once the chain is complete. If none of those
++ 	 * conditions are true (normal request), then just queue it.
++ 	 */
++ 	if (*link) {
++ 		struct io_kiocb *prev = *link;
++ 
++ 		sqe_copy = kmemdup(s->sqe, sizeof(*sqe_copy), GFP_KERNEL);
++ 		if (!sqe_copy) {
++ 			ret = -EAGAIN;
++ 			goto err_req;
++ 		}
++ 
++ 		s->sqe = sqe_copy;
++ 		memcpy(&req->submit, s, sizeof(*s));
++ 		list_add_tail(&req->list, &prev->link_list);
++ 	} else if (s->sqe->flags & IOSQE_IO_LINK) {
++ 		req->flags |= REQ_F_LINK;
++ 
++ 		memcpy(&req->submit, s, sizeof(*s));
++ 		INIT_LIST_HEAD(&req->link_list);
++ 		*link = req;
++ 	} else {
++ 		io_queue_sqe(ctx, req, s);
++ 	}
++ }
++ 
+++>>>>>>> a982eeb09b60 (io_uring: fix an issue when IOSQE_IO_LINK is inserted into defer list)
+  /*
+   * Batched submission is done, ensure local IO is flushed out.
+   */
+* Unmerged path fs/io_uring.c
