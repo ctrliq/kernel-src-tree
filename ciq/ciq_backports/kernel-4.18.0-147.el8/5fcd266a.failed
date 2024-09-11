@@ -1,0 +1,178 @@
+net/ipv4: Add support for dumping addresses for a specific device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] ipv4: Add support for dumping addresses for a specific device (Petr Oros) [1700306]
+Rebuild_FUZZ: 96.83%
+commit-author David Ahern <dsahern@gmail.com>
+commit 5fcd266a9f64bc75707f7ddc96427f2e8caaacd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5fcd266a.failed
+
+If an RTM_GETADDR dump request has ifa_index set in the ifaddrmsg
+header, then return only the addresses for that device.
+
+	Signed-off-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5fcd266a9f64bc75707f7ddc96427f2e8caaacd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/devinet.c
+diff --cc net/ipv4/devinet.c
+index 6c015dfe13b4,63d5b58fbfdb..000000000000
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@@ -1659,11 -1661,94 +1660,96 @@@ nla_put_failure
+  	return -EMSGSIZE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int inet_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
++ 				      struct inet_fill_args *fillargs,
++ 				      struct net **tgt_net, struct sock *sk,
++ 				      struct netlink_callback *cb)
++ {
++ 	struct netlink_ext_ack *extack = cb->extack;
++ 	struct nlattr *tb[IFA_MAX+1];
++ 	struct ifaddrmsg *ifm;
++ 	int err, i;
++ 
++ 	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ifm))) {
++ 		NL_SET_ERR_MSG(extack, "ipv4: Invalid header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ifm = nlmsg_data(nlh);
++ 	if (ifm->ifa_prefixlen || ifm->ifa_flags || ifm->ifa_scope) {
++ 		NL_SET_ERR_MSG(extack, "ipv4: Invalid values in header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	fillargs->ifindex = ifm->ifa_index;
++ 	if (fillargs->ifindex) {
++ 		cb->answer_flags |= NLM_F_DUMP_FILTERED;
++ 		fillargs->flags |= NLM_F_DUMP_FILTERED;
++ 	}
++ 
++ 	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
++ 				 ifa_ipv4_policy, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	for (i = 0; i <= IFA_MAX; ++i) {
++ 		if (!tb[i])
++ 			continue;
++ 
++ 		if (i == IFA_TARGET_NETNSID) {
++ 			struct net *net;
++ 
++ 			fillargs->netnsid = nla_get_s32(tb[i]);
++ 
++ 			net = rtnl_get_net_ns_capable(sk, fillargs->netnsid);
++ 			if (IS_ERR(net)) {
++ 				NL_SET_ERR_MSG(extack, "ipv4: Invalid target network namespace id");
++ 				return PTR_ERR(net);
++ 			}
++ 			*tgt_net = net;
++ 		} else {
++ 			NL_SET_ERR_MSG(extack, "ipv4: Unsupported attribute in dump request");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int in_dev_dump_addr(struct in_device *in_dev, struct sk_buff *skb,
++ 			    struct netlink_callback *cb, int s_ip_idx,
++ 			    struct inet_fill_args *fillargs)
++ {
++ 	struct in_ifaddr *ifa;
++ 	int ip_idx = 0;
++ 	int err;
++ 
++ 	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next, ip_idx++) {
++ 		if (ip_idx < s_ip_idx)
++ 			continue;
++ 
++ 		err = inet_fill_ifaddr(skb, ifa, fillargs);
++ 		if (err < 0)
++ 			goto done;
++ 
++ 		nl_dump_check_consistent(cb, nlmsg_hdr(skb));
++ 	}
++ 	err = 0;
++ 
++ done:
++ 	cb->args[2] = ip_idx;
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 5fcd266a9f64 (net/ipv4: Add support for dumping addresses for a specific device)
+  static int inet_dump_ifaddr(struct sk_buff *skb, struct netlink_callback *cb)
+  {
+ -	const struct nlmsghdr *nlh = cb->nlh;
+  	struct inet_fill_args fillargs = {
+  		.portid = NETLINK_CB(cb->skb).portid,
+ -		.seq = nlh->nlmsg_seq,
+ +		.seq = cb->nlh->nlmsg_seq,
+  		.event = RTM_NEWADDR,
+  		.flags = NLM_F_MULTI,
+  		.netnsid = -1,
+@@@ -1681,17 -1764,26 +1767,37 @@@
+  
+  	s_h = cb->args[0];
+  	s_idx = idx = cb->args[1];
+ -	s_ip_idx = cb->args[2];
+ -
+ +	s_ip_idx = ip_idx = cb->args[2];
+ +
+++<<<<<<< HEAD
+ +	if (nlmsg_parse(cb->nlh, sizeof(struct ifaddrmsg), tb, IFA_MAX,
+ +			ifa_ipv4_policy, NULL) >= 0) {
+ +		if (tb[IFA_TARGET_NETNSID]) {
+ +			fillargs.netnsid = nla_get_s32(tb[IFA_TARGET_NETNSID]);
+ +
+ +			tgt_net = rtnl_get_net_ns_capable(skb->sk,
+ +							  fillargs.netnsid);
+ +			if (IS_ERR(tgt_net))
+ +				return PTR_ERR(tgt_net);
+++=======
++ 	if (cb->strict_check) {
++ 		err = inet_valid_dump_ifaddr_req(nlh, &fillargs, &tgt_net,
++ 						 skb->sk, cb);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		if (fillargs.ifindex) {
++ 			dev = __dev_get_by_index(tgt_net, fillargs.ifindex);
++ 			if (!dev)
++ 				return -ENODEV;
++ 
++ 			in_dev = __in_dev_get_rtnl(dev);
++ 			if (in_dev) {
++ 				err = in_dev_dump_addr(in_dev, skb, cb, s_ip_idx,
++ 						       &fillargs);
++ 			}
++ 			goto put_tgt_net;
+++>>>>>>> 5fcd266a9f64 (net/ipv4: Add support for dumping addresses for a specific device)
+  		}
+  	}
+  
+@@@ -1729,7 -1817,7 +1835,11 @@@ cont
+  done:
+  	cb->args[0] = h;
+  	cb->args[1] = idx;
+++<<<<<<< HEAD
+ +	cb->args[2] = ip_idx;
+++=======
++ put_tgt_net:
+++>>>>>>> 5fcd266a9f64 (net/ipv4: Add support for dumping addresses for a specific device)
+  	if (fillargs.netnsid >= 0)
+  		put_net(tgt_net);
+  
+* Unmerged path net/ipv4/devinet.c
