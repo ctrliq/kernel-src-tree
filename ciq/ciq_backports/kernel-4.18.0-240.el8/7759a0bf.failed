@@ -1,0 +1,141 @@
+io_uring: fix extra put in sync_file_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 7759a0bfadceef3910d0e50f86d63b6ed58b4e70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7759a0bf.failed
+
+[   40.179474] refcount_t: underflow; use-after-free.
+[   40.179499] WARNING: CPU: 6 PID: 1848 at lib/refcount.c:28 refcount_warn_saturate+0xae/0xf0
+...
+[   40.179612] RIP: 0010:refcount_warn_saturate+0xae/0xf0
+[   40.179617] Code: 28 44 0a 01 01 e8 d7 01 c2 ff 0f 0b 5d c3 80 3d 15 44 0a 01 00 75 91 48 c7 c7 b8 f5 75 be c6 05 05 44 0a 01 01 e8 b7 01 c2 ff <0f> 0b 5d c3 80 3d f3 43 0a 01 00 0f 85 6d ff ff ff 48 c7 c7 10 f6
+[   40.179619] RSP: 0018:ffffb252423ebe18 EFLAGS: 00010286
+[   40.179623] RAX: 0000000000000000 RBX: ffff98d65e929400 RCX: 0000000000000000
+[   40.179625] RDX: 0000000000000001 RSI: 0000000000000086 RDI: 00000000ffffffff
+[   40.179627] RBP: ffffb252423ebe18 R08: 0000000000000001 R09: 000000000000055d
+[   40.179629] R10: 0000000000000c8c R11: 0000000000000001 R12: 0000000000000000
+[   40.179631] R13: ffff98d68c434400 R14: ffff98d6a9cbaa20 R15: ffff98d6a609ccb8
+[   40.179634] FS:  0000000000000000(0000) GS:ffff98d6af580000(0000) knlGS:0000000000000000
+[   40.179636] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   40.179638] CR2: 00000000033e3194 CR3: 000000006480a003 CR4: 00000000003606e0
+[   40.179641] Call Trace:
+[   40.179652]  io_put_req+0x36/0x40
+[   40.179657]  io_free_work+0x15/0x20
+[   40.179661]  io_worker_handle_work+0x2f5/0x480
+[   40.179667]  io_wqe_worker+0x2a9/0x360
+[   40.179674]  ? _raw_spin_unlock_irqrestore+0x24/0x40
+[   40.179681]  kthread+0x12c/0x170
+[   40.179685]  ? io_worker_handle_work+0x480/0x480
+[   40.179690]  ? kthread_park+0x90/0x90
+[   40.179695]  ret_from_fork+0x35/0x40
+[   40.179702] ---[ end trace 85027405f00110aa ]---
+
+Opcode handler must never put submission ref, but that's what
+io_sync_file_range_finish() do. use io_steal_work() there.
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 7759a0bfadceef3910d0e50f86d63b6ed58b4e70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,7f10af02c3d1..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1555,36 -2835,59 +1555,52 @@@ static int io_prep_sfr(struct io_kiocb 
+  	if (unlikely(sqe->addr || sqe->ioprio || sqe->buf_index))
+  		return -EINVAL;
+  
+ -	req->sync.flags = READ_ONCE(sqe->fsync_flags);
+ -	if (unlikely(req->sync.flags & ~IORING_FSYNC_DATASYNC))
+ -		return -EINVAL;
+ -
+ -	req->sync.off = READ_ONCE(sqe->off);
+ -	req->sync.len = READ_ONCE(sqe->len);
+ -	return 0;
+ -}
+ -
+ -static bool io_req_cancelled(struct io_kiocb *req)
+ -{
+ -	if (req->work.flags & IO_WQ_WORK_CANCEL) {
+ -		req_set_fail_links(req);
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ +	return ret;
+  }
+  
+ -static void __io_fsync(struct io_kiocb *req)
+ +static int io_sync_file_range(struct io_kiocb *req,
+ +			      const struct io_uring_sqe *sqe,
+ +			      bool force_nonblock)
+  {
+ -	loff_t end = req->sync.off + req->sync.len;
+ +	loff_t sqe_off;
+ +	loff_t sqe_len;
+ +	unsigned flags;
+  	int ret;
+  
+ -	ret = vfs_fsync_range(req->file, req->sync.off,
+ -				end > 0 ? end : LLONG_MAX,
+ -				req->sync.flags & IORING_FSYNC_DATASYNC);
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req(req);
+ -}
+ +	ret = io_prep_sfr(req, sqe);
+ +	if (ret)
+ +		return ret;
+  
+ -static void io_fsync_finish(struct io_wq_work **workptr)
+++<<<<<<< HEAD
+++=======
+++
+++static void io_sync_file_range_finish(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 
++ 	if (io_req_cancelled(req))
++ 		return;
+ -	__io_fsync(req);
+++	__io_sync_file_range(req);
++ 	io_steal_work(req, workptr);
++ }
++ 
+ -static int io_fsync(struct io_kiocb *req, bool force_nonblock)
+++static int io_sync_file_range(struct io_kiocb *req, bool force_nonblock)
++ {
+ -	/* fsync always requires a blocking context */
+ -	if (force_nonblock) {
+ -		req->work.func = io_fsync_finish;
+++>>>>>>> 7759a0bfadce (io_uring: fix extra put in sync_file_range())
+ +	/* sync_file_range always requires a blocking context */
+ +	if (force_nonblock)
+  		return -EAGAIN;
+ -	}
+ -	__io_fsync(req);
+ +
+ +	sqe_off = READ_ONCE(sqe->off);
+ +	sqe_len = READ_ONCE(sqe->len);
+ +	flags = READ_ONCE(sqe->sync_range_flags);
+ +
+ +	ret = sync_file_range(req->rw.ki_filp, sqe_off, sqe_len, flags);
+ +
+ +	if (ret < 0 && (req->flags & REQ_F_LINK))
+ +		req->flags |= REQ_F_FAIL_LINK;
+ +	io_cqring_add_event(req->ctx, sqe->user_data, ret);
+ +	io_put_req(req);
+  	return 0;
+  }
+  
+* Unmerged path fs/io_uring.c
