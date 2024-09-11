@@ -1,0 +1,106 @@
+xprtrdma: Close window between waking RPC senders and posting Receives
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 2ae50ad68cd79224198b525f7bd645c9da98b6ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2ae50ad6.failed
+
+A recent clean up attempted to separate Receive handling and RPC
+Reply processing, in the name of clean layering.
+
+Unfortunately, we can't do this because the Receive Queue has to be
+refilled _after_ the most recent credit update from the responder
+is parsed from the transport header, but _before_ we wake up the
+next RPC sender. That is right in the middle of
+rpcrdma_reply_handler().
+
+Usually this isn't a problem because current responder
+implementations don't vary their credit grant. The one exception is
+when a connection is established: the grant goes from one to a much
+larger number on the first Receive. The requester MUST post enough
+Receives right then so that any outstanding requests can be sent
+without risking RNR and connection loss.
+
+Fixes: 6ceea36890a0 ("xprtrdma: Refactor Receive accounting")
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 2ae50ad68cd79224198b525f7bd645c9da98b6ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 84b79f93c8f2,7c125e6cca4f..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -1350,12 -1390,9 +1350,18 @@@ void rpcrdma_reply_handler(struct rpcrd
+  		credits = 1;	/* don't deadlock */
+  	else if (credits > buf->rb_max_requests)
+  		credits = buf->rb_max_requests;
+++<<<<<<< HEAD
+ +	if (buf->rb_credits != credits) {
+ +		spin_lock_bh(&xprt->transport_lock);
+ +		buf->rb_credits = credits;
+ +		xprt->cwnd = credits << RPC_CWNDSHIFT;
+ +		spin_unlock_bh(&xprt->transport_lock);
+ +	}
+++=======
++ 	if (buf->rb_credits != credits)
++ 		rpcrdma_update_cwnd(r_xprt, credits);
++ 	rpcrdma_post_recvs(r_xprt, false);
+++>>>>>>> 2ae50ad68cd7 (xprtrdma: Close window between waking RPC senders and posting Receives)
+  
+  	req = rpcr_to_rdmar(rqst);
+  	if (req->rl_reply) {
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 078deea63c94..2870a3e73f54 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -81,7 +81,6 @@ rpcrdma_regbuf_alloc(size_t size, enum dma_data_direction direction,
+ 		     gfp_t flags);
+ static void rpcrdma_regbuf_dma_unmap(struct rpcrdma_regbuf *rb);
+ static void rpcrdma_regbuf_free(struct rpcrdma_regbuf *rb);
+-static void rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, bool temp);
+ 
+ /* Wait for outstanding transport work to finish. ib_drain_qp
+  * handles the drains in the wrong order for us, so open code
+@@ -169,7 +168,6 @@ rpcrdma_wc_receive(struct ib_cq *cq, struct ib_wc *wc)
+ 				   rdmab_addr(rep->rr_rdmabuf),
+ 				   wc->byte_len, DMA_FROM_DEVICE);
+ 
+-	rpcrdma_post_recvs(r_xprt, false);
+ 	rpcrdma_reply_handler(rep);
+ 	return;
+ 
+@@ -1487,8 +1485,13 @@ rpcrdma_ep_post(struct rpcrdma_ia *ia,
+ 	return 0;
+ }
+ 
+-static void
+-rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, bool temp)
++/**
++ * rpcrdma_post_recvs - Refill the Receive Queue
++ * @r_xprt: controlling transport instance
++ * @temp: mark Receive buffers to be deleted after use
++ *
++ */
++void rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, bool temp)
+ {
+ 	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+ 	struct rpcrdma_ep *ep = &r_xprt->rx_ep;
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 3d3c2b9bba6f..7f38b077b621 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -506,6 +506,7 @@ void rpcrdma_ep_disconnect(struct rpcrdma_ep *, struct rpcrdma_ia *);
+ 
+ int rpcrdma_ep_post(struct rpcrdma_ia *, struct rpcrdma_ep *,
+ 				struct rpcrdma_req *);
++void rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, bool temp);
+ 
+ /*
+  * Buffer calls - xprtrdma/verbs.c
