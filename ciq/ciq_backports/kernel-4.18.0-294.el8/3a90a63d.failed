@@ -1,0 +1,168 @@
+scsi: scsi_debug: every_nth triggered error injection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Douglas Gilbert <dgilbert@interlog.com>
+commit 3a90a63d02b8b7e8348d7549f55d24e1bb3a293f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3a90a63d.failed
+
+This patch simplifies, or at least makes more consistent, the way setting
+the every_nth parameter injects errors. Here is a list of 'opts' flags and
+in which cases they inject errors when abs(every_nth)%command_count == 0 is
+reached:
+
+  - OPT_RECOVERED_ERR: issued on READ(*)s, WRITE(*)s and
+                       WRITE_SCATTEREDs
+  - OPT_DIF_ERR:       issued on READ(*)s, WRITE(*)s and
+                       WRITE_SCATTEREDs
+  - OPT_DIX_ERR:       issued on READ(*)s, WRITE(*)s and
+                       WRITE_SCATTEREDs
+  - OPT_SHORT_TRANSFER: issued on READ(*)s
+  - OPT_TRANSPORT_ERR: issued on all commands
+  - OPT_CMD_ABORT:     issued on all commands
+
+The other uses of every_nth were not modified.
+
+Previously if, for example, OPT_SHORT_TRANSFER was armed then if
+(abs(every_nth) % command_count == 0) occurred during a command that was
+_not_ a READ, then no error injection occurred. This behaviour puzzled
+several testers. Now a global "inject_pending" flag is set and the _next_
+READ will get hit and that flag is cleared. OPT_RECOVERED_ERR, OPT_DIF_ERR
+and OPT_DIX_ERR have similar behaviour. A downside of this is that there
+might be a hang-over pending injection that gets triggered by a following
+test.
+
+Also expand the every_nth runtime parameter so that it can take hex value
+(i.e. with a leading '0x') as well as a decimal value. Now both the 'opts'
+and the 'every_nth' runtime parameters can take hexadecimal values.
+
+Link: https://lore.kernel.org/r/20200712182927.72044-2-dgilbert@interlog.com
+	Signed-off-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3a90a63d02b8b7e8348d7549f55d24e1bb3a293f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 820227007ec1,5eec23ae8948..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -2697,14 -3084,14 +2678,17 @@@ static int prot_verify_read(struct scsi
+  
+  static int resp_read_dt0(struct scsi_cmnd *scp, struct sdebug_dev_info *devip)
+  {
+ -	bool check_prot;
+ +	u8 *cmd = scp->cmnd;
+++<<<<<<< HEAD
+ +	struct sdebug_queued_cmd *sqcp;
+ +	u64 lba;
+  	u32 num;
+  	u32 ei_lba;
+ +	unsigned long iflags;
+  	int ret;
+ -	u64 lba;
+ -	struct sdeb_store_info *sip = devip2sip(devip, true);
+ -	rwlock_t *macc_lckp = sip ? &sip->macc_lck : &sdeb_fake_rw_lck;
+ -	u8 *cmd = scp->cmnd;
+ +	bool check_prot;
+++=======
+++>>>>>>> 3a90a63d02b8 (scsi: scsi_debug: every_nth triggered error injection)
+  
+  	switch (cmd[0]) {
+  	case READ_16:
+@@@ -4264,26 -5317,15 +4237,13 @@@ static void clear_queue_stats(void
+  	atomic_set(&sdebug_a_tsf, 0);
+  }
+  
+- static void setup_inject(struct sdebug_queue *sqp,
+- 			 struct sdebug_queued_cmd *sqcp)
++ static bool inject_on_this_cmd(void)
+  {
+- 	if ((atomic_read(&sdebug_cmnd_count) % abs(sdebug_every_nth)) > 0) {
+- 		if (sdebug_every_nth > 0)
+- 			sqcp->inj_recovered = sqcp->inj_transport
+- 				= sqcp->inj_dif
+- 				= sqcp->inj_dix = sqcp->inj_short
+- 				= sqcp->inj_host_busy = sqcp->inj_cmd_abort = 0;
+- 		return;
+- 	}
+- 	sqcp->inj_recovered = !!(SDEBUG_OPT_RECOVERED_ERR & sdebug_opts);
+- 	sqcp->inj_transport = !!(SDEBUG_OPT_TRANSPORT_ERR & sdebug_opts);
+- 	sqcp->inj_dif = !!(SDEBUG_OPT_DIF_ERR & sdebug_opts);
+- 	sqcp->inj_dix = !!(SDEBUG_OPT_DIX_ERR & sdebug_opts);
+- 	sqcp->inj_short = !!(SDEBUG_OPT_SHORT_TRANSFER & sdebug_opts);
+- 	sqcp->inj_host_busy = !!(SDEBUG_OPT_HOST_BUSY & sdebug_opts);
+- 	sqcp->inj_cmd_abort = !!(SDEBUG_OPT_CMD_ABORT & sdebug_opts);
++ 	if (sdebug_every_nth == 0)
++ 		return false;
++ 	return (atomic_read(&sdebug_cmnd_count) % abs(sdebug_every_nth)) == 0;
+  }
+  
+ -#define INCLUSIVE_TIMING_MAX_NS 1000000		/* 1 millisecond */
+ -
+  /* Complete the processing of the thread that queued a SCSI command to this
+   * driver. It either completes the command by calling cmnd_done() or
+   * schedules a hr timer or work queue then returns 0. Returns
+@@@ -4295,8 -5337,11 +4255,14 @@@ static int schedule_resp(struct scsi_cm
+  				    struct sdebug_dev_info *),
+  			 int delta_jiff, int ndelay)
+  {
+++<<<<<<< HEAD
+++=======
++ 	bool new_sd_dp;
++ 	bool inject = false;
++ 	int k, num_in_q, qdepth;
+++>>>>>>> 3a90a63d02b8 (scsi: scsi_debug: every_nth triggered error injection)
+  	unsigned long iflags;
+ -	u64 ns_from_boot = 0;
+ +	int k, num_in_q, qdepth, inject;
+  	struct sdebug_queue *sqp;
+  	struct sdebug_queued_cmd *sqcp;
+  	struct scsi_device *sdp;
+@@@ -4365,19 -5408,28 +4330,35 @@@
+  	cmnd->host_scribble = (unsigned char *)sqcp;
+  	sd_dp = sqcp->sd_dp;
+  	spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+++<<<<<<< HEAD
+ +	if (unlikely(sdebug_every_nth && sdebug_any_injecting_opt))
+ +		setup_inject(sqp, sqcp);
+ +	if (sd_dp == NULL) {
+++=======
++ 	if (!sd_dp) {
+++>>>>>>> 3a90a63d02b8 (scsi: scsi_debug: every_nth triggered error injection)
+  		sd_dp = kzalloc(sizeof(*sd_dp), GFP_ATOMIC);
+ -		if (!sd_dp) {
+ -			atomic_dec(&devip->num_in_q);
+ -			clear_bit(k, sqp->in_use_bm);
+ +		if (sd_dp == NULL)
+  			return SCSI_MLQUEUE_HOST_BUSY;
+ -		}
+ -		new_sd_dp = true;
+ -	} else {
+ -		new_sd_dp = false;
+  	}
+  
+++<<<<<<< HEAD
+ +	cmnd->result = pfp != NULL ? pfp(cmnd, devip) : 0;
+++=======
++ 	/* Set the hostwide tag */
++ 	if (sdebug_host_max_queue)
++ 		sd_dp->hc_idx = get_tag(cmnd);
++ 
++ 	if (ndelay > 0 && ndelay < INCLUSIVE_TIMING_MAX_NS)
++ 		ns_from_boot = ktime_get_boottime_ns();
++ 
++ 	/* one of the resp_*() response functions is called here */
++ 	cmnd->result = pfp ? pfp(cmnd, devip) : 0;
+++>>>>>>> 3a90a63d02b8 (scsi: scsi_debug: every_nth triggered error injection)
+  	if (cmnd->result & SDEG_RES_IMMED_MASK) {
+ +		/*
+ +		 * This is the F_DELAY_OVERR case. No delay.
+ +		 */
+  		cmnd->result &= ~SDEG_RES_IMMED_MASK;
+  		delta_jiff = ndelay = 0;
+  	}
+* Unmerged path drivers/scsi/scsi_debug.c
