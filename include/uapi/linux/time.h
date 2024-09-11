@@ -68,6 +68,11 @@ struct __kernel_old_timeval {
 	__kernel_long_t tv_usec;
 };
 
+struct __kernel_sock_timeval {
+	__s64 tv_sec;
+	__s64 tv_usec;
+};
+
 /*
  * The IDs of the various system clocks (for POSIX.1b interval timers):
  */
