@@ -494,7 +494,7 @@ xfs_dir2_leafn_add(
 	lep->address = cpu_to_be32(xfs_dir2_db_off_to_dataptr(args->geo,
 				args->blkno, args->index));
 
-	dp->d_ops->leaf_hdr_to_disk(leaf, &leafhdr);
+	xfs_dir2_leaf_hdr_to_disk(dp->i_mount, leaf, &leafhdr);
 	xfs_dir3_leaf_log_header(args, bp);
 	xfs_dir3_leaf_log_ents(args, bp, lfloglow, lfloghigh);
 	xfs_dir3_leaf_check(dp, bp);
@@ -1074,8 +1074,8 @@ xfs_dir2_leafn_rebalance(
 	ASSERT(hdr1.stale + hdr2.stale == oldstale);
 
 	/* log the changes made when moving the entries */
-	dp->d_ops->leaf_hdr_to_disk(leaf1, &hdr1);
-	dp->d_ops->leaf_hdr_to_disk(leaf2, &hdr2);
+	xfs_dir2_leaf_hdr_to_disk(dp->i_mount, leaf1, &hdr1);
+	xfs_dir2_leaf_hdr_to_disk(dp->i_mount, leaf2, &hdr2);
 	xfs_dir3_leaf_log_header(args, blk1->bp);
 	xfs_dir3_leaf_log_header(args, blk2->bp);
 
@@ -1244,7 +1244,7 @@ xfs_dir2_leafn_remove(
 	 * Log the leaf block changes.
 	 */
 	leafhdr.stale++;
-	dp->d_ops->leaf_hdr_to_disk(leaf, &leafhdr);
+	xfs_dir2_leaf_hdr_to_disk(dp->i_mount, leaf, &leafhdr);
 	xfs_dir3_leaf_log_header(args, bp);
 
 	lep->address = cpu_to_be32(XFS_DIR2_NULL_DATAPTR);
@@ -1600,8 +1600,8 @@ xfs_dir2_leafn_unbalance(
 	save_blk->hashval = be32_to_cpu(sents[savehdr.count - 1].hashval);
 
 	/* log the changes made when moving the entries */
-	dp->d_ops->leaf_hdr_to_disk(save_leaf, &savehdr);
-	dp->d_ops->leaf_hdr_to_disk(drop_leaf, &drophdr);
+	xfs_dir2_leaf_hdr_to_disk(dp->i_mount, save_leaf, &savehdr);
+	xfs_dir2_leaf_hdr_to_disk(dp->i_mount, drop_leaf, &drophdr);
 	xfs_dir3_leaf_log_header(args, save_blk->bp);
 	xfs_dir3_leaf_log_header(args, drop_blk->bp);
 
