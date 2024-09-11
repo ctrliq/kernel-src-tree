@@ -1,0 +1,267 @@
+netfilter: nf_log_arp: merge with nf_log_syslog
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit f11d61e7957d9dd54c4d87bb59da83fa949c15cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/f11d61e7.failed
+
+similar to previous change: nf_log_syslog now covers ARP logging
+as well, the old nf_log_arp module is removed.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit f11d61e7957d9dd54c4d87bb59da83fa949c15cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/netfilter/Makefile
+#	net/ipv4/netfilter/nf_log_arp.c
+#	net/ipv4/netfilter/nf_log_ipv4.c
+diff --cc net/ipv4/netfilter/Makefile
+index 2cfdda7b109f,f38fb1368ddb..000000000000
+--- a/net/ipv4/netfilter/Makefile
++++ b/net/ipv4/netfilter/Makefile
+@@@ -9,10 -9,6 +9,13 @@@ obj-$(CONFIG_NF_DEFRAG_IPV4) += nf_defr
+  obj-$(CONFIG_NF_SOCKET_IPV4) += nf_socket_ipv4.o
+  obj-$(CONFIG_NF_TPROXY_IPV4) += nf_tproxy_ipv4.o
+  
+++<<<<<<< HEAD
+ +# logging
+ +obj-$(CONFIG_NF_LOG_ARP) += nf_log_arp.o
+ +obj-$(CONFIG_NF_LOG_IPV4) += nf_log_ipv4.o
+ +
+++=======
+++>>>>>>> f11d61e7957d (netfilter: nf_log_arp: merge with nf_log_syslog)
+  # reject
+  obj-$(CONFIG_NF_REJECT_IPV4) += nf_reject_ipv4.o
+  
+diff --cc net/ipv4/netfilter/nf_log_ipv4.c
+index cde1918607e9,c01769c6d641..000000000000
+--- a/net/ipv4/netfilter/nf_log_ipv4.c
++++ b/net/ipv4/netfilter/nf_log_ipv4.c
+@@@ -34,14 -31,104 +34,103 @@@ static const struct nf_loginfo default_
+  	},
+  };
+  
++ struct arppayload {
++ 	unsigned char mac_src[ETH_ALEN];
++ 	unsigned char ip_src[4];
++ 	unsigned char mac_dst[ETH_ALEN];
++ 	unsigned char ip_dst[4];
++ };
++ 
++ static void noinline_for_stack
++ dump_arp_packet(struct nf_log_buf *m,
++ 		const struct nf_loginfo *info,
++ 		const struct sk_buff *skb, unsigned int nhoff)
++ {
++ 	const struct arppayload *ap;
++ 	struct arppayload _arpp;
++ 	const struct arphdr *ah;
++ 	unsigned int logflags;
++ 	struct arphdr _arph;
++ 
++ 	ah = skb_header_pointer(skb, 0, sizeof(_arph), &_arph);
++ 	if (!ah) {
++ 		nf_log_buf_add(m, "TRUNCATED");
++ 		return;
++ 	}
++ 
++ 	if (info->type == NF_LOG_TYPE_LOG)
++ 		logflags = info->u.log.logflags;
++ 	else
++ 		logflags = NF_LOG_DEFAULT_MASK;
++ 
++ 	if (logflags & NF_LOG_MACDECODE) {
++ 		nf_log_buf_add(m, "MACSRC=%pM MACDST=%pM ",
++ 			       eth_hdr(skb)->h_source, eth_hdr(skb)->h_dest);
++ 		nf_log_dump_vlan(m, skb);
++ 		nf_log_buf_add(m, "MACPROTO=%04x ",
++ 			       ntohs(eth_hdr(skb)->h_proto));
++ 	}
++ 
++ 	nf_log_buf_add(m, "ARP HTYPE=%d PTYPE=0x%04x OPCODE=%d",
++ 		       ntohs(ah->ar_hrd), ntohs(ah->ar_pro), ntohs(ah->ar_op));
++ 	/* If it's for Ethernet and the lengths are OK, then log the ARP
++ 	 * payload.
++ 	 */
++ 	if (ah->ar_hrd != htons(ARPHRD_ETHER) ||
++ 	    ah->ar_hln != ETH_ALEN ||
++ 	    ah->ar_pln != sizeof(__be32))
++ 		return;
++ 
++ 	ap = skb_header_pointer(skb, sizeof(_arph), sizeof(_arpp), &_arpp);
++ 	if (!ap) {
++ 		nf_log_buf_add(m, " INCOMPLETE [%zu bytes]",
++ 			       skb->len - sizeof(_arph));
++ 		return;
++ 	}
++ 	nf_log_buf_add(m, " MACSRC=%pM IPSRC=%pI4 MACDST=%pM IPDST=%pI4",
++ 		       ap->mac_src, ap->ip_src, ap->mac_dst, ap->ip_dst);
++ }
++ 
++ static void nf_log_arp_packet(struct net *net, u_int8_t pf,
++ 			      unsigned int hooknum, const struct sk_buff *skb,
++ 			      const struct net_device *in,
++ 			      const struct net_device *out,
++ 			      const struct nf_loginfo *loginfo,
++ 			      const char *prefix)
++ {
++ 	struct nf_log_buf *m;
++ 
++ 	/* FIXME: Disabled from containers until syslog ns is supported */
++ 	if (!net_eq(net, &init_net) && !sysctl_nf_log_all_netns)
++ 		return;
++ 
++ 	m = nf_log_buf_open();
++ 
++ 	if (!loginfo)
++ 		loginfo = &default_loginfo;
++ 
++ 	nf_log_dump_packet_common(m, pf, hooknum, skb, in, out, loginfo,
++ 				  prefix);
++ 	dump_arp_packet(m, loginfo, skb, 0);
++ 
++ 	nf_log_buf_close(m);
++ }
++ 
++ static struct nf_logger nf_arp_logger __read_mostly = {
++ 	.name		= "nf_log_arp",
++ 	.type		= NF_LOG_TYPE_LOG,
++ 	.logfn		= nf_log_arp_packet,
++ 	.me		= THIS_MODULE,
++ };
++ 
+  /* One level of recursion won't kill us */
+ -static noinline_for_stack void
+ -dump_ipv4_packet(struct net *net, struct nf_log_buf *m,
+ -		 const struct nf_loginfo *info,
+ -		 const struct sk_buff *skb, unsigned int iphoff)
+ +static void dump_ipv4_packet(struct net *net, struct nf_log_buf *m,
+ +			     const struct nf_loginfo *info,
+ +			     const struct sk_buff *skb, unsigned int iphoff)
+  {
+ +	struct iphdr _iph;
+  	const struct iphdr *ih;
+  	unsigned int logflags;
+ -	struct iphdr _iph;
+  
+  	if (info->type == NF_LOG_TYPE_LOG)
+  		logflags = info->u.log.logflags;
+@@@ -347,22 -430,33 +436,33 @@@ static struct nf_logger nf_ip_logger __
+  	.me		= THIS_MODULE,
+  };
+  
+ -static int __net_init nf_log_syslog_net_init(struct net *net)
+ +static int __net_init nf_log_ipv4_net_init(struct net *net)
+  {
+- 	return nf_log_set(net, NFPROTO_IPV4, &nf_ip_logger);
++ 	int ret = nf_log_set(net, NFPROTO_IPV4, &nf_ip_logger);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = nf_log_set(net, NFPROTO_ARP, &nf_arp_logger);
++ 	if (ret)
++ 		goto err1;
++ err1:
++ 	nf_log_unset(net, &nf_arp_logger);
++ 	return ret;
+  }
+  
+ -static void __net_exit nf_log_syslog_net_exit(struct net *net)
+ +static void __net_exit nf_log_ipv4_net_exit(struct net *net)
+  {
+  	nf_log_unset(net, &nf_ip_logger);
++ 	nf_log_unset(net, &nf_arp_logger);
+  }
+  
+ -static struct pernet_operations nf_log_syslog_net_ops = {
+ -	.init = nf_log_syslog_net_init,
+ -	.exit = nf_log_syslog_net_exit,
+ +static struct pernet_operations nf_log_ipv4_net_ops = {
+ +	.init = nf_log_ipv4_net_init,
+ +	.exit = nf_log_ipv4_net_exit,
+  };
+  
+ -static int __init nf_log_syslog_init(void)
+ +static int __init nf_log_ipv4_init(void)
+  {
+  	int ret;
+  
+@@@ -371,28 -465,36 +471,45 @@@
+  		return ret;
+  
+  	ret = nf_log_register(NFPROTO_IPV4, &nf_ip_logger);
+ -	if (ret < 0)
+ +	if (ret < 0) {
+ +		pr_err("failed to register logger\n");
+  		goto err1;
+ +	}
+  
+- 	return 0;
++ 	ret = nf_log_register(NFPROTO_ARP, &nf_arp_logger);
++ 	if (ret < 0)
++ 		goto err2;
+  
++ 	return 0;
++ err2:
++ 	nf_log_unregister(&nf_arp_logger);
+  err1:
+++<<<<<<< HEAD:net/ipv4/netfilter/nf_log_ipv4.c
+ +	unregister_pernet_subsys(&nf_log_ipv4_net_ops);
+++=======
++ 	pr_err("failed to register logger\n");
++ 	unregister_pernet_subsys(&nf_log_syslog_net_ops);
+++>>>>>>> f11d61e7957d (netfilter: nf_log_arp: merge with nf_log_syslog):net/netfilter/nf_log_syslog.c
+  	return ret;
+  }
+  
+ -static void __exit nf_log_syslog_exit(void)
+ +static void __exit nf_log_ipv4_exit(void)
+  {
+ -	unregister_pernet_subsys(&nf_log_syslog_net_ops);
+ +	unregister_pernet_subsys(&nf_log_ipv4_net_ops);
+  	nf_log_unregister(&nf_ip_logger);
++ 	nf_log_unregister(&nf_arp_logger);
+  }
+  
+ -module_init(nf_log_syslog_init);
+ -module_exit(nf_log_syslog_exit);
+ +module_init(nf_log_ipv4_init);
+ +module_exit(nf_log_ipv4_exit);
+  
+  MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
+ -MODULE_DESCRIPTION("Netfilter syslog packet logging");
+ +MODULE_DESCRIPTION("Netfilter IPv4 packet logging");
+  MODULE_LICENSE("GPL");
+++<<<<<<< HEAD:net/ipv4/netfilter/nf_log_ipv4.c
+++=======
++ MODULE_ALIAS("nf_log_arp");
++ MODULE_ALIAS("nf_log_ipv4");
+++>>>>>>> f11d61e7957d (netfilter: nf_log_arp: merge with nf_log_syslog):net/netfilter/nf_log_syslog.c
+  MODULE_ALIAS_NF_LOGGER(AF_INET, 0);
++ MODULE_ALIAS_NF_LOGGER(3, 0);
+* Unmerged path net/ipv4/netfilter/nf_log_arp.c
+diff --git a/net/ipv4/netfilter/Kconfig b/net/ipv4/netfilter/Kconfig
+index ea688832fc4e..dabb0c582c8d 100644
+--- a/net/ipv4/netfilter/Kconfig
++++ b/net/ipv4/netfilter/Kconfig
+@@ -75,7 +75,10 @@ config NF_DUP_IPV4
+ config NF_LOG_ARP
+ 	tristate "ARP packet logging"
+ 	default m if NETFILTER_ADVANCED=n
+-	select NF_LOG_COMMON
++	select NF_LOG_SYSLOG
++	help
++	This is a backwards-compat option for the user's convenience
++	(e.g. when running oldconfig). It selects CONFIG_NF_LOG_SYSLOG.
+ 
+ config NF_LOG_IPV4
+ 	tristate "IPv4 packet logging"
+* Unmerged path net/ipv4/netfilter/Makefile
+* Unmerged path net/ipv4/netfilter/nf_log_arp.c
+* Unmerged path net/ipv4/netfilter/nf_log_ipv4.c
