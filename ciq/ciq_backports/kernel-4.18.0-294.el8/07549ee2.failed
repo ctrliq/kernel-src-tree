@@ -1,0 +1,327 @@
+RDMA/rds: Remove FMR support for memory registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 07549ee21ce5247143ffb069bf838025d86b908c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/07549ee2.failed
+
+Use FRWR method for memory registration by default and remove the ancient
+and unsafe FMR method.
+
+Link: https://lore.kernel.org/r/3-v3-f58e6669d5d3+2cf-fmr_removal_jgg@mellanox.com
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 07549ee21ce5247143ffb069bf838025d86b908c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/ib.c
+#	net/rds/ib.h
+#	net/rds/ib_cm.c
+#	net/rds/ib_fmr.c
+#	net/rds/ib_rdma.c
+diff --cc net/rds/ib.c
+index 7d8f34bd89d5,6c43b3e4c736..000000000000
+--- a/net/rds/ib.c
++++ b/net/rds/ib.c
+@@@ -124,15 -127,19 +124,23 @@@ void rds_ib_dev_put(struct rds_ib_devic
+  		queue_work(rds_wq, &rds_ibdev->free_work);
+  }
+  
+ -static int rds_ib_add_one(struct ib_device *device)
+ +static void rds_ib_add_one(struct ib_device *device)
+  {
+  	struct rds_ib_device *rds_ibdev;
+++<<<<<<< HEAD
+ +	bool has_fr, has_fmr;
+++=======
++ 	int ret;
+++>>>>>>> 07549ee21ce5 (RDMA/rds: Remove FMR support for memory registration)
+  
+  	/* Only handle IB (no iWARP) devices */
+  	if (device->node_type != RDMA_NODE_IB_CA)
+ -		return -EOPNOTSUPP;
+ +		return;
+  
++ 	/* Device must support FRWR */
++ 	if (!(device->attrs.device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS))
++ 		return -EOPNOTSUPP;
++ 
+  	rds_ibdev = kzalloc_node(sizeof(struct rds_ib_device), GFP_KERNEL,
+  				 ibdev_to_node(device));
+  	if (!rds_ibdev)
+@@@ -145,13 -152,17 +153,22 @@@
+  	rds_ibdev->max_wrs = device->attrs.max_qp_wr;
+  	rds_ibdev->max_sge = min(device->attrs.max_send_sge, RDS_IB_MAX_SGE);
+  
+++<<<<<<< HEAD
+ +	has_fr = (device->attrs.device_cap_flags &
+ +		  IB_DEVICE_MEM_MGT_EXTENSIONS);
+ +	has_fmr = (device->ops.alloc_fmr && device->ops.dealloc_fmr &&
+ +		   device->ops.map_phys_fmr && device->ops.unmap_fmr);
+ +	rds_ibdev->use_fastreg = (has_fr && !has_fmr);
+++=======
++ 	rds_ibdev->odp_capable =
++ 		!!(device->attrs.device_cap_flags &
++ 		   IB_DEVICE_ON_DEMAND_PAGING) &&
++ 		!!(device->attrs.odp_caps.per_transport_caps.rc_odp_caps &
++ 		   IB_ODP_SUPPORT_WRITE) &&
++ 		!!(device->attrs.odp_caps.per_transport_caps.rc_odp_caps &
++ 		   IB_ODP_SUPPORT_READ);
+++>>>>>>> 07549ee21ce5 (RDMA/rds: Remove FMR support for memory registration)
+  
+- 	rds_ibdev->fmr_max_remaps = device->attrs.max_map_per_fmr?: 32;
+  	rds_ibdev->max_1m_mrs = device->attrs.max_mr ?
+  		min_t(unsigned int, (device->attrs.max_mr / 2),
+  		      rds_ib_mr_1m_pool_size) : rds_ib_mr_1m_pool_size;
+@@@ -193,18 -216,12 +210,15 @@@
+  		goto put_dev;
+  	}
+  
+- 	rdsdebug("RDS/IB: max_mr = %d, max_wrs = %d, max_sge = %d, fmr_max_remaps = %d, max_1m_mrs = %d, max_8k_mrs = %d\n",
++ 	rdsdebug("RDS/IB: max_mr = %d, max_wrs = %d, max_sge = %d, max_1m_mrs = %d, max_8k_mrs = %d\n",
+  		 device->attrs.max_fmr, rds_ibdev->max_wrs, rds_ibdev->max_sge,
+- 		 rds_ibdev->fmr_max_remaps, rds_ibdev->max_1m_mrs,
+- 		 rds_ibdev->max_8k_mrs);
++ 		 rds_ibdev->max_1m_mrs, rds_ibdev->max_8k_mrs);
+  
+- 	pr_info("RDS/IB: %s: %s supported and preferred\n",
+- 		device->name,
+- 		rds_ibdev->use_fastreg ? "FRMR" : "FMR");
++ 	pr_info("RDS/IB: %s: added\n", device->name);
+  
+ +	INIT_LIST_HEAD(&rds_ibdev->ipaddr_list);
+ +	INIT_LIST_HEAD(&rds_ibdev->conn_list);
+ +
+  	down_write(&rds_ib_devices_lock);
+  	list_add_tail_rcu(&rds_ibdev->list, &rds_ib_devices);
+  	up_write(&rds_ib_devices_lock);
+diff --cc net/rds/ib.h
+index d5fe46a080b3,5ae069d39eab..000000000000
+--- a/net/rds/ib.h
++++ b/net/rds/ib.h
+@@@ -216,7 -246,8 +216,12 @@@ struct rds_ib_device 
+  	struct list_head	conn_list;
+  	struct ib_device	*dev;
+  	struct ib_pd		*pd;
+++<<<<<<< HEAD
+ +	bool                    use_fastreg;
+++=======
++ 	struct dma_pool		*rid_hdrs_pool; /* RDS headers DMA pool */
++ 	u8			odp_capable:1;
+++>>>>>>> 07549ee21ce5 (RDMA/rds: Remove FMR support for memory registration)
+  
+  	unsigned int		max_mrs;
+  	struct rds_ib_mr_pool	*mr_1m_pool;
+diff --cc net/rds/ib_cm.c
+index f1684ae6abfd,c3319ff3ee11..000000000000
+--- a/net/rds/ib_cm.c
++++ b/net/rds/ib_cm.c
+@@@ -413,13 -527,10 +413,17 @@@ static int rds_ib_setup_qp(struct rds_c
+  		return -EOPNOTSUPP;
+  
+  	/* The fr_queue_space is currently set to 512, to add extra space on
+- 	 * completion queue and send queue. This extra space is used for FRMR
++ 	 * completion queue and send queue. This extra space is used for FRWR
+  	 * registration and invalidation work requests
+  	 */
+++<<<<<<< HEAD
+ +	fr_queue_space = rds_ibdev->use_fastreg ?
+ +			 (RDS_IB_DEFAULT_FR_WR + 1) +
+ +			 (RDS_IB_DEFAULT_FR_INV_WR + 1)
+ +			 : 0;
+++=======
++ 	fr_queue_space = RDS_IB_DEFAULT_FR_WR;
+++>>>>>>> 07549ee21ce5 (RDMA/rds: Remove FMR support for memory registration)
+  
+  	/* add the conn now so that connection establishment has the dev */
+  	rds_ib_add_conn(rds_ibdev, conn);
+diff --cc net/rds/ib_rdma.c
+index 2e49a40a5e11,8f070ee7e742..000000000000
+--- a/net/rds/ib_rdma.c
++++ b/net/rds/ib_rdma.c
+@@@ -176,9 -181,20 +176,23 @@@ void rds_ib_get_mr_info(struct rds_ib_d
+  	struct rds_ib_mr_pool *pool_1m = rds_ibdev->mr_1m_pool;
+  
+  	iinfo->rdma_mr_max = pool_1m->max_items;
+- 	iinfo->rdma_mr_size = pool_1m->fmr_attr.max_pages;
++ 	iinfo->rdma_mr_size = pool_1m->max_pages;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_IPV6)
++ void rds6_ib_get_mr_info(struct rds_ib_device *rds_ibdev,
++ 			 struct rds6_info_rdma_connection *iinfo6)
++ {
++ 	struct rds_ib_mr_pool *pool_1m = rds_ibdev->mr_1m_pool;
++ 
++ 	iinfo6->rdma_mr_max = pool_1m->max_items;
++ 	iinfo6->rdma_mr_size = pool_1m->max_pages;
++ }
++ #endif
++ 
+++>>>>>>> 07549ee21ce5 (RDMA/rds: Remove FMR support for memory registration)
+  struct rds_ib_mr *rds_ib_reuse_mr(struct rds_ib_mr_pool *pool)
+  {
+  	struct rds_ib_mr *ibmr = NULL;
+@@@ -398,31 -406,23 +412,28 @@@ int rds_ib_flush_mr_pool(struct rds_ib_
+  	if (list_empty(&unmap_list))
+  		goto out;
+  
+- 	if (pool->use_fastreg)
+- 		rds_ib_unreg_frmr(&unmap_list, &nfreed, &unpinned, free_goal);
+- 	else
+- 		rds_ib_unreg_fmr(&unmap_list, &nfreed, &unpinned, free_goal);
++ 	rds_ib_unreg_frmr(&unmap_list, &nfreed, &unpinned, free_goal);
+  
+  	if (!list_empty(&unmap_list)) {
+ -		unsigned long flags;
+ +		/* we have to make sure that none of the things we're about
+ +		 * to put on the clean list would race with other cpus trying
+ +		 * to pull items off.  The llist would explode if we managed to
+ +		 * remove something from the clean list and then add it back again
+ +		 * while another CPU was spinning on that same item in llist_del_first.
+ +		 *
+ +		 * This is pretty unlikely, but just in case  wait for an llist grace period
+ +		 * here before adding anything back into the clean list.
+ +		 */
+ +		wait_clean_list_grace();
+  
+ -		list_to_llist_nodes(&unmap_list, &clean_nodes, &clean_tail);
+ -		if (ibmr_ret) {
+ +		list_to_llist_nodes(pool, &unmap_list, &clean_nodes, &clean_tail);
+ +		if (ibmr_ret)
+  			*ibmr_ret = llist_entry(clean_nodes, struct rds_ib_mr, llnode);
+ -			clean_nodes = clean_nodes->next;
+ -		}
+ +
+  		/* more than one entry in llist nodes */
+ -		if (clean_nodes) {
+ -			spin_lock_irqsave(&pool->clean_lock, flags);
+ -			llist_add_batch(clean_nodes, clean_tail,
+ -					&pool->clean_list);
+ -			spin_unlock_irqrestore(&pool->clean_lock, flags);
+ -		}
+ +		if (clean_nodes->next)
+ +			llist_add_batch(clean_nodes->next, clean_tail, &pool->clean_list);
+ +
+  	}
+  
+  	atomic_sub(unpinned, &pool->free_pinned);
+@@@ -492,11 -489,18 +503,8 @@@ void rds_ib_free_mr(void *trans_private
+  
+  	rdsdebug("RDS/IB: free_mr nents %u\n", ibmr->sg_len);
+  
+ -	if (ibmr->odp) {
+ -		/* A MR created and marked as use_once. We use delayed work,
+ -		 * because there is a change that we are in interrupt and can't
+ -		 * call to ib_dereg_mr() directly.
+ -		 */
+ -		INIT_DELAYED_WORK(&ibmr->work, rds_ib_odp_mr_worker);
+ -		queue_delayed_work(rds_ib_mr_wq, &ibmr->work, 0);
+ -		return;
+ -	}
+ -
+  	/* Return it to the pool's free list */
+- 	if (rds_ibdev->use_fastreg)
+- 		rds_ib_free_frmr_list(ibmr);
+- 	else
+- 		rds_ib_free_fmr_list(ibmr);
++ 	rds_ib_free_frmr_list(ibmr);
+  
+  	atomic_add(ibmr->sg_len, &pool->free_pinned);
+  	atomic_inc(&pool->dirty_count);
+* Unmerged path net/rds/ib_fmr.c
+diff --git a/net/rds/Makefile b/net/rds/Makefile
+index b5d568bd479c..c6e1f82803e0 100644
+--- a/net/rds/Makefile
++++ b/net/rds/Makefile
+@@ -7,7 +7,7 @@ rds-y :=	af_rds.o bind.o cong.o connection.o info.o message.o   \
+ obj-$(CONFIG_RDS_RDMA) += rds_rdma.o
+ rds_rdma-y :=	rdma_transport.o \
+ 			ib.o ib_cm.o ib_recv.o ib_ring.o ib_send.o ib_stats.o \
+-			ib_sysctl.o ib_rdma.o ib_fmr.o ib_frmr.o
++			ib_sysctl.o ib_rdma.o ib_frmr.o
+ 
+ 
+ obj-$(CONFIG_RDS_TCP) += rds_tcp.o
+* Unmerged path net/rds/ib.c
+* Unmerged path net/rds/ib.h
+* Unmerged path net/rds/ib_cm.c
+* Unmerged path net/rds/ib_fmr.c
+diff --git a/net/rds/ib_frmr.c b/net/rds/ib_frmr.c
+index 0af74de10c90..fde6e96f7f34 100644
+--- a/net/rds/ib_frmr.c
++++ b/net/rds/ib_frmr.c
+@@ -58,7 +58,7 @@ static struct rds_ib_mr *rds_ib_alloc_frmr(struct rds_ib_device *rds_ibdev,
+ 
+ 	frmr = &ibmr->u.frmr;
+ 	frmr->mr = ib_alloc_mr(rds_ibdev->pd, IB_MR_TYPE_MEM_REG,
+-			 pool->fmr_attr.max_pages);
++			 pool->max_pages);
+ 	if (IS_ERR(frmr->mr)) {
+ 		pr_warn("RDS/IB: %s failed to allocate MR", __func__);
+ 		goto out_no_cigar;
+@@ -205,7 +205,7 @@ static int rds_ib_map_frmr(struct rds_ib_device *rds_ibdev,
+ 	}
+ 	frmr->dma_npages += len >> PAGE_SHIFT;
+ 
+-	if (frmr->dma_npages > ibmr->pool->fmr_attr.max_pages) {
++	if (frmr->dma_npages > ibmr->pool->max_pages) {
+ 		ret = -EMSGSIZE;
+ 		goto out_unmap;
+ 	}
+diff --git a/net/rds/ib_mr.h b/net/rds/ib_mr.h
+index 655f01d427fe..038f79e89dc1 100644
+--- a/net/rds/ib_mr.h
++++ b/net/rds/ib_mr.h
+@@ -43,10 +43,6 @@
+ #define RDS_MR_8K_SCALE			(256 / (RDS_MR_8K_MSG_SIZE + 1))
+ #define RDS_MR_8K_POOL_SIZE		(RDS_MR_8K_SCALE * (8192 / 2))
+ 
+-struct rds_ib_fmr {
+-	struct ib_fmr		*fmr;
+-};
+-
+ enum rds_ib_fr_state {
+ 	FRMR_IS_FREE,	/* mr invalidated & ready for use */
+ 	FRMR_IS_INUSE,	/* mr is in use or used & can be invalidated */
+@@ -79,7 +75,6 @@ struct rds_ib_mr {
+ 	int				sg_dma_len;
+ 
+ 	union {
+-		struct rds_ib_fmr	fmr;
+ 		struct rds_ib_frmr	frmr;
+ 	} u;
+ };
+@@ -102,8 +97,7 @@ struct rds_ib_mr_pool {
+ 	unsigned long		max_items;
+ 	unsigned long		max_items_soft;
+ 	unsigned long		max_free_pinned;
+-	struct ib_fmr_attr	fmr_attr;
+-	bool			use_fastreg;
++	unsigned int		max_pages;
+ };
+ 
+ extern struct workqueue_struct *rds_ib_mr_wq;
+@@ -125,15 +119,9 @@ void rds_ib_mr_exit(void);
+ 
+ void __rds_ib_teardown_mr(struct rds_ib_mr *);
+ void rds_ib_teardown_mr(struct rds_ib_mr *);
+-struct rds_ib_mr *rds_ib_alloc_fmr(struct rds_ib_device *, int);
+ struct rds_ib_mr *rds_ib_reuse_mr(struct rds_ib_mr_pool *);
+ int rds_ib_flush_mr_pool(struct rds_ib_mr_pool *, int, struct rds_ib_mr **);
+-struct rds_ib_mr *rds_ib_reg_fmr(struct rds_ib_device *, struct scatterlist *,
+-				 unsigned long, u32 *);
+ struct rds_ib_mr *rds_ib_try_reuse_ibmr(struct rds_ib_mr_pool *);
+-void rds_ib_unreg_fmr(struct list_head *, unsigned int *,
+-		      unsigned long *, unsigned int);
+-void rds_ib_free_fmr_list(struct rds_ib_mr *);
+ struct rds_ib_mr *rds_ib_reg_frmr(struct rds_ib_device *rds_ibdev,
+ 				  struct rds_ib_connection *ic,
+ 				  struct scatterlist *sg,
+* Unmerged path net/rds/ib_rdma.c
