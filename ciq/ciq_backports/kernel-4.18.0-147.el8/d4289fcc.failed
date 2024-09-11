@@ -1,0 +1,136 @@
+net: IP6 defrag: use rbtrees for IPv6 defrag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] IP6 defrag: use rbtrees for IPv6 defrag (Guillaume Nault) [1660282]
+Rebuild_FUZZ: 93.98%
+commit-author Peter Oskolkov <posk@google.com>
+commit d4289fcc9b16b89619ee1c54f829e05e56de8b9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d4289fcc.failed
+
+Currently, IPv6 defragmentation code drops non-last fragments that
+are smaller than 1280 bytes: see
+commit 0ed4229b08c1 ("ipv6: defrag: drop non-last frags smaller than min mtu")
+
+This behavior is not specified in IPv6 RFCs and appears to break
+compatibility with some IPv6 implemenations, as reported here:
+https://www.spinics.net/lists/netdev/msg543846.html
+
+This patch re-uses common IP defragmentation queueing and reassembly
+code in IPv6, removing the 1280 byte restriction.
+
+	Signed-off-by: Peter Oskolkov <posk@google.com>
+	Reported-by: Tom Herbert <tom@herbertland.com>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d4289fcc9b16b89619ee1c54f829e05e56de8b9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/reassembly.c
+diff --cc net/ipv6/reassembly.c
+index 10e3f6cfc7d3,24264d0a4b85..000000000000
+--- a/net/ipv6/reassembly.c
++++ b/net/ipv6/reassembly.c
+@@@ -325,88 -279,27 +279,58 @@@ static int ip6_frag_reasm(struct frag_q
+  	/* We have to remove fragment header from datagram and to relocate
+  	 * header in order to calculate ICV correctly. */
+  	nhoff = fq->nhoffset;
+- 	skb_network_header(head)[nhoff] = skb_transport_header(head)[0];
+- 	memmove(head->head + sizeof(struct frag_hdr), head->head,
+- 		(head->data - head->head) - sizeof(struct frag_hdr));
+- 	if (skb_mac_header_was_set(head))
+- 		head->mac_header += sizeof(struct frag_hdr);
+- 	head->network_header += sizeof(struct frag_hdr);
+- 
+- 	skb_reset_transport_header(head);
+- 	skb_push(head, head->data - skb_network_header(head));
+- 
+- 	sum_truesize = head->truesize;
+- 	for (fp = head->next; fp;) {
+- 		bool headstolen;
+- 		int delta;
+- 		struct sk_buff *next = fp->next;
++ 	skb_network_header(skb)[nhoff] = skb_transport_header(skb)[0];
++ 	memmove(skb->head + sizeof(struct frag_hdr), skb->head,
++ 		(skb->data - skb->head) - sizeof(struct frag_hdr));
++ 	if (skb_mac_header_was_set(skb))
++ 		skb->mac_header += sizeof(struct frag_hdr);
++ 	skb->network_header += sizeof(struct frag_hdr);
++ 
++ 	skb_reset_transport_header(skb);
++ 
++ 	inet_frag_reasm_finish(&fq->q, skb, reasm_data);
+  
+++<<<<<<< HEAD
+ +		sum_truesize += fp->truesize;
+ +		if (head->ip_summed != fp->ip_summed)
+ +			head->ip_summed = CHECKSUM_NONE;
+ +		else if (head->ip_summed == CHECKSUM_COMPLETE)
+ +			head->csum = csum_add(head->csum, fp->csum);
+ +
+ +		if (skb_try_coalesce(head, fp, &headstolen, &delta)) {
+ +			kfree_skb_partial(fp, headstolen);
+ +		} else {
+ +			fp->sk = NULL;
+ +			if (!skb_shinfo(head)->frag_list)
+ +				skb_shinfo(head)->frag_list = fp;
+ +			head->data_len += fp->len;
+ +			head->len += fp->len;
+ +			head->truesize += fp->truesize;
+ +		}
+ +		fp = next;
+ +	}
+ +	sub_frag_mem_limit(fq->q.net, sum_truesize);
+ +
+ +	head->next = NULL;
+ +	head->dev = dev;
+ +	head->tstamp = fq->q.stamp;
+ +	ipv6_hdr(head)->payload_len = htons(payload_len);
+ +	ipv6_change_dsfield(ipv6_hdr(head), 0xff, ecn);
+ +	IP6CB(head)->nhoff = nhoff;
+ +	IP6CB(head)->flags |= IP6SKB_FRAGMENTED;
+ +	IP6CB(head)->frag_max_size = fq->q.max_size;
+++=======
++ 	skb->dev = dev;
++ 	ipv6_hdr(skb)->payload_len = htons(payload_len);
++ 	ipv6_change_dsfield(ipv6_hdr(skb), 0xff, ecn);
++ 	IP6CB(skb)->nhoff = nhoff;
++ 	IP6CB(skb)->flags |= IP6SKB_FRAGMENTED;
++ 	IP6CB(skb)->frag_max_size = fq->q.max_size;
+++>>>>>>> d4289fcc9b16 (net: IP6 defrag: use rbtrees for IPv6 defrag)
+  
+  	/* Yes, and fold redundant checksum back. 8) */
+- 	skb_postpush_rcsum(head, skb_network_header(head),
+- 			   skb_network_header_len(head));
++ 	skb_postpush_rcsum(skb, skb_network_header(skb),
++ 			   skb_network_header_len(skb));
+  
+  	rcu_read_lock();
+  	__IP6_INC_STATS(net, __in6_dev_get(dev), IPSTATS_MIB_REASMOKS);
+diff --git a/include/net/ipv6_frag.h b/include/net/ipv6_frag.h
+index 6ced1e6899b6..28aa9b30aece 100644
+--- a/include/net/ipv6_frag.h
++++ b/include/net/ipv6_frag.h
+@@ -82,8 +82,15 @@ ip6frag_expire_frag_queue(struct net *net, struct frag_queue *fq)
+ 	__IP6_INC_STATS(net, __in6_dev_get(dev), IPSTATS_MIB_REASMTIMEOUT);
+ 
+ 	/* Don't send error if the first segment did not arrive. */
+-	head = fq->q.fragments;
+-	if (!(fq->q.flags & INET_FRAG_FIRST_IN) || !head)
++	if (!(fq->q.flags & INET_FRAG_FIRST_IN))
++		goto out;
++
++	/* sk_buff::dev and sk_buff::rbnode are unionized. So we
++	 * pull the head out of the tree in order to be able to
++	 * deal with head->dev.
++	 */
++	head = inet_frag_pull_head(&fq->q);
++	if (!head)
+ 		goto out;
+ 
+ 	head->dev = dev;
+* Unmerged path net/ipv6/reassembly.c
