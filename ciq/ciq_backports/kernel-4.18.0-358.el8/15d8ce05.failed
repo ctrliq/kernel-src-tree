@@ -1,0 +1,444 @@
+Bluetooth: le_simult_central_peripheral experimental feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Alain Michaud <alainm@chromium.org>
+commit 15d8ce05ebec37a0d701cde768bbf21349f2329d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/15d8ce05.failed
+
+This patch adds an le_simult_central_peripheral features which allows a
+clients to determine if the controller is able to support peripheral and
+central connections separately and at the same time.
+
+	Signed-off-by: Alain Michaud <alainm@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 15d8ce05ebec37a0d701cde768bbf21349f2329d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/mgmt.c
+diff --cc net/bluetooth/mgmt.c
+index aba945c1f53e,d29da80e38fe..000000000000
+--- a/net/bluetooth/mgmt.c
++++ b/net/bluetooth/mgmt.c
+@@@ -3625,15 -3696,407 +3625,287 @@@ unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_blocked_keys(struct sock *sk, struct hci_dev *hdev, void *data,
+++=======
++ static int read_security_info(struct sock *sk, struct hci_dev *hdev,
++ 			      void *data, u16 data_len)
++ {
++ 	char buf[16];
++ 	struct mgmt_rp_read_security_info *rp = (void *)buf;
++ 	u16 sec_len = 0;
++ 	u8 flags = 0;
++ 
++ 	bt_dev_dbg(hdev, "sock %p", sk);
++ 
++ 	memset(&buf, 0, sizeof(buf));
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	/* When the Read Simple Pairing Options command is supported, then
++ 	 * the remote public key validation is supported.
++ 	 */
++ 	if (hdev->commands[41] & 0x08)
++ 		flags |= 0x01;	/* Remote public key validation (BR/EDR) */
++ 
++ 	flags |= 0x02;		/* Remote public key validation (LE) */
++ 
++ 	/* When the Read Encryption Key Size command is supported, then the
++ 	 * encryption key size is enforced.
++ 	 */
++ 	if (hdev->commands[20] & 0x10)
++ 		flags |= 0x04;	/* Encryption key size enforcement (BR/EDR) */
++ 
++ 	flags |= 0x08;		/* Encryption key size enforcement (LE) */
++ 
++ 	sec_len = eir_append_data(rp->sec, sec_len, 0x01, &flags, 1);
++ 
++ 	/* When the Read Simple Pairing Options command is supported, then
++ 	 * also max encryption key size information is provided.
++ 	 */
++ 	if (hdev->commands[41] & 0x08)
++ 		sec_len = eir_append_le16(rp->sec, sec_len, 0x02,
++ 					  hdev->max_enc_key_size);
++ 
++ 	sec_len = eir_append_le16(rp->sec, sec_len, 0x03, SMP_MAX_ENC_KEY_SIZE);
++ 
++ 	rp->sec_len = cpu_to_le16(sec_len);
++ 
++ 	hci_dev_unlock(hdev);
++ 
++ 	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_READ_SECURITY_INFO, 0,
++ 				 rp, sizeof(*rp) + sec_len);
++ }
++ 
++ #ifdef CONFIG_BT_FEATURE_DEBUG
++ /* d4992530-b9ec-469f-ab01-6c481c47da1c */
++ static const u8 debug_uuid[16] = {
++ 	0x1c, 0xda, 0x47, 0x1c, 0x48, 0x6c, 0x01, 0xab,
++ 	0x9f, 0x46, 0xec, 0xb9, 0x30, 0x25, 0x99, 0xd4,
++ };
++ #endif
++ 
++ /* 671b10b5-42c0-4696-9227-eb28d1b049d6 */
++ static const u8 simult_central_periph_uuid[16] = {
++ 	0xd6, 0x49, 0xb0, 0xd1, 0x28, 0xeb, 0x27, 0x92,
++ 	0x96, 0x46, 0xc0, 0x42, 0xb5, 0x10, 0x1b, 0x67,
++ };
++ 
++ static int read_exp_features_info(struct sock *sk, struct hci_dev *hdev,
++ 				  void *data, u16 data_len)
++ {
++ 	char buf[44];
++ 	struct mgmt_rp_read_exp_features_info *rp = (void *)buf;
++ 	u16 idx = 0;
++ 	u32 flags;
++ 
++ 	bt_dev_dbg(hdev, "sock %p", sk);
++ 
++ 	memset(&buf, 0, sizeof(buf));
++ 
++ #ifdef CONFIG_BT_FEATURE_DEBUG
++ 	if (!hdev) {
++ 		flags = bt_dbg_get() ? BIT(0) : 0;
++ 
++ 		memcpy(rp->features[idx].uuid, debug_uuid, 16);
++ 		rp->features[idx].flags = cpu_to_le32(flags);
++ 		idx++;
++ 	}
++ #endif
++ 
++ 	if (hdev) {
++ 		if (test_bit(HCI_QUIRK_VALID_LE_STATES, &hdev->quirks) &&
++ 		    (hdev->le_states[4] & 0x08) &&	/* Central */
++ 		    (hdev->le_states[4] & 0x40) &&	/* Peripheral */
++ 		    (hdev->le_states[3] & 0x10))	/* Simultaneous */
++ 			flags = BIT(0);
++ 		else
++ 			flags = 0;
++ 
++ 		memcpy(rp->features[idx].uuid, simult_central_periph_uuid, 16);
++ 		rp->features[idx].flags = cpu_to_le32(flags);
++ 		idx++;
++ 	}
++ 
++ 	rp->feature_count = cpu_to_le16(idx);
++ 
++ 	/* After reading the experimental features information, enable
++ 	 * the events to update client on any future change.
++ 	 */
++ 	hci_sock_set_flag(sk, HCI_MGMT_EXP_FEATURE_EVENTS);
++ 
++ 	return mgmt_cmd_complete(sk, hdev ? hdev->id : MGMT_INDEX_NONE,
++ 				 MGMT_OP_READ_EXP_FEATURES_INFO,
++ 				 0, rp, sizeof(*rp) + (20 * idx));
++ }
++ 
++ #ifdef CONFIG_BT_FEATURE_DEBUG
++ static int exp_debug_feature_changed(bool enabled, struct sock *skip)
++ {
++ 	struct mgmt_ev_exp_feature_changed ev;
++ 
++ 	memset(&ev, 0, sizeof(ev));
++ 	memcpy(ev.uuid, debug_uuid, 16);
++ 	ev.flags = cpu_to_le32(enabled ? BIT(0) : 0);
++ 
++ 	return mgmt_limited_event(MGMT_EV_EXP_FEATURE_CHANGED, NULL,
++ 				  &ev, sizeof(ev),
++ 				  HCI_MGMT_EXP_FEATURE_EVENTS, skip);
++ }
++ #endif
++ 
++ static int set_exp_feature(struct sock *sk, struct hci_dev *hdev,
++ 			   void *data, u16 data_len)
++ {
++ 	struct mgmt_cp_set_exp_feature *cp = data;
++ 	struct mgmt_rp_set_exp_feature rp;
++ 
++ 	bt_dev_dbg(hdev, "sock %p", sk);
++ 
++ 	if (!memcmp(cp->uuid, ZERO_KEY, 16)) {
++ 		memset(rp.uuid, 0, 16);
++ 		rp.flags = cpu_to_le32(0);
++ 
++ #ifdef CONFIG_BT_FEATURE_DEBUG
++ 		if (!hdev) {
++ 			bool changed = bt_dbg_get();
++ 
++ 			bt_dbg_set(false);
++ 
++ 			if (changed)
++ 				exp_debug_feature_changed(false, sk);
++ 		}
++ #endif
++ 
++ 		hci_sock_set_flag(sk, HCI_MGMT_EXP_FEATURE_EVENTS);
++ 
++ 		return mgmt_cmd_complete(sk, hdev ? hdev->id : MGMT_INDEX_NONE,
++ 					 MGMT_OP_SET_EXP_FEATURE, 0,
++ 					 &rp, sizeof(rp));
++ 	}
++ 
++ #ifdef CONFIG_BT_FEATURE_DEBUG
++ 	if (!memcmp(cp->uuid, debug_uuid, 16)) {
++ 		bool val, changed;
++ 		int err;
++ 
++ 		/* Command requires to use the non-controller index */
++ 		if (hdev)
++ 			return mgmt_cmd_status(sk, hdev->id,
++ 					       MGMT_OP_SET_EXP_FEATURE,
++ 					       MGMT_STATUS_INVALID_INDEX);
++ 
++ 		/* Parameters are limited to a single octet */
++ 		if (data_len != MGMT_SET_EXP_FEATURE_SIZE + 1)
++ 			return mgmt_cmd_status(sk, MGMT_INDEX_NONE,
++ 					       MGMT_OP_SET_EXP_FEATURE,
++ 					       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 		/* Only boolean on/off is supported */
++ 		if (cp->param[0] != 0x00 && cp->param[0] != 0x01)
++ 			return mgmt_cmd_status(sk, MGMT_INDEX_NONE,
++ 					       MGMT_OP_SET_EXP_FEATURE,
++ 					       MGMT_STATUS_INVALID_PARAMS);
++ 
++ 		val = !!cp->param[0];
++ 		changed = val ? !bt_dbg_get() : bt_dbg_get();
++ 		bt_dbg_set(val);
++ 
++ 		memcpy(rp.uuid, debug_uuid, 16);
++ 		rp.flags = cpu_to_le32(val ? BIT(0) : 0);
++ 
++ 		hci_sock_set_flag(sk, HCI_MGMT_EXP_FEATURE_EVENTS);
++ 
++ 		err = mgmt_cmd_complete(sk, MGMT_INDEX_NONE,
++ 					MGMT_OP_SET_EXP_FEATURE, 0,
++ 					&rp, sizeof(rp));
++ 
++ 		if (changed)
++ 			exp_debug_feature_changed(val, sk);
++ 
++ 		return err;
++ 	}
++ #endif
++ 
++ 	return mgmt_cmd_status(sk, hdev ? hdev->id : MGMT_INDEX_NONE,
++ 			       MGMT_OP_SET_EXP_FEATURE,
++ 			       MGMT_STATUS_NOT_SUPPORTED);
++ }
++ 
++ #define SUPPORTED_DEVICE_FLAGS() ((1U << HCI_CONN_FLAG_MAX) - 1)
++ 
++ static int get_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
++ 			    u16 data_len)
++ {
++ 	struct mgmt_cp_get_device_flags *cp = data;
++ 	struct mgmt_rp_get_device_flags rp;
++ 	struct bdaddr_list_with_flags *br_params;
++ 	struct hci_conn_params *params;
++ 	u32 supported_flags = SUPPORTED_DEVICE_FLAGS();
++ 	u32 current_flags = 0;
++ 	u8 status = MGMT_STATUS_INVALID_PARAMS;
++ 
++ 	bt_dev_dbg(hdev, "Get device flags %pMR (type 0x%x)\n",
++ 		   &cp->addr.bdaddr, cp->addr.type);
++ 
++ 	hci_dev_lock(hdev);
++ 
++ 	if (cp->addr.type == BDADDR_BREDR) {
++ 		br_params = hci_bdaddr_list_lookup_with_flags(&hdev->whitelist,
++ 							      &cp->addr.bdaddr,
++ 							      cp->addr.type);
++ 		if (!br_params)
++ 			goto done;
++ 
++ 		current_flags = br_params->current_flags;
++ 	} else {
++ 		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
++ 						le_addr_type(cp->addr.type));
++ 
++ 		if (!params)
++ 			goto done;
++ 
++ 		current_flags = params->current_flags;
++ 	}
++ 
++ 	bacpy(&rp.addr.bdaddr, &cp->addr.bdaddr);
++ 	rp.addr.type = cp->addr.type;
++ 	rp.supported_flags = cpu_to_le32(supported_flags);
++ 	rp.current_flags = cpu_to_le32(current_flags);
++ 
++ 	status = MGMT_STATUS_SUCCESS;
++ 
++ done:
++ 	hci_dev_unlock(hdev);
++ 
++ 	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_GET_DEVICE_FLAGS, status,
++ 				&rp, sizeof(rp));
++ }
++ 
++ static void device_flags_changed(struct sock *sk, struct hci_dev *hdev,
++ 				 bdaddr_t *bdaddr, u8 bdaddr_type,
++ 				 u32 supported_flags, u32 current_flags)
++ {
++ 	struct mgmt_ev_device_flags_changed ev;
++ 
++ 	bacpy(&ev.addr.bdaddr, bdaddr);
++ 	ev.addr.type = bdaddr_type;
++ 	ev.supported_flags = cpu_to_le32(supported_flags);
++ 	ev.current_flags = cpu_to_le32(current_flags);
++ 
++ 	mgmt_event(MGMT_EV_DEVICE_FLAGS_CHANGED, hdev, &ev, sizeof(ev), sk);
++ }
++ 
++ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
+++>>>>>>> 15d8ce05ebec (Bluetooth: le_simult_central_peripheral experimental feature)
+  			    u16 len)
+  {
+ -	struct mgmt_cp_set_device_flags *cp = data;
+ -	struct bdaddr_list_with_flags *br_params;
+ -	struct hci_conn_params *params;
+ -	u8 status = MGMT_STATUS_INVALID_PARAMS;
+ -	u32 supported_flags = SUPPORTED_DEVICE_FLAGS();
+ -	u32 current_flags = __le32_to_cpu(cp->current_flags);
+ -
+ -	bt_dev_dbg(hdev, "Set device flags %pMR (type 0x%x) = 0x%x",
+ -		   &cp->addr.bdaddr, cp->addr.type,
+ -		   __le32_to_cpu(current_flags));
+ -
+ -	if ((supported_flags | current_flags) != supported_flags) {
+ -		bt_dev_warn(hdev, "Bad flag given (0x%x) vs supported (0x%0x)",
+ -			    current_flags, supported_flags);
+ -		goto done;
+ -	}
+ -
+ -	hci_dev_lock(hdev);
+ -
+ -	if (cp->addr.type == BDADDR_BREDR) {
+ -		br_params = hci_bdaddr_list_lookup_with_flags(&hdev->whitelist,
+ -							      &cp->addr.bdaddr,
+ -							      cp->addr.type);
+ -
+ -		if (br_params) {
+ -			br_params->current_flags = current_flags;
+ -			status = MGMT_STATUS_SUCCESS;
+ -		} else {
+ -			bt_dev_warn(hdev, "No such BR/EDR device %pMR (0x%x)",
+ -				    &cp->addr.bdaddr, cp->addr.type);
+ -		}
+ -	} else {
+ -		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
+ -						le_addr_type(cp->addr.type));
+ -		if (params) {
+ -			params->current_flags = current_flags;
+ -			status = MGMT_STATUS_SUCCESS;
+ -		} else {
+ -			bt_dev_warn(hdev, "No such LE device %pMR (0x%x)",
+ -				    &cp->addr.bdaddr,
+ -				    le_addr_type(cp->addr.type));
+ -		}
+ -	}
+ -
+ -done:
+ -	hci_dev_unlock(hdev);
+ -
+ -	if (status == MGMT_STATUS_SUCCESS)
+ -		device_flags_changed(sk, hdev, &cp->addr.bdaddr, cp->addr.type,
+ -				     supported_flags, current_flags);
+ -
+ -	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_SET_DEVICE_FLAGS, status,
+ -				 &cp->addr, sizeof(cp->addr));
+ -}
+ -
+ -static void mgmt_adv_monitor_added(struct sock *sk, struct hci_dev *hdev,
+ -				   u16 handle)
+ -{
+ -	struct mgmt_ev_adv_monitor_added ev;
+ -
+ -	ev.monitor_handle = cpu_to_le16(handle);
+ -
+ -	mgmt_event(MGMT_EV_ADV_MONITOR_ADDED, hdev, &ev, sizeof(ev), sk);
+ -}
+ -
+ -static void mgmt_adv_monitor_removed(struct sock *sk, struct hci_dev *hdev,
+ -				     u16 handle)
+ -{
+ -	struct mgmt_ev_adv_monitor_added ev;
+ -
+ -	ev.monitor_handle = cpu_to_le16(handle);
+ -
+ -	mgmt_event(MGMT_EV_ADV_MONITOR_REMOVED, hdev, &ev, sizeof(ev), sk);
+ -}
+ -
+ -static int read_adv_mon_features(struct sock *sk, struct hci_dev *hdev,
+ -				 void *data, u16 len)
+ -{
+ -	struct adv_monitor *monitor = NULL;
+ -	struct mgmt_rp_read_adv_monitor_features *rp = NULL;
+ -	int handle;
+ -	size_t rp_size = 0;
+ -	__u32 supported = 0;
+ -	__u16 num_handles = 0;
+ -	__u16 handles[HCI_MAX_ADV_MONITOR_NUM_HANDLES];
+ -
+ -	BT_DBG("request for %s", hdev->name);
+ -
+ -	hci_dev_lock(hdev);
+ -
+ -	if (msft_get_features(hdev) & MSFT_FEATURE_MASK_LE_ADV_MONITOR)
+ -		supported |= MGMT_ADV_MONITOR_FEATURE_MASK_OR_PATTERNS;
+ -
+ -	idr_for_each_entry(&hdev->adv_monitors_idr, monitor, handle) {
+ -		handles[num_handles++] = monitor->handle;
+ -	}
+ -
+ -	hci_dev_unlock(hdev);
+ -
+ -	rp_size = sizeof(*rp) + (num_handles * sizeof(u16));
+ -	rp = kmalloc(rp_size, GFP_KERNEL);
+ -	if (!rp)
+ -		return -ENOMEM;
+ -
+ -	/* Once controller-based monitoring is in place, the enabled_features
+ -	 * should reflect the use.
+ -	 */
+ -	rp->supported_features = cpu_to_le32(supported);
+ -	rp->enabled_features = 0;
+ -	rp->max_num_handles = cpu_to_le16(HCI_MAX_ADV_MONITOR_NUM_HANDLES);
+ -	rp->max_num_patterns = HCI_MAX_ADV_MONITOR_NUM_PATTERNS;
+ -	rp->num_handles = cpu_to_le16(num_handles);
+ -	if (num_handles)
+ -		memcpy(&rp->handles, &handles, (num_handles * sizeof(u16)));
+ -
+ -	return mgmt_cmd_complete(sk, hdev->id,
+ -				 MGMT_OP_READ_ADV_MONITOR_FEATURES,
+ -				 MGMT_STATUS_SUCCESS, rp, rp_size);
+ -}
+ -
+ -static int add_adv_patterns_monitor(struct sock *sk, struct hci_dev *hdev,
+ -				    void *data, u16 len)
+ -{
+ -	struct mgmt_cp_add_adv_patterns_monitor *cp = data;
+ -	struct mgmt_rp_add_adv_patterns_monitor rp;
+ -	struct adv_monitor *m = NULL;
+ -	struct adv_pattern *p = NULL;
+ -	unsigned int mp_cnt = 0, prev_adv_monitors_cnt;
+ -	__u8 cp_ofst = 0, cp_len = 0;
+ -	int err, i;
+ +	int err = MGMT_STATUS_SUCCESS;
+ +	struct mgmt_cp_set_blocked_keys *keys = data;
+ +	const u16 max_key_count = ((U16_MAX - sizeof(*keys)) /
+ +				   sizeof(struct mgmt_blocked_key_info));
+ +	u16 key_count, expected_len;
+ +	int i;
+  
+  	BT_DBG("request for %s", hdev->name);
+  
+* Unmerged path net/bluetooth/mgmt.c
