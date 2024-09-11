@@ -1,0 +1,115 @@
+x86/pkru: Remove xstate fiddling from write_pkru()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 72a6c08c44e4460e39315ca828f60b8d5afd6b19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/72a6c08c.failed
+
+The PKRU value of a task is stored in task->thread.pkru when the task is
+scheduled out. PKRU is restored on schedule in from there. So keeping the
+XSAVE buffer up to date is a pointless exercise.
+
+Remove the xstate fiddling and cleanup all related functions.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.897372712@linutronix.de
+(cherry picked from commit 72a6c08c44e4460e39315ca828f60b8d5afd6b19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pkru.h
+diff --cc arch/x86/include/asm/pkru.h
+index 42811035a543,ccc539faa5bb..000000000000
+--- a/arch/x86/include/asm/pkru.h
++++ b/arch/x86/include/asm/pkru.h
+@@@ -41,23 -41,14 +41,20 @@@ static inline u32 read_pkru(void
+  
+  static inline void write_pkru(u32 pkru)
+  {
+++<<<<<<< HEAD
+ +	struct pkru_state *pk;
+ +
+ +	if (!boot_cpu_has(X86_FEATURE_OSPKE))
+++=======
++ 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+++>>>>>>> 72a6c08c44e4 (x86/pkru: Remove xstate fiddling from write_pkru())
+  		return;
+- 
+- 	pk = get_xsave_addr(&current->thread.fpu.state.xsave, XFEATURE_PKRU);
+- 
+  	/*
+- 	 * The PKRU value in xstate needs to be in sync with the value that is
+- 	 * written to the CPU. The FPU restore on return to userland would
+- 	 * otherwise load the previous value again.
++ 	 * WRPKRU is relatively expensive compared to RDPKRU.
++ 	 * Avoid WRPKRU when it would not change the value.
+  	 */
+- 	fpregs_lock();
+- 	if (pk)
+- 		pk->pkru = pkru;
+- 	__write_pkru(pkru);
+- 	fpregs_unlock();
++ 	if (pkru != rdpkru())
++ 		wrpkru(pkru);
+  }
+  
+  static inline void pkru_write_default(void)
+* Unmerged path arch/x86/include/asm/pkru.h
+diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+index 4e831af97daf..c36d0cc08975 100644
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@ -119,25 +119,13 @@ static inline void wrpkru(u32 pkru)
+ 		     : : "a" (pkru), "c"(ecx), "d"(edx));
+ }
+ 
+-static inline void __write_pkru(u32 pkru)
+-{
+-	/*
+-	 * WRPKRU is relatively expensive compared to RDPKRU.
+-	 * Avoid WRPKRU when it would not change the value.
+-	 */
+-	if (pkru == rdpkru())
+-		return;
+-
+-	wrpkru(pkru);
+-}
+-
+ #else
+ static inline u32 rdpkru(void)
+ {
+ 	return 0;
+ }
+ 
+-static inline void __write_pkru(u32 pkru)
++static inline void wrpkru(u32 pkru)
+ {
+ }
+ #endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index f11d38cc6d91..a09e5761498f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -931,7 +931,7 @@ void kvm_load_guest_xsave_state(struct kvm_vcpu *vcpu)
+ 	    (kvm_read_cr4_bits(vcpu, X86_CR4_PKE) ||
+ 	     (vcpu->arch.xcr0 & XFEATURE_MASK_PKRU)) &&
+ 	    vcpu->arch.pkru != vcpu->arch.host_pkru)
+-		__write_pkru(vcpu->arch.pkru);
++		write_pkru(vcpu->arch.pkru);
+ }
+ EXPORT_SYMBOL_GPL(kvm_load_guest_xsave_state);
+ 
+@@ -945,7 +945,7 @@ void kvm_load_host_xsave_state(struct kvm_vcpu *vcpu)
+ 	     (vcpu->arch.xcr0 & XFEATURE_MASK_PKRU))) {
+ 		vcpu->arch.pkru = rdpkru();
+ 		if (vcpu->arch.pkru != vcpu->arch.host_pkru)
+-			__write_pkru(vcpu->arch.host_pkru);
++			write_pkru(vcpu->arch.host_pkru);
+ 	}
+ 
+ 	if (kvm_read_cr4_bits(vcpu, X86_CR4_OSXSAVE)) {
