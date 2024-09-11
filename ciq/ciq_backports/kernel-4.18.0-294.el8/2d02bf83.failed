@@ -1,0 +1,191 @@
+powerpc/papr_scm: Fetch nvdimm performance stats from PHYP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vaibhav Jain <vaibhav@linux.ibm.com>
+commit 2d02bf835e5731de632c8a13567905fa7c0da01c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2d02bf83.failed
+
+Update papr_scm.c to query dimm performance statistics from PHYP via
+H_SCM_PERFORMANCE_STATS hcall and export them to user-space as PAPR
+specific NVDIMM attribute 'perf_stats' in sysfs. The patch also
+provide a sysfs ABI documentation for the stats being reported and
+their meanings.
+
+During NVDIMM probe time in papr_scm_nvdimm_init() a special variant
+of H_SCM_PERFORMANCE_STATS hcall is issued to check if collection of
+performance statistics is supported or not. If successful then a PHYP
+returns a maximum possible buffer length needed to read all
+performance stats. This returned value is stored in a per-nvdimm
+attribute 'stat_buffer_len'.
+
+The layout of request buffer for reading NVDIMM performance stats from
+PHYP is defined in 'struct papr_scm_perf_stats' and 'struct
+papr_scm_perf_stat'. These structs are used in newly introduced
+drc_pmem_query_stats() that issues the H_SCM_PERFORMANCE_STATS hcall.
+
+The sysfs access function perf_stats_show() uses value
+'stat_buffer_len' to allocate a buffer large enough to hold all
+possible NVDIMM performance stats and passes it to
+drc_pmem_query_stats() to populate. Finally statistics reported in the
+buffer are formatted into the sysfs access function output buffer.
+
+	Signed-off-by: Vaibhav Jain <vaibhav@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200731064153.182203-2-vaibhav@linux.ibm.com
+(cherry picked from commit 2d02bf835e5731de632c8a13567905fa7c0da01c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/papr_scm.c
+diff --cc arch/powerpc/platforms/pseries/papr_scm.c
+index 292deced159f,f37f3f70007d..000000000000
+--- a/arch/powerpc/platforms/pseries/papr_scm.c
++++ b/arch/powerpc/platforms/pseries/papr_scm.c
+@@@ -89,8 -112,14 +109,11 @@@ struct papr_scm_priv 
+  
+  	/* Health information for the dimm */
+  	u64 health_bitmap;
++ 
++ 	/* length of the stat buffer as expected by phyp */
++ 	size_t stat_buffer_len;
+  };
+  
+ -static LIST_HEAD(papr_nd_regions);
+ -static DEFINE_MUTEX(papr_ndr_lock);
+ -
+  static int drc_pmem_bind(struct papr_scm_priv *p)
+  {
+  	unsigned long ret[PLPAR_HCALL_BUFSIZE];
+@@@ -629,24 -733,47 +725,68 @@@ int papr_scm_ndctl(struct nvdimm_bus_de
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int papr_scm_node(int node)
+ +{
+ +	int min_dist = INT_MAX, dist;
+ +	int nid, min_node;
+ +
+ +	if ((node == NUMA_NO_NODE) || node_online(node))
+ +		return node;
+ +
+ +	min_node = first_online_node;
+ +	for_each_online_node(nid) {
+ +		dist = node_distance(node, nid);
+ +		if (dist < min_dist) {
+ +			min_dist = dist;
+ +			min_node = nid;
+ +		}
+ +	}
+ +	return min_node;
+ +}
+++=======
++ static ssize_t perf_stats_show(struct device *dev,
++ 			       struct device_attribute *attr, char *buf)
++ {
++ 	int index, rc;
++ 	struct seq_buf s;
++ 	struct papr_scm_perf_stat *stat;
++ 	struct papr_scm_perf_stats *stats;
++ 	struct nvdimm *dimm = to_nvdimm(dev);
++ 	struct papr_scm_priv *p = nvdimm_provider_data(dimm);
++ 
++ 	if (!p->stat_buffer_len)
++ 		return -ENOENT;
++ 
++ 	/* Allocate the buffer for phyp where stats are written */
++ 	stats = kzalloc(p->stat_buffer_len, GFP_KERNEL);
++ 	if (!stats)
++ 		return -ENOMEM;
++ 
++ 	/* Ask phyp to return all dimm perf stats */
++ 	rc = drc_pmem_query_stats(p, stats, 0);
++ 	if (rc)
++ 		goto free_stats;
++ 	/*
++ 	 * Go through the returned output buffer and print stats and
++ 	 * values. Since stat_id is essentially a char string of
++ 	 * 8 bytes, simply use the string format specifier to print it.
++ 	 */
++ 	seq_buf_init(&s, buf, PAGE_SIZE);
++ 	for (index = 0, stat = stats->scm_statistic;
++ 	     index < be32_to_cpu(stats->num_statistics);
++ 	     ++index, ++stat) {
++ 		seq_buf_printf(&s, "%.8s = 0x%016llX\n",
++ 			       stat->stat_id,
++ 			       be64_to_cpu(stat->stat_val));
++ 	}
++ 
++ free_stats:
++ 	kfree(stats);
++ 	return rc ? rc : seq_buf_used(&s);
++ }
++ DEVICE_ATTR_RO(perf_stats);
+++>>>>>>> 2d02bf835e57 (powerpc/papr_scm: Fetch nvdimm performance stats from PHYP)
+  
+  static ssize_t flags_show(struct device *dev,
+  			  struct device_attribute *attr, char *buf)
+@@@ -773,6 -905,20 +915,23 @@@ static int papr_scm_nvdimm_init(struct 
+  		dev_info(dev, "Region registered with target node %d and online node %d",
+  			 target_nid, online_nid);
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&papr_ndr_lock);
++ 	list_add_tail(&p->region_list, &papr_nd_regions);
++ 	mutex_unlock(&papr_ndr_lock);
++ 
++ 	/* Try retriving the stat buffer and see if its supported */
++ 	stat_size = drc_pmem_query_stats(p, NULL, 0);
++ 	if (stat_size > 0) {
++ 		p->stat_buffer_len = stat_size;
++ 		dev_dbg(&p->pdev->dev, "Max perf-stat size %lu-bytes\n",
++ 			p->stat_buffer_len);
++ 	} else {
++ 		dev_info(&p->pdev->dev, "Dimm performance stats unavailable\n");
++ 	}
++ 
+++>>>>>>> 2d02bf835e57 (powerpc/papr_scm: Fetch nvdimm performance stats from PHYP)
+  	return 0;
+  
+  err:	nvdimm_bus_unregister(p->bus);
+diff --git a/Documentation/ABI/testing/sysfs-bus-papr-pmem b/Documentation/ABI/testing/sysfs-bus-papr-pmem
+index 5b10d036a8d4..c1a67275c43f 100644
+--- a/Documentation/ABI/testing/sysfs-bus-papr-pmem
++++ b/Documentation/ABI/testing/sysfs-bus-papr-pmem
+@@ -25,3 +25,30 @@ Description:
+ 				  NVDIMM have been scrubbed.
+ 		* "locked"	: Indicating that NVDIMM contents cant
+ 				  be modified until next power cycle.
++
++What:		/sys/bus/nd/devices/nmemX/papr/perf_stats
++Date:		May, 2020
++KernelVersion:	v5.9
++Contact:	linuxppc-dev <linuxppc-dev@lists.ozlabs.org>, linux-nvdimm@lists.01.org,
++Description:
++		(RO) Report various performance stats related to papr-scm NVDIMM
++		device.  Each stat is reported on a new line with each line
++		composed of a stat-identifier followed by it value. Below are
++		currently known dimm performance stats which are reported:
++
++		* "CtlResCt" : Controller Reset Count
++		* "CtlResTm" : Controller Reset Elapsed Time
++		* "PonSecs " : Power-on Seconds
++		* "MemLife " : Life Remaining
++		* "CritRscU" : Critical Resource Utilization
++		* "HostLCnt" : Host Load Count
++		* "HostSCnt" : Host Store Count
++		* "HostSDur" : Host Store Duration
++		* "HostLDur" : Host Load Duration
++		* "MedRCnt " : Media Read Count
++		* "MedWCnt " : Media Write Count
++		* "MedRDur " : Media Read Duration
++		* "MedWDur " : Media Write Duration
++		* "CchRHCnt" : Cache Read Hit Count
++		* "CchWHCnt" : Cache Write Hit Count
++		* "FastWCnt" : Fast Write Count
+\ No newline at end of file
+* Unmerged path arch/powerpc/platforms/pseries/papr_scm.c
