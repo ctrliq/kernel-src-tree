@@ -1,0 +1,169 @@
+s390/pci: fix leak of PCI device structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 0b13525c20febcfecccf6fc1db5969727401317d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/0b13525c.failed
+
+In commit 05bc1be6db4b2 ("s390/pci: create zPCI bus") we removed the
+pci_dev_put() call matching the earlier pci_get_slot() done as part of
+__zpci_event_availability(). This was based on the wrong understanding
+that the device_put() done as part of pci_destroy_device() would counter
+the pci_get_slot() when it only counters the initial reference. This
+same understanding and existing bad example also lead to not doing
+a pci_dev_put() in zpci_remove_device().
+
+Since releasing the PCI devices, unlike releasing the PCI slot, does not
+print any debug message for testing I added one in pci_release_dev().
+This revealed that we are indeed leaking the PCI device on PCI
+hotunplug. Further testing also revealed another missing pci_dev_put() in
+disable_slot().
+
+Fix this by adding the missing pci_dev_put() in disable_slot() and fix
+zpci_remove_device() with the correct pci_dev_put() calls. Also instead
+of calling pci_get_slot() in __zpci_event_availability() to determine if
+a PCI device is registered and then doing the same again in
+zpci_remove_device() do this once in zpci_remove_device() which makes
+sure that the pdev in __zpci_event_availability() is only used for the
+result of pci_scan_single_device() which does not need a reference count
+decremnt as its ownership goes to the PCI bus.
+
+Also move the check if zdev->zbus->bus is set into zpci_remove_device()
+since it may be that we're removing a device with devfn != 0 which never
+had a PCI bus. So we can still set the pdev->error_state to indicate
+that the device is not usable anymore, add a flag to set the error state.
+
+Fixes: 05bc1be6db4b2 ("s390/pci: create zPCI bus")
+	Cc: <stable@vger.kernel.org> # 5.8+: e1bff843cde6 s390/pci: remove superfluous zdev->zbus check
+	Cc: <stable@vger.kernel.org> # 5.8+: ba764dd703fe s390/pci: refactor zpci_create_device()
+	Cc: <stable@vger.kernel.org> # 5.8+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 0b13525c20febcfecccf6fc1db5969727401317d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pci.h
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/include/asm/pci.h
+index 4f768fcec21b,a75d94a9bcb2..000000000000
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@@ -197,13 -201,10 +197,18 @@@ extern unsigned int s390_pci_no_rid
+    Prototypes
+  ----------------------------------------------------------------------------- */
+  /* Base stuff */
+++<<<<<<< HEAD
+ +int zpci_create_device(struct zpci_dev *);
+ +void zpci_remove_device(struct zpci_dev *zdev);
+++=======
++ int zpci_create_device(u32 fid, u32 fh, enum zpci_state state);
++ void zpci_remove_device(struct zpci_dev *zdev, bool set_error);
+++>>>>>>> 0b13525c20fe (s390/pci: fix leak of PCI device structure)
+  int zpci_enable_device(struct zpci_dev *);
+  int zpci_disable_device(struct zpci_dev *);
+ +void zpci_device_reserved(struct zpci_dev *zdev);
+ +bool zpci_is_device_configured(struct zpci_dev *zdev);
+ +
+  int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64);
+  int zpci_unregister_ioat(struct zpci_dev *, u8);
+  void zpci_remove_reserved_devices(void);
+diff --cc arch/s390/pci/pci.c
+index d206caf84217,91064077526d..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -728,11 -696,22 +737,27 @@@ void zpci_remove_device(struct zpci_de
+  	struct zpci_bus *zbus = zdev->zbus;
+  	struct pci_dev *pdev;
+  
++ 	if (!zdev->zbus->bus)
++ 		return;
++ 
+  	pdev = pci_get_slot(zbus->bus, zdev->devfn);
+  	if (pdev) {
+++<<<<<<< HEAD
+ +		if (pdev->is_virtfn)
+ +			return zpci_remove_virtfn(pdev, zdev->vfn);
+++=======
++ 		if (set_error)
++ 			pdev->error_state = pci_channel_io_perm_failure;
++ 		if (pdev->is_virtfn) {
++ 			zpci_iov_remove_virtfn(pdev, zdev->vfn);
++ 			/* balance pci_get_slot */
++ 			pci_dev_put(pdev);
++ 			return;
++ 		}
+++>>>>>>> 0b13525c20fe (s390/pci: fix leak of PCI device structure)
+  		pci_stop_and_remove_bus_device_locked(pdev);
++ 		/* balance pci_get_slot */
++ 		pci_dev_put(pdev);
+  	}
+  }
+  
+* Unmerged path arch/s390/include/asm/pci.h
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_event.c b/arch/s390/pci/pci_event.c
+index b32a8575da86..bdcf288cf8cc 100644
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@ -76,13 +76,10 @@ void zpci_event_error(void *data)
+ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ {
+ 	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
+-	struct pci_dev *pdev = NULL;
+ 	enum zpci_state state;
++	struct pci_dev *pdev;
+ 	int ret;
+ 
+-	if (zdev && zdev->zbus->bus)
+-		pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
+-
+ 	zpci_err("avail CCDF:\n");
+ 	zpci_err_hex(ccdf, sizeof(*ccdf));
+ 
+@@ -124,8 +121,7 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 	case 0x0303: /* Deconfiguration requested */
+ 		if (!zdev)
+ 			break;
+-		if (pdev)
+-			zpci_remove_device(zdev);
++		zpci_remove_device(zdev, false);
+ 
+ 		ret = zpci_disable_device(zdev);
+ 		if (ret)
+@@ -140,12 +136,10 @@ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ 	case 0x0304: /* Configured -> Standby|Reserved */
+ 		if (!zdev)
+ 			break;
+-		if (pdev) {
+-			/* Give the driver a hint that the function is
+-			 * already unusable. */
+-			pdev->error_state = pci_channel_io_perm_failure;
+-			zpci_remove_device(zdev);
+-		}
++		/* Give the driver a hint that the function is
++		 * already unusable.
++		 */
++		zpci_remove_device(zdev, true);
+ 
+ 		zdev->fh = ccdf->fh;
+ 		zpci_disable_device(zdev);
+diff --git a/drivers/pci/hotplug/s390_pci_hpc.c b/drivers/pci/hotplug/s390_pci_hpc.c
+index 8534cf105796..93174f503464 100644
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@ -93,8 +93,9 @@ static int disable_slot(struct hotplug_slot *hotplug_slot)
+ 		pci_dev_put(pdev);
+ 		return -EBUSY;
+ 	}
++	pci_dev_put(pdev);
+ 
+-	zpci_remove_device(zdev);
++	zpci_remove_device(zdev, false);
+ 
+ 	rc = zpci_disable_device(zdev);
+ 	if (rc)
