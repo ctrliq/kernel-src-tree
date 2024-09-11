@@ -1,0 +1,138 @@
+x86/fpu: Eager switch PKRU state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Rik van Riel <riel@surriel.com>
+commit 0cecca9d03c964abbd2b7927d0670eb70db4ebf2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0cecca9d.failed
+
+While most of a task's FPU state is only needed in user space, the
+protection keys need to be in place immediately after a context switch.
+
+The reason is that any access to userspace memory while running in
+kernel mode also needs to abide by the memory permissions specified in
+the protection keys.
+
+The "eager switch" is a preparation for loading the FPU state on return
+to userland. Instead of decoupling PKRU state from xstate, update PKRU
+within xstate on write operations by the kernel.
+
+For user tasks the PKRU should be always read from the xsave area and it
+should not change anything because the PKRU value was loaded as part of
+FPU restore.
+
+For kernel threads the default "init_pkru_value" will be written. Before
+this commit, the kernel thread would end up with a random value which it
+inherited from the previous user task.
+
+ [ bigeasy: save pkru to xstate, no cache, don't use __raw_xsave_addr() ]
+
+ [ bp: update commit message, sort headers properly in asm/fpu/xstate.h ]
+
+	Signed-off-by: Rik van Riel <riel@surriel.com>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Aubrey Li <aubrey.li@intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+	Cc: Joerg Roedel <jroedel@suse.de>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: kvm ML <kvm@vger.kernel.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190403164156.19645-16-bigeasy@linutronix.de
+(cherry picked from commit 0cecca9d03c964abbd2b7927d0670eb70db4ebf2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/internal.h
+diff --cc arch/x86/include/asm/fpu/internal.h
+index 8265ef2d693b,6eb4a0b1ad0e..000000000000
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@@ -548,14 -535,27 +549,38 @@@ switch_fpu_prepare(struct fpu *old_fpu
+   */
+  static inline void switch_fpu_finish(struct fpu *new_fpu, int cpu)
+  {
+++<<<<<<< HEAD
+ +	bool preload = static_cpu_has(X86_FEATURE_FPU) &&
+ +		       new_fpu->initialized;
+ +
+ +	if (preload) {
+ +		if (!fpregs_state_valid(new_fpu, cpu))
+ +			copy_kernel_to_fpregs(&new_fpu->state);
+ +		fpregs_activate(new_fpu);
+ +	}
+++=======
++ 	u32 pkru_val = init_pkru_value;
++ 	struct pkru_state *pk;
++ 
++ 	if (!static_cpu_has(X86_FEATURE_FPU))
++ 		return;
++ 
++ 	__fpregs_load_activate(new_fpu, cpu);
++ 
++ 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
++ 		return;
++ 
++ 	/*
++ 	 * PKRU state is switched eagerly because it needs to be valid before we
++ 	 * return to userland e.g. for a copy_to_user() operation.
++ 	 */
++ 	if (current->mm) {
++ 		pk = get_xsave_addr(&new_fpu->state.xsave, XFEATURE_PKRU);
++ 		if (pk)
++ 			pkru_val = pk->pkru;
++ 	}
++ 	__write_pkru(pkru_val);
+++>>>>>>> 0cecca9d03c9 (x86/fpu: Eager switch PKRU state)
+  }
+  
+  /*
+* Unmerged path arch/x86/include/asm/fpu/internal.h
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 48581988d78c..7da5d197f02c 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -2,9 +2,11 @@
+ #ifndef __ASM_X86_XSAVE_H
+ #define __ASM_X86_XSAVE_H
+ 
++#include <linux/uaccess.h>
+ #include <linux/types.h>
++
+ #include <asm/processor.h>
+-#include <linux/uaccess.h>
++#include <asm/user.h>
+ 
+ /* Bit 63 of XCR0 is reserved for future expansion */
+ #define XFEATURE_MASK_EXTEND	(~(XFEATURE_MASK_FPSSE | (1ULL << 63)))
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 4c645521002d..c32a4e646fb0 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -1266,6 +1266,12 @@ static inline pmd_t pmd_swp_clear_soft_dirty(pmd_t pmd)
+ #define PKRU_WD_BIT 0x2
+ #define PKRU_BITS_PER_PKEY 2
+ 
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++extern u32 init_pkru_value;
++#else
++#define init_pkru_value	0
++#endif
++
+ static inline bool __pkru_allows_read(u32 pkru, u16 pkey)
+ {
+ 	int pkru_pkey_bits = pkey * PKRU_BITS_PER_PKEY;
