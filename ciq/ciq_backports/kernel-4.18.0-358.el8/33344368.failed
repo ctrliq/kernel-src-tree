@@ -1,0 +1,269 @@
+x86/fpu: Clean up the fpu__clear() variants
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 33344368cb08f8d6bf55a32aa052318d3a69ea84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/33344368.failed
+
+fpu__clear() currently resets both register state and kernel XSAVE buffer
+state.  It has two modes: one for all state (supervisor and user) and
+another for user state only.  fpu__clear_all() uses the "all state"
+(user_only=0) mode, while a number of signal paths use the user_only=1
+mode.
+
+Make fpu__clear() work only for user state (user_only=1) and remove the
+"all state" (user_only=0) code.  Rename it to match so it can be used by
+the signal paths.
+
+Replace the "all state" (user_only=0) fpu__clear() functionality.  Use the
+TIF_NEED_FPU_LOAD functionality instead of making any actual hardware
+registers changes in this path.
+
+Instead of invoking fpu__initialize() just memcpy() init_fpstate into the
+task's FPU state because that has already the correct format and in case of
+PKRU also contains the default PKRU value. Move the actual PKRU write out
+into flush_thread() where it belongs and where it will end up anyway when
+PKRU and XSTATE have been untangled.
+
+For bisectability a workaround is required which stores the PKRU value in
+the xstate memory until PKRU is untangled from XSTATE for context
+switching and return to user.
+
+[ Dave Hansen: Polished changelog ]
+[ tglx: Fixed the PKRU fallout ]
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121455.922729522@linutronix.de
+(cherry picked from commit 33344368cb08f8d6bf55a32aa052318d3a69ea84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/core.c
+#	arch/x86/kernel/process.c
+diff --cc arch/x86/kernel/fpu/core.c
+index 1e27c69db876,aa7e808b9d1e..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -261,63 -260,6 +261,66 @@@ int fpu__copy(struct task_struct *dst, 
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Activate the current task's in-memory FPU context,
+ + * if it has not been used before:
+ + */
+ +static void fpu__initialize(struct fpu *fpu)
+ +{
+ +	WARN_ON_FPU(fpu != &current->thread.fpu);
+ +
+ +	set_thread_flag(TIF_NEED_FPU_LOAD);
+ +	fpstate_init(&fpu->state);
+ +	trace_x86_fpu_init_state(fpu);
+ +}
+ +
+ +/*
+ + * This function must be called before we read a task's fpstate.
+ + *
+ + * There's two cases where this gets called:
+ + *
+ + * - for the current task (when coredumping), in which case we have
+ + *   to save the latest FPU registers into the fpstate,
+ + *
+ + * - or it's called for stopped tasks (ptrace), in which case the
+ + *   registers were already saved by the context-switch code when
+ + *   the task scheduled out.
+ + *
+ + * If the task has used the FPU before then save it.
+ + */
+ +void fpu__prepare_read(struct fpu *fpu)
+ +{
+ +	if (fpu == &current->thread.fpu)
+ +		fpu__save(fpu);
+ +}
+ +
+ +/*
+ + * This function must be called before we write a task's fpstate.
+ + *
+ + * Invalidate any cached FPU registers.
+ + *
+ + * After this function call, after registers in the fpstate are
+ + * modified and the child task has woken up, the child task will
+ + * restore the modified FPU state from the modified context. If we
+ + * didn't clear its cached status here then the cached in-registers
+ + * state pending on its former CPU could be restored, corrupting
+ + * the modifications.
+ + */
+ +void fpu__prepare_write(struct fpu *fpu)
+ +{
+ +	/*
+ +	 * Only stopped child tasks can be used to modify the FPU
+ +	 * state in the fpstate buffer:
+ +	 */
+ +	WARN_ON_FPU(fpu == &current->thread.fpu);
+ +
+ +	/* Invalidate any cached state: */
+ +	__fpu_invalidate_fpregs_state(fpu);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 33344368cb08 (x86/fpu: Clean up the fpu__clear() variants)
+   * Drops current FPU state: deactivates the fpregs and
+   * the fpstate. NOTE: it still leaves previous contents
+   * in the fpregs in the eager-FPU case.
+@@@ -356,17 -298,65 +359,66 @@@ static inline void copy_init_fpstate_to
+  	else
+  		frstor(&init_fpstate.fsave);
+  
+ -	pkru_write_default();
+ +	if (boot_cpu_has(X86_FEATURE_OSPKE))
+ +		copy_init_pkru_to_fpregs();
+  }
+  
++ static inline unsigned int init_fpstate_copy_size(void)
++ {
++ 	if (!use_xsave())
++ 		return fpu_kernel_xstate_size;
++ 
++ 	/* XSAVE(S) just needs the legacy and the xstate header part */
++ 	return sizeof(init_fpstate.xsave);
++ }
++ 
++ /* Temporary workaround. Will be removed once PKRU and XSTATE are untangled. */
++ static inline void pkru_set_default_in_xstate(struct xregs_state *xsave)
++ {
++ 	struct pkru_state *pk;
++ 
++ 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
++ 		return;
++ 	/*
++ 	 * Force XFEATURE_PKRU to be set in the header otherwise
++ 	 * get_xsave_addr() does not work and it also needs to be set to
++ 	 * make XRSTOR(S) load it.
++ 	 */
++ 	xsave->header.xfeatures |= XFEATURE_MASK_PKRU;
++ 	pk = get_xsave_addr(xsave, XFEATURE_PKRU);
++ 	pk->pkru = pkru_get_init_value();
++ }
++ 
+  /*
+-  * Clear the FPU state back to init state.
+-  *
+-  * Called by sys_execve(), by the signal handler code and by various
+-  * error paths.
++  * Reset current->fpu memory state to the init values.
+   */
+- static void fpu__clear(struct fpu *fpu, bool user_only)
++ static void fpu_reset_fpstate(void)
++ {
++ 	struct fpu *fpu = &current->thread.fpu;
++ 
++ 	fpregs_lock();
++ 	fpu__drop(fpu);
++ 	/*
++ 	 * This does not change the actual hardware registers. It just
++ 	 * resets the memory image and sets TIF_NEED_FPU_LOAD so a
++ 	 * subsequent return to usermode will reload the registers from the
++ 	 * task's memory image.
++ 	 *
++ 	 * Do not use fpstate_init() here. Just copy init_fpstate which has
++ 	 * the correct content already except for PKRU.
++ 	 */
++ 	memcpy(&fpu->state, &init_fpstate, init_fpstate_copy_size());
++ 	pkru_set_default_in_xstate(&fpu->state.xsave);
++ 	set_thread_flag(TIF_NEED_FPU_LOAD);
++ 	fpregs_unlock();
++ }
++ 
++ /*
++  * Reset current's user FPU states to the init states.  current's
++  * supervisor states, if any, are not modified by this function.  The
++  * caller guarantees that the XSTATE header in memory is intact.
++  */
++ void fpu__clear_user_states(struct fpu *fpu)
+  {
+  	WARN_ON_FPU(fpu != &current->thread.fpu);
+  
+@@@ -376,32 -367,33 +429,57 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	fpregs_lock();
+ +
+ +	if (user_only) {
+ +		if (!fpregs_state_valid(fpu, smp_processor_id()) &&
+ +		    xfeatures_mask_supervisor())
+ +			copy_kernel_to_xregs(&fpu->state.xsave,
+ +					     xfeatures_mask_supervisor());
+ +		copy_init_fpstate_to_fpregs(xfeatures_mask_user());
+ +	} else {
+ +		copy_init_fpstate_to_fpregs(xfeatures_mask_all);
+++=======
++ 	/*
++ 	 * Ensure that current's supervisor states are loaded into their
++ 	 * corresponding registers.
++ 	 */
++ 	if (xfeatures_mask_supervisor() &&
++ 	    !fpregs_state_valid(fpu, smp_processor_id())) {
++ 		os_xrstor(&fpu->state.xsave, xfeatures_mask_supervisor());
+++>>>>>>> 33344368cb08 (x86/fpu: Clean up the fpu__clear() variants)
+  	}
+  
++ 	/* Reset user states in registers. */
++ 	restore_fpregs_from_init_fpstate(xfeatures_mask_user());
++ 
++ 	/*
++ 	 * Now all FPU registers have their desired values.  Inform the FPU
++ 	 * state machine that current's FPU registers are in the hardware
++ 	 * registers. The memory image does not need to be updated because
++ 	 * any operation relying on it has to save the registers first when
++ 	 * current's FPU is marked active.
++ 	 */
+  	fpregs_mark_activate();
+  	fpregs_unlock();
+  }
+  
+++<<<<<<< HEAD
+ +void fpu__clear_user_states(struct fpu *fpu)
+ +{
+ +	fpu__clear(fpu, true);
+ +}
+ +
+ +void fpu__clear_all(struct fpu *fpu)
+ +{
+ +	fpu__clear(fpu, false);
+++=======
++ void fpu_flush_thread(void)
++ {
++ 	fpu_reset_fpstate();
+++>>>>>>> 33344368cb08 (x86/fpu: Clean up the fpu__clear() variants)
+  }
+- 
+  /*
+   * Load FPU context before returning to userspace.
+   */
+diff --cc arch/x86/kernel/process.c
+index 56f2acf80dcb,de942b038815..000000000000
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@@ -242,7 -214,8 +251,12 @@@ void flush_thread(void
+  	flush_ptrace_hw_breakpoint(tsk);
+  	memset(tsk->thread.tls_array, 0, sizeof(tsk->thread.tls_array));
+  
+++<<<<<<< HEAD
+ +	fpu__clear_all(&tsk->thread.fpu);
+++=======
++ 	fpu_flush_thread();
++ 	pkru_flush_thread();
+++>>>>>>> 33344368cb08 (x86/fpu: Clean up the fpu__clear() variants)
+  }
+  
+  void disable_TSC(void)
+* Unmerged path arch/x86/kernel/fpu/core.c
+* Unmerged path arch/x86/kernel/process.c
