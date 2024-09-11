@@ -1,0 +1,136 @@
+Change in Openvswitch to support MPLS label depth of 3 in ingress direction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Martin Varghese <martin.varghese@nokia.com>
+commit fbdcdd78da7c95f1b970d371e1b23cbd3aa990f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/fbdcdd78.failed
+
+The openvswitch was supporting a MPLS label depth of 1 in the ingress
+direction though the userspace OVS supports a max depth of 3 labels.
+This change enables openvswitch module to support a max depth of
+3 labels in the ingress.
+
+	Signed-off-by: Martin Varghese <martin.varghese@nokia.com>
+	Acked-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fbdcdd78da7c95f1b970d371e1b23cbd3aa990f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/flow_netlink.c
+diff --cc net/openvswitch/flow_netlink.c
+index 3e70a3748e18,65c2e3458ff5..000000000000
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@@ -3083,8 -3092,9 +3107,14 @@@ static int __ovs_nla_copy_actions(struc
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		case OVS_ACTION_ATTR_POP_MPLS:
+ +			if (vlan_tci & htons(VLAN_TAG_PRESENT) ||
+++=======
++ 		case OVS_ACTION_ATTR_POP_MPLS: {
++ 			__be16  proto;
++ 			if (vlan_tci & htons(VLAN_CFI_MASK) ||
+++>>>>>>> fbdcdd78da7c (Change in Openvswitch to support MPLS label depth of 3 in ingress direction)
+  			    !eth_p_mpls(eth_type))
+  				return -EINVAL;
+  
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index f571f686dac6..75fd7e829c74 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -215,7 +215,7 @@ static int set_mpls(struct sk_buff *skb, struct sw_flow_key *flow_key,
+ 	if (err)
+ 		return err;
+ 
+-	flow_key->mpls.top_lse = lse;
++	flow_key->mpls.lse[0] = lse;
+ 	return 0;
+ }
+ 
+diff --git a/net/openvswitch/flow.c b/net/openvswitch/flow.c
+index c9fba8b5badd..03f856a935ca 100644
+--- a/net/openvswitch/flow.c
++++ b/net/openvswitch/flow.c
+@@ -650,27 +650,35 @@ static int key_extract_l3l4(struct sk_buff *skb, struct sw_flow_key *key)
+ 			memset(&key->ipv4, 0, sizeof(key->ipv4));
+ 		}
+ 	} else if (eth_p_mpls(key->eth.type)) {
+-		size_t stack_len = MPLS_HLEN;
++		u8 label_count = 1;
+ 
++		memset(&key->mpls, 0, sizeof(key->mpls));
+ 		skb_set_inner_network_header(skb, skb->mac_len);
+ 		while (1) {
+ 			__be32 lse;
+ 
+-			error = check_header(skb, skb->mac_len + stack_len);
++			error = check_header(skb, skb->mac_len +
++					     label_count * MPLS_HLEN);
+ 			if (unlikely(error))
+ 				return 0;
+ 
+ 			memcpy(&lse, skb_inner_network_header(skb), MPLS_HLEN);
+ 
+-			if (stack_len == MPLS_HLEN)
+-				memcpy(&key->mpls.top_lse, &lse, MPLS_HLEN);
++			if (label_count <= MPLS_LABEL_DEPTH)
++				memcpy(&key->mpls.lse[label_count - 1], &lse,
++				       MPLS_HLEN);
+ 
+-			skb_set_inner_network_header(skb, skb->mac_len + stack_len);
++			skb_set_inner_network_header(skb, skb->mac_len +
++						     label_count * MPLS_HLEN);
+ 			if (lse & htonl(MPLS_LS_S_MASK))
+ 				break;
+ 
+-			stack_len += MPLS_HLEN;
++			label_count++;
+ 		}
++		if (label_count > MPLS_LABEL_DEPTH)
++			label_count = MPLS_LABEL_DEPTH;
++
++		key->mpls.num_labels_mask = GENMASK(label_count - 1, 0);
+ 	} else if (key->eth.type == htons(ETH_P_IPV6)) {
+ 		int nh_len;             /* IPv6 Header + Extensions */
+ 
+diff --git a/net/openvswitch/flow.h b/net/openvswitch/flow.h
+index 4995fbea8186..9bd4b1faddf1 100644
+--- a/net/openvswitch/flow.h
++++ b/net/openvswitch/flow.h
+@@ -44,6 +44,7 @@ enum sw_flow_mac_proto {
+ 	MAC_PROTO_ETHERNET,
+ };
+ #define SW_FLOW_KEY_INVALID	0x80
++#define MPLS_LABEL_DEPTH       3
+ 
+ /* Store options at the end of the array if they are less than the
+  * maximum size. This allows us to get the benefits of variable length
+@@ -98,9 +99,6 @@ struct sw_flow_key {
+ 					 * protocol.
+ 					 */
+ 	union {
+-		struct {
+-			__be32 top_lse;	/* top label stack entry */
+-		} mpls;
+ 		struct {
+ 			u8     proto;	/* IP protocol or lower 8 bits of ARP opcode. */
+ 			u8     tos;	    /* IP ToS. */
+@@ -149,6 +147,11 @@ struct sw_flow_key {
+ 				} nd;
+ 			};
+ 		} ipv6;
++		struct {
++			u32 num_labels_mask;    /* labels present bitmap of effective length MPLS_LABEL_DEPTH */
++			__be32 lse[MPLS_LABEL_DEPTH];     /* label stack entry  */
++		} mpls;
++
+ 		struct ovs_key_nsh nsh;         /* network service header */
+ 	};
+ 	struct {
+* Unmerged path net/openvswitch/flow_netlink.c
