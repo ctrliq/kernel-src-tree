@@ -3139,8 +3139,9 @@ static void ice_vsi_release_all(struct ice_pf *pf)
 /**
  * ice_dis_vsi - pause a VSI
  * @vsi: the VSI being paused
+ * @locked: is the rtnl_lock already held
  */
-static void ice_dis_vsi(struct ice_vsi *vsi)
+static void ice_dis_vsi(struct ice_vsi *vsi, bool locked)
 {
 	if (test_bit(__ICE_DOWN, vsi->state))
 		return;
@@ -3149,9 +3150,13 @@ static void ice_dis_vsi(struct ice_vsi *vsi)
 
 	if (vsi->type == ICE_VSI_PF && vsi->netdev) {
 		if (netif_running(vsi->netdev)) {
-			rtnl_lock();
-			vsi->netdev->netdev_ops->ndo_stop(vsi->netdev);
-			rtnl_unlock();
+			if (!locked) {
+				rtnl_lock();
+				vsi->netdev->netdev_ops->ndo_stop(vsi->netdev);
+				rtnl_unlock();
+			} else {
+				vsi->netdev->netdev_ops->ndo_stop(vsi->netdev);
+			}
 		} else {
 			ice_vsi_close(vsi);
 		}
@@ -3190,7 +3195,7 @@ static void ice_pf_dis_all_vsi(struct ice_pf *pf)
 
 	ice_for_each_vsi(pf, v)
 		if (pf->vsi[v])
-			ice_dis_vsi(pf->vsi[v]);
+			ice_dis_vsi(pf->vsi[v], false);
 }
 
 /**
