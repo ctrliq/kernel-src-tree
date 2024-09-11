@@ -1,0 +1,270 @@
+rcu/tree: Keep kfree_rcu() awake during lock contention
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Joel Fernandes (Google) <joel@joelfernandes.org>
+commit 8ac88f7177c75bf9b7b8c29a8054115e1c712baf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8ac88f71.failed
+
+On PREEMPT_RT kernels, the krcp spinlock gets converted to an rt-mutex
+and causes kfree_rcu() callers to sleep. This makes it unusable for
+callers in purely atomic sections such as non-threaded IRQ handlers and
+raw spinlock sections. Fix it by converting the spinlock to a raw
+spinlock.
+
+Vetting all code paths, there is no reason to believe that the raw
+spinlock will hurt RT latencies as it is not held for a long time.
+
+	Cc: bigeasy@linutronix.de
+	Cc: Uladzislau Rezki <urezki@gmail.com>
+	Reviewed-by: Uladzislau Rezki <urezki@gmail.com>
+	Signed-off-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 8ac88f7177c75bf9b7b8c29a8054115e1c712baf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 4aa7b6bbcde6,c5de5adca0dd..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2711,8 -3013,10 +2711,8 @@@ struct kfree_rcu_cpu_work 
+   */
+  struct kfree_rcu_cpu {
+  	struct rcu_head *head;
+ -	struct kfree_rcu_bulk_data *bhead;
+ -	struct kfree_rcu_bulk_data *bcached;
+  	struct kfree_rcu_cpu_work krw_arr[KFREE_N_BATCHES];
+- 	spinlock_t lock;
++ 	raw_spinlock_t lock;
+  	struct delayed_work monitor_work;
+  	bool monitor_todo;
+  	bool initialized;
+@@@ -2734,17 -3049,49 +2734,23 @@@ static void kfree_rcu_work(struct work_
+  	krwp = container_of(to_rcu_work(work),
+  			    struct kfree_rcu_cpu_work, rcu_work);
+  	krcp = krwp->krcp;
+- 	spin_lock_irqsave(&krcp->lock, flags);
++ 	raw_spin_lock_irqsave(&krcp->lock, flags);
+  	head = krwp->head_free;
+  	krwp->head_free = NULL;
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&krcp->lock, flags);
+++=======
++ 	bhead = krwp->bhead_free;
++ 	krwp->bhead_free = NULL;
++ 	raw_spin_unlock_irqrestore(&krcp->lock, flags);
+++>>>>>>> 8ac88f7177c7 (rcu/tree: Keep kfree_rcu() awake during lock contention)
+  
+ -	/* "bhead" is now private, so traverse locklessly. */
+ -	for (; bhead; bhead = bnext) {
+ -		bnext = bhead->next;
+ -
+ -		debug_rcu_head_unqueue_bulk(bhead->head_free_debug);
+ -
+ -		rcu_lock_acquire(&rcu_callback_map);
+ -		trace_rcu_invoke_kfree_bulk_callback(rcu_state.name,
+ -			bhead->nr_records, bhead->records);
+ -
+ -		kfree_bulk(bhead->nr_records, bhead->records);
+ -		rcu_lock_release(&rcu_callback_map);
+ -
+ -		if (cmpxchg(&krcp->bcached, NULL, bhead))
+ -			free_page((unsigned long) bhead);
+ -
+ -		cond_resched_tasks_rcu_qs();
+ -	}
+ -
+ -	/*
+ -	 * Emergency case only. It can happen under low memory
+ -	 * condition when an allocation gets failed, so the "bulk"
+ -	 * path can not be temporary maintained.
+ -	 */
+ +	// List "head" is now private, so traverse locklessly.
+  	for (; head; head = next) {
+ -		unsigned long offset = (unsigned long)head->func;
+ -
+  		next = head->next;
+ +		// Potentially optimize with kfree_bulk in future.
+  		debug_rcu_head_unqueue(head);
+ -		rcu_lock_acquire(&rcu_callback_map);
+ -		trace_rcu_invoke_kfree_callback(rcu_state.name, head, offset);
+ -
+ -		if (!WARN_ON_ONCE(!__is_kfree_rcu_offset(offset)))
+ -			kfree((void *)head - offset);
+ -
+ -		rcu_lock_release(&rcu_callback_map);
+ +		__rcu_reclaim(rcu_state.name, head);
+  		cond_resched_tasks_rcu_qs();
+  	}
+  }
+@@@ -2810,32 -3181,68 +2816,32 @@@ static void kfree_rcu_monitor(struct wo
+  	if (krcp->monitor_todo)
+  		kfree_rcu_drain_unlock(krcp, flags);
+  	else
+- 		spin_unlock_irqrestore(&krcp->lock, flags);
++ 		raw_spin_unlock_irqrestore(&krcp->lock, flags);
+  }
+  
+ -static inline bool
+ -kfree_call_rcu_add_ptr_to_bulk(struct kfree_rcu_cpu *krcp,
+ -	struct rcu_head *head, rcu_callback_t func)
+ +/*
+ + * This version of kfree_call_rcu does not do batching of kfree_rcu() requests.
+ + * Used only by rcuperf torture test for comparison with kfree_rcu_batch().
+ + */
+ +void kfree_call_rcu_nobatch(struct rcu_head *head, rcu_callback_t func)
+  {
+ -	struct kfree_rcu_bulk_data *bnode;
+ -
+ -	if (unlikely(!krcp->initialized))
+ -		return false;
+ -
+ -	lockdep_assert_held(&krcp->lock);
+ -
+ -	/* Check if a new block is required. */
+ -	if (!krcp->bhead ||
+ -			krcp->bhead->nr_records == KFREE_BULK_MAX_ENTR) {
+ -		bnode = xchg(&krcp->bcached, NULL);
+ -		if (!bnode) {
+ -			WARN_ON_ONCE(sizeof(struct kfree_rcu_bulk_data) > PAGE_SIZE);
+ -
+ -			bnode = (struct kfree_rcu_bulk_data *)
+ -				__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
+ -		}
+ -
+ -		/* Switch to emergency path. */
+ -		if (unlikely(!bnode))
+ -			return false;
+ -
+ -		/* Initialize the new block. */
+ -		bnode->nr_records = 0;
+ -		bnode->next = krcp->bhead;
+ -		bnode->head_free_debug = NULL;
+ -
+ -		/* Attach it to the head. */
+ -		krcp->bhead = bnode;
+ -	}
+ -
+ -#ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
+ -	head->func = func;
+ -	head->next = krcp->bhead->head_free_debug;
+ -	krcp->bhead->head_free_debug = head;
+ -#endif
+ -
+ -	/* Finally insert. */
+ -	krcp->bhead->records[krcp->bhead->nr_records++] =
+ -		(void *) head - (unsigned long) func;
+ -
+ -	return true;
+ +	__call_rcu(head, func, 1);
+  }
+ +EXPORT_SYMBOL_GPL(kfree_call_rcu_nobatch);
+  
+  /*
+ - * Queue a request for lazy invocation of kfree_bulk()/kfree() after a grace
+ - * period. Please note there are two paths are maintained, one is the main one
+ - * that uses kfree_bulk() interface and second one is emergency one, that is
+ - * used only when the main path can not be maintained temporary, due to memory
+ - * pressure.
+ + * Queue a request for lazy invocation of kfree() after a grace period.
+   *
+   * Each kfree_call_rcu() request is added to a batch. The batch will be drained
+ - * every KFREE_DRAIN_JIFFIES number of jiffies. All the objects in the batch will
+ - * be free'd in workqueue context. This allows us to: batch requests together to
+ - * reduce the number of grace periods during heavy kfree_rcu() load.
+ + * every KFREE_DRAIN_JIFFIES number of jiffies. All the objects in the batch
+ + * will be kfree'd in workqueue context. This allows us to:
+ + *
+ + * 1.	Batch requests together to reduce the number of grace periods during
+ + *	heavy kfree_rcu() load.
+ + *
+ + * 2.	It makes it possible to use kfree_bulk() on a large number of
+ + *	kfree_rcu() requests thus reducing cache misses and the per-object
+ + *	overhead of kfree().
+   */
+  void kfree_call_rcu(struct rcu_head *head, rcu_callback_t func)
+  {
+@@@ -2874,6 -3288,56 +2880,59 @@@ unlock_return
+  }
+  EXPORT_SYMBOL_GPL(kfree_call_rcu);
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned long
++ kfree_rcu_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
++ {
++ 	int cpu;
++ 	unsigned long count = 0;
++ 
++ 	/* Snapshot count of all CPUs */
++ 	for_each_online_cpu(cpu) {
++ 		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
++ 
++ 		count += READ_ONCE(krcp->count);
++ 	}
++ 
++ 	return count;
++ }
++ 
++ static unsigned long
++ kfree_rcu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
++ {
++ 	int cpu, freed = 0;
++ 	unsigned long flags;
++ 
++ 	for_each_online_cpu(cpu) {
++ 		int count;
++ 		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
++ 
++ 		count = krcp->count;
++ 		raw_spin_lock_irqsave(&krcp->lock, flags);
++ 		if (krcp->monitor_todo)
++ 			kfree_rcu_drain_unlock(krcp, flags);
++ 		else
++ 			raw_spin_unlock_irqrestore(&krcp->lock, flags);
++ 
++ 		sc->nr_to_scan -= count;
++ 		freed += count;
++ 
++ 		if (sc->nr_to_scan <= 0)
++ 			break;
++ 	}
++ 
++ 	return freed;
++ }
++ 
++ static struct shrinker kfree_rcu_shrinker = {
++ 	.count_objects = kfree_rcu_shrink_count,
++ 	.scan_objects = kfree_rcu_shrink_scan,
++ 	.batch = 0,
++ 	.seeks = DEFAULT_SEEKS,
++ };
++ 
+++>>>>>>> 8ac88f7177c7 (rcu/tree: Keep kfree_rcu() awake during lock contention)
+  void __init kfree_rcu_scheduler_running(void)
+  {
+  	int cpu;
+@@@ -3773,9 -4250,12 +3832,15 @@@ static void __init kfree_rcu_batch_init
+  	for_each_possible_cpu(cpu) {
+  		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
+  
+++<<<<<<< HEAD
+ +		spin_lock_init(&krcp->lock);
+ +		for (i = 0; i < KFREE_N_BATCHES; i++)
+++=======
++ 		raw_spin_lock_init(&krcp->lock);
++ 		for (i = 0; i < KFREE_N_BATCHES; i++) {
++ 			INIT_RCU_WORK(&krcp->krw_arr[i].rcu_work, kfree_rcu_work);
+++>>>>>>> 8ac88f7177c7 (rcu/tree: Keep kfree_rcu() awake during lock contention)
+  			krcp->krw_arr[i].krcp = krcp;
+ -		}
+ -
+  		INIT_DELAYED_WORK(&krcp->monitor_work, kfree_rcu_monitor);
+  		krcp->initialized = true;
+  	}
+* Unmerged path kernel/rcu/tree.c
