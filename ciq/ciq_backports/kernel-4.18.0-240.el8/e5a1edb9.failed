@@ -1,0 +1,205 @@
+powerpc/mm: move update_mmu_cache() into book3s hash utils.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [powerpc] mm: move update_mmu_cache() into book3s hash utils (Greg Kurz) [1748772]
+Rebuild_FUZZ: 91.74%
+commit-author Christophe Leroy <christophe.leroy@c-s.fr>
+commit e5a1edb9fe4cfa07e37a59475f8f7d0a8939c73e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e5a1edb9.failed
+
+update_mmu_cache() is only for BOOK3S, and can be simplified for
+BOOK3S32.
+
+Move it out of mem.c into respective BOOK3S32 and BOOK3S64 files
+containing hash utils.
+
+BOOK3S64 version of hash_preload() is only used locally, declare it
+static.
+
+Remove the radix_enabled() stuff in BOOK3S32 version.
+
+	Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/107aaf43583a5f5d09e0d4e84c4c4390ecfcd512.1565933217.git.christophe.leroy@c-s.fr
+
+(cherry picked from commit e5a1edb9fe4cfa07e37a59475f8f7d0a8939c73e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/book3s32/mmu.c
+#	arch/powerpc/mm/mem.c
+diff --cc arch/powerpc/mm/mem.c
+index 54211ad167a4,69f99128a8d6..000000000000
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@@ -466,63 -408,6 +466,66 @@@ void flush_icache_user_range(struct vm_
+  EXPORT_SYMBOL(flush_icache_user_range);
+  
+  /*
+++<<<<<<< HEAD
+ + * This is called at the end of handling a user page fault, when the
+ + * fault has been handled by updating a PTE in the linux page tables.
+ + * We use it to preload an HPTE into the hash table corresponding to
+ + * the updated linux PTE.
+ + * 
+ + * This must always be called with the pte lock held.
+ + */
+ +void update_mmu_cache(struct vm_area_struct *vma, unsigned long address,
+ +		      pte_t *ptep)
+ +{
+ +#ifdef CONFIG_PPC_STD_MMU
+ +	/*
+ +	 * We don't need to worry about _PAGE_PRESENT here because we are
+ +	 * called with either mm->page_table_lock held or ptl lock held
+ +	 */
+ +	unsigned long trap;
+ +	bool is_exec;
+ +
+ +	if (radix_enabled()) {
+ +		prefetch((void *)address);
+ +		return;
+ +	}
+ +
+ +	/* We only want HPTEs for linux PTEs that have _PAGE_ACCESSED set */
+ +	if (!pte_young(*ptep) || address >= TASK_SIZE)
+ +		return;
+ +
+ +	/* We try to figure out if we are coming from an instruction
+ +	 * access fault and pass that down to __hash_page so we avoid
+ +	 * double-faulting on execution of fresh text. We have to test
+ +	 * for regs NULL since init will get here first thing at boot
+ +	 *
+ +	 * We also avoid filling the hash if not coming from a fault
+ +	 */
+ +
+ +	trap = current->thread.regs ? TRAP(current->thread.regs) : 0UL;
+ +	switch (trap) {
+ +	case 0x300:
+ +		is_exec = false;
+ +		break;
+ +	case 0x400:
+ +		is_exec = true;
+ +		break;
+ +	default:
+ +		return;
+ +	}
+ +
+ +	hash_preload(vma->vm_mm, address, is_exec, trap);
+ +#endif /* CONFIG_PPC_STD_MMU */
+ +#if (defined(CONFIG_PPC_BOOK3E_64) || defined(CONFIG_PPC_FSL_BOOK3E)) \
+ +	&& defined(CONFIG_HUGETLB_PAGE)
+ +	if (is_vm_hugetlb_page(vma))
+ +		book3e_hugetlb_preload(vma, address, *ptep);
+ +#endif
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> e5a1edb9fe4c (powerpc/mm: move update_mmu_cache() into book3s hash utils.)
+   * System memory should not be in /proc/iomem but various tools expect it
+   * (eg kdump).
+   */
+* Unmerged path arch/powerpc/mm/book3s32/mmu.c
+* Unmerged path arch/powerpc/mm/book3s32/mmu.c
+diff --git a/arch/powerpc/mm/book3s64/hash_utils.c b/arch/powerpc/mm/book3s64/hash_utils.c
+index a638a0fa8666..83bb74f0aec5 100644
+--- a/arch/powerpc/mm/book3s64/hash_utils.c
++++ b/arch/powerpc/mm/book3s64/hash_utils.c
+@@ -1507,8 +1507,8 @@ static bool should_hash_preload(struct mm_struct *mm, unsigned long ea)
+ }
+ #endif
+ 
+-void hash_preload(struct mm_struct *mm, unsigned long ea,
+-		  bool is_exec, unsigned long trap)
++static void hash_preload(struct mm_struct *mm, unsigned long ea,
++			 bool is_exec, unsigned long trap)
+ {
+ 	int hugepage_shift;
+ 	unsigned long vsid;
+@@ -1588,6 +1588,57 @@ void hash_preload(struct mm_struct *mm, unsigned long ea,
+ 	local_irq_restore(flags);
+ }
+ 
++/*
++ * This is called at the end of handling a user page fault, when the
++ * fault has been handled by updating a PTE in the linux page tables.
++ * We use it to preload an HPTE into the hash table corresponding to
++ * the updated linux PTE.
++ *
++ * This must always be called with the pte lock held.
++ */
++void update_mmu_cache(struct vm_area_struct *vma, unsigned long address,
++		      pte_t *ptep)
++{
++	/*
++	 * We don't need to worry about _PAGE_PRESENT here because we are
++	 * called with either mm->page_table_lock held or ptl lock held
++	 */
++	unsigned long trap;
++	bool is_exec;
++
++	if (radix_enabled()) {
++		prefetch((void *)address);
++		return;
++	}
++
++	/* We only want HPTEs for linux PTEs that have _PAGE_ACCESSED set */
++	if (!pte_young(*ptep) || address >= TASK_SIZE)
++		return;
++
++	/*
++	 * We try to figure out if we are coming from an instruction
++	 * access fault and pass that down to __hash_page so we avoid
++	 * double-faulting on execution of fresh text. We have to test
++	 * for regs NULL since init will get here first thing at boot.
++	 *
++	 * We also avoid filling the hash if not coming from a fault.
++	 */
++
++	trap = current->thread.regs ? TRAP(current->thread.regs) : 0UL;
++	switch (trap) {
++	case 0x300:
++		is_exec = false;
++		break;
++	case 0x400:
++		is_exec = true;
++		break;
++	default:
++		return;
++	}
++
++	hash_preload(vma->vm_mm, address, is_exec, trap);
++}
++
+ #ifdef CONFIG_PPC_MEM_KEYS
+ /*
+  * Return the protection key associated with the given address and the
+* Unmerged path arch/powerpc/mm/mem.c
+diff --git a/arch/powerpc/mm/mmu_decl.h b/arch/powerpc/mm/mmu_decl.h
+index d3085e8d3d35..32ab9daa3f6c 100644
+--- a/arch/powerpc/mm/mmu_decl.h
++++ b/arch/powerpc/mm/mmu_decl.h
+@@ -82,10 +82,6 @@ static inline void _tlbivax_bcast(unsigned long address, unsigned int pid,
+ 
+ #else /* CONFIG_PPC_MMU_NOHASH */
+ 
+-extern void hash_preload(struct mm_struct *mm, unsigned long ea,
+-			 bool is_exec, unsigned long trap);
+-
+-
+ extern void _tlbie(unsigned long address);
+ extern void _tlbia(void);
+ 
+@@ -93,6 +89,9 @@ extern void _tlbia(void);
+ 
+ #ifdef CONFIG_PPC32
+ 
++void hash_preload(struct mm_struct *mm, unsigned long ea,
++		  bool is_exec, unsigned long trap);
++
+ extern void mapin_ram(void);
+ extern void setbat(int index, unsigned long virt, phys_addr_t phys,
+ 		   unsigned int size, pgprot_t prot);
