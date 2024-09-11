@@ -1,0 +1,312 @@
+net/mlx5: Refactor mlx5_esw_query_functions for modularity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Refactor mlx5_esw_query_functions for modularity (Alaa Hleihel) [1724327 1724336]
+Rebuild_FUZZ: 96.43%
+commit-author Parav Pandit <parav@mellanox.com>
+commit dd28087c14777a7f2571260d44394eb709a59368
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/dd28087c.failed
+
+Functions change event output data size changes when functions other
+than VFs will be enabled in HCA CAP.
+With current API, multiple callers needs to align, calculate accurate
+size of the output data depending on number on non VF functions enabled
+in the device.
+Instead of duplicating such math at multiple places, refactor
+mlx5_esw_query_functions() to return raw output allocated by itself.
+
+Caller must free the allocated memory using kvfree() as described in the
+function comment section.
+This hides calcuation within mlx5_esw_query_functions() and provides
+simpler API.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit dd28087c14777a7f2571260d44394eb709a59368)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+#	drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index f4a0b22e3987,62954265b57c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1685,6 -1715,58 +1685,61 @@@ static int eswitch_vport_event(struct n
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * mlx5_esw_query_functions - Returns raw output about functions state
++  * @dev:	Pointer to device to query
++  *
++  * mlx5_esw_query_functions() allocates and returns functions changed
++  * raw output memory pointer from device on success. Otherwise returns ERR_PTR.
++  * Caller must free the memory using kvfree() when valid pointer is returned.
++  */
++ const u32 *mlx5_esw_query_functions(struct mlx5_core_dev *dev)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_esw_functions_out);
++ 	u32 in[MLX5_ST_SZ_DW(query_esw_functions_in)] = {};
++ 	u32 *out;
++ 	int err;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	MLX5_SET(query_esw_functions_in, in, opcode,
++ 		 MLX5_CMD_OP_QUERY_ESW_FUNCTIONS);
++ 
++ 	err = mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
++ 	if (!err)
++ 		return out;
++ 
++ 	kvfree(out);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void mlx5_eswitch_event_handlers_register(struct mlx5_eswitch *esw)
++ {
++ 	MLX5_NB_INIT(&esw->nb, eswitch_vport_event, NIC_VPORT_CHANGE);
++ 	mlx5_eq_notifier_register(esw->dev, &esw->nb);
++ 
++ 	if (esw->mode == MLX5_ESWITCH_OFFLOADS && mlx5_eswitch_is_funcs_handler(esw->dev)) {
++ 		MLX5_NB_INIT(&esw->esw_funcs.nb, mlx5_esw_funcs_changed_handler,
++ 			     ESW_FUNCTIONS_CHANGED);
++ 		mlx5_eq_notifier_register(esw->dev, &esw->esw_funcs.nb);
++ 	}
++ }
++ 
++ static void mlx5_eswitch_event_handlers_unregister(struct mlx5_eswitch *esw)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_OFFLOADS && mlx5_eswitch_is_funcs_handler(esw->dev))
++ 		mlx5_eq_notifier_unregister(esw->dev, &esw->esw_funcs.nb);
++ 
++ 	mlx5_eq_notifier_unregister(esw->dev, &esw->nb);
++ 
++ 	flush_workqueue(esw->work_queue);
++ }
++ 
+++>>>>>>> dd28087c1477 (net/mlx5: Refactor mlx5_esw_query_functions for modularity)
+  /* Public E-Switch API */
+  #define ESW_ALLOWED(esw) ((esw) && MLX5_ESWITCH_MANAGER((esw)->dev))
+  
+@@@ -2465,6 -2541,26 +2520,31 @@@ bool mlx5_esw_lag_prereq(struct mlx5_co
+  bool mlx5_esw_multipath_prereq(struct mlx5_core_dev *dev0,
+  			       struct mlx5_core_dev *dev1)
+  {
+++<<<<<<< HEAD
+ +	return (dev0->priv.eswitch->mode == SRIOV_OFFLOADS &&
+ +		dev1->priv.eswitch->mode == SRIOV_OFFLOADS);
+++=======
++ 	return (dev0->priv.eswitch->mode == MLX5_ESWITCH_OFFLOADS &&
++ 		dev1->priv.eswitch->mode == MLX5_ESWITCH_OFFLOADS);
++ }
++ 
++ void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, const int num_vfs)
++ {
++ 	const u32 *out;
++ 
++ 	WARN_ON_ONCE(esw->mode != MLX5_ESWITCH_NONE);
++ 
++ 	if (!mlx5_core_is_ecpf_esw_manager(esw->dev)) {
++ 		esw->esw_funcs.num_vfs = num_vfs;
++ 		return;
++ 	}
++ 
++ 	out = mlx5_esw_query_functions(esw->dev);
++ 	if (IS_ERR(out))
++ 		return;
++ 
++ 	esw->esw_funcs.num_vfs = MLX5_GET(query_esw_functions_out, out,
++ 					  host_params_context.host_num_of_vfs);
++ 	kvfree(out);
+++>>>>>>> dd28087c1477 (net/mlx5: Refactor mlx5_esw_query_functions for modularity)
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index af9a875f1cf1,d2d33a9893bb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -381,13 -403,15 +381,18 @@@ bool mlx5_esw_lag_prereq(struct mlx5_co
+  bool mlx5_esw_multipath_prereq(struct mlx5_core_dev *dev0,
+  			       struct mlx5_core_dev *dev1);
+  
+++<<<<<<< HEAD
+++=======
++ const u32 *mlx5_esw_query_functions(struct mlx5_core_dev *dev);
++ 
+++>>>>>>> dd28087c1477 (net/mlx5: Refactor mlx5_esw_query_functions for modularity)
+  #define MLX5_DEBUG_ESWITCH_MASK BIT(3)
+  
+ -#define esw_info(__dev, format, ...)			\
+ -	dev_info((__dev)->device, "E-Switch: " format, ##__VA_ARGS__)
+ +#define esw_info(dev, format, ...)				\
+ +	pr_info("(%s): E-Switch: " format, (dev)->priv.name, ##__VA_ARGS__)
+  
+ -#define esw_warn(__dev, format, ...)			\
+ -	dev_warn((__dev)->device, "E-Switch: " format, ##__VA_ARGS__)
+ +#define esw_warn(dev, format, ...)				\
+ +	pr_warn("(%s): E-Switch: " format, (dev)->priv.name, ##__VA_ARGS__)
+  
+  #define esw_debug(dev, format, ...)				\
+  	mlx5_core_dbg_mask(dev, MLX5_DEBUG_ESWITCH_MASK, format, ##__VA_ARGS__)
+@@@ -399,9 -556,16 +404,19 @@@ void mlx5e_tc_clean_fdb_peer_flows(stru
+  /* eswitch API stubs */
+  static inline int  mlx5_eswitch_init(struct mlx5_core_dev *dev) { return 0; }
+  static inline void mlx5_eswitch_cleanup(struct mlx5_eswitch *esw) {}
+ -static inline int  mlx5_eswitch_enable(struct mlx5_eswitch *esw, int mode) { return 0; }
+ -static inline void mlx5_eswitch_disable(struct mlx5_eswitch *esw) {}
+ +static inline int  mlx5_eswitch_enable_sriov(struct mlx5_eswitch *esw, int nvfs, int mode) { return 0; }
+ +static inline void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw) {}
+  static inline bool mlx5_esw_lag_prereq(struct mlx5_core_dev *dev0, struct mlx5_core_dev *dev1) { return true; }
+++<<<<<<< HEAD
+++=======
++ static inline bool mlx5_eswitch_is_funcs_handler(struct mlx5_core_dev *dev) { return false; }
++ static inline const u32 *mlx5_esw_query_functions(struct mlx5_core_dev *dev)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
++ static inline void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, const int num_vfs) {}
+++>>>>>>> dd28087c1477 (net/mlx5: Refactor mlx5_esw_query_functions for modularity)
+  
+  #define FDB_MAX_CHAIN 1
+  #define FDB_SLOW_PATH_CHAIN (FDB_MAX_CHAIN + 1)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 2a02050a09e7,74ab7bd264ed..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1599,11 -2043,77 +1599,82 @@@ static void esw_offloads_steering_clean
+  	esw_destroy_vport_rx_group(esw);
+  	esw_destroy_offloads_table(esw);
+  	esw_destroy_offloads_fdb_tables(esw);
+ -	esw_destroy_offloads_acl_tables(esw);
+ +	if (MLX5_CAP_GEN(esw->dev, prio_tag_required))
+ +		esw_prio_tag_acls_cleanup(esw);
+  }
+  
+++<<<<<<< HEAD
+ +int esw_offloads_init(struct mlx5_eswitch *esw, int nvports)
+++=======
++ static void
++ esw_vfs_changed_event_handler(struct mlx5_eswitch *esw, const u32 *out)
++ {
++ 	bool host_pf_disabled;
++ 	u16 new_num_vfs;
++ 
++ 	new_num_vfs = MLX5_GET(query_esw_functions_out, out,
++ 			       host_params_context.host_num_of_vfs);
++ 	host_pf_disabled = MLX5_GET(query_esw_functions_out, out,
++ 				    host_params_context.host_pf_disabled);
++ 
++ 	if (new_num_vfs == esw->esw_funcs.num_vfs || host_pf_disabled)
++ 		return;
++ 
++ 	/* Number of VFs can only change from "0 to x" or "x to 0". */
++ 	if (esw->esw_funcs.num_vfs > 0) {
++ 		esw_offloads_unload_vf_reps(esw, esw->esw_funcs.num_vfs);
++ 	} else {
++ 		int err;
++ 
++ 		err = esw_offloads_load_vf_reps(esw, new_num_vfs);
++ 		if (err)
++ 			return;
++ 	}
++ 	esw->esw_funcs.num_vfs = new_num_vfs;
++ }
++ 
++ static void esw_functions_changed_event_handler(struct work_struct *work)
++ {
++ 	struct mlx5_host_work *host_work;
++ 	struct mlx5_eswitch *esw;
++ 	const u32 *out;
++ 
++ 	host_work = container_of(work, struct mlx5_host_work, work);
++ 	esw = host_work->esw;
++ 
++ 	out = mlx5_esw_query_functions(esw->dev);
++ 	if (IS_ERR(out))
++ 		goto out;
++ 
++ 	esw_vfs_changed_event_handler(esw, out);
++ 	kvfree(out);
++ out:
++ 	kfree(host_work);
++ }
++ 
++ int mlx5_esw_funcs_changed_handler(struct notifier_block *nb, unsigned long type, void *data)
++ {
++ 	struct mlx5_esw_functions *esw_funcs;
++ 	struct mlx5_host_work *host_work;
++ 	struct mlx5_eswitch *esw;
++ 
++ 	host_work = kzalloc(sizeof(*host_work), GFP_ATOMIC);
++ 	if (!host_work)
++ 		return NOTIFY_DONE;
++ 
++ 	esw_funcs = mlx5_nb_cof(nb, struct mlx5_esw_functions, nb);
++ 	esw = container_of(esw_funcs, struct mlx5_eswitch, esw_funcs);
++ 
++ 	host_work->esw = esw;
++ 
++ 	INIT_WORK(&host_work->work, esw_functions_changed_event_handler);
++ 	queue_work(esw->work_queue, &host_work->work);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ int esw_offloads_init(struct mlx5_eswitch *esw)
+++>>>>>>> dd28087c1477 (net/mlx5: Refactor mlx5_esw_query_functions for modularity)
+  {
+  	int err;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+index a249b3c3843d,61fcfd8b39b4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+@@@ -208,6 -195,30 +208,33 @@@ void mlx5_sriov_detach(struct mlx5_core
+  	mlx5_device_disable_sriov(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u16 mlx5_get_max_vfs(struct mlx5_core_dev *dev)
++ {
++ 	u16 host_total_vfs;
++ 	const u32 *out;
++ 
++ 	if (mlx5_core_is_ecpf_esw_manager(dev)) {
++ 		out = mlx5_esw_query_functions(dev);
++ 
++ 		/* Old FW doesn't support getting total_vfs from esw func
++ 		 * but supports getting it from pci_sriov.
++ 		 */
++ 		if (IS_ERR(out))
++ 			goto done;
++ 		host_total_vfs = MLX5_GET(query_esw_functions_out, out,
++ 					  host_params_context.host_total_vfs);
++ 		kvfree(out);
++ 		if (host_total_vfs)
++ 			return host_total_vfs;
++ 	}
++ 
++ done:
++ 	return pci_sriov_get_totalvfs(dev->pdev);
++ }
++ 
+++>>>>>>> dd28087c1477 (net/mlx5: Refactor mlx5_esw_query_functions for modularity)
+  int mlx5_sriov_init(struct mlx5_core_dev *dev)
+  {
+  	struct mlx5_core_sriov *sriov = &dev->priv.sriov;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/sriov.c
