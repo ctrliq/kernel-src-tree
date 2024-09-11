@@ -1,0 +1,206 @@
+KVM: s390: diag9c (directed yield) forwarding
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Pierre Morel <pmorel@linux.ibm.com>
+commit 87e28a15c42cc592009c32a8c20e5789059027c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/87e28a15.failed
+
+When we intercept a DIAG_9C from the guest we verify that the
+target real CPU associated with the virtual CPU designated by
+the guest is running and if not we forward the DIAG_9C to the
+target real CPU.
+
+To avoid a diag9c storm we allow a maximal rate of diag9c forwarding.
+
+The rate is calculated as a count per second defined as a new
+parameter of the s390 kvm module: diag9c_forwarding_hz .
+
+The default value of 0 is to not forward diag9c.
+
+	Signed-off-by: Pierre Morel <pmorel@linux.ibm.com>
+Link: https://lore.kernel.org/r/1613997661-22525-2-git-send-email-pmorel@linux.ibm.com
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit 87e28a15c42cc592009c32a8c20e5789059027c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/smp.h
+diff --cc arch/s390/include/asm/smp.h
+index 3907ead27ffa,e317fd4866c1..000000000000
+--- a/arch/s390/include/asm/smp.h
++++ b/arch/s390/include/asm/smp.h
+@@@ -88,9 -62,7 +88,14 @@@ extern int smp_rescan_cpus(void)
+  extern void __noreturn cpu_die(void);
+  extern void __cpu_die(unsigned int cpu);
+  extern int __cpu_disable(void);
+++<<<<<<< HEAD
+ +#else
+ +static inline int smp_rescan_cpus(void) { return 0; }
+ +static inline void cpu_die(void) { }
+ +#endif
+++=======
++ extern void schedule_mcck_handler(void);
++ void notrace smp_yield_cpu(int cpu);
+++>>>>>>> 87e28a15c42c (KVM: s390: diag9c (directed yield) forwarding)
+  
+  #endif /* __ASM_SMP_H */
+diff --git a/Documentation/virt/kvm/s390-diag.rst b/Documentation/virt/kvm/s390-diag.rst
+index eaac4864d3d6..ca85f030eb0b 100644
+--- a/Documentation/virt/kvm/s390-diag.rst
++++ b/Documentation/virt/kvm/s390-diag.rst
+@@ -84,3 +84,36 @@ If the function code specifies 0x501, breakpoint functions may be performed.
+ This function code is handled by userspace.
+ 
+ This diagnose function code has no subfunctions and uses no parameters.
++
++
++DIAGNOSE function code 'X'9C - Voluntary Time Slice Yield
++---------------------------------------------------------
++
++General register 1 contains the target CPU address.
++
++In a guest of a hypervisor like LPAR, KVM or z/VM using shared host CPUs,
++DIAGNOSE with function code 0x9c may improve system performance by
++yielding the host CPU on which the guest CPU is running to be assigned
++to another guest CPU, preferably the logical CPU containing the specified
++target CPU.
++
++
++DIAG 'X'9C forwarding
+++++++++++++++++++++++
++
++The guest may send a DIAGNOSE 0x9c in order to yield to a certain
++other vcpu. An example is a Linux guest that tries to yield to the vcpu
++that is currently holding a spinlock, but not running.
++
++However, on the host the real cpu backing the vcpu may itself not be
++running.
++Forwarding the DIAGNOSE 0x9c initially sent by the guest to yield to
++the backing cpu will hopefully cause that cpu, and thus subsequently
++the guest's vcpu, to be scheduled.
++
++
++diag9c_forwarding_hz
++    KVM kernel parameter allowing to specify the maximum number of DIAGNOSE
++    0x9c forwarding per second in the purpose of avoiding a DIAGNOSE 0x9c
++    forwarding storm.
++    A value of 0 turns the forwarding off.
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index 89764ebf4658..d5f8cadceb25 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -454,6 +454,7 @@ struct kvm_vcpu_stat {
+ 	u64 diagnose_44;
+ 	u64 diagnose_9c;
+ 	u64 diagnose_9c_ignored;
++	u64 diagnose_9c_forward;
+ 	u64 diagnose_258;
+ 	u64 diagnose_308;
+ 	u64 diagnose_500;
+* Unmerged path arch/s390/include/asm/smp.h
+diff --git a/arch/s390/kernel/smp.c b/arch/s390/kernel/smp.c
+index e7edc5917254..05f7f1e2f9a5 100644
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -414,6 +414,7 @@ void smp_yield_cpu(int cpu)
+ 		asm volatile("diag 0,0,0x44");
+ 	}
+ }
++EXPORT_SYMBOL_GPL(smp_yield_cpu);
+ 
+ /*
+  * Send cpus emergency shutdown signal. This gives the cpus the
+diff --git a/arch/s390/kvm/diag.c b/arch/s390/kvm/diag.c
+index 563429dece03..569af09b54ee 100644
+--- a/arch/s390/kvm/diag.c
++++ b/arch/s390/kvm/diag.c
+@@ -151,6 +151,19 @@ static int __diag_time_slice_end(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++static int forward_cnt;
++static unsigned long cur_slice;
++
++static int diag9c_forwarding_overrun(void)
++{
++	/* Reset the count on a new slice */
++	if (time_after(jiffies, cur_slice)) {
++		cur_slice = jiffies;
++		forward_cnt = diag9c_forwarding_hz / HZ;
++	}
++	return forward_cnt-- <= 0 ? 1 : 0;
++}
++
+ static int __diag_time_slice_end_directed(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_vcpu *tcpu;
+@@ -168,9 +181,21 @@ static int __diag_time_slice_end_directed(struct kvm_vcpu *vcpu)
+ 	if (!tcpu)
+ 		goto no_yield;
+ 
+-	/* target already running */
+-	if (READ_ONCE(tcpu->cpu) >= 0)
+-		goto no_yield;
++	/* target guest VCPU already running */
++	if (READ_ONCE(tcpu->cpu) >= 0) {
++		if (!diag9c_forwarding_hz || diag9c_forwarding_overrun())
++			goto no_yield;
++
++		/* target host CPU already running */
++		if (!vcpu_is_preempted(tcpu->cpu))
++			goto no_yield;
++		smp_yield_cpu(tcpu->cpu);
++		VCPU_EVENT(vcpu, 5,
++			   "diag time slice end directed to %d: yield forwarded",
++			   tid);
++		vcpu->stat.diagnose_9c_forward++;
++		return 0;
++	}
+ 
+ 	if (kvm_vcpu_yield_to(tcpu) <= 0)
+ 		goto no_yield;
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 08167f746c15..b9527f095d15 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -156,6 +156,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
+ 	VCPU_STAT("instruction_diag_44", diagnose_44),
+ 	VCPU_STAT("instruction_diag_9c", diagnose_9c),
+ 	VCPU_STAT("diag_9c_ignored", diagnose_9c_ignored),
++	VCPU_STAT("diag_9c_forward", diagnose_9c_forward),
+ 	VCPU_STAT("instruction_diag_258", diagnose_258),
+ 	VCPU_STAT("instruction_diag_308", diagnose_308),
+ 	VCPU_STAT("instruction_diag_500", diagnose_500),
+@@ -189,6 +190,11 @@ static bool use_gisa  = true;
+ module_param(use_gisa, bool, 0644);
+ MODULE_PARM_DESC(use_gisa, "Use the GISA if the host supports it.");
+ 
++/* maximum diag9c forwarding per second */
++unsigned int diag9c_forwarding_hz;
++module_param(diag9c_forwarding_hz, uint, 0644);
++MODULE_PARM_DESC(diag9c_forwarding_hz, "Maximum diag9c forwarding per second, 0 to turn off");
++
+ /*
+  * For now we handle at most 16 double words as this is what the s390 base
+  * kernel handles and stores in the prefix page. If we ever need to go beyond
+diff --git a/arch/s390/kvm/kvm-s390.h b/arch/s390/kvm/kvm-s390.h
+index 79dcd647b378..9fad25109b0d 100644
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -471,4 +471,12 @@ void kvm_s390_reinject_machine_check(struct kvm_vcpu *vcpu,
+  * @kvm: the KVM guest
+  */
+ void kvm_s390_vcpu_crypto_reset_all(struct kvm *kvm);
++
++/**
++ * diag9c_forwarding_hz
++ *
++ * Set the maximum number of diag9c forwarding per second
++ */
++extern unsigned int diag9c_forwarding_hz;
++
+ #endif
