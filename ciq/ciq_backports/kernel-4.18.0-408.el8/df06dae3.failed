@@ -1,0 +1,241 @@
+KVM: Don't actually set a request when evicting vCPUs for GFN cache invd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit df06dae3f2a8bfb83683abf88d3dcde23fc8093d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/df06dae3.failed
+
+Don't actually set a request bit in vcpu->requests when making a request
+purely to force a vCPU to exit the guest.  Logging a request but not
+actually consuming it would cause the vCPU to get stuck in an infinite
+loop during KVM_RUN because KVM would see the pending request and bail
+from VM-Enter to service the request.
+
+Note, it's currently impossible for KVM to set KVM_REQ_GPC_INVALIDATE as
+nothing in KVM is wired up to set guest_uses_pa=true.  But, it'd be all
+too easy for arch code to introduce use of kvm_gfn_to_pfn_cache_init()
+without implementing handling of the request, especially since getting
+test coverage of MMU notifier interaction with specific KVM features
+usually requires a directed test.
+
+Opportunistically rename gfn_to_pfn_cache_invalidate_start()'s wake_vcpus
+to evict_vcpus.  The purpose of the request is to get vCPUs out of guest
+mode, it's supposed to _avoid_ waking vCPUs that are blocking.
+
+Opportunistically rename KVM_REQ_GPC_INVALIDATE to be more specific as to
+what it wants to accomplish, and to genericize the name so that it can
+used for similar but unrelated scenarios, should they arise in the future.
+Add a comment and documentation to explain why the "no action" request
+exists.
+
+Add compile-time assertions to help detect improper usage.  Use the inner
+assertless helper in the one s390 path that makes requests without a
+hardcoded request.
+
+	Cc: David Woodhouse <dwmw@amazon.co.uk>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220223165302.3205276-1-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit df06dae3f2a8bfb83683abf88d3dcde23fc8093d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kvm_host.h
+#	virt/kvm/pfncache.c
+diff --cc include/linux/kvm_host.h
+index 905b4457d163,678fd7914521..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -150,14 -154,23 +151,27 @@@ static inline bool is_error_page(struc
+   * Bits 4-7 are reserved for more arch-independent bits.
+   */
+  #define KVM_REQ_TLB_FLUSH         (0 | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+ -#define KVM_REQ_VM_DEAD           (1 | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+ +#define KVM_REQ_MMU_RELOAD        (1 | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+  #define KVM_REQ_UNBLOCK           2
+  #define KVM_REQ_UNHALT            3
+++<<<<<<< HEAD
+ +#define KVM_REQ_VM_DEAD           (4 | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+++=======
+++>>>>>>> df06dae3f2a8 (KVM: Don't actually set a request when evicting vCPUs for GFN cache invd)
+  #define KVM_REQUEST_ARCH_BASE     8
+  
++ /*
++  * KVM_REQ_OUTSIDE_GUEST_MODE exists is purely as way to force the vCPU to
++  * OUTSIDE_GUEST_MODE.  KVM_REQ_OUTSIDE_GUEST_MODE differs from a vCPU "kick"
++  * in that it ensures the vCPU has reached OUTSIDE_GUEST_MODE before continuing
++  * on.  A kick only guarantees that the vCPU is on its way out, e.g. a previous
++  * kick may have set vcpu->mode to EXITING_GUEST_MODE, and so there's no
++  * guarantee the vCPU received an IPI and has actually exited guest mode.
++  */
++ #define KVM_REQ_OUTSIDE_GUEST_MODE	(KVM_REQUEST_NO_ACTION | KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
++ 
+  #define KVM_ARCH_REQ_FLAGS(nr, flags) ({ \
+ -	BUILD_BUG_ON((unsigned)(nr) >= (sizeof_field(struct kvm_vcpu, requests) * 8) - KVM_REQUEST_ARCH_BASE); \
+ +	BUILD_BUG_ON((unsigned)(nr) >= (FIELD_SIZEOF(struct kvm_vcpu, requests) * 8) - KVM_REQUEST_ARCH_BASE); \
+  	(unsigned)(((nr) + KVM_REQUEST_ARCH_BASE) | (flags)); \
+  })
+  #define KVM_ARCH_REQ(nr)           KVM_ARCH_REQ_FLAGS(nr, 0)
+@@@ -914,6 -1223,105 +928,108 @@@ int kvm_vcpu_write_guest(struct kvm_vcp
+  			 unsigned long len);
+  void kvm_vcpu_mark_page_dirty(struct kvm_vcpu *vcpu, gfn_t gfn);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * kvm_gfn_to_pfn_cache_init - prepare a cached kernel mapping and HPA for a
++  *                             given guest physical address.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @vcpu:	   vCPU to be used for marking pages dirty and to be woken on
++  *		   invalidation.
++  * @guest_uses_pa: indicates that the resulting host physical PFN is used while
++  *		   @vcpu is IN_GUEST_MODE; invalidations of the cache from MMU
++  *		   notifiers (but not for KVM memslot changes!) will also force
++  *		   @vcpu to exit the guest to refresh the cache.
++  * @kernel_map:    requests a kernel virtual mapping (kmap / memremap).
++  * @gpa:	   guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  * @dirty:         mark the cache dirty immediately.
++  *
++  * @return:	   0 for success.
++  *		   -EINVAL for a mapping which would cross a page boundary.
++  *                 -EFAULT for an untranslatable guest physical address.
++  *
++  * This primes a gfn_to_pfn_cache and links it into the @kvm's list for
++  * invalidations to be processed.  Callers are required to use
++  * kvm_gfn_to_pfn_cache_check() to ensure that the cache is valid before
++  * accessing the target page.
++  */
++ int kvm_gfn_to_pfn_cache_init(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 			      struct kvm_vcpu *vcpu, bool guest_uses_pa,
++ 			      bool kernel_map, gpa_t gpa, unsigned long len,
++ 			      bool dirty);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_check - check validity of a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @gpa:	   current guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  * @dirty:         mark the cache dirty immediately.
++  *
++  * @return:	   %true if the cache is still valid and the address matches.
++  *		   %false if the cache is not valid.
++  *
++  * Callers outside IN_GUEST_MODE context should hold a read lock on @gpc->lock
++  * while calling this function, and then continue to hold the lock until the
++  * access is complete.
++  *
++  * Callers in IN_GUEST_MODE may do so without locking, although they should
++  * still hold a read lock on kvm->scru for the memslot checks.
++  */
++ bool kvm_gfn_to_pfn_cache_check(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 				gpa_t gpa, unsigned long len);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_refresh - update a previously initialized cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @gpa:	   updated guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  * @dirty:         mark the cache dirty immediately.
++  *
++  * @return:	   0 for success.
++  *		   -EINVAL for a mapping which would cross a page boundary.
++  *                 -EFAULT for an untranslatable guest physical address.
++  *
++  * This will attempt to refresh a gfn_to_pfn_cache. Note that a successful
++  * returm from this function does not mean the page can be immediately
++  * accessed because it may have raced with an invalidation. Callers must
++  * still lock and check the cache status, as this function does not return
++  * with the lock still held to permit access.
++  */
++ int kvm_gfn_to_pfn_cache_refresh(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 				 gpa_t gpa, unsigned long len, bool dirty);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_unmap - temporarily unmap a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  *
++  * This unmaps the referenced page and marks it dirty, if appropriate. The
++  * cache is left in the invalid state but at least the mapping from GPA to
++  * userspace HVA will remain cached and can be reused on a subsequent
++  * refresh.
++  */
++ void kvm_gfn_to_pfn_cache_unmap(struct kvm *kvm, struct gfn_to_pfn_cache *gpc);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_destroy - destroy and unlink a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  *
++  * This removes a cache from the @kvm's list to be processed on MMU notifier
++  * invocation.
++  */
++ void kvm_gfn_to_pfn_cache_destroy(struct kvm *kvm, struct gfn_to_pfn_cache *gpc);
++ 
+++>>>>>>> df06dae3f2a8 (KVM: Don't actually set a request when evicting vCPUs for GFN cache invd)
+  void kvm_sigset_activate(struct kvm_vcpu *vcpu);
+  void kvm_sigset_deactivate(struct kvm_vcpu *vcpu);
+  
+* Unmerged path virt/kvm/pfncache.c
+diff --git a/Documentation/virt/kvm/vcpu-requests.rst b/Documentation/virt/kvm/vcpu-requests.rst
+index ad2915ef7020..f3d38e8a1fb3 100644
+--- a/Documentation/virt/kvm/vcpu-requests.rst
++++ b/Documentation/virt/kvm/vcpu-requests.rst
+@@ -136,6 +136,16 @@ KVM_REQ_UNHALT
+   such as a pending signal, which does not indicate the VCPU's halt
+   emulation should stop, and therefore does not make the request.
+ 
++KVM_REQ_OUTSIDE_GUEST_MODE
++
++  This "request" ensures the target vCPU has exited guest mode prior to the
++  sender of the request continuing on.  No action needs be taken by the target,
++  and so no request is actually logged for the target.  This request is similar
++  to a "kick", but unlike a kick it guarantees the vCPU has actually exited
++  guest mode.  A kick only guarantees the vCPU will exit at some point in the
++  future, e.g. a previous kick may have started the process, but there's no
++  guarantee the to-be-kicked vCPU has fully exited guest mode.
++
+ KVM_REQUEST_MASK
+ ----------------
+ 
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 537e809fbaae..383a96267b41 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -3362,7 +3362,7 @@ void exit_sie(struct kvm_vcpu *vcpu)
+ /* Kick a guest cpu out of SIE to process a request synchronously */
+ void kvm_s390_sync_request(int req, struct kvm_vcpu *vcpu)
+ {
+-	kvm_make_request(req, vcpu);
++	__kvm_make_request(req, vcpu);
+ 	kvm_s390_vcpu_request(vcpu);
+ }
+ 
+* Unmerged path include/linux/kvm_host.h
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 0c65a05748b3..e43d96fc9e5d 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -267,7 +267,8 @@ static void kvm_make_vcpu_request(struct kvm_vcpu *vcpu, unsigned int req,
+ {
+ 	int cpu;
+ 
+-	kvm_make_request(req, vcpu);
++	if (likely(!(req & KVM_REQUEST_NO_ACTION)))
++		__kvm_make_request(req, vcpu);
+ 
+ 	if (!(req & KVM_REQUEST_NO_WAKEUP) && kvm_vcpu_wake_up(vcpu))
+ 		return;
+* Unmerged path virt/kvm/pfncache.c
