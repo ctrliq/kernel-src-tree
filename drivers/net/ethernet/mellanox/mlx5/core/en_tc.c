@@ -1318,7 +1318,7 @@ static void __mlx5e_tc_del_fdb_peer_flow(struct mlx5e_tc_flow *flow)
 	flow->flags &= ~MLX5E_TC_FLOW_DUP;
 
 	mlx5e_tc_del_fdb_flow(flow->peer_flow->priv, flow->peer_flow);
-	kvfree(flow->peer_flow);
+	kfree(flow->peer_flow);
 	flow->peer_flow = NULL;
 }
 
