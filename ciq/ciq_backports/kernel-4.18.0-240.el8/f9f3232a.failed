@@ -1,0 +1,399 @@
+dma-mapping: explicitly wire up ->mmap and ->get_sgtable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit f9f3232a7d0ab73a33d11f4056c5823010f03d55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f9f3232a.failed
+
+While the default ->mmap and ->get_sgtable implementations work for the
+majority of our dma_map_ops impementations they are inherently safe
+for others that don't use the page allocator or CMA and/or use their
+own way of remapping not covered by the common code.  So remove the
+defaults if these methods are not wired up, but instead wire up the
+default implementations for all safe instances.
+
+Fixes: e1c7e324539a ("dma-mapping: always provide the dma_map_ops based implementation")
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit f9f3232a7d0ab73a33d11f4056c5823010f03d55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/ia64/hp/common/sba_iommu.c
+#	arch/mips/jazz/jazzdma.c
+#	drivers/parisc/ccio-dma.c
+#	drivers/parisc/sba_iommu.c
+diff --cc arch/ia64/hp/common/sba_iommu.c
+index ee5b652d320a,4c0ea6c2833d..000000000000
+--- a/arch/ia64/hp/common/sba_iommu.c
++++ b/arch/ia64/hp/common/sba_iommu.c
+@@@ -2207,12 -2182,9 +2207,17 @@@ const struct dma_map_ops sba_dma_ops = 
+  	.unmap_page		= sba_unmap_page,
+  	.map_sg			= sba_map_sg_attrs,
+  	.unmap_sg		= sba_unmap_sg_attrs,
+ +	.sync_single_for_cpu	= machvec_dma_sync_single,
+ +	.sync_sg_for_cpu	= machvec_dma_sync_sg,
+ +	.sync_single_for_device	= machvec_dma_sync_single,
+ +	.sync_sg_for_device	= machvec_dma_sync_sg,
+  	.dma_supported		= sba_dma_supported,
+++<<<<<<< HEAD
+ +	.mapping_error		= sba_dma_mapping_error,
+++=======
++ 	.mmap			= dma_common_mmap,
++ 	.get_sgtable		= dma_common_get_sgtable,
+++>>>>>>> f9f3232a7d0a (dma-mapping: explicitly wire up ->mmap and ->get_sgtable)
+  };
+  
+  void sba_dma_init(void)
+diff --cc arch/mips/jazz/jazzdma.c
+index d626a9a391cc,a01e14955187..000000000000
+--- a/arch/mips/jazz/jazzdma.c
++++ b/arch/mips/jazz/jazzdma.c
+@@@ -556,4 -560,129 +556,133 @@@ int vdma_get_enable(int channel
+  	return enable;
+  }
+  
+++<<<<<<< HEAD
+ +arch_initcall(vdma_init);
+++=======
++ static void *jazz_dma_alloc(struct device *dev, size_t size,
++ 		dma_addr_t *dma_handle, gfp_t gfp, unsigned long attrs)
++ {
++ 	void *ret;
++ 
++ 	ret = dma_direct_alloc_pages(dev, size, dma_handle, gfp, attrs);
++ 	if (!ret)
++ 		return NULL;
++ 
++ 	*dma_handle = vdma_alloc(virt_to_phys(ret), size);
++ 	if (*dma_handle == DMA_MAPPING_ERROR) {
++ 		dma_direct_free_pages(dev, size, ret, *dma_handle, attrs);
++ 		return NULL;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void jazz_dma_free(struct device *dev, size_t size, void *vaddr,
++ 		dma_addr_t dma_handle, unsigned long attrs)
++ {
++ 	vdma_free(dma_handle);
++ 	dma_direct_free_pages(dev, size, vaddr, dma_handle, attrs);
++ }
++ 
++ static dma_addr_t jazz_dma_map_page(struct device *dev, struct page *page,
++ 		unsigned long offset, size_t size, enum dma_data_direction dir,
++ 		unsigned long attrs)
++ {
++ 	phys_addr_t phys = page_to_phys(page) + offset;
++ 
++ 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		arch_sync_dma_for_device(dev, phys, size, dir);
++ 	return vdma_alloc(phys, size);
++ }
++ 
++ static void jazz_dma_unmap_page(struct device *dev, dma_addr_t dma_addr,
++ 		size_t size, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		arch_sync_dma_for_cpu(dev, vdma_log2phys(dma_addr), size, dir);
++ 	vdma_free(dma_addr);
++ }
++ 
++ static int jazz_dma_map_sg(struct device *dev, struct scatterlist *sglist,
++ 		int nents, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	int i;
++ 	struct scatterlist *sg;
++ 
++ 	for_each_sg(sglist, sg, nents, i) {
++ 		if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 			arch_sync_dma_for_device(dev, sg_phys(sg), sg->length,
++ 				dir);
++ 		sg->dma_address = vdma_alloc(sg_phys(sg), sg->length);
++ 		if (sg->dma_address == DMA_MAPPING_ERROR)
++ 			return 0;
++ 		sg_dma_len(sg) = sg->length;
++ 	}
++ 
++ 	return nents;
++ }
++ 
++ static void jazz_dma_unmap_sg(struct device *dev, struct scatterlist *sglist,
++ 		int nents, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	int i;
++ 	struct scatterlist *sg;
++ 
++ 	for_each_sg(sglist, sg, nents, i) {
++ 		if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 			arch_sync_dma_for_cpu(dev, sg_phys(sg), sg->length,
++ 				dir);
++ 		vdma_free(sg->dma_address);
++ 	}
++ }
++ 
++ static void jazz_dma_sync_single_for_device(struct device *dev,
++ 		dma_addr_t addr, size_t size, enum dma_data_direction dir)
++ {
++ 	arch_sync_dma_for_device(dev, vdma_log2phys(addr), size, dir);
++ }
++ 
++ static void jazz_dma_sync_single_for_cpu(struct device *dev,
++ 		dma_addr_t addr, size_t size, enum dma_data_direction dir)
++ {
++ 	arch_sync_dma_for_cpu(dev, vdma_log2phys(addr), size, dir);
++ }
++ 
++ static void jazz_dma_sync_sg_for_device(struct device *dev,
++ 		struct scatterlist *sgl, int nents, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	for_each_sg(sgl, sg, nents, i)
++ 		arch_sync_dma_for_device(dev, sg_phys(sg), sg->length, dir);
++ }
++ 
++ static void jazz_dma_sync_sg_for_cpu(struct device *dev,
++ 		struct scatterlist *sgl, int nents, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	for_each_sg(sgl, sg, nents, i)
++ 		arch_sync_dma_for_cpu(dev, sg_phys(sg), sg->length, dir);
++ }
++ 
++ const struct dma_map_ops jazz_dma_ops = {
++ 	.alloc			= jazz_dma_alloc,
++ 	.free			= jazz_dma_free,
++ 	.map_page		= jazz_dma_map_page,
++ 	.unmap_page		= jazz_dma_unmap_page,
++ 	.map_sg			= jazz_dma_map_sg,
++ 	.unmap_sg		= jazz_dma_unmap_sg,
++ 	.sync_single_for_cpu	= jazz_dma_sync_single_for_cpu,
++ 	.sync_single_for_device	= jazz_dma_sync_single_for_device,
++ 	.sync_sg_for_cpu	= jazz_dma_sync_sg_for_cpu,
++ 	.sync_sg_for_device	= jazz_dma_sync_sg_for_device,
++ 	.dma_supported		= dma_direct_supported,
++ 	.cache_sync		= arch_dma_cache_sync,
++ 	.mmap			= dma_common_mmap,
++ 	.get_sgtable		= dma_common_get_sgtable,
++ };
++ EXPORT_SYMBOL(jazz_dma_ops);
+++>>>>>>> f9f3232a7d0a (dma-mapping: explicitly wire up ->mmap and ->get_sgtable)
+diff --cc drivers/parisc/ccio-dma.c
+index 614823617b8b,1d7125d29bee..000000000000
+--- a/drivers/parisc/ccio-dma.c
++++ b/drivers/parisc/ccio-dma.c
+@@@ -1038,7 -1024,8 +1038,12 @@@ static const struct dma_map_ops ccio_op
+  	.unmap_page =		ccio_unmap_page,
+  	.map_sg = 		ccio_map_sg,
+  	.unmap_sg = 		ccio_unmap_sg,
+++<<<<<<< HEAD
+ +	.mapping_error =	ccio_mapping_error,
+++=======
++ 	.mmap =			dma_common_mmap,
++ 	.get_sgtable =		dma_common_get_sgtable,
+++>>>>>>> f9f3232a7d0a (dma-mapping: explicitly wire up ->mmap and ->get_sgtable)
+  };
+  
+  #ifdef CONFIG_PROC_FS
+diff --cc drivers/parisc/sba_iommu.c
+index 11de0eccf968,fa4df65b7e28..000000000000
+--- a/drivers/parisc/sba_iommu.c
++++ b/drivers/parisc/sba_iommu.c
+@@@ -1098,7 -1084,8 +1098,12 @@@ static const struct dma_map_ops sba_op
+  	.unmap_page =		sba_unmap_page,
+  	.map_sg =		sba_map_sg,
+  	.unmap_sg =		sba_unmap_sg,
+++<<<<<<< HEAD
+ +	.mapping_error =	sba_mapping_error,
+++=======
++ 	.mmap =			dma_common_mmap,
++ 	.get_sgtable =		dma_common_get_sgtable,
+++>>>>>>> f9f3232a7d0a (dma-mapping: explicitly wire up ->mmap and ->get_sgtable)
+  };
+  
+  
+diff --git a/arch/alpha/kernel/pci_iommu.c b/arch/alpha/kernel/pci_iommu.c
+index 6923b0d9c1e1..2fb6711746e7 100644
+--- a/arch/alpha/kernel/pci_iommu.c
++++ b/arch/alpha/kernel/pci_iommu.c
+@@ -949,5 +949,7 @@ const struct dma_map_ops alpha_pci_ops = {
+ 	.unmap_sg		= alpha_pci_unmap_sg,
+ 	.mapping_error		= alpha_pci_mapping_error,
+ 	.dma_supported		= alpha_pci_supported,
++	.mmap			= dma_common_mmap,
++	.get_sgtable		= dma_common_get_sgtable,
+ };
+ EXPORT_SYMBOL(alpha_pci_ops);
+* Unmerged path arch/ia64/hp/common/sba_iommu.c
+diff --git a/arch/ia64/sn/pci/pci_dma.c b/arch/ia64/sn/pci/pci_dma.c
+index 96eb2567718a..4ac6868f5273 100644
+--- a/arch/ia64/sn/pci/pci_dma.c
++++ b/arch/ia64/sn/pci/pci_dma.c
+@@ -473,6 +473,8 @@ static struct dma_map_ops sn_dma_ops = {
+ 	.mapping_error		= sn_dma_mapping_error,
+ 	.dma_supported		= sn_dma_supported,
+ 	.get_required_mask	= sn_dma_get_required_mask,
++	.mmap			= dma_common_mmap,
++	.get_sgtable		= dma_common_get_sgtable,
+ };
+ 
+ void sn_dma_init(void)
+* Unmerged path arch/mips/jazz/jazzdma.c
+diff --git a/arch/powerpc/kernel/dma-iommu.c b/arch/powerpc/kernel/dma-iommu.c
+index 92b318df1aa1..c7bf2ff1f0c1 100644
+--- a/arch/powerpc/kernel/dma-iommu.c
++++ b/arch/powerpc/kernel/dma-iommu.c
+@@ -208,4 +208,6 @@ const struct dma_map_ops dma_iommu_ops = {
+ 	.sync_single_for_device	= dma_iommu_sync_for_device,
+ 	.sync_sg_for_cpu	= dma_iommu_sync_sg_for_cpu,
+ 	.sync_sg_for_device	= dma_iommu_sync_sg_for_device,
++	.mmap			= dma_common_mmap,
++	.get_sgtable		= dma_common_get_sgtable,
+ };
+diff --git a/arch/powerpc/platforms/ps3/system-bus.c b/arch/powerpc/platforms/ps3/system-bus.c
+index 5cc35d6b94b6..93644eb3183b 100644
+--- a/arch/powerpc/platforms/ps3/system-bus.c
++++ b/arch/powerpc/platforms/ps3/system-bus.c
+@@ -712,6 +712,8 @@ static const struct dma_map_ops ps3_sb_dma_ops = {
+ 	.get_required_mask = ps3_dma_get_required_mask,
+ 	.map_page = ps3_sb_map_page,
+ 	.unmap_page = ps3_unmap_page,
++	.mmap = dma_common_mmap,
++	.get_sgtable = dma_common_get_sgtable,
+ };
+ 
+ static const struct dma_map_ops ps3_ioc0_dma_ops = {
+@@ -723,6 +725,8 @@ static const struct dma_map_ops ps3_ioc0_dma_ops = {
+ 	.get_required_mask = ps3_dma_get_required_mask,
+ 	.map_page = ps3_ioc0_map_page,
+ 	.unmap_page = ps3_unmap_page,
++	.mmap = dma_common_mmap,
++	.get_sgtable = dma_common_get_sgtable,
+ };
+ 
+ /**
+diff --git a/arch/powerpc/platforms/pseries/vio.c b/arch/powerpc/platforms/pseries/vio.c
+index 88b6dc024d6a..073d1b2e6068 100644
+--- a/arch/powerpc/platforms/pseries/vio.c
++++ b/arch/powerpc/platforms/pseries/vio.c
+@@ -609,6 +609,8 @@ static const struct dma_map_ops vio_dma_mapping_ops = {
+ 	.unmap_page        = vio_dma_iommu_unmap_page,
+ 	.dma_supported     = dma_iommu_dma_supported,
+ 	.get_required_mask = dma_iommu_get_required_mask,
++	.mmap		   = dma_common_mmap,
++	.get_sgtable	   = dma_common_get_sgtable,
+ };
+ 
+ /**
+diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
+index 346ba382193a..117ebc40db55 100644
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@ -668,6 +668,8 @@ const struct dma_map_ops s390_pci_dma_ops = {
+ 	.unmap_sg	= s390_dma_unmap_sg,
+ 	.map_page	= s390_dma_map_pages,
+ 	.unmap_page	= s390_dma_unmap_pages,
++	.mmap		= dma_common_mmap,
++	.get_sgtable	= dma_common_get_sgtable,
+ 	/* dma_supported is unconditionally true without a callback */
+ };
+ EXPORT_SYMBOL_GPL(s390_pci_dma_ops);
+diff --git a/arch/x86/kernel/amd_gart_64.c b/arch/x86/kernel/amd_gart_64.c
+index 22dc52101e8b..272d7aafcfc9 100644
+--- a/arch/x86/kernel/amd_gart_64.c
++++ b/arch/x86/kernel/amd_gart_64.c
+@@ -680,6 +680,8 @@ static const struct dma_map_ops gart_dma_ops = {
+ 	.unmap_page			= gart_unmap_page,
+ 	.alloc				= gart_alloc_coherent,
+ 	.free				= gart_free_coherent,
++	.mmap				= dma_common_mmap,
++	.get_sgtable			= dma_common_get_sgtable,
+ 	.dma_supported			= dma_direct_supported,
+ };
+ 
+diff --git a/arch/x86/kernel/pci-calgary_64.c b/arch/x86/kernel/pci-calgary_64.c
+index bbfc8b1e9104..47225accd7f1 100644
+--- a/arch/x86/kernel/pci-calgary_64.c
++++ b/arch/x86/kernel/pci-calgary_64.c
+@@ -493,6 +493,8 @@ static const struct dma_map_ops calgary_dma_ops = {
+ 	.unmap_page = calgary_unmap_page,
+ 	.mapping_error = calgary_mapping_error,
+ 	.dma_supported = dma_direct_supported,
++	.mmap = dma_common_mmap,
++	.get_sgtable = dma_common_get_sgtable,
+ };
+ 
+ static inline void __iomem * busno_to_bbar(unsigned char num)
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index faadb3a79718..db3142d6dba9 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -2781,6 +2781,8 @@ static const struct dma_map_ops amd_iommu_dma_ops = {
+ 	.map_sg		= map_sg,
+ 	.unmap_sg	= unmap_sg,
+ 	.dma_supported	= amd_iommu_dma_supported,
++	.mmap		= dma_common_mmap,
++	.get_sgtable	= dma_common_get_sgtable,
+ };
+ 
+ static int init_reserved_iova_ranges(void)
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index e339a5e3c53b..ca9233fe51b5 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -3770,6 +3770,8 @@ static const struct dma_map_ops intel_dma_ops = {
+ 	.map_resource = intel_map_resource,
+ 	.unmap_resource = intel_unmap_page,
+ 	.dma_supported = dma_direct_supported,
++	.mmap = dma_common_mmap,
++	.get_sgtable = dma_common_get_sgtable,
+ };
+ 
+ static inline int iommu_domain_cache_init(void)
+* Unmerged path drivers/parisc/ccio-dma.c
+* Unmerged path drivers/parisc/sba_iommu.c
+diff --git a/kernel/dma/mapping.c b/kernel/dma/mapping.c
+index ce98092815ed..83a46ff3548f 100644
+--- a/kernel/dma/mapping.c
++++ b/kernel/dma/mapping.c
+@@ -153,11 +153,12 @@ int dma_get_sgtable_attrs(struct device *dev, struct sg_table *sgt,
+ {
+ 	const struct dma_map_ops *ops = get_dma_ops(dev);
+ 
+-	if (!dma_is_direct(ops) && ops->get_sgtable)
+-		return ops->get_sgtable(dev, sgt, cpu_addr, dma_addr, size,
+-					attrs);
+-	return dma_common_get_sgtable(dev, sgt, cpu_addr, dma_addr, size,
+-			attrs);
++	if (dma_is_direct(ops))
++		return dma_common_get_sgtable(dev, sgt, cpu_addr, dma_addr,
++				size, attrs);
++	if (!ops->get_sgtable)
++		return -ENXIO;
++	return ops->get_sgtable(dev, sgt, cpu_addr, dma_addr, size, attrs);
+ }
+ EXPORT_SYMBOL(dma_get_sgtable_attrs);
+ 
+@@ -238,9 +239,12 @@ int dma_mmap_attrs(struct device *dev, struct vm_area_struct *vma,
+ {
+ 	const struct dma_map_ops *ops = get_dma_ops(dev);
+ 
+-	if (!dma_is_direct(ops) && ops->mmap)
+-		return ops->mmap(dev, vma, cpu_addr, dma_addr, size, attrs);
+-	return dma_common_mmap(dev, vma, cpu_addr, dma_addr, size, attrs);
++	if (dma_is_direct(ops))
++		return dma_common_mmap(dev, vma, cpu_addr, dma_addr, size,
++				attrs);
++	if (!ops->mmap)
++		return -ENXIO;
++	return ops->mmap(dev, vma, cpu_addr, dma_addr, size, attrs);
+ }
+ EXPORT_SYMBOL(dma_mmap_attrs);
+ 
