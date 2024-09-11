@@ -1,0 +1,325 @@
+ALSA: usb-audio: Drop unneeded snd_usb_substream fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 6aa719d15a1903eb3fd0e052ae53f3b024ad4d05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/6aa719d1.failed
+
+Some fields like interface and alt_idx in snd_usb_substream are mostly
+useless now as they can be referred via either cur_audiofmt or
+data_endpoint assigned to the substream.  Drop those, and also assure
+the concurrency about the access of cur_audiofmt field.
+
+	Tested-by: Keith Milner <kamilner@superlative.org>
+	Tested-by: Dylan Robinson <dylan_robinson@motu.com>
+Link: https://lore.kernel.org/r/20201123085347.19667-31-tiwai@suse.de
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 6aa719d15a1903eb3fd0e052ae53f3b024ad4d05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/usb/pcm.c
+diff --cc sound/usb/pcm.c
+index 6f25783cf701,95a6a854dc55..000000000000
+--- a/sound/usb/pcm.c
++++ b/sound/usb/pcm.c
+@@@ -881,38 -725,93 +881,113 @@@ static int snd_usb_hw_params(struct snd
+  			     struct snd_pcm_hw_params *hw_params)
+  {
+  	struct snd_usb_substream *subs = substream->runtime->private_data;
+ -	struct snd_usb_audio *chip = subs->stream->chip;
+ -	const struct audioformat *fmt;
+ -	const struct audioformat *sync_fmt;
+ +	struct audioformat *fmt;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	subs->pcm_format = params_format(hw_params);
+ +	subs->period_bytes = params_period_bytes(hw_params);
+ +	subs->period_frames = params_period_size(hw_params);
+ +	subs->buffer_periods = params_periods(hw_params);
+ +	subs->channels = params_channels(hw_params);
+ +	subs->cur_rate = params_rate(hw_params);
+++=======
++ 	ret = snd_media_start_pipeline(subs);
++ 	if (ret)
++ 		return ret;
++ 
++ 	fmt = find_substream_format(subs, hw_params);
++ 	if (!fmt) {
++ 		usb_audio_dbg(chip,
++ 			      "cannot find format: format=%s, rate=%d, channels=%d\n",
++ 			      snd_pcm_format_name(params_format(hw_params)),
++ 			      params_rate(hw_params), params_channels(hw_params));
++ 		ret = -EINVAL;
++ 		goto stop_pipeline;
++ 	}
++ 
++ 	if (fmt->implicit_fb &&
++ 	    (fmt->iface != fmt->sync_iface ||
++ 	     fmt->altsetting != fmt->sync_altsetting)) {
++ 		sync_fmt = find_implicit_fb_sync_format(chip, fmt, hw_params,
++ 							!substream->stream);
++ 		if (!sync_fmt) {
++ 			usb_audio_dbg(chip,
++ 				      "cannot find sync format: ep=0x%x, iface=%d:%d, format=%s, rate=%d, channels=%d\n",
++ 				      fmt->sync_ep, fmt->sync_iface,
++ 				      fmt->sync_altsetting,
++ 				      snd_pcm_format_name(params_format(hw_params)),
++ 				      params_rate(hw_params), params_channels(hw_params));
++ 			ret = -EINVAL;
++ 			goto stop_pipeline;
++ 		}
++ 	} else {
++ 		sync_fmt = fmt;
++ 	}
++ 
++ 	ret = snd_usb_lock_shutdown(chip);
++ 	if (ret < 0)
++ 		goto stop_pipeline;
++ 
++ 	ret = snd_usb_pcm_change_state(subs, UAC3_PD_STATE_D0);
++ 	if (ret < 0)
++ 		goto unlock;
++ 
++ 	if (subs->data_endpoint) {
++ 		if (snd_usb_endpoint_compatible(chip, subs->data_endpoint,
++ 						fmt, hw_params))
++ 			goto unlock;
++ 		close_endpoints(chip, subs);
++ 	}
++ 
++ 	subs->data_endpoint = snd_usb_endpoint_open(chip, fmt, hw_params, false);
++ 	if (!subs->data_endpoint) {
++ 		ret = -EINVAL;
++ 		goto unlock;
++ 	}
++ 
++ 	if (fmt->sync_ep) {
++ 		subs->sync_endpoint = snd_usb_endpoint_open(chip, sync_fmt,
++ 							    hw_params,
++ 							    fmt == sync_fmt);
++ 		if (!subs->sync_endpoint) {
++ 			ret = -EINVAL;
++ 			goto unlock;
++ 		}
++ 
++ 		snd_usb_endpoint_set_sync(chip, subs->data_endpoint,
++ 					  subs->sync_endpoint);
++ 	}
++ 
++ 	mutex_lock(&chip->mutex);
++ 	subs->cur_audiofmt = fmt;
++ 	mutex_unlock(&chip->mutex);
++ 
++ 	ret = configure_endpoints(chip, subs);
+++>>>>>>> 6aa719d15a19 (ALSA: usb-audio: Drop unneeded snd_usb_substream fields)
+  
+ - unlock:
+ +	fmt = find_substream_format(subs);
+ +	if (!fmt) {
+ +		dev_dbg(&subs->dev->dev,
+ +			"cannot set format: format = %#x, rate = %d, channels = %d\n",
+ +			   subs->pcm_format, subs->cur_rate, subs->channels);
+ +		return -EINVAL;
+ +	}
+ +
+ +	ret = snd_usb_lock_shutdown(subs->stream->chip);
+  	if (ret < 0)
+ -		close_endpoints(chip, subs);
+ +		return ret;
+  
+ -	snd_usb_unlock_shutdown(chip);
+ - stop_pipeline:
+ +	ret = snd_usb_pcm_change_state(subs, UAC3_PD_STATE_D0);
+  	if (ret < 0)
+ -		snd_media_stop_pipeline(subs);
+ +		goto unlock;
+  
+ +	ret = set_format(subs, fmt);
+ +	if (ret < 0)
+ +		goto unlock;
+ +
+ + unlock:
+ +	snd_usb_unlock_shutdown(subs->stream->chip);
+  	return ret;
+  }
+  
+@@@ -926,19 -825,14 +1001,23 @@@ static int snd_usb_hw_free(struct snd_p
+  	struct snd_usb_substream *subs = substream->runtime->private_data;
+  	struct snd_usb_audio *chip = subs->stream->chip;
+  
+++<<<<<<< HEAD
+++=======
++ 	snd_media_stop_pipeline(subs);
++ 	mutex_lock(&chip->mutex);
+++>>>>>>> 6aa719d15a19 (ALSA: usb-audio: Drop unneeded snd_usb_substream fields)
+  	subs->cur_audiofmt = NULL;
+- 	subs->cur_rate = 0;
+- 	subs->period_bytes = 0;
++ 	mutex_unlock(&chip->mutex);
+  	if (!snd_usb_lock_shutdown(chip)) {
+ -		if (stop_endpoints(subs))
+ -			sync_pending_stops(subs);
+ -		close_endpoints(chip, subs);
+ +		stop_endpoints(subs);
+ +		sync_pending_stops(subs);
+ +		snd_usb_endpoint_deactivate(subs->sync_endpoint);
+ +		snd_usb_endpoint_deactivate(subs->data_endpoint);
+ +		if (subs->data_endpoint) {
+ +			subs->data_endpoint->sync_master = NULL;
+ +			subs->data_endpoint = NULL;
+ +		}
+ +		subs->sync_endpoint = NULL;
+  		snd_usb_unlock_shutdown(chip);
+  	}
+  
+@@@ -1396,9 -1263,8 +1475,7 @@@ static int snd_usb_pcm_open(struct snd_
+  	struct snd_usb_stream *as = snd_pcm_substream_chip(substream);
+  	struct snd_pcm_runtime *runtime = substream->runtime;
+  	struct snd_usb_substream *subs = &as->substream[direction];
+ -	int ret;
+  
+- 	subs->interface = -1;
+- 	subs->altset_idx = 0;
+  	runtime->hw = snd_usb_hardware;
+  	runtime->private_data = subs;
+  	subs->pcm_substream = substream;
+@@@ -1419,11 -1294,9 +1496,17 @@@ static int snd_usb_pcm_close(struct snd
+  	struct snd_usb_substream *subs = &as->substream[direction];
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!as->chip->keep_iface &&
+ +	    subs->interface >= 0 &&
+ +	    !snd_usb_lock_shutdown(subs->stream->chip)) {
+ +		usb_set_interface(subs->dev, subs->interface, 0);
+ +		subs->interface = -1;
+++=======
++ 	snd_media_stop_pipeline(subs);
++ 
++ 	if (!snd_usb_lock_shutdown(subs->stream->chip)) {
+++>>>>>>> 6aa719d15a19 (ALSA: usb-audio: Drop unneeded snd_usb_substream fields)
+  		ret = snd_usb_pcm_change_state(subs, UAC3_PD_STATE_D1);
+  		snd_usb_unlock_shutdown(subs->stream->chip);
+  		if (ret < 0)
+diff --git a/sound/usb/card.c b/sound/usb/card.c
+index 010bfff56c04..9b37bc76d60d 100644
+--- a/sound/usb/card.c
++++ b/sound/usb/card.c
+@@ -123,7 +123,6 @@ static void snd_usb_stream_disconnect(struct snd_usb_stream *as)
+ 		subs = &as->substream[idx];
+ 		if (!subs->num_formats)
+ 			continue;
+-		subs->interface = -1;
+ 		subs->data_endpoint = NULL;
+ 		subs->sync_endpoint = NULL;
+ 	}
+diff --git a/sound/usb/card.h b/sound/usb/card.h
+index ce446f8dba4b..29000a197a51 100644
+--- a/sound/usb/card.h
++++ b/sound/usb/card.h
+@@ -132,18 +132,10 @@ struct snd_usb_substream {
+ 	struct usb_device *dev;
+ 	struct snd_pcm_substream *pcm_substream;
+ 	int direction;	/* playback or capture */
+-	int interface;	/* current interface */
+ 	int endpoint;	/* assigned endpoint */
+ 	struct audioformat *cur_audiofmt;	/* current audioformat pointer (for hw_params callback) */
+ 	struct snd_usb_power_domain *str_pd;	/* UAC3 Power Domain for streaming path */
+-	snd_pcm_format_t pcm_format;	/* current audio format (for hw_params callback) */
+-	unsigned int channels;		/* current number of channels (for hw_params callback) */
+ 	unsigned int channels_max;	/* max channels in the all audiofmts */
+-	unsigned int cur_rate;		/* current rate (for hw_params callback) */
+-	unsigned int period_bytes;	/* current period bytes (for hw_params callback) */
+-	unsigned int period_frames;	/* current frames per period */
+-	unsigned int buffer_periods;	/* current periods per buffer */
+-	unsigned int altset_idx;     /* USB data format: index of alternate setting */
+ 	unsigned int txfr_quirk:1;	/* allow sub-frame alignment */
+ 	unsigned int tx_length_quirk:1;	/* add length specifier to transfers */
+ 	unsigned int fmt_type;		/* USB audio format type (1-3) */
+* Unmerged path sound/usb/pcm.c
+diff --git a/sound/usb/proc.c b/sound/usb/proc.c
+index 889c550c9f29..447ba32e281c 100644
+--- a/sound/usb/proc.c
++++ b/sound/usb/proc.c
+@@ -175,32 +175,39 @@ static void proc_dump_ep_status(struct snd_usb_substream *subs,
+ 	}
+ }
+ 
+-static void proc_dump_substream_status(struct snd_usb_substream *subs, struct snd_info_buffer *buffer)
++static void proc_dump_substream_status(struct snd_usb_audio *chip,
++				       struct snd_usb_substream *subs,
++				       struct snd_info_buffer *buffer)
+ {
++	mutex_lock(&chip->mutex);
+ 	if (subs->running) {
+ 		snd_iprintf(buffer, "  Status: Running\n");
+-		snd_iprintf(buffer, "    Interface = %d\n", subs->interface);
+-		snd_iprintf(buffer, "    Altset = %d\n", subs->altset_idx);
++		if (subs->cur_audiofmt) {
++			snd_iprintf(buffer, "    Interface = %d\n", subs->cur_audiofmt->iface);
++			snd_iprintf(buffer, "    Altset = %d\n", subs->cur_audiofmt->altsetting);
++		}
+ 		proc_dump_ep_status(subs, subs->data_endpoint, subs->sync_endpoint, buffer);
+ 	} else {
+ 		snd_iprintf(buffer, "  Status: Stop\n");
+ 	}
++	mutex_unlock(&chip->mutex);
+ }
+ 
+ static void proc_pcm_format_read(struct snd_info_entry *entry, struct snd_info_buffer *buffer)
+ {
+ 	struct snd_usb_stream *stream = entry->private_data;
++	struct snd_usb_audio *chip = stream->chip;
+ 
+-	snd_iprintf(buffer, "%s : %s\n", stream->chip->card->longname, stream->pcm->name);
++	snd_iprintf(buffer, "%s : %s\n", chip->card->longname, stream->pcm->name);
+ 
+ 	if (stream->substream[SNDRV_PCM_STREAM_PLAYBACK].num_formats) {
+ 		snd_iprintf(buffer, "\nPlayback:\n");
+-		proc_dump_substream_status(&stream->substream[SNDRV_PCM_STREAM_PLAYBACK], buffer);
++		proc_dump_substream_status(chip, &stream->substream[SNDRV_PCM_STREAM_PLAYBACK], buffer);
+ 		proc_dump_substream_formats(&stream->substream[SNDRV_PCM_STREAM_PLAYBACK], buffer);
+ 	}
+ 	if (stream->substream[SNDRV_PCM_STREAM_CAPTURE].num_formats) {
+ 		snd_iprintf(buffer, "\nCapture:\n");
+-		proc_dump_substream_status(&stream->substream[SNDRV_PCM_STREAM_CAPTURE], buffer);
++		proc_dump_substream_status(chip, &stream->substream[SNDRV_PCM_STREAM_CAPTURE], buffer);
+ 		proc_dump_substream_formats(&stream->substream[SNDRV_PCM_STREAM_CAPTURE], buffer);
+ 	}
+ }
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 83bcb952d999..f77b40f86434 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -1423,7 +1423,7 @@ static void set_format_emu_quirk(struct snd_usb_substream *subs,
+ 	 * by playback substream
+ 	 */
+ 	if (subs->direction == SNDRV_PCM_STREAM_PLAYBACK) {
+-		if (subs->stream->substream[SNDRV_PCM_STREAM_CAPTURE].interface != -1)
++		if (subs->stream->substream[SNDRV_PCM_STREAM_CAPTURE].cur_audiofmt)
+ 			return;
+ 	}
+ 
+@@ -1458,13 +1458,13 @@ static void set_format_emu_quirk(struct snd_usb_substream *subs,
+  */
+ static int pioneer_djm_set_format_quirk(struct snd_usb_substream *subs)
+ {
+-
++	unsigned int cur_rate = subs->data_endpoint->cur_rate;
+ 	/* Convert sample rate value to little endian */
+ 	u8 sr[3];
+ 
+-	sr[0] = subs->cur_rate & 0xff;
+-	sr[1] = (subs->cur_rate >> 8) & 0xff;
+-	sr[2] = (subs->cur_rate >> 16) & 0xff;
++	sr[0] = cur_rate & 0xff;
++	sr[1] = (cur_rate >> 8) & 0xff;
++	sr[2] = (cur_rate >> 16) & 0xff;
+ 
+ 	/* Configure device */
+ 	usb_set_interface(subs->dev, 0, 1);
