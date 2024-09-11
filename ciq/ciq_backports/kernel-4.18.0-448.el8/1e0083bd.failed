@@ -1,0 +1,196 @@
+gve: DQO: avoid unused variable warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit 1e0083bd0777e4a418a6710d9ee04b979cdbe5cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/1e0083bd.failed
+
+The use of dma_unmap_addr()/dma_unmap_len() in the driver causes
+multiple warnings when these macros are defined as empty, e.g.
+in an ARCH=i386 allmodconfig build:
+
+drivers/net/ethernet/google/gve/gve_tx_dqo.c: In function 'gve_tx_add_skb_no_copy_dqo':
+drivers/net/ethernet/google/gve/gve_tx_dqo.c:494:40: error: unused variable 'buf' [-Werror=unused-variable]
+  494 |                 struct gve_tx_dma_buf *buf =
+
+This is not how the NEED_DMA_MAP_STATE macros are meant to work,
+as they rely on never using local variables or a temporary structure
+like gve_tx_dma_buf.
+
+Remote the gve_tx_dma_buf definition and open-code the contents
+in all places to avoid the warning. This causes some rather long
+lines but otherwise ends up making the driver slightly smaller.
+
+Fixes: a57e5de476be ("gve: DQO: Add TX path")
+Link: https://lore.kernel.org/netdev/20210723231957.1113800-1-bcf@google.com/
+Link: https://lore.kernel.org/netdev/20210721151100.2042139-1-arnd@kernel.org/
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1e0083bd0777e4a418a6710d9ee04b979cdbe5cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_tx.c
+#	drivers/net/ethernet/google/gve/gve_tx_dqo.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index c3c095d645bd,85bf825606e8..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -218,7 -229,13 +218,17 @@@ struct gve_tx_iovec 
+   */
+  struct gve_tx_buffer_state {
+  	struct sk_buff *skb; /* skb for this pkt */
+++<<<<<<< HEAD
+ +	struct gve_tx_iovec iov[GVE_TX_MAX_IOVEC]; /* segments of this pkt */
+++=======
++ 	union {
++ 		struct gve_tx_iovec iov[GVE_TX_MAX_IOVEC]; /* segments of this pkt */
++ 		struct {
++ 			DEFINE_DMA_UNMAP_ADDR(dma);
++ 			DEFINE_DMA_UNMAP_LEN(len);
++ 		};
++ 	};
+++>>>>>>> 1e0083bd0777 (gve: DQO: avoid unused variable warnings)
+  };
+  
+  /* A TX buffer - each queue has one */
+diff --cc drivers/net/ethernet/google/gve/gve_tx.c
+index 6559c232a86a,9922ce46a635..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_tx.c
++++ b/drivers/net/ethernet/google/gve/gve_tx.c
+@@@ -284,11 -295,25 +284,29 @@@ static inline int gve_skb_fifo_bytes_re
+  	return bytes;
+  }
+  
+ -/* The most descriptors we could need is MAX_SKB_FRAGS + 3 : 1 for each skb frag,
+ - * +1 for the skb linear portion, +1 for when tcp hdr needs to be in separate descriptor,
+ - * and +1 if the payload wraps to the beginning of the FIFO.
+ +/* The most descriptors we could need are 3 - 1 for the headers, 1 for
+ + * the beginning of the payload at the end of the FIFO, and 1 if the
+ + * payload wraps to the beginning of the FIFO.
+   */
+++<<<<<<< HEAD
+ +#define MAX_TX_DESC_NEEDED	3
+++=======
++ #define MAX_TX_DESC_NEEDED	(MAX_SKB_FRAGS + 3)
++ static void gve_tx_unmap_buf(struct device *dev, struct gve_tx_buffer_state *info)
++ {
++ 	if (info->skb) {
++ 		dma_unmap_single(dev, dma_unmap_addr(info, dma),
++ 				 dma_unmap_len(info, len),
++ 				 DMA_TO_DEVICE);
++ 		dma_unmap_len_set(info, len, 0);
++ 	} else {
++ 		dma_unmap_page(dev, dma_unmap_addr(info, dma),
++ 			       dma_unmap_len(info, len),
++ 			       DMA_TO_DEVICE);
++ 		dma_unmap_len_set(info, len, 0);
++ 	}
++ }
+++>>>>>>> 1e0083bd0777 (gve: DQO: avoid unused variable warnings)
+  
+  /* Check if sufficient resources (descriptor ring space, FIFO space) are
+   * available to transmit the given number of bytes.
+@@@ -455,6 -482,91 +473,94 @@@ static int gve_tx_add_skb(struct gve_tx
+  	return 1 + payload_nfrags;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int gve_tx_add_skb_no_copy(struct gve_priv *priv, struct gve_tx_ring *tx,
++ 				  struct sk_buff *skb)
++ {
++ 	const struct skb_shared_info *shinfo = skb_shinfo(skb);
++ 	int hlen, payload_nfrags, l4_hdr_offset;
++ 	union gve_tx_desc *pkt_desc, *seg_desc;
++ 	struct gve_tx_buffer_state *info;
++ 	bool is_gso = skb_is_gso(skb);
++ 	u32 idx = tx->req & tx->mask;
++ 	u64 addr;
++ 	u32 len;
++ 	int i;
++ 
++ 	info = &tx->info[idx];
++ 	pkt_desc = &tx->desc[idx];
++ 
++ 	l4_hdr_offset = skb_checksum_start_offset(skb);
++ 	/* If the skb is gso, then we want only up to the tcp header in the first segment
++ 	 * to efficiently replicate on each segment otherwise we want the linear portion
++ 	 * of the skb (which will contain the checksum because skb->csum_start and
++ 	 * skb->csum_offset are given relative to skb->head) in the first segment.
++ 	 */
++ 	hlen = is_gso ? l4_hdr_offset + tcp_hdrlen(skb) : skb_headlen(skb);
++ 	len = skb_headlen(skb);
++ 
++ 	info->skb =  skb;
++ 
++ 	addr = dma_map_single(tx->dev, skb->data, len, DMA_TO_DEVICE);
++ 	if (unlikely(dma_mapping_error(tx->dev, addr))) {
++ 		tx->dma_mapping_error++;
++ 		goto drop;
++ 	}
++ 	dma_unmap_len_set(info, len, len);
++ 	dma_unmap_addr_set(info, dma, addr);
++ 
++ 	payload_nfrags = shinfo->nr_frags;
++ 	if (hlen < len) {
++ 		/* For gso the rest of the linear portion of the skb needs to
++ 		 * be in its own descriptor.
++ 		 */
++ 		payload_nfrags++;
++ 		gve_tx_fill_pkt_desc(pkt_desc, skb, is_gso, l4_hdr_offset,
++ 				     1 + payload_nfrags, hlen, addr);
++ 
++ 		len -= hlen;
++ 		addr += hlen;
++ 		idx = (tx->req + 1) & tx->mask;
++ 		seg_desc = &tx->desc[idx];
++ 		gve_tx_fill_seg_desc(seg_desc, skb, is_gso, len, addr);
++ 	} else {
++ 		gve_tx_fill_pkt_desc(pkt_desc, skb, is_gso, l4_hdr_offset,
++ 				     1 + payload_nfrags, hlen, addr);
++ 	}
++ 
++ 	for (i = 0; i < shinfo->nr_frags; i++) {
++ 		const skb_frag_t *frag = &shinfo->frags[i];
++ 
++ 		idx = (idx + 1) & tx->mask;
++ 		seg_desc = &tx->desc[idx];
++ 		len = skb_frag_size(frag);
++ 		addr = skb_frag_dma_map(tx->dev, frag, 0, len, DMA_TO_DEVICE);
++ 		if (unlikely(dma_mapping_error(tx->dev, addr))) {
++ 			tx->dma_mapping_error++;
++ 			goto unmap_drop;
++ 		}
++ 		tx->info[idx].skb = NULL;
++ 		dma_unmap_len_set(&tx->info[idx], len, len);
++ 		dma_unmap_addr_set(&tx->info[idx], dma, addr);
++ 
++ 		gve_tx_fill_seg_desc(seg_desc, skb, is_gso, len, addr);
++ 	}
++ 
++ 	return 1 + payload_nfrags;
++ 
++ unmap_drop:
++ 	i += (payload_nfrags == shinfo->nr_frags ? 1 : 2);
++ 	while (i--) {
++ 		idx--;
++ 		gve_tx_unmap_buf(tx->dev, &tx->info[idx & tx->mask]);
++ 	}
++ drop:
++ 	tx->dropped_pkt++;
++ 	return 0;
++ }
++ 
+++>>>>>>> 1e0083bd0777 (gve: DQO: avoid unused variable warnings)
+  netdev_tx_t gve_tx(struct sk_buff *skb, struct net_device *dev)
+  {
+  	struct gve_priv *priv = netdev_priv(dev);
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx_dqo.c
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx.c
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx_dqo.c
