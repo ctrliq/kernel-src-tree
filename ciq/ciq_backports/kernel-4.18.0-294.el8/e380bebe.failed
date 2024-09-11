@@ -1,0 +1,246 @@
+mm, compaction: keep migration source private to a single compaction instance
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit e380bebe4771548df9bece8b7ad9dab07d9158a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e380bebe.failed
+
+Due to either a fast search of the free list or a linear scan, it is
+possible for multiple compaction instances to pick the same pageblock
+for migration.  This is lucky for one scanner and increased scanning for
+all the others.  It also allows a race between requests on which first
+allocates the resulting free block.
+
+This patch tests and updates the pageblock skip for the migration
+scanner carefully.  When isolating a block, it will check and skip if
+the block is already in use.  Once the zone lock is acquired, it will be
+rechecked so that only one scanner can set the pageblock skip for
+exclusive use.  Any scanner contending will continue with a linear scan.
+The skip bit is still set if no pages can be isolated in a range.  While
+this may result in redundant scanning, it avoids unnecessarily acquiring
+the zone lock when there are no suitable migration sources.
+
+1-socket thpscale
+Amean     fault-both-1         0.00 (   0.00%)        0.00 *   0.00%*
+Amean     fault-both-3      3390.40 (   0.00%)     3024.41 (  10.80%)
+Amean     fault-both-5      5082.28 (   0.00%)     4749.30 (   6.55%)
+Amean     fault-both-7      7012.51 (   0.00%)     6454.95 (   7.95%)
+Amean     fault-both-12    11346.63 (   0.00%)    10324.83 (   9.01%)
+Amean     fault-both-18    15324.19 (   0.00%)    12896.82 *  15.84%*
+Amean     fault-both-24    16088.50 (   0.00%)    13470.60 *  16.27%*
+Amean     fault-both-30    18723.42 (   0.00%)    17143.99 (   8.44%)
+Amean     fault-both-32    18612.01 (   0.00%)    17743.91 (   4.66%)
+
+                                5.0.0-rc1              5.0.0-rc1
+                            findmig-v3r15          isolmig-v3r15
+Percentage huge-3        89.83 (   0.00%)       92.96 (   3.48%)
+Percentage huge-5        91.96 (   0.00%)       93.26 (   1.41%)
+Percentage huge-7        92.85 (   0.00%)       93.63 (   0.84%)
+Percentage huge-12       92.74 (   0.00%)       92.80 (   0.07%)
+Percentage huge-18       91.71 (   0.00%)       91.62 (  -0.10%)
+Percentage huge-24       92.13 (   0.00%)       91.50 (  -0.69%)
+Percentage huge-30       93.79 (   0.00%)       92.73 (  -1.13%)
+Percentage huge-32       91.27 (   0.00%)       91.94 (   0.74%)
+
+This shows a reasonable reduction in latency as multiple compaction
+scanners do not operate on the same blocks with a similar allocation
+success rate.
+
+Compaction migrate scanned    41093126    25646769
+
+Migration scan rates are reduced by 38%.
+
+Link: http://lkml.kernel.org/r/20190118175136.31341-11-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: YueHaibing <yuehaibing@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e380bebe4771548df9bece8b7ad9dab07d9158a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 9d273235c740,097572e2ec5d..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -1207,6 -1294,147 +1275,150 @@@ typedef enum 
+   */
+  int sysctl_compact_unevictable_allowed __read_mostly = 1;
+  
+++<<<<<<< HEAD
+++=======
++ static inline void
++ update_fast_start_pfn(struct compact_control *cc, unsigned long pfn)
++ {
++ 	if (cc->fast_start_pfn == ULONG_MAX)
++ 		return;
++ 
++ 	if (!cc->fast_start_pfn)
++ 		cc->fast_start_pfn = pfn;
++ 
++ 	cc->fast_start_pfn = min(cc->fast_start_pfn, pfn);
++ }
++ 
++ static inline unsigned long
++ reinit_migrate_pfn(struct compact_control *cc)
++ {
++ 	if (!cc->fast_start_pfn || cc->fast_start_pfn == ULONG_MAX)
++ 		return cc->migrate_pfn;
++ 
++ 	cc->migrate_pfn = cc->fast_start_pfn;
++ 	cc->fast_start_pfn = ULONG_MAX;
++ 
++ 	return cc->migrate_pfn;
++ }
++ 
++ /*
++  * Briefly search the free lists for a migration source that already has
++  * some free pages to reduce the number of pages that need migration
++  * before a pageblock is free.
++  */
++ static unsigned long fast_find_migrateblock(struct compact_control *cc)
++ {
++ 	unsigned int limit = freelist_scan_limit(cc);
++ 	unsigned int nr_scanned = 0;
++ 	unsigned long distance;
++ 	unsigned long pfn = cc->migrate_pfn;
++ 	unsigned long high_pfn;
++ 	int order;
++ 
++ 	/* Skip hints are relied on to avoid repeats on the fast search */
++ 	if (cc->ignore_skip_hint)
++ 		return pfn;
++ 
++ 	/*
++ 	 * If the migrate_pfn is not at the start of a zone or the start
++ 	 * of a pageblock then assume this is a continuation of a previous
++ 	 * scan restarted due to COMPACT_CLUSTER_MAX.
++ 	 */
++ 	if (pfn != cc->zone->zone_start_pfn && pfn != pageblock_start_pfn(pfn))
++ 		return pfn;
++ 
++ 	/*
++ 	 * For smaller orders, just linearly scan as the number of pages
++ 	 * to migrate should be relatively small and does not necessarily
++ 	 * justify freeing up a large block for a small allocation.
++ 	 */
++ 	if (cc->order <= PAGE_ALLOC_COSTLY_ORDER)
++ 		return pfn;
++ 
++ 	/*
++ 	 * Only allow kcompactd and direct requests for movable pages to
++ 	 * quickly clear out a MOVABLE pageblock for allocation. This
++ 	 * reduces the risk that a large movable pageblock is freed for
++ 	 * an unmovable/reclaimable small allocation.
++ 	 */
++ 	if (cc->direct_compaction && cc->migratetype != MIGRATE_MOVABLE)
++ 		return pfn;
++ 
++ 	/*
++ 	 * When starting the migration scanner, pick any pageblock within the
++ 	 * first half of the search space. Otherwise try and pick a pageblock
++ 	 * within the first eighth to reduce the chances that a migration
++ 	 * target later becomes a source.
++ 	 */
++ 	distance = (cc->free_pfn - cc->migrate_pfn) >> 1;
++ 	if (cc->migrate_pfn != cc->zone->zone_start_pfn)
++ 		distance >>= 2;
++ 	high_pfn = pageblock_start_pfn(cc->migrate_pfn + distance);
++ 
++ 	for (order = cc->order - 1;
++ 	     order >= PAGE_ALLOC_COSTLY_ORDER && pfn == cc->migrate_pfn && nr_scanned < limit;
++ 	     order--) {
++ 		struct free_area *area = &cc->zone->free_area[order];
++ 		struct list_head *freelist;
++ 		unsigned long flags;
++ 		struct page *freepage;
++ 
++ 		if (!area->nr_free)
++ 			continue;
++ 
++ 		spin_lock_irqsave(&cc->zone->lock, flags);
++ 		freelist = &area->free_list[MIGRATE_MOVABLE];
++ 		list_for_each_entry(freepage, freelist, lru) {
++ 			unsigned long free_pfn;
++ 
++ 			nr_scanned++;
++ 			free_pfn = page_to_pfn(freepage);
++ 			if (free_pfn < high_pfn) {
++ 				/*
++ 				 * Avoid if skipped recently. Ideally it would
++ 				 * move to the tail but even safe iteration of
++ 				 * the list assumes an entry is deleted, not
++ 				 * reordered.
++ 				 */
++ 				if (get_pageblock_skip(freepage)) {
++ 					if (list_is_last(freelist, &freepage->lru))
++ 						break;
++ 
++ 					continue;
++ 				}
++ 
++ 				/* Reorder to so a future search skips recent pages */
++ 				move_freelist_tail(freelist, freepage);
++ 
++ 				update_fast_start_pfn(cc, free_pfn);
++ 				pfn = pageblock_start_pfn(free_pfn);
++ 				cc->fast_search_fail = 0;
++ 				set_pageblock_skip(freepage);
++ 				break;
++ 			}
++ 
++ 			if (nr_scanned >= limit) {
++ 				cc->fast_search_fail++;
++ 				move_freelist_tail(freelist, freepage);
++ 				break;
++ 			}
++ 		}
++ 		spin_unlock_irqrestore(&cc->zone->lock, flags);
++ 	}
++ 
++ 	cc->total_migrate_scanned += nr_scanned;
++ 
++ 	/*
++ 	 * If fast scanning failed then use a cached entry for a page block
++ 	 * that had free pages as the basis for starting a linear scan.
++ 	 */
++ 	if (pfn == cc->migrate_pfn)
++ 		pfn = reinit_migrate_pfn(cc);
++ 
++ 	return pfn;
++ }
++ 
+++>>>>>>> e380bebe4771 (mm, compaction: keep migration source private to a single compaction instance)
+  /*
+   * Isolate all pages that can be migrated from the first suitable block,
+   * starting at the block pointed to by the migrate scanner pfn within
+@@@ -1258,8 -1496,15 +1470,20 @@@ static isolate_migrate_t isolate_migrat
+  		if (!page)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		/* If isolation recently failed, do not retry */
+ +		if (!isolation_suitable(cc, page))
+++=======
++ 		/*
++ 		 * If isolation recently failed, do not retry. Only check the
++ 		 * pageblock once. COMPACT_CLUSTER_MAX causes a pageblock
++ 		 * to be visited multiple times. Assume skip was checked
++ 		 * before making it "skip" so other compaction instances do
++ 		 * not scan the same block.
++ 		 */
++ 		if (IS_ALIGNED(low_pfn, pageblock_nr_pages) &&
++ 		    !fast_find_block && !isolation_suitable(cc, page))
+++>>>>>>> e380bebe4771 (mm, compaction: keep migration source private to a single compaction instance)
+  			continue;
+  
+  		/*
+* Unmerged path mm/compaction.c
