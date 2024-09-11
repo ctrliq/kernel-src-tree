@@ -1,0 +1,190 @@
+s390/qeth: convert IP table spinlock to mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit df2a2a5225cccb9b738230d52c3fb74f83cf4456
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/df2a2a52.failed
+
+All users of the lock are running in process context now.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df2a2a5225cccb9b738230d52c3fb74f83cf4456)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_l3_main.c
+index 5c75e9de0497,f804d27eb569..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -268,6 -268,30 +268,33 @@@ static int qeth_l3_add_ip(struct qeth_c
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qeth_l3_modify_ip(struct qeth_card *card, struct qeth_ipaddr *addr,
++ 			     bool add)
++ {
++ 	int rc;
++ 
++ 	mutex_lock(&card->ip_lock);
++ 	rc = add ? qeth_l3_add_ip(card, addr) : qeth_l3_delete_ip(card, addr);
++ 	mutex_unlock(&card->ip_lock);
++ 
++ 	return rc;
++ }
++ 
++ static void qeth_l3_drain_rx_mode_cache(struct qeth_card *card)
++ {
++ 	struct qeth_ipaddr *addr;
++ 	struct hlist_node *tmp;
++ 	int i;
++ 
++ 	hash_for_each_safe(card->ip_mc_htable, i, tmp, addr, hnode) {
++ 		hash_del(&addr->hnode);
++ 		kfree(addr);
++ 	}
++ }
++ 
+++>>>>>>> df2a2a5225cc (s390/qeth: convert IP table spinlock to mutex)
+  static void qeth_l3_clear_ip_htable(struct qeth_card *card, int recover)
+  {
+  	struct qeth_ipaddr *addr;
+@@@ -287,19 -311,9 +314,24 @@@
+  		addr->disp_flag = QETH_DISP_ADDR_ADD;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&card->ip_lock);
+++=======
++ 	mutex_unlock(&card->ip_lock);
++ }
+++>>>>>>> df2a2a5225cc (s390/qeth: convert IP table spinlock to mutex)
+  
+ +	spin_lock_bh(&card->mclock);
+ +
+ +	hash_for_each_safe(card->ip_mc_htable, i, tmp, addr, hnode) {
+ +		hash_del(&addr->hnode);
+ +		kfree(addr);
+ +	}
+ +
+ +	spin_unlock_bh(&card->mclock);
+ +
+ +
+ +}
+  static void qeth_l3_recover_ip(struct qeth_card *card)
+  {
+  	struct qeth_ipaddr *addr;
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 3f49d01040df..3d672cc6738f 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -767,13 +767,13 @@ struct qeth_card {
+ 	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
+ 	DECLARE_HASHTABLE(mac_htable, 4);
+ 	DECLARE_HASHTABLE(ip_htable, 4);
++	struct mutex ip_lock;
+ 	DECLARE_HASHTABLE(ip_mc_htable, 4);
+ 	struct work_struct kernel_thread_starter;
+ 	spinlock_t thread_mask_lock;
+ 	unsigned long thread_start_mask;
+ 	unsigned long thread_allowed_mask;
+ 	unsigned long thread_running_mask;
+-	spinlock_t ip_lock;
+ 	struct qeth_ipato ipato;
+ 	struct list_head cmd_waiter_list;
+ 	/* QDIO buffer handling */
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index 54cb6ce97b38..c07c6ac203c3 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -1418,7 +1418,6 @@ static void qeth_setup_card(struct qeth_card *card)
+ 	card->state = CARD_STATE_DOWN;
+ 	spin_lock_init(&card->mclock);
+ 	spin_lock_init(&card->lock);
+-	spin_lock_init(&card->ip_lock);
+ 	spin_lock_init(&card->thread_mask_lock);
+ 	mutex_init(&card->conf_mutex);
+ 	mutex_init(&card->discipline_mutex);
+* Unmerged path drivers/s390/net/qeth_l3_main.c
+diff --git a/drivers/s390/net/qeth_l3_sys.c b/drivers/s390/net/qeth_l3_sys.c
+index cff518b0f904..327b25f9ca4a 100644
+--- a/drivers/s390/net/qeth_l3_sys.c
++++ b/drivers/s390/net/qeth_l3_sys.c
+@@ -367,9 +367,9 @@ static ssize_t qeth_l3_dev_ipato_enable_store(struct device *dev,
+ 
+ 	if (card->ipato.enabled != enable) {
+ 		card->ipato.enabled = enable;
+-		spin_lock_bh(&card->ip_lock);
++		mutex_lock(&card->ip_lock);
+ 		qeth_l3_update_ipato(card);
+-		spin_unlock_bh(&card->ip_lock);
++		mutex_unlock(&card->ip_lock);
+ 	}
+ out:
+ 	mutex_unlock(&card->conf_mutex);
+@@ -412,9 +412,9 @@ static ssize_t qeth_l3_dev_ipato_invert4_store(struct device *dev,
+ 
+ 	if (card->ipato.invert4 != invert) {
+ 		card->ipato.invert4 = invert;
+-		spin_lock_bh(&card->ip_lock);
++		mutex_lock(&card->ip_lock);
+ 		qeth_l3_update_ipato(card);
+-		spin_unlock_bh(&card->ip_lock);
++		mutex_unlock(&card->ip_lock);
+ 	}
+ out:
+ 	mutex_unlock(&card->conf_mutex);
+@@ -436,7 +436,7 @@ static ssize_t qeth_l3_dev_ipato_add_show(char *buf, struct qeth_card *card,
+ 	entry_len = (proto == QETH_PROT_IPV4)? 12 : 40;
+ 	/* add strlen for "/<mask>\n" */
+ 	entry_len += (proto == QETH_PROT_IPV4)? 5 : 6;
+-	spin_lock_bh(&card->ip_lock);
++	mutex_lock(&card->ip_lock);
+ 	list_for_each_entry(ipatoe, &card->ipato.entries, entry) {
+ 		if (ipatoe->proto != proto)
+ 			continue;
+@@ -449,7 +449,7 @@ static ssize_t qeth_l3_dev_ipato_add_show(char *buf, struct qeth_card *card,
+ 		i += snprintf(buf + i, PAGE_SIZE - i,
+ 			      "%s/%i\n", addr_str, ipatoe->mask_bits);
+ 	}
+-	spin_unlock_bh(&card->ip_lock);
++	mutex_unlock(&card->ip_lock);
+ 	i += snprintf(buf + i, PAGE_SIZE - i, "\n");
+ 
+ 	return i;
+@@ -598,9 +598,9 @@ static ssize_t qeth_l3_dev_ipato_invert6_store(struct device *dev,
+ 
+ 	if (card->ipato.invert6 != invert) {
+ 		card->ipato.invert6 = invert;
+-		spin_lock_bh(&card->ip_lock);
++		mutex_lock(&card->ip_lock);
+ 		qeth_l3_update_ipato(card);
+-		spin_unlock_bh(&card->ip_lock);
++		mutex_unlock(&card->ip_lock);
+ 	}
+ out:
+ 	mutex_unlock(&card->conf_mutex);
+@@ -684,7 +684,7 @@ static ssize_t qeth_l3_dev_ip_add_show(struct device *dev, char *buf,
+ 
+ 	entry_len = (proto == QETH_PROT_IPV4)? 12 : 40;
+ 	entry_len += 2; /* \n + terminator */
+-	spin_lock_bh(&card->ip_lock);
++	mutex_lock(&card->ip_lock);
+ 	hash_for_each(card->ip_htable, i, ipaddr, hnode) {
+ 		if (ipaddr->proto != proto || ipaddr->type != type)
+ 			continue;
+@@ -698,7 +698,7 @@ static ssize_t qeth_l3_dev_ip_add_show(struct device *dev, char *buf,
+ 		str_len += snprintf(buf + str_len, PAGE_SIZE - str_len, "%s\n",
+ 				    addr_str);
+ 	}
+-	spin_unlock_bh(&card->ip_lock);
++	mutex_unlock(&card->ip_lock);
+ 	str_len += snprintf(buf + str_len, PAGE_SIZE - str_len, "\n");
+ 
+ 	return str_len;
