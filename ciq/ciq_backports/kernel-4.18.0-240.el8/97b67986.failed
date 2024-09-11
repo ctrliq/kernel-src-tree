@@ -1,0 +1,247 @@
+fbcon: call fbcon_fb_(un)registered directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 97b67986f1451c772b488d597310f95c14547cce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/97b67986.failed
+
+With
+
+commit 6104c37094e729f3d4ce65797002112735d49cd1
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Tue Aug 1 17:32:07 2017 +0200
+
+    fbcon: Make fbcon a built-time depency for fbdev
+
+we have a static dependency between fbcon and fbdev, and we can
+replace the indirection through the notifier chain with a function
+call.
+
+v2: Sam Ravnborg noticed that mach-pxa/am200epd.c has a notifier too,
+and listens to this.
+
+...
+
+Looking at the code it seems to wait for some fb to show up, so that
+it can get the framebuffer base address from the fb_info struct. I
+suspect his is some firmware fbdev. Then it uses that information to
+let the real fbdev driver (metronomefb.c by the looks) get at the
+framebuffer memory.
+
+This doesn't looke like it's easy to fix (except by deleting the
+entire thing, seems untouched since 2008, we might be able to get away
+with that), so let's just stuff a few #ifdef into fb.h and fbmem.c and
+cry over them for a bit.
+
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Reviewed-by: Sam Ravnborg <sam@ravnborg.org>
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Cc: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Hans de Goede <hdegoede@redhat.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "Noralf Trønnes" <noralf@tronnes.org>
+	Cc: Yisheng Xie <ysxie@foxmail.com>
+	Cc: Peter Rosin <peda@axentia.se>
+	Cc: "Michał Mirosław" <mirq-linux@rere.qmqm.pl>
+	Cc: Thomas Zimmermann <tzimmermann@suse.de>
+	Cc: Mikulas Patocka <mpatocka@redhat.com>
+	Cc: linux-fbdev@vger.kernel.org
+	Cc: Daniel Mack <daniel@zonque.org>
+	Cc: Haojian Zhuang <haojian.zhuang@gmail.com>
+	Cc: Robert Jarzmik <robert.jarzmik@free.fr>
+	Cc: Konstantin Khorenko <khorenko@virtuozzo.com>
+	Cc: Prarit Bhargava <prarit@redhat.com>
+	Cc: Gerd Hoffmann <kraxel@redhat.com>
+	Cc: Steve Sakoman <sakoman@gmail.com>
+	Cc: Steve Sakoman <steve@sakoman.com>
+	Cc: linux-arm-kernel@lists.infradead.org
+Link: https://patchwork.freedesktop.org/patch/msgid/20190528090304.9388-11-daniel.vetter@ffwll.ch
+(cherry picked from commit 97b67986f1451c772b488d597310f95c14547cce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbcon.c
+#	drivers/video/fbdev/core/fbmem.c
+diff --cc drivers/video/fbdev/core/fbcon.c
+index 6235851b0dfc,c12fc98035e0..000000000000
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@@ -3098,6 -3123,11 +3098,14 @@@ void fbcon_fb_unregistered(struct fb_in
+  {
+  	int i, idx;
+  
+++<<<<<<< HEAD
+++=======
++ 	WARN_CONSOLE_UNLOCKED();
++ 
++ 	if (deferred_takeover)
++ 		return;
++ 
+++>>>>>>> 97b67986f145 (fbcon: call fbcon_fb_(un)registered directly)
+  	idx = info->node;
+  	for (i = first_fb_vc; i <= last_fb_vc; i++) {
+  		if (con2fb_map[i] == idx)
+diff --cc drivers/video/fbdev/core/fbmem.c
+index 6ab151c45d19,bed7698ad18a..000000000000
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@@ -1693,28 -1722,39 +1692,35 @@@ static int do_register_framebuffer(stru
+  	fb_add_videomode(&mode, &fb_info->modelist);
+  	registered_fb[i] = fb_info;
+  
+- 	event.info = fb_info;
++ #ifdef CONFIG_GUMSTIX_AM200EPD
++ 	{
++ 		struct fb_event event;
++ 		event.info = fb_info;
++ 		fb_notifier_call_chain(FB_EVENT_FB_REGISTERED, &event);
++ 	}
++ #endif
++ 
+  	if (!lockless_register_fb)
+  		console_lock();
+ -	else
+ -		atomic_inc(&ignore_console_lock_warning);
+  	if (!lock_fb_info(fb_info)) {
+ -		ret = -ENODEV;
+ -		goto unlock_console;
+ +		if (!lockless_register_fb)
+ +			console_unlock();
+ +		return -ENODEV;
+  	}
+  
+- 	fb_notifier_call_chain(FB_EVENT_FB_REGISTERED, &event);
++ 	ret = fbcon_fb_registered(fb_info);
+  	unlock_fb_info(fb_info);
+ -unlock_console:
+  	if (!lockless_register_fb)
+  		console_unlock();
+ -	else
+ -		atomic_dec(&ignore_console_lock_warning);
+ -	return ret;
+ +	return 0;
+  }
+  
+ -static int unbind_console(struct fb_info *fb_info)
+ +static int do_unregister_framebuffer(struct fb_info *fb_info)
+  {
+  	struct fb_event event;
+ -	int ret;
+ -	int i = fb_info->node;
+ +	int i, ret = 0;
+  
+ +	i = fb_info->node;
+  	if (i < 0 || i >= FB_MAX || registered_fb[i] != fb_info)
+  		return -EINVAL;
+  
+@@@ -1729,6 -1769,17 +1735,20 @@@
+  	unlock_fb_info(fb_info);
+  	console_unlock();
+  
+++<<<<<<< HEAD
+++=======
++ 	return ret;
++ }
++ 
++ static int __unlink_framebuffer(struct fb_info *fb_info);
++ 
++ static int do_unregister_framebuffer(struct fb_info *fb_info)
++ {
++ 	int ret;
++ 
++ 	ret = unbind_console(fb_info);
++ 
+++>>>>>>> 97b67986f145 (fbcon: call fbcon_fb_(un)registered directly)
+  	if (ret)
+  		return -EINVAL;
+  
+@@@ -1739,12 -1790,18 +1759,18 @@@
+  	    (fb_info->pixmap.flags & FB_PIXMAP_DEFAULT))
+  		kfree(fb_info->pixmap.addr);
+  	fb_destroy_modelist(&fb_info->modelist);
+ -	registered_fb[fb_info->node] = NULL;
+ +	registered_fb[i] = NULL;
+  	num_registered_fb--;
+  	fb_cleanup_device(fb_info);
+- 	event.info = fb_info;
++ #ifdef CONFIG_GUMSTIX_AM200EPD
++ 	{
++ 		struct fb_event event;
++ 		event.info = fb_info;
++ 		fb_notifier_call_chain(FB_EVENT_FB_UNREGISTERED, &event);
++ 	}
++ #endif
+  	console_lock();
+- 	fb_notifier_call_chain(FB_EVENT_FB_UNREGISTERED, &event);
++ 	fbcon_fb_unregistered(fb_info);
+  	console_unlock();
+  
+  	/* this may free fb info */
+diff --git a/arch/arm/mach-pxa/am200epd.c b/arch/arm/mach-pxa/am200epd.c
+index 50e18ed37fa6..cac0bb09db14 100644
+--- a/arch/arm/mach-pxa/am200epd.c
++++ b/arch/arm/mach-pxa/am200epd.c
+@@ -347,8 +347,17 @@ int __init am200_init(void)
+ {
+ 	int ret;
+ 
+-	/* before anything else, we request notification for any fb
+-	 * creation events */
++	/*
++	 * Before anything else, we request notification for any fb
++	 * creation events.
++	 *
++	 * FIXME: This is terrible and needs to be nuked. The notifier is used
++	 * to get at the fb base address from the boot splash fb driver, which
++	 * is then passed to metronomefb. Instaed of metronomfb or this board
++	 * support file here figuring this out on their own.
++	 *
++	 * See also the #ifdef in fbmem.c.
++	 */
+ 	fb_register_client(&am200_fb_notif);
+ 
+ 	pxa2xx_mfp_config(ARRAY_AND_SIZE(am200_pin_config));
+* Unmerged path drivers/video/fbdev/core/fbcon.c
+* Unmerged path drivers/video/fbdev/core/fbmem.c
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+index 04cb0fcc9db4..d2e493f3a6ef 100644
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -136,10 +136,13 @@ struct fb_cursor_user {
+ #define FB_EVENT_RESUME			0x03
+ /*      An entry from the modelist was removed */
+ #define FB_EVENT_MODE_DELETE            0x04
+-/*      A driver registered itself */
++
++#ifdef CONFIG_GUMSTIX_AM200EPD
++/* only used by mach-pxa/am200epd.c */
+ #define FB_EVENT_FB_REGISTERED          0x05
+-/*      A driver unregistered itself */
+ #define FB_EVENT_FB_UNREGISTERED        0x06
++#endif
++
+ /*      CONSOLE-SPECIFIC: get console to framebuffer mapping */
+ #define FB_EVENT_GET_CONSOLE_MAP        0x07
+ /*      CONSOLE-SPECIFIC: set console to framebuffer mapping */
+diff --git a/include/linux/fbcon.h b/include/linux/fbcon.h
+index f68a7db14165..94a71e9e1257 100644
+--- a/include/linux/fbcon.h
++++ b/include/linux/fbcon.h
+@@ -4,9 +4,13 @@
+ #ifdef CONFIG_FRAMEBUFFER_CONSOLE
+ void __init fb_console_init(void);
+ void __exit fb_console_exit(void);
++int fbcon_fb_registered(struct fb_info *info);
++void fbcon_fb_unregistered(struct fb_info *info);
+ #else
+ static inline void fb_console_init(void) {}
+ static inline void fb_console_exit(void) {}
++static inline int fbcon_fb_registered(struct fb_info *info) { return 0; }
++static inline void fbcon_fb_unregistered(struct fb_info *info) {}
+ #endif
+ 
+ #endif /* _LINUX_FBCON_H */
