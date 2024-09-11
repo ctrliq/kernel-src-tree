@@ -11805,7 +11805,6 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 		    insn->code == (BPF_ALU64 | BPF_SUB | BPF_X)) {
 			const u8 code_add = BPF_ALU64 | BPF_ADD | BPF_X;
 			const u8 code_sub = BPF_ALU64 | BPF_SUB | BPF_X;
-			struct bpf_insn insn_buf[16];
 			struct bpf_insn *patch = &insn_buf[0];
 			bool issrc, isneg, isimm;
 			u32 off_reg;
