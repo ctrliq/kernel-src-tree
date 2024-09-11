@@ -1,0 +1,303 @@
+x86/thermal: Fix LVT thermal setup for SMI delivery mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Borislav Petkov <bp@suse.de>
+commit 9a90ed065a155d13db0d0ffeaad5cc54e51c90c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/9a90ed06.failed
+
+There are machines out there with added value crap^WBIOS which provide an
+SMI handler for the local APIC thermal sensor interrupt. Out of reset,
+the BSP on those machines has something like 0x200 in that APIC register
+(timestamps left in because this whole issue is timing sensitive):
+
+  [    0.033858] read lvtthmr: 0x330, val: 0x200
+
+which means:
+
+ - bit 16 - the interrupt mask bit is clear and thus that interrupt is enabled
+ - bits [10:8] have 010b which means SMI delivery mode.
+
+Now, later during boot, when the kernel programs the local APIC, it
+soft-disables it temporarily through the spurious vector register:
+
+  setup_local_APIC:
+
+  	...
+
+	/*
+	 * If this comes from kexec/kcrash the APIC might be enabled in
+	 * SPIV. Soft disable it before doing further initialization.
+	 */
+	value = apic_read(APIC_SPIV);
+	value &= ~APIC_SPIV_APIC_ENABLED;
+	apic_write(APIC_SPIV, value);
+
+which means (from the SDM):
+
+"10.4.7.2 Local APIC State After It Has Been Software Disabled
+
+...
+
+* The mask bits for all the LVT entries are set. Attempts to reset these
+bits will be ignored."
+
+And this happens too:
+
+  [    0.124111] APIC: Switch to symmetric I/O mode setup
+  [    0.124117] lvtthmr 0x200 before write 0xf to APIC 0xf0
+  [    0.124118] lvtthmr 0x10200 after write 0xf to APIC 0xf0
+
+This results in CPU 0 soft lockups depending on the placement in time
+when the APIC soft-disable happens. Those soft lockups are not 100%
+reproducible and the reason for that can only be speculated as no one
+tells you what SMM does. Likely, it confuses the SMM code that the APIC
+is disabled and the thermal interrupt doesn't doesn't fire at all,
+leading to CPU 0 stuck in SMM forever...
+
+Now, before
+
+  4f432e8bb15b ("x86/mce: Get rid of mcheck_intel_therm_init()")
+
+due to how the APIC_LVTTHMR was read before APIC initialization in
+mcheck_intel_therm_init(), it would read the value with the mask bit 16
+clear and then intel_init_thermal() would replicate it onto the APs and
+all would be peachy - the thermal interrupt would remain enabled.
+
+But that commit moved that reading to a later moment in
+intel_init_thermal(), resulting in reading APIC_LVTTHMR on the BSP too
+late and with its interrupt mask bit set.
+
+Thus, revert back to the old behavior of reading the thermal LVT
+register before the APIC gets initialized.
+
+Fixes: 4f432e8bb15b ("x86/mce: Get rid of mcheck_intel_therm_init()")
+	Reported-by: James Feeney <james@nurealm.net>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: <stable@vger.kernel.org>
+	Cc: Zhang Rui <rui.zhang@intel.com>
+	Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Link: https://lkml.kernel.org/r/YKIqDdFNaXYd39wz@zn.tnic
+(cherry picked from commit 9a90ed065a155d13db0d0ffeaad5cc54e51c90c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/thermal.h
+#	arch/x86/kernel/setup.c
+diff --cc arch/x86/kernel/setup.c
+index ba2d713c58f3,ff653d608d5f..000000000000
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@@ -1,134 -1,60 +1,180 @@@
+  /*
+   *  Copyright (C) 1995  Linus Torvalds
+   *
+ - * This file contains the setup_arch() code, which handles the architecture-dependent
+ - * parts of early kernel initialization.
+ + *  Support of BIGMEM added by Gerhard Wichert, Siemens AG, July 1999
+ + *
+ + *  Memory region support
+ + *	David Parsons <orc@pell.chi.il.us>, July-August 1999
+ + *
+ + *  Added E820 sanitization routine (removes overlapping memory regions);
+ + *  Brian Moyle <bmoyle@mvista.com>, February 2001
+ + *
+ + * Moved CPU detection code to cpu/${cpu}.c
+ + *    Patrick Mochel <mochel@osdl.org>, March 2002
+ + *
+ + *  Provisions for empty E820 memory regions (reported by certain BIOSes).
+ + *  Alex Achenbach <xela@slit.de>, December 2002.
+ + *
+   */
+++<<<<<<< HEAD
+++=======
++ #include <linux/console.h>
++ #include <linux/crash_dump.h>
++ #include <linux/dma-map-ops.h>
++ #include <linux/dmi.h>
++ #include <linux/efi.h>
++ #include <linux/init_ohci1394_dma.h>
++ #include <linux/initrd.h>
++ #include <linux/iscsi_ibft.h>
++ #include <linux/memblock.h>
++ #include <linux/pci.h>
++ #include <linux/root_dev.h>
++ #include <linux/hugetlb.h>
++ #include <linux/tboot.h>
++ #include <linux/usb/xhci-dbgp.h>
++ #include <linux/static_call.h>
++ #include <linux/swiotlb.h>
++ 
++ #include <uapi/linux/mount.h>
++ 
++ #include <xen/xen.h>
++ 
++ #include <asm/apic.h>
++ #include <asm/numa.h>
++ #include <asm/bios_ebda.h>
++ #include <asm/bugs.h>
++ #include <asm/cpu.h>
++ #include <asm/efi.h>
++ #include <asm/gart.h>
++ #include <asm/hypervisor.h>
++ #include <asm/io_apic.h>
++ #include <asm/kasan.h>
++ #include <asm/kaslr.h>
++ #include <asm/mce.h>
++ #include <asm/mtrr.h>
++ #include <asm/realmode.h>
++ #include <asm/olpc_ofw.h>
++ #include <asm/pci-direct.h>
++ #include <asm/prom.h>
++ #include <asm/proto.h>
++ #include <asm/thermal.h>
++ #include <asm/unwind.h>
++ #include <asm/vsyscall.h>
++ #include <linux/vmalloc.h>
+++>>>>>>> 9a90ed065a15 (x86/thermal: Fix LVT thermal setup for SMI delivery mode)
+ +
+ +/*
+ + * This file handles the architecture-dependent parts of initialization
+ + */
+ +
+ +#include <linux/sched.h>
+ +#include <linux/mm.h>
+ +#include <linux/mmzone.h>
+ +#include <linux/screen_info.h>
+ +#include <linux/ioport.h>
+ +#include <linux/acpi.h>
+ +#include <linux/sfi.h>
+ +#include <linux/apm_bios.h>
+ +#include <linux/initrd.h>
+ +#include <linux/memblock.h>
+ +#include <linux/seq_file.h>
+ +#include <linux/console.h>
+ +#include <linux/root_dev.h>
+ +#include <linux/highmem.h>
+ +#include <linux/export.h>
+ +#include <linux/efi.h>
+ +#include <linux/init.h>
+ +#include <linux/edd.h>
+ +#include <linux/iscsi_ibft.h>
+ +#include <linux/nodemask.h>
+ +#include <linux/kexec.h>
+ +#include <linux/dmi.h>
+ +#include <linux/pfn.h>
+ +#include <linux/pci.h>
+ +#include <asm/pci-direct.h>
+ +#include <linux/init_ohci1394_dma.h>
+ +#include <linux/kvm_para.h>
+ +#include <linux/dma-contiguous.h>
+ +#include <xen/xen.h>
+ +#include <uapi/linux/mount.h>
+ +
+ +#include <linux/errno.h>
+ +#include <linux/kernel.h>
+ +#include <linux/stddef.h>
+ +#include <linux/unistd.h>
+ +#include <linux/ptrace.h>
+ +#include <linux/user.h>
+ +#include <linux/delay.h>
+ +
+ +#include <linux/kallsyms.h>
+ +#include <linux/cpufreq.h>
+ +#include <linux/dma-mapping.h>
+ +#include <linux/ctype.h>
+ +#include <linux/uaccess.h>
+ +#include <linux/security.h>
+ +
+ +#include <linux/percpu.h>
+ +#include <linux/crash_dump.h>
+ +#include <linux/dma-contiguous.h>
+ +#include <linux/tboot.h>
+ +#include <linux/jiffies.h>
+ +#include <linux/mem_encrypt.h>
+ +#include <linux/sizes.h>
+ +
+ +#include <linux/usb/xhci-dbgp.h>
+ +#include <linux/swiotlb.h>
+ +#include <video/edid.h>
+ +
+ +#include <asm/mtrr.h>
+ +#include <asm/apic.h>
+ +#include <asm/realmode.h>
+ +#include <asm/e820/api.h>
+ +#include <asm/mpspec.h>
+ +#include <asm/setup.h>
+ +#include <asm/efi.h>
+ +#include <asm/timer.h>
+ +#include <asm/i8259.h>
+ +#include <asm/sections.h>
+ +#include <asm/io_apic.h>
+ +#include <asm/ist.h>
+ +#include <asm/setup_arch.h>
+ +#include <asm/bios_ebda.h>
+ +#include <asm/cacheflush.h>
+ +#include <asm/processor.h>
+ +#include <asm/bugs.h>
+ +#include <asm/kasan.h>
+ +
+ +#include <asm/vsyscall.h>
+ +#include <asm/cpu.h>
+ +#include <asm/desc.h>
+ +#include <asm/dma.h>
+ +#include <asm/iommu.h>
+ +#include <asm/gart.h>
+ +#include <asm/mmu_context.h>
+ +#include <asm/proto.h>
+ +
+ +#include <asm/paravirt.h>
+ +#include <asm/hypervisor.h>
+ +#include <asm/olpc_ofw.h>
+ +
+ +#include <asm/percpu.h>
+ +#include <asm/topology.h>
+ +#include <asm/apicdef.h>
+ +#include <asm/amd_nb.h>
+ +#include <asm/mce.h>
+ +#include <asm/alternative.h>
+ +#include <asm/prom.h>
+ +#include <asm/microcode.h>
+ +#include <asm/kaslr.h>
+ +#include <asm/unwind.h>
+ +#include <asm/intel-family.h>
+  
+  /*
+ - * max_low_pfn_mapped: highest directly mapped pfn < 4 GB
+ - * max_pfn_mapped:     highest directly mapped pfn > 4 GB
+ + * max_low_pfn_mapped: highest direct mapped pfn under 4GB
+ + * max_pfn_mapped:     highest direct mapped pfn over 4GB
+   *
+   * The direct mapping only covers E820_TYPE_RAM regions, so the ranges and gaps are
+ - * represented by pfn_mapped[].
+ + * represented by pfn_mapped
+   */
+  unsigned long max_low_pfn_mapped;
+  unsigned long max_pfn_mapped;
+* Unmerged path arch/x86/include/asm/thermal.h
+* Unmerged path arch/x86/include/asm/thermal.h
+diff --git a/arch/x86/kernel/cpu/mce/therm_throt.c b/arch/x86/kernel/cpu/mce/therm_throt.c
+index ee229ceee745..02c7df5f0dd1 100644
+--- a/arch/x86/kernel/cpu/mce/therm_throt.c
++++ b/arch/x86/kernel/cpu/mce/therm_throt.c
+@@ -422,6 +422,17 @@ void __init mcheck_intel_therm_init(void)
+ 		lvtthmr_init = apic_read(APIC_LVTTHMR);
+ }
+ 
++void __init therm_lvt_init(void)
++{
++	/*
++	 * This function is only called on boot CPU. Save the init thermal
++	 * LVT value on BSP and use that value to restore APs' thermal LVT
++	 * entry BIOS programmed later
++	 */
++	if (intel_thermal_supported(&boot_cpu_data))
++		lvtthmr_init = apic_read(APIC_LVTTHMR);
++}
++
+ void intel_init_thermal(struct cpuinfo_x86 *c)
+ {
+ 	unsigned int cpu = smp_processor_id();
+* Unmerged path arch/x86/kernel/setup.c
