@@ -661,7 +661,7 @@ ping_test()
 
 	ping_do $1 $2
 	check_err $?
-	log_test "ping"
+	log_test "ping$3"
 }
 
 ping6_do()
@@ -680,7 +680,7 @@ ping6_test()
 
 	ping6_do $1 $2
 	check_err $?
-	log_test "ping6"
+	log_test "ping6$3"
 }
 
 learning_test()
