@@ -1,0 +1,931 @@
+s390/ap: add card/queue deconfig state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 4f2fcccdb547b09a4532c705078811e672fb9235
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4f2fcccd.failed
+
+This patch adds a new config state to the ap card and queue
+devices. This state reflects the response code
+0x03 "AP deconfigured" on TQAP invocation and is tracked with
+every ap bus scan.
+
+Together with this new state now a card/queue device which
+is 'deconfigured' is not disposed any more. However, for backward
+compatibility the online state now needs to take this state into
+account. So a card/queue is offline when the device is not configured.
+Furthermore a device can't get switched from offline to online state
+when not configured.
+
+The config state is shown in sysfs at
+  /sys/devices/ap/cardxx/config
+for the card and
+  /sys/devices/ap/cardxx/xx.yyyy/config
+for each queue within each card.
+It is a read-only attribute reflecting the negation of the
+'AP deconfig' state as it is noted in the AP documents.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 4f2fcccdb547b09a4532c705078811e672fb9235)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+#	drivers/s390/crypto/ap_bus.h
+#	drivers/s390/crypto/ap_queue.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 70b945ce5806,485cbfcbf06e..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -287,37 -301,42 +287,61 @@@ int ap_test_config_ctrl_domain(unsigne
+  }
+  EXPORT_SYMBOL(ap_test_config_ctrl_domain);
+  
+ -/*
+ - * ap_queue_info(): Check and get AP queue info.
+ - * Returns true if TAPQ succeeded and the info is filled or
+ - * false otherwise.
+ +/**
+ + * ap_query_queue(): Check if an AP queue is available.
+ + * @qid: The AP queue number
+ + * @queue_depth: Pointer to queue depth value
+ + * @device_type: Pointer to device type value
+ + * @facilities: Pointer to facility indicator
+   */
+++<<<<<<< HEAD
+ +static int ap_query_queue(ap_qid_t qid, int *queue_depth, int *device_type,
+ +			  unsigned int *facilities)
+++=======
++ static bool ap_queue_info(ap_qid_t qid, int *q_type,
++ 			  unsigned int *q_fac, int *q_depth, bool *q_decfg)
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  {
+  	struct ap_queue_status status;
+ -	unsigned long info = 0;
+ +	unsigned long info;
+ +	int nd;
+  
+ -	/* make sure we don't run into a specifiation exception */
+ -	if (AP_QID_CARD(qid) > ap_max_adapter_id ||
+ -	    AP_QID_QUEUE(qid) > ap_max_domain_id)
+ -		return false;
+ +	if (!ap_test_config_card_id(AP_QID_CARD(qid)))
+ +		return -ENODEV;
+  
+ -	/* call TAPQ on this APQN */
+  	status = ap_test_queue(qid, ap_apft_available(), &info);
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+++<<<<<<< HEAD
+ +		*queue_depth = (int)(info & 0xff);
+ +		*device_type = (int)((info >> 24) & 0xff);
+ +		*facilities = (unsigned int)(info >> 32);
+ +		/* Update maximum domain id */
+ +		nd = (info >> 16) & 0xff;
+ +		/* if N bit is available, z13 and newer */
+ +		if ((info & (1UL << 57)) && nd > 0)
+ +			ap_max_domain_id = nd;
+ +		else /* older machine types */
+ +			ap_max_domain_id = 15;
+ +		switch (*device_type) {
+++=======
++ 	case AP_RESPONSE_RESET_IN_PROGRESS:
++ 	case AP_RESPONSE_DECONFIGURED:
++ 	case AP_RESPONSE_CHECKSTOPPED:
++ 	case AP_RESPONSE_BUSY:
++ 		/*
++ 		 * According to the architecture in all these cases the
++ 		 * info should be filled. All bits 0 is not possible as
++ 		 * there is at least one of the mode bits set.
++ 		 */
++ 		if (WARN_ON_ONCE(!info))
++ 			return false;
++ 		*q_type = (int)((info >> 24) & 0xff);
++ 		*q_fac = (unsigned int)(info >> 32);
++ 		*q_depth = (int)(info & 0xff);
++ 		*q_decfg = status.response_code == AP_RESPONSE_DECONFIGURED;
++ 		switch (*q_type) {
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  			/* For CEX2 and CEX3 the available functions
+  			 * are not reflected by the facilities bits.
+  			 * Instead it is coded into the type. So here
+@@@ -1390,80 -1294,38 +1414,98 @@@ static int __match_queue_device_with_qu
+  
+  /*
+   * Helper function for ap_scan_bus().
+-  * Does the scan bus job for the given adapter id.
++  * Remove card device and associated queue devices.
+   */
+- static void _ap_scan_bus_adapter(int id)
++ static inline void ap_scan_rm_card_dev_and_queue_devs(struct ap_card *ac)
+  {
+++<<<<<<< HEAD
+++=======
++ 	bus_for_each_dev(&ap_bus_type, NULL,
++ 			 (void *)(long) ac->id,
++ 			 __ap_queue_devices_with_id_unregister);
++ 	device_unregister(&ac->ap_dev.device);
++ }
++ 
++ /*
++  * Helper function for ap_scan_bus().
++  * Does the scan bus job for all the domains within
++  * a valid adapter given by an ap_card ptr.
++  */
++ static inline void ap_scan_domains(struct ap_card *ac)
++ {
++ 	bool decfg;
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  	ap_qid_t qid;
+  	unsigned int func;
+- 	struct ap_card *ac;
+  	struct device *dev;
+  	struct ap_queue *aq;
+++<<<<<<< HEAD
+ +	int rc, dom, depth, type, comp_type, borked;
+ +
+ +	/* check if there is a card device registered with this id */
+ +	dev = bus_find_device(&ap_bus_type, NULL,
+ +			      (void *)(long) id,
+ +			      __match_card_device_with_id);
+ +	ac = dev ? to_ap_card(dev) : NULL;
+ +	if (!ap_test_config_card_id(id)) {
+ +		if (dev) {
+ +			/* Card device has been removed from configuration */
+ +			bus_for_each_dev(&ap_bus_type, NULL,
+ +					 (void *)(long) id,
+ +					 __ap_queue_devices_with_id_unregister);
+ +			device_unregister(dev);
+ +			put_device(dev);
+ +		}
+ +		return;
+ +	}
+++=======
++ 	int rc, dom, depth, type;
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  
+  	/*
+- 	 * This card id is enabled in the configuration. If we already have
+- 	 * a card device with this id, check if type and functions are still
+- 	 * the very same. Also verify that at least one queue is available.
++ 	 * Go through the configuration for the domains and compare them
++ 	 * to the existing queue devices. Also take care of the config
++ 	 * and error state for the queue devices.
+  	 */
+++<<<<<<< HEAD
+ +	if (ac) {
+ +		/* find the first valid queue */
+ +		for (dom = 0; dom < AP_DOMAINS; dom++) {
+ +			qid = AP_MKQID(id, dom);
+ +			if (ap_query_queue(qid, &depth, &type, &func) == 0)
+ +				break;
+ +		}
+ +		borked = 0;
+ +		if (dom >= AP_DOMAINS) {
+ +			/* no accessible queue on this card */
+ +			borked = 1;
+ +		} else if (ac->raw_hwtype != type) {
+ +			/* card type has changed */
+ +			AP_DBF(DBF_INFO, "card=%02x type changed.\n", id);
+ +			borked = 1;
+ +		} else if (ac->functions != func) {
+ +			/* card functions have changed */
+ +			AP_DBF(DBF_INFO, "card=%02x functions changed.\n", id);
+ +			borked = 1;
+ +		}
+ +		if (borked) {
+ +			/* unregister card device and associated queues */
+ +			bus_for_each_dev(&ap_bus_type, NULL,
+ +					 (void *)(long) id,
+ +					 __ap_queue_devices_with_id_unregister);
+ +			device_unregister(dev);
+ +			put_device(dev);
+ +			/* go back if there is no valid queue on this card */
+ +			if (dom >= AP_DOMAINS)
+ +				return;
+ +			ac = NULL;
+ +		}
+ +	}
+++=======
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  
+- 	/*
+- 	 * Go through all possible queue ids. Check and maybe create or release
+- 	 * queue devices for this card. If there exists no card device yet,
+- 	 * create a card device also.
+- 	 */
+- 	for (dom = 0; dom < AP_DOMAINS; dom++) {
+- 		qid = AP_MKQID(id, dom);
++ 	for (dom = 0; dom <= ap_max_domain_id; dom++) {
++ 		qid = AP_MKQID(ac->id, dom);
+  		dev = bus_find_device(&ap_bus_type, NULL,
+  				      (void *)(long) qid,
+  				      __match_queue_device_with_qid);
+@@@ -1478,68 -1339,233 +1519,264 @@@
+  			}
+  			continue;
+  		}
+++<<<<<<< HEAD
+ +		/* try to fetch infos about this queue */
+ +		rc = ap_query_queue(qid, &depth, &type, &func);
+ +		if (dev) {
+ +			if (rc == -ENODEV)
+ +				borked = 1;
+ +			else {
+ +				spin_lock_bh(&aq->lock);
+ +				borked = aq->state == AP_STATE_BORKED;
+ +				spin_unlock_bh(&aq->lock);
+ +			}
+ +			if (borked) {
+ +				/* Remove broken device */
+ +				AP_DBF(DBF_DEBUG,
+ +				       "removing broken queue=%02x.%04x\n",
+ +				       id, dom);
+++=======
++ 		/* domain is valid, get info from this APQN */
++ 		if (!ap_queue_info(qid, &type, &func, &depth, &decfg)) {
++ 			if (aq) {
++ 				AP_DBF_INFO(
++ 					"%s(%d,%d) ap_queue_info() not successful, rm queue device\n",
++ 					__func__, ac->id, dom);
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  				device_unregister(dev);
++ 				put_device(dev);
+  			}
+- 			put_device(dev);
+  			continue;
+  		}
+++<<<<<<< HEAD
+ +		if (rc)
+ +			continue;
+ +		/* a new queue device is needed, check out comp type */
+ +		comp_type = ap_get_compatible_type(qid, type, func);
+ +		if (!comp_type)
+ +			continue;
+ +		/* maybe a card device needs to be created first */
+ +		if (!ac) {
+ +			ac = ap_card_create(id, depth, type, comp_type, func);
+ +			if (!ac)
+++=======
++ 		/* if no queue device exists, create a new one */
++ 		if (!aq) {
++ 			aq = ap_queue_create(qid, ac->ap_dev.device_type);
++ 			if (!aq) {
++ 				AP_DBF_WARN("%s(%d,%d) ap_queue_create() failed\n",
++ 					    __func__, ac->id, dom);
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  				continue;
+- 			ac->ap_dev.device.bus = &ap_bus_type;
+- 			ac->ap_dev.device.parent = ap_root_device;
+- 			dev_set_name(&ac->ap_dev.device, "card%02x", id);
+- 			/* Register card device with AP bus */
+- 			rc = device_register(&ac->ap_dev.device);
++ 			}
++ 			aq->card = ac;
++ 			aq->config = !decfg;
++ 			dev = &aq->ap_dev.device;
++ 			dev->bus = &ap_bus_type;
++ 			dev->parent = &ac->ap_dev.device;
++ 			dev_set_name(dev, "%02x.%04x", ac->id, dom);
++ 			/* register queue device */
++ 			rc = device_register(dev);
+  			if (rc) {
+- 				put_device(&ac->ap_dev.device);
+- 				ac = NULL;
++ 				AP_DBF_WARN("%s(%d,%d) device_register() failed\n",
++ 					    __func__, ac->id, dom);
++ 				goto put_dev_and_continue;
++ 			}
++ 			if (decfg)
++ 				AP_DBF_INFO("%s(%d,%d) new (decfg) queue device created\n",
++ 					    __func__, ac->id, dom);
++ 			else
++ 				AP_DBF_INFO("%s(%d,%d) new queue device created\n",
++ 					    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		/* Check config state on the already existing queue device */
++ 		spin_lock_bh(&aq->lock);
++ 		if (decfg && aq->config) {
++ 			/* config off this queue device */
++ 			aq->config = false;
++ 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED) {
++ 				aq->dev_state = AP_DEV_STATE_ERROR;
++ 				aq->last_err_rc = AP_RESPONSE_DECONFIGURED;
++ 			}
++ 			spin_unlock_bh(&aq->lock);
++ 			AP_DBF_INFO("%s(%d,%d) queue device config off\n",
++ 				    __func__, ac->id, dom);
++ 			/* 'receive' pending messages with -EAGAIN */
++ 			ap_flush_queue(aq);
++ 			goto put_dev_and_continue;
++ 		}
++ 		if (!decfg && !aq->config) {
++ 			/* config on this queue device */
++ 			aq->config = true;
++ 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED) {
++ 				aq->dev_state = AP_DEV_STATE_OPERATING;
++ 				aq->sm_state = AP_SM_STATE_RESET_START;
++ 			}
++ 			spin_unlock_bh(&aq->lock);
++ 			AP_DBF_INFO("%s(%d,%d) queue device config on\n",
++ 				    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		/* handle other error states */
++ 		if (!decfg && aq->dev_state == AP_DEV_STATE_ERROR) {
++ 			spin_unlock_bh(&aq->lock);
++ 			/* 'receive' pending messages with -EAGAIN */
++ 			ap_flush_queue(aq);
++ 			/* re-init (with reset) the queue device */
++ 			ap_queue_init_state(aq);
++ 			AP_DBF_INFO("%s(%d,%d) queue device reinit enforced\n",
++ 				    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		spin_unlock_bh(&aq->lock);
++ put_dev_and_continue:
++ 		put_device(dev);
++ 	}
++ }
++ 
++ /*
++  * Helper function for ap_scan_bus().
++  * Does the scan bus job for the given adapter id.
++  */
++ static inline void ap_scan_adapter(int ap)
++ {
++ 	bool decfg;
++ 	ap_qid_t qid;
++ 	unsigned int func;
++ 	struct device *dev;
++ 	struct ap_card *ac;
++ 	int rc, dom, depth, type, comp_type;
++ 
++ 	/* Is there currently a card device for this adapter ? */
++ 	dev = bus_find_device(&ap_bus_type, NULL,
++ 			      (void *)(long) ap,
++ 			      __match_card_device_with_id);
++ 	ac = dev ? to_ap_card(dev) : NULL;
++ 
++ 	/* Adapter not in configuration ? */
++ 	if (!ap_test_config_card_id(ap)) {
++ 		if (ac) {
++ 			AP_DBF_INFO("%s(%d) ap not in config any more, rm card and queue devices\n",
++ 				    __func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		}
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Adapter ap is valid in the current configuration. So do some checks:
++ 	 * If no card device exists, build one. If a card device exists, check
++ 	 * for type and functions changed. For all this we need to find a valid
++ 	 * APQN first.
++ 	 */
++ 
++ 	for (dom = 0; dom <= ap_max_domain_id; dom++)
++ 		if (ap_test_config_usage_domain(dom)) {
++ 			qid = AP_MKQID(ap, dom);
++ 			if (ap_queue_info(qid, &type, &func, &depth, &decfg))
+  				break;
++ 		}
++ 	if (dom > ap_max_domain_id) {
++ 		/* Could not find a valid APQN for this adapter */
++ 		if (ac) {
++ 			AP_DBF_INFO(
++ 				"%s(%d) no type info (no APQN found), rm card and queue devices\n",
++ 				__func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		} else {
++ 			AP_DBF_DBG("%s(%d) no type info (no APQN found), ignored\n",
++ 				   __func__, ap);
++ 		}
++ 		return;
++ 	}
++ 	if (!type) {
++ 		/* No apdater type info available, an unusable adapter */
++ 		if (ac) {
++ 			AP_DBF_INFO("%s(%d) no valid type (0) info, rm card and queue devices\n",
++ 				    __func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		} else {
++ 			AP_DBF_DBG("%s(%d) no valid type (0) info, ignored\n",
++ 				   __func__, ap);
++ 		}
++ 		return;
++ 	}
++ 
++ 	if (ac) {
++ 		/* Check APQN against existing card device for changes */
++ 		if (ac->raw_hwtype != type) {
++ 			AP_DBF_INFO("%s(%d) hwtype %d changed, rm card and queue devices\n",
++ 				    __func__, ap, type);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 			ac = NULL;
++ 		} else if (ac->functions != func) {
++ 			AP_DBF_INFO("%s(%d) functions 0x%08x changed, rm card and queue devices\n",
++ 				    __func__, ap, type);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 			ac = NULL;
++ 		} else {
++ 			if (decfg && ac->config) {
++ 				ac->config = false;
++ 				AP_DBF_INFO("%s(%d) card device config off\n",
++ 					    __func__, ap);
++ 
++ 			}
++ 			if (!decfg && !ac->config) {
++ 				ac->config = true;
++ 				AP_DBF_INFO("%s(%d) card device config on\n",
++ 					    __func__, ap);
+  			}
+- 			/* get it and thus adjust reference counter */
+- 			get_device(&ac->ap_dev.device);
+  		}
+- 		/* now create the new queue device */
+- 		aq = ap_queue_create(qid, comp_type);
+- 		if (!aq)
+- 			continue;
+- 		aq->card = ac;
+- 		aq->ap_dev.device.bus = &ap_bus_type;
+- 		aq->ap_dev.device.parent = &ac->ap_dev.device;
+- 		dev_set_name(&aq->ap_dev.device, "%02x.%04x", id, dom);
+- 		/* Register queue device */
+- 		rc = device_register(&aq->ap_dev.device);
++ 	}
++ 
++ 	if (!ac) {
++ 		/* Build a new card device */
++ 		comp_type = ap_get_compatible_type(qid, type, func);
++ 		if (!comp_type) {
++ 			AP_DBF_WARN("%s(%d) type %d, can't get compatibility type\n",
++ 				    __func__, ap, type);
++ 			return;
++ 		}
++ 		ac = ap_card_create(ap, depth, type, comp_type, func);
++ 		if (!ac) {
++ 			AP_DBF_WARN("%s(%d) ap_card_create() failed\n",
++ 				    __func__, ap);
++ 			return;
++ 		}
++ 		ac->config = !decfg;
++ 		dev = &ac->ap_dev.device;
++ 		dev->bus = &ap_bus_type;
++ 		dev->parent = ap_root_device;
++ 		dev_set_name(dev, "card%02x", ap);
++ 		/* Register the new card device with AP bus */
++ 		rc = device_register(dev);
+  		if (rc) {
+- 			put_device(&aq->ap_dev.device);
+- 			continue;
++ 			AP_DBF_WARN("%s(%d) device_register() failed\n",
++ 				    __func__, ap);
++ 			put_device(dev);
++ 			return;
+  		}
+- 	} /* end domain loop */
++ 		/* get it and thus adjust reference counter */
++ 		get_device(dev);
++ 		if (decfg)
++ 			AP_DBF_INFO("%s(%d) new (decfg) card device type=%d func=0x%08x created\n",
++ 				    __func__, ap, type, func);
++ 		else
++ 			AP_DBF_INFO("%s(%d) new card device type=%d func=0x%08x created\n",
++ 				    __func__, ap, type, func);
++ 	}
++ 
++ 	/* Verify the domains and the queue devices for this card */
++ 	ap_scan_domains(ac);
+  
+- 	if (ac)
+- 		put_device(&ac->ap_dev.device);
++ 	/* release the card device */
++ 	put_device(&ac->ap_dev.device);
+  }
+  
+  /**
+@@@ -1548,16 -1574,16 +1785,16 @@@
+   */
+  static void ap_scan_bus(struct work_struct *unused)
+  {
+- 	int id;
++ 	int ap;
+  
+ -	ap_fetch_qci_info(ap_qci_info);
+ -	ap_select_domain();
+ +	AP_DBF(DBF_DEBUG, "%s running\n", __func__);
+  
+ -	AP_DBF_DBG("%s running\n", __func__);
+ +	ap_query_configuration(ap_configuration);
+ +	ap_select_domain();
+  
+  	/* loop over all possible adapters */
+- 	for (id = 0; id < AP_DEVICES; id++)
+- 		_ap_scan_bus_adapter(id);
++ 	for (ap = 0; ap <= ap_max_adapter_id; ap++)
++ 		ap_scan_adapter(ap);
+  
+  	/* check if there is at least one queue available with default domain */
+  	if (ap_domain_index >= 0) {
+diff --cc drivers/s390/crypto/ap_bus.h
+index 0a20eede0143,56c8bed7b6a1..000000000000
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@@ -172,6 -178,8 +173,11 @@@ struct ap_queue 
+  	struct ap_card *card;		/* Ptr to assoc. AP card. */
+  	spinlock_t lock;		/* Per device lock. */
+  	void *private;			/* ap driver private pointer. */
+++<<<<<<< HEAD
+++=======
++ 	enum ap_dev_state dev_state;	/* queue device state */
++ 	bool config;			/* configured state */
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  	ap_qid_t qid;			/* AP queue id. */
+  	int interrupt;			/* indicate if interrupts are enabled */
+  	int queue_count;		/* # messages currently on AP queue. */
+diff --cc drivers/s390/crypto/ap_queue.c
+index 7bd5294989aa,5523338ca65d..000000000000
+--- a/drivers/s390/crypto/ap_queue.c
++++ b/drivers/s390/crypto/ap_queue.c
+@@@ -593,12 -563,138 +593,144 @@@ static ssize_t interrupt_show(struct de
+  
+  static DEVICE_ATTR_RO(interrupt);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t config_show(struct device *dev,
++ 			     struct device_attribute *attr, char *buf)
++ {
++ 	struct ap_queue *aq = to_ap_queue(dev);
++ 	int rc;
++ 
++ 	spin_lock_bh(&aq->lock);
++ 	rc = scnprintf(buf, PAGE_SIZE, "%d\n", aq->config ? 1 : 0);
++ 	spin_unlock_bh(&aq->lock);
++ 	return rc;
++ }
++ 
++ static DEVICE_ATTR_RO(config);
++ 
++ #ifdef CONFIG_ZCRYPT_DEBUG
++ static ssize_t states_show(struct device *dev,
++ 			   struct device_attribute *attr, char *buf)
++ {
++ 	struct ap_queue *aq = to_ap_queue(dev);
++ 	int rc = 0;
++ 
++ 	spin_lock_bh(&aq->lock);
++ 	/* queue device state */
++ 	switch (aq->dev_state) {
++ 	case AP_DEV_STATE_UNINITIATED:
++ 		rc = scnprintf(buf, PAGE_SIZE, "UNINITIATED\n");
++ 		break;
++ 	case AP_DEV_STATE_OPERATING:
++ 		rc = scnprintf(buf, PAGE_SIZE, "OPERATING");
++ 		break;
++ 	case AP_DEV_STATE_SHUTDOWN:
++ 		rc = scnprintf(buf, PAGE_SIZE, "SHUTDOWN");
++ 		break;
++ 	case AP_DEV_STATE_ERROR:
++ 		rc = scnprintf(buf, PAGE_SIZE, "ERROR");
++ 		break;
++ 	default:
++ 		rc = scnprintf(buf, PAGE_SIZE, "UNKNOWN");
++ 	}
++ 	/* state machine state */
++ 	if (aq->dev_state) {
++ 		switch (aq->sm_state) {
++ 		case AP_SM_STATE_RESET_START:
++ 			rc += scnprintf(buf + rc, PAGE_SIZE - rc,
++ 					" [RESET_START]\n");
++ 			break;
++ 		case AP_SM_STATE_RESET_WAIT:
++ 			rc += scnprintf(buf + rc, PAGE_SIZE - rc,
++ 					" [RESET_WAIT]\n");
++ 			break;
++ 		case AP_SM_STATE_SETIRQ_WAIT:
++ 			rc += scnprintf(buf + rc, PAGE_SIZE - rc,
++ 					" [SETIRQ_WAIT]\n");
++ 			break;
++ 		case AP_SM_STATE_IDLE:
++ 			rc += scnprintf(buf + rc, PAGE_SIZE - rc,
++ 					" [IDLE]\n");
++ 			break;
++ 		case AP_SM_STATE_WORKING:
++ 			rc += scnprintf(buf + rc, PAGE_SIZE - rc,
++ 					" [WORKING]\n");
++ 			break;
++ 		case AP_SM_STATE_QUEUE_FULL:
++ 			rc += scnprintf(buf + rc, PAGE_SIZE - rc,
++ 					" [FULL]\n");
++ 			break;
++ 		default:
++ 			rc += scnprintf(buf + rc, PAGE_SIZE - rc,
++ 					" [UNKNOWN]\n");
++ 		}
++ 	}
++ 	spin_unlock_bh(&aq->lock);
++ 
++ 	return rc;
++ }
++ static DEVICE_ATTR_RO(states);
++ 
++ static ssize_t last_err_rc_show(struct device *dev,
++ 				struct device_attribute *attr, char *buf)
++ {
++ 	struct ap_queue *aq = to_ap_queue(dev);
++ 	int rc;
++ 
++ 	spin_lock_bh(&aq->lock);
++ 	rc = aq->last_err_rc;
++ 	spin_unlock_bh(&aq->lock);
++ 
++ 	switch (rc) {
++ 	case AP_RESPONSE_NORMAL:
++ 		return scnprintf(buf, PAGE_SIZE, "NORMAL\n");
++ 	case AP_RESPONSE_Q_NOT_AVAIL:
++ 		return scnprintf(buf, PAGE_SIZE, "Q_NOT_AVAIL\n");
++ 	case AP_RESPONSE_RESET_IN_PROGRESS:
++ 		return scnprintf(buf, PAGE_SIZE, "RESET_IN_PROGRESS\n");
++ 	case AP_RESPONSE_DECONFIGURED:
++ 		return scnprintf(buf, PAGE_SIZE, "DECONFIGURED\n");
++ 	case AP_RESPONSE_CHECKSTOPPED:
++ 		return scnprintf(buf, PAGE_SIZE, "CHECKSTOPPED\n");
++ 	case AP_RESPONSE_BUSY:
++ 		return scnprintf(buf, PAGE_SIZE, "BUSY\n");
++ 	case AP_RESPONSE_INVALID_ADDRESS:
++ 		return scnprintf(buf, PAGE_SIZE, "INVALID_ADDRESS\n");
++ 	case AP_RESPONSE_OTHERWISE_CHANGED:
++ 		return scnprintf(buf, PAGE_SIZE, "OTHERWISE_CHANGED\n");
++ 	case AP_RESPONSE_Q_FULL:
++ 		return scnprintf(buf, PAGE_SIZE, "Q_FULL/NO_PENDING_REPLY\n");
++ 	case AP_RESPONSE_INDEX_TOO_BIG:
++ 		return scnprintf(buf, PAGE_SIZE, "INDEX_TOO_BIG\n");
++ 	case AP_RESPONSE_NO_FIRST_PART:
++ 		return scnprintf(buf, PAGE_SIZE, "NO_FIRST_PART\n");
++ 	case AP_RESPONSE_MESSAGE_TOO_BIG:
++ 		return scnprintf(buf, PAGE_SIZE, "MESSAGE_TOO_BIG\n");
++ 	case AP_RESPONSE_REQ_FAC_NOT_INST:
++ 		return scnprintf(buf, PAGE_SIZE, "REQ_FAC_NOT_INST\n");
++ 	default:
++ 		return scnprintf(buf, PAGE_SIZE, "response code %d\n", rc);
++ 	}
++ }
++ static DEVICE_ATTR_RO(last_err_rc);
++ #endif
++ 
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  static struct attribute *ap_queue_dev_attrs[] = {
+  	&dev_attr_request_count.attr,
+  	&dev_attr_requestq_count.attr,
+  	&dev_attr_pendingq_count.attr,
+  	&dev_attr_reset.attr,
+  	&dev_attr_interrupt.attr,
+++<<<<<<< HEAD
+++=======
++ 	&dev_attr_config.attr,
++ #ifdef CONFIG_ZCRYPT_DEBUG
++ 	&dev_attr_states.attr,
++ 	&dev_attr_last_err_rc.attr,
++ #endif
+++>>>>>>> 4f2fcccdb547 (s390/ap: add card/queue deconfig state)
+  	NULL
+  };
+  
+* Unmerged path drivers/s390/crypto/ap_bus.c
+* Unmerged path drivers/s390/crypto/ap_bus.h
+diff --git a/drivers/s390/crypto/ap_card.c b/drivers/s390/crypto/ap_card.c
+index 6588713319ba..bf1e964b0048 100644
+--- a/drivers/s390/crypto/ap_card.c
++++ b/drivers/s390/crypto/ap_card.c
+@@ -139,6 +139,16 @@ static ssize_t modalias_show(struct device *dev,
+ 
+ static DEVICE_ATTR_RO(modalias);
+ 
++static ssize_t config_show(struct device *dev,
++			   struct device_attribute *attr, char *buf)
++{
++	struct ap_card *ac = to_ap_card(dev);
++
++	return scnprintf(buf, PAGE_SIZE, "%d\n", ac->config ? 1 : 0);
++}
++
++static DEVICE_ATTR_RO(config);
++
+ static struct attribute *ap_card_dev_attrs[] = {
+ 	&dev_attr_hwtype.attr,
+ 	&dev_attr_raw_hwtype.attr,
+@@ -148,6 +158,7 @@ static struct attribute *ap_card_dev_attrs[] = {
+ 	&dev_attr_requestq_count.attr,
+ 	&dev_attr_pendingq_count.attr,
+ 	&dev_attr_modalias.attr,
++	&dev_attr_config.attr,
+ 	NULL
+ };
+ 
+* Unmerged path drivers/s390/crypto/ap_queue.c
+diff --git a/drivers/s390/crypto/zcrypt_api.c b/drivers/s390/crypto/zcrypt_api.c
+index 1d27c6c62e02..74108c7cbfa9 100644
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@ -672,8 +672,9 @@ static long zcrypt_rsa_modexpo(struct ap_perms *perms,
+ 	pref_zq = NULL;
+ 	spin_lock(&zcrypt_list_lock);
+ 	for_each_zcrypt_card(zc) {
+-		/* Check for online accelarator and CCA cards */
+-		if (!zc->online || !(zc->card->functions & 0x18000000))
++		/* Check for useable accelarator or CCA card */
++		if (!zc->online || !zc->card->config ||
++		    !(zc->card->functions & 0x18000000))
+ 			continue;
+ 		/* Check for size limits */
+ 		if (zc->min_mod_size > mex->inputdatalength ||
+@@ -687,8 +688,9 @@ static long zcrypt_rsa_modexpo(struct ap_perms *perms,
+ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ 			continue;
+ 		for_each_zcrypt_queue(zq, zc) {
+-			/* check if device is online and eligible */
+-			if (!zq->online || !zq->ops->rsa_modexpo)
++			/* check if device is useable and eligible */
++			if (!zq->online || !zq->ops->rsa_modexpo ||
++			    !zq->queue->config)
+ 				continue;
+ 			/* check if device node has admission for this queue */
+ 			if (!zcrypt_check_queue(perms,
+@@ -756,8 +758,9 @@ static long zcrypt_rsa_crt(struct ap_perms *perms,
+ 	pref_zq = NULL;
+ 	spin_lock(&zcrypt_list_lock);
+ 	for_each_zcrypt_card(zc) {
+-		/* Check for online accelarator and CCA cards */
+-		if (!zc->online || !(zc->card->functions & 0x18000000))
++		/* Check for useable accelarator or CCA card */
++		if (!zc->online || !zc->card->config ||
++		    !(zc->card->functions & 0x18000000))
+ 			continue;
+ 		/* Check for size limits */
+ 		if (zc->min_mod_size > crt->inputdatalength ||
+@@ -771,8 +774,9 @@ static long zcrypt_rsa_crt(struct ap_perms *perms,
+ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ 			continue;
+ 		for_each_zcrypt_queue(zq, zc) {
+-			/* check if device is online and eligible */
+-			if (!zq->online || !zq->ops->rsa_modexpo_crt)
++			/* check if device is useable and eligible */
++			if (!zq->online || !zq->ops->rsa_modexpo_crt ||
++			    !zq->queue->config)
+ 				continue;
+ 			/* check if device node has admission for this queue */
+ 			if (!zcrypt_check_queue(perms,
+@@ -842,8 +846,9 @@ static long _zcrypt_send_cprb(struct ap_perms *perms,
+ 	pref_zq = NULL;
+ 	spin_lock(&zcrypt_list_lock);
+ 	for_each_zcrypt_card(zc) {
+-		/* Check for online CCA cards */
+-		if (!zc->online || !(zc->card->functions & 0x10000000))
++		/* Check for useable CCA card */
++		if (!zc->online || !zc->card->config ||
++		    !(zc->card->functions & 0x10000000))
+ 			continue;
+ 		/* Check for user selected CCA card */
+ 		if (xcRB->user_defined != AUTOSELECT &&
+@@ -857,9 +862,10 @@ static long _zcrypt_send_cprb(struct ap_perms *perms,
+ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ 			continue;
+ 		for_each_zcrypt_queue(zq, zc) {
+-			/* check if device is online and eligible */
++			/* check for device useable and eligible */
+ 			if (!zq->online ||
+ 			    !zq->ops->send_cprb ||
++			    !zq->queue->config ||
+ 			    (tdom != AUTOSEL_DOM &&
+ 			     tdom != AP_QID_QUEUE(zq->queue->qid)))
+ 				continue;
+@@ -982,8 +988,9 @@ static long _zcrypt_send_ep11_cprb(struct ap_perms *perms,
+ 	pref_zq = NULL;
+ 	spin_lock(&zcrypt_list_lock);
+ 	for_each_zcrypt_card(zc) {
+-		/* Check for online EP11 cards */
+-		if (!zc->online || !(zc->card->functions & 0x04000000))
++		/* Check for useable EP11 card */
++		if (!zc->online || !zc->card->config ||
++		    !(zc->card->functions & 0x04000000))
+ 			continue;
+ 		/* Check for user selected EP11 card */
+ 		if (targets &&
+@@ -997,9 +1004,10 @@ static long _zcrypt_send_ep11_cprb(struct ap_perms *perms,
+ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ 			continue;
+ 		for_each_zcrypt_queue(zq, zc) {
+-			/* check if device is online and eligible */
++			/* check if device is useable and eligible */
+ 			if (!zq->online ||
+ 			    !zq->ops->send_ep11_cprb ||
++			    !zq->queue->config ||
+ 			    (targets &&
+ 			     !is_desired_ep11_queue(zq->queue->qid,
+ 						    target_num, targets)))
+@@ -1068,16 +1076,18 @@ static long zcrypt_rng(char *buffer)
+ 	pref_zq = NULL;
+ 	spin_lock(&zcrypt_list_lock);
+ 	for_each_zcrypt_card(zc) {
+-		/* Check for online CCA cards */
+-		if (!zc->online || !(zc->card->functions & 0x10000000))
++		/* Check for useable CCA card */
++		if (!zc->online || !zc->card->config ||
++		    !(zc->card->functions & 0x10000000))
+ 			continue;
+ 		/* get weight index of the card device	*/
+ 		weight = zc->speed_rating[func_code];
+ 		if (zcrypt_card_compare(zc, pref_zc, weight, pref_weight))
+ 			continue;
+ 		for_each_zcrypt_queue(zq, zc) {
+-			/* check if device is online and eligible */
+-			if (!zq->online || !zq->ops->rng)
++			/* check if device is useable and eligible */
++			if (!zq->online || !zq->ops->rng ||
++			    !zq->queue->config)
+ 				continue;
+ 			if (zcrypt_queue_compare(zq, pref_zq,
+ 						 weight, pref_weight))
+diff --git a/drivers/s390/crypto/zcrypt_card.c b/drivers/s390/crypto/zcrypt_card.c
+index c53cab4b0c9e..e342eb86acd1 100644
+--- a/drivers/s390/crypto/zcrypt_card.c
++++ b/drivers/s390/crypto/zcrypt_card.c
+@@ -50,22 +50,28 @@ static ssize_t online_show(struct device *dev,
+ 			   struct device_attribute *attr,
+ 			   char *buf)
+ {
+-	struct zcrypt_card *zc = to_ap_card(dev)->private;
++	struct ap_card *ac = to_ap_card(dev);
++	struct zcrypt_card *zc = ac->private;
++	int online = ac->config && zc->online ? 1 : 0;
+ 
+-	return scnprintf(buf, PAGE_SIZE, "%d\n", zc->online);
++	return scnprintf(buf, PAGE_SIZE, "%d\n", online);
+ }
+ 
+ static ssize_t online_store(struct device *dev,
+ 			    struct device_attribute *attr,
+ 			    const char *buf, size_t count)
+ {
+-	struct zcrypt_card *zc = to_ap_card(dev)->private;
++	struct ap_card *ac = to_ap_card(dev);
++	struct zcrypt_card *zc = ac->private;
+ 	struct zcrypt_queue *zq;
+ 	int online, id;
+ 
+ 	if (sscanf(buf, "%d\n", &online) != 1 || online < 0 || online > 1)
+ 		return -EINVAL;
+ 
++	if (online && !ac->config)
++		return -ENODEV;
++
+ 	zc->online = online;
+ 	id = zc->card->id;
+ 
+diff --git a/drivers/s390/crypto/zcrypt_queue.c b/drivers/s390/crypto/zcrypt_queue.c
+index 8bae6ad159a7..3c207066313c 100644
+--- a/drivers/s390/crypto/zcrypt_queue.c
++++ b/drivers/s390/crypto/zcrypt_queue.c
+@@ -40,22 +40,27 @@ static ssize_t online_show(struct device *dev,
+ 			   struct device_attribute *attr,
+ 			   char *buf)
+ {
+-	struct zcrypt_queue *zq = to_ap_queue(dev)->private;
++	struct ap_queue *aq = to_ap_queue(dev);
++	struct zcrypt_queue *zq = aq->private;
++	int online = aq->config && zq->online ? 1 : 0;
+ 
+-	return scnprintf(buf, PAGE_SIZE, "%d\n", zq->online);
++	return scnprintf(buf, PAGE_SIZE, "%d\n", online);
+ }
+ 
+ static ssize_t online_store(struct device *dev,
+ 			    struct device_attribute *attr,
+ 			    const char *buf, size_t count)
+ {
+-	struct zcrypt_queue *zq = to_ap_queue(dev)->private;
++	struct ap_queue *aq = to_ap_queue(dev);
++	struct zcrypt_queue *zq = aq->private;
+ 	struct zcrypt_card *zc = zq->zcard;
+ 	int online;
+ 
+ 	if (sscanf(buf, "%d\n", &online) != 1 || online < 0 || online > 1)
+ 		return -EINVAL;
+ 
++	if (online && (!aq->config || !aq->card->config))
++		return -ENODEV;
+ 	if (online && !zc->online)
+ 		return -EINVAL;
+ 	zq->online = online;
