@@ -1,0 +1,831 @@
+drm/i915: Prepare for multiple GTs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+commit bec68cc9ea42d853f00da347793cefe49575a574
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/bec68cc9.failed
+
+On a multi-tile platform, each tile has its own registers + GGTT
+space, and BAR 0 is extended to cover all of them.
+
+Up to four GTs are supported in i915->gt[], with slot zero
+shadowing the existing i915->gt0 to enable source compatibility
+with legacy driver paths. A for_each_gt macro is added to iterate
+over the GTs and will be used by upcoming patches that convert
+various parts of the driver to be multi-gt aware.
+
+Only the primary/root tile is initialized for now; the other
+tiles will be detected and plugged in by future patches once the
+necessary infrastructure is in place to handle them.
+
+	Signed-off-by: Abdiel Janulgue <abdiel.janulgue@gmail.com>
+	Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+	Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+	Signed-off-by: Andi Shyti <andi.shyti@linux.intel.com>
+	Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Matthew Auld <matthew.auld@intel.com>
+	Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+	Reviewed-by: Andrzej Hajda <andrzej.hajda@intel.com>
+	Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220318233938.149744-4-andi.shyti@linux.intel.com
+(cherry picked from commit bec68cc9ea42d853f00da347793cefe49575a574)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gt/intel_gt.c
+#	drivers/gpu/drm/i915/gt/intel_gt.h
+#	drivers/gpu/drm/i915/gt/intel_gt_types.h
+#	drivers/gpu/drm/i915/i915_drv.c
+#	drivers/gpu/drm/i915/intel_memory_region.h
+#	drivers/gpu/drm/i915/intel_uncore.c
+#	drivers/gpu/drm/i915/intel_uncore.h
+#	drivers/gpu/drm/i915/selftests/mock_gem_device.c
+diff --cc drivers/gpu/drm/i915/gt/intel_gt.c
+index 59d36fff08ab,cfac4a913642..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@@ -18,14 -27,10 +18,18 @@@
+  #include "intel_renderstate.h"
+  #include "intel_rps.h"
+  #include "intel_uncore.h"
+ +#include "intel_pm.h"
+  #include "shmem_utils.h"
+  
+++<<<<<<< HEAD
+ +void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+++=======
++ static void __intel_gt_init_early(struct intel_gt *gt)
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  {
+ +	gt->i915 = i915;
+ +	gt->uncore = &i915->uncore;
+ +
+  	spin_lock_init(&gt->irq_lock);
+  
+  	mutex_init(&gt->tlb_invalidate_lock);
+@@@ -42,15 -47,27 +46,30 @@@
+  	intel_gt_init_timelines(gt);
+  	intel_gt_pm_init_early(gt);
+  
+ -	intel_uc_init_early(&gt->uc);
+  	intel_rps_init_early(&gt->rps);
+++<<<<<<< HEAD
+ +	intel_uc_init_early(&gt->uc);
+++=======
+  }
+  
+- int intel_gt_probe_lmem(struct intel_gt *gt)
++ /* Preliminary initialization of Tile 0 */
++ void intel_root_gt_init_early(struct drm_i915_private *i915)
++ {
++ 	struct intel_gt *gt = to_gt(i915);
++ 
++ 	gt->i915 = i915;
++ 	gt->uncore = &i915->uncore;
++ 
++ 	__intel_gt_init_early(gt);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
++ }
++ 
++ static int intel_gt_probe_lmem(struct intel_gt *gt)
+  {
+  	struct drm_i915_private *i915 = gt->i915;
++ 	unsigned int instance = gt->info.id;
++ 	int id = INTEL_REGION_LMEM_0 + instance;
+  	struct intel_memory_region *mem;
+- 	int id;
+  	int err;
+  
+  	mem = intel_gt_setup_lmem(gt);
+@@@ -67,9 -82,8 +86,13 @@@
+  		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	id = INTEL_REGION_LMEM;
+ +
+++=======
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  	mem->id = id;
++ 	mem->instance = instance;
+  
+  	intel_memory_region_set_name(mem, "local%u", mem->instance);
+  
+@@@ -685,20 -808,320 +708,321 @@@ void intel_gt_driver_release(struct int
+  	intel_gt_pm_fini(gt);
+  	intel_gt_fini_scratch(gt);
+  	intel_gt_fini_buffer_pool(gt);
+ -	intel_gt_fini_hwconfig(gt);
+  }
+  
+- void intel_gt_driver_late_release(struct intel_gt *gt)
++ void intel_gt_driver_late_release_all(struct drm_i915_private *i915)
+  {
++ 	struct intel_gt *gt;
++ 	unsigned int id;
++ 
+  	/* We need to wait for inflight RCU frees to release their grip */
+  	rcu_barrier();
+  
+- 	intel_uc_driver_late_release(&gt->uc);
+- 	intel_gt_fini_requests(gt);
+- 	intel_gt_fini_reset(gt);
+- 	intel_gt_fini_timelines(gt);
+- 	intel_engines_free(gt);
++ 	for_each_gt(gt, i915, id) {
++ 		intel_uc_driver_late_release(&gt->uc);
++ 		intel_gt_fini_requests(gt);
++ 		intel_gt_fini_reset(gt);
++ 		intel_gt_fini_timelines(gt);
++ 		intel_engines_free(gt);
++ 	}
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ /**
++  * intel_gt_reg_needs_read_steering - determine whether a register read
++  *     requires explicit steering
++  * @gt: GT structure
++  * @reg: the register to check steering requirements for
++  * @type: type of multicast steering to check
++  *
++  * Determines whether @reg needs explicit steering of a specific type for
++  * reads.
++  *
++  * Returns false if @reg does not belong to a register range of the given
++  * steering type, or if the default (subslice-based) steering IDs are suitable
++  * for @type steering too.
++  */
++ static bool intel_gt_reg_needs_read_steering(struct intel_gt *gt,
++ 					     i915_reg_t reg,
++ 					     enum intel_steering_type type)
++ {
++ 	const u32 offset = i915_mmio_reg_offset(reg);
++ 	const struct intel_mmio_range *entry;
++ 
++ 	if (likely(!intel_gt_needs_read_steering(gt, type)))
++ 		return false;
++ 
++ 	for (entry = gt->steering_table[type]; entry->end; entry++) {
++ 		if (offset >= entry->start && offset <= entry->end)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /**
++  * intel_gt_get_valid_steering - determines valid IDs for a class of MCR steering
++  * @gt: GT structure
++  * @type: multicast register type
++  * @sliceid: Slice ID returned
++  * @subsliceid: Subslice ID returned
++  *
++  * Determines sliceid and subsliceid values that will steer reads
++  * of a specific multicast register class to a valid value.
++  */
++ static void intel_gt_get_valid_steering(struct intel_gt *gt,
++ 					enum intel_steering_type type,
++ 					u8 *sliceid, u8 *subsliceid)
++ {
++ 	switch (type) {
++ 	case L3BANK:
++ 		GEM_DEBUG_WARN_ON(!gt->info.l3bank_mask); /* should be impossible! */
++ 
++ 		*sliceid = 0;		/* unused */
++ 		*subsliceid = __ffs(gt->info.l3bank_mask);
++ 		break;
++ 	case MSLICE:
++ 		GEM_DEBUG_WARN_ON(!gt->info.mslice_mask); /* should be impossible! */
++ 
++ 		*sliceid = __ffs(gt->info.mslice_mask);
++ 		*subsliceid = 0;	/* unused */
++ 		break;
++ 	case LNCF:
++ 		GEM_DEBUG_WARN_ON(!gt->info.mslice_mask); /* should be impossible! */
++ 
++ 		/*
++ 		 * An LNCF is always present if its mslice is present, so we
++ 		 * can safely just steer to LNCF 0 in all cases.
++ 		 */
++ 		*sliceid = __ffs(gt->info.mslice_mask) << 1;
++ 		*subsliceid = 0;	/* unused */
++ 		break;
++ 	default:
++ 		MISSING_CASE(type);
++ 		*sliceid = 0;
++ 		*subsliceid = 0;
++ 	}
++ }
++ 
++ /**
++  * intel_gt_read_register_fw - reads a GT register with support for multicast
++  * @gt: GT structure
++  * @reg: register to read
++  *
++  * This function will read a GT register.  If the register is a multicast
++  * register, the read will be steered to a valid instance (i.e., one that
++  * isn't fused off or powered down by power gating).
++  *
++  * Returns the value from a valid instance of @reg.
++  */
++ u32 intel_gt_read_register_fw(struct intel_gt *gt, i915_reg_t reg)
++ {
++ 	int type;
++ 	u8 sliceid, subsliceid;
++ 
++ 	for (type = 0; type < NUM_STEERING_TYPES; type++) {
++ 		if (intel_gt_reg_needs_read_steering(gt, reg, type)) {
++ 			intel_gt_get_valid_steering(gt, type, &sliceid,
++ 						    &subsliceid);
++ 			return intel_uncore_read_with_mcr_steering_fw(gt->uncore,
++ 								      reg,
++ 								      sliceid,
++ 								      subsliceid);
++ 		}
++ 	}
++ 
++ 	return intel_uncore_read_fw(gt->uncore, reg);
++ }
++ 
++ /**
++  * intel_gt_get_valid_steering_for_reg - get a valid steering for a register
++  * @gt: GT structure
++  * @reg: register for which the steering is required
++  * @sliceid: return variable for slice steering
++  * @subsliceid: return variable for subslice steering
++  *
++  * This function returns a slice/subslice pair that is guaranteed to work for
++  * read steering of the given register. Note that a value will be returned even
++  * if the register is not replicated and therefore does not actually require
++  * steering.
++  */
++ void intel_gt_get_valid_steering_for_reg(struct intel_gt *gt, i915_reg_t reg,
++ 					 u8 *sliceid, u8 *subsliceid)
++ {
++ 	int type;
++ 
++ 	for (type = 0; type < NUM_STEERING_TYPES; type++) {
++ 		if (intel_gt_reg_needs_read_steering(gt, reg, type)) {
++ 			intel_gt_get_valid_steering(gt, type, sliceid,
++ 						    subsliceid);
++ 			return;
++ 		}
++ 	}
++ 
++ 	*sliceid = gt->default_steering.groupid;
++ 	*subsliceid = gt->default_steering.instanceid;
++ }
++ 
++ u32 intel_gt_read_register(struct intel_gt *gt, i915_reg_t reg)
++ {
++ 	int type;
++ 	u8 sliceid, subsliceid;
++ 
++ 	for (type = 0; type < NUM_STEERING_TYPES; type++) {
++ 		if (intel_gt_reg_needs_read_steering(gt, reg, type)) {
++ 			intel_gt_get_valid_steering(gt, type, &sliceid,
++ 						    &subsliceid);
++ 			return intel_uncore_read_with_mcr_steering(gt->uncore,
++ 								   reg,
++ 								   sliceid,
++ 								   subsliceid);
++ 		}
++ 	}
++ 
++ 	return intel_uncore_read(gt->uncore, reg);
++ }
++ 
++ static void report_steering_type(struct drm_printer *p,
++ 				 struct intel_gt *gt,
++ 				 enum intel_steering_type type,
++ 				 bool dump_table)
++ {
++ 	const struct intel_mmio_range *entry;
++ 	u8 slice, subslice;
++ 
++ 	BUILD_BUG_ON(ARRAY_SIZE(intel_steering_types) != NUM_STEERING_TYPES);
++ 
++ 	if (!gt->steering_table[type]) {
++ 		drm_printf(p, "%s steering: uses default steering\n",
++ 			   intel_steering_types[type]);
++ 		return;
++ 	}
++ 
++ 	intel_gt_get_valid_steering(gt, type, &slice, &subslice);
++ 	drm_printf(p, "%s steering: sliceid=0x%x, subsliceid=0x%x\n",
++ 		   intel_steering_types[type], slice, subslice);
++ 
++ 	if (!dump_table)
++ 		return;
++ 
++ 	for (entry = gt->steering_table[type]; entry->end; entry++)
++ 		drm_printf(p, "\t0x%06x - 0x%06x\n", entry->start, entry->end);
++ }
++ 
++ void intel_gt_report_steering(struct drm_printer *p, struct intel_gt *gt,
++ 			      bool dump_table)
++ {
++ 	drm_printf(p, "Default steering: sliceid=0x%x, subsliceid=0x%x\n",
++ 		   gt->default_steering.groupid,
++ 		   gt->default_steering.instanceid);
++ 
++ 	if (HAS_MSLICES(gt->i915)) {
++ 		report_steering_type(p, gt, MSLICE, dump_table);
++ 		report_steering_type(p, gt, LNCF, dump_table);
++ 	}
++ }
++ 
++ static int intel_gt_tile_setup(struct intel_gt *gt, phys_addr_t phys_addr)
++ {
++ 	int ret;
++ 
++ 	if (!gt_is_root(gt)) {
++ 		struct intel_uncore_mmio_debug *mmio_debug;
++ 		struct intel_uncore *uncore;
++ 
++ 		uncore = kzalloc(sizeof(*uncore), GFP_KERNEL);
++ 		if (!uncore)
++ 			return -ENOMEM;
++ 
++ 		mmio_debug = kzalloc(sizeof(*mmio_debug), GFP_KERNEL);
++ 		if (!mmio_debug) {
++ 			kfree(uncore);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		gt->uncore = uncore;
++ 		gt->uncore->debug = mmio_debug;
++ 
++ 		__intel_gt_init_early(gt);
++ 	}
++ 
++ 	intel_uncore_init_early(gt->uncore, gt);
++ 
++ 	ret = intel_uncore_setup_mmio(gt->uncore, phys_addr);
++ 	if (ret)
++ 		return ret;
++ 
++ 	gt->phys_addr = phys_addr;
++ 
++ 	return 0;
++ }
++ 
++ static void
++ intel_gt_tile_cleanup(struct intel_gt *gt)
++ {
++ 	intel_uncore_cleanup_mmio(gt->uncore);
++ 
++ 	if (!gt_is_root(gt)) {
++ 		kfree(gt->uncore->debug);
++ 		kfree(gt->uncore);
++ 		kfree(gt);
++ 	}
++ }
++ 
++ int intel_gt_probe_all(struct drm_i915_private *i915)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(i915->drm.dev);
++ 	struct intel_gt *gt = &i915->gt0;
++ 	phys_addr_t phys_addr;
++ 	unsigned int mmio_bar;
++ 	int ret;
++ 
++ 	mmio_bar = GRAPHICS_VER(i915) == 2 ? 1 : 0;
++ 	phys_addr = pci_resource_start(pdev, mmio_bar);
++ 
++ 	/*
++ 	 * We always have at least one primary GT on any device
++ 	 * and it has been already initialized early during probe
++ 	 * in i915_driver_probe()
++ 	 */
++ 	ret = intel_gt_tile_setup(gt, phys_addr);
++ 	if (ret)
++ 		return ret;
++ 
++ 	i915->gt[0] = gt;
++ 
++ 	/* TODO: add more tiles */
++ 	return 0;
++ }
++ 
++ int intel_gt_tiles_init(struct drm_i915_private *i915)
++ {
++ 	struct intel_gt *gt;
++ 	unsigned int id;
++ 	int ret;
++ 
++ 	for_each_gt(gt, i915, id) {
++ 		ret = intel_gt_probe_lmem(gt);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void intel_gt_release_all(struct drm_i915_private *i915)
++ {
++ 	struct intel_gt *gt;
++ 	unsigned int id;
++ 
++ 	for_each_gt(gt, i915, id) {
++ 		intel_gt_tile_cleanup(gt);
++ 		i915->gt[id] = NULL;
++ 	}
+  }
+  
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  void intel_gt_info_print(const struct intel_gt_info *info,
+  			 struct drm_printer *p)
+  {
+diff --cc drivers/gpu/drm/i915/gt/intel_gt.h
+index 8ae37abb488d,e76168e10a21..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt.h
+@@@ -39,9 -39,8 +39,14 @@@ static inline struct intel_gt *huc_to_g
+  	return container_of(huc, struct intel_gt, uc.huc);
+  }
+  
+++<<<<<<< HEAD
+ +void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915);
+ +void intel_gt_init_hw_early(struct intel_gt *gt, struct i915_ggtt *ggtt);
+ +int intel_gt_probe_lmem(struct intel_gt *gt);
+++=======
++ void intel_root_gt_init_early(struct drm_i915_private *i915);
++ int intel_gt_assign_ggtt(struct intel_gt *gt);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  int intel_gt_init_mmio(struct intel_gt *gt);
+  int __must_check intel_gt_init_hw(struct intel_gt *gt);
+  int intel_gt_init(struct intel_gt *gt);
+@@@ -51,8 -50,10 +56,8 @@@ void intel_gt_driver_unregister(struct 
+  void intel_gt_driver_remove(struct intel_gt *gt);
+  void intel_gt_driver_release(struct intel_gt *gt);
+  
+- void intel_gt_driver_late_release(struct intel_gt *gt);
++ void intel_gt_driver_late_release_all(struct drm_i915_private *i915);
+  
+ -int intel_gt_wait_for_idle(struct intel_gt *gt, long timeout);
+ -
+  void intel_gt_check_and_clear_faults(struct intel_gt *gt);
+  void intel_gt_clear_error_registers(struct intel_gt *gt,
+  				    intel_engine_mask_t engine_mask);
+@@@ -80,6 -81,31 +85,34 @@@ static inline bool intel_gt_is_wedged(c
+  	return unlikely(test_bit(I915_WEDGED, &gt->reset.flags));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool intel_gt_needs_read_steering(struct intel_gt *gt,
++ 						enum intel_steering_type type)
++ {
++ 	return gt->steering_table[type];
++ }
++ 
++ void intel_gt_get_valid_steering_for_reg(struct intel_gt *gt, i915_reg_t reg,
++ 					 u8 *sliceid, u8 *subsliceid);
++ 
++ u32 intel_gt_read_register_fw(struct intel_gt *gt, i915_reg_t reg);
++ u32 intel_gt_read_register(struct intel_gt *gt, i915_reg_t reg);
++ 
++ void intel_gt_report_steering(struct drm_printer *p, struct intel_gt *gt,
++ 			      bool dump_table);
++ 
++ int intel_gt_probe_all(struct drm_i915_private *i915);
++ int intel_gt_tiles_init(struct drm_i915_private *i915);
++ void intel_gt_release_all(struct drm_i915_private *i915);
++ 
++ #define for_each_gt(gt__, i915__, id__) \
++ 	for ((id__) = 0; \
++ 	     (id__) < I915_MAX_GT; \
++ 	     (id__)++) \
++ 		for_each_if(((gt__) = (i915__)->gt[(id__)]))
++ 
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  void intel_gt_info_print(const struct intel_gt_info *info,
+  			 struct drm_printer *p);
+  
+diff --cc drivers/gpu/drm/i915/gt/intel_gt_types.h
+index afeb478ce0ca,937b2e1a305e..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+@@@ -147,10 -179,32 +147,29 @@@ struct intel_gt 
+  
+  	struct i915_vma *scratch;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct intel_migrate migrate;
++ 
++ 	const struct intel_mmio_range *steering_table[NUM_STEERING_TYPES];
++ 
++ 	struct {
++ 		u8 groupid;
++ 		u8 instanceid;
++ 	} default_steering;
++ 
++ 	/*
++ 	 * Base of per-tile GTTMMADR where we can derive the MMIO and the GGTT.
++ 	 */
++ 	phys_addr_t phys_addr;
++ 
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  	struct intel_gt_info {
++ 		unsigned int id;
++ 
+  		intel_engine_mask_t engine_mask;
+ -
+ -		u32 l3bank_mask;
+ -
+  		u8 num_engines;
+  
+ -		/* General presence of SFC units */
+ -		u8 sfc_mask;
+ -
+  		/* Media engine access to SFC per instance */
+  		u8 vdbox_sfc_access;
+  
+diff --cc drivers/gpu/drm/i915/i915_drv.c
+index bf7e91e5799e,6f8762b26b1c..000000000000
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@@ -311,7 -321,6 +311,10 @@@ static int i915_driver_early_probe(stru
+  	intel_step_init(dev_priv);
+  
+  	intel_uncore_mmio_debug_init_early(&dev_priv->mmio_debug);
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_drv.c
+ +	intel_uncore_init_early(&dev_priv->uncore, dev_priv);
+++=======
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs):drivers/gpu/drm/i915/i915_driver.c
+  
+  	spin_lock_init(&dev_priv->irq_lock);
+  	spin_lock_init(&dev_priv->gpu_error.lock);
+@@@ -342,7 -351,7 +345,11 @@@
+  
+  	intel_wopcm_init_early(&dev_priv->wopcm);
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_drv.c
+ +	intel_gt_init_early(&dev_priv->gt, dev_priv);
+++=======
++ 	intel_root_gt_init_early(dev_priv);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs):drivers/gpu/drm/i915/i915_driver.c
+  
+  	i915_gem_init_early(dev_priv);
+  
+@@@ -363,7 -372,7 +370,11 @@@
+  
+  err_gem:
+  	i915_gem_cleanup_early(dev_priv);
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_drv.c
+ +	intel_gt_driver_late_release(&dev_priv->gt);
+++=======
++ 	intel_gt_driver_late_release_all(dev_priv);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs):drivers/gpu/drm/i915/i915_driver.c
+  	intel_region_ttm_device_fini(dev_priv);
+  err_ttm:
+  	vlv_suspend_cleanup(dev_priv);
+@@@ -382,7 -391,7 +393,11 @@@ static void i915_driver_late_release(st
+  	intel_irq_fini(dev_priv);
+  	intel_power_domains_cleanup(dev_priv);
+  	i915_gem_cleanup_early(dev_priv);
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_drv.c
+ +	intel_gt_driver_late_release(&dev_priv->gt);
+++=======
++ 	intel_gt_driver_late_release_all(dev_priv);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs):drivers/gpu/drm/i915/i915_driver.c
+  	intel_region_ttm_device_fini(dev_priv);
+  	vlv_suspend_cleanup(dev_priv);
+  	i915_workqueues_cleanup(dev_priv);
+@@@ -409,12 -418,13 +424,22 @@@ static int i915_driver_mmio_probe(struc
+  	if (i915_inject_probe_failure(dev_priv))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_drv.c
+ +	if (i915_get_bridge_dev(dev_priv))
+ +		return -EIO;
+ +
+ +	ret = intel_uncore_init_mmio(&dev_priv->uncore);
+ +	if (ret < 0)
+ +		goto err_bridge;
+++=======
++ 	ret = i915_get_bridge_dev(dev_priv);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	ret = intel_uncore_init_mmio(&dev_priv->uncore);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs):drivers/gpu/drm/i915/i915_driver.c
+  
+  	/* Try to make sure MCHBAR is enabled before poking at it */
+  	intel_setup_mchbar(dev_priv);
+@@@ -432,7 -442,6 +457,10 @@@
+  err_uncore:
+  	intel_teardown_mchbar(dev_priv);
+  	intel_uncore_fini_mmio(&dev_priv->uncore);
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_drv.c
+ +err_bridge:
+++=======
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs):drivers/gpu/drm/i915/i915_driver.c
+  	pci_dev_put(dev_priv->bridge_dev);
+  
+  	return ret;
+@@@ -575,9 -587,7 +603,13 @@@ static int i915_driver_hw_probe(struct 
+  	if (ret)
+  		goto err_ggtt;
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/i915_drv.c
+ +	intel_gt_init_hw_early(&dev_priv->gt, &dev_priv->ggtt);
+ +
+ +	ret = intel_gt_probe_lmem(&dev_priv->gt);
+++=======
++ 	ret = intel_gt_tiles_init(dev_priv);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs):drivers/gpu/drm/i915/i915_driver.c
+  	if (ret)
+  		goto err_mem_regions;
+  
+diff --cc drivers/gpu/drm/i915/intel_memory_region.h
+index 1f7dac63abb7,2d84aff53efd..000000000000
+--- a/drivers/gpu/drm/i915/intel_memory_region.h
++++ b/drivers/gpu/drm/i915/intel_memory_region.h
+@@@ -29,7 -29,10 +29,14 @@@ enum intel_memory_type 
+  
+  enum intel_region_id {
+  	INTEL_REGION_SMEM = 0,
+++<<<<<<< HEAD
+ +	INTEL_REGION_LMEM,
+++=======
++ 	INTEL_REGION_LMEM_0,
++ 	INTEL_REGION_LMEM_1,
++ 	INTEL_REGION_LMEM_2,
++ 	INTEL_REGION_LMEM_3,
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  	INTEL_REGION_STOLEN_SMEM,
+  	INTEL_REGION_STOLEN_LMEM,
+  	INTEL_REGION_UNKNOWN, /* Should be last */
+diff --cc drivers/gpu/drm/i915/intel_uncore.c
+index 38731cf3390e,8b9caaaacc21..000000000000
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@@ -1811,14 -2039,11 +1811,15 @@@ static int i915_pmic_bus_access_notifie
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+ +static int uncore_mmio_setup(struct intel_uncore *uncore)
+++=======
++ int intel_uncore_setup_mmio(struct intel_uncore *uncore, phys_addr_t phys_addr)
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  {
+  	struct drm_i915_private *i915 = uncore->i915;
+- 	struct pci_dev *pdev = to_pci_dev(i915->drm.dev);
+- 	int mmio_bar;
+  	int mmio_size;
+  
+- 	mmio_bar = GRAPHICS_VER(i915) == 2 ? 1 : 0;
+  	/*
+  	 * Before gen4, the registers and the GTT are behind different BARs.
+  	 * However, from gen4 onwards, the registers and the GTT are shared
+@@@ -1844,11 -2069,9 +1845,9 @@@
+  	return 0;
+  }
+  
+ -void intel_uncore_cleanup_mmio(struct intel_uncore *uncore)
+ +static void uncore_mmio_cleanup(struct intel_uncore *uncore)
+  {
+- 	struct pci_dev *pdev = to_pci_dev(uncore->i915->drm.dev);
+- 
+- 	pci_iounmap(pdev, uncore->regs);
++ 	iounmap(uncore->regs);
+  }
+  
+  void intel_uncore_init_early(struct intel_uncore *uncore,
+diff --cc drivers/gpu/drm/i915/intel_uncore.h
+index 1a8e1017f936,52fe3d89dd2b..000000000000
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@@ -29,8 -29,9 +29,9 @@@
+  #include <linux/notifier.h>
+  #include <linux/hrtimer.h>
+  #include <linux/io-64-nonatomic-lo-hi.h>
++ #include <linux/types.h>
+  
+ -#include "i915_reg_defs.h"
+ +#include "i915_reg.h"
+  
+  struct drm_i915_private;
+  struct intel_runtime_pm;
+@@@ -185,7 -213,16 +186,12 @@@ intel_uncore_has_fifo(const struct inte
+  void
+  intel_uncore_mmio_debug_init_early(struct intel_uncore_mmio_debug *mmio_debug);
+  void intel_uncore_init_early(struct intel_uncore *uncore,
+++<<<<<<< HEAD
+ +			     struct drm_i915_private *i915);
+++=======
++ 			     struct intel_gt *gt);
++ int intel_uncore_setup_mmio(struct intel_uncore *uncore, phys_addr_t phys_addr);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  int intel_uncore_init_mmio(struct intel_uncore *uncore);
+  void intel_uncore_prune_engine_fw_domains(struct intel_uncore *uncore,
+  					  struct intel_gt *gt);
+diff --cc drivers/gpu/drm/i915/selftests/mock_gem_device.c
+index d189c4bd4bef,9c31a16f8380..000000000000
+--- a/drivers/gpu/drm/i915/selftests/mock_gem_device.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+@@@ -72,7 -73,7 +72,11 @@@ static void mock_device_release(struct 
+  	destroy_workqueue(i915->wq);
+  
+  	intel_region_ttm_device_fini(i915);
+++<<<<<<< HEAD
+ +	intel_gt_driver_late_release(&i915->gt);
+++=======
++ 	intel_gt_driver_late_release_all(i915);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  	intel_memory_regions_driver_release(i915);
+  
+  	drm_mode_config_cleanup(&i915->drm);
+@@@ -174,12 -182,14 +183,20 @@@ struct drm_i915_private *mock_gem_devic
+  	mkwrite_device_info(i915)->memory_regions = REGION_SMEM;
+  	intel_memory_regions_hw_probe(i915);
+  
+ -	spin_lock_init(&i915->gpu_error.lock);
+ +	mock_uncore_init(&i915->uncore, i915);
+  
+  	i915_gem_init__mm(i915);
+++<<<<<<< HEAD
+ +	intel_gt_init_early(&i915->gt, i915);
+ +	atomic_inc(&i915->gt.wakeref.count); /* disable; no hw support */
+ +	i915->gt.awake = -ENODEV;
+++=======
++ 	intel_root_gt_init_early(i915);
++ 	mock_uncore_init(&i915->uncore, i915);
++ 	atomic_inc(&to_gt(i915)->wakeref.count); /* disable; no hw support */
++ 	to_gt(i915)->awake = -ENODEV;
++ 	mock_gt_probe(i915);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  
+  	ret = intel_region_ttm_device_init(i915);
+  	if (ret)
+@@@ -219,7 -234,7 +236,11 @@@ err_unlock
+  err_drv:
+  	intel_region_ttm_device_fini(i915);
+  err_ttm:
+++<<<<<<< HEAD
+ +	intel_gt_driver_late_release(&i915->gt);
+++=======
++ 	intel_gt_driver_late_release_all(i915);
+++>>>>>>> bec68cc9ea42 (drm/i915: Prepare for multiple GTs)
+  	intel_memory_regions_driver_release(i915);
+  	drm_mode_config_cleanup(&i915->drm);
+  	mock_destroy_device(i915);
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.h
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt_pm.c b/drivers/gpu/drm/i915/gt/intel_gt_pm.c
+index aef3084e8b16..ab1b51224c2a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt_pm.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt_pm.c
+@@ -128,7 +128,14 @@ static const struct intel_wakeref_ops wf_ops = {
+ 
+ void intel_gt_pm_init_early(struct intel_gt *gt)
+ {
+-	intel_wakeref_init(&gt->wakeref, gt->uncore->rpm, &wf_ops);
++	/*
++	 * We access the runtime_pm structure via gt->i915 here rather than
++	 * gt->uncore as we do elsewhere in the file because gt->uncore is not
++	 * yet initialized for all tiles at this point in the driver startup.
++	 * runtime_pm is per-device rather than per-tile, so this is still the
++	 * correct structure.
++	 */
++	intel_wakeref_init(&gt->wakeref, &gt->i915->runtime_pm, &wf_ops);
+ 	seqcount_mutex_init(&gt->stats.lock, &gt->wakeref.mutex);
+ }
+ 
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_types.h
+* Unmerged path drivers/gpu/drm/i915/i915_drv.c
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 4120fd31e1b9..925537723998 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1158,6 +1158,12 @@ struct drm_i915_private {
+ 	/* Abstract the submission mechanism (legacy ringbuffer or execlists) away */
+ 	struct intel_gt gt;
+ 
++	/*
++	 * i915->gt[0] == &i915->gt0
++	 */
++#define I915_MAX_GT 4
++	struct intel_gt *gt[I915_MAX_GT];
++
+ 	struct {
+ 		struct i915_gem_contexts {
+ 			spinlock_t lock; /* locks list */
+* Unmerged path drivers/gpu/drm/i915/intel_memory_region.h
+* Unmerged path drivers/gpu/drm/i915/intel_uncore.c
+* Unmerged path drivers/gpu/drm/i915/intel_uncore.h
+* Unmerged path drivers/gpu/drm/i915/selftests/mock_gem_device.c
