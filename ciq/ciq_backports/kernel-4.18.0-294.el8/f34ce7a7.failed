@@ -1,0 +1,297 @@
+iommu: Add gfp parameter to io_pgtable_ops->map()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Baolin Wang <baolin.wang@linux.alibaba.com>
+commit f34ce7a7018c2f71d78fc7f512f6daf01e487114
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f34ce7a7.failed
+
+Now the ARM page tables are always allocated by GFP_ATOMIC parameter,
+but the iommu_ops->map() function has been added a gfp_t parameter by
+commit 781ca2de89ba ("iommu: Add gfp parameter to iommu_ops::map"),
+thus io_pgtable_ops->map() should use the gfp parameter passed from
+iommu_ops->map() to allocate page pages, which can avoid wasting the
+memory allocators atomic pools for some non-atomic contexts.
+
+	Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+	Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/3093df4cb95497aaf713fca623ce4ecebb197c2e.1591930156.git.baolin.wang@linux.alibaba.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit f34ce7a7018c2f71d78fc7f512f6daf01e487114)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/panfrost/panfrost_mmu.c
+#	drivers/iommu/mtk_iommu.c
+diff --cc drivers/iommu/mtk_iommu.c
+index 38aceac865e2,b7b16414a217..000000000000
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@@ -389,15 -390,14 +389,20 @@@ static int mtk_iommu_map(struct iommu_d
+  			 phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
+  {
+  	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
+ -	struct mtk_iommu_data *data = mtk_iommu_get_m4u_data();
+ +	unsigned long flags;
+ +	int ret;
+  
+ -	/* The "4GB mode" M4U physically can not use the lower remap of Dram. */
+ -	if (data->enable_4GB)
+ -		paddr |= BIT_ULL(32);
+ +	spin_lock_irqsave(&dom->pgtlock, flags);
+ +	ret = dom->iop->map(dom->iop, iova, paddr & DMA_BIT_MASK(32),
+ +			    size, prot);
+ +	spin_unlock_irqrestore(&dom->pgtlock, flags);
+  
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	/* Synchronize with the tlb_lock */
++ 	return dom->iop->map(dom->iop, iova, paddr, size, prot, gfp);
+++>>>>>>> f34ce7a7018c (iommu: Add gfp parameter to io_pgtable_ops->map())
+  }
+  
+  static size_t mtk_iommu_unmap(struct iommu_domain *domain,
+* Unmerged path drivers/gpu/drm/panfrost/panfrost_mmu.c
+* Unmerged path drivers/gpu/drm/panfrost/panfrost_mmu.c
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index c9ee0544240f..c6a1328e3f06 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -2459,7 +2459,7 @@ static int arm_smmu_map(struct iommu_domain *domain, unsigned long iova,
+ 	if (!ops)
+ 		return -ENODEV;
+ 
+-	return ops->map(ops, iova, paddr, size, prot);
++	return ops->map(ops, iova, paddr, size, prot, gfp);
+ }
+ 
+ static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
+diff --git a/drivers/iommu/arm-smmu.c b/drivers/iommu/arm-smmu.c
+index 9e5b4be0654e..3cc70845674f 100644
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@ -1380,7 +1380,7 @@ static int arm_smmu_map(struct iommu_domain *domain, unsigned long iova,
+ 		return -ENODEV;
+ 
+ 	arm_smmu_rpm_get(smmu);
+-	ret = ops->map(ops, iova, paddr, size, prot);
++	ret = ops->map(ops, iova, paddr, size, prot, gfp);
+ 	arm_smmu_rpm_put(smmu);
+ 
+ 	return ret;
+diff --git a/drivers/iommu/io-pgtable-arm-v7s.c b/drivers/iommu/io-pgtable-arm-v7s.c
+index c4cce9fb7cff..78319cee95e4 100644
+--- a/drivers/iommu/io-pgtable-arm-v7s.c
++++ b/drivers/iommu/io-pgtable-arm-v7s.c
+@@ -440,7 +440,7 @@ static arm_v7s_iopte arm_v7s_install_table(arm_v7s_iopte *table,
+ 
+ static int __arm_v7s_map(struct arm_v7s_io_pgtable *data, unsigned long iova,
+ 			 phys_addr_t paddr, size_t size, int prot,
+-			 int lvl, arm_v7s_iopte *ptep)
++			 int lvl, arm_v7s_iopte *ptep, gfp_t gfp)
+ {
+ 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+ 	arm_v7s_iopte pte, *cptep;
+@@ -461,7 +461,7 @@ static int __arm_v7s_map(struct arm_v7s_io_pgtable *data, unsigned long iova,
+ 	/* Grab a pointer to the next level */
+ 	pte = READ_ONCE(*ptep);
+ 	if (!pte) {
+-		cptep = __arm_v7s_alloc_table(lvl + 1, GFP_ATOMIC, data);
++		cptep = __arm_v7s_alloc_table(lvl + 1, gfp, data);
+ 		if (!cptep)
+ 			return -ENOMEM;
+ 
+@@ -482,11 +482,11 @@ static int __arm_v7s_map(struct arm_v7s_io_pgtable *data, unsigned long iova,
+ 	}
+ 
+ 	/* Rinse, repeat */
+-	return __arm_v7s_map(data, iova, paddr, size, prot, lvl + 1, cptep);
++	return __arm_v7s_map(data, iova, paddr, size, prot, lvl + 1, cptep, gfp);
+ }
+ 
+ static int arm_v7s_map(struct io_pgtable_ops *ops, unsigned long iova,
+-			phys_addr_t paddr, size_t size, int prot)
++			phys_addr_t paddr, size_t size, int prot, gfp_t gfp)
+ {
+ 	struct arm_v7s_io_pgtable *data = io_pgtable_ops_to_data(ops);
+ 	struct io_pgtable *iop = &data->iop;
+@@ -500,7 +500,7 @@ static int arm_v7s_map(struct io_pgtable_ops *ops, unsigned long iova,
+ 		    paddr >= (1ULL << data->iop.cfg.oas)))
+ 		return -ERANGE;
+ 
+-	ret = __arm_v7s_map(data, iova, paddr, size, prot, 1, data->pgd);
++	ret = __arm_v7s_map(data, iova, paddr, size, prot, 1, data->pgd, gfp);
+ 	/*
+ 	 * Synchronise all PTE updates for the new mapping before there's
+ 	 * a chance for anything to kick off a table walk for the new iova.
+@@ -890,12 +890,12 @@ static int __init arm_v7s_do_selftests(void)
+ 		if (ops->map(ops, iova, iova, size, IOMMU_READ |
+ 						    IOMMU_WRITE |
+ 						    IOMMU_NOEXEC |
+-						    IOMMU_CACHE))
++						    IOMMU_CACHE, GFP_KERNEL))
+ 			return __FAIL(ops);
+ 
+ 		/* Overlapping mappings */
+ 		if (!ops->map(ops, iova, iova + size, size,
+-			      IOMMU_READ | IOMMU_NOEXEC))
++			      IOMMU_READ | IOMMU_NOEXEC, GFP_KERNEL))
+ 			return __FAIL(ops);
+ 
+ 		if (ops->iova_to_phys(ops, iova + 42) != (iova + 42))
+@@ -914,7 +914,7 @@ static int __init arm_v7s_do_selftests(void)
+ 			return __FAIL(ops);
+ 
+ 		/* Remap of partial unmap */
+-		if (ops->map(ops, iova_start + size, size, size, IOMMU_READ))
++		if (ops->map(ops, iova_start + size, size, size, IOMMU_READ, GFP_KERNEL))
+ 			return __FAIL(ops);
+ 
+ 		if (ops->iova_to_phys(ops, iova_start + size + 42)
+@@ -935,7 +935,7 @@ static int __init arm_v7s_do_selftests(void)
+ 			return __FAIL(ops);
+ 
+ 		/* Remap full block */
+-		if (ops->map(ops, iova, iova, size, IOMMU_WRITE))
++		if (ops->map(ops, iova, iova, size, IOMMU_WRITE, GFP_KERNEL))
+ 			return __FAIL(ops);
+ 
+ 		if (ops->iova_to_phys(ops, iova + 42) != (iova + 42))
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index ef444b478704..fd0262bda776 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -383,7 +383,7 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
+ 
+ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
+ 			  phys_addr_t paddr, size_t size, arm_lpae_iopte prot,
+-			  int lvl, arm_lpae_iopte *ptep)
++			  int lvl, arm_lpae_iopte *ptep, gfp_t gfp)
+ {
+ 	arm_lpae_iopte *cptep, pte;
+ 	size_t block_size = ARM_LPAE_BLOCK_SIZE(lvl, data);
+@@ -404,7 +404,7 @@ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
+ 	/* Grab a pointer to the next level */
+ 	pte = READ_ONCE(*ptep);
+ 	if (!pte) {
+-		cptep = __arm_lpae_alloc_pages(tblsz, GFP_ATOMIC, cfg);
++		cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg);
+ 		if (!cptep)
+ 			return -ENOMEM;
+ 
+@@ -424,7 +424,7 @@ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
+ 	}
+ 
+ 	/* Rinse, repeat */
+-	return __arm_lpae_map(data, iova, paddr, size, prot, lvl + 1, cptep);
++	return __arm_lpae_map(data, iova, paddr, size, prot, lvl + 1, cptep, gfp);
+ }
+ 
+ static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
+@@ -475,7 +475,7 @@ static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
+ }
+ 
+ static int arm_lpae_map(struct io_pgtable_ops *ops, unsigned long iova,
+-			phys_addr_t paddr, size_t size, int iommu_prot)
++			phys_addr_t paddr, size_t size, int iommu_prot, gfp_t gfp)
+ {
+ 	struct arm_lpae_io_pgtable *data = io_pgtable_ops_to_data(ops);
+ 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+@@ -494,7 +494,7 @@ static int arm_lpae_map(struct io_pgtable_ops *ops, unsigned long iova,
+ 		return -ERANGE;
+ 
+ 	prot = arm_lpae_prot_to_pte(data, iommu_prot);
+-	ret = __arm_lpae_map(data, iova, paddr, size, prot, lvl, ptep);
++	ret = __arm_lpae_map(data, iova, paddr, size, prot, lvl, ptep, gfp);
+ 	/*
+ 	 * Synchronise all PTE updates for the new mapping before there's
+ 	 * a chance for anything to kick off a table walk for the new iova.
+@@ -1203,12 +1203,12 @@ static int __init arm_lpae_run_tests(struct io_pgtable_cfg *cfg)
+ 			if (ops->map(ops, iova, iova, size, IOMMU_READ |
+ 							    IOMMU_WRITE |
+ 							    IOMMU_NOEXEC |
+-							    IOMMU_CACHE))
++							    IOMMU_CACHE, GFP_KERNEL))
+ 				return __FAIL(ops, i);
+ 
+ 			/* Overlapping mappings */
+ 			if (!ops->map(ops, iova, iova + size, size,
+-				      IOMMU_READ | IOMMU_NOEXEC))
++				      IOMMU_READ | IOMMU_NOEXEC, GFP_KERNEL))
+ 				return __FAIL(ops, i);
+ 
+ 			if (ops->iova_to_phys(ops, iova + 42) != (iova + 42))
+@@ -1223,7 +1223,7 @@ static int __init arm_lpae_run_tests(struct io_pgtable_cfg *cfg)
+ 			return __FAIL(ops, i);
+ 
+ 		/* Remap of partial unmap */
+-		if (ops->map(ops, SZ_1G + size, size, size, IOMMU_READ))
++		if (ops->map(ops, SZ_1G + size, size, size, IOMMU_READ, GFP_KERNEL))
+ 			return __FAIL(ops, i);
+ 
+ 		if (ops->iova_to_phys(ops, SZ_1G + size + 42) != (size + 42))
+@@ -1241,7 +1241,7 @@ static int __init arm_lpae_run_tests(struct io_pgtable_cfg *cfg)
+ 				return __FAIL(ops, i);
+ 
+ 			/* Remap full block */
+-			if (ops->map(ops, iova, iova, size, IOMMU_WRITE))
++			if (ops->map(ops, iova, iova, size, IOMMU_WRITE, GFP_KERNEL))
+ 				return __FAIL(ops, i);
+ 
+ 			if (ops->iova_to_phys(ops, iova + 42) != (iova + 42))
+diff --git a/drivers/iommu/ipmmu-vmsa.c b/drivers/iommu/ipmmu-vmsa.c
+index 8ccab8ec763c..f139f0a2624a 100644
+--- a/drivers/iommu/ipmmu-vmsa.c
++++ b/drivers/iommu/ipmmu-vmsa.c
+@@ -708,7 +708,7 @@ static int ipmmu_map(struct iommu_domain *io_domain, unsigned long iova,
+ 	if (!domain)
+ 		return -ENODEV;
+ 
+-	return domain->iop->map(domain->iop, iova, paddr, size, prot);
++	return domain->iop->map(domain->iop, iova, paddr, size, prot, gfp);
+ }
+ 
+ static size_t ipmmu_unmap(struct iommu_domain *io_domain, unsigned long iova,
+diff --git a/drivers/iommu/msm_iommu.c b/drivers/iommu/msm_iommu.c
+index 306a90d2f5e4..bed8c95f5b2f 100644
+--- a/drivers/iommu/msm_iommu.c
++++ b/drivers/iommu/msm_iommu.c
+@@ -528,7 +528,7 @@ static int msm_iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 	int ret;
+ 
+ 	spin_lock_irqsave(&priv->pgtlock, flags);
+-	ret = priv->iop->map(priv->iop, iova, pa, len, prot);
++	ret = priv->iop->map(priv->iop, iova, pa, len, prot, GFP_ATOMIC);
+ 	spin_unlock_irqrestore(&priv->pgtlock, flags);
+ 
+ 	return ret;
+* Unmerged path drivers/iommu/mtk_iommu.c
+diff --git a/drivers/iommu/qcom_iommu.c b/drivers/iommu/qcom_iommu.c
+index 763f16e52d2a..387e12b10854 100644
+--- a/drivers/iommu/qcom_iommu.c
++++ b/drivers/iommu/qcom_iommu.c
+@@ -444,7 +444,7 @@ static int qcom_iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 		return -ENODEV;
+ 
+ 	spin_lock_irqsave(&qcom_domain->pgtbl_lock, flags);
+-	ret = ops->map(ops, iova, paddr, size, prot);
++	ret = ops->map(ops, iova, paddr, size, prot, GFP_ATOMIC);
+ 	spin_unlock_irqrestore(&qcom_domain->pgtbl_lock, flags);
+ 	return ret;
+ }
+diff --git a/include/linux/io-pgtable.h b/include/linux/io-pgtable.h
+index 6b1b8be3ebec..7e3e8db99937 100644
+--- a/include/linux/io-pgtable.h
++++ b/include/linux/io-pgtable.h
+@@ -137,7 +137,7 @@ struct io_pgtable_cfg {
+  */
+ struct io_pgtable_ops {
+ 	int (*map)(struct io_pgtable_ops *ops, unsigned long iova,
+-		   phys_addr_t paddr, size_t size, int prot);
++		   phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
+ 	size_t (*unmap)(struct io_pgtable_ops *ops, unsigned long iova,
+ 			size_t size, struct iommu_iotlb_gather *gather);
+ 	phys_addr_t (*iova_to_phys)(struct io_pgtable_ops *ops,
