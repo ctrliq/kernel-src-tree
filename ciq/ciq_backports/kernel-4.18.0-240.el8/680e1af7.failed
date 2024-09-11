@@ -1,0 +1,255 @@
+drm/i915: Add pre/post plane updates for SAGV
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+commit 680e1af713d92940e39a313a8592b13a6885a14c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/680e1af7.failed
+
+Lets have a unified way to handle SAGV changes,
+espoecially considering the upcoming Gen12 changes.
+
+Current "standard" way of doing this in commit_tail
+is pre/post plane updates, when everything which
+has to be forbidden and not supported in new config
+has to be restricted before update and relaxed after
+plane update.
+
+v2: - Removed unneeded returns(Ville)
+
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Signed-off-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200415143911.10244-5-stanislav.lisovskiy@intel.com
+(cherry picked from commit 680e1af713d92940e39a313a8592b13a6885a14c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display.c
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/display/intel_display.c
+index 5c8c11deb857,5d44f828b150..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@@ -13797,81 -15326,37 +13797,76 @@@ static void intel_atomic_commit_tail(st
+  	intel_wakeref_t wakeref = 0;
+  	int i;
+  
+ -	intel_atomic_commit_fence_wait(state);
+ +	intel_atomic_commit_fence_wait(intel_state);
+  
+ -	drm_atomic_helper_wait_for_dependencies(&state->base);
+ +	drm_atomic_helper_wait_for_dependencies(state);
+  
+ -	if (state->modeset)
+ +	if (intel_state->modeset)
+  		wakeref = intel_display_power_get(dev_priv, POWER_DOMAIN_MODESET);
+  
+ -	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
+ -					    new_crtc_state, i) {
+ +	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
+ +		old_intel_crtc_state = to_intel_crtc_state(old_crtc_state);
+ +		new_intel_crtc_state = to_intel_crtc_state(new_crtc_state);
+ +		intel_crtc = to_intel_crtc(crtc);
+ +
+  		if (needs_modeset(new_crtc_state) ||
+ -		    new_crtc_state->update_pipe) {
+ +		    to_intel_crtc_state(new_crtc_state)->update_pipe) {
+  
+ -			put_domains[crtc->pipe] =
+ -				modeset_get_crtc_power_domains(new_crtc_state);
+ +			put_domains[intel_crtc->pipe] =
+ +				modeset_get_crtc_power_domains(crtc,
+ +					new_intel_crtc_state);
+  		}
+ -	}
+  
+ -	intel_commit_modeset_disables(state);
+ +		if (!needs_modeset(new_crtc_state))
+ +			continue;
+ +
+ +		intel_pre_plane_update(old_intel_crtc_state, new_intel_crtc_state);
+  
+ -	/* FIXME: Eventually get rid of our crtc->config pointer */
+ -	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i)
+ -		crtc->config = new_crtc_state;
+ +		if (old_crtc_state->active) {
+ +			intel_crtc_disable_planes(intel_state, intel_crtc);
+  
+ -	if (state->modeset) {
+ -		drm_atomic_helper_update_legacy_modeset_state(dev, &state->base);
+ +			/*
+ +			 * We need to disable pipe CRC before disabling the pipe,
+ +			 * or we race against vblank off.
+ +			 */
+ +			intel_crtc_disable_pipe_crc(intel_crtc);
+ +
+ +			dev_priv->display.crtc_disable(old_intel_crtc_state, state);
+ +			intel_crtc->active = false;
+ +			intel_fbc_disable(intel_crtc);
+ +			intel_disable_shared_dpll(old_intel_crtc_state);
+ +
+ +			/*
+ +			 * Underruns don't always raise
+ +			 * interrupts, so check manually.
+ +			 */
+ +			intel_check_cpu_fifo_underruns(dev_priv);
+ +			intel_check_pch_fifo_underruns(dev_priv);
+ +
+ +			/* FIXME unify this for all platforms */
+ +			if (!new_crtc_state->active &&
+ +			    !HAS_GMCH(dev_priv) &&
+ +			    dev_priv->display.initial_watermarks)
+ +				dev_priv->display.initial_watermarks(intel_state,
+ +								     new_intel_crtc_state);
+ +		}
+ +	}
+ +
+ +	/* FIXME: Eventually get rid of our intel_crtc->config pointer */
+ +	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i)
+ +		to_intel_crtc(crtc)->config = to_intel_crtc_state(new_crtc_state);
+ +
+ +	if (intel_state->modeset) {
+ +		drm_atomic_helper_update_legacy_modeset_state(state->dev, state);
+  
+ -		intel_set_cdclk_pre_plane_update(state);
+ +		intel_set_cdclk_pre_plane_update(dev_priv,
+ +						 &intel_state->cdclk.actual,
+ +						 &dev_priv->cdclk.actual,
+ +						 intel_state->cdclk.pipe);
+  
+- 		/*
+- 		 * SKL workaround: bspec recommends we disable the SAGV when we
+- 		 * have more then one pipe enabled
+- 		 */
+- 		if (!intel_can_enable_sagv(state))
+- 			intel_disable_sagv(dev_priv);
++ 		intel_sagv_pre_plane_update(state);
+  
+ -		intel_modeset_verify_disabled(dev_priv, state);
+ +		intel_modeset_verify_disabled(dev, state);
+  	}
+  
+  	/* Complete the events for pipes that have now been disabled */
+@@@ -13942,15 -15447,19 +13937,23 @@@
+  		intel_modeset_verify_crtc(crtc, state, old_crtc_state, new_crtc_state);
+  	}
+  
+ -	/* Underruns don't always raise interrupts, so check manually */
+ -	intel_check_cpu_fifo_underruns(dev_priv);
+ -	intel_check_pch_fifo_underruns(dev_priv);
+ +	if (intel_state->modeset)
+ +		intel_verify_planes(intel_state);
+  
+++<<<<<<< HEAD
+ +	if (intel_state->modeset && intel_can_enable_sagv(state))
+ +		intel_enable_sagv(dev_priv);
+++=======
++ 	if (state->modeset) {
++ 		intel_verify_planes(state);
++ 
++ 		intel_sagv_post_plane_update(state);
++ 	}
+++>>>>>>> 680e1af713d9 (drm/i915: Add pre/post plane updates for SAGV)
+  
+ -	drm_atomic_helper_commit_hw_done(&state->base);
+ +	drm_atomic_helper_commit_hw_done(state);
+  
+ -	if (state->modeset) {
+ +	if (intel_state->modeset) {
+  		/* As one of the primary mmio accessors, KMS has a high
+  		 * likelihood of triggering bugs in unclaimed access. After we
+  		 * finish modesetting, see if an error has been flagged, and if
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 8862271193ca,d54833a1578f..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -3744,47 -3757,34 +3744,67 @@@ intel_disable_sagv(struct drm_i915_priv
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +bool intel_can_enable_sagv(struct drm_atomic_state *state)
+++=======
++ void intel_sagv_pre_plane_update(struct intel_atomic_state *state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++ 
++ 	if (!intel_can_enable_sagv(state))
++ 		intel_disable_sagv(dev_priv);
++ }
++ 
++ void intel_sagv_post_plane_update(struct intel_atomic_state *state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++ 
++ 	if (intel_can_enable_sagv(state))
++ 		intel_enable_sagv(dev_priv);
++ }
++ 
++ static bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
+++>>>>>>> 680e1af713d9 (drm/i915: Add pre/post plane updates for SAGV)
+  {
+ -	struct drm_device *dev = crtc_state->uapi.crtc->dev;
+ +	struct drm_device *dev = state->dev;
+  	struct drm_i915_private *dev_priv = to_i915(dev);
+ -	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ +	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+ +	struct intel_crtc *crtc;
+  	struct intel_plane *plane;
+ +	struct intel_crtc_state *cstate;
+ +	enum pipe pipe;
+  	int level, latency;
+ +	int sagv_block_time_us;
+ +
+ +	if (!intel_has_sagv(dev_priv))
+ +		return false;
+  
+ -	if (!crtc_state->hw.active)
+ +	if (IS_GEN(dev_priv, 9))
+ +		sagv_block_time_us = 30;
+ +	else if (IS_GEN(dev_priv, 10))
+ +		sagv_block_time_us = 20;
+ +	else
+ +		sagv_block_time_us = 10;
+ +
+ +	/*
+ +	 * If there are no active CRTCs, no additional checks need be performed
+ +	 */
+ +	if (hweight32(intel_state->active_crtcs) == 0)
+  		return true;
+  
+ -	if (crtc_state->hw.adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE)
+ +	/*
+ +	 * SKL+ workaround: bspec recommends we disable SAGV when we have
+ +	 * more then one pipe enabled
+ +	 */
+ +	if (hweight32(intel_state->active_crtcs) > 1)
+ +		return false;
+ +
+ +	/* Since we're now guaranteed to only have one active CRTC... */
+ +	pipe = ffs(intel_state->active_crtcs) - 1;
+ +	crtc = intel_get_crtc_for_pipe(dev_priv, pipe);
+ +	cstate = to_intel_crtc_state(crtc->base.state);
+ +
+ +	if (crtc->base.state->adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE)
+  		return false;
+  
+  	for_each_intel_plane_on_crtc(dev, crtc, plane) {
+* Unmerged path drivers/gpu/drm/i915/display/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
+diff --git a/drivers/gpu/drm/i915/intel_pm.h b/drivers/gpu/drm/i915/intel_pm.h
+index 4ccb5a53b61c..87859a8e8e58 100644
+--- a/drivers/gpu/drm/i915/intel_pm.h
++++ b/drivers/gpu/drm/i915/intel_pm.h
+@@ -58,6 +58,8 @@ void vlv_wm_sanitize(struct drm_i915_private *dev_priv);
+ bool intel_can_enable_sagv(struct drm_atomic_state *state);
+ int intel_enable_sagv(struct drm_i915_private *dev_priv);
+ int intel_disable_sagv(struct drm_i915_private *dev_priv);
++void intel_sagv_pre_plane_update(struct intel_atomic_state *state);
++void intel_sagv_post_plane_update(struct intel_atomic_state *state);
+ bool skl_wm_level_equals(const struct skl_wm_level *l1,
+ 			 const struct skl_wm_level *l2);
+ bool skl_ddb_allocation_overlaps(const struct skl_ddb_entry *ddb,
