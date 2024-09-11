@@ -1,0 +1,187 @@
+mt76: add support for 802.3 rx frames
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit e195dad1411594809cb955c96a7a514bcc4ad638
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/e195dad1.failed
+
+Do not try to access the header when receiving them
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit e195dad1411594809cb955c96a7a514bcc4ad638)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mac80211.c
+diff --cc drivers/net/wireless/mediatek/mt76/mac80211.c
+index 29af1c0cb76f,f9381bd96244..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mac80211.c
++++ b/drivers/net/wireless/mediatek/mt76/mac80211.c
+@@@ -841,7 -832,12 +842,16 @@@ mt76_airtime_check(struct mt76_dev *dev
+  		return;
+  
+  	if (!wcid || !wcid->sta) {
+++<<<<<<< HEAD
+ +		if (!ether_addr_equal(hdr->addr1, dev->macaddr))
+++=======
++ 		struct ieee80211_hdr *hdr = mt76_skb_get_hdr(skb);
++ 
++ 		if (status->flag & RX_FLAG_8023)
++ 			return;
++ 
++ 		if (!ether_addr_equal(hdr->addr1, dev->phy.macaddr))
+++>>>>>>> e195dad14115 (mt76: add support for 802.3 rx frames)
+  			return;
+  
+  		wcid = NULL;
+diff --git a/drivers/net/wireless/mediatek/mt76/agg-rx.c b/drivers/net/wireless/mediatek/mt76/agg-rx.c
+index df25c00d9e06..144e8a8910ba 100644
+--- a/drivers/net/wireless/mediatek/mt76/agg-rx.c
++++ b/drivers/net/wireless/mediatek/mt76/agg-rx.c
+@@ -122,6 +122,7 @@ mt76_rx_aggr_check_ctl(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	struct ieee80211_bar *bar = mt76_skb_get_hdr(skb);
+ 	struct mt76_wcid *wcid = status->wcid;
+ 	struct mt76_rx_tid *tid;
++	u8 tidno = status->qos_ctl & IEEE80211_QOS_CTL_TID_MASK;
+ 	u16 seqno;
+ 
+ 	if (!ieee80211_is_ctl(bar->frame_control))
+@@ -130,9 +131,9 @@ mt76_rx_aggr_check_ctl(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	if (!ieee80211_is_back_req(bar->frame_control))
+ 		return;
+ 
+-	status->tid = le16_to_cpu(bar->control) >> 12;
++	status->qos_ctl = tidno = le16_to_cpu(bar->control) >> 12;
+ 	seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(bar->start_seq_num));
+-	tid = rcu_dereference(wcid->aggr[status->tid]);
++	tid = rcu_dereference(wcid->aggr[tidno]);
+ 	if (!tid)
+ 		return;
+ 
+@@ -147,12 +148,12 @@ mt76_rx_aggr_check_ctl(struct sk_buff *skb, struct sk_buff_head *frames)
+ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+-	struct ieee80211_hdr *hdr = mt76_skb_get_hdr(skb);
+ 	struct mt76_wcid *wcid = status->wcid;
+ 	struct ieee80211_sta *sta;
+ 	struct mt76_rx_tid *tid;
+ 	bool sn_less;
+ 	u16 seqno, head, size, idx;
++	u8 tidno = status->qos_ctl & IEEE80211_QOS_CTL_TID_MASK;
+ 	u8 ackp;
+ 
+ 	__skb_queue_tail(frames, skb);
+@@ -161,18 +162,18 @@ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	if (!sta)
+ 		return;
+ 
+-	if (!status->aggr) {
++	if (!status->aggr && !(status->flag & RX_FLAG_8023)) {
+ 		mt76_rx_aggr_check_ctl(skb, frames);
+ 		return;
+ 	}
+ 
+ 	/* not part of a BA session */
+-	ackp = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_ACK_POLICY_MASK;
++	ackp = status->qos_ctl & IEEE80211_QOS_CTL_ACK_POLICY_MASK;
+ 	if (ackp != IEEE80211_QOS_CTL_ACK_POLICY_BLOCKACK &&
+ 	    ackp != IEEE80211_QOS_CTL_ACK_POLICY_NORMAL)
+ 		return;
+ 
+-	tid = rcu_dereference(wcid->aggr[status->tid]);
++	tid = rcu_dereference(wcid->aggr[tidno]);
+ 	if (!tid)
+ 		return;
+ 
+* Unmerged path drivers/net/wireless/mediatek/mt76/mac80211.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76.h b/drivers/net/wireless/mediatek/mt76/mt76.h
+index e5947573fe0b..202ce694612e 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76.h
++++ b/drivers/net/wireless/mediatek/mt76/mt76.h
+@@ -494,7 +494,7 @@ struct mt76_rx_status {
+ 
+ 	u8 ext_phy:1;
+ 	u8 aggr:1;
+-	u8 tid;
++	u8 qos_ctl;
+ 	u16 seqno;
+ 
+ 	u16 freq;
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7603/mac.c b/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+index d0066e98a766..fd2605d92838 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+@@ -651,7 +651,7 @@ mt7603_mac_fill_rx(struct mt7603_dev *dev, struct sk_buff *skb)
+ 
+ 	status->aggr = unicast &&
+ 		       !ieee80211_is_qos_nullfunc(hdr->frame_control);
+-	status->tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
++	status->qos_ctl = *ieee80211_get_qos_ctl(hdr);
+ 	status->seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
+ 
+ 	return 0;
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mac.c b/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+index 433d4c941a48..033231606cf2 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+@@ -456,7 +456,7 @@ static int mt7615_mac_fill_rx(struct mt7615_dev *dev, struct sk_buff *skb)
+ 
+ 	status->aggr = unicast &&
+ 		       !ieee80211_is_qos_nullfunc(hdr->frame_control);
+-	status->tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
++	status->qos_ctl = *ieee80211_get_qos_ctl(hdr);
+ 	status->seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
+ 
+ 	return 0;
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76x02_mac.c b/drivers/net/wireless/mediatek/mt76/mt76x02_mac.c
+index da6d3f51f6d4..9c68cfda0efb 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76x02_mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt76x02_mac.c
+@@ -770,6 +770,7 @@ int mt76x02_mac_process_rx(struct mt76x02_dev *dev, struct sk_buff *skb,
+ 			   void *rxi)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++	struct ieee80211_hdr *hdr;
+ 	struct mt76x02_rxwi *rxwi = rxi;
+ 	struct mt76x02_sta *sta;
+ 	u32 rxinfo = le32_to_cpu(rxwi->rxinfo);
+@@ -864,7 +865,8 @@ int mt76x02_mac_process_rx(struct mt76x02_dev *dev, struct sk_buff *skb,
+ 	status->freq = dev->mphy.chandef.chan->center_freq;
+ 	status->band = dev->mphy.chandef.chan->band;
+ 
+-	status->tid = FIELD_GET(MT_RXWI_TID, tid_sn);
++	hdr = (struct ieee80211_hdr *)skb->data;
++	status->qos_ctl = *ieee80211_get_qos_ctl(hdr);
+ 	status->seqno = FIELD_GET(MT_RXWI_SN, tid_sn);
+ 
+ 	return mt76x02_mac_process_rate(dev, status, rate);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7915/mac.c b/drivers/net/wireless/mediatek/mt76/mt7915/mac.c
+index 75cc60fe135a..c4cb69137fbf 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/mac.c
+@@ -556,7 +556,7 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
+ 
+ 	status->aggr = unicast &&
+ 		       !ieee80211_is_qos_nullfunc(hdr->frame_control);
+-	status->tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
++	status->qos_ctl = *ieee80211_get_qos_ctl(hdr);
+ 	status->seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
+ 
+ 	return 0;
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/mac.c b/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+index 968894cfc98b..320fe1d6fb8d 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+@@ -528,7 +528,7 @@ int mt7921_mac_fill_rx(struct mt7921_dev *dev, struct sk_buff *skb)
+ 
+ 	status->aggr = unicast &&
+ 		       !ieee80211_is_qos_nullfunc(hdr->frame_control);
+-	status->tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
++	status->qos_ctl = *ieee80211_get_qos_ctl(hdr);
+ 	status->seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
+ 
+ 	return 0;
