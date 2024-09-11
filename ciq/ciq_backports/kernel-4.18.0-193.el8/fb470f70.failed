@@ -1,0 +1,365 @@
+net: phy: aquantia: add hwmon support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] phy: aquantia: add hwmon support (Petr Oros) [1772010]
+Rebuild_FUZZ: 92.75%
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit fb470f70fea71a0e0adf3e69d1971db6b2119e3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/fb470f70.failed
+
+This adds HWMON support for the temperature sensor and the related
+alarms on the 107/108/109 chips. This patch is based on work from
+Nikita and Andrew. I added:
+- support for changing alarm thresholds via sysfs
+- move HWMON code to a separate source file to improve maintainability
+- smaller changes like using IS_REACHABLE instead of ifdef
+  (avoids problems if PHY driver is built in and HWMON is a module)
+
+v2:
+- remove struct aqr_priv
+- rename header file to aquantia.h
+v3:
+- add conditional compiling of aquantia_hwmon.c
+- improve converting sensor register values to/from long
+- add helper aqr_hwmon_test_bit
+
+	Signed-off-by: Nikita Yushchenko <nikita.yoush@cogentembedded.com>
+	Signed-off-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fb470f70fea71a0e0adf3e69d1971db6b2119e3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/aquantia_main.c
+diff --cc drivers/net/phy/aquantia_main.c
+index ce43883caa6d,37218e5d7cc9..000000000000
+--- a/drivers/net/phy/aquantia_main.c
++++ b/drivers/net/phy/aquantia_main.c
+@@@ -224,9 -231,9 +226,14 @@@ static struct phy_driver aqr_driver[] 
+  {
+  	PHY_ID_MATCH_MODEL(PHY_ID_AQR107),
+  	.name		= "Aquantia AQR107",
+ +	.features	= PHY_10GBIT_FULL_FEATURES,
+ +	.flags		= PHY_HAS_INTERRUPT,
+  	.aneg_done	= genphy_c45_aneg_done,
+++<<<<<<< HEAD
+++=======
++ 	.get_features	= genphy_c45_pma_read_abilities,
++ 	.probe		= aqr_hwmon_probe,
+++>>>>>>> fb470f70fea7 (net: phy: aquantia: add hwmon support)
+  	.config_aneg    = aqr_config_aneg,
+  	.config_intr	= aqr_config_intr,
+  	.ack_interrupt	= aqr_ack_interrupt,
+@@@ -235,8 -242,10 +242,14 @@@
+  {
+  	PHY_ID_MATCH_MODEL(PHY_ID_AQCS109),
+  	.name		= "Aquantia AQCS109",
+ +	.features	= PHY_10GBIT_FULL_FEATURES,
+  	.aneg_done	= genphy_c45_aneg_done,
+++<<<<<<< HEAD
+++=======
++ 	.get_features	= genphy_c45_pma_read_abilities,
++ 	.probe		= aqr_hwmon_probe,
++ 	.config_init	= aqcs109_config_init,
+++>>>>>>> fb470f70fea7 (net: phy: aquantia: add hwmon support)
+  	.config_aneg    = aqr_config_aneg,
+  	.config_intr	= aqr_config_intr,
+  	.ack_interrupt	= aqr_ack_interrupt,
+diff --git a/drivers/net/phy/Makefile b/drivers/net/phy/Makefile
+index 888daece5577..ece5dae67174 100644
+--- a/drivers/net/phy/Makefile
++++ b/drivers/net/phy/Makefile
+@@ -47,6 +47,9 @@ obj-y				+= $(sfp-obj-y) $(sfp-obj-m)
+ 
+ obj-$(CONFIG_AMD_PHY)		+= amd.o
+ aquantia-objs			+= aquantia_main.o
++ifdef CONFIG_HWMON
++aquantia-objs			+= aquantia_hwmon.o
++endif
+ obj-$(CONFIG_AQUANTIA_PHY)	+= aquantia.o
+ obj-$(CONFIG_ASIX_PHY)		+= asix.o
+ obj-$(CONFIG_AT803X_PHY)	+= at803x.o
+diff --git a/drivers/net/phy/aquantia.h b/drivers/net/phy/aquantia.h
+new file mode 100644
+index 000000000000..5a16caab7b2f
+--- /dev/null
++++ b/drivers/net/phy/aquantia.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * HWMON driver for Aquantia PHY
++ *
++ * Author: Nikita Yushchenko <nikita.yoush@cogentembedded.com>
++ * Author: Andrew Lunn <andrew@lunn.ch>
++ * Author: Heiner Kallweit <hkallweit1@gmail.com>
++ */
++
++#include <linux/device.h>
++#include <linux/phy.h>
++
++#if IS_REACHABLE(CONFIG_HWMON)
++int aqr_hwmon_probe(struct phy_device *phydev);
++#else
++static inline int aqr_hwmon_probe(struct phy_device *phydev) { return 0; }
++#endif
+diff --git a/drivers/net/phy/aquantia_hwmon.c b/drivers/net/phy/aquantia_hwmon.c
+new file mode 100644
+index 000000000000..19c4c280a6cd
+--- /dev/null
++++ b/drivers/net/phy/aquantia_hwmon.c
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: GPL-2.0
++/* HWMON driver for Aquantia PHY
++ *
++ * Author: Nikita Yushchenko <nikita.yoush@cogentembedded.com>
++ * Author: Andrew Lunn <andrew@lunn.ch>
++ * Author: Heiner Kallweit <hkallweit1@gmail.com>
++ */
++
++#include <linux/phy.h>
++#include <linux/device.h>
++#include <linux/ctype.h>
++#include <linux/hwmon.h>
++
++#include "aquantia.h"
++
++/* Vendor specific 1, MDIO_MMD_VEND2 */
++#define VEND1_THERMAL_PROV_HIGH_TEMP_FAIL	0xc421
++#define VEND1_THERMAL_PROV_LOW_TEMP_FAIL	0xc422
++#define VEND1_THERMAL_PROV_HIGH_TEMP_WARN	0xc423
++#define VEND1_THERMAL_PROV_LOW_TEMP_WARN	0xc424
++#define VEND1_THERMAL_STAT1			0xc820
++#define VEND1_THERMAL_STAT2			0xc821
++#define VEND1_THERMAL_STAT2_VALID		BIT(0)
++#define VEND1_GENERAL_STAT1			0xc830
++#define VEND1_GENERAL_STAT1_HIGH_TEMP_FAIL	BIT(14)
++#define VEND1_GENERAL_STAT1_LOW_TEMP_FAIL	BIT(13)
++#define VEND1_GENERAL_STAT1_HIGH_TEMP_WARN	BIT(12)
++#define VEND1_GENERAL_STAT1_LOW_TEMP_WARN	BIT(11)
++
++#if IS_REACHABLE(CONFIG_HWMON)
++
++static umode_t aqr_hwmon_is_visible(const void *data,
++				    enum hwmon_sensor_types type,
++				    u32 attr, int channel)
++{
++	if (type != hwmon_temp)
++		return 0;
++
++	switch (attr) {
++	case hwmon_temp_input:
++	case hwmon_temp_min_alarm:
++	case hwmon_temp_max_alarm:
++	case hwmon_temp_lcrit_alarm:
++	case hwmon_temp_crit_alarm:
++		return 0444;
++	case hwmon_temp_min:
++	case hwmon_temp_max:
++	case hwmon_temp_lcrit:
++	case hwmon_temp_crit:
++		return 0644;
++	default:
++		return 0;
++	}
++}
++
++static int aqr_hwmon_get(struct phy_device *phydev, int reg, long *value)
++{
++	int temp = phy_read_mmd(phydev, MDIO_MMD_VEND1, reg);
++
++	if (temp < 0)
++		return temp;
++
++	/* 16 bit value is 2's complement with LSB = 1/256th degree Celsius */
++	*value = (s16)temp * 1000 / 256;
++
++	return 0;
++}
++
++static int aqr_hwmon_set(struct phy_device *phydev, int reg, long value)
++{
++	int temp;
++
++	if (value >= 128000 || value < -128000)
++		return -ERANGE;
++
++	temp = value * 256 / 1000;
++
++	/* temp is in s16 range and we're interested in lower 16 bits only */
++	return phy_write_mmd(phydev, MDIO_MMD_VEND1, reg, (u16)temp);
++}
++
++static int aqr_hwmon_test_bit(struct phy_device *phydev, int reg, int bit)
++{
++	int val = phy_read_mmd(phydev, MDIO_MMD_VEND1, reg);
++
++	if (val < 0)
++		return val;
++
++	return !!(val & bit);
++}
++
++static int aqr_hwmon_status1(struct phy_device *phydev, int bit, long *value)
++{
++	int val = aqr_hwmon_test_bit(phydev, VEND1_GENERAL_STAT1, bit);
++
++	if (val < 0)
++		return val;
++
++	*value = val;
++
++	return 0;
++}
++
++static int aqr_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
++			  u32 attr, int channel, long *value)
++{
++	struct phy_device *phydev = dev_get_drvdata(dev);
++	int reg;
++
++	if (type != hwmon_temp)
++		return -EOPNOTSUPP;
++
++	switch (attr) {
++	case hwmon_temp_input:
++		reg = aqr_hwmon_test_bit(phydev, VEND1_THERMAL_STAT2,
++					 VEND1_THERMAL_STAT2_VALID);
++		if (reg < 0)
++			return reg;
++		if (!reg)
++			return -EBUSY;
++
++		return aqr_hwmon_get(phydev, VEND1_THERMAL_STAT1, value);
++
++	case hwmon_temp_lcrit:
++		return aqr_hwmon_get(phydev, VEND1_THERMAL_PROV_LOW_TEMP_FAIL,
++				     value);
++	case hwmon_temp_min:
++		return aqr_hwmon_get(phydev, VEND1_THERMAL_PROV_LOW_TEMP_WARN,
++				     value);
++	case hwmon_temp_max:
++		return aqr_hwmon_get(phydev, VEND1_THERMAL_PROV_HIGH_TEMP_WARN,
++				     value);
++	case hwmon_temp_crit:
++		return aqr_hwmon_get(phydev, VEND1_THERMAL_PROV_HIGH_TEMP_FAIL,
++				     value);
++	case hwmon_temp_lcrit_alarm:
++		return aqr_hwmon_status1(phydev,
++					 VEND1_GENERAL_STAT1_LOW_TEMP_FAIL,
++					 value);
++	case hwmon_temp_min_alarm:
++		return aqr_hwmon_status1(phydev,
++					 VEND1_GENERAL_STAT1_LOW_TEMP_WARN,
++					 value);
++	case hwmon_temp_max_alarm:
++		return aqr_hwmon_status1(phydev,
++					 VEND1_GENERAL_STAT1_HIGH_TEMP_WARN,
++					 value);
++	case hwmon_temp_crit_alarm:
++		return aqr_hwmon_status1(phydev,
++					 VEND1_GENERAL_STAT1_HIGH_TEMP_FAIL,
++					 value);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int aqr_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
++			   u32 attr, int channel, long value)
++{
++	struct phy_device *phydev = dev_get_drvdata(dev);
++
++	if (type != hwmon_temp)
++		return -EOPNOTSUPP;
++
++	switch (attr) {
++	case hwmon_temp_lcrit:
++		return aqr_hwmon_set(phydev, VEND1_THERMAL_PROV_LOW_TEMP_FAIL,
++				     value);
++	case hwmon_temp_min:
++		return aqr_hwmon_set(phydev, VEND1_THERMAL_PROV_LOW_TEMP_WARN,
++				     value);
++	case hwmon_temp_max:
++		return aqr_hwmon_set(phydev, VEND1_THERMAL_PROV_HIGH_TEMP_WARN,
++				     value);
++	case hwmon_temp_crit:
++		return aqr_hwmon_set(phydev, VEND1_THERMAL_PROV_HIGH_TEMP_FAIL,
++				     value);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static const struct hwmon_ops aqr_hwmon_ops = {
++	.is_visible = aqr_hwmon_is_visible,
++	.read = aqr_hwmon_read,
++	.write = aqr_hwmon_write,
++};
++
++static u32 aqr_hwmon_chip_config[] = {
++	HWMON_C_REGISTER_TZ,
++	0,
++};
++
++static const struct hwmon_channel_info aqr_hwmon_chip = {
++	.type = hwmon_chip,
++	.config = aqr_hwmon_chip_config,
++};
++
++static u32 aqr_hwmon_temp_config[] = {
++	HWMON_T_INPUT |
++	HWMON_T_MAX | HWMON_T_MIN |
++	HWMON_T_MAX_ALARM | HWMON_T_MIN_ALARM |
++	HWMON_T_CRIT | HWMON_T_LCRIT |
++	HWMON_T_CRIT_ALARM | HWMON_T_LCRIT_ALARM,
++	0,
++};
++
++static const struct hwmon_channel_info aqr_hwmon_temp = {
++	.type = hwmon_temp,
++	.config = aqr_hwmon_temp_config,
++};
++
++static const struct hwmon_channel_info *aqr_hwmon_info[] = {
++	&aqr_hwmon_chip,
++	&aqr_hwmon_temp,
++	NULL,
++};
++
++static const struct hwmon_chip_info aqr_hwmon_chip_info = {
++	.ops = &aqr_hwmon_ops,
++	.info = aqr_hwmon_info,
++};
++
++int aqr_hwmon_probe(struct phy_device *phydev)
++{
++	struct device *dev = &phydev->mdio.dev;
++	struct device *hwmon_dev;
++	char *hwmon_name;
++	int i, j;
++
++	hwmon_name = devm_kstrdup(dev, dev_name(dev), GFP_KERNEL);
++	if (!hwmon_name)
++		return -ENOMEM;
++
++	for (i = j = 0; hwmon_name[i]; i++) {
++		if (isalnum(hwmon_name[i])) {
++			if (i != j)
++				hwmon_name[j] = hwmon_name[i];
++			j++;
++		}
++	}
++	hwmon_name[j] = '\0';
++
++	hwmon_dev = devm_hwmon_device_register_with_info(dev, hwmon_name,
++					phydev, &aqr_hwmon_chip_info, NULL);
++
++	return PTR_ERR_OR_ZERO(hwmon_dev);
++}
++
++#endif
+* Unmerged path drivers/net/phy/aquantia_main.c
