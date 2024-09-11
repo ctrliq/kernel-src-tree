@@ -1032,7 +1032,7 @@ srcu_unlock:
 	return ret ? ret : npages;
 }
 
-/**
+/*
  * Parse a series of data segments for page fault handling.
  *
  * @dev:  Pointer to mlx5 IB device
