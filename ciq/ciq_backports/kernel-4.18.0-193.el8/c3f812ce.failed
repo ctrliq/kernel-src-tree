@@ -1,0 +1,604 @@
+page_pool: do not release pool until inflight == 0.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] page_pool: do not release pool until inflight == 0 (Jiri Benc) [1802507]
+Rebuild_FUZZ: 99.01%
+commit-author Jonathan Lemon <jonathan.lemon@gmail.com>
+commit c3f812cea0d7006469d1cf33a4a9f0a12bb4b3a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c3f812ce.failed
+
+The page pool keeps track of the number of pages in flight, and
+it isn't safe to remove the pool until all pages are returned.
+
+Disallow removing the pool until all pages are back, so the pool
+is always available for page producers.
+
+Make the page pool responsible for its own delayed destruction
+instead of relying on XDP, so the page pool can be used without
+the xdp memory model.
+
+When all pages are returned, free the pool and notify xdp if the
+pool is registered with the xdp memory system.  Have the callback
+perform a table walk since some drivers (cpsw) may share the pool
+among multiple xdp_rxq_info.
+
+Note that the increment of pages_state_release_cnt may result in
+inflight == 0, resulting in the pool being released.
+
+Fixes: d956a048cd3f ("xdp: force mem allocator removal and periodic warning")
+	Signed-off-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c3f812cea0d7006469d1cf33a4a9f0a12bb4b3a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+#	include/net/page_pool.h
+#	include/net/xdp_priv.h
+#	include/trace/events/xdp.h
+#	net/core/page_pool.c
+#	net/core/xdp.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 4e858f3b0119,8cc4cd0cc515..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -1454,8 -1502,9 +1454,14 @@@ static void free_dma_rx_desc_resources(
+  					  sizeof(struct dma_extended_desc),
+  					  rx_q->dma_erx, rx_q->dma_rx_phy);
+  
+++<<<<<<< HEAD
+ +		kfree(rx_q->rx_skbuff_dma);
+ +		kfree(rx_q->rx_skbuff);
+++=======
++ 		kfree(rx_q->buf_pool);
++ 		if (rx_q->page_pool)
++ 			page_pool_destroy(rx_q->page_pool);
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  	}
+  }
+  
+diff --cc include/net/page_pool.h
+index b373b65dd450,1121faa99c12..000000000000
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@@ -66,9 -68,15 +66,19 @@@ struct page_pool_params 
+  };
+  
+  struct page_pool {
+ +	struct rcu_head rcu;
+  	struct page_pool_params p;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct delayed_work release_dw;
++ 	void (*disconnect)(void *);
++ 	unsigned long defer_start;
++ 	unsigned long defer_warn;
++ 
++ 	u32 pages_state_hold_cnt;
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  	/*
+  	 * Data structure for allocation side
+  	 *
+@@@ -118,20 -134,20 +128,37 @@@ inline enum dma_data_direction page_poo
+  
+  struct page_pool *page_pool_create(const struct page_pool_params *params);
+  
+++<<<<<<< HEAD
+ +void page_pool_destroy(struct page_pool *pool);
+ +void page_pool_unmap_page(struct page_pool *pool, struct page *page);
+ +
+ +void __page_pool_free(struct page_pool *pool);
+ +static inline void page_pool_free(struct page_pool *pool)
+ +{
+ +	/* When page_pool isn't compiled-in, net/core/xdp.c doesn't
+ +	 * allow registering MEM_TYPE_PAGE_POOL, but shield linker.
+ +	 */
+ +#ifdef CONFIG_PAGE_POOL
+ +	__page_pool_free(pool);
+ +#endif
+ +}
+ +
+++=======
++ #ifdef CONFIG_PAGE_POOL
++ void page_pool_destroy(struct page_pool *pool);
++ void page_pool_use_xdp_mem(struct page_pool *pool, void (*disconnect)(void *));
++ #else
++ static inline void page_pool_destroy(struct page_pool *pool)
++ {
++ }
++ 
++ static inline void page_pool_use_xdp_mem(struct page_pool *pool,
++ 					 void (*disconnect)(void *))
++ {
++ }
++ #endif
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  /* Never call this directly, use helpers below */
+  void __page_pool_put_page(struct page_pool *pool,
+  			  struct page *page, bool allow_direct);
+@@@ -153,6 -169,20 +180,23 @@@ static inline void page_pool_recycle_di
+  	__page_pool_put_page(pool, page, true);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Disconnects a page (from a page_pool).  API users can have a need
++  * to disconnect a page (from a page_pool), to allow it to be used as
++  * a regular page (that will eventually be returned to the normal
++  * page-allocator via put_page).
++  */
++ void page_pool_unmap_page(struct page_pool *pool, struct page *page);
++ static inline void page_pool_release_page(struct page_pool *pool,
++ 					  struct page *page)
++ {
++ #ifdef CONFIG_PAGE_POOL
++ 	page_pool_unmap_page(pool, page);
++ #endif
++ }
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  static inline dma_addr_t page_pool_get_dma_addr(struct page *page)
+  {
+  	return page->dma_addr;
+@@@ -167,4 -197,9 +211,12 @@@ static inline bool is_page_pool_compile
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool page_pool_put(struct page_pool *pool)
++ {
++ 	return refcount_dec_and_test(&pool->user_cnt);
++ }
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  #endif /* _NET_PAGE_POOL_H */
+diff --cc include/trace/events/xdp.h
+index b28f6a2958d5,a7378bcd9928..000000000000
+--- a/include/trace/events/xdp.h
++++ b/include/trace/events/xdp.h
+@@@ -297,6 -298,110 +297,113 @@@ TRACE_EVENT(xdp_devmap_xmit
+  		  __entry->from_ifindex, __entry->to_ifindex, __entry->err)
+  );
+  
+++<<<<<<< HEAD
+++=======
++ /* Expect users already include <net/xdp.h>, but not xdp_priv.h */
++ #include <net/xdp_priv.h>
++ 
++ #define __MEM_TYPE_MAP(FN)	\
++ 	FN(PAGE_SHARED)		\
++ 	FN(PAGE_ORDER0)		\
++ 	FN(PAGE_POOL)		\
++ 	FN(ZERO_COPY)
++ 
++ #define __MEM_TYPE_TP_FN(x)	\
++ 	TRACE_DEFINE_ENUM(MEM_TYPE_##x);
++ #define __MEM_TYPE_SYM_FN(x)	\
++ 	{ MEM_TYPE_##x, #x },
++ #define __MEM_TYPE_SYM_TAB	\
++ 	__MEM_TYPE_MAP(__MEM_TYPE_SYM_FN) { -1, 0 }
++ __MEM_TYPE_MAP(__MEM_TYPE_TP_FN)
++ 
++ TRACE_EVENT(mem_disconnect,
++ 
++ 	TP_PROTO(const struct xdp_mem_allocator *xa),
++ 
++ 	TP_ARGS(xa),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(const struct xdp_mem_allocator *,	xa)
++ 		__field(u32,		mem_id)
++ 		__field(u32,		mem_type)
++ 		__field(const void *,	allocator)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->xa		= xa;
++ 		__entry->mem_id		= xa->mem.id;
++ 		__entry->mem_type	= xa->mem.type;
++ 		__entry->allocator	= xa->allocator;
++ 	),
++ 
++ 	TP_printk("mem_id=%d mem_type=%s allocator=%p",
++ 		  __entry->mem_id,
++ 		  __print_symbolic(__entry->mem_type, __MEM_TYPE_SYM_TAB),
++ 		  __entry->allocator
++ 	)
++ );
++ 
++ TRACE_EVENT(mem_connect,
++ 
++ 	TP_PROTO(const struct xdp_mem_allocator *xa,
++ 		 const struct xdp_rxq_info *rxq),
++ 
++ 	TP_ARGS(xa, rxq),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(const struct xdp_mem_allocator *,	xa)
++ 		__field(u32,		mem_id)
++ 		__field(u32,		mem_type)
++ 		__field(const void *,	allocator)
++ 		__field(const struct xdp_rxq_info *,		rxq)
++ 		__field(int,		ifindex)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->xa		= xa;
++ 		__entry->mem_id		= xa->mem.id;
++ 		__entry->mem_type	= xa->mem.type;
++ 		__entry->allocator	= xa->allocator;
++ 		__entry->rxq		= rxq;
++ 		__entry->ifindex	= rxq->dev->ifindex;
++ 	),
++ 
++ 	TP_printk("mem_id=%d mem_type=%s allocator=%p"
++ 		  " ifindex=%d",
++ 		  __entry->mem_id,
++ 		  __print_symbolic(__entry->mem_type, __MEM_TYPE_SYM_TAB),
++ 		  __entry->allocator,
++ 		  __entry->ifindex
++ 	)
++ );
++ 
++ TRACE_EVENT(mem_return_failed,
++ 
++ 	TP_PROTO(const struct xdp_mem_info *mem,
++ 		 const struct page *page),
++ 
++ 	TP_ARGS(mem, page),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(const struct page *,	page)
++ 		__field(u32,		mem_id)
++ 		__field(u32,		mem_type)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->page		= page;
++ 		__entry->mem_id		= mem->id;
++ 		__entry->mem_type	= mem->type;
++ 	),
++ 
++ 	TP_printk("mem_id=%d mem_type=%s page=%p",
++ 		  __entry->mem_id,
++ 		  __print_symbolic(__entry->mem_type, __MEM_TYPE_SYM_TAB),
++ 		  __entry->page
++ 	)
++ );
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  #endif /* _TRACE_XDP_H */
+  
+  #include <trace/define_trace.h>
+diff --cc net/core/page_pool.c
+index 41391b5dc14c,dfc2501c35d9..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -14,6 -16,11 +14,14 @@@
+  #include <linux/page-flags.h>
+  #include <linux/mm.h> /* for __put_page() */
+  
+++<<<<<<< HEAD
+++=======
++ #include <trace/events/page_pool.h>
++ 
++ #define DEFER_TIME (msecs_to_jiffies(1000))
++ #define DEFER_WARN_INTERVAL (60 * HZ)
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  static int page_pool_init(struct page_pool *pool,
+  			  const struct page_pool_params *params)
+  {
+@@@ -173,14 -187,34 +181,37 @@@ struct page *page_pool_alloc_pages(stru
+  }
+  EXPORT_SYMBOL(page_pool_alloc_pages);
+  
+++<<<<<<< HEAD
+++=======
++ /* Calculate distance between two u32 values, valid if distance is below 2^(31)
++  *  https://en.wikipedia.org/wiki/Serial_number_arithmetic#General_Solution
++  */
++ #define _distance(a, b)	(s32)((a) - (b))
++ 
++ static s32 page_pool_inflight(struct page_pool *pool)
++ {
++ 	u32 release_cnt = atomic_read(&pool->pages_state_release_cnt);
++ 	u32 hold_cnt = READ_ONCE(pool->pages_state_hold_cnt);
++ 	s32 inflight;
++ 
++ 	inflight = _distance(hold_cnt, release_cnt);
++ 
++ 	trace_page_pool_inflight(pool, inflight, hold_cnt, release_cnt);
++ 	WARN(inflight < 0, "Negative(%d) inflight packet-pages", inflight);
++ 
++ 	return inflight;
++ }
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  /* Cleanup page_pool state from page */
+  static void __page_pool_clean_page(struct page_pool *pool,
+  				   struct page *page)
+  {
+  	dma_addr_t dma;
++ 	int count;
+  
+  	if (!(pool->p.flags & PP_FLAG_DMA_MAP))
+ -		goto skip_dma_unmap;
+ +		return;
+  
+  	dma = page->dma_addr;
+  	/* DMA unmap */
+@@@ -188,6 -222,12 +219,15 @@@
+  			     PAGE_SIZE << pool->p.order, pool->p.dma_dir,
+  			     DMA_ATTR_SKIP_CPU_SYNC);
+  	page->dma_addr = 0;
+++<<<<<<< HEAD
+++=======
++ skip_dma_unmap:
++ 	/* This may be the last page returned, releasing the pool, so
++ 	 * it is not safe to reference pool afterwards.
++ 	 */
++ 	count = atomic_inc_return(&pool->pages_state_release_cnt);
++ 	trace_page_pool_state_release(pool, page, count);
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  }
+  
+  /* unmap the page and clean our state */
+@@@ -292,28 -336,20 +332,38 @@@ static void __page_pool_empty_ring(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +void __page_pool_free(struct page_pool *pool)
+ +{
+ +	WARN(pool->alloc.count, "API usage violation");
+ +	WARN(!ptr_ring_empty(&pool->ring), "ptr_ring is not empty");
+++=======
++ static void page_pool_free(struct page_pool *pool)
++ {
++ 	if (pool->disconnect)
++ 		pool->disconnect(pool);
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  
+  	ptr_ring_cleanup(&pool->ring, NULL);
+ +	kfree(pool);
+ +}
+- EXPORT_SYMBOL(__page_pool_free);
+  
+ -	if (pool->p.flags & PP_FLAG_DMA_MAP)
+ -		put_device(pool->p.dev);
+++<<<<<<< HEAD
+ +static void __page_pool_destroy_rcu(struct rcu_head *rcu)
+ +{
+ +	struct page_pool *pool;
+  
+ -	kfree(pool);
+ +	pool = container_of(rcu, struct page_pool, rcu);
+ +
+ +	__page_pool_empty_ring(pool);
+ +	__page_pool_free(pool);
+  }
+  
+ +/* Cleanup and release resources */
+ +void page_pool_destroy(struct page_pool *pool)
+++=======
++ static void page_pool_scrub(struct page_pool *pool)
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  {
+  	struct page *page;
+  
+@@@ -330,8 -366,64 +380,71 @@@
+  	 * be in-flight.
+  	 */
+  	__page_pool_empty_ring(pool);
+++<<<<<<< HEAD
+ +
+ +	/* An xdp_mem_allocator can still ref page_pool pointer */
+ +	call_rcu(&pool->rcu, __page_pool_destroy_rcu);
+ +}
+++=======
++ }
++ 
++ static int page_pool_release(struct page_pool *pool)
++ {
++ 	int inflight;
++ 
++ 	page_pool_scrub(pool);
++ 	inflight = page_pool_inflight(pool);
++ 	if (!inflight)
++ 		page_pool_free(pool);
++ 
++ 	return inflight;
++ }
++ 
++ static void page_pool_release_retry(struct work_struct *wq)
++ {
++ 	struct delayed_work *dwq = to_delayed_work(wq);
++ 	struct page_pool *pool = container_of(dwq, typeof(*pool), release_dw);
++ 	int inflight;
++ 
++ 	inflight = page_pool_release(pool);
++ 	if (!inflight)
++ 		return;
++ 
++ 	/* Periodic warning */
++ 	if (time_after_eq(jiffies, pool->defer_warn)) {
++ 		int sec = (s32)((u32)jiffies - (u32)pool->defer_start) / HZ;
++ 
++ 		pr_warn("%s() stalled pool shutdown %d inflight %d sec\n",
++ 			__func__, inflight, sec);
++ 		pool->defer_warn = jiffies + DEFER_WARN_INTERVAL;
++ 	}
++ 
++ 	/* Still not ready to be disconnected, retry later */
++ 	schedule_delayed_work(&pool->release_dw, DEFER_TIME);
++ }
++ 
++ void page_pool_use_xdp_mem(struct page_pool *pool, void (*disconnect)(void *))
++ {
++ 	refcount_inc(&pool->user_cnt);
++ 	pool->disconnect = disconnect;
++ }
++ 
++ void page_pool_destroy(struct page_pool *pool)
++ {
++ 	if (!pool)
++ 		return;
++ 
++ 	if (!page_pool_put(pool))
++ 		return;
++ 
++ 	if (!page_pool_release(pool))
++ 		return;
++ 
++ 	pool->defer_start = jiffies;
++ 	pool->defer_warn  = jiffies + DEFER_WARN_INTERVAL;
++ 
++ 	INIT_DELAYED_WORK(&pool->release_dw, page_pool_release_retry);
++ 	schedule_delayed_work(&pool->release_dw, DEFER_TIME);
++ }
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  EXPORT_SYMBOL(page_pool_destroy);
+diff --cc net/core/xdp.c
+index 762abeb89847,8e405abaf05a..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -94,6 -81,59 +94,62 @@@ static void __xdp_mem_allocator_rcu_fre
+  	kfree(xa);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mem_xa_remove(struct xdp_mem_allocator *xa)
++ {
++ 	trace_mem_disconnect(xa);
++ 
++ 	mutex_lock(&mem_id_lock);
++ 
++ 	if (!rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params))
++ 		call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
++ 
++ 	mutex_unlock(&mem_id_lock);
++ }
++ 
++ static void mem_allocator_disconnect(void *allocator)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 	struct rhashtable_iter iter;
++ 
++ 	rhashtable_walk_enter(mem_id_ht, &iter);
++ 	do {
++ 		rhashtable_walk_start(&iter);
++ 
++ 		while ((xa = rhashtable_walk_next(&iter)) && !IS_ERR(xa)) {
++ 			if (xa->allocator == allocator)
++ 				mem_xa_remove(xa);
++ 		}
++ 
++ 		rhashtable_walk_stop(&iter);
++ 
++ 	} while (xa == ERR_PTR(-EAGAIN));
++ 	rhashtable_walk_exit(&iter);
++ }
++ 
++ static void mem_id_disconnect(int id)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 
++ 	mutex_lock(&mem_id_lock);
++ 
++ 	xa = rhashtable_lookup_fast(mem_id_ht, &id, mem_id_rht_params);
++ 	if (!xa) {
++ 		mutex_unlock(&mem_id_lock);
++ 		WARN(1, "Request remove non-existing id(%d), driver bug?", id);
++ 		return;
++ 	}
++ 
++ 	trace_mem_disconnect(xa);
++ 
++ 	if (!rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params))
++ 		call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
++ 
++ 	mutex_unlock(&mem_id_lock);
++ }
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  void xdp_rxq_info_unreg_mem_model(struct xdp_rxq_info *xdp_rxq)
+  {
+  	struct xdp_mem_allocator *xa;
+@@@ -107,18 -147,15 +163,25 @@@
+  	if (id == 0)
+  		return;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&mem_id_lock);
+ +
+ +	xa = rhashtable_lookup_fast(mem_id_ht, &id, mem_id_rht_params);
+ +	if (xa && !rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params))
+ +		call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
+ +
+ +	mutex_unlock(&mem_id_lock);
+++=======
++ 	if (xdp_rxq->mem.type == MEM_TYPE_ZERO_COPY)
++ 		return mem_id_disconnect(id);
++ 
++ 	if (xdp_rxq->mem.type == MEM_TYPE_PAGE_POOL) {
++ 		rcu_read_lock();
++ 		xa = rhashtable_lookup(mem_id_ht, &id, mem_id_rht_params);
++ 		page_pool_destroy(xa->page_pool);
++ 		rcu_read_unlock();
++ 	}
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  }
+  EXPORT_SYMBOL_GPL(xdp_rxq_info_unreg_mem_model);
+  
+@@@ -307,8 -344,12 +370,14 @@@ int xdp_rxq_info_reg_mem_model(struct x
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (type == MEM_TYPE_PAGE_POOL)
++ 		page_pool_use_xdp_mem(allocator, mem_allocator_disconnect);
++ 
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  	mutex_unlock(&mem_id_lock);
+  
+ -	trace_mem_connect(xdp_alloc, xdp_rxq);
+  	return 0;
+  err:
+  	mutex_unlock(&mem_id_lock);
+@@@ -335,12 -376,8 +404,17 @@@ static void __xdp_return(void *data, st
+  		/* mem->id is valid, checked in xdp_rxq_info_reg_mem_model() */
+  		xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
+  		page = virt_to_head_page(data);
+++<<<<<<< HEAD
+ +		if (xa) {
+ +			napi_direct &= !xdp_return_frame_no_direct();
+ +			page_pool_put_page(xa->page_pool, page, napi_direct);
+ +		} else {
+ +			put_page(page);
+ +		}
+++=======
++ 		napi_direct &= !xdp_return_frame_no_direct();
++ 		page_pool_put_page(xa->page_pool, page, napi_direct);
+++>>>>>>> c3f812cea0d7 (page_pool: do not release pool until inflight == 0.)
+  		rcu_read_unlock();
+  		break;
+  	case MEM_TYPE_PAGE_SHARED:
+* Unmerged path include/net/xdp_priv.h
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+* Unmerged path include/net/page_pool.h
+* Unmerged path include/net/xdp_priv.h
+* Unmerged path include/trace/events/xdp.h
+* Unmerged path net/core/page_pool.c
+* Unmerged path net/core/xdp.c
