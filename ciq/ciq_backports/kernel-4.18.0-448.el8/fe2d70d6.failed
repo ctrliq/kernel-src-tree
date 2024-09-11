@@ -1,0 +1,252 @@
+fbcon: Call con2fb_map functions directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit fe2d70d6f6ff038c20705c34695bd34ac072af14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/fe2d70d6.failed
+
+These are actually fbcon ioctls which just happen to be exposed
+through /dev/fb*. They completely ignore which fb_info they're called
+on, and I think the userspace tool even hardcodes to /dev/fb0.
+
+Hence just forward the entire thing to fbcon.c wholesale.
+
+Note that this patch drops the fb_lock/unlock on the set side. Since
+the ioctl can operate on any fb (as passed in through
+con2fb.framebuffer) this is bogus. Also note that fbcon.c in general
+never calls fb_lock on anything, so this has been badly broken
+already.
+
+With this the last user of the fbcon notifier callback is gone, and we
+can garbage collect that too.
+
+v2: add missing uaccess.h include (alpha fails to compile otherwise),
+reported by kbuild.
+
+v3: Remember to also drop the #defines (Maarten)
+
+v4: Add the static inline to dummy functions.
+
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Reviewed-by: Sam Ravnborg <sam@ravnborg.org>
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Cc: Hans de Goede <hdegoede@redhat.com>
+	Cc: Yisheng Xie <ysxie@foxmail.com>
+	Cc: "Michał Mirosław" <mirq-linux@rere.qmqm.pl>
+	Cc: Peter Rosin <peda@axentia.se>
+	Cc: Mikulas Patocka <mpatocka@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190528090304.9388-31-daniel.vetter@ffwll.ch
+(cherry picked from commit fe2d70d6f6ff038c20705c34695bd34ac072af14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbcon.c
+#	include/linux/fb.h
+diff --cc drivers/video/fbdev/core/fbcon.c
+index 373fd59f6a25,31d6a4e54436..000000000000
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@@ -3337,58 -3319,28 +3338,79 @@@ static void fbcon_get_requirement(struc
+  	}
+  }
+  
+- static int fbcon_event_notify(struct notifier_block *self,
+- 			      unsigned long action, void *data)
++ int fbcon_set_con2fb_map_ioctl(void __user *argp)
+  {
+++<<<<<<< HEAD
+ +	struct fb_event *event = data;
+ +	struct fb_info *info = event->info;
+ +	struct fb_videomode *mode;
+ +	struct fb_con2fbmap *con2fb;
+ +	struct fb_blit_caps *caps;
+ +	int idx, ret = 0;
+ +
+ +	switch(action) {
+ +	case FB_EVENT_SUSPEND:
+ +		fbcon_suspended(info);
+ +		break;
+ +	case FB_EVENT_RESUME:
+ +		fbcon_resumed(info);
+ +		break;
+ +	case FB_EVENT_MODE_CHANGE:
+ +		fbcon_modechanged(info);
+ +		break;
+ +	case FB_EVENT_MODE_CHANGE_ALL:
+ +		fbcon_set_all_vcs(info);
+ +		break;
+ +	case FB_EVENT_MODE_DELETE:
+ +		mode = event->data;
+ +		ret = fbcon_mode_deleted(info, mode);
+ +		break;
+ +	case FB_EVENT_FB_UNBIND:
+ +		idx = info->node;
+ +		ret = fbcon_fb_unbind(idx);
+ +		break;
+ +	case FB_EVENT_SET_CONSOLE_MAP:
+ +		/* called with console lock held */
+ +		con2fb = event->data;
+ +		ret = set_con2fb_map(con2fb->console - 1,
+ +				     con2fb->framebuffer, 1);
+ +		break;
+ +	case FB_EVENT_GET_CONSOLE_MAP:
+ +		con2fb = event->data;
+ +		con2fb->framebuffer = con2fb_map[con2fb->console - 1];
+ +		break;
+ +	case FB_EVENT_BLANK:
+ +		fbcon_fb_blanked(info, *(int *)event->data);
+ +		break;
+ +	case FB_EVENT_NEW_MODELIST:
+ +		fbcon_new_modelist(info);
+ +		break;
+ +	case FB_EVENT_GET_REQ:
+ +		caps = event->data;
+ +		fbcon_get_requirement(info, caps);
+ +		break;
+++=======
++ 	struct fb_con2fbmap con2fb;
++ 	int ret;
++ 
++ 	if (copy_from_user(&con2fb, argp, sizeof(con2fb)))
++ 		return -EFAULT;
++ 	if (con2fb.console < 1 || con2fb.console > MAX_NR_CONSOLES)
++ 		return -EINVAL;
++ 	if (con2fb.framebuffer >= FB_MAX)
++ 		return -EINVAL;
++ 	if (!registered_fb[con2fb.framebuffer])
++ 		request_module("fb%d", con2fb.framebuffer);
++ 	if (!registered_fb[con2fb.framebuffer]) {
++ 		return -EINVAL;
+++>>>>>>> fe2d70d6f6ff (fbcon: Call con2fb_map functions directly)
+  	}
++ 
++ 	console_lock();
++ 	ret = set_con2fb_map(con2fb.console - 1,
++ 			     con2fb.framebuffer, 1);
++ 	console_unlock();
++ 
+  	return ret;
+  }
+  
+diff --cc include/linux/fb.h
+index 5bd1a6c3d119,303771264644..000000000000
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@@ -143,26 -133,11 +143,30 @@@ struct fb_cursor_user 
+  #define FB_EVENT_FB_UNREGISTERED        0x06
+  #endif
+  
+++<<<<<<< HEAD
+ +/*      CONSOLE-SPECIFIC: get console to framebuffer mapping */
+ +#define FB_EVENT_GET_CONSOLE_MAP        0x07
+ +/*      CONSOLE-SPECIFIC: set console to framebuffer mapping */
+ +#define FB_EVENT_SET_CONSOLE_MAP        0x08
+ +/*      A hardware display blank change occurred */
+++=======
++ /*      A display blank is requested       */
+++>>>>>>> fe2d70d6f6ff (fbcon: Call con2fb_map functions directly)
+  #define FB_EVENT_BLANK                  0x09
+ -/*      A hardware display blank early change occurred */
+ +/*      Private modelist is to be replaced */
+ +#define FB_EVENT_NEW_MODELIST           0x0A
+ +/*	The resolution of the passed in fb_info about to change and
+ +        all vc's should be changed         */
+ +#define FB_EVENT_MODE_CHANGE_ALL	0x0B
+ +/*	A software display blank change occurred */
+ +#define FB_EVENT_CONBLANK               0x0C
+ +/*      Get drawing requirements        */
+ +#define FB_EVENT_GET_REQ                0x0D
+ +/*      Unbind from the console if possible */
+ +#define FB_EVENT_FB_UNBIND              0x0E
+ +/*      A hardware display blank early change occured */
+  #define FB_EARLY_EVENT_BLANK		0x10
+ -/*      A hardware display blank revert early change occurred */
+ +/*      A hardware display blank revert early change occured */
+  #define FB_R_EARLY_EVENT_BLANK		0x11
+  
+  struct fb_event {
+* Unmerged path drivers/video/fbdev/core/fbcon.c
+diff --git a/drivers/video/fbdev/core/fbmem.c b/drivers/video/fbdev/core/fbmem.c
+index 32dffdd5addd..57bf4fe81ab3 100644
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@ -1073,10 +1073,8 @@ static long do_fb_ioctl(struct fb_info *info, unsigned int cmd,
+ 	const struct fb_ops *fb;
+ 	struct fb_var_screeninfo var;
+ 	struct fb_fix_screeninfo fix;
+-	struct fb_con2fbmap con2fb;
+ 	struct fb_cmap cmap_from;
+ 	struct fb_cmap_user cmap;
+-	struct fb_event event;
+ 	void __user *argp = (void __user *)arg;
+ 	long ret = 0;
+ 
+@@ -1138,38 +1136,10 @@ static long do_fb_ioctl(struct fb_info *info, unsigned int cmd,
+ 		ret = -EINVAL;
+ 		break;
+ 	case FBIOGET_CON2FBMAP:
+-		if (copy_from_user(&con2fb, argp, sizeof(con2fb)))
+-			return -EFAULT;
+-		if (con2fb.console < 1 || con2fb.console > MAX_NR_CONSOLES)
+-			return -EINVAL;
+-		con2fb.framebuffer = -1;
+-		event.data = &con2fb;
+-		lock_fb_info(info);
+-		event.info = info;
+-		fb_notifier_call_chain(FB_EVENT_GET_CONSOLE_MAP, &event);
+-		unlock_fb_info(info);
+-		ret = copy_to_user(argp, &con2fb, sizeof(con2fb)) ? -EFAULT : 0;
++		ret = fbcon_get_con2fb_map_ioctl(argp);
+ 		break;
+ 	case FBIOPUT_CON2FBMAP:
+-		if (copy_from_user(&con2fb, argp, sizeof(con2fb)))
+-			return -EFAULT;
+-		if (con2fb.console < 1 || con2fb.console > MAX_NR_CONSOLES)
+-			return -EINVAL;
+-		if (con2fb.framebuffer >= FB_MAX)
+-			return -EINVAL;
+-		if (!registered_fb[con2fb.framebuffer])
+-			request_module("fb%d", con2fb.framebuffer);
+-		if (!registered_fb[con2fb.framebuffer]) {
+-			ret = -EINVAL;
+-			break;
+-		}
+-		event.data = &con2fb;
+-		console_lock();
+-		lock_fb_info(info);
+-		event.info = info;
+-		ret = fb_notifier_call_chain(FB_EVENT_SET_CONSOLE_MAP, &event);
+-		unlock_fb_info(info);
+-		console_unlock();
++		ret = fbcon_set_con2fb_map_ioctl(argp);
+ 		break;
+ 	case FBIOBLANK:
+ 		console_lock();
+* Unmerged path include/linux/fb.h
+diff --git a/include/linux/fbcon.h b/include/linux/fbcon.h
+index 34abc144f9f8..a5ae90b91e8c 100644
+--- a/include/linux/fbcon.h
++++ b/include/linux/fbcon.h
+@@ -7,12 +7,16 @@ void __exit fb_console_exit(void);
+ int fbcon_fb_registered(struct fb_info *info);
+ void fbcon_fb_unregistered(struct fb_info *info);
+ void fbcon_remap_all(struct fb_info *info);
++int fbcon_set_con2fb_map_ioctl(void __user *argp);
++int fbcon_get_con2fb_map_ioctl(void __user *argp);
+ #else
+ static inline void fb_console_init(void) {}
+ static inline void fb_console_exit(void) {}
+ static inline int fbcon_fb_registered(struct fb_info *info) { return 0; }
+ static inline void fbcon_fb_unregistered(struct fb_info *info) {}
+ static inline void fbcon_remap_all(struct fb_info *info) {}
++static inline int fbcon_set_con2fb_map_ioctl(void __user *argp) { return 0; }
++static inline int fbcon_get_con2fb_map_ioctl(void __user *argp) { return 0; }
+ #endif
+ 
+ #endif /* _LINUX_FBCON_H */
