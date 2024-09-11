@@ -1,0 +1,156 @@
+s390/pci: stash associated GISA designation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Matthew Rosato <mjrosato@linux.ibm.com>
+commit c68468ed3416ea88d7b14dabb1fa584c3a90cd85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/c68468ed.failed
+
+For passthrough devices, we will need to know the GISA designation of the
+guest if interpretation facilities are to be used.  Setup to stash this in
+the zdev and set a default of 0 (no GISA designation) for now; a subsequent
+patch will set a valid GISA designation for passthrough devices.
+Also, extend mpcific routines to specify this stashed designation as part
+of the mpcific command.
+
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Reviewed-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Reviewed-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Signed-off-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220606203325.110625-9-mjrosato@linux.ibm.com
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+(cherry picked from commit c68468ed3416ea88d7b14dabb1fa584c3a90cd85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index 028424f063d3,c8b9d866434c..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -117,7 -120,11 +117,15 @@@ int zpci_register_ioat(struct zpci_dev 
+  	fib.pba = base;
+  	fib.pal = limit;
+  	fib.iota = iota | ZPCI_IOTA_RTTO_FLAG;
+++<<<<<<< HEAD
+ +	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
+++=======
++ 	fib.gd = zdev->gisa;
++ 	cc = zpci_mod_fc(req, &fib, &status);
++ 	if (cc)
++ 		zpci_dbg(3, "reg ioat fid:%x, cc:%d, status:%d\n", zdev->fid, cc, status);
++ 	return cc;
+++>>>>>>> c68468ed3416 (s390/pci: stash associated GISA designation)
+  }
+  
+  /* Modify PCI: Unregister I/O address translation parameters */
+@@@ -127,10 -134,12 +135,12 @@@ int zpci_unregister_ioat(struct zpci_de
+  	struct zpci_fib fib = {0};
+  	u8 cc, status;
+  
++ 	fib.gd = zdev->gisa;
++ 
+  	cc = zpci_mod_fc(req, &fib, &status);
+ -	if (cc)
+ -		zpci_dbg(3, "unreg ioat fid:%x, cc:%d, status:%d\n", zdev->fid, cc, status);
+ -	return cc;
+ +	if (cc == 3) /* Function already gone. */
+ +		cc = 0;
+ +	return cc ? -EIO : 0;
+  }
+  
+  /* Modify PCI: Set PCI function measurement parameters */
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 7938897b2742..6801bbc475ca 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -124,6 +124,7 @@ struct zpci_dev {
+ 	enum zpci_state state;
+ 	u32		fid;		/* function ID, used by sclp */
+ 	u32		fh;		/* function handle, used by insn's */
++	u32		gisa;		/* GISA designation for passthrough */
+ 	u16		vfn;		/* virtual function number */
+ 	u16		pchid;		/* physical channel ID */
+ 	u8		pfgid;		/* function group ID */
+diff --git a/arch/s390/include/asm/pci_clp.h b/arch/s390/include/asm/pci_clp.h
+index eb51272dd2cc..6a9f26643a70 100644
+--- a/arch/s390/include/asm/pci_clp.h
++++ b/arch/s390/include/asm/pci_clp.h
+@@ -159,7 +159,8 @@ struct clp_req_set_pci {
+ 	u16 reserved2;
+ 	u8 oc;				/* operation controls */
+ 	u8 ndas;			/* number of dma spaces */
+-	u64 reserved3;
++	u32 reserved3;
++	u32 gisa;			/* GISA designation */
+ } __packed;
+ 
+ /* Set PCI function response */
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_clp.c b/arch/s390/pci/pci_clp.c
+index 45c5438cc74b..651686d05432 100644
+--- a/arch/s390/pci/pci_clp.c
++++ b/arch/s390/pci/pci_clp.c
+@@ -260,11 +260,15 @@ static int clp_set_pci_fn(struct zpci_dev *zdev, u8 nr_dma_as, u8 command)
+ {
+ 	struct clp_req_rsp_set_pci *rrb;
+ 	int rc, retries = 100;
++	u32 gisa = 0;
+ 
+ 	rrb = clp_alloc_block(GFP_KERNEL);
+ 	if (!rrb)
+ 		return -ENOMEM;
+ 
++	if (command != CLP_SET_DISABLE_PCI_FN)
++		gisa = zdev->gisa;
++
+ 	do {
+ 		memset(rrb, 0, sizeof(*rrb));
+ 		rrb->request.hdr.len = sizeof(rrb->request);
+@@ -273,6 +277,7 @@ static int clp_set_pci_fn(struct zpci_dev *zdev, u8 nr_dma_as, u8 command)
+ 		rrb->request.fh = zdev->fh;
+ 		rrb->request.oc = command;
+ 		rrb->request.ndas = nr_dma_as;
++		rrb->request.gisa = gisa;
+ 
+ 		rc = clp_req(rrb, CLP_LPS_PCI);
+ 		if (rrb->response.hdr.rsp == CLP_RC_SETPCIFN_BUSY) {
+diff --git a/arch/s390/pci/pci_irq.c b/arch/s390/pci/pci_irq.c
+index 68e6712efb5c..180cd31c35a6 100644
+--- a/arch/s390/pci/pci_irq.c
++++ b/arch/s390/pci/pci_irq.c
+@@ -42,6 +42,7 @@ static int zpci_set_airq(struct zpci_dev *zdev)
+ 	fib.fmt0.aibvo = 0;	/* each zdev has its own interrupt vector */
+ 	fib.fmt0.aisb = virt_to_phys(zpci_sbv->vector) + (zdev->aisb / 64) * 8;
+ 	fib.fmt0.aisbo = zdev->aisb & 63;
++	fib.gd = zdev->gisa;
+ 
+ 	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
+ }
+@@ -53,6 +54,8 @@ static int zpci_clear_airq(struct zpci_dev *zdev)
+ 	struct zpci_fib fib = {0};
+ 	u8 cc, status;
+ 
++	fib.gd = zdev->gisa;
++
+ 	cc = zpci_mod_fc(req, &fib, &status);
+ 	if (cc == 3 || (cc == 1 && status == 24))
+ 		/* Function already gone or IRQs already deregistered. */
+@@ -71,6 +74,7 @@ static int zpci_set_directed_irq(struct zpci_dev *zdev)
+ 	fib.fmt = 1;
+ 	fib.fmt1.noi = zdev->msi_nr_irqs;
+ 	fib.fmt1.dibvo = zdev->msi_first_bit;
++	fib.gd = zdev->gisa;
+ 
+ 	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
+ }
+@@ -83,6 +87,7 @@ static int zpci_clear_directed_irq(struct zpci_dev *zdev)
+ 	u8 cc, status;
+ 
+ 	fib.fmt = 1;
++	fib.gd = zdev->gisa;
+ 	cc = zpci_mod_fc(req, &fib, &status);
+ 	if (cc == 3 || (cc == 1 && status == 24))
+ 		/* Function already gone or IRQs already deregistered. */
