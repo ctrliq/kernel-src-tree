@@ -1,0 +1,125 @@
+x86/KVM/VMX: Move the l1tf_flush_l1d test to vmx_l1d_flush()
+
+jira LE-1907
+cve CVE-2018-3646
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Nicolai Stange <nstange@suse.de>
+commit 5b6ccc6c3b1a477fbac9ec97a0b4c1c48e765209
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/5b6ccc6c.failed
+
+Currently, vmx_vcpu_run() checks if l1tf_flush_l1d is set and invokes
+vmx_l1d_flush() if so.
+
+This test is unncessary for the "always flush L1D" mode.
+
+Move the check to vmx_l1d_flush()'s conditional mode code path.
+
+Notes:
+- vmx_l1d_flush() is likely to get inlined anyway and thus, there's no
+  extra function call.
+  
+- This inverts the (static) branch prediction, but there hadn't been any
+  explicit likely()/unlikely() annotations before and so it stays as is.
+
+	Signed-off-by: Nicolai Stange <nstange@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 5b6ccc6c3b1a477fbac9ec97a0b4c1c48e765209)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index d9e0ef7725c0,ec955b870756..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9950,6 -9671,70 +9950,73 @@@ static int vmx_handle_exit(struct kvm_v
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Software based L1D cache flush which is used when microcode providing
++  * the cache control MSR is not loaded.
++  *
++  * The L1D cache is 32 KiB on Nehalem and later microarchitectures, but to
++  * flush it is required to read in 64 KiB because the replacement algorithm
++  * is not exactly LRU. This could be sized at runtime via topology
++  * information but as all relevant affected CPUs have 32KiB L1D cache size
++  * there is no point in doing so.
++  */
++ #define L1D_CACHE_ORDER 4
++ static void *vmx_l1d_flush_pages;
++ 
++ static void vmx_l1d_flush(struct kvm_vcpu *vcpu)
++ {
++ 	int size = PAGE_SIZE << L1D_CACHE_ORDER;
++ 
++ 	/*
++ 	 * This code is only executed when the the flush mode is 'cond' or
++ 	 * 'always'
++ 	 */
++ 	if (static_branch_likely(&vmx_l1d_flush_cond)) {
++ 		bool flush_l1d = vcpu->arch.l1tf_flush_l1d;
++ 
++ 		/*
++ 		 * Clear the flush bit, it gets set again either from
++ 		 * vcpu_run() or from one of the unsafe VMEXIT
++ 		 * handlers.
++ 		 */
++ 		vcpu->arch.l1tf_flush_l1d = false;
++ 		if (!flush_l1d)
++ 			return;
++ 	}
++ 
++ 	vcpu->stat.l1d_flush++;
++ 
++ 	if (static_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
++ 		return;
++ 	}
++ 
++ 	asm volatile(
++ 		/* First ensure the pages are in the TLB */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lpopulate_tlb:\n\t"
++ 		"movzbl	(%[flush_pages], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$4096, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lpopulate_tlb\n\t"
++ 		"xorl	%%eax, %%eax\n\t"
++ 		"cpuid\n\t"
++ 		/* Now fill the cache */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lfill_cache:\n"
++ 		"movzbl	(%[flush_pages], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$64, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lfill_cache\n\t"
++ 		"lfence\n"
++ 		:: [flush_pages] "r" (vmx_l1d_flush_pages),
++ 		    [size] "r" (size)
++ 		: "eax", "ebx", "ecx", "edx");
++ }
++ 
+++>>>>>>> 5b6ccc6c3b1a (x86/KVM/VMX: Move the l1tf_flush_l1d test to vmx_l1d_flush())
+  static void update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+@@@ -10446,6 -10232,9 +10513,12 @@@ static void __noclone vmx_vcpu_run(stru
+  	evmcs_rsp = static_branch_unlikely(&enable_evmcs) ?
+  		(unsigned long)&current_evmcs->host_rsp : 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (static_branch_unlikely(&vmx_l1d_should_flush))
++ 		vmx_l1d_flush(vcpu);
++ 
+++>>>>>>> 5b6ccc6c3b1a (x86/KVM/VMX: Move the l1tf_flush_l1d test to vmx_l1d_flush())
+  	asm(
+  		/* Store host registers */
+  		"push %%" _ASM_DX "; push %%" _ASM_BP ";"
+* Unmerged path arch/x86/kvm/vmx.c
