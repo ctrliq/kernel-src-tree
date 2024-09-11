@@ -51,6 +51,7 @@ FEATURE_TESTS_BASIC :=                  \
         libpython-version               \
         libslang                        \
         libslang-include-subdir         \
+        libtraceevent                   \
         libcrypto                       \
         libunwind                       \
         pthread-attr-setaffinity-np     \
