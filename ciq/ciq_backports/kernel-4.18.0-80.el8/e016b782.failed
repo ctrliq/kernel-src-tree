@@ -1,0 +1,201 @@
+block: return just one value from part_in_flight
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit e016b78201a2d9ff40f3f0da072292689af24c7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/e016b782.failed
+
+The previous patches deleted all the code that needed the second value
+returned from part_in_flight - now the kernel only uses the first value.
+
+Consequently, part_in_flight (and blk_mq_in_flight) may be changed so that
+it only returns one value.
+
+This patch just refactors the code, there's no functional change.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e016b78201a2d9ff40f3f0da072292689af24c7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+#	block/partition-generic.c
+diff --cc block/genhd.c
+index be5bab20b2ab,1dd8fd6613b8..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -57,29 -57,32 +57,47 @@@ void part_inc_in_flight(struct request_
+  
+  void part_dec_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+  {
+ -	if (queue_is_mq(q))
+ +	if (q->mq_ops)
+  		return;
+  
+ -	part_stat_local_dec(part, in_flight[rw]);
+ +	atomic_dec(&part->in_flight[rw]);
+  	if (part->partno)
+ -		part_stat_local_dec(&part_to_disk(part)->part0, in_flight[rw]);
+ +		atomic_dec(&part_to_disk(part)->part0.in_flight[rw]);
+  }
+  
+- void part_in_flight(struct request_queue *q, struct hd_struct *part,
+- 		    unsigned int inflight[2])
++ unsigned int part_in_flight(struct request_queue *q, struct hd_struct *part)
+  {
+++<<<<<<< HEAD
+ +	if (q->mq_ops) {
+ +		blk_mq_in_flight(q, part, inflight);
+ +		return;
+ +	}
+ +
+ +	inflight[0] = atomic_read(&part->in_flight[0]) +
+ +			atomic_read(&part->in_flight[1]);
+ +	if (part->partno) {
+ +		part = &part_to_disk(part)->part0;
+ +		inflight[1] = atomic_read(&part->in_flight[0]) +
+ +				atomic_read(&part->in_flight[1]);
+ +	}
+++=======
++ 	int cpu;
++ 	unsigned int inflight;
++ 
++ 	if (queue_is_mq(q)) {
++ 		return blk_mq_in_flight(q, part);
++ 	}
++ 
++ 	inflight = 0;
++ 	for_each_possible_cpu(cpu) {
++ 		inflight += part_stat_local_read_cpu(part, in_flight[0], cpu) +
++ 			    part_stat_local_read_cpu(part, in_flight[1], cpu);
++ 	}
++ 	if ((int)inflight < 0)
++ 		inflight = 0;
++ 
++ 	return inflight;
+++>>>>>>> e016b78201a2 (block: return just one value from part_in_flight)
+  }
+  
+  void part_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+@@@ -1316,8 -1338,7 +1334,12 @@@ static int diskstats_show(struct seq_fi
+  	struct disk_part_iter piter;
+  	struct hd_struct *hd;
+  	char buf[BDEVNAME_SIZE];
+++<<<<<<< HEAD
+ +	unsigned int inflight[2];
+ +	int cpu;
+++=======
++ 	unsigned int inflight;
+++>>>>>>> e016b78201a2 (block: return just one value from part_in_flight)
+  
+  	/*
+  	if (&disk_to_dev(gp)->kobj.entry == block_class.devices.next)
+@@@ -1329,10 -1350,7 +1351,14 @@@
+  
+  	disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
+  	while ((hd = disk_part_iter_next(&piter))) {
+++<<<<<<< HEAD
+ +		cpu = part_stat_lock();
+ +		part_round_stats(gp->queue, cpu, hd);
+ +		part_stat_unlock();
+ +		part_in_flight(gp->queue, hd, inflight);
+++=======
++ 		inflight = part_in_flight(gp->queue, hd);
+++>>>>>>> e016b78201a2 (block: return just one value from part_in_flight)
+  		seq_printf(seqf, "%4d %7d %s "
+  			   "%lu %lu %lu %u "
+  			   "%lu %lu %lu %u "
+diff --cc block/partition-generic.c
+index 5f8db5c5140f,8e596a8dff32..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -120,13 -120,9 +120,19 @@@ ssize_t part_stat_show(struct device *d
+  {
+  	struct hd_struct *p = dev_to_part(dev);
+  	struct request_queue *q = part_to_disk(p)->queue;
+++<<<<<<< HEAD
+ +	unsigned int inflight[2];
+ +	int cpu;
+ +
+ +	cpu = part_stat_lock();
+ +	part_round_stats(q, cpu, p);
+ +	part_stat_unlock();
+ +	part_in_flight(q, p, inflight);
+++=======
++ 	unsigned int inflight;
++ 
++ 	inflight = part_in_flight(q, p);
+++>>>>>>> e016b78201a2 (block: return just one value from part_in_flight)
+  	return sprintf(buf,
+  		"%8lu %8lu %8llu %8u "
+  		"%8lu %8lu %8llu %8u "
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 3326a4ca1205..c7fe546cb977 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -97,25 +97,23 @@ static bool blk_mq_check_inflight(struct blk_mq_hw_ctx *hctx,
+ 	struct mq_inflight *mi = priv;
+ 
+ 	/*
+-	 * index[0] counts the specific partition that was asked for. index[1]
+-	 * counts the ones that are active on the whole device, so increment
+-	 * that if mi->part is indeed a partition, and not a whole device.
++	 * index[0] counts the specific partition that was asked for.
+ 	 */
+ 	if (rq->part == mi->part)
+ 		mi->inflight[0]++;
+-	if (mi->part->partno)
+-		mi->inflight[1]++;
+ 
+ 	return true;
+ }
+ 
+-void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
+-		      unsigned int inflight[2])
++unsigned int blk_mq_in_flight(struct request_queue *q, struct hd_struct *part)
+ {
++	unsigned inflight[2];
+ 	struct mq_inflight mi = { .part = part, .inflight = inflight, };
+ 
+ 	inflight[0] = inflight[1] = 0;
+ 	blk_mq_queue_tag_busy_iter(q, blk_mq_check_inflight, &mi);
++
++	return inflight[0];
+ }
+ 
+ static bool blk_mq_check_inflight_rw(struct blk_mq_hw_ctx *hctx,
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 7a8828f8b01e..30ca0ecb795c 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -165,8 +165,7 @@ static inline bool blk_mq_hw_queue_mapped(struct blk_mq_hw_ctx *hctx)
+ 	return hctx->nr_ctx && hctx->tags;
+ }
+ 
+-void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
+-		      unsigned int inflight[2]);
++unsigned int blk_mq_in_flight(struct request_queue *q, struct hd_struct *part);
+ void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 			 unsigned int inflight[2]);
+ 
+* Unmerged path block/genhd.c
+* Unmerged path block/partition-generic.c
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index f767293b00e6..468a651ba81d 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -376,8 +376,7 @@ static inline void free_part_stats(struct hd_struct *part)
+ #define part_stat_sub(cpu, gendiskp, field, subnd)			\
+ 	part_stat_add(cpu, gendiskp, field, -subnd)
+ 
+-void part_in_flight(struct request_queue *q, struct hd_struct *part,
+-		    unsigned int inflight[2]);
++unsigned int part_in_flight(struct request_queue *q, struct hd_struct *part);
+ void part_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 		       unsigned int inflight[2]);
+ void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
