@@ -56,8 +56,9 @@ enum {
 	NETIF_F_GSO_ESP_BIT,		/* ... ESP with TSO */
 	NETIF_F_GSO_UDP_BIT,		/* ... UFO, deprecated except tuntap */
 	NETIF_F_GSO_UDP_L4_BIT,		/* ... UDP payload GSO (not UFO) */
+	NETIF_F_GSO_FRAGLIST_BIT,		/* ... Fraglist GSO */
 	/**/NETIF_F_GSO_LAST =		/* last bit, see GSO_MASK */
-		NETIF_F_GSO_UDP_L4_BIT,
+		NETIF_F_GSO_FRAGLIST_BIT,
 
 	/* RHEL only: bits reserved for future features.
 	 * GSO-related bit must be allocated from the top of this list, and
@@ -99,6 +100,7 @@ enum {
 
 	NETIF_F_GRO_HW_BIT,		/* Hardware Generic receive offload */
 	NETIF_F_HW_TLS_RECORD_BIT,	/* Offload TLS record */
+	NETIF_F_GRO_FRAGLIST_BIT,	/* Fraglist GRO */
 
 	/*
 	 * Add your fresh new feature above and remember to update
@@ -169,6 +171,8 @@ enum {
 #define NETIF_F_GSO_UDP_L4	__NETIF_F(GSO_UDP_L4)
 #define NETIF_F_HW_TLS_TX	__NETIF_F(HW_TLS_TX)
 #define NETIF_F_HW_TLS_RX	__NETIF_F(HW_TLS_RX)
+#define NETIF_F_GRO_FRAGLIST	__NETIF_F(GRO_FRAGLIST)
+#define NETIF_F_GSO_FRAGLIST	__NETIF_F(GSO_FRAGLIST)
 
 #define for_each_netdev_feature(mask_addr, bit)	\
 	for_each_set_bit(bit, (unsigned long *)mask_addr, NETDEV_FEATURE_COUNT)
