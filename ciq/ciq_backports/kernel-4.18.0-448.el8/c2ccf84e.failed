@@ -1,0 +1,1371 @@
+net/sched: act_api: Add extack to offload_act_setup() callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit c2ccf84ecb715bb81dc7f51e69d680a95bf055ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/c2ccf84e.failed
+
+The callback is used by various actions to populate the flow action
+structure prior to offload. Pass extack to this callback so that the
+various actions will be able to report accurate error messages to user
+space.
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Petr Machata <petrm@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c2ccf84ecb715bb81dc7f51e69d680a95bf055ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	include/net/pkt_cls.h
+#	net/sched/act_api.c
+#	net/sched/act_csum.c
+#	net/sched/act_ct.c
+#	net/sched/act_gact.c
+#	net/sched/act_gate.c
+#	net/sched/act_mirred.c
+#	net/sched/act_mpls.c
+#	net/sched/act_pedit.c
+#	net/sched/act_police.c
+#	net/sched/act_sample.c
+#	net/sched/act_skbedit.c
+#	net/sched/act_tunnel_key.c
+#	net/sched/act_vlan.c
+#	net/sched/cls_api.c
+diff --cc include/net/act_api.h
+index b5b624c7e488,9cf6870b526e..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -121,6 -133,9 +121,12 @@@ struct tc_action_ops 
+  	struct psample_group *
+  	(*get_psample_group)(const struct tc_action *a,
+  			     tc_action_priv_destructor *destructor);
+++<<<<<<< HEAD
+++=======
++ 	int     (*offload_act_setup)(struct tc_action *act, void *entry_data,
++ 				     u32 *index_inc, bool bind,
++ 				     struct netlink_ext_ack *extack);
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  };
+  
+  struct tc_action_net {
+diff --cc include/net/pkt_cls.h
+index a51dab4004b6,8cf001aed858..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -533,8 -547,12 +533,15 @@@ tcf_match_indev(struct sk_buff *skb, in
+  }
+  
+  int tc_setup_offload_action(struct flow_action *flow_action,
+- 			    const struct tcf_exts *exts);
++ 			    const struct tcf_exts *exts,
++ 			    struct netlink_ext_ack *extack);
+  void tc_cleanup_offload_action(struct flow_action *flow_action);
+++<<<<<<< HEAD
+++=======
++ int tc_setup_action(struct flow_action *flow_action,
++ 		    struct tc_action *actions[],
++ 		    struct netlink_ext_ack *extack);
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  
+  int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
+  		     void *type_data, bool err_stop, bool rtnl_held);
+diff --cc net/sched/act_api.c
+index f274ee42a202,da9733da9868..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -135,8 -131,244 +135,246 @@@ static void free_tcf(struct tc_action *
+  	kfree(p);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void offload_action_hw_count_set(struct tc_action *act,
++ 					u32 hw_count)
++ {
++ 	act->in_hw_count = hw_count;
++ }
++ 
++ static void offload_action_hw_count_inc(struct tc_action *act,
++ 					u32 hw_count)
++ {
++ 	act->in_hw_count += hw_count;
++ }
++ 
++ static void offload_action_hw_count_dec(struct tc_action *act,
++ 					u32 hw_count)
++ {
++ 	act->in_hw_count = act->in_hw_count > hw_count ?
++ 			   act->in_hw_count - hw_count : 0;
++ }
++ 
++ static unsigned int tcf_offload_act_num_actions_single(struct tc_action *act)
++ {
++ 	if (is_tcf_pedit(act))
++ 		return tcf_pedit_nkeys(act);
++ 	else
++ 		return 1;
++ }
++ 
++ static bool tc_act_skip_hw(u32 flags)
++ {
++ 	return (flags & TCA_ACT_FLAGS_SKIP_HW) ? true : false;
++ }
++ 
++ static bool tc_act_skip_sw(u32 flags)
++ {
++ 	return (flags & TCA_ACT_FLAGS_SKIP_SW) ? true : false;
++ }
++ 
++ static bool tc_act_in_hw(struct tc_action *act)
++ {
++ 	return !!act->in_hw_count;
++ }
++ 
++ /* SKIP_HW and SKIP_SW are mutually exclusive flags. */
++ static bool tc_act_flags_valid(u32 flags)
++ {
++ 	flags &= TCA_ACT_FLAGS_SKIP_HW | TCA_ACT_FLAGS_SKIP_SW;
++ 
++ 	return flags ^ (TCA_ACT_FLAGS_SKIP_HW | TCA_ACT_FLAGS_SKIP_SW);
++ }
++ 
++ static int offload_action_init(struct flow_offload_action *fl_action,
++ 			       struct tc_action *act,
++ 			       enum offload_act_command  cmd,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	fl_action->extack = extack;
++ 	fl_action->command = cmd;
++ 	fl_action->index = act->tcfa_index;
++ 
++ 	if (act->ops->offload_act_setup) {
++ 		spin_lock_bh(&act->tcfa_lock);
++ 		err = act->ops->offload_act_setup(act, fl_action, NULL,
++ 						  false, extack);
++ 		spin_unlock_bh(&act->tcfa_lock);
++ 		return err;
++ 	}
++ 
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static int tcf_action_offload_cmd_ex(struct flow_offload_action *fl_act,
++ 				     u32 *hw_count)
++ {
++ 	int err;
++ 
++ 	err = flow_indr_dev_setup_offload(NULL, NULL, TC_SETUP_ACT,
++ 					  fl_act, NULL, NULL);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (hw_count)
++ 		*hw_count = err;
++ 
++ 	return 0;
++ }
++ 
++ static int tcf_action_offload_cmd_cb_ex(struct flow_offload_action *fl_act,
++ 					u32 *hw_count,
++ 					flow_indr_block_bind_cb_t *cb,
++ 					void *cb_priv)
++ {
++ 	int err;
++ 
++ 	err = cb(NULL, NULL, cb_priv, TC_SETUP_ACT, NULL, fl_act, NULL);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (hw_count)
++ 		*hw_count = 1;
++ 
++ 	return 0;
++ }
++ 
++ static int tcf_action_offload_cmd(struct flow_offload_action *fl_act,
++ 				  u32 *hw_count,
++ 				  flow_indr_block_bind_cb_t *cb,
++ 				  void *cb_priv)
++ {
++ 	return cb ? tcf_action_offload_cmd_cb_ex(fl_act, hw_count,
++ 						 cb, cb_priv) :
++ 		    tcf_action_offload_cmd_ex(fl_act, hw_count);
++ }
++ 
++ static int tcf_action_offload_add_ex(struct tc_action *action,
++ 				     struct netlink_ext_ack *extack,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_priv)
++ {
++ 	bool skip_sw = tc_act_skip_sw(action->tcfa_flags);
++ 	struct tc_action *actions[TCA_ACT_MAX_PRIO] = {
++ 		[0] = action,
++ 	};
++ 	struct flow_offload_action *fl_action;
++ 	u32 in_hw_count = 0;
++ 	int num, err = 0;
++ 
++ 	if (tc_act_skip_hw(action->tcfa_flags))
++ 		return 0;
++ 
++ 	num = tcf_offload_act_num_actions_single(action);
++ 	fl_action = offload_action_alloc(num);
++ 	if (!fl_action)
++ 		return -ENOMEM;
++ 
++ 	err = offload_action_init(fl_action, action, FLOW_ACT_REPLACE, extack);
++ 	if (err)
++ 		goto fl_err;
++ 
++ 	err = tc_setup_action(&fl_action->action, actions, extack);
++ 	if (err) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Failed to setup tc actions for offload");
++ 		goto fl_err;
++ 	}
++ 
++ 	err = tcf_action_offload_cmd(fl_action, &in_hw_count, cb, cb_priv);
++ 	if (!err)
++ 		cb ? offload_action_hw_count_inc(action, in_hw_count) :
++ 		     offload_action_hw_count_set(action, in_hw_count);
++ 
++ 	if (skip_sw && !tc_act_in_hw(action))
++ 		err = -EINVAL;
++ 
++ 	tc_cleanup_offload_action(&fl_action->action);
++ 
++ fl_err:
++ 	kfree(fl_action);
++ 
++ 	return err;
++ }
++ 
++ /* offload the tc action after it is inserted */
++ static int tcf_action_offload_add(struct tc_action *action,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	return tcf_action_offload_add_ex(action, extack, NULL, NULL);
++ }
++ 
++ int tcf_action_update_hw_stats(struct tc_action *action)
++ {
++ 	struct flow_offload_action fl_act = {};
++ 	int err;
++ 
++ 	if (!tc_act_in_hw(action))
++ 		return -EOPNOTSUPP;
++ 
++ 	err = offload_action_init(&fl_act, action, FLOW_ACT_STATS, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = tcf_action_offload_cmd(&fl_act, NULL, NULL, NULL);
++ 	if (!err) {
++ 		preempt_disable();
++ 		tcf_action_stats_update(action, fl_act.stats.bytes,
++ 					fl_act.stats.pkts,
++ 					fl_act.stats.drops,
++ 					fl_act.stats.lastused,
++ 					true);
++ 		preempt_enable();
++ 		action->used_hw_stats = fl_act.stats.used_hw_stats;
++ 		action->used_hw_stats_valid = true;
++ 	} else {
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tcf_action_update_hw_stats);
++ 
++ static int tcf_action_offload_del_ex(struct tc_action *action,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_priv)
++ {
++ 	struct flow_offload_action fl_act = {};
++ 	u32 in_hw_count = 0;
++ 	int err = 0;
++ 
++ 	if (!tc_act_in_hw(action))
++ 		return 0;
++ 
++ 	err = offload_action_init(&fl_act, action, FLOW_ACT_DESTROY, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = tcf_action_offload_cmd(&fl_act, &in_hw_count, cb, cb_priv);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	if (!cb && action->in_hw_count != in_hw_count)
++ 		return -EINVAL;
++ 
++ 	/* do not need to update hw state when deleting action */
++ 	if (cb && in_hw_count)
++ 		offload_action_hw_count_dec(action, in_hw_count);
++ 
++ 	return 0;
++ }
++ 
++ static int tcf_action_offload_del(struct tc_action *action)
++ {
++ 	return tcf_action_offload_del_ex(action, NULL, NULL);
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static void tcf_action_cleanup(struct tc_action *p)
+  {
+ -	tcf_action_offload_del(p);
+  	if (p->ops->cleanup)
+  		p->ops->cleanup(p);
+  
+diff --cc net/sched/act_csum.c
+index 7e4c90a0a58f,22847ee009ef..000000000000
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@@ -700,6 -695,25 +700,28 @@@ static size_t tcf_csum_get_fill_size(co
+  	return nla_total_size(sizeof(struct tc_csum));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_csum_offload_act_setup(struct tc_action *act, void *entry_data,
++ 				      u32 *index_inc, bool bind,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		entry->id = FLOW_ACTION_CSUM;
++ 		entry->csum_flags = tcf_csum_update_flags(act);
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		fl_action->id = FLOW_ACTION_CSUM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_csum_ops = {
+  	.kind		= "csum",
+  	.id		= TCA_ID_CSUM,
+diff --cc net/sched/act_ct.c
+index 2346a574da20,8af9d6e5ba61..000000000000
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@@ -1499,6 -1583,27 +1499,30 @@@ static void tcf_stats_update(struct tc_
+  	c->tcf_tm.lastuse = max_t(u64, c->tcf_tm.lastuse, lastuse);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_ct_offload_act_setup(struct tc_action *act, void *entry_data,
++ 				    u32 *index_inc, bool bind,
++ 				    struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		entry->id = FLOW_ACTION_CT;
++ 		entry->ct.action = tcf_ct_action(act);
++ 		entry->ct.zone = tcf_ct_zone(act);
++ 		entry->ct.flow_table = tcf_ct_ft(act);
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		fl_action->id = FLOW_ACTION_CT;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_ct_ops = {
+  	.kind		=	"ct",
+  	.id		=	TCA_ID_CT,
+diff --cc net/sched/act_gact.c
+index 540cebb57be7,db84a0473cc1..000000000000
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@@ -257,6 -252,44 +257,47 @@@ static size_t tcf_gact_get_fill_size(co
+  	return sz;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_gact_offload_act_setup(struct tc_action *act, void *entry_data,
++ 				      u32 *index_inc, bool bind,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		if (is_tcf_gact_ok(act)) {
++ 			entry->id = FLOW_ACTION_ACCEPT;
++ 		} else if (is_tcf_gact_shot(act)) {
++ 			entry->id = FLOW_ACTION_DROP;
++ 		} else if (is_tcf_gact_trap(act)) {
++ 			entry->id = FLOW_ACTION_TRAP;
++ 		} else if (is_tcf_gact_goto_chain(act)) {
++ 			entry->id = FLOW_ACTION_GOTO;
++ 			entry->chain_index = tcf_gact_goto_chain_index(act);
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		if (is_tcf_gact_ok(act))
++ 			fl_action->id = FLOW_ACTION_ACCEPT;
++ 		else if (is_tcf_gact_shot(act))
++ 			fl_action->id = FLOW_ACTION_DROP;
++ 		else if (is_tcf_gact_trap(act))
++ 			fl_action->id = FLOW_ACTION_TRAP;
++ 		else if (is_tcf_gact_goto_chain(act))
++ 			fl_action->id = FLOW_ACTION_GOTO;
++ 		else
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_gact_ops = {
+  	.kind		=	"gact",
+  	.id		=	TCA_ID_GACT,
+diff --cc net/sched/act_gate.c
+index ac985c53ebaf,fd5155274733..000000000000
+--- a/net/sched/act_gate.c
++++ b/net/sched/act_gate.c
+@@@ -597,6 -597,55 +597,58 @@@ static size_t tcf_gate_get_fill_size(co
+  	return nla_total_size(sizeof(struct tc_gate));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcf_gate_entry_destructor(void *priv)
++ {
++ 	struct action_gate_entry *oe = priv;
++ 
++ 	kfree(oe);
++ }
++ 
++ static int tcf_gate_get_entries(struct flow_action_entry *entry,
++ 				const struct tc_action *act)
++ {
++ 	entry->gate.entries = tcf_gate_get_list(act);
++ 
++ 	if (!entry->gate.entries)
++ 		return -EINVAL;
++ 
++ 	entry->destructor = tcf_gate_entry_destructor;
++ 	entry->destructor_priv = entry->gate.entries;
++ 
++ 	return 0;
++ }
++ 
++ static int tcf_gate_offload_act_setup(struct tc_action *act, void *entry_data,
++ 				      u32 *index_inc, bool bind,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		entry->id = FLOW_ACTION_GATE;
++ 		entry->gate.prio = tcf_gate_prio(act);
++ 		entry->gate.basetime = tcf_gate_basetime(act);
++ 		entry->gate.cycletime = tcf_gate_cycletime(act);
++ 		entry->gate.cycletimeext = tcf_gate_cycletimeext(act);
++ 		entry->gate.num_entries = tcf_gate_num_entries(act);
++ 		err = tcf_gate_get_entries(entry, act);
++ 		if (err)
++ 			return err;
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		fl_action->id = FLOW_ACTION_GATE;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_gate_ops = {
+  	.kind		=	"gate",
+  	.id		=	TCA_ID_GATE,
+diff --cc net/sched/act_mirred.c
+index de09f8f40c4c,70a6a4447e6b..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -453,6 -450,56 +453,59 @@@ static size_t tcf_mirred_get_fill_size(
+  	return nla_total_size(sizeof(struct tc_mirred));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcf_offload_mirred_get_dev(struct flow_action_entry *entry,
++ 				       const struct tc_action *act)
++ {
++ 	entry->dev = act->ops->get_dev(act, &entry->destructor);
++ 	if (!entry->dev)
++ 		return;
++ 	entry->destructor_priv = entry->dev;
++ }
++ 
++ static int tcf_mirred_offload_act_setup(struct tc_action *act, void *entry_data,
++ 					u32 *index_inc, bool bind,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		if (is_tcf_mirred_egress_redirect(act)) {
++ 			entry->id = FLOW_ACTION_REDIRECT;
++ 			tcf_offload_mirred_get_dev(entry, act);
++ 		} else if (is_tcf_mirred_egress_mirror(act)) {
++ 			entry->id = FLOW_ACTION_MIRRED;
++ 			tcf_offload_mirred_get_dev(entry, act);
++ 		} else if (is_tcf_mirred_ingress_redirect(act)) {
++ 			entry->id = FLOW_ACTION_REDIRECT_INGRESS;
++ 			tcf_offload_mirred_get_dev(entry, act);
++ 		} else if (is_tcf_mirred_ingress_mirror(act)) {
++ 			entry->id = FLOW_ACTION_MIRRED_INGRESS;
++ 			tcf_offload_mirred_get_dev(entry, act);
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		if (is_tcf_mirred_egress_redirect(act))
++ 			fl_action->id = FLOW_ACTION_REDIRECT;
++ 		else if (is_tcf_mirred_egress_mirror(act))
++ 			fl_action->id = FLOW_ACTION_MIRRED;
++ 		else if (is_tcf_mirred_ingress_redirect(act))
++ 			fl_action->id = FLOW_ACTION_REDIRECT_INGRESS;
++ 		else if (is_tcf_mirred_ingress_mirror(act))
++ 			fl_action->id = FLOW_ACTION_MIRRED_INGRESS;
++ 		else
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_mirred_ops = {
+  	.kind		=	"mirred",
+  	.id		=	TCA_ID_MIRRED,
+diff --cc net/sched/act_mpls.c
+index 9789d894911b,23fcfa5605df..000000000000
+--- a/net/sched/act_mpls.c
++++ b/net/sched/act_mpls.c
+@@@ -385,6 -384,58 +385,61 @@@ static int tcf_mpls_search(struct net *
+  	return tcf_idr_search(tn, a, index);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_mpls_offload_act_setup(struct tc_action *act, void *entry_data,
++ 				      u32 *index_inc, bool bind,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		switch (tcf_mpls_action(act)) {
++ 		case TCA_MPLS_ACT_PUSH:
++ 			entry->id = FLOW_ACTION_MPLS_PUSH;
++ 			entry->mpls_push.proto = tcf_mpls_proto(act);
++ 			entry->mpls_push.label = tcf_mpls_label(act);
++ 			entry->mpls_push.tc = tcf_mpls_tc(act);
++ 			entry->mpls_push.bos = tcf_mpls_bos(act);
++ 			entry->mpls_push.ttl = tcf_mpls_ttl(act);
++ 			break;
++ 		case TCA_MPLS_ACT_POP:
++ 			entry->id = FLOW_ACTION_MPLS_POP;
++ 			entry->mpls_pop.proto = tcf_mpls_proto(act);
++ 			break;
++ 		case TCA_MPLS_ACT_MODIFY:
++ 			entry->id = FLOW_ACTION_MPLS_MANGLE;
++ 			entry->mpls_mangle.label = tcf_mpls_label(act);
++ 			entry->mpls_mangle.tc = tcf_mpls_tc(act);
++ 			entry->mpls_mangle.bos = tcf_mpls_bos(act);
++ 			entry->mpls_mangle.ttl = tcf_mpls_ttl(act);
++ 			break;
++ 		default:
++ 			return -EOPNOTSUPP;
++ 		}
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		switch (tcf_mpls_action(act)) {
++ 		case TCA_MPLS_ACT_PUSH:
++ 			fl_action->id = FLOW_ACTION_MPLS_PUSH;
++ 			break;
++ 		case TCA_MPLS_ACT_POP:
++ 			fl_action->id = FLOW_ACTION_MPLS_POP;
++ 			break;
++ 		case TCA_MPLS_ACT_MODIFY:
++ 			fl_action->id = FLOW_ACTION_MPLS_MANGLE;
++ 			break;
++ 		default:
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_mpls_ops = {
+  	.kind		=	"mpls",
+  	.id		=	TCA_ID_MPLS,
+diff --cc net/sched/act_pedit.c
+index 22175eb1255f,dc12d502c4fe..000000000000
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@@ -491,6 -487,40 +491,43 @@@ static int tcf_pedit_search(struct net 
+  	return tcf_idr_search(tn, a, index);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_pedit_offload_act_setup(struct tc_action *act, void *entry_data,
++ 				       u32 *index_inc, bool bind,
++ 				       struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 		int k;
++ 
++ 		for (k = 0; k < tcf_pedit_nkeys(act); k++) {
++ 			switch (tcf_pedit_cmd(act, k)) {
++ 			case TCA_PEDIT_KEY_EX_CMD_SET:
++ 				entry->id = FLOW_ACTION_MANGLE;
++ 				break;
++ 			case TCA_PEDIT_KEY_EX_CMD_ADD:
++ 				entry->id = FLOW_ACTION_ADD;
++ 				break;
++ 			default:
++ 				return -EOPNOTSUPP;
++ 			}
++ 			entry->mangle.htype = tcf_pedit_htype(act, k);
++ 			entry->mangle.mask = tcf_pedit_mask(act, k);
++ 			entry->mangle.val = tcf_pedit_val(act, k);
++ 			entry->mangle.offset = tcf_pedit_offset(act, k);
++ 			entry->hw_stats = tc_act_hw_stats(act->hw_stats);
++ 			entry++;
++ 		}
++ 		*index_inc = k;
++ 	} else {
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_pedit_ops = {
+  	.kind		=	"pedit",
+  	.id		=	TCA_ID_PEDIT,
+diff --cc net/sched/act_police.c
+index ff539596b715,77c17e9b46d1..000000000000
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@@ -423,6 -419,77 +423,80 @@@ static int tcf_police_search(struct ne
+  	return tcf_idr_search(tn, a, index);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_police_act_to_flow_act(int tc_act, u32 *extval)
++ {
++ 	int act_id = -EOPNOTSUPP;
++ 
++ 	if (!TC_ACT_EXT_OPCODE(tc_act)) {
++ 		if (tc_act == TC_ACT_OK)
++ 			act_id = FLOW_ACTION_ACCEPT;
++ 		else if (tc_act ==  TC_ACT_SHOT)
++ 			act_id = FLOW_ACTION_DROP;
++ 		else if (tc_act == TC_ACT_PIPE)
++ 			act_id = FLOW_ACTION_PIPE;
++ 	} else if (TC_ACT_EXT_CMP(tc_act, TC_ACT_GOTO_CHAIN)) {
++ 		act_id = FLOW_ACTION_GOTO;
++ 		*extval = tc_act & TC_ACT_EXT_VAL_MASK;
++ 	} else if (TC_ACT_EXT_CMP(tc_act, TC_ACT_JUMP)) {
++ 		act_id = FLOW_ACTION_JUMP;
++ 		*extval = tc_act & TC_ACT_EXT_VAL_MASK;
++ 	}
++ 
++ 	return act_id;
++ }
++ 
++ static int tcf_police_offload_act_setup(struct tc_action *act, void *entry_data,
++ 					u32 *index_inc, bool bind,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 		struct tcf_police *police = to_police(act);
++ 		struct tcf_police_params *p;
++ 		int act_id;
++ 
++ 		p = rcu_dereference_protected(police->params,
++ 					      lockdep_is_held(&police->tcf_lock));
++ 
++ 		entry->id = FLOW_ACTION_POLICE;
++ 		entry->police.burst = tcf_police_burst(act);
++ 		entry->police.rate_bytes_ps =
++ 			tcf_police_rate_bytes_ps(act);
++ 		entry->police.peakrate_bytes_ps = tcf_police_peakrate_bytes_ps(act);
++ 		entry->police.avrate = tcf_police_tcfp_ewma_rate(act);
++ 		entry->police.overhead = tcf_police_rate_overhead(act);
++ 		entry->police.burst_pkt = tcf_police_burst_pkt(act);
++ 		entry->police.rate_pkt_ps =
++ 			tcf_police_rate_pkt_ps(act);
++ 		entry->police.mtu = tcf_police_tcfp_mtu(act);
++ 
++ 		act_id = tcf_police_act_to_flow_act(police->tcf_action,
++ 						    &entry->police.exceed.extval);
++ 		if (act_id < 0)
++ 			return act_id;
++ 
++ 		entry->police.exceed.act_id = act_id;
++ 
++ 		act_id = tcf_police_act_to_flow_act(p->tcfp_result,
++ 						    &entry->police.notexceed.extval);
++ 		if (act_id < 0)
++ 			return act_id;
++ 
++ 		entry->police.notexceed.act_id = act_id;
++ 
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		fl_action->id = FLOW_ACTION_POLICE;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  MODULE_AUTHOR("Alexey Kuznetsov");
+  MODULE_DESCRIPTION("Policing actions");
+  MODULE_LICENSE("GPL");
+diff --cc net/sched/act_sample.c
+index ad03dbf8c57f,2f7f5e44d28c..000000000000
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@@ -285,6 -282,36 +285,39 @@@ tcf_sample_get_group(const struct tc_ac
+  	return group;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcf_offload_sample_get_group(struct flow_action_entry *entry,
++ 					 const struct tc_action *act)
++ {
++ 	entry->sample.psample_group =
++ 		act->ops->get_psample_group(act, &entry->destructor);
++ 	entry->destructor_priv = entry->sample.psample_group;
++ }
++ 
++ static int tcf_sample_offload_act_setup(struct tc_action *act, void *entry_data,
++ 					u32 *index_inc, bool bind,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		entry->id = FLOW_ACTION_SAMPLE;
++ 		entry->sample.trunc_size = tcf_sample_trunc_size(act);
++ 		entry->sample.truncate = tcf_sample_truncate(act);
++ 		entry->sample.rate = tcf_sample_rate(act);
++ 		tcf_offload_sample_get_group(entry, act);
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		fl_action->id = FLOW_ACTION_SAMPLE;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_sample_ops = {
+  	.kind	  = "sample",
+  	.id	  = TCA_ID_SAMPLE,
+diff --cc net/sched/act_skbedit.c
+index 15e1b9646bf0,8cd8e506c9c9..000000000000
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@@ -338,6 -327,42 +338,45 @@@ static size_t tcf_skbedit_get_fill_size
+  		+ nla_total_size_64bit(sizeof(u64)); /* TCA_SKBEDIT_FLAGS */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_skbedit_offload_act_setup(struct tc_action *act, void *entry_data,
++ 					 u32 *index_inc, bool bind,
++ 					 struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		if (is_tcf_skbedit_mark(act)) {
++ 			entry->id = FLOW_ACTION_MARK;
++ 			entry->mark = tcf_skbedit_mark(act);
++ 		} else if (is_tcf_skbedit_ptype(act)) {
++ 			entry->id = FLOW_ACTION_PTYPE;
++ 			entry->ptype = tcf_skbedit_ptype(act);
++ 		} else if (is_tcf_skbedit_priority(act)) {
++ 			entry->id = FLOW_ACTION_PRIORITY;
++ 			entry->priority = tcf_skbedit_priority(act);
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		if (is_tcf_skbedit_mark(act))
++ 			fl_action->id = FLOW_ACTION_MARK;
++ 		else if (is_tcf_skbedit_ptype(act))
++ 			fl_action->id = FLOW_ACTION_PTYPE;
++ 		else if (is_tcf_skbedit_priority(act))
++ 			fl_action->id = FLOW_ACTION_PRIORITY;
++ 		else
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_skbedit_ops = {
+  	.kind		=	"skbedit",
+  	.id		=	TCA_ID_SKBEDIT,
+diff --cc net/sched/act_tunnel_key.c
+index 49718e0c173b,3c6f40478c81..000000000000
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@@ -791,6 -787,60 +791,63 @@@ static int tunnel_key_search(struct ne
+  	return tcf_idr_search(tn, a, index);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcf_tunnel_encap_put_tunnel(void *priv)
++ {
++ 	struct ip_tunnel_info *tunnel = priv;
++ 
++ 	kfree(tunnel);
++ }
++ 
++ static int tcf_tunnel_encap_get_tunnel(struct flow_action_entry *entry,
++ 				       const struct tc_action *act)
++ {
++ 	entry->tunnel = tcf_tunnel_info_copy(act);
++ 	if (!entry->tunnel)
++ 		return -ENOMEM;
++ 	entry->destructor = tcf_tunnel_encap_put_tunnel;
++ 	entry->destructor_priv = entry->tunnel;
++ 	return 0;
++ }
++ 
++ static int tcf_tunnel_key_offload_act_setup(struct tc_action *act,
++ 					    void *entry_data,
++ 					    u32 *index_inc,
++ 					    bool bind,
++ 					    struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		if (is_tcf_tunnel_set(act)) {
++ 			entry->id = FLOW_ACTION_TUNNEL_ENCAP;
++ 			err = tcf_tunnel_encap_get_tunnel(entry, act);
++ 			if (err)
++ 				return err;
++ 		} else if (is_tcf_tunnel_release(act)) {
++ 			entry->id = FLOW_ACTION_TUNNEL_DECAP;
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		if (is_tcf_tunnel_set(act))
++ 			fl_action->id = FLOW_ACTION_TUNNEL_ENCAP;
++ 		else if (is_tcf_tunnel_release(act))
++ 			fl_action->id = FLOW_ACTION_TUNNEL_DECAP;
++ 		else
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_tunnel_key_ops = {
+  	.kind		=	"tunnel_key",
+  	.id		=	TCA_ID_TUNNEL_KEY,
+diff --cc net/sched/act_vlan.c
+index b9dcb2d5e0cb,8c89bce99cbd..000000000000
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@@ -375,6 -368,67 +375,70 @@@ static size_t tcf_vlan_get_fill_size(co
+  		+ nla_total_size(sizeof(u8)); /* TCA_VLAN_PUSH_VLAN_PRIORITY */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_vlan_offload_act_setup(struct tc_action *act, void *entry_data,
++ 				      u32 *index_inc, bool bind,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	if (bind) {
++ 		struct flow_action_entry *entry = entry_data;
++ 
++ 		switch (tcf_vlan_action(act)) {
++ 		case TCA_VLAN_ACT_PUSH:
++ 			entry->id = FLOW_ACTION_VLAN_PUSH;
++ 			entry->vlan.vid = tcf_vlan_push_vid(act);
++ 			entry->vlan.proto = tcf_vlan_push_proto(act);
++ 			entry->vlan.prio = tcf_vlan_push_prio(act);
++ 			break;
++ 		case TCA_VLAN_ACT_POP:
++ 			entry->id = FLOW_ACTION_VLAN_POP;
++ 			break;
++ 		case TCA_VLAN_ACT_MODIFY:
++ 			entry->id = FLOW_ACTION_VLAN_MANGLE;
++ 			entry->vlan.vid = tcf_vlan_push_vid(act);
++ 			entry->vlan.proto = tcf_vlan_push_proto(act);
++ 			entry->vlan.prio = tcf_vlan_push_prio(act);
++ 			break;
++ 		case TCA_VLAN_ACT_POP_ETH:
++ 			entry->id = FLOW_ACTION_VLAN_POP_ETH;
++ 			break;
++ 		case TCA_VLAN_ACT_PUSH_ETH:
++ 			entry->id = FLOW_ACTION_VLAN_PUSH_ETH;
++ 			tcf_vlan_push_eth(entry->vlan_push_eth.src, entry->vlan_push_eth.dst, act);
++ 			break;
++ 		default:
++ 			return -EOPNOTSUPP;
++ 		}
++ 		*index_inc = 1;
++ 	} else {
++ 		struct flow_offload_action *fl_action = entry_data;
++ 
++ 		switch (tcf_vlan_action(act)) {
++ 		case TCA_VLAN_ACT_PUSH:
++ 			fl_action->id = FLOW_ACTION_VLAN_PUSH;
++ 			break;
++ 		case TCA_VLAN_ACT_POP:
++ 			fl_action->id = FLOW_ACTION_VLAN_POP;
++ 			break;
++ 		case TCA_VLAN_ACT_MODIFY:
++ 			fl_action->id = FLOW_ACTION_VLAN_MANGLE;
++ 			break;
++ 		case TCA_VLAN_ACT_POP_ETH:
++ 			fl_action->id = FLOW_ACTION_VLAN_POP_ETH;
++ 			break;
++ 		case TCA_VLAN_ACT_PUSH_ETH:
++ 			fl_action->id = FLOW_ACTION_VLAN_PUSH_ETH;
++ 			break;
++ 		default:
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  static struct tc_action_ops act_vlan_ops = {
+  	.kind		=	"vlan",
+  	.id		=	TCA_ID_VLAN,
+diff --cc net/sched/cls_api.c
+index 319c68029e64,dd711ae048ff..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -3506,81 -3511,28 +3506,103 @@@ void tc_cleanup_offload_action(struct f
+  }
+  EXPORT_SYMBOL(tc_cleanup_offload_action);
+  
+++<<<<<<< HEAD
+ +static void tcf_mirred_get_dev(struct flow_action_entry *entry,
+ +			       const struct tc_action *act)
+ +{
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	entry->dev = act->ops->get_dev(act, &entry->destructor);
+ +	if (!entry->dev)
+ +		return;
+ +	entry->destructor_priv = entry->dev;
+ +#endif
+ +}
+ +
+ +static void tcf_tunnel_encap_put_tunnel(void *priv)
+ +{
+ +	struct ip_tunnel_info *tunnel = priv;
+ +
+ +	kfree(tunnel);
+ +}
+ +
+ +static int tcf_tunnel_encap_get_tunnel(struct flow_action_entry *entry,
+ +				       const struct tc_action *act)
+ +{
+ +	entry->tunnel = tcf_tunnel_info_copy(act);
+ +	if (!entry->tunnel)
+ +		return -ENOMEM;
+ +	entry->destructor = tcf_tunnel_encap_put_tunnel;
+ +	entry->destructor_priv = entry->tunnel;
+ +	return 0;
+ +}
+ +
+ +static void tcf_sample_get_group(struct flow_action_entry *entry,
+ +				 const struct tc_action *act)
+ +{
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	entry->sample.psample_group =
+ +		act->ops->get_psample_group(act, &entry->destructor);
+ +	entry->destructor_priv = entry->sample.psample_group;
+ +#endif
+ +}
+ +
+ +static void tcf_gate_entry_destructor(void *priv)
+ +{
+ +	struct action_gate_entry *oe = priv;
+ +
+ +	kfree(oe);
+ +}
+ +
+ +static int tcf_gate_get_entries(struct flow_action_entry *entry,
+ +				const struct tc_action *act)
+ +{
+ +	entry->gate.entries = tcf_gate_get_list(act);
+ +
+ +	if (!entry->gate.entries)
+ +		return -EINVAL;
+ +
+ +	entry->destructor = tcf_gate_entry_destructor;
+ +	entry->destructor_priv = entry->gate.entries;
+ +
+ +	return 0;
+ +}
+ +
+ +static enum flow_action_hw_stats tc_act_hw_stats(u8 hw_stats)
+ +{
+ +	if (WARN_ON_ONCE(hw_stats > TCA_ACT_HW_STATS_ANY))
+ +		return FLOW_ACTION_HW_STATS_DONT_CARE;
+ +	else if (!hw_stats)
+ +		return FLOW_ACTION_HW_STATS_DISABLED;
+ +
+ +	return hw_stats;
+ +}
+ +
+ +int tc_setup_offload_action(struct flow_action *flow_action,
+ +			    const struct tcf_exts *exts)
+++=======
++ static int tc_setup_offload_act(struct tc_action *act,
++ 				struct flow_action_entry *entry,
++ 				u32 *index_inc,
++ 				struct netlink_ext_ack *extack)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	if (act->ops->offload_act_setup)
++ 		return act->ops->offload_act_setup(act, entry, index_inc, true,
++ 						   extack);
++ 	else
++ 		return -EOPNOTSUPP;
++ #else
++ 	return 0;
++ #endif
++ }
++ 
++ int tc_setup_action(struct flow_action *flow_action,
++ 		    struct tc_action *actions[],
++ 		    struct netlink_ext_ack *extack)
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  {
+ -	int i, j, index, err = 0;
+  	struct tc_action *act;
+ +	int i, j, k, err = 0;
+  
+  	BUILD_BUG_ON(TCA_ACT_HW_STATS_ANY != FLOW_ACTION_HW_STATS_ANY);
+  	BUILD_BUG_ON(TCA_ACT_HW_STATS_IMMEDIATE != FLOW_ACTION_HW_STATS_IMMEDIATE);
+@@@ -3600,153 -3552,14 +3622,162 @@@
+  			goto err_out_locked;
+  
+  		entry->hw_stats = tc_act_hw_stats(act->hw_stats);
+++<<<<<<< HEAD
+ +
+ +		if (is_tcf_gact_ok(act)) {
+ +			entry->id = FLOW_ACTION_ACCEPT;
+ +		} else if (is_tcf_gact_shot(act)) {
+ +			entry->id = FLOW_ACTION_DROP;
+ +		} else if (is_tcf_gact_trap(act)) {
+ +			entry->id = FLOW_ACTION_TRAP;
+ +		} else if (is_tcf_gact_goto_chain(act)) {
+ +			entry->id = FLOW_ACTION_GOTO;
+ +			entry->chain_index = tcf_gact_goto_chain_index(act);
+ +		} else if (is_tcf_mirred_egress_redirect(act)) {
+ +			entry->id = FLOW_ACTION_REDIRECT;
+ +			tcf_mirred_get_dev(entry, act);
+ +		} else if (is_tcf_mirred_egress_mirror(act)) {
+ +			entry->id = FLOW_ACTION_MIRRED;
+ +			tcf_mirred_get_dev(entry, act);
+ +		} else if (is_tcf_mirred_ingress_redirect(act)) {
+ +			entry->id = FLOW_ACTION_REDIRECT_INGRESS;
+ +			tcf_mirred_get_dev(entry, act);
+ +		} else if (is_tcf_mirred_ingress_mirror(act)) {
+ +			entry->id = FLOW_ACTION_MIRRED_INGRESS;
+ +			tcf_mirred_get_dev(entry, act);
+ +		} else if (is_tcf_vlan(act)) {
+ +			switch (tcf_vlan_action(act)) {
+ +			case TCA_VLAN_ACT_PUSH:
+ +				entry->id = FLOW_ACTION_VLAN_PUSH;
+ +				entry->vlan.vid = tcf_vlan_push_vid(act);
+ +				entry->vlan.proto = tcf_vlan_push_proto(act);
+ +				entry->vlan.prio = tcf_vlan_push_prio(act);
+ +				break;
+ +			case TCA_VLAN_ACT_POP:
+ +				entry->id = FLOW_ACTION_VLAN_POP;
+ +				break;
+ +			case TCA_VLAN_ACT_MODIFY:
+ +				entry->id = FLOW_ACTION_VLAN_MANGLE;
+ +				entry->vlan.vid = tcf_vlan_push_vid(act);
+ +				entry->vlan.proto = tcf_vlan_push_proto(act);
+ +				entry->vlan.prio = tcf_vlan_push_prio(act);
+ +				break;
+ +			default:
+ +				err = -EOPNOTSUPP;
+ +				goto err_out_locked;
+ +			}
+ +		} else if (is_tcf_tunnel_set(act)) {
+ +			entry->id = FLOW_ACTION_TUNNEL_ENCAP;
+ +			err = tcf_tunnel_encap_get_tunnel(entry, act);
+ +			if (err)
+ +				goto err_out_locked;
+ +		} else if (is_tcf_tunnel_release(act)) {
+ +			entry->id = FLOW_ACTION_TUNNEL_DECAP;
+ +		} else if (is_tcf_pedit(act)) {
+ +			for (k = 0; k < tcf_pedit_nkeys(act); k++) {
+ +				switch (tcf_pedit_cmd(act, k)) {
+ +				case TCA_PEDIT_KEY_EX_CMD_SET:
+ +					entry->id = FLOW_ACTION_MANGLE;
+ +					break;
+ +				case TCA_PEDIT_KEY_EX_CMD_ADD:
+ +					entry->id = FLOW_ACTION_ADD;
+ +					break;
+ +				default:
+ +					err = -EOPNOTSUPP;
+ +					goto err_out_locked;
+ +				}
+ +				entry->mangle.htype = tcf_pedit_htype(act, k);
+ +				entry->mangle.mask = tcf_pedit_mask(act, k);
+ +				entry->mangle.val = tcf_pedit_val(act, k);
+ +				entry->mangle.offset = tcf_pedit_offset(act, k);
+ +				entry->hw_stats = tc_act_hw_stats(act->hw_stats);
+ +				entry = &flow_action->entries[++j];
+ +			}
+ +		} else if (is_tcf_csum(act)) {
+ +			entry->id = FLOW_ACTION_CSUM;
+ +			entry->csum_flags = tcf_csum_update_flags(act);
+ +		} else if (is_tcf_skbedit_mark(act)) {
+ +			entry->id = FLOW_ACTION_MARK;
+ +			entry->mark = tcf_skbedit_mark(act);
+ +		} else if (is_tcf_sample(act)) {
+ +			entry->id = FLOW_ACTION_SAMPLE;
+ +			entry->sample.trunc_size = tcf_sample_trunc_size(act);
+ +			entry->sample.truncate = tcf_sample_truncate(act);
+ +			entry->sample.rate = tcf_sample_rate(act);
+ +			tcf_sample_get_group(entry, act);
+ +		} else if (is_tcf_police(act)) {
+ +			entry->id = FLOW_ACTION_POLICE;
+ +			entry->police.burst = tcf_police_burst(act);
+ +			entry->police.rate_bytes_ps =
+ +				tcf_police_rate_bytes_ps(act);
+ +			entry->police.burst_pkt = tcf_police_burst_pkt(act);
+ +			entry->police.rate_pkt_ps =
+ +				tcf_police_rate_pkt_ps(act);
+ +			entry->police.mtu = tcf_police_tcfp_mtu(act);
+ +			entry->police.index = act->tcfa_index;
+ +		} else if (is_tcf_ct(act)) {
+ +			entry->id = FLOW_ACTION_CT;
+ +			entry->ct.action = tcf_ct_action(act);
+ +			entry->ct.zone = tcf_ct_zone(act);
+ +			entry->ct.flow_table = tcf_ct_ft(act);
+ +		} else if (is_tcf_mpls(act)) {
+ +			switch (tcf_mpls_action(act)) {
+ +			case TCA_MPLS_ACT_PUSH:
+ +				entry->id = FLOW_ACTION_MPLS_PUSH;
+ +				entry->mpls_push.proto = tcf_mpls_proto(act);
+ +				entry->mpls_push.label = tcf_mpls_label(act);
+ +				entry->mpls_push.tc = tcf_mpls_tc(act);
+ +				entry->mpls_push.bos = tcf_mpls_bos(act);
+ +				entry->mpls_push.ttl = tcf_mpls_ttl(act);
+ +				break;
+ +			case TCA_MPLS_ACT_POP:
+ +				entry->id = FLOW_ACTION_MPLS_POP;
+ +				entry->mpls_pop.proto = tcf_mpls_proto(act);
+ +				break;
+ +			case TCA_MPLS_ACT_MODIFY:
+ +				entry->id = FLOW_ACTION_MPLS_MANGLE;
+ +				entry->mpls_mangle.label = tcf_mpls_label(act);
+ +				entry->mpls_mangle.tc = tcf_mpls_tc(act);
+ +				entry->mpls_mangle.bos = tcf_mpls_bos(act);
+ +				entry->mpls_mangle.ttl = tcf_mpls_ttl(act);
+ +				break;
+ +			default:
+ +				err = -EOPNOTSUPP;
+ +				goto err_out_locked;
+ +			}
+ +		} else if (is_tcf_skbedit_ptype(act)) {
+ +			entry->id = FLOW_ACTION_PTYPE;
+ +			entry->ptype = tcf_skbedit_ptype(act);
+ +		} else if (is_tcf_skbedit_priority(act)) {
+ +			entry->id = FLOW_ACTION_PRIORITY;
+ +			entry->priority = tcf_skbedit_priority(act);
+ +		} else if (is_tcf_gate(act)) {
+ +			entry->id = FLOW_ACTION_GATE;
+ +			entry->gate.index = tcf_gate_index(act);
+ +			entry->gate.prio = tcf_gate_prio(act);
+ +			entry->gate.basetime = tcf_gate_basetime(act);
+ +			entry->gate.cycletime = tcf_gate_cycletime(act);
+ +			entry->gate.cycletimeext = tcf_gate_cycletimeext(act);
+ +			entry->gate.num_entries = tcf_gate_num_entries(act);
+ +			err = tcf_gate_get_entries(entry, act);
+ +			if (err)
+ +				goto err_out_locked;
+ +		} else {
+ +			err = -EOPNOTSUPP;
+++=======
++ 		entry->hw_index = act->tcfa_index;
++ 		index = 0;
++ 		err = tc_setup_offload_act(act, entry, &index, extack);
++ 		if (!err)
++ 			j += index;
++ 		else
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  			goto err_out_locked;
+ +		}
+  		spin_unlock_bh(&act->tcfa_lock);
+ +
+ +		if (!is_tcf_pedit(act))
+ +			j++;
+  	}
+  
+  err_out:
+@@@ -3758,6 -3571,20 +3789,23 @@@ err_out_locked
+  	spin_unlock_bh(&act->tcfa_lock);
+  	goto err_out;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int tc_setup_offload_action(struct flow_action *flow_action,
++ 			    const struct tcf_exts *exts,
++ 			    struct netlink_ext_ack *extack)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	if (!exts)
++ 		return 0;
++ 
++ 	return tc_setup_action(flow_action, exts->actions, extack);
++ #else
++ 	return 0;
++ #endif
++ }
+++>>>>>>> c2ccf84ecb71 (net/sched: act_api: Add extack to offload_act_setup() callback)
+  EXPORT_SYMBOL(tc_setup_offload_action);
+  
+  unsigned int tcf_exts_num_actions(struct tcf_exts *exts)
+* Unmerged path include/net/act_api.h
+* Unmerged path include/net/pkt_cls.h
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/act_csum.c
+* Unmerged path net/sched/act_ct.c
+* Unmerged path net/sched/act_gact.c
+* Unmerged path net/sched/act_gate.c
+* Unmerged path net/sched/act_mirred.c
+* Unmerged path net/sched/act_mpls.c
+* Unmerged path net/sched/act_pedit.c
+* Unmerged path net/sched/act_police.c
+* Unmerged path net/sched/act_sample.c
+* Unmerged path net/sched/act_skbedit.c
+* Unmerged path net/sched/act_tunnel_key.c
+* Unmerged path net/sched/act_vlan.c
+* Unmerged path net/sched/cls_api.c
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index 0208edfada27..081d728cf782 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -469,7 +469,8 @@ static int fl_hw_replace_filter(struct tcf_proto *tp,
+ 	cls_flower.rule->match.key = &f->mkey;
+ 	cls_flower.classid = f->res.classid;
+ 
+-	err = tc_setup_offload_action(&cls_flower.rule->action, &f->exts);
++	err = tc_setup_offload_action(&cls_flower.rule->action, &f->exts,
++				      cls_flower.common.extack);
+ 	if (err) {
+ 		kfree(cls_flower.rule);
+ 		NL_SET_ERR_MSG_MOD(cls_flower.common.extack,
+@@ -2283,7 +2284,8 @@ static int fl_reoffload(struct tcf_proto *tp, bool add, flow_setup_cb_t *cb,
+ 		cls_flower.rule->match.mask = &f->mask->key;
+ 		cls_flower.rule->match.key = &f->mkey;
+ 
+-		err = tc_setup_offload_action(&cls_flower.rule->action, &f->exts);
++		err = tc_setup_offload_action(&cls_flower.rule->action, &f->exts,
++					      cls_flower.common.extack);
+ 		if (err) {
+ 			kfree(cls_flower.rule);
+ 			NL_SET_ERR_MSG_MOD(cls_flower.common.extack,
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+index b35032839f3c..e7984f21731b 100644
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -101,7 +101,8 @@ static int mall_replace_hw_filter(struct tcf_proto *tp,
+ 	cls_mall.command = TC_CLSMATCHALL_REPLACE;
+ 	cls_mall.cookie = cookie;
+ 
+-	err = tc_setup_offload_action(&cls_mall.rule->action, &head->exts);
++	err = tc_setup_offload_action(&cls_mall.rule->action, &head->exts,
++				      cls_mall.common.extack);
+ 	if (err) {
+ 		kfree(cls_mall.rule);
+ 		mall_destroy_hw_filter(tp, head, cookie, NULL);
+@@ -303,7 +304,8 @@ static int mall_reoffload(struct tcf_proto *tp, bool add, flow_setup_cb_t *cb,
+ 		TC_CLSMATCHALL_REPLACE : TC_CLSMATCHALL_DESTROY;
+ 	cls_mall.cookie = (unsigned long)head;
+ 
+-	err = tc_setup_offload_action(&cls_mall.rule->action, &head->exts);
++	err = tc_setup_offload_action(&cls_mall.rule->action, &head->exts,
++				      cls_mall.common.extack);
+ 	if (err) {
+ 		kfree(cls_mall.rule);
+ 		NL_SET_ERR_MSG_MOD(cls_mall.common.extack,
