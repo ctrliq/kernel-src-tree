@@ -1,0 +1,143 @@
+PCI: Add pcie_reset_flr() with 'probe' argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Amey Narkhede <ameynarkhede03@gmail.com>
+commit 56f107d7813f116484019617043393a7753ffcbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/56f107d7.failed
+
+Most reset methods are of the form "pci_*_reset(dev, probe)".  pcie_flr()
+was an exception because it relied on a separate pcie_has_flr() function
+instead of taking a "probe" argument.
+
+Add "pcie_reset_flr(dev, probe)" to follow the convention.  Remove
+pcie_has_flr().
+
+Some pcie_flr() callers that did not use pcie_has_flr() remain.
+
+[bhelgaas: commit log, rework pcie_reset_flr() to use dev->devcap directly]
+Link: https://lore.kernel.org/r/20210817180500.1253-3-ameynarkhede03@gmail.com
+	Signed-off-by: Amey Narkhede <ameynarkhede03@gmail.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Raphael Norwitz <raphael.norwitz@nutanix.com>
+(cherry picked from commit 56f107d7813f116484019617043393a7753ffcbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci.c
+diff --cc drivers/pci/pci.c
+index c3df2812af1a,b0a63bdf8207..000000000000
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@@ -4598,25 -4623,6 +4598,28 @@@ int pci_wait_for_pending_transaction(st
+  EXPORT_SYMBOL(pci_wait_for_pending_transaction);
+  
+  /**
+++<<<<<<< HEAD
+ + * pcie_has_flr - check if a device supports function level resets
+ + * @dev: device to check
+ + *
+ + * Returns true if the device advertises support for PCIe function level
+ + * resets.
+ + */
+ +bool pcie_has_flr(struct pci_dev *dev)
+ +{
+ +	u32 cap;
+ +
+ +	if (dev->dev_flags & PCI_DEV_FLAGS_NO_FLR_RESET)
+ +		return false;
+ +
+ +	pcie_capability_read_dword(dev, PCI_EXP_DEVCAP, &cap);
+ +	return cap & PCI_EXP_DEVCAP_FLR;
+ +}
+ +EXPORT_SYMBOL_GPL(pcie_has_flr);
+ +
+ +/**
+++=======
+++>>>>>>> 56f107d7813f (PCI: Add pcie_reset_flr() with 'probe' argument)
+   * pcie_flr - initiate a PCIe function level reset
+   * @dev: device to reset
+   *
+diff --git a/drivers/crypto/cavium/nitrox/nitrox_main.c b/drivers/crypto/cavium/nitrox/nitrox_main.c
+index b3f6f56f0bc6..b059bbc8d817 100644
+--- a/drivers/crypto/cavium/nitrox/nitrox_main.c
++++ b/drivers/crypto/cavium/nitrox/nitrox_main.c
+@@ -220,9 +220,7 @@ static int nitrox_device_flr(struct pci_dev *pdev)
+ 		return -ENOMEM;
+ 	}
+ 
+-	/* check flr support */
+-	if (pcie_has_flr(pdev))
+-		pcie_flr(pdev);
++	pcie_reset_flr(pdev, 0);
+ 
+ 	pci_restore_state(pdev);
+ 
+* Unmerged path drivers/pci/pci.c
+diff --git a/drivers/pci/pcie/aer.c b/drivers/pci/pcie/aer.c
+index 050d92bbf51c..2314a73d524c 100644
+--- a/drivers/pci/pcie/aer.c
++++ b/drivers/pci/pcie/aer.c
+@@ -1405,13 +1405,11 @@ static pci_ers_result_t aer_root_reset(struct pci_dev *dev)
+ 	}
+ 
+ 	if (type == PCI_EXP_TYPE_RC_EC || type == PCI_EXP_TYPE_RC_END) {
+-		if (pcie_has_flr(dev)) {
+-			rc = pcie_flr(dev);
+-			pci_info(dev, "has been reset (%d)\n", rc);
+-		} else {
+-			pci_info(dev, "not reset (no FLR support)\n");
+-			rc = -ENOTTY;
+-		}
++		rc = pcie_reset_flr(dev, 0);
++		if (!rc)
++			pci_info(dev, "has been reset\n");
++		else
++			pci_info(dev, "not reset (no FLR support: %d)\n", rc);
+ 	} else {
+ 		rc = pci_bus_error_reset(dev);
+ 		pci_info(dev, "%s Port link has been reset (%d)\n",
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 62f27075a735..bdc68b86f675 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -3848,7 +3848,7 @@ static int nvme_disable_and_flr(struct pci_dev *dev, int probe)
+ 	u32 cfg;
+ 
+ 	if (dev->class != PCI_CLASS_STORAGE_EXPRESS ||
+-	    !pcie_has_flr(dev) || !pci_resource_start(dev, 0))
++	    pcie_reset_flr(dev, 1) || !pci_resource_start(dev, 0))
+ 		return -ENOTTY;
+ 
+ 	if (probe)
+@@ -3917,13 +3917,10 @@ static int nvme_disable_and_flr(struct pci_dev *dev, int probe)
+  */
+ static int delay_250ms_after_flr(struct pci_dev *dev, int probe)
+ {
+-	if (!pcie_has_flr(dev))
+-		return -ENOTTY;
+-
+ 	if (probe)
+-		return 0;
++		return pcie_reset_flr(dev, 1);
+ 
+-	pcie_flr(dev);
++	pcie_reset_flr(dev, 0);
+ 
+ 	msleep(250);
+ 
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 0b97f3c12e39..743a75de9b41 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1293,7 +1293,7 @@ u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
+ 			     enum pci_bus_speed *speed,
+ 			     enum pcie_link_width *width);
+ void pcie_print_link_status(struct pci_dev *dev);
+-bool pcie_has_flr(struct pci_dev *dev);
++int pcie_reset_flr(struct pci_dev *dev, int probe);
+ int pcie_flr(struct pci_dev *dev);
+ int __pci_reset_function_locked(struct pci_dev *dev);
+ int pci_reset_function(struct pci_dev *dev);
