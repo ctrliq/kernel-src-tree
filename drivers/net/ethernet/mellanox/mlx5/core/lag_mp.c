@@ -99,10 +99,12 @@ static void mlx5_lag_fib_event_flush(struct notifier_block *nb)
 	flush_workqueue(mp->wq);
 }
 
-static void mlx5_lag_fib_set(struct lag_mp *mp, struct fib_info *fi)
+static void mlx5_lag_fib_set(struct lag_mp *mp, struct fib_info *fi, u32 dst, int dst_len)
 {
 	mp->fib.mfi = fi;
 	mp->fib.priority = fi->fib_priority;
+	mp->fib.dst = dst;
+	mp->fib.dst_len = dst_len;
 }
 
 struct mlx5_fib_event_work {
@@ -115,10 +117,10 @@ struct mlx5_fib_event_work {
 	};
 };
 
-static void mlx5_lag_fib_route_event(struct mlx5_lag *ldev,
-				     unsigned long event,
-				     struct fib_info *fi)
+static void mlx5_lag_fib_route_event(struct mlx5_lag *ldev, unsigned long event,
+				     struct fib_entry_notifier_info *fen_info)
 {
+	struct fib_info *fi = fen_info->fi;
 	struct lag_mp *mp = &ldev->lag_mp;
 
 	/* Handle delete event */
@@ -130,7 +132,9 @@ static void mlx5_lag_fib_route_event(struct mlx5_lag *ldev,
 	}
 
 	/* Handle multipath entry with lower priority value */
-	if (mp->fib.mfi && mp->fib.mfi != fi && fi->fib_priority >= mp->fib.priority)
+	if (mp->fib.mfi && mp->fib.mfi != fi &&
+	    (mp->fib.dst != fen_info->dst || mp->fib.dst_len != fen_info->dst_len) &&
+	    fi->fib_priority >= mp->fib.priority)
 		return;
 
 	/* Handle add/replace event */
@@ -144,7 +148,7 @@ static void mlx5_lag_fib_route_event(struct mlx5_lag *ldev,
 
 			i++;
 			mlx5_lag_set_port_affinity(ldev, i);
-			mlx5_lag_fib_set(mp, fi);
+			mlx5_lag_fib_set(mp, fi, fen_info->dst, fen_info->dst_len);
 		}
 
 		return;
@@ -172,7 +176,7 @@ static void mlx5_lag_fib_route_event(struct mlx5_lag *ldev,
 	}
 
 	mlx5_lag_set_port_affinity(ldev, MLX5_LAG_NORMAL_AFFINITY);
-	mlx5_lag_fib_set(mp, fi);
+	mlx5_lag_fib_set(mp, fi, fen_info->dst, fen_info->dst_len);
 }
 
 static void mlx5_lag_fib_nexthop_event(struct mlx5_lag *ldev,
@@ -213,7 +217,7 @@ static void mlx5_lag_fib_update(struct work_struct *work)
 	case FIB_EVENT_ENTRY_REPLACE:
 	case FIB_EVENT_ENTRY_DEL:
 		mlx5_lag_fib_route_event(ldev, fib_work->event,
-					 fib_work->fen_info.fi);
+					 &fib_work->fen_info);
 		fib_info_put(fib_work->fen_info.fi);
 		break;
 	case FIB_EVENT_NH_ADD:
