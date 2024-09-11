@@ -271,6 +271,8 @@ ice_devlink_flash_update(struct devlink *devlink, const char *path,
 		return err;
 	}
 
+	dev_dbg(dev, "Beginning flash update with file '%s'\n", params->file_name);
+
 	devlink_flash_update_begin_notify(devlink);
 	devlink_flash_update_status_notify(devlink, "Preparing to flash",
 					   component, 0, 0);
