@@ -1,0 +1,303 @@
+mm: base LRU balancing on an explicit cost model
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 1431d4d11abb265e79cd44bed2f5ea93f1bcc57b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1431d4d1.failed
+
+Currently, scan pressure between the anon and file LRU lists is balanced
+based on a mixture of reclaim efficiency and a somewhat vague notion of
+"value" of having certain pages in memory over others.  That concept of
+value is problematic, because it has caused us to count any event that
+remotely makes one LRU list more or less preferrable for reclaim, even
+when these events are not directly comparable and impose very different
+costs on the system.  One example is referenced file pages that we still
+deactivate and referenced anonymous pages that we actually rotate back to
+the head of the list.
+
+There is also conceptual overlap with the LRU algorithm itself.  By
+rotating recently used pages instead of reclaiming them, the algorithm
+already biases the applied scan pressure based on page value.  Thus, when
+rebalancing scan pressure due to rotations, we should think of reclaim
+cost, and leave assessing the page value to the LRU algorithm.
+
+Lastly, considering both value-increasing as well as value-decreasing
+events can sometimes cause the same type of event to be counted twice,
+i.e.  how rotating a page increases the LRU value, while reclaiming it
+succesfully decreases the value.  In itself this will balance out fine,
+but it quietly skews the impact of events that are only recorded once.
+
+The abstract metric of "value", the murky relationship with the LRU
+algorithm, and accounting both negative and positive events make the
+current pressure balancing model hard to reason about and modify.
+
+This patch switches to a balancing model of accounting the concrete,
+actually observed cost of reclaiming one LRU over another.  For now, that
+cost includes pages that are scanned but rotated back to the list head.
+Subsequent patches will add consideration for IO caused by refaulting of
+recently evicted pages.
+
+Replace struct zone_reclaim_stat with two cost counters in the lruvec, and
+make everything that affects cost go through a new lru_note_cost()
+function.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+Link: http://lkml.kernel.org/r/20200520232525.798933-9-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1431d4d11abb265e79cd44bed2f5ea93f1bcc57b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	mm/swap.c
+#	mm/vmscan.c
+diff --cc include/linux/mmzone.h
+index ce2990f782e1,e57248ccb63d..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -303,17 -242,10 +303,24 @@@ static inline int is_active_lru(enum lr
+  	return (lru == LRU_ACTIVE_ANON || lru == LRU_ACTIVE_FILE);
+  }
+  
+++<<<<<<< HEAD
+ +struct zone_reclaim_stat {
+ +	/*
+ +	 * The pageout code in vmscan.c keeps track of how many of the
+ +	 * mem/swap backed and file backed pages are referenced.
+ +	 * The higher the rotated/scanned ratio, the more valuable
+ +	 * that cache is.
+ +	 *
+ +	 * The anon LRU stats live in [0], file LRU stats in [1]
+ +	 */
+ +	unsigned long		recent_rotated[2];
+ +	unsigned long		recent_scanned[2];
+++=======
++ enum lruvec_flags {
++ 	LRUVEC_CONGESTED,		/* lruvec has many dirty pages
++ 					 * backed by a congested BDI
++ 					 */
+++>>>>>>> 1431d4d11abb (mm: base LRU balancing on an explicit cost model)
+  };
+  
+  struct lruvec {
+diff --cc mm/swap.c
+index 70728521e27e,fedeb925dbfe..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -261,14 -278,12 +261,23 @@@ void rotate_reclaimable_page(struct pag
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void update_page_reclaim_stat(struct lruvec *lruvec,
+ +				     int file, int rotated)
+ +{
+ +	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+ +
+ +	reclaim_stat->recent_scanned[file]++;
+ +	if (rotated)
+ +		reclaim_stat->recent_rotated[file]++;
+++=======
++ void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
++ {
++ 	if (file)
++ 		lruvec->file_cost += nr_pages;
++ 	else
++ 		lruvec->anon_cost += nr_pages;
+++>>>>>>> 1431d4d11abb (mm: base LRU balancing on an explicit cost model)
+  }
+  
+  static void __activate_page(struct page *page, struct lruvec *lruvec,
+@@@ -545,7 -538,7 +554,11 @@@ static void lru_deactivate_file_fn(stru
+  
+  	if (active)
+  		__count_vm_event(PGDEACTIVATE);
+++<<<<<<< HEAD
+ +	update_page_reclaim_stat(lruvec, file, 0);
+++=======
++ 	lru_note_cost(lruvec, !file, hpage_nr_pages(page));
+++>>>>>>> 1431d4d11abb (mm: base LRU balancing on an explicit cost model)
+  }
+  
+  static void lru_deactivate_fn(struct page *page, struct lruvec *lruvec,
+@@@ -561,7 -554,7 +574,11 @@@
+  		add_page_to_lru_list(page, lruvec, lru);
+  
+  		__count_vm_events(PGDEACTIVATE, hpage_nr_pages(page));
+++<<<<<<< HEAD
+ +		update_page_reclaim_stat(lruvec, file, 0);
+++=======
++ 		lru_note_cost(lruvec, !file, hpage_nr_pages(page));
+++>>>>>>> 1431d4d11abb (mm: base LRU balancing on an explicit cost model)
+  	}
+  }
+  
+@@@ -586,7 -579,7 +603,11 @@@ static void lru_lazyfree_fn(struct pag
+  
+  		__count_vm_events(PGLAZYFREE, hpage_nr_pages(page));
+  		count_memcg_page_event(page, PGLAZYFREE);
+++<<<<<<< HEAD
+ +		update_page_reclaim_stat(lruvec, 1, 0);
+++=======
++ 		lru_note_cost(lruvec, 0, hpage_nr_pages(page));
+++>>>>>>> 1431d4d11abb (mm: base LRU balancing on an explicit cost model)
+  	}
+  }
+  
+diff --cc mm/vmscan.c
+index 709a0e80e054,c5b2a68f4ef6..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1887,13 -1910,12 +1887,12 @@@ shrink_inactive_list(unsigned long nr_t
+  {
+  	LIST_HEAD(page_list);
+  	unsigned long nr_scanned;
+ -	unsigned int nr_reclaimed = 0;
+ +	unsigned long nr_reclaimed = 0;
+  	unsigned long nr_taken;
+  	struct reclaim_stat stat;
+ -	bool file = is_file_lru(lru);
+ +	int file = is_file_lru(lru);
+  	enum vm_event_item item;
+  	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+- 	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+  	bool stalled = false;
+  
+  	while (unlikely(too_many_isolated(pgdat, file, sc))) {
+@@@ -1917,12 -1939,12 +1916,15 @@@
+  				     &nr_scanned, sc, lru);
+  
+  	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+++<<<<<<< HEAD
+ +	reclaim_stat->recent_scanned[file] += nr_taken;
+ +
+++=======
+++>>>>>>> 1431d4d11abb (mm: base LRU balancing on an explicit cost model)
+  	item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
+ -	if (!cgroup_reclaim(sc))
+ +	if (global_reclaim(sc))
+  		__count_vm_events(item, nr_scanned);
+  	__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
+ -	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
+ -
+  	spin_unlock_irq(&pgdat->lru_lock);
+  
+  	if (nr_taken == 0)
+@@@ -1933,16 -1955,20 +1935,28 @@@
+  
+  	spin_lock_irq(&pgdat->lru_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	move_pages_to_lru(lruvec, &page_list);
++ 
++ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
++ 	/*
++ 	 * Rotating pages costs CPU without actually
++ 	 * progressing toward the reclaim goal.
++ 	 */
++ 	lru_note_cost(lruvec, 0, stat.nr_activate[0]);
++ 	lru_note_cost(lruvec, 1, stat.nr_activate[1]);
+++>>>>>>> 1431d4d11abb (mm: base LRU balancing on an explicit cost model)
+  	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+ -	if (!cgroup_reclaim(sc))
+ +	if (global_reclaim(sc))
+  		__count_vm_events(item, nr_reclaimed);
+  	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+ -	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+ +	reclaim_stat->recent_rotated[0] += stat.nr_activate[0];
+ +	reclaim_stat->recent_rotated[1] += stat.nr_activate[1];
+ +
+ +	putback_inactive_pages(lruvec, &page_list);
+ +
+ +	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+  
+  	spin_unlock_irq(&pgdat->lru_lock);
+  
+@@@ -2127,10 -2085,10 +2139,10 @@@ static void shrink_active_list(unsigne
+  	 * helps balance scan pressure between file and anonymous pages in
+  	 * get_scan_count.
+  	 */
+- 	reclaim_stat->recent_rotated[file] += nr_rotated;
++ 	lru_note_cost(lruvec, file, nr_rotated);
+  
+ -	nr_activate = move_pages_to_lru(lruvec, &l_active);
+ -	nr_deactivate = move_pages_to_lru(lruvec, &l_inactive);
+ +	nr_activate = move_active_pages_to_lru(lruvec, &l_active, lru);
+ +	nr_deactivate = move_active_pages_to_lru(lruvec, &l_inactive, lru - LRU_ACTIVE);
+  	/* Keep all free pages in l_active list */
+  	list_splice(&l_inactive, &l_active);
+  
+@@@ -2299,11 -2237,11 +2311,10 @@@ enum scan_balance 
+   * nr[0] = anon inactive pages to scan; nr[1] = anon active pages to scan
+   * nr[2] = file inactive pages to scan; nr[3] = file active pages to scan
+   */
+ -static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+ -			   unsigned long *nr)
+ +static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ +			   struct scan_control *sc, unsigned long *nr)
+  {
+ -	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+  	int swappiness = mem_cgroup_swappiness(memcg);
+- 	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+  	u64 fraction[2];
+  	u64 denominator = 0;	/* gcc */
+  	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+* Unmerged path include/linux/mmzone.h
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 8552871db183..b89370460ea3 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -325,6 +325,8 @@ extern unsigned long nr_free_pagecache_pages(void);
+ 
+ 
+ /* linux/mm/swap.c */
++extern void lru_note_cost(struct lruvec *lruvec, bool file,
++			  unsigned int nr_pages);
+ extern void lru_cache_add(struct page *);
+ extern void lru_cache_add_anon(struct page *page);
+ extern void lru_cache_add_file(struct page *page);
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 71efd84f37cc..4984d162a925 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3919,23 +3919,17 @@ static int memcg_stat_show(struct seq_file *m, void *v)
+ 	{
+ 		pg_data_t *pgdat;
+ 		struct mem_cgroup_per_node *mz;
+-		struct zone_reclaim_stat *rstat;
+-		unsigned long recent_rotated[2] = {0, 0};
+-		unsigned long recent_scanned[2] = {0, 0};
++		unsigned long anon_cost = 0;
++		unsigned long file_cost = 0;
+ 
+ 		for_each_online_pgdat(pgdat) {
+ 			mz = mem_cgroup_nodeinfo(memcg, pgdat->node_id);
+-			rstat = &mz->lruvec.reclaim_stat;
+ 
+-			recent_rotated[0] += rstat->recent_rotated[0];
+-			recent_rotated[1] += rstat->recent_rotated[1];
+-			recent_scanned[0] += rstat->recent_scanned[0];
+-			recent_scanned[1] += rstat->recent_scanned[1];
++			anon_cost += mz->lruvec.anon_cost;
++			file_cost += mz->lruvec.file_cost;
+ 		}
+-		seq_printf(m, "recent_rotated_anon %lu\n", recent_rotated[0]);
+-		seq_printf(m, "recent_rotated_file %lu\n", recent_rotated[1]);
+-		seq_printf(m, "recent_scanned_anon %lu\n", recent_scanned[0]);
+-		seq_printf(m, "recent_scanned_file %lu\n", recent_scanned[1]);
++		seq_printf(m, "anon_cost %lu\n", anon_cost);
++		seq_printf(m, "file_cost %lu\n", file_cost);
+ 	}
+ #endif
+ 
+* Unmerged path mm/swap.c
+* Unmerged path mm/vmscan.c
