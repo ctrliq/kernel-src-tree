@@ -1,0 +1,130 @@
+rcu/segcblist: Add debug checks for segment lengths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Joel Fernandes (Google) <joel@joelfernandes.org>
+commit b4e6039e8af8c20dfbbdfcaebfcbd7c9d9ffe713
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b4e6039e.failed
+
+This commit adds debug checks near the end of rcu_do_batch() that emit
+warnings if an empty rcu_segcblist structure has non-zero segment counts,
+or, conversely, if a non-empty structure has all-zero segment counts.
+
+	Signed-off-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+[ paulmck: Fix queue/segment-length checks. ]
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit b4e6039e8af8c20dfbbdfcaebfcbd7c9d9ffe713)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/rcu_segcblist.c
+diff --cc kernel/rcu/rcu_segcblist.c
+index 66c440083921,89e0dff890bf..000000000000
+--- a/kernel/rcu/rcu_segcblist.c
++++ b/kernel/rcu/rcu_segcblist.c
+@@@ -101,6 -88,58 +101,61 @@@ static void rcu_segcblist_set_len(struc
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Get the length of a segment of the rcu_segcblist structure. */
++ static long rcu_segcblist_get_seglen(struct rcu_segcblist *rsclp, int seg)
++ {
++ 	return READ_ONCE(rsclp->seglen[seg]);
++ }
++ 
++ /* Return number of callbacks in segmented callback list by summing seglen. */
++ long rcu_segcblist_n_segment_cbs(struct rcu_segcblist *rsclp)
++ {
++ 	long len = 0;
++ 	int i;
++ 
++ 	for (i = RCU_DONE_TAIL; i < RCU_CBLIST_NSEGS; i++)
++ 		len += rcu_segcblist_get_seglen(rsclp, i);
++ 
++ 	return len;
++ }
++ 
++ /* Set the length of a segment of the rcu_segcblist structure. */
++ static void rcu_segcblist_set_seglen(struct rcu_segcblist *rsclp, int seg, long v)
++ {
++ 	WRITE_ONCE(rsclp->seglen[seg], v);
++ }
++ 
++ /* Increase the numeric length of a segment by a specified amount. */
++ static void rcu_segcblist_add_seglen(struct rcu_segcblist *rsclp, int seg, long v)
++ {
++ 	WRITE_ONCE(rsclp->seglen[seg], rsclp->seglen[seg] + v);
++ }
++ 
++ /* Move from's segment length to to's segment. */
++ static void rcu_segcblist_move_seglen(struct rcu_segcblist *rsclp, int from, int to)
++ {
++ 	long len;
++ 
++ 	if (from == to)
++ 		return;
++ 
++ 	len = rcu_segcblist_get_seglen(rsclp, from);
++ 	if (!len)
++ 		return;
++ 
++ 	rcu_segcblist_add_seglen(rsclp, to, len);
++ 	rcu_segcblist_set_seglen(rsclp, from, 0);
++ }
++ 
++ /* Increment segment's length. */
++ static void rcu_segcblist_inc_seglen(struct rcu_segcblist *rsclp, int seg)
++ {
++ 	rcu_segcblist_add_seglen(rsclp, seg, 1);
++ }
++ 
+++>>>>>>> b4e6039e8af8 (rcu/segcblist: Add debug checks for segment lengths)
+  /*
+   * Increase the numeric length of an rcu_segcblist structure by the
+   * specified amount, which can be negative.  This can cause the ->len
+* Unmerged path kernel/rcu/rcu_segcblist.c
+diff --git a/kernel/rcu/rcu_segcblist.h b/kernel/rcu/rcu_segcblist.h
+index 521387794401..8738a9a1812f 100644
+--- a/kernel/rcu/rcu_segcblist.h
++++ b/kernel/rcu/rcu_segcblist.h
+@@ -28,6 +28,9 @@ static inline long rcu_cblist_n_cbs(struct rcu_cblist *rclp)
+ 	return READ_ONCE(rclp->len);
+ }
+ 
++/* Return number of callbacks in segmented callback list by summing seglen. */
++long rcu_segcblist_n_segment_cbs(struct rcu_segcblist *rsclp);
++
+ void rcu_cblist_init(struct rcu_cblist *rclp);
+ void rcu_cblist_enqueue(struct rcu_cblist *rclp, struct rcu_head *rhp);
+ void rcu_cblist_flush_enqueue(struct rcu_cblist *drclp,
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 86082b46d681..01a5f7c17ae9 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -2381,6 +2381,7 @@ int rcutree_dead_cpu(unsigned int cpu)
+ static void rcu_do_batch(struct rcu_data *rdp)
+ {
+ 	int div;
++	bool __maybe_unused empty;
+ 	unsigned long flags;
+ 	const bool offloaded = rcu_segcblist_is_offloaded(&rdp->cblist);
+ 	struct rcu_head *rhp;
+@@ -2496,9 +2497,12 @@ static void rcu_do_batch(struct rcu_data *rdp)
+ 	 * The following usually indicates a double call_rcu().  To track
+ 	 * this down, try building with CONFIG_DEBUG_OBJECTS_RCU_HEAD=y.
+ 	 */
+-	WARN_ON_ONCE(count == 0 && !rcu_segcblist_empty(&rdp->cblist));
++	empty = rcu_segcblist_empty(&rdp->cblist);
++	WARN_ON_ONCE(count == 0 && !empty);
+ 	WARN_ON_ONCE(!IS_ENABLED(CONFIG_RCU_NOCB_CPU) &&
+-		     count != 0 && rcu_segcblist_empty(&rdp->cblist));
++		     count != 0 && empty);
++	WARN_ON_ONCE(count == 0 && rcu_segcblist_n_segment_cbs(&rdp->cblist) != 0);
++	WARN_ON_ONCE(!empty && rcu_segcblist_n_segment_cbs(&rdp->cblist) == 0);
+ 
+ 	rcu_nocb_unlock_irqrestore(rdp, flags);
+ 
