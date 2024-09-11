@@ -1,0 +1,172 @@
+netfilter: nf_tables: fix nat hook table deletion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 1e9451cbda456a170518b2bfd643e2cb980880bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1e9451cb.failed
+
+sybot came up with following transaction:
+ add table ip syz0
+ add chain ip syz0 syz2 { type nat hook prerouting priority 0; policy accept; }
+ add table ip syz0 { flags dormant; }
+ delete chain ip syz0 syz2
+ delete table ip syz0
+
+which yields:
+hook not found, pf 2 num 0
+WARNING: CPU: 0 PID: 6775 at net/netfilter/core.c:413 __nf_unregister_net_hook+0x3e6/0x4a0 net/netfilter/core.c:413
+[..]
+ nft_unregister_basechain_hooks net/netfilter/nf_tables_api.c:206 [inline]
+ nft_table_disable net/netfilter/nf_tables_api.c:835 [inline]
+ nf_tables_table_disable net/netfilter/nf_tables_api.c:868 [inline]
+ nf_tables_commit+0x32d3/0x4d70 net/netfilter/nf_tables_api.c:7550
+ nfnetlink_rcv_batch net/netfilter/nfnetlink.c:486 [inline]
+ nfnetlink_rcv_skb_batch net/netfilter/nfnetlink.c:544 [inline]
+ nfnetlink_rcv+0x14a5/0x1e50 net/netfilter/nfnetlink.c:562
+ netlink_unicast_kernel net/netlink/af_netlink.c:1303 [inline]
+
+Problem is that when I added ability to override base hook registration
+to make nat basechains register with the nat core instead of netfilter
+core, I forgot to update nft_table_disable() to use that instead of
+the 'raw' hook register interface.
+
+In syzbot transaction, the basechain is of 'nat' type. Its registered
+with the nat core.  The switch to 'dormant mode' attempts to delete from
+netfilter core instead.
+
+After updating nft_table_disable/enable to use the correct helper,
+nft_(un)register_basechain_hooks can be folded into the only remaining
+caller.
+
+Because nft_trans_table_enable() won't do anything when the DORMANT flag
+is set, remove the flag first, then re-add it in case re-enablement
+fails, else this patch breaks sequence:
+
+add table ip x { flags dormant; }
+/* add base chains */
+add table ip x
+
+The last 'add' will remove the dormant flags, but won't have any other
+effect -- base chains are not registered.
+Then, next 'set dormant flag' will create another 'hook not found'
+splat.
+
+	Reported-by: syzbot+2570f2c036e3da5db176@syzkaller.appspotmail.com
+Fixes: 4e25ceb80b58 ("netfilter: nf_tables: allow chain type to override hook register")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 1e9451cbda456a170518b2bfd643e2cb980880bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 7f5b4bab8843,88325b264737..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -149,6 -153,41 +149,44 @@@ static void nft_set_trans_bind(const st
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nft_netdev_register_hooks(struct net *net,
++ 				     struct list_head *hook_list)
++ {
++ 	struct nft_hook *hook;
++ 	int err, j;
++ 
++ 	j = 0;
++ 	list_for_each_entry(hook, hook_list, list) {
++ 		err = nf_register_net_hook(net, &hook->ops);
++ 		if (err < 0)
++ 			goto err_register;
++ 
++ 		j++;
++ 	}
++ 	return 0;
++ 
++ err_register:
++ 	list_for_each_entry(hook, hook_list, list) {
++ 		if (j-- <= 0)
++ 			break;
++ 
++ 		nf_unregister_net_hook(net, &hook->ops);
++ 	}
++ 	return err;
++ }
++ 
++ static void nft_netdev_unregister_hooks(struct net *net,
++ 					struct list_head *hook_list)
++ {
++ 	struct nft_hook *hook;
++ 
++ 	list_for_each_entry(hook, hook_list, list)
++ 		nf_unregister_net_hook(net, &hook->ops);
++ }
++ 
+++>>>>>>> 1e9451cbda45 (netfilter: nf_tables: fix nat hook table deletion)
+  static int nf_tables_register_hook(struct net *net,
+  				   const struct nft_table *table,
+  				   struct nft_chain *chain)
+@@@ -166,7 -205,10 +204,14 @@@
+  	if (basechain->type->ops_register)
+  		return basechain->type->ops_register(net, ops);
+  
+++<<<<<<< HEAD
+ +	return nf_register_net_hook(net, ops);
+++=======
++ 	if (table->family == NFPROTO_NETDEV)
++ 		return nft_netdev_register_hooks(net, &basechain->hook_list);
++ 
++ 	return nf_register_net_hook(net, &basechain->ops);
+++>>>>>>> 1e9451cbda45 (netfilter: nf_tables: fix nat hook table deletion)
+  }
+  
+  static void nf_tables_unregister_hook(struct net *net,
+@@@ -185,7 -227,10 +230,14 @@@
+  	if (basechain->type->ops_unregister)
+  		return basechain->type->ops_unregister(net, ops);
+  
+++<<<<<<< HEAD
+ +	nf_unregister_net_hook(net, ops);
+++=======
++ 	if (table->family == NFPROTO_NETDEV)
++ 		nft_netdev_unregister_hooks(net, &basechain->hook_list);
++ 	else
++ 		nf_unregister_net_hook(net, &basechain->ops);
+++>>>>>>> 1e9451cbda45 (netfilter: nf_tables: fix nat hook table deletion)
+  }
+  
+  static int nft_trans_table_add(struct nft_ctx *ctx, int msg_type)
+@@@ -744,7 -820,7 +796,11 @@@ static void nft_table_disable(struct ne
+  		if (cnt && i++ == cnt)
+  			break;
+  
+++<<<<<<< HEAD
+ +		nf_unregister_net_hook(net, &nft_base_chain(chain)->ops);
+++=======
++ 		nf_tables_unregister_hook(net, table, chain);
+++>>>>>>> 1e9451cbda45 (netfilter: nf_tables: fix nat hook table deletion)
+  	}
+  }
+  
+@@@ -759,9 -835,9 +815,13 @@@ static int nf_tables_table_enable(struc
+  		if (!nft_is_base_chain(chain))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		err = nf_register_net_hook(net, &nft_base_chain(chain)->ops);
+++=======
++ 		err = nf_tables_register_hook(net, table, chain);
+++>>>>>>> 1e9451cbda45 (netfilter: nf_tables: fix nat hook table deletion)
+  		if (err < 0)
+ -			goto err_register_hooks;
+ +			goto err;
+  
+  		i++;
+  	}
+* Unmerged path net/netfilter/nf_tables_api.c
