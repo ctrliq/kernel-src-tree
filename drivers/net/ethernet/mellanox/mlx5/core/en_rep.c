@@ -1161,6 +1161,8 @@ static int mlx5e_rep_get_phys_port_name(struct net_device *dev,
 
 	if (rep->vport == FDB_UPLINK_VPORT)
 		ret = snprintf(buf, len, "p%d", fn);
+	else if (rep->vport == MLX5_VPORT_PF)
+		ret = snprintf(buf, len, "pf%d", fn);
 	else
 		ret = snprintf(buf, len, "pf%dvf%d", fn, rep->vport - 1);
 
