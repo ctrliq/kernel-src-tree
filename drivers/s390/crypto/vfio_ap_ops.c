@@ -370,7 +370,7 @@ static ssize_t name_show(struct kobject *kobj, struct device *dev, char *buf)
 	return sprintf(buf, "%s\n", VFIO_AP_MDEV_NAME_HWVIRT);
 }
 
-MDEV_TYPE_ATTR_RO(name);
+static MDEV_TYPE_ATTR_RO(name);
 
 static ssize_t available_instances_show(struct kobject *kobj,
 					struct device *dev, char *buf)
@@ -379,7 +379,7 @@ static ssize_t available_instances_show(struct kobject *kobj,
 		       atomic_read(&matrix_dev->available_instances));
 }
 
-MDEV_TYPE_ATTR_RO(available_instances);
+static MDEV_TYPE_ATTR_RO(available_instances);
 
 static ssize_t device_api_show(struct kobject *kobj, struct device *dev,
 			       char *buf)
@@ -387,7 +387,7 @@ static ssize_t device_api_show(struct kobject *kobj, struct device *dev,
 	return sprintf(buf, "%s\n", VFIO_DEVICE_API_AP_STRING);
 }
 
-MDEV_TYPE_ATTR_RO(device_api);
+static MDEV_TYPE_ATTR_RO(device_api);
 
 static struct attribute *vfio_ap_mdev_type_attrs[] = {
 	&mdev_type_attr_name.attr,
@@ -688,7 +688,7 @@ static ssize_t unassign_adapter_store(struct device *dev,
 
 	return count;
 }
-DEVICE_ATTR_WO(unassign_adapter);
+static DEVICE_ATTR_WO(unassign_adapter);
 
 static int
 vfio_ap_mdev_verify_queues_reserved_for_apqi(struct ap_matrix_mdev *matrix_mdev,
@@ -784,7 +784,7 @@ done:
 
 	return ret;
 }
-DEVICE_ATTR_WO(assign_domain);
+static DEVICE_ATTR_WO(assign_domain);
 
 
 /**
@@ -830,7 +830,7 @@ static ssize_t unassign_domain_store(struct device *dev,
 
 	return count;
 }
-DEVICE_ATTR_WO(unassign_domain);
+static DEVICE_ATTR_WO(unassign_domain);
 
 /**
  * assign_control_domain_store
@@ -879,7 +879,7 @@ static ssize_t assign_control_domain_store(struct device *dev,
 
 	return count;
 }
-DEVICE_ATTR_WO(assign_control_domain);
+static DEVICE_ATTR_WO(assign_control_domain);
 
 /**
  * unassign_control_domain_store
@@ -923,7 +923,7 @@ static ssize_t unassign_control_domain_store(struct device *dev,
 
 	return count;
 }
-DEVICE_ATTR_WO(unassign_control_domain);
+static DEVICE_ATTR_WO(unassign_control_domain);
 
 static ssize_t control_domains_show(struct device *dev,
 				    struct device_attribute *dev_attr,
@@ -947,7 +947,7 @@ static ssize_t control_domains_show(struct device *dev,
 
 	return nchars;
 }
-DEVICE_ATTR_RO(control_domains);
+static DEVICE_ATTR_RO(control_domains);
 
 static ssize_t matrix_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
@@ -997,7 +997,7 @@ static ssize_t matrix_show(struct device *dev, struct device_attribute *attr,
 
 	return nchars;
 }
-DEVICE_ATTR_RO(matrix);
+static DEVICE_ATTR_RO(matrix);
 
 static struct attribute *vfio_ap_mdev_attrs[] = {
 	&dev_attr_assign_adapter.attr,
