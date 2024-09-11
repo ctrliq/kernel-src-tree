@@ -1,0 +1,408 @@
+dma-mapping: remove the default map_resource implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit cfced786969c2a3e1bca45d7055a00311d93ae6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cfced786.failed
+
+Instead provide a proper implementation in the direct mapping code, and
+also wire it up for arm and powerpc, leaving an error return for all the
+IOMMU or virtual mapping instances for which we'd have to wire up an
+actual implementation
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+(cherry picked from commit cfced786969c2a3e1bca45d7055a00311d93ae6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/mm/dma-mapping.c
+#	arch/powerpc/kernel/dma.c
+diff --cc arch/arm/mm/dma-mapping.c
+index ed17026d70f8,3c8534904209..000000000000
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@@ -218,7 -212,7 +219,11 @@@ const struct dma_map_ops arm_coherent_d
+  	.get_sgtable		= arm_dma_get_sgtable,
+  	.map_page		= arm_coherent_dma_map_page,
+  	.map_sg			= arm_dma_map_sg,
+++<<<<<<< HEAD
+ +	.mapping_error		= arm_dma_mapping_error,
+++=======
++ 	.map_resource		= dma_direct_map_resource,
+++>>>>>>> cfced786969c (dma-mapping: remove the default map_resource implementation)
+  	.dma_supported		= arm_dma_supported,
+  };
+  EXPORT_SYMBOL(arm_coherent_dma_ops);
+diff --cc arch/powerpc/kernel/dma.c
+index b9f7283e7224,258b9e8ebb99..000000000000
+--- a/arch/powerpc/kernel/dma.c
++++ b/arch/powerpc/kernel/dma.c
+@@@ -27,25 -27,259 +27,38 @@@
+   * default the offset is PCI_DRAM_OFFSET.
+   */
+  
+ -static u64 __maybe_unused get_pfn_limit(struct device *dev)
+ -{
+ -	u64 pfn = (dev->coherent_dma_mask >> PAGE_SHIFT) + 1;
+ -	struct dev_archdata __maybe_unused *sd = &dev->archdata;
+ -
+ -#ifdef CONFIG_SWIOTLB
+ -	if (sd->max_direct_dma_addr && dev->dma_ops == &powerpc_swiotlb_dma_ops)
+ -		pfn = min_t(u64, pfn, sd->max_direct_dma_addr >> PAGE_SHIFT);
+ -#endif
+ -
+ -	return pfn;
+ -}
+ -
+ -static int dma_nommu_dma_supported(struct device *dev, u64 mask)
+ -{
+ -#ifdef CONFIG_PPC64
+ -	u64 limit = get_dma_offset(dev) + (memblock_end_of_DRAM() - 1);
+ -
+ -	/* Limit fits in the mask, we are good */
+ -	if (mask >= limit)
+ -		return 1;
+ -
+ -#ifdef CONFIG_FSL_SOC
+ -	/*
+ -	 * Freescale gets another chance via ZONE_DMA, however
+ -	 * that will have to be refined if/when they support iommus
+ -	 */
+ -	return 1;
+ -#endif
+ -	/* Sorry ... */
+ -	return 0;
+ -#else
+ -	return 1;
+ -#endif
+ -}
+ -
+ -#ifndef CONFIG_NOT_COHERENT_CACHE
+ -void *__dma_nommu_alloc_coherent(struct device *dev, size_t size,
+ -				  dma_addr_t *dma_handle, gfp_t flag,
+ -				  unsigned long attrs)
+ -{
+ -	void *ret;
+ -	struct page *page;
+ -	int node = dev_to_node(dev);
+ -#ifdef CONFIG_FSL_SOC
+ -	u64 pfn = get_pfn_limit(dev);
+ -	int zone;
+ -
+ -	/*
+ -	 * This code should be OK on other platforms, but we have drivers that
+ -	 * don't set coherent_dma_mask. As a workaround we just ifdef it. This
+ -	 * whole routine needs some serious cleanup.
+ -	 */
+ -
+ -	zone = dma_pfn_limit_to_zone(pfn);
+ -	if (zone < 0) {
+ -		dev_err(dev, "%s: No suitable zone for pfn %#llx\n",
+ -			__func__, pfn);
+ -		return NULL;
+ -	}
+ -
+ -	switch (zone) {
+ -#ifdef CONFIG_ZONE_DMA
+ -	case ZONE_DMA:
+ -		flag |= GFP_DMA;
+ -		break;
+ -#endif
+ -	};
+ -#endif /* CONFIG_FSL_SOC */
+ -
+ -	page = alloc_pages_node(node, flag, get_order(size));
+ -	if (page == NULL)
+ -		return NULL;
+ -	ret = page_address(page);
+ -	memset(ret, 0, size);
+ -	*dma_handle = __pa(ret) + get_dma_offset(dev);
+ -
+ -	return ret;
+ -}
+ -
+ -void __dma_nommu_free_coherent(struct device *dev, size_t size,
+ -				void *vaddr, dma_addr_t dma_handle,
+ -				unsigned long attrs)
+ -{
+ -	free_pages((unsigned long)vaddr, get_order(size));
+ -}
+ -#endif /* !CONFIG_NOT_COHERENT_CACHE */
+ -
+ -static void *dma_nommu_alloc_coherent(struct device *dev, size_t size,
+ -				       dma_addr_t *dma_handle, gfp_t flag,
+ -				       unsigned long attrs)
+ -{
+ -	struct iommu_table *iommu;
+ -
+ -	/* The coherent mask may be smaller than the real mask, check if
+ -	 * we can really use the direct ops
+ -	 */
+ -	if (dma_nommu_dma_supported(dev, dev->coherent_dma_mask))
+ -		return __dma_nommu_alloc_coherent(dev, size, dma_handle,
+ -						   flag, attrs);
+ -
+ -	/* Ok we can't ... do we have an iommu ? If not, fail */
+ -	iommu = get_iommu_table_base(dev);
+ -	if (!iommu)
+ -		return NULL;
+ -
+ -	/* Try to use the iommu */
+ -	return iommu_alloc_coherent(dev, iommu, size, dma_handle,
+ -				    dev->coherent_dma_mask, flag,
+ -				    dev_to_node(dev));
+ -}
+ -
+ -static void dma_nommu_free_coherent(struct device *dev, size_t size,
+ -				     void *vaddr, dma_addr_t dma_handle,
+ -				     unsigned long attrs)
+ -{
+ -	struct iommu_table *iommu;
+ -
+ -	/* See comments in dma_nommu_alloc_coherent() */
+ -	if (dma_nommu_dma_supported(dev, dev->coherent_dma_mask))
+ -		return __dma_nommu_free_coherent(dev, size, vaddr, dma_handle,
+ -						  attrs);
+ -	/* Maybe we used an iommu ... */
+ -	iommu = get_iommu_table_base(dev);
+ -
+ -	/* If we hit that we should have never allocated in the first
+ -	 * place so how come we are freeing ?
+ -	 */
+ -	if (WARN_ON(!iommu))
+ -		return;
+ -	iommu_free_coherent(iommu, size, vaddr, dma_handle);
+ -}
+ -
+ -int dma_nommu_mmap_coherent(struct device *dev, struct vm_area_struct *vma,
+ -			     void *cpu_addr, dma_addr_t handle, size_t size,
+ -			     unsigned long attrs)
+ -{
+ -	unsigned long pfn;
+ -
+ -#ifdef CONFIG_NOT_COHERENT_CACHE
+ -	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ -	pfn = __dma_get_coherent_pfn((unsigned long)cpu_addr);
+ -#else
+ -	pfn = page_to_pfn(virt_to_page(cpu_addr));
+ -#endif
+ -	return remap_pfn_range(vma, vma->vm_start,
+ -			       pfn + vma->vm_pgoff,
+ -			       vma->vm_end - vma->vm_start,
+ -			       vma->vm_page_prot);
+ -}
+ -
+ -static int dma_nommu_map_sg(struct device *dev, struct scatterlist *sgl,
+ -			     int nents, enum dma_data_direction direction,
+ -			     unsigned long attrs)
+ -{
+ -	struct scatterlist *sg;
+ -	int i;
+ -
+ -	for_each_sg(sgl, sg, nents, i) {
+ -		sg->dma_address = sg_phys(sg) + get_dma_offset(dev);
+ -		sg->dma_length = sg->length;
+ -
+ -		if (attrs & DMA_ATTR_SKIP_CPU_SYNC)
+ -			continue;
+ -
+ -		__dma_sync_page(sg_page(sg), sg->offset, sg->length, direction);
+ -	}
+ -
+ -	return nents;
+ -}
+ -
+ -static void dma_nommu_unmap_sg(struct device *dev, struct scatterlist *sgl,
+ -				int nents, enum dma_data_direction direction,
+ -				unsigned long attrs)
+ -{
+ -	struct scatterlist *sg;
+ -	int i;
+ -
+ -	for_each_sg(sgl, sg, nents, i)
+ -		__dma_sync_page(sg_page(sg), sg->offset, sg->length, direction);
+ -}
+ -
+ -static u64 dma_nommu_get_required_mask(struct device *dev)
+ -{
+ -	u64 end, mask;
+ -
+ -	end = memblock_end_of_DRAM() + get_dma_offset(dev);
+ -
+ -	mask = 1ULL << (fls64(end) - 1);
+ -	mask += mask - 1;
+ -
+ -	return mask;
+ -}
+ -
+ -static inline dma_addr_t dma_nommu_map_page(struct device *dev,
+ -					     struct page *page,
+ -					     unsigned long offset,
+ -					     size_t size,
+ -					     enum dma_data_direction dir,
+ -					     unsigned long attrs)
+ -{
+ -	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+ -		__dma_sync_page(page, offset, size, dir);
+ -
+ -	return page_to_phys(page) + offset + get_dma_offset(dev);
+ -}
+ -
+ -static inline void dma_nommu_unmap_page(struct device *dev,
+ -					 dma_addr_t dma_address,
+ -					 size_t size,
+ -					 enum dma_data_direction direction,
+ -					 unsigned long attrs)
+ -{
+ -	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+ -		__dma_sync(bus_to_virt(dma_address), size, direction);
+ -}
+ -
+ -#ifdef CONFIG_NOT_COHERENT_CACHE
+ -static inline void dma_nommu_sync_sg(struct device *dev,
+ -		struct scatterlist *sgl, int nents,
+ -		enum dma_data_direction direction)
+ -{
+ -	struct scatterlist *sg;
+ -	int i;
+ -
+ -	for_each_sg(sgl, sg, nents, i)
+ -		__dma_sync_page(sg_page(sg), sg->offset, sg->length, direction);
+ -}
+ -
+ -static inline void dma_nommu_sync_single(struct device *dev,
+ -					  dma_addr_t dma_handle, size_t size,
+ -					  enum dma_data_direction direction)
+ -{
+ -	__dma_sync(bus_to_virt(dma_handle), size, direction);
+ -}
+ -#endif
+ -
+  const struct dma_map_ops dma_nommu_ops = {
+++<<<<<<< HEAD
+++=======
++ 	.alloc				= dma_nommu_alloc_coherent,
++ 	.free				= dma_nommu_free_coherent,
++ 	.mmap				= dma_nommu_mmap_coherent,
++ 	.map_sg				= dma_nommu_map_sg,
++ 	.unmap_sg			= dma_nommu_unmap_sg,
++ 	.dma_supported			= dma_nommu_dma_supported,
++ 	.map_page			= dma_nommu_map_page,
++ 	.unmap_page			= dma_nommu_unmap_page,
++ 	.map_resource			= dma_direct_map_resource,
++ 	.get_required_mask		= dma_nommu_get_required_mask,
+++>>>>>>> cfced786969c (dma-mapping: remove the default map_resource implementation)
+ +#ifdef CONFIG_NOT_COHERENT_CACHE
+ +	.alloc				= __dma_nommu_alloc_coherent,
+ +	.free				= __dma_nommu_free_coherent,
+ +#else
+ +	.alloc				= dma_direct_alloc,
+ +	.free				= dma_direct_free,
+ +#endif
+ +	.map_sg				= dma_direct_map_sg,
+ +	.dma_supported			= dma_direct_supported,
+ +	.map_page			= dma_direct_map_page,
+ +	.get_required_mask		= dma_direct_get_required_mask,
+  #ifdef CONFIG_NOT_COHERENT_CACHE
+ -	.sync_single_for_cpu 		= dma_nommu_sync_single,
+ -	.sync_single_for_device 	= dma_nommu_sync_single,
+ -	.sync_sg_for_cpu 		= dma_nommu_sync_sg,
+ -	.sync_sg_for_device 		= dma_nommu_sync_sg,
+ +	.unmap_sg			= dma_direct_unmap_sg,
+ +	.unmap_page			= dma_direct_unmap_page,
+ +	.sync_single_for_cpu 		= dma_direct_sync_single_for_cpu,
+ +	.sync_single_for_device 	= dma_direct_sync_single_for_device,
+ +	.sync_sg_for_cpu 		= dma_direct_sync_sg_for_cpu,
+ +	.sync_sg_for_device 		= dma_direct_sync_sg_for_device,
+  #endif
+  };
+  EXPORT_SYMBOL(dma_nommu_ops);
+* Unmerged path arch/arm/mm/dma-mapping.c
+diff --git a/arch/powerpc/kernel/dma-swiotlb.c b/arch/powerpc/kernel/dma-swiotlb.c
+index a3000fb2efde..a151e030fae1 100644
+--- a/arch/powerpc/kernel/dma-swiotlb.c
++++ b/arch/powerpc/kernel/dma-swiotlb.c
+@@ -39,6 +39,7 @@ const struct dma_map_ops powerpc_swiotlb_dma_ops = {
+ 	.dma_supported = swiotlb_dma_supported,
+ 	.map_page = dma_direct_map_page,
+ 	.unmap_page = dma_direct_unmap_page,
++	.map_resource = dma_direct_map_resource,
+ 	.sync_single_for_cpu = dma_direct_sync_single_for_cpu,
+ 	.sync_single_for_device = dma_direct_sync_single_for_device,
+ 	.sync_sg_for_cpu = dma_direct_sync_sg_for_cpu,
+* Unmerged path arch/powerpc/kernel/dma.c
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index f08f222fef10..a01a4088ac97 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -215,6 +215,8 @@ dma_addr_t dma_direct_map_page(struct device *dev, struct page *page,
+ 		unsigned long attrs);
+ int dma_direct_map_sg(struct device *dev, struct scatterlist *sgl, int nents,
+ 		enum dma_data_direction dir, unsigned long attrs);
++dma_addr_t dma_direct_map_resource(struct device *dev, phys_addr_t paddr,
++		size_t size, enum dma_data_direction dir, unsigned long attrs);
+ 
+ #if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || \
+     defined(CONFIG_SWIOTLB)
+@@ -355,19 +357,19 @@ static inline dma_addr_t dma_map_resource(struct device *dev,
+ 					  unsigned long attrs)
+ {
+ 	const struct dma_map_ops *ops = get_dma_ops(dev);
+-	dma_addr_t addr;
++	dma_addr_t addr = DMA_MAPPING_ERROR;
+ 
+ 	BUG_ON(!valid_dma_direction(dir));
+ 
+ 	/* Don't allow RAM to be mapped */
+ 	BUG_ON(pfn_valid(PHYS_PFN(phys_addr)));
+ 
+-	addr = phys_addr;
+-	if (ops && ops->map_resource)
++	if (dma_is_direct(ops))
++		addr = dma_direct_map_resource(dev, phys_addr, size, dir, attrs);
++	else if (ops->map_resource)
+ 		addr = ops->map_resource(dev, phys_addr, size, dir, attrs);
+ 
+ 	debug_dma_map_resource(dev, phys_addr, size, dir, addr);
+-
+ 	return addr;
+ }
+ 
+@@ -378,7 +380,7 @@ static inline void dma_unmap_resource(struct device *dev, dma_addr_t addr,
+ 	const struct dma_map_ops *ops = get_dma_ops(dev);
+ 
+ 	BUG_ON(!valid_dma_direction(dir));
+-	if (ops && ops->unmap_resource)
++	if (!dma_is_direct(ops) && ops->unmap_resource)
+ 		ops->unmap_resource(dev, addr, size, dir, attrs);
+ 	debug_dma_unmap_resource(dev, addr, size, dir);
+ }
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index 9f38de9d2578..997267e2bcb1 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -370,6 +370,20 @@ int dma_direct_map_sg(struct device *dev, struct scatterlist *sgl, int nents,
+ }
+ EXPORT_SYMBOL(dma_direct_map_sg);
+ 
++dma_addr_t dma_direct_map_resource(struct device *dev, phys_addr_t paddr,
++		size_t size, enum dma_data_direction dir, unsigned long attrs)
++{
++	dma_addr_t dma_addr = paddr;
++
++	if (unlikely(!dma_direct_possible(dev, dma_addr, size))) {
++		report_addr(dev, dma_addr, size);
++		return DMA_MAPPING_ERROR;
++	}
++
++	return dma_addr;
++}
++EXPORT_SYMBOL(dma_direct_map_resource);
++
+ /*
+  * Because 32-bit DMA masks are so common we expect every architecture to be
+  * able to satisfy them - either by not supporting more physical memory, or by
