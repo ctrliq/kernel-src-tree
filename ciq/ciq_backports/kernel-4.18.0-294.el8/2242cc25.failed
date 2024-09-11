@@ -1,0 +1,144 @@
+RDMA/mlx5: Perform check if QP creation flow is valid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 2242cc25ce82058986ff7721e3d2464d775032df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2242cc25.failed
+
+Fast check that kernel and user flows provides enough
+data to create QP.
+
+Link: https://lore.kernel.org/r/20200427154636.381474-4-leon@kernel.org
+	Reviewed-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 2242cc25ce82058986ff7721e3d2464d775032df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 9f87b08d533e,91d6151c349c..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -2681,8 -2665,68 +2637,64 @@@ static int set_mlx_qp_type(struct mlx5_
+  	}
+  
+  	return 0;
+ -
+ -out:
+ -	mlx5_ib_dbg(dev, "Unsupported QP type %d\n", attr->qp_type);
+ -	return -EOPNOTSUPP;
+  }
+  
++ static int check_valid_flow(struct mlx5_ib_dev *dev, struct ib_pd *pd,
++ 			    struct ib_qp_init_attr *attr,
++ 			    struct ib_udata *udata)
++ {
++ 	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
++ 		udata, struct mlx5_ib_ucontext, ibucontext);
++ 
++ 	if (!udata) {
++ 		/* Kernel create_qp callers */
++ 		if (attr->rwq_ind_tbl)
++ 			return -EOPNOTSUPP;
++ 
++ 		switch (attr->qp_type) {
++ 		case IB_QPT_RAW_PACKET:
++ 		case IB_QPT_DRIVER:
++ 			return -EOPNOTSUPP;
++ 		default:
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	/* Userspace create_qp callers */
++ 	if (attr->qp_type == IB_QPT_RAW_PACKET && !ucontext->cqe_version) {
++ 		mlx5_ib_dbg(dev,
++ 			"Raw Packet QP is only supported for CQE version > 0\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (attr->qp_type != IB_QPT_RAW_PACKET && attr->rwq_ind_tbl) {
++ 		mlx5_ib_dbg(dev,
++ 			    "Wrong QP type %d for the RWQ indirect table\n",
++ 			    attr->qp_type);
++ 		return -EINVAL;
++ 	}
++ 
++ 	switch (attr->qp_type) {
++ 	case IB_QPT_SMI:
++ 	case MLX5_IB_QPT_HW_GSI:
++ 	case MLX5_IB_QPT_REG_UMR:
++ 	case IB_QPT_GSI:
++ 		mlx5_ib_dbg(dev, "Kernel doesn't support QP type %d\n",
++ 			    attr->qp_type);
++ 		return -EINVAL;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	/*
++ 	 * We don't need to see this warning, it means that kernel code
++ 	 * missing ib_pd. Placed here to catch developer's mistakes.
++ 	 */
++ 	WARN_ONCE(!pd && attr->qp_type != IB_QPT_XRC_TGT,
++ 		  "There is a missing PD pointer assignment\n");
++ 	return 0;
++ }
++ 
+  struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd,
+  				struct ib_qp_init_attr *verbs_init_attr,
+  				struct ib_udata *udata)
+@@@ -2693,31 -2737,20 +2705,45 @@@
+  	int err;
+  	struct ib_qp_init_attr mlx_init_attr;
+  	struct ib_qp_init_attr *init_attr = verbs_init_attr;
+- 	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
+- 		udata, struct mlx5_ib_ucontext, ibucontext);
+  
+++<<<<<<< HEAD
+ +	if (pd) {
+ +		dev = to_mdev(pd->device);
+ +
+ +		if (init_attr->qp_type == IB_QPT_RAW_PACKET) {
+ +			if (!ucontext) {
+ +				mlx5_ib_dbg(dev, "Raw Packet QP is not supported for kernel consumers\n");
+ +				return ERR_PTR(-EINVAL);
+ +			} else if (!ucontext->cqe_version) {
+ +				mlx5_ib_dbg(dev, "Raw Packet QP is only supported for CQE version > 0\n");
+ +				return ERR_PTR(-EINVAL);
+ +			}
+ +		}
+ +	} else {
+ +		/* being cautious here */
+ +		if (init_attr->qp_type != IB_QPT_XRC_TGT &&
+ +		    init_attr->qp_type != MLX5_IB_QPT_REG_UMR) {
+ +			pr_warn("%s: no PD for transport %s\n", __func__,
+ +				ib_qp_type_str(init_attr->qp_type));
+ +			return ERR_PTR(-EINVAL);
+ +		}
+ +		dev = to_mdev(to_mxrcd(init_attr->xrcd)->ibxrcd.device);
+ +	}
+++=======
++ 	dev = pd ? to_mdev(pd->device) :
++ 		   to_mdev(to_mxrcd(init_attr->xrcd)->ibxrcd.device);
++ 
++ 	err = check_qp_type(dev, init_attr);
++ 	if (err) {
++ 		mlx5_ib_dbg(dev, "Unsupported QP type %d\n",
++ 			    init_attr->qp_type);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	err = check_valid_flow(dev, pd, init_attr, udata);
++ 	if (err)
++ 		return ERR_PTR(err);
+++>>>>>>> 2242cc25ce82 (RDMA/mlx5: Perform check if QP creation flow is valid)
+  
+  	if (init_attr->qp_type == IB_QPT_DRIVER) {
+  		struct mlx5_ib_create_qp ucmd;
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
