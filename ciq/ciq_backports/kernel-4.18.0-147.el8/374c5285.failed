@@ -1,0 +1,234 @@
+RDMA/bnxt_re: Enable GSI QP support for 57500 series
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Devesh Sharma <devesh.sharma@broadcom.com>
+commit 374c5285abee0aa1b9e04c6beb86e13b6813db09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/374c5285.failed
+
+In the new 57500 series of adapters the GSI qp is a UD type QP unlike the
+previous generation where it was a Raw Eth QP. Changing the control and
+data path to support the same. Listing all the significant diffs:
+
+ - AH creation resolve network type unconditionally
+ - Add check at relevant places to distinguish from Raw Eth
+   processing flow.
+ - bnxt_re_process_res_ud_wc report completion with GRH flag
+   when qp is GSI.
+ - Change length, cfa_meta and smac to match new driver/hardware
+   interface.
+ - Add new driver/hardware interface.
+
+	Signed-off-by: Selvin Xavier <selvin.xavier@broadcom.com>
+	Signed-off-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 374c5285abee0aa1b9e04c6beb86e13b6813db09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/bnxt_re/ib_verbs.c
+diff --cc drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index fffc5b5f04de,2d5f9c35bfdc..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@@ -663,8 -663,27 +663,26 @@@ int bnxt_re_destroy_ah(struct ib_ah *ib
+  	return 0;
+  }
+  
++ static u8 bnxt_re_stack_to_dev_nw_type(enum rdma_network_type ntype)
++ {
++ 	u8 nw_type;
++ 
++ 	switch (ntype) {
++ 	case RDMA_NETWORK_IPV4:
++ 		nw_type = CMDQ_CREATE_AH_TYPE_V2IPV4;
++ 		break;
++ 	case RDMA_NETWORK_IPV6:
++ 		nw_type = CMDQ_CREATE_AH_TYPE_V2IPV6;
++ 		break;
++ 	default:
++ 		nw_type = CMDQ_CREATE_AH_TYPE_V1;
++ 		break;
++ 	}
++ 	return nw_type;
++ }
++ 
+  struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
+  				struct rdma_ah_attr *ah_attr,
+ -				u32 flags,
+  				struct ib_udata *udata)
+  {
+  	struct bnxt_re_pd *pd = container_of(ib_pd, struct bnxt_re_pd, ib_pd);
+@@@ -699,28 -719,11 +718,20 @@@
+  	ah->qplib_ah.flow_label = grh->flow_label;
+  	ah->qplib_ah.hop_limit = grh->hop_limit;
+  	ah->qplib_ah.sl = rdma_ah_get_sl(ah_attr);
+++<<<<<<< HEAD
+ +	if (ib_pd->uobject &&
+ +	    !rdma_is_multicast_addr((struct in6_addr *)
+ +				    grh->dgid.raw) &&
+ +	    !rdma_link_local_addr((struct in6_addr *)
+ +				  grh->dgid.raw)) {
+ +		const struct ib_gid_attr *sgid_attr;
+++=======
+++>>>>>>> 374c5285abee (RDMA/bnxt_re: Enable GSI QP support for 57500 series)
+  
+- 		sgid_attr = grh->sgid_attr;
+- 		/* Get network header type for this GID */
+- 		nw_type = rdma_gid_attr_network_type(sgid_attr);
+- 		switch (nw_type) {
+- 		case RDMA_NETWORK_IPV4:
+- 			ah->qplib_ah.nw_type = CMDQ_CREATE_AH_TYPE_V2IPV4;
+- 			break;
+- 		case RDMA_NETWORK_IPV6:
+- 			ah->qplib_ah.nw_type = CMDQ_CREATE_AH_TYPE_V2IPV6;
+- 			break;
+- 		default:
+- 			ah->qplib_ah.nw_type = CMDQ_CREATE_AH_TYPE_V1;
+- 			break;
+- 		}
+- 	}
++ 	sgid_attr = grh->sgid_attr;
++ 	/* Get network header type for this GID */
++ 	nw_type = rdma_gid_attr_network_type(sgid_attr);
++ 	ah->qplib_ah.nw_type = bnxt_re_stack_to_dev_nw_type(nw_type);
+  
+  	memcpy(ah->qplib_ah.dmac, ah_attr->roce.dmac, ETH_ALEN);
+  	rc = bnxt_qplib_create_ah(&rdev->qplib_res, &ah->qplib_ah,
+* Unmerged path drivers/infiniband/hw/bnxt_re/ib_verbs.c
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_fp.c b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+index b98b054148cd..4ce7e855d338 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+@@ -44,6 +44,7 @@
+ #include <linux/slab.h>
+ #include <linux/pci.h>
+ #include <linux/prefetch.h>
++#include <linux/if_ether.h>
+ 
+ #include "roce_hsi.h"
+ 
+@@ -1617,7 +1618,8 @@ int bnxt_qplib_post_send(struct bnxt_qplib_qp *qp,
+ 				((offsetof(typeof(*sqe), data) + 15) >> 4);
+ 		sqe->inv_key_or_imm_data = cpu_to_le32(
+ 						wqe->send.inv_key);
+-		if (qp->type == CMDQ_CREATE_QP_TYPE_UD) {
++		if (qp->type == CMDQ_CREATE_QP_TYPE_UD ||
++		    qp->type == CMDQ_CREATE_QP_TYPE_GSI) {
+ 			sqe->q_key = cpu_to_le32(wqe->send.q_key);
+ 			sqe->dst_qp = cpu_to_le32(
+ 					wqe->send.dst_qp & SQ_SEND_DST_QP_MASK);
+@@ -2410,12 +2412,14 @@ static int bnxt_qplib_cq_process_res_ud(struct bnxt_qplib_cq *cq,
+ 	}
+ 	cqe = *pcqe;
+ 	cqe->opcode = hwcqe->cqe_type_toggle & CQ_BASE_CQE_TYPE_MASK;
+-	cqe->length = le32_to_cpu(hwcqe->length);
++	cqe->length = (u32)le16_to_cpu(hwcqe->length);
++	cqe->cfa_meta = le16_to_cpu(hwcqe->cfa_metadata);
+ 	cqe->invrkey = le32_to_cpu(hwcqe->imm_data);
+ 	cqe->flags = le16_to_cpu(hwcqe->flags);
+ 	cqe->status = hwcqe->status;
+ 	cqe->qp_handle = (u64)(unsigned long)qp;
+-	memcpy(cqe->smac, hwcqe->src_mac, 6);
++	/*FIXME: Endianness fix needed for smace */
++	memcpy(cqe->smac, hwcqe->src_mac, ETH_ALEN);
+ 	wr_id_idx = le32_to_cpu(hwcqe->src_qp_high_srq_or_rq_wr_id)
+ 				& CQ_RES_UD_SRQ_OR_RQ_WR_ID_MASK;
+ 	cqe->src_qp = le16_to_cpu(hwcqe->src_qp_low) |
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_fp.h b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+index f317bae36dd0..23bb5a550d9f 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+@@ -347,6 +347,7 @@ struct bnxt_qplib_cqe {
+ 	u8				type;
+ 	u8				opcode;
+ 	u32				length;
++	u16				cfa_meta;
+ 	u64				wr_id;
+ 	union {
+ 		__be32			immdata;
+diff --git a/drivers/infiniband/hw/bnxt_re/roce_hsi.h b/drivers/infiniband/hw/bnxt_re/roce_hsi.h
+index 8a9ead419ac2..b454303143f3 100644
+--- a/drivers/infiniband/hw/bnxt_re/roce_hsi.h
++++ b/drivers/infiniband/hw/bnxt_re/roce_hsi.h
+@@ -505,22 +505,24 @@ struct cq_res_rc {
+ 
+ /* Responder UD CQE (32 bytes) */
+ struct cq_res_ud {
+-	__le32 length;
++	__le16 length;
+ 	#define CQ_RES_UD_LENGTH_MASK				    0x3fffUL
+ 	#define CQ_RES_UD_LENGTH_SFT				    0
+-	#define CQ_RES_UD_RESERVED18_MASK			    0xffffc000UL
+-	#define CQ_RES_UD_RESERVED18_SFT			    14
++	__le16 cfa_metadata;
++	#define CQ_RES_UD_CFA_METADATA_VID_MASK			0xfffUL
++	#define CQ_RES_UD_CFA_METADATA_VID_SFT			0
++	#define CQ_RES_UD_CFA_METADATA_DE			0x1000UL
++	#define CQ_RES_UD_CFA_METADATA_PRI_MASK			0xe000UL
++	#define CQ_RES_UD_CFA_METADATA_PRI_SFT			13
+ 	__le32 imm_data;
+ 	__le64 qp_handle;
+ 	__le16 src_mac[3];
+ 	__le16 src_qp_low;
+ 	u8 cqe_type_toggle;
+-	#define CQ_RES_UD_TOGGLE				    0x1UL
+-	#define CQ_RES_UD_CQE_TYPE_MASK			    0x1eUL
+-	#define CQ_RES_UD_CQE_TYPE_SFT				    1
++	#define CQ_RES_UD_TOGGLE				   0x1UL
++	#define CQ_RES_UD_CQE_TYPE_MASK				   0x1eUL
++	#define CQ_RES_UD_CQE_TYPE_SFT				   1
+ 	#define CQ_RES_UD_CQE_TYPE_RES_UD			   (0x2UL << 1)
+-	#define CQ_RES_UD_RESERVED3_MASK			    0xe0UL
+-	#define CQ_RES_UD_RESERVED3_SFT			    5
+ 	u8 status;
+ 	#define CQ_RES_UD_STATUS_OK				   0x0UL
+ 	#define CQ_RES_UD_STATUS_LOCAL_ACCESS_ERROR		   0x1UL
+@@ -536,18 +538,30 @@ struct cq_res_ud {
+ 	#define CQ_RES_UD_FLAGS_SRQ_SRQ			   (0x1UL << 0)
+ 	#define CQ_RES_UD_FLAGS_SRQ_LAST    CQ_RES_UD_FLAGS_SRQ_SRQ
+ 	#define CQ_RES_UD_FLAGS_IMM				    0x2UL
+-	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_MASK		    0xcUL
+-	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_SFT		    2
+-	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_V1			   (0x0UL << 2)
+-	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_V2IPV4		   (0x2UL << 2)
+-	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_V2IPV6		   (0x3UL << 2)
++	#define CQ_RES_UD_FLAGS_UNUSED_MASK			0xcUL
++	#define CQ_RES_UD_FLAGS_UNUSED_SFT			2
++	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_MASK		0x30UL
++	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_SFT			4
++	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_V1			(0x0UL << 4)
++	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_V2IPV4		(0x2UL << 4)
++	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_V2IPV6		(0x3UL << 4)
+ 	#define CQ_RES_UD_FLAGS_ROCE_IP_VER_LAST		\
+ 					CQ_RES_UD_FLAGS_ROCE_IP_VER_V2IPV6
++	#define CQ_RES_UD_FLAGS_META_FORMAT_MASK		0x3c0UL
++	#define CQ_RES_UD_FLAGS_META_FORMAT_SFT			6
++	#define CQ_RES_UD_FLAGS_META_FORMAT_NONE		(0x0UL << 6)
++	#define CQ_RES_UD_FLAGS_META_FORMAT_VLAN		(0x1UL << 6)
++	#define CQ_RES_UD_FLAGS_META_FORMAT_TUNNEL_ID		(0x2UL << 6)
++	#define CQ_RES_UD_FLAGS_META_FORMAT_CHDR_DATA		(0x3UL << 6)
++	#define CQ_RES_UD_FLAGS_META_FORMAT_HDR_OFFSET		(0x4UL << 6)
++	#define CQ_RES_UD_FLAGS_META_FORMAT_LAST		\
++					CQ_RES_UD_FLAGS_META_FORMAT_HDR_OFFSET
++	#define CQ_RES_UD_FLAGS_EXT_META_FORMAT_MASK		0xc00UL
++	#define CQ_RES_UD_FLAGS_EXT_META_FORMAT_SFT		10
++
+ 	__le32 src_qp_high_srq_or_rq_wr_id;
+ 	#define CQ_RES_UD_SRQ_OR_RQ_WR_ID_MASK			    0xfffffUL
+ 	#define CQ_RES_UD_SRQ_OR_RQ_WR_ID_SFT			    0
+-	#define CQ_RES_UD_RESERVED4_MASK			    0xf00000UL
+-	#define CQ_RES_UD_RESERVED4_SFT			    20
+ 	#define CQ_RES_UD_SRC_QP_HIGH_MASK			    0xff000000UL
+ 	#define CQ_RES_UD_SRC_QP_HIGH_SFT			    24
+ };
+@@ -983,6 +997,7 @@ struct cmdq_create_qp {
+ 	#define CMDQ_CREATE_QP_TYPE_RC				   0x2UL
+ 	#define CMDQ_CREATE_QP_TYPE_UD				   0x4UL
+ 	#define CMDQ_CREATE_QP_TYPE_RAW_ETHERTYPE		   0x6UL
++	#define CMDQ_CREATE_QP_TYPE_GSI				   0x7UL
+ 	u8 sq_pg_size_sq_lvl;
+ 	#define CMDQ_CREATE_QP_SQ_LVL_MASK			    0xfUL
+ 	#define CMDQ_CREATE_QP_SQ_LVL_SFT			    0
