@@ -1,0 +1,195 @@
+xfs: standardize extent size hint validation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit 6b69e485894b355b333bd286f0f0958e41d8754a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/6b69e485.failed
+
+While chasing a bug involving invalid extent size hints being propagated
+into newly created realtime files, I noticed that the xfs_ioctl_setattr
+checks for the extent size hints weren't the same as the ones now
+encoded in libxfs and used for validation in repair and mkfs.
+
+Because the checks in libxfs are more stringent than the ones in the
+ioctl, it's possible for a live system to set inode flags that
+immediately result in corruption warnings.  Specifically, it's possible
+to set an extent size hint on an rtinherit directory without checking if
+the hint is aligned to the realtime extent size, which makes no sense
+since that combination is used only to seed new realtime files.
+
+Replace the open-coded and inadequate checks with the libxfs verifier
+versions and update the code comments a bit.
+
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 6b69e485894b355b333bd286f0f0958e41d8754a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_ioctl.c
+diff --cc fs/xfs/xfs_ioctl.c
+index 0b05f7dd7822,6407921aca96..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -1335,83 -1273,53 +1323,61 @@@ out_error
+  static int
+  xfs_ioctl_setattr_check_extsize(
+  	struct xfs_inode	*ip,
+ -	struct fileattr		*fa)
+ +	struct fsxattr		*fa)
+  {
+  	struct xfs_mount	*mp = ip->i_mount;
+- 	xfs_extlen_t		size;
+- 	xfs_fsblock_t		extsize_fsb;
++ 	xfs_failaddr_t		failaddr;
++ 	uint16_t		new_diflags;
+  
+ -	if (!fa->fsx_valid)
+ -		return 0;
+ -
+  	if (S_ISREG(VFS_I(ip)->i_mode) && ip->i_df.if_nextents &&
+++<<<<<<< HEAD
+ +	    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) != fa->fsx_extsize))
+++=======
++ 	    XFS_FSB_TO_B(mp, ip->i_extsize) != fa->fsx_extsize)
+++>>>>>>> 6b69e485894b (xfs: standardize extent size hint validation)
+  		return -EINVAL;
+  
+- 	if (fa->fsx_extsize == 0)
+- 		return 0;
+- 
+- 	extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
+- 	if (extsize_fsb > MAXEXTLEN)
++ 	if (fa->fsx_extsize & mp->m_blockmask)
+  		return -EINVAL;
+  
+- 	if (XFS_IS_REALTIME_INODE(ip) ||
+- 	    (fa->fsx_xflags & FS_XFLAG_REALTIME)) {
+- 		size = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
+- 	} else {
+- 		size = mp->m_sb.sb_blocksize;
+- 		if (extsize_fsb > mp->m_sb.sb_agblocks / 2)
+- 			return -EINVAL;
+- 	}
+- 
+- 	if (fa->fsx_extsize % size)
+- 		return -EINVAL;
++ 	new_diflags = xfs_flags2diflags(ip, fa->fsx_xflags);
+  
+- 	return 0;
++ 	failaddr = xfs_inode_validate_extsize(ip->i_mount,
++ 			XFS_B_TO_FSB(mp, fa->fsx_extsize),
++ 			VFS_I(ip)->i_mode, new_diflags);
++ 	return failaddr != NULL ? -EINVAL : 0;
+  }
+  
+- /*
+-  * CoW extent size hint validation rules are:
+-  *
+-  * 1. CoW extent size hint can only be set if reflink is enabled on the fs.
+-  *    The inode does not have to have any shared blocks, but it must be a v3.
+-  * 2. FS_XFLAG_COWEXTSIZE is only valid for directories and regular files;
+-  *    for a directory, the hint is propagated to new files.
+-  * 3. Can be changed on files & directories at any time.
+-  * 4. CoW extsize hint of 0 turns off hints, clears inode flags.
+-  * 5. Extent size must be a multiple of the appropriate block size.
+-  * 6. The extent size hint must be limited to half the AG size to avoid
+-  *    alignment extending the extent beyond the limits of the AG.
+-  *
+-  * Please keep this function in sync with xfs_scrub_inode_cowextsize.
+-  */
+  static int
+  xfs_ioctl_setattr_check_cowextsize(
+  	struct xfs_inode	*ip,
+ -	struct fileattr		*fa)
+ +	struct fsxattr		*fa)
+  {
+  	struct xfs_mount	*mp = ip->i_mount;
+- 	xfs_extlen_t		size;
+- 	xfs_fsblock_t		cowextsize_fsb;
++ 	xfs_failaddr_t		failaddr;
++ 	uint64_t		new_diflags2;
++ 	uint16_t		new_diflags;
+  
+++<<<<<<< HEAD
+ +	if (!(fa->fsx_xflags & FS_XFLAG_COWEXTSIZE))
+ +		return 0;
+ +
+ +	if (!xfs_sb_version_hasreflink(&ip->i_mount->m_sb))
+- 		return -EINVAL;
+- 
+- 	if (fa->fsx_cowextsize == 0)
+++=======
++ 	if (!fa->fsx_valid)
+  		return 0;
+  
+- 	cowextsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_cowextsize);
+- 	if (cowextsize_fsb > MAXEXTLEN)
++ 	if (fa->fsx_cowextsize & mp->m_blockmask)
+++>>>>>>> 6b69e485894b (xfs: standardize extent size hint validation)
+  		return -EINVAL;
+  
+- 	size = mp->m_sb.sb_blocksize;
+- 	if (cowextsize_fsb > mp->m_sb.sb_agblocks / 2)
+- 		return -EINVAL;
++ 	new_diflags = xfs_flags2diflags(ip, fa->fsx_xflags);
++ 	new_diflags2 = xfs_flags2diflags2(ip, fa->fsx_xflags);
+  
+- 	if (fa->fsx_cowextsize % size)
+- 		return -EINVAL;
+- 
+- 	return 0;
++ 	failaddr = xfs_inode_validate_cowextsize(ip->i_mount,
++ 			XFS_B_TO_FSB(mp, fa->fsx_cowextsize),
++ 			VFS_I(ip)->i_mode, new_diflags, new_diflags2);
++ 	return failaddr != NULL ? -EINVAL : 0;
+  }
+  
+  static int
+diff --git a/fs/xfs/libxfs/xfs_inode_buf.c b/fs/xfs/libxfs/xfs_inode_buf.c
+index 671aeb012e3f..c26426fafaf1 100644
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@ -560,8 +560,17 @@ xfs_dinode_calc_crc(
+ /*
+  * Validate di_extsize hint.
+  *
+- * The rules are documented at xfs_ioctl_setattr_check_extsize().
+- * These functions must be kept in sync with each other.
++ * 1. Extent size hint is only valid for directories and regular files.
++ * 2. FS_XFLAG_EXTSIZE is only valid for regular files.
++ * 3. FS_XFLAG_EXTSZINHERIT is only valid for directories.
++ * 4. Hint cannot be larger than MAXTEXTLEN.
++ * 5. Can be changed on directories at any time.
++ * 6. Hint value of 0 turns off hints, clears inode flags.
++ * 7. Extent size must be a multiple of the appropriate block size.
++ *    For realtime files, this is the rt extent size.
++ * 8. For non-realtime files, the extent size hint must be limited
++ *    to half the AG size to avoid alignment extending the extent beyond the
++ *    limits of the AG.
+  */
+ xfs_failaddr_t
+ xfs_inode_validate_extsize(
+@@ -617,8 +626,15 @@ xfs_inode_validate_extsize(
+ /*
+  * Validate di_cowextsize hint.
+  *
+- * The rules are documented at xfs_ioctl_setattr_check_cowextsize().
+- * These functions must be kept in sync with each other.
++ * 1. CoW extent size hint can only be set if reflink is enabled on the fs.
++ *    The inode does not have to have any shared blocks, but it must be a v3.
++ * 2. FS_XFLAG_COWEXTSIZE is only valid for directories and regular files;
++ *    for a directory, the hint is propagated to new files.
++ * 3. Can be changed on files & directories at any time.
++ * 4. Hint value of 0 turns off hints, clears inode flags.
++ * 5. Extent size must be a multiple of the appropriate block size.
++ * 6. The extent size hint must be limited to half the AG size to avoid
++ *    alignment extending the extent beyond the limits of the AG.
+  */
+ xfs_failaddr_t
+ xfs_inode_validate_cowextsize(
+* Unmerged path fs/xfs/xfs_ioctl.c
