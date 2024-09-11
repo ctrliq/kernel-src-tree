@@ -1,0 +1,607 @@
+mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 5292e24a6acf5694e0a32c31e3321964176bc17e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5292e24a.failed
+
+The 'interval_sub' is placed on the 'notifier_subscriptions' interval
+tree.
+
+This eliminates the poor name 'mni' for this variable.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 5292e24a6acf5694e0a32c31e3321964176bc17e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmu_notifier.h
+#	mm/mmu_notifier.c
+diff --cc include/linux/mmu_notifier.h
+index d924803cea7c,736f6918335e..000000000000
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@@ -317,25 -277,24 +317,26 @@@ mmu_notifier_get(const struct mmu_notif
+  {
+  	struct mmu_notifier *ret;
+  
+ -	down_write(&mm->mmap_sem);
+ +	mmap_write_lock(mm);
+  	ret = mmu_notifier_get_locked(ops, mm);
+ -	up_write(&mm->mmap_sem);
+ +	mmap_write_unlock(mm);
+  	return ret;
+  }
+ -void mmu_notifier_put(struct mmu_notifier *subscription);
+ +void mmu_notifier_put(struct mmu_notifier *mn);
+  void mmu_notifier_synchronize(void);
+  
+ -extern int mmu_notifier_register(struct mmu_notifier *subscription,
+ +extern int mmu_notifier_register(struct mmu_notifier *mn,
+  				 struct mm_struct *mm);
+ -extern int __mmu_notifier_register(struct mmu_notifier *subscription,
+ +extern int __mmu_notifier_register(struct mmu_notifier *mn,
+  				   struct mm_struct *mm);
+ -extern void mmu_notifier_unregister(struct mmu_notifier *subscription,
+ +extern void mmu_notifier_unregister(struct mmu_notifier *mn,
+  				    struct mm_struct *mm);
+ +extern void mmu_notifier_unregister_no_release(struct mmu_notifier *mn,
+ +					       struct mm_struct *mm);
+  
+- unsigned long mmu_interval_read_begin(struct mmu_interval_notifier *mni);
+- int mmu_interval_notifier_insert(struct mmu_interval_notifier *mni,
++ unsigned long
++ mmu_interval_read_begin(struct mmu_interval_notifier *interval_sub);
++ int mmu_interval_notifier_insert(struct mmu_interval_notifier *interval_sub,
+  				 struct mm_struct *mm, unsigned long start,
+  				 unsigned long length,
+  				 const struct mmu_interval_notifier_ops *ops);
+@@@ -401,14 -362,15 +404,20 @@@ mmu_interval_read_retry(struct mmu_inte
+   * This call can be used as part of loops and other expensive operations to
+   * expedite a retry.
+   */
+++<<<<<<< HEAD
+ +static inline bool mmu_interval_check_retry(struct mmu_interval_notifier *mni,
+ +				    unsigned long seq)
+++=======
++ static inline bool
++ mmu_interval_check_retry(struct mmu_interval_notifier *interval_sub,
++ 			 unsigned long seq)
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  {
+  	/* Pairs with the WRITE_ONCE in mmu_interval_set_seq() */
+- 	return READ_ONCE(mni->invalidate_seq) != seq;
++ 	return READ_ONCE(interval_sub->invalidate_seq) != seq;
+  }
+  
+ -extern void __mmu_notifier_subscriptions_destroy(struct mm_struct *mm);
+ +extern void __mmu_notifier_mm_destroy(struct mm_struct *mm);
+  extern void __mmu_notifier_release(struct mm_struct *mm);
+  extern int __mmu_notifier_clear_flush_young(struct mm_struct *mm,
+  					  unsigned long start,
+diff --cc mm/mmu_notifier.c
+index 4361d699fa34,ef3973a5d34a..000000000000
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@@ -83,12 -81,13 +83,12 @@@ struct mmu_notifier_mm 
+   *    seq & 1   # True if a writer exists
+   *
+   * The later state avoids some expensive work on inv_end in the common case of
+-  * no mni monitoring the VA.
++  * no mmu_interval_notifier monitoring the VA.
+   */
+ -static bool
+ -mn_itree_is_invalidating(struct mmu_notifier_subscriptions *subscriptions)
+ +static bool mn_itree_is_invalidating(struct mmu_notifier_mm *mmn_mm)
+  {
+ -	lockdep_assert_held(&subscriptions->lock);
+ -	return subscriptions->invalidate_seq & 1;
+ +	lockdep_assert_held(&mmn_mm->lock);
+ +	return mmn_mm->invalidate_seq & 1;
+  }
+  
+  static struct mmu_interval_notifier *
+@@@ -127,15 -126,15 +127,15 @@@ mn_itree_inv_next(struct mmu_interval_n
+  	return container_of(node, struct mmu_interval_notifier, interval_tree);
+  }
+  
+ -static void mn_itree_inv_end(struct mmu_notifier_subscriptions *subscriptions)
+ +static void mn_itree_inv_end(struct mmu_notifier_mm *mmn_mm)
+  {
+- 	struct mmu_interval_notifier *mni;
++ 	struct mmu_interval_notifier *interval_sub;
+  	struct hlist_node *next;
+  
+ -	spin_lock(&subscriptions->lock);
+ -	if (--subscriptions->active_invalidate_ranges ||
+ -	    !mn_itree_is_invalidating(subscriptions)) {
+ -		spin_unlock(&subscriptions->lock);
+ +	spin_lock(&mmn_mm->lock);
+ +	if (--mmn_mm->active_invalidate_ranges ||
+ +	    !mn_itree_is_invalidating(mmn_mm)) {
+ +		spin_unlock(&mmn_mm->lock);
+  		return;
+  	}
+  
+@@@ -148,19 -147,20 +148,32 @@@
+  	 * they are progressed. This arrangement for tree updates is used to
+  	 * avoid using a blocking lock during invalidate_range_start.
+  	 */
+++<<<<<<< HEAD
+ +	hlist_for_each_entry_safe(mni, next, &mmn_mm->deferred_list,
+ +				  deferred_item) {
+ +		if (RB_EMPTY_NODE(&mni->interval_tree.rb))
+ +			interval_tree_insert(&mni->interval_tree,
+ +					     &mmn_mm->itree);
+ +		else
+ +			interval_tree_remove(&mni->interval_tree,
+ +					     &mmn_mm->itree);
+ +		hlist_del(&mni->deferred_item);
+++=======
++ 	hlist_for_each_entry_safe(interval_sub, next,
++ 				  &subscriptions->deferred_list,
++ 				  deferred_item) {
++ 		if (RB_EMPTY_NODE(&interval_sub->interval_tree.rb))
++ 			interval_tree_insert(&interval_sub->interval_tree,
++ 					     &subscriptions->itree);
++ 		else
++ 			interval_tree_remove(&interval_sub->interval_tree,
++ 					     &subscriptions->itree);
++ 		hlist_del(&interval_sub->deferred_item);
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	}
+ -	spin_unlock(&subscriptions->lock);
+ +	spin_unlock(&mmn_mm->lock);
+  
+ -	wake_up_all(&subscriptions->wq);
+ +	wake_up_all(&mmn_mm->wq);
+  }
+  
+  /**
+@@@ -182,27 -182,30 +195,44 @@@
+   *
+   * The return value should be passed to mmu_interval_read_retry().
+   */
+- unsigned long mmu_interval_read_begin(struct mmu_interval_notifier *mni)
++ unsigned long
++ mmu_interval_read_begin(struct mmu_interval_notifier *interval_sub)
+  {
+++<<<<<<< HEAD
+ +	struct mmu_notifier_mm *mmn_mm = mni->mm->mmu_notifier_mm;
+++=======
++ 	struct mmu_notifier_subscriptions *subscriptions =
++ 		interval_sub->mm->notifier_subscriptions;
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	unsigned long seq;
+  	bool is_invalidating;
+  
+  	/*
+- 	 * If the mni has a different seq value under the user_lock than we
+- 	 * started with then it has collided.
++ 	 * If the subscription has a different seq value under the user_lock
++ 	 * than we started with then it has collided.
+  	 *
+++<<<<<<< HEAD
+ +	 * If the mni currently has the same seq value as the mmn_mm seq, then
+ +	 * it is currently between invalidate_start/end and is colliding.
+++=======
++ 	 * If the subscription currently has the same seq value as the
++ 	 * subscriptions seq, then it is currently between
++ 	 * invalidate_start/end and is colliding.
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	 *
+  	 * The locking looks broadly like this:
+  	 *   mn_tree_invalidate_start():          mmu_interval_read_begin():
+  	 *                                         spin_lock
+++<<<<<<< HEAD
+ +	 *                                          seq = READ_ONCE(mni->invalidate_seq);
+ +	 *                                          seq == mmn_mm->invalidate_seq
+++=======
++ 	 *                                          seq = READ_ONCE(interval_sub->invalidate_seq);
++ 	 *                                          seq == subs->invalidate_seq
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	 *                                         spin_unlock
+  	 *    spin_lock
+ -	 *     seq = ++subscriptions->invalidate_seq
+ +	 *     seq = ++mmn_mm->invalidate_seq
+  	 *    spin_unlock
+  	 *     op->invalidate_range():
+  	 *       user_lock
+@@@ -226,14 -229,14 +256,20 @@@
+  	 * eventual mmu_interval_read_retry(), which provides a barrier via the
+  	 * user_lock.
+  	 */
+ -	spin_lock(&subscriptions->lock);
+ +	spin_lock(&mmn_mm->lock);
+  	/* Pairs with the WRITE_ONCE in mmu_interval_set_seq() */
+++<<<<<<< HEAD
+ +	seq = READ_ONCE(mni->invalidate_seq);
+ +	is_invalidating = seq == mmn_mm->invalidate_seq;
+ +	spin_unlock(&mmn_mm->lock);
+++=======
++ 	seq = READ_ONCE(interval_sub->invalidate_seq);
++ 	is_invalidating = seq == subscriptions->invalidate_seq;
++ 	spin_unlock(&subscriptions->lock);
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  
+  	/*
+- 	 * mni->invalidate_seq must always be set to an odd value via
++ 	 * interval_sub->invalidate_seq must always be set to an odd value via
+  	 * mmu_interval_set_seq() using the provided cur_seq from
+  	 * mn_itree_inv_start_range(). This ensures that if seq does wrap we
+  	 * will always clear the below sleep in some reasonable time as
+@@@ -268,9 -272,12 +304,18 @@@ static void mn_itree_release(struct mmu
+  	unsigned long cur_seq;
+  	bool ret;
+  
+++<<<<<<< HEAD
+ +	for (mni = mn_itree_inv_start_range(mmn_mm, &range, &cur_seq); mni;
+ +	     mni = mn_itree_inv_next(mni, &range)) {
+ +		ret = mni->ops->invalidate(mni, &range, cur_seq);
+++=======
++ 	for (interval_sub =
++ 		     mn_itree_inv_start_range(subscriptions, &range, &cur_seq);
++ 	     interval_sub;
++ 	     interval_sub = mn_itree_inv_next(interval_sub, &range)) {
++ 		ret = interval_sub->ops->invalidate(interval_sub, &range,
++ 						    cur_seq);
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  		WARN_ON(!ret);
+  	}
+  
+@@@ -432,23 -436,43 +477,39 @@@ void __mmu_notifier_change_pte(struct m
+  	srcu_read_unlock(&srcu, id);
+  }
+  
+ -static int mn_itree_invalidate(struct mmu_notifier_subscriptions *subscriptions,
+ -			       const struct mmu_notifier_range *range)
+ +static void mn_itree_invalidate(struct mmu_notifier_mm *mmn_mm,
+ +				const struct mmu_notifier_range *range)
+  {
+- 	struct mmu_interval_notifier *mni;
++ 	struct mmu_interval_notifier *interval_sub;
+  	unsigned long cur_seq;
+  
+++<<<<<<< HEAD
+ +	for (mni = mn_itree_inv_start_range(mmn_mm, range, &cur_seq); mni;
+ +	     mni = mn_itree_inv_next(mni, range)) {
+ +
+ +		mni->ops->invalidate(mni, range, cur_seq);
+++=======
++ 	for (interval_sub =
++ 		     mn_itree_inv_start_range(subscriptions, range, &cur_seq);
++ 	     interval_sub;
++ 	     interval_sub = mn_itree_inv_next(interval_sub, range)) {
++ 		bool ret;
++ 
++ 		ret = interval_sub->ops->invalidate(interval_sub, range,
++ 						    cur_seq);
++ 		if (!ret) {
++ 			if (WARN_ON(mmu_notifier_range_blockable(range)))
++ 				continue;
++ 			goto out_would_block;
++ 		}
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	}
+ -	return 0;
+ -
+ -out_would_block:
+ -	/*
+ -	 * On -EAGAIN the non-blocking caller is not allowed to call
+ -	 * invalidate_range_end()
+ -	 */
+ -	mn_itree_inv_end(subscriptions);
+ -	return -EAGAIN;
+  }
+  
+ -static int mn_hlist_invalidate_range_start(
+ -	struct mmu_notifier_subscriptions *subscriptions,
+ -	struct mmu_notifier_range *range)
+ +static void mn_hlist_invalidate_range_start(struct mmu_notifier_mm *mmn_mm,
+ +					    struct mmu_notifier_range *range)
+  {
+ -	struct mmu_notifier *subscription;
+ -	int ret = 0;
+ +	struct mmu_notifier *mn;
+  	int id;
+  
+  	id = srcu_read_lock(&srcu);
+@@@ -817,53 -834,66 +878,58 @@@ void mmu_notifier_unregister(struct mmu
+  }
+  EXPORT_SYMBOL_GPL(mmu_notifier_unregister);
+  
+ -static void mmu_notifier_free_rcu(struct rcu_head *rcu)
+ +static void mmu_notifier_rh_free_rcu(struct rcu_head *rcu)
+  {
+ -	struct mmu_notifier *subscription =
+ -		container_of(rcu, struct mmu_notifier, rcu);
+ -	struct mm_struct *mm = subscription->mm;
+ -
+ -	subscription->ops->free_notifier(subscription);
+ -	/* Pairs with the get in __mmu_notifier_register() */
+ -	mmdrop(mm);
+ +	kfree(container_of(rcu, struct mmu_notifier_rh, rcu));
+  }
+  
+ -/**
+ - * mmu_notifier_put - Release the reference on the notifier
+ - * @mn: The notifier to act on
+ - *
+ - * This function must be paired with each mmu_notifier_get(), it releases the
+ - * reference obtained by the get. If this is the last reference then process
+ - * to free the notifier will be run asynchronously.
+ - *
+ - * Unlike mmu_notifier_unregister() the get/put flow only calls ops->release
+ - * when the mm_struct is destroyed. Instead free_notifier is always called to
+ - * release any resources held by the user.
+ - *
+ - * As ops->release is not guaranteed to be called, the user must ensure that
+ - * all sptes are dropped, and no new sptes can be established before
+ - * mmu_notifier_put() is called.
+ - *
+ - * This function can be called from the ops->release callback, however the
+ - * caller must still ensure it is called pairwise with mmu_notifier_get().
+ - *
+ - * Modules calling this function must call mmu_notifier_synchronize() in
+ - * their __exit functions to ensure the async work is completed.
+ +/*
+ + * Same as mmu_notifier_unregister but no callback and no srcu synchronization.
+   */
+ -void mmu_notifier_put(struct mmu_notifier *subscription)
+ +void mmu_notifier_unregister_no_release(struct mmu_notifier *mn,
+ +					struct mm_struct *mm)
+  {
+ -	struct mm_struct *mm = subscription->mm;
+ +	spin_lock(&mm->mmu_notifier_mm->lock);
+ +	/*
+ +	 * Can not use list_del_rcu() since __mmu_notifier_release
+ +	 * can delete it before we hold the lock.
+ +	 */
+ +	hlist_del_init_rcu(&mn->hlist);
+ +	spin_unlock(&mm->mmu_notifier_mm->lock);
+  
+ -	spin_lock(&mm->notifier_subscriptions->lock);
+ -	if (WARN_ON(!subscription->users) || --subscription->users)
+ -		goto out_unlock;
+ -	hlist_del_init_rcu(&subscription->hlist);
+ -	spin_unlock(&mm->notifier_subscriptions->lock);
+ +	call_srcu(&srcu, &mn->_rh->rcu, mmu_notifier_rh_free_rcu);
+  
+ -	call_srcu(&srcu, &subscription->rcu, mmu_notifier_free_rcu);
+ -	return;
+ +	BUG_ON(atomic_read(&mm->mm_count) <= 0);
+ +	mmdrop(mm);
+ +}
+ +EXPORT_SYMBOL_GPL(mmu_notifier_unregister_no_release);
+  
+ -out_unlock:
+ -	spin_unlock(&mm->notifier_subscriptions->lock);
+ +static void mmu_notifier_free_rcu(struct rcu_head *rcu)
+ +{
+ +	struct mmu_notifier_rh *mn_rh = container_of(rcu, struct mmu_notifier_rh, rcu);
+ +	struct mm_struct *mm = mn_rh->mm;
+ +	struct mmu_notifier *mn = mn_rh->back_ptr;
+ +
+ +	kfree(mn_rh);
+ +	mn->ops->free_notifier(mn);
+ +	/* Pairs with the get in __mmu_notifier_register() */
+ +	mmdrop(mm);
+  }
+ -EXPORT_SYMBOL_GPL(mmu_notifier_put);
+  
+  static int __mmu_interval_notifier_insert(
+++<<<<<<< HEAD
+ +	struct mmu_interval_notifier *mni, struct mm_struct *mm,
+ +	struct mmu_notifier_mm *mmn_mm, unsigned long start,
+++=======
++ 	struct mmu_interval_notifier *interval_sub, struct mm_struct *mm,
++ 	struct mmu_notifier_subscriptions *subscriptions, unsigned long start,
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	unsigned long length, const struct mmu_interval_notifier_ops *ops)
+  {
+- 	mni->mm = mm;
+- 	mni->ops = ops;
+- 	RB_CLEAR_NODE(&mni->interval_tree.rb);
+- 	mni->interval_tree.start = start;
++ 	interval_sub->mm = mm;
++ 	interval_sub->ops = ops;
++ 	RB_CLEAR_NODE(&interval_sub->interval_tree.rb);
++ 	interval_sub->interval_tree.start = start;
+  	/*
+  	 * Note that the representation of the intervals in the interval tree
+  	 * considers the ending point as contained in the interval.
+@@@ -889,32 -920,34 +956,53 @@@
+  	 * possibility for live lock, instead defer the add to
+  	 * mn_itree_inv_end() so this algorithm is deterministic.
+  	 *
+- 	 * In all cases the value for the mni->invalidate_seq should be
++ 	 * In all cases the value for the interval_sub->invalidate_seq should be
+  	 * odd, see mmu_interval_read_begin()
+  	 */
+++<<<<<<< HEAD
+ +	spin_lock(&mmn_mm->lock);
+ +	if (mmn_mm->active_invalidate_ranges) {
+ +		if (mn_itree_is_invalidating(mmn_mm))
+ +			hlist_add_head(&mni->deferred_item,
+ +				       &mmn_mm->deferred_list);
+ +		else {
+ +			mmn_mm->invalidate_seq |= 1;
+ +			interval_tree_insert(&mni->interval_tree,
+ +					     &mmn_mm->itree);
+ +		}
+ +		mni->invalidate_seq = mmn_mm->invalidate_seq;
+++=======
++ 	spin_lock(&subscriptions->lock);
++ 	if (subscriptions->active_invalidate_ranges) {
++ 		if (mn_itree_is_invalidating(subscriptions))
++ 			hlist_add_head(&interval_sub->deferred_item,
++ 				       &subscriptions->deferred_list);
++ 		else {
++ 			subscriptions->invalidate_seq |= 1;
++ 			interval_tree_insert(&interval_sub->interval_tree,
++ 					     &subscriptions->itree);
++ 		}
++ 		interval_sub->invalidate_seq = subscriptions->invalidate_seq;
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	} else {
+ -		WARN_ON(mn_itree_is_invalidating(subscriptions));
+ +		WARN_ON(mn_itree_is_invalidating(mmn_mm));
+  		/*
+- 		 * The starting seq for a mni not under invalidation should be
+- 		 * odd, not equal to the current invalidate_seq and
++ 		 * The starting seq for a subscription not under invalidation
++ 		 * should be odd, not equal to the current invalidate_seq and
+  		 * invalidate_seq should not 'wrap' to the new seq any time
+  		 * soon.
+  		 */
+++<<<<<<< HEAD
+ +		mni->invalidate_seq = mmn_mm->invalidate_seq - 1;
+ +		interval_tree_insert(&mni->interval_tree, &mmn_mm->itree);
+++=======
++ 		interval_sub->invalidate_seq =
++ 			subscriptions->invalidate_seq - 1;
++ 		interval_tree_insert(&interval_sub->interval_tree,
++ 				     &subscriptions->itree);
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	}
+ -	spin_unlock(&subscriptions->lock);
+ +	spin_unlock(&mmn_mm->lock);
+  	return 0;
+  }
+  
+@@@ -948,10 -981,10 +1036,15 @@@ int mmu_interval_notifier_insert(struc
+  		ret = mmu_notifier_register(NULL, mm);
+  		if (ret)
+  			return ret;
+ -		subscriptions = mm->notifier_subscriptions;
+ +		mmn_mm = mm->mmu_notifier_mm;
+  	}
+++<<<<<<< HEAD
+ +	return __mmu_interval_notifier_insert(mni, mm, mmn_mm, start, length,
+ +					      ops);
+++=======
++ 	return __mmu_interval_notifier_insert(interval_sub, mm, subscriptions,
++ 					      start, length, ops);
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  }
+  EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert);
+  
+@@@ -970,10 -1003,10 +1063,15 @@@ int mmu_interval_notifier_insert_locked
+  		ret = __mmu_notifier_register(NULL, mm);
+  		if (ret)
+  			return ret;
+ -		subscriptions = mm->notifier_subscriptions;
+ +		mmn_mm = mm->mmu_notifier_mm;
+  	}
+++<<<<<<< HEAD
+ +	return __mmu_interval_notifier_insert(mni, mm, mmn_mm, start, length,
+ +					      ops);
+++=======
++ 	return __mmu_interval_notifier_insert(interval_sub, mm, subscriptions,
++ 					      start, length, ops);
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  }
+  EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert_locked);
+  
+@@@ -987,10 -1020,11 +1085,16 @@@
+   * Once this returns ops callbacks are no longer running on other CPUs and
+   * will not be called in future.
+   */
+- void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni)
++ void mmu_interval_notifier_remove(struct mmu_interval_notifier *interval_sub)
+  {
+++<<<<<<< HEAD
+ +	struct mm_struct *mm = mni->mm;
+ +	struct mmu_notifier_mm *mmn_mm = mm->mmu_notifier_mm;
+++=======
++ 	struct mm_struct *mm = interval_sub->mm;
++ 	struct mmu_notifier_subscriptions *subscriptions =
++ 		mm->notifier_subscriptions;
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	unsigned long seq = 0;
+  
+  	might_sleep();
+@@@ -1001,18 -1035,19 +1105,29 @@@
+  		 * remove is being called after insert put this on the
+  		 * deferred list, but before the deferred list was processed.
+  		 */
+- 		if (RB_EMPTY_NODE(&mni->interval_tree.rb)) {
+- 			hlist_del(&mni->deferred_item);
++ 		if (RB_EMPTY_NODE(&interval_sub->interval_tree.rb)) {
++ 			hlist_del(&interval_sub->deferred_item);
+  		} else {
+++<<<<<<< HEAD
+ +			hlist_add_head(&mni->deferred_item,
+ +				       &mmn_mm->deferred_list);
+ +			seq = mmn_mm->invalidate_seq;
+ +		}
+ +	} else {
+ +		WARN_ON(RB_EMPTY_NODE(&mni->interval_tree.rb));
+ +		interval_tree_remove(&mni->interval_tree, &mmn_mm->itree);
+++=======
++ 			hlist_add_head(&interval_sub->deferred_item,
++ 				       &subscriptions->deferred_list);
++ 			seq = subscriptions->invalidate_seq;
++ 		}
++ 	} else {
++ 		WARN_ON(RB_EMPTY_NODE(&interval_sub->interval_tree.rb));
++ 		interval_tree_remove(&interval_sub->interval_tree,
++ 				     &subscriptions->itree);
+++>>>>>>> 5292e24a6acf (mm/mmu_notifiers: Use 'interval_sub' as the variable for mmu_interval_notifier)
+  	}
+ -	spin_unlock(&subscriptions->lock);
+ +	spin_unlock(&mmn_mm->lock);
+  
+  	/*
+  	 * The possible sleep on progress in the invalidation requires the
+diff --git a/Documentation/vm/hmm.rst b/Documentation/vm/hmm.rst
+index e49486475822..561969754bc0 100644
+--- a/Documentation/vm/hmm.rst
++++ b/Documentation/vm/hmm.rst
+@@ -149,14 +149,14 @@ CPU page table into a device page table; HMM helps keep both synchronized. A
+ device driver that wants to mirror a process address space must start with the
+ registration of a mmu_interval_notifier::
+ 
+- mni->ops = &driver_ops;
+- int mmu_interval_notifier_insert(struct mmu_interval_notifier *mni,
+-			          unsigned long start, unsigned long length,
+-			          struct mm_struct *mm);
++ int mmu_interval_notifier_insert(struct mmu_interval_notifier *interval_sub,
++				  struct mm_struct *mm, unsigned long start,
++				  unsigned long length,
++				  const struct mmu_interval_notifier_ops *ops);
+ 
+-During the driver_ops->invalidate() callback the device driver must perform
+-the update action to the range (mark range read only, or fully unmap,
+-etc.). The device must complete the update before the driver callback returns.
++During the ops->invalidate() callback the device driver must perform the
++update action to the range (mark range read only, or fully unmap, etc.). The
++device must complete the update before the driver callback returns.
+ 
+ When the device driver wants to populate a range of virtual addresses, it can
+ use::
+@@ -181,16 +181,16 @@ The usage pattern is::
+       struct hmm_range range;
+       ...
+ 
+-      range.notifier = &mni;
++      range.notifier = &interval_sub;
+       range.start = ...;
+       range.end = ...;
+       range.hmm_pfns = ...;
+ 
+-      if (!mmget_not_zero(mni->notifier.mm))
++      if (!mmget_not_zero(interval_sub->notifier.mm))
+           return -EFAULT;
+ 
+  again:
+-      range.notifier_seq = mmu_interval_read_begin(&mni);
++      range.notifier_seq = mmu_interval_read_begin(&interval_sub);
+       down_read(&mm->mmap_sem);
+       ret = hmm_range_fault(&range);
+       if (ret) {
+* Unmerged path include/linux/mmu_notifier.h
+* Unmerged path mm/mmu_notifier.c
