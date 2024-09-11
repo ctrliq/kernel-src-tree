@@ -1,0 +1,147 @@
+arm64: Restrict ARM64_ERRATUM_1188873 mitigation to AArch32
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Marc Zyngier <marc.zyngier@arm.com>
+commit 0f80cad3124f986d0e46c14d46b8da06d87a2bf4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0f80cad3.failed
+
+We currently deal with ARM64_ERRATUM_1188873 by always trapping EL0
+accesses for both instruction sets. Although nothing wrong comes out
+of that, people trying to squeeze the last drop of performance from
+buggy HW find this over the top. Oh well.
+
+Let's change the mitigation by flipping the counter enable bit
+on return to userspace. Non-broken HW gets an extra branch on
+the fast path, which is hopefully not the end of the world.
+The arch timer workaround is also removed.
+
+	Acked-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit 0f80cad3124f986d0e46c14d46b8da06d87a2bf4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/entry.S
+#	drivers/clocksource/arm_arch_timer.c
+diff --cc arch/arm64/kernel/entry.S
+index 864ada8a265a,1a7811b7e3c4..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -331,8 -336,22 +331,27 @@@ alternative_if ARM64_WORKAROUND_84571
+  alternative_else_nop_endif
+  #endif
+  3:
+++<<<<<<< HEAD
+ +	apply_ssbd 0, 5f, x0, x1
+ +5:
+++=======
++ #ifdef CONFIG_ARM64_ERRATUM_1188873
++ alternative_if_not ARM64_WORKAROUND_1188873
++ 	b	4f
++ alternative_else_nop_endif
++ 	/*
++ 	 * if (x22.mode32 == cntkctl_el1.el0vcten)
++ 	 *     cntkctl_el1.el0vcten = ~cntkctl_el1.el0vcten
++ 	 */
++ 	mrs	x1, cntkctl_el1
++ 	eon	x0, x1, x22, lsr #3
++ 	tbz	x0, #1, 4f
++ 	eor	x1, x1, #2	// ARCH_TIMER_USR_VCT_ACCESS_EN
++ 	msr	cntkctl_el1, x1
++ 4:
++ #endif
++ 	apply_ssbd 0, x0, x1
+++>>>>>>> 0f80cad3124f (arm64: Restrict ARM64_ERRATUM_1188873 mitigation to AArch32)
+  	.endif
+  
+  	msr	elr_el1, x21			// set up the return data
+diff --cc drivers/clocksource/arm_arch_timer.c
+index b9243e2328b4,da11a9508b77..000000000000
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@@ -319,10 -319,45 +319,52 @@@ static u64 notrace arm64_858921_read_cn
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_ARM64_ERRATUM_1188873
+ +static u64 notrace arm64_1188873_read_cntvct_el0(void)
+ +{
+ +	return read_sysreg(cntvct_el0);
+++=======
++ #ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
++ /*
++  * The low bits of the counter registers are indeterminate while bit 10 or
++  * greater is rolling over. Since the counter value can jump both backward
++  * (7ff -> 000 -> 800) and forward (7ff -> fff -> 800), ignore register values
++  * with all ones or all zeros in the low bits. Bound the loop by the maximum
++  * number of CPU cycles in 3 consecutive 24 MHz counter periods.
++  */
++ #define __sun50i_a64_read_reg(reg) ({					\
++ 	u64 _val;							\
++ 	int _retries = 150;						\
++ 									\
++ 	do {								\
++ 		_val = read_sysreg(reg);				\
++ 		_retries--;						\
++ 	} while (((_val + 1) & GENMASK(9, 0)) <= 1 && _retries);	\
++ 									\
++ 	WARN_ON_ONCE(!_retries);					\
++ 	_val;								\
++ })
++ 
++ static u64 notrace sun50i_a64_read_cntpct_el0(void)
++ {
++ 	return __sun50i_a64_read_reg(cntpct_el0);
++ }
++ 
++ static u64 notrace sun50i_a64_read_cntvct_el0(void)
++ {
++ 	return __sun50i_a64_read_reg(cntvct_el0);
++ }
++ 
++ static u32 notrace sun50i_a64_read_cntp_tval_el0(void)
++ {
++ 	return read_sysreg(cntp_cval_el0) - sun50i_a64_read_cntpct_el0();
++ }
++ 
++ static u32 notrace sun50i_a64_read_cntv_tval_el0(void)
++ {
++ 	return read_sysreg(cntv_cval_el0) - sun50i_a64_read_cntvct_el0();
+++>>>>>>> 0f80cad3124f (arm64: Restrict ARM64_ERRATUM_1188873 mitigation to AArch32)
+  }
+  #endif
+  
+@@@ -415,12 -450,17 +457,26 @@@ static const struct arch_timer_erratum_
+  		.read_cntvct_el0 = arm64_858921_read_cntvct_el0,
+  	},
+  #endif
+++<<<<<<< HEAD
+ +#ifdef CONFIG_ARM64_ERRATUM_1188873
+ +	{
+ +		.match_type = ate_match_local_cap_id,
+ +		.id = (void *)ARM64_WORKAROUND_1188873,
+ +		.desc = "ARM erratum 1188873",
+ +		.read_cntvct_el0 = arm64_1188873_read_cntvct_el0,
+++=======
++ #ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
++ 	{
++ 		.match_type = ate_match_dt,
++ 		.id = "allwinner,erratum-unknown1",
++ 		.desc = "Allwinner erratum UNKNOWN1",
++ 		.read_cntp_tval_el0 = sun50i_a64_read_cntp_tval_el0,
++ 		.read_cntv_tval_el0 = sun50i_a64_read_cntv_tval_el0,
++ 		.read_cntpct_el0 = sun50i_a64_read_cntpct_el0,
++ 		.read_cntvct_el0 = sun50i_a64_read_cntvct_el0,
++ 		.set_next_event_phys = erratum_set_next_event_tval_phys,
++ 		.set_next_event_virt = erratum_set_next_event_tval_virt,
+++>>>>>>> 0f80cad3124f (arm64: Restrict ARM64_ERRATUM_1188873 mitigation to AArch32)
+  	},
+  #endif
+  };
+* Unmerged path arch/arm64/kernel/entry.S
+* Unmerged path drivers/clocksource/arm_arch_timer.c
