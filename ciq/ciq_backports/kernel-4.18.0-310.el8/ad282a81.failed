@@ -1,0 +1,158 @@
+locking/static_key: Add support for deferred static branches
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit ad282a8117d5048398f506f20b092c14b3b3c43f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/ad282a81.failed
+
+Add deferred static branches.  We can't unfortunately use the
+nice trick of encapsulating the entire structure in true/false
+variants, because the inside has to be either struct static_key_true
+or struct static_key_false.  Use defines to pass the appropriate
+members to the helpers separately.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: alexei.starovoitov@gmail.com
+	Cc: ard.biesheuvel@linaro.org
+	Cc: oss-drivers@netronome.com
+	Cc: yamada.masahiro@socionext.com
+Link: https://lkml.kernel.org/r/20190330000854.30142-2-jakub.kicinski@netronome.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ad282a8117d5048398f506f20b092c14b3b3c43f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/jump_label_ratelimit.h
+diff --cc include/linux/jump_label_ratelimit.h
+index baa8eabbaa56,42710d5949ba..000000000000
+--- a/include/linux/jump_label_ratelimit.h
++++ b/include/linux/jump_label_ratelimit.h
+@@@ -11,15 -11,58 +11,69 @@@ struct static_key_deferred 
+  	unsigned long timeout;
+  	struct delayed_work work;
+  };
+ +#endif
+  
+++<<<<<<< HEAD
+ +#ifdef HAVE_JUMP_LABEL
+ +extern void static_key_slow_dec_deferred(struct static_key_deferred *key);
+ +extern void static_key_deferred_flush(struct static_key_deferred *key);
+ +extern void
+ +jump_label_rate_limit(struct static_key_deferred *key, unsigned long rl);
+ +
+ +#else	/* !HAVE_JUMP_LABEL */
+++=======
++ struct static_key_true_deferred {
++ 	struct static_key_true key;
++ 	unsigned long timeout;
++ 	struct delayed_work work;
++ };
++ 
++ struct static_key_false_deferred {
++ 	struct static_key_false key;
++ 	unsigned long timeout;
++ 	struct delayed_work work;
++ };
++ 
++ #define static_key_slow_dec_deferred(x)					\
++ 	__static_key_slow_dec_deferred(&(x)->key, &(x)->work, (x)->timeout)
++ #define static_branch_slow_dec_deferred(x)				\
++ 	__static_key_slow_dec_deferred(&(x)->key.key, &(x)->work, (x)->timeout)
++ 
++ #define static_key_deferred_flush(x)					\
++ 	__static_key_deferred_flush((x), &(x)->work)
++ 
++ extern void
++ __static_key_slow_dec_deferred(struct static_key *key,
++ 			       struct delayed_work *work,
++ 			       unsigned long timeout);
++ extern void __static_key_deferred_flush(void *key, struct delayed_work *work);
++ extern void
++ jump_label_rate_limit(struct static_key_deferred *key, unsigned long rl);
++ 
++ extern void jump_label_update_timeout(struct work_struct *work);
++ 
++ #define DEFINE_STATIC_KEY_DEFERRED_TRUE(name, rl)			\
++ 	struct static_key_true_deferred name = {			\
++ 		.key =		{ STATIC_KEY_INIT_TRUE },		\
++ 		.timeout =	(rl),					\
++ 		.work =	__DELAYED_WORK_INITIALIZER((name).work,		\
++ 						   jump_label_update_timeout, \
++ 						   0),			\
++ 	}
++ 
++ #define DEFINE_STATIC_KEY_DEFERRED_FALSE(name, rl)			\
++ 	struct static_key_false_deferred name = {			\
++ 		.key =		{ STATIC_KEY_INIT_FALSE },		\
++ 		.timeout =	(rl),					\
++ 		.work =	__DELAYED_WORK_INITIALIZER((name).work,		\
++ 						   jump_label_update_timeout, \
++ 						   0),			\
++ 	}
++ 
++ #define static_branch_deferred_inc(x)	static_branch_inc(&(x)->key)
++ 
++ #else	/* !CONFIG_JUMP_LABEL */
+++>>>>>>> ad282a8117d5 (locking/static_key: Add support for deferred static branches)
+  struct static_key_deferred {
+  	struct static_key  key;
+  };
+* Unmerged path include/linux/jump_label_ratelimit.h
+diff --git a/kernel/jump_label.c b/kernel/jump_label.c
+index e8955d130135..14ec77393cd4 100644
+--- a/kernel/jump_label.c
++++ b/kernel/jump_label.c
+@@ -250,12 +250,13 @@ static void __static_key_slow_dec(struct static_key *key,
+ 	cpus_read_unlock();
+ }
+ 
+-static void jump_label_update_timeout(struct work_struct *work)
++void jump_label_update_timeout(struct work_struct *work)
+ {
+ 	struct static_key_deferred *key =
+ 		container_of(work, struct static_key_deferred, work.work);
+ 	__static_key_slow_dec(&key->key, 0, NULL);
+ }
++EXPORT_SYMBOL_GPL(jump_label_update_timeout);
+ 
+ void static_key_slow_dec(struct static_key *key)
+ {
+@@ -270,19 +271,21 @@ void static_key_slow_dec_cpuslocked(struct static_key *key)
+ 	__static_key_slow_dec_cpuslocked(key, 0, NULL);
+ }
+ 
+-void static_key_slow_dec_deferred(struct static_key_deferred *key)
++void __static_key_slow_dec_deferred(struct static_key *key,
++				    struct delayed_work *work,
++				    unsigned long timeout)
+ {
+ 	STATIC_KEY_CHECK_USE(key);
+-	__static_key_slow_dec(&key->key, key->timeout, &key->work);
++	__static_key_slow_dec(key, timeout, work);
+ }
+-EXPORT_SYMBOL_GPL(static_key_slow_dec_deferred);
++EXPORT_SYMBOL_GPL(__static_key_slow_dec_deferred);
+ 
+-void static_key_deferred_flush(struct static_key_deferred *key)
++void __static_key_deferred_flush(void *key, struct delayed_work *work)
+ {
+ 	STATIC_KEY_CHECK_USE(key);
+-	flush_delayed_work(&key->work);
++	flush_delayed_work(work);
+ }
+-EXPORT_SYMBOL_GPL(static_key_deferred_flush);
++EXPORT_SYMBOL_GPL(__static_key_deferred_flush);
+ 
+ void jump_label_rate_limit(struct static_key_deferred *key,
+ 		unsigned long rl)
