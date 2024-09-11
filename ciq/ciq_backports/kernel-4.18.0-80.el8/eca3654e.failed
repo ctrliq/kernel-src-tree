@@ -1,0 +1,229 @@
+vfs: enable remap callers that can handle short operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit eca3654e3cc7d93e9734d0fa96cfb15c7f356244
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/eca3654e.failed
+
+Plumb in a remap flag that enables the filesystem remap handler to
+shorten remapping requests for callers that can handle it.  Now
+copy_file_range can report partial success (in case we run up against
+alignment problems, resource limits, etc.).
+
+We also enable CAN_SHORTEN for fideduperange to maintain existing
+userspace-visible behavior where xfs/btrfs shorten the dedupe range to
+avoid stale post-eof data exposure.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit eca3654e3cc7d93e9734d0fa96cfb15c7f356244)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/vfs.txt
+#	fs/read_write.c
+#	include/linux/fs.h
+diff --cc Documentation/filesystems/vfs.txt
+index be4090e00997,5f71a252e2e0..000000000000
+--- a/Documentation/filesystems/vfs.txt
++++ b/Documentation/filesystems/vfs.txt
+@@@ -958,11 -961,18 +958,26 @@@ otherwise noted
+  
+    copy_file_range: called by the copy_file_range(2) system call.
+  
+++<<<<<<< HEAD
+ +  clone_file_range: called by the ioctl(2) system call for FICLONERANGE and
+ +	FICLONE commands.
+ +
+ +  dedupe_file_range: called by the ioctl(2) system call for FIDEDUPERANGE
+ +	command.
+++=======
++   remap_file_range: called by the ioctl(2) system call for FICLONERANGE and
++ 	FICLONE and FIDEDUPERANGE commands to remap file ranges.  An
++ 	implementation should remap len bytes at pos_in of the source file into
++ 	the dest file at pos_out.  Implementations must handle callers passing
++ 	in len == 0; this means "remap to the end of the source file".  The
++ 	return value should the number of bytes remapped, or the usual
++ 	negative error code if errors occurred before any bytes were remapped.
++ 	The remap_flags parameter accepts REMAP_FILE_* flags.  If
++ 	REMAP_FILE_DEDUP is set then the implementation must only remap if the
++ 	requested file ranges have identical contents.  If REMAP_CAN_SHORTEN is
++ 	set, the caller is ok with the implementation shortening the request
++ 	length to satisfy alignment or EOF requirements (or any other reason).
+++>>>>>>> eca3654e3cc7 (vfs: enable remap callers that can handle short operations)
+  
+    fadvise: possibly called by the fadvise64() system call.
+  
+diff --cc fs/read_write.c
+index 734c5661fb69,c0bcc1a20650..000000000000
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@@ -1588,11 -1588,15 +1588,23 @@@ ssize_t vfs_copy_file_range(struct fil
+  	 * Try cloning first, this is supported by more file systems, and
+  	 * more efficient if both clone and copy are supported (e.g. NFS).
+  	 */
+++<<<<<<< HEAD
+ +	if (file_in->f_op->clone_file_range) {
+ +		ret = file_in->f_op->clone_file_range(file_in, pos_in,
+ +				file_out, pos_out, len);
+ +		if (ret == 0) {
+ +			ret = len;
+++=======
++ 	if (file_in->f_op->remap_file_range) {
++ 		loff_t cloned;
++ 
++ 		cloned = file_in->f_op->remap_file_range(file_in, pos_in,
++ 				file_out, pos_out,
++ 				min_t(loff_t, MAX_RW_COUNT, len),
++ 				REMAP_FILE_CAN_SHORTEN);
++ 		if (cloned > 0) {
++ 			ret = cloned;
+++>>>>>>> eca3654e3cc7 (vfs: enable remap callers that can handle short operations)
+  			goto done;
+  		}
+  	}
+@@@ -1721,20 -1728,28 +1735,35 @@@ static int remap_verify_area(struct fil
+  static int generic_remap_check_len(struct inode *inode_in,
+  				   struct inode *inode_out,
+  				   loff_t pos_out,
+ -				   loff_t *len,
+ -				   unsigned int remap_flags)
+ +				   u64 *len,
+ +				   bool is_dedupe)
+  {
+  	u64 blkmask = i_blocksize(inode_in) - 1;
++ 	loff_t new_len = *len;
+  
+  	if ((*len & blkmask) == 0)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (is_dedupe)
+ +		*len &= ~blkmask;
+ +	else if (pos_out + *len < i_size_read(inode_out))
+ +		return -EINVAL;
+++=======
++ 	if ((remap_flags & REMAP_FILE_DEDUP) ||
++ 	    pos_out + *len < i_size_read(inode_out))
++ 		new_len &= ~blkmask;
+++>>>>>>> eca3654e3cc7 (vfs: enable remap callers that can handle short operations)
+  
+- 	return 0;
++ 	if (new_len == *len)
++ 		return 0;
++ 
++ 	if (remap_flags & REMAP_FILE_CAN_SHORTEN) {
++ 		*len = new_len;
++ 		return 0;
++ 	}
++ 
++ 	return (remap_flags & REMAP_FILE_DEDUP) ? -EBADE : -EINVAL;
+  }
+  
+  /*
+@@@ -1980,10 -2019,14 +2009,17 @@@ out_error
+  }
+  EXPORT_SYMBOL(vfs_dedupe_file_range_compare);
+  
+ -loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
+ -				 struct file *dst_file, loff_t dst_pos,
+ -				 loff_t len, unsigned int remap_flags)
+ +int vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
+ +			      struct file *dst_file, loff_t dst_pos, u64 len)
+  {
+++<<<<<<< HEAD
+ +	s64 ret;
+++=======
++ 	loff_t ret;
++ 
++ 	WARN_ON_ONCE(remap_flags & ~(REMAP_FILE_DEDUP |
++ 				     REMAP_FILE_CAN_SHORTEN));
+++>>>>>>> eca3654e3cc7 (vfs: enable remap callers that can handle short operations)
+  
+  	ret = mnt_want_write_file(dst_file);
+  	if (ret)
+@@@ -2083,7 -2126,8 +2119,12 @@@ int vfs_dedupe_file_range(struct file *
+  		}
+  
+  		deduped = vfs_dedupe_file_range_one(file, off, dst_file,
+++<<<<<<< HEAD
+ +						    info->dest_offset, len);
+++=======
++ 						    info->dest_offset, len,
++ 						    REMAP_FILE_CAN_SHORTEN);
+++>>>>>>> eca3654e3cc7 (vfs: enable remap callers that can handle short operations)
+  		if (deduped == -EBADE)
+  			info->status = FILE_DEDUPE_RANGE_DIFFERS;
+  		else if (deduped < 0)
+diff --cc include/linux/fs.h
+index 6f009fb80ab1,34c22d695011..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1703,6 -1721,25 +1703,28 @@@ struct block_device_operations
+  #define NOMMU_VMFLAGS \
+  	(NOMMU_MAP_READ | NOMMU_MAP_WRITE | NOMMU_MAP_EXEC)
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * These flags control the behavior of the remap_file_range function pointer.
++  * If it is called with len == 0 that means "remap to end of source file".
++  * See Documentation/filesystems/vfs.txt for more details about this call.
++  *
++  * REMAP_FILE_DEDUP: only remap if contents identical (i.e. deduplicate)
++  * REMAP_FILE_CAN_SHORTEN: caller can handle a shortened request
++  */
++ #define REMAP_FILE_DEDUP		(1 << 0)
++ #define REMAP_FILE_CAN_SHORTEN		(1 << 1)
++ 
++ /*
++  * These flags signal that the caller is ok with altering various aspects of
++  * the behavior of the remap operation.  The changes must be made by the
++  * implementation; the vfs remap helper functions can take advantage of them.
++  * Flags in this category exist to preserve the quirky behavior of the hoisted
++  * btrfs clone/dedupe ioctls.
++  */
++ #define REMAP_FILE_ADVISORY		(REMAP_FILE_CAN_SHORTEN)
+++>>>>>>> eca3654e3cc7 (vfs: enable remap callers that can handle short operations)
+  
+  struct iov_iter;
+  
+* Unmerged path Documentation/filesystems/vfs.txt
+* Unmerged path fs/read_write.c
+* Unmerged path include/linux/fs.h
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 84b7301e41a0..7c4a68d00f0e 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3045,8 +3045,7 @@ int generic_remap_checks(struct file *file_in, loff_t pos_in,
+ 		bcount = ALIGN(size_in, bs) - pos_in;
+ 	} else {
+ 		if (!IS_ALIGNED(count, bs))
+-			return -EINVAL;
+-
++			count = ALIGN_DOWN(count, bs);
+ 		bcount = count;
+ 	}
+ 
+@@ -3056,10 +3055,14 @@ int generic_remap_checks(struct file *file_in, loff_t pos_in,
+ 	    pos_out < pos_in + bcount)
+ 		return -EINVAL;
+ 
+-	/* For now we don't support changing the length. */
+-	if (*req_count != count)
++	/*
++	 * We shortened the request but the caller can't deal with that, so
++	 * bounce the request back to userspace.
++	 */
++	if (*req_count != count && !(remap_flags & REMAP_FILE_CAN_SHORTEN))
+ 		return -EINVAL;
+ 
++	*req_count = count;
+ 	return 0;
+ }
+ 
