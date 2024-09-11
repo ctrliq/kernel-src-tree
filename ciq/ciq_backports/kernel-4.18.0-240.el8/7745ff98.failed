@@ -1,0 +1,333 @@
+libbpf: Fix another __u64 printf warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 7745ff9842617323adbe24e71c495d5ebd9aa352
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7745ff98.failed
+
+Fix yet another printf warning for %llu specifier on ppc64le. This time size_t
+casting won't work, so cast to verbose `unsigned long long`.
+
+Fixes: 166750bc1dd2 ("libbpf: Support libbpf-provided extern variables")
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20191219052103.3515-1-andriin@fb.com
+(cherry picked from commit 7745ff9842617323adbe24e71c495d5ebd9aa352)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 365ad04b00a7,9576a90c5a1c..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -960,6 -1002,302 +960,305 @@@ static int bpf_object__init_global_data
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static struct extern_desc *find_extern_by_name(const struct bpf_object *obj,
++ 					       const void *name)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < obj->nr_extern; i++) {
++ 		if (strcmp(obj->externs[i].name, name) == 0)
++ 			return &obj->externs[i];
++ 	}
++ 	return NULL;
++ }
++ 
++ static int set_ext_value_tri(struct extern_desc *ext, void *ext_val,
++ 			     char value)
++ {
++ 	switch (ext->type) {
++ 	case EXT_BOOL:
++ 		if (value == 'm') {
++ 			pr_warn("extern %s=%c should be tristate or char\n",
++ 				ext->name, value);
++ 			return -EINVAL;
++ 		}
++ 		*(bool *)ext_val = value == 'y' ? true : false;
++ 		break;
++ 	case EXT_TRISTATE:
++ 		if (value == 'y')
++ 			*(enum libbpf_tristate *)ext_val = TRI_YES;
++ 		else if (value == 'm')
++ 			*(enum libbpf_tristate *)ext_val = TRI_MODULE;
++ 		else /* value == 'n' */
++ 			*(enum libbpf_tristate *)ext_val = TRI_NO;
++ 		break;
++ 	case EXT_CHAR:
++ 		*(char *)ext_val = value;
++ 		break;
++ 	case EXT_UNKNOWN:
++ 	case EXT_INT:
++ 	case EXT_CHAR_ARR:
++ 	default:
++ 		pr_warn("extern %s=%c should be bool, tristate, or char\n",
++ 			ext->name, value);
++ 		return -EINVAL;
++ 	}
++ 	ext->is_set = true;
++ 	return 0;
++ }
++ 
++ static int set_ext_value_str(struct extern_desc *ext, char *ext_val,
++ 			     const char *value)
++ {
++ 	size_t len;
++ 
++ 	if (ext->type != EXT_CHAR_ARR) {
++ 		pr_warn("extern %s=%s should char array\n", ext->name, value);
++ 		return -EINVAL;
++ 	}
++ 
++ 	len = strlen(value);
++ 	if (value[len - 1] != '"') {
++ 		pr_warn("extern '%s': invalid string config '%s'\n",
++ 			ext->name, value);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* strip quotes */
++ 	len -= 2;
++ 	if (len >= ext->sz) {
++ 		pr_warn("extern '%s': long string config %s of (%zu bytes) truncated to %d bytes\n",
++ 			ext->name, value, len, ext->sz - 1);
++ 		len = ext->sz - 1;
++ 	}
++ 	memcpy(ext_val, value + 1, len);
++ 	ext_val[len] = '\0';
++ 	ext->is_set = true;
++ 	return 0;
++ }
++ 
++ static int parse_u64(const char *value, __u64 *res)
++ {
++ 	char *value_end;
++ 	int err;
++ 
++ 	errno = 0;
++ 	*res = strtoull(value, &value_end, 0);
++ 	if (errno) {
++ 		err = -errno;
++ 		pr_warn("failed to parse '%s' as integer: %d\n", value, err);
++ 		return err;
++ 	}
++ 	if (*value_end) {
++ 		pr_warn("failed to parse '%s' as integer completely\n", value);
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
++ static bool is_ext_value_in_range(const struct extern_desc *ext, __u64 v)
++ {
++ 	int bit_sz = ext->sz * 8;
++ 
++ 	if (ext->sz == 8)
++ 		return true;
++ 
++ 	/* Validate that value stored in u64 fits in integer of `ext->sz`
++ 	 * bytes size without any loss of information. If the target integer
++ 	 * is signed, we rely on the following limits of integer type of
++ 	 * Y bits and subsequent transformation:
++ 	 *
++ 	 *     -2^(Y-1) <= X           <= 2^(Y-1) - 1
++ 	 *            0 <= X + 2^(Y-1) <= 2^Y - 1
++ 	 *            0 <= X + 2^(Y-1) <  2^Y
++ 	 *
++ 	 *  For unsigned target integer, check that all the (64 - Y) bits are
++ 	 *  zero.
++ 	 */
++ 	if (ext->is_signed)
++ 		return v + (1ULL << (bit_sz - 1)) < (1ULL << bit_sz);
++ 	else
++ 		return (v >> bit_sz) == 0;
++ }
++ 
++ static int set_ext_value_num(struct extern_desc *ext, void *ext_val,
++ 			     __u64 value)
++ {
++ 	if (ext->type != EXT_INT && ext->type != EXT_CHAR) {
++ 		pr_warn("extern %s=%llu should be integer\n",
++ 			ext->name, (unsigned long long)value);
++ 		return -EINVAL;
++ 	}
++ 	if (!is_ext_value_in_range(ext, value)) {
++ 		pr_warn("extern %s=%llu value doesn't fit in %d bytes\n",
++ 			ext->name, (unsigned long long)value, ext->sz);
++ 		return -ERANGE;
++ 	}
++ 	switch (ext->sz) {
++ 		case 1: *(__u8 *)ext_val = value; break;
++ 		case 2: *(__u16 *)ext_val = value; break;
++ 		case 4: *(__u32 *)ext_val = value; break;
++ 		case 8: *(__u64 *)ext_val = value; break;
++ 		default:
++ 			return -EINVAL;
++ 	}
++ 	ext->is_set = true;
++ 	return 0;
++ }
++ 
++ static int bpf_object__process_kconfig_line(struct bpf_object *obj,
++ 					    char *buf, void *data)
++ {
++ 	struct extern_desc *ext;
++ 	char *sep, *value;
++ 	int len, err = 0;
++ 	void *ext_val;
++ 	__u64 num;
++ 
++ 	if (strncmp(buf, "CONFIG_", 7))
++ 		return 0;
++ 
++ 	sep = strchr(buf, '=');
++ 	if (!sep) {
++ 		pr_warn("failed to parse '%s': no separator\n", buf);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Trim ending '\n' */
++ 	len = strlen(buf);
++ 	if (buf[len - 1] == '\n')
++ 		buf[len - 1] = '\0';
++ 	/* Split on '=' and ensure that a value is present. */
++ 	*sep = '\0';
++ 	if (!sep[1]) {
++ 		*sep = '=';
++ 		pr_warn("failed to parse '%s': no value\n", buf);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ext = find_extern_by_name(obj, buf);
++ 	if (!ext || ext->is_set)
++ 		return 0;
++ 
++ 	ext_val = data + ext->data_off;
++ 	value = sep + 1;
++ 
++ 	switch (*value) {
++ 	case 'y': case 'n': case 'm':
++ 		err = set_ext_value_tri(ext, ext_val, *value);
++ 		break;
++ 	case '"':
++ 		err = set_ext_value_str(ext, ext_val, value);
++ 		break;
++ 	default:
++ 		/* assume integer */
++ 		err = parse_u64(value, &num);
++ 		if (err) {
++ 			pr_warn("extern %s=%s should be integer\n",
++ 				ext->name, value);
++ 			return err;
++ 		}
++ 		err = set_ext_value_num(ext, ext_val, num);
++ 		break;
++ 	}
++ 	if (err)
++ 		return err;
++ 	pr_debug("extern %s=%s\n", ext->name, value);
++ 	return 0;
++ }
++ 
++ static int bpf_object__read_kconfig_file(struct bpf_object *obj, void *data)
++ {
++ 	char buf[PATH_MAX];
++ 	struct utsname uts;
++ 	int len, err = 0;
++ 	gzFile file;
++ 
++ 	uname(&uts);
++ 	len = snprintf(buf, PATH_MAX, "/boot/config-%s", uts.release);
++ 	if (len < 0)
++ 		return -EINVAL;
++ 	else if (len >= PATH_MAX)
++ 		return -ENAMETOOLONG;
++ 
++ 	/* gzopen also accepts uncompressed files. */
++ 	file = gzopen(buf, "r");
++ 	if (!file)
++ 		file = gzopen("/proc/config.gz", "r");
++ 
++ 	if (!file) {
++ 		pr_warn("failed to open system Kconfig\n");
++ 		return -ENOENT;
++ 	}
++ 
++ 	while (gzgets(file, buf, sizeof(buf))) {
++ 		err = bpf_object__process_kconfig_line(obj, buf, data);
++ 		if (err) {
++ 			pr_warn("error parsing system Kconfig line '%s': %d\n",
++ 				buf, err);
++ 			goto out;
++ 		}
++ 	}
++ 
++ out:
++ 	gzclose(file);
++ 	return err;
++ }
++ 
++ static int bpf_object__read_kconfig_mem(struct bpf_object *obj,
++ 					const char *config, void *data)
++ {
++ 	char buf[PATH_MAX];
++ 	int err = 0;
++ 	FILE *file;
++ 
++ 	file = fmemopen((void *)config, strlen(config), "r");
++ 	if (!file) {
++ 		err = -errno;
++ 		pr_warn("failed to open in-memory Kconfig: %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	while (fgets(buf, sizeof(buf), file)) {
++ 		err = bpf_object__process_kconfig_line(obj, buf, data);
++ 		if (err) {
++ 			pr_warn("error parsing in-memory Kconfig line '%s': %d\n",
++ 				buf, err);
++ 			break;
++ 		}
++ 	}
++ 
++ 	fclose(file);
++ 	return err;
++ }
++ 
++ static int bpf_object__init_kconfig_map(struct bpf_object *obj)
++ {
++ 	struct extern_desc *last_ext;
++ 	size_t map_sz;
++ 	int err;
++ 
++ 	if (obj->nr_extern == 0)
++ 		return 0;
++ 
++ 	last_ext = &obj->externs[obj->nr_extern - 1];
++ 	map_sz = last_ext->data_off + last_ext->sz;
++ 
++ 	err = bpf_object__init_internal_map(obj, LIBBPF_MAP_KCONFIG,
++ 					    obj->efile.symbols_shndx,
++ 					    NULL, map_sz);
++ 	if (err)
++ 		return err;
++ 
++ 	obj->kconfig_map_idx = obj->nr_maps - 1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 7745ff984261 (libbpf: Fix another __u64 printf warning)
+  static int bpf_object__init_user_maps(struct bpf_object *obj, bool strict)
+  {
+  	Elf_Data *symbols = obj->efile.symbols;
+* Unmerged path tools/lib/bpf/libbpf.c
