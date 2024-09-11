@@ -1,0 +1,175 @@
+block: add BIO_NO_PAGE_REF flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 399254aaf4892113c806816f7e64cf40c804d46d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/399254aa.failed
+
+If bio_iov_iter_get_pages() is called on an iov_iter that is flagged
+with NO_REF, then we don't need to add a page reference for the pages
+that we add.
+
+Add BIO_NO_PAGE_REF to track this in the bio, so IO completion knows
+not to drop a reference to these pages.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 399254aaf4892113c806816f7e64cf40c804d46d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+#	fs/iomap.c
+diff --cc fs/block_dev.c
+index 1fdba81f1ba5,78d3257435c0..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -335,11 -336,14 +335,22 @@@ static void blkdev_bio_end_io(struct bi
+  	if (should_dirty) {
+  		bio_check_pages_dirty(bio);
+  	} else {
+++<<<<<<< HEAD
+ +		struct bio_vec *bvec;
+ +		int i;
+ +
+ +		bio_for_each_segment_all(bvec, bio, i)
+ +			put_page(bvec->bv_page);
+++=======
++ 		if (!bio_flagged(bio, BIO_NO_PAGE_REF)) {
++ 			struct bvec_iter_all iter_all;
++ 			struct bio_vec *bvec;
++ 			int i;
++ 
++ 			bio_for_each_segment_all(bvec, bio, i, iter_all)
++ 				put_page(bvec->bv_page);
++ 		}
+++>>>>>>> 399254aaf489 (block: add BIO_NO_PAGE_REF flag)
+  		bio_put(bio);
+  	}
+  }
+diff --cc fs/iomap.c
+index cb0b2eea8b70,abdd18e404f8..000000000000
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@@ -1617,11 -1589,14 +1617,22 @@@ static void iomap_dio_bio_end_io(struc
+  	if (should_dirty) {
+  		bio_check_pages_dirty(bio);
+  	} else {
+++<<<<<<< HEAD
+ +		struct bio_vec *bvec;
+ +		int i;
+ +
+ +		bio_for_each_segment_all(bvec, bio, i)
+ +			put_page(bvec->bv_page);
+++=======
++ 		if (!bio_flagged(bio, BIO_NO_PAGE_REF)) {
++ 			struct bvec_iter_all iter_all;
++ 			struct bio_vec *bvec;
++ 			int i;
++ 
++ 			bio_for_each_segment_all(bvec, bio, i, iter_all)
++ 				put_page(bvec->bv_page);
++ 		}
+++>>>>>>> 399254aaf489 (block: add BIO_NO_PAGE_REF flag)
+  		bio_put(bio);
+  	}
+  }
+diff --git a/block/bio.c b/block/bio.c
+index ad86e2528de5..92fef0f04432 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -842,20 +842,14 @@ static int __bio_iov_bvec_add_pages(struct bio *bio, struct iov_iter *iter)
+ 	size = bio_add_page(bio, bv->bv_page, len,
+ 				bv->bv_offset + iter->iov_offset);
+ 	if (size == len) {
+-		struct page *page;
+-		int i;
++		if (!bio_flagged(bio, BIO_NO_PAGE_REF)) {
++			struct page *page;
++			int i;
++
++			mp_bvec_for_each_page(page, bv, i)
++				get_page(page);
++		}
+ 
+-		/*
+-		 * For the normal O_DIRECT case, we could skip grabbing this
+-		 * reference and then not have to put them again when IO
+-		 * completes. But this breaks some in-kernel users, like
+-		 * splicing to/from a loop device, where we release the pipe
+-		 * pages unconditionally. If we can fix that case, we can
+-		 * get rid of the get here and the need to call
+-		 * bio_release_pages() at IO completion time.
+-		 */
+-		mp_bvec_for_each_page(page, bv, i)
+-			get_page(page);
+ 		iov_iter_advance(iter, size);
+ 		return 0;
+ 	}
+@@ -924,10 +918,12 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
+  * This takes either an iterator pointing to user memory, or one pointing to
+  * kernel pages (BVEC iterator). If we're adding user pages, we pin them and
+  * map them into the kernel. On IO completion, the caller should put those
+- * pages. For now, when adding kernel pages, we still grab a reference to the
+- * page. This isn't strictly needed for the common case, but some call paths
+- * end up releasing pages from eg a pipe and we can't easily control these.
+- * See comment in __bio_iov_bvec_add_pages().
++ * pages. If we're adding kernel pages, and the caller told us it's safe to
++ * do so, we just have to add the pages to the bio directly. We don't grab an
++ * extra reference to those pages (the user should already have that), and we
++ * don't put the page on IO completion. The caller needs to check if the bio is
++ * flagged BIO_NO_PAGE_REF on IO completion. If it isn't, then pages should be
++ * released.
+  *
+  * The function tries, but does not guarantee, to pin as many pages as
+  * fit into the bio, or are requested in *iter, whatever is smaller. If
+@@ -939,6 +935,13 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
+ 	const bool is_bvec = iov_iter_is_bvec(iter);
+ 	unsigned short orig_vcnt = bio->bi_vcnt;
+ 
++	/*
++	 * If this is a BVEC iter, then the pages are kernel pages. Don't
++	 * release them on IO completion, if the caller asked us to.
++	 */
++	if (is_bvec && iov_iter_bvec_no_ref(iter))
++		bio_set_flag(bio, BIO_NO_PAGE_REF);
++
+ 	do {
+ 		int ret;
+ 
+@@ -1692,7 +1695,8 @@ static void bio_dirty_fn(struct work_struct *work)
+ 		next = bio->bi_private;
+ 
+ 		bio_set_pages_dirty(bio);
+-		bio_release_pages(bio);
++		if (!bio_flagged(bio, BIO_NO_PAGE_REF))
++			bio_release_pages(bio);
+ 		bio_put(bio);
+ 	}
+ }
+@@ -1708,7 +1712,8 @@ void bio_check_pages_dirty(struct bio *bio)
+ 			goto defer;
+ 	}
+ 
+-	bio_release_pages(bio);
++	if (!bio_flagged(bio, BIO_NO_PAGE_REF))
++		bio_release_pages(bio);
+ 	bio_put(bio);
+ 	return;
+ defer:
+* Unmerged path fs/block_dev.c
+* Unmerged path fs/iomap.c
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 7d5563ece44f..4f764b7ba794 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -220,6 +220,7 @@ struct bio {
+ /*
+  * bio flags
+  */
++#define BIO_NO_PAGE_REF	0	/* don't put release vec pages */
+ #define BIO_SEG_VALID	1	/* bi_phys_segments valid */
+ #define BIO_CLONED	2	/* doesn't own data */
+ #define BIO_BOUNCED	3	/* bio is a bounce bio */
