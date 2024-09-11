@@ -1,0 +1,454 @@
+iommu/arm-smmu: Add context init implementation hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit ba7e4a08bbf7441664b3d140671db8d08ea15f22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ba7e4a08.failed
+
+Allocating and initialising a context for a domain is another point
+where certain implementations are known to want special behaviour.
+Currently the other half of the Cavium workaround comes into play here,
+so let's finish the job to get the whole thing right out of the way.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit ba7e4a08bbf7441664b3d140671db8d08ea15f22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu-impl.c
+#	drivers/iommu/arm-smmu.c
+#	drivers/iommu/arm-smmu.h
+diff --cc drivers/iommu/arm-smmu.c
+index c913cdd695bd,b8628e2ab579..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -39,8 -27,6 +39,11 @@@
+  #include <linux/interrupt.h>
+  #include <linux/io.h>
+  #include <linux/io-64-nonatomic-hi-lo.h>
+++<<<<<<< HEAD
+ +#include <linux/io-pgtable.h>
+ +#include <linux/iommu.h>
+++=======
+++>>>>>>> ba7e4a08bbf7 (iommu/arm-smmu: Add context init implementation hook)
+  #include <linux/iopoll.h>
+  #include <linux/init.h>
+  #include <linux/moduleparam.h>
+@@@ -165,152 -103,15 +168,155 @@@ struct arm_smmu_master_cfg 
+  	s16				smendx[];
+  };
+  #define INVALID_SMENDX			-1
+ -#define __fwspec_cfg(fw) ((struct arm_smmu_master_cfg *)fw->iommu_priv)
+ -#define fwspec_smmu(fw)  (__fwspec_cfg(fw)->smmu)
+ -#define fwspec_smendx(fw, i) \
+ -	(i >= fw->num_ids ? INVALID_SMENDX : __fwspec_cfg(fw)->smendx[i])
+ -#define for_each_cfg_sme(fw, i, idx) \
+ -	for (i = 0; idx = fwspec_smendx(fw, i), i < fw->num_ids; ++i)
+ +#define cfg_smendx(cfg, fw, i) \
+ +	(i >= fw->num_ids ? INVALID_SMENDX : cfg->smendx[i])
+ +#define for_each_cfg_sme(cfg, fw, i, idx) \
+ +	for (i = 0; idx = cfg_smendx(cfg, fw, i), i < fw->num_ids; ++i)
+ +
+ +struct arm_smmu_device {
+ +	struct device			*dev;
+ +
+ +	void __iomem			*base;
+ +	void __iomem			*cb_base;
+ +	unsigned long			pgshift;
+ +
+ +#define ARM_SMMU_FEAT_COHERENT_WALK	(1 << 0)
+ +#define ARM_SMMU_FEAT_STREAM_MATCH	(1 << 1)
+ +#define ARM_SMMU_FEAT_TRANS_S1		(1 << 2)
+ +#define ARM_SMMU_FEAT_TRANS_S2		(1 << 3)
+ +#define ARM_SMMU_FEAT_TRANS_NESTED	(1 << 4)
+ +#define ARM_SMMU_FEAT_TRANS_OPS		(1 << 5)
+ +#define ARM_SMMU_FEAT_VMID16		(1 << 6)
+ +#define ARM_SMMU_FEAT_FMT_AARCH64_4K	(1 << 7)
+ +#define ARM_SMMU_FEAT_FMT_AARCH64_16K	(1 << 8)
+ +#define ARM_SMMU_FEAT_FMT_AARCH64_64K	(1 << 9)
+ +#define ARM_SMMU_FEAT_FMT_AARCH32_L	(1 << 10)
+ +#define ARM_SMMU_FEAT_FMT_AARCH32_S	(1 << 11)
+ +#define ARM_SMMU_FEAT_EXIDS		(1 << 12)
+ +	u32				features;
+ +
+ +#define ARM_SMMU_OPT_SECURE_CFG_ACCESS (1 << 0)
+ +	u32				options;
+ +	enum arm_smmu_arch_version	version;
+ +	enum arm_smmu_implementation	model;
+ +
+ +	u32				num_context_banks;
+ +	u32				num_s2_context_banks;
+ +	DECLARE_BITMAP(context_map, ARM_SMMU_MAX_CBS);
+ +	struct arm_smmu_cb		*cbs;
+ +	atomic_t			irptndx;
+ +
+ +	u32				num_mapping_groups;
+ +	u16				streamid_mask;
+ +	u16				smr_mask_mask;
+ +	struct arm_smmu_smr		*smrs;
+ +	struct arm_smmu_s2cr		*s2crs;
+ +	struct mutex			stream_map_mutex;
+ +
+ +	unsigned long			va_size;
+ +	unsigned long			ipa_size;
+ +	unsigned long			pa_size;
+ +	unsigned long			pgsize_bitmap;
+ +
+ +	u32				num_global_irqs;
+ +	u32				num_context_irqs;
+ +	unsigned int			*irqs;
+ +	struct clk_bulk_data		*clks;
+ +	int				num_clks;
+ +
+ +	u32				cavium_id_base; /* Specific to Cavium */
+ +
+ +	spinlock_t			global_sync_lock;
+ +
+ +	/* IOMMU core code handle */
+ +	struct iommu_device		iommu;
+ +};
+ +
+++<<<<<<< HEAD
+ +enum arm_smmu_context_fmt {
+ +	ARM_SMMU_CTX_FMT_NONE,
+ +	ARM_SMMU_CTX_FMT_AARCH64,
+ +	ARM_SMMU_CTX_FMT_AARCH32_L,
+ +	ARM_SMMU_CTX_FMT_AARCH32_S,
+ +};
+ +
+ +struct arm_smmu_cfg {
+ +	u8				cbndx;
+ +	u8				irptndx;
+ +	union {
+ +		u16			asid;
+ +		u16			vmid;
+ +	};
+ +	enum arm_smmu_cbar_type		cbar;
+ +	enum arm_smmu_context_fmt	fmt;
+ +};
+ +#define INVALID_IRPTNDX			0xff
+ +
+ +enum arm_smmu_domain_stage {
+ +	ARM_SMMU_DOMAIN_S1 = 0,
+ +	ARM_SMMU_DOMAIN_S2,
+ +	ARM_SMMU_DOMAIN_NESTED,
+ +	ARM_SMMU_DOMAIN_BYPASS,
+ +};
+ +
+ +struct arm_smmu_flush_ops {
+ +	struct iommu_flush_ops		tlb;
+ +	void (*tlb_inv_range)(unsigned long iova, size_t size, size_t granule,
+ +			      bool leaf, void *cookie);
+ +	void (*tlb_sync)(void *cookie);
+ +};
+ +
+ +struct arm_smmu_domain {
+ +	struct arm_smmu_device		*smmu;
+ +	struct io_pgtable_ops		*pgtbl_ops;
+ +	const struct arm_smmu_flush_ops	*flush_ops;
+ +	struct arm_smmu_cfg		cfg;
+ +	enum arm_smmu_domain_stage	stage;
+ +	bool				non_strict;
+ +	struct mutex			init_mutex; /* Protects smmu pointer */
+ +	spinlock_t			cb_lock; /* Serialises ATS1* ops and TLB syncs */
+ +	struct iommu_domain		domain;
+ +};
+ +
+ +static void __iomem *arm_smmu_page(struct arm_smmu_device *smmu, int n)
+ +{
+ +	return smmu->base + (n << smmu->pgshift);
+ +}
+ +
+ +static u32 arm_smmu_readl(struct arm_smmu_device *smmu, int page, int offset)
+ +{
+ +	return readl_relaxed(arm_smmu_page(smmu, page) + offset);
+ +}
+ +
+ +static void arm_smmu_writel(struct arm_smmu_device *smmu, int page, int offset,
+ +			    u32 val)
+ +{
+ +	writel_relaxed(val, arm_smmu_page(smmu, page) + offset);
+ +}
+ +
+ +#define ARM_SMMU_GR1		1
+  
+ +#define arm_smmu_gr1_read(s, o)		\
+ +	arm_smmu_readl((s), ARM_SMMU_GR1, (o))
+ +#define arm_smmu_gr1_write(s, o, v)	\
+ +	arm_smmu_writel((s), ARM_SMMU_GR1, (o), (v))
+ +
+ +struct arm_smmu_option_prop {
+ +	u32 opt;
+ +	const char *prop;
+ +};
+ +
+ +static atomic_t cavium_smmu_context_count = ATOMIC_INIT(0);
+ +
+++=======
+++>>>>>>> ba7e4a08bbf7 (iommu/arm-smmu: Add context init implementation hook)
+  static bool using_legacy_binding, using_generic_binding;
+  
+ +static struct arm_smmu_option_prop arm_smmu_options[] = {
+ +	{ ARM_SMMU_OPT_SECURE_CFG_ACCESS, "calxeda,smmu-secure-config-access" },
+ +	{ 0, NULL},
+ +};
+ +
+  static inline int arm_smmu_rpm_get(struct arm_smmu_device *smmu)
+  {
+  	if (pm_runtime_enabled(smmu->dev))
+diff --cc drivers/iommu/arm-smmu.h
+index 671b3a337fea,611ed742e56f..000000000000
+--- a/drivers/iommu/arm-smmu.h
++++ b/drivers/iommu/arm-smmu.h
+@@@ -22,21 -10,30 +22,34 @@@
+  #ifndef _ARM_SMMU_H
+  #define _ARM_SMMU_H
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/atomic.h>
++ #include <linux/bits.h>
++ #include <linux/clk.h>
++ #include <linux/device.h>
++ #include <linux/io-pgtable.h>
++ #include <linux/iommu.h>
++ #include <linux/mutex.h>
++ #include <linux/spinlock.h>
++ #include <linux/types.h>
++ 
+++>>>>>>> ba7e4a08bbf7 (iommu/arm-smmu: Add context init implementation hook)
+  /* Configuration registers */
+  #define ARM_SMMU_GR0_sCR0		0x0
+ -#define sCR0_VMID16EN			BIT(31)
+ -#define sCR0_BSU			GENMASK(15, 14)
+ -#define sCR0_FB				BIT(13)
+ -#define sCR0_PTM			BIT(12)
+ -#define sCR0_VMIDPNE			BIT(11)
+ -#define sCR0_USFCFG			BIT(10)
+ -#define sCR0_GCFGFIE			BIT(5)
+ -#define sCR0_GCFGFRE			BIT(4)
+ -#define sCR0_EXIDENABLE			BIT(3)
+ -#define sCR0_GFIE			BIT(2)
+ -#define sCR0_GFRE			BIT(1)
+ -#define sCR0_CLIENTPD			BIT(0)
+ +#define sCR0_CLIENTPD			(1 << 0)
+ +#define sCR0_GFRE			(1 << 1)
+ +#define sCR0_GFIE			(1 << 2)
+ +#define sCR0_EXIDENABLE			(1 << 3)
+ +#define sCR0_GCFGFRE			(1 << 4)
+ +#define sCR0_GCFGFIE			(1 << 5)
+ +#define sCR0_USFCFG			(1 << 10)
+ +#define sCR0_VMIDPNE			(1 << 11)
+ +#define sCR0_PTM			(1 << 12)
+ +#define sCR0_FB				(1 << 13)
+ +#define sCR0_VMID16EN			(1 << 31)
+ +#define sCR0_BSU_SHIFT			14
+ +#define sCR0_BSU_MASK			0x3
+  
+  /* Auxiliary Configuration register */
+  #define ARM_SMMU_GR0_sACR		0x10
+@@@ -216,4 -202,193 +229,196 @@@ enum arm_smmu_cbar_type 
+  #define ARM_SMMU_CB_ATSR		0x8f0
+  #define ATSR_ACTIVE			BIT(0)
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /* Maximum number of context banks per SMMU */
++ #define ARM_SMMU_MAX_CBS		128
++ 
++ 
++ /* Shared driver definitions */
++ enum arm_smmu_arch_version {
++ 	ARM_SMMU_V1,
++ 	ARM_SMMU_V1_64K,
++ 	ARM_SMMU_V2,
++ };
++ 
++ enum arm_smmu_implementation {
++ 	GENERIC_SMMU,
++ 	ARM_MMU500,
++ 	CAVIUM_SMMUV2,
++ 	QCOM_SMMUV2,
++ };
++ 
++ struct arm_smmu_device {
++ 	struct device			*dev;
++ 
++ 	void __iomem			*base;
++ 	unsigned int			numpage;
++ 	unsigned int			pgshift;
++ 
++ #define ARM_SMMU_FEAT_COHERENT_WALK	(1 << 0)
++ #define ARM_SMMU_FEAT_STREAM_MATCH	(1 << 1)
++ #define ARM_SMMU_FEAT_TRANS_S1		(1 << 2)
++ #define ARM_SMMU_FEAT_TRANS_S2		(1 << 3)
++ #define ARM_SMMU_FEAT_TRANS_NESTED	(1 << 4)
++ #define ARM_SMMU_FEAT_TRANS_OPS		(1 << 5)
++ #define ARM_SMMU_FEAT_VMID16		(1 << 6)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_4K	(1 << 7)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_16K	(1 << 8)
++ #define ARM_SMMU_FEAT_FMT_AARCH64_64K	(1 << 9)
++ #define ARM_SMMU_FEAT_FMT_AARCH32_L	(1 << 10)
++ #define ARM_SMMU_FEAT_FMT_AARCH32_S	(1 << 11)
++ #define ARM_SMMU_FEAT_EXIDS		(1 << 12)
++ 	u32				features;
++ 
++ 	enum arm_smmu_arch_version	version;
++ 	enum arm_smmu_implementation	model;
++ 	const struct arm_smmu_impl	*impl;
++ 
++ 	u32				num_context_banks;
++ 	u32				num_s2_context_banks;
++ 	DECLARE_BITMAP(context_map, ARM_SMMU_MAX_CBS);
++ 	struct arm_smmu_cb		*cbs;
++ 	atomic_t			irptndx;
++ 
++ 	u32				num_mapping_groups;
++ 	u16				streamid_mask;
++ 	u16				smr_mask_mask;
++ 	struct arm_smmu_smr		*smrs;
++ 	struct arm_smmu_s2cr		*s2crs;
++ 	struct mutex			stream_map_mutex;
++ 
++ 	unsigned long			va_size;
++ 	unsigned long			ipa_size;
++ 	unsigned long			pa_size;
++ 	unsigned long			pgsize_bitmap;
++ 
++ 	u32				num_global_irqs;
++ 	u32				num_context_irqs;
++ 	unsigned int			*irqs;
++ 	struct clk_bulk_data		*clks;
++ 	int				num_clks;
++ 
++ 	spinlock_t			global_sync_lock;
++ 
++ 	/* IOMMU core code handle */
++ 	struct iommu_device		iommu;
++ };
++ 
++ enum arm_smmu_context_fmt {
++ 	ARM_SMMU_CTX_FMT_NONE,
++ 	ARM_SMMU_CTX_FMT_AARCH64,
++ 	ARM_SMMU_CTX_FMT_AARCH32_L,
++ 	ARM_SMMU_CTX_FMT_AARCH32_S,
++ };
++ 
++ struct arm_smmu_cfg {
++ 	u8				cbndx;
++ 	u8				irptndx;
++ 	union {
++ 		u16			asid;
++ 		u16			vmid;
++ 	};
++ 	enum arm_smmu_cbar_type		cbar;
++ 	enum arm_smmu_context_fmt	fmt;
++ };
++ #define INVALID_IRPTNDX			0xff
++ 
++ enum arm_smmu_domain_stage {
++ 	ARM_SMMU_DOMAIN_S1 = 0,
++ 	ARM_SMMU_DOMAIN_S2,
++ 	ARM_SMMU_DOMAIN_NESTED,
++ 	ARM_SMMU_DOMAIN_BYPASS,
++ };
++ 
++ struct arm_smmu_domain {
++ 	struct arm_smmu_device		*smmu;
++ 	struct io_pgtable_ops		*pgtbl_ops;
++ 	const struct iommu_gather_ops	*tlb_ops;
++ 	struct arm_smmu_cfg		cfg;
++ 	enum arm_smmu_domain_stage	stage;
++ 	bool				non_strict;
++ 	struct mutex			init_mutex; /* Protects smmu pointer */
++ 	spinlock_t			cb_lock; /* Serialises ATS1* ops and TLB syncs */
++ 	struct iommu_domain		domain;
++ };
++ 
++ 
++ /* Implementation details, yay! */
++ struct arm_smmu_impl {
++ 	u32 (*read_reg)(struct arm_smmu_device *smmu, int page, int offset);
++ 	void (*write_reg)(struct arm_smmu_device *smmu, int page, int offset,
++ 			  u32 val);
++ 	u64 (*read_reg64)(struct arm_smmu_device *smmu, int page, int offset);
++ 	void (*write_reg64)(struct arm_smmu_device *smmu, int page, int offset,
++ 			    u64 val);
++ 	int (*cfg_probe)(struct arm_smmu_device *smmu);
++ 	int (*reset)(struct arm_smmu_device *smmu);
++ 	int (*init_context)(struct arm_smmu_domain *smmu_domain);
++ };
++ 
++ static inline void __iomem *arm_smmu_page(struct arm_smmu_device *smmu, int n)
++ {
++ 	return smmu->base + (n << smmu->pgshift);
++ }
++ 
++ static inline u32 arm_smmu_readl(struct arm_smmu_device *smmu, int page, int offset)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->read_reg))
++ 		return smmu->impl->read_reg(smmu, page, offset);
++ 	return readl_relaxed(arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline void arm_smmu_writel(struct arm_smmu_device *smmu, int page,
++ 				   int offset, u32 val)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->write_reg))
++ 		smmu->impl->write_reg(smmu, page, offset, val);
++ 	else
++ 		writel_relaxed(val, arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline u64 arm_smmu_readq(struct arm_smmu_device *smmu, int page, int offset)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->read_reg64))
++ 		return smmu->impl->read_reg64(smmu, page, offset);
++ 	return readq_relaxed(arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ static inline void arm_smmu_writeq(struct arm_smmu_device *smmu, int page,
++ 				   int offset, u64 val)
++ {
++ 	if (smmu->impl && unlikely(smmu->impl->write_reg64))
++ 		smmu->impl->write_reg64(smmu, page, offset, val);
++ 	else
++ 		writeq_relaxed(val, arm_smmu_page(smmu, page) + offset);
++ }
++ 
++ #define ARM_SMMU_GR0		0
++ #define ARM_SMMU_GR1		1
++ #define ARM_SMMU_CB(s, n)	((s)->numpage + (n))
++ 
++ #define arm_smmu_gr0_read(s, o)		\
++ 	arm_smmu_readl((s), ARM_SMMU_GR0, (o))
++ #define arm_smmu_gr0_write(s, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_GR0, (o), (v))
++ 
++ #define arm_smmu_gr1_read(s, o)		\
++ 	arm_smmu_readl((s), ARM_SMMU_GR1, (o))
++ #define arm_smmu_gr1_write(s, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_GR1, (o), (v))
++ 
++ #define arm_smmu_cb_read(s, n, o)	\
++ 	arm_smmu_readl((s), ARM_SMMU_CB((s), (n)), (o))
++ #define arm_smmu_cb_write(s, n, o, v)	\
++ 	arm_smmu_writel((s), ARM_SMMU_CB((s), (n)), (o), (v))
++ #define arm_smmu_cb_readq(s, n, o)	\
++ 	arm_smmu_readq((s), ARM_SMMU_CB((s), (n)), (o))
++ #define arm_smmu_cb_writeq(s, n, o, v)	\
++ 	arm_smmu_writeq((s), ARM_SMMU_CB((s), (n)), (o), (v))
++ 
++ struct arm_smmu_device *arm_smmu_impl_init(struct arm_smmu_device *smmu);
++ 
+++>>>>>>> ba7e4a08bbf7 (iommu/arm-smmu: Add context init implementation hook)
+  #endif /* _ARM_SMMU_H */
+* Unmerged path drivers/iommu/arm-smmu-impl.c
+* Unmerged path drivers/iommu/arm-smmu-impl.c
+* Unmerged path drivers/iommu/arm-smmu.c
+* Unmerged path drivers/iommu/arm-smmu.h
