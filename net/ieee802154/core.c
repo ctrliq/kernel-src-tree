@@ -214,7 +214,7 @@ int cfg802154_switch_netns(struct cfg802154_registered_device *rdev,
 		if (!wpan_dev->netdev)
 			continue;
 		wpan_dev->netdev->features &= ~NETIF_F_NETNS_LOCAL;
-		err = dev_change_net_namespace(wpan_dev->netdev, net, "wpan%d", 0);
+		err = dev_change_net_namespace(wpan_dev->netdev, net, "wpan%d");
 		if (err)
 			break;
 		wpan_dev->netdev->features |= NETIF_F_NETNS_LOCAL;
@@ -231,7 +231,7 @@ int cfg802154_switch_netns(struct cfg802154_registered_device *rdev,
 				continue;
 			wpan_dev->netdev->features &= ~NETIF_F_NETNS_LOCAL;
 			err = dev_change_net_namespace(wpan_dev->netdev, net,
-						       "wpan%d", 0);
+						       "wpan%d");
 			WARN_ON(err);
 			wpan_dev->netdev->features |= NETIF_F_NETNS_LOCAL;
 		}
