@@ -1,0 +1,236 @@
+rcu/nocb: Set SEGCBLIST_SOFTIRQ_ONLY at the very last stage of de-offloading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Frederic Weisbecker <frederic@kernel.org>
+commit b9ced9e1ab51ed6057ac8198fd1eeb404a32a867
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b9ced9e1.failed
+
+This commit sets SEGCBLIST_SOFTIRQ_ONLY once toggling is otherwise fully
+complete, allowing further RCU callback manipulation to be carried out
+locklessly and locally.
+
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+	Cc: Joel Fernandes <joel@joelfernandes.org>
+	Cc: Neeraj Upadhyay <neeraju@codeaurora.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Inspired-by: Paul E. McKenney <paulmck@kernel.org>
+	Tested-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit b9ced9e1ab51ed6057ac8198fd1eeb404a32a867)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree_plugin.h
+diff --cc kernel/rcu/tree_plugin.h
+index 10e9e427ecfe,8641b72f6d0d..000000000000
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@@ -2187,6 -2284,197 +2187,200 @@@ static void do_nocb_deferred_wakeup(str
+  		do_nocb_deferred_wakeup_common(rdp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rdp_offload_toggle(struct rcu_data *rdp,
++ 			       bool offload, unsigned long flags)
++ 	__releases(rdp->nocb_lock)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	struct rcu_data *rdp_gp = rdp->nocb_gp_rdp;
++ 	bool wake_gp = false;
++ 
++ 	rcu_segcblist_offload(cblist, offload);
++ 
++ 	if (rdp->nocb_cb_sleep)
++ 		rdp->nocb_cb_sleep = false;
++ 	rcu_nocb_unlock_irqrestore(rdp, flags);
++ 
++ 	/*
++ 	 * Ignore former value of nocb_cb_sleep and force wake up as it could
++ 	 * have been spuriously set to false already.
++ 	 */
++ 	swake_up_one(&rdp->nocb_cb_wq);
++ 
++ 	raw_spin_lock_irqsave(&rdp_gp->nocb_gp_lock, flags);
++ 	if (rdp_gp->nocb_gp_sleep) {
++ 		rdp_gp->nocb_gp_sleep = false;
++ 		wake_gp = true;
++ 	}
++ 	raw_spin_unlock_irqrestore(&rdp_gp->nocb_gp_lock, flags);
++ 
++ 	if (wake_gp)
++ 		wake_up_process(rdp_gp->nocb_gp_kthread);
++ 
++ 	return 0;
++ }
++ 
++ static int __rcu_nocb_rdp_deoffload(struct rcu_data *rdp)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	printk("De-offloading %d\n", rdp->cpu);
++ 
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	/*
++ 	 * If there are still pending work offloaded, the offline
++ 	 * CPU won't help much handling them.
++ 	 */
++ 	if (cpu_is_offline(rdp->cpu) && !rcu_segcblist_empty(&rdp->cblist)) {
++ 		rcu_nocb_unlock_irqrestore(rdp, flags);
++ 		return -EBUSY;
++ 	}
++ 
++ 	ret = rdp_offload_toggle(rdp, false, flags);
++ 	swait_event_exclusive(rdp->nocb_state_wq,
++ 			      !rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB |
++ 							SEGCBLIST_KTHREAD_GP));
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	/* Make sure nocb timer won't stay around */
++ 	WRITE_ONCE(rdp->nocb_defer_wakeup, RCU_NOCB_WAKE_OFF);
++ 	rcu_nocb_unlock_irqrestore(rdp, flags);
++ 	del_timer_sync(&rdp->nocb_timer);
++ 
++ 	/*
++ 	 * Flush bypass. While IRQs are disabled and once we set
++ 	 * SEGCBLIST_SOFTIRQ_ONLY, no callback is supposed to be
++ 	 * enqueued on bypass.
++ 	 */
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	rcu_nocb_flush_bypass(rdp, NULL, jiffies);
++ 	rcu_segcblist_set_flags(cblist, SEGCBLIST_SOFTIRQ_ONLY);
++ 	/*
++ 	 * With SEGCBLIST_SOFTIRQ_ONLY, we can't use
++ 	 * rcu_nocb_unlock_irqrestore() anymore. Theoretically we
++ 	 * could set SEGCBLIST_SOFTIRQ_ONLY with cb unlocked and IRQs
++ 	 * disabled now, but let's be paranoid.
++ 	 */
++ 	raw_spin_unlock_irqrestore(&rdp->nocb_lock, flags);
++ 
++ 	return ret;
++ }
++ 
++ static long rcu_nocb_rdp_deoffload(void *arg)
++ {
++ 	struct rcu_data *rdp = arg;
++ 
++ 	WARN_ON_ONCE(rdp->cpu != raw_smp_processor_id());
++ 	return __rcu_nocb_rdp_deoffload(rdp);
++ }
++ 
++ int rcu_nocb_cpu_deoffload(int cpu)
++ {
++ 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
++ 	int ret = 0;
++ 
++ 	if (rdp == rdp->nocb_gp_rdp) {
++ 		pr_info("Can't deoffload an rdp GP leader (yet)\n");
++ 		return -EINVAL;
++ 	}
++ 	mutex_lock(&rcu_state.barrier_mutex);
++ 	cpus_read_lock();
++ 	if (rcu_segcblist_is_offloaded(&rdp->cblist)) {
++ 		if (cpu_online(cpu)) {
++ 			ret = work_on_cpu(cpu, rcu_nocb_rdp_deoffload, rdp);
++ 		} else {
++ 			ret = __rcu_nocb_rdp_deoffload(rdp);
++ 		}
++ 		if (!ret)
++ 			cpumask_clear_cpu(cpu, rcu_nocb_mask);
++ 	}
++ 	cpus_read_unlock();
++ 	mutex_unlock(&rcu_state.barrier_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(rcu_nocb_cpu_deoffload);
++ 
++ static int __rcu_nocb_rdp_offload(struct rcu_data *rdp)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	/*
++ 	 * For now we only support re-offload, ie: the rdp must have been
++ 	 * offloaded on boot first.
++ 	 */
++ 	if (!rdp->nocb_gp_rdp)
++ 		return -EINVAL;
++ 
++ 	printk("Offloading %d\n", rdp->cpu);
++ 	/*
++ 	 * Can't use rcu_nocb_lock_irqsave() while we are in
++ 	 * SEGCBLIST_SOFTIRQ_ONLY mode.
++ 	 */
++ 	raw_spin_lock_irqsave(&rdp->nocb_lock, flags);
++ 	/* Re-enable nocb timer */
++ 	WRITE_ONCE(rdp->nocb_defer_wakeup, RCU_NOCB_WAKE_NOT);
++ 	/*
++ 	 * We didn't take the nocb lock while working on the
++ 	 * rdp->cblist in SEGCBLIST_SOFTIRQ_ONLY mode.
++ 	 * Every modifications that have been done previously on
++ 	 * rdp->cblist must be visible remotely by the nocb kthreads
++ 	 * upon wake up after reading the cblist flags.
++ 	 *
++ 	 * The layout against nocb_lock enforces that ordering:
++ 	 *
++ 	 *  __rcu_nocb_rdp_offload()   nocb_cb_wait()/nocb_gp_wait()
++ 	 * -------------------------   ----------------------------
++ 	 *      WRITE callbacks           rcu_nocb_lock()
++ 	 *      rcu_nocb_lock()           READ flags
++ 	 *      WRITE flags               READ callbacks
++ 	 *      rcu_nocb_unlock()         rcu_nocb_unlock()
++ 	 */
++ 	ret = rdp_offload_toggle(rdp, true, flags);
++ 	swait_event_exclusive(rdp->nocb_state_wq,
++ 			      rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB) &&
++ 			      rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_GP));
++ 
++ 	return ret;
++ }
++ 
++ static long rcu_nocb_rdp_offload(void *arg)
++ {
++ 	struct rcu_data *rdp = arg;
++ 
++ 	WARN_ON_ONCE(rdp->cpu != raw_smp_processor_id());
++ 	return __rcu_nocb_rdp_offload(rdp);
++ }
++ 
++ int rcu_nocb_cpu_offload(int cpu)
++ {
++ 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
++ 	int ret = 0;
++ 
++ 	mutex_lock(&rcu_state.barrier_mutex);
++ 	cpus_read_lock();
++ 	if (!rcu_segcblist_is_offloaded(&rdp->cblist)) {
++ 		if (cpu_online(cpu)) {
++ 			ret = work_on_cpu(cpu, rcu_nocb_rdp_offload, rdp);
++ 		} else {
++ 			ret = __rcu_nocb_rdp_offload(rdp);
++ 		}
++ 		if (!ret)
++ 			cpumask_set_cpu(cpu, rcu_nocb_mask);
++ 	}
++ 	cpus_read_unlock();
++ 	mutex_unlock(&rcu_state.barrier_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(rcu_nocb_cpu_offload);
++ 
+++>>>>>>> b9ced9e1ab51 (rcu/nocb: Set SEGCBLIST_SOFTIRQ_ONLY at the very last stage of de-offloading)
+  void __init rcu_init_nohz(void)
+  {
+  	int cpu;
+* Unmerged path kernel/rcu/tree_plugin.h
