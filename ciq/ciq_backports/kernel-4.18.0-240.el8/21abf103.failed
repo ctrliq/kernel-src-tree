@@ -1,0 +1,370 @@
+gpio: Pass a flag to gpiochip_request_own_desc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 21abf103818a4735e80fb0ab03934bed8ae9a028
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/21abf103.failed
+
+Before things go out of hand, make it possible to pass
+flags when requesting "own" descriptors from a gpio_chip.
+This is necessary if the chip wants to request a GPIO with
+active low semantics, for example.
+
+	Cc: Janusz Krzysztofik <jmkrzyszt@gmail.com>
+	Cc: Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
+	Cc: Jason Cooper <jason@lakedaemon.net>
+	Cc: Jiri Kosina <jkosina@suse.cz>
+	Cc: Roger Quadros <rogerq@ti.com>
+	Reviewed-by: Gregory CLEMENT <gregory.clement@free-electrons.com>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit 21abf103818a4735e80fb0ab03934bed8ae9a028)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/mach-omap1/ams-delta-fiq.c
+#	arch/arm/mach-omap1/board-ams-delta.c
+diff --cc arch/arm/mach-omap1/ams-delta-fiq.c
+index d7ca9e2b40d2,0324d0f209ea..000000000000
+--- a/arch/arm/mach-omap1/ams-delta-fiq.c
++++ b/arch/arm/mach-omap1/ams-delta-fiq.c
+@@@ -88,6 -94,46 +88,49 @@@ void __init ams_delta_init_fiq(void
+  	unsigned long val, offset;
+  	int i, retval;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Store irq_chip location for IRQ handler use */
++ 	irq_chip = chip->irq.chip;
++ 	if (!irq_chip) {
++ 		pr_err("%s: GPIO chip %s is missing IRQ function\n", __func__,
++ 		       chip->label);
++ 		return;
++ 	}
++ 
++ 	for (i = 0; i < ARRAY_SIZE(irq_data); i++) {
++ 		gpiod = gpiochip_request_own_desc(chip, i, pin_name[i], 0);
++ 		if (IS_ERR(gpiod)) {
++ 			pr_err("%s: failed to get GPIO pin %d (%ld)\n",
++ 			       __func__, i, PTR_ERR(gpiod));
++ 			return;
++ 		}
++ 		/* Store irq_data location for IRQ handler use */
++ 		irq_data[i] = irq_get_irq_data(gpiod_to_irq(gpiod));
++ 
++ 		/*
++ 		 * FIQ handler takes full control over serio data and clk GPIO
++ 		 * pins.  Initiaize them and keep requested so nobody can
++ 		 * interfere.  Fail if any of those two couldn't be requested.
++ 		 */
++ 		switch (i) {
++ 		case AMS_DELTA_GPIO_PIN_KEYBRD_DATA:
++ 			data = gpiod;
++ 			gpiod_direction_input(data);
++ 			break;
++ 		case AMS_DELTA_GPIO_PIN_KEYBRD_CLK:
++ 			clk = gpiod;
++ 			gpiod_direction_input(clk);
++ 			break;
++ 		default:
++ 			gpiochip_free_own_desc(gpiod);
++ 			break;
++ 		}
++ 	}
++ 	if (!data || !clk)
++ 		goto out_gpio;
++ 
+++>>>>>>> 21abf103818a (gpio: Pass a flag to gpiochip_request_own_desc())
+  	fiqhandler_start = &qwerty_fiqin_start;
+  	fiqhandler_length = &qwerty_fiqin_end - &qwerty_fiqin_start;
+  	pr_info("Installing fiq handler from %p, length 0x%x\n",
+diff --cc arch/arm/mach-omap1/board-ams-delta.c
+index 87308262ee38,6719e139eb62..000000000000
+--- a/arch/arm/mach-omap1/board-ams-delta.c
++++ b/arch/arm/mach-omap1/board-ams-delta.c
+@@@ -651,6 -793,111 +651,114 @@@ static struct platform_device ams_delta
+  	},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * leds-gpio driver doesn't make use of GPIO lookup tables,
++  * it has to be provided with GPIO numbers over platform data
++  * if GPIO descriptor info can't be obtained from device tree.
++  * We could either define GPIO lookup tables and use them on behalf
++  * of the leds-gpio device, or we can use GPIO driver level methods
++  * for identification of GPIO numbers as long as we don't support
++  * device tree.  Let's do the latter.
++  */
++ static void __init ams_delta_led_init(struct gpio_chip *chip)
++ {
++ 	struct gpio_desc *gpiod;
++ 	int i;
++ 
++ 	for (i = LATCH1_PIN_LED_CAMERA; i < LATCH1_PIN_DOCKIT1; i++) {
++ 		gpiod = gpiochip_request_own_desc(chip, i, "camera-led", 0);
++ 		if (IS_ERR(gpiod)) {
++ 			pr_warn("%s: %s GPIO %d request failed (%ld)\n",
++ 				__func__, LATCH1_LABEL, i, PTR_ERR(gpiod));
++ 			continue;
++ 		}
++ 
++ 		/* Assign GPIO numbers to LED device. */
++ 		gpio_leds[i].gpio = desc_to_gpio(gpiod);
++ 
++ 		gpiochip_free_own_desc(gpiod);
++ 	}
++ 
++ 	gpio_led_register_device(PLATFORM_DEVID_NONE, &leds_pdata);
++ }
++ 
++ /*
++  * The purpose of this function is to take care of assignment of GPIO numbers
++  * to platform devices which depend on GPIO lines provided by Amstrad Delta
++  * latch1 and/or latch2 GPIO devices but don't use GPIO lookup tables.
++  * The function may be called as soon as latch1/latch2 GPIO devices are
++  * initilized.  Since basic-mmio-gpio driver is not registered before
++  * device_initcall, this may happen at erliest during device_initcall_sync.
++  * Dependent devices shouldn't be registered before that, their
++  * registration may be performed from within this function or later.
++  */
++ static int __init ams_delta_gpio_init(void)
++ {
++ 	struct gpio_chip *chip;
++ 
++ 	if (!machine_is_ams_delta())
++ 		return -ENODEV;
++ 
++ 	chip = gpiochip_find(LATCH1_LABEL, gpiochip_match_by_label);
++ 	if (!chip)
++ 		pr_err("%s: latch1 GPIO chip not found\n", __func__);
++ 	else
++ 		ams_delta_led_init(chip);
++ 
++ 	return 0;
++ }
++ device_initcall_sync(ams_delta_gpio_init);
++ 
++ static int __init modem_nreset_init(void)
++ {
++ 	int err;
++ 
++ 	err = platform_device_register(&modem_nreset_device);
++ 	if (err)
++ 		pr_err("Couldn't register the modem regulator device\n");
++ 
++ 	return err;
++ }
++ 
++ 
++ /*
++  * This function expects MODEM IRQ number already assigned to the port.
++  * The MODEM device requires its RESET# pin kept high during probe.
++  * That requirement can be fulfilled in several ways:
++  * - with a descriptor of already functional modem_nreset regulator
++  *   assigned to the MODEM private data,
++  * - with the regulator not yet controlled by modem_pm function but
++  *   already enabled by default on probe,
++  * - before the modem_nreset regulator is probed, with the pin already
++  *   set high explicitly.
++  * The last one is already guaranteed by ams_delta_latch2_init() called
++  * from machine_init.
++  * In order to avoid taking over ttyS0 device slot, the MODEM device
++  * should be registered after OMAP serial ports.  Since those ports
++  * are registered at arch_initcall, this function can be called safely
++  * at arch_initcall_sync earliest.
++  */
++ static int __init ams_delta_modem_init(void)
++ {
++ 	int err;
++ 
++ 	if (!machine_is_ams_delta())
++ 		return -ENODEV;
++ 
++ 	omap_cfg_reg(M14_1510_GPIO2);
++ 
++ 	/* Initialize the modem_nreset regulator consumer before use */
++ 	modem_priv.regulator = ERR_PTR(-ENODEV);
++ 
++ 	err = platform_device_register(&ams_delta_modem_device);
++ 
++ 	return err;
++ }
++ arch_initcall_sync(ams_delta_modem_init);
++ 
+++>>>>>>> 21abf103818a (gpio: Pass a flag to gpiochip_request_own_desc())
+  static int __init late_init(void)
+  {
+  	int err;
+diff --git a/Documentation/driver-api/gpio/driver.rst b/Documentation/driver-api/gpio/driver.rst
+index c1d57a1e373b..3043167fc557 100644
+--- a/Documentation/driver-api/gpio/driver.rst
++++ b/Documentation/driver-api/gpio/driver.rst
+@@ -434,7 +434,9 @@ try_module_get()). A GPIO driver can use the following functions instead
+ to request and free descriptors without being pinned to the kernel forever::
+ 
+ 	struct gpio_desc *gpiochip_request_own_desc(struct gpio_desc *desc,
+-						    const char *label)
++						    u16 hwnum,
++						    const char *label,
++						    enum gpiod_flags flags)
+ 
+ 	void gpiochip_free_own_desc(struct gpio_desc *desc)
+ 
+* Unmerged path arch/arm/mach-omap1/ams-delta-fiq.c
+* Unmerged path arch/arm/mach-omap1/board-ams-delta.c
+diff --git a/drivers/gpio/gpio-mvebu.c b/drivers/gpio/gpio-mvebu.c
+index 6e02148c208b..6c675c5accba 100644
+--- a/drivers/gpio/gpio-mvebu.c
++++ b/drivers/gpio/gpio-mvebu.c
+@@ -608,7 +608,7 @@ static int mvebu_pwm_request(struct pwm_chip *chip, struct pwm_device *pwm)
+ 		ret = -EBUSY;
+ 	} else {
+ 		desc = gpiochip_request_own_desc(&mvchip->chip,
+-						 pwm->hwpwm, "mvebu-pwm");
++						 pwm->hwpwm, "mvebu-pwm", 0);
+ 		if (IS_ERR(desc)) {
+ 			ret = PTR_ERR(desc);
+ 			goto out;
+diff --git a/drivers/gpio/gpiolib-acpi.c b/drivers/gpio/gpiolib-acpi.c
+index 621b4676ab4b..b7ad7d88746a 100644
+--- a/drivers/gpio/gpiolib-acpi.c
++++ b/drivers/gpio/gpiolib-acpi.c
+@@ -217,7 +217,7 @@ static acpi_status acpi_gpiochip_alloc_event(struct acpi_resource *ares,
+ 	if (!handler)
+ 		return AE_OK;
+ 
+-	desc = gpiochip_request_own_desc(chip, pin, "ACPI:Event");
++	desc = gpiochip_request_own_desc(chip, pin, "ACPI:Event", 0);
+ 	if (IS_ERR(desc)) {
+ 		dev_err(chip->parent, "Failed to request GPIO\n");
+ 		return AE_ERROR;
+@@ -922,21 +922,14 @@ acpi_gpio_adr_space_handler(u32 function, acpi_physical_address address,
+ 			const char *label = "ACPI:OpRegion";
+ 			int err;
+ 
+-			desc = gpiochip_request_own_desc(chip, pin, label);
++			desc = gpiochip_request_own_desc(chip, pin, label,
++							 flags);
+ 			if (IS_ERR(desc)) {
+ 				status = AE_ERROR;
+ 				mutex_unlock(&achip->conn_lock);
+ 				goto out;
+ 			}
+ 
+-			err = gpiod_configure_flags(desc, label, 0, flags);
+-			if (err < 0) {
+-				status = AE_NOT_CONFIGURED;
+-				gpiochip_free_own_desc(desc);
+-				mutex_unlock(&achip->conn_lock);
+-				goto out;
+-			}
+-
+ 			conn = kzalloc(sizeof(*conn), GFP_KERNEL);
+ 			if (!conn) {
+ 				status = AE_NO_MEMORY;
+diff --git a/drivers/gpio/gpiolib.c b/drivers/gpio/gpiolib.c
+index cb5dcf148c71..90a27266bc8c 100644
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -2456,6 +2456,7 @@ EXPORT_SYMBOL_GPL(gpiochip_is_requested);
+  * @chip: GPIO chip
+  * @hwnum: hardware number of the GPIO for which to request the descriptor
+  * @label: label for the GPIO
++ * @flags: flags for this GPIO or 0 if default
+  *
+  * Function allows GPIO chip drivers to request and use their own GPIO
+  * descriptors via gpiolib API. Difference to gpiod_request() is that this
+@@ -2468,7 +2469,8 @@ EXPORT_SYMBOL_GPL(gpiochip_is_requested);
+  * code on failure.
+  */
+ struct gpio_desc *gpiochip_request_own_desc(struct gpio_chip *chip, u16 hwnum,
+-					    const char *label)
++					    const char *label,
++					    enum gpiod_flags flags)
+ {
+ 	struct gpio_desc *desc = gpiochip_get_desc(chip, hwnum);
+ 	int err;
+@@ -2482,6 +2484,13 @@ struct gpio_desc *gpiochip_request_own_desc(struct gpio_chip *chip, u16 hwnum,
+ 	if (err < 0)
+ 		return ERR_PTR(err);
+ 
++	err = gpiod_configure_flags(desc, label, 0, flags);
++	if (err) {
++		chip_err(chip, "setup of own GPIO %s failed\n", label);
++		gpiod_free_commit(desc);
++		return ERR_PTR(err);
++	}
++
+ 	return desc;
+ }
+ EXPORT_SYMBOL_GPL(gpiochip_request_own_desc);
+@@ -4334,7 +4343,15 @@ int gpiod_hog(struct gpio_desc *desc, const char *name,
+ 	chip = gpiod_to_chip(desc);
+ 	hwnum = gpio_chip_hwgpio(desc);
+ 
+-	local_desc = gpiochip_request_own_desc(chip, hwnum, name);
++	/*
++	 * FIXME: not very elegant that we call gpiod_configure_flags()
++	 * twice here (once inside gpiochip_request_own_desc() and
++	 * again here), but the gpiochip_request_own_desc() is external
++	 * and cannot really pass the lflags so this is the lesser evil
++	 * at the moment. Pass zero as dflags on this first call so we
++	 * don't screw anything up.
++	 */
++	local_desc = gpiochip_request_own_desc(chip, hwnum, name, 0);
+ 	if (IS_ERR(local_desc)) {
+ 		status = PTR_ERR(local_desc);
+ 		pr_err("requesting hog GPIO %s (chip %s, offset %d) failed, %d\n",
+diff --git a/drivers/hid/hid-cp2112.c b/drivers/hid/hid-cp2112.c
+index 33db830a12a9..8fd44407a0df 100644
+--- a/drivers/hid/hid-cp2112.c
++++ b/drivers/hid/hid-cp2112.c
+@@ -1193,7 +1193,7 @@ static int __maybe_unused cp2112_allocate_irq(struct cp2112_device *dev,
+ 		return -EINVAL;
+ 
+ 	dev->desc[pin] = gpiochip_request_own_desc(&dev->gc, pin,
+-						   "HID/I2C:Event");
++						   "HID/I2C:Event", 0);
+ 	if (IS_ERR(dev->desc[pin])) {
+ 		dev_err(dev->gc.parent, "Failed to request GPIO\n");
+ 		return PTR_ERR(dev->desc[pin]);
+diff --git a/drivers/memory/omap-gpmc.c b/drivers/memory/omap-gpmc.c
+index c215287e80cf..b9b4f7058b05 100644
+--- a/drivers/memory/omap-gpmc.c
++++ b/drivers/memory/omap-gpmc.c
+@@ -2170,7 +2170,8 @@ static int gpmc_probe_generic_child(struct platform_device *pdev,
+ 		unsigned int wait_pin = gpmc_s.wait_pin;
+ 
+ 		waitpin_desc = gpiochip_request_own_desc(&gpmc->gpio_chip,
+-							 wait_pin, "WAITPIN");
++							 wait_pin, "WAITPIN",
++							 0);
+ 		if (IS_ERR(waitpin_desc)) {
+ 			dev_err(&pdev->dev, "invalid wait-pin: %d\n", wait_pin);
+ 			ret = PTR_ERR(waitpin_desc);
+diff --git a/include/linux/gpio/driver.h b/include/linux/gpio/driver.h
+index 62e829e6c271..6e52af2aaee0 100644
+--- a/include/linux/gpio/driver.h
++++ b/include/linux/gpio/driver.h
+@@ -17,6 +17,7 @@ struct device_node;
+ struct seq_file;
+ struct gpio_device;
+ struct module;
++enum gpiod_flags;
+ 
+ #ifdef CONFIG_GPIOLIB
+ 
+@@ -606,7 +607,8 @@ gpiochip_remove_pin_ranges(struct gpio_chip *chip)
+ #endif /* CONFIG_PINCTRL */
+ 
+ struct gpio_desc *gpiochip_request_own_desc(struct gpio_chip *chip, u16 hwnum,
+-					    const char *label);
++					    const char *label,
++					    enum gpiod_flags flags);
+ void gpiochip_free_own_desc(struct gpio_desc *desc);
+ 
+ void devprop_gpiochip_set_names(struct gpio_chip *chip,
