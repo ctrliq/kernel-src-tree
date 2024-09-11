@@ -1,0 +1,347 @@
+ice: don't set VF VLAN caps in switchdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+commit cede04b35258faaa5acc3932ac07ab855d59e5f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/cede04b3.failed
+
+In switchdev mode any VLAN manipulation from VF side isn't allowed.
+In order to prevent parsing VLAN commands don't set VF VLAN caps.
+This will result in removing VLAN specific opcodes from allowlist.
+If VF send any VLAN specific opcode PF driver will answer with not
+supported error.
+
+With this approach VF driver know that VLAN caps aren't supported so it
+shouldn't send VLAN specific opcodes. Thanks to that, some ugly errors
+will not show up in dmesg (ex. on creating VFs in switchdev mode
+there are errors about not supported VLAN insertion and stripping)
+
+Move setting VLAN caps to separate function, including
+switchdev mode specific code.
+
+	Signed-off-by: Michal Swiatkowski <michal.swiatkowski@linux.intel.com>
+	Tested-by: Sandeep Penigalapati <sandeep.penigalapati@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit cede04b35258faaa5acc3932ac07ab855d59e5f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index f47989ad400e,9b2d862e11d8..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -2164,141 -1748,153 +2164,194 @@@ static int ice_vc_get_ver_msg(struct ic
+  }
+  
+  /**
+ - * ice_is_vc_addr_primary - check if the MAC address is the VF's primary MAC
+ - * @vc_ether_addr: VIRTCHNL structure that contains MAC and type
+ + * ice_vc_get_max_frame_size - get max frame size allowed for VF
+ + * @vf: VF used to determine max frame size
+   *
+ - * This function should only be called when the MAC address in
+ - * virtchnl_ether_addr is a valid unicast MAC
+ + * Max frame size is determined based on the current port's max frame size and
+ + * whether a port VLAN is configured on this VF. The VF is not aware whether
+ + * it's in a port VLAN so the PF needs to account for this in max frame size
+ + * checks and sending the max frame size to the VF.
+   */
+ -static bool
+ -ice_is_vc_addr_primary(struct virtchnl_ether_addr __maybe_unused *vc_ether_addr)
+ +static u16 ice_vc_get_max_frame_size(struct ice_vf *vf)
+  {
+ -	u8 type = ice_vc_ether_addr_type(vc_ether_addr);
+ +	struct ice_port_info *pi = ice_vf_get_port_info(vf);
+ +	u16 max_frame_size;
+  
+ -	return (type == VIRTCHNL_ETHER_ADDR_PRIMARY);
+ +	max_frame_size = pi->phy.link_info.max_frame_size;
+ +
+ +	if (vf->port_vlan_info)
+ +		max_frame_size -= VLAN_HLEN;
+ +
+ +	return max_frame_size;
+  }
+  
++ /**
+ - * ice_vfhw_mac_add - update the VF's cached hardware MAC if allowed
+ - * @vf: VF to update
+ - * @vc_ether_addr: structure from VIRTCHNL with MAC to add
+++ * ice_vc_get_vlan_caps
+++ * @hw: pointer to the hw
+++ * @vf: pointer to the VF info
+++ * @vsi: pointer to the VSI
+++ * @driver_caps: current driver caps
+++ *
+++ * Return 0 if there is no VLAN caps supported, or VLAN caps value
++  */
+ -static void
+ -ice_vfhw_mac_add(struct ice_vf *vf, struct virtchnl_ether_addr *vc_ether_addr)
+++static u32
+++ice_vc_get_vlan_caps(struct ice_hw *hw, struct ice_vf *vf, struct ice_vsi *vsi,
+++		     u32 driver_caps)
++ {
+ -	u8 *mac_addr = vc_ether_addr->addr;
+ -
+ -	if (!is_valid_ether_addr(mac_addr))
+ -		return;
+++	if (ice_is_eswitch_mode_switchdev(vf->pf))
+++		/* In switchdev setting VLAN from VF isn't supported */
+++		return 0;
++ 
+ -	/* only allow legacy VF drivers to set the device and hardware MAC if it
+ -	 * is zero and allow new VF drivers to set the hardware MAC if the type
+ -	 * was correctly specified over VIRTCHNL
+ -	 */
+ -	if ((ice_is_vc_addr_legacy(vc_ether_addr) &&
+ -	     is_zero_ether_addr(vf->hw_lan_addr.addr)) ||
+ -	    ice_is_vc_addr_primary(vc_ether_addr)) {
+ -		ether_addr_copy(vf->dev_lan_addr.addr, mac_addr);
+ -		ether_addr_copy(vf->hw_lan_addr.addr, mac_addr);
+++	if (driver_caps & VIRTCHNL_VF_OFFLOAD_VLAN_V2) {
+++		/* VLAN offloads based on current device configuration */
+++		return VIRTCHNL_VF_OFFLOAD_VLAN_V2;
+++	} else if (driver_caps & VIRTCHNL_VF_OFFLOAD_VLAN) {
+++		/* allow VF to negotiate VIRTCHNL_VF_OFFLOAD explicitly for
+++		 * these two conditions, which amounts to guest VLAN filtering
+++		 * and offloads being based on the inner VLAN or the
+++		 * inner/single VLAN respectively and don't allow VF to
+++		 * negotiate VIRTCHNL_VF_OFFLOAD in any other cases
+++		 */
+++		if (ice_is_dvm_ena(hw) && ice_vf_is_port_vlan_ena(vf)) {
+++			return VIRTCHNL_VF_OFFLOAD_VLAN;
+++		} else if (!ice_is_dvm_ena(hw) &&
+++			   !ice_vf_is_port_vlan_ena(vf)) {
+++			/* configure backward compatible support for VFs that
+++			 * only support VIRTCHNL_VF_OFFLOAD_VLAN, the PF is
+++			 * configured in SVM, and no port VLAN is configured
+++			 */
+++			ice_vf_vsi_cfg_svm_legacy_vlan_mode(vsi);
+++			return VIRTCHNL_VF_OFFLOAD_VLAN;
+++		} else if (ice_is_dvm_ena(hw)) {
+++			/* configure software offloaded VLAN support when DVM
+++			 * is enabled, but no port VLAN is enabled
+++			 */
+++			ice_vf_vsi_cfg_dvm_legacy_vlan_mode(vsi);
+++		}
++ 	}
++ 
+ -	/* hardware and device MACs are already set, but its possible that the
+ -	 * VF driver sent the VIRTCHNL_OP_ADD_ETH_ADDR message before the
+ -	 * VIRTCHNL_OP_DEL_ETH_ADDR when trying to update its MAC, so save it
+ -	 * away for the legacy VF driver case as it will be updated in the
+ -	 * delete flow for this case
+ -	 */
+ -	if (ice_is_vc_addr_legacy(vc_ether_addr)) {
+ -		ether_addr_copy(vf->legacy_last_added_umac.addr,
+ -				mac_addr);
+ -		vf->legacy_last_added_umac.time_modified = jiffies;
+ -	}
+++	return 0;
++ }
++ 
+  /**
+ - * ice_vc_add_mac_addr - attempt to add the MAC address passed in
+ + * ice_vc_get_vf_res_msg
+   * @vf: pointer to the VF info
+ - * @vsi: pointer to the VF's VSI
+ - * @vc_ether_addr: VIRTCHNL MAC address structure used to add MAC
+ + * @msg: pointer to the msg buffer
+ + *
+ + * called from the VF to request its resources
+   */
+ -static int
+ -ice_vc_add_mac_addr(struct ice_vf *vf, struct ice_vsi *vsi,
+ -		    struct virtchnl_ether_addr *vc_ether_addr)
+ +static int ice_vc_get_vf_res_msg(struct ice_vf *vf, u8 *msg)
+  {
+ -	struct device *dev = ice_pf_to_dev(vf->pf);
+ -	u8 *mac_addr = vc_ether_addr->addr;
+ +	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
+ +	struct virtchnl_vf_resource *vfres = NULL;
+ +	struct ice_pf *pf = vf->pf;
+ +	struct ice_vsi *vsi;
+ +	int len = 0;
+  	int ret;
+  
+ -	/* device MAC already added */
+ -	if (ether_addr_equal(mac_addr, vf->dev_lan_addr.addr))
+ -		return 0;
+ -
+ -	if (is_unicast_ether_addr(mac_addr) && !ice_can_vf_change_mac(vf)) {
+ -		dev_err(dev, "VF attempting to override administratively set MAC address, bring down and up the VF interface to resume normal operation\n");
+ -		return -EPERM;
+ +	if (ice_check_vf_init(pf, vf)) {
+ +		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+ +		goto err;
+  	}
+  
+ -	ret = ice_fltr_add_mac(vsi, mac_addr, ICE_FWD_TO_VSI);
+ -	if (ret == -EEXIST) {
+ -		dev_dbg(dev, "MAC %pM already exists for VF %d\n", mac_addr,
+ -			vf->vf_id);
+ -		/* don't return since we might need to update
+ -		 * the primary MAC in ice_vfhw_mac_add() below
+ -		 */
+ -	} else if (ret) {
+ -		dev_err(dev, "Failed to add MAC %pM for VF %d\n, error %d\n",
+ -			mac_addr, vf->vf_id, ret);
+ -		return ret;
+ -	} else {
+ -		vf->num_mac++;
+ +	len = sizeof(struct virtchnl_vf_resource);
+ +
+ +	vfres = kzalloc(len, GFP_KERNEL);
+ +	if (!vfres) {
+ +		v_ret = VIRTCHNL_STATUS_ERR_NO_MEMORY;
+ +		len = 0;
+ +		goto err;
+  	}
+ +	if (VF_IS_V11(&vf->vf_ver))
+ +		vf->driver_caps = *(u32 *)msg;
+ +	else
+ +		vf->driver_caps = VIRTCHNL_VF_OFFLOAD_L2 |
+ +				  VIRTCHNL_VF_OFFLOAD_RSS_REG |
+ +				  VIRTCHNL_VF_OFFLOAD_VLAN;
+  
+ -	ice_vfhw_mac_add(vf, vc_ether_addr);
+ +	vfres->vf_cap_flags = VIRTCHNL_VF_OFFLOAD_L2;
+ +	vsi = ice_get_vf_vsi(vf);
+ +	if (!vsi) {
+ +		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+ +		goto err;
+ +	}
+  
+ -	return ret;
+ -}
+++<<<<<<< HEAD:drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+ +	if (!vsi->info.pvid)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_VLAN;
+++=======
+++	vfres->vf_cap_flags |= ice_vc_get_vlan_caps(hw, vf, vsi,
+++						    vf->driver_caps);
+++>>>>>>> cede04b35258 (ice: don't set VF VLAN caps in switchdev):drivers/net/ethernet/intel/ice/ice_virtchnl.c
+  
+ -/**
+ - * ice_is_legacy_umac_expired - check if last added legacy unicast MAC expired
+ - * @last_added_umac: structure used to check expiration
+ - */
+ -static bool ice_is_legacy_umac_expired(struct ice_time_mac *last_added_umac)
+ -{
+ -#define ICE_LEGACY_VF_MAC_CHANGE_EXPIRE_TIME	msecs_to_jiffies(3000)
+ -	return time_is_before_jiffies(last_added_umac->time_modified +
+ -				      ICE_LEGACY_VF_MAC_CHANGE_EXPIRE_TIME);
+ -}
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_PF) {
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_PF;
+ +	} else {
+ +		if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_AQ)
+ +			vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_AQ;
+ +		else
+ +			vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_REG;
+ +	}
+  
+ -/**
+ - * ice_update_legacy_cached_mac - update cached hardware MAC for legacy VF
+ - * @vf: VF to update
+ - * @vc_ether_addr: structure from VIRTCHNL with MAC to check
+ - *
+ - * only update cached hardware MAC for legacy VF drivers on delete
+ - * because we cannot guarantee order/type of MAC from the VF driver
+ - */
+ -static void
+ -ice_update_legacy_cached_mac(struct ice_vf *vf,
+ -			     struct virtchnl_ether_addr *vc_ether_addr)
+ -{
+ -	if (!ice_is_vc_addr_legacy(vc_ether_addr) ||
+ -	    ice_is_legacy_umac_expired(&vf->legacy_last_added_umac))
+ -		return;
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_FDIR_PF)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_FDIR_PF;
+  
+ -	ether_addr_copy(vf->dev_lan_addr.addr, vf->legacy_last_added_umac.addr);
+ -	ether_addr_copy(vf->hw_lan_addr.addr, vf->legacy_last_added_umac.addr);
+ -}
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RSS_PCTYPE_V2)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RSS_PCTYPE_V2;
+  
+ -/**
+ - * ice_vfhw_mac_del - update the VF's cached hardware MAC if allowed
+ - * @vf: VF to update
+ - * @vc_ether_addr: structure from VIRTCHNL with MAC to delete
+ - */
+ -static void
+ -ice_vfhw_mac_del(struct ice_vf *vf, struct virtchnl_ether_addr *vc_ether_addr)
+ -{
+ -	u8 *mac_addr = vc_ether_addr->addr;
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_ENCAP)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_ENCAP;
+  
+ -	if (!is_valid_ether_addr(mac_addr) ||
+ -	    !ether_addr_equal(vf->dev_lan_addr.addr, mac_addr))
+ -		return;
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_ENCAP_CSUM)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_ENCAP_CSUM;
+  
+ -	/* allow the device MAC to be repopulated in the add flow and don't
+ -	 * clear the hardware MAC (i.e. hw_lan_addr.addr) here as that is meant
+ -	 * to be persistent on VM reboot and across driver unload/load, which
+ -	 * won't work if we clear the hardware MAC here
+ -	 */
+ -	eth_zero_addr(vf->dev_lan_addr.addr);
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_RX_POLLING)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_RX_POLLING;
+  
+ -	ice_update_legacy_cached_mac(vf, vc_ether_addr);
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_WB_ON_ITR)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_WB_ON_ITR;
+ +
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_REQ_QUEUES)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_REQ_QUEUES;
+ +
+ +	if (vf->driver_caps & VIRTCHNL_VF_CAP_ADV_LINK_SPEED)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_CAP_ADV_LINK_SPEED;
+ +
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_ADV_RSS_PF)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_ADV_RSS_PF;
+ +
+ +	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_USO)
+ +		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_USO;
+ +
+ +	vfres->num_vsis = 1;
+ +	/* Tx and Rx queue are equal for VF */
+ +	vfres->num_queue_pairs = vsi->num_txq;
+ +	vfres->max_vectors = pf->num_msix_per_vf;
+ +	vfres->rss_key_size = ICE_VSIQF_HKEY_ARRAY_SIZE;
+ +	vfres->rss_lut_size = ICE_VSIQF_HLUT_ARRAY_SIZE;
+ +	vfres->max_mtu = ice_vc_get_max_frame_size(vf);
+ +
+ +	vfres->vsi_res[0].vsi_id = vf->lan_vsi_num;
+ +	vfres->vsi_res[0].vsi_type = VIRTCHNL_VSI_SRIOV;
+ +	vfres->vsi_res[0].num_queue_pairs = vsi->num_txq;
+ +	ether_addr_copy(vfres->vsi_res[0].default_mac_addr,
+ +			vf->hw_lan_addr.addr);
+ +
+ +	/* match guest capabilities */
+ +	vf->driver_caps = vfres->vf_cap_flags;
+ +
+ +	ice_vc_set_caps_allowlist(vf);
+ +	ice_vc_set_working_allowlist(vf);
+ +
+ +	set_bit(ICE_VF_STATE_ACTIVE, vf->vf_states);
+ +
+ +err:
+ +	/* send the response back to the VF */
+ +	ret = ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_GET_VF_RESOURCES, v_ret,
+ +				    (u8 *)vfres, len);
+ +
+ +	kfree(vfres);
+ +	return ret;
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
