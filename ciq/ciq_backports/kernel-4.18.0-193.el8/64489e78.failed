@@ -1,0 +1,267 @@
+locking/rwsem: Implement a new locking scheme
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Waiman Long <longman@redhat.com>
+commit 64489e78004cb5623211c75790cac90bd25ff5e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/64489e78.failed
+
+The current way of using various reader, writer and waiting biases
+in the rwsem code are confusing and hard to understand. I have to
+reread the rwsem count guide in the rwsem-xadd.c file from time to
+time to remind myself how this whole thing works. It also makes the
+rwsem code harder to be optimized.
+
+To make rwsem more sane, a new locking scheme similar to the one in
+qrwlock is now being used.  The atomic long count has the following
+bit definitions:
+
+  Bit  0   - writer locked bit
+  Bit  1   - waiters present bit
+  Bits 2-7 - reserved for future extension
+  Bits 8-X - reader count (24/56 bits)
+
+The cmpxchg instruction is now used to acquire the write lock. The read
+lock is still acquired with xadd instruction, so there is no change here.
+This scheme will allow up to 16M/64P active readers which should be
+more than enough. We can always use some more reserved bits if necessary.
+
+With that change, we can deterministically know if a rwsem has been
+write-locked. Looking at the count alone, however, one cannot determine
+for certain if a rwsem is owned by readers or not as the readers that
+set the reader count bits may be in the process of backing out. So we
+still need the reader-owned bit in the owner field to be sure.
+
+With a locking microbenchmark running on 5.1 based kernel, the total
+locking rates (in kops/s) of the benchmark on a 8-socket 120-core
+IvyBridge-EX system before and after the patch were as follows:
+
+                  Before Patch      After Patch
+   # of Threads  wlock    rlock    wlock    rlock
+   ------------  -----    -----    -----    -----
+        1        30,659   31,341   31,055   31,283
+        2         8,909   16,457    9,884   17,659
+        4         9,028   15,823    8,933   20,233
+        8         8,410   14,212    7,230   17,140
+       16         8,217   25,240    7,479   24,607
+
+The locking rates of the benchmark on a Power8 system were as follows:
+
+                  Before Patch      After Patch
+   # of Threads  wlock    rlock    wlock    rlock
+   ------------  -----    -----    -----    -----
+        1        12,963   13,647   13,275   13,601
+        2         7,570   11,569    7,902   10,829
+        4         5,232    5,516    5,466    5,435
+        8         5,233    3,386    5,467    3,168
+
+The locking rates of the benchmark on a 2-socket ARM64 system were
+as follows:
+
+                  Before Patch      After Patch
+   # of Threads  wlock    rlock    wlock    rlock
+   ------------  -----    -----    -----    -----
+        1        21,495   21,046   21,524   21,074
+        2         5,293   10,502    5,333   10,504
+        4         5,325   11,463    5,358   11,631
+        8         5,391   11,712    5,470   11,680
+
+The performance are roughly the same before and after the patch. There
+are run-to-run variations in performance. Runs with higher variances
+usually have higher throughput.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: huang ying <huang.ying.caritas@gmail.com>
+Link: https://lkml.kernel.org/r/20190520205918.22251-4-longman@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 64489e78004cb5623211c75790cac90bd25ff5e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/rwsem-xadd.c
+diff --cc kernel/locking/rwsem-xadd.c
+index 95094b39bc35,7d537b50a849..000000000000
+--- a/kernel/locking/rwsem-xadd.c
++++ b/kernel/locking/rwsem-xadd.c
+@@@ -436,12 -387,10 +387,16 @@@ __rwsem_down_read_failed_common(struct 
+  		/*
+  		 * In case the wait queue is empty and the lock isn't owned
+  		 * by a writer, this reader can exit the slowpath and return
+- 		 * immediately as its RWSEM_ACTIVE_READ_BIAS has already
+- 		 * been set in the count.
++ 		 * immediately as its RWSEM_READER_BIAS has already been
++ 		 * set in the count.
+  		 */
+++<<<<<<< HEAD
+ +		if (atomic_long_read(&sem->count) >= 0) {
+ +			/* Provide lock ACQUIRE */
+ +			smp_acquire__after_ctrl_dep();
+++=======
++ 		if (!(atomic_long_read(&sem->count) & RWSEM_WRITER_MASK)) {
+++>>>>>>> 64489e78004c (locking/rwsem: Implement a new locking scheme)
+  			raw_spin_unlock_irq(&sem->wait_lock);
+  			rwsem_set_reader_owned(sem);
+  			lockevent_inc(rwsem_rlock_fast);
+* Unmerged path kernel/locking/rwsem-xadd.c
+diff --git a/kernel/locking/rwsem.h b/kernel/locking/rwsem.h
+index 64877f5294e3..52b605683be7 100644
+--- a/kernel/locking/rwsem.h
++++ b/kernel/locking/rwsem.h
+@@ -42,24 +42,24 @@
+ #endif
+ 
+ /*
+- * R/W semaphores originally for PPC using the stuff in lib/rwsem.c.
+- * Adapted largely from include/asm-i386/rwsem.h
+- * by Paul Mackerras <paulus@samba.org>.
+- */
+-
+-/*
+- * the semaphore definition
++ * The definition of the atomic counter in the semaphore:
++ *
++ * Bit  0   - writer locked bit
++ * Bit  1   - waiters present bit
++ * Bits 2-7 - reserved
++ * Bits 8-X - 24-bit (32-bit) or 56-bit reader count
++ *
++ * atomic_long_fetch_add() is used to obtain reader lock, whereas
++ * atomic_long_cmpxchg() will be used to obtain writer lock.
+  */
+-#ifdef CONFIG_64BIT
+-# define RWSEM_ACTIVE_MASK		0xffffffffL
+-#else
+-# define RWSEM_ACTIVE_MASK		0x0000ffffL
+-#endif
+-
+-#define RWSEM_ACTIVE_BIAS		0x00000001L
+-#define RWSEM_WAITING_BIAS		(-RWSEM_ACTIVE_MASK-1)
+-#define RWSEM_ACTIVE_READ_BIAS		RWSEM_ACTIVE_BIAS
+-#define RWSEM_ACTIVE_WRITE_BIAS		(RWSEM_WAITING_BIAS + RWSEM_ACTIVE_BIAS)
++#define RWSEM_WRITER_LOCKED	(1UL << 0)
++#define RWSEM_FLAG_WAITERS	(1UL << 1)
++#define RWSEM_READER_SHIFT	8
++#define RWSEM_READER_BIAS	(1UL << RWSEM_READER_SHIFT)
++#define RWSEM_READER_MASK	(~(RWSEM_READER_BIAS - 1))
++#define RWSEM_WRITER_MASK	RWSEM_WRITER_LOCKED
++#define RWSEM_LOCK_MASK		(RWSEM_WRITER_MASK|RWSEM_READER_MASK)
++#define RWSEM_READ_FAILED_MASK	(RWSEM_WRITER_MASK|RWSEM_FLAG_WAITERS)
+ 
+ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ /*
+@@ -174,7 +174,8 @@ extern struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem);
+  */
+ static inline void __down_read(struct rw_semaphore *sem)
+ {
+-	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0)) {
++	if (unlikely(atomic_long_fetch_add_acquire(RWSEM_READER_BIAS,
++			&sem->count) & RWSEM_READ_FAILED_MASK)) {
+ 		rwsem_down_read_failed(sem);
+ 		DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner &
+ 					RWSEM_READER_OWNED), sem);
+@@ -185,7 +186,8 @@ static inline void __down_read(struct rw_semaphore *sem)
+ 
+ static inline int __down_read_killable(struct rw_semaphore *sem)
+ {
+-	if (unlikely(atomic_long_inc_return_acquire(&sem->count) <= 0)) {
++	if (unlikely(atomic_long_fetch_add_acquire(RWSEM_READER_BIAS,
++			&sem->count) & RWSEM_READ_FAILED_MASK)) {
+ 		if (IS_ERR(rwsem_down_read_failed_killable(sem)))
+ 			return -EINTR;
+ 		DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner &
+@@ -206,11 +208,11 @@ static inline int __down_read_trylock(struct rw_semaphore *sem)
+ 	lockevent_inc(rwsem_rtrylock);
+ 	do {
+ 		if (atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
+-					tmp + RWSEM_ACTIVE_READ_BIAS)) {
++					tmp + RWSEM_READER_BIAS)) {
+ 			rwsem_set_reader_owned(sem);
+ 			return 1;
+ 		}
+-	} while (tmp >= 0);
++	} while (!(tmp & RWSEM_READ_FAILED_MASK));
+ 	return 0;
+ }
+ 
+@@ -219,22 +221,16 @@ static inline int __down_read_trylock(struct rw_semaphore *sem)
+  */
+ static inline void __down_write(struct rw_semaphore *sem)
+ {
+-	long tmp;
+-
+-	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
+-					     &sem->count);
+-	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++	if (unlikely(atomic_long_cmpxchg_acquire(&sem->count, 0,
++						 RWSEM_WRITER_LOCKED)))
+ 		rwsem_down_write_failed(sem);
+ 	rwsem_set_owner(sem);
+ }
+ 
+ static inline int __down_write_killable(struct rw_semaphore *sem)
+ {
+-	long tmp;
+-
+-	tmp = atomic_long_add_return_acquire(RWSEM_ACTIVE_WRITE_BIAS,
+-					     &sem->count);
+-	if (unlikely(tmp != RWSEM_ACTIVE_WRITE_BIAS))
++	if (unlikely(atomic_long_cmpxchg_acquire(&sem->count, 0,
++						 RWSEM_WRITER_LOCKED)))
+ 		if (IS_ERR(rwsem_down_write_failed_killable(sem)))
+ 			return -EINTR;
+ 	rwsem_set_owner(sem);
+@@ -247,7 +243,7 @@ static inline int __down_write_trylock(struct rw_semaphore *sem)
+ 
+ 	lockevent_inc(rwsem_wtrylock);
+ 	tmp = atomic_long_cmpxchg_acquire(&sem->count, RWSEM_UNLOCKED_VALUE,
+-		      RWSEM_ACTIVE_WRITE_BIAS);
++					  RWSEM_WRITER_LOCKED);
+ 	if (tmp == RWSEM_UNLOCKED_VALUE) {
+ 		rwsem_set_owner(sem);
+ 		return true;
+@@ -265,8 +261,9 @@ static inline void __up_read(struct rw_semaphore *sem)
+ 	DEBUG_RWSEMS_WARN_ON(!((unsigned long)sem->owner & RWSEM_READER_OWNED),
+ 				sem);
+ 	rwsem_clear_reader_owned(sem);
+-	tmp = atomic_long_dec_return_release(&sem->count);
+-	if (unlikely(tmp < -1 && (tmp & RWSEM_ACTIVE_MASK) == 0))
++	tmp = atomic_long_add_return_release(-RWSEM_READER_BIAS, &sem->count);
++	if (unlikely((tmp & (RWSEM_LOCK_MASK|RWSEM_FLAG_WAITERS))
++			== RWSEM_FLAG_WAITERS))
+ 		rwsem_wake(sem);
+ }
+ 
+@@ -277,8 +274,8 @@ static inline void __up_write(struct rw_semaphore *sem)
+ {
+ 	DEBUG_RWSEMS_WARN_ON(sem->owner != current, sem);
+ 	rwsem_clear_owner(sem);
+-	if (unlikely(atomic_long_sub_return_release(RWSEM_ACTIVE_WRITE_BIAS,
+-						    &sem->count) < 0))
++	if (unlikely(atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED,
++			&sem->count) & RWSEM_FLAG_WAITERS))
+ 		rwsem_wake(sem);
+ }
+ 
+@@ -297,8 +294,9 @@ static inline void __downgrade_write(struct rw_semaphore *sem)
+ 	 * write side. As such, rely on RELEASE semantics.
+ 	 */
+ 	DEBUG_RWSEMS_WARN_ON(sem->owner != current, sem);
+-	tmp = atomic_long_add_return_release(-RWSEM_WAITING_BIAS, &sem->count);
++	tmp = atomic_long_fetch_add_release(
++		-RWSEM_WRITER_LOCKED+RWSEM_READER_BIAS, &sem->count);
+ 	rwsem_set_reader_owned(sem);
+-	if (tmp < 0)
++	if (tmp & RWSEM_FLAG_WAITERS)
+ 		rwsem_downgrade_wake(sem);
+ }
