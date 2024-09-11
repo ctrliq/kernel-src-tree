@@ -1068,7 +1068,7 @@ out_encode_err:
  */
 int nfssvc_decode_voidarg(struct svc_rqst *rqstp, __be32 *p)
 {
-	return 1;
+	return true;
 }
 
 /**
