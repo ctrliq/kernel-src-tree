@@ -1,0 +1,308 @@
+tracing/osnoise: Allow multiple instances of the same tracer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Daniel Bristot de Oliveira <bristot@kernel.org>
+commit 2fac8d6486d5c34e2ec7028580142b8209da3f92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/2fac8d64.failed
+
+Currently, the user can start only one instance of timerlat/osnoise
+tracers and the tracers cannot run in parallel.
+
+As starting point to add more flexibility, let's allow the same tracer to
+run on different trace instances. The workload will start when the first
+trace_array (instance) is registered and stop when the last instance
+is unregistered.
+
+So, while this patch allows the same tracer to run in multiple
+instances (e.g., two instances running osnoise), it still does not allow
+instances of timerlat and osnoise in parallel (e.g., one timerlat and
+osnoise). That is because the osnoise: events have different behavior
+depending on which tracer is enabled (osnoise or timerlat). Enabling
+the parallel usage of these two tracers is in my TODO list.
+
+Link: https://lkml.kernel.org/r/38c8f14b613492a4f3f938d9d3bf0b063b72f0f0.1635702894.git.bristot@kernel.org
+
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Tom Zanussi <zanussi@kernel.org>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Juri Lelli <juri.lelli@redhat.com>
+	Cc: Clark Williams <williams@redhat.com>
+	Cc: John Kacur <jkacur@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Daniel Bristot de Oliveira <bristot@kernel.org>
+	Cc: linux-rt-users@vger.kernel.org
+	Cc: linux-trace-devel@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Daniel Bristot de Oliveira <bristot@kernel.org>
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit 2fac8d6486d5c34e2ec7028580142b8209da3f92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_osnoise.c
+diff --cc kernel/trace/trace_osnoise.c
+index 60adf8c7f9ff,eb617ccb81f1..000000000000
+--- a/kernel/trace/trace_osnoise.c
++++ b/kernel/trace/trace_osnoise.c
+@@@ -51,6 -49,99 +51,102 @@@ static struct trace_array	*osnoise_trac
+  #define DEFAULT_TIMERLAT_PRIO	95			/* FIFO 95 */
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * trace_array of the enabled osnoise/timerlat instances.
++  */
++ struct osnoise_instance {
++ 	struct list_head	list;
++ 	struct trace_array	*tr;
++ };
++ struct list_head osnoise_instances;
++ 
++ static bool osnoise_has_registered_instances(void)
++ {
++ 	return !!list_first_or_null_rcu(&osnoise_instances,
++ 					struct osnoise_instance,
++ 					list);
++ }
++ 
++ /*
++  * osnoise_instance_registered - check if a tr is already registered
++  */
++ static int osnoise_instance_registered(struct trace_array *tr)
++ {
++ 	struct osnoise_instance *inst;
++ 	int found = 0;
++ 
++ 	rcu_read_lock();
++ 	list_for_each_entry_rcu(inst, &osnoise_instances, list) {
++ 		if (inst->tr == tr)
++ 			found = 1;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return found;
++ }
++ 
++ /*
++  * osnoise_register_instance - register a new trace instance
++  *
++  * Register a trace_array *tr in the list of instances running
++  * osnoise/timerlat tracers.
++  */
++ static int osnoise_register_instance(struct trace_array *tr)
++ {
++ 	struct osnoise_instance *inst;
++ 
++ 	/*
++ 	 * register/unregister serialization is provided by trace's
++ 	 * trace_types_lock.
++ 	 */
++ 	lockdep_assert_held(&trace_types_lock);
++ 
++ 	inst = kmalloc(sizeof(*inst), GFP_KERNEL);
++ 	if (!inst)
++ 		return -ENOMEM;
++ 
++ 	INIT_LIST_HEAD_RCU(&inst->list);
++ 	inst->tr = tr;
++ 	list_add_tail_rcu(&inst->list, &osnoise_instances);
++ 
++ 	return 0;
++ }
++ 
++ /*
++  *  osnoise_unregister_instance - unregister a registered trace instance
++  *
++  * Remove the trace_array *tr from the list of instances running
++  * osnoise/timerlat tracers.
++  */
++ static void osnoise_unregister_instance(struct trace_array *tr)
++ {
++ 	struct osnoise_instance *inst;
++ 	int found = 0;
++ 
++ 	/*
++ 	 * register/unregister serialization is provided by trace's
++ 	 * trace_types_lock.
++ 	 */
++ 	lockdep_assert_held(&trace_types_lock);
++ 
++ 	list_for_each_entry_rcu(inst, &osnoise_instances, list) {
++ 		if (inst->tr == tr) {
++ 			list_del_rcu(&inst->list);
++ 			found = 1;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!found)
++ 		return;
++ 
++ 	synchronize_rcu();
++ 	kfree(inst);
++ }
++ 
++ /*
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+   * NMI runtime info.
+   */
+  struct osn_nmi {
+@@@ -1963,7 -2157,14 +2069,18 @@@ static int osnoise_workload_start(void
+   */
+  static void osnoise_workload_stop(void)
+  {
+++<<<<<<< HEAD
+ +	if (!osnoise_busy)
+++=======
++ 	/*
++ 	 * Instances need to be unregistered before calling
++ 	 * stop. Hence, if there is a registered instance, more
++ 	 * than one instance is running, and the workload will not
++ 	 * yet stop. Otherwise, this code is on the way to disable
++ 	 * the last instance, and the workload can stop.
++ 	 */
++ 	if (osnoise_has_registered_instances())
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+  		return;
+  
+  	trace_osnoise_callback_enabled = false;
+@@@ -1986,7 -2185,11 +2103,15 @@@ static void osnoise_tracer_start(struc
+  {
+  	int retval;
+  
+++<<<<<<< HEAD
+ +	if (osnoise_busy)
+++=======
++ 	/*
++ 	 * If the instance is already registered, there is no need to
++ 	 * register it again.
++ 	 */
++ 	if (osnoise_instance_registered(tr))
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+  		return;
+  
+  	retval = osnoise_workload_start();
+@@@ -1997,20 -2201,19 +2122,32 @@@
+  
+  static void osnoise_tracer_stop(struct trace_array *tr)
+  {
+++<<<<<<< HEAD
+ +	if (!osnoise_busy)
+ +		return;
+ +
+++=======
++ 	osnoise_unregister_instance(tr);
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+  	osnoise_workload_stop();
+  }
+  
+  static int osnoise_tracer_init(struct trace_array *tr)
+  {
+++<<<<<<< HEAD
+ +
+ +	/* Only allow one instance to enable this */
+ +	if (osnoise_busy)
+++=======
++ 	/*
++ 	 * Only allow osnoise tracer if timerlat tracer is not running
++ 	 * already.
++ 	 */
++ 	if (timerlat_enabled())
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+  		return -EBUSY;
+  
+ +	osnoise_trace = tr;
+  	tr->max_latency = 0;
+  
+  	osnoise_tracer_start(tr);
+@@@ -2038,45 -2240,55 +2175,72 @@@ static void timerlat_tracer_start(struc
+  {
+  	int retval;
+  
+++<<<<<<< HEAD
+ +	if (osnoise_busy)
+++=======
++ 	/*
++ 	 * If the instance is already registered, there is no need to
++ 	 * register it again.
++ 	 */
++ 	if (osnoise_instance_registered(tr))
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+  		return;
+  
+- 	osnoise_data.timerlat_tracer = 1;
+- 
+  	retval = osnoise_workload_start();
+  	if (retval)
+- 		goto out_err;
++ 		pr_err(BANNER "Error starting timerlat tracer\n");
+  
+ -	osnoise_register_instance(tr);
+ -
+  	return;
+- out_err:
+- 	pr_err(BANNER "Error starting timerlat tracer\n");
+  }
+  
+  static void timerlat_tracer_stop(struct trace_array *tr)
+  {
+  	int cpu;
+  
+++<<<<<<< HEAD
+ +	if (!osnoise_busy)
+ +		return;
+++=======
++ 	osnoise_unregister_instance(tr);
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+  
+- 	for_each_online_cpu(cpu)
+- 		per_cpu(per_cpu_osnoise_var, cpu).sampling = 0;
+- 
+- 	osnoise_tracer_stop(tr);
++ 	/*
++ 	 * Instruct the threads to stop only if this is the last instance.
++ 	 */
++ 	if (!osnoise_has_registered_instances()) {
++ 		for_each_online_cpu(cpu)
++ 			per_cpu(per_cpu_osnoise_var, cpu).sampling = 0;
++ 	}
+  
+- 	osnoise_data.timerlat_tracer = 0;
++ 	osnoise_workload_stop();
+  }
+  
+  static int timerlat_tracer_init(struct trace_array *tr)
+  {
+++<<<<<<< HEAD
+ +	/* Only allow one instance to enable this */
+ +	if (osnoise_busy)
+ +		return -EBUSY;
+ +
+ +	osnoise_trace = tr;
+ +
+ +	tr->max_latency = 0;
+++=======
++ 	/*
++ 	 * Only allow timerlat tracer if osnoise tracer is not running already.
++ 	 */
++ 	if (osnoise_has_registered_instances() && !osnoise_data.timerlat_tracer)
++ 		return -EBUSY;
++ 
++ 	/*
++ 	 * If this is the first instance, set timerlat_tracer to block
++ 	 * osnoise tracer start.
++ 	 */
++ 	if (!osnoise_has_registered_instances())
++ 		osnoise_data.timerlat_tracer = 1;
+++>>>>>>> 2fac8d6486d5 (tracing/osnoise: Allow multiple instances of the same tracer)
+  
++ 	tr->max_latency = 0;
+  	timerlat_tracer_start(tr);
+  
+  	return 0;
+* Unmerged path kernel/trace/trace_osnoise.c
