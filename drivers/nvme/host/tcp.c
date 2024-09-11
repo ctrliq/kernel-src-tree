@@ -78,6 +78,7 @@ struct nvme_tcp_queue {
 	spinlock_t		lock;
 	struct mutex		send_mutex;
 	struct list_head	send_list;
+	bool			more_requests;
 
 	/* recv state */
 	void			*pdu;
@@ -278,7 +279,9 @@ static inline void nvme_tcp_queue_request(struct nvme_tcp_request *req,
 	 */
 	if (queue->io_cpu == smp_processor_id() &&
 	    sync && empty && mutex_trylock(&queue->send_mutex)) {
+		queue->more_requests = !last;
 		nvme_tcp_try_send(queue);
+		queue->more_requests = false;
 		mutex_unlock(&queue->send_mutex);
 	} else {
 		queue_work_on(queue->io_cpu, nvme_tcp_wq, &queue->io_work);
@@ -861,6 +864,12 @@ done:
 	read_unlock(&sk->sk_callback_lock);
 }
 
+static inline bool nvme_tcp_queue_more(struct nvme_tcp_queue *queue)
+{
+	return !list_empty(&queue->send_list) ||
+		!llist_empty(&queue->req_list) || queue->more_requests;
+}
+
 static inline void nvme_tcp_done_send_req(struct nvme_tcp_queue *queue)
 {
 	queue->request = NULL;
@@ -882,7 +891,7 @@ static int nvme_tcp_try_send_data(struct nvme_tcp_request *req)
 		bool last = nvme_tcp_pdu_last_send(req, len);
 		int ret, flags = MSG_DONTWAIT;
 
-		if (last && !queue->data_digest)
+		if (last && !queue->data_digest && !nvme_tcp_queue_more(queue))
 			flags |= MSG_EOR;
 		else
 			flags |= MSG_MORE | MSG_SENDPAGE_NOTLAST;
@@ -929,7 +938,7 @@ static int nvme_tcp_try_send_cmd_pdu(struct nvme_tcp_request *req)
 	int flags = MSG_DONTWAIT;
 	int ret;
 
-	if (inline_data)
+	if (inline_data || nvme_tcp_queue_more(queue))
 		flags |= MSG_MORE | MSG_SENDPAGE_NOTLAST;
 	else
 		flags |= MSG_EOR;
@@ -994,11 +1003,16 @@ static int nvme_tcp_try_send_ddgst(struct nvme_tcp_request *req)
 {
 	struct nvme_tcp_queue *queue = req->queue;
 	int ret;
-	struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_EOR };
+	struct msghdr msg = { .msg_flags = MSG_DONTWAIT };
 	struct kvec iov = {
 		.iov_base = &req->ddgst + req->offset,
 		.iov_len = NVME_TCP_DIGEST_LENGTH - req->offset
 	};
+
+	if (nvme_tcp_queue_more(queue))
+		msg.msg_flags |= MSG_MORE;
+	else
+		msg.msg_flags |= MSG_EOR;
 
 	ret = kernel_sendmsg(queue->sock, &msg, &iov, 1, iov.iov_len);
 	if (unlikely(ret <= 0))
