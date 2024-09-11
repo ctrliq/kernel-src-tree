@@ -1,0 +1,189 @@
+skbuff: allow 'slow_gro' for skb carring sock reference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 5e10da5385d20c4bae587bc2921e5fdd9655d5fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/5e10da53.failed
+
+This change leverages the infrastructure introduced by the previous
+patches to allow soft devices passing to the GRO engine owned skbs
+without impacting the fast-path.
+
+It's up to the GRO caller ensuring the slow_gro bit validity before
+invoking the GRO engine. The new helper skb_prepare_for_gro() is
+introduced for that goal.
+
+On slow_gro, skbs are aggregated only with equal sk.
+Additionally, skb truesize on GRO recycle and free is correctly
+updated so that sk wmem is not changed by the GRO processing.
+
+rfc-> v1:
+ - fixed bad truesize on dev_gro_receive NAPI_FREE
+ - use the existing state bit
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5e10da5385d20c4bae587bc2921e5fdd9655d5fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/core/skbuff.c
+diff --cc net/core/dev.c
+index 4f3813eeafe4,dcc87fcd64ba..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5553,6 -6022,32 +5553,35 @@@ static void gro_list_prepare(struct nap
+  			diffs = memcmp(skb_mac_header(p),
+  				       skb_mac_header(skb),
+  				       maclen);
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* in most common scenarions _state is 0
++ 		 * otherwise we are already on some slower paths
++ 		 * either skip all the infrequent tests altogether or
++ 		 * avoid trying too hard to skip each of them individually
++ 		 */
++ 		if (!diffs && unlikely(skb->slow_gro | p->slow_gro)) {
++ #if IS_ENABLED(CONFIG_SKB_EXTENSIONS) && IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
++ 			struct tc_skb_ext *skb_ext;
++ 			struct tc_skb_ext *p_ext;
++ #endif
++ 
++ 			diffs |= p->sk != skb->sk;
++ 			diffs |= skb_metadata_dst_cmp(p, skb);
++ 			diffs |= skb_get_nfct(p) ^ skb_get_nfct(skb);
++ 
++ #if IS_ENABLED(CONFIG_SKB_EXTENSIONS) && IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
++ 			skb_ext = skb_ext_find(skb, TC_SKB_EXT);
++ 			p_ext = skb_ext_find(p, TC_SKB_EXT);
++ 
++ 			diffs |= (!!p_ext) ^ (!!skb_ext);
++ 			if (!diffs && unlikely(skb_ext))
++ 				diffs |= p_ext->chain ^ skb_ext->chain;
++ #endif
++ 		}
++ 
+++>>>>>>> 5e10da5385d2 (skbuff: allow 'slow_gro' for skb carring sock reference)
+  		NAPI_GRO_CB(p)->same_flow = !diffs;
+  	}
+  }
+@@@ -5799,7 -6311,12 +5828,16 @@@ static void napi_reuse_skb(struct napi_
+  	skb->encapsulation = 0;
+  	skb_shinfo(skb)->gso_type = 0;
+  	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
+++<<<<<<< HEAD
+ +	skb_ext_reset(skb);
+++=======
++ 	if (unlikely(skb->slow_gro)) {
++ 		skb_orphan(skb);
++ 		skb_ext_reset(skb);
++ 		nf_reset_ct(skb);
++ 		skb->slow_gro = 0;
++ 	}
+++>>>>>>> 5e10da5385d2 (skbuff: allow 'slow_gro' for skb carring sock reference)
+  
+  	napi->skb = skb;
+  }
+diff --cc net/core/skbuff.c
+index 11454d214ad6,fcbd977186b0..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -760,43 -927,41 +760,60 @@@ void __consume_stateless_skb(struct sk_
+  	kfree_skbmem(skb);
+  }
+  
+ -static void napi_skb_cache_put(struct sk_buff *skb)
+ +void __kfree_skb_flush(void)
+  {
+  	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ -	u32 i;
+  
+ -	kasan_poison_object_data(skbuff_head_cache, skb);
+ +	/* flush skb_cache if containing objects */
+ +	if (nc->skb_count) {
+ +		kmem_cache_free_bulk(skbuff_head_cache, nc->skb_count,
+ +				     nc->skb_cache);
+ +		nc->skb_count = 0;
+ +	}
+ +}
+ +
+ +static inline void _kfree_skb_defer(struct sk_buff *skb)
+ +{
+ +	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ +
+ +	/* drop skb->head and call any destructors for packet */
+ +	skb_release_all(skb);
+ +
+ +	/* record skb to CPU local list */
+  	nc->skb_cache[nc->skb_count++] = skb;
+  
+ -	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ -		for (i = NAPI_SKB_CACHE_HALF; i < NAPI_SKB_CACHE_SIZE; i++)
+ -			kasan_unpoison_object_data(skbuff_head_cache,
+ -						   nc->skb_cache[i]);
+ +#ifdef CONFIG_SLUB
+ +	/* SLUB writes into objects when freeing */
+ +	prefetchw(skb);
+ +#endif
+  
+ -		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_HALF,
+ -				     nc->skb_cache + NAPI_SKB_CACHE_HALF);
+ -		nc->skb_count = NAPI_SKB_CACHE_HALF;
+ +	/* flush skb_cache if it is filled */
+ +	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ +		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE,
+ +				     nc->skb_cache);
+ +		nc->skb_count = 0;
+  	}
+  }
+ -
+  void __kfree_skb_defer(struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	_kfree_skb_defer(skb);
+++=======
++ 	skb_release_all(skb);
++ 	napi_skb_cache_put(skb);
++ }
++ 
++ void napi_skb_free_stolen_head(struct sk_buff *skb)
++ {
++ 	if (unlikely(skb->slow_gro)) {
++ 		nf_reset_ct(skb);
++ 		skb_dst_drop(skb);
++ 		skb_ext_put(skb);
++ 		skb_orphan(skb);
++ 		skb->slow_gro = 0;
++ 	}
++ 	napi_skb_cache_put(skb);
+++>>>>>>> 5e10da5385d2 (skbuff: allow 'slow_gro' for skb carring sock reference)
+  }
+  
+  void napi_consume_skb(struct sk_buff *skb, int budget)
+diff --git a/include/net/sock.h b/include/net/sock.h
+index b3e2a308efa6..7bd66419fe33 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -2229,6 +2229,15 @@ static inline __must_check bool skb_set_owner_sk_safe(struct sk_buff *skb, struc
+ 	return false;
+ }
+ 
++static inline void skb_prepare_for_gro(struct sk_buff *skb)
++{
++	if (skb->destructor != sock_wfree) {
++		skb_orphan(skb);
++		return;
++	}
++	skb->slow_gro = 1;
++}
++
+ void sk_reset_timer(struct sock *sk, struct timer_list *timer,
+ 		    unsigned long expires);
+ 
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/skbuff.c
