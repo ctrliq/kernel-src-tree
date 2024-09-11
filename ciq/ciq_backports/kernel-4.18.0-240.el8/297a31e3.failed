@@ -1,0 +1,345 @@
+io_uring: remove unnecessary NULL checks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 297a31e3e8318f533cff4fe33ffaefb74f72c6e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/297a31e3.failed
+
+The "kmsg" pointer can't be NULL and we have already dereferenced it so
+a check here would be useless.
+
+	Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 297a31e3e8318f533cff4fe33ffaefb74f72c6e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index ffb8e9d82a6a,d35b45696c73..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1574,50 -2562,159 +1574,210 @@@ static int io_sync_file_range(struct io
+  	return 0;
+  }
+  
+ -static int io_openat_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ +#if defined(CONFIG_NET)
+ +static int io_send_recvmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +			   bool force_nonblock,
+ +		   long (*fn)(struct socket *, struct user_msghdr __user *,
+ +				unsigned int))
+  {
+ -	const char __user *fname;
+ +	struct socket *sock;
+  	int ret;
+  
+ -	if (sqe->ioprio || sqe->buf_index)
+ +	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
+  		return -EINVAL;
+ -	if (sqe->flags & IOSQE_FIXED_FILE)
+ -		return -EBADF;
+ -	if (req->flags & REQ_F_NEED_CLEANUP)
+ -		return 0;
+  
+ -	req->open.dfd = READ_ONCE(sqe->fd);
+ -	req->open.how.mode = READ_ONCE(sqe->len);
+ -	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ -	req->open.how.flags = READ_ONCE(sqe->open_flags);
+ +	sock = sock_from_file(req->file, &ret);
+ +	if (sock) {
+ +		struct user_msghdr __user *msg;
+ +		unsigned flags;
+  
+ -	req->open.filename = getname(fname);
+ -	if (IS_ERR(req->open.filename)) {
+ -		ret = PTR_ERR(req->open.filename);
+ -		req->open.filename = NULL;
+ -		return ret;
+ +		flags = READ_ONCE(sqe->msg_flags);
+ +		if (flags & MSG_DONTWAIT)
+ +			req->flags |= REQ_F_NOWAIT;
+ +		else if (force_nonblock)
+ +			flags |= MSG_DONTWAIT;
+ +
+++<<<<<<< HEAD
+ +		msg = (struct user_msghdr __user *) (unsigned long)
+ +			READ_ONCE(sqe->addr);
+++=======
+++		ret = __sys_sendmsg_sock(sock, &kmsg->msg, flags);
+++		if (force_nonblock && ret == -EAGAIN) {
+++			if (req->io)
+++				return -EAGAIN;
+++			if (io_alloc_async_ctx(req)) {
+++				if (kmsg->iov != kmsg->fast_iov)
+++					kfree(kmsg->iov);
+++				return -ENOMEM;
+++			}
+++			req->flags |= REQ_F_NEED_CLEANUP;
+++			memcpy(&req->io->msg, &io.msg, sizeof(io.msg));
+++			return -EAGAIN;
+++		}
+++		if (ret == -ERESTARTSYS)
+++			ret = -EINTR;
+++	}
+++>>>>>>> 297a31e3e831 (io_uring: remove unnecessary NULL checks)
+ +
+ +		ret = fn(sock, msg, flags);
+ +		if (force_nonblock && ret == -EAGAIN)
+++<<<<<<< HEAD
+++=======
+++			return -EAGAIN;
+++		if (ret == -ERESTARTSYS)
+++			ret = -EINTR;
++ 	}
++ 
+ -	req->flags |= REQ_F_NEED_CLEANUP;
+++	io_cqring_add_event(req, ret);
+++	if (ret < 0)
+++		req_set_fail_links(req);
+++	io_put_req_find_next(req, nxt);
++ 	return 0;
+++#else
+++	return -EOPNOTSUPP;
+++#endif
++ }
++ 
+ -static int io_openat2_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+++static int io_recvmsg_prep(struct io_kiocb *req,
+++			   const struct io_uring_sqe *sqe)
++ {
+ -	struct open_how __user *how;
+ -	const char __user *fname;
+ -	size_t len;
+++#if defined(CONFIG_NET)
+++	struct io_sr_msg *sr = &req->sr_msg;
+++	struct io_async_ctx *io = req->io;
++ 	int ret;
++ 
+ -	if (sqe->ioprio || sqe->buf_index)
+ -		return -EINVAL;
+ -	if (sqe->flags & IOSQE_FIXED_FILE)
+ -		return -EBADF;
+++	sr->msg_flags = READ_ONCE(sqe->msg_flags);
+++	sr->msg = u64_to_user_ptr(READ_ONCE(sqe->addr));
+++	sr->len = READ_ONCE(sqe->len);
+++
+++	if (!io || req->opcode == IORING_OP_RECV)
+++		return 0;
+++	/* iovec is already imported */
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
+ -	req->open.dfd = READ_ONCE(sqe->fd);
+ -	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ -	how = u64_to_user_ptr(READ_ONCE(sqe->addr2));
+ -	len = READ_ONCE(sqe->len);
+ -
+ -	if (len < OPEN_HOW_SIZE_VER0)
+ -		return -EINVAL;
+ -
+ -	ret = copy_struct_from_user(&req->open.how, sizeof(req->open.how), how,
+ -					len);
+ -	if (ret)
+ -		return ret;
+ -
+ -	if (!(req->open.how.flags & O_PATH) && force_o_largefile())
+ -		req->open.how.flags |= O_LARGEFILE;
+ -
+ -	req->open.filename = getname(fname);
+ -	if (IS_ERR(req->open.filename)) {
+ -		ret = PTR_ERR(req->open.filename);
+ -		req->open.filename = NULL;
+ -		return ret;
+ -	}
+ -
+ -	req->flags |= REQ_F_NEED_CLEANUP;
+ -	return 0;
+++	io->msg.iov = io->msg.fast_iov;
+++	ret = recvmsg_copy_msghdr(&io->msg.msg, sr->msg, sr->msg_flags,
+++					&io->msg.uaddr, &io->msg.iov);
+++	if (!ret)
+++		req->flags |= REQ_F_NEED_CLEANUP;
+++	return ret;
+++#else
+++	return -EOPNOTSUPP;
+++#endif
++ }
++ 
+ -static int io_openat2(struct io_kiocb *req, struct io_kiocb **nxt,
+++static int io_recvmsg(struct io_kiocb *req, struct io_kiocb **nxt,
++ 		      bool force_nonblock)
++ {
+ -	struct open_flags op;
+ -	struct file *file;
+++#if defined(CONFIG_NET)
+++	struct io_async_msghdr *kmsg = NULL;
+++	struct socket *sock;
++ 	int ret;
++ 
+ -	if (force_nonblock)
+ -		return -EAGAIN;
+++	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
+++		return -EINVAL;
++ 
+ -	ret = build_open_flags(&req->open.how, &op);
+ -	if (ret)
+ -		goto err;
+++	sock = sock_from_file(req->file, &ret);
+++	if (sock) {
+++		struct io_async_ctx io;
+++		unsigned flags;
++ 
+ -	ret = get_unused_fd_flags(req->open.how.flags);
+ -	if (ret < 0)
+ -		goto err;
+++		if (req->io) {
+++			kmsg = &req->io->msg;
+++			kmsg->msg.msg_name = &req->io->msg.addr;
+++			/* if iov is set, it's allocated already */
+++			if (!kmsg->iov)
+++				kmsg->iov = kmsg->fast_iov;
+++			kmsg->msg.msg_iter.iov = kmsg->iov;
+++		} else {
+++			struct io_sr_msg *sr = &req->sr_msg;
++ 
+ -	file = do_filp_open(req->open.dfd, req->open.filename, &op);
+ -	if (IS_ERR(file)) {
+ -		put_unused_fd(ret);
+ -		ret = PTR_ERR(file);
+ -	} else {
+ -		fsnotify_open(file);
+ -		fd_install(ret, file);
+++			kmsg = &io.msg;
+++			kmsg->msg.msg_name = &io.msg.addr;
+++
+++			io.msg.iov = io.msg.fast_iov;
+++			ret = recvmsg_copy_msghdr(&io.msg.msg, sr->msg,
+++					sr->msg_flags, &io.msg.uaddr,
+++					&io.msg.iov);
+++			if (ret)
+++				return ret;
+++		}
+++
+++		flags = req->sr_msg.msg_flags;
+++		if (flags & MSG_DONTWAIT)
+++			req->flags |= REQ_F_NOWAIT;
+++		else if (force_nonblock)
+++			flags |= MSG_DONTWAIT;
+++
+++		ret = __sys_recvmsg_sock(sock, &kmsg->msg, req->sr_msg.msg,
+++						kmsg->uaddr, flags);
+++		if (force_nonblock && ret == -EAGAIN) {
+++			if (req->io)
+++				return -EAGAIN;
+++			if (io_alloc_async_ctx(req)) {
+++				if (kmsg->iov != kmsg->fast_iov)
+++					kfree(kmsg->iov);
+++				return -ENOMEM;
+++			}
+++			memcpy(&req->io->msg, &io.msg, sizeof(io.msg));
+++			req->flags |= REQ_F_NEED_CLEANUP;
+++			return -EAGAIN;
+++		}
+++		if (ret == -ERESTARTSYS)
+++			ret = -EINTR;
++ 	}
+ -err:
+ -	putname(req->open.filename);
+++
+++	if (kmsg && kmsg->iov != kmsg->fast_iov)
+++		kfree(kmsg->iov);
++ 	req->flags &= ~REQ_F_NEED_CLEANUP;
+++	io_cqring_add_event(req, ret);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
++ 	io_put_req_find_next(req, nxt);
++ 	return 0;
+++#else
+++	return -EOPNOTSUPP;
+++#endif
++ }
++ 
+ -static int io_openat(struct io_kiocb *req, struct io_kiocb **nxt,
+ -		     bool force_nonblock)
+++static int io_recv(struct io_kiocb *req, struct io_kiocb **nxt,
+++		   bool force_nonblock)
++ {
+ -	req->open.how = build_open_how(req->open.how.flags, req->open.how.mode);
+ -	return io_openat2(req, nxt, force_nonblock);
+ -}
+++#if defined(CONFIG_NET)
+++	struct socket *sock;
+++	int ret;
++ 
+ -static int io_epoll_ctl_prep(struct io_kiocb *req,
+ -			     const struct io_uring_sqe *sqe)
+ -{
+ -#if defined(CONFIG_EPOLL)
+ -	if (sqe->ioprio || sqe->buf_index)
+++	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 
+ -	req->epoll.epfd = READ_ONCE(sqe->fd);
+ -	req->epoll.op = READ_ONCE(sqe->len);
+ -	req->epoll.fd = READ_ONCE(sqe->off);
+ -
+ -	if (ep_op_has_event(req->epoll.op)) {
+ -		struct epoll_event __user *ev;
+++	sock = sock_from_file(req->file, &ret);
+++	if (sock) {
+++		struct io_sr_msg *sr = &req->sr_msg;
+++		struct msghdr msg;
+++		struct iovec iov;
+++		unsigned flags;
++ 
+ -		ev = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ -		if (copy_from_user(&req->epoll.event, ev, sizeof(*ev)))
+ -			return -EFAULT;
+++		ret = import_single_range(READ, sr->buf, sr->len, &iov,
+++						&msg.msg_iter);
+++		if (ret)
+++>>>>>>> 297a31e3e831 (io_uring: remove unnecessary NULL checks)
+ +			return ret;
+ +		if (ret == -ERESTARTSYS)
+ +			ret = -EINTR;
+  	}
+  
+ +	io_cqring_add_event(req->ctx, sqe->user_data, ret);
+ +	io_put_req(req);
+  	return 0;
+ -#else
+ -	return -EOPNOTSUPP;
+ -#endif
+  }
+ +#endif
+  
+ -static int io_epoll_ctl(struct io_kiocb *req, struct io_kiocb **nxt,
+ -			bool force_nonblock)
+ +static int io_sendmsg(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +		      bool force_nonblock)
+  {
+ -#if defined(CONFIG_EPOLL)
+ -	struct io_epoll *ie = &req->epoll;
+ -	int ret;
+ -
+ -	ret = do_epoll_ctl(ie->epfd, ie->op, ie->fd, &ie->event, force_nonblock);
+ -	if (force_nonblock && ret == -EAGAIN)
+ -		return -EAGAIN;
+ -
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req_find_next(req, nxt);
+ -	return 0;
+ +#if defined(CONFIG_NET)
+ +	return io_send_recvmsg(req, sqe, force_nonblock, __sys_sendmsg_sock);
+  #else
+  	return -EOPNOTSUPP;
+  #endif
+* Unmerged path fs/io_uring.c
