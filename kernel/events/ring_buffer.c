@@ -39,7 +39,12 @@ static void perf_output_get_handle(struct perf_output_handle *handle)
 	struct ring_buffer *rb = handle->rb;
 
 	preempt_disable();
-	local_inc(&rb->nest);
+
+	/*
+	 * Avoid an explicit LOAD/STORE such that architectures with memops
+	 * can use them.
+	 */
+	(*(volatile unsigned int *)&rb->nest)++;
 	handle->wakeup = local_read(&rb->wakeup);
 }
 
@@ -47,6 +52,17 @@ static void perf_output_put_handle(struct perf_output_handle *handle)
 {
 	struct ring_buffer *rb = handle->rb;
 	unsigned long head;
+	unsigned int nest;
+
+	/*
+	 * If this isn't the outermost nesting, we don't have to update
+	 * @rb->user_page->data_head.
+	 */
+	nest = READ_ONCE(rb->nest);
+	if (nest > 1) {
+		WRITE_ONCE(rb->nest, nest - 1);
+		goto out;
+	}
 
 again:
 	/*
@@ -64,15 +80,6 @@ again:
 	 * IRQ/NMI can happen here and advance @rb->head, causing our
 	 * load above to be stale.
 	 */
-
-	/*
-	 * If this isn't the outermost nesting, we don't have to update
-	 * @rb->user_page->data_head.
-	 */
-	if (local_read(&rb->nest) > 1) {
-		local_dec(&rb->nest);
-		goto out;
-	}
 
 	/*
 	 * Since the mmap() consumer (userspace) can run on a different CPU:
@@ -109,7 +116,7 @@ again:
 	 * write will (temporarily) publish a stale value.
 	 */
 	barrier();
-	local_set(&rb->nest, 0);
+	WRITE_ONCE(rb->nest, 0);
 
 	/*
 	 * Ensure we decrement @rb->nest before we validate the @rb->head.
@@ -117,7 +124,7 @@ again:
 	 */
 	barrier();
 	if (unlikely(head != local_read(&rb->head))) {
-		local_inc(&rb->nest);
+		WRITE_ONCE(rb->nest, 1);
 		goto again;
 	}
 
@@ -356,6 +363,7 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 	struct perf_event *output_event = event;
 	unsigned long aux_head, aux_tail;
 	struct ring_buffer *rb;
+	unsigned int nest;
 
 	if (output_event->parent)
 		output_event = output_event->parent;
@@ -386,12 +394,15 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 	if (!refcount_inc_not_zero(&rb->aux_refcount))
 		goto err;
 
+	nest = READ_ONCE(rb->aux_nest);
 	/*
 	 * Nesting is not supported for AUX area, make sure nested
 	 * writers are caught early
 	 */
-	if (WARN_ON_ONCE(local_xchg(&rb->aux_nest, 1)))
+	if (WARN_ON_ONCE(nest))
 		goto err_put;
+
+	WRITE_ONCE(rb->aux_nest, nest + 1);
 
 	aux_head = rb->aux_head;
 
@@ -420,7 +431,7 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 		if (!handle->size) { /* A, matches D */
 			event->pending_disable = smp_processor_id();
 			perf_output_wakeup(handle);
-			local_set(&rb->aux_nest, 0);
+			WRITE_ONCE(rb->aux_nest, 0);
 			goto err_put;
 		}
 	}
@@ -509,7 +520,7 @@ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size)
 
 	handle->event = NULL;
 
-	local_set(&rb->aux_nest, 0);
+	WRITE_ONCE(rb->aux_nest, 0);
 	/* can't be last */
 	rb_free_aux(rb);
 	ring_buffer_put(rb);
