@@ -1,0 +1,168 @@
+xfs: support returning partial reflink results
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 3f68c1f562f1e4c5e1a515b392a2e0a509a342d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/3f68c1f5.failed
+
+Back when the XFS reflink code only supported clone_file_range, we were
+only able to return zero or negative error codes to userspace.  However,
+now that copy_file_range (which returns bytes copied) can use XFS'
+clone_file_range, we have the opportunity to return partial results.
+For example, if userspace sends a 1GB clone request and we run out of
+space halfway through, we at least can tell userspace that we completed
+512M of that request like a regular write.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 3f68c1f562f1e4c5e1a515b392a2e0a509a342d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_reflink.h
+diff --cc fs/xfs/xfs_file.c
+index 61a5ad2600e8,7d42ab8fe6e1..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -919,28 -919,20 +919,36 @@@ out_unlock
+  	return error;
+  }
+  
+ -STATIC loff_t
+ -xfs_file_remap_range(
+ +STATIC int
+ +xfs_file_clone_range(
+ +	struct file	*file_in,
+ +	loff_t		pos_in,
+ +	struct file	*file_out,
+ +	loff_t		pos_out,
+ +	u64		len)
+ +{
+++<<<<<<< HEAD
+ +	return xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +				     len, false);
+ +}
+ +
+ +STATIC int
+ +xfs_file_dedupe_range(
+  	struct file	*file_in,
+  	loff_t		pos_in,
+  	struct file	*file_out,
+  	loff_t		pos_out,
+ -	loff_t		len,
+ -	unsigned int	remap_flags)
+ +	u64		len)
+  {
+ +	return xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +				     len, true);
+++=======
++ 	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_ADVISORY))
++ 		return -EINVAL;
++ 
++ 	return xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
++ 			len, remap_flags);
+++>>>>>>> 3f68c1f562f1 (xfs: support returning partial reflink results)
+  }
+  
+  STATIC int
+diff --cc fs/xfs/xfs_reflink.h
+index c585ad9552b2,cbc26ff79a8f..000000000000
+--- a/fs/xfs/xfs_reflink.h
++++ b/fs/xfs/xfs_reflink.h
+@@@ -27,8 -27,9 +27,14 @@@ extern int xfs_reflink_cancel_cow_range
+  extern int xfs_reflink_end_cow(struct xfs_inode *ip, xfs_off_t offset,
+  		xfs_off_t count);
+  extern int xfs_reflink_recover_cow(struct xfs_mount *mp);
+++<<<<<<< HEAD
+ +extern int xfs_reflink_remap_range(struct file *file_in, loff_t pos_in,
+ +		struct file *file_out, loff_t pos_out, u64 len, bool is_dedupe);
+++=======
++ extern loff_t xfs_reflink_remap_range(struct file *file_in, loff_t pos_in,
++ 		struct file *file_out, loff_t pos_out, loff_t len,
++ 		unsigned int remap_flags);
+++>>>>>>> 3f68c1f562f1 (xfs: support returning partial reflink results)
+  extern int xfs_reflink_inode_has_shared_extents(struct xfs_trans *tp,
+  		struct xfs_inode *ip, bool *has_shared);
+  extern int xfs_reflink_clear_inode_flag(struct xfs_inode *ip,
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index c17089911875..1689395fc841 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -1121,13 +1121,15 @@ xfs_reflink_remap_blocks(
+ 	loff_t			pos_in,
+ 	struct xfs_inode	*dest,
+ 	loff_t			pos_out,
+-	loff_t			remap_len)
++	loff_t			remap_len,
++	loff_t			*remapped)
+ {
+ 	struct xfs_bmbt_irec	imap;
+ 	xfs_fileoff_t		srcoff;
+ 	xfs_fileoff_t		destoff;
+ 	xfs_filblks_t		len;
+ 	xfs_filblks_t		range_len;
++	xfs_filblks_t		remapped_len = 0;
+ 	xfs_off_t		new_isize = pos_out + remap_len;
+ 	int			nimaps;
+ 	int			error = 0;
+@@ -1174,10 +1176,13 @@ xfs_reflink_remap_blocks(
+ 		srcoff += range_len;
+ 		destoff += range_len;
+ 		len -= range_len;
++		remapped_len += range_len;
+ 	}
+ 
+ 	if (error)
+ 		trace_xfs_reflink_remap_blocks_error(dest, error, _RET_IP_);
++	*remapped = min_t(loff_t, remap_len,
++			  XFS_FSB_TO_B(src->i_mount, remapped_len));
+ 	return error;
+ }
+ 
+@@ -1409,7 +1414,7 @@ xfs_reflink_remap_prep(
+ /*
+  * Link a range of blocks from one file to another.
+  */
+-int
++loff_t
+ xfs_reflink_remap_range(
+ 	struct file		*file_in,
+ 	loff_t			pos_in,
+@@ -1423,8 +1428,9 @@ xfs_reflink_remap_range(
+ 	struct inode		*inode_out = file_inode(file_out);
+ 	struct xfs_inode	*dest = XFS_I(inode_out);
+ 	struct xfs_mount	*mp = src->i_mount;
++	loff_t			remapped = 0;
+ 	xfs_extlen_t		cowextsize;
+-	ssize_t			ret;
++	int			ret;
+ 
+ 	if (!xfs_sb_version_hasreflink(&mp->m_sb))
+ 		return -EOPNOTSUPP;
+@@ -1440,7 +1446,8 @@ xfs_reflink_remap_range(
+ 
+ 	trace_xfs_reflink_remap_range(src, pos_in, len, dest, pos_out);
+ 
+-	ret = xfs_reflink_remap_blocks(src, pos_in, dest, pos_out, len);
++	ret = xfs_reflink_remap_blocks(src, pos_in, dest, pos_out, len,
++			&remapped);
+ 	if (ret)
+ 		goto out_unlock;
+ 
+@@ -1463,7 +1470,7 @@ xfs_reflink_remap_range(
+ 	xfs_reflink_remap_unlock(file_in, file_out);
+ 	if (ret)
+ 		trace_xfs_reflink_remap_range_error(dest, ret, _RET_IP_);
+-	return ret;
++	return remapped > 0 ? remapped : ret;
+ }
+ 
+ /*
+* Unmerged path fs/xfs/xfs_reflink.h
