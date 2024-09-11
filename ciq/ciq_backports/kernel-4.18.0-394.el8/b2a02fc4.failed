@@ -1,0 +1,131 @@
+smp: Optimize send_call_function_single_ipi()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit b2a02fc43a1f40ef4eb2fb2b06357382608d4d84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/b2a02fc4.failed
+
+Just like the ttwu_queue_remote() IPI, make use of _TIF_POLLING_NRFLAG
+to avoid sending IPIs to idle CPUs.
+
+[ mingo: Fix UP build bug. ]
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20200526161907.953304789@infradead.org
+(cherry picked from commit b2a02fc43a1f40ef4eb2fb2b06357382608d4d84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 631f3e8030ae,fa0d4990618e..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -2396,14 -2296,14 +2396,25 @@@ static void wake_csd_func(void *info
+  	sched_ttwu_pending();
+  }
+  
+++<<<<<<< HEAD
+ +void scheduler_ipi(void)
+ +{
+ +	/*
+ +	 * Fold TIF_NEED_RESCHED into the preempt_count; anybody setting
+ +	 * TIF_NEED_RESCHED remotely (for the first time) will also send
+ +	 * this IPI.
+ +	 */
+ +	preempt_fold_need_resched();
+++=======
++ void send_call_function_single_ipi(int cpu)
++ {
++ 	struct rq *rq = cpu_rq(cpu);
++ 
++ 	if (!set_nr_if_polling(rq->idle))
++ 		arch_send_call_function_single_ipi(cpu);
++ 	else
++ 		trace_sched_wake_idle_without_ipi(cpu);
+++>>>>>>> b2a02fc43a1f (smp: Optimize send_call_function_single_ipi())
+  }
+  
+  /*
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index 7203381da5c0..fbe4ef1bbe19 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -295,6 +295,11 @@ static void do_idle(void)
+ 	 */
+ 	smp_mb__after_atomic();
+ 
++	/*
++	 * RCU relies on this call to be done outside of an RCU read-side
++	 * critical section.
++	 */
++	flush_smp_call_function_from_idle();
+ 	sched_ttwu_pending();
+ 	schedule_idle();
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 018da337e9e4..ec49ce1404ee 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1575,11 +1575,12 @@ static inline void unregister_sched_domain_sysctl(void)
+ }
+ #endif
+ 
+-#else
++extern void flush_smp_call_function_from_idle(void);
+ 
++#else /* !CONFIG_SMP: */
++static inline void flush_smp_call_function_from_idle(void) { }
+ static inline void sched_ttwu_pending(void) { }
+-
+-#endif /* CONFIG_SMP */
++#endif
+ 
+ #include "stats.h"
+ #include "autogroup.h"
+diff --git a/kernel/smp.c b/kernel/smp.c
+index db3e44b3aed3..a438bc2da600 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -134,6 +134,8 @@ static __always_inline void csd_unlock(call_single_data_t *csd)
+ 
+ static DEFINE_PER_CPU_SHARED_ALIGNED(call_single_data_t, csd_data);
+ 
++extern void send_call_function_single_ipi(int cpu);
++
+ /*
+  * Insert a previously allocated call_single_data_t element
+  * for execution on the given CPU. data must already have
+@@ -177,7 +179,7 @@ static int generic_exec_single(int cpu, call_single_data_t *csd,
+ 	 * equipped to do the right thing...
+ 	 */
+ 	if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
+-		arch_send_call_function_single_ipi(cpu);
++		send_call_function_single_ipi(cpu);
+ 
+ 	return 0;
+ }
+@@ -277,6 +279,18 @@ static void flush_smp_call_function_queue(bool warn_cpu_offline)
+ 	}
+ }
+ 
++void flush_smp_call_function_from_idle(void)
++{
++	unsigned long flags;
++
++	if (llist_empty(this_cpu_ptr(&call_single_queue)))
++		return;
++
++	local_irq_save(flags);
++	flush_smp_call_function_queue(true);
++	local_irq_restore(flags);
++}
++
+ /*
+  * smp_call_function_single - Run a function on a specific CPU
+  * @func: The function to run. This must be fast and non-blocking.
