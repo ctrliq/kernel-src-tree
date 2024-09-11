@@ -1,0 +1,151 @@
+perf/x86/intel: Fix fixed counter check warning for some Alder Lake
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit ee72a94ea4a6d8fa304a506859cd07ecdc0cf5c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/ee72a94e.failed
+
+For some Alder Lake machine, the below fixed counter check warning may be
+triggered.
+
+[    2.010766] hw perf events fixed 5 > max(4), clipping!
+
+Current perf unconditionally increases the number of the GP counters and
+the fixed counters for a big core PMU on an Alder Lake system, because
+the number enumerated in the CPUID only reflects the common counters.
+The big core may has more counters. However, Alder Lake may have an
+alternative configuration. With that configuration,
+the X86_FEATURE_HYBRID_CPU is not set. The number of the GP counters and
+fixed counters enumerated in the CPUID is accurate. Perf mistakenly
+increases the number of counters. The warning is triggered.
+
+Directly use the enumerated value on the system with the alternative
+configuration.
+
+Fixes: f83d2f91d259 ("perf/x86/intel: Add Alder Lake Hybrid support")
+	Reported-by: Jin Yao <yao.jin@linux.intel.com>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/1624029174-122219-2-git-send-email-kan.liang@linux.intel.com
+(cherry picked from commit ee72a94ea4a6d8fa304a506859cd07ecdc0cf5c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/core.c
+diff --cc arch/x86/events/intel/core.c
+index 802b59942b31,d39991b93f4a..000000000000
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@@ -5866,6 -6104,104 +5866,107 @@@ __init int intel_pmu_init(void
+  		name = "sapphire_rapids";
+  		break;
+  
+++<<<<<<< HEAD
+++=======
++ 	case INTEL_FAM6_ALDERLAKE:
++ 	case INTEL_FAM6_ALDERLAKE_L:
++ 		/*
++ 		 * Alder Lake has 2 types of CPU, core and atom.
++ 		 *
++ 		 * Initialize the common PerfMon capabilities here.
++ 		 */
++ 		x86_pmu.hybrid_pmu = kcalloc(X86_HYBRID_NUM_PMUS,
++ 					     sizeof(struct x86_hybrid_pmu),
++ 					     GFP_KERNEL);
++ 		if (!x86_pmu.hybrid_pmu)
++ 			return -ENOMEM;
++ 		static_branch_enable(&perf_is_hybrid);
++ 		x86_pmu.num_hybrid_pmus = X86_HYBRID_NUM_PMUS;
++ 
++ 		x86_pmu.late_ack = true;
++ 		x86_pmu.pebs_aliases = NULL;
++ 		x86_pmu.pebs_prec_dist = true;
++ 		x86_pmu.pebs_block = true;
++ 		x86_pmu.flags |= PMU_FL_HAS_RSP_1;
++ 		x86_pmu.flags |= PMU_FL_NO_HT_SHARING;
++ 		x86_pmu.flags |= PMU_FL_PEBS_ALL;
++ 		x86_pmu.flags |= PMU_FL_INSTR_LATENCY;
++ 		x86_pmu.flags |= PMU_FL_MEM_LOADS_AUX;
++ 		x86_pmu.lbr_pt_coexist = true;
++ 		intel_pmu_pebs_data_source_skl(false);
++ 		x86_pmu.num_topdown_events = 8;
++ 		x86_pmu.update_topdown_event = adl_update_topdown_event;
++ 		x86_pmu.set_topdown_event_period = adl_set_topdown_event_period;
++ 
++ 		x86_pmu.filter_match = intel_pmu_filter_match;
++ 		x86_pmu.get_event_constraints = adl_get_event_constraints;
++ 		x86_pmu.hw_config = adl_hw_config;
++ 		x86_pmu.limit_period = spr_limit_period;
++ 		x86_pmu.get_hybrid_cpu_type = adl_get_hybrid_cpu_type;
++ 		/*
++ 		 * The rtm_abort_event is used to check whether to enable GPRs
++ 		 * for the RTM abort event. Atom doesn't have the RTM abort
++ 		 * event. There is no harmful to set it in the common
++ 		 * x86_pmu.rtm_abort_event.
++ 		 */
++ 		x86_pmu.rtm_abort_event = X86_CONFIG(.event=0xc9, .umask=0x04);
++ 
++ 		td_attr = adl_hybrid_events_attrs;
++ 		mem_attr = adl_hybrid_mem_attrs;
++ 		tsx_attr = adl_hybrid_tsx_attrs;
++ 		extra_attr = boot_cpu_has(X86_FEATURE_RTM) ?
++ 			adl_hybrid_extra_attr_rtm : adl_hybrid_extra_attr;
++ 
++ 		/* Initialize big core specific PerfMon capabilities.*/
++ 		pmu = &x86_pmu.hybrid_pmu[X86_HYBRID_PMU_CORE_IDX];
++ 		pmu->name = "cpu_core";
++ 		pmu->cpu_type = hybrid_big;
++ 		if (cpu_feature_enabled(X86_FEATURE_HYBRID_CPU)) {
++ 			pmu->num_counters = x86_pmu.num_counters + 2;
++ 			pmu->num_counters_fixed = x86_pmu.num_counters_fixed + 1;
++ 		} else {
++ 			pmu->num_counters = x86_pmu.num_counters;
++ 			pmu->num_counters_fixed = x86_pmu.num_counters_fixed;
++ 		}
++ 		pmu->max_pebs_events = min_t(unsigned, MAX_PEBS_EVENTS, pmu->num_counters);
++ 		pmu->unconstrained = (struct event_constraint)
++ 					__EVENT_CONSTRAINT(0, (1ULL << pmu->num_counters) - 1,
++ 							   0, pmu->num_counters, 0, 0);
++ 		pmu->intel_cap.capabilities = x86_pmu.intel_cap.capabilities;
++ 		pmu->intel_cap.perf_metrics = 1;
++ 		pmu->intel_cap.pebs_output_pt_available = 0;
++ 
++ 		memcpy(pmu->hw_cache_event_ids, spr_hw_cache_event_ids, sizeof(pmu->hw_cache_event_ids));
++ 		memcpy(pmu->hw_cache_extra_regs, spr_hw_cache_extra_regs, sizeof(pmu->hw_cache_extra_regs));
++ 		pmu->event_constraints = intel_spr_event_constraints;
++ 		pmu->pebs_constraints = intel_spr_pebs_event_constraints;
++ 		pmu->extra_regs = intel_spr_extra_regs;
++ 
++ 		/* Initialize Atom core specific PerfMon capabilities.*/
++ 		pmu = &x86_pmu.hybrid_pmu[X86_HYBRID_PMU_ATOM_IDX];
++ 		pmu->name = "cpu_atom";
++ 		pmu->cpu_type = hybrid_small;
++ 		pmu->num_counters = x86_pmu.num_counters;
++ 		pmu->num_counters_fixed = x86_pmu.num_counters_fixed;
++ 		pmu->max_pebs_events = x86_pmu.max_pebs_events;
++ 		pmu->unconstrained = (struct event_constraint)
++ 					__EVENT_CONSTRAINT(0, (1ULL << pmu->num_counters) - 1,
++ 							   0, pmu->num_counters, 0, 0);
++ 		pmu->intel_cap.capabilities = x86_pmu.intel_cap.capabilities;
++ 		pmu->intel_cap.perf_metrics = 0;
++ 		pmu->intel_cap.pebs_output_pt_available = 1;
++ 
++ 		memcpy(pmu->hw_cache_event_ids, glp_hw_cache_event_ids, sizeof(pmu->hw_cache_event_ids));
++ 		memcpy(pmu->hw_cache_extra_regs, tnt_hw_cache_extra_regs, sizeof(pmu->hw_cache_extra_regs));
++ 		pmu->hw_cache_event_ids[C(ITLB)][C(OP_READ)][C(RESULT_ACCESS)] = -1;
++ 		pmu->event_constraints = intel_slm_event_constraints;
++ 		pmu->pebs_constraints = intel_grt_pebs_event_constraints;
++ 		pmu->extra_regs = intel_grt_extra_regs;
++ 		pr_cont("Alderlake Hybrid events, ");
++ 		name = "alderlake_hybrid";
++ 		break;
++ 
+++>>>>>>> ee72a94ea4a6 (perf/x86/intel: Fix fixed counter check warning for some Alder Lake)
+  	default:
+  		switch (x86_pmu.version) {
+  		case 1:
+* Unmerged path arch/x86/events/intel/core.c
