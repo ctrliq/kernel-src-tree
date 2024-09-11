@@ -1,0 +1,194 @@
+mm/memremap: add ZONE_DEVICE support for compound pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Joao Martins <joao.m.martins@oracle.com>
+commit c4386bd8ee3a921c3c799b7197dc898ade76a453
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/c4386bd8.failed
+
+Add a new @vmemmap_shift property for struct dev_pagemap which specifies
+that a devmap is composed of a set of compound pages of order
+@vmemmap_shift, instead of base pages.  When a compound page devmap is
+requested, all but the first page are initialised as tail pages instead
+of order-0 pages.
+
+For certain ZONE_DEVICE users like device-dax which have a fixed page
+size, this creates an opportunity to optimize GUP and GUP-fast walkers,
+treating it the same way as THP or hugetlb pages.
+
+Additionally, commit 7118fc2906e2 ("hugetlb: address ref count racing in
+prep_compound_gigantic_page") removed set_page_count() because the
+setting of page ref count to zero was redundant.  devmap pages don't
+come from page allocator though and only head page refcount is used for
+compound pages, hence initialize tail page count to zero.
+
+Link: https://lkml.kernel.org/r/20211202204422.26777-5-joao.m.martins@oracle.com
+	Signed-off-by: Joao Martins <joao.m.martins@oracle.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dave Jiang <dave.jiang@intel.com>
+	Cc: Jane Chu <jane.chu@oracle.com>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Muchun Song <songmuchun@bytedance.com>
+	Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+	Cc: Vishal Verma <vishal.l.verma@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c4386bd8ee3a921c3c799b7197dc898ade76a453)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memremap.h
+diff --cc include/linux/memremap.h
+index 34d0e54d38c4,61a6a0e27359..000000000000
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@@ -125,23 -113,16 +130,31 @@@ struct dev_pagemap_ops 
+   * @ranges: array of ranges to be mapped when nr_range > 1
+   */
+  struct dev_pagemap {
+ +	RH_KABI_DEPRECATE(dev_page_fault_t, page_fault)
+ +	RH_KABI_DEPRECATE(dev_page_free_t, page_free)
+  	struct vmem_altmap altmap;
+ +	RH_KABI_DEPRECATE(bool, altmap_valid)
+ +	RH_KABI_DEPRECATE(struct resource, res)
+  	struct percpu_ref *ref;
+ -	struct percpu_ref internal_ref;
+ -	struct completion done;
+ +	RH_KABI_DEPRECATE(struct device *, dev)
+ +	RH_KABI_DEPRECATE(void *, data)
+  	enum memory_type type;
+++<<<<<<< HEAD
+ +	RH_KABI_DEPRECATE(u64, pci_p2pdma_bus_offset)
+ +	RH_KABI_EXTEND(const struct dev_pagemap_ops *ops)
+ +	RH_KABI_EXTEND(unsigned int flags)
+ +	RH_KABI_EXTEND(struct percpu_ref internal_ref)
+ +	RH_KABI_EXTEND(struct completion done)
+ +	RH_KABI_EXTEND(void *owner)
+ +	RH_KABI_EXTEND(int nr_range)
+ +	RH_KABI_BROKEN_INSERT_BLOCK(
+++=======
++ 	unsigned int flags;
++ 	unsigned long vmemmap_shift;
++ 	const struct dev_pagemap_ops *ops;
++ 	void *owner;
++ 	int nr_range;
+++>>>>>>> c4386bd8ee3a (mm/memremap: add ZONE_DEVICE support for compound pages)
+  	union {
+  		struct range range;
+  		struct range ranges[0];
+* Unmerged path include/linux/memremap.h
+diff --git a/mm/memremap.c b/mm/memremap.c
+index 2455bac89506..21dee7e50567 100644
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@ -102,15 +102,22 @@ static unsigned long pfn_end(struct dev_pagemap *pgmap, int range_id)
+ 	return (range->start + range_len(range)) >> PAGE_SHIFT;
+ }
+ 
+-static unsigned long pfn_next(unsigned long pfn)
++static unsigned long pfn_next(struct dev_pagemap *pgmap, unsigned long pfn)
+ {
+-	if (pfn % 1024 == 0)
++	if (pfn % (1024 << pgmap->vmemmap_shift))
+ 		cond_resched();
+-	return pfn + 1;
++	return pfn + pgmap_vmemmap_nr(pgmap);
++}
++
++static unsigned long pfn_len(struct dev_pagemap *pgmap, unsigned long range_id)
++{
++	return (pfn_end(pgmap, range_id) -
++		pfn_first(pgmap, range_id)) >> pgmap->vmemmap_shift;
+ }
+ 
+ #define for_each_device_pfn(pfn, map, i) \
+-	for (pfn = pfn_first(map, i); pfn < pfn_end(map, i); pfn = pfn_next(pfn))
++	for (pfn = pfn_first(map, i); pfn < pfn_end(map, i); \
++	     pfn = pfn_next(map, pfn))
+ 
+ static void dev_pagemap_kill(struct dev_pagemap *pgmap)
+ {
+@@ -292,8 +299,7 @@ static int pagemap_range(struct dev_pagemap *pgmap, struct mhp_params *params,
+ 	memmap_init_zone_device(&NODE_DATA(nid)->node_zones[ZONE_DEVICE],
+ 				PHYS_PFN(range->start),
+ 				PHYS_PFN(range_len(range)), pgmap);
+-	percpu_ref_get_many(pgmap->ref, pfn_end(pgmap, range_id)
+-			- pfn_first(pgmap, range_id));
++	percpu_ref_get_many(pgmap->ref, pfn_len(pgmap, range_id));
+ 	return 0;
+ 
+ err_add_memory:
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 67f29fa563d0..3719980e2345 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6217,6 +6217,35 @@ static void __ref __init_zone_device_page(struct page *page, unsigned long pfn,
+ 	}
+ }
+ 
++static void __ref memmap_init_compound(struct page *head,
++				       unsigned long head_pfn,
++				       unsigned long zone_idx, int nid,
++				       struct dev_pagemap *pgmap,
++				       unsigned long nr_pages)
++{
++	unsigned long pfn, end_pfn = head_pfn + nr_pages;
++	unsigned int order = pgmap->vmemmap_shift;
++
++	__SetPageHead(head);
++	for (pfn = head_pfn + 1; pfn < end_pfn; pfn++) {
++		struct page *page = pfn_to_page(pfn);
++
++		__init_zone_device_page(page, pfn, zone_idx, nid, pgmap);
++		prep_compound_tail(head, pfn - head_pfn);
++		set_page_count(page, 0);
++
++		/*
++		 * The first tail page stores compound_mapcount_ptr() and
++		 * compound_order() and the second tail page stores
++		 * compound_pincount_ptr(). Call prep_compound_head() after
++		 * the first and second tail pages have been initialized to
++		 * not have the data overwritten.
++		 */
++		if (pfn == head_pfn + 2)
++			prep_compound_head(head, order);
++	}
++}
++
+ void __ref memmap_init_zone_device(struct zone *zone,
+ 				   unsigned long start_pfn,
+ 				   unsigned long nr_pages,
+@@ -6225,6 +6254,7 @@ void __ref memmap_init_zone_device(struct zone *zone,
+ 	unsigned long pfn, end_pfn = start_pfn + nr_pages;
+ 	struct pglist_data *pgdat = zone->zone_pgdat;
+ 	struct vmem_altmap *altmap = pgmap_altmap(pgmap);
++	unsigned int pfns_per_compound = pgmap_vmemmap_nr(pgmap);
+ 	unsigned long zone_idx = zone_idx(zone);
+ 	unsigned long start = jiffies;
+ 	int nid = pgdat->node_id;
+@@ -6242,10 +6272,16 @@ void __ref memmap_init_zone_device(struct zone *zone,
+ 		nr_pages = end_pfn - start_pfn;
+ 	}
+ 
+-	for (pfn = start_pfn; pfn < end_pfn; pfn++) {
++	for (pfn = start_pfn; pfn < end_pfn; pfn += pfns_per_compound) {
+ 		struct page *page = pfn_to_page(pfn);
+ 
+ 		__init_zone_device_page(page, pfn, zone_idx, nid, pgmap);
++
++		if (pfns_per_compound == 1)
++			continue;
++
++		memmap_init_compound(page, pfn, zone_idx, nid, pgmap,
++				     pfns_per_compound);
+ 	}
+ 
+ 	pr_info("%s initialised %lu pages in %ums\n", __func__,
