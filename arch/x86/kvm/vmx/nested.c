@@ -1079,21 +1079,20 @@ static bool nested_cr3_valid(struct kvm_vcpu *vcpu, unsigned long val)
 static int nested_vmx_load_cr3(struct kvm_vcpu *vcpu, unsigned long cr3, bool nested_ept,
 			       u32 *entry_failure_code)
 {
-	if (cr3 != kvm_read_cr3(vcpu) || (!nested_ept && pdptrs_changed(vcpu))) {
-		if (CC(!nested_cr3_valid(vcpu, cr3))) {
-			*entry_failure_code = ENTRY_FAIL_DEFAULT;
-			return -EINVAL;
-		}
+	if (CC(!nested_cr3_valid(vcpu, cr3))) {
+		*entry_failure_code = ENTRY_FAIL_DEFAULT;
+		return -EINVAL;
+	}
 
-		/*
-		 * If PAE paging and EPT are both on, CR3 is not used by the CPU and
-		 * must not be dereferenced.
-		 */
-		if (is_pae_paging(vcpu) && !nested_ept) {
-			if (CC(!load_pdptrs(vcpu, vcpu->arch.walk_mmu, cr3))) {
-				*entry_failure_code = ENTRY_FAIL_PDPTE;
-				return -EINVAL;
-			}
+	/*
+	 * If PAE paging and EPT are both on, CR3 is not used by the CPU and
+	 * must not be dereferenced.
+	 */
+	if (!nested_ept && is_pae_paging(vcpu) &&
+	    (cr3 != kvm_read_cr3(vcpu) || pdptrs_changed(vcpu))) {
+		if (CC(!load_pdptrs(vcpu, vcpu->arch.walk_mmu, cr3))) {
+			*entry_failure_code = ENTRY_FAIL_PDPTE;
+			return -EINVAL;
 		}
 	}
 
