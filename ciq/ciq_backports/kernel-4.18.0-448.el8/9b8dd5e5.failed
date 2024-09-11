@@ -1,0 +1,107 @@
+gve: DQO: Add RX path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Bailey Forrest <bcf@google.com>
+commit 9b8dd5e5ea48bbb7532d20c4093a79d8283e4029
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9b8dd5e5.failed
+
+The RX queue has an array of `gve_rx_buf_state_dqo` objects. All
+allocated pages have an associated buf_state object. When a buffer is
+posted on the RX buffer queue, the buffer ID will be the buf_state's
+index into the RX queue's array.
+
+On packet reception, the RX queue will have one descriptor for each
+buffer associated with a received packet. Each RX descriptor will have
+a buffer_id that was posted on the buffer queue.
+
+Notable mentions:
+
+- We use a default buffer size of 2048 bytes. Based on page size, we
+  may post separate sections of a single page as separate buffers.
+
+- The driver holds an extra reference on pages passed up the receive
+  path with an skb and keeps these pages on a list. When posting new
+  buffers to the NIC, we check if any of these pages has only our
+  reference, or another buffer sized segment of the page has no
+  references. If so, it is free to reuse. This page recycling approach
+  is a common netdev optimization that reduces page alloc/free calls.
+
+- Pages in the free list have a page_count bias in order to avoid an
+  atomic increment of pagecount every time we attempt to reuse a page.
+  # references = page_count() - bias
+
+- In order to track when a page is safe to reuse, we keep track of the
+  last offset which had a single SKB reference. When this occurs, it
+  implies that every single other offset is reusable. Otherwise, we
+  don't know if offsets can be safely reused.
+
+- We maintain two free lists of pages. List #1 (recycled_buf_states)
+  contains pages we know can be reused right away. List #2
+  (used_buf_states) contains pages which cannot be used right away. We
+  only attempt to get pages from list #2 when list #1 is empty. We only
+  attempt to use a small fixed number pages from list #2 before giving
+  up and allocating a new page. Both lists are FIFOs in hope that by the
+  time we attempt to reuse a page, the references were dropped.
+
+	Signed-off-by: Bailey Forrest <bcf@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Reviewed-by: Catherine Sullivan <csully@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9b8dd5e5ea48bbb7532d20c4093a79d8283e4029)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve_rx_dqo.c
+* Unmerged path drivers/net/ethernet/google/gve/gve_rx_dqo.c
+diff --git a/drivers/net/ethernet/google/gve/gve.h b/drivers/net/ethernet/google/gve/gve.h
+index c3c095d645bd..d3ed1a12d974 100644
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@ -53,6 +53,7 @@ struct gve_rx_slot_page_info {
+ 	struct page *page;
+ 	void *page_address;
+ 	u32 page_offset; /* offset to write to in page */
++	int pagecnt_bias; /* expected pagecnt if only the driver has a ref */
+ 	u8 can_flip;
+ };
+ 
+* Unmerged path drivers/net/ethernet/google/gve/gve_rx_dqo.c
+diff --git a/drivers/net/ethernet/google/gve/gve_utils.c b/drivers/net/ethernet/google/gve/gve_utils.c
+index a0607a824ab9..93f3dcbeeea9 100644
+--- a/drivers/net/ethernet/google/gve/gve_utils.c
++++ b/drivers/net/ethernet/google/gve/gve_utils.c
+@@ -64,3 +64,18 @@ struct sk_buff *gve_rx_copy(struct net_device *dev, struct napi_struct *napi,
+ 	return skb;
+ }
+ 
++void gve_dec_pagecnt_bias(struct gve_rx_slot_page_info *page_info)
++{
++	page_info->pagecnt_bias--;
++	if (page_info->pagecnt_bias == 0) {
++		int pagecount = page_count(page_info->page);
++
++		/* If we have run out of bias - set it back up to INT_MAX
++		 * minus the existing refs.
++		 */
++		page_info->pagecnt_bias = INT_MAX - pagecount;
++
++		/* Set pagecount back up to max. */
++		page_ref_add(page_info->page, INT_MAX - pagecount);
++	}
++}
+diff --git a/drivers/net/ethernet/google/gve/gve_utils.h b/drivers/net/ethernet/google/gve/gve_utils.h
+index 8fb39b990bbc..79595940b351 100644
+--- a/drivers/net/ethernet/google/gve/gve_utils.h
++++ b/drivers/net/ethernet/google/gve/gve_utils.h
+@@ -21,5 +21,8 @@ struct sk_buff *gve_rx_copy(struct net_device *dev, struct napi_struct *napi,
+ 			    struct gve_rx_slot_page_info *page_info, u16 len,
+ 			    u16 pad);
+ 
++/* Decrement pagecnt_bias. Set it back to INT_MAX if it reached zero. */
++void gve_dec_pagecnt_bias(struct gve_rx_slot_page_info *page_info);
++
+ #endif /* _GVE_UTILS_H */
+ 
