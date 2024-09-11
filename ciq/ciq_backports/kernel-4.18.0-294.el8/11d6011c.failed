@@ -1,0 +1,100 @@
+net: core: device_rename: Use rwsem instead of a seqcount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] core: device_rename: Use rwsem instead of a seqcount (Patrick Talbert) [1883310]
+Rebuild_FUZZ: 95.41%
+commit-author Ahmed S. Darwish <a.darwish@linutronix.de>
+commit 11d6011c2cf29f7c8181ebde6c8bc0c4d83adcd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/11d6011c.failed
+
+Sequence counters write paths are critical sections that must never be
+preempted, and blocking, even for CONFIG_PREEMPTION=n, is not allowed.
+
+Commit 5dbe7c178d3f ("net: fix kernel deadlock with interface rename and
+netdev name retrieval.") handled a deadlock, observed with
+CONFIG_PREEMPTION=n, where the devnet_rename seqcount read side was
+infinitely spinning: it got scheduled after the seqcount write side
+blocked inside its own critical section.
+
+To fix that deadlock, among other issues, the commit added a
+cond_resched() inside the read side section. While this will get the
+non-preemptible kernel eventually unstuck, the seqcount reader is fully
+exhausting its slice just spinning -- until TIF_NEED_RESCHED is set.
+
+The fix is also still broken: if the seqcount reader belongs to a
+real-time scheduling policy, it can spin forever and the kernel will
+livelock.
+
+Disabling preemption over the seqcount write side critical section will
+not work: inside it are a number of GFP_KERNEL allocations and mutex
+locking through the drivers/base/ :: device_rename() call chain.
+
+>From all the above, replace the seqcount with a rwsem.
+
+Fixes: 5dbe7c178d3f (net: fix kernel deadlock with interface rename and netdev name retrieval.)
+Fixes: 30e6c9fa93cf (net: devnet_rename_seq should be a seqcount)
+Fixes: c91f6df2db49 (sockopt: Change getsockopt() of SO_BINDTODEVICE to return an interface name)
+	Cc: <stable@vger.kernel.org>
+	Reported-by: kbuild test robot <lkp@intel.com> [ v1 missing up_read() on error exit ]
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com> [ v1 missing up_read() on error exit ]
+	Signed-off-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+	Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 11d6011c2cf29f7c8181ebde6c8bc0c4d83adcd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 65c2a5d350fc,061496a1f640..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -824,10 -999,6 +825,13 @@@ EXPORT_SYMBOL(dev_get_by_napi_id)
+   *	@net: network namespace
+   *	@name: a pointer to the buffer where the name will be stored.
+   *	@ifindex: the ifindex of the interface to get the name from.
+++<<<<<<< HEAD
+ + *
+ + *	The use of raw_seqcount_begin() and cond_resched() before
+ + *	retrying is required as we want to give the writers a chance
+ + *	to complete when CONFIG_PREEMPT is not set.
+++=======
+++>>>>>>> 11d6011c2cf2 (net: core: device_rename: Use rwsem instead of a seqcount)
+   */
+  int netdev_get_name(struct net *net, char *name, int ifindex)
+  {
+@@@ -1106,13 -1275,27 +1109,13 @@@ int dev_change_name(struct net_device *
+  	BUG_ON(!dev_net(dev));
+  
+  	net = dev_net(dev);
+ -
+ -	/* Some auto-enslaved devices e.g. failover slaves are
+ -	 * special, as userspace might rename the device after
+ -	 * the interface had been brought up and running since
+ -	 * the point kernel initiated auto-enslavement. Allow
+ -	 * live name change even when these slave devices are
+ -	 * up and running.
+ -	 *
+ -	 * Typically, users of these auto-enslaving devices
+ -	 * don't actually care about slave name change, as
+ -	 * they are supposed to operate on master interface
+ -	 * directly.
+ -	 */
+ -	if (dev->flags & IFF_UP &&
+ -	    likely(!(dev->priv_flags & IFF_LIVE_RENAME_OK)))
+ +	if (dev->flags & IFF_UP)
+  		return -EBUSY;
+  
+- 	write_seqcount_begin(&devnet_rename_seq);
++ 	down_write(&devnet_rename_sem);
+  
+  	if (strncmp(newname, dev->name, IFNAMSIZ) == 0) {
+- 		write_seqcount_end(&devnet_rename_seq);
++ 		up_write(&devnet_rename_sem);
+  		return 0;
+  	}
+  
+* Unmerged path net/core/dev.c
