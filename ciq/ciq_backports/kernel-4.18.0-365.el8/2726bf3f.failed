@@ -1,0 +1,227 @@
+swiotlb: Make SWIOTLB_NO_FORCE perform no allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Florian Fainelli <f.fainelli@gmail.com>
+commit 2726bf3ff2520dba61fafc90a055640f7ad54e05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/2726bf3f.failed
+
+When SWIOTLB_NO_FORCE is used, there should really be no allocations of
+default_nslabs to occur since we are not going to use those slabs. If a
+platform was somehow setting swiotlb_no_force and a later call to
+swiotlb_init() was to be made we would still be proceeding with
+allocating the default SWIOTLB size (64MB), whereas if swiotlb=noforce
+was set on the kernel command line we would have only allocated 2KB.
+
+This would be inconsistent and the point of initializing default_nslabs
+to 1, was intended to allocate the minimum amount of memory possible, so
+simply remove that minimal allocation period.
+
+	Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit 2726bf3ff2520dba61fafc90a055640f7ad54e05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index be0e4e04c6fd,0a5b6f7e75bc..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -120,12 -83,10 +120,15 @@@ setup_io_tlb_npages(char *str
+  	}
+  	if (*str == ',')
+  		++str;
+- 	if (!strcmp(str, "force")) {
++ 	if (!strcmp(str, "force"))
+  		swiotlb_force = SWIOTLB_FORCE;
+- 	} else if (!strcmp(str, "noforce")) {
++ 	else if (!strcmp(str, "noforce"))
+  		swiotlb_force = SWIOTLB_NO_FORCE;
+++<<<<<<< HEAD
+ +		io_tlb_nslabs = 1;
+ +	}
+++=======
+++>>>>>>> 2726bf3ff252 (swiotlb: Make SWIOTLB_NO_FORCE perform no allocation)
+  
+  	return 0;
+  }
+@@@ -225,54 -168,37 +228,57 @@@ void __init swiotlb_update_mem_attribut
+  
+  int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
+  {
+ -	unsigned long bytes = nslabs << IO_TLB_SHIFT, i;
+ -	struct io_tlb_mem *mem;
+ +	unsigned long i, bytes;
+  	size_t alloc_size;
+  
++ 	if (swiotlb_force == SWIOTLB_NO_FORCE)
++ 		return 0;
++ 
+  	/* protect against double initialization */
+ -	if (WARN_ON_ONCE(io_tlb_default_mem))
+ +	if (WARN_ON_ONCE(io_tlb_start))
+  		return -ENOMEM;
+  
+ -	alloc_size = PAGE_ALIGN(struct_size(mem, slots, nslabs));
+ -	mem = memblock_alloc(alloc_size, PAGE_SIZE);
+ -	if (!mem)
+ +	bytes = nslabs << IO_TLB_SHIFT;
+ +
+ +	io_tlb_nslabs = nslabs;
+ +	io_tlb_start = __pa(tlb);
+ +	io_tlb_end = io_tlb_start + bytes;
+ +
+ +	/*
+ +	 * Allocate and initialize the free list array.  This array is used
+ +	 * to find contiguous free memory regions of size up to IO_TLB_SEGSIZE
+ +	 * between io_tlb_start and io_tlb_end.
+ +	 */
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(int));
+ +	io_tlb_list = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_list)
+ +		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+ +		      __func__, alloc_size, PAGE_SIZE);
+ +
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(phys_addr_t));
+ +	io_tlb_orig_addr = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_orig_addr)
+ +		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+ +		      __func__, alloc_size, PAGE_SIZE);
+ +
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(size_t));
+ +	io_tlb_orig_size = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_orig_size)
+  		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+  		      __func__, alloc_size, PAGE_SIZE);
+ -	mem->nslabs = nslabs;
+ -	mem->start = __pa(tlb);
+ -	mem->end = mem->start + bytes;
+ -	mem->index = 0;
+ -	spin_lock_init(&mem->lock);
+ -	for (i = 0; i < mem->nslabs; i++) {
+ -		mem->slots[i].list = IO_TLB_SEGSIZE - io_tlb_offset(i);
+ -		mem->slots[i].orig_addr = INVALID_PHYS_ADDR;
+ -		mem->slots[i].alloc_size = 0;
+ +
+ +	for (i = 0; i < io_tlb_nslabs; i++) {
+ +		io_tlb_list[i] = IO_TLB_SEGSIZE - io_tlb_offset(i);
+ +		io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
+ +		io_tlb_orig_size[i] = 0;
+  	}
+ +	io_tlb_index = 0;
+ +	no_iotlb_memory = false;
+  
+ -	io_tlb_default_mem = mem;
+  	if (verbose)
+  		swiotlb_print_info();
+ -	swiotlb_set_max_segment(mem->nslabs << IO_TLB_SHIFT);
+ +
+ +	swiotlb_set_max_segment(io_tlb_nslabs << IO_TLB_SHIFT);
+  	return 0;
+  }
+  
+@@@ -283,29 -209,24 +289,32 @@@
+  void  __init
+  swiotlb_init(int verbose)
+  {
+ -	size_t bytes = PAGE_ALIGN(default_nslabs << IO_TLB_SHIFT);
+ -	void *tlb;
+ +	size_t default_size = IO_TLB_DEFAULT_SIZE;
+ +	unsigned char *vstart;
+ +	unsigned long bytes;
+ +
+ +	if (!io_tlb_nslabs) {
+ +		io_tlb_nslabs = (default_size >> IO_TLB_SHIFT);
+ +		io_tlb_nslabs = ALIGN(io_tlb_nslabs, IO_TLB_SEGSIZE);
+ +	}
+ +
+ +	bytes = io_tlb_nslabs << IO_TLB_SHIFT;
+  
++ 	if (swiotlb_force == SWIOTLB_NO_FORCE)
++ 		return;
++ 
+  	/* Get IO TLB memory from the low pages */
+ -	tlb = memblock_alloc_low(bytes, PAGE_SIZE);
+ -	if (!tlb)
+ -		goto fail;
+ -	if (swiotlb_init_with_tbl(tlb, default_nslabs, verbose))
+ -		goto fail_free_mem;
+ -	return;
+ -
+ -fail_free_mem:
+ -	memblock_free_early(__pa(tlb), bytes);
+ -fail:
+ +	vstart = memblock_alloc_low_nopanic(PAGE_ALIGN(bytes), PAGE_SIZE);
+ +	if (vstart && !swiotlb_init_with_tbl(vstart, io_tlb_nslabs, verbose))
+ +		return;
+ +
+ +	if (io_tlb_start) {
+ +		memblock_free_early(io_tlb_start,
+ +				    PAGE_ALIGN(io_tlb_nslabs << IO_TLB_SHIFT));
+ +		io_tlb_start = 0;
+ +	}
+  	pr_warn("Cannot allocate buffer");
+ +	no_iotlb_memory = true;
+  }
+  
+  /*
+@@@ -321,10 -244,8 +330,15 @@@ swiotlb_late_init_with_default_size(siz
+  	unsigned int order;
+  	int rc = 0;
+  
+++<<<<<<< HEAD
+ +	if (!io_tlb_nslabs) {
+ +		io_tlb_nslabs = (default_size >> IO_TLB_SHIFT);
+ +		io_tlb_nslabs = ALIGN(io_tlb_nslabs, IO_TLB_SEGSIZE);
+ +	}
+++=======
++ 	if (swiotlb_force == SWIOTLB_NO_FORCE)
++ 		return 0;
+++>>>>>>> 2726bf3ff252 (swiotlb: Make SWIOTLB_NO_FORCE perform no allocation)
+  
+  	/*
+  	 * Get IO TLB memory from the low pages
+@@@ -368,17 -280,32 +382,20 @@@ static void swiotlb_cleanup(void
+  int
+  swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
+  {
+ -	unsigned long bytes = nslabs << IO_TLB_SHIFT, i;
+ -	struct io_tlb_mem *mem;
+ +	unsigned long i, bytes;
+  
++ 	if (swiotlb_force == SWIOTLB_NO_FORCE)
++ 		return 0;
++ 
+  	/* protect against double initialization */
+ -	if (WARN_ON_ONCE(io_tlb_default_mem))
+ +	if (WARN_ON_ONCE(io_tlb_start))
+  		return -ENOMEM;
+  
+ -	mem = (void *)__get_free_pages(GFP_KERNEL,
+ -		get_order(struct_size(mem, slots, nslabs)));
+ -	if (!mem)
+ -		return -ENOMEM;
+ +	bytes = nslabs << IO_TLB_SHIFT;
+  
+ -	mem->nslabs = nslabs;
+ -	mem->start = virt_to_phys(tlb);
+ -	mem->end = mem->start + bytes;
+ -	mem->index = 0;
+ -	mem->late_alloc = 1;
+ -	spin_lock_init(&mem->lock);
+ -	for (i = 0; i < mem->nslabs; i++) {
+ -		mem->slots[i].list = IO_TLB_SEGSIZE - io_tlb_offset(i);
+ -		mem->slots[i].orig_addr = INVALID_PHYS_ADDR;
+ -		mem->slots[i].alloc_size = 0;
+ -	}
+ +	io_tlb_nslabs = nslabs;
+ +	io_tlb_start = virt_to_phys(tlb);
+ +	io_tlb_end = io_tlb_start + bytes;
+  
+  	set_memory_decrypted((unsigned long)tlb, bytes >> PAGE_SHIFT);
+  	memset(tlb, 0, bytes);
+* Unmerged path kernel/dma/swiotlb.c
