@@ -316,8 +316,7 @@ static int _hist_entry__sym_snprintf(struct map *map, struct symbol *sym,
 	return ret;
 }
 
-static int hist_entry__sym_snprintf(struct hist_entry *he, char *bf,
-				    size_t size, unsigned int width)
+int hist_entry__sym_snprintf(struct hist_entry *he, char *bf, size_t size, unsigned int width)
 {
 	return _hist_entry__sym_snprintf(he->ms.map, he->ms.sym, he->ip,
 					 he->level, bf, size, width);
