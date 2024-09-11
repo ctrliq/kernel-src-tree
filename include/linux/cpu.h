@@ -173,6 +173,7 @@ enum cpuhp_smt_control {
 	CPU_SMT_DISABLED,
 	CPU_SMT_FORCE_DISABLED,
 	CPU_SMT_NOT_SUPPORTED,
+	CPU_SMT_NOT_IMPLEMENTED,
 };
 
 #if defined(CONFIG_SMP) && defined(CONFIG_HOTPLUG_SMT)
@@ -181,7 +182,7 @@ extern void cpu_smt_disable(bool force);
 extern void cpu_smt_check_topology_early(void);
 extern void cpu_smt_check_topology(void);
 #else
-# define cpu_smt_control		(CPU_SMT_ENABLED)
+# define cpu_smt_control		(CPU_SMT_NOT_IMPLEMENTED)
 static inline void cpu_smt_disable(bool force) { }
 static inline void cpu_smt_check_topology_early(void) { }
 static inline void cpu_smt_check_topology(void) { }
