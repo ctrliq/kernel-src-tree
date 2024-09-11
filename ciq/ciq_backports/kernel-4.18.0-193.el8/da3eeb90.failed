@@ -1,0 +1,202 @@
+net: flow_offload: add list handling functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] flow_offload: add list handling functions (Ivan Vecera) [1737890]
+Rebuild_FUZZ: 94.25%
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit da3eeb904ff432ec22cf7b4db17a47647428873a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/da3eeb90.failed
+
+This patch adds the list handling functions for the flow block API:
+
+* flow_block_cb_lookup() allows drivers to look up for existing flow blocks.
+* flow_block_cb_add() adds a flow block to the per driver list to be registered
+  by the core.
+* flow_block_cb_remove() to remove a flow block from the list of existing
+  flow blocks per driver and to request the core to unregister this.
+
+The flow block API also annotates the netns this flow block belongs to.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit da3eeb904ff432ec22cf7b4db17a47647428873a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow_offload.h
+#	net/core/flow_offload.c
+#	net/sched/cls_api.c
+diff --cc include/net/flow_offload.h
+index 1f9db8aa6acb,563d7dc7afc1..000000000000
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@@ -231,4 -238,63 +231,66 @@@ static inline void flow_stats_update(st
+  	flow_stats->lastused	= max_t(u64, flow_stats->lastused, lastused);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum flow_block_command {
++ 	FLOW_BLOCK_BIND,
++ 	FLOW_BLOCK_UNBIND,
++ };
++ 
++ enum flow_block_binder_type {
++ 	FLOW_BLOCK_BINDER_TYPE_UNSPEC,
++ 	FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
++ 	FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS,
++ };
++ 
++ struct tcf_block;
++ struct netlink_ext_ack;
++ 
++ struct flow_block_offload {
++ 	enum flow_block_command command;
++ 	enum flow_block_binder_type binder_type;
++ 	struct tcf_block *block;
++ 	struct net *net;
++ 	struct list_head cb_list;
++ 	struct list_head *driver_block_list;
++ 	struct netlink_ext_ack *extack;
++ };
++ 
++ struct flow_block_cb {
++ 	struct list_head	driver_list;
++ 	struct list_head	list;
++ 	struct net		*net;
++ 	tc_setup_cb_t		*cb;
++ 	void			*cb_ident;
++ 	void			*cb_priv;
++ 	void			(*release)(void *cb_priv);
++ 	unsigned int		refcnt;
++ };
++ 
++ struct flow_block_cb *flow_block_cb_alloc(struct net *net, tc_setup_cb_t *cb,
++ 					  void *cb_ident, void *cb_priv,
++ 					  void (*release)(void *cb_priv));
++ void flow_block_cb_free(struct flow_block_cb *block_cb);
++ 
++ struct flow_block_cb *flow_block_cb_lookup(struct flow_block_offload *offload,
++ 					   tc_setup_cb_t *cb, void *cb_ident);
++ 
++ static inline void flow_block_cb_add(struct flow_block_cb *block_cb,
++ 				     struct flow_block_offload *offload)
++ {
++ 	list_add_tail(&block_cb->list, &offload->cb_list);
++ }
++ 
++ static inline void flow_block_cb_remove(struct flow_block_cb *block_cb,
++ 					struct flow_block_offload *offload)
++ {
++ 	list_move(&block_cb->list, &offload->cb_list);
++ }
++ 
++ int flow_block_cb_setup_simple(struct flow_block_offload *f,
++ 			       struct list_head *driver_list, tc_setup_cb_t *cb,
++ 			       void *cb_ident, void *cb_priv, bool ingress_only);
++ 
+++>>>>>>> da3eeb904ff4 (net: flow_offload: add list handling functions)
+  #endif /* _NET_FLOW_OFFLOAD_H */
+diff --cc net/core/flow_offload.c
+index fd722fcdcd91,c81a7e0c5e04..000000000000
+--- a/net/core/flow_offload.c
++++ b/net/core/flow_offload.c
+@@@ -165,3 -165,72 +165,75 @@@ void flow_rule_match_enc_opts(const str
+  	FLOW_DISSECTOR_MATCH(rule, FLOW_DISSECTOR_KEY_ENC_OPTS, out);
+  }
+  EXPORT_SYMBOL(flow_rule_match_enc_opts);
+++<<<<<<< HEAD
+++=======
++ 
++ struct flow_block_cb *flow_block_cb_alloc(struct net *net, tc_setup_cb_t *cb,
++ 					  void *cb_ident, void *cb_priv,
++ 					  void (*release)(void *cb_priv))
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
++ 	if (!block_cb)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	block_cb->net = net;
++ 	block_cb->cb = cb;
++ 	block_cb->cb_ident = cb_ident;
++ 	block_cb->cb_priv = cb_priv;
++ 	block_cb->release = release;
++ 
++ 	return block_cb;
++ }
++ EXPORT_SYMBOL(flow_block_cb_alloc);
++ 
++ void flow_block_cb_free(struct flow_block_cb *block_cb)
++ {
++ 	if (block_cb->release)
++ 		block_cb->release(block_cb->cb_priv);
++ 
++ 	kfree(block_cb);
++ }
++ EXPORT_SYMBOL(flow_block_cb_free);
++ 
++ struct flow_block_cb *flow_block_cb_lookup(struct flow_block_offload *f,
++ 					   tc_setup_cb_t *cb, void *cb_ident)
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	list_for_each_entry(block_cb, f->driver_block_list, driver_list) {
++ 		if (block_cb->net == f->net &&
++ 		    block_cb->cb == cb &&
++ 		    block_cb->cb_ident == cb_ident)
++ 			return block_cb;
++ 	}
++ 
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(flow_block_cb_lookup);
++ 
++ int flow_block_cb_setup_simple(struct flow_block_offload *f,
++ 			       struct list_head *driver_block_list,
++ 			       tc_setup_cb_t *cb, void *cb_ident, void *cb_priv,
++ 			       bool ingress_only)
++ {
++ 	if (ingress_only &&
++ 	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	f->driver_block_list = driver_block_list;
++ 
++ 	switch (f->command) {
++ 	case FLOW_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block, cb, cb_ident, cb_priv,
++ 					     f->extack);
++ 	case FLOW_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block, cb, cb_ident);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ EXPORT_SYMBOL(flow_block_cb_setup_simple);
+++>>>>>>> da3eeb904ff4 (net: flow_offload: add list handling functions)
+diff --cc net/sched/cls_api.c
+index b0823f40b408,ccbd51bed88c..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -683,7 -679,8 +683,12 @@@ static void tc_indr_block_ing_cmd(struc
+  {
+  	struct tc_block_offload bo = {
+  		.command	= command,
+++<<<<<<< HEAD
+ +		.binder_type	= TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
+++=======
++ 		.binder_type	= FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
++ 		.net		= dev_net(indr_dev->dev),
+++>>>>>>> da3eeb904ff4 (net: flow_offload: add list handling functions)
+  		.block		= indr_dev->block,
+  	};
+  
+* Unmerged path include/net/flow_offload.h
+* Unmerged path net/core/flow_offload.c
+* Unmerged path net/sched/cls_api.c
