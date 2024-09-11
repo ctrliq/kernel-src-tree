@@ -1,0 +1,130 @@
+kvm: x86: Introduce KVM_CAP_EXCEPTION_PAYLOAD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jim Mattson <jmattson@google.com>
+commit c4f55198c7c2b87909b166ffc2f6b68d9af6766c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c4f55198.failed
+
+This is a per-VM capability which can be enabled by userspace so that
+the faulting linear address will be included with the information
+about a pending #PF in L2, and the "new DR6 bits" will be included
+with the information about a pending #DB in L2. With this capability
+enabled, the L1 hypervisor can now intercept #PF before CR2 is
+modified. Under VMX, the L1 hypervisor can now intercept #DB before
+DR6 and DR7 are modified.
+
+When userspace has enabled KVM_CAP_EXCEPTION_PAYLOAD, it should
+generally provide an appropriate payload when injecting a #PF or #DB
+exception via KVM_SET_VCPU_EVENTS. However, to support restoring old
+checkpoints, this payload is not required.
+
+Note that bit 16 of the "new DR6 bits" is set to indicate that a debug
+exception (#DB) or a breakpoint exception (#BP) occurred inside an RTM
+region while advanced debugging of RTM transactional regions was
+enabled. This is the reverse of DR6.RTM, which is cleared in this
+scenario.
+
+This capability also enables exception.pending in struct
+kvm_vcpu_events, which allows userspace to distinguish between pending
+and injected exceptions.
+
+	Reported-by: Jim Mattson <jmattson@google.com>
+	Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c4f55198c7c2b87909b166ffc2f6b68d9af6766c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index a76a9addaa2b,cb6d44e1fe02..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -964,7 -961,10 +964,14 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_ARM_INJECT_SERROR_ESR 158
+  #define KVM_CAP_MSR_PLATFORM_INFO 159
+  #define KVM_CAP_PPC_NESTED_HV 160
+++<<<<<<< HEAD
+ +#define KVM_CAP_ARM_VM_IPA_SIZE 165
+++=======
++ #define KVM_CAP_HYPERV_SEND_IPI 161
++ #define KVM_CAP_COALESCED_PIO 162
++ #define KVM_CAP_HYPERV_ENLIGHTENED_VMCS 163
++ #define KVM_CAP_EXCEPTION_PAYLOAD 164
+++>>>>>>> c4f55198c7c2 (kvm: x86: Introduce KVM_CAP_EXCEPTION_PAYLOAD)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index d581b945e19e..b7f6cdb21e54 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -4571,7 +4571,7 @@ hpage module parameter is not set to 1, -EINVAL is returned.
+ While it is generally possible to create a huge page backed VM without
+ this capability, the VM will not be able to run.
+ 
+-7.14 KVM_CAP_MSR_PLATFORM_INFO
++7.15 KVM_CAP_MSR_PLATFORM_INFO
+ 
+ Architectures: x86
+ Parameters: args[0] whether feature should be enabled or not
+@@ -4594,6 +4594,31 @@ state).  Enabling this capability on a VM depends on the CPU having
+ the necessary functionality and on the facility being enabled with a
+ kvm-hv module parameter.
+ 
++7.17 KVM_CAP_EXCEPTION_PAYLOAD
++
++Architectures: x86
++Parameters: args[0] whether feature should be enabled or not
++
++With this capability enabled, CR2 will not be modified prior to the
++emulated VM-exit when L1 intercepts a #PF exception that occurs in
++L2. Similarly, for kvm-intel only, DR6 will not be modified prior to
++the emulated VM-exit when L1 intercepts a #DB exception that occurs in
++L2. As a result, when KVM_GET_VCPU_EVENTS reports a pending #PF (or
++#DB) exception for L2, exception.has_payload will be set and the
++faulting address (or the new DR6 bits*) will be reported in the
++exception_payload field. Similarly, when userspace injects a #PF (or
++#DB) into L2 using KVM_SET_VCPU_EVENTS, it is expected to set
++exception.has_payload and to put the faulting address (or the new DR6
++bits*) in the exception_payload field.
++
++This capability also enables exception.pending in struct
++kvm_vcpu_events, which allows userspace to distinguish between pending
++and injected exceptions.
++
++
++* For the new DR6 bits, note that bit 16 is set iff the #DB exception
++  will clear DR6.RTM.
++
+ 8. Other capabilities.
+ ----------------------
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 20eb23cd5c43..2cddb6a23fb7 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3015,6 +3015,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_IMMEDIATE_EXIT:
+ 	case KVM_CAP_GET_MSR_FEATURES:
+ 	case KVM_CAP_MSR_PLATFORM_INFO:
++	case KVM_CAP_EXCEPTION_PAYLOAD:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_SYNC_REGS:
+@@ -4455,6 +4456,10 @@ static int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		kvm->arch.guest_can_read_msr_platform_info = cap->args[0];
+ 		r = 0;
+ 		break;
++	case KVM_CAP_EXCEPTION_PAYLOAD:
++		kvm->arch.exception_payload_enabled = cap->args[0];
++		r = 0;
++		break;
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+* Unmerged path include/uapi/linux/kvm.h
