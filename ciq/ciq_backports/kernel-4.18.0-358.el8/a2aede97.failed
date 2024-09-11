@@ -1,0 +1,131 @@
+scsi: scsi_debug: Improve command duration calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Douglas Gilbert <dgilbert@interlog.com>
+commit a2aede970a8e12cadb8be779066cd64e6dd37e82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a2aede97.failed
+
+Previously the code did the work implied by the given SCSI command and
+after that it waited for a timer based on the user specified command
+duration to be exhausted before informing the mid-level that the command
+was complete. For short command durations, the time to complete the work
+implied by the SCSI command could be significant compared to the user
+specified command duration.
+
+For example a WRITE of 128 blocks (say 512 bytes each) on a machine that
+can copy from main memory to main memory at a rate of 10 GB/sec will take
+around 6.4 microseconds to do that copy.  If the user specified a command
+duration of 5 microseconds (ndelay=5000), should the driver do a further
+delay of 5 microseconds after the copy or return immediately because 6.4 >
+5 ?
+
+The action prior to this patch was to always do the timer based
+delay. After this patch, for ndelay values less than 1 millisecond, this
+driver will complete the command immediately.  And in the case where the
+user specified delay was 7 microseconds, a timer delay of 600 nanoseconds
+will be set ((7 - 6.4) * 1000).
+
+Link: https://lore.kernel.org/r/20200421151424.32668-6-dgilbert@interlog.com
+	Signed-off-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a2aede970a8e12cadb8be779066cd64e6dd37e82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 59e8909a7d8a,43b96ab6384c..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -5342,13 -4382,28 +5342,15 @@@ static void clear_queue_stats(void
+  	atomic_set(&sdebug_a_tsf, 0);
+  }
+  
+ -static void setup_inject(struct sdebug_queue *sqp,
+ -			 struct sdebug_queued_cmd *sqcp)
+ +static bool inject_on_this_cmd(void)
+  {
+ -	if ((atomic_read(&sdebug_cmnd_count) % abs(sdebug_every_nth)) > 0) {
+ -		if (sdebug_every_nth > 0)
+ -			sqcp->inj_recovered = sqcp->inj_transport
+ -				= sqcp->inj_dif
+ -				= sqcp->inj_dix = sqcp->inj_short
+ -				= sqcp->inj_host_busy = sqcp->inj_cmd_abort = 0;
+ -		return;
+ -	}
+ -	sqcp->inj_recovered = !!(SDEBUG_OPT_RECOVERED_ERR & sdebug_opts);
+ -	sqcp->inj_transport = !!(SDEBUG_OPT_TRANSPORT_ERR & sdebug_opts);
+ -	sqcp->inj_dif = !!(SDEBUG_OPT_DIF_ERR & sdebug_opts);
+ -	sqcp->inj_dix = !!(SDEBUG_OPT_DIX_ERR & sdebug_opts);
+ -	sqcp->inj_short = !!(SDEBUG_OPT_SHORT_TRANSFER & sdebug_opts);
+ -	sqcp->inj_host_busy = !!(SDEBUG_OPT_HOST_BUSY & sdebug_opts);
+ -	sqcp->inj_cmd_abort = !!(SDEBUG_OPT_CMD_ABORT & sdebug_opts);
+ +	if (sdebug_every_nth == 0)
+ +		return false;
+ +	return (atomic_read(&sdebug_cmnd_count) % abs(sdebug_every_nth)) == 0;
+  }
+  
++ #define INCLUSIVE_TIMING_MAX_NS 1000000		/* 1 millisecond */
++ 
+  /* Complete the processing of the thread that queued a SCSI command to this
+   * driver. It either completes the command by calling cmnd_done() or
+   * schedules a hr timer or work queue then returns 0. Returns
+@@@ -5360,9 -4415,10 +5362,16 @@@ static int schedule_resp(struct scsi_cm
+  				    struct sdebug_dev_info *),
+  			 int delta_jiff, int ndelay)
+  {
+++<<<<<<< HEAD
+ +	bool inject = false;
+ +	int k, num_in_q, qdepth;
+ +	unsigned long iflags;
+++=======
++ 	bool new_sd_dp;
++ 	int k, num_in_q, qdepth, inject;
++ 	unsigned long iflags;
++ 	u64 ns_from_boot = 0;
+++>>>>>>> a2aede970a8e (scsi: scsi_debug: Improve command duration calculation)
+  	struct sdebug_queue *sqp;
+  	struct sdebug_queued_cmd *sqcp;
+  	struct scsi_device *sdp;
+@@@ -5430,20 -4486,22 +5438,33 @@@
+  	cmnd->host_scribble = (unsigned char *)sqcp;
+  	sd_dp = sqcp->sd_dp;
+  	spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ -	if (unlikely(sdebug_every_nth && sdebug_any_injecting_opt))
+ -		setup_inject(sqp, sqcp);
+ -	if (sd_dp == NULL) {
+ +	if (!sd_dp) {
+  		sd_dp = kzalloc(sizeof(*sd_dp), GFP_ATOMIC);
+ -		if (sd_dp == NULL)
+ +		if (!sd_dp) {
+ +			atomic_dec(&devip->num_in_q);
+ +			clear_bit(k, sqp->in_use_bm);
+  			return SCSI_MLQUEUE_HOST_BUSY;
+++<<<<<<< HEAD
+ +		}
+ +	}
+ +
+ +	/* Set the hostwide tag */
+ +	if (sdebug_host_max_queue)
+ +		sd_dp->hc_idx = get_tag(cmnd);
+ +
+ +	cmnd->result = pfp ? pfp(cmnd, devip) : 0;
+++=======
++ 		new_sd_dp = true;
++ 	} else {
++ 		new_sd_dp = false;
++ 	}
++ 
++ 	if (ndelay > 0 && ndelay < INCLUSIVE_TIMING_MAX_NS)
++ 		ns_from_boot = ktime_get_boottime_ns();
++ 
++ 	/* one of the resp_*() response functions is called here */
++ 	cmnd->result = pfp != NULL ? pfp(cmnd, devip) : 0;
+++>>>>>>> a2aede970a8e (scsi: scsi_debug: Improve command duration calculation)
+  	if (cmnd->result & SDEG_RES_IMMED_MASK) {
+  		cmnd->result &= ~SDEG_RES_IMMED_MASK;
+  		delta_jiff = ndelay = 0;
+* Unmerged path drivers/scsi/scsi_debug.c
