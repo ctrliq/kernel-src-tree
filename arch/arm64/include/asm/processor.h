@@ -22,6 +22,14 @@
 #define KERNEL_DS		UL(-1)
 #define USER_DS			((UL(1) << VA_BITS) - 1)
 
+/*
+ * On arm64 systems, unaligned accesses by the CPU are cheap, and so there is
+ * no point in shifting all network buffers by 2 bytes just to make some IP
+ * header fields appear aligned in memory, potentially sacrificing some DMA
+ * performance on some platforms.
+ */
+#define NET_IP_ALIGN	0
+
 #ifndef __ASSEMBLY__
 
 /*
