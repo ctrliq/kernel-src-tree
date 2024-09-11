@@ -1,0 +1,105 @@
+nfs: Fix memory leak of export_path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Tom Rix <trix@redhat.com>
+commit 4659ed7cc8514369043053463514408ca16ad6f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4659ed7c.failed
+
+The try_location function is called within a loop by nfs_follow_referral.
+try_location calls nfs4_pathname_string to created the export_path.
+nfs4_pathname_string allocates the memory. export_path is stored in the
+nfs_fs_context/fs_context structure similarly as hostname and source.
+But whereas the ctx hostname and source are freed before assignment,
+export_path is not.  So if there are multiple loops, the new export_path
+will overwrite the old without the old being freed.
+
+So call kfree for export_path.
+
+	Signed-off-by: Tom Rix <trix@redhat.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 4659ed7cc8514369043053463514408ca16ad6f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4namespace.c
+diff --cc fs/nfs/nfs4namespace.c
+index 1ec3b72ae697,873342308dc0..000000000000
+--- a/fs/nfs/nfs4namespace.c
++++ b/fs/nfs/nfs4namespace.c
+@@@ -236,32 -279,47 +236,57 @@@ out
+  	return new;
+  }
+  
+ -static int try_location(struct fs_context *fc,
+ -			const struct nfs4_fs_location *location)
+ +static struct vfsmount *try_location(struct nfs_clone_mount *mountdata,
+ +				     char *page, char *page2,
+ +				     const struct nfs4_fs_location *location)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+ -	unsigned int len, s;
+ -	char *export_path, *source, *p;
+ -	int ret = -ENOENT;
+ -
+ -	/* Allocate a buffer big enough to hold any of the hostnames plus a
+ -	 * terminating char and also a buffer big enough to hold the hostname
+ -	 * plus a colon plus the path.
+ -	 */
+ -	len = 0;
+ +	const size_t addr_bufsize = sizeof(struct sockaddr_storage);
+ +	struct net *net = rpc_net_ns(NFS_SB(mountdata->sb)->client);
+ +	struct vfsmount *mnt = ERR_PTR(-ENOENT);
+ +	char *mnt_path;
+ +	unsigned int maxbuflen;
+ +	unsigned int s;
+ +
+ +	mnt_path = nfs4_pathname_string(&location->rootpath, page2, PAGE_SIZE);
+ +	if (IS_ERR(mnt_path))
+ +		return ERR_CAST(mnt_path);
+ +	mountdata->mnt_path = mnt_path;
+ +	maxbuflen = mnt_path - 1 - page2;
+ +
+ +	mountdata->addr = kmalloc(addr_bufsize, GFP_KERNEL);
+ +	if (mountdata->addr == NULL)
+ +		return ERR_PTR(-ENOMEM);
+ +
+  	for (s = 0; s < location->nservers; s++) {
+  		const struct nfs4_string *buf = &location->servers[s];
+ -		if (buf->len > len)
+ -			len = buf->len;
+ -	}
+  
+++<<<<<<< HEAD
+ +		if (buf->len <= 0 || buf->len >= maxbuflen)
+ +			continue;
+++=======
++ 	kfree(ctx->nfs_server.hostname);
++ 	ctx->nfs_server.hostname = kmalloc(len + 1, GFP_KERNEL);
++ 	if (!ctx->nfs_server.hostname)
++ 		return -ENOMEM;
++ 
++ 	export_path = nfs4_pathname_string(&location->rootpath,
++ 					   &ctx->nfs_server.export_path_len);
++ 	if (IS_ERR(export_path))
++ 		return PTR_ERR(export_path);
++ 
++ 	kfree(ctx->nfs_server.export_path);
++ 	ctx->nfs_server.export_path = export_path;
++ 
++ 	source = kmalloc(len + 1 + ctx->nfs_server.export_path_len + 1,
++ 			 GFP_KERNEL);
++ 	if (!source)
++ 		return -ENOMEM;
++ 
++ 	kfree(fc->source);
++ 	fc->source = source;
++ 	for (s = 0; s < location->nservers; s++) {
++ 		const struct nfs4_string *buf = &location->servers[s];
+++>>>>>>> 4659ed7cc851 (nfs: Fix memory leak of export_path)
+  
+  		if (memchr(buf->data, IPV6_SCOPE_DELIMITER, buf->len))
+  			continue;
+* Unmerged path fs/nfs/nfs4namespace.c
