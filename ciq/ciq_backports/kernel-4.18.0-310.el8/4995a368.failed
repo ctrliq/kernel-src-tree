@@ -1,0 +1,302 @@
+KVM: SVM: Use a separate vmcb for the nested L2 guest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Cathy Avery <cavery@redhat.com>
+commit 4995a3685f1b768648187ed20bea3366f5f76228
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/4995a368.failed
+
+svm->vmcb will now point to a separate vmcb for L1 (not nested) or L2
+(nested).
+
+The main advantages are removing get_host_vmcb and hsave, in favor of
+concepts that are shared with VMX.
+
+We don't need anymore to stash the L1 registers in hsave while L2
+runs, but we need to copy the VMLOAD/VMSAVE registers from VMCB01 to
+VMCB02 and back.  This more or less has the same cost, but code-wise
+nested_svm_vmloadsave can be reused.
+
+This patch omits several optimizations that are possible:
+
+- for simplicity there is some wholesale copying of vmcb.control areas
+which can go away.
+
+- we should be able to better use the VMCB01 and VMCB02 clean bits.
+
+- another possibility is to always use VMCB01 for VMLOAD and VMSAVE,
+thus avoiding the copy of VMLOAD/VMSAVE registers from VMCB01 to
+VMCB02 and back.
+
+Tested:
+kvm-unit-tests
+kvm self tests
+Loaded fedora nested guest on fedora
+
+	Signed-off-by: Cathy Avery <cavery@redhat.com>
+Message-Id: <20201011184818.3609-3-cavery@redhat.com>
+[Fix conflicts; keep VMCB02 G_PAT up to date whenever guest writes the
+ PAT MSR; do not copy CR4 over from VMCB01 as it is not needed anymore; add
+ a few more comments. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4995a3685f1b768648187ed20bea3366f5f76228)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/nested.c
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/nested.c
+index 93c8c786ad5c,7e049be65b13..000000000000
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@@ -451,9 -482,15 +465,19 @@@ int enter_svm_guest_mode(struct vcpu_sv
+  
+  
+  	svm->nested.vmcb12_gpa = vmcb12_gpa;
++ 
++ 	WARN_ON(svm->vmcb == svm->nested.vmcb02.ptr);
++ 
++ 	nested_svm_vmloadsave(svm->vmcb01.ptr, svm->nested.vmcb02.ptr);
+  	load_nested_vmcb_control(svm, &vmcb12->control);
+++<<<<<<< HEAD
+++=======
++ 
++ 	svm_switch_vmcb(svm, &svm->nested.vmcb02);
++ 	nested_prepare_vmcb_control(svm);
+++>>>>>>> 4995a3685f1b (KVM: SVM: Use a separate vmcb for the nested L2 guest)
+  	nested_prepare_vmcb_save(svm, vmcb12);
+ +	nested_prepare_vmcb_control(svm);
+  
+  	ret = nested_svm_load_cr3(&svm->vcpu, vmcb12->save.cr3,
+  				  nested_npt_enabled(svm));
+diff --cc arch/x86/kvm/svm/svm.c
+index 05deab5ed2e8,aa7f6aee1d69..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -1308,20 -1329,39 +1329,25 @@@ void svm_switch_vmcb(struct vcpu_svm *s
+  static int svm_create_vcpu(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm;
+++<<<<<<< HEAD
+ +	struct page *vmcb_page;
+++=======
++ 	struct page *vmcb01_page;
++ 	struct page *vmsa_page = NULL;
+++>>>>>>> 4995a3685f1b (KVM: SVM: Use a separate vmcb for the nested L2 guest)
+  	int err;
+  
+  	BUILD_BUG_ON(offsetof(struct vcpu_svm, vcpu) != 0);
+  	svm = to_svm(vcpu);
+  
+  	err = -ENOMEM;
+- 	vmcb_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+- 	if (!vmcb_page)
++ 	vmcb01_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
++ 	if (!vmcb01_page)
+  		goto out;
+  
+ -	if (sev_es_guest(svm->vcpu.kvm)) {
+ -		/*
+ -		 * SEV-ES guests require a separate VMSA page used to contain
+ -		 * the encrypted register state of the guest.
+ -		 */
+ -		vmsa_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+ -		if (!vmsa_page)
+ -			goto error_free_vmcb_page;
+ -
+ -		/*
+ -		 * SEV-ES guests maintain an encrypted version of their FPU
+ -		 * state which is restored and saved on VMRUN and VMEXIT.
+ -		 * Free the fpu structure to prevent KVM from attempting to
+ -		 * access the FPU state.
+ -		 */
+ -		kvm_free_guest_fpu(vcpu);
+ -	}
+ -
+  	err = avic_init_vcpu(svm);
+  	if (err)
+ -		goto error_free_vmsa_page;
+ +		goto error_free_vmcb_page;
+  
+  	/* We initialize this flag to true to make sure that the is_running
+  	 * bit would be set the first time the vcpu is loaded.
+@@@ -1337,9 -1377,16 +1363,22 @@@
+  
+  	svm_vcpu_init_msrpm(vcpu, svm->msrpm);
+  
+++<<<<<<< HEAD
+ +	svm->vmcb = page_address(vmcb_page);
+ +	svm->vmcb_pa = __sme_set(page_to_pfn(vmcb_page) << PAGE_SHIFT);
+ +	svm->asid_generation = 0;
+++=======
++ 	svm->vmcb01.ptr = page_address(vmcb01_page);
++ 	svm->vmcb01.pa = __sme_set(page_to_pfn(vmcb01_page) << PAGE_SHIFT);
++ 
++ 	if (vmsa_page)
++ 		svm->vmsa = page_address(vmsa_page);
++ 
++ 	svm->asid_generation = 0;
++ 	svm->guest_state_loaded = false;
++ 
++ 	svm_switch_vmcb(svm, &svm->vmcb01);
+++>>>>>>> 4995a3685f1b (KVM: SVM: Use a separate vmcb for the nested L2 guest)
+  	init_vmcb(svm);
+  
+  	svm_init_osvw(vcpu);
+@@@ -1347,8 -1398,11 +1386,8 @@@
+  
+  	return 0;
+  
+ -error_free_vmsa_page:
+ -	if (vmsa_page)
+ -		__free_page(vmsa_page);
+  error_free_vmcb_page:
+- 	__free_page(vmcb_page);
++ 	__free_page(vmcb01_page);
+  out:
+  	return err;
+  }
+@@@ -1374,7 -1428,9 +1413,13 @@@ static void svm_free_vcpu(struct kvm_vc
+  
+  	svm_free_nested(svm);
+  
+++<<<<<<< HEAD
+ +	__free_page(pfn_to_page(__sme_clr(svm->vmcb_pa) >> PAGE_SHIFT));
+++=======
++ 	sev_free_vcpu(vcpu);
++ 
++ 	__free_page(pfn_to_page(__sme_clr(svm->vmcb01.pa) >> PAGE_SHIFT));
+++>>>>>>> 4995a3685f1b (KVM: SVM: Use a separate vmcb for the nested L2 guest)
+  	__free_pages(virt_to_page(svm->msrpm), MSRPM_ALLOC_ORDER);
+  }
+  
+@@@ -3438,10 -3551,17 +3485,10 @@@ bool svm_interrupt_blocked(struct kvm_v
+  	if (!gif_set(svm))
+  		return true;
+  
+ -	if (sev_es_guest(svm->vcpu.kvm)) {
+ -		/*
+ -		 * SEV-ES guests to not expose RFLAGS. Use the VMCB interrupt mask
+ -		 * bit to determine the state of the IF flag.
+ -		 */
+ -		if (!(vmcb->control.int_state & SVM_GUEST_INTERRUPT_MASK))
+ -			return true;
+ -	} else if (is_guest_mode(vcpu)) {
+ +	if (is_guest_mode(vcpu)) {
+  		/* As long as interrupts are being delivered...  */
+  		if ((svm->nested.ctl.int_ctl & V_INTR_MASKING_MASK)
+- 		    ? !(svm->nested.hsave->save.rflags & X86_EFLAGS_IF)
++ 		    ? !(svm->vmcb01.ptr->save.rflags & X86_EFLAGS_IF)
+  		    : !(kvm_get_rflags(vcpu) & X86_EFLAGS_IF))
+  			return true;
+  
+* Unmerged path arch/x86/kvm/svm/nested.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index de600f536464..ac34b2d79ebf 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -84,8 +84,13 @@ struct kvm_svm {
+ 
+ struct kvm_vcpu;
+ 
++struct kvm_vmcb_info {
++	struct vmcb *ptr;
++	unsigned long pa;
++};
++
+ struct svm_nested_state {
+-	struct vmcb *hsave;
++	struct kvm_vmcb_info vmcb02;
+ 	u64 hsave_msr;
+ 	u64 vm_cr_msr;
+ 	u64 vmcb12_gpa;
+@@ -107,6 +112,8 @@ struct vcpu_svm {
+ 	struct kvm_vcpu vcpu;
+ 	struct vmcb *vmcb;
+ 	unsigned long vmcb_pa;
++	struct kvm_vmcb_info vmcb01;
++	struct kvm_vmcb_info *current_vmcb;
+ 	struct svm_cpu_data *svm_data;
+ 	u32 asid;
+ 	uint64_t asid_generation;
+@@ -217,14 +224,6 @@ static inline struct vcpu_svm *to_svm(struct kvm_vcpu *vcpu)
+ 	return container_of(vcpu, struct vcpu_svm, vcpu);
+ }
+ 
+-static inline struct vmcb *get_host_vmcb(struct vcpu_svm *svm)
+-{
+-	if (is_guest_mode(&svm->vcpu))
+-		return svm->nested.hsave;
+-	else
+-		return svm->vmcb;
+-}
+-
+ static inline void vmcb_set_intercept(struct vmcb_control_area *control, u32 bit)
+ {
+ 	WARN_ON_ONCE(bit >= 32 * MAX_INTERCEPT);
+@@ -245,7 +244,7 @@ static inline bool vmcb_is_intercept(struct vmcb_control_area *control, u32 bit)
+ 
+ static inline void set_dr_intercepts(struct vcpu_svm *svm)
+ {
+-	struct vmcb *vmcb = get_host_vmcb(svm);
++	struct vmcb *vmcb = svm->vmcb01.ptr;
+ 
+ 	if (!sev_es_guest(svm->vcpu.kvm)) {
+ 		vmcb_set_intercept(&vmcb->control, INTERCEPT_DR0_READ);
+@@ -272,7 +271,7 @@ static inline void set_dr_intercepts(struct vcpu_svm *svm)
+ 
+ static inline void clr_dr_intercepts(struct vcpu_svm *svm)
+ {
+-	struct vmcb *vmcb = get_host_vmcb(svm);
++	struct vmcb *vmcb = svm->vmcb01.ptr;
+ 
+ 	vmcb->control.intercepts[INTERCEPT_DR] = 0;
+ 
+@@ -287,7 +286,7 @@ static inline void clr_dr_intercepts(struct vcpu_svm *svm)
+ 
+ static inline void set_exception_intercept(struct vcpu_svm *svm, u32 bit)
+ {
+-	struct vmcb *vmcb = get_host_vmcb(svm);
++	struct vmcb *vmcb = svm->vmcb01.ptr;
+ 
+ 	WARN_ON_ONCE(bit >= 32);
+ 	vmcb_set_intercept(&vmcb->control, INTERCEPT_EXCEPTION_OFFSET + bit);
+@@ -297,7 +296,7 @@ static inline void set_exception_intercept(struct vcpu_svm *svm, u32 bit)
+ 
+ static inline void clr_exception_intercept(struct vcpu_svm *svm, u32 bit)
+ {
+-	struct vmcb *vmcb = get_host_vmcb(svm);
++	struct vmcb *vmcb = svm->vmcb01.ptr;
+ 
+ 	WARN_ON_ONCE(bit >= 32);
+ 	vmcb_clr_intercept(&vmcb->control, INTERCEPT_EXCEPTION_OFFSET + bit);
+@@ -307,7 +306,7 @@ static inline void clr_exception_intercept(struct vcpu_svm *svm, u32 bit)
+ 
+ static inline void svm_set_intercept(struct vcpu_svm *svm, int bit)
+ {
+-	struct vmcb *vmcb = get_host_vmcb(svm);
++	struct vmcb *vmcb = svm->vmcb01.ptr;
+ 
+ 	vmcb_set_intercept(&vmcb->control, bit);
+ 
+@@ -316,7 +315,7 @@ static inline void svm_set_intercept(struct vcpu_svm *svm, int bit)
+ 
+ static inline void svm_clr_intercept(struct vcpu_svm *svm, int bit)
+ {
+-	struct vmcb *vmcb = get_host_vmcb(svm);
++	struct vmcb *vmcb = svm->vmcb01.ptr;
+ 
+ 	vmcb_clr_intercept(&vmcb->control, bit);
+ 
+@@ -417,6 +416,8 @@ int nested_svm_check_exception(struct vcpu_svm *svm, unsigned nr,
+ 			       bool has_error_code, u32 error_code);
+ int nested_svm_exit_special(struct vcpu_svm *svm);
+ void sync_nested_vmcb_control(struct vcpu_svm *svm);
++void nested_vmcb02_compute_g_pat(struct vcpu_svm *svm);
++void svm_switch_vmcb(struct vcpu_svm *svm, struct kvm_vmcb_info *target_vmcb);
+ 
+ extern struct kvm_x86_nested_ops svm_nested_ops;
+ 
