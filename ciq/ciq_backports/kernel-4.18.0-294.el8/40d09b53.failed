@@ -1,0 +1,261 @@
+blk-mq: add a new blk_mq_complete_request_remote API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 40d09b53bfc557af7481b9d80f060a7ac9c7d314
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/40d09b53.failed
+
+This is a variant of blk_mq_complete_request_remote that only completes
+the request if it needs to be bounced to another CPU or a softirq.  If
+the request can be completed locally the function returns false and lets
+the driver complete it without requring and indirect function call.
+
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 40d09b53bfc557af7481b9d80f060a7ac9c7d314)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 1240414f08f2,b8738b3c6d06..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -573,76 -576,139 +573,202 @@@ void blk_mq_end_request(struct request 
+  }
+  EXPORT_SYMBOL(blk_mq_end_request);
+  
+++<<<<<<< HEAD
+ +static void __blk_mq_complete_request_remote(void *data)
+ +{
+ +	struct request *rq = data;
+ +	struct request_queue *q = rq->q;
+ +
+ +	q->mq_ops->complete(rq);
+++=======
++ /*
++  * Softirq action handler - move entries to local list and loop over them
++  * while passing them to the queue registered handler.
++  */
++ static __latent_entropy void blk_done_softirq(struct softirq_action *h)
++ {
++ 	struct list_head *cpu_list, local_list;
++ 
++ 	local_irq_disable();
++ 	cpu_list = this_cpu_ptr(&blk_cpu_done);
++ 	list_replace_init(cpu_list, &local_list);
++ 	local_irq_enable();
++ 
++ 	while (!list_empty(&local_list)) {
++ 		struct request *rq;
++ 
++ 		rq = list_entry(local_list.next, struct request, ipi_list);
++ 		list_del_init(&rq->ipi_list);
++ 		rq->q->mq_ops->complete(rq);
++ 	}
++ }
++ 
++ static void blk_mq_trigger_softirq(struct request *rq)
++ {
++ 	struct list_head *list;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	list = this_cpu_ptr(&blk_cpu_done);
++ 	list_add_tail(&rq->ipi_list, list);
++ 
++ 	/*
++ 	 * If the list only contains our just added request, signal a raise of
++ 	 * the softirq.  If there are already entries there, someone already
++ 	 * raised the irq but it hasn't run yet.
++ 	 */
++ 	if (list->next == &rq->ipi_list)
++ 		raise_softirq_irqoff(BLOCK_SOFTIRQ);
++ 	local_irq_restore(flags);
++ }
++ 
++ static int blk_softirq_cpu_dead(unsigned int cpu)
++ {
++ 	/*
++ 	 * If a CPU goes away, splice its entries to the current CPU
++ 	 * and trigger a run of the softirq
++ 	 */
++ 	local_irq_disable();
++ 	list_splice_init(&per_cpu(blk_cpu_done, cpu),
++ 			 this_cpu_ptr(&blk_cpu_done));
++ 	raise_softirq_irqoff(BLOCK_SOFTIRQ);
++ 	local_irq_enable();
++ 
++ 	return 0;
++ }
++ 
++ 
++ static void __blk_mq_complete_request_remote(void *data)
++ {
++ 	struct request *rq = data;
++ 
++ 	/*
++ 	 * For most of single queue controllers, there is only one irq vector
++ 	 * for handling I/O completion, and the only irq's affinity is set
++ 	 * to all possible CPUs.  On most of ARCHs, this affinity means the irq
++ 	 * is handled on one specific CPU.
++ 	 *
++ 	 * So complete I/O requests in softirq context in case of single queue
++ 	 * devices to avoid degrading I/O performance due to irqsoff latency.
++ 	 */
++ 	if (rq->q->nr_hw_queues == 1)
++ 		blk_mq_trigger_softirq(rq);
++ 	else
++ 		rq->q->mq_ops->complete(rq);
++ }
++ 
++ static inline bool blk_mq_complete_need_ipi(struct request *rq)
++ {
++ 	int cpu = raw_smp_processor_id();
++ 
++ 	if (!IS_ENABLED(CONFIG_SMP) ||
++ 	    !test_bit(QUEUE_FLAG_SAME_COMP, &rq->q->queue_flags))
++ 		return false;
++ 
++ 	/* same CPU or cache domain?  Complete locally */
++ 	if (cpu == rq->mq_ctx->cpu ||
++ 	    (!test_bit(QUEUE_FLAG_SAME_FORCE, &rq->q->queue_flags) &&
++ 	     cpus_share_cache(cpu, rq->mq_ctx->cpu)))
++ 		return false;
++ 
++ 	/* don't try to IPI to an offline CPU */
++ 	return cpu_online(rq->mq_ctx->cpu);
+++>>>>>>> 40d09b53bfc5 (blk-mq: add a new blk_mq_complete_request_remote API)
++ }
++ 
++ bool blk_mq_complete_request_remote(struct request *rq)
++ {
++ 	WRITE_ONCE(rq->state, MQ_RQ_COMPLETE);
++ 
++ 	/*
++ 	 * For a polled request, always complete locallly, it's pointless
++ 	 * to redirect the completion.
++ 	 */
++ 	if (rq->cmd_flags & REQ_HIPRI)
++ 		return false;
++ 
++ 	if (blk_mq_complete_need_ipi(rq)) {
++ 		rq->csd.func = __blk_mq_complete_request_remote;
++ 		rq->csd.info = rq;
++ 		rq->csd.flags = 0;
++ 		smp_call_function_single_async(rq->mq_ctx->cpu, &rq->csd);
++ 	} else {
++ 		if (rq->q->nr_hw_queues > 1)
++ 			return false;
++ 		blk_mq_trigger_softirq(rq);
++ 	}
++ 
++ 	return true;
+  }
++ EXPORT_SYMBOL_GPL(blk_mq_complete_request_remote);
+  
+  /**
+ - * blk_mq_complete_request - end I/O on a request
+ - * @rq:		the request being processed
+ + * blk_mq_force_complete_rq() - Force complete the request, bypassing any error
+ + * 				injection that could drop the completion.
+ + * @rq: Request to be force completed
+   *
+ - * Description:
+ - *	Complete a request by scheduling the ->complete_rq operation.
+ - **/
+ -void blk_mq_complete_request(struct request *rq)
+ + * Drivers should use blk_mq_complete_request() to complete requests in their
+ + * normal IO path. For timeout error recovery, drivers may call this forced
+ + * completion routine after they've reclaimed timed out requests to bypass
+ + * potentially subsequent fake timeouts.
+ + */
+ +void blk_mq_force_complete_rq(struct request *rq)
+  {
+++<<<<<<< HEAD
+ +	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ +	struct request_queue *q = rq->q;
+ +	bool shared = false;
+ +	int cpu;
+ +
+ +	WRITE_ONCE(rq->state, MQ_RQ_COMPLETE);
+ +
+ +	/*
+ +	 * For a polled request, always complete locallly, it's pointless
+ +	 * to redirect the completion.
+ +	 */
+ +	if (rq->cmd_flags & REQ_HIPRI) {
+ +		q->mq_ops->complete(rq);
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * Most of single queue controllers, there is only one irq vector
+ +	 * for handling IO completion, and the only irq's affinity is set
+ +	 * as all possible CPUs. On most of ARCHs, this affinity means the
+ +	 * irq is handled on one specific CPU.
+ +	 *
+ +	 * So complete IO reqeust in softirq context in case of single queue
+ +	 * for not degrading IO performance by irqsoff latency.
+ +	 */
+ +	if (q->nr_hw_queues == 1) {
+ +		__blk_complete_request(rq);
+ +		return;
+ +	}
+ +
+ +	if (!IS_ENABLED(CONFIG_SMP) ||
+ +	    !test_bit(QUEUE_FLAG_SAME_COMP, &q->queue_flags)) {
+ +		q->mq_ops->complete(rq);
+ +		return;
+ +	}
+ +
+ +	cpu = raw_smp_processor_id();
+ +	if (!test_bit(QUEUE_FLAG_SAME_FORCE, &q->queue_flags))
+ +		shared = cpus_share_cache(cpu, ctx->cpu);
+ +
+ +	if (cpu != ctx->cpu && !shared && cpu_online(ctx->cpu)) {
+ +		rq->csd.func = __blk_mq_complete_request_remote;
+ +		rq->csd.info = rq;
+ +		rq->csd.flags = 0;
+ +		smp_call_function_single_async(ctx->cpu, &rq->csd);
+ +	} else {
+ +		q->mq_ops->complete(rq);
+ +	}
+++=======
++ 	if (!blk_mq_complete_request_remote(rq))
++ 		rq->q->mq_ops->complete(rq);
+++>>>>>>> 40d09b53bfc5 (blk-mq: add a new blk_mq_complete_request_remote API)
+  }
+ -EXPORT_SYMBOL(blk_mq_complete_request);
+ +EXPORT_SYMBOL_GPL(blk_mq_force_complete_rq);
+  
+  static void hctx_unlock(struct blk_mq_hw_ctx *hctx, int srcu_idx)
+  	__releases(hctx->srcu)
+diff --cc include/linux/blk-mq.h
+index 200eeffcb439,1641ec6cd7e5..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -398,10 -503,10 +398,15 @@@ void __blk_mq_end_request(struct reques
+  void blk_mq_requeue_request(struct request *rq, bool kick_requeue_list);
+  void blk_mq_kick_requeue_list(struct request_queue *q);
+  void blk_mq_delay_kick_requeue_list(struct request_queue *q, unsigned long msecs);
+++<<<<<<< HEAD
+ +bool blk_mq_complete_request(struct request *rq);
+ +void blk_mq_force_complete_rq(struct request *rq);
+++=======
++ void blk_mq_complete_request(struct request *rq);
++ bool blk_mq_complete_request_remote(struct request *rq);
+++>>>>>>> 40d09b53bfc5 (blk-mq: add a new blk_mq_complete_request_remote API)
+  bool blk_mq_bio_list_merge(struct request_queue *q, struct list_head *list,
+ -			   struct bio *bio, unsigned int nr_segs);
+ +			   struct bio *bio);
+  bool blk_mq_queue_stopped(struct request_queue *q);
+  void blk_mq_stop_hw_queue(struct blk_mq_hw_ctx *hctx);
+  void blk_mq_start_hw_queue(struct blk_mq_hw_ctx *hctx);
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
