@@ -1,0 +1,502 @@
+RDMA: Fully setup the device name in ib_register_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit e349f858d29f300ad9ad327fd57735a1d15e147f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/e349f858.failed
+
+The current code has two copies of the device name, ibdev->dev and
+dev_name(&ibdev->dev), and they are setup at different times, which is
+very confusing.
+
+Set them both up at the same time and make dev_name() the lead name, which
+is the proper use of the driver core APIs. To make it very clear that the
+name is not valid until registration pass it in to the
+ib_register_device() call rather than messing with ibdev->name directly.
+
+Also the reorganization now checks that dev_name is unique even if it does
+not contain a %.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Acked-by: Adit Ranadive <aditr@vmware.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Acked-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Reviewed-by: Shiraz Saleem <shiraz.saleem@intel.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+(cherry picked from commit e349f858d29f300ad9ad327fd57735a1d15e147f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/sysfs.c
+diff --cc drivers/infiniband/core/sysfs.c
+index 504a65fbe8ef,bc947a863b34..000000000000
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@@ -1312,9 -1311,8 +1312,14 @@@ int ib_device_register_sysfs(struct ib_
+  	int ret;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	ret = dev_set_name(class_dev, "%s", device->name);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	device->groups[0] = &dev_attr_group;
++ 	class_dev->groups = device->groups;
+++>>>>>>> e349f858d29f (RDMA: Fully setup the device name in ib_register_device)
+  
+  	ret = device_add(class_dev);
+  	if (ret)
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index a7cc0fb2561a..8df01dd72920 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -170,10 +170,9 @@ static struct ib_device *__ib_device_get_by_name(const char *name)
+ 	return NULL;
+ }
+ 
+-static int alloc_name(char *name)
++static int alloc_name(struct ib_device *ibdev, const char *name)
+ {
+ 	unsigned long *inuse;
+-	char buf[IB_DEVICE_NAME_MAX];
+ 	struct ib_device *device;
+ 	int i;
+ 
+@@ -182,24 +181,21 @@ static int alloc_name(char *name)
+ 		return -ENOMEM;
+ 
+ 	list_for_each_entry(device, &device_list, core_list) {
+-		if (!sscanf(device->name, name, &i))
++		char buf[IB_DEVICE_NAME_MAX];
++
++		if (sscanf(device->name, name, &i) != 1)
+ 			continue;
+ 		if (i < 0 || i >= PAGE_SIZE * 8)
+ 			continue;
+ 		snprintf(buf, sizeof buf, name, i);
+-		if (!strncmp(buf, device->name, IB_DEVICE_NAME_MAX))
++		if (!strcmp(buf, dev_name(&device->dev)))
+ 			set_bit(i, inuse);
+ 	}
+ 
+ 	i = find_first_zero_bit(inuse, PAGE_SIZE * 8);
+ 	free_page((unsigned long) inuse);
+-	snprintf(buf, sizeof buf, name, i);
+-
+-	if (__ib_device_get_by_name(buf))
+-		return -ENFILE;
+ 
+-	strlcpy(name, buf, IB_DEVICE_NAME_MAX);
+-	return 0;
++	return dev_set_name(&ibdev->dev, name, i);
+ }
+ 
+ static void ib_device_release(struct device *device)
+@@ -454,9 +450,9 @@ static u32 __dev_new_index(void)
+  * callback for each device that is added. @device must be allocated
+  * with ib_alloc_device().
+  */
+-int ib_register_device(struct ib_device *device,
+-		       int (*port_callback)(struct ib_device *,
+-					    u8, struct kobject *))
++int ib_register_device(struct ib_device *device, const char *name,
++		       int (*port_callback)(struct ib_device *, u8,
++					    struct kobject *))
+ {
+ 	int ret;
+ 	struct ib_client *client;
+@@ -495,11 +491,20 @@ int ib_register_device(struct ib_device *device,
+ 
+ 	mutex_lock(&device_mutex);
+ 
+-	if (strchr(device->name, '%')) {
+-		ret = alloc_name(device->name);
++	if (strchr(name, '%')) {
++		ret = alloc_name(device, name);
++		if (ret)
++			goto out;
++	} else {
++		ret = dev_set_name(&device->dev, name);
+ 		if (ret)
+ 			goto out;
+ 	}
++	if (__ib_device_get_by_name(dev_name(&device->dev))) {
++		ret = -ENFILE;
++		goto out;
++	}
++	strlcpy(device->name, dev_name(&device->dev), IB_DEVICE_NAME_MAX);
+ 
+ 	if (ib_device_check_mandatory(device)) {
+ 		ret = -EINVAL;
+* Unmerged path drivers/infiniband/core/sysfs.c
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index 85cd1a3593d6..63186396ffa4 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -547,7 +547,6 @@ static int bnxt_re_register_ib(struct bnxt_re_dev *rdev)
+ 	/* ib device init */
+ 	ibdev->owner = THIS_MODULE;
+ 	ibdev->node_type = RDMA_NODE_IB_CA;
+-	strlcpy(ibdev->name, "bnxt_re%d", IB_DEVICE_NAME_MAX);
+ 	strlcpy(ibdev->node_desc, BNXT_RE_DESC " HCA",
+ 		strlen(BNXT_RE_DESC) + 5);
+ 	ibdev->phys_port_cnt = 1;
+@@ -640,7 +639,7 @@ static int bnxt_re_register_ib(struct bnxt_re_dev *rdev)
+ 	ibdev->alloc_hw_stats           = bnxt_re_ib_alloc_hw_stats;
+ 
+ 	ibdev->driver_id = RDMA_DRIVER_BNXT_RE;
+-	return ib_register_device(ibdev, NULL);
++	return ib_register_device(ibdev, "bnxt_re%d", NULL);
+ }
+ 
+ static ssize_t show_rev(struct device *device, struct device_attribute *attr,
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_provider.c b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+index 68bc2f9a532f..1ea13f2cec4e 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+@@ -1355,7 +1355,6 @@ int iwch_register_device(struct iwch_dev *dev)
+ 	int i;
+ 
+ 	pr_debug("%s iwch_dev %p\n", __func__, dev);
+-	strlcpy(dev->ibdev.name, "cxgb3_%d", IB_DEVICE_NAME_MAX);
+ 	memset(&dev->ibdev.node_guid, 0, sizeof(dev->ibdev.node_guid));
+ 	memcpy(&dev->ibdev.node_guid, dev->rdev.t3cdev_p->lldev->dev_addr, 6);
+ 	dev->ibdev.owner = THIS_MODULE;
+@@ -1443,7 +1442,7 @@ int iwch_register_device(struct iwch_dev *dev)
+ 	       sizeof(dev->ibdev.iwcm->ifname));
+ 
+ 	dev->ibdev.driver_id = RDMA_DRIVER_CXGB3;
+-	ret = ib_register_device(&dev->ibdev, NULL);
++	ret = ib_register_device(&dev->ibdev, "cxgb3_%d", NULL);
+ 	if (ret)
+ 		goto bail1;
+ 
+diff --git a/drivers/infiniband/hw/cxgb4/provider.c b/drivers/infiniband/hw/cxgb4/provider.c
+index 61b8bdb9423d..a92910267a02 100644
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@ -567,7 +567,6 @@ void c4iw_register_device(struct work_struct *work)
+ 	struct c4iw_dev *dev = ctx->dev;
+ 
+ 	pr_debug("c4iw_dev %p\n", dev);
+-	strlcpy(dev->ibdev.name, "cxgb4_%d", IB_DEVICE_NAME_MAX);
+ 	memset(&dev->ibdev.node_guid, 0, sizeof(dev->ibdev.node_guid));
+ 	memcpy(&dev->ibdev.node_guid, dev->rdev.lldi.ports[0]->dev_addr, 6);
+ 	dev->ibdev.owner = THIS_MODULE;
+@@ -658,7 +657,7 @@ void c4iw_register_device(struct work_struct *work)
+ 	       sizeof(dev->ibdev.iwcm->ifname));
+ 
+ 	dev->ibdev.driver_id = RDMA_DRIVER_CXGB4;
+-	ret = ib_register_device(&dev->ibdev, NULL);
++	ret = ib_register_device(&dev->ibdev, "cxgb4_%d", NULL);
+ 	if (ret)
+ 		goto err_kfree_iwcm;
+ 
+diff --git a/drivers/infiniband/hw/hns/hns_roce_main.c b/drivers/infiniband/hw/hns/hns_roce_main.c
+index bb35475fc0ff..87a03b8960a8 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -509,7 +509,6 @@ static int hns_roce_register_device(struct hns_roce_dev *hr_dev)
+ 	spin_lock_init(&iboe->lock);
+ 
+ 	ib_dev = &hr_dev->ib_dev;
+-	strlcpy(ib_dev->name, "hns_%d", IB_DEVICE_NAME_MAX);
+ 
+ 	ib_dev->owner			= THIS_MODULE;
+ 	ib_dev->node_type		= RDMA_NODE_IB_CA;
+@@ -590,7 +589,7 @@ static int hns_roce_register_device(struct hns_roce_dev *hr_dev)
+ 	ib_dev->disassociate_ucontext	= hns_roce_disassociate_ucontext;
+ 
+ 	ib_dev->driver_id = RDMA_DRIVER_HNS;
+-	ret = ib_register_device(ib_dev, NULL);
++	ret = ib_register_device(ib_dev, "hns_%d", NULL);
+ 	if (ret) {
+ 		dev_err(dev, "ib_register_device failed!\n");
+ 		return ret;
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 7d85414742ff..3829f1af7b32 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -2790,7 +2790,6 @@ static struct i40iw_ib_device *i40iw_init_rdma_device(struct i40iw_device *iwdev
+ 		i40iw_pr_err("iwdev == NULL\n");
+ 		return NULL;
+ 	}
+-	strlcpy(iwibdev->ibdev.name, "i40iw%d", IB_DEVICE_NAME_MAX);
+ 	iwibdev->ibdev.owner = THIS_MODULE;
+ 	iwdev->iwibdev = iwibdev;
+ 	iwibdev->iwdev = iwdev;
+@@ -2938,7 +2937,7 @@ int i40iw_register_rdma_device(struct i40iw_device *iwdev)
+ 	iwibdev = iwdev->iwibdev;
+ 
+ 	iwibdev->ibdev.driver_id = RDMA_DRIVER_I40IW;
+-	ret = ib_register_device(&iwibdev->ibdev, NULL);
++	ret = ib_register_device(&iwibdev->ibdev, "i40iw%d", NULL);
+ 	if (ret)
+ 		goto error;
+ 
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index df0764da8283..19395119a3a6 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -2636,7 +2636,6 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+ 	ibdev->dev = dev;
+ 	ibdev->bond_next_port	= 0;
+ 
+-	strlcpy(ibdev->ib_dev.name, "mlx4_%d", IB_DEVICE_NAME_MAX);
+ 	ibdev->ib_dev.owner		= THIS_MODULE;
+ 	ibdev->ib_dev.node_type		= RDMA_NODE_IB_CA;
+ 	ibdev->ib_dev.local_dma_lkey	= dev->caps.reserved_lkey;
+@@ -2897,7 +2896,7 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+ 		goto err_steer_free_bitmap;
+ 
+ 	ibdev->ib_dev.driver_id = RDMA_DRIVER_MLX4;
+-	if (ib_register_device(&ibdev->ib_dev, NULL))
++	if (ib_register_device(&ibdev->ib_dev, "mlx4_%d", NULL))
+ 		goto err_diag_counters;
+ 
+ 	if (mlx4_ib_mad_init(ibdev))
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 1177d9389ab8..85208e7eaea4 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -5336,7 +5336,6 @@ void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+ int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+ {
+ 	struct mlx5_core_dev *mdev = dev->mdev;
+-	const char *name;
+ 	int err;
+ 	int i;
+ 
+@@ -5369,12 +5368,6 @@ int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+ 	if (mlx5_use_mad_ifc(dev))
+ 		get_ext_port_caps(dev);
+ 
+-	if (!mlx5_lag_is_active(mdev))
+-		name = "mlx5_%d";
+-	else
+-		name = "mlx5_bond_%d";
+-
+-	strlcpy(dev->ib_dev.name, name, IB_DEVICE_NAME_MAX);
+ 	dev->ib_dev.owner		= THIS_MODULE;
+ 	dev->ib_dev.node_type		= RDMA_NODE_IB_CA;
+ 	dev->ib_dev.local_dma_lkey	= 0 /* not supported for now */;
+@@ -5788,7 +5781,13 @@ static int mlx5_ib_stage_populate_specs(struct mlx5_ib_dev *dev)
+ 
+ int mlx5_ib_stage_ib_reg_init(struct mlx5_ib_dev *dev)
+ {
+-	return ib_register_device(&dev->ib_dev, NULL);
++	const char *name;
++
++	if (!mlx5_lag_is_active(dev->mdev))
++		name = "mlx5_%d";
++	else
++		name = "mlx5_bond_%d";
++	return ib_register_device(&dev->ib_dev, name, NULL);
+ }
+ 
+ static void mlx5_ib_stage_depopulate_specs(struct mlx5_ib_dev *dev)
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index 0d3473b4596e..7bd7e2ad17e4 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -1198,7 +1198,6 @@ int mthca_register_device(struct mthca_dev *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	strlcpy(dev->ib_dev.name, "mthca%d", IB_DEVICE_NAME_MAX);
+ 	dev->ib_dev.owner                = THIS_MODULE;
+ 
+ 	dev->ib_dev.uverbs_abi_ver	 = MTHCA_UVERBS_ABI_VERSION;
+@@ -1297,7 +1296,7 @@ int mthca_register_device(struct mthca_dev *dev)
+ 	mutex_init(&dev->cap_mask_mutex);
+ 
+ 	dev->ib_dev.driver_id = RDMA_DRIVER_MTHCA;
+-	ret = ib_register_device(&dev->ib_dev, NULL);
++	ret = ib_register_device(&dev->ib_dev, "mthca%d", NULL);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index 8b1f114062e5..8ae02f3dcf7c 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -3694,7 +3694,6 @@ struct nes_ib_device *nes_init_ofa_device(struct net_device *netdev)
+ 	if (nesibdev == NULL) {
+ 		return NULL;
+ 	}
+-	strlcpy(nesibdev->ibdev.name, "nes%d", IB_DEVICE_NAME_MAX);
+ 	nesibdev->ibdev.owner = THIS_MODULE;
+ 
+ 	nesibdev->ibdev.node_type = RDMA_NODE_RNIC;
+@@ -3858,7 +3857,7 @@ int nes_register_ofa_device(struct nes_ib_device *nesibdev)
+ 	int i, ret;
+ 
+ 	nesvnic->nesibdev->ibdev.driver_id = RDMA_DRIVER_NES;
+-	ret = ib_register_device(&nesvnic->nesibdev->ibdev, NULL);
++	ret = ib_register_device(&nesvnic->nesibdev->ibdev, "nes%d", NULL);
+ 	if (ret) {
+ 		return ret;
+ 	}
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_main.c b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+index 5962c0ed9847..4e5b40b7a3ee 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_main.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+@@ -116,7 +116,6 @@ static void get_dev_fw_str(struct ib_device *device, char *str)
+ 
+ static int ocrdma_register_device(struct ocrdma_dev *dev)
+ {
+-	strlcpy(dev->ibdev.name, "ocrdma%d", IB_DEVICE_NAME_MAX);
+ 	ocrdma_get_guid(dev, (u8 *)&dev->ibdev.node_guid);
+ 	BUILD_BUG_ON(sizeof(OCRDMA_NODE_DESC) > IB_DEVICE_NODE_DESC_MAX);
+ 	memcpy(dev->ibdev.node_desc, OCRDMA_NODE_DESC,
+@@ -215,7 +214,7 @@ static int ocrdma_register_device(struct ocrdma_dev *dev)
+ 		dev->ibdev.post_srq_recv = ocrdma_post_srq_recv;
+ 	}
+ 	dev->ibdev.driver_id = RDMA_DRIVER_OCRDMA;
+-	return ib_register_device(&dev->ibdev, NULL);
++	return ib_register_device(&dev->ibdev, "ocrdma%d", NULL);
+ }
+ 
+ static int ocrdma_alloc_resources(struct ocrdma_dev *dev)
+diff --git a/drivers/infiniband/hw/qedr/main.c b/drivers/infiniband/hw/qedr/main.c
+index ad22b32bbd9c..6ef66d942ed5 100644
+--- a/drivers/infiniband/hw/qedr/main.c
++++ b/drivers/infiniband/hw/qedr/main.c
+@@ -170,8 +170,6 @@ static int qedr_register_device(struct qedr_dev *dev)
+ {
+ 	int rc;
+ 
+-	strlcpy(dev->ibdev.name, "qedr%d", IB_DEVICE_NAME_MAX);
+-
+ 	dev->ibdev.node_guid = dev->attr.node_guid;
+ 	memcpy(dev->ibdev.node_desc, QEDR_NODE_DESC, sizeof(QEDR_NODE_DESC));
+ 	dev->ibdev.owner = THIS_MODULE;
+@@ -254,7 +252,7 @@ static int qedr_register_device(struct qedr_dev *dev)
+ 	dev->ibdev.get_dev_fw_str = qedr_get_dev_fw_str;
+ 
+ 	dev->ibdev.driver_id = RDMA_DRIVER_QEDR;
+-	return ib_register_device(&dev->ibdev, NULL);
++	return ib_register_device(&dev->ibdev, "qedr%d", NULL);
+ }
+ 
+ /* This function allocates fast-path status block memory */
+diff --git a/drivers/infiniband/hw/usnic/usnic_ib_main.c b/drivers/infiniband/hw/usnic/usnic_ib_main.c
+index bdce7ed386a8..9250463313db 100644
+--- a/drivers/infiniband/hw/usnic/usnic_ib_main.c
++++ b/drivers/infiniband/hw/usnic/usnic_ib_main.c
+@@ -364,7 +364,6 @@ static void *usnic_ib_device_add(struct pci_dev *dev)
+ 	us_ibdev->ib_dev.num_comp_vectors = USNIC_IB_NUM_COMP_VECTORS;
+ 	us_ibdev->ib_dev.dev.parent = &dev->dev;
+ 	us_ibdev->ib_dev.uverbs_abi_ver = USNIC_UVERBS_ABI_VERSION;
+-	strlcpy(us_ibdev->ib_dev.name, "usnic_%d", IB_DEVICE_NAME_MAX);
+ 
+ 	us_ibdev->ib_dev.uverbs_cmd_mask =
+ 		(1ull << IB_USER_VERBS_CMD_GET_CONTEXT) |
+@@ -416,7 +415,7 @@ static void *usnic_ib_device_add(struct pci_dev *dev)
+ 
+ 
+ 	us_ibdev->ib_dev.driver_id = RDMA_DRIVER_USNIC;
+-	if (ib_register_device(&us_ibdev->ib_dev, NULL))
++	if (ib_register_device(&us_ibdev->ib_dev, "usnic_%d", NULL))
+ 		goto err_fwd_dealloc;
+ 
+ 	usnic_fwd_set_mtu(us_ibdev->ufdev, us_ibdev->netdev->mtu);
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+index 912933549dfb..b0565ed19868 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+@@ -162,7 +162,6 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
+ 	int ret = -1;
+ 	int i = 0;
+ 
+-	strlcpy(dev->ib_dev.name, "vmw_pvrdma%d", IB_DEVICE_NAME_MAX);
+ 	dev->ib_dev.node_guid = dev->dsr->caps.node_guid;
+ 	dev->sys_image_guid = dev->dsr->caps.sys_image_guid;
+ 	dev->flags = 0;
+@@ -270,7 +269,7 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
+ 	dev->ib_dev.driver_id = RDMA_DRIVER_VMW_PVRDMA;
+ 	spin_lock_init(&dev->srq_tbl_lock);
+ 
+-	ret = ib_register_device(&dev->ib_dev, NULL);
++	ret = ib_register_device(&dev->ib_dev, "vmw_pvrdma%d", NULL);
+ 	if (ret)
+ 		goto err_srq_free;
+ 
+diff --git a/drivers/infiniband/sw/rdmavt/vt.c b/drivers/infiniband/sw/rdmavt/vt.c
+index 17e4abc067af..e3249d46bcef 100644
+--- a/drivers/infiniband/sw/rdmavt/vt.c
++++ b/drivers/infiniband/sw/rdmavt/vt.c
+@@ -828,7 +828,8 @@ int rvt_register_device(struct rvt_dev_info *rdi, u32 driver_id)
+ 
+ 	rdi->ibdev.driver_id = driver_id;
+ 	/* We are now good to announce we exist */
+-	ret =  ib_register_device(&rdi->ibdev, rdi->driver_f.port_callback);
++	ret = ib_register_device(&rdi->ibdev, dev_name(&rdi->ibdev.dev),
++				 rdi->driver_f.port_callback);
+ 	if (ret) {
+ 		rvt_pr_err(rdi, "Failed to register driver with ib core.\n");
+ 		goto bail_mr;
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index 0ea394554c8e..3ac0dd8be467 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -1159,7 +1159,6 @@ int rxe_register_device(struct rxe_dev *rxe)
+ 	struct ib_device *dev = &rxe->ib_dev;
+ 	struct crypto_shash *tfm;
+ 
+-	strlcpy(dev->name, "rxe%d", IB_DEVICE_NAME_MAX);
+ 	strlcpy(dev->node_desc, "rxe", sizeof(dev->node_desc));
+ 
+ 	dev->owner = THIS_MODULE;
+@@ -1261,7 +1260,7 @@ int rxe_register_device(struct rxe_dev *rxe)
+ 	rxe->tfm = tfm;
+ 
+ 	dev->driver_id = RDMA_DRIVER_RXE;
+-	err = ib_register_device(dev, NULL);
++	err = ib_register_device(dev, "rxe%d", NULL);
+ 	if (err) {
+ 		pr_warn("%s failed with error %d\n", __func__, err);
+ 		goto err1;
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 6eada57914aa..c98525899507 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2647,9 +2647,9 @@ void ib_dealloc_device(struct ib_device *device);
+ 
+ void ib_get_device_fw_str(struct ib_device *device, char *str);
+ 
+-int ib_register_device(struct ib_device *device,
+-		       int (*port_callback)(struct ib_device *,
+-					    u8, struct kobject *));
++int ib_register_device(struct ib_device *device, const char *name,
++		       int (*port_callback)(struct ib_device *, u8,
++					    struct kobject *));
+ void ib_unregister_device(struct ib_device *device);
+ 
+ int ib_register_client   (struct ib_client *client);
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index e32facdd9fd3..065c9fbe6589 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -429,7 +429,14 @@ static inline void rvt_set_ibdev_name(struct rvt_dev_info *rdi,
+ 				      const char *fmt, const char *name,
+ 				      const int unit)
+ {
+-	snprintf(rdi->ibdev.name, sizeof(rdi->ibdev.name), fmt, name, unit);
++	/*
++	 * FIXME: rvt and its users want to touch the ibdev before
++	 * registration and have things like the name work. We don't have the
++	 * infrastructure in the core to support this directly today, hack it
++	 * to work by setting the name manually here.
++	 */
++	dev_set_name(&rdi->ibdev.dev, fmt, name, unit);
++	strlcpy(rdi->ibdev.name, dev_name(&rdi->ibdev.dev), IB_DEVICE_NAME_MAX);
+ }
+ 
+ /**
