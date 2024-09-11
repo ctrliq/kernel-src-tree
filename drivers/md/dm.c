@@ -1454,6 +1454,7 @@ static int __send_empty_flush(struct clone_info *ci)
 	flush_bio.bi_opf = REQ_OP_WRITE | REQ_PREFLUSH | REQ_SYNC;
 	ci->bio = &flush_bio;
 	ci->sector_count = 0;
+	ci->io->tio.clone.bi_iter.bi_size = 0;
 
 	/*
 	 * Empty flush uses a statically initialized bio, as the base for
