@@ -24,6 +24,7 @@
 
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/iommu.h>
 
 #include "gt/intel_gt.h"
 #include "gt/intel_gt_requests.h"
@@ -112,6 +113,9 @@ struct drm_i915_private *mock_gem_device(void)
 {
 	struct drm_i915_private *i915;
 	struct pci_dev *pdev;
+#if IS_ENABLED(CONFIG_IOMMU_API) && defined(CONFIG_INTEL_IOMMU)
+	struct dev_iommu iommu;
+#endif
 	int err;
 
 	pdev = kzalloc(sizeof(*pdev) + sizeof(*i915), GFP_KERNEL);
@@ -125,8 +129,10 @@ struct drm_i915_private *mock_gem_device(void)
 	dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 
 #if IS_ENABLED(CONFIG_IOMMU_API) && defined(CONFIG_INTEL_IOMMU)
-	/* hack to disable iommu for the fake device; force identity mapping */
-	pdev->dev.archdata.iommu = (void *)-1;
+	/* HACK HACK HACK to disable iommu for the fake device; force identity mapping */
+	memset(&iommu, 0, sizeof(iommu));
+	iommu.priv = (void *)-1;
+	pdev->dev.iommu = &iommu;
 #endif
 
 	i915 = (struct drm_i915_private *)(pdev + 1);
