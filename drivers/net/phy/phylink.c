@@ -307,6 +307,10 @@ static int phylink_parse_mode(struct phylink *pl, struct fwnode_handle *fwnode)
 			phylink_set(pl->supported, 2500baseX_Full);
 			break;
 
+		case PHY_INTERFACE_MODE_5GBASER:
+			phylink_set(pl->supported, 5000baseT_Full);
+			break;
+
 		case PHY_INTERFACE_MODE_USXGMII:
 		case PHY_INTERFACE_MODE_10GKR:
 			phylink_set(pl->supported, 10baseT_Half);
