@@ -1,0 +1,80 @@
+svcrdma: Normalize Send page handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 2a1e4f21d84184f7ff5768ee3d3d0c30b1135867
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2a1e4f21.failed
+
+Currently svc_rdma_sendto() migrates xdr_buf pages into a separate
+page list and NULLs out a bunch of entries in rq_pages while the
+pages are under I/O. The Send completion handler then frees those
+pages later.
+
+Instead, let's wait for the Send completion, then handle page
+releasing in the nfsd thread. I'd like to avoid the cost of 250+
+put_page() calls in the Send completion handler, which is single-
+threaded.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 2a1e4f21d84184f7ff5768ee3d3d0c30b1135867)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_sendto.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index e6fab5dd20d0,62d55850ca54..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@@ -283,12 -286,8 +286,17 @@@ static void svc_rdma_wc_send(struct ib_
+  	atomic_inc(&rdma->sc_sq_avail);
+  	wake_up(&rdma->sc_send_wait);
+  
+++<<<<<<< HEAD
+ +	svc_rdma_send_ctxt_put(rdma, ctxt);
+ +
+ +	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+ +		set_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags);
+ +		svc_xprt_enqueue(&rdma->sc_xprt);
+ +	}
+++=======
++ 	if (unlikely(wc->status != IB_WC_SUCCESS))
++ 		svc_xprt_deferred_close(&rdma->sc_xprt);
+++>>>>>>> 2a1e4f21d841 (svcrdma: Normalize Send page handling)
+  }
+  
+  /**
+diff --git a/include/linux/sunrpc/svc_rdma.h b/include/linux/sunrpc/svc_rdma.h
+index 9c4cf3614de1..cb690009935e 100644
+--- a/include/linux/sunrpc/svc_rdma.h
++++ b/include/linux/sunrpc/svc_rdma.h
+@@ -165,6 +165,7 @@ struct svc_rdma_send_ctxt {
+ 
+ 	struct ib_send_wr	sc_send_wr;
+ 	struct ib_cqe		sc_cqe;
++	struct completion	sc_done;
+ 	struct xdr_buf		sc_hdrbuf;
+ 	struct xdr_stream	sc_stream;
+ 	void			*sc_xprt_buf;
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+index 9150df35fb6f..16897fcb659c 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+@@ -93,7 +93,13 @@ static int svc_rdma_bc_sendto(struct svcxprt_rdma *rdma,
+ 	 */
+ 	get_page(virt_to_page(rqst->rq_buffer));
+ 	sctxt->sc_send_wr.opcode = IB_WR_SEND;
+-	return svc_rdma_send(rdma, sctxt);
++	ret = svc_rdma_send(rdma, sctxt);
++	if (ret < 0)
++		return ret;
++
++	ret = wait_for_completion_killable(&sctxt->sc_done);
++	svc_rdma_send_ctxt_put(rdma, sctxt);
++	return ret;
+ }
+ 
+ /* Server-side transport endpoint wants a whole page for its send
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_sendto.c
