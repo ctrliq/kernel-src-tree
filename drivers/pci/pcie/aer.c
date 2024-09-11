@@ -138,9 +138,6 @@ static int enable_ecrc_checking(struct pci_dev *dev)
 	int pos;
 	u32 reg32;
 
-	if (!pci_is_pcie(dev))
-		return -ENODEV;
-
 	pos = dev->aer_cap;
 	if (!pos)
 		return -ENODEV;
@@ -165,9 +162,6 @@ static int disable_ecrc_checking(struct pci_dev *dev)
 {
 	int pos;
 	u32 reg32;
-
-	if (!pci_is_pcie(dev))
-		return -ENODEV;
 
 	pos = dev->aer_cap;
 	if (!pos)
@@ -409,9 +403,6 @@ int pci_aer_raw_clear_status(struct pci_dev *dev)
 	int pos;
 	u32 status;
 	int port_type;
-
-	if (!pci_is_pcie(dev))
-		return -ENODEV;
 
 	pos = dev->aer_cap;
 	if (!pos)
