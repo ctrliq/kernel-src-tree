@@ -1,0 +1,186 @@
+SUNRPC: Improve latency for interactive tasks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 918f3c1fe83c5baa4892b943d3f5ac7191d8fb74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/918f3c1f.failed
+
+One of the intentions with the priority queues was to ensure that no
+single process can hog the transport. The field task->tk_owner therefore
+identifies the RPC call's origin, and is intended to allow the RPC layer
+to organise queues for fairness.
+This commit therefore modifies the transmit queue to group requests
+by task->tk_owner, and ensures that we round robin among those groups.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 918f3c1fe83c5baa4892b943d3f5ac7191d8fb74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/xprt.h
+#	net/sunrpc/xprt.c
+diff --cc include/linux/sunrpc/xprt.h
+index dea3a9fa5d2a,e377620b9744..000000000000
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@@ -82,7 -82,14 +82,18 @@@ struct rpc_rqst 
+  	struct page		**rq_enc_pages;	/* scratch pages for use by
+  						   gss privacy code */
+  	void (*rq_release_snd_buf)(struct rpc_rqst *); /* release rq_enc_pages */
+++<<<<<<< HEAD
+ +	struct list_head	rq_list;
+++=======
++ 
++ 	union {
++ 		struct list_head	rq_list;	/* Slot allocation list */
++ 		struct list_head	rq_recv;	/* Receive queue */
++ 	};
++ 
++ 	struct list_head	rq_xmit;	/* Send queue */
++ 	struct list_head	rq_xmit2;	/* Send queue */
+++>>>>>>> 918f3c1fe83c (SUNRPC: Improve latency for interactive tasks)
+  
+  	void			*rq_buffer;	/* Call XDR encode buffer */
+  	size_t			rq_callsize;
+diff --cc net/sunrpc/xprt.c
+index eacde9249456,44d0eeaddaac..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -956,6 -1006,129 +956,132 @@@ static void xprt_timer(struct rpc_task 
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * xprt_request_wait_receive - wait for the reply to an RPC request
++  * @task: RPC task about to send a request
++  *
++  */
++ void xprt_request_wait_receive(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (!test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate))
++ 		return;
++ 	/*
++ 	 * Sleep on the pending queue if we're expecting a reply.
++ 	 * The spinlock ensures atomicity between the test of
++ 	 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
++ 	 */
++ 	spin_lock(&xprt->queue_lock);
++ 	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
++ 		xprt->ops->set_retrans_timeout(task);
++ 		rpc_sleep_on(&xprt->pending, task, xprt_timer);
++ 		/*
++ 		 * Send an extra queue wakeup call if the
++ 		 * connection was dropped in case the call to
++ 		 * rpc_sleep_on() raced.
++ 		 */
++ 		if (xprt_request_retransmit_after_disconnect(task))
++ 			rpc_wake_up_queued_task_set_status(&xprt->pending,
++ 					task, -ENOTCONN);
++ 	}
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ static bool
++ xprt_request_need_enqueue_transmit(struct rpc_task *task, struct rpc_rqst *req)
++ {
++ 	return !test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ }
++ 
++ /**
++  * xprt_request_enqueue_transmit - queue a task for transmission
++  * @task: pointer to rpc_task
++  *
++  * Add a task to the transmission queue.
++  */
++ void
++ xprt_request_enqueue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *pos, *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (xprt_request_need_enqueue_transmit(task, req)) {
++ 		spin_lock(&xprt->queue_lock);
++ 		list_for_each_entry(pos, &xprt->xmit_queue, rq_xmit) {
++ 			if (pos->rq_task->tk_owner != task->tk_owner)
++ 				continue;
++ 			list_add_tail(&req->rq_xmit2, &pos->rq_xmit2);
++ 			INIT_LIST_HEAD(&req->rq_xmit);
++ 			goto out;
++ 		}
++ 		list_add_tail(&req->rq_xmit, &xprt->xmit_queue);
++ 		INIT_LIST_HEAD(&req->rq_xmit2);
++ out:
++ 		set_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ 		spin_unlock(&xprt->queue_lock);
++ 	}
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit_locked - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  * Caller must hold xprt->queue_lock
++  */
++ static void
++ xprt_request_dequeue_transmit_locked(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 
++ 	if (!test_and_clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 		return;
++ 	if (!list_empty(&req->rq_xmit)) {
++ 		list_del(&req->rq_xmit);
++ 		if (!list_empty(&req->rq_xmit2)) {
++ 			struct rpc_rqst *next = list_first_entry(&req->rq_xmit2,
++ 					struct rpc_rqst, rq_xmit2);
++ 			list_del(&req->rq_xmit2);
++ 			list_add_tail(&next->rq_xmit, &next->rq_xprt->xmit_queue);
++ 		}
++ 	} else
++ 		list_del(&req->rq_xmit2);
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  */
++ static void
++ xprt_request_dequeue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	xprt_request_dequeue_transmit_locked(task);
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ /**
++  * xprt_request_need_retransmit - Test if a task needs retransmission
++  * @task: pointer to rpc_task
++  *
++  * Test for whether a connection breakage requires the task to retransmit
++  */
++ bool
++ xprt_request_need_retransmit(struct rpc_task *task)
++ {
++ 	return xprt_request_retransmit_after_disconnect(task);
++ }
++ 
++ /**
+++>>>>>>> 918f3c1fe83c (SUNRPC: Improve latency for interactive tasks)
+   * xprt_prepare_transmit - reserve the transport before sending a request
+   * @task: RPC task about to send a request
+   *
+* Unmerged path include/linux/sunrpc/xprt.h
+* Unmerged path net/sunrpc/xprt.c
