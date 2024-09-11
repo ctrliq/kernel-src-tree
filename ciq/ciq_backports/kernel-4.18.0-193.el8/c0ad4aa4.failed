@@ -1,0 +1,103 @@
+sched/fair: Robustify CFS-bandwidth timer locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit c0ad4aa4d8416a39ad262a2bd68b30acd951bf0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c0ad4aa4.failed
+
+Traditionally hrtimer callbacks were run with IRQs disabled, but with
+the introduction of HRTIMER_MODE_SOFT it is possible they run from
+SoftIRQ context, which does _NOT_ have IRQs disabled.
+
+Allow for the CFS bandwidth timers (period_timer and slack_timer) to
+be ran from SoftIRQ context; this entails removing the assumption that
+IRQs are already disabled from the locking.
+
+While mainline doesn't strictly need this, -RT forces all timers not
+explicitly marked with MODE_HARD into MODE_SOFT and trips over this.
+And marking these timers as MODE_HARD doesn't make sense as they're
+not required for RT operation and can potentially be quite expensive.
+
+	Reported-by: Tom Putzeys <tom.putzeys@be.atlascopco.com>
+	Tested-by: Mike Galbraith <efault@gmx.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20190107125231.GE14122@hirez.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit c0ad4aa4d8416a39ad262a2bd68b30acd951bf0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index ac1ea15cb853,3b61e19b504a..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -4769,11 -4782,11 +4770,11 @@@ static void do_sched_cfs_slack_timer(st
+  
+  	runtime = distribute_cfs_runtime(cfs_b, runtime, expires);
+  
+- 	raw_spin_lock(&cfs_b->lock);
++ 	raw_spin_lock_irqsave(&cfs_b->lock, flags);
+  	if (expires == cfs_b->runtime_expires)
+ -		lsub_positive(&cfs_b->runtime, runtime);
+ +		cfs_b->runtime -= min(runtime, cfs_b->runtime);
+  	cfs_b->distribute_running = 0;
+- 	raw_spin_unlock(&cfs_b->lock);
++ 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+  }
+  
+  /*
+@@@ -4853,39 -4864,17 +4854,44 @@@ static enum hrtimer_restart sched_cfs_p
+  {
+  	struct cfs_bandwidth *cfs_b =
+  		container_of(timer, struct cfs_bandwidth, period_timer);
++ 	unsigned long flags;
+  	int overrun;
+  	int idle = 0;
+ +	int count = 0;
+  
+- 	raw_spin_lock(&cfs_b->lock);
++ 	raw_spin_lock_irqsave(&cfs_b->lock, flags);
+  	for (;;) {
+  		overrun = hrtimer_forward_now(timer, cfs_b->period);
+  		if (!overrun)
+  			break;
+  
+++<<<<<<< HEAD
+ +		if (++count > 3) {
+ +			u64 new, old = ktime_to_ns(cfs_b->period);
+ +
+ +			new = (old * 147) / 128; /* ~115% */
+ +			new = min(new, max_cfs_quota_period);
+ +
+ +			cfs_b->period = ns_to_ktime(new);
+ +
+ +			/* since max is 1s, this is limited to 1e9^2, which fits in u64 */
+ +			cfs_b->quota *= new;
+ +			cfs_b->quota = div64_u64(cfs_b->quota, old);
+ +
+ +			pr_warn_ratelimited(
+ +	"cfs_period_timer[cpu%d]: period too short, scaling up (new cfs_period_us %lld, cfs_quota_us = %lld)\n",
+ +				smp_processor_id(),
+ +				div_u64(new, NSEC_PER_USEC),
+ +				div_u64(cfs_b->quota, NSEC_PER_USEC));
+ +
+ +			/* reset count so we don't come right back in here */
+ +			count = 0;
+ +		}
+ +
+ +		idle = do_sched_cfs_period_timer(cfs_b, overrun);
+++=======
++ 		idle = do_sched_cfs_period_timer(cfs_b, overrun, flags);
+++>>>>>>> c0ad4aa4d841 (sched/fair: Robustify CFS-bandwidth timer locking)
+  	}
+  	if (idle)
+  		cfs_b->period_active = 0;
+* Unmerged path kernel/sched/fair.c
