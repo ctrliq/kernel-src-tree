@@ -1,0 +1,187 @@
+s390/vfio-ap: use proper locking order when setting/clearing KVM pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit b84eb8e05057f6f329e28f2563668340ea14184b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b84eb8e0.failed
+
+The group notifier that handles the VFIO_GROUP_NOTIFY_SET_KVM event must
+use the required locks in proper locking order to dynamically update the
+guest's APCB. The proper locking order is:
+
+       1. matrix_dev->guests_lock: required to use the KVM pointer to
+          update a KVM guest's APCB.
+
+       2. matrix_mdev->kvm->lock: required to update a KVM guest's APCB.
+
+       3. matrix_dev->mdevs_lock: required to store or access the data
+          stored in a struct ap_matrix_mdev instance.
+
+Two macros are introduced to acquire and release the locks in the proper
+order. These macros are now used by the group notifier functions.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit b84eb8e05057f6f329e28f2563668340ea14184b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index 69b05ef08538,20f779dd8ab9..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -24,21 -26,67 +24,71 @@@
+  #define VFIO_AP_MDEV_TYPE_HWVIRT "passthrough"
+  #define VFIO_AP_MDEV_NAME_HWVIRT "VFIO AP Passthrough Device"
+  
+ -#define AP_QUEUE_ASSIGNED "assigned"
+ -#define AP_QUEUE_UNASSIGNED "unassigned"
+ -#define AP_QUEUE_IN_USE "in use"
+ -
+ -static int vfio_ap_mdev_reset_queues(struct ap_matrix_mdev *matrix_mdev);
+ +static int vfio_ap_mdev_reset_queues(struct mdev_device *mdev);
+  static struct vfio_ap_queue *vfio_ap_find_queue(int apqn);
+ -static const struct vfio_device_ops vfio_ap_matrix_dev_ops;
+  
+  /**
+++<<<<<<< HEAD
+ + * vfio_ap_get_queue - retrieve a queue with a specific APQN from a list
+ + * @matrix_mdev: the associated mediated matrix
+ + * @apqn: The queue APQN
+++=======
++  * get_update_locks_for_kvm: Acquire the locks required to dynamically update a
++  *			     KVM guest's APCB in the proper order.
++  *
++  * @kvm: a pointer to a struct kvm object containing the KVM guest's APCB.
++  *
++  * The proper locking order is:
++  * 1. matrix_dev->guests_lock: required to use the KVM pointer to update a KVM
++  *			       guest's APCB.
++  * 2. kvm->lock:	       required to update a guest's APCB
++  * 3. matrix_dev->mdevs_lock:  required to access data stored in a matrix_mdev
++  *
++  * Note: If @kvm is NULL, the KVM lock will not be taken.
++  */
++ static inline void get_update_locks_for_kvm(struct kvm *kvm)
++ {
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 	if (kvm)
++ 		mutex_lock(&kvm->lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ }
++ 
++ /**
++  * release_update_locks_for_kvm: Release the locks used to dynamically update a
++  *				 KVM guest's APCB in the proper order.
++  *
++  * @kvm: a pointer to a struct kvm object containing the KVM guest's APCB.
++  *
++  * The proper unlocking order is:
++  * 1. matrix_dev->mdevs_lock
++  * 2. kvm->lock
++  * 3. matrix_dev->guests_lock
++  *
++  * Note: If @kvm is NULL, the KVM lock will not be released.
++  */
++ static inline void release_update_locks_for_kvm(struct kvm *kvm)
++ {
++ 	mutex_unlock(&matrix_dev->mdevs_lock);
++ 	if (kvm)
++ 		mutex_unlock(&kvm->lock);
++ 	mutex_unlock(&matrix_dev->guests_lock);
++ }
++ 
++ /**
++  * vfio_ap_mdev_get_queue - retrieve a queue with a specific APQN from a
++  *			    hash table of queues assigned to a matrix mdev
++  * @matrix_mdev: the matrix mdev
++  * @apqn: The APQN of a queue device
+++>>>>>>> b84eb8e05057 (s390/vfio-ap: use proper locking order when setting/clearing KVM pointer)
+ + *
+ + * Retrieve a queue with a specific APQN from the list of the
+ + * devices of the vfio_ap_drv.
+ + * Verify that the APID and the APQI are set in the matrix.
+   *
+ - * Return: the pointer to the vfio_ap_queue struct representing the queue or
+ - *	   NULL if the queue is not assigned to @matrix_mdev
+ + * Return: the pointer to the associated vfio_ap_queue
+   */
+ -static struct vfio_ap_queue *vfio_ap_mdev_get_queue(
+ +static struct vfio_ap_queue *vfio_ap_get_queue(
+  					struct ap_matrix_mdev *matrix_mdev,
+  					int apqn)
+  {
+@@@ -1064,26 -1309,22 +1114,38 @@@ static int vfio_ap_mdev_set_kvm(struct 
+  		kvm->arch.crypto.pqap_hook = &matrix_mdev->pqap_hook;
+  		up_write(&kvm->arch.crypto.pqap_hook_rwsem);
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&kvm->lock);
+ +		mutex_lock(&matrix_dev->lock);
+ +
+ +		list_for_each_entry(m, &matrix_dev->mdev_list, node) {
+ +			if (m != matrix_mdev && m->kvm == kvm) {
+ +				mutex_unlock(&kvm->lock);
+ +				mutex_unlock(&matrix_dev->lock);
+++=======
++ 		get_update_locks_for_kvm(kvm);
++ 
++ 		list_for_each_entry(m, &matrix_dev->mdev_list, node) {
++ 			if (m != matrix_mdev && m->kvm == kvm) {
++ 				release_update_locks_for_kvm(kvm);
+++>>>>>>> b84eb8e05057 (s390/vfio-ap: use proper locking order when setting/clearing KVM pointer)
+  				return -EPERM;
+  			}
+  		}
+  
+  		kvm_get_kvm(kvm);
+  		matrix_mdev->kvm = kvm;
+ -		kvm_arch_crypto_set_masks(kvm, matrix_mdev->shadow_apcb.apm,
+ -					  matrix_mdev->shadow_apcb.aqm,
+ -					  matrix_mdev->shadow_apcb.adm);
+ +		kvm_arch_crypto_set_masks(kvm,
+ +					  matrix_mdev->matrix.apm,
+ +					  matrix_mdev->matrix.aqm,
+ +					  matrix_mdev->matrix.adm);
+  
+++<<<<<<< HEAD
+ +		mutex_unlock(&kvm->lock);
+ +		mutex_unlock(&matrix_dev->lock);
+++=======
++ 		release_update_locks_for_kvm(kvm);
+++>>>>>>> b84eb8e05057 (s390/vfio-ap: use proper locking order when setting/clearing KVM pointer)
+  	}
+  
+  	return 0;
+@@@ -1141,16 -1375,14 +1203,24 @@@ static void vfio_ap_mdev_unset_kvm(stru
+  		kvm->arch.crypto.pqap_hook = NULL;
+  		up_write(&kvm->arch.crypto.pqap_hook_rwsem);
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&kvm->lock);
+ +		mutex_lock(&matrix_dev->lock);
+++=======
++ 		get_update_locks_for_kvm(kvm);
+++>>>>>>> b84eb8e05057 (s390/vfio-ap: use proper locking order when setting/clearing KVM pointer)
+  
+  		kvm_arch_crypto_clear_masks(kvm);
+ -		vfio_ap_mdev_reset_queues(matrix_mdev);
+ +		vfio_ap_mdev_reset_queues(matrix_mdev->mdev);
+  		kvm_put_kvm(kvm);
+  		matrix_mdev->kvm = NULL;
+  
+++<<<<<<< HEAD
+ +		mutex_unlock(&kvm->lock);
+ +		mutex_unlock(&matrix_dev->lock);
+++=======
++ 		release_update_locks_for_kvm(kvm);
+++>>>>>>> b84eb8e05057 (s390/vfio-ap: use proper locking order when setting/clearing KVM pointer)
+  	}
+  }
+  
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
