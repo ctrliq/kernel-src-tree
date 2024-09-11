@@ -1,0 +1,151 @@
+mm, compaction: finish pageblock scanning on contention
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit cb2dcaf023c2cf12d45289c82d4030d33f7df73e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cb2dcaf0.failed
+
+Async migration aborts on spinlock contention but contention can be high
+when there are multiple compaction attempts and kswapd is active.  The
+consequence is that the migration scanners move forward uselessly while
+still contending on locks for longer while leaving suitable migration
+sources behind.
+
+This patch will acquire the lock but track when contention occurs.  When
+it does, the current pageblock will finish as compaction may succeed for
+that block and then abort.  This will have a variable impact on latency
+as in some cases useless scanning is avoided (reduces latency) but a
+lock will be contended (increase latency) or a single contended
+pageblock is scanned that would otherwise have been skipped (increase
+latency).
+
+                                     5.0.0-rc1              5.0.0-rc1
+                                norescan-v3r16    finishcontend-v3r16
+Amean     fault-both-1         0.00 (   0.00%)        0.00 *   0.00%*
+Amean     fault-both-3      3002.07 (   0.00%)     3153.17 (  -5.03%)
+Amean     fault-both-5      4684.47 (   0.00%)     4280.52 (   8.62%)
+Amean     fault-both-7      6815.54 (   0.00%)     5811.50 *  14.73%*
+Amean     fault-both-12    10864.02 (   0.00%)     9276.85 (  14.61%)
+Amean     fault-both-18    12247.52 (   0.00%)    11032.67 (   9.92%)
+Amean     fault-both-24    15683.99 (   0.00%)    14285.70 (   8.92%)
+Amean     fault-both-30    18620.02 (   0.00%)    16293.76 *  12.49%*
+Amean     fault-both-32    19250.28 (   0.00%)    16721.02 *  13.14%*
+
+                                5.0.0-rc1              5.0.0-rc1
+                           norescan-v3r16    finishcontend-v3r16
+Percentage huge-1         0.00 (   0.00%)        0.00 (   0.00%)
+Percentage huge-3        95.00 (   0.00%)       96.82 (   1.92%)
+Percentage huge-5        94.22 (   0.00%)       95.40 (   1.26%)
+Percentage huge-7        92.35 (   0.00%)       95.92 (   3.86%)
+Percentage huge-12       91.90 (   0.00%)       96.73 (   5.25%)
+Percentage huge-18       89.58 (   0.00%)       96.77 (   8.03%)
+Percentage huge-24       90.03 (   0.00%)       96.05 (   6.69%)
+Percentage huge-30       89.14 (   0.00%)       96.81 (   8.60%)
+Percentage huge-32       90.58 (   0.00%)       97.41 (   7.54%)
+
+There is a variable impact that is mostly good on latency while allocation
+success rates are slightly higher.  System CPU usage is reduced by about
+10% but scan rate impact is mixed
+
+Compaction migrate scanned    27997659.00    20148867
+Compaction free scanned      120782791.00   118324914
+
+Migration scan rates are reduced 28% which is expected as a pageblock is
+used by the async scanner instead of skipped.  The impact on the free
+scanner is known to be variable.  Overall the primary justification for
+this patch is that completing scanning of a pageblock is very important
+for later patches.
+
+[yuehaibing@huawei.com: fix unused variable warning]
+Link: http://lkml.kernel.org/r/20190118175136.31341-14-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: YueHaibing <yuehaibing@huawei.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cb2dcaf023c2cf12d45289c82d4030d33f7df73e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 9d273235c740,5325211398f8..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -848,10 -887,15 +835,20 @@@ isolate_migratepages_block(struct compa
+  
+  		/* If we already hold the lock, we can skip some rechecking */
+  		if (!locked) {
+- 			locked = compact_trylock_irqsave(zone_lru_lock(zone),
++ 			locked = compact_lock_irqsave(zone_lru_lock(zone),
+  								&flags, cc);
+++<<<<<<< HEAD
+ +			if (!locked)
+ +				break;
+++=======
++ 
++ 			/* Try get exclusive access under lock */
++ 			if (!skip_updated) {
++ 				skip_updated = true;
++ 				if (test_and_set_skip(cc, page, low_pfn))
++ 					goto isolate_abort;
++ 			}
+++>>>>>>> cb2dcaf023c2 (mm, compaction: finish pageblock scanning on contention)
+  
+  			/* Recheck PageLRU and PageCompound under lock */
+  			if (!PageLRU(page))
+@@@ -886,8 -930,14 +883,19 @@@ isolate_success
+  		cc->nr_migratepages++;
+  		nr_isolated++;
+  
+++<<<<<<< HEAD
+ +		/* Avoid isolating too much */
+ +		if (cc->nr_migratepages == COMPACT_CLUSTER_MAX) {
+++=======
++ 		/*
++ 		 * Avoid isolating too much unless this block is being
++ 		 * rescanned (e.g. dirty/writeback pages, parallel allocation)
++ 		 * or a lock is contended. For contention, isolate quickly to
++ 		 * potentially remove one source of contention.
++ 		 */
++ 		if (cc->nr_migratepages == COMPACT_CLUSTER_MAX &&
++ 		    !cc->rescan && !cc->contended) {
+++>>>>>>> cb2dcaf023c2 (mm, compaction: finish pageblock scanning on contention)
+  			++low_pfn;
+  			break;
+  		}
+@@@ -1342,8 -1773,9 +1339,9 @@@ static enum compact_result __compact_fi
+  		return COMPACT_CONTINUE;
+  
+  	/* Direct compactor: Is a suitable page free? */
++ 	ret = COMPACT_NO_SUITABLE_PAGE;
+  	for (order = cc->order; order < MAX_ORDER; order++) {
+ -		struct free_area *area = &cc->zone->free_area[order];
+ +		struct free_area *area = &zone->free_area[order];
+  		bool can_steal;
+  
+  		/* Job done if page is free of the right migratetype */
+@@@ -1385,11 -1818,13 +1384,14 @@@
+  		}
+  	}
+  
+- 	return COMPACT_NO_SUITABLE_PAGE;
++ 	if (cc->contended || fatal_signal_pending(current))
++ 		ret = COMPACT_CONTENDED;
++ 
++ 	return ret;
+  }
+  
+ -static enum compact_result compact_finished(struct compact_control *cc)
+ +static enum compact_result compact_finished(struct zone *zone,
+ +			struct compact_control *cc)
+  {
+  	int ret;
+  
+* Unmerged path mm/compaction.c
