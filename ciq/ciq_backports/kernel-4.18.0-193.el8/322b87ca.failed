@@ -1,0 +1,202 @@
+bnxt_en: add page_pool support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andy Gospodarek <gospo@broadcom.com>
+commit 322b87ca55f2f3936ec9f9de438ef9b2115b5c9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/322b87ca.failed
+
+This removes contention over page allocation for XDP_REDIRECT actions by
+adding page_pool support per queue for the driver.  The performance for
+XDP_REDIRECT actions scales linearly with the number of cores performing
+redirect actions when using the page pools instead of the standard page
+allocator.
+
+v2: Fix up the error path from XDP registration, noted by Ilias Apalodimas.
+
+	Signed-off-by: Andy Gospodarek <gospo@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 322b87ca55f2f3936ec9f9de438ef9b2115b5c9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/Kconfig
+diff --cc drivers/net/ethernet/broadcom/Kconfig
+index 468621e8a3f2,e9017caf024d..000000000000
+--- a/drivers/net/ethernet/broadcom/Kconfig
++++ b/drivers/net/ethernet/broadcom/Kconfig
+@@@ -196,6 -198,8 +196,11 @@@ config BNX
+  	depends on PCI
+  	select FW_LOADER
+  	select LIBCRC32C
+++<<<<<<< HEAD
+++=======
++ 	select NET_DEVLINK
++ 	select PAGE_POOL
+++>>>>>>> 322b87ca55f2 (bnxt_en: add page_pool support)
+  	---help---
+  	  This driver supports Broadcom NetXtreme-C/E 10/25/40/50 gigabit
+  	  Ethernet cards.  To compile this driver as a module, choose M here:
+* Unmerged path drivers/net/ethernet/broadcom/Kconfig
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index fa16b08f5035..c36b8d7f4e15 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -54,6 +54,7 @@
+ #include <net/pkt_cls.h>
+ #include <linux/hwmon.h>
+ #include <linux/hwmon-sysfs.h>
++#include <net/page_pool.h>
+ 
+ #include "bnxt_hsi.h"
+ #include "bnxt.h"
+@@ -670,19 +671,20 @@ static void bnxt_tx_int(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts)
+ }
+ 
+ static struct page *__bnxt_alloc_rx_page(struct bnxt *bp, dma_addr_t *mapping,
++					 struct bnxt_rx_ring_info *rxr,
+ 					 gfp_t gfp)
+ {
+ 	struct device *dev = &bp->pdev->dev;
+ 	struct page *page;
+ 
+-	page = alloc_page(gfp);
++	page = page_pool_dev_alloc_pages(rxr->page_pool);
+ 	if (!page)
+ 		return NULL;
+ 
+ 	*mapping = dma_map_page_attrs(dev, page, 0, PAGE_SIZE, bp->rx_dir,
+ 				      DMA_ATTR_WEAK_ORDERING);
+ 	if (dma_mapping_error(dev, *mapping)) {
+-		__free_page(page);
++		page_pool_recycle_direct(rxr->page_pool, page);
+ 		return NULL;
+ 	}
+ 	*mapping += bp->rx_dma_offset;
+@@ -718,7 +720,8 @@ int bnxt_alloc_rx_data(struct bnxt *bp, struct bnxt_rx_ring_info *rxr,
+ 	dma_addr_t mapping;
+ 
+ 	if (BNXT_RX_PAGE_MODE(bp)) {
+-		struct page *page = __bnxt_alloc_rx_page(bp, &mapping, gfp);
++		struct page *page =
++			__bnxt_alloc_rx_page(bp, &mapping, rxr, gfp);
+ 
+ 		if (!page)
+ 			return -ENOMEM;
+@@ -2363,7 +2366,7 @@ static void bnxt_free_rx_skbs(struct bnxt *bp)
+ 				dma_unmap_page_attrs(&pdev->dev, mapping,
+ 						     PAGE_SIZE, bp->rx_dir,
+ 						     DMA_ATTR_WEAK_ORDERING);
+-				__free_page(data);
++				page_pool_recycle_direct(rxr->page_pool, data);
+ 			} else {
+ 				dma_unmap_single_attrs(&pdev->dev, mapping,
+ 						       bp->rx_buf_use_size,
+@@ -2500,6 +2503,8 @@ static void bnxt_free_rx_rings(struct bnxt *bp)
+ 		if (xdp_rxq_info_is_reg(&rxr->xdp_rxq))
+ 			xdp_rxq_info_unreg(&rxr->xdp_rxq);
+ 
++		rxr->page_pool = NULL;
++
+ 		kfree(rxr->rx_tpa);
+ 		rxr->rx_tpa = NULL;
+ 
+@@ -2514,6 +2519,26 @@ static void bnxt_free_rx_rings(struct bnxt *bp)
+ 	}
+ }
+ 
++static int bnxt_alloc_rx_page_pool(struct bnxt *bp,
++				   struct bnxt_rx_ring_info *rxr)
++{
++	struct page_pool_params pp = { 0 };
++
++	pp.pool_size = bp->rx_ring_size;
++	pp.nid = dev_to_node(&bp->pdev->dev);
++	pp.dev = &bp->pdev->dev;
++	pp.dma_dir = DMA_BIDIRECTIONAL;
++
++	rxr->page_pool = page_pool_create(&pp);
++	if (IS_ERR(rxr->page_pool)) {
++		int err = PTR_ERR(rxr->page_pool);
++
++		rxr->page_pool = NULL;
++		return err;
++	}
++	return 0;
++}
++
+ static int bnxt_alloc_rx_rings(struct bnxt *bp)
+ {
+ 	int i, rc, agg_rings = 0, tpa_rings = 0;
+@@ -2533,14 +2558,24 @@ static int bnxt_alloc_rx_rings(struct bnxt *bp)
+ 
+ 		ring = &rxr->rx_ring_struct;
+ 
++		rc = bnxt_alloc_rx_page_pool(bp, rxr);
++		if (rc)
++			return rc;
++
+ 		rc = xdp_rxq_info_reg(&rxr->xdp_rxq, bp->dev, i);
+-		if (rc < 0)
++		if (rc < 0) {
++			page_pool_free(rxr->page_pool);
++			rxr->page_pool = NULL;
+ 			return rc;
++		}
+ 
+ 		rc = xdp_rxq_info_reg_mem_model(&rxr->xdp_rxq,
+-						MEM_TYPE_PAGE_SHARED, NULL);
++						MEM_TYPE_PAGE_POOL,
++						rxr->page_pool);
+ 		if (rc) {
+ 			xdp_rxq_info_unreg(&rxr->xdp_rxq);
++			page_pool_free(rxr->page_pool);
++			rxr->page_pool = NULL;
+ 			return rc;
+ 		}
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 075c3f4ba376..ab315c7eb426 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -26,6 +26,8 @@
+ #include <net/xdp.h>
+ #include <linux/net_dim.h>
+ 
++struct page_pool;
++
+ struct tx_bd {
+ 	__le32 tx_bd_len_flags_type;
+ 	#define TX_BD_TYPE					(0x3f << 0)
+@@ -799,6 +801,7 @@ struct bnxt_rx_ring_info {
+ 	struct bnxt_ring_struct	rx_ring_struct;
+ 	struct bnxt_ring_struct	rx_agg_ring_struct;
+ 	struct xdp_rxq_info	xdp_rxq;
++	struct page_pool	*page_pool;
+ };
+ 
+ struct bnxt_cp_ring_info {
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index 12489d235eb9..c6f6f2033880 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -15,6 +15,7 @@
+ #include <linux/bpf.h>
+ #include <linux/bpf_trace.h>
+ #include <linux/filter.h>
++#include <net/page_pool.h>
+ #include "bnxt_hsi.h"
+ #include "bnxt.h"
+ #include "bnxt_xdp.h"
+@@ -191,7 +192,7 @@ bool bnxt_rx_xdp(struct bnxt *bp, struct bnxt_rx_ring_info *rxr, u16 cons,
+ 
+ 		if (xdp_do_redirect(bp->dev, &xdp, xdp_prog)) {
+ 			trace_xdp_exception(bp->dev, xdp_prog, act);
+-			__free_page(page);
++			page_pool_recycle_direct(rxr->page_pool, page);
+ 			return true;
+ 		}
+ 
