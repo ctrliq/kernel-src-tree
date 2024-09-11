@@ -1,0 +1,194 @@
+mm: kmem: prepare remote memcg charging infra for interrupt contexts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 37d5985c003daab138a72dd4af9853b396d91c26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/37d5985c.failed
+
+Remote memcg charging API uses current->active_memcg to store the
+currently active memory cgroup, which overwrites the memory cgroup of the
+current process.  It works well for normal contexts, but doesn't work for
+interrupt contexts: indeed, if an interrupt occurs during the execution of
+a section with an active memcg set, all allocations inside the interrupt
+will be charged to the active memcg set (given that we'll enable
+accounting for allocations from an interrupt context).  But because the
+interrupt might have no relation to the active memcg set outside, it's
+obviously wrong from the accounting prospective.
+
+To resolve this problem, let's add a global percpu int_active_memcg
+variable, which will be used to store an active memory cgroup which will
+be used from interrupt contexts.  set_active_memcg() will transparently
+use current->active_memcg or int_active_memcg depending on the context.
+
+To make the read part simple and transparent for the caller, let's
+introduce two new functions:
+  - struct mem_cgroup *active_memcg(void),
+  - struct mem_cgroup *get_active_memcg(void).
+
+They are returning the active memcg if it's set, hiding all implementation
+details: where to get it depending on the current context.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+Link: http://lkml.kernel.org/r/20200827225843.1270629-4-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 37d5985c003daab138a72dd4af9853b396d91c26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched/mm.h
+diff --cc include/linux/sched/mm.h
+index c49257a3b510,d5ece7a9a403..000000000000
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@@ -308,39 -279,38 +308,54 @@@ static inline void memalloc_nocma_resto
+  #endif
+  
+  #ifdef CONFIG_MEMCG
++ DECLARE_PER_CPU(struct mem_cgroup *, int_active_memcg);
+  /**
+ - * set_active_memcg - Starts the remote memcg charging scope.
+ + * memalloc_use_memcg - Starts the remote memcg charging scope.
+   * @memcg: memcg to charge.
+   *
+   * This function marks the beginning of the remote memcg charging scope. All the
+   * __GFP_ACCOUNT allocations till the end of the scope will be charged to the
+   * given memcg.
+   *
+ - * NOTE: This function can nest. Users must save the return value and
+ - * reset the previous value after their own charging scope is over.
+ + * NOTE: This function is not nesting safe.
+ + */
+ +static inline void memalloc_use_memcg(struct mem_cgroup *memcg)
+ +{
+++<<<<<<< HEAD
+ +	WARN_ON_ONCE(current->active_memcg);
+ +	current->active_memcg = memcg;
+ +}
+ +
+ +/**
+ + * memalloc_unuse_memcg - Ends the remote memcg charging scope.
+ + *
+ + * This function marks the end of the remote memcg charging scope started by
+ + * memalloc_use_memcg().
+   */
+ -static inline struct mem_cgroup *
+ -set_active_memcg(struct mem_cgroup *memcg)
+ +static inline void memalloc_unuse_memcg(void)
+  {
+ +	current->active_memcg = NULL;
+++=======
++ 	struct mem_cgroup *old;
++ 
++ 	if (in_interrupt()) {
++ 		old = this_cpu_read(int_active_memcg);
++ 		this_cpu_write(int_active_memcg, memcg);
++ 	} else {
++ 		old = current->active_memcg;
++ 		current->active_memcg = memcg;
++ 	}
++ 
++ 	return old;
+++>>>>>>> 37d5985c003d (mm: kmem: prepare remote memcg charging infra for interrupt contexts)
+  }
+  #else
+ -static inline struct mem_cgroup *
+ -set_active_memcg(struct mem_cgroup *memcg)
+ +static inline void memalloc_use_memcg(struct mem_cgroup *memcg)
+ +{
+ +}
+ +
+ +static inline void memalloc_unuse_memcg(void)
+  {
+ -	return NULL;
+  }
+  #endif
+  
+* Unmerged path include/linux/sched/mm.h
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index e4ee0600b869..d3224d2d0e95 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -82,6 +82,9 @@ EXPORT_SYMBOL(memory_cgrp_subsys);
+ 
+ struct mem_cgroup *root_mem_cgroup __read_mostly;
+ 
++/* Active memory cgroup to use from an interrupt context */
++DEFINE_PER_CPU(struct mem_cgroup *, int_active_memcg);
++
+ /* Socket memory accounting disabled? */
+ static bool cgroup_memory_nosocket;
+ 
+@@ -1083,26 +1086,43 @@ struct mem_cgroup *get_mem_cgroup_from_page(struct page *page)
+ }
+ EXPORT_SYMBOL(get_mem_cgroup_from_page);
+ 
+-/**
+- * If current->active_memcg is non-NULL, do not fallback to current->mm->memcg.
+- */
+-static __always_inline struct mem_cgroup *get_mem_cgroup_from_current(void)
++static __always_inline struct mem_cgroup *active_memcg(void)
+ {
+-	if (memcg_kmem_bypass())
+-		return NULL;
++	if (in_interrupt())
++		return this_cpu_read(int_active_memcg);
++	else
++		return current->active_memcg;
++}
+ 
+-	if (unlikely(current->active_memcg)) {
+-		struct mem_cgroup *memcg;
++static __always_inline struct mem_cgroup *get_active_memcg(void)
++{
++	struct mem_cgroup *memcg;
+ 
+-		rcu_read_lock();
++	rcu_read_lock();
++	memcg = active_memcg();
++	if (memcg) {
+ 		/* current->active_memcg must hold a ref. */
+-		if (WARN_ON_ONCE(!css_tryget(&current->active_memcg->css)))
++		if (WARN_ON_ONCE(!css_tryget(&memcg->css)))
+ 			memcg = root_mem_cgroup;
+ 		else
+ 			memcg = current->active_memcg;
+-		rcu_read_unlock();
+-		return memcg;
+ 	}
++	rcu_read_unlock();
++
++	return memcg;
++}
++
++/**
++ * If active memcg is set, do not fallback to current->mm->memcg.
++ */
++static __always_inline struct mem_cgroup *get_mem_cgroup_from_current(void)
++{
++	if (memcg_kmem_bypass())
++		return NULL;
++
++	if (unlikely(active_memcg()))
++		return get_active_memcg();
++
+ 	return get_mem_cgroup_from_mm(current->mm);
+ }
+ 
+@@ -2936,8 +2956,8 @@ __always_inline struct obj_cgroup *get_obj_cgroup_from_current(void)
+ 		return NULL;
+ 
+ 	rcu_read_lock();
+-	if (unlikely(current->active_memcg))
+-		memcg = rcu_dereference(current->active_memcg);
++	if (unlikely(active_memcg()))
++		memcg = active_memcg();
+ 	else
+ 		memcg = mem_cgroup_from_task(current);
+ 
