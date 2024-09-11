@@ -1,0 +1,139 @@
+ip: factor out protocol delivery helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 68cb7d531e6a87250a51b8a4ee1c79b3445aeff3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/68cb7d53.failed
+
+So that we can re-use it at the UDP level in a later patch
+
+rfc v3 -> v1
+ - add the helper declaration into the ip header
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 68cb7d531e6a87250a51b8a4ee1c79b3445aeff3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_input.c
+diff --cc net/ipv4/ip_input.c
+index b3b8be4e4532,72250b4e466d..000000000000
+--- a/net/ipv4/ip_input.c
++++ b/net/ipv4/ip_input.c
+@@@ -189,54 -188,50 +189,99 @@@ bool ip_call_ra_chain(struct sk_buff *s
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_DECLARE(int udp_rcv(struct sk_buff *));
+ +INDIRECT_CALLABLE_DECLARE(int tcp_v4_rcv(struct sk_buff *));
+++=======
++ void ip_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int protocol)
++ {
++ 	const struct net_protocol *ipprot;
++ 	int raw, ret;
++ 
++ resubmit:
++ 	raw = raw_local_deliver(skb, protocol);
++ 
++ 	ipprot = rcu_dereference(inet_protos[protocol]);
++ 	if (ipprot) {
++ 		if (!ipprot->no_policy) {
++ 			if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
++ 				kfree_skb(skb);
++ 				return;
++ 			}
++ 			nf_reset(skb);
++ 		}
++ 		ret = ipprot->handler(skb);
++ 		if (ret < 0) {
++ 			protocol = -ret;
++ 			goto resubmit;
++ 		}
++ 		__IP_INC_STATS(net, IPSTATS_MIB_INDELIVERS);
++ 	} else {
++ 		if (!raw) {
++ 			if (xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
++ 				__IP_INC_STATS(net, IPSTATS_MIB_INUNKNOWNPROTOS);
++ 				icmp_send(skb, ICMP_DEST_UNREACH,
++ 					  ICMP_PROT_UNREACH, 0);
++ 			}
++ 			kfree_skb(skb);
++ 		} else {
++ 			__IP_INC_STATS(net, IPSTATS_MIB_INDELIVERS);
++ 			consume_skb(skb);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 68cb7d531e6a (ip: factor out protocol delivery helper)
+  static int ip_local_deliver_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+  {
+  	__skb_pull(skb, skb_network_header_len(skb));
+  
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	{
+ +		int protocol = ip_hdr(skb)->protocol;
+ +		const struct net_protocol *ipprot;
+ +		int raw;
+ +
+ +	resubmit:
+ +		raw = raw_local_deliver(skb, protocol);
+ +
+ +		ipprot = rcu_dereference(inet_protos[protocol]);
+ +		if (ipprot) {
+ +			int ret;
+ +
+ +			if (!ipprot->no_policy) {
+ +				if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+ +					kfree_skb(skb);
+ +					goto out;
+ +				}
+ +				nf_reset(skb);
+ +			}
+ +			ret = INDIRECT_CALL_2(ipprot->handler, tcp_v4_rcv,
+ +					      udp_rcv, skb);
+ +			if (ret < 0) {
+ +				protocol = -ret;
+ +				goto resubmit;
+ +			}
+ +			__IP_INC_STATS(net, IPSTATS_MIB_INDELIVERS);
+ +		} else {
+ +			if (!raw) {
+ +				if (xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+ +					__IP_INC_STATS(net, IPSTATS_MIB_INUNKNOWNPROTOS);
+ +					icmp_send(skb, ICMP_DEST_UNREACH,
+ +						  ICMP_PROT_UNREACH, 0);
+ +				}
+ +				kfree_skb(skb);
+ +			} else {
+ +				__IP_INC_STATS(net, IPSTATS_MIB_INDELIVERS);
+ +				consume_skb(skb);
+ +			}
+ +		}
+ +	}
+ + out:
+++=======
++ 	ip_protocol_deliver_rcu(net, skb, ip_hdr(skb)->protocol);
+++>>>>>>> 68cb7d531e6a (ip: factor out protocol delivery helper)
+  	rcu_read_unlock();
+  
+  	return 0;
+diff --git a/include/net/ip.h b/include/net/ip.h
+index 31b20ba7b639..fbec2680ef39 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -139,6 +139,7 @@ int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
+ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
+ 	   struct net_device *orig_dev);
+ int ip_local_deliver(struct sk_buff *skb);
++void ip_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int proto);
+ int ip_mr_input(struct sk_buff *skb);
+ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb);
+ int ip_mc_output(struct net *net, struct sock *sk, struct sk_buff *skb);
+* Unmerged path net/ipv4/ip_input.c
