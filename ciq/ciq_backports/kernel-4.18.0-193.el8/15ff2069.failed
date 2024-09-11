@@ -1,0 +1,178 @@
+printk: Add caller information to printk() output.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+commit 15ff2069cb7f967dae6a8f8c176ba51447c75f00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/15ff2069.failed
+
+Sometimes we want to print a series of printk() messages to consoles
+without being disturbed by concurrent printk() from interrupts and/or
+other threads. But we can't enforce printk() callers to use their local
+buffers because we need to ask them to make too much changes. Also, even
+buffering up to one line inside printk() might cause failing to emit
+an important clue under critical situation.
+
+Therefore, instead of trying to help buffering, let's try to help
+reconstructing messages by saving caller information as of calling
+log_store() and adding it as "[T$thread_id]" or "[C$processor_id]"
+upon printing to consoles.
+
+Some examples for console output:
+
+  [    1.222773][    T1] x86: Booting SMP configuration:
+  [    2.779635][    T1] pci 0000:00:01.0: PCI bridge to [bus 01]
+  [    5.069193][  T268] Fusion MPT base driver 3.04.20
+  [    9.316504][    C2] random: fast init done
+  [   13.413336][ T3355] Initialized host personality
+
+Some examples for /dev/kmsg output:
+
+  6,496,1222773,-,caller=T1;x86: Booting SMP configuration:
+  6,968,2779635,-,caller=T1;pci 0000:00:01.0: PCI bridge to [bus 01]
+   SUBSYSTEM=pci
+   DEVICE=+pci:0000:00:01.0
+  6,1353,5069193,-,caller=T268;Fusion MPT base driver 3.04.20
+  5,1526,9316504,-,caller=C2;random: fast init done
+  6,1575,13413336,-,caller=T3355;Initialized host personality
+
+Note that this patch changes max length of messages which can be printed
+by printk() or written to /dev/kmsg interface from 992 bytes to 976 bytes,
+based on an assumption that userspace won't try to write messages hitting
+that border line to /dev/kmsg interface.
+
+Link: http://lkml.kernel.org/r/93f19e57-5051-c67d-9af4-b17624062d44@i-love.sakura.ne.jp
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Sergey Senozhatsky <sergey.senozhatsky.work@gmail.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: LKML <linux-kernel@vger.kernel.org>
+	Cc: syzkaller <syzkaller@googlegroups.com>
+	Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+(cherry picked from commit 15ff2069cb7f967dae6a8f8c176ba51447c75f00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 2c240612abfc,e3d977bbc7ab..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1229,42 -1253,50 +1254,76 @@@ static inline void boot_delay_msec(int 
+  static bool printk_time = IS_ENABLED(CONFIG_PRINTK_TIME);
+  module_param_named(time, printk_time, bool, S_IRUGO | S_IWUSR);
+  
+ -static size_t print_syslog(unsigned int level, char *buf)
+ -{
+ -	return sprintf(buf, "<%u>", level);
+ -}
+ -
+  static size_t print_time(u64 ts, char *buf)
+  {
+ -	unsigned long rem_nsec = do_div(ts, 1000000000);
+ +	unsigned long rem_nsec;
+ +
+ +	if (!printk_time)
+ +		return 0;
+ +
+ +	rem_nsec = do_div(ts, 1000000000);
+ +
+ +	if (!buf)
+ +		return snprintf(NULL, 0, "[%5lu.000000] ", (unsigned long)ts);
+  
+- 	return sprintf(buf, "[%5lu.%06lu] ",
++ 	return sprintf(buf, "[%5lu.%06lu]",
+  		       (unsigned long)ts, rem_nsec / 1000);
+  }
+  
+++<<<<<<< HEAD
+ +static size_t print_prefix(const struct printk_log *msg, bool syslog, char *buf)
+++=======
++ #ifdef CONFIG_PRINTK_CALLER
++ static size_t print_caller(u32 id, char *buf)
++ {
++ 	char caller[12];
++ 
++ 	snprintf(caller, sizeof(caller), "%c%u",
++ 		 id & 0x80000000 ? 'C' : 'T', id & ~0x80000000);
++ 	return sprintf(buf, "[%6s]", caller);
++ }
++ #else
++ #define print_caller(id, buf) 0
++ #endif
++ 
++ static size_t print_prefix(const struct printk_log *msg, bool syslog,
++ 			   bool time, char *buf)
+++>>>>>>> 15ff2069cb7f (printk: Add caller information to printk() output.)
+  {
+  	size_t len = 0;
+ +	unsigned int prefix = (msg->facility << 3) | msg->level;
+  
+++<<<<<<< HEAD
+ +	if (syslog) {
+ +		if (buf) {
+ +			len += sprintf(buf, "<%u>", prefix);
+ +		} else {
+ +			len += 3;
+ +			if (prefix > 999)
+ +				len += 3;
+ +			else if (prefix > 99)
+ +				len += 2;
+ +			else if (prefix > 9)
+ +				len++;
+ +		}
+ +	}
+ +
+ +	len += print_time(msg->ts_nsec, buf ? buf + len : NULL);
+++=======
++ 	if (syslog)
++ 		len = print_syslog((msg->facility << 3) | msg->level, buf);
++ 
++ 	if (time)
++ 		len += print_time(msg->ts_nsec, buf + len);
++ 
++ 	len += print_caller(msg->caller_id, buf + len);
++ 
++ 	if (IS_ENABLED(CONFIG_PRINTK_CALLER) || time) {
++ 		buf[len++] = ' ';
++ 		buf[len] = '\0';
++ 	}
++ 
+++>>>>>>> 15ff2069cb7f (printk: Add caller information to printk() output.)
+  	return len;
+  }
+  
+* Unmerged path kernel/printk/printk.c
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index e75d8d876da6..36b826d1aaf4 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -15,6 +15,23 @@ config PRINTK_TIME
+ 	  The behavior is also controlled by the kernel command line
+ 	  parameter printk.time=1. See Documentation/admin-guide/kernel-parameters.rst
+ 
++config PRINTK_CALLER
++	bool "Show caller information on printks"
++	depends on PRINTK
++	help
++	  Selecting this option causes printk() to add a caller "thread id" (if
++	  in task context) or a caller "processor id" (if not in task context)
++	  to every message.
++
++	  This option is intended for environments where multiple threads
++	  concurrently call printk() for many times, for it is difficult to
++	  interpret without knowing where these lines (or sometimes individual
++	  line which was divided into multiple lines due to race) came from.
++
++	  Since toggling after boot makes the code racy, currently there is
++	  no option to enable/disable at the kernel command line parameter or
++	  sysfs interface.
++
+ config CONSOLE_LOGLEVEL_DEFAULT
+ 	int "Default console loglevel (1-15)"
+ 	range 1 15
