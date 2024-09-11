@@ -1,0 +1,317 @@
+vfio/type1: Introduce iova list and add iommu aperture validity check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [vfio] type1: Introduce iova list and add iommu aperture validity check (Auger Eric) [1704597]
+Rebuild_FUZZ: 96.24%
+commit-author Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+commit 1108696aecf048433bf77806570f57bdbb6ef724
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1108696a.failed
+
+This introduces an iova list that is valid for dma mappings. Make
+sure the new iommu aperture window doesn't conflict with the current
+one or with any existing dma mappings during attach.
+
+	Signed-off-by: Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+	Reviewed-by: Eric Auger <eric.auger@redhat.com>
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 1108696aecf048433bf77806570f57bdbb6ef724)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/vfio_iommu_type1.c
+diff --cc drivers/vfio/vfio_iommu_type1.c
+index 7c23a77fd289,6a69652b406b..000000000000
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@@ -97,8 -95,15 +98,14 @@@ struct vfio_dma 
+  struct vfio_group {
+  	struct iommu_group	*iommu_group;
+  	struct list_head	next;
+ -	bool			mdev_group;	/* An mdev group */
+  };
+  
++ struct vfio_iova {
++ 	struct list_head	list;
++ 	dma_addr_t		start;
++ 	dma_addr_t		end;
++ };
++ 
+  /*
+   * Guest RAM pinning working set or DMA target
+   */
+@@@ -1340,6 -1299,242 +1347,245 @@@ static bool vfio_iommu_has_sw_msi(struc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct device *vfio_mdev_get_iommu_device(struct device *dev)
++ {
++ 	struct device *(*fn)(struct device *dev);
++ 	struct device *iommu_device;
++ 
++ 	fn = symbol_get(mdev_get_iommu_device);
++ 	if (fn) {
++ 		iommu_device = fn(dev);
++ 		symbol_put(mdev_get_iommu_device);
++ 
++ 		return iommu_device;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static int vfio_mdev_attach_domain(struct device *dev, void *data)
++ {
++ 	struct iommu_domain *domain = data;
++ 	struct device *iommu_device;
++ 
++ 	iommu_device = vfio_mdev_get_iommu_device(dev);
++ 	if (iommu_device) {
++ 		if (iommu_dev_feature_enabled(iommu_device, IOMMU_DEV_FEAT_AUX))
++ 			return iommu_aux_attach_device(domain, iommu_device);
++ 		else
++ 			return iommu_attach_device(domain, iommu_device);
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ static int vfio_mdev_detach_domain(struct device *dev, void *data)
++ {
++ 	struct iommu_domain *domain = data;
++ 	struct device *iommu_device;
++ 
++ 	iommu_device = vfio_mdev_get_iommu_device(dev);
++ 	if (iommu_device) {
++ 		if (iommu_dev_feature_enabled(iommu_device, IOMMU_DEV_FEAT_AUX))
++ 			iommu_aux_detach_device(domain, iommu_device);
++ 		else
++ 			iommu_detach_device(domain, iommu_device);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int vfio_iommu_attach_group(struct vfio_domain *domain,
++ 				   struct vfio_group *group)
++ {
++ 	if (group->mdev_group)
++ 		return iommu_group_for_each_dev(group->iommu_group,
++ 						domain->domain,
++ 						vfio_mdev_attach_domain);
++ 	else
++ 		return iommu_attach_group(domain->domain, group->iommu_group);
++ }
++ 
++ static void vfio_iommu_detach_group(struct vfio_domain *domain,
++ 				    struct vfio_group *group)
++ {
++ 	if (group->mdev_group)
++ 		iommu_group_for_each_dev(group->iommu_group, domain->domain,
++ 					 vfio_mdev_detach_domain);
++ 	else
++ 		iommu_detach_group(domain->domain, group->iommu_group);
++ }
++ 
++ static bool vfio_bus_is_mdev(struct bus_type *bus)
++ {
++ 	struct bus_type *mdev_bus;
++ 	bool ret = false;
++ 
++ 	mdev_bus = symbol_get(mdev_bus_type);
++ 	if (mdev_bus) {
++ 		ret = (bus == mdev_bus);
++ 		symbol_put(mdev_bus_type);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int vfio_mdev_iommu_device(struct device *dev, void *data)
++ {
++ 	struct device **old = data, *new;
++ 
++ 	new = vfio_mdev_get_iommu_device(dev);
++ 	if (!new || (*old && *old != new))
++ 		return -EINVAL;
++ 
++ 	*old = new;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * This is a helper function to insert an address range to iova list.
++  * The list is initially created with a single entry corresponding to
++  * the IOMMU domain geometry to which the device group is attached.
++  * The list aperture gets modified when a new domain is added to the
++  * container if the new aperture doesn't conflict with the current one
++  * or with any existing dma mappings. The list is also modified to
++  * exclude any reserved regions associated with the device group.
++  */
++ static int vfio_iommu_iova_insert(struct list_head *head,
++ 				  dma_addr_t start, dma_addr_t end)
++ {
++ 	struct vfio_iova *region;
++ 
++ 	region = kmalloc(sizeof(*region), GFP_KERNEL);
++ 	if (!region)
++ 		return -ENOMEM;
++ 
++ 	INIT_LIST_HEAD(&region->list);
++ 	region->start = start;
++ 	region->end = end;
++ 
++ 	list_add_tail(&region->list, head);
++ 	return 0;
++ }
++ 
++ /*
++  * Check the new iommu aperture conflicts with existing aper or with any
++  * existing dma mappings.
++  */
++ static bool vfio_iommu_aper_conflict(struct vfio_iommu *iommu,
++ 				     dma_addr_t start, dma_addr_t end)
++ {
++ 	struct vfio_iova *first, *last;
++ 	struct list_head *iova = &iommu->iova_list;
++ 
++ 	if (list_empty(iova))
++ 		return false;
++ 
++ 	/* Disjoint sets, return conflict */
++ 	first = list_first_entry(iova, struct vfio_iova, list);
++ 	last = list_last_entry(iova, struct vfio_iova, list);
++ 	if (start > last->end || end < first->start)
++ 		return true;
++ 
++ 	/* Check for any existing dma mappings below the new start */
++ 	if (start > first->start) {
++ 		if (vfio_find_dma(iommu, first->start, start - first->start))
++ 			return true;
++ 	}
++ 
++ 	/* Check for any existing dma mappings beyond the new end */
++ 	if (end < last->end) {
++ 		if (vfio_find_dma(iommu, end + 1, last->end - end))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Resize iommu iova aperture window. This is called only if the new
++  * aperture has no conflict with existing aperture and dma mappings.
++  */
++ static int vfio_iommu_aper_resize(struct list_head *iova,
++ 				  dma_addr_t start, dma_addr_t end)
++ {
++ 	struct vfio_iova *node, *next;
++ 
++ 	if (list_empty(iova))
++ 		return vfio_iommu_iova_insert(iova, start, end);
++ 
++ 	/* Adjust iova list start */
++ 	list_for_each_entry_safe(node, next, iova, list) {
++ 		if (start < node->start)
++ 			break;
++ 		if (start >= node->start && start < node->end) {
++ 			node->start = start;
++ 			break;
++ 		}
++ 		/* Delete nodes before new start */
++ 		list_del(&node->list);
++ 		kfree(node);
++ 	}
++ 
++ 	/* Adjust iova list end */
++ 	list_for_each_entry_safe(node, next, iova, list) {
++ 		if (end > node->end)
++ 			continue;
++ 		if (end > node->start && end <= node->end) {
++ 			node->end = end;
++ 			continue;
++ 		}
++ 		/* Delete nodes after new end */
++ 		list_del(&node->list);
++ 		kfree(node);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void vfio_iommu_iova_free(struct list_head *iova)
++ {
++ 	struct vfio_iova *n, *next;
++ 
++ 	list_for_each_entry_safe(n, next, iova, list) {
++ 		list_del(&n->list);
++ 		kfree(n);
++ 	}
++ }
++ 
++ static int vfio_iommu_iova_get_copy(struct vfio_iommu *iommu,
++ 				    struct list_head *iova_copy)
++ {
++ 	struct list_head *iova = &iommu->iova_list;
++ 	struct vfio_iova *n;
++ 	int ret;
++ 
++ 	list_for_each_entry(n, iova, list) {
++ 		ret = vfio_iommu_iova_insert(iova_copy, n->start, n->end);
++ 		if (ret)
++ 			goto out_free;
++ 	}
++ 
++ 	return 0;
++ 
++ out_free:
++ 	vfio_iommu_iova_free(iova_copy);
++ 	return ret;
++ }
++ 
++ static void vfio_iommu_iova_insert_copy(struct vfio_iommu *iommu,
++ 					struct list_head *iova_copy)
++ {
++ 	struct list_head *iova = &iommu->iova_list;
++ 
++ 	vfio_iommu_iova_free(iova);
++ 
++ 	list_splice_tail(iova_copy, iova);
++ }
+++>>>>>>> 1108696aecf0 (vfio/type1: Introduce iova list and add iommu aperture validity check)
+  static int vfio_iommu_type1_attach_group(void *iommu_data,
+  					 struct iommu_group *iommu_group)
+  {
+@@@ -1452,11 -1679,10 +1723,10 @@@
+  				list_add(&group->next, &d->group_list);
+  				iommu_domain_free(domain->domain);
+  				kfree(domain);
+- 				mutex_unlock(&iommu->lock);
+- 				return 0;
++ 				goto done;
+  			}
+  
+ -			ret = vfio_iommu_attach_group(domain, group);
+ +			ret = iommu_attach_group(domain->domain, iommu_group);
+  			if (ret)
+  				goto out_domain;
+  		}
+@@@ -1482,9 -1710,10 +1754,10 @@@ done
+  	return 0;
+  
+  out_detach:
+ -	vfio_iommu_detach_group(domain, group);
+ +	iommu_detach_group(domain->domain, iommu_group);
+  out_domain:
+  	iommu_domain_free(domain->domain);
++ 	vfio_iommu_iova_free(&iova_copy);
+  out_free:
+  	kfree(domain);
+  	kfree(group);
+* Unmerged path drivers/vfio/vfio_iommu_type1.c
