@@ -1,0 +1,146 @@
+io_uring: only return -EBUSY for submit on non-flushed backlog
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit c4a2ed72c9a61594b6afc23e1fbc78878d32b5a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c4a2ed72.failed
+
+We return -EBUSY on submit when we have a CQ ring overflow backlog, but
+that can be a bit problematic if the application is using pure userspace
+poll of the CQ ring. For that case, if the ring briefly overflowed and
+we have pending entries in the backlog, the submit flushes the backlog
+successfully but still returns -EBUSY. If we're able to fully flush the
+CQ ring backlog, let the submission proceed.
+
+	Reported-by: Dan Melnic <dmm@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c4a2ed72c9a61594b6afc23e1fbc78878d32b5a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 66de1d702552,129723087bad..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -550,9 -654,91 +550,97 @@@ static void io_cqring_ev_posted(struct 
+  		eventfd_signal(ctx->cq_ev_fd, 1);
+  }
+  
+++<<<<<<< HEAD
+ +static void io_cqring_add_event(struct io_ring_ctx *ctx, u64 user_data,
+ +				long res)
+ +{
+++=======
++ /* Returns true if there are no backlogged entries after the flush */
++ static bool io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force)
++ {
++ 	struct io_rings *rings = ctx->rings;
++ 	struct io_uring_cqe *cqe;
++ 	struct io_kiocb *req;
++ 	unsigned long flags;
++ 	LIST_HEAD(list);
++ 
++ 	if (!force) {
++ 		if (list_empty_careful(&ctx->cq_overflow_list))
++ 			return true;
++ 		if ((ctx->cached_cq_tail - READ_ONCE(rings->cq.head) ==
++ 		    rings->cq_ring_entries))
++ 			return false;
++ 	}
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 
++ 	/* if force is set, the ring is going away. always drop after that */
++ 	if (force)
++ 		ctx->cq_overflow_flushed = true;
++ 
++ 	cqe = NULL;
++ 	while (!list_empty(&ctx->cq_overflow_list)) {
++ 		cqe = io_get_cqring(ctx);
++ 		if (!cqe && !force)
++ 			break;
++ 
++ 		req = list_first_entry(&ctx->cq_overflow_list, struct io_kiocb,
++ 						list);
++ 		list_move(&req->list, &list);
++ 		if (cqe) {
++ 			WRITE_ONCE(cqe->user_data, req->user_data);
++ 			WRITE_ONCE(cqe->res, req->result);
++ 			WRITE_ONCE(cqe->flags, 0);
++ 		} else {
++ 			WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 		}
++ 	}
++ 
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	while (!list_empty(&list)) {
++ 		req = list_first_entry(&list, struct io_kiocb, list);
++ 		list_del(&req->list);
++ 		io_put_req(req);
++ 	}
++ 
++ 	return cqe != NULL;
++ }
++ 
++ static void io_cqring_fill_event(struct io_kiocb *req, long res)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_uring_cqe *cqe;
++ 
++ 	trace_io_uring_complete(ctx, req->user_data, res);
++ 
++ 	/*
++ 	 * If we can't get a cq entry, userspace overflowed the
++ 	 * submission (by quite a lot). Increment the overflow count in
++ 	 * the ring.
++ 	 */
++ 	cqe = io_get_cqring(ctx);
++ 	if (likely(cqe)) {
++ 		WRITE_ONCE(cqe->user_data, req->user_data);
++ 		WRITE_ONCE(cqe->res, res);
++ 		WRITE_ONCE(cqe->flags, 0);
++ 	} else if (ctx->cq_overflow_flushed) {
++ 		WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 	} else {
++ 		refcount_inc(&req->refs);
++ 		req->result = res;
++ 		list_add_tail(&req->list, &ctx->cq_overflow_list);
++ 	}
++ }
++ 
++ static void io_cqring_add_event(struct io_kiocb *req, long res)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
+++>>>>>>> c4a2ed72c9a6 (io_uring: only return -EBUSY for submit on non-flushed backlog)
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&ctx->completion_lock, flags);
+@@@ -2413,9 -3145,13 +2501,18 @@@ static int io_submit_sqes(struct io_rin
+  {
+  	struct io_submit_state state, *statep = NULL;
+  	struct io_kiocb *link = NULL;
+ +	struct io_kiocb *shadow_req = NULL;
+ +	bool prev_was_link = false;
+  	int i, submitted = 0;
+++<<<<<<< HEAD
+++=======
++ 	bool mm_fault = false;
++ 
++ 	/* if we have a backlog and couldn't flush it all, return BUSY */
++ 	if (!list_empty(&ctx->cq_overflow_list) &&
++ 	    !io_cqring_overflow_flush(ctx, false))
++ 		return -EBUSY;
+++>>>>>>> c4a2ed72c9a6 (io_uring: only return -EBUSY for submit on non-flushed backlog)
+  
+  	if (nr > IO_PLUG_THRESHOLD) {
+  		io_submit_state_start(&state, ctx, nr);
+* Unmerged path fs/io_uring.c
