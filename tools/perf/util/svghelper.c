@@ -22,7 +22,6 @@
 #include <linux/zalloc.h>
 
 #include "env.h"
-#include "perf.h"
 #include "svghelper.h"
 #include "cpumap.h"
 

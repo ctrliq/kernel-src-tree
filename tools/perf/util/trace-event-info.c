@@ -36,7 +36,6 @@
 #include <linux/kernel.h>
 #include <linux/zalloc.h>
 
-#include "../perf.h"
 #include "trace-event.h"
 #include <api/fs/tracing_path.h>
 #include "evsel.h"
