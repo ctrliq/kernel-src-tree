@@ -1,0 +1,497 @@
+vfs: Introduce fs_context, switch vfs_kern_mount() to it.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [fs] vfs: Introduce fs_context, switch vfs_kern_mount() to it (Scott Mayhew) [1622041]
+Rebuild_FUZZ: 99.12%
+commit-author David Howells <dhowells@redhat.com>
+commit 9bc61ab18b1d41f26dc06b9e6d3c203e65f83fe6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9bc61ab1.failed
+
+Introduce a filesystem context concept to be used during superblock
+creation for mount and superblock reconfiguration for remount.  This is
+allocated at the beginning of the mount procedure and into it is placed:
+
+ (1) Filesystem type.
+
+ (2) Namespaces.
+
+ (3) Source/Device names (there may be multiple).
+
+ (4) Superblock flags (SB_*).
+
+ (5) Security details.
+
+ (6) Filesystem-specific data, as set by the mount options.
+
+Accessor functions are then provided to set up a context, parameterise it
+from monolithic mount data (the data page passed to mount(2)) and tear it
+down again.
+
+A legacy wrapper is provided that implements what will be the basic
+operations, wrapping access to filesystems that aren't yet aware of the
+fs_context.
+
+Finally, vfs_kern_mount() is changed to make use of the fs_context and
+mount_fs() is replaced by vfs_get_tree(), called from vfs_kern_mount().
+[AV -- add missing kstrdup()]
+[AV -- put_cred() can be unconditional - fc->cred can't be NULL]
+[AV -- take legacy_validate() contents into legacy_parse_monolithic()]
+[AV -- merge KERNEL_MOUNT and USER_MOUNT]
+[AV -- don't unlock superblock on success return from vfs_get_tree()]
+[AV -- kill 'reference' argument of init_fs_context()]
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+Co-developed-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 9bc61ab18b1d41f26dc06b9e6d3c203e65f83fe6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+#	fs/super.c
+diff --cc fs/namespace.c
+index 7910046ac0d6,3f2fd7a34733..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -26,6 -26,8 +26,11 @@@
+  #include <linux/memblock.h>
+  #include <linux/task_work.h>
+  #include <linux/sched/task.h>
+++<<<<<<< HEAD
+++=======
++ #include <uapi/linux/mount.h>
++ #include <linux/fs_context.h>
+++>>>>>>> 9bc61ab18b1d (vfs: Introduce fs_context, switch vfs_kern_mount() to it.)
+  
+  #include "pnode.h"
+  #include "internal.h"
+diff --cc fs/super.c
+index ddb8d35441c7,fc3887277ad1..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -35,6 -35,8 +35,11 @@@
+  #include <linux/fsnotify.h>
+  #include <linux/lockdep.h>
+  #include <linux/user_namespace.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/fs_context.h>
++ #include <uapi/linux/mount.h>
+++>>>>>>> 9bc61ab18b1d (vfs: Introduce fs_context, switch vfs_kern_mount() to it.)
+  #include "internal.h"
+  
+  static int thaw_super_locked(struct super_block *sb);
+@@@ -1244,29 -1242,24 +1249,37 @@@ struct dentry *mount_single(struct file
+  }
+  EXPORT_SYMBOL(mount_single);
+  
+- struct dentry *
+- mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
++ /**
++  * vfs_get_tree - Get the mountable root
++  * @fc: The superblock configuration context.
++  *
++  * The filesystem is invoked to get or create a superblock which can then later
++  * be used for mounting.  The filesystem places a pointer to the root to be
++  * used for mounting in @fc->root.
++  */
++ int vfs_get_tree(struct fs_context *fc)
+  {
+- 	struct dentry *root;
+  	struct super_block *sb;
+++<<<<<<< HEAD
+ +	int error = -ENOMEM;
+ +	struct security_mnt_opts opts;
+ +
+ +	security_init_mnt_opts(&opts);
+ +
+ +	if (data && !(type->fs_flags & FS_BINARY_MOUNTDATA)) {
+ +		error = security_sb_eat_lsm_opts(data, &opts);
+ +		if (error)
+ +			return ERR_PTR(error);
+ +	}
+++=======
++ 	int error;
+  
+- 	root = type->mount(type, flags, name, data);
+- 	if (IS_ERR(root)) {
+- 		error = PTR_ERR(root);
+- 		goto out_free_secdata;
+- 	}
+- 	sb = root->d_sb;
+- 	BUG_ON(!sb);
++ 	error = legacy_get_tree(fc);
++ 	if (error < 0)
++ 		return error;
+++>>>>>>> 9bc61ab18b1d (vfs: Introduce fs_context, switch vfs_kern_mount() to it.)
++ 
++ 	sb = fc->root->d_sb;
+  	WARN_ON(!sb->s_bdi);
+  
+  	/*
+@@@ -1278,10 -1271,16 +1291,23 @@@
+  	smp_wmb();
+  	sb->s_flags |= SB_BORN;
+  
+++<<<<<<< HEAD
+ +	error = security_sb_kern_mount(sb, flags, &opts);
+ +	if (error)
+ +		goto out_sb;
+ +
+++=======
++ 	error = security_sb_set_mnt_opts(sb, fc->security, 0, NULL);
++ 	if (error)
++ 		goto out_sb;
++ 
++ 	if (!(fc->sb_flags & (MS_KERNMOUNT|MS_SUBMOUNT))) {
++ 		error = security_sb_kern_mount(sb);
++ 		if (error)
++ 			goto out_sb;
++ 	}
++ 
+++>>>>>>> 9bc61ab18b1d (vfs: Introduce fs_context, switch vfs_kern_mount() to it.)
+  	/*
+  	 * filesystems should never set s_maxbytes larger than MAX_LFS_FILESIZE
+  	 * but s_maxbytes was an unsigned long long for many releases. Throw
+@@@ -1289,18 -1288,16 +1315,28 @@@
+  	 * violate this rule.
+  	 */
+  	WARN((sb->s_maxbytes < 0), "%s set sb->s_maxbytes to "
+- 		"negative value (%lld)\n", type->name, sb->s_maxbytes);
++ 		"negative value (%lld)\n", fc->fs_type->name, sb->s_maxbytes);
+  
+++<<<<<<< HEAD
+ +	up_write(&sb->s_umount);
+ +	security_free_mnt_opts(&opts);
+ +	return root;
+++=======
++ 	return 0;
+++>>>>>>> 9bc61ab18b1d (vfs: Introduce fs_context, switch vfs_kern_mount() to it.)
+  out_sb:
+- 	dput(root);
++ 	dput(fc->root);
++ 	fc->root = NULL;
+  	deactivate_locked_super(sb);
+++<<<<<<< HEAD
+ +out_free_secdata:
+ +	security_free_mnt_opts(&opts);
+ +	return ERR_PTR(error);
+++=======
++ 	return error;
+++>>>>>>> 9bc61ab18b1d (vfs: Introduce fs_context, switch vfs_kern_mount() to it.)
+  }
++ EXPORT_SYMBOL(vfs_get_tree);
+  
+  /*
+   * Setup private BDI for given superblock. It gets automatically cleaned up
+diff --git a/fs/Makefile b/fs/Makefile
+index cc8cb6f06b2b..7f71d0ce5ff0 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -12,7 +12,8 @@ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		attr.o bad_inode.o file.o filesystems.o namespace.o \
+ 		seq_file.o xattr.o libfs.o fs-writeback.o \
+ 		pnode.o splice.o sync.o utimes.o d_path.o \
+-		stack.o fs_struct.o statfs.o fs_pin.o nsfs.o
++		stack.o fs_struct.o statfs.o fs_pin.o nsfs.o \
++		fs_context.o
+ 
+ ifeq ($(CONFIG_BLOCK),y)
+ obj-y +=	buffer.o block_dev.o direct-io.o mpage.o
+diff --git a/fs/fs_context.c b/fs/fs_context.c
+new file mode 100644
+index 000000000000..4294091b689d
+--- /dev/null
++++ b/fs/fs_context.c
+@@ -0,0 +1,182 @@
++/* Provide a way to create a superblock configuration context within the kernel
++ * that allows a superblock to be set up prior to mounting.
++ *
++ * Copyright (C) 2017 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#include <linux/fs_context.h>
++#include <linux/fs.h>
++#include <linux/mount.h>
++#include <linux/nsproxy.h>
++#include <linux/slab.h>
++#include <linux/magic.h>
++#include <linux/security.h>
++#include <linux/mnt_namespace.h>
++#include <linux/pid_namespace.h>
++#include <linux/user_namespace.h>
++#include <net/net_namespace.h>
++#include "mount.h"
++#include "internal.h"
++
++struct legacy_fs_context {
++	char			*legacy_data;	/* Data page for legacy filesystems */
++	size_t			data_size;
++};
++
++static int legacy_init_fs_context(struct fs_context *fc);
++
++/**
++ * alloc_fs_context - Create a filesystem context.
++ * @fs_type: The filesystem type.
++ * @reference: The dentry from which this one derives (or NULL)
++ * @sb_flags: Filesystem/superblock flags (SB_*)
++ * @sb_flags_mask: Applicable members of @sb_flags
++ * @purpose: The purpose that this configuration shall be used for.
++ *
++ * Open a filesystem and create a mount context.  The mount context is
++ * initialised with the supplied flags and, if a submount/automount from
++ * another superblock (referred to by @reference) is supplied, may have
++ * parameters such as namespaces copied across from that superblock.
++ */
++static struct fs_context *alloc_fs_context(struct file_system_type *fs_type,
++				      struct dentry *reference,
++				      unsigned int sb_flags,
++				      unsigned int sb_flags_mask,
++				      enum fs_context_purpose purpose)
++{
++	struct fs_context *fc;
++	int ret = -ENOMEM;
++
++	fc = kzalloc(sizeof(struct fs_context), GFP_KERNEL);
++	if (!fc)
++		return ERR_PTR(-ENOMEM);
++
++	fc->purpose	= purpose;
++	fc->sb_flags	= sb_flags;
++	fc->sb_flags_mask = sb_flags_mask;
++	fc->fs_type	= get_filesystem(fs_type);
++	fc->cred	= get_current_cred();
++	fc->net_ns	= get_net(current->nsproxy->net_ns);
++
++	switch (purpose) {
++	case FS_CONTEXT_FOR_MOUNT:
++		fc->user_ns = get_user_ns(fc->cred->user_ns);
++		break;
++	}
++
++	ret = legacy_init_fs_context(fc);
++	if (ret < 0)
++		goto err_fc;
++	fc->need_free = true;
++	return fc;
++
++err_fc:
++	put_fs_context(fc);
++	return ERR_PTR(ret);
++}
++
++struct fs_context *fs_context_for_mount(struct file_system_type *fs_type,
++					unsigned int sb_flags)
++{
++	return alloc_fs_context(fs_type, NULL, sb_flags, 0,
++					FS_CONTEXT_FOR_MOUNT);
++}
++EXPORT_SYMBOL(fs_context_for_mount);
++
++static void legacy_fs_context_free(struct fs_context *fc);
++/**
++ * put_fs_context - Dispose of a superblock configuration context.
++ * @fc: The context to dispose of.
++ */
++void put_fs_context(struct fs_context *fc)
++{
++	struct super_block *sb;
++
++	if (fc->root) {
++		sb = fc->root->d_sb;
++		dput(fc->root);
++		fc->root = NULL;
++		deactivate_super(sb);
++	}
++
++	if (fc->need_free)
++		legacy_fs_context_free(fc);
++
++	security_free_mnt_opts(&fc->security);
++	if (fc->net_ns)
++		put_net(fc->net_ns);
++	put_user_ns(fc->user_ns);
++	put_cred(fc->cred);
++	kfree(fc->subtype);
++	put_filesystem(fc->fs_type);
++	kfree(fc->source);
++	kfree(fc);
++}
++EXPORT_SYMBOL(put_fs_context);
++
++/*
++ * Free the config for a filesystem that doesn't support fs_context.
++ */
++static void legacy_fs_context_free(struct fs_context *fc)
++{
++	kfree(fc->fs_private);
++}
++
++/*
++ * Add monolithic mount data.
++ */
++static int legacy_parse_monolithic(struct fs_context *fc, void *data)
++{
++	struct legacy_fs_context *ctx = fc->fs_private;
++	ctx->legacy_data = data;
++	if (!ctx->legacy_data)
++		return 0;
++	if (fc->fs_type->fs_flags & FS_BINARY_MOUNTDATA)
++		return 0;
++	return security_sb_eat_lsm_opts(ctx->legacy_data, &fc->security);
++}
++
++/*
++ * Get a mountable root with the legacy mount command.
++ */
++int legacy_get_tree(struct fs_context *fc)
++{
++	struct legacy_fs_context *ctx = fc->fs_private;
++	struct super_block *sb;
++	struct dentry *root;
++
++	root = fc->fs_type->mount(fc->fs_type, fc->sb_flags,
++				      fc->source, ctx->legacy_data);
++	if (IS_ERR(root))
++		return PTR_ERR(root);
++
++	sb = root->d_sb;
++	BUG_ON(!sb);
++
++	fc->root = root;
++	return 0;
++}
++
++/*
++ * Initialise a legacy context for a filesystem that doesn't support
++ * fs_context.
++ */
++static int legacy_init_fs_context(struct fs_context *fc)
++{
++	fc->fs_private = kzalloc(sizeof(struct legacy_fs_context), GFP_KERNEL);
++	if (!fc->fs_private)
++		return -ENOMEM;
++	return 0;
++}
++
++int parse_monolithic_mount_data(struct fs_context *fc, void *data)
++{
++	return legacy_parse_monolithic(fc, data);
++}
+diff --git a/fs/internal.h b/fs/internal.h
+index 172c0652a6e5..82bcb0dfbb9d 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -17,6 +17,7 @@ struct linux_binprm;
+ struct path;
+ struct mount;
+ struct shrink_control;
++struct fs_context;
+ 
+ /*
+  * block_dev.c
+@@ -49,6 +50,12 @@ extern int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
+  */
+ extern void __init chrdev_init(void);
+ 
++/*
++ * fs_context.c
++ */
++extern int legacy_get_tree(struct fs_context *fc);
++extern int parse_monolithic_mount_data(struct fs_context *, void *);
++
+ /*
+  * namei.c
+  */
+@@ -101,8 +108,6 @@ extern struct file *alloc_empty_file_noaccount(int, const struct cred *);
+  */
+ extern int do_remount_sb(struct super_block *, int, void *, int);
+ extern bool trylock_super(struct super_block *sb);
+-extern struct dentry *mount_fs(struct file_system_type *,
+-			       int, const char *, void *);
+ extern struct super_block *user_get_super(dev_t);
+ 
+ /*
+* Unmerged path fs/namespace.c
+* Unmerged path fs/super.c
+diff --git a/include/linux/fs_context.h b/include/linux/fs_context.h
+new file mode 100644
+index 000000000000..9805514444c9
+--- /dev/null
++++ b/include/linux/fs_context.h
+@@ -0,0 +1,64 @@
++/* Filesystem superblock creation and reconfiguration context.
++ *
++ * Copyright (C) 2018 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#ifndef _LINUX_FS_CONTEXT_H
++#define _LINUX_FS_CONTEXT_H
++
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/security.h>
++
++struct cred;
++struct dentry;
++struct file_operations;
++struct file_system_type;
++struct net;
++struct user_namespace;
++
++enum fs_context_purpose {
++	FS_CONTEXT_FOR_MOUNT,		/* New superblock for explicit mount */
++};
++
++/*
++ * Filesystem context for holding the parameters used in the creation or
++ * reconfiguration of a superblock.
++ *
++ * Superblock creation fills in ->root whereas reconfiguration begins with this
++ * already set.
++ *
++ * See Documentation/filesystems/mounting.txt
++ */
++struct fs_context {
++	struct file_system_type	*fs_type;
++	void			*fs_private;	/* The filesystem's context */
++	struct dentry		*root;		/* The root and superblock */
++	struct user_namespace	*user_ns;	/* The user namespace for this mount */
++	struct net		*net_ns;	/* The network namespace for this mount */
++	const struct cred	*cred;		/* The mounter's credentials */
++	const char		*source;	/* The source name (eg. dev path) */
++	const char		*subtype;	/* The subtype to set on the superblock */
++	void			*security;	/* Linux S&M options */
++	unsigned int		sb_flags;	/* Proposed superblock flags (SB_*) */
++	unsigned int		sb_flags_mask;	/* Superblock flags that were changed */
++	enum fs_context_purpose	purpose:8;
++	bool			need_free:1;	/* Need to call ops->free() */
++};
++
++/*
++ * fs_context manipulation functions.
++ */
++extern struct fs_context *fs_context_for_mount(struct file_system_type *fs_type,
++						unsigned int sb_flags);
++
++extern int vfs_get_tree(struct fs_context *fc);
++extern void put_fs_context(struct fs_context *fc);
++
++#endif /* _LINUX_FS_CONTEXT_H */
