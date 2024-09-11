@@ -1,0 +1,244 @@
+selftests: bpf: enable hi32 randomization for all tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jiong Wang <jiong.wang@netronome.com>
+commit 9d120b4127e8df04ee665241916056b0156b37c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9d120b41.failed
+
+The previous libbpf patch allows user to specify "prog_flags" to bpf
+program load APIs. To enable high 32-bit randomization for a test, we need
+to set BPF_F_TEST_RND_HI32 in "prog_flags".
+
+To enable such randomization for all tests, we need to make sure all places
+are passing BPF_F_TEST_RND_HI32. Changing them one by one is not
+convenient, also, it would be better if a test could be switched to
+"normal" running mode without code change.
+
+Given the program load APIs used across bpf selftests are mostly:
+  bpf_prog_load:      load from file
+  bpf_load_program:   load from raw insns
+
+A test_stub.c is implemented for bpf seltests, it offers two functions for
+testing purpose:
+
+  bpf_prog_test_load
+  bpf_test_load_program
+
+The are the same as "bpf_prog_load" and "bpf_load_program", except they
+also set BPF_F_TEST_RND_HI32. Given *_xattr functions are the APIs to
+customize any "prog_flags", it makes little sense to put these two
+functions into libbpf.
+
+Then, the following CFLAGS are passed to compilations for host programs:
+  -Dbpf_prog_load=bpf_prog_test_load
+  -Dbpf_load_program=bpf_test_load_program
+
+They migrate the used load APIs to the test version, hence enable high
+32-bit randomization for these tests without changing source code.
+
+Besides all these, there are several testcases are using
+"bpf_prog_load_attr" directly, their call sites are updated to pass
+BPF_F_TEST_RND_HI32.
+
+	Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 9d120b4127e8df04ee665241916056b0156b37c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/Makefile
+#	tools/testing/selftests/bpf/prog_tests/bpf_verif_scale.c
+#	tools/testing/selftests/bpf/test_sock_fields.c
+diff --cc tools/testing/selftests/bpf/Makefile
+index 9bfa8b025d92,fa002da36d0d..000000000000
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@@ -10,15 -10,16 +10,26 @@@ ifneq ($(wildcard $(GENHDR)),
+    GENFLAGS := -DHAVE_GENHDR
+  endif
+  
+++<<<<<<< HEAD
+ +CFLAGS += -Wall -O2 -I$(APIDIR) -I$(LIBDIR) -I$(BPFDIR) -I$(GENDIR) $(GENFLAGS) -I../../../include
+++=======
++ CLANG		?= clang
++ LLC		?= llc
++ LLVM_OBJCOPY	?= llvm-objcopy
++ LLVM_READELF	?= llvm-readelf
++ BTF_PAHOLE	?= pahole
++ CFLAGS += -Wall -O2 -I$(APIDIR) -I$(LIBDIR) -I$(BPFDIR) -I$(GENDIR) $(GENFLAGS) -I../../../include \
++ 	  -Dbpf_prog_load=bpf_prog_test_load \
++ 	  -Dbpf_load_program=bpf_test_load_program
+++>>>>>>> 9d120b4127e8 (selftests: bpf: enable hi32 randomization for all tests)
+  LDLIBS += -lcap -lelf -lrt -lpthread
+  
+ +TEST_CUSTOM_PROGS = $(OUTPUT)/urandom_read
+ +all: $(TEST_CUSTOM_PROGS)
+ +
+ +$(TEST_CUSTOM_PROGS): $(OUTPUT)/%: %.c
+ +	$(CC) -o $(TEST_CUSTOM_PROGS) $< -Wl,--build-id
+ +
+  # Order correspond to 'make run_tests' order
+  TEST_GEN_PROGS = test_verifier test_tag test_maps test_lru_map test_lpm_map test_progs \
+  	test_align test_verifier_log test_dev_cgroup test_tcpbpf_user \
+@@@ -67,11 -70,20 +78,11 @@@ TEST_GEN_PROGS_EXTENDED = test_libbpf_o
+  
+  include ../lib.mk
+  
+ -# NOTE: $(OUTPUT) won't get default value if used before lib.mk
+ -TEST_CUSTOM_PROGS = $(OUTPUT)/urandom_read
+ -all: $(TEST_CUSTOM_PROGS)
+ -
+ -$(OUTPUT)/urandom_read: $(OUTPUT)/%: %.c
+ -	$(CC) -o $@ $< -Wl,--build-id
+ -
+ -$(OUTPUT)/test_maps: map_tests/*.c
+ -
+  BPFOBJ := $(OUTPUT)/libbpf.a
+  
+- $(TEST_GEN_PROGS): $(BPFOBJ)
++ $(TEST_GEN_PROGS): test_stub.o $(BPFOBJ)
+  
+- $(TEST_GEN_PROGS_EXTENDED): $(OUTPUT)/libbpf.a
++ $(TEST_GEN_PROGS_EXTENDED): test_stub.o $(OUTPUT)/libbpf.a
+  
+  $(OUTPUT)/test_dev_cgroup: cgroup_helpers.c
+  $(OUTPUT)/test_skb_cgroup_id_user: cgroup_helpers.c
+@@@ -154,9 -162,43 +165,46 @@@ endi
+  endif
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ TEST_PROGS_CFLAGS := -I. -I$(OUTPUT)
++ TEST_VERIFIER_CFLAGS := -I. -I$(OUTPUT) -Iverifier
++ 
++ ifneq ($(SUBREG_CODEGEN),)
++ ALU32_BUILD_DIR = $(OUTPUT)/alu32
++ TEST_CUSTOM_PROGS += $(ALU32_BUILD_DIR)/test_progs_32
++ $(ALU32_BUILD_DIR):
++ 	mkdir -p $@
++ 
++ $(ALU32_BUILD_DIR)/urandom_read: $(OUTPUT)/urandom_read
++ 	cp $< $@
++ 
++ $(ALU32_BUILD_DIR)/test_progs_32: test_progs.c $(OUTPUT)/libbpf.a\
++ 						$(ALU32_BUILD_DIR) \
++ 						$(ALU32_BUILD_DIR)/urandom_read
++ 	$(CC) $(TEST_PROGS_CFLAGS) $(CFLAGS) \
++ 		-o $(ALU32_BUILD_DIR)/test_progs_32 \
++ 		test_progs.c test_stub.c trace_helpers.c prog_tests/*.c \
++ 		$(OUTPUT)/libbpf.a $(LDLIBS)
++ 
++ $(ALU32_BUILD_DIR)/test_progs_32: $(PROG_TESTS_H)
++ $(ALU32_BUILD_DIR)/test_progs_32: prog_tests/*.c
++ 
++ $(ALU32_BUILD_DIR)/%.o: progs/%.c $(ALU32_BUILD_DIR) \
++ 					$(ALU32_BUILD_DIR)/test_progs_32
++ 	$(CLANG) $(CLANG_FLAGS) \
++ 		 -O2 -target bpf -emit-llvm -c $< -o - |      \
++ 	$(LLC) -march=bpf -mattr=+alu32 -mcpu=$(CPU) $(LLC_FLAGS) \
++ 		-filetype=obj -o $@
++ ifeq ($(DWARF2BTF),y)
++ 	$(BTF_PAHOLE) -J $@
++ endif
++ endif
++ 
+++>>>>>>> 9d120b4127e8 (selftests: bpf: enable hi32 randomization for all tests)
+  # Have one program compiled without "-target bpf" to test whether libbpf loads
+  # it successfully
+ -$(OUTPUT)/test_xdp.o: progs/test_xdp.c
+ +$(OUTPUT)/test_xdp.o: test_xdp.c
+  	$(CLANG) $(CLANG_FLAGS) \
+  		-O2 -emit-llvm -c $< -o - | \
+  	$(LLC) -march=bpf -mcpu=$(CPU) $(LLC_FLAGS) -filetype=obj -o $@
+* Unmerged path tools/testing/selftests/bpf/prog_tests/bpf_verif_scale.c
+* Unmerged path tools/testing/selftests/bpf/test_sock_fields.c
+* Unmerged path tools/testing/selftests/bpf/Makefile
+* Unmerged path tools/testing/selftests/bpf/prog_tests/bpf_verif_scale.c
+diff --git a/tools/testing/selftests/bpf/test_sock_addr.c b/tools/testing/selftests/bpf/test_sock_addr.c
+index 4ecde2392327..61fd95b89af8 100644
+--- a/tools/testing/selftests/bpf/test_sock_addr.c
++++ b/tools/testing/selftests/bpf/test_sock_addr.c
+@@ -836,6 +836,7 @@ static int load_path(const struct sock_addr_test *test, const char *path)
+ 	attr.file = path;
+ 	attr.prog_type = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
+ 	attr.expected_attach_type = test->expected_attach_type;
++	attr.prog_flags = BPF_F_TEST_RND_HI32;
+ 
+ 	if (bpf_prog_load_xattr(&attr, &obj, &prog_fd)) {
+ 		if (test->expected_result != LOAD_REJECT)
+* Unmerged path tools/testing/selftests/bpf/test_sock_fields.c
+diff --git a/tools/testing/selftests/bpf/test_socket_cookie.c b/tools/testing/selftests/bpf/test_socket_cookie.c
+index e51d63786ff8..cac8ee57a013 100644
+--- a/tools/testing/selftests/bpf/test_socket_cookie.c
++++ b/tools/testing/selftests/bpf/test_socket_cookie.c
+@@ -148,6 +148,7 @@ static int run_test(int cgfd)
+ 	memset(&attr, 0, sizeof(attr));
+ 	attr.file = SOCKET_COOKIE_PROG;
+ 	attr.prog_type = BPF_PROG_TYPE_UNSPEC;
++	attr.prog_flags = BPF_F_TEST_RND_HI32;
+ 
+ 	err = bpf_prog_load_xattr(&attr, &pobj, &prog_fd);
+ 	if (err) {
+diff --git a/tools/testing/selftests/bpf/test_stub.c b/tools/testing/selftests/bpf/test_stub.c
+new file mode 100644
+index 000000000000..84e81a89e2f9
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_stub.c
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright (C) 2019 Netronome Systems, Inc. */
++
++#include <bpf/bpf.h>
++#include <bpf/libbpf.h>
++#include <string.h>
++
++int bpf_prog_test_load(const char *file, enum bpf_prog_type type,
++		       struct bpf_object **pobj, int *prog_fd)
++{
++	struct bpf_prog_load_attr attr;
++
++	memset(&attr, 0, sizeof(struct bpf_prog_load_attr));
++	attr.file = file;
++	attr.prog_type = type;
++	attr.expected_attach_type = 0;
++	attr.prog_flags = BPF_F_TEST_RND_HI32;
++
++	return bpf_prog_load_xattr(&attr, pobj, prog_fd);
++}
++
++int bpf_test_load_program(enum bpf_prog_type type, const struct bpf_insn *insns,
++			  size_t insns_cnt, const char *license,
++			  __u32 kern_version, char *log_buf,
++		     size_t log_buf_sz)
++{
++	struct bpf_load_program_attr load_attr;
++
++	memset(&load_attr, 0, sizeof(struct bpf_load_program_attr));
++	load_attr.prog_type = type;
++	load_attr.expected_attach_type = 0;
++	load_attr.name = NULL;
++	load_attr.insns = insns;
++	load_attr.insns_cnt = insns_cnt;
++	load_attr.license = license;
++	load_attr.kern_version = kern_version;
++	load_attr.prog_flags = BPF_F_TEST_RND_HI32;
++
++	return bpf_load_program_xattr(&load_attr, log_buf, log_buf_sz);
++}
+diff --git a/tools/testing/selftests/bpf/test_verifier.c b/tools/testing/selftests/bpf/test_verifier.c
+index 96071fae318d..066c71aa496b 100644
+--- a/tools/testing/selftests/bpf/test_verifier.c
++++ b/tools/testing/selftests/bpf/test_verifier.c
+@@ -17105,7 +17105,7 @@ static void do_test_single(struct bpf_test *test, bool unpriv,
+ 		return;
+ 	prog_len = probe_filter_length(prog);
+ 
+-	pflags = 0;
++	pflags = BPF_F_TEST_RND_HI32;
+ 	if (test->flags & F_LOAD_WITH_STRICT_ALIGNMENT)
+ 		pflags |= BPF_F_STRICT_ALIGNMENT;
+ 	if (test->flags & F_NEEDS_EFFICIENT_UNALIGNED_ACCESS)
