@@ -387,20 +387,12 @@ ssize_t ib_uverbs_dealloc_pd(struct ib_uverbs_file *file,
 			     int in_len, int out_len)
 {
 	struct ib_uverbs_dealloc_pd cmd;
-	struct ib_uobject          *uobj;
-	int                         ret;
 
 	if (copy_from_user(&cmd, buf, sizeof cmd))
 		return -EFAULT;
 
-	uobj  = uobj_get_write(UVERBS_OBJECT_PD, cmd.pd_handle,
-			       file->ucontext);
-	if (IS_ERR(uobj))
-		return PTR_ERR(uobj);
-
-	ret = uobj_remove_commit(uobj);
-
-	return ret ?: in_len;
+	return uobj_perform_destroy(UVERBS_OBJECT_PD, cmd.pd_handle, file,
+				    in_len);
 }
 
 struct xrcd_table_entry {
@@ -617,19 +609,12 @@ ssize_t ib_uverbs_close_xrcd(struct ib_uverbs_file *file,
 			     int out_len)
 {
 	struct ib_uverbs_close_xrcd cmd;
-	struct ib_uobject           *uobj;
-	int                         ret = 0;
 
 	if (copy_from_user(&cmd, buf, sizeof cmd))
 		return -EFAULT;
 
-	uobj  = uobj_get_write(UVERBS_OBJECT_XRCD, cmd.xrcd_handle,
-			       file->ucontext);
-	if (IS_ERR(uobj))
-		return PTR_ERR(uobj);
-
-	ret = uobj_remove_commit(uobj);
-	return ret ?: in_len;
+	return uobj_perform_destroy(UVERBS_OBJECT_XRCD, cmd.xrcd_handle, file,
+				    in_len);
 }
 
 int ib_uverbs_dealloc_xrcd(struct ib_uverbs_device *dev,
@@ -845,20 +830,12 @@ ssize_t ib_uverbs_dereg_mr(struct ib_uverbs_file *file,
 			   int out_len)
 {
 	struct ib_uverbs_dereg_mr cmd;
-	struct ib_uobject	 *uobj;
-	int                       ret = -EINVAL;
 
 	if (copy_from_user(&cmd, buf, sizeof cmd))
 		return -EFAULT;
 
-	uobj  = uobj_get_write(UVERBS_OBJECT_MR, cmd.mr_handle,
-			       file->ucontext);
-	if (IS_ERR(uobj))
-		return PTR_ERR(uobj);
-
-	ret = uobj_remove_commit(uobj);
-
-	return ret ?: in_len;
+	return uobj_perform_destroy(UVERBS_OBJECT_MR, cmd.mr_handle, file,
+				    in_len);
 }
 
 ssize_t ib_uverbs_alloc_mw(struct ib_uverbs_file *file,
@@ -937,19 +914,12 @@ ssize_t ib_uverbs_dealloc_mw(struct ib_uverbs_file *file,
 			     int out_len)
 {
 	struct ib_uverbs_dealloc_mw cmd;
-	struct ib_uobject	   *uobj;
-	int                         ret = -EINVAL;
 
 	if (copy_from_user(&cmd, buf, sizeof(cmd)))
 		return -EFAULT;
 
-	uobj  = uobj_get_write(UVERBS_OBJECT_MW, cmd.mw_handle,
-			       file->ucontext);
-	if (IS_ERR(uobj))
-		return PTR_ERR(uobj);
-
-	ret = uobj_remove_commit(uobj);
-	return ret ?: in_len;
+	return uobj_perform_destroy(UVERBS_OBJECT_MW, cmd.mw_handle, file,
+				    in_len);
 }
 
 ssize_t ib_uverbs_create_comp_channel(struct ib_uverbs_file *file,
@@ -2728,19 +2698,12 @@ ssize_t ib_uverbs_destroy_ah(struct ib_uverbs_file *file,
 			     const char __user *buf, int in_len, int out_len)
 {
 	struct ib_uverbs_destroy_ah cmd;
-	struct ib_uobject	   *uobj;
-	int			    ret;
 
 	if (copy_from_user(&cmd, buf, sizeof cmd))
 		return -EFAULT;
 
-	uobj  = uobj_get_write(UVERBS_OBJECT_AH, cmd.ah_handle,
-			       file->ucontext);
-	if (IS_ERR(uobj))
-		return PTR_ERR(uobj);
-
-	ret = uobj_remove_commit(uobj);
-	return ret ?: in_len;
+	return uobj_perform_destroy(UVERBS_OBJECT_AH, cmd.ah_handle, file,
+				    in_len);
 }
 
 ssize_t ib_uverbs_attach_mcast(struct ib_uverbs_file *file,
@@ -3532,7 +3495,6 @@ int ib_uverbs_ex_destroy_rwq_ind_table(struct ib_uverbs_file *file,
 				       struct ib_udata *uhw)
 {
 	struct ib_uverbs_ex_destroy_rwq_ind_table	cmd = {};
-	struct ib_uobject		*uobj;
 	int			ret;
 	size_t required_cmd_sz;
 
@@ -3553,12 +3515,8 @@ int ib_uverbs_ex_destroy_rwq_ind_table(struct ib_uverbs_file *file,
 	if (cmd.comp_mask)
 		return -EOPNOTSUPP;
 
-	uobj  = uobj_get_write(UVERBS_OBJECT_RWQ_IND_TBL, cmd.ind_tbl_handle,
-			       file->ucontext);
-	if (IS_ERR(uobj))
-		return PTR_ERR(uobj);
-
-	return uobj_remove_commit(uobj);
+	return uobj_perform_destroy(UVERBS_OBJECT_RWQ_IND_TBL,
+				    cmd.ind_tbl_handle, file, 0);
 }
 
 int ib_uverbs_ex_create_flow(struct ib_uverbs_file *file,
@@ -3746,7 +3704,6 @@ int ib_uverbs_ex_destroy_flow(struct ib_uverbs_file *file,
 			      struct ib_udata *uhw)
 {
 	struct ib_uverbs_destroy_flow	cmd;
-	struct ib_uobject		*uobj;
 	int				ret;
 
 	if (ucore->inlen < sizeof(cmd))
@@ -3759,13 +3716,8 @@ int ib_uverbs_ex_destroy_flow(struct ib_uverbs_file *file,
 	if (cmd.comp_mask)
 		return -EINVAL;
 
-	uobj  = uobj_get_write(UVERBS_OBJECT_FLOW, cmd.flow_handle,
-			       file->ucontext);
-	if (IS_ERR(uobj))
-		return PTR_ERR(uobj);
-
-	ret = uobj_remove_commit(uobj);
-	return ret;
+	return uobj_perform_destroy(UVERBS_OBJECT_FLOW, cmd.flow_handle, file,
+				    0);
 }
 
 static int __uverbs_create_xsrq(struct ib_uverbs_file *file,
