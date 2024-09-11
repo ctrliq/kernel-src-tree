@@ -1,0 +1,189 @@
+iommu/vt-d: Add first level page table interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] vt-d: Add first level page table interface (Jerry Snitselaar) [1742234]
+Rebuild_FUZZ: 93.33%
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 437f35e1cd4c8d043633bb72f4260369af68fbf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/437f35e1.failed
+
+This adds an interface to setup the PASID entries for first
+level page table translation.
+
+	Cc: Ashok Raj <ashok.raj@intel.com>
+	Cc: Jacob Pan <jacob.jun.pan@linux.intel.com>
+	Cc: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Sanjay Kumar <sanjay.k.kumar@intel.com>
+	Signed-off-by: Liu Yi L <yi.l.liu@intel.com>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Reviewed-by: Ashok Raj <ashok.raj@intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 437f35e1cd4c8d043633bb72f4260369af68fbf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-pasid.h
+diff --cc drivers/iommu/intel-pasid.h
+index 7aa7e4a635a7,512c63ec8a22..000000000000
+--- a/drivers/iommu/intel-pasid.h
++++ b/drivers/iommu/intel-pasid.h
+@@@ -12,10 -12,33 +12,37 @@@
+  
+  #define PASID_RID2PASID			0x0
+  #define PASID_MIN			0x1
+++<<<<<<< HEAD
+ +#define PASID_MAX			0x20000
+++=======
++ #define PASID_MAX			0x100000
++ #define PASID_PTE_MASK			0x3F
++ #define PASID_PTE_PRESENT		1
++ #define PDE_PFN_MASK			PAGE_MASK
++ #define PASID_PDE_SHIFT			6
++ #define MAX_NR_PASID_BITS		20
++ 
++ /*
++  * Domain ID reserved for pasid entries programmed for first-level
++  * only and pass-through transfer modes.
++  */
++ #define FLPT_DEFAULT_DID		1
++ 
++ /*
++  * The SUPERVISOR_MODE flag indicates a first level translation which
++  * can be used for access to kernel addresses. It is valid only for
++  * access to the kernel's static 1:1 mapping of physical memory — not
++  * to vmalloc or even module mappings.
++  */
++ #define PASID_FLAG_SUPERVISOR_MODE	BIT(0)
++ 
++ struct pasid_dir_entry {
++ 	u64 val;
++ };
+++>>>>>>> 437f35e1cd4c (iommu/vt-d: Add first level page table interface)
+  
+  struct pasid_entry {
+ -	u64 val[8];
+ +	u64 val;
+  };
+  
+  /* The representative of a PASID table */
+diff --git a/drivers/iommu/intel-pasid.c b/drivers/iommu/intel-pasid.c
+index 63accc78b1fb..ab9d6303ad21 100644
+--- a/drivers/iommu/intel-pasid.c
++++ b/drivers/iommu/intel-pasid.c
+@@ -10,6 +10,7 @@
+ #define pr_fmt(fmt)	"DMAR: " fmt
+ 
+ #include <linux/bitops.h>
++#include <linux/cpufeature.h>
+ #include <linux/dmar.h>
+ #include <linux/intel-iommu.h>
+ #include <linux/iommu.h>
+@@ -332,6 +333,26 @@ static inline void pasid_set_page_snoop(struct pasid_entry *pe, bool value)
+ 	pasid_set_bits(&pe->val[1], 1 << 23, value);
+ }
+ 
++/*
++ * Setup the First Level Page table Pointer field (Bit 140~191)
++ * of a scalable mode PASID entry.
++ */
++static inline void
++pasid_set_flptr(struct pasid_entry *pe, u64 value)
++{
++	pasid_set_bits(&pe->val[2], VTD_PAGE_MASK, value);
++}
++
++/*
++ * Setup the First Level Paging Mode field (Bit 130~131) of a
++ * scalable mode PASID entry.
++ */
++static inline void
++pasid_set_flpm(struct pasid_entry *pe, u64 value)
++{
++	pasid_set_bits(&pe->val[2], GENMASK_ULL(3, 2), value << 2);
++}
++
+ static void
+ pasid_cache_invalidation_with_pasid(struct intel_iommu *iommu,
+ 				    u16 did, int pasid)
+@@ -402,6 +423,65 @@ void intel_pasid_tear_down_entry(struct intel_iommu *iommu,
+ 		devtlb_invalidation_with_pasid(iommu, dev, pasid);
+ }
+ 
++/*
++ * Set up the scalable mode pasid table entry for first only
++ * translation type.
++ */
++int intel_pasid_setup_first_level(struct intel_iommu *iommu,
++				  struct device *dev, pgd_t *pgd,
++				  int pasid, u16 did, int flags)
++{
++	struct pasid_entry *pte;
++
++	if (!ecap_flts(iommu->ecap)) {
++		pr_err("No first level translation support on %s\n",
++		       iommu->name);
++		return -EINVAL;
++	}
++
++	pte = intel_pasid_get_entry(dev, pasid);
++	if (WARN_ON(!pte))
++		return -EINVAL;
++
++	pasid_clear_entry(pte);
++
++	/* Setup the first level page table pointer: */
++	pasid_set_flptr(pte, (u64)__pa(pgd));
++	if (flags & PASID_FLAG_SUPERVISOR_MODE) {
++		if (!ecap_srs(iommu->ecap)) {
++			pr_err("No supervisor request support on %s\n",
++			       iommu->name);
++			return -EINVAL;
++		}
++		pasid_set_sre(pte);
++	}
++
++#ifdef CONFIG_X86
++	if (cpu_feature_enabled(X86_FEATURE_LA57))
++		pasid_set_flpm(pte, 1);
++#endif /* CONFIG_X86 */
++
++	pasid_set_domain_id(pte, did);
++	pasid_set_address_width(pte, iommu->agaw);
++	pasid_set_page_snoop(pte, !!ecap_smpwc(iommu->ecap));
++
++	/* Setup Present and PASID Granular Transfer Type: */
++	pasid_set_translation_type(pte, 1);
++	pasid_set_present(pte);
++
++	if (!ecap_coherent(iommu->ecap))
++		clflush_cache_range(pte, sizeof(*pte));
++
++	if (cap_caching_mode(iommu->cap)) {
++		pasid_cache_invalidation_with_pasid(iommu, did, pasid);
++		iotlb_invalidation_with_pasid(iommu, did, pasid);
++	} else {
++		iommu_flush_write_buffer(iommu);
++	}
++
++	return 0;
++}
++
+ /*
+  * Set up the scalable mode pasid entry for second only translation type.
+  */
+* Unmerged path drivers/iommu/intel-pasid.h
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index d83908420a83..82ea27362d75 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -152,6 +152,7 @@
+  */
+ 
+ #define ecap_smpwc(e)		(((e) >> 48) & 0x1)
++#define ecap_flts(e)		(((e) >> 47) & 0x1)
+ #define ecap_slts(e)		(((e) >> 46) & 0x1)
+ #define ecap_smts(e)		(((e) >> 43) & 0x1)
+ #define ecap_dit(e)		((e >> 41) & 0x1)
