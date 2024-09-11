@@ -1,0 +1,317 @@
+dm: simplify bio-based IO accounting further
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit 9d20653fe84ebd772c3af71808e6a727603e0b71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/9d20653f.failed
+
+Now that io splitting is recorded prior to, or during, ->map IO
+accounting can happen immediately rather than defer until after
+bio splitting in dm_split_and_process_bio().
+
+Remove the DM_IO_START_ACCT flag and also remove dm_io's map_task
+member because there is no longer any need to wait for splitting to
+occur before accounting.
+
+Also move dm_io struct's 'flags' member to consolidate struct holes.
+
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 9d20653fe84ebd772c3af71808e6a727603e0b71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-core.h
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-core.h
+index a9c78c74b3c7,d21648a923ea..000000000000
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@@ -210,26 -252,45 +210,49 @@@ struct dm_target_io 
+   * One of these is allocated per original bio.
+   * It contains the first clone used for that original.
+   */
+ -#define DM_IO_MAGIC 19577
+ +#define DM_IO_MAGIC 5191977
+  struct dm_io {
+++<<<<<<< HEAD
+ +	unsigned int magic;
+++=======
++ 	unsigned short magic;
++ 	blk_short_t flags;
++ 	spinlock_t lock;
++ 	unsigned long start_time;
++ 	void *data;
++ 	struct dm_io *next;
++ 	struct dm_stats_aux stats_aux;
++ 	blk_status_t status;
+++>>>>>>> 9d20653fe84e (dm: simplify bio-based IO accounting further)
+  	atomic_t io_count;
+  	struct mapped_device *md;
+ -
+ -	/* The three fields represent mapped part of original bio */
+  	struct bio *orig_bio;
+ -	unsigned int sector_offset; /* offset to end of orig_bio */
+ -	unsigned int sectors;
+ -
+ +	blk_status_t status;
+ +	unsigned long start_time;
+ +	spinlock_t endio_lock;
+ +	struct dm_stats_aux stats_aux;
+  	/* last member of dm_target_io is 'struct bio' */
+  	struct dm_target_io tio;
+  };
+  
+++<<<<<<< HEAD
+ +static inline void dm_io_inc_pending(struct dm_io *io)
+++=======
++ /*
++  * dm_io flags
++  */
++ enum {
++ 	DM_IO_ACCOUNTED,
++ 	DM_IO_WAS_SPLIT
++ };
++ 
++ static inline bool dm_io_flagged(struct dm_io *io, unsigned int bit)
+++>>>>>>> 9d20653fe84e (dm: simplify bio-based IO accounting further)
+  {
+ -	return (io->flags & (1U << bit)) != 0;
+ +	atomic_inc(&io->io_count);
+  }
+  
+ -static inline void dm_io_set_flag(struct dm_io *io, unsigned int bit)
+ -{
+ -	io->flags |= (1U << bit);
+ -}
+ +void dm_io_dec_pending(struct dm_io *io, blk_status_t error);
+  
+  static inline struct completion *dm_get_completion_from_kobject(struct kobject *kobj)
+  {
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,50e081f68792..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -616,11 -596,12 +616,17 @@@ static struct dm_io *alloc_io(struct ma
+  	this_cpu_inc(*md->pending_io);
+  	io->orig_bio = bio;
+  	io->md = md;
+++<<<<<<< HEAD
+ +	spin_lock_init(&io->endio_lock);
+++=======
++ 	spin_lock_init(&io->lock);
++ 	io->start_time = jiffies;
++ 	io->flags = 0;
+++>>>>>>> 9d20653fe84e (dm: simplify bio-based IO accounting further)
+ +
+ +	io->start_time = jiffies;
+  
+ -	if (static_branch_unlikely(&stats_enabled))
+ -		dm_stats_record_start(&md->stats, &io->stats_aux);
+ +	dm_stats_record_start(&md->stats, &io->stats_aux);
+  
+  	return io;
+  }
+@@@ -1252,6 -1233,43 +1258,39 @@@ void dm_accept_partial_bio(struct bio *
+  }
+  EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * @clone: clone bio that DM core passed to target's .map function
++  * @tgt_clone: clone of @clone bio that target needs submitted
++  *
++  * Targets should use this interface to submit bios they take
++  * ownership of when returning DM_MAPIO_SUBMITTED.
++  *
++  * Target should also enable ti->accounts_remapped_io
++  */
++ void dm_submit_bio_remap(struct bio *clone, struct bio *tgt_clone)
++ {
++ 	struct dm_target_io *tio = clone_to_tio(clone);
++ 	struct dm_io *io = tio->io;
++ 
++ 	/* establish bio that will get submitted */
++ 	if (!tgt_clone)
++ 		tgt_clone = clone;
++ 
++ 	/*
++ 	 * Account io->origin_bio to DM dev on behalf of target
++ 	 * that took ownership of IO with DM_MAPIO_SUBMITTED.
++ 	 */
++ 	dm_start_io_acct(io, clone);
++ 
++ 	trace_block_bio_remap(tgt_clone, disk_devt(io->md->disk),
++ 			      tio->old_sector);
++ 	submit_bio_noacct(tgt_clone);
++ }
++ EXPORT_SYMBOL_GPL(dm_submit_bio_remap);
++ 
+++>>>>>>> 9d20653fe84e (dm: simplify bio-based IO accounting further)
+  static noinline void __set_swap_bios_limit(struct mapped_device *md, int latch)
+  {
+  	mutex_lock(&md->swap_bios_lock);
+@@@ -1295,31 -1309,38 +1334,40 @@@ static blk_qc_t __map_bio(struct dm_tar
+  		down(&md->swap_bios_semaphore);
+  	}
+  
+ -	if (static_branch_unlikely(&zoned_enabled)) {
+ -		/*
+ -		 * Check if the IO needs a special mapping due to zone append
+ -		 * emulation on zoned target. In this case, dm_zone_map_bio()
+ -		 * calls the target map operation.
+ -		 */
+ -		if (unlikely(dm_emulate_zone_append(md)))
+ -			r = dm_zone_map_bio(tio);
+ -		else
+ -			r = ti->type->map(ti, clone);
+ -	} else
+ -		r = ti->type->map(ti, clone);
+ -
+ +	r = ti->type->map(ti, clone);
+  	switch (r) {
+  	case DM_MAPIO_SUBMITTED:
+++<<<<<<< HEAD
+ +		break;
+ +	case DM_MAPIO_REMAPPED:
+ +		/* the bio has been remapped so dispatch it */
+ +		trace_block_bio_remap(clone->bi_disk->queue, clone,
+ +				      bio_dev(io->orig_bio), sector);
+ +		ret = generic_make_request(clone);
+++=======
++ 		/* target has assumed ownership of this io */
++ 		if (!ti->accounts_remapped_io)
++ 			dm_start_io_acct(io, clone);
++ 		break;
++ 	case DM_MAPIO_REMAPPED:
++ 		dm_submit_bio_remap(clone, NULL);
+++>>>>>>> 9d20653fe84e (dm: simplify bio-based IO accounting further)
+  		break;
+  	case DM_MAPIO_KILL:
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+ +			up(&md->swap_bios_semaphore);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_IOERR);
+ +		break;
+  	case DM_MAPIO_REQUEUE:
+ -		if (static_branch_unlikely(&swap_bios_enabled) &&
+ -		    unlikely(swap_bios_limit(ti, clone)))
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+  			up(&md->swap_bios_semaphore);
+ -		free_tio(clone);
+ -		if (r == DM_MAPIO_KILL)
+ -			dm_io_dec_pending(io, BLK_STS_IOERR);
+ -		else
+ -			dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+  		break;
+  	default:
+  		DMWARN("unimplemented target map return value: %d", r);
+@@@ -1608,55 -1630,56 +1656,87 @@@ static void init_clone_info(struct clon
+  /*
+   * Entry point to split a bio into clones and submit them to the targets.
+   */
+ -static void dm_split_and_process_bio(struct mapped_device *md,
+ -				     struct dm_table *map, struct bio *bio)
+ +static blk_qc_t __split_and_process_bio(struct mapped_device *md,
+ +					struct dm_table *map, struct bio *bio)
+  {
+  	struct clone_info ci;
+ -	struct dm_io *io;
+ -	blk_status_t error = BLK_STS_OK;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+ +	int error = 0;
+  
+  	init_clone_info(&ci, md, map, bio);
+ -	io = ci.io;
+  
+  	if (bio->bi_opf & REQ_PREFLUSH) {
+ -		__send_empty_flush(&ci);
+ -		/* dm_io_complete submits any data associated with flush */
+ -		goto out;
+ +		error = __send_empty_flush(&ci);
+ +		/* dm_io_dec_pending submits any data associated with flush */
+ +	} else if (op_is_zone_mgmt(bio_op(bio))) {
+ +		ci.bio = bio;
+ +		ci.sector_count = 0;
+ +		error = __split_and_process_non_flush(&ci);
+ +	} else {
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		error = __split_and_process_non_flush(&ci);
+ +		if (ci.sector_count && !error) {
+ +			/*
+ +			 * Remainder must be passed to generic_make_request()
+ +			 * so that it gets handled *after* bios already submitted
+ +			 * have been completely processed.
+ +			 * We take a clone of the original to store in
+ +			 * ci.io->orig_bio to be used by end_io_acct() and
+ +			 * for dec_pending to use for completion handling.
+ +			 */
+ +			struct bio *b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ +						  GFP_NOIO, &md->queue->bio_split);
+ +			ci.io->orig_bio = b;
+ +
+ +			bio_chain(b, bio);
+ +			trace_block_split(md->queue, b, bio->bi_iter.bi_sector);
+ +			ret = generic_make_request(bio);
+ +		}
+  	}
+ +	start_io_acct(ci.io);
+  
+++<<<<<<< HEAD
+ +	/* drop the extra reference count */
+ +	dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+++=======
++ 	error = __split_and_process_bio(&ci);
++ 	if (error || !ci.sector_count)
++ 		goto out;
++ 	/*
++ 	 * Remainder must be passed to submit_bio_noacct() so it gets handled
++ 	 * *after* bios already submitted have been completely processed.
++ 	 */
++ 	bio_trim(bio, io->sectors, ci.sector_count);
++ 	trace_block_split(bio, bio->bi_iter.bi_sector);
++ 	bio_inc_remaining(bio);
++ 	submit_bio_noacct(bio);
++ out:
++ 	/*
++ 	 * Drop the extra reference count for non-POLLED bio, and hold one
++ 	 * reference for POLLED bio, which will be released in dm_poll_bio
++ 	 *
++ 	 * Add every dm_io instance into the dm_io list head which is stored
++ 	 * in bio->bi_private, so that dm_poll_bio can poll them all.
++ 	 */
++ 	if (error || !ci.submit_as_polled) {
++ 		/*
++ 		 * In case of submission failure, the extra reference for
++ 		 * submitting io isn't consumed yet
++ 		 */
++ 		if (error)
++ 			atomic_dec(&io->io_count);
++ 		dm_io_dec_pending(io, error);
++ 	} else
++ 		dm_queue_poll_io(bio, io);
+++>>>>>>> 9d20653fe84e (dm: simplify bio-based IO accounting further)
+  }
+  
+ -static void dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+* Unmerged path drivers/md/dm-core.h
+* Unmerged path drivers/md/dm.c
