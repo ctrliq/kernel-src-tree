@@ -1,0 +1,157 @@
+mm: swapoff: remove too limiting SWAP_UNUSE_MAX_TRIES
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Hugh Dickins <hughd@google.com>
+commit dd862deb151aad2548e72b077a82ad3aa91b715f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/dd862deb.failed
+
+SWAP_UNUSE_MAX_TRIES 3 appeared to work well in earlier testing, but
+further testing has proved it to be a source of unnecessary swapoff
+EBUSY failures (which can then be followed by unmount EBUSY failures).
+
+When mmget_not_zero() or shmem's igrab() fails, there is an mm exiting
+or inode being evicted, freeing up swap independent of try_to_unuse().
+Those typically completed much sooner than the old quadratic swapoff,
+but now it's more common that swapoff may need to wait for them.
+
+It's possible to move those cases from init_mm.mmlist and shmem_swaplist
+to separate "exiting" swaplists, and try_to_unuse() then wait for those
+lists to be emptied; but we've not bothered with that in the past, and
+don't want to risk missing some other forgotten case.  So just revert to
+cycling around until the swap is gone, without any retries limit.
+
+Link: http://lkml.kernel.org/r/alpine.LSU.2.11.1904081256170.1523@eggly.anvils
+Fixes: b56a2d8af914 ("mm: rid swapoff of quadratic complexity")
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Cc: "Alex Xu (Hello71)" <alex_y_xu@yahoo.ca>
+	Cc: Huang Ying <ying.huang@intel.com>
+	Cc: Kelley Nielsen <kelleynnn@gmail.com>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Vineeth Pillai <vpillai@digitalocean.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit dd862deb151aad2548e72b077a82ad3aa91b715f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swapfile.c
+diff --cc mm/swapfile.c
+index b77fb155eaf4,bf4ef2e40f23..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -2174,42 -2026,32 +2174,46 @@@ static unsigned int find_next_to_unuse(
+  int try_to_unuse(unsigned int type, bool frontswap,
+  		 unsigned long pages_to_unuse)
+  {
+ -	struct mm_struct *prev_mm;
+ -	struct mm_struct *mm;
+ -	struct list_head *p;
+ -	int retval = 0;
+  	struct swap_info_struct *si = swap_info[type];
+ +	struct mm_struct *start_mm;
+ +	volatile unsigned char *swap_map; /* swap_map is accessed without
+ +					   * locking. Mark it as volatile
+ +					   * to prevent compiler doing
+ +					   * something odd.
+ +					   */
+ +	unsigned char swcount;
+  	struct page *page;
+  	swp_entry_t entry;
+++<<<<<<< HEAD
+ +	unsigned int i = 0;
+ +	int retval = 0;
+++=======
++ 	unsigned int i;
+++>>>>>>> dd862deb151a (mm: swapoff: remove too limiting SWAP_UNUSE_MAX_TRIES)
+  
+ -	if (!si->inuse_pages)
+ -		return 0;
+ -
+ -	if (!frontswap)
+ -		pages_to_unuse = 0;
+ -
+ -retry:
+ -	retval = shmem_unuse(type, frontswap, &pages_to_unuse);
+ -	if (retval)
+ -		goto out;
+ -
+ -	prev_mm = &init_mm;
+ -	mmget(prev_mm);
+ +	/*
+ +	 * When searching mms for an entry, a good strategy is to
+ +	 * start at the first mm we freed the previous entry from
+ +	 * (though actually we don't notice whether we or coincidence
+ +	 * freed the entry).  Initialize this start_mm with a hold.
+ +	 *
+ +	 * A simpler strategy would be to start at the last mm we
+ +	 * freed the previous entry from; but that would take less
+ +	 * advantage of mmlist ordering, which clusters forked mms
+ +	 * together, child after parent.  If we race with dup_mmap(), we
+ +	 * prefer to resolve parent before child, lest we miss entries
+ +	 * duplicated after we scanned child: using last mm would invert
+ +	 * that.
+ +	 */
+ +	start_mm = &init_mm;
+ +	mmget(&init_mm);
+  
+ -	spin_lock(&mmlist_lock);
+ -	p = &init_mm.mmlist;
+ -	while ((p = p->next) != &init_mm.mmlist) {
+ +	/*
+ +	 * Keep on scanning until all entries have gone.  Usually,
+ +	 * one pass through swap_map is enough, but not necessarily:
+ +	 * there are races when an instance of an entry might be missed.
+ +	 */
+ +	while ((i = find_next_to_unuse(si, i, frontswap)) != 0) {
+  		if (signal_pending(current)) {
+  			retval = -EINTR;
+  			break;
+@@@ -2382,18 -2102,31 +2386,38 @@@
+  		put_page(page);
+  
+  		/*
+ -		 * For frontswap, we just need to unuse pages_to_unuse, if
+ -		 * it was specified. Need not check frontswap again here as
+ -		 * we already zeroed out pages_to_unuse if not frontswap.
+ +		 * Make sure that we aren't completely killing
+ +		 * interactive performance.
+  		 */
+ -		if (pages_to_unuse && --pages_to_unuse == 0)
+ -			goto out;
+ +		cond_resched();
+ +		if (frontswap && pages_to_unuse > 0) {
+ +			if (!--pages_to_unuse)
+ +				break;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	mmput(start_mm);
+ +	return retval;
+++=======
++ 	/*
++ 	 * Lets check again to see if there are still swap entries in the map.
++ 	 * If yes, we would need to do retry the unuse logic again.
++ 	 * Under global memory pressure, swap entries can be reinserted back
++ 	 * into process space after the mmlist loop above passes over them.
++ 	 *
++ 	 * Limit the number of retries? No: when shmem_unuse()'s igrab() fails,
++ 	 * a shmem inode using swap is being evicted; and when mmget_not_zero()
++ 	 * above fails, that mm is likely to be freeing swap from exit_mmap().
++ 	 * Both proceed at their own independent pace: we could move them to
++ 	 * separate lists, and wait for those lists to be emptied; but it's
++ 	 * easier and more robust (though cpu-intensive) just to keep retrying.
++ 	 */
++ 	if (si->inuse_pages)
++ 		goto retry;
++ out:
++ 	return (retval == FRONTSWAP_PAGES_UNUSED) ? 0 : retval;
+++>>>>>>> dd862deb151a (mm: swapoff: remove too limiting SWAP_UNUSE_MAX_TRIES)
+  }
+  
+  /*
+* Unmerged path mm/swapfile.c
