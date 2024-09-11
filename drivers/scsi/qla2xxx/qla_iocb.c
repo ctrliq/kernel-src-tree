@@ -2776,7 +2776,8 @@ qla2x00_els_dcmd2_sp_done(void *ptr, int res)
 		} else {
 			memset(&ea, 0, sizeof(ea));
 			ea.fcport = fcport;
-			ea.rc = res;
+			ea.data[0] = MBS_COMMAND_COMPLETE;
+			ea.sp = sp;
 			qla24xx_handle_plogi_done_event(vha, &ea);
 		}
 
