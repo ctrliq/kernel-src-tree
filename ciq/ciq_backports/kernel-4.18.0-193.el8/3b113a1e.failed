@@ -1,0 +1,345 @@
+IB/mlx5: Support device memory type attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Ariel Levkovich <lariel@mellanox.com>
+commit 3b113a1ec3d4ac7e1e621b77650ac05491f5924a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3b113a1e.failed
+
+This patch intoruduces a new mlx5_ib driver attribute to the DM allocation
+method - the DM type.
+
+In order to allow addition of new types in downstream patches this patch
+also refactors the allocation, deallocation and registration handlers to
+consider the requested type and perform the necessary actions according to
+it.
+
+Since not all future device memory types will be such that are mapped to
+user memory, the mandatory page index output attribute is modified to be
+optional.
+
+	Signed-off-by: Ariel Levkovich <lariel@mellanox.com>
+	Reviewed-by: Eli Cohen <eli@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 3b113a1ec3d4ac7e1e621b77650ac05491f5924a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	include/uapi/rdma/mlx5_user_ioctl_verbs.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 46c0299d6e7a,97f32a03e456..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -2327,24 -2353,33 +2359,42 @@@ err_free
+  	return ERR_PTR(err);
+  }
+  
+ -int mlx5_ib_dealloc_dm(struct ib_dm *ibdm, struct uverbs_attr_bundle *attrs)
+ +int mlx5_ib_dealloc_dm(struct ib_dm *ibdm)
+  {
+- 	struct mlx5_memic *memic = &to_mdev(ibdm->device)->memic;
++ 	struct mlx5_dm *dm_db = &to_mdev(ibdm->device)->dm;
+  	struct mlx5_ib_dm *dm = to_mdm(ibdm);
+- 	u64 act_size = roundup(dm->ibdm.length, MLX5_MEMIC_BASE_SIZE);
+  	u32 page_idx;
+  	int ret;
+  
+- 	ret = mlx5_cmd_dealloc_memic(memic, dm->dev_addr, act_size);
+- 	if (ret)
+- 		return ret;
++ 	switch (dm->type) {
++ 	case MLX5_IB_UAPI_DM_TYPE_MEMIC:
++ 		ret = mlx5_cmd_dealloc_memic(dm_db, dm->dev_addr, dm->size);
++ 		if (ret)
++ 			return ret;
+  
+++<<<<<<< HEAD
+ +	page_idx = (dm->dev_addr - memic->dev->bar_addr -
+ +		    MLX5_CAP64_DEV_MEM(memic->dev, memic_bar_start_addr)) >>
+ +		    PAGE_SHIFT;
+ +	bitmap_clear(to_mucontext(ibdm->uobject->context)->dm_pages,
+ +		     page_idx,
+ +		     DIV_ROUND_UP(act_size, PAGE_SIZE));
+++=======
++ 		page_idx = (dm->dev_addr -
++ 			    pci_resource_start(dm_db->dev->pdev, 0) -
++ 			    MLX5_CAP64_DEV_MEM(dm_db->dev,
++ 					       memic_bar_start_addr)) >>
++ 			   PAGE_SHIFT;
++ 		bitmap_clear(rdma_udata_to_drv_context(&attrs->driver_udata,
++ 						       struct mlx5_ib_ucontext,
++ 						       ibucontext)
++ 				     ->dm_pages,
++ 			     page_idx, DIV_ROUND_UP(dm->size, PAGE_SIZE));
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> 3b113a1ec3d4 (IB/mlx5: Support device memory type attribute)
+  
+  	kfree(dm);
+  
+diff --cc include/uapi/rdma/mlx5_user_ioctl_verbs.h
+index 173ec938ff3a,c291fb2f8446..000000000000
+--- a/include/uapi/rdma/mlx5_user_ioctl_verbs.h
++++ b/include/uapi/rdma/mlx5_user_ioctl_verbs.h
+@@@ -52,5 -52,14 +52,17 @@@ enum mlx5_ib_uapi_flow_action_packet_re
+  	MLX5_IB_UAPI_FLOW_ACTION_PACKET_REFORMAT_TYPE_L2_TO_L3_TUNNEL = 0x3,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_ib_uapi_devx_async_cmd_hdr {
++ 	__aligned_u64	wr_id;
++ 	__u8		out_data[];
++ };
++ 
++ enum mlx5_ib_uapi_dm_type {
++ 	MLX5_IB_UAPI_DM_TYPE_MEMIC,
++ };
++ 
+++>>>>>>> 3b113a1ec3d4 (IB/mlx5: Support device memory type attribute)
+  #endif
+  
+diff --git a/drivers/infiniband/hw/mlx5/cmd.c b/drivers/infiniband/hw/mlx5/cmd.c
+index be95ac5aeb30..f0e9c7609083 100644
+--- a/drivers/infiniband/hw/mlx5/cmd.c
++++ b/drivers/infiniband/hw/mlx5/cmd.c
+@@ -82,10 +82,10 @@ int mlx5_cmd_modify_cong_params(struct mlx5_core_dev *dev,
+ 	return mlx5_cmd_exec(dev, in, in_size, out, sizeof(out));
+ }
+ 
+-int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
+-			  u64 length, u32 alignment)
++int mlx5_cmd_alloc_memic(struct mlx5_dm *dm, phys_addr_t *addr,
++			 u64 length, u32 alignment)
+ {
+-	struct mlx5_core_dev *dev = memic->dev;
++	struct mlx5_core_dev *dev = dm->dev;
+ 	u64 num_memic_hw_pages = MLX5_CAP_DEV_MEM(dev, memic_bar_size)
+ 					>> PAGE_SHIFT;
+ 	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
+@@ -115,17 +115,17 @@ int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
+ 		 mlx5_alignment);
+ 
+ 	while (page_idx < num_memic_hw_pages) {
+-		spin_lock(&memic->memic_lock);
+-		page_idx = bitmap_find_next_zero_area(memic->memic_alloc_pages,
++		spin_lock(&dm->lock);
++		page_idx = bitmap_find_next_zero_area(dm->memic_alloc_pages,
+ 						      num_memic_hw_pages,
+ 						      page_idx,
+ 						      num_pages, 0);
+ 
+ 		if (page_idx < num_memic_hw_pages)
+-			bitmap_set(memic->memic_alloc_pages,
++			bitmap_set(dm->memic_alloc_pages,
+ 				   page_idx, num_pages);
+ 
+-		spin_unlock(&memic->memic_lock);
++		spin_unlock(&dm->lock);
+ 
+ 		if (page_idx >= num_memic_hw_pages)
+ 			break;
+@@ -135,10 +135,10 @@ int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
+ 
+ 		ret = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+ 		if (ret) {
+-			spin_lock(&memic->memic_lock);
+-			bitmap_clear(memic->memic_alloc_pages,
++			spin_lock(&dm->lock);
++			bitmap_clear(dm->memic_alloc_pages,
+ 				     page_idx, num_pages);
+-			spin_unlock(&memic->memic_lock);
++			spin_unlock(&dm->lock);
+ 
+ 			if (ret == -EAGAIN) {
+ 				page_idx++;
+@@ -157,9 +157,9 @@ int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
+ 	return -ENOMEM;
+ }
+ 
+-int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length)
++int mlx5_cmd_dealloc_memic(struct mlx5_dm *dm, u64 addr, u64 length)
+ {
+-	struct mlx5_core_dev *dev = memic->dev;
++	struct mlx5_core_dev *dev = dm->dev;
+ 	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
+ 	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
+ 	u32 out[MLX5_ST_SZ_DW(dealloc_memic_out)] = {0};
+@@ -177,10 +177,10 @@ int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length)
+ 	err =  mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+ 
+ 	if (!err) {
+-		spin_lock(&memic->memic_lock);
+-		bitmap_clear(memic->memic_alloc_pages,
++		spin_lock(&dm->lock);
++		bitmap_clear(dm->memic_alloc_pages,
+ 			     start_page_idx, num_pages);
+-		spin_unlock(&memic->memic_lock);
++		spin_unlock(&dm->lock);
+ 	}
+ 
+ 	return err;
+diff --git a/drivers/infiniband/hw/mlx5/cmd.h b/drivers/infiniband/hw/mlx5/cmd.h
+index 923a7b93f507..80a644bea6c7 100644
+--- a/drivers/infiniband/hw/mlx5/cmd.h
++++ b/drivers/infiniband/hw/mlx5/cmd.h
+@@ -44,9 +44,9 @@ int mlx5_cmd_query_cong_params(struct mlx5_core_dev *dev, int cong_point,
+ int mlx5_cmd_query_ext_ppcnt_counters(struct mlx5_core_dev *dev, void *out);
+ int mlx5_cmd_modify_cong_params(struct mlx5_core_dev *mdev,
+ 				void *in, int in_size);
+-int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
++int mlx5_cmd_alloc_memic(struct mlx5_dm *dm, phys_addr_t *addr,
+ 			 u64 length, u32 alignment);
+-int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length);
++int mlx5_cmd_dealloc_memic(struct mlx5_dm *dm, u64 addr, u64 length);
+ void mlx5_cmd_dealloc_pd(struct mlx5_core_dev *dev, u32 pdn, u16 uid);
+ void mlx5_cmd_destroy_tir(struct mlx5_core_dev *dev, u32 tirn, u16 uid);
+ void mlx5_cmd_destroy_tis(struct mlx5_core_dev *dev, u32 tisn, u16 uid);
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 37022aa82058..471c6e3896e6 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -48,6 +48,7 @@
+ #include <rdma/mlx5-abi.h>
+ #include <rdma/uverbs_ioctl.h>
+ #include <rdma/mlx5_user_ioctl_cmds.h>
++#include <rdma/mlx5_user_ioctl_verbs.h>
+ 
+ #include "srq.h"
+ 
+@@ -551,15 +552,17 @@ enum mlx5_ib_mtt_access_flags {
+ struct mlx5_ib_dm {
+ 	struct ib_dm		ibdm;
+ 	phys_addr_t		dev_addr;
++	u32			type;
++	size_t			size;
+ };
+ 
+ #define MLX5_IB_MTT_PRESENT (MLX5_IB_MTT_READ | MLX5_IB_MTT_WRITE)
+ 
+-#define MLX5_IB_DM_ALLOWED_ACCESS (IB_ACCESS_LOCAL_WRITE   |\
+-				   IB_ACCESS_REMOTE_WRITE  |\
+-				   IB_ACCESS_REMOTE_READ   |\
+-				   IB_ACCESS_REMOTE_ATOMIC |\
+-				   IB_ZERO_BASED)
++#define MLX5_IB_DM_MEMIC_ALLOWED_ACCESS (IB_ACCESS_LOCAL_WRITE   |\
++					 IB_ACCESS_REMOTE_WRITE  |\
++					 IB_ACCESS_REMOTE_READ   |\
++					 IB_ACCESS_REMOTE_ATOMIC |\
++					 IB_ZERO_BASED)
+ 
+ struct mlx5_ib_mr {
+ 	struct ib_mr		ibmr;
+@@ -844,9 +847,13 @@ struct mlx5_ib_flow_action {
+ 	};
+ };
+ 
+-struct mlx5_memic {
++struct mlx5_dm {
+ 	struct mlx5_core_dev *dev;
+-	spinlock_t		memic_lock;
++	/* This lock is used to protect the access to the shared
++	 * allocation map when concurrent requests by different
++	 * processes are handled.
++	 */
++	spinlock_t lock;
+ 	DECLARE_BITMAP(memic_alloc_pages, MLX5_MAX_MEMIC_PAGES);
+ };
+ 
+@@ -951,7 +958,7 @@ struct mlx5_ib_dev {
+ 	u8			umr_fence;
+ 	struct list_head	ib_dev_list;
+ 	u64			sys_image_guid;
+-	struct mlx5_memic	memic;
++	struct mlx5_dm		dm;
+ 	u16			devx_whitelist_uid;
+ 	struct mlx5_srq_table   srq_table;
+ 	struct mlx5_async_ctx   async_ctx;
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index 0a633d06794a..39634756e5a3 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1193,8 +1193,8 @@ static void set_mr_fields(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr,
+ 	mr->access_flags = access_flags;
+ }
+ 
+-static struct ib_mr *mlx5_ib_get_memic_mr(struct ib_pd *pd, u64 memic_addr,
+-					  u64 length, int acc)
++static struct ib_mr *mlx5_ib_get_dm_mr(struct ib_pd *pd, u64 start_addr,
++				       u64 length, int acc, int mode)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ 	int inlen = MLX5_ST_SZ_BYTES(create_mkey_in);
+@@ -1216,9 +1216,8 @@ static struct ib_mr *mlx5_ib_get_memic_mr(struct ib_pd *pd, u64 memic_addr,
+ 
+ 	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
+ 
+-	MLX5_SET(mkc, mkc, access_mode_1_0, MLX5_MKC_ACCESS_MODE_MEMIC & 0x3);
+-	MLX5_SET(mkc, mkc, access_mode_4_2,
+-		 (MLX5_MKC_ACCESS_MODE_MEMIC >> 2) & 0x7);
++	MLX5_SET(mkc, mkc, access_mode_1_0, mode & 0x3);
++	MLX5_SET(mkc, mkc, access_mode_4_2, (mode >> 2) & 0x7);
+ 	MLX5_SET(mkc, mkc, a, !!(acc & IB_ACCESS_REMOTE_ATOMIC));
+ 	MLX5_SET(mkc, mkc, rw, !!(acc & IB_ACCESS_REMOTE_WRITE));
+ 	MLX5_SET(mkc, mkc, rr, !!(acc & IB_ACCESS_REMOTE_READ));
+@@ -1228,7 +1227,7 @@ static struct ib_mr *mlx5_ib_get_memic_mr(struct ib_pd *pd, u64 memic_addr,
+ 	MLX5_SET64(mkc, mkc, len, length);
+ 	MLX5_SET(mkc, mkc, pd, to_mpd(pd)->pdn);
+ 	MLX5_SET(mkc, mkc, qpn, 0xffffff);
+-	MLX5_SET64(mkc, mkc, start_addr, memic_addr - dev->mdev->bar_addr);
++	MLX5_SET64(mkc, mkc, start_addr, start_addr);
+ 
+ 	err = mlx5_core_create_mkey(mdev, &mr->mmkey, in, inlen);
+ 	if (err)
+@@ -1270,15 +1269,24 @@ struct ib_mr *mlx5_ib_reg_dm_mr(struct ib_pd *pd, struct ib_dm *dm,
+ 				struct uverbs_attr_bundle *attrs)
+ {
+ 	struct mlx5_ib_dm *mdm = to_mdm(dm);
+-	u64 memic_addr;
++	struct mlx5_core_dev *dev = to_mdev(dm->device)->mdev;
++	u64 start_addr = mdm->dev_addr + attr->offset;
++	int mode;
+ 
+-	if (attr->access_flags & ~MLX5_IB_DM_ALLOWED_ACCESS)
+-		return ERR_PTR(-EINVAL);
++	switch (mdm->type) {
++	case MLX5_IB_UAPI_DM_TYPE_MEMIC:
++		if (attr->access_flags & ~MLX5_IB_DM_MEMIC_ALLOWED_ACCESS)
++			return ERR_PTR(-EINVAL);
+ 
+-	memic_addr = mdm->dev_addr + attr->offset;
++		mode = MLX5_MKC_ACCESS_MODE_MEMIC;
++		start_addr -= pci_resource_start(dev->pdev, 0);
++		break;
++	default:
++		return ERR_PTR(-EINVAL);
++	}
+ 
+-	return mlx5_ib_get_memic_mr(pd, memic_addr, attr->length,
+-				    attr->access_flags);
++	return mlx5_ib_get_dm_mr(pd, start_addr, attr->length,
++				 attr->access_flags, mode);
+ }
+ 
+ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+diff --git a/include/uapi/rdma/mlx5_user_ioctl_cmds.h b/include/uapi/rdma/mlx5_user_ioctl_cmds.h
+index 1a1890885f56..2f5a19a283d8 100644
+--- a/include/uapi/rdma/mlx5_user_ioctl_cmds.h
++++ b/include/uapi/rdma/mlx5_user_ioctl_cmds.h
+@@ -44,6 +44,7 @@ enum mlx5_ib_create_flow_action_attrs {
+ enum mlx5_ib_alloc_dm_attrs {
+ 	MLX5_IB_ATTR_ALLOC_DM_RESP_START_OFFSET = (1U << UVERBS_ID_NS_SHIFT),
+ 	MLX5_IB_ATTR_ALLOC_DM_RESP_PAGE_INDEX,
++	MLX5_IB_ATTR_ALLOC_DM_REQ_TYPE,
+ };
+ 
+ enum mlx5_ib_devx_methods {
+* Unmerged path include/uapi/rdma/mlx5_user_ioctl_verbs.h
