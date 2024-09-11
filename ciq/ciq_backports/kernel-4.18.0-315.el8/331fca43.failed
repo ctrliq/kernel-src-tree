@@ -1,0 +1,253 @@
+bpf: tcp: Add bpf_skops_hdr_opt_len() and bpf_skops_write_hdr_opt()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 331fca4315efa3bbd258fbdf8209d59d253c0480
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/331fca43.failed
+
+The bpf prog needs to parse the SYN header to learn what options have
+been sent by the peer's bpf-prog before writing its options into SYNACK.
+This patch adds a "syn_skb" arg to tcp_make_synack() and send_synack().
+This syn_skb will eventually be made available (as read-only) to the
+bpf prog.  This will be the only SYN packet available to the bpf
+prog during syncookie.  For other regular cases, the bpf prog can
+also use the saved_syn.
+
+When writing options, the bpf prog will first be called to tell the
+kernel its required number of bytes.  It is done by the new
+bpf_skops_hdr_opt_len().  The bpf prog will only be called when the new
+BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG is set in tp->bpf_sock_ops_cb_flags.
+When the bpf prog returns, the kernel will know how many bytes are needed
+and then update the "*remaining" arg accordingly.  4 byte alignment will
+be included in the "*remaining" before this function returns.  The 4 byte
+aligned number of bytes will also be stored into the opts->bpf_opt_len.
+"bpf_opt_len" is a newly added member to the struct tcp_out_options.
+
+Then the new bpf_skops_write_hdr_opt() will call the bpf prog to write the
+header options.  The bpf prog is only called if it has reserved spaces
+before (opts->bpf_opt_len > 0).
+
+The bpf prog is the last one getting a chance to reserve header space
+and writing the header option.
+
+These two functions are half implemented to highlight the changes in
+TCP stack.  The actual codes preparing the bpf running context and
+invoking the bpf prog will be added in the later patch with other
+necessary bpf pieces.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/bpf/20200820190052.2885316-1-kafai@fb.com
+(cherry picked from commit 331fca4315efa3bbd258fbdf8209d59d253c0480)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	net/ipv4/tcp_output.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index 0a8b1917a074,18d0e128bc3c..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -4224,8 -4173,11 +4224,16 @@@ enum 
+  	BPF_SOCK_OPS_RETRANS_CB_FLAG	= (1<<1),
+  	BPF_SOCK_OPS_STATE_CB_FLAG	= (1<<2),
+  	BPF_SOCK_OPS_RTT_CB_FLAG	= (1<<3),
+++<<<<<<< HEAD
+ +/* Mask of all currently supported cb flags */
+ +	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0xF,
+++=======
++ 	BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG  = (1<<4),
++ 	BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG = (1<<5),
++ 	BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG = (1<<6),
++ /* Mask of all currently supported cb flags */
++ 	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0x7F,
+++>>>>>>> 331fca4315ef (bpf: tcp: Add bpf_skops_hdr_opt_len() and bpf_skops_write_hdr_opt())
+  };
+  
+  /* List of known BPF sock_ops operators.
+diff --cc net/ipv4/tcp_output.c
+index 2a06236089f6,673db6879e46..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -1222,7 -1282,12 +1291,16 @@@ static int __tcp_transmit_skb(struct so
+  	}
+  #endif
+  
+++<<<<<<< HEAD
+ +	icsk->icsk_af_ops->send_check(sk, skb);
+++=======
++ 	/* BPF prog is the last one writing header option */
++ 	bpf_skops_write_hdr_opt(sk, skb, NULL, NULL, 0, &opts);
++ 
++ 	INDIRECT_CALL_INET(icsk->icsk_af_ops->send_check,
++ 			   tcp_v6_send_check, tcp_v4_send_check,
++ 			   sk, skb);
+++>>>>>>> 331fca4315ef (bpf: tcp: Add bpf_skops_hdr_opt_len() and bpf_skops_write_hdr_opt())
+  
+  	if (likely(tcb->tcp_flags & TCPHDR_ACK))
+  		tcp_event_ack_sent(sk, tcp_skb_pcount(skb), rcv_nxt);
+@@@ -3319,13 -3408,14 +3397,24 @@@ int tcp_send_synack(struct sock *sk
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * tcp_make_synack - Prepare a SYN-ACK.
+ + * sk: listener socket
+ + * dst: dst entry attached to the SYNACK
+ + * req: request_sock pointer
+ + *
+ + * Allocate one skb and build a SYNACK packet.
+ + * @dst is consumed : Caller should not use it again.
+++=======
++  * tcp_make_synack - Allocate one skb and build a SYNACK packet.
++  * @sk: listener socket
++  * @dst: dst entry attached to the SYNACK. It is consumed and caller
++  *       should not use it again.
++  * @req: request_sock pointer
++  * @foc: cookie for tcp fast open
++  * @synack_type: Type of synack to prepare
++  * @syn_skb: SYN packet just received.  It could be NULL for rtx case.
+++>>>>>>> 331fca4315ef (bpf: tcp: Add bpf_skops_hdr_opt_len() and bpf_skops_write_hdr_opt())
+   */
+  struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
+  				struct request_sock *req,
+@@@ -3416,8 -3516,12 +3509,17 @@@
+  	rcu_read_unlock();
+  #endif
+  
+++<<<<<<< HEAD
+ +	/* Do not fool tcpdump (if any), clean our debris */
+ +	skb->tstamp = 0;
+++=======
++ 	bpf_skops_write_hdr_opt((struct sock *)sk, skb, req, syn_skb,
++ 				synack_type, &opts);
++ 
++ 	skb->skb_mstamp_ns = now;
++ 	tcp_add_tx_delay(skb, tp);
++ 
+++>>>>>>> 331fca4315ef (bpf: tcp: Add bpf_skops_hdr_opt_len() and bpf_skops_write_hdr_opt())
+  	return skb;
+  }
+  EXPORT_SYMBOL(tcp_make_synack);
+diff --cc tools/include/uapi/linux/bpf.h
+index 0dc0309df9c7,18d0e128bc3c..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -4204,8 -4173,11 +4204,16 @@@ enum 
+  	BPF_SOCK_OPS_RETRANS_CB_FLAG	= (1<<1),
+  	BPF_SOCK_OPS_STATE_CB_FLAG	= (1<<2),
+  	BPF_SOCK_OPS_RTT_CB_FLAG	= (1<<3),
+++<<<<<<< HEAD
+ +/* Mask of all currently supported cb flags */
+ +	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0xF,
+++=======
++ 	BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG  = (1<<4),
++ 	BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG = (1<<5),
++ 	BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG = (1<<6),
++ /* Mask of all currently supported cb flags */
++ 	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0x7F,
+++>>>>>>> 331fca4315ef (bpf: tcp: Add bpf_skops_hdr_opt_len() and bpf_skops_write_hdr_opt())
+  };
+  
+  /* List of known BPF sock_ops operators.
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index b92b04b1ecea..0dc62fe29f27 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -462,7 +462,8 @@ enum tcp_synack_type {
+ struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
+ 				struct request_sock *req,
+ 				struct tcp_fastopen_cookie *foc,
+-				enum tcp_synack_type synack_type);
++				enum tcp_synack_type synack_type,
++				struct sk_buff *syn_skb);
+ int tcp_disconnect(struct sock *sk, int flags);
+ 
+ void tcp_finish_connect(struct sock *sk, struct sk_buff *skb);
+@@ -1996,7 +1997,8 @@ struct tcp_request_sock_ops {
+ 	int (*send_synack)(const struct sock *sk, struct dst_entry *dst,
+ 			   struct flowi *fl, struct request_sock *req,
+ 			   struct tcp_fastopen_cookie *foc,
+-			   enum tcp_synack_type synack_type);
++			   enum tcp_synack_type synack_type,
++			   struct sk_buff *syn_skb);
+ };
+ 
+ extern const struct tcp_request_sock_ops tcp_request_sock_ipv4_ops;
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 0a07f42fdf6f..438e0174130e 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -6629,7 +6629,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
+ 	}
+ 	if (fastopen_sk) {
+ 		af_ops->send_synack(fastopen_sk, dst, &fl, req,
+-				    &foc, TCP_SYNACK_FASTOPEN);
++				    &foc, TCP_SYNACK_FASTOPEN, skb);
+ 		/* Add the child socket directly into the accept queue */
+ 		if (!inet_csk_reqsk_queue_add(sk, req, fastopen_sk)) {
+ 			reqsk_fastopen_remove(fastopen_sk, req, false);
+@@ -6647,7 +6647,8 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
+ 				tcp_timeout_init((struct sock *)req));
+ 		af_ops->send_synack(sk, dst, &fl, req, &foc,
+ 				    !want_cookie ? TCP_SYNACK_NORMAL :
+-						   TCP_SYNACK_COOKIE);
++						   TCP_SYNACK_COOKIE,
++				    skb);
+ 		if (want_cookie) {
+ 			reqsk_free(req);
+ 			return 0;
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 88c2291f51d0..3e76fbcb34d4 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -935,7 +935,8 @@ static int tcp_v4_send_synack(const struct sock *sk, struct dst_entry *dst,
+ 			      struct flowi *fl,
+ 			      struct request_sock *req,
+ 			      struct tcp_fastopen_cookie *foc,
+-			      enum tcp_synack_type synack_type)
++			      enum tcp_synack_type synack_type,
++			      struct sk_buff *syn_skb)
+ {
+ 	const struct inet_request_sock *ireq = inet_rsk(req);
+ 	struct flowi4 fl4;
+@@ -946,7 +947,7 @@ static int tcp_v4_send_synack(const struct sock *sk, struct dst_entry *dst,
+ 	if (!dst && (dst = inet_csk_route_req(sk, &fl4, req)) == NULL)
+ 		return -1;
+ 
+-	skb = tcp_make_synack(sk, dst, req, foc, synack_type);
++	skb = tcp_make_synack(sk, dst, req, foc, synack_type, syn_skb);
+ 
+ 	if (skb) {
+ 		__tcp_v4_send_check(skb, ireq->ir_loc_addr, ireq->ir_rmt_addr);
+* Unmerged path net/ipv4/tcp_output.c
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index b8508da8e3a8..b28b8fa9e40c 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -483,7 +483,8 @@ static int tcp_v6_send_synack(const struct sock *sk, struct dst_entry *dst,
+ 			      struct flowi *fl,
+ 			      struct request_sock *req,
+ 			      struct tcp_fastopen_cookie *foc,
+-			      enum tcp_synack_type synack_type)
++			      enum tcp_synack_type synack_type,
++			      struct sk_buff *syn_skb)
+ {
+ 	struct inet_request_sock *ireq = inet_rsk(req);
+ 	struct ipv6_pinfo *np = inet6_sk(sk);
+@@ -497,7 +498,7 @@ static int tcp_v6_send_synack(const struct sock *sk, struct dst_entry *dst,
+ 					       IPPROTO_TCP)) == NULL)
+ 		goto done;
+ 
+-	skb = tcp_make_synack(sk, dst, req, foc, synack_type);
++	skb = tcp_make_synack(sk, dst, req, foc, synack_type, syn_skb);
+ 
+ 	if (skb) {
+ 		__tcp_v6_send_check(skb, &ireq->ir_v6_loc_addr,
+* Unmerged path tools/include/uapi/linux/bpf.h
