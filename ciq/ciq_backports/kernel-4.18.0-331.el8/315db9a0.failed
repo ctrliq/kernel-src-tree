@@ -1,0 +1,100 @@
+cifs: fix leak in cifs_smb3_do_mount() ctx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author David Disseldorp <ddiss@suse.de>
+commit 315db9a05b7a56810728589baa930864107e4634
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/315db9a0.failed
+
+cifs_smb3_do_mount() calls smb3_fs_context_dup() and then
+cifs_setup_volume_info(). The latter's subsequent smb3_parse_devname()
+call overwrites the cifs_sb->ctx->UNC string already dup'ed by
+smb3_fs_context_dup(), resulting in a leak. E.g.
+
+unreferenced object 0xffff888002980420 (size 32):
+  comm "mount", pid 160, jiffies 4294892541 (age 30.416s)
+  hex dump (first 32 bytes):
+    5c 5c 31 39 32 2e 31 36 38 2e 31 37 34 2e 31 30  \\192.168.174.10
+    34 5c 72 61 70 69 64 6f 2d 73 68 61 72 65 00 00  4\rapido-share..
+  backtrace:
+    [<00000000069e12f6>] kstrdup+0x28/0x50
+    [<00000000b61f4032>] smb3_fs_context_dup+0x127/0x1d0 [cifs]
+    [<00000000c6e3e3bf>] cifs_smb3_do_mount+0x77/0x660 [cifs]
+    [<0000000063467a6b>] smb3_get_tree+0xdf/0x220 [cifs]
+    [<00000000716f731e>] vfs_get_tree+0x1b/0x90
+    [<00000000491d3892>] path_mount+0x62a/0x910
+    [<0000000046b2e774>] do_mount+0x50/0x70
+    [<00000000ca7b64dd>] __x64_sys_mount+0x81/0xd0
+    [<00000000b5122496>] do_syscall_64+0x33/0x40
+    [<000000002dd397af>] entry_SYSCALL_64_after_hwframe+0x44/0xae
+
+This change is a bandaid until the cifs_setup_volume_info() TODO and
+error handling issues are resolved.
+
+	Signed-off-by: David Disseldorp <ddiss@suse.de>
+	Acked-by: Ronnie Sahlberg <lsahlber@redhat.com>
+	Reviewed-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+CC: <stable@vger.kernel.org> # v5.11+
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 315db9a05b7a56810728589baa930864107e4634)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifsfs.c
+diff --cc fs/cifs/cifsfs.c
+index e1f4772cf344,39f4889a036b..000000000000
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@@ -819,22 -841,39 +819,32 @@@ cifs_smb3_do_mount(struct file_system_t
+  	cifs_sb = kzalloc(sizeof(struct cifs_sb_info), GFP_KERNEL);
+  	if (cifs_sb == NULL) {
+  		root = ERR_PTR(-ENOMEM);
+ -		goto out;
+ +		goto out_nls;
+  	}
+  
+ -	cifs_sb->ctx = kzalloc(sizeof(struct smb3_fs_context), GFP_KERNEL);
+ -	if (!cifs_sb->ctx) {
+ +	cifs_sb->mountdata = kstrndup(data, PAGE_SIZE, GFP_KERNEL);
+ +	if (cifs_sb->mountdata == NULL) {
+  		root = ERR_PTR(-ENOMEM);
+ -		goto out;
+ -	}
+ -	rc = smb3_fs_context_dup(cifs_sb->ctx, old_ctx);
+ -	if (rc) {
+ -		root = ERR_PTR(rc);
+ -		goto out;
+ +		goto out_free;
+  	}
+  
+++<<<<<<< HEAD
+ +	rc = cifs_setup_cifs_sb(ctx, cifs_sb);
+++=======
++ 	/* cifs_setup_volume_info->smb3_parse_devname() redups UNC & prepath */
++ 	kfree(cifs_sb->ctx->UNC);
++ 	cifs_sb->ctx->UNC = NULL;
++ 	kfree(cifs_sb->ctx->prepath);
++ 	cifs_sb->ctx->prepath = NULL;
++ 
++ 	rc = cifs_setup_volume_info(cifs_sb->ctx, NULL, old_ctx->UNC);
+++>>>>>>> 315db9a05b7a (cifs: fix leak in cifs_smb3_do_mount() ctx)
+  	if (rc) {
+  		root = ERR_PTR(rc);
+ -		goto out;
+ +		goto out_free;
+  	}
+  
+ -	rc = cifs_setup_cifs_sb(cifs_sb);
+ -	if (rc) {
+ -		root = ERR_PTR(rc);
+ -		goto out;
+ -	}
+ -
+ -	rc = cifs_mount(cifs_sb, cifs_sb->ctx);
+ +	rc = cifs_mount(cifs_sb, ctx);
+  	if (rc) {
+  		if (!(flags & SB_SILENT))
+  			cifs_dbg(VFS, "cifs_mount failed w/return code = %d\n",
+* Unmerged path fs/cifs/cifsfs.c
