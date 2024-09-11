@@ -1,0 +1,160 @@
+tcp_bbr: fix quantization code to not raise cwnd if not probing bandwidth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Kevin(Yudong) Yang <yyd@google.com>
+commit 6b3656a60f2067738d1a423328199720806f0c44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6b3656a6.failed
+
+There was a bug in the previous logic that attempted to ensure gain cycling
+gets inflight above BDP even for small BDPs. This code correctly raised and
+lowered target inflight values during the gain cycle. And this code
+correctly ensured that cwnd was raised when probing bandwidth. However, it
+did not correspondingly ensure that cwnd was *not* raised in this way when
+*not* probing for bandwidth. The result was that small-BDP flows that were
+always cwnd-bound could go for many cycles with a fixed cwnd, and not probe
+or yield bandwidth at all. This meant that multiple small-BDP flows could
+fail to converge in their bandwidth allocations.
+
+Fixes: 3c346b233c68 ("tcp_bbr: fix bw probing to raise in-flight data for very small BDPs")
+	Signed-off-by: Kevin(Yudong) Yang <yyd@google.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Acked-by: Yuchung Cheng <ycheng@google.com>
+	Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+	Acked-by: Priyaranjan Jha <priyarjha@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b3656a60f2067738d1a423328199720806f0c44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_bbr.c
+diff --cc net/ipv4/tcp_bbr.c
+index f2d5ee3c7777,32772d6ded4e..000000000000
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@@ -348,8 -370,27 +348,32 @@@ static u32 bbr_target_cwnd(struct sock 
+  
+  	w = (u64)bw * bbr->min_rtt_us;
+  
+++<<<<<<< HEAD
+ +	/* Apply a gain to the given value, then remove the BW_SCALE shift. */
+ +	cwnd = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
+++=======
++ 	/* Apply a gain to the given value, remove the BW_SCALE shift, and
++ 	 * round the value up to avoid a negative feedback loop.
++ 	 */
++ 	bdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
++ 
++ 	return bdp;
++ }
++ 
++ /* To achieve full performance in high-speed paths, we budget enough cwnd to
++  * fit full-sized skbs in-flight on both end hosts to fully utilize the path:
++  *   - one skb in sending host Qdisc,
++  *   - one skb in sending host TSO/GSO engine
++  *   - one skb being received by receiver host LRO/GRO/delayed-ACK engine
++  * Don't worry, at low rates (bbr_min_tso_rate) this won't bloat cwnd because
++  * in such cases tso_segs_goal is 1. The minimum cwnd is 4 packets,
++  * which allows 2 outstanding 2-packet sequences, to try to keep pipe
++  * full even with ACK-every-other-packet delayed ACKs.
++  */
++ static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd)
++ {
++ 	struct bbr *bbr = inet_csk_ca(sk);
+++>>>>>>> 6b3656a60f20 (tcp_bbr: fix quantization code to not raise cwnd if not probing bandwidth)
+  
+  	/* Allow enough full-sized skbs in flight to utilize end systems. */
+  	cwnd += 3 * bbr_tso_segs_goal(sk);
+@@@ -364,6 -405,66 +388,69 @@@
+  	return cwnd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Find inflight based on min RTT and the estimated bottleneck bandwidth. */
++ static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
++ {
++ 	u32 inflight;
++ 
++ 	inflight = bbr_bdp(sk, bw, gain);
++ 	inflight = bbr_quantization_budget(sk, inflight);
++ 
++ 	return inflight;
++ }
++ 
++ /* With pacing at lower layers, there's often less data "in the network" than
++  * "in flight". With TSQ and departure time pacing at lower layers (e.g. fq),
++  * we often have several skbs queued in the pacing layer with a pre-scheduled
++  * earliest departure time (EDT). BBR adapts its pacing rate based on the
++  * inflight level that it estimates has already been "baked in" by previous
++  * departure time decisions. We calculate a rough estimate of the number of our
++  * packets that might be in the network at the earliest departure time for the
++  * next skb scheduled:
++  *   in_network_at_edt = inflight_at_edt - (EDT - now) * bw
++  * If we're increasing inflight, then we want to know if the transmit of the
++  * EDT skb will push inflight above the target, so inflight_at_edt includes
++  * bbr_tso_segs_goal() from the skb departing at EDT. If decreasing inflight,
++  * then estimate if inflight will sink too low just before the EDT transmit.
++  */
++ static u32 bbr_packets_in_net_at_edt(struct sock *sk, u32 inflight_now)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 	struct bbr *bbr = inet_csk_ca(sk);
++ 	u64 now_ns, edt_ns, interval_us;
++ 	u32 interval_delivered, inflight_at_edt;
++ 
++ 	now_ns = tp->tcp_clock_cache;
++ 	edt_ns = max(tp->tcp_wstamp_ns, now_ns);
++ 	interval_us = div_u64(edt_ns - now_ns, NSEC_PER_USEC);
++ 	interval_delivered = (u64)bbr_bw(sk) * interval_us >> BW_SCALE;
++ 	inflight_at_edt = inflight_now;
++ 	if (bbr->pacing_gain > BBR_UNIT)              /* increasing inflight */
++ 		inflight_at_edt += bbr_tso_segs_goal(sk);  /* include EDT skb */
++ 	if (interval_delivered >= inflight_at_edt)
++ 		return 0;
++ 	return inflight_at_edt - interval_delivered;
++ }
++ 
++ /* Find the cwnd increment based on estimate of ack aggregation */
++ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
++ {
++ 	u32 max_aggr_cwnd, aggr_cwnd = 0;
++ 
++ 	if (bbr_extra_acked_gain && bbr_full_bw_reached(sk)) {
++ 		max_aggr_cwnd = ((u64)bbr_bw(sk) * bbr_extra_acked_max_us)
++ 				/ BW_UNIT;
++ 		aggr_cwnd = (bbr_extra_acked_gain * bbr_extra_acked(sk))
++ 			     >> BBR_SCALE;
++ 		aggr_cwnd = min(aggr_cwnd, max_aggr_cwnd);
++ 	}
++ 
++ 	return aggr_cwnd;
++ }
++ 
+++>>>>>>> 6b3656a60f20 (tcp_bbr: fix quantization code to not raise cwnd if not probing bandwidth)
+  /* An optimization in BBR to reduce losses: On the first round of recovery, we
+   * follow the packet conservation principle: send P packets per P packets acked.
+   * After that, we slow-start and send at most 2*P packets per P packets acked.
+@@@ -424,8 -525,15 +511,19 @@@ static void bbr_set_cwnd(struct sock *s
+  	if (bbr_set_cwnd_to_recover_or_restore(sk, rs, acked, &cwnd))
+  		goto done;
+  
+++<<<<<<< HEAD
+++=======
++ 	target_cwnd = bbr_bdp(sk, bw, gain);
++ 
++ 	/* Increment the cwnd to account for excess ACKed data that seems
++ 	 * due to aggregation (of data and/or ACKs) visible in the ACK stream.
++ 	 */
++ 	target_cwnd += bbr_ack_aggregation_cwnd(sk);
++ 	target_cwnd = bbr_quantization_budget(sk, target_cwnd);
++ 
+++>>>>>>> 6b3656a60f20 (tcp_bbr: fix quantization code to not raise cwnd if not probing bandwidth)
+  	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
+ +	target_cwnd = bbr_target_cwnd(sk, bw, gain);
+  	if (bbr_full_bw_reached(sk))  /* only cut cwnd if we filled the pipe */
+  		cwnd = min(cwnd + acked, target_cwnd);
+  	else if (cwnd < target_cwnd || tp->delivered < TCP_INIT_CWND)
+* Unmerged path net/ipv4/tcp_bbr.c
