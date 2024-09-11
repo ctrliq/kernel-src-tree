@@ -1,0 +1,198 @@
+KVM: x86: Move RDPMC emulation to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit c483c45471b94f59c76cf45b676eb08318a9519a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/c483c454.failed
+
+Move the entirety of the accelerated RDPMC emulation to x86.c, and assign
+the common handler directly to the exit handler array for VMX.  SVM has
+bizarre nrips behavior that prevents it from directly invoking the common
+handler.  The nrips goofiness will be addressed in a future patch.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210205005750.3841462-8-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c483c45471b94f59c76cf45b676eb08318a9519a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/svm/svm.c
+index 05deab5ed2e8,cbb124b253f3..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -2399,49 -2403,41 +2399,51 @@@ static int iret_interception(struct vcp
+  	return 1;
+  }
+  
+ -static int invlpg_interception(struct kvm_vcpu *vcpu)
+ +static int invd_interception(struct vcpu_svm *svm)
+ +{
+ +	/* Treat an INVD instruction as a NOP and just skip it. */
+ +	return kvm_skip_emulated_instruction(&svm->vcpu);
+ +}
+ +
+ +static int invlpg_interception(struct vcpu_svm *svm)
+  {
+  	if (!static_cpu_has(X86_FEATURE_DECODEASSISTS))
+ -		return kvm_emulate_instruction(vcpu, 0);
+ +		return kvm_emulate_instruction(&svm->vcpu, 0);
+  
+ -	kvm_mmu_invlpg(vcpu, to_svm(vcpu)->vmcb->control.exit_info_1);
+ -	return kvm_skip_emulated_instruction(vcpu);
+ +	kvm_mmu_invlpg(&svm->vcpu, svm->vmcb->control.exit_info_1);
+ +	return kvm_skip_emulated_instruction(&svm->vcpu);
+  }
+  
+ -static int emulate_on_interception(struct kvm_vcpu *vcpu)
+ +static int emulate_on_interception(struct vcpu_svm *svm)
+  {
+ -	return kvm_emulate_instruction(vcpu, 0);
+ +	return kvm_emulate_instruction(&svm->vcpu, 0);
+  }
+  
+ -static int rsm_interception(struct kvm_vcpu *vcpu)
+ +static int rsm_interception(struct vcpu_svm *svm)
+  {
+ -	return kvm_emulate_instruction_from_buffer(vcpu, rsm_ins_bytes, 2);
+ +	return kvm_emulate_instruction_from_buffer(&svm->vcpu, rsm_ins_bytes, 2);
+  }
+  
+ -static int rdpmc_interception(struct kvm_vcpu *vcpu)
+ +static int rdpmc_interception(struct vcpu_svm *svm)
+  {
+- 	int err;
+- 
+  	if (!nrips)
+ -		return emulate_on_interception(vcpu);
+ +		return emulate_on_interception(svm);
+  
+++<<<<<<< HEAD
+ +	err = kvm_rdpmc(&svm->vcpu);
+ +	return kvm_complete_insn_gp(&svm->vcpu, err);
+++=======
++ 	return kvm_emulate_rdpmc(vcpu);
+++>>>>>>> c483c45471b9 (KVM: x86: Move RDPMC emulation to common code)
+  }
+  
+ -static bool check_selective_cr0_intercepted(struct kvm_vcpu *vcpu,
+ +static bool check_selective_cr0_intercepted(struct vcpu_svm *svm,
+  					    unsigned long val)
+  {
+ -	struct vcpu_svm *svm = to_svm(vcpu);
+ -	unsigned long cr0 = vcpu->arch.cr0;
+ +	unsigned long cr0 = svm->vcpu.arch.cr0;
+  	bool ret = false;
+  
+ -	if (!is_guest_mode(vcpu) ||
+ +	if (!is_guest_mode(&svm->vcpu) ||
+  	    (!(vmcb_is_intercept(&svm->nested.ctl, INTERCEPT_SELECTIVE_CR0))))
+  		return false;
+  
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 9c626d532031,c5e270da820a..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -5195,29 -5192,6 +5195,32 @@@ static int handle_invlpg(struct kvm_vcp
+  	return kvm_skip_emulated_instruction(vcpu);
+  }
+  
+++<<<<<<< HEAD
+ +static int handle_rdpmc(struct kvm_vcpu *vcpu)
+ +{
+ +	int err;
+ +
+ +	err = kvm_rdpmc(vcpu);
+ +	return kvm_complete_insn_gp(vcpu, err);
+ +}
+ +
+ +static int handle_wbinvd(struct kvm_vcpu *vcpu)
+ +{
+ +	return kvm_emulate_wbinvd(vcpu);
+ +}
+ +
+ +static int handle_xsetbv(struct kvm_vcpu *vcpu)
+ +{
+ +	u64 new_bv = kvm_read_edx_eax(vcpu);
+ +	u32 index = kvm_rcx_read(vcpu);
+ +
+ +	if (kvm_set_xcr(vcpu, index, new_bv) == 0)
+ +		return kvm_skip_emulated_instruction(vcpu);
+ +	return 1;
+ +}
+ +
+++=======
+++>>>>>>> c483c45471b9 (KVM: x86: Move RDPMC emulation to common code)
+  static int handle_apic_access(struct kvm_vcpu *vcpu)
+  {
+  	if (likely(fasteoi)) {
+@@@ -5656,10 -5612,10 +5659,15 @@@ static int (*kvm_vmx_exit_handlers[])(s
+  	[EXIT_REASON_MSR_WRITE]               = kvm_emulate_wrmsr,
+  	[EXIT_REASON_INTERRUPT_WINDOW]        = handle_interrupt_window,
+  	[EXIT_REASON_HLT]                     = kvm_emulate_halt,
+ -	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
+ +	[EXIT_REASON_INVD]		      = handle_invd,
+  	[EXIT_REASON_INVLPG]		      = handle_invlpg,
+++<<<<<<< HEAD
+ +	[EXIT_REASON_RDPMC]                   = handle_rdpmc,
+ +	[EXIT_REASON_VMCALL]                  = handle_vmcall,
+++=======
++ 	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
++ 	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
+++>>>>>>> c483c45471b9 (KVM: x86: Move RDPMC emulation to common code)
+  	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
+  	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
+  	[EXIT_REASON_VMPTRLD]		      = handle_vmx_instruction,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b3a59b5f9bb5..db3f6964d890 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1558,7 +1558,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr);
+ 
+ unsigned long kvm_get_rflags(struct kvm_vcpu *vcpu);
+ void kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags);
+-bool kvm_rdpmc(struct kvm_vcpu *vcpu);
++int kvm_emulate_rdpmc(struct kvm_vcpu *vcpu);
+ 
+ void kvm_queue_exception(struct kvm_vcpu *vcpu, unsigned nr);
+ void kvm_queue_exception_e(struct kvm_vcpu *vcpu, unsigned nr, u32 error_code);
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 703d0876830f..48d886a87469 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1189,20 +1189,21 @@ void kvm_get_dr(struct kvm_vcpu *vcpu, int dr, unsigned long *val)
+ }
+ EXPORT_SYMBOL_GPL(kvm_get_dr);
+ 
+-bool kvm_rdpmc(struct kvm_vcpu *vcpu)
++int kvm_emulate_rdpmc(struct kvm_vcpu *vcpu)
+ {
+ 	u32 ecx = kvm_rcx_read(vcpu);
+ 	u64 data;
+-	int err;
+ 
+-	err = kvm_pmu_rdpmc(vcpu, ecx, &data);
+-	if (err)
+-		return err;
++	if (kvm_pmu_rdpmc(vcpu, ecx, &data)) {
++		kvm_inject_gp(vcpu, 0);
++		return 1;
++	}
++
+ 	kvm_rax_write(vcpu, (u32)data);
+ 	kvm_rdx_write(vcpu, data >> 32);
+-	return err;
++	return kvm_skip_emulated_instruction(vcpu);
+ }
+-EXPORT_SYMBOL_GPL(kvm_rdpmc);
++EXPORT_SYMBOL_GPL(kvm_emulate_rdpmc);
+ 
+ /*
+  * List of msr numbers which we expose to userspace through KVM_GET_MSRS
