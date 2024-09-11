@@ -1,0 +1,212 @@
+nvme-core: replace ctrl page size with a macro
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit 6c3c05b087ada8947cd31895f67e433070446234
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/6c3c05b0.failed
+
+Saving the nvme controller's page size was from a time when the driver
+tried to use different sized pages, but this value is always set to
+a constant, and has been this way for some time. Remove the 'page_size'
+field and replace its usage with the constant value.
+
+This also lets the compiler make some micro-optimizations in the io
+path, and that's always a good thing.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 6c3c05b087ada8947cd31895f67e433070446234)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index d488d280480d,0ab0dcf84d5e..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -535,9 -515,7 +535,13 @@@ static inline bool nvme_pci_use_sgls(st
+  static void nvme_unmap_data(struct nvme_dev *dev, struct request *req)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+++<<<<<<< HEAD
+ +	enum dma_data_direction dma_dir = rq_data_dir(req) ?
+ +			DMA_TO_DEVICE : DMA_FROM_DEVICE;
+ +	const int last_prp = dev->ctrl.page_size / sizeof(__le64) - 1;
+++=======
++ 	const int last_prp = NVME_CTRL_PAGE_SIZE / sizeof(__le64) - 1;
+++>>>>>>> 6c3c05b087ad (nvme-core: replace ctrl page size with a macro)
+  	dma_addr_t dma_addr = iod->first_dma, next_dma_addr;
+  	int i;
+  
+@@@ -765,6 -745,43 +768,46 @@@ static blk_status_t nvme_pci_setup_sgls
+  	return BLK_STS_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static blk_status_t nvme_setup_prp_simple(struct nvme_dev *dev,
++ 		struct request *req, struct nvme_rw_command *cmnd,
++ 		struct bio_vec *bv)
++ {
++ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++ 	unsigned int offset = bv->bv_offset & (NVME_CTRL_PAGE_SIZE - 1);
++ 	unsigned int first_prp_len = NVME_CTRL_PAGE_SIZE - offset;
++ 
++ 	iod->first_dma = dma_map_bvec(dev->dev, bv, rq_dma_dir(req), 0);
++ 	if (dma_mapping_error(dev->dev, iod->first_dma))
++ 		return BLK_STS_RESOURCE;
++ 	iod->dma_len = bv->bv_len;
++ 
++ 	cmnd->dptr.prp1 = cpu_to_le64(iod->first_dma);
++ 	if (bv->bv_len > first_prp_len)
++ 		cmnd->dptr.prp2 = cpu_to_le64(iod->first_dma + first_prp_len);
++ 	return BLK_STS_OK;
++ }
++ 
++ static blk_status_t nvme_setup_sgl_simple(struct nvme_dev *dev,
++ 		struct request *req, struct nvme_rw_command *cmnd,
++ 		struct bio_vec *bv)
++ {
++ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++ 
++ 	iod->first_dma = dma_map_bvec(dev->dev, bv, rq_dma_dir(req), 0);
++ 	if (dma_mapping_error(dev->dev, iod->first_dma))
++ 		return BLK_STS_RESOURCE;
++ 	iod->dma_len = bv->bv_len;
++ 
++ 	cmnd->flags = NVME_CMD_SGL_METABUF;
++ 	cmnd->dptr.sgl.addr = cpu_to_le64(iod->first_dma);
++ 	cmnd->dptr.sgl.length = cpu_to_le32(iod->dma_len);
++ 	cmnd->dptr.sgl.type = NVME_SGL_FMT_DATA_DESC << 4;
++ 	return BLK_STS_OK;
++ }
++ 
+++>>>>>>> 6c3c05b087ad (nvme-core: replace ctrl page size with a macro)
+  static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+  		struct nvme_command *cmnd)
+  {
+@@@ -772,15 -789,25 +815,31 @@@
+  	blk_status_t ret = BLK_STS_RESOURCE;
+  	int nr_mapped;
+  
+++<<<<<<< HEAD
+ +	if (blk_rq_payload_bytes(req) > NVME_INT_BYTES(dev) ||
+ +	    blk_rq_nr_phys_segments(req) > NVME_INT_PAGES) {
+ +		iod->sg = mempool_alloc(dev->iod_mempool, GFP_ATOMIC);
+ +		if (!iod->sg)
+ +			return BLK_STS_RESOURCE;
+ +	} else {
+ +		iod->sg = iod->inline_sg;
+++=======
++ 	if (blk_rq_nr_phys_segments(req) == 1) {
++ 		struct bio_vec bv = req_bvec(req);
++ 
++ 		if (!is_pci_p2pdma_page(bv.bv_page)) {
++ 			if (bv.bv_offset + bv.bv_len <= NVME_CTRL_PAGE_SIZE * 2)
++ 				return nvme_setup_prp_simple(dev, req,
++ 							     &cmnd->rw, &bv);
++ 
++ 			if (iod->nvmeq->qid &&
++ 			    dev->ctrl.sgls & ((1 << 0) | (1 << 1)))
++ 				return nvme_setup_sgl_simple(dev, req,
++ 							     &cmnd->rw, &bv);
++ 		}
+++>>>>>>> 6c3c05b087ad (nvme-core: replace ctrl page size with a macro)
+  	}
+  
+ -	iod->dma_len = 0;
+ -	iod->sg = mempool_alloc(dev->iod_mempool, GFP_ATOMIC);
+ -	if (!iod->sg)
+ -		return BLK_STS_RESOURCE;
+  	sg_init_table(iod->sg, blk_rq_nr_phys_segments(req));
+  	iod->nents = blk_rq_map_sg(req->q, req, iod->sg);
+  	if (!iod->nents)
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index b9d19e246c73..82a0f4d9f91c 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -2397,12 +2397,7 @@ EXPORT_SYMBOL_GPL(nvme_disable_ctrl);
+ 
+ int nvme_enable_ctrl(struct nvme_ctrl *ctrl)
+ {
+-	/*
+-	 * Default to a 4K page size, with the intention to update this
+-	 * path in the future to accomodate architectures with differing
+-	 * kernel and IO page sizes.
+-	 */
+-	unsigned dev_page_min, page_shift = 12;
++	unsigned dev_page_min;
+ 	int ret;
+ 
+ 	ret = ctrl->ops->reg_read64(ctrl, NVME_REG_CAP, &ctrl->cap);
+@@ -2412,20 +2407,18 @@ int nvme_enable_ctrl(struct nvme_ctrl *ctrl)
+ 	}
+ 	dev_page_min = NVME_CAP_MPSMIN(ctrl->cap) + 12;
+ 
+-	if (page_shift < dev_page_min) {
++	if (NVME_CTRL_PAGE_SHIFT < dev_page_min) {
+ 		dev_err(ctrl->device,
+ 			"Minimum device page size %u too large for host (%u)\n",
+-			1 << dev_page_min, 1 << page_shift);
++			1 << dev_page_min, 1 << NVME_CTRL_PAGE_SHIFT);
+ 		return -ENODEV;
+ 	}
+ 
+-	ctrl->page_size = 1 << page_shift;
+-
+ 	if (NVME_CAP_CSS(ctrl->cap) & NVME_CAP_CSS_CSI)
+ 		ctrl->ctrl_config = NVME_CC_CSS_CSI;
+ 	else
+ 		ctrl->ctrl_config = NVME_CC_CSS_NVM;
+-	ctrl->ctrl_config |= (page_shift - 12) << NVME_CC_MPS_SHIFT;
++	ctrl->ctrl_config |= (NVME_CTRL_PAGE_SHIFT - 12) << NVME_CC_MPS_SHIFT;
+ 	ctrl->ctrl_config |= NVME_CC_AMS_RR | NVME_CC_SHN_NONE;
+ 	ctrl->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
+ 	ctrl->ctrl_config |= NVME_CC_ENABLE;
+@@ -2478,13 +2471,13 @@ static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
+ 
+ 	if (ctrl->max_hw_sectors) {
+ 		u32 max_segments =
+-			(ctrl->max_hw_sectors / (ctrl->page_size >> 9)) + 1;
++			(ctrl->max_hw_sectors / (NVME_CTRL_PAGE_SIZE >> 9)) + 1;
+ 
+ 		max_segments = min_not_zero(max_segments, ctrl->max_segments);
+ 		blk_queue_max_hw_sectors(q, ctrl->max_hw_sectors);
+ 		blk_queue_max_segments(q, min_t(u32, max_segments, USHRT_MAX));
+ 	}
+-	blk_queue_virt_boundary(q, ctrl->page_size - 1);
++	blk_queue_virt_boundary(q, NVME_CTRL_PAGE_SIZE - 1);
+ 	blk_queue_dma_alignment(q, 7);
+ 	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
+ 		vwc = true;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 27291260757b..0b8ac8ef0d3e 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -37,6 +37,14 @@ extern unsigned int admin_timeout;
+ #define  NVME_INLINE_METADATA_SG_CNT  1
+ #endif
+ 
++/*
++ * Default to a 4K page size, with the intention to update this
++ * path in the future to accommodate architectures with differing
++ * kernel and IO page sizes.
++ */
++#define NVME_CTRL_PAGE_SHIFT	12
++#define NVME_CTRL_PAGE_SIZE	(1 << NVME_CTRL_PAGE_SHIFT)
++
+ extern struct workqueue_struct *nvme_wq;
+ extern struct workqueue_struct *nvme_reset_wq;
+ extern struct workqueue_struct *nvme_delete_wq;
+@@ -261,7 +269,6 @@ struct nvme_ctrl {
+ 	u32 queue_count;
+ 
+ 	u64 cap;
+-	u32 page_size;
+ 	u32 max_hw_sectors;
+ 	u32 max_segments;
+ 	u32 max_integrity_segments;
+* Unmerged path drivers/nvme/host/pci.c
