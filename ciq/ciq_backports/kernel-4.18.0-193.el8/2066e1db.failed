@@ -1,0 +1,140 @@
+s390/qeth: convert RCD code to common IO infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 2066e1db9eef8e2057bb3a1b7cb3503a7f6725d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2066e1db.failed
+
+The RCD code is the last remaining IO path that doesn't use the
+qeth_send_control_data() infrastructure. Doing so allows us to remove
+all sorts of custom state machinery and logic in the IRQ handler.
+
+Instead of introducing statically allocated cmd buffers for this single
+IO on the data channel, use the new qeth_alloc_cmd() helper.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2066e1db9eef8e2057bb3a1b7cb3503a7f6725d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index e5c7d28f1e6f,671754a0e591..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -1618,62 -1585,6 +1597,65 @@@ int qeth_qdio_clear_card(struct qeth_ca
+  }
+  EXPORT_SYMBOL_GPL(qeth_qdio_clear_card);
+  
+++<<<<<<< HEAD
+ +static int qeth_read_conf_data(struct qeth_card *card, void **buffer,
+ +			       int *length)
+ +{
+ +	struct ciw *ciw;
+ +	char *rcd_buf;
+ +	int ret;
+ +	struct qeth_channel *channel = &card->data;
+ +
+ +	/*
+ +	 * scan for RCD command in extended SenseID data
+ +	 */
+ +	ciw = ccw_device_get_ciw(channel->ccwdev, CIW_TYPE_RCD);
+ +	if (!ciw || ciw->cmd == 0)
+ +		return -EOPNOTSUPP;
+ +	rcd_buf = kzalloc(ciw->count, GFP_KERNEL | GFP_DMA);
+ +	if (!rcd_buf)
+ +		return -ENOMEM;
+ +
+ +	qeth_setup_ccw(channel->ccw, ciw->cmd, 0, ciw->count, rcd_buf);
+ +	channel->state = CH_STATE_RCD;
+ +	spin_lock_irq(get_ccwdev_lock(channel->ccwdev));
+ +	ret = ccw_device_start_timeout(channel->ccwdev, channel->ccw,
+ +				       QETH_RCD_PARM, LPM_ANYPATH, 0,
+ +				       QETH_RCD_TIMEOUT);
+ +	spin_unlock_irq(get_ccwdev_lock(channel->ccwdev));
+ +	if (!ret)
+ +		wait_event(card->wait_q,
+ +			   (channel->state == CH_STATE_RCD_DONE ||
+ +			    channel->state == CH_STATE_DOWN));
+ +	if (channel->state == CH_STATE_DOWN)
+ +		ret = -EIO;
+ +	else
+ +		channel->state = CH_STATE_DOWN;
+ +	if (ret) {
+ +		kfree(rcd_buf);
+ +		*buffer = NULL;
+ +		*length = 0;
+ +	} else {
+ +		*length = ciw->count;
+ +		*buffer = rcd_buf;
+ +	}
+ +	return ret;
+ +}
+ +
+ +static void qeth_configure_unitaddr(struct qeth_card *card, char *prcd)
+ +{
+ +	QETH_DBF_TEXT(SETUP, 2, "cfgunit");
+ +	card->info.chpid = prcd[30];
+ +	card->info.unit_addr2 = prcd[31];
+ +	card->info.cula = prcd[63];
+ +	card->info.is_vm_nic = ((prcd[0x10] == _ascebc['V']) &&
+ +				(prcd[0x11] == _ascebc['M']));
+ +	card->info.use_v1_blkt = prcd[74] == 0xF0 && prcd[75] == 0xF0 &&
+ +				 prcd[76] >= 0xF1 && prcd[76] <= 0xF4;
+ +}
+ +
+++=======
+++>>>>>>> 2066e1db9eef (s390/qeth: convert RCD code to common IO infrastructure)
+  static enum qeth_discipline_id qeth_vm_detect_layer(struct qeth_card *card)
+  {
+  	enum qeth_discipline_id disc = QETH_DISCIPLINE_UNDETERMINED;
+@@@ -4794,11 -4754,9 +4815,9 @@@ static void qeth_determine_capabilities
+  	if (rc) {
+  		QETH_DBF_MESSAGE(2, "qeth_read_conf_data on device %x returned %i\n",
+  				 CARD_DEVID(card), rc);
+ -		QETH_CARD_TEXT_(card, 2, "5err%d", rc);
+ +		QETH_DBF_TEXT_(SETUP, 2, "5err%d", rc);
+  		goto out_offline;
+  	}
+- 	qeth_configure_unitaddr(card, prcd);
+- 	kfree(prcd);
+  
+  	rc = qdio_get_ssqd_desc(ddev, &card->ssqd);
+  	if (rc)
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index c191d547cc1a..c747232262d8 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -515,8 +515,6 @@ enum qeth_channel_states {
+ 	CH_STATE_DOWN,
+ 	CH_STATE_HALTED,
+ 	CH_STATE_STOPPED,
+-	CH_STATE_RCD,
+-	CH_STATE_RCD_DONE,
+ };
+ /**
+  * card state machine
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/net/qeth_core_mpc.h b/drivers/s390/net/qeth_core_mpc.h
+index f5237b7c14c4..fadafdc0e8e4 100644
+--- a/drivers/s390/net/qeth_core_mpc.h
++++ b/drivers/s390/net/qeth_core_mpc.h
+@@ -31,14 +31,12 @@ extern unsigned char IPA_PDU_HEADER[];
+ 
+ #define QETH_CLEAR_CHANNEL_PARM	-10
+ #define QETH_HALT_CHANNEL_PARM	-11
+-#define QETH_RCD_PARM -12
+ 
+ static inline bool qeth_intparm_is_iob(unsigned long intparm)
+ {
+ 	switch (intparm) {
+ 	case QETH_CLEAR_CHANNEL_PARM:
+ 	case QETH_HALT_CHANNEL_PARM:
+-	case QETH_RCD_PARM:
+ 	case 0:
+ 		return false;
+ 	}
