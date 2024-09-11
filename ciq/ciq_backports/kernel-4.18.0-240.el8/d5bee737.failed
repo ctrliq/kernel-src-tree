@@ -1,0 +1,85 @@
+net/tls: Annotate access to sk_prot with READ_ONCE/WRITE_ONCE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] tls: Annotate access to sk_prot with READ_ONCE/WRITE_ONCE (Sabrina Dubroca) [1819627]
+Rebuild_FUZZ: 96.61%
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit d5bee7374b68de3c44586d46e9e61ffc97a1e886
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d5bee737.failed
+
+sockmap performs lockless writes to sk->sk_prot on the following paths:
+
+tcp_bpf_{recvmsg|sendmsg} / sock_map_unref
+  sk_psock_put
+    sk_psock_drop
+      sk_psock_restore_proto
+        WRITE_ONCE(sk->sk_prot, proto)
+
+To prevent load/store tearing [1], and to make tooling aware of intentional
+shared access [2], we need to annotate other sites that access sk_prot with
+READ_ONCE/WRITE_ONCE macros.
+
+Change done with Coccinelle with following semantic patch:
+
+@@
+expression E;
+identifier I;
+struct sock *sk;
+identifier sk_prot =~ "^sk_prot$";
+@@
+(
+ E =
+-sk->sk_prot
++READ_ONCE(sk->sk_prot)
+|
+-sk->sk_prot = E
++WRITE_ONCE(sk->sk_prot, E)
+|
+-sk->sk_prot
++READ_ONCE(sk->sk_prot)
+ ->I
+)
+
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d5bee7374b68de3c44586d46e9e61ffc97a1e886)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_main.c
+diff --cc net/tls/tls_main.c
+index 1579c5ee19eb,156efce50dbd..000000000000
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@@ -604,10 -622,7 +605,14 @@@ static struct tls_context *create_ctx(s
+  
+  	mutex_init(&ctx->tx_lock);
+  	rcu_assign_pointer(icsk->icsk_ulp_data, ctx);
+++<<<<<<< HEAD
+ +	ctx->setsockopt = sk->sk_prot->setsockopt;
+ +	ctx->getsockopt = sk->sk_prot->getsockopt;
+ +	ctx->sk_proto_close = sk->sk_prot->close;
+ +	ctx->unhash = sk->sk_prot->unhash;
+++=======
++ 	ctx->sk_proto = READ_ONCE(sk->sk_prot);
+++>>>>>>> d5bee7374b68 (net/tls: Annotate access to sk_prot with READ_ONCE/WRITE_ONCE)
+  	return ctx;
+  }
+  
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index ae4dc74da110..d2a5ff9c46ae 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -353,7 +353,7 @@ static int tls_do_allocation(struct sock *sk,
+ 	if (!offload_ctx->open_record) {
+ 		if (unlikely(!skb_page_frag_refill(prepend_size, pfrag,
+ 						   sk->sk_allocation))) {
+-			sk->sk_prot->enter_memory_pressure(sk);
++			READ_ONCE(sk->sk_prot)->enter_memory_pressure(sk);
+ 			sk_stream_moderate_sndbuf(sk);
+ 			return -ENOMEM;
+ 		}
+* Unmerged path net/tls/tls_main.c
