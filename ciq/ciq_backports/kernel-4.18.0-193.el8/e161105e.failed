@@ -1,0 +1,149 @@
+net/mlx5: Function setup/teardown procedures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Function setup/teardown procedures (Alaa Hleihel) [1724335]
+Rebuild_FUZZ: 95.24%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit e161105e58da81fa9170921284559800fd6aa86a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e161105e.failed
+
+Function setup and teardown procedures are the basic procedure that
+each mlx5 pci function should perform to boot up a mlx5 device function
+and initialize basic communication with FW, before allocating any higher
+level software/firmware resources.
+
+This provides a better logical separation of mlx5 core device
+initialization flow and will help to seamlessly support creating different
+mlx5 device types such as PF, VF and SF mlx5 sub-function virtual device.
+
+This patch does not change any functionality.
+
+	Signed-off-by: Vu Pham <vuhuong@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit e161105e58da81fa9170921284559800fd6aa86a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 10376022a40f,7eaf6d8a8ccc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -943,8 -913,7 +943,12 @@@ static void mlx5_cleanup_once(struct ml
+  	mlx5_devcom_unregister_device(dev->priv.devcom);
+  }
+  
+++<<<<<<< HEAD
+ +static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
+ +			 bool boot)
+++=======
++ static int mlx5_function_setup(struct mlx5_core_dev *dev, bool boot)
+++>>>>>>> e161105e58da (net/mlx5: Function setup/teardown procedures)
+  {
+  	struct pci_dev *pdev = dev->pdev;
+  	int err;
+@@@ -1040,14 -989,74 +1024,74 @@@
+  	err = mlx5_query_hca_caps(dev);
+  	if (err) {
+  		dev_err(&pdev->dev, "query hca failed\n");
+- 		goto err_stop_poll;
++ 		goto stop_health;
++ 	}
++ 
++ 	return 0;
++ 
++ stop_health:
++ 	mlx5_stop_health_poll(dev, boot);
++ reclaim_boot_pages:
++ 	mlx5_reclaim_startup_pages(dev);
++ err_disable_hca:
++ 	mlx5_core_disable_hca(dev, 0);
++ err_cmd_cleanup:
++ 	mlx5_cmd_cleanup(dev);
++ 
++ 	return err;
++ }
++ 
++ static int mlx5_function_teardown(struct mlx5_core_dev *dev, bool boot)
++ {
++ 	int err;
++ 
++ 	mlx5_stop_health_poll(dev, boot);
++ 	err = mlx5_cmd_teardown_hca(dev);
++ 	if (err) {
++ 		dev_err(&dev->pdev->dev, "tear_down_hca failed, skip cleanup\n");
++ 		return err;
++ 	}
++ 	mlx5_reclaim_startup_pages(dev);
++ 	mlx5_core_disable_hca(dev, 0);
++ 	mlx5_cmd_cleanup(dev);
++ 
++ 	return 0;
++ }
++ 
++ static int mlx5_load_one(struct mlx5_core_dev *dev, bool boot)
++ {
++ 	struct pci_dev *pdev = dev->pdev;
++ 	int err;
++ 
++ 	dev->caps.embedded_cpu = mlx5_read_embedded_cpu(dev);
++ 	mutex_lock(&dev->intf_state_mutex);
++ 	if (test_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state)) {
++ 		dev_warn(&dev->pdev->dev, "%s: interface is up, NOP\n",
++ 			 __func__);
++ 		goto out;
+  	}
+  
++ 	dev_info(&pdev->dev, "firmware version: %d.%d.%d\n", fw_rev_maj(dev),
++ 		 fw_rev_min(dev), fw_rev_sub(dev));
++ 
++ 	/* Only PFs hold the relevant PCIe information for this query */
++ 	if (mlx5_core_is_pf(dev))
++ 		pcie_print_link_status(dev->pdev);
++ 
++ 	/* on load removing any previous indication of internal error, device is
++ 	 * up
++ 	 */
++ 	dev->state = MLX5_DEVICE_STATE_UP;
++ 
++ 	err = mlx5_function_setup(dev, boot);
++ 	if (err)
++ 		goto out;
++ 
+  	if (boot) {
+ -		err = mlx5_init_once(dev);
+ +		err = mlx5_init_once(dev, priv);
+  		if (err) {
+  			dev_err(&pdev->dev, "sw objs init failed\n");
+- 			goto err_stop_poll;
++ 			goto function_teardown;
+  		}
+  	}
+  
+@@@ -1219,20 -1212,11 +1248,11 @@@ static int mlx5_unload_one(struct mlx5_
+  	mlx5_eq_table_destroy(dev);
+  	mlx5_pagealloc_stop(dev);
+  	mlx5_events_stop(dev);
+ -	mlx5_put_uars_page(dev, dev->priv.uar);
+ +	mlx5_put_uars_page(dev, priv->uar);
+  	if (cleanup)
+  		mlx5_cleanup_once(dev);
+- 	mlx5_stop_health_poll(dev, cleanup);
+- 
+- 	err = mlx5_cmd_teardown_hca(dev);
+- 	if (err) {
+- 		dev_err(&dev->pdev->dev, "tear_down_hca failed, skip cleanup\n");
+- 		goto out;
+- 	}
+- 	mlx5_reclaim_startup_pages(dev);
+- 	mlx5_core_disable_hca(dev, 0);
+- 	mlx5_cmd_cleanup(dev);
+  
++ 	mlx5_function_teardown(dev, cleanup);
+  out:
+  	mutex_unlock(&dev->intf_state_mutex);
+  	return err;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
