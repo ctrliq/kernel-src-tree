@@ -1,0 +1,421 @@
+dm: improve abnormal bio processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit 4edadf6dcb54d2a86eeb424f27122dc0076d9267
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4edadf6d.failed
+
+Read/write/flush are the most common operations, optimize switch in
+is_abnormal_io() for those cases. Follows same pattern established in
+block perf-wip commit ("block: optimise blk_may_split for normal rw")
+
+Also, push is_abnormal_io() check and blk_queue_split() down from
+dm_submit_bio() to dm_split_and_process_bio() and set new
+'is_abnormal_io' flag in clone_info. Optimize __split_and_process_bio
+and __process_abnormal_io by leveraging ci.is_abnormal_io flag.
+
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 4edadf6dcb54d2a86eeb424f27122dc0076d9267)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,9650ba2075b8..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -69,6 -84,8 +69,11 @@@ struct clone_info 
+  	struct dm_io *io;
+  	sector_t sector;
+  	unsigned sector_count;
+++<<<<<<< HEAD
+++=======
++ 	bool is_abnormal_io:1;
++ 	bool submit_as_polled:1;
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  };
+  
+  #define DM_TARGET_IO_BIO_OFFSET (offsetof(struct dm_target_io, clone))
+@@@ -1526,31 -1492,30 +1531,48 @@@ static int __send_changing_extent_only(
+  
+  static bool is_abnormal_io(struct bio *bio)
+  {
+- 	bool r = false;
++ 	unsigned int op = bio_op(bio);
+  
+++<<<<<<< HEAD
+ +	switch (bio_op(bio)) {
+ +	case REQ_OP_DISCARD:
+ +	case REQ_OP_SECURE_ERASE:
+ +	case REQ_OP_WRITE_SAME:
+ +	case REQ_OP_WRITE_ZEROES:
+ +		r = true;
+ +		break;
+++=======
++ 	if (op != REQ_OP_READ && op != REQ_OP_WRITE && op != REQ_OP_FLUSH) {
++ 		switch (op) {
++ 		case REQ_OP_DISCARD:
++ 		case REQ_OP_SECURE_ERASE:
++ 		case REQ_OP_WRITE_ZEROES:
++ 			return true;
++ 		default:
++ 			break;
++ 		}
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  	}
+  
+- 	return r;
++ 	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static bool __process_abnormal_io(struct clone_info *ci, struct dm_target *ti,
+ +				  int *result)
+++=======
++ static blk_status_t __process_abnormal_io(struct clone_info *ci,
++ 					  struct dm_target *ti)
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  {
+ +	struct bio *bio = ci->bio;
+  	unsigned num_bios = 0;
+ +	bool is_split_required = false;
+  
+ -	switch (bio_op(ci->bio)) {
+ +	switch (bio_op(bio)) {
+  	case REQ_OP_DISCARD:
+  		num_bios = ti->num_discard_bios;
+ +		is_split_required = is_split_required_for_discard(ti);
+  		break;
+  	case REQ_OP_SECURE_ERASE:
+  		num_bios = ti->num_secure_erase_bios;
+@@@ -1561,35 -1523,88 +1583,56 @@@
+  	case REQ_OP_WRITE_ZEROES:
+  		num_bios = ti->num_write_zeroes_bios;
+  		break;
+- 	default:
+- 		return false;
+  	}
+  
+++<<<<<<< HEAD
+ +	*result = __send_changing_extent_only(ci, ti, num_bios, is_split_required);
+ +	return true;
+++=======
++ 	/*
++ 	 * Even though the device advertised support for this type of
++ 	 * request, that does not mean every target supports it, and
++ 	 * reconfiguration might also have changed that since the
++ 	 * check was performed.
++ 	 */
++ 	if (unlikely(!num_bios))
++ 		return BLK_STS_NOTSUPP;
++ 
++ 	__send_changing_extent_only(ci, ti, num_bios);
++ 	return BLK_STS_OK;
+ -}
+ -
+ -/*
+ - * Reuse ->bi_private as dm_io list head for storing all dm_io instances
+ - * associated with this bio, and this bio's bi_private needs to be
+ - * stored in dm_io->data before the reuse.
+ - *
+ - * bio->bi_private is owned by fs or upper layer, so block layer won't
+ - * touch it after splitting. Meantime it won't be changed by anyone after
+ - * bio is submitted. So this reuse is safe.
+ - */
+ -static inline struct dm_io **dm_poll_list_head(struct bio *bio)
+ -{
+ -	return (struct dm_io **)&bio->bi_private;
+ -}
+ -
+ -static void dm_queue_poll_io(struct bio *bio, struct dm_io *io)
+ -{
+ -	struct dm_io **head = dm_poll_list_head(bio);
+ -
+ -	if (!(bio->bi_opf & REQ_DM_POLL_LIST)) {
+ -		bio->bi_opf |= REQ_DM_POLL_LIST;
+ -		/*
+ -		 * Save .bi_private into dm_io, so that we can reuse
+ -		 * .bi_private as dm_io list head for storing dm_io list
+ -		 */
+ -		io->data = bio->bi_private;
+ -
+ -		/* tell block layer to poll for completion */
+ -		bio->bi_cookie = ~BLK_QC_T_NONE;
+ -
+ -		io->next = NULL;
+ -	} else {
+ -		/*
+ -		 * bio recursed due to split, reuse original poll list,
+ -		 * and save bio->bi_private too.
+ -		 */
+ -		io->data = (*head)->data;
+ -		io->next = *head;
+ -	}
+ -
+ -	*head = io;
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  }
+  
+  /*
+   * Select the correct strategy for processing a non-flush bio.
+   */
+ -static blk_status_t __split_and_process_bio(struct clone_info *ci)
+ +static int __split_and_process_non_flush(struct clone_info *ci)
+  {
+ -	struct bio *clone;
+  	struct dm_target *ti;
+  	unsigned len;
+++<<<<<<< HEAD
+ +	int r;
+ +
+ +	ti = dm_table_find_target(ci->map, ci->sector);
+ +	if (!ti)
+ +		return -EIO;
+++=======
++ 
++ 	ti = dm_table_find_target(ci->map, ci->sector);
++ 	if (unlikely(!ti))
++ 		return BLK_STS_IOERR;
++ 	else if (unlikely(ci->is_abnormal_io))
++ 		return __process_abnormal_io(ci, ti);
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  
+ -	/*
+ -	 * Only support bio polling for normal IO, and the target io is
+ -	 * exactly inside the dm_io instance (verified in dm_poll_dm_io)
+ -	 */
+ -	ci->submit_as_polled = ci->bio->bi_opf & REQ_POLLED;
+ +	if (__process_abnormal_io(ci, ti, &r))
+ +		return r;
+  
+  	len = min_t(sector_t, max_io_len(ti, ci->sector), ci->sector_count);
+ -	setup_split_accounting(ci, len);
+ -	clone = alloc_tio(ci, ti, 0, &len, GFP_NOIO);
+ -	__map_bio(clone);
+ +
+ +	r = __clone_and_map_data_bio(ci, ti, ci->sector, &len);
+ +	if (r < 0)
+ +		return r;
+  
+  	ci->sector += len;
+  	ci->sector_count -= len;
+@@@ -1602,61 -1617,81 +1645,85 @@@ static void init_clone_info(struct clon
+  {
+  	ci->map = map;
+  	ci->io = alloc_io(md, bio);
+++<<<<<<< HEAD
+++=======
++ 	ci->bio = bio;
++ 	ci->is_abnormal_io = is_abnormal;
++ 	ci->submit_as_polled = false;
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  	ci->sector = bio->bi_iter.bi_sector;
+ -	ci->sector_count = bio_sectors(bio);
+ -
+ -	/* Shouldn't happen but sector_count was being set to 0 so... */
+ -	if (static_branch_unlikely(&zoned_enabled) &&
+ -	    WARN_ON_ONCE(op_is_zone_mgmt(bio_op(bio)) && ci->sector_count))
+ -		ci->sector_count = 0;
+  }
+  
+  /*
+   * Entry point to split a bio into clones and submit them to the targets.
+   */
+ -static void dm_split_and_process_bio(struct mapped_device *md,
+ -				     struct dm_table *map, struct bio *bio)
+ +static blk_qc_t __split_and_process_bio(struct mapped_device *md,
+ +					struct dm_table *map, struct bio *bio)
+  {
+  	struct clone_info ci;
+++<<<<<<< HEAD
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+ +	int error = 0;
+ +
+ +	init_clone_info(&ci, md, map, bio);
+++=======
++ 	struct dm_io *io;
++ 	blk_status_t error = BLK_STS_OK;
++ 	bool is_abnormal;
++ 
++ 	is_abnormal = is_abnormal_io(bio);
++ 	if (unlikely(is_abnormal)) {
++ 		/*
++ 		 * Use blk_queue_split() for abnormal IO (e.g. discard, etc)
++ 		 * otherwise associated queue_limits won't be imposed.
++ 		 */
++ 		blk_queue_split(&bio);
++ 	}
++ 
++ 	init_clone_info(&ci, md, map, bio, is_abnormal);
++ 	io = ci.io;
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  
+  	if (bio->bi_opf & REQ_PREFLUSH) {
+ -		__send_empty_flush(&ci);
+ -		/* dm_io_complete submits any data associated with flush */
+ -		goto out;
+ +		error = __send_empty_flush(&ci);
+ +		/* dm_io_dec_pending submits any data associated with flush */
+ +	} else if (op_is_zone_mgmt(bio_op(bio))) {
+ +		ci.bio = bio;
+ +		ci.sector_count = 0;
+ +		error = __split_and_process_non_flush(&ci);
+ +	} else {
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		error = __split_and_process_non_flush(&ci);
+ +		if (ci.sector_count && !error) {
+ +			/*
+ +			 * Remainder must be passed to generic_make_request()
+ +			 * so that it gets handled *after* bios already submitted
+ +			 * have been completely processed.
+ +			 * We take a clone of the original to store in
+ +			 * ci.io->orig_bio to be used by end_io_acct() and
+ +			 * for dec_pending to use for completion handling.
+ +			 */
+ +			struct bio *b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ +						  GFP_NOIO, &md->queue->bio_split);
+ +			ci.io->orig_bio = b;
+ +
+ +			bio_chain(b, bio);
+ +			trace_block_split(md->queue, b, bio->bi_iter.bi_sector);
+ +			ret = generic_make_request(bio);
+ +		}
+  	}
+ +	start_io_acct(ci.io);
+  
+ -	error = __split_and_process_bio(&ci);
+ -	if (error || !ci.sector_count)
+ -		goto out;
+ -	/*
+ -	 * Remainder must be passed to submit_bio_noacct() so it gets handled
+ -	 * *after* bios already submitted have been completely processed.
+ -	 */
+ -	bio_trim(bio, io->sectors, ci.sector_count);
+ -	trace_block_split(bio, bio->bi_iter.bi_sector);
+ -	bio_inc_remaining(bio);
+ -	submit_bio_noacct(bio);
+ -out:
+ -	/*
+ -	 * Drop the extra reference count for non-POLLED bio, and hold one
+ -	 * reference for POLLED bio, which will be released in dm_poll_bio
+ -	 *
+ -	 * Add every dm_io instance into the dm_io list head which is stored
+ -	 * in bio->bi_private, so that dm_poll_bio can poll them all.
+ -	 */
+ -	if (error || !ci.submit_as_polled) {
+ -		/*
+ -		 * In case of submission failure, the extra reference for
+ -		 * submitting io isn't consumed yet
+ -		 */
+ -		if (error)
+ -			atomic_dec(&io->io_count);
+ -		dm_io_dec_pending(io, error);
+ -	} else
+ -		dm_queue_poll_io(bio, io);
+ +	/* drop the extra reference count */
+ +	dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+  }
+  
+ -static void dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+@@@ -1674,38 -1709,60 +1741,42 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Use blk_queue_split() for abnormal IO (e.g. discard, writesame, etc)
+ +	 * otherwise associated queue_limits won't be imposed.
+ +	 */
+ +	if (is_abnormal_io(bio))
+ +		blk_queue_split(md->queue, &bio);
+ +
+ +	ret = __split_and_process_bio(md, map, bio);
+++=======
++ 	dm_split_and_process_bio(md, map, bio);
+++>>>>>>> 4edadf6dcb54 (dm: improve abnormal bio processing)
+  out:
+ -	dm_put_live_table_bio(md, srcu_idx, bio);
+ -}
+ -
+ -static bool dm_poll_dm_io(struct dm_io *io, struct io_comp_batch *iob,
+ -			  unsigned int flags)
+ -{
+ -	WARN_ON_ONCE(!dm_tio_is_normal(&io->tio));
+ -
+ -	/* don't poll if the mapped io is done */
+ -	if (atomic_read(&io->io_count) > 1)
+ -		bio_poll(&io->tio.clone, iob, flags);
+ -
+ -	/* bio_poll holds the last reference */
+ -	return atomic_read(&io->io_count) == 1;
+ +	dm_put_live_table(md, srcu_idx);
+ +	return ret;
+  }
+  
+ -static int dm_poll_bio(struct bio *bio, struct io_comp_batch *iob,
+ -		       unsigned int flags)
+ +static int dm_any_congested(void *congested_data, int bdi_bits)
+  {
+ -	struct dm_io **head = dm_poll_list_head(bio);
+ -	struct dm_io *list = *head;
+ -	struct dm_io *tmp = NULL;
+ -	struct dm_io *curr, *next;
+ -
+ -	/* Only poll normal bio which was marked as REQ_DM_POLL_LIST */
+ -	if (!(bio->bi_opf & REQ_DM_POLL_LIST))
+ -		return 0;
+ -
+ -	WARN_ON_ONCE(!list);
+ -
+ -	/*
+ -	 * Restore .bi_private before possibly completing dm_io.
+ -	 *
+ -	 * bio_poll() is only possible once @bio has been completely
+ -	 * submitted via submit_bio_noacct()'s depth-first submission.
+ -	 * So there is no dm_queue_poll_io() race associated with
+ -	 * clearing REQ_DM_POLL_LIST here.
+ -	 */
+ -	bio->bi_opf &= ~REQ_DM_POLL_LIST;
+ -	bio->bi_private = list->data;
+ +	int r = bdi_bits;
+ +	struct mapped_device *md = congested_data;
+ +	struct dm_table *map;
+  
+ -	for (curr = list, next = curr->next; curr; curr = next, next =
+ -			curr ? curr->next : NULL) {
+ -		if (dm_poll_dm_io(curr, iob, flags)) {
+ +	if (!test_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags)) {
+ +		if (dm_request_based(md)) {
+  			/*
+ -			 * clone_endio() has already occurred, so no
+ -			 * error handling is needed here.
+ +			 * With request-based DM we only need to check the
+ +			 * top-level queue for congestion.
+  			 */
+ -			__dm_io_dec_pending(curr);
+ +			struct backing_dev_info *bdi = md->queue->backing_dev_info;
+ +			r = bdi->wb.congested->state & bdi_bits;
+  		} else {
+ -			curr->next = tmp;
+ -			tmp = curr;
+ +			map = dm_get_live_table_fast(md);
+ +			if (map)
+ +				r = dm_table_any_congested(map, bdi_bits);
+ +			dm_put_live_table_fast(md);
+  		}
+  	}
+  
+* Unmerged path drivers/md/dm.c
