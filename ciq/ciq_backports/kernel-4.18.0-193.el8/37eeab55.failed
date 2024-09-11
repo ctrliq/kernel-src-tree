@@ -1,0 +1,304 @@
+RDMA/core: Extend ib_device_get_by_index for net namespace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit 37eeab55aeca98cb6648b471f09c0e651ccb1e7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/37eeab55.failed
+
+Extend ib_device_get_by_index() API to check device access for
+net namespace for serving netlink commands.
+
+Also enforce net ns check on dumpit commands which iterate over all
+registered rdma devices and which don't call ib_device_get_by_index().
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 37eeab55aeca98cb6648b471f09c0e651ccb1e7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/core/nldev.c
+diff --cc drivers/infiniband/core/device.c
+index 3aa933cc02d9,e6f82f4d4108..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -154,13 -254,19 +154,23 @@@ struct ib_device *ib_device_get_by_inde
+  {
+  	struct ib_device *device;
+  
+ -	down_read(&devices_rwsem);
+ -	device = xa_load(&devices, index);
+ +	down_read(&lists_rwsem);
+ +	device = __ib_device_get_by_index(index);
+  	if (device) {
++ 		if (!rdma_dev_access_netns(device, net)) {
++ 			device = NULL;
++ 			goto out;
++ 		}
++ 
+  		if (!ib_device_try_get(device))
+  			device = NULL;
+  	}
+++<<<<<<< HEAD
+ +	up_read(&lists_rwsem);
+++=======
++ out:
++ 	up_read(&devices_rwsem);
+++>>>>>>> 37eeab55aeca (RDMA/core: Extend ib_device_get_by_index for net namespace)
+  	return device;
+  }
+  
+@@@ -1052,8 -1819,11 +1062,16 @@@ int ib_enum_all_devs(nldev_callback nld
+  	unsigned int idx = 0;
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	down_read(&lists_rwsem);
+ +	list_for_each_entry(dev, &device_list, core_list) {
+++=======
++ 	down_read(&devices_rwsem);
++ 	xa_for_each_marked (&devices, index, dev, DEVICE_REGISTERED) {
++ 		if (!rdma_dev_access_netns(dev, sock_net(skb->sk)))
++ 			continue;
++ 
+++>>>>>>> 37eeab55aeca (RDMA/core: Extend ib_device_get_by_index for net namespace)
+  		ret = nldev_cb(dev, skb, cb, idx);
+  		if (ret)
+  			break;
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,284e5f103fc9..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -949,6 -968,89 +949,92 @@@ static bool is_visible_in_pid_ns(struc
+  	return task_active_pid_ns(current) == task_active_pid_ns(res->task);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int res_get_common_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			       struct netlink_ext_ack *extack,
++ 			       enum rdma_restrack_type res_type)
++ {
++ 	const struct nldev_fill_res_entry *fe = &fill_entries[res_type];
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct rdma_restrack_entry *res;
++ 	struct ib_device *device;
++ 	u32 index, id, port = 0;
++ 	bool has_cap_net_admin;
++ 	struct sk_buff *msg;
++ 	int ret;
++ 
++ 	ret = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (ret || !tb[RDMA_NLDEV_ATTR_DEV_INDEX] || !fe->id || !tb[fe->id])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(sock_net(skb->sk), index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (tb[RDMA_NLDEV_ATTR_PORT_INDEX]) {
++ 		port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
++ 		if (!rdma_is_port_valid(device, port)) {
++ 			ret = -EINVAL;
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	if ((port && fe->flags & NLDEV_PER_DEV) ||
++ 	    (!port && ~fe->flags & NLDEV_PER_DEV)) {
++ 		ret = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	id = nla_get_u32(tb[fe->id]);
++ 	res = rdma_restrack_get_byid(device, res_type, id);
++ 	if (IS_ERR(res)) {
++ 		ret = PTR_ERR(res);
++ 		goto err;
++ 	}
++ 
++ 	if (!is_visible_in_pid_ns(res)) {
++ 		ret = -ENOENT;
++ 		goto err_get;
++ 	}
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg) {
++ 		ret = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	nlh = nlmsg_put(msg, NETLINK_CB(skb).portid, nlh->nlmsg_seq,
++ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, fe->nldev_cmd),
++ 			0, 0);
++ 
++ 	if (fill_nldev_handle(msg, device)) {
++ 		ret = -EMSGSIZE;
++ 		goto err_free;
++ 	}
++ 
++ 	has_cap_net_admin = netlink_capable(skb, CAP_NET_ADMIN);
++ 	ret = fe->fill_res_func(msg, has_cap_net_admin, res, port);
++ 	rdma_restrack_put(res);
++ 	if (ret)
++ 		goto err_free;
++ 
++ 	nlmsg_end(msg, nlh);
++ 	ib_device_put(device);
++ 	return rdma_nl_unicast(msg, NETLINK_CB(skb).portid);
++ 
++ err_free:
++ 	nlmsg_free(msg);
++ err_get:
++ 	rdma_restrack_put(res);
++ err:
++ 	ib_device_put(device);
++ 	return ret;
++ }
++ 
+++>>>>>>> 37eeab55aeca (RDMA/core: Extend ib_device_get_by_index for net namespace)
+  static int res_get_common_dumpit(struct sk_buff *skb,
+  				 struct netlink_callback *cb,
+  				 enum rdma_restrack_type res_type)
+@@@ -1090,6 -1203,115 +1176,118 @@@ RES_GET_FUNCS(cq, RDMA_RESTRACK_CQ)
+  RES_GET_FUNCS(pd, RDMA_RESTRACK_PD);
+  RES_GET_FUNCS(mr, RDMA_RESTRACK_MR);
+  
+++<<<<<<< HEAD
+++=======
++ static LIST_HEAD(link_ops);
++ static DECLARE_RWSEM(link_ops_rwsem);
++ 
++ static const struct rdma_link_ops *link_ops_get(const char *type)
++ {
++ 	const struct rdma_link_ops *ops;
++ 
++ 	list_for_each_entry(ops, &link_ops, list) {
++ 		if (!strcmp(ops->type, type))
++ 			goto out;
++ 	}
++ 	ops = NULL;
++ out:
++ 	return ops;
++ }
++ 
++ void rdma_link_register(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	if (WARN_ON_ONCE(link_ops_get(ops->type)))
++ 		goto out;
++ 	list_add(&ops->list, &link_ops);
++ out:
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_register);
++ 
++ void rdma_link_unregister(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	list_del(&ops->list);
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_unregister);
++ 
++ static int nldev_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	char ibdev_name[IB_DEVICE_NAME_MAX];
++ 	const struct rdma_link_ops *ops;
++ 	char ndev_name[IFNAMSIZ];
++ 	struct net_device *ndev;
++ 	char type[IFNAMSIZ];
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_NAME] ||
++ 	    !tb[RDMA_NLDEV_ATTR_LINK_TYPE] || !tb[RDMA_NLDEV_ATTR_NDEV_NAME])
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(ibdev_name, tb[RDMA_NLDEV_ATTR_DEV_NAME],
++ 		    sizeof(ibdev_name));
++ 	if (strchr(ibdev_name, '%'))
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(type, tb[RDMA_NLDEV_ATTR_LINK_TYPE], sizeof(type));
++ 	nla_strlcpy(ndev_name, tb[RDMA_NLDEV_ATTR_NDEV_NAME],
++ 		    sizeof(ndev_name));
++ 
++ 	ndev = dev_get_by_name(&init_net, ndev_name);
++ 	if (!ndev)
++ 		return -ENODEV;
++ 
++ 	down_read(&link_ops_rwsem);
++ 	ops = link_ops_get(type);
++ #ifdef CONFIG_MODULES
++ 	if (!ops) {
++ 		up_read(&link_ops_rwsem);
++ 		request_module("rdma-link-%s", type);
++ 		down_read(&link_ops_rwsem);
++ 		ops = link_ops_get(type);
++ 	}
++ #endif
++ 	err = ops ? ops->newlink(ibdev_name, ndev) : -EINVAL;
++ 	up_read(&link_ops_rwsem);
++ 	dev_put(ndev);
++ 
++ 	return err;
++ }
++ 
++ static int nldev_dellink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct ib_device *device;
++ 	u32 index;
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_INDEX])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(sock_net(skb->sk), index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (!(device->attrs.device_cap_flags & IB_DEVICE_ALLOW_USER_UNREG)) {
++ 		ib_device_put(device);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ib_unregister_device_and_put(device);
++ 	return 0;
++ }
++ 
+++>>>>>>> 37eeab55aeca (RDMA/core: Extend ib_device_get_by_index for net namespace)
+  static const struct rdma_nl_cbs nldev_cb_table[RDMA_NLDEV_NUM_OPS] = {
+  	[RDMA_NLDEV_CMD_GET] = {
+  		.doit = nldev_get_doit,
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 9d1d4bce8f87..58e978483792 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -269,7 +269,8 @@ static inline void ib_mad_agent_security_change(void)
+ }
+ #endif
+ 
+-struct ib_device *ib_device_get_by_index(u32 ifindex);
++struct ib_device *ib_device_get_by_index(const struct net *net, u32 index);
++
+ /* RDMA device netlink */
+ void nldev_init(void);
+ void nldev_exit(void);
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path drivers/infiniband/core/nldev.c
