@@ -1,0 +1,127 @@
+iommu/dma: Resurrect the "forcedac" option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 3542dcb15cef66c0b9e6c3b33168eb657e0d9520
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/3542dcb1.failed
+
+In converting intel-iommu over to the common IOMMU DMA ops, it quietly
+lost the functionality of its "forcedac" option. Since this is a handy
+thing both for testing and for performance optimisation on certain
+platforms, reimplement it under the common IOMMU parameter namespace.
+
+For the sake of fixing the inadvertent breakage of the Intel-specific
+parameter, remove the dmar_forcedac remnants and hook it up as an alias
+while documenting the transition to the new common parameter.
+
+Fixes: c588072bba6b ("iommu/vt-d: Convert intel iommu driver to the iommu ops")
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Acked-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Reviewed-by: John Garry <john.garry@huawei.com>
+Link: https://lore.kernel.org/r/7eece8e0ea7bfbe2cd0e30789e0d46df573af9b0.1614961776.git.robin.murphy@arm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 3542dcb15cef66c0b9e6c3b33168eb657e0d9520)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+#	include/linux/dma-iommu.h
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index 3c22aaf8f949,835f810f2f26..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -1755,13 -1869,6 +1755,16 @@@
+  			bypassed by not enabling DMAR with this option. In
+  			this case, gfx device will use physical address for
+  			DMA.
+++<<<<<<< HEAD
+ +		forcedac [x86_64]
+ +			With this option iommu will not optimize to look
+ +			for io virtual address below 32-bit forcing dual
+ +			address cycle on pci bus for cards supporting greater
+ +			than 32-bit addressing. The default is to look
+ +			for translation below 32-bit and if not available
+ +			then look in the higher range.
+++=======
+++>>>>>>> 3542dcb15cef (iommu/dma: Resurrect the "forcedac" option)
+  		strict [Default Off]
+  			With this option on every unmap_single operation will
+  			result in a hardware IOTLB flush operation as opposed
+diff --cc include/linux/dma-iommu.h
+index b3cc3fb84079,13d1f4c14d7b..000000000000
+--- a/include/linux/dma-iommu.h
++++ b/include/linux/dma-iommu.h
+@@@ -48,6 -37,11 +48,14 @@@ void iommu_dma_compose_msi_msg(struct m
+  
+  void iommu_dma_get_resv_regions(struct device *dev, struct list_head *list);
+  
+++<<<<<<< HEAD
+++=======
++ void iommu_dma_free_cpu_cached_iovas(unsigned int cpu,
++ 		struct iommu_domain *domain);
++ 
++ extern bool iommu_dma_forcedac;
++ 
+++>>>>>>> 3542dcb15cef (iommu/dma: Resurrect the "forcedac" option)
+  #else /* CONFIG_IOMMU_DMA */
+  
+  struct iommu_domain;
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index fe135a263f73..3025fac931c6 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -64,6 +64,17 @@ struct iommu_dma_cookie {
+ };
+ 
+ static DEFINE_STATIC_KEY_FALSE(iommu_deferred_attach_enabled);
++bool iommu_dma_forcedac __read_mostly;
++
++static int __init iommu_dma_forcedac_setup(char *str)
++{
++	int ret = kstrtobool(str, &iommu_dma_forcedac);
++
++	if (!ret && iommu_dma_forcedac)
++		pr_info("Forcing DAC for PCI devices\n");
++	return ret;
++}
++early_param("iommu.forcedac", iommu_dma_forcedac_setup);
+ 
+ static inline size_t cookie_msi_granule(struct iommu_dma_cookie *cookie)
+ {
+@@ -435,7 +446,7 @@ static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
+ 		dma_limit = min(dma_limit, (u64)domain->geometry.aperture_end);
+ 
+ 	/* Try to get PCI devices a SAC address */
+-	if (dma_limit > DMA_BIT_MASK(32) && dev_is_pci(dev))
++	if (dma_limit > DMA_BIT_MASK(32) && !iommu_dma_forcedac && dev_is_pci(dev))
+ 		iova = alloc_iova_fast(iovad, iova_len,
+ 				       DMA_BIT_MASK(32) >> shift, false);
+ 
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 1a3fd6c1234e..eeac80cfd19a 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -359,7 +359,6 @@ int intel_iommu_enabled = 0;
+ EXPORT_SYMBOL_GPL(intel_iommu_enabled);
+ 
+ static int dmar_map_gfx = 1;
+-static int dmar_forcedac;
+ static int intel_iommu_strict;
+ static int intel_iommu_superpage = 1;
+ static int iommu_identity_mapping;
+@@ -454,8 +453,8 @@ static int __init intel_iommu_setup(char *str)
+ 			dmar_map_gfx = 0;
+ 			pr_info("Disable GFX device mapping\n");
+ 		} else if (!strncmp(str, "forcedac", 8)) {
+-			pr_info("Forcing DAC for PCI devices\n");
+-			dmar_forcedac = 1;
++			pr_warn("intel_iommu=forcedac deprecated; use iommu.forcedac instead\n");
++			iommu_dma_forcedac = true;
+ 		} else if (!strncmp(str, "strict", 6)) {
+ 			pr_info("Disable batched IOTLB flush\n");
+ 			intel_iommu_strict = 1;
+* Unmerged path include/linux/dma-iommu.h
