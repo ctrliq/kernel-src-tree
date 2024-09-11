@@ -427,6 +427,12 @@ extern void __mmu_notifier_invalidate_range(struct mm_struct *mm,
 				  unsigned long start, unsigned long end);
 extern bool mm_has_blockable_invalidate_notifiers(struct mm_struct *mm);
 
+static inline bool
+mmu_notifier_range_blockable(const struct mmu_notifier_range *range)
+{
+	return range->blockable;
+}
+
 static inline void mmu_notifier_release(struct mm_struct *mm)
 {
 	if (mm_has_notifiers(mm))
@@ -650,6 +656,11 @@ static inline void _mmu_notifier_range_init(struct mmu_notifier_range *range,
 #define mmu_notifier_range_init(range,event,flags,vma,mm,start,end)  \
 	_mmu_notifier_range_init(range, start, end)
 
+static inline bool
+mmu_notifier_range_blockable(const struct mmu_notifier_range *range)
+{
+	return true;
+}
 
 static inline int mm_has_notifiers(struct mm_struct *mm)
 {
