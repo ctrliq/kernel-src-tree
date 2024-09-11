@@ -1,0 +1,235 @@
+mm/gup: factor out duplicate code from four routines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit a43e982082c24c2f5c0b139daac9657ac352eed3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a43e9820.failed
+
+Patch series "mm/gup: prereqs to track dma-pinned pages: FOLL_PIN", v12.
+
+Overview:
+
+This is a prerequisite to solving the problem of proper interactions
+between file-backed pages, and [R]DMA activities, as discussed in [1],
+[2], [3], and in a remarkable number of email threads since about
+2017.  :)
+
+A new internal gup flag, FOLL_PIN is introduced, and thoroughly
+documented in the last patch's Documentation/vm/pin_user_pages.rst.
+
+I believe that this will provide a good starting point for doing the
+layout lease work that Ira Weiny has been working on.  That's because
+these new wrapper functions provide a clean, constrained, systematically
+named set of functionality that, again, is required in order to even
+know if a page is "dma-pinned".
+
+In contrast to earlier approaches, the page tracking can be
+incrementally applied to the kernel call sites that, until now, have
+been simply calling get_user_pages() ("gup").  In other words, opt-in by
+changing from this:
+
+    get_user_pages() (sets FOLL_GET)
+    put_page()
+
+to this:
+    pin_user_pages() (sets FOLL_PIN)
+    unpin_user_page()
+
+Testing:
+
+* I've done some overall kernel testing (LTP, and a few other goodies),
+  and some directed testing to exercise some of the changes. And as you
+  can see, gup_benchmark is enhanced to exercise this. Basically, I've
+  been able to runtime test the core get_user_pages() and
+  pin_user_pages() and related routines, but not so much on several of
+  the call sites--but those are generally just a couple of lines
+  changed, each.
+
+  Not much of the kernel is actually using this, which on one hand
+  reduces risk quite a lot. But on the other hand, testing coverage
+  is low. So I'd love it if, in particular, the Infiniband and PowerPC
+  folks could do a smoke test of this series for me.
+
+  Runtime testing for the call sites so far is pretty light:
+
+    * io_uring: Some directed tests from liburing exercise this, and
+                they pass.
+    * process_vm_access.c: A small directed test passes.
+    * gup_benchmark: the enhanced version hits the new gup.c code, and
+                     passes.
+    * infiniband: Ran rdma-core tests: rdma-core/build/bin/run_tests.py
+    * VFIO: compiles (I'm vowing to set up a run time test soon, but it's
+                      not ready just yet)
+    * powerpc: it compiles...
+    * drm/via: compiles...
+    * goldfish: compiles...
+    * net/xdp: compiles...
+    * media/v4l2: compiles...
+
+[1] Some slow progress on get_user_pages() (Apr 2, 2019): https://lwn.net/Articles/784574/
+[2] DMA and get_user_pages() (LPC: Dec 12, 2018): https://lwn.net/Articles/774411/
+[3] The trouble with get_user_pages() (Apr 30, 2018): https://lwn.net/Articles/753027/
+
+This patch (of 22):
+
+There are four locations in gup.c that have a fair amount of code
+duplication.  This means that changing one requires making the same
+changes in four places, not to mention reading the same code four times,
+and wondering if there are subtle differences.
+
+Factor out the common code into static functions, thus reducing the
+overall line count and the code's complexity.
+
+Also, take the opportunity to slightly improve the efficiency of the
+error cases, by doing a mass subtraction of the refcount, surrounded by
+get_page()/put_page().
+
+Also, further simplify (slightly), by waiting until the the successful
+end of each routine, to increment *nr.
+
+Link: http://lkml.kernel.org/r/20200107224558.2362728-2-jhubbard@nvidia.com
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jérôme Glisse <jglisse@redhat.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Alex Williamson <alex.williamson@redhat.com>
+	Cc: Björn Töpel <bjorn.topel@intel.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Leon Romanovsky <leonro@mellanox.com>
+	Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a43e982082c24c2f5c0b139daac9657ac352eed3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index 42f411e0bfd1,706f85b84f47..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -1887,8 -1978,105 +1887,107 @@@ static int __gup_device_huge_pud(pud_t 
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static int record_subpages(struct page *page, unsigned long addr,
++ 			   unsigned long end, struct page **pages)
++ {
++ 	int nr;
++ 
++ 	for (nr = 0; addr != end; addr += PAGE_SIZE)
++ 		pages[nr++] = page++;
++ 
++ 	return nr;
++ }
++ 
++ static void put_compound_head(struct page *page, int refs)
++ {
++ 	VM_BUG_ON_PAGE(page_ref_count(page) < refs, page);
++ 	/*
++ 	 * Calling put_page() for each ref is unnecessarily slow. Only the last
++ 	 * ref needs a put_page().
++ 	 */
++ 	if (refs > 1)
++ 		page_ref_sub(page, refs - 1);
++ 	put_page(page);
++ }
++ 
++ #ifdef CONFIG_ARCH_HAS_HUGEPD
++ static unsigned long hugepte_addr_end(unsigned long addr, unsigned long end,
++ 				      unsigned long sz)
++ {
++ 	unsigned long __boundary = (addr + sz) & ~(sz-1);
++ 	return (__boundary - 1 < end - 1) ? __boundary : end;
++ }
++ 
++ static int gup_hugepte(pte_t *ptep, unsigned long sz, unsigned long addr,
++ 		       unsigned long end, unsigned int flags,
++ 		       struct page **pages, int *nr)
++ {
++ 	unsigned long pte_end;
++ 	struct page *head, *page;
++ 	pte_t pte;
++ 	int refs;
++ 
++ 	pte_end = (addr + sz) & ~(sz-1);
++ 	if (pte_end < end)
++ 		end = pte_end;
++ 
++ 	pte = READ_ONCE(*ptep);
++ 
++ 	if (!pte_access_permitted(pte, flags & FOLL_WRITE))
++ 		return 0;
++ 
++ 	/* hugepages are never "special" */
++ 	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
++ 
++ 	head = pte_page(pte);
++ 	page = head + ((addr & (sz-1)) >> PAGE_SHIFT);
++ 	refs = record_subpages(page, addr, end, pages + *nr);
++ 
++ 	head = try_get_compound_head(head, refs);
++ 	if (!head)
++ 		return 0;
++ 
++ 	if (unlikely(pte_val(pte) != pte_val(*ptep))) {
++ 		put_compound_head(head, refs);
++ 		return 0;
++ 	}
++ 
++ 	*nr += refs;
++ 	SetPageReferenced(head);
++ 	return 1;
++ }
++ 
++ static int gup_huge_pd(hugepd_t hugepd, unsigned long addr,
++ 		unsigned int pdshift, unsigned long end, unsigned int flags,
++ 		struct page **pages, int *nr)
++ {
++ 	pte_t *ptep;
++ 	unsigned long sz = 1UL << hugepd_shift(hugepd);
++ 	unsigned long next;
++ 
++ 	ptep = hugepte_offset(hugepd, addr, pdshift);
++ 	do {
++ 		next = hugepte_addr_end(addr, end, sz);
++ 		if (!gup_hugepte(ptep, sz, addr, end, flags, pages, nr))
++ 			return 0;
++ 	} while (ptep++, addr = next, addr != end);
++ 
++ 	return 1;
++ }
++ #else
++ static inline int gup_huge_pd(hugepd_t hugepd, unsigned long addr,
++ 		unsigned int pdshift, unsigned long end, unsigned int flags,
++ 		struct page **pages, int *nr)
++ {
++ 	return 0;
++ }
++ #endif /* CONFIG_ARCH_HAS_HUGEPD */
++ 
+++>>>>>>> a43e982082c2 (mm/gup: factor out duplicate code from four routines)
+  static int gup_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
+ -			unsigned long end, unsigned int flags,
+ -			struct page **pages, int *nr)
+ +		unsigned long end, unsigned int flags, struct page **pages, int *nr)
+  {
+  	struct page *head, *page;
+  	int refs;
+* Unmerged path mm/gup.c
