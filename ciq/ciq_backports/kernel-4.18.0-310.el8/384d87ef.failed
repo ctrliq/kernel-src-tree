@@ -1,0 +1,230 @@
+block: Do not discard buffers under a mounted filesystem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jan Kara <jack@suse.cz>
+commit 384d87ef2c954fc58e6c5fd8253e4a1984f5fe02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/384d87ef.failed
+
+Discarding blocks and buffers under a mounted filesystem is hardly
+anything admin wants to do. Usually it will confuse the filesystem and
+sometimes the loss of buffer_head state (including b_private field) can
+even cause crashes like:
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000008
+PGD 0 P4D 0
+Oops: 0002 [#1] SMP PTI
+CPU: 4 PID: 203778 Comm: jbd2/dm-3-8 Kdump: loaded Tainted: G O     --------- -  - 4.18.0-147.5.0.5.h126.eulerosv2r9.x86_64 #1
+Hardware name: Huawei RH2288H V3/BC11HGSA0, BIOS 1.57 08/11/2015
+RIP: 0010:jbd2_journal_grab_journal_head+0x1b/0x40 [jbd2]
+...
+Call Trace:
+ __jbd2_journal_insert_checkpoint+0x23/0x70 [jbd2]
+ jbd2_journal_commit_transaction+0x155f/0x1b60 [jbd2]
+ kjournald2+0xbd/0x270 [jbd2]
+
+So if we don't have block device open with O_EXCL already, claim the
+block device while we truncate buffer cache. This makes sure any
+exclusive block device user (such as filesystem) cannot operate on the
+device while we are discarding buffer cache.
+
+	Reported-by: Ye Bin <yebin10@huawei.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+[axboe: fix !CONFIG_BLOCK error in truncate_bdev_range()]
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 384d87ef2c954fc58e6c5fd8253e4a1984f5fe02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index 1eec45e42411,37ec5a73d027..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -1942,6 -1953,60 +1942,50 @@@ static inline void bio_end_io_acct(stru
+  {
+  	return disk_end_io_acct(bio->bi_disk, bio_op(bio), start_time);
+  }
+ +#endif /* CONFIG_BLOCK */
+  
+ -int bdev_read_only(struct block_device *bdev);
+ -int set_blocksize(struct block_device *bdev, int size);
+ -
+ -const char *bdevname(struct block_device *bdev, char *buffer);
+ -struct block_device *lookup_bdev(const char *);
+ -
+ -void blkdev_show(struct seq_file *seqf, off_t offset);
+ -
+ -#define BDEVNAME_SIZE	32	/* Largest string for a blockdev identifier */
+ -#define BDEVT_SIZE	10	/* Largest string for MAJ:MIN for blkdev */
+ -#ifdef CONFIG_BLOCK
+ -#define BLKDEV_MAJOR_MAX	512
+ -#else
+ -#define BLKDEV_MAJOR_MAX	0
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ int blkdev_get(struct block_device *bdev, fmode_t mode, void *holder);
++ struct block_device *blkdev_get_by_path(const char *path, fmode_t mode,
++ 		void *holder);
++ struct block_device *blkdev_get_by_dev(dev_t dev, fmode_t mode, void *holder);
++ int bd_prepare_to_claim(struct block_device *bdev, struct block_device *whole,
++ 		void *holder);
++ void bd_abort_claiming(struct block_device *bdev, struct block_device *whole,
++ 		void *holder);
++ void blkdev_put(struct block_device *bdev, fmode_t mode);
++ 
++ struct block_device *I_BDEV(struct inode *inode);
++ struct block_device *bdget(dev_t);
++ struct block_device *bdgrab(struct block_device *bdev);
++ void bdput(struct block_device *);
++ 
++ #ifdef CONFIG_BLOCK
++ void invalidate_bdev(struct block_device *bdev);
++ int truncate_bdev_range(struct block_device *bdev, fmode_t mode, loff_t lstart,
++ 			loff_t lend);
++ int sync_blockdev(struct block_device *bdev);
++ #else
++ static inline void invalidate_bdev(struct block_device *bdev)
++ {
++ }
++ static inline int truncate_bdev_range(struct block_device *bdev, fmode_t mode,
++ 				      loff_t lstart, loff_t lend)
++ {
++ 	return 0;
++ }
++ static inline int sync_blockdev(struct block_device *bdev)
++ {
++ 	return 0;
++ }
++ #endif
++ int fsync_bdev(struct block_device *bdev);
++ 
++ struct super_block *freeze_bdev(struct block_device *bdev);
++ int thaw_bdev(struct block_device *bdev, struct super_block *sb);
++ 
++ #endif /* _LINUX_BLKDEV_H */
+++>>>>>>> 384d87ef2c95 (block: Do not discard buffers under a mounted filesystem)
+diff --git a/block/ioctl.c b/block/ioctl.c
+index c601553711eb..cd05dae9a298 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -110,8 +110,7 @@ static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
+ 	uint64_t range[2];
+ 	uint64_t start, len;
+ 	struct request_queue *q = bdev_get_queue(bdev);
+-	struct address_space *mapping = bdev->bd_inode->i_mapping;
+-
++	int err;
+ 
+ 	if (!(mode & FMODE_WRITE))
+ 		return -EBADF;
+@@ -132,7 +131,11 @@ static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
+ 
+ 	if (start + len > i_size_read(bdev->bd_inode))
+ 		return -EINVAL;
+-	truncate_inode_pages_range(mapping, start, start + len - 1);
++
++	err = truncate_bdev_range(bdev, mode, start, start + len - 1);
++	if (err)
++		return err;
++
+ 	return blkdev_issue_discard(bdev, start >> 9, len >> 9,
+ 				    GFP_KERNEL, flags);
+ }
+@@ -141,8 +144,8 @@ static int blk_ioctl_zeroout(struct block_device *bdev, fmode_t mode,
+ 		unsigned long arg)
+ {
+ 	uint64_t range[2];
+-	struct address_space *mapping;
+ 	uint64_t start, end, len;
++	int err;
+ 
+ 	if (!(mode & FMODE_WRITE))
+ 		return -EBADF;
+@@ -164,8 +167,9 @@ static int blk_ioctl_zeroout(struct block_device *bdev, fmode_t mode,
+ 		return -EINVAL;
+ 
+ 	/* Invalidate the page cache, including dirty pages */
+-	mapping = bdev->bd_inode->i_mapping;
+-	truncate_inode_pages_range(mapping, start, end);
++	err = truncate_bdev_range(bdev, mode, start, end);
++	if (err)
++		return err;
+ 
+ 	return blkdev_issue_zeroout(bdev, start >> 9, len >> 9, GFP_KERNEL,
+ 			BLKDEV_ZERO_NOUNMAP);
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index f19cc879b480..ade68b8151b0 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -104,6 +104,35 @@ void invalidate_bdev(struct block_device *bdev)
+ }
+ EXPORT_SYMBOL(invalidate_bdev);
+ 
++/*
++ * Drop all buffers & page cache for given bdev range. This function bails
++ * with error if bdev has other exclusive owner (such as filesystem).
++ */
++int truncate_bdev_range(struct block_device *bdev, fmode_t mode,
++			loff_t lstart, loff_t lend)
++{
++	struct block_device *claimed_bdev = NULL;
++	int err;
++
++	/*
++	 * If we don't hold exclusive handle for the device, upgrade to it
++	 * while we discard the buffer cache to avoid discarding buffers
++	 * under live filesystem.
++	 */
++	if (!(mode & FMODE_EXCL)) {
++		claimed_bdev = bdev->bd_contains;
++		err = bd_prepare_to_claim(bdev, claimed_bdev,
++					  truncate_bdev_range);
++		if (err)
++			return err;
++	}
++	truncate_inode_pages_range(bdev->bd_inode->i_mapping, lstart, lend);
++	if (claimed_bdev)
++		bd_abort_claiming(bdev, claimed_bdev, truncate_bdev_range);
++	return 0;
++}
++EXPORT_SYMBOL(truncate_bdev_range);
++
+ static void set_init_blocksize(struct block_device *bdev)
+ {
+ 	unsigned bsize = bdev_logical_block_size(bdev);
+@@ -2080,7 +2109,6 @@ static long blkdev_fallocate(struct file *file, int mode, loff_t start,
+ 			     loff_t len)
+ {
+ 	struct block_device *bdev = I_BDEV(bdev_file_inode(file));
+-	struct address_space *mapping;
+ 	loff_t end = start + len - 1;
+ 	loff_t isize;
+ 	int error;
+@@ -2108,8 +2136,9 @@ static long blkdev_fallocate(struct file *file, int mode, loff_t start,
+ 		return -EINVAL;
+ 
+ 	/* Invalidate the page cache, including dirty pages. */
+-	mapping = bdev->bd_inode->i_mapping;
+-	truncate_inode_pages_range(mapping, start, end);
++	error = truncate_bdev_range(bdev, file->f_mode, start, end);
++	if (error)
++		return error;
+ 
+ 	switch (mode) {
+ 	case FALLOC_FL_ZERO_RANGE:
+@@ -2136,7 +2165,7 @@ static long blkdev_fallocate(struct file *file, int mode, loff_t start,
+ 	 * the caller will be given -EBUSY.  The third argument is
+ 	 * inclusive, so the rounding here is safe.
+ 	 */
+-	return invalidate_inode_pages2_range(mapping,
++	return invalidate_inode_pages2_range(bdev->bd_inode->i_mapping,
+ 					     start >> PAGE_SHIFT,
+ 					     end >> PAGE_SHIFT);
+ }
+* Unmerged path include/linux/blkdev.h
