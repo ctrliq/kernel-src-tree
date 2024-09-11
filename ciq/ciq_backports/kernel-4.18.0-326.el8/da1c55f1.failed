@@ -1,0 +1,432 @@
+mmap locking API: rename mmap_sem to mmap_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Michel Lespinasse <walken@google.com>
+commit da1c55f1b272f4bd54671d459b39ea7b54944ef9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/da1c55f1.failed
+
+Rename the mmap_sem field to mmap_lock.  Any new uses of this lock should
+now go through the new mmap locking api.  The mmap_lock is still
+implemented as a rwsem, though this could change in the future.
+
+[akpm@linux-foundation.org: fix it for mm-gup-might_lock_readmmap_sem-in-get_user_pages_fast.patch]
+
+	Signed-off-by: Michel Lespinasse <walken@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+	Reviewed-by: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Laurent Dufour <ldufour@linux.ibm.com>
+	Cc: Liam Howlett <Liam.Howlett@oracle.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Ying Han <yinghan@google.com>
+Link: http://lkml.kernel.org/r/20200520052908.204642-11-walken@google.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit da1c55f1b272f4bd54671d459b39ea7b54944ef9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/fault.c
+#	include/linux/mmap_lock.h
+#	mm/gup.c
+#	mm/mmu_notifier.c
+diff --cc arch/x86/mm/fault.c
+index 7f5ccfefd8cb,c23bcd027ae1..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -1502,21 -1355,11 +1502,25 @@@ trace_page_fault_entries(unsigned long 
+  		trace_page_fault_kernel(address, regs, error_code);
+  }
+  
+ -dotraplinkage void
+ -do_page_fault(struct pt_regs *regs, unsigned long hw_error_code,
+ -		unsigned long address)
+ +/*
+ + * We must have this function blacklisted from kprobes, tagged with notrace
+ + * and call read_cr2() before calling anything else. To avoid calling any
+ + * kind of tracing machinery before we've observed the CR2 value.
+ + *
+ + * exception_{enter,exit}() contains all sorts of tracepoints.
+ + */
+ +dotraplinkage void notrace
+ +do_page_fault(struct pt_regs *regs, unsigned long error_code)
+  {
+++<<<<<<< HEAD
+ +	unsigned long address = read_cr2(); /* Get the faulting address */
+ +	enum ctx_state prev_state;
+ +
+ +	prev_state = exception_enter();
+ +
+++=======
++ 	prefetchw(&current->mm->mmap_lock);
+++>>>>>>> da1c55f1b272 (mmap locking API: rename mmap_sem to mmap_lock)
+  	/*
+  	 * KVM has two types of events that are, logically, interrupts, but
+  	 * are unfortunately delivered using the #PF vector.  These events are
+diff --cc include/linux/mmap_lock.h
+index 2948fef897dd,0707671851a8..000000000000
+--- a/include/linux/mmap_lock.h
++++ b/include/linux/mmap_lock.h
+@@@ -1,8 -1,10 +1,8 @@@
+  #ifndef _LINUX_MMAP_LOCK_H
+  #define _LINUX_MMAP_LOCK_H
+  
+ -#include <linux/mmdebug.h>
+ -
+  #define MMAP_LOCK_INITIALIZER(name) \
+- 	.mmap_sem = __RWSEM_INITIALIZER((name).mmap_sem),
++ 	.mmap_lock = __RWSEM_INITIALIZER((name).mmap_lock),
+  
+  static inline void mmap_init_lock(struct mm_struct *mm)
+  {
+@@@ -11,12 -13,17 +11,20 @@@
+  
+  static inline void mmap_write_lock(struct mm_struct *mm)
+  {
+- 	down_write(&mm->mmap_sem);
++ 	down_write(&mm->mmap_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mmap_write_lock_nested(struct mm_struct *mm, int subclass)
++ {
++ 	down_write_nested(&mm->mmap_lock, subclass);
++ }
++ 
+++>>>>>>> da1c55f1b272 (mmap locking API: rename mmap_sem to mmap_lock)
+  static inline int mmap_write_lock_killable(struct mm_struct *mm)
+  {
+- 	return down_write_killable(&mm->mmap_sem);
++ 	return down_write_killable(&mm->mmap_lock);
+  }
+  
+  static inline bool mmap_write_trylock(struct mm_struct *mm)
+@@@ -65,7 -72,19 +73,22 @@@ static inline bool mmap_read_trylock_no
+  
+  static inline void mmap_read_unlock_non_owner(struct mm_struct *mm)
+  {
+- 	up_read_non_owner(&mm->mmap_sem);
++ 	up_read_non_owner(&mm->mmap_lock);
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static inline void mmap_assert_locked(struct mm_struct *mm)
++ {
++ 	lockdep_assert_held(&mm->mmap_lock);
++ 	VM_BUG_ON_MM(!rwsem_is_locked(&mm->mmap_lock), mm);
++ }
++ 
++ static inline void mmap_assert_write_locked(struct mm_struct *mm)
++ {
++ 	lockdep_assert_held_write(&mm->mmap_lock);
++ 	VM_BUG_ON_MM(!rwsem_is_locked(&mm->mmap_lock), mm);
+  }
+  
+++>>>>>>> da1c55f1b272 (mmap locking API: rename mmap_sem to mmap_lock)
+  #endif /* _LINUX_MMAP_LOCK_H */
+diff --cc mm/gup.c
+index 2007cab8de67,762fb9f733b2..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -2623,6 -2749,9 +2623,12 @@@ static int internal_get_user_pages_fast
+  				       FOLL_FAST_ONLY)))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!(gup_flags & FOLL_FAST_ONLY))
++ 		might_lock_read(&current->mm->mmap_lock);
++ 
+++>>>>>>> da1c55f1b272 (mmap locking API: rename mmap_sem to mmap_lock)
+  	start = untagged_addr(start) & PAGE_MASK;
+  	addr = start;
+  	len = (unsigned long) nr_pages << PAGE_SHIFT;
+diff --cc mm/mmu_notifier.c
+index 69117c59984a,2f348b6c9c9a..000000000000
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@@ -1069,9 -890,189 +1069,192 @@@ void mmu_notifier_put(struct mmu_notifi
+  	return;
+  
+  out_unlock:
+ -	spin_unlock(&mm->notifier_subscriptions->lock);
+ +	spin_unlock(&mm->mmu_notifier_mm->lock);
+  }
+  EXPORT_SYMBOL_GPL(mmu_notifier_put);
+++<<<<<<< HEAD
+++=======
++ 
++ static int __mmu_interval_notifier_insert(
++ 	struct mmu_interval_notifier *interval_sub, struct mm_struct *mm,
++ 	struct mmu_notifier_subscriptions *subscriptions, unsigned long start,
++ 	unsigned long length, const struct mmu_interval_notifier_ops *ops)
++ {
++ 	interval_sub->mm = mm;
++ 	interval_sub->ops = ops;
++ 	RB_CLEAR_NODE(&interval_sub->interval_tree.rb);
++ 	interval_sub->interval_tree.start = start;
++ 	/*
++ 	 * Note that the representation of the intervals in the interval tree
++ 	 * considers the ending point as contained in the interval.
++ 	 */
++ 	if (length == 0 ||
++ 	    check_add_overflow(start, length - 1,
++ 			       &interval_sub->interval_tree.last))
++ 		return -EOVERFLOW;
++ 
++ 	/* Must call with a mmget() held */
++ 	if (WARN_ON(atomic_read(&mm->mm_count) <= 0))
++ 		return -EINVAL;
++ 
++ 	/* pairs with mmdrop in mmu_interval_notifier_remove() */
++ 	mmgrab(mm);
++ 
++ 	/*
++ 	 * If some invalidate_range_start/end region is going on in parallel
++ 	 * we don't know what VA ranges are affected, so we must assume this
++ 	 * new range is included.
++ 	 *
++ 	 * If the itree is invalidating then we are not allowed to change
++ 	 * it. Retrying until invalidation is done is tricky due to the
++ 	 * possibility for live lock, instead defer the add to
++ 	 * mn_itree_inv_end() so this algorithm is deterministic.
++ 	 *
++ 	 * In all cases the value for the interval_sub->invalidate_seq should be
++ 	 * odd, see mmu_interval_read_begin()
++ 	 */
++ 	spin_lock(&subscriptions->lock);
++ 	if (subscriptions->active_invalidate_ranges) {
++ 		if (mn_itree_is_invalidating(subscriptions))
++ 			hlist_add_head(&interval_sub->deferred_item,
++ 				       &subscriptions->deferred_list);
++ 		else {
++ 			subscriptions->invalidate_seq |= 1;
++ 			interval_tree_insert(&interval_sub->interval_tree,
++ 					     &subscriptions->itree);
++ 		}
++ 		interval_sub->invalidate_seq = subscriptions->invalidate_seq;
++ 	} else {
++ 		WARN_ON(mn_itree_is_invalidating(subscriptions));
++ 		/*
++ 		 * The starting seq for a subscription not under invalidation
++ 		 * should be odd, not equal to the current invalidate_seq and
++ 		 * invalidate_seq should not 'wrap' to the new seq any time
++ 		 * soon.
++ 		 */
++ 		interval_sub->invalidate_seq =
++ 			subscriptions->invalidate_seq - 1;
++ 		interval_tree_insert(&interval_sub->interval_tree,
++ 				     &subscriptions->itree);
++ 	}
++ 	spin_unlock(&subscriptions->lock);
++ 	return 0;
++ }
++ 
++ /**
++  * mmu_interval_notifier_insert - Insert an interval notifier
++  * @interval_sub: Interval subscription to register
++  * @start: Starting virtual address to monitor
++  * @length: Length of the range to monitor
++  * @mm : mm_struct to attach to
++  *
++  * This function subscribes the interval notifier for notifications from the
++  * mm.  Upon return the ops related to mmu_interval_notifier will be called
++  * whenever an event that intersects with the given range occurs.
++  *
++  * Upon return the range_notifier may not be present in the interval tree yet.
++  * The caller must use the normal interval notifier read flow via
++  * mmu_interval_read_begin() to establish SPTEs for this range.
++  */
++ int mmu_interval_notifier_insert(struct mmu_interval_notifier *interval_sub,
++ 				 struct mm_struct *mm, unsigned long start,
++ 				 unsigned long length,
++ 				 const struct mmu_interval_notifier_ops *ops)
++ {
++ 	struct mmu_notifier_subscriptions *subscriptions;
++ 	int ret;
++ 
++ 	might_lock(&mm->mmap_lock);
++ 
++ 	subscriptions = smp_load_acquire(&mm->notifier_subscriptions);
++ 	if (!subscriptions || !subscriptions->has_itree) {
++ 		ret = mmu_notifier_register(NULL, mm);
++ 		if (ret)
++ 			return ret;
++ 		subscriptions = mm->notifier_subscriptions;
++ 	}
++ 	return __mmu_interval_notifier_insert(interval_sub, mm, subscriptions,
++ 					      start, length, ops);
++ }
++ EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert);
++ 
++ int mmu_interval_notifier_insert_locked(
++ 	struct mmu_interval_notifier *interval_sub, struct mm_struct *mm,
++ 	unsigned long start, unsigned long length,
++ 	const struct mmu_interval_notifier_ops *ops)
++ {
++ 	struct mmu_notifier_subscriptions *subscriptions =
++ 		mm->notifier_subscriptions;
++ 	int ret;
++ 
++ 	mmap_assert_write_locked(mm);
++ 
++ 	if (!subscriptions || !subscriptions->has_itree) {
++ 		ret = __mmu_notifier_register(NULL, mm);
++ 		if (ret)
++ 			return ret;
++ 		subscriptions = mm->notifier_subscriptions;
++ 	}
++ 	return __mmu_interval_notifier_insert(interval_sub, mm, subscriptions,
++ 					      start, length, ops);
++ }
++ EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert_locked);
++ 
++ /**
++  * mmu_interval_notifier_remove - Remove a interval notifier
++  * @interval_sub: Interval subscription to unregister
++  *
++  * This function must be paired with mmu_interval_notifier_insert(). It cannot
++  * be called from any ops callback.
++  *
++  * Once this returns ops callbacks are no longer running on other CPUs and
++  * will not be called in future.
++  */
++ void mmu_interval_notifier_remove(struct mmu_interval_notifier *interval_sub)
++ {
++ 	struct mm_struct *mm = interval_sub->mm;
++ 	struct mmu_notifier_subscriptions *subscriptions =
++ 		mm->notifier_subscriptions;
++ 	unsigned long seq = 0;
++ 
++ 	might_sleep();
++ 
++ 	spin_lock(&subscriptions->lock);
++ 	if (mn_itree_is_invalidating(subscriptions)) {
++ 		/*
++ 		 * remove is being called after insert put this on the
++ 		 * deferred list, but before the deferred list was processed.
++ 		 */
++ 		if (RB_EMPTY_NODE(&interval_sub->interval_tree.rb)) {
++ 			hlist_del(&interval_sub->deferred_item);
++ 		} else {
++ 			hlist_add_head(&interval_sub->deferred_item,
++ 				       &subscriptions->deferred_list);
++ 			seq = subscriptions->invalidate_seq;
++ 		}
++ 	} else {
++ 		WARN_ON(RB_EMPTY_NODE(&interval_sub->interval_tree.rb));
++ 		interval_tree_remove(&interval_sub->interval_tree,
++ 				     &subscriptions->itree);
++ 	}
++ 	spin_unlock(&subscriptions->lock);
++ 
++ 	/*
++ 	 * The possible sleep on progress in the invalidation requires the
++ 	 * caller not hold any locks held by invalidation callbacks.
++ 	 */
++ 	lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
++ 	lock_map_release(&__mmu_notifier_invalidate_range_start_map);
++ 	if (seq)
++ 		wait_event(subscriptions->wq,
++ 			   READ_ONCE(subscriptions->invalidate_seq) != seq);
++ 
++ 	/* pairs with mmgrab in mmu_interval_notifier_insert() */
++ 	mmdrop(mm);
++ }
++ EXPORT_SYMBOL_GPL(mmu_interval_notifier_remove);
++ 
+++>>>>>>> da1c55f1b272 (mmap locking API: rename mmap_sem to mmap_lock)
+  /**
+   * mmu_notifier_synchronize - Ensure all mmu_notifiers are freed
+   *
+diff --git a/arch/ia64/mm/fault.c b/arch/ia64/mm/fault.c
+index a9d55ad8d67b..b13319da72b1 100644
+--- a/arch/ia64/mm/fault.c
++++ b/arch/ia64/mm/fault.c
+@@ -92,8 +92,8 @@ ia64_do_page_fault (unsigned long address, unsigned long isr, struct pt_regs *re
+ 	mask = ((((isr >> IA64_ISR_X_BIT) & 1UL) << VM_EXEC_BIT)
+ 		| (((isr >> IA64_ISR_W_BIT) & 1UL) << VM_WRITE_BIT));
+ 
+-	/* mmap_sem is performance critical.... */
+-	prefetchw(&mm->mmap_sem);
++	/* mmap_lock is performance critical.... */
++	prefetchw(&mm->mmap_lock);
+ 
+ 	/*
+ 	 * If we're in an interrupt or have no user context, we must not take the fault..
+* Unmerged path arch/x86/mm/fault.c
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem.c b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+index ba55618bef21..519369da8aa6 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+@@ -701,7 +701,7 @@ static int etnaviv_gem_userptr_get_pages(struct etnaviv_gem_object *etnaviv_obj)
+ 	struct etnaviv_gem_userptr *userptr = &etnaviv_obj->userptr;
+ 	int ret, pinned = 0, npages = etnaviv_obj->base.size >> PAGE_SHIFT;
+ 
+-	might_lock_read(&current->mm->mmap_sem);
++	might_lock_read(&current->mm->mmap_lock);
+ 
+ 	if (userptr->mm != current->mm)
+ 		return -EPERM;
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index c24772248cd5..70011fd628ad 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -424,7 +424,7 @@ struct mm_struct {
+ 		spinlock_t page_table_lock; /* Protects page tables and some
+ 					     * counters
+ 					     */
+-		struct rw_semaphore mmap_sem;
++		struct rw_semaphore mmap_lock;
+ 
+ 		struct list_head mmlist; /* List of maybe swapped mm's.	These
+ 					  * are globally strung together off
+* Unmerged path include/linux/mmap_lock.h
+* Unmerged path mm/gup.c
+diff --git a/mm/memory.c b/mm/memory.c
+index 2d81ca6d26e3..df201598764d 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4540,7 +4540,7 @@ void __might_fault(const char *file, int line)
+ 	__might_sleep(file, line, 0);
+ #if defined(CONFIG_DEBUG_ATOMIC_SLEEP)
+ 	if (current->mm)
+-		might_lock_read(&current->mm->mmap_sem);
++		might_lock_read(&current->mm->mmap_lock);
+ #endif
+ }
+ EXPORT_SYMBOL(__might_fault);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index f1a83e0aa395..3ca0ccd196cd 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -3475,7 +3475,7 @@ static void vm_lock_anon_vma(struct mm_struct *mm, struct anon_vma *anon_vma)
+ 		 * The LSB of head.next can't change from under us
+ 		 * because we hold the mm_all_locks_mutex.
+ 		 */
+-		down_write_nest_lock(&anon_vma->root->rwsem, &mm->mmap_sem);
++		down_write_nest_lock(&anon_vma->root->rwsem, &mm->mmap_lock);
+ 		/*
+ 		 * We can safely modify head.next after taking the
+ 		 * anon_vma->root->rwsem. If some other vma in this mm shares
+@@ -3505,7 +3505,7 @@ static void vm_lock_mapping(struct mm_struct *mm, struct address_space *mapping)
+ 		 */
+ 		if (test_and_set_bit(AS_MM_ALL_LOCKS, &mapping->flags))
+ 			BUG();
+-		down_write_nest_lock(&mapping->i_mmap_rwsem, &mm->mmap_sem);
++		down_write_nest_lock(&mapping->i_mmap_rwsem, &mm->mmap_lock);
+ 	}
+ }
+ 
+* Unmerged path mm/mmu_notifier.c
