@@ -515,7 +515,7 @@ prog_dump(struct bpf_prog_info *info, enum dump_mode mode,
 	int fd;
 
 	if (mode == DUMP_JITED) {
-		if (info->jited_prog_len == 0) {
+		if (info->jited_prog_len == 0 || !info->jited_prog_insns) {
 			p_info("no instructions returned");
 			return -1;
 		}
