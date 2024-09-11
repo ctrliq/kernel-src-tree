@@ -1,0 +1,170 @@
+net: switchdev: introduce helper for checking dynamically learned FDB entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit c6451cda100d4ebbc3f6819e1161ce0e38ce7746
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c6451cda.failed
+
+It is a bit difficult to understand what DSA checks when it tries to
+avoid installing dynamically learned addresses on foreign interfaces as
+local host addresses, so create a generic switchdev helper that can be
+reused and is generally more readable.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c6451cda100d4ebbc3f6819e1161ce0e38ce7746)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/dsa/slave.c
+diff --cc net/dsa/slave.c
+index 24cc4de02bd3,feb64f58faed..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -1523,29 -2380,106 +1523,114 @@@ static int dsa_slave_switchdev_event(st
+  				     unsigned long event, void *ptr)
+  {
+  	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+ -	const struct switchdev_notifier_fdb_info *fdb_info;
+  	struct dsa_switchdev_event_work *switchdev_work;
+ -	bool host_addr = false;
+ -	struct dsa_port *dp;
+ -	int err;
+ +
+ +	if (!dsa_slave_dev_check(dev))
+ +		return NOTIFY_DONE;
+ +
+ +	switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
+ +	if (!switchdev_work)
+ +		return NOTIFY_BAD;
+ +
+ +	INIT_WORK(&switchdev_work->work,
+ +		  dsa_slave_switchdev_event_work);
+ +	switchdev_work->dev = dev;
+ +	switchdev_work->event = event;
+  
+  	switch (event) {
+ -	case SWITCHDEV_PORT_ATTR_SET:
+ -		err = switchdev_handle_port_attr_set(dev, ptr,
+ -						     dsa_slave_dev_check,
+ -						     dsa_slave_port_attr_set);
+ -		return notifier_from_errno(err);
+ -	case SWITCHDEV_FDB_ADD_TO_DEVICE:
+ +	case SWITCHDEV_FDB_ADD_TO_DEVICE: /* fall through */
+  	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+++<<<<<<< HEAD
+ +		if (dsa_slave_switchdev_fdb_work_init(switchdev_work, ptr))
+ +			goto err_fdb_work_init;
+++=======
++ 		fdb_info = ptr;
++ 
++ 		if (dsa_slave_dev_check(dev)) {
++ 			dp = dsa_slave_to_port(dev);
++ 
++ 			if (fdb_info->is_local)
++ 				host_addr = true;
++ 			else if (!fdb_info->added_by_user)
++ 				return NOTIFY_OK;
++ 		} else {
++ 			/* Snoop addresses added to foreign interfaces
++ 			 * bridged with us, or the bridge
++ 			 * itself. Dynamically learned addresses can
++ 			 * also be added for switches that don't
++ 			 * automatically learn SA from CPU-injected
++ 			 * traffic.
++ 			 */
++ 			struct net_device *br_dev;
++ 			struct dsa_slave_priv *p;
++ 
++ 			if (netif_is_bridge_master(dev))
++ 				br_dev = dev;
++ 			else
++ 				br_dev = netdev_master_upper_dev_get_rcu(dev);
++ 
++ 			if (!br_dev)
++ 				return NOTIFY_DONE;
++ 
++ 			if (!netif_is_bridge_master(br_dev))
++ 				return NOTIFY_DONE;
++ 
++ 			p = dsa_slave_dev_lower_find(br_dev);
++ 			if (!p)
++ 				return NOTIFY_DONE;
++ 
++ 			dp = p->dp;
++ 			host_addr = fdb_info->is_local;
++ 
++ 			/* FDB entries learned by the software bridge should
++ 			 * be installed as host addresses only if the driver
++ 			 * requests assisted learning.
++ 			 * On the other hand, FDB entries for local termination
++ 			 * should always be installed.
++ 			 */
++ 			if (switchdev_fdb_is_dynamically_learned(fdb_info) &&
++ 			    !dp->ds->assisted_learning_on_cpu_port)
++ 				return NOTIFY_DONE;
++ 
++ 			/* When the bridge learns an address on an offloaded
++ 			 * LAG we don't want to send traffic to the CPU, the
++ 			 * other ports bridged with the LAG should be able to
++ 			 * autonomously forward towards it.
++ 			 * On the other hand, if the address is local
++ 			 * (therefore not learned) then we want to trap it to
++ 			 * the CPU regardless of whether the interface it
++ 			 * belongs to is offloaded or not.
++ 			 */
++ 			if (dsa_tree_offloads_bridge_port(dp->ds->dst, dev) &&
++ 			    !fdb_info->is_local)
++ 				return NOTIFY_DONE;
++ 		}
++ 
++ 		if (!dp->ds->ops->port_fdb_add || !dp->ds->ops->port_fdb_del)
++ 			return NOTIFY_DONE;
++ 
++ 		switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
++ 		if (!switchdev_work)
++ 			return NOTIFY_BAD;
++ 
++ 		INIT_WORK(&switchdev_work->work,
++ 			  dsa_slave_switchdev_event_work);
++ 		switchdev_work->ds = dp->ds;
++ 		switchdev_work->port = dp->index;
++ 		switchdev_work->event = event;
++ 		switchdev_work->dev = dev;
++ 
++ 		ether_addr_copy(switchdev_work->addr,
++ 				fdb_info->addr);
++ 		switchdev_work->vid = fdb_info->vid;
++ 		switchdev_work->host_addr = host_addr;
++ 
++ 		/* Hold a reference for dsa_fdb_offload_notify */
+++>>>>>>> c6451cda100d (net: switchdev: introduce helper for checking dynamically learned FDB entries)
+  		dev_hold(dev);
+ -		dsa_schedule_work(&switchdev_work->work);
+  		break;
+  	default:
+ +		kfree(switchdev_work);
+  		return NOTIFY_DONE;
+  	}
+  
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 4b6737027b82..c0f96ba153e7 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -192,6 +192,12 @@ switchdev_notifier_info_to_extack(const struct switchdev_notifier_info *info)
+ 	return info->extack;
+ }
+ 
++static inline bool
++switchdev_fdb_is_dynamically_learned(const struct switchdev_notifier_fdb_info *fdb_info)
++{
++	return !fdb_info->added_by_user && !fdb_info->is_local;
++}
++
+ #ifdef CONFIG_NET_SWITCHDEV
+ 
+ void switchdev_deferred_process(void);
+* Unmerged path net/dsa/slave.c
