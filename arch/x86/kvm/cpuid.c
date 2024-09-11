@@ -293,7 +293,7 @@ static __always_inline void cpuid_mask(u32 *word, int wordnum)
 
 struct kvm_cpuid_array {
 	struct kvm_cpuid_entry2 *entries;
-	const int maxnent;
+	int maxnent;
 	int nent;
 };
 
@@ -909,7 +909,6 @@ int kvm_dev_ioctl_get_cpuid(struct kvm_cpuid2 *cpuid,
 
 	struct kvm_cpuid_array array = {
 		.nent = 0,
-		.maxnent = cpuid->nent,
 	};
 	int r, i;
 
@@ -925,6 +924,8 @@ int kvm_dev_ioctl_get_cpuid(struct kvm_cpuid2 *cpuid,
 					   cpuid->nent));
 	if (!array.entries)
 		return -ENOMEM;
+
+	array.maxnent = cpuid->nent;
 
 	for (i = 0; i < ARRAY_SIZE(funcs); i++) {
 		r = get_cpuid_func(&array, funcs[i], type);
