@@ -1,0 +1,158 @@
+net/sched: cls_flower add CT_FLAGS_INVALID flag support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author wenxu <wenxu@ucloud.cn>
+commit 7baf2429a1a965369b0ce44efb6315cdd515aa9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/7baf2429.failed
+
+This patch add the TCA_FLOWER_KEY_CT_FLAGS_INVALID flag to
+match the ct_state with invalid for conntrack.
+
+	Signed-off-by: wenxu <wenxu@ucloud.cn>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Link: https://lore.kernel.org/r/1611045110-682-1-git-send-email-wenxu@ucloud.cn
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7baf2429a1a965369b0ce44efb6315cdd515aa9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/pkt_cls.h
+diff --cc include/uapi/linux/pkt_cls.h
+index 0499d13a9b13,709668e264b0..000000000000
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@@ -591,8 -591,7 +591,12 @@@ enum 
+  	TCA_FLOWER_KEY_CT_FLAGS_ESTABLISHED = 1 << 1, /* Part of an existing connection. */
+  	TCA_FLOWER_KEY_CT_FLAGS_RELATED = 1 << 2, /* Related to an established connection. */
+  	TCA_FLOWER_KEY_CT_FLAGS_TRACKED = 1 << 3, /* Conntrack has occurred. */
+++<<<<<<< HEAD
+ +
+ +	__TCA_FLOWER_KEY_CT_FLAGS_MAX,
+++=======
++ 	TCA_FLOWER_KEY_CT_FLAGS_INVALID = 1 << 4, /* Conntrack is invalid. */
+++>>>>>>> 7baf2429a1a9 (net/sched: cls_flower add CT_FLAGS_INVALID flag support)
+  };
+  
+  enum {
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 91dd9520da5a..49a6cc03c2f1 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1370,8 +1370,8 @@ void
+ skb_flow_dissect_ct(const struct sk_buff *skb,
+ 		    struct flow_dissector *flow_dissector,
+ 		    void *target_container,
+-		    u16 *ctinfo_map,
+-		    size_t mapsize);
++		    u16 *ctinfo_map, size_t mapsize,
++		    bool post_ct);
+ void
+ skb_flow_dissect_tunnel_info(const struct sk_buff *skb,
+ 			     struct flow_dissector *flow_dissector,
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index bfa4da838e85..74382edc6bdb 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -388,6 +388,7 @@ struct qdisc_skb_cb {
+ #define QDISC_CB_PRIV_LEN 20
+ 	unsigned char		data[QDISC_CB_PRIV_LEN];
+ 	u16			mru;
++	bool			post_ct;
+ };
+ 
+ typedef void tcf_chain_head_change_t(struct tcf_proto *tp_head, void *priv);
+* Unmerged path include/uapi/linux/pkt_cls.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index b1235cdd1ab6..c41240820296 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3743,6 +3743,7 @@ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
+ 
+ 	/* qdisc_skb_cb(skb)->pkt_len was already set by the caller. */
+ 	qdisc_skb_cb(skb)->mru = 0;
++	qdisc_skb_cb(skb)->post_ct = false;
+ 	mini_qdisc_bstats_cpu_update(miniq, skb);
+ 
+ 	switch (tcf_classify(skb, miniq->filter_list, &cl_res, false)) {
+@@ -4804,6 +4805,7 @@ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
+ 
+ 	qdisc_skb_cb(skb)->pkt_len = skb->len;
+ 	qdisc_skb_cb(skb)->mru = 0;
++	qdisc_skb_cb(skb)->post_ct = false;
+ 	skb->tc_at_ingress = 1;
+ 	mini_qdisc_bstats_cpu_update(miniq, skb);
+ 
+diff --git a/net/core/flow_dissector.c b/net/core/flow_dissector.c
+index b294b0ab2dfd..fcbb487b51f2 100644
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -239,9 +239,8 @@ skb_flow_dissect_set_enc_addr_type(enum flow_dissector_key_id type,
+ void
+ skb_flow_dissect_ct(const struct sk_buff *skb,
+ 		    struct flow_dissector *flow_dissector,
+-		    void *target_container,
+-		    u16 *ctinfo_map,
+-		    size_t mapsize)
++		    void *target_container, u16 *ctinfo_map,
++		    size_t mapsize, bool post_ct)
+ {
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ 	struct flow_dissector_key_ct *key;
+@@ -253,13 +252,19 @@ skb_flow_dissect_ct(const struct sk_buff *skb,
+ 		return;
+ 
+ 	ct = nf_ct_get(skb, &ctinfo);
+-	if (!ct)
++	if (!ct && !post_ct)
+ 		return;
+ 
+ 	key = skb_flow_dissector_target(flow_dissector,
+ 					FLOW_DISSECTOR_KEY_CT,
+ 					target_container);
+ 
++	if (!ct) {
++		key->ct_state = TCA_FLOWER_KEY_CT_FLAGS_TRACKED |
++				TCA_FLOWER_KEY_CT_FLAGS_INVALID;
++		return;
++	}
++
+ 	if (ctinfo < mapsize)
+ 		key->ct_state = ctinfo_map[ctinfo];
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK_ZONES)
+diff --git a/net/sched/act_ct.c b/net/sched/act_ct.c
+index a0fb3c025b36..bf22200fd017 100644
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@ -1031,6 +1031,7 @@ static int tcf_ct_act(struct sk_buff *skb, const struct tc_action *a,
+ 
+ out:
+ 	tcf_action_update_bstats(&c->common, skb);
++	qdisc_skb_cb(skb)->post_ct = true;
+ 	if (defrag)
+ 		qdisc_skb_cb(skb)->pkt_len = skb->len;
+ 	return retval;
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index c61fbe0be01d..7e1302f5f1aa 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -313,6 +313,7 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ 		       struct tcf_result *res)
+ {
+ 	struct cls_fl_head *head = rcu_dereference_bh(tp->root);
++	bool post_ct = qdisc_skb_cb(skb)->post_ct;
+ 	struct fl_flow_key skb_key;
+ 	struct fl_flow_mask *mask;
+ 	struct cls_fl_filter *f;
+@@ -329,7 +330,8 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ 		skb_flow_dissect_tunnel_info(skb, &mask->dissector, &skb_key);
+ 		skb_flow_dissect_ct(skb, &mask->dissector, &skb_key,
+ 				    fl_ct_info_to_flower_map,
+-				    ARRAY_SIZE(fl_ct_info_to_flower_map));
++				    ARRAY_SIZE(fl_ct_info_to_flower_map),
++				    post_ct);
+ 		skb_flow_dissect_hash(skb, &mask->dissector, &skb_key);
+ 		skb_flow_dissect(skb, &mask->dissector, &skb_key, 0);
+ 
