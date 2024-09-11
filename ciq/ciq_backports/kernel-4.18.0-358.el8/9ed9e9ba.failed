@@ -1,0 +1,267 @@
+bpf: Count the number of times recursion was prevented
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 9ed9e9ba2337205311398a312796c213737bac35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/9ed9e9ba.failed
+
+Add per-program counter for number of times recursion prevention mechanism
+was triggered and expose it via show_fdinfo and bpf_prog_info.
+Teach bpftool to print it.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210210033634.62081-7-alexei.starovoitov@gmail.com
+(cherry picked from commit 9ed9e9ba2337205311398a312796c213737bac35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+#	kernel/bpf/trampoline.c
+diff --cc include/linux/filter.h
+index d0df16c403ee,3b00fc906ccd..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -554,6 -540,13 +554,16 @@@ struct bpf_binary_header 
+  	u8 image[] __aligned(BPF_IMAGE_ALIGNMENT);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_prog_stats {
++ 	u64 cnt;
++ 	u64 nsecs;
++ 	u64 misses;
++ 	struct u64_stats_sync syncp;
++ } __aligned(2 * sizeof(u64));
++ 
+++>>>>>>> 9ed9e9ba2337 (bpf: Count the number of times recursion was prevented)
+  struct bpf_prog {
+  	u16			pages;		/* Number of allocated pages */
+  	u16			jited:1,	/* Is our filter JIT'ed? */
+diff --cc kernel/bpf/trampoline.c
+index e4f61015e2e7,7bc3b3209224..000000000000
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@@ -489,23 -381,72 +489,77 @@@ out
+  	mutex_unlock(&trampoline_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define NO_START_TIME 1
++ static u64 notrace bpf_prog_start_time(void)
++ {
++ 	u64 start = NO_START_TIME;
++ 
++ 	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
++ 		start = sched_clock();
++ 		if (unlikely(!start))
++ 			start = NO_START_TIME;
++ 	}
++ 	return start;
++ }
++ 
++ static void notrace inc_misses_counter(struct bpf_prog *prog)
++ {
++ 	struct bpf_prog_stats *stats;
++ 
++ 	stats = this_cpu_ptr(prog->stats);
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->misses++;
++ 	u64_stats_update_end(&stats->syncp);
++ }
++ 
+++>>>>>>> 9ed9e9ba2337 (bpf: Count the number of times recursion was prevented)
+  /* The logic is similar to BPF_PROG_RUN, but with an explicit
+   * rcu_read_lock() and migrate_disable() which are required
+   * for the trampoline. The macro is split into
+ - * call __bpf_prog_enter
+ + * call _bpf_prog_enter
+   * call prog->bpf_func
+   * call __bpf_prog_exit
+ - *
+ - * __bpf_prog_enter returns:
+ - * 0 - skip execution of the bpf prog
+ - * 1 - execute bpf prog
+ - * [2..MAX_U64] - excute bpf prog and record execution time.
+ - *     This is start time.
+   */
+ -u64 notrace __bpf_prog_enter(struct bpf_prog *prog)
+ +u64 notrace __bpf_prog_enter(void)
+  	__acquires(RCU)
+  {
+ +	u64 start = 0;
+ +
+  	rcu_read_lock();
+  	migrate_disable();
+++<<<<<<< HEAD
+ +	if (static_branch_unlikely(&bpf_stats_enabled_key))
+ +		start = sched_clock();
+ +	return start;
+++=======
++ 	if (unlikely(__this_cpu_inc_return(*(prog->active)) != 1)) {
++ 		inc_misses_counter(prog);
++ 		return 0;
++ 	}
++ 	return bpf_prog_start_time();
++ }
++ 
++ static void notrace update_prog_stats(struct bpf_prog *prog,
++ 				      u64 start)
++ {
++ 	struct bpf_prog_stats *stats;
++ 
++ 	if (static_branch_unlikely(&bpf_stats_enabled_key) &&
++ 	    /* static_key could be enabled in __bpf_prog_enter*
++ 	     * and disabled in __bpf_prog_exit*.
++ 	     * And vice versa.
++ 	     * Hence check that 'start' is valid.
++ 	     */
++ 	    start > NO_START_TIME) {
++ 		stats = this_cpu_ptr(prog->stats);
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->cnt++;
++ 		stats->nsecs += sched_clock() - start;
++ 		u64_stats_update_end(&stats->syncp);
++ 	}
+++>>>>>>> 9ed9e9ba2337 (bpf: Count the number of times recursion was prevented)
+  }
+  
+  void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
+@@@ -535,10 -463,17 +589,18 @@@ void notrace __bpf_prog_enter_sleepable
+  	rcu_read_lock_trace();
+  	migrate_disable();
+  	might_fault();
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(__this_cpu_inc_return(*(prog->active)) != 1)) {
++ 		inc_misses_counter(prog);
++ 		return 0;
++ 	}
++ 	return bpf_prog_start_time();
+++>>>>>>> 9ed9e9ba2337 (bpf: Count the number of times recursion was prevented)
+  }
+  
+ -void notrace __bpf_prog_exit_sleepable(struct bpf_prog *prog, u64 start)
+ +void notrace __bpf_prog_exit_sleepable(void)
+  {
+ -	update_prog_stats(prog, start);
+ -	__this_cpu_dec(*(prog->active));
+  	migrate_enable();
+  	rcu_read_unlock_trace();
+  }
+* Unmerged path include/linux/filter.h
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 686b357dddc9..088652f991f1 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -4521,6 +4521,7 @@ struct bpf_prog_info {
+ 	__aligned_u64 prog_tags;
+ 	__u64 run_time_ns;
+ 	__u64 run_cnt;
++	__u64 recursion_misses;
+ } __attribute__((aligned(8)));
+ 
+ struct bpf_map_info {
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index d8cbaca28508..290b5ee78cb2 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1761,25 +1761,28 @@ static int bpf_prog_release(struct inode *inode, struct file *filp)
+ static void bpf_prog_get_stats(const struct bpf_prog *prog,
+ 			       struct bpf_prog_stats *stats)
+ {
+-	u64 nsecs = 0, cnt = 0;
++	u64 nsecs = 0, cnt = 0, misses = 0;
+ 	int cpu;
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		const struct bpf_prog_stats *st;
+ 		unsigned int start;
+-		u64 tnsecs, tcnt;
++		u64 tnsecs, tcnt, tmisses;
+ 
+ 		st = per_cpu_ptr(prog->aux->stats, cpu);
+ 		do {
+ 			start = u64_stats_fetch_begin_irq(&st->syncp);
+ 			tnsecs = st->nsecs;
+ 			tcnt = st->cnt;
++			tmisses = st->misses;
+ 		} while (u64_stats_fetch_retry_irq(&st->syncp, start));
+ 		nsecs += tnsecs;
+ 		cnt += tcnt;
++		misses += tmisses;
+ 	}
+ 	stats->nsecs = nsecs;
+ 	stats->cnt = cnt;
++	stats->misses = misses;
+ }
+ 
+ #ifdef CONFIG_PROC_FS
+@@ -1798,14 +1801,16 @@ static void bpf_prog_show_fdinfo(struct seq_file *m, struct file *filp)
+ 		   "memlock:\t%llu\n"
+ 		   "prog_id:\t%u\n"
+ 		   "run_time_ns:\t%llu\n"
+-		   "run_cnt:\t%llu\n",
++		   "run_cnt:\t%llu\n"
++		   "recursion_misses:\t%llu\n",
+ 		   prog->type,
+ 		   prog->jited,
+ 		   prog_tag,
+ 		   prog->pages * 1ULL << PAGE_SHIFT,
+ 		   prog->aux->id,
+ 		   stats.nsecs,
+-		   stats.cnt);
++		   stats.cnt,
++		   stats.misses);
+ }
+ #endif
+ 
+@@ -3473,6 +3478,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
+ 	bpf_prog_get_stats(prog, &stats);
+ 	info.run_time_ns = stats.nsecs;
+ 	info.run_cnt = stats.cnt;
++	info.recursion_misses = stats.misses;
+ 
+ 	if (!bpf_capable()) {
+ 		info.jited_prog_len = 0;
+* Unmerged path kernel/bpf/trampoline.c
+diff --git a/tools/bpf/bpftool/prog.c b/tools/bpf/bpftool/prog.c
+index 1fe3ba255bad..f2b915b20546 100644
+--- a/tools/bpf/bpftool/prog.c
++++ b/tools/bpf/bpftool/prog.c
+@@ -368,6 +368,8 @@ static void print_prog_header_json(struct bpf_prog_info *info)
+ 		jsonw_uint_field(json_wtr, "run_time_ns", info->run_time_ns);
+ 		jsonw_uint_field(json_wtr, "run_cnt", info->run_cnt);
+ 	}
++	if (info->recursion_misses)
++		jsonw_uint_field(json_wtr, "recursion_misses", info->recursion_misses);
+ }
+ 
+ static void print_prog_json(struct bpf_prog_info *info, int fd)
+@@ -446,6 +448,8 @@ static void print_prog_header_plain(struct bpf_prog_info *info)
+ 	if (info->run_time_ns)
+ 		printf(" run_time_ns %lld run_cnt %lld",
+ 		       info->run_time_ns, info->run_cnt);
++	if (info->recursion_misses)
++		printf(" recursion_misses %lld", info->recursion_misses);
+ 	printf("\n");
+ }
+ 
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index b8b779d43102..022081f0be8d 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -4501,6 +4501,7 @@ struct bpf_prog_info {
+ 	__aligned_u64 prog_tags;
+ 	__u64 run_time_ns;
+ 	__u64 run_cnt;
++	__u64 recursion_misses;
+ } __attribute__((aligned(8)));
+ 
+ struct bpf_map_info {
