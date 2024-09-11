@@ -1,0 +1,130 @@
+dm: add WARN_ON_ONCE to dm_submit_bio_remap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 0a8e9599b91db84b25e4f13e89ed9b5cc3c2d15f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0a8e9599.failed
+
+If a target uses dm_submit_bio_remap() it should set
+ti->accounts_remapped_io.
+
+Also, switch dm_start_io_acct() WARN_ON to WARN_ON_ONCE.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 0a8e9599b91db84b25e4f13e89ed9b5cc3c2d15f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,1c5c9036a20e..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -584,15 -526,33 +584,38 @@@ static void dm_io_acct(bool end, struc
+  		bio->bi_iter.bi_size = bi_size;
+  }
+  
+ -static void __dm_start_io_acct(struct dm_io *io, struct bio *bio)
+ +static void start_io_acct(struct dm_io *io)
+  {
+ -	dm_io_acct(false, io->md, bio, io->start_time, &io->stats_aux);
+ +	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+  }
+  
+ -static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+++<<<<<<< HEAD
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+++=======
++ 	/* Must account IO to DM device in terms of orig_bio */
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	/*
++ 	 * Ensure IO accounting is only ever started once.
++ 	 * Expect no possibility for race unless is_duplicate_bio.
++ 	 */
++ 	if (!clone || likely(!clone_to_tio(clone)->is_duplicate_bio)) {
++ 		if (WARN_ON_ONCE(io->was_accounted))
++ 			return;
++ 		io->was_accounted = 1;
++ 	} else if (xchg(&io->was_accounted, 1) == 1)
++ 		return;
++ 
++ 	__dm_start_io_acct(io, bio);
++ }
++ 
++ static void dm_end_io_acct(struct dm_io *io, struct bio *bio)
++ {
++ 	dm_io_acct(true, io->md, bio, io->start_time, &io->stats_aux);
+++>>>>>>> 0a8e9599b91d (dm: add WARN_ON_ONCE to dm_submit_bio_remap)
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+@@@ -1252,6 -1179,58 +1275,61 @@@ void dm_accept_partial_bio(struct bio *
+  }
+  EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+  
+++<<<<<<< HEAD
+++=======
++ static inline void __dm_submit_bio_remap(struct bio *clone,
++ 					 dev_t dev, sector_t old_sector)
++ {
++ 	trace_block_bio_remap(clone, dev, old_sector);
++ 	submit_bio_noacct(clone);
++ }
++ 
++ /*
++  * @clone: clone bio that DM core passed to target's .map function
++  * @tgt_clone: clone of @clone bio that target needs submitted
++  * @from_wq: caller is a workqueue thread managed by DM target
++  *
++  * Targets should use this interface to submit bios they take
++  * ownership of when returning DM_MAPIO_SUBMITTED.
++  *
++  * Target should also enable ti->accounts_remapped_io
++  */
++ void dm_submit_bio_remap(struct bio *clone, struct bio *tgt_clone,
++ 			 bool from_wq)
++ {
++ 	struct dm_target_io *tio = clone_to_tio(clone);
++ 	struct dm_io *io = tio->io;
++ 
++ 	WARN_ON_ONCE(!tio->ti->accounts_remapped_io);
++ 
++ 	/* establish bio that will get submitted */
++ 	if (!tgt_clone)
++ 		tgt_clone = clone;
++ 
++ 	/*
++ 	 * Account io->origin_bio to DM dev on behalf of target
++ 	 * that took ownership of IO with DM_MAPIO_SUBMITTED.
++ 	 */
++ 	if (!from_wq) {
++ 		/* Still in target's map function */
++ 		io->start_io_acct = true;
++ 	} else {
++ 		/*
++ 		 * Called by another thread, managed by DM target,
++ 		 * wait for dm_split_and_process_bio() to store
++ 		 * io->orig_bio
++ 		 */
++ 		while (unlikely(!smp_load_acquire(&io->orig_bio)))
++ 			msleep(1);
++ 		dm_start_io_acct(io, clone);
++ 	}
++ 
++ 	__dm_submit_bio_remap(tgt_clone, disk_devt(io->md->disk),
++ 			      tio->old_sector);
++ }
++ EXPORT_SYMBOL_GPL(dm_submit_bio_remap);
++ 
+++>>>>>>> 0a8e9599b91d (dm: add WARN_ON_ONCE to dm_submit_bio_remap)
+  static noinline void __set_swap_bios_limit(struct mapped_device *md, int latch)
+  {
+  	mutex_lock(&md->swap_bios_lock);
+* Unmerged path drivers/md/dm.c
