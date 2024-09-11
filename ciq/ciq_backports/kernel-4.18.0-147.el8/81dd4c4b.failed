@@ -1,0 +1,280 @@
+IB/mlx5: Validate correct PD before prefetch MR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Moni Shoua <monis@mellanox.com>
+commit 81dd4c4be3a765351189c7572ac963711d2bb652
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/81dd4c4b.failed
+
+When prefetching odp mr it is required to verify that pd of the mr is
+identical to the pd for which the advise_mr request arrived with.
+
+This check was missing from synchronous flow and is added now.
+
+Fixes: 813e90b1aeaa ("IB/mlx5: Add advise_mr() support")
+	Reported-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 81dd4c4be3a765351189c7572ac963711d2bb652)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index 4e6f586dbb7c,d828c20af38c..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -629,14 -737,15 +629,19 @@@ struct pf_frame 
+   *  abort the page fault handling.
+   */
+  static int pagefault_single_data_segment(struct mlx5_ib_dev *dev,
+++<<<<<<< HEAD
+ +					 u32 key, u64 io_virt, size_t bcnt,
+++=======
++ 					 struct ib_pd *pd, u32 key,
++ 					 u64 io_virt, size_t bcnt,
+++>>>>>>> 81dd4c4be3a7 (IB/mlx5: Validate correct PD before prefetch MR)
+  					 u32 *bytes_committed,
+ -					 u32 *bytes_mapped, u32 flags)
+ +					 u32 *bytes_mapped)
+  {
+  	int npages = 0, srcu_key, ret, i, outlen, cur_outlen = 0, depth = 0;
+ -	bool prefetch = flags & MLX5_PF_FLAGS_PREFETCH;
+  	struct pf_frame *head = NULL, *frame;
+  	struct mlx5_core_mkey *mmkey;
+ +	struct mlx5_ib_mw *mw;
+  	struct mlx5_ib_mr *mr;
+  	struct mlx5_klm *pklm;
+  	u32 *out = NULL;
+@@@ -664,7 -780,18 +669,22 @@@ next_mr
+  			goto srcu_unlock;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (!mr->umem->odp_data) {
+++=======
++ 		if (prefetch) {
++ 			if (!is_odp_mr(mr) ||
++ 			    mr->ibmr.pd != pd) {
++ 				mlx5_ib_dbg(dev, "Invalid prefetch request: %s\n",
++ 					    is_odp_mr(mr) ?  "MR is not ODP" :
++ 					    "PD is not of the MR");
++ 				ret = -EINVAL;
++ 				goto srcu_unlock;
++ 			}
++ 		}
++ 
++ 		if (!is_odp_mr(mr)) {
+++>>>>>>> 81dd4c4be3a7 (IB/mlx5: Validate correct PD before prefetch MR)
+  			mlx5_ib_dbg(dev, "skipping non ODP MR (lkey=0x%06x) in page fault handler.\n",
+  				    key);
+  			if (bytes_mapped)
+@@@ -848,9 -971,10 +868,10 @@@ static int pagefault_data_segments(stru
+  			continue;
+  		}
+  
+- 		ret = pagefault_single_data_segment(dev, key, io_virt, bcnt,
++ 		ret = pagefault_single_data_segment(dev, NULL, key,
++ 						    io_virt, bcnt,
+  						    &pfault->bytes_committed,
+ -						    bytes_mapped, 0);
+ +						    bytes_mapped);
+  		if (ret < 0)
+  			break;
+  		npages += ret;
+@@@ -1160,8 -1339,9 +1181,14 @@@ static void mlx5_ib_mr_rdma_pfault_hand
+  		prefetch_len = min(MAX_PREFETCH_LEN, prefetch_len);
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = pagefault_single_data_segment(dev, rkey, address, length,
+ +					    &pfault->bytes_committed, NULL);
+++=======
++ 	ret = pagefault_single_data_segment(dev, NULL, rkey, address, length,
++ 					    &pfault->bytes_committed, NULL,
++ 					    0);
+++>>>>>>> 81dd4c4be3a7 (IB/mlx5: Validate correct PD before prefetch MR)
+  	if (ret == -EAGAIN) {
+  		/* We're racing with an invalidation, don't prefetch */
+  		prefetch_activated = 0;
+@@@ -1186,9 -1366,10 +1213,9 @@@
+  	if (prefetch_activated) {
+  		u32 bytes_committed = 0;
+  
+- 		ret = pagefault_single_data_segment(dev, rkey, address,
++ 		ret = pagefault_single_data_segment(dev, NULL, rkey, address,
+  						    prefetch_len,
+ -						    &bytes_committed, NULL,
+ -						    0);
+ +						    &bytes_committed, NULL);
+  		if (ret < 0 && ret != -EAGAIN) {
+  			mlx5_ib_dbg(dev, "Prefetch failed. ret: %d, QP 0x%x, address: 0x%.16llx, length = 0x%.16x\n",
+  				    ret, pfault->token, address, prefetch_len);
+@@@ -1265,3 -1661,160 +1292,163 @@@ int mlx5_ib_odp_init(void
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct prefetch_mr_work {
++ 	struct work_struct work;
++ 	struct ib_pd *pd;
++ 	u32 pf_flags;
++ 	u32 num_sge;
++ 	struct ib_sge sg_list[0];
++ };
++ 
++ static void num_pending_prefetch_dec(struct mlx5_ib_dev *dev,
++ 				     struct ib_sge *sg_list, u32 num_sge,
++ 				     u32 from)
++ {
++ 	u32 i;
++ 	int srcu_key;
++ 
++ 	srcu_key = srcu_read_lock(&dev->mr_srcu);
++ 
++ 	for (i = from; i < num_sge; ++i) {
++ 		struct mlx5_core_mkey *mmkey;
++ 		struct mlx5_ib_mr *mr;
++ 
++ 		mmkey = __mlx5_mr_lookup(dev->mdev,
++ 					 mlx5_base_mkey(sg_list[i].lkey));
++ 		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
++ 		atomic_dec(&mr->num_pending_prefetch);
++ 	}
++ 
++ 	srcu_read_unlock(&dev->mr_srcu, srcu_key);
++ }
++ 
++ static bool num_pending_prefetch_inc(struct ib_pd *pd,
++ 				     struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	bool ret = true;
++ 	u32 i;
++ 
++ 	for (i = 0; i < num_sge; ++i) {
++ 		struct mlx5_core_mkey *mmkey;
++ 		struct mlx5_ib_mr *mr;
++ 
++ 		mmkey = __mlx5_mr_lookup(dev->mdev,
++ 					 mlx5_base_mkey(sg_list[i].lkey));
++ 		if (!mmkey || mmkey->key != sg_list[i].lkey) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		if (mmkey->type != MLX5_MKEY_MR) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
++ 
++ 		if (mr->ibmr.pd != pd) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		if (!mr->live) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		atomic_inc(&mr->num_pending_prefetch);
++ 	}
++ 
++ 	if (!ret)
++ 		num_pending_prefetch_dec(dev, sg_list, i, 0);
++ 
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_prefetch_sg_list(struct ib_pd *pd, u32 pf_flags,
++ 				    struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	u32 i;
++ 	int ret = 0;
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 
++ 	for (i = 0; i < num_sge; ++i) {
++ 		struct ib_sge *sg = &sg_list[i];
++ 		int bytes_committed = 0;
++ 
++ 		ret = pagefault_single_data_segment(dev, pd, sg->lkey, sg->addr,
++ 						    sg->length,
++ 						    &bytes_committed, NULL,
++ 						    pf_flags);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 
++ 	return ret < 0 ? ret : 0;
++ }
++ 
++ static void mlx5_ib_prefetch_mr_work(struct work_struct *work)
++ {
++ 	struct prefetch_mr_work *w =
++ 		container_of(work, struct prefetch_mr_work, work);
++ 
++ 	if (ib_device_try_get(w->pd->device)) {
++ 		mlx5_ib_prefetch_sg_list(w->pd, w->pf_flags, w->sg_list,
++ 					 w->num_sge);
++ 		ib_device_put(w->pd->device);
++ 	}
++ 
++ 	num_pending_prefetch_dec(to_mdev(w->pd->device), w->sg_list,
++ 				 w->num_sge, 0);
++ 	kfree(w);
++ }
++ 
++ int mlx5_ib_advise_mr_prefetch(struct ib_pd *pd,
++ 			       enum ib_uverbs_advise_mr_advice advice,
++ 			       u32 flags, struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	u32 pf_flags = MLX5_PF_FLAGS_PREFETCH;
++ 	struct prefetch_mr_work *work;
++ 	bool valid_req;
++ 	int srcu_key;
++ 
++ 	if (advice == IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH)
++ 		pf_flags |= MLX5_PF_FLAGS_DOWNGRADE;
++ 
++ 	if (flags & IB_UVERBS_ADVISE_MR_FLAG_FLUSH)
++ 		return mlx5_ib_prefetch_sg_list(pd, pf_flags, sg_list,
++ 						num_sge);
++ 
++ 	work = kvzalloc(struct_size(work, sg_list, num_sge), GFP_KERNEL);
++ 	if (!work)
++ 		return -ENOMEM;
++ 
++ 	memcpy(work->sg_list, sg_list, num_sge * sizeof(struct ib_sge));
++ 
++ 	/* It is guaranteed that the pd when work is executed is the pd when
++ 	 * work was queued since pd can't be destroyed while it holds MRs and
++ 	 * destroying a MR leads to flushing the workquque
++ 	 */
++ 	work->pd = pd;
++ 	work->pf_flags = pf_flags;
++ 	work->num_sge = num_sge;
++ 
++ 	INIT_WORK(&work->work, mlx5_ib_prefetch_mr_work);
++ 
++ 	srcu_key = srcu_read_lock(&dev->mr_srcu);
++ 
++ 	valid_req = num_pending_prefetch_inc(pd, sg_list, num_sge);
++ 	if (valid_req)
++ 		queue_work(system_unbound_wq, &work->work);
++ 	else
++ 		kfree(work);
++ 
++ 	srcu_read_unlock(&dev->mr_srcu, srcu_key);
++ 
++ 	return valid_req ? 0 : -EINVAL;
++ }
+++>>>>>>> 81dd4c4be3a7 (IB/mlx5: Validate correct PD before prefetch MR)
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
