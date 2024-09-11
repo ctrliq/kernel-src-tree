@@ -1,0 +1,115 @@
+mm: Make mem_dump_obj() handle vmalloc() memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Paul E. McKenney <paulmck@kernel.org>
+commit 98f180837a896ecedf8f7e12af22b57f271d43c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/98f18083.failed
+
+This commit adds vmalloc() support to mem_dump_obj().  Note that the
+vmalloc_dump_obj() function combines the checking and dumping, in
+contrast with the split between kmem_valid_obj() and kmem_dump_obj().
+The reason for the difference is that the checking in the vmalloc()
+case involves acquiring a global lock, and redundant acquisitions of
+global locks should be avoided, even on not-so-fast paths.
+
+Note that this change causes on-stack variables to be reported as
+vmalloc() storage from kernel_clone() or similar, depending on the degree
+of inlining that your compiler does.  This is likely more helpful than
+the earlier "non-paged (local) memory".
+
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: <linux-mm@kvack.org>
+	Reported-by: Andrii Nakryiko <andrii@kernel.org>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Tested-by: Naresh Kamboju <naresh.kamboju@linaro.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 98f180837a896ecedf8f7e12af22b57f271d43c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/util.c
+diff --cc mm/util.c
+index cfebce329d05,54870226cea6..000000000000
+--- a/mm/util.c
++++ b/mm/util.c
+@@@ -839,3 -982,34 +839,37 @@@ int memcmp_pages(struct page *page1, st
+  	kunmap_atomic(addr1);
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * mem_dump_obj - Print available provenance information
++  * @object: object for which to find provenance information.
++  *
++  * This function uses pr_cont(), so that the caller is expected to have
++  * printed out whatever preamble is appropriate.  The provenance information
++  * depends on the type of object and on how much debugging is enabled.
++  * For example, for a slab-cache object, the slab name is printed, and,
++  * if available, the return address and stack trace from the allocation
++  * of that object.
++  */
++ void mem_dump_obj(void *object)
++ {
++ 	if (kmem_valid_obj(object)) {
++ 		kmem_dump_obj(object);
++ 		return;
++ 	}
++ 	if (vmalloc_dump_obj(object))
++ 		return;
++ 	if (!virt_addr_valid(object)) {
++ 		if (object == NULL)
++ 			pr_cont(" NULL pointer.\n");
++ 		else if (object == ZERO_SIZE_PTR)
++ 			pr_cont(" zero-size pointer.\n");
++ 		else
++ 			pr_cont(" non-paged memory.\n");
++ 		return;
++ 	}
++ 	pr_cont(" non-slab/vmalloc memory.\n");
++ }
+++>>>>>>> 98f180837a89 (mm: Make mem_dump_obj() handle vmalloc() memory)
+diff --git a/include/linux/vmalloc.h b/include/linux/vmalloc.h
+index d9963e1a44e4..f3340d38d002 100644
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@ -241,4 +241,10 @@ pcpu_free_vm_areas(struct vm_struct **vms, int nr_vms)
+ int register_vmap_purge_notifier(struct notifier_block *nb);
+ int unregister_vmap_purge_notifier(struct notifier_block *nb);
+ 
++#ifdef CONFIG_MMU
++bool vmalloc_dump_obj(void *object);
++#else
++static inline bool vmalloc_dump_obj(void *object) { return false; }
++#endif
++
+ #endif /* _LINUX_VMALLOC_H */
+* Unmerged path mm/util.c
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 3dec6b87997e..9a07d057abf0 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -3512,6 +3512,18 @@ void pcpu_free_vm_areas(struct vm_struct **vms, int nr_vms)
+ }
+ #endif	/* CONFIG_SMP */
+ 
++bool vmalloc_dump_obj(void *object)
++{
++	struct vm_struct *vm;
++	void *objp = (void *)PAGE_ALIGN((unsigned long)object);
++
++	vm = find_vm_area(objp);
++	if (!vm)
++		return false;
++	pr_cont(" vmalloc allocated at %pS\n", vm->caller);
++	return true;
++}
++
+ #ifdef CONFIG_PROC_FS
+ static void *s_start(struct seq_file *m, loff_t *pos)
+ 	__acquires(&vmap_purge_lock)
