@@ -1,0 +1,425 @@
+bridge: mrp: Implement LC mode for MRP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Horatiu Vultur <horatiu.vultur@microchip.com>
+commit bfd042321a7afa769c855c37f2bbe2703dc72ef2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/bfd04232.failed
+
+Extend MRP to support LC mode(link check) for the interconnect port.
+This applies only to the interconnect ring.
+
+Opposite to RC mode(ring check) the LC mode is using CFM frames to
+detect when the link goes up or down and based on that the userspace
+will need to react.
+One advantage of the LC mode over RC mode is that there will be fewer
+frames in the normal rings. Because RC mode generates InTest on all
+ports while LC mode sends CFM frame only on the interconnect port.
+
+All 4 nodes part of the interconnect ring needs to have the same mode.
+And it is not possible to have running LC and RC mode at the same time
+on a node.
+
+Whenever the MIM starts it needs to detect the status of the other 3
+nodes in the interconnect ring so it would send a frame called
+InLinkStatus, on which the clients needs to reply with their link
+status.
+
+This patch adds InLinkStatus frame type and extends existing rules on
+how to forward this frame.
+
+	Acked-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: Horatiu Vultur <horatiu.vultur@microchip.com>
+Link: https://lore.kernel.org/r/20201124082525.273820-1-horatiu.vultur@microchip.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit bfd042321a7afa769c855c37f2bbe2703dc72ef2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/mrp_bridge.h
+#	net/bridge/br_mrp.c
+diff --cc include/uapi/linux/mrp_bridge.h
+index 694a68dcbe43,9744773de5ff..000000000000
+--- a/include/uapi/linux/mrp_bridge.h
++++ b/include/uapi/linux/mrp_bridge.h
+@@@ -42,6 -57,18 +42,21 @@@ enum br_mrp_tlv_header_type 
+  	BR_MRP_TLV_HEADER_RING_TOPO = 0x3,
+  	BR_MRP_TLV_HEADER_RING_LINK_DOWN = 0x4,
+  	BR_MRP_TLV_HEADER_RING_LINK_UP = 0x5,
+++<<<<<<< HEAD
+++=======
++ 	BR_MRP_TLV_HEADER_IN_TEST = 0x6,
++ 	BR_MRP_TLV_HEADER_IN_TOPO = 0x7,
++ 	BR_MRP_TLV_HEADER_IN_LINK_DOWN = 0x8,
++ 	BR_MRP_TLV_HEADER_IN_LINK_UP = 0x9,
++ 	BR_MRP_TLV_HEADER_IN_LINK_STATUS = 0xa,
++ 	BR_MRP_TLV_HEADER_OPTION = 0x7f,
++ };
++ 
++ enum br_mrp_sub_tlv_header_type {
++ 	BR_MRP_SUB_TLV_HEADER_TEST_MGR_NACK = 0x1,
++ 	BR_MRP_SUB_TLV_HEADER_TEST_PROPAGATE = 0x2,
++ 	BR_MRP_SUB_TLV_HEADER_TEST_AUTO_MGR = 0x3,
+++>>>>>>> bfd042321a7a (bridge: mrp: Implement LC mode for MRP)
+  };
+  
+  struct br_mrp_tlv_hdr {
+diff --cc net/bridge/br_mrp.c
+index d673550412b4,cec2c4e4561d..000000000000
+--- a/net/bridge/br_mrp.c
++++ b/net/bridge/br_mrp.c
+@@@ -486,6 -690,181 +486,184 @@@ int br_mrp_start_test(struct net_bridg
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Set in state, int state can be only Open or Closed
++  * note: already called with rtnl_lock
++  */
++ int br_mrp_set_in_state(struct net_bridge *br, struct br_mrp_in_state *state)
++ {
++ 	struct br_mrp *mrp = br_mrp_find_in_id(br, state->in_id);
++ 
++ 	if (!mrp)
++ 		return -EINVAL;
++ 
++ 	if (mrp->in_state == BR_MRP_IN_STATE_CLOSED &&
++ 	    state->in_state != BR_MRP_IN_STATE_CLOSED)
++ 		mrp->in_transitions++;
++ 
++ 	mrp->in_state = state->in_state;
++ 
++ 	br_mrp_switchdev_set_in_state(br, mrp, state->in_state);
++ 
++ 	return 0;
++ }
++ 
++ /* Set in role, in role can be only MIM(Media Interconnection Manager) or
++  * MIC(Media Interconnection Client).
++  * note: already called with rtnl_lock
++  */
++ int br_mrp_set_in_role(struct net_bridge *br, struct br_mrp_in_role *role)
++ {
++ 	struct br_mrp *mrp = br_mrp_find_id(br, role->ring_id);
++ 	struct net_bridge_port *p;
++ 	int err;
++ 
++ 	if (!mrp)
++ 		return -EINVAL;
++ 
++ 	if (!br_mrp_get_port(br, role->i_ifindex))
++ 		return -EINVAL;
++ 
++ 	if (role->in_role == BR_MRP_IN_ROLE_DISABLED) {
++ 		u8 state;
++ 
++ 		/* It is not allowed to disable a port that doesn't exist */
++ 		p = rtnl_dereference(mrp->i_port);
++ 		if (!p)
++ 			return -EINVAL;
++ 
++ 		/* Stop the generating MRP_InTest frames */
++ 		cancel_delayed_work_sync(&mrp->in_test_work);
++ 		br_mrp_switchdev_send_in_test(br, mrp, 0, 0, 0);
++ 
++ 		/* Remove the port */
++ 		spin_lock_bh(&br->lock);
++ 		state = netif_running(br->dev) ?
++ 				BR_STATE_FORWARDING : BR_STATE_DISABLED;
++ 		p->state = state;
++ 		p->flags &= ~BR_MRP_AWARE;
++ 		spin_unlock_bh(&br->lock);
++ 		br_mrp_port_switchdev_set_state(p, state);
++ 		rcu_assign_pointer(mrp->i_port, NULL);
++ 
++ 		mrp->in_role = role->in_role;
++ 		mrp->in_id = 0;
++ 
++ 		return 0;
++ 	}
++ 
++ 	/* It is not possible to have the same port part of multiple rings */
++ 	if (!br_mrp_unique_ifindex(br, role->i_ifindex))
++ 		return -EINVAL;
++ 
++ 	/* It is not allowed to set a different interconnect port if the mrp
++ 	 * instance has already one. First it needs to be disabled and after
++ 	 * that set the new port
++ 	 */
++ 	if (rcu_access_pointer(mrp->i_port))
++ 		return -EINVAL;
++ 
++ 	p = br_mrp_get_port(br, role->i_ifindex);
++ 	spin_lock_bh(&br->lock);
++ 	p->state = BR_STATE_FORWARDING;
++ 	p->flags |= BR_MRP_AWARE;
++ 	spin_unlock_bh(&br->lock);
++ 	rcu_assign_pointer(mrp->i_port, p);
++ 
++ 	mrp->in_role = role->in_role;
++ 	mrp->in_id = role->in_id;
++ 
++ 	/* If there is an error just bailed out */
++ 	err = br_mrp_switchdev_set_in_role(br, mrp, role->in_id,
++ 					   role->ring_id, role->in_role);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	/* Now detect if the HW actually applied the role or not. If the HW
++ 	 * applied the role it means that the SW will not to do those operations
++ 	 * anymore. For example if the role is MIM then the HW will notify the
++ 	 * SW when interconnect ring is open, but if the is not pushed to the HW
++ 	 * the SW will need to detect when the interconnect ring is open.
++ 	 */
++ 	mrp->in_role_offloaded = err == -EOPNOTSUPP ? 0 : 1;
++ 
++ 	return 0;
++ }
++ 
++ /* Start to generate MRP_InTest frames, the frames are generated by
++  * HW and if it fails, they are generated by the SW.
++  * note: already called with rtnl_lock
++  */
++ int br_mrp_start_in_test(struct net_bridge *br,
++ 			 struct br_mrp_start_in_test *in_test)
++ {
++ 	struct br_mrp *mrp = br_mrp_find_in_id(br, in_test->in_id);
++ 
++ 	if (!mrp)
++ 		return -EINVAL;
++ 
++ 	if (mrp->in_role != BR_MRP_IN_ROLE_MIM)
++ 		return -EINVAL;
++ 
++ 	/* Try to push it to the HW and if it fails then continue with SW
++ 	 * implementation and if that also fails then return error.
++ 	 */
++ 	if (!br_mrp_switchdev_send_in_test(br, mrp, in_test->interval,
++ 					   in_test->max_miss, in_test->period))
++ 		return 0;
++ 
++ 	mrp->in_test_interval = in_test->interval;
++ 	mrp->in_test_end = jiffies + usecs_to_jiffies(in_test->period);
++ 	mrp->in_test_max_miss = in_test->max_miss;
++ 	mrp->in_test_count_miss = 0;
++ 	queue_delayed_work(system_wq, &mrp->in_test_work,
++ 			   usecs_to_jiffies(in_test->interval));
++ 
++ 	return 0;
++ }
++ 
++ /* Determin if the frame type is a ring frame */
++ static bool br_mrp_ring_frame(struct sk_buff *skb)
++ {
++ 	const struct br_mrp_tlv_hdr *hdr;
++ 	struct br_mrp_tlv_hdr _hdr;
++ 
++ 	hdr = skb_header_pointer(skb, sizeof(uint16_t), sizeof(_hdr), &_hdr);
++ 	if (!hdr)
++ 		return false;
++ 
++ 	if (hdr->type == BR_MRP_TLV_HEADER_RING_TEST ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_RING_TOPO ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_RING_LINK_DOWN ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_RING_LINK_UP ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_OPTION)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /* Determin if the frame type is an interconnect frame */
++ static bool br_mrp_in_frame(struct sk_buff *skb)
++ {
++ 	const struct br_mrp_tlv_hdr *hdr;
++ 	struct br_mrp_tlv_hdr _hdr;
++ 
++ 	hdr = skb_header_pointer(skb, sizeof(uint16_t), sizeof(_hdr), &_hdr);
++ 	if (!hdr)
++ 		return false;
++ 
++ 	if (hdr->type == BR_MRP_TLV_HEADER_IN_TEST ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_IN_TOPO ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_IN_LINK_DOWN ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_IN_LINK_UP ||
++ 	    hdr->type == BR_MRP_TLV_HEADER_IN_LINK_STATUS)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> bfd042321a7a (bridge: mrp: Implement LC mode for MRP)
+  /* Process only MRP Test frame. All the other MRP frames are processed by
+   * userspace application
+   * note: already called with rcu_read_lock
+@@@ -544,30 -1050,145 +722,119 @@@ static int br_mrp_rcv(struct net_bridge
+  	s_port = rcu_dereference(mrp->s_port);
+  	if (!s_port)
+  		return 0;
+ -	s_dst = s_port;
+ -
+ -	/* If the frame is a ring frame then it is not required to check the
+ -	 * interconnect role and ports to process or forward the frame
+ -	 */
+ -	if (br_mrp_ring_frame(skb)) {
+ -		/* If the role is MRM then don't forward the frames */
+ -		if (mrp->ring_role == BR_MRP_RING_ROLE_MRM) {
+ -			br_mrp_mrm_process(mrp, p, skb);
+ -			goto no_forward;
+ -		}
+ -
+ -		/* If the role is MRA then don't forward the frames if it
+ -		 * behaves as MRM node
+ -		 */
+ -		if (mrp->ring_role == BR_MRP_RING_ROLE_MRA) {
+ -			if (!mrp->test_monitor) {
+ -				br_mrp_mrm_process(mrp, p, skb);
+ -				goto no_forward;
+ -			}
+ -
+ -			br_mrp_mra_process(mrp, br, p, skb);
+ -		}
+  
+ -		goto forward;
+ +	/* If the role is MRM then don't forward the frames */
+ +	if (mrp->ring_role == BR_MRP_RING_ROLE_MRM) {
+ +		br_mrp_mrm_process(mrp, p, skb);
+ +		return 1;
+  	}
+  
+ -	if (br_mrp_in_frame(skb)) {
+ -		u8 in_type = br_mrp_get_frame_type(skb);
+ +	/* Clone the frame and forward it on the other MRP port */
+ +	nskb = skb_clone(skb, GFP_ATOMIC);
+ +	if (!nskb)
+ +		return 0;
+  
+ -		i_port = rcu_dereference(mrp->i_port);
+ -		i_dst = i_port;
+ +	p_dev = p_port->dev;
+ +	s_dev = s_port->dev;
+  
+ -		/* If the ring port is in block state it should not forward
+ -		 * In_Test frames
+ -		 */
+ -		if (br_mrp_is_ring_port(p_port, s_port, p) &&
+ -		    p->state == BR_STATE_BLOCKING &&
+ -		    in_type == BR_MRP_TLV_HEADER_IN_TEST)
+ -			goto no_forward;
+ +	if (p_dev == dev)
+ +		d_dev = s_dev;
+ +	else
+ +		d_dev = p_dev;
+  
+ -		/* Nodes that behaves as MRM needs to stop forwarding the
+ -		 * frames in case the ring is closed, otherwise will be a loop.
+ -		 * In this case the frame is no forward between the ring ports.
+ -		 */
+ -		if (br_mrp_mrm_behaviour(mrp) &&
+ -		    br_mrp_is_ring_port(p_port, s_port, p) &&
+ -		    (s_port->state != BR_STATE_FORWARDING ||
+ -		     p_port->state != BR_STATE_FORWARDING)) {
+ -			p_dst = NULL;
+ -			s_dst = NULL;
+ -		}
+ +	nskb->dev = d_dev;
+ +	skb_push(nskb, ETH_HLEN);
+ +	dev_queue_xmit(nskb);
+  
+++<<<<<<< HEAD
+++=======
++ 		/* A node that behaves as MRC and doesn't have a interconnect
++ 		 * role then it should forward all frames between the ring ports
++ 		 * because it doesn't have an interconnect port
++ 		 */
++ 		if (br_mrp_mrc_behaviour(mrp) &&
++ 		    mrp->in_role == BR_MRP_IN_ROLE_DISABLED)
++ 			goto forward;
++ 
++ 		if (mrp->in_role == BR_MRP_IN_ROLE_MIM) {
++ 			if (in_type == BR_MRP_TLV_HEADER_IN_TEST) {
++ 				/* MIM should not forward it's own InTest
++ 				 * frames
++ 				 */
++ 				if (br_mrp_mim_process(mrp, p, skb)) {
++ 					goto no_forward;
++ 				} else {
++ 					if (br_mrp_is_ring_port(p_port, s_port,
++ 								p))
++ 						i_dst = NULL;
++ 
++ 					if (br_mrp_is_in_port(i_port, p))
++ 						goto no_forward;
++ 				}
++ 			} else {
++ 				/* MIM should forward IntLinkChange/Status and
++ 				 * IntTopoChange between ring ports but MIM
++ 				 * should not forward IntLinkChange/Status and
++ 				 * IntTopoChange if the frame was received at
++ 				 * the interconnect port
++ 				 */
++ 				if (br_mrp_is_ring_port(p_port, s_port, p))
++ 					i_dst = NULL;
++ 
++ 				if (br_mrp_is_in_port(i_port, p))
++ 					goto no_forward;
++ 			}
++ 		}
++ 
++ 		if (mrp->in_role == BR_MRP_IN_ROLE_MIC) {
++ 			/* MIC should forward InTest frames on all ports
++ 			 * regardless of the received port
++ 			 */
++ 			if (in_type == BR_MRP_TLV_HEADER_IN_TEST)
++ 				goto forward;
++ 
++ 			/* MIC should forward IntLinkChange frames only if they
++ 			 * are received on ring ports to all the ports
++ 			 */
++ 			if (br_mrp_is_ring_port(p_port, s_port, p) &&
++ 			    (in_type == BR_MRP_TLV_HEADER_IN_LINK_UP ||
++ 			     in_type == BR_MRP_TLV_HEADER_IN_LINK_DOWN))
++ 				goto forward;
++ 
++ 			/* MIC should forward IntLinkStatus frames only to
++ 			 * interconnect port if it was received on a ring port.
++ 			 * If it is received on interconnect port then, it
++ 			 * should be forward on both ring ports
++ 			 */
++ 			if (br_mrp_is_ring_port(p_port, s_port, p) &&
++ 			    in_type == BR_MRP_TLV_HEADER_IN_LINK_STATUS) {
++ 				p_dst = NULL;
++ 				s_dst = NULL;
++ 			}
++ 
++ 			/* Should forward the InTopo frames only between the
++ 			 * ring ports
++ 			 */
++ 			if (in_type == BR_MRP_TLV_HEADER_IN_TOPO) {
++ 				i_dst = NULL;
++ 				goto forward;
++ 			}
++ 
++ 			/* In all the other cases don't forward the frames */
++ 			goto no_forward;
++ 		}
++ 	}
++ 
++ forward:
++ 	if (p_dst)
++ 		br_forward(p_dst, skb, true, false);
++ 	if (s_dst)
++ 		br_forward(s_dst, skb, true, false);
++ 	if (i_dst)
++ 		br_forward(i_dst, skb, true, false);
++ 
++ no_forward:
+++>>>>>>> bfd042321a7a (bridge: mrp: Implement LC mode for MRP)
+  	return 1;
+  }
+  
+* Unmerged path include/uapi/linux/mrp_bridge.h
+* Unmerged path net/bridge/br_mrp.c
