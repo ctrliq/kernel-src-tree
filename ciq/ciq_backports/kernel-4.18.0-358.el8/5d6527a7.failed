@@ -1,0 +1,1608 @@
+mm/mmu_notifier: use structure for invalidate_range_start/end callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jérôme Glisse <jglisse@redhat.com>
+commit 5d6527a784f7a6d247961e046e830de8d71b47d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5d6527a7.failed
+
+Patch series "mmu notifier contextual informations", v2.
+
+This patchset adds contextual information, why an invalidation is
+happening, to mmu notifier callback.  This is necessary for user of mmu
+notifier that wish to maintains their own data structure without having to
+add new fields to struct vm_area_struct (vma).
+
+For instance device can have they own page table that mirror the process
+address space.  When a vma is unmap (munmap() syscall) the device driver
+can free the device page table for the range.
+
+Today we do not have any information on why a mmu notifier call back is
+happening and thus device driver have to assume that it is always an
+munmap().  This is inefficient at it means that it needs to re-allocate
+device page table on next page fault and rebuild the whole device driver
+data structure for the range.
+
+Other use case beside munmap() also exist, for instance it is pointless
+for device driver to invalidate the device page table when the
+invalidation is for the soft dirtyness tracking.  Or device driver can
+optimize away mprotect() that change the page table permission access for
+the range.
+
+This patchset enables all this optimizations for device drivers.  I do not
+include any of those in this series but another patchset I am posting will
+leverage this.
+
+The patchset is pretty simple from a code point of view.  The first two
+patches consolidate all mmu notifier arguments into a struct so that it is
+easier to add/change arguments.  The last patch adds the contextual
+information (munmap, protection, soft dirty, clear, ...).
+
+This patch (of 3):
+
+To avoid having to change many callback definition everytime we want to
+add a parameter use a structure to group all parameters for the
+mmu_notifier invalidate_range_start/end callback.  No functional changes
+with this patch.
+
+[akpm@linux-foundation.org: fix drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c kerneldoc]
+Link: http://lkml.kernel.org/r/20181205053628.3210-2-jglisse@redhat.com
+	Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+	Acked-by: Jan Kara <jack@suse.cz>
+	Acked-by: Jason Gunthorpe <jgg@mellanox.com>	[infiniband]
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Ross Zwisler <zwisler@kernel.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krcmar <rkrcmar@redhat.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Christian Koenig <christian.koenig@amd.com>
+	Cc: Felix Kuehling <felix.kuehling@amd.com>
+	Cc: Ralph Campbell <rcampbell@nvidia.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5d6527a784f7a6d247961e046e830de8d71b47d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+#	drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+#	drivers/gpu/drm/radeon/radeon_mn.c
+#	drivers/infiniband/core/umem_odp.c
+#	drivers/infiniband/hw/hfi1/mmu_rb.c
+#	drivers/misc/mic/scif/scif_dma.c
+#	drivers/misc/sgi-gru/grutlbpurge.c
+#	drivers/xen/gntdev.c
+#	include/linux/mmu_notifier.h
+#	mm/hmm.c
+#	mm/mmu_notifier.c
+#	virt/kvm/kvm_main.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+index 828b5167ff12,3e6823fdd939..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+@@@ -60,67 -213,219 +60,193 @@@
+   * Block for operations on BOs to finish and mark pages as accessed and
+   * potentially dirty.
+   */
+ -static void amdgpu_mn_invalidate_node(struct amdgpu_mn_node *node,
+ -				      unsigned long start,
+ -				      unsigned long end)
+ +static bool amdgpu_mn_invalidate_gfx(struct mmu_interval_notifier *mni,
+ +				     const struct mmu_notifier_range *range,
+ +				     unsigned long cur_seq)
+  {
+ -	struct amdgpu_bo *bo;
+ +	struct amdgpu_bo *bo = container_of(mni, struct amdgpu_bo, notifier);
+ +	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+  	long r;
+  
+ -	list_for_each_entry(bo, &node->bos, mn_list) {
+ +	if (!mmu_notifier_range_blockable(range))
+ +		return false;
+  
+ -		if (!amdgpu_ttm_tt_affect_userptr(bo->tbo.ttm, start, end))
+ -			continue;
+ +	mutex_lock(&adev->notifier_lock);
+  
+ -		r = reservation_object_wait_timeout_rcu(bo->tbo.resv,
+ -			true, false, MAX_SCHEDULE_TIMEOUT);
+ -		if (r <= 0)
+ -			DRM_ERROR("(%ld) failed to wait for user bo\n", r);
+ +	mmu_interval_set_seq(mni, cur_seq);
+  
+ -		amdgpu_ttm_tt_mark_user_pages(bo->tbo.ttm);
+ -	}
+ +	r = dma_resv_wait_timeout_rcu(bo->tbo.base.resv, true, false,
+ +				      MAX_SCHEDULE_TIMEOUT);
+ +	mutex_unlock(&adev->notifier_lock);
+ +	if (r <= 0)
+ +		DRM_ERROR("(%ld) failed to wait for user bo\n", r);
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct mmu_interval_notifier_ops amdgpu_mn_gfx_ops = {
+ +	.invalidate = amdgpu_mn_invalidate_gfx,
+++=======
++ /**
++  * amdgpu_mn_invalidate_range_start_gfx - callback to notify about mm change
++  *
++  * @mn: our notifier
++  * @range: mmu notifier context
++  *
++  * Block for operations on BOs to finish and mark pages as accessed and
++  * potentially dirty.
++  */
++ static int amdgpu_mn_invalidate_range_start_gfx(struct mmu_notifier *mn,
++ 			const struct mmu_notifier_range *range)
++ {
++ 	struct amdgpu_mn *amn = container_of(mn, struct amdgpu_mn, mn);
++ 	struct interval_tree_node *it;
++ 	unsigned long end;
++ 
++ 	/* notification is exclusive, but interval is inclusive */
++ 	end = range->end - 1;
++ 
++ 	/* TODO we should be able to split locking for interval tree and
++ 	 * amdgpu_mn_invalidate_node
++ 	 */
++ 	if (amdgpu_mn_read_lock(amn, range->blockable))
++ 		return -EAGAIN;
++ 
++ 	it = interval_tree_iter_first(&amn->objects, range->start, end);
++ 	while (it) {
++ 		struct amdgpu_mn_node *node;
++ 
++ 		if (!range->blockable) {
++ 			amdgpu_mn_read_unlock(amn);
++ 			return -EAGAIN;
++ 		}
++ 
++ 		node = container_of(it, struct amdgpu_mn_node, it);
++ 		it = interval_tree_iter_next(it, range->start, end);
++ 
++ 		amdgpu_mn_invalidate_node(node, range->start, end);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * amdgpu_mn_invalidate_range_start_hsa - callback to notify about mm change
++  *
++  * @mn: our notifier
++  * @mm: the mm this callback is about
++  * @start: start of updated range
++  * @end: end of updated range
++  *
++  * We temporarily evict all BOs between start and end. This
++  * necessitates evicting all user-mode queues of the process. The BOs
++  * are restorted in amdgpu_mn_invalidate_range_end_hsa.
++  */
++ static int amdgpu_mn_invalidate_range_start_hsa(struct mmu_notifier *mn,
++ 			const struct mmu_notifier_range *range)
++ {
++ 	struct amdgpu_mn *amn = container_of(mn, struct amdgpu_mn, mn);
++ 	struct interval_tree_node *it;
++ 	unsigned long end;
++ 
++ 	/* notification is exclusive, but interval is inclusive */
++ 	end = range->end - 1;
++ 
++ 	if (amdgpu_mn_read_lock(amn, range->blockable))
++ 		return -EAGAIN;
++ 
++ 	it = interval_tree_iter_first(&amn->objects, range->start, end);
++ 	while (it) {
++ 		struct amdgpu_mn_node *node;
++ 		struct amdgpu_bo *bo;
++ 
++ 		if (!range->blockable) {
++ 			amdgpu_mn_read_unlock(amn);
++ 			return -EAGAIN;
++ 		}
++ 
++ 		node = container_of(it, struct amdgpu_mn_node, it);
++ 		it = interval_tree_iter_next(it, range->start, end);
++ 
++ 		list_for_each_entry(bo, &node->bos, mn_list) {
++ 			struct kgd_mem *mem = bo->kfd_bo;
++ 
++ 			if (amdgpu_ttm_tt_affect_userptr(bo->tbo.ttm,
++ 							 range->start,
++ 							 end))
++ 				amdgpu_amdkfd_evict_userptr(mem, range->mm);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * amdgpu_mn_invalidate_range_end - callback to notify about mm change
++  *
++  * @mn: our notifier
++  * @mm: the mm this callback is about
++  * @start: start of updated range
++  * @end: end of updated range
++  *
++  * Release the lock again to allow new command submissions.
++  */
++ static void amdgpu_mn_invalidate_range_end(struct mmu_notifier *mn,
++ 			const struct mmu_notifier_range *range)
++ {
++ 	struct amdgpu_mn *amn = container_of(mn, struct amdgpu_mn, mn);
++ 
++ 	amdgpu_mn_read_unlock(amn);
++ }
++ 
++ static const struct mmu_notifier_ops amdgpu_mn_ops[] = {
++ 	[AMDGPU_MN_TYPE_GFX] = {
++ 		.release = amdgpu_mn_release,
++ 		.invalidate_range_start = amdgpu_mn_invalidate_range_start_gfx,
++ 		.invalidate_range_end = amdgpu_mn_invalidate_range_end,
++ 	},
++ 	[AMDGPU_MN_TYPE_HSA] = {
++ 		.release = amdgpu_mn_release,
++ 		.invalidate_range_start = amdgpu_mn_invalidate_range_start_hsa,
++ 		.invalidate_range_end = amdgpu_mn_invalidate_range_end,
++ 	},
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  };
+  
+ -/* Low bits of any reasonable mm pointer will be unused due to struct
+ - * alignment. Use these bits to make a unique key from the mm pointer
+ - * and notifier type.
+ - */
+ -#define AMDGPU_MN_KEY(mm, type) ((unsigned long)(mm) + (type))
+ -
+  /**
+ - * amdgpu_mn_get - create notifier context
+ + * amdgpu_mn_invalidate_hsa - callback to notify about mm change
+   *
+ - * @adev: amdgpu device pointer
+ - * @type: type of MMU notifier context
+ + * @mni: the range (mm) is about to update
+ + * @range: details on the invalidation
+ + * @cur_seq: Value to pass to mmu_interval_set_seq()
+   *
+ - * Creates a notifier context for current->mm.
+ + * We temporarily evict the BO attached to this range. This necessitates
+ + * evicting all user-mode queues of the process.
+   */
+ -struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev,
+ -				enum amdgpu_mn_type type)
+ +static bool amdgpu_mn_invalidate_hsa(struct mmu_interval_notifier *mni,
+ +				     const struct mmu_notifier_range *range,
+ +				     unsigned long cur_seq)
+  {
+ -	struct mm_struct *mm = current->mm;
+ -	struct amdgpu_mn *amn;
+ -	unsigned long key = AMDGPU_MN_KEY(mm, type);
+ -	int r;
+ -
+ -	mutex_lock(&adev->mn_lock);
+ -	if (down_write_killable(&mm->mmap_sem)) {
+ -		mutex_unlock(&adev->mn_lock);
+ -		return ERR_PTR(-EINTR);
+ -	}
+ -
+ -	hash_for_each_possible(adev->mn_hash, amn, node, key)
+ -		if (AMDGPU_MN_KEY(amn->mm, amn->type) == key)
+ -			goto release_locks;
+ -
+ -	amn = kzalloc(sizeof(*amn), GFP_KERNEL);
+ -	if (!amn) {
+ -		amn = ERR_PTR(-ENOMEM);
+ -		goto release_locks;
+ -	}
+ -
+ -	amn->adev = adev;
+ -	amn->mm = mm;
+ -	init_rwsem(&amn->lock);
+ -	amn->type = type;
+ -	amn->mn.ops = &amdgpu_mn_ops[type];
+ -	amn->objects = RB_ROOT_CACHED;
+ -	mutex_init(&amn->read_lock);
+ -	atomic_set(&amn->recursion, 0);
+ -
+ -	r = __mmu_notifier_register(&amn->mn, mm);
+ -	if (r)
+ -		goto free_amn;
+ +	struct amdgpu_bo *bo = container_of(mni, struct amdgpu_bo, notifier);
+ +	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+  
+ -	hash_add(adev->mn_hash, &amn->node, AMDGPU_MN_KEY(mm, type));
+ +	if (!mmu_notifier_range_blockable(range))
+ +		return false;
+  
+ -release_locks:
+ -	up_write(&mm->mmap_sem);
+ -	mutex_unlock(&adev->mn_lock);
+ +	mutex_lock(&adev->notifier_lock);
+  
+ -	return amn;
+ +	mmu_interval_set_seq(mni, cur_seq);
+  
+ -free_amn:
+ -	up_write(&mm->mmap_sem);
+ -	mutex_unlock(&adev->mn_lock);
+ -	kfree(amn);
+ +	amdgpu_amdkfd_evict_userptr(bo->kfd_bo, bo->notifier.mm);
+ +	mutex_unlock(&adev->notifier_lock);
+  
+ -	return ERR_PTR(r);
+ +	return true;
+  }
+  
+ +static const struct mmu_interval_notifier_ops amdgpu_mn_hsa_ops = {
+ +	.invalidate = amdgpu_mn_invalidate_hsa,
+ +};
+ +
+  /**
+   * amdgpu_mn_register - register a BO for notifier updates
+   *
+diff --cc drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+index 3258765ead6f,3df77020aada..000000000000
+--- a/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+@@@ -39,59 -57,70 +39,69 @@@ struct i915_mmu_object 
+  	struct i915_mmu_notifier *mn;
+  	struct drm_i915_gem_object *obj;
+  	struct interval_tree_node it;
+ -	struct list_head link;
+ -	struct work_struct work;
+ -	bool attached;
+  };
+  
+ -static void cancel_userptr(struct work_struct *work)
+ +static void add_object(struct i915_mmu_object *mo)
+  {
+ -	struct i915_mmu_object *mo = container_of(work, typeof(*mo), work);
+ -	struct drm_i915_gem_object *obj = mo->obj;
+ -	struct work_struct *active;
+ -
+ -	/* Cancel any active worker and force us to re-evaluate gup */
+ -	mutex_lock(&obj->mm.lock);
+ -	active = fetch_and_zero(&obj->userptr.work);
+ -	mutex_unlock(&obj->mm.lock);
+ -	if (active)
+ -		goto out;
+ -
+ -	i915_gem_object_wait(obj, I915_WAIT_ALL, MAX_SCHEDULE_TIMEOUT, NULL);
+ -
+ -	mutex_lock(&obj->base.dev->struct_mutex);
+ -
+ -	/* We are inside a kthread context and can't be interrupted */
+ -	if (i915_gem_object_unbind(obj) == 0)
+ -		__i915_gem_object_put_pages(obj, I915_MM_NORMAL);
+ -	WARN_ONCE(i915_gem_object_has_pages(obj),
+ -		  "Failed to release pages: bind_count=%d, pages_pin_count=%d, pin_global=%d\n",
+ -		  obj->bind_count,
+ -		  atomic_read(&obj->mm.pages_pin_count),
+ -		  obj->pin_global);
+ -
+ -	mutex_unlock(&obj->base.dev->struct_mutex);
+ -
+ -out:
+ -	i915_gem_object_put(obj);
+ +	GEM_BUG_ON(!RB_EMPTY_NODE(&mo->it.rb));
+ +	interval_tree_insert(&mo->it, &mo->mn->objects);
+  }
+  
+ -static void add_object(struct i915_mmu_object *mo)
+ +static void del_object(struct i915_mmu_object *mo)
+  {
+ -	if (mo->attached)
+ +	if (RB_EMPTY_NODE(&mo->it.rb))
+  		return;
+  
+ -	interval_tree_insert(&mo->it, &mo->mn->objects);
+ -	mo->attached = true;
+ +	interval_tree_remove(&mo->it, &mo->mn->objects);
+ +	RB_CLEAR_NODE(&mo->it.rb);
+  }
+  
+ -static void del_object(struct i915_mmu_object *mo)
+++<<<<<<< HEAD:drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+ +static void
+ +__i915_gem_userptr_set_active(struct drm_i915_gem_object *obj, bool value)
+  {
+ -	if (!mo->attached)
+ +	struct i915_mmu_object *mo = obj->userptr.mmu_object;
+ +
+ +	/*
+ +	 * During mm_invalidate_range we need to cancel any userptr that
+ +	 * overlaps the range being invalidated. Doing so requires the
+ +	 * struct_mutex, and that risks recursion. In order to cause
+ +	 * recursion, the user must alias the userptr address space with
+ +	 * a GTT mmapping (possible with a MAP_FIXED) - then when we have
+ +	 * to invalidate that mmaping, mm_invalidate_range is called with
+ +	 * the userptr address *and* the struct_mutex held.  To prevent that
+ +	 * we set a flag under the i915_mmu_notifier spinlock to indicate
+ +	 * whether this object is valid.
+ +	 */
+ +	if (!mo)
+  		return;
+  
+ -	interval_tree_remove(&mo->it, &mo->mn->objects);
+ -	mo->attached = false;
+ +	spin_lock(&mo->mn->lock);
+ +	if (value)
+ +		add_object(mo);
+ +	else
+ +		del_object(mo);
+ +	spin_unlock(&mo->mn->lock);
+  }
+  
+ +static int
+ +userptr_mn_invalidate_range_start(struct mmu_notifier *_mn,
+ +				  const struct mmu_notifier_range *range)
+++=======
++ static int i915_gem_userptr_mn_invalidate_range_start(struct mmu_notifier *_mn,
++ 			const struct mmu_notifier_range *range)
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback):drivers/gpu/drm/i915/i915_gem_userptr.c
+  {
+  	struct i915_mmu_notifier *mn =
+  		container_of(_mn, struct i915_mmu_notifier, mn);
+ -	struct i915_mmu_object *mo;
+  	struct interval_tree_node *it;
+++<<<<<<< HEAD:drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+ +	unsigned long end;
+ +	int ret = 0;
+++=======
++ 	LIST_HEAD(cancelled);
++ 	unsigned long end;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback):drivers/gpu/drm/i915/i915_gem_userptr.c
+  
+  	if (RB_EMPTY_ROOT(&mn->objects.rb_root))
+  		return 0;
+@@@ -102,15 -131,11 +112,21 @@@
+  	spin_lock(&mn->lock);
+  	it = interval_tree_iter_first(&mn->objects, range->start, end);
+  	while (it) {
+++<<<<<<< HEAD:drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+ +		struct drm_i915_gem_object *obj;
+ +
+ +		if (!mmu_notifier_range_blockable(range)) {
+ +			ret = -EAGAIN;
+ +			break;
+++=======
++ 		if (!range->blockable) {
++ 			spin_unlock(&mn->lock);
++ 			return -EAGAIN;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback):drivers/gpu/drm/i915/i915_gem_userptr.c
+  		}
+ -		/* The mmu_object is released late when destroying the
+ +
+ +		/*
+ +		 * The mmu_object is released late when destroying the
+  		 * GEM object so it is entirely possible to gain a
+  		 * reference on an object in the process of being freed
+  		 * since our serialisation is via the spinlock and not
+@@@ -119,35 -144,21 +135,40 @@@
+  		 * use-after-free we only acquire a reference on the
+  		 * object if it is not in the process of being destroyed.
+  		 */
+ -		mo = container_of(it, struct i915_mmu_object, it);
+ -		if (kref_get_unless_zero(&mo->obj->base.refcount))
+ -			queue_work(mn->wq, &mo->work);
+ +		obj = container_of(it, struct i915_mmu_object, it)->obj;
+ +		if (!kref_get_unless_zero(&obj->base.refcount)) {
+ +			it = interval_tree_iter_next(it, range->start, end);
+ +			continue;
+ +		}
+ +		spin_unlock(&mn->lock);
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+ +		ret = i915_gem_object_unbind(obj,
+ +					     I915_GEM_OBJECT_UNBIND_ACTIVE |
+ +					     I915_GEM_OBJECT_UNBIND_BARRIER);
+ +		if (ret == 0)
+ +			ret = __i915_gem_object_put_pages(obj);
+ +		i915_gem_object_put(obj);
+ +		if (ret)
+ +			return ret;
+ +
+ +		spin_lock(&mn->lock);
+ +
+ +		/*
+ +		 * As we do not (yet) protect the mmu from concurrent insertion
+ +		 * over this range, there is no guarantee that this search will
+ +		 * terminate given a pathologic workload.
+ +		 */
+ +		it = interval_tree_iter_first(&mn->objects, range->start, end);
+++=======
++ 		list_add(&mo->link, &cancelled);
++ 		it = interval_tree_iter_next(it, range->start, end);
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback):drivers/gpu/drm/i915/i915_gem_userptr.c
+  	}
+ -	list_for_each_entry(mo, &cancelled, link)
+ -		del_object(mo);
+  	spin_unlock(&mn->lock);
+  
+ -	if (!list_empty(&cancelled))
+ -		flush_workqueue(mn->wq);
+ +	return ret;
+  
+ -	return 0;
+  }
+  
+  static const struct mmu_notifier_ops i915_gem_userptr_notifier = {
+diff --cc drivers/gpu/drm/radeon/radeon_mn.c
+index e37c9a57a7c3,b3019505065a..000000000000
+--- a/drivers/gpu/drm/radeon/radeon_mn.c
++++ b/drivers/gpu/drm/radeon/radeon_mn.c
+@@@ -46,44 -118,130 +46,143 @@@
+   * We block for all BOs between start and end to be idle and
+   * unmap them by move them into system domain again.
+   */
+++<<<<<<< HEAD
+ +static bool radeon_mn_invalidate(struct mmu_interval_notifier *mn,
+ +				 const struct mmu_notifier_range *range,
+ +				 unsigned long cur_seq)
+++=======
++ static int radeon_mn_invalidate_range_start(struct mmu_notifier *mn,
++ 				const struct mmu_notifier_range *range)
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  {
+ -	struct radeon_mn *rmn = container_of(mn, struct radeon_mn, mn);
+ +	struct radeon_bo *bo = container_of(mn, struct radeon_bo, notifier);
+  	struct ttm_operation_ctx ctx = { false, false };
+++<<<<<<< HEAD
+ +	long r;
+ +
+ +	if (!bo->tbo.ttm || !radeon_ttm_tt_is_bound(bo->tbo.bdev, bo->tbo.ttm))
+ +		return true;
+ +
+ +	if (!mmu_notifier_range_blockable(range))
+ +		return false;
+ +
+ +	r = radeon_bo_reserve(bo, true);
+ +	if (r) {
+ +		DRM_ERROR("(%ld) failed to reserve user bo\n", r);
+ +		return true;
+++=======
++ 	struct interval_tree_node *it;
++ 	unsigned long end;
++ 	int ret = 0;
++ 
++ 	/* notification is exclusive, but interval is inclusive */
++ 	end = range->end - 1;
++ 
++ 	/* TODO we should be able to split locking for interval tree and
++ 	 * the tear down.
++ 	 */
++ 	if (range->blockable)
++ 		mutex_lock(&rmn->lock);
++ 	else if (!mutex_trylock(&rmn->lock))
++ 		return -EAGAIN;
++ 
++ 	it = interval_tree_iter_first(&rmn->objects, range->start, end);
++ 	while (it) {
++ 		struct radeon_mn_node *node;
++ 		struct radeon_bo *bo;
++ 		long r;
++ 
++ 		if (!range->blockable) {
++ 			ret = -EAGAIN;
++ 			goto out_unlock;
++ 		}
++ 
++ 		node = container_of(it, struct radeon_mn_node, it);
++ 		it = interval_tree_iter_next(it, range->start, end);
++ 
++ 		list_for_each_entry(bo, &node->bos, mn_list) {
++ 
++ 			if (!bo->tbo.ttm || bo->tbo.ttm->state != tt_bound)
++ 				continue;
++ 
++ 			r = radeon_bo_reserve(bo, true);
++ 			if (r) {
++ 				DRM_ERROR("(%ld) failed to reserve user bo\n", r);
++ 				continue;
++ 			}
++ 
++ 			r = reservation_object_wait_timeout_rcu(bo->tbo.resv,
++ 				true, false, MAX_SCHEDULE_TIMEOUT);
++ 			if (r <= 0)
++ 				DRM_ERROR("(%ld) failed to wait for user bo\n", r);
++ 
++ 			radeon_ttm_placement_from_domain(bo, RADEON_GEM_DOMAIN_CPU);
++ 			r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++ 			if (r)
++ 				DRM_ERROR("(%ld) failed to validate user bo\n", r);
++ 
++ 			radeon_bo_unreserve(bo);
++ 		}
++ 	}
++ 	
++ out_unlock:
++ 	mutex_unlock(&rmn->lock);
++ 
++ 	return ret;
++ }
++ 
++ static const struct mmu_notifier_ops radeon_mn_ops = {
++ 	.release = radeon_mn_release,
++ 	.invalidate_range_start = radeon_mn_invalidate_range_start,
++ };
++ 
++ /**
++  * radeon_mn_get - create notifier context
++  *
++  * @rdev: radeon device pointer
++  *
++  * Creates a notifier context for current->mm.
++  */
++ static struct radeon_mn *radeon_mn_get(struct radeon_device *rdev)
++ {
++ 	struct mm_struct *mm = current->mm;
++ 	struct radeon_mn *rmn;
++ 	int r;
++ 
++ 	if (down_write_killable(&mm->mmap_sem))
++ 		return ERR_PTR(-EINTR);
++ 
++ 	mutex_lock(&rdev->mn_lock);
++ 
++ 	hash_for_each_possible(rdev->mn_hash, rmn, node, (unsigned long)mm)
++ 		if (rmn->mm == mm)
++ 			goto release_locks;
++ 
++ 	rmn = kzalloc(sizeof(*rmn), GFP_KERNEL);
++ 	if (!rmn) {
++ 		rmn = ERR_PTR(-ENOMEM);
++ 		goto release_locks;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  	}
+  
+ -	rmn->rdev = rdev;
+ -	rmn->mm = mm;
+ -	rmn->mn.ops = &radeon_mn_ops;
+ -	mutex_init(&rmn->lock);
+ -	rmn->objects = RB_ROOT_CACHED;
+ -	
+ -	r = __mmu_notifier_register(&rmn->mn, mm);
+ -	if (r)
+ -		goto free_rmn;
+ -
+ -	hash_add(rdev->mn_hash, &rmn->node, (unsigned long)mm);
+ +	r = dma_resv_wait_timeout_rcu(bo->tbo.base.resv, true, false,
+ +				      MAX_SCHEDULE_TIMEOUT);
+ +	if (r <= 0)
+ +		DRM_ERROR("(%ld) failed to wait for user bo\n", r);
+  
+ -release_locks:
+ -	mutex_unlock(&rdev->mn_lock);
+ -	up_write(&mm->mmap_sem);
+ -
+ -	return rmn;
+ -
+ -free_rmn:
+ -	mutex_unlock(&rdev->mn_lock);
+ -	up_write(&mm->mmap_sem);
+ -	kfree(rmn);
+ +	radeon_ttm_placement_from_domain(bo, RADEON_GEM_DOMAIN_CPU);
+ +	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+ +	if (r)
+ +		DRM_ERROR("(%ld) failed to validate user bo\n", r);
+  
+ -	return ERR_PTR(r);
+ +	radeon_bo_unreserve(bo);
+ +	return true;
+  }
+  
+ +static const struct mmu_interval_notifier_ops radeon_mn_ops = {
+ +	.invalidate = radeon_mn_invalidate,
+ +};
+ +
+  /**
+   * radeon_mn_register - register a BO for notifier updates
+   *
+diff --cc drivers/infiniband/core/umem_odp.c
+index 8a77fe583fed,a4ec43093cb3..000000000000
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@@ -113,15 -145,16 +113,27 @@@ static int invalidate_range_start_tramp
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void ib_umem_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						    struct mm_struct *mm,
+ +						    unsigned long start,
+ +						    unsigned long end)
+++=======
++ static int ib_umem_notifier_invalidate_range_start(struct mmu_notifier *mn,
++ 				const struct mmu_notifier_range *range)
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  {
+  	struct ib_ucontext_per_mm *per_mm =
+  		container_of(mn, struct ib_ucontext_per_mm, mn);
+  
+++<<<<<<< HEAD
+ +	down_read(&per_mm->umem_rwsem);
+++=======
++ 	if (range->blockable)
++ 		down_read(&per_mm->umem_rwsem);
++ 	else if (!down_read_trylock(&per_mm->umem_rwsem))
++ 		return -EAGAIN;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  
+  	if (!per_mm->active) {
+  		up_read(&per_mm->umem_rwsem);
+@@@ -130,12 -163,13 +142,19 @@@
+  		 * CPU without a lock, that fact is relied on to skip the unlock
+  		 * in range_end.
+  		 */
+ -		return 0;
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start,
+ +				      end,
+ +				      invalidate_range_start_trampoline, NULL);
+++=======
++ 	return rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, range->start,
++ 					     range->end,
++ 					     invalidate_range_start_trampoline,
++ 					     range->blockable, NULL);
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  }
+  
+  static int invalidate_range_end_trampoline(struct ib_umem_odp *item, u64 start,
+@@@ -156,9 -188,9 +173,15 @@@ static void ib_umem_notifier_invalidate
+  	if (unlikely(!per_mm->active))
+  		return;
+  
+++<<<<<<< HEAD
+ +	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start,
+ +				      end,
+ +				      invalidate_range_end_trampoline, NULL);
+++=======
++ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, range->start,
++ 				      range->end,
++ 				      invalidate_range_end_trampoline, true, NULL);
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  	up_read(&per_mm->umem_rwsem);
+  }
+  
+diff --cc drivers/infiniband/hw/hfi1/mmu_rb.c
+index 268aec04d3d4,14d2a90964c3..000000000000
+--- a/drivers/infiniband/hw/hfi1/mmu_rb.c
++++ b/drivers/infiniband/hw/hfi1/mmu_rb.c
+@@@ -54,11 -52,23 +54,16 @@@
+  #include "mmu_rb.h"
+  #include "trace.h"
+  
+ -struct mmu_rb_handler {
+ -	struct mmu_notifier mn;
+ -	struct rb_root_cached root;
+ -	void *ops_arg;
+ -	spinlock_t lock;        /* protect the RB tree */
+ -	struct mmu_rb_ops *ops;
+ -	struct mm_struct *mm;
+ -	struct list_head lru_list;
+ -	struct work_struct del_work;
+ -	struct list_head del_list;
+ -	struct workqueue_struct *wq;
+ -};
+ -
+  static unsigned long mmu_node_start(struct mmu_rb_node *);
+  static unsigned long mmu_node_last(struct mmu_rb_node *);
+++<<<<<<< HEAD
+ +static void mmu_notifier_range_start(struct mmu_notifier *,
+ +				     struct mm_struct *,
+ +				     unsigned long, unsigned long);
+++=======
++ static int mmu_notifier_range_start(struct mmu_notifier *,
++ 		const struct mmu_notifier_range *);
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  static struct mmu_rb_node *__mmu_rb_search(struct mmu_rb_handler *,
+  					   unsigned long, unsigned long);
+  static void do_remove(struct mmu_rb_handler *handler,
+@@@ -287,10 -282,8 +292,15 @@@ void hfi1_mmu_rb_remove(struct mmu_rb_h
+  	handler->ops->remove(handler->ops_arg, node);
+  }
+  
+++<<<<<<< HEAD
+ +static void mmu_notifier_range_start(struct mmu_notifier *mn,
+ +				     struct mm_struct *mm,
+ +				     unsigned long start,
+ +				     unsigned long end)
+++=======
++ static int mmu_notifier_range_start(struct mmu_notifier *mn,
++ 		const struct mmu_notifier_range *range)
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  {
+  	struct mmu_rb_handler *handler =
+  		container_of(mn, struct mmu_rb_handler, mn);
+diff --cc drivers/misc/mic/scif/scif_dma.c
+index 63d6246d6dff,e0d97044d0e9..000000000000
+--- a/drivers/misc/mic/scif/scif_dma.c
++++ b/drivers/misc/mic/scif/scif_dma.c
+@@@ -200,15 -200,15 +200,26 @@@ static void scif_mmu_notifier_release(s
+  	schedule_work(&scif_info.misc_work);
+  }
+  
+++<<<<<<< HEAD
+ +static void scif_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						     struct mm_struct *mm,
+ +						     unsigned long start,
+ +						     unsigned long end)
+++=======
++ static int scif_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
++ 					const struct mmu_notifier_range *range)
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  {
+  	struct scif_mmu_notif	*mmn;
+  
+  	mmn = container_of(mn, struct scif_mmu_notif, ep_mmu_notifier);
+++<<<<<<< HEAD
+ +	scif_rma_destroy_tcw(mmn, start, end - start);
+++=======
++ 	scif_rma_destroy_tcw(mmn, range->start, range->end - range->start);
++ 
++ 	return 0;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  }
+  
+  static void scif_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+diff --cc drivers/misc/sgi-gru/grutlbpurge.c
+index efb7c0a71ee6,ca2032afe035..000000000000
+--- a/drivers/misc/sgi-gru/grutlbpurge.c
++++ b/drivers/misc/sgi-gru/grutlbpurge.c
+@@@ -219,9 -219,8 +219,14 @@@ void gru_flush_all_tlb(struct gru_stat
+  /*
+   * MMUOPS notifier callout functions
+   */
+++<<<<<<< HEAD
+ +static void gru_invalidate_range_start(struct mmu_notifier *mn,
+ +				       struct mm_struct *mm,
+ +				       unsigned long start, unsigned long end)
+++=======
++ static int gru_invalidate_range_start(struct mmu_notifier *mn,
++ 			const struct mmu_notifier_range *range)
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  {
+  	struct gru_mm_struct *gms = container_of(mn, struct gru_mm_struct,
+  						 ms_notifier);
+@@@ -229,8 -228,10 +234,15 @@@
+  	STAT(mmu_invalidate_range);
+  	atomic_inc(&gms->ms_range_active);
+  	gru_dbg(grudev, "gms %p, start 0x%lx, end 0x%lx, act %d\n", gms,
+++<<<<<<< HEAD
+ +		start, end, atomic_read(&gms->ms_range_active));
+ +	gru_flush_tlb_range(gms, start, end - start);
+++=======
++ 		range->start, range->end, atomic_read(&gms->ms_range_active));
++ 	gru_flush_tlb_range(gms, range->start, range->end - range->start);
++ 
++ 	return 0;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  }
+  
+  static void gru_invalidate_range_end(struct mmu_notifier *mn,
+@@@ -244,46 -244,75 +255,47 @@@
+  	(void)atomic_dec_and_test(&gms->ms_range_active);
+  
+  	wake_up_all(&gms->ms_wait_queue);
+- 	gru_dbg(grudev, "gms %p, start 0x%lx, end 0x%lx\n", gms, start, end);
++ 	gru_dbg(grudev, "gms %p, start 0x%lx, end 0x%lx\n",
++ 		gms, range->start, range->end);
+  }
+  
+ -static void gru_release(struct mmu_notifier *mn, struct mm_struct *mm)
+ +static struct mmu_notifier *gru_alloc_notifier(struct mm_struct *mm)
+  {
+ -	struct gru_mm_struct *gms = container_of(mn, struct gru_mm_struct,
+ -						 ms_notifier);
+ +	struct gru_mm_struct *gms;
+ +
+ +	gms = kzalloc(sizeof(*gms), GFP_KERNEL);
+ +	if (!gms)
+ +		return ERR_PTR(-ENOMEM);
+ +	STAT(gms_alloc);
+ +	spin_lock_init(&gms->ms_asid_lock);
+ +	init_waitqueue_head(&gms->ms_wait_queue);
+  
+ -	gms->ms_released = 1;
+ -	gru_dbg(grudev, "gms %p\n", gms);
+ +	return &gms->ms_notifier;
+  }
+  
+ +static void gru_free_notifier(struct mmu_notifier *mn)
+ +{
+ +	kfree(container_of(mn, struct gru_mm_struct, ms_notifier));
+ +	STAT(gms_free);
+ +}
+  
+  static const struct mmu_notifier_ops gru_mmuops = {
+ +	.flags			= MMU_INVALIDATE_DOES_NOT_BLOCK,
+  	.invalidate_range_start	= gru_invalidate_range_start,
+  	.invalidate_range_end	= gru_invalidate_range_end,
+ -	.release		= gru_release,
+ +	.alloc_notifier		= gru_alloc_notifier,
+ +	.free_notifier		= gru_free_notifier,
+  };
+  
+ -/* Move this to the basic mmu_notifier file. But for now... */
+ -static struct mmu_notifier *mmu_find_ops(struct mm_struct *mm,
+ -			const struct mmu_notifier_ops *ops)
+ -{
+ -	struct mmu_notifier *mn, *gru_mn = NULL;
+ -
+ -	if (mm->mmu_notifier_mm) {
+ -		rcu_read_lock();
+ -		hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list,
+ -					 hlist)
+ -		    if (mn->ops == ops) {
+ -			gru_mn = mn;
+ -			break;
+ -		}
+ -		rcu_read_unlock();
+ -	}
+ -	return gru_mn;
+ -}
+ -
+  struct gru_mm_struct *gru_register_mmu_notifier(void)
+  {
+ -	struct gru_mm_struct *gms;
+  	struct mmu_notifier *mn;
+ -	int err;
+ -
+ -	mn = mmu_find_ops(current->mm, &gru_mmuops);
+ -	if (mn) {
+ -		gms = container_of(mn, struct gru_mm_struct, ms_notifier);
+ -		atomic_inc(&gms->ms_refcnt);
+ -	} else {
+ -		gms = kzalloc(sizeof(*gms), GFP_KERNEL);
+ -		if (!gms)
+ -			return ERR_PTR(-ENOMEM);
+ -		STAT(gms_alloc);
+ -		spin_lock_init(&gms->ms_asid_lock);
+ -		gms->ms_notifier.ops = &gru_mmuops;
+ -		atomic_set(&gms->ms_refcnt, 1);
+ -		init_waitqueue_head(&gms->ms_wait_queue);
+ -		err = __mmu_notifier_register(&gms->ms_notifier, current->mm);
+ -		if (err)
+ -			goto error;
+ -	}
+ -	if (gms)
+ -		gru_dbg(grudev, "gms %p, refcnt %d\n", gms,
+ -			atomic_read(&gms->ms_refcnt));
+ -	return gms;
+ -error:
+ -	kfree(gms);
+ -	return ERR_PTR(err);
+ +
+ +	mn = mmu_notifier_get_locked(&gru_mmuops, current->mm);
+ +	if (IS_ERR(mn))
+ +		return ERR_CAST(mn);
+ +
+ +	return container_of(mn, struct gru_mm_struct, ms_notifier);
+  }
+  
+  void gru_drop_mmu_notifier(struct gru_mm_struct *gms)
+diff --cc drivers/xen/gntdev.c
+index 7faf273ba78b,5efc5eee9544..000000000000
+--- a/drivers/xen/gntdev.c
++++ b/drivers/xen/gntdev.c
+@@@ -461,23 -515,39 +461,50 @@@ static void unmap_if_in_range(struct gr
+  				(mstart - map->vma->vm_start) >> PAGE_SHIFT,
+  				(mend - mstart) >> PAGE_SHIFT);
+  	WARN_ON(err);
+ -
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void mn_invl_range_start(struct mmu_notifier *mn,
+ +				struct mm_struct *mm,
+ +				unsigned long start, unsigned long end)
+ +{
+ +	struct gntdev_priv *priv = container_of(mn, struct gntdev_priv, mn);
+ +	struct grant_map *map;
+++=======
++ static int mn_invl_range_start(struct mmu_notifier *mn,
++ 			       const struct mmu_notifier_range *range)
++ {
++ 	struct gntdev_priv *priv = container_of(mn, struct gntdev_priv, mn);
++ 	struct gntdev_grant_map *map;
++ 	int ret = 0;
++ 
++ 	if (range->blockable)
++ 		mutex_lock(&priv->lock);
++ 	else if (!mutex_trylock(&priv->lock))
++ 		return -EAGAIN;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  
+ +	mutex_lock(&priv->lock);
+  	list_for_each_entry(map, &priv->maps, next) {
+++<<<<<<< HEAD
+ +		unmap_if_in_range(map, start, end);
+ +	}
+ +	list_for_each_entry(map, &priv->freeable_maps, next) {
+ +		unmap_if_in_range(map, start, end);
+++=======
++ 		ret = unmap_if_in_range(map, range->start, range->end,
++ 					range->blockable);
++ 		if (ret)
++ 			goto out_unlock;
++ 	}
++ 	list_for_each_entry(map, &priv->freeable_maps, next) {
++ 		ret = unmap_if_in_range(map, range->start, range->end,
++ 					range->blockable);
++ 		if (ret)
++ 			goto out_unlock;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  	}
+ -
+ -out_unlock:
+  	mutex_unlock(&priv->lock);
+ -
+ -	return ret;
+  }
+  
+  static void mn_release(struct mmu_notifier *mn,
+diff --cc include/linux/mmu_notifier.h
+index d924803cea7c,3d377805b29c..000000000000
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@@ -62,31 -18,21 +62,38 @@@ extern struct lockdep_map __mmu_notifie
+   * critical section and it's released only when mm_count reaches zero
+   * in mmdrop().
+   */
+ +#ifdef __GENKSYMS__
+  struct mmu_notifier_mm {
+ -	/* all mmu notifiers registerd in this mm are queued in this list */
+ +	/* all mmu notifiers registered in this mm are queued in this list */
+  	struct hlist_head list;
+ -	/* to serialize the list modifications and hlist_unhashed */
+  	spinlock_t lock;
+  };
+ +#else
+ +struct mmu_notifier_mm;
+ +#endif
+ +struct mmu_interval_notifier;
+ +/* mmu_notifier_ops flags */
+ +#define MMU_INVALIDATE_DOES_NOT_BLOCK	(0x01)
+ +
+ +#define MMU_NOTIFIER_RANGE_BLOCKABLE (1 << 0)
+  
++ struct mmu_notifier_range {
++ 	struct mm_struct *mm;
++ 	unsigned long start;
++ 	unsigned long end;
++ 	bool blockable;
++ };
++ 
+  struct mmu_notifier_ops {
+ +	/*
+ +	 * Flags to specify behavior of callbacks for this MMU notifier.
+ +	 * Used to determine which context an operation may be called.
+ +	 *
+ +	 * MMU_INVALIDATE_DOES_NOT_BLOCK: invalidate_range_* callbacks do not
+ +	 *	block
+ +	 */
+ +	int flags;
+ +
+  	/*
+  	 * Called either by mmu_notifier_unregister or when the mm is
+  	 * being destroyed by exit_mmap, always before all pages are
+@@@ -199,16 -145,17 +206,20 @@@
+  	 * address space but may still be referenced by sptes until
+  	 * the last refcount is dropped.
+  	 *
+ -	 * If blockable argument is set to false then the callback cannot
+ -	 * sleep and has to return with -EAGAIN. 0 should be returned
+ -	 * otherwise. Please note that if invalidate_range_start approves
+ -	 * a non-blocking behavior then the same applies to
+ -	 * invalidate_range_end.
+ -	 *
+ +	 * If both of these callbacks cannot block, and invalidate_range
+ +	 * cannot block, mmu_notifier_ops.flags should have
+ +	 * MMU_INVALIDATE_DOES_NOT_BLOCK set.
+  	 */
+++<<<<<<< HEAD
+ +	void (*invalidate_range_start)(struct mmu_notifier *mn,
+ +				       struct mm_struct *mm,
+ +				       unsigned long start, unsigned long end);
+++=======
++ 	int (*invalidate_range_start)(struct mmu_notifier *mn,
++ 				      const struct mmu_notifier_range *range);
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  	void (*invalidate_range_end)(struct mmu_notifier *mn,
+- 				     struct mm_struct *mm,
+- 				     unsigned long start, unsigned long end);
++ 				     const struct mmu_notifier_range *range);
+  
+  	/*
+  	 * invalidate_range() is either called between
+diff --cc mm/hmm.c
+index bdafd6d7b076,789587731217..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -35,6 -33,276 +35,279 @@@
+  #include <linux/mmu_notifier.h>
+  #include <linux/memory_hotplug.h>
+  
+++<<<<<<< HEAD
+++=======
++ #define PA_SECTION_SIZE (1UL << PA_SECTION_SHIFT)
++ 
++ #if IS_ENABLED(CONFIG_HMM_MIRROR)
++ static const struct mmu_notifier_ops hmm_mmu_notifier_ops;
++ 
++ /*
++  * struct hmm - HMM per mm struct
++  *
++  * @mm: mm struct this HMM struct is bound to
++  * @lock: lock protecting ranges list
++  * @ranges: list of range being snapshotted
++  * @mirrors: list of mirrors for this mm
++  * @mmu_notifier: mmu notifier to track updates to CPU page table
++  * @mirrors_sem: read/write semaphore protecting the mirrors list
++  */
++ struct hmm {
++ 	struct mm_struct	*mm;
++ 	spinlock_t		lock;
++ 	struct list_head	ranges;
++ 	struct list_head	mirrors;
++ 	struct mmu_notifier	mmu_notifier;
++ 	struct rw_semaphore	mirrors_sem;
++ };
++ 
++ /*
++  * hmm_register - register HMM against an mm (HMM internal)
++  *
++  * @mm: mm struct to attach to
++  *
++  * This is not intended to be used directly by device drivers. It allocates an
++  * HMM struct if mm does not have one, and initializes it.
++  */
++ static struct hmm *hmm_register(struct mm_struct *mm)
++ {
++ 	struct hmm *hmm = READ_ONCE(mm->hmm);
++ 	bool cleanup = false;
++ 
++ 	/*
++ 	 * The hmm struct can only be freed once the mm_struct goes away,
++ 	 * hence we should always have pre-allocated an new hmm struct
++ 	 * above.
++ 	 */
++ 	if (hmm)
++ 		return hmm;
++ 
++ 	hmm = kmalloc(sizeof(*hmm), GFP_KERNEL);
++ 	if (!hmm)
++ 		return NULL;
++ 	INIT_LIST_HEAD(&hmm->mirrors);
++ 	init_rwsem(&hmm->mirrors_sem);
++ 	hmm->mmu_notifier.ops = NULL;
++ 	INIT_LIST_HEAD(&hmm->ranges);
++ 	spin_lock_init(&hmm->lock);
++ 	hmm->mm = mm;
++ 
++ 	spin_lock(&mm->page_table_lock);
++ 	if (!mm->hmm)
++ 		mm->hmm = hmm;
++ 	else
++ 		cleanup = true;
++ 	spin_unlock(&mm->page_table_lock);
++ 
++ 	if (cleanup)
++ 		goto error;
++ 
++ 	/*
++ 	 * We should only get here if hold the mmap_sem in write mode ie on
++ 	 * registration of first mirror through hmm_mirror_register()
++ 	 */
++ 	hmm->mmu_notifier.ops = &hmm_mmu_notifier_ops;
++ 	if (__mmu_notifier_register(&hmm->mmu_notifier, mm))
++ 		goto error_mm;
++ 
++ 	return mm->hmm;
++ 
++ error_mm:
++ 	spin_lock(&mm->page_table_lock);
++ 	if (mm->hmm == hmm)
++ 		mm->hmm = NULL;
++ 	spin_unlock(&mm->page_table_lock);
++ error:
++ 	kfree(hmm);
++ 	return NULL;
++ }
++ 
++ void hmm_mm_destroy(struct mm_struct *mm)
++ {
++ 	kfree(mm->hmm);
++ }
++ 
++ static int hmm_invalidate_range(struct hmm *hmm, bool device,
++ 				const struct hmm_update *update)
++ {
++ 	struct hmm_mirror *mirror;
++ 	struct hmm_range *range;
++ 
++ 	spin_lock(&hmm->lock);
++ 	list_for_each_entry(range, &hmm->ranges, list) {
++ 		unsigned long addr, idx, npages;
++ 
++ 		if (update->end < range->start || update->start >= range->end)
++ 			continue;
++ 
++ 		range->valid = false;
++ 		addr = max(update->start, range->start);
++ 		idx = (addr - range->start) >> PAGE_SHIFT;
++ 		npages = (min(range->end, update->end) - addr) >> PAGE_SHIFT;
++ 		memset(&range->pfns[idx], 0, sizeof(*range->pfns) * npages);
++ 	}
++ 	spin_unlock(&hmm->lock);
++ 
++ 	if (!device)
++ 		return 0;
++ 
++ 	down_read(&hmm->mirrors_sem);
++ 	list_for_each_entry(mirror, &hmm->mirrors, list) {
++ 		int ret;
++ 
++ 		ret = mirror->ops->sync_cpu_device_pagetables(mirror, update);
++ 		if (!update->blockable && ret == -EAGAIN) {
++ 			up_read(&hmm->mirrors_sem);
++ 			return -EAGAIN;
++ 		}
++ 	}
++ 	up_read(&hmm->mirrors_sem);
++ 
++ 	return 0;
++ }
++ 
++ static void hmm_release(struct mmu_notifier *mn, struct mm_struct *mm)
++ {
++ 	struct hmm_mirror *mirror;
++ 	struct hmm *hmm = mm->hmm;
++ 
++ 	down_write(&hmm->mirrors_sem);
++ 	mirror = list_first_entry_or_null(&hmm->mirrors, struct hmm_mirror,
++ 					  list);
++ 	while (mirror) {
++ 		list_del_init(&mirror->list);
++ 		if (mirror->ops->release) {
++ 			/*
++ 			 * Drop mirrors_sem so callback can wait on any pending
++ 			 * work that might itself trigger mmu_notifier callback
++ 			 * and thus would deadlock with us.
++ 			 */
++ 			up_write(&hmm->mirrors_sem);
++ 			mirror->ops->release(mirror);
++ 			down_write(&hmm->mirrors_sem);
++ 		}
++ 		mirror = list_first_entry_or_null(&hmm->mirrors,
++ 						  struct hmm_mirror, list);
++ 	}
++ 	up_write(&hmm->mirrors_sem);
++ }
++ 
++ static int hmm_invalidate_range_start(struct mmu_notifier *mn,
++ 			const struct mmu_notifier_range *range)
++ {
++ 	struct hmm_update update;
++ 	struct hmm *hmm = range->mm->hmm;
++ 
++ 	VM_BUG_ON(!hmm);
++ 
++ 	update.start = range->start;
++ 	update.end = range->end;
++ 	update.event = HMM_UPDATE_INVALIDATE;
++ 	update.blockable = range->blockable;
++ 	return hmm_invalidate_range(hmm, true, &update);
++ }
++ 
++ static void hmm_invalidate_range_end(struct mmu_notifier *mn,
++ 			const struct mmu_notifier_range *range)
++ {
++ 	struct hmm_update update;
++ 	struct hmm *hmm = range->mm->hmm;
++ 
++ 	VM_BUG_ON(!hmm);
++ 
++ 	update.start = range->start;
++ 	update.end = range->end;
++ 	update.event = HMM_UPDATE_INVALIDATE;
++ 	update.blockable = true;
++ 	hmm_invalidate_range(hmm, false, &update);
++ }
++ 
++ static const struct mmu_notifier_ops hmm_mmu_notifier_ops = {
++ 	.release		= hmm_release,
++ 	.invalidate_range_start	= hmm_invalidate_range_start,
++ 	.invalidate_range_end	= hmm_invalidate_range_end,
++ };
++ 
++ /*
++  * hmm_mirror_register() - register a mirror against an mm
++  *
++  * @mirror: new mirror struct to register
++  * @mm: mm to register against
++  *
++  * To start mirroring a process address space, the device driver must register
++  * an HMM mirror struct.
++  *
++  * THE mm->mmap_sem MUST BE HELD IN WRITE MODE !
++  */
++ int hmm_mirror_register(struct hmm_mirror *mirror, struct mm_struct *mm)
++ {
++ 	/* Sanity check */
++ 	if (!mm || !mirror || !mirror->ops)
++ 		return -EINVAL;
++ 
++ again:
++ 	mirror->hmm = hmm_register(mm);
++ 	if (!mirror->hmm)
++ 		return -ENOMEM;
++ 
++ 	down_write(&mirror->hmm->mirrors_sem);
++ 	if (mirror->hmm->mm == NULL) {
++ 		/*
++ 		 * A racing hmm_mirror_unregister() is about to destroy the hmm
++ 		 * struct. Try again to allocate a new one.
++ 		 */
++ 		up_write(&mirror->hmm->mirrors_sem);
++ 		mirror->hmm = NULL;
++ 		goto again;
++ 	} else {
++ 		list_add(&mirror->list, &mirror->hmm->mirrors);
++ 		up_write(&mirror->hmm->mirrors_sem);
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(hmm_mirror_register);
++ 
++ /*
++  * hmm_mirror_unregister() - unregister a mirror
++  *
++  * @mirror: new mirror struct to register
++  *
++  * Stop mirroring a process address space, and cleanup.
++  */
++ void hmm_mirror_unregister(struct hmm_mirror *mirror)
++ {
++ 	bool should_unregister = false;
++ 	struct mm_struct *mm;
++ 	struct hmm *hmm;
++ 
++ 	if (mirror->hmm == NULL)
++ 		return;
++ 
++ 	hmm = mirror->hmm;
++ 	down_write(&hmm->mirrors_sem);
++ 	list_del_init(&mirror->list);
++ 	should_unregister = list_empty(&hmm->mirrors);
++ 	mirror->hmm = NULL;
++ 	mm = hmm->mm;
++ 	hmm->mm = NULL;
++ 	up_write(&hmm->mirrors_sem);
++ 
++ 	if (!should_unregister || mm == NULL)
++ 		return;
++ 
++ 	mmu_notifier_unregister_no_release(&hmm->mmu_notifier, mm);
++ 
++ 	spin_lock(&mm->page_table_lock);
++ 	if (mm->hmm == hmm)
++ 		mm->hmm = NULL;
++ 	spin_unlock(&mm->page_table_lock);
++ 
++ 	kfree(hmm);
++ }
++ EXPORT_SYMBOL(hmm_mirror_unregister);
++ 
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  struct hmm_vma_walk {
+  	struct hmm_range	*range;
+  	unsigned long		last;
+diff --cc mm/mmu_notifier.c
+index 4361d699fa34,74a7dc3d11c8..000000000000
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@@ -432,54 -167,59 +432,81 @@@ void __mmu_notifier_change_pte(struct m
+  	srcu_read_unlock(&srcu, id);
+  }
+  
+ -int __mmu_notifier_invalidate_range_start(struct mm_struct *mm,
+ -				  unsigned long start, unsigned long end,
+ -				  bool blockable)
+ +static void mn_itree_invalidate(struct mmu_notifier_mm *mmn_mm,
+ +				const struct mmu_notifier_range *range)
+ +{
+ +	struct mmu_interval_notifier *mni;
+ +	unsigned long cur_seq;
+ +
+ +	for (mni = mn_itree_inv_start_range(mmn_mm, range, &cur_seq); mni;
+ +	     mni = mn_itree_inv_next(mni, range)) {
+ +
+ +		mni->ops->invalidate(mni, range, cur_seq);
+ +	}
+ +}
+ +
+ +static void mn_hlist_invalidate_range_start(struct mmu_notifier_mm *mmn_mm,
+ +					    struct mmu_notifier_range *range)
+  {
++ 	struct mmu_notifier_range _range, *range = &_range;
+  	struct mmu_notifier *mn;
+ -	int ret = 0;
+  	int id;
+  
++ 	range->blockable = blockable;
++ 	range->start = start;
++ 	range->end = end;
++ 	range->mm = mm;
++ 
+  	id = srcu_read_lock(&srcu);
+ -	hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list, hlist) {
+ +	hlist_for_each_entry_rcu(mn, &mmn_mm->list, hlist) {
+  		if (mn->ops->invalidate_range_start) {
+++<<<<<<< HEAD
+ +			mn->ops->invalidate_range_start(mn, range->mm, range->start, range->end);
+++=======
++ 			int _ret = mn->ops->invalidate_range_start(mn, range);
++ 			if (_ret) {
++ 				pr_info("%pS callback failed with %d in %sblockable context.\n",
++ 						mn->ops->invalidate_range_start, _ret,
++ 						!blockable ? "non-" : "");
++ 				ret = _ret;
++ 			}
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  		}
+  	}
+  	srcu_read_unlock(&srcu, id);
+ +}
+  
+ -	return ret;
+ +void __mmu_notifier_invalidate_range_start(struct mmu_notifier_range *range)
+ +{
+ +	struct mmu_notifier_mm *mmn_mm = range->mm->mmu_notifier_mm;
+ +
+ +	if (mmn_mm->has_itree) {
+ +		mn_itree_invalidate(mmn_mm, range);
+ +	}
+ +	if (!hlist_empty(&mmn_mm->list))
+ +		mn_hlist_invalidate_range_start(mmn_mm, range);
+  }
+ -EXPORT_SYMBOL_GPL(__mmu_notifier_invalidate_range_start);
+  
+ -void __mmu_notifier_invalidate_range_end(struct mm_struct *mm,
+ -					 unsigned long start,
+ -					 unsigned long end,
+ -					 bool only_end)
+ +static void mn_hlist_invalidate_end(struct mmu_notifier_mm *mmn_mm,
+ +				    struct mmu_notifier_range *range,
+ +				    bool only_end)
+  {
++ 	struct mmu_notifier_range _range, *range = &_range;
+  	struct mmu_notifier *mn;
+  	int id;
+  
++ 	/*
++ 	 * The end call back will never be call if the start refused to go
++ 	 * through because of blockable was false so here assume that we
++ 	 * can block.
++ 	 */
++ 	range->blockable = true;
++ 	range->start = start;
++ 	range->end = end;
++ 	range->mm = mm;
++ 
+  	id = srcu_read_lock(&srcu);
+ -	hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list, hlist) {
+ +	hlist_for_each_entry_rcu(mn, &mmn_mm->list, hlist) {
+  		/*
+  		 * Call invalidate_range here too to avoid the need for the
+  		 * subsystem of having to register an invalidate_range_end
+@@@ -494,12 -234,9 +521,18 @@@
+  		 * already happen under page table lock.
+  		 */
+  		if (!only_end && mn->ops->invalidate_range)
+++<<<<<<< HEAD
+ +			mn->ops->invalidate_range(mn, range->mm,
+ +						  range->start,
+ +						  range->end);
+ +		if (mn->ops->invalidate_range_end) {
+ +			mn->ops->invalidate_range_end(mn, range->mm, range->start, range->end);
+ +		}
+++=======
++ 			mn->ops->invalidate_range(mn, mm, start, end);
++ 		if (mn->ops->invalidate_range_end)
++ 			mn->ops->invalidate_range_end(mn, range);
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  	}
+  	srcu_read_unlock(&srcu, id);
+  }
+diff --cc virt/kvm/kvm_main.c
+index 5bc5158b0adb,666d0155662d..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -477,10 -362,8 +477,15 @@@ static void kvm_mmu_notifier_change_pte
+  	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+ +static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						    struct mm_struct *mm,
+ +						    unsigned long start,
+ +						    unsigned long end)
+++=======
++ static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
++ 					const struct mmu_notifier_range *range)
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  {
+  	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+  	int need_tlb_flush = 0, idx;
+@@@ -493,31 -377,20 +498,44 @@@
+  	 * count is also read inside the mmu_lock critical section.
+  	 */
+  	kvm->mmu_notifier_count++;
+++<<<<<<< HEAD
+ +	if (likely(kvm->mmu_notifier_count == 1)) {
+ +		kvm->mmu_notifier_range_start = start;
+ +		kvm->mmu_notifier_range_end = end;
+ +	} else {
+ +		/*
+ +		 * Fully tracking multiple concurrent ranges has dimishing
+ +		 * returns. Keep things simple and just find the minimal range
+ +		 * which includes the current and new ranges. As there won't be
+ +		 * enough information to subtract a range after its invalidate
+ +		 * completes, any ranges invalidated concurrently will
+ +		 * accumulate and persist until all outstanding invalidates
+ +		 * complete.
+ +		 */
+ +		kvm->mmu_notifier_range_start =
+ +			min(kvm->mmu_notifier_range_start, start);
+ +		kvm->mmu_notifier_range_end =
+ +			max(kvm->mmu_notifier_range_end, end);
+ +	}
+ +	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end, 0);
+++=======
++ 	need_tlb_flush = kvm_unmap_hva_range(kvm, range->start, range->end);
++ 	need_tlb_flush |= kvm->tlbs_dirty;
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  	/* we've to flush the tlb before the pages can be freed */
+ -	if (need_tlb_flush)
+ +	if (need_tlb_flush || kvm->tlbs_dirty)
+  		kvm_flush_remote_tlbs(kvm);
+  
+++<<<<<<< HEAD
+ +	KVM_MMU_UNLOCK(kvm);
+++=======
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	ret = kvm_arch_mmu_notifier_invalidate_range(kvm, range->start,
++ 					range->end, range->blockable);
++ 
+++>>>>>>> 5d6527a784f7 (mm/mmu_notifier: use structure for invalidate_range_start/end callback)
+  	srcu_read_unlock(&kvm->srcu, idx);
+ -
+ -	return ret;
+  }
+  
+  static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_userptr.c
+* Unmerged path drivers/gpu/drm/radeon/radeon_mn.c
+* Unmerged path drivers/infiniband/core/umem_odp.c
+* Unmerged path drivers/infiniband/hw/hfi1/mmu_rb.c
+* Unmerged path drivers/misc/mic/scif/scif_dma.c
+* Unmerged path drivers/misc/sgi-gru/grutlbpurge.c
+* Unmerged path drivers/xen/gntdev.c
+* Unmerged path include/linux/mmu_notifier.h
+* Unmerged path mm/hmm.c
+* Unmerged path mm/mmu_notifier.c
+* Unmerged path virt/kvm/kvm_main.c
