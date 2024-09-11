@@ -218,6 +218,8 @@ static int ib_uverbs_get_context(struct uverbs_attr_bundle *attrs)
 	if (ret)
 		return ret;
 
+	if (!down_read_trylock(&file->hw_destroy_rwsem))
+		return -EIO;
 	mutex_lock(&file->ucontext_lock);
 	ib_dev = srcu_dereference(file->device->ib_dev,
 				  &file->device->disassociate_srcu);
@@ -289,7 +291,7 @@ static int ib_uverbs_get_context(struct uverbs_attr_bundle *attrs)
 	smp_store_release(&file->ucontext, ucontext);
 
 	mutex_unlock(&file->ucontext_lock);
-
+	up_read(&file->hw_destroy_rwsem);
 	return 0;
 
 err_file:
@@ -307,6 +309,7 @@ err_alloc:
 
 err:
 	mutex_unlock(&file->ucontext_lock);
+	up_read(&file->hw_destroy_rwsem);
 	return ret;
 }
 
