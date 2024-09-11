@@ -1,0 +1,153 @@
+x86/KVM/VMX: Add L1D MSR based flush
+
+jira LE-1907
+cve CVE-2018-3646
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 3fa045be4c720146b18a19cea7a767dc6ad5df94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/3fa045be.failed
+
+336996-Speculative-Execution-Side-Channel-Mitigations.pdf defines a new MSR
+(IA32_FLUSH_CMD aka 0x10B) which has similar write-only semantics to other
+MSRs defined in the document.
+
+The semantics of this MSR is to allow "finer granularity invalidation of
+caching structures than existing mechanisms like WBINVD. It will writeback
+and invalidate the L1 data cache, including all cachelines brought in by
+preceding instructions, without invalidating all caches (eg. L2 or
+LLC). Some processors may also invalidate the first level level instruction
+cache on a L1D_FLUSH command. The L1 data and instruction caches may be
+shared across the logical processors of a core."
+
+Use it instead of the loop based L1 flush algorithm.
+
+A copy of this document is available at
+   https://bugzilla.kernel.org/show_bug.cgi?id=199511
+
+[ tglx: Avoid allocating pages when the MSR is available ]
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 3fa045be4c720146b18a19cea7a767dc6ad5df94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 82f23cbd7f05,a1dbc17c7a03..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9925,6 -9563,51 +9925,54 @@@ static int vmx_handle_exit(struct kvm_v
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Software based L1D cache flush which is used when microcode providing
++  * the cache control MSR is not loaded.
++  *
++  * The L1D cache is 32 KiB on Nehalem and later microarchitectures, but to
++  * flush it is required to read in 64 KiB because the replacement algorithm
++  * is not exactly LRU. This could be sized at runtime via topology
++  * information but as all relevant affected CPUs have 32KiB L1D cache size
++  * there is no point in doing so.
++  */
++ #define L1D_CACHE_ORDER 4
++ static void *vmx_l1d_flush_pages;
++ 
++ static void __maybe_unused vmx_l1d_flush(void)
++ {
++ 	int size = PAGE_SIZE << L1D_CACHE_ORDER;
++ 
++ 	if (static_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
++ 		return;
++ 	}
++ 
++ 	asm volatile(
++ 		/* First ensure the pages are in the TLB */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lpopulate_tlb:\n\t"
++ 		"movzbl	(%[empty_zp], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$4096, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lpopulate_tlb\n\t"
++ 		"xorl	%%eax, %%eax\n\t"
++ 		"cpuid\n\t"
++ 		/* Now fill the cache */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lfill_cache:\n"
++ 		"movzbl	(%[empty_zp], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$64, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lfill_cache\n\t"
++ 		"lfence\n"
++ 		:: [empty_zp] "r" (vmx_l1d_flush_pages),
++ 		    [size] "r" (size)
++ 		: "eax", "ebx", "ecx", "edx");
++ }
++ 
+++>>>>>>> 3fa045be4c72 (x86/KVM/VMX: Add L1D MSR based flush)
+  static void update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+@@@ -13852,6 -13155,33 +13900,36 @@@ static struct kvm_x86_ops vmx_x86_ops _
+  	.enable_smi_window = enable_smi_window,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int __init vmx_setup_l1d_flush(void)
++ {
++ 	struct page *page;
++ 
++ 	if (vmentry_l1d_flush == VMENTER_L1D_FLUSH_NEVER ||
++ 	    !boot_cpu_has_bug(X86_BUG_L1TF))
++ 		return 0;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		page = alloc_pages(GFP_KERNEL, L1D_CACHE_ORDER);
++ 		if (!page)
++ 			return -ENOMEM;
++ 		vmx_l1d_flush_pages = page_address(page);
++ 	}
++ 
++ 	static_branch_enable(&vmx_l1d_should_flush);
++ 	return 0;
++ }
++ 
++ static void vmx_free_l1d_flush_pages(void)
++ {
++ 	if (vmx_l1d_flush_pages) {
++ 		free_pages((unsigned long)vmx_l1d_flush_pages, L1D_CACHE_ORDER);
++ 		vmx_l1d_flush_pages = NULL;
++ 	}
++ }
++ 
+++>>>>>>> 3fa045be4c72 (x86/KVM/VMX: Add L1D MSR based flush)
+  static int __init vmx_init(void)
+  {
+  	int r;
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 68b2c3150de1..0e7517089b80 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -76,6 +76,12 @@
+ 						    * control required.
+ 						    */
+ 
++#define MSR_IA32_FLUSH_CMD		0x0000010b
++#define L1D_FLUSH			(1 << 0)   /*
++						    * Writeback and invalidate the
++						    * L1 data cache.
++						    */
++
+ #define MSR_IA32_BBL_CR_CTL		0x00000119
+ #define MSR_IA32_BBL_CR_CTL3		0x0000011e
+ 
+* Unmerged path arch/x86/kvm/vmx.c
