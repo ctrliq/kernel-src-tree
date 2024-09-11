@@ -1,0 +1,164 @@
+KVM: arm64: Handle calls to prefixed hyp functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrew Scull <ascull@google.com>
+commit f50b6f6ae131b6ee7d5dd738961eda0c00b7f027
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f50b6f6a.failed
+
+Once hyp functions are moved to a hyp object, they will have prefixed symbols.
+This change declares and gets the address of the prefixed version for calls to
+the hyp functions.
+
+To aid migration, the hyp functions that have not yet moved have their prefixed
+versions aliased to their non-prefixed version. This begins with all the hyp
+functions being listed and will reduce to none of them once the migration is
+complete.
+
+	Signed-off-by: Andrew Scull <ascull@google.com>
+
+[David: Extracted kvm_call_hyp nVHE branches into own helper macros, added
+        comments around symbol aliases.]
+
+	Signed-off-by: David Brazdil <dbrazdil@google.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20200625131420.71444-6-dbrazdil@google.com
+(cherry picked from commit f50b6f6ae131b6ee7d5dd738961eda0c00b7f027)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/image-vars.h
+diff --cc arch/arm64/kernel/image-vars.h
+index 25a2a9b479c2,36444bac6a05..000000000000
+--- a/arch/arm64/kernel/image-vars.h
++++ b/arch/arm64/kernel/image-vars.h
+@@@ -48,4 -50,45 +48,47 @@@ __efistub_screen_info		= screen_info
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM
++ 
++ /*
++  * KVM nVHE code has its own symbol namespace prefixed with __kvm_nvhe_, to
++  * separate it from the kernel proper. The following symbols are legally
++  * accessed by it, therefore provide aliases to make them linkable.
++  * Do not include symbols which may not be safely accessed under hypervisor
++  * memory mappings.
++  */
++ 
++ #define KVM_NVHE_ALIAS(sym) __kvm_nvhe_##sym = sym;
++ 
++ /* Symbols defined in debug-sr.c (not yet compiled with nVHE build rules). */
++ KVM_NVHE_ALIAS(__kvm_get_mdcr_el2);
++ 
++ /* Symbols defined in switch.c (not yet compiled with nVHE build rules). */
++ KVM_NVHE_ALIAS(__kvm_vcpu_run_nvhe);
++ 
++ /* Symbols defined in sysreg-sr.c (not yet compiled with nVHE build rules). */
++ KVM_NVHE_ALIAS(__kvm_enable_ssbs);
++ 
++ /* Symbols defined in timer-sr.c (not yet compiled with nVHE build rules). */
++ KVM_NVHE_ALIAS(__kvm_timer_set_cntvoff);
++ 
++ /* Symbols defined in tlb.c (not yet compiled with nVHE build rules). */
++ KVM_NVHE_ALIAS(__kvm_flush_vm_context);
++ KVM_NVHE_ALIAS(__kvm_tlb_flush_local_vmid);
++ KVM_NVHE_ALIAS(__kvm_tlb_flush_vmid);
++ KVM_NVHE_ALIAS(__kvm_tlb_flush_vmid_ipa);
++ 
++ /* Symbols defined in vgic-v3-sr.c (not yet compiled with nVHE build rules). */
++ KVM_NVHE_ALIAS(__vgic_v3_get_ich_vtr_el2);
++ KVM_NVHE_ALIAS(__vgic_v3_init_lrs);
++ KVM_NVHE_ALIAS(__vgic_v3_read_vmcr);
++ KVM_NVHE_ALIAS(__vgic_v3_restore_aprs);
++ KVM_NVHE_ALIAS(__vgic_v3_save_aprs);
++ KVM_NVHE_ALIAS(__vgic_v3_write_vmcr);
++ 
++ #endif /* CONFIG_KVM */
++ 
+++>>>>>>> f50b6f6ae131 (KVM: arm64: Handle calls to prefixed hyp functions)
+  #endif /* __ARM64_KERNEL_IMAGE_VARS_H */
+diff --git a/arch/arm64/include/asm/kvm_asm.h b/arch/arm64/include/asm/kvm_asm.h
+index d8855ef14df1..31c8e7d99d32 100644
+--- a/arch/arm64/include/asm/kvm_asm.h
++++ b/arch/arm64/include/asm/kvm_asm.h
+@@ -51,6 +51,24 @@
+ 
+ #include <linux/mm.h>
+ 
++/*
++ * Translate name of a symbol defined in nVHE hyp to the name seen
++ * by kernel proper. All nVHE symbols are prefixed by the build system
++ * to avoid clashes with the VHE variants.
++ */
++#define kvm_nvhe_sym(sym)	__kvm_nvhe_##sym
++
++#define DECLARE_KVM_VHE_SYM(sym)	extern char sym[]
++#define DECLARE_KVM_NVHE_SYM(sym)	extern char kvm_nvhe_sym(sym)[]
++
++/*
++ * Define a pair of symbols sharing the same name but one defined in
++ * VHE and the other in nVHE hyp implementations.
++ */
++#define DECLARE_KVM_HYP_SYM(sym)		\
++	DECLARE_KVM_VHE_SYM(sym);		\
++	DECLARE_KVM_NVHE_SYM(sym)
++
+ /* Translate a kernel address of @sym into its equivalent linear mapping */
+ #define kvm_ksym_ref(sym)						\
+ 	({								\
+@@ -59,6 +77,7 @@
+ 			val = lm_alias(&sym);				\
+ 		val;							\
+ 	 })
++#define kvm_ksym_ref_nvhe(sym)	kvm_ksym_ref(kvm_nvhe_sym(sym))
+ 
+ struct kvm;
+ struct kvm_vcpu;
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index a4ff87839c1d..e7b17f6f9994 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -462,6 +462,18 @@ void kvm_arm_resume_guest(struct kvm *kvm);
+ 
+ u64 __kvm_call_hyp(void *hypfn, ...);
+ 
++#define kvm_call_hyp_nvhe(f, ...)					\
++	do {								\
++		DECLARE_KVM_NVHE_SYM(f);				\
++		__kvm_call_hyp(kvm_ksym_ref_nvhe(f), ##__VA_ARGS__);	\
++	} while(0)
++
++#define kvm_call_hyp_nvhe_ret(f, ...)					\
++	({								\
++		DECLARE_KVM_NVHE_SYM(f);				\
++		__kvm_call_hyp(kvm_ksym_ref_nvhe(f), ##__VA_ARGS__);	\
++	})
++
+ /*
+  * The couple of isb() below are there to guarantee the same behaviour
+  * on VHE as on !VHE, where the eret to EL1 acts as a context
+@@ -473,7 +485,7 @@ u64 __kvm_call_hyp(void *hypfn, ...);
+ 			f(__VA_ARGS__);					\
+ 			isb();						\
+ 		} else {						\
+-			__kvm_call_hyp(kvm_ksym_ref(f), ##__VA_ARGS__); \
++			kvm_call_hyp_nvhe(f, ##__VA_ARGS__);		\
+ 		}							\
+ 	} while(0)
+ 
+@@ -485,8 +497,7 @@ u64 __kvm_call_hyp(void *hypfn, ...);
+ 			ret = f(__VA_ARGS__);				\
+ 			isb();						\
+ 		} else {						\
+-			ret = __kvm_call_hyp(kvm_ksym_ref(f),		\
+-					     ##__VA_ARGS__);		\
++			ret = kvm_call_hyp_nvhe_ret(f, ##__VA_ARGS__);	\
+ 		}							\
+ 									\
+ 		ret;							\
+* Unmerged path arch/arm64/kernel/image-vars.h
