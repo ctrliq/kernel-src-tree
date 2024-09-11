@@ -56,7 +56,7 @@ static int __bpfilter_process_sockopt(struct sock *sk, int optname,
 	req.is_set = is_set;
 	req.pid = current->pid;
 	req.cmd = optname;
-	req.addr = (long)optval;
+	req.addr = (long __force __user)optval;
 	req.len = optlen;
 	mutex_lock(&bpfilter_lock);
 	if (!bpfilter_ops.info.pid)
@@ -98,7 +98,7 @@ static int start_umh(void)
 	pr_info("Loaded bpfilter_umh pid %d\n", bpfilter_ops.info.pid);
 
 	/* health check that usermode process started correctly */
-	if (__bpfilter_process_sockopt(NULL, 0, 0, 0, 0) != 0) {
+	if (__bpfilter_process_sockopt(NULL, 0, NULL, 0, 0) != 0) {
 		stop_umh();
 		return -EFAULT;
 	}
