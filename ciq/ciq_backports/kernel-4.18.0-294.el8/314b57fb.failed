@@ -1,0 +1,314 @@
+mm: balance LRU lists based on relative thrashing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 314b57fb0460001a090b35ff8be987f2c868ad3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/314b57fb.failed
+
+Since the LRUs were split into anon and file lists, the VM has been
+balancing between page cache and anonymous pages based on per-list ratios
+of scanned vs.  rotated pages.  In most cases that tips page reclaim
+towards the list that is easier to reclaim and has the fewest actively
+used pages, but there are a few problems with it:
+
+1. Refaults and LRU rotations are weighted the same way, even though
+   one costs IO and the other costs a bit of CPU.
+
+2. The less we scan an LRU list based on already observed rotations,
+   the more we increase the sampling interval for new references, and
+   rotations become even more likely on that list. This can enter a
+   death spiral in which we stop looking at one list completely until
+   the other one is all but annihilated by page reclaim.
+
+Since commit a528910e12ec ("mm: thrash detection-based file cache sizing")
+we have refault detection for the page cache.  Along with swapin events,
+they are good indicators of when the file or anon list, respectively, is
+too small for its workingset and needs to grow.
+
+For example, if the page cache is thrashing, the cache pages need more
+time in memory, while there may be colder pages on the anonymous list.
+Likewise, if swapped pages are faulting back in, it indicates that we
+reclaim anonymous pages too aggressively and should back off.
+
+Replace LRU rotations with refaults and swapins as the basis for relative
+reclaim cost of the two LRUs.  This will have the VM target list balances
+that incur the least amount of IO on aggregate.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+Link: http://lkml.kernel.org/r/20200520232525.798933-12-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 314b57fb0460001a090b35ff8be987f2c868ad3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swap.h
+#	mm/swap.c
+#	mm/swap_state.c
+#	mm/vmscan.c
+diff --cc include/linux/swap.h
+index 8552871db183,0b71bf75fb67..000000000000
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@@ -325,9 -334,8 +325,13 @@@ extern unsigned long nr_free_pagecache_
+  
+  
+  /* linux/mm/swap.c */
+++<<<<<<< HEAD
+++=======
++ extern void lru_note_cost(struct page *);
+++>>>>>>> 314b57fb0460 (mm: balance LRU lists based on relative thrashing)
+  extern void lru_cache_add(struct page *);
+ +extern void lru_cache_add_anon(struct page *page);
+ +extern void lru_cache_add_file(struct page *page);
+  extern void lru_add_page_tail(struct page *page, struct page *page_tail,
+  			 struct lruvec *lruvec, struct list_head *head);
+  extern void activate_page(struct page *);
+diff --cc mm/swap.c
+index 70728521e27e,2dc7d392642f..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -261,14 -278,15 +261,26 @@@ void rotate_reclaimable_page(struct pag
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void update_page_reclaim_stat(struct lruvec *lruvec,
+ +				     int file, int rotated)
+ +{
+ +	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+ +
+ +	reclaim_stat->recent_scanned[file]++;
+ +	if (rotated)
+ +		reclaim_stat->recent_rotated[file]++;
+++=======
++ void lru_note_cost(struct page *page)
++ {
++ 	struct lruvec *lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
++ 
++ 	/* Record new data point */
++ 	if (page_is_file_lru(page))
++ 		lruvec->file_cost++;
++ 	else
++ 		lruvec->anon_cost++;
+++>>>>>>> 314b57fb0460 (mm: balance LRU lists based on relative thrashing)
+  }
+  
+  static void __activate_page(struct page *page, struct lruvec *lruvec,
+diff --cc mm/swap_state.c
+index e2aded84261e,1cd0b345ff7e..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -430,47 -405,56 +430,83 @@@ struct page *__read_swap_cache_async(sw
+  		 * Swap entry may have been freed since our caller observed it.
+  		 */
+  		err = swapcache_prepare(entry);
+ -		if (!err)
+ +		if (err == -EEXIST) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * We might race against get_swap_page() and stumble
+ +			 * across a SWAP_HAS_CACHE swap_map entry whose page
+ +			 * has not been brought into the swapcache yet.
+ +			 */
+ +			cond_resched();
+ +			continue;
+ +		}
+ +		if (err) {		/* swp entry is obsolete ? */
+ +			radix_tree_preload_end();
+  			break;
+ +		}
+  
+ -		put_page(page);
+ -		if (err != -EEXIST)
+ -			return NULL;
+ -
+ +		/* May fail (-ENOMEM) if radix-tree node allocation failed. */
+ +		__SetPageLocked(new_page);
+ +		__SetPageSwapBacked(new_page);
+ +		err = __add_to_swap_cache(new_page, entry);
+ +		if (likely(!err)) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * Initiate read into locked page and return.
+ +			 */
+ +			SetPageWorkingset(new_page);
+ +			lru_cache_add_anon(new_page);
+ +			*new_page_allocated = true;
+ +			return new_page;
+ +		}
+ +		radix_tree_preload_end();
+ +		__ClearPageLocked(new_page);
+  		/*
+ -		 * We might race against __delete_from_swap_cache(), and
+ -		 * stumble across a swap_map entry whose SWAP_HAS_CACHE
+ -		 * has not yet been cleared.  Or race against another
+ -		 * __read_swap_cache_async(), which has set SWAP_HAS_CACHE
+ -		 * in swap_map, but not yet added its page to swap cache.
+ +		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
+ +		 * clear SWAP_HAS_CACHE flag.
+  		 */
+ -		cond_resched();
+ -	}
+ -
+ +		put_swap_page(new_page, entry);
+ +	} while (err != -ENOMEM);
+ +
+++<<<<<<< HEAD
+ +	if (new_page)
+ +		put_page(new_page);
+ +	return found_page;
+++=======
++ 	/*
++ 	 * The swap entry is ours to swap in. Prepare the new page.
++ 	 */
++ 
++ 	__SetPageLocked(page);
++ 	__SetPageSwapBacked(page);
++ 
++ 	/* May fail (-ENOMEM) if XArray node allocation failed. */
++ 	if (add_to_swap_cache(page, entry, gfp_mask & GFP_KERNEL)) {
++ 		put_swap_page(page, entry);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	if (mem_cgroup_charge(page, NULL, gfp_mask)) {
++ 		delete_from_swap_cache(page);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	/* XXX: Move to lru_cache_add() when it supports new vs putback */
++ 	spin_lock_irq(&page_pgdat(page)->lru_lock);
++ 	lru_note_cost(page);
++ 	spin_unlock_irq(&page_pgdat(page)->lru_lock);
++ 
++ 	/* Caller will initiate read into locked page */
++ 	SetPageWorkingset(page);
++ 	lru_cache_add(page);
++ 	*new_page_allocated = true;
++ 	return page;
++ 
++ fail_unlock:
++ 	unlock_page(page);
++ 	put_page(page);
++ 	return NULL;
+++>>>>>>> 314b57fb0460 (mm: balance LRU lists based on relative thrashing)
+  }
+  
+  /*
+diff --cc mm/vmscan.c
+index 709a0e80e054,76e823db21a7..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1933,16 -1955,14 +1933,22 @@@ shrink_inactive_list(unsigned long nr_t
+  
+  	spin_lock_irq(&pgdat->lru_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	move_pages_to_lru(lruvec, &page_list);
++ 
++ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+++>>>>>>> 314b57fb0460 (mm: balance LRU lists based on relative thrashing)
+  	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+ -	if (!cgroup_reclaim(sc))
+ +	if (global_reclaim(sc))
+  		__count_vm_events(item, nr_reclaimed);
+  	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+ -	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+ +	reclaim_stat->recent_rotated[0] += stat.nr_activate[0];
+ +	reclaim_stat->recent_rotated[1] += stat.nr_activate[1];
+ +
+ +	putback_inactive_pages(lruvec, &page_list);
+ +
+ +	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+  
+  	spin_unlock_irq(&pgdat->lru_lock);
+  
+@@@ -2121,16 -2073,9 +2127,19 @@@ static void shrink_active_list(unsigne
+  	 * Move pages back to the lru list.
+  	 */
+  	spin_lock_irq(&pgdat->lru_lock);
+++<<<<<<< HEAD
+ +	/*
+ +	 * Count referenced pages from currently used mappings as rotated,
+ +	 * even though only some of them are actually re-activated.  This
+ +	 * helps balance scan pressure between file and anonymous pages in
+ +	 * get_scan_count.
+ +	 */
+ +	reclaim_stat->recent_rotated[file] += nr_rotated;
+++=======
+++>>>>>>> 314b57fb0460 (mm: balance LRU lists based on relative thrashing)
+  
+ -	nr_activate = move_pages_to_lru(lruvec, &l_active);
+ -	nr_deactivate = move_pages_to_lru(lruvec, &l_inactive);
+ +	nr_activate = move_active_pages_to_lru(lruvec, &l_active, lru);
+ +	nr_deactivate = move_active_pages_to_lru(lruvec, &l_inactive, lru - LRU_ACTIVE);
+  	/* Keep all free pages in l_active list */
+  	list_splice(&l_inactive, &l_active);
+  
+@@@ -2425,26 -2312,17 +2435,31 @@@ static void get_scan_count(struct lruve
+  		lruvec_lru_size(lruvec, LRU_INACTIVE_FILE, MAX_NR_ZONES);
+  
+  	spin_lock_irq(&pgdat->lru_lock);
+ -	totalcost = lruvec->anon_cost + lruvec->file_cost;
+ -	if (unlikely(totalcost > (anon + file) / 4)) {
+ -		lruvec->anon_cost /= 2;
+ -		lruvec->file_cost /= 2;
+ -		totalcost /= 2;
+ +	if (unlikely(reclaim_stat->recent_scanned[0] > anon / 4)) {
+ +		reclaim_stat->recent_scanned[0] /= 2;
+ +		reclaim_stat->recent_rotated[0] /= 2;
+ +	}
+ +
+ +	if (unlikely(reclaim_stat->recent_scanned[1] > file / 4)) {
+ +		reclaim_stat->recent_scanned[1] /= 2;
+ +		reclaim_stat->recent_rotated[1] /= 2;
+  	}
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * The amount of pressure on anon vs file pages is inversely
+ +	 * proportional to the fraction of recently scanned pages on
+ +	 * each list that were recently referenced and in active use.
+ +	 */
+ +	ap = anon_prio * (reclaim_stat->recent_scanned[0] + 1);
+ +	ap /= reclaim_stat->recent_rotated[0] + 1;
+++=======
++ 	ap = anon_prio * (totalcost + 1);
++ 	ap /= lruvec->anon_cost + 1;
+++>>>>>>> 314b57fb0460 (mm: balance LRU lists based on relative thrashing)
+  
+ -	fp = file_prio * (totalcost + 1);
+ -	fp /= lruvec->file_cost + 1;
+ +	fp = file_prio * (reclaim_stat->recent_scanned[1] + 1);
+ +	fp /= reclaim_stat->recent_rotated[1] + 1;
+  	spin_unlock_irq(&pgdat->lru_lock);
+  
+  	fraction[0] = ap;
+* Unmerged path include/linux/swap.h
+* Unmerged path mm/swap.c
+* Unmerged path mm/swap_state.c
+* Unmerged path mm/vmscan.c
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 44c5c225f293..0e5666af5f98 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -365,6 +365,10 @@ void workingset_refault(struct page *page, void *shadow)
+ 	/* Page was active prior to eviction */
+ 	if (workingset) {
+ 		SetPageWorkingset(page);
++		/* XXX: Move to lru_cache_add() when it supports new vs putback */
++		spin_lock_irq(&page_pgdat(page)->lru_lock);
++		lru_note_cost(page);
++		spin_unlock_irq(&page_pgdat(page)->lru_lock);
+ 		inc_lruvec_state(lruvec, WORKINGSET_RESTORE);
+ 	}
+ out:
