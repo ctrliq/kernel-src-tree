@@ -1,0 +1,208 @@
+NFSv4: Add support for the NFSv4.2 "change_attr_type" attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 7f08a3359a3c1e39c2a118fbbe583d8c8db14ace
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/7f08a335.failed
+
+The change_attr_type allows the server to provide a description of how
+the change attribute will behave. This again will allow the client to
+optimise its behaviour w.r.t. attribute revalidation.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 7f08a3359a3c1e39c2a118fbbe583d8c8db14ace)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/nfs4.h
+diff --cc include/linux/nfs4.h
+index 686d3a6ef63a,15004c469807..000000000000
+--- a/include/linux/nfs4.h
++++ b/include/linux/nfs4.h
+@@@ -682,6 -686,38 +683,41 @@@ struct nfs4_op_map 
+  	} u;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs42_netaddr {
++ 	char		netid[RPCBIND_MAXNETIDLEN];
++ 	char		addr[RPCBIND_MAXUADDRLEN + 1];
++ 	u32		netid_len;
++ 	u32		addr_len;
++ };
++ 
++ enum netloc_type4 {
++ 	NL4_NAME		= 1,
++ 	NL4_URL			= 2,
++ 	NL4_NETADDR		= 3,
++ };
++ 
++ struct nl4_server {
++ 	enum netloc_type4	nl4_type;
++ 	union {
++ 		struct { /* NL4_NAME, NL4_URL */
++ 			int	nl4_str_sz;
++ 			char	nl4_str[NFS4_OPAQUE_LIMIT + 1];
++ 		};
++ 		struct nfs42_netaddr	nl4_addr; /* NL4_NETADDR */
++ 	} u;
++ };
++ 
++ enum nfs4_change_attr_type {
++ 	NFS4_CHANGE_TYPE_IS_MONOTONIC_INCR = 0,
++ 	NFS4_CHANGE_TYPE_IS_VERSION_COUNTER = 1,
++ 	NFS4_CHANGE_TYPE_IS_VERSION_COUNTER_NOPNFS = 2,
++ 	NFS4_CHANGE_TYPE_IS_TIME_METADATA = 3,
++ 	NFS4_CHANGE_TYPE_IS_UNDEFINED = 4,
++ };
++ 
+++>>>>>>> 7f08a3359a3c (NFSv4: Add support for the NFSv4.2 "change_attr_type" attribute)
+  /*
+   * Options for setxattr. These match the flags for setxattr(2).
+   */
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 801c79552d56..e2c2ad2a7317 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -794,6 +794,7 @@ static void nfs_server_set_fsinfo(struct nfs_server *server,
+ 	server->maxfilesize = fsinfo->maxfilesize;
+ 
+ 	server->time_delta = fsinfo->time_delta;
++	server->change_attr_type = fsinfo->change_attr_type;
+ 
+ 	server->clone_blksize = fsinfo->clone_blksize;
+ 	/* We're airborne Set socket buffersize */
+@@ -935,6 +936,8 @@ struct nfs_server *nfs_alloc_server(void)
+ 		return NULL;
+ 	}
+ 
++	server->change_attr_type = NFS4_CHANGE_TYPE_IS_UNDEFINED;
++
+ 	ida_init(&server->openowner_id);
+ 	ida_init(&server->lockowner_id);
+ 	pnfs_init_server(server);
+diff --git a/fs/nfs/nfs3xdr.c b/fs/nfs/nfs3xdr.c
+index abbebc47d61b..e6eca1d7481b 100644
+--- a/fs/nfs/nfs3xdr.c
++++ b/fs/nfs/nfs3xdr.c
+@@ -2227,6 +2227,7 @@ static int decode_fsinfo3resok(struct xdr_stream *xdr,
+ 
+ 	/* ignore properties */
+ 	result->lease_time = 0;
++	result->change_attr_type = NFS4_CHANGE_TYPE_IS_TIME_METADATA;
+ 	return 0;
+ }
+ 
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 599edfec3dbe..81d7913620bc 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -265,6 +265,7 @@ const u32 nfs4_fsinfo_bitmap[3] = { FATTR4_WORD0_MAXFILESIZE
+ 			| FATTR4_WORD1_FS_LAYOUT_TYPES,
+ 			FATTR4_WORD2_LAYOUT_BLKSIZE
+ 			| FATTR4_WORD2_CLONE_BLKSIZE
++			| FATTR4_WORD2_CHANGE_ATTR_TYPE
+ 			| FATTR4_WORD2_XATTR_SUPPORT
+ };
+ 
+diff --git a/fs/nfs/nfs4xdr.c b/fs/nfs/nfs4xdr.c
+index e8e4d2c7e914..2b766929b0b0 100644
+--- a/fs/nfs/nfs4xdr.c
++++ b/fs/nfs/nfs4xdr.c
+@@ -153,6 +153,7 @@ static int decode_layoutget(struct xdr_stream *xdr, struct rpc_rqst *req,
+ 				 5 /* fs layout types */ + \
+ 				 1 /* layout blksize */ + \
+ 				 1 /* clone blksize */ + \
++				 1 /* change attr type */ + \
+ 				 1 /* xattr support */)
+ #define encode_renew_maxsz	(op_encode_hdr_maxsz + 3)
+ #define decode_renew_maxsz	(op_decode_hdr_maxsz)
+@@ -4847,6 +4848,32 @@ static int decode_attr_clone_blksize(struct xdr_stream *xdr, uint32_t *bitmap,
+ 	return 0;
+ }
+ 
++static int decode_attr_change_attr_type(struct xdr_stream *xdr,
++					uint32_t *bitmap,
++					enum nfs4_change_attr_type *res)
++{
++	u32 tmp = NFS4_CHANGE_TYPE_IS_UNDEFINED;
++
++	dprintk("%s: bitmap is %x\n", __func__, bitmap[2]);
++	if (bitmap[2] & FATTR4_WORD2_CHANGE_ATTR_TYPE) {
++		if (xdr_stream_decode_u32(xdr, &tmp))
++			return -EIO;
++		bitmap[2] &= ~FATTR4_WORD2_CHANGE_ATTR_TYPE;
++	}
++
++	switch(tmp) {
++	case NFS4_CHANGE_TYPE_IS_MONOTONIC_INCR:
++	case NFS4_CHANGE_TYPE_IS_VERSION_COUNTER:
++	case NFS4_CHANGE_TYPE_IS_VERSION_COUNTER_NOPNFS:
++	case NFS4_CHANGE_TYPE_IS_TIME_METADATA:
++		*res = tmp;
++		break;
++	default:
++		*res = NFS4_CHANGE_TYPE_IS_UNDEFINED;
++	}
++	return 0;
++}
++
+ static int decode_fsinfo(struct xdr_stream *xdr, struct nfs_fsinfo *fsinfo)
+ {
+ 	unsigned int savep;
+@@ -4895,6 +4922,11 @@ static int decode_fsinfo(struct xdr_stream *xdr, struct nfs_fsinfo *fsinfo)
+ 	if (status)
+ 		goto xdr_error;
+ 
++	status = decode_attr_change_attr_type(xdr, bitmap,
++					      &fsinfo->change_attr_type);
++	if (status)
++		goto xdr_error;
++
+ 	status = decode_attr_xattrsupport(xdr, bitmap,
+ 					  &fsinfo->xattr_support);
+ 	if (status)
+diff --git a/fs/nfs/proc.c b/fs/nfs/proc.c
+index 73ab7c59d3a7..ea19dbf12301 100644
+--- a/fs/nfs/proc.c
++++ b/fs/nfs/proc.c
+@@ -91,6 +91,7 @@ nfs_proc_get_root(struct nfs_server *server, struct nfs_fh *fhandle,
+ 	info->dtpref = fsinfo.tsize;
+ 	info->maxfilesize = 0x7FFFFFFF;
+ 	info->lease_time = 0;
++	info->change_attr_type = NFS4_CHANGE_TYPE_IS_TIME_METADATA;
+ 	return 0;
+ }
+ 
+* Unmerged path include/linux/nfs4.h
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index 9381c29e8349..fbab3ddef616 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -178,6 +178,9 @@ struct nfs_server {
+ #define NFS_OPTION_FSCACHE	0x00000001	/* - local caching enabled */
+ #define NFS_OPTION_MIGRATION	0x00000002	/* - NFSv4 migration enabled */
+ 
++	enum nfs4_change_attr_type
++				change_attr_type;/* Description of change attribute */
++
+ 	struct nfs_fsid		fsid;
+ 	__u64			maxfilesize;	/* maximum file size */
+ 	struct timespec64	time_delta;	/* smallest time granularity */
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index c7415c60d283..e28a3932d10f 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -152,6 +152,8 @@ struct nfs_fsinfo {
+ 	__u32			layouttype[NFS_MAX_LAYOUT_TYPES]; /* supported pnfs layout driver */
+ 	__u32			blksize; /* preferred pnfs io block size */
+ 	__u32			clone_blksize; /* granularity of a CLONE operation */
++	enum nfs4_change_attr_type
++				change_attr_type; /* Info about change attr */
+ 	__u32			xattr_support; /* User xattrs supported */
+ };
+ 
