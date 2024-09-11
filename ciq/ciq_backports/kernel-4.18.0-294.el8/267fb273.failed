@@ -1,0 +1,247 @@
+perf: Reduce stack usage of perf_output_begin()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 267fb27352b6fc9fdbad753127a239f75618ecbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/267fb273.failed
+
+__perf_output_begin() has an on-stack struct perf_sample_data in the
+unlikely case it needs to generate a LOST record. However, every call
+to perf_output_begin() must already have a perf_sample_data on-stack.
+
+	Reported-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20201030151954.985416146@infradead.org
+(cherry picked from commit 267fb27352b6fc9fdbad753127a239f75618ecbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 1d66dada1434,fc681c7c1e03..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -8664,6 -8674,90 +8665,93 @@@ void perf_event_bpf_event(struct bpf_pr
+  	perf_iterate_sb(perf_event_bpf_output, &bpf_event, NULL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct perf_text_poke_event {
++ 	const void		*old_bytes;
++ 	const void		*new_bytes;
++ 	size_t			pad;
++ 	u16			old_len;
++ 	u16			new_len;
++ 
++ 	struct {
++ 		struct perf_event_header	header;
++ 
++ 		u64				addr;
++ 	} event_id;
++ };
++ 
++ static int perf_event_text_poke_match(struct perf_event *event)
++ {
++ 	return event->attr.text_poke;
++ }
++ 
++ static void perf_event_text_poke_output(struct perf_event *event, void *data)
++ {
++ 	struct perf_text_poke_event *text_poke_event = data;
++ 	struct perf_output_handle handle;
++ 	struct perf_sample_data sample;
++ 	u64 padding = 0;
++ 	int ret;
++ 
++ 	if (!perf_event_text_poke_match(event))
++ 		return;
++ 
++ 	perf_event_header__init_id(&text_poke_event->event_id.header, &sample, event);
++ 
++ 	ret = perf_output_begin(&handle, &sample, event,
++ 				text_poke_event->event_id.header.size);
++ 	if (ret)
++ 		return;
++ 
++ 	perf_output_put(&handle, text_poke_event->event_id);
++ 	perf_output_put(&handle, text_poke_event->old_len);
++ 	perf_output_put(&handle, text_poke_event->new_len);
++ 
++ 	__output_copy(&handle, text_poke_event->old_bytes, text_poke_event->old_len);
++ 	__output_copy(&handle, text_poke_event->new_bytes, text_poke_event->new_len);
++ 
++ 	if (text_poke_event->pad)
++ 		__output_copy(&handle, &padding, text_poke_event->pad);
++ 
++ 	perf_event__output_id_sample(event, &handle, &sample);
++ 
++ 	perf_output_end(&handle);
++ }
++ 
++ void perf_event_text_poke(const void *addr, const void *old_bytes,
++ 			  size_t old_len, const void *new_bytes, size_t new_len)
++ {
++ 	struct perf_text_poke_event text_poke_event;
++ 	size_t tot, pad;
++ 
++ 	if (!atomic_read(&nr_text_poke_events))
++ 		return;
++ 
++ 	tot  = sizeof(text_poke_event.old_len) + old_len;
++ 	tot += sizeof(text_poke_event.new_len) + new_len;
++ 	pad  = ALIGN(tot, sizeof(u64)) - tot;
++ 
++ 	text_poke_event = (struct perf_text_poke_event){
++ 		.old_bytes    = old_bytes,
++ 		.new_bytes    = new_bytes,
++ 		.pad          = pad,
++ 		.old_len      = old_len,
++ 		.new_len      = new_len,
++ 		.event_id  = {
++ 			.header = {
++ 				.type = PERF_RECORD_TEXT_POKE,
++ 				.misc = PERF_RECORD_MISC_KERNEL,
++ 				.size = sizeof(text_poke_event.event_id) + tot + pad,
++ 			},
++ 			.addr = (unsigned long)addr,
++ 		},
++ 	};
++ 
++ 	perf_iterate_sb(perf_event_text_poke_output, &text_poke_event, NULL);
++ }
++ 
+++>>>>>>> 267fb27352b6 (perf: Reduce stack usage of perf_output_begin())
+  void perf_event_itrace_started(struct perf_event *event)
+  {
+  	event->attach_state |= PERF_ATTACH_ITRACE;
+diff --git a/arch/powerpc/perf/imc-pmu.c b/arch/powerpc/perf/imc-pmu.c
+index 495a91f808e2..429a559b803f 100644
+--- a/arch/powerpc/perf/imc-pmu.c
++++ b/arch/powerpc/perf/imc-pmu.c
+@@ -1340,7 +1340,7 @@ static void dump_trace_imc_data(struct perf_event *event)
+ 			/* If this is a valid record, create the sample */
+ 			struct perf_output_handle handle;
+ 
+-			if (perf_output_begin(&handle, event, header.size))
++			if (perf_output_begin(&handle, &data, event, header.size))
+ 				return;
+ 
+ 			perf_output_sample(&handle, &header, &data, event);
+diff --git a/arch/s390/kernel/perf_cpum_sf.c b/arch/s390/kernel/perf_cpum_sf.c
+index 1b959d2e08dd..b371a68be5e6 100644
+--- a/arch/s390/kernel/perf_cpum_sf.c
++++ b/arch/s390/kernel/perf_cpum_sf.c
+@@ -661,7 +661,7 @@ static void cpumsf_output_event_pid(struct perf_event *event,
+ 	rcu_read_lock();
+ 
+ 	perf_prepare_sample(&header, data, event, regs);
+-	if (perf_output_begin(&handle, event, header.size))
++	if (perf_output_begin(&handle, data, event, header.size))
+ 		goto out;
+ 
+ 	/* Update the process ID (see also kernel/events/core.c) */
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index 5c282aff6f3d..4c7689729bdf 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -642,8 +642,8 @@ int intel_pmu_drain_bts_buffer(void)
+ 	rcu_read_lock();
+ 	perf_prepare_sample(&header, &data, event, &regs);
+ 
+-	if (perf_output_begin(&handle, event, header.size *
+-			      (top - base - skip)))
++	if (perf_output_begin(&handle, &data, event,
++			      header.size * (top - base - skip)))
+ 		goto unlock;
+ 
+ 	for (at = base; at < top; at++) {
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index b1ac9c8c629e..5a62873aef4a 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1374,11 +1374,14 @@ perf_event_addr_filters(struct perf_event *event)
+ extern void perf_event_addr_filters_sync(struct perf_event *event);
+ 
+ extern int perf_output_begin(struct perf_output_handle *handle,
++			     struct perf_sample_data *data,
+ 			     struct perf_event *event, unsigned int size);
+ extern int perf_output_begin_forward(struct perf_output_handle *handle,
+-				    struct perf_event *event,
+-				    unsigned int size);
++				     struct perf_sample_data *data,
++				     struct perf_event *event,
++				     unsigned int size);
+ extern int perf_output_begin_backward(struct perf_output_handle *handle,
++				      struct perf_sample_data *data,
+ 				      struct perf_event *event,
+ 				      unsigned int size);
+ 
+* Unmerged path kernel/events/core.c
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 192b8abc6330..ef91ae75ca56 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -147,6 +147,7 @@ ring_buffer_has_space(unsigned long head, unsigned long tail,
+ 
+ static __always_inline int
+ __perf_output_begin(struct perf_output_handle *handle,
++		    struct perf_sample_data *data,
+ 		    struct perf_event *event, unsigned int size,
+ 		    bool backward)
+ {
+@@ -237,18 +238,16 @@ __perf_output_begin(struct perf_output_handle *handle,
+ 	handle->size = (1UL << page_shift) - offset;
+ 
+ 	if (unlikely(have_lost)) {
+-		struct perf_sample_data sample_data;
+-
+ 		lost_event.header.size = sizeof(lost_event);
+ 		lost_event.header.type = PERF_RECORD_LOST;
+ 		lost_event.header.misc = 0;
+ 		lost_event.id          = event->id;
+ 		lost_event.lost        = local_xchg(&rb->lost, 0);
+ 
+-		perf_event_header__init_id(&lost_event.header,
+-					   &sample_data, event);
++		/* XXX mostly redundant; @data is already fully initializes */
++		perf_event_header__init_id(&lost_event.header, data, event);
+ 		perf_output_put(handle, lost_event);
+-		perf_event__output_id_sample(event, handle, &sample_data);
++		perf_event__output_id_sample(event, handle, data);
+ 	}
+ 
+ 	return 0;
+@@ -263,22 +262,25 @@ __perf_output_begin(struct perf_output_handle *handle,
+ }
+ 
+ int perf_output_begin_forward(struct perf_output_handle *handle,
+-			     struct perf_event *event, unsigned int size)
++			      struct perf_sample_data *data,
++			      struct perf_event *event, unsigned int size)
+ {
+-	return __perf_output_begin(handle, event, size, false);
++	return __perf_output_begin(handle, data, event, size, false);
+ }
+ 
+ int perf_output_begin_backward(struct perf_output_handle *handle,
++			       struct perf_sample_data *data,
+ 			       struct perf_event *event, unsigned int size)
+ {
+-	return __perf_output_begin(handle, event, size, true);
++	return __perf_output_begin(handle, data, event, size, true);
+ }
+ 
+ int perf_output_begin(struct perf_output_handle *handle,
++		      struct perf_sample_data *data,
+ 		      struct perf_event *event, unsigned int size)
+ {
+ 
+-	return __perf_output_begin(handle, event, size,
++	return __perf_output_begin(handle, data, event, size,
+ 				   unlikely(is_write_backward(event)));
+ }
+ 
