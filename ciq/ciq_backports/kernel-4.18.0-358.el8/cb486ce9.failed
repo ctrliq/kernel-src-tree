@@ -1,0 +1,329 @@
+net: bridge: mcast: querier and query state affect only current context type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit cb486ce99576741a84c75623daeffb2f7758cbf9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/cb486ce9.failed
+
+It is a minor optimization and better behaviour to make sure querier and
+query sending routines affect only the matching multicast context
+depending if vlan snooping is enabled (vlan ctx vs bridge ctx).
+It also avoids sending unnecessary extra query packets.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cb486ce99576741a84c75623daeffb2f7758cbf9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+diff --cc net/bridge/br_multicast.c
+index def6f1840985,f30c2e5d3142..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -1046,9 -1628,13 +1046,16 @@@ static void __br_multicast_send_query(s
+  	struct sk_buff *skb;
+  	u8 igmp_type;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!br_multicast_ctx_should_use(brmctx, pmctx) ||
++ 	    !br_multicast_ctx_matches_vlan_snooping(brmctx))
++ 		return;
++ 
+++>>>>>>> cb486ce99576 (net: bridge: mcast: querier and query state affect only current context type)
+  again_under_lmqt:
+ -	skb = br_multicast_alloc_query(brmctx, pmctx, pg, ip_dst, group,
+ -				       with_srcs, over_lmqt, sflag, &igmp_type,
+ +	skb = br_multicast_alloc_query(br, pg, ip_dst, group, with_srcs,
+ +				       over_lmqt, sflag, &igmp_type,
+  				       need_rexmit);
+  	if (!skb)
+  		return;
+@@@ -2911,23 -3849,189 +2918,76 @@@ static void __br_multicast_open(struct 
+  	mod_timer(&query->timer, jiffies);
+  }
+  
+ -static void __br_multicast_open(struct net_bridge_mcast *brmctx)
+ -{
+ -	__br_multicast_open_query(brmctx->br, &brmctx->ip4_own_query);
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	__br_multicast_open_query(brmctx->br, &brmctx->ip6_own_query);
+ -#endif
+ -}
+ -
+  void br_multicast_open(struct net_bridge *br)
+  {
+++<<<<<<< HEAD
+ +	__br_multicast_open(br, &br->ip4_own_query);
+++=======
++ 	ASSERT_RTNL();
++ 
++ 	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED)) {
++ 		struct net_bridge_vlan_group *vg;
++ 		struct net_bridge_vlan *vlan;
++ 
++ 		vg = br_vlan_group(br);
++ 		if (vg) {
++ 			list_for_each_entry(vlan, &vg->vlan_list, vlist) {
++ 				struct net_bridge_mcast *brmctx;
++ 
++ 				brmctx = &vlan->br_mcast_ctx;
++ 				if (br_vlan_is_brentry(vlan) &&
++ 				    !br_multicast_ctx_vlan_disabled(brmctx))
++ 					__br_multicast_open(&vlan->br_mcast_ctx);
++ 			}
++ 		}
++ 	} else {
++ 		__br_multicast_open(&br->multicast_ctx);
++ 	}
++ }
++ 
++ static void __br_multicast_stop(struct net_bridge_mcast *brmctx)
++ {
++ 	del_timer_sync(&brmctx->ip4_mc_router_timer);
++ 	del_timer_sync(&brmctx->ip4_other_query.timer);
++ 	del_timer_sync(&brmctx->ip4_own_query.timer);
+++>>>>>>> cb486ce99576 (net: bridge: mcast: querier and query state affect only current context type)
+  #if IS_ENABLED(CONFIG_IPV6)
+ -	del_timer_sync(&brmctx->ip6_mc_router_timer);
+ -	del_timer_sync(&brmctx->ip6_other_query.timer);
+ -	del_timer_sync(&brmctx->ip6_own_query.timer);
+ +	__br_multicast_open(br, &br->ip6_own_query);
+  #endif
+  }
+  
+ -void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on)
+ -{
+ -	struct net_bridge *br;
+ -
+ -	/* it's okay to check for the flag without the multicast lock because it
+ -	 * can only change under RTNL -> multicast_lock, we need the latter to
+ -	 * sync with timers and packets
+ -	 */
+ -	if (on == !!(vlan->priv_flags & BR_VLFLAG_MCAST_ENABLED))
+ -		return;
+ -
+ -	if (br_vlan_is_master(vlan)) {
+ -		br = vlan->br;
+ -
+ -		if (!br_vlan_is_brentry(vlan) ||
+ -		    (on &&
+ -		     br_multicast_ctx_vlan_global_disabled(&vlan->br_mcast_ctx)))
+ -			return;
+ -
+ -		spin_lock_bh(&br->multicast_lock);
+ -		vlan->priv_flags ^= BR_VLFLAG_MCAST_ENABLED;
+ -		spin_unlock_bh(&br->multicast_lock);
+ -
+ -		if (on)
+ -			__br_multicast_open(&vlan->br_mcast_ctx);
+ -		else
+ -			__br_multicast_stop(&vlan->br_mcast_ctx);
+ -	} else {
+ -		struct net_bridge_mcast *brmctx;
+ -
+ -		brmctx = br_multicast_port_ctx_get_global(&vlan->port_mcast_ctx);
+ -		if (on && br_multicast_ctx_vlan_global_disabled(brmctx))
+ -			return;
+ -
+ -		br = vlan->port->br;
+ -		spin_lock_bh(&br->multicast_lock);
+ -		vlan->priv_flags ^= BR_VLFLAG_MCAST_ENABLED;
+ -		if (on)
+ -			__br_multicast_enable_port_ctx(&vlan->port_mcast_ctx);
+ -		else
+ -			__br_multicast_disable_port_ctx(&vlan->port_mcast_ctx);
+ -		spin_unlock_bh(&br->multicast_lock);
+ -	}
+ -}
+ -
+ -void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan, bool on)
+ -{
+ -	struct net_bridge_port *p;
+ -
+ -	if (WARN_ON_ONCE(!br_vlan_is_master(vlan)))
+ -		return;
+ -
+ -	list_for_each_entry(p, &vlan->br->port_list, list) {
+ -		struct net_bridge_vlan *vport;
+ -
+ -		vport = br_vlan_find(nbp_vlan_group(p), vlan->vid);
+ -		if (!vport)
+ -			continue;
+ -		br_multicast_toggle_one_vlan(vport, on);
+ -	}
+ -}
+ -
+ -int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
+ -				      struct netlink_ext_ack *extack)
+ -{
+ -	struct net_bridge_vlan_group *vg;
+ -	struct net_bridge_vlan *vlan;
+ -	struct net_bridge_port *p;
+ -
+ -	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED) == on)
+ -		return 0;
+ -
+ -	if (on && !br_opt_get(br, BROPT_VLAN_ENABLED)) {
+ -		NL_SET_ERR_MSG_MOD(extack, "Cannot enable multicast vlan snooping with vlan filtering disabled");
+ -		return -EINVAL;
+ -	}
+ -
+ -	vg = br_vlan_group(br);
+ -	if (!vg)
+ -		return 0;
+ -
+ -	br_opt_toggle(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED, on);
+ -
+ -	/* disable/enable non-vlan mcast contexts based on vlan snooping */
+ -	if (on)
+ -		__br_multicast_stop(&br->multicast_ctx);
+ -	else
+ -		__br_multicast_open(&br->multicast_ctx);
+ -	list_for_each_entry(p, &br->port_list, list) {
+ -		if (on)
+ -			br_multicast_disable_port(p);
+ -		else
+ -			br_multicast_enable_port(p);
+ -	}
+ -
+ -	list_for_each_entry(vlan, &vg->vlan_list, vlist)
+ -		br_multicast_toggle_vlan(vlan, on);
+ -
+ -	return 0;
+ -}
+ -
+ -bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on)
+ -{
+ -	ASSERT_RTNL();
+ -
+ -	/* BR_VLFLAG_GLOBAL_MCAST_ENABLED relies on eventual consistency and
+ -	 * requires only RTNL to change
+ -	 */
+ -	if (on == !!(vlan->priv_flags & BR_VLFLAG_GLOBAL_MCAST_ENABLED))
+ -		return false;
+ -
+ -	vlan->priv_flags ^= BR_VLFLAG_GLOBAL_MCAST_ENABLED;
+ -	br_multicast_toggle_vlan(vlan, on);
+ -
+ -	return true;
+ -}
+ -
+  void br_multicast_stop(struct net_bridge *br)
+  {
+++<<<<<<< HEAD
+ +	del_timer_sync(&br->multicast_router_timer);
+ +	del_timer_sync(&br->ip4_other_query.timer);
+ +	del_timer_sync(&br->ip4_own_query.timer);
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	del_timer_sync(&br->ip6_other_query.timer);
+ +	del_timer_sync(&br->ip6_own_query.timer);
+ +#endif
+++=======
++ 	ASSERT_RTNL();
++ 
++ 	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED)) {
++ 		struct net_bridge_vlan_group *vg;
++ 		struct net_bridge_vlan *vlan;
++ 
++ 		vg = br_vlan_group(br);
++ 		if (vg) {
++ 			list_for_each_entry(vlan, &vg->vlan_list, vlist) {
++ 				struct net_bridge_mcast *brmctx;
++ 
++ 				brmctx = &vlan->br_mcast_ctx;
++ 				if (br_vlan_is_brentry(vlan) &&
++ 				    !br_multicast_ctx_vlan_disabled(brmctx))
++ 					__br_multicast_stop(&vlan->br_mcast_ctx);
++ 			}
++ 		}
++ 	} else {
++ 		__br_multicast_stop(&br->multicast_ctx);
++ 	}
+++>>>>>>> cb486ce99576 (net: bridge: mcast: querier and query state affect only current context type)
+  }
+  
+  void br_multicast_dev_del(struct net_bridge *br)
+@@@ -3037,19 -4176,45 +3097,26 @@@ static void br_multicast_start_querier(
+  {
+  	struct net_bridge_port *port;
+  
+++<<<<<<< HEAD
+ +	__br_multicast_open(br, query);
+++=======
++ 	if (!br_multicast_ctx_matches_vlan_snooping(brmctx))
++ 		return;
++ 
++ 	__br_multicast_open_query(brmctx->br, query);
+++>>>>>>> cb486ce99576 (net: bridge: mcast: querier and query state affect only current context type)
+  
+  	rcu_read_lock();
+ -	list_for_each_entry_rcu(port, &brmctx->br->port_list, list) {
+ -		struct bridge_mcast_own_query *ip4_own_query;
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -		struct bridge_mcast_own_query *ip6_own_query;
+ -#endif
+ -
+ -		if (br_multicast_port_ctx_state_stopped(&port->multicast_ctx))
+ +	list_for_each_entry_rcu(port, &br->port_list, list) {
+ +		if (port->state == BR_STATE_DISABLED ||
+ +		    port->state == BR_STATE_BLOCKING)
+  			continue;
+  
+ -		if (br_multicast_ctx_is_vlan(brmctx)) {
+ -			struct net_bridge_vlan *vlan;
+ -
+ -			vlan = br_vlan_find(nbp_vlan_group(port), brmctx->vlan->vid);
+ -			if (!vlan ||
+ -			    br_multicast_port_ctx_state_stopped(&vlan->port_mcast_ctx))
+ -				continue;
+ -
+ -			ip4_own_query = &vlan->port_mcast_ctx.ip4_own_query;
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -			ip6_own_query = &vlan->port_mcast_ctx.ip6_own_query;
+ -#endif
+ -		} else {
+ -			ip4_own_query = &port->multicast_ctx.ip4_own_query;
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -			ip6_own_query = &port->multicast_ctx.ip6_own_query;
+ -#endif
+ -		}
+ -
+ -		if (query == &brmctx->ip4_own_query)
+ -			br_multicast_enable(ip4_own_query);
+ +		if (query == &br->ip4_own_query)
+ +			br_multicast_enable(&port->ip4_own_query);
+  #if IS_ENABLED(CONFIG_IPV6)
+  		else
+ -			br_multicast_enable(ip6_own_query);
+ +			br_multicast_enable(&port->ip6_own_query);
+  #endif
+  	}
+  	rcu_read_unlock();
+* Unmerged path net/bridge/br_multicast.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 30e07225bc94..409acdc4f8bf 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -834,6 +834,17 @@ static inline unsigned long br_multicast_gmi(const struct net_bridge *br)
+ 	return 2 * br->multicast_query_interval +
+ 	       br->multicast_query_response_interval;
+ }
++
++static inline bool
++br_multicast_ctx_matches_vlan_snooping(const struct net_bridge_mcast *brmctx)
++{
++	bool vlan_snooping_enabled;
++
++	vlan_snooping_enabled = !!br_opt_get(brmctx->br,
++					     BROPT_MCAST_VLAN_SNOOPING_ENABLED);
++
++	return !!(vlan_snooping_enabled == br_multicast_ctx_is_vlan(brmctx));
++}
+ #else
+ static inline int br_multicast_rcv(struct net_bridge *br,
+ 				   struct net_bridge_port *port,
