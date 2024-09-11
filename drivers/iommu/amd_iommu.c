@@ -1407,6 +1407,8 @@ static u64 *fetch_pte(struct protection_domain *domain,
 	int level;
 	u64 *pte;
 
+	*page_size = 0;
+
 	if (address > PM_LEVEL_SIZE(domain->mode))
 		return NULL;
 
