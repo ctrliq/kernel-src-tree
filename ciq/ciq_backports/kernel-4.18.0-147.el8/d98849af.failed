@@ -1,0 +1,167 @@
+dma-direct: handle DMA_ATTR_NO_KERNEL_MAPPING in common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit d98849aff87911013aadb730138ab728b52fc547
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d98849af.failed
+
+DMA_ATTR_NO_KERNEL_MAPPING is generally implemented by allocating
+normal cacheable pages or CMA memory, and then returning the page
+pointer as the opaque handle.  Lift that code from the xtensa and
+generic dma remapping implementations into the generic dma-direct
+code so that we don't even call arch_dma_alloc for these allocations.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit d98849aff87911013aadb730138ab728b52fc547)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/xtensa/kernel/pci-dma.c
+#	include/linux/dma-noncoherent.h
+diff --cc arch/xtensa/kernel/pci-dma.c
+index a02dc563d290,206771277dff..000000000000
+--- a/arch/xtensa/kernel/pci-dma.c
++++ b/arch/xtensa/kernel/pci-dma.c
+@@@ -161,27 -181,19 +161,32 @@@ static void *xtensa_dma_alloc(struct de
+  		return p;
+  	}
+  #endif
+ -	BUG_ON(!platform_vaddr_cached(page_address(page)));
+ -	__invalidate_dcache_range((unsigned long)page_address(page), size);
+ -	return platform_vaddr_to_uncached(page_address(page));
+ +	ret = (unsigned long)page_address(page);
+ +	BUG_ON(ret < XCHAL_KSEG_CACHED_VADDR ||
+ +	       ret > XCHAL_KSEG_CACHED_VADDR + XCHAL_KSEG_SIZE - 1);
+ +
+ +	uncached = ret + XCHAL_KSEG_BYPASS_VADDR - XCHAL_KSEG_CACHED_VADDR;
+ +	__invalidate_dcache_range(ret, size);
+ +
+ +	return (void *)uncached;
+  }
+  
+ -void arch_dma_free(struct device *dev, size_t size, void *vaddr,
+ -		dma_addr_t dma_handle, unsigned long attrs)
+ +static void xtensa_dma_free(struct device *dev, size_t size, void *vaddr,
+ +			    dma_addr_t dma_handle, unsigned long attrs)
+  {
+  	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
+ +	unsigned long addr = (unsigned long)vaddr;
+  	struct page *page;
+  
+++<<<<<<< HEAD
+ +	if (addr >= XCHAL_KSEG_BYPASS_VADDR &&
+ +	    addr - XCHAL_KSEG_BYPASS_VADDR < XCHAL_KSEG_SIZE) {
+ +		addr += XCHAL_KSEG_CACHED_VADDR - XCHAL_KSEG_BYPASS_VADDR;
+ +		page = virt_to_page(addr);
+++=======
++ 	if (platform_vaddr_uncached(vaddr)) {
++ 		page = virt_to_page(platform_vaddr_to_cached(vaddr));
+++>>>>>>> d98849aff879 (dma-direct: handle DMA_ATTR_NO_KERNEL_MAPPING in common code)
+  	} else {
+  #ifdef CONFIG_MMU
+  		dma_common_free_remap(vaddr, size, VM_MAP);
+diff --cc include/linux/dma-noncoherent.h
+index 69b36ed31a99,53ee36ecdf37..000000000000
+--- a/include/linux/dma-noncoherent.h
++++ b/include/linux/dma-noncoherent.h
+@@@ -20,6 -20,22 +20,25 @@@ static inline bool dev_is_dma_coherent(
+  }
+  #endif /* CONFIG_ARCH_HAS_DMA_COHERENCE_H */
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Check if an allocation needs to be marked uncached to be coherent.
++  */
++ static inline bool dma_alloc_need_uncached(struct device *dev,
++ 		unsigned long attrs)
++ {
++ 	if (dev_is_dma_coherent(dev))
++ 		return false;
++ 	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING)
++ 		return false;
++ 	if (IS_ENABLED(CONFIG_DMA_NONCOHERENT_CACHE_SYNC) &&
++ 	    (attrs & DMA_ATTR_NON_CONSISTENT))
++ 		return false;
++ 	return true;
++ }
++ 
+++>>>>>>> d98849aff879 (dma-direct: handle DMA_ATTR_NO_KERNEL_MAPPING in common code)
+  void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+  		gfp_t gfp, unsigned long attrs);
+  void arch_dma_free(struct device *dev, size_t size, void *cpu_addr,
+* Unmerged path arch/xtensa/kernel/pci-dma.c
+* Unmerged path include/linux/dma-noncoherent.h
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index 26bb7b9a7670..696c88b9da3f 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -139,6 +139,14 @@ void *dma_direct_alloc_pages(struct device *dev, size_t size,
+ 	if (!page)
+ 		return NULL;
+ 
++	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING) {
++		/* remove any dirty cache lines on the kernel alias */
++		if (!PageHighMem(page))
++			arch_dma_prep_coherent(page, size);
++		/* return the page pointer as the opaque cookie */
++		return page;
++	}
++
+ 	if (PageHighMem(page)) {
+ 		/*
+ 		 * Depending on the cma= arguments and per-arch setup
+@@ -172,6 +180,12 @@ void dma_direct_free_pages(struct device *dev, size_t size, void *cpu_addr,
+ {
+ 	unsigned int page_order = get_order(size);
+ 
++	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING) {
++		/* cpu_addr is a struct page cookie, not a kernel address */
++		__dma_direct_free_pages(dev, size, cpu_addr);
++		return;
++	}
++
+ 	if (force_dma_unencrypted())
+ 		set_memory_encrypted((unsigned long)cpu_addr, 1 << page_order);
+ 	__dma_direct_free_pages(dev, size, virt_to_page(cpu_addr));
+diff --git a/kernel/dma/remap.c b/kernel/dma/remap.c
+index 0207e3764d52..a594aec07882 100644
+--- a/kernel/dma/remap.c
++++ b/kernel/dma/remap.c
+@@ -202,8 +202,7 @@ void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 
+ 	size = PAGE_ALIGN(size);
+ 
+-	if (!gfpflags_allow_blocking(flags) &&
+-	    !(attrs & DMA_ATTR_NO_KERNEL_MAPPING)) {
++	if (!gfpflags_allow_blocking(flags)) {
+ 		ret = dma_alloc_from_pool(size, &page, flags);
+ 		if (!ret)
+ 			return NULL;
+@@ -217,11 +216,6 @@ void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 	/* remove any dirty cache lines on the kernel alias */
+ 	arch_dma_prep_coherent(page, size);
+ 
+-	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING) {
+-		ret = page; /* opaque cookie */
+-		goto done;
+-	}
+-
+ 	/* create a coherent mapping */
+ 	ret = dma_common_contiguous_remap(page, size, VM_USERMAP,
+ 			arch_dma_mmap_pgprot(dev, PAGE_KERNEL, attrs),
+@@ -240,10 +234,7 @@ void *arch_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ void arch_dma_free(struct device *dev, size_t size, void *vaddr,
+ 		dma_addr_t dma_handle, unsigned long attrs)
+ {
+-	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING) {
+-		/* vaddr is a struct page cookie, not a kernel address */
+-		__dma_direct_free_pages(dev, size, vaddr);
+-	} else if (!dma_free_from_pool(vaddr, PAGE_ALIGN(size))) {
++	if (!dma_free_from_pool(vaddr, PAGE_ALIGN(size))) {
+ 		phys_addr_t phys = dma_to_phys(dev, dma_handle);
+ 		struct page *page = pfn_to_page(__phys_to_pfn(phys));
+ 
