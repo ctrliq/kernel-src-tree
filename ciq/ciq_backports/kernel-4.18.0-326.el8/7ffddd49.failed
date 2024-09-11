@@ -1,0 +1,108 @@
+mm: hugetlb: fix a race between freeing and dissolving the page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Muchun Song <songmuchun@bytedance.com>
+commit 7ffddd499ba6122b1a07828f023d1d67629aa017
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/7ffddd49.failed
+
+There is a race condition between __free_huge_page()
+and dissolve_free_huge_page().
+
+  CPU0:                         CPU1:
+
+  // page_count(page) == 1
+  put_page(page)
+    __free_huge_page(page)
+                                dissolve_free_huge_page(page)
+                                  spin_lock(&hugetlb_lock)
+                                  // PageHuge(page) && !page_count(page)
+                                  update_and_free_page(page)
+                                  // page is freed to the buddy
+                                  spin_unlock(&hugetlb_lock)
+      spin_lock(&hugetlb_lock)
+      clear_page_huge_active(page)
+      enqueue_huge_page(page)
+      // It is wrong, the page is already freed
+      spin_unlock(&hugetlb_lock)
+
+The race window is between put_page() and dissolve_free_huge_page().
+
+We should make sure that the page is already on the free list when it is
+dissolved.
+
+As a result __free_huge_page would corrupt page(s) already in the buddy
+allocator.
+
+Link: https://lkml.kernel.org/r/20210115124942.46403-4-songmuchun@bytedance.com
+Fixes: c8721bbbdd36 ("mm: memory-hotplug: enable memory hotplug to handle hugepage")
+	Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+	Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Yang Shi <shy828301@gmail.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7ffddd499ba6122b1a07828f023d1d67629aa017)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 9c4322042002,c6ee3c28a04e..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -872,21 -1055,18 +888,33 @@@ static struct page *dequeue_huge_page_n
+  		if (nocma && is_migrate_cma_page(page))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (!PageHWPoison(page))
+ +			break;
+++=======
++ 		if (PageHWPoison(page))
++ 			continue;
++ 
++ 		list_move(&page->lru, &h->hugepage_activelist);
++ 		set_page_refcounted(page);
++ 		ClearPageHugeFreed(page);
++ 		h->free_huge_pages--;
++ 		h->free_huge_pages_node[nid]--;
++ 		return page;
+++>>>>>>> 7ffddd499ba6 (mm: hugetlb: fix a race between freeing and dissolving the page)
+  	}
+  
+ -	return NULL;
+ +	/*
+ +	 * if 'non-isolated free hugepage' not found on the list,
+ +	 * the allocation fails.
+ +	 */
+ +	if (&h->hugepage_freelists[nid] == &page->lru)
+ +		return NULL;
+ +	list_move(&page->lru, &h->hugepage_activelist);
+ +	set_page_refcounted(page);
+ +	h->free_huge_pages--;
+ +	h->free_huge_pages_node[nid]--;
+ +	return page;
+  }
+  
+  static struct page *dequeue_huge_page_nodemask(struct hstate *h, gfp_t gfp_mask, int nid,
+@@@ -1327,10 -1517,12 +1355,11 @@@ static void prep_new_huge_page(struct h
+  {
+  	INIT_LIST_HEAD(&page->lru);
+  	set_compound_page_dtor(page, HUGETLB_PAGE_DTOR);
+ -	set_hugetlb_cgroup(page, NULL);
+ -	set_hugetlb_cgroup_rsvd(page, NULL);
+  	spin_lock(&hugetlb_lock);
+ +	set_hugetlb_cgroup(page, NULL);
+  	h->nr_huge_pages++;
+  	h->nr_huge_pages_node[nid]++;
++ 	ClearPageHugeFreed(page);
+  	spin_unlock(&hugetlb_lock);
+  }
+  
+* Unmerged path mm/hugetlb.c
