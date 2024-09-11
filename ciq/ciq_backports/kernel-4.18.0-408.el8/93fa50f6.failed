@@ -1,0 +1,223 @@
+KVM: x86/mmu: Batch TLB flushes from TDP MMU for MMU notifier change_spte
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 93fa50f644e0aea735bd21e9f86f95ad6c7cf40e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/93fa50f6.failed
+
+Batch TLB flushes (with other MMUs) when handling ->change_spte()
+notifications in the TDP MMU.  The MMU notifier path in question doesn't
+allow yielding and correcty flushes before dropping mmu_lock.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20220226001546.360188-9-seanjc@google.com>
+	Reviewed-by: Mingwei Zhang <mizhang@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 93fa50f644e0aea735bd21e9f86f95ad6c7cf40e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index c08bb02954b0,9b1d64468d95..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -1092,133 -1143,95 +1092,142 @@@ int kvm_tdp_mmu_zap_hva_range(struct kv
+   * Mark the SPTEs range of GFNs [start, end) unaccessed and return non-zero
+   * if any of the GFNs in the range have been accessed.
+   */
+ -static bool age_gfn_range(struct kvm *kvm, struct tdp_iter *iter,
+ -			  struct kvm_gfn_range *range)
+ +static int age_gfn_range(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			 struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+ +			 unsigned long unused)
+  {
+ -	u64 new_spte = 0;
+ -
+ -	/* If we have a non-accessed entry we don't need to change the pte. */
+ -	if (!is_accessed_spte(iter->old_spte))
+ -		return false;
+ +	struct tdp_iter iter;
+ +	int young = 0;
+ +	u64 new_spte;
+  
+ -	new_spte = iter->old_spte;
+ +	rcu_read_lock();
+  
+ -	if (spte_ad_enabled(new_spte)) {
+ -		new_spte &= ~shadow_accessed_mask;
+ -	} else {
+ +	tdp_root_for_each_leaf_pte(iter, root, start, end) {
+  		/*
+ -		 * Capture the dirty status of the page, so that it doesn't get
+ -		 * lost when the SPTE is marked for access tracking.
+ +		 * If we have a non-accessed entry we don't need to change the
+ +		 * pte.
+  		 */
+ -		if (is_writable_pte(new_spte))
+ -			kvm_set_pfn_dirty(spte_to_pfn(new_spte));
+ +		if (!is_accessed_spte(iter.old_spte))
+ +			continue;
+ +
+ +		new_spte = iter.old_spte;
+ +
+ +		if (spte_ad_enabled(new_spte)) {
+ +			new_spte &= ~shadow_accessed_mask;
+ +		} else {
+ +			/*
+ +			 * Capture the dirty status of the page, so that it doesn't get
+ +			 * lost when the SPTE is marked for access tracking.
+ +			 */
+ +			if (is_writable_pte(new_spte))
+ +				kvm_set_pfn_dirty(spte_to_pfn(new_spte));
+ +
+ +			new_spte = mark_spte_for_access_track(new_spte);
+ +		}
+  
+ -		new_spte = mark_spte_for_access_track(new_spte);
+ +		tdp_mmu_set_spte_no_acc_track(kvm, &iter, new_spte);
+ +		young = 1;
+  	}
+  
+ -	tdp_mmu_set_spte_no_acc_track(kvm, iter, new_spte);
+ +	rcu_read_unlock();
+  
+ -	return true;
+ +	return young;
+  }
+  
+ -bool kvm_tdp_mmu_age_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_tdp_mmu_age_hva_range(struct kvm *kvm, unsigned long start,
+ +			      unsigned long end)
+  {
+ -	return kvm_tdp_mmu_handle_gfn(kvm, range, age_gfn_range);
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, start, end, 0,
+ +					    age_gfn_range);
+  }
+  
+ -static bool test_age_gfn(struct kvm *kvm, struct tdp_iter *iter,
+ -			 struct kvm_gfn_range *range)
+ +static int test_age_gfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			struct kvm_mmu_page *root, gfn_t gfn, gfn_t end,
+ +			unsigned long unused)
+  {
+ -	return is_accessed_spte(iter->old_spte);
+ +	struct tdp_iter iter;
+ +
+ +	tdp_root_for_each_leaf_pte(iter, root, gfn, end)
+ +		if (is_accessed_spte(iter.old_spte))
+ +			return 1;
+ +
+ +	return 0;
+  }
+  
+ -bool kvm_tdp_mmu_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_tdp_mmu_test_age_hva(struct kvm *kvm, unsigned long hva)
+  {
+ -	return kvm_tdp_mmu_handle_gfn(kvm, range, test_age_gfn);
+ +	return kvm_tdp_mmu_handle_hva(kvm, hva, 0, test_age_gfn);
+  }
+  
+ -static bool set_spte_gfn(struct kvm *kvm, struct tdp_iter *iter,
+ -			 struct kvm_gfn_range *range)
+ +/*
+ + * Handle the changed_pte MMU notifier for the TDP MMU.
+ + * data is a pointer to the new pte_t mapping the HVA specified by the MMU
+ + * notifier.
+ + * Returns non-zero if a flush is needed before releasing the MMU lock.
+ + */
+ +static int set_tdp_spte(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			struct kvm_mmu_page *root, gfn_t gfn, gfn_t end,
+ +			unsigned long data)
+  {
+++<<<<<<< HEAD
+ +	struct tdp_iter iter;
+ +	pte_t *ptep = (pte_t *)data;
+ +	kvm_pfn_t new_pfn;
+  	u64 new_spte;
+ +	int need_flush = 0;
+  
+ -	/* Huge pages aren't expected to be modified without first being zapped. */
+ -	WARN_ON(pte_huge(range->pte) || range->start + 1 != range->end);
+ +	rcu_read_lock();
+  
+ -	if (iter->level != PG_LEVEL_4K ||
+ -	    !is_shadow_present_pte(iter->old_spte))
+ -		return false;
+ +	WARN_ON(pte_huge(*ptep) || (gfn + 1) != end);
+  
+ -	/*
+ -	 * Note, when changing a read-only SPTE, it's not strictly necessary to
+ -	 * zero the SPTE before setting the new PFN, but doing so preserves the
+ -	 * invariant that the PFN of a present * leaf SPTE can never change.
+ -	 * See __handle_changed_spte().
+ -	 */
+ -	tdp_mmu_set_spte(kvm, iter, 0);
+ +	new_pfn = pte_pfn(*ptep);
+  
+ -	if (!pte_write(range->pte)) {
+ -		new_spte = kvm_mmu_changed_pte_notifier_make_spte(iter->old_spte,
+ -								  pte_pfn(range->pte));
+ +	tdp_root_for_each_leaf_pte(iter, root, gfn, gfn + 1) {
+ +		if (iter.level != PG_LEVEL_4K)
+ +			continue;
+  
+ -		tdp_mmu_set_spte(kvm, iter, new_spte);
+ +		if (!is_shadow_present_pte(iter.old_spte))
+ +			break;
+ +
+ +		/*
+ +		 * Note, when changing a read-only SPTE, it's not strictly
+ +		 * necessary to zero the SPTE before setting the new PFN, but
+ +		 * doing so preserves the invariant that the PFN of a present
+ +		 * leaf SPTE can never change.  See __handle_changed_spte().
+ +		 */
+ +		tdp_mmu_set_spte(kvm, &iter, 0);
+ +
+ +		if (!pte_write(*ptep)) {
+ +			new_spte = kvm_mmu_changed_pte_notifier_make_spte(
+ +					iter.old_spte, new_pfn);
+ +
+ +			tdp_mmu_set_spte(kvm, &iter, new_spte);
+ +		}
+ +
+ +		need_flush = 1;
+  	}
+  
+ -	return true;
+ +	if (need_flush)
+ +		kvm_flush_remote_tlbs_with_address(kvm, gfn, 1);
+ +
+ +	rcu_read_unlock();
+ +
+ +	return 0;
+  }
+  
+ -/*
+ - * Handle the changed_pte MMU notifier for the TDP MMU.
+ - * data is a pointer to the new pte_t mapping the HVA specified by the MMU
+ - * notifier.
+ - * Returns non-zero if a flush is needed before releasing the MMU lock.
+ - */
+ -bool kvm_tdp_mmu_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_tdp_mmu_set_spte_hva(struct kvm *kvm, unsigned long address,
+ +			     pte_t *host_ptep)
+  {
+ +	return kvm_tdp_mmu_handle_hva(kvm, address, (unsigned long)host_ptep,
+ +				      set_tdp_spte);
+++=======
++ 	/*
++ 	 * No need to handle the remote TLB flush under RCU protection, the
++ 	 * target SPTE _must_ be a leaf SPTE, i.e. cannot result in freeing a
++ 	 * shadow page.  See the WARN on pfn_changed in __handle_changed_spte().
++ 	 */
++ 	return kvm_tdp_mmu_handle_gfn(kvm, range, set_spte_gfn);
+++>>>>>>> 93fa50f644e0 (KVM: x86/mmu: Batch TLB flushes from TDP MMU for MMU notifier change_spte)
+  }
+  
+  /*
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
