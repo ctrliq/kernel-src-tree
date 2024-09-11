@@ -1,0 +1,186 @@
+x86/platform/uv: Remove UV BAU TLB Shootdown Handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mike Travis <mike.travis@hpe.com>
+commit 39297dde7390e01bfd737052fbb5313a09062e2d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/39297dde.failed
+
+The Broadcast Assist Unit (BAU) TLB shootdown handler is being rewritten
+to become the UV BAU APIC driver. It is designed to speed up sending
+IPIs to selective CPUs within the system. Remove the current TLB
+shutdown handler (tlb_uv.c) file and a couple of kernel hooks in the
+interim.
+
+	Signed-off-by: Mike Travis <mike.travis@hpe.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dimitri Sivanich <dimitri.sivanich@hpe.com>
+Link: https://lkml.kernel.org/r/20201005203929.148656-2-mike.travis@hpe.com
+(cherry picked from commit 39297dde7390e01bfd737052fbb5313a09062e2d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/idtentry.h
+#	arch/x86/include/asm/uv/uv_bau.h
+#	arch/x86/kernel/idt.c
+#	arch/x86/mm/tlb.c
+#	arch/x86/platform/uv/Makefile
+#	arch/x86/platform/uv/tlb_uv.c
+diff --cc arch/x86/kernel/idt.c
+index cdf4700ac5e2,1bffb87dcfdc..000000000000
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@@ -127,21 -139,18 +127,26 @@@ static const __initconst struct idt_dat
+  #endif
+  
+  #ifdef CONFIG_X86_LOCAL_APIC
+ -	INTG(LOCAL_TIMER_VECTOR,		asm_sysvec_apic_timer_interrupt),
+ -	INTG(X86_PLATFORM_IPI_VECTOR,		asm_sysvec_x86_platform_ipi),
+ +	INTG(LOCAL_TIMER_VECTOR,	apic_timer_interrupt),
+ +	INTG(X86_PLATFORM_IPI_VECTOR,	x86_platform_ipi),
+  # ifdef CONFIG_HAVE_KVM
+ -	INTG(POSTED_INTR_VECTOR,		asm_sysvec_kvm_posted_intr_ipi),
+ -	INTG(POSTED_INTR_WAKEUP_VECTOR,		asm_sysvec_kvm_posted_intr_wakeup_ipi),
+ -	INTG(POSTED_INTR_NESTED_VECTOR,		asm_sysvec_kvm_posted_intr_nested_ipi),
+ +	INTG(POSTED_INTR_VECTOR,	kvm_posted_intr_ipi),
+ +	INTG(POSTED_INTR_WAKEUP_VECTOR, kvm_posted_intr_wakeup_ipi),
+ +	INTG(POSTED_INTR_NESTED_VECTOR, kvm_posted_intr_nested_ipi),
+  # endif
+  # ifdef CONFIG_IRQ_WORK
+ -	INTG(IRQ_WORK_VECTOR,			asm_sysvec_irq_work),
+ +	INTG(IRQ_WORK_VECTOR,		irq_work_interrupt),
+  # endif
+++<<<<<<< HEAD
+ +#ifdef CONFIG_X86_UV
+ +	INTG(UV_BAU_MESSAGE,		uv_bau_message_intr1),
+ +#endif
+ +	INTG(SPURIOUS_APIC_VECTOR,	spurious_interrupt),
+ +	INTG(ERROR_APIC_VECTOR,		error_interrupt),
+++=======
++ 	INTG(SPURIOUS_APIC_VECTOR,		asm_sysvec_spurious_apic_interrupt),
++ 	INTG(ERROR_APIC_VECTOR,			asm_sysvec_error_interrupt),
+++>>>>>>> 39297dde7390 (x86/platform/uv: Remove UV BAU TLB Shootdown Handler)
+  #endif
+  };
+  
+diff --cc arch/x86/mm/tlb.c
+index ed12bde105b1,11666ba19b62..000000000000
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@@ -13,8 -14,19 +13,7 @@@
+  #include <asm/nospec-branch.h>
+  #include <asm/cache.h>
+  #include <asm/apic.h>
+- #include <asm/uv/uv.h>
+  
+ -#include "mm_internal.h"
+ -
+ -#ifdef CONFIG_PARAVIRT
+ -# define STATIC_NOPV
+ -#else
+ -# define STATIC_NOPV			static
+ -# define __flush_tlb_local		native_flush_tlb_local
+ -# define __flush_tlb_global		native_flush_tlb_global
+ -# define __flush_tlb_one_user(addr)	native_flush_tlb_one_user(addr)
+ -# define __flush_tlb_others(msk, info)	native_flush_tlb_others(msk, info)
+ -#endif
+ -
+  /*
+   *	TLB flushing, formerly SMP-only
+   *		c/o Linus Torvalds.
+@@@ -640,33 -799,28 +639,48 @@@ void native_flush_tlb_others(const stru
+  		trace_tlb_flush(TLB_REMOTE_SEND_IPI,
+  				(info->end - info->start) >> PAGE_SHIFT);
+  
+++<<<<<<< HEAD
+ +	if (is_uv_system()) {
+ +		/*
+ +		 * This whole special case is confused.  UV has a "Broadcast
+ +		 * Assist Unit", which seems to be a fancy way to send IPIs.
+ +		 * Back when x86 used an explicit TLB flush IPI, UV was
+ +		 * optimized to use its own mechanism.  These days, x86 uses
+ +		 * smp_call_function_many(), but UV still uses a manual IPI,
+ +		 * and that IPI's action is out of date -- it does a manual
+ +		 * flush instead of calling flush_tlb_func_remote().  This
+ +		 * means that the percpu tlb_gen variables won't be updated
+ +		 * and we'll do pointless flushes on future context switches.
+ +		 *
+ +		 * Rather than hooking native_flush_tlb_others() here, I think
+ +		 * that UV should be updated so that smp_call_function_many(),
+ +		 * etc, are optimal on UV.
+ +		 */
+ +		unsigned int cpu;
+ +
+ +		cpu = smp_processor_id();
+ +		cpumask = uv_flush_tlb_others(cpumask, info);
+ +		if (cpumask)
+ +			smp_call_function_many(cpumask, flush_tlb_func_remote,
+ +					       (void *)info, 1);
+ +		return;
+ +	}
+ +	smp_call_function_many(cpumask, flush_tlb_func_remote,
+++=======
++ 	/*
++ 	 * If no page tables were freed, we can skip sending IPIs to
++ 	 * CPUs in lazy TLB mode. They will flush the CPU themselves
++ 	 * at the next context switch.
++ 	 *
++ 	 * However, if page tables are getting freed, we need to send the
++ 	 * IPI everywhere, to prevent CPUs in lazy TLB mode from tripping
++ 	 * up on the new contents of what used to be page tables, while
++ 	 * doing a speculative memory access.
++ 	 */
++ 	if (info->freed_tables)
++ 		smp_call_function_many(cpumask, flush_tlb_func_remote,
+++>>>>>>> 39297dde7390 (x86/platform/uv: Remove UV BAU TLB Shootdown Handler)
+  			       (void *)info, 1);
+ -	else
+ -		on_each_cpu_cond_mask(tlb_is_not_lazy, flush_tlb_func_remote,
+ -				(void *)info, 1, cpumask);
+ -}
+ -
+ -void flush_tlb_others(const struct cpumask *cpumask,
+ -		      const struct flush_tlb_info *info)
+ -{
+ -	__flush_tlb_others(cpumask, info);
+  }
+  
+  /*
+diff --cc arch/x86/platform/uv/Makefile
+index 52079bebd014,224ff0504890..000000000000
+--- a/arch/x86/platform/uv/Makefile
++++ b/arch/x86/platform/uv/Makefile
+@@@ -1,1 -1,2 +1,6 @@@
+++<<<<<<< HEAD
+ +obj-$(CONFIG_X86_UV)		+= tlb_uv.o bios_uv.o uv_irq.o uv_sysfs.o uv_time.o uv_nmi.o
+++=======
++ # SPDX-License-Identifier: GPL-2.0-only
++ obj-$(CONFIG_X86_UV)		+= bios_uv.o uv_irq.o uv_sysfs.o uv_time.o uv_nmi.o
+++>>>>>>> 39297dde7390 (x86/platform/uv: Remove UV BAU TLB Shootdown Handler)
+* Unmerged path arch/x86/include/asm/idtentry.h
+* Unmerged path arch/x86/include/asm/uv/uv_bau.h
+* Unmerged path arch/x86/platform/uv/tlb_uv.c
+* Unmerged path arch/x86/include/asm/idtentry.h
+diff --git a/arch/x86/include/asm/uv/uv.h b/arch/x86/include/asm/uv/uv.h
+index 0b046989e778..b6ebe2068a2c 100644
+--- a/arch/x86/include/asm/uv/uv.h
++++ b/arch/x86/include/asm/uv/uv.h
+@@ -34,10 +34,8 @@ extern int is_uv_hubbed(int uvtype);
+ extern void uv_cpu_init(void);
+ extern void uv_nmi_init(void);
+ extern void uv_system_init(void);
+-extern const struct cpumask *uv_flush_tlb_others(const struct cpumask *cpumask,
+-						 const struct flush_tlb_info *info);
+ 
+-#else	/* X86_UV */
++#else	/* !X86_UV */
+ 
+ static inline enum uv_system_type get_uv_system_type(void) { return UV_NONE; }
+ static inline bool is_early_uv_system(void)	{ return 0; }
+* Unmerged path arch/x86/include/asm/uv/uv_bau.h
+* Unmerged path arch/x86/kernel/idt.c
+* Unmerged path arch/x86/mm/tlb.c
+* Unmerged path arch/x86/platform/uv/Makefile
+* Unmerged path arch/x86/platform/uv/tlb_uv.c
