@@ -1,0 +1,139 @@
+efi/x86: move UV_SYSTAB handling into arch/x86
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ard Biesheuvel <ard.biesheuvel@linaro.org>
+commit ec7e1605d79d1d469b25e396f2056e42386f512f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ec7e1605.failed
+
+The SGI UV UEFI machines are tightly coupled to the x86 architecture
+so there is no need to keep any awareness of its existence in the
+generic EFI layer, especially since we already have the infrastructure
+to handle arch-specific configuration tables, and were even already
+using it to some extent.
+
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+(cherry picked from commit ec7e1605d79d1d469b25e396f2056e42386f512f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi.c
+diff --cc arch/x86/platform/efi/efi.c
+index 4c3f7e46cc36,9866a3584765..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -64,6 -64,27 +64,30 @@@ static efi_config_table_type_t arch_tab
+  	{NULL_GUID, NULL, NULL},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const unsigned long * const efi_tables[] = {
++ 	&efi.mps,
++ 	&efi.acpi,
++ 	&efi.acpi20,
++ 	&efi.smbios,
++ 	&efi.smbios3,
++ 	&efi.sal_systab,
++ 	&efi.boot_info,
++ 	&efi.hcdp,
++ 	&efi.uga,
++ #ifdef CONFIG_X86_UV
++ 	&uv_systab_phys,
++ #endif
++ 	&efi.fw_vendor,
++ 	&efi.runtime,
++ 	&efi.config_table,
++ 	&efi.esrt,
++ 	&efi.properties_table,
++ 	&efi.mem_attr_table,
++ };
++ 
+++>>>>>>> ec7e1605d79d (efi/x86: move UV_SYSTAB handling into arch/x86)
+  u64 efi_setup;		/* efi setup_data physical address */
+  
+  static int add_efi_memmap __initdata;
+diff --git a/arch/x86/include/asm/uv/uv.h b/arch/x86/include/asm/uv/uv.h
+index 1271aebe909d..ecabb40bad58 100644
+--- a/arch/x86/include/asm/uv/uv.h
++++ b/arch/x86/include/asm/uv/uv.h
+@@ -24,10 +24,12 @@ static inline int uv(int uvtype)
+ 	return 1;
+ }
+ 
++extern unsigned long uv_systab_phys;
++
+ extern enum uv_system_type get_uv_system_type(void);
+ static inline bool is_early_uv_system(void)
+ {
+-	return !((efi.uv_systab == EFI_INVALID_TABLE_ADDR) || !efi.uv_systab);
++	return uv_systab_phys && uv_systab_phys != EFI_INVALID_TABLE_ADDR;
+ }
+ extern int is_uv_system(void);
+ extern int is_uv_hubbed(int uvtype);
+* Unmerged path arch/x86/platform/efi/efi.c
+diff --git a/arch/x86/platform/uv/bios_uv.c b/arch/x86/platform/uv/bios_uv.c
+index 606a6677b934..da0bb9fc3045 100644
+--- a/arch/x86/platform/uv/bios_uv.c
++++ b/arch/x86/platform/uv/bios_uv.c
+@@ -27,6 +27,8 @@
+ #include <asm/uv/bios.h>
+ #include <asm/uv/uv_hub.h>
+ 
++unsigned long uv_systab_phys __ro_after_init = EFI_INVALID_TABLE_ADDR;
++
+ struct uv_systab *uv_systab;
+ 
+ static s64 __uv_bios_call(enum uv_bios_cmd which, u64 a1, u64 a2, u64 a3,
+@@ -191,13 +193,13 @@ int uv_bios_set_legacy_vga_target(bool decode, int domain, int bus)
+ int uv_bios_init(void)
+ {
+ 	uv_systab = NULL;
+-	if ((efi.uv_systab == EFI_INVALID_TABLE_ADDR) ||
+-	    !efi.uv_systab || efi_runtime_disabled()) {
++	if ((uv_systab_phys == EFI_INVALID_TABLE_ADDR) ||
++	    !uv_systab_phys || efi_runtime_disabled()) {
+ 		pr_crit("UV: UVsystab: missing\n");
+ 		return -EEXIST;
+ 	}
+ 
+-	uv_systab = ioremap(efi.uv_systab, sizeof(struct uv_systab));
++	uv_systab = ioremap(uv_systab_phys, sizeof(struct uv_systab));
+ 	if (!uv_systab || strncmp(uv_systab->signature, UV_SYSTAB_SIG, 4)) {
+ 		pr_err("UV: UVsystab: bad signature!\n");
+ 		iounmap(uv_systab);
+@@ -209,7 +211,7 @@ int uv_bios_init(void)
+ 		int size = uv_systab->size;
+ 
+ 		iounmap(uv_systab);
+-		uv_systab = ioremap(efi.uv_systab, size);
++		uv_systab = ioremap(uv_systab_phys, size);
+ 		if (!uv_systab) {
+ 			pr_err("UV: UVsystab: ioremap(%d) failed!\n", size);
+ 			return -EFAULT;
+diff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c
+index 3c0464112093..76f8947d20e8 100644
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@ -45,7 +45,6 @@ struct efi __read_mostly efi = {
+ 	.boot_info		= EFI_INVALID_TABLE_ADDR,
+ 	.hcdp			= EFI_INVALID_TABLE_ADDR,
+ 	.uga			= EFI_INVALID_TABLE_ADDR,
+-	.uv_systab		= EFI_INVALID_TABLE_ADDR,
+ 	.fw_vendor		= EFI_INVALID_TABLE_ADDR,
+ 	.runtime		= EFI_INVALID_TABLE_ADDR,
+ 	.config_table		= EFI_INVALID_TABLE_ADDR,
+diff --git a/include/linux/efi.h b/include/linux/efi.h
+index f214b7a114d6..af33b8bfce73 100644
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@ -983,7 +983,6 @@ extern struct efi {
+ 	unsigned long boot_info;	/* boot info table */
+ 	unsigned long hcdp;		/* HCDP table */
+ 	unsigned long uga;		/* UGA table */
+-	unsigned long uv_systab;	/* UV system table */
+ 	unsigned long fw_vendor;	/* fw_vendor */
+ 	unsigned long runtime;		/* runtime table */
+ 	unsigned long config_table;	/* config tables */
