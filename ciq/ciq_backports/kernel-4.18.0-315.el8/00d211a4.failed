@@ -1,0 +1,156 @@
+bpf: tcp: Add bpf_skops_parse_hdr()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 00d211a4ea6f48e8e3b758813fe23ad28193d3bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/00d211a4.failed
+
+The patch adds a function bpf_skops_parse_hdr().
+It will call the bpf prog to parse the TCP header received at
+a tcp_sock that has at least reached the ESTABLISHED state.
+
+For the packets received during the 3WHS (SYN, SYNACK and ACK),
+the received skb will be available to the bpf prog during the callback
+in bpf_skops_established() introduced in the previous patch and
+in the bpf_skops_write_hdr_opt() that will be added in the
+next patch.
+
+Calling bpf prog to parse header is controlled by two new flags in
+tp->bpf_sock_ops_cb_flags:
+BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG and
+BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG.
+
+When BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG is set,
+the bpf prog will only be called when there is unknown
+option in the TCP header.
+
+When BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG is set,
+the bpf prog will be called on all received TCP header.
+
+This function is half implemented to highlight the changes in
+TCP stack.  The actual codes preparing the bpf running context and
+invoking the bpf prog will be added in the later patch with other
+necessary bpf pieces.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/bpf/20200820190046.2885054-1-kafai@fb.com
+(cherry picked from commit 00d211a4ea6f48e8e3b758813fe23ad28193d3bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index 0a07f42fdf6f,b520450170d1..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -130,6 -130,69 +130,72 @@@ void clean_acked_data_disable(struct in
+  	icsk->icsk_clean_acked = NULL;
+  }
+  EXPORT_SYMBOL_GPL(clean_acked_data_disable);
+++<<<<<<< HEAD
+++=======
++ 
++ void clean_acked_data_flush(void)
++ {
++ 	static_key_deferred_flush(&clean_acked_data_enabled);
++ }
++ EXPORT_SYMBOL_GPL(clean_acked_data_flush);
++ #endif
++ 
++ #ifdef CONFIG_CGROUP_BPF
++ static void bpf_skops_parse_hdr(struct sock *sk, struct sk_buff *skb)
++ {
++ 	bool unknown_opt = tcp_sk(sk)->rx_opt.saw_unknown &&
++ 		BPF_SOCK_OPS_TEST_FLAG(tcp_sk(sk),
++ 				       BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG);
++ 	bool parse_all_opt = BPF_SOCK_OPS_TEST_FLAG(tcp_sk(sk),
++ 						    BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
++ 
++ 	if (likely(!unknown_opt && !parse_all_opt))
++ 		return;
++ 
++ 	/* The skb will be handled in the
++ 	 * bpf_skops_established() or
++ 	 * bpf_skops_write_hdr_opt().
++ 	 */
++ 	switch (sk->sk_state) {
++ 	case TCP_SYN_RECV:
++ 	case TCP_SYN_SENT:
++ 	case TCP_LISTEN:
++ 		return;
++ 	}
++ 
++ 	/* BPF prog will have access to the sk and skb.
++ 	 *
++ 	 * The bpf running context preparation and the actual bpf prog
++ 	 * calling will be implemented in a later PATCH together with
++ 	 * other bpf pieces.
++ 	 */
++ }
++ 
++ static void bpf_skops_established(struct sock *sk, int bpf_op,
++ 				  struct sk_buff *skb)
++ {
++ 	struct bpf_sock_ops_kern sock_ops;
++ 
++ 	sock_owned_by_me(sk);
++ 
++ 	memset(&sock_ops, 0, offsetof(struct bpf_sock_ops_kern, temp));
++ 	sock_ops.op = bpf_op;
++ 	sock_ops.is_fullsock = 1;
++ 	sock_ops.sk = sk;
++ 	/* skb will be passed to the bpf prog in a later patch. */
++ 
++ 	BPF_CGROUP_RUN_PROG_SOCK_OPS(&sock_ops);
++ }
++ #else
++ static void bpf_skops_parse_hdr(struct sock *sk, struct sk_buff *skb)
++ {
++ }
++ 
++ static void bpf_skops_established(struct sock *sk, int bpf_op,
++ 				  struct sk_buff *skb)
++ {
++ }
+++>>>>>>> 00d211a4ea6f (bpf: tcp: Add bpf_skops_parse_hdr())
+  #endif
+  
+  static void tcp_gro_dev_warn(struct sock *sk, const struct sk_buff *skb,
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 0a8b1917a074..bd3e92c4ee8a 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -4224,8 +4224,10 @@ enum {
+ 	BPF_SOCK_OPS_RETRANS_CB_FLAG	= (1<<1),
+ 	BPF_SOCK_OPS_STATE_CB_FLAG	= (1<<2),
+ 	BPF_SOCK_OPS_RTT_CB_FLAG	= (1<<3),
++	BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG  = (1<<4),
++	BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG = (1<<5),
+ /* Mask of all currently supported cb flags */
+-	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0xF,
++	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0x3F,
+ };
+ 
+ /* List of known BPF sock_ops operators.
+* Unmerged path net/ipv4/tcp_input.c
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 0dc0309df9c7..1a4df9d27520 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -4204,8 +4204,10 @@ enum {
+ 	BPF_SOCK_OPS_RETRANS_CB_FLAG	= (1<<1),
+ 	BPF_SOCK_OPS_STATE_CB_FLAG	= (1<<2),
+ 	BPF_SOCK_OPS_RTT_CB_FLAG	= (1<<3),
++	BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG  = (1<<4),
++	BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG = (1<<5),
+ /* Mask of all currently supported cb flags */
+-	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0xF,
++	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0x3F,
+ };
+ 
+ /* List of known BPF sock_ops operators.
