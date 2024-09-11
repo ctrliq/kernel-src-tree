@@ -1,0 +1,284 @@
+fuse: add fuse_iqueue_ops callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Stefan Hajnoczi <stefanha@redhat.com>
+commit ae3aad77f46fbba56eff7141b2fc49870b60827e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ae3aad77.failed
+
+The /dev/fuse device uses fiq->waitq and fasync to signal that requests are
+available.  These mechanisms do not apply to virtio-fs.  This patch
+introduces callbacks so alternative behavior can be used.
+
+Note that queue_interrupt() changes along these lines:
+
+  spin_lock(&fiq->waitq.lock);
+  wake_up_locked(&fiq->waitq);
++ kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
+  spin_unlock(&fiq->waitq.lock);
+- kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
+
+Since queue_request() and queue_forget() also call kill_fasync() inside
+the spinlock this should be safe.
+
+	Signed-off-by: Stefan Hajnoczi <stefanha@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit ae3aad77f46fbba56eff7141b2fc49870b60827e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/inode.c
+diff --cc fs/fuse/inode.c
+index 523a1f18c557,734fdd597c3e..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -1208,8 -1174,53 +1213,56 @@@ static int fuse_fill_super(struct super
+  
+  	list_add_tail(&fc->entry, &fuse_conn_list);
+  	sb->s_root = root_dentry;
+ -	*ctx->fudptr = fud;
+ +	file->private_data = fud;
+  	mutex_unlock(&fuse_mutex);
+++<<<<<<< HEAD
+++=======
++ 	return 0;
++ 
++  err_unlock:
++ 	mutex_unlock(&fuse_mutex);
++ 	dput(root_dentry);
++  err_dev_free:
++ 	fuse_dev_free(fud);
++  err:
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(fuse_fill_super_common);
++ 
++ static int fuse_fill_super(struct super_block *sb, struct fs_context *fsc)
++ {
++ 	struct fuse_fs_context *ctx = fsc->fs_private;
++ 	struct file *file;
++ 	int err;
++ 	struct fuse_conn *fc;
++ 
++ 	err = -EINVAL;
++ 	file = fget(ctx->fd);
++ 	if (!file)
++ 		goto err;
++ 
++ 	/*
++ 	 * Require mount to happen from the same user namespace which
++ 	 * opened /dev/fuse to prevent potential attacks.
++ 	 */
++ 	if ((file->f_op != &fuse_dev_operations) ||
++ 	    (file->f_cred->user_ns != sb->s_user_ns))
++ 		goto err_fput;
++ 	ctx->fudptr = &file->private_data;
++ 
++ 	fc = kmalloc(sizeof(*fc), GFP_KERNEL);
++ 	err = -ENOMEM;
++ 	if (!fc)
++ 		goto err_fput;
++ 
++ 	fuse_conn_init(fc, sb->s_user_ns, &fuse_dev_fiq_ops, NULL);
++ 	fc->release = fuse_free_conn;
++ 	sb->s_fs_info = fc;
++ 
++ 	err = fuse_fill_super_common(sb, ctx);
++ 	if (err)
++ 		goto err_put_conn;
+++>>>>>>> ae3aad77f46f (fuse: add fuse_iqueue_ops callbacks)
+  	/*
+  	 * atomic_dec_and_test() in fput() provides the necessary
+  	 * memory barrier for file->private_data to be visible on all
+diff --git a/fs/fuse/cuse.c b/fs/fuse/cuse.c
+index e9e6bfbea74c..f13037f37ba3 100644
+--- a/fs/fuse/cuse.c
++++ b/fs/fuse/cuse.c
+@@ -507,7 +507,7 @@ static int cuse_channel_open(struct inode *inode, struct file *file)
+ 	 * Limit the cuse channel to requests that can
+ 	 * be represented in file->f_cred->user_ns.
+ 	 */
+-	fuse_conn_init(&cc->fc, file->f_cred->user_ns);
++	fuse_conn_init(&cc->fc, file->f_cred->user_ns, &fuse_dev_fiq_ops, NULL);
+ 
+ 	fud = fuse_dev_alloc(&cc->fc);
+ 	if (!fud) {
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index 702b724c7ddf..3150fb68a67e 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -279,14 +279,33 @@ static unsigned int fuse_req_hash(u64 unique)
+ 	return hash_long(unique & ~FUSE_INT_REQ_BIT, FUSE_PQ_HASH_BITS);
+ }
+ 
+-static void queue_request(struct fuse_iqueue *fiq, struct fuse_req *req)
++/**
++ * A new request is available, wake fiq->waitq
++ */
++static void fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq)
++__releases(fiq->lock)
++{
++	wake_up(&fiq->waitq);
++	kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
++	spin_unlock(&fiq->lock);
++}
++
++const struct fuse_iqueue_ops fuse_dev_fiq_ops = {
++	.wake_forget_and_unlock		= fuse_dev_wake_and_unlock,
++	.wake_interrupt_and_unlock	= fuse_dev_wake_and_unlock,
++	.wake_pending_and_unlock	= fuse_dev_wake_and_unlock,
++};
++EXPORT_SYMBOL_GPL(fuse_dev_fiq_ops);
++
++static void queue_request_and_unlock(struct fuse_iqueue *fiq,
++				     struct fuse_req *req)
++__releases(fiq->lock)
+ {
+ 	req->in.h.len = sizeof(struct fuse_in_header) +
+ 		fuse_len_args(req->args->in_numargs,
+ 			      (struct fuse_arg *) req->args->in_args);
+ 	list_add_tail(&req->list, &fiq->pending);
+-	wake_up(&fiq->waitq);
+-	kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
++	fiq->ops->wake_pending_and_unlock(fiq);
+ }
+ 
+ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
+@@ -301,12 +320,11 @@ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
+ 	if (fiq->connected) {
+ 		fiq->forget_list_tail->next = forget;
+ 		fiq->forget_list_tail = forget;
+-		wake_up(&fiq->waitq);
+-		kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
++		fiq->ops->wake_forget_and_unlock(fiq);
+ 	} else {
+ 		kfree(forget);
++		spin_unlock(&fiq->lock);
+ 	}
+-	spin_unlock(&fiq->lock);
+ }
+ 
+ static void flush_bg_queue(struct fuse_conn *fc)
+@@ -322,8 +340,7 @@ static void flush_bg_queue(struct fuse_conn *fc)
+ 		fc->active_background++;
+ 		spin_lock(&fiq->lock);
+ 		req->in.h.unique = fuse_get_unique(fiq);
+-		queue_request(fiq, req);
+-		spin_unlock(&fiq->lock);
++		queue_request_and_unlock(fiq, req);
+ 	}
+ }
+ 
+@@ -411,10 +428,10 @@ static int queue_interrupt(struct fuse_iqueue *fiq, struct fuse_req *req)
+ 			spin_unlock(&fiq->lock);
+ 			return 0;
+ 		}
+-		wake_up(&fiq->waitq);
+-		kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
++		fiq->ops->wake_interrupt_and_unlock(fiq);
++	} else {
++		spin_unlock(&fiq->lock);
+ 	}
+-	spin_unlock(&fiq->lock);
+ 	return 0;
+ }
+ 
+@@ -474,11 +491,10 @@ static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
+ 		req->out.h.error = -ENOTCONN;
+ 	} else {
+ 		req->in.h.unique = fuse_get_unique(fiq);
+-		queue_request(fiq, req);
+ 		/* acquire extra reference, since request is still needed
+ 		   after request_end() */
+ 		__fuse_get_request(req);
+-		spin_unlock(&fiq->lock);
++		queue_request_and_unlock(fiq, req);
+ 
+ 		request_wait_answer(fc, req);
+ 		/* Pairs with smp_wmb() in request_end() */
+@@ -668,14 +684,12 @@ static int fuse_simple_notify_reply(struct fuse_conn *fc,
+ 
+ 	spin_lock(&fiq->lock);
+ 	if (fiq->connected) {
+-		queue_request(fiq, req);
+-		spin_unlock(&fiq->lock);
++		queue_request_and_unlock(fiq, req);
+ 	} else {
+ 		err = -ENODEV;
+ 		spin_unlock(&fiq->lock);
+ 		fuse_put_request(fc, req);
+ 	}
+-	spin_unlock(&fiq->lock);
+ 
+ 	return err;
+ }
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index b9287760b32a..478da377f316 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -344,6 +344,39 @@ struct fuse_req {
+ 
+ };
+ 
++struct fuse_iqueue;
++
++/**
++ * Input queue callbacks
++ *
++ * Input queue signalling is device-specific.  For example, the /dev/fuse file
++ * uses fiq->waitq and fasync to wake processes that are waiting on queue
++ * readiness.  These callbacks allow other device types to respond to input
++ * queue activity.
++ */
++struct fuse_iqueue_ops {
++	/**
++	 * Signal that a forget has been queued
++	 */
++	void (*wake_forget_and_unlock)(struct fuse_iqueue *fiq)
++		__releases(fiq->lock);
++
++	/**
++	 * Signal that an INTERRUPT request has been queued
++	 */
++	void (*wake_interrupt_and_unlock)(struct fuse_iqueue *fiq)
++		__releases(fiq->lock);
++
++	/**
++	 * Signal that a request has been queued
++	 */
++	void (*wake_pending_and_unlock)(struct fuse_iqueue *fiq)
++		__releases(fiq->lock);
++};
++
++/** /dev/fuse input queue operations */
++extern const struct fuse_iqueue_ops fuse_dev_fiq_ops;
++
+ struct fuse_iqueue {
+ 	/** Connection established */
+ 	unsigned connected;
+@@ -372,6 +405,12 @@ struct fuse_iqueue {
+ 
+ 	/** O_ASYNC requests */
+ 	struct fasync_struct *fasync;
++
++	/** Device-specific callbacks */
++	const struct fuse_iqueue_ops *ops;
++
++	/** Device-specific state */
++	void *priv;
+ };
+ 
+ #define FUSE_PQ_HASH_BITS 8
+@@ -894,7 +933,8 @@ struct fuse_conn *fuse_conn_get(struct fuse_conn *fc);
+ /**
+  * Initialize fuse_conn
+  */
+-void fuse_conn_init(struct fuse_conn *fc, struct user_namespace *user_ns);
++void fuse_conn_init(struct fuse_conn *fc, struct user_namespace *user_ns,
++		    const struct fuse_iqueue_ops *fiq_ops, void *fiq_priv);
+ 
+ /**
+  * Release reference to fuse_conn
+* Unmerged path fs/fuse/inode.c
