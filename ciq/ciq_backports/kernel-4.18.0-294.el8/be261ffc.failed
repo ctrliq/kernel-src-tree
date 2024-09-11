@@ -1,0 +1,170 @@
+x86: Remove X86_FEATURE_MFENCE_RDTSC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] Remove X86_FEATURE_MFENCE_RDTSC (Paolo Bonzini) [1904054 1906893 1904128]
+Rebuild_FUZZ: 92.54%
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit be261ffce6f13229dad50f59c5e491f933d3167f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/be261ffc.failed
+
+AMD and Intel both have serializing lfence (X86_FEATURE_LFENCE_RDTSC).
+They've both had it for a long time, and AMD has had it enabled in Linux
+since Spectre v1 was announced.
+
+Back then, there was a proposal to remove the serializing mfence feature
+bit (X86_FEATURE_MFENCE_RDTSC), since both AMD and Intel have
+serializing lfence.  At the time, it was (ahem) speculated that some
+hypervisors might not yet support its removal, so it remained for the
+time being.
+
+Now a year-and-a-half later, it should be safe to remove.
+
+I asked Andrew Cooper about whether it's still needed:
+
+  So if you're virtualised, you've got no choice in the matter.  lfence
+  is either dispatch-serialising or not on AMD, and you won't be able to
+  change it.
+
+  Furthermore, you can't accurately tell what state the bit is in, because
+  the MSR might not be virtualised at all, or may not reflect the true
+  state in hardware.  Worse still, attempting to set the bit may not be
+  successful even if there isn't a fault for doing so.
+
+  Xen sets the DE_CFG bit unconditionally, as does Linux by the looks of
+  things (see MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT).  ISTR other hypervisor
+  vendors saying the same, but I don't have any information to hand.
+
+  If you are running under a hypervisor which has been updated, then
+  lfence will almost certainly be dispatch-serialising in practice, and
+  you'll almost certainly see the bit already set in DE_CFG.  If you're
+  running under a hypervisor which hasn't been patched since Spectre,
+  you've already lost in many more ways.
+
+  I'd argue that X86_FEATURE_MFENCE_RDTSC is not worth keeping.
+
+So remove it.  This will reduce some code rot, and also make it easier
+to hook barrier_nospec() up to a cmdline disable for performance
+raisins, without having to need an alternative_3() macro.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/d990aa51e40063acb9888e8c1b688e41355a9588.1562255067.git.jpoimboe@redhat.com
+
+(cherry picked from commit be261ffce6f13229dad50f59c5e491f933d3167f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/msr.h
+#	arch/x86/kernel/cpu/hygon.c
+diff --cc arch/x86/include/asm/msr.h
+index 04addd6e0a4a,86f20d520a07..000000000000
+--- a/arch/x86/include/asm/msr.h
++++ b/arch/x86/include/asm/msr.h
+@@@ -227,9 -229,18 +227,20 @@@ static __always_inline unsigned long lo
+  	 * ordering guarantees as reading from a global memory location
+  	 * that some other imaginary CPU is updating continuously with a
+  	 * time stamp.
+ -	 *
+ -	 * Thus, use the preferred barrier on the respective CPU, aiming for
+ -	 * RDTSCP as the default.
+  	 */
+++<<<<<<< HEAD
+ +	barrier_nospec();
+ +	return rdtsc();
+++=======
++ 	asm volatile(ALTERNATIVE_2("rdtsc",
++ 				   "lfence; rdtsc", X86_FEATURE_LFENCE_RDTSC,
++ 				   "rdtscp", X86_FEATURE_RDTSCP)
++ 			: EAX_EDX_RET(val, low, high)
++ 			/* RDTSCP clobbers ECX with MSR_TSC_AUX. */
++ 			:: "ecx");
++ 
++ 	return EAX_EDX_VAL(val, low, high);
+++>>>>>>> be261ffce6f1 (x86: Remove X86_FEATURE_MFENCE_RDTSC)
+  }
+  
+  static inline unsigned long long native_read_pmc(int counter)
+* Unmerged path arch/x86/kernel/cpu/hygon.c
+diff --git a/arch/x86/include/asm/barrier.h b/arch/x86/include/asm/barrier.h
+index 84f848c2541a..7f828fe49797 100644
+--- a/arch/x86/include/asm/barrier.h
++++ b/arch/x86/include/asm/barrier.h
+@@ -49,8 +49,7 @@ static inline unsigned long array_index_mask_nospec(unsigned long index,
+ #define array_index_mask_nospec array_index_mask_nospec
+ 
+ /* Prevent speculative execution past this barrier. */
+-#define barrier_nospec() alternative_2("", "mfence", X86_FEATURE_MFENCE_RDTSC, \
+-					   "lfence", X86_FEATURE_LFENCE_RDTSC)
++#define barrier_nospec() alternative("", "lfence", X86_FEATURE_LFENCE_RDTSC)
+ 
+ #define dma_rmb()	barrier()
+ #define dma_wmb()	barrier()
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index a9ad60c4f34e..c8a0f9492d43 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -96,7 +96,6 @@
+ #define X86_FEATURE_SYSCALL32		( 3*32+14) /* "" syscall in IA32 userspace */
+ #define X86_FEATURE_SYSENTER32		( 3*32+15) /* "" sysenter in IA32 userspace */
+ #define X86_FEATURE_REP_GOOD		( 3*32+16) /* REP microcode works well */
+-#define X86_FEATURE_MFENCE_RDTSC	( 3*32+17) /* "" MFENCE synchronizes RDTSC */
+ #define X86_FEATURE_LFENCE_RDTSC	( 3*32+18) /* "" LFENCE synchronizes RDTSC */
+ #define X86_FEATURE_ACC_POWER		( 3*32+19) /* AMD Accumulated Power Mechanism */
+ #define X86_FEATURE_NOPL		( 3*32+20) /* The NOPL (0F 1F) instructions */
+* Unmerged path arch/x86/include/asm/msr.h
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 8ac3b473318d..8f7a9727ad8b 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -910,12 +910,8 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 	init_amd_cacheinfo(c);
+ 
+ 	if (cpu_has(c, X86_FEATURE_XMM2)) {
+-		unsigned long long val;
+-		int ret;
+-
+ 		/*
+-		 * A serializing LFENCE has less overhead than MFENCE, so
+-		 * use it for execution serialization.  On families which
++		 * Use LFENCE for execution serialization.  On families which
+ 		 * don't have that MSR, LFENCE is already serializing.
+ 		 * msr_set_bit() uses the safe accessors, too, even if the MSR
+ 		 * is not present.
+@@ -923,19 +919,8 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 		msr_set_bit(MSR_F10H_DECFG,
+ 			    MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT);
+ 
+-		/*
+-		 * Verify that the MSR write was successful (could be running
+-		 * under a hypervisor) and only then assume that LFENCE is
+-		 * serializing.
+-		 */
+-		ret = rdmsrl_safe(MSR_F10H_DECFG, &val);
+-		if (!ret && (val & MSR_F10H_DECFG_LFENCE_SERIALIZE)) {
+-			/* A serializing LFENCE stops RDTSC speculation */
+-			set_cpu_cap(c, X86_FEATURE_LFENCE_RDTSC);
+-		} else {
+-			/* MFENCE stops RDTSC speculation */
+-			set_cpu_cap(c, X86_FEATURE_MFENCE_RDTSC);
+-		}
++		/* A serializing LFENCE stops RDTSC speculation */
++		set_cpu_cap(c, X86_FEATURE_LFENCE_RDTSC);
+ 	}
+ 
+ 	/*
+* Unmerged path arch/x86/kernel/cpu/hygon.c
+diff --git a/tools/arch/x86/include/asm/cpufeatures.h b/tools/arch/x86/include/asm/cpufeatures.h
+index e5db5d4ea413..8088b0410a25 100644
+--- a/tools/arch/x86/include/asm/cpufeatures.h
++++ b/tools/arch/x86/include/asm/cpufeatures.h
+@@ -96,7 +96,6 @@
+ #define X86_FEATURE_SYSCALL32		( 3*32+14) /* "" syscall in IA32 userspace */
+ #define X86_FEATURE_SYSENTER32		( 3*32+15) /* "" sysenter in IA32 userspace */
+ #define X86_FEATURE_REP_GOOD		( 3*32+16) /* REP microcode works well */
+-#define X86_FEATURE_MFENCE_RDTSC	( 3*32+17) /* "" MFENCE synchronizes RDTSC */
+ #define X86_FEATURE_LFENCE_RDTSC	( 3*32+18) /* "" LFENCE synchronizes RDTSC */
+ #define X86_FEATURE_ACC_POWER		( 3*32+19) /* AMD Accumulated Power Mechanism */
+ #define X86_FEATURE_NOPL		( 3*32+20) /* The NOPL (0F 1F) instructions */
