@@ -1,0 +1,127 @@
+gfs2: eliminate ssize parameter from gfs2_struct2blk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 2e9eeaa1175112ac494ba3c2ea4b71b1febeb6ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/2e9eeaa1.failed
+
+Every caller of function gfs2_struct2blk specified sizeof(u64).
+
+This patch eliminates the unnecessary parameter and replaces the
+size calculation with a new superblock variable that is computed
+to be the maximum number of block pointers we can fit inside a
+log descriptor, as is done for pointers per dinode and indirect
+block.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andrew Price <anprice@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 2e9eeaa1175112ac494ba3c2ea4b71b1febeb6ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 60c486e0225a,66189ae62c1d..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -518,9 -469,8 +515,14 @@@ static unsigned int calc_reserved(struc
+  		reserved += DIV_ROUND_UP(dbuf, databuf_limit(sdp));
+  	}
+  
+++<<<<<<< HEAD
+ +	if (sdp->sd_log_committed_revoke > 0)
+ +		reserved += gfs2_struct2blk(sdp, sdp->sd_log_committed_revoke,
+ +					  sizeof(u64));
+++=======
++ 	if (sdp->sd_log_commited_revoke > 0)
++ 		reserved += gfs2_struct2blk(sdp, sdp->sd_log_commited_revoke);
+++>>>>>>> 2e9eeaa11751 (gfs2: eliminate ssize parameter from gfs2_struct2blk)
+  	/* One for the overall header */
+  	if (reserved)
+  		reserved++;
+diff --git a/fs/gfs2/glops.c b/fs/gfs2/glops.c
+index 7f45c3c2c845..253ce7c2120d 100644
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@ -126,7 +126,7 @@ static int gfs2_ail_empty_gl(struct gfs2_glock *gl)
+ 	/* A shortened, inline version of gfs2_trans_begin()
+          * tr->alloced is not set since the transaction structure is
+          * on the stack */
+-	tr.tr_reserved = 1 + gfs2_struct2blk(sdp, tr.tr_revokes, sizeof(u64));
++	tr.tr_reserved = 1 + gfs2_struct2blk(sdp, tr.tr_revokes);
+ 	tr.tr_ip = _RET_IP_;
+ 	ret = gfs2_log_reserve(sdp, tr.tr_reserved);
+ 	if (ret < 0)
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 87f2a7d5777d..9568c5b4210d 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -732,6 +732,7 @@ struct gfs2_sbd {
+ 	u32 sd_fsb2bb_shift;
+ 	u32 sd_diptrs;	/* Number of pointers in a dinode */
+ 	u32 sd_inptrs;	/* Number of pointers in a indirect block */
++	u32 sd_ldptrs;  /* Number of pointers in a log descriptor block */
+ 	u32 sd_jbsize;	/* Size of a journaled data block */
+ 	u32 sd_hash_bsize;	/* sizeof(exhash block) */
+ 	u32 sd_hash_bsize_shift;
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index 8c57555ffaa2..fc5c19e2113b 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -63,9 +63,9 @@ static inline void gfs2_ordered_add_inode(struct gfs2_inode *ip)
+ 		spin_unlock(&sdp->sd_ordered_lock);
+ 	}
+ }
++
+ extern void gfs2_ordered_del_inode(struct gfs2_inode *ip);
+-extern unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct,
+-			    unsigned int ssize);
++extern unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct);
+ 
+ extern void gfs2_remove_from_ail(struct gfs2_bufdata *bd);
+ extern void gfs2_log_release(struct gfs2_sbd *sdp, unsigned int blks);
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index 6988c9324a2e..707ab18e8f30 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -872,7 +872,7 @@ static void revoke_lo_before_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+ 	if (!sdp->sd_log_num_revoke)
+ 		return;
+ 
+-	length = gfs2_struct2blk(sdp, sdp->sd_log_num_revoke, sizeof(u64));
++	length = gfs2_struct2blk(sdp, sdp->sd_log_num_revoke);
+ 	page = gfs2_get_log_desc(sdp, GFS2_LOG_DESC_REVOKE, length, sdp->sd_log_num_revoke);
+ 	offset = sizeof(struct gfs2_log_descriptor);
+ 
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index 1aa20417b6a4..7f00a2b158fe 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -302,6 +302,8 @@ static int gfs2_read_sb(struct gfs2_sbd *sdp, int silent)
+ 			  sizeof(struct gfs2_dinode)) / sizeof(u64);
+ 	sdp->sd_inptrs = (sdp->sd_sb.sb_bsize -
+ 			  sizeof(struct gfs2_meta_header)) / sizeof(u64);
++	sdp->sd_ldptrs = (sdp->sd_sb.sb_bsize -
++			  sizeof(struct gfs2_log_descriptor)) / sizeof(u64);
+ 	sdp->sd_jbsize = sdp->sd_sb.sb_bsize - sizeof(struct gfs2_meta_header);
+ 	sdp->sd_hash_bsize = sdp->sd_sb.sb_bsize / 2;
+ 	sdp->sd_hash_bsize_shift = sdp->sd_sb.sb_bsize_shift - 1;
+diff --git a/fs/gfs2/trans.c b/fs/gfs2/trans.c
+index fba688d93b27..22659b5410fc 100644
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@ -52,8 +52,7 @@ int gfs2_trans_begin(struct gfs2_sbd *sdp, unsigned int blocks,
+ 	if (blocks)
+ 		tr->tr_reserved += 6 + blocks;
+ 	if (revokes)
+-		tr->tr_reserved += gfs2_struct2blk(sdp, revokes,
+-						   sizeof(u64));
++		tr->tr_reserved += gfs2_struct2blk(sdp, revokes);
+ 	INIT_LIST_HEAD(&tr->tr_databuf);
+ 	INIT_LIST_HEAD(&tr->tr_buf);
+ 	INIT_LIST_HEAD(&tr->tr_list);
