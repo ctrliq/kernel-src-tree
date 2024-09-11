@@ -1,0 +1,142 @@
+KVM: Wait 'til the bitter end to initialize the "new" memslot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 0f9bdef3d933ba10d577b446c703a901fa5fdc30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0f9bdef3.failed
+
+Initialize the "new" memslot in the !DELETE path only after the various
+sanity checks have passed.  This will allow a future commit to allocate
+@new dynamically without having to copy a memslot, and without having to
+deal with freeing @new in error paths and in the "nothing to change" path
+that's hiding in the sanity checks.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+	Signed-off-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+Message-Id: <a084d0531ca3a826a7f861eb2b08b5d1c06ef265.1638817641.git.maciej.szmigiero@oracle.com>
+(cherry picked from commit 0f9bdef3d933ba10d577b446c703a901fa5fdc30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index b1373f69ce5e,71815e75e41c..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1524,9 -1839,12 +1524,11 @@@ out_slots
+  int __kvm_set_memory_region(struct kvm *kvm,
+  			    const struct kvm_userspace_memory_region *mem)
+  {
+ -	struct kvm_memory_slot *old;
+ +	struct kvm_memory_slot *old, *tmp;
+  	struct kvm_memory_slot new;
+ -	struct kvm_memslots *slots;
+  	enum kvm_mr_change change;
++ 	unsigned long npages;
++ 	gfn_t base_gfn;
+  	int as_id, id;
+  	int r;
+  
+@@@ -1553,7 -1871,11 +1555,9 @@@
+  		return -EINVAL;
+  	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
+  		return -EINVAL;
++ 	if ((mem->memory_size >> PAGE_SHIFT) > KVM_MEM_MAX_NR_PAGES)
++ 		return -EINVAL;
+  
+ -	slots = __kvm_memslots(kvm, as_id);
+ -
+  	/*
+  	 * Note, the old memslot (and the pointer itself!) may be invalidated
+  	 * and/or destroyed by kvm_set_memslot().
+@@@ -1571,18 -1893,11 +1575,11 @@@
+  		new.id = id;
+  		new.as_id = as_id;
+  
+ -		return kvm_set_memslot(kvm, old, &new, KVM_MR_DELETE);
+ +		return kvm_set_memslot(kvm, mem, &new, KVM_MR_DELETE);
+  	}
+  
+- 	new.as_id = as_id;
+- 	new.id = id;
+- 	new.base_gfn = mem->guest_phys_addr >> PAGE_SHIFT;
+- 	new.npages = mem->memory_size >> PAGE_SHIFT;
+- 	new.flags = mem->flags;
+- 	new.userspace_addr = mem->userspace_addr;
+- 
+- 	if (new.npages > KVM_MEM_MAX_NR_PAGES)
+- 		return -EINVAL;
++ 	base_gfn = (mem->guest_phys_addr >> PAGE_SHIFT);
++ 	npages = (mem->memory_size >> PAGE_SHIFT);
+  
+  	if (!old || !old->npages) {
+  		change = KVM_MR_CREATE;
+@@@ -1606,46 -1920,20 +1603,61 @@@
+  			change = KVM_MR_FLAGS_ONLY;
+  		else /* Nothing to change. */
+  			return 0;
+ +
+ +		/* Copy dirty_bitmap from the current memslot. */
+ +		new.dirty_bitmap = old.dirty_bitmap;
+  	}
+  
+++<<<<<<< HEAD
+ +	if ((change == KVM_MR_CREATE) || (change == KVM_MR_MOVE)) {
+ +		/* Check for overlaps */
+ +		kvm_for_each_memslot(tmp, __kvm_memslots(kvm, as_id)) {
+ +			if (tmp->id == id)
+ +				continue;
+ +			if (!((new.base_gfn + new.npages <= tmp->base_gfn) ||
+ +			      (new.base_gfn >= tmp->base_gfn + tmp->npages)))
+ +				return -EEXIST;
+ +		}
+ +	}
+ +
+ +	/* Allocate/free page dirty bitmap as needed */
+ +	if (!(new.flags & KVM_MEM_LOG_DIRTY_PAGES))
+ +		new.dirty_bitmap = NULL;
+ +	else if (!new.dirty_bitmap && !kvm->dirty_ring_size) {
+ +		r = kvm_alloc_dirty_bitmap(&new);
+ +		if (r)
+ +			return r;
+ +
+ +		if (kvm_dirty_log_manual_protect_and_init_set(kvm))
+ +			bitmap_set(new.dirty_bitmap, 0, new.npages);
+ +	}
+ +
+ +	r = kvm_set_memslot(kvm, mem, &new, change);
+ +	if (r)
+ +		goto out_bitmap;
+ +
+ +	if (old.dirty_bitmap && !new.dirty_bitmap)
+ +		kvm_destroy_dirty_bitmap(&old);
+ +	return 0;
+ +
+ +out_bitmap:
+ +	if (new.dirty_bitmap && !old.dirty_bitmap)
+ +		kvm_destroy_dirty_bitmap(&new);
+ +	return r;
+++=======
++ 	if ((change == KVM_MR_CREATE || change == KVM_MR_MOVE) &&
++ 	    kvm_check_memslot_overlap(slots, id, base_gfn, base_gfn + npages))
++ 		return -EEXIST;
++ 
++ 	new.as_id = as_id;
++ 	new.id = id;
++ 	new.base_gfn = base_gfn;
++ 	new.npages = npages;
++ 	new.flags = mem->flags;
++ 	new.userspace_addr = mem->userspace_addr;
++ 
++ 	return kvm_set_memslot(kvm, old, &new, change);
+++>>>>>>> 0f9bdef3d933 (KVM: Wait 'til the bitter end to initialize the "new" memslot)
+  }
+  EXPORT_SYMBOL_GPL(__kvm_set_memory_region);
+  
+* Unmerged path virt/kvm/kvm_main.c
