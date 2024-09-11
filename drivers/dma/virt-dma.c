@@ -120,7 +120,6 @@ void vchan_dma_desc_free_list(struct virt_dma_chan *vc, struct list_head *head)
 		if (dmaengine_desc_test_reuse(&vd->tx)) {
 			list_move_tail(&vd->node, &vc->desc_allocated);
 		} else {
-			dev_dbg(vc->chan.device->dev, "txd %p: freeing\n", vd);
 			list_del(&vd->node);
 			vc->desc_free(vd);
 		}
