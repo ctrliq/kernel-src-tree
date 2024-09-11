@@ -1,0 +1,247 @@
+Bluetooth: btusb: Fix failing to init controllers with operation firmware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+commit 1f14a620f30b01234f8b61df396f513e2ec4887f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/1f14a620.failed
+
+Some firmware when operation don't may have broken versions leading to
+error like the following:
+
+[    6.176482] Bluetooth: hci0: Firmware revision 0.0 build 121 week 7 2021
+[    6.177906] bluetooth hci0: Direct firmware load for intel/ibt-20-0-0.sfi failed with error -2
+[    6.177910] Bluetooth: hci0: Failed to load Intel firmware file intel/ibt-20-0-0.sfi (-2)
+
+Since we load the firmware file just to check if its version had changed
+comparing to the one already loaded we can just skip since the firmware
+is already operation.
+
+Fixes: ac0565462e330 ("Bluetooth: btintel: Check firmware version before
+download")
+	Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 1f14a620f30b01234f8b61df396f513e2ec4887f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/btusb.c
+diff --cc drivers/bluetooth/btusb.c
+index 462c90dfb348,b88c63fbf7fb..000000000000
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@@ -2445,9 -2428,169 +2445,173 @@@ static bool btusb_setup_intel_new_get_f
+  			suffix);
+  		break;
+  	default:
+ -		return -EINVAL;
+ +		return false;
+  	}
+++<<<<<<< HEAD
+ +	return true;
+++=======
++ 
++ 	return 0;
++ }
++ 
++ static void btusb_setup_intel_newgen_get_fw_name(const struct intel_version_tlv *ver_tlv,
++ 						 char *fw_name, size_t len,
++ 						 const char *suffix)
++ {
++ 	/* The firmware file name for new generation controllers will be
++ 	 * ibt-<cnvi_top type+cnvi_top step>-<cnvr_top type+cnvr_top step>
++ 	 */
++ 	snprintf(fw_name, len, "intel/ibt-%04x-%04x.%s",
++ 		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver_tlv->cnvi_top),
++ 					  INTEL_CNVX_TOP_STEP(ver_tlv->cnvi_top)),
++ 		 INTEL_CNVX_TOP_PACK_SWAB(INTEL_CNVX_TOP_TYPE(ver_tlv->cnvr_top),
++ 					  INTEL_CNVX_TOP_STEP(ver_tlv->cnvr_top)),
++ 		 suffix);
++ }
++ 
++ static int btusb_download_wait(struct hci_dev *hdev, ktime_t calltime, int msec)
++ {
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t delta, rettime;
++ 	unsigned long long duration;
++ 	int err;
++ 
++ 	set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 
++ 	bt_dev_info(hdev, "Waiting for firmware download to complete");
++ 
++ 	err = wait_on_bit_timeout(&data->flags, BTUSB_DOWNLOADING,
++ 				  TASK_INTERRUPTIBLE,
++ 				  msecs_to_jiffies(msec));
++ 	if (err == -EINTR) {
++ 		bt_dev_err(hdev, "Firmware loading interrupted");
++ 		return err;
++ 	}
++ 
++ 	if (err) {
++ 		bt_dev_err(hdev, "Firmware loading timeout");
++ 		return -ETIMEDOUT;
++ 	}
++ 
++ 	if (test_bit(BTUSB_FIRMWARE_FAILED, &data->flags)) {
++ 		bt_dev_err(hdev, "Firmware loading failed");
++ 		return -ENOEXEC;
++ 	}
++ 
++ 	rettime = ktime_get();
++ 	delta = ktime_sub(rettime, calltime);
++ 	duration = (unsigned long long)ktime_to_ns(delta) >> 10;
++ 
++ 	bt_dev_info(hdev, "Firmware loaded in %llu usecs", duration);
++ 
++ 	return 0;
++ }
++ 
++ static int btusb_intel_download_firmware_newgen(struct hci_dev *hdev,
++ 						struct intel_version_tlv *ver,
++ 						u32 *boot_param)
++ {
++ 	const struct firmware *fw;
++ 	char fwname[64];
++ 	int err;
++ 	struct btusb_data *data = hci_get_drvdata(hdev);
++ 	ktime_t calltime;
++ 
++ 	if (!ver || !boot_param)
++ 		return -EINVAL;
++ 
++ 	/* The firmware variant determines if the device is in bootloader
++ 	 * mode or is running operational firmware. The value 0x03 identifies
++ 	 * the bootloader and the value 0x23 identifies the operational
++ 	 * firmware.
++ 	 *
++ 	 * When the operational firmware is already present, then only
++ 	 * the check for valid Bluetooth device address is needed. This
++ 	 * determines if the device will be added as configured or
++ 	 * unconfigured controller.
++ 	 *
++ 	 * It is not possible to use the Secure Boot Parameters in this
++ 	 * case since that command is only available in bootloader mode.
++ 	 */
++ 	if (ver->img_type == 0x03) {
++ 		clear_bit(BTUSB_BOOTLOADER, &data->flags);
++ 		btintel_check_bdaddr(hdev);
++ 	}
++ 
++ 	/* If the OTP has no valid Bluetooth device address, then there will
++ 	 * also be no valid address for the operational firmware.
++ 	 */
++ 	if (!bacmp(&ver->otp_bd_addr, BDADDR_ANY)) {
++ 		bt_dev_info(hdev, "No device address configured");
++ 		set_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks);
++ 	}
++ 
++ 	btusb_setup_intel_newgen_get_fw_name(ver, fwname, sizeof(fwname), "sfi");
++ 	err = firmware_request_nowarn(&fw, fwname, &hdev->dev);
++ 	if (err < 0) {
++ 		if (!test_bit(BTUSB_BOOTLOADER, &data->flags)) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			return 0;
++ 		}
++ 
++ 		bt_dev_err(hdev, "Failed to load Intel firmware file %s (%d)",
++ 			   fwname, err);
++ 
++ 		return err;
++ 	}
++ 
++ 	bt_dev_info(hdev, "Found device firmware: %s", fwname);
++ 
++ 	if (fw->size < 644) {
++ 		bt_dev_err(hdev, "Invalid size of firmware file (%zu)",
++ 			   fw->size);
++ 		err = -EBADF;
++ 		goto done;
++ 	}
++ 
++ 	calltime = ktime_get();
++ 
++ 	set_bit(BTUSB_DOWNLOADING, &data->flags);
++ 
++ 	/* Start firmware downloading and get boot parameter */
++ 	err = btintel_download_firmware_newgen(hdev, ver, fw, boot_param,
++ 					       INTEL_HW_VARIANT(ver->cnvi_bt),
++ 					       ver->sbe_type);
++ 	if (err < 0) {
++ 		if (err == -EALREADY) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			err = 0;
++ 			goto done;
++ 		}
++ 
++ 		/* When FW download fails, send Intel Reset to retry
++ 		 * FW download.
++ 		 */
++ 		btintel_reset_to_bootloader(hdev);
++ 		goto done;
++ 	}
++ 
++ 	/* Before switching the device into operational mode and with that
++ 	 * booting the loaded firmware, wait for the bootloader notification
++ 	 * that all fragments have been successfully received.
++ 	 *
++ 	 * When the event processing receives the notification, then the
++ 	 * BTUSB_DOWNLOADING flag will be cleared.
++ 	 *
++ 	 * The firmware loading should not take longer than 5 seconds
++ 	 * and thus just timeout if that happens and fail the setup
++ 	 * of this device.
++ 	 */
++ 	err = btusb_download_wait(hdev, calltime, 5000);
++ 	if (err == -ETIMEDOUT)
++ 		btintel_reset_to_bootloader(hdev);
++ 
++ done:
++ 	release_firmware(fw);
++ 	return err;
+++>>>>>>> 1f14a620f30b (Bluetooth: btusb: Fix failing to init controllers with operation firmware)
+  }
+  
+  static int btusb_intel_download_firmware(struct hci_dev *hdev,
+@@@ -2570,14 -2686,27 +2734,35 @@@
+  	 */
+  	err = btusb_setup_intel_new_get_fw_name(ver, params, fwname,
+  						sizeof(fwname), "sfi");
+++<<<<<<< HEAD
+ +	if (!err) {
+++=======
++ 	if (err < 0) {
++ 		if (!test_bit(BTUSB_BOOTLOADER, &data->flags)) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			return 0;
++ 		}
++ 
+++>>>>>>> 1f14a620f30b (Bluetooth: btusb: Fix failing to init controllers with operation firmware)
+  		bt_dev_err(hdev, "Unsupported Intel firmware naming");
+  		return -EINVAL;
+  	}
+  
+- 	err = request_firmware(&fw, fwname, &hdev->dev);
++ 	err = firmware_request_nowarn(&fw, fwname, &hdev->dev);
+  	if (err < 0) {
+++<<<<<<< HEAD
+ +		bt_dev_err(hdev, "Failed to load Intel firmware file (%d)", err);
+++=======
++ 		if (!test_bit(BTUSB_BOOTLOADER, &data->flags)) {
++ 			/* Firmware has already been loaded */
++ 			set_bit(BTUSB_FIRMWARE_LOADED, &data->flags);
++ 			return 0;
++ 		}
++ 
++ 		bt_dev_err(hdev, "Failed to load Intel firmware file %s (%d)",
++ 			   fwname, err);
+++>>>>>>> 1f14a620f30b (Bluetooth: btusb: Fix failing to init controllers with operation firmware)
+  		return err;
+  	}
+  
+* Unmerged path drivers/bluetooth/btusb.c
