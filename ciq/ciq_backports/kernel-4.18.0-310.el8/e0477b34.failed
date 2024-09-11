@@ -1,0 +1,428 @@
+RDMA: Explicitly pass in the dma_device to ib_register_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit e0477b34d9d11c1a7b1f80bfdbcdc8952ce2adb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/e0477b34.failed
+
+The code in setup_dma_device has become rather convoluted, move all of
+this to the drivers. Drives now pass in a DMA capable struct device which
+will be used to setup DMA, or drivers must fully configure the ibdev for
+DMA and pass in NULL.
+
+Other than setting the masks in rvt all drivers were doing this already
+anyhow.
+
+mthca, mlx4 and mlx5 were already setting up maximum DMA segment size for
+DMA based on their hardweare limits in:
+__mthca_init_one()
+  dma_set_max_seg_size (1G)
+
+__mlx4_init_one()
+  dma_set_max_seg_size (1G)
+
+mlx5_pci_init()
+  set_dma_caps()
+    dma_set_max_seg_size (2G)
+
+Other non software drivers (except usnic) were extended to UINT_MAX [1, 2]
+instead of 2G as was before.
+
+[1] https://lore.kernel.org/linux-rdma/20200924114940.GE9475@nvidia.com/
+[2] https://lore.kernel.org/linux-rdma/20200924114940.GE9475@nvidia.com/
+
+Link: https://lore.kernel.org/r/20201008082752.275846-1-leon@kernel.org
+Link: https://lore.kernel.org/r/6b2ed339933d066622d5715903870676d8cc523a.1602590106.git.mchehab+huawei@kernel.org
+	Suggested-by: Christoph Hellwig <hch@infradead.org>
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Mauro Carvalho Chehab <mchehab+huawei@kernel.org>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit e0477b34d9d11c1a7b1f80bfdbcdc8952ce2adb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/hw/usnic/usnic_ib_main.c
+diff --cc drivers/infiniband/core/device.c
+index 30a7bf1c3b41,a3b1fc84cdca..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -1182,54 -1177,23 +1182,71 @@@ out
+  	return ret;
+  }
+  
+- static void setup_dma_device(struct ib_device *device)
++ static void setup_dma_device(struct ib_device *device,
++ 			     struct device *dma_device)
+  {
+++<<<<<<< HEAD
+ +	struct device *parent = device->dev.parent;
+ +
+ +	WARN_ON_ONCE(device->dma_device);
+ +	if (device->dev.dma_ops) {
+ +		/*
+ +		 * The caller provided custom DMA operations. Copy the
+ +		 * DMA-related fields that are used by e.g. dma_alloc_coherent()
+ +		 * into device->dev.
+ +		 */
+ +		device->dma_device = &device->dev;
+ +		if (!device->dev.dma_mask) {
+ +			if (parent)
+ +				device->dev.dma_mask = parent->dma_mask;
+ +			else
+ +				WARN_ON_ONCE(true);
+ +		}
+ +		if (!device->dev.coherent_dma_mask) {
+ +			if (parent)
+ +				device->dev.coherent_dma_mask =
+ +					parent->coherent_dma_mask;
+ +			else
+ +				WARN_ON_ONCE(true);
+ +		}
+ +	} else {
+ +		/*
+ +		 * The caller did not provide custom DMA operations. Use the
+ +		 * DMA mapping operations of the parent device.
+ +		 */
+ +		WARN_ON_ONCE(!parent);
+ +		device->dma_device = parent;
+ +	}
+ +
+ +	if (!device->dev.dma_parms) {
+ +		if (parent) {
+ +			/*
+ +			 * The caller did not provide DMA parameters, so
+ +			 * 'parent' probably represents a PCI device. The PCI
+ +			 * core sets the maximum segment size to 64
+ +			 * KB. Increase this parameter to 2 GB.
+ +			 */
+ +			device->dev.dma_parms = parent->dma_parms;
+ +			dma_set_max_seg_size(device->dma_device, SZ_2G);
+ +		} else {
+ +			WARN_ON_ONCE(true);
+ +		}
+++=======
++ 	/*
++ 	 * If the caller does not provide a DMA capable device then the IB
++ 	 * device will be used. In this case the caller should fully setup the
++ 	 * ibdev for DMA. This usually means using dma_virt_ops.
++ 	 */
++ #ifdef CONFIG_DMA_VIRT_OPS
++ 	if (!dma_device) {
++ 		device->dev.dma_ops = &dma_virt_ops;
++ 		dma_device = &device->dev;
+++>>>>>>> e0477b34d9d1 (RDMA: Explicitly pass in the dma_device to ib_register_device)
+  	}
++ #endif
++ 	WARN_ON(!dma_device);
++ 	device->dma_device = dma_device;
++ 	WARN_ON(!device->dma_device->dma_parms);
+  }
+  
+  /*
+diff --cc drivers/infiniband/hw/usnic/usnic_ib_main.c
+index 73966edf92b7,aa2e65fc5cd6..000000000000
+--- a/drivers/infiniband/hw/usnic/usnic_ib_main.c
++++ b/drivers/infiniband/hw/usnic/usnic_ib_main.c
+@@@ -411,22 -421,14 +411,31 @@@ static void *usnic_ib_device_add(struc
+  
+  	rdma_set_device_sysfs_group(&us_ibdev->ib_dev, &usnic_attr_group);
+  
+++<<<<<<< HEAD
+ +	if (ib_register_device(&us_ibdev->ib_dev, "usnic_%d"))
+++=======
++ 	ret = ib_device_set_netdev(&us_ibdev->ib_dev, us_ibdev->netdev, 1);
++ 	if (ret)
++ 		goto err_fwd_dealloc;
++ 
++ 	dma_set_max_seg_size(&dev->dev, SZ_2G);
++ 	if (ib_register_device(&us_ibdev->ib_dev, "usnic_%d", &dev->dev))
+++>>>>>>> e0477b34d9d1 (RDMA: Explicitly pass in the dma_device to ib_register_device)
+  		goto err_fwd_dealloc;
+  
+ +	us_ibdev->netdev_nb.notifier_call = usnic_ib_netdevice_event;
+ +	err = register_netdevice_notifier(&us_ibdev->netdev_nb);
+ +	if (err) {
+ +		usnic_err("Failed to register netdev notifier\n");
+ +		goto err_fwd_dealloc;
+ +	}
+ +	us_ibdev->inet_nb.notifier_call = usnic_ib_inetaddr_event;
+ +	err = register_inetaddr_notifier(&us_ibdev->inet_nb);
+ +	if (err) {
+ +		usnic_err("Failed to register inet addr notifier\n");
+ +		goto err_netdev_notifier;
+ +	}
+ +
+  	usnic_fwd_set_mtu(us_ibdev->ufdev, us_ibdev->netdev->mtu);
+  	usnic_fwd_set_mac(us_ibdev->ufdev, us_ibdev->netdev->dev_addr);
+  	if (netif_carrier_ok(us_ibdev->netdev))
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index 53aee5a42ab8..04621ba8fa76 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -736,7 +736,8 @@ static int bnxt_re_register_ib(struct bnxt_re_dev *rdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	return ib_register_device(ibdev, "bnxt_re%d");
++	dma_set_max_seg_size(&rdev->en_dev->pdev->dev, UINT_MAX);
++	return ib_register_device(ibdev, "bnxt_re%d", &rdev->en_dev->pdev->dev);
+ }
+ 
+ static void bnxt_re_dev_remove(struct bnxt_re_dev *rdev)
+diff --git a/drivers/infiniband/hw/cxgb4/provider.c b/drivers/infiniband/hw/cxgb4/provider.c
+index 14acc29b648f..72abb0e6b963 100644
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@ -568,7 +568,9 @@ void c4iw_register_device(struct work_struct *work)
+ 	ret = set_netdevs(&dev->ibdev, &dev->rdev);
+ 	if (ret)
+ 		goto err_dealloc_ctx;
+-	ret = ib_register_device(&dev->ibdev, "cxgb4_%d");
++	dma_set_max_seg_size(&dev->rdev.lldi.pdev->dev, UINT_MAX);
++	ret = ib_register_device(&dev->ibdev, "cxgb4_%d",
++				 &dev->rdev.lldi.pdev->dev);
+ 	if (ret)
+ 		goto err_dealloc_ctx;
+ 	return;
+diff --git a/drivers/infiniband/hw/efa/efa_main.c b/drivers/infiniband/hw/efa/efa_main.c
+index 92d701146320..6faed3a81e08 100644
+--- a/drivers/infiniband/hw/efa/efa_main.c
++++ b/drivers/infiniband/hw/efa/efa_main.c
+@@ -331,7 +331,7 @@ static int efa_ib_device_add(struct efa_dev *dev)
+ 
+ 	ib_set_device_ops(&dev->ibdev, &efa_dev_ops);
+ 
+-	err = ib_register_device(&dev->ibdev, "efa_%d");
++	err = ib_register_device(&dev->ibdev, "efa_%d", &pdev->dev);
+ 	if (err)
+ 		goto err_release_doorbell_bar;
+ 
+@@ -418,7 +418,7 @@ static int efa_device_init(struct efa_com_dev *edev, struct pci_dev *pdev)
+ 			err);
+ 		return err;
+ 	}
+-
++	dma_set_max_seg_size(&pdev->dev, UINT_MAX);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/infiniband/hw/hns/hns_roce_main.c b/drivers/infiniband/hw/hns/hns_roce_main.c
+index 8b1f50f7c10f..1f7d701fef9c 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -511,7 +511,8 @@ static int hns_roce_register_device(struct hns_roce_dev *hr_dev)
+ 		if (ret)
+ 			return ret;
+ 	}
+-	ret = ib_register_device(ib_dev, "hns_%d");
++	dma_set_max_seg_size(dev, UINT_MAX);
++	ret = ib_register_device(ib_dev, "hns_%d", dev);
+ 	if (ret) {
+ 		dev_err(dev, "ib_register_device failed!\n");
+ 		return ret;
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index f03d9769941c..d3be8df524cb 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -2765,7 +2765,8 @@ int i40iw_register_rdma_device(struct i40iw_device *iwdev)
+ 	if (ret)
+ 		goto error;
+ 
+-	ret = ib_register_device(&iwibdev->ibdev, "i40iw%d");
++	dma_set_max_seg_size(&iwdev->hw.pcidev->dev, UINT_MAX);
++	ret = ib_register_device(&iwibdev->ibdev, "i40iw%d", &iwdev->hw.pcidev->dev);
+ 	if (ret)
+ 		goto error;
+ 
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index 83d23bae44ad..3fa8c7a8420c 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -2839,7 +2839,8 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+ 		goto err_steer_free_bitmap;
+ 
+ 	rdma_set_device_sysfs_group(&ibdev->ib_dev, &mlx4_attr_group);
+-	if (ib_register_device(&ibdev->ib_dev, "mlx4_%d"))
++	if (ib_register_device(&ibdev->ib_dev, "mlx4_%d",
++			       &dev->persist->pdev->dev))
+ 		goto err_diag_counters;
+ 
+ 	if (mlx4_ib_mad_init(ibdev))
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 97d5f414e693..98b1ee9743d3 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -4391,7 +4391,7 @@ static int mlx5_ib_stage_ib_reg_init(struct mlx5_ib_dev *dev)
+ 		name = "mlx5_%d";
+ 	else
+ 		name = "mlx5_bond_%d";
+-	return ib_register_device(&dev->ib_dev, name);
++	return ib_register_device(&dev->ib_dev, name, &dev->mdev->pdev->dev);
+ }
+ 
+ static void mlx5_ib_stage_pre_ib_reg_umr_cleanup(struct mlx5_ib_dev *dev)
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index 368e0268177f..759e6c84c415 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -1201,7 +1201,7 @@ int mthca_register_device(struct mthca_dev *dev)
+ 	mutex_init(&dev->cap_mask_mutex);
+ 
+ 	rdma_set_device_sysfs_group(&dev->ib_dev, &mthca_attr_group);
+-	ret = ib_register_device(&dev->ib_dev, "mthca%d");
++	ret = ib_register_device(&dev->ib_dev, "mthca%d", &dev->pdev->dev);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_main.c b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+index c15cfc6cef81..9149f5227e7b 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_main.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+@@ -256,7 +256,9 @@ static int ocrdma_register_device(struct ocrdma_dev *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	return ib_register_device(&dev->ibdev, "ocrdma%d");
++	dma_set_max_seg_size(&dev->nic_info.pdev->dev, UINT_MAX);
++	return ib_register_device(&dev->ibdev, "ocrdma%d",
++				  &dev->nic_info.pdev->dev);
+ }
+ 
+ static int ocrdma_alloc_resources(struct ocrdma_dev *dev)
+diff --git a/drivers/infiniband/hw/qedr/main.c b/drivers/infiniband/hw/qedr/main.c
+index bf098224e118..f64466c882b5 100644
+--- a/drivers/infiniband/hw/qedr/main.c
++++ b/drivers/infiniband/hw/qedr/main.c
+@@ -293,7 +293,8 @@ static int qedr_register_device(struct qedr_dev *dev)
+ 	if (rc)
+ 		return rc;
+ 
+-	return ib_register_device(&dev->ibdev, "qedr%d");
++	dma_set_max_seg_size(&dev->pdev->dev, UINT_MAX);
++	return ib_register_device(&dev->ibdev, "qedr%d", &dev->pdev->dev);
+ }
+ 
+ /* This function allocates fast-path status block memory */
+* Unmerged path drivers/infiniband/hw/usnic/usnic_ib_main.c
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+index 10e67283b9db..6895bac53990 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+@@ -270,7 +270,7 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
+ 	spin_lock_init(&dev->srq_tbl_lock);
+ 	rdma_set_device_sysfs_group(&dev->ib_dev, &pvrdma_attr_group);
+ 
+-	ret = ib_register_device(&dev->ib_dev, "vmw_pvrdma%d");
++	ret = ib_register_device(&dev->ib_dev, "vmw_pvrdma%d", &dev->pdev->dev);
+ 	if (ret)
+ 		goto err_srq_free;
+ 
+@@ -854,7 +854,7 @@ static int pvrdma_pci_probe(struct pci_dev *pdev,
+ 			goto err_free_resource;
+ 		}
+ 	}
+-
++	dma_set_max_seg_size(&pdev->dev, UINT_MAX);
+ 	pci_set_master(pdev);
+ 
+ 	/* Map register space */
+diff --git a/drivers/infiniband/sw/rdmavt/vt.c b/drivers/infiniband/sw/rdmavt/vt.c
+index 2d534c450f3c..52218684ad4a 100644
+--- a/drivers/infiniband/sw/rdmavt/vt.c
++++ b/drivers/infiniband/sw/rdmavt/vt.c
+@@ -579,7 +579,9 @@ int rvt_register_device(struct rvt_dev_info *rdi)
+ 	spin_lock_init(&rdi->n_cqs_lock);
+ 
+ 	/* DMA Operations */
+-	rdi->ibdev.dev.dma_ops = rdi->ibdev.dev.dma_ops ? : &dma_virt_ops;
++	rdi->ibdev.dev.dma_parms = rdi->ibdev.dev.parent->dma_parms;
++	dma_set_coherent_mask(&rdi->ibdev.dev,
++			      rdi->ibdev.dev.parent->coherent_dma_mask);
+ 
+ 	/* Protection Domain */
+ 	spin_lock_init(&rdi->n_pds_lock);
+@@ -627,7 +629,7 @@ int rvt_register_device(struct rvt_dev_info *rdi)
+ 		rdi->ibdev.num_comp_vectors = 1;
+ 
+ 	/* We are now good to announce we exist */
+-	ret = ib_register_device(&rdi->ibdev, dev_name(&rdi->ibdev.dev));
++	ret = ib_register_device(&rdi->ibdev, dev_name(&rdi->ibdev.dev), NULL);
+ 	if (ret) {
+ 		rvt_pr_err(rdi, "Failed to register driver with ib core.\n");
+ 		goto bail_wss;
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index 6f655b55dded..b340eb8a1581 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -1126,12 +1126,9 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name)
+ 	dev->local_dma_lkey = 0;
+ 	addrconf_addr_eui48((unsigned char *)&dev->node_guid,
+ 			    rxe->ndev->dev_addr);
+-	dev->dev.dma_ops = &dma_virt_ops;
+ 	dev->dev.dma_parms = &rxe->dma_parms;
+-	rxe->dma_parms = (struct device_dma_parameters)
+-		{ .max_segment_size = SZ_2G };
+-	dma_coerce_mask_and_coherent(&dev->dev,
+-				     dma_get_required_mask(&dev->dev));
++	dma_set_max_seg_size(&dev->dev, UINT_MAX);
++	dma_set_coherent_mask(&dev->dev, dma_get_required_mask(&dev->dev));
+ 
+ 	dev->uverbs_cmd_mask = BIT_ULL(IB_USER_VERBS_CMD_GET_CONTEXT)
+ 	    | BIT_ULL(IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL)
+@@ -1180,7 +1177,7 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name)
+ 	rxe->tfm = tfm;
+ 
+ 	rdma_set_device_sysfs_group(dev, &rxe_attr_group);
+-	err = ib_register_device(dev, ibdev_name);
++	err = ib_register_device(dev, ibdev_name, NULL);
+ 	if (err)
+ 		pr_warn("%s failed with error %d\n", __func__, err);
+ 
+diff --git a/drivers/infiniband/sw/siw/siw_main.c b/drivers/infiniband/sw/siw/siw_main.c
+index 3b707def889f..6e756eec6baf 100644
+--- a/drivers/infiniband/sw/siw/siw_main.c
++++ b/drivers/infiniband/sw/siw/siw_main.c
+@@ -69,7 +69,7 @@ static int siw_device_register(struct siw_device *sdev, const char *name)
+ 
+ 	sdev->vendor_part_id = dev_id++;
+ 
+-	rv = ib_register_device(base_dev, name);
++	rv = ib_register_device(base_dev, name, NULL);
+ 	if (rv) {
+ 		pr_warn("siw: device registration error %d\n", rv);
+ 		return rv;
+@@ -382,10 +382,10 @@ static struct siw_device *siw_device_create(struct net_device *netdev)
+ 	 */
+ 	base_dev->phys_port_cnt = 1;
+ 	base_dev->dev.parent = parent;
+-	base_dev->dev.dma_ops = &dma_virt_ops;
+ 	base_dev->dev.dma_parms = &sdev->dma_parms;
+-	sdev->dma_parms = (struct device_dma_parameters)
+-		{ .max_segment_size = SZ_2G };
++	dma_set_max_seg_size(&base_dev->dev, UINT_MAX);
++	dma_set_coherent_mask(&base_dev->dev,
++			      dma_get_required_mask(&base_dev->dev));
+ 	base_dev->num_comp_vectors = num_possible_cpus();
+ 
+ 	xa_init_flags(&sdev->qp_xa, XA_FLAGS_ALLOC1);
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index a63d25a22e2f..6600d03d046a 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2785,7 +2785,8 @@ void ib_dealloc_device(struct ib_device *device);
+ 
+ void ib_get_device_fw_str(struct ib_device *device, char *str);
+ 
+-int ib_register_device(struct ib_device *device, const char *name);
++int ib_register_device(struct ib_device *device, const char *name,
++		       struct device *dma_device);
+ void ib_unregister_device(struct ib_device *device);
+ void ib_unregister_driver(enum rdma_driver_id driver_id);
+ void ib_unregister_device_and_put(struct ib_device *device);
