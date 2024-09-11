@@ -1,0 +1,97 @@
+net/smc: Fix af_ops of child socket pointing to released memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 49b7d376abe54a49e8bd5e64824032b7c97c62d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/49b7d376.failed
+
+Child sockets may inherit the af_ops from the parent listen socket.
+When the listen socket is released then the af_ops of the child socket
+points to released memory.
+Solve that by restoring the original af_ops for child sockets which
+inherited the parent af_ops. And clear any inherited user_data of the
+parent socket.
+
+Fixes: 8270d9c21041 ("net/smc: Limit backlog connections")
+	Reviewed-by: Wenjia Zhang <wenjia@linux.ibm.com>
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: D. Wythe <alibuda@linux.alibaba.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 49b7d376abe54a49e8bd5e64824032b7c97c62d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/af_smc.c
+diff --cc net/smc/af_smc.c
+index c97c5de215d7,14ddc40149e8..000000000000
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@@ -71,6 -113,61 +71,64 @@@ static void smc_set_keepalive(struct so
+  	smc->clcsock->sk->sk_prot->keepalive(smc->clcsock->sk, val);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sock *smc_tcp_syn_recv_sock(const struct sock *sk,
++ 					  struct sk_buff *skb,
++ 					  struct request_sock *req,
++ 					  struct dst_entry *dst,
++ 					  struct request_sock *req_unhash,
++ 					  bool *own_req)
++ {
++ 	struct smc_sock *smc;
++ 	struct sock *child;
++ 
++ 	smc = smc_clcsock_user_data(sk);
++ 
++ 	if (READ_ONCE(sk->sk_ack_backlog) + atomic_read(&smc->queued_smc_hs) >
++ 				sk->sk_max_ack_backlog)
++ 		goto drop;
++ 
++ 	if (sk_acceptq_is_full(&smc->sk)) {
++ 		NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
++ 		goto drop;
++ 	}
++ 
++ 	/* passthrough to original syn recv sock fct */
++ 	child = smc->ori_af_ops->syn_recv_sock(sk, skb, req, dst, req_unhash,
++ 					       own_req);
++ 	/* child must not inherit smc or its ops */
++ 	if (child) {
++ 		rcu_assign_sk_user_data(child, NULL);
++ 
++ 		/* v4-mapped sockets don't inherit parent ops. Don't restore. */
++ 		if (inet_csk(child)->icsk_af_ops == inet_csk(sk)->icsk_af_ops)
++ 			inet_csk(child)->icsk_af_ops = smc->ori_af_ops;
++ 	}
++ 	return child;
++ 
++ drop:
++ 	dst_release(dst);
++ 	tcp_listendrop(sk);
++ 	return NULL;
++ }
++ 
++ static bool smc_hs_congested(const struct sock *sk)
++ {
++ 	const struct smc_sock *smc;
++ 
++ 	smc = smc_clcsock_user_data(sk);
++ 
++ 	if (!smc)
++ 		return true;
++ 
++ 	if (workqueue_congested(WORK_CPU_UNBOUND, smc_hs_wq))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 49b7d376abe5 (net/smc: Fix af_ops of child socket pointing to released memory)
+  static struct smc_hashinfo smc_v4_hashinfo = {
+  	.lock = __RW_LOCK_UNLOCKED(smc_v4_hashinfo.lock),
+  };
+* Unmerged path net/smc/af_smc.c
