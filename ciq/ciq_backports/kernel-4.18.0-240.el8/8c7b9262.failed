@@ -1,0 +1,142 @@
+gfs2: Give up the iopen glock on contention
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 8c7b9262a8607636ecd7250f29c7aac17f08901c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8c7b9262.failed
+
+When there's contention on the iopen glock, it means that the link count
+of the corresponding inode has dropped to zero on a remote node which is
+now trying to delete the inode.  In that case, try to evict the inode so
+that the iopen glock will be released, which will allow the remote node
+to do its job.
+
+When the inode is still open locally, the inode's reference count won't
+drop to zero and so we'll keep holding the inode and its iopen glock.
+The remote node will time out its request to grab the iopen glock, and
+when the inode is finally closed locally, we'll try to delete it
+ourself.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 8c7b9262a8607636ecd7250f29c7aac17f08901c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index 76c32d90eaaf,bf7daa35f73f..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -669,9 -755,65 +669,67 @@@ out_unlock
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void gfs2_inode_remember_delete(struct gfs2_glock *gl, u64 generation)
++ {
++ 	struct gfs2_inode_lvb *ri = (void *)gl->gl_lksb.sb_lvbptr;
++ 
++ 	if (ri->ri_magic == 0)
++ 		ri->ri_magic = cpu_to_be32(GFS2_MAGIC);
++ 	if (ri->ri_magic == cpu_to_be32(GFS2_MAGIC))
++ 		ri->ri_generation_deleted = cpu_to_be64(generation);
++ }
++ 
++ bool gfs2_inode_already_deleted(struct gfs2_glock *gl, u64 generation)
++ {
++ 	struct gfs2_inode_lvb *ri = (void *)gl->gl_lksb.sb_lvbptr;
++ 
++ 	if (ri->ri_magic != cpu_to_be32(GFS2_MAGIC))
++ 		return false;
++ 	return generation <= be64_to_cpu(ri->ri_generation_deleted);
++ }
++ 
++ static bool gfs2_try_evict(struct gfs2_glock *gl)
++ {
++ 	struct gfs2_inode *ip;
++ 	bool evicted = false;
++ 
++ 	/*
++ 	 * If there is contention on the iopen glock and we have an inode, try
++ 	 * to grab and release the inode so that it can be evicted.  This will
++ 	 * allow the remote node to go ahead and delete the inode without us
++ 	 * having to do it, which will avoid rgrp glock thrashing.
++ 	 *
++ 	 * The remote node is likely still holding the corresponding inode
++ 	 * glock, so it will run before we get to verify that the delete has
++ 	 * happened below.
++ 	 */
++ 	spin_lock(&gl->gl_lockref.lock);
++ 	ip = gl->gl_object;
++ 	if (ip && !igrab(&ip->i_inode))
++ 		ip = NULL;
++ 	spin_unlock(&gl->gl_lockref.lock);
++ 	if (ip) {
++ 		set_bit(GIF_DEFERRED_DELETE, &ip->i_flags);
++ 		d_prune_aliases(&ip->i_inode);
++ 		iput(&ip->i_inode);
++ 
++ 		/* If the inode was evicted, gl->gl_object will now be NULL. */
++ 		spin_lock(&gl->gl_lockref.lock);
++ 		ip = gl->gl_object;
++ 		if (ip)
++ 			clear_bit(GIF_DEFERRED_DELETE, &ip->i_flags);
++ 		spin_unlock(&gl->gl_lockref.lock);
++ 		evicted = !ip;
++ 	}
++ 	return evicted;
++ }
++ 
+++>>>>>>> 8c7b9262a860 (gfs2: Give up the iopen glock on contention)
+  static void delete_work_func(struct work_struct *work)
+  {
+ -	struct delayed_work *dwork = to_delayed_work(work);
+ -	struct gfs2_glock *gl = container_of(dwork, struct gfs2_glock, gl_delete);
+ +	struct gfs2_glock *gl = container_of(work, struct gfs2_glock, gl_delete);
+  	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  	struct inode *inode;
+  	u64 no_addr = gl->gl_name.ln_number;
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index bfd74134b369..b6dbf005962b 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -404,6 +404,7 @@ enum {
+ 	GIF_ORDERED		= 4,
+ 	GIF_FREE_VFS_INODE      = 5,
+ 	GIF_GLOP_PENDING	= 6,
++	GIF_DEFERRED_DELETE	= 7,
+ };
+ 
+ struct gfs2_inode {
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index 54e9fed68925..c296faba6af6 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1588,9 +1588,12 @@ static void gfs2_evict_inode(struct inode *inode)
+ 	if (test_bit(GIF_ALLOC_FAILED, &ip->i_flags)) {
+ 		BUG_ON(!gfs2_glock_is_locked_by_me(ip->i_gl));
+ 		gfs2_holder_mark_uninitialized(&gh);
+-		goto alloc_failed;
++		goto out_delete;
+ 	}
+ 
++	if (test_bit(GIF_DEFERRED_DELETE, &ip->i_flags))
++		goto out;
++
+ 	/* Deletes should never happen under memory pressure anymore.  */
+ 	if (WARN_ON_ONCE(current->flags & PF_MEMALLOC))
+ 		goto out;
+@@ -1620,7 +1623,7 @@ static void gfs2_evict_inode(struct inode *inode)
+ 	if (inode->i_nlink)
+ 		goto out_truncate;
+ 
+-alloc_failed:
++out_delete:
+ 	if (gfs2_holder_initialized(&ip->i_iopen_gh) &&
+ 	    test_bit(HIF_HOLDER, &ip->i_iopen_gh.gh_iflags)) {
+ 		ip->i_iopen_gh.gh_flags |= GL_NOCACHE;
