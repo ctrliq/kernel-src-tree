@@ -1,0 +1,79 @@
+mm: memcontrol: fix stat-corrupting race in charge moving
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit abb242f57196dbaa108271575353a0453f6834ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/abb242f5.failed
+
+The move_lock is a per-memcg lock, but the VM accounting code that needs
+to acquire it comes from the page and follows page->mem_cgroup under RCU
+protection.  That means that the page becomes unlocked not when we drop
+the move_lock, but when we update page->mem_cgroup.  And that assignment
+doesn't imply any memory ordering.  If that pointer write gets reordered
+against the reads of the page state - page_mapped, PageDirty etc.  the
+state may change while we rely on it being stable and we can end up
+corrupting the counters.
+
+Place an SMP memory barrier to make sure we're done with all page state by
+the time the new page->mem_cgroup becomes visible.
+
+Also replace the open-coded move_lock with a lock_page_memcg() to make it
+more obvious what we're serializing against.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Alex Shi <alex.shi@linux.alibaba.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+Link: http://lkml.kernel.org/r/20200508183105.225460-3-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit abb242f57196dbaa108271575353a0453f6834ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index ef707fd00e25,8f95896c5aa1..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -5353,14 -5480,23 +5347,29 @@@ static int mem_cgroup_move_account(stru
+  	}
+  
+  	/*
++ 	 * All state has been migrated, let's switch to the new memcg.
++ 	 *
+  	 * It is safe to change page->mem_cgroup here because the page
+- 	 * is referenced, charged, and isolated - we can't race with
+- 	 * uncharging, charging, migration, or LRU putback.
++ 	 * is referenced, charged, isolated, and locked: we can't race
++ 	 * with (un)charging, migration, LRU putback, or anything else
++ 	 * that would rely on a stable page->mem_cgroup.
++ 	 *
++ 	 * Note that lock_page_memcg is a memcg lock, not a page lock,
++ 	 * to save space. As soon as we switch page->mem_cgroup to a
++ 	 * new memcg that isn't locked, the above state can change
++ 	 * concurrently again. Make sure we're truly done with it.
+  	 */
++ 	smp_mb();
+  
+++<<<<<<< HEAD
+ +	/* caller should have done css_get */
+ +	page->mem_cgroup = to;
+ +	spin_unlock_irqrestore(&from->move_lock, flags);
+++=======
++ 	page->mem_cgroup = to; 	/* caller should have done css_get */
++ 
++ 	__unlock_page_memcg(from);
+++>>>>>>> abb242f57196 (mm: memcontrol: fix stat-corrupting race in charge moving)
+  
+  	ret = 0;
+  
+* Unmerged path mm/memcontrol.c
