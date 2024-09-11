@@ -1,0 +1,170 @@
+ceph: allow arbitrary security.* xattrs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jeff Layton <jlayton@kernel.org>
+commit b8fe918b090442447d821b32b7dd6e17d5b5dfc1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b8fe918b.failed
+
+Most filesystems don't limit what security.* xattrs can be set or
+fetched. I see no reason that we need to limit that on cephfs either.
+
+Drop the special xattr handler for "security." xattrs, and allow the
+"other" xattr handler to handle security xattrs as well.
+
+In addition to fixing xfstest generic/093, this allows us to support
+per-file capabilities (a'la setcap(8)).
+
+Link: https://tracker.ceph.com/issues/41135
+	Signed-off-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit b8fe918b090442447d821b32b7dd6e17d5b5dfc1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/xattr.c
+diff --cc fs/ceph/xattr.c
+index b56f150a7d46,cb18ee637cb7..000000000000
+--- a/fs/ceph/xattr.c
++++ b/fs/ceph/xattr.c
+@@@ -17,26 -18,10 +17,31 @@@
+  static int __remove_xattr(struct ceph_inode_info *ci,
+  			  struct ceph_inode_xattr *xattr);
+  
+ +static const struct xattr_handler ceph_other_xattr_handler;
+ +
+ +/*
+ + * List of handlers for synthetic system.* attributes. Other
+ + * attributes are handled directly.
+ + */
+ +const struct xattr_handler *ceph_xattr_handlers[] = {
+ +#ifdef CONFIG_CEPH_FS_POSIX_ACL
+ +	&posix_acl_access_xattr_handler,
+ +	&posix_acl_default_xattr_handler,
+ +#endif
+ +	&ceph_other_xattr_handler,
+ +	NULL,
+ +};
+ +
+  static bool ceph_is_valid_xattr(const char *name)
+  {
+++<<<<<<< HEAD
+ +	return !strncmp(name, XATTR_CEPH_PREFIX, XATTR_CEPH_PREFIX_LEN) ||
+ +	       !strncmp(name, XATTR_SECURITY_PREFIX,
+ +			XATTR_SECURITY_PREFIX_LEN) ||
+++=======
++ 	return !strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN) ||
++ 	       !strncmp(name, XATTR_CEPH_PREFIX, XATTR_CEPH_PREFIX_LEN) ||
+++>>>>>>> b8fe918b0904 (ceph: allow arbitrary security.* xattrs)
+  	       !strncmp(name, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN) ||
+  	       !strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN);
+  }
+@@@ -1211,4 -1196,101 +1216,105 @@@ bool ceph_security_xattr_deadlock(struc
+  	spin_unlock(&ci->i_ceph_lock);
+  	return ret;
+  }
+++<<<<<<< HEAD
+ +#endif
+++=======
++ 
++ #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
++ int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
++ 			   struct ceph_acl_sec_ctx *as_ctx)
++ {
++ 	struct ceph_pagelist *pagelist = as_ctx->pagelist;
++ 	const char *name;
++ 	size_t name_len;
++ 	int err;
++ 
++ 	err = security_dentry_init_security(dentry, mode, &dentry->d_name,
++ 					    &as_ctx->sec_ctx,
++ 					    &as_ctx->sec_ctxlen);
++ 	if (err < 0) {
++ 		WARN_ON_ONCE(err != -EOPNOTSUPP);
++ 		err = 0; /* do nothing */
++ 		goto out;
++ 	}
++ 
++ 	err = -ENOMEM;
++ 	if (!pagelist) {
++ 		pagelist = ceph_pagelist_alloc(GFP_KERNEL);
++ 		if (!pagelist)
++ 			goto out;
++ 		err = ceph_pagelist_reserve(pagelist, PAGE_SIZE);
++ 		if (err)
++ 			goto out;
++ 		ceph_pagelist_encode_32(pagelist, 1);
++ 	}
++ 
++ 	/*
++ 	 * FIXME: Make security_dentry_init_security() generic. Currently
++ 	 * It only supports single security module and only selinux has
++ 	 * dentry_init_security hook.
++ 	 */
++ 	name = XATTR_NAME_SELINUX;
++ 	name_len = strlen(name);
++ 	err = ceph_pagelist_reserve(pagelist,
++ 				    4 * 2 + name_len + as_ctx->sec_ctxlen);
++ 	if (err)
++ 		goto out;
++ 
++ 	if (as_ctx->pagelist) {
++ 		/* update count of KV pairs */
++ 		BUG_ON(pagelist->length <= sizeof(__le32));
++ 		if (list_is_singular(&pagelist->head)) {
++ 			le32_add_cpu((__le32*)pagelist->mapped_tail, 1);
++ 		} else {
++ 			struct page *page = list_first_entry(&pagelist->head,
++ 							     struct page, lru);
++ 			void *addr = kmap_atomic(page);
++ 			le32_add_cpu((__le32*)addr, 1);
++ 			kunmap_atomic(addr);
++ 		}
++ 	} else {
++ 		as_ctx->pagelist = pagelist;
++ 	}
++ 
++ 	ceph_pagelist_encode_32(pagelist, name_len);
++ 	ceph_pagelist_append(pagelist, name, name_len);
++ 
++ 	ceph_pagelist_encode_32(pagelist, as_ctx->sec_ctxlen);
++ 	ceph_pagelist_append(pagelist, as_ctx->sec_ctx, as_ctx->sec_ctxlen);
++ 
++ 	err = 0;
++ out:
++ 	if (pagelist && !as_ctx->pagelist)
++ 		ceph_pagelist_release(pagelist);
++ 	return err;
++ }
++ #endif /* CONFIG_CEPH_FS_SECURITY_LABEL */
++ #endif /* CONFIG_SECURITY */
++ 
++ void ceph_release_acl_sec_ctx(struct ceph_acl_sec_ctx *as_ctx)
++ {
++ #ifdef CONFIG_CEPH_FS_POSIX_ACL
++ 	posix_acl_release(as_ctx->acl);
++ 	posix_acl_release(as_ctx->default_acl);
++ #endif
++ #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
++ 	security_release_secctx(as_ctx->sec_ctx, as_ctx->sec_ctxlen);
++ #endif
++ 	if (as_ctx->pagelist)
++ 		ceph_pagelist_release(as_ctx->pagelist);
++ }
++ 
++ /*
++  * List of handlers for synthetic system.* attributes. Other
++  * attributes are handled directly.
++  */
++ const struct xattr_handler *ceph_xattr_handlers[] = {
++ #ifdef CONFIG_CEPH_FS_POSIX_ACL
++ 	&posix_acl_access_xattr_handler,
++ 	&posix_acl_default_xattr_handler,
++ #endif
++ 	&ceph_other_xattr_handler,
++ 	NULL,
++ };
+++>>>>>>> b8fe918b0904 (ceph: allow arbitrary security.* xattrs)
+* Unmerged path fs/ceph/xattr.c
