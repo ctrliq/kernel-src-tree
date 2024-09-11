@@ -1,0 +1,160 @@
+net: bridge: fix build when setting skb->offload_fwd_mark with CONFIG_NET_SWITCHDEV=n
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit c5381154393d42e2edd77fc74f1493f9f93908cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c5381154.failed
+
+Switchdev support can be disabled at compile time, and in that case,
+struct sk_buff will not contain the offload_fwd_mark field.
+
+To make the code in br_forward.c work in both cases, we do what is done
+in other places and we create a helper function, with an empty shim
+definition, that is implemented by the br_switchdev.o translation module.
+This is always compiled if and only if CONFIG_NET_SWITCHDEV is y or m.
+
+	Reported-by: kernel test robot <lkp@intel.com>
+Fixes: 472111920f1c ("net: bridge: switchdev: allow the TX data plane forwarding to be offloaded")
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c5381154393d42e2edd77fc74f1493f9f93908cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_forward.c
+#	net/bridge/br_private.h
+#	net/bridge/br_switchdev.c
+diff --cc net/bridge/br_forward.c
+index f7e843fb9dc4,ec646656dbf1..000000000000
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@@ -52,6 -48,8 +52,11 @@@ int br_dev_queue_push_xmit(struct net *
+  		skb_set_network_header(skb, depth);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	br_switchdev_frame_set_offload_fwd_mark(skb);
++ 
+++>>>>>>> c5381154393d (net: bridge: fix build when setting skb->offload_fwd_mark with CONFIG_NET_SWITCHDEV=n)
+  	dev_queue_xmit(skb);
+  
+  	return 0;
+diff --cc net/bridge/br_private.h
+index 30e07225bc94,1c57877270f7..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -1465,6 -1879,14 +1465,17 @@@ static inline void br_sysfs_delbr(struc
+  
+  /* br_switchdev.c */
+  #ifdef CONFIG_NET_SWITCHDEV
+++<<<<<<< HEAD
+++=======
++ bool br_switchdev_frame_uses_tx_fwd_offload(struct sk_buff *skb);
++ 
++ void br_switchdev_frame_set_offload_fwd_mark(struct sk_buff *skb);
++ 
++ void nbp_switchdev_frame_mark_tx_fwd_offload(const struct net_bridge_port *p,
++ 					     struct sk_buff *skb);
++ void nbp_switchdev_frame_mark_tx_fwd_to_hwdom(const struct net_bridge_port *p,
++ 					      struct sk_buff *skb);
+++>>>>>>> c5381154393d (net: bridge: fix build when setting skb->offload_fwd_mark with CONFIG_NET_SWITCHDEV=n)
+  void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
+  			      struct sk_buff *skb);
+  bool nbp_switchdev_allowed_egress(const struct net_bridge_port *p,
+@@@ -1487,6 -1907,27 +1498,30 @@@ static inline void br_switchdev_frame_u
+  	skb->offload_fwd_mark = 0;
+  }
+  #else
+++<<<<<<< HEAD
+++=======
++ static inline bool br_switchdev_frame_uses_tx_fwd_offload(struct sk_buff *skb)
++ {
++ 	return false;
++ }
++ 
++ static inline void br_switchdev_frame_set_offload_fwd_mark(struct sk_buff *skb)
++ {
++ }
++ 
++ static inline void
++ nbp_switchdev_frame_mark_tx_fwd_offload(const struct net_bridge_port *p,
++ 					struct sk_buff *skb)
++ {
++ }
++ 
++ static inline void
++ nbp_switchdev_frame_mark_tx_fwd_to_hwdom(const struct net_bridge_port *p,
++ 					 struct sk_buff *skb)
++ {
++ }
++ 
+++>>>>>>> c5381154393d (net: bridge: fix build when setting skb->offload_fwd_mark with CONFIG_NET_SWITCHDEV=n)
+  static inline void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
+  					    struct sk_buff *skb)
+  {
+diff --cc net/bridge/br_switchdev.c
+index be7535fa5f0e,9cf9ab320c48..000000000000
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@@ -8,6 -8,51 +8,54 @@@
+  
+  #include "br_private.h"
+  
+++<<<<<<< HEAD
+++=======
++ static struct static_key_false br_switchdev_tx_fwd_offload;
++ 
++ static bool nbp_switchdev_can_offload_tx_fwd(const struct net_bridge_port *p,
++ 					     const struct sk_buff *skb)
++ {
++ 	if (!static_branch_unlikely(&br_switchdev_tx_fwd_offload))
++ 		return false;
++ 
++ 	return (p->flags & BR_TX_FWD_OFFLOAD) &&
++ 	       (p->hwdom != BR_INPUT_SKB_CB(skb)->src_hwdom);
++ }
++ 
++ bool br_switchdev_frame_uses_tx_fwd_offload(struct sk_buff *skb)
++ {
++ 	if (!static_branch_unlikely(&br_switchdev_tx_fwd_offload))
++ 		return false;
++ 
++ 	return BR_INPUT_SKB_CB(skb)->tx_fwd_offload;
++ }
++ 
++ void br_switchdev_frame_set_offload_fwd_mark(struct sk_buff *skb)
++ {
++ 	skb->offload_fwd_mark = br_switchdev_frame_uses_tx_fwd_offload(skb);
++ }
++ 
++ /* Mark the frame for TX forwarding offload if this egress port supports it */
++ void nbp_switchdev_frame_mark_tx_fwd_offload(const struct net_bridge_port *p,
++ 					     struct sk_buff *skb)
++ {
++ 	if (nbp_switchdev_can_offload_tx_fwd(p, skb))
++ 		BR_INPUT_SKB_CB(skb)->tx_fwd_offload = true;
++ }
++ 
++ /* Lazily adds the hwdom of the egress bridge port to the bit mask of hwdoms
++  * that the skb has been already forwarded to, to avoid further cloning to
++  * other ports in the same hwdom by making nbp_switchdev_allowed_egress()
++  * return false.
++  */
++ void nbp_switchdev_frame_mark_tx_fwd_to_hwdom(const struct net_bridge_port *p,
++ 					      struct sk_buff *skb)
++ {
++ 	if (nbp_switchdev_can_offload_tx_fwd(p, skb))
++ 		set_bit(p->hwdom, &BR_INPUT_SKB_CB(skb)->fwd_hwdoms);
++ }
++ 
+++>>>>>>> c5381154393d (net: bridge: fix build when setting skb->offload_fwd_mark with CONFIG_NET_SWITCHDEV=n)
+  void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
+  			      struct sk_buff *skb)
+  {
+* Unmerged path net/bridge/br_forward.c
+* Unmerged path net/bridge/br_private.h
+* Unmerged path net/bridge/br_switchdev.c
