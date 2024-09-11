@@ -1,0 +1,106 @@
+KVM: x86/mmu: handle cmpxchg failure in kvm_tdp_mmu_get_root
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Ben Gardon <bgardon@google.com>
+commit fb10129335ca6cc7a229226b03f54394757d773d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/fb101293.failed
+
+To reduce dependence on the MMU write lock, don't rely on the assumption
+that the atomic operation in kvm_tdp_mmu_get_root will always succeed.
+By not relying on that assumption, threads do not need to hold the MMU
+lock in write mode in order to take a reference on a TDP MMU root.
+
+In the root iterator, this change means that some roots might have to be
+skipped if they are found to have a zero refcount. This will still never
+happen as of this patch, but a future patch will need that flexibility to
+make the root iterator safe under the MMU read lock.
+
+	Signed-off-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20210401233736.638171-8-bgardon@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit fb10129335ca6cc7a229226b03f54394757d773d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index f8ed7b2ec807,6c1765c9642c..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -86,8 -80,24 +86,29 @@@ static inline struct kvm_mmu_page *tdp_
+  {
+  	struct kvm_mmu_page *next_root;
+  
+++<<<<<<< HEAD
+ +	next_root = list_next_entry(root, link);
+ +	kvm_tdp_mmu_put_root(kvm, root);
+++=======
++ 	lockdep_assert_held_write(&kvm->mmu_lock);
++ 
++ 	if (prev_root)
++ 		next_root = list_next_entry(prev_root, link);
++ 	else
++ 		next_root = list_first_entry(&kvm->arch.tdp_mmu_roots,
++ 					     typeof(*next_root), link);
++ 
++ 	while (!list_entry_is_head(next_root, &kvm->arch.tdp_mmu_roots, link) &&
++ 	       !kvm_tdp_mmu_get_root(kvm, next_root))
++ 		next_root = list_next_entry(next_root, link);
++ 
++ 	if (list_entry_is_head(next_root, &kvm->arch.tdp_mmu_roots, link))
++ 		next_root = NULL;
++ 
++ 	if (prev_root)
++ 		kvm_tdp_mmu_put_root(kvm, prev_root);
++ 
+++>>>>>>> fb10129335ca (KVM: x86/mmu: handle cmpxchg failure in kvm_tdp_mmu_get_root)
+  	return next_root;
+  }
+  
+@@@ -149,11 -162,10 +170,16 @@@ hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(str
+  	role = page_role_for_level(vcpu, vcpu->arch.mmu->shadow_root_level);
+  
+  	/* Check for an existing root before allocating a new one. */
+++<<<<<<< HEAD
+ +	for_each_tdp_mmu_root(kvm, root) {
+ +		if (root->role.word == role.word) {
+ +			kvm_tdp_mmu_get_root(kvm, root);
+++=======
++ 	for_each_tdp_mmu_root(kvm, root, kvm_mmu_role_as_id(role)) {
++ 		if (root->role.word == role.word &&
++ 		    kvm_tdp_mmu_get_root(kvm, root))
+++>>>>>>> fb10129335ca (KVM: x86/mmu: handle cmpxchg failure in kvm_tdp_mmu_get_root)
+  			goto out;
+- 		}
+  	}
+  
+  	root = alloc_tdp_mmu_page(vcpu, 0, vcpu->arch.mmu->shadow_root_level);
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 536da45dea9d..60bab8ccbd5a 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -7,17 +7,10 @@
+ 
+ hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu);
+ 
+-static inline void kvm_tdp_mmu_get_root(struct kvm *kvm,
+-					struct kvm_mmu_page *root)
++__must_check static inline bool kvm_tdp_mmu_get_root(struct kvm *kvm,
++						     struct kvm_mmu_page *root)
+ {
+-	lockdep_assert_held_write(&kvm->mmu_lock);
+-
+-	/*
+-	 * This should never fail since roots are removed from the roots
+-	 * list under the MMU write lock when their reference count falls
+-	 * to zero.
+-	 */
+-	refcount_inc_not_zero(&root->tdp_mmu_root_count);
++	return refcount_inc_not_zero(&root->tdp_mmu_root_count);
+ }
+ 
+ void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root);
