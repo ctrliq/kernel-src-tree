@@ -12,7 +12,6 @@
 #endif
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <linux/module.h>
 #include <linux/skbuff.h>
 #include <linux/crc32.h>
 
