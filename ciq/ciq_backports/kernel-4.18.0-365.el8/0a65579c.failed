@@ -1,0 +1,218 @@
+swiotlb: Refactor swiotlb init functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Claire Chang <tientzu@chromium.org>
+commit 0a65579cdd28bed3e84e1b4929c3080da4f06d79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/0a65579c.failed
+
+Add a new function, swiotlb_init_io_tlb_mem, for the io_tlb_mem struct
+initialization to make the code reusable.
+
+	Signed-off-by: Claire Chang <tientzu@chromium.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Stefano Stabellini <sstabellini@kernel.org>
+	Acked-by: Stefano Stabellini <sstabellini@kernel.org>
+	Tested-by: Will Deacon <will@kernel.org>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit 0a65579cdd28bed3e84e1b4929c3080da4f06d79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index be0e4e04c6fd,414db5fc8de9..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -223,56 -168,50 +223,85 @@@ void __init swiotlb_update_mem_attribut
+  	memset(vaddr, 0, bytes);
+  }
+  
++ static void swiotlb_init_io_tlb_mem(struct io_tlb_mem *mem, phys_addr_t start,
++ 				    unsigned long nslabs, bool late_alloc)
++ {
++ 	void *vaddr = phys_to_virt(start);
++ 	unsigned long bytes = nslabs << IO_TLB_SHIFT, i;
++ 
++ 	mem->nslabs = nslabs;
++ 	mem->start = start;
++ 	mem->end = mem->start + bytes;
++ 	mem->index = 0;
++ 	mem->late_alloc = late_alloc;
++ 	spin_lock_init(&mem->lock);
++ 	for (i = 0; i < mem->nslabs; i++) {
++ 		mem->slots[i].list = IO_TLB_SEGSIZE - io_tlb_offset(i);
++ 		mem->slots[i].orig_addr = INVALID_PHYS_ADDR;
++ 		mem->slots[i].alloc_size = 0;
++ 	}
++ 	memset(vaddr, 0, bytes);
++ }
++ 
+  int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
+  {
+++<<<<<<< HEAD
+ +	unsigned long i, bytes;
+++=======
++ 	struct io_tlb_mem *mem;
+++>>>>>>> 0a65579cdd28 (swiotlb: Refactor swiotlb init functions)
+  	size_t alloc_size;
+  
+ -	if (swiotlb_force == SWIOTLB_NO_FORCE)
+ -		return 0;
+ -
+  	/* protect against double initialization */
+ -	if (WARN_ON_ONCE(io_tlb_default_mem))
+ +	if (WARN_ON_ONCE(io_tlb_start))
+  		return -ENOMEM;
+  
+ -	alloc_size = PAGE_ALIGN(struct_size(mem, slots, nslabs));
+ -	mem = memblock_alloc(alloc_size, PAGE_SIZE);
+ -	if (!mem)
+ +	bytes = nslabs << IO_TLB_SHIFT;
+ +
+ +	io_tlb_nslabs = nslabs;
+ +	io_tlb_start = __pa(tlb);
+ +	io_tlb_end = io_tlb_start + bytes;
+ +
+ +	/*
+ +	 * Allocate and initialize the free list array.  This array is used
+ +	 * to find contiguous free memory regions of size up to IO_TLB_SEGSIZE
+ +	 * between io_tlb_start and io_tlb_end.
+ +	 */
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(int));
+ +	io_tlb_list = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_list)
+  		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+  		      __func__, alloc_size, PAGE_SIZE);
+++<<<<<<< HEAD
+++=======
++ 
++ 	swiotlb_init_io_tlb_mem(mem, __pa(tlb), nslabs, false);
+++>>>>>>> 0a65579cdd28 (swiotlb: Refactor swiotlb init functions)
+ +
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(phys_addr_t));
+ +	io_tlb_orig_addr = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_orig_addr)
+ +		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+ +		      __func__, alloc_size, PAGE_SIZE);
+ +
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(size_t));
+ +	io_tlb_orig_size = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_orig_size)
+ +		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+ +		      __func__, alloc_size, PAGE_SIZE);
+ +
+ +	for (i = 0; i < io_tlb_nslabs; i++) {
+ +		io_tlb_list[i] = IO_TLB_SEGSIZE - io_tlb_offset(i);
+ +		io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
+ +		io_tlb_orig_size[i] = 0;
+ +	}
+ +	io_tlb_index = 0;
+ +	no_iotlb_memory = false;
+  
+ -	io_tlb_default_mem = mem;
+  	if (verbose)
+  		swiotlb_print_info();
+ -	swiotlb_set_max_segment(mem->nslabs << IO_TLB_SHIFT);
+ +
+ +	swiotlb_set_max_segment(io_tlb_nslabs << IO_TLB_SHIFT);
+  	return 0;
+  }
+  
+@@@ -368,73 -293,29 +397,85 @@@ static void swiotlb_cleanup(void
+  int
+  swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
+  {
+++<<<<<<< HEAD
+ +	unsigned long i, bytes;
+++=======
++ 	struct io_tlb_mem *mem;
++ 	unsigned long bytes = nslabs << IO_TLB_SHIFT;
++ 
++ 	if (swiotlb_force == SWIOTLB_NO_FORCE)
++ 		return 0;
+++>>>>>>> 0a65579cdd28 (swiotlb: Refactor swiotlb init functions)
+  
+  	/* protect against double initialization */
+ -	if (WARN_ON_ONCE(io_tlb_default_mem))
+ +	if (WARN_ON_ONCE(io_tlb_start))
+  		return -ENOMEM;
+  
+ -	mem = (void *)__get_free_pages(GFP_KERNEL,
+ -		get_order(struct_size(mem, slots, nslabs)));
+ -	if (!mem)
+ -		return -ENOMEM;
+ +	bytes = nslabs << IO_TLB_SHIFT;
+  
+++<<<<<<< HEAD
+ +	io_tlb_nslabs = nslabs;
+ +	io_tlb_start = virt_to_phys(tlb);
+ +	io_tlb_end = io_tlb_start + bytes;
+ +
+++=======
++ 	memset(mem, 0, sizeof(*mem));
+++>>>>>>> 0a65579cdd28 (swiotlb: Refactor swiotlb init functions)
+  	set_memory_decrypted((unsigned long)tlb, bytes >> PAGE_SHIFT);
+- 	memset(tlb, 0, bytes);
++ 	swiotlb_init_io_tlb_mem(mem, virt_to_phys(tlb), nslabs, true);
+  
+ -	io_tlb_default_mem = mem;
+ +	/*
+ +	 * Allocate and initialize the free list array.  This array is used
+ +	 * to find contiguous free memory regions of size up to IO_TLB_SEGSIZE
+ +	 * between io_tlb_start and io_tlb_end.
+ +	 */
+ +	io_tlb_list = (unsigned int *)__get_free_pages(GFP_KERNEL,
+ +				      get_order(io_tlb_nslabs * sizeof(int)));
+ +	if (!io_tlb_list)
+ +		goto cleanup3;
+ +
+ +	io_tlb_orig_addr = (phys_addr_t *)
+ +		__get_free_pages(GFP_KERNEL,
+ +				 get_order(io_tlb_nslabs *
+ +					   sizeof(phys_addr_t)));
+ +	if (!io_tlb_orig_addr)
+ +		goto cleanup4;
+ +
+ +	io_tlb_orig_size = (size_t *)
+ +		__get_free_pages(GFP_KERNEL,
+ +				 get_order(io_tlb_nslabs *
+ +					   sizeof(size_t)));
+ +	if (!io_tlb_orig_size)
+ +		goto cleanup5;
+ +
+ +
+ +	for (i = 0; i < io_tlb_nslabs; i++) {
+ +		io_tlb_list[i] = IO_TLB_SEGSIZE - io_tlb_offset(i);
+ +		io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
+ +		io_tlb_orig_size[i] = 0;
+ +	}
+ +	io_tlb_index = 0;
+ +	no_iotlb_memory = false;
+ +
+  	swiotlb_print_info();
+ -	swiotlb_set_max_segment(mem->nslabs << IO_TLB_SHIFT);
+ +
+ +	late_alloc = 1;
+ +
+ +	swiotlb_set_max_segment(io_tlb_nslabs << IO_TLB_SHIFT);
+ +
+  	return 0;
+ +
+ +cleanup5:
+ +	free_pages((unsigned long)io_tlb_orig_addr, get_order(io_tlb_nslabs *
+ +							      sizeof(phys_addr_t)));
+ +
+ +cleanup4:
+ +	free_pages((unsigned long)io_tlb_list, get_order(io_tlb_nslabs *
+ +	                                                 sizeof(int)));
+ +	io_tlb_list = NULL;
+ +cleanup3:
+ +	swiotlb_cleanup();
+ +	return -ENOMEM;
+  }
+  
+  void __init swiotlb_exit(void)
+* Unmerged path kernel/dma/swiotlb.c
