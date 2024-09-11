@@ -1,0 +1,183 @@
+mptcp: subflow: add mptcp_subflow_init_cookie_req helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit c83a47e50d8fd3825a4758158e9edd5acdc74185
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c83a47e5.failed
+
+Will be used to initialize the mptcp request socket when a MP_CAPABLE
+request was handled in syncookie mode, i.e. when a TCP ACK containing a
+MP_CAPABLE option is a valid syncookie value.
+
+Normally (non-cookie case), MPTCP will generate a unique 32 bit connection
+ID and stores it in the MPTCP token storage to be able to retrieve the
+mptcp socket for subflow joining.
+
+In syncookie case, we do not want to store any state, so just generate the
+unique ID and use it in the reply.
+
+This means there is a small window where another connection could generate
+the same token.
+
+When Cookie ACK comes back, we check that the token has not been registered
+in the mean time.  If it was, the connection needs to fall back to TCP.
+
+Changes in v2:
+ - use req->syncookie instead of passing 'want_cookie' arg to ->init_req()
+   (Eric Dumazet)
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c83a47e50d8fd3825a4758158e9edd5acdc74185)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.h
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/protocol.h
+index 223e4fb33f77,d76d3b40d69e..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -395,12 -389,22 +395,18 @@@ void mptcp_data_acked(struct sock *sk)
+  void mptcp_subflow_eof(struct sock *sk);
+  bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq);
+  
+ -void __init mptcp_token_init(void);
+ -static inline void mptcp_token_init_request(struct request_sock *req)
+ -{
+ -	mptcp_subflow_rsk(req)->token_node.pprev = NULL;
+ -}
+ -
+  int mptcp_token_new_request(struct request_sock *req);
+ -void mptcp_token_destroy_request(struct request_sock *req);
+ +void mptcp_token_destroy_request(u32 token);
+  int mptcp_token_new_connect(struct sock *sk);
+++<<<<<<< HEAD
+ +int mptcp_token_new_accept(u32 token, struct sock *conn);
+++=======
++ void mptcp_token_accept(struct mptcp_subflow_request_sock *r,
++ 			struct mptcp_sock *msk);
++ bool mptcp_token_exists(u32 token);
+++>>>>>>> c83a47e50d8f (mptcp: subflow: add mptcp_subflow_init_cookie_req helper)
+  struct mptcp_sock *mptcp_token_get_sock(u32 token);
+ -struct mptcp_sock *mptcp_token_iter_next(const struct net *net, long *s_slot,
+ -					 long *s_num);
+ -void mptcp_token_destroy(struct mptcp_sock *msk);
+ +void mptcp_token_destroy(u32 token);
+  
+  void mptcp_crypto_key_sha(u64 key, u32 *token, u64 *idsn);
+  
+diff --cc net/mptcp/subflow.c
+index 22fdf725310a,3d346572d4c9..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -172,13 -138,33 +172,35 @@@ static void subflow_init_req(struct req
+  	}
+  
+  	if (mp_opt.mp_capable && listener->request_mptcp) {
+++<<<<<<< HEAD
+ +		int err;
+++=======
++ 		int err, retries = 4;
++ 
++ 		subflow_req->ssn_offset = TCP_SKB_CB(skb)->seq;
++ again:
++ 		do {
++ 			get_random_bytes(&subflow_req->local_key, sizeof(subflow_req->local_key));
++ 		} while (subflow_req->local_key == 0);
+++>>>>>>> c83a47e50d8f (mptcp: subflow: add mptcp_subflow_init_cookie_req helper)
++ 
++ 		if (unlikely(req->syncookie)) {
++ 			mptcp_crypto_key_sha(subflow_req->local_key,
++ 					     &subflow_req->token,
++ 					     &subflow_req->idsn);
++ 			if (mptcp_token_exists(subflow_req->token)) {
++ 				if (retries-- > 0)
++ 					goto again;
++ 			} else {
++ 				subflow_req->mp_capable = 1;
++ 			}
++ 			return;
++ 		}
+  
+  		err = mptcp_token_new_request(req);
+  		if (err == 0)
+  			subflow_req->mp_capable = 1;
+ -		else if (retries-- > 0)
+ -			goto again;
+  
+- 		subflow_req->ssn_offset = TCP_SKB_CB(skb)->seq;
+  	} else if (mp_opt.mp_join && listener->request_mptcp) {
+  		subflow_req->ssn_offset = TCP_SKB_CB(skb)->seq;
+  		subflow_req->mp_join = 1;
+diff --git a/include/net/mptcp.h b/include/net/mptcp.h
+index 76eb915bf91c..3525d2822abe 100644
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@ -131,6 +131,9 @@ static inline bool mptcp_skb_can_collapse(const struct sk_buff *to,
+ }
+ 
+ void mptcp_seq_show(struct seq_file *seq);
++int mptcp_subflow_init_cookie_req(struct request_sock *req,
++				  const struct sock *sk_listener,
++				  struct sk_buff *skb);
+ #else
+ 
+ static inline void mptcp_init(void)
+@@ -200,6 +203,13 @@ static inline bool mptcp_skb_can_collapse(const struct sk_buff *to,
+ 
+ static inline void mptcp_space(const struct sock *ssk, int *s, int *fs) { }
+ static inline void mptcp_seq_show(struct seq_file *seq) { }
++
++static inline int mptcp_subflow_init_cookie_req(struct request_sock *req,
++						const struct sock *sk_listener,
++						struct sk_buff *skb)
++{
++	return 0; /* TCP fallback */
++}
+ #endif /* CONFIG_MPTCP */
+ 
+ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+* Unmerged path net/mptcp/protocol.h
+* Unmerged path net/mptcp/subflow.c
+diff --git a/net/mptcp/token.c b/net/mptcp/token.c
+index 9e1312968673..c50aafd08ad3 100644
+--- a/net/mptcp/token.c
++++ b/net/mptcp/token.c
+@@ -153,6 +153,32 @@ int mptcp_token_new_accept(u32 token, struct sock *conn)
+ 	return err;
+ }
+ 
++bool mptcp_token_exists(u32 token)
++{
++	struct hlist_nulls_node *pos;
++	struct token_bucket *bucket;
++	struct mptcp_sock *msk;
++	struct sock *sk;
++
++	rcu_read_lock();
++	bucket = token_bucket(token);
++
++again:
++	sk_nulls_for_each_rcu(sk, pos, &bucket->msk_chain) {
++		msk = mptcp_sk(sk);
++		if (READ_ONCE(msk->token) == token)
++			goto found;
++	}
++	if (get_nulls_value(pos) != (token & token_mask))
++		goto again;
++
++	rcu_read_unlock();
++	return false;
++found:
++	rcu_read_unlock();
++	return true;
++}
++
+ /**
+  * mptcp_token_get_sock - retrieve mptcp connection sock using its token
+  * @token: token of the mptcp connection to retrieve
