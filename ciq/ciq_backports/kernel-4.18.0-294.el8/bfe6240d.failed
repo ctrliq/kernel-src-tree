@@ -1,0 +1,216 @@
+iommu/vt-d: Fix pointer cast warnings on 32 bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit bfe6240dfe4f16c20db94bc7c0ab9ffa316fb926
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bfe6240d.failed
+
+Pointers should be casted to unsigned long to avoid "cast from pointer
+to integer of different size" warnings.
+
+drivers/iommu/intel-pasid.c:818:6: warning:
+    cast from pointer to integer of different size [-Wpointer-to-int-cast]
+drivers/iommu/intel-pasid.c:821:9: warning:
+    cast from pointer to integer of different size [-Wpointer-to-int-cast]
+drivers/iommu/intel-pasid.c:824:23: warning:
+    cast from pointer to integer of different size [-Wpointer-to-int-cast]
+drivers/iommu/intel-svm.c:343:45: warning:
+    cast to pointer from integer of different size [-Wint-to-pointer-cast]
+
+Fixes: b0d1f8741b81 ("iommu/vt-d: Add nested translation helper function")
+Fixes: 56722a4398a3 ("iommu/vt-d: Add bind guest PASID support")
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20200519013423.11971-1-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit bfe6240dfe4f16c20db94bc7c0ab9ffa316fb926)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-pasid.c
+diff --cc drivers/iommu/intel-pasid.c
+index aee3ee8491cf,c81f0f17c6ba..000000000000
+--- a/drivers/iommu/intel-pasid.c
++++ b/drivers/iommu/intel-pasid.c
+@@@ -683,3 -693,161 +683,164 @@@ int intel_pasid_setup_pass_through(stru
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int
++ intel_pasid_setup_bind_data(struct intel_iommu *iommu, struct pasid_entry *pte,
++ 			    struct iommu_gpasid_bind_data_vtd *pasid_data)
++ {
++ 	/*
++ 	 * Not all guest PASID table entry fields are passed down during bind,
++ 	 * here we only set up the ones that are dependent on guest settings.
++ 	 * Execution related bits such as NXE, SMEP are not supported.
++ 	 * Other fields, such as snoop related, are set based on host needs
++ 	 * regardless of guest settings.
++ 	 */
++ 	if (pasid_data->flags & IOMMU_SVA_VTD_GPASID_SRE) {
++ 		if (!ecap_srs(iommu->ecap)) {
++ 			pr_err_ratelimited("No supervisor request support on %s\n",
++ 					   iommu->name);
++ 			return -EINVAL;
++ 		}
++ 		pasid_set_sre(pte);
++ 	}
++ 
++ 	if (pasid_data->flags & IOMMU_SVA_VTD_GPASID_EAFE) {
++ 		if (!ecap_eafs(iommu->ecap)) {
++ 			pr_err_ratelimited("No extended access flag support on %s\n",
++ 					   iommu->name);
++ 			return -EINVAL;
++ 		}
++ 		pasid_set_eafe(pte);
++ 	}
++ 
++ 	/*
++ 	 * Memory type is only applicable to devices inside processor coherent
++ 	 * domain. Will add MTS support once coherent devices are available.
++ 	 */
++ 	if (pasid_data->flags & IOMMU_SVA_VTD_GPASID_MTS_MASK) {
++ 		pr_warn_ratelimited("No memory type support %s\n",
++ 				    iommu->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * intel_pasid_setup_nested() - Set up PASID entry for nested translation.
++  * This could be used for guest shared virtual address. In this case, the
++  * first level page tables are used for GVA-GPA translation in the guest,
++  * second level page tables are used for GPA-HPA translation.
++  *
++  * @iommu:      IOMMU which the device belong to
++  * @dev:        Device to be set up for translation
++  * @gpgd:       FLPTPTR: First Level Page translation pointer in GPA
++  * @pasid:      PASID to be programmed in the device PASID table
++  * @pasid_data: Additional PASID info from the guest bind request
++  * @domain:     Domain info for setting up second level page tables
++  * @addr_width: Address width of the first level (guest)
++  */
++ int intel_pasid_setup_nested(struct intel_iommu *iommu, struct device *dev,
++ 			     pgd_t *gpgd, int pasid,
++ 			     struct iommu_gpasid_bind_data_vtd *pasid_data,
++ 			     struct dmar_domain *domain, int addr_width)
++ {
++ 	struct pasid_entry *pte;
++ 	struct dma_pte *pgd;
++ 	int ret = 0;
++ 	u64 pgd_val;
++ 	int agaw;
++ 	u16 did;
++ 
++ 	if (!ecap_nest(iommu->ecap)) {
++ 		pr_err_ratelimited("IOMMU: %s: No nested translation support\n",
++ 				   iommu->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!(domain->flags & DOMAIN_FLAG_NESTING_MODE)) {
++ 		pr_err_ratelimited("Domain is not in nesting mode, %x\n",
++ 				   domain->flags);
++ 		return -EINVAL;
++ 	}
++ 
++ 	pte = intel_pasid_get_entry(dev, pasid);
++ 	if (WARN_ON(!pte))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Caller must ensure PASID entry is not in use, i.e. not bind the
++ 	 * same PASID to the same device twice.
++ 	 */
++ 	if (pasid_pte_is_present(pte))
++ 		return -EBUSY;
++ 
++ 	pasid_clear_entry(pte);
++ 
++ 	/* Sanity checking performed by caller to make sure address
++ 	 * width matching in two dimensions:
++ 	 * 1. CPU vs. IOMMU
++ 	 * 2. Guest vs. Host.
++ 	 */
++ 	switch (addr_width) {
++ #ifdef CONFIG_X86
++ 	case ADDR_WIDTH_5LEVEL:
++ 		if (!cpu_feature_enabled(X86_FEATURE_LA57) ||
++ 		    !cap_5lp_support(iommu->cap)) {
++ 			dev_err_ratelimited(dev,
++ 					    "5-level paging not supported\n");
++ 			return -EINVAL;
++ 		}
++ 
++ 		pasid_set_flpm(pte, 1);
++ 		break;
++ #endif
++ 	case ADDR_WIDTH_4LEVEL:
++ 		pasid_set_flpm(pte, 0);
++ 		break;
++ 	default:
++ 		dev_err_ratelimited(dev, "Invalid guest address width %d\n",
++ 				    addr_width);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* First level PGD is in GPA, must be supported by the second level */
++ 	if ((uintptr_t)gpgd > domain->max_addr) {
++ 		dev_err_ratelimited(dev,
++ 				    "Guest PGD %lx not supported, max %llx\n",
++ 				    (uintptr_t)gpgd, domain->max_addr);
++ 		return -EINVAL;
++ 	}
++ 	pasid_set_flptr(pte, (uintptr_t)gpgd);
++ 
++ 	ret = intel_pasid_setup_bind_data(iommu, pte, pasid_data);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Setup the second level based on the given domain */
++ 	pgd = domain->pgd;
++ 
++ 	agaw = iommu_skip_agaw(domain, iommu, &pgd);
++ 	if (agaw < 0) {
++ 		dev_err_ratelimited(dev, "Invalid domain page table\n");
++ 		return -EINVAL;
++ 	}
++ 	pgd_val = virt_to_phys(pgd);
++ 	pasid_set_slptr(pte, pgd_val);
++ 	pasid_set_fault_enable(pte);
++ 
++ 	did = domain->iommu_did[iommu->seq_id];
++ 	pasid_set_domain_id(pte, did);
++ 
++ 	pasid_set_address_width(pte, agaw);
++ 	pasid_set_page_snoop(pte, !!ecap_smpwc(iommu->ecap));
++ 
++ 	pasid_set_translation_type(pte, PASID_ENTRY_PGTT_NESTED);
++ 	pasid_set_present(pte);
++ 	pasid_flush_caches(iommu, pte, pasid, did);
++ 
++ 	return ret;
++ }
+++>>>>>>> bfe6240dfe4f (iommu/vt-d: Fix pointer cast warnings on 32 bit)
+* Unmerged path drivers/iommu/intel-pasid.c
+diff --git a/drivers/iommu/intel-svm.c b/drivers/iommu/intel-svm.c
+index 38bac5ed3f74..78ac36c28577 100644
+--- a/drivers/iommu/intel-svm.c
++++ b/drivers/iommu/intel-svm.c
+@@ -349,7 +349,8 @@ int intel_svm_bind_gpasid(struct iommu_domain *domain, struct device *dev,
+ 	 * call the nested mode setup function here.
+ 	 */
+ 	spin_lock(&iommu->lock);
+-	ret = intel_pasid_setup_nested(iommu, dev, (pgd_t *)data->gpgd,
++	ret = intel_pasid_setup_nested(iommu, dev,
++				       (pgd_t *)(uintptr_t)data->gpgd,
+ 				       data->hpasid, &data->vtd, dmar_domain,
+ 				       data->addr_width);
+ 	spin_unlock(&iommu->lock);
