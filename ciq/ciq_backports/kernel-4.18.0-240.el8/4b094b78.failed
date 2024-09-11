@@ -1,0 +1,143 @@
+mm/page_alloc.c: initialize memmap of unavailable memory directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 4b094b7851bf4bf551ad456195d3f26e1c03bd74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4b094b78.failed
+
+Let's make sure that all memory holes are actually marked PageReserved(),
+that page_to_pfn() produces reliable results, and that these pages are not
+detected as "mmap" pages due to the mapcount.
+
+E.g., booting a x86-64 QEMU guest with 4160 MB:
+
+[    0.010585] Early memory node ranges
+[    0.010586]   node   0: [mem 0x0000000000001000-0x000000000009efff]
+[    0.010588]   node   0: [mem 0x0000000000100000-0x00000000bffdefff]
+[    0.010589]   node   0: [mem 0x0000000100000000-0x0000000143ffffff]
+
+max_pfn is 0x144000.
+
+Before this change:
+
+[root@localhost ~]# ./page-types -r -a 0x144000,
+             flags      page-count       MB  symbolic-flags                     long-symbolic-flags
+0x0000000000000800           16384       64  ___________M_______________________________        mmap
+             total           16384       64
+
+After this change:
+
+[root@localhost ~]# ./page-types -r -a 0x144000,
+             flags      page-count       MB  symbolic-flags                     long-symbolic-flags
+0x0000000100000000           16384       64  ___________________________r_______________        reserved
+             total           16384       64
+
+IOW, especially the unavailable physical memory ("memory hole") in the
+last section would not get properly marked PageReserved() and is indicated
+to be "mmap" memory.
+
+Drop the trace of that function from include/linux/mm.h - nobody else
+needs it, and rename it accordingly.
+
+Note: The fake zone/node might not be covered by the zone/node span.  This
+is not an urgent issue (for now, we had the same node/zone due to the
+zeroing).  We'll need a clean way to mark memory holes (e.g., using a page
+type PageHole() if possible or a fake ZONE_INVALID) and eventually stop
+marking these memory holes PageReserved().
+
+Link: http://lkml.kernel.org/r/20191211163201.17179-4-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Bob Picco <bob.picco@oracle.com>
+	Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Pavel Tatashin <pasha.tatashin@oracle.com>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Cc: Steven Sistare <steven.sistare@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4b094b7851bf4bf551ad456195d3f26e1c03bd74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+#	mm/page_alloc.c
+diff --cc include/linux/mm.h
+index 7814b1c09166,080f8ac8bfb7..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -2154,12 -2182,6 +2154,15 @@@ extern int __meminit __early_pfn_to_nid
+  					struct mminit_pfnnid_cache *state);
+  #endif
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_HAVE_MEMBLOCK) && !defined(CONFIG_FLAT_NODE_MEM_MAP)
+ +void zero_resv_unavail(void);
+ +#else
+ +static inline void zero_resv_unavail(void) {}
+ +#endif
+ +
+++=======
+++>>>>>>> 4b094b7851bf (mm/page_alloc.c: initialize memmap of unavailable memory directly)
+  extern void set_dma_reserve(unsigned long new_dma_reserve);
+  extern void memmap_init_zone(unsigned long, int, unsigned long, unsigned long,
+  		enum memmap_context, struct vmem_altmap *);
+diff --cc mm/page_alloc.c
+index b6838fbdf305,7d5b9dbf4087..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -6491,13 -6914,12 +6491,13 @@@ void __paginginit free_area_init_node(i
+  	free_area_init_core(pgdat);
+  }
+  
+ -#if !defined(CONFIG_FLAT_NODE_MEM_MAP)
+ +#if defined(CONFIG_HAVE_MEMBLOCK) && !defined(CONFIG_FLAT_NODE_MEM_MAP)
+ +
+  /*
+-  * Zero all valid struct pages in range [spfn, epfn), return number of struct
+-  * pages zeroed
++  * Initialize all valid struct pages in the range [spfn, epfn) and mark them
++  * PageReserved(). Return the number of struct pages that were initialized.
+   */
+- static u64 zero_pfn_range(unsigned long spfn, unsigned long epfn)
++ static u64 __init init_unavailable_range(unsigned long spfn, unsigned long epfn)
+  {
+  	unsigned long pfn;
+  	u64 pgcnt = 0;
+@@@ -6528,7 -6956,7 +6534,11 @@@
+   * layout is manually configured via memmap=, or when the highest physical
+   * address (max_pfn) does not end on a section boundary.
+   */
+++<<<<<<< HEAD
+ +void __paginginit zero_resv_unavail(void)
+++=======
++ static void __init init_unavailable_mem(void)
+++>>>>>>> 4b094b7851bf (mm/page_alloc.c: initialize memmap of unavailable memory directly)
+  {
+  	phys_addr_t start, end;
+  	u64 i, pgcnt;
+@@@ -6562,7 -6991,11 +6573,15 @@@
+  	if (pgcnt)
+  		pr_info("Zeroed struct page in unavailable ranges: %lld pages", pgcnt);
+  }
+++<<<<<<< HEAD
+ +#endif /* CONFIG_HAVE_MEMBLOCK && !CONFIG_FLAT_NODE_MEM_MAP */
+++=======
++ #else
++ static inline void __init init_unavailable_mem(void)
++ {
++ }
++ #endif /* !CONFIG_FLAT_NODE_MEM_MAP */
+++>>>>>>> 4b094b7851bf (mm/page_alloc.c: initialize memmap of unavailable memory directly)
+  
+  #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+  
+* Unmerged path include/linux/mm.h
+* Unmerged path mm/page_alloc.c
