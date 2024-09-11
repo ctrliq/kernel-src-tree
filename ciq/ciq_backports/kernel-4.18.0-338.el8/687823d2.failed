@@ -1,0 +1,395 @@
+cxgb4/ch_ktls: creating skbs causes panic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Rohit Maheshwari <rohitm@chelsio.com>
+commit 687823d2d104df8226eacba74fda9f4ba3aecd6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/687823d2.failed
+
+Creating SKB per tls record and freeing the original one causes
+panic. There will be race if connection reset is requested. By
+freeing original skb, refcnt will be decremented and that means,
+there is no pending record to send, and so tls_dev_del will be
+requested in control path while SKB of related connection is in
+queue.
+ Better approach is to use same SKB to send one record (partial
+data) at a time. We still have to create a new SKB when partial
+last part of a record is requested.
+ This fix introduces new API cxgb4_write_partial_sgl() to send
+partial part of skb. Present cxgb4_write_sgl can only provide
+feasibility to start from an offset which limits to header only
+and it can write sgls for the whole skb len. But this new API
+will help in both. It can start from any offset and can end
+writing in middle of the skb.
+
+v4->v5:
+- Removed extra changes.
+
+Fixes: 429765a149f1 ("chcr: handle partial end part of a record")
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 687823d2d104df8226eacba74fda9f4ba3aecd6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 074af13f5bc4,950841988ffe..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -1,11 -1,63 +1,55 @@@
+  // SPDX-License-Identifier: GPL-2.0-only
+  /* Copyright (C) 2020 Chelsio Communications.  All rights reserved. */
+  
+ -#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ -
+ -#include <linux/skbuff.h>
+ -#include <linux/module.h>
+ +#ifdef CONFIG_CHELSIO_TLS_DEVICE
+  #include <linux/highmem.h>
+ -#include <linux/ip.h>
+ -#include <net/ipv6.h>
+ -#include <linux/netdevice.h>
+  #include "chcr_ktls.h"
+ -
+ -static LIST_HEAD(uld_ctx_list);
+ -static DEFINE_MUTEX(dev_mutex);
+ +#include "clip_tbl.h"
+  
++ /* chcr_get_nfrags_to_send: get the remaining nfrags after start offset
++  * @skb: skb
++  * @start: start offset.
++  * @len: how much data to send after @start
++  */
++ static int chcr_get_nfrags_to_send(struct sk_buff *skb, u32 start, u32 len)
++ {
++ 	struct skb_shared_info *si = skb_shinfo(skb);
++ 	u32 frag_size, skb_linear_data_len = skb_headlen(skb);
++ 	u8 nfrags = 0, frag_idx = 0;
++ 	skb_frag_t *frag;
++ 
++ 	/* if its a linear skb then return 1 */
++ 	if (!skb_is_nonlinear(skb))
++ 		return 1;
++ 
++ 	if (unlikely(start < skb_linear_data_len)) {
++ 		frag_size = min(len, skb_linear_data_len - start);
++ 		start = 0;
++ 	} else {
++ 		start -= skb_linear_data_len;
++ 
++ 		frag = &si->frags[frag_idx];
++ 		frag_size = skb_frag_size(frag);
++ 		while (start >= frag_size) {
++ 			start -= frag_size;
++ 			frag_idx++;
++ 			frag = &si->frags[frag_idx];
++ 			frag_size = skb_frag_size(frag);
++ 		}
++ 		frag_size = min(len, skb_frag_size(frag) - start);
++ 	}
++ 	len -= frag_size;
++ 	nfrags++;
++ 
++ 	while (len) {
++ 		frag_size = min(len, skb_frag_size(&si->frags[frag_idx]));
++ 		len -= frag_size;
++ 		nfrags++;
++ 		frag_idx++;
++ 	}
++ 	return nfrags;
++ }
++ 
+  static int chcr_init_tcb_fields(struct chcr_ktls_info *tx_info);
+  /*
+   * chcr_ktls_save_keys: calculate and save crypto keys.
+@@@ -1641,15 -1647,16 +1615,16 @@@ static int chcr_end_part_handler(struc
+  	/* check if it is a complete record */
+  	if (tls_end_offset == record->len) {
+  		nskb = skb;
+ -		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_complete_pkts);
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_complete_pkts);
+  	} else {
+- 		dev_kfree_skb_any(skb);
+- 
+- 		nskb = alloc_skb(0, GFP_KERNEL);
+- 		if (!nskb)
++ 		nskb = alloc_skb(0, GFP_ATOMIC);
++ 		if (!nskb) {
++ 			dev_kfree_skb_any(skb);
+  			return NETDEV_TX_BUSY;
++ 		}
++ 
+  		/* copy complete record in skb */
+- 		chcr_ktls_copy_record_in_skb(nskb, record);
++ 		chcr_ktls_copy_record_in_skb(nskb, skb, record);
+  		/* packet is being sent from the beginning, update the tcp_seq
+  		 * accordingly.
+  		 */
+@@@ -1659,7 -1666,15 +1634,19 @@@
+  		 */
+  		if (chcr_ktls_update_snd_una(tx_info, q))
+  			goto out;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_end_pkts);
+++=======
++ 		/* reset skb offset */
++ 		skb_offset = 0;
++ 
++ 		if (last_wr)
++ 			dev_kfree_skb_any(skb);
++ 
++ 		last_wr = true;
++ 
++ 		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_end_pkts);
+++>>>>>>> 687823d2d104 (cxgb4/ch_ktls: creating skbs causes panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	}
+  
+  	if (chcr_ktls_xmit_wr_complete(nskb, tx_info, q, tcp_seq,
+@@@ -1712,27 -1729,18 +1701,31 @@@ static int chcr_short_record_handler(st
+  
+  	if (remaining_record > 0 &&
+  	    remaining_record < TLS_CIPHER_AES_GCM_128_TAG_SIZE) {
+- 		int trimmed_len = skb->data_len -
++ 		int trimmed_len = data_len -
+  			(TLS_CIPHER_AES_GCM_128_TAG_SIZE - remaining_record);
+- 		struct sk_buff *tmp_skb = NULL;
+  		/* don't process the pkt if it is only a partial tag */
+- 		if (skb->data_len < TLS_CIPHER_AES_GCM_128_TAG_SIZE)
++ 		if (data_len < TLS_CIPHER_AES_GCM_128_TAG_SIZE)
+  			goto out;
+  
+- 		WARN_ON(trimmed_len > skb->data_len);
++ 		WARN_ON(trimmed_len > data_len);
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		/* shift to those many bytes */
+ +		tmp_skb = alloc_skb(0, GFP_KERNEL);
+ +		if (unlikely(!tmp_skb))
+ +			goto out;
+ +
+ +		chcr_ktls_skb_shift(tmp_skb, skb, trimmed_len);
+ +		/* free the last trimmed portion */
+ +		dev_kfree_skb_any(skb);
+ +		skb = tmp_skb;
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_trimmed_pkts);
+++=======
++ 		data_len = trimmed_len;
++ 		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_trimmed_pkts);
+++>>>>>>> 687823d2d104 (cxgb4/ch_ktls: creating skbs causes panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	}
+- 	data_len = skb->data_len;
++ 
+  	/* check if the middle record's start point is 16 byte aligned. CTR
+  	 * needs 16 byte aligned start point to start encryption.
+  	 */
+@@@ -1839,12 -1847,9 +1830,15 @@@ int chcr_ktls_xmit(struct sk_buff *skb
+  	struct tcphdr *th = tcp_hdr(skb);
+  	int data_len, qidx, ret = 0, mss;
+  	struct tls_record_info *record;
+ +	struct chcr_stats_debug *stats;
+  	struct chcr_ktls_info *tx_info;
+ +	u32 tls_end_offset, tcp_seq;
+  	struct tls_context *tls_ctx;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	struct sk_buff *local_skb;
+ +	int new_connection_state;
+++=======
+++>>>>>>> 687823d2d104 (cxgb4/ch_ktls: creating skbs causes panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	struct sge_eth_txq *q;
+  	struct adapter *adap;
+  	unsigned long flags;
+@@@ -1867,25 -1871,9 +1861,28 @@@
+  	if (unlikely(!tx_info))
+  		goto out;
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	/* check the connection state, we don't need to pass new connection
+ +	 * state, state machine will check and update the new state if it is
+ +	 * stuck due to responses not received from HW.
+ +	 * Start the tx handling only if state is KTLS_CONN_TX_READY.
+ +	 */
+ +	new_connection_state = chcr_ktls_update_connection_state(tx_info, 0);
+ +	if (new_connection_state != KTLS_CONN_TX_READY)
+ +		goto out;
+ +
+ +	/* don't touch the original skb, make a new skb to extract each records
+ +	 * and send them separately.
+ +	 */
+ +	local_skb = alloc_skb(0, GFP_KERNEL);
+ +
+ +	if (unlikely(!local_skb))
+ +		return NETDEV_TX_BUSY;
+ +
+++=======
+++>>>>>>> 687823d2d104 (cxgb4/ch_ktls: creating skbs causes panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	adap = tx_info->adap;
+ -	stats = &adap->ch_ktls_stats;
+ -	port_stats = &stats->ktls_port[tx_info->port_id];
+ +	stats = &adap->chcr_stats;
+  
+  	qidx = skb->queue_mapping;
+  	q = &adap->sge.ethtxq[qidx + tx_info->first_qset];
+@@@ -1905,12 -1893,6 +1902,14 @@@
+  		return NETDEV_TX_BUSY;
+  	}
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	/* copy skb contents into local skb */
+ +	chcr_ktls_skb_copy(skb, local_skb);
+ +
+ +	/* go through the skb and send only one record at a time. */
+ +	data_len = skb->data_len;
+++=======
+++>>>>>>> 687823d2d104 (cxgb4/ch_ktls: creating skbs causes panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	/* TCP segments can be in received either complete or partial.
+  	 * chcr_end_part_handler will handle cases if complete record or end
+  	 * part of the record is received. Incase of partial end part of record,
+@@@ -1937,10 -1919,9 +1936,9 @@@
+  
+  		if (unlikely(tls_record_is_start_marker(record))) {
+  			spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
+ -			atomic64_inc(&port_stats->ktls_tx_skip_no_sync_data);
+ +			atomic64_inc(&stats->ktls_tx_skip_no_sync_data);
+  			goto out;
+  		}
+- 
+  		/* increase page reference count of the record, so that there
+  		 * won't be any chance of page free in middle if in case stack
+  		 * receives ACK and try to delete the record.
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 69fdfede6bbe..fdb0e7952431 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -2087,6 +2087,9 @@ void cxgb4_inline_tx_skb(const struct sk_buff *skb, const struct sge_txq *q,
+ void cxgb4_write_sgl(const struct sk_buff *skb, struct sge_txq *q,
+ 		     struct ulptx_sgl *sgl, u64 *end, unsigned int start,
+ 		     const dma_addr_t *addr);
++void cxgb4_write_partial_sgl(const struct sk_buff *skb, struct sge_txq *q,
++			     struct ulptx_sgl *sgl, u64 *end,
++			     const dma_addr_t *addr, u32 start, u32 send_len);
+ void cxgb4_ring_tx_db(struct adapter *adap, struct sge_txq *q, int n);
+ int t4_set_vlan_acl(struct adapter *adap, unsigned int mbox, unsigned int vf,
+ 		    u16 vlan);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/sge.c b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+index d1c0b53b96ee..d8c67d8a5d4c 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@ -887,6 +887,114 @@ void cxgb4_write_sgl(const struct sk_buff *skb, struct sge_txq *q,
+ }
+ EXPORT_SYMBOL(cxgb4_write_sgl);
+ 
++/*	cxgb4_write_partial_sgl - populate SGL for partial packet
++ *	@skb: the packet
++ *	@q: the Tx queue we are writing into
++ *	@sgl: starting location for writing the SGL
++ *	@end: points right after the end of the SGL
++ *	@addr: the list of bus addresses for the SGL elements
++ *	@start: start offset in the SKB where partial data starts
++ *	@len: length of data from @start to send out
++ *
++ *	This API will handle sending out partial data of a skb if required.
++ *	Unlike cxgb4_write_sgl, @start can be any offset into the skb data,
++ *	and @len will decide how much data after @start offset to send out.
++ */
++void cxgb4_write_partial_sgl(const struct sk_buff *skb, struct sge_txq *q,
++			     struct ulptx_sgl *sgl, u64 *end,
++			     const dma_addr_t *addr, u32 start, u32 len)
++{
++	struct ulptx_sge_pair buf[MAX_SKB_FRAGS / 2 + 1] = {0}, *to;
++	u32 frag_size, skb_linear_data_len = skb_headlen(skb);
++	struct skb_shared_info *si = skb_shinfo(skb);
++	u8 i = 0, frag_idx = 0, nfrags = 0;
++	skb_frag_t *frag;
++
++	/* Fill the first SGL either from linear data or from partial
++	 * frag based on @start.
++	 */
++	if (unlikely(start < skb_linear_data_len)) {
++		frag_size = min(len, skb_linear_data_len - start);
++		sgl->len0 = htonl(frag_size);
++		sgl->addr0 = cpu_to_be64(addr[0] + start);
++		len -= frag_size;
++		nfrags++;
++	} else {
++		start -= skb_linear_data_len;
++		frag = &si->frags[frag_idx];
++		frag_size = skb_frag_size(frag);
++		/* find the first frag */
++		while (start >= frag_size) {
++			start -= frag_size;
++			frag_idx++;
++			frag = &si->frags[frag_idx];
++			frag_size = skb_frag_size(frag);
++		}
++
++		frag_size = min(len, skb_frag_size(frag) - start);
++		sgl->len0 = cpu_to_be32(frag_size);
++		sgl->addr0 = cpu_to_be64(addr[frag_idx + 1] + start);
++		len -= frag_size;
++		nfrags++;
++		frag_idx++;
++	}
++
++	/* If the entire partial data fit in one SGL, then send it out
++	 * now.
++	 */
++	if (!len)
++		goto done;
++
++	/* Most of the complexity below deals with the possibility we hit the
++	 * end of the queue in the middle of writing the SGL.  For this case
++	 * only we create the SGL in a temporary buffer and then copy it.
++	 */
++	to = (u8 *)end > (u8 *)q->stat ? buf : sgl->sge;
++
++	/* If the skb couldn't fit in first SGL completely, fill the
++	 * rest of the frags in subsequent SGLs. Note that each SGL
++	 * pair can store 2 frags.
++	 */
++	while (len) {
++		frag_size = min(len, skb_frag_size(&si->frags[frag_idx]));
++		to->len[i & 1] = cpu_to_be32(frag_size);
++		to->addr[i & 1] = cpu_to_be64(addr[frag_idx + 1]);
++		if (i && (i & 1))
++			to++;
++		nfrags++;
++		frag_idx++;
++		i++;
++		len -= frag_size;
++	}
++
++	/* If we ended in an odd boundary, then set the second SGL's
++	 * length in the pair to 0.
++	 */
++	if (i & 1)
++		to->len[1] = cpu_to_be32(0);
++
++	/* Copy from temporary buffer to Tx ring, in case we hit the
++	 * end of the queue in the middle of writing the SGL.
++	 */
++	if (unlikely((u8 *)end > (u8 *)q->stat)) {
++		u32 part0 = (u8 *)q->stat - (u8 *)sgl->sge, part1;
++
++		if (likely(part0))
++			memcpy(sgl->sge, buf, part0);
++		part1 = (u8 *)end - (u8 *)q->stat;
++		memcpy(q->desc, (u8 *)buf + part0, part1);
++		end = (void *)q->desc + part1;
++	}
++
++	/* 0-pad to multiple of 16 */
++	if ((uintptr_t)end & 8)
++		*end = 0;
++done:
++	sgl->cmd_nsge = htonl(ULPTX_CMD_V(ULP_TX_SC_DSGL) |
++			ULPTX_NSGE_V(nfrags));
++}
++EXPORT_SYMBOL(cxgb4_write_partial_sgl);
++
+ /* This function copies 64 byte coalesced work request to
+  * memory mapped BAR2 space. For coalesced WR SGE fetches
+  * data from the FIFO instead of from Host.
