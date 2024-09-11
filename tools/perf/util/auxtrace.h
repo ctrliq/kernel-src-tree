@@ -35,6 +35,7 @@ struct perf_session;
 struct perf_evlist;
 struct perf_tool;
 struct perf_mmap;
+struct perf_sample;
 struct option;
 struct record_opts;
 struct auxtrace_info_event;
