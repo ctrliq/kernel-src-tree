@@ -1,0 +1,163 @@
+kunit: support failure from dynamic analysis tools
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Uriel Guajardo <urielguajardo@google.com>
+commit 359a376081d4fadfb073e3ddeb6bd6dc94d98341
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/359a3760.failed
+
+Add a kunit_fail_current_test() function to fail the currently running
+test, if any, with an error message.
+
+This is largely intended for dynamic analysis tools like UBSAN and for
+fakes.
+E.g. say I had a fake ops struct for testing and I wanted my `free`
+function to complain if it was called with an invalid argument, or
+caught a double-free. Most return void and have no normal means of
+signalling failure (e.g. super_operations, iommu_ops, etc.).
+
+Key points:
+* Always update current->kunit_test so anyone can use it.
+  * commit 83c4e7a0363b ("KUnit: KASAN Integration") only updated it for
+  CONFIG_KASAN=y
+
+* Create a new header <kunit/test-bug.h> so non-test code doesn't have
+to include all of <kunit/test.h> (e.g. lib/ubsan.c)
+
+* Forward the file and line number to make it easier to track down
+failures
+
+* Declare the helper function for nice __printf() warnings about mismatched
+format strings even when KUnit is not enabled.
+
+Example output from kunit_fail_current_test("message"):
+[15:19:34] [FAILED] example_simple_test
+[15:19:34]     # example_simple_test: initializing
+[15:19:34]     # example_simple_test: lib/kunit/kunit-example-test.c:24: message
+[15:19:34]     not ok 1 - example_simple_test
+
+Fixed minor check patch with checkpatch --fix option:
+Shuah Khan <skhan@linuxfoundation.org>
+
+	Signed-off-by: Daniel Latypov <dlatypov@google.com>
+	Signed-off-by: Uriel Guajardo <urielguajardo@google.com>
+	Reviewed-by: Alan Maguire <alan.maguire@oracle.com>
+	Reviewed-by: Brendan Higgins <brendanhiggins@google.com>
+	Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+(cherry picked from commit 359a376081d4fadfb073e3ddeb6bd6dc94d98341)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/kunit/test.c
+diff --cc lib/kunit/test.c
+index 77ccd5de5b47,2f6cc0123232..000000000000
+--- a/lib/kunit/test.c
++++ b/lib/kunit/test.c
+@@@ -15,10 -17,39 +16,46 @@@
+  #include "string-stream.h"
+  #include "try-catch-impl.h"
+  
+++<<<<<<< HEAD
+ +static void kunit_set_failure(struct kunit *test)
+ +{
+ +	WRITE_ONCE(test->success, false);
+ +}
+++=======
++ #if IS_BUILTIN(CONFIG_KUNIT)
++ /*
++  * Fail the current test and print an error message to the log.
++  */
++ void __kunit_fail_current_test(const char *file, int line, const char *fmt, ...)
++ {
++ 	va_list args;
++ 	int len;
++ 	char *buffer;
++ 
++ 	if (!current->kunit_test)
++ 		return;
++ 
++ 	kunit_set_failure(current->kunit_test);
++ 
++ 	/* kunit_err() only accepts literals, so evaluate the args first. */
++ 	va_start(args, fmt);
++ 	len = vsnprintf(NULL, 0, fmt, args) + 1;
++ 	va_end(args);
++ 
++ 	buffer = kunit_kmalloc(current->kunit_test, len, GFP_KERNEL);
++ 	if (!buffer)
++ 		return;
++ 
++ 	va_start(args, fmt);
++ 	vsnprintf(buffer, len, fmt, args);
++ 	va_end(args);
++ 
++ 	kunit_err(current->kunit_test, "%s:%d: %s", file, line, buffer);
++ 	kunit_kfree(current->kunit_test, buffer);
++ }
++ EXPORT_SYMBOL_GPL(__kunit_fail_current_test);
++ #endif
+++>>>>>>> 359a376081d4 (kunit: support failure from dynamic analysis tools)
+  
+  /*
+   * Append formatted message to log, size of which is limited to
+@@@ -277,6 -308,8 +314,11 @@@ static void kunit_try_run_case(void *da
+  	struct kunit_suite *suite = ctx->suite;
+  	struct kunit_case *test_case = ctx->test_case;
+  
+++<<<<<<< HEAD
+++=======
++ 	current->kunit_test = test;
++ 
+++>>>>>>> 359a376081d4 (kunit: support failure from dynamic analysis tools)
+  	/*
+  	 * kunit_run_case_internal may encounter a fatal error; if it does,
+  	 * abort will be called, this thread will exit, and finally the parent
+@@@ -623,6 -657,7 +665,10 @@@ void kunit_cleanup(struct kunit *test
+  		spin_unlock(&test->lock);
+  		kunit_remove_resource(test, res);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	current->kunit_test = NULL;
+++>>>>>>> 359a376081d4 (kunit: support failure from dynamic analysis tools)
+  }
+  EXPORT_SYMBOL_GPL(kunit_cleanup);
+  
+diff --git a/include/kunit/test-bug.h b/include/kunit/test-bug.h
+new file mode 100644
+index 000000000000..ce6f6edc7801
+--- /dev/null
++++ b/include/kunit/test-bug.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * KUnit API allowing dynamic analysis tools to interact with KUnit tests
++ *
++ * Copyright (C) 2020, Google LLC.
++ * Author: Uriel Guajardo <urielguajardo@google.com>
++ */
++
++#ifndef _KUNIT_TEST_BUG_H
++#define _KUNIT_TEST_BUG_H
++
++#define kunit_fail_current_test(fmt, ...) \
++	__kunit_fail_current_test(__FILE__, __LINE__, fmt, ##__VA_ARGS__)
++
++#if IS_BUILTIN(CONFIG_KUNIT)
++
++extern __printf(3, 4) void __kunit_fail_current_test(const char *file, int line,
++						    const char *fmt, ...);
++
++#else
++
++static __printf(3, 4) void __kunit_fail_current_test(const char *file, int line,
++						    const char *fmt, ...)
++{
++}
++
++#endif
++
++#endif /* _KUNIT_TEST_BUG_H */
+* Unmerged path lib/kunit/test.c
