@@ -67,12 +67,6 @@ struct scan_control {
 	/* How many pages shrink_list() should reclaim */
 	unsigned long nr_to_reclaim;
 
-	/* This context's GFP mask */
-	gfp_t gfp_mask;
-
-	/* Allocation order */
-	int order;
-
 	/*
 	 * Nodemask of nodes allowed by the caller. If NULL, all nodes
 	 * are scanned.
@@ -84,12 +78,6 @@ struct scan_control {
 	 * primary target of this reclaim invocation.
 	 */
 	struct mem_cgroup *target_mem_cgroup;
-
-	/* Scan (total_size >> priority) pages at once */
-	int priority;
-
-	/* The highest zone to isolate pages for reclaim from */
-	enum zone_type reclaim_idx;
 
 	/* Writepage batching in laptop mode; RECLAIM_WRITE */
 	unsigned int may_writepage:1;
@@ -112,6 +100,18 @@ struct scan_control {
 
 	/* One of the zones is ready for compaction */
 	unsigned int compaction_ready:1;
+
+	/* Allocation order */
+	s8 order;
+
+	/* Scan (total_size >> priority) pages at once */
+	s8 priority;
+
+	/* The highest zone to isolate pages for reclaim from */
+	s8 reclaim_idx;
+
+	/* This context's GFP mask */
+	gfp_t gfp_mask;
 
 	/* Incremented by the number of inactive pages that were scanned */
 	unsigned long nr_scanned;
@@ -3239,6 +3239,14 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.may_unmap = 1,
 		.may_swap = 1,
 	};
+
+	/*
+	 * scan_control uses s8 fields for order, priority, and reclaim_idx.
+	 * Confirm they are large enough for max values.
+	 */
+	BUILD_BUG_ON(MAX_ORDER > S8_MAX);
+	BUILD_BUG_ON(DEF_PRIORITY > S8_MAX);
+	BUILD_BUG_ON(MAX_NR_ZONES > S8_MAX);
 
 	/*
 	 * Do not enter reclaim if fatal signal was delivered while throttled.
