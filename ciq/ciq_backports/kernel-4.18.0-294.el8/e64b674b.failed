@@ -1,0 +1,301 @@
+software node: implement reference properties
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dmitry Torokhov <dmitry.torokhov@gmail.com>
+commit e64b674bc9d76edb4cf1b8c98446b1d29a16b9df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e64b674b.failed
+
+It is possible to store references to software nodes in the same fashion as
+other static properties, so that users do not need to define separate
+structures:
+
+static const struct software_node gpio_bank_b_node = {
+	.name = "B",
+};
+
+static const struct property_entry simone_key_enter_props[] = {
+	PROPERTY_ENTRY_U32("linux,code", KEY_ENTER),
+	PROPERTY_ENTRY_STRING("label", "enter"),
+	PROPERTY_ENTRY_REF("gpios", &gpio_bank_b_node, 123, GPIO_ACTIVE_LOW),
+	{ }
+};
+
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit e64b674bc9d76edb4cf1b8c98446b1d29a16b9df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/swnode.c
+#	include/linux/property.h
+diff --cc drivers/base/swnode.c
+index d8d0dc0ca5ac,604d7327bba7..000000000000
+--- a/drivers/base/swnode.c
++++ b/drivers/base/swnode.c
+@@@ -248,32 -236,42 +248,58 @@@ static int property_entry_copy_data(str
+  				    const struct property_entry *src)
+  {
+  	const void *pointer = property_get_pointer(src);
+ -	void *dst_ptr;
+ -	size_t nval;
+ -
+ -	/*
+ -	 * Properties with no data should not be marked as stored
+ -	 * out of line.
+ -	 */
+ -	if (!src->is_inline && !src->length)
+ -		return -ENODATA;
+ -
+ +	const void *new;
+ +
+ +	if (src->is_array) {
+ +		if (!src->length)
+ +			return -ENODATA;
+ +
+++<<<<<<< HEAD
+ +		if (src->type == DEV_PROP_STRING) {
+ +			new = property_copy_string_array(src);
+ +			if (!new)
+ +				return -ENOMEM;
+ +		} else {
+ +			new = kmemdup(pointer, src->length, GFP_KERNEL);
+ +			if (!new)
+ +				return -ENOMEM;
+++=======
++ 	/*
++ 	 * Reference properties are never stored inline as
++ 	 * they are too big.
++ 	 */
++ 	if (src->type == DEV_PROP_REF && src->is_inline)
++ 		return -EINVAL;
++ 
++ 	if (src->length <= sizeof(dst->value)) {
++ 		dst_ptr = &dst->value;
++ 		dst->is_inline = true;
++ 	} else {
++ 		dst_ptr = kmalloc(src->length, GFP_KERNEL);
++ 		if (!dst_ptr)
++ 			return -ENOMEM;
++ 		dst->pointer = dst_ptr;
++ 	}
++ 
++ 	if (src->type == DEV_PROP_STRING) {
++ 		nval = src->length / sizeof(const char *);
++ 		if (!property_copy_string_array(dst_ptr, pointer, nval)) {
++ 			if (!dst->is_inline)
++ 				kfree(dst->pointer);
++ 			return -ENOMEM;
+++>>>>>>> e64b674bc9d7 (software node: implement reference properties)
+  		}
+ +
+ +		dst->is_array = true;
+ +		dst->pointer = new;
+ +	} else if (src->type == DEV_PROP_STRING) {
+ +		new = kstrdup(src->value.str, GFP_KERNEL);
+ +		if (!new && src->value.str)
+ +			return -ENOMEM;
+ +
+ +		dst->value.str = new;
+  	} else {
+ -		memcpy(dst_ptr, pointer, src->length);
+ +		dst->value = src->value;
+  	}
+  
+  	dst->length = src->length;
+@@@ -484,21 -480,49 +510,47 @@@ software_node_get_reference_args(const 
+  {
+  	struct swnode *swnode = to_swnode(fwnode);
+  	const struct software_node_reference *ref;
++ 	const struct software_node_ref_args *ref_array;
++ 	const struct software_node_ref_args *ref_args;
+  	const struct property_entry *prop;
+  	struct fwnode_handle *refnode;
+ -	u32 nargs_prop_val;
+ -	int error;
+  	int i;
+  
+- 	if (!swnode || !swnode->node->references)
++ 	if (!swnode)
+  		return -ENOENT;
+  
+- 	for (ref = swnode->node->references; ref->name; ref++)
+- 		if (!strcmp(ref->name, propname))
+- 			break;
++ 	prop = property_entry_get(swnode->node->properties, propname);
++ 	if (prop) {
++ 		if (prop->type != DEV_PROP_REF)
++ 			return -EINVAL;
+  
+- 	if (!ref->name || index > (ref->nrefs - 1))
+- 		return -ENOENT;
++ 		/*
++ 		 * We expect that references are never stored inline, even
++ 		 * single ones, as they are too big.
++ 		 */
++ 		if (prop->is_inline)
++ 			return -EINVAL;
++ 
++ 		if (index * sizeof(*ref_args) >= prop->length)
++ 			return -ENOENT;
++ 
++ 		ref_array = prop->pointer;
++ 		ref_args = &ref_array[index];
++ 	} else {
++ 		if (!swnode->node->references)
++ 			return -ENOENT;
++ 
++ 		for (ref = swnode->node->references; ref->name; ref++)
++ 			if (!strcmp(ref->name, propname))
++ 				break;
++ 
++ 		if (!ref->name || index > (ref->nrefs - 1))
++ 			return -ENOENT;
++ 
++ 		ref_args = &ref->refs[index];
++ 	}
+  
+- 	refnode = software_node_fwnode(ref->refs[index].node);
++ 	refnode = software_node_fwnode(ref_args->node);
+  	if (!refnode)
+  		return -ENOENT;
+  
+diff --cc include/linux/property.h
+index b1dbe0ba27b1,3df7089f0dbd..000000000000
+--- a/include/linux/property.h
++++ b/include/linux/property.h
+@@@ -258,32 -270,37 +273,56 @@@ struct property_entry 
+   * and structs.
+   */
+  
+++<<<<<<< HEAD
+ +#define __PROPERTY_ENTRY_ARRAY_LEN(_name_, _type_, _Type_, _val_, _len_)\
+ +(struct property_entry) {						\
+ +	.name = _name_,							\
+ +	.length = (_len_) * sizeof(_type_),				\
+ +	.is_array = true,						\
+++=======
++ #define __PROPERTY_ENTRY_ELEMENT_SIZE(_elem_)				\
++ 	sizeof(((struct property_entry *)NULL)->value._elem_[0])
++ 
++ #define __PROPERTY_ENTRY_ARRAY_ELSIZE_LEN(_name_, _elsize_, _Type_,	\
++ 					  _val_, _len_)			\
++ (struct property_entry) {						\
++ 	.name = _name_,							\
++ 	.length = (_len_) * (_elsize_),					\
+++>>>>>>> e64b674bc9d7 (software node: implement reference properties)
+  	.type = DEV_PROP_##_Type_,					\
+  	{ .pointer = _val_ },						\
+  }
+  
++ #define __PROPERTY_ENTRY_ARRAY_LEN(_name_, _elem_, _Type_, _val_, _len_)\
++ 	__PROPERTY_ENTRY_ARRAY_ELSIZE_LEN(_name_,			\
++ 				__PROPERTY_ENTRY_ELEMENT_SIZE(_elem_),	\
++ 				_Type_, _val_, _len_)
++ 
+  #define PROPERTY_ENTRY_U8_ARRAY_LEN(_name_, _val_, _len_)		\
+ -	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u8_data, U8, _val_, _len_)
+ +	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u8, U8, _val_, _len_)
+  #define PROPERTY_ENTRY_U16_ARRAY_LEN(_name_, _val_, _len_)		\
+ -	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u16_data, U16, _val_, _len_)
+ +	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u16, U16, _val_, _len_)
+  #define PROPERTY_ENTRY_U32_ARRAY_LEN(_name_, _val_, _len_)		\
+ -	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u32_data, U32, _val_, _len_)
+ +	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u32, U32, _val_, _len_)
+  #define PROPERTY_ENTRY_U64_ARRAY_LEN(_name_, _val_, _len_)		\
+ -	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u64_data, U64, _val_, _len_)
+ +	__PROPERTY_ENTRY_ARRAY_LEN(_name_, u64, U64, _val_, _len_)
+ +
+  #define PROPERTY_ENTRY_STRING_ARRAY_LEN(_name_, _val_, _len_)		\
+++<<<<<<< HEAD
+ +(struct property_entry) {						\
+ +	.name = _name_,							\
+ +	.length = (_len_) * sizeof(const char *),			\
+ +	.is_array = true,						\
+ +	.type = DEV_PROP_STRING,					\
+ +	{ .pointer = _val_ },						\
+ +}
+++=======
++ 	__PROPERTY_ENTRY_ARRAY_LEN(_name_, str, STRING, _val_, _len_)
++ #define PROPERTY_ENTRY_REF_ARRAY_LEN(_name_, _val_, _len_)		\
++ 	__PROPERTY_ENTRY_ARRAY_ELSIZE_LEN(_name_,			\
++ 				sizeof(struct software_node_ref_args),	\
++ 				REF, _val_, _len_)
+++>>>>>>> e64b674bc9d7 (software node: implement reference properties)
+  
+  #define PROPERTY_ENTRY_U8_ARRAY(_name_, _val_)				\
+  	PROPERTY_ENTRY_U8_ARRAY_LEN(_name_, _val_, ARRAY_SIZE(_val_))
+@@@ -295,37 -312,47 +334,51 @@@
+  	PROPERTY_ENTRY_U64_ARRAY_LEN(_name_, _val_, ARRAY_SIZE(_val_))
+  #define PROPERTY_ENTRY_STRING_ARRAY(_name_, _val_)			\
+  	PROPERTY_ENTRY_STRING_ARRAY_LEN(_name_, _val_, ARRAY_SIZE(_val_))
++ #define PROPERTY_ENTRY_REF_ARRAY(_name_, _val_)			\
++ 	PROPERTY_ENTRY_REF_ARRAY_LEN(_name_, _val_, ARRAY_SIZE(_val_))
+  
+ -#define __PROPERTY_ENTRY_ELEMENT(_name_, _elem_, _Type_, _val_)		\
+ -(struct property_entry) {						\
+ -	.name = _name_,							\
+ -	.length = __PROPERTY_ENTRY_ELEMENT_SIZE(_elem_),		\
+ -	.is_inline = true,						\
+ -	.type = DEV_PROP_##_Type_,					\
+ -	{ .value = { ._elem_[0] = _val_ } },				\
+ +#define __PROPERTY_ENTRY_INTEGER(_name_, _type_, _Type_, _val_)	\
+ +(struct property_entry) {					\
+ +	.name = _name_,						\
+ +	.length = sizeof(_type_),				\
+ +	.type = DEV_PROP_##_Type_,				\
+ +	{ .value = { ._type_##_data = _val_ } },		\
+  }
+  
+ -#define PROPERTY_ENTRY_U8(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u8_data, U8, _val_)
+ -#define PROPERTY_ENTRY_U16(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u16_data, U16, _val_)
+ -#define PROPERTY_ENTRY_U32(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u32_data, U32, _val_)
+ -#define PROPERTY_ENTRY_U64(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u64_data, U64, _val_)
+ -#define PROPERTY_ENTRY_STRING(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, str, STRING, _val_)
+ +#define PROPERTY_ENTRY_U8(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u8, U8, _val_)
+ +#define PROPERTY_ENTRY_U16(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u16, U16, _val_)
+ +#define PROPERTY_ENTRY_U32(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u32, U32, _val_)
+ +#define PROPERTY_ENTRY_U64(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u64, U64, _val_)
+ +
+ +#define PROPERTY_ENTRY_STRING(_name_, _val_)		\
+ +(struct property_entry) {				\
+ +	.name = _name_,					\
+ +	.length = sizeof(_val_),			\
+ +	.type = DEV_PROP_STRING,			\
+ +	{ .value = { .str = _val_ } },			\
+ +}
+  
+  #define PROPERTY_ENTRY_BOOL(_name_)		\
+  (struct property_entry) {			\
+  	.name = _name_,				\
+ -	.is_inline = true,			\
+  }
+  
++ #define PROPERTY_ENTRY_REF(_name_, _ref_, ...)				\
++ (struct property_entry) {						\
++ 	.name = _name_,							\
++ 	.length = sizeof(struct software_node_ref_args),		\
++ 	.type = DEV_PROP_REF,						\
++ 	{ .pointer = &(const struct software_node_ref_args) {		\
++ 		.node = _ref_,						\
++ 		.nargs = ARRAY_SIZE(((u64[]){ 0, ##__VA_ARGS__ })) - 1,	\
++ 		.args = { __VA_ARGS__ },				\
++ 	} },								\
++ }
++ 
+  struct property_entry *
+  property_entries_dup(const struct property_entry *properties);
+  
+* Unmerged path drivers/base/swnode.c
+* Unmerged path include/linux/property.h
