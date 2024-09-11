@@ -1,0 +1,159 @@
+scsi: qla2xxx: edif: bsg refactor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Quinn Tran <qutran@marvell.com>
+commit 7a7b0b4865d3490f62d6ef1a3aa39fa2b47859a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/7a7b0b48.failed
+
+ - Add version field to edif bsg for future enhancement.
+
+ - Add version edif bsg version check
+
+ - Remove unused interfaces and fields.
+
+Link: https://lore.kernel.org/r/20220607044627.19563-3-njavali@marvell.com
+Fixes: dd30706e73b7 ("scsi: qla2xxx: edif: Add key update")
+	Signed-off-by: Quinn Tran <qutran@marvell.com>
+	Signed-off-by: Nilesh Javali <njavali@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 7a7b0b4865d3490f62d6ef1a3aa39fa2b47859a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_edif_bsg.h
+diff --cc drivers/scsi/qla2xxx/qla_edif_bsg.h
+index 53026d82ebff,301523e4f483..000000000000
+--- a/drivers/scsi/qla2xxx/qla_edif_bsg.h
++++ b/drivers/scsi/qla2xxx/qla_edif_bsg.h
+@@@ -120,8 -118,10 +118,10 @@@ struct app_pinfo 
+  
+  struct app_pinfo_reply {
+  	uint8_t		port_count;
++ 	uint8_t		version;
++ 	uint8_t		pad[VND_CMD_PAD_SIZE];
+  	uint8_t		reserved[VND_CMD_APP_RESERVED_SIZE];
+ -	struct app_pinfo ports[];
+ +	struct app_pinfo ports[0];
+  } __packed;
+  
+  struct app_sinfo_req {
+@@@ -140,7 -142,10 +142,14 @@@ struct app_sinfo 
+  
+  struct app_stats_reply {
+  	uint8_t		elem_count;
+++<<<<<<< HEAD
+ +	struct app_sinfo elem[0];
+++=======
++ 	uint8_t		version;
++ 	uint8_t		pad[VND_CMD_PAD_SIZE];
++ 	uint8_t		reserved[VND_CMD_APP_RESERVED_SIZE];
++ 	struct app_sinfo elem[];
+++>>>>>>> 7a7b0b4865d3 (scsi: qla2xxx: edif: bsg refactor)
+  } __packed;
+  
+  struct qla_sa_update_frame {
+diff --git a/drivers/scsi/qla2xxx/qla_edif.c b/drivers/scsi/qla2xxx/qla_edif.c
+index e789f59395ce..0a49834198ca 100644
+--- a/drivers/scsi/qla2xxx/qla_edif.c
++++ b/drivers/scsi/qla2xxx/qla_edif.c
+@@ -280,14 +280,19 @@ qla_edif_app_check(scsi_qla_host_t *vha, struct app_id appid)
+ {
+ 	/* check that the app is allow/known to the driver */
+ 
+-	if (appid.app_vid == EDIF_APP_ID) {
+-		ql_dbg(ql_dbg_edif + ql_dbg_verbose, vha, 0x911d, "%s app id ok\n", __func__);
+-		return true;
++	if (appid.app_vid != EDIF_APP_ID) {
++		ql_dbg(ql_dbg_edif, vha, 0x911d, "%s app id not ok (%x)",
++		    __func__, appid.app_vid);
++		return false;
++	}
++
++	if (appid.version != EDIF_VERSION1) {
++		ql_dbg(ql_dbg_edif, vha, 0x911d, "%s app version is not ok (%x)",
++		    __func__, appid.version);
++		return false;
+ 	}
+-	ql_dbg(ql_dbg_edif, vha, 0x911d, "%s app id not ok (%x)",
+-	    __func__, appid.app_vid);
+ 
+-	return false;
++	return true;
+ }
+ 
+ static void
+@@ -555,6 +560,7 @@ qla_edif_app_start(scsi_qla_host_t *vha, struct bsg_job *bsg_job)
+ 	appreply.host_support_edif = vha->hw->flags.edif_enabled;
+ 	appreply.edif_enode_active = vha->pur_cinfo.enode_flags;
+ 	appreply.edif_edb_active = vha->e_dbell.db_flags;
++	appreply.version = EDIF_VERSION1;
+ 
+ 	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
+ 
+@@ -684,6 +690,7 @@ qla_edif_app_authok(scsi_qla_host_t *vha, struct bsg_job *bsg_job)
+ 	portid.b.area   = appplogiok.u.d_id.b.area;
+ 	portid.b.al_pa  = appplogiok.u.d_id.b.al_pa;
+ 
++	appplogireply.version = EDIF_VERSION1;
+ 	switch (appplogiok.type) {
+ 	case PL_TYPE_WWPN:
+ 		fcport = qla2x00_find_fcport_by_wwpn(vha,
+@@ -876,6 +883,8 @@ qla_edif_app_getfcinfo(scsi_qla_host_t *vha, struct bsg_job *bsg_job)
+ 	} else {
+ 		struct fc_port	*fcport = NULL, *tf;
+ 
++		app_reply->version = EDIF_VERSION1;
++
+ 		list_for_each_entry_safe(fcport, tf, &vha->vp_fcports, list) {
+ 			if (!(fcport->flags & FCF_FCSP_DEVICE))
+ 				continue;
+@@ -892,9 +901,6 @@ qla_edif_app_getfcinfo(scsi_qla_host_t *vha, struct bsg_job *bsg_job)
+ 			if (tdid.b24 != 0 && tdid.b24 != fcport->d_id.b24)
+ 				continue;
+ 
+-			app_reply->ports[pcnt].rekey_count =
+-				fcport->edif.rekey_cnt;
+-
+ 			if (fcport->scan_state != QLA_FCPORT_FOUND)
+ 				continue;
+ 
+@@ -909,6 +915,7 @@ qla_edif_app_getfcinfo(scsi_qla_host_t *vha, struct bsg_job *bsg_job)
+ 
+ 			rval = 0;
+ 
++			app_reply->ports[pcnt].version = EDIF_VERSION1;
+ 			app_reply->ports[pcnt].remote_type =
+ 				VND_CMD_RTYPE_UNKNOWN;
+ 			if (fcport->port_type & (FCT_NVME_TARGET | FCT_TARGET))
+@@ -1005,6 +1012,8 @@ qla_edif_app_getstats(scsi_qla_host_t *vha, struct bsg_job *bsg_job)
+ 	} else {
+ 		struct fc_port	*fcport = NULL, *tf;
+ 
++		app_reply->version = EDIF_VERSION1;
++
+ 		list_for_each_entry_safe(fcport, tf, &vha->vp_fcports, list) {
+ 			if (fcport->edif.enable) {
+ 				if (pcnt > app_req.num_ports)
+@@ -2036,6 +2045,7 @@ qla_edb_eventcreate(scsi_qla_host_t *vha, uint32_t dbtype,
+ 		edbnode->u.sa_aen.port_id = fcport->d_id;
+ 		edbnode->u.sa_aen.status =  data;
+ 		edbnode->u.sa_aen.key_type =  data2;
++		edbnode->u.sa_aen.version = EDIF_VERSION1;
+ 		break;
+ 	default:
+ 		ql_dbg(ql_dbg_edif, vha, 0x09102,
+@@ -3379,6 +3389,10 @@ int qla_edif_process_els(scsi_qla_host_t *vha, struct bsg_job *bsg_job)
+ 	port_id_t d_id;
+ 	struct qla_bsg_auth_els_request *p =
+ 	    (struct qla_bsg_auth_els_request *)bsg_job->request;
++	struct qla_bsg_auth_els_reply *rpl =
++	    (struct qla_bsg_auth_els_reply *)bsg_job->reply;
++
++	rpl->version = EDIF_VERSION1;
+ 
+ 	d_id.b.al_pa = bsg_request->rqst_data.h_els.port_id[2];
+ 	d_id.b.area = bsg_request->rqst_data.h_els.port_id[1];
+* Unmerged path drivers/scsi/qla2xxx/qla_edif_bsg.h
