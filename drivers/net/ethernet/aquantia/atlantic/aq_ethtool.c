@@ -314,21 +314,10 @@ static int aq_ethtool_set_coalesce(struct net_device *ndev,
 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
 	struct aq_nic_cfg_s *cfg = aq_nic_get_cfg(aq_nic);
 
-	/* This is not yet supported
-	 */
-	if (coal->use_adaptive_rx_coalesce || coal->use_adaptive_tx_coalesce)
-		return -EOPNOTSUPP;
-
 	/* Atlantic only supports timing based coalescing
 	 */
 	if (coal->rx_max_coalesced_frames > 1 ||
-	    coal->rx_coalesce_usecs_irq ||
-	    coal->rx_max_coalesced_frames_irq)
-		return -EOPNOTSUPP;
-
-	if (coal->tx_max_coalesced_frames > 1 ||
-	    coal->tx_coalesce_usecs_irq ||
-	    coal->tx_max_coalesced_frames_irq)
+	    coal->tx_max_coalesced_frames > 1)
 		return -EOPNOTSUPP;
 
 	/* We do not support frame counting. Check this
@@ -595,6 +584,8 @@ static void aq_set_msg_level(struct net_device *ndev, u32 data)
 }
 
 const struct ethtool_ops aq_ethtool_ops = {
+	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+				     ETHTOOL_COALESCE_MAX_FRAMES,
 	.get_link            = aq_ethtool_get_link,
 	.get_regs_len        = aq_ethtool_get_regs_len,
 	.get_regs            = aq_ethtool_get_regs,
