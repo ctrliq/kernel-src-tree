@@ -1,0 +1,212 @@
+locking/rwsem: Add missing __init_rwsem() for PREEMPT_RT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Mike Galbraith <efault@gmx.de>
+commit 15eb7c888e749fbd1cc0370f3d38de08ad903700
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/15eb7c88.failed
+
+730633f0b7f95 became the first direct caller of __init_rwsem() vs the
+usual init_rwsem(), exposing PREEMPT_RT's lack thereof.  Add it.
+
+[ tglx: Move it out of line ]
+
+	Signed-off-by: Mike Galbraith <efault@gmx.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/50a936b7d8f12277d6ec7ed2ef0421a381056909.camel@gmx.de
+
+(cherry picked from commit 15eb7c888e749fbd1cc0370f3d38de08ad903700)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rwsem.h
+#	kernel/locking/rwsem.c
+diff --cc include/linux/rwsem.h
+index 7d1cd30334c3,352c6127cb90..000000000000
+--- a/include/linux/rwsem.h
++++ b/include/linux/rwsem.h
+@@@ -111,6 -122,53 +111,56 @@@ static inline int rwsem_is_contended(st
+  	return !list_empty(&sem->wait_list);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #else /* !CONFIG_PREEMPT_RT */
++ 
++ #include <linux/rwbase_rt.h>
++ 
++ struct rw_semaphore {
++ 	struct rwbase_rt	rwbase;
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	struct lockdep_map	dep_map;
++ #endif
++ };
++ 
++ #define __RWSEM_INITIALIZER(name)				\
++ 	{							\
++ 		.rwbase = __RWBASE_INITIALIZER(name),		\
++ 		__RWSEM_DEP_MAP_INIT(name)			\
++ 	}
++ 
++ #define DECLARE_RWSEM(lockname) \
++ 	struct rw_semaphore lockname = __RWSEM_INITIALIZER(lockname)
++ 
++ extern void  __init_rwsem(struct rw_semaphore *rwsem, const char *name,
++ 			  struct lock_class_key *key);
++ 
++ #define init_rwsem(sem)						\
++ do {								\
++ 	static struct lock_class_key __key;			\
++ 								\
++ 	__init_rwsem((sem), #sem, &__key);			\
++ } while (0)
++ 
++ static __always_inline int rwsem_is_locked(struct rw_semaphore *sem)
++ {
++ 	return rw_base_is_locked(&sem->rwbase);
++ }
++ 
++ static __always_inline int rwsem_is_contended(struct rw_semaphore *sem)
++ {
++ 	return rw_base_is_contended(&sem->rwbase);
++ }
++ 
++ #endif /* CONFIG_PREEMPT_RT */
++ 
++ /*
++  * The functions below are the same for all rwsem implementations including
++  * the RT specific variant.
++  */
++ 
+++>>>>>>> 15eb7c888e74 (locking/rwsem: Add missing __init_rwsem() for PREEMPT_RT)
+  /*
+   * lock for reading
+   */
+diff --cc kernel/locking/rwsem.c
+index b251178daca3,000e8d5a2884..000000000000
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@@ -1352,6 -1345,116 +1352,119 @@@ static inline void __downgrade_write(st
+  		rwsem_downgrade_wake(sem);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #else /* !CONFIG_PREEMPT_RT */
++ 
++ #define RT_MUTEX_BUILD_MUTEX
++ #include "rtmutex.c"
++ 
++ #define rwbase_set_and_save_current_state(state)	\
++ 	set_current_state(state)
++ 
++ #define rwbase_restore_current_state()			\
++ 	__set_current_state(TASK_RUNNING)
++ 
++ #define rwbase_rtmutex_lock_state(rtm, state)		\
++ 	__rt_mutex_lock(rtm, state)
++ 
++ #define rwbase_rtmutex_slowlock_locked(rtm, state)	\
++ 	__rt_mutex_slowlock_locked(rtm, NULL, state)
++ 
++ #define rwbase_rtmutex_unlock(rtm)			\
++ 	__rt_mutex_unlock(rtm)
++ 
++ #define rwbase_rtmutex_trylock(rtm)			\
++ 	__rt_mutex_trylock(rtm)
++ 
++ #define rwbase_signal_pending_state(state, current)	\
++ 	signal_pending_state(state, current)
++ 
++ #define rwbase_schedule()				\
++ 	schedule()
++ 
++ #include "rwbase_rt.c"
++ 
++ void __init_rwsem(struct rw_semaphore *sem, const char *name,
++ 		  struct lock_class_key *key)
++ {
++ 	init_rwbase_rt(&(sem)->rwbase);
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	debug_check_no_locks_freed((void *)sem, sizeof(*sem));
++ 	lockdep_init_map_wait(&sem->dep_map, name, key, 0, LD_WAIT_SLEEP);
++ #endif
++ }
++ EXPORT_SYMBOL(__init_rwsem);
++ 
++ static inline void __down_read(struct rw_semaphore *sem)
++ {
++ 	rwbase_read_lock(&sem->rwbase, TASK_UNINTERRUPTIBLE);
++ }
++ 
++ static inline int __down_read_interruptible(struct rw_semaphore *sem)
++ {
++ 	return rwbase_read_lock(&sem->rwbase, TASK_INTERRUPTIBLE);
++ }
++ 
++ static inline int __down_read_killable(struct rw_semaphore *sem)
++ {
++ 	return rwbase_read_lock(&sem->rwbase, TASK_KILLABLE);
++ }
++ 
++ static inline int __down_read_trylock(struct rw_semaphore *sem)
++ {
++ 	return rwbase_read_trylock(&sem->rwbase);
++ }
++ 
++ static inline void __up_read(struct rw_semaphore *sem)
++ {
++ 	rwbase_read_unlock(&sem->rwbase, TASK_NORMAL);
++ }
++ 
++ static inline void __sched __down_write(struct rw_semaphore *sem)
++ {
++ 	rwbase_write_lock(&sem->rwbase, TASK_UNINTERRUPTIBLE);
++ }
++ 
++ static inline int __sched __down_write_killable(struct rw_semaphore *sem)
++ {
++ 	return rwbase_write_lock(&sem->rwbase, TASK_KILLABLE);
++ }
++ 
++ static inline int __down_write_trylock(struct rw_semaphore *sem)
++ {
++ 	return rwbase_write_trylock(&sem->rwbase);
++ }
++ 
++ static inline void __up_write(struct rw_semaphore *sem)
++ {
++ 	rwbase_write_unlock(&sem->rwbase);
++ }
++ 
++ static inline void __downgrade_write(struct rw_semaphore *sem)
++ {
++ 	rwbase_write_downgrade(&sem->rwbase);
++ }
++ 
++ /* Debug stubs for the common API */
++ #define DEBUG_RWSEMS_WARN_ON(c, sem)
++ 
++ static inline void __rwsem_set_reader_owned(struct rw_semaphore *sem,
++ 					    struct task_struct *owner)
++ {
++ }
++ 
++ static inline bool is_rwsem_reader_owned(struct rw_semaphore *sem)
++ {
++ 	int count = atomic_read(&sem->rwbase.readers);
++ 
++ 	return count < 0 && count != READER_BIAS;
++ }
++ 
++ #endif /* CONFIG_PREEMPT_RT */
++ 
+++>>>>>>> 15eb7c888e74 (locking/rwsem: Add missing __init_rwsem() for PREEMPT_RT)
+  /*
+   * lock for reading
+   */
+* Unmerged path include/linux/rwsem.h
+* Unmerged path kernel/locking/rwsem.c
