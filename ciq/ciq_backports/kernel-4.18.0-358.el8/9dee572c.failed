@@ -1,0 +1,351 @@
+net: bridge: vlan: add mcast snooping control
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 9dee572c384846f4ece029ab5688faed0682e48a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/9dee572c.failed
+
+Add a new global vlan option which controls whether multicast snooping
+is enabled or disabled for a single vlan. It controls the vlan private
+flag: BR_VLFLAG_GLOBAL_MCAST_ENABLED.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9dee572c384846f4ece029ab5688faed0682e48a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_multicast.c
+index def6f1840985,976491951c82..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -2919,15 -3887,145 +2919,135 @@@ void br_multicast_open(struct net_bridg
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on)
++ {
++ 	struct net_bridge *br;
++ 
++ 	/* it's okay to check for the flag without the multicast lock because it
++ 	 * can only change under RTNL -> multicast_lock, we need the latter to
++ 	 * sync with timers and packets
++ 	 */
++ 	if (on == !!(vlan->priv_flags & BR_VLFLAG_MCAST_ENABLED))
++ 		return;
++ 
++ 	if (br_vlan_is_master(vlan)) {
++ 		br = vlan->br;
++ 
++ 		if (!br_vlan_is_brentry(vlan) ||
++ 		    (on &&
++ 		     br_multicast_ctx_vlan_global_disabled(&vlan->br_mcast_ctx)))
++ 			return;
++ 
++ 		spin_lock_bh(&br->multicast_lock);
++ 		vlan->priv_flags ^= BR_VLFLAG_MCAST_ENABLED;
++ 		spin_unlock_bh(&br->multicast_lock);
++ 
++ 		if (on)
++ 			__br_multicast_open(&vlan->br_mcast_ctx);
++ 		else
++ 			__br_multicast_stop(&vlan->br_mcast_ctx);
++ 	} else {
++ 		struct net_bridge_mcast *brmctx;
++ 
++ 		brmctx = br_multicast_port_ctx_get_global(&vlan->port_mcast_ctx);
++ 		if (on && br_multicast_ctx_vlan_global_disabled(brmctx))
++ 			return;
++ 
++ 		br = vlan->port->br;
++ 		spin_lock_bh(&br->multicast_lock);
++ 		vlan->priv_flags ^= BR_VLFLAG_MCAST_ENABLED;
++ 		if (on)
++ 			__br_multicast_enable_port_ctx(&vlan->port_mcast_ctx);
++ 		else
++ 			__br_multicast_disable_port_ctx(&vlan->port_mcast_ctx);
++ 		spin_unlock_bh(&br->multicast_lock);
++ 	}
++ }
++ 
++ void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan, bool on)
++ {
++ 	struct net_bridge_port *p;
++ 
++ 	if (WARN_ON_ONCE(!br_vlan_is_master(vlan)))
++ 		return;
++ 
++ 	list_for_each_entry(p, &vlan->br->port_list, list) {
++ 		struct net_bridge_vlan *vport;
++ 
++ 		vport = br_vlan_find(nbp_vlan_group(p), vlan->vid);
++ 		if (!vport)
++ 			continue;
++ 		br_multicast_toggle_one_vlan(vport, on);
++ 	}
++ }
++ 
++ int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	struct net_bridge_vlan_group *vg;
++ 	struct net_bridge_vlan *vlan;
++ 	struct net_bridge_port *p;
++ 
++ 	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED) == on)
++ 		return 0;
++ 
++ 	if (on && !br_opt_get(br, BROPT_VLAN_ENABLED)) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Cannot enable multicast vlan snooping with vlan filtering disabled");
++ 		return -EINVAL;
++ 	}
++ 
++ 	vg = br_vlan_group(br);
++ 	if (!vg)
++ 		return 0;
++ 
++ 	br_opt_toggle(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED, on);
++ 
++ 	/* disable/enable non-vlan mcast contexts based on vlan snooping */
++ 	if (on)
++ 		__br_multicast_stop(&br->multicast_ctx);
++ 	else
++ 		__br_multicast_open(&br->multicast_ctx);
++ 	list_for_each_entry(p, &br->port_list, list) {
++ 		if (on)
++ 			br_multicast_disable_port(p);
++ 		else
++ 			br_multicast_enable_port(p);
++ 	}
++ 
++ 	list_for_each_entry(vlan, &vg->vlan_list, vlist)
++ 		br_multicast_toggle_vlan(vlan, on);
++ 
++ 	return 0;
++ }
++ 
++ bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on)
++ {
++ 	ASSERT_RTNL();
++ 
++ 	/* BR_VLFLAG_GLOBAL_MCAST_ENABLED relies on eventual consistency and
++ 	 * requires only RTNL to change
++ 	 */
++ 	if (on == !!(vlan->priv_flags & BR_VLFLAG_GLOBAL_MCAST_ENABLED))
++ 		return false;
++ 
++ 	vlan->priv_flags ^= BR_VLFLAG_GLOBAL_MCAST_ENABLED;
++ 	br_multicast_toggle_vlan(vlan, on);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 9dee572c3848 (net: bridge: vlan: add mcast snooping control)
+  void br_multicast_stop(struct net_bridge *br)
+  {
+ -	ASSERT_RTNL();
+ -
+ -	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED)) {
+ -		struct net_bridge_vlan_group *vg;
+ -		struct net_bridge_vlan *vlan;
+ -
+ -		vg = br_vlan_group(br);
+ -		if (vg) {
+ -			list_for_each_entry(vlan, &vg->vlan_list, vlist) {
+ -				struct net_bridge_mcast *brmctx;
+ -
+ -				brmctx = &vlan->br_mcast_ctx;
+ -				if (br_vlan_is_brentry(vlan) &&
+ -				    !br_multicast_ctx_vlan_disabled(brmctx))
+ -					__br_multicast_stop(&vlan->br_mcast_ctx);
+ -			}
+ -		}
+ -	}
+ -
+ -	__br_multicast_stop(&br->multicast_ctx);
+ +	del_timer_sync(&br->multicast_router_timer);
+ +	del_timer_sync(&br->ip4_other_query.timer);
+ +	del_timer_sync(&br->ip4_own_query.timer);
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	del_timer_sync(&br->ip6_other_query.timer);
+ +	del_timer_sync(&br->ip6_own_query.timer);
+ +#endif
+  }
+  
+  void br_multicast_dev_del(struct net_bridge *br)
+diff --cc net/bridge/br_private.h
+index 59db848b9ec6,4681a4b6020f..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -754,6 -889,32 +754,35 @@@ void br_mdb_init(void)
+  void br_mdb_uninit(void);
+  void br_multicast_host_join(struct net_bridge_mdb_entry *mp, bool notify);
+  void br_multicast_host_leave(struct net_bridge_mdb_entry *mp, bool notify);
+++<<<<<<< HEAD
+++=======
++ void br_multicast_star_g_handle_mode(struct net_bridge_port_group *pg,
++ 				     u8 filter_mode);
++ void br_multicast_sg_add_exclude_ports(struct net_bridge_mdb_entry *star_mp,
++ 				       struct net_bridge_port_group *sg);
++ struct net_bridge_group_src *
++ br_multicast_find_group_src(struct net_bridge_port_group *pg, struct br_ip *ip);
++ void br_multicast_del_group_src(struct net_bridge_group_src *src,
++ 				bool fastleave);
++ void br_multicast_ctx_init(struct net_bridge *br,
++ 			   struct net_bridge_vlan *vlan,
++ 			   struct net_bridge_mcast *brmctx);
++ void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx);
++ void br_multicast_port_ctx_init(struct net_bridge_port *port,
++ 				struct net_bridge_vlan *vlan,
++ 				struct net_bridge_mcast_port *pmctx);
++ void br_multicast_port_ctx_deinit(struct net_bridge_mcast_port *pmctx);
++ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on);
++ void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan, bool on);
++ int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
++ 				      struct netlink_ext_ack *extack);
++ bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on);
++ 
++ static inline bool br_group_is_l2(const struct br_ip *group)
++ {
++ 	return group->proto == 0;
++ }
+++>>>>>>> 9dee572c3848 (net: bridge: vlan: add mcast snooping control)
+  
+  #define mlock_dereference(X, br) \
+  	rcu_dereference_protected(X, lockdep_is_held(&br->multicast_lock))
+@@@ -931,6 -1246,49 +960,52 @@@ static inline int br_multicast_igmp_typ
+  {
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void br_multicast_ctx_init(struct net_bridge *br,
++ 					 struct net_bridge_vlan *vlan,
++ 					 struct net_bridge_mcast *brmctx)
++ {
++ }
++ 
++ static inline void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx)
++ {
++ }
++ 
++ static inline void br_multicast_port_ctx_init(struct net_bridge_port *port,
++ 					      struct net_bridge_vlan *vlan,
++ 					      struct net_bridge_mcast_port *pmctx)
++ {
++ }
++ 
++ static inline void br_multicast_port_ctx_deinit(struct net_bridge_mcast_port *pmctx)
++ {
++ }
++ 
++ static inline void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan,
++ 						bool on)
++ {
++ }
++ 
++ static inline void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan,
++ 					    bool on)
++ {
++ }
++ 
++ static inline int br_multicast_toggle_vlan_snooping(struct net_bridge *br,
++ 						    bool on,
++ 						    struct netlink_ext_ack *extack)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan,
++ 						   bool on)
++ {
++ 	return false;
++ }
+++>>>>>>> 9dee572c3848 (net: bridge: vlan: add mcast snooping control)
+  #endif
+  
+  /* br_vlan.c */
+diff --git a/include/uapi/linux/if_bridge.h b/include/uapi/linux/if_bridge.h
+index d643fa57361d..1b9dee054cd6 100644
+--- a/include/uapi/linux/if_bridge.h
++++ b/include/uapi/linux/if_bridge.h
+@@ -491,6 +491,7 @@ enum {
+ 	BRIDGE_VLANDB_GOPTS_UNSPEC,
+ 	BRIDGE_VLANDB_GOPTS_ID,
+ 	BRIDGE_VLANDB_GOPTS_RANGE,
++	BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING,
+ 	__BRIDGE_VLANDB_GOPTS_MAX
+ };
+ #define BRIDGE_VLANDB_GOPTS_MAX (__BRIDGE_VLANDB_GOPTS_MAX - 1)
+* Unmerged path net/bridge/br_multicast.c
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/br_vlan_options.c b/net/bridge/br_vlan_options.c
+index 827bfc319599..4ef975b20185 100644
+--- a/net/bridge/br_vlan_options.c
++++ b/net/bridge/br_vlan_options.c
+@@ -262,7 +262,9 @@ int br_vlan_process_options(const struct net_bridge *br,
+ bool br_vlan_global_opts_can_enter_range(const struct net_bridge_vlan *v_curr,
+ 					 const struct net_bridge_vlan *r_end)
+ {
+-	return v_curr->vid - r_end->vid == 1;
++	return v_curr->vid - r_end->vid == 1 &&
++	       ((v_curr->priv_flags ^ r_end->priv_flags) &
++		BR_VLFLAG_GLOBAL_MCAST_ENABLED) == 0;
+ }
+ 
+ bool br_vlan_global_opts_fill(struct sk_buff *skb, u16 vid, u16 vid_range,
+@@ -281,6 +283,12 @@ bool br_vlan_global_opts_fill(struct sk_buff *skb, u16 vid, u16 vid_range,
+ 	    nla_put_u16(skb, BRIDGE_VLANDB_GOPTS_RANGE, vid_range))
+ 		goto out_err;
+ 
++#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++	if (nla_put_u8(skb, BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING,
++		       !!(v_opts->priv_flags & BR_VLFLAG_GLOBAL_MCAST_ENABLED)))
++		goto out_err;
++#endif
++
+ 	nla_nest_end(skb, nest);
+ 
+ 	return true;
+@@ -295,6 +303,9 @@ static size_t rtnl_vlan_global_opts_nlmsg_size(void)
+ 	return NLMSG_ALIGN(sizeof(struct br_vlan_msg))
+ 		+ nla_total_size(0) /* BRIDGE_VLANDB_GLOBAL_OPTIONS */
+ 		+ nla_total_size(sizeof(u16)) /* BRIDGE_VLANDB_GOPTS_ID */
++#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++		+ nla_total_size(sizeof(u8)) /* BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING */
++#endif
+ 		+ nla_total_size(sizeof(u16)); /* BRIDGE_VLANDB_GOPTS_RANGE */
+ }
+ 
+@@ -349,12 +360,23 @@ static int br_vlan_process_global_one_opts(const struct net_bridge *br,
+ 					   struct netlink_ext_ack *extack)
+ {
+ 	*changed = false;
++#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++	if (tb[BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING]) {
++		u8 mc_snooping;
++
++		mc_snooping = nla_get_u8(tb[BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING]);
++		if (br_multicast_toggle_global_vlan(v, !!mc_snooping))
++			*changed = true;
++	}
++#endif
++
+ 	return 0;
+ }
+ 
+ static const struct nla_policy br_vlan_db_gpol[BRIDGE_VLANDB_GOPTS_MAX + 1] = {
+ 	[BRIDGE_VLANDB_GOPTS_ID]	= { .type = NLA_U16 },
+ 	[BRIDGE_VLANDB_GOPTS_RANGE]	= { .type = NLA_U16 },
++	[BRIDGE_VLANDB_GOPTS_MCAST_SNOOPING]	= { .type = NLA_U8 },
+ };
+ 
+ int br_vlan_rtm_process_global_options(struct net_device *dev,
