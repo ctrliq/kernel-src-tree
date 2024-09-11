@@ -1,0 +1,310 @@
+cgroup: remove cgroup_enable_task_cg_lists() optimization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tejun Heo <tj@kernel.org>
+commit 5153faac18d293fc7abb19ff7034683fbcd82dc7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5153faac.failed
+
+cgroup_enable_task_cg_lists() is used to lazyily initialize task
+cgroup associations on the first use to reduce fork / exit overheads
+on systems which don't use cgroup.  Unfortunately, locking around it
+has never been actually correct and its value is dubious given how the
+vast majority of systems use cgroup right away from boot.
+
+This patch removes the optimization.  For now, replace the cg_list
+based branches with WARN_ON_ONCE()'s to be on the safe side.  We can
+simplify the logic further in the future.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Reported-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 5153faac18d293fc7abb19ff7034683fbcd82dc7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cgroup.c
+#	kernel/cgroup/cpuset.c
+diff --cc kernel/cgroup/cgroup.c
+index 944df6f20822,cf32c0c7a45d..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -1864,65 -1883,6 +1864,68 @@@ static int cgroup_remount(struct kernfs
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * To reduce the fork() overhead for systems that are not actually using
+ + * their cgroups capability, we don't maintain the lists running through
+ + * each css_set to its tasks until we see the list actually used - in other
+ + * words after the first mount.
+ + */
+ +static bool use_task_css_set_links __read_mostly;
+ +
+ +static void cgroup_enable_task_cg_lists(void)
+ +{
+ +	struct task_struct *p, *g;
+ +
+ +	/*
+ +	 * We need tasklist_lock because RCU is not safe against
+ +	 * while_each_thread(). Besides, a forking task that has passed
+ +	 * cgroup_post_fork() without seeing use_task_css_set_links = 1
+ +	 * is not guaranteed to have its child immediately visible in the
+ +	 * tasklist if we walk through it with RCU.
+ +	 */
+ +	read_lock(&tasklist_lock);
+ +	spin_lock_irq(&css_set_lock);
+ +
+ +	if (use_task_css_set_links)
+ +		goto out_unlock;
+ +
+ +	use_task_css_set_links = true;
+ +
+ +	do_each_thread(g, p) {
+ +		WARN_ON_ONCE(!list_empty(&p->cg_list) ||
+ +			     task_css_set(p) != &init_css_set);
+ +
+ +		/*
+ +		 * We should check if the process is exiting, otherwise
+ +		 * it will race with cgroup_exit() in that the list
+ +		 * entry won't be deleted though the process has exited.
+ +		 * Do it while holding siglock so that we don't end up
+ +		 * racing against cgroup_exit().
+ +		 *
+ +		 * Interrupts were already disabled while acquiring
+ +		 * the css_set_lock, so we do not need to disable it
+ +		 * again when acquiring the sighand->siglock here.
+ +		 */
+ +		spin_lock(&p->sighand->siglock);
+ +		if (!(p->flags & PF_EXITING)) {
+ +			struct css_set *cset = task_css_set(p);
+ +
+ +			if (!css_set_populated(cset))
+ +				css_set_update_populated(cset, true);
+ +			list_add_tail(&p->cg_list, &cset->tasks);
+ +			get_css_set(cset);
+ +			cset->nr_tasks++;
+ +		}
+ +		spin_unlock(&p->sighand->siglock);
+ +	} while_each_thread(g, p);
+ +out_unlock:
+ +	spin_unlock_irq(&css_set_lock);
+ +	read_unlock(&tasklist_lock);
+ +}
+ +
+++=======
+++>>>>>>> 5153faac18d2 (cgroup: remove cgroup_enable_task_cg_lists() optimization)
+  static void init_cgroup_housekeeping(struct cgroup *cgrp)
+  {
+  	struct cgroup_subsys *ss;
+@@@ -2095,64 -2059,86 +2098,78 @@@ struct dentry *cgroup_do_mount(struct f
+  		mutex_unlock(&cgroup_mutex);
+  
+  		nsdentry = kernfs_node_dentry(cgrp->kn, sb);
+ -		dput(fc->root);
+ -		fc->root = nsdentry;
+ -		if (IS_ERR(nsdentry)) {
+ -			ret = PTR_ERR(nsdentry);
+ +		dput(dentry);
+ +		if (IS_ERR(nsdentry))
+  			deactivate_locked_super(sb);
+ -		}
+ +		dentry = nsdentry;
+  	}
+  
+ -	if (!ctx->kfc.new_sb_created)
+ -		cgroup_put(&ctx->root->cgrp);
+ -
+ -	return ret;
+ -}
+ -
+ -/*
+ - * Destroy a cgroup filesystem context.
+ - */
+ -static void cgroup_fs_context_free(struct fs_context *fc)
+ -{
+ -	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+ +	if (!new_sb)
+ +		cgroup_put(&root->cgrp);
+  
+ -	kfree(ctx->name);
+ -	kfree(ctx->release_agent);
+ -	put_cgroup_ns(ctx->ns);
+ -	kernfs_free_fs_context(fc);
+ -	kfree(ctx);
+ +	return dentry;
+  }
+  
+ -static int cgroup_get_tree(struct fs_context *fc)
+ +static struct dentry *cgroup_mount(struct file_system_type *fs_type,
+ +			 int flags, const char *unused_dev_name,
+ +			 void *data)
+  {
+ -	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+ +	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
+ +	struct dentry *dentry;
+  	int ret;
+  
+ -	cgrp_dfl_visible = true;
+ -	cgroup_get_live(&cgrp_dfl_root.cgrp);
+ -	ctx->root = &cgrp_dfl_root;
+ +	get_cgroup_ns(ns);
+  
+ -	ret = cgroup_do_get_tree(fc);
+ -	if (!ret)
+ -		apply_cgroup_root_flags(ctx->flags);
+ -	return ret;
+ -}
+ +	/* Check if the caller has permission to mount. */
+ +	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN)) {
+ +		put_cgroup_ns(ns);
+ +		return ERR_PTR(-EPERM);
+ +	}
+  
+ -static const struct fs_context_operations cgroup_fs_context_ops = {
+ -	.free		= cgroup_fs_context_free,
+ -	.parse_param	= cgroup2_parse_param,
+ -	.get_tree	= cgroup_get_tree,
+ -	.reconfigure	= cgroup_reconfigure,
+ -};
+++<<<<<<< HEAD
+ +	/*
+ +	 * The first time anyone tries to mount a cgroup, enable the list
+ +	 * linking each css_set to its tasks and fix up all existing tasks.
+ +	 */
+ +	if (!use_task_css_set_links)
+ +		cgroup_enable_task_cg_lists();
+  
+ -static const struct fs_context_operations cgroup1_fs_context_ops = {
+ -	.free		= cgroup_fs_context_free,
+ -	.parse_param	= cgroup1_parse_param,
+ -	.get_tree	= cgroup1_get_tree,
+ -	.reconfigure	= cgroup1_reconfigure,
+ -};
+ +	if (fs_type == &cgroup2_fs_type) {
+ +		unsigned int root_flags;
+  
+ -/*
+ - * Initialise the cgroup filesystem creation/reconfiguration context.  Notably,
+ - * we select the namespace we're going to use.
+ - */
+ -static int cgroup_init_fs_context(struct fs_context *fc)
+ -{
+ -	struct cgroup_fs_context *ctx;
+ +		ret = parse_cgroup_root_flags(data, &root_flags);
+ +		if (ret) {
+ +			put_cgroup_ns(ns);
+ +			return ERR_PTR(ret);
+ +		}
+  
+ -	ctx = kzalloc(sizeof(struct cgroup_fs_context), GFP_KERNEL);
+ -	if (!ctx)
+ -		return -ENOMEM;
+ +		cgrp_dfl_visible = true;
+ +		cgroup_get_live(&cgrp_dfl_root.cgrp);
+  
+ +		dentry = cgroup_do_mount(&cgroup2_fs_type, flags, &cgrp_dfl_root,
+ +					 CGROUP2_SUPER_MAGIC, ns);
+ +		if (!IS_ERR(dentry))
+ +			apply_cgroup_root_flags(root_flags);
+ +	} else {
+ +		dentry = cgroup1_mount(&cgroup_fs_type, flags, data,
+ +				       CGROUP_SUPER_MAGIC, ns);
+ +	}
+ +
+ +	put_cgroup_ns(ns);
+ +	return dentry;
+++=======
++ 	ctx->ns = current->nsproxy->cgroup_ns;
++ 	get_cgroup_ns(ctx->ns);
++ 	fc->fs_private = &ctx->kfc;
++ 	if (fc->fs_type == &cgroup2_fs_type)
++ 		fc->ops = &cgroup_fs_context_ops;
++ 	else
++ 		fc->ops = &cgroup1_fs_context_ops;
++ 	put_user_ns(fc->user_ns);
++ 	fc->user_ns = get_user_ns(ctx->ns->user_ns);
++ 	fc->global = true;
++ 	return 0;
+++>>>>>>> 5153faac18d2 (cgroup: remove cgroup_enable_task_cg_lists() optimization)
+  }
+  
+  static void cgroup_kill_sb(struct super_block *sb)
+diff --cc kernel/cgroup/cpuset.c
+index 634f0fa72b0c,faff8f99e8f2..000000000000
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@@ -920,6 -906,65 +920,68 @@@ done
+  	return ndoms;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void update_tasks_root_domain(struct cpuset *cs)
++ {
++ 	struct css_task_iter it;
++ 	struct task_struct *task;
++ 
++ 	css_task_iter_start(&cs->css, 0, &it);
++ 
++ 	while ((task = css_task_iter_next(&it)))
++ 		dl_add_task_root_domain(task);
++ 
++ 	css_task_iter_end(&it);
++ }
++ 
++ static void rebuild_root_domains(void)
++ {
++ 	struct cpuset *cs = NULL;
++ 	struct cgroup_subsys_state *pos_css;
++ 
++ 	percpu_rwsem_assert_held(&cpuset_rwsem);
++ 	lockdep_assert_cpus_held();
++ 	lockdep_assert_held(&sched_domains_mutex);
++ 
++ 	rcu_read_lock();
++ 
++ 	/*
++ 	 * Clear default root domain DL accounting, it will be computed again
++ 	 * if a task belongs to it.
++ 	 */
++ 	dl_clear_root_domain(&def_root_domain);
++ 
++ 	cpuset_for_each_descendant_pre(cs, pos_css, &top_cpuset) {
++ 
++ 		if (cpumask_empty(cs->effective_cpus)) {
++ 			pos_css = css_rightmost_descendant(pos_css);
++ 			continue;
++ 		}
++ 
++ 		css_get(&cs->css);
++ 
++ 		rcu_read_unlock();
++ 
++ 		update_tasks_root_domain(cs);
++ 
++ 		rcu_read_lock();
++ 		css_put(&cs->css);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
++ static void
++ partition_and_rebuild_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
++ 				    struct sched_domain_attr *dattr_new)
++ {
++ 	mutex_lock(&sched_domains_mutex);
++ 	partition_sched_domains_locked(ndoms_new, doms_new, dattr_new);
++ 	rebuild_root_domains();
++ 	mutex_unlock(&sched_domains_mutex);
++ }
++ 
+++>>>>>>> 5153faac18d2 (cgroup: remove cgroup_enable_task_cg_lists() optimization)
+  /*
+   * Rebuild scheduler domains.
+   *
+* Unmerged path kernel/cgroup/cgroup.c
+* Unmerged path kernel/cgroup/cpuset.c
