@@ -1,0 +1,196 @@
+mm: add kvfree_sensitive() for freeing sensitive data objects
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Waiman Long <longman@redhat.com>
+commit d4eaa2837851db2bfed572898bfc17f9a9f9151e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d4eaa283.failed
+
+For kvmalloc'ed data object that contains sensitive information like
+cryptographic keys, we need to make sure that the buffer is always cleared
+before freeing it.  Using memset() alone for buffer clearing may not
+provide certainty as the compiler may compile it away.  To be sure, the
+special memzero_explicit() has to be used.
+
+This patch introduces a new kvfree_sensitive() for freeing those sensitive
+data objects allocated by kvmalloc().  The relevant places where
+kvfree_sensitive() can be used are modified to use it.
+
+Fixes: 4f0882491a14 ("KEYS: Avoid false positive ENOMEM error on key read")
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Eric Biggers <ebiggers@google.com>
+	Acked-by: David Howells <dhowells@redhat.com>
+	Cc: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+	Cc: James Morris <jmorris@namei.org>
+	Cc: "Serge E. Hallyn" <serge@hallyn.com>
+	Cc: Joe Perches <joe@perches.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Uladzislau Rezki <urezki@gmail.com>
+Link: http://lkml.kernel.org/r/20200407200318.11711-1-longman@redhat.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d4eaa2837851db2bfed572898bfc17f9a9f9151e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+diff --cc include/linux/mm.h
+index 9ce29aaca430,5bfc36320e3c..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -714,6 -746,43 +714,46 @@@ static inline int is_vmalloc_or_module_
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ extern void *kvmalloc_node(size_t size, gfp_t flags, int node);
++ static inline void *kvmalloc(size_t size, gfp_t flags)
++ {
++ 	return kvmalloc_node(size, flags, NUMA_NO_NODE);
++ }
++ static inline void *kvzalloc_node(size_t size, gfp_t flags, int node)
++ {
++ 	return kvmalloc_node(size, flags | __GFP_ZERO, node);
++ }
++ static inline void *kvzalloc(size_t size, gfp_t flags)
++ {
++ 	return kvmalloc(size, flags | __GFP_ZERO);
++ }
++ 
++ static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
++ {
++ 	size_t bytes;
++ 
++ 	if (unlikely(check_mul_overflow(n, size, &bytes)))
++ 		return NULL;
++ 
++ 	return kvmalloc(bytes, flags);
++ }
++ 
++ static inline void *kvcalloc(size_t n, size_t size, gfp_t flags)
++ {
++ 	return kvmalloc_array(n, size, flags | __GFP_ZERO);
++ }
++ 
++ extern void kvfree(const void *addr);
++ extern void kvfree_sensitive(const void *addr, size_t len);
++ 
++ /*
++  * Mapcount of compound page as a whole, does not include mapped sub-pages.
++  *
++  * Must be called only for compound pages or any their tail sub-pages.
++  */
+++>>>>>>> d4eaa2837851 (mm: add kvfree_sensitive() for freeing sensitive data objects)
+  static inline int compound_mapcount(struct page *page)
+  {
+  	VM_BUG_ON_PAGE(!PageCompound(page), page);
+* Unmerged path include/linux/mm.h
+diff --git a/mm/util.c b/mm/util.c
+index 0e6d1e20c23f..663618b09184 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -490,6 +490,24 @@ void kvfree(const void *addr)
+ }
+ EXPORT_SYMBOL(kvfree);
+ 
++/**
++ * kvfree_sensitive - Free a data object containing sensitive information.
++ * @addr: address of the data object to be freed.
++ * @len: length of the data object.
++ *
++ * Use the special memzero_explicit() function to clear the content of a
++ * kvmalloc'ed object containing sensitive data to make sure that the
++ * compiler won't optimize out the data clearing.
++ */
++void kvfree_sensitive(const void *addr, size_t len)
++{
++	if (likely(!ZERO_OR_NULL_PTR(addr))) {
++		memzero_explicit((void *)addr, len);
++		kvfree(addr);
++	}
++}
++EXPORT_SYMBOL(kvfree_sensitive);
++
+ static inline void *__page_rmapping(struct page *page)
+ {
+ 	unsigned long mapping;
+diff --git a/security/keys/internal.h b/security/keys/internal.h
+index b4998862f5ac..8c12f15e61e3 100644
+--- a/security/keys/internal.h
++++ b/security/keys/internal.h
+@@ -315,15 +315,4 @@ static inline void key_check(const struct key *key)
+ #define key_check(key) do {} while(0)
+ 
+ #endif
+-
+-/*
+- * Helper function to clear and free a kvmalloc'ed memory object.
+- */
+-static inline void __kvzfree(const void *addr, size_t len)
+-{
+-	if (addr) {
+-		memset((void *)addr, 0, len);
+-		kvfree(addr);
+-	}
+-}
+ #endif /* _INTERNAL_H */
+diff --git a/security/keys/keyctl.c b/security/keys/keyctl.c
+index a714d1c27e4c..07ee71568220 100644
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@ -133,10 +133,7 @@ SYSCALL_DEFINE5(add_key, const char __user *, _type,
+ 
+ 	key_ref_put(keyring_ref);
+  error3:
+-	if (payload) {
+-		memzero_explicit(payload, plen);
+-		kvfree(payload);
+-	}
++	kvfree_sensitive(payload, plen);
+  error2:
+ 	kfree(description);
+  error:
+@@ -351,7 +348,7 @@ long keyctl_update_key(key_serial_t id,
+ 
+ 	key_ref_put(key_ref);
+ error2:
+-	__kvzfree(payload, plen);
++	kvfree_sensitive(payload, plen);
+ error:
+ 	return ret;
+ }
+@@ -859,7 +856,7 @@ long keyctl_read_key(key_serial_t keyid, char __user *buffer, size_t buflen)
+ 		 */
+ 		if (ret > key_data_len) {
+ 			if (unlikely(key_data))
+-				__kvzfree(key_data, key_data_len);
++				kvfree_sensitive(key_data, key_data_len);
+ 			key_data_len = ret;
+ 			continue;	/* Allocate buffer */
+ 		}
+@@ -868,7 +865,7 @@ long keyctl_read_key(key_serial_t keyid, char __user *buffer, size_t buflen)
+ 			ret = -EFAULT;
+ 		break;
+ 	}
+-	__kvzfree(key_data, key_data_len);
++	kvfree_sensitive(key_data, key_data_len);
+ 
+ key_put_out:
+ 	key_put(key);
+@@ -1170,10 +1167,7 @@ long keyctl_instantiate_key_common(key_serial_t id,
+ 		keyctl_change_reqkey_auth(NULL);
+ 
+ error2:
+-	if (payload) {
+-		memzero_explicit(payload, plen);
+-		kvfree(payload);
+-	}
++	kvfree_sensitive(payload, plen);
+ error:
+ 	return ret;
+ }
