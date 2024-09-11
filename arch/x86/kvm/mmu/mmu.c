@@ -1435,7 +1435,7 @@ static int kvm_set_pte_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
 {
 	u64 *sptep;
 	struct rmap_iterator iter;
-	int need_flush = 0;
+	bool need_flush = false;
 	u64 new_spte;
 	pte_t *ptep = (pte_t *)data;
 	kvm_pfn_t new_pfn;
@@ -1448,7 +1448,7 @@ restart:
 		rmap_printk("spte %p %llx gfn %llx (%d)\n",
 			    sptep, *sptep, gfn, level);
 
-		need_flush = 1;
+		need_flush = true;
 
 		if (pte_write(*ptep)) {
 			pte_list_remove(rmap_head, sptep);
@@ -1464,7 +1464,7 @@ restart:
 
 	if (need_flush && kvm_available_flush_tlb_with_range()) {
 		kvm_flush_remote_tlbs_with_address(kvm, gfn, 1);
-		return 0;
+		return false;
 	}
 
 	return need_flush;
@@ -1638,8 +1638,8 @@ static int kvm_test_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
 
 	for_each_rmap_spte(rmap_head, &iter, sptep)
 		if (is_accessed_spte(*sptep))
-			return 1;
-	return 0;
+			return true;
+	return false;
 }
 
 #define RMAP_RECYCLE_THRESHOLD 1000
