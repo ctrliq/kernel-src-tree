@@ -1,0 +1,96 @@
+nvme: introduce max_integrity_segments ctrl attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 95093350394a394e7c4e778176194b14b76ec5d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/95093350.failed
+
+This patch doesn't change any logic, and is needed as a preparation
+for adding PI support for fabrics drivers that will use an extended
+LBA format for metadata and will support more than 1 integrity segment.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Israel Rukshin <israelr@mellanox.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 95093350394a394e7c4e778176194b14b76ec5d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index ce3f74d6d89f,404edceb84cb..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1932,13 -1881,28 +1934,31 @@@ static void nvme_update_disk_info(struc
+  	blk_queue_io_min(disk->queue, phys_bs);
+  	blk_queue_io_opt(disk->queue, io_opt);
+  
+ -	/*
+ -	 * The block layer can't support LBA sizes larger than the page size
+ -	 * yet, so catch this early and don't allow block I/O.
+ -	 */
+ -	if (ns->lba_shift > PAGE_SHIFT)
+ +	if (ns->ms && !ns->ext &&
+ +	    (ns->ctrl->ops->flags & NVME_F_METADATA_SUPPORTED))
+ +		nvme_init_integrity(disk, ns->ms, ns->pi_type);
+ +	if ((ns->ms && !nvme_ns_has_pi(ns) && !blk_get_integrity(disk)) ||
+ +	    ns->lba_shift > PAGE_SHIFT)
+  		capacity = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Register a metadata profile for PI, or the plain non-integrity NVMe
++ 	 * metadata masquerading as Type 0 if supported, otherwise reject block
++ 	 * I/O to namespaces with metadata except when the namespace supports
++ 	 * PI, as it can strip/insert in that case.
++ 	 */
++ 	if (ns->ms) {
++ 		if (IS_ENABLED(CONFIG_BLK_DEV_INTEGRITY) &&
++ 		    (ns->features & NVME_NS_METADATA_SUPPORTED))
++ 			nvme_init_integrity(disk, ns->ms, ns->pi_type,
++ 					    ns->ctrl->max_integrity_segments);
++ 		else if (!nvme_ns_has_pi(ns))
++ 			capacity = 0;
++ 	}
++ 
+++>>>>>>> 95093350394a (nvme: introduce max_integrity_segments ctrl attribute)
+  	set_capacity_revalidate_and_notify(disk, capacity, false);
+  
+  	nvme_config_discard(disk, ns);
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 74fc5994de0f..ddefe7051973 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -236,6 +236,7 @@ struct nvme_ctrl {
+ 	u32 page_size;
+ 	u32 max_hw_sectors;
+ 	u32 max_segments;
++	u32 max_integrity_segments;
+ 	u16 crdt[3];
+ 	u16 oncs;
+ 	u16 oacs;
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 16c731608646..26179996c9f3 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2536,6 +2536,12 @@ static void nvme_reset_work(struct work_struct *work)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * We do not support an SGL for metadata (yet), so we are limited to a
++	 * single integrity segment for the separate metadata pointer.
++	 */
++	dev->ctrl.max_integrity_segments = 1;
++
+ 	result = nvme_init_identify(&dev->ctrl);
+ 	if (result)
+ 		goto out;
