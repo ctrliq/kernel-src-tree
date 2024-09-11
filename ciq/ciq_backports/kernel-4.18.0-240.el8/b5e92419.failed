@@ -1,0 +1,232 @@
+SUNRPC: Remove the bh-safe lock requirement on xprt->transport_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit b5e924191f87239e555f3ef3b8d8e697bb95e7dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b5e92419.failed
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit b5e924191f87239e555f3ef3b8d8e697bb95e7dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index 6526f98a92bd,8d41fcf25650..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -673,12 -668,11 +673,12 @@@ static void xprt_autoclose(struct work_
+  void xprt_disconnect_done(struct rpc_xprt *xprt)
+  {
+  	dprintk("RPC:       disconnected transport %p\n", xprt);
+- 	spin_lock_bh(&xprt->transport_lock);
++ 	spin_lock(&xprt->transport_lock);
+  	xprt_clear_connected(xprt);
+  	xprt_clear_write_space_locked(xprt);
+ +	xprt_clear_congestion_window_wait_locked(xprt);
+  	xprt_wake_pending_tasks(xprt, -ENOTCONN);
+- 	spin_unlock_bh(&xprt->transport_lock);
++ 	spin_unlock(&xprt->transport_lock);
+  }
+  EXPORT_SYMBOL_GPL(xprt_disconnect_done);
+  
+@@@ -1802,13 -1760,18 +1797,22 @@@ void xprt_release(struct rpc_task *task
+  	}
+  
+  	xprt = req->rq_xprt;
+++<<<<<<< HEAD
+ +	xprt_request_dequeue_xprt(task);
+ +	spin_lock_bh(&xprt->transport_lock);
+++=======
++ 	if (task->tk_ops->rpc_count_stats != NULL)
++ 		task->tk_ops->rpc_count_stats(task, task->tk_calldata);
++ 	else if (task->tk_client)
++ 		rpc_count_iostats(task, task->tk_client->cl_metrics);
++ 	xprt_request_dequeue_all(task, req);
++ 	spin_lock(&xprt->transport_lock);
+++>>>>>>> b5e924191f87 (SUNRPC: Remove the bh-safe lock requirement on xprt->transport_lock)
+  	xprt->ops->release_xprt(xprt, task);
+  	if (xprt->ops->release_request)
+  		xprt->ops->release_request(task);
+ -	xprt->last_used = jiffies;
+  	xprt_schedule_autodisconnect(xprt);
+- 	spin_unlock_bh(&xprt->transport_lock);
++ 	spin_unlock(&xprt->transport_lock);
+  	if (req->rq_buffer)
+  		xprt->ops->buf_free(task);
+  	xprt_inject_disconnect(xprt);
+* Unmerged path net/sunrpc/xprt.c
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index c1efe5fc3ca2..b333afb16862 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -1334,10 +1334,10 @@ void rpcrdma_reply_handler(struct rpcrdma_rep *rep)
+ 	else if (credits > buf->rb_max_requests)
+ 		credits = buf->rb_max_requests;
+ 	if (buf->rb_credits != credits) {
+-		spin_lock_bh(&xprt->transport_lock);
++		spin_lock(&xprt->transport_lock);
+ 		buf->rb_credits = credits;
+ 		xprt->cwnd = credits << RPC_CWNDSHIFT;
+-		spin_unlock_bh(&xprt->transport_lock);
++		spin_unlock(&xprt->transport_lock);
+ 	}
+ 	rpcrdma_post_recvs(r_xprt, false);
+ 
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+index a164965cc4f6..c4fb930779a9 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+@@ -72,9 +72,9 @@ int svc_rdma_handle_bc_reply(struct rpc_xprt *xprt, __be32 *rdma_resp,
+ 	else if (credits > r_xprt->rx_buf.rb_bc_max_requests)
+ 		credits = r_xprt->rx_buf.rb_bc_max_requests;
+ 
+-	spin_lock_bh(&xprt->transport_lock);
++	spin_lock(&xprt->transport_lock);
+ 	xprt->cwnd = credits << RPC_CWNDSHIFT;
+-	spin_unlock_bh(&xprt->transport_lock);
++	spin_unlock(&xprt->transport_lock);
+ 
+ 	spin_lock(&xprt->queue_lock);
+ 	ret = 0;
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_transport.c b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+index 0004535c0188..3fe665152d95 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@ -226,9 +226,9 @@ static void handle_connect_req(struct rdma_cm_id *new_cma_id,
+ 	 * Enqueue the new transport on the accept queue of the listening
+ 	 * transport
+ 	 */
+-	spin_lock_bh(&listen_xprt->sc_lock);
++	spin_lock(&listen_xprt->sc_lock);
+ 	list_add_tail(&newxprt->sc_accept_q, &listen_xprt->sc_accept_q);
+-	spin_unlock_bh(&listen_xprt->sc_lock);
++	spin_unlock(&listen_xprt->sc_lock);
+ 
+ 	set_bit(XPT_CONN, &listen_xprt->sc_xprt.xpt_flags);
+ 	svc_xprt_enqueue(&listen_xprt->sc_xprt);
+@@ -401,7 +401,7 @@ static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt)
+ 	listen_rdma = container_of(xprt, struct svcxprt_rdma, sc_xprt);
+ 	clear_bit(XPT_CONN, &xprt->xpt_flags);
+ 	/* Get the next entry off the accept list */
+-	spin_lock_bh(&listen_rdma->sc_lock);
++	spin_lock(&listen_rdma->sc_lock);
+ 	if (!list_empty(&listen_rdma->sc_accept_q)) {
+ 		newxprt = list_entry(listen_rdma->sc_accept_q.next,
+ 				     struct svcxprt_rdma, sc_accept_q);
+@@ -409,7 +409,7 @@ static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt)
+ 	}
+ 	if (!list_empty(&listen_rdma->sc_accept_q))
+ 		set_bit(XPT_CONN, &listen_rdma->sc_xprt.xpt_flags);
+-	spin_unlock_bh(&listen_rdma->sc_lock);
++	spin_unlock(&listen_rdma->sc_lock);
+ 	if (!newxprt)
+ 		return NULL;
+ 
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index ce0f3bc11b12..8a0cef593363 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -886,7 +886,7 @@ static int xs_nospace(struct rpc_rqst *req)
+ 			req->rq_slen);
+ 
+ 	/* Protect against races with write_space */
+-	spin_lock_bh(&xprt->transport_lock);
++	spin_lock(&xprt->transport_lock);
+ 
+ 	/* Don't race with disconnect */
+ 	if (xprt_connected(xprt)) {
+@@ -896,7 +896,7 @@ static int xs_nospace(struct rpc_rqst *req)
+ 	} else
+ 		ret = -ENOTCONN;
+ 
+-	spin_unlock_bh(&xprt->transport_lock);
++	spin_unlock(&xprt->transport_lock);
+ 
+ 	/* Race breaker in case memory is freed before above code is called */
+ 	if (ret == -EAGAIN) {
+@@ -1351,6 +1351,7 @@ static void xs_destroy(struct rpc_xprt *xprt)
+ 	cancel_delayed_work_sync(&transport->connect_worker);
+ 	xs_close(xprt);
+ 	cancel_work_sync(&transport->recv_worker);
++	cancel_work_sync(&transport->error_worker);
+ 	xs_xprt_free(xprt);
+ 	module_put(THIS_MODULE);
+ }
+@@ -1404,9 +1405,9 @@ static void xs_udp_data_read_skb(struct rpc_xprt *xprt,
+ 	}
+ 
+ 
+-	spin_lock_bh(&xprt->transport_lock);
++	spin_lock(&xprt->transport_lock);
+ 	xprt_adjust_cwnd(xprt, task, copied);
+-	spin_unlock_bh(&xprt->transport_lock);
++	spin_unlock(&xprt->transport_lock);
+ 	spin_lock(&xprt->queue_lock);
+ 	xprt_complete_rqst(task, copied);
+ 	__UDPX_INC_STATS(sk, UDP_MIB_INDATAGRAMS);
+@@ -1516,7 +1517,6 @@ static void xs_tcp_state_change(struct sock *sk)
+ 	trace_rpc_socket_state_change(xprt, sk->sk_socket);
+ 	switch (sk->sk_state) {
+ 	case TCP_ESTABLISHED:
+-		spin_lock(&xprt->transport_lock);
+ 		if (!xprt_test_and_set_connected(xprt)) {
+ 			xprt->connect_cookie++;
+ 			clear_bit(XPRT_SOCK_CONNECTING, &transport->sock_state);
+@@ -1527,7 +1527,6 @@ static void xs_tcp_state_change(struct sock *sk)
+ 						   xprt->stat.connect_start;
+ 			xs_run_error_worker(transport, XPRT_SOCK_WAKE_PENDING);
+ 		}
+-		spin_unlock(&xprt->transport_lock);
+ 		break;
+ 	case TCP_FIN_WAIT1:
+ 		/* The client initiated a shutdown of the socket */
+@@ -1684,9 +1683,9 @@ static void xs_udp_set_buffer_size(struct rpc_xprt *xprt, size_t sndsize, size_t
+  */
+ static void xs_udp_timer(struct rpc_xprt *xprt, struct rpc_task *task)
+ {
+-	spin_lock_bh(&xprt->transport_lock);
++	spin_lock(&xprt->transport_lock);
+ 	xprt_adjust_cwnd(xprt, task, -ETIMEDOUT);
+-	spin_unlock_bh(&xprt->transport_lock);
++	spin_unlock(&xprt->transport_lock);
+ }
+ 
+ static int xs_get_random_port(void)
+@@ -2221,13 +2220,13 @@ static void xs_tcp_set_socket_timeouts(struct rpc_xprt *xprt,
+ 	unsigned int opt_on = 1;
+ 	unsigned int timeo;
+ 
+-	spin_lock_bh(&xprt->transport_lock);
++	spin_lock(&xprt->transport_lock);
+ 	keepidle = DIV_ROUND_UP(xprt->timeout->to_initval, HZ);
+ 	keepcnt = xprt->timeout->to_retries + 1;
+ 	timeo = jiffies_to_msecs(xprt->timeout->to_initval) *
+ 		(xprt->timeout->to_retries + 1);
+ 	clear_bit(XPRT_SOCK_UPD_TIMEOUT, &transport->sock_state);
+-	spin_unlock_bh(&xprt->transport_lock);
++	spin_unlock(&xprt->transport_lock);
+ 
+ 	/* TCP Keepalive options */
+ 	kernel_setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
+@@ -2252,7 +2251,7 @@ static void xs_tcp_set_connect_timeout(struct rpc_xprt *xprt,
+ 	struct rpc_timeout to;
+ 	unsigned long initval;
+ 
+-	spin_lock_bh(&xprt->transport_lock);
++	spin_lock(&xprt->transport_lock);
+ 	if (reconnect_timeout < xprt->max_reconnect_timeout)
+ 		xprt->max_reconnect_timeout = reconnect_timeout;
+ 	if (connect_timeout < xprt->connect_timeout) {
+@@ -2269,7 +2268,7 @@ static void xs_tcp_set_connect_timeout(struct rpc_xprt *xprt,
+ 		xprt->connect_timeout = connect_timeout;
+ 	}
+ 	set_bit(XPRT_SOCK_UPD_TIMEOUT, &transport->sock_state);
+-	spin_unlock_bh(&xprt->transport_lock);
++	spin_unlock(&xprt->transport_lock);
+ }
+ 
+ static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
