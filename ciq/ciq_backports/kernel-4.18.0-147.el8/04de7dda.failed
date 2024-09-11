@@ -1,0 +1,719 @@
+net/mlx5e: Infrastructure for duplicated offloading of TC flows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Roi Dayan <roid@mellanox.com>
+commit 04de7dda7394fa9c2b0fc9cec65661d9b4f0d04d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/04de7dda.failed
+
+Under uplink LAG or multipath schemes, traffic that matches one flow
+might arrive on both uplink ports and transmitted through both
+as part of supporting aggregation and high-availability.
+
+To cope with the fact that the SW model might use logical SW port
+(e.g uplink team or bond) but we have two HW ports with e-switch on
+each, there are cases where in order to offload a SW TC rule we
+need to duplicate it to two HW flows.
+
+Since each HW rule has its own counter we also aggregate the counter
+of both rules when a flow stats query is executed from user-space.
+
+Introduce the changes for the different elements (add/delete/stats),
+currently nothing is duplicated.
+
+	Signed-off-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Aviv Heller <avivh@mellanox.com>
+	Signed-off-by: Shahar Klein <shahark@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 04de7dda7394fa9c2b0fc9cec65661d9b4f0d04d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c9ee89f4edb1,eacccac05dda..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -50,9 -49,10 +50,14 @@@
+  #include "en_rep.h"
+  #include "en_tc.h"
+  #include "eswitch.h"
+ +#include "lib/vxlan.h"
+  #include "fs_core.h"
+  #include "en/port.h"
+++<<<<<<< HEAD
+++=======
++ #include "en/tc_tun.h"
++ #include "lib/devcom.h"
+++>>>>>>> 04de7dda7394 (net/mlx5e: Infrastructure for duplicated offloading of TC flows)
+  
+  struct mlx5_nic_flow_attr {
+  	u32 action;
+@@@ -74,6 -74,8 +79,11 @@@ enum 
+  	MLX5E_TC_FLOW_OFFLOADED	= BIT(MLX5E_TC_FLOW_BASE + 2),
+  	MLX5E_TC_FLOW_HAIRPIN	= BIT(MLX5E_TC_FLOW_BASE + 3),
+  	MLX5E_TC_FLOW_HAIRPIN_RSS = BIT(MLX5E_TC_FLOW_BASE + 4),
+++<<<<<<< HEAD
+++=======
++ 	MLX5E_TC_FLOW_SLOW	  = BIT(MLX5E_TC_FLOW_BASE + 5),
++ 	MLX5E_TC_FLOW_DUP         = BIT(MLX5E_TC_FLOW_BASE + 6),
+++>>>>>>> 04de7dda7394 (net/mlx5e: Infrastructure for duplicated offloading of TC flows)
+  };
+  
+  #define MLX5E_TC_MAX_SPLITS 1
+@@@ -82,11 -106,17 +92,21 @@@ struct mlx5e_tc_flow 
+  	struct rhash_head	node;
+  	struct mlx5e_priv	*priv;
+  	u64			cookie;
+ -	u16			flags;
+ +	u8			flags;
+  	struct mlx5_flow_handle *rule[MLX5E_TC_MAX_SPLITS + 1];
+++<<<<<<< HEAD
+ +	struct list_head	encap;   /* flows sharing the same encap ID */
+++=======
++ 	/* Flow can be associated with multiple encap IDs.
++ 	 * The number of encaps is bounded by the number of supported
++ 	 * destinations.
++ 	 */
++ 	struct encap_flow_item encaps[MLX5_MAX_FLOW_FWD_VPORTS];
++ 	struct mlx5e_tc_flow    *peer_flow;
+++>>>>>>> 04de7dda7394 (net/mlx5e: Infrastructure for duplicated offloading of TC flows)
+  	struct list_head	mod_hdr; /* flows sharing the same mod hdr ID */
+  	struct list_head	hairpin; /* flows sharing the same hairpin */
++ 	struct list_head	peer;    /* flows with peer flow */
+  	union {
+  		struct mlx5_esw_flow_attr esw_attr[0];
+  		struct mlx5_nic_flow_attr nic_attr[0];
+@@@ -1089,42 -1289,14 +1142,44 @@@ static void mlx5e_tc_del_fdb_peer_flow(
+  static void mlx5e_tc_del_flow(struct mlx5e_priv *priv,
+  			      struct mlx5e_tc_flow *flow)
+  {
+- 	if (flow->flags & MLX5E_TC_FLOW_ESWITCH)
++ 	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
++ 		mlx5e_tc_del_fdb_peer_flow(flow);
+  		mlx5e_tc_del_fdb_flow(priv, flow);
+- 	else
++ 	} else {
+  		mlx5e_tc_del_nic_flow(priv, flow);
++ 	}
+  }
+  
+ +static void parse_vxlan_attr(struct mlx5_flow_spec *spec,
+ +			     struct tc_cls_flower_offload *f)
+ +{
+ +	void *headers_c = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+ +				       outer_headers);
+ +	void *headers_v = MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ +				       outer_headers);
+ +	void *misc_c = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+ +				    misc_parameters);
+ +	void *misc_v = MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ +				    misc_parameters);
+ +
+ +	MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, ip_protocol);
+ +	MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_protocol, IPPROTO_UDP);
+ +
+ +	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ENC_KEYID)) {
+ +		struct flow_dissector_key_keyid *key =
+ +			skb_flow_dissector_target(f->dissector,
+ +						  FLOW_DISSECTOR_KEY_ENC_KEYID,
+ +						  f->key);
+ +		struct flow_dissector_key_keyid *mask =
+ +			skb_flow_dissector_target(f->dissector,
+ +						  FLOW_DISSECTOR_KEY_ENC_KEYID,
+ +						  f->mask);
+ +		MLX5_SET(fte_match_set_misc, misc_c, vxlan_vni,
+ +			 be32_to_cpu(mask->keyid));
+ +		MLX5_SET(fte_match_set_misc, misc_v, vxlan_vni,
+ +			 be32_to_cpu(key->keyid));
+ +	}
+ +}
+  
+  static int parse_tunnel_attr(struct mlx5e_priv *priv,
+  			     struct mlx5_flow_spec *spec,
+@@@ -2766,31 -2699,20 +2821,44 @@@ static struct rhashtable *get_tc_ht(str
+  		return &priv->fs.tc.ht;
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5e_configure_flower(struct mlx5e_priv *priv,
+ +			   struct tc_cls_flower_offload *f, int flags)
+++=======
++ static bool is_peer_flow_needed(struct mlx5e_tc_flow *flow)
++ {
++ 	return false;
++ }
++ 
++ static int
++ mlx5e_alloc_flow(struct mlx5e_priv *priv, int attr_size,
++ 		 struct tc_cls_flower_offload *f, u16 flow_flags,
++ 		 struct mlx5e_tc_flow_parse_attr **__parse_attr,
++ 		 struct mlx5e_tc_flow **__flow)
+++>>>>>>> 04de7dda7394 (net/mlx5e: Infrastructure for duplicated offloading of TC flows)
+  {
+ +	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+  	struct mlx5e_tc_flow_parse_attr *parse_attr;
+ +	struct rhashtable *tc_ht = get_tc_ht(priv);
+  	struct mlx5e_tc_flow *flow;
+ -	int err;
+ +	int attr_size, err = 0;
+ +	u8 flow_flags = 0;
+ +
+ +	get_flags(flags, &flow_flags);
+ +
+ +	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
+ +	if (flow) {
+ +		netdev_warn_once(priv->netdev, "flow cookie %lx already exists, ignoring\n", f->cookie);
+ +		return 0;
+ +	}
+ +
+ +	if (esw && esw->mode == SRIOV_OFFLOADS) {
+ +		flow_flags |= MLX5E_TC_FLOW_ESWITCH;
+ +		attr_size  = sizeof(struct mlx5_esw_flow_attr);
+ +	} else {
+ +		flow_flags |= MLX5E_TC_FLOW_NIC;
+ +		attr_size  = sizeof(struct mlx5_nic_flow_attr);
+ +	}
+  
+  	flow = kzalloc(sizeof(*flow) + attr_size, GFP_KERNEL);
+  	parse_attr = kvzalloc(sizeof(*parse_attr), GFP_KERNEL);
+@@@ -2803,47 -2725,256 +2871,284 @@@
+  	flow->flags = flow_flags;
+  	flow->priv = priv;
+  
+++<<<<<<< HEAD
+ +	err = parse_cls_flower(priv, flow, &parse_attr->spec, f);
+ +	if (err < 0)
+ +		goto err_free;
+ +
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
+ +		err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow);
+ +		if (err < 0)
+ +			goto err_free;
+ +		flow->rule[0] = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow);
+ +	} else {
+ +		err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow);
+ +		if (err < 0)
+ +			goto err_free;
+ +		flow->rule[0] = mlx5e_tc_add_nic_flow(priv, parse_attr, flow);
+++=======
++ 	*__flow = flow;
++ 	*__parse_attr = parse_attr;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ 	return err;
++ }
++ 
++ static int
++ __mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
++ 		     struct tc_cls_flower_offload *f,
++ 		     u16 flow_flags,
++ 		     struct net_device *filter_dev,
++ 		     struct mlx5_eswitch_rep *in_rep,
++ 		     struct mlx5_core_dev *in_mdev,
++ 		     struct mlx5e_tc_flow **__flow)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	struct mlx5e_tc_flow *flow;
++ 	int attr_size, err;
++ 
++ 	flow_flags |= MLX5E_TC_FLOW_ESWITCH;
++ 	attr_size  = sizeof(struct mlx5_esw_flow_attr);
++ 	err = mlx5e_alloc_flow(priv, attr_size, f, flow_flags,
++ 			       &parse_attr, &flow);
++ 	if (err)
++ 		goto out;
++ 	parse_attr->filter_dev = filter_dev;
++ 	flow->esw_attr->parse_attr = parse_attr;
++ 	err = parse_cls_flower(flow->priv, flow, &parse_attr->spec,
++ 			       f, filter_dev);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	flow->esw_attr->chain = f->common.chain_index;
++ 	flow->esw_attr->prio = TC_H_MAJ(f->common.prio) >> 16;
++ 	err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	flow->esw_attr->in_rep = in_rep;
++ 	flow->esw_attr->in_mdev = in_mdev;
++ 	err = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int mlx5e_tc_add_fdb_peer_flow(struct tc_cls_flower_offload *f,
++ 				      struct mlx5e_tc_flow *flow)
++ {
++ 	struct mlx5e_priv *priv = flow->priv, *peer_priv;
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch, *peer_esw;
++ 	struct mlx5_devcom *devcom = priv->mdev->priv.devcom;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	struct mlx5e_rep_priv *peer_urpriv;
++ 	struct mlx5e_tc_flow *peer_flow;
++ 	struct mlx5_core_dev *in_mdev;
++ 	int err = 0;
++ 
++ 	peer_esw = mlx5_devcom_get_peer_data(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
++ 	if (!peer_esw)
++ 		return -ENODEV;
++ 
++ 	peer_urpriv = mlx5_eswitch_get_uplink_priv(peer_esw, REP_ETH);
++ 	peer_priv = netdev_priv(peer_urpriv->netdev);
++ 
++ 	/* in_mdev is assigned of which the packet originated from.
++ 	 * So packets redirected to uplink use the same mdev of the
++ 	 * original flow and packets redirected from uplink use the
++ 	 * peer mdev.
++ 	 */
++ 	if (flow->esw_attr->in_rep->vport == FDB_UPLINK_VPORT)
++ 		in_mdev = peer_priv->mdev;
++ 	else
++ 		in_mdev = priv->mdev;
++ 
++ 	parse_attr = flow->esw_attr->parse_attr;
++ 	err = __mlx5e_add_fdb_flow(peer_priv, f, flow->flags,
++ 				   parse_attr->filter_dev,
++ 				   flow->esw_attr->in_rep, in_mdev, &peer_flow);
++ 	if (err)
++ 		goto out;
++ 
++ 	flow->peer_flow = peer_flow;
++ 	flow->flags |= MLX5E_TC_FLOW_DUP;
++ 	mutex_lock(&esw->offloads.peer_mutex);
++ 	list_add_tail(&flow->peer, &esw->offloads.peer_flows);
++ 	mutex_unlock(&esw->offloads.peer_mutex);
++ 
++ out:
++ 	mlx5_devcom_release_peer_data(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
++ 		   struct tc_cls_flower_offload *f,
++ 		   u16 flow_flags,
++ 		   struct net_device *filter_dev,
++ 		   struct mlx5e_tc_flow **__flow)
++ {
++ 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
++ 	struct mlx5_eswitch_rep *in_rep = rpriv->rep;
++ 	struct mlx5_core_dev *in_mdev = priv->mdev;
++ 	struct mlx5e_tc_flow *flow;
++ 	int err;
++ 
++ 	err = __mlx5e_add_fdb_flow(priv, f, flow_flags, filter_dev, in_rep,
++ 				   in_mdev, &flow);
++ 	if (err)
++ 		goto out;
++ 
++ 	if (is_peer_flow_needed(flow)) {
++ 		err = mlx5e_tc_add_fdb_peer_flow(f, flow);
++ 		if (err) {
++ 			mlx5e_tc_del_fdb_flow(priv, flow);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_add_nic_flow(struct mlx5e_priv *priv,
++ 		   struct tc_cls_flower_offload *f,
++ 		   u16 flow_flags,
++ 		   struct net_device *filter_dev,
++ 		   struct mlx5e_tc_flow **__flow)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	struct mlx5e_tc_flow *flow;
++ 	int attr_size, err;
++ 
++ 	/* multi-chain not supported for NIC rules */
++ 	if (!tc_cls_can_offload_and_chain0(priv->netdev, &f->common))
++ 		return -EOPNOTSUPP;
++ 
++ 	flow_flags |= MLX5E_TC_FLOW_NIC;
++ 	attr_size  = sizeof(struct mlx5_nic_flow_attr);
++ 	err = mlx5e_alloc_flow(priv, attr_size, f, flow_flags,
++ 			       &parse_attr, &flow);
++ 	if (err)
++ 		goto out;
++ 
++ 	parse_attr->filter_dev = filter_dev;
++ 	err = parse_cls_flower(flow->priv, flow, &parse_attr->spec,
++ 			       f, filter_dev);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = mlx5e_tc_add_nic_flow(priv, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	kvfree(parse_attr);
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_tc_add_flow(struct mlx5e_priv *priv,
++ 		  struct tc_cls_flower_offload *f,
++ 		  int flags,
++ 		  struct net_device *filter_dev,
++ 		  struct mlx5e_tc_flow **flow)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	u16 flow_flags;
++ 	int err;
++ 
++ 	get_flags(flags, &flow_flags);
++ 
++ 	if (!tc_can_offload_extack(priv->netdev, f->common.extack))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (esw && esw->mode == SRIOV_OFFLOADS)
++ 		err = mlx5e_add_fdb_flow(priv, f, flow_flags,
++ 					 filter_dev, flow);
++ 	else
++ 		err = mlx5e_add_nic_flow(priv, f, flow_flags,
++ 					 filter_dev, flow);
++ 
++ 	return err;
++ }
++ 
++ int mlx5e_configure_flower(struct net_device *dev, struct mlx5e_priv *priv,
++ 			   struct tc_cls_flower_offload *f, int flags)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct rhashtable *tc_ht = get_tc_ht(priv);
++ 	struct mlx5e_tc_flow *flow;
++ 	int err = 0;
++ 
++ 	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
++ 	if (flow) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "flow cookie already exists, ignoring");
++ 		netdev_warn_once(priv->netdev,
++ 				 "flow cookie %lx already exists, ignoring\n",
++ 				 f->cookie);
++ 		goto out;
+++>>>>>>> 04de7dda7394 (net/mlx5e: Infrastructure for duplicated offloading of TC flows)
+  	}
+  
+ -	err = mlx5e_tc_add_flow(priv, f, flags, dev, &flow);
+ -	if (err)
+ -		goto out;
+ +	if (IS_ERR(flow->rule[0])) {
+ +		err = PTR_ERR(flow->rule[0]);
+ +		if (err != -EAGAIN)
+ +			goto err_free;
+ +	}
+ +
+ +	if (err != -EAGAIN)
+ +		flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
+ +
+ +	if (!(flow->flags & MLX5E_TC_FLOW_ESWITCH) ||
+ +	    !(flow->esw_attr->action &
+ +	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
+ +		kvfree(parse_attr);
+  
+  	err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
+ -	if (err)
+ -		goto err_free;
+ +	if (err) {
+ +		mlx5e_tc_del_flow(priv, flow);
+ +		kfree(flow);
+ +	}
+  
+ -	return 0;
+ +	return err;
+  
+  err_free:
+ -	mlx5e_tc_del_flow(priv, flow);
+ +	kvfree(parse_attr);
+  	kfree(flow);
+ -out:
+  	return err;
+  }
+  
+@@@ -2877,10 -3008,12 +3182,12 @@@ int mlx5e_delete_flower(struct mlx5e_pr
+  	return 0;
+  }
+  
+ -int mlx5e_stats_flower(struct net_device *dev, struct mlx5e_priv *priv,
+ +int mlx5e_stats_flower(struct mlx5e_priv *priv,
+  		       struct tc_cls_flower_offload *f, int flags)
+  {
++ 	struct mlx5_devcom *devcom = priv->mdev->priv.devcom;
+  	struct rhashtable *tc_ht = get_tc_ht(priv);
++ 	struct mlx5_eswitch *peer_esw;
+  	struct mlx5e_tc_flow *flow;
+  	struct mlx5_fc *counter;
+  	u64 bytes;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 828174ece8e4,76cb57202474..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -528,6 -542,98 +528,101 @@@ void mlx5_eswitch_del_send_to_vport_rul
+  	mlx5_del_flow_rules(rule);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void peer_miss_rules_setup(struct mlx5_core_dev *peer_dev,
++ 				  struct mlx5_flow_spec *spec,
++ 				  struct mlx5_flow_destination *dest)
++ {
++ 	void *misc = MLX5_ADDR_OF(fte_match_param, spec->match_value,
++ 				  misc_parameters);
++ 
++ 	MLX5_SET(fte_match_set_misc, misc, source_eswitch_owner_vhca_id,
++ 		 MLX5_CAP_GEN(peer_dev, vhca_id));
++ 
++ 	spec->match_criteria_enable = MLX5_MATCH_MISC_PARAMETERS;
++ 
++ 	misc = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
++ 			    misc_parameters);
++ 	MLX5_SET_TO_ONES(fte_match_set_misc, misc, source_port);
++ 	MLX5_SET_TO_ONES(fte_match_set_misc, misc,
++ 			 source_eswitch_owner_vhca_id);
++ 
++ 	dest->type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
++ 	dest->vport.num = 0;
++ 	dest->vport.vhca_id = MLX5_CAP_GEN(peer_dev, vhca_id);
++ 	dest->vport.flags |= MLX5_FLOW_DEST_VPORT_VHCA_ID;
++ }
++ 
++ static int esw_add_fdb_peer_miss_rules(struct mlx5_eswitch *esw,
++ 				       struct mlx5_core_dev *peer_dev)
++ {
++ 	struct mlx5_flow_destination dest = {};
++ 	struct mlx5_flow_act flow_act = {0};
++ 	struct mlx5_flow_handle **flows;
++ 	struct mlx5_flow_handle *flow;
++ 	struct mlx5_flow_spec *spec;
++ 	/* total vports is the same for both e-switches */
++ 	int nvports = esw->total_vports;
++ 	void *misc;
++ 	int err, i;
++ 
++ 	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++ 	if (!spec)
++ 		return -ENOMEM;
++ 
++ 	peer_miss_rules_setup(peer_dev, spec, &dest);
++ 
++ 	flows = kvzalloc(nvports * sizeof(*flows), GFP_KERNEL);
++ 	if (!flows) {
++ 		err = -ENOMEM;
++ 		goto alloc_flows_err;
++ 	}
++ 
++ 	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 	misc = MLX5_ADDR_OF(fte_match_param, spec->match_value,
++ 			    misc_parameters);
++ 
++ 	for (i = 1; i < nvports; i++) {
++ 		MLX5_SET(fte_match_set_misc, misc, source_port, i);
++ 		flow = mlx5_add_flow_rules(esw->fdb_table.offloads.slow_fdb,
++ 					   spec, &flow_act, &dest, 1);
++ 		if (IS_ERR(flow)) {
++ 			err = PTR_ERR(flow);
++ 			esw_warn(esw->dev, "FDB: Failed to add peer miss flow rule err %d\n", err);
++ 			goto add_flow_err;
++ 		}
++ 		flows[i] = flow;
++ 	}
++ 
++ 	esw->fdb_table.offloads.peer_miss_rules = flows;
++ 
++ 	kvfree(spec);
++ 	return 0;
++ 
++ add_flow_err:
++ 	for (i--; i > 0; i--)
++ 		mlx5_del_flow_rules(flows[i]);
++ 	kvfree(flows);
++ alloc_flows_err:
++ 	kvfree(spec);
++ 	return err;
++ }
++ 
++ static void esw_del_fdb_peer_miss_rules(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_flow_handle **flows;
++ 	int i;
++ 
++ 	flows = esw->fdb_table.offloads.peer_miss_rules;
++ 
++ 	for (i = 1; i < esw->total_vports; i++)
++ 		mlx5_del_flow_rules(flows[i]);
++ 
++ 	kvfree(flows);
++ }
++ 
+++>>>>>>> 04de7dda7394 (net/mlx5e: Infrastructure for duplicated offloading of TC flows)
+  static int esw_add_fdb_miss_rule(struct mlx5_eswitch *esw)
+  {
+  	struct mlx5_flow_act flow_act = {0};
+@@@ -1160,6 -1298,105 +1255,108 @@@ err_reps
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define ESW_OFFLOADS_DEVCOM_PAIR	(0)
++ #define ESW_OFFLOADS_DEVCOM_UNPAIR	(1)
++ 
++ static int mlx5_esw_offloads_pair(struct mlx5_eswitch *esw,
++ 				  struct mlx5_eswitch *peer_esw)
++ {
++ 	int err;
++ 
++ 	err = esw_add_fdb_peer_miss_rules(esw, peer_esw->dev);
++ 	if (err)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ void mlx5e_tc_clean_fdb_peer_flows(struct mlx5_eswitch *esw);
++ 
++ static void mlx5_esw_offloads_unpair(struct mlx5_eswitch *esw)
++ {
++ 	mlx5e_tc_clean_fdb_peer_flows(esw);
++ 	esw_del_fdb_peer_miss_rules(esw);
++ }
++ 
++ static int mlx5_esw_offloads_devcom_event(int event,
++ 					  void *my_data,
++ 					  void *event_data)
++ {
++ 	struct mlx5_eswitch *esw = my_data;
++ 	struct mlx5_eswitch *peer_esw = event_data;
++ 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
++ 	int err;
++ 
++ 	switch (event) {
++ 	case ESW_OFFLOADS_DEVCOM_PAIR:
++ 		err = mlx5_esw_offloads_pair(esw, peer_esw);
++ 		if (err)
++ 			goto err_out;
++ 
++ 		err = mlx5_esw_offloads_pair(peer_esw, esw);
++ 		if (err)
++ 			goto err_pair;
++ 
++ 		mlx5_devcom_set_paired(devcom, MLX5_DEVCOM_ESW_OFFLOADS, true);
++ 		break;
++ 
++ 	case ESW_OFFLOADS_DEVCOM_UNPAIR:
++ 		if (!mlx5_devcom_is_paired(devcom, MLX5_DEVCOM_ESW_OFFLOADS))
++ 			break;
++ 
++ 		mlx5_devcom_set_paired(devcom, MLX5_DEVCOM_ESW_OFFLOADS, false);
++ 		mlx5_esw_offloads_unpair(peer_esw);
++ 		mlx5_esw_offloads_unpair(esw);
++ 		break;
++ 	}
++ 
++ 	return 0;
++ 
++ err_pair:
++ 	mlx5_esw_offloads_unpair(esw);
++ 
++ err_out:
++ 	mlx5_core_err(esw->dev, "esw offloads devcom event failure, event %u err %d",
++ 		      event, err);
++ 	return err;
++ }
++ 
++ static void esw_offloads_devcom_init(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
++ 
++ 	INIT_LIST_HEAD(&esw->offloads.peer_flows);
++ 	mutex_init(&esw->offloads.peer_mutex);
++ 
++ 	if (!MLX5_CAP_ESW(esw->dev, merged_eswitch))
++ 		return;
++ 
++ 	mlx5_devcom_register_component(devcom,
++ 				       MLX5_DEVCOM_ESW_OFFLOADS,
++ 				       mlx5_esw_offloads_devcom_event,
++ 				       esw);
++ 
++ 	mlx5_devcom_send_event(devcom,
++ 			       MLX5_DEVCOM_ESW_OFFLOADS,
++ 			       ESW_OFFLOADS_DEVCOM_PAIR, esw);
++ }
++ 
++ static void esw_offloads_devcom_cleanup(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
++ 
++ 	if (!MLX5_CAP_ESW(esw->dev, merged_eswitch))
++ 		return;
++ 
++ 	mlx5_devcom_send_event(devcom, MLX5_DEVCOM_ESW_OFFLOADS,
++ 			       ESW_OFFLOADS_DEVCOM_UNPAIR, esw);
++ 
++ 	mlx5_devcom_unregister_component(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
++ }
++ 
+++>>>>>>> 04de7dda7394 (net/mlx5e: Infrastructure for duplicated offloading of TC flows)
+  int esw_offloads_init(struct mlx5_eswitch *esw, int nvports)
+  {
+  	int err;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index de691a49ed92..ca953750da0c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -164,6 +164,8 @@ struct mlx5_esw_offload {
+ 	struct mlx5_flow_table *ft_offloads;
+ 	struct mlx5_flow_group *vport_rx_group;
+ 	struct mlx5_eswitch_rep *vport_reps;
++	struct list_head peer_flows;
++	struct mutex peer_mutex;
+ 	DECLARE_HASHTABLE(encap_tbl, 8);
+ 	DECLARE_HASHTABLE(mod_hdr_tbl, 8);
+ 	u8 inline_mode;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
