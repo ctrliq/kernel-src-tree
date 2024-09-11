@@ -1,0 +1,536 @@
+kcsan: Introduce KCSAN_ACCESS_ASSERT access type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Marco Elver <elver@google.com>
+commit d591ec3db75f9eadfa7976ff8796c674c0027715
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/d591ec3d.failed
+
+The KCSAN_ACCESS_ASSERT access type may be used to introduce dummy reads
+and writes to assert certain properties of concurrent code, where bugs
+could not be detected as normal data races.
+
+For example, a variable that is only meant to be written by a single
+CPU, but may be read (without locking) by other CPUs must still be
+marked properly to avoid data races. However, concurrent writes,
+regardless if WRITE_ONCE() or not, would be a bug. Using
+kcsan_check_access(&x, sizeof(x), KCSAN_ACCESS_ASSERT) would allow
+catching such bugs.
+
+To support KCSAN_ACCESS_ASSERT the following notable changes were made:
+
+  * If an access is of type KCSAN_ASSERT_ACCESS, disable various filters
+    that only apply to data races, so that all races that KCSAN observes are
+    reported.
+  * Bug reports that involve an ASSERT access type will be reported as
+    "KCSAN: assert: race in ..." instead of "data-race"; this will help
+    more easily distinguish them.
+  * Update a few comments to just mention 'races' where we do not always
+    mean pure data races.
+
+	Signed-off-by: Marco Elver <elver@google.com>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d591ec3db75f9eadfa7976ff8796c674c0027715)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kcsan-checks.h
+#	kernel/kcsan/core.c
+#	kernel/kcsan/debugfs.c
+#	kernel/kcsan/report.c
+#	lib/Kconfig.kcsan
+diff --cc include/linux/kcsan-checks.h
+index e78220661086,5dcadc221026..000000000000
+--- a/include/linux/kcsan-checks.h
++++ b/include/linux/kcsan-checks.h
+@@@ -6,19 -6,25 +6,29 @@@
+  #include <linux/types.h>
+  
+  /*
+-  * Access type modifiers.
++  * ACCESS TYPE MODIFIERS
++  *
++  *   <none>: normal read access;
++  *   WRITE : write access;
++  *   ATOMIC: access is atomic;
++  *   ASSERT: access is not a regular access, but an assertion;
+   */
+ -#define KCSAN_ACCESS_WRITE  0x1
+ +#define KCSAN_ACCESS_WRITE 0x1
+  #define KCSAN_ACCESS_ATOMIC 0x2
++ #define KCSAN_ACCESS_ASSERT 0x4
+  
+  /*
+ - * __kcsan_*: Always calls into the runtime when KCSAN is enabled. This may be used
+ + * __kcsan_*: Always calls into runtime when KCSAN is enabled. This may be used
+   * even in compilation units that selectively disable KCSAN, but must use KCSAN
+ - * to validate access to an address. Never use these in header files!
+ + * to validate access to an address.   Never use these in header files!
+   */
+  #ifdef CONFIG_KCSAN
+  /**
+++<<<<<<< HEAD
+ + * __kcsan_check_access - check generic access for data race
+++=======
++  * __kcsan_check_access - check generic access for races
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+   *
+   * @ptr address of access
+   * @size size of access
+diff --cc kernel/kcsan/core.c
+index c40f2454f5a3,87ef01e40199..000000000000
+--- a/kernel/kcsan/core.c
++++ b/kernel/kcsan/core.c
+@@@ -54,8 -55,8 +54,13 @@@ static DEFINE_PER_CPU(struct kcsan_ctx
+  #define SLOT_IDX(slot, i) (slot + ((i + KCSAN_CHECK_ADJACENT) % NUM_SLOTS))
+  
+  /*
+++<<<<<<< HEAD
+ + * SLOT_IDX_FAST is used in fast-path. Not first checking the address's primary
+ + * slot (middle) is fine if we assume that data races occur rarely. The set of
+++=======
++  * SLOT_IDX_FAST is used in the fast-path. Not first checking the address's primary
++  * slot (middle) is fine if we assume that races occur rarely. The set of
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+   * indices {SLOT_IDX(slot, i) | i in [0, NUM_SLOTS)} is equivalent to
+   * {SLOT_IDX_FAST(slot, i) | i in [0, NUM_SLOTS)}.
+   */
+@@@ -175,10 -170,28 +180,30 @@@ static inline struct kcsan_ctx *get_ctx
+  	return in_task() ? &current->kcsan_ctx : raw_cpu_ptr(&kcsan_cpu_ctx);
+  }
+  
+ -static __always_inline bool
+ -is_atomic(const volatile void *ptr, size_t size, int type)
+ +static inline bool is_atomic(const volatile void *ptr)
+  {
+ -	struct kcsan_ctx *ctx;
+ +	struct kcsan_ctx *ctx = get_ctx();
+  
+++<<<<<<< HEAD
+++=======
++ 	if ((type & KCSAN_ACCESS_ATOMIC) != 0)
++ 		return true;
++ 
++ 	/*
++ 	 * Unless explicitly declared atomic, never consider an assertion access
++ 	 * as atomic. This allows using them also in atomic regions, such as
++ 	 * seqlocks, without implicitly changing their semantics.
++ 	 */
++ 	if ((type & KCSAN_ACCESS_ASSERT) != 0)
++ 		return false;
++ 
++ 	if (IS_ENABLED(CONFIG_KCSAN_ASSUME_PLAIN_WRITES_ATOMIC) &&
++ 	    (type & KCSAN_ACCESS_WRITE) != 0 && size <= sizeof(long) &&
++ 	    IS_ALIGNED((unsigned long)ptr, size))
++ 		return true; /* Assume aligned writes up to word size are atomic. */
++ 
++ 	ctx = get_ctx();
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  	if (unlikely(ctx->atomic_next > 0)) {
+  		/*
+  		 * Because we do not have separate contexts for nested
+@@@ -296,9 -315,11 +325,14 @@@ static noinline void kcsan_found_watchp
+  	user_access_restore(flags);
+  }
+  
+ -static noinline void
+ -kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type)
+ +static noinline void kcsan_setup_watchpoint(const volatile void *ptr,
+ +					    size_t size, bool is_write)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const bool is_write = (type & KCSAN_ACCESS_WRITE) != 0;
++ 	const bool is_assert = (type & KCSAN_ACCESS_ASSERT) != 0;
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  	atomic_long_t *watchpoint;
+  	union {
+  		u8 _1;
+@@@ -421,14 -442,33 +455,43 @@@
+  		/*
+  		 * No need to increment 'data_races' counter, as the racing
+  		 * thread already did.
++ 		 *
++ 		 * Count 'assert_failures' for each failed ASSERT access,
++ 		 * therefore both this thread and the racing thread may
++ 		 * increment this counter.
+  		 */
+++<<<<<<< HEAD
+ +		kcsan_report(ptr, size, is_write, size > 8 || value_change,
+ +			     smp_processor_id(), KCSAN_REPORT_RACE_SIGNAL);
+++=======
++ 		if (is_assert)
++ 			kcsan_counter_inc(KCSAN_COUNTER_ASSERT_FAILURES);
++ 
++ 		/*
++ 		 * - If we were not able to observe a value change due to size
++ 		 *   constraints, always assume a value change.
++ 		 * - If the access type is an assertion, we also always assume a
++ 		 *   value change to always report the race.
++ 		 */
++ 		value_change = value_change || size > 8 || is_assert;
++ 
++ 		kcsan_report(ptr, size, type, value_change, smp_processor_id(),
++ 			     KCSAN_REPORT_RACE_SIGNAL);
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  	} else if (value_change) {
+  		/* Inferring a race, since the value should not have changed. */
++ 
+  		kcsan_counter_inc(KCSAN_COUNTER_RACES_UNKNOWN_ORIGIN);
+++<<<<<<< HEAD
+ +		if (IS_ENABLED(CONFIG_KCSAN_REPORT_RACE_UNKNOWN_ORIGIN))
+ +			kcsan_report(ptr, size, is_write, true,
+++=======
++ 		if (is_assert)
++ 			kcsan_counter_inc(KCSAN_COUNTER_ASSERT_FAILURES);
++ 
++ 		if (IS_ENABLED(CONFIG_KCSAN_REPORT_RACE_UNKNOWN_ORIGIN) || is_assert)
++ 			kcsan_report(ptr, size, type, true,
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  				     smp_processor_id(),
+  				     KCSAN_REPORT_RACE_UNKNOWN_ORIGIN);
+  	}
+diff --cc kernel/kcsan/debugfs.c
+index 041d520a0183,a9dad44130e6..000000000000
+--- a/kernel/kcsan/debugfs.c
++++ b/kernel/kcsan/debugfs.c
+@@@ -41,22 -41,15 +41,34 @@@ static DEFINE_SPINLOCK(report_filterlis
+  static const char *counter_to_name(enum kcsan_counter_id id)
+  {
+  	switch (id) {
+++<<<<<<< HEAD
+ +	case KCSAN_COUNTER_USED_WATCHPOINTS:
+ +		return "used_watchpoints";
+ +	case KCSAN_COUNTER_SETUP_WATCHPOINTS:
+ +		return "setup_watchpoints";
+ +	case KCSAN_COUNTER_DATA_RACES:
+ +		return "data_races";
+ +	case KCSAN_COUNTER_NO_CAPACITY:
+ +		return "no_capacity";
+ +	case KCSAN_COUNTER_REPORT_RACES:
+ +		return "report_races";
+ +	case KCSAN_COUNTER_RACES_UNKNOWN_ORIGIN:
+ +		return "races_unknown_origin";
+ +	case KCSAN_COUNTER_UNENCODABLE_ACCESSES:
+ +		return "unencodable_accesses";
+ +	case KCSAN_COUNTER_ENCODING_FALSE_POSITIVES:
+ +		return "encoding_false_positives";
+++=======
++ 	case KCSAN_COUNTER_USED_WATCHPOINTS:		return "used_watchpoints";
++ 	case KCSAN_COUNTER_SETUP_WATCHPOINTS:		return "setup_watchpoints";
++ 	case KCSAN_COUNTER_DATA_RACES:			return "data_races";
++ 	case KCSAN_COUNTER_ASSERT_FAILURES:		return "assert_failures";
++ 	case KCSAN_COUNTER_NO_CAPACITY:			return "no_capacity";
++ 	case KCSAN_COUNTER_REPORT_RACES:		return "report_races";
++ 	case KCSAN_COUNTER_RACES_UNKNOWN_ORIGIN:	return "races_unknown_origin";
++ 	case KCSAN_COUNTER_UNENCODABLE_ACCESSES:	return "unencodable_accesses";
++ 	case KCSAN_COUNTER_ENCODING_FALSE_POSITIVES:	return "encoding_false_positives";
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  	case KCSAN_COUNTER_COUNT:
+  		BUG();
+  	}
+diff --cc kernel/kcsan/report.c
+index 94d805f88916,3bc590e6be7e..000000000000
+--- a/kernel/kcsan/report.c
++++ b/kernel/kcsan/report.c
+@@@ -33,19 -34,122 +33,133 @@@ static struct 
+  } other_info = { .ptr = NULL };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Information about reported races; used to rate limit reporting.
++  */
++ struct report_time {
++ 	/*
++ 	 * The last time the race was reported.
++ 	 */
++ 	unsigned long time;
++ 
++ 	/*
++ 	 * The frames of the 2 threads; if only 1 thread is known, one frame
++ 	 * will be 0.
++ 	 */
++ 	unsigned long frame1;
++ 	unsigned long frame2;
++ };
++ 
++ /*
++  * Since we also want to be able to debug allocators with KCSAN, to avoid
++  * deadlock, report_times cannot be dynamically resized with krealloc in
++  * rate_limit_report.
++  *
++  * Therefore, we use a fixed-size array, which at most will occupy a page. This
++  * still adequately rate limits reports, assuming that a) number of unique data
++  * races is not excessive, and b) occurrence of unique races within the
++  * same time window is limited.
++  */
++ #define REPORT_TIMES_MAX (PAGE_SIZE / sizeof(struct report_time))
++ #define REPORT_TIMES_SIZE                                                      \
++ 	(CONFIG_KCSAN_REPORT_ONCE_IN_MS > REPORT_TIMES_MAX ?                   \
++ 		 REPORT_TIMES_MAX :                                            \
++ 		 CONFIG_KCSAN_REPORT_ONCE_IN_MS)
++ static struct report_time report_times[REPORT_TIMES_SIZE];
++ 
++ /*
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+   * This spinlock protects reporting and other_info, since other_info is usually
+   * required when reporting.
+   */
+  static DEFINE_SPINLOCK(report_lock);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Checks if the race identified by thread frames frame1 and frame2 has
++  * been reported since (now - KCSAN_REPORT_ONCE_IN_MS).
++  */
++ static bool rate_limit_report(unsigned long frame1, unsigned long frame2)
++ {
++ 	struct report_time *use_entry = &report_times[0];
++ 	unsigned long invalid_before;
++ 	int i;
++ 
++ 	BUILD_BUG_ON(CONFIG_KCSAN_REPORT_ONCE_IN_MS != 0 && REPORT_TIMES_SIZE == 0);
++ 
++ 	if (CONFIG_KCSAN_REPORT_ONCE_IN_MS == 0)
++ 		return false;
++ 
++ 	invalid_before = jiffies - msecs_to_jiffies(CONFIG_KCSAN_REPORT_ONCE_IN_MS);
++ 
++ 	/* Check if a matching race report exists. */
++ 	for (i = 0; i < REPORT_TIMES_SIZE; ++i) {
++ 		struct report_time *rt = &report_times[i];
++ 
++ 		/*
++ 		 * Must always select an entry for use to store info as we
++ 		 * cannot resize report_times; at the end of the scan, use_entry
++ 		 * will be the oldest entry, which ideally also happened before
++ 		 * KCSAN_REPORT_ONCE_IN_MS ago.
++ 		 */
++ 		if (time_before(rt->time, use_entry->time))
++ 			use_entry = rt;
++ 
++ 		/*
++ 		 * Initially, no need to check any further as this entry as well
++ 		 * as following entries have never been used.
++ 		 */
++ 		if (rt->time == 0)
++ 			break;
++ 
++ 		/* Check if entry expired. */
++ 		if (time_before(rt->time, invalid_before))
++ 			continue; /* before KCSAN_REPORT_ONCE_IN_MS ago */
++ 
++ 		/* Reported recently, check if race matches. */
++ 		if ((rt->frame1 == frame1 && rt->frame2 == frame2) ||
++ 		    (rt->frame1 == frame2 && rt->frame2 == frame1))
++ 			return true;
++ 	}
++ 
++ 	use_entry->time = jiffies;
++ 	use_entry->frame1 = frame1;
++ 	use_entry->frame2 = frame2;
++ 	return false;
++ }
++ 
++ /*
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+   * Special rules to skip reporting.
+   */
+ -static bool
+ -skip_report(bool value_change, unsigned long top_frame)
+ +static bool skip_report(bool is_write, bool value_change,
+ +			unsigned long top_frame)
+  {
+++<<<<<<< HEAD
+ +	if (IS_ENABLED(CONFIG_KCSAN_REPORT_VALUE_CHANGE_ONLY) && is_write &&
+ +	    !value_change) {
+++=======
++ 	/*
++ 	 * The first call to skip_report always has value_change==true, since we
++ 	 * cannot know the value written of an instrumented access. For the 2nd
++ 	 * call there are 6 cases with CONFIG_KCSAN_REPORT_VALUE_CHANGE_ONLY:
++ 	 *
++ 	 * 1. read watchpoint, conflicting write (value_change==true): report;
++ 	 * 2. read watchpoint, conflicting write (value_change==false): skip;
++ 	 * 3. write watchpoint, conflicting write (value_change==true): report;
++ 	 * 4. write watchpoint, conflicting write (value_change==false): skip;
++ 	 * 5. write watchpoint, conflicting read (value_change==false): skip;
++ 	 * 6. write watchpoint, conflicting read (value_change==true): report;
++ 	 *
++ 	 * Cases 1-4 are intuitive and expected; case 5 ensures we do not report
++ 	 * data races where the write may have rewritten the same value; case 6
++ 	 * is possible either if the size is larger than what we check value
++ 	 * changes for or the access type is KCSAN_ACCESS_ASSERT.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_KCSAN_REPORT_VALUE_CHANGE_ONLY) && !value_change) {
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  		/*
+  		 * The access is a write, but the data value did not change.
+  		 *
+@@@ -64,9 -168,36 +178,40 @@@
+  	return kcsan_skip_report_debugfs(top_frame);
+  }
+  
+ -static const char *get_access_type(int type)
+ +static inline const char *get_access_type(bool is_write)
+  {
+++<<<<<<< HEAD
+ +	return is_write ? "write" : "read";
+++=======
++ 	switch (type) {
++ 	case 0:
++ 		return "read";
++ 	case KCSAN_ACCESS_ATOMIC:
++ 		return "read (marked)";
++ 	case KCSAN_ACCESS_WRITE:
++ 		return "write";
++ 	case KCSAN_ACCESS_WRITE | KCSAN_ACCESS_ATOMIC:
++ 		return "write (marked)";
++ 
++ 	/*
++ 	 * ASSERT variants:
++ 	 */
++ 	case KCSAN_ACCESS_ASSERT:
++ 	case KCSAN_ACCESS_ASSERT | KCSAN_ACCESS_ATOMIC:
++ 		return "assert no writes";
++ 	case KCSAN_ACCESS_ASSERT | KCSAN_ACCESS_WRITE:
++ 	case KCSAN_ACCESS_ASSERT | KCSAN_ACCESS_WRITE | KCSAN_ACCESS_ATOMIC:
++ 		return "assert no accesses";
++ 
++ 	default:
++ 		BUG();
++ 	}
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
++ }
++ 
++ static const char *get_bug_type(int type)
++ {
++ 	return (type & KCSAN_ACCESS_ASSERT) != 0 ? "assert: race" : "data-race";
+  }
+  
+  /* Return thread description: in task or interrupt. */
+@@@ -150,15 -284,16 +295,28 @@@ static bool print_report(const volatil
+  		 * Order functions lexographically for consistent bug titles.
+  		 * Do not print offset of functions to keep title short.
+  		 */
+++<<<<<<< HEAD
+ +		cmp = sym_strcmp(other_fn, this_fn);
+ +		pr_err("BUG: KCSAN: data-race in %ps / %ps\n",
+ +		       cmp < 0 ? other_fn : this_fn,
+ +		       cmp < 0 ? this_fn : other_fn);
+ +	} break;
+ +
+ +	case KCSAN_REPORT_RACE_UNKNOWN_ORIGIN:
+ +		pr_err("BUG: KCSAN: data-race in %pS\n",
+ +		       (void *)stack_entries[skipnr]);
+++=======
++ 		cmp = sym_strcmp((void *)other_frame, (void *)this_frame);
++ 		pr_err("BUG: KCSAN: %s in %ps / %ps\n",
++ 		       get_bug_type(access_type | other_info.access_type),
++ 		       (void *)(cmp < 0 ? other_frame : this_frame),
++ 		       (void *)(cmp < 0 ? this_frame : other_frame));
++ 	} break;
++ 
++ 	case KCSAN_REPORT_RACE_UNKNOWN_ORIGIN:
++ 		pr_err("BUG: KCSAN: %s in %pS\n", get_bug_type(access_type),
++ 		       (void *)this_frame);
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  		break;
+  
+  	default:
+diff --cc lib/Kconfig.kcsan
+index b258cca3def8,f0b791143c6a..000000000000
+--- a/lib/Kconfig.kcsan
++++ b/lib/Kconfig.kcsan
+@@@ -4,13 -4,19 +4,29 @@@ config HAVE_ARCH_KCSA
+  	bool
+  
+  menuconfig KCSAN
+++<<<<<<< HEAD
+ +	bool "KCSAN: watchpoint-based dynamic data race detector"
+ +	depends on HAVE_ARCH_KCSAN && !KASAN && STACKTRACE
+ +	default n
+ +	help
+ +	  Kernel Concurrency Sanitizer is a dynamic data race detector, which
+ +	  uses a watchpoint-based sampling approach to detect races. See
+ +	  <file:Documentation/dev-tools/kcsan.rst> for more details.
+++=======
++ 	bool "KCSAN: dynamic race detector"
++ 	depends on HAVE_ARCH_KCSAN && DEBUG_KERNEL && !KASAN
++ 	select STACKTRACE
++ 	help
++ 	  The Kernel Concurrency Sanitizer (KCSAN) is a dynamic race detector,
++ 	  which relies on compile-time instrumentation, and uses a
++ 	  watchpoint-based sampling approach to detect races.
++ 
++ 	  KCSAN's primary purpose is to detect data races. KCSAN can also be
++ 	  used to check properties, with the help of provided assertions, of
++ 	  concurrent code where bugs do not manifest as data races.
++ 
++ 	  See <file:Documentation/dev-tools/kcsan.rst> for more details.
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  
+  if KCSAN
+  
+@@@ -103,13 -88,23 +119,33 @@@ config KCSAN_SKIP_WATCH_RANDOMIZ
+  	  KCSAN_WATCH_SKIP. If false, the chosen value is always
+  	  KCSAN_WATCH_SKIP.
+  
+++<<<<<<< HEAD
+ +# Note that, while some of the below options could be turned into boot
+ +# parameters, to optimize for the common use-case, we avoid this because: (a)
+ +# it would impact performance (and we want to avoid static branch for all
+ +# {READ,WRITE}_ONCE, atomic_*, bitops, etc.), and (b) complicate the design
+ +# without real benefit. The main purpose of the below options are for use in
+ +# fuzzer configs to control reported data races, and are not expected to be
+ +# switched frequently by a user.
+++=======
++ config KCSAN_REPORT_ONCE_IN_MS
++ 	int "Duration in milliseconds, in which any given race is only reported once"
++ 	default 3000
++ 	help
++ 	  Any given race is only reported once in the defined time window.
++ 	  Different races may still generate reports within a duration that is
++ 	  smaller than the duration defined here. This allows rate limiting
++ 	  reporting to avoid flooding the console with reports.  Setting this
++ 	  to 0 disables rate limiting.
++ 
++ # The main purpose of the below options is to control reported data races (e.g.
++ # in fuzzer configs), and are not expected to be switched frequently by other
++ # users. We could turn some of them into boot parameters, but given they should
++ # not be switched normally, let's keep them here to simplify configuration.
++ #
++ # The defaults below are chosen to be very conservative, and may miss certain
++ # bugs.
+++>>>>>>> d591ec3db75f (kcsan: Introduce KCSAN_ACCESS_ASSERT access type)
+  
+  config KCSAN_REPORT_RACE_UNKNOWN_ORIGIN
+  	bool "Report races of unknown origin"
+* Unmerged path include/linux/kcsan-checks.h
+* Unmerged path kernel/kcsan/core.c
+* Unmerged path kernel/kcsan/debugfs.c
+diff --git a/kernel/kcsan/kcsan.h b/kernel/kcsan/kcsan.h
+index 1bb2f1c0d61e..013d750cf314 100644
+--- a/kernel/kcsan/kcsan.h
++++ b/kernel/kcsan/kcsan.h
+@@ -39,6 +39,13 @@ enum kcsan_counter_id {
+ 	 */
+ 	KCSAN_COUNTER_DATA_RACES,
+ 
++	/*
++	 * Total number of ASSERT failures due to races. If the observed race is
++	 * due to two conflicting ASSERT type accesses, then both will be
++	 * counted.
++	 */
++	KCSAN_COUNTER_ASSERT_FAILURES,
++
+ 	/*
+ 	 * Number of times no watchpoints were available.
+ 	 */
+* Unmerged path kernel/kcsan/report.c
+* Unmerged path lib/Kconfig.kcsan
