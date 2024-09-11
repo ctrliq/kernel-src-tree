@@ -115,8 +115,7 @@ xfs_iomap_end_fsb(
 
 static xfs_extlen_t
 xfs_eof_alignment(
-	struct xfs_inode	*ip,
-	xfs_extlen_t		extsize)
+	struct xfs_inode	*ip)
 {
 	struct xfs_mount	*mp = ip->i_mount;
 	xfs_extlen_t		align = 0;
@@ -139,17 +138,6 @@ xfs_eof_alignment(
 			align = 0;
 	}
 
-	/*
-	 * Always round up the allocation request to an extent boundary
-	 * (when file on a real-time subvolume or has di_extsize hint).
-	 */
-	if (extsize) {
-		if (align)
-			align = roundup_64(align, extsize);
-		else
-			align = extsize;
-	}
-
 	return align;
 }
 
@@ -164,11 +152,21 @@ xfs_iomap_eof_align_last_fsb(
 {
 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, XFS_DATA_FORK);
 	xfs_extlen_t		extsz = xfs_get_extsz_hint(ip);
-	xfs_extlen_t		align = xfs_eof_alignment(ip, extsz);
+	xfs_extlen_t		align = xfs_eof_alignment(ip);
 	struct xfs_bmbt_irec	irec;
 	struct xfs_iext_cursor	icur;
 
 	ASSERT(ifp->if_flags & XFS_IFEXTENTS);
+
+	/*
+	 * Always round up the allocation request to the extent hint boundary.
+	 */
+	if (extsz) {
+		if (align)
+			align = roundup_64(align, extsz);
+		else
+			align = extsz;
+	}
 
 	if (align) {
 		xfs_fileoff_t	aligned_end_fsb = roundup_64(end_fsb, align);
@@ -672,7 +670,7 @@ xfs_file_iomap_begin_delay(
 			p_end_fsb = XFS_B_TO_FSBT(mp, end_offset) +
 					prealloc_blocks;
 
-			align = xfs_eof_alignment(ip, 0);
+			align = xfs_eof_alignment(ip);
 			if (align)
 				p_end_fsb = roundup_64(p_end_fsb, align);
 
