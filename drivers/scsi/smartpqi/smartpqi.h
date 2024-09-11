@@ -1148,6 +1148,7 @@ struct pqi_ctrl_info {
 	struct mutex	ofa_mutex; /* serialize ofa */
 	bool		controller_online;
 	bool		block_requests;
+	bool		scan_blocked;
 	bool		in_ofa;
 	bool		in_shutdown;
 	u8		inbound_spanning_supported : 1;
@@ -1421,16 +1422,6 @@ struct bmic_diag_options {
 };
 
 #pragma pack()
-
-static inline void pqi_ctrl_busy(struct pqi_ctrl_info *ctrl_info)
-{
-	atomic_inc(&ctrl_info->num_busy_threads);
-}
-
-static inline void pqi_ctrl_unbusy(struct pqi_ctrl_info *ctrl_info)
-{
-	atomic_dec(&ctrl_info->num_busy_threads);
-}
 
 static inline struct pqi_ctrl_info *shost_to_hba(struct Scsi_Host *shost)
 {
