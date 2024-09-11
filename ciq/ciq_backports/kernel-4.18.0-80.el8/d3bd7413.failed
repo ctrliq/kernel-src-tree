@@ -1,0 +1,188 @@
+bpf: fix sanitation of alu op with pointer / scalar type from different paths
+
+jira LE-1907
+cve CVE-2019-7308
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit d3bd7413e0ca40b60cf60d4003246d067cafdeda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/d3bd7413.failed
+
+While 979d63d50c0c ("bpf: prevent out of bounds speculation on pointer
+arithmetic") took care of rejecting alu op on pointer when e.g. pointer
+came from two different map values with different map properties such as
+value size, Jann reported that a case was not covered yet when a given
+alu op is used in both "ptr_reg += reg" and "numeric_reg += reg" from
+different branches where we would incorrectly try to sanitize based
+on the pointer's limit. Catch this corner case and reject the program
+instead.
+
+Fixes: 979d63d50c0c ("bpf: prevent out of bounds speculation on pointer arithmetic")
+	Reported-by: Jann Horn <jannh@google.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d3bd7413e0ca40b60cf60d4003246d067cafdeda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf_verifier.h
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf_verifier.h
+index 693f5514abf9,573cca00a0e6..000000000000
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@@ -140,6 -168,14 +140,17 @@@ struct bpf_verifier_state_list 
+  	struct bpf_verifier_state_list *next;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Possible states for alu_state member. */
++ #define BPF_ALU_SANITIZE_SRC		1U
++ #define BPF_ALU_SANITIZE_DST		2U
++ #define BPF_ALU_NEG_VALUE		(1U << 2)
++ #define BPF_ALU_NON_POINTER		(1U << 3)
++ #define BPF_ALU_SANITIZE		(BPF_ALU_SANITIZE_SRC | \
++ 					 BPF_ALU_SANITIZE_DST)
++ 
+++>>>>>>> d3bd7413e0ca (bpf: fix sanitation of alu op with pointer / scalar type from different paths)
+  struct bpf_insn_aux_data {
+  	union {
+  		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
+diff --cc kernel/bpf/verifier.c
+index 749e6dd7b3f6,56674a7c3778..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -2548,6 -3070,125 +2548,128 @@@ static bool check_reg_sane_offset(struc
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct bpf_insn_aux_data *cur_aux(struct bpf_verifier_env *env)
++ {
++ 	return &env->insn_aux_data[env->insn_idx];
++ }
++ 
++ static int retrieve_ptr_limit(const struct bpf_reg_state *ptr_reg,
++ 			      u32 *ptr_limit, u8 opcode, bool off_is_neg)
++ {
++ 	bool mask_to_left = (opcode == BPF_ADD &&  off_is_neg) ||
++ 			    (opcode == BPF_SUB && !off_is_neg);
++ 	u32 off;
++ 
++ 	switch (ptr_reg->type) {
++ 	case PTR_TO_STACK:
++ 		off = ptr_reg->off + ptr_reg->var_off.value;
++ 		if (mask_to_left)
++ 			*ptr_limit = MAX_BPF_STACK + off;
++ 		else
++ 			*ptr_limit = -off;
++ 		return 0;
++ 	case PTR_TO_MAP_VALUE:
++ 		if (mask_to_left) {
++ 			*ptr_limit = ptr_reg->umax_value + ptr_reg->off;
++ 		} else {
++ 			off = ptr_reg->smin_value + ptr_reg->off;
++ 			*ptr_limit = ptr_reg->map_ptr->value_size - off;
++ 		}
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static bool can_skip_alu_sanitation(const struct bpf_verifier_env *env,
++ 				    const struct bpf_insn *insn)
++ {
++ 	return env->allow_ptr_leaks || BPF_SRC(insn->code) == BPF_K;
++ }
++ 
++ static int update_alu_sanitation_state(struct bpf_insn_aux_data *aux,
++ 				       u32 alu_state, u32 alu_limit)
++ {
++ 	/* If we arrived here from different branches with different
++ 	 * state or limits to sanitize, then this won't work.
++ 	 */
++ 	if (aux->alu_state &&
++ 	    (aux->alu_state != alu_state ||
++ 	     aux->alu_limit != alu_limit))
++ 		return -EACCES;
++ 
++ 	/* Corresponding fixup done in fixup_bpf_calls(). */
++ 	aux->alu_state = alu_state;
++ 	aux->alu_limit = alu_limit;
++ 	return 0;
++ }
++ 
++ static int sanitize_val_alu(struct bpf_verifier_env *env,
++ 			    struct bpf_insn *insn)
++ {
++ 	struct bpf_insn_aux_data *aux = cur_aux(env);
++ 
++ 	if (can_skip_alu_sanitation(env, insn))
++ 		return 0;
++ 
++ 	return update_alu_sanitation_state(aux, BPF_ALU_NON_POINTER, 0);
++ }
++ 
++ static int sanitize_ptr_alu(struct bpf_verifier_env *env,
++ 			    struct bpf_insn *insn,
++ 			    const struct bpf_reg_state *ptr_reg,
++ 			    struct bpf_reg_state *dst_reg,
++ 			    bool off_is_neg)
++ {
++ 	struct bpf_verifier_state *vstate = env->cur_state;
++ 	struct bpf_insn_aux_data *aux = cur_aux(env);
++ 	bool ptr_is_dst_reg = ptr_reg == dst_reg;
++ 	u8 opcode = BPF_OP(insn->code);
++ 	u32 alu_state, alu_limit;
++ 	struct bpf_reg_state tmp;
++ 	bool ret;
++ 
++ 	if (can_skip_alu_sanitation(env, insn))
++ 		return 0;
++ 
++ 	/* We already marked aux for masking from non-speculative
++ 	 * paths, thus we got here in the first place. We only care
++ 	 * to explore bad access from here.
++ 	 */
++ 	if (vstate->speculative)
++ 		goto do_sim;
++ 
++ 	alu_state  = off_is_neg ? BPF_ALU_NEG_VALUE : 0;
++ 	alu_state |= ptr_is_dst_reg ?
++ 		     BPF_ALU_SANITIZE_SRC : BPF_ALU_SANITIZE_DST;
++ 
++ 	if (retrieve_ptr_limit(ptr_reg, &alu_limit, opcode, off_is_neg))
++ 		return 0;
++ 	if (update_alu_sanitation_state(aux, alu_state, alu_limit))
++ 		return -EACCES;
++ do_sim:
++ 	/* Simulate and find potential out-of-bounds access under
++ 	 * speculative execution from truncation as a result of
++ 	 * masking when off was not within expected range. If off
++ 	 * sits in dst, then we temporarily need to move ptr there
++ 	 * to simulate dst (== 0) +/-= ptr. Needed, for example,
++ 	 * for cases where we use K-based arithmetic in one direction
++ 	 * and truncated reg-based in the other in order to explore
++ 	 * bad access.
++ 	 */
++ 	if (!ptr_is_dst_reg) {
++ 		tmp = *dst_reg;
++ 		*dst_reg = *ptr_reg;
++ 	}
++ 	ret = push_stack(env, env->insn_idx + 1, env->insn_idx, true);
++ 	if (!ptr_is_dst_reg)
++ 		*dst_reg = tmp;
++ 	return !ret ? -EFAULT : 0;
++ }
++ 
+++>>>>>>> d3bd7413e0ca (bpf: fix sanitation of alu op with pointer / scalar type from different paths)
+  /* Handles arithmetic on a pointer and a scalar: computes new min/max and var_off.
+   * Caller should also handle BPF_MOV case separately.
+   * If we return -EACCES, caller may want to try again treating pointer as a
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/verifier.c
