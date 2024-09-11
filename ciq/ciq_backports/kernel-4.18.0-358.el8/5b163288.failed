@@ -1,0 +1,191 @@
+net: bridge: multicast: add EHT host handling functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 5b16328879302695101f403f261ff7c5f1ee4b84
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5b163288.failed
+
+Add functions to create, destroy and lookup an EHT host. These are
+per-host entries contained in the eht_host_tree in net_bridge_port_group
+which are used to store a list of all sources (S,G) entries joined for that
+group by each host, the host's current filter mode and total number of
+joined entries.
+No functional changes yet, these would be used in later patches.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 5b16328879302695101f403f261ff7c5f1ee4b84)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+diff --cc net/bridge/br_multicast.c
+index 4eaac3b4a6ea,dc6e879dc840..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -792,12 -1168,22 +792,17 @@@ struct net_bridge_port_group *br_multic
+  	if (unlikely(!p))
+  		return NULL;
+  
+ -	p->key.addr = *group;
+ -	p->key.port = port;
+ +	p->addr = *group;
+ +	p->port = port;
+  	p->flags = flags;
+  	p->filter_mode = filter_mode;
+++<<<<<<< HEAD
+++=======
++ 	p->rt_protocol = rt_protocol;
++ 	p->eht_host_tree = RB_ROOT;
+++>>>>>>> 5b1632887930 (net: bridge: multicast: add EHT host handling functions)
+  	p->mcast_gc.destroy = br_multicast_destroy_port_group;
+  	INIT_HLIST_HEAD(&p->src_list);
+ -
+ -	if (!br_multicast_is_star_g(group) &&
+ -	    rhashtable_lookup_insert_fast(&port->br->sg_port_tbl, &p->rhnode,
+ -					  br_sg_port_rht_params)) {
+ -		kfree(p);
+ -		return NULL;
+ -	}
+ -
+  	rcu_assign_pointer(p->next, next);
+  	timer_setup(&p->timer, br_multicast_port_group_expired, 0);
+  	timer_setup(&p->rexmit_timer, br_multicast_port_group_rexmit, 0);
+diff --git a/net/bridge/Makefile b/net/bridge/Makefile
+index 4702702a74d3..7fb9a021873b 100644
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@ -18,7 +18,7 @@ br_netfilter-y := br_netfilter_hooks.o
+ br_netfilter-$(subst m,y,$(CONFIG_IPV6)) += br_netfilter_ipv6.o
+ obj-$(CONFIG_BRIDGE_NETFILTER) += br_netfilter.o
+ 
+-bridge-$(CONFIG_BRIDGE_IGMP_SNOOPING) += br_multicast.o br_mdb.o
++bridge-$(CONFIG_BRIDGE_IGMP_SNOOPING) += br_multicast.o br_mdb.o br_multicast_eht.o
+ 
+ bridge-$(CONFIG_BRIDGE_VLAN_FILTERING) += br_vlan.o br_vlan_tunnel.o br_vlan_options.o
+ 
+* Unmerged path net/bridge/br_multicast.c
+diff --git a/net/bridge/br_multicast_eht.c b/net/bridge/br_multicast_eht.c
+new file mode 100644
+index 000000000000..5cebca45e72c
+--- /dev/null
++++ b/net/bridge/br_multicast_eht.c
+@@ -0,0 +1,115 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Copyright (c) 2020, Nikolay Aleksandrov <nikolay@nvidia.com>
++#include <linux/err.h>
++#include <linux/export.h>
++#include <linux/if_ether.h>
++#include <linux/igmp.h>
++#include <linux/in.h>
++#include <linux/jhash.h>
++#include <linux/kernel.h>
++#include <linux/log2.h>
++#include <linux/netdevice.h>
++#include <linux/netfilter_bridge.h>
++#include <linux/random.h>
++#include <linux/rculist.h>
++#include <linux/skbuff.h>
++#include <linux/slab.h>
++#include <linux/timer.h>
++#include <linux/inetdevice.h>
++#include <linux/mroute.h>
++#include <net/ip.h>
++#include <net/switchdev.h>
++#if IS_ENABLED(CONFIG_IPV6)
++#include <linux/icmpv6.h>
++#include <net/ipv6.h>
++#include <net/mld.h>
++#include <net/ip6_checksum.h>
++#include <net/addrconf.h>
++#endif
++
++#include "br_private.h"
++#include "br_private_mcast_eht.h"
++
++static struct net_bridge_group_eht_host *
++br_multicast_eht_host_lookup(struct net_bridge_port_group *pg,
++			     union net_bridge_eht_addr *h_addr)
++{
++	struct rb_node *node = pg->eht_host_tree.rb_node;
++
++	while (node) {
++		struct net_bridge_group_eht_host *this;
++		int result;
++
++		this = rb_entry(node, struct net_bridge_group_eht_host,
++				rb_node);
++		result = memcmp(h_addr, &this->h_addr, sizeof(*h_addr));
++		if (result < 0)
++			node = node->rb_left;
++		else if (result > 0)
++			node = node->rb_right;
++		else
++			return this;
++	}
++
++	return NULL;
++}
++
++static int br_multicast_eht_host_filter_mode(struct net_bridge_port_group *pg,
++					     union net_bridge_eht_addr *h_addr)
++{
++	struct net_bridge_group_eht_host *eht_host;
++
++	eht_host = br_multicast_eht_host_lookup(pg, h_addr);
++	if (!eht_host)
++		return MCAST_INCLUDE;
++
++	return eht_host->filter_mode;
++}
++
++static void __eht_destroy_host(struct net_bridge_group_eht_host *eht_host)
++{
++	WARN_ON(!hlist_empty(&eht_host->set_entries));
++
++	rb_erase(&eht_host->rb_node, &eht_host->pg->eht_host_tree);
++	RB_CLEAR_NODE(&eht_host->rb_node);
++	kfree(eht_host);
++}
++
++static struct net_bridge_group_eht_host *
++__eht_lookup_create_host(struct net_bridge_port_group *pg,
++			 union net_bridge_eht_addr *h_addr,
++			 unsigned char filter_mode)
++{
++	struct rb_node **link = &pg->eht_host_tree.rb_node, *parent = NULL;
++	struct net_bridge_group_eht_host *eht_host;
++
++	while (*link) {
++		struct net_bridge_group_eht_host *this;
++		int result;
++
++		this = rb_entry(*link, struct net_bridge_group_eht_host,
++				rb_node);
++		result = memcmp(h_addr, &this->h_addr, sizeof(*h_addr));
++		parent = *link;
++		if (result < 0)
++			link = &((*link)->rb_left);
++		else if (result > 0)
++			link = &((*link)->rb_right);
++		else
++			return this;
++	}
++
++	eht_host = kzalloc(sizeof(*eht_host), GFP_ATOMIC);
++	if (!eht_host)
++		return NULL;
++
++	memcpy(&eht_host->h_addr, h_addr, sizeof(*h_addr));
++	INIT_HLIST_HEAD(&eht_host->set_entries);
++	eht_host->pg = pg;
++	eht_host->filter_mode = filter_mode;
++
++	rb_link_node(&eht_host->rb_node, parent, link);
++	rb_insert_color(&eht_host->rb_node, &pg->eht_host_tree);
++
++	return eht_host;
++}
