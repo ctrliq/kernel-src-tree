@@ -1,0 +1,207 @@
+block: remove ->poll_fn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 529262d56dbebe6a26df5d2fd24cc0e1bc8579e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/529262d5.failed
+
+This was intended to support users like nvme multipath, but is just
+getting in the way and adding another indirect call.
+
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 529262d56dbebe6a26df5d2fd24cc0e1bc8579e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq.c
+#	include/linux/blkdev.h
+diff --cc block/blk-core.c
+index d7c519b2554b,ad59102ee30a..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2518,19 -1248,8 +2518,22 @@@ blk_qc_t submit_bio(struct bio *bio
+  
+  	return generic_make_request(bio);
+  }
+ -EXPORT_SYMBOL(submit_bio);
+ +EXPORT_SYMBOL(submit_bio);
+ +
+++<<<<<<< HEAD
+ +bool blk_poll(struct request_queue *q, blk_qc_t cookie)
+ +{
+ +	if (!q->poll_fn || !blk_qc_t_valid(cookie))
+ +		return false;
+ +
+ +	if (current->plug)
+ +		blk_flush_plug_list(current->plug, false);
+ +	return q->poll_fn(q, cookie);
+ +}
+ +EXPORT_SYMBOL_GPL(blk_poll);
+  
+++=======
+++>>>>>>> 529262d56dbe (block: remove ->poll_fn)
+  /**
+   * blk_cloned_rq_check_limits - Helper function to check a cloned request
+   *                              for new the queue limits
+diff --cc block/blk-mq.c
+index dfedb46e2ece,50d529602e05..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -38,7 -38,6 +38,10 @@@
+  #include "blk-mq-sched.h"
+  #include "blk-rq-qos.h"
+  
+++<<<<<<< HEAD
+ +static bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie);
+++=======
+++>>>>>>> 529262d56dbe (block: remove ->poll_fn)
+  static void blk_mq_poll_stats_start(struct request_queue *q);
+  static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+  
+@@@ -3377,9 -3394,75 +3378,79 @@@ static bool blk_mq_poll(struct request_
+  			return false;
+  	}
+  
+++<<<<<<< HEAD
+ +	return __blk_mq_poll(hctx, rq);
+++=======
++ 	return blk_mq_poll_hybrid_sleep(q, hctx, rq);
+  }
+  
++ /**
++  * blk_poll - poll for IO completions
++  * @q:  the queue
++  * @cookie: cookie passed back at IO submission time
++  * @spin: whether to spin for completions
++  *
++  * Description:
++  *    Poll for completions on the passed in queue. Returns number of
++  *    completed entries found. If @spin is true, then blk_poll will continue
++  *    looping until at least one completion is found, unless the task is
++  *    otherwise marked running (or we need to reschedule).
++  */
++ int blk_poll(struct request_queue *q, blk_qc_t cookie, bool spin)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	long state;
++ 
++ 	if (!blk_qc_t_valid(cookie) ||
++ 	    !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ 		return 0;
++ 
++ 	if (current->plug)
++ 		blk_flush_plug_list(current->plug, false);
++ 
++ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
++ 
++ 	/*
++ 	 * If we sleep, have the caller restart the poll loop to reset
++ 	 * the state. Like for the other success return cases, the
++ 	 * caller is responsible for checking if the IO completed. If
++ 	 * the IO isn't complete, we'll get called again and will go
++ 	 * straight to the busy poll loop.
++ 	 */
++ 	if (blk_mq_poll_hybrid(q, hctx, cookie))
++ 		return 1;
++ 
++ 	hctx->poll_considered++;
++ 
++ 	state = current->state;
++ 	do {
++ 		int ret;
++ 
++ 		hctx->poll_invoked++;
++ 
++ 		ret = q->mq_ops->poll(hctx);
++ 		if (ret > 0) {
++ 			hctx->poll_success++;
++ 			__set_current_state(TASK_RUNNING);
++ 			return ret;
++ 		}
++ 
++ 		if (signal_pending_state(state, current))
++ 			__set_current_state(TASK_RUNNING);
++ 
++ 		if (current->state == TASK_RUNNING)
++ 			return 1;
++ 		if (ret < 0 || !spin)
++ 			break;
++ 		cpu_relax();
++ 	} while (!need_resched());
++ 
++ 	__set_current_state(TASK_RUNNING);
++ 	return 0;
+++>>>>>>> 529262d56dbe (block: remove ->poll_fn)
++ }
++ EXPORT_SYMBOL_GPL(blk_poll);
++ 
+  unsigned int blk_mq_rq_cpu(struct request *rq)
+  {
+  	return rq->mq_ctx->cpu;
+diff --cc include/linux/blkdev.h
+index d890005b9f66,0b3874bdbc6a..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -308,18 -282,10 +308,21 @@@ static inline unsigned short req_get_io
+  
+  struct blk_queue_ctx;
+  
+ +typedef void (request_fn_proc) (struct request_queue *q);
+  typedef blk_qc_t (make_request_fn) (struct request_queue *q, struct bio *bio);
+++<<<<<<< HEAD
+ +typedef bool (poll_q_fn) (struct request_queue *q, blk_qc_t);
+ +typedef int (prep_rq_fn) (struct request_queue *, struct request *);
+ +typedef void (unprep_rq_fn) (struct request_queue *, struct request *);
+++=======
+++>>>>>>> 529262d56dbe (block: remove ->poll_fn)
+  
+  struct bio_vec;
+ +typedef void (softirq_done_fn)(struct request *);
+  typedef int (dma_drain_needed_fn)(struct request *);
+ +typedef int (bsg_job_fn) (struct bsg_job *);
+ +typedef int (init_rq_fn)(struct request_queue *, struct request *, gfp_t);
+ +typedef void (exit_rq_fn)(struct request_queue *, struct request *);
+  
+  enum blk_eh_timer_return {
+  	BLK_EH_DONE,		/* drivers has completed the command */
+@@@ -439,28 -399,8 +442,31 @@@ struct request_queue 
+  	struct blk_queue_stats	*stats;
+  	struct rq_qos		*rq_qos;
+  
+ +	/*
+ +	 * If blkcg is not used, @q->root_rl serves all requests.  If blkcg
+ +	 * is used, root blkg allocates from @q->root_rl and all other
+ +	 * blkgs from their own blkg->rl.  Which one to use should be
+ +	 * determined using bio_request_list().
+ +	 */
+ +	struct request_list	root_rl;
+ +
+ +	request_fn_proc		*request_fn;
+  	make_request_fn		*make_request_fn;
+++<<<<<<< HEAD
+ +	poll_q_fn		*poll_fn;
+ +	prep_rq_fn		*prep_rq_fn;
+ +	unprep_rq_fn		*unprep_rq_fn;
+ +	softirq_done_fn		*softirq_done_fn;
+ +	rq_timed_out_fn		*rq_timed_out_fn;
+++=======
+++>>>>>>> 529262d56dbe (block: remove ->poll_fn)
+  	dma_drain_needed_fn	*dma_drain_needed;
+ +	/* Called just after a request is allocated */
+ +	init_rq_fn		*init_rq_fn;
+ +	/* Called just before a request is freed */
+ +	exit_rq_fn		*exit_rq_fn;
+ +	/* Called from inside blk_get_request() */
+ +	void (*initialize_rq_fn)(struct request *rq);
+  
+  	const struct blk_mq_ops	*mq_ops;
+  
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blkdev.h
