@@ -1,0 +1,444 @@
+KVM: x86/mmu: Drop KVM's hugepage enums in favor of the kernel's enums
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 3bae0459bcd559506a2ca5807040ff722de5b136
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3bae0459.failed
+
+Replace KVM's PT_PAGE_TABLE_LEVEL, PT_DIRECTORY_LEVEL and PT_PDPE_LEVEL
+with the kernel's PG_LEVEL_4K, PG_LEVEL_2M and PG_LEVEL_1G.  KVM's
+enums are borderline impossible to remember and result in code that is
+visually difficult to audit, e.g.
+
+        if (!enable_ept)
+                ept_lpage_level = 0;
+        else if (cpu_has_vmx_ept_1g_page())
+                ept_lpage_level = PT_PDPE_LEVEL;
+        else if (cpu_has_vmx_ept_2m_page())
+                ept_lpage_level = PT_DIRECTORY_LEVEL;
+        else
+                ept_lpage_level = PT_PAGE_TABLE_LEVEL;
+
+versus
+
+        if (!enable_ept)
+                ept_lpage_level = 0;
+        else if (cpu_has_vmx_ept_1g_page())
+                ept_lpage_level = PG_LEVEL_1G;
+        else if (cpu_has_vmx_ept_2m_page())
+                ept_lpage_level = PG_LEVEL_2M;
+        else
+                ept_lpage_level = PG_LEVEL_4K;
+
+No functional change intended.
+
+	Suggested-by: Barret Rhoden <brho@google.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200428005422.4235-4-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3bae0459bcd559506a2ca5807040ff722de5b136)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 2c5020360749,fd94668c0f0f..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -3121,10 -3030,10 +3119,10 @@@ static int set_spte(struct kvm_vcpu *vc
+  	if (pte_access & ACC_USER_MASK)
+  		spte |= shadow_user_mask;
+  
+- 	if (level > PT_PAGE_TABLE_LEVEL)
++ 	if (level > PG_LEVEL_4K)
+  		spte |= PT_PAGE_SIZE_MASK;
+  	if (tdp_enabled)
+ -		spte |= kvm_x86_ops.get_mt_mask(vcpu, gfn,
+ +		spte |= kvm_x86_ops->get_mt_mask(vcpu, gfn,
+  			kvm_is_mmio_pfn(pfn));
+  
+  	if (host_writable)
+@@@ -3334,33 -3230,77 +3331,94 @@@ static void direct_pte_prefetch(struct 
+  	__direct_pte_prefetch(vcpu, sp, sptep);
+  }
+  
+ -static int host_pfn_mapping_level(struct kvm_vcpu *vcpu, gfn_t gfn,
+ -				  kvm_pfn_t pfn, struct kvm_memory_slot *slot)
+ +static void transparent_hugepage_adjust(struct kvm_vcpu *vcpu,
+ +					gfn_t gfn, kvm_pfn_t *pfnp,
+ +					int *levelp)
+  {
+++<<<<<<< HEAD
+ +	kvm_pfn_t pfn = *pfnp;
+ +	int level = *levelp;
+++=======
++ 	unsigned long hva;
++ 	pte_t *pte;
++ 	int level;
++ 
++ 	if (!PageCompound(pfn_to_page(pfn)) && !kvm_is_zone_device_pfn(pfn))
++ 		return PG_LEVEL_4K;
++ 
++ 	/*
++ 	 * Note, using the already-retrieved memslot and __gfn_to_hva_memslot()
++ 	 * is not solely for performance, it's also necessary to avoid the
++ 	 * "writable" check in __gfn_to_hva_many(), which will always fail on
++ 	 * read-only memslots due to gfn_to_hva() assuming writes.  Earlier
++ 	 * page fault steps have already verified the guest isn't writing a
++ 	 * read-only memslot.
++ 	 */
++ 	hva = __gfn_to_hva_memslot(slot, gfn);
++ 
++ 	pte = lookup_address_in_mm(vcpu->kvm->mm, hva, &level);
++ 	if (unlikely(!pte))
++ 		return PG_LEVEL_4K;
++ 
++ 	return level;
++ }
++ 
++ static int kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, gfn_t gfn,
++ 				   int max_level, kvm_pfn_t *pfnp)
++ {
++ 	struct kvm_memory_slot *slot;
++ 	struct kvm_lpage_info *linfo;
++ 	kvm_pfn_t pfn = *pfnp;
++ 	kvm_pfn_t mask;
++ 	int level;
++ 
++ 	if (unlikely(max_level == PG_LEVEL_4K))
++ 		return PG_LEVEL_4K;
++ 
++ 	if (is_error_noslot_pfn(pfn) || kvm_is_reserved_pfn(pfn))
++ 		return PG_LEVEL_4K;
++ 
++ 	slot = gfn_to_memslot_dirty_bitmap(vcpu, gfn, true);
++ 	if (!slot)
++ 		return PG_LEVEL_4K;
++ 
++ 	max_level = min(max_level, max_page_level);
++ 	for ( ; max_level > PG_LEVEL_4K; max_level--) {
++ 		linfo = lpage_info_slot(gfn, slot, max_level);
++ 		if (!linfo->disallow_lpage)
++ 			break;
++ 	}
++ 
++ 	if (max_level == PG_LEVEL_4K)
++ 		return PG_LEVEL_4K;
++ 
++ 	level = host_pfn_mapping_level(vcpu, gfn, pfn, slot);
++ 	if (level == PG_LEVEL_4K)
++ 		return level;
++ 
++ 	level = min(level, max_level);
+++>>>>>>> 3bae0459bcd5 (KVM: x86/mmu: Drop KVM's hugepage enums in favor of the kernel's enums)
+  
+  	/*
+ -	 * mmu_notifier_retry() was successful and mmu_lock is held, so
+ -	 * the pmd can't be split from under us.
+ +	 * Check if it's a transparent hugepage. If this would be an
+ +	 * hugetlbfs page, level wouldn't be set to
+ +	 * PT_PAGE_TABLE_LEVEL and there would be no adjustment done
+ +	 * here.
+  	 */
+ -	mask = KVM_PAGES_PER_HPAGE(level) - 1;
+ -	VM_BUG_ON((gfn & mask) != (pfn & mask));
+ -	*pfnp = pfn & ~mask;
+ +	if (!is_error_noslot_pfn(pfn) && !kvm_is_reserved_pfn(pfn) &&
+ +	    !kvm_is_zone_device_pfn(pfn) && level == PT_PAGE_TABLE_LEVEL &&
+ +	    PageTransCompoundMap(pfn_to_page(pfn))) {
+ +		unsigned long mask;
+  
+ -	return level;
+ +		/*
+ +		 * mmu_notifier_retry() was successful and mmu_lock is held, so
+ +		 * the pmd can't be split from under us.
+ +		 */
+ +		*levelp = level = PT_DIRECTORY_LEVEL;
+ +		mask = KVM_PAGES_PER_HPAGE(level) - 1;
+ +		VM_BUG_ON((gfn & mask) != (pfn & mask));
+ +		*pfnp = pfn & ~mask;
+ +	}
+  }
+  
+  static void disallowed_hugepage_adjust(struct kvm_shadow_walk_iterator it,
+@@@ -4187,12 -4125,8 +4245,12 @@@ static int direct_page_fault(struct kvm
+  		return r;
+  
+  	if (lpage_disallowed)
+- 		max_level = PT_PAGE_TABLE_LEVEL;
++ 		max_level = PG_LEVEL_4K;
+  
+ +	level = mapping_level(vcpu, gfn, &max_level);
+ +	if (level > PT_PAGE_TABLE_LEVEL)
+ +		gfn &= ~(KVM_PAGES_PER_HPAGE(level) - 1);
+ +
+  	if (fast_page_fault(vcpu, gpa, error_code))
+  		return RET_PF_RETRY;
+  
+@@@ -5611,9 -5561,23 +5669,26 @@@ void kvm_mmu_invpcid_gva(struct kvm_vcp
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_invpcid_gva);
+  
+ -void kvm_configure_mmu(bool enable_tdp, int tdp_page_level)
+ +void kvm_configure_mmu(bool enable_tdp)
+  {
+  	tdp_enabled = enable_tdp;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * max_page_level reflects the capabilities of KVM's MMU irrespective
++ 	 * of kernel support, e.g. KVM may be capable of using 1GB pages when
++ 	 * the kernel is not.  But, KVM never creates a page size greater than
++ 	 * what is used by the kernel for any given HVA, i.e. the kernel's
++ 	 * capabilities are ultimately consulted by kvm_mmu_hugepage_adjust().
++ 	 */
++ 	if (tdp_enabled)
++ 		max_page_level = tdp_page_level;
++ 	else if (boot_cpu_has(X86_FEATURE_GBPAGES))
++ 		max_page_level = PG_LEVEL_1G;
++ 	else
++ 		max_page_level = PG_LEVEL_2M;
+++>>>>>>> 3bae0459bcd5 (KVM: x86/mmu: Drop KVM's hugepage enums in favor of the kernel's enums)
+  }
+  EXPORT_SYMBOL_GPL(kvm_configure_mmu);
+  
+diff --cc arch/x86/kvm/svm/svm.c
+index 16a059812b69,4c808cc059f1..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -1467,7 -888,7 +1467,11 @@@ static __init int svm_hardware_setup(vo
+  	if (npt_enabled && !npt)
+  		npt_enabled = false;
+  
+++<<<<<<< HEAD
+ +	kvm_configure_mmu(npt_enabled);
+++=======
++ 	kvm_configure_mmu(npt_enabled, PG_LEVEL_1G);
+++>>>>>>> 3bae0459bcd5 (KVM: x86/mmu: Drop KVM's hugepage enums in favor of the kernel's enums)
+  	pr_info("kvm: Nested Paging %sabled\n", npt_enabled ? "en" : "dis");
+  
+  	if (nrips) {
+diff --cc arch/x86/kvm/vmx/vmx.c
+index d3ab0cabbd21,30faae51573d..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -7797,7 -8007,16 +7797,20 @@@ static __init int hardware_setup(void
+  
+  	if (enable_ept)
+  		vmx_enable_tdp();
+++<<<<<<< HEAD
+ +	kvm_configure_mmu(enable_ept);
+++=======
++ 
++ 	if (!enable_ept)
++ 		ept_lpage_level = 0;
++ 	else if (cpu_has_vmx_ept_1g_page())
++ 		ept_lpage_level = PG_LEVEL_1G;
++ 	else if (cpu_has_vmx_ept_2m_page())
++ 		ept_lpage_level = PG_LEVEL_2M;
++ 	else
++ 		ept_lpage_level = PG_LEVEL_4K;
++ 	kvm_configure_mmu(enable_ept, ept_lpage_level);
+++>>>>>>> 3bae0459bcd5 (KVM: x86/mmu: Drop KVM's hugepage enums in favor of the kernel's enums)
+  
+  	/*
+  	 * Only enable PML when hardware supports PML feature, and both EPT
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 932995a9037d..ccf53030bb79 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -108,14 +108,8 @@
+ #define UNMAPPED_GVA (~(gpa_t)0)
+ 
+ /* KVM Hugepage definitions for x86 */
+-enum {
+-	PT_PAGE_TABLE_LEVEL   = 1,
+-	PT_DIRECTORY_LEVEL    = 2,
+-	PT_PDPE_LEVEL         = 3,
+-};
+-#define KVM_MAX_HUGEPAGE_LEVEL	PT_PDPE_LEVEL
+-#define KVM_NR_PAGE_SIZES	(KVM_MAX_HUGEPAGE_LEVEL - \
+-				 PT_PAGE_TABLE_LEVEL + 1)
++#define KVM_MAX_HUGEPAGE_LEVEL	PG_LEVEL_1G
++#define KVM_NR_PAGE_SIZES	(KVM_MAX_HUGEPAGE_LEVEL - PG_LEVEL_4K + 1)
+ #define KVM_HPAGE_GFN_SHIFT(x)	(((x) - 1) * 9)
+ #define KVM_HPAGE_SHIFT(x)	(PAGE_SHIFT + KVM_HPAGE_GFN_SHIFT(x))
+ #define KVM_HPAGE_SIZE(x)	(1UL << KVM_HPAGE_SHIFT(x))
+@@ -124,7 +118,7 @@ enum {
+ 
+ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
+ {
+-	/* KVM_HPAGE_GFN_SHIFT(PT_PAGE_TABLE_LEVEL) must be 0. */
++	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
+ 	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
+ 		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
+ }
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/page_track.c b/arch/x86/kvm/mmu/page_track.c
+index cff8b3d56e0c..865cca03c9c0 100644
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@ -64,7 +64,7 @@ static void update_gfn_track(struct kvm_memory_slot *slot, gfn_t gfn,
+ {
+ 	int index, val;
+ 
+-	index = gfn_to_index(gfn, slot->base_gfn, PT_PAGE_TABLE_LEVEL);
++	index = gfn_to_index(gfn, slot->base_gfn, PG_LEVEL_4K);
+ 
+ 	val = slot->arch.gfn_track[mode][index];
+ 
+@@ -154,7 +154,7 @@ bool kvm_page_track_is_active(struct kvm_vcpu *vcpu, gfn_t gfn,
+ 	if (!slot)
+ 		return false;
+ 
+-	index = gfn_to_index(gfn, slot->base_gfn, PT_PAGE_TABLE_LEVEL);
++	index = gfn_to_index(gfn, slot->base_gfn, PG_LEVEL_4K);
+ 	return !!READ_ONCE(slot->arch.gfn_track[mode][index]);
+ }
+ 
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index 27067dfd36d9..533eb53bcd26 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -78,7 +78,7 @@
+ #define PT_GUEST_ACCESSED_MASK (1 << PT_GUEST_ACCESSED_SHIFT)
+ 
+ #define gpte_to_gfn_lvl FNAME(gpte_to_gfn_lvl)
+-#define gpte_to_gfn(pte) gpte_to_gfn_lvl((pte), PT_PAGE_TABLE_LEVEL)
++#define gpte_to_gfn(pte) gpte_to_gfn_lvl((pte), PG_LEVEL_4K)
+ 
+ /*
+  * The guest_walker structure emulates the behavior of the hardware page
+@@ -201,7 +201,7 @@ static bool FNAME(prefetch_invalid_gpte)(struct kvm_vcpu *vcpu,
+ 	    !(gpte & PT_GUEST_ACCESSED_MASK))
+ 		goto no_present;
+ 
+-	if (FNAME(is_rsvd_bits_set)(vcpu->arch.mmu, gpte, PT_PAGE_TABLE_LEVEL))
++	if (FNAME(is_rsvd_bits_set)(vcpu->arch.mmu, gpte, PG_LEVEL_4K))
+ 		goto no_present;
+ 
+ 	return false;
+@@ -439,7 +439,7 @@ static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+ 	gfn = gpte_to_gfn_lvl(pte, walker->level);
+ 	gfn += (addr & PT_LVL_OFFSET_MASK(walker->level)) >> PAGE_SHIFT;
+ 
+-	if (PTTYPE == 32 && walker->level > PT_PAGE_TABLE_LEVEL && is_cpuid_PSE36())
++	if (PTTYPE == 32 && walker->level > PG_LEVEL_4K && is_cpuid_PSE36())
+ 		gfn += pse36_gfn_delta(pte);
+ 
+ 	real_gpa = mmu->translate_gpa(vcpu, gfn_to_gpa(gfn), access, &walker->fault);
+@@ -555,7 +555,7 @@ FNAME(prefetch_gpte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 	 * we call mmu_set_spte() with host_writable = true because
+ 	 * pte_prefetch_gfn_to_pfn always gets a writable pfn.
+ 	 */
+-	mmu_set_spte(vcpu, spte, pte_access, 0, PT_PAGE_TABLE_LEVEL, gfn, pfn,
++	mmu_set_spte(vcpu, spte, pte_access, 0, PG_LEVEL_4K, gfn, pfn,
+ 		     true, true);
+ 
+ 	kvm_release_pfn_clean(pfn);
+@@ -578,7 +578,7 @@ static bool FNAME(gpte_changed)(struct kvm_vcpu *vcpu,
+ 	u64 mask;
+ 	int r, index;
+ 
+-	if (level == PT_PAGE_TABLE_LEVEL) {
++	if (level == PG_LEVEL_4K) {
+ 		mask = PTE_PREFETCH_NUM * sizeof(pt_element_t) - 1;
+ 		base_gpa = pte_gpa & ~mask;
+ 		index = (pte_gpa - base_gpa) / sizeof(pt_element_t);
+@@ -603,7 +603,7 @@ static void FNAME(pte_prefetch)(struct kvm_vcpu *vcpu, struct guest_walker *gw,
+ 
+ 	sp = page_header(__pa(sptep));
+ 
+-	if (sp->role.level > PT_PAGE_TABLE_LEVEL)
++	if (sp->role.level > PG_LEVEL_4K)
+ 		return;
+ 
+ 	if (sp->role.direct)
+@@ -840,7 +840,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gpa_t addr, u32 error_code,
+ 	      &walker, user_fault, &vcpu->arch.write_fault_to_shadow_pgtable);
+ 
+ 	if (lpage_disallowed || is_self_change_mapping)
+-		max_level = PT_PAGE_TABLE_LEVEL;
++		max_level = PG_LEVEL_4K;
+ 	else
+ 		max_level = walker.level;
+ 
+@@ -900,7 +900,7 @@ static gpa_t FNAME(get_level1_sp_gpa)(struct kvm_mmu_page *sp)
+ {
+ 	int offset = 0;
+ 
+-	WARN_ON(sp->role.level != PT_PAGE_TABLE_LEVEL);
++	WARN_ON(sp->role.level != PG_LEVEL_4K);
+ 
+ 	if (PTTYPE == 32)
+ 		offset = sp->role.quadrant << PT64_LEVEL_BITS;
+@@ -1086,7 +1086,7 @@ static int FNAME(sync_page)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+ 		host_writable = sp->spt[i] & SPTE_HOST_WRITEABLE;
+ 
+ 		set_spte_ret |= set_spte(vcpu, &sp->spt[i],
+-					 pte_access, PT_PAGE_TABLE_LEVEL,
++					 pte_access, PG_LEVEL_4K,
+ 					 gfn, spte_to_pfn(sp->spt[i]),
+ 					 true, false, host_writable);
+ 	}
+diff --git a/arch/x86/kvm/mmu_audit.c b/arch/x86/kvm/mmu_audit.c
+index abac7e208853..4554c2164463 100644
+--- a/arch/x86/kvm/mmu_audit.c
++++ b/arch/x86/kvm/mmu_audit.c
+@@ -103,7 +103,7 @@ static void audit_mappings(struct kvm_vcpu *vcpu, u64 *sptep, int level)
+ 	sp = page_header(__pa(sptep));
+ 
+ 	if (sp->unsync) {
+-		if (level != PT_PAGE_TABLE_LEVEL) {
++		if (level != PG_LEVEL_4K) {
+ 			audit_printk(vcpu->kvm, "unsync sp: %p "
+ 				     "level = %d\n", sp, level);
+ 			return;
+@@ -179,7 +179,7 @@ static void check_mappings_rmap(struct kvm *kvm, struct kvm_mmu_page *sp)
+ {
+ 	int i;
+ 
+-	if (sp->role.level != PT_PAGE_TABLE_LEVEL)
++	if (sp->role.level != PG_LEVEL_4K)
+ 		return;
+ 
+ 	for (i = 0; i < PT64_ENT_PER_PAGE; ++i) {
+@@ -203,7 +203,7 @@ static void audit_write_protection(struct kvm *kvm, struct kvm_mmu_page *sp)
+ 
+ 	slots = kvm_memslots_for_spte_role(kvm, sp->role);
+ 	slot = __gfn_to_memslot(slots, sp->gfn);
+-	rmap_head = __gfn_to_rmap(sp->gfn, PT_PAGE_TABLE_LEVEL, slot);
++	rmap_head = __gfn_to_rmap(sp->gfn, PG_LEVEL_4K, slot);
+ 
+ 	for_each_rmap_spte(rmap_head, &iter, sptep) {
+ 		if (is_writable_pte(*sptep))
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 12e08a32ea3b..e3fb188359ec 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9892,7 +9892,7 @@ static void kvm_mmu_slot_apply_flags(struct kvm *kvm,
+ {
+ 	/* Still write protect RO slot */
+ 	if (new->flags & KVM_MEM_READONLY) {
+-		kvm_mmu_slot_remove_write_access(kvm, new, PT_PAGE_TABLE_LEVEL);
++		kvm_mmu_slot_remove_write_access(kvm, new, PG_LEVEL_4K);
+ 		return;
+ 	}
+ 
+@@ -9932,7 +9932,7 @@ static void kvm_mmu_slot_apply_flags(struct kvm *kvm,
+ 		} else {
+ 			int level =
+ 				kvm_dirty_log_manual_protect_and_init_set(kvm) ?
+-				PT_DIRECTORY_LEVEL : PT_PAGE_TABLE_LEVEL;
++				PG_LEVEL_2M : PG_LEVEL_4K;
+ 
+ 			/*
+ 			 * If we're with initial-all-set, we don't need
