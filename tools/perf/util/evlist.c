@@ -35,6 +35,8 @@
 #include <linux/err.h>
 #include <linux/zalloc.h>
 
+#include <internal/xyarray.h>
+
 #ifdef LACKS_SIGQUEUE_PROTOTYPE
 int sigqueue(pid_t pid, int sig, const union sigval value);
 #endif
