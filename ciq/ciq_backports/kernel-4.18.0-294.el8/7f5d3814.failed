@@ -1,0 +1,540 @@
+new primitive: __fs_parse()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 7f5d38141e309bb4ba995d9726928af85a299c50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7f5d3814.failed
+
+fs_parse() analogue taking p_log instead of fs_context.
+fs_parse() turned into a wrapper, callers in ceph_common and rbd
+switched to __fs_parse().
+
+As the result, fs_parse() never gets NULL fs_context and neither
+do fs_context-based logging primitives
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 7f5d38141e309bb4ba995d9726928af85a299c50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/rbd.c
+#	fs/fs_parser.c
+#	include/linux/fs_context.h
+#	include/linux/fs_parser.h
+#	net/ceph/ceph_common.c
+diff --cc drivers/block/rbd.c
+index ea25974ec267,47e82f076a12..000000000000
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@@ -6393,6 -6348,118 +6393,121 @@@ static inline char *dup_token(const cha
+  	return dup;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rbd_parse_param(struct fs_parameter *param,
++ 			    struct rbd_parse_opts_ctx *pctx)
++ {
++ 	struct rbd_options *opt = pctx->opts;
++ 	struct fs_parse_result result;
++ 	struct p_log log = {.prefix = "rbd"};
++ 	int token, ret;
++ 
++ 	ret = ceph_parse_param(param, pctx->copts, NULL);
++ 	if (ret != -ENOPARAM)
++ 		return ret;
++ 
++ 	token = __fs_parse(&log, &rbd_parameters, param, &result);
++ 	dout("%s fs_parse '%s' token %d\n", __func__, param->key, token);
++ 	if (token < 0) {
++ 		if (token == -ENOPARAM)
++ 			return inval_plog(&log, "Unknown parameter '%s'",
++ 					  param->key);
++ 		return token;
++ 	}
++ 
++ 	switch (token) {
++ 	case Opt_queue_depth:
++ 		if (result.uint_32 < 1)
++ 			goto out_of_range;
++ 		opt->queue_depth = result.uint_32;
++ 		break;
++ 	case Opt_alloc_size:
++ 		if (result.uint_32 < SECTOR_SIZE)
++ 			goto out_of_range;
++ 		if (!is_power_of_2(result.uint_32))
++ 			return inval_plog(&log, "alloc_size must be a power of 2");
++ 		opt->alloc_size = result.uint_32;
++ 		break;
++ 	case Opt_lock_timeout:
++ 		/* 0 is "wait forever" (i.e. infinite timeout) */
++ 		if (result.uint_32 > INT_MAX / 1000)
++ 			goto out_of_range;
++ 		opt->lock_timeout = msecs_to_jiffies(result.uint_32 * 1000);
++ 		break;
++ 	case Opt_pool_ns:
++ 		kfree(pctx->spec->pool_ns);
++ 		pctx->spec->pool_ns = param->string;
++ 		param->string = NULL;
++ 		break;
++ 	case Opt_read_only:
++ 		opt->read_only = true;
++ 		break;
++ 	case Opt_read_write:
++ 		opt->read_only = false;
++ 		break;
++ 	case Opt_lock_on_read:
++ 		opt->lock_on_read = true;
++ 		break;
++ 	case Opt_exclusive:
++ 		opt->exclusive = true;
++ 		break;
++ 	case Opt_notrim:
++ 		opt->trim = false;
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	return 0;
++ 
++ out_of_range:
++ 	return inval_plog(&log, "%s out of range", param->key);
++ }
++ 
++ /*
++  * This duplicates most of generic_parse_monolithic(), untying it from
++  * fs_context and skipping standard superblock and security options.
++  */
++ static int rbd_parse_options(char *options, struct rbd_parse_opts_ctx *pctx)
++ {
++ 	char *key;
++ 	int ret = 0;
++ 
++ 	dout("%s '%s'\n", __func__, options);
++ 	while ((key = strsep(&options, ",")) != NULL) {
++ 		if (*key) {
++ 			struct fs_parameter param = {
++ 				.key	= key,
++ 				.type	= fs_value_is_flag,
++ 			};
++ 			char *value = strchr(key, '=');
++ 			size_t v_len = 0;
++ 
++ 			if (value) {
++ 				if (value == key)
++ 					continue;
++ 				*value++ = 0;
++ 				v_len = strlen(value);
++ 				param.string = kmemdup_nul(value, v_len,
++ 							   GFP_KERNEL);
++ 				if (!param.string)
++ 					return -ENOMEM;
++ 				param.type = fs_value_is_string;
++ 			}
++ 			param.size = v_len;
++ 
++ 			ret = rbd_parse_param(&param, pctx);
++ 			kfree(param.string);
++ 			if (ret)
++ 				break;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 7f5d38141e30 (new primitive: __fs_parse())
+  /*
+   * Parse the options provided for an "rbd add" (i.e., rbd image
+   * mapping) request.  These arrive via a write to /sys/bus/rbd/add,
+diff --cc net/ceph/ceph_common.c
+index 47dc7ae211b5,9f8bc962985d..000000000000
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@@ -370,242 -382,159 +370,270 @@@ out
+  	return err;
+  }
+  
+ -int ceph_parse_mon_ips(const char *buf, size_t len, struct ceph_options *opt,
+ -		       struct fs_context *fc)
+ +struct ceph_options *
+ +ceph_parse_options(char *options, const char *dev_name,
+ +			const char *dev_name_end,
+ +			int (*parse_extra_token)(char *c, void *private),
+ +			void *private)
+  {
+ -	struct p_log log = {.prefix = "libceph", .log = fc ? fc->log : NULL};
+ -	int ret;
+ +	struct ceph_options *opt;
+ +	const char *c;
+ +	int err = -ENOMEM;
+ +	substring_t argstr[MAX_OPT_ARGS];
+ +
+ +	opt = kzalloc(sizeof(*opt), GFP_KERNEL);
+ +	if (!opt)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	opt->crush_locs = RB_ROOT;
+ +	opt->mon_addr = kcalloc(CEPH_MAX_MON, sizeof(*opt->mon_addr),
+ +				GFP_KERNEL);
+ +	if (!opt->mon_addr)
+ +		goto out;
+  
+ +	dout("parse_options %p options '%s' dev_name '%s'\n", opt, options,
+ +	     dev_name);
+ +
+ +	/* start with defaults */
+ +	opt->flags = CEPH_OPT_DEFAULT;
+ +	opt->osd_keepalive_timeout = CEPH_OSD_KEEPALIVE_DEFAULT;
+ +	opt->mount_timeout = CEPH_MOUNT_TIMEOUT_DEFAULT;
+ +	opt->osd_idle_ttl = CEPH_OSD_IDLE_TTL_DEFAULT;
+ +	opt->osd_request_timeout = CEPH_OSD_REQUEST_TIMEOUT_DEFAULT;
+ +	opt->read_from_replica = CEPH_READ_FROM_REPLICA_DEFAULT;
+ +
+ +	/* get mon ip(s) */
+  	/* ip1[:port1][,ip2[:port2]...] */
+ -	ret = ceph_parse_ips(buf, buf + len, opt->mon_addr, CEPH_MAX_MON,
+ -			     &opt->num_mon);
+ -	if (ret) {
+ -		error_plog(&log, "Failed to parse monitor IPs: %d", ret);
+ -		return ret;
+ -	}
+ +	err = ceph_parse_ips(dev_name, dev_name_end, opt->mon_addr,
+ +			     CEPH_MAX_MON, &opt->num_mon);
+ +	if (err < 0)
+ +		goto out;
+  
+++<<<<<<< HEAD
+ +	/* parse mount options */
+ +	while ((c = strsep(&options, ",")) != NULL) {
+ +		int token, intval;
+ +		if (!*c)
+ +			continue;
+ +		err = -EINVAL;
+ +		token = match_token((char *)c, opt_tokens, argstr);
+ +		if (token < 0 && parse_extra_token) {
+ +			/* extra? */
+ +			err = parse_extra_token((char *)c, private);
+ +			if (err < 0) {
+ +				pr_err("bad option at '%s'\n", c);
+ +				goto out;
+ +			}
+ +			continue;
+++=======
++ 	return 0;
++ }
++ EXPORT_SYMBOL(ceph_parse_mon_ips);
++ 
++ int ceph_parse_param(struct fs_parameter *param, struct ceph_options *opt,
++ 		     struct fs_context *fc)
++ {
++ 	struct fs_parse_result result;
++ 	int token, err;
++ 	struct p_log log = {.prefix = "libceph", .log = fc ? fc->log : NULL};
++ 
++ 	token = __fs_parse(&log, &ceph_parameters, param, &result);
++ 	dout("%s fs_parse '%s' token %d\n", __func__, param->key, token);
++ 	if (token < 0)
++ 		return token;
++ 
++ 	switch (token) {
++ 	case Opt_ip:
++ 		err = ceph_parse_ips(param->string,
++ 				     param->string + param->size,
++ 				     &opt->my_addr,
++ 				     1, NULL);
++ 		if (err) {
++ 			error_plog(&log, "Failed to parse ip: %d", err);
++ 			return err;
+++>>>>>>> 7f5d38141e30 (new primitive: __fs_parse())
+  		}
+ -		opt->flags |= CEPH_OPT_MYIP;
+ -		break;
+ -
+ -	case Opt_fsid:
+ -		err = parse_fsid(param->string, &opt->fsid);
+ -		if (err) {
+ -			error_plog(&log, "Failed to parse fsid: %d", err);
+ -			return err;
+ +		if (token < Opt_last_int) {
+ +			err = match_int(&argstr[0], &intval);
+ +			if (err < 0) {
+ +				pr_err("bad option arg (not int) at '%s'\n", c);
+ +				goto out;
+ +			}
+ +			dout("got int token %d val %d\n", token, intval);
+ +		} else if (token > Opt_last_int && token < Opt_last_string) {
+ +			dout("got string token %d val %s\n", token,
+ +			     argstr[0].from);
+ +		} else {
+ +			dout("got token %d\n", token);
+  		}
+ -		opt->flags |= CEPH_OPT_FSID;
+ -		break;
+ -	case Opt_name:
+ -		kfree(opt->name);
+ -		opt->name = param->string;
+ -		param->string = NULL;
+ -		break;
+ -	case Opt_secret:
+ -		ceph_crypto_key_destroy(opt->key);
+ -		kfree(opt->key);
+ +		switch (token) {
+ +		case Opt_ip:
+ +			err = ceph_parse_ips(argstr[0].from,
+ +					     argstr[0].to,
+ +					     &opt->my_addr,
+ +					     1, NULL);
+ +			if (err < 0)
+ +				goto out;
+ +			opt->flags |= CEPH_OPT_MYIP;
+ +			break;
+  
+ -		opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ -		if (!opt->key)
+ -			return -ENOMEM;
+ -		err = ceph_crypto_key_unarmor(opt->key, param->string);
+ -		if (err) {
+ -			error_plog(&log, "Failed to parse secret: %d", err);
+ -			return err;
+ -		}
+ -		break;
+ -	case Opt_key:
+ -		ceph_crypto_key_destroy(opt->key);
+ -		kfree(opt->key);
+ +		case Opt_fsid:
+ +			err = parse_fsid(argstr[0].from, &opt->fsid);
+ +			if (err == 0)
+ +				opt->flags |= CEPH_OPT_FSID;
+ +			break;
+ +		case Opt_name:
+ +			kfree(opt->name);
+ +			opt->name = kstrndup(argstr[0].from,
+ +					      argstr[0].to-argstr[0].from,
+ +					      GFP_KERNEL);
+ +			if (!opt->name) {
+ +				err = -ENOMEM;
+ +				goto out;
+ +			}
+ +			break;
+ +		case Opt_secret:
+ +			ceph_crypto_key_destroy(opt->key);
+ +			kfree(opt->key);
+ +
+ +		        opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ +			if (!opt->key) {
+ +				err = -ENOMEM;
+ +				goto out;
+ +			}
+ +			err = ceph_crypto_key_unarmor(opt->key, argstr[0].from);
+ +			if (err < 0)
+ +				goto out;
+ +			break;
+ +		case Opt_key:
+ +			ceph_crypto_key_destroy(opt->key);
+ +			kfree(opt->key);
+ +
+ +		        opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ +			if (!opt->key) {
+ +				err = -ENOMEM;
+ +				goto out;
+ +			}
+ +			err = get_secret(opt->key, argstr[0].from);
+ +			if (err < 0)
+ +				goto out;
+ +			break;
+ +		case Opt_crush_location:
+ +			ceph_clear_crush_locs(&opt->crush_locs);
+ +			err = ceph_parse_crush_location(argstr[0].from,
+ +							&opt->crush_locs);
+ +			if (err) {
+ +				pr_err("failed to parse CRUSH location: %d\n",
+ +				       err);
+ +				goto out;
+ +			}
+ +			break;
+ +		case Opt_read_from_replica:
+ +			if (!strcmp(argstr[0].from, "no")) {
+ +				opt->read_from_replica = 0;
+ +			} else if (!strcmp(argstr[0].from, "balance")) {
+ +				opt->read_from_replica = CEPH_OSD_FLAG_BALANCE_READS;
+ +			} else if (!strcmp(argstr[0].from, "localize")) {
+ +				opt->read_from_replica = CEPH_OSD_FLAG_LOCALIZE_READS;
+ +			} else {
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			break;
+ +
+ +			/* misc */
+ +		case Opt_osdtimeout:
+ +			pr_warn("ignoring deprecated osdtimeout option\n");
+ +			break;
+ +		case Opt_osdkeepalivetimeout:
+ +			/* 0 isn't well defined right now, reject it */
+ +			if (intval < 1 || intval > INT_MAX / 1000) {
+ +				pr_err("osdkeepalive out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->osd_keepalive_timeout =
+ +					msecs_to_jiffies(intval * 1000);
+ +			break;
+ +		case Opt_osd_idle_ttl:
+ +			/* 0 isn't well defined right now, reject it */
+ +			if (intval < 1 || intval > INT_MAX / 1000) {
+ +				pr_err("osd_idle_ttl out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->osd_idle_ttl = msecs_to_jiffies(intval * 1000);
+ +			break;
+ +		case Opt_mount_timeout:
+ +			/* 0 is "wait forever" (i.e. infinite timeout) */
+ +			if (intval < 0 || intval > INT_MAX / 1000) {
+ +				pr_err("mount_timeout out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->mount_timeout = msecs_to_jiffies(intval * 1000);
+ +			break;
+ +		case Opt_osd_request_timeout:
+ +			/* 0 is "wait forever" (i.e. infinite timeout) */
+ +			if (intval < 0 || intval > INT_MAX / 1000) {
+ +				pr_err("osd_request_timeout out of range\n");
+ +				err = -EINVAL;
+ +				goto out;
+ +			}
+ +			opt->osd_request_timeout = msecs_to_jiffies(intval * 1000);
+ +			break;
+  
+ -		opt->key = kzalloc(sizeof(*opt->key), GFP_KERNEL);
+ -		if (!opt->key)
+ -			return -ENOMEM;
+ -		return get_secret(opt->key, param->string, &log);
+ -
+ -	case Opt_osdtimeout:
+ -		warn_plog(&log, "Ignoring osdtimeout");
+ -		break;
+ -	case Opt_osdkeepalivetimeout:
+ -		/* 0 isn't well defined right now, reject it */
+ -		if (result.uint_32 < 1 || result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->osd_keepalive_timeout =
+ -		    msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ -	case Opt_osd_idle_ttl:
+ -		/* 0 isn't well defined right now, reject it */
+ -		if (result.uint_32 < 1 || result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->osd_idle_ttl = msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ -	case Opt_mount_timeout:
+ -		/* 0 is "wait forever" (i.e. infinite timeout) */
+ -		if (result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->mount_timeout = msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ -	case Opt_osd_request_timeout:
+ -		/* 0 is "wait forever" (i.e. infinite timeout) */
+ -		if (result.uint_32 > INT_MAX / 1000)
+ -			goto out_of_range;
+ -		opt->osd_request_timeout =
+ -		    msecs_to_jiffies(result.uint_32 * 1000);
+ -		break;
+ -
+ -	case Opt_share:
+ -		if (!result.negated)
+ +		case Opt_share:
+  			opt->flags &= ~CEPH_OPT_NOSHARE;
+ -		else
+ +			break;
+ +		case Opt_noshare:
+  			opt->flags |= CEPH_OPT_NOSHARE;
+ -		break;
+ -	case Opt_crc:
+ -		if (!result.negated)
+ +			break;
+ +
+ +		case Opt_crc:
+  			opt->flags &= ~CEPH_OPT_NOCRC;
+ -		else
+ +			break;
+ +		case Opt_nocrc:
+  			opt->flags |= CEPH_OPT_NOCRC;
+ -		break;
+ -	case Opt_cephx_require_signatures:
+ -		if (!result.negated)
+ +			break;
+ +
+ +		case Opt_cephx_require_signatures:
+  			opt->flags &= ~CEPH_OPT_NOMSGAUTH;
+ -		else
+ +			break;
+ +		case Opt_nocephx_require_signatures:
+  			opt->flags |= CEPH_OPT_NOMSGAUTH;
+ -		break;
+ -	case Opt_cephx_sign_messages:
+ -		if (!result.negated)
+ +			break;
+ +		case Opt_cephx_sign_messages:
+  			opt->flags &= ~CEPH_OPT_NOMSGSIGN;
+ -		else
+ +			break;
+ +		case Opt_nocephx_sign_messages:
+  			opt->flags |= CEPH_OPT_NOMSGSIGN;
+ -		break;
+ -	case Opt_tcp_nodelay:
+ -		if (!result.negated)
+ +			break;
+ +
+ +		case Opt_tcp_nodelay:
+  			opt->flags |= CEPH_OPT_TCP_NODELAY;
+ -		else
+ +			break;
+ +		case Opt_notcp_nodelay:
+  			opt->flags &= ~CEPH_OPT_TCP_NODELAY;
+ -		break;
+ +			break;
+  
+ -	case Opt_abort_on_full:
+ -		opt->flags |= CEPH_OPT_ABORT_ON_FULL;
+ -		break;
+ +		case Opt_abort_on_full:
+ +			opt->flags |= CEPH_OPT_ABORT_ON_FULL;
+ +			break;
+  
+ -	default:
+ -		BUG();
+ +		default:
+ +			BUG_ON(token);
+ +		}
+  	}
+  
+ -	return 0;
+ +	/* success */
+ +	return opt;
+  
+ -out_of_range:
+ -	return inval_plog(&log, "%s out of range", param->key);
+ +out:
+ +	ceph_destroy_options(opt);
+ +	return ERR_PTR(err);
+  }
+ -EXPORT_SYMBOL(ceph_parse_param);
+ +EXPORT_SYMBOL(ceph_parse_options);
+  
+  int ceph_print_client_options(struct seq_file *m, struct ceph_client *client,
+  			      bool show_all)
+* Unmerged path fs/fs_parser.c
+* Unmerged path include/linux/fs_context.h
+* Unmerged path include/linux/fs_parser.h
+* Unmerged path drivers/block/rbd.c
+* Unmerged path fs/fs_parser.c
+* Unmerged path include/linux/fs_context.h
+* Unmerged path include/linux/fs_parser.h
+* Unmerged path net/ceph/ceph_common.c
