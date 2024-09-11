@@ -1298,7 +1298,7 @@ err1:
 	return err;
 }
 
-int rxe_unregister_device(struct rxe_dev *rxe)
+void rxe_unregister_device(struct rxe_dev *rxe)
 {
 	int i;
 	struct ib_device *dev = &rxe->ib_dev;
@@ -1307,6 +1307,4 @@ int rxe_unregister_device(struct rxe_dev *rxe)
 		device_remove_file(&dev->dev, rxe_dev_attributes[i]);
 
 	ib_unregister_device(dev);
-
-	return 0;
 }
