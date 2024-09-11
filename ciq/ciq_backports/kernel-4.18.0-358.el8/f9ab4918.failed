@@ -1,0 +1,91 @@
+blk-mq: Use llist_head for blk_cpu_done
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit f9ab49184af093f0bf6c0e6583f5b25da2c09ff5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f9ab4918.failed
+
+With llist_head it is possible to avoid the locking (the irq-off region)
+when items are added. This makes it possible to add items on a remote
+CPU without additional locking.
+llist_add() returns true if the list was previously empty. This can be
+used to invoke the SMP function call / raise sofirq only if the first
+item was added (otherwise it is already pending).
+This simplifies the code a little and reduces the IRQ-off regions.
+
+blk_mq_raise_softirq() needs a preempt-disable section to ensure the
+request is enqueued on the same CPU as the softirq is raised.
+Some callers (USB-storage) invoke this path in preemptible context.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f9ab49184af093f0bf6c0e6583f5b25da2c09ff5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index c901d11906e8,463de2981df8..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -39,9 -41,7 +39,13 @@@
+  #include "blk-mq-sched.h"
+  #include "blk-rq-qos.h"
+  
+++<<<<<<< HEAD
+ +static enum cpuhp_state blk_mq_online;
+ +
+ +static DEFINE_PER_CPU(struct list_head, blk_cpu_done);
+++=======
++ static DEFINE_PER_CPU(struct llist_head, blk_cpu_done);
+++>>>>>>> f9ab49184af0 (blk-mq: Use llist_head for blk_cpu_done)
+  
+  static void blk_mq_poll_stats_start(struct request_queue *q);
+  static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+@@@ -668,17 -654,15 +657,26 @@@ bool blk_mq_complete_request_remote(str
+  		return false;
+  
+  	if (blk_mq_complete_need_ipi(rq)) {
+++<<<<<<< HEAD
+ +		rq->csd.func = __blk_mq_complete_request_remote;
+ +		rq->csd.info = rq;
+ +		rq->csd.flags = 0;
+ +		smp_call_function_single_async(rq->mq_ctx->cpu, &rq->csd);
+ +	} else {
+ +		if (rq->q->nr_hw_queues > 1)
+ +			return false;
+ +		blk_mq_trigger_softirq(rq);
+++=======
++ 		blk_mq_complete_send_ipi(rq);
++ 		return true;
+++>>>>>>> f9ab49184af0 (blk-mq: Use llist_head for blk_cpu_done)
+  	}
+  
+- 	return true;
++ 	if (rq->q->nr_hw_queues == 1) {
++ 		blk_mq_raise_softirq(rq);
++ 		return true;
++ 	}
++ 	return false;
+  }
+  EXPORT_SYMBOL_GPL(blk_mq_complete_request_remote);
+  
+* Unmerged path block/blk-mq.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index a64dfa63d799..ddb1d7852063 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -164,7 +164,7 @@ struct request {
+ 	 */
+ 	union {
+ 		struct hlist_node hash;	/* merge hash */
+-		struct list_head ipi_list;
++		struct llist_node ipi_list;
+ 	};
+ 
+ 	/*
