@@ -1,0 +1,512 @@
+block: add a bdev_kobj helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8d65269fe8065fee889bca5b204d711b0695a8f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/8d65269f.failed
+
+Add a little helper to find the kobject for a struct block_device.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Coly Li <colyli@suse.de>		[bcache]
+	Acked-by: David Sterba <dsterba@suse.com>	[btrfs]
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 8d65269fe8065fee889bca5b204d711b0695a8f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/bcache/super.c
+#	fs/btrfs/sysfs.c
+diff --cc drivers/md/bcache/super.c
+index fab4f47eb41b,a6a5e21e4fd1..000000000000
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@@ -2085,7 -2341,7 +2084,11 @@@ static int register_cache(struct cache_
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (kobject_add(&ca->kobj, &part_to_dev(bdev->bd_part)->kobj, "bcache")) {
+++=======
++ 	if (kobject_add(&ca->kobj, bdev_kobj(bdev), "bcache")) {
+++>>>>>>> 8d65269fe806 (block: add a bdev_kobj helper)
+  		err = "error calling kobject_add";
+  		ret = -ENOMEM;
+  		goto out;
+diff --cc fs/btrfs/sysfs.c
+index 4a4e960c7c66,24b6c6dc6900..000000000000
+--- a/fs/btrfs/sysfs.c
++++ b/fs/btrfs/sysfs.c
+@@@ -715,80 -1105,338 +715,195 @@@ static void init_feature_attrs(void
+  	}
+  }
+  
+ -/*
+ - * Create a sysfs entry for a given block group type at path
+ - * /sys/fs/btrfs/UUID/allocation/data/TYPE
+ - */
+ -void btrfs_sysfs_add_block_group_type(struct btrfs_block_group *cache)
+ -{
+ -	struct btrfs_fs_info *fs_info = cache->fs_info;
+ -	struct btrfs_space_info *space_info = cache->space_info;
+ -	struct raid_kobject *rkobj;
+ -	const int index = btrfs_bg_flags_to_raid_index(cache->flags);
+ -	unsigned int nofs_flag;
+ -	int ret;
+ -
+ -	/*
+ -	 * Setup a NOFS context because kobject_add(), deep in its call chain,
+ -	 * does GFP_KERNEL allocations, and we are often called in a context
+ -	 * where if reclaim is triggered we can deadlock (we are either holding
+ -	 * a transaction handle or some lock required for a transaction
+ -	 * commit).
+ -	 */
+ -	nofs_flag = memalloc_nofs_save();
+ -
+ -	rkobj = kzalloc(sizeof(*rkobj), GFP_NOFS);
+ -	if (!rkobj) {
+ -		memalloc_nofs_restore(nofs_flag);
+ -		btrfs_warn(cache->fs_info,
+ -				"couldn't alloc memory for raid level kobject");
+ -		return;
+ -	}
+ -
+ -	rkobj->flags = cache->flags;
+ -	kobject_init(&rkobj->kobj, &btrfs_raid_ktype);
+ -
+ -	/*
+ -	 * We call this either on mount, or if we've created a block group for a
+ -	 * new index type while running (i.e. when restriping).  The running
+ -	 * case is tricky because we could race with other threads, so we need
+ -	 * to have this check to make sure we didn't already init the kobject.
+ -	 *
+ -	 * We don't have to protect on the free side because it only happens on
+ -	 * unmount.
+ -	 */
+ -	spin_lock(&space_info->lock);
+ -	if (space_info->block_group_kobjs[index]) {
+ -		spin_unlock(&space_info->lock);
+ -		kobject_put(&rkobj->kobj);
+ -		return;
+ -	} else {
+ -		space_info->block_group_kobjs[index] = &rkobj->kobj;
+ -	}
+ -	spin_unlock(&space_info->lock);
+ -
+ -	ret = kobject_add(&rkobj->kobj, &space_info->kobj, "%s",
+ -			  btrfs_bg_type_to_raid_name(rkobj->flags));
+ -	memalloc_nofs_restore(nofs_flag);
+ -	if (ret) {
+ -		spin_lock(&space_info->lock);
+ -		space_info->block_group_kobjs[index] = NULL;
+ -		spin_unlock(&space_info->lock);
+ -		kobject_put(&rkobj->kobj);
+ -		btrfs_warn(fs_info,
+ -			"failed to add kobject for block cache, ignoring");
+ -		return;
+ -	}
+ -}
+ -
+ -/*
+ - * Remove sysfs directories for all block group types of a given space info and
+ - * the space info as well
+ - */
+ -void btrfs_sysfs_remove_space_info(struct btrfs_space_info *space_info)
+ -{
+ -	int i;
+ -
+ -	for (i = 0; i < BTRFS_NR_RAID_TYPES; i++) {
+ -		struct kobject *kobj;
+ -
+ -		kobj = space_info->block_group_kobjs[i];
+ -		space_info->block_group_kobjs[i] = NULL;
+ -		if (kobj) {
+ -			kobject_del(kobj);
+ -			kobject_put(kobj);
+ -		}
+ -	}
+ -	kobject_del(&space_info->kobj);
+ -	kobject_put(&space_info->kobj);
+ -}
+ -
+ -static const char *alloc_name(u64 flags)
+ -{
+ -	switch (flags) {
+ -	case BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_DATA:
+ -		return "mixed";
+ -	case BTRFS_BLOCK_GROUP_METADATA:
+ -		return "metadata";
+ -	case BTRFS_BLOCK_GROUP_DATA:
+ -		return "data";
+ -	case BTRFS_BLOCK_GROUP_SYSTEM:
+ -		return "system";
+ -	default:
+ -		WARN_ON(1);
+ -		return "invalid-combination";
+ -	};
+ -}
+ +/* when one_device is NULL, it removes all device links */
+  
+ -/*
+ - * Create a sysfs entry for a space info type at path
+ - * /sys/fs/btrfs/UUID/allocation/TYPE
+ - */
+ -int btrfs_sysfs_add_space_info_type(struct btrfs_fs_info *fs_info,
+ -				    struct btrfs_space_info *space_info)
+ -{
+ -	int ret;
+ -
+ -	ret = kobject_init_and_add(&space_info->kobj, &space_info_ktype,
+ -				   fs_info->space_info_kobj, "%s",
+ -				   alloc_name(space_info->flags));
+ -	if (ret) {
+ -		kobject_put(&space_info->kobj);
+ -		return ret;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -void btrfs_sysfs_remove_device(struct btrfs_device *device)
+ +int btrfs_sysfs_rm_device_link(struct btrfs_fs_devices *fs_devices,
+ +		struct btrfs_device *one_device)
+  {
+++<<<<<<< HEAD
+ +	struct hd_struct *disk;
+ +	struct kobject *disk_kobj;
+++=======
++ 	struct kobject *devices_kobj;
+++>>>>>>> 8d65269fe806 (block: add a bdev_kobj helper)
+  
+ -	/*
+ -	 * Seed fs_devices devices_kobj aren't used, fetch kobject from the
+ -	 * fs_info::fs_devices.
+ -	 */
+ -	devices_kobj = device->fs_info->fs_devices->devices_kobj;
+ -	ASSERT(devices_kobj);
+ +	if (!fs_devices->device_dir_kobj)
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (one_device && one_device->bdev) {
+ +		disk = one_device->bdev->bd_part;
+ +		disk_kobj = &part_to_dev(disk)->kobj;
+++=======
++ 	if (device->bdev)
++ 		sysfs_remove_link(devices_kobj, bdev_kobj(device->bdev)->name);
++ 
++ 	if (device->devid_kobj.state_initialized) {
++ 		kobject_del(&device->devid_kobj);
++ 		kobject_put(&device->devid_kobj);
++ 		wait_for_completion(&device->kobj_unregister);
++ 	}
++ }
++ 
++ static ssize_t btrfs_devinfo_in_fs_metadata_show(struct kobject *kobj,
++ 					         struct kobj_attribute *a,
++ 					         char *buf)
++ {
++ 	int val;
++ 	struct btrfs_device *device = container_of(kobj, struct btrfs_device,
++ 						   devid_kobj);
++ 
++ 	val = !!test_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state);
++ 
++ 	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
++ }
++ BTRFS_ATTR(devid, in_fs_metadata, btrfs_devinfo_in_fs_metadata_show);
++ 
++ static ssize_t btrfs_devinfo_missing_show(struct kobject *kobj,
++ 					struct kobj_attribute *a, char *buf)
++ {
++ 	int val;
++ 	struct btrfs_device *device = container_of(kobj, struct btrfs_device,
++ 						   devid_kobj);
++ 
++ 	val = !!test_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);
++ 
++ 	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
++ }
++ BTRFS_ATTR(devid, missing, btrfs_devinfo_missing_show);
++ 
++ static ssize_t btrfs_devinfo_replace_target_show(struct kobject *kobj,
++ 					         struct kobj_attribute *a,
++ 					         char *buf)
++ {
++ 	int val;
++ 	struct btrfs_device *device = container_of(kobj, struct btrfs_device,
++ 						   devid_kobj);
++ 
++ 	val = !!test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);
++ 
++ 	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
++ }
++ BTRFS_ATTR(devid, replace_target, btrfs_devinfo_replace_target_show);
++ 
++ static ssize_t btrfs_devinfo_writeable_show(struct kobject *kobj,
++ 					    struct kobj_attribute *a, char *buf)
++ {
++ 	int val;
++ 	struct btrfs_device *device = container_of(kobj, struct btrfs_device,
++ 						   devid_kobj);
++ 
++ 	val = !!test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);
++ 
++ 	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
++ }
++ BTRFS_ATTR(devid, writeable, btrfs_devinfo_writeable_show);
++ 
++ static struct attribute *devid_attrs[] = {
++ 	BTRFS_ATTR_PTR(devid, in_fs_metadata),
++ 	BTRFS_ATTR_PTR(devid, missing),
++ 	BTRFS_ATTR_PTR(devid, replace_target),
++ 	BTRFS_ATTR_PTR(devid, writeable),
++ 	NULL
++ };
++ ATTRIBUTE_GROUPS(devid);
++ 
++ static void btrfs_release_devid_kobj(struct kobject *kobj)
++ {
++ 	struct btrfs_device *device = container_of(kobj, struct btrfs_device,
++ 						   devid_kobj);
++ 
++ 	memset(&device->devid_kobj, 0, sizeof(struct kobject));
++ 	complete(&device->kobj_unregister);
++ }
++ 
++ static struct kobj_type devid_ktype = {
++ 	.sysfs_ops	= &kobj_sysfs_ops,
++ 	.default_groups = devid_groups,
++ 	.release	= btrfs_release_devid_kobj,
++ };
++ 
++ int btrfs_sysfs_add_device(struct btrfs_device *device)
++ {
++ 	int ret;
++ 	unsigned int nofs_flag;
++ 	struct kobject *devices_kobj;
++ 	struct kobject *devinfo_kobj;
++ 
++ 	/*
++ 	 * Make sure we use the fs_info::fs_devices to fetch the kobjects even
++ 	 * for the seed fs_devices
++ 	 */
++ 	devices_kobj = device->fs_info->fs_devices->devices_kobj;
++ 	devinfo_kobj = device->fs_info->fs_devices->devinfo_kobj;
++ 	ASSERT(devices_kobj);
++ 	ASSERT(devinfo_kobj);
++ 
++ 	nofs_flag = memalloc_nofs_save();
++ 
++ 	if (device->bdev) {
++ 		struct kobject *disk_kobj = bdev_kobj(device->bdev);
+++>>>>>>> 8d65269fe806 (block: add a bdev_kobj helper)
+  
+ -		ret = sysfs_create_link(devices_kobj, disk_kobj, disk_kobj->name);
+ -		if (ret) {
+ -			btrfs_warn(device->fs_info,
+ -				"creating sysfs device link for devid %llu failed: %d",
+ -				device->devid, ret);
+ -			goto out;
+ -		}
+ +		sysfs_remove_link(fs_devices->device_dir_kobj,
+ +						disk_kobj->name);
+  	}
+  
+ -	init_completion(&device->kobj_unregister);
+ -	ret = kobject_init_and_add(&device->devid_kobj, &devid_ktype,
+ -				   devinfo_kobj, "%llu", device->devid);
+ -	if (ret) {
+ -		kobject_put(&device->devid_kobj);
+ -		btrfs_warn(device->fs_info,
+ -			   "devinfo init for devid %llu failed: %d",
+ -			   device->devid, ret);
+ +	if (one_device)
+ +		return 0;
+ +
+ +	list_for_each_entry(one_device,
+ +			&fs_devices->devices, dev_list) {
+ +		if (!one_device->bdev)
+ +			continue;
+ +		disk = one_device->bdev->bd_part;
+ +		disk_kobj = &part_to_dev(disk)->kobj;
+ +
+ +		sysfs_remove_link(fs_devices->device_dir_kobj,
+ +						disk_kobj->name);
+  	}
+  
+ -out:
+ -	memalloc_nofs_restore(nofs_flag);
+ -	return ret;
+ +	return 0;
+  }
+  
+ -static int btrfs_sysfs_add_fs_devices(struct btrfs_fs_devices *fs_devices)
+ +int btrfs_sysfs_add_device(struct btrfs_fs_devices *fs_devs)
+  {
+ -	int ret;
+ -	struct btrfs_device *device;
+ -	struct btrfs_fs_devices *seed;
+ -
+ -	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+ -		ret = btrfs_sysfs_add_device(device);
+ -		if (ret)
+ -			goto fail;
+ -	}
+ +	if (!fs_devs->device_dir_kobj)
+ +		fs_devs->device_dir_kobj = kobject_create_and_add("devices",
+ +						&fs_devs->fsid_kobj);
+  
+ -	list_for_each_entry(seed, &fs_devices->seed_list, seed_list) {
+ -		list_for_each_entry(device, &seed->devices, dev_list) {
+ -			ret = btrfs_sysfs_add_device(device);
+ -			if (ret)
+ -				goto fail;
+ -		}
+ -	}
+ +	if (!fs_devs->device_dir_kobj)
+ +		return -ENOMEM;
+  
+  	return 0;
+ -
+ -fail:
+ -	btrfs_sysfs_remove_fs_devices(fs_devices);
+ -	return ret;
+  }
+  
+ -void btrfs_kobject_uevent(struct block_device *bdev, enum kobject_action action)
+ +int btrfs_sysfs_add_device_link(struct btrfs_fs_devices *fs_devices,
+ +				struct btrfs_device *one_device)
+  {
+ -	int ret;
+ -
+ -	ret = kobject_uevent(&disk_to_dev(bdev->bd_disk)->kobj, action);
+ -	if (ret)
+ -		pr_warn("BTRFS: Sending event '%d' to kobject: '%s' (%p): failed\n",
+ -			action, kobject_name(&disk_to_dev(bdev->bd_disk)->kobj),
+ -			&disk_to_dev(bdev->bd_disk)->kobj);
+ -}
+ +	int error = 0;
+ +	struct btrfs_device *dev;
+  
+ -void btrfs_sysfs_update_sprout_fsid(struct btrfs_fs_devices *fs_devices)
+ +	list_for_each_entry(dev, &fs_devices->devices, dev_list) {
+ +		struct hd_struct *disk;
+ +		struct kobject *disk_kobj;
+  
+ -{
+ -	char fsid_buf[BTRFS_UUID_UNPARSED_SIZE];
+ +		if (!dev->bdev)
+ +			continue;
+  
+ -	/*
+ -	 * Sprouting changes fsid of the mounted filesystem, rename the fsid
+ -	 * directory
+ -	 */
+ -	snprintf(fsid_buf, BTRFS_UUID_UNPARSED_SIZE, "%pU", fs_devices->fsid);
+ -	if (kobject_rename(&fs_devices->fsid_kobj, fsid_buf))
+ -		btrfs_warn(fs_devices->fs_info,
+ -				"sysfs: failed to create fsid for sprout");
+ -}
+ +		if (one_device && one_device != dev)
+ +			continue;
+  
+ -void btrfs_sysfs_update_devid(struct btrfs_device *device)
+ -{
+ -	char tmp[24];
+ +		disk = dev->bdev->bd_part;
+ +		disk_kobj = &part_to_dev(disk)->kobj;
+  
+ -	snprintf(tmp, sizeof(tmp), "%llu", device->devid);
+ +		error = sysfs_create_link(fs_devices->device_dir_kobj,
+ +					  disk_kobj, disk_kobj->name);
+ +		if (error)
+ +			break;
+ +	}
+  
+ -	if (kobject_rename(&device->devid_kobj, tmp))
+ -		btrfs_warn(device->fs_devices->fs_info,
+ -			   "sysfs: failed to update devid for %llu",
+ -			   device->devid);
+ +	return error;
+  }
+  
+  /* /sys/fs/btrfs/ entry */
+* Unmerged path drivers/md/bcache/super.c
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 55bba3a9987d..77fcfcdf939b 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -2421,7 +2421,6 @@ EXPORT_SYMBOL(md_integrity_add_rdev);
+ static int bind_rdev_to_array(struct md_rdev *rdev, struct mddev *mddev)
+ {
+ 	char b[BDEVNAME_SIZE];
+-	struct kobject *ko;
+ 	int err;
+ 
+ 	/* prevent duplicates */
+@@ -2484,9 +2483,8 @@ static int bind_rdev_to_array(struct md_rdev *rdev, struct mddev *mddev)
+ 	if ((err = kobject_add(&rdev->kobj, &mddev->kobj, "dev-%s", b)))
+ 		goto fail;
+ 
+-	ko = &part_to_dev(rdev->bdev->bd_part)->kobj;
+ 	/* failure here is OK */
+-	err = sysfs_create_link(&rdev->kobj, ko, "block");
++	err = sysfs_create_link(&rdev->kobj, bdev_kobj(rdev->bdev), "block");
+ 	rdev->sysfs_state = sysfs_get_dirent_safe(rdev->kobj.sd, "state");
+ 	rdev->sysfs_unack_badblocks =
+ 		sysfs_get_dirent_safe(rdev->kobj.sd, "unacknowledged_bad_blocks");
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index f19cc879b480..db78b356d53b 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1318,7 +1318,7 @@ int bd_link_disk_holder(struct block_device *bdev, struct gendisk *disk)
+ 	holder->disk = disk;
+ 	holder->refcnt = 1;
+ 
+-	ret = add_symlink(disk->slave_dir, &part_to_dev(bdev->bd_part)->kobj);
++	ret = add_symlink(disk->slave_dir, bdev_kobj(bdev));
+ 	if (ret)
+ 		goto out_free;
+ 
+@@ -1335,7 +1335,7 @@ int bd_link_disk_holder(struct block_device *bdev, struct gendisk *disk)
+ 	goto out_unlock;
+ 
+ out_del:
+-	del_symlink(disk->slave_dir, &part_to_dev(bdev->bd_part)->kobj);
++	del_symlink(disk->slave_dir, bdev_kobj(bdev));
+ out_free:
+ 	kfree(holder);
+ out_unlock:
+@@ -1363,7 +1363,7 @@ void bd_unlink_disk_holder(struct block_device *bdev, struct gendisk *disk)
+ 	holder = bd_find_holder_disk(bdev, disk);
+ 
+ 	if (!WARN_ON_ONCE(holder == NULL) && !--holder->refcnt) {
+-		del_symlink(disk->slave_dir, &part_to_dev(bdev->bd_part)->kobj);
++		del_symlink(disk->slave_dir, bdev_kobj(bdev));
+ 		del_symlink(bdev->bd_part->holder_dir,
+ 			    &disk_to_dev(disk)->kobj);
+ 		kobject_put(bdev->bd_part->holder_dir);
+* Unmerged path fs/btrfs/sysfs.c
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 01eb143dd5ae..b99b2fc242a7 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -20,6 +20,9 @@ struct io_context;
+ struct cgroup_subsys_state;
+ typedef void (bio_end_io_t) (struct bio *);
+ 
++#define bdev_kobj(_bdev) \
++	(&part_to_dev((_bdev)->bd_part)->kobj)
++
+ /*
+  * Block error status values.  See block/blk-core:blk_errors for the details.
+  * Alpha cannot write a byte atomically, so we need to use 32-bit value.
