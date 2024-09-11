@@ -2548,7 +2548,8 @@ static int ice_vsi_cfg(struct ice_vsi *vsi)
 		if (err)
 			return err;
 	}
-	err = ice_vsi_cfg_txqs(vsi);
+
+	err = ice_vsi_cfg_lan_txqs(vsi);
 	if (!err)
 		err = ice_vsi_cfg_rxqs(vsi);
 
@@ -3042,7 +3043,8 @@ int ice_down(struct ice_vsi *vsi)
 	}
 
 	ice_vsi_dis_irq(vsi);
-	tx_err = ice_vsi_stop_tx_rings(vsi, ICE_NO_RESET, 0);
+
+	tx_err = ice_vsi_stop_lan_tx_rings(vsi, ICE_NO_RESET, 0);
 	if (tx_err)
 		netdev_err(vsi->netdev,
 			   "Failed stop Tx rings, VSI %d error %d\n",
