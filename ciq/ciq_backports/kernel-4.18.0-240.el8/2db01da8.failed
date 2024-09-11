@@ -1,0 +1,144 @@
+s390/qdio: fill SBALEs with absolute addresses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 2db01da8d25f0420c411e788a9e1ba39269ae37b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2db01da8.failed
+
+sbale->addr holds an absolute address (or for some FCP usage, an opaque
+request ID), and should only be used with proper virt/phys translation.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 2db01da8d25f0420c411e788a9e1ba39269ae37b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 467baa41e746,03935466265c..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5078,14 -5288,14 +5079,19 @@@ next_packet
+  		element++;
+  		offset = 0;
+  	}
+ +	*hdr = element->addr + offset;
+  
+++<<<<<<< HEAD
+ +	offset += sizeof(struct qeth_hdr);
+++=======
++ 	hdr = phys_to_virt(element->addr) + offset;
++ 	offset += sizeof(*hdr);
+++>>>>>>> 2db01da8d25f (s390/qdio: fill SBALEs with absolute addresses)
+  	skb = NULL;
+  
+ -	switch (hdr->hdr.l2.id) {
+ +	switch ((*hdr)->hdr.l2.id) {
+  	case QETH_HEADER_TYPE_LAYER2:
+ -		skb_len = hdr->hdr.l2.pkt_length;
+ +		skb_len = (*hdr)->hdr.l2.pkt_length;
+  		linear_len = ETH_HLEN;
+  		headroom = 0;
+  		break;
+diff --git a/arch/s390/include/asm/qdio.h b/arch/s390/include/asm/qdio.h
+index 998e78112c7d..cbdf8af21d14 100644
+--- a/arch/s390/include/asm/qdio.h
++++ b/arch/s390/include/asm/qdio.h
+@@ -203,7 +203,7 @@ struct slib {
+  * @scount: SBAL count
+  * @sflags: whole SBAL flags
+  * @length: length
+- * @addr: address
++ * @addr: absolute data address
+ */
+ struct qdio_buffer_element {
+ 	u8 eflags;
+@@ -213,7 +213,7 @@ struct qdio_buffer_element {
+ 	u8 scount;
+ 	u8 sflags;
+ 	u32 length;
+-	void *addr;
++	u64 addr;
+ } __attribute__ ((packed, aligned(16)));
+ 
+ /**
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/scsi/zfcp_fsf.c b/drivers/s390/scsi/zfcp_fsf.c
+index aaa4066c5699..dc624a211c58 100644
+--- a/drivers/s390/scsi/zfcp_fsf.c
++++ b/drivers/s390/scsi/zfcp_fsf.c
+@@ -2414,7 +2414,7 @@ void zfcp_fsf_reqid_check(struct zfcp_qdio *qdio, int sbal_idx)
+ 	for (idx = 0; idx < QDIO_MAX_ELEMENTS_PER_BUFFER; idx++) {
+ 
+ 		sbale = &sbal->element[idx];
+-		req_id = (unsigned long) sbale->addr;
++		req_id = sbale->addr;
+ 		fsf_req = zfcp_reqlist_find_rm(adapter->req_list, req_id);
+ 
+ 		if (!fsf_req) {
+diff --git a/drivers/s390/scsi/zfcp_qdio.c b/drivers/s390/scsi/zfcp_qdio.c
+index f7222b89ae66..d7f784d7d077 100644
+--- a/drivers/s390/scsi/zfcp_qdio.c
++++ b/drivers/s390/scsi/zfcp_qdio.c
+@@ -98,7 +98,7 @@ static void zfcp_qdio_int_resp(struct ccw_device *cdev, unsigned int qdio_err,
+ 			memset(pl, 0,
+ 			       ZFCP_QDIO_MAX_SBALS_PER_REQ * sizeof(void *));
+ 			sbale = qdio->res_q[idx]->element;
+-			req_id = (u64) sbale->addr;
++			req_id = sbale->addr;
+ 			scount = min(sbale->scount + 1,
+ 				     ZFCP_QDIO_MAX_SBALS_PER_REQ + 1);
+ 				     /* incl. signaling SBAL */
+@@ -200,7 +200,7 @@ int zfcp_qdio_sbals_from_sg(struct zfcp_qdio *qdio, struct zfcp_qdio_req *q_req,
+ 					     q_req->sbal_number);
+ 			return -EINVAL;
+ 		}
+-		sbale->addr = sg_virt(sg);
++		sbale->addr = sg_phys(sg);
+ 		sbale->length = sg->length;
+ 	}
+ 	return 0;
+@@ -419,7 +419,7 @@ int zfcp_qdio_open(struct zfcp_qdio *qdio)
+ 		sbale->length = 0;
+ 		sbale->eflags = SBAL_EFLAGS_LAST_ENTRY;
+ 		sbale->sflags = 0;
+-		sbale->addr = NULL;
++		sbale->addr = 0;
+ 	}
+ 
+ 	if (do_QDIO(cdev, QDIO_FLAG_SYNC_INPUT, 0, 0, QDIO_MAX_BUFFERS_PER_Q))
+diff --git a/drivers/s390/scsi/zfcp_qdio.h b/drivers/s390/scsi/zfcp_qdio.h
+index 886c662cc154..f230e02b8463 100644
+--- a/drivers/s390/scsi/zfcp_qdio.h
++++ b/drivers/s390/scsi/zfcp_qdio.h
+@@ -120,14 +120,14 @@ void zfcp_qdio_req_init(struct zfcp_qdio *qdio, struct zfcp_qdio_req *q_req,
+ 					% QDIO_MAX_BUFFERS_PER_Q;
+ 
+ 	sbale = zfcp_qdio_sbale_req(qdio, q_req);
+-	sbale->addr = (void *) req_id;
++	sbale->addr = req_id;
+ 	sbale->eflags = 0;
+ 	sbale->sflags = SBAL_SFLAGS0_COMMAND | sbtype;
+ 
+ 	if (unlikely(!data))
+ 		return;
+ 	sbale++;
+-	sbale->addr = data;
++	sbale->addr = virt_to_phys(data);
+ 	sbale->length = len;
+ }
+ 
+@@ -148,7 +148,7 @@ void zfcp_qdio_fill_next(struct zfcp_qdio *qdio, struct zfcp_qdio_req *q_req,
+ 	BUG_ON(q_req->sbale_curr == qdio->max_sbale_per_sbal - 1);
+ 	q_req->sbale_curr++;
+ 	sbale = zfcp_qdio_sbale_curr(qdio, q_req);
+-	sbale->addr = data;
++	sbale->addr = virt_to_phys(data);
+ 	sbale->length = len;
+ }
+ 
