@@ -1,0 +1,158 @@
+netfilter: nf_tables: allow to specify stateful expression in set definition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 65038428b2c6c5be79d3f78a6b79c0cdc3a58a41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/65038428.failed
+
+This patch allows users to specify the stateful expression for the
+elements in this set via NFTA_SET_EXPR. This new feature allows you to
+turn on counters for all of the elements in this set.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 65038428b2c6c5be79d3f78a6b79c0cdc3a58a41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 13b98da99069,f1910cd795fd..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3715,13 -3652,11 +3716,12 @@@ static int nf_tables_fill_set(struct sk
+  			goto nla_put_failure;
+  	}
+  
+ -	if (nla_put(skb, NFTA_SET_USERDATA, set->udlen, set->udata))
+ +	if (set->udata &&
+ +	    nla_put(skb, NFTA_SET_USERDATA, set->udlen, set->udata))
+  		goto nla_put_failure;
+  
+- 	desc = nla_nest_start_noflag(skb, NFTA_SET_DESC);
+- 
+- 	if (desc == NULL)
++ 	nest = nla_nest_start_noflag(skb, NFTA_SET_DESC);
++ 	if (!nest)
+  		goto nla_put_failure;
+  	if (set->size &&
+  	    nla_put_be32(skb, NFTA_SET_DESC_SIZE, htonl(set->size)))
+@@@ -4183,21 -4135,27 +4201,33 @@@ static int nf_tables_newset(struct net 
+  	table->use++;
+  	return 0;
+  
+- err4:
++ err_set_trans:
+  	ops->destroy(set);
+- err3:
++ err_set_init:
++ 	if (expr)
++ 		nft_expr_destroy(&ctx, expr);
++ err_set_alloc_name:
+  	kfree(set->name);
+- err2:
++ err_set_name:
+  	kvfree(set);
+ +err1:
+ +	module_put(to_set_type(ops)->owner);
+  	return err;
+  }
+  
+  static void nft_set_destroy(const struct nft_ctx *ctx, struct nft_set *set)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (WARN_ON(set->use > 0))
++ 		return;
++ 
++ 	if (set->expr)
++ 		nft_expr_destroy(ctx, set->expr);
++ 
+++>>>>>>> 65038428b2c6 (netfilter: nf_tables: allow to specify stateful expression in set definition)
+  	set->ops->destroy(set);
+ +	module_put(to_set_type(set->ops)->owner);
+  	kfree(set->name);
+  	kvfree(set);
+  }
+@@@ -5000,6 -4991,35 +5030,38 @@@ static int nft_add_set_elem(struct nft_
+  		timeout = set->timeout;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	expiration = 0;
++ 	if (nla[NFTA_SET_ELEM_EXPIRATION] != NULL) {
++ 		if (!(set->flags & NFT_SET_TIMEOUT))
++ 			return -EINVAL;
++ 		err = nf_msecs_to_jiffies64(nla[NFTA_SET_ELEM_EXPIRATION],
++ 					    &expiration);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	if (nla[NFTA_SET_ELEM_EXPR] != NULL) {
++ 		expr = nft_set_elem_expr_alloc(ctx, set,
++ 					       nla[NFTA_SET_ELEM_EXPR]);
++ 		if (IS_ERR(expr))
++ 			return PTR_ERR(expr);
++ 
++ 		err = -EOPNOTSUPP;
++ 		if (set->expr && set->expr->ops != expr->ops)
++ 			goto err_set_elem_expr;
++ 	} else if (set->expr) {
++ 		expr = kzalloc(set->expr->ops->size, GFP_KERNEL);
++ 		if (!expr)
++ 			return -ENOMEM;
++ 
++ 		err = nft_expr_clone(expr, set->expr);
++ 		if (err < 0)
++ 			goto err_set_elem_expr;
++ 	}
++ 
+++>>>>>>> 65038428b2c6 (netfilter: nf_tables: allow to specify stateful expression in set definition)
+  	err = nft_setelem_parse_key(ctx, set, &elem.key.val,
+  				    nla[NFTA_SET_ELEM_KEY]);
+  	if (err < 0)
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 4256c4e85870..1b5cf9dcd36a 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -416,6 +416,7 @@ void nft_unregister_set(struct nft_set_type *type);
+  *	@policy: set parameterization (see enum nft_set_policies)
+  *	@udlen: user data length
+  *	@udata: user data
++ *	@expr: stateful expression
+  * 	@ops: set ops
+  * 	@flags: set flags
+  *	@genmask: generation mask
+@@ -443,6 +444,7 @@ struct nft_set {
+ 	u16				policy;
+ 	u16				udlen;
+ 	unsigned char			*udata;
++	struct nft_expr			*expr;
+ 	/* runtime data below here */
+ 	const struct nft_set_ops	*ops ____cacheline_aligned;
+ 	u16				flags:14,
+diff --git a/include/uapi/linux/netfilter/nf_tables.h b/include/uapi/linux/netfilter/nf_tables.h
+index 0e84aea666bb..ee379b81c303 100644
+--- a/include/uapi/linux/netfilter/nf_tables.h
++++ b/include/uapi/linux/netfilter/nf_tables.h
+@@ -343,6 +343,7 @@ enum nft_set_field_attributes {
+  * @NFTA_SET_USERDATA: user data (NLA_BINARY)
+  * @NFTA_SET_OBJ_TYPE: stateful object type (NLA_U32: NFT_OBJECT_*)
+  * @NFTA_SET_HANDLE: set handle (NLA_U64)
++ * @NFTA_SET_EXPR: set expression (NLA_NESTED: nft_expr_attributes)
+  */
+ enum nft_set_attributes {
+ 	NFTA_SET_UNSPEC,
+@@ -362,6 +363,7 @@ enum nft_set_attributes {
+ 	NFTA_SET_PAD,
+ 	NFTA_SET_OBJ_TYPE,
+ 	NFTA_SET_HANDLE,
++	NFTA_SET_EXPR,
+ 	__NFTA_SET_MAX
+ };
+ #define NFTA_SET_MAX		(__NFTA_SET_MAX - 1)
+* Unmerged path net/netfilter/nf_tables_api.c
