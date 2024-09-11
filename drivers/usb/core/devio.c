@@ -2137,6 +2137,9 @@ static int proc_ioctl(struct usb_dev_state *ps, struct usbdevfs_ioctl *ctl)
 	if (ps->privileges_dropped)
 		return -EACCES;
 
+	if (!connected(ps))
+		return -ENODEV;
+
 	/* alloc buffer */
 	size = _IOC_SIZE(ctl->ioctl_code);
 	if (size > 0) {
@@ -2151,11 +2154,6 @@ static int proc_ioctl(struct usb_dev_state *ps, struct usbdevfs_ioctl *ctl)
 		} else {
 			memset(buf, 0, size);
 		}
-	}
-
-	if (!connected(ps)) {
-		kfree(buf);
-		return -ENODEV;
 	}
 
 	if (ps->dev->state != USB_STATE_CONFIGURED)
