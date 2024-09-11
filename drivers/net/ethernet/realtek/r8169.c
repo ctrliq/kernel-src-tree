@@ -655,7 +655,6 @@ struct rtl8169_private {
 	struct clk *clk;
 
 	void (*hw_start)(struct rtl8169_private *tp);
-	bool (*tso_csum)(struct rtl8169_private *, struct sk_buff *, u32 *);
 
 	struct {
 		DECLARE_BITMAP(flags, RTL_FLAG_MAX);
@@ -5779,8 +5778,7 @@ static int msdn_giant_send_check(struct sk_buff *skb)
 	return ret;
 }
 
-static bool rtl8169_tso_csum_v1(struct rtl8169_private *tp,
-				struct sk_buff *skb, u32 *opts)
+static void rtl8169_tso_csum_v1(struct sk_buff *skb, u32 *opts)
 {
 	u32 mss = skb_shinfo(skb)->gso_size;
 
@@ -5797,8 +5795,6 @@ static bool rtl8169_tso_csum_v1(struct rtl8169_private *tp,
 		else
 			WARN_ON_ONCE(1);
 	}
-
-	return true;
 }
 
 static bool rtl8169_tso_csum_v2(struct rtl8169_private *tp,
@@ -5888,6 +5884,18 @@ static bool rtl_tx_slots_avail(struct rtl8169_private *tp,
 	return slots_avail > nr_frags;
 }
 
+/* Versions RTL8102e and from RTL8168c onwards support csum_v2 */
+static bool rtl_chip_supports_csum_v2(struct rtl8169_private *tp)
+{
+	switch (tp->mac_version) {
+	case RTL_GIGA_MAC_VER_02 ... RTL_GIGA_MAC_VER_06:
+	case RTL_GIGA_MAC_VER_10 ... RTL_GIGA_MAC_VER_17:
+		return false;
+	default:
+		return true;
+	}
+}
+
 static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 				      struct net_device *dev)
 {
@@ -5910,9 +5918,13 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 	opts[1] = cpu_to_le32(rtl8169_tx_vlan_tag(skb));
 	opts[0] = DescOwn;
 
-	if (!tp->tso_csum(tp, skb, opts)) {
-		r8169_csum_workaround(tp, skb);
-		return NETDEV_TX_OK;
+	if (rtl_chip_supports_csum_v2(tp)) {
+		if (!rtl8169_tso_csum_v2(tp, skb, opts)) {
+			r8169_csum_workaround(tp, skb);
+			return NETDEV_TX_OK;
+		}
+	} else {
+		rtl8169_tso_csum_v1(skb, opts);
 	}
 
 	len = skb_headlen(skb);
@@ -6950,18 +6962,6 @@ static void rtl_hw_initialize(struct rtl8169_private *tp)
 	}
 }
 
-/* Versions RTL8102e and from RTL8168c onwards support csum_v2 */
-static bool rtl_chip_supports_csum_v2(struct rtl8169_private *tp)
-{
-	switch (tp->mac_version) {
-	case RTL_GIGA_MAC_VER_02 ... RTL_GIGA_MAC_VER_06:
-	case RTL_GIGA_MAC_VER_10 ... RTL_GIGA_MAC_VER_17:
-		return false;
-	default:
-		return true;
-	}
-}
-
 static int rtl_jumbo_max(struct rtl8169_private *tp)
 {
 	/* Non-GBit versions don't support jumbo frames */
@@ -7157,12 +7157,8 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		/* Disallow toggling */
 		dev->hw_features &= ~NETIF_F_HW_VLAN_CTAG_RX;
 
-	if (rtl_chip_supports_csum_v2(tp)) {
-		tp->tso_csum = rtl8169_tso_csum_v2;
+	if (rtl_chip_supports_csum_v2(tp))
 		dev->hw_features |= NETIF_F_IPV6_CSUM | NETIF_F_TSO6;
-	} else {
-		tp->tso_csum = rtl8169_tso_csum_v1;
-	}
 
 	dev->hw_features |= NETIF_F_RXALL;
 	dev->hw_features |= NETIF_F_RXFCS;
