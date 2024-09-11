@@ -1,0 +1,245 @@
+nvmet: add error log support for file backend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit c6aa3542e01026a94d24713ee2c0dce517e9b6de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c6aa3542.failed
+
+This patch adds support for the file backend to populate the
+error log entries. Here we map the errno to the NVMe status codes.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit c6aa3542e01026a94d24713ee2c0dce517e9b6de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/core.c
+#	drivers/nvme/target/io-cmd-file.c
+diff --cc drivers/nvme/target/core.c
+index 628b8f0276bd,cc81d0231587..000000000000
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@@ -40,6 -41,48 +40,51 @@@ static DEFINE_IDA(cntlid_ida)
+   */
+  DECLARE_RWSEM(nvmet_config_sem);
+  
+++<<<<<<< HEAD
+++=======
++ u32 nvmet_ana_group_enabled[NVMET_MAX_ANAGRPS + 1];
++ u64 nvmet_ana_chgcnt;
++ DECLARE_RWSEM(nvmet_ana_sem);
++ 
++ inline u16 errno_to_nvme_status(struct nvmet_req *req, int errno)
++ {
++ 	u16 status;
++ 
++ 	switch (errno) {
++ 	case -ENOSPC:
++ 		req->error_loc = offsetof(struct nvme_rw_command, length);
++ 		status = NVME_SC_CAP_EXCEEDED | NVME_SC_DNR;
++ 		break;
++ 	case -EREMOTEIO:
++ 		req->error_loc = offsetof(struct nvme_rw_command, slba);
++ 		status = NVME_SC_LBA_RANGE | NVME_SC_DNR;
++ 		break;
++ 	case -EOPNOTSUPP:
++ 		req->error_loc = offsetof(struct nvme_common_command, opcode);
++ 		switch (req->cmd->common.opcode) {
++ 		case nvme_cmd_dsm:
++ 		case nvme_cmd_write_zeroes:
++ 			status = NVME_SC_ONCS_NOT_SUPPORTED | NVME_SC_DNR;
++ 			break;
++ 		default:
++ 			status = NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
++ 		}
++ 		break;
++ 	case -ENODATA:
++ 		req->error_loc = offsetof(struct nvme_rw_command, nsid);
++ 		status = NVME_SC_ACCESS_DENIED;
++ 		break;
++ 	case -EIO:
++ 		/* FALLTHRU */
++ 	default:
++ 		req->error_loc = offsetof(struct nvme_common_command, opcode);
++ 		status = NVME_SC_INTERNAL | NVME_SC_DNR;
++ 	}
++ 
++ 	return status;
++ }
++ 
+++>>>>>>> c6aa3542e010 (nvmet: add error log support for file backend)
+  static struct nvmet_subsys *nvmet_find_get_subsys(struct nvmet_port *port,
+  		const char *subsysnqn);
+  
+diff --cc drivers/nvme/target/io-cmd-file.c
+index 1500690046b1,517522305e5c..000000000000
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@@ -121,11 -121,12 +122,12 @@@ static void nvmet_file_io_done(struct k
+  			mempool_free(req->f.bvec, req->ns->bvec_pool);
+  	}
+  
+- 	nvmet_req_complete(req, ret != req->data_len ?
+- 			NVME_SC_INTERNAL | NVME_SC_DNR : 0);
++ 	if (unlikely(ret != req->data_len))
++ 		status = errno_to_nvme_status(req, ret);
++ 	nvmet_req_complete(req, status);
+  }
+  
+ -static bool nvmet_file_execute_io(struct nvmet_req *req, int ki_flags)
+ +static void nvmet_file_execute_rw(struct nvmet_req *req)
+  {
+  	ssize_t nr_bvec = DIV_ROUND_UP(req->data_len, PAGE_SIZE);
+  	struct sg_page_iter sg_pg_iter;
+@@@ -142,23 -142,8 +144,28 @@@
+  
+  	pos = le64_to_cpu(req->cmd->rw.slba) << req->ns->blksize_shift;
+  	if (unlikely(pos + req->data_len > req->ns->size)) {
+++<<<<<<< HEAD
+ +		nvmet_req_complete(req, NVME_SC_LBA_RANGE | NVME_SC_DNR);
+ +		return;
+ +	}
+ +
+ +	if (nr_bvec > NVMET_MAX_INLINE_BIOVEC)
+ +		req->f.bvec = kmalloc_array(nr_bvec, sizeof(struct bio_vec),
+ +				GFP_KERNEL);
+ +	else
+ +		req->f.bvec = req->inline_bvec;
+ +
+ +	req->f.mpool_alloc = false;
+ +	if (unlikely(!req->f.bvec)) {
+ +		/* fallback under memory pressure */
+ +		req->f.bvec = mempool_alloc(req->ns->bvec_pool, GFP_KERNEL);
+ +		req->f.mpool_alloc = true;
+ +		if (nr_bvec > NVMET_MAX_MPOOL_BVEC)
+ +			is_sync = true;
+++=======
++ 		nvmet_req_complete(req, errno_to_nvme_status(req, -ENOSPC));
++ 		return true;
+++>>>>>>> c6aa3542e010 (nvmet: add error log support for file backend)
+  	}
+  
+  	memset(&req->f.iocb, 0, sizeof(struct kiocb));
+@@@ -182,15 -168,95 +189,44 @@@
+  		nr_bvec--;
+  	}
+  
+ -	if (WARN_ON_ONCE(total_len != req->data_len)) {
+ +	if (WARN_ON_ONCE(total_len != req->data_len))
+  		ret = -EIO;
+ -		goto complete;
+ -	}
+ -
+ -	if (unlikely(is_sync)) {
+ -		ret = total_len;
+ -		goto complete;
+ -	}
+ -
+ -	/*
+ -	 * A NULL ki_complete ask for synchronous execution, which we want
+ -	 * for the IOCB_NOWAIT case.
+ -	 */
+ -	if (!(ki_flags & IOCB_NOWAIT))
+ -		req->f.iocb.ki_complete = nvmet_file_io_done;
+ -
+ -	ret = nvmet_file_submit_bvec(req, pos, bv_cnt, total_len, ki_flags);
+ -
+ -	switch (ret) {
+ -	case -EIOCBQUEUED:
+ -		return true;
+ -	case -EAGAIN:
+ -		if (WARN_ON_ONCE(!(ki_flags & IOCB_NOWAIT)))
+ -			goto complete;
+ -		return false;
+ -	case -EOPNOTSUPP:
+ -		/*
+ -		 * For file systems returning error -EOPNOTSUPP, handle
+ -		 * IOCB_NOWAIT error case separately and retry without
+ -		 * IOCB_NOWAIT.
+ -		 */
+ -		if ((ki_flags & IOCB_NOWAIT))
+ -			return false;
+ -		break;
+ -	}
+ -
+ -complete:
+ -	nvmet_file_io_done(&req->f.iocb, ret, 0);
+ -	return true;
+ -}
+ -
+ -static void nvmet_file_buffered_io_work(struct work_struct *w)
+ -{
+ -	struct nvmet_req *req = container_of(w, struct nvmet_req, f.work);
+ -
+ -	nvmet_file_execute_io(req, 0);
+ -}
+ -
+ -static void nvmet_file_submit_buffered_io(struct nvmet_req *req)
+ -{
+ -	INIT_WORK(&req->f.work, nvmet_file_buffered_io_work);
+ -	queue_work(buffered_io_wq, &req->f.work);
+ -}
+ -
+ -static void nvmet_file_execute_rw(struct nvmet_req *req)
+ -{
+ -	ssize_t nr_bvec = DIV_ROUND_UP(req->data_len, PAGE_SIZE);
+ -
+ -	if (!req->sg_cnt || !nr_bvec) {
+ -		nvmet_req_complete(req, 0);
+ +out:
+ +	if (unlikely(is_sync || ret)) {
+ +		nvmet_file_io_done(&req->f.iocb, ret < 0 ? ret : total_len, 0);
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	req->f.iocb.ki_complete = nvmet_file_io_done;
+ +	nvmet_file_submit_bvec(req, pos, bv_cnt, total_len);
+++=======
++ 
++ 	if (nr_bvec > NVMET_MAX_INLINE_BIOVEC)
++ 		req->f.bvec = kmalloc_array(nr_bvec, sizeof(struct bio_vec),
++ 				GFP_KERNEL);
++ 	else
++ 		req->f.bvec = req->inline_bvec;
++ 
++ 	if (unlikely(!req->f.bvec)) {
++ 		/* fallback under memory pressure */
++ 		req->f.bvec = mempool_alloc(req->ns->bvec_pool, GFP_KERNEL);
++ 		req->f.mpool_alloc = true;
++ 	} else
++ 		req->f.mpool_alloc = false;
++ 
++ 	if (req->ns->buffered_io) {
++ 		if (likely(!req->f.mpool_alloc) &&
++ 				nvmet_file_execute_io(req, IOCB_NOWAIT))
++ 			return;
++ 		nvmet_file_submit_buffered_io(req);
++ 	} else
++ 		nvmet_file_execute_io(req, 0);
++ }
++ 
++ u16 nvmet_file_flush(struct nvmet_req *req)
++ {
++ 	return errno_to_nvme_status(req, vfs_fsync(req->ns->file, 1));
+++>>>>>>> c6aa3542e010 (nvmet: add error log support for file backend)
+  }
+  
+  static void nvmet_file_flush_work(struct work_struct *w)
+* Unmerged path drivers/nvme/target/core.c
+* Unmerged path drivers/nvme/target/io-cmd-file.c
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 79e9206ddeb8..f824b11e8a5c 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -429,4 +429,6 @@ static inline u32 nvmet_rw_len(struct nvmet_req *req)
+ 	return ((u32)le16_to_cpu(req->cmd->rw.length) + 1) <<
+ 			req->ns->blksize_shift;
+ }
++
++u16 errno_to_nvme_status(struct nvmet_req *req, int errno);
+ #endif /* _NVMET_H */
