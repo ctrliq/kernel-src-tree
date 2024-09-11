@@ -472,7 +472,7 @@ int acpi_processor_pstate_control(void)
 
 int acpi_processor_notify_smm(struct module *calling_module)
 {
-	static int is_done = 0;
+	static int is_done;
 	int result;
 
 	if (!acpi_processor_cpufreq_init)
