@@ -3138,8 +3138,10 @@ static int io_sqe_files_update(struct io_ring_ctx *ctx, void __user *arg,
 			}
 			ctx->user_files[i] = file;
 			err = io_sqe_file_register(ctx, file, i);
-			if (err)
+			if (err) {
+				fput(file);
 				break;
+			}
 		}
 		nr_args--;
 		done++;
