@@ -1,0 +1,148 @@
+kcsan: Rate-limit reporting per data races
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Marco Elver <elver@google.com>
+commit 05f9a4067964e3f864210271a6299f13d2eeea55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/05f9a406.failed
+
+KCSAN data-race reports can occur quite frequently, so much so as
+to render the system useless.  This commit therefore adds support for
+time-based rate-limiting KCSAN reports, with the time interval specified
+by a new KCSAN_REPORT_ONCE_IN_MS Kconfig option.  The default is 3000
+milliseconds, also known as three seconds.
+
+Because KCSAN must detect data races in allocators and in other contexts
+where use of allocation is ill-advised, a fixed-size array is used to
+buffer reports during each reporting interval.  To reduce the number of
+reports lost due to array overflow, this commit stores only one instance
+of duplicate reports, which has the benefit of further reducing KCSAN's
+console output rate.
+
+	Reported-by: Qian Cai <cai@lca.pw>
+	Suggested-by: Paul E. McKenney <paulmck@kernel.org>
+	Signed-off-by: Marco Elver <elver@google.com>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 05f9a4067964e3f864210271a6299f13d2eeea55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kcsan/report.c
+diff --cc kernel/kcsan/report.c
+index ead5610bafa7,b5b4feea49de..000000000000
+--- a/kernel/kcsan/report.c
++++ b/kernel/kcsan/report.c
+@@@ -22,15 -23,49 +23,49 @@@
+   * the reports, with reporting being in the slow-path.
+   */
+  static struct {
+ -	const volatile void	*ptr;
+ -	size_t			size;
+ -	int			access_type;
+ -	int			task_pid;
+ -	int			cpu_id;
+ -	unsigned long		stack_entries[NUM_STACK_ENTRIES];
+ -	int			num_stack_entries;
+ +	const volatile void *ptr;
+ +	size_t size;
+ +	bool is_write;
+ +	int task_pid;
+ +	int cpu_id;
+ +	unsigned long stack_entries[NUM_STACK_ENTRIES];
+ +	int num_stack_entries;
+  } other_info = { .ptr = NULL };
+  
++ /*
++  * Information about reported data races; used to rate limit reporting.
++  */
++ struct report_time {
++ 	/*
++ 	 * The last time the data race was reported.
++ 	 */
++ 	unsigned long time;
++ 
++ 	/*
++ 	 * The frames of the 2 threads; if only 1 thread is known, one frame
++ 	 * will be 0.
++ 	 */
++ 	unsigned long frame1;
++ 	unsigned long frame2;
++ };
++ 
++ /*
++  * Since we also want to be able to debug allocators with KCSAN, to avoid
++  * deadlock, report_times cannot be dynamically resized with krealloc in
++  * rate_limit_report.
++  *
++  * Therefore, we use a fixed-size array, which at most will occupy a page. This
++  * still adequately rate limits reports, assuming that a) number of unique data
++  * races is not excessive, and b) occurrence of unique data races within the
++  * same time window is limited.
++  */
++ #define REPORT_TIMES_MAX (PAGE_SIZE / sizeof(struct report_time))
++ #define REPORT_TIMES_SIZE                                                      \
++ 	(CONFIG_KCSAN_REPORT_ONCE_IN_MS > REPORT_TIMES_MAX ?                   \
++ 		 REPORT_TIMES_MAX :                                            \
++ 		 CONFIG_KCSAN_REPORT_ONCE_IN_MS)
++ static struct report_time report_times[REPORT_TIMES_SIZE];
++ 
+  /*
+   * This spinlock protects reporting and other_info, since other_info is usually
+   * required when reporting.
+@@@ -116,10 -218,11 +204,12 @@@ static bool print_report(const volatil
+  			 enum kcsan_report_type type)
+  {
+  	unsigned long stack_entries[NUM_STACK_ENTRIES] = { 0 };
+ -	int num_stack_entries = stack_trace_save(stack_entries, NUM_STACK_ENTRIES, 1);
+ +	int num_stack_entries =
+ +		stack_trace_save(stack_entries, NUM_STACK_ENTRIES, 1);
+  	int skipnr = get_stack_skipnr(stack_entries, num_stack_entries);
+- 	int other_skipnr;
++ 	unsigned long this_frame = stack_entries[skipnr];
++ 	unsigned long other_frame = 0;
++ 	int other_skipnr = 0; /* silence uninit warnings */
+  
+  	/*
+  	 * Must check report filter rules before starting to print.
+@@@ -130,10 -233,10 +220,16 @@@
+  	if (type == KCSAN_REPORT_RACE_SIGNAL) {
+  		other_skipnr = get_stack_skipnr(other_info.stack_entries,
+  						other_info.num_stack_entries);
++ 		other_frame = other_info.stack_entries[other_skipnr];
+  
+++<<<<<<< HEAD
+ +		/* value_change is only known for the other thread */
+ +		if (skip_report(other_info.is_write, value_change,
+ +				other_info.stack_entries[other_skipnr]))
+++=======
++ 		/* @value_change is only known for the other thread */
++ 		if (skip_report(other_info.access_type, value_change, other_frame))
+++>>>>>>> 05f9a4067964 (kcsan: Rate-limit reporting per data races)
+  			return false;
+  	}
+  
+* Unmerged path kernel/kcsan/report.c
+diff --git a/lib/Kconfig.kcsan b/lib/Kconfig.kcsan
+index 40794f884f31..22e7669bb104 100644
+--- a/lib/Kconfig.kcsan
++++ b/lib/Kconfig.kcsan
+@@ -103,6 +103,16 @@ config KCSAN_SKIP_WATCH_RANDOMIZE
+ 	  KCSAN_WATCH_SKIP. If false, the chosen value is always
+ 	  KCSAN_WATCH_SKIP.
+ 
++config KCSAN_REPORT_ONCE_IN_MS
++	int "Duration in milliseconds, in which any given data race is only reported once"
++	default 3000
++	help
++	  Any given data race is only reported once in the defined time window.
++	  Different data races may still generate reports within a duration
++	  that is smaller than the duration defined here. This allows rate
++	  limiting reporting to avoid flooding the console with reports.
++	  Setting this to 0 disables rate limiting.
++
+ # Note that, while some of the below options could be turned into boot
+ # parameters, to optimize for the common use-case, we avoid this because: (a)
+ # it would impact performance (and we want to avoid static branch for all
