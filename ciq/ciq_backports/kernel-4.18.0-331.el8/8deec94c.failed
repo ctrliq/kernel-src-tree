@@ -1,0 +1,307 @@
+net: stmmac: set IRQ affinity hint for multi MSI vectors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Ong Boon Leong <boon.leong.ong@intel.com>
+commit 8deec94c6040bb4a767f6e9456a0a44c7f2e713e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/8deec94c.failed
+
+Certain platform likes Intel mGBE has independent hardware IRQ resources
+for TX and RX DMA operation. In preparation to support XDP TX, we add IRQ
+affinity hint to group both RX and TX queue of the same queue ID to the
+same CPU.
+
+Changes in v2:
+ - IRQ affinity hint need to set to null before IRQ is released.
+   Thanks to issue reported by Song, Yoong Siang.
+
+	Reported-by: Song, Yoong Siang <yoong.siang.song@intel.com>
+	Signed-off-by: Ong Boon Leong <boon.leong.ong@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8deec94c6040bb4a767f6e9456a0a44c7f2e713e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index cdc2dcaadc73,9d63e8c365ae..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -2901,6 -2993,271 +2901,274 @@@ static void stmmac_hw_teardown(struct n
+  	clk_disable_unprepare(priv->plat->clk_ptp_ref);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void stmmac_free_irq(struct net_device *dev,
++ 			    enum request_irq_err irq_err, int irq_idx)
++ {
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	int j;
++ 
++ 	switch (irq_err) {
++ 	case REQ_IRQ_ERR_ALL:
++ 		irq_idx = priv->plat->tx_queues_to_use;
++ 		fallthrough;
++ 	case REQ_IRQ_ERR_TX:
++ 		for (j = irq_idx - 1; j >= 0; j--) {
++ 			if (priv->tx_irq[j] > 0) {
++ 				irq_set_affinity_hint(priv->tx_irq[j], NULL);
++ 				free_irq(priv->tx_irq[j], &priv->tx_queue[j]);
++ 			}
++ 		}
++ 		irq_idx = priv->plat->rx_queues_to_use;
++ 		fallthrough;
++ 	case REQ_IRQ_ERR_RX:
++ 		for (j = irq_idx - 1; j >= 0; j--) {
++ 			if (priv->rx_irq[j] > 0) {
++ 				irq_set_affinity_hint(priv->rx_irq[j], NULL);
++ 				free_irq(priv->rx_irq[j], &priv->rx_queue[j]);
++ 			}
++ 		}
++ 
++ 		if (priv->sfty_ue_irq > 0 && priv->sfty_ue_irq != dev->irq)
++ 			free_irq(priv->sfty_ue_irq, dev);
++ 		fallthrough;
++ 	case REQ_IRQ_ERR_SFTY_UE:
++ 		if (priv->sfty_ce_irq > 0 && priv->sfty_ce_irq != dev->irq)
++ 			free_irq(priv->sfty_ce_irq, dev);
++ 		fallthrough;
++ 	case REQ_IRQ_ERR_SFTY_CE:
++ 		if (priv->lpi_irq > 0 && priv->lpi_irq != dev->irq)
++ 			free_irq(priv->lpi_irq, dev);
++ 		fallthrough;
++ 	case REQ_IRQ_ERR_LPI:
++ 		if (priv->wol_irq > 0 && priv->wol_irq != dev->irq)
++ 			free_irq(priv->wol_irq, dev);
++ 		fallthrough;
++ 	case REQ_IRQ_ERR_WOL:
++ 		free_irq(dev->irq, dev);
++ 		fallthrough;
++ 	case REQ_IRQ_ERR_MAC:
++ 	case REQ_IRQ_ERR_NO:
++ 		/* If MAC IRQ request error, no more IRQ to free */
++ 		break;
++ 	}
++ }
++ 
++ static int stmmac_request_irq_multi_msi(struct net_device *dev)
++ {
++ 	enum request_irq_err irq_err = REQ_IRQ_ERR_NO;
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	cpumask_t cpu_mask;
++ 	int irq_idx = 0;
++ 	char *int_name;
++ 	int ret;
++ 	int i;
++ 
++ 	/* For common interrupt */
++ 	int_name = priv->int_name_mac;
++ 	sprintf(int_name, "%s:%s", dev->name, "mac");
++ 	ret = request_irq(dev->irq, stmmac_mac_interrupt,
++ 			  0, int_name, dev);
++ 	if (unlikely(ret < 0)) {
++ 		netdev_err(priv->dev,
++ 			   "%s: alloc mac MSI %d (error: %d)\n",
++ 			   __func__, dev->irq, ret);
++ 		irq_err = REQ_IRQ_ERR_MAC;
++ 		goto irq_error;
++ 	}
++ 
++ 	/* Request the Wake IRQ in case of another line
++ 	 * is used for WoL
++ 	 */
++ 	if (priv->wol_irq > 0 && priv->wol_irq != dev->irq) {
++ 		int_name = priv->int_name_wol;
++ 		sprintf(int_name, "%s:%s", dev->name, "wol");
++ 		ret = request_irq(priv->wol_irq,
++ 				  stmmac_mac_interrupt,
++ 				  0, int_name, dev);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: alloc wol MSI %d (error: %d)\n",
++ 				   __func__, priv->wol_irq, ret);
++ 			irq_err = REQ_IRQ_ERR_WOL;
++ 			goto irq_error;
++ 		}
++ 	}
++ 
++ 	/* Request the LPI IRQ in case of another line
++ 	 * is used for LPI
++ 	 */
++ 	if (priv->lpi_irq > 0 && priv->lpi_irq != dev->irq) {
++ 		int_name = priv->int_name_lpi;
++ 		sprintf(int_name, "%s:%s", dev->name, "lpi");
++ 		ret = request_irq(priv->lpi_irq,
++ 				  stmmac_mac_interrupt,
++ 				  0, int_name, dev);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: alloc lpi MSI %d (error: %d)\n",
++ 				   __func__, priv->lpi_irq, ret);
++ 			irq_err = REQ_IRQ_ERR_LPI;
++ 			goto irq_error;
++ 		}
++ 	}
++ 
++ 	/* Request the Safety Feature Correctible Error line in
++ 	 * case of another line is used
++ 	 */
++ 	if (priv->sfty_ce_irq > 0 && priv->sfty_ce_irq != dev->irq) {
++ 		int_name = priv->int_name_sfty_ce;
++ 		sprintf(int_name, "%s:%s", dev->name, "safety-ce");
++ 		ret = request_irq(priv->sfty_ce_irq,
++ 				  stmmac_safety_interrupt,
++ 				  0, int_name, dev);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: alloc sfty ce MSI %d (error: %d)\n",
++ 				   __func__, priv->sfty_ce_irq, ret);
++ 			irq_err = REQ_IRQ_ERR_SFTY_CE;
++ 			goto irq_error;
++ 		}
++ 	}
++ 
++ 	/* Request the Safety Feature Uncorrectible Error line in
++ 	 * case of another line is used
++ 	 */
++ 	if (priv->sfty_ue_irq > 0 && priv->sfty_ue_irq != dev->irq) {
++ 		int_name = priv->int_name_sfty_ue;
++ 		sprintf(int_name, "%s:%s", dev->name, "safety-ue");
++ 		ret = request_irq(priv->sfty_ue_irq,
++ 				  stmmac_safety_interrupt,
++ 				  0, int_name, dev);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: alloc sfty ue MSI %d (error: %d)\n",
++ 				   __func__, priv->sfty_ue_irq, ret);
++ 			irq_err = REQ_IRQ_ERR_SFTY_UE;
++ 			goto irq_error;
++ 		}
++ 	}
++ 
++ 	/* Request Rx MSI irq */
++ 	for (i = 0; i < priv->plat->rx_queues_to_use; i++) {
++ 		if (priv->rx_irq[i] == 0)
++ 			continue;
++ 
++ 		int_name = priv->int_name_rx_irq[i];
++ 		sprintf(int_name, "%s:%s-%d", dev->name, "rx", i);
++ 		ret = request_irq(priv->rx_irq[i],
++ 				  stmmac_msi_intr_rx,
++ 				  0, int_name, &priv->rx_queue[i]);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: alloc rx-%d  MSI %d (error: %d)\n",
++ 				   __func__, i, priv->rx_irq[i], ret);
++ 			irq_err = REQ_IRQ_ERR_RX;
++ 			irq_idx = i;
++ 			goto irq_error;
++ 		}
++ 		cpumask_clear(&cpu_mask);
++ 		cpumask_set_cpu(i % num_online_cpus(), &cpu_mask);
++ 		irq_set_affinity_hint(priv->rx_irq[i], &cpu_mask);
++ 	}
++ 
++ 	/* Request Tx MSI irq */
++ 	for (i = 0; i < priv->plat->tx_queues_to_use; i++) {
++ 		if (priv->tx_irq[i] == 0)
++ 			continue;
++ 
++ 		int_name = priv->int_name_tx_irq[i];
++ 		sprintf(int_name, "%s:%s-%d", dev->name, "tx", i);
++ 		ret = request_irq(priv->tx_irq[i],
++ 				  stmmac_msi_intr_tx,
++ 				  0, int_name, &priv->tx_queue[i]);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: alloc tx-%d  MSI %d (error: %d)\n",
++ 				   __func__, i, priv->tx_irq[i], ret);
++ 			irq_err = REQ_IRQ_ERR_TX;
++ 			irq_idx = i;
++ 			goto irq_error;
++ 		}
++ 		cpumask_clear(&cpu_mask);
++ 		cpumask_set_cpu(i % num_online_cpus(), &cpu_mask);
++ 		irq_set_affinity_hint(priv->tx_irq[i], &cpu_mask);
++ 	}
++ 
++ 	return 0;
++ 
++ irq_error:
++ 	stmmac_free_irq(dev, irq_err, irq_idx);
++ 	return ret;
++ }
++ 
++ static int stmmac_request_irq_single(struct net_device *dev)
++ {
++ 	enum request_irq_err irq_err = REQ_IRQ_ERR_NO;
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	int ret;
++ 
++ 	ret = request_irq(dev->irq, stmmac_interrupt,
++ 			  IRQF_SHARED, dev->name, dev);
++ 	if (unlikely(ret < 0)) {
++ 		netdev_err(priv->dev,
++ 			   "%s: ERROR: allocating the IRQ %d (error: %d)\n",
++ 			   __func__, dev->irq, ret);
++ 		irq_err = REQ_IRQ_ERR_MAC;
++ 		return ret;
++ 	}
++ 
++ 	/* Request the Wake IRQ in case of another line
++ 	 * is used for WoL
++ 	 */
++ 	if (priv->wol_irq > 0 && priv->wol_irq != dev->irq) {
++ 		ret = request_irq(priv->wol_irq, stmmac_interrupt,
++ 				  IRQF_SHARED, dev->name, dev);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: ERROR: allocating the WoL IRQ %d (%d)\n",
++ 				   __func__, priv->wol_irq, ret);
++ 			irq_err = REQ_IRQ_ERR_WOL;
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	/* Request the IRQ lines */
++ 	if (priv->lpi_irq > 0 && priv->lpi_irq != dev->irq) {
++ 		ret = request_irq(priv->lpi_irq, stmmac_interrupt,
++ 				  IRQF_SHARED, dev->name, dev);
++ 		if (unlikely(ret < 0)) {
++ 			netdev_err(priv->dev,
++ 				   "%s: ERROR: allocating the LPI IRQ %d (%d)\n",
++ 				   __func__, priv->lpi_irq, ret);
++ 			irq_err = REQ_IRQ_ERR_LPI;
++ 			goto irq_error;
++ 		}
++ 	}
++ 
++ 	return 0;
++ 
++ irq_error:
++ 	stmmac_free_irq(dev, irq_err, 0);
++ 	return ret;
++ }
++ 
++ static int stmmac_request_irq(struct net_device *dev)
++ {
++ 	struct stmmac_priv *priv = netdev_priv(dev);
++ 	int ret;
++ 
++ 	/* Request the IRQ lines */
++ 	if (priv->plat->multi_msi_en)
++ 		ret = stmmac_request_irq_multi_msi(dev);
++ 	else
++ 		ret = stmmac_request_irq_single(dev);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 8deec94c6040 (net: stmmac: set IRQ affinity hint for multi MSI vectors)
+  /**
+   *  stmmac_open - open entry point of the driver
+   *  @dev : pointer to the device structure.
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
