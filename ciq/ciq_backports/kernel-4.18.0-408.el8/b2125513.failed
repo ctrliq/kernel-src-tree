@@ -1,0 +1,346 @@
+KVM: SEV: Allow SEV intra-host migration of VM with mirrors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Peter Gonda <pgonda@google.com>
+commit b2125513dfc0dd0ec5a9605138a3c356592cfb73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/b2125513.failed
+
+For SEV-ES VMs with mirrors to be intra-host migrated they need to be
+able to migrate with the mirror. This is due to that fact that all VMSAs
+need to be added into the VM with LAUNCH_UPDATE_VMSA before
+lAUNCH_FINISH. Allowing migration with mirrors allows users of SEV-ES to
+keep the mirror VMs VMSAs during migration.
+
+Adds a list of mirror VMs for the original VM iterate through during its
+migration. During the iteration the owner pointers can be updated from
+the source to the destination. This fixes the ASID leaking issue which
+caused the blocking of migration of VMs with mirrors.
+
+	Signed-off-by: Peter Gonda <pgonda@google.com>
+	Cc: Sean Christopherson <seanjc@google.com>
+	Cc: Marc Orr <marcorr@google.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: kvm@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+Message-Id: <20220211193634.3183388-1-pgonda@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b2125513dfc0dd0ec5a9605138a3c356592cfb73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/sev.c
+#	arch/x86/kvm/svm/svm.h
+#	tools/testing/selftests/kvm/x86_64/sev_migrate_tests.c
+diff --cc arch/x86/kvm/svm/sev.c
+index dad0c7c2d1aa,789b69294d28..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -1544,7 -1545,243 +1545,247 @@@ static bool is_cmd_allowed_from_mirror(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
+++=======
++ static int sev_lock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 	int r = -EBUSY;
++ 
++ 	if (dst_kvm == src_kvm)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Bail if these VMs are already involved in a migration to avoid
++ 	 * deadlock between two VMs trying to migrate to/from each other.
++ 	 */
++ 	if (atomic_cmpxchg_acquire(&dst_sev->migration_in_progress, 0, 1))
++ 		return -EBUSY;
++ 
++ 	if (atomic_cmpxchg_acquire(&src_sev->migration_in_progress, 0, 1))
++ 		goto release_dst;
++ 
++ 	r = -EINTR;
++ 	if (mutex_lock_killable(&dst_kvm->lock))
++ 		goto release_src;
++ 	if (mutex_lock_killable_nested(&src_kvm->lock, SINGLE_DEPTH_NESTING))
++ 		goto unlock_dst;
++ 	return 0;
++ 
++ unlock_dst:
++ 	mutex_unlock(&dst_kvm->lock);
++ release_src:
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ release_dst:
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	return r;
++ }
++ 
++ static void sev_unlock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 
++ 	mutex_unlock(&dst_kvm->lock);
++ 	mutex_unlock(&src_kvm->lock);
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ }
++ 
++ 
++ static int sev_lock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i, j;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		if (mutex_lock_killable(&vcpu->mutex))
++ 			goto out_unlock;
++ 	}
++ 
++ 	return 0;
++ 
++ out_unlock:
++ 	kvm_for_each_vcpu(j, vcpu, kvm) {
++ 		if (i == j)
++ 			break;
++ 
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 	return -EINTR;
++ }
++ 
++ static void sev_unlock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ }
++ 
++ static void sev_migrate_from(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src = &to_kvm_svm(src_kvm)->sev_info;
++ 	struct kvm_sev_info *mirror;
++ 
++ 	dst->active = true;
++ 	dst->asid = src->asid;
++ 	dst->handle = src->handle;
++ 	dst->pages_locked = src->pages_locked;
++ 	dst->enc_context_owner = src->enc_context_owner;
++ 
++ 	src->asid = 0;
++ 	src->active = false;
++ 	src->handle = 0;
++ 	src->pages_locked = 0;
++ 	src->enc_context_owner = NULL;
++ 
++ 	list_cut_before(&dst->regions_list, &src->regions_list, &src->regions_list);
++ 
++ 	/*
++ 	 * If this VM has mirrors, "transfer" each mirror's refcount of the
++ 	 * source to the destination (this KVM).  The caller holds a reference
++ 	 * to the source, so there's no danger of use-after-free.
++ 	 */
++ 	list_cut_before(&dst->mirror_vms, &src->mirror_vms, &src->mirror_vms);
++ 	list_for_each_entry(mirror, &dst->mirror_vms, mirror_entry) {
++ 		kvm_get_kvm(dst_kvm);
++ 		kvm_put_kvm(src_kvm);
++ 		mirror->enc_context_owner = dst_kvm;
++ 	}
++ 
++ 	/*
++ 	 * If this VM is a mirror, remove the old mirror from the owners list
++ 	 * and add the new mirror to the list.
++ 	 */
++ 	if (is_mirroring_enc_context(dst_kvm)) {
++ 		struct kvm_sev_info *owner_sev_info =
++ 			&to_kvm_svm(dst->enc_context_owner)->sev_info;
++ 
++ 		list_del(&src->mirror_entry);
++ 		list_add_tail(&dst->mirror_entry, &owner_sev_info->mirror_vms);
++ 	}
++ }
++ 
++ static int sev_es_migrate_from(struct kvm *dst, struct kvm *src)
++ {
++ 	unsigned long i;
++ 	struct kvm_vcpu *dst_vcpu, *src_vcpu;
++ 	struct vcpu_svm *dst_svm, *src_svm;
++ 
++ 	if (atomic_read(&src->online_vcpus) != atomic_read(&dst->online_vcpus))
++ 		return -EINVAL;
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		if (!src_vcpu->arch.guest_state_protected)
++ 			return -EINVAL;
++ 	}
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		src_svm = to_svm(src_vcpu);
++ 		dst_vcpu = kvm_get_vcpu(dst, i);
++ 		dst_svm = to_svm(dst_vcpu);
++ 
++ 		/*
++ 		 * Transfer VMSA and GHCB state to the destination.  Nullify and
++ 		 * clear source fields as appropriate, the state now belongs to
++ 		 * the destination.
++ 		 */
++ 		memcpy(&dst_svm->sev_es, &src_svm->sev_es, sizeof(src_svm->sev_es));
++ 		dst_svm->vmcb->control.ghcb_gpa = src_svm->vmcb->control.ghcb_gpa;
++ 		dst_svm->vmcb->control.vmsa_pa = src_svm->vmcb->control.vmsa_pa;
++ 		dst_vcpu->arch.guest_state_protected = true;
++ 
++ 		memset(&src_svm->sev_es, 0, sizeof(src_svm->sev_es));
++ 		src_svm->vmcb->control.ghcb_gpa = INVALID_PAGE;
++ 		src_svm->vmcb->control.vmsa_pa = INVALID_PAGE;
++ 		src_vcpu->arch.guest_state_protected = false;
++ 	}
++ 	to_kvm_svm(src)->sev_info.es_active = false;
++ 	to_kvm_svm(dst)->sev_info.es_active = true;
++ 
++ 	return 0;
++ }
++ 
++ int sev_vm_move_enc_context_from(struct kvm *kvm, unsigned int source_fd)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev, *cg_cleanup_sev;
++ 	struct file *source_kvm_file;
++ 	struct kvm *source_kvm;
++ 	bool charged = false;
++ 	int ret;
++ 
++ 	source_kvm_file = fget(source_fd);
++ 	if (!file_is_kvm(source_kvm_file)) {
++ 		ret = -EBADF;
++ 		goto out_fput;
++ 	}
++ 
++ 	source_kvm = source_kvm_file->private_data;
++ 	ret = sev_lock_two_vms(kvm, source_kvm);
++ 	if (ret)
++ 		goto out_fput;
++ 
++ 	if (sev_guest(kvm) || !sev_guest(source_kvm)) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	src_sev = &to_kvm_svm(source_kvm)->sev_info;
++ 
++ 	dst_sev->misc_cg = get_current_misc_cg();
++ 	cg_cleanup_sev = dst_sev;
++ 	if (dst_sev->misc_cg != src_sev->misc_cg) {
++ 		ret = sev_misc_cg_try_charge(dst_sev);
++ 		if (ret)
++ 			goto out_dst_cgroup;
++ 		charged = true;
++ 	}
++ 
++ 	ret = sev_lock_vcpus_for_migration(kvm);
++ 	if (ret)
++ 		goto out_dst_cgroup;
++ 	ret = sev_lock_vcpus_for_migration(source_kvm);
++ 	if (ret)
++ 		goto out_dst_vcpu;
++ 
++ 	if (sev_es_guest(source_kvm)) {
++ 		ret = sev_es_migrate_from(kvm, source_kvm);
++ 		if (ret)
++ 			goto out_source_vcpu;
++ 	}
++ 
++ 	sev_migrate_from(kvm, source_kvm);
++ 	kvm_vm_dead(source_kvm);
++ 	cg_cleanup_sev = src_sev;
++ 	ret = 0;
++ 
++ out_source_vcpu:
++ 	sev_unlock_vcpus_for_migration(source_kvm);
++ out_dst_vcpu:
++ 	sev_unlock_vcpus_for_migration(kvm);
++ out_dst_cgroup:
++ 	/* Operates on the source on success, on the destination on failure.  */
++ 	if (charged)
++ 		sev_misc_cg_uncharge(cg_cleanup_sev);
++ 	put_misc_cg(cg_cleanup_sev->misc_cg);
++ 	cg_cleanup_sev->misc_cg = NULL;
++ out_unlock:
++ 	sev_unlock_two_vms(kvm, source_kvm);
++ out_fput:
++ 	if (source_kvm_file)
++ 		fput(source_kvm_file);
++ 	return ret;
++ }
++ 
++ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
+++>>>>>>> b2125513dfc0 (KVM: SEV: Allow SEV intra-host migration of VM with mirrors)
+  {
+  	struct kvm_sev_cmd sev_cmd;
+  	int r;
+@@@ -1791,9 -2028,10 +2032,13 @@@ int svm_vm_copy_asid_from(struct kvm *k
+  	 */
+  	source_sev = &to_kvm_svm(source_kvm)->sev_info;
+  	kvm_get_kvm(source_kvm);
+++<<<<<<< HEAD
+++=======
++ 	mirror_sev = &to_kvm_svm(kvm)->sev_info;
++ 	list_add_tail(&mirror_sev->mirror_entry, &source_sev->mirror_vms);
+++>>>>>>> b2125513dfc0 (KVM: SEV: Allow SEV intra-host migration of VM with mirrors)
+  
+  	/* Set enc_context_owner and copy its encryption context over */
+- 	mirror_sev = &to_kvm_svm(kvm)->sev_info;
+  	mirror_sev->enc_context_owner = source_kvm;
+  	mirror_sev->active = true;
+  	mirror_sev->asid = source_sev->asid;
+@@@ -1826,9 -2065,16 +2072,20 @@@ void sev_vm_destroy(struct kvm *kvm
+  	if (!sev_guest(kvm))
+  		return;
+  
++ 	WARN_ON(!list_empty(&sev->mirror_vms));
++ 
+  	/* If this is a mirror_kvm release the enc_context_owner and skip sev cleanup */
+  	if (is_mirroring_enc_context(kvm)) {
+++<<<<<<< HEAD
+ +		kvm_put_kvm(sev->enc_context_owner);
+++=======
++ 		struct kvm *owner_kvm = sev->enc_context_owner;
++ 
++ 		mutex_lock(&owner_kvm->lock);
++ 		list_del(&sev->mirror_entry);
++ 		mutex_unlock(&owner_kvm->lock);
++ 		kvm_put_kvm(owner_kvm);
+++>>>>>>> b2125513dfc0 (KVM: SEV: Allow SEV intra-host migration of VM with mirrors)
+  		return;
+  	}
+  
+diff --cc arch/x86/kvm/svm/svm.h
+index b72dd1b3a3c6,dddcaa827c5f..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -79,7 -79,10 +79,12 @@@ struct kvm_sev_info 
+  	struct list_head regions_list;  /* List of registered regions */
+  	u64 ap_jump_table;	/* SEV-ES AP Jump Table address */
+  	struct kvm *enc_context_owner; /* Owner of copied encryption context */
+++<<<<<<< HEAD
+++=======
++ 	struct list_head mirror_vms; /* List of VMs mirroring */
++ 	struct list_head mirror_entry; /* Use as a list entry of mirrors */
+++>>>>>>> b2125513dfc0 (KVM: SEV: Allow SEV intra-host migration of VM with mirrors)
+  	struct misc_cg *misc_cg; /* For misc cgroup accounting */
+ -	atomic_t migration_in_progress;
+  };
+  
+  struct kvm_svm {
+* Unmerged path tools/testing/selftests/kvm/x86_64/sev_migrate_tests.c
+* Unmerged path arch/x86/kvm/svm/sev.c
+* Unmerged path arch/x86/kvm/svm/svm.h
+* Unmerged path tools/testing/selftests/kvm/x86_64/sev_migrate_tests.c
