@@ -1,0 +1,151 @@
+xfs: use perag through unlink processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit f40aadb2bb64fe0a3d9b59957e70796d629cdee2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/f40aadb2.failed
+
+Unlinked lists are held in the perag, and freeing of inodes needs to
+be passed a perag, too, so look up the perag early in the unlink
+processing and use it throughout.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+
+(cherry picked from commit f40aadb2bb64fe0a3d9b59957e70796d629cdee2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/xfs_inode.c
+index b0de190614c0,336c350206a8..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -2584,19 -2539,18 +2595,29 @@@ xfs_ifree
+  	ASSERT(ip->i_disk_size == 0 || !S_ISREG(VFS_I(ip)->i_mode));
+  	ASSERT(ip->i_nblocks == 0);
+  
++ 	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
++ 
+  	/*
+ -	 * Pull the on-disk inode from the AGI unlinked list.
+ +	 * Free the inode first so that we guarantee that the AGI lock is going
+ +	 * to be taken before we remove the inode from the unlinked list. This
+ +	 * makes the AGI lock -> unlinked list modification order the same as
+ +	 * used in O_TMPFILE creation.
+  	 */
+++<<<<<<< HEAD
+ +	error = xfs_difree(tp, ip->i_ino, &xic);
+++=======
++ 	error = xfs_iunlink_remove(tp, pag, ip);
+++>>>>>>> f40aadb2bb64 (xfs: use perag through unlink processing)
+  	if (error)
+- 		return error;
++ 		goto out;
+  
+++<<<<<<< HEAD
+ +	error = xfs_iunlink_remove(tp, ip);
+++=======
++ 	error = xfs_difree(tp, pag, ip->i_ino, &xic);
+++>>>>>>> f40aadb2bb64 (xfs: use perag through unlink processing)
+  	if (error)
+- 		return error;
++ 		goto out;
+  
+  	/*
+  	 * Free any local-format data sitting around before we reset the
+diff --git a/fs/xfs/libxfs/xfs_ialloc.c b/fs/xfs/libxfs/xfs_ialloc.c
+index 1e69b4d32727..fe329631c6ab 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -2096,35 +2096,33 @@ xfs_difree_finobt(
+  */
+ int
+ xfs_difree(
+-	struct xfs_trans	*tp,		/* transaction pointer */
+-	xfs_ino_t		inode,		/* inode to be freed */
+-	struct xfs_icluster	*xic)	/* cluster info if deleted */
++	struct xfs_trans	*tp,
++	struct xfs_perag	*pag,
++	xfs_ino_t		inode,
++	struct xfs_icluster	*xic)
+ {
+ 	/* REFERENCED */
+ 	xfs_agblock_t		agbno;	/* block number containing inode */
+ 	struct xfs_buf		*agbp;	/* buffer for allocation group header */
+ 	xfs_agino_t		agino;	/* allocation group inode number */
+-	xfs_agnumber_t		agno;	/* allocation group number */
+ 	int			error;	/* error return value */
+ 	struct xfs_mount	*mp = tp->t_mountp;
+ 	struct xfs_inobt_rec_incore rec;/* btree record */
+-	struct xfs_perag	*pag;
+ 
+ 	/*
+ 	 * Break up inode number into its components.
+ 	 */
+-	agno = XFS_INO_TO_AGNO(mp, inode);
+-	if (agno >= mp->m_sb.sb_agcount) {
+-		xfs_warn(mp, "%s: agno >= mp->m_sb.sb_agcount (%d >= %d).",
+-			__func__, agno, mp->m_sb.sb_agcount);
++	if (pag->pag_agno != XFS_INO_TO_AGNO(mp, inode)) {
++		xfs_warn(mp, "%s: agno != pag->pag_agno (%d != %d).",
++			__func__, XFS_INO_TO_AGNO(mp, inode), pag->pag_agno);
+ 		ASSERT(0);
+ 		return -EINVAL;
+ 	}
+ 	agino = XFS_INO_TO_AGINO(mp, inode);
+-	if (inode != XFS_AGINO_TO_INO(mp, agno, agino))  {
++	if (inode != XFS_AGINO_TO_INO(mp, pag->pag_agno, agino))  {
+ 		xfs_warn(mp, "%s: inode != XFS_AGINO_TO_INO() (%llu != %llu).",
+ 			__func__, (unsigned long long)inode,
+-			(unsigned long long)XFS_AGINO_TO_INO(mp, agno, agino));
++			(unsigned long long)XFS_AGINO_TO_INO(mp, pag->pag_agno, agino));
+ 		ASSERT(0);
+ 		return -EINVAL;
+ 	}
+@@ -2138,7 +2136,7 @@ xfs_difree(
+ 	/*
+ 	 * Get the allocation group header.
+ 	 */
+-	error = xfs_ialloc_read_agi(mp, tp, agno, &agbp);
++	error = xfs_ialloc_read_agi(mp, tp, pag->pag_agno, &agbp);
+ 	if (error) {
+ 		xfs_warn(mp, "%s: xfs_ialloc_read_agi() returned error %d.",
+ 			__func__, error);
+@@ -2148,7 +2146,6 @@ xfs_difree(
+ 	/*
+ 	 * Fix up the inode allocation btree.
+ 	 */
+-	pag = agbp->b_pag;
+ 	error = xfs_difree_inobt(mp, tp, agbp, pag, agino, xic, &rec);
+ 	if (error)
+ 		goto error0;
+diff --git a/fs/xfs/libxfs/xfs_ialloc.h b/fs/xfs/libxfs/xfs_ialloc.h
+index 3511086a7ae1..530cba61749b 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.h
++++ b/fs/xfs/libxfs/xfs_ialloc.h
+@@ -58,17 +58,8 @@ xfs_dialloc_ag(
+ 	xfs_ino_t		parent,
+ 	xfs_ino_t		*inop);
+ 
+-/*
+- * Free disk inode.  Carefully avoids touching the incore inode, all
+- * manipulations incore are the caller's responsibility.
+- * The on-disk inode is not changed by this operation, only the
+- * btree (free inode mask) is changed.
+- */
+-int					/* error */
+-xfs_difree(
+-	struct xfs_trans *tp,		/* transaction pointer */
+-	xfs_ino_t	inode,		/* inode to be freed */
+-	struct xfs_icluster *ifree);	/* cluster info if deleted */
++int xfs_difree(struct xfs_trans *tp, struct xfs_perag *pag,
++		xfs_ino_t ino, struct xfs_icluster *ifree);
+ 
+ /*
+  * Return the location of the inode in imap, for mapping it into a buffer.
+* Unmerged path fs/xfs/xfs_inode.c
