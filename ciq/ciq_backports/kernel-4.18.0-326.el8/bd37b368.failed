@@ -1,0 +1,229 @@
+s390/nvme: support firmware-assisted dump to NVMe disks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Alexander Egorenkov <egorenar@linux.ibm.com>
+commit bd37b36832f62bf42ab66da8744191d99252a6e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/bd37b368.failed
+
+From the kernel perspective NVMe dump works exactly like zFCP dump.
+Therefore, adapt all places where code explicitly tests only for
+IPL of type FCP DUMP. And also set the memory end correctly in this case.
+
+	Signed-off-by: Alexander Egorenkov <egorenar@linux.ibm.com>
+	Reviewed-by: Vasily Gorbik <gor@linux.ibm.com>
+	Reviewed-by: Philipp Rudo <prudo@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit bd37b36832f62bf42ab66da8744191d99252a6e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/boot/ipl_parm.c
+#	drivers/s390/char/zcore.c
+diff --cc arch/s390/boot/ipl_parm.c
+index fd310c395135,f94b91d72620..000000000000
+--- a/arch/s390/boot/ipl_parm.c
++++ b/arch/s390/boot/ipl_parm.c
+@@@ -204,17 -272,31 +204,32 @@@ static void parse_mem_opt(void
+  	}
+  }
+  
++ static inline bool is_ipl_block_dump(void)
++ {
++ 	if (ipl_block.pb0_hdr.pbt == IPL_PBT_FCP &&
++ 	    ipl_block.fcp.opt == IPL_PB0_FCP_OPT_DUMP)
++ 		return true;
++ 	if (ipl_block.pb0_hdr.pbt == IPL_PBT_NVME &&
++ 	    ipl_block.nvme.opt == IPL_PB0_NVME_OPT_DUMP)
++ 		return true;
++ 	return false;
++ }
++ 
+  void setup_memory_end(void)
+  {
+ +	parse_mem_opt();
+  #ifdef CONFIG_CRASH_DUMP
+  	if (OLDMEM_BASE) {
+  		kaslr_enabled = 0;
+++<<<<<<< HEAD
+ +		memory_end = min(memory_end ?: OLDMEM_SIZE, OLDMEM_SIZE);
+ +		memory_end_set = 1;
+ +	} else if (ipl_block_valid &&
+ +		   ipl_block.pb0_hdr.pbt == IPL_PBT_FCP &&
+ +		   ipl_block.fcp.opt == IPL_PB0_FCP_OPT_DUMP) {
+++=======
++ 	} else if (ipl_block_valid && is_ipl_block_dump()) {
+++>>>>>>> bd37b36832f6 (s390/nvme: support firmware-assisted dump to NVMe disks)
+  		kaslr_enabled = 0;
+  		if (!sclp_early_get_hsa_size(&memory_end) && memory_end)
+  			memory_end_set = 1;
+diff --cc drivers/s390/char/zcore.c
+index 2d5c6e908914,1515fdc3c1ab..000000000000
+--- a/drivers/s390/char/zcore.c
++++ b/drivers/s390/char/zcore.c
+@@@ -1,8 -1,7 +1,12 @@@
+  // SPDX-License-Identifier: GPL-1.0+
+  /*
+   * zcore module to export memory content and register sets for creating system
+++<<<<<<< HEAD
+ + * dumps on SCSI disks (zfcpdump). The "zcore/mem" debugfs file shows the same
+ + * dump format as s390 standalone dumps.
+++=======
++  * dumps on SCSI/NVMe disks (zfcp/nvme dump).
+++>>>>>>> bd37b36832f6 (s390/nvme: support firmware-assisted dump to NVMe disks)
+   *
+   * For more information please refer to Documentation/s390/zfcpdump.rst
+   *
+* Unmerged path arch/s390/boot/ipl_parm.c
+diff --git a/arch/s390/include/asm/ipl.h b/arch/s390/include/asm/ipl.h
+index 2ad5b1a4af55..6ff11f3a2d47 100644
+--- a/arch/s390/include/asm/ipl.h
++++ b/arch/s390/include/asm/ipl.h
+@@ -95,6 +95,12 @@ extern struct ipl_info ipl_info;
+ extern void setup_ipl(void);
+ extern void set_os_info_reipl_block(void);
+ 
++static inline bool is_ipl_type_dump(void)
++{
++	return (ipl_info.type == IPL_TYPE_FCP_DUMP) ||
++		(ipl_info.type == IPL_TYPE_NVME_DUMP);
++}
++
+ struct ipl_report {
+ 	struct ipl_parameter_block *ipib;
+ 	struct list_head components;
+diff --git a/arch/s390/kernel/crash_dump.c b/arch/s390/kernel/crash_dump.c
+index 579b88a5c9e2..662b83c4ef15 100644
+--- a/arch/s390/kernel/crash_dump.c
++++ b/arch/s390/kernel/crash_dump.c
+@@ -138,7 +138,7 @@ int copy_oldmem_kernel(void *dst, void *src, size_t count)
+ 	while (count) {
+ 		from = __pa(src);
+ 		if (!OLDMEM_BASE && from < sclp.hsa_size) {
+-			/* Copy from zfcpdump HSA area */
++			/* Copy from zfcp/nvme dump HSA area */
+ 			len = min(count, sclp.hsa_size - from);
+ 			rc = memcpy_hsa_kernel(dst, from, len);
+ 			if (rc)
+@@ -181,7 +181,7 @@ static int copy_oldmem_user(void __user *dst, void *src, size_t count)
+ 	while (count) {
+ 		from = __pa(src);
+ 		if (!OLDMEM_BASE && from < sclp.hsa_size) {
+-			/* Copy from zfcpdump HSA area */
++			/* Copy from zfcp/nvme dump HSA area */
+ 			len = min(count, sclp.hsa_size - from);
+ 			rc = memcpy_hsa_user(dst, from, len);
+ 			if (rc)
+@@ -255,7 +255,7 @@ static int remap_oldmem_pfn_range_kdump(struct vm_area_struct *vma,
+ }
+ 
+ /*
+- * Remap "oldmem" for zfcpdump
++ * Remap "oldmem" for zfcp/nvme dump
+  *
+  * We only map available memory above HSA size. Memory below HSA size
+  * is read on demand using the copy_oldmem_page() function.
+@@ -280,7 +280,7 @@ static int remap_oldmem_pfn_range_zfcpdump(struct vm_area_struct *vma,
+ }
+ 
+ /*
+- * Remap "oldmem" for kdump or zfcpdump
++ * Remap "oldmem" for kdump or zfcp/nvme dump
+  */
+ int remap_oldmem_pfn_range(struct vm_area_struct *vma, unsigned long from,
+ 			   unsigned long pfn, unsigned long size, pgprot_t prot)
+@@ -635,11 +635,11 @@ int elfcorehdr_alloc(unsigned long long *addr, unsigned long long *size)
+ 	u32 alloc_size;
+ 	u64 hdr_off;
+ 
+-	/* If we are not in kdump or zfcpdump mode return */
+-	if (!OLDMEM_BASE && ipl_info.type != IPL_TYPE_FCP_DUMP)
++	/* If we are not in kdump or zfcp/nvme dump mode return */
++	if (!OLDMEM_BASE && !is_ipl_type_dump())
+ 		return 0;
+-	/* If we cannot get HSA size for zfcpdump return error */
+-	if (ipl_info.type == IPL_TYPE_FCP_DUMP && !sclp.hsa_size)
++	/* If we cannot get HSA size for zfcp/nvme dump return error */
++	if (is_ipl_type_dump() && !sclp.hsa_size)
+ 		return -ENODEV;
+ 
+ 	/* For kdump, exclude previous crashkernel memory */
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index a20ea4673750..55266fcd3db4 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -246,7 +246,7 @@ static void __init conmode_default(void)
+ #ifdef CONFIG_CRASH_DUMP
+ static void __init setup_zfcpdump(void)
+ {
+-	if (ipl_info.type != IPL_TYPE_FCP_DUMP)
++	if (!is_ipl_type_dump())
+ 		return;
+ 	if (OLDMEM_BASE)
+ 		return;
+@@ -1136,7 +1136,7 @@ void __init setup_arch(char **cmdline_p)
+ 	if (IS_ENABLED(CONFIG_EXPOLINE))
+ 		nospec_init_branches();
+ 
+-	/* Setup zfcpdump support */
++	/* Setup zfcp/nvme dump support */
+ 	setup_zfcpdump();
+ 
+ 	/* Add system specific data to the random pool */
+diff --git a/arch/s390/kernel/smp.c b/arch/s390/kernel/smp.c
+index 05f7f1e2f9a5..894d8c37e3a7 100644
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -592,14 +592,14 @@ int smp_store_status(int cpu)
+ /*
+  * Collect CPU state of the previous, crashed system.
+  * There are four cases:
+- * 1) standard zfcp dump
+- *    condition: OLDMEM_BASE == NULL && ipl_info.type == IPL_TYPE_FCP_DUMP
++ * 1) standard zfcp/nvme dump
++ *    condition: OLDMEM_BASE == NULL && is_ipl_type_dump() == true
+  *    The state for all CPUs except the boot CPU needs to be collected
+  *    with sigp stop-and-store-status. The boot CPU state is located in
+  *    the absolute lowcore of the memory stored in the HSA. The zcore code
+  *    will copy the boot CPU state from the HSA.
+- * 2) stand-alone kdump for SCSI (zfcp dump with swapped memory)
+- *    condition: OLDMEM_BASE != NULL && ipl_info.type == IPL_TYPE_FCP_DUMP
++ * 2) stand-alone kdump for SCSI/NVMe (zfcp/nvme dump with swapped memory)
++ *    condition: OLDMEM_BASE != NULL && is_ipl_type_dump() == true
+  *    The state for all CPUs except the boot CPU needs to be collected
+  *    with sigp stop-and-store-status. The firmware or the boot-loader
+  *    stored the registers of the boot CPU in the absolute lowcore in the
+@@ -646,7 +646,7 @@ void __init smp_save_dump_cpus(void)
+ 	unsigned long page;
+ 	bool is_boot_cpu;
+ 
+-	if (!(OLDMEM_BASE || ipl_info.type == IPL_TYPE_FCP_DUMP))
++	if (!(OLDMEM_BASE || is_ipl_type_dump()))
+ 		/* No previous system present, normal boot. */
+ 		return;
+ 	/* Allocate a page as dumping area for the store status sigps */
+@@ -668,7 +668,7 @@ void __init smp_save_dump_cpus(void)
+ 			/* Get the vector registers */
+ 			smp_save_cpu_vxrs(sa, addr, is_boot_cpu, page);
+ 		/*
+-		 * For a zfcp dump OLDMEM_BASE == NULL and the registers
++		 * For a zfcp/nvme dump OLDMEM_BASE == NULL and the registers
+ 		 * of the boot CPU are stored in the HSA. To retrieve
+ 		 * these registers an SCLP request is required which is
+ 		 * done by drivers/s390/char/zcore.c:init_cpu_info()
+diff --git a/drivers/s390/char/sclp_sdias.c b/drivers/s390/char/sclp_sdias.c
+index 13f97fd73aca..3ca99cd7852b 100644
+--- a/drivers/s390/char/sclp_sdias.c
++++ b/drivers/s390/char/sclp_sdias.c
+@@ -257,7 +257,7 @@ static int __init sclp_sdias_init_async(void)
+ 
+ int __init sclp_sdias_init(void)
+ {
+-	if (ipl_info.type != IPL_TYPE_FCP_DUMP)
++	if (!is_ipl_type_dump())
+ 		return 0;
+ 	sclp_sdias_sccb = (void *) __get_free_page(GFP_KERNEL | GFP_DMA);
+ 	BUG_ON(!sclp_sdias_sccb);
+* Unmerged path drivers/s390/char/zcore.c
