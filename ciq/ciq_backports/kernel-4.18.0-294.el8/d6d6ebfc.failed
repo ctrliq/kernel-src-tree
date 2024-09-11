@@ -1,0 +1,166 @@
+powerpc/mm/radix: Remove split_kernel_mapping()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Bharata B Rao <bharata@linux.ibm.com>
+commit d6d6ebfc5dbb4008be21baa4ec2ad45606578966
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d6d6ebfc.failed
+
+We split the page table mapping on memory unplug if the
+linear range was mapped with huge page mapping (for ex: 1G)
+The page table splitting code has a few issues:
+
+1. Recursive locking
+--------------------
+Memory unplug path takes cpu_hotplug_lock and calls stop_machine()
+for splitting the mappings. However stop_machine() takes
+cpu_hotplug_lock again causing deadlock.
+
+2. BUG: sleeping function called from in_atomic() context
+---------------------------------------------------------
+Memory unplug path (remove_pagetable) takes init_mm.page_table_lock
+spinlock and later calls stop_machine() which does wait_for_completion()
+
+3. Bad unlock unbalance
+-----------------------
+Memory unplug path takes init_mm.page_table_lock spinlock and calls
+stop_machine(). The stop_machine thread function runs in a different
+thread context (migration thread) which tries to release and reaquire
+ptl. Releasing ptl from a different thread than which acquired it
+causes bad unlock unbalance.
+
+These problems can be avoided if we avoid mapping hot-plugged memory
+with 1G mapping, thereby removing the need for splitting them during
+unplug. The kernel always make sure the minimum unplug request is
+SUBSECTION_SIZE for device memory and SECTION_SIZE for regular memory.
+
+In preparation for such a change remove page table splitting support.
+
+This essentially is a revert of
+commit 4dd5f8a99e791 ("powerpc/mm/radix: Split linear mapping on hot-unplug")
+
+	Signed-off-by: Bharata B Rao <bharata@linux.ibm.com>
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200709131925.922266-4-aneesh.kumar@linux.ibm.com
+(cherry picked from commit d6d6ebfc5dbb4008be21baa4ec2ad45606578966)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/book3s64/radix_pgtable.c
+diff --cc arch/powerpc/mm/book3s64/radix_pgtable.c
+index ea0a0f917c21,d5a01b9aadc9..000000000000
+--- a/arch/powerpc/mm/book3s64/radix_pgtable.c
++++ b/arch/powerpc/mm/book3s64/radix_pgtable.c
+@@@ -16,10 -13,9 +16,9 @@@
+  #include <linux/memblock.h>
+  #include <linux/of_fdt.h>
+  #include <linux/mm.h>
+ -#include <linux/hugetlb.h>
+  #include <linux/string_helpers.h>
+- #include <linux/stop_machine.h>
+  
+ +#include <asm/pgtable.h>
+  #include <asm/pgalloc.h>
+  #include <asm/mmu_context.h>
+  #include <asm/dma.h>
+@@@ -712,30 -721,6 +711,33 @@@ static void free_pud_table(pud_t *pud_s
+  	p4d_clear(p4d);
+  }
+  
+++<<<<<<< HEAD
+ +struct change_mapping_params {
+ +	pte_t *pte;
+ +	unsigned long start;
+ +	unsigned long end;
+ +	unsigned long aligned_start;
+ +	unsigned long aligned_end;
+ +};
+ +
+ +static int __meminit stop_machine_change_mapping(void *data)
+ +{
+ +	struct change_mapping_params *params =
+ +			(struct change_mapping_params *)data;
+ +
+ +	if (!data)
+ +		return -1;
+ +
+ +	spin_unlock(&init_mm.page_table_lock);
+ +	pte_clear(&init_mm, params->aligned_start, params->pte);
+ +	create_physical_mapping(params->aligned_start, params->start, -1);
+ +	create_physical_mapping(params->end, params->aligned_end, -1);
+ +	spin_lock(&init_mm.page_table_lock);
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> d6d6ebfc5dbb (powerpc/mm/radix: Remove split_kernel_mapping())
+  static void remove_pte_table(pte_t *pte_start, unsigned long addr,
+  			     unsigned long end)
+  {
+@@@ -824,8 -763,13 +780,18 @@@ static void remove_pmd_table(pmd_t *pmd
+  		if (!pmd_present(*pmd))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (pmd_huge(*pmd)) {
+ +			split_kernel_mapping(addr, end, PMD_SIZE, (pte_t *)pmd);
+++=======
++ 		if (pmd_is_leaf(*pmd)) {
++ 			if (!IS_ALIGNED(addr, PMD_SIZE) ||
++ 			    !IS_ALIGNED(next, PMD_SIZE)) {
++ 				WARN_ONCE(1, "%s: unaligned range\n", __func__);
++ 				continue;
++ 			}
++ 			pte_clear(&init_mm, addr, (pte_t *)pmd);
+++>>>>>>> d6d6ebfc5dbb (powerpc/mm/radix: Remove split_kernel_mapping())
+  			continue;
+  		}
+  
+@@@ -849,8 -793,13 +815,18 @@@ static void remove_pud_table(pud_t *pud
+  		if (!pud_present(*pud))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (pud_huge(*pud)) {
+ +			split_kernel_mapping(addr, end, PUD_SIZE, (pte_t *)pud);
+++=======
++ 		if (pud_is_leaf(*pud)) {
++ 			if (!IS_ALIGNED(addr, PUD_SIZE) ||
++ 			    !IS_ALIGNED(next, PUD_SIZE)) {
++ 				WARN_ONCE(1, "%s: unaligned range\n", __func__);
++ 				continue;
++ 			}
++ 			pte_clear(&init_mm, addr, (pte_t *)pud);
+++>>>>>>> d6d6ebfc5dbb (powerpc/mm/radix: Remove split_kernel_mapping())
+  			continue;
+  		}
+  
+@@@ -872,11 -822,18 +848,22 @@@ static void __meminit remove_pagetable(
+  		next = pgd_addr_end(addr, end);
+  
+  		pgd = pgd_offset_k(addr);
+ -		p4d = p4d_offset(pgd, addr);
+ -		if (!p4d_present(*p4d))
+ +		if (!pgd_present(*pgd))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (pgd_huge(*pgd)) {
+ +			split_kernel_mapping(addr, end, PGDIR_SIZE, (pte_t *)pgd);
+++=======
++ 		if (p4d_is_leaf(*p4d)) {
++ 			if (!IS_ALIGNED(addr, P4D_SIZE) ||
++ 			    !IS_ALIGNED(next, P4D_SIZE)) {
++ 				WARN_ONCE(1, "%s: unaligned range\n", __func__);
++ 				continue;
++ 			}
++ 
++ 			pte_clear(&init_mm, addr, (pte_t *)pgd);
+++>>>>>>> d6d6ebfc5dbb (powerpc/mm/radix: Remove split_kernel_mapping())
+  			continue;
+  		}
+  
+* Unmerged path arch/powerpc/mm/book3s64/radix_pgtable.c
