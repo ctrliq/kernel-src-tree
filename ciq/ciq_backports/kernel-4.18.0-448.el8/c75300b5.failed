@@ -1,0 +1,160 @@
+fbcon: untangle fbcon_exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit c75300b5c64b013a6a04c8385094eeff849595ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/c75300b5.failed
+
+There's a bunch of confusions going on here:
+- The deferred fbcon setup notifier should only be cleaned up from
+  fb_console_exit(), to be symmetric with fb_console_init()
+- We also need to make sure we don't race with the work, which means
+  temporarily dropping the console lock (or we can deadlock)
+- That also means no point in clearing deferred_takeover, we are
+  unloading everything anyway.
+- Finally rename fbcon_exit to fbcon_release_all and move it, since
+  that's what's it doing when being called from consw->con_deinit
+  through fbcon_deinit.
+
+To answer a question from Sam just quoting my own reply:
+
+> We loose the call to fbcon_release_all() here [in fb_console_exit()].
+> We have part of the old fbcon_exit() above, but miss the release parts.
+
+Ah yes that's the entire point of this change. The release_all in the
+fbcon exit path was only needed when fbcon was a separate module
+indepedent from core fb.ko. Which means it was possible to unload fbcon
+while having fbdev drivers registered.
+
+But since we've merged them that has become impossible, so by the time the
+fb.ko module can be unloaded, there's guaranteed to be no fbdev drivers
+left. And hence removing them is pointless.
+
+v2: Explain the why better (Sam)
+
+	Acked-by: Sam Ravnborg <sam@ravnborg.org>
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Daniel Vetter <daniel@ffwll.ch>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Claudio Suarez <cssk@net-c.es>
+	Cc: Du Cheng <ducheng2@gmail.com>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220405210335.3434130-17-daniel.vetter@ffwll.ch
+(cherry picked from commit c75300b5c64b013a6a04c8385094eeff849595ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbcon.c
+diff --cc drivers/video/fbdev/core/fbcon.c
+index 1a25ce50a9fd,944f514c77ec..000000000000
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@@ -3656,79 -3314,8 +3676,82 @@@ static void fbcon_start(void
+  		return;
+  	}
+  #endif
+ +
+ +	if (num_registered_fb) {
+ +		int i;
+ +
+ +		for (i = 0; i < FB_MAX; i++) {
+ +			if (registered_fb[i] != NULL) {
+ +				info_idx = i;
+ +				break;
+ +			}
+ +		}
+ +
+ +		do_fbcon_takeover(0);
+ +	}
+ +}
+ +
+++<<<<<<< HEAD
+ +static void fbcon_exit(void)
+ +{
+ +	struct fb_info *info;
+ +	int i, j, mapped;
+ +
+ +
+ +#ifdef CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER
+ +	if (deferred_takeover) {
+ +		dummycon_unregister_output_notifier(&fbcon_output_nb);
+ +		deferred_takeover = false;
+ +	}
+ +#endif
+ +
+ +	kvfree((void *)softback_buf);
+ +	softback_buf = 0UL;
+ +
+ +	for (i = 0; i < FB_MAX; i++) {
+ +		int pending = 0;
+ +
+ +		mapped = 0;
+ +		info = registered_fb[i];
+ +
+ +		if (info == NULL)
+ +			continue;
+ +
+ +		if (info->queue.func)
+ +			pending = cancel_work_sync(&info->queue);
+ +		DPRINTK("fbcon: %s pending work\n", (pending ? "canceled" :
+ +			"no"));
+ +
+ +		for (j = first_fb_vc; j <= last_fb_vc; j++) {
+ +			if (con2fb_map[j] == i) {
+ +				mapped = 1;
+ +				con2fb_map[j] = -1;
+ +			}
+ +		}
+ +
+ +		if (mapped) {
+ +			if (info->fbops->fb_release)
+ +				info->fbops->fb_release(info, 0);
+ +			module_put(info->fbops->owner);
+ +
+ +			if (info->fbcon_par) {
+ +				struct fbcon_ops *ops = info->fbcon_par;
+ +
+ +				fbcon_del_cursor_timer(info);
+ +				kfree(ops->cursor_src);
+ +				kfree(ops->cursor_state.mask);
+ +				kfree(info->fbcon_par);
+ +				info->fbcon_par = NULL;
+ +			}
+ +
+ +			if (info->queue.func == fb_flashcursor)
+ +				info->queue.func = NULL;
+ +		}
+ +	}
+  }
+  
+++=======
+++>>>>>>> c75300b5c64b (fbcon: untangle fbcon_exit)
+  void __init fb_console_init(void)
+  {
+  	int i;
+@@@ -3769,11 -3355,19 +3792,20 @@@ static void __exit fbcon_deinit_device(
+  
+  void __exit fb_console_exit(void)
+  {
++ #ifdef CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER
++ 	console_lock();
++ 	if (deferred_takeover)
++ 		dummycon_unregister_output_notifier(&fbcon_output_nb);
++ 	console_unlock();
++ 
++ 	cancel_work_sync(&fbcon_deferred_takeover_work);
++ #endif
++ 
+  	console_lock();
+ +	fb_unregister_client(&fbcon_event_notifier);
+  	fbcon_deinit_device();
+  	device_destroy(fb_class, MKDEV(0, 0));
+- 	fbcon_exit();
++ 
+  	do_unregister_con_driver(&fb_con);
+  	console_unlock();
+  }	
+* Unmerged path drivers/video/fbdev/core/fbcon.c
