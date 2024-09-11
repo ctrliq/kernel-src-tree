@@ -1,0 +1,129 @@
+net/mlx5e: Create route entry infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Vlad Buslov <vladbu@nvidia.com>
+commit 777bb800c6967517772e882118b414e1c6cb7087
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/777bb800.failed
+
+Implement dedicated route entry infrastructure to be used in following
+patch by route update event. Both encap (indirectly through their
+corresponding encap entries) and decap (directly) flows are attached to
+routing entry. Since route update also requires updating encap (route
+device MAC address is a source MAC address of tunnel encapsulation), same
+encap_tbl_lock mutex is used for synchronization.
+
+The new infrastructure looks similar to existing infrastructures for shared
+encap, mod_hdr and hairpin entries:
+
+- Per-eswitch hash table is used for quick entry lookup.
+
+- Flows are attached to per-entry linked list and hold reference to entry
+  during their lifetime.
+
+- Atomic reference counting and rcu mechanisms are used as synchronization
+  primitives for concurrent access.
+
+The infrastructure also enables connection tracking on stacked devices
+topology by attaching CT chain 0 flow on tunneling dev to decap route
+entry.
+
+	Signed-off-by: Vlad Buslov <vladbu@nvidia.com>
+	Signed-off-by: Dmytro Linkin <dlinkin@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 777bb800c6967517772e882118b414e1c6cb7087)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_priv.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 00c2a6fd4471,2cc31f99db9b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -1393,9 -1370,11 +1404,10 @@@ static void mlx5e_tc_del_fdb_flow(struc
+  			mlx5e_detach_encap(priv, flow, out_index);
+  			kfree(attr->parse_attr->tun_info[out_index]);
+  		}
++ 	}
+  	kvfree(attr->parse_attr);
+ -	kvfree(attr->esw_attr->rx_tun_attr);
+  
+ -	mlx5_tc_ct_match_del(get_ct_priv(priv), &flow->attr->ct_attr);
+ +	mlx5_tc_ct_match_del(priv, &flow->attr->ct_attr);
+  
+  	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
+  		mlx5e_detach_mod_hdr(priv, flow);
+@@@ -4338,6 -3704,9 +4350,12 @@@ static int parse_tc_fdb_actions(struct 
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* always set IP version for indirect table handling */
++ 	attr->ip_version = mlx5e_tc_get_ip_version(&parse_attr->spec, true);
++ 
+++>>>>>>> 777bb800c696 (net/mlx5e: Create route entry infrastructure)
+  	if (MLX5_CAP_GEN(esw->dev, prio_tag_required) &&
+  	    action & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP) {
+  		/* For prio tag mode, replace vlan pop with rewrite vlan prio
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index d7bf5ced61fa,310c405e81d7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1794,11 -1827,13 +1794,16 @@@ int mlx5_eswitch_init(struct mlx5_core_
+  
+  	mutex_init(&esw->offloads.encap_tbl_lock);
+  	hash_init(esw->offloads.encap_tbl);
+ +	mlx5e_mod_hdr_tbl_init(&esw->offloads.mod_hdr);
+  	mutex_init(&esw->offloads.decap_tbl_lock);
+  	hash_init(esw->offloads.decap_tbl);
+++<<<<<<< HEAD
+++=======
++ 	mlx5e_mod_hdr_tbl_init(&esw->offloads.mod_hdr);
++ 	hash_init(esw->offloads.route_tbl);
+++>>>>>>> 777bb800c696 (net/mlx5e: Create route entry infrastructure)
+  	atomic64_set(&esw->offloads.num_flows, 0);
+  	ida_init(&esw->offloads.vport_metadata_ida);
+ -	xa_init_flags(&esw->offloads.vhca_map, XA_FLAGS_ALLOC);
+  	mutex_init(&esw->state_lock);
+  	mutex_init(&esw->mode_lock);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_priv.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_priv.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 988195ab1c54..8e04126f088a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -181,6 +181,7 @@ struct mlx5e_encap_entry {
+ 	 */
+ 	struct hlist_node encap_hlist;
+ 	struct list_head flows;
++	struct list_head route_list;
+ 	struct mlx5_pkt_reformat *pkt_reformat;
+ 	const struct ip_tunnel_info *tun_info;
+ 	unsigned char h_dest[ETH_ALEN];	/* destination eth addr	*/
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index a877326fe8ec..186fe092c653 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -211,6 +211,7 @@ struct mlx5_esw_offload {
+ 	struct mutex peer_mutex;
+ 	struct mutex encap_tbl_lock; /* protects encap_tbl */
+ 	DECLARE_HASHTABLE(encap_tbl, 8);
++	DECLARE_HASHTABLE(route_tbl, 8);
+ 	struct mutex decap_tbl_lock; /* protects decap_tbl */
+ 	DECLARE_HASHTABLE(decap_tbl, 8);
+ 	struct mod_hdr_tbl mod_hdr;
