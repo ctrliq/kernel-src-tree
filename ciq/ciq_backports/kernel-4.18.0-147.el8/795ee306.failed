@@ -1,0 +1,264 @@
+lib/genalloc: introduce chunk owners
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 795ee30648c708502da9df637f83c33361d68dcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/795ee306.failed
+
+The p2pdma facility enables a provider to publish a pool of dma
+addresses for a consumer to allocate.  A genpool is used internally by
+p2pdma to collect dma resources, 'chunks', to be handed out to
+consumers.  Whenever a consumer allocates a resource it needs to pin the
+'struct dev_pagemap' instance that backs the chunk selected by
+pci_alloc_p2pmem().
+
+Currently that reference is taken globally on the entire provider
+device.  That sets up a lifetime mismatch whereby the p2pdma core needs
+to maintain hacks to make sure the percpu_ref is not released twice.
+
+This lifetime mismatch also stands in the way of a fix to
+devm_memremap_pages() whereby devm_memremap_pages_release() must wait for
+the percpu_ref ->release() callback to complete before it can proceed to
+teardown pages.
+
+So, towards fixing this situation, introduce the ability to store a 'chunk
+owner' at gen_pool_add() time, and a facility to retrieve the owner at
+gen_pool_{alloc,free}() time.  For p2pdma this will be used to store and
+recall individual dev_pagemap reference counter instances per-chunk.
+
+Link: http://lkml.kernel.org/r/155727338118.292046.13407378933221579644.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Logan Gunthorpe <logang@deltatee.com>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: "Jérôme Glisse" <jglisse@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "Rafael J. Wysocki" <rafael@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 795ee30648c708502da9df637f83c33361d68dcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/genalloc.h
+diff --cc include/linux/genalloc.h
+index 6c62eeca754f,a337313e064f..000000000000
+--- a/include/linux/genalloc.h
++++ b/include/linux/genalloc.h
+@@@ -116,13 -124,47 +124,52 @@@ static inline int gen_pool_add(struct g
+  	return gen_pool_add_virt(pool, addr, -1, size, nid);
+  }
+  extern void gen_pool_destroy(struct gen_pool *);
+- extern unsigned long gen_pool_alloc(struct gen_pool *, size_t);
+- extern unsigned long gen_pool_alloc_algo(struct gen_pool *, size_t,
+- 		genpool_algo_t algo, void *data);
++ unsigned long gen_pool_alloc_algo_owner(struct gen_pool *pool, size_t size,
++ 		genpool_algo_t algo, void *data, void **owner);
++ 
++ static inline unsigned long gen_pool_alloc_owner(struct gen_pool *pool,
++ 		size_t size, void **owner)
++ {
++ 	return gen_pool_alloc_algo_owner(pool, size, pool->algo, pool->data,
++ 			owner);
++ }
++ 
++ static inline unsigned long gen_pool_alloc_algo(struct gen_pool *pool,
++ 		size_t size, genpool_algo_t algo, void *data)
++ {
++ 	return gen_pool_alloc_algo_owner(pool, size, algo, data, NULL);
++ }
++ 
++ /**
++  * gen_pool_alloc - allocate special memory from the pool
++  * @pool: pool to allocate from
++  * @size: number of bytes to allocate from the pool
++  *
++  * Allocate the requested number of bytes from the specified pool.
++  * Uses the pool allocation function (with first-fit algorithm by default).
++  * Can not be used in NMI handler on architectures without
++  * NMI-safe cmpxchg implementation.
++  */
++ static inline unsigned long gen_pool_alloc(struct gen_pool *pool, size_t size)
++ {
++ 	return gen_pool_alloc_algo(pool, size, pool->algo, pool->data);
++ }
++ 
+  extern void *gen_pool_dma_alloc(struct gen_pool *pool, size_t size,
+  		dma_addr_t *dma);
+++<<<<<<< HEAD
+ +void *gen_pool_dma_zalloc(struct gen_pool *pool, size_t size, dma_addr_t *dma);
+ +extern void gen_pool_free(struct gen_pool *, unsigned long, size_t);
+++=======
++ extern void gen_pool_free_owner(struct gen_pool *pool, unsigned long addr,
++ 		size_t size, void **owner);
++ static inline void gen_pool_free(struct gen_pool *pool, unsigned long addr,
++                 size_t size)
++ {
++ 	gen_pool_free_owner(pool, addr, size, NULL);
++ }
++ 
+++>>>>>>> 795ee30648c7 (lib/genalloc: introduce chunk owners)
+  extern void gen_pool_for_each_chunk(struct gen_pool *,
+  	void (*)(struct gen_pool *, struct gen_pool_chunk *, void *), void *);
+  extern size_t gen_pool_avail(struct gen_pool *);
+* Unmerged path include/linux/genalloc.h
+diff --git a/lib/genalloc.c b/lib/genalloc.c
+index 90b028c0e441..c1df932658e4 100644
+--- a/lib/genalloc.c
++++ b/lib/genalloc.c
+@@ -167,20 +167,21 @@ struct gen_pool *gen_pool_create(int min_alloc_order, int nid)
+ EXPORT_SYMBOL(gen_pool_create);
+ 
+ /**
+- * gen_pool_add_virt - add a new chunk of special memory to the pool
++ * gen_pool_add_owner- add a new chunk of special memory to the pool
+  * @pool: pool to add new memory chunk to
+  * @virt: virtual starting address of memory chunk to add to pool
+  * @phys: physical starting address of memory chunk to add to pool
+  * @size: size in bytes of the memory chunk to add to pool
+  * @nid: node id of the node the chunk structure and bitmap should be
+  *       allocated on, or -1
++ * @owner: private data the publisher would like to recall at alloc time
+  *
+  * Add a new chunk of special memory to the specified pool.
+  *
+  * Returns 0 on success or a -ve errno on failure.
+  */
+-int gen_pool_add_virt(struct gen_pool *pool, unsigned long virt, phys_addr_t phys,
+-		 size_t size, int nid)
++int gen_pool_add_owner(struct gen_pool *pool, unsigned long virt, phys_addr_t phys,
++		 size_t size, int nid, void *owner)
+ {
+ 	struct gen_pool_chunk *chunk;
+ 	int nbits = size >> pool->min_alloc_order;
+@@ -194,6 +195,7 @@ int gen_pool_add_virt(struct gen_pool *pool, unsigned long virt, phys_addr_t phy
+ 	chunk->phys_addr = phys;
+ 	chunk->start_addr = virt;
+ 	chunk->end_addr = virt + size - 1;
++	chunk->owner = owner;
+ 	atomic_long_set(&chunk->avail, size);
+ 
+ 	spin_lock(&pool->lock);
+@@ -202,7 +204,7 @@ int gen_pool_add_virt(struct gen_pool *pool, unsigned long virt, phys_addr_t phy
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(gen_pool_add_virt);
++EXPORT_SYMBOL(gen_pool_add_owner);
+ 
+ /**
+  * gen_pool_virt_to_phys - return the physical address of memory
+@@ -259,35 +261,20 @@ void gen_pool_destroy(struct gen_pool *pool)
+ EXPORT_SYMBOL(gen_pool_destroy);
+ 
+ /**
+- * gen_pool_alloc - allocate special memory from the pool
+- * @pool: pool to allocate from
+- * @size: number of bytes to allocate from the pool
+- *
+- * Allocate the requested number of bytes from the specified pool.
+- * Uses the pool allocation function (with first-fit algorithm by default).
+- * Can not be used in NMI handler on architectures without
+- * NMI-safe cmpxchg implementation.
+- */
+-unsigned long gen_pool_alloc(struct gen_pool *pool, size_t size)
+-{
+-	return gen_pool_alloc_algo(pool, size, pool->algo, pool->data);
+-}
+-EXPORT_SYMBOL(gen_pool_alloc);
+-
+-/**
+- * gen_pool_alloc_algo - allocate special memory from the pool
++ * gen_pool_alloc_algo_owner - allocate special memory from the pool
+  * @pool: pool to allocate from
+  * @size: number of bytes to allocate from the pool
+  * @algo: algorithm passed from caller
+  * @data: data passed to algorithm
++ * @owner: optionally retrieve the chunk owner
+  *
+  * Allocate the requested number of bytes from the specified pool.
+  * Uses the pool allocation function (with first-fit algorithm by default).
+  * Can not be used in NMI handler on architectures without
+  * NMI-safe cmpxchg implementation.
+  */
+-unsigned long gen_pool_alloc_algo(struct gen_pool *pool, size_t size,
+-		genpool_algo_t algo, void *data)
++unsigned long gen_pool_alloc_algo_owner(struct gen_pool *pool, size_t size,
++		genpool_algo_t algo, void *data, void **owner)
+ {
+ 	struct gen_pool_chunk *chunk;
+ 	unsigned long addr = 0;
+@@ -298,6 +285,9 @@ unsigned long gen_pool_alloc_algo(struct gen_pool *pool, size_t size,
+ 	BUG_ON(in_nmi());
+ #endif
+ 
++	if (owner)
++		*owner = NULL;
++
+ 	if (size == 0)
+ 		return 0;
+ 
+@@ -325,12 +315,14 @@ unsigned long gen_pool_alloc_algo(struct gen_pool *pool, size_t size,
+ 		addr = chunk->start_addr + ((unsigned long)start_bit << order);
+ 		size = nbits << order;
+ 		atomic_long_sub(size, &chunk->avail);
++		if (owner)
++			*owner = chunk->owner;
+ 		break;
+ 	}
+ 	rcu_read_unlock();
+ 	return addr;
+ }
+-EXPORT_SYMBOL(gen_pool_alloc_algo);
++EXPORT_SYMBOL(gen_pool_alloc_algo_owner);
+ 
+ /**
+  * gen_pool_dma_alloc - allocate special memory from the pool for DMA usage
+@@ -393,12 +385,14 @@ EXPORT_SYMBOL(gen_pool_dma_zalloc);
+  * @pool: pool to free to
+  * @addr: starting address of memory to free back to pool
+  * @size: size in bytes of memory to free
++ * @owner: private data stashed at gen_pool_add() time
+  *
+  * Free previously allocated special memory back to the specified
+  * pool.  Can not be used in NMI handler on architectures without
+  * NMI-safe cmpxchg implementation.
+  */
+-void gen_pool_free(struct gen_pool *pool, unsigned long addr, size_t size)
++void gen_pool_free_owner(struct gen_pool *pool, unsigned long addr, size_t size,
++		void **owner)
+ {
+ 	struct gen_pool_chunk *chunk;
+ 	int order = pool->min_alloc_order;
+@@ -408,6 +402,9 @@ void gen_pool_free(struct gen_pool *pool, unsigned long addr, size_t size)
+ 	BUG_ON(in_nmi());
+ #endif
+ 
++	if (owner)
++		*owner = NULL;
++
+ 	nbits = (size + (1UL << order) - 1) >> order;
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(chunk, &pool->chunks, next_chunk) {
+@@ -418,6 +415,8 @@ void gen_pool_free(struct gen_pool *pool, unsigned long addr, size_t size)
+ 			BUG_ON(remain);
+ 			size = nbits << order;
+ 			atomic_long_add(size, &chunk->avail);
++			if (owner)
++				*owner = chunk->owner;
+ 			rcu_read_unlock();
+ 			return;
+ 		}
+@@ -425,7 +424,7 @@ void gen_pool_free(struct gen_pool *pool, unsigned long addr, size_t size)
+ 	rcu_read_unlock();
+ 	BUG();
+ }
+-EXPORT_SYMBOL(gen_pool_free);
++EXPORT_SYMBOL(gen_pool_free_owner);
+ 
+ /**
+  * gen_pool_for_each_chunk - call func for every chunk of generic memory pool
