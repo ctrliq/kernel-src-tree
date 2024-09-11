@@ -1,0 +1,176 @@
+arm64: mm: convert cpu_do_switch_mm() to C
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 25b92693a1b67a47b0c64a3410009d09e9658412
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/25b92693.failed
+
+There's no reason that cpu_do_switch_mm() needs to be written as an
+assembly function, and having it as a C function would make it easier to
+maintain.
+
+This patch converts cpu_do_switch_mm() to C, removing code that this
+change makes redundant (e.g. the mmid macro). Since the header comment
+was stale and the prototype now implies all the necessary information,
+this comment is removed. The 'pgd_phys' argument is made a phys_addr_t
+to match the return type of virt_to_phys().
+
+At the same time, post_ttbr_update_workaround() is updated to use
+IS_ENABLED(), which allows the compiler to figure out it can elide calls
+for !CONFIG_CAVIUM_ERRATUM_27456 builds.
+
+There should be no functional change as a result of this patch.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+[catalin.marinas@arm.com: change comments from asm-style to C-style]
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 25b92693a1b67a47b0c64a3410009d09e9658412)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/proc.S
+diff --cc arch/arm64/mm/proc.S
+index 768b1405972d,76899c6eee2b..000000000000
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@@ -154,34 -142,6 +154,37 @@@ ENDPROC(cpu_do_resume
+  	.popsection
+  #endif
+  
+++<<<<<<< HEAD
+ +/*
+ + *	cpu_do_switch_mm(pgd_phys, tsk)
+ + *
+ + *	Set the translation table base pointer to be pgd_phys.
+ + *
+ + *	- pgd_phys - physical address of new TTB
+ + */
+ +ENTRY(cpu_do_switch_mm)
+ +	mrs	x2, ttbr1_el1
+ +	mmid	x1, x1				// get mm->context.id
+ +	phys_to_ttbr x3, x0
+ +
+ +alternative_if ARM64_HAS_CNP
+ +	cbz     x1, 1f                          // skip CNP for reserved ASID
+ +	orr     x3, x3, #TTBR_CNP_BIT
+ +1:
+ +alternative_else_nop_endif
+ +#ifdef CONFIG_ARM64_SW_TTBR0_PAN
+ +	bfi	x3, x1, #48, #16		// set the ASID field in TTBR0
+ +#endif
+ +	bfi	x2, x1, #48, #16		// set the ASID
+ +	msr	ttbr1_el1, x2			// in TTBR1 (since TCR.A1 is set)
+ +	isb
+ +	msr	ttbr0_el1, x3			// now update TTBR0
+ +	isb
+ +	b	post_ttbr_update_workaround	// Back to C code...
+ +ENDPROC(cpu_do_switch_mm)
+ +
+++=======
+++>>>>>>> 25b92693a1b6 (arm64: mm: convert cpu_do_switch_mm() to C)
+  	.pushsection ".idmap.text", "awx"
+  
+  .macro	__idmap_cpu_set_reserved_ttbr1, tmp1, tmp2
+diff --git a/arch/arm64/include/asm/assembler.h b/arch/arm64/include/asm/assembler.h
+index ea0868c34441..0e63a57c6a05 100644
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -267,12 +267,6 @@ alternative_endif
+ 	ldr	\rd, [\rn, #VMA_VM_MM]
+ 	.endm
+ 
+-/*
+- * mmid - get context id from mm pointer (mm->context.id)
+- */
+-	.macro	mmid, rd, rn
+-	ldr	\rd, [\rn, #MM_CONTEXT_ID]
+-	.endm
+ /*
+  * read_ctr - read CTR_EL0. If the system has mismatched register fields,
+  * provide the system wide safe value from arm64_ftr_reg_ctrel0.sys_val
+diff --git a/arch/arm64/include/asm/mmu_context.h b/arch/arm64/include/asm/mmu_context.h
+index a00ecfe5604d..c0ab02789acb 100644
+--- a/arch/arm64/include/asm/mmu_context.h
++++ b/arch/arm64/include/asm/mmu_context.h
+@@ -57,6 +57,8 @@ static inline void cpu_set_reserved_ttbr0(void)
+ 	isb();
+ }
+ 
++void cpu_do_switch_mm(phys_addr_t pgd_phys, struct mm_struct *mm);
++
+ static inline void cpu_switch_mm(pgd_t *pgd, struct mm_struct *mm)
+ {
+ 	BUG_ON(pgd == swapper_pg_dir);
+diff --git a/arch/arm64/include/asm/proc-fns.h b/arch/arm64/include/asm/proc-fns.h
+index 16cef2e8449e..dee646700980 100644
+--- a/arch/arm64/include/asm/proc-fns.h
++++ b/arch/arm64/include/asm/proc-fns.h
+@@ -25,11 +25,9 @@
+ 
+ #include <asm/page.h>
+ 
+-struct mm_struct;
+ struct cpu_suspend_ctx;
+ 
+ extern void cpu_do_idle(void);
+-extern void cpu_do_switch_mm(unsigned long pgd_phys, struct mm_struct *mm);
+ extern void cpu_do_suspend(struct cpu_suspend_ctx *ptr);
+ extern u64 cpu_do_resume(phys_addr_t ptr, u64 idmap_ttbr);
+ 
+diff --git a/arch/arm64/mm/context.c b/arch/arm64/mm/context.c
+index 2293fb7caace..e4c863368058 100644
+--- a/arch/arm64/mm/context.c
++++ b/arch/arm64/mm/context.c
+@@ -17,6 +17,7 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/bitops.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+@@ -319,10 +320,37 @@ enum tlb_flush_types tlb_flush_check(struct mm_struct *mm, unsigned int cpu)
+ /* Errata workaround post TTBRx_EL1 update. */
+ asmlinkage void post_ttbr_update_workaround(void)
+ {
++	if (!IS_ENABLED(CONFIG_CAVIUM_ERRATUM_27456))
++		return;
++
+ 	asm(ALTERNATIVE("nop; nop; nop",
+ 			"ic iallu; dsb nsh; isb",
+-			ARM64_WORKAROUND_CAVIUM_27456,
+-			CONFIG_CAVIUM_ERRATUM_27456));
++			ARM64_WORKAROUND_CAVIUM_27456));
++}
++
++void cpu_do_switch_mm(phys_addr_t pgd_phys, struct mm_struct *mm)
++{
++	unsigned long ttbr1 = read_sysreg(ttbr1_el1);
++	unsigned long asid = ASID(mm);
++	unsigned long ttbr0 = phys_to_ttbr(pgd_phys);
++
++	/* Skip CNP for the reserved ASID */
++	if (system_supports_cnp() && asid)
++		ttbr0 |= TTBR_CNP_BIT;
++
++	/* SW PAN needs a copy of the ASID in TTBR0 for entry */
++	if (IS_ENABLED(CONFIG_ARM64_SW_TTBR0_PAN))
++		ttbr0 |= FIELD_PREP(TTBR_ASID_MASK, asid);
++
++	/* Set ASID in TTBR1 since TCR.A1 is set */
++	ttbr1 &= ~TTBR_ASID_MASK;
++	ttbr1 |= FIELD_PREP(TTBR_ASID_MASK, asid);
++
++	write_sysreg(ttbr1, ttbr1_el1);
++	isb();
++	write_sysreg(ttbr0, ttbr0_el1);
++	isb();
++	post_ttbr_update_workaround();
+ }
+ 
+ static int asids_update_limit(void)
+* Unmerged path arch/arm64/mm/proc.S
