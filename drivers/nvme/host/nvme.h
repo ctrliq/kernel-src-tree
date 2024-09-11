@@ -749,7 +749,7 @@ static inline void nvme_mpath_init_ctrl(struct nvme_ctrl *ctrl)
 static inline int nvme_mpath_init_identify(struct nvme_ctrl *ctrl,
 		struct nvme_id_ctrl *id)
 {
-	if (ctrl->subsys->cmic & (1 << 3))
+	if (ctrl->subsys->cmic & NVME_CTRL_CMIC_ANA)
 		dev_warn(ctrl->device,
 "Please enable CONFIG_NVME_MULTIPATH for full support of multi-port devices.\n");
 	return 0;
