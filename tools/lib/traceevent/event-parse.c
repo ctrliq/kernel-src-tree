@@ -7120,6 +7120,7 @@ void tep_free(struct tep_handle *tep)
 	free(tep->events);
 	free(tep->sort_events);
 	free(tep->func_resolver);
+	tep_free_plugin_paths(tep);
 
 	free(tep);
 }
