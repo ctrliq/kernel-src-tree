@@ -1,0 +1,159 @@
+iommu/io-pgtable-arm: Rationalise MAIR handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 205577ab6f7ade6185f764ed78fb6875dca40205
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/205577ab.failed
+
+Between VMSAv8-64 and the various 32-bit formats, there is either one
+64-bit MAIR or a pair of 32-bit MAIR0/MAIR1 or NMRR/PMRR registers.
+As such, keeping two 64-bit values in io_pgtable_cfg has always been
+overkill.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 205577ab6f7ade6185f764ed78fb6875dca40205)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/ipmmu-vmsa.c
+diff --cc drivers/iommu/ipmmu-vmsa.c
+index 8ccab8ec763c,e4da6efbda49..000000000000
+--- a/drivers/iommu/ipmmu-vmsa.c
++++ b/drivers/iommu/ipmmu-vmsa.c
+@@@ -402,6 -414,57 +402,60 @@@ static int ipmmu_domain_init_context(st
+  {
+  	u64 ttbr;
+  	u32 tmp;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* TTBR0 */
++ 	ttbr = domain->cfg.arm_lpae_s1_cfg.ttbr[0];
++ 	ipmmu_ctx_write_root(domain, IMTTLBR0, ttbr);
++ 	ipmmu_ctx_write_root(domain, IMTTUBR0, ttbr >> 32);
++ 
++ 	/*
++ 	 * TTBCR
++ 	 * We use long descriptors and allocate the whole 32-bit VA space to
++ 	 * TTBR0.
++ 	 */
++ 	if (domain->mmu->features->twobit_imttbcr_sl0)
++ 		tmp = IMTTBCR_SL0_TWOBIT_LVL_1;
++ 	else
++ 		tmp = IMTTBCR_SL0_LVL_1;
++ 
++ 	if (domain->mmu->features->cache_snoop)
++ 		tmp |= IMTTBCR_SH0_INNER_SHAREABLE | IMTTBCR_ORGN0_WB_WA |
++ 		       IMTTBCR_IRGN0_WB_WA;
++ 
++ 	ipmmu_ctx_write_root(domain, IMTTBCR, IMTTBCR_EAE | tmp);
++ 
++ 	/* MAIR0 */
++ 	ipmmu_ctx_write_root(domain, IMMAIR0,
++ 			     domain->cfg.arm_lpae_s1_cfg.mair);
++ 
++ 	/* IMBUSCR */
++ 	if (domain->mmu->features->setup_imbuscr)
++ 		ipmmu_ctx_write_root(domain, IMBUSCR,
++ 				     ipmmu_ctx_read_root(domain, IMBUSCR) &
++ 				     ~(IMBUSCR_DVM | IMBUSCR_BUSSEL_MASK));
++ 
++ 	/*
++ 	 * IMSTR
++ 	 * Clear all interrupt flags.
++ 	 */
++ 	ipmmu_ctx_write_root(domain, IMSTR, ipmmu_ctx_read_root(domain, IMSTR));
++ 
++ 	/*
++ 	 * IMCTR
++ 	 * Enable the MMU and interrupt generation. The long-descriptor
++ 	 * translation table format doesn't use TEX remapping. Don't enable AF
++ 	 * software management as we have no use for it. Flush the TLB as
++ 	 * required when modifying the context registers.
++ 	 */
++ 	ipmmu_ctx_write_all(domain, IMCTR,
++ 			    IMCTR_INTEN | IMCTR_FLUSH | IMCTR_MMUEN);
++ }
++ 
++ static int ipmmu_domain_init_context(struct ipmmu_vmsa_domain *domain)
++ {
+++>>>>>>> 205577ab6f7a (iommu/io-pgtable-arm: Rationalise MAIR handling)
+  	int ret;
+  
+  	/*
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index d076622e2dd4..d4d84eb2a588 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -2179,7 +2179,7 @@ static int arm_smmu_domain_finalise_s1(struct arm_smmu_domain *smmu_domain,
+ 	cfg->cd.asid	= (u16)asid;
+ 	cfg->cd.ttbr	= pgtbl_cfg->arm_lpae_s1_cfg.ttbr[0];
+ 	cfg->cd.tcr	= pgtbl_cfg->arm_lpae_s1_cfg.tcr;
+-	cfg->cd.mair	= pgtbl_cfg->arm_lpae_s1_cfg.mair[0];
++	cfg->cd.mair	= pgtbl_cfg->arm_lpae_s1_cfg.mair;
+ 	return 0;
+ 
+ out_free_asid:
+diff --git a/drivers/iommu/arm-smmu.c b/drivers/iommu/arm-smmu.c
+index ab9a0239376c..b204ebfca568 100644
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@ -744,8 +744,8 @@ static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain,
+ 			cb->mair[0] = pgtbl_cfg->arm_v7s_cfg.prrr;
+ 			cb->mair[1] = pgtbl_cfg->arm_v7s_cfg.nmrr;
+ 		} else {
+-			cb->mair[0] = pgtbl_cfg->arm_lpae_s1_cfg.mair[0];
+-			cb->mair[1] = pgtbl_cfg->arm_lpae_s1_cfg.mair[1];
++			cb->mair[0] = pgtbl_cfg->arm_lpae_s1_cfg.mair;
++			cb->mair[1] = pgtbl_cfg->arm_lpae_s1_cfg.mair >> 32;
+ 		}
+ 	}
+ }
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index 4e5d466384a5..d74ccef9d4e7 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -872,8 +872,7 @@ arm_64_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
+ 	      (ARM_LPAE_MAIR_ATTR_INC_OWBRWA
+ 	       << ARM_LPAE_MAIR_ATTR_SHIFT(ARM_LPAE_MAIR_ATTR_IDX_INC_OCACHE));
+ 
+-	cfg->arm_lpae_s1_cfg.mair[0] = reg;
+-	cfg->arm_lpae_s1_cfg.mair[1] = 0;
++	cfg->arm_lpae_s1_cfg.mair = reg;
+ 
+ 	/* Looking good; allocate a pgd */
+ 	data->pgd = __arm_lpae_alloc_pages(ARM_LPAE_PGD_SIZE(data),
+* Unmerged path drivers/iommu/ipmmu-vmsa.c
+diff --git a/drivers/iommu/qcom_iommu.c b/drivers/iommu/qcom_iommu.c
+index 763f16e52d2a..eb04d827e084 100644
+--- a/drivers/iommu/qcom_iommu.c
++++ b/drivers/iommu/qcom_iommu.c
+@@ -295,9 +295,9 @@ static int qcom_iommu_init_domain(struct iommu_domain *domain,
+ 
+ 		/* MAIRs (stage-1 only) */
+ 		iommu_writel(ctx, ARM_SMMU_CB_S1_MAIR0,
+-				pgtbl_cfg.arm_lpae_s1_cfg.mair[0]);
++				pgtbl_cfg.arm_lpae_s1_cfg.mair);
+ 		iommu_writel(ctx, ARM_SMMU_CB_S1_MAIR1,
+-				pgtbl_cfg.arm_lpae_s1_cfg.mair[1]);
++				pgtbl_cfg.arm_lpae_s1_cfg.mair >> 32);
+ 
+ 		/* SCTLR */
+ 		reg = SCTLR_CFIE | SCTLR_CFRE | SCTLR_AFE | SCTLR_TRE |
+diff --git a/include/linux/io-pgtable.h b/include/linux/io-pgtable.h
+index 6b1b8be3ebec..3a76d3e29930 100644
+--- a/include/linux/io-pgtable.h
++++ b/include/linux/io-pgtable.h
+@@ -103,7 +103,7 @@ struct io_pgtable_cfg {
+ 		struct {
+ 			u64	ttbr[2];
+ 			u64	tcr;
+-			u64	mair[2];
++			u64	mair;
+ 		} arm_lpae_s1_cfg;
+ 
+ 		struct {
