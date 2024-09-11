@@ -1,0 +1,185 @@
+kasan: separate metadata_fetch_row for each mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 96e0279df6d8f2a1394de2b41815b0065c031950
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/96e0279d.failed
+
+This is a preparatory commit for the upcoming addition of a new hardware
+tag-based (MTE-based) KASAN mode.
+
+Rework print_memory_metadata() to make it agnostic with regard to the way
+metadata is stored.  Allow providing a separate metadata_fetch_row()
+implementation for each KASAN mode.  Hardware tag-based KASAN will provide
+its own implementation that doesn't use shadow memory.
+
+No functional changes for software modes.
+
+Link: https://lkml.kernel.org/r/5fb1ec0152bb1f521505017800387ec3e36ffe18.1606161801.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Signed-off-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Reviewed-by: Alexander Potapenko <glider@google.com>
+	Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 96e0279df6d8f2a1394de2b41815b0065c031950)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/report_generic.c
+* Unmerged path mm/kasan/report_generic.c
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index ac499456740f..9c37d6d8da6a 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -56,6 +56,13 @@
+ #define KASAN_ABI_VERSION 1
+ #endif
+ 
++/* Metadata layout customization. */
++#define META_BYTES_PER_BLOCK 1
++#define META_BLOCKS_PER_ROW 16
++#define META_BYTES_PER_ROW (META_BLOCKS_PER_ROW * META_BYTES_PER_BLOCK)
++#define META_MEM_BYTES_PER_ROW (META_BYTES_PER_ROW * KASAN_GRANULE_SIZE)
++#define META_ROWS_AROUND_ADDR 2
++
+ struct kasan_access_info {
+ 	const void *access_addr;
+ 	const void *first_bad_addr;
+@@ -165,6 +172,7 @@ bool check_memory_region(unsigned long addr, size_t size, bool write,
+ 
+ void *find_first_bad_addr(void *addr, size_t size);
+ const char *get_bug_type(struct kasan_access_info *info);
++void metadata_fetch_row(char *buffer, void *row);
+ 
+ bool kasan_report(unsigned long addr, size_t size,
+ 		bool is_write, unsigned long ip);
+diff --git a/mm/kasan/report.c b/mm/kasan/report.c
+index a0772fe304d1..5b1c2e3790d5 100644
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@ -30,12 +30,6 @@
+ #include "kasan.h"
+ #include "../slab.h"
+ 
+-/* Metadata layout customization. */
+-#define META_BYTES_PER_BLOCK 1
+-#define META_BLOCKS_PER_ROW 16
+-#define META_BYTES_PER_ROW (META_BLOCKS_PER_ROW * META_BYTES_PER_BLOCK)
+-#define META_ROWS_AROUND_ADDR 2
+-
+ static unsigned long kasan_flags;
+ 
+ #define KASAN_BIT_REPORTED	0
+@@ -397,55 +391,59 @@ static void print_address_description(void *addr, u8 tag)
+ 	print_address_stack_frame(addr);
+ }
+ 
+-static bool row_is_guilty(const void *row, const void *guilty)
++static bool meta_row_is_guilty(const void *row, const void *addr)
+ {
+-	return (row <= guilty) && (guilty < row + META_BYTES_PER_ROW);
++	return (row <= addr) && (addr < row + META_MEM_BYTES_PER_ROW);
+ }
+ 
+-static int shadow_pointer_offset(const void *row, const void *shadow)
++static int meta_pointer_offset(const void *row, const void *addr)
+ {
+-	/* The length of ">ff00ff00ff00ff00: " is
+-	 *    3 + (BITS_PER_LONG/8)*2 chars.
++	/*
++	 * Memory state around the buggy address:
++	 *  ff00ff00ff00ff00: 00 00 00 05 fe fe fe fe fe fe fe fe fe fe fe fe
++	 *  ...
++	 *
++	 * The length of ">ff00ff00ff00ff00: " is
++	 *    3 + (BITS_PER_LONG / 8) * 2 chars.
++	 * The length of each granule metadata is 2 bytes
++	 *    plus 1 byte for space.
+ 	 */
+-	return 3 + (BITS_PER_LONG/8)*2 + (shadow - row)*2 +
+-		(shadow - row) / META_BYTES_PER_BLOCK + 1;
++	return 3 + (BITS_PER_LONG / 8) * 2 +
++		(addr - row) / KASAN_GRANULE_SIZE * 3 + 1;
+ }
+ 
+ static void print_memory_metadata(const void *addr)
+ {
+ 	int i;
+-	const void *shadow = kasan_mem_to_shadow(addr);
+-	const void *shadow_row;
++	void *row;
+ 
+-	shadow_row = (void *)round_down((unsigned long)shadow,
+-					META_BYTES_PER_ROW)
+-		- META_ROWS_AROUND_ADDR * META_BYTES_PER_ROW;
++	row = (void *)round_down((unsigned long)addr, META_MEM_BYTES_PER_ROW)
++			- META_ROWS_AROUND_ADDR * META_MEM_BYTES_PER_ROW;
+ 
+ 	pr_err("Memory state around the buggy address:\n");
+ 
+ 	for (i = -META_ROWS_AROUND_ADDR; i <= META_ROWS_AROUND_ADDR; i++) {
+-		const void *kaddr = kasan_shadow_to_mem(shadow_row);
+-		char buffer[4 + (BITS_PER_LONG/8)*2];
+-		char shadow_buf[META_BYTES_PER_ROW];
++		char buffer[4 + (BITS_PER_LONG / 8) * 2];
++		char metadata[META_BYTES_PER_ROW];
+ 
+ 		snprintf(buffer, sizeof(buffer),
+-			(i == 0) ? ">%px: " : " %px: ", kaddr);
++				(i == 0) ? ">%px: " : " %px: ", row);
++
+ 		/*
+ 		 * We should not pass a shadow pointer to generic
+ 		 * function, because generic functions may try to
+ 		 * access kasan mapping for the passed address.
+ 		 */
+-		memcpy(shadow_buf, shadow_row, META_BYTES_PER_ROW);
++		metadata_fetch_row(&metadata[0], row);
++
+ 		print_hex_dump(KERN_ERR, buffer,
+ 			DUMP_PREFIX_NONE, META_BYTES_PER_ROW, 1,
+-			shadow_buf, META_BYTES_PER_ROW, 0);
++			metadata, META_BYTES_PER_ROW, 0);
+ 
+-		if (row_is_guilty(shadow_row, shadow))
+-			pr_err("%*c\n",
+-				shadow_pointer_offset(shadow_row, shadow),
+-				'^');
++		if (meta_row_is_guilty(row, addr))
++			pr_err("%*c\n", meta_pointer_offset(row, addr), '^');
+ 
+-		shadow_row += META_BYTES_PER_ROW;
++		row += META_MEM_BYTES_PER_ROW;
+ 	}
+ }
+ 
+* Unmerged path mm/kasan/report_generic.c
+diff --git a/mm/kasan/tags_report.c b/mm/kasan/tags_report.c
+index 5f183501b871..659fbb682db0 100644
+--- a/mm/kasan/tags_report.c
++++ b/mm/kasan/tags_report.c
+@@ -80,6 +80,11 @@ void *find_first_bad_addr(void *addr, size_t size)
+ 	return p;
+ }
+ 
++void metadata_fetch_row(char *buffer, void *row)
++{
++	memcpy(buffer, kasan_mem_to_shadow(row), META_BYTES_PER_ROW);
++}
++
+ void print_tags(u8 addr_tag, const void *addr)
+ {
+ 	u8 *shadow = (u8 *)kasan_mem_to_shadow(addr);
