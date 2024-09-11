@@ -356,6 +356,7 @@ struct vfio_region_gfx_edid {
 #define VFIO_REGION_TYPE_CCW			(2)
 /* ccw sub-types */
 #define VFIO_REGION_SUBTYPE_CCW_ASYNC_CMD	(1)
+#define VFIO_REGION_SUBTYPE_CCW_SCHIB		(2)
 
 /*
  * 10de vendor sub-type
