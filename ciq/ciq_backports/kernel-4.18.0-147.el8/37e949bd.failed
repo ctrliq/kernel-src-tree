@@ -1,0 +1,236 @@
+proc/kcore: clean up ELF header generation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Omar Sandoval <osandov@fb.com>
+commit 37e949bd5293ddb70acf236eedf2ae8caa1db57b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/37e949bd.failed
+
+Currently, the ELF file header, program headers, and note segment are
+allocated all at once, in some icky code dating back to 2.3.  Programs
+tend to read the file header, then the program headers, then the note
+segment, all separately, so this is a waste of effort.  It's cleaner and
+more efficient to handle the three separately.
+
+Link: http://lkml.kernel.org/r/19c92cbad0e11f6103ff3274b2e7a7e51a1eb74b.1531953780.git.osandov@fb.com
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Bhupesh Sharma <bhsharma@redhat.com>
+	Cc: Eric Biederman <ebiederm@xmission.com>
+	Cc: James Morse <james.morse@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 37e949bd5293ddb70acf236eedf2ae8caa1db57b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/kcore.c
+diff --cc fs/proc/kcore.c
+index 00d616f7727a,808ef9afd084..000000000000
+--- a/fs/proc/kcore.c
++++ b/fs/proc/kcore.c
+@@@ -69,12 -61,11 +60,13 @@@ kclist_add(struct kcore_list *new, voi
+  	new->size = size;
+  	new->type = type;
+  
+ +	write_lock(&kclist_lock);
+  	list_add_tail(&new->list, &kclist_head);
+ +	write_unlock(&kclist_lock);
+  }
+  
+- static size_t get_kcore_size(int *nphdr, size_t *elf_buflen)
++ static size_t get_kcore_size(int *nphdr, size_t *phdrs_len, size_t *notes_len,
++ 			     size_t *data_offset)
+  {
+  	size_t try, size;
+  	struct kcore_list *m;
+@@@ -275,169 -267,22 +268,176 @@@ out
+  	return ret;
+  }
+  
+- /*****************************************************************************/
+- /*
+-  * determine size of ELF note
+-  */
+- static int notesize(struct memelfnote *en)
++ static void append_kcore_note(char *notes, size_t *i, const char *name,
++ 			      unsigned int type, const void *desc,
++ 			      size_t descsz)
+  {
+- 	int sz;
+- 
+- 	sz = sizeof(struct elf_note);
+- 	sz += roundup((strlen(en->name) + 1), 4);
+- 	sz += roundup(en->datasz, 4);
++ 	struct elf_note *note = (struct elf_note *)&notes[*i];
++ 
++ 	note->n_namesz = strlen(name) + 1;
++ 	note->n_descsz = descsz;
++ 	note->n_type = type;
++ 	*i += sizeof(*note);
++ 	memcpy(&notes[*i], name, note->n_namesz);
++ 	*i = ALIGN(*i + note->n_namesz, 4);
++ 	memcpy(&notes[*i], desc, descsz);
++ 	*i = ALIGN(*i + descsz, 4);
++ }
+  
+++<<<<<<< HEAD
+ +	return sz;
+ +} /* end notesize() */
+ +
+ +/*****************************************************************************/
+ +/*
+ + * store a note in the header buffer
+ + */
+ +static char *storenote(struct memelfnote *men, char *bufp)
+ +{
+ +	struct elf_note en;
+ +
+ +#define DUMP_WRITE(addr,nr) do { memcpy(bufp,addr,nr); bufp += nr; } while(0)
+ +
+ +	en.n_namesz = strlen(men->name) + 1;
+ +	en.n_descsz = men->datasz;
+ +	en.n_type = men->type;
+ +
+ +	DUMP_WRITE(&en, sizeof(en));
+ +	DUMP_WRITE(men->name, en.n_namesz);
+ +
+ +	/* XXX - cast from long long to long to avoid need for libgcc.a */
+ +	bufp = (char*) roundup((unsigned long)bufp,4);
+ +	DUMP_WRITE(men->data, men->datasz);
+ +	bufp = (char*) roundup((unsigned long)bufp,4);
+ +
+ +#undef DUMP_WRITE
+ +
+ +	return bufp;
+ +} /* end storenote() */
+ +
+ +/*
+ + * store an ELF coredump header in the supplied buffer
+ + * nphdr is the number of elf_phdr to insert
+ + */
+ +static void elf_kcore_store_hdr(char *bufp, int nphdr, int dataoff)
+ +{
+ +	struct elf_prstatus prstatus;	/* NT_PRSTATUS */
+ +	struct elf_prpsinfo prpsinfo;	/* NT_PRPSINFO */
+ +	struct elf_phdr *nhdr, *phdr;
+ +	struct elfhdr *elf;
+ +	struct memelfnote notes[3];
+ +	off_t offset = 0;
+ +	struct kcore_list *m;
+ +
+ +	/* setup ELF header */
+ +	elf = (struct elfhdr *) bufp;
+ +	bufp += sizeof(struct elfhdr);
+ +	offset += sizeof(struct elfhdr);
+ +	memcpy(elf->e_ident, ELFMAG, SELFMAG);
+ +	elf->e_ident[EI_CLASS]	= ELF_CLASS;
+ +	elf->e_ident[EI_DATA]	= ELF_DATA;
+ +	elf->e_ident[EI_VERSION]= EV_CURRENT;
+ +	elf->e_ident[EI_OSABI] = ELF_OSABI;
+ +	memset(elf->e_ident+EI_PAD, 0, EI_NIDENT-EI_PAD);
+ +	elf->e_type	= ET_CORE;
+ +	elf->e_machine	= ELF_ARCH;
+ +	elf->e_version	= EV_CURRENT;
+ +	elf->e_entry	= 0;
+ +	elf->e_phoff	= sizeof(struct elfhdr);
+ +	elf->e_shoff	= 0;
+ +	elf->e_flags	= ELF_CORE_EFLAGS;
+ +	elf->e_ehsize	= sizeof(struct elfhdr);
+ +	elf->e_phentsize= sizeof(struct elf_phdr);
+ +	elf->e_phnum	= nphdr;
+ +	elf->e_shentsize= 0;
+ +	elf->e_shnum	= 0;
+ +	elf->e_shstrndx	= 0;
+ +
+ +	/* setup ELF PT_NOTE program header */
+ +	nhdr = (struct elf_phdr *) bufp;
+ +	bufp += sizeof(struct elf_phdr);
+ +	offset += sizeof(struct elf_phdr);
+ +	nhdr->p_type	= PT_NOTE;
+ +	nhdr->p_offset	= 0;
+ +	nhdr->p_vaddr	= 0;
+ +	nhdr->p_paddr	= 0;
+ +	nhdr->p_filesz	= 0;
+ +	nhdr->p_memsz	= 0;
+ +	nhdr->p_flags	= 0;
+ +	nhdr->p_align	= 0;
+ +
+ +	/* setup ELF PT_LOAD program header for every area */
+ +	list_for_each_entry(m, &kclist_head, list) {
+ +		phdr = (struct elf_phdr *) bufp;
+ +		bufp += sizeof(struct elf_phdr);
+ +		offset += sizeof(struct elf_phdr);
+ +
+ +		phdr->p_type	= PT_LOAD;
+ +		phdr->p_flags	= PF_R|PF_W|PF_X;
+ +		phdr->p_offset	= kc_vaddr_to_offset(m->addr) + dataoff;
+ +		if (m->type == KCORE_REMAP)
+ +			phdr->p_vaddr	= (size_t)m->vaddr;
+ +		else
+ +			phdr->p_vaddr	= (size_t)m->addr;
+ +		if (m->type == KCORE_RAM || m->type == KCORE_TEXT || m->type == KCORE_REMAP)
+ +			phdr->p_paddr	= __pa(m->addr);
+ +		else
+ +			phdr->p_paddr	= (elf_addr_t)-1;
+ +		phdr->p_filesz	= phdr->p_memsz	= m->size;
+ +		phdr->p_align	= PAGE_SIZE;
+ +	}
+ +
+ +	/*
+ +	 * Set up the notes in similar form to SVR4 core dumps made
+ +	 * with info from their /proc.
+ +	 */
+ +	nhdr->p_offset	= offset;
+ +
+ +	/* set up the process status */
+ +	notes[0].name = CORE_STR;
+ +	notes[0].type = NT_PRSTATUS;
+ +	notes[0].datasz = sizeof(struct elf_prstatus);
+ +	notes[0].data = &prstatus;
+ +
+ +	memset(&prstatus, 0, sizeof(struct elf_prstatus));
+ +
+ +	nhdr->p_filesz	= notesize(&notes[0]);
+ +	bufp = storenote(&notes[0], bufp);
+ +
+ +	/* set up the process info */
+ +	notes[1].name	= CORE_STR;
+ +	notes[1].type	= NT_PRPSINFO;
+ +	notes[1].datasz	= sizeof(struct elf_prpsinfo);
+ +	notes[1].data	= &prpsinfo;
+ +
+ +	memset(&prpsinfo, 0, sizeof(struct elf_prpsinfo));
+ +	prpsinfo.pr_state	= 0;
+ +	prpsinfo.pr_sname	= 'R';
+ +	prpsinfo.pr_zomb	= 0;
+ +
+ +	strcpy(prpsinfo.pr_fname, "vmlinux");
+ +	strlcpy(prpsinfo.pr_psargs, saved_command_line, sizeof(prpsinfo.pr_psargs));
+ +
+ +	nhdr->p_filesz	+= notesize(&notes[1]);
+ +	bufp = storenote(&notes[1], bufp);
+ +
+ +	/* set up the task structure */
+ +	notes[2].name	= CORE_STR;
+ +	notes[2].type	= NT_TASKSTRUCT;
+ +	notes[2].datasz	= arch_task_struct_size;
+ +	notes[2].data	= current;
+ +
+ +	nhdr->p_filesz	+= notesize(&notes[2]);
+ +	bufp = storenote(&notes[2], bufp);
+ +
+ +} /* end elf_kcore_store_hdr() */
+ +
+ +/*****************************************************************************/
+ +/*
+ + * read from the ELF header and then kernel memory
+ + */
+++=======
+++>>>>>>> 37e949bd5293 (proc/kcore: clean up ELF header generation)
+  static ssize_t
+  read_kcore(struct file *file, char __user *buffer, size_t buflen, loff_t *fpos)
+  {
+* Unmerged path fs/proc/kcore.c
