@@ -56,6 +56,7 @@
 #include <asm/spec_ctrl.h>
 
 #include <asm/uv/uv.h>
+#include <asm/sigframe.h>
 
 #include "cpu.h"
 
@@ -1188,6 +1189,8 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
 	sld_setup(c);
 
 	fpu__init_system(c);
+
+	init_sigframe_size();
 
 #ifdef CONFIG_X86_32
 	/*
