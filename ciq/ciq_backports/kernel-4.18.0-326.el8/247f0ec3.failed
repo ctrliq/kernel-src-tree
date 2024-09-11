@@ -1,0 +1,308 @@
+selftests/bpf: Drop python client/server in favor of threads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Alexander Duyck <alexanderduyck@fb.com>
+commit 247f0ec361b7e0c5c67db8222873182fb8be5146
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/247f0ec3.failed
+
+Drop the tcp_client/server.py files in favor of using a client and server
+thread within the test case. Specifically we spawn a new thread to play the
+role of the server, and the main testing thread plays the role of client.
+
+Add logic to the end of the run_test function to guarantee that the sockets
+are closed when we begin verifying results.
+
+Doing this we are able to reduce overhead since we don't have two python
+workers possibly floating around. In addition we don't have to worry about
+synchronization issues and as such the retry loop waiting for the threads
+to close the sockets can be dropped as we will have already closed the
+sockets in the local executable and synchronized the server thread.
+
+	Signed-off-by: Alexander Duyck <alexanderduyck@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/160443929638.1086697.2430242340980315521.stgit@localhost.localdomain
+(cherry picked from commit 247f0ec361b7e0c5c67db8222873182fb8be5146)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/test_tcpbpf_user.c
+diff --cc tools/testing/selftests/bpf/test_tcpbpf_user.c
+index 74a9e49988b6,616269abdb41..000000000000
+--- a/tools/testing/selftests/bpf/test_tcpbpf_user.c
++++ b/tools/testing/selftests/bpf/test_tcpbpf_user.c
+@@@ -1,23 -1,14 +1,35 @@@
+  // SPDX-License-Identifier: GPL-2.0
+  #include <inttypes.h>
+++<<<<<<< HEAD:tools/testing/selftests/bpf/test_tcpbpf_user.c
+ +#include <stdio.h>
+ +#include <stdlib.h>
+ +#include <unistd.h>
+ +#include <errno.h>
+ +#include <string.h>
+ +#include <linux/bpf.h>
+ +#include <sys/types.h>
+ +#include <bpf/bpf.h>
+ +#include <bpf/libbpf.h>
+ +
+ +#include "bpf_rlimit.h"
+ +#include "bpf_util.h"
+ +#include "cgroup_helpers.h"
+ +
+ +#include "test_tcpbpf.h"
+ +
+ +/* 3 comes from one listening socket + both ends of the connection */
+ +#define EXPECTED_CLOSE_EVENTS		3
+++=======
++ #include <test_progs.h>
++ #include <network_helpers.h>
++ 
++ #include "test_tcpbpf.h"
++ 
++ #define LO_ADDR6 "::1"
++ #define CG_NAME "/tcpbpf-user-test"
++ 
++ static __u32 duration;
+++>>>>>>> 247f0ec361b7 (selftests/bpf: Drop python client/server in favor of threads):tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+  
+  #define EXPECT_EQ(expected, actual, fmt)			\
+  	do {							\
+@@@ -76,20 -69,76 +90,93 @@@ int verify_sockopt_result(int sock_map_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD:tools/testing/selftests/bpf/test_tcpbpf_user.c
+ +static int bpf_find_map(const char *test, struct bpf_object *obj,
+ +			const char *name)
+ +{
+ +	struct bpf_map *map;
+ +
+ +	map = bpf_object__find_map_by_name(obj, name);
+ +	if (!map) {
+ +		printf("%s:FAIL:map '%s' not found\n", test, name);
+ +		return -1;
+ +	}
+ +	return bpf_map__fd(map);
+ +}
+ +
+ +int main(int argc, char **argv)
+++=======
++ static int run_test(void)
++ {
++ 	int listen_fd = -1, cli_fd = -1, accept_fd = -1;
++ 	char buf[1000];
++ 	int err = -1;
++ 	int i, rv;
++ 
++ 	listen_fd = start_server(AF_INET6, SOCK_STREAM, LO_ADDR6, 0, 0);
++ 	if (CHECK(listen_fd == -1, "start_server", "listen_fd:%d errno:%d\n",
++ 		  listen_fd, errno))
++ 		goto done;
++ 
++ 	cli_fd = connect_to_fd(listen_fd, 0);
++ 	if (CHECK(cli_fd == -1, "connect_to_fd(listen_fd)",
++ 		  "cli_fd:%d errno:%d\n", cli_fd, errno))
++ 		goto done;
++ 
++ 	accept_fd = accept(listen_fd, NULL, NULL);
++ 	if (CHECK(accept_fd == -1, "accept(listen_fd)",
++ 		  "accept_fd:%d errno:%d\n", accept_fd, errno))
++ 		goto done;
++ 
++ 	/* Send 1000B of '+'s from cli_fd -> accept_fd */
++ 	for (i = 0; i < 1000; i++)
++ 		buf[i] = '+';
++ 
++ 	rv = send(cli_fd, buf, 1000, 0);
++ 	if (CHECK(rv != 1000, "send(cli_fd)", "rv:%d errno:%d\n", rv, errno))
++ 		goto done;
++ 
++ 	rv = recv(accept_fd, buf, 1000, 0);
++ 	if (CHECK(rv != 1000, "recv(accept_fd)", "rv:%d errno:%d\n", rv, errno))
++ 		goto done;
++ 
++ 	/* Send 500B of '.'s from accept_fd ->cli_fd */
++ 	for (i = 0; i < 500; i++)
++ 		buf[i] = '.';
++ 
++ 	rv = send(accept_fd, buf, 500, 0);
++ 	if (CHECK(rv != 500, "send(accept_fd)", "rv:%d errno:%d\n", rv, errno))
++ 		goto done;
++ 
++ 	rv = recv(cli_fd, buf, 500, 0);
++ 	if (CHECK(rv != 500, "recv(cli_fd)", "rv:%d errno:%d\n", rv, errno))
++ 		goto done;
++ 
++ 	/*
++ 	 * shutdown accept first to guarantee correct ordering for
++ 	 * bytes_received and bytes_acked when we go to verify the results.
++ 	 */
++ 	shutdown(accept_fd, SHUT_WR);
++ 	err = recv(cli_fd, buf, 1, 0);
++ 	if (CHECK(err, "recv(cli_fd) for fin", "err:%d errno:%d\n", err, errno))
++ 		goto done;
++ 
++ 	shutdown(cli_fd, SHUT_WR);
++ 	err = recv(accept_fd, buf, 1, 0);
++ 	CHECK(err, "recv(accept_fd) for fin", "err:%d errno:%d\n", err, errno);
++ done:
++ 	if (accept_fd != -1)
++ 		close(accept_fd);
++ 	if (cli_fd != -1)
++ 		close(cli_fd);
++ 	if (listen_fd != -1)
++ 		close(listen_fd);
++ 
++ 	return err;
++ }
++ 
++ void test_tcpbpf_user(void)
+++>>>>>>> 247f0ec361b7 (selftests/bpf: Drop python client/server in favor of threads):tools/testing/selftests/bpf/prog_tests/tcpbpf_user.c
+  {
+  	const char *file = "test_tcpbpf_kern.o";
+  	int prog_fd, map_fd, sock_map_fd;
+diff --git a/tools/testing/selftests/bpf/tcp_client.py b/tools/testing/selftests/bpf/tcp_client.py
+deleted file mode 100755
+index bfff82be3fc1..000000000000
+--- a/tools/testing/selftests/bpf/tcp_client.py
++++ /dev/null
+@@ -1,50 +0,0 @@
+-#!/usr/bin/env python3
+-#
+-# SPDX-License-Identifier: GPL-2.0
+-#
+-
+-import sys, os, os.path, getopt
+-import socket, time
+-import subprocess
+-import select
+-
+-def read(sock, n):
+-    buf = b''
+-    while len(buf) < n:
+-        rem = n - len(buf)
+-        try: s = sock.recv(rem)
+-        except (socket.error) as e: return b''
+-        buf += s
+-    return buf
+-
+-def send(sock, s):
+-    total = len(s)
+-    count = 0
+-    while count < total:
+-        try: n = sock.send(s)
+-        except (socket.error) as e: n = 0
+-        if n == 0:
+-            return count;
+-        count += n
+-    return count
+-
+-
+-serverPort = int(sys.argv[1])
+-
+-# create active socket
+-sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+-try:
+-    sock.connect(('::1', serverPort))
+-except socket.error as e:
+-    sys.exit(1)
+-
+-buf = b''
+-n = 0
+-while n < 1000:
+-    buf += b'+'
+-    n += 1
+-
+-sock.settimeout(1);
+-n = send(sock, buf)
+-n = read(sock, 500)
+-sys.exit(0)
+diff --git a/tools/testing/selftests/bpf/tcp_server.py b/tools/testing/selftests/bpf/tcp_server.py
+deleted file mode 100755
+index 42ab8882f00f..000000000000
+--- a/tools/testing/selftests/bpf/tcp_server.py
++++ /dev/null
+@@ -1,80 +0,0 @@
+-#!/usr/bin/env python3
+-#
+-# SPDX-License-Identifier: GPL-2.0
+-#
+-
+-import sys, os, os.path, getopt
+-import socket, time
+-import subprocess
+-import select
+-
+-def read(sock, n):
+-    buf = b''
+-    while len(buf) < n:
+-        rem = n - len(buf)
+-        try: s = sock.recv(rem)
+-        except (socket.error) as e: return b''
+-        buf += s
+-    return buf
+-
+-def send(sock, s):
+-    total = len(s)
+-    count = 0
+-    while count < total:
+-        try: n = sock.send(s)
+-        except (socket.error) as e: n = 0
+-        if n == 0:
+-            return count;
+-        count += n
+-    return count
+-
+-
+-SERVER_PORT = 12877
+-MAX_PORTS = 2
+-
+-serverPort = SERVER_PORT
+-serverSocket = None
+-
+-# create passive socket
+-serverSocket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+-
+-try: serverSocket.bind(('::1', 0))
+-except socket.error as msg:
+-    print('bind fails: ' + str(msg))
+-
+-sn = serverSocket.getsockname()
+-serverPort = sn[1]
+-
+-cmdStr = ("./tcp_client.py %d &") % (serverPort)
+-os.system(cmdStr)
+-
+-buf = b''
+-n = 0
+-while n < 500:
+-    buf += b'.'
+-    n += 1
+-
+-serverSocket.listen(MAX_PORTS)
+-readList = [serverSocket]
+-
+-while True:
+-    readyRead, readyWrite, inError = \
+-        select.select(readList, [], [], 2)
+-
+-    if len(readyRead) > 0:
+-        waitCount = 0
+-        for sock in readyRead:
+-            if sock == serverSocket:
+-                (clientSocket, address) = serverSocket.accept()
+-                address = str(address[0])
+-                readList.append(clientSocket)
+-            else:
+-                sock.settimeout(1);
+-                s = read(sock, 1000)
+-                n = send(sock, buf)
+-                sock.close()
+-                serverSocket.close()
+-                sys.exit(0)
+-    else:
+-        print('Select timeout!')
+-        sys.exit(1)
+* Unmerged path tools/testing/selftests/bpf/test_tcpbpf_user.c
