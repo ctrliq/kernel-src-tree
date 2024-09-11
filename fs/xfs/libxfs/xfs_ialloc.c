@@ -2363,7 +2363,8 @@ out_map:
 	}
 	error = 0;
 out_drop:
-	xfs_perag_put(pag);
+	if (pag)
+		xfs_perag_put(pag);
 	return error;
 }
 
