@@ -1,0 +1,339 @@
+x86/asm: Move native_write_cr0/4() out of line
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 7652ac92018536eb807b6c2130100c85f1ba7e3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/7652ac92.failed
+
+The pinning of sensitive CR0 and CR4 bits caused a boot crash when loading
+the kvm_intel module on a kernel compiled with CONFIG_PARAVIRT=n.
+
+The reason is that the static key which controls the pinning is marked RO
+after init. The kvm_intel module contains a CR4 write which requires to
+update the static key entry list. That obviously does not work when the key
+is in a RO section.
+
+With CONFIG_PARAVIRT enabled this does not happen because the CR4 write
+uses the paravirt indirection and the actual write function is built in.
+
+As the key is intended to be immutable after init, move
+native_write_cr0/4() out of line.
+
+While at it consolidate the update of the cr4 shadow variable and store the
+value right away when the pinning is initialized on a booting CPU. No point
+in reading it back 20 instructions later. This allows to confine the static
+key and the pinning variable to cpu/common and allows to mark them static.
+
+Fixes: 8dbec27a242c ("x86/asm: Pin sensitive CR0 bits")
+Fixes: 873d50d58f67 ("x86/asm: Pin sensitive CR4 bits")
+	Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Reported-by: Xi Ruoyao <xry111@mengyan1223.wang>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Xi Ruoyao <xry111@mengyan1223.wang>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/alpine.DEB.2.21.1907102140340.1758@nanos.tec.linutronix.de
+
+(cherry picked from commit 7652ac92018536eb807b6c2130100c85f1ba7e3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/processor.h
+#	arch/x86/include/asm/special_insns.h
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/include/asm/processor.h
+index 190ba9825ba1,6e0a3b43d027..000000000000
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@@ -684,7 -741,7 +684,11 @@@ extern void load_direct_gdt(int)
+  extern void load_fixmap_gdt(int);
+  extern void load_percpu_segment(int);
+  extern void cpu_init(void);
+++<<<<<<< HEAD
+ +extern void cpu_init_exception_handling(void);
+++=======
++ extern void cr4_init(void);
+++>>>>>>> 7652ac920185 (x86/asm: Move native_write_cr0/4() out of line)
+  
+  static inline unsigned long get_debugctlmsr(void)
+  {
+diff --cc arch/x86/include/asm/special_insns.h
+index b2d9ccdfd2dc,219be88a59d2..000000000000
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@@ -16,6 -18,8 +16,11 @@@
+   */
+  extern unsigned long __force_order;
+  
+++<<<<<<< HEAD
+++=======
++ void native_write_cr0(unsigned long val);
++ 
+++>>>>>>> 7652ac920185 (x86/asm: Move native_write_cr0/4() out of line)
+  static inline unsigned long native_read_cr0(void)
+  {
+  	unsigned long val;
+@@@ -85,10 -71,7 +72,14 @@@ static inline unsigned long native_read
+  	return val;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void native_write_cr4(unsigned long val)
+ +{
+ +	asm volatile("mov %0,%%cr4": : "r" (val), "m" (__force_order));
+ +}
+++=======
++ void native_write_cr4(unsigned long val);
+++>>>>>>> 7652ac920185 (x86/asm: Move native_write_cr0/4() out of line)
+  
+  #ifdef CONFIG_X86_64
+  static inline unsigned long native_read_cr8(void)
+diff --cc arch/x86/kernel/cpu/common.c
+index 2a2db559b939,11472178e17f..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -376,21 -366,76 +376,87 @@@ out
+  	cr4_clear_bits(X86_CR4_UMIP);
+  }
+  
+++<<<<<<< HEAD
+ +static __init int x86_nofsgsbase_setup(char *arg)
+++=======
++ static DEFINE_STATIC_KEY_FALSE_RO(cr_pinning);
++ static unsigned long cr4_pinned_bits __ro_after_init;
++ 
++ void native_write_cr0(unsigned long val)
++ {
++ 	unsigned long bits_missing = 0;
++ 
++ set_register:
++ 	asm volatile("mov %0,%%cr0": "+r" (val), "+m" (__force_order));
++ 
++ 	if (static_branch_likely(&cr_pinning)) {
++ 		if (unlikely((val & X86_CR0_WP) != X86_CR0_WP)) {
++ 			bits_missing = X86_CR0_WP;
++ 			val |= bits_missing;
++ 			goto set_register;
++ 		}
++ 		/* Warn after we've set the missing bits. */
++ 		WARN_ONCE(bits_missing, "CR0 WP bit went missing!?\n");
++ 	}
++ }
++ EXPORT_SYMBOL(native_write_cr0);
++ 
++ void native_write_cr4(unsigned long val)
++ {
++ 	unsigned long bits_missing = 0;
++ 
++ set_register:
++ 	asm volatile("mov %0,%%cr4": "+r" (val), "+m" (cr4_pinned_bits));
++ 
++ 	if (static_branch_likely(&cr_pinning)) {
++ 		if (unlikely((val & cr4_pinned_bits) != cr4_pinned_bits)) {
++ 			bits_missing = ~val & cr4_pinned_bits;
++ 			val |= bits_missing;
++ 			goto set_register;
++ 		}
++ 		/* Warn after we've set the missing bits. */
++ 		WARN_ONCE(bits_missing, "CR4 bits went missing: %lx!?\n",
++ 			  bits_missing);
++ 	}
++ }
++ EXPORT_SYMBOL(native_write_cr4);
++ 
++ void cr4_init(void)
++ {
++ 	unsigned long cr4 = __read_cr4();
++ 
++ 	if (boot_cpu_has(X86_FEATURE_PCID))
++ 		cr4 |= X86_CR4_PCIDE;
++ 	if (static_branch_likely(&cr_pinning))
++ 		cr4 |= cr4_pinned_bits;
++ 
++ 	__write_cr4(cr4);
++ 
++ 	/* Initialize cr4 shadow for this CPU. */
++ 	this_cpu_write(cpu_tlbstate.cr4, cr4);
++ }
++ 
++ /*
++  * Once CPU feature detection is finished (and boot params have been
++  * parsed), record any of the sensitive CR bits that are set, and
++  * enable CR pinning.
++  */
++ static void __init setup_cr_pinning(void)
+++>>>>>>> 7652ac920185 (x86/asm: Move native_write_cr0/4() out of line)
+  {
+ -	unsigned long mask;
+ +	/* Require an exact match without trailing characters. */
+ +	if (strlen(arg))
+ +		return 0;
+  
+ -	mask = (X86_CR4_SMEP | X86_CR4_SMAP | X86_CR4_UMIP);
+ -	cr4_pinned_bits = this_cpu_read(cpu_tlbstate.cr4) & mask;
+ -	static_key_enable(&cr_pinning.key);
+ +	/* Do not emit a message if the feature is not present. */
+ +	if (!boot_cpu_has(X86_FEATURE_FSGSBASE))
+ +		return 1;
+ +
+ +	setup_clear_cpu_cap(X86_FEATURE_FSGSBASE);
+ +	pr_info("FSGSBASE disabled via kernel command line\n");
+ +	return 1;
+  }
+ +__setup("nofsgsbase", x86_nofsgsbase_setup);
+  
+  /*
+   * Protection Keys are not available in 32-bit mode.
+@@@ -1916,13 -1772,13 +1982,20 @@@ void cpu_init(void
+  
+  	wait_for_master_cpu(cpu);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Initialize the CR4 shadow before doing anything that could
+ +	 * try to read it.
+ +	 */
+ +	cr4_init_shadow();
+ +
+ +	ucode_cpu_init(cpu);
+++=======
++ 	if (cpu)
++ 		load_ucode_ap();
++ 
++ 	t = &per_cpu(cpu_tss_rw, cpu);
+++>>>>>>> 7652ac920185 (x86/asm: Move native_write_cr0/4() out of line)
+  
+  #ifdef CONFIG_NUMA
+  	if (this_cpu_read(numa_node) == 0 &&
+@@@ -1990,22 -1859,62 +2063,75 @@@
+  	load_fixmap_gdt(cpu);
+  }
+  
+ -#else
+ -
+ -void cpu_init(void)
+ +static void bsp_resume(void)
+  {
+++<<<<<<< HEAD
+ +	if (this_cpu->c_bsp_resume)
+ +		this_cpu->c_bsp_resume(&boot_cpu_data);
+++=======
++ 	int cpu = smp_processor_id();
++ 	struct task_struct *curr = current;
++ 	struct tss_struct *t = &per_cpu(cpu_tss_rw, cpu);
++ 
++ 	wait_for_master_cpu(cpu);
++ 
++ 	show_ucode_info_early();
++ 
++ 	pr_info("Initializing CPU#%d\n", cpu);
++ 
++ 	if (cpu_feature_enabled(X86_FEATURE_VME) ||
++ 	    boot_cpu_has(X86_FEATURE_TSC) ||
++ 	    boot_cpu_has(X86_FEATURE_DE))
++ 		cr4_clear_bits(X86_CR4_VME|X86_CR4_PVI|X86_CR4_TSD|X86_CR4_DE);
++ 
++ 	load_current_idt();
++ 	switch_to_new_gdt(cpu);
++ 
++ 	/*
++ 	 * Set up and load the per-CPU TSS and LDT
++ 	 */
++ 	mmgrab(&init_mm);
++ 	curr->active_mm = &init_mm;
++ 	BUG_ON(curr->mm);
++ 	initialize_tlbstate_and_flush();
++ 	enter_lazy_tlb(&init_mm, curr);
++ 
++ 	/*
++ 	 * Initialize the TSS.  sp0 points to the entry trampoline stack
++ 	 * regardless of what task is running.
++ 	 */
++ 	set_tss_desc(cpu, &get_cpu_entry_area(cpu)->tss.x86_tss);
++ 	load_TR_desc();
++ 	load_sp0((unsigned long)(cpu_entry_stack(cpu) + 1));
++ 
++ 	load_mm_ldt(&init_mm);
++ 
++ 	t->x86_tss.io_bitmap_base = IO_BITMAP_OFFSET;
++ 
++ #ifdef CONFIG_DOUBLEFAULT
++ 	/* Set up doublefault TSS pointer in the GDT */
++ 	__set_tss_desc(cpu, GDT_ENTRY_DOUBLEFAULT_TSS, &doublefault_tss);
++ #endif
++ 
++ 	clear_all_debug_regs();
++ 	dbg_restore_debug_regs();
++ 
++ 	fpu__init_cpu();
++ 
++ 	load_fixmap_gdt(cpu);
+++>>>>>>> 7652ac920185 (x86/asm: Move native_write_cr0/4() out of line)
+  }
+ -#endif
+ +
+ +static struct syscore_ops cpu_syscore_ops = {
+ +	.resume		= bsp_resume,
+ +};
+ +
+ +static int __init init_cpu_syscore(void)
+ +{
+ +	register_syscore_ops(&cpu_syscore_ops);
+ +	return 0;
+ +}
+ +core_initcall(init_cpu_syscore);
+  
+  /*
+   * The microcode loader calls this upon late microcode load to recheck features,
+diff --cc arch/x86/kernel/smpboot.c
+index 18f014982211,259d1d2be076..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -234,22 -215,15 +234,21 @@@ static void notrace start_secondary(voi
+  	 * before cpu_init(), SMP booting is too fragile that we want to
+  	 * limit the things done here to the most necessary things.
+  	 */
+++<<<<<<< HEAD
+ +	if (boot_cpu_has(X86_FEATURE_PCID))
+ +		__write_cr4(__read_cr4() | X86_CR4_PCIDE);
+++=======
++ 	cr4_init();
+++>>>>>>> 7652ac920185 (x86/asm: Move native_write_cr0/4() out of line)
+  
+  #ifdef CONFIG_X86_32
+  	/* switch away from the initial page table */
+  	load_cr3(swapper_pg_dir);
+- 	/*
+- 	 * Initialize the CR4 shadow before doing anything that could
+- 	 * try to read it.
+- 	 */
+- 	cr4_init_shadow();
+  	__flush_tlb_all();
+  #endif
+ -	load_current_idt();
+ +	cpu_init_exception_handling();
+  	cpu_init();
+ +	rcu_cpu_starting(raw_smp_processor_id());
+  	x86_cpuinit.early_percpu_clock_init();
+  	preempt_disable();
+  	smp_callin();
+* Unmerged path arch/x86/include/asm/processor.h
+* Unmerged path arch/x86/include/asm/special_insns.h
+* Unmerged path arch/x86/kernel/cpu/common.c
+* Unmerged path arch/x86/kernel/smpboot.c
+diff --git a/arch/x86/xen/smp_pv.c b/arch/x86/xen/smp_pv.c
+index 649e264f0607..d5154a1d1e40 100644
+--- a/arch/x86/xen/smp_pv.c
++++ b/arch/x86/xen/smp_pv.c
+@@ -57,6 +57,7 @@ static void cpu_bringup(void)
+ {
+ 	int cpu;
+ 
++	cr4_init();
+ 	cpu_init();
+ 	touch_softlockup_watchdog();
+ 	preempt_disable();
