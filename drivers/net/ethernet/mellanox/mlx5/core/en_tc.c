@@ -3293,6 +3293,7 @@ int mlx5e_configure_flower(struct net_device *dev, struct mlx5e_priv *priv,
 		netdev_warn_once(priv->netdev,
 				 "flow cookie %lx already exists, ignoring\n",
 				 f->cookie);
+		err = -EEXIST;
 		goto out;
 	}
 
