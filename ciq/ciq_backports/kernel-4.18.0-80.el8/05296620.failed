@@ -1,0 +1,284 @@
+xdp: factor out common program/flags handling from drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 05296620f6d14dce0030b87e1e57891a770fb65c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/05296620.failed
+
+Basic operations drivers perform during xdp setup and query can
+be moved to helpers in the core.  Encapsulate program and flags
+into a structure and add helpers.  Note that the structure is
+intended as the "main" program information source in the driver.
+Most drivers will additionally place the program pointer in their
+fast path or ring structures.
+
+The helpers don't have a huge impact now, but they will
+decrease the code duplication when programs can be installed
+in HW and driver at the same time.  Encapsulating the basic
+operations in helpers will hopefully also reduce the number
+of changes to drivers which adopt them.
+
+Helpers could really be static inline, but they depend on
+definition of struct netdev_bpf which means they'd have
+to be placed in netdevice.h, an already 4500 line header.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 05296620f6d14dce0030b87e1e57891a770fb65c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/test_offload.py
+diff --cc tools/testing/selftests/bpf/test_offload.py
+index be800d0e7a84,40401e9e9351..000000000000
+--- a/tools/testing/selftests/bpf/test_offload.py
++++ b/tools/testing/selftests/bpf/test_offload.py
+@@@ -830,8 -830,8 +830,13 @@@ try
+      check_extack_nsim(err, "program loaded with different flags.", args)
+      ret, _, err = sim.unset_xdp("", force=True,
+                                  fail=False, include_stderr=True)
+++<<<<<<< HEAD
+ +    fail(ret == 0, "Removed program with a bad mode mode")
+ +    check_extack_nsim(err, "program loaded with different flags.", args)
+++=======
++     fail(ret == 0, "Removed program with a bad mode")
++     check_extack(err, "program loaded with different flags.", args)
+++>>>>>>> 05296620f6d1 (xdp: factor out common program/flags handling from drivers)
+  
+      start_test("Test MTU restrictions...")
+      ret, _ = sim.set_mtu(9000, fail=False)
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 2a71a9ffd095..2021dda595b7 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -553,8 +553,7 @@ struct nfp_net_dp {
+  * @rss_cfg:            RSS configuration
+  * @rss_key:            RSS secret key
+  * @rss_itbl:           RSS indirection table
+- * @xdp_flags:		Flags with which XDP prog was loaded
+- * @xdp_prog:		XDP prog (for ctrl path, both DRV and HW modes)
++ * @xdp:		Information about the attached XDP program
+  * @max_r_vecs:		Number of allocated interrupt vectors for RX/TX
+  * @max_tx_rings:       Maximum number of TX rings supported by the Firmware
+  * @max_rx_rings:       Maximum number of RX rings supported by the Firmware
+@@ -610,8 +609,7 @@ struct nfp_net {
+ 	u8 rss_key[NFP_NET_CFG_RSS_KEY_SZ];
+ 	u8 rss_itbl[NFP_NET_CFG_RSS_ITBL_SZ];
+ 
+-	u32 xdp_flags;
+-	struct bpf_prog *xdp_prog;
++	struct xdp_attachment_info xdp;
+ 
+ 	unsigned int max_tx_rings;
+ 	unsigned int max_rx_rings;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index c22435a9f494..5e147040fbc2 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -3424,34 +3424,29 @@ nfp_net_xdp_setup_drv(struct nfp_net *nn, struct bpf_prog *prog,
+ 	return nfp_net_ring_reconfig(nn, dp, extack);
+ }
+ 
+-static int
+-nfp_net_xdp_setup(struct nfp_net *nn, struct bpf_prog *prog, u32 flags,
+-		  struct netlink_ext_ack *extack)
++static int nfp_net_xdp_setup(struct nfp_net *nn, struct netdev_bpf *bpf)
+ {
+ 	struct bpf_prog *drv_prog, *offload_prog;
+ 	int err;
+ 
+-	if (nn->xdp_prog && (flags ^ nn->xdp_flags) & XDP_FLAGS_MODES)
++	if (!xdp_attachment_flags_ok(&nn->xdp, bpf))
+ 		return -EBUSY;
+ 
+ 	/* Load both when no flags set to allow easy activation of driver path
+ 	 * when program is replaced by one which can't be offloaded.
+ 	 */
+-	drv_prog     = flags & XDP_FLAGS_HW_MODE  ? NULL : prog;
+-	offload_prog = flags & XDP_FLAGS_DRV_MODE ? NULL : prog;
++	drv_prog     = bpf->flags & XDP_FLAGS_HW_MODE  ? NULL : bpf->prog;
++	offload_prog = bpf->flags & XDP_FLAGS_DRV_MODE ? NULL : bpf->prog;
+ 
+-	err = nfp_net_xdp_setup_drv(nn, drv_prog, extack);
++	err = nfp_net_xdp_setup_drv(nn, drv_prog, bpf->extack);
+ 	if (err)
+ 		return err;
+ 
+-	err = nfp_app_xdp_offload(nn->app, nn, offload_prog, extack);
+-	if (err && flags & XDP_FLAGS_HW_MODE)
++	err = nfp_app_xdp_offload(nn->app, nn, offload_prog, bpf->extack);
++	if (err && bpf->flags & XDP_FLAGS_HW_MODE)
+ 		return err;
+ 
+-	if (nn->xdp_prog)
+-		bpf_prog_put(nn->xdp_prog);
+-	nn->xdp_prog = prog;
+-	nn->xdp_flags = flags;
++	xdp_attachment_setup(&nn->xdp, bpf);
+ 
+ 	return 0;
+ }
+@@ -3463,12 +3458,9 @@ static int nfp_net_xdp(struct net_device *netdev, struct netdev_bpf *xdp)
+ 	switch (xdp->command) {
+ 	case XDP_SETUP_PROG:
+ 	case XDP_SETUP_PROG_HW:
+-		return nfp_net_xdp_setup(nn, xdp->prog, xdp->flags,
+-					 xdp->extack);
++		return nfp_net_xdp_setup(nn, xdp);
+ 	case XDP_QUERY_PROG:
+-		xdp->prog_id = nn->xdp_prog ? nn->xdp_prog->aux->id : 0;
+-		xdp->prog_flags = nn->xdp_prog ? nn->xdp_flags : 0;
+-		return 0;
++		return xdp_attachment_query(&nn->xdp, xdp);
+ 	default:
+ 		return nfp_app_bpf(nn->app, nn, xdp);
+ 	}
+diff --git a/drivers/net/netdevsim/bpf.c b/drivers/net/netdevsim/bpf.c
+index 712e6f918065..c485d97b5df4 100644
+--- a/drivers/net/netdevsim/bpf.c
++++ b/drivers/net/netdevsim/bpf.c
+@@ -199,10 +199,8 @@ static int nsim_xdp_set_prog(struct netdevsim *ns, struct netdev_bpf *bpf)
+ {
+ 	int err;
+ 
+-	if (ns->xdp_prog && (bpf->flags ^ ns->xdp_flags) & XDP_FLAGS_MODES) {
+-		NSIM_EA(bpf->extack, "program loaded with different flags");
++	if (!xdp_attachment_flags_ok(&ns->xdp, bpf))
+ 		return -EBUSY;
+-	}
+ 
+ 	if (bpf->command == XDP_SETUP_PROG && !ns->bpf_xdpdrv_accept) {
+ 		NSIM_EA(bpf->extack, "driver XDP disabled in DebugFS");
+@@ -219,11 +217,7 @@ static int nsim_xdp_set_prog(struct netdevsim *ns, struct netdev_bpf *bpf)
+ 			return err;
+ 	}
+ 
+-	if (ns->xdp_prog)
+-		bpf_prog_put(ns->xdp_prog);
+-
+-	ns->xdp_prog = bpf->prog;
+-	ns->xdp_flags = bpf->flags;
++	xdp_attachment_setup(&ns->xdp, bpf);
+ 
+ 	if (!bpf->prog)
+ 		ns->xdp_prog_mode = XDP_ATTACHED_NONE;
+@@ -567,9 +561,7 @@ int nsim_bpf(struct net_device *dev, struct netdev_bpf *bpf)
+ 		nsim_bpf_destroy_prog(bpf->offload.prog);
+ 		return 0;
+ 	case XDP_QUERY_PROG:
+-		bpf->prog_id = ns->xdp_prog ? ns->xdp_prog->aux->id : 0;
+-		bpf->prog_flags = ns->xdp_prog ? ns->xdp_flags : 0;
+-		return 0;
++		return xdp_attachment_query(&ns->xdp, bpf);
+ 	case XDP_SETUP_PROG:
+ 		err = nsim_setup_prog_checks(ns, bpf);
+ 		if (err)
+@@ -636,6 +628,6 @@ void nsim_bpf_uninit(struct netdevsim *ns)
+ {
+ 	WARN_ON(!list_empty(&ns->bpf_bound_progs));
+ 	WARN_ON(!list_empty(&ns->bpf_bound_maps));
+-	WARN_ON(ns->xdp_prog);
++	WARN_ON(ns->xdp.prog);
+ 	WARN_ON(ns->bpf_offloaded);
+ }
+diff --git a/drivers/net/netdevsim/netdevsim.h b/drivers/net/netdevsim/netdevsim.h
+index 8ca50b72c328..6a03d229c21d 100644
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -18,6 +18,7 @@
+ #include <linux/list.h>
+ #include <linux/netdevice.h>
+ #include <linux/u64_stats_sync.h>
++#include <net/xdp.h>
+ 
+ #define DRV_NAME	"netdevsim"
+ 
+@@ -46,9 +47,8 @@ struct netdevsim {
+ 	struct bpf_prog	*bpf_offloaded;
+ 	u32 bpf_offloaded_id;
+ 
+-	u32 xdp_flags;
++	struct xdp_attachment_info xdp;
+ 	int xdp_prog_mode;
+-	struct bpf_prog	*xdp_prog;
+ 
+ 	u32 prog_id_gen;
+ 
+diff --git a/include/net/xdp.h b/include/net/xdp.h
+index 2deea7166a34..fcb033f51d8c 100644
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -144,4 +144,17 @@ xdp_data_meta_unsupported(const struct xdp_buff *xdp)
+ 	return unlikely(xdp->data_meta > xdp->data);
+ }
+ 
++struct xdp_attachment_info {
++	struct bpf_prog *prog;
++	u32 flags;
++};
++
++struct netdev_bpf;
++int xdp_attachment_query(struct xdp_attachment_info *info,
++			 struct netdev_bpf *bpf);
++bool xdp_attachment_flags_ok(struct xdp_attachment_info *info,
++			     struct netdev_bpf *bpf);
++void xdp_attachment_setup(struct xdp_attachment_info *info,
++			  struct netdev_bpf *bpf);
++
+ #endif /* __LINUX_NET_XDP_H__ */
+diff --git a/net/core/xdp.c b/net/core/xdp.c
+index 6771f1855b96..fd905f7d6fab 100644
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -3,8 +3,11 @@
+  * Copyright (c) 2017 Jesper Dangaard Brouer, Red Hat Inc.
+  * Released under terms in GPL version 2.  See COPYING.
+  */
++#include <linux/bpf.h>
++#include <linux/filter.h>
+ #include <linux/types.h>
+ #include <linux/mm.h>
++#include <linux/netdevice.h>
+ #include <linux/slab.h>
+ #include <linux/idr.h>
+ #include <linux/rhashtable.h>
+@@ -371,3 +374,34 @@ void xdp_return_buff(struct xdp_buff *xdp)
+ 	__xdp_return(xdp->data, &xdp->rxq->mem, true, xdp->handle);
+ }
+ EXPORT_SYMBOL_GPL(xdp_return_buff);
++
++int xdp_attachment_query(struct xdp_attachment_info *info,
++			 struct netdev_bpf *bpf)
++{
++	bpf->prog_id = info->prog ? info->prog->aux->id : 0;
++	bpf->prog_flags = info->prog ? info->flags : 0;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xdp_attachment_query);
++
++bool xdp_attachment_flags_ok(struct xdp_attachment_info *info,
++			     struct netdev_bpf *bpf)
++{
++	if (info->prog && (bpf->flags ^ info->flags) & XDP_FLAGS_MODES) {
++		NL_SET_ERR_MSG(bpf->extack,
++			       "program loaded with different flags");
++		return false;
++	}
++	return true;
++}
++EXPORT_SYMBOL_GPL(xdp_attachment_flags_ok);
++
++void xdp_attachment_setup(struct xdp_attachment_info *info,
++			  struct netdev_bpf *bpf)
++{
++	if (info->prog)
++		bpf_prog_put(info->prog);
++	info->prog = bpf->prog;
++	info->flags = bpf->flags;
++}
++EXPORT_SYMBOL_GPL(xdp_attachment_setup);
+* Unmerged path tools/testing/selftests/bpf/test_offload.py
