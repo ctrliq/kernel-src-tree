@@ -1,0 +1,133 @@
+KVM: x86: Consolidate VM allocation and free for VMX and SVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 562b6b089d64724278de61114da658fb0a516250
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/562b6b08.failed
+
+Move the VM allocation and free code to common x86 as the logic is
+more or less identical across SVM and VMX.
+
+Note, although hyperv.hv_pa_pg is part of the common kvm->arch, it's
+(currently) only allocated by VMX VMs.  But, since kfree() plays nice
+when passed a NULL pointer, the superfluous call for SVM is harmless
+and avoids future churn if SVM gains support for HyperV's direct TLB
+flush.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+[Make vm_size a field instead of a function. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 562b6b089d64724278de61114da658fb0a516250)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/kvm/svm.c
+index 2ed3eaf9120c,fd3fc9fbefff..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -7386,9 -7382,8 +7373,14 @@@ static struct kvm_x86_ops svm_x86_ops _
+  	.vcpu_free = svm_free_vcpu,
+  	.vcpu_reset = svm_vcpu_reset,
+  
+++<<<<<<< HEAD
+ +	.vm_alloc = svm_vm_alloc,
+ +	.vm_free = svm_vm_free,
+ +	.vm_init = avic_vm_init,
+++=======
++ 	.vm_size = sizeof(struct kvm_svm),
++ 	.vm_init = svm_vm_init,
+++>>>>>>> 562b6b089d64 (KVM: x86: Consolidate VM allocation and free for VMX and SVM)
+  	.vm_destroy = svm_vm_destroy,
+  
+  	.prepare_guest_switch = svm_prepare_guest_switch,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index e2bd7dd0377e..9d833b96ccc7 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1053,8 +1053,7 @@ struct kvm_x86_ops {
+ 	bool (*has_emulated_msr)(int index);
+ 	void (*cpuid_update)(struct kvm_vcpu *vcpu);
+ 
+-	struct kvm *(*vm_alloc)(void);
+-	void (*vm_free)(struct kvm *);
++	unsigned int vm_size;
+ 	int (*vm_init)(struct kvm *kvm);
+ 	void (*vm_destroy)(struct kvm *kvm);
+ 
+@@ -1270,13 +1269,10 @@ extern struct kmem_cache *x86_fpu_cache;
+ #define __KVM_HAVE_ARCH_VM_ALLOC
+ static inline struct kvm *kvm_arch_alloc_vm(void)
+ {
+-	return kvm_x86_ops->vm_alloc();
+-}
+-
+-static inline void kvm_arch_free_vm(struct kvm *kvm)
+-{
+-	return kvm_x86_ops->vm_free(kvm);
++	return __vmalloc(kvm_x86_ops->vm_size,
++			 GFP_KERNEL_ACCOUNT | __GFP_ZERO, PAGE_KERNEL);
+ }
++void kvm_arch_free_vm(struct kvm *kvm);
+ 
+ #define __KVM_HAVE_ARCH_FLUSH_REMOTE_TLB
+ static inline int kvm_arch_flush_remote_tlb(struct kvm *kvm)
+* Unmerged path arch/x86/kvm/svm.c
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index d870593f02f1..aee5fa30fd4b 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6779,20 +6779,6 @@ static void vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	vmx_complete_interrupts(vmx);
+ }
+ 
+-static struct kvm *vmx_vm_alloc(void)
+-{
+-	BUILD_BUG_ON(offsetof(struct kvm_vmx, kvm) != 0);
+-
+-	return __vmalloc(sizeof(struct kvm_vmx),
+-			 GFP_KERNEL_ACCOUNT | __GFP_ZERO, PAGE_KERNEL);
+-}
+-
+-static void vmx_vm_free(struct kvm *kvm)
+-{
+-	kfree(kvm->arch.hyperv.hv_pa_pg);
+-	vfree(kvm);
+-}
+-
+ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -7888,9 +7874,8 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 	.cpu_has_accelerated_tpr = report_flexpriority,
+ 	.has_emulated_msr = vmx_has_emulated_msr,
+ 
++	.vm_size = sizeof(struct kvm_vmx),
+ 	.vm_init = vmx_vm_init,
+-	.vm_alloc = vmx_vm_alloc,
+-	.vm_free = vmx_vm_free,
+ 
+ 	.vcpu_create = vmx_create_vcpu,
+ 	.vcpu_free = vmx_free_vcpu,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index bc1561f8055a..f937f38e311a 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -9545,6 +9545,13 @@ void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu)
+ 	kvm_x86_ops->sched_in(vcpu, cpu);
+ }
+ 
++void kvm_arch_free_vm(struct kvm *kvm)
++{
++	kfree(kvm->arch.hyperv.hv_pa_pg);
++	vfree(kvm);
++}
++
++
+ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ {
+ 	if (type)
