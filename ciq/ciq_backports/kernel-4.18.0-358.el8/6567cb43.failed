@@ -1,0 +1,155 @@
+net: bridge: multicast: add mdb context support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 6567cb438a51016f9f2152cb966f5715dc3c3c7b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/6567cb43.failed
+
+Choose the proper bridge multicast context when user-spaces is adding
+mdb entries. Currently we require the vlan to be configured on at least
+one device (port or bridge) in order to add an mdb entry if vlan
+mcast snooping is enabled (vlan snooping implies vlan filtering).
+Note that we always allow deleting an entry, regardless of the vlan state.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6567cb438a51016f9f2152cb966f5715dc3c3c7b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mdb.c
+diff --cc net/bridge/br_mdb.c
+index 5621f5510fd4,7b6c3b91d272..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -742,19 -1019,80 +742,87 @@@ static int br_mdb_parse(struct sk_buff 
+  	return 0;
+  }
+  
++ static struct net_bridge_mcast *
++ __br_mdb_choose_context(struct net_bridge *br,
++ 			const struct br_mdb_entry *entry,
++ 			struct netlink_ext_ack *extack)
++ {
++ 	struct net_bridge_mcast *brmctx = NULL;
++ 	struct net_bridge_vlan *v;
++ 
++ 	if (!br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED)) {
++ 		brmctx = &br->multicast_ctx;
++ 		goto out;
++ 	}
++ 
++ 	if (!entry->vid) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Cannot add an entry without a vlan when vlan snooping is enabled");
++ 		goto out;
++ 	}
++ 
++ 	v = br_vlan_find(br_vlan_group(br), entry->vid);
++ 	if (!v) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Vlan is not configured");
++ 		goto out;
++ 	}
++ 	if (br_multicast_ctx_vlan_global_disabled(&v->br_mcast_ctx)) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Vlan's multicast processing is disabled");
++ 		goto out;
++ 	}
++ 	brmctx = &v->br_mcast_ctx;
++ out:
++ 	return brmctx;
++ }
++ 
+  static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
+ -			    struct br_mdb_entry *entry,
+ -			    struct nlattr **mdb_attrs,
+ +			    struct br_ip *group, struct br_mdb_entry *entry,
+  			    struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	struct net_bridge_mdb_entry *mp;
+ +	struct net_bridge_port_group *p;
+ +	struct net_bridge_port_group __rcu **pp;
+++=======
++ 	struct net_bridge_mdb_entry *mp, *star_mp;
++ 	struct net_bridge_port_group __rcu **pp;
++ 	struct net_bridge_port_group *p;
++ 	struct net_bridge_mcast *brmctx;
++ 	struct br_ip group, star_group;
+++>>>>>>> 6567cb438a51 (net: bridge: multicast: add mdb context support)
+  	unsigned long now = jiffies;
+ -	unsigned char flags = 0;
+ -	u8 filter_mode;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	mp = br_mdb_ip_get(br, group);
+++=======
++ 	__mdb_entry_to_br_ip(entry, &group, mdb_attrs);
++ 
++ 	brmctx = __br_mdb_choose_context(br, entry, extack);
++ 	if (!brmctx)
++ 		return -EINVAL;
++ 
++ 	/* host join errors which can happen before creating the group */
++ 	if (!port) {
++ 		/* don't allow any flags for host-joined groups */
++ 		if (entry->state) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Flags are not allowed for host groups");
++ 			return -EINVAL;
++ 		}
++ 		if (!br_multicast_is_star_g(&group)) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Groups with sources cannot be manually host joined");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	if (br_group_is_l2(&group) && entry->state != MDB_PERMANENT) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Only permanent L2 entries allowed");
++ 		return -EINVAL;
++ 	}
++ 
++ 	mp = br_mdb_ip_get(br, &group);
+++>>>>>>> 6567cb438a51 (net: bridge: multicast: add mdb context support)
+  	if (!mp) {
+ -		mp = br_multicast_new_group(br, &group);
+ +		mp = br_multicast_new_group(br, group);
+  		err = PTR_ERR_OR_ZERO(mp);
+  		if (err)
+  			return err;
+@@@ -797,8 -1136,28 +865,33 @@@
+  	}
+  	rcu_assign_pointer(*pp, p);
+  	if (entry->state == MDB_TEMPORARY)
+++<<<<<<< HEAD
+ +		mod_timer(&p->timer, now + br->multicast_membership_interval);
+ +	br_mdb_notify(br->dev, mp, p, RTM_NEWMDB);
+++=======
++ 		mod_timer(&p->timer,
++ 			  now + brmctx->multicast_membership_interval);
++ 	br_mdb_notify(br->dev, mp, p, RTM_NEWMDB);
++ 	/* if we are adding a new EXCLUDE port group (*,G) it needs to be also
++ 	 * added to all S,G entries for proper replication, if we are adding
++ 	 * a new INCLUDE port (S,G) then all of *,G EXCLUDE ports need to be
++ 	 * added to it for proper replication
++ 	 */
++ 	if (br_multicast_should_handle_mode(brmctx, group.proto)) {
++ 		switch (filter_mode) {
++ 		case MCAST_EXCLUDE:
++ 			br_multicast_star_g_handle_mode(p, MCAST_EXCLUDE);
++ 			break;
++ 		case MCAST_INCLUDE:
++ 			star_group = p->key.addr;
++ 			memset(&star_group.src, 0, sizeof(star_group.src));
++ 			star_mp = br_mdb_ip_get(br, &star_group);
++ 			if (star_mp)
++ 				br_multicast_sg_add_exclude_ports(star_mp, p);
++ 			break;
++ 		}
++ 	}
+++>>>>>>> 6567cb438a51 (net: bridge: multicast: add mdb context support)
+  
+  	return 0;
+  }
+* Unmerged path net/bridge/br_mdb.c
