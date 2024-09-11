@@ -1,0 +1,81 @@
+KVM: nVMX: Reload APIC access page on nested VM-Exit only if necessary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 1196cb970b996be69a2fcd9756117b394f8e7526
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1196cb97.failed
+
+Defer reloading L1's APIC page by logging the need for a reload and
+processing it during nested VM-Exit instead of unconditionally reloading
+the APIC page on nested VM-Exit.  This eliminates a TLB flush on the
+majority of VM-Exits as the APIC page rarely needs to be reloaded.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200320212833.3507-28-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1196cb970b996be69a2fcd9756117b394f8e7526)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index dbadf7ce3b2f,4739b780c74e..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -6200,10 -6142,14 +6200,20 @@@ void vmx_set_virtual_apic_mode(struct k
+  
+  static void vmx_set_apic_access_page_addr(struct kvm_vcpu *vcpu, hpa_t hpa)
+  {
+++<<<<<<< HEAD
+ +	if (!is_guest_mode(vcpu)) {
+ +		vmcs_write64(APIC_ACCESS_ADDR, hpa);
+ +		vmx_flush_tlb(vcpu, true);
+++=======
++ 	/* Defer reload until vmcs01 is the current VMCS. */
++ 	if (is_guest_mode(vcpu)) {
++ 		to_vmx(vcpu)->nested.reload_vmcs01_apic_access_page = true;
++ 		return;
+++>>>>>>> 1196cb970b99 (KVM: nVMX: Reload APIC access page on nested VM-Exit only if necessary)
+  	}
++ 
++ 	vmcs_write64(APIC_ACCESS_ADDR, hpa);
++ 	vmx_flush_tlb_current(vcpu);
+  }
+  
+  static void vmx_hwapic_isr_update(struct kvm_vcpu *vcpu, int max_isr)
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index cd775c31a62d..5c510f9186a3 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -4338,11 +4338,10 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+ 	kvm_vcpu_unmap(vcpu, &vmx->nested.pi_desc_map, true);
+ 	vmx->nested.pi_desc = NULL;
+ 
+-	/*
+-	 * We are now running in L2, mmu_notifier will force to reload the
+-	 * page's hpa for L2 vmcs. Need to reload it for L1 before entering L1.
+-	 */
+-	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
++	if (vmx->nested.reload_vmcs01_apic_access_page) {
++		vmx->nested.reload_vmcs01_apic_access_page = false;
++		kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
++	}
+ 
+ 	if ((exit_reason != -1) && (enable_shadow_vmcs || vmx->nested.hv_evmcs))
+ 		vmx->nested.need_vmcs12_to_shadow_sync = true;
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 70790b80a8a1..809adbb4d4c0 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -139,6 +139,7 @@ struct nested_vmx {
+ 	bool vmcs02_initialized;
+ 
+ 	bool change_vmcs01_virtual_apic_mode;
++	bool reload_vmcs01_apic_access_page;
+ 
+ 	/*
+ 	 * Enlightened VMCS has been enabled. It does not mean that L1 has to
