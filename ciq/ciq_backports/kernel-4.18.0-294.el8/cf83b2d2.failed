@@ -1,0 +1,532 @@
+bpf: Permit cond_resched for some iterators
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit cf83b2d2e2b64920bd6999b199dfa271d7e94cf8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cf83b2d2.failed
+
+Commit e679654a704e ("bpf: Fix a rcu_sched stall issue with
+bpf task/task_file iterator") tries to fix rcu stalls warning
+which is caused by bpf task_file iterator when running
+"bpftool prog".
+
+      rcu: INFO: rcu_sched self-detected stall on CPU
+      rcu: \x097-....: (20999 ticks this GP) idle=302/1/0x4000000000000000 softirq=1508852/1508852 fqs=4913
+      \x09(t=21031 jiffies g=2534773 q=179750)
+      NMI backtrace for cpu 7
+      CPU: 7 PID: 184195 Comm: bpftool Kdump: loaded Tainted: G        W         5.8.0-00004-g68bfc7f8c1b4 #6
+      Hardware name: Quanta Twin Lakes MP/Twin Lakes Passive MP, BIOS F09_3A17 05/03/2019
+      Call Trace:
+      <IRQ>
+      dump_stack+0x57/0x70
+      nmi_cpu_backtrace.cold+0x14/0x53
+      ? lapic_can_unplug_cpu.cold+0x39/0x39
+      nmi_trigger_cpumask_backtrace+0xb7/0xc7
+      rcu_dump_cpu_stacks+0xa2/0xd0
+      rcu_sched_clock_irq.cold+0x1ff/0x3d9
+      ? tick_nohz_handler+0x100/0x100
+      update_process_times+0x5b/0x90
+      tick_sched_timer+0x5e/0xf0
+      __hrtimer_run_queues+0x12a/0x2a0
+      hrtimer_interrupt+0x10e/0x280
+      __sysvec_apic_timer_interrupt+0x51/0xe0
+      asm_call_on_stack+0xf/0x20
+      </IRQ>
+      sysvec_apic_timer_interrupt+0x6f/0x80
+      ...
+      task_file_seq_next+0x52/0xa0
+      bpf_seq_read+0xb9/0x320
+      vfs_read+0x9d/0x180
+      ksys_read+0x5f/0xe0
+      do_syscall_64+0x38/0x60
+      entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+The fix is to limit the number of bpf program runs to be
+one million. This fixed the program in most cases. But
+we also found under heavy load, which can increase the wallclock
+time for bpf_seq_read(), the warning may still be possible.
+
+For example, calling bpf_delay() in the "while" loop of
+bpf_seq_read(), which will introduce artificial delay,
+the warning will show up in my qemu run.
+
+  static unsigned q;
+  volatile unsigned *p = &q;
+  volatile unsigned long long ll;
+  static void bpf_delay(void)
+  {
+         int i, j;
+
+         for (i = 0; i < 10000; i++)
+                 for (j = 0; j < 10000; j++)
+                         ll += *p;
+  }
+
+There are two ways to fix this issue. One is to reduce the above
+one million threshold to say 100,000 and hopefully rcu warning will
+not show up any more. Another is to introduce a target feature
+which enables bpf_seq_read() calling cond_resched().
+
+This patch took second approach as the first approach may cause
+more -EAGAIN failures for read() syscalls. Note that not all bpf_iter
+targets can permit cond_resched() in bpf_seq_read() as some, e.g.,
+netlink seq iterator, rcu read lock critical section spans through
+seq_ops->next() -> seq_ops->show() -> seq_ops->next().
+
+For the kernel code with the above hack, "bpftool p" roughly takes
+38 seconds to finish on my VM with 184 bpf program runs.
+Using the following command, I am able to collect the number of
+context switches:
+   perf stat -e context-switches -- ./bpftool p >& log
+Without this patch,
+   69      context-switches
+With this patch,
+   75      context-switches
+This patch added additional 6 context switches, roughly every 6 seconds
+to reschedule, to avoid lengthy no-rescheduling which may cause the
+above RCU warnings.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20201028061054.1411116-1-yhs@fb.com
+(cherry picked from commit cf83b2d2e2b64920bd6999b199dfa271d7e94cf8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/bpf_iter.c
+#	kernel/bpf/task_iter.c
+diff --cc include/linux/bpf.h
+index 53810b02f758,2fffd30e13ac..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -1148,19 -1276,66 +1148,50 @@@ struct bpf_link *bpf_link_get_from_fd(u
+  int bpf_obj_pin_user(u32 ufd, const char __user *pathname);
+  int bpf_obj_get_user(const char __user *pathname, int flags);
+  
+ -#define BPF_ITER_FUNC_PREFIX "bpf_iter_"
+ -#define DEFINE_BPF_ITER_FUNC(target, args...)			\
+ -	extern int bpf_iter_ ## target(args);			\
+ -	int __init bpf_iter_ ## target(args) { return 0; }
+ +typedef int (*bpf_iter_init_seq_priv_t)(void *private_data);
+ +typedef void (*bpf_iter_fini_seq_priv_t)(void *private_data);
+  
+++<<<<<<< HEAD
+ +struct bpf_iter_reg {
+ +	const char *target;
+ +	const struct seq_operations *seq_ops;
+ +	bpf_iter_init_seq_priv_t init_seq_private;
+ +	bpf_iter_fini_seq_priv_t fini_seq_private;
+ +	u32 seq_priv_size;
+++=======
++ struct bpf_iter_aux_info {
++ 	struct bpf_map *map;
++ };
++ 
++ typedef int (*bpf_iter_attach_target_t)(struct bpf_prog *prog,
++ 					union bpf_iter_link_info *linfo,
++ 					struct bpf_iter_aux_info *aux);
++ typedef void (*bpf_iter_detach_target_t)(struct bpf_iter_aux_info *aux);
++ typedef void (*bpf_iter_show_fdinfo_t) (const struct bpf_iter_aux_info *aux,
++ 					struct seq_file *seq);
++ typedef int (*bpf_iter_fill_link_info_t)(const struct bpf_iter_aux_info *aux,
++ 					 struct bpf_link_info *info);
++ 
++ enum bpf_iter_feature {
++ 	BPF_ITER_RESCHED	= BIT(0),
++ };
++ 
++ #define BPF_ITER_CTX_ARG_MAX 2
++ struct bpf_iter_reg {
++ 	const char *target;
++ 	bpf_iter_attach_target_t attach_target;
++ 	bpf_iter_detach_target_t detach_target;
++ 	bpf_iter_show_fdinfo_t show_fdinfo;
++ 	bpf_iter_fill_link_info_t fill_link_info;
++ 	u32 ctx_arg_info_size;
++ 	u32 feature;
++ 	struct bpf_ctx_arg_aux ctx_arg_info[BPF_ITER_CTX_ARG_MAX];
++ 	const struct bpf_iter_seq_info *seq_info;
+++>>>>>>> cf83b2d2e2b6 (bpf: Permit cond_resched for some iterators)
+  };
+  
+ -struct bpf_iter_meta {
+ -	__bpf_md_ptr(struct seq_file *, seq);
+ -	u64 session_id;
+ -	u64 seq_num;
+ -};
+ -
+ -struct bpf_iter__bpf_map_elem {
+ -	__bpf_md_ptr(struct bpf_iter_meta *, meta);
+ -	__bpf_md_ptr(struct bpf_map *, map);
+ -	__bpf_md_ptr(void *, key);
+ -	__bpf_md_ptr(void *, value);
+ -};
+ -
+ -int bpf_iter_reg_target(const struct bpf_iter_reg *reg_info);
+ -void bpf_iter_unreg_target(const struct bpf_iter_reg *reg_info);
+ -bool bpf_iter_prog_supported(struct bpf_prog *prog);
+ -int bpf_iter_link_attach(const union bpf_attr *attr, struct bpf_prog *prog);
+ -int bpf_iter_new_fd(struct bpf_link *link);
+ -bool bpf_link_is_iter(struct bpf_link *link);
+ -struct bpf_prog *bpf_iter_get_info(struct bpf_iter_meta *meta, bool in_stop);
+ -int bpf_iter_run_prog(struct bpf_prog *prog, void *ctx);
+ -void bpf_iter_map_show_fdinfo(const struct bpf_iter_aux_info *aux,
+ -			      struct seq_file *seq);
+ -int bpf_iter_map_fill_link_info(const struct bpf_iter_aux_info *aux,
+ -				struct bpf_link_info *info);
+ +int bpf_iter_reg_target(struct bpf_iter_reg *reg_info);
+ +void bpf_iter_unreg_target(const char *target);
+  
+  int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value);
+  int bpf_percpu_array_copy(struct bpf_map *map, void *key, void *value);
+diff --cc kernel/bpf/bpf_iter.c
+index 5a8119d17d14,5454161407f1..000000000000
+--- a/kernel/bpf/bpf_iter.c
++++ b/kernel/bpf/bpf_iter.c
+@@@ -17,7 -31,259 +17,263 @@@ struct bpf_iter_target_info 
+  static struct list_head targets = LIST_HEAD_INIT(targets);
+  static DEFINE_MUTEX(targets_mutex);
+  
+++<<<<<<< HEAD
+ +int bpf_iter_reg_target(struct bpf_iter_reg *reg_info)
+++=======
++ /* protect bpf_iter_link changes */
++ static DEFINE_MUTEX(link_mutex);
++ 
++ /* incremented on every opened seq_file */
++ static atomic64_t session_id;
++ 
++ static int prepare_seq_file(struct file *file, struct bpf_iter_link *link,
++ 			    const struct bpf_iter_seq_info *seq_info);
++ 
++ static void bpf_iter_inc_seq_num(struct seq_file *seq)
++ {
++ 	struct bpf_iter_priv_data *iter_priv;
++ 
++ 	iter_priv = container_of(seq->private, struct bpf_iter_priv_data,
++ 				 target_private);
++ 	iter_priv->seq_num++;
++ }
++ 
++ static void bpf_iter_dec_seq_num(struct seq_file *seq)
++ {
++ 	struct bpf_iter_priv_data *iter_priv;
++ 
++ 	iter_priv = container_of(seq->private, struct bpf_iter_priv_data,
++ 				 target_private);
++ 	iter_priv->seq_num--;
++ }
++ 
++ static void bpf_iter_done_stop(struct seq_file *seq)
++ {
++ 	struct bpf_iter_priv_data *iter_priv;
++ 
++ 	iter_priv = container_of(seq->private, struct bpf_iter_priv_data,
++ 				 target_private);
++ 	iter_priv->done_stop = true;
++ }
++ 
++ static bool bpf_iter_support_resched(struct seq_file *seq)
++ {
++ 	struct bpf_iter_priv_data *iter_priv;
++ 
++ 	iter_priv = container_of(seq->private, struct bpf_iter_priv_data,
++ 				 target_private);
++ 	return iter_priv->tinfo->reg_info->feature & BPF_ITER_RESCHED;
++ }
++ 
++ /* maximum visited objects before bailing out */
++ #define MAX_ITER_OBJECTS	1000000
++ 
++ /* bpf_seq_read, a customized and simpler version for bpf iterator.
++  * no_llseek is assumed for this file.
++  * The following are differences from seq_read():
++  *  . fixed buffer size (PAGE_SIZE)
++  *  . assuming no_llseek
++  *  . stop() may call bpf program, handling potential overflow there
++  */
++ static ssize_t bpf_seq_read(struct file *file, char __user *buf, size_t size,
++ 			    loff_t *ppos)
++ {
++ 	struct seq_file *seq = file->private_data;
++ 	size_t n, offs, copied = 0;
++ 	int err = 0, num_objs = 0;
++ 	bool can_resched;
++ 	void *p;
++ 
++ 	mutex_lock(&seq->lock);
++ 
++ 	if (!seq->buf) {
++ 		seq->size = PAGE_SIZE << 3;
++ 		seq->buf = kvmalloc(seq->size, GFP_KERNEL);
++ 		if (!seq->buf) {
++ 			err = -ENOMEM;
++ 			goto done;
++ 		}
++ 	}
++ 
++ 	if (seq->count) {
++ 		n = min(seq->count, size);
++ 		err = copy_to_user(buf, seq->buf + seq->from, n);
++ 		if (err) {
++ 			err = -EFAULT;
++ 			goto done;
++ 		}
++ 		seq->count -= n;
++ 		seq->from += n;
++ 		copied = n;
++ 		goto done;
++ 	}
++ 
++ 	seq->from = 0;
++ 	p = seq->op->start(seq, &seq->index);
++ 	if (!p)
++ 		goto stop;
++ 	if (IS_ERR(p)) {
++ 		err = PTR_ERR(p);
++ 		seq->op->stop(seq, p);
++ 		seq->count = 0;
++ 		goto done;
++ 	}
++ 
++ 	err = seq->op->show(seq, p);
++ 	if (err > 0) {
++ 		/* object is skipped, decrease seq_num, so next
++ 		 * valid object can reuse the same seq_num.
++ 		 */
++ 		bpf_iter_dec_seq_num(seq);
++ 		seq->count = 0;
++ 	} else if (err < 0 || seq_has_overflowed(seq)) {
++ 		if (!err)
++ 			err = -E2BIG;
++ 		seq->op->stop(seq, p);
++ 		seq->count = 0;
++ 		goto done;
++ 	}
++ 
++ 	can_resched = bpf_iter_support_resched(seq);
++ 	while (1) {
++ 		loff_t pos = seq->index;
++ 
++ 		num_objs++;
++ 		offs = seq->count;
++ 		p = seq->op->next(seq, p, &seq->index);
++ 		if (pos == seq->index) {
++ 			pr_info_ratelimited("buggy seq_file .next function %ps "
++ 				"did not updated position index\n",
++ 				seq->op->next);
++ 			seq->index++;
++ 		}
++ 
++ 		if (IS_ERR_OR_NULL(p))
++ 			break;
++ 
++ 		/* got a valid next object, increase seq_num */
++ 		bpf_iter_inc_seq_num(seq);
++ 
++ 		if (seq->count >= size)
++ 			break;
++ 
++ 		if (num_objs >= MAX_ITER_OBJECTS) {
++ 			if (offs == 0) {
++ 				err = -EAGAIN;
++ 				seq->op->stop(seq, p);
++ 				goto done;
++ 			}
++ 			break;
++ 		}
++ 
++ 		err = seq->op->show(seq, p);
++ 		if (err > 0) {
++ 			bpf_iter_dec_seq_num(seq);
++ 			seq->count = offs;
++ 		} else if (err < 0 || seq_has_overflowed(seq)) {
++ 			seq->count = offs;
++ 			if (offs == 0) {
++ 				if (!err)
++ 					err = -E2BIG;
++ 				seq->op->stop(seq, p);
++ 				goto done;
++ 			}
++ 			break;
++ 		}
++ 
++ 		if (can_resched)
++ 			cond_resched();
++ 	}
++ stop:
++ 	offs = seq->count;
++ 	/* bpf program called if !p */
++ 	seq->op->stop(seq, p);
++ 	if (!p) {
++ 		if (!seq_has_overflowed(seq)) {
++ 			bpf_iter_done_stop(seq);
++ 		} else {
++ 			seq->count = offs;
++ 			if (offs == 0) {
++ 				err = -E2BIG;
++ 				goto done;
++ 			}
++ 		}
++ 	}
++ 
++ 	n = min(seq->count, size);
++ 	err = copy_to_user(buf, seq->buf, n);
++ 	if (err) {
++ 		err = -EFAULT;
++ 		goto done;
++ 	}
++ 	copied = n;
++ 	seq->count -= n;
++ 	seq->from = n;
++ done:
++ 	if (!copied)
++ 		copied = err;
++ 	else
++ 		*ppos += copied;
++ 	mutex_unlock(&seq->lock);
++ 	return copied;
++ }
++ 
++ static const struct bpf_iter_seq_info *
++ __get_seq_info(struct bpf_iter_link *link)
++ {
++ 	const struct bpf_iter_seq_info *seq_info;
++ 
++ 	if (link->aux.map) {
++ 		seq_info = link->aux.map->ops->iter_seq_info;
++ 		if (seq_info)
++ 			return seq_info;
++ 	}
++ 
++ 	return link->tinfo->reg_info->seq_info;
++ }
++ 
++ static int iter_open(struct inode *inode, struct file *file)
++ {
++ 	struct bpf_iter_link *link = inode->i_private;
++ 
++ 	return prepare_seq_file(file, link, __get_seq_info(link));
++ }
++ 
++ static int iter_release(struct inode *inode, struct file *file)
++ {
++ 	struct bpf_iter_priv_data *iter_priv;
++ 	struct seq_file *seq;
++ 
++ 	seq = file->private_data;
++ 	if (!seq)
++ 		return 0;
++ 
++ 	iter_priv = container_of(seq->private, struct bpf_iter_priv_data,
++ 				 target_private);
++ 
++ 	if (iter_priv->seq_info->fini_seq_private)
++ 		iter_priv->seq_info->fini_seq_private(seq->private);
++ 
++ 	bpf_prog_put(iter_priv->prog);
++ 	seq->private = iter_priv;
++ 
++ 	return seq_release_private(inode, file);
++ }
++ 
++ const struct file_operations bpf_iter_fops = {
++ 	.open		= iter_open,
++ 	.llseek		= no_llseek,
++ 	.read		= bpf_seq_read,
++ 	.release	= iter_release,
++ };
++ 
++ /* The argument reg_info will be cached in bpf_iter_target_info.
++  * The common practice is to declare target reg_info as
++  * a const static variable and passed as an argument to
++  * bpf_iter_reg_target().
++  */
++ int bpf_iter_reg_target(const struct bpf_iter_reg *reg_info)
+++>>>>>>> cf83b2d2e2b6 (bpf: Permit cond_resched for some iterators)
+  {
+  	struct bpf_iter_target_info *tinfo;
+  
+diff --cc kernel/bpf/task_iter.c
+index 6ff6f14e1cae,1fdb2fc196cd..000000000000
+--- a/kernel/bpf/task_iter.c
++++ b/kernel/bpf/task_iter.c
+@@@ -316,24 -324,53 +316,69 @@@ static const struct seq_operations task
+  	.show	= task_file_seq_show,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ BTF_ID_LIST(btf_task_file_ids)
++ BTF_ID(struct, task_struct)
++ BTF_ID(struct, file)
++ 
++ static const struct bpf_iter_seq_info task_seq_info = {
++ 	.seq_ops		= &task_seq_ops,
++ 	.init_seq_private	= init_seq_pidns,
++ 	.fini_seq_private	= fini_seq_pidns,
++ 	.seq_priv_size		= sizeof(struct bpf_iter_seq_task_info),
++ };
++ 
++ static struct bpf_iter_reg task_reg_info = {
++ 	.target			= "task",
++ 	.feature		= BPF_ITER_RESCHED,
++ 	.ctx_arg_info_size	= 1,
++ 	.ctx_arg_info		= {
++ 		{ offsetof(struct bpf_iter__task, task),
++ 		  PTR_TO_BTF_ID_OR_NULL },
++ 	},
++ 	.seq_info		= &task_seq_info,
++ };
++ 
++ static const struct bpf_iter_seq_info task_file_seq_info = {
++ 	.seq_ops		= &task_file_seq_ops,
++ 	.init_seq_private	= init_seq_pidns,
++ 	.fini_seq_private	= fini_seq_pidns,
++ 	.seq_priv_size		= sizeof(struct bpf_iter_seq_task_file_info),
++ };
++ 
++ static struct bpf_iter_reg task_file_reg_info = {
++ 	.target			= "task_file",
++ 	.feature		= BPF_ITER_RESCHED,
++ 	.ctx_arg_info_size	= 2,
++ 	.ctx_arg_info		= {
++ 		{ offsetof(struct bpf_iter__task_file, task),
++ 		  PTR_TO_BTF_ID_OR_NULL },
++ 		{ offsetof(struct bpf_iter__task_file, file),
++ 		  PTR_TO_BTF_ID_OR_NULL },
++ 	},
++ 	.seq_info		= &task_file_seq_info,
++ };
++ 
+++>>>>>>> cf83b2d2e2b6 (bpf: Permit cond_resched for some iterators)
+  static int __init task_iter_init(void)
+  {
+ +	struct bpf_iter_reg task_file_reg_info = {
+ +		.target			= "task_file",
+ +		.seq_ops		= &task_file_seq_ops,
+ +		.init_seq_private	= init_seq_pidns,
+ +		.fini_seq_private	= fini_seq_pidns,
+ +		.seq_priv_size		= sizeof(struct bpf_iter_seq_task_file_info),
+ +	};
+ +	struct bpf_iter_reg task_reg_info = {
+ +		.target			= "task",
+ +		.seq_ops		= &task_seq_ops,
+ +		.init_seq_private	= init_seq_pidns,
+ +		.fini_seq_private	= fini_seq_pidns,
+ +		.seq_priv_size		= sizeof(struct bpf_iter_seq_task_info),
+ +	};
+  	int ret;
+  
+ -	task_reg_info.ctx_arg_info[0].btf_id = btf_task_file_ids[0];
+  	ret = bpf_iter_reg_target(&task_reg_info);
+  	if (ret)
+  		return ret;
+* Unmerged path include/linux/bpf.h
+* Unmerged path kernel/bpf/bpf_iter.c
+* Unmerged path kernel/bpf/task_iter.c
