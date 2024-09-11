@@ -1,0 +1,279 @@
+ceph: remove the extra slashes in the server path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiubo Li <xiubli@redhat.com>
+commit 4fbc0c711b2464ee1551850b85002faae0b775d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4fbc0c71.failed
+
+It's possible to pass the mount helper a server path that has more
+than one contiguous slash character. For example:
+
+  $ mount -t ceph 192.168.195.165:40176:/// /mnt/cephfs/
+
+In the MDS server side the extra slashes of the server path will be
+treated as snap dir, and then we can get the following debug logs:
+
+  ceph:  mount opening path //
+  ceph:  open_root_inode opening '//'
+  ceph:  fill_trace 0000000059b8a3bc is_dentry 0 is_target 1
+  ceph:  alloc_inode 00000000dc4ca00b
+  ceph:  get_inode created new inode 00000000dc4ca00b 1.ffffffffffffffff ino 1
+  ceph:  get_inode on 1=1.ffffffffffffffff got 00000000dc4ca00b
+
+And then when creating any new file or directory under the mount
+point, we can hit the following BUG_ON in ceph_fill_trace():
+
+  BUG_ON(ceph_snap(dir) != dvino.snap);
+
+Have the client ignore the extra slashes in the server path when
+mounting. This will also canonicalize the path, so that identical mounts
+can be consilidated.
+
+1) "//mydir1///mydir//"
+2) "/mydir1/mydir"
+3) "/mydir1/mydir/"
+
+Regardless of the internal treatment of these paths, the kernel still
+stores the original string including the leading '/' for presentation
+to userland.
+
+URL: https://tracker.ceph.com/issues/42771
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 4fbc0c711b2464ee1551850b85002faae0b775d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/super.c
+diff --cc fs/ceph/super.c
+index f47c913c51eb,112927dbd2f2..000000000000
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@@ -141,98 -141,143 +140,212 @@@ enum 
+  	/* int args above */
+  	Opt_snapdirname,
+  	Opt_mds_namespace,
+ +	Opt_fscache_uniq,
+  	Opt_recover_session,
+ -	Opt_source,
+ +	Opt_last_string,
+  	/* string args above */
+  	Opt_dirstat,
+ +	Opt_nodirstat,
+  	Opt_rbytes,
+ +	Opt_norbytes,
+  	Opt_asyncreaddir,
+ +	Opt_noasyncreaddir,
+  	Opt_dcache,
+ +	Opt_nodcache,
+  	Opt_ino32,
+ +	Opt_noino32,
+  	Opt_fscache,
+ +	Opt_nofscache,
+  	Opt_poolperm,
+ +	Opt_nopoolperm,
+  	Opt_require_active_mds,
+ +	Opt_norequire_active_mds,
+ +#ifdef CONFIG_CEPH_FS_POSIX_ACL
+  	Opt_acl,
+ +#endif
+ +	Opt_noacl,
+  	Opt_quotadf,
+ -	Opt_copyfrom,
+ +	Opt_noquotadf,
+  };
+  
+ -enum ceph_recover_session_mode {
+ -	ceph_recover_session_no,
+ -	ceph_recover_session_clean
+ +static match_table_t fsopt_tokens = {
+ +	{Opt_wsize, "wsize=%d"},
+ +	{Opt_rsize, "rsize=%d"},
+ +	{Opt_rasize, "rasize=%d"},
+ +	{Opt_caps_wanted_delay_min, "caps_wanted_delay_min=%d"},
+ +	{Opt_caps_wanted_delay_max, "caps_wanted_delay_max=%d"},
+ +	{Opt_caps_max, "caps_max=%d"},
+ +	{Opt_readdir_max_entries, "readdir_max_entries=%d"},
+ +	{Opt_readdir_max_bytes, "readdir_max_bytes=%d"},
+ +	{Opt_congestion_kb, "write_congestion_kb=%d"},
+ +	/* int args above */
+ +	{Opt_snapdirname, "snapdirname=%s"},
+ +	{Opt_mds_namespace, "mds_namespace=%s"},
+ +	{Opt_recover_session, "recover_session=%s"},
+ +	{Opt_fscache_uniq, "fsc=%s"},
+ +	/* string args above */
+ +	{Opt_dirstat, "dirstat"},
+ +	{Opt_nodirstat, "nodirstat"},
+ +	{Opt_rbytes, "rbytes"},
+ +	{Opt_norbytes, "norbytes"},
+ +	{Opt_asyncreaddir, "asyncreaddir"},
+ +	{Opt_noasyncreaddir, "noasyncreaddir"},
+ +	{Opt_dcache, "dcache"},
+ +	{Opt_nodcache, "nodcache"},
+ +	{Opt_ino32, "ino32"},
+ +	{Opt_noino32, "noino32"},
+ +	{Opt_fscache, "fsc"},
+ +	{Opt_nofscache, "nofsc"},
+ +	{Opt_poolperm, "poolperm"},
+ +	{Opt_nopoolperm, "nopoolperm"},
+ +	{Opt_require_active_mds, "require_active_mds"},
+ +	{Opt_norequire_active_mds, "norequire_active_mds"},
+ +#ifdef CONFIG_CEPH_FS_POSIX_ACL
+ +	{Opt_acl, "acl"},
+ +#endif
+ +	{Opt_noacl, "noacl"},
+ +	{Opt_quotadf, "quotadf"},
+ +	{Opt_noquotadf, "noquotadf"},
+ +	{-1, NULL}
+  };
+  
+++<<<<<<< HEAD
+ +static int parse_fsopt_token(char *c, void *private)
+++=======
++ static const struct fs_parameter_enum ceph_mount_param_enums[] = {
++ 	{ Opt_recover_session,	"no",		ceph_recover_session_no },
++ 	{ Opt_recover_session,	"clean",	ceph_recover_session_clean },
++ 	{}
++ };
++ 
++ static const struct fs_parameter_spec ceph_mount_param_specs[] = {
++ 	fsparam_flag_no ("acl",				Opt_acl),
++ 	fsparam_flag_no ("asyncreaddir",		Opt_asyncreaddir),
++ 	fsparam_s32	("caps_max",			Opt_caps_max),
++ 	fsparam_u32	("caps_wanted_delay_max",	Opt_caps_wanted_delay_max),
++ 	fsparam_u32	("caps_wanted_delay_min",	Opt_caps_wanted_delay_min),
++ 	fsparam_u32	("write_congestion_kb",		Opt_congestion_kb),
++ 	fsparam_flag_no ("copyfrom",			Opt_copyfrom),
++ 	fsparam_flag_no ("dcache",			Opt_dcache),
++ 	fsparam_flag_no ("dirstat",			Opt_dirstat),
++ 	__fsparam	(fs_param_is_string, "fsc",	Opt_fscache,
++ 			 fs_param_neg_with_no | fs_param_v_optional),
++ 	fsparam_flag_no ("ino32",			Opt_ino32),
++ 	fsparam_string	("mds_namespace",		Opt_mds_namespace),
++ 	fsparam_flag_no ("poolperm",			Opt_poolperm),
++ 	fsparam_flag_no ("quotadf",			Opt_quotadf),
++ 	fsparam_u32	("rasize",			Opt_rasize),
++ 	fsparam_flag_no ("rbytes",			Opt_rbytes),
++ 	fsparam_u32	("readdir_max_bytes",		Opt_readdir_max_bytes),
++ 	fsparam_u32	("readdir_max_entries",		Opt_readdir_max_entries),
++ 	fsparam_enum	("recover_session",		Opt_recover_session),
++ 	fsparam_flag_no ("require_active_mds",		Opt_require_active_mds),
++ 	fsparam_u32	("rsize",			Opt_rsize),
++ 	fsparam_string	("snapdirname",			Opt_snapdirname),
++ 	fsparam_string	("source",			Opt_source),
++ 	fsparam_u32	("wsize",			Opt_wsize),
++ 	{}
++ };
++ 
++ static const struct fs_parameter_description ceph_mount_parameters = {
++ 	.name           = "ceph",
++ 	.specs          = ceph_mount_param_specs,
++ 	.enums		= ceph_mount_param_enums,
++ };
++ 
++ struct ceph_parse_opts_ctx {
++ 	struct ceph_options		*copts;
++ 	struct ceph_mount_options	*opts;
++ };
++ 
++ /*
++  * Parse the source parameter.  Distinguish the server list from the path.
++  *
++  * The source will look like:
++  *     <server_spec>[,<server_spec>...]:[<path>]
++  * where
++  *     <server_spec> is <ip>[:<port>]
++  *     <path> is optional, but if present must begin with '/'
++  */
++ static int ceph_parse_source(struct fs_parameter *param, struct fs_context *fc)
+++>>>>>>> 4fbc0c711b24 (ceph: remove the extra slashes in the server path)
+  {
+ -	struct ceph_parse_opts_ctx *pctx = fc->fs_private;
+ -	struct ceph_mount_options *fsopt = pctx->opts;
+ -	char *dev_name = param->string, *dev_name_end;
+ -	int ret;
+ +	struct ceph_mount_options *fsopt = private;
+ +	substring_t argstr[MAX_OPT_ARGS];
+ +	int token, intval, ret;
+  
+++<<<<<<< HEAD
+ +	token = match_token((char *)c, fsopt_tokens, argstr);
+++=======
++ 	dout("%s '%s'\n", __func__, dev_name);
++ 	if (!dev_name || !*dev_name)
++ 		return invalf(fc, "ceph: Empty source");
++ 
++ 	dev_name_end = strchr(dev_name, '/');
++ 	if (dev_name_end) {
++ 		kfree(fsopt->server_path);
++ 
++ 		/*
++ 		 * The server_path will include the whole chars from userland
++ 		 * including the leading '/'.
++ 		 */
++ 		fsopt->server_path = kstrdup(dev_name_end, GFP_KERNEL);
++ 		if (!fsopt->server_path)
++ 			return -ENOMEM;
++ 	} else {
++ 		dev_name_end = dev_name + strlen(dev_name);
++ 	}
++ 
++ 	dev_name_end--;		/* back up to ':' separator */
++ 	if (dev_name_end < dev_name || *dev_name_end != ':')
++ 		return invalf(fc, "ceph: No path or : separator in source");
++ 
++ 	dout("device name '%.*s'\n", (int)(dev_name_end - dev_name), dev_name);
++ 	if (fsopt->server_path)
++ 		dout("server path '%s'\n", fsopt->server_path);
++ 
++ 	ret = ceph_parse_mon_ips(param->string, dev_name_end - dev_name,
++ 				 pctx->copts, fc);
++ 	if (ret)
++ 		return ret;
++ 
++ 	fc->source = param->string;
++ 	param->string = NULL;
++ 	return 0;
++ }
++ 
++ static int ceph_parse_mount_param(struct fs_context *fc,
++ 				  struct fs_parameter *param)
++ {
++ 	struct ceph_parse_opts_ctx *pctx = fc->fs_private;
++ 	struct ceph_mount_options *fsopt = pctx->opts;
++ 	struct fs_parse_result result;
++ 	unsigned int mode;
++ 	int token, ret;
++ 
++ 	ret = ceph_parse_param(param, pctx->copts, fc);
++ 	if (ret != -ENOPARAM)
++ 		return ret;
++ 
++ 	token = fs_parse(fc, &ceph_mount_parameters, param, &result);
++ 	dout("%s fs_parse '%s' token %d\n", __func__, param->key, token);
+++>>>>>>> 4fbc0c711b24 (ceph: remove the extra slashes in the server path)
+  	if (token < 0)
+ -		return token;
+ +		return -EINVAL;
+ +
+ +	if (token < Opt_last_int) {
+ +		ret = match_int(&argstr[0], &intval);
+ +		if (ret < 0) {
+ +			pr_err("bad option arg (not int) at '%s'\n", c);
+ +			return ret;
+ +		}
+ +		dout("got int token %d val %d\n", token, intval);
+ +	} else if (token > Opt_last_int && token < Opt_last_string) {
+ +		dout("got string token %d val %s\n", token,
+ +		     argstr[0].from);
+ +	} else {
+ +		dout("got token %d\n", token);
+ +	}
+  
+  	switch (token) {
+  	case Opt_snapdirname:
+* Unmerged path fs/ceph/super.c
