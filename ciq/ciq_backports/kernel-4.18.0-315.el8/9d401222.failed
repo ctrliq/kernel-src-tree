@@ -1,0 +1,134 @@
+iwlwifi: pcie: add ISR debug info for msix debug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Mordechay Goodstein <mordechay.goodstein@intel.com>
+commit 9d401222db54dac353fecad26f2610c12c33ef47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/9d401222.failed
+
+The debug prints help in case we get timeout on waiting for
+hw.
+
+	Signed-off-by: Mordechay Goodstein <mordechay.goodstein@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Link: https://lore.kernel.org/r/iwlwifi.20210411124417.306e2e56d3e8.I72e2977abbb1fddf23b8476bedf6a183fe969ff5@changeid
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+(cherry picked from commit 9d401222db54dac353fecad26f2610c12c33ef47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+diff --cc drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+index 42322424f0ef,fb8491412be4..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+@@@ -1009,10 -1009,65 +1009,68 @@@ void iwl_pcie_rx_init_rxb_lists(struct 
+  	rxq->used_count = 0;
+  }
+  
+ -static int iwl_pcie_rx_handle(struct iwl_trans *trans, int queue, int budget);
+ -
+ -static int iwl_pcie_napi_poll(struct napi_struct *napi, int budget)
+ +int iwl_pcie_dummy_napi_poll(struct napi_struct *napi, int budget)
+  {
+++<<<<<<< HEAD
+ +	WARN_ON(1);
+ +	return 0;
+++=======
++ 	struct iwl_rxq *rxq = container_of(napi, struct iwl_rxq, napi);
++ 	struct iwl_trans_pcie *trans_pcie;
++ 	struct iwl_trans *trans;
++ 	int ret;
++ 
++ 	trans_pcie = container_of(napi->dev, struct iwl_trans_pcie, napi_dev);
++ 	trans = trans_pcie->trans;
++ 
++ 	ret = iwl_pcie_rx_handle(trans, rxq->id, budget);
++ 
++ 	IWL_DEBUG_ISR(trans, "[%d] handled %d, budget %d\n",
++ 		      rxq->id, ret, budget);
++ 
++ 	if (ret < budget) {
++ 		spin_lock(&trans_pcie->irq_lock);
++ 		if (test_bit(STATUS_INT_ENABLED, &trans->status))
++ 			_iwl_enable_interrupts(trans);
++ 		spin_unlock(&trans_pcie->irq_lock);
++ 
++ 		napi_complete_done(&rxq->napi, ret);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int iwl_pcie_napi_poll_msix(struct napi_struct *napi, int budget)
++ {
++ 	struct iwl_rxq *rxq = container_of(napi, struct iwl_rxq, napi);
++ 	struct iwl_trans_pcie *trans_pcie;
++ 	struct iwl_trans *trans;
++ 	int ret;
++ 
++ 	trans_pcie = container_of(napi->dev, struct iwl_trans_pcie, napi_dev);
++ 	trans = trans_pcie->trans;
++ 
++ 	ret = iwl_pcie_rx_handle(trans, rxq->id, budget);
++ 	IWL_DEBUG_ISR(trans, "[%d] handled %d, budget %d\n", rxq->id, ret,
++ 		      budget);
++ 
++ 	if (ret < budget) {
++ 		int irq_line = rxq->id;
++ 
++ 		/* FIRST_RSS is shared with line 0 */
++ 		if (trans_pcie->shared_vec_mask & IWL_SHARED_IRQ_FIRST_RSS &&
++ 		    rxq->id == 1)
++ 			irq_line = 0;
++ 
++ 		spin_lock(&trans_pcie->irq_lock);
++ 		iwl_pcie_clear_irq(trans, irq_line);
++ 		spin_unlock(&trans_pcie->irq_lock);
++ 
++ 		napi_complete_done(&rxq->napi, ret);
++ 	}
++ 
++ 	return ret;
+++>>>>>>> 9d401222db54 (iwlwifi: pcie: add ISR debug info for msix debug)
+  }
+  
+  static int _iwl_pcie_rx_init(struct iwl_trans *trans)
+@@@ -1578,13 -1645,15 +1638,14 @@@ irqreturn_t iwl_pcie_irq_rx_msix_handle
+  		return IRQ_NONE;
+  
+  	lock_map_acquire(&trans->sync_cmd_lockdep_map);
++ 	IWL_DEBUG_ISR(trans, "[%d] Got interrupt\n", entry->entry);
+  
+  	local_bh_disable();
+ -	if (napi_schedule_prep(&rxq->napi))
+ -		__napi_schedule(&rxq->napi);
+ -	else
+ -		iwl_pcie_clear_irq(trans, entry->entry);
+ +	iwl_pcie_rx_handle(trans, entry->entry);
+  	local_bh_enable();
+  
+ +	iwl_pcie_clear_irq(trans, entry);
+ +
+  	lock_map_release(&trans->sync_cmd_lockdep_map);
+  
+  	return IRQ_HANDLED;
+* Unmerged path drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+index dab46c132379..6ea65815d934 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+@@ -1604,6 +1604,11 @@ iwl_pcie_set_interrupt_capa(struct pci_dev *pdev,
+ 	} else {
+ 		trans_pcie->trans->num_rx_queues = num_irqs - 1;
+ 	}
++
++	IWL_DEBUG_INFO(trans,
++		       "MSI-X enabled with rx queues %d, vec mask 0x%x\n",
++		       trans_pcie->trans->num_rx_queues, trans_pcie->shared_vec_mask);
++
+ 	WARN_ON(trans_pcie->trans->num_rx_queues > IWL_MAX_RX_HW_QUEUES);
+ 
+ 	trans_pcie->alloc_vecs = num_irqs;
