@@ -1,0 +1,194 @@
+net/mlx5e: Avoid unbounded peer devices when unpairing TC hairpin rules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Alaa Hleihel <alaa@mellanox.com>
+commit 4d8fcf216c90bc25e34ae2200aa8985ee3158898
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/4d8fcf21.failed
+
+If the peer device was already unbound, then do not attempt to modify
+it's resources, otherwise we will crash on dereferencing non-existing
+device.
+
+Fixes: 5c65c564c962 ("net/mlx5e: Support offloading TC NIC hairpin flows")
+	Signed-off-by: Alaa Hleihel <alaa@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 4d8fcf216c90bc25e34ae2200aa8985ee3158898)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index c488db7d1bb9,f291d1bf1558..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -4286,23 -4315,7 +4286,27 @@@ static int mlx5e_xdp(struct net_device 
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_POLL_CONTROLLER
+ +/* Fake "interrupt" called by netpoll (eg netconsole) to send skbs without
+ + * reenabling interrupts.
+ + */
+ +static void mlx5e_netpoll(struct net_device *dev)
+ +{
+ +	struct mlx5e_priv *priv = netdev_priv(dev);
+ +	struct mlx5e_channels *chs = &priv->channels;
+ +
+ +	int i;
+ +
+ +	for (i = 0; i < chs->num; i++)
+ +		napi_schedule(&chs->c[i]->napi);
+ +}
+ +#endif
+ +
+ +static const struct net_device_ops mlx5e_netdev_ops = {
+++=======
++ const struct net_device_ops mlx5e_netdev_ops = {
+++>>>>>>> 4d8fcf216c90 (net/mlx5e: Avoid unbounded peer devices when unpairing TC hairpin rules)
+  	.ndo_open                = mlx5e_open,
+  	.ndo_stop                = mlx5e_close,
+  	.ndo_start_xmit          = mlx5e_xmit,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 7ebed66cd496..bd79f7319ea9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -54,6 +54,7 @@
+ #include "en_stats.h"
+ #include "vxlan.h"
+ 
++extern const struct net_device_ops mlx5e_netdev_ops;
+ struct page_pool;
+ 
+ #define MLX5E_METADATA_ETHER_TYPE (0x8CE4)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 3346a902b8ed..f29576c8b02a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -2869,14 +2869,71 @@ int mlx5e_stats_flower(struct mlx5e_priv *priv,
+ 	return 0;
+ }
+ 
++static void mlx5e_tc_hairpin_update_dead_peer(struct mlx5e_priv *priv,
++					      struct mlx5e_priv *peer_priv)
++{
++	struct mlx5_core_dev *peer_mdev = peer_priv->mdev;
++	struct mlx5e_hairpin_entry *hpe;
++	u16 peer_vhca_id;
++	int bkt;
++
++	if (!same_hw_devs(priv, peer_priv))
++		return;
++
++	peer_vhca_id = MLX5_CAP_GEN(peer_mdev, vhca_id);
++
++	hash_for_each(priv->fs.tc.hairpin_tbl, bkt, hpe, hairpin_hlist) {
++		if (hpe->peer_vhca_id == peer_vhca_id)
++			hpe->hp->pair->peer_gone = true;
++	}
++}
++
++static int mlx5e_tc_netdev_event(struct notifier_block *this,
++				 unsigned long event, void *ptr)
++{
++	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
++	struct mlx5e_flow_steering *fs;
++	struct mlx5e_priv *peer_priv;
++	struct mlx5e_tc_table *tc;
++	struct mlx5e_priv *priv;
++
++	if (ndev->netdev_ops != &mlx5e_netdev_ops ||
++	    event != NETDEV_UNREGISTER ||
++	    ndev->reg_state == NETREG_REGISTERED)
++		return NOTIFY_DONE;
++
++	tc = container_of(this, struct mlx5e_tc_table, netdevice_nb);
++	fs = container_of(tc, struct mlx5e_flow_steering, tc);
++	priv = container_of(fs, struct mlx5e_priv, fs);
++	peer_priv = netdev_priv(ndev);
++	if (priv == peer_priv ||
++	    !(priv->netdev->features & NETIF_F_HW_TC))
++		return NOTIFY_DONE;
++
++	mlx5e_tc_hairpin_update_dead_peer(priv, peer_priv);
++
++	return NOTIFY_DONE;
++}
++
+ int mlx5e_tc_nic_init(struct mlx5e_priv *priv)
+ {
+ 	struct mlx5e_tc_table *tc = &priv->fs.tc;
++	int err;
+ 
+ 	hash_init(tc->mod_hdr_tbl);
+ 	hash_init(tc->hairpin_tbl);
+ 
+-	return rhashtable_init(&tc->ht, &tc_ht_params);
++	err = rhashtable_init(&tc->ht, &tc_ht_params);
++	if (err)
++		return err;
++
++	tc->netdevice_nb.notifier_call = mlx5e_tc_netdev_event;
++	if (register_netdevice_notifier(&tc->netdevice_nb)) {
++		tc->netdevice_nb.notifier_call = NULL;
++		mlx5_core_warn(priv->mdev, "Failed to register netdev notifier\n");
++	}
++
++	return err;
+ }
+ 
+ static void _mlx5e_tc_del_flow(void *ptr, void *arg)
+@@ -2892,6 +2949,9 @@ void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv)
+ {
+ 	struct mlx5e_tc_table *tc = &priv->fs.tc;
+ 
++	if (tc->netdevice_nb.notifier_call)
++		unregister_netdevice_notifier(&tc->netdevice_nb);
++
+ 	rhashtable_free_and_destroy(&tc->ht, _mlx5e_tc_del_flow, NULL);
+ 
+ 	if (!IS_ERR_OR_NULL(tc->t)) {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/transobj.c b/drivers/net/ethernet/mellanox/mlx5/core/transobj.c
+index d2f76070ea7c..a1ee9a8a769e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/transobj.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/transobj.c
+@@ -475,7 +475,8 @@ static void mlx5_hairpin_destroy_queues(struct mlx5_hairpin *hp)
+ 
+ 	for (i = 0; i < hp->num_channels; i++) {
+ 		mlx5_core_destroy_rq(hp->func_mdev, hp->rqn[i]);
+-		mlx5_core_destroy_sq(hp->peer_mdev, hp->sqn[i]);
++		if (!hp->peer_gone)
++			mlx5_core_destroy_sq(hp->peer_mdev, hp->sqn[i]);
+ 	}
+ }
+ 
+@@ -567,6 +568,8 @@ static void mlx5_hairpin_unpair_queues(struct mlx5_hairpin *hp)
+ 				       MLX5_RQC_STATE_RST, 0, 0);
+ 
+ 	/* unset peer SQs */
++	if (hp->peer_gone)
++		return;
+ 	for (i = 0; i < hp->num_channels; i++)
+ 		mlx5_hairpin_modify_sq(hp->peer_mdev, hp->sqn[i], MLX5_SQC_STATE_RDY,
+ 				       MLX5_SQC_STATE_RST, 0, 0);
+diff --git a/include/linux/mlx5/transobj.h b/include/linux/mlx5/transobj.h
+index 83a33a1873a6..7f5ca2cd3a32 100644
+--- a/include/linux/mlx5/transobj.h
++++ b/include/linux/mlx5/transobj.h
+@@ -90,6 +90,8 @@ struct mlx5_hairpin {
+ 
+ 	u32 *rqn;
+ 	u32 *sqn;
++
++	bool peer_gone;
+ };
+ 
+ struct mlx5_hairpin *
