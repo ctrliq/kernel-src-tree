@@ -135,7 +135,7 @@ static unsigned long kvm_get_tsc_khz(void)
 	return pvclock_tsc_khz(&hv_clock[0].pvti);
 }
 
-static void kvm_get_preset_lpj(void)
+static void __init kvm_get_preset_lpj(void)
 {
 	unsigned long khz;
 	u64 lpj;
