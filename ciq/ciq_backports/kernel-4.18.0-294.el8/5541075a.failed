@@ -1,0 +1,170 @@
+bpf: Prevent double bpf_prog_put call from bpf_tracing_prog_attach
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 5541075a348b6ca6ac668653f7d2c423ae8e00b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5541075a.failed
+
+The bpf_tracing_prog_attach error path calls bpf_prog_put
+on prog, which causes refcount underflow when it's called
+from link_create function.
+
+  link_create
+    prog = bpf_prog_get              <-- get
+    ...
+    tracing_bpf_link_attach(prog..
+      bpf_tracing_prog_attach(prog..
+        out_put_prog:
+          bpf_prog_put(prog);        <-- put
+
+    if (ret < 0)
+      bpf_prog_put(prog);            <-- put
+
+Removing bpf_prog_put call from bpf_tracing_prog_attach
+and making sure its callers call it instead.
+
+Fixes: 4a1e7c0c63e0 ("bpf: Support attaching freplace programs to multiple attach points")
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210111191650.1241578-1-jolsa@kernel.org
+(cherry picked from commit 5541075a348b6ca6ac668653f7d2c423ae8e00b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/syscall.c
+diff --cc kernel/bpf/syscall.c
+index 124e66325086,e5999d86c76e..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -2524,21 -2618,100 +2524,26 @@@ static int bpf_tracing_prog_attach(stru
+  		      &bpf_tracing_link_lops, prog);
+  	link->attach_type = prog->expected_attach_type;
+  
+ -	mutex_lock(&prog->aux->dst_mutex);
+ -
+ -	/* There are a few possible cases here:
+ -	 *
+ -	 * - if prog->aux->dst_trampoline is set, the program was just loaded
+ -	 *   and not yet attached to anything, so we can use the values stored
+ -	 *   in prog->aux
+ -	 *
+ -	 * - if prog->aux->dst_trampoline is NULL, the program has already been
+ -         *   attached to a target and its initial target was cleared (below)
+ -	 *
+ -	 * - if tgt_prog != NULL, the caller specified tgt_prog_fd +
+ -	 *   target_btf_id using the link_create API.
+ -	 *
+ -	 * - if tgt_prog == NULL when this function was called using the old
+ -         *   raw_tracepoint_open API, and we need a target from prog->aux
+ -         *
+ -         * The combination of no saved target in prog->aux, and no target
+ -         * specified on load is illegal, and we reject that here.
+ -	 */
+ -	if (!prog->aux->dst_trampoline && !tgt_prog) {
+ -		err = -ENOENT;
+ -		goto out_unlock;
+ -	}
+ -
+ -	if (!prog->aux->dst_trampoline ||
+ -	    (key && key != prog->aux->dst_trampoline->key)) {
+ -		/* If there is no saved target, or the specified target is
+ -		 * different from the destination specified at load time, we
+ -		 * need a new trampoline and a check for compatibility
+ -		 */
+ -		struct bpf_attach_target_info tgt_info = {};
+ -
+ -		err = bpf_check_attach_target(NULL, prog, tgt_prog, btf_id,
+ -					      &tgt_info);
+ -		if (err)
+ -			goto out_unlock;
+ -
+ -		tr = bpf_trampoline_get(key, &tgt_info);
+ -		if (!tr) {
+ -			err = -ENOMEM;
+ -			goto out_unlock;
+ -		}
+ -	} else {
+ -		/* The caller didn't specify a target, or the target was the
+ -		 * same as the destination supplied during program load. This
+ -		 * means we can reuse the trampoline and reference from program
+ -		 * load time, and there is no need to allocate a new one. This
+ -		 * can only happen once for any program, as the saved values in
+ -		 * prog->aux are cleared below.
+ -		 */
+ -		tr = prog->aux->dst_trampoline;
+ -		tgt_prog = prog->aux->dst_prog;
+ -	}
+ -
+  	err = bpf_link_prime(&link->link, &link_primer);
+ -	if (err)
+ -		goto out_unlock;
+ +	if (err) {
+ +		kfree(link);
+ +		goto out_put_prog;
+ +	}
+  
+ -	err = bpf_trampoline_link_prog(prog, tr);
+ +	err = bpf_trampoline_link_prog(prog);
+  	if (err) {
+  		bpf_link_cleanup(&link_primer);
+ -		link = NULL;
+ -		goto out_unlock;
+ +		goto out_put_prog;
+  	}
+  
+ -	link->tgt_prog = tgt_prog;
+ -	link->trampoline = tr;
+ -
+ -	/* Always clear the trampoline and target prog from prog->aux to make
+ -	 * sure the original attach destination is not kept alive after a
+ -	 * program is (re-)attached to another target.
+ -	 */
+ -	if (prog->aux->dst_prog &&
+ -	    (tgt_prog_fd || tr != prog->aux->dst_trampoline))
+ -		/* got extra prog ref from syscall, or attaching to different prog */
+ -		bpf_prog_put(prog->aux->dst_prog);
+ -	if (prog->aux->dst_trampoline && tr != prog->aux->dst_trampoline)
+ -		/* we allocated a new trampoline, so free the old one */
+ -		bpf_trampoline_put(prog->aux->dst_trampoline);
+ -
+ -	prog->aux->dst_prog = NULL;
+ -	prog->aux->dst_trampoline = NULL;
+ -	mutex_unlock(&prog->aux->dst_mutex);
+ -
+  	return bpf_link_settle(&link_primer);
+ -out_unlock:
+ -	if (tr && tr != prog->aux->dst_trampoline)
+ -		bpf_trampoline_put(tr);
+ -	mutex_unlock(&prog->aux->dst_mutex);
+ -	kfree(link);
+  out_put_prog:
+++<<<<<<< HEAD
+ +	bpf_prog_put(prog);
+++=======
++ 	if (tgt_prog_fd && tgt_prog)
++ 		bpf_prog_put(tgt_prog);
+++>>>>>>> 5541075a348b (bpf: Prevent double bpf_prog_put call from bpf_tracing_prog_attach)
+  	return err;
+  }
+  
+@@@ -2653,7 -2824,10 +2658,14 @@@ static int bpf_raw_tracepoint_open(cons
+  			tp_name = prog->aux->attach_func_name;
+  			break;
+  		}
+++<<<<<<< HEAD
+ +		return bpf_tracing_prog_attach(prog);
+++=======
++ 		err = bpf_tracing_prog_attach(prog, 0, 0);
++ 		if (err >= 0)
++ 			return err;
++ 		goto out_put_prog;
+++>>>>>>> 5541075a348b (bpf: Prevent double bpf_prog_put call from bpf_tracing_prog_attach)
+  	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+  	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+  		if (strncpy_from_user(buf,
+* Unmerged path kernel/bpf/syscall.c
