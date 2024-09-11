@@ -606,7 +606,9 @@ struct mlx5_ifc_e_switch_cap_bits {
 
 	u8         vxlan_encap_decap[0x1];
 	u8         nvgre_encap_decap[0x1];
-	u8         reserved_at_22[0x9];
+	u8         reserved_at_22[0x1];
+	u8         log_max_fdb_encap_uplink[0x5];
+	u8         reserved_at_21[0x3];
 	u8         log_max_packet_reformat_context[0x5];
 	u8         reserved_2b[0x6];
 	u8         max_encap_header_size[0xa];
@@ -1202,8 +1204,10 @@ enum mlx5_flow_destination_type {
 struct mlx5_ifc_dest_format_struct_bits {
 	u8         destination_type[0x8];
 	u8         destination_id[0x18];
+
 	u8         destination_eswitch_owner_vhca_id_valid[0x1];
-	u8         reserved_at_21[0xf];
+	u8         packet_reformat[0x1];
+	u8         reserved_at_22[0xe];
 	u8         destination_eswitch_owner_vhca_id[0x10];
 };
 
@@ -1211,6 +1215,14 @@ struct mlx5_ifc_flow_counter_list_bits {
 	u8         flow_counter_id[0x20];
 
 	u8         reserved_at_20[0x20];
+};
+
+struct mlx5_ifc_extended_dest_format_bits {
+	struct mlx5_ifc_dest_format_struct_bits destination_entry;
+
+	u8         packet_reformat_id[0x20];
+
+	u8         reserved_at_60[0x20];
 };
 
 union mlx5_ifc_dest_format_struct_flow_counter_list_auto_bits {
@@ -2434,7 +2446,8 @@ struct mlx5_ifc_flow_context_bits {
 	u8         reserved_at_60[0x10];
 	u8         action[0x10];
 
-	u8         reserved_at_80[0x8];
+	u8         extended_destination[0x1];
+	u8         reserved_at_80[0x7];
 	u8         destination_list_size[0x18];
 
 	u8         reserved_at_a0[0x8];
