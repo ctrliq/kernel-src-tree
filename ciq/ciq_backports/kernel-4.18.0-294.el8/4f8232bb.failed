@@ -1,0 +1,680 @@
+dma-direct: remove the cached_kernel_address hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 4f8232bbf887123f78bcdca3dfd2b3dfa52a0112
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4f8232bb.failed
+
+dma-direct now finds the kernel address for coherent allocations based
+on the dma address, so the cached_kernel_address hooks is unused and
+can be removed entirely.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+(cherry picked from commit 4f8232bbf887123f78bcdca3dfd2b3dfa52a0112)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/microblaze/mm/consistent.c
+#	arch/mips/mm/dma-noncoherent.c
+#	arch/nios2/mm/dma-mapping.c
+#	arch/xtensa/kernel/pci-dma.c
+diff --cc arch/microblaze/mm/consistent.c
+index b0ac81828e6a,cede7c5e8135..000000000000
+--- a/arch/microblaze/mm/consistent.c
++++ b/arch/microblaze/mm/consistent.c
+@@@ -3,264 -4,49 +3,270 @@@
+   * Copyright (C) 2010 Michal Simek <monstr@monstr.eu>
+   * Copyright (C) 2010 PetaLogix
+   * Copyright (C) 2005 John Williams <jwilliams@itee.uq.edu.au>
+ + *
+ + * Based on PowerPC version derived from arch/arm/mm/consistent.c
+ + * Copyright (C) 2001 Dan Malek (dmalek@jlc.net)
+ + * Copyright (C) 2000 Russell King
+ + *
+ + * This program is free software; you can redistribute it and/or modify
+ + * it under the terms of the GNU General Public License version 2 as
+ + * published by the Free Software Foundation.
+   */
+  
+ +#include <linux/export.h>
+ +#include <linux/signal.h>
+ +#include <linux/sched.h>
+  #include <linux/kernel.h>
+ +#include <linux/errno.h>
+  #include <linux/string.h>
+  #include <linux/types.h>
+ +#include <linux/ptrace.h>
+ +#include <linux/mman.h>
+  #include <linux/mm.h>
+ +#include <linux/swap.h>
+ +#include <linux/stddef.h>
+ +#include <linux/vmalloc.h>
+  #include <linux/init.h>
+ -#include <linux/dma-noncoherent.h>
+ +#include <linux/delay.h>
+ +#include <linux/memblock.h>
+ +#include <linux/highmem.h>
+ +#include <linux/pci.h>
+ +#include <linux/interrupt.h>
+ +#include <linux/gfp.h>
+ +
+ +#include <asm/pgalloc.h>
+ +#include <linux/io.h>
+ +#include <linux/hardirq.h>
+ +#include <linux/mmu_context.h>
+ +#include <asm/mmu.h>
+ +#include <linux/uaccess.h>
+ +#include <asm/pgtable.h>
+  #include <asm/cpuinfo.h>
+ -#include <asm/cacheflush.h>
+ +#include <asm/tlbflush.h>
+ +
+ +#ifndef CONFIG_MMU
+ +/* I have to use dcache values because I can't relate on ram size */
+ +# define UNCACHED_SHADOW_MASK (cpuinfo.dcache_high - cpuinfo.dcache_base + 1)
+ +#endif
+  
+ -void arch_dma_prep_coherent(struct page *page, size_t size)
+ +/*
+ + * Consistent memory allocators. Used for DMA devices that want to
+ + * share uncached memory with the processor core.
+ + * My crufty no-MMU approach is simple. In the HW platform we can optionally
+ + * mirror the DDR up above the processor cacheable region.  So, memory accessed
+ + * in this mirror region will not be cached.  It's alloced from the same
+ + * pool as normal memory, but the handle we return is shifted up into the
+ + * uncached region.  This will no doubt cause big problems if memory allocated
+ + * here is not also freed properly. -- JW
+ + */
+ +void *consistent_alloc(gfp_t gfp, size_t size, dma_addr_t *dma_handle)
+  {
+ -	phys_addr_t paddr = page_to_phys(page);
+ +	unsigned long order, vaddr;
+ +	void *ret;
+ +	unsigned int i, err = 0;
+ +	struct page *page, *end;
+  
+ -	flush_dcache_range(paddr, paddr + size);
+ -}
+ +#ifdef CONFIG_MMU
+ +	phys_addr_t pa;
+ +	struct vm_struct *area;
+ +	unsigned long va;
+ +#endif
+ +
+ +	if (in_interrupt())
+ +		BUG();
+ +
+ +	/* Only allocate page size areas. */
+ +	size = PAGE_ALIGN(size);
+ +	order = get_order(size);
+ +
+ +	vaddr = __get_free_pages(gfp, order);
+ +	if (!vaddr)
+ +		return NULL;
+ +
+ +	/*
+ +	 * we need to ensure that there are no cachelines in use,
+ +	 * or worse dirty in this area.
+ +	 */
+ +	flush_dcache_range(virt_to_phys((void *)vaddr),
+ +					virt_to_phys((void *)vaddr) + size);
+  
+  #ifndef CONFIG_MMU
+ +	ret = (void *)vaddr;
+ +	/*
+ +	 * Here's the magic!  Note if the uncached shadow is not implemented,
+ +	 * it's up to the calling code to also test that condition and make
+ +	 * other arranegments, such as manually flushing the cache and so on.
+ +	 */
+ +# ifdef CONFIG_XILINX_UNCACHED_SHADOW
+ +	ret = (void *)((unsigned) ret | UNCACHED_SHADOW_MASK);
+ +# endif
+ +	if ((unsigned int)ret > cpuinfo.dcache_base &&
+ +				(unsigned int)ret < cpuinfo.dcache_high)
+ +		pr_warn("ERROR: Your cache coherent area is CACHED!!!\n");
+++<<<<<<< HEAD
+ +
+ +	/* dma_handle is same as physical (shadowed) address */
+ +	*dma_handle = (dma_addr_t)ret;
+ +#else
+ +	/* Allocate some common virtual space to map the new pages. */
+ +	area = get_vm_area(size, VM_ALLOC);
+ +	if (!area) {
+ +		free_pages(vaddr, order);
+ +		return NULL;
+ +	}
+ +	va = (unsigned long) area->addr;
+ +	ret = (void *)va;
+ +
+ +	/* This gives us the real physical address of the first page. */
+ +	*dma_handle = pa = __virt_to_phys(vaddr);
+ +#endif
+ +
+ +	/*
+ +	 * free wasted pages.  We skip the first page since we know
+ +	 * that it will have count = 1 and won't require freeing.
+ +	 * We also mark the pages in use as reserved so that
+ +	 * remap_page_range works.
+ +	 */
+ +	page = virt_to_page(vaddr);
+ +	end = page + (1 << order);
+ +
+ +	split_page(page, order);
+ +
+ +	for (i = 0; i < size && err == 0; i += PAGE_SIZE) {
+ +#ifdef CONFIG_MMU
+ +		/* MS: This is the whole magic - use cache inhibit pages */
+ +		err = map_page(va + i, pa + i, _PAGE_KERNEL | _PAGE_NO_CACHE);
+ +#endif
+ +
+ +		SetPageReserved(page);
+ +		page++;
+ +	}
+ +
+ +	/* Free the otherwise unused pages. */
+ +	while (page < end) {
+ +		__free_page(page);
+ +		page++;
+ +	}
+ +
+ +	if (err) {
+ +		free_pages(vaddr, order);
+ +		return NULL;
+ +	}
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL(consistent_alloc);
+ +
+ +#ifdef CONFIG_MMU
+ +static pte_t *consistent_virt_to_pte(void *vaddr)
+ +{
+ +	unsigned long addr = (unsigned long)vaddr;
+ +
+ +	return pte_offset_kernel(pmd_offset(pgd_offset_k(addr), addr), addr);
+ +}
+ +
+ +unsigned long consistent_virt_to_pfn(void *vaddr)
+ +{
+ +	pte_t *ptep = consistent_virt_to_pte(vaddr);
+ +
+ +	if (pte_none(*ptep) || !pte_present(*ptep))
+ +		return 0;
+ +
+ +	return pte_pfn(*ptep);
+ +}
+ +#endif
+ +
+  /*
+ - * Consistent memory allocators. Used for DMA devices that want to share
+ - * uncached memory with the processor core.  My crufty no-MMU approach is
+ - * simple.  In the HW platform we can optionally mirror the DDR up above the
+ - * processor cacheable region.  So, memory accessed in this mirror region will
+ - * not be cached.  It's alloced from the same pool as normal memory, but the
+ - * handle we return is shifted up into the uncached region.  This will no doubt
+ - * cause big problems if memory allocated here is not also freed properly. -- JW
+ - *
+ - * I have to use dcache values because I can't relate on ram size:
+ + * free page(s) as defined by the above mapping.
+   */
+ -#ifdef CONFIG_XILINX_UNCACHED_SHADOW
+ -#define UNCACHED_SHADOW_MASK (cpuinfo.dcache_high - cpuinfo.dcache_base + 1)
+ +void consistent_free(size_t size, void *vaddr)
+ +{
+ +	struct page *page;
+ +
+ +	if (in_interrupt())
+ +		BUG();
+ +
+ +	size = PAGE_ALIGN(size);
+ +
+ +#ifndef CONFIG_MMU
+ +	/* Clear SHADOW_MASK bit in address, and free as per usual */
+ +# ifdef CONFIG_XILINX_UNCACHED_SHADOW
+ +	vaddr = (void *)((unsigned)vaddr & ~UNCACHED_SHADOW_MASK);
+ +# endif
+ +	page = virt_to_page(vaddr);
+ +
+ +	do {
+ +		__free_reserved_page(page);
+ +		page++;
+ +	} while (size -= PAGE_SIZE);
+  #else
+ -#define UNCACHED_SHADOW_MASK 0
+ -#endif /* CONFIG_XILINX_UNCACHED_SHADOW */
+ +	do {
+ +		pte_t *ptep = consistent_virt_to_pte(vaddr);
+ +		unsigned long pfn;
+ +
+ +		if (!pte_none(*ptep) && pte_present(*ptep)) {
+ +			pfn = pte_pfn(*ptep);
+ +			pte_clear(&init_mm, (unsigned int)vaddr, ptep);
+ +			if (pfn_valid(pfn)) {
+ +				page = pfn_to_page(pfn);
+ +				__free_reserved_page(page);
+ +			}
+ +		}
+ +		vaddr += PAGE_SIZE;
+ +	} while (size -= PAGE_SIZE);
+  
+ -void *uncached_kernel_address(void *ptr)
+ +	/* flush tlb */
+ +	flush_tlb_all();
+ +#endif
+ +}
+ +EXPORT_SYMBOL(consistent_free);
+ +
+ +/*
+ + * make an area consistent.
+ + */
+ +void consistent_sync(void *vaddr, size_t size, int direction)
+  {
+ -	unsigned long addr = (unsigned long)ptr;
+ +	unsigned long start;
+ +	unsigned long end;
+  
+ -	addr |= UNCACHED_SHADOW_MASK;
+ -	if (addr > cpuinfo.dcache_base && addr < cpuinfo.dcache_high)
+ -		pr_warn("ERROR: Your cache coherent area is CACHED!!!\n");
+ +	start = (unsigned long)vaddr;
+ +
+ +	/* Convert start address back down to unshadowed memory region */
+ +#ifdef CONFIG_XILINX_UNCACHED_SHADOW
+ +	start &= ~UNCACHED_SHADOW_MASK;
+ +#endif
+ +	end = start + size;
+ +
+ +	switch (direction) {
+ +	case PCI_DMA_NONE:
+ +		BUG();
+ +	case PCI_DMA_FROMDEVICE:	/* invalidate only */
+ +		invalidate_dcache_range(start, end);
+ +		break;
+ +	case PCI_DMA_TODEVICE:		/* writeback only */
+ +		flush_dcache_range(start, end);
+ +		break;
+ +	case PCI_DMA_BIDIRECTIONAL:	/* writeback and invalidate */
+ +		flush_dcache_range(start, end);
+ +		break;
+ +	}
+ +}
+ +EXPORT_SYMBOL(consistent_sync);
+ +
+ +/*
+ + * consistent_sync_page makes memory consistent. identical
+ + * to consistent_sync, but takes a struct page instead of a
+ + * virtual address
+ + */
+ +void consistent_sync_page(struct page *page, unsigned long offset,
+ +	size_t size, int direction)
+ +{
+ +	unsigned long start = (unsigned long)page_address(page) + offset;
+ +	consistent_sync((void *)start, size, direction);
+ +}
+ +EXPORT_SYMBOL(consistent_sync_page);
+++=======
++ 	return (void *)addr;
++ }
++ #endif /* CONFIG_MMU */
+++>>>>>>> 4f8232bbf887 (dma-direct: remove the cached_kernel_address hook)
+diff --cc arch/nios2/mm/dma-mapping.c
+index 4be815519dd4,f30f2749257c..000000000000
+--- a/arch/nios2/mm/dma-mapping.c
++++ b/arch/nios2/mm/dma-mapping.c
+@@@ -58,147 -60,18 +58,150 @@@ static inline void __dma_sync_for_cpu(v
+  	}
+  }
+  
+ -void arch_dma_prep_coherent(struct page *page, size_t size)
+ +static void *nios2_dma_alloc(struct device *dev, size_t size,
+ +		dma_addr_t *dma_handle, gfp_t gfp, unsigned long attrs)
+ +{
+ +	void *ret;
+ +
+ +	/* optimized page clearing */
+ +	gfp |= __GFP_ZERO;
+ +
+ +	if (dev == NULL || (dev->coherent_dma_mask < 0xffffffff))
+ +		gfp |= GFP_DMA;
+ +
+ +	ret = (void *) __get_free_pages(gfp, get_order(size));
+ +	if (ret != NULL) {
+ +		*dma_handle = virt_to_phys(ret);
+ +		flush_dcache_range((unsigned long) ret,
+ +			(unsigned long) ret + size);
+ +		ret = UNCAC_ADDR(ret);
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+ +static void nios2_dma_free(struct device *dev, size_t size, void *vaddr,
+ +		dma_addr_t dma_handle, unsigned long attrs)
+ +{
+ +	unsigned long addr = (unsigned long) CAC_ADDR((unsigned long) vaddr);
+ +
+ +	free_pages(addr, get_order(size));
+ +}
+++<<<<<<< HEAD
+ +
+ +static int nios2_dma_map_sg(struct device *dev, struct scatterlist *sg,
+ +		int nents, enum dma_data_direction direction,
+ +		unsigned long attrs)
+ +{
+ +	int i;
+ +
+ +	for_each_sg(sg, sg, nents, i) {
+ +		void *addr = sg_virt(sg);
+ +
+ +		if (!addr)
+ +			continue;
+ +
+ +		sg->dma_address = sg_phys(sg);
+ +
+ +		if (attrs & DMA_ATTR_SKIP_CPU_SYNC)
+ +			continue;
+ +
+ +		__dma_sync_for_device(addr, sg->length, direction);
+ +	}
+ +
+ +	return nents;
+ +}
+ +
+ +static dma_addr_t nios2_dma_map_page(struct device *dev, struct page *page,
+ +			unsigned long offset, size_t size,
+ +			enum dma_data_direction direction,
+ +			unsigned long attrs)
+  {
+ -	unsigned long start = (unsigned long)page_address(page);
+ +	void *addr = page_address(page) + offset;
+ +
+ +	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+ +		__dma_sync_for_device(addr, size, direction);
+ +
+ +	return page_to_phys(page) + offset;
+ +}
+  
+ -	flush_dcache_range(start, start + size);
+ +static void nios2_dma_unmap_page(struct device *dev, dma_addr_t dma_address,
+ +		size_t size, enum dma_data_direction direction,
+ +		unsigned long attrs)
+ +{
+ +	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+ +		__dma_sync_for_cpu(phys_to_virt(dma_address), size, direction);
+  }
+  
+ -void *uncached_kernel_address(void *ptr)
+ +static void nios2_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
+ +		int nhwentries, enum dma_data_direction direction,
+ +		unsigned long attrs)
+  {
+ -	unsigned long addr = (unsigned long)ptr;
+ +	void *addr;
+ +	int i;
+ +
+ +	if (direction == DMA_TO_DEVICE)
+ +		return;
+  
+ -	addr |= CONFIG_NIOS2_IO_REGION_BASE;
+ +	if (attrs & DMA_ATTR_SKIP_CPU_SYNC)
+ +		return;
+  
+ -	return (void *)ptr;
+ +	for_each_sg(sg, sg, nhwentries, i) {
+ +		addr = sg_virt(sg);
+ +		if (addr)
+ +			__dma_sync_for_cpu(addr, sg->length, direction);
+ +	}
+ +}
+ +
+ +static void nios2_dma_sync_single_for_cpu(struct device *dev,
+ +		dma_addr_t dma_handle, size_t size,
+ +		enum dma_data_direction direction)
+ +{
+ +	__dma_sync_for_cpu(phys_to_virt(dma_handle), size, direction);
+  }
+ +
+ +static void nios2_dma_sync_single_for_device(struct device *dev,
+ +		dma_addr_t dma_handle, size_t size,
+ +		enum dma_data_direction direction)
+ +{
+ +	__dma_sync_for_device(phys_to_virt(dma_handle), size, direction);
+ +}
+ +
+ +static void nios2_dma_sync_sg_for_cpu(struct device *dev,
+ +		struct scatterlist *sg, int nelems,
+ +		enum dma_data_direction direction)
+ +{
+ +	int i;
+ +
+ +	/* Make sure that gcc doesn't leave the empty loop body.  */
+ +	for_each_sg(sg, sg, nelems, i)
+ +		__dma_sync_for_cpu(sg_virt(sg), sg->length, direction);
+ +}
+ +
+ +static void nios2_dma_sync_sg_for_device(struct device *dev,
+ +		struct scatterlist *sg, int nelems,
+ +		enum dma_data_direction direction)
+ +{
+ +	int i;
+ +
+ +	/* Make sure that gcc doesn't leave the empty loop body.  */
+ +	for_each_sg(sg, sg, nelems, i)
+ +		__dma_sync_for_device(sg_virt(sg), sg->length, direction);
+ +
+ +}
+ +
+ +const struct dma_map_ops nios2_dma_ops = {
+ +	.alloc			= nios2_dma_alloc,
+ +	.free			= nios2_dma_free,
+ +	.map_page		= nios2_dma_map_page,
+ +	.unmap_page		= nios2_dma_unmap_page,
+ +	.map_sg			= nios2_dma_map_sg,
+ +	.unmap_sg		= nios2_dma_unmap_sg,
+ +	.sync_single_for_device	= nios2_dma_sync_single_for_device,
+ +	.sync_single_for_cpu	= nios2_dma_sync_single_for_cpu,
+ +	.sync_sg_for_cpu	= nios2_dma_sync_sg_for_cpu,
+ +	.sync_sg_for_device	= nios2_dma_sync_sg_for_device,
+ +};
+ +EXPORT_SYMBOL(nios2_dma_ops);
+++=======
+++>>>>>>> 4f8232bbf887 (dma-direct: remove the cached_kernel_address hook)
+diff --cc arch/xtensa/kernel/pci-dma.c
+index a02dc563d290,6a685545d5c9..000000000000
+--- a/arch/xtensa/kernel/pci-dma.c
++++ b/arch/xtensa/kernel/pci-dma.c
+@@@ -115,149 -87,13 +115,159 @@@ static void xtensa_sync_sg_for_device(s
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Note: We assume that the full memory space is always mapped to 'kseg'
+ + *	 Otherwise we have to use page attributes (not implemented).
+++=======
++  * Memory caching is platform-dependent in noMMU xtensa configurations.
++  * This function should be implemented in platform code in order to enable
++  * coherent DMA memory operations when CONFIG_MMU is not enabled.
+++>>>>>>> 4f8232bbf887 (dma-direct: remove the cached_kernel_address hook)
+   */
+ +
+ +static void *xtensa_dma_alloc(struct device *dev, size_t size,
+ +			      dma_addr_t *handle, gfp_t flag,
+ +			      unsigned long attrs)
+ +{
+ +	unsigned long ret;
+ +	unsigned long uncached;
+ +	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
+ +	struct page *page = NULL;
+ +
+ +	/* ignore region speicifiers */
+ +
+ +	flag &= ~(__GFP_DMA | __GFP_HIGHMEM);
+ +
+ +	if (dev == NULL || (dev->coherent_dma_mask < 0xffffffff))
+ +		flag |= GFP_DMA;
+ +
+ +	if (gfpflags_allow_blocking(flag))
+ +		page = dma_alloc_from_contiguous(dev, count, get_order(size),
+ +						 flag & __GFP_NOWARN);
+ +
+ +	if (!page)
+ +		page = alloc_pages(flag, get_order(size));
+ +
+ +	if (!page)
+ +		return NULL;
+ +
+ +	*handle = phys_to_dma(dev, page_to_phys(page));
+ +
+  #ifdef CONFIG_MMU
+ -void *uncached_kernel_address(void *p)
+ +	if (PageHighMem(page)) {
+ +		void *p;
+ +
+ +		p = dma_common_contiguous_remap(page, size, VM_MAP,
+ +						pgprot_noncached(PAGE_KERNEL),
+ +						__builtin_return_address(0));
+ +		if (!p) {
+ +			if (!dma_release_from_contiguous(dev, page, count))
+ +				__free_pages(page, get_order(size));
+ +		}
+ +		return p;
+ +	}
+ +#endif
+ +	ret = (unsigned long)page_address(page);
+ +	BUG_ON(ret < XCHAL_KSEG_CACHED_VADDR ||
+ +	       ret > XCHAL_KSEG_CACHED_VADDR + XCHAL_KSEG_SIZE - 1);
+ +
+ +	uncached = ret + XCHAL_KSEG_BYPASS_VADDR - XCHAL_KSEG_CACHED_VADDR;
+ +	__invalidate_dcache_range(ret, size);
+ +
+ +	return (void *)uncached;
+ +}
+++<<<<<<< HEAD
+ +
+ +static void xtensa_dma_free(struct device *dev, size_t size, void *vaddr,
+ +			    dma_addr_t dma_handle, unsigned long attrs)
+  {
+ -	return p + XCHAL_KSEG_BYPASS_VADDR - XCHAL_KSEG_CACHED_VADDR;
+ +	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
+ +	unsigned long addr = (unsigned long)vaddr;
+ +	struct page *page;
+ +
+ +	if (addr >= XCHAL_KSEG_BYPASS_VADDR &&
+ +	    addr - XCHAL_KSEG_BYPASS_VADDR < XCHAL_KSEG_SIZE) {
+ +		addr += XCHAL_KSEG_CACHED_VADDR - XCHAL_KSEG_BYPASS_VADDR;
+ +		page = virt_to_page(addr);
+ +	} else {
+ +#ifdef CONFIG_MMU
+ +		dma_common_free_remap(vaddr, size, VM_MAP);
+ +#endif
+ +		page = pfn_to_page(PHYS_PFN(dma_to_phys(dev, dma_handle)));
+ +	}
+ +
+ +	if (!dma_release_from_contiguous(dev, page, count))
+ +		__free_pages(page, get_order(size));
+  }
+ +
+ +static dma_addr_t xtensa_map_page(struct device *dev, struct page *page,
+ +				  unsigned long offset, size_t size,
+ +				  enum dma_data_direction dir,
+ +				  unsigned long attrs)
+ +{
+ +	dma_addr_t dma_handle = page_to_phys(page) + offset;
+ +
+ +	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+ +		xtensa_sync_single_for_device(dev, dma_handle, size, dir);
+ +
+ +	return dma_handle;
+ +}
+ +
+ +static void xtensa_unmap_page(struct device *dev, dma_addr_t dma_handle,
+ +			      size_t size, enum dma_data_direction dir,
+ +			      unsigned long attrs)
+ +{
+ +	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+ +		xtensa_sync_single_for_cpu(dev, dma_handle, size, dir);
+ +}
+ +
+ +static int xtensa_map_sg(struct device *dev, struct scatterlist *sg,
+ +			 int nents, enum dma_data_direction dir,
+ +			 unsigned long attrs)
+ +{
+ +	struct scatterlist *s;
+ +	int i;
+ +
+ +	for_each_sg(sg, s, nents, i) {
+ +		s->dma_address = xtensa_map_page(dev, sg_page(s), s->offset,
+ +						 s->length, dir, attrs);
+ +	}
+ +	return nents;
+ +}
+ +
+ +static void xtensa_unmap_sg(struct device *dev,
+ +			    struct scatterlist *sg, int nents,
+ +			    enum dma_data_direction dir,
+ +			    unsigned long attrs)
+ +{
+ +	struct scatterlist *s;
+ +	int i;
+ +
+ +	for_each_sg(sg, s, nents, i) {
+ +		xtensa_unmap_page(dev, sg_dma_address(s),
+ +				  sg_dma_len(s), dir, attrs);
+ +	}
+ +}
+ +
+ +int xtensa_dma_mapping_error(struct device *dev, dma_addr_t dma_addr)
+ +{
+ +	return 0;
+ +}
+ +
+ +const struct dma_map_ops xtensa_dma_map_ops = {
+ +	.alloc = xtensa_dma_alloc,
+ +	.free = xtensa_dma_free,
+ +	.map_page = xtensa_map_page,
+ +	.unmap_page = xtensa_unmap_page,
+ +	.map_sg = xtensa_map_sg,
+ +	.unmap_sg = xtensa_unmap_sg,
+ +	.sync_single_for_cpu = xtensa_sync_single_for_cpu,
+ +	.sync_single_for_device = xtensa_sync_single_for_device,
+ +	.sync_sg_for_cpu = xtensa_sync_sg_for_cpu,
+ +	.sync_sg_for_device = xtensa_sync_sg_for_device,
+ +	.mapping_error = xtensa_dma_mapping_error,
+ +};
+ +EXPORT_SYMBOL(xtensa_dma_map_ops);
+++=======
++ #endif /* CONFIG_MMU */
+++>>>>>>> 4f8232bbf887 (dma-direct: remove the cached_kernel_address hook)
+* Unmerged path arch/mips/mm/dma-noncoherent.c
+diff --git a/arch/Kconfig b/arch/Kconfig
+index ce2392831931..577b124211ee 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -246,7 +246,7 @@ config ARCH_HAS_SET_DIRECT_MAP
+ 
+ #
+ # Select if arch has an uncached kernel segment and provides the
+-# uncached_kernel_address / cached_kernel_address symbols to use it
++# uncached_kernel_address symbol to use it
+ #
+ config ARCH_HAS_UNCACHED_SEGMENT
+ 	select ARCH_HAS_DMA_PREP_COHERENT
+* Unmerged path arch/microblaze/mm/consistent.c
+* Unmerged path arch/mips/mm/dma-noncoherent.c
+* Unmerged path arch/nios2/mm/dma-mapping.c
+* Unmerged path arch/xtensa/kernel/pci-dma.c
+diff --git a/include/linux/dma-noncoherent.h b/include/linux/dma-noncoherent.h
+index ecd8259e2fe3..2b766c92c125 100644
+--- a/include/linux/dma-noncoherent.h
++++ b/include/linux/dma-noncoherent.h
+@@ -109,6 +109,5 @@ static inline void arch_dma_prep_coherent(struct page *page, size_t size)
+ #endif /* CONFIG_ARCH_HAS_DMA_PREP_COHERENT */
+ 
+ void *uncached_kernel_address(void *addr);
+-void *cached_kernel_address(void *addr);
+ 
+ #endif /* _LINUX_DMA_NONCOHERENT_H */
