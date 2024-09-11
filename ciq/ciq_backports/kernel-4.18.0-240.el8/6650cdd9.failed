@@ -1,0 +1,516 @@
+x86/split_lock: Enable split lock detection by kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Peter Zijlstra (Intel) <peterz@infradead.org>
+commit 6650cdd9a8ccf00555dbbe743d58541ad8feb6a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6650cdd9.failed
+
+A split-lock occurs when an atomic instruction operates on data that spans
+two cache lines. In order to maintain atomicity the core takes a global bus
+lock.
+
+This is typically >1000 cycles slower than an atomic operation within a
+cache line. It also disrupts performance on other cores (which must wait
+for the bus lock to be released before their memory operations can
+complete). For real-time systems this may mean missing deadlines. For other
+systems it may just be very annoying.
+
+Some CPUs have the capability to raise an #AC trap when a split lock is
+attempted.
+
+Provide a command line option to give the user choices on how to handle
+this:
+
+split_lock_detect=
+	off	- not enabled (no traps for split locks)
+	warn	- warn once when an application does a
+		  split lock, but allow it to continue
+		  running.
+	fatal	- Send SIGBUS to applications that cause split lock
+
+On systems that support split lock detection the default is "warn". Note
+that if the kernel hits a split lock in any mode other than "off" it will
+OOPs.
+
+One implementation wrinkle is that the MSR to control the split lock
+detection is per-core, not per thread. This might result in some short
+lived races on HT systems in "warn" mode if Linux tries to enable on one
+thread while disabling on the other. Race analysis by Sean Christopherson:
+
+  - Toggling of split-lock is only done in "warn" mode.  Worst case
+    scenario of a race is that a misbehaving task will generate multiple
+    #AC exceptions on the same instruction.  And this race will only occur
+    if both siblings are running tasks that generate split-lock #ACs, e.g.
+    a race where sibling threads are writing different values will only
+    occur if CPUx is disabling split-lock after an #AC and CPUy is
+    re-enabling split-lock after *its* previous task generated an #AC.
+  - Transitioning between off/warn/fatal modes at runtime isn't supported
+    and disabling is tracked per task, so hardware will always reach a steady
+    state that matches the configured mode.  I.e. split-lock is guaranteed to
+    be enabled in hardware once all _TIF_SLD threads have been scheduled out.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Co-developed-by: Fenghua Yu <fenghua.yu@intel.com>
+	Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+Co-developed-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20200126200535.GB30377@agluck-desk2.amr.corp.intel.com
+(cherry picked from commit 6650cdd9a8ccf00555dbbe743d58541ad8feb6a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/thread_info.h
+#	arch/x86/kernel/cpu/intel.c
+diff --cc arch/x86/include/asm/thread_info.h
+index c0da378eed8b,f807930bd763..000000000000
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@@ -142,18 -144,10 +144,24 @@@ struct thread_info 
+  	 _TIF_SECCOMP | _TIF_SYSCALL_TRACEPOINT |	\
+  	 _TIF_NOHZ)
+  
+ +/* work to do on any return to user space */
+ +#define _TIF_ALLWORK_MASK						\
+ +	(_TIF_SYSCALL_TRACE | _TIF_NOTIFY_RESUME | _TIF_SIGPENDING |	\
+ +	 _TIF_NEED_RESCHED | _TIF_SINGLESTEP | _TIF_SYSCALL_EMU |	\
+ +	 _TIF_SYSCALL_AUDIT | _TIF_USER_RETURN_NOTIFY | _TIF_UPROBE |	\
+ +	 _TIF_PATCH_PENDING | _TIF_NOHZ | _TIF_SYSCALL_TRACEPOINT |	\
+ +	 _TIF_FSCHECK)
+ +
+  /* flags to check in __switch_to() */
+++<<<<<<< HEAD
+ +#define _TIF_WORK_CTXSW_BASE						\
+ +	(_TIF_IO_BITMAP|_TIF_NOCPUID|_TIF_NOTSC|_TIF_BLOCKSTEP|		\
+ +	 _TIF_SSBD | _TIF_SPEC_FORCE_UPDATE)
+++=======
++ #define _TIF_WORK_CTXSW_BASE					\
++ 	(_TIF_NOCPUID | _TIF_NOTSC | _TIF_BLOCKSTEP |		\
++ 	 _TIF_SSBD | _TIF_SPEC_FORCE_UPDATE | _TIF_SLD)
+++>>>>>>> 6650cdd9a8cc (x86/split_lock: Enable split lock detection by kernel)
+  
+  /*
+   * Avoid calls to __switch_to_xtra() on UP as STIBP is not evaluated.
+diff --cc arch/x86/kernel/cpu/intel.c
+index ae064a2ca368,db3e745e5d47..000000000000
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@@ -31,38 -33,42 +33,51 @@@
+  #include <asm/apic.h>
+  #endif
+  
++ enum split_lock_detect_state {
++ 	sld_off = 0,
++ 	sld_warn,
++ 	sld_fatal,
++ };
++ 
++ /*
++  * Default to sld_off because most systems do not support split lock detection
++  * split_lock_setup() will switch this to sld_warn on systems that support
++  * split lock detect, unless there is a command line override.
++  */
++ static enum split_lock_detect_state sld_state = sld_off;
++ 
+  /*
+ - * Processors which have self-snooping capability can handle conflicting
+ - * memory type across CPUs by snooping its own cache. However, there exists
+ - * CPU models in which having conflicting memory types still leads to
+ - * unpredictable behavior, machine check errors, or hangs. Clear this
+ - * feature to prevent its use on machines with known erratas.
+ + * Just in case our CPU detection goes bad, or you have a weird system,
+ + * allow a way to override the automatic disabling of MPX.
+   */
+ -static void check_memory_type_self_snoop_errata(struct cpuinfo_x86 *c)
+ +static int forcempx;
+ +
+ +static int __init forcempx_setup(char *__unused)
+  {
+ -	switch (c->x86_model) {
+ -	case INTEL_FAM6_CORE_YONAH:
+ -	case INTEL_FAM6_CORE2_MEROM:
+ -	case INTEL_FAM6_CORE2_MEROM_L:
+ -	case INTEL_FAM6_CORE2_PENRYN:
+ -	case INTEL_FAM6_CORE2_DUNNINGTON:
+ -	case INTEL_FAM6_NEHALEM:
+ -	case INTEL_FAM6_NEHALEM_G:
+ -	case INTEL_FAM6_NEHALEM_EP:
+ -	case INTEL_FAM6_NEHALEM_EX:
+ -	case INTEL_FAM6_WESTMERE:
+ -	case INTEL_FAM6_WESTMERE_EP:
+ -	case INTEL_FAM6_SANDYBRIDGE:
+ -		setup_clear_cpu_cap(X86_FEATURE_SELFSNOOP);
+ +	forcempx = 1;
+ +
+ +	return 1;
+ +}
+ +__setup("intel-skd-046-workaround=disable", forcempx_setup);
+ +
+ +void check_mpx_erratum(struct cpuinfo_x86 *c)
+ +{
+ +	if (forcempx)
+ +		return;
+ +	/*
+ +	 * Turn off the MPX feature on CPUs where SMEP is not
+ +	 * available or disabled.
+ +	 *
+ +	 * Works around Intel Erratum SKD046: "Branch Instructions
+ +	 * May Initialize MPX Bound Registers Incorrectly".
+ +	 *
+ +	 * This might falsely disable MPX on systems without
+ +	 * SMEP, like Atom processors without SMEP.  But there
+ +	 * is no such hardware known at the moment.
+ +	 */
+ +	if (cpu_has(c, X86_FEATURE_MPX) && !cpu_has(c, X86_FEATURE_SMEP)) {
+ +		setup_clear_cpu_cap(X86_FEATURE_MPX);
+ +		pr_warn("x86/mpx: Disabling MPX since SMEP not present\n");
+  	}
+  }
+  
+@@@ -1034,3 -965,158 +1053,161 @@@ static const struct cpu_dev intel_cpu_d
+  
+  cpu_dev_register(intel_cpu_dev);
+  
+++<<<<<<< HEAD
+++=======
++ #undef pr_fmt
++ #define pr_fmt(fmt) "x86/split lock detection: " fmt
++ 
++ static const struct {
++ 	const char			*option;
++ 	enum split_lock_detect_state	state;
++ } sld_options[] __initconst = {
++ 	{ "off",	sld_off   },
++ 	{ "warn",	sld_warn  },
++ 	{ "fatal",	sld_fatal },
++ };
++ 
++ static inline bool match_option(const char *arg, int arglen, const char *opt)
++ {
++ 	int len = strlen(opt);
++ 
++ 	return len == arglen && !strncmp(arg, opt, len);
++ }
++ 
++ static void __init split_lock_setup(void)
++ {
++ 	char arg[20];
++ 	int i, ret;
++ 
++ 	setup_force_cpu_cap(X86_FEATURE_SPLIT_LOCK_DETECT);
++ 	sld_state = sld_warn;
++ 
++ 	ret = cmdline_find_option(boot_command_line, "split_lock_detect",
++ 				  arg, sizeof(arg));
++ 	if (ret >= 0) {
++ 		for (i = 0; i < ARRAY_SIZE(sld_options); i++) {
++ 			if (match_option(arg, ret, sld_options[i].option)) {
++ 				sld_state = sld_options[i].state;
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	switch (sld_state) {
++ 	case sld_off:
++ 		pr_info("disabled\n");
++ 		break;
++ 
++ 	case sld_warn:
++ 		pr_info("warning about user-space split_locks\n");
++ 		break;
++ 
++ 	case sld_fatal:
++ 		pr_info("sending SIGBUS on user-space split_locks\n");
++ 		break;
++ 	}
++ }
++ 
++ /*
++  * Locking is not required at the moment because only bit 29 of this
++  * MSR is implemented and locking would not prevent that the operation
++  * of one thread is immediately undone by the sibling thread.
++  * Use the "safe" versions of rdmsr/wrmsr here because although code
++  * checks CPUID and MSR bits to make sure the TEST_CTRL MSR should
++  * exist, there may be glitches in virtualization that leave a guest
++  * with an incorrect view of real h/w capabilities.
++  */
++ static bool __sld_msr_set(bool on)
++ {
++ 	u64 test_ctrl_val;
++ 
++ 	if (rdmsrl_safe(MSR_TEST_CTRL, &test_ctrl_val))
++ 		return false;
++ 
++ 	if (on)
++ 		test_ctrl_val |= MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
++ 	else
++ 		test_ctrl_val &= ~MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
++ 
++ 	return !wrmsrl_safe(MSR_TEST_CTRL, test_ctrl_val);
++ }
++ 
++ static void split_lock_init(void)
++ {
++ 	if (sld_state == sld_off)
++ 		return;
++ 
++ 	if (__sld_msr_set(true))
++ 		return;
++ 
++ 	/*
++ 	 * If this is anything other than the boot-cpu, you've done
++ 	 * funny things and you get to keep whatever pieces.
++ 	 */
++ 	pr_warn("MSR fail -- disabled\n");
++ 	sld_state = sld_off;
++ }
++ 
++ bool handle_user_split_lock(struct pt_regs *regs, long error_code)
++ {
++ 	if ((regs->flags & X86_EFLAGS_AC) || sld_state == sld_fatal)
++ 		return false;
++ 
++ 	pr_warn_ratelimited("#AC: %s/%d took a split_lock trap at address: 0x%lx\n",
++ 			    current->comm, current->pid, regs->ip);
++ 
++ 	/*
++ 	 * Disable the split lock detection for this task so it can make
++ 	 * progress and set TIF_SLD so the detection is re-enabled via
++ 	 * switch_to_sld() when the task is scheduled out.
++ 	 */
++ 	__sld_msr_set(false);
++ 	set_tsk_thread_flag(current, TIF_SLD);
++ 	return true;
++ }
++ 
++ /*
++  * This function is called only when switching between tasks with
++  * different split-lock detection modes. It sets the MSR for the
++  * mode of the new task. This is right most of the time, but since
++  * the MSR is shared by hyperthreads on a physical core there can
++  * be glitches when the two threads need different modes.
++  */
++ void switch_to_sld(unsigned long tifn)
++ {
++ 	__sld_msr_set(!(tifn & _TIF_SLD));
++ }
++ 
++ #define SPLIT_LOCK_CPU(model) {X86_VENDOR_INTEL, 6, model, X86_FEATURE_ANY}
++ 
++ /*
++  * The following processors have the split lock detection feature. But
++  * since they don't have the IA32_CORE_CAPABILITIES MSR, the feature cannot
++  * be enumerated. Enable it by family and model matching on these
++  * processors.
++  */
++ static const struct x86_cpu_id split_lock_cpu_ids[] __initconst = {
++ 	SPLIT_LOCK_CPU(INTEL_FAM6_ICELAKE_X),
++ 	SPLIT_LOCK_CPU(INTEL_FAM6_ICELAKE_L),
++ 	{}
++ };
++ 
++ void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c)
++ {
++ 	u64 ia32_core_caps = 0;
++ 
++ 	if (c->x86_vendor != X86_VENDOR_INTEL)
++ 		return;
++ 	if (cpu_has(c, X86_FEATURE_CORE_CAPABILITIES)) {
++ 		/* Enumerate features reported in IA32_CORE_CAPABILITIES MSR. */
++ 		rdmsrl(MSR_IA32_CORE_CAPS, ia32_core_caps);
++ 	} else if (!boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
++ 		/* Enumerate split lock detection by family and model. */
++ 		if (x86_match_cpu(split_lock_cpu_ids))
++ 			ia32_core_caps |= MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT;
++ 	}
++ 
++ 	if (ia32_core_caps & MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT)
++ 		split_lock_setup();
++ }
+++>>>>>>> 6650cdd9a8cc (x86/split_lock: Enable split lock detection by kernel)
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 711a7535799c..40c061581c21 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4522,6 +4522,28 @@
+ 	spia_pedr=
+ 	spia_peddr=
+ 
++	split_lock_detect=
++			[X86] Enable split lock detection
++
++			When enabled (and if hardware support is present), atomic
++			instructions that access data across cache line
++			boundaries will result in an alignment check exception.
++
++			off	- not enabled
++
++			warn	- the kernel will emit rate limited warnings
++				  about applications triggering the #AC
++				  exception. This mode is the default on CPUs
++				  that supports split lock detection.
++
++			fatal	- the kernel will send SIGBUS to applications
++				  that trigger the #AC exception.
++
++			If an #AC exception is hit in the kernel or in
++			firmware (i.e. not while executing in user mode)
++			the kernel will oops in either "warn" or "fatal"
++			mode.
++
+ 	srcutree.counter_wrap_check [KNL]
+ 			Specifies how frequently to check for
+ 			grace-period sequence counter wrap for the
+diff --git a/arch/x86/include/asm/cpu.h b/arch/x86/include/asm/cpu.h
+index adc6cc86b062..ff6f3ca649b3 100644
+--- a/arch/x86/include/asm/cpu.h
++++ b/arch/x86/include/asm/cpu.h
+@@ -40,4 +40,16 @@ int mwait_usable(const struct cpuinfo_x86 *);
+ unsigned int x86_family(unsigned int sig);
+ unsigned int x86_model(unsigned int sig);
+ unsigned int x86_stepping(unsigned int sig);
++#ifdef CONFIG_CPU_SUP_INTEL
++extern void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c);
++extern void switch_to_sld(unsigned long tifn);
++extern bool handle_user_split_lock(struct pt_regs *regs, long error_code);
++#else
++static inline void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c) {}
++static inline void switch_to_sld(unsigned long tifn) {}
++static inline bool handle_user_split_lock(struct pt_regs *regs, long error_code)
++{
++	return false;
++}
++#endif
+ #endif /* _ASM_X86_CPU_H */
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index 66fb2673f8a0..52218de7c137 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -281,6 +281,7 @@
+ #define X86_FEATURE_CQM_MBM_LOCAL	(11*32+ 3) /* LLC Local MBM monitoring */
+ #define X86_FEATURE_FENCE_SWAPGS_USER	(11*32+ 4) /* "" LFENCE in user entry SWAPGS path */
+ #define X86_FEATURE_FENCE_SWAPGS_KERNEL	(11*32+ 5) /* "" LFENCE in kernel entry SWAPGS path */
++#define X86_FEATURE_SPLIT_LOCK_DETECT	(11*32+ 6) /* #AC for split lock */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000007:1 (EAX), word 12 */
+ #define X86_FEATURE_AVX512_BF16		(12*32+ 5) /* AVX512 BFLOAT16 instructions */
+@@ -361,6 +362,7 @@
+ #define X86_FEATURE_INTEL_STIBP		(18*32+27) /* "" Single Thread Indirect Branch Predictors */
+ #define X86_FEATURE_FLUSH_L1D		(18*32+28) /* Flush L1D cache */
+ #define X86_FEATURE_ARCH_CAPABILITIES	(18*32+29) /* IA32_ARCH_CAPABILITIES MSR (Intel) */
++#define X86_FEATURE_CORE_CAPABILITIES	(18*32+30) /* "" IA32_CORE_CAPABILITIES MSR */
+ #define X86_FEATURE_SPEC_CTRL_SSBD	(18*32+31) /* "" Speculative Store Bypass Disable */
+ 
+ /* Words 19-21: reserved for future extension */
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index caf6dc0a7881..1196459cd1b3 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -41,6 +41,10 @@
+ 
+ /* Intel MSRs. Some also available on other CPUs */
+ 
++#define MSR_TEST_CTRL				0x00000033
++#define MSR_TEST_CTRL_SPLIT_LOCK_DETECT_BIT	29
++#define MSR_TEST_CTRL_SPLIT_LOCK_DETECT		BIT(MSR_TEST_CTRL_SPLIT_LOCK_DETECT_BIT)
++
+ #define MSR_IA32_SPEC_CTRL		0x00000048 /* Speculation Control */
+ #define SPEC_CTRL_IBRS			BIT(0)	   /* Indirect Branch Restricted Speculation */
+ #define SPEC_CTRL_STIBP_SHIFT		1	   /* Single Thread Indirect Branch Predictor (STIBP) bit */
+@@ -70,6 +74,11 @@
+  */
+ #define MSR_IA32_UMWAIT_CONTROL_TIME_MASK	(~0x03U)
+ 
++/* Abbreviated from Intel SDM name IA32_CORE_CAPABILITIES */
++#define MSR_IA32_CORE_CAPS			  0x000000cf
++#define MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT_BIT  5
++#define MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT	  BIT(MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT_BIT)
++
+ #define MSR_PKG_CST_CONFIG_CONTROL	0x000000e2
+ #define NHM_C3_AUTO_DEMOTE		(1UL << 25)
+ #define NHM_C1_AUTO_DEMOTE		(1UL << 26)
+* Unmerged path arch/x86/include/asm/thread_info.h
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 5f7db41af81c..2eaea52cb2ab 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1172,6 +1172,8 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
+ 
+ 	cpu_set_bug_bits(c);
+ 
++	cpu_set_core_cap_bits(c);
++
+ 	fpu__init_system(c);
+ 
+ #ifdef CONFIG_X86_32
+* Unmerged path arch/x86/kernel/cpu/intel.c
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index e5c5b1d724ab..fdde11833a04 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -541,6 +541,9 @@ void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p)
+ 		/* Enforce MSR update to ensure consistent state */
+ 		__speculation_ctrl_update(~tifn, tifn);
+ 	}
++
++	if ((tifp ^ tifn) & _TIF_SLD)
++		switch_to_sld(tifn);
+ }
+ 
+ /*
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 4b96d9a574ff..f22a24807153 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -51,6 +51,7 @@
+ #include <asm/traps.h>
+ #include <asm/desc.h>
+ #include <asm/fpu/internal.h>
++#include <asm/cpu.h>
+ #include <asm/cpu_entry_area.h>
+ #include <asm/mce.h>
+ #include <asm/fixmap.h>
+@@ -247,7 +248,6 @@ do_trap(int trapnr, int signr, char *str, struct pt_regs *regs,
+ {
+ 	struct task_struct *tsk = current;
+ 
+-
+ 	if (!do_trap_no_signal(tsk, trapnr, str, regs, error_code))
+ 		return;
+ 
+@@ -293,9 +293,29 @@ DO_ERROR(X86_TRAP_OLD_MF, SIGFPE,           0, NULL, "coprocessor segment overru
+ DO_ERROR(X86_TRAP_TS,     SIGSEGV,          0, NULL, "invalid TSS",         invalid_TSS)
+ DO_ERROR(X86_TRAP_NP,     SIGBUS,           0, NULL, "segment not present", segment_not_present)
+ DO_ERROR(X86_TRAP_SS,     SIGBUS,           0, NULL, "stack segment",       stack_segment)
+-DO_ERROR(X86_TRAP_AC,     SIGBUS,  BUS_ADRALN, NULL, "alignment check",     alignment_check)
+ #undef IP
+ 
++dotraplinkage void do_alignment_check(struct pt_regs *regs, long error_code)
++{
++	char *str = "alignment check";
++
++	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
++
++	if (notify_die(DIE_TRAP, str, regs, error_code, X86_TRAP_AC, SIGBUS) == NOTIFY_STOP)
++		return;
++
++	if (!user_mode(regs))
++		die("Split lock detected\n", regs, error_code);
++
++	local_irq_enable();
++
++	if (handle_user_split_lock(regs, error_code))
++		return;
++
++	do_trap(X86_TRAP_AC, SIGBUS, "alignment check", regs,
++		error_code, BUS_ADRALN, NULL);
++}
++
+ #ifdef CONFIG_VMAP_STACK
+ __visible void __noreturn handle_stack_overflow(const char *message,
+ 						struct pt_regs *regs,
