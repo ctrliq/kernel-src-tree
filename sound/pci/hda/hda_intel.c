@@ -1023,6 +1023,9 @@ static int azx_prepare(struct device *dev)
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct azx *chip;
 
+	if (!azx_is_pm_ready(card))
+		return 0;
+
 	chip = card->private_data;
 	chip->pm_prepared = 1;
 
@@ -1036,6 +1039,9 @@ static void azx_complete(struct device *dev)
 {
 	struct snd_card *card = dev_get_drvdata(dev);
 	struct azx *chip;
+
+	if (!azx_is_pm_ready(card))
+		return;
 
 	chip = card->private_data;
 	chip->pm_prepared = 0;
