@@ -1,0 +1,249 @@
+drm/i915/perf: Use GTT when saving/restoring engine GPR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+commit e43ff99c8deda85234e6233e0f4af6cb09566a37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e43ff99c.failed
+
+MI_STORE_REGISTER_MEM and MI_LOAD_REGISTER_MEM need to know which
+translation to use when saving restoring the engine general purpose
+registers to and from the GT scratch. Since GT scratch is mapped to
+ggtt, we need to set an additional bit in the command to use GTT.
+
+Fixes: daed3e44396d17 ("drm/i915/perf: implement active wait for noa configurations")
+	Suggested-by: Prathap Kumar Valsan <prathap.kumar.valsan@intel.com>
+	Signed-off-by: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+	Reviewed-by: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200709224504.11345-1-chris@chris-wilson.co.uk
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit e43ff99c8deda85234e6233e0f4af6cb09566a37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_perf.c
+diff --cc drivers/gpu/drm/i915/i915_perf.c
+index 5140017f9a39,c6f6370283cf..000000000000
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@@ -1554,9 -1584,210 +1554,216 @@@ unlock
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void config_oa_regs(struct drm_i915_private *dev_priv,
+ +			   const struct i915_oa_reg *regs,
+ +			   u32 n_regs)
+++=======
++ static u32 *save_restore_register(struct i915_perf_stream *stream, u32 *cs,
++ 				  bool save, i915_reg_t reg, u32 offset,
++ 				  u32 dword_count)
++ {
++ 	u32 cmd;
++ 	u32 d;
++ 
++ 	cmd = save ? MI_STORE_REGISTER_MEM : MI_LOAD_REGISTER_MEM;
++ 	cmd |= MI_SRM_LRM_GLOBAL_GTT;
++ 	if (INTEL_GEN(stream->perf->i915) >= 8)
++ 		cmd++;
++ 
++ 	for (d = 0; d < dword_count; d++) {
++ 		*cs++ = cmd;
++ 		*cs++ = i915_mmio_reg_offset(reg) + 4 * d;
++ 		*cs++ = intel_gt_scratch_offset(stream->engine->gt,
++ 						offset) + 4 * d;
++ 		*cs++ = 0;
++ 	}
++ 
++ 	return cs;
++ }
++ 
++ static int alloc_noa_wait(struct i915_perf_stream *stream)
++ {
++ 	struct drm_i915_private *i915 = stream->perf->i915;
++ 	struct drm_i915_gem_object *bo;
++ 	struct i915_vma *vma;
++ 	const u64 delay_ticks = 0xffffffffffffffff -
++ 		i915_cs_timestamp_ns_to_ticks(i915, atomic64_read(&stream->perf->noa_programming_delay));
++ 	const u32 base = stream->engine->mmio_base;
++ #define CS_GPR(x) GEN8_RING_CS_GPR(base, x)
++ 	u32 *batch, *ts0, *cs, *jump;
++ 	int ret, i;
++ 	enum {
++ 		START_TS,
++ 		NOW_TS,
++ 		DELTA_TS,
++ 		JUMP_PREDICATE,
++ 		DELTA_TARGET,
++ 		N_CS_GPR
++ 	};
++ 
++ 	bo = i915_gem_object_create_internal(i915, 4096);
++ 	if (IS_ERR(bo)) {
++ 		drm_err(&i915->drm,
++ 			"Failed to allocate NOA wait batchbuffer\n");
++ 		return PTR_ERR(bo);
++ 	}
++ 
++ 	/*
++ 	 * We pin in GGTT because we jump into this buffer now because
++ 	 * multiple OA config BOs will have a jump to this address and it
++ 	 * needs to be fixed during the lifetime of the i915/perf stream.
++ 	 */
++ 	vma = i915_gem_object_ggtt_pin(bo, NULL, 0, 0, PIN_HIGH);
++ 	if (IS_ERR(vma)) {
++ 		ret = PTR_ERR(vma);
++ 		goto err_unref;
++ 	}
++ 
++ 	batch = cs = i915_gem_object_pin_map(bo, I915_MAP_WB);
++ 	if (IS_ERR(batch)) {
++ 		ret = PTR_ERR(batch);
++ 		goto err_unpin;
++ 	}
++ 
++ 	/* Save registers. */
++ 	for (i = 0; i < N_CS_GPR; i++)
++ 		cs = save_restore_register(
++ 			stream, cs, true /* save */, CS_GPR(i),
++ 			INTEL_GT_SCRATCH_FIELD_PERF_CS_GPR + 8 * i, 2);
++ 	cs = save_restore_register(
++ 		stream, cs, true /* save */, MI_PREDICATE_RESULT_1,
++ 		INTEL_GT_SCRATCH_FIELD_PERF_PREDICATE_RESULT_1, 1);
++ 
++ 	/* First timestamp snapshot location. */
++ 	ts0 = cs;
++ 
++ 	/*
++ 	 * Initial snapshot of the timestamp register to implement the wait.
++ 	 * We work with 32b values, so clear out the top 32b bits of the
++ 	 * register because the ALU works 64bits.
++ 	 */
++ 	*cs++ = MI_LOAD_REGISTER_IMM(1);
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(START_TS)) + 4;
++ 	*cs++ = 0;
++ 	*cs++ = MI_LOAD_REGISTER_REG | (3 - 2);
++ 	*cs++ = i915_mmio_reg_offset(RING_TIMESTAMP(base));
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(START_TS));
++ 
++ 	/*
++ 	 * This is the location we're going to jump back into until the
++ 	 * required amount of time has passed.
++ 	 */
++ 	jump = cs;
++ 
++ 	/*
++ 	 * Take another snapshot of the timestamp register. Take care to clear
++ 	 * up the top 32bits of CS_GPR(1) as we're using it for other
++ 	 * operations below.
++ 	 */
++ 	*cs++ = MI_LOAD_REGISTER_IMM(1);
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(NOW_TS)) + 4;
++ 	*cs++ = 0;
++ 	*cs++ = MI_LOAD_REGISTER_REG | (3 - 2);
++ 	*cs++ = i915_mmio_reg_offset(RING_TIMESTAMP(base));
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(NOW_TS));
++ 
++ 	/*
++ 	 * Do a diff between the 2 timestamps and store the result back into
++ 	 * CS_GPR(1).
++ 	 */
++ 	*cs++ = MI_MATH(5);
++ 	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCA, MI_MATH_REG(NOW_TS));
++ 	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCB, MI_MATH_REG(START_TS));
++ 	*cs++ = MI_MATH_SUB;
++ 	*cs++ = MI_MATH_STORE(MI_MATH_REG(DELTA_TS), MI_MATH_REG_ACCU);
++ 	*cs++ = MI_MATH_STORE(MI_MATH_REG(JUMP_PREDICATE), MI_MATH_REG_CF);
++ 
++ 	/*
++ 	 * Transfer the carry flag (set to 1 if ts1 < ts0, meaning the
++ 	 * timestamp have rolled over the 32bits) into the predicate register
++ 	 * to be used for the predicated jump.
++ 	 */
++ 	*cs++ = MI_LOAD_REGISTER_REG | (3 - 2);
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(JUMP_PREDICATE));
++ 	*cs++ = i915_mmio_reg_offset(MI_PREDICATE_RESULT_1);
++ 
++ 	/* Restart from the beginning if we had timestamps roll over. */
++ 	*cs++ = (INTEL_GEN(i915) < 8 ?
++ 		 MI_BATCH_BUFFER_START :
++ 		 MI_BATCH_BUFFER_START_GEN8) |
++ 		MI_BATCH_PREDICATE;
++ 	*cs++ = i915_ggtt_offset(vma) + (ts0 - batch) * 4;
++ 	*cs++ = 0;
++ 
++ 	/*
++ 	 * Now add the diff between to previous timestamps and add it to :
++ 	 *      (((1 * << 64) - 1) - delay_ns)
++ 	 *
++ 	 * When the Carry Flag contains 1 this means the elapsed time is
++ 	 * longer than the expected delay, and we can exit the wait loop.
++ 	 */
++ 	*cs++ = MI_LOAD_REGISTER_IMM(2);
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(DELTA_TARGET));
++ 	*cs++ = lower_32_bits(delay_ticks);
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(DELTA_TARGET)) + 4;
++ 	*cs++ = upper_32_bits(delay_ticks);
++ 
++ 	*cs++ = MI_MATH(4);
++ 	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCA, MI_MATH_REG(DELTA_TS));
++ 	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCB, MI_MATH_REG(DELTA_TARGET));
++ 	*cs++ = MI_MATH_ADD;
++ 	*cs++ = MI_MATH_STOREINV(MI_MATH_REG(JUMP_PREDICATE), MI_MATH_REG_CF);
++ 
++ 	*cs++ = MI_ARB_CHECK;
++ 
++ 	/*
++ 	 * Transfer the result into the predicate register to be used for the
++ 	 * predicated jump.
++ 	 */
++ 	*cs++ = MI_LOAD_REGISTER_REG | (3 - 2);
++ 	*cs++ = i915_mmio_reg_offset(CS_GPR(JUMP_PREDICATE));
++ 	*cs++ = i915_mmio_reg_offset(MI_PREDICATE_RESULT_1);
++ 
++ 	/* Predicate the jump.  */
++ 	*cs++ = (INTEL_GEN(i915) < 8 ?
++ 		 MI_BATCH_BUFFER_START :
++ 		 MI_BATCH_BUFFER_START_GEN8) |
++ 		MI_BATCH_PREDICATE;
++ 	*cs++ = i915_ggtt_offset(vma) + (jump - batch) * 4;
++ 	*cs++ = 0;
++ 
++ 	/* Restore registers. */
++ 	for (i = 0; i < N_CS_GPR; i++)
++ 		cs = save_restore_register(
++ 			stream, cs, false /* restore */, CS_GPR(i),
++ 			INTEL_GT_SCRATCH_FIELD_PERF_CS_GPR + 8 * i, 2);
++ 	cs = save_restore_register(
++ 		stream, cs, false /* restore */, MI_PREDICATE_RESULT_1,
++ 		INTEL_GT_SCRATCH_FIELD_PERF_PREDICATE_RESULT_1, 1);
++ 
++ 	/* And return to the ring. */
++ 	*cs++ = MI_BATCH_BUFFER_END;
++ 
++ 	GEM_BUG_ON(cs - batch > PAGE_SIZE / sizeof(*batch));
++ 
++ 	i915_gem_object_flush_map(bo);
++ 	__i915_gem_object_release_map(bo);
++ 
++ 	stream->noa_wait = vma;
++ 	return 0;
++ 
++ err_unpin:
++ 	i915_vma_unpin_and_release(&vma, 0);
++ err_unref:
++ 	i915_gem_object_put(bo);
++ 	return ret;
++ }
++ 
++ static u32 *write_cs_mi_lri(u32 *cs,
++ 			    const struct i915_oa_reg *reg_data,
++ 			    u32 n_regs)
+++>>>>>>> e43ff99c8ded (drm/i915/perf: Use GTT when saving/restoring engine GPR)
+  {
+  	u32 i;
+  
+* Unmerged path drivers/gpu/drm/i915/i915_perf.c
