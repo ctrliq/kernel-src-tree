@@ -151,6 +151,8 @@ int genphy_c45_read_link(struct phy_device *phydev, u32 mmd_mask)
 			val = phy_read_mmd(phydev, devad, MDIO_STAT1);
 			if (val < 0)
 				return val;
+			else if (val & MDIO_STAT1_LSTATUS)
+				continue;
 		}
 
 		val = phy_read_mmd(phydev, devad, MDIO_STAT1);
