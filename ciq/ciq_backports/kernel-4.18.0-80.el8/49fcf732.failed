@@ -1,0 +1,179 @@
+lockdown: Enforce module signatures if the kernel is locked down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [kernel] MODSIGN: Enforce module signatures if the kernel is locked down (Lenny Szubowicz) [1568532]
+Rebuild_FUZZ: 92.91%
+commit-author David Howells <dhowells@redhat.com>
+commit 49fcf732bdae0550721ef73af7c45109ce26b2a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/49fcf732.failed
+
+If the kernel is locked down, require that all modules have valid
+signatures that we can verify.
+
+I have adjusted the errors generated:
+
+ (1) If there's no signature (ENODATA) or we can't check it (ENOPKG,
+     ENOKEY), then:
+
+     (a) If signatures are enforced then EKEYREJECTED is returned.
+
+     (b) If there's no signature or we can't check it, but the kernel is
+	 locked down then EPERM is returned (this is then consistent with
+	 other lockdown cases).
+
+ (2) If the signature is unparseable (EBADMSG, EINVAL), the signature fails
+     the check (EKEYREJECTED) or a system error occurs (eg. ENOMEM), we
+     return the error we got.
+
+Note that the X.509 code doesn't check for key expiry as the RTC might not
+be valid or might not have been transferred to the kernel's clock yet.
+
+ [Modified by Matthew Garrett to remove the IMA integration. This will
+  be replaced with integration with the IMA architecture policy
+  patchset.]
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Matthew Garrett <matthewgarrett@google.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Cc: Jessica Yu <jeyu@kernel.org>
+	Signed-off-by: James Morris <jmorris@namei.org>
+(cherry picked from commit 49fcf732bdae0550721ef73af7c45109ce26b2a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/security.h
+#	security/lockdown/Kconfig
+#	security/lockdown/lockdown.c
+diff --cc include/linux/security.h
+index 88d30fc975e7,9e8abb60a99f..000000000000
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@@ -70,9 -77,40 +70,43 @@@ enum lsm_event 
+  	LSM_POLICY_CHANGE,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * These are reasons that can be passed to the security_locked_down()
++  * LSM hook. Lockdown reasons that protect kernel integrity (ie, the
++  * ability for userland to modify kernel code) are placed before
++  * LOCKDOWN_INTEGRITY_MAX.  Lockdown reasons that protect kernel
++  * confidentiality (ie, the ability for userland to extract
++  * information from the running kernel that would otherwise be
++  * restricted) are placed before LOCKDOWN_CONFIDENTIALITY_MAX.
++  *
++  * LSM authors should note that the semantics of any given lockdown
++  * reason are not guaranteed to be stable - the same reason may block
++  * one set of features in one kernel release, and a slightly different
++  * set of features in a later kernel release. LSMs that seek to expose
++  * lockdown policy at any level of granularity other than "none",
++  * "integrity" or "confidentiality" are responsible for either
++  * ensuring that they expose a consistent level of functionality to
++  * userland, or ensuring that userland is aware that this is
++  * potentially a moving target. It is easy to misuse this information
++  * in a way that could break userspace. Please be careful not to do
++  * so.
++  *
++  * If you add to this, remember to extend lockdown_reasons in
++  * security/lockdown/lockdown.c.
++  */
++ enum lockdown_reason {
++ 	LOCKDOWN_NONE,
++ 	LOCKDOWN_MODULE_SIGNATURE,
++ 	LOCKDOWN_INTEGRITY_MAX,
++ 	LOCKDOWN_CONFIDENTIALITY_MAX,
++ };
++ 
+++>>>>>>> 49fcf732bdae (lockdown: Enforce module signatures if the kernel is locked down)
+  /* These functions are in security/commoncap.c */
+  extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
+ -		       int cap, unsigned int opts);
+ +		       int cap, int audit);
+  extern int cap_settime(const struct timespec64 *ts, const struct timezone *tz);
+  extern int cap_ptrace_access_check(struct task_struct *child, unsigned int mode);
+  extern int cap_ptrace_traceme(struct task_struct *parent);
+* Unmerged path security/lockdown/Kconfig
+* Unmerged path security/lockdown/lockdown.c
+* Unmerged path include/linux/security.h
+diff --git a/init/Kconfig b/init/Kconfig
+index 9c529c763326..56cf289d28a6 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1813,6 +1813,11 @@ config MODULE_SIG
+ 	  kernel build dependency so that the signing tool can use its crypto
+ 	  library.
+ 
++	  You should enable this option if you wish to use either
++	  CONFIG_SECURITY_LOCKDOWN_LSM or lockdown functionality imposed via
++	  another LSM - otherwise unsigned modules will be loadable regardless
++	  of the lockdown policy.
++
+ 	  !!!WARNING!!!  If you enable this option, you MUST make sure that the
+ 	  module DOES NOT get stripped after being signed.  This includes the
+ 	  debuginfo strip done by some packagers (such as rpmbuild) and
+diff --git a/kernel/module.c b/kernel/module.c
+index f475f30eed8c..1bcf77f15c05 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -2761,8 +2761,9 @@ static inline void kmemleak_load_module(const struct module *mod,
+ #ifdef CONFIG_MODULE_SIG
+ static int module_sig_check(struct load_info *info, int flags)
+ {
+-	int err = -ENOKEY;
++	int err = -ENODATA;
+ 	const unsigned long markerlen = sizeof(MODULE_SIG_STRING) - 1;
++	const char *reason;
+ 	const void *mod = info->hdr;
+ 
+ 	/*
+@@ -2777,16 +2778,38 @@ static int module_sig_check(struct load_info *info, int flags)
+ 		err = mod_verify_sig(mod, &info->len);
+ 	}
+ 
+-	if (!err) {
++	switch (err) {
++	case 0:
+ 		info->sig_ok = true;
+ 		return 0;
+-	}
+ 
+-	/* Not having a signature is only an error if we're strict. */
+-	if (err == -ENOKEY && !is_module_sig_enforced())
+-		err = 0;
++		/* We don't permit modules to be loaded into trusted kernels
++		 * without a valid signature on them, but if we're not
++		 * enforcing, certain errors are non-fatal.
++		 */
++	case -ENODATA:
++		reason = "Loading of unsigned module";
++		goto decide;
++	case -ENOPKG:
++		reason = "Loading of module with unsupported crypto";
++		goto decide;
++	case -ENOKEY:
++		reason = "Loading of module with unavailable key";
++	decide:
++		if (is_module_sig_enforced()) {
++			pr_notice("%s is rejected\n", reason);
++			return -EKEYREJECTED;
++		}
+ 
+-	return err;
++		return security_locked_down(LOCKDOWN_MODULE_SIGNATURE);
++
++		/* All other errors are fatal, including nomem, unparseable
++		 * signatures and signature check failures - even if signatures
++		 * aren't required.
++		 */
++	default:
++		return err;
++	}
+ }
+ #else /* !CONFIG_MODULE_SIG */
+ static int module_sig_check(struct load_info *info, int flags)
+* Unmerged path security/lockdown/Kconfig
+* Unmerged path security/lockdown/lockdown.c
