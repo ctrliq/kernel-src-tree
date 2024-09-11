@@ -1,0 +1,235 @@
+net: phylink: delay MAC configuration for copper SFP modules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Russell King <rmk+kernel@armlinux.org.uk>
+commit 52c956003a9d5bcae1f445f9dfd42b624adb6e87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/52c95600.failed
+
+Knowing whether we need to delay the MAC configuration because a module
+may have a PHY is useful to phylink to allow NBASE-T modules to work on
+systems supporting no more than 2.5G speeds.
+
+This commit allows us to delay such configuration until after the PHY
+has been probed by recording the parsed capabilities, and if the module
+may have a PHY, doing no more until the module_start() notification is
+called.  At that point, we either have a PHY, or we don't.
+
+We move the PHY-based setup a little later, and use the PHYs support
+capabilities rather than the EEPROM parsed capabilities to determine
+whether we can support the PHY.
+
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 52c956003a9d5bcae1f445f9dfd42b624adb6e87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/phylink.c
+diff --cc drivers/net/phy/phylink.c
+index d2ef72edac49,01f958508f80..000000000000
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@@ -68,8 -72,44 +68,11 @@@ struct phylink 
+  	bool mac_link_dropped;
+  
+  	struct sfp_bus *sfp_bus;
++ 	bool sfp_may_have_phy;
++ 	__ETHTOOL_DECLARE_LINK_MODE_MASK(sfp_support);
++ 	u8 sfp_port;
+  };
+  
+ -#define phylink_printk(level, pl, fmt, ...) \
+ -	do { \
+ -		if ((pl)->config->type == PHYLINK_NETDEV) \
+ -			netdev_printk(level, (pl)->netdev, fmt, ##__VA_ARGS__); \
+ -		else if ((pl)->config->type == PHYLINK_DEV) \
+ -			dev_printk(level, (pl)->dev, fmt, ##__VA_ARGS__); \
+ -	} while (0)
+ -
+ -#define phylink_err(pl, fmt, ...) \
+ -	phylink_printk(KERN_ERR, pl, fmt, ##__VA_ARGS__)
+ -#define phylink_warn(pl, fmt, ...) \
+ -	phylink_printk(KERN_WARNING, pl, fmt, ##__VA_ARGS__)
+ -#define phylink_info(pl, fmt, ...) \
+ -	phylink_printk(KERN_INFO, pl, fmt, ##__VA_ARGS__)
+ -#if defined(CONFIG_DYNAMIC_DEBUG)
+ -#define phylink_dbg(pl, fmt, ...) \
+ -do {									\
+ -	if ((pl)->config->type == PHYLINK_NETDEV)			\
+ -		netdev_dbg((pl)->netdev, fmt, ##__VA_ARGS__);		\
+ -	else if ((pl)->config->type == PHYLINK_DEV)			\
+ -		dev_dbg((pl)->dev, fmt, ##__VA_ARGS__);			\
+ -} while (0)
+ -#elif defined(DEBUG)
+ -#define phylink_dbg(pl, fmt, ...)					\
+ -	phylink_printk(KERN_DEBUG, pl, fmt, ##__VA_ARGS__)
+ -#else
+ -#define phylink_dbg(pl, fmt, ...)					\
+ -({									\
+ -	if (0)								\
+ -		phylink_printk(KERN_DEBUG, pl, fmt, ##__VA_ARGS__);	\
+ -})
+ -#endif
+ -
+  /**
+   * phylink_set_port_modes() - set the port type modes in the ethtool mask
+   * @mask: ethtool link mode mask
+@@@ -1613,25 -1687,21 +1616,31 @@@ static void phylink_sfp_detach(void *up
+  	pl->netdev->sfp_bus = NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static int phylink_sfp_module_insert(void *upstream,
+ +				     const struct sfp_eeprom_id *id)
+++=======
++ static int phylink_sfp_config(struct phylink *pl, u8 mode,
++ 			      const unsigned long *supported,
++ 			      const unsigned long *advertising)
+++>>>>>>> 52c956003a9d (net: phylink: delay MAC configuration for copper SFP modules)
+  {
+ +	struct phylink *pl = upstream;
+ +	__ETHTOOL_DECLARE_LINK_MODE_MASK(support) = { 0, };
+  	__ETHTOOL_DECLARE_LINK_MODE_MASK(support1);
+ -	__ETHTOOL_DECLARE_LINK_MODE_MASK(support);
+  	struct phylink_link_state config;
+  	phy_interface_t iface;
+ +	int ret = 0;
+  	bool changed;
+ -	int ret;
+ +	u8 port;
+  
+ -	linkmode_copy(support, supported);
+ +	ASSERT_RTNL();
+ +
+ +	sfp_parse_support(pl->sfp_bus, id, support);
+ +	port = sfp_parse_port(pl->sfp_bus, id, support);
+  
+  	memset(&config, 0, sizeof(config));
+ -	linkmode_copy(config.advertising, advertising);
+ +	linkmode_copy(config.advertising, support);
+  	config.interface = PHY_INTERFACE_MODE_NA;
+  	config.speed = SPEED_UNKNOWN;
+  	config.duplex = DUPLEX_UNKNOWN;
+@@@ -1687,12 -1755,12 +1696,12 @@@
+  
+  		changed = true;
+  
+ -		phylink_info(pl, "switched to %s/%s link mode\n",
+ -			     phylink_an_mode_str(mode),
+ -			     phy_modes(config.interface));
+ +		netdev_info(pl->netdev, "switched to %s/%s link mode\n",
+ +			    phylink_an_mode_str(MLO_AN_INBAND),
+ +			    phy_modes(config.interface));
+  	}
+  
+- 	pl->link_port = port;
++ 	pl->link_port = pl->sfp_port;
+  
+  	if (changed && !test_bit(PHYLINK_DISABLE_STOPPED,
+  				 &pl->phylink_disable_state))
+@@@ -1701,6 -1769,26 +1710,29 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int phylink_sfp_module_insert(void *upstream,
++ 				     const struct sfp_eeprom_id *id)
++ {
++ 	struct phylink *pl = upstream;
++ 	unsigned long *support = pl->sfp_support;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	linkmode_zero(support);
++ 	sfp_parse_support(pl->sfp_bus, id, support);
++ 	pl->sfp_port = sfp_parse_port(pl->sfp_bus, id, support);
++ 
++ 	/* If this module may have a PHY connecting later, defer until later */
++ 	pl->sfp_may_have_phy = sfp_may_have_phy(pl->sfp_bus, id);
++ 	if (pl->sfp_may_have_phy)
++ 		return 0;
++ 
++ 	return phylink_sfp_config(pl, MLO_AN_INBAND, support, support);
++ }
++ 
+++>>>>>>> 52c956003a9d (net: phylink: delay MAC configuration for copper SFP modules)
+  static int phylink_sfp_module_start(void *upstream)
+  {
+  	struct phylink *pl = upstream;
+* Unmerged path drivers/net/phy/phylink.c
+diff --git a/drivers/net/phy/sfp-bus.c b/drivers/net/phy/sfp-bus.c
+index 7cf07411130e..ec22e2e2bf61 100644
+--- a/drivers/net/phy/sfp-bus.c
++++ b/drivers/net/phy/sfp-bus.c
+@@ -101,6 +101,7 @@ static const struct sfp_quirk *sfp_lookup_quirk(const struct sfp_eeprom_id *id)
+ 
+ 	return NULL;
+ }
++
+ /**
+  * sfp_parse_port() - Parse the EEPROM base ID, setting the port type
+  * @bus: a pointer to the &struct sfp_bus structure for the sfp module
+@@ -176,6 +177,33 @@ int sfp_parse_port(struct sfp_bus *bus, const struct sfp_eeprom_id *id,
+ }
+ EXPORT_SYMBOL_GPL(sfp_parse_port);
+ 
++/**
++ * sfp_may_have_phy() - indicate whether the module may have a PHY
++ * @bus: a pointer to the &struct sfp_bus structure for the sfp module
++ * @id: a pointer to the module's &struct sfp_eeprom_id
++ *
++ * Parse the EEPROM identification given in @id, and return whether
++ * this module may have a PHY.
++ */
++bool sfp_may_have_phy(struct sfp_bus *bus, const struct sfp_eeprom_id *id)
++{
++	if (id->base.e1000_base_t)
++		return true;
++
++	if (id->base.phys_id != SFF8024_ID_DWDM_SFP) {
++		switch (id->base.extended_cc) {
++		case SFF8024_ECC_10GBASE_T_SFI:
++		case SFF8024_ECC_10GBASE_T_SR:
++		case SFF8024_ECC_5GBASE_T:
++		case SFF8024_ECC_2_5GBASE_T:
++			return true;
++		}
++	}
++
++	return false;
++}
++EXPORT_SYMBOL_GPL(sfp_may_have_phy);
++
+ /**
+  * sfp_parse_support() - Parse the eeprom id for supported link modes
+  * @bus: a pointer to the &struct sfp_bus structure for the sfp module
+diff --git a/include/linux/sfp.h b/include/linux/sfp.h
+index 089e7ead4cbf..9fd13538d990 100644
+--- a/include/linux/sfp.h
++++ b/include/linux/sfp.h
+@@ -505,6 +505,7 @@ struct sfp_upstream_ops {
+ #if IS_ENABLED(CONFIG_SFP)
+ int sfp_parse_port(struct sfp_bus *bus, const struct sfp_eeprom_id *id,
+ 		   unsigned long *support);
++bool sfp_may_have_phy(struct sfp_bus *bus, const struct sfp_eeprom_id *id);
+ void sfp_parse_support(struct sfp_bus *bus, const struct sfp_eeprom_id *id,
+ 		       unsigned long *support);
+ phy_interface_t sfp_select_interface(struct sfp_bus *bus,
+@@ -527,6 +528,12 @@ static inline int sfp_parse_port(struct sfp_bus *bus,
+ 	return PORT_OTHER;
+ }
+ 
++static inline bool sfp_may_have_phy(struct sfp_bus *bus,
++				    const struct sfp_eeprom_id *id)
++{
++	return false;
++}
++
+ static inline void sfp_parse_support(struct sfp_bus *bus,
+ 				     const struct sfp_eeprom_id *id,
+ 				     unsigned long *support)
