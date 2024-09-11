@@ -1,0 +1,147 @@
+fs/ext4: Only change S_DAX on inode load
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ira Weiny <ira.weiny@intel.com>
+commit 043546e46dc70c25ff7e2cf6d09cbb0424fc9978
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/043546e4.failed
+
+To prevent complications with in memory inodes we only set S_DAX on
+inode load.  FS_XFLAG_DAX can be changed at any time and S_DAX will
+change after inode eviction and reload.
+
+Add init bool to ext4_set_inode_flags() to indicate if the inode is
+being newly initialized.
+
+Assert that S_DAX is not set on an inode which is just being loaded.
+
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+
+Link: https://lore.kernel.org/r/20200528150003.828793-6-ira.weiny@intel.com
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 043546e46dc70c25ff7e2cf6d09cbb0424fc9978)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+#	fs/ext4/verity.c
+diff --cc fs/ext4/inode.c
+index 8e7de233296c,01636cf5f322..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -4736,10 -4410,17 +4736,10 @@@ static bool ext4_should_use_dax(struct 
+  		return false;
+  	if (ext4_test_inode_flag(inode, EXT4_INODE_ENCRYPT))
+  		return false;
+ -	if (ext4_test_inode_flag(inode, EXT4_INODE_VERITY))
+ -		return false;
+ -	if (!test_bit(EXT4_FLAGS_BDEV_IS_DAX, &sbi->s_ext4_flags))
+ -		return false;
+ -	if (test_opt(inode->i_sb, DAX_ALWAYS))
+ -		return true;
+ -
+ -	return false;
+ +	return true;
+  }
+  
+- void ext4_set_inode_flags(struct inode *inode)
++ void ext4_set_inode_flags(struct inode *inode, bool init)
+  {
+  	unsigned int flags = EXT4_I(inode)->i_flags;
+  	unsigned int new_fl = 0;
+@@@ -4754,13 -4437,22 +4756,22 @@@
+  		new_fl |= S_NOATIME;
+  	if (flags & EXT4_DIRSYNC_FL)
+  		new_fl |= S_DIRSYNC;
+++<<<<<<< HEAD
+ +	if (ext4_should_use_dax(inode))
+++=======
++ 
++ 	/* Because of the way inode_set_flags() works we must preserve S_DAX
++ 	 * here if already set. */
++ 	new_fl |= (inode->i_flags & S_DAX);
++ 	if (init && ext4_should_enable_dax(inode))
+++>>>>>>> 043546e46dc7 (fs/ext4: Only change S_DAX on inode load)
+  		new_fl |= S_DAX;
++ 
+  	if (flags & EXT4_ENCRYPT_FL)
+  		new_fl |= S_ENCRYPTED;
+ -	if (flags & EXT4_CASEFOLD_FL)
+ -		new_fl |= S_CASEFOLD;
+ -	if (flags & EXT4_VERITY_FL)
+ -		new_fl |= S_VERITY;
+  	inode_set_flags(inode, new_fl,
+  			S_SYNC|S_APPEND|S_IMMUTABLE|S_NOATIME|S_DIRSYNC|S_DAX|
+ -			S_ENCRYPTED|S_CASEFOLD|S_VERITY);
+ +			S_ENCRYPTED);
+  }
+  
+  static blkcnt_t ext4_inode_blocks(struct ext4_inode *raw_inode,
+* Unmerged path fs/ext4/verity.c
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 3fa62516bbdb..7a461976a4dc 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2546,7 +2546,7 @@ extern int ext4_can_truncate(struct inode *inode);
+ extern int ext4_truncate(struct inode *);
+ extern int ext4_break_layouts(struct inode *);
+ extern int ext4_punch_hole(struct inode *inode, loff_t offset, loff_t length);
+-extern void ext4_set_inode_flags(struct inode *);
++extern void ext4_set_inode_flags(struct inode *, bool init);
+ extern int ext4_alloc_da_blocks(struct inode *inode);
+ extern void ext4_set_aops(struct inode *inode);
+ extern int ext4_writepage_trans_blocks(struct inode *);
+diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
+index e451ffb37ca1..83929d70d1cf 100644
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -1119,7 +1119,7 @@ struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
+ 	ei->i_block_group = group;
+ 	ei->i_last_alloc_group = ~0;
+ 
+-	ext4_set_inode_flags(inode);
++	ext4_set_inode_flags(inode, true);
+ 	if (IS_DIRSYNC(inode))
+ 		ext4_handle_sync(handle);
+ 	if (insert_inode_locked(inode) < 0) {
+* Unmerged path fs/ext4/inode.c
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index 1f47e6df3d10..ae1ab8796b53 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -382,7 +382,8 @@ static int ext4_ioctl_setflags(struct inode *inode,
+ 			ext4_clear_inode_flag(inode, i);
+ 	}
+ 
+-	ext4_set_inode_flags(inode);
++	ext4_set_inode_flags(inode, false);
++
+ 	inode->i_ctime = current_time(inode);
+ 
+ 	err = ext4_mark_iloc_dirty(handle, inode, &iloc);
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 45de20b6730f..6469e2e1a377 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1357,7 +1357,7 @@ static int ext4_set_context(struct inode *inode, const void *ctx, size_t len,
+ 			 * Update inode->i_flags - S_ENCRYPTED will be enabled,
+ 			 * S_DAX may be disabled
+ 			 */
+-			ext4_set_inode_flags(inode);
++			ext4_set_inode_flags(inode, false);
+ 		}
+ 		return res;
+ 	}
+@@ -1384,7 +1384,7 @@ static int ext4_set_context(struct inode *inode, const void *ctx, size_t len,
+ 		 * Update inode->i_flags - S_ENCRYPTED will be enabled,
+ 		 * S_DAX may be disabled
+ 		 */
+-		ext4_set_inode_flags(inode);
++		ext4_set_inode_flags(inode, false);
+ 		res = ext4_mark_inode_dirty(handle, inode);
+ 		if (res)
+ 			EXT4_ERROR_INODE(inode, "Failed to mark inode dirty");
+* Unmerged path fs/ext4/verity.c
