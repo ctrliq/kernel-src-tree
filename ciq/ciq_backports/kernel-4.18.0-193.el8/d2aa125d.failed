@@ -1,0 +1,194 @@
+net: Don't set transport offset to invalid value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] Don't set transport offset to invalid value (Ivan Vecera) [1765561]
+Rebuild_FUZZ: 94.51%
+commit-author Maxim Mikityanskiy <maximmi@mellanox.com>
+commit d2aa125d629080c4f3e31f23b7f612ef6b8492ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d2aa125d.failed
+
+If the socket was created with socket(AF_PACKET, SOCK_RAW, 0),
+skb->protocol will be unset, __skb_flow_dissect() will fail, and
+skb_probe_transport_header() will fall back to the offset_hint, making
+the resulting skb_transport_offset incorrect.
+
+If, however, there is no transport header in the packet,
+transport_header shouldn't be set to an arbitrary value.
+
+Fix it by leaving the transport offset unset if it couldn't be found, to
+be explicit rather than to fill it with some wrong value. It changes the
+behavior, but if some code relied on the old behavior, it would be
+broken anyway, as the old one is incorrect.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d2aa125d629080c4f3e31f23b7f612ef6b8492ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/virtio_net.h
+diff --cc include/linux/virtio_net.h
+index e0348cb0a1dd,6728bf581e98..000000000000
+--- a/include/linux/virtio_net.h
++++ b/include/linux/virtio_net.h
+@@@ -61,20 -61,10 +61,26 @@@ static inline int virtio_net_hdr_to_skb
+  		/* gso packets without NEEDS_CSUM do not set transport_offset.
+  		 * probe and drop if does not match one of the above types.
+  		 */
+++<<<<<<< HEAD
+ +		if (gso_type && skb->network_header) {
+ +			if (!skb->protocol)
+ +				virtio_net_hdr_set_proto(skb, hdr);
+ +retry:
+ +			skb_probe_transport_header(skb, -1);
+ +			if (!skb_transport_header_was_set(skb)) {
+ +				/* UFO does not specify ipv4 or 6: try both */
+ +				if (gso_type & SKB_GSO_UDP &&
+ +				    skb->protocol == htons(ETH_P_IP)) {
+ +					skb->protocol = htons(ETH_P_IPV6);
+ +					goto retry;
+ +				}
+++=======
++ 		if (gso_type) {
++ 			skb_probe_transport_header(skb);
++ 			if (!skb_transport_header_was_set(skb))
+++>>>>>>> d2aa125d6290 (net: Don't set transport offset to invalid value)
+  				return -EINVAL;
+ +			}
+  		}
+  	}
+  
+diff --git a/drivers/net/tap.c b/drivers/net/tap.c
+index 5a11cc1ef57b..90614b20084a 100644
+--- a/drivers/net/tap.c
++++ b/drivers/net/tap.c
+@@ -712,7 +712,7 @@ static ssize_t tap_get_user(struct tap_queue *q, void *msg_control,
+ 			goto err_kfree;
+ 	}
+ 
+-	skb_probe_transport_header(skb, ETH_HLEN);
++	skb_probe_transport_header(skb);
+ 
+ 	/* Move network header to the right position for VLAN tagged packets */
+ 	if ((skb->protocol == htons(ETH_P_8021Q) ||
+@@ -1188,7 +1188,7 @@ static int tap_get_user_xdp(struct tap_queue *q, struct xdp_buff *xdp)
+ 	tap = rcu_dereference(q->tap);
+ 	if (tap) {
+ 		skb->dev = tap->dev;
+-		skb_probe_transport_header(skb, ETH_HLEN);
++		skb_probe_transport_header(skb);
+ 		dev_queue_xmit(skb);
+ 	} else {
+ 		kfree_skb(skb);
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index 3271c040b424..25ee9186c6e4 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -1967,7 +1967,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
+ 	}
+ 
+ 	skb_reset_network_header(skb);
+-	skb_probe_transport_header(skb, 0);
++	skb_probe_transport_header(skb);
+ 
+ 	if (skb_xdp) {
+ 		struct bpf_prog *xdp_prog;
+@@ -2529,7 +2529,7 @@ static int tun_xdp_one(struct tun_struct *tun,
+ 
+ 	skb->protocol = eth_type_trans(skb, tun->dev);
+ 	skb_reset_network_header(skb);
+-	skb_probe_transport_header(skb, 0);
++	skb_probe_transport_header(skb);
+ 
+ 	if (skb_xdp) {
+ 		err = do_xdp_generic(xdp_prog, skb);
+diff --git a/drivers/net/xen-netback/netback.c b/drivers/net/xen-netback/netback.c
+index a27daa23c9dc..d9da6b1c45ea 100644
+--- a/drivers/net/xen-netback/netback.c
++++ b/drivers/net/xen-netback/netback.c
+@@ -1169,15 +1169,24 @@ static int xenvif_tx_submit(struct xenvif_queue *queue)
+ 			continue;
+ 		}
+ 
+-		skb_probe_transport_header(skb, 0);
++		skb_probe_transport_header(skb);
+ 
+ 		/* If the packet is GSO then we will have just set up the
+ 		 * transport header offset in checksum_setup so it's now
+ 		 * straightforward to calculate gso_segs.
+ 		 */
+ 		if (skb_is_gso(skb)) {
+-			int mss = skb_shinfo(skb)->gso_size;
+-			int hdrlen = skb_transport_header(skb) -
++			int mss, hdrlen;
++
++			/* GSO implies having the L4 header. */
++			WARN_ON_ONCE(!skb_transport_header_was_set(skb));
++			if (unlikely(!skb_transport_header_was_set(skb))) {
++				kfree_skb(skb);
++				continue;
++			}
++
++			mss = skb_shinfo(skb)->gso_size;
++			hdrlen = skb_transport_header(skb) -
+ 				skb_mac_header(skb) +
+ 				tcp_hdrlen(skb);
+ 
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 9f40de2e11fc..e7592aa62e6f 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2477,8 +2477,7 @@ static inline void skb_pop_mac_header(struct sk_buff *skb)
+ 	skb->mac_header = skb->network_header;
+ }
+ 
+-static inline void skb_probe_transport_header(struct sk_buff *skb,
+-					      const int offset_hint)
++static inline void skb_probe_transport_header(struct sk_buff *skb)
+ {
+ 	struct flow_keys_basic keys;
+ 
+@@ -2487,8 +2486,6 @@ static inline void skb_probe_transport_header(struct sk_buff *skb,
+ 
+ 	if (skb_flow_dissect_flow_keys_basic(skb, &keys, NULL, 0, 0, 0, 0))
+ 		skb_set_transport_header(skb, keys.control.thoff);
+-	else if (offset_hint >= 0)
+-		skb_set_transport_header(skb, offset_hint);
+ }
+ 
+ static inline void skb_mac_header_rebuild(struct sk_buff *skb)
+* Unmerged path include/linux/virtio_net.h
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index be3b2bbfc0a3..bc3918bc8ee6 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -1971,7 +1971,7 @@ static int packet_sendmsg_spkt(struct socket *sock, struct msghdr *msg,
+ 	if (unlikely(extra_len == 4))
+ 		skb->no_fcs = 1;
+ 
+-	skb_probe_transport_header(skb, 0);
++	skb_probe_transport_header(skb);
+ 
+ 	dev_queue_xmit(skb);
+ 	rcu_read_unlock();
+@@ -2520,7 +2520,7 @@ static int tpacket_fill_skb(struct packet_sock *po, struct sk_buff *skb,
+ 		len = ((to_write > len_max) ? len_max : to_write);
+ 	}
+ 
+-	skb_probe_transport_header(skb, 0);
++	skb_probe_transport_header(skb);
+ 
+ 	return tp_len;
+ }
+@@ -2931,7 +2931,7 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
+ 		virtio_net_hdr_set_proto(skb, &vnet_hdr);
+ 	}
+ 
+-	skb_probe_transport_header(skb, reserve);
++	skb_probe_transport_header(skb);
+ 
+ 	if (unlikely(extra_len == 4))
+ 		skb->no_fcs = 1;
