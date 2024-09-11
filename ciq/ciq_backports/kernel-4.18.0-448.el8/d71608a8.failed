@@ -1,0 +1,110 @@
+mm/slab_common: fix possible double free of kmem_cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Feng Tang <feng.tang@intel.com>
+commit d71608a877362becdc94191f190902fac1e64d35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d71608a8.failed
+
+When doing slub_debug test, kfence's 'test_memcache_typesafe_by_rcu'
+kunit test case cause a use-after-free error:
+
+  BUG: KASAN: use-after-free in kobject_del+0x14/0x30
+  Read of size 8 at addr ffff888007679090 by task kunit_try_catch/261
+
+  CPU: 1 PID: 261 Comm: kunit_try_catch Tainted: G    B            N 6.0.0-rc5-next-20220916 #17
+  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.15.0-1 04/01/2014
+  Call Trace:
+   <TASK>
+   dump_stack_lvl+0x34/0x48
+   print_address_description.constprop.0+0x87/0x2a5
+   print_report+0x103/0x1ed
+   kasan_report+0xb7/0x140
+   kobject_del+0x14/0x30
+   kmem_cache_destroy+0x130/0x170
+   test_exit+0x1a/0x30
+   kunit_try_run_case+0xad/0xc0
+   kunit_generic_run_threadfn_adapter+0x26/0x50
+   kthread+0x17b/0x1b0
+   </TASK>
+
+The cause is inside kmem_cache_destroy():
+
+kmem_cache_destroy
+    acquire lock/mutex
+    shutdown_cache
+        schedule_work(kmem_cache_release) (if RCU flag set)
+    release lock/mutex
+    kmem_cache_release (if RCU flag not set)
+
+In some certain timing, the scheduled work could be run before
+the next RCU flag checking, which can then get a wrong value
+and lead to double kmem_cache_release().
+
+Fix it by caching the RCU flag inside protected area, just like 'refcnt'
+
+Fixes: 0495e337b703 ("mm/slab_common: Deleting kobject in kmem_cache_destroy() without holding slab_mutex/cpu_hotplug_lock")
+	Signed-off-by: Feng Tang <feng.tang@intel.com>
+	Reviewed-by: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+	Reviewed-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+(cherry picked from commit d71608a877362becdc94191f190902fac1e64d35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab_common.c
+diff --cc mm/slab_common.c
+index 6e42c1ba0546,ccc02573588f..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -495,7 -474,8 +495,12 @@@ void slab_kmem_cache_release(struct kme
+  
+  void kmem_cache_destroy(struct kmem_cache *s)
+  {
+++<<<<<<< HEAD
+ +	int err;
+++=======
++ 	int refcnt;
++ 	bool rcu_set;
+++>>>>>>> d71608a87736 (mm/slab_common: fix possible double free of kmem_cache)
+  
+  	if (unlikely(!s) || !kasan_check_byte(s))
+  		return;
+@@@ -503,19 -483,20 +508,31 @@@
+  	cpus_read_lock();
+  	mutex_lock(&slab_mutex);
+  
+++<<<<<<< HEAD
+ +	s->refcount--;
+ +	if (s->refcount)
+++=======
++ 	rcu_set = s->flags & SLAB_TYPESAFE_BY_RCU;
++ 
++ 	refcnt = --s->refcount;
++ 	if (refcnt)
+++>>>>>>> d71608a87736 (mm/slab_common: fix possible double free of kmem_cache)
+  		goto out_unlock;
+  
+ -	WARN(shutdown_cache(s),
+ -	     "%s %s: Slab cache still has objects when called from %pS",
+ -	     __func__, s->name, (void *)_RET_IP_);
+ +	err = shutdown_cache(s);
+ +	if (err) {
+ +		pr_err("%s %s: Slab cache still has objects\n",
+ +		       __func__, s->name);
+ +		dump_stack();
+ +	}
+  out_unlock:
+  	mutex_unlock(&slab_mutex);
+  	cpus_read_unlock();
+++<<<<<<< HEAD
+++=======
++ 	if (!refcnt && !rcu_set)
++ 		kmem_cache_release(s);
+++>>>>>>> d71608a87736 (mm/slab_common: fix possible double free of kmem_cache)
+  }
+  EXPORT_SYMBOL(kmem_cache_destroy);
+  
+* Unmerged path mm/slab_common.c
