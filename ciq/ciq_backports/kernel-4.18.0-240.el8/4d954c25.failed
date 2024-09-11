@@ -1,0 +1,564 @@
+io_uring: add IOSQE_BUFFER_SELECT support for IORING_OP_READV
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 4d954c258a0c365a85a2d1b1cccf63aec38fca4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4d954c25.failed
+
+This adds support for the vectored read. This is limited to supporting
+just 1 segment in the iov, and is provided just for convenience for
+applications that use IORING_OP_READV already.
+
+The iov helpers will be used for IORING_OP_RECVMSG as well.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4d954c258a0c365a85a2d1b1cccf63aec38fca4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,7c855a038a1b..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -366,8 -648,201 +366,206 @@@ struct io_submit_state 
+  	unsigned int		ios_left;
+  };
+  
+++<<<<<<< HEAD
+ +static void io_sq_wq_submit_work(struct work_struct *work);
+ +static void __io_free_req(struct io_kiocb *req);
+++=======
++ struct io_op_def {
++ 	/* needs req->io allocated for deferral/async */
++ 	unsigned		async_ctx : 1;
++ 	/* needs current->mm setup, does mm access */
++ 	unsigned		needs_mm : 1;
++ 	/* needs req->file assigned */
++ 	unsigned		needs_file : 1;
++ 	/* needs req->file assigned IFF fd is >= 0 */
++ 	unsigned		fd_non_neg : 1;
++ 	/* hash wq insertion if file is a regular file */
++ 	unsigned		hash_reg_file : 1;
++ 	/* unbound wq insertion if file is a non-regular file */
++ 	unsigned		unbound_nonreg_file : 1;
++ 	/* opcode is not supported by this kernel */
++ 	unsigned		not_supported : 1;
++ 	/* needs file table */
++ 	unsigned		file_table : 1;
++ 	/* needs ->fs */
++ 	unsigned		needs_fs : 1;
++ 	/* set if opcode supports polled "wait" */
++ 	unsigned		pollin : 1;
++ 	unsigned		pollout : 1;
++ 	/* op supports buffer selection */
++ 	unsigned		buffer_select : 1;
++ };
++ 
++ static const struct io_op_def io_op_defs[] = {
++ 	[IORING_OP_NOP] = {},
++ 	[IORING_OP_READV] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 		.buffer_select		= 1,
++ 	},
++ 	[IORING_OP_WRITEV] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.hash_reg_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_FSYNC] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_READ_FIXED] = {
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 	},
++ 	[IORING_OP_WRITE_FIXED] = {
++ 		.needs_file		= 1,
++ 		.hash_reg_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_POLL_ADD] = {
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 	},
++ 	[IORING_OP_POLL_REMOVE] = {},
++ 	[IORING_OP_SYNC_FILE_RANGE] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_SENDMSG] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.needs_fs		= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_RECVMSG] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.needs_fs		= 1,
++ 		.pollin			= 1,
++ 	},
++ 	[IORING_OP_TIMEOUT] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 	},
++ 	[IORING_OP_TIMEOUT_REMOVE] = {},
++ 	[IORING_OP_ACCEPT] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.file_table		= 1,
++ 		.pollin			= 1,
++ 	},
++ 	[IORING_OP_ASYNC_CANCEL] = {},
++ 	[IORING_OP_LINK_TIMEOUT] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 	},
++ 	[IORING_OP_CONNECT] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_FALLOCATE] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_OPENAT] = {
++ 		.needs_file		= 1,
++ 		.fd_non_neg		= 1,
++ 		.file_table		= 1,
++ 		.needs_fs		= 1,
++ 	},
++ 	[IORING_OP_CLOSE] = {
++ 		.needs_file		= 1,
++ 		.file_table		= 1,
++ 	},
++ 	[IORING_OP_FILES_UPDATE] = {
++ 		.needs_mm		= 1,
++ 		.file_table		= 1,
++ 	},
++ 	[IORING_OP_STATX] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.fd_non_neg		= 1,
++ 		.needs_fs		= 1,
++ 	},
++ 	[IORING_OP_READ] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 		.buffer_select		= 1,
++ 	},
++ 	[IORING_OP_WRITE] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_FADVISE] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_MADVISE] = {
++ 		.needs_mm		= 1,
++ 	},
++ 	[IORING_OP_SEND] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_RECV] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 		.buffer_select		= 1,
++ 	},
++ 	[IORING_OP_OPENAT2] = {
++ 		.needs_file		= 1,
++ 		.fd_non_neg		= 1,
++ 		.file_table		= 1,
++ 		.needs_fs		= 1,
++ 	},
++ 	[IORING_OP_EPOLL_CTL] = {
++ 		.unbound_nonreg_file	= 1,
++ 		.file_table		= 1,
++ 	},
++ 	[IORING_OP_SPLICE] = {
++ 		.needs_file		= 1,
++ 		.hash_reg_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 	},
++ 	[IORING_OP_PROVIDE_BUFFERS] = {},
++ };
++ 
++ static void io_wq_submit_work(struct io_wq_work **workptr);
++ static void io_cqring_fill_event(struct io_kiocb *req, long res);
++ static void io_put_req(struct io_kiocb *req);
++ static void __io_double_put_req(struct io_kiocb *req);
++ static struct io_kiocb *io_prep_linked_timeout(struct io_kiocb *req);
++ static void io_queue_linked_timeout(struct io_kiocb *req);
++ static int __io_sqe_files_update(struct io_ring_ctx *ctx,
++ 				 struct io_uring_files_update *ip,
++ 				 unsigned nr_args);
++ static int io_grab_files(struct io_kiocb *req);
++ static void io_ring_file_ref_flush(struct fixed_file_data *data);
++ static void io_cleanup_req(struct io_kiocb *req);
++ static int io_file_get(struct io_submit_state *state, struct io_kiocb *req,
++ 		       int fd, struct file **out_file, bool fixed);
++ static void __io_queue_sqe(struct io_kiocb *req,
++ 			   const struct io_uring_sqe *sqe);
+++>>>>>>> 4d954c258a0c (io_uring: add IOSQE_BUFFER_SELECT support for IORING_OP_READV)
+  
+  static struct kmem_cache *req_cachep;
+  
+@@@ -693,11 -1604,98 +891,50 @@@ static void io_put_req(struct io_kiocb 
+  		io_free_req(req);
+  }
+  
+ -static void io_steal_work(struct io_kiocb *req,
+ -			  struct io_wq_work **workptr)
+ -{
+ -	/*
+ -	 * It's in an io-wq worker, so there always should be at least
+ -	 * one reference, which will be dropped in io_put_work() just
+ -	 * after the current handler returns.
+ -	 *
+ -	 * It also means, that if the counter dropped to 1, then there is
+ -	 * no asynchronous users left, so it's safe to steal the next work.
+ -	 */
+ -	if (refcount_read(&req->refs) == 1) {
+ -		struct io_kiocb *nxt = NULL;
+ -
+ -		io_req_find_next(req, &nxt);
+ -		if (nxt)
+ -			io_wq_assign_next(workptr, nxt);
+ -	}
+ -}
+ -
+ -/*
+ - * Must only be used if we don't need to care about links, usually from
+ - * within the completion handling itself.
+ - */
+ -static void __io_double_put_req(struct io_kiocb *req)
+ -{
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		__io_free_req(req);
+ -}
+ -
+ -static void io_double_put_req(struct io_kiocb *req)
+ -{
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		io_free_req(req);
+ -}
+ -
+ -static unsigned io_cqring_events(struct io_ring_ctx *ctx, bool noflush)
+ +static unsigned io_cqring_events(struct io_cq_ring *ring)
+  {
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	if (test_bit(0, &ctx->cq_check_overflow)) {
+ -		/*
+ -		 * noflush == true is from the waitqueue handler, just ensure
+ -		 * we wake up the task, and the next invocation will flush the
+ -		 * entries. We cannot safely to it from here.
+ -		 */
+ -		if (noflush && !list_empty(&ctx->cq_overflow_list))
+ -			return -1U;
+ -
+ -		io_cqring_overflow_flush(ctx, false);
+ -	}
+ -
+  	/* See comment at the top of this file */
+  	smp_rmb();
+++<<<<<<< HEAD
+ +	return READ_ONCE(ring->r.tail) - READ_ONCE(ring->r.head);
+++=======
++ 	return ctx->cached_cq_tail - READ_ONCE(rings->cq.head);
++ }
++ 
++ static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
++ {
++ 	struct io_rings *rings = ctx->rings;
++ 
++ 	/* make sure SQ entry isn't read before tail */
++ 	return smp_load_acquire(&rings->sq.tail) - ctx->cached_sq_head;
++ }
++ 
++ static inline bool io_req_multi_free(struct req_batch *rb, struct io_kiocb *req)
++ {
++ 	if ((req->flags & REQ_F_LINK) || io_is_fallback_req(req))
++ 		return false;
++ 
++ 	if (!(req->flags & REQ_F_FIXED_FILE) || req->io)
++ 		rb->need_iter++;
++ 
++ 	rb->reqs[rb->to_free++] = req;
++ 	if (unlikely(rb->to_free == ARRAY_SIZE(rb->reqs)))
++ 		io_free_req_many(req->ctx, rb);
++ 	return true;
++ }
++ 
++ static int io_put_kbuf(struct io_kiocb *req)
++ {
++ 	struct io_buffer *kbuf;
++ 	int cflags;
++ 
++ 	kbuf = (struct io_buffer *) (unsigned long) req->rw.addr;
++ 	cflags = kbuf->bid << IORING_CQE_BUFFER_SHIFT;
++ 	cflags |= IORING_CQE_F_BUFFER;
++ 	req->rw.addr = 0;
++ 	kfree(kbuf);
++ 	return cflags;
+++>>>>>>> 4d954c258a0c (io_uring: add IOSQE_BUFFER_SELECT support for IORING_OP_READV)
+  }
+  
+  /*
+@@@ -1159,41 -2189,196 +1396,213 @@@ static int io_import_fixed(struct io_ri
+  		}
+  	}
+  
+ -	return len;
+ +	/* don't drop a reference to these pages */
+ +	iter->type |= ITER_BVEC_FLAG_NO_REF;
+ +	return 0;
+  }
+  
+ -static void io_ring_submit_unlock(struct io_ring_ctx *ctx, bool needs_lock)
+ +static ssize_t io_import_iovec(struct io_ring_ctx *ctx, int rw,
+ +			       const struct sqe_submit *s, struct iovec **iovec,
+ +			       struct iov_iter *iter)
+  {
+++<<<<<<< HEAD
+ +	const struct io_uring_sqe *sqe = s->sqe;
+ +	void __user *buf = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ +	size_t sqe_len = READ_ONCE(sqe->len);
+ +	u8 opcode;
+ +
+ +	/*
+ +	 * We're reading ->opcode for the second time, but the first read
+ +	 * doesn't care whether it's _FIXED or not, so it doesn't matter
+ +	 * whether ->opcode changes concurrently. The first read does care
+ +	 * about whether it is a READ or a WRITE, so we don't trust this read
+ +	 * for that purpose and instead let the caller pass in the read/write
+ +	 * flag.
+ +	 */
+ +	opcode = READ_ONCE(sqe->opcode);
+ +	if (opcode == IORING_OP_READ_FIXED ||
+ +	    opcode == IORING_OP_WRITE_FIXED) {
+ +		ssize_t ret = io_import_fixed(ctx, rw, sqe, iter);
+++=======
++ 	if (needs_lock)
++ 		mutex_unlock(&ctx->uring_lock);
++ }
++ 
++ static void io_ring_submit_lock(struct io_ring_ctx *ctx, bool needs_lock)
++ {
++ 	/*
++ 	 * "Normal" inline submissions always hold the uring_lock, since we
++ 	 * grab it from the system call. Same is true for the SQPOLL offload.
++ 	 * The only exception is when we've detached the request and issue it
++ 	 * from an async worker thread, grab the lock for that case.
++ 	 */
++ 	if (needs_lock)
++ 		mutex_lock(&ctx->uring_lock);
++ }
++ 
++ static struct io_buffer *io_buffer_select(struct io_kiocb *req, size_t *len,
++ 					  int bgid, struct io_buffer *kbuf,
++ 					  bool needs_lock)
++ {
++ 	struct io_buffer *head;
++ 
++ 	if (req->flags & REQ_F_BUFFER_SELECTED)
++ 		return kbuf;
++ 
++ 	io_ring_submit_lock(req->ctx, needs_lock);
++ 
++ 	lockdep_assert_held(&req->ctx->uring_lock);
++ 
++ 	head = idr_find(&req->ctx->io_buffer_idr, bgid);
++ 	if (head) {
++ 		if (!list_empty(&head->list)) {
++ 			kbuf = list_last_entry(&head->list, struct io_buffer,
++ 							list);
++ 			list_del(&kbuf->list);
++ 		} else {
++ 			kbuf = head;
++ 			idr_remove(&req->ctx->io_buffer_idr, bgid);
++ 		}
++ 		if (*len > kbuf->len)
++ 			*len = kbuf->len;
++ 	} else {
++ 		kbuf = ERR_PTR(-ENOBUFS);
++ 	}
++ 
++ 	io_ring_submit_unlock(req->ctx, needs_lock);
++ 
++ 	return kbuf;
++ }
++ 
++ static void __user *io_rw_buffer_select(struct io_kiocb *req, size_t *len,
++ 					bool needs_lock)
++ {
++ 	struct io_buffer *kbuf;
++ 	int bgid;
++ 
++ 	kbuf = (struct io_buffer *) (unsigned long) req->rw.addr;
++ 	bgid = (int) (unsigned long) req->rw.kiocb.private;
++ 	kbuf = io_buffer_select(req, len, bgid, kbuf, needs_lock);
++ 	if (IS_ERR(kbuf))
++ 		return kbuf;
++ 	req->rw.addr = (u64) (unsigned long) kbuf;
++ 	req->flags |= REQ_F_BUFFER_SELECTED;
++ 	return u64_to_user_ptr(kbuf->addr);
++ }
++ 
++ #ifdef CONFIG_COMPAT
++ static ssize_t io_compat_import(struct io_kiocb *req, struct iovec *iov,
++ 				bool needs_lock)
++ {
++ 	struct compat_iovec __user *uiov;
++ 	compat_ssize_t clen;
++ 	void __user *buf;
++ 	ssize_t len;
++ 
++ 	uiov = u64_to_user_ptr(req->rw.addr);
++ 	if (!access_ok(uiov, sizeof(*uiov)))
++ 		return -EFAULT;
++ 	if (__get_user(clen, &uiov->iov_len))
++ 		return -EFAULT;
++ 	if (clen < 0)
++ 		return -EINVAL;
++ 
++ 	len = clen;
++ 	buf = io_rw_buffer_select(req, &len, needs_lock);
++ 	if (IS_ERR(buf))
++ 		return PTR_ERR(buf);
++ 	iov[0].iov_base = buf;
++ 	iov[0].iov_len = (compat_size_t) len;
++ 	return 0;
++ }
++ #endif
++ 
++ static ssize_t __io_iov_buffer_select(struct io_kiocb *req, struct iovec *iov,
++ 				      bool needs_lock)
++ {
++ 	struct iovec __user *uiov = u64_to_user_ptr(req->rw.addr);
++ 	void __user *buf;
++ 	ssize_t len;
++ 
++ 	if (copy_from_user(iov, uiov, sizeof(*uiov)))
++ 		return -EFAULT;
++ 
++ 	len = iov[0].iov_len;
++ 	if (len < 0)
++ 		return -EINVAL;
++ 	buf = io_rw_buffer_select(req, &len, needs_lock);
++ 	if (IS_ERR(buf))
++ 		return PTR_ERR(buf);
++ 	iov[0].iov_base = buf;
++ 	iov[0].iov_len = len;
++ 	return 0;
++ }
++ 
++ static ssize_t io_iov_buffer_select(struct io_kiocb *req, struct iovec *iov,
++ 				    bool needs_lock)
++ {
++ 	if (req->flags & REQ_F_BUFFER_SELECTED)
++ 		return 0;
++ 	if (!req->rw.len)
++ 		return 0;
++ 	else if (req->rw.len > 1)
++ 		return -EINVAL;
++ 
++ #ifdef CONFIG_COMPAT
++ 	if (req->ctx->compat)
++ 		return io_compat_import(req, iov, needs_lock);
++ #endif
++ 
++ 	return __io_iov_buffer_select(req, iov, needs_lock);
++ }
++ 
++ static ssize_t io_import_iovec(int rw, struct io_kiocb *req,
++ 			       struct iovec **iovec, struct iov_iter *iter,
++ 			       bool needs_lock)
++ {
++ 	void __user *buf = u64_to_user_ptr(req->rw.addr);
++ 	size_t sqe_len = req->rw.len;
++ 	ssize_t ret;
++ 	u8 opcode;
++ 
++ 	opcode = req->opcode;
++ 	if (opcode == IORING_OP_READ_FIXED || opcode == IORING_OP_WRITE_FIXED) {
++ 		*iovec = NULL;
++ 		return io_import_fixed(req, rw, iter);
++ 	}
++ 
++ 	/* buffer index only valid with fixed read/write, or buffer select  */
++ 	if (req->rw.kiocb.private && !(req->flags & REQ_F_BUFFER_SELECT))
++ 		return -EINVAL;
++ 
++ 	if (opcode == IORING_OP_READ || opcode == IORING_OP_WRITE) {
++ 		if (req->flags & REQ_F_BUFFER_SELECT) {
++ 			buf = io_rw_buffer_select(req, &sqe_len, needs_lock);
++ 			if (IS_ERR(buf)) {
++ 				*iovec = NULL;
++ 				return PTR_ERR(buf);
++ 			}
++ 		}
++ 
++ 		ret = import_single_range(rw, buf, sqe_len, *iovec, iter);
+++>>>>>>> 4d954c258a0c (io_uring: add IOSQE_BUFFER_SELECT support for IORING_OP_READV)
+  		*iovec = NULL;
+  		return ret < 0 ? ret : sqe_len;
+  	}
+  
+ -	if (req->io) {
+ -		struct io_async_rw *iorw = &req->io->rw;
+ -
+ -		*iovec = iorw->iov;
+ -		iov_iter_init(iter, rw, *iovec, iorw->nr_segs, iorw->size);
+ -		if (iorw->iov == iorw->fast_iov)
+ -			*iovec = NULL;
+ -		return iorw->size;
+ -	}
+ +	if (!s->has_user)
+ +		return -EFAULT;
+  
++ 	if (req->flags & REQ_F_BUFFER_SELECT) {
++ 		ret = io_iov_buffer_select(req, *iovec, needs_lock);
++ 		if (!ret)
++ 			iov_iter_init(iter, rw, *iovec, 1, (*iovec)->iov_len);
++ 		*iovec = NULL;
++ 		return ret;
++ 	}
++ 
+  #ifdef CONFIG_COMPAT
+ -	if (req->ctx->compat)
+ +	if (ctx->compat)
+  		return compat_import_iovec(rw, buf, sqe_len, UIO_FASTIOV,
+  						iovec, iter);
+  #endif
+* Unmerged path fs/io_uring.c
