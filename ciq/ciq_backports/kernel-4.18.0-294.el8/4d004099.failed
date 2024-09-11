@@ -1,0 +1,333 @@
+lockdep: Fix lockdep recursion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 4d004099a668c41522242aa146a38cc4eb59cb1e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4d004099.failed
+
+Steve reported that lockdep_assert*irq*(), when nested inside lockdep
+itself, will trigger a false-positive.
+
+One example is the stack-trace code, as called from inside lockdep,
+triggering tracing, which in turn calls RCU, which then uses
+lockdep_assert_irqs_disabled().
+
+Fixes: a21ee6055c30 ("lockdep: Change hardirq{s_enabled,_context} to per-cpu variables")
+	Reported-by: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 4d004099a668c41522242aa146a38cc4eb59cb1e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/lockdep.h
+#	kernel/locking/lockdep.c
+diff --cc include/linux/lockdep.h
+index 15a6e20d4aa2,b1227be47496..000000000000
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@@ -532,38 -532,49 +532,63 @@@ do {									
+  	lock_release(&(lock)->dep_map, _THIS_IP_);			\
+  } while (0)
+  
+++<<<<<<< HEAD
+ +#define lockdep_assert_irqs_enabled()	do {				\
+ +		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+ +			  !current->hardirqs_enabled,			\
+ +			  "IRQs not enabled as expected\n");		\
+ +	} while (0)
+++=======
++ DECLARE_PER_CPU(int, hardirqs_enabled);
++ DECLARE_PER_CPU(int, hardirq_context);
++ DECLARE_PER_CPU(unsigned int, lockdep_recursion);
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  
+ -/*
+ - * The below lockdep_assert_*() macros use raw_cpu_read() to access the above
+ - * per-cpu variables. This is required because this_cpu_read() will potentially
+ - * call into preempt/irq-disable and that obviously isn't right. This is also
+ - * correct because when IRQs are enabled, it doesn't matter if we accidentally
+ - * read the value from our previous CPU.
+ - */
+ +#define lockdep_assert_irqs_disabled()	do {				\
+ +		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+ +			  current->hardirqs_enabled,			\
+ +			  "IRQs not disabled as expected\n");		\
+ +	} while (0)
+  
+++<<<<<<< HEAD
+ +#define lockdep_assert_in_irq() do {					\
+ +		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+ +			  !current->hardirq_context,			\
+ +			  "Not in hardirq as expected\n");		\
+ +	} while (0)
+++=======
++ #define __lockdep_enabled	(debug_locks && !raw_cpu_read(lockdep_recursion))
++ 
++ #define lockdep_assert_irqs_enabled()					\
++ do {									\
++ 	WARN_ON_ONCE(__lockdep_enabled && !raw_cpu_read(hardirqs_enabled)); \
++ } while (0)
++ 
++ #define lockdep_assert_irqs_disabled()					\
++ do {									\
++ 	WARN_ON_ONCE(__lockdep_enabled && raw_cpu_read(hardirqs_enabled)); \
++ } while (0)
++ 
++ #define lockdep_assert_in_irq()						\
++ do {									\
++ 	WARN_ON_ONCE(__lockdep_enabled && !raw_cpu_read(hardirq_context)); \
++ } while (0)
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  
+  #define lockdep_assert_preemption_enabled()				\
+  do {									\
+  	WARN_ON_ONCE(IS_ENABLED(CONFIG_PREEMPT_COUNT)	&&		\
+- 		     debug_locks			&&		\
++ 		     __lockdep_enabled			&&		\
+  		     (preempt_count() != 0		||		\
+ -		      !raw_cpu_read(hardirqs_enabled)));		\
+ +		      !this_cpu_read(hardirqs_enabled)));		\
+  } while (0)
+  
+  #define lockdep_assert_preemption_disabled()				\
+  do {									\
+  	WARN_ON_ONCE(IS_ENABLED(CONFIG_PREEMPT_COUNT)	&&		\
+- 		     debug_locks			&&		\
++ 		     __lockdep_enabled			&&		\
+  		     (preempt_count() == 0		&&		\
+ -		      raw_cpu_read(hardirqs_enabled)));			\
+ +		      this_cpu_read(hardirqs_enabled)));		\
+  } while (0)
+  
+  #else
+diff --cc kernel/locking/lockdep.c
+index 3d05c48cad08,85d15f0362dc..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -397,10 -410,15 +414,20 @@@ void lockdep_init_task(struct task_stru
+  	task->lockdep_recursion = 0;
+  }
+  
++ static __always_inline void lockdep_recursion_inc(void)
++ {
++ 	__this_cpu_inc(lockdep_recursion);
++ }
++ 
+  static __always_inline void lockdep_recursion_finish(void)
+  {
+++<<<<<<< HEAD
+ +	if (WARN_ON_ONCE(--current->lockdep_recursion))
+ +		current->lockdep_recursion = 0;
+++=======
++ 	if (WARN_ON_ONCE(__this_cpu_dec_return(lockdep_recursion)))
++ 		__this_cpu_write(lockdep_recursion, 0);
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  }
+  
+  void lockdep_set_selftest_task(struct task_struct *task)
+@@@ -3639,22 -3658,33 +3666,35 @@@ static void __trace_hardirqs_on_caller(
+  	 * this bit from being set before)
+  	 */
+  	if (curr->softirqs_enabled)
+ -		mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ);
+ +		if (!mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ))
+ +			return;
+ +
+ +	curr->hardirq_enable_ip = ip;
+ +	curr->hardirq_enable_event = ++curr->irq_events;
+ +	debug_atomic_inc(hardirqs_on_events);
+  }
+  
+ -/**
+ - * lockdep_hardirqs_on_prepare - Prepare for enabling interrupts
+ - * @ip:		Caller address
+ - *
+ - * Invoked before a possible transition to RCU idle from exit to user or
+ - * guest mode. This ensures that all RCU operations are done before RCU
+ - * stops watching. After the RCU transition lockdep_hardirqs_on() has to be
+ - * invoked to set the final state.
+ - */
+ -void lockdep_hardirqs_on_prepare(unsigned long ip)
+ +__visible void trace_hardirqs_on_caller(unsigned long ip)
+  {
+ -	if (unlikely(!debug_locks))
+ +	time_hardirqs_on(CALLER_ADDR0, ip);
+ +
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(current->hardirqs_enabled)) {
+++=======
++ 	/*
++ 	 * NMIs do not (and cannot) track lock dependencies, nothing to do.
++ 	 */
++ 	if (unlikely(in_nmi()))
++ 		return;
++ 
++ 	if (unlikely(__this_cpu_read(lockdep_recursion)))
++ 		return;
++ 
++ 	if (unlikely(lockdep_hardirqs_enabled())) {
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  		/*
+  		 * Neither irq nor preemption are disabled here
+  		 * so this is racy by nature but losing one hit
+@@@ -3682,31 -3712,98 +3722,112 @@@
+  	 * Can't allow enabling interrupts while in an interrupt handler,
+  	 * that's general bad form and such. Recursion, limited stack etc..
+  	 */
+ -	if (DEBUG_LOCKS_WARN_ON(lockdep_hardirq_context()))
+ +	if (DEBUG_LOCKS_WARN_ON(current->hardirq_context))
+  		return;
+  
+++<<<<<<< HEAD
+ +	current->lockdep_recursion++;
+ +	__trace_hardirqs_on_caller(ip);
+++=======
++ 	current->hardirq_chain_key = current->curr_chain_key;
++ 
++ 	lockdep_recursion_inc();
++ 	__trace_hardirqs_on_caller();
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  	lockdep_recursion_finish();
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on_prepare);
+ +EXPORT_SYMBOL(trace_hardirqs_on_caller);
+  
+ -void noinstr lockdep_hardirqs_on(unsigned long ip)
+ +void trace_hardirqs_on(void)
+  {
+++<<<<<<< HEAD
+ +	trace_hardirqs_on_caller(CALLER_ADDR0);
+++=======
++ 	struct irqtrace_events *trace = &current->irqtrace;
++ 
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * NMIs can happen in the middle of local_irq_{en,dis}able() where the
++ 	 * tracking state and hardware state are out of sync.
++ 	 *
++ 	 * NMIs must save lockdep_hardirqs_enabled() to restore IRQ state from,
++ 	 * and not rely on hardware state like normal interrupts.
++ 	 */
++ 	if (unlikely(in_nmi())) {
++ 		if (!IS_ENABLED(CONFIG_TRACE_IRQFLAGS_NMI))
++ 			return;
++ 
++ 		/*
++ 		 * Skip:
++ 		 *  - recursion check, because NMI can hit lockdep;
++ 		 *  - hardware state check, because above;
++ 		 *  - chain_key check, see lockdep_hardirqs_on_prepare().
++ 		 */
++ 		goto skip_checks;
++ 	}
++ 
++ 	if (unlikely(__this_cpu_read(lockdep_recursion)))
++ 		return;
++ 
++ 	if (lockdep_hardirqs_enabled()) {
++ 		/*
++ 		 * Neither irq nor preemption are disabled here
++ 		 * so this is racy by nature but losing one hit
++ 		 * in a stat is not a big deal.
++ 		 */
++ 		__debug_atomic_inc(redundant_hardirqs_on);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We're enabling irqs and according to our state above irqs weren't
++ 	 * already enabled, yet we find the hardware thinks they are in fact
++ 	 * enabled.. someone messed up their IRQ state tracing.
++ 	 */
++ 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++ 		return;
++ 
++ 	/*
++ 	 * Ensure the lock stack remained unchanged between
++ 	 * lockdep_hardirqs_on_prepare() and lockdep_hardirqs_on().
++ 	 */
++ 	DEBUG_LOCKS_WARN_ON(current->hardirq_chain_key !=
++ 			    current->curr_chain_key);
++ 
++ skip_checks:
++ 	/* we'll do an OFF -> ON transition: */
++ 	__this_cpu_write(hardirqs_enabled, 1);
++ 	trace->hardirq_enable_ip = ip;
++ 	trace->hardirq_enable_event = ++trace->irq_events;
++ 	debug_atomic_inc(hardirqs_on_events);
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on);
+ +EXPORT_SYMBOL(trace_hardirqs_on);
+  
+  /*
+   * Hardirqs were disabled:
+   */
+ -void noinstr lockdep_hardirqs_off(unsigned long ip)
+ +__visible void trace_hardirqs_off_caller(unsigned long ip)
+  {
+ -	if (unlikely(!debug_locks))
+ -		return;
+ +	struct task_struct *curr = current;
+ +
+++<<<<<<< HEAD
+ +	time_hardirqs_off(CALLER_ADDR0, ip);
+  
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+++=======
++ 	/*
++ 	 * Matching lockdep_hardirqs_on(), allow NMIs in the middle of lockdep;
++ 	 * they will restore the software state. This ensures the software
++ 	 * state is consistent inside NMIs as well.
++ 	 */
++ 	if (in_nmi()) {
++ 		if (!IS_ENABLED(CONFIG_TRACE_IRQFLAGS_NMI))
++ 			return;
++ 	} else if (__this_cpu_read(lockdep_recursion))
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  		return;
+  
+  	/*
+@@@ -3738,11 -3832,11 +3859,11 @@@ EXPORT_SYMBOL(trace_hardirqs_off)
+  /*
+   * Softirqs will be enabled:
+   */
+ -void lockdep_softirqs_on(unsigned long ip)
+ +void trace_softirqs_on(unsigned long ip)
+  {
+ -	struct irqtrace_events *trace = &current->irqtrace;
+ +	struct task_struct *curr = current;
+  
+- 	if (unlikely(!debug_locks || current->lockdep_recursion))
++ 	if (unlikely(!lockdep_enabled()))
+  		return;
+  
+  	/*
+@@@ -3778,11 -3872,9 +3899,15 @@@
+  /*
+   * Softirqs were disabled:
+   */
+ -void lockdep_softirqs_off(unsigned long ip)
+ +void trace_softirqs_off(unsigned long ip)
+  {
+++<<<<<<< HEAD
+ +	struct task_struct *curr = current;
+ +
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+++=======
++ 	if (unlikely(!lockdep_enabled()))
+++>>>>>>> 4d004099a668 (lockdep: Fix lockdep recursion)
+  		return;
+  
+  	/*
+* Unmerged path include/linux/lockdep.h
+* Unmerged path kernel/locking/lockdep.c
