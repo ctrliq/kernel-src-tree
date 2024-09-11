@@ -1,0 +1,176 @@
+mm: gup: pack has_pinned in MMF_HAS_PINNED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit a458b76a4171f893efa7657dc079924580a8746a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/a458b76a.failed
+
+has_pinned 32bit can be packed in the MMF_HAS_PINNED bit as a noop
+cleanup.
+
+Any atomic_inc/dec to the mm cacheline shared by all threads in pin-fast
+would reintroduce a loss of SMP scalability to pin-fast, so there's no
+future potential usefulness to keep an atomic in the mm for this.
+
+set_bit(MMF_HAS_PINNED) will be theoretically a bit slower than WRITE_ONCE
+(atomic_set is equivalent to WRITE_ONCE), but the set_bit (just like
+atomic_set after this commit) has to be still issued only once per "mm",
+so the difference between the two will be lost in the noise.
+
+will-it-scale "mmap2" shows no change in performance with enterprise
+config as expected.
+
+will-it-scale "pin_fast" retains the > 4000% SMP scalability performance
+improvement against upstream as expected.
+
+This is a noop as far as overall performance and SMP scalability are
+concerned.
+
+[peterx@redhat.com: pack has_pinned in MMF_HAS_PINNED]
+  Link: https://lkml.kernel.org/r/YJqWESqyxa8OZA+2@t490s
+[akpm@linux-foundation.org: coding style fixes]
+[peterx@redhat.com: fix build for task_mmu.c, introduce mm_set_has_pinned_flag, fix comments]
+
+Link: https://lkml.kernel.org/r/20210507150553.208763-4-peterx@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Signed-off-by: Peter Xu <peterx@redhat.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: Kirill Shutemov <kirill@shutemov.name>
+	Cc: Kirill Tkhai <ktkhai@virtuozzo.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a458b76a4171f893efa7657dc079924580a8746a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+diff --cc fs/proc/task_mmu.c
+index 3945b2d54401,66965ad88d8b..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -952,6 -1038,23 +952,26 @@@ struct clear_refs_private 
+  };
+  
+  #ifdef CONFIG_MEM_SOFT_DIRTY
+++<<<<<<< HEAD
+++=======
++ 
++ static inline bool pte_is_pinned(struct vm_area_struct *vma, unsigned long addr, pte_t pte)
++ {
++ 	struct page *page;
++ 
++ 	if (!pte_write(pte))
++ 		return false;
++ 	if (!is_cow_mapping(vma->vm_flags))
++ 		return false;
++ 	if (likely(!test_bit(MMF_HAS_PINNED, &vma->vm_mm->flags)))
++ 		return false;
++ 	page = vm_normal_page(vma, addr, pte);
++ 	if (!page)
++ 		return false;
++ 	return page_maybe_dma_pinned(page);
++ }
++ 
+++>>>>>>> a458b76a4171 (mm: gup: pack has_pinned in MMF_HAS_PINNED)
+  static inline void clear_soft_dirty(struct vm_area_struct *vma,
+  		unsigned long addr, pte_t *pte)
+  {
+* Unmerged path fs/proc/task_mmu.c
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index a5582d37267e..086d0066966c 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1232,7 +1232,7 @@ static inline bool page_needs_cow_for_dma(struct vm_area_struct *vma,
+ 	if (!is_cow_mapping(vma->vm_flags))
+ 		return false;
+ 
+-	if (!atomic_read(&vma->vm_mm->has_pinned))
++	if (!test_bit(MMF_HAS_PINNED, &vma->vm_mm->flags))
+ 		return false;
+ 
+ 	return page_maybe_dma_pinned(page);
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index dfd82eab2902..4d9e3a656875 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -73,6 +73,14 @@ static inline int get_dumpable(struct mm_struct *mm)
+ #define MMF_OOM_VICTIM		25	/* mm is the oom victim */
+ #define MMF_OOM_REAP_QUEUED	26	/* mm was queued for oom_reaper */
+ #define MMF_MULTIPROCESS	27	/* mm is shared between processes */
++/*
++ * MMF_HAS_PINNED: Whether this mm has pinned any pages.  This can be either
++ * replaced in the future by mm.pinned_vm when it becomes stable, or grow into
++ * a counter on its own. We're aggresive on this bit for now: even if the
++ * pinned pages were unpinned later on, we'll still keep this bit set for the
++ * lifecycle of this mm, just for simplicity.
++ */
++#define MMF_HAS_PINNED		28	/* FOLL_PIN has run, never cleared */
+ #define MMF_DISABLE_THP_MASK	(1 << MMF_DISABLE_THP)
+ 
+ #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 059f64613141..d930ac68e623 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1031,7 +1031,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	mm_pgtables_bytes_init(mm);
+ 	mm->map_count = 0;
+ 	mm->locked_vm = 0;
+-	atomic_set(&mm->has_pinned, 0);
+ 	atomic64_set(&mm->pinned_vm, 0);
+ 	memset(&mm->rss_stat, 0, sizeof(mm->rss_stat));
+ 	spin_lock_init(&mm->page_table_lock);
+diff --git a/mm/gup.c b/mm/gup.c
+index e59347450cfa..b45768b6f266 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -420,6 +420,17 @@ void unpin_user_pages(struct page **pages, unsigned long npages)
+ }
+ EXPORT_SYMBOL(unpin_user_pages);
+ 
++/*
++ * Set the MMF_HAS_PINNED if not set yet; after set it'll be there for the mm's
++ * lifecycle.  Avoid setting the bit unless necessary, or it might cause write
++ * cache bouncing on large SMP machines for concurrent pinned gups.
++ */
++static inline void mm_set_has_pinned_flag(unsigned long *mm_flags)
++{
++	if (!test_bit(MMF_HAS_PINNED, mm_flags))
++		set_bit(MMF_HAS_PINNED, mm_flags);
++}
++
+ #ifdef CONFIG_MMU
+ static struct page *no_page_table(struct vm_area_struct *vma,
+ 		unsigned int flags)
+@@ -1350,8 +1361,8 @@ static __always_inline long __get_user_pages_locked(struct task_struct *tsk,
+ 		BUG_ON(*locked != 1);
+ 	}
+ 
+-	if ((flags & FOLL_PIN) && !atomic_read(&mm->has_pinned))
+-		atomic_set(&mm->has_pinned, 1);
++	if (flags & FOLL_PIN)
++		mm_set_has_pinned_flag(&mm->flags);
+ 
+ 	/*
+ 	 * FOLL_PIN and FOLL_GET are mutually exclusive. Traditional behavior
+@@ -2743,8 +2754,8 @@ static int internal_get_user_pages_fast(unsigned long start,
+ 				       FOLL_FAST_ONLY)))
+ 		return -EINVAL;
+ 
+-	if ((gup_flags & FOLL_PIN) && !atomic_read(&current->mm->has_pinned))
+-		atomic_set(&current->mm->has_pinned, 1);
++	if (gup_flags & FOLL_PIN)
++		mm_set_has_pinned_flag(&current->mm->flags);
+ 
+ 	if (!(gup_flags & FOLL_FAST_ONLY))
+ 		might_lock_read(&current->mm->mmap_sem);
