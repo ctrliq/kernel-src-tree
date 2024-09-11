@@ -1,0 +1,591 @@
+tools/bpf: move libbpf pr_* debug print functions to headers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit 8461ef8b7ef286212ca954d8b82dac3ceecb219d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8461ef8b.failed
+
+A global function libbpf_print, which is invisible
+outside the shared library, is defined to print based
+on levels. The pr_warning, pr_info and pr_debug
+macros are moved into the newly created header
+common.h. So any .c file including common.h can
+use these macros directly.
+
+Currently btf__new and btf_ext__new API has an argument getting
+__pr_debug function pointer into btf.c so the debugging information
+can be printed there. This patch removed this parameter
+from btf__new and btf_ext__new and directly using pr_debug in btf.c.
+
+Another global function libbpf_print_level_available, also
+invisible outside the shared library, can test
+whether a particular level debug printing is
+available or not. It is used in btf.c to
+test whether DEBUG level debug printing is availabl or not,
+based on which the log buffer will be allocated when loading
+btf to the kernel.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 8461ef8b7ef286212ca954d8b82dac3ceecb219d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+#	tools/lib/bpf/btf.h
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/test_libbpf.cpp
+diff --cc tools/lib/bpf/btf.c
+index ad19a43e946a,93e792b82242..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -372,3 -432,354 +373,357 @@@ int btf__fd(const struct btf *btf
+  {
+  	return btf->fd;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ const char *btf__name_by_offset(const struct btf *btf, __u32 offset)
++ {
++ 	if (offset < btf->hdr->str_len)
++ 		return &btf->strings[offset];
++ 	else
++ 		return NULL;
++ }
++ 
++ int btf__get_from_id(__u32 id, struct btf **btf)
++ {
++ 	struct bpf_btf_info btf_info = { 0 };
++ 	__u32 len = sizeof(btf_info);
++ 	__u32 last_size;
++ 	int btf_fd;
++ 	void *ptr;
++ 	int err;
++ 
++ 	err = 0;
++ 	*btf = NULL;
++ 	btf_fd = bpf_btf_get_fd_by_id(id);
++ 	if (btf_fd < 0)
++ 		return 0;
++ 
++ 	/* we won't know btf_size until we call bpf_obj_get_info_by_fd(). so
++ 	 * let's start with a sane default - 4KiB here - and resize it only if
++ 	 * bpf_obj_get_info_by_fd() needs a bigger buffer.
++ 	 */
++ 	btf_info.btf_size = 4096;
++ 	last_size = btf_info.btf_size;
++ 	ptr = malloc(last_size);
++ 	if (!ptr) {
++ 		err = -ENOMEM;
++ 		goto exit_free;
++ 	}
++ 
++ 	bzero(ptr, last_size);
++ 	btf_info.btf = ptr_to_u64(ptr);
++ 	err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 
++ 	if (!err && btf_info.btf_size > last_size) {
++ 		void *temp_ptr;
++ 
++ 		last_size = btf_info.btf_size;
++ 		temp_ptr = realloc(ptr, last_size);
++ 		if (!temp_ptr) {
++ 			err = -ENOMEM;
++ 			goto exit_free;
++ 		}
++ 		ptr = temp_ptr;
++ 		bzero(ptr, last_size);
++ 		btf_info.btf = ptr_to_u64(ptr);
++ 		err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 	}
++ 
++ 	if (err || btf_info.btf_size > last_size) {
++ 		err = errno;
++ 		goto exit_free;
++ 	}
++ 
++ 	*btf = btf__new((__u8 *)(long)btf_info.btf, btf_info.btf_size);
++ 	if (IS_ERR(*btf)) {
++ 		err = PTR_ERR(*btf);
++ 		*btf = NULL;
++ 	}
++ 
++ exit_free:
++ 	close(btf_fd);
++ 	free(ptr);
++ 
++ 	return err;
++ }
++ 
++ struct btf_ext_sec_copy_param {
++ 	__u32 off;
++ 	__u32 len;
++ 	__u32 min_rec_size;
++ 	struct btf_ext_info *ext_info;
++ 	const char *desc;
++ };
++ 
++ static int btf_ext_copy_info(struct btf_ext *btf_ext,
++ 			     __u8 *data, __u32 data_size,
++ 			     struct btf_ext_sec_copy_param *ext_sec)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 	const struct btf_ext_info_sec *sinfo;
++ 	struct btf_ext_info *ext_info;
++ 	__u32 info_left, record_size;
++ 	/* The start of the info sec (including the __u32 record_size). */
++ 	const void *info;
++ 
++ 	/* data and data_size do not include btf_ext_header from now on */
++ 	data = data + hdr->hdr_len;
++ 	data_size -= hdr->hdr_len;
++ 
++ 	if (ext_sec->off & 0x03) {
++ 		pr_debug(".BTF.ext %s section is not aligned to 4 bytes\n",
++ 		     ext_sec->desc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (data_size < ext_sec->off ||
++ 	    ext_sec->len > data_size - ext_sec->off) {
++ 		pr_debug("%s section (off:%u len:%u) is beyond the end of the ELF section .BTF.ext\n",
++ 		     ext_sec->desc, ext_sec->off, ext_sec->len);
++ 		return -EINVAL;
++ 	}
++ 
++ 	info = data + ext_sec->off;
++ 	info_left = ext_sec->len;
++ 
++ 	/* At least a record size */
++ 	if (info_left < sizeof(__u32)) {
++ 		pr_debug(".BTF.ext %s record size not found\n", ext_sec->desc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* The record size needs to meet the minimum standard */
++ 	record_size = *(__u32 *)info;
++ 	if (record_size < ext_sec->min_rec_size ||
++ 	    record_size & 0x03) {
++ 		pr_debug("%s section in .BTF.ext has invalid record size %u\n",
++ 		     ext_sec->desc, record_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	sinfo = info + sizeof(__u32);
++ 	info_left -= sizeof(__u32);
++ 
++ 	/* If no records, return failure now so .BTF.ext won't be used. */
++ 	if (!info_left) {
++ 		pr_debug("%s section in .BTF.ext has no records", ext_sec->desc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	while (info_left) {
++ 		unsigned int sec_hdrlen = sizeof(struct btf_ext_info_sec);
++ 		__u64 total_record_size;
++ 		__u32 num_records;
++ 
++ 		if (info_left < sec_hdrlen) {
++ 			pr_debug("%s section header is not found in .BTF.ext\n",
++ 			     ext_sec->desc);
++ 			return -EINVAL;
++ 		}
++ 
++ 		num_records = sinfo->num_info;
++ 		if (num_records == 0) {
++ 			pr_debug("%s section has incorrect num_records in .BTF.ext\n",
++ 			     ext_sec->desc);
++ 			return -EINVAL;
++ 		}
++ 
++ 		total_record_size = sec_hdrlen +
++ 				    (__u64)num_records * record_size;
++ 		if (info_left < total_record_size) {
++ 			pr_debug("%s section has incorrect num_records in .BTF.ext\n",
++ 			     ext_sec->desc);
++ 			return -EINVAL;
++ 		}
++ 
++ 		info_left -= total_record_size;
++ 		sinfo = (void *)sinfo + total_record_size;
++ 	}
++ 
++ 	ext_info = ext_sec->ext_info;
++ 	ext_info->len = ext_sec->len - sizeof(__u32);
++ 	ext_info->rec_size = record_size;
++ 	ext_info->info = malloc(ext_info->len);
++ 	if (!ext_info->info)
++ 		return -ENOMEM;
++ 	memcpy(ext_info->info, info + sizeof(__u32), ext_info->len);
++ 
++ 	return 0;
++ }
++ 
++ static int btf_ext_copy_func_info(struct btf_ext *btf_ext,
++ 				  __u8 *data, __u32 data_size)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 	struct btf_ext_sec_copy_param param = {
++ 		.off = hdr->func_info_off,
++ 		.len = hdr->func_info_len,
++ 		.min_rec_size = sizeof(struct bpf_func_info_min),
++ 		.ext_info = &btf_ext->func_info,
++ 		.desc = "func_info"
++ 	};
++ 
++ 	return btf_ext_copy_info(btf_ext, data, data_size, &param);
++ }
++ 
++ static int btf_ext_copy_line_info(struct btf_ext *btf_ext,
++ 				  __u8 *data, __u32 data_size)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 	struct btf_ext_sec_copy_param param = {
++ 		.off = hdr->line_info_off,
++ 		.len = hdr->line_info_len,
++ 		.min_rec_size = sizeof(struct bpf_line_info_min),
++ 		.ext_info = &btf_ext->line_info,
++ 		.desc = "line_info",
++ 	};
++ 
++ 	return btf_ext_copy_info(btf_ext, data, data_size, &param);
++ }
++ 
++ static int btf_ext_parse_hdr(__u8 *data, __u32 data_size)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 
++ 	if (data_size < offsetof(struct btf_ext_header, func_info_off) ||
++ 	    data_size < hdr->hdr_len) {
++ 		pr_debug("BTF.ext header not found");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (hdr->magic != BTF_MAGIC) {
++ 		pr_debug("Invalid BTF.ext magic:%x\n", hdr->magic);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (hdr->version != BTF_VERSION) {
++ 		pr_debug("Unsupported BTF.ext version:%u\n", hdr->version);
++ 		return -ENOTSUP;
++ 	}
++ 
++ 	if (hdr->flags) {
++ 		pr_debug("Unsupported BTF.ext flags:%x\n", hdr->flags);
++ 		return -ENOTSUP;
++ 	}
++ 
++ 	if (data_size == hdr->hdr_len) {
++ 		pr_debug("BTF.ext has no data\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void btf_ext__free(struct btf_ext *btf_ext)
++ {
++ 	if (!btf_ext)
++ 		return;
++ 
++ 	free(btf_ext->func_info.info);
++ 	free(btf_ext->line_info.info);
++ 	free(btf_ext);
++ }
++ 
++ struct btf_ext *btf_ext__new(__u8 *data, __u32 size)
++ {
++ 	struct btf_ext *btf_ext;
++ 	int err;
++ 
++ 	err = btf_ext_parse_hdr(data, size);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	btf_ext = calloc(1, sizeof(struct btf_ext));
++ 	if (!btf_ext)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	err = btf_ext_copy_func_info(btf_ext, data, size);
++ 	if (err) {
++ 		btf_ext__free(btf_ext);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	err = btf_ext_copy_line_info(btf_ext, data, size);
++ 	if (err) {
++ 		btf_ext__free(btf_ext);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	return btf_ext;
++ }
++ 
++ static int btf_ext_reloc_info(const struct btf *btf,
++ 			      const struct btf_ext_info *ext_info,
++ 			      const char *sec_name, __u32 insns_cnt,
++ 			      void **info, __u32 *cnt)
++ {
++ 	__u32 sec_hdrlen = sizeof(struct btf_ext_info_sec);
++ 	__u32 i, record_size, existing_len, records_len;
++ 	struct btf_ext_info_sec *sinfo;
++ 	const char *info_sec_name;
++ 	__u64 remain_len;
++ 	void *data;
++ 
++ 	record_size = ext_info->rec_size;
++ 	sinfo = ext_info->info;
++ 	remain_len = ext_info->len;
++ 	while (remain_len > 0) {
++ 		records_len = sinfo->num_info * record_size;
++ 		info_sec_name = btf__name_by_offset(btf, sinfo->sec_name_off);
++ 		if (strcmp(info_sec_name, sec_name)) {
++ 			remain_len -= sec_hdrlen + records_len;
++ 			sinfo = (void *)sinfo + sec_hdrlen + records_len;
++ 			continue;
++ 		}
++ 
++ 		existing_len = (*cnt) * record_size;
++ 		data = realloc(*info, existing_len + records_len);
++ 		if (!data)
++ 			return -ENOMEM;
++ 
++ 		memcpy(data + existing_len, sinfo->data, records_len);
++ 		/* adjust insn_off only, the rest data will be passed
++ 		 * to the kernel.
++ 		 */
++ 		for (i = 0; i < sinfo->num_info; i++) {
++ 			__u32 *insn_off;
++ 
++ 			insn_off = data + existing_len + (i * record_size);
++ 			*insn_off = *insn_off / sizeof(struct bpf_insn) +
++ 				insns_cnt;
++ 		}
++ 		*info = data;
++ 		*cnt += sinfo->num_info;
++ 		return 0;
++ 	}
++ 
++ 	return -ENOENT;
++ }
++ 
++ int btf_ext__reloc_func_info(const struct btf *btf, const struct btf_ext *btf_ext,
++ 			     const char *sec_name, __u32 insns_cnt,
++ 			     void **func_info, __u32 *cnt)
++ {
++ 	return btf_ext_reloc_info(btf, &btf_ext->func_info, sec_name,
++ 				  insns_cnt, func_info, cnt);
++ }
++ 
++ int btf_ext__reloc_line_info(const struct btf *btf, const struct btf_ext *btf_ext,
++ 			     const char *sec_name, __u32 insns_cnt,
++ 			     void **line_info, __u32 *cnt)
++ {
++ 	return btf_ext_reloc_info(btf, &btf_ext->line_info, sec_name,
++ 				  insns_cnt, line_info, cnt);
++ }
++ 
++ __u32 btf_ext__func_info_rec_size(const struct btf_ext *btf_ext)
++ {
++ 	return btf_ext->func_info.rec_size;
++ }
++ 
++ __u32 btf_ext__line_info_rec_size(const struct btf_ext *btf_ext)
++ {
++ 	return btf_ext->line_info.rec_size;
++ }
+++>>>>>>> 8461ef8b7ef2 (tools/bpf: move libbpf pr_* debug print functions to headers)
+diff --cc tools/lib/bpf/btf.h
+index caac3a404dc5,b1e8e54cc21d..000000000000
+--- a/tools/lib/bpf/btf.h
++++ b/tools/lib/bpf/btf.h
+@@@ -6,19 -6,82 +6,83 @@@
+  
+  #include <linux/types.h>
+  
+ -#ifdef __cplusplus
+ -extern "C" {
+ -#endif
+ -
+ -#ifndef LIBBPF_API
+ -#define LIBBPF_API __attribute__((visibility("default")))
+ -#endif
+ -
+  #define BTF_ELF_SEC ".BTF"
+ -#define BTF_EXT_ELF_SEC ".BTF.ext"
+  
+  struct btf;
+ -struct btf_ext;
+  struct btf_type;
+  
+++<<<<<<< HEAD
+ +typedef int (*btf_print_fn_t)(const char *, ...)
+ +	__attribute__((format(printf, 1, 2)));
+ +
+ +void btf__free(struct btf *btf);
+ +struct btf *btf__new(__u8 *data, __u32 size, btf_print_fn_t err_log);
+ +__s32 btf__find_by_name(const struct btf *btf, const char *type_name);
+ +const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
+ +__s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
+ +int btf__fd(const struct btf *btf);
+ +
+++=======
++ /*
++  * The .BTF.ext ELF section layout defined as
++  *   struct btf_ext_header
++  *   func_info subsection
++  *
++  * The func_info subsection layout:
++  *   record size for struct bpf_func_info in the func_info subsection
++  *   struct btf_sec_func_info for section #1
++  *   a list of bpf_func_info records for section #1
++  *     where struct bpf_func_info mimics one in include/uapi/linux/bpf.h
++  *     but may not be identical
++  *   struct btf_sec_func_info for section #2
++  *   a list of bpf_func_info records for section #2
++  *   ......
++  *
++  * Note that the bpf_func_info record size in .BTF.ext may not
++  * be the same as the one defined in include/uapi/linux/bpf.h.
++  * The loader should ensure that record_size meets minimum
++  * requirement and pass the record as is to the kernel. The
++  * kernel will handle the func_info properly based on its contents.
++  */
++ struct btf_ext_header {
++ 	__u16	magic;
++ 	__u8	version;
++ 	__u8	flags;
++ 	__u32	hdr_len;
++ 
++ 	/* All offsets are in bytes relative to the end of this header */
++ 	__u32	func_info_off;
++ 	__u32	func_info_len;
++ 	__u32	line_info_off;
++ 	__u32	line_info_len;
++ };
++ 
++ LIBBPF_API void btf__free(struct btf *btf);
++ LIBBPF_API struct btf *btf__new(__u8 *data, __u32 size);
++ LIBBPF_API __s32 btf__find_by_name(const struct btf *btf,
++ 				   const char *type_name);
++ LIBBPF_API const struct btf_type *btf__type_by_id(const struct btf *btf,
++ 						  __u32 id);
++ LIBBPF_API __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
++ LIBBPF_API int btf__resolve_type(const struct btf *btf, __u32 type_id);
++ LIBBPF_API int btf__fd(const struct btf *btf);
++ LIBBPF_API const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
++ LIBBPF_API int btf__get_from_id(__u32 id, struct btf **btf);
++ 
++ struct btf_ext *btf_ext__new(__u8 *data, __u32 size);
++ void btf_ext__free(struct btf_ext *btf_ext);
++ int btf_ext__reloc_func_info(const struct btf *btf,
++ 			     const struct btf_ext *btf_ext,
++ 			     const char *sec_name, __u32 insns_cnt,
++ 			     void **func_info, __u32 *func_info_len);
++ int btf_ext__reloc_line_info(const struct btf *btf,
++ 			     const struct btf_ext *btf_ext,
++ 			     const char *sec_name, __u32 insns_cnt,
++ 			     void **line_info, __u32 *cnt);
++ __u32 btf_ext__func_info_rec_size(const struct btf_ext *btf_ext);
++ __u32 btf_ext__line_info_rec_size(const struct btf_ext *btf_ext);
++ 
++ #ifdef __cplusplus
++ } /* extern "C" */
+++>>>>>>> 8461ef8b7ef2 (tools/bpf: move libbpf pr_* debug print functions to headers)
+  #endif
+ -
+ -#endif /* __LIBBPF_BTF_H */
+diff --cc tools/lib/bpf/libbpf.c
+index 38df8e0ed95d,eeba77b695ad..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -860,6 -928,21 +879,24 @@@ static int bpf_object__elf_collect(stru
+  		pr_warning("Corrupted ELF file: index of strtab invalid\n");
+  		return LIBBPF_ERRNO__FORMAT;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (btf_ext_data) {
++ 		if (!obj->btf) {
++ 			pr_debug("Ignore ELF section %s because its depending ELF section %s is not found.\n",
++ 				 BTF_EXT_ELF_SEC, BTF_ELF_SEC);
++ 		} else {
++ 			obj->btf_ext = btf_ext__new(btf_ext_data->d_buf,
++ 						    btf_ext_data->d_size);
++ 			if (IS_ERR(obj->btf_ext)) {
++ 				pr_warning("Error loading ELF section %s: %ld. Ignored and continue.\n",
++ 					   BTF_EXT_ELF_SEC,
++ 					   PTR_ERR(obj->btf_ext));
++ 				obj->btf_ext = NULL;
++ 			}
++ 		}
++ 	}
+++>>>>>>> 8461ef8b7ef2 (tools/bpf: move libbpf pr_* debug print functions to headers)
+  	if (obj->efile.maps_shndx >= 0) {
+  		err = bpf_object__init_maps(obj, flags);
+  		if (err)
+* Unmerged path tools/lib/bpf/test_libbpf.cpp
+* Unmerged path tools/lib/bpf/btf.c
+* Unmerged path tools/lib/bpf/btf.h
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index c8c168c73302..4c563abc8312 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -51,6 +51,12 @@ enum libbpf_errno {
+ 
+ int libbpf_strerror(int err, char *buf, size_t size);
+ 
++enum libbpf_print_level {
++        LIBBPF_WARN,
++        LIBBPF_INFO,
++        LIBBPF_DEBUG,
++};
++
+ /*
+  * __printf is defined in include/linux/compiler-gcc.h. However,
+  * it would be better if libbpf.h didn't depend on Linux header files.
+diff --git a/tools/lib/bpf/libbpf_util.h b/tools/lib/bpf/libbpf_util.h
+new file mode 100644
+index 000000000000..0fdc3b1d0e33
+--- /dev/null
++++ b/tools/lib/bpf/libbpf_util.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
++/* Copyright (c) 2019 Facebook */
++
++#ifndef __LIBBPF_LIBBPF_UTIL_H
++#define __LIBBPF_LIBBPF_UTIL_H
++
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++extern void libbpf_print(enum libbpf_print_level level,
++			 const char *format, ...)
++	__attribute__((format(printf, 2, 3)));
++
++extern bool libbpf_print_level_available(enum libbpf_print_level level);
++
++#define __pr(level, fmt, ...)	\
++do {				\
++	libbpf_print(level, "libbpf: " fmt, ##__VA_ARGS__);	\
++} while (0)
++
++#define pr_warning(fmt, ...)	__pr(LIBBPF_WARN, fmt, ##__VA_ARGS__)
++#define pr_info(fmt, ...)	__pr(LIBBPF_INFO, fmt, ##__VA_ARGS__)
++#define pr_debug(fmt, ...)	__pr(LIBBPF_DEBUG, fmt, ##__VA_ARGS__)
++
++#ifdef __cplusplus
++} /* extern "C" */
++#endif
++
++#endif
+* Unmerged path tools/lib/bpf/test_libbpf.cpp
