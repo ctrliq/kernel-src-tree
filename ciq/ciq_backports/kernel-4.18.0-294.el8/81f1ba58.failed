@@ -1,0 +1,176 @@
+mm/vmalloc: remove preempt_disable/enable when doing preloading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit 81f1ba586e393ad43350bded96d1ec3c48674b00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/81f1ba58.failed
+
+Some background.  The preemption was disabled before to guarantee that a
+preloaded object is available for a CPU, it was stored for.  That was
+achieved by combining the disabling the preemption and taking the spin
+lock while the ne_fit_preload_node is checked.
+
+The aim was to not allocate in atomic context when spinlock is taken
+later, for regular vmap allocations.  But that approach conflicts with
+CONFIG_PREEMPT_RT philosophy.  It means that calling spin_lock() with
+disabled preemption is forbidden in the CONFIG_PREEMPT_RT kernel.
+
+Therefore, get rid of preempt_disable() and preempt_enable() when the
+preload is done for splitting purpose.  As a result we do not guarantee
+now that a CPU is preloaded, instead we minimize the case when it is
+not, with this change, by populating the per cpu preload pointer under
+the vmap_area_lock.
+
+This implies that at least each caller that has done the preallocation
+will not fallback to an atomic allocation later.  It is possible that
+the preallocation would be pointless or that no preallocation is done
+because of the race but the data shows that this is really rare.
+
+For example i run the special test case that follows the preload pattern
+and path.  20 "unbind" threads run it and each does 1000000 allocations.
+Only 3.5 times among 1000000 a CPU was not preloaded.  So it can happen
+but the number is negligible.
+
+[mhocko@suse.com: changelog additions]
+Link: http://lkml.kernel.org/r/20191016095438.12391-1-urezki@gmail.com
+Fixes: 82dd23e84be3 ("mm/vmalloc.c: preload a CPU with one object for split purpose")
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Acked-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Acked-by: Daniel Wagner <dwagner@suse.de>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Oleksiy Avramchenko <oleksiy.avramchenko@sonymobile.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 81f1ba586e393ad43350bded96d1ec3c48674b00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmalloc.c
+diff --cc mm/vmalloc.c
+index c82a0db1aefc,90517b4b21ef..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -432,77 -1076,42 +432,108 @@@ static struct vmap_area *alloc_vmap_are
+  	kmemleak_scan_area(&va->rb_node, SIZE_MAX, gfp_mask & GFP_RECLAIM_MASK);
+  
+  retry:
+ +	spin_lock(&vmap_area_lock);
+  	/*
+++<<<<<<< HEAD
+ +	 * Invalidate cache if we have more permissive parameters.
+ +	 * cached_hole_size notes the largest hole noticed _below_
+ +	 * the vmap_area cached in free_vmap_cache: if size fits
+ +	 * into that hole, we want to scan from vstart to reuse
+ +	 * the hole instead of allocating above free_vmap_cache.
+ +	 * Note that __free_vmap_area may update free_vmap_cache
+ +	 * without updating cached_hole_size or cached_align.
+ +	 */
+ +	if (!free_vmap_cache ||
+ +			size < cached_hole_size ||
+ +			vstart < cached_vstart ||
+ +			align < cached_align) {
+ +nocache:
+ +		cached_hole_size = 0;
+ +		free_vmap_cache = NULL;
+ +	}
+ +	/* record if we encounter less permissive parameters */
+ +	cached_vstart = vstart;
+ +	cached_align = align;
+ +
+ +	/* find starting point for our search */
+ +	if (free_vmap_cache) {
+ +		first = rb_entry(free_vmap_cache, struct vmap_area, rb_node);
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr < vstart)
+ +			goto nocache;
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +	} else {
+ +		addr = ALIGN(vstart, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +		n = vmap_area_root.rb_node;
+ +		first = NULL;
+ +
+ +		while (n) {
+ +			struct vmap_area *tmp;
+ +			tmp = rb_entry(n, struct vmap_area, rb_node);
+ +			if (tmp->va_end >= addr) {
+ +				first = tmp;
+ +				if (tmp->va_start <= addr)
+ +					break;
+ +				n = n->rb_left;
+ +			} else
+ +				n = n->rb_right;
+ +		}
+ +
+ +		if (!first)
+ +			goto found;
+ +	}
+ +
+ +	/* from the starting point, walk areas until a suitable hole is found */
+ +	while (addr + size > first->va_start && addr + size <= vend) {
+ +		if (addr + cached_hole_size < first->va_start)
+ +			cached_hole_size = first->va_start - addr;
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+++=======
++ 	 * Preload this CPU with one extra vmap_area object. It is used
++ 	 * when fit type of free area is NE_FIT_TYPE. Please note, it
++ 	 * does not guarantee that an allocation occurs on a CPU that
++ 	 * is preloaded, instead we minimize the case when it is not.
++ 	 * It can happen because of cpu migration, because there is a
++ 	 * race until the below spinlock is taken.
++ 	 *
++ 	 * The preload is done in non-atomic context, thus it allows us
++ 	 * to use more permissive allocation masks to be more stable under
++ 	 * low memory condition and high memory pressure. In rare case,
++ 	 * if not preloaded, GFP_NOWAIT is used.
++ 	 *
++ 	 * Set "pva" to NULL here, because of "retry" path.
++ 	 */
++ 	pva = NULL;
++ 
++ 	if (!this_cpu_read(ne_fit_preload_node))
++ 		/*
++ 		 * Even if it fails we do not really care about that.
++ 		 * Just proceed as it is. If needed "overflow" path
++ 		 * will refill the cache we allocate from.
++ 		 */
++ 		pva = kmem_cache_alloc_node(vmap_area_cachep, GFP_KERNEL, node);
++ 
++ 	spin_lock(&vmap_area_lock);
++ 
++ 	if (pva && __this_cpu_cmpxchg(ne_fit_preload_node, NULL, pva))
++ 		kmem_cache_free(vmap_area_cachep, pva);
+++>>>>>>> 81f1ba586e39 (mm/vmalloc: remove preempt_disable/enable when doing preloading)
+  
+ -	/*
+ -	 * If an allocation fails, the "vend" address is
+ -	 * returned. Therefore trigger the overflow path.
+ -	 */
+ -	addr = __alloc_vmap_area(size, align, vstart, vend);
+ -	if (unlikely(addr == vend))
+ +		if (list_is_last(&first->list, &vmap_area_list))
+ +			goto found;
+ +
+ +		first = list_next_entry(first, list);
+ +	}
+ +
+ +found:
+ +	if (addr + size > vend)
+  		goto overflow;
+  
+  	va->va_start = addr;
+* Unmerged path mm/vmalloc.c
