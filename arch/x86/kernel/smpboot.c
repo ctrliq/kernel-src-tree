@@ -49,7 +49,7 @@
 #include <linux/sched/hotplug.h>
 #include <linux/sched/task_stack.h>
 #include <linux/percpu.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 #include <linux/err.h>
 #include <linux/nmi.h>
 #include <linux/tboot.h>
@@ -328,10 +328,9 @@ int topology_phys_to_logical_die(unsigned int die_id, unsigned int cur_cpu)
 	for_each_possible_cpu(cpu) {
 		struct cpuinfo_x86 *c = &cpu_data(cpu);
 
-		if (c->initialized &&
-		    c->cpuinfo_x86_extended_rh.cpu_die_id == die_id &&
+		if (c->initialized && c->_rh.cpu_die_id == die_id &&
 		    c->phys_proc_id == proc_id)
-			return c->cpuinfo_x86_extended_rh.logical_die_id;
+			return c->_rh.logical_die_id;
 	}
 	return -1;
 }
@@ -380,7 +379,7 @@ int topology_update_die_map(unsigned int die, unsigned int cpu)
 			cpu, die, new);
 	}
 found:
-	cpu_data(cpu).cpuinfo_x86_extended_rh.logical_die_id = new;
+	cpu_data(cpu)._rh.logical_die_id = new;
 	return 0;
 }
 
@@ -392,7 +391,7 @@ void __init smp_store_boot_cpu_info(void)
 	*c = boot_cpu_data;
 	c->cpu_index = id;
 	topology_update_package_map(c->phys_proc_id, id);
-	topology_update_die_map(c->cpuinfo_x86_extended_rh.cpu_die_id, id);
+	topology_update_die_map(c->_rh.cpu_die_id, id);
 	c->initialized = true;
 }
 
@@ -447,8 +446,7 @@ static bool match_smt(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 		int cpu1 = c->cpu_index, cpu2 = o->cpu_index;
 
 		if (c->phys_proc_id == o->phys_proc_id &&
-		    (c->cpuinfo_x86_extended_rh.cpu_die_id ==
-		     o->cpuinfo_x86_extended_rh.cpu_die_id) &&
+		    (c->_rh.cpu_die_id == o->_rh.cpu_die_id) &&
 		    per_cpu(cpu_llc_id, cpu1) == per_cpu(cpu_llc_id, cpu2)) {
 			if (c->cpu_core_id == o->cpu_core_id)
 				return topology_sane(c, o, "smt");
@@ -460,8 +458,7 @@ static bool match_smt(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 		}
 
 	} else if (c->phys_proc_id == o->phys_proc_id &&
-		   (c->cpuinfo_x86_extended_rh.cpu_die_id ==
-		    o->cpuinfo_x86_extended_rh.cpu_die_id) &&
+		   (c->_rh.cpu_die_id == o->_rh.cpu_die_id) &&
 		   c->cpu_core_id == o->cpu_core_id) {
 		return topology_sane(c, o, "smt");
 	}
@@ -485,7 +482,7 @@ static bool match_smt(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
  */
 
 static const struct x86_cpu_id snc_cpu[] = {
-	{ X86_VENDOR_INTEL, 6, INTEL_FAM6_SKYLAKE_X },
+	X86_MATCH_INTEL_FAM6_MODEL(SKYLAKE_X, NULL),
 	{}
 };
 
@@ -527,8 +524,7 @@ static bool match_pkg(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 static bool match_die(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
 {
 	if ((c->phys_proc_id == o->phys_proc_id) &&
-	    (c->cpuinfo_x86_extended_rh.cpu_die_id ==
-	     o->cpuinfo_x86_extended_rh.cpu_die_id))
+	    (c->_rh.cpu_die_id == o->_rh.cpu_die_id))
 		return true;
 	return false;
 }

@@ -4,30 +4,34 @@
  * modify it under the terms of version 2 of the GNU General Public
  * License as published by the Free Software Foundation.
  */
+#define _GNU_SOURCE
 #include "test_progs.h"
+#include "cgroup_helpers.h"
 #include "bpf_rlimit.h"
 #include <argp.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
 #include <string.h>
+#include <execinfo.h> /* backtrace */
 
 /* defined in test_progs.h */
-struct test_env env;
-int error_cnt, pass_cnt;
+struct test_env env = {};
 
 struct prog_test_def {
 	const char *test_name;
 	int test_num;
 	void (*run_test)(void);
 	bool force_log;
-	int pass_cnt;
 	int error_cnt;
 	int skip_cnt;
 	bool tested;
+	bool need_cgroup_cleanup;
 
-	const char *subtest_name;
+	char *subtest_name;
 	int subtest_num;
 
 	/* store counts before subtest started */
-	int old_pass_cnt;
 	int old_error_cnt;
 };
 
@@ -37,24 +41,29 @@ struct prog_test_def {
  */
 int usleep(useconds_t usec)
 {
-	struct timespec ts;
+	struct timespec ts = {
+		.tv_sec = usec / 1000000,
+		.tv_nsec = (usec % 1000000) * 1000,
+	};
 
-	if (usec > 999999) {
-		ts.tv_sec = usec / 1000000;
-		ts.tv_nsec = usec % 1000000;
-	} else {
-		ts.tv_sec = 0;
-		ts.tv_nsec = usec;
-	}
-	return nanosleep(&ts, NULL);
+	return syscall(__NR_nanosleep, &ts, NULL);
 }
 
 static bool should_run(struct test_selector *sel, int num, const char *name)
 {
-	if (sel->name && sel->name[0] && !strstr(name, sel->name))
-		return false;
+	int i;
 
-	if (!sel->num_set)
+	for (i = 0; i < sel->blacklist.cnt; i++) {
+		if (strstr(name, sel->blacklist.strs[i]))
+			return false;
+	}
+
+	for (i = 0; i < sel->whitelist.cnt; i++) {
+		if (strstr(name, sel->whitelist.strs[i]))
+			return true;
+	}
+
+	if (!sel->whitelist.cnt && !sel->num_set)
 		return true;
 
 	return num < sel->num_set_len && sel->num_set[num];
@@ -67,7 +76,7 @@ static void dump_test_log(const struct prog_test_def *test, bool failed)
 
 	fflush(stdout); /* exports env.log_buf & env.log_cnt */
 
-	if (env.verbose || test->force_log || failed) {
+	if (env.verbosity > VERBOSE_NONE || test->force_log || failed) {
 		if (env.log_cnt) {
 			env.log_buf[env.log_cnt] = '\0';
 			fprintf(env.stdout, "%s", env.log_buf);
@@ -87,10 +96,38 @@ static void skip_account(void)
 	}
 }
 
+static void stdio_restore(void);
+
+/* A bunch of tests set custom affinity per-thread and/or per-process. Reset
+ * it after each test/sub-test.
+ */
+static void reset_affinity() {
+
+	cpu_set_t cpuset;
+	int i, err;
+
+	CPU_ZERO(&cpuset);
+	for (i = 0; i < env.nr_cpus; i++)
+		CPU_SET(i, &cpuset);
+
+	err = sched_setaffinity(0, sizeof(cpuset), &cpuset);
+	if (err < 0) {
+		stdio_restore();
+		fprintf(stderr, "Failed to reset process affinity: %d!\n", err);
+		exit(-1);
+	}
+	err = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+	if (err < 0) {
+		stdio_restore();
+		fprintf(stderr, "Failed to reset thread affinity: %d!\n", err);
+		exit(-1);
+	}
+}
+
 void test__end_subtest()
 {
 	struct prog_test_def *test = env.test;
-	int sub_error_cnt = error_cnt - test->old_error_cnt;
+	int sub_error_cnt = test->error_cnt - test->old_error_cnt;
 
 	if (sub_error_cnt)
 		env.fail_cnt++;
@@ -103,16 +140,19 @@ void test__end_subtest()
 	fprintf(env.stdout, "#%d/%d %s:%s\n",
 	       test->test_num, test->subtest_num,
 	       test->subtest_name, sub_error_cnt ? "FAIL" : "OK");
+
+	reset_affinity();
+
+	free(test->subtest_name);
+	test->subtest_name = NULL;
 }
 
 bool test__start_subtest(const char *name)
 {
 	struct prog_test_def *test = env.test;
 
-	if (test->subtest_name) {
+	if (test->subtest_name)
 		test__end_subtest();
-		test->subtest_name = NULL;
-	}
 
 	test->subtest_num++;
 
@@ -126,9 +166,14 @@ bool test__start_subtest(const char *name)
 	if (!should_run(&env.subtest_selector, test->subtest_num, name))
 		return false;
 
-	test->subtest_name = name;
-	env.test->old_pass_cnt = pass_cnt;
-	env.test->old_error_cnt = error_cnt;
+	test->subtest_name = strdup(name);
+	if (!test->subtest_name) {
+		fprintf(env.stderr,
+			"Subtest #%d: failed to copy subtest name!\n",
+			test->subtest_num);
+		return false;
+	}
+	env.test->old_error_cnt = env.test->error_cnt;
 
 	return true;
 }
@@ -140,6 +185,44 @@ void test__force_log() {
 void test__skip(void)
 {
 	env.test->skip_cnt++;
+}
+
+void test__fail(void)
+{
+	env.test->error_cnt++;
+}
+
+int test__join_cgroup(const char *path)
+{
+	int fd;
+
+	if (!env.test->need_cgroup_cleanup) {
+		if (setup_cgroup_environment()) {
+			fprintf(stderr,
+				"#%d %s: Failed to setup cgroup environment\n",
+				env.test->test_num, env.test->test_name);
+			return -1;
+		}
+
+		env.test->need_cgroup_cleanup = true;
+	}
+
+	fd = create_and_get_cgroup(path);
+	if (fd < 0) {
+		fprintf(stderr,
+			"#%d %s: Failed to create cgroup '%s' (errno=%d)\n",
+			env.test->test_num, env.test->test_name, path, errno);
+		return fd;
+	}
+
+	if (join_cgroup(path)) {
+		fprintf(stderr,
+			"#%d %s: Failed to join cgroup '%s' (errno=%d)\n",
+			env.test->test_num, env.test->test_name, path, errno);
+		return -1;
+	}
+
+	return fd;
 }
 
 struct ipv4_packet pkt_v4 = {
@@ -165,8 +248,8 @@ int bpf_find_map(const char *test, struct bpf_object *obj, const char *name)
 
 	map = bpf_object__find_map_by_name(obj, name);
 	if (!map) {
-		printf("%s:FAIL:map '%s' not found\n", test, name);
-		error_cnt++;
+		fprintf(stdout, "%s:FAIL:map '%s' not found\n", test, name);
+		test__fail();
 		return -1;
 	}
 	return bpf_map__fd(map);
@@ -312,6 +395,7 @@ const char argp_program_doc[] = "BPF selftests test runner";
 enum ARG_KEYS {
 	ARG_TEST_NUM = 'n',
 	ARG_TEST_NAME = 't',
+	ARG_TEST_NAME_BLACKLIST = 'b',
 	ARG_VERIFIER_STATS = 's',
 	ARG_VERBOSE = 'v',
 };
@@ -319,22 +403,71 @@ enum ARG_KEYS {
 static const struct argp_option opts[] = {
 	{ "num", ARG_TEST_NUM, "NUM", 0,
 	  "Run test number NUM only " },
-	{ "name", ARG_TEST_NAME, "NAME", 0,
-	  "Run tests with names containing NAME" },
+	{ "name", ARG_TEST_NAME, "NAMES", 0,
+	  "Run tests with names containing any string from NAMES list" },
+	{ "name-blacklist", ARG_TEST_NAME_BLACKLIST, "NAMES", 0,
+	  "Don't run tests with names containing any string from NAMES list" },
 	{ "verifier-stats", ARG_VERIFIER_STATS, NULL, 0,
 	  "Output verifier statistics", },
 	{ "verbose", ARG_VERBOSE, "LEVEL", OPTION_ARG_OPTIONAL,
-	  "Verbose output (use -vv for extra verbose output)" },
+	  "Verbose output (use -vv or -vvv for progressively verbose output)" },
 	{},
 };
 
 static int libbpf_print_fn(enum libbpf_print_level level,
 			   const char *format, va_list args)
 {
-	if (!env.very_verbose && level == LIBBPF_DEBUG)
+	if (env.verbosity < VERBOSE_VERY && level == LIBBPF_DEBUG)
 		return 0;
-	vprintf(format, args);
+	vfprintf(stdout, format, args);
 	return 0;
+}
+
+static void free_str_set(const struct str_set *set)
+{
+	int i;
+
+	if (!set)
+		return;
+
+	for (i = 0; i < set->cnt; i++)
+		free((void *)set->strs[i]);
+	free(set->strs);
+}
+
+static int parse_str_list(const char *s, struct str_set *set)
+{
+	char *input, *state = NULL, *next, **tmp, **strs = NULL;
+	int cnt = 0;
+
+	input = strdup(s);
+	if (!input)
+		return -ENOMEM;
+
+	set->cnt = 0;
+	set->strs = NULL;
+
+	while ((next = strtok_r(state ? NULL : input, ",", &state))) {
+		tmp = realloc(strs, sizeof(*strs) * (cnt + 1));
+		if (!tmp)
+			goto err;
+		strs = tmp;
+
+		strs[cnt] = strdup(next);
+		if (!strs[cnt])
+			goto err;
+
+		cnt++;
+	}
+
+	set->cnt = cnt;
+	set->strs = (const char **)strs;
+	free(input);
+	return 0;
+err:
+	free(strs);
+	free(input);
+	return -ENOMEM;
 }
 
 int parse_num_list(const char *s, struct test_selector *sel)
@@ -398,6 +531,8 @@ int parse_num_list(const char *s, struct test_selector *sel)
 	return 0;
 }
 
+extern int extra_prog_load_log_flags;
+
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
 	struct test_env *env = state->input;
@@ -426,12 +561,24 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 
 		if (subtest_str) {
 			*subtest_str = '\0';
-			env->subtest_selector.name = strdup(subtest_str + 1);
-			if (!env->subtest_selector.name)
+			if (parse_str_list(subtest_str + 1,
+					   &env->subtest_selector.whitelist))
 				return -ENOMEM;
 		}
-		env->test_selector.name = strdup(arg);
-		if (!env->test_selector.name)
+		if (parse_str_list(arg, &env->test_selector.whitelist))
+			return -ENOMEM;
+		break;
+	}
+	case ARG_TEST_NAME_BLACKLIST: {
+		char *subtest_str = strchr(arg, '/');
+
+		if (subtest_str) {
+			*subtest_str = '\0';
+			if (parse_str_list(subtest_str + 1,
+					   &env->subtest_selector.blacklist))
+				return -ENOMEM;
+		}
+		if (parse_str_list(arg, &env->test_selector.blacklist))
 			return -ENOMEM;
 		break;
 	}
@@ -439,9 +586,14 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		env->verifier_stats = true;
 		break;
 	case ARG_VERBOSE:
+		env->verbosity = VERBOSE_NORMAL;
 		if (arg) {
 			if (strcmp(arg, "v") == 0) {
-				env->very_verbose = true;
+				env->verbosity = VERBOSE_VERY;
+				extra_prog_load_log_flags = 1;
+			} else if (strcmp(arg, "vv") == 0) {
+				env->verbosity = VERBOSE_SUPER;
+				extra_prog_load_log_flags = 2;
 			} else {
 				fprintf(stderr,
 					"Unrecognized verbosity setting ('%s'), only -v and -vv are supported\n",
@@ -449,7 +601,6 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 				return -EINVAL;
 			}
 		}
-		env->verbose = true;
 		break;
 	case ARGP_KEY_ARG:
 		argp_usage(state);
@@ -468,7 +619,7 @@ static void stdio_hijack(void)
 	env.stdout = stdout;
 	env.stderr = stderr;
 
-	if (env.verbose) {
+	if (env.verbosity > VERBOSE_NONE) {
 		/* nothing to do, output to stdout by default */
 		return;
 	}
@@ -527,8 +678,25 @@ int cd_flavor_subdir(const char *exec_name)
 	if (!flavor)
 		return 0;
 	flavor++;
-	printf("Switching to flavor '%s' subdirectory...\n", flavor);
+	fprintf(stdout, "Switching to flavor '%s' subdirectory...\n", flavor);
 	return chdir(flavor);
+}
+
+#define MAX_BACKTRACE_SZ 128
+void crash_handler(int signum)
+{
+	void *bt[MAX_BACKTRACE_SZ];
+	size_t sz;
+
+	sz = backtrace(bt, ARRAY_SIZE(bt));
+
+	if (env.test)
+		dump_test_log(env.test, true);
+	if (env.stdout)
+		stdio_restore();
+
+	fprintf(stderr, "Caught signal #%d!\nStack trace:\n", signum);
+	backtrace_symbols_fd(bt, sz, STDERR_FILENO);
 }
 
 int main(int argc, char **argv)
@@ -538,7 +706,13 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
+	struct sigaction sigact = {
+		.sa_handler = crash_handler,
+		.sa_flags = SA_RESETHAND,
+	};
 	int err, i;
+
+	sigaction(SIGSEGV, &sigact, NULL);
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, &env);
 	if (err)
@@ -553,12 +727,16 @@ int main(int argc, char **argv)
 	srand(time(NULL));
 
 	env.jit_enabled = is_jit_enabled();
+	env.nr_cpus = libbpf_num_possible_cpus();
+	if (env.nr_cpus < 0) {
+		fprintf(stderr, "Failed to get number of CPUs: %d!\n",
+			env.nr_cpus);
+		return -1;
+	}
 
 	stdio_hijack();
 	for (i = 0; i < prog_test_cnt; i++) {
 		struct prog_test_def *test = &prog_test_defs[i];
-		int old_pass_cnt = pass_cnt;
-		int old_error_cnt = error_cnt;
 
 		env.test = test;
 		test->test_num = i + 1;
@@ -573,8 +751,6 @@ int main(int argc, char **argv)
 			test__end_subtest();
 
 		test->tested = true;
-		test->pass_cnt = pass_cnt - old_pass_cnt;
-		test->error_cnt = error_cnt - old_error_cnt;
 		if (test->error_cnt)
 			env.fail_cnt++;
 		else
@@ -586,13 +762,21 @@ int main(int argc, char **argv)
 		fprintf(env.stdout, "#%d %s:%s\n",
 			test->test_num, test->test_name,
 			test->error_cnt ? "FAIL" : "OK");
+
+		reset_affinity();
+		if (test->need_cgroup_cleanup)
+			cleanup_cgroup_environment();
 	}
 	stdio_restore();
-	printf("Summary: %d/%d PASSED, %d SKIPPED, %d FAILED\n",
-	       env.succ_cnt, env.sub_succ_cnt, env.skip_cnt, env.fail_cnt);
+	fprintf(stdout, "Summary: %d/%d PASSED, %d SKIPPED, %d FAILED\n",
+		env.succ_cnt, env.sub_succ_cnt, env.skip_cnt, env.fail_cnt);
 
+	free_str_set(&env.test_selector.blacklist);
+	free_str_set(&env.test_selector.whitelist);
 	free(env.test_selector.num_set);
+	free_str_set(&env.subtest_selector.blacklist);
+	free_str_set(&env.subtest_selector.whitelist);
 	free(env.subtest_selector.num_set);
 
-	return error_cnt ? EXIT_FAILURE : EXIT_SUCCESS;
+	return env.fail_cnt ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -923,6 +923,7 @@ static void cmd_work_handler(struct work_struct *work)
 	/* Skip sending command to fw if internal error */
 	if (pci_channel_offline(dev->pdev) ||
 	    dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR ||
+	    cmd->state != MLX5_CMDIF_STATE_UP ||
 	    !opcode_allowed(&dev->cmd, ent->op)) {
 		u8 status = 0;
 		u32 drv_synd;
@@ -1399,49 +1400,19 @@ static void clean_debug_files(struct mlx5_core_dev *dev)
 	debugfs_remove_recursive(dbg->dbg_root);
 }
 
-static int create_debugfs_files(struct mlx5_core_dev *dev)
+static void create_debugfs_files(struct mlx5_core_dev *dev)
 {
 	struct mlx5_cmd_debug *dbg = &dev->cmd.dbg;
-	int err = -ENOMEM;
-
-	if (!mlx5_debugfs_root)
-		return 0;
 
 	dbg->dbg_root = debugfs_create_dir("cmd", dev->priv.dbg_root);
-	if (!dbg->dbg_root)
-		return err;
 
-	dbg->dbg_in = debugfs_create_file("in", 0400, dbg->dbg_root,
-					  dev, &dfops);
-	if (!dbg->dbg_in)
-		goto err_dbg;
-
-	dbg->dbg_out = debugfs_create_file("out", 0200, dbg->dbg_root,
-					   dev, &dfops);
-	if (!dbg->dbg_out)
-		goto err_dbg;
-
-	dbg->dbg_outlen = debugfs_create_file("out_len", 0600, dbg->dbg_root,
-					      dev, &olfops);
-	if (!dbg->dbg_outlen)
-		goto err_dbg;
-
-	dbg->dbg_status = debugfs_create_u8("status", 0600, dbg->dbg_root,
-					    &dbg->status);
-	if (!dbg->dbg_status)
-		goto err_dbg;
-
-	dbg->dbg_run = debugfs_create_file("run", 0200, dbg->dbg_root, dev, &fops);
-	if (!dbg->dbg_run)
-		goto err_dbg;
+	debugfs_create_file("in", 0400, dbg->dbg_root, dev, &dfops);
+	debugfs_create_file("out", 0200, dbg->dbg_root, dev, &dfops);
+	debugfs_create_file("out_len", 0600, dbg->dbg_root, dev, &olfops);
+	debugfs_create_u8("status", 0600, dbg->dbg_root, &dbg->status);
+	debugfs_create_file("run", 0200, dbg->dbg_root, dev, &fops);
 
 	mlx5_cmdif_debugfs_init(dev);
-
-	return 0;
-
-err_dbg:
-	clean_debug_files(dev);
-	return err;
 }
 
 void mlx5_cmd_allowed_opcode(struct mlx5_core_dev *dev, u16 opcode)
@@ -1742,6 +1713,7 @@ static int cmd_exec(struct mlx5_core_dev *dev, void *in, int in_size, void *out,
 	opcode = MLX5_GET(mbox_in, in, opcode);
 	if (pci_channel_offline(dev->pdev) ||
 	    dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR ||
+	    dev->cmd.state != MLX5_CMDIF_STATE_UP ||
 	    !opcode_allowed(&dev->cmd, opcode)) {
 		err = mlx5_internal_err_ret_value(dev, opcode, &drv_synd, &status);
 		MLX5_SET(mbox_out, out, status, status);
@@ -2013,6 +1985,7 @@ int mlx5_cmd_init(struct mlx5_core_dev *dev)
 		goto err_free_page;
 	}
 
+	cmd->state = MLX5_CMDIF_STATE_DOWN;
 	cmd->checksum_disabled = 1;
 	cmd->max_reg_cmds = (1 << cmd->log_sz) - 1;
 	cmd->bitmask = (1UL << cmd->max_reg_cmds) - 1;
@@ -2062,16 +2035,9 @@ int mlx5_cmd_init(struct mlx5_core_dev *dev)
 		goto err_cache;
 	}
 
-	err = create_debugfs_files(dev);
-	if (err) {
-		err = -ENOMEM;
-		goto err_wq;
-	}
+	create_debugfs_files(dev);
 
 	return 0;
-
-err_wq:
-	destroy_workqueue(cmd->wq);
 
 err_cache:
 	destroy_msg_cache(dev);
@@ -2099,3 +2065,10 @@ void mlx5_cmd_cleanup(struct mlx5_core_dev *dev)
 	kvfree(cmd->stats);
 }
 EXPORT_SYMBOL(mlx5_cmd_cleanup);
+
+void mlx5_cmd_set_state(struct mlx5_core_dev *dev,
+			enum mlx5_cmdif_state cmdif_state)
+{
+	dev->cmd.state = cmdif_state;
+}
+EXPORT_SYMBOL(mlx5_cmd_set_state);

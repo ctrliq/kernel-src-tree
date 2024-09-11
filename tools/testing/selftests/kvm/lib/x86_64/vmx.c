@@ -1,9 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * tools/testing/selftests/kvm/lib/x86_64/vmx.c
  *
  * Copyright (C) 2018, Google LLC.
- *
- * This work is licensed under the terms of the GNU GPL, version 2.
  */
 
 #include "test_util.h"
@@ -161,11 +160,11 @@ bool prepare_for_vmx_operation(struct vmx_pages *vmx)
 	 *  Bit 2: Enables VMXON outside of SMX operation. If clear, VMXON
 	 *    outside of SMX causes a #GP.
 	 */
-	required = FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX;
-	required |= FEATURE_CONTROL_LOCKED;
-	feature_control = rdmsr(MSR_IA32_FEATURE_CONTROL);
+	required = FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX;
+	required |= FEAT_CTL_LOCKED;
+	feature_control = rdmsr(MSR_IA32_FEAT_CTL);
 	if ((feature_control & required) != required)
-		wrmsr(MSR_IA32_FEATURE_CONTROL, feature_control | required);
+		wrmsr(MSR_IA32_FEAT_CTL, feature_control | required);
 
 	/* Enter VMX root operation. */
 	*(uint32_t *)(vmx->vmxon) = vmcs_revision();
@@ -380,12 +379,17 @@ void prepare_vmcs(struct vmx_pages *vmx, void *guest_rip, void *guest_rsp)
 	init_vmcs_guest_state(guest_rip, guest_rsp);
 }
 
-void nested_vmx_check_supported(void)
+bool nested_vmx_supported(void)
 {
 	struct kvm_cpuid_entry2 *entry = kvm_get_supported_cpuid_entry(1);
 
-	if (!(entry->ecx & CPUID_VMX)) {
-		fprintf(stderr, "nested VMX not enabled, skipping test\n");
+	return entry->ecx & CPUID_VMX;
+}
+
+void nested_vmx_check_supported(void)
+{
+	if (!nested_vmx_supported()) {
+		print_skip("nested VMX not enabled");
 		exit(KSFT_SKIP);
 	}
 }

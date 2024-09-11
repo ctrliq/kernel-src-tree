@@ -11,11 +11,12 @@
 #include "builtin.h"
 
 #include "util/parse-events.h"
-#include "util/cache.h"
 #include "util/pmu.h"
 #include "util/debug.h"
 #include "util/metricgroup.h"
+#include <subcmd/pager.h>
 #include <subcmd/parse-options.h>
+#include <stdio.h>
 
 static bool desc_flag = true;
 static bool details_flag;

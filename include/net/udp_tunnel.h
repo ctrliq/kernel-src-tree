@@ -67,9 +67,9 @@ typedef int (*udp_tunnel_encap_rcv_t)(struct sock *sk, struct sk_buff *skb);
 typedef int (*udp_tunnel_encap_err_lookup_t)(struct sock *sk,
 					     struct sk_buff *skb);
 typedef void (*udp_tunnel_encap_destroy_t)(struct sock *sk);
-typedef struct sk_buff **(*udp_tunnel_gro_receive_t)(struct sock *sk,
-						     struct sk_buff **head,
-						     struct sk_buff *skb);
+typedef struct sk_buff *(*udp_tunnel_gro_receive_t)(struct sock *sk,
+						    struct list_head *head,
+						    struct sk_buff *skb);
 typedef int (*udp_tunnel_gro_complete_t)(struct sock *sk, struct sk_buff *skb,
 					 int nhoff);
 

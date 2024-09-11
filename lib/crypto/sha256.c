@@ -16,8 +16,9 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/export.h>
 #include <linux/string.h>
-#include <crypto/sha256.h>
+#include <crypto/sha.h>
 #include <asm/unaligned.h>
 
 static inline u32 Ch(u32 x, u32 y, u32 z)
@@ -208,21 +209,6 @@ static void sha256_transform(u32 *state, const u8 *input)
 	memzero_explicit(W, 64 * sizeof(u32));
 }
 
-int sha256_init(struct sha256_state *sctx)
-{
-	sctx->state[0] = SHA256_H0;
-	sctx->state[1] = SHA256_H1;
-	sctx->state[2] = SHA256_H2;
-	sctx->state[3] = SHA256_H3;
-	sctx->state[4] = SHA256_H4;
-	sctx->state[5] = SHA256_H5;
-	sctx->state[6] = SHA256_H6;
-	sctx->state[7] = SHA256_H7;
-	sctx->count = 0;
-
-	return 0;
-}
-
 int sha256_update(struct sha256_state *sctx, const u8 *data, unsigned int len)
 {
 	unsigned int partial, done;
@@ -252,8 +238,15 @@ int sha256_update(struct sha256_state *sctx, const u8 *data, unsigned int len)
 
 	return 0;
 }
+EXPORT_SYMBOL(sha256_update);
 
-int sha256_final(struct sha256_state *sctx, u8 *out)
+int sha224_update(struct sha256_state *sctx, const u8 *data, unsigned int len)
+{
+	return sha256_update(sctx, data, len);
+}
+EXPORT_SYMBOL(sha224_update);
+
+static int __sha256_final(struct sha256_state *sctx, u8 *out, int digest_words)
 {
 	__be32 *dst = (__be32 *)out;
 	__be64 bits;
@@ -273,7 +266,7 @@ int sha256_final(struct sha256_state *sctx, u8 *out)
 	sha256_update(sctx, (const u8 *)&bits, sizeof(bits));
 
 	/* Store state in digest */
-	for (i = 0; i < 8; i++)
+	for (i = 0; i < digest_words; i++)
 		put_unaligned_be32(sctx->state[i], &dst[i]);
 
 	/* Zeroize sensitive information. */
@@ -281,3 +274,15 @@ int sha256_final(struct sha256_state *sctx, u8 *out)
 
 	return 0;
 }
+
+int sha256_final(struct sha256_state *sctx, u8 *out)
+{
+	return __sha256_final(sctx, out, 8);
+}
+EXPORT_SYMBOL(sha256_final);
+
+int sha224_final(struct sha256_state *sctx, u8 *out)
+{
+	return __sha256_final(sctx, out, 7);
+}
+EXPORT_SYMBOL(sha224_final);

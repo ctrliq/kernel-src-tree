@@ -134,7 +134,7 @@ static int e1000_mii_ioctl(struct net_device *netdev, struct ifreq *ifr,
 			   int cmd);
 static void e1000_enter_82542_rst(struct e1000_adapter *adapter);
 static void e1000_leave_82542_rst(struct e1000_adapter *adapter);
-static void e1000_tx_timeout(struct net_device *dev);
+static void e1000_tx_timeout(struct net_device *dev, unsigned int txqueue);
 static void e1000_reset_task(struct work_struct *work);
 static void e1000_smartspeed(struct e1000_adapter *adapter);
 static int e1000_82547_fifo_workaround(struct e1000_adapter *adapter,
@@ -3491,7 +3491,7 @@ exit:
  * e1000_tx_timeout - Respond to a Tx Hang
  * @netdev: network interface device structure
  **/
-static void e1000_tx_timeout(struct net_device *netdev)
+static void e1000_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 {
 	struct e1000_adapter *adapter = netdev_priv(netdev);
 
@@ -3568,8 +3568,8 @@ static int e1000_change_mtu(struct net_device *netdev, int new_mtu)
 	     (max_frame == MAXIMUM_ETHERNET_VLAN_SIZE)))
 		adapter->rx_buffer_len = MAXIMUM_ETHERNET_VLAN_SIZE;
 
-	netdev_dbg(netdev, "changing MTU from %d to %d\n",
-		   netdev->mtu, new_mtu);
+	pr_info("%s changing MTU from %d to %d\n",
+		netdev->name, netdev->mtu, new_mtu);
 	netdev->mtu = new_mtu;
 
 	if (netif_running(netdev))

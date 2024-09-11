@@ -616,22 +616,29 @@ static int ath10k_qmi_host_cap_send_sync(struct ath10k_qmi *qmi)
 {
 	struct wlfw_host_cap_resp_msg_v01 resp = {};
 	struct wlfw_host_cap_req_msg_v01 req = {};
+	struct qmi_elem_info *req_ei;
 	struct ath10k *ar = qmi->ar;
+	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
 	struct qmi_txn txn;
 	int ret;
 
 	req.daemon_support_valid = 1;
 	req.daemon_support = 0;
 
-	ret = qmi_txn_init(&qmi->qmi_hdl, &txn,
-			   wlfw_host_cap_resp_msg_v01_ei, &resp);
+	ret = qmi_txn_init(&qmi->qmi_hdl, &txn, wlfw_host_cap_resp_msg_v01_ei,
+			   &resp);
 	if (ret < 0)
 		goto out;
+
+	if (test_bit(ATH10K_SNOC_FLAG_8BIT_HOST_CAP_QUIRK, &ar_snoc->flags))
+		req_ei = wlfw_host_cap_8bit_req_msg_v01_ei;
+	else
+		req_ei = wlfw_host_cap_req_msg_v01_ei;
 
 	ret = qmi_send_request(&qmi->qmi_hdl, NULL, &txn,
 			       QMI_WLFW_HOST_CAP_REQ_V01,
 			       WLFW_HOST_CAP_REQ_MSG_V01_MAX_MSG_LEN,
-			       wlfw_host_cap_req_msg_v01_ei, &req);
+			       req_ei, &req);
 	if (ret < 0) {
 		qmi_txn_cancel(&txn);
 		ath10k_err(ar, "failed to send host capability request: %d\n", ret);
@@ -680,7 +687,7 @@ int ath10k_qmi_set_fw_log_mode(struct ath10k *ar, u8 fw_log_mode)
 			       wlfw_ini_req_msg_v01_ei, &req);
 	if (ret < 0) {
 		qmi_txn_cancel(&txn);
-		ath10k_err(ar, "fail to send fw log reqest: %d\n", ret);
+		ath10k_err(ar, "failed to send fw log request: %d\n", ret);
 		goto out;
 	}
 
@@ -689,7 +696,7 @@ int ath10k_qmi_set_fw_log_mode(struct ath10k *ar, u8 fw_log_mode)
 		goto out;
 
 	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
-		ath10k_err(ar, "fw log request rejectedr: %d\n",
+		ath10k_err(ar, "fw log request rejected: %d\n",
 			   resp.resp.error);
 		ret = -EINVAL;
 		goto out;

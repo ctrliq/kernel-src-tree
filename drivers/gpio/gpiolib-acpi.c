@@ -19,6 +19,7 @@
 #include <linux/pinctrl/pinctrl.h>
 
 #include "gpiolib.h"
+#include "gpiolib-acpi.h"
 
 static int run_edge_events_on_boot = -1;
 module_param(run_edge_events_on_boot, int, 0444);
@@ -289,15 +290,14 @@ static acpi_status acpi_gpiochip_alloc_event(struct acpi_resource *ares,
 	if (!handler)
 		return AE_OK;
 
-	desc = gpiochip_request_own_desc(chip, pin, "ACPI:Event");
+	desc = gpiochip_request_own_desc(chip, pin, "ACPI:Event",
+					 GPIO_ACTIVE_HIGH, GPIOD_IN);
 	if (IS_ERR(desc)) {
 		dev_err(chip->parent,
 			"Failed to request GPIO for pin 0x%04X, err %ld\n",
 			pin, PTR_ERR(desc));
 		return AE_OK;
 	}
-
-	gpiod_direction_input(desc);
 
 	ret = gpiochip_lock_as_irq(chip, pin);
 	if (ret) {
@@ -806,6 +806,16 @@ static struct gpio_desc *acpi_get_gpiod_by_index(struct acpi_device *adev,
 	return ret ? ERR_PTR(ret) : lookup.desc;
 }
 
+static bool acpi_can_fallback_to_crs(struct acpi_device *adev,
+				     const char *con_id)
+{
+	/* Never allow fallback if the device has properties */
+	if (acpi_dev_has_props(adev) || adev->driver_gpios)
+		return false;
+
+	return con_id == NULL;
+}
+
 struct gpio_desc *acpi_find_gpio(struct device *dev,
 				 const char *con_id,
 				 unsigned int idx,
@@ -931,6 +941,7 @@ int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index)
 			return PTR_ERR(desc);
 
 		if (info.gpioint && idx++ == index) {
+			unsigned long lflags = GPIO_LOOKUP_FLAGS_DEFAULT;
 			char label[32];
 			int irq;
 
@@ -942,7 +953,7 @@ int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index)
 				return irq;
 
 			snprintf(label, sizeof(label), "GpioInt() %d", index);
-			ret = gpiod_configure_flags(desc, label, 0, info.flags);
+			ret = gpiod_configure_flags(desc, label, lflags, info.flags);
 			if (ret < 0)
 				return ret;
 
@@ -1034,17 +1045,11 @@ acpi_gpio_adr_space_handler(u32 function, acpi_physical_address address,
 			enum gpiod_flags flags = acpi_gpio_to_gpiod_flags(agpio);
 			const char *label = "ACPI:OpRegion";
 
-			desc = gpiochip_request_own_desc(chip, pin, label);
+			desc = gpiochip_request_own_desc(chip, pin, label,
+							 GPIO_ACTIVE_HIGH,
+							 flags);
 			if (IS_ERR(desc)) {
 				status = AE_ERROR;
-				mutex_unlock(&achip->conn_lock);
-				goto out;
-			}
-
-			err = gpiod_configure_flags(desc, label, 0, flags);
-			if (err < 0) {
-				status = AE_NOT_CONFIGURED;
-				gpiochip_free_own_desc(desc);
 				mutex_unlock(&achip->conn_lock);
 				goto out;
 			}
@@ -1126,7 +1131,7 @@ acpi_gpiochip_parse_own_gpio(struct acpi_gpio_chip *achip,
 	u32 gpios[2];
 	int ret;
 
-	*lflags = 0;
+	*lflags = GPIO_LOOKUP_FLAGS_DEFAULT;
 	*dflags = 0;
 	*name = NULL;
 
@@ -1345,15 +1350,6 @@ int acpi_gpio_count(struct device *dev, const char *con_id)
 			count = crs_count;
 	}
 	return count ? count : -ENOENT;
-}
-
-bool acpi_can_fallback_to_crs(struct acpi_device *adev, const char *con_id)
-{
-	/* Never allow fallback if the device has properties */
-	if (acpi_dev_has_props(adev) || adev->driver_gpios)
-		return false;
-
-	return con_id == NULL;
 }
 
 /* Run deferred acpi_gpiochip_request_irqs() */

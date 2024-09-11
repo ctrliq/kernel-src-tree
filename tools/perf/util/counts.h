@@ -2,18 +2,12 @@
 #ifndef __PERF_COUNTS_H
 #define __PERF_COUNTS_H
 
-#include "xyarray.h"
+#include <linux/types.h>
+#include <internal/xyarray.h>
+#include <perf/evsel.h>
+#include <stdbool.h>
 
-struct perf_counts_values {
-	union {
-		struct {
-			u64 val;
-			u64 ena;
-			u64 run;
-		};
-		u64 values[3];
-	};
-};
+struct evsel;
 
 struct perf_counts {
 	s8			  scaled;
@@ -44,8 +38,8 @@ perf_counts__set_loaded(struct perf_counts *counts, int cpu, int thread, bool lo
 struct perf_counts *perf_counts__new(int ncpus, int nthreads);
 void perf_counts__delete(struct perf_counts *counts);
 
-void perf_evsel__reset_counts(struct perf_evsel *evsel);
-int perf_evsel__alloc_counts(struct perf_evsel *evsel, int ncpus, int nthreads);
-void perf_evsel__free_counts(struct perf_evsel *evsel);
+void perf_evsel__reset_counts(struct evsel *evsel);
+int perf_evsel__alloc_counts(struct evsel *evsel, int ncpus, int nthreads);
+void perf_evsel__free_counts(struct evsel *evsel);
 
 #endif /* __PERF_COUNTS_H */

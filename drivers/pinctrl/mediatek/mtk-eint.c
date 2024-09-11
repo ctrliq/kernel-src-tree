@@ -11,7 +11,7 @@
 
 #include <linux/delay.h>
 #include <linux/err.h>
-#include <linux/gpio/driver.h>
+#include <linux/gpio.h>
 #include <linux/io.h>
 #include <linux/irqdomain.h>
 #include <linux/of_irq.h>

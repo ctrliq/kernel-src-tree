@@ -26,7 +26,6 @@
 #include <linux/initrd.h>
 #include <linux/console.h>
 #include <linux/cache.h>
-#include <linux/bootmem.h>
 #include <linux/screen_info.h>
 #include <linux/init.h>
 #include <linux/kexec.h>
@@ -219,7 +218,7 @@ static void __init request_standard_resources(void)
 	num_standard_resources = memblock.memory.cnt;
 	standard_resources = memblock_alloc_low(num_standard_resources *
 					        sizeof(*standard_resources),
-					        0);
+					        SMP_CACHE_BYTES);
 
 	for_each_memblock(memory, region) {
 		res = &standard_resources[i++];

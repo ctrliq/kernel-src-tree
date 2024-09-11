@@ -34,7 +34,6 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/initrd.h>
-#include <linux/bootmem.h>
 #include <linux/root_dev.h>
 #include <linux/console.h>
 #include <linux/kernel_stat.h>
@@ -74,6 +73,7 @@
 #include <asm/nospec-branch.h>
 #include <asm/mem_detect.h>
 #include <asm/uv.h>
+#include <asm/asm-offsets.h>
 #include "entry.h"
 
 /*
@@ -93,10 +93,6 @@ char elf_platform[ELF_PLATFORM_SIZE];
 
 unsigned long int_hwcap = 0;
 
-#ifdef CONFIG_PROTECTED_VIRTUALIZATION_GUEST
-int __bootdata_preserved(prot_virt_guest);
-#endif
-
 int __bootdata(noexec_disabled);
 int __bootdata(memory_end_set);
 unsigned long __bootdata(memory_end);
@@ -111,6 +107,8 @@ unsigned long __bootdata_preserved(__etext_dma);
 unsigned long __bootdata_preserved(__sdma);
 unsigned long __bootdata_preserved(__edma);
 unsigned long __bootdata_preserved(__kaslr_offset);
+unsigned int __bootdata_preserved(zlib_dfltcc_support);
+EXPORT_SYMBOL(zlib_dfltcc_support);
 
 unsigned long VMALLOC_START;
 EXPORT_SYMBOL(VMALLOC_START);
@@ -322,7 +320,7 @@ static void __init setup_lowcore_dat_off(void)
 	 * Setup lowcore for boot cpu
 	 */
 	BUILD_BUG_ON(sizeof(struct lowcore) != LC_PAGES * PAGE_SIZE);
-	lc = memblock_virt_alloc_low(sizeof(*lc), sizeof(*lc));
+	lc = memblock_alloc_low(sizeof(*lc), sizeof(*lc));
 	lc->restart_psw.mask = PSW_KERNEL_BITS;
 	lc->restart_psw.addr = (unsigned long) restart_int_handler;
 	lc->external_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
@@ -340,10 +338,10 @@ static void __init setup_lowcore_dat_off(void)
 	lc->kernel_stack = ((unsigned long) &init_thread_union)
 		+ THREAD_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
 	lc->async_stack = (unsigned long)
-		memblock_virt_alloc(ASYNC_SIZE, ASYNC_SIZE)
+		memblock_alloc(ASYNC_SIZE, ASYNC_SIZE)
 		+ ASYNC_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
 	lc->panic_stack = (unsigned long)
-		memblock_virt_alloc(PAGE_SIZE, PAGE_SIZE)
+		memblock_alloc(PAGE_SIZE, PAGE_SIZE)
 		+ PAGE_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
 	lc->current_task = (unsigned long)&init_task;
 	lc->lpp = LPP_MAGIC;
@@ -365,7 +363,7 @@ static void __init setup_lowcore_dat_off(void)
 	lc->last_update_timer = S390_lowcore.last_update_timer;
 	lc->last_update_clock = S390_lowcore.last_update_clock;
 
-	restart_stack = memblock_virt_alloc(ASYNC_SIZE, ASYNC_SIZE);
+	restart_stack = memblock_alloc(ASYNC_SIZE, ASYNC_SIZE);
 	restart_stack += ASYNC_SIZE;
 
 	/*
@@ -391,6 +389,8 @@ static void __init setup_lowcore_dat_off(void)
 	arch_spin_lock_setup(0);
 #endif
 	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
+	lc->return_lpswe = gen_lpswe(__LC_RETURN_PSW);
+	lc->return_mcck_lpswe = gen_lpswe(__LC_RETURN_MCCK_PSW);
 
 	set_prefix((u32)(unsigned long) lc);
 	lowcore_ptr[0] = lc;
@@ -441,7 +441,7 @@ static void __init setup_resources(void)
 	bss_resource.end = (unsigned long) __bss_stop - 1;
 
 	for_each_memblock(memory, reg) {
-		res = memblock_virt_alloc(sizeof(*res), 8);
+		res = memblock_alloc(sizeof(*res), 8);
 		res->flags = IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM;
 
 		res->name = "System RAM";
@@ -455,7 +455,7 @@ static void __init setup_resources(void)
 			    std_res->start > res->end)
 				continue;
 			if (std_res->end > res->end) {
-				sub_res = memblock_virt_alloc(sizeof(*sub_res), 8);
+				sub_res = memblock_alloc(sizeof(*sub_res), 8);
 				*sub_res = *std_res;
 				sub_res->end = res->end;
 				std_res->start = res->end + 1;
@@ -499,6 +499,9 @@ static void __init setup_memory_end(void)
 		else
 			vmax = _REGION1_SIZE; /* 4-level kernel page table */
 	}
+
+	if (is_prot_virt_host())
+		adjust_to_uv_max(&vmax);
 
 	/* module area is at the end of the kernel address space. */
 	MODULES_END = vmax;
@@ -1076,6 +1079,8 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	memblock_trim_memory(1UL << (MAX_ORDER - 1 + PAGE_SHIFT));
 
+	if (is_prot_virt_host())
+		setup_uv();
 	setup_memory_end();
 	setup_memory();
 	dma_contiguous_reserve(memory_end);

@@ -12,6 +12,7 @@
 #include <linux/rhashtable.h>
 #include <net/netfilter/nf_flow_table.h>
 #include <net/netlink.h>
+#include <net/flow_offload.h>
 
 #define NFT_JUMP_STACK_SIZE	16
 
@@ -160,6 +161,7 @@ struct nft_ctx {
 	const struct nlattr * const 	*nla;
 	u32				portid;
 	u32				seq;
+	u16				flags;
 	u8				family;
 	u8				level;
 	bool				report;
@@ -749,6 +751,9 @@ enum nft_trans_phase {
 	NFT_TRANS_RELEASE
 };
 
+struct nft_flow_rule;
+struct nft_offload_ctx;
+
 /**
  *	struct nft_expr_ops - nf_tables expression operations
  *
@@ -791,6 +796,10 @@ struct nft_expr_ops {
 						    const struct nft_data **data);
 	bool				(*gc)(struct net *net,
 					      const struct nft_expr *expr);
+	int				(*offload)(struct nft_offload_ctx *ctx,
+						   struct nft_flow_rule *flow,
+						   const struct nft_expr *expr);
+	u32				offload_flags;
 	const struct nft_expr_type	*type;
 	void				*data;
 };
@@ -890,6 +899,7 @@ static inline struct nft_userdata *nft_userdata(const struct nft_rule *rule)
 
 enum nft_chain_flags {
 	NFT_BASE_CHAIN			= 0x1,
+	NFT_CHAIN_HW_OFFLOAD		= 0x2,
 };
 
 #define NFT_CHAIN_POLICY_UNSET		U8_MAX
@@ -976,20 +986,22 @@ struct nft_hook {
  *	struct nft_base_chain - nf_tables base chain
  *
  *	@ops: netfilter hook ops
+ *	@hook_list: list of netfilter hooks (for NFPROTO_NETDEV family)
  *	@type: chain type
  *	@policy: default policy
  *	@stats: per-cpu chain stats
  *	@chain: the chain
- *	@dev_name: device name that this base chain is attached to (if any)
+ *	@flow_block: flow block (for hardware offload)
  */
 struct nft_base_chain {
 	struct nf_hook_ops		ops;
+	struct list_head		hook_list;
 	const struct nft_chain_type	*type;
 	u8				policy;
 	u8				flags;
 	struct nft_stats __percpu	*stats;
 	struct nft_chain		chain;
-	char 				dev_name[IFNAMSIZ];
+	struct flow_block		flow_block;
 };
 
 static inline struct nft_base_chain *nft_base_chain(const struct nft_chain *chain)
@@ -1345,23 +1357,28 @@ static inline void nft_set_elem_clear_busy(struct nft_set_ext *ext)
  *
  *	@list: used internally
  *	@msg_type: message type
+ *	@put_net: ctx->net needs to be put
  *	@ctx: transaction context
  *	@data: internal information related to the transaction
  */
 struct nft_trans {
 	struct list_head		list;
 	int				msg_type;
+	bool				put_net;
 	struct nft_ctx			ctx;
 	char				data[0];
 };
 
 struct nft_trans_rule {
 	struct nft_rule			*rule;
+	struct nft_flow_rule		*flow;
 	u32				rule_id;
 };
 
 #define nft_trans_rule(trans)	\
 	(((struct nft_trans_rule *)trans->data)->rule)
+#define nft_trans_flow_rule(trans)	\
+	(((struct nft_trans_rule *)trans->data)->flow)
 #define nft_trans_rule_id(trans)	\
 	(((struct nft_trans_rule *)trans->data)->rule_id)
 
@@ -1434,4 +1451,6 @@ struct nft_trans_flowtable {
 int __init nft_chain_filter_init(void);
 void nft_chain_filter_fini(void);
 
+void __init nft_chain_route_init(void);
+void nft_chain_route_fini(void);
 #endif /* _NET_NF_TABLES_H */

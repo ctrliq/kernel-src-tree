@@ -548,12 +548,13 @@ static void remove_link(struct snd_soc_component *comp,
 	if (dobj->ops && dobj->ops->link_unload)
 		dobj->ops->link_unload(comp, dobj);
 
+	list_del(&dobj->list);
+	snd_soc_remove_pcm_runtime(comp->card,
+			snd_soc_get_pcm_runtime(comp->card, link));
+
 	kfree(link->name);
 	kfree(link->stream_name);
 	kfree(link->cpus->dai_name);
-
-	list_del(&dobj->list);
-	snd_soc_remove_dai_link(comp->card, link);
 	kfree(link);
 }
 
@@ -1989,7 +1990,7 @@ static int soc_tplg_fe_link_create(struct soc_tplg *tplg,
 		goto err;
 	}
 
-	ret = snd_soc_add_dai_link(tplg->comp->card, link);
+	ret = snd_soc_add_pcm_runtime(tplg->comp->card, link);
 	if (ret < 0) {
 		dev_err(tplg->comp->dev, "ASoC: adding FE link failed\n");
 		goto err;

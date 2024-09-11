@@ -10,6 +10,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/mm.h>
 #include <asm/vas.h>
 #include <uapi/asm/vas-api.h>
 #include "vas.h"

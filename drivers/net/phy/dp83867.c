@@ -12,6 +12,8 @@
 #include <linux/of.h>
 #include <linux/phy.h>
 #include <linux/delay.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
 
 #include <dt-bindings/net/ti-dp83867.h>
 
@@ -21,11 +23,13 @@
 #define MII_DP83867_PHYCTRL	0x10
 #define MII_DP83867_MICR	0x12
 #define MII_DP83867_ISR		0x13
-#define DP83867_CTRL		0x1f
+#define DP83867_CFG2		0x14
 #define DP83867_CFG3		0x1e
+#define DP83867_CTRL		0x1f
 
 /* Extended Registers */
-#define DP83867_CFG4            0x0031
+#define DP83867_FLD_THR_CFG	0x002e
+#define DP83867_CFG4		0x0031
 #define DP83867_CFG4_SGMII_ANEG_MASK (BIT(5) | BIT(6))
 #define DP83867_CFG4_SGMII_ANEG_TIMER_11MS   (3 << 5)
 #define DP83867_CFG4_SGMII_ANEG_TIMER_800US  (2 << 5)
@@ -34,8 +38,17 @@
 
 #define DP83867_RGMIICTL	0x0032
 #define DP83867_STRAP_STS1	0x006E
+#define DP83867_STRAP_STS2	0x006f
 #define DP83867_RGMIIDCTL	0x0086
+#define DP83867_RXFCFG		0x0134
+#define DP83867_RXFPMD1	0x0136
+#define DP83867_RXFPMD2	0x0137
+#define DP83867_RXFPMD3	0x0138
+#define DP83867_RXFSOP1	0x0139
+#define DP83867_RXFSOP2	0x013A
+#define DP83867_RXFSOP3	0x013B
 #define DP83867_IO_MUX_CFG	0x0170
+#define DP83867_SGMIICTL	0x00D3
 #define DP83867_10M_SGMII_CFG   0x016F
 #define DP83867_10M_SGMII_RATE_ADAPT_MASK BIT(7)
 
@@ -60,8 +73,26 @@
 #define DP83867_RGMII_TX_CLK_DELAY_EN		BIT(1)
 #define DP83867_RGMII_RX_CLK_DELAY_EN		BIT(0)
 
+/* SGMIICTL bits */
+#define DP83867_SGMII_TYPE		BIT(14)
+
+/* RXFCFG bits*/
+#define DP83867_WOL_MAGIC_EN		BIT(0)
+#define DP83867_WOL_BCAST_EN		BIT(2)
+#define DP83867_WOL_UCAST_EN		BIT(4)
+#define DP83867_WOL_SEC_EN		BIT(5)
+#define DP83867_WOL_ENH_MAC		BIT(7)
+
 /* STRAP_STS1 bits */
 #define DP83867_STRAP_STS1_RESERVED		BIT(11)
+
+/* STRAP_STS2 bits */
+#define DP83867_STRAP_STS2_CLK_SKEW_TX_MASK	GENMASK(6, 4)
+#define DP83867_STRAP_STS2_CLK_SKEW_TX_SHIFT	4
+#define DP83867_STRAP_STS2_CLK_SKEW_RX_MASK	GENMASK(2, 0)
+#define DP83867_STRAP_STS2_CLK_SKEW_RX_SHIFT	0
+#define DP83867_STRAP_STS2_CLK_SKEW_NONE	BIT(2)
+#define DP83867_STRAP_STS2_STRAP_FLD		BIT(10)
 
 /* PHY CTRL bits */
 #define DP83867_PHYCR_TX_FIFO_DEPTH_SHIFT	14
@@ -73,11 +104,16 @@
 #define DP83867_PHYCR_FORCE_LINK_GOOD		BIT(10)
 
 /* RGMIIDCTL bits */
+#define DP83867_RGMII_TX_CLK_DELAY_MAX		0xf
 #define DP83867_RGMII_TX_CLK_DELAY_SHIFT	4
+#define DP83867_RGMII_TX_CLK_DELAY_INV	(DP83867_RGMII_TX_CLK_DELAY_MAX + 1)
+#define DP83867_RGMII_RX_CLK_DELAY_MAX		0xf
+#define DP83867_RGMII_RX_CLK_DELAY_SHIFT	0
+#define DP83867_RGMII_RX_CLK_DELAY_INV	(DP83867_RGMII_RX_CLK_DELAY_MAX + 1)
+
 
 /* IO_MUX_CFG bits */
-#define DP83867_IO_MUX_CFG_IO_IMPEDANCE_CTRL	0x1f
-
+#define DP83867_IO_MUX_CFG_IO_IMPEDANCE_MASK	0x1f
 #define DP83867_IO_MUX_CFG_IO_IMPEDANCE_MAX	0x0
 #define DP83867_IO_MUX_CFG_IO_IMPEDANCE_MIN	0x1f
 #define DP83867_IO_MUX_CFG_CLK_O_DISABLE	BIT(6)
@@ -90,6 +126,9 @@
 
 /* CFG4 bits */
 #define DP83867_CFG4_PORT_MIRROR_EN              BIT(0)
+
+/* FLD_THR_CFG */
+#define DP83867_FLD_THR_CFG_ENERGY_LOST_THR_MASK	0x7
 
 enum {
 	DP83867_PORT_MIRROING_KEEP,
@@ -107,6 +146,7 @@ struct dp83867_private {
 	bool rxctrl_strap_quirk;
 	bool set_clk_output;
 	u32 clk_output_sel;
+	bool sgmii_ref_clk_en;
 };
 
 static int dp83867_ack_interrupt(struct phy_device *phydev)
@@ -117,6 +157,115 @@ static int dp83867_ack_interrupt(struct phy_device *phydev)
 		return err;
 
 	return 0;
+}
+
+static int dp83867_set_wol(struct phy_device *phydev,
+			   struct ethtool_wolinfo *wol)
+{
+	struct net_device *ndev = phydev->attached_dev;
+	u16 val_rxcfg, val_micr;
+	u8 *mac;
+
+	val_rxcfg = phy_read_mmd(phydev, DP83867_DEVADDR, DP83867_RXFCFG);
+	val_micr = phy_read(phydev, MII_DP83867_MICR);
+
+	if (wol->wolopts & (WAKE_MAGIC | WAKE_MAGICSECURE | WAKE_UCAST |
+			    WAKE_BCAST)) {
+		val_rxcfg |= DP83867_WOL_ENH_MAC;
+		val_micr |= MII_DP83867_MICR_WOL_INT_EN;
+
+		if (wol->wolopts & WAKE_MAGIC) {
+			mac = (u8 *)ndev->dev_addr;
+
+			if (!is_valid_ether_addr(mac))
+				return -EINVAL;
+
+			phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RXFPMD1,
+				      (mac[1] << 8 | mac[0]));
+			phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RXFPMD2,
+				      (mac[3] << 8 | mac[2]));
+			phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RXFPMD3,
+				      (mac[5] << 8 | mac[4]));
+
+			val_rxcfg |= DP83867_WOL_MAGIC_EN;
+		} else {
+			val_rxcfg &= ~DP83867_WOL_MAGIC_EN;
+		}
+
+		if (wol->wolopts & WAKE_MAGICSECURE) {
+			phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RXFSOP1,
+				      (wol->sopass[1] << 8) | wol->sopass[0]);
+			phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RXFSOP1,
+				      (wol->sopass[3] << 8) | wol->sopass[2]);
+			phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RXFSOP1,
+				      (wol->sopass[5] << 8) | wol->sopass[4]);
+
+			val_rxcfg |= DP83867_WOL_SEC_EN;
+		} else {
+			val_rxcfg &= ~DP83867_WOL_SEC_EN;
+		}
+
+		if (wol->wolopts & WAKE_UCAST)
+			val_rxcfg |= DP83867_WOL_UCAST_EN;
+		else
+			val_rxcfg &= ~DP83867_WOL_UCAST_EN;
+
+		if (wol->wolopts & WAKE_BCAST)
+			val_rxcfg |= DP83867_WOL_BCAST_EN;
+		else
+			val_rxcfg &= ~DP83867_WOL_BCAST_EN;
+	} else {
+		val_rxcfg &= ~DP83867_WOL_ENH_MAC;
+		val_micr &= ~MII_DP83867_MICR_WOL_INT_EN;
+	}
+
+	phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RXFCFG, val_rxcfg);
+	phy_write(phydev, MII_DP83867_MICR, val_micr);
+
+	return 0;
+}
+
+static void dp83867_get_wol(struct phy_device *phydev,
+			    struct ethtool_wolinfo *wol)
+{
+	u16 value, sopass_val;
+
+	wol->supported = (WAKE_UCAST | WAKE_BCAST | WAKE_MAGIC |
+			WAKE_MAGICSECURE);
+	wol->wolopts = 0;
+
+	value = phy_read_mmd(phydev, DP83867_DEVADDR, DP83867_RXFCFG);
+
+	if (value & DP83867_WOL_UCAST_EN)
+		wol->wolopts |= WAKE_UCAST;
+
+	if (value & DP83867_WOL_BCAST_EN)
+		wol->wolopts |= WAKE_BCAST;
+
+	if (value & DP83867_WOL_MAGIC_EN)
+		wol->wolopts |= WAKE_MAGIC;
+
+	if (value & DP83867_WOL_SEC_EN) {
+		sopass_val = phy_read_mmd(phydev, DP83867_DEVADDR,
+					  DP83867_RXFSOP1);
+		wol->sopass[0] = (sopass_val & 0xff);
+		wol->sopass[1] = (sopass_val >> 8);
+
+		sopass_val = phy_read_mmd(phydev, DP83867_DEVADDR,
+					  DP83867_RXFSOP2);
+		wol->sopass[2] = (sopass_val & 0xff);
+		wol->sopass[3] = (sopass_val >> 8);
+
+		sopass_val = phy_read_mmd(phydev, DP83867_DEVADDR,
+					  DP83867_RXFSOP3);
+		wol->sopass[4] = (sopass_val & 0xff);
+		wol->sopass[5] = (sopass_val >> 8);
+
+		wol->wolopts |= WAKE_MAGICSECURE;
+	}
+
+	if (!(value & DP83867_WOL_ENH_MAC))
+		wol->wolopts = 0;
 }
 
 static int dp83867_config_intr(struct phy_device *phydev)
@@ -157,6 +306,48 @@ static int dp83867_config_port_mirroring(struct phy_device *phydev)
 	return 0;
 }
 
+static int dp83867_verify_rgmii_cfg(struct phy_device *phydev)
+{
+	struct dp83867_private *dp83867 = phydev->priv;
+
+	/* Existing behavior was to use default pin strapping delay in rgmii
+	 * mode, but rgmii should have meant no delay.  Warn existing users.
+	 */
+	if (phydev->interface == PHY_INTERFACE_MODE_RGMII) {
+		const u16 val = phy_read_mmd(phydev, DP83867_DEVADDR,
+					     DP83867_STRAP_STS2);
+		const u16 txskew = (val & DP83867_STRAP_STS2_CLK_SKEW_TX_MASK) >>
+				   DP83867_STRAP_STS2_CLK_SKEW_TX_SHIFT;
+		const u16 rxskew = (val & DP83867_STRAP_STS2_CLK_SKEW_RX_MASK) >>
+				   DP83867_STRAP_STS2_CLK_SKEW_RX_SHIFT;
+
+		if (txskew != DP83867_STRAP_STS2_CLK_SKEW_NONE ||
+		    rxskew != DP83867_STRAP_STS2_CLK_SKEW_NONE)
+			phydev_warn(phydev,
+				    "PHY has delays via pin strapping, but phy-mode = 'rgmii'\n"
+				    "Should be 'rgmii-id' to use internal delays txskew:%x rxskew:%x\n",
+				    txskew, rxskew);
+	}
+
+	/* RX delay *must* be specified if internal delay of RX is used. */
+	if ((phydev->interface == PHY_INTERFACE_MODE_RGMII_ID ||
+	     phydev->interface == PHY_INTERFACE_MODE_RGMII_RXID) &&
+	     dp83867->rx_id_delay == DP83867_RGMII_RX_CLK_DELAY_INV) {
+		phydev_err(phydev, "ti,rx-internal-delay must be specified\n");
+		return -EINVAL;
+	}
+
+	/* TX delay *must* be specified if internal delay of TX is used. */
+	if ((phydev->interface == PHY_INTERFACE_MODE_RGMII_ID ||
+	     phydev->interface == PHY_INTERFACE_MODE_RGMII_TXID) &&
+	     dp83867->tx_id_delay == DP83867_RGMII_TX_CLK_DELAY_INV) {
+		phydev_err(phydev, "ti,tx-internal-delay must be specified\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 #ifdef CONFIG_OF_MDIO
 static int dp83867_of_init(struct phy_device *phydev)
 {
@@ -167,8 +358,6 @@ static int dp83867_of_init(struct phy_device *phydev)
 
 	if (!of_node)
 		return -ENODEV;
-
-	dp83867->io_impedance = -EINVAL;
 
 	/* Optional configuration */
 	ret = of_property_read_u32(of_node, "ti,clk-output-sel",
@@ -191,23 +380,35 @@ static int dp83867_of_init(struct phy_device *phydev)
 		dp83867->io_impedance = DP83867_IO_MUX_CFG_IO_IMPEDANCE_MAX;
 	else if (of_property_read_bool(of_node, "ti,min-output-impedance"))
 		dp83867->io_impedance = DP83867_IO_MUX_CFG_IO_IMPEDANCE_MIN;
+	else
+		dp83867->io_impedance = -1; /* leave at default */
 
 	dp83867->rxctrl_strap_quirk = of_property_read_bool(of_node,
 					"ti,dp83867-rxctrl-strap-quirk");
 
+	dp83867->sgmii_ref_clk_en = of_property_read_bool(of_node,
+					"ti,sgmii-ref-clock-output-enable");
+
+
+	dp83867->rx_id_delay = DP83867_RGMII_RX_CLK_DELAY_INV;
 	ret = of_property_read_u32(of_node, "ti,rx-internal-delay",
 				   &dp83867->rx_id_delay);
-	if (ret &&
-	    (phydev->interface == PHY_INTERFACE_MODE_RGMII_ID ||
-	     phydev->interface == PHY_INTERFACE_MODE_RGMII_RXID))
-		return ret;
+	if (!ret && dp83867->rx_id_delay > DP83867_RGMII_RX_CLK_DELAY_MAX) {
+		phydev_err(phydev,
+			   "ti,rx-internal-delay value of %u out of range\n",
+			   dp83867->rx_id_delay);
+		return -EINVAL;
+	}
 
+	dp83867->tx_id_delay = DP83867_RGMII_TX_CLK_DELAY_INV;
 	ret = of_property_read_u32(of_node, "ti,tx-internal-delay",
 				   &dp83867->tx_id_delay);
-	if (ret &&
-	    (phydev->interface == PHY_INTERFACE_MODE_RGMII_ID ||
-	     phydev->interface == PHY_INTERFACE_MODE_RGMII_TXID))
-		return ret;
+	if (!ret && dp83867->tx_id_delay > DP83867_RGMII_TX_CLK_DELAY_MAX) {
+		phydev_err(phydev,
+			   "ti,tx-internal-delay value of %u out of range\n",
+			   dp83867->tx_id_delay);
+		return -EINVAL;
+	}
 
 	if (of_property_read_bool(of_node, "enet-phy-lane-swap"))
 		dp83867->port_mirroring = DP83867_PORT_MIRROING_EN;
@@ -271,10 +472,28 @@ static int dp83867_config_init(struct phy_device *phydev)
 	int ret, val, bs;
 	u16 delay;
 
+	ret = dp83867_verify_rgmii_cfg(phydev);
+	if (ret)
+		return ret;
+
 	/* RX_DV/RX_CTRL strapped in mode 1 or mode 2 workaround */
 	if (dp83867->rxctrl_strap_quirk)
 		phy_clear_bits_mmd(phydev, DP83867_DEVADDR, DP83867_CFG4,
 				   BIT(7));
+
+	bs = phy_read_mmd(phydev, DP83867_DEVADDR, DP83867_STRAP_STS2);
+	if (bs & DP83867_STRAP_STS2_STRAP_FLD) {
+		/* When using strap to enable FLD, the ENERGY_LOST_FLD_THR will
+		 * be set to 0x2. This may causes the PHY link to be unstable -
+		 * the default value 0x1 need to be restored.
+		 */
+		ret = phy_modify_mmd(phydev, DP83867_DEVADDR,
+				     DP83867_FLD_THR_CFG,
+				     DP83867_FLD_THR_CFG_ENERGY_LOST_THR_MASK,
+				     0x1);
+		if (ret)
+			return ret;
+	}
 
 	if (phy_interface_is_rgmii(phydev) ||
 	    phydev->interface == PHY_INTERFACE_MODE_SGMII) {
@@ -320,9 +539,16 @@ static int dp83867_config_init(struct phy_device *phydev)
 		if (ret)
 			return ret;
 
-		/* Set up RGMII delays */
+		/* If rgmii mode with no internal delay is selected, we do NOT use
+		 * aligned mode as one might expect.  Instead we use the PHY's default
+		 * based on pin strapping.  And the "mode 0" default is to *use*
+		 * internal delay with a value of 7 (2.00 ns).
+		 *
+		 * Set up RGMII delays
+		*/
 		val = phy_read_mmd(phydev, DP83867_DEVADDR, DP83867_RGMIICTL);
 
+		val &= ~(DP83867_RGMII_TX_CLK_DELAY_EN | DP83867_RGMII_RX_CLK_DELAY_EN);
 		if (phydev->interface == PHY_INTERFACE_MODE_RGMII_ID)
 			val |= (DP83867_RGMII_TX_CLK_DELAY_EN | DP83867_RGMII_RX_CLK_DELAY_EN);
 
@@ -334,18 +560,22 @@ static int dp83867_config_init(struct phy_device *phydev)
 
 		phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RGMIICTL, val);
 
-		delay = (dp83867->rx_id_delay |
-			(dp83867->tx_id_delay << DP83867_RGMII_TX_CLK_DELAY_SHIFT));
+		delay = 0;
+		if (dp83867->rx_id_delay != DP83867_RGMII_RX_CLK_DELAY_INV)
+			delay |= dp83867->rx_id_delay;
+		if (dp83867->tx_id_delay != DP83867_RGMII_TX_CLK_DELAY_INV)
+			delay |= dp83867->tx_id_delay <<
+				 DP83867_RGMII_TX_CLK_DELAY_SHIFT;
 
 		phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RGMIIDCTL,
 			      delay);
-
-		if (dp83867->io_impedance >= 0)
-			phy_modify_mmd(phydev, DP83867_DEVADDR, DP83867_IO_MUX_CFG,
-				       DP83867_IO_MUX_CFG_IO_IMPEDANCE_CTRL,
-				       dp83867->io_impedance &
-				       DP83867_IO_MUX_CFG_IO_IMPEDANCE_CTRL);
 	}
+
+	/* If specified, set io impedance */
+	if (dp83867->io_impedance >= 0)
+		phy_modify_mmd(phydev, DP83867_DEVADDR, DP83867_IO_MUX_CFG,
+			       DP83867_IO_MUX_CFG_IO_IMPEDANCE_MASK,
+			       dp83867->io_impedance);
 
 	if (phydev->interface == PHY_INTERFACE_MODE_SGMII) {
 		/* For support SPEED_10 in SGMII mode
@@ -372,6 +602,17 @@ static int dp83867_config_init(struct phy_device *phydev)
 
 		if (ret)
 			return ret;
+
+		val = phy_read_mmd(phydev, DP83867_DEVADDR, DP83867_SGMIICTL);
+		/* SGMII type is set to 4-wire mode by default.
+		 * If we place appropriate property in dts (see above)
+		 * switch on 6-wire mode.
+		 */
+		if (dp83867->sgmii_ref_clk_en)
+			val |= DP83867_SGMII_TYPE;
+		else
+			val &= ~DP83867_SGMII_TYPE;
+		phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_SGMIICTL, val);
 	}
 
 	val = phy_read(phydev, DP83867_CFG3);
@@ -432,6 +673,9 @@ static struct phy_driver dp83867_driver[] = {
 		.probe          = dp83867_probe,
 		.config_init	= dp83867_config_init,
 		.soft_reset	= dp83867_phy_reset,
+
+		.get_wol	= dp83867_get_wol,
+		.set_wol	= dp83867_set_wol,
 
 		/* IRQ related */
 		.ack_interrupt	= dp83867_ack_interrupt,

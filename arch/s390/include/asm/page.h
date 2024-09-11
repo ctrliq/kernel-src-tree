@@ -153,6 +153,11 @@ static inline int devmem_is_allowed(unsigned long pfn)
 #define HAVE_ARCH_FREE_PAGE
 #define HAVE_ARCH_ALLOC_PAGE
 
+#if IS_ENABLED(CONFIG_PGSTE)
+int arch_make_page_accessible(struct page *page);
+#define HAVE_ARCH_MAKE_PAGE_ACCESSIBLE
+#endif
+
 #endif /* !__ASSEMBLY__ */
 
 #define __PAGE_OFFSET		0x0UL
@@ -178,8 +183,6 @@ static inline int devmem_is_allowed(unsigned long pfn)
 
 #define VM_DATA_DEFAULT_FLAGS	(VM_READ | VM_WRITE | \
 				 VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)
-
-#define ARCH_ZONE_DMA_BITS	31
 
 #include <asm-generic/memory_model.h>
 #include <asm-generic/getorder.h>

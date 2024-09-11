@@ -203,6 +203,7 @@ static void pseries_cpu_die(unsigned int cpu)
 	int tries;
 	int cpu_status = 1;
 	unsigned int pcpu = get_hard_smp_processor_id(cpu);
+	unsigned long timeout = jiffies + msecs_to_jiffies(120000);
 
 	if (get_preferred_offline_state(cpu) == CPU_STATE_INACTIVE) {
 		cpu_status = 1;
@@ -214,13 +215,19 @@ static void pseries_cpu_die(unsigned int cpu)
 			msleep(1);
 		}
 	} else if (get_preferred_offline_state(cpu) == CPU_STATE_OFFLINE) {
-
-		for (tries = 0; tries < 25; tries++) {
+		while (true) {
 			cpu_status = smp_query_cpu_stopped(pcpu);
 			if (cpu_status == QCSS_STOPPED ||
 			    cpu_status == QCSS_HARDWARE_ERROR)
 				break;
-			cpu_relax();
+
+			if (time_after(jiffies, timeout)) {
+				pr_warn("CPU %i (hwid %i) didn't die after 120 seconds\n",
+					cpu, pcpu);
+				timeout = jiffies + msecs_to_jiffies(120000);
+			}
+
+			cond_resched();
 		}
 	}
 

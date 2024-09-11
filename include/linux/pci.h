@@ -44,6 +44,13 @@
 
 #include <linux/rh_kabi.h>
 
+#define PCI_STATUS_ERROR_BITS (PCI_STATUS_DETECTED_PARITY  | \
+			       PCI_STATUS_SIG_SYSTEM_ERROR | \
+			       PCI_STATUS_REC_MASTER_ABORT | \
+			       PCI_STATUS_REC_TARGET_ABORT | \
+			       PCI_STATUS_SIG_TARGET_ABORT | \
+			       PCI_STATUS_PARITY)
+
 /*
  * The PCI interface treats multi-function devices as independent
  * devices.  The slot/function address of each device is encoded
@@ -154,6 +161,8 @@ static inline const char *pci_power_name(pci_power_t state)
 }
 
 /**
+ * typedef pci_channel_state_t
+ *
  * The pci_channel state describes connectivity between the CPU and
  * the PCI device.  If some PCI bus between here and the PCI device
  * has crashed or locked up, this info is reflected here.
@@ -261,6 +270,7 @@ enum pci_bus_speed {
 	PCIE_SPEED_5_0GT		= 0x15,
 	PCIE_SPEED_8_0GT		= 0x16,
 	PCIE_SPEED_16_0GT		= 0x17,
+	PCIE_SPEED_32_0GT		= 0x18,
 	PCI_SPEED_UNKNOWN		= 0xff,
 };
 
@@ -283,7 +293,6 @@ struct irq_affinity;
 struct pcie_link_state;
 struct pci_vpd;
 struct pci_sriov;
-struct pci_ats;
 struct pci_p2pdma;
 
 struct pci_dev_extended_rh {
@@ -406,11 +415,12 @@ struct pci_dev {
 	unsigned int	is_hotplug_bridge:1;
 	unsigned int	shpc_managed:1;		/* SHPC owned by shpchp */
 	unsigned int	is_thunderbolt:1;	/* Thunderbolt controller */
-	unsigned int	__aer_firmware_first_valid:1;
-	unsigned int	__aer_firmware_first:1;
+	RH_KABI_DEPRECATE(unsigned int,	__aer_firmware_first_valid:1)
+	RH_KABI_DEPRECATE(unsigned int,	__aer_firmware_first:1)
 	unsigned int	broken_intx_masking:1;	/* INTx masking can't be used */
 	unsigned int	io_window_1k:1;		/* Intel bridge 1K I/O windows */
 	unsigned int	irq_managed:1;
+	unsigned int	has_secondary_link:1;
 	unsigned int	non_compliant_bars:1;	/* Broken BARs; ignore them */
 	unsigned int	is_probed:1;		/* Device probing in progress */
 	unsigned int	link_active_reporting:1;/* Device capable of reporting link active */
@@ -426,6 +436,12 @@ struct pci_dev {
 	RH_KABI_FILL_HOLE(unsigned int	io_window:1)	/* Bridge has I/O window */
 	RH_KABI_FILL_HOLE(unsigned int	pref_window:1)	/* Bridge has pref mem window */
 	RH_KABI_FILL_HOLE(unsigned int	pref_64_window:1)/* Pref mem window is 64-bit */
+#ifdef CONFIG_PCI_PRI
+	RH_KABI_FILL_HOLE(unsigned int  pasid_required:1) /* PRG Response PASID Required */
+#endif
+#ifdef CONFIG_PCIE_DPC
+	RH_KABI_FILL_HOLE(unsigned int	dpc_rp_extensions:1)
+#endif
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -448,11 +464,6 @@ struct pci_dev {
 	const struct attribute_group **msi_irq_groups;
 #endif
 	struct pci_vpd *vpd;
-#ifdef CONFIG_PCIE_DPC
-	u16		dpc_cap;
-	unsigned int	dpc_rp_extensions:1;
-	u8		dpc_rp_log_size;
-#endif
 #ifdef CONFIG_PCI_ATS
 	union {
 		struct pci_sriov	*sriov;		/* PF: SR-IOV info */
@@ -460,14 +471,12 @@ struct pci_dev {
 	};
 	u16		ats_cap;	/* ATS Capability offset */
 	u8		ats_stu;	/* ATS Smallest Translation Unit */
+	RH_KABI_DEPRECATE(atomic_t, ats_ref_cnt)
 #endif
 #ifdef CONFIG_PCI_PRI
-	u16		pri_cap;	/* PRI Capability offset */
 	u32		pri_reqs_alloc; /* Number of PRI requests allocated */
-	unsigned int	pasid_required:1; /* PRG Response PASID Required */
 #endif
 #ifdef CONFIG_PCI_PASID
-	u16		pasid_cap;	/* PASID Capability offset */
 	u16		pasid_features;
 #endif
 	struct pci_p2pdma *p2pdma;
@@ -477,10 +486,16 @@ struct pci_dev {
 
 	unsigned long	priv_flags;	/* Private flags for the PCI driver */
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
-	RH_KABI_RESERVE(3)
-	RH_KABI_RESERVE(4)
+#ifdef CONFIG_PCI_PRI
+	RH_KABI_USE(1, u16  pri_cap)	/* PRI Capability offset */
+#endif
+#ifdef CONFIG_PCI_PASID
+	RH_KABI_USE(2, u16  pasid_cap)	/* PASID Capability offset */
+#endif
+#ifdef CONFIG_PCIE_DPC
+	RH_KABI_USE(3, u16  dpc_cap)
+	RH_KABI_USE(4, u8   dpc_rp_log_size)
+#endif
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
@@ -492,7 +507,7 @@ struct pci_dev {
 	RH_KABI_RESERVE(13)
 	RH_KABI_RESERVE(14)
 	RH_KABI_RESERVE(15)
-	RH_KABI_SIZE_AND_EXTEND(pci_dev_extended)
+	RH_KABI_AUX_EMBED(pci_dev_extended)
 };
 
 static inline struct pci_dev *pci_physfn(struct pci_dev *dev)
@@ -815,6 +830,50 @@ struct pci_error_handlers {
 
 
 struct module;
+
+/**
+ * struct pci_driver - PCI driver structure
+ * @node:	List of driver structures.
+ * @name:	Driver name.
+ * @id_table:	Pointer to table of device IDs the driver is
+ *		interested in.  Most drivers should export this
+ *		table using MODULE_DEVICE_TABLE(pci,...).
+ * @probe:	This probing function gets called (during execution
+ *		of pci_register_driver() for already existing
+ *		devices or later if a new device gets inserted) for
+ *		all PCI devices which match the ID table and are not
+ *		"owned" by the other drivers yet. This function gets
+ *		passed a "struct pci_dev \*" for each device whose
+ *		entry in the ID table matches the device. The probe
+ *		function returns zero when the driver chooses to
+ *		take "ownership" of the device or an error code
+ *		(negative number) otherwise.
+ *		The probe function always gets called from process
+ *		context, so it can sleep.
+ * @remove:	The remove() function gets called whenever a device
+ *		being handled by this driver is removed (either during
+ *		deregistration of the driver or when it's manually
+ *		pulled out of a hot-pluggable slot).
+ *		The remove function always gets called from process
+ *		context, so it can sleep.
+ * @suspend:	Put device into low power state.
+ * @suspend_late: Put device into low power state.
+ * @resume_early: Wake device from low power state.
+ * @resume:	Wake device from low power state.
+ *		(Please see Documentation/power/pci.rst for descriptions
+ *		of PCI Power Management and the related functions.)
+ * @shutdown:	Hook into reboot_notifier_list (kernel/sys.c).
+ *		Intended to stop any idling DMA operations.
+ *		Useful for enabling wake-on-lan (NIC) or changing
+ *		the power state of a device before reboot.
+ *		e.g. drivers/net/e100.c.
+ * @sriov_configure: Optional driver callback to allow configuration of
+ *		number of VFs to enable via sysfs "sriov_numvfs" file.
+ * @err_handler: See Documentation/PCI/pci-error-recovery.rst
+ * @groups:	Sysfs attribute groups.
+ * @driver:	Driver model structure.
+ * @dynids:	List of dynamically added device IDs.
+ */
 struct pci_driver {
 	struct list_head	node;
 	const char		*name;
@@ -926,6 +985,11 @@ enum {
 	PCI_SCAN_ALL_PCIE_DEVS	= 0x00000040,	/* Scan all, not just dev 0 */
 };
 
+#define PCI_IRQ_LEGACY		(1 << 0) /* Allow legacy interrupts */
+#define PCI_IRQ_MSI		(1 << 1) /* Allow MSI interrupts */
+#define PCI_IRQ_MSIX		(1 << 2) /* Allow MSI-X interrupts */
+#define PCI_IRQ_AFFINITY	(1 << 3) /* Auto-assign affinity */
+
 /* These external functions are only available when PCI support is enabled */
 #ifdef CONFIG_PCI
 
@@ -970,7 +1034,7 @@ resource_size_t pcibios_align_resource(void *, const struct resource *,
 				resource_size_t,
 				resource_size_t);
 
-/* Weak but can be overriden by arch */
+/* Weak but can be overridden by arch */
 void pci_fixup_cardbus(struct pci_bus *);
 
 /* Generic PCI functions used internally */
@@ -1206,6 +1270,7 @@ int pci_select_bars(struct pci_dev *dev, unsigned long flags);
 bool pci_device_is_present(struct pci_dev *pdev);
 void pci_ignore_hotplug(struct pci_dev *dev);
 struct pci_dev *pci_real_dma_dev(struct pci_dev *dev);
+int pci_status_get_and_clear_errors(struct pci_dev *pdev);
 
 int __printf(6, 7) pci_request_irq(struct pci_dev *dev, unsigned int nr,
 		irq_handler_t handler, irq_handler_t thread_fn, void *dev_id,
@@ -1405,11 +1470,6 @@ resource_size_t pcibios_window_alignment(struct pci_bus *bus,
 int pci_set_vga_state(struct pci_dev *pdev, bool decode,
 		      unsigned int command_bits, u32 flags);
 
-#define PCI_IRQ_LEGACY		(1 << 0) /* Allow legacy interrupts */
-#define PCI_IRQ_MSI		(1 << 1) /* Allow MSI interrupts */
-#define PCI_IRQ_MSIX		(1 << 2) /* Allow MSI-X interrupts */
-#define PCI_IRQ_AFFINITY	(1 << 3) /* Auto-assign affinity */
-
 /*
  * Virtual interrupts allow for more interrupts to be allocated
  * than the device has interrupts for. These are not programmed
@@ -1508,14 +1568,6 @@ static inline const struct cpumask *pci_irq_get_affinity(struct pci_dev *pdev,
 }
 #endif
 
-static inline int
-pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs,
-		      unsigned int max_vecs, unsigned int flags)
-{
-	return pci_alloc_irq_vectors_affinity(dev, min_vecs, max_vecs, flags,
-					      NULL);
-}
-
 /**
  * pci_irqd_intx_xlate() - Translate PCI INTx value to an IRQ domain hwirq
  * @d: the INTx IRQ domain
@@ -1587,28 +1639,6 @@ static inline bool pci_aer_available(void) { return false; }
 #endif
 
 bool pci_ats_disabled(void);
-
-#ifdef CONFIG_PCI_ATS
-/* Address Translation Service */
-void pci_ats_init(struct pci_dev *dev);
-int pci_enable_ats(struct pci_dev *dev, int ps);
-void pci_disable_ats(struct pci_dev *dev);
-int pci_ats_queue_depth(struct pci_dev *dev);
-int pci_ats_page_aligned(struct pci_dev *dev);
-#else
-static inline void pci_ats_init(struct pci_dev *d) { }
-static inline int pci_enable_ats(struct pci_dev *d, int ps) { return -ENODEV; }
-static inline void pci_disable_ats(struct pci_dev *d) { }
-static inline int pci_ats_queue_depth(struct pci_dev *d) { return -ENODEV; }
-static inline int pci_ats_page_aligned(struct pci_dev *dev) { return 0; }
-#endif
-
-#ifdef CONFIG_PCIE_PTM
-int pci_enable_ptm(struct pci_dev *dev, u8 *granularity);
-#else
-static inline int pci_enable_ptm(struct pci_dev *dev, u8 *granularity)
-{ return -EINVAL; }
-#endif
 
 void pci_cfg_access_lock(struct pci_dev *dev);
 bool pci_cfg_access_trylock(struct pci_dev *dev);
@@ -1789,13 +1819,39 @@ static inline int pci_irqd_intx_xlate(struct irq_domain *d,
 				      unsigned long *out_hwirq,
 				      unsigned int *out_type)
 { return -EINVAL; }
+
+static inline const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
+							 struct pci_dev *dev)
+{ return NULL; }
+static inline bool pci_ats_disabled(void) { return true; }
+
+static inline int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+	return -EINVAL;
+}
+
+static inline int
+pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
+			       unsigned int max_vecs, unsigned int flags,
+			       struct irq_affinity *aff_desc)
+{
+	return -ENOSPC;
+}
 #endif /* CONFIG_PCI */
+
+static inline int
+pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs,
+		      unsigned int max_vecs, unsigned int flags)
+{
+	return pci_alloc_irq_vectors_affinity(dev, min_vecs, max_vecs, flags,
+					      NULL);
+}
 
 /* Include architecture-dependent settings and functions */
 
 #include <asm/pci.h>
 
-/* These two functions provide almost identical functionality. Depennding
+/* These two functions provide almost identical functionality. Depending
  * on the architecture, one will be implemented as a wrapper around the
  * other (in drivers/pci/mmap.c).
  *
@@ -1864,25 +1920,9 @@ static inline const char *pci_name(const struct pci_dev *pdev)
 	return dev_name(&pdev->dev);
 }
 
-
-/*
- * Some archs don't want to expose struct resource to userland as-is
- * in sysfs and /proc
- */
-#ifdef HAVE_ARCH_PCI_RESOURCE_TO_USER
 void pci_resource_to_user(const struct pci_dev *dev, int bar,
 			  const struct resource *rsrc,
 			  resource_size_t *start, resource_size_t *end);
-#else
-static inline void pci_resource_to_user(const struct pci_dev *dev, int bar,
-		const struct resource *rsrc, resource_size_t *start,
-		resource_size_t *end)
-{
-	*start = rsrc->start;
-	*end = rsrc->end;
-}
-#endif /* HAVE_ARCH_PCI_RESOURCE_TO_USER */
-
 
 /*
  * The world is not perfect and supplies us with broken PCI devices.
@@ -2236,7 +2276,7 @@ static inline u8 pci_vpd_srdt_tag(const u8 *srdt)
 
 /**
  * pci_vpd_info_field_size - Extracts the information field length
- * @lrdt: Pointer to the beginning of an information field header
+ * @info_field: Pointer to the beginning of an information field header
  *
  * Returns the extracted information field length.
  */

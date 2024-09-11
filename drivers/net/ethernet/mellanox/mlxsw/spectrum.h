@@ -14,6 +14,7 @@
 #include <linux/dcbnl.h>
 #include <linux/in6.h>
 #include <linux/notifier.h>
+#include <linux/net_namespace.h>
 #include <net/psample.h>
 #include <net/pkt_cls.h>
 #include <net/red.h>
@@ -175,6 +176,7 @@ struct mlxsw_sp {
 	struct mlxsw_sp_ptp_state *ptp_state;
 	struct mlxsw_sp_counter_pool *counter_pool;
 	struct mlxsw_sp_span *span;
+	struct mlxsw_sp_trap *trap;
 	const struct mlxsw_fw_rev *req_rev;
 	const char *fw_filename;
 	const struct mlxsw_sp_kvdl_ops *kvdl_ops;
@@ -446,8 +448,6 @@ extern const struct mlxsw_sp_sb_vals mlxsw_sp2_sb_vals;
 /* spectrum_switchdev.c */
 int mlxsw_sp_switchdev_init(struct mlxsw_sp *mlxsw_sp);
 void mlxsw_sp_switchdev_fini(struct mlxsw_sp *mlxsw_sp);
-void mlxsw_sp_port_switchdev_init(struct mlxsw_sp_port *mlxsw_sp_port);
-void mlxsw_sp_port_switchdev_fini(struct mlxsw_sp_port *mlxsw_sp_port);
 int mlxsw_sp_rif_fdb_op(struct mlxsw_sp *mlxsw_sp, const char *mac, u16 fid,
 			bool adding);
 void
@@ -536,7 +536,8 @@ union mlxsw_sp_l3addr {
 	struct in6_addr addr6;
 };
 
-int mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp);
+int mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp,
+			 struct netlink_ext_ack *extack);
 void mlxsw_sp_router_fini(struct mlxsw_sp *mlxsw_sp);
 int mlxsw_sp_netdevice_router_port_event(struct net_device *dev,
 					 unsigned long event, void *ptr);
@@ -786,9 +787,16 @@ struct mlxsw_sp_acl_rule_info *
 mlxsw_sp_acl_rule_rulei(struct mlxsw_sp_acl_rule *rule);
 int mlxsw_sp_acl_rule_get_stats(struct mlxsw_sp *mlxsw_sp,
 				struct mlxsw_sp_acl_rule *rule,
-				u64 *packets, u64 *bytes, u64 *last_use);
+				u64 *packets, u64 *bytes, u64 *last_use,
+				enum flow_action_hw_stats *used_hw_stats);
 
 struct mlxsw_sp_fid *mlxsw_sp_acl_dummy_fid(struct mlxsw_sp *mlxsw_sp);
+
+static inline const struct flow_action_cookie *
+mlxsw_sp_acl_act_cookie_lookup(struct mlxsw_sp *mlxsw_sp, u32 cookie_index)
+{
+	return mlxsw_afa_cookie_lookup(mlxsw_sp->afa, cookie_index);
+}
 
 int mlxsw_sp_acl_init(struct mlxsw_sp *mlxsw_sp);
 void mlxsw_sp_acl_fini(struct mlxsw_sp *mlxsw_sp);
@@ -1015,5 +1023,26 @@ int mlxsw_sp_trap_action_set(struct mlxsw_core *mlxsw_core,
 			     enum devlink_trap_action action);
 int mlxsw_sp_trap_group_init(struct mlxsw_core *mlxsw_core,
 			     const struct devlink_trap_group *group);
+int mlxsw_sp_trap_group_set(struct mlxsw_core *mlxsw_core,
+			    const struct devlink_trap_group *group,
+			    const struct devlink_trap_policer *policer);
+int
+mlxsw_sp_trap_policer_init(struct mlxsw_core *mlxsw_core,
+			   const struct devlink_trap_policer *policer);
+void mlxsw_sp_trap_policer_fini(struct mlxsw_core *mlxsw_core,
+				const struct devlink_trap_policer *policer);
+int
+mlxsw_sp_trap_policer_set(struct mlxsw_core *mlxsw_core,
+			  const struct devlink_trap_policer *policer,
+			  u64 rate, u64 burst, struct netlink_ext_ack *extack);
+int
+mlxsw_sp_trap_policer_counter_get(struct mlxsw_core *mlxsw_core,
+				  const struct devlink_trap_policer *policer,
+				  u64 *p_drops);
+
+static inline struct net *mlxsw_sp_net(struct mlxsw_sp *mlxsw_sp)
+{
+	return mlxsw_core_net(mlxsw_sp->core);
+}
 
 #endif

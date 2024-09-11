@@ -400,6 +400,8 @@ static int of_fpga_region_probe(struct platform_device *pdev)
 	struct fpga_manager *mgr;
 	int ret;
 
+	mark_tech_preview("FPGA Region", THIS_MODULE);
+
 	/* Find the FPGA mgr specified by region or parent region. */
 	mgr = of_fpga_region_get_mgr(np);
 	if (IS_ERR(mgr))

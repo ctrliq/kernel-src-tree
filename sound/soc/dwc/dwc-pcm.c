@@ -246,7 +246,7 @@ static int dw_pcm_new(struct snd_soc_component *component,
 
 	snd_pcm_set_managed_buffer_all(rtd->pcm,
 			SNDRV_DMA_TYPE_CONTINUOUS,
-			snd_dma_continuous_data(GFP_KERNEL), size, size);
+			NULL, size, size);
 	return 0;
 }
 

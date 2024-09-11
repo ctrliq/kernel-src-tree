@@ -35,6 +35,8 @@ static int fme_region_probe(struct platform_device *pdev)
 	struct fpga_manager *mgr;
 	int ret;
 
+	mark_tech_preview("FPGA Region for DFL FPGA Management Engine", THIS_MODULE);
+
 	mgr = fpga_mgr_get(&pdata->mgr->dev);
 	if (IS_ERR(mgr))
 		return -EPROBE_DEFER;

@@ -253,8 +253,7 @@ static void fm10k_clean_rx_ring(struct fm10k_ring *rx_ring)
 	if (!rx_ring->rx_buffer)
 		return;
 
-	if (rx_ring->skb)
-		dev_kfree_skb(rx_ring->skb);
+	dev_kfree_skb(rx_ring->skb);
 	rx_ring->skb = NULL;
 
 	/* Free all the Rx ring sk_buffs */
@@ -699,7 +698,7 @@ static netdev_tx_t fm10k_xmit_frame(struct sk_buff *skb, struct net_device *dev)
  * @netdev: network interface device structure
  * @txqueue: the index of the Tx queue that timed out
  **/
-static void fm10k_tx_timeout(struct net_device *netdev)
+static void fm10k_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 {
 	struct fm10k_intfc *interface = netdev_priv(netdev);
 	struct fm10k_ring *tx_ring;

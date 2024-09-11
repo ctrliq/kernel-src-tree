@@ -577,10 +577,10 @@ static void cell_dma_dev_setup(struct device *dev)
 		u64 addr = cell_iommu_get_fixed_address(dev);
 
 		if (addr != OF_BAD_ADDR)
-			set_dma_offset(dev, addr + dma_iommu_fixed_base);
+			dev->archdata.dma_offset = addr + dma_iommu_fixed_base;
 		set_iommu_table_base(dev, cell_get_iommu_table(dev));
 	} else {
-		set_dma_offset(dev, cell_dma_nommu_offset);
+		dev->archdata.dma_offset = cell_dma_nommu_offset;
 	}
 }
 
@@ -600,8 +600,6 @@ static int cell_of_bus_notify(struct notifier_block *nb, unsigned long action,
 
 	if (cell_iommu_enabled)
 		dev->dma_ops = &dma_iommu_ops;
-	else
-		dev->dma_ops = &dma_nommu_ops;
 	cell_dma_dev_setup(dev);
 	return 0;
 }
@@ -727,7 +725,6 @@ static int __init cell_iommu_init_disabled(void)
 	unsigned long base = 0, size;
 
 	/* When no iommu is present, we use direct DMA ops */
-	set_pci_dma_ops(&dma_nommu_ops);
 
 	/* First make sure all IOC translation is turned off */
 	cell_disable_iommus();

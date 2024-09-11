@@ -353,7 +353,8 @@ static int mlxsw_m_fw_rev_validate(struct mlxsw_m *mlxsw_m)
 }
 
 static int mlxsw_m_init(struct mlxsw_core *mlxsw_core,
-			const struct mlxsw_bus_info *mlxsw_bus_info)
+			const struct mlxsw_bus_info *mlxsw_bus_info,
+			struct netlink_ext_ack *extack)
 {
 	struct mlxsw_m *mlxsw_m = mlxsw_core_driver_priv(mlxsw_core);
 	int err;

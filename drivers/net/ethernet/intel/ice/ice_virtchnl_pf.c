@@ -4,16 +4,18 @@
 #include "ice.h"
 #include "ice_base.h"
 #include "ice_lib.h"
+#include "ice_fltr.h"
 
 /**
  * ice_validate_vf_id - helper to check if VF ID is valid
  * @pf: pointer to the PF structure
  * @vf_id: the ID of the VF to check
  */
-static int ice_validate_vf_id(struct ice_pf *pf, int vf_id)
+static int ice_validate_vf_id(struct ice_pf *pf, u16 vf_id)
 {
+	/* vf_id range is only valid for 0-255, and should always be unsigned */
 	if (vf_id >= pf->num_alloc_vfs) {
-		dev_err(ice_pf_to_dev(pf), "Invalid VF ID: %d\n", vf_id);
+		dev_err(ice_pf_to_dev(pf), "Invalid VF ID: %u\n", vf_id);
 		return -EINVAL;
 	}
 	return 0;
@@ -27,11 +29,42 @@ static int ice_validate_vf_id(struct ice_pf *pf, int vf_id)
 static int ice_check_vf_init(struct ice_pf *pf, struct ice_vf *vf)
 {
 	if (!test_bit(ICE_VF_STATE_INIT, vf->vf_states)) {
-		dev_err(ice_pf_to_dev(pf), "VF ID: %d in reset. Try again.\n",
+		dev_err(ice_pf_to_dev(pf), "VF ID: %u in reset. Try again.\n",
 			vf->vf_id);
 		return -EBUSY;
 	}
 	return 0;
+}
+
+/**
+ * ice_err_to_virt_err - translate errors for VF return code
+ * @ice_err: error return code
+ */
+static enum virtchnl_status_code ice_err_to_virt_err(enum ice_status ice_err)
+{
+	switch (ice_err) {
+	case ICE_SUCCESS:
+		return VIRTCHNL_STATUS_SUCCESS;
+	case ICE_ERR_BAD_PTR:
+	case ICE_ERR_INVAL_SIZE:
+	case ICE_ERR_DEVICE_NOT_SUPPORTED:
+	case ICE_ERR_PARAM:
+	case ICE_ERR_CFG:
+		return VIRTCHNL_STATUS_ERR_PARAM;
+	case ICE_ERR_NO_MEMORY:
+		return VIRTCHNL_STATUS_ERR_NO_MEMORY;
+	case ICE_ERR_NOT_READY:
+	case ICE_ERR_RESET_FAILED:
+	case ICE_ERR_FW_API_VER:
+	case ICE_ERR_AQ_ERROR:
+	case ICE_ERR_AQ_TIMEOUT:
+	case ICE_ERR_AQ_FULL:
+	case ICE_ERR_AQ_NO_WORK:
+	case ICE_ERR_AQ_EMPTY:
+		return VIRTCHNL_STATUS_ERR_ADMIN_QUEUE_ERROR;
+	default:
+		return VIRTCHNL_STATUS_ERR_NOT_SUPPORTED;
+	}
 }
 
 /**
@@ -47,7 +80,7 @@ ice_vc_vf_broadcast(struct ice_pf *pf, enum virtchnl_ops v_opcode,
 		    enum virtchnl_status_code v_retval, u8 *msg, u16 msglen)
 {
 	struct ice_hw *hw = &pf->hw;
-	int i;
+	unsigned int i;
 
 	ice_for_each_vf(pf, i) {
 		struct ice_vf *vf = &pf->vf[i];
@@ -99,8 +132,8 @@ ice_set_pfe_link(struct ice_vf *vf, struct virtchnl_pf_event *pfe,
  */
 static bool ice_vf_has_no_qs_ena(struct ice_vf *vf)
 {
-	return (!bitmap_weight(vf->rxq_ena, ICE_MAX_BASE_QS_PER_VF) &&
-		!bitmap_weight(vf->txq_ena, ICE_MAX_BASE_QS_PER_VF));
+	return (!bitmap_weight(vf->rxq_ena, ICE_MAX_RSS_QS_PER_VF) &&
+		!bitmap_weight(vf->txq_ena, ICE_MAX_RSS_QS_PER_VF));
 }
 
 /**
@@ -170,7 +203,12 @@ static void ice_free_vf_res(struct ice_vf *vf)
 		vf->num_mac = 0;
 	}
 
-	last_vector_idx = vf->first_vector_idx + pf->num_vf_msix - 1;
+	last_vector_idx = vf->first_vector_idx + pf->num_msix_per_vf - 1;
+
+	/* clear VF MDD event information */
+	memset(&vf->mdd_tx_events, 0, sizeof(vf->mdd_tx_events));
+	memset(&vf->mdd_rx_events, 0, sizeof(vf->mdd_rx_events));
+
 	/* Disable interrupts so that VF starts in a known state */
 	for (i = vf->first_vector_idx; i <= last_vector_idx; i++) {
 		wr32(&pf->hw, GLINT_DYN_CTL(i), GLINT_DYN_CTL_CLEARPBA_M);
@@ -201,7 +239,7 @@ static void ice_dis_vf_mappings(struct ice_vf *vf)
 	wr32(hw, VPINT_ALLOC_PCI(vf->vf_id), 0);
 
 	first = vf->first_vector_idx;
-	last = first + pf->num_vf_msix - 1;
+	last = first + pf->num_msix_per_vf - 1;
 	for (v = first; v <= last; v++) {
 		u32 reg;
 
@@ -227,11 +265,7 @@ static void ice_dis_vf_mappings(struct ice_vf *vf)
  * ice_sriov_free_msix_res - Reset/free any used MSIX resources
  * @pf: pointer to the PF structure
  *
- * If MSIX entries from the pf->irq_tracker were needed then we need to
- * reset the irq_tracker->end and give back the entries we needed to
- * num_avail_sw_msix.
- *
- * If no MSIX entries were taken from the pf->irq_tracker then just clear
+ * Since no MSIX entries are taken from the pf->irq_tracker then just clear
  * the pf->sriov_base_vector.
  *
  * Returns 0 on success, and -EINVAL on error.
@@ -248,11 +282,7 @@ static int ice_sriov_free_msix_res(struct ice_pf *pf)
 		return -EINVAL;
 
 	/* give back irq_tracker resources used */
-	if (pf->sriov_base_vector < res->num_entries) {
-		res->end = res->num_entries;
-		pf->num_avail_sw_msix +=
-			res->num_entries - pf->sriov_base_vector;
-	}
+	WARN_ON(pf->sriov_base_vector < res->num_entries);
 
 	pf->sriov_base_vector = 0;
 
@@ -266,8 +296,8 @@ static int ice_sriov_free_msix_res(struct ice_pf *pf)
 void ice_set_vf_state_qs_dis(struct ice_vf *vf)
 {
 	/* Clear Rx/Tx enabled queues flag */
-	bitmap_zero(vf->txq_ena, ICE_MAX_BASE_QS_PER_VF);
-	bitmap_zero(vf->rxq_ena, ICE_MAX_BASE_QS_PER_VF);
+	bitmap_zero(vf->txq_ena, ICE_MAX_RSS_QS_PER_VF);
+	bitmap_zero(vf->rxq_ena, ICE_MAX_RSS_QS_PER_VF);
 	clear_bit(ICE_VF_STATE_QS_ENA, vf->vf_states);
 }
 
@@ -295,18 +325,13 @@ void ice_free_vfs(struct ice_pf *pf)
 {
 	struct device *dev = ice_pf_to_dev(pf);
 	struct ice_hw *hw = &pf->hw;
-	int tmp, i;
+	unsigned int tmp, i;
 
 	if (!pf->vf)
 		return;
 
 	while (test_and_set_bit(__ICE_VF_DIS, pf->state))
 		usleep_range(1000, 2000);
-
-	/* Avoid wait time by stopping all VFs at the same time */
-	ice_for_each_vf(pf, i)
-		if (test_bit(ICE_VF_STATE_QS_ENA, pf->vf[i].vf_states))
-			ice_dis_vf_qs(&pf->vf[i]);
 
 	/* Disable IOV before freeing resources. This lets any VF drivers
 	 * running in the host get themselves cleaned up before we yank
@@ -317,8 +342,13 @@ void ice_free_vfs(struct ice_pf *pf)
 	else
 		dev_warn(dev, "VFs are assigned - not disabling SR-IOV\n");
 
+	/* Avoid wait time by stopping all VFs at the same time */
+	ice_for_each_vf(pf, i)
+		if (test_bit(ICE_VF_STATE_QS_ENA, pf->vf[i].vf_states))
+			ice_dis_vf_qs(&pf->vf[i]);
+
 	tmp = pf->num_alloc_vfs;
-	pf->num_vf_qps = 0;
+	pf->num_qps_per_vf = 0;
 	pf->num_alloc_vfs = 0;
 	for (i = 0; i < tmp; i++) {
 		if (test_bit(ICE_VF_STATE_INIT, pf->vf[i].vf_states)) {
@@ -340,7 +370,7 @@ void ice_free_vfs(struct ice_pf *pf)
 	 * before this function ever gets called.
 	 */
 	if (!pci_vfs_assigned(pf->pdev)) {
-		int vf_id;
+		unsigned int vf_id;
 
 		/* Acknowledge VFLR for all VFs. Without this, VFs will fail to
 		 * work correctly when SR-IOV gets re-enabled.
@@ -371,9 +401,9 @@ static void ice_trigger_vf_reset(struct ice_vf *vf, bool is_vflr, bool is_pfr)
 {
 	struct ice_pf *pf = vf->pf;
 	u32 reg, reg_idx, bit_idx;
+	unsigned int vf_abs_id, i;
 	struct device *dev;
 	struct ice_hw *hw;
-	int vf_abs_id, i;
 
 	dev = ice_pf_to_dev(pf);
 	hw = &pf->hw;
@@ -421,7 +451,7 @@ static void ice_trigger_vf_reset(struct ice_vf *vf, bool is_vflr, bool is_pfr)
 		if ((reg & VF_TRANS_PENDING_M) == 0)
 			break;
 
-		dev_err(dev, "VF %d PCI transactions stuck\n", vf->vf_id);
+		dev_err(dev, "VF %u PCI transactions stuck\n", vf->vf_id);
 		udelay(ICE_PCI_CIAD_WAIT_DELAY_US);
 	}
 }
@@ -463,8 +493,9 @@ static int ice_vsi_manage_pvid(struct ice_vsi *vsi, u16 pvid_info, bool enable)
 
 	status = ice_update_vsi(hw, vsi->idx, ctxt, NULL);
 	if (status) {
-		dev_info(ice_hw_to_dev(hw), "update VSI for port VLAN failed, err %d aq_err %d\n",
-			 status, hw->adminq.sq_last_status);
+		dev_info(ice_hw_to_dev(hw), "update VSI for port VLAN failed, err %s aq_err %s\n",
+			 ice_stat_str(status),
+			 ice_aq_str(hw->adminq.sq_last_status));
 		ret = -EIO;
 		goto out;
 	}
@@ -506,7 +537,7 @@ ice_vf_vsi_setup(struct ice_pf *pf, struct ice_port_info *pi, u16 vf_id)
  */
 static int ice_calc_vf_first_vector_idx(struct ice_pf *pf, struct ice_vf *vf)
 {
-	return pf->sriov_base_vector + vf->vf_id * pf->num_vf_msix;
+	return pf->sriov_base_vector + vf->vf_id * pf->num_msix_per_vf;
 }
 
 /**
@@ -518,7 +549,6 @@ static int ice_calc_vf_first_vector_idx(struct ice_pf *pf, struct ice_vf *vf)
 static int ice_alloc_vsi_res(struct ice_vf *vf)
 {
 	struct ice_pf *pf = vf->pf;
-	LIST_HEAD(tmp_add_list);
 	u8 broadcast[ETH_ALEN];
 	struct ice_vsi *vsi;
 	struct device *dev;
@@ -540,7 +570,8 @@ static int ice_alloc_vsi_res(struct ice_vf *vf)
 	/* Check if port VLAN exist before, and restore it accordingly */
 	if (vf->port_vlan_info) {
 		ice_vsi_manage_pvid(vsi, vf->port_vlan_info, true);
-		if (ice_vsi_add_vlan(vsi, vf->port_vlan_info & VLAN_VID_MASK))
+		if (ice_vsi_add_vlan(vsi, vf->port_vlan_info & VLAN_VID_MASK,
+				     ICE_FWD_TO_VSI))
 			dev_warn(ice_pf_to_dev(pf), "Failed to add Port VLAN %d filter for VF %d\n",
 				 vf->port_vlan_info & VLAN_VID_MASK, vf->vf_id);
 	} else {
@@ -549,27 +580,23 @@ static int ice_alloc_vsi_res(struct ice_vf *vf)
 		 * untagged broadcast/multicast traffic seen on the VF
 		 * interface.
 		 */
-		if (ice_vsi_add_vlan(vsi, 0))
+		if (ice_vsi_add_vlan(vsi, 0, ICE_FWD_TO_VSI))
 			dev_warn(ice_pf_to_dev(pf), "Failed to add VLAN 0 filter for VF %d, MDD events will trigger. Reset the VF, disable spoofchk, or enable 8021q module on the guest\n",
 				 vf->vf_id);
 	}
 
-	eth_broadcast_addr(broadcast);
-
-	status = ice_add_mac_to_list(vsi, &tmp_add_list, broadcast);
-	if (status)
-		goto ice_alloc_vsi_res_exit;
-
 	if (is_valid_ether_addr(vf->dflt_lan_addr.addr)) {
-		status = ice_add_mac_to_list(vsi, &tmp_add_list,
-					     vf->dflt_lan_addr.addr);
+		status = ice_fltr_add_mac(vsi, vf->dflt_lan_addr.addr,
+					  ICE_FWD_TO_VSI);
 		if (status)
 			goto ice_alloc_vsi_res_exit;
 	}
 
-	status = ice_add_mac(&pf->hw, &tmp_add_list);
+	eth_broadcast_addr(broadcast);
+	status = ice_fltr_add_mac(vsi, broadcast, ICE_FWD_TO_VSI);
 	if (status)
-		dev_err(dev, "could not add mac filters error %d\n", status);
+		dev_err(dev, "could not add mac filters error %d\n",
+			status);
 	else
 		vf->num_mac = 1;
 
@@ -580,7 +607,6 @@ static int ice_alloc_vsi_res(struct ice_vf *vf)
 	 * more vectors.
 	 */
 ice_alloc_vsi_res_exit:
-	ice_free_fltr_list(dev, &tmp_add_list);
 	return status;
 }
 
@@ -599,7 +625,7 @@ static int ice_alloc_vf_res(struct ice_vf *vf)
 	 */
 	tx_rx_queue_left = min_t(int, ice_get_avail_txq_count(pf),
 				 ice_get_avail_rxq_count(pf));
-	tx_rx_queue_left += ICE_DFLT_QS_PER_VF;
+	tx_rx_queue_left += pf->num_qps_per_vf;
 	if (vf->num_req_qs && vf->num_req_qs <= tx_rx_queue_left &&
 	    vf->num_req_qs != vf->num_vf_qs)
 		vf->num_vf_qs = vf->num_req_qs;
@@ -645,9 +671,9 @@ static void ice_ena_vf_mappings(struct ice_vf *vf)
 	hw = &pf->hw;
 	vsi = pf->vsi[vf->lan_vsi_idx];
 	first = vf->first_vector_idx;
-	last = (first + pf->num_vf_msix) - 1;
+	last = (first + pf->num_msix_per_vf) - 1;
 	abs_first = first + pf->hw.func_caps.common_cap.msix_vector_first_id;
-	abs_last = (abs_first + pf->num_vf_msix) - 1;
+	abs_last = (abs_first + pf->num_msix_per_vf) - 1;
 	abs_vf_id = vf->vf_id + hw->func_caps.vf_base_id;
 
 	/* VF Vector allocation */
@@ -765,7 +791,7 @@ int ice_calc_vf_reg_idx(struct ice_vf *vf, struct ice_q_vector *q_vector)
 	pf = vf->pf;
 
 	/* always add one to account for the OICR being the first MSIX */
-	return pf->sriov_base_vector + pf->num_vf_msix * vf->vf_id +
+	return pf->sriov_base_vector + pf->num_msix_per_vf * vf->vf_id +
 		q_vector->v_idx + 1;
 }
 
@@ -798,127 +824,112 @@ static int ice_get_max_valid_res_idx(struct ice_res_tracker *res)
  * @num_msix_needed: number of MSIX vectors needed for all SR-IOV VFs
  *
  * This function allows SR-IOV resources to be taken from the end of the PF's
- * allowed HW MSIX vectors so in many cases the irq_tracker will not
- * be needed. In these cases we just set the pf->sriov_base_vector and return
- * success.
+ * allowed HW MSIX vectors so that the irq_tracker will not be affected. We
+ * just set the pf->sriov_base_vector and return success.
  *
- * If SR-IOV needs to use any pf->irq_tracker entries it updates the
- * irq_tracker->end based on the first entry needed for SR-IOV. This makes it
- * so any calls to ice_get_res() using the irq_tracker will not try to use
- * resources at or beyond the newly set value.
+ * If there are not enough resources available, return an error. This should
+ * always be caught by ice_set_per_vf_res().
  *
  * Return 0 on success, and -EINVAL when there are not enough MSIX vectors in
  * in the PF's space available for SR-IOV.
  */
 static int ice_sriov_set_msix_res(struct ice_pf *pf, u16 num_msix_needed)
 {
-	int max_valid_res_idx = ice_get_max_valid_res_idx(pf->irq_tracker);
-	u16 pf_total_msix_vectors =
-		pf->hw.func_caps.common_cap.num_msix_vectors;
-	struct ice_res_tracker *res = pf->irq_tracker;
+	u16 total_vectors = pf->hw.func_caps.common_cap.num_msix_vectors;
+	int vectors_used = pf->irq_tracker->num_entries;
 	int sriov_base_vector;
 
-	if (max_valid_res_idx < 0)
-		return max_valid_res_idx;
-
-	sriov_base_vector = pf_total_msix_vectors - num_msix_needed;
+	sriov_base_vector = total_vectors - num_msix_needed;
 
 	/* make sure we only grab irq_tracker entries from the list end and
 	 * that we have enough available MSIX vectors
 	 */
-	if (sriov_base_vector <= max_valid_res_idx)
+	if (sriov_base_vector < vectors_used)
 		return -EINVAL;
 
 	pf->sriov_base_vector = sriov_base_vector;
-
-	/* dip into irq_tracker entries and update used resources */
-	if (num_msix_needed > (pf_total_msix_vectors - res->num_entries)) {
-		pf->num_avail_sw_msix -=
-			res->num_entries - pf->sriov_base_vector;
-		res->end = pf->sriov_base_vector;
-	}
 
 	return 0;
 }
 
 /**
- * ice_check_avail_res - check if vectors and queues are available
+ * ice_set_per_vf_res - check if vectors and queues are available
  * @pf: pointer to the PF structure
  *
- * This function is where we calculate actual number of resources for VF VSIs,
- * we don't reserve ahead of time during probe. Returns success if vectors and
- * queues resources are available, otherwise returns error code
+ * First, determine HW interrupts from common pool. If we allocate fewer VFs, we
+ * get more vectors and can enable more queues per VF. Note that this does not
+ * grab any vectors from the SW pool already allocated. Also note, that all
+ * vector counts include one for each VF's miscellaneous interrupt vector
+ * (i.e. OICR).
+ *
+ * Minimum VFs - 2 vectors, 1 queue pair
+ * Small VFs - 5 vectors, 4 queue pairs
+ * Medium VFs - 17 vectors, 16 queue pairs
+ *
+ * Second, determine number of queue pairs per VF by starting with a pre-defined
+ * maximum each VF supports. If this is not possible, then we adjust based on
+ * queue pairs available on the device.
+ *
+ * Lastly, set queue and MSI-X VF variables tracked by the PF so it can be used
+ * by each VF during VF initialization and reset.
  */
-static int ice_check_avail_res(struct ice_pf *pf)
+static int ice_set_per_vf_res(struct ice_pf *pf)
 {
 	int max_valid_res_idx = ice_get_max_valid_res_idx(pf->irq_tracker);
-	u16 num_msix, num_txq, num_rxq, num_avail_msix;
+	int msix_avail_per_vf, msix_avail_for_sriov;
 	struct device *dev = ice_pf_to_dev(pf);
+	u16 num_msix_per_vf, num_txq, num_rxq;
 
 	if (!pf->num_alloc_vfs || max_valid_res_idx < 0)
 		return -EINVAL;
 
-	/* add 1 to max_valid_res_idx to account for it being 0-based */
-	num_avail_msix = pf->hw.func_caps.common_cap.num_msix_vectors -
-		(max_valid_res_idx + 1);
-
-	/* Grab from HW interrupts common pool
-	 * Note: By the time the user decides it needs more vectors in a VF
-	 * its already too late since one must decide this prior to creating the
-	 * VF interface. So the best we can do is take a guess as to what the
-	 * user might want.
-	 *
-	 * We have two policies for vector allocation:
-	 * 1. if num_alloc_vfs is from 1 to 16, then we consider this as small
-	 * number of NFV VFs used for NFV appliances, since this is a special
-	 * case, we try to assign maximum vectors per VF (65) as much as
-	 * possible, based on determine_resources algorithm.
-	 * 2. if num_alloc_vfs is from 17 to 256, then its large number of
-	 * regular VFs which are not used for any special purpose. Hence try to
-	 * grab default interrupt vectors (5 as supported by AVF driver).
-	 */
-	if (pf->num_alloc_vfs <= 16) {
-		num_msix = ice_determine_res(pf, num_avail_msix,
-					     ICE_MAX_INTR_PER_VF,
-					     ICE_MIN_INTR_PER_VF);
-	} else if (pf->num_alloc_vfs <= ICE_MAX_VF_COUNT) {
-		num_msix = ice_determine_res(pf, num_avail_msix,
-					     ICE_DFLT_INTR_PER_VF,
-					     ICE_MIN_INTR_PER_VF);
+	/* determine MSI-X resources per VF */
+	msix_avail_for_sriov = pf->hw.func_caps.common_cap.num_msix_vectors -
+		pf->irq_tracker->num_entries;
+	msix_avail_per_vf = msix_avail_for_sriov / pf->num_alloc_vfs;
+	if (msix_avail_per_vf >= ICE_NUM_VF_MSIX_MED) {
+		num_msix_per_vf = ICE_NUM_VF_MSIX_MED;
+	} else if (msix_avail_per_vf >= ICE_NUM_VF_MSIX_SMALL) {
+		num_msix_per_vf = ICE_NUM_VF_MSIX_SMALL;
+	} else if (msix_avail_per_vf >= ICE_MIN_INTR_PER_VF) {
+		num_msix_per_vf = ICE_MIN_INTR_PER_VF;
 	} else {
-		dev_err(dev, "Number of VFs %d exceeds max VF count %d\n",
-			pf->num_alloc_vfs, ICE_MAX_VF_COUNT);
+		dev_err(dev, "Only %d MSI-X interrupts available for SR-IOV. Not enough to support minimum of %d MSI-X interrupts per VF for %d VFs\n",
+			msix_avail_for_sriov, ICE_MIN_INTR_PER_VF,
+			pf->num_alloc_vfs);
 		return -EIO;
 	}
 
-	if (!num_msix)
-		return -EIO;
-
-	/* Grab from the common pool
-	 * start by requesting Default queues (4 as supported by AVF driver),
-	 * Note that, the main difference between queues and vectors is, latter
-	 * can only be reserved at init time but queues can be requested by VF
-	 * at runtime through Virtchnl, that is the reason we start by reserving
-	 * few queues.
-	 */
+	/* determine queue resources per VF */
 	num_txq = ice_determine_res(pf, ice_get_avail_txq_count(pf),
-				    ICE_DFLT_QS_PER_VF, ICE_MIN_QS_PER_VF);
+				    min_t(u16,
+					  num_msix_per_vf - ICE_NONQ_VECS_VF,
+					  ICE_MAX_RSS_QS_PER_VF),
+				    ICE_MIN_QS_PER_VF);
 
 	num_rxq = ice_determine_res(pf, ice_get_avail_rxq_count(pf),
-				    ICE_DFLT_QS_PER_VF, ICE_MIN_QS_PER_VF);
+				    min_t(u16,
+					  num_msix_per_vf - ICE_NONQ_VECS_VF,
+					  ICE_MAX_RSS_QS_PER_VF),
+				    ICE_MIN_QS_PER_VF);
 
-	if (!num_txq || !num_rxq)
+	if (!num_txq || !num_rxq) {
+		dev_err(dev, "Not enough queues to support minimum of %d queue pairs per VF for %d VFs\n",
+			ICE_MIN_QS_PER_VF, pf->num_alloc_vfs);
 		return -EIO;
+	}
 
-	if (ice_sriov_set_msix_res(pf, num_msix * pf->num_alloc_vfs))
+	if (ice_sriov_set_msix_res(pf, num_msix_per_vf * pf->num_alloc_vfs)) {
+		dev_err(dev, "Unable to set MSI-X resources for %d VFs\n",
+			pf->num_alloc_vfs);
 		return -EINVAL;
+	}
 
-	/* since AVF driver works with only queue pairs which means, it expects
-	 * to have equal number of Rx and Tx queues, so take the minimum of
-	 * available Tx or Rx queues
-	 */
-	pf->num_vf_qps = min_t(int, num_txq, num_rxq);
-	pf->num_vf_msix = num_msix;
+	/* only allow equal Tx/Rx queue count (i.e. queue pairs) */
+	pf->num_qps_per_vf = min_t(int, num_txq, num_rxq);
+	pf->num_msix_per_vf = num_msix_per_vf;
+	dev_info(dev, "Enabling %d VFs with %d vectors and %d queues per VF\n",
+		 pf->num_alloc_vfs, pf->num_msix_per_vf, pf->num_qps_per_vf);
 
 	return 0;
 }
@@ -1027,7 +1038,7 @@ static bool ice_config_res_vfs(struct ice_pf *pf)
 	struct ice_hw *hw = &pf->hw;
 	int v;
 
-	if (ice_check_avail_res(pf)) {
+	if (ice_set_per_vf_res(pf)) {
 		dev_err(dev, "Cannot allocate VF resources, try with fewer number of VFs\n");
 		return false;
 	}
@@ -1040,7 +1051,7 @@ static bool ice_config_res_vfs(struct ice_pf *pf)
 	ice_for_each_vf(pf, v) {
 		struct ice_vf *vf = &pf->vf[v];
 
-		vf->num_vf_qs = pf->num_vf_qps;
+		vf->num_vf_qs = pf->num_qps_per_vf;
 		dev_dbg(dev, "VF-id %d has %d queues configured\n", vf->vf_id,
 			vf->num_vf_qs);
 		ice_cleanup_and_realloc_vf(vf);
@@ -1101,7 +1112,6 @@ bool ice_reset_all_vfs(struct ice_pf *pf, bool is_vflr)
 	 * finished resetting.
 	 */
 	for (i = 0, v = 0; i < 10 && v < pf->num_alloc_vfs; i++) {
-
 		/* Check each VF in sequence */
 		while (v < pf->num_alloc_vfs) {
 			u32 reg;
@@ -1174,9 +1184,10 @@ static bool ice_is_vf_disabled(struct ice_vf *vf)
  * @vf: pointer to the VF structure
  * @is_vflr: true if VFLR was issued, false if not
  *
- * Returns true if the VF is reset, false otherwise.
+ * Returns true if the VF is currently in reset, resets successfully, or resets
+ * are disabled and false otherwise.
  */
-static bool ice_reset_vf(struct ice_vf *vf, bool is_vflr)
+bool ice_reset_vf(struct ice_vf *vf, bool is_vflr)
 {
 	struct ice_pf *pf = vf->pf;
 	struct ice_vsi *vsi;
@@ -1188,6 +1199,12 @@ static bool ice_reset_vf(struct ice_vf *vf, bool is_vflr)
 	int i;
 
 	dev = ice_pf_to_dev(pf);
+
+	if (test_bit(__ICE_VF_RESETS_DISABLED, pf->state)) {
+		dev_dbg(dev, "Trying to reset VF %d, but all VF resets are disabled\n",
+			vf->vf_id);
+		return true;
+	}
 
 	if (ice_is_vf_disabled(vf)) {
 		dev_dbg(dev, "VF is already disabled, there is no need for resetting it, telling VM, all is fine %d\n",
@@ -1495,7 +1512,7 @@ int ice_sriov_configure(struct pci_dev *pdev, int num_vfs)
 void ice_process_vflr_event(struct ice_pf *pf)
 {
 	struct ice_hw *hw = &pf->hw;
-	int vf_id;
+	unsigned int vf_id;
 	u32 reg;
 
 	if (!test_and_clear_bit(__ICE_VFLR_EVENT_PENDING, pf->state) ||
@@ -1524,6 +1541,72 @@ static void ice_vc_reset_vf(struct ice_vf *vf)
 {
 	ice_vc_notify_vf_reset(vf);
 	ice_reset_vf(vf, false);
+}
+
+/**
+ * ice_get_vf_from_pfq - get the VF who owns the PF space queue passed in
+ * @pf: PF used to index all VFs
+ * @pfq: queue index relative to the PF's function space
+ *
+ * If no VF is found who owns the pfq then return NULL, otherwise return a
+ * pointer to the VF who owns the pfq
+ */
+static struct ice_vf *ice_get_vf_from_pfq(struct ice_pf *pf, u16 pfq)
+{
+	unsigned int vf_id;
+
+	ice_for_each_vf(pf, vf_id) {
+		struct ice_vf *vf = &pf->vf[vf_id];
+		struct ice_vsi *vsi;
+		u16 rxq_idx;
+
+		vsi = pf->vsi[vf->lan_vsi_idx];
+
+		ice_for_each_rxq(vsi, rxq_idx)
+			if (vsi->rxq_map[rxq_idx] == pfq)
+				return vf;
+	}
+
+	return NULL;
+}
+
+/**
+ * ice_globalq_to_pfq - convert from global queue index to PF space queue index
+ * @pf: PF used for conversion
+ * @globalq: global queue index used to convert to PF space queue index
+ */
+static u32 ice_globalq_to_pfq(struct ice_pf *pf, u32 globalq)
+{
+	return globalq - pf->hw.func_caps.common_cap.rxq_first_id;
+}
+
+/**
+ * ice_vf_lan_overflow_event - handle LAN overflow event for a VF
+ * @pf: PF that the LAN overflow event happened on
+ * @event: structure holding the event information for the LAN overflow event
+ *
+ * Determine if the LAN overflow event was caused by a VF queue. If it was not
+ * caused by a VF, do nothing. If a VF caused this LAN overflow event trigger a
+ * reset on the offending VF.
+ */
+void
+ice_vf_lan_overflow_event(struct ice_pf *pf, struct ice_rq_event_info *event)
+{
+	u32 gldcb_rtctq, queue;
+	struct ice_vf *vf;
+
+	gldcb_rtctq = le32_to_cpu(event->desc.params.lan_overflow.prtdcb_ruptq);
+	dev_dbg(ice_pf_to_dev(pf), "GLDCB_RTCTQ: 0x%08x\n", gldcb_rtctq);
+
+	/* event returns device global Rx queue number */
+	queue = (gldcb_rtctq & GLDCB_RTCTQ_RXQNUM_M) >>
+		GLDCB_RTCTQ_RXQNUM_S;
+
+	vf = ice_get_vf_from_pfq(pf, ice_globalq_to_pfq(pf, queue));
+	if (!vf)
+		return;
+
+	ice_vc_reset_vf(vf);
 }
 
 /**
@@ -1574,8 +1657,9 @@ ice_vc_send_msg_to_vf(struct ice_vf *vf, u32 v_opcode,
 	aq_ret = ice_aq_send_msg_to_vf(&pf->hw, vf->vf_id, v_opcode, v_retval,
 				       msg, msglen, NULL);
 	if (aq_ret && pf->hw.mailboxq.sq_last_status != ICE_AQ_RC_ENOSYS) {
-		dev_info(dev, "Unable to send the message to VF %d ret %d aq_err %d\n",
-			 vf->vf_id, aq_ret, pf->hw.mailboxq.sq_last_status);
+		dev_info(dev, "Unable to send the message to VF %d ret %s aq_err %s\n",
+			 vf->vf_id, ice_stat_str(aq_ret),
+			 ice_aq_str(pf->hw.mailboxq.sq_last_status));
 		return -EIO;
 	}
 
@@ -1684,7 +1768,7 @@ static int ice_vc_get_vf_res_msg(struct ice_vf *vf, u8 *msg)
 	vfres->num_vsis = 1;
 	/* Tx and Rx queue are equal for VF */
 	vfres->num_queue_pairs = vsi->num_txq;
-	vfres->max_vectors = pf->num_vf_msix;
+	vfres->max_vectors = pf->num_msix_per_vf;
 	vfres->rss_key_size = ICE_VSIQF_HKEY_ARRAY_SIZE;
 	vfres->rss_lut_size = ICE_VSIQF_HLUT_ARRAY_SIZE;
 
@@ -1883,6 +1967,48 @@ error_param:
 }
 
 /**
+ * ice_wait_on_vf_reset - poll to make sure a given VF is ready after reset
+ * @vf: The VF being resseting
+ *
+ * The max poll time is about ~800ms, which is about the maximum time it takes
+ * for a VF to be reset and/or a VF driver to be removed.
+ */
+static void ice_wait_on_vf_reset(struct ice_vf *vf)
+{
+	int i;
+
+	for (i = 0; i < ICE_MAX_VF_RESET_TRIES; i++) {
+		if (test_bit(ICE_VF_STATE_INIT, vf->vf_states))
+			break;
+		msleep(ICE_MAX_VF_RESET_SLEEP_MS);
+	}
+}
+
+/**
+ * ice_check_vf_ready_for_cfg - check if VF is ready to be configured/queried
+ * @vf: VF to check if it's ready to be configured/queried
+ *
+ * The purpose of this function is to make sure the VF is not in reset, not
+ * disabled, and initialized so it can be configured and/or queried by a host
+ * administrator.
+ */
+static int ice_check_vf_ready_for_cfg(struct ice_vf *vf)
+{
+	struct ice_pf *pf;
+
+	ice_wait_on_vf_reset(vf);
+
+	if (ice_is_vf_disabled(vf))
+		return -EINVAL;
+
+	pf = vf->pf;
+	if (ice_check_vf_init(pf, vf))
+		return -EBUSY;
+
+	return 0;
+}
+
+/**
  * ice_set_vf_spoofchk
  * @netdev: network interface device structure
  * @vf_id: VF identifier
@@ -1899,16 +2025,16 @@ int ice_set_vf_spoofchk(struct net_device *netdev, int vf_id, bool ena)
 	enum ice_status status;
 	struct device *dev;
 	struct ice_vf *vf;
-	int ret = 0;
+	int ret;
 
 	dev = ice_pf_to_dev(pf);
 	if (ice_validate_vf_id(pf, vf_id))
 		return -EINVAL;
 
 	vf = &pf->vf[vf_id];
-
-	if (ice_check_vf_init(pf, vf))
-		return -EBUSY;
+	ret = ice_check_vf_ready_for_cfg(vf);
+	if (ret)
+		return ret;
 
 	vf_vsi = pf->vsi[vf->lan_vsi_idx];
 	if (!vf_vsi) {
@@ -1948,8 +2074,9 @@ int ice_set_vf_spoofchk(struct net_device *netdev, int vf_id, bool ena)
 
 	status = ice_update_vsi(&pf->hw, vf_vsi->idx, ctx, NULL);
 	if (status) {
-		dev_err(dev, "Failed to %sable spoofchk on VF %d VSI %d\n error %d\n",
-			ena ? "en" : "dis", vf->vf_id, vf_vsi->vsi_num, status);
+		dev_err(dev, "Failed to %sable spoofchk on VF %d VSI %d\n error %s\n",
+			ena ? "en" : "dis", vf->vf_id, vf_vsi->vsi_num,
+			ice_stat_str(status));
 		ret = -EIO;
 		goto out;
 	}
@@ -1961,6 +2088,174 @@ int ice_set_vf_spoofchk(struct net_device *netdev, int vf_id, bool ena)
 out:
 	kfree(ctx);
 	return ret;
+}
+
+/**
+ * ice_is_any_vf_in_promisc - check if any VF(s) are in promiscuous mode
+ * @pf: PF structure for accessing VF(s)
+ *
+ * Return false if no VF(s) are in unicast and/or multicast promiscuous mode,
+ * else return true
+ */
+bool ice_is_any_vf_in_promisc(struct ice_pf *pf)
+{
+	int vf_idx;
+
+	ice_for_each_vf(pf, vf_idx) {
+		struct ice_vf *vf = &pf->vf[vf_idx];
+
+		/* found a VF that has promiscuous mode configured */
+		if (test_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states) ||
+		    test_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * ice_vc_cfg_promiscuous_mode_msg
+ * @vf: pointer to the VF info
+ * @msg: pointer to the msg buffer
+ *
+ * called from the VF to configure VF VSIs promiscuous mode
+ */
+static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
+{
+	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
+	struct virtchnl_promisc_info *info =
+	    (struct virtchnl_promisc_info *)msg;
+	struct ice_pf *pf = vf->pf;
+	struct ice_vsi *vsi;
+	struct device *dev;
+	bool rm_promisc;
+	int ret = 0;
+
+	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
+		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+		goto error_param;
+	}
+
+	if (!ice_vc_isvalid_vsi_id(vf, info->vsi_id)) {
+		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+		goto error_param;
+	}
+
+	vsi = pf->vsi[vf->lan_vsi_idx];
+	if (!vsi) {
+		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+		goto error_param;
+	}
+
+	dev = ice_pf_to_dev(pf);
+	if (!test_bit(ICE_VIRTCHNL_VF_CAP_PRIVILEGE, &vf->vf_caps)) {
+		dev_err(dev, "Unprivileged VF %d is attempting to configure promiscuous mode\n",
+			vf->vf_id);
+		/* Leave v_ret alone, lie to the VF on purpose. */
+		goto error_param;
+	}
+
+	rm_promisc = !(info->flags & FLAG_VF_UNICAST_PROMISC) &&
+		!(info->flags & FLAG_VF_MULTICAST_PROMISC);
+
+	if (vsi->num_vlan || vf->port_vlan_info) {
+		struct ice_vsi *pf_vsi = ice_get_main_vsi(pf);
+		struct net_device *pf_netdev;
+
+		if (!pf_vsi) {
+			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+			goto error_param;
+		}
+
+		pf_netdev = pf_vsi->netdev;
+
+		ret = ice_set_vf_spoofchk(pf_netdev, vf->vf_id, rm_promisc);
+		if (ret) {
+			dev_err(dev, "Failed to update spoofchk to %s for VF %d VSI %d when setting promiscuous mode\n",
+				rm_promisc ? "ON" : "OFF", vf->vf_id,
+				vsi->vsi_num);
+			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+		}
+
+		ret = ice_cfg_vlan_pruning(vsi, true, !rm_promisc);
+		if (ret) {
+			dev_err(dev, "Failed to configure VLAN pruning in promiscuous mode\n");
+			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
+			goto error_param;
+		}
+	}
+
+	if (!test_bit(ICE_FLAG_VF_TRUE_PROMISC_ENA, pf->flags)) {
+		bool set_dflt_vsi = !!(info->flags & FLAG_VF_UNICAST_PROMISC);
+
+		if (set_dflt_vsi && !ice_is_dflt_vsi_in_use(pf->first_sw))
+			/* only attempt to set the default forwarding VSI if
+			 * it's not currently set
+			 */
+			ret = ice_set_dflt_vsi(pf->first_sw, vsi);
+		else if (!set_dflt_vsi &&
+			 ice_is_vsi_dflt_vsi(pf->first_sw, vsi))
+			/* only attempt to free the default forwarding VSI if we
+			 * are the owner
+			 */
+			ret = ice_clear_dflt_vsi(pf->first_sw);
+
+		if (ret) {
+			dev_err(dev, "%sable VF %d as the default VSI failed, error %d\n",
+				set_dflt_vsi ? "en" : "dis", vf->vf_id, ret);
+			v_ret = VIRTCHNL_STATUS_ERR_ADMIN_QUEUE_ERROR;
+			goto error_param;
+		}
+	} else {
+		enum ice_status status;
+		u8 promisc_m;
+
+		if (info->flags & FLAG_VF_UNICAST_PROMISC) {
+			if (vf->port_vlan_info || vsi->num_vlan)
+				promisc_m = ICE_UCAST_VLAN_PROMISC_BITS;
+			else
+				promisc_m = ICE_UCAST_PROMISC_BITS;
+		} else if (info->flags & FLAG_VF_MULTICAST_PROMISC) {
+			if (vf->port_vlan_info || vsi->num_vlan)
+				promisc_m = ICE_MCAST_VLAN_PROMISC_BITS;
+			else
+				promisc_m = ICE_MCAST_PROMISC_BITS;
+		} else {
+			if (vf->port_vlan_info || vsi->num_vlan)
+				promisc_m = ICE_UCAST_VLAN_PROMISC_BITS;
+			else
+				promisc_m = ICE_UCAST_PROMISC_BITS;
+		}
+
+		/* Configure multicast/unicast with or without VLAN promiscuous
+		 * mode
+		 */
+		status = ice_vf_set_vsi_promisc(vf, vsi, promisc_m, rm_promisc);
+		if (status) {
+			dev_err(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d failed, error: %s\n",
+				rm_promisc ? "dis" : "en", vf->vf_id,
+				ice_stat_str(status));
+			v_ret = ice_err_to_virt_err(status);
+			goto error_param;
+		} else {
+			dev_dbg(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d succeeded\n",
+				rm_promisc ? "dis" : "en", vf->vf_id);
+		}
+	}
+
+	if (info->flags & FLAG_VF_MULTICAST_PROMISC)
+		set_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states);
+	else
+		clear_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states);
+
+	if (info->flags & FLAG_VF_UNICAST_PROMISC)
+		set_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states);
+	else
+		clear_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states);
+
+error_param:
+	return ice_vc_send_msg_to_vf(vf, VIRTCHNL_OP_CONFIG_PROMISCUOUS_MODE,
+				     v_ret, NULL, 0);
 }
 
 /**
@@ -2014,8 +2309,8 @@ error_param:
 static bool ice_vc_validate_vqs_bitmaps(struct virtchnl_queue_select *vqs)
 {
 	if ((!vqs->rx_queues && !vqs->tx_queues) ||
-	    vqs->rx_queues >= BIT(ICE_MAX_BASE_QS_PER_VF) ||
-	    vqs->tx_queues >= BIT(ICE_MAX_BASE_QS_PER_VF))
+	    vqs->rx_queues >= BIT(ICE_MAX_RSS_QS_PER_VF) ||
+	    vqs->tx_queues >= BIT(ICE_MAX_RSS_QS_PER_VF))
 		return false;
 
 	return true;
@@ -2110,7 +2405,7 @@ static int ice_vc_ena_qs_msg(struct ice_vf *vf, u8 *msg)
 	 * programmed using ice_vsi_cfg_txqs
 	 */
 	q_map = vqs->rx_queues;
-	for_each_set_bit(vf_q_id, &q_map, ICE_MAX_BASE_QS_PER_VF) {
+	for_each_set_bit(vf_q_id, &q_map, ICE_MAX_RSS_QS_PER_VF) {
 		if (!ice_vc_isvalid_q_id(vf, vqs->vsi_id, vf_q_id)) {
 			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 			goto error_param;
@@ -2133,7 +2428,7 @@ static int ice_vc_ena_qs_msg(struct ice_vf *vf, u8 *msg)
 
 	vsi = pf->vsi[vf->lan_vsi_idx];
 	q_map = vqs->tx_queues;
-	for_each_set_bit(vf_q_id, &q_map, ICE_MAX_BASE_QS_PER_VF) {
+	for_each_set_bit(vf_q_id, &q_map, ICE_MAX_RSS_QS_PER_VF) {
 		if (!ice_vc_isvalid_q_id(vf, vqs->vsi_id, vf_q_id)) {
 			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 			goto error_param;
@@ -2191,12 +2486,6 @@ static int ice_vc_dis_qs_msg(struct ice_vf *vf, u8 *msg)
 		goto error_param;
 	}
 
-	if (vqs->rx_queues > ICE_MAX_BASE_QS_PER_VF ||
-	    vqs->tx_queues > ICE_MAX_BASE_QS_PER_VF) {
-		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
-		goto error_param;
-	}
-
 	vsi = pf->vsi[vf->lan_vsi_idx];
 	if (!vsi) {
 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
@@ -2206,7 +2495,7 @@ static int ice_vc_dis_qs_msg(struct ice_vf *vf, u8 *msg)
 	if (vqs->tx_queues) {
 		q_map = vqs->tx_queues;
 
-		for_each_set_bit(vf_q_id, &q_map, ICE_MAX_BASE_QS_PER_VF) {
+		for_each_set_bit(vf_q_id, &q_map, ICE_MAX_RSS_QS_PER_VF) {
 			struct ice_ring *ring = vsi->tx_rings[vf_q_id];
 			struct ice_txq_meta txq_meta = { 0 };
 
@@ -2237,7 +2526,7 @@ static int ice_vc_dis_qs_msg(struct ice_vf *vf, u8 *msg)
 	q_map = vqs->rx_queues;
 	/* speed up Rx queue disable by batching them if possible */
 	if (q_map &&
-	    bitmap_equal(&q_map, vf->rxq_ena, ICE_MAX_BASE_QS_PER_VF)) {
+	    bitmap_equal(&q_map, vf->rxq_ena, ICE_MAX_RSS_QS_PER_VF)) {
 		if (ice_vsi_stop_all_rx_rings(vsi)) {
 			dev_err(ice_pf_to_dev(vsi->back), "Failed to stop all Rx rings on VSI %d\n",
 				vsi->vsi_num);
@@ -2245,9 +2534,9 @@ static int ice_vc_dis_qs_msg(struct ice_vf *vf, u8 *msg)
 			goto error_param;
 		}
 
-		bitmap_zero(vf->rxq_ena, ICE_MAX_BASE_QS_PER_VF);
+		bitmap_zero(vf->rxq_ena, ICE_MAX_RSS_QS_PER_VF);
 	} else if (q_map) {
-		for_each_set_bit(vf_q_id, &q_map, ICE_MAX_BASE_QS_PER_VF) {
+		for_each_set_bit(vf_q_id, &q_map, ICE_MAX_RSS_QS_PER_VF) {
 			if (!ice_vc_isvalid_q_id(vf, vqs->vsi_id, vf_q_id)) {
 				v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 				goto error_param;
@@ -2281,6 +2570,57 @@ error_param:
 }
 
 /**
+ * ice_cfg_interrupt
+ * @vf: pointer to the VF info
+ * @vsi: the VSI being configured
+ * @vector_id: vector ID
+ * @map: vector map for mapping vectors to queues
+ * @q_vector: structure for interrupt vector
+ * configure the IRQ to queue map
+ */
+static int
+ice_cfg_interrupt(struct ice_vf *vf, struct ice_vsi *vsi, u16 vector_id,
+		  struct virtchnl_vector_map *map,
+		  struct ice_q_vector *q_vector)
+{
+	u16 vsi_q_id, vsi_q_id_idx;
+	unsigned long qmap;
+
+	q_vector->num_ring_rx = 0;
+	q_vector->num_ring_tx = 0;
+
+	qmap = map->rxq_map;
+	for_each_set_bit(vsi_q_id_idx, &qmap, ICE_MAX_RSS_QS_PER_VF) {
+		vsi_q_id = vsi_q_id_idx;
+
+		if (!ice_vc_isvalid_q_id(vf, vsi->vsi_num, vsi_q_id))
+			return VIRTCHNL_STATUS_ERR_PARAM;
+
+		q_vector->num_ring_rx++;
+		q_vector->rx.itr_idx = map->rxitr_idx;
+		vsi->rx_rings[vsi_q_id]->q_vector = q_vector;
+		ice_cfg_rxq_interrupt(vsi, vsi_q_id, vector_id,
+				      q_vector->rx.itr_idx);
+	}
+
+	qmap = map->txq_map;
+	for_each_set_bit(vsi_q_id_idx, &qmap, ICE_MAX_RSS_QS_PER_VF) {
+		vsi_q_id = vsi_q_id_idx;
+
+		if (!ice_vc_isvalid_q_id(vf, vsi->vsi_num, vsi_q_id))
+			return VIRTCHNL_STATUS_ERR_PARAM;
+
+		q_vector->num_ring_tx++;
+		q_vector->tx.itr_idx = map->txitr_idx;
+		vsi->tx_rings[vsi_q_id]->q_vector = q_vector;
+		ice_cfg_txq_interrupt(vsi, vsi_q_id, vector_id,
+				      q_vector->tx.itr_idx);
+	}
+
+	return VIRTCHNL_STATUS_SUCCESS;
+}
+
+/**
  * ice_vc_cfg_irq_map_msg
  * @vf: pointer to the VF info
  * @msg: pointer to the msg buffer
@@ -2290,13 +2630,11 @@ error_param:
 static int ice_vc_cfg_irq_map_msg(struct ice_vf *vf, u8 *msg)
 {
 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
+	u16 num_q_vectors_mapped, vsi_id, vector_id;
 	struct virtchnl_irq_map_info *irqmap_info;
-	u16 vsi_id, vsi_q_id, vector_id;
 	struct virtchnl_vector_map *map;
 	struct ice_pf *pf = vf->pf;
-	u16 num_q_vectors_mapped;
 	struct ice_vsi *vsi;
-	unsigned long qmap;
 	int i;
 
 	irqmap_info = (struct virtchnl_irq_map_info *)msg;
@@ -2307,8 +2645,8 @@ static int ice_vc_cfg_irq_map_msg(struct ice_vf *vf, u8 *msg)
 	 * there is actually at least a single VF queue vector mapped
 	 */
 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states) ||
-	    pf->num_vf_msix < num_q_vectors_mapped ||
-	    !irqmap_info->num_vectors) {
+	    pf->num_msix_per_vf < num_q_vectors_mapped ||
+	    !num_q_vectors_mapped) {
 		v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 		goto error_param;
 	}
@@ -2329,7 +2667,7 @@ static int ice_vc_cfg_irq_map_msg(struct ice_vf *vf, u8 *msg)
 		/* vector_id is always 0-based for each VF, and can never be
 		 * larger than or equal to the max allowed interrupts per VF
 		 */
-		if (!(vector_id < ICE_MAX_INTR_PER_VF) ||
+		if (!(vector_id < pf->num_msix_per_vf) ||
 		    !ice_vc_isvalid_vsi_id(vf, vsi_id) ||
 		    (!vector_id && (map->rxq_map || map->txq_map))) {
 			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
@@ -2350,33 +2688,10 @@ static int ice_vc_cfg_irq_map_msg(struct ice_vf *vf, u8 *msg)
 		}
 
 		/* lookout for the invalid queue index */
-		qmap = map->rxq_map;
-		q_vector->num_ring_rx = 0;
-		for_each_set_bit(vsi_q_id, &qmap, ICE_MAX_BASE_QS_PER_VF) {
-			if (!ice_vc_isvalid_q_id(vf, vsi_id, vsi_q_id)) {
-				v_ret = VIRTCHNL_STATUS_ERR_PARAM;
-				goto error_param;
-			}
-			q_vector->num_ring_rx++;
-			q_vector->rx.itr_idx = map->rxitr_idx;
-			vsi->rx_rings[vsi_q_id]->q_vector = q_vector;
-			ice_cfg_rxq_interrupt(vsi, vsi_q_id, vector_id,
-					      q_vector->rx.itr_idx);
-		}
-
-		qmap = map->txq_map;
-		q_vector->num_ring_tx = 0;
-		for_each_set_bit(vsi_q_id, &qmap, ICE_MAX_BASE_QS_PER_VF) {
-			if (!ice_vc_isvalid_q_id(vf, vsi_id, vsi_q_id)) {
-				v_ret = VIRTCHNL_STATUS_ERR_PARAM;
-				goto error_param;
-			}
-			q_vector->num_ring_tx++;
-			q_vector->tx.itr_idx = map->txitr_idx;
-			vsi->tx_rings[vsi_q_id]->q_vector = q_vector;
-			ice_cfg_txq_interrupt(vsi, vsi_q_id, vector_id,
-					      q_vector->tx.itr_idx);
-		}
+		v_ret = (enum virtchnl_status_code)
+			ice_cfg_interrupt(vf, vsi, vector_id, map, q_vector);
+		if (v_ret)
+			goto error_param;
 	}
 
 error_param:
@@ -2419,7 +2734,7 @@ static int ice_vc_cfg_qs_msg(struct ice_vf *vf, u8 *msg)
 		goto error_param;
 	}
 
-	if (qci->num_queue_pairs > ICE_MAX_BASE_QS_PER_VF ||
+	if (qci->num_queue_pairs > ICE_MAX_RSS_QS_PER_VF ||
 	    qci->num_queue_pairs > min_t(u16, vsi->alloc_txq, vsi->alloc_rxq)) {
 		dev_err(ice_pf_to_dev(pf), "VF-%d requesting more than supported number of queues: %d\n",
 			vf->vf_id, min_t(u16, vsi->alloc_txq, vsi->alloc_rxq));
@@ -2536,14 +2851,14 @@ ice_vc_add_mac_addr(struct ice_vf *vf, struct ice_vsi *vsi, u8 *mac_addr)
 		return -EPERM;
 	}
 
-	status = ice_vsi_cfg_mac_fltr(vsi, mac_addr, true);
+	status = ice_fltr_add_mac(vsi, mac_addr, ICE_FWD_TO_VSI);
 	if (status == ICE_ERR_ALREADY_EXISTS) {
 		dev_err(dev, "MAC %pM already exists for VF %d\n", mac_addr,
 			vf->vf_id);
 		return -EEXIST;
 	} else if (status) {
-		dev_err(dev, "Failed to add MAC %pM for VF %d\n, error %d\n",
-			mac_addr, vf->vf_id, status);
+		dev_err(dev, "Failed to add MAC %pM for VF %d\n, error %s\n",
+			mac_addr, vf->vf_id, ice_stat_str(status));
 		return -EIO;
 	}
 
@@ -2573,14 +2888,14 @@ ice_vc_del_mac_addr(struct ice_vf *vf, struct ice_vsi *vsi, u8 *mac_addr)
 	    ether_addr_equal(mac_addr, vf->dflt_lan_addr.addr))
 		return 0;
 
-	status = ice_vsi_cfg_mac_fltr(vsi, mac_addr, false);
+	status = ice_fltr_remove_mac(vsi, mac_addr, ICE_FWD_TO_VSI);
 	if (status == ICE_ERR_DOES_NOT_EXIST) {
 		dev_err(dev, "MAC %pM does not exist for VF %d\n", mac_addr,
 			vf->vf_id);
 		return -ENOENT;
 	} else if (status) {
-		dev_err(dev, "Failed to delete MAC %pM for VF %d, error %d\n",
-			mac_addr, vf->vf_id, status);
+		dev_err(dev, "Failed to delete MAC %pM for VF %d, error %s\n",
+			mac_addr, vf->vf_id, ice_stat_str(status));
 		return -EIO;
 	}
 
@@ -2710,8 +3025,8 @@ static int ice_vc_request_qs_msg(struct ice_vf *vf, u8 *msg)
 	struct ice_pf *pf = vf->pf;
 	u16 max_allowed_vf_queues;
 	u16 tx_rx_queue_left;
-	u16 cur_queues;
 	struct device *dev;
+	u16 cur_queues;
 
 	dev = ice_pf_to_dev(pf);
 	if (!test_bit(ICE_VF_STATE_ACTIVE, vf->vf_states)) {
@@ -2726,16 +3041,16 @@ static int ice_vc_request_qs_msg(struct ice_vf *vf, u8 *msg)
 	if (!req_queues) {
 		dev_err(dev, "VF %d tried to request 0 queues. Ignoring.\n",
 			vf->vf_id);
-	} else if (req_queues > ICE_MAX_BASE_QS_PER_VF) {
+	} else if (req_queues > ICE_MAX_RSS_QS_PER_VF) {
 		dev_err(dev, "VF %d tried to request more than %d queues.\n",
-			vf->vf_id, ICE_MAX_BASE_QS_PER_VF);
-		vfres->num_queue_pairs = ICE_MAX_BASE_QS_PER_VF;
+			vf->vf_id, ICE_MAX_RSS_QS_PER_VF);
+		vfres->num_queue_pairs = ICE_MAX_RSS_QS_PER_VF;
 	} else if (req_queues > cur_queues &&
 		   req_queues - cur_queues > tx_rx_queue_left) {
 		dev_warn(dev, "VF %d requested %u more queues, but only %u left.\n",
 			 vf->vf_id, req_queues - cur_queues, tx_rx_queue_left);
 		vfres->num_queue_pairs = min_t(u16, max_allowed_vf_queues,
-					       ICE_MAX_BASE_QS_PER_VF);
+					       ICE_MAX_RSS_QS_PER_VF);
 	} else {
 		/* request is successful, then reset VF */
 		vf->num_req_qs = req_queues;
@@ -2770,7 +3085,7 @@ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
 	struct device *dev;
 	struct ice_vf *vf;
 	u16 vlanprio;
-	int ret = 0;
+	int ret;
 
 	dev = ice_pf_to_dev(pf);
 	if (ice_validate_vf_id(pf, vf_id))
@@ -2789,15 +3104,17 @@ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
 
 	vf = &pf->vf[vf_id];
 	vsi = pf->vsi[vf->lan_vsi_idx];
-	if (ice_check_vf_init(pf, vf))
-		return -EBUSY;
+
+	ret = ice_check_vf_ready_for_cfg(vf);
+	if (ret)
+		return ret;
 
 	vlanprio = vlan_id | (qos << VLAN_PRIO_SHIFT);
 
 	if (vf->port_vlan_info == vlanprio) {
 		/* duplicate request, so just return success */
 		dev_dbg(dev, "Duplicate pvid %d request\n", vlanprio);
-		return ret;
+		return 0;
 	}
 
 	if (vlan_id || qos) {
@@ -2815,12 +3132,12 @@ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
 		/* add VLAN 0 filter back when transitioning from port VLAN to
 		 * no port VLAN. No change to old port VLAN on failure.
 		 */
-		ret = ice_vsi_add_vlan(vsi, 0);
+		ret = ice_vsi_add_vlan(vsi, 0, ICE_FWD_TO_VSI);
 		if (ret)
 			return ret;
 		ret = ice_vsi_manage_pvid(vsi, 0, false);
 		if (ret)
-			goto error_manage_pvid;
+			return ret;
 	}
 
 	if (vlan_id) {
@@ -2828,9 +3145,9 @@ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
 			 vlan_id, qos, vf_id);
 
 		/* add VLAN filter for the port VLAN */
-		ret = ice_vsi_add_vlan(vsi, vlan_id);
+		ret = ice_vsi_add_vlan(vsi, vlan_id, ICE_FWD_TO_VSI);
 		if (ret)
-			goto error_manage_pvid;
+			return ret;
 	}
 	/* remove old port VLAN filter with valid VLAN ID or QoS fields */
 	if (vf->port_vlan_info)
@@ -2839,8 +3156,7 @@ ice_set_vf_port_vlan(struct net_device *netdev, int vf_id, u16 vlan_id, u8 qos,
 	/* keep port VLAN information persistent on resets */
 	vf->port_vlan_info = le16_to_cpu(vsi->info.pvid);
 
-error_manage_pvid:
-	return ret;
+	return 0;
 }
 
 /**
@@ -2923,8 +3239,9 @@ static int ice_vc_process_vlan_msg(struct ice_vf *vf, u8 *msg, bool add_v)
 		goto error_param;
 	}
 
-	if (test_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states) ||
-	    test_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
+	if ((test_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states) ||
+	     test_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states)) &&
+	    test_bit(ICE_FLAG_VF_TRUE_PROMISC_ENA, pf->flags))
 		vlan_promisc = true;
 
 	if (add_v) {
@@ -2949,7 +3266,7 @@ static int ice_vc_process_vlan_msg(struct ice_vf *vf, u8 *msg, bool add_v)
 			if (!vid)
 				continue;
 
-			status = ice_vsi_add_vlan(vsi, vid);
+			status = ice_vsi_add_vlan(vsi, vid, ICE_FWD_TO_VSI);
 			if (status) {
 				v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 				goto error_param;
@@ -3248,6 +3565,9 @@ error_handler:
 	case VIRTCHNL_OP_GET_STATS:
 		err = ice_vc_get_stats_msg(vf, msg);
 		break;
+	case VIRTCHNL_OP_CONFIG_PROMISCUOUS_MODE:
+		err = ice_vc_cfg_promiscuous_mode_msg(vf, msg);
+		break;
 	case VIRTCHNL_OP_ADD_VLAN:
 		err = ice_vc_add_vlan_msg(vf, msg);
 		break;
@@ -3321,20 +3641,36 @@ ice_get_vf_cfg(struct net_device *netdev, int vf_id, struct ifla_vf_info *ivi)
 }
 
 /**
- * ice_wait_on_vf_reset
- * @vf: The VF being resseting
+ * ice_unicast_mac_exists - check if the unicast MAC exists on the PF's switch
+ * @pf: PF used to reference the switch's rules
+ * @umac: unicast MAC to compare against existing switch rules
  *
- * Poll to make sure a given VF is ready after reset
+ * Return true on the first/any match, else return false
  */
-static void ice_wait_on_vf_reset(struct ice_vf *vf)
+static bool ice_unicast_mac_exists(struct ice_pf *pf, u8 *umac)
 {
-	int i;
+	struct ice_sw_recipe *mac_recipe_list =
+		&pf->hw.switch_info->recp_list[ICE_SW_LKUP_MAC];
+	struct ice_fltr_mgmt_list_entry *list_itr;
+	struct list_head *rule_head;
+	struct mutex *rule_lock; /* protect MAC filter list access */
 
-	for (i = 0; i < ICE_MAX_VF_RESET_WAIT; i++) {
-		if (test_bit(ICE_VF_STATE_INIT, vf->vf_states))
-			break;
-		msleep(20);
+	rule_head = &mac_recipe_list->filt_rules;
+	rule_lock = &mac_recipe_list->filt_rule_lock;
+
+	mutex_lock(rule_lock);
+	list_for_each_entry(list_itr, rule_head, list_entry) {
+		u8 *existing_mac = &list_itr->fltr_info.l_data.mac.mac_addr[0];
+
+		if (ether_addr_equal(existing_mac, umac)) {
+			mutex_unlock(rule_lock);
+			return true;
+		}
 	}
+
+	mutex_unlock(rule_lock);
+
+	return false;
 }
 
 /**
@@ -3349,26 +3685,28 @@ int ice_set_vf_mac(struct net_device *netdev, int vf_id, u8 *mac)
 {
 	struct ice_pf *pf = ice_netdev_to_pf(netdev);
 	struct ice_vf *vf;
-	int ret = 0;
+	int ret;
 
 	if (ice_validate_vf_id(pf, vf_id))
 		return -EINVAL;
 
-	vf = &pf->vf[vf_id];
-	/* Don't set MAC on disabled VF */
-	if (ice_is_vf_disabled(vf))
-		return -EINVAL;
-
-	/* In case VF is in reset mode, wait until it is completed. Depending
-	 * on factors like queue disabling routine, this could take ~250ms
-	 */
-	ice_wait_on_vf_reset(vf);
-
-	if (ice_check_vf_init(pf, vf))
-		return -EBUSY;
-
 	if (is_zero_ether_addr(mac) || is_multicast_ether_addr(mac)) {
 		netdev_err(netdev, "%pM not a valid unicast address\n", mac);
+		return -EINVAL;
+	}
+
+	vf = &pf->vf[vf_id];
+	/* nothing left to do, unicast MAC already set */
+	if (ether_addr_equal(vf->dflt_lan_addr.addr, mac))
+		return 0;
+
+	ret = ice_check_vf_ready_for_cfg(vf);
+	if (ret)
+		return ret;
+
+	if (ice_unicast_mac_exists(pf, mac)) {
+		netdev_err(netdev, "Unicast MAC %pM already exists on this PF. Preventing setting VF %u unicast MAC address to %pM\n",
+			   mac, vf_id, mac);
 		return -EINVAL;
 	}
 
@@ -3383,7 +3721,7 @@ int ice_set_vf_mac(struct net_device *netdev, int vf_id, u8 *mac)
 		    vf_id, mac);
 
 	ice_vc_reset_vf(vf);
-	return ret;
+	return 0;
 }
 
 /**
@@ -3398,22 +3736,15 @@ int ice_set_vf_trust(struct net_device *netdev, int vf_id, bool trusted)
 {
 	struct ice_pf *pf = ice_netdev_to_pf(netdev);
 	struct ice_vf *vf;
+	int ret;
 
 	if (ice_validate_vf_id(pf, vf_id))
 		return -EINVAL;
 
 	vf = &pf->vf[vf_id];
-	/* Don't set Trusted Mode on disabled VF */
-	if (ice_is_vf_disabled(vf))
-		return -EINVAL;
-
-	/* In case VF is in reset mode, wait until it is completed. Depending
-	 * on factors like queue disabling routine, this could take ~250ms
-	 */
-	ice_wait_on_vf_reset(vf);
-
-	if (ice_check_vf_init(pf, vf))
-		return -EBUSY;
+	ret = ice_check_vf_ready_for_cfg(vf);
+	if (ret)
+		return ret;
 
 	/* Check if already trusted */
 	if (trusted == vf->trusted)
@@ -3439,13 +3770,15 @@ int ice_set_vf_link_state(struct net_device *netdev, int vf_id, int link_state)
 {
 	struct ice_pf *pf = ice_netdev_to_pf(netdev);
 	struct ice_vf *vf;
+	int ret;
 
 	if (ice_validate_vf_id(pf, vf_id))
 		return -EINVAL;
 
 	vf = &pf->vf[vf_id];
-	if (ice_check_vf_init(pf, vf))
-		return -EBUSY;
+	ret = ice_check_vf_ready_for_cfg(vf);
+	if (ret)
+		return ret;
 
 	switch (link_state) {
 	case IFLA_VF_LINK_STATE_AUTO:
@@ -3481,14 +3814,15 @@ int ice_get_vf_stats(struct net_device *netdev, int vf_id,
 	struct ice_eth_stats *stats;
 	struct ice_vsi *vsi;
 	struct ice_vf *vf;
+	int ret;
 
 	if (ice_validate_vf_id(pf, vf_id))
 		return -EINVAL;
 
 	vf = &pf->vf[vf_id];
-
-	if (ice_check_vf_init(pf, vf))
-		return -EBUSY;
+	ret = ice_check_vf_ready_for_cfg(vf);
+	if (ret)
+		return ret;
 
 	vsi = pf->vsi[vf->lan_vsi_idx];
 	if (!vsi)
@@ -3511,4 +3845,66 @@ int ice_get_vf_stats(struct net_device *netdev, int vf_id,
 	vf_stats->tx_dropped = stats->tx_discards;
 
 	return 0;
+}
+
+/**
+ * ice_print_vf_rx_mdd_event - print VF Rx malicious driver detect event
+ * @vf: pointer to the VF structure
+ */
+void ice_print_vf_rx_mdd_event(struct ice_vf *vf)
+{
+	struct ice_pf *pf = vf->pf;
+	struct device *dev;
+
+	dev = ice_pf_to_dev(pf);
+
+	dev_info(dev, "%d Rx Malicious Driver Detection events detected on PF %d VF %d MAC %pM. mdd-auto-reset-vfs=%s\n",
+		 vf->mdd_rx_events.count, pf->hw.pf_id, vf->vf_id,
+		 vf->dflt_lan_addr.addr,
+		 test_bit(ICE_FLAG_MDD_AUTO_RESET_VF, pf->flags)
+			  ? "on" : "off");
+}
+
+/**
+ * ice_print_vfs_mdd_event - print VFs malicious driver detect event
+ * @pf: pointer to the PF structure
+ *
+ * Called from ice_handle_mdd_event to rate limit and print VFs MDD events.
+ */
+void ice_print_vfs_mdd_events(struct ice_pf *pf)
+{
+	struct device *dev = ice_pf_to_dev(pf);
+	struct ice_hw *hw = &pf->hw;
+	int i;
+
+	/* check that there are pending MDD events to print */
+	if (!test_and_clear_bit(__ICE_MDD_VF_PRINT_PENDING, pf->state))
+		return;
+
+	/* VF MDD event logs are rate limited to one second intervals */
+	if (time_is_after_jiffies(pf->last_printed_mdd_jiffies + HZ * 1))
+		return;
+
+	pf->last_printed_mdd_jiffies = jiffies;
+
+	ice_for_each_vf(pf, i) {
+		struct ice_vf *vf = &pf->vf[i];
+
+		/* only print Rx MDD event message if there are new events */
+		if (vf->mdd_rx_events.count != vf->mdd_rx_events.last_printed) {
+			vf->mdd_rx_events.last_printed =
+							vf->mdd_rx_events.count;
+			ice_print_vf_rx_mdd_event(vf);
+		}
+
+		/* only print Tx MDD event message if there are new events */
+		if (vf->mdd_tx_events.count != vf->mdd_tx_events.last_printed) {
+			vf->mdd_tx_events.last_printed =
+							vf->mdd_tx_events.count;
+
+			dev_info(dev, "%d Tx Malicious Driver Detection events detected on PF %d VF %d MAC %pM.\n",
+				 vf->mdd_tx_events.count, hw->pf_id, i,
+				 vf->dflt_lan_addr.addr);
+		}
+	}
 }

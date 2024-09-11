@@ -9,6 +9,7 @@
 #include "builtin.h"
 
 #include "util/color.h"
+#include "util/dso.h"
 #include "util/evlist.h"
 #include "util/evsel.h"
 #include "util/map.h"
@@ -20,6 +21,7 @@
 #include "util/auxtrace.h"
 #include "util/jit.h"
 #include "util/symbol.h"
+#include "util/synthetic-events.h"
 #include "util/thread.h"
 #include <linux/err.h>
 
@@ -97,7 +99,7 @@ static int perf_event__repipe_op2_synth(struct perf_session *session,
 
 static int perf_event__repipe_attr(struct perf_tool *tool,
 				   union perf_event *event,
-				   struct perf_evlist **pevlist)
+				   struct evlist **pevlist)
 {
 	struct perf_inject *inject = container_of(tool, struct perf_inject,
 						  tool);
@@ -238,13 +240,13 @@ perf_inject__cut_auxtrace_sample(struct perf_inject *inject,
 typedef int (*inject_handler)(struct perf_tool *tool,
 			      union perf_event *event,
 			      struct perf_sample *sample,
-			      struct perf_evsel *evsel,
+			      struct evsel *evsel,
 			      struct machine *machine);
 
 static int perf_event__repipe_sample(struct perf_tool *tool,
 				     union perf_event *event,
 				     struct perf_sample *sample,
-				     struct perf_evsel *evsel,
+				     struct evsel *evsel,
 				     struct machine *machine)
 {
 	struct perf_inject *inject = container_of(tool, struct perf_inject,
@@ -442,7 +444,7 @@ static int dso__inject_build_id(struct dso *dso, struct perf_tool *tool,
 static int perf_event__inject_buildid(struct perf_tool *tool,
 				      union perf_event *event,
 				      struct perf_sample *sample,
-				      struct perf_evsel *evsel __maybe_unused,
+				      struct evsel *evsel __maybe_unused,
 				      struct machine *machine)
 {
 	struct addr_location al;
@@ -483,7 +485,7 @@ repipe:
 static int perf_inject__sched_process_exit(struct perf_tool *tool,
 					   union perf_event *event __maybe_unused,
 					   struct perf_sample *sample,
-					   struct perf_evsel *evsel __maybe_unused,
+					   struct evsel *evsel __maybe_unused,
 					   struct machine *machine __maybe_unused)
 {
 	struct perf_inject *inject = container_of(tool, struct perf_inject, tool);
@@ -503,7 +505,7 @@ static int perf_inject__sched_process_exit(struct perf_tool *tool,
 static int perf_inject__sched_switch(struct perf_tool *tool,
 				     union perf_event *event,
 				     struct perf_sample *sample,
-				     struct perf_evsel *evsel,
+				     struct evsel *evsel,
 				     struct machine *machine)
 {
 	struct perf_inject *inject = container_of(tool, struct perf_inject, tool);
@@ -527,7 +529,7 @@ static int perf_inject__sched_switch(struct perf_tool *tool,
 static int perf_inject__sched_stat(struct perf_tool *tool,
 				   union perf_event *event __maybe_unused,
 				   struct perf_sample *sample,
-				   struct perf_evsel *evsel,
+				   struct evsel *evsel,
 				   struct machine *machine)
 {
 	struct event_entry *ent;
@@ -548,8 +550,8 @@ found:
 
 	sample_sw.period = sample->period;
 	sample_sw.time	 = sample->time;
-	perf_event__synthesize_sample(event_sw, evsel->attr.sample_type,
-				      evsel->attr.read_format, &sample_sw);
+	perf_event__synthesize_sample(event_sw, evsel->core.attr.sample_type,
+				      evsel->core.attr.read_format, &sample_sw);
 	build_id__mark_dso_hit(tool, event_sw, &sample_sw, evsel, machine);
 	return perf_event__repipe(tool, event_sw, &sample_sw, machine);
 }
@@ -559,10 +561,10 @@ static void sig_handler(int sig __maybe_unused)
 	session_done = 1;
 }
 
-static int perf_evsel__check_stype(struct perf_evsel *evsel,
+static int perf_evsel__check_stype(struct evsel *evsel,
 				   u64 sample_type, const char *sample_msg)
 {
-	struct perf_event_attr *attr = &evsel->attr;
+	struct perf_event_attr *attr = &evsel->core.attr;
 	const char *name = perf_evsel__name(evsel);
 
 	if (!(attr->sample_type & sample_type)) {
@@ -577,7 +579,7 @@ static int perf_evsel__check_stype(struct perf_evsel *evsel,
 static int drop_sample(struct perf_tool *tool __maybe_unused,
 		       union perf_event *event __maybe_unused,
 		       struct perf_sample *sample __maybe_unused,
-		       struct perf_evsel *evsel __maybe_unused,
+		       struct evsel *evsel __maybe_unused,
 		       struct machine *machine __maybe_unused)
 {
 	return 0;
@@ -585,65 +587,13 @@ static int drop_sample(struct perf_tool *tool __maybe_unused,
 
 static void strip_init(struct perf_inject *inject)
 {
-	struct perf_evlist *evlist = inject->session->evlist;
-	struct perf_evsel *evsel;
+	struct evlist *evlist = inject->session->evlist;
+	struct evsel *evsel;
 
 	inject->tool.context_switch = perf_event__drop;
 
 	evlist__for_each_entry(evlist, evsel)
 		evsel->handler = drop_sample;
-}
-
-static bool has_tracking(struct perf_evsel *evsel)
-{
-	return evsel->attr.mmap || evsel->attr.mmap2 || evsel->attr.comm ||
-	       evsel->attr.task;
-}
-
-#define COMPAT_MASK (PERF_SAMPLE_ID | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | \
-		     PERF_SAMPLE_ID | PERF_SAMPLE_CPU | PERF_SAMPLE_IDENTIFIER)
-
-/*
- * In order that the perf.data file is parsable, tracking events like MMAP need
- * their selected event to exist, except if there is only 1 selected event left
- * and it has a compatible sample type.
- */
-static bool ok_to_remove(struct perf_evlist *evlist,
-			 struct perf_evsel *evsel_to_remove)
-{
-	struct perf_evsel *evsel;
-	int cnt = 0;
-	bool ok = false;
-
-	if (!has_tracking(evsel_to_remove))
-		return true;
-
-	evlist__for_each_entry(evlist, evsel) {
-		if (evsel->handler != drop_sample) {
-			cnt += 1;
-			if ((evsel->attr.sample_type & COMPAT_MASK) ==
-			    (evsel_to_remove->attr.sample_type & COMPAT_MASK))
-				ok = true;
-		}
-	}
-
-	return ok && cnt == 1;
-}
-
-static void strip_fini(struct perf_inject *inject)
-{
-	struct perf_evlist *evlist = inject->session->evlist;
-	struct perf_evsel *evsel, *tmp;
-
-	/* Remove non-synthesized evsels if possible */
-	evlist__for_each_entry_safe(evlist, tmp, evsel) {
-		if (evsel->handler == drop_sample &&
-		    ok_to_remove(evlist, evsel)) {
-			pr_debug("Deleting %s\n", perf_evsel__name(evsel));
-			perf_evlist__remove(evlist, evsel);
-			perf_evsel__delete(evsel);
-		}
-	}
 }
 
 static int __cmd_inject(struct perf_inject *inject)
@@ -669,7 +619,7 @@ static int __cmd_inject(struct perf_inject *inject)
 	if (inject->build_ids) {
 		inject->tool.sample = perf_event__inject_buildid;
 	} else if (inject->sched_stat) {
-		struct perf_evsel *evsel;
+		struct evsel *evsel;
 
 		evlist__for_each_entry(session->evlist, evsel) {
 			const char *name = perf_evsel__name(evsel);
@@ -730,7 +680,7 @@ static int __cmd_inject(struct perf_inject *inject)
 		 * remove the evsel.
 		 */
 		if (inject->itrace_synth_opts.set) {
-			struct perf_evsel *evsel;
+			struct evsel *evsel;
 
 			perf_header__clear_feat(&session->header,
 						HEADER_AUXTRACE);
@@ -742,11 +692,9 @@ static int __cmd_inject(struct perf_inject *inject)
 			if (evsel) {
 				pr_debug("Deleting %s\n",
 					 perf_evsel__name(evsel));
-				perf_evlist__remove(session->evlist, evsel);
-				perf_evsel__delete(evsel);
+				evlist__remove(session->evlist, evsel);
+				evsel__delete(evsel);
 			}
-			if (inject->strip)
-				strip_fini(inject);
 		}
 		session->header.data_offset = output_data_offset;
 		session->header.data_size = inject->bytes_written;

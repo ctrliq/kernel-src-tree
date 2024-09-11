@@ -302,9 +302,14 @@ static void nvdimm_bus_release(struct device *dev)
 	kfree(nvdimm_bus);
 }
 
+static const struct device_type nvdimm_bus_dev_type = {
+	.release = nvdimm_bus_release,
+	.groups = nvdimm_bus_attribute_groups,
+};
+
 static bool is_nvdimm_bus(struct device *dev)
 {
-	return dev->release == nvdimm_bus_release;
+	return dev->type == &nvdimm_bus_dev_type;
 }
 
 struct nvdimm_bus *walk_to_nvdimm_bus(struct device *nd_dev)
@@ -357,7 +362,7 @@ struct nvdimm_bus *nvdimm_bus_register(struct device *parent,
 	badrange_init(&nvdimm_bus->badrange);
 	nvdimm_bus->nd_desc = nd_desc;
 	nvdimm_bus->dev.parent = parent;
-	nvdimm_bus->dev.release = nvdimm_bus_release;
+	nvdimm_bus->dev.type = &nvdimm_bus_dev_type;
 	nvdimm_bus->dev.groups = nd_desc->attr_groups;
 	nvdimm_bus->dev.bus = &nvdimm_bus_type;
 	nvdimm_bus->dev.of_node = nd_desc->of_node;
@@ -1256,7 +1261,7 @@ static const struct file_operations nvdimm_bus_fops = {
 	.owner = THIS_MODULE,
 	.open = nd_open,
 	.unlocked_ioctl = bus_ioctl,
-	.compat_ioctl = bus_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.llseek = noop_llseek,
 };
 
@@ -1264,7 +1269,7 @@ static const struct file_operations nvdimm_fops = {
 	.owner = THIS_MODULE,
 	.open = nd_open,
 	.unlocked_ioctl = dimm_ioctl,
-	.compat_ioctl = dimm_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.llseek = noop_llseek,
 };
 

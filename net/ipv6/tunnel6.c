@@ -232,16 +232,14 @@ static void tunnel46_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 			break;
 }
 
-static int tunnelmpls6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+static void tunnelmpls6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 			   u8 type, u8 code, int offset, __be32 info)
 {
 	struct xfrm6_tunnel *handler;
 
 	for_each_tunnel_rcu(tunnelmpls6_handlers, handler)
 		if (!handler->err_handler(skb, opt, type, code, offset, info))
-			return 0;
-
-	return -ENOENT;
+			break;
 }
 
 static const struct inet6_protocol tunnel6_protocol = {

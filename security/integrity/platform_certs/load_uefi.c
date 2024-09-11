@@ -68,22 +68,22 @@ static __init void *get_cert_list(efi_char16_t *name, efi_guid_t *guid,
 /*
  * load_moklist_certs() - Load MokList certs
  *
+ * Returns:	Summary error status
+ *
  * Load the certs contained in the UEFI MokListRT database into the
  * platform trusted keyring.
  *
  * This routine checks the EFI MOK config table first. If and only if
  * that fails, this routine uses the MokListRT ordinary UEFI variable.
- *
- * Return:	Status
  */
 static int __init load_moklist_certs(void)
 {
-	struct efi_mokvar_table_entry *mokvar_entry;
 	efi_guid_t mok_var = EFI_SHIM_LOCK_GUID;
-	void *mok;
-	unsigned long moksize;
+	void *mok = NULL;
+	unsigned long moksize = 0;
 	efi_status_t status;
-	int rc;
+	struct efi_mokvar_table_entry *mokvar_entry = NULL;
+	int rc = 0;
 
 	/* First try to load certs from the EFI MOKvar config table.
 	 * It's not an error if the MOKvar config table doesn't exist
@@ -107,19 +107,19 @@ static int __init load_moklist_certs(void)
 	 * if we can't get it.
 	 */
 	mok = get_cert_list(L"MokListRT", &mok_var, &moksize, &status);
-	if (mok) {
+	if (!mok) {
+		if (status == EFI_NOT_FOUND)
+			pr_debug("MokListRT variable wasn't found\n");
+		else
+			pr_info("Couldn't get UEFI MokListRT\n");
+	} else {
 		rc = parse_efi_signature_list("UEFI:MokListRT",
 					      mok, moksize, get_handler_for_db);
-		kfree(mok);
 		if (rc)
 			pr_err("Couldn't parse MokListRT signatures: %d\n", rc);
-		return rc;
+		kfree(mok);
 	}
-	if (status == EFI_NOT_FOUND)
-		pr_debug("MokListRT variable wasn't found\n");
-	else
-		pr_info("Couldn't get UEFI MokListRT\n");
-	return 0;
+	return rc;
 }
 
 /*

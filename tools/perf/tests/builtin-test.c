@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <sys/wait.h>
@@ -169,8 +170,8 @@ static struct test generic_tests[] = {
 		.func = test__mmap_thread_lookup,
 	},
 	{
-		.desc = "Share thread mg",
-		.func = test__thread_mg_share,
+		.desc = "Share thread maps",
+		.func = test__thread_maps_share,
 	},
 	{
 		.desc = "Sort output of hist entries",
@@ -262,6 +263,11 @@ static struct test generic_tests[] = {
 		.desc = "Print cpu map",
 		.func = test__cpu_map_print,
 	},
+	{
+		.desc = "Merge cpu map",
+		.func = test__cpu_map_merge,
+	},
+
 	{
 		.desc = "Probe SDT events",
 		.func = test__sdt_event,

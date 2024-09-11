@@ -436,7 +436,7 @@ struct vfsmount *nfs_do_submount(struct dentry *, struct nfs_fh *,
 				 struct nfs_fattr *, rpc_authflavor_t);
 
 /* getroot.c */
-extern struct dentry *nfs_get_root(struct super_block *, struct nfs_fh *,
+extern struct dentry *nfs_get_root(struct super_block *, struct nfs_mount_info *,
 				   const char *);
 #if IS_ENABLED(CONFIG_NFS_V4)
 extern struct dentry *nfs4_get_root(struct super_block *, struct nfs_fh *,

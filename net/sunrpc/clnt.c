@@ -590,6 +590,9 @@ struct rpc_clnt *rpc_create(struct rpc_create_args *args)
 	xprt->resvport = 1;
 	if (args->flags & RPC_CLNT_CREATE_NONPRIVPORT)
 		xprt->resvport = 0;
+	xprt->reuseport = 0;
+	if (args->flags & RPC_CLNT_CREATE_REUSEPORT)
+		xprt->reuseport = 1;
 
 	clnt = rpc_create_xprt(args, xprt);
 	if (IS_ERR(clnt) || args->nconnect <= 1)
@@ -845,14 +848,8 @@ void rpc_killall_tasks(struct rpc_clnt *clnt)
 	 * Spin lock all_tasks to prevent changes...
 	 */
 	spin_lock(&clnt->cl_lock);
-	list_for_each_entry(rovr, &clnt->cl_tasks, tk_task) {
-		if (!RPC_IS_ACTIVATED(rovr))
-			continue;
-		if (!(rovr->tk_flags & RPC_TASK_KILLED)) {
-			rovr->tk_flags |= RPC_TASK_KILLED;
-			rpc_exit(rovr, -EIO);
-		}
-	}
+	list_for_each_entry(rovr, &clnt->cl_tasks, tk_task)
+		rpc_signal_task(rovr);
 	spin_unlock(&clnt->cl_lock);
 }
 EXPORT_SYMBOL_GPL(rpc_killall_tasks);
@@ -983,11 +980,10 @@ out:
 }
 EXPORT_SYMBOL_GPL(rpc_bind_new_program);
 
-static struct rpc_xprt *
-rpc_task_get_xprt(struct rpc_clnt *clnt)
+struct rpc_xprt *
+rpc_task_get_xprt(struct rpc_clnt *clnt, struct rpc_xprt *xprt)
 {
 	struct rpc_xprt_switch *xps;
-	struct rpc_xprt *xprt= xprt_iter_get_next(&clnt->cl_xpi);
 
 	if (!xprt)
 		return NULL;
@@ -1044,11 +1040,32 @@ void rpc_task_release_client(struct rpc_task *task)
 	}
 }
 
+static struct rpc_xprt *
+rpc_task_get_first_xprt(struct rpc_clnt *clnt)
+{
+	struct rpc_xprt *xprt;
+
+	rcu_read_lock();
+	xprt = xprt_get(rcu_dereference(clnt->cl_xprt));
+	rcu_read_unlock();
+	return rpc_task_get_xprt(clnt, xprt);
+}
+
+static struct rpc_xprt *
+rpc_task_get_next_xprt(struct rpc_clnt *clnt)
+{
+	return rpc_task_get_xprt(clnt, xprt_iter_get_next(&clnt->cl_xpi));
+}
+
 static
 void rpc_task_set_transport(struct rpc_task *task, struct rpc_clnt *clnt)
 {
-	if (!task->tk_xprt)
-		task->tk_xprt = rpc_task_get_xprt(clnt);
+	if (task->tk_xprt)
+		return;
+	if (task->tk_flags & RPC_TASK_NO_ROUND_ROBIN)
+		task->tk_xprt = rpc_task_get_first_xprt(clnt);
+	else
+		task->tk_xprt = rpc_task_get_next_xprt(clnt);
 }
 
 static
@@ -1542,8 +1559,6 @@ EXPORT_SYMBOL_GPL(rpc_force_rebind);
 static int
 __rpc_restart_call(struct rpc_task *task, void (*action)(struct rpc_task *))
 {
-	if (RPC_ASSASSINATED(task))
-		return 0;
 	task->tk_status = 0;
 	task->tk_rpc_status = 0;
 	task->tk_action = action;
@@ -1814,7 +1829,7 @@ call_allocate(struct rpc_task *task)
 		return;
 	}
 
-	rpc_exit(task, -ERESTARTSYS);
+	rpc_call_rpcerror(task, -ERESTARTSYS);
 }
 
 static int
@@ -2552,7 +2567,7 @@ rpc_encode_header(struct rpc_task *task, struct xdr_stream *xdr)
 	return 0;
 out_fail:
 	trace_rpc_bad_callhdr(task);
-	rpc_exit(task, error);
+	rpc_call_rpcerror(task, error);
 	return error;
 }
 
@@ -2619,7 +2634,7 @@ out_garbage:
 		return -EAGAIN;
 	}
 out_err:
-	rpc_exit(task, error);
+	rpc_call_rpcerror(task, error);
 	return error;
 
 out_unparsable:
@@ -2885,7 +2900,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
 	struct rpc_xprt *xprt;
 	unsigned long connect_timeout;
 	unsigned long reconnect_timeout;
-	unsigned char resvport;
+	unsigned char resvport, reuseport;
 	int ret = 0;
 
 	rcu_read_lock();
@@ -2897,6 +2912,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
 		return -EAGAIN;
 	}
 	resvport = xprt->resvport;
+	reuseport = xprt->reuseport;
 	connect_timeout = xprt->connect_timeout;
 	reconnect_timeout = xprt->max_reconnect_timeout;
 	rcu_read_unlock();
@@ -2907,6 +2923,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
 		goto out_put_switch;
 	}
 	xprt->resvport = resvport;
+	xprt->reuseport = reuseport;
 	if (xprt->ops->set_connect_timeout != NULL)
 		xprt->ops->set_connect_timeout(xprt,
 				connect_timeout,

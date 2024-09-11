@@ -120,20 +120,13 @@ static void ib_uverbs_release_dev(struct device *device)
 
 	uverbs_destroy_api(dev->uapi);
 	cleanup_srcu_struct(&dev->disassociate_srcu);
+	mutex_destroy(&dev->lists_mutex);
+	mutex_destroy(&dev->xrcd_tree_mutex);
 	kfree(dev);
 }
 
-static void ib_uverbs_release_async_event_file(struct kref *ref)
-{
-	struct ib_uverbs_async_event_file *file =
-		container_of(ref, struct ib_uverbs_async_event_file, ref);
-
-	kfree(file);
-}
-
-void ib_uverbs_release_ucq(struct ib_uverbs_file *file,
-			  struct ib_uverbs_completion_event_file *ev_file,
-			  struct ib_ucq_object *uobj)
+void ib_uverbs_release_ucq(struct ib_uverbs_completion_event_file *ev_file,
+			   struct ib_ucq_object *uobj)
 {
 	struct ib_uverbs_event *evt, *tmp;
 
@@ -148,20 +141,21 @@ void ib_uverbs_release_ucq(struct ib_uverbs_file *file,
 		uverbs_uobject_put(&ev_file->uobj);
 	}
 
-	ib_uverbs_release_uevent(file, &uobj->uevent);
+	ib_uverbs_release_uevent(&uobj->uevent);
 }
 
-void ib_uverbs_release_uevent(struct ib_uverbs_file *file,
-			      struct ib_uevent_object *uobj)
+void ib_uverbs_release_uevent(struct ib_uevent_object *uobj)
 {
+	struct ib_uverbs_async_event_file *async_file =
+		READ_ONCE(uobj->uobject.ufile->async_file);
 	struct ib_uverbs_event *evt, *tmp;
 
-	spin_lock_irq(&file->async_file->ev_queue.lock);
+	spin_lock_irq(&async_file->ev_queue.lock);
 	list_for_each_entry_safe(evt, tmp, &uobj->event_list, obj_list) {
 		list_del(&evt->list);
 		kfree(evt);
 	}
-	spin_unlock_irq(&file->async_file->ev_queue.lock);
+	spin_unlock_irq(&async_file->ev_queue.lock);
 }
 
 void ib_uverbs_detach_umcast(struct ib_qp *qp,
@@ -201,12 +195,13 @@ void ib_uverbs_release_file(struct kref *ref)
 		ib_uverbs_comp_dev(file->device);
 
 	if (file->async_file)
-		kref_put(&file->async_file->ref,
-			 ib_uverbs_release_async_event_file);
+		uverbs_uobject_put(&file->async_file->uobj);
 	put_device(&file->device->dev);
 
 	if (file->disassociate_page)
 		__free_pages(file->disassociate_page, 0);
+	mutex_destroy(&file->umap_lock);
+	mutex_destroy(&file->ucontext_lock);
 	kfree(file);
 }
 
@@ -335,35 +330,6 @@ static int ib_uverbs_comp_event_fasync(int fd, struct file *filp, int on)
 	return fasync_helper(fd, filp, on, &comp_ev_file->ev_queue.async_queue);
 }
 
-static int ib_uverbs_async_event_close(struct inode *inode, struct file *filp)
-{
-	struct ib_uverbs_async_event_file *file = filp->private_data;
-	struct ib_uverbs_file *uverbs_file = file->uverbs_file;
-	struct ib_uverbs_event *entry, *tmp;
-	int closed_already = 0;
-
-	mutex_lock(&uverbs_file->device->lists_mutex);
-	spin_lock_irq(&file->ev_queue.lock);
-	closed_already = file->ev_queue.is_closed;
-	file->ev_queue.is_closed = 1;
-	list_for_each_entry_safe(entry, tmp, &file->ev_queue.event_list, list) {
-		if (entry->counter)
-			list_del(&entry->obj_list);
-		kfree(entry);
-	}
-	spin_unlock_irq(&file->ev_queue.lock);
-	if (!closed_already) {
-		list_del(&file->list);
-		ib_unregister_event_handler(&uverbs_file->event_handler);
-	}
-	mutex_unlock(&uverbs_file->device->lists_mutex);
-
-	kref_put(&uverbs_file->ref, ib_uverbs_release_file);
-	kref_put(&file->ref, ib_uverbs_release_async_event_file);
-
-	return 0;
-}
-
 const struct file_operations uverbs_event_fops = {
 	.owner	 = THIS_MODULE,
 	.read	 = ib_uverbs_comp_event_read,
@@ -373,11 +339,11 @@ const struct file_operations uverbs_event_fops = {
 	.llseek	 = no_llseek,
 };
 
-static const struct file_operations uverbs_async_event_fops = {
+const struct file_operations uverbs_async_event_fops = {
 	.owner	 = THIS_MODULE,
 	.read	 = ib_uverbs_async_event_read,
 	.poll    = ib_uverbs_async_event_poll,
-	.release = ib_uverbs_async_event_close,
+	.release = uverbs_async_event_release,
 	.fasync  = ib_uverbs_async_event_fasync,
 	.llseek	 = no_llseek,
 };
@@ -417,10 +383,9 @@ void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context)
 	kill_fasync(&ev_queue->async_queue, SIGIO, POLL_IN);
 }
 
-static void
-ib_uverbs_async_handler(struct ib_uverbs_async_event_file *async_file,
-			__u64 element, __u64 event, struct list_head *obj_list,
-			u32 *counter)
+void ib_uverbs_async_handler(struct ib_uverbs_async_event_file *async_file,
+			     __u64 element, __u64 event,
+			     struct list_head *obj_list, u32 *counter)
 {
 	struct ib_uverbs_event *entry;
 	unsigned long flags;
@@ -454,7 +419,7 @@ ib_uverbs_async_handler(struct ib_uverbs_async_event_file *async_file,
 static void uverbs_uobj_event(struct ib_uevent_object *eobj,
 			      struct ib_event *event)
 {
-	ib_uverbs_async_handler(eobj->uobject.ufile->async_file,
+	ib_uverbs_async_handler(READ_ONCE(eobj->uobject.ufile->async_file),
 				eobj->uobject.user_handle, event->event,
 				&eobj->event_list, &eobj->events_reported);
 }
@@ -487,15 +452,9 @@ static void ib_uverbs_event_handler(struct ib_event_handler *handler,
 				    struct ib_event *event)
 {
 	ib_uverbs_async_handler(
-		container_of(handler, struct ib_uverbs_file, event_handler)
-			->async_file,
+		container_of(handler, struct ib_uverbs_async_event_file,
+			     event_handler),
 		event->element.port_num, event->event, NULL, NULL);
-}
-
-void ib_uverbs_free_async_event_file(struct ib_uverbs_file *file)
-{
-	kref_put(&file->async_file->ref, ib_uverbs_release_async_event_file);
-	file->async_file = NULL;
 }
 
 void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue)
@@ -507,45 +466,25 @@ void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue)
 	ev_queue->async_queue = NULL;
 }
 
-struct file *ib_uverbs_alloc_async_event_file(struct ib_uverbs_file *uverbs_file,
-					      struct ib_device	*ib_dev)
+void ib_uverbs_init_async_event_file(
+	struct ib_uverbs_async_event_file *async_file)
 {
-	struct ib_uverbs_async_event_file *ev_file;
-	struct file *filp;
+	struct ib_uverbs_file *uverbs_file = async_file->uobj.ufile;
+	struct ib_device *ib_dev = async_file->uobj.context->device;
 
-	ev_file = kzalloc(sizeof(*ev_file), GFP_KERNEL);
-	if (!ev_file)
-		return ERR_PTR(-ENOMEM);
+	ib_uverbs_init_event_queue(&async_file->ev_queue);
 
-	ib_uverbs_init_event_queue(&ev_file->ev_queue);
-	ev_file->uverbs_file = uverbs_file;
-	kref_get(&ev_file->uverbs_file->ref);
-	kref_init(&ev_file->ref);
-	filp = anon_inode_getfile("[infinibandevent]", &uverbs_async_event_fops,
-				  ev_file, O_RDONLY);
-	if (IS_ERR(filp))
-		goto err_put_refs;
+	/* The first async_event_file becomes the default one for the file. */
+	lockdep_assert_held(&uverbs_file->ucontext_lock);
+	if (!uverbs_file->async_file) {
+		/* Pairs with the put in ib_uverbs_release_file */
+		uverbs_uobject_get(&async_file->uobj);
+		smp_store_release(&uverbs_file->async_file, async_file);
+	}
 
-	mutex_lock(&uverbs_file->device->lists_mutex);
-	list_add_tail(&ev_file->list,
-		      &uverbs_file->device->uverbs_events_file_list);
-	mutex_unlock(&uverbs_file->device->lists_mutex);
-
-	WARN_ON(uverbs_file->async_file);
-	uverbs_file->async_file = ev_file;
-	kref_get(&uverbs_file->async_file->ref);
-	INIT_IB_EVENT_HANDLER(&uverbs_file->event_handler,
-			      ib_dev,
+	INIT_IB_EVENT_HANDLER(&async_file->event_handler, ib_dev,
 			      ib_uverbs_event_handler);
-	ib_register_event_handler(&uverbs_file->event_handler);
-	/* At that point async file stuff was fully set */
-
-	return filp;
-
-err_put_refs:
-	kref_put(&ev_file->uverbs_file->ref, ib_uverbs_release_file);
-	kref_put(&ev_file->ref, ib_uverbs_release_async_event_file);
-	return filp;
+	ib_register_event_handler(&async_file->event_handler);
 }
 
 static ssize_t verify_hdr(struct ib_uverbs_cmd_hdr *hdr,
@@ -721,6 +660,8 @@ out_unlock:
 	return (ret) ? : count;
 }
 
+static const struct vm_operations_struct rdma_umap_ops;
+
 static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct ib_uverbs_file *file = filp->private_data;
@@ -734,43 +675,11 @@ static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
 		ret = PTR_ERR(ucontext);
 		goto out;
 	}
-
+	vma->vm_ops = &rdma_umap_ops;
 	ret = ucontext->device->ops.mmap(ucontext, vma);
 out:
 	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
 	return ret;
-}
-
-/*
- * Each time we map IO memory into user space this keeps track of the mapping.
- * When the device is hot-unplugged we 'zap' the mmaps in user space to point
- * to the zero page and allow the hot unplug to proceed.
- *
- * This is necessary for cases like PCI physical hot unplug as the actual BAR
- * memory may vanish after this and access to it from userspace could MCE.
- *
- * RDMA drivers supporting disassociation must have their user space designed
- * to cope in some way with their IO pages going to the zero page.
- */
-struct rdma_umap_priv {
-	struct vm_area_struct *vma;
-	struct list_head list;
-};
-
-static const struct vm_operations_struct rdma_umap_ops;
-
-static void rdma_umap_priv_init(struct rdma_umap_priv *priv,
-				struct vm_area_struct *vma)
-{
-	struct ib_uverbs_file *ufile = vma->vm_file->private_data;
-
-	priv->vma = vma;
-	vma->vm_private_data = priv;
-	vma->vm_ops = &rdma_umap_ops;
-
-	mutex_lock(&ufile->umap_lock);
-	list_add(&priv->list, &ufile->umaps);
-	mutex_unlock(&ufile->umap_lock);
 }
 
 /*
@@ -798,7 +707,7 @@ static void rdma_umap_open(struct vm_area_struct *vma)
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		goto out_unlock;
-	rdma_umap_priv_init(priv, vma);
+	rdma_umap_priv_init(priv, vma, opriv->entry);
 
 	up_read(&ufile->hw_destroy_rwsem);
 	return;
@@ -829,6 +738,9 @@ static void rdma_umap_close(struct vm_area_struct *vma)
 	 * this point.
 	 */
 	mutex_lock(&ufile->umap_lock);
+	if (priv->entry)
+		rdma_user_mmap_entry_put(priv->entry);
+
 	list_del(&priv->list);
 	mutex_unlock(&ufile->umap_lock);
 	kfree(priv);
@@ -879,44 +791,6 @@ static const struct vm_operations_struct rdma_umap_ops = {
 	.close = rdma_umap_close,
 	.fault = rdma_umap_fault,
 };
-
-/*
- * Map IO memory into a process. This is to be called by drivers as part of
- * their mmap() functions if they wish to send something like PCI-E BAR memory
- * to userspace.
- */
-int rdma_user_mmap_io(struct ib_ucontext *ucontext, struct vm_area_struct *vma,
-		      unsigned long pfn, unsigned long size, pgprot_t prot)
-{
-	struct ib_uverbs_file *ufile = ucontext->ufile;
-	struct rdma_umap_priv *priv;
-
-	if (!(vma->vm_flags & VM_SHARED))
-		return -EINVAL;
-
-	if (vma->vm_end - vma->vm_start != size)
-		return -EINVAL;
-
-	/* Driver is using this wrong, must be called by ib_uverbs_mmap */
-	if (WARN_ON(!vma->vm_file ||
-		    vma->vm_file->private_data != ufile))
-		return -EINVAL;
-	lockdep_assert_held(&ufile->device->disassociate_srcu);
-
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	vma->vm_page_prot = prot;
-	if (io_remap_pfn_range(vma, vma->vm_start, pfn, size, prot)) {
-		kfree(priv);
-		return -EAGAIN;
-	}
-
-	rdma_umap_priv_init(priv, vma);
-	return 0;
-}
-EXPORT_SYMBOL(rdma_user_mmap_io);
 
 void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile)
 {
@@ -971,6 +845,11 @@ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile)
 
 			zap_vma_ptes(vma, vma->vm_start,
 				     vma->vm_end - vma->vm_start);
+
+			if (priv->entry) {
+				rdma_user_mmap_entry_put(priv->entry);
+				priv->entry = NULL;
+			}
 		}
 		mutex_unlock(&ufile->umap_lock);
 	skip_mm:
@@ -1092,7 +971,7 @@ static const struct file_operations uverbs_fops = {
 	.release = ib_uverbs_close,
 	.llseek	 = no_llseek,
 	.unlocked_ioctl = ib_uverbs_ioctl,
-	.compat_ioctl = ib_uverbs_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 static const struct file_operations uverbs_mmap_fops = {
@@ -1103,7 +982,7 @@ static const struct file_operations uverbs_mmap_fops = {
 	.release = ib_uverbs_close,
 	.llseek	 = no_llseek,
 	.unlocked_ioctl = ib_uverbs_ioctl,
-	.compat_ioctl = ib_uverbs_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 static int ib_uverbs_get_nl_info(struct ib_device *ibdev, void *client_data,
@@ -1238,7 +1117,6 @@ static void ib_uverbs_add_one(struct ib_device *device)
 	mutex_init(&uverbs_dev->xrcd_tree_mutex);
 	mutex_init(&uverbs_dev->lists_mutex);
 	INIT_LIST_HEAD(&uverbs_dev->uverbs_file_list);
-	INIT_LIST_HEAD(&uverbs_dev->uverbs_events_file_list);
 	rcu_assign_pointer(uverbs_dev->ib_dev, device);
 	uverbs_dev->num_comp_vectors = device->num_comp_vectors;
 
@@ -1283,14 +1161,9 @@ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
 					struct ib_device *ib_dev)
 {
 	struct ib_uverbs_file *file;
-	struct ib_uverbs_async_event_file *event_file;
-	struct ib_event event;
 
 	/* Pending running commands to terminate */
 	uverbs_disassociate_api_pre(uverbs_dev);
-	event.event = IB_EVENT_DEVICE_FATAL;
-	event.element.port_num = 0;
-	event.device = ib_dev;
 
 	mutex_lock(&uverbs_dev->lists_mutex);
 	while (!list_empty(&uverbs_dev->uverbs_file_list)) {
@@ -1306,30 +1179,10 @@ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
 		 */
 		mutex_unlock(&uverbs_dev->lists_mutex);
 
-		ib_uverbs_event_handler(&file->event_handler, &event);
 		uverbs_destroy_ufile_hw(file, RDMA_REMOVE_DRIVER_REMOVE);
 		kref_put(&file->ref, ib_uverbs_release_file);
 
 		mutex_lock(&uverbs_dev->lists_mutex);
-	}
-
-	while (!list_empty(&uverbs_dev->uverbs_events_file_list)) {
-		event_file = list_first_entry(&uverbs_dev->
-					      uverbs_events_file_list,
-					      struct ib_uverbs_async_event_file,
-					      list);
-		spin_lock_irq(&event_file->ev_queue.lock);
-		event_file->ev_queue.is_closed = 1;
-		spin_unlock_irq(&event_file->ev_queue.lock);
-
-		list_del(&event_file->list);
-		ib_unregister_event_handler(
-			&event_file->uverbs_file->event_handler);
-		event_file->uverbs_file->event_handler.device =
-			NULL;
-
-		wake_up_interruptible(&event_file->ev_queue.poll_wait);
-		kill_fasync(&event_file->ev_queue.async_queue, SIGIO, POLL_IN);
 	}
 	mutex_unlock(&uverbs_dev->lists_mutex);
 

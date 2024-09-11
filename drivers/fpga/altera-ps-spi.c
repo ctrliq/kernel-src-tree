@@ -1,13 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Altera Passive Serial SPI Driver
  *
  *  Copyright (c) 2017 United Western Technologies, Corporation
  *
  *  Joshua Clayton <stillcompiling@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
  *
  * Manage Altera FPGA firmware that is loaded over SPI using the passive
  * serial configuration method.
@@ -261,6 +258,8 @@ static int altera_ps_probe(struct spi_device *spi)
 	struct altera_ps_conf *conf;
 	const struct of_device_id *of_id;
 	struct fpga_manager *mgr;
+
+	mark_tech_preview("Altera FPGA firmware over SPI", THIS_MODULE);
 
 	conf = devm_kzalloc(&spi->dev, sizeof(*conf), GFP_KERNEL);
 	if (!conf)

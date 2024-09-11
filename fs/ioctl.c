@@ -65,6 +65,9 @@ static int ioctl_fibmap(struct file *filp, int __user *p)
 	res = get_user(block, p);
 	if (res)
 		return res;
+	if (block < 0)
+		return -EINVAL;
+
 	res = mapping->a_ops->bmap(mapping, block);
 	return put_user(res, p);
 }

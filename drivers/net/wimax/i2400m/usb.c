@@ -567,7 +567,7 @@ error_alloc_netdev:
 
 
 /*
- * Disconnect a i2400m from the system.
+ * Disconect a i2400m from the system.
  *
  * i2400m_stop() has been called before, so al the rx and tx contexts
  * have been taken down already. Make sure the queue is stopped,

@@ -111,7 +111,7 @@ struct perf_raw_record {
  */
 struct perf_branch_stack {
 	__u64				nr;
-	__u64				hw_idx;
+	RH_KABI_BROKEN_INSERT(__u64				hw_idx)
 	struct perf_branch_entry	entries[0];
 };
 
@@ -429,8 +429,7 @@ struct pmu {
 	 * implementation and Perf core context switch handling callbacks for usage
 	 * examples.
 	 */
-	void (*swap_task_ctx)		(struct perf_event_context *prev,
-					 struct perf_event_context *next);
+	RH_KABI_BROKEN_INSERT(void (*swap_task_ctx)		(struct perf_event_context *prev, struct perf_event_context *next))
 					/* optional */
 
 	/*
@@ -453,9 +452,7 @@ struct pmu {
 	 *
 	 * Optional.
 	 */
-	long (*snapshot_aux)		(struct perf_event *event,
-					 struct perf_output_handle *handle,
-					 unsigned long size);
+	RH_KABI_BROKEN_INSERT(long (*snapshot_aux)		(struct perf_event *event, struct perf_output_handle *handle, unsigned long size))
 
 	/*
 	 * Validate address range filters: make sure the HW supports the
@@ -863,9 +860,11 @@ struct perf_cpu_context {
 	 * Per-CPU storage for iterators used in visit_groups_merge. The default
 	 * storage is of size 2 to hold the CPU and any CPU event iterators.
 	 */
+	RH_KABI_BROKEN_INSERT_BLOCK(
 	int				heap_size;
 	struct perf_event		**heap;
 	struct perf_event		*heap_default[2];
+	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 };
 
 struct perf_output_handle {
@@ -1004,7 +1003,7 @@ struct perf_sample_data {
 		u32	reserved;
 	}				cpu_entry;
 	struct perf_callchain_entry	*callchain;
-	u64				aux_size;
+	RH_KABI_BROKEN_INSERT(u64				aux_size)
 
 	/*
 	 * regs_user may point to task_pt_regs or to regs_user_copy, depending
@@ -1017,7 +1016,7 @@ struct perf_sample_data {
 	u64				stack_user_size;
 
 	u64				phys_addr;
-	u64				cgroup;
+	RH_KABI_BROKEN_INSERT(u64				cgroup)
 } ____cacheline_aligned;
 
 /* default value for data source */

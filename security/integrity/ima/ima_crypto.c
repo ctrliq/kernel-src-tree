@@ -671,8 +671,8 @@ static void ima_pcrread(u32 idx, struct tpm_digest *d)
  * hash algorithm for reading the TPM PCRs as for calculating the boot
  * aggregate digest as stored in the measurement list.
  */
-static int __init ima_calc_boot_aggregate_tfm(char *digest, u16 alg_id,
-					      struct crypto_shash *tfm)
+static int ima_calc_boot_aggregate_tfm(char *digest, u16 alg_id,
+				       struct crypto_shash *tfm)
 {
 	struct tpm_digest d = { .alg_id = alg_id, .digest = {0} };
 	int rc;
@@ -701,7 +701,7 @@ static int __init ima_calc_boot_aggregate_tfm(char *digest, u16 alg_id,
 	return rc;
 }
 
-int __init ima_calc_boot_aggregate(struct ima_digest_data *hash)
+int ima_calc_boot_aggregate(struct ima_digest_data *hash)
 {
 	struct crypto_shash *tfm;
 	u16 crypto_id, alg_id;

@@ -9,7 +9,9 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <uapi/linux/mman.h> /* To get things like MAP_HUGETLB even on older libc headers */
+#include "dso.h"
 #include "map.h"
+#include "map_symbol.h"
 #include "thread.h"
 #include "vdso.h"
 #include "build-id.h"
@@ -21,9 +23,9 @@
 #include "namespaces.h"
 #include "unwind.h"
 #include "srccode.h"
+#include "ui/ui.h"
 
 static void __maps__insert(struct maps *maps, struct map *map);
-static void __maps__insert_name(struct maps *maps, struct map *map);
 
 static inline int is_anon_memory(const char *filename, u32 flags)
 {
@@ -159,12 +161,6 @@ struct map *map__new(struct machine *machine, u64 start, u64 len,
 		anon = is_anon_memory(filename, flags);
 		vdso = is_vdso_map(filename);
 		no_dso = is_no_dso_memory(filename);
-
-		if (id)
-			map->dso_id = *id;
-		else
-			map->dso_id.min = map->dso_id.ino = map->dso_id.ino_generation = 0;
-
 		map->prot = prot;
 		map->flags = flags;
 		nsi = nsinfo__get(thread->nsinfo);
@@ -194,7 +190,7 @@ struct map *map__new(struct machine *machine, u64 start, u64 len,
 			pgoff = 0;
 			dso = machine__findnew_vdso(machine, thread);
 		} else
-			dso = machine__findnew_dso(machine, filename);
+			dso = machine__findnew_dso_id(machine, filename, id);
 
 		if (dso == NULL)
 			goto out_delete;
@@ -435,7 +431,7 @@ int map__fprintf_srcline(struct map *map, u64 addr, const char *prefix,
 
 	if (map && map->dso) {
 		char *srcline = map__srcline(map, addr, NULL);
-		if (srcline != SRCLINE_UNKNOWN)
+		if (strncmp(srcline, SRCLINE_UNKNOWN, strlen(SRCLINE_UNKNOWN)) != 0)
 			ret = fprintf(fp, "%s%s", prefix, srcline);
 		free_srcline(srcline);
 	}
@@ -521,98 +517,133 @@ u64 map__objdump_2mem(struct map *map, u64 ip)
 	return ip + map->reloc;
 }
 
-static void maps__init(struct maps *maps)
+void maps__init(struct maps *maps, struct machine *machine)
 {
 	maps->entries = RB_ROOT;
-	maps->names = RB_ROOT;
 	init_rwsem(&maps->lock);
+	maps->machine = machine;
+	maps->last_search_by_name = NULL;
+	maps->nr_maps = 0;
+	maps->maps_by_name = NULL;
+	refcount_set(&maps->refcnt, 1);
 }
 
-void map_groups__init(struct map_groups *mg, struct machine *machine)
+static void __maps__free_maps_by_name(struct maps *maps)
 {
-	maps__init(&mg->maps);
-	mg->machine = machine;
-	refcount_set(&mg->refcnt, 1);
+	/*
+	 * Free everything to try to do it from the rbtree in the next search
+	 */
+	zfree(&maps->maps_by_name);
+	maps->nr_maps_allocated = 0;
 }
 
-void map_groups__insert(struct map_groups *mg, struct map *map)
+void maps__insert(struct maps *maps, struct map *map)
 {
-	maps__insert(&mg->maps, map);
+	down_write(&maps->lock);
+	__maps__insert(maps, map);
+	++maps->nr_maps;
+
+	if (map->dso && map->dso->kernel) {
+		struct kmap *kmap = map__kmap(map);
+
+		if (kmap)
+			kmap->kmaps = maps;
+		else
+			pr_err("Internal error: kernel dso with non kernel map\n");
+	}
+
+
+	/*
+	 * If we already performed some search by name, then we need to add the just
+	 * inserted map and resort.
+	 */
+	if (maps->maps_by_name) {
+		if (maps->nr_maps > maps->nr_maps_allocated) {
+			int nr_allocate = maps->nr_maps * 2;
+			struct map **maps_by_name = realloc(maps->maps_by_name, nr_allocate * sizeof(map));
+
+			if (maps_by_name == NULL) {
+				__maps__free_maps_by_name(maps);
+				up_write(&maps->lock);
+				return;
+			}
+
+			maps->maps_by_name = maps_by_name;
+			maps->nr_maps_allocated = nr_allocate;
+		}
+		maps->maps_by_name[maps->nr_maps - 1] = map;
+		__maps__sort_by_name(maps);
+	}
+	up_write(&maps->lock);
+}
+
+static void __maps__remove(struct maps *maps, struct map *map)
+{
+	rb_erase_init(&map->rb_node, &maps->entries);
+	map__put(map);
+}
+
+void maps__remove(struct maps *maps, struct map *map)
+{
+	down_write(&maps->lock);
+	if (maps->last_search_by_name == map)
+		maps->last_search_by_name = NULL;
+
+	__maps__remove(maps, map);
+	--maps->nr_maps;
+	if (maps->maps_by_name)
+		__maps__free_maps_by_name(maps);
+	up_write(&maps->lock);
 }
 
 static void __maps__purge(struct maps *maps)
 {
-	struct rb_root *root = &maps->entries;
-	struct rb_node *next = rb_first(root);
+	struct map *pos, *next;
 
-	while (next) {
-		struct map *pos = rb_entry(next, struct map, rb_node);
-
-		next = rb_next(&pos->rb_node);
-		rb_erase_init(&pos->rb_node, root);
+	maps__for_each_entry_safe(maps, pos, next) {
+		rb_erase_init(&pos->rb_node,  &maps->entries);
 		map__put(pos);
 	}
 }
 
-static void __maps__purge_names(struct maps *maps)
-{
-	struct rb_root *root = &maps->names;
-	struct rb_node *next = rb_first(root);
-
-	while (next) {
-		struct map *pos = rb_entry(next, struct map, rb_node_name);
-
-		next = rb_next(&pos->rb_node_name);
-		rb_erase_init(&pos->rb_node_name, root);
-		map__put(pos);
-	}
-}
-
-static void maps__exit(struct maps *maps)
+void maps__exit(struct maps *maps)
 {
 	down_write(&maps->lock);
 	__maps__purge(maps);
-	__maps__purge_names(maps);
 	up_write(&maps->lock);
 }
 
-void map_groups__exit(struct map_groups *mg)
+bool maps__empty(struct maps *maps)
 {
-	maps__exit(&mg->maps);
+	return !maps__first(maps);
 }
 
-bool map_groups__empty(struct map_groups *mg)
+struct maps *maps__new(struct machine *machine)
 {
-	return !maps__first(&mg->maps);
+	struct maps *maps = zalloc(sizeof(*maps));
+
+	if (maps != NULL)
+		maps__init(maps, machine);
+
+	return maps;
 }
 
-struct map_groups *map_groups__new(struct machine *machine)
+void maps__delete(struct maps *maps)
 {
-	struct map_groups *mg = zalloc(sizeof(*mg));
-
-	if (mg != NULL)
-		map_groups__init(mg, machine);
-
-	return mg;
+	maps__exit(maps);
+	unwind__finish_access(maps);
+	free(maps);
 }
 
-void map_groups__delete(struct map_groups *mg)
+void maps__put(struct maps *maps)
 {
-	map_groups__exit(mg);
-	unwind__finish_access(mg);
-	free(mg);
+	if (maps && refcount_dec_and_test(&maps->refcnt))
+		maps__delete(maps);
 }
 
-void map_groups__put(struct map_groups *mg)
+struct symbol *maps__find_symbol(struct maps *maps, u64 addr, struct map **mapp)
 {
-	if (mg && refcount_dec_and_test(&mg->refcnt))
-		map_groups__delete(mg);
-}
-
-struct symbol *map_groups__find_symbol(struct map_groups *mg,
-				       u64 addr, struct map **mapp)
-{
-	struct map *map = map_groups__find(mg, addr);
+	struct map *map = maps__find(maps, addr);
 
 	/* Ensure map is loaded before using map->map_ip */
 	if (map != NULL && map__load(map) >= 0) {
@@ -631,17 +662,14 @@ static bool map__contains_symbol(struct map *map, struct symbol *sym)
 	return ip >= map->start && ip < map->end;
 }
 
-struct symbol *maps__find_symbol_by_name(struct maps *maps, const char *name,
-					 struct map **mapp)
+struct symbol *maps__find_symbol_by_name(struct maps *maps, const char *name, struct map **mapp)
 {
 	struct symbol *sym;
-	struct rb_node *nd;
+	struct map *pos;
 
 	down_read(&maps->lock);
 
-	for (nd = rb_first(&maps->entries); nd; nd = rb_next(nd)) {
-		struct map *pos = rb_entry(nd, struct map, rb_node);
-
+	maps__for_each_entry(maps, pos) {
 		sym = map__find_symbol_by_name(pos, name);
 
 		if (sym == NULL)
@@ -661,38 +689,30 @@ out:
 	return sym;
 }
 
-struct symbol *map_groups__find_symbol_by_name(struct map_groups *mg,
-					       const char *name,
-					       struct map **mapp)
+int maps__find_ams(struct maps *maps, struct addr_map_symbol *ams)
 {
-	return maps__find_symbol_by_name(&mg->maps, name, mapp);
-}
-
-int map_groups__find_ams(struct map_groups *mg, struct addr_map_symbol *ams)
-{
-	if (ams->addr < ams->map->start || ams->addr >= ams->map->end) {
-		if (mg == NULL)
+	if (ams->addr < ams->ms.map->start || ams->addr >= ams->ms.map->end) {
+		if (maps == NULL)
 			return -1;
-		ams->map = map_groups__find(mg, ams->addr);
-		if (ams->map == NULL)
+		ams->ms.map = maps__find(maps, ams->addr);
+		if (ams->ms.map == NULL)
 			return -1;
 	}
 
-	ams->al_addr = ams->map->map_ip(ams->map, ams->addr);
-	ams->sym = map__find_symbol(ams->map, ams->al_addr);
+	ams->al_addr = ams->ms.map->map_ip(ams->ms.map, ams->addr);
+	ams->ms.sym = map__find_symbol(ams->ms.map, ams->al_addr);
 
-	return ams->sym ? 0 : -1;
+	return ams->ms.sym ? 0 : -1;
 }
 
-static size_t maps__fprintf(struct maps *maps, FILE *fp)
+size_t maps__fprintf(struct maps *maps, FILE *fp)
 {
 	size_t printed = 0;
-	struct rb_node *nd;
+	struct map *pos;
 
 	down_read(&maps->lock);
 
-	for (nd = rb_first(&maps->entries); nd; nd = rb_next(nd)) {
-		struct map *pos = rb_entry(nd, struct map, rb_node);
+	maps__for_each_entry(maps, pos) {
 		printed += fprintf(fp, "Map:");
 		printed += map__fprintf(pos, fp);
 		if (verbose > 2) {
@@ -706,20 +726,8 @@ static size_t maps__fprintf(struct maps *maps, FILE *fp)
 	return printed;
 }
 
-size_t map_groups__fprintf(struct map_groups *mg, FILE *fp)
+int maps__fixup_overlappings(struct maps *maps, struct map *map, FILE *fp)
 {
-	return maps__fprintf(&mg->maps, fp);
-}
-
-static void __map_groups__insert(struct map_groups *mg, struct map *map)
-{
-	__maps__insert(&mg->maps, map);
-	__maps__insert_name(&mg->maps, map);
-}
-
-int map_groups__fixup_overlappings(struct map_groups *mg, struct map *map, FILE *fp)
-{
-	struct maps *maps = &mg->maps;
 	struct rb_root *root;
 	struct rb_node *next, *first;
 	int err = 0;
@@ -784,7 +792,7 @@ int map_groups__fixup_overlappings(struct map_groups *mg, struct map *map, FILE 
 			}
 
 			before->end = map->start;
-			__map_groups__insert(mg, before);
+			__maps__insert(maps, before);
 			if (verbose >= 2 && !use_browser)
 				map__fprintf(before, fp);
 			map__put(before);
@@ -801,7 +809,7 @@ int map_groups__fixup_overlappings(struct map_groups *mg, struct map *map, FILE 
 			after->start = map->end;
 			after->pgoff += map->end - pos->start;
 			assert(pos->map_ip(pos, map->end) == after->map_ip(after, map->end));
-			__map_groups__insert(mg, after);
+			__maps__insert(maps, after);
 			if (verbose >= 2 && !use_browser)
 				map__fprintf(after, fp);
 			map__put(after);
@@ -822,31 +830,30 @@ out:
 /*
  * XXX This should not really _copy_ te maps, but refcount them.
  */
-int map_groups__clone(struct thread *thread, struct map_groups *parent)
+int maps__clone(struct thread *thread, struct maps *parent)
 {
-	struct map_groups *mg = thread->mg;
+	struct maps *maps = thread->maps;
 	int err = -ENOMEM;
 	struct map *map;
-	struct maps *maps = &parent->maps;
 
-	down_read(&maps->lock);
+	down_read(&parent->lock);
 
-	for (map = maps__first(maps); map; map = map__next(map)) {
+	maps__for_each_entry(parent, map) {
 		struct map *new = map__clone(map);
 		if (new == NULL)
 			goto out_unlock;
 
-		err = unwind__prepare_access(mg, new, NULL);
+		err = unwind__prepare_access(maps, new, NULL);
 		if (err)
 			goto out_unlock;
 
-		map_groups__insert(mg, new);
+		maps__insert(maps, new);
 		map__put(new);
 	}
 
 	err = 0;
 out_unlock:
-	up_read(&maps->lock);
+	up_read(&parent->lock);
 	return err;
 }
 
@@ -869,51 +876,6 @@ static void __maps__insert(struct maps *maps, struct map *map)
 	rb_link_node(&map->rb_node, parent, p);
 	rb_insert_color(&map->rb_node, &maps->entries);
 	map__get(map);
-}
-
-static void __maps__insert_name(struct maps *maps, struct map *map)
-{
-	struct rb_node **p = &maps->names.rb_node;
-	struct rb_node *parent = NULL;
-	struct map *m;
-	int rc;
-
-	while (*p != NULL) {
-		parent = *p;
-		m = rb_entry(parent, struct map, rb_node_name);
-		rc = strcmp(m->dso->short_name, map->dso->short_name);
-		if (rc < 0)
-			p = &(*p)->rb_left;
-		else
-			p = &(*p)->rb_right;
-	}
-	rb_link_node(&map->rb_node_name, parent, p);
-	rb_insert_color(&map->rb_node_name, &maps->names);
-	map__get(map);
-}
-
-void maps__insert(struct maps *maps, struct map *map)
-{
-	down_write(&maps->lock);
-	__maps__insert(maps, map);
-	__maps__insert_name(maps, map);
-	up_write(&maps->lock);
-}
-
-static void __maps__remove(struct maps *maps, struct map *map)
-{
-	rb_erase_init(&map->rb_node, &maps->entries);
-	map__put(map);
-
-	rb_erase_init(&map->rb_node_name, &maps->names);
-	map__put(map);
-}
-
-void maps__remove(struct maps *maps, struct map *map)
-{
-	down_write(&maps->lock);
-	__maps__remove(maps, map);
-	up_write(&maps->lock);
 }
 
 struct map *maps__find(struct maps *maps, u64 ip)
@@ -979,7 +941,7 @@ struct kmap *map__kmap(struct map *map)
 	return kmap;
 }
 
-struct map_groups *map__kmaps(struct map *map)
+struct maps *map__kmaps(struct map *map)
 {
 	struct kmap *kmap = map__kmap(map);
 

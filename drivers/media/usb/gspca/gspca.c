@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Main USB camera driver
  *
@@ -5,16 +6,6 @@
  *
  * Camera button input handling by Márton Németh
  * Copyright (C) 2009-2010 Márton Németh <nm127@freemail.hu>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2 of the License, or (at your
- * option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -1205,11 +1196,11 @@ static int vidioc_querycap(struct file *file, void  *priv,
 {
 	struct gspca_dev *gspca_dev = video_drvdata(file);
 
-	strlcpy((char *) cap->driver, gspca_dev->sd_desc->name,
-			sizeof cap->driver);
+	strscpy((char *)cap->driver, gspca_dev->sd_desc->name,
+		sizeof(cap->driver));
 	if (gspca_dev->dev->product != NULL) {
-		strlcpy((char *) cap->card, gspca_dev->dev->product,
-			sizeof cap->card);
+		strscpy((char *)cap->card, gspca_dev->dev->product,
+			sizeof(cap->card));
 	} else {
 		snprintf((char *) cap->card, sizeof cap->card,
 			"USB Camera (%04x:%04x)",
@@ -1218,10 +1209,6 @@ static int vidioc_querycap(struct file *file, void  *priv,
 	}
 	usb_make_path(gspca_dev->dev, (char *) cap->bus_info,
 			sizeof(cap->bus_info));
-	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE
-			  | V4L2_CAP_STREAMING
-			  | V4L2_CAP_READWRITE;
-	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	return 0;
 }
 
@@ -1234,7 +1221,7 @@ static int vidioc_enum_input(struct file *file, void *priv,
 		return -EINVAL;
 	input->type = V4L2_INPUT_TYPE_CAMERA;
 	input->status = gspca_dev->cam.input_flags;
-	strlcpy(input->name, gspca_dev->sd_desc->name,
+	strscpy(input->name, gspca_dev->sd_desc->name,
 		sizeof input->name);
 	return 0;
 }
@@ -1517,6 +1504,8 @@ int gspca_dev_probe2(struct usb_interface *intf,
 	gspca_dev->empty_packet = -1;	/* don't check the empty packets */
 	gspca_dev->vdev = gspca_template;
 	gspca_dev->vdev.v4l2_dev = &gspca_dev->v4l2_dev;
+	gspca_dev->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE |
+				      V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
 	video_set_drvdata(&gspca_dev->vdev, gspca_dev);
 	gspca_dev->module = module;
 

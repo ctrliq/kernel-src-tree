@@ -293,7 +293,7 @@ struct radix_tree_node {
         ((RADIX_TREE_MAP_SIZE + BITS_PER_LONG - 1) / BITS_PER_LONG)
 	void __rcu	*slots[RADIX_TREE_MAP_SIZE];
 	unsigned long tags[RADIX_TREE_MAX_TAGS][RADIX_TREE_TAG_LONGS];
-	RH_KABI_SIZE_AND_EXTEND(radix_tree_node);
+	RH_KABI_AUX_EMBED(radix_tree_node);
 };
 #endif
 
@@ -324,14 +324,14 @@ struct RH_KABI_RENAME(radix_tree_root, xarray) {
 /* private: The rest of the data structure is not to be used directly. */
 	gfp_t		RH_KABI_RENAME(gfp_mask, xa_flags);
 	RH_KABI_RENAME(struct radix_tree_node __rcu *rnode, void __rcu * xa_head);
-	RH_KABI_SIZE_AND_EXTEND(RH_KABI_RENAME(radix_tree_root, xarray));
+	RH_KABI_AUX_EMBED(RH_KABI_RENAME(radix_tree_root, xarray));
 };
 
 #define XARRAY_INIT(name, flags) {				\
 	.xa_lock = __SPIN_LOCK_UNLOCKED(name.xa_lock),		\
 	.xa_flags = flags,					\
 	.xa_head = NULL,					\
-	RH_KABI_INIT_SIZE(xarray)				\
+	RH_KABI_AUX_INIT_SIZE(xarray)				\
 }
 
 /**
@@ -409,7 +409,7 @@ static inline void xa_init_flags(struct xarray *xa, gfp_t flags)
 	spin_lock_init(&xa->xa_lock);
 	xa->xa_flags = flags;
 	xa->xa_head = NULL;
-	RH_KABI_SET_SIZE(xa, xarray);
+	RH_KABI_AUX_SET_SIZE(xa, xarray);
 	_xa_init_flags(xa, flags);
 }
 

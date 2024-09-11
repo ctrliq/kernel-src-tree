@@ -114,7 +114,7 @@ void gfs2_revoke_clean(struct gfs2_jdesc *jd)
 	struct gfs2_revoke_replay *rr;
 
 	while (!list_empty(head)) {
-		rr = list_entry(head->next, struct gfs2_revoke_replay, rr_list);
+		rr = list_first_entry(head, struct gfs2_revoke_replay, rr_list);
 		list_del(&rr->rr_list);
 		kfree(rr);
 	}
@@ -177,129 +177,6 @@ static int get_log_header(struct gfs2_jdesc *jd, unsigned int blk,
 	error = __get_log_header(sdp, (const struct gfs2_log_header *)bh->b_data,
 				 blk, head);
 	brelse(bh);
-
-	return error;
-}
-
-/**
- * find_good_lh - find a good log header
- * @jd: the journal
- * @blk: the segment to start searching from
- * @lh: the log header to fill in
- * @forward: if true search forward in the log, else search backward
- *
- * Call get_log_header() to get a log header for a segment, but if the
- * segment is bad, either scan forward or backward until we find a good one.
- *
- * Returns: errno
- */
-
-static int find_good_lh(struct gfs2_jdesc *jd, unsigned int *blk,
-			struct gfs2_log_header_host *head)
-{
-	unsigned int orig_blk = *blk;
-	int error;
-
-	for (;;) {
-		error = get_log_header(jd, *blk, head);
-		if (error <= 0)
-			return error;
-
-		if (++*blk == jd->jd_blocks)
-			*blk = 0;
-
-		if (*blk == orig_blk) {
-			gfs2_consist_inode(GFS2_I(jd->jd_inode));
-			return -EIO;
-		}
-	}
-}
-
-/**
- * jhead_scan - make sure we've found the head of the log
- * @jd: the journal
- * @head: this is filled in with the log descriptor of the head
- *
- * At this point, seg and lh should be either the head of the log or just
- * before.  Scan forward until we find the head.
- *
- * Returns: errno
- */
-
-static int jhead_scan(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head)
-{
-	unsigned int blk = head->lh_blkno;
-	struct gfs2_log_header_host lh;
-	int error;
-
-	for (;;) {
-		if (++blk == jd->jd_blocks)
-			blk = 0;
-
-		error = get_log_header(jd, blk, &lh);
-		if (error < 0)
-			return error;
-		if (error == 1)
-			continue;
-
-		if (lh.lh_sequence == head->lh_sequence) {
-			gfs2_consist_inode(GFS2_I(jd->jd_inode));
-			return -EIO;
-		}
-		if (lh.lh_sequence < head->lh_sequence)
-			break;
-
-		*head = lh;
-	}
-
-	return 0;
-}
-
-/**
- * gfs2_find_jhead - find the head of a log
- * @jd: the journal
- * @head: the log descriptor for the head of the log is returned here
- *
- * Do a binary search of a journal and find the valid log entry with the
- * highest sequence number.  (i.e. the log head)
- *
- * Returns: errno
- */
-
-int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head)
-{
-	struct gfs2_log_header_host lh_1, lh_m;
-	u32 blk_1, blk_2, blk_m;
-	int error;
-
-	blk_1 = 0;
-	blk_2 = jd->jd_blocks - 1;
-
-	for (;;) {
-		blk_m = (blk_1 + blk_2) / 2;
-
-		error = find_good_lh(jd, &blk_1, &lh_1);
-		if (error)
-			return error;
-
-		error = find_good_lh(jd, &blk_m, &lh_m);
-		if (error)
-			return error;
-
-		if (blk_1 == blk_m || blk_m == blk_2)
-			break;
-
-		if (lh_1.lh_sequence <= lh_m.lh_sequence)
-			blk_1 = blk_m;
-		else
-			blk_2 = blk_m;
-	}
-
-	error = jhead_scan(jd, &lh_1);
-	if (error)
-		return error;
-
-	*head = lh_1;
 
 	return error;
 }
@@ -389,11 +266,13 @@ static void clean_journal(struct gfs2_jdesc *jd,
 	u32 lblock = head->lh_blkno;
 
 	gfs2_replay_incr_blk(jd, &lblock);
-	if (jd->jd_jid == sdp->sd_lockstruct.ls_jid)
-		sdp->sd_log_flush_head = lblock;
 	gfs2_write_log_header(sdp, jd, head->lh_sequence + 1, 0, lblock,
 			      GFS2_LOG_HEAD_UNMOUNT | GFS2_LOG_HEAD_RECOVERY,
 			      REQ_PREFLUSH | REQ_FUA | REQ_META | REQ_SYNC);
+	if (jd->jd_jid == sdp->sd_lockstruct.ls_jid) {
+		sdp->sd_log_flush_head = lblock;
+		gfs2_log_incr_head(sdp);
+	}
 }
 
 
@@ -429,6 +308,11 @@ void gfs2_recover_func(struct work_struct *work)
 	int error = 0;
 	int jlocked = 0;
 
+	if (gfs2_withdrawn(sdp)) {
+		fs_err(sdp, "jid=%u: Recovery not attempted due to withdraw.\n",
+		       jd->jd_jid);
+		goto fail;
+	}
 	t_start = ktime_get();
 	if (sdp->sd_args.ar_spectator)
 		goto fail;
@@ -469,7 +353,7 @@ void gfs2_recover_func(struct work_struct *work)
 	if (error)
 		goto fail_gunlock_ji;
 
-	error = gfs2_find_jhead(jd, &head);
+	error = gfs2_find_jhead(jd, &head, true);
 	if (error)
 		goto fail_gunlock_ji;
 	t_jhd = ktime_get();
@@ -514,8 +398,13 @@ void gfs2_recover_func(struct work_struct *work)
 		}
 
 		t_tlck = ktime_get();
-		fs_info(sdp, "jid=%u: Replaying journal...\n", jd->jd_jid);
+		fs_info(sdp, "jid=%u: Replaying journal...0x%x to 0x%x\n",
+			jd->jd_jid, head.lh_tail, head.lh_blkno);
 
+		/* We take the sd_log_flush_lock here primarily to prevent log
+		 * flushes and simultaneous journal replays from stomping on
+		 * each other wrt sd_log_bio. */
+		down_write(&sdp->sd_log_flush_lock);
 		for (pass = 0; pass < 2; pass++) {
 			lops_before_scan(jd, &head, pass);
 			error = foreach_descriptor(jd, head.lh_tail,
@@ -526,6 +415,7 @@ void gfs2_recover_func(struct work_struct *work)
 		}
 
 		clean_journal(jd, &head);
+		up_write(&sdp->sd_log_flush_lock);
 
 		gfs2_glock_dq_uninit(&thaw_gh);
 		t_rep = ktime_get();

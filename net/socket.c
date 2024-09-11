@@ -1657,7 +1657,8 @@ SYSCALL_DEFINE2(listen, int, fd, int, backlog)
 
 int __sys_accept4_file(struct file *file, unsigned file_flags,
 		       struct sockaddr __user *upeer_sockaddr,
-		       int __user *upeer_addrlen, int flags)
+		       int __user *upeer_addrlen, int flags,
+		       unsigned long nofile)
 {
 	struct socket *sock, *newsock;
 	struct file *newfile;
@@ -1688,7 +1689,7 @@ int __sys_accept4_file(struct file *file, unsigned file_flags,
 	 */
 	__module_get(newsock->ops->owner);
 
-	newfd = get_unused_fd_flags(flags);
+	newfd = __get_unused_fd_flags(flags, nofile);
 	if (unlikely(newfd < 0)) {
 		err = newfd;
 		sock_release(newsock);
@@ -1757,7 +1758,8 @@ int __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
 	f = fdget(fd);
 	if (f.file) {
 		ret = __sys_accept4_file(f.file, 0, upeer_sockaddr,
-						upeer_addrlen, flags);
+						upeer_addrlen, flags,
+						rlimit(RLIMIT_NOFILE));
 		if (f.flags)
 			fput(f.file);
 	}
@@ -1789,26 +1791,22 @@ SYSCALL_DEFINE3(accept, int, fd, struct sockaddr __user *, upeer_sockaddr,
  *	include the -EINPROGRESS status for such sockets.
  */
 
-int __sys_connect_file(struct file *file, struct sockaddr __user *uservaddr,
+int __sys_connect_file(struct file *file, struct sockaddr_storage *address,
 		       int addrlen, int file_flags)
 {
 	struct socket *sock;
-	struct sockaddr_storage address;
 	int err;
 
 	sock = sock_from_file(file, &err);
 	if (!sock)
 		goto out;
-	err = move_addr_to_kernel(uservaddr, addrlen, &address);
-	if (err < 0)
-		goto out;
 
 	err =
-	    security_socket_connect(sock, (struct sockaddr *)&address, addrlen);
+	    security_socket_connect(sock, (struct sockaddr *)address, addrlen);
 	if (err)
 		goto out;
 
-	err = sock->ops->connect(sock, (struct sockaddr *)&address, addrlen,
+	err = sock->ops->connect(sock, (struct sockaddr *)address, addrlen,
 				 sock->file->f_flags | file_flags);
 out:
 	return err;
@@ -1821,7 +1819,11 @@ int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
 
 	f = fdget(fd);
 	if (f.file) {
-		ret = __sys_connect_file(f.file, uservaddr, addrlen, 0);
+		struct sockaddr_storage address;
+
+		ret = move_addr_to_kernel(uservaddr, addrlen, &address);
+		if (!ret)
+			ret = __sys_connect_file(f.file, &address, addrlen, 0);
 		if (f.flags)
 			fput(f.file);
 	}
@@ -2176,10 +2178,10 @@ struct used_address {
 	unsigned int name_len;
 };
 
-static int copy_msghdr_from_user(struct msghdr *kmsg,
-				 struct user_msghdr __user *umsg,
-				 struct sockaddr __user **save_addr,
-				 struct iovec **iov)
+int __copy_msghdr_from_user(struct msghdr *kmsg,
+			    struct user_msghdr __user *umsg,
+			    struct sockaddr __user **save_addr,
+			    struct iovec __user **uiov, size_t *nsegs)
 {
 	struct user_msghdr msg;
 	ssize_t err;
@@ -2221,6 +2223,23 @@ static int copy_msghdr_from_user(struct msghdr *kmsg,
 		return -EMSGSIZE;
 
 	kmsg->msg_iocb = NULL;
+	*uiov = msg.msg_iov;
+	*nsegs = msg.msg_iovlen;
+	return 0;
+}
+
+static int copy_msghdr_from_user(struct msghdr *kmsg,
+				 struct user_msghdr __user *umsg,
+				 struct sockaddr __user **save_addr,
+				 struct iovec **iov)
+{
+	struct user_msghdr msg;
+	ssize_t err;
+
+	err = __copy_msghdr_from_user(kmsg, umsg, save_addr, &msg.msg_iov,
+					&msg.msg_iovlen);
+	if (err)
+		return err;
 
 	err = import_iovec(save_addr ? READ : WRITE,
 			    msg.msg_iov, msg.msg_iovlen,
@@ -2309,9 +2328,9 @@ out:
 	return err;
 }
 
-static int sendmsg_copy_msghdr(struct msghdr *msg,
-			       struct user_msghdr __user *umsg, unsigned flags,
-			       struct iovec **iov)
+int sendmsg_copy_msghdr(struct msghdr *msg,
+			struct user_msghdr __user *umsg, unsigned flags,
+			struct iovec **iov)
 {
 	int err;
 
@@ -2353,27 +2372,14 @@ static int ___sys_sendmsg(struct socket *sock, struct user_msghdr __user *msg,
 /*
  *	BSD sendmsg interface
  */
-long __sys_sendmsg_sock(struct socket *sock, struct user_msghdr __user *umsg,
+long __sys_sendmsg_sock(struct socket *sock, struct msghdr *msg,
 			unsigned int flags)
 {
-	struct iovec iovstack[UIO_FASTIOV], *iov = iovstack;
-	struct sockaddr_storage address;
-	struct msghdr msg = { .msg_name = &address };
-	ssize_t err;
-
-	err = sendmsg_copy_msghdr(&msg, umsg, flags, &iov);
-	if (err)
-		return err;
 	/* disallow ancillary data requests from this path */
-	if (msg.msg_control || msg.msg_controllen) {
-		err = -EINVAL;
-		goto out;
-	}
+	if (msg->msg_control || msg->msg_controllen)
+		return -EINVAL;
 
-	err = ____sys_sendmsg(sock, &msg, flags, NULL, 0);
-out:
-	kfree(iov);
-	return err;
+	return ____sys_sendmsg(sock, msg, flags, NULL, 0);
 }
 
 long __sys_sendmsg(int fd, struct user_msghdr __user *msg, unsigned int flags,
@@ -2479,10 +2485,10 @@ SYSCALL_DEFINE4(sendmmsg, int, fd, struct mmsghdr __user *, mmsg,
 	return __sys_sendmmsg(fd, mmsg, vlen, flags, true);
 }
 
-static int recvmsg_copy_msghdr(struct msghdr *msg,
-			       struct user_msghdr __user *umsg, unsigned flags,
-			       struct sockaddr __user **uaddr,
-			       struct iovec **iov)
+int recvmsg_copy_msghdr(struct msghdr *msg,
+			struct user_msghdr __user *umsg, unsigned flags,
+			struct sockaddr __user **uaddr,
+			struct iovec **iov)
 {
 	ssize_t err;
 
@@ -2572,28 +2578,15 @@ static int ___sys_recvmsg(struct socket *sock, struct user_msghdr __user *msg,
  *	BSD recvmsg interface
  */
 
-long __sys_recvmsg_sock(struct socket *sock, struct user_msghdr __user *umsg,
-			unsigned int flags)
+long __sys_recvmsg_sock(struct socket *sock, struct msghdr *msg,
+			struct user_msghdr __user *umsg,
+			struct sockaddr __user *uaddr, unsigned int flags)
 {
-	struct iovec iovstack[UIO_FASTIOV], *iov = iovstack;
-	struct sockaddr_storage address;
-	struct msghdr msg = { .msg_name = &address };
-	struct sockaddr __user *uaddr;
-	ssize_t err;
-
-	err = recvmsg_copy_msghdr(&msg, umsg, flags, &uaddr, &iov);
-	if (err)
-		return err;
 	/* disallow ancillary data requests from this path */
-	if (msg.msg_control || msg.msg_controllen) {
-		err = -EINVAL;
-		goto out;
-	}
+	if (msg->msg_control || msg->msg_controllen)
+		return -EINVAL;
 
-	err = ____sys_recvmsg(sock, &msg, umsg, uaddr, flags, 0);
-out:
-	kfree(iov);
-	return err;
+	return ____sys_recvmsg(sock, msg, umsg, uaddr, flags, 0);
 }
 
 long __sys_recvmsg(int fd, struct user_msghdr __user *msg, unsigned int flags,

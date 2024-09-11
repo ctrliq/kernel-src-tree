@@ -6,6 +6,7 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
+#include <linux/gpio/consumer.h>
 #include <linux/acpi.h>
 #include <linux/acpi_iort.h>
 #include <linux/signal.h>

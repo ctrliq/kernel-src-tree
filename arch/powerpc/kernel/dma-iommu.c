@@ -20,14 +20,14 @@
  */
 static inline bool dma_iommu_alloc_bypass(struct device *dev)
 {
-	return dev->archdata.iommu_bypass && !iommu_fixed_is_weak &&
+	return dev->iommu_bypass && !iommu_fixed_is_weak &&
 		dma_direct_supported(dev, dev->coherent_dma_mask);
 }
 
 static inline bool dma_iommu_map_bypass(struct device *dev,
 		unsigned long attrs)
 {
-	return dev->archdata.iommu_bypass &&
+	return dev->iommu_bypass &&
 		(!iommu_fixed_is_weak || (attrs & DMA_ATTR_WEAK_ORDERING));
 }
 
@@ -129,7 +129,7 @@ int dma_iommu_dma_supported(struct device *dev, u64 mask)
 	}
 
 	if (dev_is_pci(dev) && dma_iommu_bypass_supported(dev, mask)) {
-		dev->archdata.iommu_bypass = true;
+		dev->iommu_bypass = true;
 		dev_dbg(dev, "iommu: 64-bit OK, using fixed ops\n");
 		return 1;
 	}
@@ -142,7 +142,7 @@ int dma_iommu_dma_supported(struct device *dev, u64 mask)
 	}
 
 	dev_dbg(dev, "iommu: not 64-bit, using default ops\n");
-	dev->archdata.iommu_bypass = false;
+	dev->iommu_bypass = false;
 	return 1;
 }
 
@@ -208,4 +208,6 @@ const struct dma_map_ops dma_iommu_ops = {
 	.sync_single_for_device	= dma_iommu_sync_for_device,
 	.sync_sg_for_cpu	= dma_iommu_sync_sg_for_cpu,
 	.sync_sg_for_device	= dma_iommu_sync_sg_for_device,
+	.mmap			= dma_common_mmap,
+	.get_sgtable		= dma_common_get_sgtable,
 };

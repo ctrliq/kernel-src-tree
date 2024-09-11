@@ -5000,7 +5000,7 @@ static int hcd_fotg210_init(struct usb_hcd *hcd)
 	fotg210->command = temp;
 
 	/* Accept arbitrarily long scatter-gather lists */
-	if (!(hcd->driver->flags & HCD_LOCAL_MEM))
+	if (!hcd->localmem_pool)
 		hcd->self.sg_tablesize = ~0;
 	return 0;
 }
@@ -5508,7 +5508,7 @@ static const struct hc_driver fotg210_fotg210_hc_driver = {
 	 * generic hardware linkage
 	 */
 	.irq			= fotg210_irq,
-	.flags			= HCD_MEMORY | HCD_USB2,
+	.flags			= HCD_MEMORY | HCD_DMA | HCD_USB2,
 
 	/*
 	 * basic lifecycle operations

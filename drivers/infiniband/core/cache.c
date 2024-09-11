@@ -46,7 +46,7 @@
 
 struct ib_pkey_cache {
 	int             table_len;
-	u16             table[];
+	u16             table[0];
 };
 
 struct ib_update_work {
@@ -809,6 +809,7 @@ static void release_gid_table(struct ib_device *device,
 	if (leak)
 		return;
 
+	mutex_destroy(&table->lock);
 	kfree(table->data_vec);
 	kfree(table);
 }

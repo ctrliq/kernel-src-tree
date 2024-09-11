@@ -50,7 +50,7 @@
 }
 
 /**
- * X86_MATCH_VENDOR_FAM_MODEL_FEATURE - Macro for CPU matching
+ * X86_MATCH_VENDOR_FAM_MODEL_FEATURE - Base macro for CPU matching
  * @_vendor:	The vendor name, e.g. INTEL, AMD, HYGON, ..., ANY
  *		The name is expanded to X86_VENDOR_@_vendor
  * @_family:	The family number or X86_FAMILY_ANY
@@ -60,12 +60,20 @@
  *		format is unsigned long. The supplied value, pointer
  *		etc. is casted to unsigned long internally.
  *
- * The steppings arguments of X86_MATCH_VENDOR_FAM_MODEL_STEPPINGS_FEATURE() is
- * set to wildcards.
+ * Use only if you need all selectors. Otherwise use one of the shorter
+ * macros of the X86_MATCH_* family. If there is no matching shorthand
+ * macro, consider to add one. If you really need to wrap one of the macros
+ * into another macro at the usage site for good reasons, then please
+ * start this local macro with X86_MATCH to allow easy grepping.
  */
-#define X86_MATCH_VENDOR_FAM_MODEL_FEATURE(vendor, family, model, feature, data) \
-	X86_MATCH_VENDOR_FAM_MODEL_STEPPINGS_FEATURE(vendor, family, model, \
-						X86_STEPPING_ANY, feature, data)
+#define X86_MATCH_VENDOR_FAM_MODEL_FEATURE(_vendor, _family, _model,	\
+					   _feature, _data) {		\
+	.vendor		= X86_VENDOR_##_vendor,				\
+	.family		= _family,					\
+	.model		= _model,					\
+	.feature	= _feature,					\
+	.driver_data	= (unsigned long) _data				\
+}
 
 /**
  * X86_MATCH_VENDOR_FAM_FEATURE - Macro for matching vendor, family and CPU feature
@@ -190,6 +198,7 @@ struct x86_cpu_desc {
 }
 
 extern const struct x86_cpu_id *x86_match_cpu(const struct x86_cpu_id *match);
+extern const struct x86_cpu_id_v2 *x86_match_cpu_v2(const struct x86_cpu_id_v2 *match);
 extern bool x86_cpu_has_min_microcode_rev(const struct x86_cpu_desc *table);
 
 #endif /* _ASM_X86_CPU_DEVICE_ID */

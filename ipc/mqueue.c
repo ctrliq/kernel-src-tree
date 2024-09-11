@@ -77,7 +77,7 @@ struct mqueue_inode_info {
 
 	struct sigevent notify;
 	struct pid *notify_owner;
-	u32 notify_self_exec_id;
+	u64 notify_self_exec_id;
 	struct user_namespace *notify_user_ns;
 	struct user_struct *user;	/* user who created, for accounting */
 	struct sock *notify_sock;
@@ -700,7 +700,7 @@ static void __do_notify(struct mqueue_inode_info *info)
 			 * signals to programs that don't expect them.
 			 */
 			task = pid_task(info->notify_owner, PIDTYPE_TGID);
-			if (task && task->self_exec_id ==
+			if (task && task->task_struct_rh->self_exec_id ==
 						info->notify_self_exec_id) {
 				do_send_sig_info(info->notify.sigev_signo,
 						&sig_i, task, PIDTYPE_TGID);
@@ -1297,7 +1297,8 @@ retry:
 			info->notify.sigev_signo = notification->sigev_signo;
 			info->notify.sigev_value = notification->sigev_value;
 			info->notify.sigev_notify = SIGEV_SIGNAL;
-			info->notify_self_exec_id = current->self_exec_id;
+			info->notify_self_exec_id =
+				current->task_struct_rh->self_exec_id;
 			break;
 		}
 

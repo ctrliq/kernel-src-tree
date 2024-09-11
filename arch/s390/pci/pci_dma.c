@@ -404,7 +404,7 @@ static void *s390_dma_alloc(struct device *dev, size_t size,
 	dma_addr_t map;
 
 	size = PAGE_ALIGN(size);
-	page = alloc_pages(flag, get_order(size));
+	page = alloc_pages(flag | __GFP_ZERO, get_order(size));
 	if (!page)
 		return NULL;
 
@@ -668,6 +668,8 @@ const struct dma_map_ops s390_pci_dma_ops = {
 	.unmap_sg	= s390_dma_unmap_sg,
 	.map_page	= s390_dma_map_pages,
 	.unmap_page	= s390_dma_unmap_pages,
+	.mmap		= dma_common_mmap,
+	.get_sgtable	= dma_common_get_sgtable,
 	/* dma_supported is unconditionally true without a callback */
 };
 EXPORT_SYMBOL_GPL(s390_pci_dma_ops);

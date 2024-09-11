@@ -1112,6 +1112,7 @@ mlxsw_devlink_info_get(struct devlink *devlink, struct devlink_info_req *req,
 
 static int
 mlxsw_devlink_core_bus_device_reload_down(struct devlink *devlink,
+					  bool netns_change,
 					  struct netlink_ext_ack *extack)
 {
 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
@@ -1132,7 +1133,7 @@ mlxsw_devlink_core_bus_device_reload_up(struct devlink *devlink,
 	return mlxsw_core_bus_device_register(mlxsw_core->bus_info,
 					      mlxsw_core->bus,
 					      mlxsw_core->bus_priv, true,
-					      devlink);
+					      devlink, extack);
 }
 
 static int mlxsw_devlink_flash_update(struct devlink *devlink,
@@ -1197,6 +1198,72 @@ mlxsw_devlink_trap_group_init(struct devlink *devlink,
 	return mlxsw_driver->trap_group_init(mlxsw_core, group);
 }
 
+static int
+mlxsw_devlink_trap_group_set(struct devlink *devlink,
+			     const struct devlink_trap_group *group,
+			     const struct devlink_trap_policer *policer)
+{
+	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
+	struct mlxsw_driver *mlxsw_driver = mlxsw_core->driver;
+
+	if (!mlxsw_driver->trap_group_set)
+		return -EOPNOTSUPP;
+	return mlxsw_driver->trap_group_set(mlxsw_core, group, policer);
+}
+
+static int
+mlxsw_devlink_trap_policer_init(struct devlink *devlink,
+				const struct devlink_trap_policer *policer)
+{
+	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
+	struct mlxsw_driver *mlxsw_driver = mlxsw_core->driver;
+
+	if (!mlxsw_driver->trap_policer_init)
+		return -EOPNOTSUPP;
+	return mlxsw_driver->trap_policer_init(mlxsw_core, policer);
+}
+
+static void
+mlxsw_devlink_trap_policer_fini(struct devlink *devlink,
+				const struct devlink_trap_policer *policer)
+{
+	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
+	struct mlxsw_driver *mlxsw_driver = mlxsw_core->driver;
+
+	if (!mlxsw_driver->trap_policer_fini)
+		return;
+	mlxsw_driver->trap_policer_fini(mlxsw_core, policer);
+}
+
+static int
+mlxsw_devlink_trap_policer_set(struct devlink *devlink,
+			       const struct devlink_trap_policer *policer,
+			       u64 rate, u64 burst,
+			       struct netlink_ext_ack *extack)
+{
+	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
+	struct mlxsw_driver *mlxsw_driver = mlxsw_core->driver;
+
+	if (!mlxsw_driver->trap_policer_set)
+		return -EOPNOTSUPP;
+	return mlxsw_driver->trap_policer_set(mlxsw_core, policer, rate, burst,
+					      extack);
+}
+
+static int
+mlxsw_devlink_trap_policer_counter_get(struct devlink *devlink,
+				       const struct devlink_trap_policer *policer,
+				       u64 *p_drops)
+{
+	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
+	struct mlxsw_driver *mlxsw_driver = mlxsw_core->driver;
+
+	if (!mlxsw_driver->trap_policer_counter_get)
+		return -EOPNOTSUPP;
+	return mlxsw_driver->trap_policer_counter_get(mlxsw_core, policer,
+						      p_drops);
+}
+
 static const struct devlink_ops mlxsw_devlink_ops = {
 	.reload_down		= mlxsw_devlink_core_bus_device_reload_down,
 	.reload_up		= mlxsw_devlink_core_bus_device_reload_up,
@@ -1219,13 +1286,19 @@ static const struct devlink_ops mlxsw_devlink_ops = {
 	.trap_fini			= mlxsw_devlink_trap_fini,
 	.trap_action_set		= mlxsw_devlink_trap_action_set,
 	.trap_group_init		= mlxsw_devlink_trap_group_init,
+	.trap_group_set			= mlxsw_devlink_trap_group_set,
+	.trap_policer_init		= mlxsw_devlink_trap_policer_init,
+	.trap_policer_fini		= mlxsw_devlink_trap_policer_fini,
+	.trap_policer_set		= mlxsw_devlink_trap_policer_set,
+	.trap_policer_counter_get	= mlxsw_devlink_trap_policer_counter_get,
 };
 
 static int
 __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 				 const struct mlxsw_bus *mlxsw_bus,
 				 void *bus_priv, bool reload,
-				 struct devlink *devlink)
+				 struct devlink *devlink,
+				 struct netlink_ext_ack *extack)
 {
 	const char *device_kind = mlxsw_bus_info->device_kind;
 	struct mlxsw_core *mlxsw_core;
@@ -1299,7 +1372,7 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 	}
 
 	if (mlxsw_driver->init) {
-		err = mlxsw_driver->init(mlxsw_core, mlxsw_bus_info);
+		err = mlxsw_driver->init(mlxsw_core, mlxsw_bus_info, extack);
 		if (err)
 			goto err_driver_init;
 	}
@@ -1315,6 +1388,9 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 
 	if (mlxsw_driver->params_register)
 		devlink_params_publish(devlink);
+
+	if (!reload)
+		devlink_reload_enable(devlink);
 
 	return 0;
 
@@ -1350,14 +1426,16 @@ err_devlink_alloc:
 int mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 				   const struct mlxsw_bus *mlxsw_bus,
 				   void *bus_priv, bool reload,
-				   struct devlink *devlink)
+				   struct devlink *devlink,
+				   struct netlink_ext_ack *extack)
 {
 	bool called_again = false;
 	int err;
 
 again:
 	err = __mlxsw_core_bus_device_register(mlxsw_bus_info, mlxsw_bus,
-					       bus_priv, reload, devlink);
+					       bus_priv, reload,
+					       devlink, extack);
 	/* -EAGAIN is returned in case the FW was updated. FW needs
 	 * a reset, so lets try to call __mlxsw_core_bus_device_register()
 	 * again.
@@ -1376,6 +1454,8 @@ void mlxsw_core_bus_device_unregister(struct mlxsw_core *mlxsw_core,
 {
 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
 
+	if (!reload)
+		devlink_reload_disable(devlink);
 	if (devlink_is_reload_failed(devlink)) {
 		if (!reload)
 			/* Only the parts that were not de-initialized in the
@@ -2192,13 +2272,22 @@ int mlxsw_core_module_max_width(struct mlxsw_core *mlxsw_core, u8 module)
 	/* Here we need to get the module width according to the module type. */
 
 	switch (module_type) {
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C8X: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_QSFP_DD: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_OSFP:
+		return 8;
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C4X: /* fall through */
 	case MLXSW_REG_PMTM_MODULE_TYPE_BP_4X: /* fall through */
-	case MLXSW_REG_PMTM_MODULE_TYPE_BP_QSFP:
+	case MLXSW_REG_PMTM_MODULE_TYPE_QSFP:
 		return 4;
-	case MLXSW_REG_PMTM_MODULE_TYPE_BP_2X:
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C2X: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_BP_2X: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_SFP_DD: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_DSFP:
 		return 2;
-	case MLXSW_REG_PMTM_MODULE_TYPE_BP_SFP: /* fall through */
-	case MLXSW_REG_PMTM_MODULE_TYPE_BP_1X:
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C1X: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_BP_1X: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_SFP:
 		return 1;
 	default:
 		return -EINVAL;

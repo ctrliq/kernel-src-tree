@@ -13,6 +13,7 @@
  * GNU General Public License for more details.
  */
 
+#include <linux/gpio.h>
 #include <linux/gpio/driver.h>
 #include <linux/io.h>
 #include <linux/init.h>

@@ -25,27 +25,31 @@
 #include "util/bpf-event.h"
 #include "util/config.h"
 #include "util/color.h"
+#include "util/dso.h"
 #include "util/evlist.h"
 #include "util/evsel.h"
+#include "util/evsel_config.h"
 #include "util/event.h"
 #include "util/machine.h"
 #include "util/map.h"
+#include "util/mmap.h"
 #include "util/session.h"
 #include "util/symbol.h"
-#include "util/thread.h"
-#include "util/thread_map.h"
+#include "util/synthetic-events.h"
 #include "util/top.h"
+#include "util/util.h"
 #include <linux/rbtree.h>
 #include <subcmd/parse-options.h>
 #include "util/parse-events.h"
+#include "util/callchain.h"
 #include "util/cpumap.h"
-#include "util/xyarray.h"
 #include "util/sort.h"
 #include "util/string2.h"
 #include "util/term.h"
 #include "util/intlist.h"
 #include "util/parse-branch-options.h"
 #include "arch/common.h"
+#include "ui/ui.h"
 
 #include "util/debug.h"
 #include "util/ordered-events.h"
@@ -79,6 +83,7 @@
 #include <linux/err.h>
 
 #include <linux/ctype.h>
+#include <perf/mmap.h>
 
 static volatile int done;
 static volatile int resize;
@@ -103,7 +108,7 @@ static void perf_top__resize(struct perf_top *top)
 
 static int perf_top__parse_source(struct perf_top *top, struct hist_entry *he)
 {
-	struct perf_evsel *evsel;
+	struct evsel *evsel;
 	struct symbol *sym;
 	struct annotation *notes;
 	struct map *map;
@@ -131,7 +136,7 @@ static int perf_top__parse_source(struct perf_top *top, struct hist_entry *he)
 	notes = symbol__annotation(sym);
 	pthread_mutex_lock(&notes->lock);
 
-	if (!symbol__hists(sym, top->evlist->nr_entries)) {
+	if (!symbol__hists(sym, top->evlist->core.nr_entries)) {
 		pthread_mutex_unlock(&notes->lock);
 		pr_err("Not enough memory for annotating '%s' symbol!\n",
 		       sym->name);
@@ -139,12 +144,12 @@ static int perf_top__parse_source(struct perf_top *top, struct hist_entry *he)
 		return err;
 	}
 
-	err = symbol__annotate(sym, map, evsel, 0, &top->annotation_opts, NULL);
+	err = symbol__annotate(&he->ms, evsel, &top->annotation_opts, NULL);
 	if (err == 0) {
 		top->sym_filter_entry = he;
 	} else {
 		char msg[BUFSIZ];
-		symbol__strerror_disassemble(sym, map, err, msg, sizeof(msg));
+		symbol__strerror_disassemble(&he->ms, err, msg, sizeof(msg));
 		pr_err("Couldn't annotate %s: %s\n", sym->name, msg);
 	}
 
@@ -188,7 +193,7 @@ static void ui__warn_map_erange(struct map *map, struct symbol *sym, u64 ip)
 static void perf_top__record_precise_ip(struct perf_top *top,
 					struct hist_entry *he,
 					struct perf_sample *sample,
-					struct perf_evsel *evsel, u64 ip)
+					struct evsel *evsel, u64 ip)
 {
 	struct annotation *notes;
 	struct symbol *sym = he->ms.sym;
@@ -230,7 +235,7 @@ static void perf_top__record_precise_ip(struct perf_top *top,
 static void perf_top__show_details(struct perf_top *top)
 {
 	struct hist_entry *he = top->sym_filter_entry;
-	struct perf_evsel *evsel;
+	struct evsel *evsel;
 	struct annotation *notes;
 	struct symbol *symbol;
 	int more;
@@ -253,7 +258,7 @@ static void perf_top__show_details(struct perf_top *top)
 	printf("Showing %s for %s\n", perf_evsel__name(top->sym_evsel), symbol->name);
 	printf("  Events  Pcnt (>=%d%%)\n", top->annotation_opts.min_pcnt);
 
-	more = symbol__annotate_printf(symbol, he->ms.map, top->sym_evsel, &top->annotation_opts);
+	more = symbol__annotate_printf(&he->ms, top->sym_evsel, &top->annotation_opts);
 
 	if (top->evlist->enabled) {
 		if (top->zero)
@@ -267,12 +272,28 @@ out_unlock:
 	pthread_mutex_unlock(&notes->lock);
 }
 
-static void evlist__resort_hists(struct evlist *evlist)
+static void perf_top__resort_hists(struct perf_top *t)
 {
+	struct evlist *evlist = t->evlist;
 	struct evsel *pos;
 
 	evlist__for_each_entry(evlist, pos) {
 		struct hists *hists = evsel__hists(pos);
+
+		/*
+		 * unlink existing entries so that they can be linked
+		 * in a correct order in hists__match() below.
+		 */
+		hists__unlink(hists);
+
+		if (evlist->enabled) {
+			if (t->zero) {
+				hists__delete_entries(hists);
+			} else {
+				hists__decay_entries(hists, t->hide_user_symbols,
+						     t->hide_kernel_symbols);
+			}
+		}
 
 		hists__collapse_resort(hists, NULL);
 
@@ -296,7 +317,7 @@ static void perf_top__print_sym_table(struct perf_top *top)
 	char bf[160];
 	int printed = 0;
 	const int win_width = top->winsize.ws_col - 1;
-	struct perf_evsel *evsel = top->sym_evsel;
+	struct evsel *evsel = top->sym_evsel;
 	struct hists *hists = evsel__hists(evsel);
 
 	puts(CONSOLE_CLEAR);
@@ -322,16 +343,7 @@ static void perf_top__print_sym_table(struct perf_top *top)
 		return;
 	}
 
-	if (top->evlist->enabled) {
-		if (top->zero) {
-			hists__delete_entries(hists);
-		} else {
-			hists__decay_entries(hists, top->hide_user_symbols,
-					     top->hide_kernel_symbols);
-		}
-	}
-
-	evlist__resort_hists(top->evlist);
+	perf_top__resort_hists(top);
 
 	hists__output_recalc_col_len(hists, top->print_entries - printed);
 	putchar('\n');
@@ -429,7 +441,7 @@ static void perf_top__print_mapped_keys(struct perf_top *top)
 	fprintf(stdout, "\t[d]     display refresh delay.             \t(%d)\n", top->delay_secs);
 	fprintf(stdout, "\t[e]     display entries (lines).           \t(%d)\n", top->print_entries);
 
-	if (top->evlist->nr_entries > 1)
+	if (top->evlist->core.nr_entries > 1)
 		fprintf(stdout, "\t[E]     active event counter.              \t(%s)\n", perf_evsel__name(top->sym_evsel));
 
 	fprintf(stdout, "\t[f]     profile display filter (count).    \t(%d)\n", top->count_filter);
@@ -464,7 +476,7 @@ static int perf_top__key_mapped(struct perf_top *top, int c)
 		case 'S':
 			return 1;
 		case 'E':
-			return top->evlist->nr_entries > 1 ? 1 : 0;
+			return top->evlist->core.nr_entries > 1 ? 1 : 0;
 		default:
 			break;
 	}
@@ -510,7 +522,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 			}
 			break;
 		case 'E':
-			if (top->evlist->nr_entries > 1) {
+			if (top->evlist->core.nr_entries > 1) {
 				/* Select 0 as the default event: */
 				int counter = 0;
 
@@ -521,8 +533,8 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 
 				prompt_integer(&counter, "Enter details event counter");
 
-				if (counter >= top->evlist->nr_entries) {
-					top->sym_evsel = perf_evlist__first(top->evlist);
+				if (counter >= top->evlist->core.nr_entries) {
+					top->sym_evsel = evlist__first(top->evlist);
 					fprintf(stderr, "Sorry, no such event, using %s.\n", perf_evsel__name(top->sym_evsel));
 					sleep(1);
 					break;
@@ -531,7 +543,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 					if (top->sym_evsel->idx == counter)
 						break;
 			} else
-				top->sym_evsel = perf_evlist__first(top->evlist);
+				top->sym_evsel = evlist__first(top->evlist);
 			break;
 		case 'f':
 			prompt_integer(&top->count_filter, "Enter display event count filter");
@@ -579,24 +591,11 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 static void perf_top__sort_new_samples(void *arg)
 {
 	struct perf_top *t = arg;
-	struct perf_evsel *evsel = t->sym_evsel;
-	struct hists *hists;
 
 	if (t->evlist->selected != NULL)
 		t->sym_evsel = t->evlist->selected;
 
-	hists = evsel__hists(evsel);
-
-	if (t->evlist->enabled) {
-		if (t->zero) {
-			hists__delete_entries(hists);
-		} else {
-			hists__decay_entries(hists, t->hide_user_symbols,
-					     t->hide_kernel_symbols);
-		}
-	}
-
-	evlist__resort_hists(t->evlist);
+	perf_top__resort_hists(t);
 
 	if (t->lost || t->drop)
 		pr_warning("Too slow to read ring buffer (change period (-c/-F) or limit CPUs (-C)\n");
@@ -610,7 +609,7 @@ static void stop_top(void)
 
 static void *display_thread_tui(void *arg)
 {
-	struct perf_evsel *pos;
+	struct evsel *pos;
 	struct perf_top *top = arg;
 	const char *help = "For a higher level overview, try: perf top --sort comm,dso";
 	struct hist_browser_timer hbt = {
@@ -730,7 +729,7 @@ static int hist_iter__top_callback(struct hist_entry_iter *iter,
 {
 	struct perf_top *top = arg;
 	struct hist_entry *he = iter->he;
-	struct perf_evsel *evsel = iter->evsel;
+	struct evsel *evsel = iter->evsel;
 
 	if (perf_hpp_list.sym && single)
 		perf_top__record_precise_ip(top, he, iter->sample, evsel, al->addr);
@@ -743,7 +742,7 @@ static int hist_iter__top_callback(struct hist_entry_iter *iter,
 
 static void perf_event__process_sample(struct perf_tool *tool,
 				       const union perf_event *event,
-				       struct perf_evsel *evsel,
+				       struct evsel *evsel,
 				       struct perf_sample *sample,
 				       struct machine *machine)
 {
@@ -851,7 +850,7 @@ static void perf_event__process_sample(struct perf_tool *tool,
 
 static void
 perf_top__process_lost(struct perf_top *top, union perf_event *event,
-		       struct perf_evsel *evsel)
+		       struct evsel *evsel)
 {
 	struct hists *hists = evsel__hists(evsel);
 
@@ -863,7 +862,7 @@ perf_top__process_lost(struct perf_top *top, union perf_event *event,
 static void
 perf_top__process_lost_samples(struct perf_top *top,
 			       union perf_event *event,
-			       struct perf_evsel *evsel)
+			       struct evsel *evsel)
 {
 	struct hists *hists = evsel__hists(evsel);
 
@@ -877,15 +876,15 @@ static u64 last_timestamp;
 static void perf_top__mmap_read_idx(struct perf_top *top, int idx)
 {
 	struct record_opts *opts = &top->record_opts;
-	struct perf_evlist *evlist = top->evlist;
-	struct perf_mmap *md;
+	struct evlist *evlist = top->evlist;
+	struct mmap *md;
 	union perf_event *event;
 
 	md = opts->overwrite ? &evlist->overwrite_mmap[idx] : &evlist->mmap[idx];
-	if (perf_mmap__read_init(md) < 0)
+	if (perf_mmap__read_init(&md->core) < 0)
 		return;
 
-	while ((event = perf_mmap__read_event(md)) != NULL) {
+	while ((event = perf_mmap__read_event(&md->core)) != NULL) {
 		int ret;
 
 		ret = perf_evlist__parse_sample_timestamp(evlist, event, &last_timestamp);
@@ -896,7 +895,7 @@ static void perf_top__mmap_read_idx(struct perf_top *top, int idx)
 		if (ret)
 			break;
 
-		perf_mmap__consume(md);
+		perf_mmap__consume(&md->core);
 
 		if (top->qe.rotate) {
 			pthread_mutex_lock(&top->qe.mutex);
@@ -906,19 +905,19 @@ static void perf_top__mmap_read_idx(struct perf_top *top, int idx)
 		}
 	}
 
-	perf_mmap__read_done(md);
+	perf_mmap__read_done(&md->core);
 }
 
 static void perf_top__mmap_read(struct perf_top *top)
 {
 	bool overwrite = top->record_opts.overwrite;
-	struct perf_evlist *evlist = top->evlist;
+	struct evlist *evlist = top->evlist;
 	int i;
 
 	if (overwrite)
 		perf_evlist__toggle_bkw_mmap(evlist, BKW_MMAP_DATA_PENDING);
 
-	for (i = 0; i < top->evlist->nr_mmaps; i++)
+	for (i = 0; i < top->evlist->core.nr_mmaps; i++)
 		perf_top__mmap_read_idx(top, i);
 
 	if (overwrite) {
@@ -947,10 +946,10 @@ static void perf_top__mmap_read(struct perf_top *top)
 static int perf_top__overwrite_check(struct perf_top *top)
 {
 	struct record_opts *opts = &top->record_opts;
-	struct perf_evlist *evlist = top->evlist;
+	struct evlist *evlist = top->evlist;
 	struct perf_evsel_config_term *term;
 	struct list_head *config_terms;
-	struct perf_evsel *evsel;
+	struct evsel *evsel;
 	int set, overwrite = -1;
 
 	evlist__for_each_entry(evlist, evsel) {
@@ -976,7 +975,7 @@ static int perf_top__overwrite_check(struct perf_top *top)
 		/* has term for current event */
 		if ((overwrite < 0) && (set >= 0)) {
 			/* if it's first event, set overwrite */
-			if (evsel == perf_evlist__first(evlist))
+			if (evsel == evlist__first(evlist))
 				overwrite = set;
 			else
 				return -1;
@@ -990,21 +989,21 @@ static int perf_top__overwrite_check(struct perf_top *top)
 }
 
 static int perf_top_overwrite_fallback(struct perf_top *top,
-				       struct perf_evsel *evsel)
+				       struct evsel *evsel)
 {
 	struct record_opts *opts = &top->record_opts;
-	struct perf_evlist *evlist = top->evlist;
-	struct perf_evsel *counter;
+	struct evlist *evlist = top->evlist;
+	struct evsel *counter;
 
 	if (!opts->overwrite)
 		return 0;
 
 	/* only fall back when first event fails */
-	if (evsel != perf_evlist__first(evlist))
+	if (evsel != evlist__first(evlist))
 		return 0;
 
 	evlist__for_each_entry(evlist, counter)
-		counter->attr.write_backward = false;
+		counter->core.attr.write_backward = false;
 	opts->overwrite = false;
 	pr_debug2("fall back to non-overwrite mode\n");
 	return 1;
@@ -1013,8 +1012,8 @@ static int perf_top_overwrite_fallback(struct perf_top *top,
 static int perf_top__start_counters(struct perf_top *top)
 {
 	char msg[BUFSIZ];
-	struct perf_evsel *counter;
-	struct perf_evlist *evlist = top->evlist;
+	struct evsel *counter;
+	struct evlist *evlist = top->evlist;
 	struct record_opts *opts = &top->record_opts;
 
 	if (perf_top__overwrite_check(top)) {
@@ -1027,8 +1026,8 @@ static int perf_top__start_counters(struct perf_top *top)
 
 	evlist__for_each_entry(evlist, counter) {
 try_again:
-		if (perf_evsel__open(counter, top->evlist->cpus,
-				     top->evlist->threads) < 0) {
+		if (evsel__open(counter, top->evlist->core.cpus,
+				     top->evlist->core.threads) < 0) {
 
 			/*
 			 * Specially handle overwrite fall back.
@@ -1057,7 +1056,7 @@ try_again:
 		}
 	}
 
-	if (perf_evlist__mmap(evlist, opts->mmap_pages) < 0) {
+	if (evlist__mmap(evlist, opts->mmap_pages) < 0) {
 		ui__error("Failed to mmap with %d (%s)\n",
 			    errno, str_error_r(errno, msg, sizeof(msg)));
 		goto out_err;
@@ -1138,11 +1137,11 @@ static int deliver_event(struct ordered_events *qe,
 			 struct ordered_event *qevent)
 {
 	struct perf_top *top = qe->data;
-	struct perf_evlist *evlist = top->evlist;
+	struct evlist *evlist = top->evlist;
 	struct perf_session *session = top->session;
 	union perf_event *event = qevent->event;
 	struct perf_sample sample;
-	struct perf_evsel *evsel;
+	struct evsel *evsel;
 	struct machine *machine;
 	int ret = -1;
 
@@ -1276,7 +1275,7 @@ static int __cmd_top(struct perf_top *top)
 		pr_debug("Couldn't synthesize cgroup events.\n");
 
 	machine__synthesize_threads(&top->session->machines.host, &opts->target,
-				    top->evlist->threads, false,
+				    top->evlist->core.threads, false,
 				    top->nr_threads_synthesize);
 
 	if (top->nr_threads_synthesize > 1)
@@ -1309,7 +1308,7 @@ static int __cmd_top(struct perf_top *top)
 	 * so leave the check here.
 	 */
         if (!target__none(&opts->target))
-                perf_evlist__enable(top->evlist);
+		evlist__enable(top->evlist);
 
 	ret = -1;
 	if (pthread_create(&thread_process, NULL, process_thread, top)) {
@@ -1334,7 +1333,7 @@ static int __cmd_top(struct perf_top *top)
 	}
 
 	/* Wait for a minimal set of events before starting the snapshot */
-	perf_evlist__poll(top->evlist, 100);
+	evlist__poll(top->evlist, 100);
 
 	perf_top__mmap_read(top);
 
@@ -1344,7 +1343,7 @@ static int __cmd_top(struct perf_top *top)
 		perf_top__mmap_read(top);
 
 		if (opts->overwrite || (hits == top->samples))
-			ret = perf_evlist__poll(top->evlist, 100);
+			ret = evlist__poll(top->evlist, 100);
 
 		if (resize) {
 			perf_top__resize(top);
@@ -1536,6 +1535,10 @@ int cmd_top(int argc, const char **argv)
 		    "objdump binary to use for disassembly and annotations"),
 	OPT_STRING('M', "disassembler-style", &top.annotation_opts.disassembler_style, "disassembler style",
 		   "Specify disassembler style (e.g. -M intel for intel syntax)"),
+	OPT_STRING(0, "prefix", &top.annotation_opts.prefix, "prefix",
+		    "Add prefix to source file path names in programs (with --prefix-strip)"),
+	OPT_STRING(0, "prefix-strip", &top.annotation_opts.prefix_strip, "N",
+		    "Strip first N entries of source file path name in programs (with --prefix)"),
 	OPT_STRING('u', "uid", &target->uid_str, "user", "user to profile"),
 	OPT_CALLBACK(0, "percent-limit", &top, "percent",
 		     "Don't show entries under that percent", parse_percent_limit),
@@ -1572,7 +1575,7 @@ int cmd_top(int argc, const char **argv)
 	OPTS_EVSWITCH(&top.evswitch),
 	OPT_END()
 	};
-	struct perf_evlist *sb_evlist = NULL;
+	struct evlist *sb_evlist = NULL;
 	const char * const top_usage[] = {
 		"perf top [<options>]",
 		NULL
@@ -1585,7 +1588,7 @@ int cmd_top(int argc, const char **argv)
 	top.annotation_opts.min_pcnt = 5;
 	top.annotation_opts.context  = 4;
 
-	top.evlist = perf_evlist__new();
+	top.evlist = evlist__new();
 	if (top.evlist == NULL)
 		return -ENOMEM;
 
@@ -1612,7 +1615,10 @@ int cmd_top(int argc, const char **argv)
 	if (argc)
 		usage_with_options(top_usage, options);
 
-	if (!top.evlist->nr_entries &&
+	if (annotate_check_args(&top.annotation_opts) < 0)
+		goto out_delete_evlist;
+
+	if (!top.evlist->core.nr_entries &&
 	    perf_evlist__add_default(top.evlist) < 0) {
 		pr_err("Not enough memory for event selector list\n");
 		goto out_delete_evlist;
@@ -1692,7 +1698,7 @@ int cmd_top(int argc, const char **argv)
 		goto out_delete_evlist;
 	}
 
-	top.sym_evsel = perf_evlist__first(top.evlist);
+	top.sym_evsel = evlist__first(top.evlist);
 
 	if (!callchain_param.enabled) {
 		symbol_conf.cumulate_callchain = false;
@@ -1741,7 +1747,7 @@ int cmd_top(int argc, const char **argv)
 		perf_evlist__stop_sb_thread(sb_evlist);
 
 out_delete_evlist:
-	perf_evlist__delete(top.evlist);
+	evlist__delete(top.evlist);
 	perf_session__delete(top.session);
 
 	return status;

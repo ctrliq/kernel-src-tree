@@ -5665,9 +5665,9 @@ struct mlx5_ifc_copy_action_in_bits {
 	u8         reserved_at_38[0x8];
 };
 
-union mlx5_ifc_set_action_in_add_action_in_auto_bits {
-	struct mlx5_ifc_set_action_in_bits set_action_in;
-	struct mlx5_ifc_add_action_in_bits add_action_in;
+union mlx5_ifc_set_add_copy_action_in_auto_bits {
+	struct mlx5_ifc_set_action_in_bits  set_action_in;
+	struct mlx5_ifc_add_action_in_bits  add_action_in;
 	struct mlx5_ifc_copy_action_in_bits copy_action_in;
 	u8         reserved_at_0[0x40];
 };
@@ -5741,7 +5741,7 @@ struct mlx5_ifc_alloc_modify_header_context_in_bits {
 	u8         reserved_at_68[0x10];
 	u8         num_of_actions[0x8];
 
-	union mlx5_ifc_set_action_in_add_action_in_auto_bits actions[0];
+	union mlx5_ifc_set_add_copy_action_in_auto_bits actions[0];
 };
 
 struct mlx5_ifc_dealloc_modify_header_context_out_bits {
@@ -9891,6 +9891,34 @@ struct mlx5_ifc_pptb_reg_bits {
 	u8         reserved_at_48[0x10];
 	u8         ctrl_buff[0x4];
 	u8         untagged_buff[0x4];
+};
+
+struct mlx5_ifc_sbcam_reg_bits {
+	u8         reserved_at_0[0x8];
+	u8         feature_group[0x8];
+	u8         reserved_at_10[0x8];
+	u8         access_reg_group[0x8];
+
+	u8         reserved_at_20[0x20];
+
+	u8         sb_access_reg_cap_mask[4][0x20];
+
+	u8         reserved_at_c0[0x80];
+
+	u8         sb_feature_cap_mask[4][0x20];
+
+	u8         reserved_at_1c0[0x40];
+
+	u8         cap_total_buffer_size[0x20];
+
+	u8         cap_cell_size[0x10];
+	u8         cap_max_pg_buffers[0x8];
+	u8         cap_num_pool_supported[0x8];
+
+	u8         reserved_at_240[0x8];
+	u8         cap_sbsr_stat_size[0x8];
+	u8         cap_max_tclass_data[0x8];
+	u8         cap_max_cpu_ingress_tclass_sb[0x8];
 };
 
 struct mlx5_ifc_pbmc_reg_bits {

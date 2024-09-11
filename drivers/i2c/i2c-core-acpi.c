@@ -1,12 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Linux I2C core ACPI support code
  *
  * Copyright (C) 2014 Intel Corp, Author: Lan Tianyu <tianyu.lan@intel.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option)
- * any later version.
  */
 
 #include <linux/acpi.h>
@@ -384,10 +380,6 @@ static int i2c_acpi_find_match_adapter(struct device *dev, const void *data)
 	return ACPI_HANDLE(dev) == (acpi_handle)data;
 }
 
-static int i2c_acpi_find_match_device(struct device *dev, const void *data)
-{
-	return ACPI_COMPANION(dev) == data;
-}
 
 struct i2c_adapter *i2c_acpi_find_adapter_by_handle(acpi_handle handle)
 {
@@ -395,6 +387,7 @@ struct i2c_adapter *i2c_acpi_find_adapter_by_handle(acpi_handle handle)
 
 	dev = bus_find_device(&i2c_bus_type, NULL, handle,
 			      i2c_acpi_find_match_adapter);
+
 	return dev ? i2c_verify_adapter(dev) : NULL;
 }
 EXPORT_SYMBOL_GPL(i2c_acpi_find_adapter_by_handle);
@@ -402,10 +395,17 @@ EXPORT_SYMBOL_GPL(i2c_acpi_find_adapter_by_handle);
 static struct i2c_client *i2c_acpi_find_client_by_adev(struct acpi_device *adev)
 {
 	struct device *dev;
+	struct i2c_client *client;
 
-	dev = bus_find_device(&i2c_bus_type, NULL, adev,
-			      i2c_acpi_find_match_device);
-	return dev ? i2c_verify_client(dev) : NULL;
+	dev = bus_find_device_by_acpi_dev(&i2c_bus_type, adev);
+	if (!dev)
+		return NULL;
+
+	client = i2c_verify_client(dev);
+	if (!client)
+		put_device(dev);
+
+	return client;
 }
 
 static int i2c_acpi_notify(struct notifier_block *nb, unsigned long value,

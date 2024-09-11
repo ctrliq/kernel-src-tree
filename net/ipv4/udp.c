@@ -81,7 +81,7 @@
 
 #include <linux/uaccess.h>
 #include <asm/ioctls.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 #include <linux/highmem.h>
 #include <linux/swap.h>
 #include <linux/types.h>
@@ -116,6 +116,9 @@
 #include <net/sock_reuseport.h>
 #include <net/addrconf.h>
 #include <net/udp_tunnel.h>
+#if IS_ENABLED(CONFIG_IPV6)
+#include <net/ipv6_stubs.h>
+#endif
 
 struct udp_table udp_table __read_mostly;
 EXPORT_SYMBOL(udp_table);
@@ -1628,7 +1631,7 @@ int udp_ioctl(struct sock *sk, int cmd, unsigned long arg)
 EXPORT_SYMBOL(udp_ioctl);
 
 struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
-			       int noblock, int *peeked, int *off, int *err)
+			       int noblock, int *off, int *err)
 {
 	struct sk_buff_head *sk_queue = &sk->sk_receive_queue;
 	struct sk_buff_head *queue;
@@ -1647,13 +1650,11 @@ struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
 			break;
 
 		error = -EAGAIN;
-		*peeked = 0;
 		do {
 			spin_lock_bh(&queue->lock);
 			skb = __skb_try_recv_from_queue(sk, queue, flags,
 							udp_skb_destructor,
-							peeked, off, err,
-							&last);
+							off, err, &last);
 			if (skb) {
 				spin_unlock_bh(&queue->lock);
 				return skb;
@@ -1674,8 +1675,7 @@ struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
 
 			skb = __skb_try_recv_from_queue(sk, queue, flags,
 							udp_skb_dtor_locked,
-							peeked, off, err,
-							&last);
+							off, err, &last);
 			spin_unlock(&sk_queue->lock);
 			spin_unlock_bh(&queue->lock);
 			if (skb)
@@ -1690,7 +1690,8 @@ busy_check:
 
 		/* sk_queue is empty, reader_queue may contain peeked packets */
 	} while (timeo &&
-		 !__skb_wait_for_more_packets(sk, &error, &timeo,
+		 !__skb_wait_for_more_packets(sk, &sk->sk_receive_queue,
+					      &error, &timeo,
 					      (struct sk_buff *)sk_queue));
 
 	*err = error;
@@ -1710,8 +1711,7 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock,
 	DECLARE_SOCKADDR(struct sockaddr_in *, sin, msg->msg_name);
 	struct sk_buff *skb;
 	unsigned int ulen, copied;
-	int peeked, peeking, off;
-	int err;
+	int off, err, peeking = flags & MSG_PEEK;
 	int is_udplite = IS_UDPLITE(sk);
 	bool checksum_valid = false;
 
@@ -1719,9 +1719,8 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock,
 		return ip_recv_error(sk, msg, len, addr_len);
 
 try_again:
-	peeking = flags & MSG_PEEK;
 	off = sk_peek_offset(sk, flags);
-	skb = __skb_recv_udp(sk, flags, noblock, &peeked, &off, &err);
+	skb = __skb_recv_udp(sk, flags, noblock, &off, &err);
 	if (!skb)
 		return err;
 
@@ -1759,7 +1758,7 @@ try_again:
 	}
 
 	if (unlikely(err)) {
-		if (!peeked) {
+		if (!peeking) {
 			atomic_inc(&sk->sk_drops);
 			UDP_INC_STATS(sock_net(sk),
 				      UDP_MIB_INERRORS, is_udplite);
@@ -1768,7 +1767,7 @@ try_again:
 		return err;
 	}
 
-	if (!peeked)
+	if (!peeking)
 		UDP_INC_STATS(sock_net(sk),
 			      UDP_MIB_INDATAGRAMS, is_udplite);
 
@@ -2245,6 +2244,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	struct rtable *rt = skb_rtable(skb);
 	__be32 saddr, daddr;
 	struct net *net = dev_net(skb->dev);
+	bool refcounted;
 
 	/*
 	 *  Validate the packet.
@@ -2270,7 +2270,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	if (udp4_csum_init(skb, uh, proto))
 		goto csum_error;
 
-	sk = skb_steal_sock(skb);
+	sk = skb_steal_sock(skb, &refcounted);
 	if (sk) {
 		struct dst_entry *dst = skb_dst(skb);
 		int ret;
@@ -2279,7 +2279,8 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 			udp_sk_rx_dst_set(sk, dst);
 
 		ret = udp_unicast_rcv_skb(sk, skb, uh);
-		sock_put(sk);
+		if (refcounted)
+			sock_put(sk);
 		return ret;
 	}
 
@@ -2518,7 +2519,12 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 #ifdef CONFIG_XFRM
 		case UDP_ENCAP_ESPINUDP:
 		case UDP_ENCAP_ESPINUDP_NON_IKE:
-			up->encap_rcv = xfrm4_udp_encap_rcv;
+#if IS_ENABLED(CONFIG_IPV6)
+			if (sk->sk_family == AF_INET6)
+				up->encap_rcv = ipv6_stub->xfrm6_udp_encap_rcv;
+			else
+#endif
+				up->encap_rcv = xfrm4_udp_encap_rcv;
 #endif
 			/* FALLTHROUGH */
 		case UDP_ENCAP_L2TPINUDP:

@@ -14,10 +14,11 @@ Contents:
    e100
    e1000
    device_drivers/google/gve.rst
-   devlink-info-versions
    kapi
    z8530book
    msg_zerocopy
+   phy
+   sfp-phylink
    tls
    tls-offload
 

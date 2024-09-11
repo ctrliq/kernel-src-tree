@@ -191,6 +191,25 @@ void __iomem * __ioremap_caller(phys_addr_t addr, unsigned long size,
 	return ret;
 }
 
+#ifdef CONFIG_ZONE_DEVICE
+/*
+ * Override the generic version in mm/memremap.c.
+ *
+ * With hash translation, the direct-map range is mapped with just one
+ * page size selected by htab_init_page_sizes(). Consult
+ * mmu_psize_defs[] to determine the minimum page size alignment.
+ */
+unsigned long memremap_compat_align(void)
+{
+	unsigned int shift = mmu_psize_defs[mmu_linear_psize].shift;
+
+	if (radix_enabled())
+		return SUBSECTION_SIZE;
+	return max(SUBSECTION_SIZE, 1UL << shift);
+}
+EXPORT_SYMBOL_GPL(memremap_compat_align);
+#endif
+
 void __iomem * __ioremap(phys_addr_t addr, unsigned long size,
 			 unsigned long flags)
 {

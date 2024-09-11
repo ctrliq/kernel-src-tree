@@ -290,9 +290,13 @@ enum nla_policy_validation {
  */
 struct nla_policy {
 #ifdef __BIG_ENDIAN__
-	RH_KABI_REPLACE2(u16 type, u8 validation_type, u8 type)
+	RH_KABI_REPLACE_SPLIT(u16 type,
+			      u8 validation_type,
+			      u8 type)
 #else
-	RH_KABI_REPLACE2(u16 type, u8 type, u8 validation_type)
+	RH_KABI_REPLACE_SPLIT(u16 type,
+			      u8 type,
+			      u8 validation_type)
 #endif
 	u16		len;
 #ifdef __GENKSYMS__
@@ -1477,6 +1481,21 @@ static inline int nla_put_in6_addr(struct sk_buff *skb, int attrtype,
 				   const struct in6_addr *addr)
 {
 	return nla_put(skb, attrtype, sizeof(*addr), addr);
+}
+
+/**
+ * nla_put_bitfield32 - Add a bitfield32 netlink attribute to a socket buffer
+ * @skb: socket buffer to add attribute to
+ * @attrtype: attribute type
+ * @value: value carrying bits
+ * @selector: selector of valid bits
+ */
+static inline int nla_put_bitfield32(struct sk_buff *skb, int attrtype,
+				     __u32 value, __u32 selector)
+{
+	struct nla_bitfield32 tmp = { value, selector, };
+
+	return nla_put(skb, attrtype, sizeof(tmp), &tmp);
 }
 
 /**

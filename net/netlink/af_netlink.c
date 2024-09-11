@@ -2217,6 +2217,7 @@ static int netlink_dump(struct sock *sk)
 	 */
 	cb = &nlk->cb;
 	alloc_min_size = max_t(int, cb->min_dump_alloc, NLMSG_GOODSIZE);
+	alloc_min_size = max_t(int, alloc_min_size, cb->min_dump_alloc_rh_old);
 
 	if (alloc_min_size < nlk->max_recvmsg_len) {
 		alloc_size = nlk->max_recvmsg_len;
@@ -2338,6 +2339,7 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 	cb->data = control->data;
 	cb->module = control->module;
 	cb->min_dump_alloc = control->min_dump_alloc;
+	cb->min_dump_alloc_rh_old = control->min_dump_alloc;
 	cb->skb = skb;
 
 	nlk2 = nlk_sk(NETLINK_CB(skb).sk);

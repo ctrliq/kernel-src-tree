@@ -158,8 +158,6 @@ class HeaderParser(object):
                 break
 
         self.reader.close()
-        print('Parsed description of %d helper function(s)' % len(self.helpers),
-              file=sys.stderr)
 
 ###############################################################################
 
@@ -438,6 +436,7 @@ class PrinterHelpers(Printer):
             'struct bpf_fib_lookup',
             'struct bpf_perf_event_data',
             'struct bpf_perf_event_value',
+            'struct bpf_pidns_info',
             'struct bpf_sock',
             'struct bpf_sock_addr',
             'struct bpf_sock_ops',

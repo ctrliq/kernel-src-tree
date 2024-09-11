@@ -316,6 +316,71 @@ ice_aq_get_link_info(struct ice_port_info *pi, bool ena_lse,
 }
 
 /**
+ * ice_fill_tx_timer_and_fc_thresh
+ * @hw: pointer to the HW struct
+ * @cmd: pointer to MAC cfg structure
+ *
+ * Add Tx timer and FC refresh threshold info to Set MAC Config AQ command
+ * descriptor
+ */
+static void
+ice_fill_tx_timer_and_fc_thresh(struct ice_hw *hw,
+				struct ice_aqc_set_mac_cfg *cmd)
+{
+	u16 fc_thres_val, tx_timer_val;
+	u32 val;
+
+	/* We read back the transmit timer and FC threshold value of
+	 * LFC. Thus, we will use index =
+	 * PRTMAC_HSEC_CTL_TX_PAUSE_QUANTA_MAX_INDEX.
+	 *
+	 * Also, because we are operating on transmit timer and FC
+	 * threshold of LFC, we don't turn on any bit in tx_tmr_priority
+	 */
+#define IDX_OF_LFC PRTMAC_HSEC_CTL_TX_PAUSE_QUANTA_MAX_INDEX
+
+	/* Retrieve the transmit timer */
+	val = rd32(hw, PRTMAC_HSEC_CTL_TX_PAUSE_QUANTA(IDX_OF_LFC));
+	tx_timer_val = val &
+		PRTMAC_HSEC_CTL_TX_PAUSE_QUANTA_HSEC_CTL_TX_PAUSE_QUANTA_M;
+	cmd->tx_tmr_value = cpu_to_le16(tx_timer_val);
+
+	/* Retrieve the FC threshold */
+	val = rd32(hw, PRTMAC_HSEC_CTL_TX_PAUSE_REFRESH_TIMER(IDX_OF_LFC));
+	fc_thres_val = val & PRTMAC_HSEC_CTL_TX_PAUSE_REFRESH_TIMER_M;
+
+	cmd->fc_refresh_threshold = cpu_to_le16(fc_thres_val);
+}
+
+/**
+ * ice_aq_set_mac_cfg
+ * @hw: pointer to the HW struct
+ * @max_frame_size: Maximum Frame Size to be supported
+ * @cd: pointer to command details structure or NULL
+ *
+ * Set MAC configuration (0x0603)
+ */
+enum ice_status
+ice_aq_set_mac_cfg(struct ice_hw *hw, u16 max_frame_size, struct ice_sq_cd *cd)
+{
+	struct ice_aqc_set_mac_cfg *cmd;
+	struct ice_aq_desc desc;
+
+	cmd = &desc.params.set_mac_cfg;
+
+	if (max_frame_size == 0)
+		return ICE_ERR_PARAM;
+
+	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_set_mac_cfg);
+
+	cmd->max_frame_size = cpu_to_le16(max_frame_size);
+
+	ice_fill_tx_timer_and_fc_thresh(hw, cmd);
+
+	return ice_aq_send_cmd(hw, &desc, NULL, 0, cd);
+}
+
+/**
  * ice_init_fltr_mgmt_struct - initializes filter management list and locks
  * @hw: pointer to the HW struct
  */
@@ -588,10 +653,10 @@ void ice_output_fw_log(struct ice_hw *hw, struct ice_aq_desc *desc, void *buf)
 }
 
 /**
- * ice_get_itr_intrl_gran - determine int/intrl granularity
+ * ice_get_itr_intrl_gran
  * @hw: pointer to the HW struct
  *
- * Determines the ITR/intrl granularities based on the maximum aggregate
+ * Determines the ITR/INTRL granularities based on the maximum aggregate
  * bandwidth according to the device's configuration during power-on.
  */
 static void ice_get_itr_intrl_gran(struct ice_hw *hw)
@@ -652,6 +717,10 @@ enum ice_status ice_init_hw(struct ice_hw *hw)
 	status = ice_clear_pf_cfg(hw);
 	if (status)
 		goto err_unroll_cqinit;
+
+	/* Set bit to enable Flow Director filters */
+	wr32(hw, PFQF_FD_ENA, PFQF_FD_ENA_FD_ENA_M);
+	INIT_LIST_HEAD(&hw->fdir_list_head);
 
 	ice_clear_pxe_mode(hw);
 
@@ -743,6 +812,14 @@ enum ice_status ice_init_hw(struct ice_hw *hw)
 
 	if (status)
 		goto err_unroll_fltr_mgmt_struct;
+	/* enable jumbo frame support at MAC level */
+	status = ice_aq_set_mac_cfg(hw, ICE_AQ_SET_MAC_FRAME_SIZE_MAX, NULL);
+	if (status)
+		goto err_unroll_fltr_mgmt_struct;
+	/* Obtain counter base index which would be used by flow director */
+	status = ice_alloc_fd_res_cntr(hw, &hw->fd_ctr_base);
+	if (status)
+		goto err_unroll_fltr_mgmt_struct;
 	status = ice_init_hw_tbls(hw);
 	if (status)
 		goto err_unroll_fltr_mgmt_struct;
@@ -770,6 +847,7 @@ err_unroll_cqinit:
  */
 void ice_deinit_hw(struct ice_hw *hw)
 {
+	ice_free_fd_res_cntr(hw, hw->fd_ctr_base);
 	ice_cleanup_fltr_mgmt_struct(hw);
 
 	ice_sched_cleanup_all(hw);
@@ -934,72 +1012,6 @@ enum ice_status ice_reset(struct ice_hw *hw, enum ice_reset_req req)
 
 	/* wait for the FW to be ready */
 	return ice_check_reset(hw);
-}
-
-/**
- * ice_get_pfa_module_tlv - Reads sub module TLV from NVM PFA
- * @hw: pointer to hardware structure
- * @module_tlv: pointer to module TLV to return
- * @module_tlv_len: pointer to module TLV length to return
- * @module_type: module type requested
- *
- * Finds the requested sub module TLV type from the Preserved Field
- * Area (PFA) and returns the TLV pointer and length. The caller can
- * use these to read the variable length TLV value.
- */
-enum ice_status
-ice_get_pfa_module_tlv(struct ice_hw *hw, u16 *module_tlv, u16 *module_tlv_len,
-		       u16 module_type)
-{
-	enum ice_status status;
-	u16 pfa_len, pfa_ptr;
-	u16 next_tlv;
-
-	status = ice_read_sr_word(hw, ICE_SR_PFA_PTR, &pfa_ptr);
-	if (status) {
-		ice_debug(hw, ICE_DBG_INIT, "Preserved Field Array pointer.\n");
-		return status;
-	}
-	status = ice_read_sr_word(hw, pfa_ptr, &pfa_len);
-	if (status) {
-		ice_debug(hw, ICE_DBG_INIT, "Failed to read PFA length.\n");
-		return status;
-	}
-	/* Starting with first TLV after PFA length, iterate through the list
-	 * of TLVs to find the requested one.
-	 */
-	next_tlv = pfa_ptr + 1;
-	while (next_tlv < pfa_ptr + pfa_len) {
-		u16 tlv_sub_module_type;
-		u16 tlv_len;
-
-		/* Read TLV type */
-		status = ice_read_sr_word(hw, next_tlv, &tlv_sub_module_type);
-		if (status) {
-			ice_debug(hw, ICE_DBG_INIT, "Failed to read TLV type.\n");
-			break;
-		}
-		/* Read TLV length */
-		status = ice_read_sr_word(hw, next_tlv + 1, &tlv_len);
-		if (status) {
-			ice_debug(hw, ICE_DBG_INIT, "Failed to read TLV length.\n");
-			break;
-		}
-		if (tlv_sub_module_type == module_type) {
-			if (tlv_len) {
-				*module_tlv = next_tlv;
-				*module_tlv_len = tlv_len;
-				return 0;
-			}
-			return ICE_ERR_INVAL_SIZE;
-		}
-		/* Check next TLV, i.e. current TLV pointer + length + 2 words
-		 * (for current TLV's type and length)
-		 */
-		next_tlv = next_tlv + tlv_len + 2;
-	}
-	/* Module does not exist */
-	return ICE_ERR_DOES_NOT_EXIST;
 }
 
 /**
@@ -1745,6 +1757,33 @@ ice_parse_caps(struct ice_hw *hw, void *buf, u32 cap_count,
 			ice_debug(hw, ICE_DBG_INIT,
 				  "%s: msix_vector_first_id = %d\n", prefix,
 				  caps->msix_vector_first_id);
+			break;
+		case ICE_AQC_CAPS_FD:
+			if (dev_p) {
+				dev_p->num_flow_director_fltr = number;
+				ice_debug(hw, ICE_DBG_INIT,
+					  "%s: num_flow_director_fltr = %d\n",
+					  prefix,
+					  dev_p->num_flow_director_fltr);
+			}
+			if (func_p) {
+				u32 reg_val, val;
+
+				reg_val = rd32(hw, GLQF_FD_SIZE);
+				val = (reg_val & GLQF_FD_SIZE_FD_GSIZE_M) >>
+				      GLQF_FD_SIZE_FD_GSIZE_S;
+				func_p->fd_fltr_guar =
+				      ice_get_num_per_func(hw, val);
+				val = (reg_val & GLQF_FD_SIZE_FD_BSIZE_M) >>
+				      GLQF_FD_SIZE_FD_BSIZE_S;
+				func_p->fd_fltr_best_effort = val;
+				ice_debug(hw, ICE_DBG_INIT,
+					  "%s: fd_fltr_guar = %d\n",
+					  prefix, func_p->fd_fltr_guar);
+				ice_debug(hw, ICE_DBG_INIT,
+					  "%s: fd_fltr_best_effort = %d\n",
+					  prefix, func_p->fd_fltr_best_effort);
+			}
 			break;
 		case ICE_AQC_CAPS_MAX_MTU:
 			caps->max_mtu = number;

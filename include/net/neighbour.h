@@ -74,6 +74,7 @@ struct neigh_parms {
 	struct net_device *dev;
 	struct list_head list;
 	int	(*neigh_setup)(struct neighbour *);
+	RH_KABI_DEPRECATE_FN(void, neigh_cleanup, struct neighbour *)
 	struct neigh_table *tbl;
 
 	void	*sysctl_table;

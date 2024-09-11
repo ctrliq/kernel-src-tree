@@ -788,7 +788,7 @@ void send_sigio(struct fown_struct *fown, int fd, int band)
 	if (!pid)
 		goto out_unlock_fown;
 
-	if (type <= PIDTYPE_TGID) {
+	if ((type == PIDTYPE_PID) || (type == PIDTYPE_TGID)) {
 		rcu_read_lock();
 		p = pid_task(pid, PIDTYPE_PID);
 		if (p)
@@ -828,7 +828,7 @@ int send_sigurg(struct fown_struct *fown)
 
 	ret = 1;
 
-	if (type <= PIDTYPE_TGID) {
+	if ((type == PIDTYPE_PID) || (type == PIDTYPE_TGID)) {
 		rcu_read_lock();
 		p = pid_task(pid, PIDTYPE_PID);
 		if (p)

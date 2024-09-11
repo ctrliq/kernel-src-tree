@@ -251,7 +251,6 @@ GLOBAL(entry_SYSCALL_64_after_hwframe)
 	 */
 syscall_return_via_sysret:
 	/* rcx and r11 are already restored (see code above) */
-	UNWIND_HINT_EMPTY
 	IBRS_EXIT
 	POP_REGS pop_rdi=0 skip_r11rcx=1
 
@@ -261,6 +260,7 @@ syscall_return_via_sysret:
 	 */
 	movq	%rsp, %rdi
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp
+	UNWIND_HINT_EMPTY
 
 	pushq	RSP-RDI(%rdi)	/* RSP */
 	pushq	(%rdi)		/* RDI */
@@ -281,7 +281,6 @@ END(entry_SYSCALL_64)
  * %rsi: next task
  */
 ENTRY(__switch_to_asm)
-	UNWIND_HINT_FUNC
 	/*
 	 * Save callee-saved registers
 	 * This must match the order in inactive_task_frame
@@ -324,7 +323,7 @@ ENTRY(__switch_to_asm)
 	popq	%rbp
 
 	jmp	__switch_to
-END(__switch_to_asm)
+ENDPROC(__switch_to_asm)
 
 /*
  * A newly forked process directly context switches into this address.
@@ -515,7 +514,7 @@ END(spurious_entries_start)
  * +----------------------------------------------------+
  */
 ENTRY(interrupt_entry)
-	UNWIND_HINT_FUNC
+	UNWIND_HINT_IRET_REGS offset=16
 	ASM_CLAC
 	cld
 
@@ -548,9 +547,9 @@ ENTRY(interrupt_entry)
 	pushq	5*8(%rdi)		/* regs->eflags */
 	pushq	4*8(%rdi)		/* regs->cs */
 	pushq	3*8(%rdi)		/* regs->ip */
+	UNWIND_HINT_IRET_REGS
 	pushq	2*8(%rdi)		/* regs->orig_ax */
 	pushq	8(%rdi)			/* return address */
-	UNWIND_HINT_FUNC
 
 	movq	(%rdi), %rdi
 	jmp	2f
@@ -641,6 +640,7 @@ GLOBAL(swapgs_restore_regs_and_return_to_usermode)
 	 */
 	movq	%rsp, %rdi
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp
+	UNWIND_HINT_EMPTY
 
 	/* Copy the IRET frame to the trampoline stack. */
 	pushq	6*8(%rdi)	/* SS */
@@ -667,7 +667,7 @@ GLOBAL(swapgs_restore_regs_and_return_to_usermode)
 
 /* Returning to kernel space */
 retint_kernel:
-#ifdef CONFIG_PREEMPT
+#ifdef CONFIG_PREEMPTION
 	/* Interrupts are off */
 	/* Check if we need preemption */
 	btl	$9, EFLAGS(%rsp)		/* were interrupts off? */
@@ -1102,7 +1102,7 @@ ENTRY(xen_do_hypervisor_callback)		/* do_hypervisor_callback(struct *pt_regs) */
 	call	xen_evtchn_do_upcall
 	LEAVE_IRQ_STACK
 
-#ifndef CONFIG_PREEMPT
+#ifndef CONFIG_PREEMPTION
 	call	xen_maybe_preempt_hcall
 #endif
 	jmp	error_exit

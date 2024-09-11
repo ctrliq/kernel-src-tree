@@ -11,7 +11,7 @@
 #include <linux/mm.h>
 #include <linux/swap.h>
 #include <linux/module.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 #ifdef CONFIG_BLK_DEV_RAM
 #include <linux/blkdev.h>
 #endif
@@ -62,7 +62,7 @@ void __init mem_init(void)
 	high_memory = (void *)(memory_end & PAGE_MASK);
 
 	/* this will put all memory onto the freelists */
-	free_all_bootmem();
+	memblock_free_all();
 
 	mem_init_print_info(NULL);
 }

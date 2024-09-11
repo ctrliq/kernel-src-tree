@@ -232,7 +232,7 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr *addr,
 			return -EINVAL;
 	}
 
-	if (chan->psm && bdaddr_type_is_le(chan->src_type))
+	if (chan->psm && bdaddr_type_is_le(chan->src_type) && !chan->mode)
 		chan->mode = L2CAP_MODE_LE_FLOWCTL;
 
 	err = l2cap_chan_connect(chan, la.l2_psm, __le16_to_cpu(la.l2_cid),
@@ -273,6 +273,12 @@ static int l2cap_sock_listen(struct socket *sock, int backlog)
 	switch (chan->mode) {
 	case L2CAP_MODE_BASIC:
 	case L2CAP_MODE_LE_FLOWCTL:
+		break;
+	case L2CAP_MODE_EXT_FLOWCTL:
+		if (!enable_ecred) {
+			err = -EOPNOTSUPP;
+			goto done;
+		}
 		break;
 	case L2CAP_MODE_ERTM:
 	case L2CAP_MODE_STREAMING:
@@ -426,6 +432,8 @@ static int l2cap_sock_getsockopt_old(struct socket *sock, int optname,
 		opts.fcs      = chan->fcs;
 		opts.max_tx   = chan->max_tx;
 		opts.txwin_size = chan->tx_win;
+
+		BT_DBG("mode 0x%2.2x", chan->mode);
 
 		len = min_t(unsigned int, len, sizeof(opts));
 		if (copy_to_user(optval, (char *) &opts, len))
@@ -707,6 +715,8 @@ static int l2cap_sock_setsockopt_old(struct socket *sock, int optname,
 			break;
 		}
 
+		BT_DBG("mode 0x%2.2x", chan->mode);
+
 		chan->imtu = opts.imtu;
 		chan->omtu = opts.omtu;
 		chan->fcs  = opts.fcs;
@@ -804,10 +814,13 @@ static int l2cap_sock_setsockopt(struct socket *sock, int level, int optname,
 
 		conn = chan->conn;
 
-		/*change security for LE channels */
+		/* change security for LE channels */
 		if (chan->scid == L2CAP_CID_ATT) {
-			if (smp_conn_security(conn->hcon, sec.level))
+			if (smp_conn_security(conn->hcon, sec.level)) {
+				err = -EINVAL;
 				break;
+			}
+
 			set_bit(FLAG_PENDING_SECURITY, &chan->flags);
 			sk->sk_state = BT_CONFIG;
 			chan->state = BT_CONFIG;
@@ -936,7 +949,8 @@ static int l2cap_sock_setsockopt(struct socket *sock, int level, int optname,
 			break;
 		}
 
-		if (sk->sk_state == BT_CONNECTED) {
+		if (chan->mode == L2CAP_MODE_LE_FLOWCTL &&
+		    sk->sk_state == BT_CONNECTED) {
 			err = -EISCONN;
 			break;
 		}
@@ -946,7 +960,12 @@ static int l2cap_sock_setsockopt(struct socket *sock, int level, int optname,
 			break;
 		}
 
-		chan->imtu = opt;
+		if (chan->mode == L2CAP_MODE_EXT_FLOWCTL &&
+		    sk->sk_state == BT_CONNECTED)
+			err = l2cap_chan_reconfigure(chan, opt);
+		else
+			chan->imtu = opt;
+
 		break;
 
 	default:
@@ -1001,7 +1020,11 @@ static int l2cap_sock_recvmsg(struct socket *sock, struct msghdr *msg,
 
 	if (sk->sk_state == BT_CONNECT2 && test_bit(BT_SK_DEFER_SETUP,
 						    &bt_sk(sk)->flags)) {
-		if (bdaddr_type_is_le(pi->chan->src_type)) {
+		if (pi->chan->mode == L2CAP_MODE_EXT_FLOWCTL) {
+			sk->sk_state = BT_CONNECTED;
+			pi->chan->state = BT_CONNECTED;
+			__l2cap_ecred_conn_rsp_defer(pi->chan);
+		} else if (bdaddr_type_is_le(pi->chan->src_type)) {
 			sk->sk_state = BT_CONNECTED;
 			pi->chan->state = BT_CONNECTED;
 			__l2cap_le_connect_rsp_defer(pi->chan);
@@ -1052,7 +1075,7 @@ done:
 }
 
 /* Kill socket (only if zapped and orphan)
- * Must be called on unlocked socket.
+ * Must be called on unlocked socket, with l2cap channel lock.
  */
 static void l2cap_sock_kill(struct sock *sk)
 {
@@ -1203,6 +1226,7 @@ static int l2cap_sock_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
 	int err;
+	struct l2cap_chan *chan;
 
 	BT_DBG("sock %p, sk %p", sock, sk);
 
@@ -1212,9 +1236,17 @@ static int l2cap_sock_release(struct socket *sock)
 	bt_sock_unlink(&l2cap_sk_list, sk);
 
 	err = l2cap_sock_shutdown(sock, 2);
+	chan = l2cap_pi(sk)->chan;
+
+	l2cap_chan_hold(chan);
+	l2cap_chan_lock(chan);
 
 	sock_orphan(sk);
 	l2cap_sock_kill(sk);
+
+	l2cap_chan_unlock(chan);
+	l2cap_chan_put(chan);
+
 	return err;
 }
 
@@ -1232,12 +1264,15 @@ static void l2cap_sock_cleanup_listen(struct sock *parent)
 		BT_DBG("child chan %p state %s", chan,
 		       state_to_string(chan->state));
 
+		l2cap_chan_hold(chan);
 		l2cap_chan_lock(chan);
+
 		__clear_chan_timer(chan);
 		l2cap_chan_close(chan, ECONNRESET);
-		l2cap_chan_unlock(chan);
-
 		l2cap_sock_kill(sk);
+
+		l2cap_chan_unlock(chan);
+		l2cap_chan_put(chan);
 	}
 }
 
@@ -1265,7 +1300,7 @@ static struct l2cap_chan *l2cap_sock_new_connection_cb(struct l2cap_chan *chan)
 
 	l2cap_sock_init(sk, parent);
 
-	bt_accept_enqueue(parent, sk);
+	bt_accept_enqueue(parent, sk, false);
 
 	release_sock(parent);
 

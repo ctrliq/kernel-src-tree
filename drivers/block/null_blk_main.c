@@ -1027,6 +1027,16 @@ next:
 	return 0;
 }
 
+static void nullb_fill_pattern(struct nullb *nullb, struct page *page,
+			       unsigned int len, unsigned int off)
+{
+	void *dst;
+
+	dst = kmap_atomic(page);
+	memset(dst + off, 0xFF, len);
+	kunmap_atomic(dst);
+}
+
 static void null_handle_discard(struct nullb *nullb, sector_t sector, size_t n)
 {
 	size_t temp;
@@ -1067,10 +1077,24 @@ static int null_transfer(struct nullb *nullb, struct page *page,
 	unsigned int len, unsigned int off, bool is_write, sector_t sector,
 	bool is_fua)
 {
+	struct nullb_device *dev = nullb->dev;
+	unsigned int valid_len = len;
 	int err = 0;
 
 	if (!is_write) {
-		err = copy_from_nullb(nullb, page, off, sector, len);
+		if (dev->zoned)
+			valid_len = null_zone_valid_read_len(nullb,
+				sector, len);
+
+		if (valid_len) {
+			err = copy_from_nullb(nullb, page, off,
+				sector, valid_len);
+			off += valid_len;
+			len -= valid_len;
+		}
+
+		if (len)
+			nullb_fill_pattern(nullb, page, len, off);
 		flush_dcache_page(page);
 	} else {
 		flush_dcache_page(page);
@@ -1266,14 +1290,9 @@ static blk_status_t null_handle_cmd(struct nullb_cmd *cmd, sector_t sector,
 	if (dev->memory_backed)
 		cmd->error = null_handle_memory_backed(cmd, op);
 
-	if (!cmd->error && dev->zoned) {
-		if (op == REQ_OP_WRITE)
-			null_zone_write(cmd, sector, nr_sectors);
-		else if (op == REQ_OP_ZONE_RESET)
-			null_zone_reset(cmd, sector);
-		else if (op == REQ_OP_ZONE_RESET_ALL)
-			null_zone_reset(cmd, 0);
-	}
+	if (!cmd->error && dev->zoned)
+		cmd->error = null_handle_zoned(cmd, op, sector, nr_sectors);
+
 out:
 	nullb_complete_cmd(cmd);
 	return BLK_STS_OK;
@@ -1487,7 +1506,7 @@ static void null_config_discard(struct nullb *nullb)
 
 static const struct block_device_operations null_ops = {
 	.owner		= THIS_MODULE,
-	.report_zones	= null_zone_report,
+	.report_zones	= null_report_zones,
 };
 
 static int setup_commands(struct nullb_queue *nq)
@@ -1550,7 +1569,6 @@ static int null_gendisk_register(struct nullb *nullb)
 {
 	sector_t size = ((sector_t)nullb->dev->size * SZ_1M) >> SECTOR_SHIFT;
 	struct gendisk *disk;
-	int ret;
 
 	disk = nullb->disk = alloc_disk_node(1, nullb->dev->home_node);
 	if (!disk)
@@ -1565,11 +1583,19 @@ static int null_gendisk_register(struct nullb *nullb)
 	disk->queue		= nullb->q;
 	strncpy(disk->disk_name, nullb->disk_name, DISK_NAME_LEN);
 
+#ifdef CONFIG_BLK_DEV_ZONED
 	if (nullb->dev->zoned) {
-		ret = blk_revalidate_disk_zones(disk);
-		if (ret)
-			return ret;
+		if (queue_is_mq(nullb->q)) {
+			int ret = blk_revalidate_disk_zones(disk);
+			if (ret)
+				return ret;
+		} else {
+			blk_queue_chunk_sectors(nullb->q,
+					nullb->dev->zone_size_sects);
+			nullb->q->nr_zones = blkdev_nr_zones(disk);
+		}
 	}
+#endif
 
 	add_disk(disk);
 	return 0;
@@ -1749,7 +1775,6 @@ static int null_add_dev(struct nullb_device *dev)
 		if (rv)
 			goto out_cleanup_blk_queue;
 
-		blk_queue_chunk_sectors(nullb->q, dev->zone_size_sects);
 		nullb->q->limits.zoned = BLK_ZONED_HM;
 		blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, nullb->q);
 		blk_queue_required_elevator_features(nullb->q,

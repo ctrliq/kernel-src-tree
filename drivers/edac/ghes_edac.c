@@ -101,6 +101,19 @@ static int get_dimm_smbios_index(struct mem_ctl_info *mci, u16 handle)
 	return -1;
 }
 
+static void dimm_setup_label(struct dimm_info *dimm, u16 handle)
+{
+	const char *bank = NULL, *device = NULL;
+
+	dmi_memdev_name(handle, &bank, &device);
+
+	/* both strings must be non-zero */
+	if (bank && *bank && device && *device) {
+		snprintf(dimm->label, sizeof(dimm->label),
+			"%s %s", bank, device);
+	}
+}
+
 static void ghes_edac_dmidecode(const struct dmi_header *dh, void *arg)
 {
 	struct ghes_edac_dimm_fill *dimm_fill = arg;
@@ -183,9 +196,7 @@ static void ghes_edac_dmidecode(const struct dmi_header *dh, void *arg)
 		dimm->dtype = DEV_UNKNOWN;
 		dimm->grain = 128;		/* Likely, worse case */
 
-		/*
-		 * FIXME: It shouldn't be hard to also fill the DIMM labels
-		 */
+		dimm_setup_label(dimm, entry->handle);
 
 		if (dimm->nr_pages) {
 			edac_dbg(1, "DIMM%i: %s size = %d MB%s\n",
@@ -233,7 +244,6 @@ void ghes_edac_report_mem_error(int sev, struct cper_sec_mem_err *mem_err)
 	/* Cleans the error report buffer */
 	memset(e, 0, sizeof (*e));
 	e->error_count = 1;
-	strcpy(e->label, "unknown label");
 	e->msg = pvt->msg;
 	e->other_detail = pvt->other_detail;
 	e->top_layer = -1;
@@ -359,15 +369,22 @@ void ghes_edac_report_mem_error(int sev, struct cper_sec_mem_err *mem_err)
 			p += sprintf(p, "DIMM DMI handle: 0x%.4x ",
 				     mem_err->mem_dev_handle);
 
+		/*
+		 * kabi compatibility: There is no dimm->idx, so keep
+		 * using get_dimm_smbios_index().
+		 */
 		index = get_dimm_smbios_index(mci, mem_err->mem_dev_handle);
 		if (index >= 0) {
 			e->top_layer = index;
 			e->enable_per_layer_report = true;
+			strcpy(e->label, mci->dimms[index]->label);
 		}
-
 	}
 	if (p > e->location)
 		*(p - 1) = '\0';
+
+	if (!*e->label)
+		strcpy(e->label, "unknown memory");
 
 	/* All other fields are mapped on e->other_detail */
 	p = pvt->other_detail;

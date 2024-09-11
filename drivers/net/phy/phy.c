@@ -253,66 +253,6 @@ static void phy_sanitize_settings(struct phy_device *phydev)
 	}
 }
 
-/**
- * phy_ethtool_sset - generic ethtool sset function, handles all the details
- * @phydev: target phy_device struct
- * @cmd: ethtool_cmd
- *
- * A few notes about parameter checking:
- *
- * - We don't set port or transceiver, so we don't care what they
- *   were set to.
- * - phy_start_aneg() will make sure forced settings are sane, and
- *   choose the next best ones from the ones selected, so we don't
- *   care if ethtool tries to give us bad values.
- */
-int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd)
-{
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
-	u32 speed = ethtool_cmd_speed(cmd);
-
-	if (cmd->phy_address != phydev->mdio.addr)
-		return -EINVAL;
-
-	/* We make sure that we don't pass unsupported values in to the PHY */
-	ethtool_convert_legacy_u32_to_link_mode(advertising, cmd->advertising);
-	linkmode_and(advertising, advertising, phydev->supported);
-
-	/* Verify the settings we care about. */
-	if (cmd->autoneg != AUTONEG_ENABLE && cmd->autoneg != AUTONEG_DISABLE)
-		return -EINVAL;
-
-	if (cmd->autoneg == AUTONEG_ENABLE && cmd->advertising == 0)
-		return -EINVAL;
-
-	if (cmd->autoneg == AUTONEG_DISABLE &&
-	    ((speed != SPEED_1000 &&
-	      speed != SPEED_100 &&
-	      speed != SPEED_10) ||
-	     (cmd->duplex != DUPLEX_HALF &&
-	      cmd->duplex != DUPLEX_FULL)))
-		return -EINVAL;
-
-	phydev->autoneg = cmd->autoneg;
-
-	phydev->speed = speed;
-
-	linkmode_copy(phydev->advertising, advertising);
-
-	linkmode_mod_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
-			 phydev->advertising, AUTONEG_ENABLE == cmd->autoneg);
-
-	phydev->duplex = cmd->duplex;
-
-	phydev->mdix_ctrl = cmd->eth_tp_mdix_ctrl;
-
-	/* Restart the PHY */
-	phy_start_aneg(phydev);
-
-	return 0;
-}
-EXPORT_SYMBOL(phy_ethtool_sset);
-
 int phy_ethtool_ksettings_set(struct phy_device *phydev,
 			      const struct ethtool_link_ksettings *cmd)
 {
@@ -642,38 +582,21 @@ static int phy_poll_aneg_done(struct phy_device *phydev)
  */
 int phy_speed_down(struct phy_device *phydev, bool sync)
 {
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_old);
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_tmp);
 	int ret;
 
 	if (phydev->autoneg != AUTONEG_ENABLE)
 		return 0;
 
-	linkmode_copy(adv_old, phydev->advertising);
-	linkmode_copy(adv, phydev->lp_advertising);
-	linkmode_and(adv, adv, phydev->supported);
+	linkmode_copy(adv_tmp, phydev->advertising);
 
-	if (linkmode_test_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT, adv) ||
-	    linkmode_test_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT, adv)) {
-		linkmode_clear_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT,
-				   phydev->advertising);
-		linkmode_clear_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
-				   phydev->advertising);
-		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Half_BIT,
-				   phydev->advertising);
-		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
-				   phydev->advertising);
-	} else if (linkmode_test_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT,
-				     adv) ||
-		   linkmode_test_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT,
-				     adv)) {
-		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Half_BIT,
-				   phydev->advertising);
-		linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
-				   phydev->advertising);
-	}
+	ret = phy_speed_down_core(phydev);
+	if (ret)
+		return ret;
 
-	if (linkmode_equal(phydev->advertising, adv_old))
+	linkmode_copy(phydev->adv_old, adv_tmp);
+
+	if (linkmode_equal(phydev->advertising, adv_tmp))
 		return 0;
 
 	ret = phy_config_aneg(phydev);
@@ -692,30 +615,19 @@ EXPORT_SYMBOL_GPL(phy_speed_down);
  */
 int phy_speed_up(struct phy_device *phydev)
 {
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(all_speeds) = { 0, };
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(not_speeds);
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported);
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_old);
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(speeds);
-
-	linkmode_copy(adv_old, phydev->advertising);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_tmp);
 
 	if (phydev->autoneg != AUTONEG_ENABLE)
 		return 0;
 
-	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT, all_speeds);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT, all_speeds);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT, all_speeds);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Full_BIT, all_speeds);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Half_BIT, all_speeds);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT, all_speeds);
+	if (linkmode_empty(phydev->adv_old))
+		return 0;
 
-	linkmode_andnot(not_speeds, adv_old, all_speeds);
-	linkmode_copy(supported, phydev->supported);
-	linkmode_and(speeds, supported, all_speeds);
-	linkmode_or(phydev->advertising, not_speeds, speeds);
+	linkmode_copy(adv_tmp, phydev->advertising);
+	linkmode_copy(phydev->advertising, phydev->adv_old);
+	linkmode_zero(phydev->adv_old);
 
-	if (linkmode_equal(phydev->advertising, adv_old))
+	if (linkmode_equal(phydev->advertising, adv_tmp))
 		return 0;
 
 	return phy_config_aneg(phydev);

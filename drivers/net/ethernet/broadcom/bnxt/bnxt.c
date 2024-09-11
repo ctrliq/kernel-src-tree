@@ -70,8 +70,12 @@
 
 #define BNXT_TX_TIMEOUT		(5 * HZ)
 
+static const char version[] =
+	"Broadcom NetXtreme-C/E driver " DRV_MODULE_NAME " v" DRV_MODULE_VERSION "\n";
+
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Broadcom BCM573xx network driver");
+MODULE_VERSION(DRV_MODULE_VERSION);
 
 #define BNXT_RX_OFFSET (NET_SKB_PAD + NET_IP_ALIGN)
 #define BNXT_RX_DMA_OFFSET NET_SKB_PAD
@@ -3181,13 +3185,8 @@ static int bnxt_init_one_rx_ring(struct bnxt *bp, int ring_nr)
 	bnxt_init_rxbd_pages(ring, type);
 
 	if (BNXT_RX_PAGE_MODE(bp) && bp->xdp_prog) {
-		rxr->xdp_prog = bpf_prog_add(bp->xdp_prog, 1);
-		if (IS_ERR(rxr->xdp_prog)) {
-			int rc = PTR_ERR(rxr->xdp_prog);
-
-			rxr->xdp_prog = NULL;
-			return rc;
-		}
+		bpf_prog_add(bp->xdp_prog, 1);
+		rxr->xdp_prog = bp->xdp_prog;
 	}
 	prod = rxr->rx_prod;
 	for (i = 0; i < bp->rx_ring_size; i++) {
@@ -7231,7 +7230,7 @@ static int __bnxt_hwrm_ver_get(struct bnxt *bp, bool silent)
 static int bnxt_hwrm_ver_get(struct bnxt *bp)
 {
 	struct hwrm_ver_get_output *resp = bp->hwrm_cmd_resp_addr;
-	u32 dev_caps_cfg;
+	u32 dev_caps_cfg, hwrm_ver;
 	int rc;
 
 	bp->hwrm_max_req_len = HWRM_MAX_REQ_LEN;
@@ -7251,6 +7250,19 @@ static int bnxt_hwrm_ver_get(struct bnxt *bp)
 			    resp->hwrm_intf_upd_8b);
 		netdev_warn(bp->dev, "Please update firmware with HWRM interface 1.0.0 or newer.\n");
 	}
+
+	hwrm_ver = HWRM_VERSION_MAJOR << 16 | HWRM_VERSION_MINOR << 8 |
+			HWRM_VERSION_UPDATE;
+
+	if (bp->hwrm_spec_code > hwrm_ver)
+		snprintf(bp->hwrm_ver_supp, FW_VER_STR_LEN, "%d.%d.%d",
+			 HWRM_VERSION_MAJOR, HWRM_VERSION_MINOR,
+			 HWRM_VERSION_UPDATE);
+	else
+		snprintf(bp->hwrm_ver_supp, FW_VER_STR_LEN, "%d.%d.%d",
+			 resp->hwrm_intf_maj_8b, resp->hwrm_intf_min_8b,
+			 resp->hwrm_intf_upd_8b);
+
 	snprintf(bp->fw_ver_str, BC_HWRM_STR_LEN, "%d.%d.%d.%d",
 		 resp->hwrm_fw_maj_8b, resp->hwrm_fw_min_8b,
 		 resp->hwrm_fw_bld_8b, resp->hwrm_fw_rsvd_8b);
@@ -9970,7 +9982,7 @@ static void bnxt_reset_task(struct bnxt *bp, bool silent)
 	}
 }
 
-static void bnxt_tx_timeout(struct net_device *dev)
+static void bnxt_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	struct bnxt *bp = netdev_priv(dev);
 
@@ -10834,6 +10846,8 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 		bnxt_ulp_start(bp, rc);
 		if (!rc)
 			bnxt_reenable_sriov(bp);
+		bnxt_dl_health_recovery_done(bp);
+		bnxt_dl_health_status_update(bp, true);
 		rtnl_unlock();
 		break;
 	}
@@ -10841,6 +10855,8 @@ static void bnxt_fw_reset_task(struct work_struct *work)
 
 fw_reset_abort:
 	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
+	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF)
+		bnxt_dl_health_status_update(bp, false);
 	bp->fw_reset_state = 0;
 	rtnl_lock();
 	dev_close(bp->dev);
@@ -11822,12 +11838,16 @@ static int bnxt_pcie_dsn_get(struct bnxt *bp, u8 dsn[])
 
 static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
+	static int version_printed;
 	struct net_device *dev;
 	struct bnxt *bp;
 	int rc, max_irqs;
 
 	if (pci_is_bridge(pdev))
 		return -ENODEV;
+
+	if (version_printed++ == 0)
+		pr_info("%s", version);
 
 	/* Clear any pending DMA transactions from crash kernel
 	 * while loading driver in capture kernel.

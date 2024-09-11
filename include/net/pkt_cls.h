@@ -262,7 +262,8 @@ static inline void tcf_exts_put_net(struct tcf_exts *exts)
 
 static inline void
 tcf_exts_stats_update(const struct tcf_exts *exts,
-		      u64 bytes, u64 packets, u64 lastuse)
+		      u64 bytes, u64 packets, u64 lastuse,
+		      u8 used_hw_stats, bool used_hw_stats_valid)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	int i;
@@ -273,6 +274,8 @@ tcf_exts_stats_update(const struct tcf_exts *exts,
 		struct tc_action *a = exts->actions[i];
 
 		tcf_action_stats_update(a, bytes, packets, lastuse, true);
+		a->used_hw_stats = used_hw_stats;
+		a->used_hw_stats_valid = used_hw_stats_valid;
 	}
 
 	preempt_enable();
@@ -844,6 +847,74 @@ struct tc_root_qopt_offload {
 	enum tc_root_command command;
 	u32 handle;
 	bool ingress;
+};
+
+enum tc_ets_command {
+	TC_ETS_REPLACE,
+	TC_ETS_DESTROY,
+	TC_ETS_STATS,
+	TC_ETS_GRAFT,
+};
+
+struct tc_ets_qopt_offload_replace_params {
+	unsigned int bands;
+	u8 priomap[TC_PRIO_MAX + 1];
+	unsigned int quanta[TCQ_ETS_MAX_BANDS];	/* 0 for strict bands. */
+	unsigned int weights[TCQ_ETS_MAX_BANDS];
+	struct gnet_stats_queue *qstats;
+};
+
+struct tc_ets_qopt_offload_graft_params {
+	u8 band;
+	u32 child_handle;
+};
+
+struct tc_ets_qopt_offload {
+	enum tc_ets_command command;
+	u32 handle;
+	u32 parent;
+	union {
+		struct tc_ets_qopt_offload_replace_params replace_params;
+		struct tc_qopt_offload_stats stats;
+		struct tc_ets_qopt_offload_graft_params graft_params;
+	};
+};
+
+enum tc_tbf_command {
+	TC_TBF_REPLACE,
+	TC_TBF_DESTROY,
+	TC_TBF_STATS,
+};
+
+struct tc_tbf_qopt_offload_replace_params {
+	struct psched_ratecfg rate;
+	u32 max_size;
+	struct gnet_stats_queue *qstats;
+};
+
+struct tc_tbf_qopt_offload {
+	enum tc_tbf_command command;
+	u32 handle;
+	u32 parent;
+	union {
+		struct tc_tbf_qopt_offload_replace_params replace_params;
+		struct tc_qopt_offload_stats stats;
+	};
+};
+
+enum tc_fifo_command {
+	TC_FIFO_REPLACE,
+	TC_FIFO_DESTROY,
+	TC_FIFO_STATS,
+};
+
+struct tc_fifo_qopt_offload {
+	enum tc_fifo_command command;
+	u32 handle;
+	u32 parent;
+	union {
+		struct tc_qopt_offload_stats stats;
+	};
 };
 
 #endif

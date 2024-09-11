@@ -100,6 +100,8 @@ static int alt_fpga_bridge_probe(struct platform_device *pdev)
 	struct regmap *sysmgr;
 	int ret = 0;
 
+	mark_tech_preview("Altera SoCFPGA FPGA to SDRAM Bridge", THIS_MODULE);
+
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;

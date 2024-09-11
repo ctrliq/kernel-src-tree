@@ -778,7 +778,7 @@ static int nfp_flower_init(struct nfp_app *app)
 
 	err = flow_indr_dev_register(nfp_flower_indr_setup_tc_cb, app);
 	if (err)
-		goto err_cleanup;
+		goto err_lag_clean;
 
 	if (app_priv->flower_ext_feats & NFP_FL_FEATS_VF_RLIM)
 		nfp_flower_qos_init(app);

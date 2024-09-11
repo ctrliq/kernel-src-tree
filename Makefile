@@ -9,8 +9,8 @@ NAME = Merciless Moray
 # DRM backport version
 #
 RHEL_DRM_VERSION = 5
-RHEL_DRM_PATCHLEVEL = 3
-RHEL_DRM_SUBLEVEL = 0
+RHEL_DRM_PATCHLEVEL = 6
+RHEL_DRM_SUBLEVEL = 19
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
@@ -229,6 +229,9 @@ export srctree objtree VPATH
 # of make so .config is not included in this case either (for *config).
 
 version_h := include/generated/uapi/linux/version.h
+
+export version_h
+
 old_version_h := include/linux/version.h
 
 clean-targets := %clean mrproper cleandocs
@@ -1161,7 +1164,7 @@ define filechk_version.h
 	echo '#define RHEL_RELEASE "$(RHEL_RELEASE)"';)
 endef
 
-$(version_h): $(srctree)/Makefile FORCE
+$(version_h): $(srctree)/Makefile $(srctree)/Makefile.rhelver FORCE
 	$(call filechk,version.h)
 	$(Q)rm -f $(old_version_h)
 
@@ -1219,9 +1222,8 @@ PHONY += kselftest
 kselftest:
 	$(Q)$(MAKE) -C $(srctree)/tools/testing/selftests run_tests
 
-PHONY += kselftest-clean
-kselftest-clean:
-	$(Q)$(MAKE) -C $(srctree)/tools/testing/selftests clean
+kselftest-%: FORCE
+	$(Q)$(MAKE) -C $(srctree)/tools/testing/selftests $*
 
 PHONY += kselftest-merge
 kselftest-merge:

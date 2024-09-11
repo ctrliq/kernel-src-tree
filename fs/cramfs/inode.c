@@ -983,6 +983,14 @@ static int __init init_cramfs_fs(void)
 {
 	int rv;
 
+	/* Deprecate cramfs because there aren't many users for it
+	 * and we want to steer users towards squashfs so we don't
+	 * have to maintain multiple such filesystems in RHEL.
+	 */
+	printk(KERN_WARNING "cramfs is deprecated and is slated for removal in "
+	      "a future RHEL release. Please use an alternative file system "
+	      "like squashfs.\n");
+
 	rv = cramfs_uncompress_init();
 	if (rv < 0)
 		return rv;

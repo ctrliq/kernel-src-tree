@@ -43,6 +43,25 @@ EXPORT_SYMBOL(ioremap_bot);	/* aka VMALLOC_END */
 
 extern char etext[], _stext[], _sinittext[], _einittext[];
 
+#ifdef CONFIG_ZONE_DEVICE
+/*
+ * Override the generic version in mm/memremap.c.
+ *
+ * With hash translation, the direct-map range is mapped with just one
+ * page size selected by htab_init_page_sizes(). Consult
+ * mmu_psize_defs[] to determine the minimum page size alignment.
+ */
+unsigned long memremap_compat_align(void)
+{
+	unsigned int shift = mmu_psize_defs[mmu_linear_psize].shift;
+
+	if (radix_enabled())
+		return SUBSECTION_SIZE;
+	return max(SUBSECTION_SIZE, 1UL << shift);
+}
+EXPORT_SYMBOL_GPL(memremap_compat_align);
+#endif
+
 __ref pte_t *pte_alloc_one_kernel(struct mm_struct *mm, unsigned long address)
 {
 	pte_t *pte;
@@ -259,7 +278,7 @@ static void __init __mapin_ram_chunk(unsigned long offset, unsigned long top)
 		ktext = ((char *)v >= _stext && (char *)v < etext) ||
 			((char *)v >= _sinittext && (char *)v < _einittext);
 		map_kernel_page(v, p, ktext ? PAGE_KERNEL_TEXT : PAGE_KERNEL);
-#ifdef CONFIG_PPC_STD_MMU_32
+#ifdef CONFIG_PPC_BOOK3S_32
 		if (ktext)
 			hash_preload(&init_mm, v, false, 0x300);
 #endif

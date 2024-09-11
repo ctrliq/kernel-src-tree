@@ -306,7 +306,6 @@ static snd_pcm_uframes_t snd_tm6000_pointer(struct snd_pcm_substream *substream)
 static const struct snd_pcm_ops snd_tm6000_pcm_ops = {
 	.open = snd_tm6000_pcm_open,
 	.close = snd_tm6000_close,
-	.ioctl = snd_pcm_lib_ioctl,
 	.prepare = snd_tm6000_prepare,
 	.trigger = snd_tm6000_card_trigger,
 	.pointer = snd_tm6000_pointer,
@@ -349,8 +348,8 @@ static int tm6000_audio_init(struct tm6000_core *dev)
 		snd_printk(KERN_ERR "cannot create card instance %d\n", devnr);
 		return rc;
 	}
-	strcpy(card->driver, "tm6000-alsa");
-	strcpy(card->shortname, "TM5600/60x0");
+	strscpy(card->driver, "tm6000-alsa", sizeof(card->driver));
+	strscpy(card->shortname, "TM5600/60x0", sizeof(card->shortname));
 	sprintf(card->longname, "TM5600/60x0 Audio at bus %d device %d",
 		dev->udev->bus->busnum, dev->udev->devnum);
 
@@ -376,7 +375,7 @@ static int tm6000_audio_init(struct tm6000_core *dev)
 
 	pcm->info_flags = 0;
 	pcm->private_data = chip;
-	strcpy(pcm->name, "Trident TM5600/60x0");
+	strscpy(pcm->name, "Trident TM5600/60x0", sizeof(pcm->name));
 
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_tm6000_pcm_ops);
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);

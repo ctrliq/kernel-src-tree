@@ -692,6 +692,8 @@ static int fme_probe(struct platform_device *pdev)
 {
 	int ret;
 
+	mark_tech_preview("FPGA Management Engine driver (FME)", THIS_MODULE);
+
 	ret = fme_dev_init(pdev);
 	if (ret)
 		goto exit;

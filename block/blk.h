@@ -19,7 +19,6 @@ struct blk_flush_queue {
 	unsigned int		flush_queue_delayed:1;
 	unsigned int		flush_pending_idx:1;
 	unsigned int		flush_running_idx:1;
-	blk_status_t 		rq_status;
 	unsigned long		flush_pending_since;
 	struct list_head	flush_queue[2];
 	struct list_head	flush_data_in_flight;
@@ -30,8 +29,9 @@ struct blk_flush_queue {
 	 * at the same time
 	 */
 	struct request		*orig_rq;
-	struct lock_class_key	key;
 	spinlock_t		mq_flush_lock;
+	RH_KABI_EXTEND(blk_status_t 		rq_status)
+	RH_KABI_EXTEND(struct lock_class_key	key)
 };
 
 extern struct kmem_cache *blk_requestq_cachep;
@@ -341,5 +341,11 @@ void blk_queue_free_zone_bitmaps(struct request_queue *q);
 #else
 static inline void blk_queue_free_zone_bitmaps(struct request_queue *q) {}
 #endif
+
+/* internal helper for accessing request_aux  */
+static inline struct request_aux *rq_aux(const struct request *rq)
+{
+	return (struct request_aux *)((void *)rq - sizeof(struct request_aux));
+}
 
 #endif /* BLK_INTERNAL_H */

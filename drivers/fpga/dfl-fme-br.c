@@ -62,6 +62,8 @@ static int fme_br_probe(struct platform_device *pdev)
 	struct fme_br_priv *priv;
 	struct fpga_bridge *br;
 
+	mark_tech_preview("FPGA Bridge for DFL FPGA Management Engine", THIS_MODULE);
+
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;

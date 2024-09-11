@@ -53,7 +53,9 @@
 #include "wq.h"
 #include "mlx5_core.h"
 #include "en_stats.h"
+#include "en/dcbnl.h"
 #include "en/fs.h"
+#include "lib/hv_vhca.h"
 
 extern const struct net_device_ops mlx5e_netdev_ops;
 struct page_pool;
@@ -68,8 +70,6 @@ struct page_pool;
 #define MLX5E_HW2SW_MTU(params, hwmtu) ((hwmtu) - ((params)->hard_mtu))
 #define MLX5E_SW2HW_MTU(params, swmtu) ((swmtu) + ((params)->hard_mtu))
 
-#define MLX5E_MAX_PRIORITY      8
-#define MLX5E_MAX_DSCP          64
 #define MLX5E_MAX_NUM_TC	8
 
 #define MLX5_RX_HEADROOM NET_SKB_PAD
@@ -242,10 +242,6 @@ enum mlx5e_priv_flag {
 
 #define MLX5E_GET_PFLAG(params, pflag) (!!((params)->pflags & (BIT(pflag))))
 
-#ifdef CONFIG_MLX5_CORE_EN_DCB
-#define MLX5E_MAX_BW_ALLOC 100 /* Max percentage of BW allocation */
-#endif
-
 struct mlx5e_params {
 	u8  log_sq_size;
 	u8  rq_wq_type;
@@ -270,44 +266,9 @@ struct mlx5e_params {
 	int hard_mtu;
 };
 
-#ifdef CONFIG_MLX5_CORE_EN_DCB
-struct mlx5e_cee_config {
-	/* bw pct for priority group */
-	u8                         pg_bw_pct[CEE_DCBX_MAX_PGS];
-	u8                         prio_to_pg_map[CEE_DCBX_MAX_PRIO];
-	bool                       pfc_setting[CEE_DCBX_MAX_PRIO];
-	bool                       pfc_enable;
-};
-
-enum {
-	MLX5_DCB_CHG_RESET,
-	MLX5_DCB_NO_CHG,
-	MLX5_DCB_CHG_NO_RESET,
-};
-
-struct mlx5e_dcbx {
-	enum mlx5_dcbx_oper_mode   mode;
-	struct mlx5e_cee_config    cee_cfg; /* pending configuration */
-	u8                         dscp_app_cnt;
-
-	/* The only setting that cannot be read from FW */
-	u8                         tc_tsa[IEEE_8021QAZ_MAX_TCS];
-	u8                         cap;
-
-	/* Buffer configuration */
-	bool                       manual_buffer;
-	u32                        cable_len;
-	u32                        xoff;
-};
-
-struct mlx5e_dcbx_dp {
-	u8                         dscp2prio[MLX5E_MAX_DSCP];
-	u8                         trust_state;
-};
-#endif
-
 enum {
 	MLX5E_RQ_STATE_ENABLED,
+	MLX5E_RQ_STATE_RECOVERING,
 	MLX5E_RQ_STATE_AM,
 	MLX5E_RQ_STATE_NO_CSUM_COMPLETE,
 	MLX5E_RQ_STATE_CSUM_FULL, /* cqe_csum_full hw bit is set */
@@ -370,6 +331,7 @@ enum {
 
 struct mlx5e_sq_wqe_info {
 	u8  opcode;
+	u8 num_wqebbs;
 
 	/* Auxiliary data for different opcodes. */
 	union {
@@ -561,6 +523,8 @@ struct mlx5e_icosq {
 	/* control path */
 	struct mlx5_wq_ctrl        wq_ctrl;
 	struct mlx5e_channel      *channel;
+
+	struct work_struct         recover_work;
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_wqe_frag_info {
@@ -680,6 +644,8 @@ struct mlx5e_rq {
 	struct zero_copy_allocator zca;
 	struct xdp_umem       *umem;
 
+	struct work_struct     recover_work;
+
 	/* control */
 	struct mlx5_wq_ctrl    wq_ctrl;
 	__be32                 mkey_be;
@@ -732,7 +698,6 @@ struct mlx5e_channel {
 	DECLARE_BITMAP(state, MLX5E_CHANNEL_NUM_STATES);
 	int                        ix;
 	int                        cpu;
-	cpumask_var_t              xps_cpumask;
 };
 
 struct mlx5e_channels {
@@ -788,6 +753,15 @@ struct mlx5e_modify_sq_param {
 	int rl_index;
 };
 
+#if IS_ENABLED(CONFIG_PCI_HYPERV_INTERFACE)
+struct mlx5e_hv_vhca_stats_agent {
+	struct mlx5_hv_vhca_agent *agent;
+	struct delayed_work        work;
+	u16                        delay;
+	void                      *buf;
+};
+#endif
+
 struct mlx5e_xsk {
 	/* UMEMs are stored separately from channels, because we don't want to
 	 * lose them when channels are recreated. The kernel also stores UMEMs,
@@ -797,6 +771,15 @@ struct mlx5e_xsk {
 	struct xdp_umem **umems;
 	u16 refcnt;
 	bool ever_used;
+};
+
+/* Temporary storage for variables that are allocated when struct mlx5e_priv is
+ * initialized, and used where we can't allocate them because that functions
+ * must not fail. Use with care and make sure the same variable is not used
+ * simultaneously by multiple users.
+ */
+struct mlx5e_scratchpad {
+	cpumask_var_t cpumask;
 };
 
 struct mlx5e_priv {
@@ -857,7 +840,13 @@ struct mlx5e_priv {
 	struct mlx5e_tls          *tls;
 #endif
 	struct devlink_health_reporter *tx_reporter;
+	struct devlink_health_reporter *rx_reporter;
+	struct devlink_port            dl_port;
 	struct mlx5e_xsk           xsk;
+#if IS_ENABLED(CONFIG_PCI_HYPERV_INTERFACE)
+	struct mlx5e_hv_vhca_stats_agent stats_agent;
+#endif
+	struct mlx5e_scratchpad    scratchpad;
 };
 
 struct mlx5e_profile {
@@ -900,6 +889,26 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget);
 bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget);
 int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget);
 void mlx5e_free_txqsq_descs(struct mlx5e_txqsq *sq);
+
+static inline u32 mlx5e_rqwq_get_size(struct mlx5e_rq *rq)
+{
+	switch (rq->wq_type) {
+	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+		return mlx5_wq_ll_get_size(&rq->mpwqe.wq);
+	default:
+		return mlx5_wq_cyc_get_size(&rq->wqe.wq);
+	}
+}
+
+static inline u32 mlx5e_rqwq_get_cur_sz(struct mlx5e_rq *rq)
+{
+	switch (rq->wq_type) {
+	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+		return rq->mpwqe.wq.cur_sz;
+	default:
+		return rq->wqe.wq.cur_sz;
+	}
+}
 
 bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev);
 bool mlx5e_striding_rq_possible(struct mlx5_core_dev *mdev,
@@ -1001,24 +1010,40 @@ void mlx5e_close_channels(struct mlx5e_channels *chs);
 /* Function pointer to be used to modify HW or kernel settings while
  * switching channels
  */
-typedef int (*mlx5e_fp_preactivate)(struct mlx5e_priv *priv);
+typedef int (*mlx5e_fp_preactivate)(struct mlx5e_priv *priv, void *context);
+#define MLX5E_DEFINE_PREACTIVATE_WRAPPER_CTX(fn) \
+int fn##_ctx(struct mlx5e_priv *priv, void *context) \
+{ \
+	return fn(priv); \
+}
 int mlx5e_safe_reopen_channels(struct mlx5e_priv *priv);
 int mlx5e_safe_switch_channels(struct mlx5e_priv *priv,
 			       struct mlx5e_channels *new_chs,
-			       mlx5e_fp_preactivate preactivate);
+			       mlx5e_fp_preactivate preactivate,
+			       void *context);
 int mlx5e_num_channels_changed(struct mlx5e_priv *priv);
+int mlx5e_num_channels_changed_ctx(struct mlx5e_priv *priv, void *context);
 void mlx5e_activate_priv_channels(struct mlx5e_priv *priv);
 void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv);
 
 void mlx5e_build_default_indir_rqt(u32 *indirection_rqt, int len,
 				   int num_channels);
-void mlx5e_set_tx_cq_mode_params(struct mlx5e_params *params,
-				 u8 cq_period_mode);
-void mlx5e_set_rx_cq_mode_params(struct mlx5e_params *params,
-				 u8 cq_period_mode);
+
+void mlx5e_reset_tx_moderation(struct mlx5e_params *params, u8 cq_period_mode);
+void mlx5e_reset_rx_moderation(struct mlx5e_params *params, u8 cq_period_mode);
+void mlx5e_set_tx_cq_mode_params(struct mlx5e_params *params, u8 cq_period_mode);
+void mlx5e_set_rx_cq_mode_params(struct mlx5e_params *params, u8 cq_period_mode);
+
 void mlx5e_set_rq_type(struct mlx5_core_dev *mdev, struct mlx5e_params *params);
 void mlx5e_init_rq_type_params(struct mlx5_core_dev *mdev,
 			       struct mlx5e_params *params);
+int mlx5e_modify_rq_state(struct mlx5e_rq *rq, int curr_state, int next_state);
+void mlx5e_activate_rq(struct mlx5e_rq *rq);
+void mlx5e_deactivate_rq(struct mlx5e_rq *rq);
+void mlx5e_free_rx_descs(struct mlx5e_rq *rq);
+void mlx5e_free_rx_in_progress_descs(struct mlx5e_rq *rq);
+void mlx5e_activate_icosq(struct mlx5e_icosq *icosq);
+void mlx5e_deactivate_icosq(struct mlx5e_icosq *icosq);
 
 int mlx5e_modify_sq(struct mlx5_core_dev *mdev, u32 sqn,
 		    struct mlx5e_modify_sq_param *p);
@@ -1032,13 +1057,6 @@ static inline bool mlx5_tx_swp_supported(struct mlx5_core_dev *mdev)
 }
 
 extern const struct ethtool_ops mlx5e_ethtool_ops;
-#ifdef CONFIG_MLX5_CORE_EN_DCB
-extern const struct dcbnl_rtnl_ops mlx5e_dcbnl_ops;
-int mlx5e_dcbnl_ieee_setets_core(struct mlx5e_priv *priv, struct ieee_ets *ets);
-void mlx5e_dcbnl_initialize(struct mlx5e_priv *priv);
-void mlx5e_dcbnl_init_app(struct mlx5e_priv *priv);
-void mlx5e_dcbnl_delete_app(struct mlx5e_priv *priv);
-#endif
 
 int mlx5e_create_tir(struct mlx5_core_dev *mdev,
 		     struct mlx5e_tir *tir, u32 *in, int inlen);
@@ -1081,10 +1099,10 @@ void mlx5e_update_ndo_stats(struct mlx5e_priv *priv);
 void mlx5e_queue_update_stats(struct mlx5e_priv *priv);
 int mlx5e_bits_invert(unsigned long a, int size);
 
-typedef int (*change_hw_mtu_cb)(struct mlx5e_priv *priv);
 int mlx5e_set_dev_port_mtu(struct mlx5e_priv *priv);
+int mlx5e_set_dev_port_mtu_ctx(struct mlx5e_priv *priv, void *context);
 int mlx5e_change_mtu(struct net_device *netdev, int new_mtu,
-		     change_hw_mtu_cb set_mtu_cb);
+		     mlx5e_fp_preactivate preactivate);
 
 /* ethtool helpers */
 void mlx5e_ethtool_get_drvinfo(struct mlx5e_priv *priv,

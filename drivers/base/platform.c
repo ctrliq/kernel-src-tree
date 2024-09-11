@@ -16,7 +16,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/dma-mapping.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/pm_runtime.h>
@@ -170,7 +170,7 @@ EXPORT_SYMBOL_GPL(platform_get_irq);
  */
 int platform_get_irq_optional(struct platform_device *dev, unsigned int num)
 {
-	return __platform_get_irq(dev, num);
+	return platform_get_irq(dev, num);
 }
 EXPORT_SYMBOL_GPL(platform_get_irq_optional);
 

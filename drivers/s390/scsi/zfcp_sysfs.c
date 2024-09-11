@@ -4,7 +4,7 @@
  *
  * sysfs attributes.
  *
- * Copyright IBM Corp. 2008, 2010
+ * Copyright IBM Corp. 2008, 2020
  */
 
 #define KMSG_COMPONENT "zfcp"
@@ -337,6 +337,42 @@ static ssize_t zfcp_sysfs_port_remove_store(struct device *dev,
 static ZFCP_DEV_ATTR(adapter, port_remove, S_IWUSR, NULL,
 		     zfcp_sysfs_port_remove_store);
 
+static ssize_t zfcp_sysfs_adapter_fc_security_show(
+	struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ccw_device *cdev = to_ccwdev(dev);
+	struct zfcp_adapter *adapter = zfcp_ccw_adapter_by_cdev(cdev);
+	unsigned int status;
+	int i;
+
+	if (!adapter)
+		return -ENODEV;
+
+	/*
+	 * Adapter status COMMON_OPEN implies xconf data and xport data
+	 * was done. Adapter FC Endpoint Security capability remains
+	 * unchanged in case of COMMON_ERP_FAILED (e.g. due to local link
+	 * down).
+	 */
+	status = atomic_read(&adapter->status);
+	if (0 == (status & ZFCP_STATUS_COMMON_OPEN))
+		i = sprintf(buf, "unknown\n");
+	else if (!(adapter->adapter_features & FSF_FEATURE_FC_SECURITY))
+		i = sprintf(buf, "unsupported\n");
+	else {
+		i = zfcp_fsf_scnprint_fc_security(
+			buf, PAGE_SIZE - 1, adapter->fc_security_algorithms,
+			ZFCP_FSF_PRINT_FMT_LIST);
+		i += scnprintf(buf + i, PAGE_SIZE - i, "\n");
+	}
+
+	zfcp_ccw_adapter_put(adapter);
+	return i;
+}
+static ZFCP_DEV_ATTR(adapter, fc_security, S_IRUGO,
+		     zfcp_sysfs_adapter_fc_security_show,
+		     NULL);
+
 static struct attribute *zfcp_adapter_attrs[] = {
 	&dev_attr_adapter_failed.attr,
 	&dev_attr_adapter_in_recovery.attr,
@@ -349,6 +385,7 @@ static struct attribute *zfcp_adapter_attrs[] = {
 	&dev_attr_adapter_lic_version.attr,
 	&dev_attr_adapter_status.attr,
 	&dev_attr_adapter_hardware_version.attr,
+	&dev_attr_adapter_fc_security.attr,
 	NULL
 };
 
@@ -392,6 +429,36 @@ static ssize_t zfcp_sysfs_unit_remove_store(struct device *dev,
 }
 static DEVICE_ATTR(unit_remove, S_IWUSR, NULL, zfcp_sysfs_unit_remove_store);
 
+static ssize_t zfcp_sysfs_port_fc_security_show(struct device *dev,
+						struct device_attribute *attr,
+						char *buf)
+{
+	struct zfcp_port *port = container_of(dev, struct zfcp_port, dev);
+	struct zfcp_adapter *adapter = port->adapter;
+	unsigned int status = atomic_read(&port->status);
+	int i;
+
+	if (0 == (status & ZFCP_STATUS_COMMON_OPEN) ||
+	    0 == (status & ZFCP_STATUS_COMMON_UNBLOCKED) ||
+	    0 == (status & ZFCP_STATUS_PORT_PHYS_OPEN) ||
+	    0 != (status & ZFCP_STATUS_COMMON_ERP_FAILED) ||
+	    0 != (status & ZFCP_STATUS_COMMON_ACCESS_BOXED))
+		i = sprintf(buf, "unknown\n");
+	else if (!(adapter->adapter_features & FSF_FEATURE_FC_SECURITY))
+		i = sprintf(buf, "unsupported\n");
+	else {
+		i = zfcp_fsf_scnprint_fc_security(
+			buf, PAGE_SIZE - 1, port->connection_info,
+			ZFCP_FSF_PRINT_FMT_SINGLEITEM);
+		i += scnprintf(buf + i, PAGE_SIZE - i, "\n");
+	}
+
+	return i;
+}
+static ZFCP_DEV_ATTR(port, fc_security, S_IRUGO,
+		     zfcp_sysfs_port_fc_security_show,
+		     NULL);
+
 static struct attribute *zfcp_port_attrs[] = {
 	&dev_attr_unit_add.attr,
 	&dev_attr_unit_remove.attr,
@@ -399,6 +466,7 @@ static struct attribute *zfcp_port_attrs[] = {
 	&dev_attr_port_in_recovery.attr,
 	&dev_attr_port_status.attr,
 	&dev_attr_port_access_denied.attr,
+	&dev_attr_port_fc_security.attr,
 	NULL
 };
 static struct attribute_group zfcp_port_attr_group = {
@@ -589,7 +657,7 @@ static ssize_t zfcp_sysfs_adapter_util_show(struct device *dev,
 		return -ENOMEM;
 
 	retval = zfcp_fsf_exchange_port_data_sync(adapter->qdio, qtcb_port);
-	if (!retval)
+	if (retval == 0 || retval == -EAGAIN)
 		retval = sprintf(buf, "%u %u %u\n", qtcb_port->cp_util,
 				 qtcb_port->cb_util, qtcb_port->a_util);
 	kfree(qtcb_port);
@@ -615,7 +683,7 @@ static int zfcp_sysfs_adapter_ex_config(struct device *dev,
 		return -ENOMEM;
 
 	retval = zfcp_fsf_exchange_config_data_sync(adapter->qdio, qtcb_config);
-	if (!retval)
+	if (retval == 0 || retval == -EAGAIN)
 		*stat_inf = qtcb_config->stat_info;
 
 	kfree(qtcb_config);

@@ -178,6 +178,8 @@ int cci_pci_probe(struct pci_dev *pcidev, const struct pci_device_id *pcidevid)
 {
 	int ret;
 
+	mark_tech_preview("FPGA DFL PCIe Device Driver", THIS_MODULE);
+
 	ret = pcim_enable_device(pcidev);
 	if (ret < 0) {
 		dev_err(&pcidev->dev, "Failed to enable device %d.\n", ret);

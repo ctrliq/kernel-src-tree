@@ -41,8 +41,10 @@ static void ceph_inode_work(struct work_struct *work);
  */
 static int ceph_set_ino_cb(struct inode *inode, void *data)
 {
-	ceph_inode(inode)->i_vino = *(struct ceph_vino *)data;
-	inode->i_ino = ceph_vino_to_ino(*(struct ceph_vino *)data);
+	struct ceph_inode_info *ci = ceph_inode(inode);
+
+	ci->i_vino = *(struct ceph_vino *)data;
+	inode->i_ino = ceph_vino_to_ino_t(ci->i_vino);
 	inode_set_iversion_raw(inode, 0);
 	return 0;
 }
@@ -50,17 +52,14 @@ static int ceph_set_ino_cb(struct inode *inode, void *data)
 struct inode *ceph_get_inode(struct super_block *sb, struct ceph_vino vino)
 {
 	struct inode *inode;
-	ino_t t = ceph_vino_to_ino(vino);
 
-	inode = iget5_locked(sb, t, ceph_ino_compare, ceph_set_ino_cb, &vino);
+	inode = iget5_locked(sb, (unsigned long)vino.ino, ceph_ino_compare,
+			     ceph_set_ino_cb, &vino);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-	if (inode->i_state & I_NEW)
-		dout("get_inode created new inode %p %llx.%llx ino %llx\n",
-		     inode, ceph_vinop(inode), (u64)inode->i_ino);
 
-	dout("get_inode on %lu=%llx.%llx got %p\n", inode->i_ino, vino.ino,
-	     vino.snap, inode);
+	dout("get_inode on %llu=%llx.%llx got %p new %d\n", ceph_present_inode(inode),
+	     ceph_vinop(inode), inode, !!(inode->i_state & I_NEW));
 	return inode;
 }
 
@@ -451,6 +450,7 @@ struct inode *ceph_alloc_inode(struct super_block *sb)
 	ci->i_max_files = 0;
 
 	memset(&ci->i_dir_layout, 0, sizeof(ci->i_dir_layout));
+	memset(&ci->i_cached_layout, 0, sizeof(ci->i_cached_layout));
 	RCU_INIT_POINTER(ci->i_layout.pool_ns, NULL);
 
 	ci->i_fragtree = RB_ROOT;
@@ -475,7 +475,6 @@ struct inode *ceph_alloc_inode(struct super_block *sb)
 	ci->i_prealloc_cap_flush = NULL;
 	INIT_LIST_HEAD(&ci->i_cap_flush_list);
 	init_waitqueue_head(&ci->i_cap_wq);
-	ci->i_hold_caps_min = 0;
 	ci->i_hold_caps_max = 0;
 	INIT_LIST_HEAD(&ci->i_cap_delay_list);
 	INIT_LIST_HEAD(&ci->i_cap_snaps);
@@ -593,6 +592,7 @@ void ceph_evict_inode(struct inode *inode)
 		ceph_buffer_put(ci->i_xattrs.prealloc_blob);
 
 	ceph_put_string(rcu_dereference_raw(ci->i_layout.pool_ns));
+	ceph_put_string(rcu_dereference_raw(ci->i_cached_layout.pool_ns));
 }
 
 void ceph_destroy_inode(struct inode *inode)
@@ -2393,7 +2393,7 @@ int ceph_getattr(const struct path *path, struct kstat *stat,
 	}
 
 	generic_fillattr(inode, stat);
-	stat->ino = ceph_translate_ino(inode->i_sb, inode->i_ino);
+	stat->ino = ceph_present_inode(inode);
 
 	/*
 	 * btime on newly-allocated inodes is 0, so if this is still set to

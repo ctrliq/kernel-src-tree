@@ -102,16 +102,42 @@ struct plist;
 #define TIPC_MEDIA_INFO_OFFSET	5
 
 struct tipc_skb_cb {
-	struct sk_buff *tail;
-	unsigned long nxt_retr;
-	unsigned long retr_stamp;
-	u32 bytes_read;
-	u32 orig_member;
-	u16 chain_imp;
-	u16 ackers;
-	u16 retr_cnt;
-	bool validated;
-};
+	union {
+		struct {
+			struct sk_buff *tail;
+			unsigned long nxt_retr;
+			unsigned long retr_stamp;
+			u32 bytes_read;
+			u32 orig_member;
+			u16 chain_imp;
+			u16 ackers;
+			u16 retr_cnt;
+		} __packed;
+#ifdef CONFIG_TIPC_CRYPTO
+		struct {
+			struct tipc_crypto *rx;
+			struct tipc_aead *last;
+			u8 recurs;
+		} tx_clone_ctx __packed;
+#endif
+	} __packed;
+	union {
+		struct {
+			u8 validated:1;
+#ifdef CONFIG_TIPC_CRYPTO
+			u8 encrypted:1;
+			u8 decrypted:1;
+			u8 probe:1;
+			u8 tx_clone_deferred:1;
+#endif
+		};
+		u8 flags;
+	};
+	u8 reserved;
+#ifdef CONFIG_TIPC_CRYPTO
+	void *crypto_ctx;
+#endif
+} __packed;
 
 #define TIPC_SKB_CB(__skb) ((struct tipc_skb_cb *)&((__skb)->cb[0]))
 
@@ -134,20 +160,39 @@ struct tipc_gap_ack {
 
 /* struct tipc_gap_ack_blks
  * @len: actual length of the record
- * @gack_cnt: number of Gap ACK blocks in the record
+ * @ugack_cnt: number of Gap ACK blocks for unicast (following the broadcast
+ *             ones)
+ * @start_index: starting index for "valid" broadcast Gap ACK blocks
+ * @bgack_cnt: number of Gap ACK blocks for broadcast in the record
  * @gacks: array of Gap ACK blocks
+ *
+ *  31                       16 15                        0
+ * +-------------+-------------+-------------+-------------+
+ * |  bgack_cnt  |  ugack_cnt  |            len            |
+ * +-------------+-------------+-------------+-------------+  -
+ * |            gap            |            ack            |   |
+ * +-------------+-------------+-------------+-------------+    > bc gacks
+ * :                           :                           :   |
+ * +-------------+-------------+-------------+-------------+  -
+ * |            gap            |            ack            |   |
+ * +-------------+-------------+-------------+-------------+    > uc gacks
+ * :                           :                           :   |
+ * +-------------+-------------+-------------+-------------+  -
  */
 struct tipc_gap_ack_blks {
 	__be16 len;
-	u8 gack_cnt;
-	u8 reserved;
+	union {
+		u8 ugack_cnt;
+		u8 start_index;
+	};
+	u8 bgack_cnt;
 	struct tipc_gap_ack gacks[];
 };
 
 #define tipc_gap_ack_blks_sz(n) (sizeof(struct tipc_gap_ack_blks) + \
 				 sizeof(struct tipc_gap_ack) * (n))
 
-#define MAX_GAP_ACK_BLKS	32
+#define MAX_GAP_ACK_BLKS	128
 #define MAX_GAP_ACK_BLKS_SZ	tipc_gap_ack_blks_sz(MAX_GAP_ACK_BLKS)
 
 static inline struct tipc_msg *buf_msg(struct sk_buff *skb)
@@ -376,6 +421,11 @@ static inline u32 msg_mcast(struct tipc_msg *m)
 static inline u32 msg_connected(struct tipc_msg *m)
 {
 	return msg_type(m) == TIPC_CONN_MSG;
+}
+
+static inline u32 msg_direct(struct tipc_msg *m)
+{
+	return msg_type(m) == TIPC_DIRECT_MSG;
 }
 
 static inline u32 msg_errcode(struct tipc_msg *m)
@@ -1046,6 +1096,20 @@ static inline bool msg_is_reset(struct tipc_msg *hdr)
 	return (msg_user(hdr) == LINK_PROTOCOL) && (msg_type(hdr) == RESET_MSG);
 }
 
+/* Word 13
+ */
+static inline void msg_set_peer_net_hash(struct tipc_msg *m, u32 n)
+{
+	msg_set_word(m, 13, n);
+}
+
+static inline u32 msg_peer_net_hash(struct tipc_msg *m)
+{
+	return msg_word(m, 13);
+}
+
+/* Word 14
+ */
 static inline u32 msg_sugg_node_addr(struct tipc_msg *m)
 {
 	return msg_word(m, 14);
@@ -1091,7 +1155,7 @@ bool tipc_msg_assemble(struct sk_buff_head *list);
 bool tipc_msg_reassemble(struct sk_buff_head *list, struct sk_buff_head *rcvq);
 bool tipc_msg_pskb_copy(u32 dst, struct sk_buff_head *msg,
 			struct sk_buff_head *cpy);
-void __tipc_skb_queue_sorted(struct sk_buff_head *list, u16 seqno,
+bool __tipc_skb_queue_sorted(struct sk_buff_head *list, u16 seqno,
 			     struct sk_buff *skb);
 bool tipc_msg_skb_clone(struct sk_buff_head *msg, struct sk_buff_head *cpy);
 

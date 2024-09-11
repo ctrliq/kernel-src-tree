@@ -953,6 +953,9 @@ static int __init opal_init(void)
 	/* Initialise OPAL Power control interface */
 	opal_power_control_init();
 
+	/* Initialize OPAL secure variables */
+	opal_pdev_init("ibm,secvar-backend");
+
 	return 0;
 }
 machine_subsys_initcall(powernv, opal_init);
@@ -1103,3 +1106,5 @@ EXPORT_SYMBOL_GPL(opal_write_oppanel_async);
 EXPORT_SYMBOL_GPL(opal_int_set_mfrr);
 EXPORT_SYMBOL_GPL(opal_int_eoi);
 EXPORT_SYMBOL_GPL(opal_error_code);
+/* Export the below symbol for NX compression */
+EXPORT_SYMBOL(opal_nx_coproc_init);

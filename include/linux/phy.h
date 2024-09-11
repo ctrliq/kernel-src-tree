@@ -110,7 +110,14 @@ typedef enum {
 	PHY_INTERFACE_MODE_XAUI,
 	/* 10GBASE-KR, XFI, SFI - single lane 10G Serdes */
 	PHY_INTERFACE_MODE_10GKR,
+        /* RHEL: Fields adding at the end are safe. But code, which iterate
+	 * over all modes and use PHY_INTERFACE_MODE_MAX will need recompile
+	 * for use new interface modes. It is for example fuctions like
+	 * of_get_phy_mode()
+        */
+#ifndef __GENKSYMS__
 	PHY_INTERFACE_MODE_USXGMII,
+#endif
 	PHY_INTERFACE_MODE_MAX,
 } phy_interface_t;
 
@@ -237,7 +244,7 @@ struct mii_bus {
 	int (*read)(struct mii_bus *bus, int addr, int regnum);
 	int (*write)(struct mii_bus *bus, int addr, int regnum, u16 val);
 	int (*reset)(struct mii_bus *bus);
-	struct mdio_bus_stats stats[PHY_MAX_ADDR];
+	RH_KABI_BROKEN_INSERT(struct mdio_bus_stats stats[PHY_MAX_ADDR])
 
 	/*
 	 * A lock to ensure that only one thing can read/write
@@ -417,7 +424,6 @@ struct phy_device {
 	unsigned is_pseudo_fixed_link:1;
 	unsigned has_fixups:1;
 	unsigned suspended:1;
-	unsigned suspended_by_mdio_bus:1;
 	unsigned sysfs_links:1;
 	unsigned loopback_enabled:1;
 
@@ -429,8 +435,9 @@ struct phy_device {
 	RH_KABI_FILL_HOLE(unsigned autoneg_complete:1)
 	/* Interrupts are enabled */
 	RH_KABI_FILL_HOLE(unsigned interrupts:1)
+	RH_KABI_FILL_HOLE(unsigned suspended_by_mdio_bus:1)
 
-	/* 20 bits hole remain */
+	/* 19 bits hole remain */
 
 	enum phy_state state;
 
@@ -460,6 +467,8 @@ struct phy_device {
 	/* Energy efficient ethernet modes which should be prohibited */
 	u32 eee_broken_modes;
 
+	RH_KABI_DEPRECATE(int, link_timeout)
+
 #ifdef CONFIG_LED_TRIGGER_PHY
 	struct phy_led_trigger *phy_led_triggers;
 	unsigned int phy_num_led_triggers;
@@ -484,12 +493,19 @@ struct phy_device {
 
 	struct mutex lock;
 
+	/* RHEL specific: further changes here need to be accompanied by
+         * increasing the RH_KABI_FORCE_CHANGE version of
+         * phy_driver[s]_register.
+         */
+	RH_KABI_BROKEN_INSERT_BLOCK(
 	/* This may be modified under the rtnl lock */
 	bool sfp_bus_attached;
 	struct sfp_bus *sfp_bus;
+	struct mii_timestamper *mii_ts;
+	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+
 	struct phylink *phylink;
 	struct net_device *attached_dev;
-	struct mii_timestamper *mii_ts;
 
 	u8 mdix;
 	u8 mdix_ctrl;
@@ -502,6 +518,7 @@ struct phy_device {
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported);
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(lp_advertising);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_old);
 	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 
 	void (*phy_link_change)(struct phy_device *, bool up, bool do_carrier);
@@ -593,9 +610,6 @@ struct phy_driver {
 	 */
 	int (*did_interrupt)(struct phy_device *phydev);
 
-	/* Override default interrupt handling */
-	int (*handle_interrupt)(struct phy_device *phydev);
-
 	/* Clears up any memory if needed */
 	void (*remove)(struct phy_device *phydev);
 
@@ -604,6 +618,18 @@ struct phy_driver {
 	 * phy_id_mask.
 	 */
 	int (*match_phy_device)(struct phy_device *phydev);
+
+	/* RHEL specific: these fields was replaced by new mii_timestamper
+	 * interface.
+	*/
+	RH_KABI_DEPRECATE_FN(int, ts_info, struct phy_device *phydev,
+			     struct ethtool_ts_info *ti)
+	RH_KABI_DEPRECATE_FN(int,  hwtstamp, struct phy_device *phydev,
+			     struct ifreq *ifr)
+	RH_KABI_DEPRECATE_FN(bool, rxtstamp, struct phy_device *dev,
+			     struct sk_buff *skb, int type)
+	RH_KABI_DEPRECATE_FN(void, txtstamp, struct phy_device *dev,
+			     struct sk_buff *skb, int type)
 
 	/* Some devices (e.g. qnap TS-119P II) require PHY register changes to
 	 * enable Wake on LAN, so set_wol is provided to be called in the
@@ -677,6 +703,9 @@ struct phy_driver {
          * Should only set phydev->supported.
          */
 	RH_KABI_BROKEN_INSERT(int (*get_features)(struct phy_device *phydev))
+
+	/* Override default interrupt handling */
+        RH_KABI_BROKEN_INSERT(int (*handle_interrupt)(struct phy_device *phydev))
 };
 #define to_phy_driver(d) container_of(to_mdio_common_driver(d),		\
 				      struct phy_driver, mdiodrv)
@@ -1190,6 +1219,8 @@ static inline void phy_unlock_mdio_bus(struct phy_device *phydev)
 
 void phy_attached_print(struct phy_device *phydev, const char *fmt, ...)
 	__printf(2, 3);
+char *phy_attached_info_irq(struct phy_device *phydev)
+	__malloc;
 void phy_attached_info(struct phy_device *phydev);
 
 /* Clause 22 PHY */
@@ -1271,9 +1302,9 @@ void phy_drivers_unregister(struct phy_driver *drv, int n);
  * hide checksum change and old driver loaded with new kernel will crash. We
  * need change phy_driver{s}_register
  */
-RH_KABI_FORCE_CHANGE(3)
+RH_KABI_FORCE_CHANGE(4)
 int phy_driver_register(struct phy_driver *new_driver, struct module *owner);
-RH_KABI_FORCE_CHANGE(3)
+RH_KABI_FORCE_CHANGE(4)
 int phy_drivers_register(struct phy_driver *new_driver, int n,
 			 struct module *owner);
 void phy_state_machine(struct work_struct *work);
@@ -1281,7 +1312,6 @@ void phy_queue_state_machine(struct phy_device *phydev, unsigned long jiffies);
 void phy_mac_interrupt(struct phy_device *phydev);
 void phy_start_machine(struct phy_device *phydev);
 void phy_stop_machine(struct phy_device *phydev);
-int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd);
 void phy_ethtool_ksettings_get(struct phy_device *phydev,
 			       struct ethtool_link_ksettings *cmd);
 int phy_ethtool_ksettings_set(struct phy_device *phydev,

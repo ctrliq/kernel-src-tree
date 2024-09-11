@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Linux I2C core
  *
@@ -7,15 +8,6 @@
  *   Michael Lawnick <michael.lawnick.ext@nsn.com>
  *
  * Copyright (C) 2013-2017 Wolfram Sang <wsa@the-dreams.de>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option)
- * any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
  */
 
 #define pr_fmt(fmt) "i2c-core: " fmt
@@ -2236,10 +2228,10 @@ int i2c_probe_func_quick_read(struct i2c_adapter *adap, unsigned short addr)
 EXPORT_SYMBOL_GPL(i2c_probe_func_quick_read);
 
 struct i2c_client *
-i2c_new_probed_device(struct i2c_adapter *adap,
-		      struct i2c_board_info *info,
-		      unsigned short const *addr_list,
-		      int (*probe)(struct i2c_adapter *adap, unsigned short addr))
+i2c_new_scanned_device(struct i2c_adapter *adap,
+		       struct i2c_board_info *info,
+		       unsigned short const *addr_list,
+		       int (*probe)(struct i2c_adapter *adap, unsigned short addr))
 {
 	int i;
 
@@ -2269,11 +2261,24 @@ i2c_new_probed_device(struct i2c_adapter *adap,
 
 	if (addr_list[i] == I2C_CLIENT_END) {
 		dev_dbg(&adap->dev, "Probing failed, no device found\n");
-		return NULL;
+		return ERR_PTR(-ENODEV);
 	}
 
 	info->addr = addr_list[i];
-	return i2c_new_device(adap, info);
+	return i2c_new_client_device(adap, info);
+}
+EXPORT_SYMBOL_GPL(i2c_new_scanned_device);
+
+struct i2c_client *
+i2c_new_probed_device(struct i2c_adapter *adap,
+		      struct i2c_board_info *info,
+		      unsigned short const *addr_list,
+		      int (*probe)(struct i2c_adapter *adap, unsigned short addr))
+{
+	struct i2c_client *client;
+
+	client = i2c_new_scanned_device(adap, info, addr_list, probe);
+	return IS_ERR(client) ? NULL : client;
 }
 EXPORT_SYMBOL_GPL(i2c_new_probed_device);
 

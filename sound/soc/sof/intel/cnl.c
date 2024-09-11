@@ -18,6 +18,7 @@
 #include "../ops.h"
 #include "hda.h"
 #include "hda-ipc.h"
+#include "../sof-audio.h"
 
 static const struct snd_sof_debugfs_map cnl_dsp_debugfs[] = {
 	{"hda", HDA_DSP_HDA_BAR, 0, 0x4000, SOF_DEBUGFS_ACCESS_ALWAYS},
@@ -63,11 +64,6 @@ static irqreturn_t cnl_ipc_irq_thread(int irq, void *context)
 		/* handle immediate reply from DSP core */
 		hda_dsp_ipc_get_reply(sdev);
 		snd_sof_ipc_reply(sdev, msg);
-
-		if (sdev->code_loading)	{
-			sdev->code_loading = 0;
-			wake_up(&sdev->waitq);
-		}
 
 		cnl_ipc_dsp_done(sdev);
 
@@ -170,22 +166,47 @@ static bool cnl_compact_ipc_compress(struct snd_sof_ipc_msg *msg,
 static int cnl_ipc_send_msg(struct snd_sof_dev *sdev,
 			    struct snd_sof_ipc_msg *msg)
 {
+	struct sof_intel_hda_dev *hdev = sdev->pdata->hw_pdata;
+	struct sof_ipc_cmd_hdr *hdr;
 	u32 dr = 0;
 	u32 dd = 0;
 
+	/*
+	 * Currently the only compact IPC supported is the PM_GATE
+	 * IPC which is used for transitioning the DSP between the
+	 * D0I0 and D0I3 states. And these are sent only during the
+	 * set_power_state() op. Therefore, there will never be a case
+	 * that a compact IPC results in the DSP exiting D0I3 without
+	 * the host and FW being in sync.
+	 */
 	if (cnl_compact_ipc_compress(msg, &dr, &dd)) {
 		/* send the message via IPC registers */
 		snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDD,
 				  dd);
 		snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDR,
 				  CNL_DSP_REG_HIPCIDR_BUSY | dr);
-	} else {
-		/* send the message via mailbox */
-		sof_mailbox_write(sdev, sdev->host_box.offset, msg->msg_data,
-				  msg->msg_size);
-		snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDR,
-				  CNL_DSP_REG_HIPCIDR_BUSY);
+		return 0;
 	}
+
+	/* send the message via mailbox */
+	sof_mailbox_write(sdev, sdev->host_box.offset, msg->msg_data,
+			  msg->msg_size);
+	snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDR,
+			  CNL_DSP_REG_HIPCIDR_BUSY);
+
+	hdr = msg->msg_data;
+
+	/*
+	 * Use mod_delayed_work() to schedule the delayed work
+	 * to avoid scheduling multiple workqueue items when
+	 * IPCs are sent at a high-rate. mod_delayed_work()
+	 * modifies the timer if the work is pending.
+	 * Also, a new delayed work should not be queued after the
+	 * the CTX_SAVE IPC, which is sent before the DSP enters D3.
+	 */
+	if (hdr->cmd != (SOF_IPC_GLB_PM_MSG | SOF_IPC_PM_CTX_SAVE))
+		mod_delayed_work(system_wq, &hdev->d0i3_work,
+				 msecs_to_jiffies(SOF_HDA_D0I3_WORK_DELAY_MS));
 
 	return 0;
 }
@@ -237,6 +258,12 @@ const struct snd_sof_dsp_ops sof_cnl_ops = {
 
 	.ipc_msg_data	= hda_ipc_msg_data,
 	.ipc_pcm_params	= hda_ipc_pcm_params,
+
+	/* machine driver */
+	.machine_select = hda_machine_select,
+	.machine_register = sof_machine_register,
+	.machine_unregister = sof_machine_unregister,
+	.set_mach_params = hda_set_mach_params,
 
 	/* debug */
 	.debug_map	= cnl_dsp_debugfs,

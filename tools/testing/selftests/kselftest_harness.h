@@ -60,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -112,22 +113,24 @@
 			__FILE__, __LINE__, _metadata->name, ##__VA_ARGS__)
 
 /**
- * XFAIL(statement, fmt, ...)
+ * SKIP(statement, fmt, ...)
  *
- * @statement: statement to run after reporting XFAIL
+ * @statement: statement to run after reporting SKIP
  * @fmt: format string
  * @...: optional arguments
  *
- * This forces a "pass" after reporting a failure with an XFAIL prefix,
+ * This forces a "pass" after reporting why something is being skipped
  * and runs "statement", which is usually "return" or "goto skip".
  */
-#define XFAIL(statement, fmt, ...) do { \
+#define SKIP(statement, fmt, ...) do { \
+	snprintf(_metadata->results->reason, \
+		 sizeof(_metadata->results->reason), fmt, ##__VA_ARGS__); \
 	if (TH_LOG_ENABLED) { \
-		fprintf(TH_LOG_STREAM, "#      XFAIL     " fmt "\n", \
-			##__VA_ARGS__); \
+		fprintf(TH_LOG_STREAM, "#      SKIP     %s\n", \
+			_metadata->results->reason); \
 	} \
-	/* TODO: find a way to pass xfail to test runner process. */ \
 	_metadata->passed = 1; \
+	_metadata->skip = 1; \
 	_metadata->trigger = 0; \
 	statement; \
 } while (0)
@@ -677,7 +680,8 @@
 			__bail(_assert, _metadata->no_print, _metadata->step))
 
 #define __INC_STEP(_metadata) \
-	if (_metadata->passed && _metadata->step < 255) \
+	/* Keep "step" below 255 (which is used for "SKIP" reporting). */	\
+	if (_metadata->passed && _metadata->step < 253) \
 		_metadata->step++;
 
 #define is_signed_type(var)       (!!(((__typeof__(var))(-1)) < (__typeof__(var))1))
@@ -763,6 +767,10 @@
 	} \
 }
 
+struct __test_results {
+	char reason[1024];	/* Reason for test result */
+};
+
 struct __test_metadata;
 struct __fixture_variant_metadata;
 
@@ -810,11 +818,13 @@ struct __test_metadata {
 	struct __fixture_metadata *fixture;
 	int termsig;
 	int passed;
+	int skip;	/* did SKIP get used? */
 	int trigger; /* extra handler after the evaluation */
 	int timeout;	/* seconds to wait for test timeout */
 	bool timed_out;	/* did this test timeout instead of exiting? */
 	__u8 step;
 	bool no_print; /* manual trigger when TH_LOG_STREAM is not available */
+	struct __test_results *results;
 	struct __test_metadata *prev, *next;
 };
 
@@ -899,17 +909,31 @@ void __wait_for_test(struct __test_metadata *t)
 		fprintf(TH_LOG_STREAM,
 			"# %s: Test terminated by timeout\n", t->name);
 	} else if (WIFEXITED(status)) {
-		t->passed = t->termsig == -1 ? !WEXITSTATUS(status) : 0;
 		if (t->termsig != -1) {
+			t->passed = 0;
 			fprintf(TH_LOG_STREAM,
 				"# %s: Test exited normally instead of by signal (code: %d)\n",
 				t->name,
 				WEXITSTATUS(status));
-		} else if (!t->passed) {
-			fprintf(TH_LOG_STREAM,
-				"# %s: Test failed at step #%d\n",
-				t->name,
-				WEXITSTATUS(status));
+		} else {
+			switch (WEXITSTATUS(status)) {
+			/* Success */
+			case 0:
+				t->passed = 1;
+				break;
+			/* SKIP */
+			case 255:
+				t->passed = 1;
+				t->skip = 1;
+				break;
+			/* Other failure, assume step report. */
+			default:
+				t->passed = 0;
+				fprintf(TH_LOG_STREAM,
+					"# %s: Test failed at step #%d\n",
+					t->name,
+					WEXITSTATUS(status));
+			}
 		}
 	} else if (WIFSIGNALED(status)) {
 		t->passed = 0;
@@ -939,9 +963,11 @@ void __run_test(struct __fixture_metadata *f,
 {
 	/* reset test struct */
 	t->passed = 1;
+	t->skip = 0;
 	t->trigger = 0;
 	t->step = 0;
 	t->no_print = 0;
+	memset(t->results->reason, 0, sizeof(t->results->reason));
 
 	ksft_print_msg(" RUN           %s%s%s.%s ...\n",
 	       f->name, variant->name[0] ? "." : "", variant->name, t->name);
@@ -951,15 +977,25 @@ void __run_test(struct __fixture_metadata *f,
 		t->passed = 0;
 	} else if (t->pid == 0) {
 		t->fn(t, variant);
-		/* return the step that failed or 0 */
-		_exit(t->passed ? 0 : t->step);
+		if (t->skip)
+			_exit(255);
+		/* Pass is exit 0 */
+		if (t->passed)
+			_exit(0);
+		/* Something else happened, report the step. */
+		_exit(t->step);
 	} else {
 		__wait_for_test(t);
 	}
 	ksft_print_msg("         %4s  %s%s%s.%s\n", t->passed ? "OK" : "FAIL",
 	       f->name, variant->name[0] ? "." : "", variant->name, t->name);
-	ksft_test_result(t->passed, "%s%s%s.%s\n",
-	       f->name, variant->name[0] ? "." : "", variant->name, t->name);
+
+	if (t->skip)
+		ksft_test_result_skip("%s\n", t->results->reason[0] ?
+					t->results->reason : "unknown");
+	else
+		ksft_test_result(t->passed, "%s%s%s.%s\n",
+			f->name, variant->name[0] ? "." : "", variant->name, t->name);
 }
 
 static int test_harness_run(int __attribute__((unused)) argc,
@@ -968,6 +1004,7 @@ static int test_harness_run(int __attribute__((unused)) argc,
 	struct __fixture_variant_metadata no_variant = { .name = "", };
 	struct __fixture_variant_metadata *v;
 	struct __fixture_metadata *f;
+	struct __test_results *results;
 	struct __test_metadata *t;
 	int ret = 0;
 	unsigned int case_count = 0, test_count = 0;
@@ -982,6 +1019,9 @@ static int test_harness_run(int __attribute__((unused)) argc,
 		}
 	}
 
+	results = mmap(NULL, sizeof(*results), PROT_READ | PROT_WRITE,
+		       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
 	ksft_print_header();
 	ksft_set_plan(test_count);
 	ksft_print_msg("Starting %u tests from %u test cases.\n",
@@ -990,7 +1030,9 @@ static int test_harness_run(int __attribute__((unused)) argc,
 		for (v = f->variant ?: &no_variant; v; v = v->next) {
 			for (t = f->tests; t; t = t->next) {
 				count++;
+				t->results = results;
 				__run_test(f, v, t);
+				t->results = NULL;
 				if (t->passed)
 					pass_count++;
 				else
@@ -998,6 +1040,8 @@ static int test_harness_run(int __attribute__((unused)) argc,
 			}
 		}
 	}
+	munmap(results, sizeof(*results));
+
 	ksft_print_msg("%s: %u / %u tests passed.\n", ret ? "FAILED" : "PASSED",
 			pass_count, count);
 	ksft_exit(ret == 0);

@@ -337,68 +337,61 @@ static void smc_copy_sock_settings_to_smc(struct smc_sock *smc)
 	smc_copy_sock_settings(&smc->sk, smc->clcsock->sk, SK_FLAGS_CLC_TO_SMC);
 }
 
-/* register a new rmb, send confirm_rkey msg to register with peer */
-static int smcr_link_reg_rmb(struct smc_link *link,
-			     struct smc_buf_desc *rmb_desc, bool conf_rkey)
-{
-	if (!rmb_desc->is_reg_mr[link->link_idx]) {
-		/* register memory region for new rmb */
-		if (smc_wr_reg_send(link, rmb_desc->mr_rx[link->link_idx])) {
-			rmb_desc->is_reg_err = true;
-			return -EFAULT;
-		}
-		rmb_desc->is_reg_mr[link->link_idx] = true;
-	}
-	if (!conf_rkey)
-		return 0;
-
-	/* exchange confirm_rkey msg with peer */
-	if (!rmb_desc->is_conf_rkey) {
-		if (smc_llc_do_confirm_rkey(link, rmb_desc)) {
-			rmb_desc->is_reg_err = true;
-			return -EFAULT;
-		}
-		rmb_desc->is_conf_rkey = true;
-	}
-	return 0;
-}
-
 /* register the new rmb on all links */
-static int smcr_lgr_reg_rmbs(struct smc_link_group *lgr,
+static int smcr_lgr_reg_rmbs(struct smc_link *link,
 			     struct smc_buf_desc *rmb_desc)
 {
-	int i, rc;
+	struct smc_link_group *lgr = link->lgr;
+	int i, rc = 0;
 
+	rc = smc_llc_flow_initiate(lgr, SMC_LLC_FLOW_RKEY);
+	if (rc)
+		return rc;
+	/* protect against parallel smc_llc_cli_rkey_exchange() and
+	 * parallel smcr_link_reg_rmb()
+	 */
+	mutex_lock(&lgr->llc_conf_mutex);
 	for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
-		if (lgr->lnk[i].state != SMC_LNK_ACTIVE)
+		if (!smc_link_active(&lgr->lnk[i]))
 			continue;
-		rc = smcr_link_reg_rmb(&lgr->lnk[i], rmb_desc, true);
+		rc = smcr_link_reg_rmb(&lgr->lnk[i], rmb_desc);
 		if (rc)
-			return rc;
+			goto out;
 	}
-	return 0;
+
+	/* exchange confirm_rkey msg with peer */
+	rc = smc_llc_do_confirm_rkey(link, rmb_desc);
+	if (rc) {
+		rc = -EFAULT;
+		goto out;
+	}
+	rmb_desc->is_conf_rkey = true;
+out:
+	mutex_unlock(&lgr->llc_conf_mutex);
+	smc_llc_flow_stop(lgr, &lgr->llc_flow_lcl);
+	return rc;
 }
 
 static int smcr_clnt_conf_first_link(struct smc_sock *smc)
 {
-	struct net *net = sock_net(smc->clcsock->sk);
 	struct smc_link *link = smc->conn.lnk;
-	int rest;
+	struct smc_llc_qentry *qentry;
 	int rc;
 
 	/* receive CONFIRM LINK request from server over RoCE fabric */
-	rest = wait_for_completion_interruptible_timeout(
-		&link->llc_confirm,
-		SMC_LLC_WAIT_FIRST_TIME);
-	if (rest <= 0) {
+	qentry = smc_llc_wait(link->lgr, NULL, SMC_LLC_WAIT_TIME,
+			      SMC_LLC_CONFIRM_LINK);
+	if (!qentry) {
 		struct smc_clc_msg_decline dclc;
 
 		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
 				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
 		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_CL : rc;
 	}
-
-	if (link->llc_confirm_rc)
+	smc_llc_save_peer_uid(qentry);
+	rc = smc_llc_eval_conf_link(qentry, SMC_LLC_REQ);
+	smc_llc_flow_qentry_del(&link->lgr->llc_flow_lcl);
+	if (rc)
 		return SMC_CLC_DECL_RMBE_EC;
 
 	rc = smc_ib_modify_qp_rts(link);
@@ -407,34 +400,34 @@ static int smcr_clnt_conf_first_link(struct smc_sock *smc)
 
 	smc_wr_remember_qp_attr(link);
 
-	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc, false))
+	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc))
 		return SMC_CLC_DECL_ERR_REGRMB;
+
+	/* confirm_rkey is implicit on 1st contact */
+	smc->conn.rmb_desc->is_conf_rkey = true;
 
 	/* send CONFIRM LINK response over RoCE fabric */
 	rc = smc_llc_send_confirm_link(link, SMC_LLC_RESP);
 	if (rc < 0)
 		return SMC_CLC_DECL_TIMEOUT_CL;
 
-	/* receive ADD LINK request from server over RoCE fabric */
-	rest = wait_for_completion_interruptible_timeout(&link->llc_add,
-							 SMC_LLC_WAIT_TIME);
-	if (rest <= 0) {
+	smc_llc_link_active(link);
+	smcr_lgr_set_type(link->lgr, SMC_LGR_SINGLE);
+
+	/* optional 2nd link, receive ADD LINK request from server */
+	qentry = smc_llc_wait(link->lgr, NULL, SMC_LLC_WAIT_TIME,
+			      SMC_LLC_ADD_LINK);
+	if (!qentry) {
 		struct smc_clc_msg_decline dclc;
 
 		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
 				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
-		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_AL : rc;
+		if (rc == -EAGAIN)
+			rc = 0; /* no DECLINE received, go with one link */
+		return rc;
 	}
-
-	/* send add link reject message, only one link supported for now */
-	rc = smc_llc_send_add_link(link,
-				   link->smcibdev->mac[link->ibport - 1],
-				   link->gid, SMC_LLC_RESP);
-	if (rc < 0)
-		return SMC_CLC_DECL_TIMEOUT_AL;
-
-	smc_llc_link_active(link, net->ipv4.sysctl_tcp_keepalive_time);
-
+	smc_llc_flow_qentry_clr(&link->lgr->llc_flow_lcl);
+	smc_llc_cli_add_link(link, qentry);
 	return 0;
 }
 
@@ -488,8 +481,8 @@ static void smc_switch_to_fallback(struct smc_sock *smc)
 	if (smc->sk.sk_socket && smc->sk.sk_socket->file) {
 		smc->clcsock->file = smc->sk.sk_socket->file;
 		smc->clcsock->file->private_data = smc->clcsock;
-		smc->clcsock->wq.fasync_list =
-			smc->sk.sk_socket->wq.fasync_list;
+		smc->clcsock->wq->fasync_list =
+			smc->sk.sk_socket->wq->fasync_list;
 	}
 }
 
@@ -614,8 +607,8 @@ static int smc_connect_rdma(struct smc_sock *smc,
 			    struct smc_clc_msg_accept_confirm *aclc,
 			    struct smc_init_info *ini)
 {
+	int i, reason_code = 0;
 	struct smc_link *link;
-	int reason_code = 0;
 
 	ini->is_smcd = false;
 	ini->ib_lcl = &aclc->lcl;
@@ -628,9 +621,29 @@ static int smc_connect_rdma(struct smc_sock *smc,
 		mutex_unlock(&smc_client_lgr_pending);
 		return reason_code;
 	}
-	link = smc->conn.lnk;
 
 	smc_conn_save_peer_info(smc, aclc);
+
+	if (ini->cln_first_contact == SMC_FIRST_CONTACT) {
+		link = smc->conn.lnk;
+	} else {
+		/* set link that was assigned by server */
+		link = NULL;
+		for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
+			struct smc_link *l = &smc->conn.lgr->lnk[i];
+
+			if (l->peer_qpn == ntoh24(aclc->qpn) &&
+			    !memcmp(l->peer_gid, &aclc->lcl.gid, SMC_GID_SIZE) &&
+			    !memcmp(l->peer_mac, &aclc->lcl.mac, sizeof(l->peer_mac))) {
+				link = l;
+				break;
+			}
+		}
+		if (!link)
+			return smc_connect_abort(smc, SMC_CLC_DECL_NOSRVLINK,
+						 ini->cln_first_contact);
+		smc->conn.lnk = link;
+	}
 
 	/* create send buffer and rmb */
 	if (smc_buf_create(smc, false))
@@ -652,7 +665,7 @@ static int smc_connect_rdma(struct smc_sock *smc,
 			return smc_connect_abort(smc, SMC_CLC_DECL_ERR_RDYLNK,
 						 ini->cln_first_contact);
 	} else {
-		if (smcr_lgr_reg_rmbs(smc->conn.lgr, smc->conn.rmb_desc))
+		if (smcr_lgr_reg_rmbs(link, smc->conn.rmb_desc))
 			return smc_connect_abort(smc, SMC_CLC_DECL_ERR_REGRMB,
 						 ini->cln_first_contact);
 	}
@@ -667,7 +680,9 @@ static int smc_connect_rdma(struct smc_sock *smc,
 
 	if (ini->cln_first_contact == SMC_FIRST_CONTACT) {
 		/* QP confirmation over RoCE fabric */
+		smc_llc_flow_initiate(link->lgr, SMC_LLC_FLOW_ADD_LINK);
 		reason_code = smcr_clnt_conf_first_link(smc);
+		smc_llc_flow_stop(link->lgr, &link->lgr->llc_flow_lcl);
 		if (reason_code)
 			return smc_connect_abort(smc, reason_code,
 						 ini->cln_first_contact);
@@ -702,8 +717,11 @@ static int smc_connect_ism(struct smc_sock *smc,
 	}
 
 	/* Create send and receive buffers */
-	if (smc_buf_create(smc, true))
-		return smc_connect_abort(smc, SMC_CLC_DECL_MEM,
+	rc = smc_buf_create(smc, true);
+	if (rc)
+		return smc_connect_abort(smc, (rc == -ENOSPC) ?
+					      SMC_CLC_DECL_MAX_DMB :
+					      SMC_CLC_DECL_MEM,
 					 ini->cln_first_contact);
 
 	smc_conn_save_peer_info(smc, aclc);
@@ -1019,12 +1037,11 @@ void smc_close_non_accepted(struct sock *sk)
 
 static int smcr_serv_conf_first_link(struct smc_sock *smc)
 {
-	struct net *net = sock_net(smc->clcsock->sk);
 	struct smc_link *link = smc->conn.lnk;
-	int rest;
+	struct smc_llc_qentry *qentry;
 	int rc;
 
-	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc, false))
+	if (smcr_link_reg_rmb(link, smc->conn.rmb_desc))
 		return SMC_CLC_DECL_ERR_REGRMB;
 
 	/* send CONFIRM LINK request to client over the RoCE fabric */
@@ -1033,40 +1050,29 @@ static int smcr_serv_conf_first_link(struct smc_sock *smc)
 		return SMC_CLC_DECL_TIMEOUT_CL;
 
 	/* receive CONFIRM LINK response from client over the RoCE fabric */
-	rest = wait_for_completion_interruptible_timeout(
-		&link->llc_confirm_resp,
-		SMC_LLC_WAIT_FIRST_TIME);
-	if (rest <= 0) {
+	qentry = smc_llc_wait(link->lgr, link, SMC_LLC_WAIT_TIME,
+			      SMC_LLC_CONFIRM_LINK);
+	if (!qentry) {
 		struct smc_clc_msg_decline dclc;
 
 		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
 				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
 		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_CL : rc;
 	}
-
-	if (link->llc_confirm_resp_rc)
+	smc_llc_save_peer_uid(qentry);
+	rc = smc_llc_eval_conf_link(qentry, SMC_LLC_RESP);
+	smc_llc_flow_qentry_del(&link->lgr->llc_flow_lcl);
+	if (rc)
 		return SMC_CLC_DECL_RMBE_EC;
 
-	/* send ADD LINK request to client over the RoCE fabric */
-	rc = smc_llc_send_add_link(link,
-				   link->smcibdev->mac[link->ibport - 1],
-				   link->gid, SMC_LLC_REQ);
-	if (rc < 0)
-		return SMC_CLC_DECL_TIMEOUT_AL;
+	/* confirm_rkey is implicit on 1st contact */
+	smc->conn.rmb_desc->is_conf_rkey = true;
 
-	/* receive ADD LINK response from client over the RoCE fabric */
-	rest = wait_for_completion_interruptible_timeout(&link->llc_add_resp,
-							 SMC_LLC_WAIT_TIME);
-	if (rest <= 0) {
-		struct smc_clc_msg_decline dclc;
+	smc_llc_link_active(link);
+	smcr_lgr_set_type(link->lgr, SMC_LGR_SINGLE);
 
-		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
-				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
-		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_AL : rc;
-	}
-
-	smc_llc_link_active(link, net->ipv4.sysctl_tcp_keepalive_time);
-
+	/* initial contact - try to establish second link */
+	smc_llc_srv_add_link(link);
 	return 0;
 }
 
@@ -1195,12 +1201,14 @@ static int smc_listen_ism_init(struct smc_sock *new_smc,
 	}
 
 	/* Create send and receive buffers */
-	if (smc_buf_create(new_smc, true)) {
+	rc = smc_buf_create(new_smc, true);
+	if (rc) {
 		if (ini->cln_first_contact == SMC_FIRST_CONTACT)
 			smc_lgr_cleanup_early(&new_smc->conn);
 		else
 			smc_conn_free(&new_smc->conn);
-		return SMC_CLC_DECL_MEM;
+		return (rc == -ENOSPC) ? SMC_CLC_DECL_MAX_DMB :
+					 SMC_CLC_DECL_MEM;
 	}
 
 	return 0;
@@ -1212,7 +1220,7 @@ static int smc_listen_rdma_reg(struct smc_sock *new_smc, int local_contact)
 	struct smc_connection *conn = &new_smc->conn;
 
 	if (local_contact != SMC_FIRST_CONTACT) {
-		if (smcr_lgr_reg_rmbs(conn->lgr, conn->rmb_desc))
+		if (smcr_lgr_reg_rmbs(conn->lnk, conn->rmb_desc))
 			return SMC_CLC_DECL_ERR_REGRMB;
 	}
 	smc_rmb_sync_sg_for_device(&new_smc->conn);
@@ -1242,7 +1250,9 @@ static int smc_listen_rdma_finish(struct smc_sock *new_smc,
 			goto decline;
 		}
 		/* QP confirmation over RoCE fabric */
+		smc_llc_flow_initiate(link->lgr, SMC_LLC_FLOW_ADD_LINK);
 		reason_code = smcr_serv_conf_first_link(new_smc);
+		smc_llc_flow_stop(link->lgr, &link->lgr->llc_flow_lcl);
 		if (reason_code)
 			goto decline;
 	}

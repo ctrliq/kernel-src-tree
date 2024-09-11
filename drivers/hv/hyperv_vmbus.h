@@ -151,7 +151,6 @@ struct hv_per_cpu_context {
 	 * per-cpu list of the channels based on their CPU affinity.
 	 */
 	struct list_head chan_list;
-	struct clock_event_device *clk_evt;
 };
 
 struct hv_context {
@@ -188,8 +187,6 @@ extern int hv_synic_init(unsigned int cpu);
 
 extern void hv_synic_disable_regs(unsigned int cpu);
 extern int hv_synic_cleanup(unsigned int cpu);
-
-extern void hv_synic_clockevents_cleanup(void);
 
 /* Interface */
 
@@ -274,6 +271,32 @@ struct vmbus_connection {
 	struct workqueue_struct *work_queue;
 	struct workqueue_struct *handle_primary_chan_wq;
 	struct workqueue_struct *handle_sub_chan_wq;
+
+	/*
+	 * The number of sub-channels and hv_sock channels that should be
+	 * cleaned up upon suspend: sub-channels will be re-created upon
+	 * resume, and hv_sock channels should not survive suspend.
+	 */
+	atomic_t nr_chan_close_on_suspend;
+	/*
+	 * vmbus_bus_suspend() waits for "nr_chan_close_on_suspend" to
+	 * drop to zero.
+	 */
+	struct completion ready_for_suspend_event;
+
+	/*
+	 * The number of primary channels that should be "fixed up"
+	 * upon resume: these channels are re-offered upon resume, and some
+	 * fields of the channel offers (i.e. child_relid and connection_id)
+	 * can change, so the old offermsg must be fixed up, before the resume
+	 * callbacks of the VSC drivers start to further touch the channels.
+	 */
+	atomic_t nr_chan_fixup_on_resume;
+	/*
+	 * vmbus_bus_resume() waits for "nr_chan_fixup_on_resume" to
+	 * drop to zero.
+	 */
+	struct completion ready_for_resume_event;
 };
 
 
@@ -287,6 +310,8 @@ struct vmbus_msginfo {
 
 
 extern struct vmbus_connection vmbus_connection;
+
+int vmbus_negotiate_version(struct vmbus_channel_msginfo *msginfo, u32 version);
 
 static inline void vmbus_send_interrupt(u32 relid)
 {
@@ -378,5 +403,36 @@ enum hvutil_device_state {
 	HVUTIL_USERSPACE_RECV,   /* reply from userspace was received */
 	HVUTIL_DEVICE_DYING,     /* driver unload is in progress */
 };
+
+enum delay {
+	INTERRUPT_DELAY = 0,
+	MESSAGE_DELAY   = 1,
+};
+
+#ifdef CONFIG_HYPERV_TESTING
+
+int hv_debug_add_dev_dir(struct hv_device *dev);
+void hv_debug_rm_dev_dir(struct hv_device *dev);
+void hv_debug_rm_all_dir(void);
+int hv_debug_init(void);
+void hv_debug_delay_test(struct vmbus_channel *channel, enum delay delay_type);
+
+#else /* CONFIG_HYPERV_TESTING */
+
+static inline void hv_debug_rm_dev_dir(struct hv_device *dev) {};
+static inline void hv_debug_rm_all_dir(void) {};
+static inline void hv_debug_delay_test(struct vmbus_channel *channel,
+				       enum delay delay_type) {};
+static inline int hv_debug_init(void)
+{
+	return -1;
+}
+
+static inline int hv_debug_add_dev_dir(struct hv_device *dev)
+{
+	return -1;
+}
+
+#endif /* CONFIG_HYPERV_TESTING */
 
 #endif /* _HYPERV_VMBUS_H */

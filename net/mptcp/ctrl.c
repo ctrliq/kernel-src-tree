@@ -45,7 +45,7 @@ static struct ctl_table mptcp_sysctl_table[] = {
 
 static void mptcp_pernet_set_defaults(struct mptcp_pernet *pernet)
 {
-	pernet->mptcp_enabled = 1;
+	pernet->mptcp_enabled = 0;
 }
 
 static int mptcp_pernet_new_table(struct net *net, struct mptcp_pernet *pernet)

@@ -132,6 +132,8 @@ static int alt_fpga_bridge_probe(struct platform_device *pdev)
 	u32 enable;
 	int ret;
 
+	mark_tech_preview("Altera SoCFPGA HPS to FPGA Bridge", THIS_MODULE);
+
 	of_id = of_match_device(altera_fpga_of_match, dev);
 	if (!of_id) {
 		dev_err(dev, "failed to match device\n");

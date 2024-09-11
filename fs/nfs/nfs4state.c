@@ -1011,6 +1011,22 @@ out:
 	return ret;
 }
 
+bool nfs4_refresh_open_stateid(nfs4_stateid *dst, struct nfs4_state *state)
+{
+	bool ret;
+	int seq;
+
+	do {
+		ret = false;
+		seq = read_seqbegin(&state->seqlock);
+		if (nfs4_state_match_open_stateid_other(state, dst)) {
+			dst->seqid = state->open_stateid.seqid;
+			ret = true;
+		}
+	} while (read_seqretry(&state->seqlock, seq));
+	return ret;
+}
+
 bool nfs4_copy_open_stateid(nfs4_stateid *dst, struct nfs4_state *state)
 {
 	bool ret;
@@ -1130,7 +1146,7 @@ static void nfs_increment_seqid(int status, struct nfs_seqid *seqid)
 		case -NFS4ERR_MOVED:
 			/* Non-seqid mutating errors */
 			return;
-	};
+	}
 	/*
 	 * Note: no locking needed as we are guaranteed to be first
 	 * on the sequence list
@@ -1590,6 +1606,7 @@ static int __nfs4_reclaim_open_state(struct nfs4_state_owner *sp, struct nfs4_st
 	if (!test_bit(NFS_DELEGATED_STATE, &state->flags)) {
 		spin_lock(&state->state_lock);
 		list_for_each_entry(lock, &state->lock_states, ls_locks) {
+			trace_nfs4_state_lock_reclaim(state, lock);
 			if (!test_bit(NFS_LOCK_INITIALIZED, &lock->ls_flags))
 				pr_warn_ratelimited("NFS: %s: Lock reclaim failed!\n", __func__);
 		}

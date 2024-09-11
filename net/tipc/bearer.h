@@ -119,7 +119,8 @@ struct tipc_media {
 			char *raw);
 	u32 priority;
 	u32 tolerance;
-	u32 window;
+	u32 min_win;
+	u32 max_win;
 	u32 mtu;
 	u32 type_id;
 	u32 hwaddr_len;
@@ -158,7 +159,8 @@ struct tipc_bearer {
 	struct packet_type pt;
 	struct rcu_head rcu;
 	u32 priority;
-	u32 window;
+	u32 min_win;
+	u32 max_win;
 	u32 tolerance;
 	u32 domain;
 	u32 identity;
@@ -232,9 +234,20 @@ void tipc_bearer_xmit_skb(struct net *net, u32 bearer_id,
 			  struct tipc_media_addr *dest);
 void tipc_bearer_xmit(struct net *net, u32 bearer_id,
 		      struct sk_buff_head *xmitq,
-		      struct tipc_media_addr *dst);
+		      struct tipc_media_addr *dst,
+		      struct tipc_node *__dnode);
 void tipc_bearer_bc_xmit(struct net *net, u32 bearer_id,
 			 struct sk_buff_head *xmitq);
+void tipc_clone_to_loopback(struct net *net, struct sk_buff_head *pkts);
+int tipc_attach_loopback(struct net *net);
+void tipc_detach_loopback(struct net *net);
+
+static inline void tipc_loopback_trace(struct net *net,
+				       struct sk_buff_head *pkts)
+{
+	if (unlikely(dev_nit_active(net->loopback_dev)))
+		tipc_clone_to_loopback(net, pkts);
+}
 
 /* check if device MTU is too low for tipc headers */
 static inline bool tipc_mtu_bad(struct net_device *dev, unsigned int reserve)

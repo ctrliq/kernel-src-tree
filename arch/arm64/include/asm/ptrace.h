@@ -19,6 +19,7 @@
 #ifndef __ASM_PTRACE_H
 #define __ASM_PTRACE_H
 
+#include <linux/rh_kabi.h>
 #include <asm/cpufeature.h>
 
 #include <uapi/asm/ptrace.h>
@@ -35,9 +36,15 @@
  * means masking more IRQs (or at least that the same IRQs remain masked).
  *
  * To mask interrupts, we clear the most significant bit of PMR.
+ *
+ * Some code sections either automatically switch back to PSR.I or explicitly
+ * require to not use priority masking. If bit GIC_PRIO_PSR_I_SET is included
+ * in the  the priority mask, it indicates that PSR.I should be set and
+ * interrupt disabling temporarily does not rely on IRQ priorities.
  */
-#define GIC_PRIO_IRQON		0xf0
-#define GIC_PRIO_IRQOFF		(GIC_PRIO_IRQON & ~0x80)
+#define GIC_PRIO_IRQON			0xe0
+#define GIC_PRIO_IRQOFF			(GIC_PRIO_IRQON & ~0x80)
+#define GIC_PRIO_PSR_I_SET		(1 << 4)
 
 /* Additional SPSR bits not exposed in the UABI */
 #define PSR_MODE_THREAD_BIT	(1 << 0)
@@ -212,7 +219,7 @@ struct pt_regs {
 
 	u64 orig_addr_limit;
 	/* Only valid when ARM64_HAS_IRQ_PRIO_MASKING is enabled. */
-	u64 pmr_save;
+	u64 RH_KABI_RENAME(unused, pmr_save);
 	u64 stackframe[2];
 };
 

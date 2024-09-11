@@ -398,7 +398,8 @@ static void print_health_info(struct mlx5_core_dev *dev)
 
 static int
 mlx5_fw_reporter_diagnose(struct devlink_health_reporter *reporter,
-			  struct devlink_fmsg *fmsg)
+			  struct devlink_fmsg *fmsg,
+			  struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
 	struct mlx5_core_health *health = &dev->priv.health;
@@ -499,7 +500,8 @@ mlx5_fw_reporter_heath_buffer_data_put(struct mlx5_core_dev *dev,
 
 static int
 mlx5_fw_reporter_dump(struct devlink_health_reporter *reporter,
-		      struct devlink_fmsg *fmsg, void *priv_ctx)
+		      struct devlink_fmsg *fmsg, void *priv_ctx,
+		      struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
 	int err;
@@ -553,7 +555,8 @@ static const struct devlink_health_reporter_ops mlx5_fw_reporter_ops = {
 
 static int
 mlx5_fw_fatal_reporter_recover(struct devlink_health_reporter *reporter,
-			       void *priv_ctx)
+			       void *priv_ctx,
+			       struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
 
@@ -562,7 +565,8 @@ mlx5_fw_fatal_reporter_recover(struct devlink_health_reporter *reporter,
 
 static int
 mlx5_fw_fatal_reporter_dump(struct devlink_health_reporter *reporter,
-			    struct devlink_fmsg *fmsg, void *priv_ctx)
+			    struct devlink_fmsg *fmsg, void *priv_ctx,
+			    struct netlink_ext_ack *extack)
 {
 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
 	u32 crdump_size = dev->priv.health.crdump_size;
@@ -631,7 +635,7 @@ static void mlx5_fw_reporters_create(struct mlx5_core_dev *dev)
 
 	health->fw_reporter =
 		devlink_health_reporter_create(devlink, &mlx5_fw_reporter_ops,
-					       0, false, dev);
+					       0, dev);
 	if (IS_ERR(health->fw_reporter))
 		mlx5_core_warn(dev, "Failed to create fw reporter, err = %ld\n",
 			       PTR_ERR(health->fw_reporter));
@@ -640,7 +644,7 @@ static void mlx5_fw_reporters_create(struct mlx5_core_dev *dev)
 		devlink_health_reporter_create(devlink,
 					       &mlx5_fw_fatal_reporter_ops,
 					       MLX5_REPORTER_FW_GRACEFUL_PERIOD,
-					       true, dev);
+					       dev);
 	if (IS_ERR(health->fw_fatal_reporter))
 		mlx5_core_warn(dev, "Failed to create fw fatal reporter, err = %ld\n",
 			       PTR_ERR(health->fw_fatal_reporter));

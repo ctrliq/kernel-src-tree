@@ -1272,7 +1272,7 @@ static void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
 	tp->write_seq = TCP_SKB_CB(skb)->end_seq;
 	__skb_header_release(skb);
 	tcp_add_write_queue_tail(sk, skb);
-	sk->sk_wmem_queued += skb->truesize;
+	sk_wmem_queued_add(sk, skb->truesize);
 	sk_mem_charge(sk, skb->truesize);
 }
 
@@ -1406,7 +1406,7 @@ int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
 		return -ENOMEM; /* We'll just try again later. */
 	skb_copy_decrypted(buff, skb);
 
-	sk->sk_wmem_queued += buff->truesize;
+	sk_wmem_queued_add(sk, buff->truesize);
 	sk_mem_charge(sk, buff->truesize);
 	nlen = skb->len - len - nsize;
 	buff->truesize += nlen;
@@ -1516,7 +1516,7 @@ int tcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len)
 
 	if (delta_truesize) {
 		skb->truesize	   -= delta_truesize;
-		sk->sk_wmem_queued -= delta_truesize;
+		sk_wmem_queued_add(sk, -delta_truesize);
 		sk_mem_uncharge(sk, delta_truesize);
 		sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
 	}
@@ -1960,7 +1960,7 @@ static int tso_fragment(struct sock *sk, enum tcp_queue tcp_queue,
 		return -ENOMEM;
 	skb_copy_decrypted(buff, skb);
 
-	sk->sk_wmem_queued += buff->truesize;
+	sk_wmem_queued_add(sk, buff->truesize);
 	sk_mem_charge(sk, buff->truesize);
 	buff->truesize += nlen;
 	skb->truesize -= nlen;
@@ -2219,7 +2219,7 @@ static int tcp_mtu_probe(struct sock *sk)
 	nskb = sk_stream_alloc_skb(sk, probe_size, GFP_ATOMIC, false);
 	if (!nskb)
 		return -1;
-	sk->sk_wmem_queued += nskb->truesize;
+	sk_wmem_queued_add(sk, nskb->truesize);
 	sk_mem_charge(sk, nskb->truesize);
 
 	skb = tcp_send_head(sk);
@@ -2741,8 +2741,12 @@ u32 __tcp_select_window(struct sock *sk)
 	int mss = icsk->icsk_ack.rcv_mss;
 	int free_space = tcp_space(sk);
 	int allowed_space = tcp_full_space(sk);
-	int full_space = min_t(int, tp->window_clamp, allowed_space);
-	int window;
+	int full_space, window;
+
+	if (sk_is_mptcp(sk))
+		mptcp_space(sk, &free_space, &allowed_space);
+
+	full_space = min_t(int, tp->window_clamp, allowed_space);
 
 	if (unlikely(mss > full_space)) {
 		mss = full_space;
@@ -3274,7 +3278,7 @@ int tcp_send_synack(struct sock *sk)
 			tcp_rtx_queue_unlink_and_free(skb, sk);
 			__skb_header_release(nskb);
 			tcp_rbtree_insert(&sk->tcp_rtx_queue, nskb);
-			sk->sk_wmem_queued += nskb->truesize;
+			sk_wmem_queued_add(sk, nskb->truesize);
 			sk_mem_charge(sk, nskb->truesize);
 			skb = nskb;
 		}
@@ -3400,8 +3404,8 @@ static void tcp_ca_dst_init(struct sock *sk, const struct dst_entry *dst)
 
 	rcu_read_lock();
 	ca = tcp_ca_find_key(ca_key);
-	if (likely(ca && try_module_get(ca->owner))) {
-		module_put(icsk->icsk_ca_ops->owner);
+	if (likely(ca && bpf_try_module_get(ca, ca->owner))) {
+		bpf_module_put(icsk->icsk_ca_ops, icsk->icsk_ca_ops->owner);
 		icsk->icsk_ca_dst_locked = tcp_ca_dst_locked(dst);
 		icsk->icsk_ca_ops = ca;
 	}
@@ -3492,7 +3496,7 @@ static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)
 
 	tcb->end_seq += skb->len;
 	__skb_header_release(skb);
-	sk->sk_wmem_queued += skb->truesize;
+	sk_wmem_queued_add(sk, skb->truesize);
 	sk_mem_charge(sk, skb->truesize);
 	tp->write_seq = tcb->end_seq;
 	tp->packets_out += tcp_skb_pcount(skb);

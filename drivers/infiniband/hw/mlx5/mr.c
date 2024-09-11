@@ -50,7 +50,6 @@ enum {
 static void clean_mr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr);
 static void dereg_mr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr);
 static int mr_cache_max_order(struct mlx5_ib_dev *dev);
-static int unreg_umr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr);
 
 static bool umr_can_use_indirect_mkey(struct mlx5_ib_dev *dev)
 {
@@ -59,13 +58,9 @@ static bool umr_can_use_indirect_mkey(struct mlx5_ib_dev *dev)
 
 static int destroy_mkey(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
 {
-	int err = mlx5_core_destroy_mkey(dev->mdev, &mr->mmkey);
+	WARN_ON(xa_load(&dev->odp_mkeys, mlx5_base_mkey(mr->mmkey.key)));
 
-	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING))
-		/* Wait until all page fault handlers using the mr complete. */
-		synchronize_srcu(&dev->mr_srcu);
-
-	return err;
+	return mlx5_core_destroy_mkey(dev->mdev, &mr->mmkey);
 }
 
 static int order2idx(struct mlx5_ib_dev *dev, int order)
@@ -82,32 +77,6 @@ static bool use_umr_mtt_update(struct mlx5_ib_mr *mr, u64 start, u64 length)
 {
 	return ((u64)1 << mr->order) * MLX5_ADAPTER_PAGE_SIZE >=
 		length + (start & (MLX5_ADAPTER_PAGE_SIZE - 1));
-}
-
-static void update_odp_mr(struct mlx5_ib_mr *mr)
-{
-	if (is_odp_mr(mr)) {
-		/*
-		 * This barrier prevents the compiler from moving the
-		 * setting of umem->odp_data->private to point to our
-		 * MR, before reg_umr finished, to ensure that the MR
-		 * initialization have finished before starting to
-		 * handle invalidations.
-		 */
-		smp_wmb();
-		to_ib_umem_odp(mr->umem)->private = mr;
-		/*
-		 * Make sure we will see the new
-		 * umem->odp_data->private value in the invalidation
-		 * routines, before we can get page faults on the
-		 * MR. Page faults can happen once we put the MR in
-		 * the tree, below this line. Without the barrier,
-		 * there can be a fault handling and an invalidation
-		 * before umem->odp_data->private == mr is visible to
-		 * the invalidation handler.
-		 */
-		smp_wmb();
-	}
 }
 
 static void reg_mr_callback(int status, struct mlx5_async_work *context)
@@ -234,9 +203,6 @@ static void remove_keys(struct mlx5_ib_dev *dev, int c, int num)
 		spin_unlock_irq(&ent->lock);
 		mlx5_core_destroy_mkey(dev->mdev, &mr->mmkey);
 	}
-
-	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING))
-		synchronize_srcu(&dev->mr_srcu);
 
 	list_for_each_entry_safe(mr, tmp_mr, &del_list, list) {
 		list_del(&mr->list);
@@ -528,7 +494,7 @@ void mlx5_mr_cache_free(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
 	c = order2idx(dev, mr->order);
 	WARN_ON(c < 0 || c >= MAX_MR_CACHE_ENTRIES);
 
-	if (unreg_umr(dev, mr)) {
+	if (mlx5_mr_cache_invalidate(mr)) {
 		mr->allocated_from_cache = false;
 		destroy_mkey(dev, mr);
 		ent = &cache->ent[c];
@@ -571,10 +537,6 @@ static void clean_keys(struct mlx5_ib_dev *dev, int c)
 		spin_unlock_irq(&ent->lock);
 		mlx5_core_destroy_mkey(dev->mdev, &mr->mmkey);
 	}
-
-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-	synchronize_srcu(&dev->mr_srcu);
-#endif
 
 	list_for_each_entry_safe(mr, tmp_mr, &del_list, list) {
 		list_del(&mr->list);
@@ -790,19 +752,37 @@ static int mr_umem_get(struct mlx5_ib_dev *dev, struct ib_udata *udata,
 		       int *ncont, int *order)
 {
 	struct ib_umem *u;
-	int err;
 
 	*umem = NULL;
 
-	u = ib_umem_get(udata, start, length, access_flags, 0);
-	err = PTR_ERR_OR_ZERO(u);
-	if (err) {
-		mlx5_ib_dbg(dev, "umem get failed (%d)\n", err);
-		return err;
+	if (access_flags & IB_ACCESS_ON_DEMAND) {
+		struct ib_umem_odp *odp;
+
+		odp = ib_umem_odp_get(udata, start, length, access_flags);
+		if (IS_ERR(odp)) {
+			mlx5_ib_dbg(dev, "umem get failed (%ld)\n",
+				    PTR_ERR(odp));
+			return PTR_ERR(odp);
+		}
+
+		u = &odp->umem;
+
+		*page_shift = odp->page_shift;
+		*ncont = ib_umem_odp_num_pages(odp);
+		*npages = *ncont << (*page_shift - PAGE_SHIFT);
+		if (order)
+			*order = ilog2(roundup_pow_of_two(*ncont));
+	} else {
+		u = ib_umem_get(udata, start, length, access_flags);
+		if (IS_ERR(u)) {
+			mlx5_ib_dbg(dev, "umem get failed (%ld)\n", PTR_ERR(u));
+			return PTR_ERR(u);
+		}
+
+		mlx5_ib_cont_pages(u, start, MLX5_MKEY_PAGE_SHIFT_MASK, npages,
+				   page_shift, ncont, order);
 	}
 
-	mlx5_ib_cont_pages(u, start, MLX5_MKEY_PAGE_SHIFT_MASK, npages,
-			   page_shift, ncont, order);
 	if (!*npages) {
 		mlx5_ib_warn(dev, "avoid zero region\n");
 		ib_umem_release(u);
@@ -896,36 +876,6 @@ static struct mlx5_ib_mr *alloc_mr_from_cache(
 	return mr;
 }
 
-static inline int populate_xlt(struct mlx5_ib_mr *mr, int idx, int npages,
-			       void *xlt, int page_shift, size_t size,
-			       int flags)
-{
-	struct mlx5_ib_dev *dev = mr->dev;
-	struct ib_umem *umem = mr->umem;
-
-	if (flags & MLX5_IB_UPD_XLT_INDIRECT) {
-		if (!umr_can_use_indirect_mkey(dev))
-			return -EPERM;
-		mlx5_odp_populate_klm(xlt, idx, npages, mr, flags);
-		return npages;
-	}
-
-	npages = min_t(size_t, npages, ib_umem_num_pages(umem) - idx);
-
-	if (!(flags & MLX5_IB_UPD_XLT_ZAP)) {
-		__mlx5_ib_populate_pas(dev, umem, page_shift,
-				       idx, npages, xlt,
-				       MLX5_IB_MTT_PRESENT);
-		/* Clear padding after the pages
-		 * brought from the umem.
-		 */
-		memset(xlt + (npages * sizeof(struct mlx5_mtt)), 0,
-		       size - npages * sizeof(struct mlx5_mtt));
-	}
-
-	return npages;
-}
-
 #define MLX5_MAX_UMR_CHUNK ((1 << (MLX5_MAX_UMR_SHIFT + 4)) - \
 			    MLX5_UMR_MTT_ALIGNMENT)
 #define MLX5_SPARE_UMR_CHUNK 0x10000
@@ -949,6 +899,7 @@ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 	size_t pages_mapped = 0;
 	size_t pages_to_map = 0;
 	size_t pages_iter = 0;
+	size_t size_to_map = 0;
 	gfp_t gfp;
 	bool use_emergency_page = false;
 
@@ -995,6 +946,15 @@ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 		goto free_xlt;
 	}
 
+	if (mr->umem->is_odp) {
+		if (!(flags & MLX5_IB_UPD_XLT_INDIRECT)) {
+			struct ib_umem_odp *odp = to_ib_umem_odp(mr->umem);
+			size_t max_pages = ib_umem_odp_num_pages(odp) - idx;
+
+			pages_to_map = min_t(size_t, pages_to_map, max_pages);
+		}
+	}
+
 	sg.addr = dma;
 	sg.lkey = dev->umrc.pd->local_dma_lkey;
 
@@ -1017,14 +977,22 @@ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 	     pages_mapped < pages_to_map && !err;
 	     pages_mapped += pages_iter, idx += pages_iter) {
 		npages = min_t(int, pages_iter, pages_to_map - pages_mapped);
+		size_to_map = npages * desc_size;
 		dma_sync_single_for_cpu(ddev, dma, size, DMA_TO_DEVICE);
-		npages = populate_xlt(mr, idx, npages, xlt,
-				      page_shift, size, flags);
-
+		if (mr->umem->is_odp) {
+			mlx5_odp_populate_xlt(xlt, idx, npages, mr, flags);
+		} else {
+			__mlx5_ib_populate_pas(dev, mr->umem, page_shift, idx,
+					       npages, xlt,
+					       MLX5_IB_MTT_PRESENT);
+			/* Clear padding after the pages
+			 * brought from the umem.
+			 */
+			memset(xlt + size_to_map, 0, size - size_to_map);
+		}
 		dma_sync_single_for_device(ddev, dma, size, DMA_TO_DEVICE);
 
-		sg.length = ALIGN(npages * desc_size,
-				  MLX5_UMR_MTT_ALIGNMENT);
+		sg.length = ALIGN(size_to_map, MLX5_UMR_MTT_ALIGNMENT);
 
 		if (pages_mapped + pages_iter >= pages_to_map) {
 			if (flags & MLX5_IB_UPD_XLT_ENABLE)
@@ -1281,6 +1249,8 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 
 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING) && !start &&
 	    length == U64_MAX) {
+		if (virt_addr != start)
+			return ERR_PTR(-EINVAL);
 		if (!(access_flags & IB_ACCESS_ON_DEMAND) ||
 		    !(dev->odp_caps.general_caps & IB_ODP_SUPPORT_IMPLICIT))
 			return ERR_PTR(-EINVAL);
@@ -1332,8 +1302,6 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr->umem = umem;
 	set_mr_fields(dev, mr, npages, length, access_flags);
 
-	update_odp_mr(mr);
-
 	if (use_umr) {
 		int update_xlt_flags = MLX5_IB_UPD_XLT_ENABLE;
 
@@ -1349,9 +1317,17 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 		}
 	}
 
-	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
-		mr->live = 1;
-		atomic_set(&mr->num_pending_prefetch, 0);
+	if (is_odp_mr(mr)) {
+		to_ib_umem_odp(mr->umem)->private = mr;
+		init_waitqueue_head(&mr->q_deferred_work);
+		atomic_set(&mr->num_deferred_work, 0);
+		err = xa_err(xa_store(&dev->odp_mkeys,
+				      mlx5_base_mkey(mr->mmkey.key), &mr->mmkey,
+				      GFP_KERNEL));
+		if (err) {
+			dereg_mr(dev, mr);
+			return ERR_PTR(err);
+		}
 	}
 
 	return &mr->ibmr;
@@ -1360,22 +1336,29 @@ error:
 	return ERR_PTR(err);
 }
 
-static int unreg_umr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
+/**
+ * mlx5_mr_cache_invalidate - Fence all DMA on the MR
+ * @mr: The MR to fence
+ *
+ * Upon return the NIC will not be doing any DMA to the pages under the MR,
+ * and any DMA inprogress will be completed. Failure of this function
+ * indicates the HW has failed catastrophically.
+ */
+int mlx5_mr_cache_invalidate(struct mlx5_ib_mr *mr)
 {
-	struct mlx5_core_dev *mdev = dev->mdev;
 	struct mlx5_umr_wr umrwr = {};
 
-	if (mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR)
+	if (mr->dev->mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR)
 		return 0;
 
 	umrwr.wr.send_flags = MLX5_IB_SEND_UMR_DISABLE_MR |
 			      MLX5_IB_SEND_UMR_UPDATE_PD_ACCESS;
 	umrwr.wr.opcode = MLX5_IB_WR_UMR;
-	umrwr.pd = dev->umrc.pd;
+	umrwr.pd = mr->dev->umrc.pd;
 	umrwr.mkey = mr->mmkey.key;
 	umrwr.ignore_free_state = 1;
 
-	return mlx5_ib_post_send_wait(dev, &umrwr);
+	return mlx5_ib_post_send_wait(mr->dev, &umrwr);
 }
 
 static int rereg_umr(struct ib_pd *pd, struct mlx5_ib_mr *mr,
@@ -1459,7 +1442,7 @@ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
 		 * UMR can't be used - MKey needs to be replaced.
 		 */
 		if (mr->allocated_from_cache)
-			err = unreg_umr(dev, mr);
+			err = mlx5_mr_cache_invalidate(mr);
 		else
 			err = destroy_mkey(dev, mr);
 		if (err)
@@ -1588,54 +1571,20 @@ static void dereg_mr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
 	int npages = mr->npages;
 	struct ib_umem *umem = mr->umem;
 
-	if (is_odp_mr(mr)) {
-		struct ib_umem_odp *umem_odp = to_ib_umem_odp(umem);
+	/* Stop all DMA */
+	if (is_odp_mr(mr))
+		mlx5_ib_fence_odp_mr(mr);
+	else
+		clean_mr(dev, mr);
 
-		/* Prevent new page faults and
-		 * prefetch requests from succeeding
-		 */
-		mr->live = 0;
-
-		/* Wait for all running page-fault handlers to finish. */
-		synchronize_srcu(&dev->mr_srcu);
-
-		/* dequeue pending prefetch requests for the mr */
-		if (atomic_read(&mr->num_pending_prefetch))
-			flush_workqueue(system_unbound_wq);
-		WARN_ON(atomic_read(&mr->num_pending_prefetch));
-
-		/* Destroy all page mappings */
-		if (umem_odp->page_list)
-			mlx5_ib_invalidate_range(umem_odp,
-						 ib_umem_start(umem_odp),
-						 ib_umem_end(umem_odp));
-		else
-			mlx5_ib_free_implicit_mr(mr);
-		/*
-		 * We kill the umem before the MR for ODP,
-		 * so that there will not be any invalidations in
-		 * flight, looking at the *mr struct.
-		 */
-		ib_umem_release(umem);
-		atomic_sub(npages, &dev->mdev->priv.reg_pages);
-
-		/* Avoid double-freeing the umem. */
-		umem = NULL;
-	}
-
-	clean_mr(dev, mr);
-
-	/*
-	 * We should unregister the DMA address from the HCA before
-	 * remove the DMA mapping.
-	 */
-	mlx5_mr_cache_free(dev, mr);
-	ib_umem_release(umem);
-	if (umem)
-		atomic_sub(npages, &dev->mdev->priv.reg_pages);
-
-	if (!mr->allocated_from_cache)
+	if (mr->allocated_from_cache)
+		mlx5_mr_cache_free(dev, mr);
+	else
 		kfree(mr);
+
+	ib_umem_release(umem);
+	atomic_sub(npages, &dev->mdev->priv.reg_pages);
+
 }
 
 int mlx5_ib_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
@@ -1645,6 +1594,11 @@ int mlx5_ib_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 	if (ibmr->type == IB_MR_TYPE_INTEGRITY) {
 		dereg_mr(to_mdev(mmr->mtt_mr->ibmr.device), mmr->mtt_mr);
 		dereg_mr(to_mdev(mmr->klm_mr->ibmr.device), mmr->klm_mr);
+	}
+
+	if (is_odp_mr(mmr) && to_ib_umem_odp(mmr->umem)->is_implicit_odp) {
+		mlx5_ib_free_implicit_mr(mmr);
+		return 0;
 	}
 
 	dereg_mr(to_mdev(ibmr->device), mmr);
@@ -1971,9 +1925,19 @@ struct ib_mw *mlx5_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
 		}
 	}
 
+	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+		err = xa_err(xa_store(&dev->odp_mkeys,
+				      mlx5_base_mkey(mw->mmkey.key), &mw->mmkey,
+				      GFP_KERNEL));
+		if (err)
+			goto free_mkey;
+	}
+
 	kfree(in);
 	return &mw->ibmw;
 
+free_mkey:
+	mlx5_core_destroy_mkey(dev->mdev, &mw->mmkey);
 free:
 	kfree(mw);
 	kfree(in);
@@ -1987,13 +1951,12 @@ int mlx5_ib_dealloc_mw(struct ib_mw *mw)
 	int err;
 
 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
-		xa_erase_irq(&dev->mdev->priv.mkey_table,
-			     mlx5_base_mkey(mmw->mmkey.key));
+		xa_erase(&dev->odp_mkeys, mlx5_base_mkey(mmw->mmkey.key));
 		/*
 		 * pagefault_single_data_segment() may be accessing mmw under
 		 * SRCU if the user bound an ODP MR to this MW.
 		 */
-		synchronize_srcu(&dev->mr_srcu);
+		synchronize_srcu(&dev->odp_srcu);
 	}
 
 	err = mlx5_core_destroy_mkey(dev->mdev, &mmw->mmkey);

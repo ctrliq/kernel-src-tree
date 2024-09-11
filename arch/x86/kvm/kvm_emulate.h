@@ -221,7 +221,7 @@ struct x86_emulate_ops {
 			 enum x86_intercept_stage stage);
 
 	bool (*get_cpuid)(struct x86_emulate_ctxt *ctxt, u32 *eax, u32 *ebx,
-			  u32 *ecx, u32 *edx, bool check_limit);
+			  u32 *ecx, u32 *edx, bool exact_only);
 	bool (*guest_has_long_mode)(struct x86_emulate_ctxt *ctxt);
 	bool (*guest_has_movbe)(struct x86_emulate_ctxt *ctxt);
 	bool (*guest_has_fxsr)(struct x86_emulate_ctxt *ctxt);
@@ -301,6 +301,7 @@ struct fastop;
 typedef void (*fastop_t)(struct fastop *);
 
 struct x86_emulate_ctxt {
+	void *vcpu;
 	const struct x86_emulate_ops *ops;
 
 	/* Register state before/after emulation. */
@@ -333,9 +334,6 @@ struct x86_emulate_ctxt {
 	u8 intercept;
 	u8 op_bytes;
 	u8 ad_bytes;
-	struct operand src;
-	struct operand src2;
-	struct operand dst;
 	union {
 		int (*execute)(struct x86_emulate_ctxt *ctxt);
 		fastop_t fop;
@@ -363,6 +361,11 @@ struct x86_emulate_ctxt {
 	u8 seg_override;
 	u64 d;
 	unsigned long _eip;
+
+	/* Here begins the usercopy section. */
+	struct operand src;
+	struct operand src2;
+	struct operand dst;
 	struct operand memop;
 	unsigned long _regs[NR_VCPU_REGS];
 	struct operand *memopp;
@@ -387,6 +390,27 @@ struct x86_emulate_ctxt {
 #define X86EMUL_CPUID_VENDOR_GenuineIntel_ebx 0x756e6547
 #define X86EMUL_CPUID_VENDOR_GenuineIntel_ecx 0x6c65746e
 #define X86EMUL_CPUID_VENDOR_GenuineIntel_edx 0x49656e69
+
+#define X86EMUL_CPUID_VENDOR_CentaurHauls_ebx 0x746e6543
+#define X86EMUL_CPUID_VENDOR_CentaurHauls_ecx 0x736c7561
+#define X86EMUL_CPUID_VENDOR_CentaurHauls_edx 0x48727561
+
+static inline bool is_guest_vendor_intel(u32 ebx, u32 ecx, u32 edx)
+{
+	return ebx == X86EMUL_CPUID_VENDOR_GenuineIntel_ebx &&
+	       ecx == X86EMUL_CPUID_VENDOR_GenuineIntel_ecx &&
+	       edx == X86EMUL_CPUID_VENDOR_GenuineIntel_edx;
+}
+
+static inline bool is_guest_vendor_amd(u32 ebx, u32 ecx, u32 edx)
+{
+	return (ebx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ebx &&
+		ecx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ecx &&
+		edx == X86EMUL_CPUID_VENDOR_AuthenticAMD_edx) ||
+	       (ebx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ebx &&
+		ecx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ecx &&
+		edx == X86EMUL_CPUID_VENDOR_AMDisbetterI_edx);
+}
 
 enum x86_intercept_stage {
 	X86_ICTP_NONE = 0,   /* Allow zero-init to not match anything */

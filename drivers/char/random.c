@@ -265,6 +265,7 @@
 #include <linux/syscalls.h>
 #include <linux/completion.h>
 #include <linux/uuid.h>
+#include <linux/rcupdate.h>
 #include <crypto/chacha20.h>
 
 #include <asm/processor.h>
@@ -300,6 +301,11 @@
  */
 #define ENTROPY_SHIFT 3
 #define ENTROPY_BITS(r) ((r)->entropy_count >> ENTROPY_SHIFT)
+
+/*
+ * Hook for external RNG.
+ */
+static const struct random_extrng __rcu *extrng;
 
 /*
  * The minimum number of bits of entropy before we wake up a read on
@@ -448,6 +454,8 @@ static int ratelimit_disable __read_mostly;
 
 module_param_named(ratelimit_disable, ratelimit_disable, int, 0644);
 MODULE_PARM_DESC(ratelimit_disable, "Disable random ratelimit suppression");
+
+static const struct file_operations extrng_fops;
 
 /**********************************************************************
  *
@@ -2084,7 +2092,38 @@ static int random_fasync(int fd, struct file *filp, int on)
 	return fasync_helper(fd, filp, on, &fasync);
 }
 
+static int random_open(struct inode *inode, struct file *filp)
+{
+	const struct random_extrng *rng;
+
+	rcu_read_lock();
+	rng = extrng;
+	if (rng && !try_module_get(rng->owner))
+		rng = NULL;
+	rcu_read_unlock();
+
+	if (!rng)
+		return 0;
+
+	filp->f_op = &extrng_fops;
+
+	return 0;
+}
+
+static int extrng_release(struct inode *inode, struct file *filp)
+{
+	module_put(extrng->owner);
+	return 0;
+}
+
+static ssize_t
+extrng_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+{
+	return rcu_dereference_raw(extrng)->extrng_read(buf, nbytes);
+}
+
 const struct file_operations random_fops = {
+	.open  = random_open,
 	.read  = random_read,
 	.write = random_write,
 	.poll  = random_poll,
@@ -2094,6 +2133,7 @@ const struct file_operations random_fops = {
 };
 
 const struct file_operations urandom_fops = {
+	.open  = random_open,
 	.read  = urandom_read,
 	.write = random_write,
 	.unlocked_ioctl = random_ioctl,
@@ -2101,9 +2141,20 @@ const struct file_operations urandom_fops = {
 	.llseek = noop_llseek,
 };
 
+static const struct file_operations extrng_fops = {
+	.open  = random_open,
+	.read  = extrng_read,
+	.write = random_write,
+	.unlocked_ioctl = random_ioctl,
+	.fasync = random_fasync,
+	.llseek = noop_llseek,
+	.release = extrng_release,
+};
+
 SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
 		unsigned int, flags)
 {
+	const struct random_extrng *rng;
 	int ret;
 
 	if (flags & ~(GRND_NONBLOCK|GRND_RANDOM))
@@ -2111,6 +2162,18 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
 
 	if (count > INT_MAX)
 		count = INT_MAX;
+
+	rcu_read_lock();
+	rng = extrng;
+	if (rng && !try_module_get(rng->owner))
+		rng = NULL;
+	rcu_read_unlock();
+
+	if (rng) {
+		ret = rng->extrng_read(buf, count);
+		module_put(extrng->owner);
+		return ret;
+	}
 
 	if (flags & GRND_RANDOM)
 		return _random_read(flags & GRND_NONBLOCK, buf, count);
@@ -2428,3 +2491,16 @@ void add_hwgenerator_randomness(const char *buffer, size_t count,
 	credit_entropy_bits(poolp, entropy);
 }
 EXPORT_SYMBOL_GPL(add_hwgenerator_randomness);
+
+void random_register_extrng(const struct random_extrng *rng)
+{
+	rcu_assign_pointer(extrng, rng);
+}
+EXPORT_SYMBOL_GPL(random_register_extrng);
+
+void random_unregister_extrng(void)
+{
+	RCU_INIT_POINTER(extrng, NULL);
+	synchronize_rcu();
+}
+EXPORT_SYMBOL_GPL(random_unregister_extrng);

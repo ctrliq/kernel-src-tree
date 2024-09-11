@@ -2713,13 +2713,9 @@ struct dentry *nfs_fs_mount_common(struct nfs_server *server,
 			s->s_iflags |= SB_I_MULTIROOT;
 	}
 
-	mntroot = nfs_get_root(s, mount_info->mntfh, dev_name);
+	mntroot = nfs_get_root(s, mount_info, dev_name);
 	if (IS_ERR(mntroot))
 		goto error_splat_super;
-
-	error = mount_info->set_security(s, mntroot, mount_info);
-	if (error)
-		goto error_splat_root;
 
 	s->s_flags |= SB_ACTIVE;
 
@@ -2730,9 +2726,6 @@ out_err_nosb:
 	nfs_free_server(server);
 	goto out;
 
-error_splat_root:
-	dput(mntroot);
-	mntroot = ERR_PTR(error);
 error_splat_super:
 	deactivate_locked_super(s);
 	goto out;

@@ -256,7 +256,7 @@ struct hc_driver {
 
 	int	flags;
 #define	HCD_MEMORY	0x0001		/* HC regs use memory (else I/O) */
-#define	HCD_LOCAL_MEM	0x0002		/* HC needs local memory */
+#define	HCD_DMA		0x0002		/* HC uses DMA */
 #define	HCD_SHARED	0x0004		/* Two (or more) usb_hcds share HW */
 #define	HCD_USB11	0x0010		/* USB 1.1 */
 #define	HCD_USB2	0x0020		/* USB 2.0 */
@@ -421,6 +421,11 @@ static inline bool hcd_periodic_completion_in_progress(struct usb_hcd *hcd,
 		struct usb_host_endpoint *ep)
 {
 	return hcd->high_prio_bh.completing_ep == ep;
+}
+
+static inline bool hcd_uses_dma(struct usb_hcd *hcd)
+{
+	return IS_ENABLED(CONFIG_HAS_DMA) && (hcd->driver->flags & HCD_DMA);
 }
 
 extern int usb_hcd_link_urb_to_ep(struct usb_hcd *hcd, struct urb *urb);

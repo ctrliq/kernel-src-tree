@@ -288,6 +288,8 @@ static int fme_mgr_probe(struct platform_device *pdev)
 	struct fpga_manager *mgr;
 	struct resource *res;
 
+	mark_tech_preview("FPGA Manager for DFL FPGA Management Engine", THIS_MODULE);
+
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;

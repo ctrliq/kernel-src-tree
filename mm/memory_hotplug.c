@@ -33,7 +33,6 @@
 #include <linux/stop_machine.h>
 #include <linux/hugetlb.h>
 #include <linux/memblock.h>
-#include <linux/bootmem.h>
 #include <linux/compaction.h>
 #include <linux/rmap.h>
 
@@ -101,6 +100,7 @@ u64 max_mem_size = U64_MAX;
 static struct resource *register_memory_resource(u64 start, u64 size)
 {
 	struct resource *res, *conflict;
+
 
 	/*
 	 * Make sure value parsed from 'mem=' only restricts memory adding

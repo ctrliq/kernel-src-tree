@@ -9,7 +9,6 @@
  *
  *  DMA uncached mapping support.
  */
-#include <linux/bootmem.h>
 #include <linux/module.h>
 #include <linux/mm.h>
 #include <linux/genalloc.h>
@@ -195,6 +194,7 @@ const struct dma_map_ops arm_dma_ops = {
 	.unmap_page		= arm_dma_unmap_page,
 	.map_sg			= arm_dma_map_sg,
 	.unmap_sg		= arm_dma_unmap_sg,
+	.map_resource		= dma_direct_map_resource,
 	.sync_single_for_cpu	= arm_dma_sync_single_for_cpu,
 	.sync_single_for_device	= arm_dma_sync_single_for_device,
 	.sync_sg_for_cpu	= arm_dma_sync_sg_for_cpu,
@@ -221,6 +221,7 @@ const struct dma_map_ops arm_coherent_dma_ops = {
 	.map_page		= arm_coherent_dma_map_page,
 	.map_sg			= arm_dma_map_sg,
 	.mapping_error		= arm_dma_mapping_error,
+	.map_resource		= dma_direct_map_resource,
 	.dma_supported		= arm_dma_supported,
 	.get_required_mask	= dma_direct_get_required_mask,
 };
@@ -369,13 +370,19 @@ static void *
 __dma_alloc_remap(struct page *page, size_t size, gfp_t gfp, pgprot_t prot,
 	const void *caller)
 {
-	return dma_common_contiguous_remap(page, size, VM_DMA_COHERENT,
+	/*
+	 * DMA allocation can be mapped to user space, so lets
+	 * set VM_USERMAP flags too.
+	 */
+	return dma_common_contiguous_remap(page, size,
+			VM_ARM_DMA_CONSISTENT | VM_USERMAP,
 			prot, caller);
 }
 
 static void __dma_free_remap(void *cpu_addr, size_t size)
 {
-	dma_common_free_remap(cpu_addr, size, VM_DMA_COHERENT);
+	dma_common_free_remap(cpu_addr, size,
+			VM_ARM_DMA_CONSISTENT | VM_USERMAP);
 }
 
 #define DEFAULT_DMA_COHERENT_POOL_SIZE	SZ_256K
@@ -1373,8 +1380,8 @@ static void *
 __iommu_alloc_remap(struct page **pages, size_t size, gfp_t gfp, pgprot_t prot,
 		    const void *caller)
 {
-	return dma_common_pages_remap(pages, size, VM_DMA_COHERENT, prot,
-			caller);
+	return dma_common_pages_remap(pages, size,
+			VM_ARM_DMA_CONSISTENT | VM_USERMAP, prot, caller);
 }
 
 /*
@@ -1458,7 +1465,7 @@ static struct page **__iommu_get_pages(void *cpu_addr, unsigned long attrs)
 		return cpu_addr;
 
 	area = find_vm_area(cpu_addr);
-	if (area && (area->flags & VM_DMA_COHERENT))
+	if (area && (area->flags & VM_ARM_DMA_CONSISTENT))
 		return area->pages;
 	return NULL;
 }
@@ -1626,8 +1633,10 @@ void __arm_iommu_free_attrs(struct device *dev, size_t size, void *cpu_addr,
 		return;
 	}
 
-	if ((attrs & DMA_ATTR_NO_KERNEL_MAPPING) == 0)
-		dma_common_free_remap(cpu_addr, size, VM_DMA_COHERENT);
+	if ((attrs & DMA_ATTR_NO_KERNEL_MAPPING) == 0) {
+		dma_common_free_remap(cpu_addr, size,
+			VM_ARM_DMA_CONSISTENT | VM_USERMAP);
+	}
 
 	__iommu_remove_mapping(dev, handle, size);
 	__iommu_free_buffer(dev, pages, size, attrs);

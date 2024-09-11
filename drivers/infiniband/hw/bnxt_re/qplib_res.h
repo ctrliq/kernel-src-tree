@@ -80,6 +80,13 @@ enum bnxt_qplib_pbl_lvl {
 #define ROCE_PG_SIZE_8M		(8 * 1024 * 1024)
 #define ROCE_PG_SIZE_1G		(1024 * 1024 * 1024)
 
+struct bnxt_qplib_reg_desc {
+	u8		bar_id;
+	resource_size_t	bar_base;
+	void __iomem	*bar_reg;
+	size_t		len;
+};
+
 struct bnxt_qplib_pbl {
 	u32				pg_count;
 	u32				pg_size;
@@ -124,6 +131,13 @@ struct bnxt_qplib_hwq {
 	u32				cons;		/* raw */
 	u8				cp_bit;
 	u8				is_user;
+};
+
+struct bnxt_qplib_db_info {
+	void __iomem		*db;
+	void __iomem		*priv_db;
+	struct bnxt_qplib_hwq	*hwq;
+	u32			xid;
 };
 
 /* Tables */
@@ -283,4 +297,75 @@ void bnxt_qplib_free_ctx(struct bnxt_qplib_res *res,
 int bnxt_qplib_alloc_ctx(struct bnxt_qplib_res *res,
 			 struct bnxt_qplib_ctx *ctx,
 			 bool virt_fn, bool is_p5);
+
+static inline void bnxt_qplib_ring_db32(struct bnxt_qplib_db_info *info,
+					bool arm)
+{
+	u32 key;
+
+	key = info->hwq->cons & (info->hwq->max_elements - 1);
+	key |= (CMPL_DOORBELL_IDX_VALID |
+		(CMPL_DOORBELL_KEY_CMPL & CMPL_DOORBELL_KEY_MASK));
+	if (!arm)
+		key |= CMPL_DOORBELL_MASK;
+	writel(key, info->db);
+}
+
+static inline void bnxt_qplib_ring_db(struct bnxt_qplib_db_info *info,
+				      u32 type)
+{
+	u64 key = 0;
+
+	key = (info->xid & DBC_DBC_XID_MASK) | DBC_DBC_PATH_ROCE | type;
+	key <<= 32;
+	key |= (info->hwq->cons & (info->hwq->max_elements - 1)) &
+		DBC_DBC_INDEX_MASK;
+	writeq(key, info->db);
+}
+
+static inline void bnxt_qplib_ring_prod_db(struct bnxt_qplib_db_info *info,
+					   u32 type)
+{
+	u64 key = 0;
+
+	key = (info->xid & DBC_DBC_XID_MASK) | DBC_DBC_PATH_ROCE | type;
+	key <<= 32;
+	key |= (info->hwq->prod & (info->hwq->max_elements - 1)) &
+		DBC_DBC_INDEX_MASK;
+	writeq(key, info->db);
+}
+
+static inline void bnxt_qplib_armen_db(struct bnxt_qplib_db_info *info,
+				       u32 type)
+{
+	u64 key = 0;
+
+	key = (info->xid & DBC_DBC_XID_MASK) | DBC_DBC_PATH_ROCE | type;
+	key <<= 32;
+	writeq(key, info->priv_db);
+}
+
+static inline void bnxt_qplib_srq_arm_db(struct bnxt_qplib_db_info *info,
+					 u32 th)
+{
+	u64 key = 0;
+
+	key = (info->xid & DBC_DBC_XID_MASK) | DBC_DBC_PATH_ROCE | th;
+	key <<= 32;
+	key |=  th & DBC_DBC_INDEX_MASK;
+	writeq(key, info->priv_db);
+}
+
+static inline void bnxt_qplib_ring_nq_db(struct bnxt_qplib_db_info *info,
+					 struct bnxt_qplib_chip_ctx *cctx,
+					 bool arm)
+{
+	u32 type;
+
+	type = arm ? DBC_DBC_TYPE_NQ_ARM : DBC_DBC_TYPE_NQ;
+	if (bnxt_qplib_is_chip_gen_p5(cctx))
+		bnxt_qplib_ring_db(info, type);
+	else
+		bnxt_qplib_ring_db32(info, arm);
+}
 #endif /* __BNXT_QPLIB_RES_H__ */

@@ -1864,7 +1864,8 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 		 * This is only possible if parent == real_parent.
 		 * Check if it has changed security domain.
 		 */
-		if (tsk->parent_exec_id != READ_ONCE(tsk->parent->self_exec_id))
+		if (tsk->task_struct_rh->parent_exec_id !=
+			READ_ONCE(tsk->parent->task_struct_rh->self_exec_id))
 			sig = SIGCHLD;
 	}
 

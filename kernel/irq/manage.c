@@ -24,7 +24,7 @@
 
 #include "internals.h"
 
-#ifdef CONFIG_IRQ_FORCED_THREADING
+#if defined(CONFIG_IRQ_FORCED_THREADING) && !defined(CONFIG_PREEMPT_RT)
 __read_mostly bool force_irqthreads;
 EXPORT_SYMBOL_GPL(force_irqthreads);
 
@@ -1245,19 +1245,11 @@ static bool irq_supports_nmi(struct irq_desc *desc)
 
 static int irq_nmi_setup(struct irq_desc *desc)
 {
-	struct irq_data *d = irq_desc_get_irq_data(desc);
-	struct irq_chip *c = d->chip;
-
-	return c->irq_nmi_setup ? c->irq_nmi_setup(d) : -EINVAL;
+	return -EINVAL;
 }
 
 static void irq_nmi_teardown(struct irq_desc *desc)
 {
-	struct irq_data *d = irq_desc_get_irq_data(desc);
-	struct irq_chip *c = d->chip;
-
-	if (c->irq_nmi_teardown)
-		c->irq_nmi_teardown(d);
 }
 
 static int
@@ -1925,7 +1917,7 @@ static const void *__cleanup_nmi(unsigned int irq, struct irq_desc *desc)
 	}
 
 	irq_settings_clr_disable_unlazy(desc);
-	irq_shutdown(desc);
+	irq_shutdown_and_deactivate(desc);
 
 	irq_release_resources(desc);
 
@@ -2496,28 +2488,6 @@ int __request_percpu_irq(unsigned int irq, irq_handler_t handler,
 }
 EXPORT_SYMBOL_GPL(__request_percpu_irq);
 
-int __irq_get_irqchip_state(struct irq_data *data, enum irqchip_irq_state which,
-			    bool *state)
-{
-	struct irq_chip *chip;
-	int err = -EINVAL;
-
-	do {
-		chip = irq_data_get_irq_chip(data);
-		if (chip->irq_get_irqchip_state)
-			break;
-#ifdef CONFIG_IRQ_DOMAIN_HIERARCHY
-		data = data->parent_data;
-#else
-		data = NULL;
-#endif
-	} while (data);
-
-	if (data)
-		err = chip->irq_get_irqchip_state(data, which, state);
-	return err;
-}
-
 /**
  *	request_percpu_nmi - allocate a percpu interrupt line for NMI delivery
  *	@irq: Interrupt line to allocate
@@ -2668,6 +2638,28 @@ void teardown_percpu_nmi(unsigned int irq)
 	irq_nmi_teardown(desc);
 out:
 	irq_put_desc_unlock(desc, flags);
+}
+
+int __irq_get_irqchip_state(struct irq_data *data, enum irqchip_irq_state which,
+			    bool *state)
+{
+	struct irq_chip *chip;
+	int err = -EINVAL;
+
+	do {
+		chip = irq_data_get_irq_chip(data);
+		if (chip->irq_get_irqchip_state)
+			break;
+#ifdef CONFIG_IRQ_DOMAIN_HIERARCHY
+		data = data->parent_data;
+#else
+		data = NULL;
+#endif
+	} while (data);
+
+	if (data)
+		err = chip->irq_get_irqchip_state(data, which, state);
+	return err;
 }
 
 /**

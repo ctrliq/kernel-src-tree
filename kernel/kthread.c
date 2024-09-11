@@ -58,6 +58,33 @@ enum KTHREAD_BITS {
 	KTHREAD_SHOULD_PARK,
 };
 
+/* RHEL kABI deviation from upstream: we define housekeeping_cpumask
+ * and hk_flags directly because including linux/tick.h changes
+ * vm_struct from UNKNOWN to a known symbol, breaking kthread_bind
+ * and others on AArch64
+ */
+
+enum hk_flags {
+	HK_FLAG_TIMER           = 1,
+	HK_FLAG_RCU             = (1 << 1),
+	HK_FLAG_MISC            = (1 << 2),
+	HK_FLAG_SCHED           = (1 << 3),
+	HK_FLAG_TICK            = (1 << 4),
+	HK_FLAG_DOMAIN          = (1 << 5),
+	HK_FLAG_WQ              = (1 << 6),
+	HK_FLAG_MANAGED_IRQ     = (1 << 7),
+	HK_FLAG_KTHREAD         = (1 << 8),
+};
+
+#ifdef CONFIG_CPU_ISOLATION
+extern const struct cpumask *housekeeping_cpumask(enum hk_flags flags);
+#else
+static inline const struct cpumask *housekeeping_cpumask(enum hk_flags flags)
+{
+	return cpu_possible_mask;
+}
+#endif
+
 static inline void set_kthread_struct(void *kthread)
 {
 	/*
@@ -345,7 +372,8 @@ struct task_struct *__kthread_create_on_node(int (*threadfn)(void *data),
 		 * The kernel thread should not inherit these properties.
 		 */
 		sched_setscheduler_nocheck(task, SCHED_NORMAL, &param);
-		set_cpus_allowed_ptr(task, cpu_possible_mask);
+		set_cpus_allowed_ptr(task,
+				     housekeeping_cpumask(HK_FLAG_KTHREAD));
 	}
 	kfree(create);
 	return task;
@@ -568,7 +596,7 @@ int kthreadd(void *unused)
 	/* Setup a clean context for our children to inherit. */
 	set_task_comm(tsk, "kthreadd");
 	ignore_signals(tsk);
-	set_cpus_allowed_ptr(tsk, cpu_possible_mask);
+	set_cpus_allowed_ptr(tsk, housekeeping_cpumask(HK_FLAG_KTHREAD));
 	set_mems_allowed(node_states[N_MEMORY]);
 
 	current->flags |= PF_NOFREEZE;

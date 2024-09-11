@@ -24,14 +24,13 @@
 #include <net/netfilter/nf_conntrack_helper.h>
 #include <net/netfilter/nf_conntrack_labels.h>
 #include <net/netfilter/nf_conntrack_seqadj.h>
+#include <net/netfilter/nf_conntrack_timeout.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
 #include <net/ipv6_frag.h>
 
 #ifdef CONFIG_NF_NAT_NEEDED
-#include <linux/netfilter/nf_nat.h>
-#include <net/netfilter/nf_nat_core.h>
-#include <net/netfilter/nf_nat_l3proto.h>
+#include <net/netfilter/nf_nat.h>
 #endif
 
 #include "datapath.h"
@@ -75,6 +74,8 @@ struct ovs_conntrack_info {
 	u32 eventmask;              /* Mask of 1 << IPCT_*. */
 	struct md_mark mark;
 	struct md_labels labels;
+	char timeout[CTNL_TIMEOUT_NAME_MAX];
+	struct nf_ct_timeout *nf_ct_timeout;
 #ifdef CONFIG_NF_NAT_NEEDED
 	struct nf_nat_range2 range;  /* Only present for SRC NAT and DST NAT. */
 #endif
@@ -627,7 +628,7 @@ ovs_ct_find_existing(struct net *net, const struct nf_conntrack_zone *zone,
 	if (natted) {
 		struct nf_conntrack_tuple inverse;
 
-		if (!nf_ct_invert_tuplepr(&inverse, &tuple)) {
+		if (!nf_ct_invert_tuple(&inverse, &tuple)) {
 			pr_debug("ovs_ct_find_existing: Inversion failed!\n");
 			return NULL;
 		}
@@ -710,6 +711,14 @@ static bool skb_nfct_cached(struct net *net,
 		if (help && rcu_access_pointer(help->helper) != info->helper)
 			return false;
 	}
+	if (info->nf_ct_timeout) {
+		struct nf_conn_timeout *timeout_ext;
+
+		timeout_ext = nf_ct_timeout_find(ct);
+		if (!timeout_ext || info->nf_ct_timeout !=
+		    rcu_dereference(timeout_ext->timeout))
+			return false;
+	}
 	/* Force conntrack entry direction to the current packet? */
 	if (info->force && CTINFO2DIR(ctinfo) != IP_CT_DIR_ORIGINAL) {
 		/* Delete the conntrack entry if confirmed, else just release
@@ -750,14 +759,14 @@ static int ovs_ct_nat_execute(struct sk_buff *skb, struct nf_conn *ct,
 	switch (ctinfo) {
 	case IP_CT_RELATED:
 	case IP_CT_RELATED_REPLY:
-		if (IS_ENABLED(CONFIG_NF_NAT_IPV4) &&
+		if (IS_ENABLED(CONFIG_NF_NAT) &&
 		    skb->protocol == htons(ETH_P_IP) &&
 		    ip_hdr(skb)->protocol == IPPROTO_ICMP) {
 			if (!nf_nat_icmp_reply_translation(skb, ct, ctinfo,
 							   hooknum))
 				err = NF_DROP;
 			goto push;
-		} else if (IS_ENABLED(CONFIG_NF_NAT_IPV6) &&
+		} else if (IS_ENABLED(CONFIG_IPV6) &&
 			   skb->protocol == htons(ETH_P_IPV6)) {
 			__be16 frag_off;
 			u8 nexthdr = ipv6_hdr(skb)->nexthdr;
@@ -949,6 +958,11 @@ static int __ovs_ct_lookup(struct net *net, struct sw_flow_key *key,
 	struct nf_conn *ct;
 
 	if (!cached) {
+		struct nf_hook_state state = {
+			.hook = NF_INET_PRE_ROUTING,
+			.pf = info->family,
+			.net = net,
+		};
 		struct nf_conn *tmpl = info->ct;
 		int err;
 
@@ -960,8 +974,7 @@ static int __ovs_ct_lookup(struct net *net, struct sw_flow_key *key,
 			nf_ct_set(skb, tmpl, IP_CT_NEW);
 		}
 
-		err = nf_conntrack_in(net, info->family,
-				      NF_INET_PRE_ROUTING, skb);
+		err = nf_conntrack_in(skb, &state);
 		if (err != NF_ACCEPT)
 			return -ENOENT;
 
@@ -1499,6 +1512,8 @@ static const struct ovs_ct_len_tbl ovs_ct_attr_lens[OVS_CT_ATTR_MAX + 1] = {
 #endif
 	[OVS_CT_ATTR_EVENTMASK]	= { .minlen = sizeof(u32),
 				    .maxlen = sizeof(u32) },
+	[OVS_CT_ATTR_TIMEOUT] = { .minlen = 1,
+				  .maxlen = CTNL_TIMEOUT_NAME_MAX },
 };
 
 static int parse_ct(const struct nlattr *attr, struct ovs_conntrack_info *info,
@@ -1584,6 +1599,15 @@ static int parse_ct(const struct nlattr *attr, struct ovs_conntrack_info *info,
 			info->have_eventmask = true;
 			info->eventmask = nla_get_u32(a);
 			break;
+#ifdef CONFIG_NF_CONNTRACK_TIMEOUT
+		case OVS_CT_ATTR_TIMEOUT:
+			memcpy(info->timeout, nla_data(a), nla_len(a));
+			if (!memchr(info->timeout, '\0', nla_len(a))) {
+				OVS_NLERR(log, "Invalid conntrack timeout");
+				return -EINVAL;
+			}
+			break;
+#endif
 
 		default:
 			OVS_NLERR(log, "Unknown conntrack attr (%d)",
@@ -1665,6 +1689,18 @@ int ovs_ct_copy_action(struct net *net, const struct nlattr *attr,
 		OVS_NLERR(log, "Failed to allocate conntrack template");
 		return -ENOMEM;
 	}
+
+	if (ct_info.timeout[0]) {
+		if (nf_ct_set_timeout(net, ct_info.ct, family, key->ip.proto,
+				      ct_info.timeout))
+			pr_info_ratelimited("Failed to associated timeout "
+					    "policy `%s'\n", ct_info.timeout);
+		else
+			ct_info.nf_ct_timeout = rcu_dereference(
+				nf_ct_timeout_find(ct_info.ct)->timeout);
+
+	}
+
 	if (helper) {
 		err = ovs_ct_add_helper(&ct_info, helper, key, log);
 		if (err)
@@ -1705,7 +1741,7 @@ static bool ovs_ct_nat_to_attr(const struct ovs_conntrack_info *info,
 	}
 
 	if (info->range.flags & NF_NAT_RANGE_MAP_IPS) {
-		if (IS_ENABLED(CONFIG_NF_NAT_IPV4) &&
+		if (IS_ENABLED(CONFIG_NF_NAT) &&
 		    info->family == NFPROTO_IPV4) {
 			if (nla_put_in_addr(skb, OVS_NAT_ATTR_IP_MIN,
 					    info->range.min_addr.ip) ||
@@ -1714,7 +1750,7 @@ static bool ovs_ct_nat_to_attr(const struct ovs_conntrack_info *info,
 			     (nla_put_in_addr(skb, OVS_NAT_ATTR_IP_MAX,
 					      info->range.max_addr.ip))))
 				return false;
-		} else if (IS_ENABLED(CONFIG_NF_NAT_IPV6) &&
+		} else if (IS_ENABLED(CONFIG_IPV6) &&
 			   info->family == NFPROTO_IPV6) {
 			if (nla_put_in6_addr(skb, OVS_NAT_ATTR_IP_MIN,
 					     &info->range.min_addr.in6) ||
@@ -1785,6 +1821,10 @@ int ovs_ct_action_to_attr(const struct ovs_conntrack_info *ct_info,
 	if (ct_info->have_eventmask &&
 	    nla_put_u32(skb, OVS_CT_ATTR_EVENTMASK, ct_info->eventmask))
 		return -EMSGSIZE;
+	if (ct_info->timeout[0]) {
+		if (nla_put_string(skb, OVS_CT_ATTR_TIMEOUT, ct_info->timeout))
+			return -EMSGSIZE;
+	}
 
 #ifdef CONFIG_NF_NAT_NEEDED
 	if (ct_info->nat && !ovs_ct_nat_to_attr(ct_info, skb))
@@ -1811,8 +1851,11 @@ static void __ovs_ct_free_action(struct ovs_conntrack_info *ct_info)
 #endif
 		nf_conntrack_helper_put(ct_info->helper);
 	}
-	if (ct_info->ct)
+	if (ct_info->ct) {
+		if (ct_info->timeout[0])
+			nf_ct_destroy_timeout(ct_info->ct);
 		nf_ct_tmpl_free(ct_info->ct);
+	}
 }
 
 #if	IS_ENABLED(CONFIG_NETFILTER_CONNCOUNT)

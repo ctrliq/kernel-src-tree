@@ -47,7 +47,7 @@
 #include <linux/kthread.h>
 #include <linux/jiffies.h>	/* time_after() */
 #include <linux/slab.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 
 #include <asm/irqdomain.h>
 #include <asm/io.h>
@@ -1725,9 +1725,10 @@ static bool io_apic_level_ack_pending(struct mp_chip_data *data)
 
 static inline bool ioapic_irqd_mask(struct irq_data *data)
 {
-	/* If we are moving the irq we need to mask it */
+	/* If we are moving the IRQ we need to mask it */
 	if (unlikely(irqd_is_setaffinity_pending(data))) {
-		mask_ioapic_irq(data);
+		if (!irqd_irq_masked(data))
+			mask_ioapic_irq(data);
 		return true;
 	}
 	return false;
@@ -1764,7 +1765,9 @@ static inline void ioapic_irqd_unmask(struct irq_data *data, bool masked)
 		 */
 		if (!io_apic_level_ack_pending(data->chip_data))
 			irq_move_masked_irq(data);
-		unmask_ioapic_irq(data);
+		/* If the IRQ is masked in the core, leave it: */
+		if (!irqd_irq_masked(data))
+			unmask_ioapic_irq(data);
 	}
 }
 #else
@@ -2628,7 +2631,7 @@ static struct resource * __init ioapic_setup_resources(void)
 	n = IOAPIC_RESOURCE_NAME_SIZE + sizeof(struct resource);
 	n *= nr_ioapics;
 
-	mem = alloc_bootmem(n);
+	mem = memblock_alloc(n, SMP_CACHE_BYTES);
 	res = (void *)mem;
 
 	mem += sizeof(struct resource) * nr_ioapics;

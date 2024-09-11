@@ -3,15 +3,20 @@
 #define DFLTCC_H
 
 #include "../zlib_deflate/defutil.h"
+#include <asm/facility.h>
+#include <asm/setup.h>
 
 /*
  * Tuning parameters.
  */
 #define DFLTCC_LEVEL_MASK 0x2 /* DFLTCC compression for level 1 only */
+#define DFLTCC_LEVEL_MASK_DEBUG 0x3fe /* DFLTCC compression for all levels */
 #define DFLTCC_BLOCK_SIZE 1048576
 #define DFLTCC_FIRST_FHT_BLOCK_SIZE 4096
 #define DFLTCC_DHT_MIN_SAMPLE_SIZE 4096
 #define DFLTCC_RIBM 0
+
+#define DFLTCC_FACILITY 151
 
 /*
  * Parameter Block for Query Available Functions.
@@ -112,6 +117,11 @@ typedef enum {
 } dfltcc_inflate_action;
 dfltcc_inflate_action dfltcc_inflate(z_streamp strm,
                                      int flush, int *ret);
+static inline int is_dfltcc_enabled(void)
+{
+return (zlib_dfltcc_support != ZLIB_DFLTCC_DISABLED &&
+        test_facility(DFLTCC_FACILITY));
+}
 
 #define DEFLATE_RESET_HOOK(strm) \
     dfltcc_reset((strm), sizeof(deflate_state))
@@ -119,6 +129,8 @@ dfltcc_inflate_action dfltcc_inflate(z_streamp strm,
 #define DEFLATE_HOOK dfltcc_deflate
 
 #define DEFLATE_NEED_CHECKSUM(strm) (!dfltcc_can_deflate((strm)))
+
+#define DEFLATE_DFLTCC_ENABLED() is_dfltcc_enabled()
 
 #define INFLATE_RESET_HOOK(strm) \
     dfltcc_reset((strm), sizeof(struct inflate_state))

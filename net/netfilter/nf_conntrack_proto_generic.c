@@ -11,64 +11,9 @@
 #include <linux/timer.h>
 #include <linux/netfilter.h>
 #include <net/netfilter/nf_conntrack_l4proto.h>
+#include <net/netfilter/nf_conntrack_timeout.h>
 
 static const unsigned int nf_ct_generic_timeout = 600*HZ;
-
-static bool nf_generic_should_process(u8 proto)
-{
-	switch (proto) {
-#ifdef CONFIG_NF_CT_PROTO_GRE_MODULE
-	case IPPROTO_GRE:
-		return false;
-#endif
-	default:
-		return true;
-	}
-}
-
-static inline struct nf_generic_net *generic_pernet(struct net *net)
-{
-	return &net->ct.nf_ct_proto.generic;
-}
-
-static bool generic_pkt_to_tuple(const struct sk_buff *skb,
-				 unsigned int dataoff,
-				 struct net *net, struct nf_conntrack_tuple *tuple)
-{
-	tuple->src.u.all = 0;
-	tuple->dst.u.all = 0;
-
-	return true;
-}
-
-static unsigned int *generic_get_timeouts(struct net *net)
-{
-	return &(generic_pernet(net)->timeout);
-}
-
-/* Returns verdict for packet, or -1 for invalid. */
-static int generic_packet(struct nf_conn *ct,
-			  const struct sk_buff *skb,
-			  unsigned int dataoff,
-			  enum ip_conntrack_info ctinfo,
-			  unsigned int *timeout)
-{
-	nf_ct_refresh_acct(ct, ctinfo, skb, *timeout);
-	return NF_ACCEPT;
-}
-
-/* Called when a new connection for this protocol found. */
-static bool generic_new(struct nf_conn *ct, const struct sk_buff *skb,
-			unsigned int dataoff, unsigned int *timeouts)
-{
-	bool ret;
-
-	ret = nf_generic_should_process(nf_ct_protonum(ct));
-	if (!ret)
-		pr_warn_once("conntrack: generic helper won't handle protocol %d. Please consider loading the specific helper module.\n",
-			     nf_ct_protonum(ct));
-	return ret;
-}
 
 #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
 
@@ -78,8 +23,11 @@ static bool generic_new(struct nf_conn *ct, const struct sk_buff *skb,
 static int generic_timeout_nlattr_to_obj(struct nlattr *tb[],
 					 struct net *net, void *data)
 {
+	struct nf_generic_net *gn = nf_generic_pernet(net);
 	unsigned int *timeout = data;
-	struct nf_generic_net *gn = generic_pernet(net);
+
+	if (!timeout)
+		timeout = &gn->timeout;
 
 	if (tb[CTA_TIMEOUT_GENERIC_TIMEOUT])
 		*timeout =
@@ -141,7 +89,7 @@ static int generic_kmemdup_sysctl_table(struct nf_proto_net *pn,
 
 static int generic_init_net(struct net *net)
 {
-	struct nf_generic_net *gn = generic_pernet(net);
+	struct nf_generic_net *gn = nf_generic_pernet(net);
 	struct nf_proto_net *pn = &gn->pn;
 
 	gn->timeout = nf_ct_generic_timeout;
@@ -156,12 +104,7 @@ static struct nf_proto_net *generic_get_net_proto(struct net *net)
 
 const struct nf_conntrack_l4proto nf_conntrack_l4proto_generic =
 {
-	.l3proto		= PF_UNSPEC,
 	.l4proto		= 255,
-	.pkt_to_tuple		= generic_pkt_to_tuple,
-	.packet			= generic_packet,
-	.get_timeouts		= generic_get_timeouts,
-	.new			= generic_new,
 #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
 	.ctnl_timeout		= {
 		.nlattr_to_obj	= generic_timeout_nlattr_to_obj,

@@ -209,9 +209,9 @@ static int ib_uverbs_get_context(struct uverbs_attr_bundle *attrs)
 	struct ib_uverbs_get_context      cmd;
 	struct ib_uverbs_get_context_resp resp;
 	struct ib_ucontext		 *ucontext;
-	struct file			 *filp;
 	struct ib_rdmacg_object		 cg_obj;
 	struct ib_device *ib_dev;
+	struct ib_uobject *uobj;
 	int ret;
 
 	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
@@ -256,33 +256,30 @@ static int ib_uverbs_get_context(struct uverbs_attr_bundle *attrs)
 
 	mutex_init(&ucontext->per_mm_list_lock);
 	INIT_LIST_HEAD(&ucontext->per_mm_list);
+	xa_init_flags(&ucontext->mmap_xa, XA_FLAGS_ALLOC);
 
-	ret = get_unused_fd_flags(O_CLOEXEC);
-	if (ret < 0)
+	uobj = uobj_alloc(UVERBS_OBJECT_ASYNC_EVENT, attrs, &ib_dev);
+	if (IS_ERR(uobj)) {
+		ret = PTR_ERR(uobj);
 		goto err_free;
-	resp.async_fd = ret;
-
-	filp = ib_uverbs_alloc_async_event_file(file, ib_dev);
-	if (IS_ERR(filp)) {
-		ret = PTR_ERR(filp);
-		goto err_fd;
 	}
 
+	resp.async_fd = uobj->id;
 	resp.num_comp_vectors = file->device->num_comp_vectors;
 
 	ret = uverbs_response(attrs, &resp, sizeof(resp));
 	if (ret)
-		goto err_file;
+		goto err_uobj;
 
 	ret = ib_dev->ops.alloc_ucontext(ucontext, &attrs->driver_udata);
 	if (ret)
-		goto err_file;
-	if (!(ib_dev->attrs.device_cap_flags & IB_DEVICE_ON_DEMAND_PAGING))
-		ucontext->invalidate_range = NULL;
+		goto err_uobj;
 
 	rdma_restrack_uadd(&ucontext->res);
 
-	fd_install(resp.async_fd, filp);
+	ib_uverbs_init_async_event_file(
+		container_of(uobj, struct ib_uverbs_async_event_file, uobj));
+	rdma_alloc_commit_uobject(uobj, attrs);
 
 	/*
 	 * Make sure that ib_uverbs_get_ucontext() sees the pointer update
@@ -294,12 +291,8 @@ static int ib_uverbs_get_context(struct uverbs_attr_bundle *attrs)
 	up_read(&file->hw_destroy_rwsem);
 	return 0;
 
-err_file:
-	ib_uverbs_free_async_event_file(file);
-	fput(filp);
-
-err_fd:
-	put_unused_fd(resp.async_fd);
+err_uobj:
+	rdma_alloc_abort_uobject(uobj, attrs);
 
 err_free:
 	kfree(ucontext);
@@ -1068,7 +1061,7 @@ err_free:
 	kfree(cq);
 err_file:
 	if (ev_file)
-		ib_uverbs_release_ucq(attrs->ufile, ev_file, obj);
+		ib_uverbs_release_ucq(ev_file, obj);
 
 err:
 	uobj_alloc_abort(&obj->uevent.uobject, attrs);

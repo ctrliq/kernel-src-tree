@@ -85,6 +85,44 @@ DECLARE_EVENT_CLASS(xprtrdma_rxprt,
 				),					\
 				TP_ARGS(r_xprt))
 
+DECLARE_EVENT_CLASS(xprtrdma_connect_class,
+	TP_PROTO(
+		const struct rpcrdma_xprt *r_xprt,
+		int rc
+	),
+
+	TP_ARGS(r_xprt, rc),
+
+	TP_STRUCT__entry(
+		__field(const void *, r_xprt)
+		__field(int, rc)
+		__field(int, connect_status)
+		__string(addr, rpcrdma_addrstr(r_xprt))
+		__string(port, rpcrdma_portstr(r_xprt))
+	),
+
+	TP_fast_assign(
+		__entry->r_xprt = r_xprt;
+		__entry->rc = rc;
+		__entry->connect_status = r_xprt->rx_ep.rep_connected;
+		__assign_str(addr, rpcrdma_addrstr(r_xprt));
+		__assign_str(port, rpcrdma_portstr(r_xprt));
+	),
+
+	TP_printk("peer=[%s]:%s r_xprt=%p: rc=%d connect status=%d",
+		__get_str(addr), __get_str(port), __entry->r_xprt,
+		__entry->rc, __entry->connect_status
+	)
+);
+
+#define DEFINE_CONN_EVENT(name)						\
+		DEFINE_EVENT(xprtrdma_connect_class, xprtrdma_##name,	\
+				TP_PROTO(				\
+					const struct rpcrdma_xprt *r_xprt, \
+					int rc				\
+				),					\
+				TP_ARGS(r_xprt, rc))
+
 DECLARE_EVENT_CLASS(xprtrdma_rdch_event,
 	TP_PROTO(
 		const struct rpc_task *task,
@@ -333,47 +371,81 @@ TRACE_EVENT(xprtrdma_cm_event,
 	)
 );
 
-TRACE_EVENT(xprtrdma_disconnect,
+TRACE_EVENT(xprtrdma_inline_thresh,
 	TP_PROTO(
-		const struct rpcrdma_xprt *r_xprt,
-		int status
+		const struct rpcrdma_xprt *r_xprt
 	),
 
-	TP_ARGS(r_xprt, status),
+	TP_ARGS(r_xprt),
 
 	TP_STRUCT__entry(
 		__field(const void *, r_xprt)
-		__field(int, status)
-		__field(int, connected)
+		__field(unsigned int, inline_send)
+		__field(unsigned int, inline_recv)
+		__field(unsigned int, max_send)
+		__field(unsigned int, max_recv)
+		__string(addr, rpcrdma_addrstr(r_xprt))
+		__string(port, rpcrdma_portstr(r_xprt))
+	),
+
+	TP_fast_assign(
+		const struct rpcrdma_ep *ep = &r_xprt->rx_ep;
+
+		__entry->r_xprt = r_xprt;
+		__entry->inline_send = ep->rep_inline_send;
+		__entry->inline_recv = ep->rep_inline_recv;
+		__entry->max_send = ep->rep_max_inline_send;
+		__entry->max_recv = ep->rep_max_inline_recv;
+		__assign_str(addr, rpcrdma_addrstr(r_xprt));
+		__assign_str(port, rpcrdma_portstr(r_xprt));
+	),
+
+	TP_printk("peer=[%s]:%s r_xprt=%p neg send/recv=%u/%u, calc send/recv=%u/%u",
+		__get_str(addr), __get_str(port), __entry->r_xprt,
+		__entry->inline_send, __entry->inline_recv,
+		__entry->max_send, __entry->max_recv
+	)
+);
+
+DEFINE_CONN_EVENT(connect);
+DEFINE_CONN_EVENT(disconnect);
+
+DEFINE_RXPRT_EVENT(xprtrdma_create);
+DEFINE_RXPRT_EVENT(xprtrdma_op_destroy);
+DEFINE_RXPRT_EVENT(xprtrdma_remove);
+DEFINE_RXPRT_EVENT(xprtrdma_reinsert);
+DEFINE_RXPRT_EVENT(xprtrdma_op_inject_dsc);
+DEFINE_RXPRT_EVENT(xprtrdma_op_close);
+DEFINE_RXPRT_EVENT(xprtrdma_op_setport);
+
+TRACE_EVENT(xprtrdma_op_connect,
+	TP_PROTO(
+		const struct rpcrdma_xprt *r_xprt,
+		unsigned long delay
+	),
+
+	TP_ARGS(r_xprt, delay),
+
+	TP_STRUCT__entry(
+		__field(const void *, r_xprt)
+		__field(unsigned long, delay)
 		__string(addr, rpcrdma_addrstr(r_xprt))
 		__string(port, rpcrdma_portstr(r_xprt))
 	),
 
 	TP_fast_assign(
 		__entry->r_xprt = r_xprt;
-		__entry->status = status;
-		__entry->connected = r_xprt->rx_ep.rep_connected;
+		__entry->delay = delay;
 		__assign_str(addr, rpcrdma_addrstr(r_xprt));
 		__assign_str(port, rpcrdma_portstr(r_xprt));
 	),
 
-	TP_printk("peer=[%s]:%s r_xprt=%p: status=%d %sconnected",
-		__get_str(addr), __get_str(port),
-		__entry->r_xprt, __entry->status,
-		__entry->connected == 1 ? "still " : "dis"
+	TP_printk("peer=[%s]:%s r_xprt=%p delay=%lu",
+		__get_str(addr), __get_str(port), __entry->r_xprt,
+		__entry->delay
 	)
 );
 
-DEFINE_RXPRT_EVENT(xprtrdma_conn_start);
-DEFINE_RXPRT_EVENT(xprtrdma_conn_tout);
-DEFINE_RXPRT_EVENT(xprtrdma_create);
-DEFINE_RXPRT_EVENT(xprtrdma_op_destroy);
-DEFINE_RXPRT_EVENT(xprtrdma_remove);
-DEFINE_RXPRT_EVENT(xprtrdma_reinsert);
-DEFINE_RXPRT_EVENT(xprtrdma_reconnect);
-DEFINE_RXPRT_EVENT(xprtrdma_op_inject_dsc);
-DEFINE_RXPRT_EVENT(xprtrdma_op_close);
-DEFINE_RXPRT_EVENT(xprtrdma_op_connect);
 
 TRACE_EVENT(xprtrdma_op_set_cto,
 	TP_PROTO(
@@ -451,26 +523,89 @@ TRACE_EVENT(xprtrdma_createmrs,
 
 	TP_STRUCT__entry(
 		__field(const void *, r_xprt)
+		__string(addr, rpcrdma_addrstr(r_xprt))
+		__string(port, rpcrdma_portstr(r_xprt))
 		__field(unsigned int, count)
 	),
 
 	TP_fast_assign(
 		__entry->r_xprt = r_xprt;
 		__entry->count = count;
+		__assign_str(addr, rpcrdma_addrstr(r_xprt));
+		__assign_str(port, rpcrdma_portstr(r_xprt));
 	),
 
-	TP_printk("r_xprt=%p: created %u MRs",
-		__entry->r_xprt, __entry->count
+	TP_printk("peer=[%s]:%s r_xprt=%p: created %u MRs",
+		__get_str(addr), __get_str(port), __entry->r_xprt,
+		__entry->count
 	)
 );
 
-DEFINE_RXPRT_EVENT(xprtrdma_nomrs);
+TRACE_EVENT(xprtrdma_mr_get,
+	TP_PROTO(
+		const struct rpcrdma_req *req
+	),
+
+	TP_ARGS(req),
+
+	TP_STRUCT__entry(
+		__field(const void *, req)
+		__field(unsigned int, task_id)
+		__field(unsigned int, client_id)
+		__field(u32, xid)
+	),
+
+	TP_fast_assign(
+		const struct rpc_rqst *rqst = &req->rl_slot;
+
+		__entry->req = req;
+		__entry->task_id = rqst->rq_task->tk_pid;
+		__entry->client_id = rqst->rq_task->tk_client->cl_clid;
+		__entry->xid = be32_to_cpu(rqst->rq_xid);
+	),
+
+	TP_printk("task:%u@%u xid=0x%08x req=%p",
+		__entry->task_id, __entry->client_id, __entry->xid,
+		__entry->req
+	)
+);
+
+TRACE_EVENT(xprtrdma_nomrs,
+	TP_PROTO(
+		const struct rpcrdma_req *req
+	),
+
+	TP_ARGS(req),
+
+	TP_STRUCT__entry(
+		__field(const void *, req)
+		__field(unsigned int, task_id)
+		__field(unsigned int, client_id)
+		__field(u32, xid)
+	),
+
+	TP_fast_assign(
+		const struct rpc_rqst *rqst = &req->rl_slot;
+
+		__entry->req = req;
+		__entry->task_id = rqst->rq_task->tk_pid;
+		__entry->client_id = rqst->rq_task->tk_client->cl_clid;
+		__entry->xid = be32_to_cpu(rqst->rq_xid);
+	),
+
+	TP_printk("task:%u@%u xid=0x%08x req=%p",
+		__entry->task_id, __entry->client_id, __entry->xid,
+		__entry->req
+	)
+);
 
 DEFINE_RDCH_EVENT(read);
 DEFINE_WRCH_EVENT(write);
 DEFINE_WRCH_EVENT(reply);
 
 TRACE_DEFINE_ENUM(rpcrdma_noch);
+TRACE_DEFINE_ENUM(rpcrdma_noch_pullup);
+TRACE_DEFINE_ENUM(rpcrdma_noch_mapped);
 TRACE_DEFINE_ENUM(rpcrdma_readch);
 TRACE_DEFINE_ENUM(rpcrdma_areadch);
 TRACE_DEFINE_ENUM(rpcrdma_writech);
@@ -479,6 +614,8 @@ TRACE_DEFINE_ENUM(rpcrdma_replych);
 #define xprtrdma_show_chunktype(x)					\
 		__print_symbolic(x,					\
 				{ rpcrdma_noch, "inline" },		\
+				{ rpcrdma_noch_pullup, "pullup" },	\
+				{ rpcrdma_noch_mapped, "mapped" },	\
 				{ rpcrdma_readch, "read list" },	\
 				{ rpcrdma_areadch, "*read list" },	\
 				{ rpcrdma_writech, "write list" },	\
@@ -592,6 +729,7 @@ TRACE_EVENT(xprtrdma_post_send,
 
 	TP_STRUCT__entry(
 		__field(const void *, req)
+		__field(const void *, sc)
 		__field(unsigned int, task_id)
 		__field(unsigned int, client_id)
 		__field(int, num_sge)
@@ -605,14 +743,15 @@ TRACE_EVENT(xprtrdma_post_send,
 		__entry->task_id = rqst->rq_task->tk_pid;
 		__entry->client_id = rqst->rq_task->tk_client->cl_clid;
 		__entry->req = req;
+		__entry->sc = req->rl_sendctx;
 		__entry->num_sge = req->rl_wr.num_sge;
 		__entry->signaled = req->rl_wr.send_flags & IB_SEND_SIGNALED;
 		__entry->status = status;
 	),
 
-	TP_printk("task:%u@%u req=%p (%d SGE%s) %sstatus=%d",
+	TP_printk("task:%u@%u req=%p sc=%p (%d SGE%s) %sstatus=%d",
 		__entry->task_id, __entry->client_id,
-		__entry->req, __entry->num_sge,
+		__entry->req, __entry->sc, __entry->num_sge,
 		(__entry->num_sge == 1 ? "" : "s"),
 		(__entry->signaled ? "signaled " : ""),
 		__entry->status
@@ -621,21 +760,21 @@ TRACE_EVENT(xprtrdma_post_send,
 
 TRACE_EVENT(xprtrdma_post_recv,
 	TP_PROTO(
-		const struct ib_cqe *cqe
+		const struct rpcrdma_rep *rep
 	),
 
-	TP_ARGS(cqe),
+	TP_ARGS(rep),
 
 	TP_STRUCT__entry(
-		__field(const void *, cqe)
+		__field(const void *, rep)
 	),
 
 	TP_fast_assign(
-		__entry->cqe = cqe;
+		__entry->rep = rep;
 	),
 
-	TP_printk("cqe=%p",
-		__entry->cqe
+	TP_printk("rep=%p",
+		__entry->rep
 	)
 );
 
@@ -711,6 +850,7 @@ TRACE_EVENT(xprtrdma_wc_send,
 
 	TP_STRUCT__entry(
 		__field(const void *, req)
+		__field(const void *, sc)
 		__field(unsigned int, unmap_count)
 		__field(unsigned int, status)
 		__field(unsigned int, vendor_err)
@@ -718,13 +858,14 @@ TRACE_EVENT(xprtrdma_wc_send,
 
 	TP_fast_assign(
 		__entry->req = sc->sc_req;
+		__entry->sc = sc;
 		__entry->unmap_count = sc->sc_unmap_count;
 		__entry->status = wc->status;
 		__entry->vendor_err = __entry->status ? wc->vendor_err : 0;
 	),
 
-	TP_printk("req=%p, unmapped %u pages: %s (%u/0x%x)",
-		__entry->req, __entry->unmap_count,
+	TP_printk("req=%p sc=%p unmapped=%u: %s (%u/0x%x)",
+		__entry->req, __entry->sc, __entry->unmap_count,
 		rdma_show_wc_status(__entry->status),
 		__entry->status, __entry->vendor_err
 	)
@@ -738,14 +879,15 @@ TRACE_EVENT(xprtrdma_wc_receive,
 	TP_ARGS(wc),
 
 	TP_STRUCT__entry(
-		__field(const void *, cqe)
+		__field(const void *, rep)
 		__field(u32, byte_len)
 		__field(unsigned int, status)
 		__field(u32, vendor_err)
 	),
 
 	TP_fast_assign(
-		__entry->cqe = wc->wr_cqe;
+		__entry->rep = container_of(wc->wr_cqe, struct rpcrdma_rep,
+					    rr_cqe);
 		__entry->status = wc->status;
 		if (wc->status) {
 			__entry->byte_len = 0;
@@ -756,8 +898,8 @@ TRACE_EVENT(xprtrdma_wc_receive,
 		}
 	),
 
-	TP_printk("cqe=%p %u bytes: %s (%u/0x%x)",
-		__entry->cqe, __entry->byte_len,
+	TP_printk("rep=%p %u bytes: %s (%u/0x%x)",
+		__entry->rep, __entry->byte_len,
 		rdma_show_wc_status(__entry->status),
 		__entry->status, __entry->vendor_err
 	)

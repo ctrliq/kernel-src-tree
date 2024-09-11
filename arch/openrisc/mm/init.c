@@ -26,12 +26,11 @@
 #include <linux/mm.h>
 #include <linux/swap.h>
 #include <linux/smp.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 #include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/blkdev.h>	/* for initrd_* */
 #include <linux/pagemap.h>
-#include <linux/memblock.h>
 
 #include <asm/segment.h>
 #include <asm/pgalloc.h>
@@ -213,7 +212,7 @@ void __init mem_init(void)
 	memset((void *)empty_zero_page, 0, PAGE_SIZE);
 
 	/* this will put all low memory onto the freelists */
-	free_all_bootmem();
+	memblock_free_all();
 
 	mem_init_print_info(NULL);
 

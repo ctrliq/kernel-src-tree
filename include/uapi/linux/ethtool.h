@@ -1466,6 +1466,13 @@ enum ethtool_link_mode_bit_indices {
 	ETHTOOL_LINK_MODE_56000baseSR4_Full_BIT	= 29,
 	ETHTOOL_LINK_MODE_56000baseLR4_Full_BIT	= 30,
 	ETHTOOL_LINK_MODE_25000baseCR_Full_BIT	= 31,
+
+	/* Last allowed bit for __ETHTOOL_LINK_MODE_LEGACY_MASK is bit
+	 * 31. Please do NOT define any SUPPORTED_* or ADVERTISED_*
+	 * macro for bits > 31. The only way to use indices > 31 is to
+	 * use the new ETHTOOL_GLINKSETTINGS/ETHTOOL_SLINKSETTINGS API.
+	 */
+
 	ETHTOOL_LINK_MODE_25000baseKR_Full_BIT	= 32,
 	ETHTOOL_LINK_MODE_25000baseSR_Full_BIT	= 33,
 	ETHTOOL_LINK_MODE_50000baseCR2_Full_BIT	= 34,
@@ -1510,21 +1517,23 @@ enum ethtool_link_mode_bit_indices {
 	ETHTOOL_LINK_MODE_400000baseDR8_Full_BIT	 = 72,
 	ETHTOOL_LINK_MODE_400000baseCR8_Full_BIT	 = 73,
 
-	/* Last allowed bit for __ETHTOOL_LINK_MODE_LEGACY_MASK is bit
-	 * 31. Please do NOT define any SUPPORTED_* or ADVERTISED_*
-	 * macro for bits > 31. The only way to use indices > 31 is to
-	 * use the new ETHTOOL_GLINKSETTINGS/ETHTOOL_SLINKSETTINGS API.
+	/* must be last entry */
+	__ETHTOOL_LINK_MODE_MASK_NBITS,
+
+	/* RHEL: Last known value for RHEL 8.0 needed for emulation layer
+         * for old binary drivers compiled against RHEL 8.0
+         */
+	__ETHTOOL_LINK_MODE_LAST_RH80 = ETHTOOL_LINK_MODE_FEC_BASER_BIT,
+
+#ifdef __GENKSYMS__
+	/* RHEL: Enum __ETHTOOL_LINK_MODE_LAST and its value is protected by
+	 * KABI checker.
+	 * We also need to define __ETHTOOL_LINK_MODE_MASK_NBITS as macro
+	 * for KABI checker to preserve existing checksums of several
+	 * ethtool symbols.
 	 */
-
-	/* RHEL */
-	__ETHTOOL_LINK_MODE_LAST_RH80
-	  = ETHTOOL_LINK_MODE_FEC_BASER_BIT,
-
-	__ETHTOOL_LINK_MODE_LAST
-#ifndef __GENKSYMS__
-	  = ETHTOOL_LINK_MODE_200000baseCR4_Full_BIT,
-#else
-	  = __ETHTOOL_LINK_MODE_LAST_RH80,
+	__ETHTOOL_LINK_MODE_LAST = __ETHTOOL_LINK_MODE_LAST_RH80,
+#define __ETHTOOL_LINK_MODE_MASK_NBITS (__ETHTOOL_LINK_MODE_LAST + 1)
 #endif
 };
 

@@ -40,6 +40,7 @@
 #include "b44.h"
 
 #define DRV_MODULE_NAME		"b44"
+#define DRV_MODULE_VERSION	"2.0"
 #define DRV_DESCRIPTION		"Broadcom 44xx/47xx 10/100 PCI ethernet driver"
 
 #define B44_DEF_MSG_ENABLE	  \
@@ -96,6 +97,7 @@
 MODULE_AUTHOR("Felix Fietkau, Florian Schirmer, Pekka Pietikainen, David S. Miller");
 MODULE_DESCRIPTION(DRV_DESCRIPTION);
 MODULE_LICENSE("GPL");
+MODULE_VERSION(DRV_MODULE_VERSION);
 
 static int b44_debug = -1;	/* -1 == use B44_DEF_MSG_ENABLE as value */
 module_param(b44_debug, int, 0);
@@ -949,7 +951,7 @@ irq_ack:
 	return IRQ_RETVAL(handled);
 }
 
-static void b44_tx_timeout(struct net_device *dev)
+static void b44_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	struct b44 *bp = netdev_priv(dev);
 
@@ -1792,6 +1794,7 @@ static void b44_get_drvinfo (struct net_device *dev, struct ethtool_drvinfo *inf
 	struct ssb_bus *bus = bp->sdev->bus;
 
 	strlcpy(info->driver, DRV_MODULE_NAME, sizeof(info->driver));
+	strlcpy(info->version, DRV_MODULE_VERSION, sizeof(info->version));
 	switch (bus->bustype) {
 	case SSB_BUSTYPE_PCI:
 		strlcpy(info->bus_info, pci_name(bus->host_pci), sizeof(info->bus_info));
@@ -2346,6 +2349,8 @@ static int b44_init_one(struct ssb_device *sdev,
 	int err;
 
 	instance++;
+
+	pr_info_once("%s version %s\n", DRV_DESCRIPTION, DRV_MODULE_VERSION);
 
 	dev = alloc_etherdev(sizeof(*bp));
 	if (!dev) {

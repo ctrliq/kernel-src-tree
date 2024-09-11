@@ -102,7 +102,7 @@ static inline bool cpu_has_load_perf_global_ctrl(void)
 	       (vmcs_config.vmexit_ctrl & VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL);
 }
 
-static inline bool vmx_mpx_supported(void)
+static inline bool cpu_has_vmx_mpx(void)
 {
 	return (vmcs_config.vmexit_ctrl & VM_EXIT_CLEAR_BNDCFGS) &&
 		(vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_BNDCFGS);
@@ -145,11 +145,6 @@ static inline bool vmx_umip_emulated(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
 		SECONDARY_EXEC_DESC;
-}
-
-static inline bool vmx_pku_supported(void)
-{
-	return boot_cpu_has(X86_FEATURE_PKU);
 }
 
 static inline bool cpu_has_vmx_rdtscp(void)

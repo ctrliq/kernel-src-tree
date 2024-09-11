@@ -74,7 +74,7 @@ struct sys_reg_desc {
 #define REG_HIDDEN_GUEST	(1 << 1) /* hidden from guest */
 
 static __printf(2, 3)
-inline void print_sys_reg_msg(const struct sys_reg_params *p,
+void print_sys_reg_msg(const struct sys_reg_params *p,
 				       char *fmt, ...)
 {
 	va_list va;

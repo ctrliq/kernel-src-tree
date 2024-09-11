@@ -6,7 +6,7 @@
 
 usage()
 {
-	echo "process_configs.sh [ -n|-c|-t ] package_name kernel_version"
+	echo "process_configs.sh [ -n|-c|-t ] package_name kernel_version [cross_opts]"
 	echo "     -n: error on unset config options"
 	echo "     -c: error on mismatched config options"
 	echo "     -t: test run, do not overwrite original config"
@@ -77,7 +77,7 @@ function process_configs()
 	# assume we are in $source_tree/configs, need to get to top level
 	pushd $(switch_to_toplevel) &>/dev/null
 
-	for cfg in $SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}${SUBARCH}*.config
+	for cfg in $SCRIPT_DIR/${PACKAGE_NAME}${KVERREL}*.config
 	do
 		arch=$(head -1 $cfg | cut -b 3-)
 		cfgtmp="${cfg}.tmp"
@@ -86,7 +86,7 @@ function process_configs()
 
 		echo -n "Processing $cfg ... "
 
-		make ARCH=$arch KCONFIG_CONFIG=$cfgorig listnewconfig >& .listnewconfig
+		make ARCH=$arch ${CROSSOPTS} KCONFIG_CONFIG=$cfgorig listnewconfig >& .listnewconfig
 		grep -E 'CONFIG_' .listnewconfig > .newoptions
 		if test -n "$NEWOPTIONS" && test -s .newoptions
 		then
@@ -109,7 +109,7 @@ function process_configs()
 
 		rm .listnewconfig
 
-		make ARCH=$arch KCONFIG_CONFIG=$cfgorig oldnoconfig > /dev/null || exit 1
+		make ARCH=$arch ${CROSSOPTS} KCONFIG_CONFIG=$cfgorig oldnoconfig > /dev/null || exit 1
 		echo "# $arch" > ${cfgtmp}
 		cat "${cfgorig}" >> ${cfgtmp}
 		if test -n "$CHECKOPTIONS"
@@ -164,7 +164,7 @@ done
 
 PACKAGE_NAME="${1:-kernel}" # defines the package name used
 KVERREL="$(test -n "$2" && echo "-$2" || echo "")"
-SUBARCH="$(test -n "$3" && echo "-$3" || echo "")"
+CROSSOPTS="$3"
 SCRIPT="$(readlink -f $0)"
 OUTPUT_DIR="$PWD"
 SCRIPT_DIR="$(dirname $SCRIPT)"

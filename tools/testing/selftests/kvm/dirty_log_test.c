@@ -166,14 +166,13 @@ static void *vcpu_worker(void *data)
 			pages_count += TEST_PAGES_PER_LOOP;
 			generate_random_array(guest_array, TEST_PAGES_PER_LOOP);
 		} else {
-			TEST_ASSERT(false,
-				    "Invalid guest sync status: "
-				    "exit_reason=%s\n",
-				    exit_reason_str(run->exit_reason));
+			TEST_FAIL("Invalid guest sync status: "
+				  "exit_reason=%s\n",
+				  exit_reason_str(run->exit_reason));
 		}
 	}
 
-	DEBUG("Dirtied %"PRIu64" pages\n", pages_count);
+	pr_info("Dirtied %"PRIu64" pages\n", pages_count);
 
 	return NULL;
 }
@@ -251,6 +250,8 @@ static struct kvm_vm *create_vm(enum vm_guest_mode mode, uint32_t vcpuid,
 	struct kvm_vm *vm;
 	uint64_t extra_pg_pages = extra_mem_pages / 512 * 2;
 
+	pr_info("Testing guest mode: %s\n", vm_guest_mode_string(mode));
+
 	vm = _vm_create(mode, DEFAULT_GUEST_PHY_PAGES + extra_pg_pages, O_RDWR);
 	kvm_vm_elf_load(vm, program_invocation_name, 0, 0);
 #ifdef __x86_64__
@@ -294,10 +295,7 @@ static void run_test(enum vm_guest_mode mode, unsigned long iterations,
 	guest_num_pages = (1ul << (DIRTY_MEM_BITS -
 				   vm_get_page_shift(vm))) + 3;
 	guest_num_pages = vm_adjust_num_guest_pages(mode, guest_num_pages);
-#ifdef __s390x__
-	/* Round up to multiple of 1M (segment size) */
-	guest_num_pages = (guest_num_pages + 0xff) & ~0xffUL;
-#endif
+
 	host_page_size = getpagesize();
 	host_num_pages = vm_num_host_pages(mode, guest_num_pages);
 
@@ -314,7 +312,7 @@ static void run_test(enum vm_guest_mode mode, unsigned long iterations,
 	guest_test_phys_mem &= ~((1 << 20) - 1);
 #endif
 
-	DEBUG("guest physical test memory offset: 0x%lx\n", guest_test_phys_mem);
+	pr_info("guest physical test memory offset: 0x%lx\n", guest_test_phys_mem);
 
 	bmap = bitmap_alloc(host_num_pages);
 	host_bmap_track = bitmap_alloc(host_num_pages);
@@ -335,8 +333,7 @@ static void run_test(enum vm_guest_mode mode, unsigned long iterations,
 				    KVM_MEM_LOG_DIRTY_PAGES);
 
 	/* Do mapping for the dirty track memory slot */
-	virt_map(vm, guest_test_virt_mem, guest_test_phys_mem,
-		 guest_num_pages * guest_page_size, 0);
+	virt_map(vm, guest_test_virt_mem, guest_test_phys_mem, guest_num_pages, 0);
 
 	/* Cache the HVA pointer of the region */
 	host_test_mem = addr_gpa2hva(vm, (vm_paddr_t)guest_test_phys_mem);
@@ -379,9 +376,9 @@ static void run_test(enum vm_guest_mode mode, unsigned long iterations,
 	host_quit = true;
 	pthread_join(vcpu_thread, NULL);
 
-	DEBUG("Total bits checked: dirty (%"PRIu64"), clear (%"PRIu64"), "
-	      "track_next (%"PRIu64")\n", host_dirty_count, host_clear_count,
-	      host_track_next_count);
+	pr_info("Total bits checked: dirty (%"PRIu64"), clear (%"PRIu64"), "
+		"track_next (%"PRIu64")\n", host_dirty_count, host_clear_count,
+		host_track_next_count);
 
 	free(bmap);
 	free(host_bmap_track);
@@ -438,8 +435,7 @@ int main(int argc, char *argv[])
 	dirty_log_manual_caps =
 		kvm_check_cap(KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2);
 	if (!dirty_log_manual_caps) {
-		fprintf(stderr, "KVM_CLEAR_DIRTY_LOG not available, "
-				"skipping tests\n");
+		print_skip("KVM_CLEAR_DIRTY_LOG not available");
 		exit(KSFT_SKIP);
 	}
 	dirty_log_manual_caps &= (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE |
@@ -500,8 +496,8 @@ int main(int argc, char *argv[])
 	TEST_ASSERT(iterations > 2, "Iterations must be greater than two");
 	TEST_ASSERT(interval > 0, "Interval must be greater than zero");
 
-	DEBUG("Test iterations: %"PRIu64", interval: %"PRIu64" (ms)\n",
-	      iterations, interval);
+	pr_info("Test iterations: %"PRIu64", interval: %"PRIu64" (ms)\n",
+		iterations, interval);
 
 	srandom(time(0));
 

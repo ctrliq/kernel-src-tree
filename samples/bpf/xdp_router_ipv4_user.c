@@ -24,7 +24,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include "bpf_util.h"
-#include "libbpf.h"
+#include <bpf/libbpf.h>
 #include <sys/resource.h>
 #include <libgen.h>
 

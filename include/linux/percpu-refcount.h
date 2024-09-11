@@ -102,7 +102,7 @@ struct percpu_ref {
 	percpu_ref_func_t	*release;
 	percpu_ref_func_t	*confirm_switch;
 	bool			force_atomic:1;
-	bool			allow_reinit:1;
+	RH_KABI_FILL_HOLE(bool	allow_reinit:1)
 	struct rcu_head		rcu;
 };
 

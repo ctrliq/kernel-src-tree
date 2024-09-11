@@ -94,9 +94,10 @@ int main(int argc, char *argv[])
 
 	vcpu_set_cpuid(vm, VCPU_ID, kvm_get_supported_cpuid());
 
-	if (!kvm_check_cap(KVM_CAP_NESTED_STATE) ||
+	if (!nested_vmx_supported() ||
+	    !kvm_check_cap(KVM_CAP_NESTED_STATE) ||
 	    !kvm_check_cap(KVM_CAP_HYPERV_ENLIGHTENED_VMCS)) {
-		printf("capabilities not available, skipping test\n");
+		print_skip("Enlightened VMCS is unsupported");
 		exit(KSFT_SKIP);
 	}
 
@@ -118,20 +119,20 @@ int main(int argc, char *argv[])
 
 		switch (get_ucall(vm, VCPU_ID, &uc)) {
 		case UCALL_ABORT:
-			TEST_ASSERT(false, "%s at %s:%d", (const char *)uc.args[0],
-				    __FILE__, uc.args[1]);
+			TEST_FAIL("%s at %s:%ld", (const char *)uc.args[0],
+		      		  __FILE__, uc.args[1]);
 			/* NOT REACHED */
 		case UCALL_SYNC:
 			break;
 		case UCALL_DONE:
 			goto part1_done;
 		default:
-			TEST_ASSERT(false, "Unknown ucall %lu", uc.cmd);
+			TEST_FAIL("Unknown ucall %lu", uc.cmd);
 		}
 
 		/* UCALL_SYNC is handled here.  */
 		TEST_ASSERT(!strcmp((const char *)uc.args[0], "hello") &&
-			    uc.args[1] == stage, "Unexpected register values vmexit #%lx, got %lx",
+			    uc.args[1] == stage, "Stage %d: Unexpected register values vmexit, got %lx",
 			    stage, (ulong)uc.args[1]);
 
 		state = vcpu_save_state(vm, VCPU_ID);

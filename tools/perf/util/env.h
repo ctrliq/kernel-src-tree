@@ -4,8 +4,9 @@
 
 #include <linux/types.h>
 #include <linux/rbtree.h>
-#include "cpumap.h"
 #include "rwsem.h"
+
+struct perf_cpu_map;
 
 struct cpu_topology_map {
 	int	socket_id;
@@ -27,7 +28,7 @@ struct numa_node {
 	u32		 node;
 	u64		 mem_total;
 	u64		 mem_free;
-	struct cpu_map	*map;
+	struct perf_cpu_map	*map;
 };
 
 struct memory_node {
@@ -86,6 +87,12 @@ struct perf_env {
 		struct rb_root		btfs;
 		u32			btfs_cnt;
 	} bpf_progs;
+
+	/* same reason as above (for perf-top) */
+	struct {
+		struct rw_semaphore	lock;
+		struct rb_root		tree;
+	} cgroups;
 
 	/* For fast cpu to numa node lookup via perf_env__numa_node */
 	int			*numa_map;

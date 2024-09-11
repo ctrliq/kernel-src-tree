@@ -31,7 +31,7 @@
 #include <linux/acpi.h>
 #include <linux/ucs2_string.h>
 #include <linux/memblock.h>
-#include <linux/security.h>
+#include <linux/kernel.h>
 
 #include <asm/early_ioremap.h>
 
@@ -54,7 +54,11 @@ struct efi __read_mostly efi = {
 	.mem_attr_table		= EFI_INVALID_TABLE_ADDR,
 	.rng_seed		= EFI_INVALID_TABLE_ADDR,
 	.tpm_log		= EFI_INVALID_TABLE_ADDR,
+	.tpm_final_log		= EFI_INVALID_TABLE_ADDR,
 	.mem_reserve		= EFI_INVALID_TABLE_ADDR,
+#ifdef CONFIG_LOAD_UEFI_KEYS
+	.mokvar_table		= EFI_INVALID_TABLE_ADDR,
+#endif
 };
 EXPORT_SYMBOL(efi);
 
@@ -77,6 +81,11 @@ static unsigned long *efi_tables[] = {
 	&efi.mem_attr_table,
 #ifdef CONFIG_EFI_RCI2_TABLE
 	&rci2_table_phys,
+#endif
+	&efi.tpm_log,
+	&efi.tpm_final_log,
+#ifdef CONFIG_LOAD_UEFI_KEYS
+	&efi.mokvar_table,
 #endif
 };
 
@@ -105,6 +114,11 @@ bool efi_runtime_disabled(void)
 	return disable_runtime;
 }
 
+bool __pure __efi_soft_reserve_enabled(void)
+{
+	return !efi_enabled(EFI_MEM_NO_SOFT_RESERVE);
+}
+
 static int __init parse_efi_cmdline(char *str)
 {
 	if (!str) {
@@ -117,6 +131,9 @@ static int __init parse_efi_cmdline(char *str)
 
 	if (parse_option_str(str, "noruntime"))
 		disable_runtime = true;
+
+	if (parse_option_str(str, "nosoftreserve"))
+		set_bit(EFI_MEM_NO_SOFT_RESERVE, &efi.flags);
 
 	return 0;
 }
@@ -246,7 +263,7 @@ static void generic_ops_unregister(void)
 static char efivar_ssdt[EFIVAR_SSDT_NAME_MAX] __initdata;
 static int __init efivar_ssdt_setup(char *str)
 {
-	int ret = security_locked_down(LOCKDOWN_ACPI_TABLES);
+	int ret = kernel_is_locked_down("Modifying ACPI tables");
 
 	if (ret)
 		return ret;
@@ -317,7 +334,7 @@ static __init int efivar_ssdt_load(void)
 			goto free_data;
 		}
 
-		ret = acpi_load_table(data);
+		ret = acpi_load_table(data, NULL);
 		if (ret) {
 			pr_err("failed to load table: %d\n", ret);
 			goto free_data;
@@ -500,9 +517,13 @@ static __initdata efi_config_table_type_t common_tables[] = {
 	{EFI_MEMORY_ATTRIBUTES_TABLE_GUID, "MEMATTR", &efi.mem_attr_table},
 	{LINUX_EFI_RANDOM_SEED_TABLE_GUID, "RNG", &efi.rng_seed},
 	{LINUX_EFI_TPM_EVENT_LOG_GUID, "TPMEventLog", &efi.tpm_log},
+	{LINUX_EFI_TPM_FINAL_LOG_GUID, "TPMFinalLog", &efi.tpm_final_log},
 	{LINUX_EFI_MEMRESERVE_TABLE_GUID, "MEMRESERVE", &efi.mem_reserve},
 #ifdef CONFIG_EFI_RCI2_TABLE
 	{DELLEMC_EFI_RCI2_TABLE_GUID, NULL, &rci2_table_phys},
+#endif
+#ifdef CONFIG_LOAD_UEFI_KEYS
+	{LINUX_EFI_MOK_VARIABLE_TABLE_GUID, "MOKvar", &efi.mokvar_table},
 #endif
 	{NULL_GUID, NULL, NULL},
 };
@@ -1045,7 +1066,7 @@ int __ref efi_mem_reserve_persistent(phys_addr_t addr, u64 size)
 	/* first try to find a slot in an existing linked list entry */
 	for (prsv = efi_memreserve_root->next; prsv; prsv = rsv->next) {
 		rsv = memremap(prsv, sizeof(*rsv), MEMREMAP_WB);
-		index = __atomic_add_unless(&rsv->count, 1, rsv->size);
+		index = atomic_fetch_add_unless(&rsv->count, 1, rsv->size);
 		if (index < rsv->size) {
 			rsv->entry[index].base = addr;
 			rsv->entry[index].size = size;

@@ -429,6 +429,8 @@ static int s10_probe(struct platform_device *pdev)
 	struct fpga_manager *mgr;
 	int ret;
 
+	mark_tech_preview("Intel Stratix 10 SOC FPGA Manager", THIS_MODULE);
+
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;

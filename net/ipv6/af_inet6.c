@@ -63,6 +63,7 @@
 #endif
 #include <net/calipso.h>
 #include <net/seg6.h>
+#include <net/xfrm.h>
 
 #include <linux/uaccess.h>
 #include <linux/mroute6.h>
@@ -119,6 +120,11 @@ static int inet6_create(struct net *net, struct socket *sock, int protocol,
 	unsigned char answer_flags;
 	int try_loading_module = 0;
 	int err;
+
+	if (unlikely(protocol == IPPROTO_MPTCP_KERN))
+		return -EPROTONOSUPPORT;
+	if (unlikely(protocol == IPPROTO_MPTCP))
+		protocol = IPPROTO_MPTCP_KERN;
 
 	if (protocol < 0 || protocol >= IPPROTO_MAX)
 		return -EINVAL;
@@ -945,8 +951,13 @@ static const struct ipv6_stub ipv6_stub_impl = {
 	.fib6_lookup       = fib6_lookup,
 	.fib6_multipath_select = fib6_multipath_select,
 	.ip6_mtu_from_fib6 = ip6_mtu_from_fib6,
+	.fib6_rt_update	   = fib6_rt_update,
 	.udpv6_encap_enable = udpv6_encap_enable,
 	.ndisc_send_na = ndisc_send_na,
+#if IS_ENABLED(CONFIG_XFRM)
+	.xfrm6_udp_encap_rcv = xfrm6_udp_encap_rcv,
+	.xfrm6_rcv_encap = xfrm6_rcv_encap,
+#endif
 	.nd_tbl	= &nd_tbl,
 };
 

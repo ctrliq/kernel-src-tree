@@ -312,7 +312,6 @@ static snd_pcm_uframes_t snd_usbtv_pointer(struct snd_pcm_substream *substream)
 static const struct snd_pcm_ops snd_usbtv_pcm_ops = {
 	.open = snd_usbtv_pcm_open,
 	.close = snd_usbtv_pcm_close,
-	.ioctl = snd_pcm_lib_ioctl,
 	.prepare = snd_usbtv_prepare,
 	.trigger = snd_usbtv_card_trigger,
 	.pointer = snd_usbtv_pointer,
@@ -332,8 +331,8 @@ int usbtv_audio_init(struct usbtv *usbtv)
 	if (rv < 0)
 		return rv;
 
-	strlcpy(card->driver, usbtv->dev->driver->name, sizeof(card->driver));
-	strlcpy(card->shortname, "usbtv", sizeof(card->shortname));
+	strscpy(card->driver, usbtv->dev->driver->name, sizeof(card->driver));
+	strscpy(card->shortname, "usbtv", sizeof(card->shortname));
 	snprintf(card->longname, sizeof(card->longname),
 		"USBTV Audio at bus %d device %d", usbtv->udev->bus->busnum,
 		usbtv->udev->devnum);
@@ -346,7 +345,7 @@ int usbtv_audio_init(struct usbtv *usbtv)
 	if (rv < 0)
 		goto err;
 
-	strlcpy(pcm->name, "USBTV Audio Input", sizeof(pcm->name));
+	strscpy(pcm->name, "USBTV Audio Input", sizeof(pcm->name));
 	pcm->info_flags = 0;
 	pcm->private_data = usbtv;
 

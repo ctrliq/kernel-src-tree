@@ -9,6 +9,7 @@
 #include <linux/sched/task.h>
 #include <linux/cred.h>
 #include <linux/rh_kabi.h>
+#include <linux/posix-timers.h>
 
 /*
  * Types defining task->signal and task->sighand and APIs using them:
@@ -56,18 +57,14 @@ struct task_cputime_atomic {
 /**
  * struct thread_group_cputimer - thread group interval timer counts
  * @cputime_atomic:	atomic thread group interval timers.
- * @running:		true when there are timers running and
- *			@cputime_atomic receives updates.
- * @checking_timer:	true when a thread in the group is in the
- *			process of checking for thread group timers.
  *
  * This structure contains the version of task_cputime, above, that is
  * used for thread group CPU timer calculations.
  */
 struct thread_group_cputimer {
 	struct task_cputime_atomic cputime_atomic;
-	bool running;
-	bool checking_timer;
+	RH_KABI_DEPRECATE(bool, running)
+	RH_KABI_DEPRECATE(bool, checking_timer)
 };
 
 struct multiprocess_signals {
@@ -146,10 +143,10 @@ struct signal_struct {
 	struct thread_group_cputimer cputimer;
 
 	/* Earliest-expiration cache. */
-	struct task_cputime cputime_expires;
+	RH_KABI_DEPRECATE(struct task_cputime, cputime_expires)
 
-	struct list_head cpu_timers[3];
-
+	/* Empty if CONFIG_POSIX_TIMERS=n */
+	RH_KABI_DEPRECATE(struct list_head, cpu_timers[3])
 #endif
 
 	/* PID/PID hash table linkage. */
@@ -245,6 +242,7 @@ struct signal_struct {
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
+	RH_KABI_EXTEND(struct posix_cputimers posix_cputimers)
 } __randomize_layout;
 
 /*

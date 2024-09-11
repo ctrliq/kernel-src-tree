@@ -1,9 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * KVM_GET/SET_* tests
  *
  * Copyright (C) 2018, Red Hat, Inc.
- *
- * This work is licensed under the terms of the GNU GPL, version 2.
  *
  * Tests for vCPU state save/restore, including nested guest state.
  */
@@ -172,15 +171,16 @@ int main(int argc, char *argv[])
 	vcpu_regs_get(vm, VCPU_ID, &regs1);
 
 	if (kvm_check_cap(KVM_CAP_NESTED_STATE)) {
-		if (kvm_get_supported_cpuid_entry(0x80000001)->ecx & CPUID_SVM)
+		if (nested_svm_supported())
 			vcpu_alloc_svm(vm, &nested_gva);
-		else
+		else if (nested_vmx_supported())
 			vcpu_alloc_vmx(vm, &nested_gva);
-		vcpu_args_set(vm, VCPU_ID, 1, nested_gva);
-	} else {
-		printf("will skip nested state checks\n");
-		vcpu_args_set(vm, VCPU_ID, 1, 0);
 	}
+
+	if (!nested_gva)
+		pr_info("will skip nested state checks\n");
+
+	vcpu_args_set(vm, VCPU_ID, 1, nested_gva);
 
 	for (stage = 1;; stage++) {
 		_vcpu_run(vm, VCPU_ID);
@@ -191,20 +191,20 @@ int main(int argc, char *argv[])
 
 		switch (get_ucall(vm, VCPU_ID, &uc)) {
 		case UCALL_ABORT:
-			TEST_ASSERT(false, "%s at %s:%d", (const char *)uc.args[0],
-				    __FILE__, uc.args[1]);
+			TEST_FAIL("%s at %s:%ld", (const char *)uc.args[0],
+			       	  __FILE__, uc.args[1]);
 			/* NOT REACHED */
 		case UCALL_SYNC:
 			break;
 		case UCALL_DONE:
 			goto done;
 		default:
-			TEST_ASSERT(false, "Unknown ucall %lu", uc.cmd);
+			TEST_FAIL("Unknown ucall %lu", uc.cmd);
 		}
 
 		/* UCALL_SYNC is handled here.  */
 		TEST_ASSERT(!strcmp((const char *)uc.args[0], "hello") &&
-			    uc.args[1] == stage, "Unexpected register values vmexit #%lx, got %lx",
+			    uc.args[1] == stage, "Stage %d: Unexpected register values vmexit, got %lx",
 			    stage, (ulong)uc.args[1]);
 
 		state = vcpu_save_state(vm, VCPU_ID);

@@ -16,11 +16,14 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <math.h>
+#include <linux/string.h>
 #include <linux/zalloc.h>
 
 #include "asm/bug.h"
 
 #include "debug.h"
+#include "dso.h"
+#include "event.h"
 #include "hist.h"
 #include "sort.h"
 #include "machine.h"
@@ -28,6 +31,7 @@
 #include "callchain.h"
 #include "branch.h"
 #include "symbol.h"
+#include "../perf.h"
 
 #define CALLCHAIN_PARAM_DEFAULT			\
 	.mode		= CHAIN_GRAPH_ABS,	\
@@ -1077,7 +1081,7 @@ int callchain_cursor_append(struct callchain_cursor *cursor,
 
 int sample__resolve_callchain(struct perf_sample *sample,
 			      struct callchain_cursor *cursor, struct symbol **parent,
-			      struct perf_evsel *evsel, struct addr_location *al,
+			      struct evsel *evsel, struct addr_location *al,
 			      int max_stack)
 {
 	if (sample->callchain == NULL && !symbol_conf.show_branchflag_count)
@@ -1102,6 +1106,7 @@ int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *samp
 int fill_callchain_info(struct addr_location *al, struct callchain_cursor_node *node,
 			bool hide_unresolved)
 {
+	al->maps = node->ms.maps;
 	al->map = node->ms.map;
 	al->sym = node->ms.sym;
 	al->srcline = node->srcline;
@@ -1114,8 +1119,8 @@ int fill_callchain_info(struct addr_location *al, struct callchain_cursor_node *
 			goto out;
 	}
 
-	if (al->mg == &al->mg->machine->kmaps) {
-		if (machine__is_host(al->mg->machine)) {
+	if (al->maps == &al->maps->machine->kmaps) {
+		if (machine__is_host(al->maps->machine)) {
 			al->cpumode = PERF_RECORD_MISC_KERNEL;
 			al->level = 'k';
 		} else {
@@ -1123,7 +1128,7 @@ int fill_callchain_info(struct addr_location *al, struct callchain_cursor_node *
 			al->level = 'g';
 		}
 	} else {
-		if (machine__is_host(al->mg->machine)) {
+		if (machine__is_host(al->maps->machine)) {
 			al->cpumode = PERF_RECORD_MISC_USER;
 			al->level = '.';
 		} else if (perf_guest) {

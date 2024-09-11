@@ -184,6 +184,14 @@ struct ext4_map_blocks {
 };
 
 /*
+ * Block validity checking, system zone rbtree.
+ */
+struct ext4_system_blocks {
+	struct rb_root root;
+	struct rcu_head rcu;
+};
+
+/*
  * Flags for ext4_io_end->flags
  */
 #define	EXT4_IO_END_UNWRITTEN	0x0001
@@ -833,7 +841,6 @@ do {										\
 		}								\
 	else	{\
 		(raw_inode)->xtime = cpu_to_le32(clamp_t(int32_t, (inode)->xtime.tv_sec, S32_MIN, S32_MAX));	\
-		ext4_warning_inode(inode, "inode does not support timestamps beyond 2038"); \
 	} \
 } while (0)
 
@@ -1316,7 +1323,8 @@ struct ext4_super_block {
 	__u8	s_lastcheck_hi;
 	__u8	s_first_error_time_hi;
 	__u8	s_last_error_time_hi;
-	__u8	s_pad[2];
+	__u8	s_first_error_errcode;
+	__u8    s_last_error_errcode;
 	__le32	s_reserved[96];		/* Padding to the end of the block */
 	__le32	s_checksum;		/* crc32c(superblock) */
 };
@@ -1362,7 +1370,7 @@ struct ext4_sb_info {
 	loff_t s_bitmap_maxbytes;	/* max bytes for bitmap files */
 	struct buffer_head * s_sbh;	/* Buffer containing the super block */
 	struct ext4_super_block *s_es;	/* Pointer to the super block in the buffer */
-	struct buffer_head **s_group_desc;
+	struct buffer_head * __rcu *s_group_desc;
 	unsigned int s_mount_opt;
 	unsigned int s_mount_opt2;
 	unsigned int s_mount_flags;
@@ -1407,7 +1415,7 @@ struct ext4_sb_info {
 	int s_jquota_fmt;			/* Format of quota to use */
 #endif
 	unsigned int s_want_extra_isize; /* New inodes should reserve # bytes */
-	struct rb_root system_blks;
+	struct ext4_system_blocks __rcu *system_blks;
 
 #ifdef EXTENTS_STATS
 	/* ext4 extents stats */
@@ -1470,7 +1478,7 @@ struct ext4_sb_info {
 	unsigned int s_extent_max_zeroout_kb;
 
 	unsigned int s_log_groups_per_flex;
-	struct flex_groups *s_flex_groups;
+	struct flex_groups * __rcu *s_flex_groups;
 	ext4_group_t s_flex_groups_allocated;
 
 	/* workqueue for reserved extent conversions (buffered io) */
@@ -1533,6 +1541,49 @@ static inline int ext4_valid_inum(struct super_block *sb, unsigned long ino)
 		(ino >= EXT4_FIRST_INO(sb) &&
 		 ino <= le32_to_cpu(EXT4_SB(sb)->s_es->s_inodes_count));
 }
+
+/*
+ * Returns: sbi->field[index]
+ * Used to access an array element from the following sbi fields which require
+ * rcu protection to avoid dereferencing an invalid pointer due to reassignment
+ * - s_group_desc
+ * - s_group_info
+ * - s_flex_group
+ */
+#define sbi_array_rcu_deref(sbi, field, index)				   \
+({									   \
+	typeof(*((sbi)->field)) _v;					   \
+	rcu_read_lock();						   \
+	_v = ((typeof(_v)*)rcu_dereference((sbi)->field))[index];	   \
+	rcu_read_unlock();						   \
+	_v;								   \
+})
+
+/*
+ * Error number codes for s_{first,last}_error_errno
+ *
+ * Linux errno numbers are architecture specific, so we need to translate
+ * them into something which is architecture independent.   We don't define
+ * codes for all errno's; just the ones which are most likely to be the cause
+ * of an ext4_error() call.
+ */
+#define EXT4_ERR_UNKNOWN	 1
+#define EXT4_ERR_EIO		 2
+#define EXT4_ERR_ENOMEM		 3
+#define EXT4_ERR_EFSBADCRC	 4
+#define EXT4_ERR_EFSCORRUPTED	 5
+#define EXT4_ERR_ENOSPC		 6
+#define EXT4_ERR_ENOKEY		 7
+#define EXT4_ERR_EROFS		 8
+#define EXT4_ERR_EFBIG		 9
+#define EXT4_ERR_EEXIST		10
+#define EXT4_ERR_ERANGE		11
+#define EXT4_ERR_EOVERFLOW	12
+#define EXT4_ERR_EBUSY		13
+#define EXT4_ERR_ENOTDIR	14
+#define EXT4_ERR_ENOTEMPTY	15
+#define EXT4_ERR_ESHUTDOWN	16
+#define EXT4_ERR_EFAULT		17
 
 /*
  * Inode dynamic state flags
@@ -2553,6 +2604,7 @@ extern int ext4_generic_delete_entry(handle_t *handle,
 extern bool ext4_empty_dir(struct inode *inode);
 
 /* resize.c */
+extern void ext4_kvfree_array_rcu(void *to_free);
 extern int ext4_group_add(struct super_block *sb,
 				struct ext4_new_group_data *input);
 extern int ext4_group_extend(struct super_block *sb,
@@ -2576,19 +2628,19 @@ extern void ext4_mark_group_bitmap_corrupted(struct super_block *sb,
 					     ext4_group_t block_group,
 					     unsigned int flags);
 
-extern __printf(4, 5)
-void __ext4_error(struct super_block *, const char *, unsigned int,
+extern __printf(6, 7)
+void __ext4_error(struct super_block *, const char *, unsigned int, int, __u64,
 		  const char *, ...);
-extern __printf(5, 6)
-void __ext4_error_inode(struct inode *, const char *, unsigned int, ext4_fsblk_t,
-		      const char *, ...);
+extern __printf(6, 7)
+void __ext4_error_inode(struct inode *, const char *, unsigned int,
+			ext4_fsblk_t, int, const char *, ...);
 extern __printf(5, 6)
 void __ext4_error_file(struct file *, const char *, unsigned int, ext4_fsblk_t,
 		     const char *, ...);
 extern void __ext4_std_error(struct super_block *, const char *,
 			     unsigned int, int);
-extern __printf(4, 5)
-void __ext4_abort(struct super_block *, const char *, unsigned int,
+extern __printf(5, 6)
+void __ext4_abort(struct super_block *, const char *, unsigned int, int,
 		  const char *, ...);
 extern __printf(4, 5)
 void __ext4_warning(struct super_block *, const char *, unsigned int,
@@ -2609,8 +2661,12 @@ void __ext4_grp_locked_error(const char *, unsigned int,
 #define EXT4_ERROR_INODE(inode, fmt, a...) \
 	ext4_error_inode((inode), __func__, __LINE__, 0, (fmt), ## a)
 
-#define EXT4_ERROR_INODE_BLOCK(inode, block, fmt, a...)			\
-	ext4_error_inode((inode), __func__, __LINE__, (block), (fmt), ## a)
+#define EXT4_ERROR_INODE_ERR(inode, err, fmt, a...)			\
+	__ext4_error_inode((inode), __func__, __LINE__, 0, (err), (fmt), ## a)
+
+#define ext4_error_inode_block(inode, block, err, fmt, a...)		\
+	__ext4_error_inode((inode), __func__, __LINE__, (block), (err),	\
+			   (fmt), ## a)
 
 #define EXT4_ERROR_FILE(file, block, fmt, a...)				\
 	ext4_error_file((file), __func__, __LINE__, (block), (fmt), ## a)
@@ -2618,13 +2674,18 @@ void __ext4_grp_locked_error(const char *, unsigned int,
 #ifdef CONFIG_PRINTK
 
 #define ext4_error_inode(inode, func, line, block, fmt, ...)		\
-	__ext4_error_inode(inode, func, line, block, fmt, ##__VA_ARGS__)
+	__ext4_error_inode(inode, func, line, block, 0, fmt, ##__VA_ARGS__)
+#define ext4_error_inode_err(inode, func, line, block, err, fmt, ...)	\
+	__ext4_error_inode((inode), (func), (line), (block), 		\
+			   (err), (fmt), ##__VA_ARGS__)
 #define ext4_error_file(file, func, line, block, fmt, ...)		\
 	__ext4_error_file(file, func, line, block, fmt, ##__VA_ARGS__)
 #define ext4_error(sb, fmt, ...)					\
-	__ext4_error(sb, __func__, __LINE__, fmt, ##__VA_ARGS__)
-#define ext4_abort(sb, fmt, ...)					\
-	__ext4_abort(sb, __func__, __LINE__, fmt, ##__VA_ARGS__)
+	__ext4_error((sb), __func__, __LINE__, 0, 0, (fmt), ##__VA_ARGS__)
+#define ext4_error_err(sb, err, fmt, ...)				\
+	__ext4_error((sb), __func__, __LINE__, (err), 0, (fmt), ##__VA_ARGS__)
+#define ext4_abort(sb, err, fmt, ...)					\
+	__ext4_abort((sb), __func__, __LINE__, (err), (fmt), ##__VA_ARGS__)
 #define ext4_warning(sb, fmt, ...)					\
 	__ext4_warning(sb, __func__, __LINE__, fmt, ##__VA_ARGS__)
 #define ext4_warning_inode(inode, fmt, ...)				\
@@ -2642,7 +2703,12 @@ void __ext4_grp_locked_error(const char *, unsigned int,
 #define ext4_error_inode(inode, func, line, block, fmt, ...)		\
 do {									\
 	no_printk(fmt, ##__VA_ARGS__);					\
-	__ext4_error_inode(inode, "", 0, block, " ");			\
+	__ext4_error_inode(inode, "", 0, block, 0, " ");		\
+} while (0)
+#define ext4_error_inode_err(inode, func, line, block, err, fmt, ...)	\
+do {									\
+	no_printk(fmt, ##__VA_ARGS__);					\
+	__ext4_error_inode(inode, "", 0, block, err, " ");		\
 } while (0)
 #define ext4_error_file(file, func, line, block, fmt, ...)		\
 do {									\
@@ -2652,12 +2718,17 @@ do {									\
 #define ext4_error(sb, fmt, ...)					\
 do {									\
 	no_printk(fmt, ##__VA_ARGS__);					\
-	__ext4_error(sb, "", 0, " ");					\
+	__ext4_error(sb, "", 0, 0, 0, " ");				\
 } while (0)
-#define ext4_abort(sb, fmt, ...)					\
+#define ext4_error_err(sb, err, fmt, ...)				\
 do {									\
 	no_printk(fmt, ##__VA_ARGS__);					\
-	__ext4_abort(sb, "", 0, " ");					\
+	__ext4_error(sb, "", 0, err, 0, " ");				\
+} while (0)
+#define ext4_abort(sb, err, fmt, ...)					\
+do {									\
+	no_printk(fmt, ##__VA_ARGS__);					\
+	__ext4_abort(sb, "", 0, err, " ");				\
 } while (0)
 #define ext4_warning(sb, fmt, ...)					\
 do {									\

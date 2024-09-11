@@ -217,7 +217,6 @@ struct backing_dev_info {
 	struct radix_tree_root cgwb_tree; /* radix tree of active cgroup wbs */
 	struct rb_root cgwb_congested_tree; /* their congested states */
 	struct mutex cgwb_release_mutex;  /* protect shutdown of wb structs */
-	struct rw_semaphore wb_switch_rwsem; /* no cgwb switch while syncing */
 #else
 	struct bdi_writeback_congested *wb_congested;
 #endif
@@ -232,11 +231,15 @@ struct backing_dev_info {
 	struct dentry *debug_dir;
 	struct dentry *debug_stats;
 #endif
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
+
+	/* no cgwb switch while syncing */
+	RH_KABI_USE(1, struct rw_semaphore *wb_switch_rwsem)
+	RH_KABI_USE(2, char *dev_name)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 };
+
+#define BDI_DEV_NAME_LEN 64
 
 enum {
 	BLK_RW_ASYNC	= 0,

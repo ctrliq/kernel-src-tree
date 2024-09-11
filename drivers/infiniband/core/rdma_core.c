@@ -74,7 +74,7 @@ static int uverbs_try_lock_object(struct ib_uobject *uobj,
 	 */
 	switch (mode) {
 	case UVERBS_LOOKUP_READ:
-		return __atomic_add_unless(&uobj->usecnt, 1, -1) == -1 ?
+		return atomic_fetch_add_unless(&uobj->usecnt, 1, -1) == -1 ?
 			-EBUSY : 0;
 	case UVERBS_LOOKUP_WRITE:
 		/* lock is exclusive */
@@ -459,7 +459,8 @@ alloc_begin_fd_uobject(const struct uverbs_api_object *obj,
 	struct ib_uobject *uobj;
 	struct file *filp;
 
-	if (WARN_ON(fd_type->fops->release != &uverbs_uobject_fd_release))
+	if (WARN_ON(fd_type->fops->release != &uverbs_uobject_fd_release &&
+		    fd_type->fops->release != &uverbs_async_event_release))
 		return ERR_PTR(-EINVAL);
 
 	new_fd = get_unused_fd_flags(O_CLOEXEC);
@@ -806,6 +807,7 @@ static void ufile_destroy_ucontext(struct ib_uverbs_file *ufile,
 	rdma_restrack_del(&ucontext->res);
 
 	ib_dev->ops.dealloc_ucontext(ucontext);
+	WARN_ON(!xa_empty(&ucontext->mmap_xa));
 	kfree(ucontext);
 
 	ufile->ucontext = NULL;

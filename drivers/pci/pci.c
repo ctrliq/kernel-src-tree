@@ -172,6 +172,29 @@ unsigned char pci_bus_max_busnr(struct pci_bus *bus)
 }
 EXPORT_SYMBOL_GPL(pci_bus_max_busnr);
 
+/**
+ * pci_status_get_and_clear_errors - return and clear error bits in PCI_STATUS
+ * @pdev: the PCI device
+ *
+ * Returns error bits set in PCI_STATUS and clears them.
+ */
+int pci_status_get_and_clear_errors(struct pci_dev *pdev)
+{
+	u16 status;
+	int ret;
+
+	ret = pci_read_config_word(pdev, PCI_STATUS, &status);
+	if (ret != PCIBIOS_SUCCESSFUL)
+		return -EIO;
+
+	status &= PCI_STATUS_ERROR_BITS;
+	if (status)
+		pci_write_config_word(pdev, PCI_STATUS, status);
+
+	return status;
+}
+EXPORT_SYMBOL_GPL(pci_status_get_and_clear_errors);
+
 #ifdef CONFIG_HAS_IOMEM
 void __iomem *pci_ioremap_bar(struct pci_dev *pdev, int bar)
 {
@@ -716,7 +739,7 @@ struct resource *pci_find_resource(struct pci_dev *dev, struct resource *res)
 {
 	int i;
 
-	for (i = 0; i < PCI_ROM_RESOURCE; i++) {
+	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
 		struct resource *r = &dev->resource[i];
 
 		if (r->start && resource_contains(r, res))
@@ -1536,7 +1559,7 @@ void pci_restore_state(struct pci_dev *dev)
 	pci_restore_rebar_state(dev);
 	pci_restore_dpc_state(dev);
 
-	pci_cleanup_aer_error_status_regs(dev);
+	pci_aer_clear_status(dev);
 	pci_restore_aer_state(dev);
 
 	pci_restore_config_space(dev);
@@ -3832,7 +3855,7 @@ void pci_release_selected_regions(struct pci_dev *pdev, int bars)
 {
 	int i;
 
-	for (i = 0; i < 6; i++)
+	for (i = 0; i < PCI_STD_NUM_BARS; i++)
 		if (bars & (1 << i))
 			pci_release_region(pdev, i);
 }
@@ -3843,7 +3866,7 @@ static int __pci_request_selected_regions(struct pci_dev *pdev, int bars,
 {
 	int i;
 
-	for (i = 0; i < 6; i++)
+	for (i = 0; i < PCI_STD_NUM_BARS; i++)
 		if (bars & (1 << i))
 			if (__pci_request_region(pdev, i, res_name, excl))
 				goto err_out;
@@ -3891,7 +3914,7 @@ EXPORT_SYMBOL(pci_request_selected_regions_exclusive);
 
 void pci_release_regions(struct pci_dev *pdev)
 {
-	pci_release_selected_regions(pdev, (1 << 6) - 1);
+	pci_release_selected_regions(pdev, (1 << PCI_STD_NUM_BARS) - 1);
 }
 EXPORT_SYMBOL(pci_release_regions);
 
@@ -3910,7 +3933,8 @@ EXPORT_SYMBOL(pci_release_regions);
  */
 int pci_request_regions(struct pci_dev *pdev, const char *res_name)
 {
-	return pci_request_selected_regions(pdev, ((1 << 6) - 1), res_name);
+	return pci_request_selected_regions(pdev,
+			((1 << PCI_STD_NUM_BARS) - 1), res_name);
 }
 EXPORT_SYMBOL(pci_request_regions);
 
@@ -3932,7 +3956,7 @@ EXPORT_SYMBOL(pci_request_regions);
 int pci_request_regions_exclusive(struct pci_dev *pdev, const char *res_name)
 {
 	return pci_request_selected_regions_exclusive(pdev,
-					((1 << 6) - 1), res_name);
+				((1 << PCI_STD_NUM_BARS) - 1), res_name);
 }
 EXPORT_SYMBOL(pci_request_regions_exclusive);
 
@@ -5816,7 +5840,9 @@ enum pci_bus_speed pcie_get_speed_cap(struct pci_dev *dev)
 	 */
 	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP2, &lnkcap2);
 	if (lnkcap2) { /* PCIe r3.0-compliant */
-		if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_16_0GB)
+		if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_32_0GB)
+			return PCIE_SPEED_32_0GT;
+		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_16_0GB)
 			return PCIE_SPEED_16_0GT;
 		else if (lnkcap2 & PCI_EXP_LNKCAP2_SLS_8_0GB)
 			return PCIE_SPEED_8_0GT;
@@ -6110,6 +6136,18 @@ struct pci_dev __weak *pci_real_dma_dev(struct pci_dev *dev)
 resource_size_t __weak pcibios_default_alignment(void)
 {
 	return 0;
+}
+
+/*
+ * Arches that don't want to expose struct resource to userland as-is in
+ * sysfs and /proc can implement their own pci_resource_to_user().
+ */
+void __weak pci_resource_to_user(const struct pci_dev *dev, int bar,
+				 const struct resource *rsrc,
+				 resource_size_t *start, resource_size_t *end)
+{
+	*start = rsrc->start;
+	*end = rsrc->end;
 }
 
 static char *resource_alignment_param;

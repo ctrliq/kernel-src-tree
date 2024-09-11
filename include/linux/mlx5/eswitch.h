@@ -70,6 +70,7 @@ u16 mlx5_eswitch_get_total_vports(const struct mlx5_core_dev *dev);
 enum devlink_eswitch_encap_mode
 mlx5_eswitch_get_encap_mode(const struct mlx5_core_dev *dev);
 
+bool mlx5_eswitch_reg_c1_loopback_enabled(const struct mlx5_eswitch *esw);
 bool mlx5_eswitch_vport_match_metadata_enabled(const struct mlx5_eswitch *esw);
 
 /* Reg C0 usage:
@@ -84,6 +85,8 @@ bool mlx5_eswitch_vport_match_metadata_enabled(const struct mlx5_eswitch *esw);
 #define ESW_SOURCE_PORT_METADATA_BITS (ESW_VHCA_ID_BITS + ESW_VPORT_BITS)
 #define ESW_SOURCE_PORT_METADATA_OFFSET (32 - ESW_SOURCE_PORT_METADATA_BITS)
 #define ESW_CHAIN_TAG_METADATA_BITS (32 - ESW_SOURCE_PORT_METADATA_BITS)
+#define ESW_CHAIN_TAG_METADATA_MASK GENMASK(ESW_CHAIN_TAG_METADATA_BITS - 1,\
+					    0)
 
 static inline u32 mlx5_eswitch_get_vport_metadata_mask(void)
 {
@@ -105,6 +108,12 @@ mlx5_eswitch_get_encap_mode(const struct mlx5_core_dev *dev)
 {
 	return DEVLINK_ESWITCH_ENCAP_MODE_NONE;
 }
+
+static inline bool
+mlx5_eswitch_reg_c1_loopback_enabled(const struct mlx5_eswitch *esw)
+{
+	return false;
+};
 
 static inline bool
 mlx5_eswitch_vport_match_metadata_enabled(const struct mlx5_eswitch *esw)

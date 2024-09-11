@@ -39,6 +39,8 @@
 #include "blk-mq-sched.h"
 #include "blk-rq-qos.h"
 
+static enum cpuhp_state blk_mq_online;
+
 static void blk_mq_poll_stats_start(struct request_queue *q);
 static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
 
@@ -269,7 +271,7 @@ static inline bool blk_mq_need_time_stamp(struct request *rq)
 }
 
 static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
-		unsigned int tag, unsigned int op)
+		unsigned int tag, u64 alloc_time_ns)
 {
 	struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
 	struct request *rq = tags->static_rqs[tag];
@@ -293,7 +295,7 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 	rq->mq_ctx = data->ctx;
 	rq->mq_hctx = data->hctx;
 	rq->rq_flags = rq_flags;
-	rq->cmd_flags = op;
+	rq->cmd_flags = data->cmd_flags;
 	if (data->flags & BLK_MQ_REQ_PREEMPT)
 		rq->rq_flags |= RQF_PREEMPT;
 	if (blk_queue_io_stat(data->q))
@@ -303,12 +305,15 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 	RB_CLEAR_NODE(&rq->rb_node);
 	rq->rq_disk = NULL;
 	rq->part = NULL;
+#ifdef CONFIG_BLK_RQ_ALLOC_TIME
+	rq_aux(rq)->alloc_time_ns = alloc_time_ns;
+#endif
 	if (blk_mq_need_time_stamp(rq))
 		rq->start_time_ns = ktime_get_ns();
 	else
 		rq->start_time_ns = 0;
 	rq->io_start_time_ns = 0;
-	rq->stats_sectors = 0;
+	rq_aux(rq)->stats_sectors = 0;
 	rq->nr_phys_segments = 0;
 #if defined(CONFIG_BLK_DEV_INTEGRITY)
 	rq->nr_integrity_segments = 0;
@@ -322,29 +327,37 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 	rq->end_io = NULL;
 	rq->end_io_data = NULL;
 
-	data->ctx->rq_dispatched[op_is_sync(op)]++;
+	data->ctx->rq_dispatched[op_is_sync(data->cmd_flags)]++;
 	refcount_set(&rq->ref, 1);
+
+	if (!op_is_flush(data->cmd_flags)) {
+		struct elevator_queue *e = data->q->elevator;
+
+		rq->elv.icq = NULL;
+		if (e && e->type->ops.prepare_request) {
+			if (e->type->icq_cache)
+				blk_mq_sched_assign_ioc(rq);
+
+			e->type->ops.prepare_request(rq, data->bio);
+			rq->rq_flags |= RQF_ELVPRIV;
+		}
+	}
+
+	data->hctx->queued++;
 	return rq;
 }
 
-static struct request *blk_mq_get_request(struct request_queue *q,
-					  struct bio *bio,
-					  struct blk_mq_alloc_data *data)
+static struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data)
 {
+	struct request_queue *q = data->q;
 	struct elevator_queue *e = q->elevator;
-	struct request *rq;
+	u64 alloc_time_ns = 0;
 	unsigned int tag;
-	bool clear_ctx_on_error = false;
 
-	blk_queue_enter_live(q);
-	data->q = q;
-	if (likely(!data->ctx)) {
-		data->ctx = blk_mq_get_ctx(q);
-		clear_ctx_on_error = true;
-	}
-	if (likely(!data->hctx))
-		data->hctx = blk_mq_map_queue(q, data->cmd_flags,
-						data->ctx);
+	/* alloc_time includes depth and tag waits */
+	if (blk_queue_rq_alloc_time(q))
+		alloc_time_ns = ktime_get_ns();
+
 	if (data->cmd_flags & REQ_NOWAIT)
 		data->flags |= BLK_MQ_REQ_NOWAIT;
 
@@ -360,37 +373,43 @@ static struct request *blk_mq_get_request(struct request_queue *q,
 		    e->type->ops.limit_depth &&
 		    !(data->flags & BLK_MQ_REQ_RESERVED))
 			e->type->ops.limit_depth(data->cmd_flags, data);
-	} else {
-		blk_mq_tag_busy(data->hctx);
 	}
 
+retry:
+	data->ctx = blk_mq_get_ctx(q);
+	data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
+	if (!(data->flags & BLK_MQ_REQ_INTERNAL))
+		blk_mq_tag_busy(data->hctx);
+
+	/*
+	 * Waiting allocations only fail because of an inactive hctx.  In that
+	 * case just retry the hctx assignment and tag allocation as CPU hotplug
+	 * should have migrated us to an online CPU by now.
+	 */
 	tag = blk_mq_get_tag(data);
 	if (tag == BLK_MQ_NO_TAG) {
-		if (clear_ctx_on_error)
-			data->ctx = NULL;
-		blk_queue_exit(q);
-		return NULL;
-	}
+		if (data->flags & BLK_MQ_REQ_NOWAIT)
+			return NULL;
 
-	rq = blk_mq_rq_ctx_init(data, tag, data->cmd_flags);
-	if (!op_is_flush(data->cmd_flags)) {
-		rq->elv.icq = NULL;
-		if (e && e->type->ops.prepare_request) {
-			if (e->type->icq_cache)
-				blk_mq_sched_assign_ioc(rq);
-
-			e->type->ops.prepare_request(rq, bio);
-			rq->rq_flags |= RQF_ELVPRIV;
-		}
+		/*
+		 * Give up the CPU and sleep for a random short time to ensure
+		 * that thread using a realtime scheduling class are migrated
+		 * off the the CPU, and thus off the hctx that is going away.
+		 */
+		msleep(3);
+		goto retry;
 	}
-	data->hctx->queued++;
-	return rq;
+	return blk_mq_rq_ctx_init(data, tag, alloc_time_ns);
 }
 
 struct request *blk_mq_alloc_request(struct request_queue *q, unsigned int op,
 		blk_mq_req_flags_t flags)
 {
-	struct blk_mq_alloc_data alloc_data = { .flags = flags, .cmd_flags = op };
+	struct blk_mq_alloc_data data = {
+		.q		= q,
+		.flags		= flags,
+		.cmd_flags	= op,
+	};
 	struct request *rq;
 	int ret;
 
@@ -398,24 +417,35 @@ struct request *blk_mq_alloc_request(struct request_queue *q, unsigned int op,
 	if (ret)
 		return ERR_PTR(ret);
 
-	rq = blk_mq_get_request(q, NULL, &alloc_data);
+	rq = __blk_mq_alloc_request(&data);
 	if (!rq)
-		return ERR_PTR(-EWOULDBLOCK);
-
+		goto out_queue_exit;
 	rq->__data_len = 0;
 	rq->__sector = (sector_t) -1;
 	rq->bio = rq->biotail = NULL;
 	return rq;
+out_queue_exit:
+	blk_queue_exit(q);
+	return ERR_PTR(-EWOULDBLOCK);
 }
 EXPORT_SYMBOL(blk_mq_alloc_request);
 
 struct request *blk_mq_alloc_request_hctx(struct request_queue *q,
 	unsigned int op, blk_mq_req_flags_t flags, unsigned int hctx_idx)
 {
-	struct blk_mq_alloc_data alloc_data = { .flags = flags, .cmd_flags = op };
-	struct request *rq;
+	struct blk_mq_alloc_data data = {
+		.q		= q,
+		.flags		= flags,
+		.cmd_flags	= op,
+	};
+	u64 alloc_time_ns = 0;
 	unsigned int cpu;
+	unsigned int tag;
 	int ret;
+
+	/* alloc_time includes depth and tag waits */
+	if (blk_queue_rq_alloc_time(q))
+		alloc_time_ns = ktime_get_ns();
 
 	/*
 	 * If the tag allocator sleeps we could get an allocation for a
@@ -423,7 +453,7 @@ struct request *blk_mq_alloc_request_hctx(struct request_queue *q,
 	 * allocator for this for the rare use case of a command tied to
 	 * a specific queue.
 	 */
-	if (WARN_ON_ONCE(!(flags & BLK_MQ_REQ_NOWAIT)))
+	if (WARN_ON_ONCE(!(flags & (BLK_MQ_REQ_NOWAIT | BLK_MQ_REQ_RESERVED))))
 		return ERR_PTR(-EINVAL);
 
 	if (hctx_idx >= q->nr_hw_queues)
@@ -437,21 +467,27 @@ struct request *blk_mq_alloc_request_hctx(struct request_queue *q,
 	 * Check if the hardware context is actually mapped to anything.
 	 * If not tell the caller that it should skip this queue.
 	 */
-	alloc_data.hctx = q->queue_hw_ctx[hctx_idx];
-	if (!blk_mq_hw_queue_mapped(alloc_data.hctx)) {
-		blk_queue_exit(q);
-		return ERR_PTR(-EXDEV);
-	}
-	cpu = cpumask_first_and(alloc_data.hctx->cpumask, cpu_online_mask);
-	alloc_data.ctx = __blk_mq_get_ctx(q, cpu);
+	ret = -EXDEV;
+	data.hctx = q->queue_hw_ctx[hctx_idx];
+	if (!blk_mq_hw_queue_mapped(data.hctx))
+		goto out_queue_exit;
+	cpu = cpumask_first_and(data.hctx->cpumask, cpu_online_mask);
+	data.ctx = __blk_mq_get_ctx(q, cpu);
 
-	rq = blk_mq_get_request(q, NULL, &alloc_data);
+	if (q->elevator)
+		data.flags |= BLK_MQ_REQ_INTERNAL;
+	else
+		blk_mq_tag_busy(data.hctx);
+
+	ret = -EWOULDBLOCK;
+	tag = blk_mq_get_tag(&data);
+	if (tag == BLK_MQ_NO_TAG)
+		goto out_queue_exit;
+	return blk_mq_rq_ctx_init(&data, tag, alloc_time_ns);
+
+out_queue_exit:
 	blk_queue_exit(q);
-
-	if (!rq)
-		return ERR_PTR(-EWOULDBLOCK);
-
-	return rq;
+	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(blk_mq_alloc_request_hctx);
 
@@ -650,7 +686,7 @@ void blk_mq_start_request(struct request *rq)
 
 	if (test_bit(QUEUE_FLAG_STATS, &q->queue_flags)) {
 		rq->io_start_time_ns = ktime_get_ns();
-		rq->stats_sectors = blk_rq_sectors(rq);
+		rq_aux(rq)->stats_sectors = blk_rq_sectors(rq);
 		rq->rq_flags |= RQF_STATS;
 		rq_qos_issue(q, rq);
 	}
@@ -671,7 +707,7 @@ void blk_mq_start_request(struct request *rq)
 
 #ifdef CONFIG_BLK_DEV_INTEGRITY
 	if (blk_integrity_rq(rq) && req_op(rq) == REQ_OP_WRITE)
-		q->integrity.profile->prepare_fn(rq);
+		q->integrity.profile->ext_ops->prepare_fn(rq);
 #endif
 }
 EXPORT_SYMBOL(blk_mq_start_request);
@@ -1921,7 +1957,10 @@ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
 {
 	const int is_sync = op_is_sync(bio->bi_opf);
 	const int is_flush_fua = op_is_flush(bio->bi_opf);
-	struct blk_mq_alloc_data data = { .flags = 0};
+	struct blk_mq_alloc_data data = {
+		.q		= q,
+		.bio		= bio,
+	};
 	struct request *rq;
 	struct blk_plug *plug;
 	struct request *same_queue_rq = NULL;
@@ -1944,8 +1983,10 @@ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
 	rq_qos_throttle(q, bio);
 
 	data.cmd_flags = bio->bi_opf;
-	rq = blk_mq_get_request(q, bio, &data);
+	blk_queue_enter_live(q);
+	rq = __blk_mq_alloc_request(&data);
 	if (unlikely(!rq)) {
+		blk_queue_exit(q);
 		rq_qos_cleanup(q, bio);
 		if (bio->bi_opf & REQ_NOWAIT)
 			bio_wouldblock_error(bio);
@@ -2138,7 +2179,7 @@ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
 	 * rq_size is the size of the request plus driver payload, rounded
 	 * to the cacheline size
 	 */
-	rq_size = round_up(sizeof(struct request) + set->cmd_size,
+	rq_size = round_up(sizeof(struct request_aux) + sizeof(struct request) + set->cmd_size,
 				cache_line_size());
 	left = rq_size * depth;
 
@@ -2179,7 +2220,7 @@ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
 		to_do = min(entries_per_page, depth - i);
 		left -= to_do * rq_size;
 		for (j = 0; j < to_do; j++) {
-			struct request *rq = p;
+			struct request *rq = p + sizeof(struct request_aux);
 
 			tags->static_rqs[i] = rq;
 			if (blk_mq_init_request(set, rq, hctx_idx, node)) {
@@ -2198,6 +2239,86 @@ fail:
 	return -ENOMEM;
 }
 
+struct rq_iter_data {
+	struct blk_mq_hw_ctx *hctx;
+	bool has_rq;
+};
+
+static bool blk_mq_has_request(struct request *rq, void *data, bool reserved)
+{
+	struct rq_iter_data *iter_data = data;
+
+	if (rq->mq_hctx != iter_data->hctx)
+		return true;
+	iter_data->has_rq = true;
+	return false;
+}
+
+static bool blk_mq_hctx_has_requests(struct blk_mq_hw_ctx *hctx)
+{
+	struct blk_mq_tags *tags = hctx->sched_tags ?
+			hctx->sched_tags : hctx->tags;
+	struct rq_iter_data data = {
+		.hctx	= hctx,
+	};
+
+	blk_mq_all_tag_iter(tags, blk_mq_has_request, &data);
+	return data.has_rq;
+}
+
+static inline bool blk_mq_last_cpu_in_hctx(unsigned int cpu,
+		struct blk_mq_hw_ctx *hctx)
+{
+	if (cpumask_next_and(-1, hctx->cpumask, cpu_online_mask) != cpu)
+		return false;
+	if (cpumask_next_and(cpu, hctx->cpumask, cpu_online_mask) < nr_cpu_ids)
+		return false;
+	return true;
+}
+
+static int blk_mq_hctx_notify_offline(unsigned int cpu, struct hlist_node *node)
+{
+	struct blk_mq_hw_ctx *hctx = hlist_entry_safe(node,
+			struct blk_mq_hw_ctx, cpuhp_online);
+
+	if (!cpumask_test_cpu(cpu, hctx->cpumask) ||
+	    !blk_mq_last_cpu_in_hctx(cpu, hctx))
+		return 0;
+
+	/*
+	 * Prevent new request from being allocated on the current hctx.
+	 *
+	 * The smp_mb__after_atomic() Pairs with the implied barrier in
+	 * test_and_set_bit_lock in sbitmap_get().  Ensures the inactive flag is
+	 * seen once we return from the tag allocator.
+	 */
+	set_bit(BLK_MQ_S_INACTIVE, &hctx->state);
+	smp_mb__after_atomic();
+
+	/*
+	 * Try to grab a reference to the queue and wait for any outstanding
+	 * requests.  If we could not grab a reference the queue has been
+	 * frozen and there are no requests.
+	 */
+	if (percpu_ref_tryget(&hctx->queue->q_usage_counter)) {
+		while (blk_mq_hctx_has_requests(hctx))
+			msleep(5);
+		percpu_ref_put(&hctx->queue->q_usage_counter);
+	}
+
+	return 0;
+}
+
+static int blk_mq_hctx_notify_online(unsigned int cpu, struct hlist_node *node)
+{
+	struct blk_mq_hw_ctx *hctx = hlist_entry_safe(node,
+			struct blk_mq_hw_ctx, cpuhp_online);
+
+	if (cpumask_test_cpu(cpu, hctx->cpumask))
+		clear_bit(BLK_MQ_S_INACTIVE, &hctx->state);
+	return 0;
+}
+
 /*
  * 'cpu' is going away. splice any existing rq_list entries from this
  * software queue to the hw queue dispatch list, and ensure that it
@@ -2211,6 +2332,9 @@ static int blk_mq_hctx_notify_dead(unsigned int cpu, struct hlist_node *node)
 	enum hctx_type type;
 
 	hctx = hlist_entry_safe(node, struct blk_mq_hw_ctx, cpuhp_dead);
+	if (!cpumask_test_cpu(cpu, hctx->cpumask))
+		return 0;
+
 	ctx = __blk_mq_get_ctx(hctx->queue, cpu);
 	type = hctx->type;
 
@@ -2234,6 +2358,9 @@ static int blk_mq_hctx_notify_dead(unsigned int cpu, struct hlist_node *node)
 
 static void blk_mq_remove_cpuhp(struct blk_mq_hw_ctx *hctx)
 {
+	if (!(hctx->flags & BLK_MQ_F_STACKING) && blk_mq_online >= 0)
+		cpuhp_state_remove_instance_nocalls(blk_mq_online,
+						    &hctx->cpuhp_online);
 	cpuhp_state_remove_instance_nocalls(CPUHP_BLK_MQ_DEAD,
 					    &hctx->cpuhp_dead);
 }
@@ -2293,6 +2420,9 @@ static int blk_mq_init_hctx(struct request_queue *q,
 {
 	hctx->queue_num = hctx_idx;
 
+	if (!(hctx->flags & BLK_MQ_F_STACKING) && blk_mq_online >= 0)
+		cpuhp_state_add_instance_nocalls(blk_mq_online,
+				&hctx->cpuhp_online);
 	cpuhp_state_add_instance_nocalls(CPUHP_BLK_MQ_DEAD, &hctx->cpuhp_dead);
 
 	hctx->tags = set->tags[hctx_idx];
@@ -3421,15 +3551,14 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
 	kt = nsecs;
 
 	mode = HRTIMER_MODE_REL;
-	hrtimer_init_on_stack(&hs.timer, CLOCK_MONOTONIC, mode);
+	hrtimer_init_sleeper_on_stack(&hs, CLOCK_MONOTONIC, mode);
 	hrtimer_set_expires(&hs.timer, kt);
 
-	hrtimer_init_sleeper(&hs, current);
 	do {
 		if (blk_mq_rq_state(rq) == MQ_RQ_COMPLETE)
 			break;
 		set_current_state(TASK_UNINTERRUPTIBLE);
-		hrtimer_start_expires(&hs.timer, mode);
+		hrtimer_sleeper_start_expires(&hs, mode);
 		if (hs.task)
 			io_schedule();
 		hrtimer_cancel(&hs.timer);
@@ -3542,6 +3671,9 @@ static int __init blk_mq_init(void)
 {
 	cpuhp_setup_state_multi(CPUHP_BLK_MQ_DEAD, "block/mq:dead", NULL,
 				blk_mq_hctx_notify_dead);
+	blk_mq_online = cpuhp_setup_state_multi(CPUHP_AP_ONLINE_DYN, "block/mq:online",
+				blk_mq_hctx_notify_online,
+				blk_mq_hctx_notify_offline);
 	return 0;
 }
 subsys_initcall(blk_mq_init);

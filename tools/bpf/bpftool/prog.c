@@ -1564,6 +1564,7 @@ static int do_loadall(int argc, char **argv)
 
 static int do_profile(int argc, char **argv)
 {
+	p_err("bpftool prog profile command is not supported. Please build bpftool with clang >= 10.0.0");
 	return 0;
 }
 
@@ -2012,8 +2013,8 @@ static int do_help(int argc, char **argv)
 		"                 cgroup/bind4 | cgroup/bind6 | cgroup/post_bind4 |\n"
 		"                 cgroup/post_bind6 | cgroup/connect4 | cgroup/connect6 |\n"
 		"                 cgroup/sendmsg4 | cgroup/sendmsg6 | cgroup/recvmsg4 |\n"
-		"                 cgroup/recvmsg6 | cgroup/getsockopt |\n"
-		"                 cgroup/setsockopt }\n"
+		"                 cgroup/recvmsg6 | cgroup/getsockopt | cgroup/setsockopt |\n"
+		"                 struct_ops | fentry | fexit | freplace }\n"
 		"       ATTACH_TYPE := { msg_verdict | stream_verdict | stream_parser |\n"
 		"                        flow_dissector }\n"
 		"       METRIC := { cycles | instructions | l1d_loads | llc_misses }\n"

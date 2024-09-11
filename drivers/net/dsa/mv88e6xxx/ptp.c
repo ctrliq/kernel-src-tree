@@ -243,7 +243,8 @@ static int mv88e6xxx_ptp_enable_extts(struct mv88e6xxx_chip *chip,
 	/* Reject requests with unsupported flags */
 	if (rq->extts.flags & ~(PTP_ENABLE_FEATURE |
 				PTP_RISING_EDGE |
-				PTP_FALLING_EDGE))
+				PTP_FALLING_EDGE |
+				PTP_STRICT_FLAGS))
 		return -EOPNOTSUPP;
 
 	/* Reject requests to enable time stamping on both edges. */

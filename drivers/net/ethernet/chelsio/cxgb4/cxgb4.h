@@ -60,6 +60,7 @@
 
 #define CH_WARN(adap, fmt, ...) dev_warn(adap->pdev_dev, fmt, ## __VA_ARGS__)
 extern struct list_head adapter_list;
+extern struct list_head uld_list;
 extern struct mutex uld_mutex;
 
 /* Suspend an Ethernet Tx queue with fewer available descriptors than this.
@@ -640,6 +641,7 @@ enum {                                 /* adapter flags */
 enum {
 	ULP_CRYPTO_LOOKASIDE = 1 << 0,
 	ULP_CRYPTO_IPSEC_INLINE = 1 << 1,
+	ULP_CRYPTO_KTLS_INLINE  = 1 << 3,
 };
 
 struct rx_sw_desc;
@@ -821,6 +823,13 @@ struct sge_uld_txq_info {
 	struct sge_uld_txq *uldtxq; /* Txq's for ULD */
 	atomic_t users;		/* num users */
 	u16 ntxq;		/* # of egress uld queues */
+};
+
+/* struct to maintain ULD list to reallocate ULD resources on hotplug */
+struct cxgb4_uld_list {
+	struct cxgb4_uld_info uld_info;
+	struct list_head list_node;
+	enum cxgb4_uld uld_type;
 };
 
 enum sge_eosw_state {
@@ -1092,6 +1101,7 @@ struct adapter {
 
 	/* TC u32 offload */
 	struct cxgb4_tc_u32_table *tc_u32;
+	struct chcr_ktls chcr_ktls;
 	struct chcr_stats_debug chcr_stats;
 
 	/* TC flower offload */
@@ -2054,4 +2064,7 @@ int cxgb_open(struct net_device *dev);
 int cxgb_close(struct net_device *dev);
 void cxgb4_enable_rx(struct adapter *adap, struct sge_rspq *q);
 void cxgb4_quiesce_rx(struct sge_rspq *q);
+#ifdef CONFIG_CHELSIO_TLS_DEVICE
+int cxgb4_set_ktls_feature(struct adapter *adap, bool enable);
+#endif
 #endif /* __CXGB4_H__ */

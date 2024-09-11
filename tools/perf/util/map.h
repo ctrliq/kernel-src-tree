@@ -12,28 +12,14 @@
 #include <linux/types.h>
 
 struct dso;
-struct ip_callchain;
-struct ref_reloc_sym;
-struct map_groups;
+struct maps;
 struct machine;
-struct perf_evsel;
-
-/*
- * Data about backing storage DSO, comes from PERF_RECORD_MMAP2 meta events
- */
-struct dso_id {
-	u32	maj;
-	u32	min;
-	u64	ino;
-	u64	ino_generation;
-};
 
 struct map {
 	union {
 		struct rb_node	rb_node;
 		struct list_head node;
 	};
-	struct rb_node          rb_node_name;
 	u64			start;
 	u64			end;
 	bool			erange_warned:1;
@@ -48,7 +34,6 @@ struct map {
 	u64			(*unmap_ip)(struct map *, u64);
 
 	struct dso		*dso;
-	struct dso_id		dso_id;
 	refcount_t		refcnt;
 	u32			flags;
 };
@@ -57,7 +42,7 @@ struct kmap;
 
 struct kmap *__map__kmap(struct map *map);
 struct kmap *map__kmap(struct map *map);
-struct map_groups *map__kmaps(struct map *map);
+struct maps *map__kmaps(struct map *map);
 
 static inline u64 map__map_ip(struct map *map, u64 ip)
 {
@@ -117,6 +102,9 @@ struct thread;
 
 void map__init(struct map *map,
 	       u64 start, u64 end, u64 pgoff, struct dso *dso);
+
+struct dso_id;
+
 struct map *map__new(struct machine *machine, u64 start, u64 len,
 		     u64 pgoff, struct dso_id *id, u32 prot, u32 flags,
 		     char *filename, struct thread *thread);

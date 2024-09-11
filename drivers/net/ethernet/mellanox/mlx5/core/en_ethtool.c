@@ -357,7 +357,7 @@ int mlx5e_ethtool_set_ringparam(struct mlx5e_priv *priv,
 		goto unlock;
 	}
 
-	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL);
+	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
 
 unlock:
 	mutex_unlock(&priv->state_lock);
@@ -441,7 +441,8 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 		mlx5e_arfs_disable(priv);
 
 	/* Switch to new channels, set new parameters and close old ones */
-	err = mlx5e_safe_switch_channels(priv, &new_channels, mlx5e_num_channels_changed);
+	err = mlx5e_safe_switch_channels(priv, &new_channels,
+					 mlx5e_num_channels_changed_ctx, NULL);
 
 	if (arfs_enabled) {
 		int err2 = mlx5e_arfs_enable(priv);
@@ -526,8 +527,8 @@ int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
 	struct dim_cq_moder *rx_moder, *tx_moder;
 	struct mlx5_core_dev *mdev = priv->mdev;
 	struct mlx5e_channels new_channels = {};
+	bool reset_rx, reset_tx;
 	int err = 0;
-	bool reset;
 
 	if (!MLX5_CAP_GEN(mdev, cq_moderation))
 		return -EOPNOTSUPP;
@@ -565,16 +566,29 @@ int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
 	}
 	/* we are opened */
 
-	reset = (!!coal->use_adaptive_rx_coalesce != priv->channels.params.rx_dim_enabled) ||
-		(!!coal->use_adaptive_tx_coalesce != priv->channels.params.tx_dim_enabled);
+	reset_rx = !!coal->use_adaptive_rx_coalesce != priv->channels.params.rx_dim_enabled;
+	reset_tx = !!coal->use_adaptive_tx_coalesce != priv->channels.params.tx_dim_enabled;
 
-	if (!reset) {
+	if (!reset_rx && !reset_tx) {
 		mlx5e_set_priv_channels_coalesce(priv, coal);
 		priv->channels.params = new_channels.params;
 		goto out;
 	}
 
-	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL);
+	if (reset_rx) {
+		u8 mode = MLX5E_GET_PFLAG(&new_channels.params,
+					  MLX5E_PFLAG_RX_CQE_BASED_MODER);
+
+		mlx5e_reset_rx_moderation(&new_channels.params, mode);
+	}
+	if (reset_tx) {
+		u8 mode = MLX5E_GET_PFLAG(&new_channels.params,
+					  MLX5E_PFLAG_TX_CQE_BASED_MODER);
+
+		mlx5e_reset_tx_moderation(&new_channels.params, mode);
+	}
+
+	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
 
 out:
 	mutex_unlock(&priv->state_lock);
@@ -1152,7 +1166,8 @@ int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
 	struct mlx5e_priv *priv = netdev_priv(dev);
 	struct mlx5e_rss_params *rss = &priv->rss_params;
 	int inlen = MLX5_ST_SZ_BYTES(modify_tir_in);
-	bool hash_changed = false;
+	bool refresh_tirs = false;
+	bool refresh_rqt = false;
 	void *in;
 
 	if ((hfunc != ETH_RSS_HASH_NO_CHANGE) &&
@@ -1168,36 +1183,38 @@ int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
 
 	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != rss->hfunc) {
 		rss->hfunc = hfunc;
-		hash_changed = true;
+		refresh_rqt = true;
+		refresh_tirs = true;
 	}
 
 	if (indir) {
 		memcpy(rss->indirection_rqt, indir,
 		       sizeof(rss->indirection_rqt));
-
-		if (test_bit(MLX5E_STATE_OPENED, &priv->state)) {
-			u32 rqtn = priv->indir_rqt.rqtn;
-			struct mlx5e_redirect_rqt_param rrp = {
-				.is_rss = true,
-				{
-					.rss = {
-						.hfunc = rss->hfunc,
-						.channels  = &priv->channels,
-					},
-				},
-			};
-
-			mlx5e_redirect_rqt(priv, rqtn, MLX5E_INDIR_RQT_SIZE, rrp);
-		}
+		refresh_rqt = true;
 	}
 
 	if (key) {
 		memcpy(rss->toeplitz_hash_key, key,
 		       sizeof(rss->toeplitz_hash_key));
-		hash_changed = hash_changed || rss->hfunc == ETH_RSS_HASH_TOP;
+		refresh_tirs = refresh_tirs || rss->hfunc == ETH_RSS_HASH_TOP;
 	}
 
-	if (hash_changed)
+	if (refresh_rqt && test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+		struct mlx5e_redirect_rqt_param rrp = {
+			.is_rss = true,
+			{
+				.rss = {
+					.hfunc = rss->hfunc,
+					.channels  = &priv->channels,
+				},
+			},
+		};
+		u32 rqtn = priv->indir_rqt.rqtn;
+
+		mlx5e_redirect_rqt(priv, rqtn, MLX5E_INDIR_RQT_SIZE, rrp);
+	}
+
+	if (refresh_tirs)
 		mlx5e_modify_tirs_hash(priv, in, inlen);
 
 	mutex_unlock(&priv->state_lock);
@@ -1739,7 +1756,7 @@ static int set_pflag_cqe_based_moder(struct net_device *netdev, bool enable,
 		return 0;
 	}
 
-	return mlx5e_safe_switch_channels(priv, &new_channels, NULL);
+	return mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
 }
 
 static int set_pflag_tx_cqe_based_moder(struct net_device *netdev, bool enable)
@@ -1772,7 +1789,7 @@ int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool new_val
 		return 0;
 	}
 
-	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL);
+	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
 	if (err)
 		return err;
 
@@ -1829,7 +1846,7 @@ static int set_pflag_rx_striding_rq(struct net_device *netdev, bool enable)
 		return 0;
 	}
 
-	return mlx5e_safe_switch_channels(priv, &new_channels, NULL);
+	return mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
 }
 
 static int set_pflag_rx_no_csum_complete(struct net_device *netdev, bool enable)
@@ -1873,7 +1890,7 @@ static int set_pflag_xdp_tx_mpwqe(struct net_device *netdev, bool enable)
 		return 0;
 	}
 
-	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL);
+	err = mlx5e_safe_switch_channels(priv, &new_channels, NULL, NULL);
 	return err;
 }
 

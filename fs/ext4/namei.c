@@ -142,8 +142,9 @@ static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
 		if (ext4_dx_csum_verify(inode, dirent))
 			set_buffer_verified(bh);
 		else {
-			ext4_error_inode(inode, func, line, block,
-					 "Directory index failed checksum");
+			ext4_error_inode_err(inode, func, line, block,
+					     EFSBADCRC,
+					     "Directory index failed checksum");
 			brelse(bh);
 			return ERR_PTR(-EFSBADCRC);
 		}
@@ -152,8 +153,9 @@ static struct buffer_head *__ext4_read_dirblock(struct inode *inode,
 		if (ext4_dirent_csum_verify(inode, dirent))
 			set_buffer_verified(bh);
 		else {
-			ext4_error_inode(inode, func, line, block,
-					 "Directory block failed checksum");
+			ext4_error_inode_err(inode, func, line, block,
+					     EFSBADCRC,
+					     "Directory block failed checksum");
 			brelse(bh);
 			return ERR_PTR(-EFSBADCRC);
 		}
@@ -1439,8 +1441,9 @@ restart:
 			goto next;
 		wait_on_buffer(bh);
 		if (!buffer_uptodate(bh)) {
-			EXT4_ERROR_INODE(dir, "reading directory lblock %lu",
-					 (unsigned long) block);
+			EXT4_ERROR_INODE_ERR(dir, EIO,
+					     "reading directory lblock %lu",
+					     (unsigned long) block);
 			brelse(bh);
 			ret = ERR_PTR(-EIO);
 			goto cleanup_and_exit;
@@ -1450,8 +1453,9 @@ restart:
 					 (struct ext4_dir_entry *)bh->b_data) &&
 		    !ext4_dirent_csum_verify(dir,
 				(struct ext4_dir_entry *)bh->b_data)) {
-			EXT4_ERROR_INODE(dir, "checksumming directory "
-					 "block %lu", (unsigned long)block);
+			EXT4_ERROR_INODE_ERR(dir, EFSBADCRC,
+					     "checksumming directory "
+					     "block %lu", (unsigned long)block);
 			brelse(bh);
 			ret = ERR_PTR(-EFSBADCRC);
 			goto cleanup_and_exit;
@@ -3052,18 +3056,17 @@ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
 	if (IS_DIRSYNC(dir))
 		ext4_handle_sync(handle);
 
-	if (inode->i_nlink == 0) {
-		ext4_warning_inode(inode, "Deleting file '%.*s' with no links",
-				   dentry->d_name.len, dentry->d_name.name);
-		set_nlink(inode, 1);
-	}
 	retval = ext4_delete_entry(handle, dir, de, bh);
 	if (retval)
 		goto end_unlink;
 	dir->i_ctime = dir->i_mtime = current_time(dir);
 	ext4_update_dx_flag(dir);
 	ext4_mark_inode_dirty(handle, dir);
-	drop_nlink(inode);
+	if (inode->i_nlink == 0)
+		ext4_warning_inode(inode, "Deleting file '%.*s' with no links",
+				   dentry->d_name.len, dentry->d_name.name);
+	else
+		drop_nlink(inode);
 	if (!inode->i_nlink)
 		ext4_orphan_add(handle, inode);
 	inode->i_ctime = current_time(inode);

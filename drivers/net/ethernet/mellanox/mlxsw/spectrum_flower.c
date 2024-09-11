@@ -26,17 +26,18 @@ static int mlxsw_sp_flower_parse_actions(struct mlxsw_sp *mlxsw_sp,
 
 	if (!flow_action_has_entries(flow_action))
 		return 0;
-	if (!flow_action_mixed_hw_stats_types_check(flow_action, extack))
+	if (!flow_action_mixed_hw_stats_check(flow_action, extack))
 		return -EOPNOTSUPP;
 
 	act = flow_action_first_entry_get(flow_action);
-	if (act->hw_stats_type == FLOW_ACTION_HW_STATS_TYPE_ANY ||
-	    act->hw_stats_type == FLOW_ACTION_HW_STATS_TYPE_IMMEDIATE) {
+	if (act->hw_stats == FLOW_ACTION_HW_STATS_ANY ||
+	    act->hw_stats == FLOW_ACTION_HW_STATS_IMMEDIATE) {
 		/* Count action is inserted first */
 		err = mlxsw_sp_acl_rulei_act_count(mlxsw_sp, rulei, extack);
 		if (err)
 			return err;
-	} else {
+	} else if (act->hw_stats != FLOW_ACTION_HW_STATS_DISABLED &&
+		   act->hw_stats != FLOW_ACTION_HW_STATS_DONT_CARE) {
 		NL_SET_ERR_MSG_MOD(extack, "Unsupported action HW stats type");
 		return -EOPNOTSUPP;
 	}
@@ -577,6 +578,7 @@ int mlxsw_sp_flower_stats(struct mlxsw_sp *mlxsw_sp,
 			  struct mlxsw_sp_acl_block *block,
 			  struct flow_cls_offload *f)
 {
+	enum flow_action_hw_stats used_hw_stats = FLOW_ACTION_HW_STATS_DISABLED;
 	struct mlxsw_sp_acl_ruleset *ruleset;
 	struct mlxsw_sp_acl_rule *rule;
 	u64 packets;
@@ -595,11 +597,11 @@ int mlxsw_sp_flower_stats(struct mlxsw_sp *mlxsw_sp,
 		return -EINVAL;
 
 	err = mlxsw_sp_acl_rule_get_stats(mlxsw_sp, rule, &packets, &bytes,
-					  &lastuse);
+					  &lastuse, &used_hw_stats);
 	if (err)
 		goto err_rule_get_stats;
 
-	flow_stats_update(&f->stats, bytes, packets, lastuse);
+	flow_stats_update(&f->stats, bytes, packets, lastuse, used_hw_stats);
 
 	mlxsw_sp_acl_ruleset_put(mlxsw_sp, ruleset);
 	return 0;

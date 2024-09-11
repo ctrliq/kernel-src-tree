@@ -72,7 +72,7 @@ struct tid_rb_node {
 	dma_addr_t dma_addr;
 	bool freed;
 	unsigned int npages;
-	struct page *pages[];
+	struct page *pages[0];
 };
 
 static inline int num_user_pages(unsigned long addr,

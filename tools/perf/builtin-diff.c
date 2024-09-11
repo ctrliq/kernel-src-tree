@@ -6,6 +6,7 @@
  * DSOs and symbol information, sort them and produce a diff.
  */
 #include "builtin.h"
+#include "perf.h"
 
 #include "util/debug.h"
 #include "util/event.h"
@@ -23,8 +24,10 @@
 #include "util/annotate.h"
 #include "util/map.h"
 #include "util/spark.h"
+#include "util/block-info.h"
 #include <linux/err.h>
 #include <linux/zalloc.h>
+#include <subcmd/pager.h>
 #include <subcmd/parse-options.h>
 
 #include <errno.h>
@@ -95,8 +98,6 @@ static s64 compute_wdiff_w2;
 
 static const char		*cpu_list;
 static DECLARE_BITMAP(cpu_bitmap, MAX_NR_CPUS);
-
-static struct addr_location dummy_al;
 
 enum {
 	COMPUTE_DELTA,
@@ -386,7 +387,7 @@ struct hist_entry_ops block_hist_ops = {
 static int diff__process_sample_event(struct perf_tool *tool,
 				      union perf_event *event,
 				      struct perf_sample *sample,
-				      struct perf_evsel *evsel,
+				      struct evsel *evsel,
 				      struct machine *machine)
 {
 	struct perf_diff *pdiff = container_of(tool, struct perf_diff, tool);
@@ -454,15 +455,16 @@ static struct perf_diff pdiff = {
 		.fork	= perf_event__process_fork,
 		.lost	= perf_event__process_lost,
 		.namespaces = perf_event__process_namespaces,
+		.cgroup = perf_event__process_cgroup,
 		.ordered_events = true,
 		.ordering_requires_timestamps = true,
 	},
 };
 
-static struct perf_evsel *evsel_match(struct perf_evsel *evsel,
-				      struct perf_evlist *evlist)
+static struct evsel *evsel_match(struct evsel *evsel,
+				      struct evlist *evlist)
 {
-	struct perf_evsel *e;
+	struct evsel *e;
 
 	evlist__for_each_entry(evlist, e) {
 		if (perf_evsel__match2(evsel, e))
@@ -472,9 +474,9 @@ static struct perf_evsel *evsel_match(struct perf_evsel *evsel,
 	return NULL;
 }
 
-static void perf_evlist__collapse_resort(struct perf_evlist *evlist)
+static void perf_evlist__collapse_resort(struct evlist *evlist)
 {
-	struct perf_evsel *evsel;
+	struct evsel *evsel;
 
 	evlist__for_each_entry(evlist, evsel) {
 		struct hists *hists = evsel__hists(evsel);
@@ -536,41 +538,6 @@ static void hists__baseline_only(struct hists *hists)
 	}
 }
 
-static int64_t block_cmp(struct perf_hpp_fmt *fmt __maybe_unused,
-			 struct hist_entry *left, struct hist_entry *right)
-{
-	struct block_info *bi_l = left->block_info;
-	struct block_info *bi_r = right->block_info;
-	int cmp;
-
-	if (!bi_l->sym || !bi_r->sym) {
-		if (!bi_l->sym && !bi_r->sym)
-			return 0;
-		else if (!bi_l->sym)
-			return -1;
-		else
-			return 1;
-	}
-
-	if (bi_l->sym == bi_r->sym) {
-		if (bi_l->start == bi_r->start) {
-			if (bi_l->end == bi_r->end)
-				return 0;
-			else
-				return (int64_t)(bi_r->end - bi_l->end);
-		} else
-			return (int64_t)(bi_r->start - bi_l->start);
-	} else {
-		cmp = strcmp(bi_l->sym->name, bi_r->sym->name);
-		return cmp;
-	}
-
-	if (bi_l->sym->start != bi_r->sym->start)
-		return (int64_t)(bi_r->sym->start - bi_l->sym->start);
-
-	return (int64_t)(bi_r->sym->end - bi_l->sym->end);
-}
-
 static int64_t block_cycles_diff_cmp(struct hist_entry *left,
 				     struct hist_entry *right)
 {
@@ -599,82 +566,11 @@ static void init_block_hist(struct block_hist *bh)
 
 	INIT_LIST_HEAD(&bh->block_fmt.list);
 	INIT_LIST_HEAD(&bh->block_fmt.sort_list);
-	bh->block_fmt.cmp = block_cmp;
+	bh->block_fmt.cmp = block_info__cmp;
 	bh->block_fmt.sort = block_sort;
 	perf_hpp_list__register_sort_field(&bh->block_list,
 					   &bh->block_fmt);
 	bh->valid = true;
-}
-
-static void init_block_info(struct block_info *bi, struct symbol *sym,
-			    struct cyc_hist *ch, int offset)
-{
-	bi->sym = sym;
-	bi->start = ch->start;
-	bi->end = offset;
-	bi->cycles = ch->cycles;
-	bi->cycles_aggr = ch->cycles_aggr;
-	bi->num = ch->num;
-	bi->num_aggr = ch->num_aggr;
-
-	memcpy(bi->cycles_spark, ch->cycles_spark,
-	       NUM_SPARKS * sizeof(u64));
-}
-
-static int process_block_per_sym(struct hist_entry *he)
-{
-	struct annotation *notes;
-	struct cyc_hist *ch;
-	struct block_hist *bh;
-
-	if (!he->ms.map || !he->ms.sym)
-		return 0;
-
-	notes = symbol__annotation(he->ms.sym);
-	if (!notes || !notes->src || !notes->src->cycles_hist)
-		return 0;
-
-	bh = container_of(he, struct block_hist, he);
-	init_block_hist(bh);
-
-	ch = notes->src->cycles_hist;
-	for (unsigned int i = 0; i < symbol__size(he->ms.sym); i++) {
-		if (ch[i].num_aggr) {
-			struct block_info *bi;
-			struct hist_entry *he_block;
-
-			bi = block_info__new();
-			if (!bi)
-				return -1;
-
-			init_block_info(bi, he->ms.sym, &ch[i], i);
-			he_block = hists__add_entry_block(&bh->block_hists,
-							  &dummy_al, bi);
-			if (!he_block) {
-				block_info__put(bi);
-				return -1;
-			}
-		}
-	}
-
-	return 0;
-}
-
-static int block_pair_cmp(struct hist_entry *a, struct hist_entry *b)
-{
-	struct block_info *bi_a = a->block_info;
-	struct block_info *bi_b = b->block_info;
-	int cmp;
-
-	if (!bi_a->sym || !bi_b->sym)
-		return -1;
-
-	cmp = strcmp(bi_a->sym->name, bi_b->sym->name);
-
-	if ((!cmp) && (bi_a->start == bi_b->start) && (bi_a->end == bi_b->end))
-		return 0;
-
-	return -1;
 }
 
 static struct hist_entry *get_block_pair(struct hist_entry *he,
@@ -682,7 +578,7 @@ static struct hist_entry *get_block_pair(struct hist_entry *he,
 {
 	struct rb_root_cached *root = hists_pair->entries_in;
 	struct rb_node *next = rb_first_cached(root);
-	int cmp;
+	int64_t cmp;
 
 	while (next != NULL) {
 		struct hist_entry *he_pair = rb_entry(next, struct hist_entry,
@@ -690,7 +586,7 @@ static struct hist_entry *get_block_pair(struct hist_entry *he,
 
 		next = rb_next(&he_pair->rb_node_in);
 
-		cmp = block_pair_cmp(he_pair, he);
+		cmp = __block_info__cmp(he_pair, he);
 		if (!cmp)
 			return he_pair;
 	}
@@ -734,7 +630,7 @@ static void compute_cycles_diff(struct hist_entry *he,
 			if (i >= he->block_info->num || i >= NUM_SPARKS)
 				break;
 
-			val = labs(pair->block_info->cycles_spark[i] -
+			val = llabs(pair->block_info->cycles_spark[i] -
 				     he->block_info->cycles_spark[i]);
 
 			update_spark_value(pair->diff.svals, NUM_SPARKS,
@@ -784,8 +680,11 @@ static void hists__precompute(struct hists *hists)
 		he   = rb_entry(next, struct hist_entry, rb_node_in);
 		next = rb_next(&he->rb_node_in);
 
-		if (compute == COMPUTE_CYCLES)
-			process_block_per_sym(he);
+		if (compute == COMPUTE_CYCLES) {
+			bh = container_of(he, struct block_hist, he);
+			init_block_hist(bh);
+			block_info__process_sym(he, bh, NULL, 0);
+		}
 
 		data__for_each_file_new(i, d) {
 			pair = get_pair_data(he, d);
@@ -804,10 +703,12 @@ static void hists__precompute(struct hists *hists)
 				compute_wdiff(he, pair);
 				break;
 			case COMPUTE_CYCLES:
-				process_block_per_sym(pair);
-				bh = container_of(he, struct block_hist, he);
 				pair_bh = container_of(pair, struct block_hist,
 						       he);
+				init_block_hist(pair_bh);
+				block_info__process_sym(pair, pair_bh, NULL, 0);
+
+				bh = container_of(he, struct block_hist, he);
 
 				if (bh->valid && pair_bh->valid) {
 					block_hists_match(&bh->block_hists,
@@ -1051,8 +952,8 @@ static void data__fprintf(void)
 
 static void data_process(void)
 {
-	struct perf_evlist *evlist_base = data__files[0].session->evlist;
-	struct perf_evsel *evsel_base;
+	struct evlist *evlist_base = data__files[0].session->evlist;
+	struct evsel *evsel_base;
 	bool first = true;
 
 	evlist__for_each_entry(evlist_base, evsel_base) {
@@ -1061,8 +962,8 @@ static void data_process(void)
 		int i;
 
 		data__for_each_file_new(i, d) {
-			struct perf_evlist *evlist = d->session->evlist;
-			struct perf_evsel *evsel;
+			struct evlist *evlist = d->session->evlist;
+			struct evsel *evsel;
 			struct hists *hists;
 
 			evsel = evsel_match(evsel_base, evlist);
@@ -1395,7 +1296,8 @@ static int cycles_printf(struct hist_entry *he, struct hist_entry *pair,
 	end_line = map__srcline(he->ms.map, bi->sym->start + bi->end,
 				he->ms.sym);
 
-	if ((start_line != SRCLINE_UNKNOWN) && (end_line != SRCLINE_UNKNOWN)) {
+	if ((strncmp(start_line, SRCLINE_UNKNOWN, strlen(SRCLINE_UNKNOWN)) != 0) &&
+	    (strncmp(end_line, SRCLINE_UNKNOWN, strlen(SRCLINE_UNKNOWN)) != 0)) {
 		scnprintf(buf, sizeof(buf), "[%s -> %s] %4ld",
 			  start_line, end_line, block_he->diff.cycles);
 	} else {

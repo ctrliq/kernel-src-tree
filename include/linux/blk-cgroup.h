@@ -136,9 +136,7 @@ struct blkcg_gq {
 
 	struct blkg_policy_data		*pd[BLKCG_MAX_POLS];
 
-	spinlock_t			async_bio_lock;
-	struct bio_list			async_bios;
-	struct work_struct		async_bio_work;
+	struct rcu_head			rcu_head;
 
 	atomic_t			use_delay;
 	atomic64_t			delay_nsec;
@@ -146,7 +144,9 @@ struct blkcg_gq {
 	u64				last_delay;
 	int				last_use;
 
-	struct rcu_head			rcu_head;
+	RH_KABI_EXTEND(spinlock_t		async_bio_lock)
+	RH_KABI_EXTEND(struct bio_list		async_bios)
+	RH_KABI_EXTEND(struct work_struct	async_bio_work)
 };
 
 typedef struct blkcg_policy_data *(blkcg_pol_alloc_cpd_fn)(gfp_t gfp);

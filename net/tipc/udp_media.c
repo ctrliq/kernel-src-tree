@@ -379,6 +379,7 @@ static int tipc_udp_recv(struct sock *sk, struct sk_buff *skb)
 		goto out;
 
 	if (b && test_bit(0, &b->up)) {
+		TIPC_SKB_CB(skb)->flags = 0;
 		tipc_rcv(sock_net(sk), skb, b);
 		return 0;
 	}
@@ -835,7 +836,8 @@ struct tipc_media udp_media_info = {
 	.msg2addr	= tipc_udp_msg2addr,
 	.priority	= TIPC_DEF_LINK_PRI,
 	.tolerance	= TIPC_DEF_LINK_TOL,
-	.window		= TIPC_DEF_LINK_WIN,
+	.min_win	= TIPC_DEF_LINK_WIN,
+	.max_win	= TIPC_DEF_LINK_WIN,
 	.mtu		= TIPC_DEF_LINK_UDP_MTU,
 	.type_id	= TIPC_MEDIA_TYPE_UDP,
 	.hwaddr_len	= 0,

@@ -25,6 +25,8 @@
 #include <net/xdp_sock.h>
 #include <net/xdp.h>
 
+#include <linux/rh_features.h>
+
 #include "xsk_queue.h"
 #include "xdp_umem.h"
 #include "xsk.h"
@@ -341,11 +343,21 @@ out:
 }
 EXPORT_SYMBOL(xsk_umem_consume_tx);
 
-static int xsk_zc_xmit(struct xdp_sock *xs)
+static int xsk_wakeup(struct xdp_sock *xs, u8 flags)
 {
 	struct net_device *dev = xs->dev;
+	int err;
 
-	return dev->netdev_ops->ndo_xsk_async_xmit(dev, xs->queue_id);
+	rcu_read_lock();
+	err = dev->netdev_ops->ndo_xsk_wakeup(dev, xs->queue_id, flags);
+	rcu_read_unlock();
+
+	return err;
+}
+
+static int xsk_zc_xmit(struct xdp_sock *xs)
+{
+	return xsk_wakeup(xs, XDP_WAKEUP_TX);
 }
 
 static void xsk_destruct_skb(struct sk_buff *skb)
@@ -464,19 +476,16 @@ static __poll_t xsk_poll(struct file *file, struct socket *sock,
 	__poll_t mask = datagram_poll(file, sock, wait);
 	struct sock *sk = sock->sk;
 	struct xdp_sock *xs = xdp_sk(sk);
-	struct net_device *dev;
 	struct xdp_umem *umem;
 
 	if (unlikely(!xsk_is_bound(xs)))
 		return mask;
 
-	dev = xs->dev;
 	umem = xs->umem;
 
 	if (umem->need_wakeup) {
-		if (dev->netdev_ops->ndo_xsk_wakeup)
-			dev->netdev_ops->ndo_xsk_wakeup(dev, xs->queue_id,
-							umem->need_wakeup);
+		if (xs->zc)
+			xsk_wakeup(xs, umem->need_wakeup);
 		else
 			/* Poll needs to drive Tx also in copy mode */
 			__xsk_sendmsg(sk);
@@ -1029,7 +1038,7 @@ static int xsk_mmap(struct file *file, struct socket *sock,
 	/* Matches the smp_wmb() in xsk_init_queue */
 	smp_rmb();
 	qpg = virt_to_head_page(q->ring);
-	if (size > (PAGE_SIZE << compound_order(qpg)))
+	if (size > page_size(qpg))
 		return -EINVAL;
 
 	pfn = virt_to_phys(q->ring) >> PAGE_SHIFT;
@@ -1121,6 +1130,8 @@ static int xsk_create(struct net *net, struct socket *sock, int protocol,
 
 	if (protocol)
 		return -EPROTONOSUPPORT;
+
+	rh_mark_used_feature("AF_XDP");
 
 	sock->state = SS_UNCONNECTED;
 

@@ -1,9 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Test for x86 KVM_CAP_SYNC_REGS
  *
  * Copyright (C) 2018, Google LLC.
- *
- * This work is licensed under the terms of the GNU GPL, version 2.
  *
  * Verifies expected behavior of x86 KVM_CAP_SYNC_REGS functionality,
  * including requesting an invalid register set, updates to/from values
@@ -92,11 +91,11 @@ int main(int argc, char *argv[])
 
 	cap = kvm_check_cap(KVM_CAP_SYNC_REGS);
 	if ((cap & TEST_SYNC_FIELDS) != TEST_SYNC_FIELDS) {
-		fprintf(stderr, "KVM_CAP_SYNC_REGS not supported, skipping test\n");
+		print_skip("KVM_CAP_SYNC_REGS not supported");
 		exit(KSFT_SKIP);
 	}
 	if ((cap & INVALID_SYNC_FIELD) != 0) {
-		fprintf(stderr, "The \"invalid\" field is not invalid, skipping test\n");
+		print_skip("The \"invalid\" field is not invalid");
 		exit(KSFT_SKIP);
 	}
 

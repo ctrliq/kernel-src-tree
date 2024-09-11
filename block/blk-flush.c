@@ -477,7 +477,8 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
 		int node, int cmd_size, gfp_t flags)
 {
 	struct blk_flush_queue *fq;
-	int rq_sz = sizeof(struct request);
+	int rq_sz = sizeof(struct request_aux) + sizeof(struct request);
+	void *p;
 
 	fq = kzalloc_node(sizeof(*fq), flags, node);
 	if (!fq)
@@ -486,9 +487,11 @@ struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
 	spin_lock_init(&fq->mq_flush_lock);
 
 	rq_sz = round_up(rq_sz + cmd_size, cache_line_size());
-	fq->flush_rq = kzalloc_node(rq_sz, flags, node);
-	if (!fq->flush_rq)
+	p = kzalloc_node(rq_sz, flags, node);
+	if (!p)
 		goto fail_rq;
+
+	fq->flush_rq = p + sizeof(struct request_aux);
 
 	INIT_LIST_HEAD(&fq->flush_queue[0]);
 	INIT_LIST_HEAD(&fq->flush_queue[1]);
@@ -512,6 +515,6 @@ void blk_free_flush_queue(struct blk_flush_queue *fq)
 		return;
 
 	lockdep_unregister_key(&fq->key);
-	kfree(fq->flush_rq);
+	kfree((void *)fq->flush_rq - sizeof(struct request_aux));
 	kfree(fq);
 }

@@ -240,6 +240,7 @@ void wb_wait_for_completion(struct wb_completion *done)
 					/* if foreign slots >= 8, switch */
 #define WB_FRN_HIST_MAX_SLOTS	(WB_FRN_HIST_THR_SLOTS / 2 + 1)
 					/* one round can affect upto 5 slots */
+#define WB_FRN_MAX_IN_FLIGHT	1024	/* don't queue too many concurrently */
 
 static atomic_t isw_nr_in_flight = ATOMIC_INIT(0);
 static struct workqueue_struct *isw_wq;
@@ -338,12 +339,12 @@ struct inode_switch_wbs_context {
 
 static void bdi_down_write_wb_switch_rwsem(struct backing_dev_info *bdi)
 {
-	down_write(&bdi->wb_switch_rwsem);
+	down_write(bdi->wb_switch_rwsem);
 }
 
 static void bdi_up_write_wb_switch_rwsem(struct backing_dev_info *bdi)
 {
-	up_write(&bdi->wb_switch_rwsem);
+	up_write(bdi->wb_switch_rwsem);
 }
 
 static void inode_switch_wbs_work_fn(struct work_struct *work)
@@ -363,7 +364,7 @@ static void inode_switch_wbs_work_fn(struct work_struct *work)
 	 * If @inode switches cgwb membership while sync_inodes_sb() is
 	 * being issued, sync_inodes_sb() might miss it.  Synchronize.
 	 */
-	down_read(&bdi->wb_switch_rwsem);
+	down_read(bdi->wb_switch_rwsem);
 
 	/*
 	 * By the time control reaches here, RCU grace period has passed
@@ -457,7 +458,7 @@ skip_switch:
 	spin_unlock(&new_wb->list_lock);
 	spin_unlock(&old_wb->list_lock);
 
-	up_read(&bdi->wb_switch_rwsem);
+	up_read(bdi->wb_switch_rwsem);
 
 	if (switched) {
 		wb_wakeup(new_wb);
@@ -499,18 +500,13 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
 	if (inode->i_state & I_WB_SWITCH)
 		return;
 
-	/*
-	 * Avoid starting new switches while sync_inodes_sb() is in
-	 * progress.  Otherwise, if the down_write protected issue path
-	 * blocks heavily, we might end up starting a large number of
-	 * switches which will block on the rwsem.
-	 */
-	if (!down_read_trylock(&bdi->wb_switch_rwsem))
+	/* avoid queueing a new switch if too many are already in flight */
+	if (atomic_read(&isw_nr_in_flight) > WB_FRN_MAX_IN_FLIGHT)
 		return;
 
 	isw = kzalloc(sizeof(*isw), GFP_ATOMIC);
 	if (!isw)
-		goto out_unlock;
+		return;
 
 	/* find and pin the new wb */
 	rcu_read_lock();
@@ -544,14 +540,12 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
 	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
 	 */
 	call_rcu(&isw->rcu_head, inode_switch_wbs_rcu_fn);
-	goto out_unlock;
+	return;
 
 out_free:
 	if (isw->new_wb)
 		wb_put(isw->new_wb);
 	kfree(isw);
-out_unlock:
-	up_read(&bdi->wb_switch_rwsem);
 }
 
 /**
@@ -718,7 +712,7 @@ void wbc_detach_inode(struct writeback_control *wbc)
 EXPORT_SYMBOL_GPL(wbc_detach_inode);
 
 /**
- * wbc_account_io - account IO issued during writeback
+ * wbc_account_cgroup_owner - account writeback to update inode cgroup ownership
  * @wbc: writeback_control of the writeback in progress
  * @page: page being written out
  * @bytes: number of bytes being written out
@@ -727,8 +721,8 @@ EXPORT_SYMBOL_GPL(wbc_detach_inode);
  * controlled by @wbc.  Keep the book for foreign inode detection.  See
  * wbc_detach_inode().
  */
-void wbc_account_io(struct writeback_control *wbc, struct page *page,
-		    size_t bytes)
+void wbc_account_cgroup_owner(struct writeback_control *wbc, struct page *page,
+			      size_t bytes)
 {
 	struct cgroup_subsys_state *css;
 	int id;
@@ -765,7 +759,7 @@ void wbc_account_io(struct writeback_control *wbc, struct page *page,
 	else
 		wbc->wb_tcand_bytes -= min(bytes, wbc->wb_tcand_bytes);
 }
-EXPORT_SYMBOL_GPL(wbc_account_io);
+EXPORT_SYMBOL_GPL(wbc_account_cgroup_owner);
 
 /**
  * inode_congested - test whether an inode is congested
@@ -1984,7 +1978,7 @@ void wb_workfn(struct work_struct *work)
 						struct bdi_writeback, dwork);
 	long pages_written;
 
-	set_worker_desc("flush-%s", dev_name(wb->bdi->dev));
+	set_worker_desc("flush-%s", bdi_dev_name(wb->bdi));
 	current->flags |= PF_SWAPWRITE;
 
 	if (likely(!current_is_workqueue_rescuer() ||

@@ -53,13 +53,6 @@ static void __rpc_queue_timer_fn(struct work_struct *);
  */
 static struct rpc_wait_queue delay_queue;
 
-/*
- * rpciod-related stuff
- */
-struct workqueue_struct *rpciod_workqueue __read_mostly;
-struct workqueue_struct *xprtiod_workqueue __read_mostly;
-EXPORT_SYMBOL_GPL(xprtiod_workqueue);
-
 unsigned long
 rpc_task_timeout(const struct rpc_task *task)
 {
@@ -73,6 +66,13 @@ rpc_task_timeout(const struct rpc_task *task)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(rpc_task_timeout);
+
+/*
+ * rpciod-related stuff
+ */
+struct workqueue_struct *rpciod_workqueue __read_mostly;
+struct workqueue_struct *xprtiod_workqueue __read_mostly;
+EXPORT_SYMBOL_GPL(xprtiod_workqueue);
 
 /*
  * Disable the timer for a given RPC task. Should be called with
@@ -814,8 +814,7 @@ static void
 rpc_reset_task_statistics(struct rpc_task *task)
 {
 	task->tk_timeouts = 0;
-	task->tk_flags &= ~(RPC_CALL_MAJORSEEN|RPC_TASK_KILLED|RPC_TASK_SENT);
-
+	task->tk_flags &= ~(RPC_CALL_MAJORSEEN|RPC_TASK_SENT);
 	rpc_init_task_statistics(task);
 }
 
@@ -833,12 +832,26 @@ void rpc_exit_task(struct rpc_task *task)
 	if (task->tk_ops->rpc_call_done != NULL) {
 		task->tk_ops->rpc_call_done(task, task->tk_calldata);
 		if (task->tk_action != NULL) {
-			WARN_ON(RPC_ASSASSINATED(task));
 			/* Always release the RPC slot and buffer memory */
 			xprt_release(task);
 			rpc_reset_task_statistics(task);
 		}
 	}
+}
+
+void rpc_signal_task(struct rpc_task *task)
+{
+	struct rpc_wait_queue *queue;
+
+	if (!RPC_IS_ACTIVATED(task))
+		return;
+
+	trace_rpc_task_signalled(task, task->tk_action);
+	set_bit(RPC_TASK_SIGNALLED, &task->tk_runstate);
+	smp_mb__after_atomic();
+	queue = READ_ONCE(task->tk_waitqueue);
+	if (queue)
+		rpc_wake_up_queued_task_set_status(queue, task, -ERESTARTSYS);
 }
 
 void rpc_exit(struct rpc_task *task, int status)
@@ -896,6 +909,15 @@ static void __rpc_execute(struct rpc_task *task)
 		 */
 		if (!RPC_IS_QUEUED(task))
 			continue;
+
+		/*
+		 * Signalled tasks should exit rather than sleep.
+		 */
+		if (RPC_SIGNALLED(task)) {
+			task->tk_rpc_status = -ERESTARTSYS;
+			rpc_exit(task, -ERESTARTSYS);
+		}
+
 		/*
 		 * The queue->lock protects against races with
 		 * rpc_make_runnable().
@@ -921,15 +943,16 @@ static void __rpc_execute(struct rpc_task *task)
 		status = out_of_line_wait_on_bit(&task->tk_runstate,
 				RPC_TASK_QUEUED, rpc_wait_bit_killable,
 				TASK_KILLABLE);
-		if (status == -ERESTARTSYS) {
+		if (status < 0) {
 			/*
 			 * When a sync task receives a signal, it exits with
 			 * -ERESTARTSYS. In order to catch any callbacks that
 			 * clean up after sleeping on some queue, we don't
 			 * break the loop here, but go around once more.
 			 */
-			dprintk("RPC: %5u got signal\n", task->tk_pid);
-			task->tk_flags |= RPC_TASK_KILLED;
+			trace_rpc_task_signalled(task, task->tk_action);
+			set_bit(RPC_TASK_SIGNALLED, &task->tk_runstate);
+			task->tk_rpc_status = -ERESTARTSYS;
 			rpc_exit(task, -ERESTARTSYS);
 		}
 		dprintk("RPC: %5u sync task resuming\n", task->tk_pid);
@@ -1055,7 +1078,8 @@ static void rpc_init_task(struct rpc_task *task, const struct rpc_task_setup *ta
 	/* Initialize workqueue for async tasks */
 	task->tk_workqueue = task_setup_data->workqueue;
 
-	task->tk_xprt = xprt_get(task_setup_data->rpc_xprt);
+	task->tk_xprt = rpc_task_get_xprt(task_setup_data->rpc_client,
+			xprt_get(task_setup_data->rpc_xprt));
 
 	task->tk_op_cred = get_rpccred(task_setup_data->rpc_op_cred);
 

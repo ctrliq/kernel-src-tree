@@ -3299,15 +3299,10 @@ static int __ip6_del_rt_siblings(struct fib6_info *rt, struct fib6_config *cfg)
 								  replace_rt);
 			else
 				call_fib6_multipath_entry_notifiers(net,
-						       FIB_EVENT_ENTRY_DEL_TMP,
+						       FIB_EVENT_ENTRY_DEL,
 						       rt, rt->fib6_nsiblings,
 						       NULL);
 		}
-		call_fib6_multipath_entry_notifiers(net,
-						    FIB_EVENT_ENTRY_DEL,
-						    rt,
-						    rt->fib6_nsiblings,
-						    NULL);
 		list_for_each_entry_safe(sibling, next_sibling,
 					 &rt->fib6_siblings,
 					 fib6_siblings) {
@@ -4453,7 +4448,6 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 {
 	struct fib6_info *rt_notif = NULL, *rt_last = NULL;
 	struct nl_info *info = &cfg->fc_nlinfo;
-	enum fib_event_type event_type;
 	struct fib6_config r_cfg;
 	struct rtnexthop *rtnh;
 	struct fib6_info *rt;
@@ -4589,7 +4583,7 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 		if (rt_notif->fib6_nsiblings != nhn - 1)
 			fib_event = FIB_EVENT_ENTRY_APPEND;
 		else
-			fib_event = FIB_EVENT_ENTRY_REPLACE_TMP;
+			fib_event = FIB_EVENT_ENTRY_REPLACE;
 
 		err = call_fib6_multipath_entry_notifiers(info->nl_net,
 							  fib_event, rt_notif,
@@ -4599,14 +4593,6 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 			err_nh = NULL;
 			goto add_errout;
 		}
-	}
-	event_type = replace ? FIB_EVENT_ENTRY_REPLACE : FIB_EVENT_ENTRY_ADD;
-	err = call_fib6_multipath_entry_notifiers(info->nl_net, event_type,
-						  rt_notif, nhn - 1, extack);
-	if (err) {
-		/* Delete all the siblings that were just added */
-		err_nh = NULL;
-		goto add_errout;
 	}
 
 	/* success ... tell user about new route */
@@ -4942,6 +4928,13 @@ static int rt6_fill_node(struct net *net, struct sk_buff *skb,
 	if (rt6_flags & RTF_EXPIRES) {
 		expires = dst ? dst->expires : rt->expires;
 		expires -= jiffies;
+	}
+
+	if (!dst) {
+		if (rt->offload)
+			rtm->rtm_flags |= RTM_F_OFFLOAD;
+		if (rt->trap)
+			rtm->rtm_flags |= RTM_F_TRAP;
 	}
 
 	if (rtnl_put_cacheinfo(skb, dst, 0, expires, dst ? dst->error : 0) < 0)
@@ -5316,6 +5309,38 @@ void inet6_rt_notify(int event, struct fib6_info *rt, struct nl_info *info,
 
 	err = rt6_fill_node(net, skb, rt, NULL, NULL, NULL, 0,
 			    event, info->portid, seq, nlm_flags);
+	if (err < 0) {
+		/* -EMSGSIZE implies BUG in rt6_nlmsg_size() */
+		WARN_ON(err == -EMSGSIZE);
+		kfree_skb(skb);
+		goto errout;
+	}
+	rtnl_notify(skb, net, info->portid, RTNLGRP_IPV6_ROUTE,
+		    info->nlh, gfp_any());
+	return;
+errout:
+	if (err < 0)
+		rtnl_set_sk_err(net, RTNLGRP_IPV6_ROUTE, err);
+}
+
+void fib6_rt_update(struct net *net, struct fib6_info *rt,
+		    struct nl_info *info)
+{
+	u32 seq = info->nlh ? info->nlh->nlmsg_seq : 0;
+	struct sk_buff *skb;
+	int err = -ENOBUFS;
+
+	/* call_fib6_entry_notifiers will be removed when in-kernel notifier
+	 * is implemented and supported for nexthop objects
+	 */
+	call_fib6_entry_notifiers(net, FIB_EVENT_ENTRY_REPLACE, rt, NULL);
+
+	skb = nlmsg_new(rt6_nlmsg_size(rt), gfp_any());
+	if (!skb)
+		goto errout;
+
+	err = rt6_fill_node(net, skb, rt, NULL, NULL, NULL, 0,
+			    RTM_NEWROUTE, info->portid, seq, NLM_F_REPLACE);
 	if (err < 0) {
 		/* -EMSGSIZE implies BUG in rt6_nlmsg_size() */
 		WARN_ON(err == -EMSGSIZE);

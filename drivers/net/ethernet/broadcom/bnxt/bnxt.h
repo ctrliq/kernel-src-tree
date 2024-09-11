@@ -12,10 +12,8 @@
 #define BNXT_H
 
 #define DRV_MODULE_NAME		"bnxt_en"
+#define DRV_MODULE_VERSION	"1.10.1"
 
-/* DO NOT CHANGE DRV_VER_* defines
- * FIXME: Delete them
- */
 #define DRV_VER_MAJ	1
 #define DRV_VER_MIN	10
 #define DRV_VER_UPD	1
@@ -1388,6 +1386,7 @@ struct bnxt_fw_health {
 	u32 last_fw_reset_cnt;
 	u8 enabled:1;
 	u8 master:1;
+	u8 fatal:1;
 	u8 tmr_multiplier;
 	u8 tmr_counter;
 	u8 fw_reset_seq_cnt;
@@ -1732,6 +1731,7 @@ struct bnxt {
 #define BC_HWRM_STR_LEN		21
 #define PHY_VER_STR_LEN         (FW_VER_STR_LEN - BC_HWRM_STR_LEN)
 	char			fw_ver_str[FW_VER_STR_LEN];
+	char			hwrm_ver_supp[FW_VER_STR_LEN];
 	__be16			vxlan_port;
 	u8			vxlan_port_cnt;
 	__le16			vxlan_fw_dst_port_id;

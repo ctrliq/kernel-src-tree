@@ -5,7 +5,7 @@
  * License as published by the Free Software Foundation.
  */
 #include <uapi/linux/bpf.h>
-#include "bpf_helpers.h"
+#include <bpf/bpf_helpers.h>
 
 struct syscalls_enter_open_args {
 	unsigned long long unused;

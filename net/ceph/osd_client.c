@@ -402,7 +402,7 @@ static void osd_req_op_data_release(struct ceph_osd_request *osd_req,
 	case CEPH_OSD_OP_LIST_WATCHERS:
 		ceph_osd_data_release(&op->list_watchers.response_data);
 		break;
-	case CEPH_OSD_OP_COPY_FROM:
+	case CEPH_OSD_OP_COPY_FROM2:
 		ceph_osd_data_release(&op->copy_from.osd_data);
 		break;
 	default:
@@ -699,7 +699,7 @@ static void get_num_data_items(struct ceph_osd_request *req,
 		case CEPH_OSD_OP_SETXATTR:
 		case CEPH_OSD_OP_CMPXATTR:
 		case CEPH_OSD_OP_NOTIFY_ACK:
-		case CEPH_OSD_OP_COPY_FROM:
+		case CEPH_OSD_OP_COPY_FROM2:
 			*num_request_data_items += 1;
 			break;
 
@@ -1037,7 +1037,7 @@ static u32 osd_req_encode_op(struct ceph_osd_op *dst,
 	case CEPH_OSD_OP_CREATE:
 	case CEPH_OSD_OP_DELETE:
 		break;
-	case CEPH_OSD_OP_COPY_FROM:
+	case CEPH_OSD_OP_COPY_FROM2:
 		dst->copy_from.snapid = cpu_to_le64(src->copy_from.snapid);
 		dst->copy_from.src_version =
 			cpu_to_le64(src->copy_from.src_version);
@@ -1119,10 +1119,10 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
 				       truncate_size, truncate_seq);
 	}
 
-	req->r_flags = flags;
 	req->r_base_oloc.pool = layout->pool_id;
 	req->r_base_oloc.pool_ns = ceph_try_get_string(layout->pool_ns);
 	ceph_oid_printf(&req->r_base_oid, "%llx.%08llx", vino.ino, objnum);
+	req->r_flags = flags | osdc->client->options->read_from_replica;
 
 	req->r_snapid = vino.snap;
 	if (flags & CEPH_OSD_FLAG_WRITE)
@@ -1505,6 +1505,45 @@ static bool target_should_be_paused(struct ceph_osd_client *osdc,
 	       (osdc->osdmap->epoch < osdc->epoch_barrier);
 }
 
+static int pick_random_replica(const struct ceph_osds *acting)
+{
+	int i = prandom_u32() % acting->size;
+
+	dout("%s picked osd%d, primary osd%d\n", __func__,
+	     acting->osds[i], acting->primary);
+	return i;
+}
+
+/*
+ * Picks the closest replica based on client's location given by
+ * crush_location option.  Prefers the primary if the locality is
+ * the same.
+ */
+static int pick_closest_replica(struct ceph_osd_client *osdc,
+				const struct ceph_osds *acting)
+{
+	struct ceph_options *opt = osdc->client->options;
+	int best_i, best_locality;
+	int i = 0, locality;
+
+	do {
+		locality = ceph_get_crush_locality(osdc->osdmap,
+						   acting->osds[i],
+						   &opt->crush_locs);
+		if (i == 0 ||
+		    (locality >= 0 && best_locality < 0) ||
+		    (locality >= 0 && best_locality >= 0 &&
+		     locality < best_locality)) {
+			best_i = i;
+			best_locality = locality;
+		}
+	} while (++i < acting->size);
+
+	dout("%s picked osd%d with locality %d, primary osd%d\n", __func__,
+	     acting->osds[best_i], best_locality, acting->primary);
+	return best_i;
+}
+
 enum calc_target_result {
 	CALC_TARGET_NO_ACTION = 0,
 	CALC_TARGET_NEED_RESEND,
@@ -1518,6 +1557,8 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 	struct ceph_pg_pool_info *pi;
 	struct ceph_pg pgid, last_pgid;
 	struct ceph_osds up, acting;
+	bool is_read = t->flags & CEPH_OSD_FLAG_READ;
+	bool is_write = t->flags & CEPH_OSD_FLAG_WRITE;
 	bool force_resend = false;
 	bool unpaused = false;
 	bool legacy_change = false;
@@ -1548,9 +1589,9 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 	ceph_oid_copy(&t->target_oid, &t->base_oid);
 	ceph_oloc_copy(&t->target_oloc, &t->base_oloc);
 	if ((t->flags & CEPH_OSD_FLAG_IGNORE_OVERLAY) == 0) {
-		if (t->flags & CEPH_OSD_FLAG_READ && pi->read_tier >= 0)
+		if (is_read && pi->read_tier >= 0)
 			t->target_oloc.pool = pi->read_tier;
-		if (t->flags & CEPH_OSD_FLAG_WRITE && pi->write_tier >= 0)
+		if (is_write && pi->write_tier >= 0)
 			t->target_oloc.pool = pi->write_tier;
 
 		pi = ceph_pg_pool_by_id(osdc->osdmap, t->target_oloc.pool);
@@ -1589,7 +1630,8 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 		unpaused = true;
 	}
 	legacy_change = ceph_pg_compare(&t->pgid, &pgid) ||
-			ceph_osds_changed(&t->acting, &acting, any_change);
+			ceph_osds_changed(&t->acting, &acting,
+					  t->used_replica || any_change);
 	if (t->pg_num)
 		split = ceph_pg_is_split(&last_pgid, t->pg_num, pi->pg_num);
 
@@ -1605,7 +1647,24 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 		t->sort_bitwise = sort_bitwise;
 		t->recovery_deletes = recovery_deletes;
 
-		t->osd = acting.primary;
+		if ((t->flags & (CEPH_OSD_FLAG_BALANCE_READS |
+				 CEPH_OSD_FLAG_LOCALIZE_READS)) &&
+		    !is_write && pi->type == CEPH_POOL_TYPE_REP &&
+		    acting.size > 1) {
+			int pos;
+
+			WARN_ON(!is_read || acting.osds[0] != acting.primary);
+			if (t->flags & CEPH_OSD_FLAG_BALANCE_READS) {
+				pos = pick_random_replica(&acting);
+			} else {
+				pos = pick_closest_replica(osdc, &acting);
+			}
+			t->osd = acting.osds[pos];
+			t->used_replica = pos > 0;
+		} else {
+			t->osd = acting.primary;
+			t->used_replica = false;
+		}
 	}
 
 	if (unpaused || legacy_change || force_resend || split)
@@ -1974,7 +2033,7 @@ static void setup_request_data(struct ceph_osd_request *req)
 			ceph_osdc_msg_data_add(request_msg,
 					       &op->notify_ack.request_data);
 			break;
-		case CEPH_OSD_OP_COPY_FROM:
+		case CEPH_OSD_OP_COPY_FROM2:
 			ceph_osdc_msg_data_add(request_msg,
 					       &op->copy_from.osd_data);
 			break;
@@ -3665,6 +3724,26 @@ static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
 		goto out_unlock_osdc;
 	}
 
+	if (m.result == -EAGAIN) {
+		dout("req %p tid %llu EAGAIN\n", req, req->r_tid);
+		unlink_request(osd, req);
+		mutex_unlock(&osd->lock);
+
+		/*
+		 * The object is missing on the replica or not (yet)
+		 * readable.  Clear pgid to force a resend to the primary
+		 * via legacy_change.
+		 */
+		req->r_t.pgid.pool = 0;
+		req->r_t.pgid.seed = 0;
+		WARN_ON(!req->r_t.used_replica);
+		req->r_flags &= ~(CEPH_OSD_FLAG_BALANCE_READS |
+				  CEPH_OSD_FLAG_LOCALIZE_READS);
+		req->r_tid = 0;
+		__submit_request(req, false);
+		goto out_unlock_osdc;
+	}
+
 	if (m.num_ops != req->r_num_ops) {
 		pr_err("num_ops %d != %d for tid %llu\n", m.num_ops,
 		       req->r_num_ops, req->r_tid);
@@ -5241,6 +5320,7 @@ static int osd_req_op_copy_from_init(struct ceph_osd_request *req,
 				     struct ceph_object_locator *src_oloc,
 				     u32 src_fadvise_flags,
 				     u32 dst_fadvise_flags,
+				     u32 truncate_seq, u64 truncate_size,
 				     u8 copy_from_flags)
 {
 	struct ceph_osd_req_op *op;
@@ -5251,7 +5331,8 @@ static int osd_req_op_copy_from_init(struct ceph_osd_request *req,
 	if (IS_ERR(pages))
 		return PTR_ERR(pages);
 
-	op = _osd_req_op_init(req, 0, CEPH_OSD_OP_COPY_FROM, dst_fadvise_flags);
+	op = _osd_req_op_init(req, 0, CEPH_OSD_OP_COPY_FROM2,
+			      dst_fadvise_flags);
 	op->copy_from.snapid = src_snapid;
 	op->copy_from.src_version = src_version;
 	op->copy_from.flags = copy_from_flags;
@@ -5261,6 +5342,8 @@ static int osd_req_op_copy_from_init(struct ceph_osd_request *req,
 	end = p + PAGE_SIZE;
 	ceph_encode_string(&p, end, src_oid->name, src_oid->name_len);
 	encode_oloc(&p, end, src_oloc);
+	ceph_encode_32(&p, truncate_seq);
+	ceph_encode_64(&p, truncate_size);
 	op->indata_len = PAGE_SIZE - (end - p);
 
 	ceph_osd_data_pages_init(&op->copy_from.osd_data, pages,
@@ -5276,6 +5359,7 @@ int ceph_osdc_copy_from(struct ceph_osd_client *osdc,
 			struct ceph_object_id *dst_oid,
 			struct ceph_object_locator *dst_oloc,
 			u32 dst_fadvise_flags,
+			u32 truncate_seq, u64 truncate_size,
 			u8 copy_from_flags)
 {
 	struct ceph_osd_request *req;
@@ -5292,7 +5376,8 @@ int ceph_osdc_copy_from(struct ceph_osd_client *osdc,
 
 	ret = osd_req_op_copy_from_init(req, src_snapid, src_version, src_oid,
 					src_oloc, src_fadvise_flags,
-					dst_fadvise_flags, copy_from_flags);
+					dst_fadvise_flags, truncate_seq,
+					truncate_size, copy_from_flags);
 	if (ret)
 		goto out;
 

@@ -338,7 +338,7 @@ static int vfio_ccw_chp_event(struct subchannel *sch,
 
 	trace_vfio_ccw_chp_event(private->sch->schid, mask, event);
 	VFIO_CCW_MSG_EVENT(2, "%pUl (%x.%x.%04x): mask=0x%x event=%d\n",
-			   mdev_uuid(private->mdev), sch->schid.cssid,
+			   mdev_uuid_p(private->mdev), sch->schid.cssid,
 			   sch->schid.ssid, sch->schid.sch_no,
 			   mask, event);
 

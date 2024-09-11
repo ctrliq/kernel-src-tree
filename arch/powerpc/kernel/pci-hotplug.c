@@ -63,6 +63,8 @@ void pcibios_release_device(struct pci_dev *dev)
 
 	eeh_remove_device(dev);
 
+	irq_dispose_mapping(dev->irq);
+
 	if (phb->controller_ops.release_device)
 		phb->controller_ops.release_device(dev);
 

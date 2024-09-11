@@ -21,17 +21,21 @@
 #include "cs-etm.h"
 #include "cs-etm-decoder/cs-etm-decoder.h"
 #include "debug.h"
+#include "dso.h"
 #include "evlist.h"
 #include "intlist.h"
 #include "machine.h"
 #include "map.h"
 #include "perf.h"
+#include "session.h"
+#include "map_symbol.h"
+#include "branch.h"
 #include "symbol.h"
+#include "tool.h"
 #include "thread.h"
-#include "thread_map.h"
 #include "thread-stack.h"
 #include <tools/libc_compat.h>
-#include "util.h"
+#include "util/synthetic-events.h"
 
 #define MAX_TIMESTAMP (~0ULL)
 
@@ -1181,6 +1185,7 @@ static int cs_etm__synth_branch_sample(struct cs_etm_queue *etmq,
 	union perf_event *event = tidq->event_buf;
 	struct dummy_branch_stack {
 		u64			nr;
+		u64			hw_idx;
 		struct branch_entry	entries;
 	} dummy_bs;
 	u64 ip;
@@ -1211,6 +1216,7 @@ static int cs_etm__synth_branch_sample(struct cs_etm_queue *etmq,
 	if (etm->synth_opts.last_branch) {
 		dummy_bs = (struct dummy_branch_stack){
 			.nr = 1,
+			.hw_idx = -1ULL,
 			.entries = {
 				.from = sample.ip,
 				.to = sample.addr,
@@ -1268,15 +1274,15 @@ static int cs_etm__synth_event(struct perf_session *session,
 static int cs_etm__synth_events(struct cs_etm_auxtrace *etm,
 				struct perf_session *session)
 {
-	struct perf_evlist *evlist = session->evlist;
-	struct perf_evsel *evsel;
+	struct evlist *evlist = session->evlist;
+	struct evsel *evsel;
 	struct perf_event_attr attr;
 	bool found = false;
 	u64 id;
 	int err;
 
 	evlist__for_each_entry(evlist, evsel) {
-		if (evsel->attr.type == etm->pmu_type) {
+		if (evsel->core.attr.type == etm->pmu_type) {
 			found = true;
 			break;
 		}
@@ -1290,7 +1296,7 @@ static int cs_etm__synth_events(struct cs_etm_auxtrace *etm,
 	memset(&attr, 0, sizeof(struct perf_event_attr));
 	attr.size = sizeof(struct perf_event_attr);
 	attr.type = PERF_TYPE_HARDWARE;
-	attr.sample_type = evsel->attr.sample_type & PERF_SAMPLE_MASK;
+	attr.sample_type = evsel->core.attr.sample_type & PERF_SAMPLE_MASK;
 	attr.sample_type |= PERF_SAMPLE_IP | PERF_SAMPLE_TID |
 			    PERF_SAMPLE_PERIOD;
 	if (etm->timeless_decoding)
@@ -1298,16 +1304,16 @@ static int cs_etm__synth_events(struct cs_etm_auxtrace *etm,
 	else
 		attr.sample_type |= PERF_SAMPLE_TIME;
 
-	attr.exclude_user = evsel->attr.exclude_user;
-	attr.exclude_kernel = evsel->attr.exclude_kernel;
-	attr.exclude_hv = evsel->attr.exclude_hv;
-	attr.exclude_host = evsel->attr.exclude_host;
-	attr.exclude_guest = evsel->attr.exclude_guest;
-	attr.sample_id_all = evsel->attr.sample_id_all;
-	attr.read_format = evsel->attr.read_format;
+	attr.exclude_user = evsel->core.attr.exclude_user;
+	attr.exclude_kernel = evsel->core.attr.exclude_kernel;
+	attr.exclude_hv = evsel->core.attr.exclude_hv;
+	attr.exclude_host = evsel->core.attr.exclude_host;
+	attr.exclude_guest = evsel->core.attr.exclude_guest;
+	attr.sample_id_all = evsel->core.attr.sample_id_all;
+	attr.read_format = evsel->core.attr.read_format;
 
 	/* create new id val to be a fixed offset from evsel id */
-	id = evsel->id[0] + 1000000000;
+	id = evsel->core.id[0] + 1000000000;
 
 	if (!id)
 		id = 1;
@@ -2393,8 +2399,8 @@ static int cs_etm__process_auxtrace_event(struct perf_session *session,
 
 static bool cs_etm__is_timeless_decoding(struct cs_etm_auxtrace *etm)
 {
-	struct perf_evsel *evsel;
-	struct perf_evlist *evlist = etm->session->evlist;
+	struct evsel *evsel;
+	struct evlist *evlist = etm->session->evlist;
 	bool timeless_decoding = true;
 
 	/*
@@ -2402,7 +2408,7 @@ static bool cs_etm__is_timeless_decoding(struct cs_etm_auxtrace *etm)
 	 * with the time bit set.
 	 */
 	evlist__for_each_entry(evlist, evsel) {
-		if ((evsel->attr.sample_type & PERF_SAMPLE_TIME))
+		if ((evsel->core.attr.sample_type & PERF_SAMPLE_TIME))
 			timeless_decoding = false;
 	}
 
@@ -2436,7 +2442,7 @@ static const char * const cs_etmv4_priv_fmts[] = {
 	[CS_ETMV4_TRCAUTHSTATUS] = "	TRCAUTHSTATUS		       %llx\n",
 };
 
-static void cs_etm__print_auxtrace_info(u64 *val, int num)
+static void cs_etm__print_auxtrace_info(__u64 *val, int num)
 {
 	int i, j, cpu = 0;
 
@@ -2459,7 +2465,7 @@ static void cs_etm__print_auxtrace_info(u64 *val, int num)
 int cs_etm__process_auxtrace_info(union perf_event *event,
 				  struct perf_session *session)
 {
-	struct auxtrace_info_event *auxtrace_info = &event->auxtrace_info;
+	struct perf_record_auxtrace_info *auxtrace_info = &event->auxtrace_info;
 	struct cs_etm_auxtrace *etm = NULL;
 	struct int_node *inode;
 	unsigned int pmu_type;
@@ -2631,7 +2637,7 @@ int cs_etm__process_auxtrace_info(union perf_event *event,
 	if (err)
 		goto err_delete_thread;
 
-	if (thread__init_map_groups(etm->unknown_thread, etm->machine)) {
+	if (thread__init_maps(etm->unknown_thread, etm->machine)) {
 		err = -ENOMEM;
 		goto err_delete_thread;
 	}

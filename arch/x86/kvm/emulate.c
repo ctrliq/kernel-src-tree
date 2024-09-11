@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /******************************************************************************
  * emulate.c
  *
@@ -13,9 +14,6 @@
  *
  *   Avi Kivity <avi@qumranet.com>
  *   Yaniv Kamay <yaniv@qumranet.com>
- *
- * This work is licensed under the terms of the GNU GPL, version 2.  See
- * the COPYING file in the top-level directory.
  *
  * From: xen-unstable 10676:af9809f51f81a3c43f276f00c81a52ef558afda4
  */
@@ -2724,10 +2722,8 @@ static bool vendor_intel(struct x86_emulate_ctxt *ctxt)
 	u32 eax, ebx, ecx, edx;
 
 	eax = ecx = 0;
-	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, false);
-	return ebx == X86EMUL_CPUID_VENDOR_GenuineIntel_ebx
-		&& ecx == X86EMUL_CPUID_VENDOR_GenuineIntel_ecx
-		&& edx == X86EMUL_CPUID_VENDOR_GenuineIntel_edx;
+	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
+	return is_guest_vendor_intel(ebx, ecx, edx);
 }
 
 static bool em_syscall_is_enabled(struct x86_emulate_ctxt *ctxt)
@@ -2744,33 +2740,23 @@ static bool em_syscall_is_enabled(struct x86_emulate_ctxt *ctxt)
 
 	eax = 0x00000000;
 	ecx = 0x00000000;
-	ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, false);
+	ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
 	/*
-	 * Intel ("GenuineIntel")
-	 * remark: Intel CPUs only support "syscall" in 64bit
-	 * longmode. Also an 64bit guest with a
-	 * 32bit compat-app running will #UD !! While this
-	 * behaviour can be fixed (by emulating) into AMD
-	 * response - CPUs of AMD can't behave like Intel.
+	 * remark: Intel CPUs only support "syscall" in 64bit longmode. Also a
+	 * 64bit guest with a 32bit compat-app running will #UD !! While this
+	 * behaviour can be fixed (by emulating) into AMD response - CPUs of
+	 * AMD can't behave like Intel.
 	 */
-	if (ebx == X86EMUL_CPUID_VENDOR_GenuineIntel_ebx &&
-	    ecx == X86EMUL_CPUID_VENDOR_GenuineIntel_ecx &&
-	    edx == X86EMUL_CPUID_VENDOR_GenuineIntel_edx)
+	if (is_guest_vendor_intel(ebx, ecx, edx))
 		return false;
 
-	/* AMD ("AuthenticAMD") */
-	if (ebx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ebx &&
-	    ecx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ecx &&
-	    edx == X86EMUL_CPUID_VENDOR_AuthenticAMD_edx)
+	if (is_guest_vendor_amd(ebx, ecx, edx))
 		return true;
 
-	/* AMD ("AMDisbetter!") */
-	if (ebx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ebx &&
-	    ecx == X86EMUL_CPUID_VENDOR_AMDisbetterI_ecx &&
-	    edx == X86EMUL_CPUID_VENDOR_AMDisbetterI_edx)
-		return true;
-
-	/* default: (not Intel, not AMD), apply Intel's stricter rules... */
+	/*
+	 * default: (not Intel, not AMD, not Hygon), apply Intel's
+	 * stricter rules...
+	 */
 	return false;
 }
 
@@ -3984,7 +3970,7 @@ static int em_cpuid(struct x86_emulate_ctxt *ctxt)
 
 	eax = reg_read(ctxt, VCPU_REGS_RAX);
 	ecx = reg_read(ctxt, VCPU_REGS_RCX);
-	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
+	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, false);
 	*reg_write(ctxt, VCPU_REGS_RAX) = eax;
 	*reg_write(ctxt, VCPU_REGS_RBX) = ebx;
 	*reg_write(ctxt, VCPU_REGS_RCX) = ecx;
@@ -4254,7 +4240,7 @@ static int check_cr_write(struct x86_emulate_ctxt *ctxt)
 			eax = 0x80000008;
 			ecx = 0;
 			if (ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx,
-						 &edx, false))
+						 &edx, true))
 				maxphyaddr = eax & 0xff;
 			else
 				maxphyaddr = 36;

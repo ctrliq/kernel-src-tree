@@ -10,6 +10,7 @@
 #include <net/netfilter/nf_flow_table.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
+#include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_tuple.h>
 
 static DEFINE_MUTEX(flowtable_lock);
@@ -59,9 +60,9 @@ struct flow_offload *flow_offload_alloc(struct nf_conn *ct)
 	flow_offload_fill_dir(flow, FLOW_OFFLOAD_DIR_REPLY);
 
 	if (ct->status & IPS_SRC_NAT)
-		flow->flags |= FLOW_OFFLOAD_SNAT;
+		__set_bit(NF_FLOW_SNAT, &flow->flags);
 	if (ct->status & IPS_DST_NAT)
-		flow->flags |= FLOW_OFFLOAD_DNAT;
+		__set_bit(NF_FLOW_DNAT, &flow->flags);
 
 	return flow;
 
@@ -132,18 +133,13 @@ static void flow_offload_fixup_tcp(struct ip_ct_tcp *tcp)
 #define NF_FLOWTABLE_TCP_PICKUP_TIMEOUT	(120 * HZ)
 #define NF_FLOWTABLE_UDP_PICKUP_TIMEOUT	(30 * HZ)
 
-static inline __s32 nf_flow_timeout_delta(unsigned int timeout)
-{
-	return (__s32)(timeout - (u32)jiffies);
-}
-
 static void flow_offload_fixup_ct_timeout(struct nf_conn *ct)
 {
 	const struct nf_conntrack_l4proto *l4proto;
 	int l4num = nf_ct_protonum(ct);
 	unsigned int timeout;
 
-	l4proto = __nf_ct_l4proto_find(nf_ct_l3num(ct), l4num);
+	l4proto = __nf_ct_l4proto_find(l4num);
 	if (!l4proto)
 		return;
 
@@ -185,8 +181,6 @@ void flow_offload_free(struct flow_offload *flow)
 	default:
 		break;
 	}
-	if (flow->flags & FLOW_OFFLOAD_DYING)
-		nf_ct_delete(flow->ct, 0, 0);
 	nf_ct_put(flow->ct);
 	kfree_rcu(flow, rcu_head);
 }
@@ -230,7 +224,7 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
 {
 	int err;
 
-	flow->timeout = (u32)jiffies + NF_FLOW_TIMEOUT;
+	flow->timeout = nf_flowtable_time_stamp + NF_FLOW_TIMEOUT;
 
 	err = rhashtable_insert_fast(&flow_table->rhashtable,
 				     &flow->tuplehash[0].node,
@@ -248,9 +242,27 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
 		return err;
 	}
 
+	if (nf_flowtable_hw_offload(flow_table)) {
+		__set_bit(NF_FLOW_HW, &flow->flags);
+		nf_flow_offload_add(flow_table, flow);
+	}
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(flow_offload_add);
+
+void flow_offload_refresh(struct nf_flowtable *flow_table,
+			  struct flow_offload *flow)
+{
+	flow->timeout = nf_flowtable_time_stamp + NF_FLOW_TIMEOUT;
+
+	if (likely(!nf_flowtable_hw_offload(flow_table) ||
+		   !test_and_clear_bit(NF_FLOW_HW_REFRESH, &flow->flags)))
+		return;
+
+	nf_flow_offload_add(flow_table, flow);
+}
+EXPORT_SYMBOL_GPL(flow_offload_refresh);
 
 static inline bool nf_flow_has_expired(const struct flow_offload *flow)
 {
@@ -271,7 +283,7 @@ static void flow_offload_del(struct nf_flowtable *flow_table,
 
 	if (nf_flow_has_expired(flow))
 		flow_offload_fixup_ct(flow->ct);
-	else if (flow->flags & FLOW_OFFLOAD_TEARDOWN)
+	else
 		flow_offload_fixup_ct_timeout(flow->ct);
 
 	flow_offload_free(flow);
@@ -279,7 +291,7 @@ static void flow_offload_del(struct nf_flowtable *flow_table,
 
 void flow_offload_teardown(struct flow_offload *flow)
 {
-	flow->flags |= FLOW_OFFLOAD_TEARDOWN;
+	set_bit(NF_FLOW_TEARDOWN, &flow->flags);
 
 	flow_offload_fixup_ct_state(flow->ct);
 }
@@ -300,7 +312,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
 
 	dir = tuplehash->tuple.dir;
 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
-	if (flow->flags & (FLOW_OFFLOAD_DYING | FLOW_OFFLOAD_TEARDOWN))
+	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
 		return NULL;
 
 	if (unlikely(nf_ct_is_dying(flow->ct)))
@@ -348,9 +360,21 @@ static void nf_flow_offload_gc_step(struct flow_offload *flow, void *data)
 {
 	struct nf_flowtable *flow_table = data;
 
-	if (nf_flow_has_expired(flow) || nf_ct_is_dying(flow->ct) ||
-	    (flow->flags & (FLOW_OFFLOAD_DYING | FLOW_OFFLOAD_TEARDOWN)))
-		flow_offload_del(flow_table, flow);
+	if (nf_flow_has_expired(flow) || nf_ct_is_dying(flow->ct))
+		set_bit(NF_FLOW_TEARDOWN, &flow->flags);
+
+	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
+		if (test_bit(NF_FLOW_HW, &flow->flags)) {
+			if (!test_bit(NF_FLOW_HW_DYING, &flow->flags))
+				nf_flow_offload_del(flow_table, flow);
+			else if (test_bit(NF_FLOW_HW_DEAD, &flow->flags))
+				flow_offload_del(flow_table, flow);
+		} else {
+			flow_offload_del(flow_table, flow);
+		}
+	} else if (test_bit(NF_FLOW_HW, &flow->flags)) {
+		nf_flow_offload_stats(flow_table, flow);
+	}
 }
 
 static void nf_flow_offload_work_gc(struct work_struct *work)
@@ -361,6 +385,7 @@ static void nf_flow_offload_work_gc(struct work_struct *work)
 	nf_flow_table_iterate(flow_table, nf_flow_offload_gc_step, flow_table);
 	queue_delayed_work(system_power_efficient_wq, &flow_table->gc_work, HZ);
 }
+
 
 static int nf_flow_nat_port_tcp(struct sk_buff *skb, unsigned int thoff,
 				__be16 port, __be16 new_port)
@@ -483,6 +508,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
 	int err;
 
 	INIT_DEFERRABLE_WORK(&flowtable->gc_work, nf_flow_offload_work_gc);
+	flow_block_init(&flowtable->flow_block);
+	init_rwsem(&flowtable->flow_block_lock);
 
 	err = rhashtable_init(&flowtable->rhashtable,
 			      &nf_flow_offload_rhash_params);
@@ -512,7 +539,7 @@ static void nf_flow_table_do_cleanup(struct flow_offload *flow, void *data)
 	if (net_eq(nf_ct_net(flow->ct), dev_net(dev)) &&
 	    (flow->tuplehash[0].tuple.iifidx == dev->ifindex ||
 	     flow->tuplehash[1].tuple.iifidx == dev->ifindex))
-		flow_offload_dead(flow);
+		flow_offload_teardown(flow);
 }
 
 void nf_flow_table_gc_cleanup(struct nf_flowtable *flowtable,
@@ -539,6 +566,7 @@ void nf_flow_table_free(struct nf_flowtable *flow_table)
 	mutex_lock(&flowtable_lock);
 	list_del(&flow_table->list);
 	mutex_unlock(&flowtable_lock);
+
 	cancel_delayed_work_sync(&flow_table->gc_work);
 	nf_flow_table_iterate(flow_table, nf_flow_table_do_cleanup, NULL);
 	nf_flow_table_iterate(flow_table, nf_flow_offload_gc_step, flow_table);
@@ -549,6 +577,19 @@ void nf_flow_table_free(struct nf_flowtable *flow_table)
 	rhashtable_destroy(&flow_table->rhashtable);
 }
 EXPORT_SYMBOL_GPL(nf_flow_table_free);
+
+static int __init nf_flow_table_module_init(void)
+{
+	return nf_flow_table_offload_init();
+}
+
+static void __exit nf_flow_table_module_exit(void)
+{
+	nf_flow_table_offload_exit();
+}
+
+module_init(nf_flow_table_module_init);
+module_exit(nf_flow_table_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Pablo Neira Ayuso <pablo@netfilter.org>");

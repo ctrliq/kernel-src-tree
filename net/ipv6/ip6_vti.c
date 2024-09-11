@@ -300,7 +300,8 @@ static void vti6_dev_uninit(struct net_device *dev)
 	dev_put(dev);
 }
 
-static int vti6_rcv(struct sk_buff *skb)
+static int vti6_input_proto(struct sk_buff *skb, int nexthdr, __be32 spi,
+			    int encap_type)
 {
 	struct ip6_tnl *t;
 	const struct ipv6hdr *ipv6h = ipv6_hdr(skb);
@@ -327,7 +328,10 @@ static int vti6_rcv(struct sk_buff *skb)
 
 		rcu_read_unlock();
 
-		return xfrm6_rcv_tnl(skb, t);
+		XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6 = t;
+		XFRM_SPI_SKB_CB(skb)->family = AF_INET6;
+		XFRM_SPI_SKB_CB(skb)->daddroff = offsetof(struct ipv6hdr, daddr);
+		return xfrm_input(skb, nexthdr, spi, encap_type);
 	}
 	rcu_read_unlock();
 	return -EINVAL;
@@ -336,13 +340,20 @@ discard:
 	return 0;
 }
 
+static int vti6_rcv(struct sk_buff *skb)
+{
+	int nexthdr = skb_network_header(skb)[IP6CB(skb)->nhoff];
+
+	return vti6_input_proto(skb, nexthdr, 0, 0);
+}
+
 static int vti6_rcv_cb(struct sk_buff *skb, int err)
 {
 	unsigned short family;
 	struct net_device *dev;
 	struct pcpu_sw_netstats *tstats;
 	struct xfrm_state *x;
-	struct xfrm_mode *inner_mode;
+	const struct xfrm_mode *inner_mode;
 	struct ip6_tnl *t = XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6;
 	u32 orig_mark = skb->mark;
 	int ret;
@@ -1189,6 +1200,7 @@ static struct pernet_operations vti6_net_ops = {
 
 static struct xfrm6_protocol vti_esp6_protocol __read_mostly = {
 	.handler	=	vti6_rcv,
+	.input_handler	=	vti6_input_proto,
 	.cb_handler	=	vti6_rcv_cb,
 	.err_handler	=	vti6_err,
 	.priority	=	100,
@@ -1196,6 +1208,7 @@ static struct xfrm6_protocol vti_esp6_protocol __read_mostly = {
 
 static struct xfrm6_protocol vti_ah6_protocol __read_mostly = {
 	.handler	=	vti6_rcv,
+	.input_handler	=	vti6_input_proto,
 	.cb_handler	=	vti6_rcv_cb,
 	.err_handler	=	vti6_err,
 	.priority	=	100,
@@ -1203,6 +1216,7 @@ static struct xfrm6_protocol vti_ah6_protocol __read_mostly = {
 
 static struct xfrm6_protocol vti_ipcomp6_protocol __read_mostly = {
 	.handler	=	vti6_rcv,
+	.input_handler	=	vti6_input_proto,
 	.cb_handler	=	vti6_rcv_cb,
 	.err_handler	=	vti6_err,
 	.priority	=	100,

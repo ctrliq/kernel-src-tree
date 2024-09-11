@@ -133,8 +133,8 @@ static int of_mdiobus_register_phy(struct mii_bus *mdio,
 	if (mii_ts)
 		phy->mii_ts = mii_ts;
 
-	dev_dbg(&mdio->dev, "registered phy %s at address %i\n",
-		child->name, addr);
+	dev_dbg(&mdio->dev, "registered phy %pOFn at address %i\n",
+		child, addr);
 	return 0;
 }
 
@@ -163,8 +163,8 @@ static int of_mdiobus_register_device(struct mii_bus *mdio,
 		return rc;
 	}
 
-	dev_dbg(&mdio->dev, "registered mdio device %s at address %i\n",
-		child->name, addr);
+	dev_dbg(&mdio->dev, "registered mdio device %pOFn at address %i\n",
+		child, addr);
 	return 0;
 }
 
@@ -300,8 +300,8 @@ int of_mdiobus_register(struct mii_bus *mdio, struct device_node *np)
 				continue;
 
 			/* be noisy to encourage people to set reg property */
-			dev_info(&mdio->dev, "scan phy %s at address %i\n",
-				 child->name, addr);
+			dev_info(&mdio->dev, "scan phy %pOFn at address %i\n",
+				 child, addr);
 
 			if (of_mdiobus_child_is_phy(child)) {
 				rc = of_mdiobus_register_phy(mdio, child, addr);
@@ -320,12 +320,6 @@ unregister:
 }
 EXPORT_SYMBOL(of_mdiobus_register);
 
-/* Helper function for of_phy_find_device */
-static int of_phy_match(struct device *dev, const void *phy_np)
-{
-	return dev->of_node == phy_np;
-}
-
 /**
  * of_phy_find_device - Give a PHY node, find the phy_device
  * @phy_np: Pointer to the phy's device tree node
@@ -341,7 +335,7 @@ struct phy_device *of_phy_find_device(struct device_node *phy_np)
 	if (!phy_np)
 		return NULL;
 
-	d = bus_find_device(&mdio_bus_type, NULL, phy_np, of_phy_match);
+	d = bus_find_device_by_of_node(&mdio_bus_type, phy_np);
 	if (d) {
 		mdiodev = to_mdio_device(d);
 		if (mdiodev->flags & MDIO_DEVICE_FLAG_PHY)

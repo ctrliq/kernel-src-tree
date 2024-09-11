@@ -1052,11 +1052,11 @@ static int ath10k_download_fw(struct ath10k *ar)
 	}
 
 	memset(&latency_qos, 0, sizeof(latency_qos));
-	pm_qos_add_request(&latency_qos, PM_QOS_CPU_DMA_LATENCY, 0);
+	cpu_latency_qos_add_request(&latency_qos, 0);
 
 	ret = ath10k_bmi_fast_download(ar, address, data, data_len);
 
-	pm_qos_remove_request(&latency_qos);
+	cpu_latency_qos_remove_request(&latency_qos);
 
 	return ret;
 }
@@ -2807,7 +2807,7 @@ int ath10k_core_start(struct ath10k *ar, enum ath10k_firmware_mode mode,
 
 	status = ath10k_hif_set_target_log_mode(ar, fw_diag_log);
 	if (status && status != -EOPNOTSUPP) {
-		ath10k_warn(ar, "set traget log mode faileds: %d\n", status);
+		ath10k_warn(ar, "set target log mode failed: %d\n", status);
 		goto err_hif_stop;
 	}
 

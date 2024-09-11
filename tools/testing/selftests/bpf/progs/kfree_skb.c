@@ -2,9 +2,9 @@
 // Copyright (c) 2019 Facebook
 #include <linux/bpf.h>
 #include <stdbool.h>
-#include "bpf_helpers.h"
-#include "bpf_endian.h"
-#include "bpf_trace_helpers.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include <bpf/bpf_tracing.h>
 
 char _license[] SEC("license") = "GPL";
 struct {

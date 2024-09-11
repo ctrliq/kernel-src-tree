@@ -16,6 +16,7 @@
 #include <linux/workqueue.h>
 #include <linux/scatterlist.h>
 #include <linux/wait.h>
+#include <linux/mutex.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_cache.h>
 
@@ -33,7 +34,7 @@
 #define SMC_QP_RNR_RETRY			7 /* 7: infinite */
 
 struct smc_ib_devices smc_ib_devices = {	/* smc-registered ib devices */
-	.lock = __SPIN_LOCK_UNLOCKED(smc_ib_devices.lock),
+	.mutex = __MUTEX_INITIALIZER(smc_ib_devices.mutex),
 	.list = LIST_HEAD_INIT(smc_ib_devices.list),
 };
 
@@ -249,7 +250,7 @@ static void smc_ib_port_event_work(struct work_struct *work)
 		clear_bit(port_idx, &smcibdev->port_event_mask);
 		if (!smc_ib_port_active(smcibdev, port_idx + 1)) {
 			set_bit(port_idx, smcibdev->ports_going_away);
-			smc_port_terminate(smcibdev, port_idx + 1);
+			smcr_port_err(smcibdev, port_idx + 1);
 		} else {
 			clear_bit(port_idx, smcibdev->ports_going_away);
 			smcr_port_add(smcibdev, port_idx + 1);
@@ -505,6 +506,10 @@ long smc_ib_setup_per_ibdev(struct smc_ib_device *smcibdev)
 	int cqe_size_order, smc_order;
 	long rc;
 
+	mutex_lock(&smcibdev->mutex);
+	rc = 0;
+	if (smcibdev->initialized)
+		goto out;
 	/* the calculated number of cq entries fits to mlx5 cq allocation */
 	cqe_size_order = cache_line_size() == 128 ? 7 : 6;
 	smc_order = MAX_ORDER - cqe_size_order - 1;
@@ -516,7 +521,7 @@ long smc_ib_setup_per_ibdev(struct smc_ib_device *smcibdev)
 	rc = PTR_ERR_OR_ZERO(smcibdev->roce_cq_send);
 	if (IS_ERR(smcibdev->roce_cq_send)) {
 		smcibdev->roce_cq_send = NULL;
-		return rc;
+		goto out;
 	}
 	smcibdev->roce_cq_recv = ib_create_cq(smcibdev->ibdev,
 					      smc_wr_rx_cq_handler, NULL,
@@ -528,21 +533,26 @@ long smc_ib_setup_per_ibdev(struct smc_ib_device *smcibdev)
 	}
 	smc_wr_add_dev(smcibdev);
 	smcibdev->initialized = 1;
-	return rc;
+	goto out;
 
 err:
 	ib_destroy_cq(smcibdev->roce_cq_send);
+out:
+	mutex_unlock(&smcibdev->mutex);
 	return rc;
 }
 
 static void smc_ib_cleanup_per_ibdev(struct smc_ib_device *smcibdev)
 {
+	mutex_lock(&smcibdev->mutex);
 	if (!smcibdev->initialized)
-		return;
+		goto out;
 	smcibdev->initialized = 0;
 	ib_destroy_cq(smcibdev->roce_cq_recv);
 	ib_destroy_cq(smcibdev->roce_cq_send);
 	smc_wr_remove_dev(smcibdev);
+out:
+	mutex_unlock(&smcibdev->mutex);
 }
 
 static struct ib_client smc_ib_client;
@@ -565,9 +575,10 @@ static void smc_ib_add_dev(struct ib_device *ibdev)
 	INIT_WORK(&smcibdev->port_event_work, smc_ib_port_event_work);
 	atomic_set(&smcibdev->lnk_cnt, 0);
 	init_waitqueue_head(&smcibdev->lnks_deleted);
-	spin_lock(&smc_ib_devices.lock);
+	mutex_init(&smcibdev->mutex);
+	mutex_lock(&smc_ib_devices.mutex);
 	list_add_tail(&smcibdev->list, &smc_ib_devices.list);
-	spin_unlock(&smc_ib_devices.lock);
+	mutex_unlock(&smc_ib_devices.mutex);
 	ib_set_client_data(ibdev, &smc_ib_client, smcibdev);
 	INIT_IB_EVENT_HANDLER(&smcibdev->event_handler, smcibdev->ibdev,
 			      smc_ib_global_event_handler);
@@ -575,6 +586,8 @@ static void smc_ib_add_dev(struct ib_device *ibdev)
 
 	/* trigger reading of the port attributes */
 	port_cnt = smcibdev->ibdev->phys_port_cnt;
+	pr_warn_ratelimited("smc: adding ib device %s with port count %d\n",
+			    smcibdev->ibdev->name, port_cnt);
 	for (i = 0;
 	     i < min_t(size_t, port_cnt, SMC_MAX_PORTS);
 	     i++) {
@@ -583,6 +596,13 @@ static void smc_ib_add_dev(struct ib_device *ibdev)
 		if (smc_pnetid_by_dev_port(ibdev->dev.parent, i,
 					   smcibdev->pnetid[i]))
 			smc_pnetid_by_table_ib(smcibdev, i + 1);
+		pr_warn_ratelimited("smc:    ib device %s port %d has pnetid "
+				    "%.16s%s\n",
+				    smcibdev->ibdev->name, i + 1,
+				    smcibdev->pnetid[i],
+				    smcibdev->pnetid_by_user[i] ?
+				     " (user defined)" :
+				     "");
 	}
 	schedule_work(&smcibdev->port_event_work);
 }
@@ -596,9 +616,11 @@ static void smc_ib_remove_dev(struct ib_device *ibdev, void *client_data)
 	if (!smcibdev || smcibdev->ibdev != ibdev)
 		return;
 	ib_set_client_data(ibdev, &smc_ib_client, NULL);
-	spin_lock(&smc_ib_devices.lock);
+	mutex_lock(&smc_ib_devices.mutex);
 	list_del_init(&smcibdev->list); /* remove from smc_ib_devices */
-	spin_unlock(&smc_ib_devices.lock);
+	mutex_unlock(&smc_ib_devices.mutex);
+	pr_warn_ratelimited("smc: removing ib device %s\n",
+			    smcibdev->ibdev->name);
 	smc_smcr_terminate_all(smcibdev);
 	smc_ib_cleanup_per_ibdev(smcibdev);
 	ib_unregister_event_handler(&smcibdev->event_handler);

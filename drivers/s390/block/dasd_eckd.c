@@ -1607,11 +1607,9 @@ static int dasd_eckd_read_vol_info(struct dasd_device *device)
 
 static int dasd_eckd_is_ese(struct dasd_device *device)
 {
-	/*
-	 * RHEL-only: return 0 to disable ese support
-	 * this will be changed when a data integrity issue is solved
-	 */
-	return 0;
+	struct dasd_eckd_private *private = device->private;
+
+	return private->vsq.vol_info.ese;
 }
 
 static int dasd_eckd_ext_pool_id(struct dasd_device *device)

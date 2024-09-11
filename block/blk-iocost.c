@@ -185,6 +185,7 @@
 #include "blk-rq-qos.h"
 #include "blk-stat.h"
 #include "blk-wbt.h"
+#include "blk.h"
 
 #ifdef CONFIG_TRACEPOINTS
 
@@ -1848,7 +1849,7 @@ static void ioc_rqos_done(struct rq_qos *rqos, struct request *rq)
 	u64 on_q_ns, rq_wait_ns;
 	int pidx, rw;
 
-	if (!ioc->enabled || !rq->alloc_time_ns || !rq->start_time_ns)
+	if (!ioc->enabled || !rq_aux(rq)->alloc_time_ns || !rq->start_time_ns)
 		return;
 
 	switch (req_op(rq) & REQ_OP_MASK) {
@@ -1864,8 +1865,8 @@ static void ioc_rqos_done(struct rq_qos *rqos, struct request *rq)
 		return;
 	}
 
-	on_q_ns = ktime_get_ns() - rq->alloc_time_ns;
-	rq_wait_ns = rq->start_time_ns - rq->alloc_time_ns;
+	on_q_ns = ktime_get_ns() - rq_aux(rq)->alloc_time_ns;
+	rq_wait_ns = rq->start_time_ns - rq_aux(rq)->alloc_time_ns;
 
 	if (on_q_ns <= ioc->params.qos[pidx] * NSEC_PER_USEC)
 		this_cpu_inc(ioc->pcpu_stat->missed[rw].nr_met);

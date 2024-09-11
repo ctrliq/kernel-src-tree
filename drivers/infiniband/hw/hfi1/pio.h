@@ -243,7 +243,7 @@ struct sc_config_sizes {
  */
 struct pio_map_elem {
 	u32 mask;
-	struct send_context *ksc[];
+	struct send_context *ksc[0];
 };
 
 /*
@@ -263,7 +263,7 @@ struct pio_vl_map {
 	u32 mask;
 	u8 actual_vls;
 	u8 vls;
-	struct pio_map_elem *map[];
+	struct pio_map_elem *map[0];
 };
 
 int pio_map_init(struct hfi1_devdata *dd, u8 port, u8 num_vls,

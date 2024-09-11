@@ -293,11 +293,10 @@ static long kvmppc_virtmode_do_h_enter(struct kvm *kvm, unsigned long flags,
 {
 	long ret;
 
-	/* Protect linux PTE lookup from page table destruction */
-	rcu_read_lock_sched();	/* this disables preemption too */
+	preempt_disable();
 	ret = kvmppc_do_h_enter(kvm, flags, pte_index, pteh, ptel,
-				current->mm->pgd, false, pte_idx_ret);
-	rcu_read_unlock_sched();
+				kvm->mm->pgd, false, pte_idx_ret);
+	preempt_enable();
 	if (ret == H_TOO_HARD) {
 		/* this can't happen */
 		pr_err("KVM: Oops, kvmppc_h_enter returned too hard!\n");
@@ -2146,9 +2145,8 @@ static const struct file_operations debugfs_htab_fops = {
 
 void kvmppc_mmu_debugfs_init(struct kvm *kvm)
 {
-	kvm->arch.htab_dentry = debugfs_create_file("htab", 0400,
-						    kvm->arch.debugfs_dir, kvm,
-						    &debugfs_htab_fops);
+	debugfs_create_file("htab", 0400, kvm->arch.debugfs_dir, kvm,
+			    &debugfs_htab_fops);
 }
 
 void kvmppc_mmu_book3s_hv_init(struct kvm_vcpu *vcpu)

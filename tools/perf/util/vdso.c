@@ -10,7 +10,8 @@
 #include <linux/kernel.h>
 
 #include "vdso.h"
-#include "util.h"
+#include "dso.h"
+#include <internal/lib.h>
 #include "map.h"
 #include "symbol.h"
 #include "machine.h"
@@ -143,7 +144,7 @@ static enum dso_type machine__thread_dso_type(struct machine *machine,
 	enum dso_type dso_type = DSO__TYPE_UNKNOWN;
 	struct map *map;
 
-	map_groups__for_each_entry(thread->mg, map) {
+	maps__for_each_entry(thread->maps, map) {
 		struct dso *dso = map->dso;
 		if (!dso || dso->long_name[0] != '/')
 			continue;

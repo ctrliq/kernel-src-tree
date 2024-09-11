@@ -954,7 +954,7 @@ static ssize_t write_maxconn(struct file *file, char *buf, size_t size)
 
 #ifdef CONFIG_NFSD_V4
 static ssize_t __nfsd4_write_time(struct file *file, char *buf, size_t size,
-				  time_t *time, struct nfsd_net *nn)
+				  time64_t *time, struct nfsd_net *nn)
 {
 	char *mesg = buf;
 	int rv, i;
@@ -982,11 +982,11 @@ static ssize_t __nfsd4_write_time(struct file *file, char *buf, size_t size,
 		*time = i;
 	}
 
-	return scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%ld\n", *time);
+	return scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%lld\n", *time);
 }
 
 static ssize_t nfsd4_write_time(struct file *file, char *buf, size_t size,
-				time_t *time, struct nfsd_net *nn)
+				time64_t *time, struct nfsd_net *nn)
 {
 	ssize_t rv;
 
@@ -1406,6 +1406,18 @@ static struct file_system_type nfsd_fs_type = {
 };
 MODULE_ALIAS_FS("nfsd");
 
+int get_nfsdfs(struct net *net)
+{
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	struct vfsmount *mnt;
+
+	mnt =  vfs_kern_mount(&nfsd_fs_type, SB_KERNMOUNT, "nfsd", NULL);
+	if (IS_ERR(mnt))
+		return PTR_ERR(mnt);
+	nn->nfsd_mnt = mnt;
+	return 0;
+}
+
 #ifdef CONFIG_PROC_FS
 static int create_proc_exports_entry(void)
 {
@@ -1434,7 +1446,6 @@ unsigned int nfsd_net_id;
 static __net_init int nfsd_init_net(struct net *net)
 {
 	int retval;
-	struct vfsmount *mnt;
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
 	retval = nfsd_export_init(net);
@@ -1461,16 +1472,8 @@ static __net_init int nfsd_init_net(struct net *net)
 	init_waitqueue_head(&nn->ntf_wq);
 	seqlock_init(&nn->boot_lock);
 
-	mnt =  vfs_kern_mount(&nfsd_fs_type, SB_KERNMOUNT, "nfsd", NULL);
-	if (IS_ERR(mnt)) {
-		retval = PTR_ERR(mnt);
-		goto out_mount_err;
-	}
-	nn->nfsd_mnt = mnt;
 	return 0;
 
-out_mount_err:
-	nfsd_reply_cache_shutdown(nn);
 out_drc_error:
 	nfsd_idmap_shutdown(net);
 out_idmap_error:
@@ -1483,7 +1486,6 @@ static __net_exit void nfsd_exit_net(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
-	mntput(nn->nfsd_mnt);
 	nfsd_reply_cache_shutdown(nn);
 	nfsd_idmap_shutdown(net);
 	nfsd_export_shutdown(net);

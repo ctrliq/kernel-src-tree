@@ -126,7 +126,7 @@ struct radix_tree_iter {
 #ifdef CONFIG_RADIX_TREE_MULTIORDER
 	unsigned int	shift;
 #endif
-	RH_KABI_SIZE_AND_EXTEND(radix_tree_iter);
+	RH_KABI_AUX_EMBED(radix_tree_iter);
 };
 
 static inline unsigned int iter_shift(const struct radix_tree_iter *iter)

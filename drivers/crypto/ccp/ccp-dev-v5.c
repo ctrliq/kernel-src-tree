@@ -2,15 +2,13 @@
 /*
  * AMD Cryptographic Coprocessor (CCP) driver
  *
- * Copyright (C) 2016,2017 Advanced Micro Devices, Inc.
+ * Copyright (C) 2016,2019 Advanced Micro Devices, Inc.
  *
  * Author: Gary R Hook <gary.hook@amd.com>
  */
 
-#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
-#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/compiler.h>
@@ -803,8 +801,7 @@ static int ccp5_init(struct ccp_device *ccp)
 		return 1;
 	}
 
-	for (i = 0; i < MAX_HW_QUEUES; i++) {
-
+	for (i = 0; (i < MAX_HW_QUEUES) && (ccp->cmd_q_count < ccp->max_q_count); i++) {
 		if (!(qmr & (1 << i)))
 			continue;
 

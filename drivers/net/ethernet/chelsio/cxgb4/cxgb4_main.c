@@ -66,6 +66,9 @@
 #include <linux/crash_dump.h>
 #include <net/udp_tunnel.h>
 #include <net/xfrm.h>
+#if defined(CONFIG_CHELSIO_TLS_DEVICE)
+#include <net/tls.h>
+#endif
 
 #include "cxgb4.h"
 #include "cxgb4_filter.h"
@@ -186,6 +189,7 @@ static struct dentry *cxgb4_debugfs_root;
 
 LIST_HEAD(adapter_list);
 DEFINE_MUTEX(uld_mutex);
+LIST_HEAD(uld_list);
 
 static int cfg_queues(struct adapter *adap);
 
@@ -1164,7 +1168,7 @@ static u16 cxgb_select_queue(struct net_device *dev, struct sk_buff *skb,
 				     ip_hdr(skb)->protocol;
 
 		/* Send unsupported traffic pattern to normal NIC queues. */
-		txq = netdev_pick_tx(dev, skb, sb_dev);
+		txq = fallback(dev, skb, sb_dev);
 		if (xfrm_offload(skb) || is_ptp_enabled(skb, dev) ||
 		    skb->encapsulation ||
 		    (proto != IPPROTO_TCP && proto != IPPROTO_UDP))
@@ -6072,6 +6076,79 @@ static int cxgb4_iov_configure(struct pci_dev *pdev, int num_vfs)
 }
 #endif /* CONFIG_PCI_IOV */
 
+#if defined(CONFIG_CHELSIO_TLS_DEVICE)
+
+static int cxgb4_ktls_dev_add(struct net_device *netdev, struct sock *sk,
+			      enum tls_offload_ctx_dir direction,
+			      struct tls_crypto_info *crypto_info,
+			      u32 tcp_sn)
+{
+	struct adapter *adap = netdev2adap(netdev);
+	int ret = 0;
+
+	mutex_lock(&uld_mutex);
+	if (!adap->uld[CXGB4_ULD_CRYPTO].handle) {
+		dev_err(adap->pdev_dev, "chcr driver is not loaded\n");
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	if (!adap->uld[CXGB4_ULD_CRYPTO].tlsdev_ops) {
+		dev_err(adap->pdev_dev,
+			"chcr driver has no registered tlsdev_ops()\n");
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	ret = cxgb4_set_ktls_feature(adap, FW_PARAMS_PARAM_DEV_KTLS_HW_ENABLE);
+	if (ret)
+		goto out_unlock;
+
+	ret = adap->uld[CXGB4_ULD_CRYPTO].tlsdev_ops->tls_dev_add(netdev, sk,
+								  direction,
+								  crypto_info,
+								  tcp_sn);
+	/* if there is a failure, clear the refcount */
+	if (ret)
+		cxgb4_set_ktls_feature(adap,
+				       FW_PARAMS_PARAM_DEV_KTLS_HW_DISABLE);
+out_unlock:
+	mutex_unlock(&uld_mutex);
+	return ret;
+}
+
+static void cxgb4_ktls_dev_del(struct net_device *netdev,
+			       struct tls_context *tls_ctx,
+			       enum tls_offload_ctx_dir direction)
+{
+	struct adapter *adap = netdev2adap(netdev);
+
+	mutex_lock(&uld_mutex);
+	if (!adap->uld[CXGB4_ULD_CRYPTO].handle) {
+		dev_err(adap->pdev_dev, "chcr driver is not loaded\n");
+		goto out_unlock;
+	}
+
+	if (!adap->uld[CXGB4_ULD_CRYPTO].tlsdev_ops) {
+		dev_err(adap->pdev_dev,
+			"chcr driver has no registered tlsdev_ops\n");
+		goto out_unlock;
+	}
+
+	adap->uld[CXGB4_ULD_CRYPTO].tlsdev_ops->tls_dev_del(netdev, tls_ctx,
+							    direction);
+	cxgb4_set_ktls_feature(adap, FW_PARAMS_PARAM_DEV_KTLS_HW_DISABLE);
+
+out_unlock:
+	mutex_unlock(&uld_mutex);
+}
+
+static const struct tlsdev_ops cxgb4_ktls_ops = {
+	.tls_dev_add = cxgb4_ktls_dev_add,
+	.tls_dev_del = cxgb4_ktls_dev_del,
+};
+#endif /* CONFIG_CHELSIO_TLS_DEVICE */
+
 static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	struct net_device *netdev;
@@ -6325,7 +6402,14 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 			netdev->hw_features |= NETIF_F_HIGHDMA;
 		netdev->features |= netdev->hw_features;
 		netdev->vlan_features = netdev->features & VLAN_FEAT;
-
+#if defined(CONFIG_CHELSIO_TLS_DEVICE)
+		if (pi->adapter->params.crypto & FW_CAPS_CONFIG_TLS_HW) {
+			netdev->hw_features |= NETIF_F_HW_TLS_TX;
+			netdev->tlsdev_ops = &cxgb4_ktls_ops;
+			/* initialize the refcount */
+			refcount_set(&pi->adapter->chcr_ktls.ktls_refcount, 0);
+		}
+#endif
 		netdev->priv_flags |= IFF_UNICAST_FLT;
 
 		/* MTU range: 81 - 9600 */
@@ -6532,11 +6616,8 @@ fw_attach_fail:
 	/* PCIe EEH recovery on powerpc platforms needs fundamental reset */
 	pdev->needs_freset = 1;
 
-	if (is_uld(adapter)) {
-		mutex_lock(&uld_mutex);
-		list_add_tail(&adapter->list_node, &adapter_list);
-		mutex_unlock(&uld_mutex);
-	}
+	if (is_uld(adapter))
+		cxgb4_uld_enable(adapter);
 
 	if (!is_t4(adapter->params.chip))
 		cxgb4_ptp_init(adapter);

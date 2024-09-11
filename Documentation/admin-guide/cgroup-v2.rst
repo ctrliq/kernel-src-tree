@@ -608,8 +608,8 @@ on an IO device and is an example of this type.
 Protections
 -----------
 
-A cgroup is protected to be allocated upto the configured amount of
-the resource if the usages of all its ancestors are under their
+A cgroup is protected upto the configured amount of the resource
+as long as the usages of all its ancestors are under their
 protected levels.  Protections can be hard guarantees or best effort
 soft boundaries.  Protections can also be over-committed in which case
 only upto the amount available to the parent is protected among
@@ -1055,7 +1055,10 @@ PAGE_SIZE multiple when read back.
 	is within its effective min boundary, the cgroup's memory
 	won't be reclaimed under any conditions. If there is no
 	unprotected reclaimable memory available, OOM killer
-	is invoked.
+	is invoked. Above the effective min boundary (or
+	effective low boundary if it is higher), pages are reclaimed
+	proportionally to the overage, reducing reclaim pressure for
+	smaller overages.
 
        Effective min boundary is limited by memory.min values of
 	all ancestor cgroups. If there is memory.min overcommitment
@@ -1077,7 +1080,10 @@ PAGE_SIZE multiple when read back.
 	Best-effort memory protection.  If the memory usage of a
 	cgroup is within its effective low boundary, the cgroup's
 	memory won't be reclaimed unless memory can be reclaimed
-	from unprotected cgroups.
+	from unprotected cgroups.  Above the effective low boundary (or
+	effective min boundary if it is higher), pages are reclaimed
+	proportionally to the overage, reducing reclaim pressure for
+	smaller overages.
 
 	Effective low boundary is limited by memory.low values of
 	all ancestor cgroups. If there is memory.low overcommitment
@@ -1224,6 +1230,10 @@ PAGE_SIZE multiple when read back.
 		Amount of cached filesystem data that was modified and
 		is currently being written back to disk
 
+	  anon_thp
+		Amount of memory used in anonymous mappings backed by
+		transparent hugepages
+
 	  inactive_anon, active_anon, inactive_file, active_file, unevictable
 		Amount of memory, swap-backed and filesystem-backed,
 		on the internal memory management lists used by the
@@ -1282,6 +1292,18 @@ PAGE_SIZE multiple when read back.
 	  pglazyfreed
 
 		Amount of reclaimed lazyfree pages
+
+	  thp_fault_alloc
+
+		Number of transparent hugepages which were allocated to satisfy
+		a page fault, including COW faults. This counter is not present
+		when CONFIG_TRANSPARENT_HUGEPAGE is not set.
+
+	  thp_collapse_alloc
+
+		Number of transparent hugepages which were allocated to allow
+		collapsing an existing range of pages. This counter is not
+		present when CONFIG_TRANSPARENT_HUGEPAGE is not set.
 
   memory.swap.current
 	A read-only single value file which exists on non-root
@@ -2215,7 +2237,7 @@ following two functions.
 	a queue (device) has been associated with the bio and
 	before submission.
 
-  wbc_account_io(@wbc, @page, @bytes)
+  wbc_account_cgroup_owner(@wbc, @page, @bytes)
 	Should be called for each data segment being written out.
 	While this function doesn't care exactly when it's called
 	during the writeback session, it's the easiest and most
@@ -2442,8 +2464,10 @@ system performance due to overreclaim, to the point where the feature
 becomes self-defeating.
 
 The memory.low boundary on the other hand is a top-down allocated
-reserve.  A cgroup enjoys reclaim protection when it's within its low,
-which makes delegation of subtrees possible.
+reserve.  A cgroup enjoys reclaim protection when it's within its
+effective low, which makes delegation of subtrees possible. It also
+enjoys having reclaim pressure proportional to its overage when
+above its effective low.
 
 The original high boundary, the hard limit, is defined as a strict
 limit that can not budge, even if the OOM killer has to be called.

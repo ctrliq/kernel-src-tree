@@ -823,7 +823,16 @@ static const struct rpc_program cb_program = {
 static int max_cb_time(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
-	return max(nn->nfsd4_lease/10, (time_t)1) * HZ;
+
+	/*
+	 * nfsd4_lease is set to at most one hour in __nfsd4_write_time,
+	 * so we can use 32-bit math on it. Warn if that assumption
+	 * ever stops being true.
+	 */
+	if (WARN_ON_ONCE(nn->nfsd4_lease > 3600))
+		return 360 * HZ;
+
+	return max(((u32)nn->nfsd4_lease)/10, 1u) * HZ;
 }
 
 static struct workqueue_struct *callback_wq;
@@ -1083,7 +1092,7 @@ static bool nfsd4_cb_sequence_done(struct rpc_task *task, struct nfsd4_callback 
 		 * the submission code will error out, so we don't need to
 		 * handle that case here.
 		 */
-		if (task->tk_flags & RPC_TASK_KILLED)
+		if (RPC_SIGNALLED(task))
 			goto need_restart;
 
 		return true;
@@ -1135,7 +1144,7 @@ static bool nfsd4_cb_sequence_done(struct rpc_task *task, struct nfsd4_callback 
 	dprintk("%s: freed slot, new seqid=%d\n", __func__,
 		clp->cl_cb_session->se_cb_seq_nr);
 
-	if (task->tk_flags & RPC_TASK_KILLED)
+	if (RPC_SIGNALLED(task))
 		goto need_restart;
 out:
 	return ret;

@@ -48,6 +48,7 @@ enum {
 	MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT = BIT(0),
 	MLX5_FLOW_TABLE_TUNNEL_EN_DECAP = BIT(1),
 	MLX5_FLOW_TABLE_TERMINATION = BIT(2),
+	MLX5_FLOW_TABLE_UNMANAGED = BIT(3),
 };
 
 #define LEFTOVERS_RULE_NUM	 2
@@ -75,12 +76,15 @@ enum mlx5_flow_namespace_type {
 	MLX5_FLOW_NAMESPACE_SNIFFER_TX,
 	MLX5_FLOW_NAMESPACE_EGRESS,
 	MLX5_FLOW_NAMESPACE_RDMA_RX,
+	MLX5_FLOW_NAMESPACE_RDMA_RX_KERNEL,
 };
 
 enum {
 	FDB_BYPASS_PATH,
-	FDB_FAST_PATH,
+	FDB_TC_OFFLOAD,
+	FDB_FT_OFFLOAD,
 	FDB_SLOW_PATH,
+	FDB_PER_VPORT,
 };
 
 struct mlx5_pkt_reformat;
@@ -148,6 +152,7 @@ struct mlx5_flow_table_attr {
 	int max_fte;
 	u32 level;
 	u32 flags;
+	struct mlx5_flow_table *next_ft;
 
 	struct {
 		int max_num_groups;

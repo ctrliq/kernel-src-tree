@@ -283,7 +283,7 @@ struct pci_packet {
 				int resp_packet_size);
 	void *compl_ctxt;
 
-	struct pci_message message[0];
+	struct pci_message message[];
 };
 
 /*
@@ -319,19 +319,19 @@ struct pci_bus_d0_entry {
 struct pci_bus_relations {
 	struct pci_incoming_message incoming;
 	u32 device_count;
-	struct pci_function_description func[0];
+	struct pci_function_description func[];
 } __packed;
 
 struct pci_bus_relations2 {
 	struct pci_incoming_message incoming;
 	u32 device_count;
-	struct pci_function_description2 func[0];
+	struct pci_function_description2 func[];
 } __packed;
 
 struct pci_q_res_req_response {
 	struct vmpacket_descriptor hdr;
 	s32 status;			/* negative values are failures */
-	u32 probed_bar[6];
+	u32 probed_bar[PCI_STD_NUM_BARS];
 } __packed;
 
 struct pci_set_power {
@@ -518,7 +518,7 @@ struct hv_pcidev_description {
 struct hv_dr_state {
 	struct list_head list_entry;
 	u32 device_count;
-	struct hv_pcidev_description func[0];
+	struct hv_pcidev_description func[];
 };
 
 enum hv_pcichild_state {
@@ -547,7 +547,7 @@ struct hv_pci_dev {
 	 * What would be observed if one wrote 0xFFFFFFFF to a BAR and then
 	 * read it back, for each of the BAR offsets within config space.
 	 */
-	u32 probed_bar[6];
+	u32 probed_bar[PCI_STD_NUM_BARS];
 };
 
 struct hv_pci_compl {
@@ -991,7 +991,6 @@ int hv_read_config_block(struct pci_dev *pdev, void *buf, unsigned int len,
 	*bytes_returned = comp_pkt.bytes_returned;
 	return 0;
 }
-EXPORT_SYMBOL(hv_read_config_block);
 
 /**
  * hv_pci_write_config_compl() - Invoked when a response packet for a write
@@ -1078,7 +1077,6 @@ int hv_write_config_block(struct pci_dev *pdev, void *buf, unsigned int len,
 
 	return 0;
 }
-EXPORT_SYMBOL(hv_write_config_block);
 
 /**
  * hv_register_block_invalidate() - Invoked when a config block invalidation
@@ -1109,7 +1107,6 @@ int hv_register_block_invalidate(struct pci_dev *pdev, void *context,
 	return 0;
 
 }
-EXPORT_SYMBOL(hv_register_block_invalidate);
 
 /* Interrupt management hooks */
 static void hv_int_desc_free(struct hv_pci_dev *hpdev,
@@ -1621,7 +1618,7 @@ static void survey_child_resources(struct hv_pcibus_device *hbus)
 	 * so it's sufficient to just add them up without tracking alignment.
 	 */
 	list_for_each_entry(hpdev, &hbus->children, list_entry) {
-		for (i = 0; i < 6; i++) {
+		for (i = 0; i < PCI_STD_NUM_BARS; i++) {
 			if (hpdev->probed_bar[i] & PCI_BASE_ADDRESS_SPACE_IO)
 				dev_err(&hbus->hdev->device,
 					"There's an I/O BAR in this list!\n");
@@ -1712,7 +1709,7 @@ static void prepopulate_bars(struct hv_pcibus_device *hbus)
 	/* Pick addresses for the BARs. */
 	do {
 		list_for_each_entry(hpdev, &hbus->children, list_entry) {
-			for (i = 0; i < 6; i++) {
+			for (i = 0; i < PCI_STD_NUM_BARS; i++) {
 				bar_val = hpdev->probed_bar[i];
 				if (bar_val == 0)
 					continue;
@@ -1891,7 +1888,7 @@ static void q_resource_requirements(void *context, struct pci_response *resp,
 			"query resource requirements failed: %x\n",
 			resp->status);
 	} else {
-		for (i = 0; i < 6; i++) {
+		for (i = 0; i < PCI_STD_NUM_BARS; i++) {
 			completion->hpdev->probed_bar[i] =
 				q_res_req->probed_bar[i];
 		}
@@ -2756,10 +2753,8 @@ static int hv_pci_enter_d0(struct hv_device *hdev)
 	struct pci_bus_d0_entry *d0_entry;
 	struct hv_pci_compl comp_pkt;
 	struct pci_packet *pkt;
-	bool retry = true;
 	int ret;
 
-enter_d0_retry:
 	/*
 	 * Tell the host that the bus is ready to use, and moved into the
 	 * powered-on state.  This includes telling the host which region
@@ -2785,38 +2780,6 @@ enter_d0_retry:
 
 	if (ret)
 		goto exit;
-
-	/*
-	 * In certain case (Kdump) the pci device of interest was
-	 * not cleanly shut down and resource is still held on host
-	 * side, the host could return invalid device status.
-	 * We need to explicitly request host to release the resource
-	 * and try to enter D0 again.
-	 */
-	if (comp_pkt.completion_status < 0 && retry) {
-		retry = false;
-
-		dev_err(&hdev->device, "Retrying D0 Entry\n");
-
-		/*
-		 * Hv_pci_bus_exit() calls hv_send_resource_released()
-		 * to free up resources of its child devices.
-		 * In the kdump kernel we need to set the
-		 * wslot_res_allocated to 255 so it scans all child
-		 * devices to release resources allocated in the
-		 * normal kernel before panic happened.
-		 */
-		hbus->wslot_res_allocated = 255;
-
-		ret = hv_pci_bus_exit(hdev, true);
-
-		if (ret == 0) {
-			kfree(pkt);
-			goto enter_d0_retry;
-		}
-		dev_err(&hdev->device,
-			"Retrying D0 failed with ret %d\n", ret);
-	}
 
 	if (comp_pkt.completion_status < 0) {
 		dev_err(&hdev->device,
@@ -3054,6 +3017,8 @@ static int hv_pci_probe(struct hv_device *hdev,
 {
 	struct hv_pcibus_device *hbus;
 	u16 dom_req, dom;
+	char *name;
+	bool enter_d0_retry = true;
 	int ret;
 
 	/*
@@ -3157,7 +3122,14 @@ static int hv_pci_probe(struct hv_device *hdev,
 		goto free_config;
 	}
 
-	hbus->sysdata.fwnode = irq_domain_alloc_fwnode(hbus);
+	name = kasprintf(GFP_KERNEL, "%pUL", &hdev->dev_instance);
+	if (!name) {
+		ret = -ENOMEM;
+		goto unmap;
+	}
+
+	hbus->sysdata.fwnode = irq_domain_alloc_named_fwnode(name);
+	kfree(name);
 	if (!hbus->sysdata.fwnode) {
 		ret = -ENOMEM;
 		goto unmap;
@@ -3167,11 +3139,47 @@ static int hv_pci_probe(struct hv_device *hdev,
 	if (ret)
 		goto free_fwnode;
 
+retry:
 	ret = hv_pci_query_relations(hdev);
 	if (ret)
 		goto free_irq_domain;
 
 	ret = hv_pci_enter_d0(hdev);
+	/*
+	 * In certain case (Kdump) the pci device of interest was
+	 * not cleanly shut down and resource is still held on host
+	 * side, the host could return invalid device status.
+	 * We need to explicitly request host to release the resource
+	 * and try to enter D0 again.
+	 * Since the hv_pci_bus_exit() call releases structures
+	 * of all its child devices, we need to start the retry from
+	 * hv_pci_query_relations() call, requesting host to send
+	 * the synchronous child device relations message before this
+	 * information is needed in hv_send_resources_allocated()
+	 * call later.
+	 */
+	if (ret == -EPROTO && enter_d0_retry) {
+		enter_d0_retry = false;
+
+		dev_err(&hdev->device, "Retrying D0 Entry\n");
+
+		/*
+		 * Hv_pci_bus_exit() calls hv_send_resources_released()
+		 * to free up resources of its child devices.
+		 * In the kdump kernel we need to set the
+		 * wslot_res_allocated to 255 so it scans all child
+		 * devices to release resources allocated in the
+		 * normal kernel before panic happened.
+		 */
+		hbus->wslot_res_allocated = 255;
+		ret = hv_pci_bus_exit(hdev, true);
+
+		if (ret == 0)
+			goto retry;
+
+		dev_err(&hdev->device,
+			"Retrying D0 failed with ret %d\n", ret);
+	}
 	if (ret)
 		goto free_irq_domain;
 
@@ -3418,12 +3426,21 @@ static struct hv_driver hv_pci_drv = {
 static void __exit exit_hv_pci_drv(void)
 {
 	vmbus_driver_unregister(&hv_pci_drv);
+
+	hvpci_block_ops.read_block = NULL;
+	hvpci_block_ops.write_block = NULL;
+	hvpci_block_ops.reg_blk_invalidate = NULL;
 }
 
 static int __init init_hv_pci_drv(void)
 {
 	/* Set the invalid domain number's bit, so it will not be used */
 	set_bit(HVPCI_DOM_INVALID, hvpci_dom_map);
+
+	/* Initialize PCI block r/w interface */
+	hvpci_block_ops.read_block = hv_read_config_block;
+	hvpci_block_ops.write_block = hv_write_config_block;
+	hvpci_block_ops.reg_blk_invalidate = hv_register_block_invalidate;
 
 	return vmbus_driver_register(&hv_pci_drv);
 }

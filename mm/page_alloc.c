@@ -23,7 +23,6 @@
 #include <linux/interrupt.h>
 #include <linux/pagemap.h>
 #include <linux/jiffies.h>
-#include <linux/bootmem.h>
 #include <linux/memblock.h>
 #include <linux/compiler.h>
 #include <linux/kernel.h>
@@ -1680,6 +1679,13 @@ static int __init deferred_init_memmap(void *data)
 	BUG_ON(pgdat->first_deferred_pfn > pgdat_end_pfn(pgdat));
 	pgdat->first_deferred_pfn = ULONG_MAX;
 
+	/*
+	 * Once we unlock here, the zone cannot be grown anymore, thus if an
+	 * interrupt thread must allocate this early in boot, zone must be
+	 * pre-grown prior to start of deferred page initialization.
+	 */
+	pgdat_resize_unlock(pgdat, &flags);
+
 	/* Only the highest zone is deferred so find it */
 	for (zid = 0; zid < MAX_NR_ZONES; zid++) {
 		zone = pgdat->node_zones + zid;
@@ -1711,8 +1717,6 @@ static int __init deferred_init_memmap(void *data)
 						    epfn_align);
 	}
 zone_empty:
-	pgdat_resize_unlock(pgdat, &flags);
-
 	/* Sanity check that the next zone really is unpopulated */
 	WARN_ON(++zid < MAX_NR_ZONES && populated_zone(++zone));
 
@@ -1753,17 +1757,6 @@ deferred_grow_zone(struct zone *zone, unsigned int order)
 		return false;
 
 	pgdat_resize_lock(pgdat, &flags);
-
-	/*
-	 * If deferred pages have been initialized while we were waiting for
-	 * the lock, return true, as the zone was grown.  The caller will retry
-	 * this zone.  We won't return to this function since the caller also
-	 * has this static branch.
-	 */
-	if (!static_branch_unlikely(&deferred_pages)) {
-		pgdat_resize_unlock(pgdat, &flags);
-		return true;
-	}
 
 	/*
 	 * If someone grew this zone while we were waiting for spinlock, return
@@ -3519,13 +3512,13 @@ void warn_alloc(gfp_t gfp_mask, nodemask_t *nodemask, const char *fmt, ...)
 	va_start(args, fmt);
 	vaf.fmt = fmt;
 	vaf.va = &args;
-	pr_warn("%s: %pV, mode:%#x(%pGg), nodemask=%*pbl\n",
+	pr_warn("%s: %pV, mode:%#x(%pGg), nodemask=%*pbl",
 			current->comm, &vaf, gfp_mask, &gfp_mask,
 			nodemask_pr_args(nodemask));
 	va_end(args);
 
 	cpuset_print_current_mems_allowed();
-
+	pr_cont("\n");
 	dump_stack();
 	warn_alloc_show_mem(gfp_mask, nodemask);
 }
@@ -5568,7 +5561,7 @@ void __ref build_all_zonelists(pg_data_t *pgdat)
 
 /*
  * Initially all pages are reserved - free ones are freed
- * up by free_all_bootmem() once the early boot process is
+ * up by memblock_free_all() once the early boot process is
  * done. Non-atomic initialization, single-pass.
  */
 void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
@@ -5711,12 +5704,12 @@ void __ref memmap_init_zone_device(struct zone *zone,
 		__SetPageReserved(page);
 
 		/*
-		 * ZONE_DEVICE pages union ->lru with a ->pgmap back
-		 * pointer and hmm_data.  It is a bug if a ZONE_DEVICE
-		 * page is ever freed or placed on a driver-private list.
+		 * ZONE_DEVICE pages union ->lru with a ->pgmap back pointer
+		 * and zone_device_data.  It is a bug if a ZONE_DEVICE page is
+		 * ever freed or placed on a driver-private list.
 		 */
 		page->pgmap = pgmap;
-		page->hmm_data = 0;
+		page->zone_device_data = NULL;
 
 		/*
 		 * Mark the block movable so that blocks are reserved for
@@ -6335,7 +6328,7 @@ static void __init setup_usemap(struct pglist_data *pgdat,
 	zone->pageblock_flags = NULL;
 	if (usemapsize)
 		zone->pageblock_flags =
-			memblock_virt_alloc_node_nopanic(usemapsize,
+			memblock_alloc_node_nopanic(usemapsize,
 							 pgdat->node_id);
 }
 #else
@@ -6426,7 +6419,7 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 #endif
 	pgdat_page_ext_init(pgdat);
 	spin_lock_init(&pgdat->lru_lock);
-	lruvec_init(node_lruvec(pgdat));
+	lruvec_init(&pgdat->__lruvec);
 
 	pgdat->per_cpu_nodestats = &boot_nodestats;
 
@@ -6520,7 +6513,7 @@ static void __ref alloc_node_mem_map(struct pglist_data *pgdat)
 		end = pgdat_end_pfn(pgdat);
 		end = ALIGN(end, MAX_ORDER_NR_PAGES);
 		size =  (end - start) * sizeof(struct page);
-		map = memblock_virt_alloc_node_nopanic(size, pgdat->node_id);
+		map = memblock_alloc_node_nopanic(size, pgdat->node_id);
 		pgdat->node_mem_map = map + offset;
 	}
 	pr_debug("%s: node %d, pgdat %08lx, node_mem_map %08lx\n",
@@ -6581,13 +6574,12 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 	free_area_init_core(pgdat);
 }
 
-#if defined(CONFIG_HAVE_MEMBLOCK) && !defined(CONFIG_FLAT_NODE_MEM_MAP)
-
+#if !defined(CONFIG_FLAT_NODE_MEM_MAP)
 /*
- * Zero all valid struct pages in range [spfn, epfn), return number of struct
- * pages zeroed
+ * Initialize all valid struct pages in the range [spfn, epfn) and mark them
+ * PageReserved(). Return the number of struct pages that were initialized.
  */
-static u64 zero_pfn_range(unsigned long spfn, unsigned long epfn)
+static u64 __init init_unavailable_range(unsigned long spfn, unsigned long epfn)
 {
 	unsigned long pfn;
 	u64 pgcnt = 0;
@@ -6598,7 +6590,13 @@ static u64 zero_pfn_range(unsigned long spfn, unsigned long epfn)
 				+ pageblock_nr_pages - 1;
 			continue;
 		}
-		mm_zero_struct_page(pfn_to_page(pfn));
+		/*
+		 * Use a fake node/zone (0) for now. Some of these pages
+		 * (in memblock.reserved but not in memblock.memory) will
+		 * get re-initialized via reserve_bootmem_region() later.
+		 */
+		__init_single_page(pfn_to_page(pfn), pfn, 0, 0);
+		__SetPageReserved(pfn_to_page(pfn));
 		pgcnt++;
 	}
 
@@ -6610,7 +6608,7 @@ static u64 zero_pfn_range(unsigned long spfn, unsigned long epfn)
  * initialized by going through __init_single_page(). But, there are some
  * struct pages which are reserved in memblock allocator and their fields
  * may be accessed (for example page_to_pfn() on some configuration accesses
- * flags). We must explicitly zero those struct pages.
+ * flags). We must explicitly initialize those struct pages.
  *
  * This function also addresses a similar issue where struct pages are left
  * uninitialized because the physical address range is not covered by
@@ -6618,7 +6616,7 @@ static u64 zero_pfn_range(unsigned long spfn, unsigned long epfn)
  * layout is manually configured via memmap=, or when the highest physical
  * address (max_pfn) does not end on a section boundary.
  */
-void __paginginit zero_resv_unavail(void)
+static void __init init_unavailable_mem(void)
 {
 	phys_addr_t start, end;
 	u64 i, pgcnt;
@@ -6631,7 +6629,8 @@ void __paginginit zero_resv_unavail(void)
 	for_each_mem_range(i, &memblock.memory, NULL,
 			NUMA_NO_NODE, MEMBLOCK_NONE, &start, &end, NULL) {
 		if (next < start)
-			pgcnt += zero_pfn_range(PFN_DOWN(next), PFN_UP(start));
+			pgcnt += init_unavailable_range(PFN_DOWN(next),
+							PFN_UP(start));
 		next = end;
 	}
 
@@ -6642,8 +6641,8 @@ void __paginginit zero_resv_unavail(void)
 	 * considered initialized. Make sure that memmap has a well defined
 	 * state.
 	 */
-	pgcnt += zero_pfn_range(PFN_DOWN(next),
-				round_up(max_pfn, PAGES_PER_SECTION));
+	pgcnt += init_unavailable_range(PFN_DOWN(next),
+					round_up(max_pfn, PAGES_PER_SECTION));
 
 	/*
 	 * Struct pages that do not have backing memory. This could be because
@@ -6652,7 +6651,11 @@ void __paginginit zero_resv_unavail(void)
 	if (pgcnt)
 		pr_info("Zeroed struct page in unavailable ranges: %lld pages", pgcnt);
 }
-#endif /* CONFIG_HAVE_MEMBLOCK && !CONFIG_FLAT_NODE_MEM_MAP */
+#else
+static inline void __init init_unavailable_mem(void)
+{
+}
+#endif /* !CONFIG_FLAT_NODE_MEM_MAP */
 
 #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
 
@@ -7084,7 +7087,7 @@ void __init free_area_init_nodes(unsigned long *max_zone_pfn)
 	/* Initialise every node */
 	mminit_verify_pageflags_layout();
 	setup_nr_node_ids();
-	zero_resv_unavail();
+	init_unavailable_mem();
 	for_each_online_node(nid) {
 		pg_data_t *pgdat = NODE_DATA(nid);
 		free_area_init_node(nid, NULL,
@@ -7270,7 +7273,7 @@ void __init set_dma_reserve(unsigned long new_dma_reserve)
 
 void __init free_area_init(unsigned long *zones_size)
 {
-	zero_resv_unavail();
+	init_unavailable_mem();
 	free_area_init_node(0, zones_size,
 			__pa(PAGE_OFFSET) >> PAGE_SHIFT, NULL);
 }
@@ -7792,9 +7795,11 @@ void *__init alloc_large_system_hash(const char *tablename,
 		size = bucketsize << log2qty;
 		if (flags & HASH_EARLY) {
 			if (flags & HASH_ZERO)
-				table = memblock_virt_alloc_nopanic(size, 0);
+				table = memblock_alloc_nopanic(size,
+							       SMP_CACHE_BYTES);
 			else
-				table = memblock_virt_alloc_raw(size, 0);
+				table = memblock_alloc_raw(size,
+							   SMP_CACHE_BYTES);
 		} else if (hashdist) {
 			table = __vmalloc(size, gfp_flags, PAGE_KERNEL);
 		} else {
@@ -7939,8 +7944,7 @@ unmovable:
 	return true;
 }
 
-#if (defined(CONFIG_MEMORY_ISOLATION) && defined(CONFIG_COMPACTION)) || defined(CONFIG_CMA)
-
+#ifdef CONFIG_CONTIG_ALLOC
 static unsigned long pfn_max_align_down(unsigned long pfn)
 {
 	return pfn & ~(max_t(unsigned long, MAX_ORDER_NR_PAGES,

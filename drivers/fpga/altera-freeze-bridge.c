@@ -217,6 +217,8 @@ static int altera_freeze_br_probe(struct platform_device *pdev)
 	if (!np)
 		return -ENODEV;
 
+	mark_tech_preview("Altera Freeze Bridge", THIS_MODULE);
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	base_addr = devm_ioremap_resource(dev, res);
 	if (IS_ERR(base_addr))

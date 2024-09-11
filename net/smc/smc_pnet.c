@@ -12,6 +12,7 @@
 #include <linux/module.h>
 #include <linux/list.h>
 #include <linux/ctype.h>
+#include <linux/mutex.h>
 #include <net/netlink.h>
 #include <net/genetlink.h>
 
@@ -110,8 +111,14 @@ static int smc_pnet_remove_by_pnetid(struct net *net, char *pnet_name)
 		if (!pnet_name ||
 		    smc_pnet_match(pnetelem->pnet_name, pnet_name)) {
 			list_del(&pnetelem->list);
-			if (pnetelem->type == SMC_PNET_ETH && pnetelem->ndev)
+			if (pnetelem->type == SMC_PNET_ETH && pnetelem->ndev) {
 				dev_put(pnetelem->ndev);
+				pr_warn_ratelimited("smc: net device %s "
+						    "erased user defined "
+						    "pnetid %.16s\n",
+						    pnetelem->eth_name,
+						    pnetelem->pnet_name);
+			}
 			kfree(pnetelem);
 			rc = 0;
 		}
@@ -123,13 +130,19 @@ static int smc_pnet_remove_by_pnetid(struct net *net, char *pnet_name)
 		return rc;
 
 	/* remove ib devices */
-	spin_lock(&smc_ib_devices.lock);
+	mutex_lock(&smc_ib_devices.mutex);
 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
 		for (ibport = 0; ibport < SMC_MAX_PORTS; ibport++) {
 			if (ibdev->pnetid_by_user[ibport] &&
 			    (!pnet_name ||
 			     smc_pnet_match(pnet_name,
 					    ibdev->pnetid[ibport]))) {
+				pr_warn_ratelimited("smc: ib device %s ibport "
+						    "%d erased user defined "
+						    "pnetid %.16s\n",
+						    ibdev->ibdev->name,
+						    ibport + 1,
+						    ibdev->pnetid[ibport]);
 				memset(ibdev->pnetid[ibport], 0,
 				       SMC_MAX_PNETID_LEN);
 				ibdev->pnetid_by_user[ibport] = false;
@@ -137,19 +150,23 @@ static int smc_pnet_remove_by_pnetid(struct net *net, char *pnet_name)
 			}
 		}
 	}
-	spin_unlock(&smc_ib_devices.lock);
+	mutex_unlock(&smc_ib_devices.mutex);
 	/* remove smcd devices */
-	spin_lock(&smcd_dev_list.lock);
+	mutex_lock(&smcd_dev_list.mutex);
 	list_for_each_entry(smcd_dev, &smcd_dev_list.list, list) {
 		if (smcd_dev->pnetid_by_user &&
 		    (!pnet_name ||
 		     smc_pnet_match(pnet_name, smcd_dev->pnetid))) {
+			pr_warn_ratelimited("smc: smcd device %s "
+					    "erased user defined pnetid "
+					    "%.16s\n", dev_name(&smcd_dev->dev),
+					    smcd_dev->pnetid);
 			memset(smcd_dev->pnetid, 0, SMC_MAX_PNETID_LEN);
 			smcd_dev->pnetid_by_user = false;
 			rc = 0;
 		}
 	}
-	spin_unlock(&smcd_dev_list.lock);
+	mutex_unlock(&smcd_dev_list.mutex);
 	return rc;
 }
 
@@ -174,6 +191,10 @@ static int smc_pnet_add_by_ndev(struct net_device *ndev)
 			dev_hold(ndev);
 			pnetelem->ndev = ndev;
 			rc = 0;
+			pr_warn_ratelimited("smc: adding net device %s with "
+					    "user defined pnetid %.16s\n",
+					    pnetelem->eth_name,
+					    pnetelem->pnet_name);
 			break;
 		}
 	}
@@ -201,6 +222,10 @@ static int smc_pnet_remove_by_ndev(struct net_device *ndev)
 			dev_put(pnetelem->ndev);
 			pnetelem->ndev = NULL;
 			rc = 0;
+			pr_warn_ratelimited("smc: removing net device %s with "
+					    "user defined pnetid %.16s\n",
+					    pnetelem->eth_name,
+					    pnetelem->pnet_name);
 			break;
 		}
 	}
@@ -216,14 +241,14 @@ static bool smc_pnet_apply_ib(struct smc_ib_device *ib_dev, u8 ib_port,
 	u8 pnet_null[SMC_MAX_PNETID_LEN] = {0};
 	bool applied = false;
 
-	spin_lock(&smc_ib_devices.lock);
+	mutex_lock(&smc_ib_devices.mutex);
 	if (smc_pnet_match(ib_dev->pnetid[ib_port - 1], pnet_null)) {
 		memcpy(ib_dev->pnetid[ib_port - 1], pnet_name,
 		       SMC_MAX_PNETID_LEN);
 		ib_dev->pnetid_by_user[ib_port - 1] = true;
 		applied = true;
 	}
-	spin_unlock(&smc_ib_devices.lock);
+	mutex_unlock(&smc_ib_devices.mutex);
 	return applied;
 }
 
@@ -234,13 +259,13 @@ static bool smc_pnet_apply_smcd(struct smcd_dev *smcd_dev, char *pnet_name)
 	u8 pnet_null[SMC_MAX_PNETID_LEN] = {0};
 	bool applied = false;
 
-	spin_lock(&smcd_dev_list.lock);
+	mutex_lock(&smcd_dev_list.mutex);
 	if (smc_pnet_match(smcd_dev->pnetid, pnet_null)) {
 		memcpy(smcd_dev->pnetid, pnet_name, SMC_MAX_PNETID_LEN);
 		smcd_dev->pnetid_by_user = true;
 		applied = true;
 	}
-	spin_unlock(&smcd_dev_list.lock);
+	mutex_unlock(&smcd_dev_list.mutex);
 	return applied;
 }
 
@@ -276,7 +301,7 @@ static struct smc_ib_device *smc_pnet_find_ib(char *ib_name)
 {
 	struct smc_ib_device *ibdev;
 
-	spin_lock(&smc_ib_devices.lock);
+	mutex_lock(&smc_ib_devices.mutex);
 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
 		if (!strncmp(ibdev->ibdev->name, ib_name,
 			     sizeof(ibdev->ibdev->name)) ||
@@ -287,7 +312,7 @@ static struct smc_ib_device *smc_pnet_find_ib(char *ib_name)
 	}
 	ibdev = NULL;
 out:
-	spin_unlock(&smc_ib_devices.lock);
+	mutex_unlock(&smc_ib_devices.mutex);
 	return ibdev;
 }
 
@@ -296,7 +321,7 @@ static struct smcd_dev *smc_pnet_find_smcd(char *smcd_name)
 {
 	struct smcd_dev *smcd_dev;
 
-	spin_lock(&smcd_dev_list.lock);
+	mutex_lock(&smcd_dev_list.mutex);
 	list_for_each_entry(smcd_dev, &smcd_dev_list.list, list) {
 		if (!strncmp(dev_name(&smcd_dev->dev), smcd_name,
 			     IB_DEVICE_NAME_MAX - 1))
@@ -304,7 +329,7 @@ static struct smcd_dev *smc_pnet_find_smcd(char *smcd_name)
 	}
 	smcd_dev = NULL;
 out:
-	spin_unlock(&smcd_dev_list.lock);
+	mutex_unlock(&smcd_dev_list.mutex);
 	return smcd_dev;
 }
 
@@ -357,6 +382,10 @@ static int smc_pnet_add_eth(struct smc_pnettable *pnettable, struct net *net,
 		kfree(new_pe);
 		goto out_put;
 	}
+	if (ndev)
+		pr_warn_ratelimited("smc: net device %s "
+				    "applied user defined pnetid %.16s\n",
+				    new_pe->eth_name, new_pe->pnet_name);
 	return 0;
 
 out_put:
@@ -377,11 +406,24 @@ static int smc_pnet_add_ib(struct smc_pnettable *pnettable, char *ib_name,
 
 	/* try to apply the pnetid to active devices */
 	ib_dev = smc_pnet_find_ib(ib_name);
-	if (ib_dev)
+	if (ib_dev) {
 		ibdev_applied = smc_pnet_apply_ib(ib_dev, ib_port, pnet_name);
+		if (ibdev_applied)
+			pr_warn_ratelimited("smc: ib device %s ibport %d "
+					    "applied user defined pnetid "
+					    "%.16s\n", ib_dev->ibdev->name,
+					    ib_port,
+					    ib_dev->pnetid[ib_port - 1]);
+	}
 	smcd_dev = smc_pnet_find_smcd(ib_name);
-	if (smcd_dev)
+	if (smcd_dev) {
 		smcddev_applied = smc_pnet_apply_smcd(smcd_dev, pnet_name);
+		if (smcddev_applied)
+			pr_warn_ratelimited("smc: smcd device %s "
+					    "applied user defined pnetid "
+					    "%.16s\n", dev_name(&smcd_dev->dev),
+					    smcd_dev->pnetid);
+	}
 	/* Apply fails when a device has a hardware-defined pnetid set, do not
 	 * add a pnet table entry in that case.
 	 */
@@ -736,7 +778,7 @@ static struct net_device *pnet_find_base_ndev(struct net_device *ndev)
 	int i, nest_lvl;
 
 	rtnl_lock();
-	nest_lvl = dev_get_nest_level(ndev);
+	nest_lvl = ndev->lower_level;
 	for (i = 0; i < nest_lvl; i++) {
 		struct list_head *lower = &ndev->adj_list.lower;
 
@@ -784,7 +826,7 @@ static void _smc_pnet_find_roce_by_pnetid(u8 *pnet_id,
 	int i;
 
 	ini->ib_dev = NULL;
-	spin_lock(&smc_ib_devices.lock);
+	mutex_lock(&smc_ib_devices.mutex);
 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
 		if (ibdev == known_dev)
 			continue;
@@ -803,7 +845,7 @@ static void _smc_pnet_find_roce_by_pnetid(u8 *pnet_id,
 		}
 	}
 out:
-	spin_unlock(&smc_ib_devices.lock);
+	mutex_unlock(&smc_ib_devices.mutex);
 }
 
 /* find alternate roce device with same pnet_id and vlan_id */
@@ -822,7 +864,7 @@ static void smc_pnet_find_rdma_dev(struct net_device *netdev,
 {
 	struct smc_ib_device *ibdev;
 
-	spin_lock(&smc_ib_devices.lock);
+	mutex_lock(&smc_ib_devices.mutex);
 	list_for_each_entry(ibdev, &smc_ib_devices.list, list) {
 		struct net_device *ndev;
 		int i;
@@ -847,7 +889,7 @@ static void smc_pnet_find_rdma_dev(struct net_device *netdev,
 			}
 		}
 	}
-	spin_unlock(&smc_ib_devices.lock);
+	mutex_unlock(&smc_ib_devices.mutex);
 }
 
 /* Determine the corresponding IB device port based on the hardware PNETID.
@@ -883,7 +925,7 @@ static void smc_pnet_find_ism_by_pnetid(struct net_device *ndev,
 	    smc_pnet_find_ndev_pnetid_by_table(ndev, ndev_pnetid))
 		return; /* pnetid could not be determined */
 
-	spin_lock(&smcd_dev_list.lock);
+	mutex_lock(&smcd_dev_list.mutex);
 	list_for_each_entry(ismdev, &smcd_dev_list.list, list) {
 		if (smc_pnet_match(ismdev->pnetid, ndev_pnetid) &&
 		    !ismdev->going_away) {
@@ -891,7 +933,7 @@ static void smc_pnet_find_ism_by_pnetid(struct net_device *ndev,
 			break;
 		}
 	}
-	spin_unlock(&smcd_dev_list.lock);
+	mutex_unlock(&smcd_dev_list.mutex);
 }
 
 /* PNET table analysis for a given sock:

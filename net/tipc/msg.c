@@ -39,10 +39,16 @@
 #include "msg.h"
 #include "addr.h"
 #include "name_table.h"
+#include "crypto.h"
 
 #define MAX_FORWARD_SIZE 1024
+#ifdef CONFIG_TIPC_CRYPTO
+#define BUF_HEADROOM ALIGN(((LL_MAX_HEADER + 48) + EHDR_MAX_SIZE), 16)
+#define BUF_TAILROOM (TIPC_AES_GCM_TAG_SIZE)
+#else
 #define BUF_HEADROOM (LL_MAX_HEADER + 48)
 #define BUF_TAILROOM 16
+#endif
 
 static unsigned int align(unsigned int i)
 {
@@ -61,7 +67,11 @@ static unsigned int align(unsigned int i)
 struct sk_buff *tipc_buf_acquire(u32 size, gfp_t gfp)
 {
 	struct sk_buff *skb;
+#ifdef CONFIG_TIPC_CRYPTO
+	unsigned int buf_size = (BUF_HEADROOM + size + BUF_TAILROOM + 3) & ~3u;
+#else
 	unsigned int buf_size = (BUF_HEADROOM + size + 3) & ~3u;
+#endif
 
 	skb = alloc_skb_fclone(buf_size, gfp);
 	if (skb) {
@@ -173,7 +183,7 @@ int tipc_buf_append(struct sk_buff **headbuf, struct sk_buff **buf)
 	}
 
 	if (fragid == LAST_FRAGMENT) {
-		TIPC_SKB_CB(head)->validated = false;
+		TIPC_SKB_CB(head)->validated = 0;
 		if (unlikely(!tipc_msg_validate(&head)))
 			goto err;
 		*buf = head;
@@ -267,6 +277,7 @@ bool tipc_msg_validate(struct sk_buff **_skb)
 
 	if (unlikely(TIPC_SKB_CB(skb)->validated))
 		return true;
+
 	if (unlikely(!pskb_may_pull(skb, MIN_H_SIZE)))
 		return false;
 
@@ -288,7 +299,7 @@ bool tipc_msg_validate(struct sk_buff **_skb)
 	if (unlikely(skb->len < msz))
 		return false;
 
-	TIPC_SKB_CB(skb)->validated = true;
+	TIPC_SKB_CB(skb)->validated = 1;
 	return true;
 }
 
@@ -810,19 +821,19 @@ bool tipc_msg_pskb_copy(u32 dst, struct sk_buff_head *msg,
  * @seqno: sequence number of buffer to add
  * @skb: buffer to add
  */
-void __tipc_skb_queue_sorted(struct sk_buff_head *list, u16 seqno,
+bool __tipc_skb_queue_sorted(struct sk_buff_head *list, u16 seqno,
 			     struct sk_buff *skb)
 {
 	struct sk_buff *_skb, *tmp;
 
 	if (skb_queue_empty(list) || less(seqno, buf_seqno(skb_peek(list)))) {
 		__skb_queue_head(list, skb);
-		return;
+		return true;
 	}
 
 	if (more(seqno, buf_seqno(skb_peek_tail(list)))) {
 		__skb_queue_tail(list, skb);
-		return;
+		return true;
 	}
 
 	skb_queue_walk_safe(list, _skb, tmp) {
@@ -831,9 +842,10 @@ void __tipc_skb_queue_sorted(struct sk_buff_head *list, u16 seqno,
 		if (seqno == buf_seqno(_skb))
 			break;
 		__skb_queue_before(list, _skb, skb);
-		return;
+		return true;
 	}
 	kfree_skb(skb);
+	return false;
 }
 
 void tipc_skb_reject(struct net *net, int err, struct sk_buff *skb,

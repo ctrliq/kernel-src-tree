@@ -21,7 +21,10 @@
 #include <sys/param.h>
 #include "debug.h"
 #include "builtin.h"
+#include <perf/cpumap.h>
+#include <subcmd/pager.h>
 #include <subcmd/parse-options.h>
+#include "map_symbol.h"
 #include "mem-events.h"
 #include "session.h"
 #include "hist.h"
@@ -36,6 +39,9 @@
 #include "thread.h"
 #include "mem2node.h"
 #include "symbol.h"
+#include "ui/ui.h"
+#include "ui/progress.h"
+#include "../perf.h"
 
 struct c2c_hists {
 	struct hists		hists;
@@ -250,7 +256,7 @@ static void compute_stats(struct c2c_hist_entry *c2c_he,
 static int process_sample_event(struct perf_tool *tool __maybe_unused,
 				union perf_event *event,
 				struct perf_sample *sample,
-				struct perf_evsel *evsel,
+				struct evsel *evsel,
 				struct machine *machine)
 {
 	struct c2c_hists *c2c_hists = &c2c.hists;
@@ -2053,7 +2059,7 @@ static int setup_nodes(struct perf_session *session)
 	c2c.cpu2node = cpu2node;
 
 	for (node = 0; node < c2c.nodes_cnt; node++) {
-		struct cpu_map *map = n[node].map;
+		struct perf_cpu_map *map = n[node].map;
 		unsigned long *set;
 
 		set = bitmap_alloc(c2c.cpus_cnt);
@@ -2063,7 +2069,7 @@ static int setup_nodes(struct perf_session *session)
 		nodes[node] = set;
 
 		/* empty node, skip */
-		if (cpu_map__empty(map))
+		if (perf_cpu_map__empty(map))
 			continue;
 
 		for (cpu = 0; cpu < map->nr; cpu++) {
@@ -2240,8 +2246,8 @@ static void print_pareto(FILE *out)
 
 static void print_c2c_info(FILE *out, struct perf_session *session)
 {
-	struct perf_evlist *evlist = session->evlist;
-	struct perf_evsel *evsel;
+	struct evlist *evlist = session->evlist;
+	struct evsel *evsel;
 	bool first = true;
 
 	fprintf(out, "=================================================\n");
@@ -2380,7 +2386,7 @@ static int perf_c2c__browse_cacheline(struct hist_entry *he)
 	c2c_browser__update_nr_entries(browser);
 
 	while (1) {
-		key = hist_browser__run(browser, "? - help", true);
+		key = hist_browser__run(browser, "? - help", true, 0);
 
 		switch (key) {
 		case 's':
@@ -2449,7 +2455,7 @@ static int perf_c2c__hists_browse(struct hists *hists)
 	c2c_browser__update_nr_entries(browser);
 
 	while (1) {
-		key = hist_browser__run(browser, "? - help", true);
+		key = hist_browser__run(browser, "? - help", true, 0);
 
 		switch (key) {
 		case 'q':
@@ -2571,7 +2577,7 @@ parse_callchain_opt(const struct option *opt, const char *arg, int unset)
 	return parse_callchain_report_opt(arg);
 }
 
-static int setup_callchain(struct perf_evlist *evlist)
+static int setup_callchain(struct evlist *evlist)
 {
 	u64 sample_type = perf_evlist__combined_sample_type(evlist);
 	enum perf_call_graph_mode mode = CALLCHAIN_NONE;

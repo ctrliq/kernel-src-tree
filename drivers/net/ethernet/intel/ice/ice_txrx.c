@@ -15,6 +15,90 @@
 
 #define ICE_RX_HDR_SIZE		256
 
+#define FDIR_DESC_RXDID 0x40
+#define ICE_FDIR_CLEAN_DELAY 10
+
+/**
+ * ice_prgm_fdir_fltr - Program a Flow Director filter
+ * @vsi: VSI to send dummy packet
+ * @fdir_desc: flow director descriptor
+ * @raw_packet: allocated buffer for flow director
+ */
+int
+ice_prgm_fdir_fltr(struct ice_vsi *vsi, struct ice_fltr_desc *fdir_desc,
+		   u8 *raw_packet)
+{
+	struct ice_tx_buf *tx_buf, *first;
+	struct ice_fltr_desc *f_desc;
+	struct ice_tx_desc *tx_desc;
+	struct ice_ring *tx_ring;
+	struct device *dev;
+	dma_addr_t dma;
+	u32 td_cmd;
+	u16 i;
+
+	/* VSI and Tx ring */
+	if (!vsi)
+		return -ENOENT;
+	tx_ring = vsi->tx_rings[0];
+	if (!tx_ring || !tx_ring->desc)
+		return -ENOENT;
+	dev = tx_ring->dev;
+
+	/* we are using two descriptors to add/del a filter and we can wait */
+	for (i = ICE_FDIR_CLEAN_DELAY; ICE_DESC_UNUSED(tx_ring) < 2; i--) {
+		if (!i)
+			return -EAGAIN;
+		msleep_interruptible(1);
+	}
+
+	dma = dma_map_single(dev, raw_packet, ICE_FDIR_MAX_RAW_PKT_SIZE,
+			     DMA_TO_DEVICE);
+
+	if (dma_mapping_error(dev, dma))
+		return -EINVAL;
+
+	/* grab the next descriptor */
+	i = tx_ring->next_to_use;
+	first = &tx_ring->tx_buf[i];
+	f_desc = ICE_TX_FDIRDESC(tx_ring, i);
+	memcpy(f_desc, fdir_desc, sizeof(*f_desc));
+
+	i++;
+	i = (i < tx_ring->count) ? i : 0;
+	tx_desc = ICE_TX_DESC(tx_ring, i);
+	tx_buf = &tx_ring->tx_buf[i];
+
+	i++;
+	tx_ring->next_to_use = (i < tx_ring->count) ? i : 0;
+
+	memset(tx_buf, 0, sizeof(*tx_buf));
+	dma_unmap_len_set(tx_buf, len, ICE_FDIR_MAX_RAW_PKT_SIZE);
+	dma_unmap_addr_set(tx_buf, dma, dma);
+
+	tx_desc->buf_addr = cpu_to_le64(dma);
+	td_cmd = ICE_TXD_LAST_DESC_CMD | ICE_TX_DESC_CMD_DUMMY |
+		 ICE_TX_DESC_CMD_RE;
+
+	tx_buf->tx_flags = ICE_TX_FLAGS_DUMMY_PKT;
+	tx_buf->raw_buf = raw_packet;
+
+	tx_desc->cmd_type_offset_bsz =
+		ice_build_ctob(td_cmd, 0, ICE_FDIR_MAX_RAW_PKT_SIZE, 0);
+
+	/* Force memory write to complete before letting h/w know
+	 * there are new descriptors to fetch.
+	 */
+	wmb();
+
+	/* mark the data descriptor to be watched */
+	first->next_to_watch = tx_desc;
+
+	writel(tx_ring->next_to_use, tx_ring->tail);
+
+	return 0;
+}
+
 /**
  * ice_unmap_and_free_tx_buf - Release a Tx buffer
  * @ring: the ring that owns the buffer
@@ -24,7 +108,9 @@ static void
 ice_unmap_and_free_tx_buf(struct ice_ring *ring, struct ice_tx_buf *tx_buf)
 {
 	if (tx_buf->skb) {
-		if (ice_ring_is_xdp(ring))
+		if (tx_buf->tx_flags & ICE_TX_FLAGS_DUMMY_PKT)
+			devm_kfree(ring->dev, tx_buf->raw_buf);
+		else if (ice_ring_is_xdp(ring))
 			page_frag_free(tx_buf->raw_buf);
 		else
 			dev_kfree_skb_any(tx_buf->skb);
@@ -583,7 +669,8 @@ bool ice_alloc_rx_bufs(struct ice_ring *rx_ring, u16 cleaned_count)
 	struct ice_rx_buf *bi;
 
 	/* do nothing if no valid netdev defined */
-	if (!rx_ring->netdev || !cleaned_count)
+	if ((!rx_ring->netdev && rx_ring->vsi->type != ICE_VSI_CTRL) ||
+	    !cleaned_count)
 		return false;
 
 	/* get the Rx descriptor and buffer based on next_to_use */
@@ -644,7 +731,7 @@ static bool ice_page_is_reserved(struct page *page)
  * Update the offset within page so that Rx buf will be ready to be reused.
  * For systems with PAGE_SIZE < 8192 this function will flip the page offset
  * so the second half of page assigned to Rx buffer will be used, otherwise
- * the offset is moved by the @size bytes
+ * the offset is moved by "size" bytes
  */
 static void
 ice_rx_buf_adjust_pg_offset(struct ice_rx_buf *rx_buf, unsigned int size)
@@ -803,7 +890,7 @@ static struct sk_buff *
 ice_build_skb(struct ice_ring *rx_ring, struct ice_rx_buf *rx_buf,
 	      struct xdp_buff *xdp)
 {
-	unsigned int metasize = xdp->data - xdp->data_meta;
+	u8 metasize = xdp->data - xdp->data_meta;
 #if (PAGE_SIZE < 8192)
 	unsigned int truesize = ice_rx_pg_size(rx_ring) / 2;
 #else
@@ -918,7 +1005,7 @@ ice_construct_skb(struct ice_ring *rx_ring, struct ice_rx_buf *rx_buf,
  */
 static void ice_put_rx_buf(struct ice_ring *rx_ring, struct ice_rx_buf *rx_buf)
 {
-	u32 ntc = rx_ring->next_to_clean + 1;
+	u16 ntc = rx_ring->next_to_clean + 1;
 
 	/* fetch, update, and store next to clean */
 	ntc = (ntc < rx_ring->count) ? ntc : 0;
@@ -981,7 +1068,7 @@ ice_is_non_eop(struct ice_ring *rx_ring, union ice_32b_rx_flex_desc *rx_desc,
  *
  * Returns amount of work completed
  */
-static int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
+int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
 {
 	unsigned int total_rx_bytes = 0, total_rx_pkts = 0;
 	u16 cleaned_count = ICE_DESC_UNUSED(rx_ring);
@@ -1019,6 +1106,12 @@ static int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
 		 * DD bit is set.
 		 */
 		dma_rmb();
+
+		if (rx_desc->wb.rxdid == FDIR_DESC_RXDID || !rx_ring->netdev) {
+			ice_put_rx_buf(rx_ring, NULL);
+			cleaned_count++;
+			continue;
+		}
 
 		size = le16_to_cpu(rx_desc->wb.pkt_len) &
 			ICE_RX_FLX_DESC_PKT_LEN_M;
@@ -1528,7 +1621,7 @@ int ice_napi_poll(struct napi_struct *napi, int budget)
 		 * don't allow the budget to go below 1 because that would exit
 		 * polling early.
 		 */
-		budget_per_ring = max(budget / q_vector->num_ring_rx, 1);
+		budget_per_ring = max_t(int, budget / q_vector->num_ring_rx, 1);
 	else
 		/* Max of 1 Rx ring in this q_vector so give it the budget */
 		budget_per_ring = budget;
@@ -1618,11 +1711,11 @@ ice_tx_map(struct ice_ring *tx_ring, struct ice_tx_buf *first,
 {
 	u64 td_offset, td_tag, td_cmd;
 	u16 i = tx_ring->next_to_use;
-	struct skb_frag_struct *frag;
 	unsigned int data_len, size;
 	struct ice_tx_desc *tx_desc;
 	struct ice_tx_buf *tx_buf;
 	struct sk_buff *skb;
+	skb_frag_t *frag;
 	dma_addr_t dma;
 
 	td_tag = off->td_l2tag1;
@@ -1736,9 +1829,8 @@ ice_tx_map(struct ice_ring *tx_ring, struct ice_tx_buf *first,
 	ice_maybe_stop_tx(tx_ring, DESC_NEEDED);
 
 	/* notify HW of packet */
-	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more()) {
+	if (netif_xmit_stopped(txring_txq(tx_ring)) || !netdev_xmit_more())
 		writel(i, tx_ring->tail);
-	}
 
 	return;
 
@@ -2012,7 +2104,8 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 		unsigned char *hdr;
 	} l4;
 	u64 cd_mss, cd_tso_len;
-	u32 paylen, l4_start;
+	u32 paylen;
+	u8 l4_start;
 	int err;
 
 	if (skb->ip_summed != CHECKSUM_PARTIAL)
@@ -2048,7 +2141,7 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 			l4.udp->len = 0;
 
 			/* determine offset of outer transport header */
-			l4_start = l4.hdr - skb->data;
+			l4_start = (u8)(l4.hdr - skb->data);
 
 			/* remove payload length from outer checksum */
 			paylen = skb->len - l4_start;
@@ -2072,7 +2165,7 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 	}
 
 	/* determine offset of transport header */
-	l4_start = l4.hdr - skb->data;
+	l4_start = (u8)(l4.hdr - skb->data);
 
 	/* remove payload length from checksum */
 	paylen = skb->len - l4_start;
@@ -2081,12 +2174,12 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 		csum_replace_by_diff(&l4.udp->check,
 				     (__force __wsum)htonl(paylen));
 		/* compute length of UDP segmentation header */
-		off->header_len = sizeof(l4.udp) + l4_start;
+		off->header_len = (u8)sizeof(l4.udp) + l4_start;
 	} else {
 		csum_replace_by_diff(&l4.tcp->check,
 				     (__force __wsum)htonl(paylen));
 		/* compute length of TCP segmentation header */
-		off->header_len = (l4.tcp->doff * 4) + l4_start;
+		off->header_len = (u8)((l4.tcp->doff * 4) + l4_start);
 	}
 
 	/* update gso_segs and bytecount */
@@ -2146,7 +2239,7 @@ static unsigned int ice_txd_use_count(unsigned int size)
  */
 static unsigned int ice_xmit_desc_count(struct sk_buff *skb)
 {
-	const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[0];
+	const skb_frag_t *frag = &skb_shinfo(skb)->frags[0];
 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
 	unsigned int count = 0, size = skb_headlen(skb);
 
@@ -2177,7 +2270,7 @@ static unsigned int ice_xmit_desc_count(struct sk_buff *skb)
  */
 static bool __ice_chk_linearize(struct sk_buff *skb)
 {
-	const struct skb_frag_struct *frag, *stale;
+	const skb_frag_t *frag, *stale;
 	int nr_frags, sum;
 
 	/* no need to check if number of frags is less than 7 */
@@ -2192,7 +2285,7 @@ static bool __ice_chk_linearize(struct sk_buff *skb)
 	frag = &skb_shinfo(skb)->frags[0];
 
 	/* Initialize size to the negative value of gso_size minus 1. We
-	 * use this as the worst case scenerio in which the frag ahead
+	 * use this as the worst case scenario in which the frag ahead
 	 * of us only provides one byte which is why we are limited to 6
 	 * descriptors for a single transmit as the header and previous
 	 * fragment are already consuming 2 descriptors.
@@ -2317,7 +2410,7 @@ ice_xmit_frame_ring(struct sk_buff *skb, struct ice_ring *tx_ring)
 
 	if (offload.cd_qw1 & ICE_TX_DESC_DTYPE_CTX) {
 		struct ice_tx_ctx_desc *cdesc;
-		int i = tx_ring->next_to_use;
+		u16 i = tx_ring->next_to_use;
 
 		/* grab the next descriptor */
 		cdesc = ICE_TX_CTX_DESC(tx_ring, i);
@@ -2361,4 +2454,87 @@ netdev_tx_t ice_start_xmit(struct sk_buff *skb, struct net_device *netdev)
 		return NETDEV_TX_OK;
 
 	return ice_xmit_frame_ring(skb, tx_ring);
+}
+
+/**
+ * ice_clean_ctrl_tx_irq - interrupt handler for flow director Tx queue
+ * @tx_ring: tx_ring to clean
+ */
+void ice_clean_ctrl_tx_irq(struct ice_ring *tx_ring)
+{
+	struct ice_vsi *vsi = tx_ring->vsi;
+	s16 i = tx_ring->next_to_clean;
+	int budget = ICE_DFLT_IRQ_WORK;
+	struct ice_tx_desc *tx_desc;
+	struct ice_tx_buf *tx_buf;
+
+	tx_buf = &tx_ring->tx_buf[i];
+	tx_desc = ICE_TX_DESC(tx_ring, i);
+	i -= tx_ring->count;
+
+	do {
+		struct ice_tx_desc *eop_desc = tx_buf->next_to_watch;
+
+		/* if next_to_watch is not set then there is no pending work */
+		if (!eop_desc)
+			break;
+
+		/* prevent any other reads prior to eop_desc */
+		smp_rmb();
+
+		/* if the descriptor isn't done, no work to do */
+		if (!(eop_desc->cmd_type_offset_bsz &
+		      cpu_to_le64(ICE_TX_DESC_DTYPE_DESC_DONE)))
+			break;
+
+		/* clear next_to_watch to prevent false hangs */
+		tx_buf->next_to_watch = NULL;
+		tx_desc->buf_addr = 0;
+		tx_desc->cmd_type_offset_bsz = 0;
+
+		/* move past filter desc */
+		tx_buf++;
+		tx_desc++;
+		i++;
+		if (unlikely(!i)) {
+			i -= tx_ring->count;
+			tx_buf = tx_ring->tx_buf;
+			tx_desc = ICE_TX_DESC(tx_ring, 0);
+		}
+
+		/* unmap the data header */
+		if (dma_unmap_len(tx_buf, len))
+			dma_unmap_single(tx_ring->dev,
+					 dma_unmap_addr(tx_buf, dma),
+					 dma_unmap_len(tx_buf, len),
+					 DMA_TO_DEVICE);
+		if (tx_buf->tx_flags & ICE_TX_FLAGS_DUMMY_PKT)
+			devm_kfree(tx_ring->dev, tx_buf->raw_buf);
+
+		/* clear next_to_watch to prevent false hangs */
+		tx_buf->raw_buf = NULL;
+		tx_buf->tx_flags = 0;
+		tx_buf->next_to_watch = NULL;
+		dma_unmap_len_set(tx_buf, len, 0);
+		tx_desc->buf_addr = 0;
+		tx_desc->cmd_type_offset_bsz = 0;
+
+		/* move past eop_desc for start of next FD desc */
+		tx_buf++;
+		tx_desc++;
+		i++;
+		if (unlikely(!i)) {
+			i -= tx_ring->count;
+			tx_buf = tx_ring->tx_buf;
+			tx_desc = ICE_TX_DESC(tx_ring, 0);
+		}
+
+		budget--;
+	} while (likely(budget));
+
+	i += tx_ring->count;
+	tx_ring->next_to_clean = i;
+
+	/* re-enable interrupt if needed */
+	ice_irq_dynamic_ena(&vsi->back->hw, vsi, vsi->q_vectors[0]);
 }

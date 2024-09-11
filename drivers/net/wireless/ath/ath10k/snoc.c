@@ -46,7 +46,7 @@ static const char * const ath10k_regulators[] = {
 };
 
 static const char * const ath10k_clocks[] = {
-	"cxo_ref_clk_pin",
+	"cxo_ref_clk_pin", "qdss",
 };
 
 static void ath10k_snoc_htc_tx_cb(struct ath10k_ce_pipe *ce_state);
@@ -1272,6 +1272,15 @@ out:
 	return ret;
 }
 
+static void ath10k_snoc_quirks_init(struct ath10k *ar)
+{
+	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
+	struct device *dev = &ar_snoc->dev->dev;
+
+	if (of_property_read_bool(dev->of_node, "qcom,snoc-host-cap-8bit-quirk"))
+		set_bit(ATH10K_SNOC_FLAG_8BIT_HOST_CAP_QUIRK, &ar_snoc->flags);
+}
+
 int ath10k_snoc_fw_indication(struct ath10k *ar, u64 type)
 {
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
@@ -1491,6 +1500,8 @@ static int ath10k_snoc_probe(struct platform_device *pdev)
 	ar_snoc->ce.bus_ops = &ath10k_snoc_bus_ops;
 	ar->ce_priv = &ar_snoc->ce;
 	msa_size = drv_data->msa_size;
+
+	ath10k_snoc_quirks_init(ar);
 
 	ret = ath10k_snoc_resource_init(ar);
 	if (ret) {

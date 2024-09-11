@@ -25,7 +25,8 @@ struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd)
 	 */
 	if (inner_map->map_type == BPF_MAP_TYPE_PROG_ARRAY ||
 	    inner_map->map_type == BPF_MAP_TYPE_CGROUP_STORAGE ||
-	    inner_map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE) {
+	    inner_map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE ||
+	    inner_map->map_type == BPF_MAP_TYPE_STRUCT_OPS) {
 		fdput(f);
 		return ERR_PTR(-ENOTSUPP);
 	}
@@ -100,7 +101,7 @@ void *bpf_map_fd_get_ptr(struct bpf_map *map,
 		return inner_map;
 
 	if (bpf_map_meta_equal(map->inner_map_meta, inner_map))
-		inner_map = bpf_map_inc(inner_map, false);
+		bpf_map_inc(inner_map);
 	else
 		inner_map = ERR_PTR(-EINVAL);
 

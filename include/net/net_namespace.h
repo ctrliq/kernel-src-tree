@@ -36,6 +36,7 @@
 #include <linux/ns_common.h>
 #include <linux/idr.h>
 #include <linux/skbuff.h>
+#include <linux/notifier.h>
 #include <linux/siphash.h>
 
 struct user_namespace;
@@ -94,12 +95,15 @@ struct net {
 	struct list_head 	dev_base_head;
 	struct hlist_head 	*dev_name_head;
 	struct hlist_head	*dev_index_head;
+
 	unsigned int		dev_base_seq;	/* protected by rtnl_mutex */
 	int			ifindex;
 	unsigned int		dev_unreg_count;
 
 	/* core fib_rules */
 	struct list_head	rules_ops;
+
+	RH_KABI_DEPRECATE(struct list_head, fib_notifier_ops)
 
 	struct net_device       *loopback_dev;          /* The loopback */
 	struct netns_core	core;
@@ -170,6 +174,17 @@ struct net {
 	RH_KABI_EXTEND_WITH_SIZE(struct netns_xdp xdp, 21)
 	RH_KABI_EXTEND(int	sctp_ecn_enable)
 	RH_KABI_EXTEND(struct list_head        xfrm_inexact_bins)
+	RH_KABI_EXTEND(struct raw_notifier_head	netdev_chain)
+	RH_KABI_EXTEND(struct list_head		nft_module_list)
+	RH_KABI_EXTEND(struct mutex		nft_commit_mutex)
+#ifdef CONFIG_NF_CT_PROTO_GRE
+	RH_KABI_EXTEND(struct nf_gre_net	nf_ct_gre)
+#endif
+	RH_KABI_EXTEND(DEFINE_SNMP_STAT(struct linux_tls_mib, mib_tls_statistics))
+#ifdef CONFIG_MPTCP
+	RH_KABI_EXTEND(struct netns_mptcp_mib  mptcp_mib)
+#endif
+	RH_KABI_EXTEND(atomic64_t		net_cookie) /* written once */
 } __randomize_layout;
 
 #include <linux/seq_file_net.h>

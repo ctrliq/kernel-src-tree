@@ -851,6 +851,8 @@ static int afu_probe(struct platform_device *pdev)
 
 	dev_dbg(&pdev->dev, "%s\n", __func__);
 
+	mark_tech_preview("FPGA Accelerated Function Unit (AFU) driver", THIS_MODULE);
+
 	ret = afu_dev_init(pdev);
 	if (ret)
 		goto exit;

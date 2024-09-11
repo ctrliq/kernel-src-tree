@@ -172,7 +172,6 @@ struct scsi_device {
 				     * because we did a bus reset. */
 	unsigned use_10_for_rw:1; /* first try 10-byte read / write */
 	unsigned use_10_for_ms:1; /* first try 10-byte mode sense/select */
-	unsigned set_dbd_for_ms:1; /* Set "DBD" field in mode sense */
 	unsigned no_report_opcodes:1;	/* no REPORT SUPPORTED OPERATION CODES */
 	unsigned no_write_same:1;	/* no WRITE SAME command */
 	unsigned use_16_for_rw:1; /* Use read/write(16) over read/write(10) */
@@ -202,6 +201,9 @@ struct scsi_device {
 	unsigned broken_fua:1;		/* Don't set FUA bit */
 	unsigned lun_in_cdb:1;		/* Store LUN bits in CDB[1] */
 	unsigned unmap_limit_for_ws:1;	/* Use the UNMAP limit for WRITE SAME */
+
+	RH_KABI_FILL_HOLE(unsigned set_dbd_for_ms:1) /* Set "DBD" field in mode sense */
+	RH_KABI_FILL_HOLE(unsigned offline_already:1) /* Device offline message logged */
 
 	atomic_t disk_events_disable_depth; /* disable depth for disk events */
 

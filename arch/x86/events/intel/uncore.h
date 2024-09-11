@@ -530,6 +530,8 @@ void snb_uncore_cpu_init(void);
 void nhm_uncore_cpu_init(void);
 void skl_uncore_cpu_init(void);
 void icl_uncore_cpu_init(void);
+void tgl_uncore_mmio_init(void);
+void tgl_l_uncore_mmio_init(void);
 int snb_pci2phy_map_init(int devid);
 
 /* uncore_snbep.c */
@@ -548,6 +550,9 @@ void skx_uncore_cpu_init(void);
 int snr_uncore_pci_init(void);
 void snr_uncore_cpu_init(void);
 void snr_uncore_mmio_init(void);
+int icx_uncore_pci_init(void);
+void icx_uncore_cpu_init(void);
+void icx_uncore_mmio_init(void);
 
 /* uncore_nhmex.c */
 void nhmex_uncore_cpu_init(void);

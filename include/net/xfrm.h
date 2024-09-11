@@ -250,9 +250,9 @@ struct xfrm_state {
 	/* Reference to data common to all the instances of this
 	 * transformer. */
 	const struct xfrm_type	*type;
-	struct xfrm_mode	*inner_mode;
-	struct xfrm_mode	*inner_mode_iaf;
-	struct xfrm_mode	*outer_mode;
+	RH_KABI_CONST struct xfrm_mode	*inner_mode;
+	RH_KABI_CONST struct xfrm_mode	*inner_mode_iaf;
+	RH_KABI_CONST struct xfrm_mode	*outer_mode;
 
 	const struct xfrm_type_offload	*type_offload;
 
@@ -265,6 +265,7 @@ struct xfrm_state {
 
 	RH_KABI_EXTEND(u32	output_mark_mask)
 	RH_KABI_EXTEND(u32	if_id)
+	RH_KABI_EXTEND(struct sock __rcu	*encap_sk)
 };
 
 static inline struct net *xs_net(struct xfrm_state *x)
@@ -367,7 +368,7 @@ struct xfrm_state_afinfo {
 	struct module			*owner;
 	const struct xfrm_type		*type_map[IPPROTO_MAX];
 	const struct xfrm_type_offload	*type_offload_map[IPPROTO_MAX];
-	struct xfrm_mode		*mode_map[XFRM_MODE_MAX];
+	RH_KABI_DEPRECATE(struct xfrm_mode *, mode_map[XFRM_MODE_MAX])
 
 	int			(*init_flags)(struct xfrm_state *x);
 	void			(*init_tempsel)(struct xfrm_selector *sel,
@@ -444,6 +445,7 @@ int xfrm_register_type_offload(const struct xfrm_type_offload *type, unsigned sh
 int xfrm_unregister_type_offload(const struct xfrm_type_offload *type, unsigned short family);
 
 struct xfrm_mode {
+	RH_KABI_BROKEN_REMOVE_BLOCK(
 	/*
 	 * Remove encapsulation header.
 	 *
@@ -456,6 +458,16 @@ struct xfrm_mode {
 	 * payload.
 	 */
 	int (*input2)(struct xfrm_state *x, struct sk_buff *skb);
+
+	/*
+	 * This is the actual input entry point.
+	 *
+	 * For transport mode and equivalent this would be identical to
+	 * input2 (which does not need to be set).  While tunnel mode
+	 * and equivalent would set this to the tunnel encapsulation function
+	 * xfrm4_prepare_input that would in turn call input2.
+	 */
+	int (*input)(struct xfrm_state *x, struct sk_buff *skb);
 
 	/*
 	 * Add encapsulation header.
@@ -471,6 +483,17 @@ struct xfrm_mode {
 	int (*output2)(struct xfrm_state *x,struct sk_buff *skb);
 
 	/*
+	 * This is the actual output entry point.
+	 *
+	 * For transport mode and equivalent this would be identical to
+	 * output2 (which does not need to be set).  While tunnel mode
+	 * and equivalent would set this to a tunnel encapsulation function
+	 * (xfrm4_prepare_output or xfrm6_prepare_output) that would in turn
+	 * call output2.
+	 */
+	int (*output)(struct xfrm_state *x, struct sk_buff *skb);
+
+	/*
 	 * Adjust pointers into the packet and do GSO segmentation.
 	 */
 	struct sk_buff *(*gso_segment)(struct xfrm_state *x, struct sk_buff *skb, netdev_features_t features);
@@ -482,18 +505,15 @@ struct xfrm_mode {
 
 	struct xfrm_state_afinfo *afinfo;
 	struct module *owner;
-	u8 encap;
-	u8 family;
-	u8 flags;
+	) /* RH_KABI_BROKEN_REMOVE_BLOCK */
+	RH_KABI_REPLACE_SPLIT(unsigned int encap, u8 encap, u8 family)
+	RH_KABI_REPLACE(int flags, u8 flags)
 };
 
 /* Flags for xfrm_mode. */
 enum {
 	XFRM_MODE_FLAG_TUNNEL = 1,
 };
-
-int xfrm_register_mode(struct xfrm_mode *mode);
-void xfrm_unregister_mode(struct xfrm_mode *mode);
 
 static inline int xfrm_af2proto(unsigned int family)
 {
@@ -507,7 +527,7 @@ static inline int xfrm_af2proto(unsigned int family)
 	}
 }
 
-static inline struct xfrm_mode *xfrm_ip2inner_mode(struct xfrm_state *x, int ipproto)
+static inline const struct xfrm_mode *xfrm_ip2inner_mode(struct xfrm_state *x, int ipproto)
 {
 	if ((ipproto == IPPROTO_IPIP && x->props.family == AF_INET) ||
 	    (ipproto == IPPROTO_IPV6 && x->props.family == AF_INET6))
@@ -1524,6 +1544,8 @@ struct xfrm4_protocol {
 
 struct xfrm6_protocol {
 	int (*handler)(struct sk_buff *skb);
+	int (*input_handler)(struct sk_buff *skb, int nexthdr, __be32 spi,
+			     int encap_type);
 	int (*cb_handler)(struct sk_buff *skb, int err);
 	int (*err_handler)(struct sk_buff *skb, struct inet6_skb_parm *opt,
 			   u8 type, u8 code, int offset, __be32 info);
@@ -1712,6 +1734,8 @@ int xfrm6_extract_header(struct sk_buff *skb);
 int xfrm6_extract_input(struct xfrm_state *x, struct sk_buff *skb);
 int xfrm6_rcv_spi(struct sk_buff *skb, int nexthdr, __be32 spi,
 		  struct ip6_tnl *t);
+int xfrm6_rcv_encap(struct sk_buff *skb, int nexthdr, __be32 spi,
+		    int encap_type);
 int xfrm6_transport_finish(struct sk_buff *skb, int async);
 int xfrm6_rcv_tnl(struct sk_buff *skb, struct ip6_tnl *t);
 int xfrm6_rcv(struct sk_buff *skb);
@@ -1732,6 +1756,7 @@ int xfrm6_find_1stfragopt(struct xfrm_state *x, struct sk_buff *skb,
 
 #ifdef CONFIG_XFRM
 int xfrm4_udp_encap_rcv(struct sock *sk, struct sk_buff *skb);
+int xfrm6_udp_encap_rcv(struct sock *sk, struct sk_buff *skb);
 int xfrm_user_policy(struct sock *sk, int optname,
 		     u8 __user *optval, int optlen);
 #else

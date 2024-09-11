@@ -26,8 +26,7 @@ ice_aq_read_nvm(struct ice_hw *hw, u16 module_typeid, u32 offset, u16 length,
 
 	cmd = &desc.params.nvm;
 
-	/* In offset the highest byte must be zeroed. */
-	if (offset & 0xFF000000)
+	if (offset > ICE_AQC_NVM_MAX_OFFSET)
 		return ICE_ERR_PARAM;
 
 	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_nvm_read);
@@ -187,6 +186,131 @@ enum ice_status ice_read_sr_word(struct ice_hw *hw, u16 offset, u16 *data)
 }
 
 /**
+ * ice_get_pfa_module_tlv - Reads sub module TLV from NVM PFA
+ * @hw: pointer to hardware structure
+ * @module_tlv: pointer to module TLV to return
+ * @module_tlv_len: pointer to module TLV length to return
+ * @module_type: module type requested
+ *
+ * Finds the requested sub module TLV type from the Preserved Field
+ * Area (PFA) and returns the TLV pointer and length. The caller can
+ * use these to read the variable length TLV value.
+ */
+enum ice_status
+ice_get_pfa_module_tlv(struct ice_hw *hw, u16 *module_tlv, u16 *module_tlv_len,
+		       u16 module_type)
+{
+	enum ice_status status;
+	u16 pfa_len, pfa_ptr;
+	u16 next_tlv;
+
+	status = ice_read_sr_word(hw, ICE_SR_PFA_PTR, &pfa_ptr);
+	if (status) {
+		ice_debug(hw, ICE_DBG_INIT, "Preserved Field Array pointer.\n");
+		return status;
+	}
+	status = ice_read_sr_word(hw, pfa_ptr, &pfa_len);
+	if (status) {
+		ice_debug(hw, ICE_DBG_INIT, "Failed to read PFA length.\n");
+		return status;
+	}
+	/* Starting with first TLV after PFA length, iterate through the list
+	 * of TLVs to find the requested one.
+	 */
+	next_tlv = pfa_ptr + 1;
+	while (next_tlv < pfa_ptr + pfa_len) {
+		u16 tlv_sub_module_type;
+		u16 tlv_len;
+
+		/* Read TLV type */
+		status = ice_read_sr_word(hw, next_tlv, &tlv_sub_module_type);
+		if (status) {
+			ice_debug(hw, ICE_DBG_INIT, "Failed to read TLV type.\n");
+			break;
+		}
+		/* Read TLV length */
+		status = ice_read_sr_word(hw, next_tlv + 1, &tlv_len);
+		if (status) {
+			ice_debug(hw, ICE_DBG_INIT, "Failed to read TLV length.\n");
+			break;
+		}
+		if (tlv_sub_module_type == module_type) {
+			if (tlv_len) {
+				*module_tlv = next_tlv;
+				*module_tlv_len = tlv_len;
+				return 0;
+			}
+			return ICE_ERR_INVAL_SIZE;
+		}
+		/* Check next TLV, i.e. current TLV pointer + length + 2 words
+		 * (for current TLV's type and length)
+		 */
+		next_tlv = next_tlv + tlv_len + 2;
+	}
+	/* Module does not exist */
+	return ICE_ERR_DOES_NOT_EXIST;
+}
+
+/**
+ * ice_read_pba_string - Reads part number string from NVM
+ * @hw: pointer to hardware structure
+ * @pba_num: stores the part number string from the NVM
+ * @pba_num_size: part number string buffer length
+ *
+ * Reads the part number string from the NVM.
+ */
+enum ice_status
+ice_read_pba_string(struct ice_hw *hw, u8 *pba_num, u32 pba_num_size)
+{
+	u16 pba_tlv, pba_tlv_len;
+	enum ice_status status;
+	u16 pba_word, pba_size;
+	u16 i;
+
+	status = ice_get_pfa_module_tlv(hw, &pba_tlv, &pba_tlv_len,
+					ICE_SR_PBA_BLOCK_PTR);
+	if (status) {
+		ice_debug(hw, ICE_DBG_INIT, "Failed to read PBA Block TLV.\n");
+		return status;
+	}
+
+	/* pba_size is the next word */
+	status = ice_read_sr_word(hw, (pba_tlv + 2), &pba_size);
+	if (status) {
+		ice_debug(hw, ICE_DBG_INIT, "Failed to read PBA Section size.\n");
+		return status;
+	}
+
+	if (pba_tlv_len < pba_size) {
+		ice_debug(hw, ICE_DBG_INIT, "Invalid PBA Block TLV size.\n");
+		return ICE_ERR_INVAL_SIZE;
+	}
+
+	/* Subtract one to get PBA word count (PBA Size word is included in
+	 * total size)
+	 */
+	pba_size--;
+	if (pba_num_size < (((u32)pba_size * 2) + 1)) {
+		ice_debug(hw, ICE_DBG_INIT, "Buffer too small for PBA data.\n");
+		return ICE_ERR_PARAM;
+	}
+
+	for (i = 0; i < pba_size; i++) {
+		status = ice_read_sr_word(hw, (pba_tlv + 2 + 1) + i, &pba_word);
+		if (status) {
+			ice_debug(hw, ICE_DBG_INIT, "Failed to read PBA Block word %d.\n", i);
+			return status;
+		}
+
+		pba_num[(i * 2)] = (pba_word >> 8) & 0xFF;
+		pba_num[(i * 2) + 1] = pba_word & 0xFF;
+	}
+	pba_num[(pba_size * 2)] = '\0';
+
+	return status;
+}
+
+/**
  * ice_get_orom_ver_info - Read Option ROM version information
  * @hw: pointer to the HW struct
  *
@@ -240,6 +364,139 @@ static enum ice_status ice_get_orom_ver_info(struct ice_hw *hw)
 			    ICE_OROM_VER_BUILD_SHIFT);
 
 	return 0;
+}
+
+/**
+ * ice_get_netlist_ver_info
+ * @hw: pointer to the HW struct
+ *
+ * Get the netlist version information
+ */
+static enum ice_status ice_get_netlist_ver_info(struct ice_hw *hw)
+{
+	struct ice_netlist_ver_info *ver = &hw->netlist_ver;
+	enum ice_status ret;
+	u32 id_blk_start;
+	__le16 raw_data;
+	u16 data, i;
+	u16 *buff;
+
+	ret = ice_acquire_nvm(hw, ICE_RES_READ);
+	if (ret)
+		return ret;
+	buff = kcalloc(ICE_AQC_NVM_NETLIST_ID_BLK_LEN, sizeof(*buff),
+		       GFP_KERNEL);
+	if (!buff) {
+		ret = ICE_ERR_NO_MEMORY;
+		goto exit_no_mem;
+	}
+
+	/* read module length */
+	ret = ice_aq_read_nvm(hw, ICE_AQC_NVM_LINK_TOPO_NETLIST_MOD_ID,
+			      ICE_AQC_NVM_LINK_TOPO_NETLIST_LEN_OFFSET * 2,
+			      ICE_AQC_NVM_LINK_TOPO_NETLIST_LEN, &raw_data,
+			      false, false, NULL);
+	if (ret)
+		goto exit_error;
+
+	data = le16_to_cpu(raw_data);
+	/* exit if length is = 0 */
+	if (!data)
+		goto exit_error;
+
+	/* read node count */
+	ret = ice_aq_read_nvm(hw, ICE_AQC_NVM_LINK_TOPO_NETLIST_MOD_ID,
+			      ICE_AQC_NVM_NETLIST_NODE_COUNT_OFFSET * 2,
+			      ICE_AQC_NVM_NETLIST_NODE_COUNT_LEN, &raw_data,
+			      false, false, NULL);
+	if (ret)
+		goto exit_error;
+	data = le16_to_cpu(raw_data) & ICE_AQC_NVM_NETLIST_NODE_COUNT_M;
+
+	/* netlist ID block starts from offset 4 + node count * 2 */
+	id_blk_start = ICE_AQC_NVM_NETLIST_ID_BLK_START_OFFSET + data * 2;
+
+	/* read the entire netlist ID block */
+	ret = ice_aq_read_nvm(hw, ICE_AQC_NVM_LINK_TOPO_NETLIST_MOD_ID,
+			      id_blk_start * 2,
+			      ICE_AQC_NVM_NETLIST_ID_BLK_LEN * 2, buff, false,
+			      false, NULL);
+	if (ret)
+		goto exit_error;
+
+	for (i = 0; i < ICE_AQC_NVM_NETLIST_ID_BLK_LEN; i++)
+		buff[i] = le16_to_cpu(((__force __le16 *)buff)[i]);
+
+	ver->major = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_MAJOR_VER_HIGH] << 16) |
+		buff[ICE_AQC_NVM_NETLIST_ID_BLK_MAJOR_VER_LOW];
+	ver->minor = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_MINOR_VER_HIGH] << 16) |
+		buff[ICE_AQC_NVM_NETLIST_ID_BLK_MINOR_VER_LOW];
+	ver->type = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_TYPE_HIGH] << 16) |
+		buff[ICE_AQC_NVM_NETLIST_ID_BLK_TYPE_LOW];
+	ver->rev = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_REV_HIGH] << 16) |
+		buff[ICE_AQC_NVM_NETLIST_ID_BLK_REV_LOW];
+	ver->cust_ver = buff[ICE_AQC_NVM_NETLIST_ID_BLK_CUST_VER];
+	/* Read the left most 4 bytes of SHA */
+	ver->hash = buff[ICE_AQC_NVM_NETLIST_ID_BLK_SHA_HASH + 15] << 16 |
+		buff[ICE_AQC_NVM_NETLIST_ID_BLK_SHA_HASH + 14];
+
+exit_error:
+	kfree(buff);
+exit_no_mem:
+	ice_release_nvm(hw);
+	return ret;
+}
+
+/**
+ * ice_discover_flash_size - Discover the available flash size.
+ * @hw: pointer to the HW struct
+ *
+ * The device flash could be up to 16MB in size. However, it is possible that
+ * the actual size is smaller. Use bisection to determine the accessible size
+ * of flash memory.
+ */
+static enum ice_status ice_discover_flash_size(struct ice_hw *hw)
+{
+	u32 min_size = 0, max_size = ICE_AQC_NVM_MAX_OFFSET + 1;
+	enum ice_status status;
+
+	status = ice_acquire_nvm(hw, ICE_RES_READ);
+	if (status)
+		return status;
+
+	while ((max_size - min_size) > 1) {
+		u32 offset = (max_size + min_size) / 2;
+		u32 len = 1;
+		u8 data;
+
+		status = ice_read_flat_nvm(hw, offset, &len, &data, false);
+		if (status == ICE_ERR_AQ_ERROR &&
+		    hw->adminq.sq_last_status == ICE_AQ_RC_EINVAL) {
+			ice_debug(hw, ICE_DBG_NVM,
+				  "%s: New upper bound of %u bytes\n",
+				  __func__, offset);
+			status = 0;
+			max_size = offset;
+		} else if (!status) {
+			ice_debug(hw, ICE_DBG_NVM,
+				  "%s: New lower bound of %u bytes\n",
+				  __func__, offset);
+			min_size = offset;
+		} else {
+			/* an unexpected error occurred */
+			goto err_read_flat_nvm;
+		}
+	}
+
+	ice_debug(hw, ICE_DBG_NVM,
+		  "Predicted flash size is %u bytes\n", max_size);
+
+	hw->nvm.flash_size = max_size;
+
+err_read_flat_nvm:
+	ice_release_nvm(hw);
+
+	return status;
 }
 
 /**
@@ -300,23 +557,49 @@ enum ice_status ice_init_nvm(struct ice_hw *hw)
 
 	nvm->eetrack = (eetrack_hi << 16) | eetrack_lo;
 
-	/* the following devices do not have boot_cfg_tlv yet */
-	if (hw->device_id == ICE_DEV_ID_E822C_BACKPLANE ||
-	    hw->device_id == ICE_DEV_ID_E822C_QSFP ||
-	    hw->device_id == ICE_DEV_ID_E822C_10G_BASE_T ||
-	    hw->device_id == ICE_DEV_ID_E822C_SGMII ||
-	    hw->device_id == ICE_DEV_ID_E822C_SFP ||
-	    hw->device_id == ICE_DEV_ID_E822X_BACKPLANE ||
-	    hw->device_id == ICE_DEV_ID_E822L_SFP ||
-	    hw->device_id == ICE_DEV_ID_E822L_10G_BASE_T ||
-	    hw->device_id == ICE_DEV_ID_E822L_SGMII)
+	status = ice_discover_flash_size(hw);
+	if (status) {
+		ice_debug(hw, ICE_DBG_NVM,
+			  "NVM init error: failed to discover flash size.\n");
 		return status;
+	}
+
+	switch (hw->device_id) {
+	/* the following devices do not have boot_cfg_tlv yet */
+	case ICE_DEV_ID_E823C_BACKPLANE:
+	case ICE_DEV_ID_E823C_QSFP:
+	case ICE_DEV_ID_E823C_SFP:
+	case ICE_DEV_ID_E823C_10G_BASE_T:
+	case ICE_DEV_ID_E823C_SGMII:
+	case ICE_DEV_ID_E822C_BACKPLANE:
+	case ICE_DEV_ID_E822C_QSFP:
+	case ICE_DEV_ID_E822C_10G_BASE_T:
+	case ICE_DEV_ID_E822C_SGMII:
+	case ICE_DEV_ID_E822C_SFP:
+	case ICE_DEV_ID_E822L_BACKPLANE:
+	case ICE_DEV_ID_E822L_SFP:
+	case ICE_DEV_ID_E822L_10G_BASE_T:
+	case ICE_DEV_ID_E822L_SGMII:
+	case ICE_DEV_ID_E823L_BACKPLANE:
+	case ICE_DEV_ID_E823L_SFP:
+	case ICE_DEV_ID_E823L_10G_BASE_T:
+	case ICE_DEV_ID_E823L_1GBE:
+	case ICE_DEV_ID_E823L_QSFP:
+		return status;
+	default:
+		break;
+	}
 
 	status = ice_get_orom_ver_info(hw);
 	if (status) {
 		ice_debug(hw, ICE_DBG_INIT, "Failed to read Option ROM info.\n");
 		return status;
 	}
+
+	/* read the netlist version information */
+	status = ice_get_netlist_ver_info(hw);
+	if (status)
+		ice_debug(hw, ICE_DBG_INIT, "Failed to read netlist info.\n");
 
 	return 0;
 }

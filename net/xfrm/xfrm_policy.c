@@ -34,6 +34,9 @@
 #ifdef CONFIG_XFRM_STATISTICS
 #include <net/snmp.h>
 #endif
+#ifdef CONFIG_XFRM_ESPINTCP
+#include <net/espintcp.h>
+#endif
 
 #include "xfrm_hash.h"
 
@@ -2536,10 +2539,11 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 					    const struct flowi *fl,
 					    struct dst_entry *dst)
 {
+	const struct xfrm_state_afinfo *afinfo;
+	const struct xfrm_mode *inner_mode;
 	struct net *net = xp_net(policy);
 	unsigned long now = jiffies;
 	struct net_device *dev;
-	struct xfrm_mode *inner_mode;
 	struct xfrm_dst *xdst_prev = NULL;
 	struct xfrm_dst *xdst0 = NULL;
 	int i = 0;
@@ -2614,7 +2618,14 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
 		dst1->lastuse = now;
 
 		dst1->input = dst_discard;
-		dst1->output = inner_mode->afinfo->output;
+
+		rcu_read_lock();
+		afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
+		if (likely(afinfo))
+			dst1->output = afinfo->output;
+		else
+			dst1->output = dst_discard_out;
+		rcu_read_unlock();
 
 		xdst_prev = xdst;
 
@@ -3935,6 +3946,10 @@ void __init xfrm_init(void)
 	xfrm_dev_init();
 	seqcount_init(&xfrm_policy_hash_generation);
 	xfrm_input_init();
+
+#ifdef CONFIG_XFRM_ESPINTCP
+	espintcp_init();
+#endif
 
 	RCU_INIT_POINTER(xfrm_if_cb, NULL);
 	synchronize_rcu();

@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
+#include <linux/net_namespace.h>
 #include <net/devlink.h>
 
 #include "trap.h"
@@ -41,7 +42,8 @@ void mlxsw_core_driver_unregister(struct mlxsw_driver *mlxsw_driver);
 int mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
 				   const struct mlxsw_bus *mlxsw_bus,
 				   void *bus_priv, bool reload,
-				   struct devlink *devlink);
+				   struct devlink *devlink,
+				   struct netlink_ext_ack *extack);
 void mlxsw_core_bus_device_unregister(struct mlxsw_core *mlxsw_core, bool reload);
 
 struct mlxsw_tx_info {
@@ -270,7 +272,8 @@ struct mlxsw_driver {
 	const char *kind;
 	size_t priv_size;
 	int (*init)(struct mlxsw_core *mlxsw_core,
-		    const struct mlxsw_bus_info *mlxsw_bus_info);
+		    const struct mlxsw_bus_info *mlxsw_bus_info,
+		    struct netlink_ext_ack *extack);
 	void (*fini)(struct mlxsw_core *mlxsw_core);
 	int (*basic_trap_groups_set)(struct mlxsw_core *mlxsw_core);
 	int (*port_type_set)(struct mlxsw_core *mlxsw_core, u8 local_port,
@@ -324,6 +327,20 @@ struct mlxsw_driver {
 			       enum devlink_trap_action action);
 	int (*trap_group_init)(struct mlxsw_core *mlxsw_core,
 			       const struct devlink_trap_group *group);
+	int (*trap_group_set)(struct mlxsw_core *mlxsw_core,
+			      const struct devlink_trap_group *group,
+			      const struct devlink_trap_policer *policer);
+	int (*trap_policer_init)(struct mlxsw_core *mlxsw_core,
+				 const struct devlink_trap_policer *policer);
+	void (*trap_policer_fini)(struct mlxsw_core *mlxsw_core,
+				  const struct devlink_trap_policer *policer);
+	int (*trap_policer_set)(struct mlxsw_core *mlxsw_core,
+				const struct devlink_trap_policer *policer,
+				u64 rate, u64 burst,
+				struct netlink_ext_ack *extack);
+	int (*trap_policer_counter_get)(struct mlxsw_core *mlxsw_core,
+					const struct devlink_trap_policer *policer,
+					u64 *p_drops);
 	void (*txhdr_construct)(struct sk_buff *skb,
 				const struct mlxsw_tx_info *tx_info);
 	int (*resources_register)(struct mlxsw_core *mlxsw_core);
@@ -369,6 +386,11 @@ u64 mlxsw_core_res_get(struct mlxsw_core *mlxsw_core,
 
 #define MLXSW_CORE_RES_GET(mlxsw_core, short_res_id)			\
 	mlxsw_core_res_get(mlxsw_core, MLXSW_RES_ID_##short_res_id)
+
+static inline struct net *mlxsw_core_net(struct mlxsw_core *mlxsw_core)
+{
+	return devlink_net(priv_to_devlink(mlxsw_core));
+}
 
 #define MLXSW_BUS_F_TXRX	BIT(0)
 #define MLXSW_BUS_F_RESET	BIT(1)
