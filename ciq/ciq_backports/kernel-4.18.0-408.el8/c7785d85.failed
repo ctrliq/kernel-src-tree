@@ -1,0 +1,207 @@
+KVM: x86/mmu: Skip tlb flush if it has been done in zap_gfn_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Hou Wenlong <houwenlong93@linux.alibaba.com>
+commit c7785d85b6c6cc9f3d0f1a8cab128f4062b30abb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/c7785d85.failed
+
+If the parameter flush is set, zap_gfn_range() would flush remote tlb
+when yield, then tlb flush is not needed outside. So use the return
+value of zap_gfn_range() directly instead of OR on it in
+kvm_unmap_gfn_range() and kvm_tdp_mmu_unmap_gfn_range().
+
+Fixes: 3039bcc744980 ("KVM: Move x86's MMU notifier memslot walkers to generic code")
+	Signed-off-by: Hou Wenlong <houwenlong93@linux.alibaba.com>
+Message-Id: <5e16546e228877a4d974f8c0e448a93d52c7a5a9.1637140154.git.houwenlong93@linux.alibaba.com>
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c7785d85b6c6cc9f3d0f1a8cab128f4062b30abb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 009f93cd3ca5,0a8436ea0090..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -1584,43 -1574,38 +1584,55 @@@ static __always_inline int kvm_handle_h
+  	return ret;
+  }
+  
+ -bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
+ +static int kvm_handle_hva(struct kvm *kvm, unsigned long hva,
+ +			  unsigned long data, rmap_handler_t handler)
+  {
+++<<<<<<< HEAD
+ +	return kvm_handle_hva_range(kvm, hva, hva + 1, data, handler);
+++=======
++ 	bool flush = false;
++ 
++ 	if (kvm_memslots_have_rmaps(kvm))
++ 		flush = kvm_handle_gfn_range(kvm, range, kvm_unmap_rmapp);
++ 
++ 	if (is_tdp_mmu_enabled(kvm))
++ 		flush = kvm_tdp_mmu_unmap_gfn_range(kvm, range, flush);
++ 
++ 	return flush;
+++>>>>>>> c7785d85b6c6 (KVM: x86/mmu: Skip tlb flush if it has been done in zap_gfn_range())
+  }
+  
+ -bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end,
+ +			unsigned flags)
+  {
+ -	bool flush = false;
+ +	int r;
+  
+ -	if (kvm_memslots_have_rmaps(kvm))
+ -		flush = kvm_handle_gfn_range(kvm, range, kvm_set_pte_rmapp);
+ +	r = kvm_handle_hva_range(kvm, start, end, 0, kvm_unmap_rmapp);
+  
+  	if (is_tdp_mmu_enabled(kvm))
+ -		flush |= kvm_tdp_mmu_set_spte_gfn(kvm, range);
+ +		r |= kvm_tdp_mmu_zap_hva_range(kvm, start, end);
+  
+ -	return flush;
+ +	return r;
+  }
+  
+ -static bool kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ -			  struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ -			  pte_t unused)
+ +int kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte)
+ +{
+ +	int r;
+ +
+ +	r = kvm_handle_hva(kvm, hva, (unsigned long)&pte, kvm_set_pte_rmapp);
+ +
+ +	if (is_tdp_mmu_enabled(kvm))
+ +		r |= kvm_tdp_mmu_set_spte_hva(kvm, hva, &pte);
+ +
+ +	return r;
+ +}
+ +
+ +static int kvm_age_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ +			 struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ +			 unsigned long data)
+  {
+  	u64 *sptep;
+ -	struct rmap_iterator iter;
+ +	struct rmap_iterator uninitialized_var(iter);
+  	int young = 0;
+  
+  	for_each_rmap_spte(rmap_head, &iter, sptep)
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 968568d642d2,1f8c9f783b78..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -1009,71 -1026,43 +1009,77 @@@ int kvm_tdp_mmu_map(struct kvm_vcpu *vc
+  	return ret;
+  }
+  
+ -bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
+ -				 bool flush)
+ +typedef int (*tdp_handler_t)(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			     struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+ +			     unsigned long data);
+ +
+ +static __always_inline int kvm_tdp_mmu_handle_hva_range(struct kvm *kvm,
+ +							unsigned long start,
+ +							unsigned long end,
+ +							unsigned long data,
+ +							tdp_handler_t handler)
+  {
+ +	struct kvm_memslots *slots;
+ +	struct kvm_memory_slot *memslot;
+  	struct kvm_mmu_page *root;
+ -
+ +	int ret = 0;
+ +	int as_id;
+ +
+++<<<<<<< HEAD
+ +	for (as_id = 0; as_id < KVM_ADDRESS_SPACE_NUM; as_id++) {
+ +		for_each_tdp_mmu_root_yield_safe(kvm, root, as_id) {
+ +			slots = __kvm_memslots(kvm, as_id);
+ +			kvm_for_each_memslot(memslot, slots) {
+ +				unsigned long hva_start, hva_end;
+ +				gfn_t gfn_start, gfn_end;
+++=======
++ 	for_each_tdp_mmu_root(kvm, root, range->slot->as_id)
++ 		flush = zap_gfn_range(kvm, root, range->start, range->end,
++ 				      range->may_block, flush, false);
+++>>>>>>> c7785d85b6c6 (KVM: x86/mmu: Skip tlb flush if it has been done in zap_gfn_range())
+ +
+ +				hva_start = max(start, memslot->userspace_addr);
+ +				hva_end = min(end, memslot->userspace_addr +
+ +					(memslot->npages << PAGE_SHIFT));
+ +				if (hva_start >= hva_end)
+ +					continue;
+ +				/*
+ +				 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+ +				 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+ +				 */
+ +				gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+ +				gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+ +
+ +				ret |= handler(kvm, memslot, root, gfn_start,
+ +					gfn_end, data);
+ +			}
+ +		}
+ +	}
+  
+ -	return flush;
+ +	return ret;
+  }
+  
+ -typedef bool (*tdp_handler_t)(struct kvm *kvm, struct tdp_iter *iter,
+ -			      struct kvm_gfn_range *range);
+ -
+ -static __always_inline bool kvm_tdp_mmu_handle_gfn(struct kvm *kvm,
+ -						   struct kvm_gfn_range *range,
+ -						   tdp_handler_t handler)
+ +static __always_inline int kvm_tdp_mmu_handle_hva(struct kvm *kvm,
+ +						  unsigned long addr,
+ +						  unsigned long data,
+ +						  tdp_handler_t handler)
+  {
+ -	struct kvm_mmu_page *root;
+ -	struct tdp_iter iter;
+ -	bool ret = false;
+ -
+ -	rcu_read_lock();
+ -
+ -	/*
+ -	 * Don't support rescheduling, none of the MMU notifiers that funnel
+ -	 * into this helper allow blocking; it'd be dead, wasteful code.
+ -	 */
+ -	for_each_tdp_mmu_root(kvm, root, range->slot->as_id) {
+ -		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end)
+ -			ret |= handler(kvm, &iter, range);
+ -	}
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, addr, addr + 1, data, handler);
+ +}
+  
+ -	rcu_read_unlock();
+ +static int zap_gfn_range_hva_wrapper(struct kvm *kvm,
+ +				     struct kvm_memory_slot *slot,
+ +				     struct kvm_mmu_page *root, gfn_t start,
+ +				     gfn_t end, unsigned long unused)
+ +{
+ +	return zap_gfn_range(kvm, root, start, end, false, false);
+ +}
+  
+ -	return ret;
+ +int kvm_tdp_mmu_zap_hva_range(struct kvm *kvm, unsigned long start,
+ +			      unsigned long end)
+ +{
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, start, end, 0,
+ +					    zap_gfn_range_hva_wrapper);
+  }
+  
+  /*
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
