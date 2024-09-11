@@ -1,0 +1,154 @@
+xfrm: BEET mode doesn't support fragments for inner packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 68dc022d04eb0fd60a540e242dcb11ec1bee07e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/68dc022d.failed
+
+BEET mode replaces the IP(6) Headers with new IP(6) Headers when sending
+packets. However, when it's a fragment before the replacement, currently
+kernel keeps the fragment flag and replace the address field then encaps
+it with ESP. It would cause in RX side the fragments to get reassembled
+before decapping with ESP, which is incorrect.
+
+In Xiumei's testing, these fragments went over an xfrm interface and got
+encapped with ESP in the device driver, and the traffic was broken.
+
+I don't have a good way to fix it, but only to warn this out in dmesg.
+
+	Reported-by: Xiumei Mu <xmu@redhat.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 68dc022d04eb0fd60a540e242dcb11ec1bee07e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_output.c
+diff --cc net/xfrm/xfrm_output.c
+index d9edce1e45bb,e4cb0ff4dcf4..000000000000
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@@ -621,11 -629,114 +621,119 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(xfrm_output);
+  
+++<<<<<<< HEAD
+++=======
++ static int xfrm4_tunnel_check_size(struct sk_buff *skb)
++ {
++ 	int mtu, ret = 0;
++ 
++ 	if (IPCB(skb)->flags & IPSKB_XFRM_TUNNEL_SIZE)
++ 		goto out;
++ 
++ 	if (!(ip_hdr(skb)->frag_off & htons(IP_DF)) || skb->ignore_df)
++ 		goto out;
++ 
++ 	mtu = dst_mtu(skb_dst(skb));
++ 	if ((!skb_is_gso(skb) && skb->len > mtu) ||
++ 	    (skb_is_gso(skb) &&
++ 	     !skb_gso_validate_network_len(skb, ip_skb_dst_mtu(skb->sk, skb)))) {
++ 		skb->protocol = htons(ETH_P_IP);
++ 
++ 		if (skb->sk)
++ 			xfrm_local_error(skb, mtu);
++ 		else
++ 			icmp_send(skb, ICMP_DEST_UNREACH,
++ 				  ICMP_FRAG_NEEDED, htonl(mtu));
++ 		ret = -EMSGSIZE;
++ 	}
++ out:
++ 	return ret;
++ }
++ 
++ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
++ {
++ 	int err;
++ 
++ 	if (x->outer_mode.encap == XFRM_MODE_BEET &&
++ 	    ip_is_fragment(ip_hdr(skb))) {
++ 		net_warn_ratelimited("BEET mode doesn't support inner IPv4 fragments\n");
++ 		return -EAFNOSUPPORT;
++ 	}
++ 
++ 	err = xfrm4_tunnel_check_size(skb);
++ 	if (err)
++ 		return err;
++ 
++ 	XFRM_MODE_SKB_CB(skb)->protocol = ip_hdr(skb)->protocol;
++ 
++ 	xfrm4_extract_header(skb);
++ 	return 0;
++ }
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ static int xfrm6_tunnel_check_size(struct sk_buff *skb)
++ {
++ 	int mtu, ret = 0;
++ 	struct dst_entry *dst = skb_dst(skb);
++ 
++ 	if (skb->ignore_df)
++ 		goto out;
++ 
++ 	mtu = dst_mtu(dst);
++ 	if (mtu < IPV6_MIN_MTU)
++ 		mtu = IPV6_MIN_MTU;
++ 
++ 	if ((!skb_is_gso(skb) && skb->len > mtu) ||
++ 	    (skb_is_gso(skb) &&
++ 	     !skb_gso_validate_network_len(skb, ip6_skb_dst_mtu(skb)))) {
++ 		skb->dev = dst->dev;
++ 		skb->protocol = htons(ETH_P_IPV6);
++ 
++ 		if (xfrm6_local_dontfrag(skb->sk))
++ 			ipv6_stub->xfrm6_local_rxpmtu(skb, mtu);
++ 		else if (skb->sk)
++ 			xfrm_local_error(skb, mtu);
++ 		else
++ 			icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
++ 		ret = -EMSGSIZE;
++ 	}
++ out:
++ 	return ret;
++ }
++ #endif
++ 
++ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
++ {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	unsigned int ptr = 0;
++ 	int err;
++ 
++ 	if (x->outer_mode.encap == XFRM_MODE_BEET &&
++ 	    ipv6_find_hdr(skb, &ptr, NEXTHDR_FRAGMENT, NULL, NULL) >= 0) {
++ 		net_warn_ratelimited("BEET mode doesn't support inner IPv6 fragments\n");
++ 		return -EAFNOSUPPORT;
++ 	}
++ 
++ 	err = xfrm6_tunnel_check_size(skb);
++ 	if (err)
++ 		return err;
++ 
++ 	XFRM_MODE_SKB_CB(skb)->protocol = ipv6_hdr(skb)->nexthdr;
++ 
++ 	xfrm6_extract_header(skb);
++ 	return 0;
++ #else
++ 	WARN_ON_ONCE(1);
++ 	return -EAFNOSUPPORT;
++ #endif
++ }
++ 
+++>>>>>>> 68dc022d04eb (xfrm: BEET mode doesn't support fragments for inner packets)
+  static int xfrm_inner_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+  {
+ +	const struct xfrm_state_afinfo *afinfo;
+  	const struct xfrm_mode *inner_mode;
+ +	int err = -EAFNOSUPPORT;
+  
+  	if (x->sel.family == AF_UNSPEC)
+  		inner_mode = xfrm_ip2inner_mode(x,
+* Unmerged path net/xfrm/xfrm_output.c
