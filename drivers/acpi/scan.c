@@ -2405,6 +2405,8 @@ int __init acpi_scan_init(void)
 		}
 	}
 
+	acpi_turn_off_unused_power_resources();
+
 	acpi_scan_initialized = true;
 
  out:
