@@ -1,0 +1,145 @@
+sctp: improve the code for pmtu probe send and recv update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 058e6e0ed0eace43401c945082dec1d669b5b231
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/058e6e0e.failed
+
+This patch does 3 things:
+
+  - make sctp_transport_pl_send() and sctp_transport_pl_recv()
+    return bool type to decide if more probe is needed to send.
+
+  - pr_debug() only when probe is really needed to send.
+
+  - count pl.raise_count in sctp_transport_pl_send() instead of
+    sctp_transport_pl_recv(), and it's only incremented for the
+    1st probe for the same size.
+
+These are preparations for the next patch to make probes happen
+only when there's packet loss in Search Complete state.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 058e6e0ed0eace43401c945082dec1d669b5b231)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/sm_statefuns.c
+diff --cc net/sctp/sm_statefuns.c
+index 209200b6aac2,32df65f68c12..000000000000
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@@ -1289,8 -1274,10 +1289,15 @@@ enum sctp_disposition sctp_sf_backbeat_
+  		    !sctp_transport_pl_enabled(link))
+  			return SCTP_DISPOSITION_DISCARD;
+  
+++<<<<<<< HEAD
+ +		sctp_transport_pl_recv(link);
+ +		return SCTP_DISPOSITION_CONSUME;
+++=======
++ 		if (sctp_transport_pl_recv(link))
++ 			return SCTP_DISPOSITION_CONSUME;
++ 
++ 		return sctp_sf_send_probe(net, ep, asoc, type, link, commands);
+++>>>>>>> 058e6e0ed0ea (sctp: improve the code for pmtu probe send and recv update)
+  	}
+  
+  	max_interval = link->hbinterval + link->rto;
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index 1ca0aea93619..4824b38c8d10 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -1046,8 +1046,8 @@ bool sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu);
+ void sctp_transport_immediate_rtx(struct sctp_transport *);
+ void sctp_transport_dst_release(struct sctp_transport *t);
+ void sctp_transport_dst_confirm(struct sctp_transport *t);
+-void sctp_transport_pl_send(struct sctp_transport *t);
+-void sctp_transport_pl_recv(struct sctp_transport *t);
++bool sctp_transport_pl_send(struct sctp_transport *t);
++bool sctp_transport_pl_recv(struct sctp_transport *t);
+ 
+ 
+ /* This is the structure we use to queue packets as they come into
+* Unmerged path net/sctp/sm_statefuns.c
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 510029130fa7..283093b88385 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -273,16 +273,12 @@ void sctp_transport_pmtu(struct sctp_transport *transport, struct sock *sk)
+ 	sctp_transport_pl_update(transport);
+ }
+ 
+-void sctp_transport_pl_send(struct sctp_transport *t)
++bool sctp_transport_pl_send(struct sctp_transport *t)
+ {
+-	pr_debug("%s: PLPMTUD: transport: %p, state: %d, pmtu: %d, size: %d, high: %d\n",
+-		 __func__, t, t->pl.state, t->pl.pmtu, t->pl.probe_size, t->pl.probe_high);
+-
+-	if (t->pl.probe_count < SCTP_MAX_PROBES) {
+-		t->pl.probe_count++;
+-		return;
+-	}
++	if (t->pl.probe_count < SCTP_MAX_PROBES)
++		goto out;
+ 
++	t->pl.probe_count = 0;
+ 	if (t->pl.state == SCTP_PL_BASE) {
+ 		if (t->pl.probe_size == SCTP_BASE_PLPMTU) { /* BASE_PLPMTU Confirmation Failed */
+ 			t->pl.state = SCTP_PL_ERROR; /* Base -> Error */
+@@ -314,10 +310,20 @@ void sctp_transport_pl_send(struct sctp_transport *t)
+ 			sctp_assoc_sync_pmtu(t->asoc);
+ 		}
+ 	}
+-	t->pl.probe_count = 1;
++
++out:
++	if (t->pl.state == SCTP_PL_COMPLETE && t->pl.raise_count < 30 &&
++	    !t->pl.probe_count)
++		t->pl.raise_count++;
++
++	pr_debug("%s: PLPMTUD: transport: %p, state: %d, pmtu: %d, size: %d, high: %d\n",
++		 __func__, t, t->pl.state, t->pl.pmtu, t->pl.probe_size, t->pl.probe_high);
++
++	t->pl.probe_count++;
++	return true;
+ }
+ 
+-void sctp_transport_pl_recv(struct sctp_transport *t)
++bool sctp_transport_pl_recv(struct sctp_transport *t)
+ {
+ 	pr_debug("%s: PLPMTUD: transport: %p, state: %d, pmtu: %d, size: %d, high: %d\n",
+ 		 __func__, t, t->pl.state, t->pl.pmtu, t->pl.probe_size, t->pl.probe_high);
+@@ -338,7 +344,7 @@ void sctp_transport_pl_recv(struct sctp_transport *t)
+ 		if (!t->pl.probe_high) {
+ 			t->pl.probe_size = min(t->pl.probe_size + SCTP_PL_BIG_STEP,
+ 					       SCTP_MAX_PLPMTU);
+-			return;
++			return false;
+ 		}
+ 		t->pl.probe_size += SCTP_PL_MIN_STEP;
+ 		if (t->pl.probe_size >= t->pl.probe_high) {
+@@ -350,14 +356,13 @@ void sctp_transport_pl_recv(struct sctp_transport *t)
+ 			t->pathmtu = t->pl.pmtu + sctp_transport_pl_hlen(t);
+ 			sctp_assoc_sync_pmtu(t->asoc);
+ 		}
+-	} else if (t->pl.state == SCTP_PL_COMPLETE) {
+-		t->pl.raise_count++;
+-		if (t->pl.raise_count == 30) {
+-			/* Raise probe_size again after 30 * interval in Search Complete */
+-			t->pl.state = SCTP_PL_SEARCH; /* Search Complete -> Search */
+-			t->pl.probe_size += SCTP_PL_MIN_STEP;
+-		}
++	} else if (t->pl.state == SCTP_PL_COMPLETE && t->pl.raise_count == 30) {
++		/* Raise probe_size again after 30 * interval in Search Complete */
++		t->pl.state = SCTP_PL_SEARCH; /* Search Complete -> Search */
++		t->pl.probe_size += SCTP_PL_MIN_STEP;
+ 	}
++
++	return t->pl.state == SCTP_PL_COMPLETE;
+ }
+ 
+ static bool sctp_transport_pl_toobig(struct sctp_transport *t, u32 pmtu)
