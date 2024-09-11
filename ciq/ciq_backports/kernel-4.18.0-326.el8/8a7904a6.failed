@@ -1,0 +1,261 @@
+RDMA/mlx5: Lower setting the umem's PAS for SRQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit 8a7904a672a1d33c848e5129f886ee69e0773a2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/8a7904a6.failed
+
+Some of the SRQ types are created using a WQ, and the WQ requires a
+different parameter set to mlx5_umem_find_best_quantized_pgoff() as it has
+a 5 bit page_offset.
+
+Add the umem to the mlx5_srq_attr and defer computing the PAS data until
+the code has figured out what kind of mailbox to use. Compute the PAS
+directly from the umem for each of the four unique mailbox types.
+
+This also avoids allocating memory to store the user PAS, instead it is
+written directly to the mailbox as in most other cases.
+
+Fixes: 01949d0109ee ("net/mlx5_core: Enable XRCs and SRQs when using ISSI > 0")
+Link: https://lore.kernel.org/r/20201115114311.136250-8-leon@kernel.org
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 8a7904a672a1d33c848e5129f886ee69e0773a2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/srq.c
+diff --cc drivers/infiniband/hw/mlx5/srq.c
+index 39086f3cf4b4,fab6736e4d6a..000000000000
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@@ -51,10 -51,6 +51,13 @@@ static int create_srq_user(struct ib_p
+  		udata, struct mlx5_ib_ucontext, ibucontext);
+  	size_t ucmdlen;
+  	int err;
+++<<<<<<< HEAD
+ +	int npages;
+ +	int page_shift;
+ +	int ncont;
+ +	u32 offset;
+++=======
+++>>>>>>> 8a7904a672a1 (RDMA/mlx5: Lower setting the umem's PAS for SRQ)
+  	u32 uidx = MLX5_IB_DEFAULT_UIDX;
+  
+  	ucmdlen = min(udata->inlen, sizeof(ucmd));
+@@@ -86,32 -82,14 +89,39 @@@
+  		err = PTR_ERR(srq->umem);
+  		return err;
+  	}
+++<<<<<<< HEAD
+ +
+ +	mlx5_ib_cont_pages(srq->umem, ucmd.buf_addr, 0, &npages,
+ +			   &page_shift, &ncont, NULL);
+ +	err = mlx5_ib_get_buf_offset(ucmd.buf_addr, page_shift,
+ +				     &offset);
+ +	if (err) {
+ +		mlx5_ib_warn(dev, "bad offset\n");
+ +		goto err_umem;
+ +	}
+ +
+ +	in->pas = kvcalloc(ncont, sizeof(*in->pas), GFP_KERNEL);
+ +	if (!in->pas) {
+ +		err = -ENOMEM;
+ +		goto err_umem;
+ +	}
+ +
+ +	mlx5_ib_populate_pas(dev, srq->umem, page_shift, in->pas, 0);
+++=======
++ 	in->umem = srq->umem;
+++>>>>>>> 8a7904a672a1 (RDMA/mlx5: Lower setting the umem's PAS for SRQ)
+  
+  	err = mlx5_ib_db_map_user(ucontext, udata, ucmd.db_addr, &srq->db);
+  	if (err) {
+  		mlx5_ib_dbg(dev, "map doorbell failed\n");
+- 		goto err_in;
++ 		goto err_umem;
+  	}
+  
+++<<<<<<< HEAD
+ +	in->log_page_size = page_shift - MLX5_ADAPTER_PAGE_SHIFT;
+ +	in->page_offset = offset;
+++=======
+++>>>>>>> 8a7904a672a1 (RDMA/mlx5: Lower setting the umem's PAS for SRQ)
+  	in->uid = (in->type != IB_SRQT_XRC) ?  to_mpd(pd)->uid : 0;
+  	if (MLX5_CAP_GEN(dev->mdev, cqe_version) == MLX5_CQE_VERSION_V1 &&
+  	    in->type != IB_SRQT_BASIC)
+* Unmerged path drivers/infiniband/hw/mlx5/srq.c
+diff --git a/drivers/infiniband/hw/mlx5/srq.h b/drivers/infiniband/hw/mlx5/srq.h
+index 2c3627b2509d..a7e3dc5564ac 100644
+--- a/drivers/infiniband/hw/mlx5/srq.h
++++ b/drivers/infiniband/hw/mlx5/srq.h
+@@ -28,6 +28,7 @@ struct mlx5_srq_attr {
+ 	u32 user_index;
+ 	u64 db_record;
+ 	__be64 *pas;
++	struct ib_umem *umem;
+ 	u32 tm_log_list_size;
+ 	u32 tm_next_tag;
+ 	u32 tm_hw_phase_cnt;
+diff --git a/drivers/infiniband/hw/mlx5/srq_cmd.c b/drivers/infiniband/hw/mlx5/srq_cmd.c
+index db889ec3fd48..8b3385396599 100644
+--- a/drivers/infiniband/hw/mlx5/srq_cmd.c
++++ b/drivers/infiniband/hw/mlx5/srq_cmd.c
+@@ -92,6 +92,25 @@ struct mlx5_core_srq *mlx5_cmd_get_srq(struct mlx5_ib_dev *dev, u32 srqn)
+ 	return srq;
+ }
+ 
++static int __set_srq_page_size(struct mlx5_srq_attr *in,
++			       unsigned long page_size)
++{
++	if (!page_size)
++		return -EINVAL;
++	in->log_page_size = order_base_2(page_size) - MLX5_ADAPTER_PAGE_SHIFT;
++
++	if (WARN_ON(get_pas_size(in) !=
++		    ib_umem_num_dma_blocks(in->umem, page_size) * sizeof(u64)))
++		return -EINVAL;
++	return 0;
++}
++
++#define set_srq_page_size(in, typ, log_pgsz_fld)                               \
++	__set_srq_page_size(in, mlx5_umem_find_best_quantized_pgoff(           \
++					(in)->umem, typ, log_pgsz_fld,         \
++					MLX5_ADAPTER_PAGE_SHIFT, page_offset,  \
++					64, &(in)->page_offset))
++
+ static int create_srq_cmd(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
+ 			  struct mlx5_srq_attr *in)
+ {
+@@ -103,6 +122,12 @@ static int create_srq_cmd(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
+ 	int inlen;
+ 	int err;
+ 
++	if (in->umem) {
++		err = set_srq_page_size(in, srqc, log_page_size);
++		if (err)
++			return err;
++	}
++
+ 	pas_size  = get_pas_size(in);
+ 	inlen	  = MLX5_ST_SZ_BYTES(create_srq_in) + pas_size;
+ 	create_in = kvzalloc(inlen, GFP_KERNEL);
+@@ -114,7 +139,13 @@ static int create_srq_cmd(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
+ 	pas = MLX5_ADDR_OF(create_srq_in, create_in, pas);
+ 
+ 	set_srqc(srqc, in);
+-	memcpy(pas, in->pas, pas_size);
++	if (in->umem)
++		mlx5_ib_populate_pas(
++			in->umem,
++			1UL << (in->log_page_size + MLX5_ADAPTER_PAGE_SHIFT),
++			pas, 0);
++	else
++		memcpy(pas, in->pas, pas_size);
+ 
+ 	MLX5_SET(create_srq_in, create_in, opcode,
+ 		 MLX5_CMD_OP_CREATE_SRQ);
+@@ -194,6 +225,12 @@ static int create_xrc_srq_cmd(struct mlx5_ib_dev *dev,
+ 	int inlen;
+ 	int err;
+ 
++	if (in->umem) {
++		err = set_srq_page_size(in, xrc_srqc, log_page_size);
++		if (err)
++			return err;
++	}
++
+ 	pas_size  = get_pas_size(in);
+ 	inlen	  = MLX5_ST_SZ_BYTES(create_xrc_srq_in) + pas_size;
+ 	create_in = kvzalloc(inlen, GFP_KERNEL);
+@@ -207,7 +244,13 @@ static int create_xrc_srq_cmd(struct mlx5_ib_dev *dev,
+ 
+ 	set_srqc(xrc_srqc, in);
+ 	MLX5_SET(xrc_srqc, xrc_srqc, user_index, in->user_index);
+-	memcpy(pas, in->pas, pas_size);
++	if (in->umem)
++		mlx5_ib_populate_pas(
++			in->umem,
++			1UL << (in->log_page_size + MLX5_ADAPTER_PAGE_SHIFT),
++			pas, 0);
++	else
++		memcpy(pas, in->pas, pas_size);
+ 	MLX5_SET(create_xrc_srq_in, create_in, opcode,
+ 		 MLX5_CMD_OP_CREATE_XRC_SRQ);
+ 
+@@ -289,11 +332,18 @@ static int create_rmp_cmd(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
+ 	void *create_in = NULL;
+ 	void *rmpc;
+ 	void *wq;
++	void *pas;
+ 	int pas_size;
+ 	int outlen;
+ 	int inlen;
+ 	int err;
+ 
++	if (in->umem) {
++		err = set_srq_page_size(in, wq, log_wq_pg_sz);
++		if (err)
++			return err;
++	}
++
+ 	pas_size = get_pas_size(in);
+ 	inlen = MLX5_ST_SZ_BYTES(create_rmp_in) + pas_size;
+ 	outlen = MLX5_ST_SZ_BYTES(create_rmp_out);
+@@ -309,8 +359,16 @@ static int create_rmp_cmd(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
+ 
+ 	MLX5_SET(rmpc, rmpc, state, MLX5_RMPC_STATE_RDY);
+ 	MLX5_SET(create_rmp_in, create_in, uid, in->uid);
++	pas = MLX5_ADDR_OF(rmpc, rmpc, wq.pas);
++
+ 	set_wq(wq, in);
+-	memcpy(MLX5_ADDR_OF(rmpc, rmpc, wq.pas), in->pas, pas_size);
++	if (in->umem)
++		mlx5_ib_populate_pas(
++			in->umem,
++			1UL << (in->log_page_size + MLX5_ADAPTER_PAGE_SHIFT),
++			pas, 0);
++	else
++		memcpy(pas, in->pas, pas_size);
+ 
+ 	MLX5_SET(create_rmp_in, create_in, opcode, MLX5_CMD_OP_CREATE_RMP);
+ 	err = mlx5_cmd_exec(dev->mdev, create_in, inlen, create_out, outlen);
+@@ -421,10 +479,17 @@ static int create_xrq_cmd(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
+ 	void *create_in;
+ 	void *xrqc;
+ 	void *wq;
++	void *pas;
+ 	int pas_size;
+ 	int inlen;
+ 	int err;
+ 
++	if (in->umem) {
++		err = set_srq_page_size(in, wq, log_wq_pg_sz);
++		if (err)
++			return err;
++	}
++
+ 	pas_size = get_pas_size(in);
+ 	inlen = MLX5_ST_SZ_BYTES(create_xrq_in) + pas_size;
+ 	create_in = kvzalloc(inlen, GFP_KERNEL);
+@@ -433,9 +498,16 @@ static int create_xrq_cmd(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
+ 
+ 	xrqc = MLX5_ADDR_OF(create_xrq_in, create_in, xrq_context);
+ 	wq = MLX5_ADDR_OF(xrqc, xrqc, wq);
++	pas = MLX5_ADDR_OF(xrqc, xrqc, wq.pas);
+ 
+ 	set_wq(wq, in);
+-	memcpy(MLX5_ADDR_OF(xrqc, xrqc, wq.pas), in->pas, pas_size);
++	if (in->umem)
++		mlx5_ib_populate_pas(
++			in->umem,
++			1UL << (in->log_page_size + MLX5_ADAPTER_PAGE_SHIFT),
++			pas, 0);
++	else
++		memcpy(pas, in->pas, pas_size);
+ 
+ 	if (in->type == IB_SRQT_TM) {
+ 		MLX5_SET(xrqc, xrqc, topology, MLX5_XRQC_TOPOLOGY_TAG_MATCHING);
