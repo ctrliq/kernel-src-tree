@@ -1,0 +1,127 @@
+futex: Prevent requeue_pi() lock nesting issue on RT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 07d91ef510fb16a2e0ca7453222105835b7ba3b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/07d91ef5.failed
+
+The requeue_pi() operation on RT kernels creates a problem versus the
+task::pi_blocked_on state when a waiter is woken early (signal, timeout)
+and that early wake up interleaves with the requeue_pi() operation.
+
+When the requeue manages to block the waiter on the rtmutex which is
+associated to the second futex, then a concurrent early wakeup of that
+waiter faces the problem that it has to acquire the hash bucket spinlock,
+which is not an issue on non-RT kernels, but on RT kernels spinlocks are
+substituted by 'sleeping' spinlocks based on rtmutex. If the hash bucket
+lock is contended then blocking on that spinlock would result in a
+impossible situation: blocking on two locks at the same time (the hash
+bucket lock and the rtmutex representing the PI futex).
+
+It was considered to make the hash bucket locks raw_spinlocks, but
+especially requeue operations with a large amount of waiters can introduce
+significant latencies, so that's not an option for RT.
+
+The RT tree carried a solution which (ab)used task::pi_blocked_on to store
+the information about an ongoing requeue and an early wakeup which worked,
+but required to add checks for these special states all over the place.
+
+The distangling of an early wakeup of a waiter for a requeue_pi() operation
+is already looking at quite some different states and the task::pi_blocked_on
+magic just expanded that to a hard to understand 'state machine'.
+
+This can be avoided by keeping track of the waiter/requeue state in the
+futex_q object itself.
+
+Add a requeue_state field to struct futex_q with the following possible
+states:
+
+	Q_REQUEUE_PI_NONE
+	Q_REQUEUE_PI_IGNORE
+	Q_REQUEUE_PI_IN_PROGRESS
+	Q_REQUEUE_PI_WAIT
+	Q_REQUEUE_PI_DONE
+	Q_REQUEUE_PI_LOCKED
+
+The waiter starts with state = NONE and the following state transitions are
+valid:
+
+On the waiter side:
+  Q_REQUEUE_PI_NONE		-> Q_REQUEUE_PI_IGNORE
+  Q_REQUEUE_PI_IN_PROGRESS	-> Q_REQUEUE_PI_WAIT
+
+On the requeue side:
+  Q_REQUEUE_PI_NONE		-> Q_REQUEUE_PI_INPROGRESS
+  Q_REQUEUE_PI_IN_PROGRESS	-> Q_REQUEUE_PI_DONE/LOCKED
+  Q_REQUEUE_PI_IN_PROGRESS	-> Q_REQUEUE_PI_NONE (requeue failed)
+  Q_REQUEUE_PI_WAIT		-> Q_REQUEUE_PI_DONE/LOCKED
+  Q_REQUEUE_PI_WAIT		-> Q_REQUEUE_PI_IGNORE (requeue failed)
+
+The requeue side ignores a waiter with state Q_REQUEUE_PI_IGNORE as this
+signals that the waiter is already on the way out. It also means that
+the waiter is still on the 'wait' futex, i.e. uaddr1.
+
+The waiter side signals early wakeup to the requeue side either through
+setting state to Q_REQUEUE_PI_IGNORE or to Q_REQUEUE_PI_WAIT depending
+on the current state. In case of Q_REQUEUE_PI_IGNORE it can immediately
+proceed to take the hash bucket lock of uaddr1. If it set state to WAIT,
+which means the wakeup is interleaving with a requeue in progress it has
+to wait for the requeue side to change the state. Either to DONE/LOCKED
+or to IGNORE. DONE/LOCKED means the waiter q is now on the uaddr2 futex
+and either blocked (DONE) or has acquired it (LOCKED). IGNORE is set by
+the requeue side when the requeue attempt failed via deadlock detection
+and therefore the waiter's futex_q is still on the uaddr1 futex.
+
+While this is not strictly required on !RT making this unconditional has
+the benefit of common code and it also allows the waiter to avoid taking
+the hash bucket lock on the way out in certain cases, which reduces
+contention.
+
+Add the required helpers required for the state transitions, invoke them at
+the right places and restructure the futex_wait_requeue_pi() code to handle
+the return from wait (early or not) based on the state machine values.
+
+On !RT enabled kernels the waiter spin waits for the state going from
+Q_REQUEUE_PI_WAIT to some other state, on RT enabled kernels this is
+handled by rcuwait_wait_event() and the corresponding wake up on the
+requeue side.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20210815211305.693317658@linutronix.de
+(cherry picked from commit 07d91ef510fb16a2e0ca7453222105835b7ba3b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index d06bfd6fb1a1,e7b4c6121da4..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -3263,15 -3455,10 +3473,15 @@@ static int futex_wait_requeue_pi(u32 __
+  			 */
+  			ret = ret < 0 ? ret : 0;
+  		}
+++<<<<<<< HEAD
+ +	} else {
+ +		struct rt_mutex *pi_mutex;
+++=======
++ 		break;
+++>>>>>>> 07d91ef510fb (futex: Prevent requeue_pi() lock nesting issue on RT)
+  
+- 		/*
+- 		 * We have been woken up by futex_unlock_pi(), a timeout, or a
+- 		 * signal.  futex_unlock_pi() will not destroy the lock_ptr nor
+- 		 * the pi_state.
+- 		 */
+- 		WARN_ON(!q.pi_state);
++ 	case Q_REQUEUE_PI_DONE:
++ 		/* Requeue completed. Current is 'pi_blocked_on' the rtmutex */
+  		pi_mutex = &q.pi_state->pi_mutex;
+  		ret = rt_mutex_wait_proxy_lock(pi_mutex, to, &rt_waiter);
+  
+* Unmerged path kernel/futex.c
