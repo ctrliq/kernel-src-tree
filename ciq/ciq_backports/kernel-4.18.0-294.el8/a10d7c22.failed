@@ -1,0 +1,151 @@
+LSM: split ->sb_set_mnt_opts() out of ->sb_kern_mount()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit a10d7c22b34bcf744679019269bfb33ebf0b75ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a10d7c22.failed
+
+... leaving the "is it kernel-internal" logics in the caller.
+
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit a10d7c22b34bcf744679019269bfb33ebf0b75ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/hooks.c
+diff --cc security/selinux/hooks.c
+index 42145010da10,59b164d7134d..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -2828,13 -2878,6 +2827,16 @@@ static int selinux_sb_kern_mount(struc
+  {
+  	const struct cred *cred = current_cred();
+  	struct common_audit_data ad;
+++<<<<<<< HEAD
+ +	int rc = selinux_set_mnt_opts(sb, opts, 0, NULL);
+ +	if (rc)
+ +		return rc;
+ +
+ +	/* Allow all mounts performed by the kernel */
+ +	if (flags & (MS_KERNMOUNT | MS_SUBMOUNT))
+ +		return 0;
+++=======
+++>>>>>>> a10d7c22b34b (LSM: split ->sb_set_mnt_opts() out of ->sb_kern_mount())
+  
+  	ad.type = LSM_AUDIT_DATA_DENTRY;
+  	ad.u.dentry = sb->s_root;
+diff --git a/fs/super.c b/fs/super.c
+index ddb8d35441c7..5420a01f3247 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -1278,10 +1278,16 @@ mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
+ 	smp_wmb();
+ 	sb->s_flags |= SB_BORN;
+ 
+-	error = security_sb_kern_mount(sb, flags, &opts);
++	error = security_sb_set_mnt_opts(sb, &opts, 0, NULL);
+ 	if (error)
+ 		goto out_sb;
+ 
++	if (!(flags & MS_KERNMOUNT)) {
++		error = security_sb_kern_mount(sb);
++		if (error)
++			goto out_sb;
++	}
++
+ 	/*
+ 	 * filesystems should never set s_maxbytes larger than MAX_LFS_FILESIZE
+ 	 * but s_maxbytes was an unsigned long long for many releases. Throw
+diff --git a/include/linux/lsm_hooks.h b/include/linux/lsm_hooks.h
+index b8d4d4fd9a29..56f27ddc1898 100644
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@ -1474,8 +1474,7 @@ union security_list_options {
+ 	int (*sb_copy_data)(char *orig, char *copy);
+ 	int (*sb_remount)(struct super_block *sb,
+ 			  struct security_mnt_opts *opts);
+-	int (*sb_kern_mount)(struct super_block *sb, int flags,
+-			     struct security_mnt_opts *opts);
++	int (*sb_kern_mount)(struct super_block *sb);
+ 	int (*sb_show_options)(struct seq_file *m, struct super_block *sb);
+ 	int (*sb_statfs)(struct dentry *dentry);
+ 	int (*sb_mount)(const char *dev_name, const struct path *path,
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 4da4c9d220c8..a93047453f2b 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -254,8 +254,7 @@ int security_sb_alloc(struct super_block *sb);
+ void security_sb_free(struct super_block *sb);
+ int security_sb_eat_lsm_opts(char *options, struct security_mnt_opts *opts);
+ int security_sb_remount(struct super_block *sb, struct security_mnt_opts *opts);
+-int security_sb_kern_mount(struct super_block *sb, int flags,
+-			   struct security_mnt_opts *opts);
++int security_sb_kern_mount(struct super_block *sb);
+ int security_sb_show_options(struct seq_file *m, struct super_block *sb);
+ int security_sb_statfs(struct dentry *dentry);
+ int security_sb_mount(const char *dev_name, const struct path *path,
+@@ -571,8 +570,7 @@ static inline int security_sb_remount(struct super_block *sb,
+ 	return 0;
+ }
+ 
+-static inline int security_sb_kern_mount(struct super_block *sb, int flags,
+-					 struct security_mnt_opts *opts)
++static inline int security_sb_kern_mount(struct super_block *sb)
+ {
+ 	return 0;
+ }
+diff --git a/security/security.c b/security/security.c
+index 7eaa4e984e36..66cb335af402 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -388,10 +388,9 @@ int security_sb_remount(struct super_block *sb,
+ 	return call_int_hook(sb_remount, 0, sb, opts);
+ }
+ 
+-int security_sb_kern_mount(struct super_block *sb, int flags,
+-			   struct security_mnt_opts *opts)
++int security_sb_kern_mount(struct super_block *sb)
+ {
+-	return call_int_hook(sb_kern_mount, 0, sb, flags, opts);
++	return call_int_hook(sb_kern_mount, 0, sb);
+ }
+ 
+ int security_sb_show_options(struct seq_file *m, struct super_block *sb)
+* Unmerged path security/selinux/hooks.c
+diff --git a/security/smack/smack_lsm.c b/security/smack/smack_lsm.c
+index 77b0bfb018e5..12fbb99b88d3 100644
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@ -847,20 +847,6 @@ static int smack_set_mnt_opts(struct super_block *sb,
+ 	return 0;
+ }
+ 
+-/**
+- * smack_sb_kern_mount - Smack specific mount processing
+- * @sb: the file system superblock
+- * @flags: the mount flags
+- * @data: the smack mount options
+- *
+- * Returns 0 on success, an error code on failure
+- */
+-static int smack_sb_kern_mount(struct super_block *sb, int flags,
+-			       struct security_mnt_opts *opts)
+-{
+-	return smack_set_mnt_opts(sb, opts, 0, NULL);
+-}
+-
+ /**
+  * smack_sb_statfs - Smack check on statfs
+  * @dentry: identifies the file system in question
+@@ -4632,7 +4618,6 @@ static struct security_hook_list smack_hooks[] __lsm_ro_after_init = {
+ 	LSM_HOOK_INIT(sb_alloc_security, smack_sb_alloc_security),
+ 	LSM_HOOK_INIT(sb_free_security, smack_sb_free_security),
+ 	LSM_HOOK_INIT(sb_copy_data, smack_sb_copy_data),
+-	LSM_HOOK_INIT(sb_kern_mount, smack_sb_kern_mount),
+ 	LSM_HOOK_INIT(sb_statfs, smack_sb_statfs),
+ 	LSM_HOOK_INIT(sb_set_mnt_opts, smack_set_mnt_opts),
+ 	LSM_HOOK_INIT(sb_parse_opts_str, smack_parse_opts_str),
