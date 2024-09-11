@@ -1,0 +1,151 @@
+RDMA/counter: Add "auto" configuration mode support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Mark Zhang <markz@mellanox.com>
+commit 99fa331dc8629be55ac7a0cca0dc56492070ddac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/99fa331d.failed
+
+In auto mode all QPs belong to one category are bind automatically to a
+single counter set. Currently only "qp type" is supported.
+
+In this mode the qp counter is set in RST2INIT modification, and when a qp
+is destroyed the counter is unbound.
+
+	Signed-off-by: Mark Zhang <markz@mellanox.com>
+	Reviewed-by: Majd Dibbiny <majd@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 99fa331dc8629be55ac7a0cca0dc56492070ddac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/counters.c
+#	include/rdma/ib_verbs.h
+#	include/rdma/rdma_counter.h
+diff --cc include/rdma/ib_verbs.h
+index 9a1c4c9437dd,0205472eb73a..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2424,8 -2459,70 +2427,61 @@@ struct ib_device_ops 
+  	 */
+  	int (*init_port)(struct ib_device *device, u8 port_num,
+  			 struct kobject *port_sysfs);
+++<<<<<<< HEAD
+++=======
++ 	/**
++ 	 * Allows rdma drivers to add their own restrack attributes.
++ 	 */
++ 	int (*fill_res_entry)(struct sk_buff *msg,
++ 			      struct rdma_restrack_entry *entry);
++ 
++ 	/* Device lifecycle callbacks */
++ 	/*
++ 	 * Called after the device becomes registered, before clients are
++ 	 * attached
++ 	 */
++ 	int (*enable_driver)(struct ib_device *dev);
++ 	/*
++ 	 * This is called as part of ib_dealloc_device().
++ 	 */
++ 	void (*dealloc_driver)(struct ib_device *dev);
++ 
++ 	/* iWarp CM callbacks */
++ 	void (*iw_add_ref)(struct ib_qp *qp);
++ 	void (*iw_rem_ref)(struct ib_qp *qp);
++ 	struct ib_qp *(*iw_get_qp)(struct ib_device *device, int qpn);
++ 	int (*iw_connect)(struct iw_cm_id *cm_id,
++ 			  struct iw_cm_conn_param *conn_param);
++ 	int (*iw_accept)(struct iw_cm_id *cm_id,
++ 			 struct iw_cm_conn_param *conn_param);
++ 	int (*iw_reject)(struct iw_cm_id *cm_id, const void *pdata,
++ 			 u8 pdata_len);
++ 	int (*iw_create_listen)(struct iw_cm_id *cm_id, int backlog);
++ 	int (*iw_destroy_listen)(struct iw_cm_id *cm_id);
++ 	/**
++ 	 * counter_bind_qp - Bind a QP to a counter.
++ 	 * @counter - The counter to be bound. If counter->id is zero then
++ 	 *   the driver needs to allocate a new counter and set counter->id
++ 	 */
++ 	int (*counter_bind_qp)(struct rdma_counter *counter, struct ib_qp *qp);
++ 	/**
++ 	 * counter_unbind_qp - Unbind the qp from the dynamically-allocated
++ 	 *   counter and bind it onto the default one
++ 	 */
++ 	int (*counter_unbind_qp)(struct ib_qp *qp);
++ 	/**
++ 	 * counter_dealloc -De-allocate the hw counter
++ 	 */
++ 	int (*counter_dealloc)(struct rdma_counter *counter);
++ 
++ 	DECLARE_RDMA_OBJ_SIZE(ib_ah);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_cq);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_pd);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_srq);
++ 	DECLARE_RDMA_OBJ_SIZE(ib_ucontext);
+++>>>>>>> 99fa331dc862 (RDMA/counter: Add "auto" configuration mode support)
+  };
+  
+ -struct ib_core_device {
+ -	/* device must be the first element in structure until,
+ -	 * union of ib_core_device and device exists in ib_device.
+ -	 */
+ -	struct device dev;
+ -	possible_net_t rdma_net;
+ -	struct kobject *ports_kobj;
+ -	struct list_head port_list;
+ -	struct ib_device *owner; /* reach back to owner ib_device */
+ -};
+ -
+ -struct rdma_restrack_root;
+  struct ib_device {
+  	/* Do not access @dma_device directly from ULP nor from HW drivers. */
+  	struct device                *dma_device;
+* Unmerged path drivers/infiniband/core/counters.c
+* Unmerged path include/rdma/rdma_counter.h
+* Unmerged path drivers/infiniband/core/counters.c
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index ec96a7b1c811..d8e2daba0c1b 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -1282,6 +1282,9 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
+ 	SET_DEVICE_OP(dev_ops, alloc_xrcd);
+ 	SET_DEVICE_OP(dev_ops, attach_mcast);
+ 	SET_DEVICE_OP(dev_ops, check_mr_status);
++	SET_DEVICE_OP(dev_ops, counter_bind_qp);
++	SET_DEVICE_OP(dev_ops, counter_dealloc);
++	SET_DEVICE_OP(dev_ops, counter_unbind_qp);
+ 	SET_DEVICE_OP(dev_ops, create_ah);
+ 	SET_DEVICE_OP(dev_ops, create_counters);
+ 	SET_DEVICE_OP(dev_ops, create_cq);
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 202806e39171..0e6d289a5077 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -1676,6 +1676,14 @@ static int _ib_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
+ 		}
+ 	}
+ 
++	/*
++	 * Bind this qp to a counter automatically based on the rdma counter
++	 * rules. This only set in RST2INIT with port specified
++	 */
++	if (!qp->counter && (attr_mask & IB_QP_PORT) &&
++	    ((attr_mask & IB_QP_STATE) && attr->qp_state == IB_QPS_INIT))
++		rdma_counter_bind_qp_auto(qp, attr->port_num);
++
+ 	ret = ib_security_modify_qp(qp, attr, attr_mask, udata);
+ 	if (ret)
+ 		goto out;
+@@ -1874,6 +1882,7 @@ int ib_destroy_qp(struct ib_qp *qp)
+ 	if (!qp->uobject)
+ 		rdma_rw_cleanup_mrs(qp);
+ 
++	rdma_counter_unbind_qp(qp, true);
+ 	rdma_restrack_del(&qp->res);
+ 	ret = qp->device->ops.destroy_qp(qp);
+ 	if (!ret) {
+* Unmerged path include/rdma/ib_verbs.h
+* Unmerged path include/rdma/rdma_counter.h
