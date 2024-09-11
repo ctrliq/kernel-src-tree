@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
 # Makefile for vm selftests
 
+# Without this, failed build products remain, with up-to-date timestamps,
+# thus tricking Make (and you!) into believing that All Is Well, in subsequent
+# make invocations:
+.DELETE_ON_ERROR:
+
 CFLAGS = -Wall -I ../../../../usr/include $(EXTRA_CFLAGS)
 LDLIBS = -lrt
 TEST_GEN_FILES = compaction_test
