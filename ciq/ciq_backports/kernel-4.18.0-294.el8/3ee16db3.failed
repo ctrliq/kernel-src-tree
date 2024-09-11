@@ -1,0 +1,150 @@
+dm: fix IO splitting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 3ee16db390b42b8a21f2ad2ea2518f3469c6e532
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3ee16db3.failed
+
+Commit 882ec4e609c1 ("dm table: stack 'chunk_sectors' limit to account
+for target-specific splitting") caused a couple regressions:
+1) Using lcm_not_zero() when stacking chunk_sectors was a bug because
+   chunk_sectors must reflect the most limited of all devices in the
+   IO stack.
+2) DM targets that set max_io_len but that do _not_ provide an
+   .iterate_devices method no longer had there IO split properly.
+
+And commit 5091cdec56fa ("dm: change max_io_len() to use
+blk_max_size_offset()") also caused a regression where DM no longer
+supported varied (per target) IO splitting. The implication being the
+potential for severely reduced performance for IO stacks that use a DM
+target like dm-cache to hide performance limitations of a slower
+device (e.g. one that requires 4K IO splitting).
+
+Coming full circle: Fix all these issues by discontinuing stacking
+chunk_sectors up using ti->max_io_len in dm_calculate_queue_limits(),
+add optional chunk_sectors override argument to blk_max_size_offset()
+and update DM's max_io_len() to pass ti->max_io_len to its
+blk_max_size_offset() call.
+
+Passing in an optional chunk_sectors override to blk_max_size_offset()
+allows for code reuse of block's centralized calculation for max IO
+size based on provided offset and split boundary.
+
+Fixes: 882ec4e609c1 ("dm table: stack 'chunk_sectors' limit to account for target-specific splitting")
+Fixes: 5091cdec56fa ("dm: change max_io_len() to use blk_max_size_offset()")
+	Cc: stable@vger.kernel.org
+	Reported-by: John Dorminy <jdorminy@redhat.com>
+	Reported-by: Bruce Johnston <bjohnsto@redhat.com>
+	Reported-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+	Reviewed-by: John Dorminy <jdorminy@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Reviewed-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 3ee16db390b42b8a21f2ad2ea2518f3469c6e532)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index a5481d5bf4d3,f7eb3d2964f3..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1042,15 -1039,18 +1042,25 @@@ static sector_t max_io_len(sector_t sec
+  	sector_t max_len;
+  
+  	/*
+- 	 * Does the target need to split even further?
+- 	 * - q->limits.chunk_sectors reflects ti->max_io_len so
+- 	 *   blk_max_size_offset() provides required splitting.
+- 	 * - blk_max_size_offset() also respects q->limits.max_sectors
++ 	 * Does the target need to split IO even further?
++ 	 * - varied (per target) IO splitting is a tenet of DM; this
++ 	 *   explains why stacked chunk_sectors based splitting via
++ 	 *   blk_max_size_offset() isn't possible here. So pass in
++ 	 *   ti->max_io_len to override stacked chunk_sectors.
+  	 */
+++<<<<<<< HEAD
+ +	max_len = blk_max_size_offset(dm_table_get_md(ti->table)->queue,
+ +				      dm_target_offset(ti, sector));
+ +	if (len > max_len)
+ +		len = max_len;
+++=======
++ 	if (ti->max_io_len) {
++ 		max_len = blk_max_size_offset(ti->table->md->queue,
++ 					      target_offset, ti->max_io_len);
++ 		if (len > max_len)
++ 			len = max_len;
++ 	}
+++>>>>>>> 3ee16db390b4 (dm: fix IO splitting)
+  
+  	return len;
+  }
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index a7566b99b9a3..c09a3623eb24 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -160,7 +160,7 @@ static struct bio *blk_bio_write_same_split(struct request_queue *q,
+ static inline unsigned get_max_io_size(struct request_queue *q,
+ 				       struct bio *bio)
+ {
+-	unsigned sectors = blk_max_size_offset(q, bio->bi_iter.bi_sector);
++	unsigned sectors = blk_max_size_offset(q, bio->bi_iter.bi_sector, 0);
+ 	unsigned max_sectors = sectors;
+ 	unsigned pbs = queue_physical_block_size(q) >> SECTOR_SHIFT;
+ 	unsigned lbs = queue_logical_block_size(q) >> SECTOR_SHIFT;
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index e9e7c95707c4..f8c5681da058 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -18,7 +18,6 @@
+ #include <linux/mutex.h>
+ #include <linux/delay.h>
+ #include <linux/atomic.h>
+-#include <linux/lcm.h>
+ #include <linux/blk-mq.h>
+ #include <linux/mount.h>
+ #include <linux/dax.h>
+@@ -1500,10 +1499,6 @@ int dm_calculate_queue_limits(struct dm_table *table,
+ 			zone_sectors = ti_limits.chunk_sectors;
+ 		}
+ 
+-		/* Stack chunk_sectors if target-specific splitting is required */
+-		if (ti->max_io_len)
+-			ti_limits.chunk_sectors = lcm_not_zero(ti->max_io_len,
+-							       ti_limits.chunk_sectors);
+ 		/* Set I/O hints portion of queue limits */
+ 		if (ti->type->io_hints)
+ 			ti->type->io_hints(ti, &ti_limits);
+* Unmerged path drivers/md/dm.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 43b1486e0588..43d1ca8dec70 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1043,11 +1043,12 @@ static inline unsigned int blk_queue_get_max_sectors(struct request_queue *q,
+  * file system requests.
+  */
+ static inline unsigned int blk_max_size_offset(struct request_queue *q,
+-					       sector_t offset)
++					       sector_t offset,
++					       unsigned int chunk_sectors)
+ {
+-	unsigned int chunk_sectors = q->limits.chunk_sectors;
+-
+-	if (!chunk_sectors)
++	if (!chunk_sectors && q->limits.chunk_sectors)
++		chunk_sectors = q->limits.chunk_sectors;
++	else
+ 		return q->limits.max_sectors;
+ 
+ 	if (likely(is_power_of_2(chunk_sectors)))
+@@ -1071,7 +1072,7 @@ static inline unsigned int blk_rq_get_max_sectors(struct request *rq,
+ 	    req_op(rq) == REQ_OP_SECURE_ERASE)
+ 		return blk_queue_get_max_sectors(q, req_op(rq));
+ 
+-	return min(blk_max_size_offset(q, offset),
++	return min(blk_max_size_offset(q, offset, 0),
+ 			blk_queue_get_max_sectors(q, req_op(rq)));
+ }
+ 
