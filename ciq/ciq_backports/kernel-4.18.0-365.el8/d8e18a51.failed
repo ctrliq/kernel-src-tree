@@ -1,0 +1,233 @@
+net: Use skb accessors in network core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit d8e18a516f8f67404c0d21af8c93d0474fba0876
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/d8e18a51.failed
+
+In preparation for unifying the skb_frag and bio_vec, use the fine
+accessors which already exist and use skb_frag_t instead of
+struct skb_frag_struct.
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d8e18a516f8f67404c0d21af8c93d0474fba0876)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp.c
+diff --cc net/ipv4/tcp.c
+index 7c7ba9b053a0,f62f0e7e3cdd..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -1838,8 -1782,19 +1838,22 @@@ static int tcp_zerocopy_receive(struct 
+  				frags++;
+  			}
+  		}
+++<<<<<<< HEAD
+ +		if (frags->size != PAGE_SIZE || frags->page_offset)
+++=======
++ 		if (skb_frag_size(frags) != PAGE_SIZE || frags->page_offset) {
++ 			int remaining = zc->recv_skip_hint;
++ 			int size = skb_frag_size(frags);
++ 
++ 			while (remaining && (size != PAGE_SIZE ||
++ 					     frags->page_offset)) {
++ 				remaining -= size;
++ 				frags++;
++ 				size = skb_frag_size(frags);
++ 			}
++ 			zc->recv_skip_hint -= remaining;
+++>>>>>>> d8e18a516f8f (net: Use skb accessors in network core)
+  			break;
+ -		}
+  		ret = vm_insert_page(vma, address + length,
+  				     skb_frag_page(frags));
+  		if (ret)
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 09562e12d7e8..3855c359c9d6 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -3328,7 +3328,7 @@ static inline bool skb_can_coalesce(struct sk_buff *skb, int i,
+ 	if (skb_zcopy(skb))
+ 		return false;
+ 	if (i) {
+-		const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[i - 1];
++		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i - 1];
+ 
+ 		return page == skb_frag_page(frag) &&
+ 		       off == skb_frag_off(frag) + skb_frag_size(frag);
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 514903a1c6df..0142008df176 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -2403,19 +2403,19 @@ int skb_send_sock_locked(struct sock *sk, struct sk_buff *skb, int offset,
+ 	for (fragidx = 0; fragidx < skb_shinfo(skb)->nr_frags; fragidx++) {
+ 		skb_frag_t *frag  = &skb_shinfo(skb)->frags[fragidx];
+ 
+-		if (offset < frag->size)
++		if (offset < skb_frag_size(frag))
+ 			break;
+ 
+-		offset -= frag->size;
++		offset -= skb_frag_size(frag);
+ 	}
+ 
+ 	for (; len && fragidx < skb_shinfo(skb)->nr_frags; fragidx++) {
+ 		skb_frag_t *frag  = &skb_shinfo(skb)->frags[fragidx];
+ 
+-		slen = min_t(size_t, len, frag->size - offset);
++		slen = min_t(size_t, len, skb_frag_size(frag) - offset);
+ 
+ 		while (slen) {
+-			ret = kernel_sendpage_locked(sk, frag->page.p,
++			ret = kernel_sendpage_locked(sk, skb_frag_page(frag),
+ 						     frag->page_offset + offset,
+ 						     slen, MSG_DONTWAIT);
+ 			if (ret <= 0)
+@@ -2847,11 +2847,15 @@ skb_zerocopy(struct sk_buff *to, struct sk_buff *from, int len, int hlen)
+ 	skb_zerocopy_clone(to, from, GFP_ATOMIC);
+ 
+ 	for (i = 0; i < skb_shinfo(from)->nr_frags; i++) {
++		int size;
++
+ 		if (!len)
+ 			break;
+ 		skb_shinfo(to)->frags[j] = skb_shinfo(from)->frags[i];
+-		skb_shinfo(to)->frags[j].size = min_t(int, skb_shinfo(to)->frags[j].size, len);
+-		len -= skb_shinfo(to)->frags[j].size;
++		size = min_t(int, skb_frag_size(&skb_shinfo(to)->frags[j]),
++					len);
++		skb_frag_size_set(&skb_shinfo(to)->frags[j], size);
++		len -= size;
+ 		skb_frag_ref(to, j);
+ 		j++;
+ 	}
+@@ -3187,7 +3191,7 @@ static int skb_prepare_for_shift(struct sk_buff *skb)
+ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen)
+ {
+ 	int from, to, merge, todo;
+-	struct skb_frag_struct *fragfrom, *fragto;
++	skb_frag_t *fragfrom, *fragto;
+ 
+ 	BUG_ON(shiftlen > skb->len);
+ 
+@@ -3597,10 +3601,10 @@ static inline skb_frag_t skb_head_frag_to_page_desc(struct sk_buff *frag_skb)
+ 	struct page *page;
+ 
+ 	page = virt_to_head_page(frag_skb->head);
+-	head_frag.page.p = page;
++	__skb_frag_set_page(&head_frag, page);
+ 	head_frag.page_offset = frag_skb->data -
+ 		(unsigned char *)page_address(page);
+-	head_frag.size = skb_headlen(frag_skb);
++	skb_frag_size_set(&head_frag, skb_headlen(frag_skb));
+ 	return head_frag;
+ }
+ 
+@@ -4126,7 +4130,7 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
+ 
+ 		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
+ 
+-		frag->page.p	  = page;
++		__skb_frag_set_page(frag, page);
+ 		frag->page_offset = first_offset;
+ 		skb_frag_size_set(frag, first_size);
+ 
+diff --git a/net/core/tso.c b/net/core/tso.c
+index 43f4eba61933..d4d5c077ad72 100644
+--- a/net/core/tso.c
++++ b/net/core/tso.c
+@@ -55,8 +55,8 @@ void tso_build_data(struct sk_buff *skb, struct tso_t *tso, int size)
+ 		skb_frag_t *frag = &skb_shinfo(skb)->frags[tso->next_frag_idx];
+ 
+ 		/* Move to next segment */
+-		tso->size = frag->size;
+-		tso->data = page_address(frag->page.p) + frag->page_offset;
++		tso->size = skb_frag_size(frag);
++		tso->data = skb_frag_address(frag);
+ 		tso->next_frag_idx++;
+ 	}
+ }
+@@ -79,8 +79,8 @@ void tso_start(struct sk_buff *skb, struct tso_t *tso)
+ 		skb_frag_t *frag = &skb_shinfo(skb)->frags[tso->next_frag_idx];
+ 
+ 		/* Move to next segment */
+-		tso->size = frag->size;
+-		tso->data = page_address(frag->page.p) + frag->page_offset;
++		tso->size = skb_frag_size(frag);
++		tso->data = skb_frag_address(frag);
+ 		tso->next_frag_idx++;
+ 	}
+ }
+* Unmerged path net/ipv4/tcp.c
+diff --git a/net/kcm/kcmsock.c b/net/kcm/kcmsock.c
+index a0c03774c284..17bf5146f6e8 100644
+--- a/net/kcm/kcmsock.c
++++ b/net/kcm/kcmsock.c
+@@ -640,15 +640,15 @@ static int kcm_write_msgs(struct kcm_sock *kcm)
+ 			frag_offset = 0;
+ do_frag:
+ 			frag = &skb_shinfo(skb)->frags[fragidx];
+-			if (WARN_ON(!frag->size)) {
++			if (WARN_ON(!skb_frag_size(frag))) {
+ 				ret = -EINVAL;
+ 				goto out;
+ 			}
+ 
+ 			ret = kernel_sendpage(psock->sk->sk_socket,
+-					      frag->page.p,
++					      skb_frag_page(frag),
+ 					      frag->page_offset + frag_offset,
+-					      frag->size - frag_offset,
++					      skb_frag_size(frag) - frag_offset,
+ 					      MSG_DONTWAIT);
+ 			if (ret <= 0) {
+ 				if (ret == -EAGAIN) {
+@@ -683,7 +683,7 @@ static int kcm_write_msgs(struct kcm_sock *kcm)
+ 			sent += ret;
+ 			frag_offset += ret;
+ 			KCM_STATS_ADD(psock->stats.tx_bytes, ret);
+-			if (frag_offset < frag->size) {
++			if (frag_offset < skb_frag_size(frag)) {
+ 				/* Not finished with this frag */
+ 				goto do_frag;
+ 			}
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index 9c1df860fa42..983af27a81b4 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -250,14 +250,14 @@ static void tls_append_frag(struct tls_record_info *record,
+ 	skb_frag_t *frag;
+ 
+ 	frag = &record->frags[record->num_frags - 1];
+-	if (frag->page.p == pfrag->page &&
+-	    frag->page_offset + frag->size == pfrag->offset) {
+-		frag->size += size;
++	if (skb_frag_page(frag) == pfrag->page &&
++	    frag->page_offset + skb_frag_size(frag) == pfrag->offset) {
++		skb_frag_size_add(frag, size);
+ 	} else {
+ 		++frag;
+-		frag->page.p = pfrag->page;
++		__skb_frag_set_page(frag, pfrag->page);
+ 		frag->page_offset = pfrag->offset;
+-		frag->size = size;
++		skb_frag_size_set(frag, size);
+ 		++record->num_frags;
+ 		get_page(pfrag->page);
+ 	}
+@@ -290,8 +290,8 @@ static int tls_push_record(struct sock *sk,
+ 		frag = &record->frags[i];
+ 		sg_unmark_end(&offload_ctx->sg_tx_data[i]);
+ 		sg_set_page(&offload_ctx->sg_tx_data[i], skb_frag_page(frag),
+-			    frag->size, frag->page_offset);
+-		sk_mem_charge(sk, frag->size);
++			    skb_frag_size(frag), frag->page_offset);
++		sk_mem_charge(sk, skb_frag_size(frag));
+ 		get_page(skb_frag_page(frag));
+ 	}
+ 	sg_mark_end(&offload_ctx->sg_tx_data[record->num_frags - 1]);
