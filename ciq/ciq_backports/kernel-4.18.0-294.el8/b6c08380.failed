@@ -1,0 +1,230 @@
+mptcp: remove addr and subflow in PM netlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Geliang Tang <geliangtang@gmail.com>
+commit b6c08380860b926752d57c8fa9911fa388c4b876
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b6c08380.failed
+
+This patch implements the remove announced addr and subflow logic in PM
+netlink.
+
+When the PM netlink removes an address, we traverse all the existing msk
+sockets to find the relevant sockets.
+
+We add a new list named anno_list in mptcp_pm_data, to record all the
+announced addrs. In the traversing, we check if it has been recorded.
+If it has been, we trigger the RM_ADDR signal.
+
+We also check if this address is in conn_list. If it is, we remove the
+subflow which using this local address.
+
+Since we call mptcp_pm_free_anno_list in mptcp_destroy, we need to move
+__mptcp_init_sock before the mptcp_is_enabled check in mptcp_init_sock.
+
+	Suggested-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Suggested-by: Paolo Abeni <pabeni@redhat.com>
+	Suggested-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b6c08380860b926752d57c8fa9911fa388c4b876)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/pm.c
+#	net/mptcp/pm_netlink.c
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/pm.c
+index a78fc80f9b51,f450bf0d49aa..000000000000
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@@ -225,7 -234,8 +229,11 @@@ void mptcp_pm_data_init(struct mptcp_so
+  	msk->pm.status = 0;
+  
+  	spin_lock_init(&msk->pm.lock);
+++<<<<<<< HEAD
+ +	INIT_WORK(&msk->pm.work, pm_worker);
+++=======
++ 	INIT_LIST_HEAD(&msk->pm.anno_list);
+++>>>>>>> b6c08380860b (mptcp: remove addr and subflow in PM netlink)
+  
+  	mptcp_pm_nl_data_init(msk);
+  }
+diff --cc net/mptcp/pm_netlink.c
+index 6f3bf9fdbbbc,97f9280f83fb..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -179,11 -177,55 +179,55 @@@ static void check_work_pending(struct m
+  		WRITE_ONCE(msk->pm.work_pending, false);
+  }
+  
++ static bool lookup_anno_list_by_saddr(struct mptcp_sock *msk,
++ 				      struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_addr_entry *entry;
++ 
++ 	list_for_each_entry(entry, &msk->pm.anno_list, list) {
++ 		if (addresses_equal(&entry->addr, addr, false))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool mptcp_pm_alloc_anno_list(struct mptcp_sock *msk,
++ 				     struct mptcp_pm_addr_entry *entry)
++ {
++ 	struct mptcp_pm_addr_entry *clone = NULL;
++ 
++ 	if (lookup_anno_list_by_saddr(msk, &entry->addr))
++ 		return false;
++ 
++ 	clone = kmemdup(entry, sizeof(*entry), GFP_ATOMIC);
++ 	if (!clone)
++ 		return false;
++ 
++ 	list_add(&clone->list, &msk->pm.anno_list);
++ 
++ 	return true;
++ }
++ 
++ void mptcp_pm_free_anno_list(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_pm_addr_entry *entry, *tmp;
++ 
++ 	pr_debug("msk=%p", msk);
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 	list_for_each_entry_safe(entry, tmp, &msk->pm.anno_list, list) {
++ 		list_del(&entry->list);
++ 		kfree(entry);
++ 	}
++ 	spin_unlock_bh(&msk->pm.lock);
++ }
++ 
+  static void mptcp_pm_create_subflow_or_signal_addr(struct mptcp_sock *msk)
+  {
+ -	struct mptcp_addr_info remote = { 0 };
+  	struct sock *sk = (struct sock *)msk;
+  	struct mptcp_pm_addr_entry *local;
+ +	struct mptcp_addr_info remote;
+  	struct pm_nl_pernet *pernet;
+  
+  	pernet = net_generic(sock_net((struct sock *)msk), pm_nl_pernet_id);
+@@@ -199,8 -241,10 +243,15 @@@
+  					      msk->pm.add_addr_signaled);
+  
+  		if (local) {
+++<<<<<<< HEAD
+ +			msk->pm.add_addr_signaled++;
+ +			mptcp_pm_announce_addr(msk, &local->addr);
+++=======
++ 			if (mptcp_pm_alloc_anno_list(msk, local)) {
++ 				msk->pm.add_addr_signaled++;
++ 				mptcp_pm_announce_addr(msk, &local->addr, false);
++ 			}
+++>>>>>>> b6c08380860b (mptcp: remove addr and subflow in PM netlink)
+  		} else {
+  			/* pick failed, avoid fourther attempts later */
+  			msk->pm.local_addr_used = msk->pm.add_addr_signal_max;
+@@@ -545,12 -690,12 +658,12 @@@ static int mptcp_nl_cmd_del_addr(struc
+  	entry = __lookup_addr_by_id(pernet, addr.addr.id);
+  	if (!entry) {
+  		GENL_SET_ERR_MSG(info, "address not found");
+- 		ret = -EINVAL;
+- 		goto out;
++ 		spin_unlock_bh(&pernet->lock);
++ 		return -EINVAL;
+  	}
+ -	if (entry->addr.flags & MPTCP_PM_ADDR_FLAG_SIGNAL)
+ +	if (entry->flags & MPTCP_PM_ADDR_FLAG_SIGNAL)
+  		pernet->add_addr_signal_max--;
+ -	if (entry->addr.flags & MPTCP_PM_ADDR_FLAG_SUBFLOW)
+ +	if (entry->flags & MPTCP_PM_ADDR_FLAG_SUBFLOW)
+  		pernet->local_addr_max--;
+  
+  	pernet->addrs--;
+diff --cc net/mptcp/protocol.c
+index 691a71ca323f,b53e55826975..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1517,20 -1809,18 +1517,28 @@@ static int mptcp_init_sock(struct sock 
+  {
+  	struct net *net = sock_net(sk);
+  	int ret;
+ +	static bool warned;
+  
++ 	ret = __mptcp_init_sock(sk);
++ 	if (ret)
++ 		return ret;
++ 
+  	if (!mptcp_is_enabled(net))
+  		return -ENOPROTOOPT;
+  
+ -	if (unlikely(!net->mib.mptcp_statistics) && !mptcp_mib_alloc(net))
+ +	if (!warned) {
+ +		warned = true;
+ +		mark_tech_preview("Multipath TCP", NULL);
+ +	}
+ +
+ +	if (unlikely(!net->mptcp_mib.mptcp_statistics) && !mptcp_mib_alloc(net))
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	ret = __mptcp_init_sock(sk);
+++=======
++ 	ret = __mptcp_socket_create(mptcp_sk(sk));
+++>>>>>>> b6c08380860b (mptcp: remove addr and subflow in PM netlink)
+  	if (ret)
+  		return ret;
+  
+diff --cc net/mptcp/protocol.h
+index 68e02bf1a169,d1b1416797f8..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -418,9 -441,12 +419,14 @@@ void mptcp_pm_subflow_established(struc
+  void mptcp_pm_subflow_closed(struct mptcp_sock *msk, u8 id);
+  void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+  				const struct mptcp_addr_info *addr);
+++<<<<<<< HEAD
+++=======
++ void mptcp_pm_rm_addr_received(struct mptcp_sock *msk, u8 rm_id);
++ void mptcp_pm_free_anno_list(struct mptcp_sock *msk);
+++>>>>>>> b6c08380860b (mptcp: remove addr and subflow in PM netlink)
+  
+  int mptcp_pm_announce_addr(struct mptcp_sock *msk,
+ -			   const struct mptcp_addr_info *addr,
+ -			   bool echo);
+ +			   const struct mptcp_addr_info *addr);
+  int mptcp_pm_remove_addr(struct mptcp_sock *msk, u8 local_id);
+  int mptcp_pm_remove_subflow(struct mptcp_sock *msk, u8 remote_id);
+  
+diff --cc net/mptcp/subflow.c
+index 5f455274089b,a1fefc965e17..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -400,7 -435,9 +400,13 @@@ static void mptcp_sock_destruct(struct 
+  		sock_orphan(sk);
+  	}
+  
+++<<<<<<< HEAD
+ +	mptcp_token_destroy(mptcp_sk(sk)->token);
+++=======
++ 	skb_rbtree_purge(&mptcp_sk(sk)->out_of_order_queue);
++ 	mptcp_token_destroy(mptcp_sk(sk));
++ 	mptcp_pm_free_anno_list(mptcp_sk(sk));
+++>>>>>>> b6c08380860b (mptcp: remove addr and subflow in PM netlink)
+  	inet_sock_destruct(sk);
+  }
+  
+* Unmerged path net/mptcp/pm.c
+* Unmerged path net/mptcp/pm_netlink.c
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
+* Unmerged path net/mptcp/subflow.c
