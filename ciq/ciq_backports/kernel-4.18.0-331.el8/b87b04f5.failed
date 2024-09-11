@@ -1,0 +1,160 @@
+ipv4: Fix device used for dst_alloc with local routes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author David Ahern <dsahern@kernel.org>
+commit b87b04f5019e821c8c6c7761f258402e43500a1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/b87b04f5.failed
+
+Oliver reported a use case where deleting a VRF device can hang
+waiting for the refcnt to drop to 0. The root cause is that the dst
+is allocated against the VRF device but cached on the loopback
+device.
+
+The use case (added to the selftests) has an implicit VRF crossing
+due to the ordering of the FIB rules (lookup local is before the
+l3mdev rule, but the problem occurs even if the FIB rules are
+re-ordered with local after l3mdev because the VRF table does not
+have a default route to terminate the lookup). The end result is
+is that the FIB lookup returns the loopback device as the nexthop,
+but the ingress device is in a VRF. The mismatch causes the dst
+alloc against the VRF device but then cached on the loopback.
+
+The fix is to bring the trick used for IPv6 (see ip6_rt_get_dev_rcu):
+pick the dst alloc device based the fib lookup result but with checks
+that the result has a nexthop device (e.g., not an unreachable or
+prohibit entry).
+
+Fixes: f5a0aab84b74 ("net: ipv4: dst for local input routes should use l3mdev if relevant")
+	Reported-by: Oliver Herms <oliver.peter.herms@gmail.com>
+	Signed-off-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b87b04f5019e821c8c6c7761f258402e43500a1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/route.c
+diff --cc net/ipv4/route.c
+index 9d511f6cabe2,6a36ac98476f..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -1938,6 -2016,59 +1938,62 @@@ static int ip_mkroute_input(struct sk_b
+  	return __mkroute_input(skb, res, in_dev, daddr, saddr, tos);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Implements all the saddr-related checks as ip_route_input_slow(),
++  * assuming daddr is valid and the destination is not a local broadcast one.
++  * Uses the provided hint instead of performing a route lookup.
++  */
++ int ip_route_use_hint(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++ 		      u8 tos, struct net_device *dev,
++ 		      const struct sk_buff *hint)
++ {
++ 	struct in_device *in_dev = __in_dev_get_rcu(dev);
++ 	struct rtable *rt = skb_rtable(hint);
++ 	struct net *net = dev_net(dev);
++ 	int err = -EINVAL;
++ 	u32 tag = 0;
++ 
++ 	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr))
++ 		goto martian_source;
++ 
++ 	if (ipv4_is_zeronet(saddr))
++ 		goto martian_source;
++ 
++ 	if (ipv4_is_loopback(saddr) && !IN_DEV_NET_ROUTE_LOCALNET(in_dev, net))
++ 		goto martian_source;
++ 
++ 	if (rt->rt_type != RTN_LOCAL)
++ 		goto skip_validate_source;
++ 
++ 	tos &= IPTOS_RT_MASK;
++ 	err = fib_validate_source(skb, saddr, daddr, tos, 0, dev, in_dev, &tag);
++ 	if (err < 0)
++ 		goto martian_source;
++ 
++ skip_validate_source:
++ 	skb_dst_copy(skb, hint);
++ 	return 0;
++ 
++ martian_source:
++ 	ip_handle_martian_source(dev, in_dev, skb, daddr, saddr);
++ 	return err;
++ }
++ 
++ /* get device for dst_alloc with local routes */
++ static struct net_device *ip_rt_get_dev(struct net *net,
++ 					const struct fib_result *res)
++ {
++ 	struct fib_nh_common *nhc = res->fi ? res->nhc : NULL;
++ 	struct net_device *dev = NULL;
++ 
++ 	if (nhc)
++ 		dev = l3mdev_master_dev_rcu(nhc->nhc_dev);
++ 
++ 	return dev ? : net->loopback_dev;
++ }
++ 
+++>>>>>>> b87b04f5019e (ipv4: Fix device used for dst_alloc with local routes)
+  /*
+   *	NOTE. We drop all the packets that has local source
+   *	addresses, because every properly looped back packet
+@@@ -2089,9 -2225,9 +2145,9 @@@ local_input
+  		}
+  	}
+  
+- 	rth = rt_dst_alloc(l3mdev_master_dev_rcu(dev) ? : net->loopback_dev,
++ 	rth = rt_dst_alloc(ip_rt_get_dev(net, res),
+  			   flags | RTCF_LOCAL, res->type,
+ -			   IN_DEV_ORCONF(in_dev, NOPOLICY), false);
+ +			   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, do_cache);
+  	if (!rth)
+  		goto e_nobufs;
+  
+* Unmerged path net/ipv4/route.c
+diff --git a/tools/testing/selftests/net/fib_tests.sh b/tools/testing/selftests/net/fib_tests.sh
+index 655bced611a2..c85734602cdf 100755
+--- a/tools/testing/selftests/net/fib_tests.sh
++++ b/tools/testing/selftests/net/fib_tests.sh
+@@ -1329,12 +1329,37 @@ ipv4_rt_replace()
+ 	ipv4_rt_replace_mpath
+ }
+ 
++# checks that cached input route on VRF port is deleted
++# when VRF is deleted
++ipv4_local_rt_cache()
++{
++	run_cmd "ip addr add 10.0.0.1/32 dev lo"
++	run_cmd "ip netns add test-ns"
++	run_cmd "ip link add veth-outside type veth peer name veth-inside"
++	run_cmd "ip link add vrf-100 type vrf table 1100"
++	run_cmd "ip link set veth-outside master vrf-100"
++	run_cmd "ip link set veth-inside netns test-ns"
++	run_cmd "ip link set veth-outside up"
++	run_cmd "ip link set vrf-100 up"
++	run_cmd "ip route add 10.1.1.1/32 dev veth-outside table 1100"
++	run_cmd "ip netns exec test-ns ip link set veth-inside up"
++	run_cmd "ip netns exec test-ns ip addr add 10.1.1.1/32 dev veth-inside"
++	run_cmd "ip netns exec test-ns ip route add 10.0.0.1/32 dev veth-inside"
++	run_cmd "ip netns exec test-ns ip route add default via 10.0.0.1"
++	run_cmd "ip netns exec test-ns ping 10.0.0.1 -c 1 -i 1"
++	run_cmd "ip link delete vrf-100"
++
++	# if we do not hang test is a success
++	log_test $? 0 "Cached route removed from VRF port device"
++}
++
+ ipv4_route_test()
+ {
+ 	route_setup
+ 
+ 	ipv4_rt_add
+ 	ipv4_rt_replace
++	ipv4_local_rt_cache
+ 
+ 	route_cleanup
+ }
