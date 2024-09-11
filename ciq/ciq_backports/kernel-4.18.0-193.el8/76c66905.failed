@@ -1,0 +1,122 @@
+NFS/flexfiles: Speed up read failover when DSes are down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 76c6690522bb3e335ce1e201360df8776cab4d2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/76c66905.failed
+
+If we notice that a DS may be down, we should attempt to read from the
+other mirrors first before we go back to retry the dead DS.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 76c6690522bb3e335ce1e201360df8776cab4d2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/flexfilelayout/flexfilelayout.c
+diff --cc fs/nfs/flexfilelayout/flexfilelayout.c
+index 2c7d21aea13b,44ccfce3784e..000000000000
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@@ -799,25 -788,51 +799,59 @@@ ff_layout_alloc_commit_info(struct pnfs
+  	}
+  }
+  
++ static void
++ ff_layout_mark_ds_unreachable(struct pnfs_layout_segment *lseg, int idx)
++ {
++ 	struct nfs4_deviceid_node *devid = FF_LAYOUT_DEVID_NODE(lseg, idx);
++ 
++ 	if (devid)
++ 		nfs4_mark_deviceid_unavailable(devid);
++ }
++ 
++ static void
++ ff_layout_mark_ds_reachable(struct pnfs_layout_segment *lseg, int idx)
++ {
++ 	struct nfs4_deviceid_node *devid = FF_LAYOUT_DEVID_NODE(lseg, idx);
++ 
++ 	if (devid)
++ 		nfs4_mark_deviceid_available(devid);
++ }
++ 
+  static struct nfs4_pnfs_ds *
+- ff_layout_choose_best_ds_for_read(struct pnfs_layout_segment *lseg,
+- 				  int start_idx,
+- 				  int *best_idx)
++ ff_layout_choose_ds_for_read(struct pnfs_layout_segment *lseg,
++ 			     int start_idx, int *best_idx,
++ 			     bool check_device)
+  {
+  	struct nfs4_ff_layout_segment *fls = FF_LAYOUT_LSEG(lseg);
+ -	struct nfs4_ff_layout_mirror *mirror;
+  	struct nfs4_pnfs_ds *ds;
+  	bool fail_return = false;
+  	int idx;
+  
+- 	/* mirrors are sorted by efficiency */
++ 	/* mirrors are initially sorted by efficiency */
+  	for (idx = start_idx; idx < fls->mirror_array_cnt; idx++) {
+  		if (idx+1 == fls->mirror_array_cnt)
+++<<<<<<< HEAD
+ +			fail_return = true;
+ +		ds = nfs4_ff_layout_prepare_ds(lseg, idx, fail_return);
+ +		if (ds) {
+ +			*best_idx = idx;
+ +			return ds;
+ +		}
+++=======
++ 			fail_return = !check_device;
++ 
++ 		mirror = FF_LAYOUT_COMP(lseg, idx);
++ 		ds = nfs4_ff_layout_prepare_ds(lseg, mirror, fail_return);
++ 		if (!ds)
++ 			continue;
++ 
++ 		if (check_device &&
++ 		    nfs4_test_deviceid_unavailable(&mirror->mirror_ds->id_node))
++ 			continue;
++ 
++ 		*best_idx = idx;
++ 		return ds;
+++>>>>>>> 76c6690522bb (NFS/flexfiles: Speed up read failover when DSes are down)
+  	}
+  
+  	return NULL;
+* Unmerged path fs/nfs/flexfilelayout/flexfilelayout.c
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 74aa7740ce75..94ff1b63e70b 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -350,6 +350,7 @@ void nfs4_delete_deviceid(const struct pnfs_layoutdriver_type *, const struct nf
+ void nfs4_init_deviceid_node(struct nfs4_deviceid_node *, struct nfs_server *,
+ 			     const struct nfs4_deviceid *);
+ bool nfs4_put_deviceid_node(struct nfs4_deviceid_node *);
++void nfs4_mark_deviceid_available(struct nfs4_deviceid_node *node);
+ void nfs4_mark_deviceid_unavailable(struct nfs4_deviceid_node *node);
+ bool nfs4_test_deviceid_unavailable(struct nfs4_deviceid_node *node);
+ void nfs4_deviceid_purge_client(const struct nfs_client *);
+diff --git a/fs/nfs/pnfs_dev.c b/fs/nfs/pnfs_dev.c
+index e27482ba1445..68bed99208d2 100644
+--- a/fs/nfs/pnfs_dev.c
++++ b/fs/nfs/pnfs_dev.c
+@@ -283,6 +283,16 @@ nfs4_put_deviceid_node(struct nfs4_deviceid_node *d)
+ }
+ EXPORT_SYMBOL_GPL(nfs4_put_deviceid_node);
+ 
++void
++nfs4_mark_deviceid_available(struct nfs4_deviceid_node *node)
++{
++	if (test_bit(NFS_DEVICEID_UNAVAILABLE, &node->flags)) {
++		clear_bit(NFS_DEVICEID_UNAVAILABLE, &node->flags);
++		smp_mb__after_atomic();
++	}
++}
++EXPORT_SYMBOL_GPL(nfs4_mark_deviceid_available);
++
+ void
+ nfs4_mark_deviceid_unavailable(struct nfs4_deviceid_node *node)
+ {
