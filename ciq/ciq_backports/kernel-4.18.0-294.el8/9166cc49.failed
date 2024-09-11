@@ -1,0 +1,178 @@
+mac80211: implement Operating Mode Notification extended NSS support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 9166cc49767a646990a73380480356416b7794eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9166cc49.failed
+
+Somehow we missed this for a long time, but similar to the extended
+NSS support in VHT capabilities, we need to have this in Operating
+Mode notification.
+
+Implement it by
+ * parsing the 160/80+80 bit there and setting the bandwidth
+   appropriately
+ * having callers of ieee80211_get_vht_max_nss() pass in the current
+   max NSS value as received in the operating mode notification in
+   order to modify it appropriately depending on the extended NSS
+   bits.
+
+This updates all drivers that use it, i.e. only iwlwifi/mvm.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Link: https://lore.kernel.org/r/iwlwifi.20200326150855.098483728cfa.I4e8c25d3288441759c2793247197229f0696a37d@changeid
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 9166cc49767a646990a73380480356416b7794eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ieee80211.h
+diff --cc include/linux/ieee80211.h
+index 82a7597696a1,c326aec535c6..000000000000
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@@ -8,11 -9,7 +8,15 @@@
+   * Copyright (c) 2006, Michael Wu <flamingice@sourmilk.net>
+   * Copyright (c) 2013 - 2014 Intel Mobile Communications GmbH
+   * Copyright (c) 2016 - 2017 Intel Deutschland GmbH
+++<<<<<<< HEAD
+ + * Copyright (c) 2018 - 2019 Intel Corporation
+ + *
+ + * This program is free software; you can redistribute it and/or modify
+ + * it under the terms of the GNU General Public License version 2 as
+ + * published by the Free Software Foundation.
+++=======
++  * Copyright (c) 2018 - 2020 Intel Corporation
+++>>>>>>> 9166cc49767a (mac80211: implement Operating Mode Notification extended NSS support)
+   */
+  
+  #ifndef LINUX_IEEE80211_H
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/rs.c b/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+index 00e7fdbaeb7f..0e92b210dcb9 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/rs.c
+@@ -1,10 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /******************************************************************************
+  *
+- * Copyright(c) 2005 - 2014 Intel Corporation. All rights reserved.
++ * Copyright(c) 2005 - 2014, 2018 - 2020 Intel Corporation. All rights reserved.
+  * Copyright(c) 2013 - 2015 Intel Mobile Communications GmbH
+  * Copyright(c) 2016 - 2017 Intel Deutschland GmbH
+- * Copyright(c) 2018 - 2019 Intel Corporation
+  *
+  * Contact Information:
+  *  Intel Linux Wireless <linuxwifi@intel.com>
+@@ -1430,7 +1429,8 @@ static u32 rs_bw_from_sta_bw(struct ieee80211_sta *sta)
+ 		 */
+ 		if (ieee80211_get_vht_max_nss(&vht_cap,
+ 					      IEEE80211_VHT_CHANWIDTH_160MHZ,
+-					      0, true) < sta->rx_nss)
++					      0, true,
++					      sta->rx_nss) < sta->rx_nss)
+ 			return RATE_MCS_CHAN_WIDTH_80;
+ 		return RATE_MCS_CHAN_WIDTH_160;
+ 	case IEEE80211_STA_RX_BW_80:
+* Unmerged path include/linux/ieee80211.h
+diff --git a/net/mac80211/vht.c b/net/mac80211/vht.c
+index 632f07401850..9c6045f9c24d 100644
+--- a/net/mac80211/vht.c
++++ b/net/mac80211/vht.c
+@@ -4,7 +4,7 @@
+  *
+  * Portions of this file
+  * Copyright(c) 2015 - 2016 Intel Deutschland GmbH
+- * Copyright (C) 2018 - 2019 Intel Corporation
++ * Copyright (C) 2018 - 2020 Intel Corporation
+  */
+ 
+ #include <linux/ieee80211.h>
+@@ -575,15 +575,21 @@ u32 __ieee80211_vht_handle_opmode(struct ieee80211_sub_if_data *sdata,
+ 
+ 	switch (opmode & IEEE80211_OPMODE_NOTIF_CHANWIDTH_MASK) {
+ 	case IEEE80211_OPMODE_NOTIF_CHANWIDTH_20MHZ:
++		/* ignore IEEE80211_OPMODE_NOTIF_BW_160_80P80 must not be set */
+ 		sta->cur_max_bandwidth = IEEE80211_STA_RX_BW_20;
+ 		break;
+ 	case IEEE80211_OPMODE_NOTIF_CHANWIDTH_40MHZ:
++		/* ignore IEEE80211_OPMODE_NOTIF_BW_160_80P80 must not be set */
+ 		sta->cur_max_bandwidth = IEEE80211_STA_RX_BW_40;
+ 		break;
+ 	case IEEE80211_OPMODE_NOTIF_CHANWIDTH_80MHZ:
+-		sta->cur_max_bandwidth = IEEE80211_STA_RX_BW_80;
++		if (opmode & IEEE80211_OPMODE_NOTIF_BW_160_80P80)
++			sta->cur_max_bandwidth = IEEE80211_STA_RX_BW_160;
++		else
++			sta->cur_max_bandwidth = IEEE80211_STA_RX_BW_80;
+ 		break;
+ 	case IEEE80211_OPMODE_NOTIF_CHANWIDTH_160MHZ:
++		/* legacy only, no longer used by newer spec */
+ 		sta->cur_max_bandwidth = IEEE80211_STA_RX_BW_160;
+ 		break;
+ 	}
+diff --git a/net/wireless/util.c b/net/wireless/util.c
+index 6590efbbcbb9..123d6ce79b8e 100644
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -5,7 +5,7 @@
+  * Copyright 2007-2009	Johannes Berg <johannes@sipsolutions.net>
+  * Copyright 2013-2014  Intel Mobile Communications GmbH
+  * Copyright 2017	Intel Deutschland GmbH
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ #include <linux/export.h>
+ #include <linux/bitops.h>
+@@ -2030,10 +2030,10 @@ EXPORT_SYMBOL(cfg80211_send_layer2_update);
+ 
+ int ieee80211_get_vht_max_nss(struct ieee80211_vht_cap *cap,
+ 			      enum ieee80211_vht_chanwidth bw,
+-			      int mcs, bool ext_nss_bw_capable)
++			      int mcs, bool ext_nss_bw_capable,
++			      unsigned int max_vht_nss)
+ {
+ 	u16 map = le16_to_cpu(cap->supp_mcs.rx_mcs_map);
+-	int max_vht_nss = 0;
+ 	int ext_nss_bw;
+ 	int supp_width;
+ 	int i, mcs_encoding;
+@@ -2041,7 +2041,7 @@ int ieee80211_get_vht_max_nss(struct ieee80211_vht_cap *cap,
+ 	if (map == 0xffff)
+ 		return 0;
+ 
+-	if (WARN_ON(mcs > 9))
++	if (WARN_ON(mcs > 9 || max_vht_nss > 8))
+ 		return 0;
+ 	if (mcs <= 7)
+ 		mcs_encoding = 0;
+@@ -2050,16 +2050,18 @@ int ieee80211_get_vht_max_nss(struct ieee80211_vht_cap *cap,
+ 	else
+ 		mcs_encoding = 2;
+ 
+-	/* find max_vht_nss for the given MCS */
+-	for (i = 7; i >= 0; i--) {
+-		int supp = (map >> (2 * i)) & 3;
++	if (!max_vht_nss) {
++		/* find max_vht_nss for the given MCS */
++		for (i = 7; i >= 0; i--) {
++			int supp = (map >> (2 * i)) & 3;
+ 
+-		if (supp == 3)
+-			continue;
++			if (supp == 3)
++				continue;
+ 
+-		if (supp >= mcs_encoding) {
+-			max_vht_nss = i + 1;
+-			break;
++			if (supp >= mcs_encoding) {
++				max_vht_nss = i + 1;
++				break;
++			}
+ 		}
+ 	}
+ 
