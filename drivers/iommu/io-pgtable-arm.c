@@ -47,10 +47,11 @@
  * in a virtual address mapped by the pagetable in d.
  */
 #define ARM_LPAE_LVL_SHIFT(l,d)						\
-	(((ARM_LPAE_MAX_LEVELS - 1 - (l)) * (d)->bits_per_level) +	\
-	(d)->pg_shift)
+	(((ARM_LPAE_MAX_LEVELS - (l)) * (d)->bits_per_level) +		\
+	ilog2(sizeof(arm_lpae_iopte)))
 
-#define ARM_LPAE_GRANULE(d)		(1UL << (d)->pg_shift)
+#define ARM_LPAE_GRANULE(d)						\
+	(sizeof(arm_lpae_iopte) << (d)->bits_per_level)
 #define ARM_LPAE_PGD_SIZE(d)						\
 	(sizeof(arm_lpae_iopte) << (d)->pgd_bits)
 
@@ -66,9 +67,7 @@
 	 ((1 << ((d)->bits_per_level + ARM_LPAE_PGD_IDX(l,d))) - 1))
 
 /* Calculate the block/page mapping size at level l for pagetable in d. */
-#define ARM_LPAE_BLOCK_SIZE(l,d)					\
-	(1ULL << (ilog2(sizeof(arm_lpae_iopte)) +			\
-		((ARM_LPAE_MAX_LEVELS - (l)) * (d)->bits_per_level)))
+#define ARM_LPAE_BLOCK_SIZE(l,d)	(1ULL << ARM_LPAE_LVL_SHIFT(l,d))
 
 /* Page table bits */
 #define ARM_LPAE_PTE_TYPE_SHIFT		0
@@ -186,8 +185,7 @@ struct arm_lpae_io_pgtable {
 
 	int			pgd_bits;
 	int			start_level;
-	unsigned long		pg_shift;
-	unsigned long		bits_per_level;
+	int			bits_per_level;
 
 	void			*pgd;
 };
@@ -217,7 +215,7 @@ static phys_addr_t iopte_to_paddr(arm_lpae_iopte pte,
 {
 	u64 paddr = pte & ARM_LPAE_PTE_ADDR_MASK;
 
-	if (data->pg_shift < 16)
+	if (ARM_LPAE_GRANULE(data) < SZ_64K)
 		return paddr;
 
 	/* Rotate the packed high-order bits back to the top */
@@ -753,9 +751,8 @@ static void arm_lpae_restrict_pgsizes(struct io_pgtable_cfg *cfg)
 static struct arm_lpae_io_pgtable *
 arm_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg)
 {
-	unsigned long va_bits;
 	struct arm_lpae_io_pgtable *data;
-	int levels;
+	int levels, va_bits, pg_shift;
 
 	arm_lpae_restrict_pgsizes(cfg);
 
@@ -777,10 +774,10 @@ arm_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg)
 	if (!data)
 		return NULL;
 
-	data->pg_shift = __ffs(cfg->pgsize_bitmap);
-	data->bits_per_level = data->pg_shift - ilog2(sizeof(arm_lpae_iopte));
+	pg_shift = __ffs(cfg->pgsize_bitmap);
+	data->bits_per_level = pg_shift - ilog2(sizeof(arm_lpae_iopte));
 
-	va_bits = cfg->ias - data->pg_shift;
+	va_bits = cfg->ias - pg_shift;
 	levels = DIV_ROUND_UP(va_bits, data->bits_per_level);
 	data->start_level = ARM_LPAE_MAX_LEVELS - levels;
 
@@ -1146,9 +1143,9 @@ static void __init arm_lpae_dump_ops(struct io_pgtable_ops *ops)
 
 	pr_err("cfg: pgsize_bitmap 0x%lx, ias %u-bit\n",
 		cfg->pgsize_bitmap, cfg->ias);
-	pr_err("data: %d levels, 0x%zx pgd_size, %lu pg_shift, %lu bits_per_level, pgd @ %p\n",
+	pr_err("data: %d levels, 0x%zx pgd_size, %u pg_shift, %u bits_per_level, pgd @ %p\n",
 		ARM_LPAE_MAX_LEVELS - data->start_level, ARM_LPAE_PGD_SIZE(data),
-		data->pg_shift, data->bits_per_level, data->pgd);
+		ilog2(ARM_LPAE_GRANULE(data)), data->bits_per_level, data->pgd);
 }
 
 #define __FAIL(ops, i)	({						\
