@@ -1,0 +1,699 @@
+tools/bpf: implement libbpf btf__get_map_kv_tids() API function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit 96408c43447aff5091a6938f29d8b6f2d0aa2064
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/96408c43.failed
+
+Currently, to get map key/value type id's, the macro
+  BPF_ANNOTATE_KV_PAIR(<map_name>, <key_type>, <value_type>)
+needs to be defined in the bpf program for the
+corresponding map.
+
+During program/map loading time,
+the local static function bpf_map_find_btf_info()
+in libbpf.c is implemented to retrieve the key/value
+type ids given the map name.
+
+The patch refactored function bpf_map_find_btf_info()
+to create an API btf__get_map_kv_tids() which includes
+the bulk of implementation for the original function.
+The API btf__get_map_kv_tids() can be used by bcc,
+a JIT based bpf compilation system, which uses the
+same BPF_ANNOTATE_KV_PAIR to record map key/value types.
+
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 96408c43447aff5091a6938f29d8b6f2d0aa2064)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+#	tools/lib/bpf/btf.h
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/btf.c
+index ad19a43e946a,7ec0463354db..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -1,6 -1,7 +1,7 @@@
+ -// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+ +// SPDX-License-Identifier: LGPL-2.1
+  /* Copyright (c) 2018 Facebook */
+  
++ #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <unistd.h>
+@@@ -372,3 -432,426 +373,429 @@@ int btf__fd(const struct btf *btf
+  {
+  	return btf->fd;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ const char *btf__name_by_offset(const struct btf *btf, __u32 offset)
++ {
++ 	if (offset < btf->hdr->str_len)
++ 		return &btf->strings[offset];
++ 	else
++ 		return NULL;
++ }
++ 
++ int btf__get_from_id(__u32 id, struct btf **btf)
++ {
++ 	struct bpf_btf_info btf_info = { 0 };
++ 	__u32 len = sizeof(btf_info);
++ 	__u32 last_size;
++ 	int btf_fd;
++ 	void *ptr;
++ 	int err;
++ 
++ 	err = 0;
++ 	*btf = NULL;
++ 	btf_fd = bpf_btf_get_fd_by_id(id);
++ 	if (btf_fd < 0)
++ 		return 0;
++ 
++ 	/* we won't know btf_size until we call bpf_obj_get_info_by_fd(). so
++ 	 * let's start with a sane default - 4KiB here - and resize it only if
++ 	 * bpf_obj_get_info_by_fd() needs a bigger buffer.
++ 	 */
++ 	btf_info.btf_size = 4096;
++ 	last_size = btf_info.btf_size;
++ 	ptr = malloc(last_size);
++ 	if (!ptr) {
++ 		err = -ENOMEM;
++ 		goto exit_free;
++ 	}
++ 
++ 	bzero(ptr, last_size);
++ 	btf_info.btf = ptr_to_u64(ptr);
++ 	err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 
++ 	if (!err && btf_info.btf_size > last_size) {
++ 		void *temp_ptr;
++ 
++ 		last_size = btf_info.btf_size;
++ 		temp_ptr = realloc(ptr, last_size);
++ 		if (!temp_ptr) {
++ 			err = -ENOMEM;
++ 			goto exit_free;
++ 		}
++ 		ptr = temp_ptr;
++ 		bzero(ptr, last_size);
++ 		btf_info.btf = ptr_to_u64(ptr);
++ 		err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 	}
++ 
++ 	if (err || btf_info.btf_size > last_size) {
++ 		err = errno;
++ 		goto exit_free;
++ 	}
++ 
++ 	*btf = btf__new((__u8 *)(long)btf_info.btf, btf_info.btf_size);
++ 	if (IS_ERR(*btf)) {
++ 		err = PTR_ERR(*btf);
++ 		*btf = NULL;
++ 	}
++ 
++ exit_free:
++ 	close(btf_fd);
++ 	free(ptr);
++ 
++ 	return err;
++ }
++ 
++ int btf__get_map_kv_tids(const struct btf *btf, char *map_name,
++ 			 __u32 expected_key_size, __u32 expected_value_size,
++ 			 __u32 *key_type_id, __u32 *value_type_id)
++ {
++ 	const struct btf_type *container_type;
++ 	const struct btf_member *key, *value;
++ 	const size_t max_name = 256;
++ 	char container_name[max_name];
++ 	__s64 key_size, value_size;
++ 	__s32 container_id;
++ 
++ 	if (snprintf(container_name, max_name, "____btf_map_%s", map_name) ==
++ 	    max_name) {
++ 		pr_warning("map:%s length of '____btf_map_%s' is too long\n",
++ 			   map_name, map_name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	container_id = btf__find_by_name(btf, container_name);
++ 	if (container_id < 0) {
++ 		pr_warning("map:%s container_name:%s cannot be found in BTF. Missing BPF_ANNOTATE_KV_PAIR?\n",
++ 			   map_name, container_name);
++ 		return container_id;
++ 	}
++ 
++ 	container_type = btf__type_by_id(btf, container_id);
++ 	if (!container_type) {
++ 		pr_warning("map:%s cannot find BTF type for container_id:%u\n",
++ 			   map_name, container_id);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (BTF_INFO_KIND(container_type->info) != BTF_KIND_STRUCT ||
++ 	    BTF_INFO_VLEN(container_type->info) < 2) {
++ 		pr_warning("map:%s container_name:%s is an invalid container struct\n",
++ 			   map_name, container_name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	key = (struct btf_member *)(container_type + 1);
++ 	value = key + 1;
++ 
++ 	key_size = btf__resolve_size(btf, key->type);
++ 	if (key_size < 0) {
++ 		pr_warning("map:%s invalid BTF key_type_size\n", map_name);
++ 		return key_size;
++ 	}
++ 
++ 	if (expected_key_size != key_size) {
++ 		pr_warning("map:%s btf_key_type_size:%u != map_def_key_size:%u\n",
++ 			   map_name, (__u32)key_size, expected_key_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	value_size = btf__resolve_size(btf, value->type);
++ 	if (value_size < 0) {
++ 		pr_warning("map:%s invalid BTF value_type_size\n", map_name);
++ 		return value_size;
++ 	}
++ 
++ 	if (expected_value_size != value_size) {
++ 		pr_warning("map:%s btf_value_type_size:%u != map_def_value_size:%u\n",
++ 			   map_name, (__u32)value_size, expected_value_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	*key_type_id = key->type;
++ 	*value_type_id = value->type;
++ 
++ 	return 0;
++ }
++ 
++ struct btf_ext_sec_copy_param {
++ 	__u32 off;
++ 	__u32 len;
++ 	__u32 min_rec_size;
++ 	struct btf_ext_info *ext_info;
++ 	const char *desc;
++ };
++ 
++ static int btf_ext_copy_info(struct btf_ext *btf_ext,
++ 			     __u8 *data, __u32 data_size,
++ 			     struct btf_ext_sec_copy_param *ext_sec)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 	const struct btf_ext_info_sec *sinfo;
++ 	struct btf_ext_info *ext_info;
++ 	__u32 info_left, record_size;
++ 	/* The start of the info sec (including the __u32 record_size). */
++ 	const void *info;
++ 
++ 	/* data and data_size do not include btf_ext_header from now on */
++ 	data = data + hdr->hdr_len;
++ 	data_size -= hdr->hdr_len;
++ 
++ 	if (ext_sec->off & 0x03) {
++ 		pr_debug(".BTF.ext %s section is not aligned to 4 bytes\n",
++ 		     ext_sec->desc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (data_size < ext_sec->off ||
++ 	    ext_sec->len > data_size - ext_sec->off) {
++ 		pr_debug("%s section (off:%u len:%u) is beyond the end of the ELF section .BTF.ext\n",
++ 		     ext_sec->desc, ext_sec->off, ext_sec->len);
++ 		return -EINVAL;
++ 	}
++ 
++ 	info = data + ext_sec->off;
++ 	info_left = ext_sec->len;
++ 
++ 	/* At least a record size */
++ 	if (info_left < sizeof(__u32)) {
++ 		pr_debug(".BTF.ext %s record size not found\n", ext_sec->desc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* The record size needs to meet the minimum standard */
++ 	record_size = *(__u32 *)info;
++ 	if (record_size < ext_sec->min_rec_size ||
++ 	    record_size & 0x03) {
++ 		pr_debug("%s section in .BTF.ext has invalid record size %u\n",
++ 		     ext_sec->desc, record_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	sinfo = info + sizeof(__u32);
++ 	info_left -= sizeof(__u32);
++ 
++ 	/* If no records, return failure now so .BTF.ext won't be used. */
++ 	if (!info_left) {
++ 		pr_debug("%s section in .BTF.ext has no records", ext_sec->desc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	while (info_left) {
++ 		unsigned int sec_hdrlen = sizeof(struct btf_ext_info_sec);
++ 		__u64 total_record_size;
++ 		__u32 num_records;
++ 
++ 		if (info_left < sec_hdrlen) {
++ 			pr_debug("%s section header is not found in .BTF.ext\n",
++ 			     ext_sec->desc);
++ 			return -EINVAL;
++ 		}
++ 
++ 		num_records = sinfo->num_info;
++ 		if (num_records == 0) {
++ 			pr_debug("%s section has incorrect num_records in .BTF.ext\n",
++ 			     ext_sec->desc);
++ 			return -EINVAL;
++ 		}
++ 
++ 		total_record_size = sec_hdrlen +
++ 				    (__u64)num_records * record_size;
++ 		if (info_left < total_record_size) {
++ 			pr_debug("%s section has incorrect num_records in .BTF.ext\n",
++ 			     ext_sec->desc);
++ 			return -EINVAL;
++ 		}
++ 
++ 		info_left -= total_record_size;
++ 		sinfo = (void *)sinfo + total_record_size;
++ 	}
++ 
++ 	ext_info = ext_sec->ext_info;
++ 	ext_info->len = ext_sec->len - sizeof(__u32);
++ 	ext_info->rec_size = record_size;
++ 	ext_info->info = malloc(ext_info->len);
++ 	if (!ext_info->info)
++ 		return -ENOMEM;
++ 	memcpy(ext_info->info, info + sizeof(__u32), ext_info->len);
++ 
++ 	return 0;
++ }
++ 
++ static int btf_ext_copy_func_info(struct btf_ext *btf_ext,
++ 				  __u8 *data, __u32 data_size)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 	struct btf_ext_sec_copy_param param = {
++ 		.off = hdr->func_info_off,
++ 		.len = hdr->func_info_len,
++ 		.min_rec_size = sizeof(struct bpf_func_info_min),
++ 		.ext_info = &btf_ext->func_info,
++ 		.desc = "func_info"
++ 	};
++ 
++ 	return btf_ext_copy_info(btf_ext, data, data_size, &param);
++ }
++ 
++ static int btf_ext_copy_line_info(struct btf_ext *btf_ext,
++ 				  __u8 *data, __u32 data_size)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 	struct btf_ext_sec_copy_param param = {
++ 		.off = hdr->line_info_off,
++ 		.len = hdr->line_info_len,
++ 		.min_rec_size = sizeof(struct bpf_line_info_min),
++ 		.ext_info = &btf_ext->line_info,
++ 		.desc = "line_info",
++ 	};
++ 
++ 	return btf_ext_copy_info(btf_ext, data, data_size, &param);
++ }
++ 
++ static int btf_ext_parse_hdr(__u8 *data, __u32 data_size)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 
++ 	if (data_size < offsetof(struct btf_ext_header, func_info_off) ||
++ 	    data_size < hdr->hdr_len) {
++ 		pr_debug("BTF.ext header not found");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (hdr->magic != BTF_MAGIC) {
++ 		pr_debug("Invalid BTF.ext magic:%x\n", hdr->magic);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (hdr->version != BTF_VERSION) {
++ 		pr_debug("Unsupported BTF.ext version:%u\n", hdr->version);
++ 		return -ENOTSUP;
++ 	}
++ 
++ 	if (hdr->flags) {
++ 		pr_debug("Unsupported BTF.ext flags:%x\n", hdr->flags);
++ 		return -ENOTSUP;
++ 	}
++ 
++ 	if (data_size == hdr->hdr_len) {
++ 		pr_debug("BTF.ext has no data\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void btf_ext__free(struct btf_ext *btf_ext)
++ {
++ 	if (!btf_ext)
++ 		return;
++ 
++ 	free(btf_ext->func_info.info);
++ 	free(btf_ext->line_info.info);
++ 	free(btf_ext);
++ }
++ 
++ struct btf_ext *btf_ext__new(__u8 *data, __u32 size)
++ {
++ 	struct btf_ext *btf_ext;
++ 	int err;
++ 
++ 	err = btf_ext_parse_hdr(data, size);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	btf_ext = calloc(1, sizeof(struct btf_ext));
++ 	if (!btf_ext)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	err = btf_ext_copy_func_info(btf_ext, data, size);
++ 	if (err) {
++ 		btf_ext__free(btf_ext);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	err = btf_ext_copy_line_info(btf_ext, data, size);
++ 	if (err) {
++ 		btf_ext__free(btf_ext);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	return btf_ext;
++ }
++ 
++ static int btf_ext_reloc_info(const struct btf *btf,
++ 			      const struct btf_ext_info *ext_info,
++ 			      const char *sec_name, __u32 insns_cnt,
++ 			      void **info, __u32 *cnt)
++ {
++ 	__u32 sec_hdrlen = sizeof(struct btf_ext_info_sec);
++ 	__u32 i, record_size, existing_len, records_len;
++ 	struct btf_ext_info_sec *sinfo;
++ 	const char *info_sec_name;
++ 	__u64 remain_len;
++ 	void *data;
++ 
++ 	record_size = ext_info->rec_size;
++ 	sinfo = ext_info->info;
++ 	remain_len = ext_info->len;
++ 	while (remain_len > 0) {
++ 		records_len = sinfo->num_info * record_size;
++ 		info_sec_name = btf__name_by_offset(btf, sinfo->sec_name_off);
++ 		if (strcmp(info_sec_name, sec_name)) {
++ 			remain_len -= sec_hdrlen + records_len;
++ 			sinfo = (void *)sinfo + sec_hdrlen + records_len;
++ 			continue;
++ 		}
++ 
++ 		existing_len = (*cnt) * record_size;
++ 		data = realloc(*info, existing_len + records_len);
++ 		if (!data)
++ 			return -ENOMEM;
++ 
++ 		memcpy(data + existing_len, sinfo->data, records_len);
++ 		/* adjust insn_off only, the rest data will be passed
++ 		 * to the kernel.
++ 		 */
++ 		for (i = 0; i < sinfo->num_info; i++) {
++ 			__u32 *insn_off;
++ 
++ 			insn_off = data + existing_len + (i * record_size);
++ 			*insn_off = *insn_off / sizeof(struct bpf_insn) +
++ 				insns_cnt;
++ 		}
++ 		*info = data;
++ 		*cnt += sinfo->num_info;
++ 		return 0;
++ 	}
++ 
++ 	return -ENOENT;
++ }
++ 
++ int btf_ext__reloc_func_info(const struct btf *btf, const struct btf_ext *btf_ext,
++ 			     const char *sec_name, __u32 insns_cnt,
++ 			     void **func_info, __u32 *cnt)
++ {
++ 	return btf_ext_reloc_info(btf, &btf_ext->func_info, sec_name,
++ 				  insns_cnt, func_info, cnt);
++ }
++ 
++ int btf_ext__reloc_line_info(const struct btf *btf, const struct btf_ext *btf_ext,
++ 			     const char *sec_name, __u32 insns_cnt,
++ 			     void **line_info, __u32 *cnt)
++ {
++ 	return btf_ext_reloc_info(btf, &btf_ext->line_info, sec_name,
++ 				  insns_cnt, line_info, cnt);
++ }
++ 
++ __u32 btf_ext__func_info_rec_size(const struct btf_ext *btf_ext)
++ {
++ 	return btf_ext->func_info.rec_size;
++ }
++ 
++ __u32 btf_ext__line_info_rec_size(const struct btf_ext *btf_ext)
++ {
++ 	return btf_ext->line_info.rec_size;
++ }
+++>>>>>>> 96408c43447a (tools/bpf: implement libbpf btf__get_map_kv_tids() API function)
+diff --cc tools/lib/bpf/btf.h
+index caac3a404dc5,258c87e9f55d..000000000000
+--- a/tools/lib/bpf/btf.h
++++ b/tools/lib/bpf/btf.h
+@@@ -6,19 -6,86 +6,53 @@@
+  
+  #include <linux/types.h>
+  
+ -#ifdef __cplusplus
+ -extern "C" {
+ -#endif
+ -
+ -#ifndef LIBBPF_API
+ -#define LIBBPF_API __attribute__((visibility("default")))
+ -#endif
+ -
+  #define BTF_ELF_SEC ".BTF"
+ -#define BTF_EXT_ELF_SEC ".BTF.ext"
+  
+  struct btf;
+ -struct btf_ext;
+  struct btf_type;
+  
+ -/*
+ - * The .BTF.ext ELF section layout defined as
+ - *   struct btf_ext_header
+ - *   func_info subsection
+ - *
+ - * The func_info subsection layout:
+ - *   record size for struct bpf_func_info in the func_info subsection
+ - *   struct btf_sec_func_info for section #1
+ - *   a list of bpf_func_info records for section #1
+ - *     where struct bpf_func_info mimics one in include/uapi/linux/bpf.h
+ - *     but may not be identical
+ - *   struct btf_sec_func_info for section #2
+ - *   a list of bpf_func_info records for section #2
+ - *   ......
+ - *
+ - * Note that the bpf_func_info record size in .BTF.ext may not
+ - * be the same as the one defined in include/uapi/linux/bpf.h.
+ - * The loader should ensure that record_size meets minimum
+ - * requirement and pass the record as is to the kernel. The
+ - * kernel will handle the func_info properly based on its contents.
+ - */
+ -struct btf_ext_header {
+ -	__u16	magic;
+ -	__u8	version;
+ -	__u8	flags;
+ -	__u32	hdr_len;
+ +typedef int (*btf_print_fn_t)(const char *, ...)
+ +	__attribute__((format(printf, 1, 2)));
+  
+ -	/* All offsets are in bytes relative to the end of this header */
+ -	__u32	func_info_off;
+ -	__u32	func_info_len;
+ -	__u32	line_info_off;
+ -	__u32	line_info_len;
+ -};
+ +void btf__free(struct btf *btf);
+ +struct btf *btf__new(__u8 *data, __u32 size, btf_print_fn_t err_log);
+ +__s32 btf__find_by_name(const struct btf *btf, const char *type_name);
+ +const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
+ +__s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
+ +int btf__fd(const struct btf *btf);
+  
+++<<<<<<< HEAD
+++=======
++ LIBBPF_API void btf__free(struct btf *btf);
++ LIBBPF_API struct btf *btf__new(__u8 *data, __u32 size);
++ LIBBPF_API __s32 btf__find_by_name(const struct btf *btf,
++ 				   const char *type_name);
++ LIBBPF_API const struct btf_type *btf__type_by_id(const struct btf *btf,
++ 						  __u32 id);
++ LIBBPF_API __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
++ LIBBPF_API int btf__resolve_type(const struct btf *btf, __u32 type_id);
++ LIBBPF_API int btf__fd(const struct btf *btf);
++ LIBBPF_API const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
++ LIBBPF_API int btf__get_from_id(__u32 id, struct btf **btf);
++ LIBBPF_API int btf__get_map_kv_tids(const struct btf *btf, char *map_name,
++ 				    __u32 expected_key_size,
++ 				    __u32 expected_value_size,
++ 				    __u32 *key_type_id, __u32 *value_type_id);
++ 
++ LIBBPF_API struct btf_ext *btf_ext__new(__u8 *data, __u32 size);
++ LIBBPF_API void btf_ext__free(struct btf_ext *btf_ext);
++ LIBBPF_API int btf_ext__reloc_func_info(const struct btf *btf,
++ 					const struct btf_ext *btf_ext,
++ 					const char *sec_name, __u32 insns_cnt,
++ 					void **func_info, __u32 *cnt);
++ LIBBPF_API int btf_ext__reloc_line_info(const struct btf *btf,
++ 					const struct btf_ext *btf_ext,
++ 					const char *sec_name, __u32 insns_cnt,
++ 					void **line_info, __u32 *cnt);
++ LIBBPF_API __u32 btf_ext__func_info_rec_size(const struct btf_ext *btf_ext);
++ LIBBPF_API __u32 btf_ext__line_info_rec_size(const struct btf_ext *btf_ext);
++ 
++ #ifdef __cplusplus
++ } /* extern "C" */
+++>>>>>>> 96408c43447a (tools/bpf: implement libbpf btf__get_map_kv_tids() API function)
+  #endif
+ -
+ -#endif /* __LIBBPF_BTF_H */
+diff --cc tools/lib/bpf/libbpf.map
+index 4fb29f6d7a80,7990e857e003..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -119,3 -124,20 +119,23 @@@ LIBBPF_0.0.1 
+  	local:
+  		*;
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ LIBBPF_0.0.2 {
++ 	global:
++ 		bpf_probe_helper;
++ 		bpf_probe_map_type;
++ 		bpf_probe_prog_type;
++ 		bpf_map_lookup_elem_flags;
++ 		bpf_object__find_map_fd_by_name;
++ 		bpf_get_link_xdp_id;
++ 		btf__get_map_kv_tids;
++ 		btf_ext__free;
++ 		btf_ext__func_info_rec_size;
++ 		btf_ext__line_info_rec_size;
++ 		btf_ext__new;
++ 		btf_ext__reloc_func_info;
++ 		btf_ext__reloc_line_info;
++ } LIBBPF_0.0.1;
+++>>>>>>> 96408c43447a (tools/bpf: implement libbpf btf__get_map_kv_tids() API function)
+* Unmerged path tools/lib/bpf/btf.c
+* Unmerged path tools/lib/bpf/btf.h
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index 38df8e0ed95d..000ac2299b8c 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -992,72 +992,18 @@ bpf_program__collect_reloc(struct bpf_program *prog, GElf_Shdr *shdr,
+ 
+ static int bpf_map_find_btf_info(struct bpf_map *map, const struct btf *btf)
+ {
+-	const struct btf_type *container_type;
+-	const struct btf_member *key, *value;
+ 	struct bpf_map_def *def = &map->def;
+-	const size_t max_name = 256;
+-	char container_name[max_name];
+-	__s64 key_size, value_size;
+-	__s32 container_id;
+-
+-	if (snprintf(container_name, max_name, "____btf_map_%s", map->name) ==
+-	    max_name) {
+-		pr_warning("map:%s length of '____btf_map_%s' is too long\n",
+-			   map->name, map->name);
+-		return -EINVAL;
+-	}
+-
+-	container_id = btf__find_by_name(btf, container_name);
+-	if (container_id < 0) {
+-		pr_debug("map:%s container_name:%s cannot be found in BTF. Missing BPF_ANNOTATE_KV_PAIR?\n",
+-			 map->name, container_name);
+-		return container_id;
+-	}
+-
+-	container_type = btf__type_by_id(btf, container_id);
+-	if (!container_type) {
+-		pr_warning("map:%s cannot find BTF type for container_id:%u\n",
+-			   map->name, container_id);
+-		return -EINVAL;
+-	}
+-
+-	if (BTF_INFO_KIND(container_type->info) != BTF_KIND_STRUCT ||
+-	    BTF_INFO_VLEN(container_type->info) < 2) {
+-		pr_warning("map:%s container_name:%s is an invalid container struct\n",
+-			   map->name, container_name);
+-		return -EINVAL;
+-	}
+-
+-	key = (struct btf_member *)(container_type + 1);
+-	value = key + 1;
+-
+-	key_size = btf__resolve_size(btf, key->type);
+-	if (key_size < 0) {
+-		pr_warning("map:%s invalid BTF key_type_size\n",
+-			   map->name);
+-		return key_size;
+-	}
+-
+-	if (def->key_size != key_size) {
+-		pr_warning("map:%s btf_key_type_size:%u != map_def_key_size:%u\n",
+-			   map->name, (__u32)key_size, def->key_size);
+-		return -EINVAL;
+-	}
+-
+-	value_size = btf__resolve_size(btf, value->type);
+-	if (value_size < 0) {
+-		pr_warning("map:%s invalid BTF value_type_size\n", map->name);
+-		return value_size;
+-	}
++	__u32 key_type_id, value_type_id;
++	int ret;
+ 
+-	if (def->value_size != value_size) {
+-		pr_warning("map:%s btf_value_type_size:%u != map_def_value_size:%u\n",
+-			   map->name, (__u32)value_size, def->value_size);
+-		return -EINVAL;
+-	}
++	ret = btf__get_map_kv_tids(btf, map->name, def->key_size,
++				   def->value_size, &key_type_id,
++				   &value_type_id);
++	if (ret)
++		return ret;
+ 
+-	map->btf_key_type_id = key->type;
+-	map->btf_value_type_id = value->type;
++	map->btf_key_type_id = key_type_id;
++	map->btf_value_type_id = value_type_id;
+ 
+ 	return 0;
+ }
+* Unmerged path tools/lib/bpf/libbpf.map
