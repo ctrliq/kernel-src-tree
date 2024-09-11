@@ -1,0 +1,231 @@
+x86/hyperv: Initialize clockevents earlier in CPU onlining
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Michael Kelley <mikelley@microsoft.com>
+commit 4df4cb9e99f83b70d54bc0e25081ac23cceafcbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4df4cb9e.failed
+
+Hyper-V has historically initialized stimer-based clockevents late in the
+process of onlining a CPU because clockevents depend on stimer
+interrupts. In the original Hyper-V design, stimer interrupts generate a
+VMbus message, so the VMbus machinery must be running first, and VMbus
+can't be initialized until relatively late. On x86/64, LAPIC timer based
+clockevents are used during early initialization before VMbus and
+stimer-based clockevents are ready, and again during CPU offlining after
+the stimer clockevents have been shut down.
+
+Unfortunately, this design creates problems when offlining CPUs for
+hibernation or other purposes. stimer-based clockevents are shut down
+relatively early in the offlining process, so clockevents_unbind_device()
+must be used to fallback to the LAPIC-based clockevents for the remainder
+of the offlining process.  Furthermore, the late initialization and early
+shutdown of stimer-based clockevents doesn't work well on ARM64 since there
+is no other timer like the LAPIC to fallback to. So CPU onlining and
+offlining doesn't work properly.
+
+Fix this by recognizing that stimer Direct Mode is the normal path for
+newer versions of Hyper-V on x86/64, and the only path on other
+architectures. With stimer Direct Mode, stimer interrupts don't require any
+VMbus machinery. stimer clockevents can be initialized and shut down
+consistent with how it is done for other clockevent devices. While the old
+VMbus-based stimer interrupts must still be supported for backward
+compatibility on x86, that mode of operation can be treated as legacy.
+
+So add a new Hyper-V stimer entry in the CPU hotplug state list, and use
+that new state when in Direct Mode. Update the Hyper-V clocksource driver
+to allocate and initialize stimer clockevents earlier during boot. Update
+Hyper-V initialization and the VMbus driver to use this new design. As a
+result, the LAPIC timer is no longer used during boot or CPU
+onlining/offlining and clockevents_unbind_device() is not called.  But
+retain the old design as a legacy implementation for older versions of
+Hyper-V that don't support Direct Mode.
+
+	Signed-off-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Dexuan Cui <decui@microsoft.com>
+	Reviewed-by: Dexuan Cui <decui@microsoft.com>
+Link: https://lkml.kernel.org/r/1573607467-9456-1-git-send-email-mikelley@microsoft.com
+(cherry picked from commit 4df4cb9e99f83b70d54bc0e25081ac23cceafcbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/clocksource/hyperv_timer.c
+#	drivers/hv/hv.c
+#	drivers/hv/vmbus_drv.c
+#	include/clocksource/hyperv_timer.h
+#	include/linux/cpuhotplug.h
+diff --cc drivers/hv/hv.c
+index a9cfe5566941,6098e0cbdb4b..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -329,14 -202,8 +329,19 @@@ int hv_synic_init(unsigned int cpu
+  {
+  	hv_synic_enable_regs(cpu);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Register the per-cpu clockevent source.
+ +	 */
+ +	if (ms_hyperv.features & HV_MSR_SYNTIMER_AVAILABLE)
+ +		clockevents_config_and_register(hv_cpu->clk_evt,
+ +						HV_TIMER_FREQUENCY,
+ +						HV_MIN_DELTA_TICKS,
+ +						HV_MAX_MAX_DELTA_TICKS);
+++=======
++ 	hv_stimer_legacy_init(cpu, VMBUS_MESSAGE_SINT);
++ 
+++>>>>>>> 4df4cb9e99f8 (x86/hyperv: Initialize clockevents earlier in CPU onlining)
+  	return 0;
+  }
+  
+@@@ -431,14 -277,7 +436,18 @@@ int hv_synic_cleanup(unsigned int cpu
+  	if (channel_found && vmbus_connection.conn_state == CONNECTED)
+  		return -EBUSY;
+  
+++<<<<<<< HEAD
+ +	/* Turn off clockevent device */
+ +	if (ms_hyperv.features & HV_MSR_SYNTIMER_AVAILABLE) {
+ +		struct hv_per_cpu_context *hv_cpu
+ +			= this_cpu_ptr(hv_context.cpu_context);
+ +
+ +		clockevents_unbind_device(hv_cpu->clk_evt, cpu);
+ +		hv_ce_shutdown(hv_cpu->clk_evt);
+ +	}
+++=======
++ 	hv_stimer_legacy_cleanup(cpu);
+++>>>>>>> 4df4cb9e99f8 (x86/hyperv: Initialize clockevents earlier in CPU onlining)
+  
+  	hv_synic_disable_regs(cpu);
+  
+diff --cc drivers/hv/vmbus_drv.c
+index 698977f33670,8c06b3361c27..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -1274,9 -1339,10 +1274,13 @@@ static int vmbus_bus_init(void
+  	ret = hv_synic_alloc();
+  	if (ret)
+  		goto err_alloc;
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 4df4cb9e99f8 (x86/hyperv: Initialize clockevents earlier in CPU onlining)
+  	/*
+ -	 * Initialize the per-cpu interrupt state and stimer state.
+ -	 * Then connect to the host.
+ +	 * Initialize the per-cpu interrupt state and
+ +	 * connect to the host.
+  	 */
+  	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "hyperv/vmbus:online",
+  				hv_synic_init, hv_synic_cleanup);
+@@@ -1329,8 -1395,9 +1333,13 @@@
+  
+  err_connect:
+  	cpuhp_remove_state(hyperv_cpuhp_online);
+++<<<<<<< HEAD
+ +err_alloc:
+++=======
++ err_cpuhp:
+++>>>>>>> 4df4cb9e99f8 (x86/hyperv: Initialize clockevents earlier in CPU onlining)
+  	hv_synic_free();
++ err_alloc:
+  	hv_remove_vmbus_irq();
+  
+  	bus_unregister(&hv_bus);
+@@@ -2097,6 -2307,50 +2106,53 @@@ static void hv_crash_handler(struct pt_
+  	hyperv_cleanup();
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int hv_synic_suspend(void)
++ {
++ 	/*
++ 	 * When we reach here, all the non-boot CPUs have been offlined.
++ 	 * If we're in a legacy configuration where stimer Direct Mode is
++ 	 * not enabled, the stimers on the non-boot CPUs have been unbound
++ 	 * in hv_synic_cleanup() -> hv_stimer_legacy_cleanup() ->
++ 	 * hv_stimer_cleanup() -> clockevents_unbind_device().
++ 	 *
++ 	 * hv_synic_suspend() only runs on CPU0 with interrupts disabled.
++ 	 * Here we do not call hv_stimer_legacy_cleanup() on CPU0 because:
++ 	 * 1) it's unnecessary as interrupts remain disabled between
++ 	 * syscore_suspend() and syscore_resume(): see create_image() and
++ 	 * resume_target_kernel()
++ 	 * 2) the stimer on CPU0 is automatically disabled later by
++ 	 * syscore_suspend() -> timekeeping_suspend() -> tick_suspend() -> ...
++ 	 * -> clockevents_shutdown() -> ... -> hv_ce_shutdown()
++ 	 * 3) a warning would be triggered if we call
++ 	 * clockevents_unbind_device(), which may sleep, in an
++ 	 * interrupts-disabled context.
++ 	 */
++ 
++ 	hv_synic_disable_regs(0);
++ 
++ 	return 0;
++ }
++ 
++ static void hv_synic_resume(void)
++ {
++ 	hv_synic_enable_regs(0);
++ 
++ 	/*
++ 	 * Note: we don't need to call hv_stimer_init(0), because the timer
++ 	 * on CPU0 is not unbound in hv_synic_suspend(), and the timer is
++ 	 * automatically re-enabled in timekeeping_resume().
++ 	 */
++ }
++ 
++ /* The callbacks run only on CPU0, with irqs_disabled. */
++ static struct syscore_ops hv_synic_syscore_ops = {
++ 	.suspend = hv_synic_suspend,
++ 	.resume = hv_synic_resume,
++ };
++ 
+++>>>>>>> 4df4cb9e99f8 (x86/hyperv: Initialize clockevents earlier in CPU onlining)
+  static int __init hv_acpi_init(void)
+  {
+  	int ret, t;
+diff --cc include/linux/cpuhotplug.h
+index 91b93b171a60,4dcaea13b1f0..000000000000
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@@ -125,6 -127,9 +125,12 @@@ enum cpuhp_state 
+  	CPUHP_AP_MARCO_TIMER_STARTING,
+  	CPUHP_AP_MIPS_GIC_TIMER_STARTING,
+  	CPUHP_AP_ARC_TIMER_STARTING,
+++<<<<<<< HEAD
+++=======
++ 	CPUHP_AP_RISCV_TIMER_STARTING,
++ 	CPUHP_AP_CSKY_TIMER_STARTING,
++ 	CPUHP_AP_HYPERV_TIMER_STARTING,
+++>>>>>>> 4df4cb9e99f8 (x86/hyperv: Initialize clockevents earlier in CPU onlining)
+  	CPUHP_AP_KVM_STARTING,
+  	CPUHP_AP_KVM_ARM_VGIC_INIT_STARTING,
+  	CPUHP_AP_KVM_ARM_VGIC_STARTING,
+* Unmerged path drivers/clocksource/hyperv_timer.c
+* Unmerged path include/clocksource/hyperv_timer.h
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+index ccc4e18dddfe..019a71e78476 100644
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -380,6 +380,12 @@ void __init hyperv_init(void)
+ 	hypercall_msr.guest_physical_address = vmalloc_to_pfn(hv_hypercall_pg);
+ 	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+ 
++	/*
++	 * Ignore any errors in setting up stimer clockevents
++	 * as we can run with the LAPIC timer as a fallback.
++	 */
++	(void)hv_stimer_alloc();
++
+ 	hv_apic_init();
+ 
+ 	x86_init.pci.arch_init = hv_pci_init;
+* Unmerged path drivers/clocksource/hyperv_timer.c
+* Unmerged path drivers/hv/hv.c
+* Unmerged path drivers/hv/vmbus_drv.c
+* Unmerged path include/clocksource/hyperv_timer.h
+* Unmerged path include/linux/cpuhotplug.h
