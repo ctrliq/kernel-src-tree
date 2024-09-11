@@ -1,0 +1,741 @@
+RDMA/netdev: Fix netlink support in IPoIB
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Denis Drozdov <denisd@mellanox.com>
+commit 5d6b0cb3369df425de75c94c98eb3f1a86659022
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/5d6b0cb3.failed
+
+IPoIB netlink support was broken by the below commit since integrating
+the rdma_netdev support relies on an allocation flow for netdevs that
+was controlled by the ipoib driver while netdev's rtnl_newlink
+implementation assumes that the netdev will be allocated by netlink.
+Such situation leads to crash in __ipoib_device_add, once trying to
+reuse netlink device.
+
+This patch fixes the kernel oops for both mlx4 and mlx5
+devices triggered by the following command:
+
+Fixes: cd565b4b51e5 ("IB/IPoIB: Support acceleration options callbacks")
+	Signed-off-by: Denis Drozdov <denisd@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Feras Daoud <ferasda@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 5d6b0cb3369df425de75c94c98eb3f1a86659022)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+#	drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/verbs.c
+index 9d6beb948535,8ec7418e99f0..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -2344,3 -2621,49 +2344,52 @@@ void ib_drain_qp(struct ib_qp *qp
+  		ib_drain_rq(qp);
+  }
+  EXPORT_SYMBOL(ib_drain_qp);
+++<<<<<<< HEAD
+++=======
++ 
++ struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
++ 				     enum rdma_netdev_t type, const char *name,
++ 				     unsigned char name_assign_type,
++ 				     void (*setup)(struct net_device *))
++ {
++ 	struct rdma_netdev_alloc_params params;
++ 	struct net_device *netdev;
++ 	int rc;
++ 
++ 	if (!device->rdma_netdev_get_params)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	rc = device->rdma_netdev_get_params(device, port_num, type, &params);
++ 	if (rc)
++ 		return ERR_PTR(rc);
++ 
++ 	netdev = alloc_netdev_mqs(params.sizeof_priv, name, name_assign_type,
++ 				  setup, params.txqs, params.rxqs);
++ 	if (!netdev)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	return netdev;
++ }
++ EXPORT_SYMBOL(rdma_alloc_netdev);
++ 
++ int rdma_init_netdev(struct ib_device *device, u8 port_num,
++ 		     enum rdma_netdev_t type, const char *name,
++ 		     unsigned char name_assign_type,
++ 		     void (*setup)(struct net_device *),
++ 		     struct net_device *netdev)
++ {
++ 	struct rdma_netdev_alloc_params params;
++ 	int rc;
++ 
++ 	if (!device->rdma_netdev_get_params)
++ 		return -EOPNOTSUPP;
++ 
++ 	rc = device->rdma_netdev_get_params(device, port_num, type, &params);
++ 	if (rc)
++ 		return rc;
++ 
++ 	return params.initialize_rdma_netdev(device, port_num,
++ 					     netdev, params.param);
++ }
++ EXPORT_SYMBOL(rdma_init_netdev);
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 94512d9e8358,8baa75a705c5..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1989,52 -2115,20 +1989,69 @@@ static const struct net_device_ops ipoi
+  	.ndo_stop		 = ipoib_ib_dev_stop_default,
+  };
+  
+++<<<<<<< HEAD
+ +static struct net_device
+ +*ipoib_create_netdev_default(struct ib_device *hca,
+ +			     const char *name,
+ +			     unsigned char name_assign_type,
+ +			     void (*setup)(struct net_device *))
+ +{
+ +	struct net_device *dev;
+ +	struct rdma_netdev *rn;
+ +
+ +	dev = alloc_netdev((int)sizeof(struct rdma_netdev),
+ +			   name,
+ +			   name_assign_type, setup);
+ +	if (!dev)
+ +		return NULL;
+ +
+ +	rn = netdev_priv(dev);
+ +
+ +	rn->send = ipoib_send;
+ +	rn->attach_mcast = ipoib_mcast_attach;
+ +	rn->detach_mcast = ipoib_mcast_detach;
+ +	rn->free_rdma_netdev = free_netdev;
+ +	rn->hca = hca;
+ +
+ +	dev->netdev_ops = &ipoib_netdev_default_pf;
+ +
+ +	return dev;
+ +}
+ +
+ +static struct net_device *ipoib_get_netdev(struct ib_device *hca, u8 port,
+ +					   const char *name)
+ +{
+ +	struct net_device *dev;
+ +
+ +	if (hca->alloc_rdma_netdev) {
+ +		dev = hca->alloc_rdma_netdev(hca, port,
+ +					     RDMA_NETDEV_IPOIB, name,
+ +					     NET_NAME_UNKNOWN,
+ +					     ipoib_setup_common);
+ +		if (IS_ERR_OR_NULL(dev) && PTR_ERR(dev) != -EOPNOTSUPP)
+ +			return NULL;
+ +	}
+ +
+ +	if (!hca->alloc_rdma_netdev || PTR_ERR(dev) == -EOPNOTSUPP)
+ +		dev = ipoib_create_netdev_default(hca, name, NET_NAME_UNKNOWN,
+ +						  ipoib_setup_common);
+ +
+++=======
++ static struct net_device *ipoib_alloc_netdev(struct ib_device *hca, u8 port,
++ 					     const char *name)
++ {
++ 	struct net_device *dev;
++ 
++ 	dev = rdma_alloc_netdev(hca, port, RDMA_NETDEV_IPOIB, name,
++ 				NET_NAME_UNKNOWN, ipoib_setup_common);
++ 	if (!IS_ERR(dev) || PTR_ERR(dev) != -EOPNOTSUPP)
++ 		return dev;
++ 
++ 	dev = alloc_netdev(sizeof(struct rdma_netdev), name, NET_NAME_UNKNOWN,
++ 			   ipoib_setup_common);
++ 	if (!dev)
++ 		return ERR_PTR(-ENOMEM);
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  	return dev;
+  }
+  
+@@@ -2047,11 -2141,23 +2064,29 @@@ int ipoib_intf_init(struct ib_device *h
+  
+  	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+  	if (!priv)
+- 		return NULL;
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	dev = ipoib_get_netdev(hca, port, name);
+ +	if (!dev)
+ +		goto free_priv;
+++=======
++ 	priv->ca = hca;
++ 	priv->port = port;
++ 
++ 	rc = rdma_init_netdev(hca, port, RDMA_NETDEV_IPOIB, name,
++ 			      NET_NAME_UNKNOWN, ipoib_setup_common, dev);
++ 	if (rc) {
++ 		if (rc != -EOPNOTSUPP)
++ 			goto out;
++ 
++ 		dev->netdev_ops = &ipoib_netdev_default_pf;
++ 		rn->send = ipoib_send;
++ 		rn->attach_mcast = ipoib_mcast_attach;
++ 		rn->detach_mcast = ipoib_mcast_detach;
++ 		rn->hca = hca;
++ 	}
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  
+  	priv->rn_ops = dev->netdev_ops;
+  
+@@@ -2061,16 -2166,69 +2095,51 @@@
+  	else
+  		dev->netdev_ops	= &ipoib_netdev_ops_pf;
+  
+- 	rn = netdev_priv(dev);
+  	rn->clnt_priv = priv;
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Only the child register_netdev flows can handle priv_destructor
++ 	 * being set, so we force it to NULL here and handle manually until it
++ 	 * is safe to turn on.
++ 	 */
++ 	priv->next_priv_destructor = dev->priv_destructor;
++ 	dev->priv_destructor = NULL;
++ 
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  	ipoib_build_priv(dev);
+  
+- 	return priv;
+- free_priv:
++ 	return 0;
++ 
++ out:
+  	kfree(priv);
+- 	return NULL;
++ 	return rc;
++ }
++ 
++ struct net_device *ipoib_intf_alloc(struct ib_device *hca, u8 port,
++ 				    const char *name)
++ {
++ 	struct net_device *dev;
++ 	int rc;
++ 
++ 	dev = ipoib_alloc_netdev(hca, port, name);
++ 	if (IS_ERR(dev))
++ 		return dev;
++ 
++ 	rc = ipoib_intf_init(hca, port, name, dev);
++ 	if (rc) {
++ 		free_netdev(dev);
++ 		return ERR_PTR(rc);
++ 	}
++ 
++ 	/*
++ 	 * Upon success the caller must ensure ipoib_intf_free is called or
++ 	 * register_netdevice succeed'd and priv_destructor is set to
++ 	 * ipoib_intf_free.
++ 	 */
++ 	return dev;
+  }
+  
+ -void ipoib_intf_free(struct net_device *dev)
+ -{
+ -	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+ -	struct rdma_netdev *rn = netdev_priv(dev);
+ -
+ -	dev->priv_destructor = priv->next_priv_destructor;
+ -	if (dev->priv_destructor)
+ -		dev->priv_destructor(dev);
+ -
+ -	/*
+ -	 * There are some error flows around register_netdev failing that may
+ -	 * attempt to call priv_destructor twice, prevent that from happening.
+ -	 */
+ -	dev->priv_destructor = NULL;
+ -
+ -	/* unregister/destroy is very complicated. Make bugs more obvious. */
+ -	rn->clnt_priv = NULL;
+ -
+ -	kfree(priv);
+ -}
+ -
+  static ssize_t show_pkey(struct device *dev,
+  			 struct device_attribute *attr, char *buf)
+  {
+@@@ -2250,70 -2388,19 +2319,82 @@@ void ipoib_set_dev_features(struct ipoi
+  static struct net_device *ipoib_add_port(const char *format,
+  					 struct ib_device *hca, u8 port)
+  {
++ 	struct rtnl_link_ops *ops = ipoib_get_link_ops();
++ 	struct rdma_netdev_alloc_params params;
+  	struct ipoib_dev_priv *priv;
+ -	struct net_device *ndev;
+ -	int result;
+ +	struct ib_port_attr attr;
+ +	struct rdma_netdev *rn;
+ +	int result = -ENOMEM;
+ +
+++<<<<<<< HEAD
+ +	priv = ipoib_intf_alloc(hca, port, format);
+ +	if (!priv) {
+ +		pr_warn("%s, %d: ipoib_intf_alloc failed\n", hca->name, port);
+ +		goto alloc_mem_failed;
+ +	}
+  
+ +	SET_NETDEV_DEV(priv->dev, hca->dev.parent);
+ +	priv->dev->dev_id = port - 1;
+ +
+ +	result = ib_query_port(hca, port, &attr);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_port %d failed\n", hca->name, port);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	priv->max_ib_mtu = ib_mtu_enum_to_int(attr.max_mtu);
+ +
+ +	/* MTU will be reset when mcast join happens */
+ +	priv->dev->mtu  = IPOIB_UD_MTU(priv->max_ib_mtu);
+ +	priv->mcast_mtu  = priv->admin_mtu = priv->dev->mtu;
+ +	priv->dev->max_mtu = IPOIB_CM_MTU;
+ +
+ +	priv->dev->neigh_priv_len = sizeof(struct ipoib_neigh);
+ +
+ +	result = ib_query_pkey(hca, port, 0, &priv->pkey);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_pkey port %d failed (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	ipoib_set_dev_features(priv, hca);
+ +
+ +	/*
+ +	 * Set the full membership bit, so that we join the right
+ +	 * broadcast group, etc.
+ +	 */
+ +	priv->pkey |= 0x8000;
+ +
+ +	priv->dev->broadcast[8] = priv->pkey >> 8;
+ +	priv->dev->broadcast[9] = priv->pkey & 0xff;
+ +
+ +	result = ib_query_gid(hca, port, 0, &priv->local_gid, NULL);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_gid port %d failed (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw,
+ +	       sizeof(union ib_gid));
+ +	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ +
+ +	result = ipoib_dev_init(priv->dev, hca, port);
+ +	if (result) {
+ +		pr_warn("%s: failed to initialize port %d (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+ +	}
+++=======
++ 	ndev = ipoib_intf_alloc(hca, port, format);
++ 	if (IS_ERR(ndev)) {
++ 		pr_warn("%s, %d: ipoib_intf_alloc failed %ld\n", hca->name, port,
++ 			PTR_ERR(ndev));
++ 		return ndev;
++ 	}
++ 	priv = ipoib_priv(ndev);
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  
+  	INIT_IB_EVENT_HANDLER(&priv->event_handler,
+  			      priv->ca, ipoib_event);
+@@@ -2326,35 -2413,47 +2407,55 @@@
+  	if (result) {
+  		pr_warn("%s: couldn't register ipoib port %d; error %d\n",
+  			hca->name, port, result);
+ -
+ -		ipoib_parent_unregister_pre(ndev);
+ -		ipoib_intf_free(ndev);
+ -		free_netdev(ndev);
+ -
+ -		return ERR_PTR(result);
+ +		ipoib_parent_unregister_pre(priv->dev);
+ +		goto device_init_failed;
+  	}
+  
+++<<<<<<< HEAD
+ +	result = -ENOMEM;
+ +	if (ipoib_cm_add_mode_attr(priv->dev))
+++=======
++ 	if (hca->rdma_netdev_get_params) {
++ 		int rc = hca->rdma_netdev_get_params(hca, port,
++ 						     RDMA_NETDEV_IPOIB,
++ 						     &params);
++ 
++ 		if (!rc && ops->priv_size < params.sizeof_priv)
++ 			ops->priv_size = params.sizeof_priv;
++ 	}
++ 	/*
++ 	 * We cannot set priv_destructor before register_netdev because we
++ 	 * need priv to be always valid during the error flow to execute
++ 	 * ipoib_parent_unregister_pre(). Instead handle it manually and only
++ 	 * enter priv_destructor mode once we are completely registered.
++ 	 */
++ 	ndev->priv_destructor = ipoib_intf_free;
++ 
++ 	if (ipoib_cm_add_mode_attr(ndev))
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  		goto sysfs_failed;
+ -	if (ipoib_add_pkey_attr(ndev))
+ +	if (ipoib_add_pkey_attr(priv->dev))
+  		goto sysfs_failed;
+ -	if (ipoib_add_umcast_attr(ndev))
+ +	if (ipoib_add_umcast_attr(priv->dev))
+  		goto sysfs_failed;
+ -	if (device_create_file(&ndev->dev, &dev_attr_create_child))
+ +	if (device_create_file(&priv->dev->dev, &dev_attr_create_child))
+  		goto sysfs_failed;
+ -	if (device_create_file(&ndev->dev, &dev_attr_delete_child))
+ +	if (device_create_file(&priv->dev->dev, &dev_attr_delete_child))
+  		goto sysfs_failed;
+  
+ -	return ndev;
+ +	return priv->dev;
+  
+  sysfs_failed:
+ -	ipoib_parent_unregister_pre(ndev);
+ -	unregister_netdev(ndev);
+ -	return ERR_PTR(-ENOMEM);
+ +	ipoib_parent_unregister_pre(priv->dev);
+ +	unregister_netdev(priv->dev);
+ +
+ +device_init_failed:
+ +	rn = netdev_priv(priv->dev);
+ +	rn->free_rdma_netdev(priv->dev);
+ +	kfree(priv);
+ +
+ +alloc_mem_failed:
+ +	return ERR_PTR(result);
+  }
+  
+  static void ipoib_add_one(struct ib_device *device)
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+index 3e44087935ae,38c984d16996..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+@@@ -122,36 -122,28 +122,52 @@@ static int ipoib_new_child_link(struct 
+  	} else
+  		child_pkey  = nla_get_u16(data[IFLA_IPOIB_PKEY]);
+  
+++<<<<<<< HEAD
+ +	if (child_pkey == 0 || child_pkey == 0x8000)
+ +		return -EINVAL;
+ +
+ +	/*
+ +	 * Set the full membership bit, so that we join the right
+ +	 * broadcast group, etc.
+ +	 */
+ +	child_pkey |= 0x8000;
+++=======
++ 	err = ipoib_intf_init(ppriv->ca, ppriv->port, dev->name, dev);
++ 	if (err) {
++ 		ipoib_warn(ppriv, "failed to initialize pkey device\n");
++ 		return err;
++ 	}
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  
+  	err = __ipoib_vlan_add(ppriv, ipoib_priv(dev),
+  			       child_pkey, IPOIB_RTNL_CHILD);
++ 	if (err)
++ 		return err;
+  
+- 	if (!err && data)
++ 	if (data) {
+  		err = ipoib_changelink(dev, tb, data, extack);
+- 	return err;
++ 		if (err) {
++ 			unregister_netdevice(dev);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	return 0;
+  }
+  
+ +static void ipoib_unregister_child_dev(struct net_device *dev, struct list_head *head)
+ +{
+ +	struct ipoib_dev_priv *priv, *ppriv;
+ +
+ +	priv = ipoib_priv(dev);
+ +	ppriv = ipoib_priv(priv->parent);
+ +
+ +	down_write(&ppriv->vlan_rwsem);
+ +	unregister_netdevice_queue(dev, head);
+ +	list_del(&priv->list);
+ +	up_write(&ppriv->vlan_rwsem);
+ +}
+ +
+  static size_t ipoib_get_size(const struct net_device *dev)
+  {
+  	return nla_total_size(2) +	/* IFLA_IPOIB_PKEY   */
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index b62ab85c8ead,8ac8e18fbe0c..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@@ -50,40 -50,91 +50,111 @@@ static ssize_t show_parent(struct devic
+  }
+  static DEVICE_ATTR(parent, S_IRUGO, show_parent, NULL);
+  
+++<<<<<<< HEAD
+++=======
++ static bool is_child_unique(struct ipoib_dev_priv *ppriv,
++ 			    struct ipoib_dev_priv *priv)
++ {
++ 	struct ipoib_dev_priv *tpriv;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	/*
++ 	 * Since the legacy sysfs interface uses pkey for deletion it cannot
++ 	 * support more than one interface with the same pkey, it creates
++ 	 * ambiguity.  The RTNL interface deletes using the netdev so it does
++ 	 * not have a problem to support duplicated pkeys.
++ 	 */
++ 	if (priv->child_type != IPOIB_LEGACY_CHILD)
++ 		return true;
++ 
++ 	/*
++ 	 * First ensure this isn't a duplicate. We check the parent device and
++ 	 * then all of the legacy child interfaces to make sure the Pkey
++ 	 * doesn't match.
++ 	 */
++ 	if (ppriv->pkey == priv->pkey)
++ 		return false;
++ 
++ 	list_for_each_entry(tpriv, &ppriv->child_intfs, list) {
++ 		if (tpriv->pkey == priv->pkey &&
++ 		    tpriv->child_type == IPOIB_LEGACY_CHILD)
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ /*
++  * NOTE: If this function fails then the priv->dev will remain valid, however
++  * priv will have been freed and must not be touched by caller in the error
++  * case.
++  *
++  * If (ndev->reg_state == NETREG_UNINITIALIZED) then it is up to the caller to
++  * free the net_device (just as rtnl_newlink does) otherwise the net_device
++  * will be freed when the rtnl is unlocked.
++  */
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  int __ipoib_vlan_add(struct ipoib_dev_priv *ppriv, struct ipoib_dev_priv *priv,
+  		     u16 pkey, int type)
+  {
+ -	struct net_device *ndev = priv->dev;
+  	int result;
+  
+++<<<<<<< HEAD
+ +	priv->max_ib_mtu = ppriv->max_ib_mtu;
+ +	/* MTU will be reset when mcast join happens */
+ +	priv->dev->mtu   = IPOIB_UD_MTU(priv->max_ib_mtu);
+ +	priv->mcast_mtu  = priv->admin_mtu = priv->dev->mtu;
+++=======
++ 	ASSERT_RTNL();
++ 
++ 	/*
++ 	 * We do not need to touch priv if register_netdevice fails, so just
++ 	 * always use this flow.
++ 	 */
++ 	ndev->priv_destructor = ipoib_intf_free;
++ 
++ 	/*
++ 	 * Racing with unregister of the parent must be prevented by the
++ 	 * caller.
++ 	 */
++ 	WARN_ON(ppriv->dev->reg_state != NETREG_REGISTERED);
++ 
++ 	if (pkey == 0 || pkey == 0x8000) {
++ 		result = -EINVAL;
++ 		goto out_early;
++ 	}
++ 
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  	priv->parent = ppriv->dev;
+ +	set_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags);
+ +
+ +	ipoib_set_dev_features(priv, ppriv->ca);
+ +
+  	priv->pkey = pkey;
+ -	priv->child_type = type;
+  
+ -	if (!is_child_unique(ppriv, priv)) {
+ -		result = -ENOTUNIQ;
+ -		goto out_early;
+ +	memcpy(priv->dev->dev_addr, ppriv->dev->dev_addr, INFINIBAND_ALEN);
+ +	memcpy(&priv->local_gid, &ppriv->local_gid, sizeof(priv->local_gid));
+ +	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ +	priv->dev->broadcast[8] = pkey >> 8;
+ +	priv->dev->broadcast[9] = pkey & 0xff;
+ +
+ +	result = ipoib_dev_init(priv->dev, ppriv->ca, ppriv->port);
+ +	if (result < 0) {
+ +		ipoib_warn(ppriv, "failed to initialize subinterface: "
+ +			   "device %s, port %d",
+ +			   ppriv->ca->name, ppriv->port);
+ +		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	result = register_netdevice(priv->dev);
+++=======
++ 	result = register_netdevice(ndev);
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  	if (result) {
+  		ipoib_warn(priv, "failed to initialize; error %i", result);
+ -
+ -		/*
+ -		 * register_netdevice sometimes calls priv_destructor,
+ -		 * sometimes not. Make sure it was done.
+ -		 */
+ -		goto out_early;
+ +		goto err;
+  	}
+  
+  	/* RTNL childs don't need proprietary sysfs entries */
+@@@ -122,54 -172,25 +193,63 @@@ int ipoib_vlan_add(struct net_device *p
+  	if (!capable(CAP_NET_ADMIN))
+  		return -EPERM;
+  
+ -	if (!rtnl_trylock())
+ +	ppriv = ipoib_priv(pdev);
+ +
+ +	snprintf(intf_name, sizeof(intf_name), "%s.%04x",
+ +		 ppriv->dev->name, pkey);
+ +
+++<<<<<<< HEAD
+ +	if (!mutex_trylock(&ppriv->sysfs_mutex))
+  		return restart_syscall();
+  
+ +	if (!rtnl_trylock()) {
+ +		mutex_unlock(&ppriv->sysfs_mutex);
+ +		return restart_syscall();
+ +	}
+ +
+  	if (pdev->reg_state != NETREG_REGISTERED) {
+  		rtnl_unlock();
+ +		mutex_unlock(&ppriv->sysfs_mutex);
+  		return -EPERM;
+  	}
+  
+ -	ppriv = ipoib_priv(pdev);
+ +	if (!down_write_trylock(&ppriv->vlan_rwsem)) {
+ +		rtnl_unlock();
+ +		mutex_unlock(&ppriv->sysfs_mutex);
+ +		return restart_syscall();
+ +	}
+  
+ -	snprintf(intf_name, sizeof(intf_name), "%s.%04x",
+ -		 ppriv->dev->name, pkey);
+ +	priv = ipoib_intf_alloc(ppriv->ca, ppriv->port, intf_name);
+ +	if (!priv) {
+ +		result = -ENOMEM;
+ +		goto out;
+ +	}
+  
+ +	/*
+ +	 * First ensure this isn't a duplicate. We check the parent device and
+ +	 * then all of the legacy child interfaces to make sure the Pkey
+ +	 * doesn't match.
+ +	 */
+ +	if (ppriv->pkey == pkey) {
+ +		result = -ENOTUNIQ;
+ +		goto out;
+ +	}
+ +
+ +	list_for_each_entry(tpriv, &ppriv->child_intfs, list) {
+ +		if (tpriv->pkey == pkey &&
+ +		    tpriv->child_type == IPOIB_LEGACY_CHILD) {
+ +			result = -ENOTUNIQ;
+ +			goto out;
+ +		}
+ +	}
+++=======
++ 	ndev = ipoib_intf_alloc(ppriv->ca, ppriv->port, intf_name);
++ 	if (IS_ERR(ndev)) {
++ 		result = PTR_ERR(ndev);
++ 		goto out;
++ 	}
++ 	priv = ipoib_priv(ndev);
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  
+  	result = __ipoib_vlan_add(ppriv, priv, pkey, IPOIB_LEGACY_CHILD);
+  
+diff --cc include/rdma/ib_verbs.h
+index 1760f50c20d6,0ed5d913a492..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -4086,4 -4189,20 +4086,23 @@@ ib_get_vector_affinity(struct ib_devic
+   */
+  void rdma_roce_rescan_device(struct ib_device *ibdev);
+  
+++<<<<<<< HEAD
+++=======
++ struct ib_ucontext *ib_uverbs_get_ucontext(struct ib_uverbs_file *ufile);
++ 
++ int uverbs_destroy_def_handler(struct ib_uverbs_file *file,
++ 			       struct uverbs_attr_bundle *attrs);
++ 
++ struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
++ 				     enum rdma_netdev_t type, const char *name,
++ 				     unsigned char name_assign_type,
++ 				     void (*setup)(struct net_device *));
++ 
++ int rdma_init_netdev(struct ib_device *device, u8 port_num,
++ 		     enum rdma_netdev_t type, const char *name,
++ 		     unsigned char name_assign_type,
++ 		     void (*setup)(struct net_device *),
++ 		     struct net_device *netdev);
++ 
+++>>>>>>> 5d6b0cb3369d (RDMA/netdev: Fix netlink support in IPoIB)
+  #endif /* IB_VERBS_H */
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 44bce3b18901..3a63be76f103 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -491,8 +491,10 @@ void ipoib_reap_ah(struct work_struct *work);
+ struct ipoib_path *__path_find(struct net_device *dev, void *gid);
+ void ipoib_mark_paths_invalid(struct net_device *dev);
+ void ipoib_flush_paths(struct net_device *dev);
+-struct ipoib_dev_priv *ipoib_intf_alloc(struct ib_device *hca, u8 port,
+-					const char *format);
++struct net_device *ipoib_intf_alloc(struct ib_device *hca, u8 port,
++				    const char *format);
++int ipoib_intf_init(struct ib_device *hca, u8 port, const char *format,
++		    struct net_device *dev);
+ void ipoib_ib_tx_timer_func(struct timer_list *t);
+ void ipoib_ib_dev_flush_light(struct work_struct *work);
+ void ipoib_ib_dev_flush_normal(struct work_struct *work);
+@@ -525,6 +527,8 @@ int ipoib_dma_map_tx(struct ib_device *ca, struct ipoib_tx_buf *tx_req);
+ void ipoib_dma_unmap_tx(struct ipoib_dev_priv *priv,
+ 			struct ipoib_tx_buf *tx_req);
+ 
++struct rtnl_link_ops *ipoib_get_link_ops(void);
++
+ static inline void ipoib_build_sge(struct ipoib_dev_priv *priv,
+ 				   struct ipoib_tx_buf *tx_req)
+ {
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_netlink.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+* Unmerged path include/rdma/ib_verbs.h
