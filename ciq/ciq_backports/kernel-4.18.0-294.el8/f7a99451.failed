@@ -1,0 +1,338 @@
+no need to protect against put_user_ns(NULL)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit f7a9945184100b531f0de3b12c617a349236dd8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f7a99451.failed
+
+it's a no-op
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit f7a9945184100b531f0de3b12c617a349236dd8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/resctrl/rdtgroup.c
+#	fs/sysfs/mount.c
+#	kernel/cgroup/cgroup.c
+diff --cc arch/x86/kernel/cpu/resctrl/rdtgroup.c
+index 4e1b31406e0d,68bd609026e6..000000000000
+--- a/arch/x86/kernel/cpu/resctrl/rdtgroup.c
++++ b/arch/x86/kernel/cpu/resctrl/rdtgroup.c
+@@@ -2157,8 -2033,85 +2157,87 @@@ out
+  	rdt_last_cmd_clear();
+  	mutex_unlock(&rdtgroup_mutex);
+  	cpus_read_unlock();
+ -	return ret;
+ -}
+  
+++<<<<<<< HEAD
+ +	return dentry;
+++=======
++ enum rdt_param {
++ 	Opt_cdp,
++ 	Opt_cdpl2,
++ 	Opt_mba_mbps,
++ 	nr__rdt_params
++ };
++ 
++ static const struct fs_parameter_spec rdt_param_specs[] = {
++ 	fsparam_flag("cdp",		Opt_cdp),
++ 	fsparam_flag("cdpl2",		Opt_cdpl2),
++ 	fsparam_flag("mba_MBps",	Opt_mba_mbps),
++ 	{}
++ };
++ 
++ static const struct fs_parameter_description rdt_fs_parameters = {
++ 	.name		= "rdt",
++ 	.specs		= rdt_param_specs,
++ };
++ 
++ static int rdt_parse_param(struct fs_context *fc, struct fs_parameter *param)
++ {
++ 	struct rdt_fs_context *ctx = rdt_fc2context(fc);
++ 	struct fs_parse_result result;
++ 	int opt;
++ 
++ 	opt = fs_parse(fc, &rdt_fs_parameters, param, &result);
++ 	if (opt < 0)
++ 		return opt;
++ 
++ 	switch (opt) {
++ 	case Opt_cdp:
++ 		ctx->enable_cdpl3 = true;
++ 		return 0;
++ 	case Opt_cdpl2:
++ 		ctx->enable_cdpl2 = true;
++ 		return 0;
++ 	case Opt_mba_mbps:
++ 		if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
++ 			return -EINVAL;
++ 		ctx->enable_mba_mbps = true;
++ 		return 0;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ static void rdt_fs_context_free(struct fs_context *fc)
++ {
++ 	struct rdt_fs_context *ctx = rdt_fc2context(fc);
++ 
++ 	kernfs_free_fs_context(fc);
++ 	kfree(ctx);
++ }
++ 
++ static const struct fs_context_operations rdt_fs_context_ops = {
++ 	.free		= rdt_fs_context_free,
++ 	.parse_param	= rdt_parse_param,
++ 	.get_tree	= rdt_get_tree,
++ };
++ 
++ static int rdt_init_fs_context(struct fs_context *fc)
++ {
++ 	struct rdt_fs_context *ctx;
++ 
++ 	ctx = kzalloc(sizeof(struct rdt_fs_context), GFP_KERNEL);
++ 	if (!ctx)
++ 		return -ENOMEM;
++ 
++ 	ctx->kfc.root = rdt_root;
++ 	ctx->kfc.magic = RDTGROUP_SUPER_MAGIC;
++ 	fc->fs_private = &ctx->kfc;
++ 	fc->ops = &rdt_fs_context_ops;
++ 	put_user_ns(fc->user_ns);
++ 	fc->user_ns = get_user_ns(&init_user_ns);
++ 	fc->global = true;
++ 	return 0;
+++>>>>>>> f7a994518410 (no need to protect against put_user_ns(NULL))
+  }
+  
+  static int reset_all_ctrls(struct rdt_resource *r)
+diff --cc fs/sysfs/mount.c
+index 92682fcc41f6,db81cfbab9d6..000000000000
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@@ -20,27 -23,60 +20,41 @@@
+  static struct kernfs_root *sysfs_root;
+  struct kernfs_node *sysfs_root_kn;
+  
+ -static int sysfs_get_tree(struct fs_context *fc)
+ +static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+  {
+ -	struct kernfs_fs_context *kfc = fc->fs_private;
+ -	int ret;
+ +	struct dentry *root;
+ +	void *ns;
+ +	bool new_sb = false;
+  
+ -	ret = kernfs_get_tree(fc);
+ -	if (ret)
+ -		return ret;
+ -
+ -	if (kfc->new_sb_created)
+ -		fc->root->d_sb->s_iflags |= SB_I_USERNS_VISIBLE;
+ -	return 0;
+ -}
+ -
+ -static void sysfs_fs_context_free(struct fs_context *fc)
+ -{
+ -	struct kernfs_fs_context *kfc = fc->fs_private;
+ -
+ -	if (kfc->ns_tag)
+ -		kobj_ns_drop(KOBJ_NS_TYPE_NET, kfc->ns_tag);
+ -	kernfs_free_fs_context(fc);
+ -	kfree(kfc);
+ -}
+ -
+ -static const struct fs_context_operations sysfs_fs_context_ops = {
+ -	.free		= sysfs_fs_context_free,
+ -	.get_tree	= sysfs_get_tree,
+ -};
+ -
+ -static int sysfs_init_fs_context(struct fs_context *fc)
+ -{
+ -	struct kernfs_fs_context *kfc;
+ -	struct net *netns;
+ -
+ -	if (!(fc->sb_flags & SB_KERNMOUNT)) {
+ +	if (!(flags & SB_KERNMOUNT)) {
+  		if (!kobj_ns_current_may_mount(KOBJ_NS_TYPE_NET))
+ -			return -EPERM;
+ +			return ERR_PTR(-EPERM);
+  	}
+  
+ -	kfc = kzalloc(sizeof(struct kernfs_fs_context), GFP_KERNEL);
+ -	if (!kfc)
+ -		return -ENOMEM;
+ -
+ +	ns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
+ +	root = kernfs_mount_ns(fs_type, flags, sysfs_root,
+ +				SYSFS_MAGIC, &new_sb, ns);
+ +	if (!new_sb)
+ +		kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
+ +	else if (!IS_ERR(root))
+ +		root->d_sb->s_iflags |= SB_I_USERNS_VISIBLE;
+ +
+++<<<<<<< HEAD
+ +	return root;
+++=======
++ 	kfc->ns_tag = netns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
++ 	kfc->root = sysfs_root;
++ 	kfc->magic = SYSFS_MAGIC;
++ 	fc->fs_private = kfc;
++ 	fc->ops = &sysfs_fs_context_ops;
++ 	if (netns) {
++ 		put_user_ns(fc->user_ns);
++ 		fc->user_ns = get_user_ns(netns->user_ns);
++ 	}
++ 	fc->global = true;
++ 	return 0;
+++>>>>>>> f7a994518410 (no need to protect against put_user_ns(NULL))
+  }
+  
+  static void sysfs_kill_sb(struct super_block *sb)
+diff --cc kernel/cgroup/cgroup.c
+index 9e08519ae6db,bbcdd3457eb0..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -2038,57 -2101,93 +2038,78 @@@ struct dentry *cgroup_do_mount(struct f
+  		mutex_unlock(&cgroup_mutex);
+  
+  		nsdentry = kernfs_node_dentry(cgrp->kn, sb);
+ -		dput(fc->root);
+ -		fc->root = nsdentry;
+ -		if (IS_ERR(nsdentry)) {
+ -			ret = PTR_ERR(nsdentry);
+ +		dput(dentry);
+ +		if (IS_ERR(nsdentry))
+  			deactivate_locked_super(sb);
+ -		}
+ +		dentry = nsdentry;
+  	}
+  
+ -	if (!ctx->kfc.new_sb_created)
+ -		cgroup_put(&ctx->root->cgrp);
+ -
+ -	return ret;
+ -}
+ -
+ -/*
+ - * Destroy a cgroup filesystem context.
+ - */
+ -static void cgroup_fs_context_free(struct fs_context *fc)
+ -{
+ -	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+ +	if (!new_sb)
+ +		cgroup_put(&root->cgrp);
+  
+ -	kfree(ctx->name);
+ -	kfree(ctx->release_agent);
+ -	put_cgroup_ns(ctx->ns);
+ -	kernfs_free_fs_context(fc);
+ -	kfree(ctx);
+ +	return dentry;
+  }
+  
+ -static int cgroup_get_tree(struct fs_context *fc)
+ +static struct dentry *cgroup_mount(struct file_system_type *fs_type,
+ +			 int flags, const char *unused_dev_name,
+ +			 void *data)
+  {
+ -	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+ +	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
+ +	struct dentry *dentry;
+  	int ret;
+  
+ -	cgrp_dfl_visible = true;
+ -	cgroup_get_live(&cgrp_dfl_root.cgrp);
+ -	ctx->root = &cgrp_dfl_root;
+ +	get_cgroup_ns(ns);
+  
+ -	ret = cgroup_do_get_tree(fc);
+ -	if (!ret)
+ -		apply_cgroup_root_flags(ctx->flags);
+ -	return ret;
+ -}
+ +	/* Check if the caller has permission to mount. */
+ +	if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN)) {
+ +		put_cgroup_ns(ns);
+ +		return ERR_PTR(-EPERM);
+ +	}
+  
+ -static const struct fs_context_operations cgroup_fs_context_ops = {
+ -	.free		= cgroup_fs_context_free,
+ -	.parse_param	= cgroup2_parse_param,
+ -	.get_tree	= cgroup_get_tree,
+ -	.reconfigure	= cgroup_reconfigure,
+ -};
+ +	if (fs_type == &cgroup2_fs_type) {
+ +		unsigned int root_flags;
+  
+ -static const struct fs_context_operations cgroup1_fs_context_ops = {
+ -	.free		= cgroup_fs_context_free,
+ -	.parse_param	= cgroup1_parse_param,
+ -	.get_tree	= cgroup1_get_tree,
+ -	.reconfigure	= cgroup1_reconfigure,
+ -};
+ +		ret = parse_cgroup_root_flags(data, &root_flags);
+ +		if (ret) {
+ +			put_cgroup_ns(ns);
+ +			return ERR_PTR(ret);
+ +		}
+  
+ -/*
+ - * Initialise the cgroup filesystem creation/reconfiguration context.  Notably,
+ - * we select the namespace we're going to use.
+ - */
+ -static int cgroup_init_fs_context(struct fs_context *fc)
+ -{
+ -	struct cgroup_fs_context *ctx;
+ +		cgrp_dfl_visible = true;
+ +		cgroup_get_live(&cgrp_dfl_root.cgrp);
+  
+ -	ctx = kzalloc(sizeof(struct cgroup_fs_context), GFP_KERNEL);
+ -	if (!ctx)
+ -		return -ENOMEM;
+ +		dentry = cgroup_do_mount(&cgroup2_fs_type, flags, &cgrp_dfl_root,
+ +					 CGROUP2_SUPER_MAGIC, ns);
+ +		if (!IS_ERR(dentry))
+ +			apply_cgroup_root_flags(root_flags);
+ +	} else {
+ +		dentry = cgroup1_mount(&cgroup_fs_type, flags, data,
+ +				       CGROUP_SUPER_MAGIC, ns);
+ +	}
+  
+++<<<<<<< HEAD
+ +	put_cgroup_ns(ns);
+ +	return dentry;
+++=======
++ 	/*
++ 	 * The first time anyone tries to mount a cgroup, enable the list
++ 	 * linking each css_set to its tasks and fix up all existing tasks.
++ 	 */
++ 	if (!use_task_css_set_links)
++ 		cgroup_enable_task_cg_lists();
++ 
++ 	ctx->ns = current->nsproxy->cgroup_ns;
++ 	get_cgroup_ns(ctx->ns);
++ 	fc->fs_private = &ctx->kfc;
++ 	if (fc->fs_type == &cgroup2_fs_type)
++ 		fc->ops = &cgroup_fs_context_ops;
++ 	else
++ 		fc->ops = &cgroup1_fs_context_ops;
++ 	put_user_ns(fc->user_ns);
++ 	fc->user_ns = get_user_ns(ctx->ns->user_ns);
++ 	fc->global = true;
++ 	return 0;
+++>>>>>>> f7a994518410 (no need to protect against put_user_ns(NULL))
+  }
+  
+  static void cgroup_kill_sb(struct super_block *sb)
+* Unmerged path arch/x86/kernel/cpu/resctrl/rdtgroup.c
+* Unmerged path fs/sysfs/mount.c
+* Unmerged path kernel/cgroup/cgroup.c
