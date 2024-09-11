@@ -38,6 +38,18 @@ static RADIX_TREE(token_req_tree, GFP_ATOMIC);
 static DEFINE_SPINLOCK(token_tree_lock);
 static int token_used __read_mostly;
 
+static void mptcp_crypto_key_gen_sha(u64 *key, u32 *token, u64 *idsn)
+{
+	/* we might consider a faster version that computes the key as a
+	 * hash of some information available in the MPTCP socket. Use
+	 * random data at the moment, as it's probably the safest option
+	 * in case multiple sockets are opened in different namespaces at
+	 * the same time.
+	 */
+	get_random_bytes(key, sizeof(u64));
+	mptcp_crypto_key_sha(*key, token, idsn);
+}
+
 /**
  * mptcp_token_new_request - create new key/idsn/token for subflow_request
  * @req: the request socket
