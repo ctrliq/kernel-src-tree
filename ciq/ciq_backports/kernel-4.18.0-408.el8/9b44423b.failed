@@ -1,0 +1,119 @@
+KVM: VMX: Dont' send posted IRQ if vCPU == this vCPU and vCPU is IN_GUEST_MODE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Wanpeng Li <wanpengli@tencent.com>
+commit 9b44423bf4c8570834679879a8d26928d9e962e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/9b44423b.failed
+
+When delivering a virtual interrupt, don't actually send a posted interrupt
+if the target vCPU is also the currently running vCPU and is IN_GUEST_MODE,
+in which case the interrupt is being sent from a VM-Exit fastpath and the
+core run loop in vcpu_enter_guest() will manually move the interrupt from
+the PIR to vmcs.GUEST_RVI.  IRQs are disabled while IN_GUEST_MODE, thus
+there's no possibility of the virtual interrupt being sent from anything
+other than KVM, i.e. KVM won't suppress a wake event from an IRQ handler
+(see commit fdba608f15e2, "KVM: VMX: Wake vCPU when delivering posted IRQ
+even if vCPU == this vCPU").
+
+Eliding the posted interrupt restores the performance provided by the
+combination of commits 379a3c8ee444 ("KVM: VMX: Optimize posted-interrupt
+delivery for timer fastpath") and 26efe2fd92e5 ("KVM: VMX: Handle
+preemption timer fastpath").
+
+Thanks Sean for better comments.
+
+	Suggested-by: Chao Gao <chao.gao@intel.com>
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Wanpeng Li <wanpengli@tencent.com>
+Message-Id: <1643111979-36447-1-git-send-email-wanpengli@tencent.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9b44423bf4c8570834679879a8d26928d9e962e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 7cd9c365cee6,a40130e5b55d..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -3930,43 -3931,48 +3930,50 @@@ static void vmx_msr_filter_changed(stru
+  	pt_update_intercept_for_msr(vcpu);
+  }
+  
+ -static inline void kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu,
+ -						     int pi_vec)
+ +static inline bool kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu,
+ +						     bool nested)
+  {
+  #ifdef CONFIG_SMP
+ +	int pi_vec = nested ? POSTED_INTR_NESTED_VECTOR : POSTED_INTR_VECTOR;
+ +
+  	if (vcpu->mode == IN_GUEST_MODE) {
+  		/*
+- 		 * The vector of interrupt to be delivered to vcpu had
+- 		 * been set in PIR before this function.
++ 		 * The vector of the virtual has already been set in the PIR.
++ 		 * Send a notification event to deliver the virtual interrupt
++ 		 * unless the vCPU is the currently running vCPU, i.e. the
++ 		 * event is being sent from a fastpath VM-Exit handler, in
++ 		 * which case the PIR will be synced to the vIRR before
++ 		 * re-entering the guest.
+  		 *
+- 		 * Following cases will be reached in this block, and
+- 		 * we always send a notification event in all cases as
+- 		 * explained below.
++ 		 * When the target is not the running vCPU, the following
++ 		 * possibilities emerge:
+  		 *
+- 		 * Case 1: vcpu keeps in non-root mode. Sending a
+- 		 * notification event posts the interrupt to vcpu.
++ 		 * Case 1: vCPU stays in non-root mode. Sending a notification
++ 		 * event posts the interrupt to the vCPU.
+  		 *
+- 		 * Case 2: vcpu exits to root mode and is still
+- 		 * runnable. PIR will be synced to vIRR before the
+- 		 * next vcpu entry. Sending a notification event in
+- 		 * this case has no effect, as vcpu is not in root
+- 		 * mode.
++ 		 * Case 2: vCPU exits to root mode and is still runnable. The
++ 		 * PIR will be synced to the vIRR before re-entering the guest.
++ 		 * Sending a notification event is ok as the host IRQ handler
++ 		 * will ignore the spurious event.
+  		 *
+- 		 * Case 3: vcpu exits to root mode and is blocked.
+- 		 * vcpu_block() has already synced PIR to vIRR and
+- 		 * never blocks vcpu if vIRR is not cleared. Therefore,
+- 		 * a blocked vcpu here does not wait for any requested
+- 		 * interrupts in PIR, and sending a notification event
+- 		 * which has no effect is safe here.
++ 		 * Case 3: vCPU exits to root mode and is blocked. vcpu_block()
++ 		 * has already synced PIR to vIRR and never blocks the vCPU if
++ 		 * the vIRR is not empty. Therefore, a blocked vCPU here does
++ 		 * not wait for any requested interrupts in PIR, and sending a
++ 		 * notification event also results in a benign, spurious event.
+  		 */
+  
+++<<<<<<< HEAD
+ +		apic->send_IPI_mask(get_cpu_mask(vcpu->cpu), pi_vec);
+ +		return true;
+++=======
++ 		if (vcpu != kvm_get_running_vcpu())
++ 			apic->send_IPI_mask(get_cpu_mask(vcpu->cpu), pi_vec);
++ 		return;
+++>>>>>>> 9b44423bf4c8 (KVM: VMX: Dont' send posted IRQ if vCPU == this vCPU and vCPU is IN_GUEST_MODE)
+  	}
+  #endif
+ -	/*
+ -	 * The vCPU isn't in the guest; wake the vCPU in case it is blocking,
+ -	 * otherwise do nothing as KVM will grab the highest priority pending
+ -	 * IRQ via ->sync_pir_to_irr() in vcpu_enter_guest().
+ -	 */
+ -	kvm_vcpu_wake_up(vcpu);
+ +	return false;
+  }
+  
+  static int vmx_deliver_nested_posted_interrupt(struct kvm_vcpu *vcpu,
+* Unmerged path arch/x86/kvm/vmx/vmx.c
