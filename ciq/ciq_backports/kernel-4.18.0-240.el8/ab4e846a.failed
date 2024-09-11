@@ -1,0 +1,246 @@
+tcp: annotate sk->sk_wmem_queued lockless reads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit ab4e846a82d0ae00176de19f2db3c5c64f8eb5f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ab4e846a.failed
+
+For the sake of tcp_poll(), there are few places where we fetch
+sk->sk_wmem_queued while this field can change from IRQ or other cpu.
+
+We need to add READ_ONCE() annotations, and also make sure write
+sides use corresponding WRITE_ONCE() to avoid store-tearing.
+
+sk_wmem_queued_add() helper is added so that we can in
+the future convert to ADD_ONCE() or equivalent if/when
+available.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ab4e846a82d0ae00176de19f2db3c5c64f8eb5f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+#	include/trace/events/sock.h
+diff --cc include/net/sock.h
+index 7ce24998f0e7,f69b58bff7e5..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -929,7 -883,12 +929,16 @@@ static inline int sk_stream_min_wspace(
+  
+  static inline int sk_stream_wspace(const struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	return sk->sk_sndbuf - sk->sk_wmem_queued;
+++=======
++ 	return READ_ONCE(sk->sk_sndbuf) - READ_ONCE(sk->sk_wmem_queued);
++ }
++ 
++ static inline void sk_wmem_queued_add(struct sock *sk, int val)
++ {
++ 	WRITE_ONCE(sk->sk_wmem_queued, sk->sk_wmem_queued + val);
+++>>>>>>> ab4e846a82d0 (tcp: annotate sk->sk_wmem_queued lockless reads)
+  }
+  
+  void sk_stream_write_space(struct sock *sk);
+@@@ -1268,9 -1210,9 +1277,13 @@@ static inline void sk_refcnt_debug_rele
+  #define sk_refcnt_debug_release(sk) do { } while (0)
+  #endif /* SOCK_REFCNT_DEBUG */
+  
+ -static inline bool __sk_stream_memory_free(const struct sock *sk, int wake)
+ +static inline bool sk_stream_memory_free(const struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	if (sk->sk_wmem_queued >= sk->sk_sndbuf)
+++=======
++ 	if (READ_ONCE(sk->sk_wmem_queued) >= READ_ONCE(sk->sk_sndbuf))
+++>>>>>>> ab4e846a82d0 (tcp: annotate sk->sk_wmem_queued lockless reads)
+  		return false;
+  
+  	return sk->sk_prot->stream_memory_free ?
+@@@ -1519,8 -1471,15 +1532,8 @@@ static inline void sk_mem_uncharge(stru
+  static inline void sk_wmem_free_skb(struct sock *sk, struct sk_buff *skb)
+  {
+  	sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
+- 	sk->sk_wmem_queued -= skb->truesize;
++ 	sk_wmem_queued_add(sk, -skb->truesize);
+  	sk_mem_uncharge(sk, skb->truesize);
+ -	if (static_branch_unlikely(&tcp_tx_skb_cache_key) &&
+ -	    !sk->sk_tx_skb_cache && !skb_cloned(skb)) {
+ -		skb_zcopy_clear(skb, true);
+ -		sk->sk_tx_skb_cache = skb;
+ -		return;
+ -	}
+  	__kfree_skb(skb);
+  }
+  
+diff --cc include/trace/events/sock.h
+index f1d970c97422,51fe9f6719eb..000000000000
+--- a/include/trace/events/sock.h
++++ b/include/trace/events/sock.h
+@@@ -102,10 -113,13 +102,17 @@@ TRACE_EVENT(sock_exceed_buf_limit
+  		__entry->allocated = allocated;
+  		__entry->sysctl_rmem = sk_get_rmem0(sk, prot);
+  		__entry->rmem_alloc = atomic_read(&sk->sk_rmem_alloc);
+++<<<<<<< HEAD
+++=======
++ 		__entry->sysctl_wmem = sk_get_wmem0(sk, prot);
++ 		__entry->wmem_alloc = refcount_read(&sk->sk_wmem_alloc);
++ 		__entry->wmem_queued = READ_ONCE(sk->sk_wmem_queued);
++ 		__entry->kind = kind;
+++>>>>>>> ab4e846a82d0 (tcp: annotate sk->sk_wmem_queued lockless reads)
+  	),
+  
+ -	TP_printk("proto:%s sysctl_mem=%ld,%ld,%ld allocated=%ld sysctl_rmem=%d rmem_alloc=%d sysctl_wmem=%d wmem_alloc=%d wmem_queued=%d kind=%s",
+ +	TP_printk("proto:%s sysctl_mem=%ld,%ld,%ld allocated=%ld "
+ +		"sysctl_rmem=%d rmem_alloc=%d",
+  		__entry->name,
+  		__entry->sysctl_mem[0],
+  		__entry->sysctl_mem[1],
+* Unmerged path include/net/sock.h
+* Unmerged path include/trace/events/sock.h
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index 98a524a31eb3..83d84bb2adf2 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -641,7 +641,7 @@ int __zerocopy_sg_from_iter(struct sock *sk, struct sk_buff *skb,
+ 		skb->len += copied;
+ 		skb->truesize += truesize;
+ 		if (sk && sk->sk_type == SOCK_STREAM) {
+-			sk->sk_wmem_queued += truesize;
++			sk_wmem_queued_add(sk, truesize);
+ 			sk_mem_charge(sk, truesize);
+ 		} else {
+ 			refcount_add(truesize, &skb->sk->sk_wmem_alloc);
+diff --git a/net/core/sock.c b/net/core/sock.c
+index b6c8c5efd981..bb41594bad25 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -3139,7 +3139,7 @@ void sk_get_meminfo(const struct sock *sk, u32 *mem)
+ 	mem[SK_MEMINFO_WMEM_ALLOC] = sk_wmem_alloc_get(sk);
+ 	mem[SK_MEMINFO_SNDBUF] = sk->sk_sndbuf;
+ 	mem[SK_MEMINFO_FWD_ALLOC] = sk->sk_forward_alloc;
+-	mem[SK_MEMINFO_WMEM_QUEUED] = sk->sk_wmem_queued;
++	mem[SK_MEMINFO_WMEM_QUEUED] = READ_ONCE(sk->sk_wmem_queued);
+ 	mem[SK_MEMINFO_OPTMEM] = atomic_read(&sk->sk_omem_alloc);
+ 	mem[SK_MEMINFO_BACKLOG] = sk->sk_backlog.len;
+ 	mem[SK_MEMINFO_DROPS] = atomic_read(&sk->sk_drops);
+diff --git a/net/ipv4/inet_diag.c b/net/ipv4/inet_diag.c
+index 1a4e9ff02762..e24063448f8b 100644
+--- a/net/ipv4/inet_diag.c
++++ b/net/ipv4/inet_diag.c
+@@ -196,7 +196,7 @@ int inet_sk_diag_fill(struct sock *sk, struct inet_connection_sock *icsk,
+ 	if (ext & (1 << (INET_DIAG_MEMINFO - 1))) {
+ 		struct inet_diag_meminfo minfo = {
+ 			.idiag_rmem = sk_rmem_alloc_get(sk),
+-			.idiag_wmem = sk->sk_wmem_queued,
++			.idiag_wmem = READ_ONCE(sk->sk_wmem_queued),
+ 			.idiag_fmem = sk->sk_forward_alloc,
+ 			.idiag_tmem = sk_wmem_alloc_get(sk),
+ 		};
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 96323da05ba6..a7c3138c240d 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -669,7 +669,7 @@ static void skb_entail(struct sock *sk, struct sk_buff *skb)
+ 	tcb->sacked  = 0;
+ 	__skb_header_release(skb);
+ 	tcp_add_write_queue_tail(sk, skb);
+-	sk->sk_wmem_queued += skb->truesize;
++	sk_wmem_queued_add(sk, skb->truesize);
+ 	sk_mem_charge(sk, skb->truesize);
+ 	if (tp->nonagle & TCP_NAGLE_PUSH)
+ 		tp->nonagle &= ~TCP_NAGLE_PUSH;
+@@ -1029,7 +1029,7 @@ ssize_t do_tcp_sendpages(struct sock *sk, struct page *page, int offset,
+ 		skb->len += copy;
+ 		skb->data_len += copy;
+ 		skb->truesize += copy;
+-		sk->sk_wmem_queued += copy;
++		sk_wmem_queued_add(sk, copy);
+ 		sk_mem_charge(sk, copy);
+ 		skb->ip_summed = CHECKSUM_PARTIAL;
+ 		tp->write_seq += copy;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index eedbb9241575..2a5199ce7291 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -1272,7 +1272,7 @@ static void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
+ 	tp->write_seq = TCP_SKB_CB(skb)->end_seq;
+ 	__skb_header_release(skb);
+ 	tcp_add_write_queue_tail(sk, skb);
+-	sk->sk_wmem_queued += skb->truesize;
++	sk_wmem_queued_add(sk, skb->truesize);
+ 	sk_mem_charge(sk, skb->truesize);
+ }
+ 
+@@ -1406,7 +1406,7 @@ int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
+ 		return -ENOMEM; /* We'll just try again later. */
+ 	skb_copy_decrypted(buff, skb);
+ 
+-	sk->sk_wmem_queued += buff->truesize;
++	sk_wmem_queued_add(sk, buff->truesize);
+ 	sk_mem_charge(sk, buff->truesize);
+ 	nlen = skb->len - len - nsize;
+ 	buff->truesize += nlen;
+@@ -1516,7 +1516,7 @@ int tcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len)
+ 
+ 	if (delta_truesize) {
+ 		skb->truesize	   -= delta_truesize;
+-		sk->sk_wmem_queued -= delta_truesize;
++		sk_wmem_queued_add(sk, -delta_truesize);
+ 		sk_mem_uncharge(sk, delta_truesize);
+ 		sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
+ 	}
+@@ -1960,7 +1960,7 @@ static int tso_fragment(struct sock *sk, enum tcp_queue tcp_queue,
+ 		return -ENOMEM;
+ 	skb_copy_decrypted(buff, skb);
+ 
+-	sk->sk_wmem_queued += buff->truesize;
++	sk_wmem_queued_add(sk, buff->truesize);
+ 	sk_mem_charge(sk, buff->truesize);
+ 	buff->truesize += nlen;
+ 	skb->truesize -= nlen;
+@@ -2219,7 +2219,7 @@ static int tcp_mtu_probe(struct sock *sk)
+ 	nskb = sk_stream_alloc_skb(sk, probe_size, GFP_ATOMIC, false);
+ 	if (!nskb)
+ 		return -1;
+-	sk->sk_wmem_queued += nskb->truesize;
++	sk_wmem_queued_add(sk, nskb->truesize);
+ 	sk_mem_charge(sk, nskb->truesize);
+ 
+ 	skb = tcp_send_head(sk);
+@@ -3274,7 +3274,7 @@ int tcp_send_synack(struct sock *sk)
+ 			tcp_rtx_queue_unlink_and_free(skb, sk);
+ 			__skb_header_release(nskb);
+ 			tcp_rbtree_insert(&sk->tcp_rtx_queue, nskb);
+-			sk->sk_wmem_queued += nskb->truesize;
++			sk_wmem_queued_add(sk, nskb->truesize);
+ 			sk_mem_charge(sk, nskb->truesize);
+ 			skb = nskb;
+ 		}
+@@ -3492,7 +3492,7 @@ static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)
+ 
+ 	tcb->end_seq += skb->len;
+ 	__skb_header_release(skb);
+-	sk->sk_wmem_queued += skb->truesize;
++	sk_wmem_queued_add(sk, skb->truesize);
+ 	sk_mem_charge(sk, skb->truesize);
+ 	tp->write_seq = tcb->end_seq;
+ 	tp->packets_out += tcp_skb_pcount(skb);
+diff --git a/net/sched/em_meta.c b/net/sched/em_meta.c
+index e179b6816e98..21c266eccdaa 100644
+--- a/net/sched/em_meta.c
++++ b/net/sched/em_meta.c
+@@ -450,7 +450,7 @@ META_COLLECTOR(int_sk_wmem_queued)
+ 		*err = -1;
+ 		return;
+ 	}
+-	dst->value = sk->sk_wmem_queued;
++	dst->value = READ_ONCE(sk->sk_wmem_queued);
+ }
+ 
+ META_COLLECTOR(int_sk_fwd_alloc)
