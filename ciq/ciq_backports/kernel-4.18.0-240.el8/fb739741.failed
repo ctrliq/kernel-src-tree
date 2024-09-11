@@ -1,0 +1,141 @@
+selinux: properly handle multiple messages in selinux_netlink_send()
+
+jira LE-1907
+cve CVE-2020-10751
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paul Moore <paul@paul-moore.com>
+commit fb73974172ffaaf57a7c42f35424d9aece1a5af6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/fb739741.failed
+
+Fix the SELinux netlink_send hook to properly handle multiple netlink
+messages in a single sk_buff; each message is parsed and subject to
+SELinux access control.  Prior to this patch, SELinux only inspected
+the first message in the sk_buff.
+
+	Cc: stable@vger.kernel.org
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Reviewed-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit fb73974172ffaaf57a7c42f35424d9aece1a5af6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/hooks.c
+diff --cc security/selinux/hooks.c
+index 48dc0a5ec702,487d4df0e37c..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -6031,52 -5842,66 +6031,109 @@@ static unsigned int selinux_ipv6_postro
+  
+  static int selinux_netlink_send(struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	return selinux_nlmsg_perm(sk, skb);
+++=======
++ 	int rc = 0;
++ 	unsigned int msg_len;
++ 	unsigned int data_len = skb->len;
++ 	unsigned char *data = skb->data;
++ 	struct nlmsghdr *nlh;
++ 	struct sk_security_struct *sksec = sk->sk_security;
++ 	u16 sclass = sksec->sclass;
++ 	u32 perm;
++ 
++ 	while (data_len >= nlmsg_total_size(0)) {
++ 		nlh = (struct nlmsghdr *)data;
++ 
++ 		/* NOTE: the nlmsg_len field isn't reliably set by some netlink
++ 		 *       users which means we can't reject skb's with bogus
++ 		 *       length fields; our solution is to follow what
++ 		 *       netlink_rcv_skb() does and simply skip processing at
++ 		 *       messages with length fields that are clearly junk
++ 		 */
++ 		if (nlh->nlmsg_len < NLMSG_HDRLEN || nlh->nlmsg_len > data_len)
++ 			return 0;
++ 
++ 		rc = selinux_nlmsg_lookup(sclass, nlh->nlmsg_type, &perm);
++ 		if (rc == 0) {
++ 			rc = sock_has_perm(sk, perm);
++ 			if (rc)
++ 				return rc;
++ 		} else if (rc == -EINVAL) {
++ 			/* -EINVAL is a missing msg/perm mapping */
++ 			pr_warn_ratelimited("SELinux: unrecognized netlink"
++ 				" message: protocol=%hu nlmsg_type=%hu sclass=%s"
++ 				" pid=%d comm=%s\n",
++ 				sk->sk_protocol, nlh->nlmsg_type,
++ 				secclass_map[sclass - 1].name,
++ 				task_pid_nr(current), current->comm);
++ 			if (enforcing_enabled(&selinux_state) &&
++ 			    !security_get_allow_unknown(&selinux_state))
++ 				return rc;
++ 			rc = 0;
++ 		} else if (rc == -ENOENT) {
++ 			/* -ENOENT is a missing socket/class mapping, ignore */
++ 			rc = 0;
++ 		} else {
++ 			return rc;
++ 		}
++ 
++ 		/* move to the next message after applying netlink padding */
++ 		msg_len = NLMSG_ALIGN(nlh->nlmsg_len);
++ 		if (msg_len >= data_len)
++ 			return 0;
++ 		data_len -= msg_len;
++ 		data += msg_len;
++ 	}
++ 
++ 	return rc;
+++>>>>>>> fb73974172ff (selinux: properly handle multiple messages in selinux_netlink_send())
+  }
+  
+ -static void ipc_init_security(struct ipc_security_struct *isec, u16 sclass)
+ +static int ipc_alloc_security(struct kern_ipc_perm *perm,
+ +			      u16 sclass)
+  {
+ +	struct ipc_security_struct *isec;
+ +
+ +	isec = kzalloc(sizeof(struct ipc_security_struct), GFP_KERNEL);
+ +	if (!isec)
+ +		return -ENOMEM;
+ +
+  	isec->sclass = sclass;
+  	isec->sid = current_sid();
+ +	perm->security = isec;
+ +
+ +	return 0;
+ +}
+ +
+ +static void ipc_free_security(struct kern_ipc_perm *perm)
+ +{
+ +	struct ipc_security_struct *isec = perm->security;
+ +	perm->security = NULL;
+ +	kfree(isec);
+ +}
+ +
+ +static int msg_msg_alloc_security(struct msg_msg *msg)
+ +{
+ +	struct msg_security_struct *msec;
+ +
+ +	msec = kzalloc(sizeof(struct msg_security_struct), GFP_KERNEL);
+ +	if (!msec)
+ +		return -ENOMEM;
+ +
+ +	msec->sid = SECINITSID_UNLABELED;
+ +	msg->security = msec;
+ +
+ +	return 0;
+ +}
+ +
+ +static void msg_msg_free_security(struct msg_msg *msg)
+ +{
+ +	struct msg_security_struct *msec = msg->security;
+ +
+ +	msg->security = NULL;
+ +	kfree(msec);
+  }
+  
+  static int ipc_has_perm(struct kern_ipc_perm *ipc_perms,
+* Unmerged path security/selinux/hooks.c
