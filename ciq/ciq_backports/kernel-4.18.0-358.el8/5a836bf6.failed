@@ -1,0 +1,87 @@
+mm: slub: move flush_cpu_slab() invocations __free_slab() invocations out of IRQ context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit 5a836bf6b09f99ead1b69457ff39ab3011ece57b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5a836bf6.failed
+
+flush_all() flushes a specific SLAB cache on each CPU (where the cache
+is present). The deactivate_slab()/__free_slab() invocation happens
+within IPI handler and is problematic for PREEMPT_RT.
+
+The flush operation is not a frequent operation or a hot path. The
+per-CPU flush operation can be moved to within a workqueue.
+
+Because a workqueue handler, unlike IPI handler, does not disable irqs,
+flush_slab() now has to disable them for working with the kmem_cache_cpu
+fields. deactivate_slab() is safe to call with irqs enabled.
+
+[vbabka@suse.cz: adapt to new SLUB changes]
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+(cherry picked from commit 5a836bf6b09f99ead1b69457ff39ab3011ece57b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index acd06b7ae17b,b7f8b9d34e46..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2438,10 -2496,25 +2438,32 @@@ static void put_cpu_partial(struct kmem
+  
+  static inline void flush_slab(struct kmem_cache *s, struct kmem_cache_cpu *c)
+  {
+++<<<<<<< HEAD
+ +	stat(s, CPUSLAB_FLUSH);
+ +	deactivate_slab(s, c->page, c->freelist, c);
+ +
+ +	c->tid = next_tid(c->tid);
+++=======
++ 	unsigned long flags;
++ 	struct page *page;
++ 	void *freelist;
++ 
++ 	local_irq_save(flags);
++ 
++ 	page = c->page;
++ 	freelist = c->freelist;
++ 
++ 	c->page = NULL;
++ 	c->freelist = NULL;
++ 	c->tid = next_tid(c->tid);
++ 
++ 	local_irq_restore(flags);
++ 
++ 	if (page) {
++ 		deactivate_slab(s, page, freelist);
++ 		stat(s, CPUSLAB_FLUSH);
++ 	}
+++>>>>>>> 5a836bf6b09f (mm: slub: move flush_cpu_slab() invocations __free_slab() invocations out of IRQ context)
+  }
+  
+  static inline void __flush_cpu_slab(struct kmem_cache *s, int cpu)
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index 3b3a1a123e49..e3c4cca9dde8 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -499,6 +499,7 @@ void kmem_cache_destroy(struct kmem_cache *s)
+ 	if (unlikely(!s))
+ 		return;
+ 
++	cpus_read_lock();
+ 	mutex_lock(&slab_mutex);
+ 
+ 	s->refcount--;
+@@ -513,6 +514,7 @@ void kmem_cache_destroy(struct kmem_cache *s)
+ 	}
+ out_unlock:
+ 	mutex_unlock(&slab_mutex);
++	cpus_read_unlock();
+ }
+ EXPORT_SYMBOL(kmem_cache_destroy);
+ 
+* Unmerged path mm/slub.c
