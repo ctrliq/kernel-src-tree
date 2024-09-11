@@ -1,0 +1,118 @@
+arm64/cpufeature: Drop open encodings while extracting parange
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [arm64] cpufeature: Drop open encodings while extracting parange (Andrew Jones) [1842468]
+Rebuild_FUZZ: 94.92%
+commit-author Anshuman Khandual <anshuman.khandual@arm.com>
+commit f73531f0257f6bac44a8c9d5c2f3a3ccaea3d1e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f73531f0.failed
+
+Currently there are multiple instances of parange feature width mask open
+encodings while fetching it's value. Even the width mask value (0x7) itself
+is not accurate. It should be (0xf) per ID_AA64MMFR0_EL1.PARange[3:0] as in
+ARM ARM (0487F.a). Replace them with cpuid_feature_extract_unsigned_field()
+which can extract given standard feature (4 bits width i.e 0xf mask) field.
+
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Marc Zyngier <maz@kernel.org>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: kvmarm@lists.cs.columbia.edu
+	Cc: linux-arm-kernel@lists.infradead.org
+	Cc: linux-kernel@vger.kernel.org
+
+	Signed-off-by: Anshuman Khandual <anshuman.khandual@arm.com>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+	Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/1589360614-1164-1-git-send-email-anshuman.khandual@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit f73531f0257f6bac44a8c9d5c2f3a3ccaea3d1e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/cpufeature.c
+diff --cc arch/arm64/kernel/cpufeature.c
+index a1f04d917ce1,1c5bfe48d381..000000000000
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@@ -1880,6 -2315,36 +1880,39 @@@ static void verify_sve_features(void
+  	/* Add checks on other ZCR bits here if necessary */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void verify_hyp_capabilities(void)
++ {
++ 	u64 safe_mmfr1, mmfr0, mmfr1;
++ 	int parange, ipa_max;
++ 	unsigned int safe_vmid_bits, vmid_bits;
++ 
++ 	if (!IS_ENABLED(CONFIG_KVM) || !IS_ENABLED(CONFIG_KVM_ARM_HOST))
++ 		return;
++ 
++ 	safe_mmfr1 = read_sanitised_ftr_reg(SYS_ID_AA64MMFR1_EL1);
++ 	mmfr0 = read_cpuid(ID_AA64MMFR0_EL1);
++ 	mmfr1 = read_cpuid(ID_AA64MMFR1_EL1);
++ 
++ 	/* Verify VMID bits */
++ 	safe_vmid_bits = get_vmid_bits(safe_mmfr1);
++ 	vmid_bits = get_vmid_bits(mmfr1);
++ 	if (vmid_bits < safe_vmid_bits) {
++ 		pr_crit("CPU%d: VMID width mismatch\n", smp_processor_id());
++ 		cpu_die_early();
++ 	}
++ 
++ 	/* Verify IPA range */
++ 	parange = cpuid_feature_extract_unsigned_field(mmfr0,
++ 				ID_AA64MMFR0_PARANGE_SHIFT);
++ 	ipa_max = id_aa64mmfr0_parange_to_phys_shift(parange);
++ 	if (ipa_max < get_kvm_ipa_limit()) {
++ 		pr_crit("CPU%d: IPA range mismatch\n", smp_processor_id());
++ 		cpu_die_early();
++ 	}
++ }
+++>>>>>>> f73531f0257f (arm64/cpufeature: Drop open encodings while extracting parange)
+  
+  /*
+   * Run through the enabled system capabilities and enable() it on this CPU.
+* Unmerged path arch/arm64/kernel/cpufeature.c
+diff --git a/arch/arm64/kvm/reset.c b/arch/arm64/kvm/reset.c
+index 52263c52cddb..789dda7890f0 100644
+--- a/arch/arm64/kvm/reset.c
++++ b/arch/arm64/kvm/reset.c
+@@ -349,8 +349,11 @@ int kvm_reset_vcpu(struct kvm_vcpu *vcpu)
+ void kvm_set_ipa_limit(void)
+ {
+ 	unsigned int ipa_max, pa_max, va_max, parange;
++	u64 mmfr0;
+ 
+-	parange = read_sanitised_ftr_reg(SYS_ID_AA64MMFR0_EL1) & 0x7;
++	mmfr0 = read_sanitised_ftr_reg(SYS_ID_AA64MMFR0_EL1);
++	parange = cpuid_feature_extract_unsigned_field(mmfr0,
++				ID_AA64MMFR0_PARANGE_SHIFT);
+ 	pa_max = id_aa64mmfr0_parange_to_phys_shift(parange);
+ 
+ 	/* Clamp the IPA limit to the PA size supported by the kernel */
+@@ -396,7 +399,7 @@ void kvm_set_ipa_limit(void)
+  */
+ int kvm_arm_setup_stage2(struct kvm *kvm, unsigned long type)
+ {
+-	u64 vtcr = VTCR_EL2_FLAGS;
++	u64 vtcr = VTCR_EL2_FLAGS, mmfr0;
+ 	u32 parange, phys_shift;
+ 	u8 lvls;
+ 
+@@ -412,7 +415,9 @@ int kvm_arm_setup_stage2(struct kvm *kvm, unsigned long type)
+ 		phys_shift = KVM_PHYS_SHIFT;
+ 	}
+ 
+-	parange = read_sanitised_ftr_reg(SYS_ID_AA64MMFR0_EL1) & 7;
++	mmfr0 = read_sanitised_ftr_reg(SYS_ID_AA64MMFR0_EL1);
++	parange = cpuid_feature_extract_unsigned_field(mmfr0,
++				ID_AA64MMFR0_PARANGE_SHIFT);
+ 	if (parange > ID_AA64MMFR0_PARANGE_MAX)
+ 		parange = ID_AA64MMFR0_PARANGE_MAX;
+ 	vtcr |= parange << VTCR_EL2_PS_SHIFT;
