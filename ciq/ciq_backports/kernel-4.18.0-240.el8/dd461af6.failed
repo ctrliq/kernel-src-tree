@@ -1,0 +1,170 @@
+io_uring: use proper references for fallback_req locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+commit dd461af65946de060bff2dab08a63676d2731afe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/dd461af6.failed
+
+Use ctx->fallback_req address for test_and_set_bit_lock() and
+clear_bit_unlock().
+
+	Signed-off-by: Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit dd461af65946de060bff2dab08a63676d2731afe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,3da2a02531e6..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -563,8 -1279,30 +563,35 @@@ static void io_cqring_add_event(struct 
+  	io_cqring_ev_posted(ctx);
+  }
+  
+++<<<<<<< HEAD
+ +static struct io_kiocb *io_get_req(struct io_ring_ctx *ctx,
+ +				   struct io_submit_state *state)
+++=======
++ static void io_cqring_add_event(struct io_kiocb *req, long res)
++ {
++ 	__io_cqring_add_event(req, res, 0);
++ }
++ 
++ static inline bool io_is_fallback_req(struct io_kiocb *req)
++ {
++ 	return req == (struct io_kiocb *)
++ 			((unsigned long) req->ctx->fallback_req & ~1UL);
++ }
++ 
++ static struct io_kiocb *io_get_fallback_req(struct io_ring_ctx *ctx)
++ {
++ 	struct io_kiocb *req;
++ 
++ 	req = ctx->fallback_req;
++ 	if (!test_and_set_bit_lock(0, (unsigned long *) &ctx->fallback_req))
++ 		return req;
++ 
++ 	return NULL;
++ }
++ 
++ static struct io_kiocb *io_alloc_req(struct io_ring_ctx *ctx,
++ 				     struct io_submit_state *state)
+++>>>>>>> dd461af65946 (io_uring: use proper references for fallback_req locking)
+  {
+  	gfp_t gfp = GFP_KERNEL | __GFP_NOWARN;
+  	struct io_kiocb *req;
+@@@ -623,15 -1365,100 +650,22 @@@ static void io_free_req_many(struct io_
+  
+  static void __io_free_req(struct io_kiocb *req)
+  {
+ -	__io_req_aux_free(req);
+ -
+ -	if (req->flags & REQ_F_INFLIGHT) {
+ -		struct io_ring_ctx *ctx = req->ctx;
+ -		unsigned long flags;
+ -
+ -		spin_lock_irqsave(&ctx->inflight_lock, flags);
+ -		list_del(&req->inflight_entry);
+ -		if (waitqueue_active(&ctx->inflight_wait))
+ -			wake_up(&ctx->inflight_wait);
+ -		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+ -	}
+ -
+ +	if (req->file && !(req->flags & REQ_F_FIXED_FILE))
+ +		fput(req->file);
+  	percpu_ref_put(&req->ctx->refs);
+++<<<<<<< HEAD
+ +	kmem_cache_free(req_cachep, req);
+++=======
++ 	if (likely(!io_is_fallback_req(req)))
++ 		kmem_cache_free(req_cachep, req);
++ 	else
++ 		clear_bit_unlock(0, (unsigned long *) &req->ctx->fallback_req);
+++>>>>>>> dd461af65946 (io_uring: use proper references for fallback_req locking)
+  }
+  
+ -struct req_batch {
+ -	void *reqs[IO_IOPOLL_BATCH];
+ -	int to_free;
+ -	int need_iter;
+ -};
+ -
+ -static void io_free_req_many(struct io_ring_ctx *ctx, struct req_batch *rb)
+ -{
+ -	if (!rb->to_free)
+ -		return;
+ -	if (rb->need_iter) {
+ -		int i, inflight = 0;
+ -		unsigned long flags;
+ -
+ -		for (i = 0; i < rb->to_free; i++) {
+ -			struct io_kiocb *req = rb->reqs[i];
+ -
+ -			if (req->flags & REQ_F_FIXED_FILE) {
+ -				req->file = NULL;
+ -				percpu_ref_put(req->fixed_file_refs);
+ -			}
+ -			if (req->flags & REQ_F_INFLIGHT)
+ -				inflight++;
+ -			__io_req_aux_free(req);
+ -		}
+ -		if (!inflight)
+ -			goto do_free;
+ -
+ -		spin_lock_irqsave(&ctx->inflight_lock, flags);
+ -		for (i = 0; i < rb->to_free; i++) {
+ -			struct io_kiocb *req = rb->reqs[i];
+ -
+ -			if (req->flags & REQ_F_INFLIGHT) {
+ -				list_del(&req->inflight_entry);
+ -				if (!--inflight)
+ -					break;
+ -			}
+ -		}
+ -		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+ -
+ -		if (waitqueue_active(&ctx->inflight_wait))
+ -			wake_up(&ctx->inflight_wait);
+ -	}
+ -do_free:
+ -	kmem_cache_free_bulk(req_cachep, rb->to_free, rb->reqs);
+ -	percpu_ref_put_many(&ctx->refs, rb->to_free);
+ -	rb->to_free = rb->need_iter = 0;
+ -}
+ -
+ -static bool io_link_cancel_timeout(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	int ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
+ -	if (ret != -1) {
+ -		io_cqring_fill_event(req, -ECANCELED);
+ -		io_commit_cqring(ctx);
+ -		req->flags &= ~REQ_F_LINK_HEAD;
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -static void io_req_link_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
+ +static void io_req_link_next(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	bool wake_ev = false;
+ -
+ -	/* Already got next link */
+ -	if (req->flags & REQ_F_LINK_NEXT)
+ -		return;
+ +	struct io_kiocb *nxt;
+  
+  	/*
+  	 * The list should never be empty when we are called here. But could
+* Unmerged path fs/io_uring.c
