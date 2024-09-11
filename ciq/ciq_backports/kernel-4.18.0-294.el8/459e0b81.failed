@@ -1,0 +1,286 @@
+ethtool: provide link settings with LINKINFO_GET request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Michal Kubecek <mkubecek@suse.cz>
+commit 459e0b81b37043545d90629fdfb243444151e77d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/459e0b81.failed
+
+Implement LINKINFO_GET netlink request to get basic link settings provided
+by ETHTOOL_GLINKSETTINGS and ETHTOOL_GSET ioctl commands.
+
+This request provides settings not directly related to autonegotiation and
+link mode selection: physical port, phy MDIO address, MDI(-X) status,
+MDI(-X) control and transceiver.
+
+LINKINFO_GET request can be used with NLM_F_DUMP (without device
+identification) to request the information for all devices in current
+network namespace providing the data.
+
+	Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 459e0b81b37043545d90629fdfb243444151e77d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ethtool-netlink.rst
+#	include/uapi/linux/ethtool_netlink.h
+#	net/ethtool/Makefile
+#	net/ethtool/netlink.c
+#	net/ethtool/netlink.h
+diff --cc net/ethtool/Makefile
+index f68387618973,765736ec52c0..000000000000
+--- a/net/ethtool/Makefile
++++ b/net/ethtool/Makefile
+@@@ -1,3 -1,7 +1,11 @@@
+  # SPDX-License-Identifier: GPL-2.0-only
+  
+++<<<<<<< HEAD
+ +obj-y		+= ioctl.o common.o
+++=======
++ obj-y				+= ioctl.o common.o
++ 
++ obj-$(CONFIG_ETHTOOL_NETLINK)	+= ethtool_nl.o
++ 
++ ethtool_nl-y	:= netlink.o bitset.o strset.o linkinfo.o
+++>>>>>>> 459e0b81b370 (ethtool: provide link settings with LINKINFO_GET request)
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/Makefile
+diff --git a/net/ethtool/common.c b/net/ethtool/common.c
+index 0a8728565356..1d4a0aeff2cb 100644
+--- a/net/ethtool/common.c
++++ b/net/ethtool/common.c
+@@ -169,3 +169,51 @@ const char link_mode_names[][ETH_GSTRING_LEN] = {
+ 	__DEFINE_LINK_MODE_NAME(400000, CR8, Full),
+ };
+ static_assert(ARRAY_SIZE(link_mode_names) == __ETHTOOL_LINK_MODE_MASK_NBITS);
++
++/* return false if legacy contained non-0 deprecated fields
++ * maxtxpkt/maxrxpkt. rest of ksettings always updated
++ */
++bool
++convert_legacy_settings_to_link_ksettings(
++	struct ethtool_link_ksettings *link_ksettings,
++	const struct ethtool_cmd *legacy_settings)
++{
++	bool retval = true;
++
++	memset(link_ksettings, 0, sizeof(*link_ksettings));
++
++	/* This is used to tell users that driver is still using these
++	 * deprecated legacy fields, and they should not use
++	 * %ETHTOOL_GLINKSETTINGS/%ETHTOOL_SLINKSETTINGS
++	 */
++	if (legacy_settings->maxtxpkt ||
++	    legacy_settings->maxrxpkt)
++		retval = false;
++
++	ethtool_convert_legacy_u32_to_link_mode(
++		link_ksettings->link_modes.supported,
++		legacy_settings->supported);
++	ethtool_convert_legacy_u32_to_link_mode(
++		link_ksettings->link_modes.advertising,
++		legacy_settings->advertising);
++	ethtool_convert_legacy_u32_to_link_mode(
++		link_ksettings->link_modes.lp_advertising,
++		legacy_settings->lp_advertising);
++	link_ksettings->base.speed
++		= ethtool_cmd_speed(legacy_settings);
++	link_ksettings->base.duplex
++		= legacy_settings->duplex;
++	link_ksettings->base.port
++		= legacy_settings->port;
++	link_ksettings->base.phy_address
++		= legacy_settings->phy_address;
++	link_ksettings->base.autoneg
++		= legacy_settings->autoneg;
++	link_ksettings->base.mdio_support
++		= legacy_settings->mdio_support;
++	link_ksettings->base.eth_tp_mdix
++		= legacy_settings->eth_tp_mdix;
++	link_ksettings->base.eth_tp_mdix_ctrl
++		= legacy_settings->eth_tp_mdix_ctrl;
++	return retval;
++}
+diff --git a/net/ethtool/common.h b/net/ethtool/common.h
+index bbb788908cb1..c8a237402729 100644
+--- a/net/ethtool/common.h
++++ b/net/ethtool/common.h
+@@ -19,4 +19,8 @@ extern const char
+ phy_tunable_strings[__ETHTOOL_PHY_TUNABLE_COUNT][ETH_GSTRING_LEN];
+ extern const char link_mode_names[][ETH_GSTRING_LEN];
+ 
++bool convert_legacy_settings_to_link_ksettings(
++	struct ethtool_link_ksettings *link_ksettings,
++	const struct ethtool_cmd *legacy_settings);
++
+ #endif /* _ETHTOOL_COMMON_H */
+diff --git a/net/ethtool/ioctl.c b/net/ethtool/ioctl.c
+index e6221e091f3d..ac856fd64c75 100644
+--- a/net/ethtool/ioctl.c
++++ b/net/ethtool/ioctl.c
+@@ -365,54 +365,6 @@ bool ethtool_convert_link_mode_to_legacy_u32(u32 *legacy_u32,
+ }
+ EXPORT_SYMBOL(ethtool_convert_link_mode_to_legacy_u32);
+ 
+-/* return false if legacy contained non-0 deprecated fields
+- * maxtxpkt/maxrxpkt. rest of ksettings always updated
+- */
+-static bool
+-convert_legacy_settings_to_link_ksettings(
+-	struct ethtool_link_ksettings *link_ksettings,
+-	const struct ethtool_cmd *legacy_settings)
+-{
+-	bool retval = true;
+-
+-	memset(link_ksettings, 0, sizeof(*link_ksettings));
+-
+-	/* This is used to tell users that driver is still using these
+-	 * deprecated legacy fields, and they should not use
+-	 * %ETHTOOL_GLINKSETTINGS/%ETHTOOL_SLINKSETTINGS
+-	 */
+-	if (legacy_settings->maxtxpkt ||
+-	    legacy_settings->maxrxpkt)
+-		retval = false;
+-
+-	ethtool_convert_legacy_u32_to_link_mode(
+-		link_ksettings->link_modes.supported,
+-		legacy_settings->supported);
+-	ethtool_convert_legacy_u32_to_link_mode(
+-		link_ksettings->link_modes.advertising,
+-		legacy_settings->advertising);
+-	ethtool_convert_legacy_u32_to_link_mode(
+-		link_ksettings->link_modes.lp_advertising,
+-		legacy_settings->lp_advertising);
+-	link_ksettings->base.speed
+-		= ethtool_cmd_speed(legacy_settings);
+-	link_ksettings->base.duplex
+-		= legacy_settings->duplex;
+-	link_ksettings->base.port
+-		= legacy_settings->port;
+-	link_ksettings->base.phy_address
+-		= legacy_settings->phy_address;
+-	link_ksettings->base.autoneg
+-		= legacy_settings->autoneg;
+-	link_ksettings->base.mdio_support
+-		= legacy_settings->mdio_support;
+-	link_ksettings->base.eth_tp_mdix
+-		= legacy_settings->eth_tp_mdix;
+-	link_ksettings->base.eth_tp_mdix_ctrl
+-		= legacy_settings->eth_tp_mdix_ctrl;
+-	return retval;
+-}
+-
+ /* return false if ksettings link modes had higher bits
+  * set. legacy_settings always updated (best effort)
+  */
+diff --git a/net/ethtool/linkinfo.c b/net/ethtool/linkinfo.c
+new file mode 100644
+index 000000000000..f52a31af6fff
+--- /dev/null
++++ b/net/ethtool/linkinfo.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "netlink.h"
++#include "common.h"
++
++struct linkinfo_req_info {
++	struct ethnl_req_info		base;
++};
++
++struct linkinfo_reply_data {
++	struct ethnl_reply_data		base;
++	struct ethtool_link_ksettings	ksettings;
++	struct ethtool_link_settings	*lsettings;
++};
++
++#define LINKINFO_REPDATA(__reply_base) \
++	container_of(__reply_base, struct linkinfo_reply_data, base)
++
++static const struct nla_policy
++linkinfo_get_policy[ETHTOOL_A_LINKINFO_MAX + 1] = {
++	[ETHTOOL_A_LINKINFO_UNSPEC]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKINFO_HEADER]		= { .type = NLA_NESTED },
++	[ETHTOOL_A_LINKINFO_PORT]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKINFO_PHYADDR]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKINFO_TP_MDIX]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKINFO_TP_MDIX_CTRL]	= { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKINFO_TRANSCEIVER]	= { .type = NLA_REJECT },
++};
++
++static int linkinfo_prepare_data(const struct ethnl_req_info *req_base,
++				 struct ethnl_reply_data *reply_base,
++				 struct genl_info *info)
++{
++	struct linkinfo_reply_data *data = LINKINFO_REPDATA(reply_base);
++	struct net_device *dev = reply_base->dev;
++	int ret;
++
++	data->lsettings = &data->ksettings.base;
++
++	ret = ethnl_ops_begin(dev);
++	if (ret < 0)
++		return ret;
++	ret = __ethtool_get_link_ksettings(dev, &data->ksettings);
++	if (ret < 0 && info)
++		GENL_SET_ERR_MSG(info, "failed to retrieve link settings");
++	ethnl_ops_complete(dev);
++
++	return ret;
++}
++
++static int linkinfo_reply_size(const struct ethnl_req_info *req_base,
++			       const struct ethnl_reply_data *reply_base)
++{
++	return nla_total_size(sizeof(u8)) /* LINKINFO_PORT */
++		+ nla_total_size(sizeof(u8)) /* LINKINFO_PHYADDR */
++		+ nla_total_size(sizeof(u8)) /* LINKINFO_TP_MDIX */
++		+ nla_total_size(sizeof(u8)) /* LINKINFO_TP_MDIX_CTRL */
++		+ nla_total_size(sizeof(u8)) /* LINKINFO_TRANSCEIVER */
++		+ 0;
++}
++
++static int linkinfo_fill_reply(struct sk_buff *skb,
++			       const struct ethnl_req_info *req_base,
++			       const struct ethnl_reply_data *reply_base)
++{
++	const struct linkinfo_reply_data *data = LINKINFO_REPDATA(reply_base);
++
++	if (nla_put_u8(skb, ETHTOOL_A_LINKINFO_PORT, data->lsettings->port) ||
++	    nla_put_u8(skb, ETHTOOL_A_LINKINFO_PHYADDR,
++		       data->lsettings->phy_address) ||
++	    nla_put_u8(skb, ETHTOOL_A_LINKINFO_TP_MDIX,
++		       data->lsettings->eth_tp_mdix) ||
++	    nla_put_u8(skb, ETHTOOL_A_LINKINFO_TP_MDIX_CTRL,
++		       data->lsettings->eth_tp_mdix_ctrl) ||
++	    nla_put_u8(skb, ETHTOOL_A_LINKINFO_TRANSCEIVER,
++		       data->lsettings->transceiver))
++		return -EMSGSIZE;
++
++	return 0;
++}
++
++const struct ethnl_request_ops ethnl_linkinfo_request_ops = {
++	.request_cmd		= ETHTOOL_MSG_LINKINFO_GET,
++	.reply_cmd		= ETHTOOL_MSG_LINKINFO_GET_REPLY,
++	.hdr_attr		= ETHTOOL_A_LINKINFO_HEADER,
++	.max_attr		= ETHTOOL_A_LINKINFO_MAX,
++	.req_info_size		= sizeof(struct linkinfo_req_info),
++	.reply_data_size	= sizeof(struct linkinfo_reply_data),
++	.request_policy		= linkinfo_get_policy,
++
++	.prepare_data		= linkinfo_prepare_data,
++	.reply_size		= linkinfo_reply_size,
++	.fill_reply		= linkinfo_fill_reply,
++};
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
