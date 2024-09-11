@@ -1,0 +1,250 @@
+RDMA/core: Move core content from ib_uverbs to ib_core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Michal Kalderon <michal.kalderon@marvell.com>
+commit b86deba977a91aaa5a4b725d7b42970e6de28d2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b86deba9.failed
+
+Move functionality that is called by the driver, which is
+related to umap, to a new file that will be linked in ib_core.
+This is a first step in later enabling ib_uverbs to be optional.
+vm_ops is now initialized in ib_uverbs_mmap instead of
+priv_init to avoid having to move all the rdma_umap functions
+as well.
+
+Link: https://lore.kernel.org/r/20191030094417.16866-2-michal.kalderon@marvell.com
+	Suggested-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Ariel Elior <ariel.elior@marvell.com>
+	Signed-off-by: Michal Kalderon <michal.kalderon@marvell.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b86deba977a91aaa5a4b725d7b42970e6de28d2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/core_priv.h
+diff --cc drivers/infiniband/core/core_priv.h
+index 9c4d2756c453,0252da9560f4..000000000000
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@@ -366,4 -384,16 +366,19 @@@ void ib_port_unregister_module_stat(str
+  
+  int ib_device_set_netns_put(struct sk_buff *skb,
+  			    struct ib_device *dev, u32 ns_fd);
+++<<<<<<< HEAD
+++=======
++ 
++ int rdma_nl_net_init(struct rdma_dev_net *rnet);
++ void rdma_nl_net_exit(struct rdma_dev_net *rnet);
++ 
++ struct rdma_umap_priv {
++ 	struct vm_area_struct *vma;
++ 	struct list_head list;
++ };
++ 
++ void rdma_umap_priv_init(struct rdma_umap_priv *priv,
++ 			 struct vm_area_struct *vma);
++ 
+++>>>>>>> b86deba977a9 (RDMA/core: Move core content from ib_uverbs to ib_core)
+  #endif /* _CORE_PRIV_H */
+diff --git a/drivers/infiniband/core/Makefile b/drivers/infiniband/core/Makefile
+index 09881bd5f12d..9a8871e21545 100644
+--- a/drivers/infiniband/core/Makefile
++++ b/drivers/infiniband/core/Makefile
+@@ -11,7 +11,7 @@ ib_core-y :=			packer.o ud_header.o verbs.o cq.o rw.o sysfs.o \
+ 				device.o fmr_pool.o cache.o netlink.o \
+ 				roce_gid_mgmt.o mr_pool.o addr.o sa_query.o \
+ 				multicast.o mad.o smi.o agent.o mad_rmpp.o \
+-				nldev.o restrack.o counters.o
++				nldev.o restrack.o counters.o ib_core_uverbs.o
+ 
+ ib_core-$(CONFIG_SECURITY_INFINIBAND) += security.o
+ ib_core-$(CONFIG_CGROUP_RDMA) += cgroup.o
+* Unmerged path drivers/infiniband/core/core_priv.h
+diff --git a/drivers/infiniband/core/ib_core_uverbs.c b/drivers/infiniband/core/ib_core_uverbs.c
+new file mode 100644
+index 000000000000..b74d2a2fb342
+--- /dev/null
++++ b/drivers/infiniband/core/ib_core_uverbs.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/*
++ * Copyright (c) 2005 Mellanox Technologies. All rights reserved.
++ * Copyright 2018-2019 Amazon.com, Inc. or its affiliates. All rights reserved.
++ * Copyright 2019 Marvell. All rights reserved.
++ */
++#include <linux/xarray.h>
++#include "uverbs.h"
++#include "core_priv.h"
++
++/*
++ * Each time we map IO memory into user space this keeps track of the mapping.
++ * When the device is hot-unplugged we 'zap' the mmaps in user space to point
++ * to the zero page and allow the hot unplug to proceed.
++ *
++ * This is necessary for cases like PCI physical hot unplug as the actual BAR
++ * memory may vanish after this and access to it from userspace could MCE.
++ *
++ * RDMA drivers supporting disassociation must have their user space designed
++ * to cope in some way with their IO pages going to the zero page.
++ */
++void rdma_umap_priv_init(struct rdma_umap_priv *priv,
++			 struct vm_area_struct *vma)
++{
++	struct ib_uverbs_file *ufile = vma->vm_file->private_data;
++
++	priv->vma = vma;
++	vma->vm_private_data = priv;
++	/* vm_ops is setup in ib_uverbs_mmap() to avoid module dependencies */
++
++	mutex_lock(&ufile->umap_lock);
++	list_add(&priv->list, &ufile->umaps);
++	mutex_unlock(&ufile->umap_lock);
++}
++EXPORT_SYMBOL(rdma_umap_priv_init);
++
++/*
++ * Map IO memory into a process. This is to be called by drivers as part of
++ * their mmap() functions if they wish to send something like PCI-E BAR memory
++ * to userspace.
++ */
++int rdma_user_mmap_io(struct ib_ucontext *ucontext, struct vm_area_struct *vma,
++		      unsigned long pfn, unsigned long size, pgprot_t prot)
++{
++	struct ib_uverbs_file *ufile = ucontext->ufile;
++	struct rdma_umap_priv *priv;
++
++	if (!(vma->vm_flags & VM_SHARED))
++		return -EINVAL;
++
++	if (vma->vm_end - vma->vm_start != size)
++		return -EINVAL;
++
++	/* Driver is using this wrong, must be called by ib_uverbs_mmap */
++	if (WARN_ON(!vma->vm_file ||
++		    vma->vm_file->private_data != ufile))
++		return -EINVAL;
++	lockdep_assert_held(&ufile->device->disassociate_srcu);
++
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	vma->vm_page_prot = prot;
++	if (io_remap_pfn_range(vma, vma->vm_start, pfn, size, prot)) {
++		kfree(priv);
++		return -EAGAIN;
++	}
++
++	rdma_umap_priv_init(priv, vma);
++	return 0;
++}
++EXPORT_SYMBOL(rdma_user_mmap_io);
+diff --git a/drivers/infiniband/core/uverbs_main.c b/drivers/infiniband/core/uverbs_main.c
+index 8651d5f3e86a..fc43d817aa06 100644
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -768,6 +768,8 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
+ 	return (ret) ? : count;
+ }
+ 
++static const struct vm_operations_struct rdma_umap_ops;
++
+ static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
+ {
+ 	struct ib_uverbs_file *file = filp->private_data;
+@@ -781,45 +783,13 @@ static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
+ 		ret = PTR_ERR(ucontext);
+ 		goto out;
+ 	}
+-
++	vma->vm_ops = &rdma_umap_ops;
+ 	ret = ucontext->device->ops.mmap(ucontext, vma);
+ out:
+ 	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+ 	return ret;
+ }
+ 
+-/*
+- * Each time we map IO memory into user space this keeps track of the mapping.
+- * When the device is hot-unplugged we 'zap' the mmaps in user space to point
+- * to the zero page and allow the hot unplug to proceed.
+- *
+- * This is necessary for cases like PCI physical hot unplug as the actual BAR
+- * memory may vanish after this and access to it from userspace could MCE.
+- *
+- * RDMA drivers supporting disassociation must have their user space designed
+- * to cope in some way with their IO pages going to the zero page.
+- */
+-struct rdma_umap_priv {
+-	struct vm_area_struct *vma;
+-	struct list_head list;
+-};
+-
+-static const struct vm_operations_struct rdma_umap_ops;
+-
+-static void rdma_umap_priv_init(struct rdma_umap_priv *priv,
+-				struct vm_area_struct *vma)
+-{
+-	struct ib_uverbs_file *ufile = vma->vm_file->private_data;
+-
+-	priv->vma = vma;
+-	vma->vm_private_data = priv;
+-	vma->vm_ops = &rdma_umap_ops;
+-
+-	mutex_lock(&ufile->umap_lock);
+-	list_add(&priv->list, &ufile->umaps);
+-	mutex_unlock(&ufile->umap_lock);
+-}
+-
+ /*
+  * The VMA has been dup'd, initialize the vm_private_data with a new tracking
+  * struct
+@@ -927,44 +897,6 @@ static const struct vm_operations_struct rdma_umap_ops = {
+ 	.fault = rdma_umap_fault,
+ };
+ 
+-/*
+- * Map IO memory into a process. This is to be called by drivers as part of
+- * their mmap() functions if they wish to send something like PCI-E BAR memory
+- * to userspace.
+- */
+-int rdma_user_mmap_io(struct ib_ucontext *ucontext, struct vm_area_struct *vma,
+-		      unsigned long pfn, unsigned long size, pgprot_t prot)
+-{
+-	struct ib_uverbs_file *ufile = ucontext->ufile;
+-	struct rdma_umap_priv *priv;
+-
+-	if (!(vma->vm_flags & VM_SHARED))
+-		return -EINVAL;
+-
+-	if (vma->vm_end - vma->vm_start != size)
+-		return -EINVAL;
+-
+-	/* Driver is using this wrong, must be called by ib_uverbs_mmap */
+-	if (WARN_ON(!vma->vm_file ||
+-		    vma->vm_file->private_data != ufile))
+-		return -EINVAL;
+-	lockdep_assert_held(&ufile->device->disassociate_srcu);
+-
+-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+-	if (!priv)
+-		return -ENOMEM;
+-
+-	vma->vm_page_prot = prot;
+-	if (io_remap_pfn_range(vma, vma->vm_start, pfn, size, prot)) {
+-		kfree(priv);
+-		return -EAGAIN;
+-	}
+-
+-	rdma_umap_priv_init(priv, vma);
+-	return 0;
+-}
+-EXPORT_SYMBOL(rdma_user_mmap_io);
+-
+ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile)
+ {
+ 	struct rdma_umap_priv *priv, *next_priv;
