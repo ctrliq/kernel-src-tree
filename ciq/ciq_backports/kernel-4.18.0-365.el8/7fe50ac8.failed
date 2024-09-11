@@ -1,0 +1,162 @@
+net: dump more useful information in netdev_rx_csum_fault()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit 7fe50ac83f4319c18ed7c634d85cad16bd0bf509
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/7fe50ac8.failed
+
+Currently netdev_rx_csum_fault() only shows a device name,
+we need more information about the skb for debugging csum
+failures.
+
+Sample output:
+
+ ens3: hw csum failure
+ dev features: 0x0000000000014b89
+ skb len=84 data_len=0 pkt_type=0 gso_size=0 gso_type=0 nr_frags=0 ip_summed=0 csum=0 csum_complete_sw=0 csum_valid=0 csum_level=0
+
+Note, I use pr_err() just to be consistent with the existing one.
+
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7fe50ac83f4319c18ed7c634d85cad16bd0bf509)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index 514903a1c6df,fcb1155a00ec..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -2736,6 -2645,49 +2736,52 @@@ __wsum skb_copy_and_csum_bits(const str
+  }
+  EXPORT_SYMBOL(skb_copy_and_csum_bits);
+  
+++<<<<<<< HEAD
+++=======
++ __sum16 __skb_checksum_complete_head(struct sk_buff *skb, int len)
++ {
++ 	__sum16 sum;
++ 
++ 	sum = csum_fold(skb_checksum(skb, 0, len, skb->csum));
++ 	if (likely(!sum)) {
++ 		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
++ 		    !skb->csum_complete_sw)
++ 			netdev_rx_csum_fault(skb->dev, skb);
++ 	}
++ 	if (!skb_shared(skb))
++ 		skb->csum_valid = !sum;
++ 	return sum;
++ }
++ EXPORT_SYMBOL(__skb_checksum_complete_head);
++ 
++ __sum16 __skb_checksum_complete(struct sk_buff *skb)
++ {
++ 	__wsum csum;
++ 	__sum16 sum;
++ 
++ 	csum = skb_checksum(skb, 0, skb->len, 0);
++ 
++ 	/* skb->csum holds pseudo checksum */
++ 	sum = csum_fold(csum_add(skb->csum, csum));
++ 	if (likely(!sum)) {
++ 		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
++ 		    !skb->csum_complete_sw)
++ 			netdev_rx_csum_fault(skb->dev, skb);
++ 	}
++ 
++ 	if (!skb_shared(skb)) {
++ 		/* Save full packet checksum */
++ 		skb->csum = csum;
++ 		skb->ip_summed = CHECKSUM_COMPLETE;
++ 		skb->csum_complete_sw = 1;
++ 		skb->csum_valid = !sum;
++ 	}
++ 
++ 	return sum;
++ }
++ EXPORT_SYMBOL(__skb_checksum_complete);
++ 
+++>>>>>>> 7fe50ac83f43 (net: dump more useful information in netdev_rx_csum_fault())
+  static __wsum warn_crc32c_csum_update(const void *buff, int len, __wsum sum)
+  {
+  	net_warn_ratelimited(
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index bf182ed70a75..eea980319d6f 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -4855,9 +4855,10 @@ static inline bool can_checksum_protocol(netdev_features_t features,
+ }
+ 
+ #ifdef CONFIG_BUG
+-void netdev_rx_csum_fault(struct net_device *dev);
++void netdev_rx_csum_fault(struct net_device *dev, struct sk_buff *skb);
+ #else
+-static inline void netdev_rx_csum_fault(struct net_device *dev)
++static inline void netdev_rx_csum_fault(struct net_device *dev,
++					struct sk_buff *skb)
+ {
+ }
+ #endif
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index 00f961c57d69..3b48859bd26c 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -799,7 +799,7 @@ int skb_copy_and_csum_datagram_msg(struct sk_buff *skb,
+ 
+ 		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
+ 		    !skb->csum_complete_sw)
+-			netdev_rx_csum_fault(NULL);
++			netdev_rx_csum_fault(NULL, skb);
+ 	}
+ 	return 0;
+ fault:
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 3eb582bf7ca7..65373ef9df09 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3428,10 +3428,17 @@ EXPORT_SYMBOL(__skb_gso_segment);
+ 
+ /* Take action when hardware reception checksum errors are detected. */
+ #ifdef CONFIG_BUG
+-void netdev_rx_csum_fault(struct net_device *dev)
++void netdev_rx_csum_fault(struct net_device *dev, struct sk_buff *skb)
+ {
+ 	if (net_ratelimit()) {
+ 		pr_err("%s: hw csum failure\n", dev ? dev->name : "<unknown>");
++		if (dev)
++			pr_err("dev features: %pNF\n", &dev->features);
++		pr_err("skb len=%u data_len=%u pkt_type=%u gso_size=%u gso_type=%u nr_frags=%u ip_summed=%u csum=%x csum_complete_sw=%d csum_valid=%d csum_level=%u\n",
++		       skb->len, skb->data_len, skb->pkt_type,
++		       skb_shinfo(skb)->gso_size, skb_shinfo(skb)->gso_type,
++		       skb_shinfo(skb)->nr_frags, skb->ip_summed, skb->csum,
++		       skb->csum_complete_sw, skb->csum_valid, skb->csum_level);
+ 		dump_stack();
+ 	}
+ }
+@@ -6102,7 +6109,7 @@ __sum16 __skb_gro_checksum_complete(struct sk_buff *skb)
+ 	if (likely(!sum)) {
+ 		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
+ 		    !skb->csum_complete_sw)
+-			netdev_rx_csum_fault(skb->dev);
++			netdev_rx_csum_fault(skb->dev, skb);
+ 	}
+ 
+ 	NAPI_GRO_CB(skb)->csum = wsum;
+* Unmerged path net/core/skbuff.c
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 6e90a05b7af1..b9751e3f97f2 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -190,7 +190,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		return -1;
+ 	if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
+ 	    !skb->csum_complete_sw)
+-		netdev_rx_csum_fault(skb->dev);
++		netdev_rx_csum_fault(skb->dev, skb);
+ 	return 0;
+ no_checksum:
+ 	if (xdr_partial_copy_from_skb(xdr, 0, &desc, xdr_skb_read_bits) < 0)
