@@ -166,8 +166,6 @@ struct disk_part_tbl {
 struct disk_events;
 struct badblocks;
 
-#if defined(CONFIG_BLK_DEV_INTEGRITY)
-
 struct blk_integrity {
 	const struct blk_integrity_profile	*profile;
 	unsigned char				flags;
@@ -178,8 +176,6 @@ struct blk_integrity {
 	RH_KABI_RESERVE(1)
 	RH_KABI_RESERVE(2)
 };
-
-#endif	/* CONFIG_BLK_DEV_INTEGRITY */
 
 struct gendisk {
 	/* major, first_minor and minors are input parameters only,
