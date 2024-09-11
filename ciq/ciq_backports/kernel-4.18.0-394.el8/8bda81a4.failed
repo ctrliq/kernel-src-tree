@@ -1,0 +1,145 @@
+lwtunnel: Validate RTA_ENCAP_TYPE attribute length
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author David Ahern <dsahern@kernel.org>
+commit 8bda81a4d400cf8a72e554012f0d8c45e07a3904
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/8bda81a4.failed
+
+lwtunnel_valid_encap_type_attr is used to validate encap attributes
+within a multipath route. Add length validation checking to the type.
+
+lwtunnel_valid_encap_type_attr is called converting attributes to
+fib{6,}_config struct which means it is used before fib_get_nhs,
+ip6_route_multipath_add, and ip6_route_multipath_del - other
+locations that use rtnh_ok and then nla_get_u16 on RTA_ENCAP_TYPE
+attribute.
+
+Fixes: 9ed59592e3e3 ("lwtunnel: fix autoload of lwt modules")
+
+	Signed-off-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8bda81a4d400cf8a72e554012f0d8c45e07a3904)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_semantics.c
+diff --cc net/ipv4/fib_semantics.c
+index fe98b77497aa,92c29ab3d042..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -513,41 -707,52 +513,52 @@@ static int fib_get_nhs(struct fib_info 
+  
+  		attrlen = rtnh_attrlen(rtnh);
+  		if (attrlen > 0) {
+ -			struct nlattr *nla, *nlav, *attrs = rtnh_attrs(rtnh);
+ +			struct nlattr *nla, *attrs = rtnh_attrs(rtnh);
+  
+  			nla = nla_find(attrs, attrlen, RTA_GATEWAY);
+ -			nlav = nla_find(attrs, attrlen, RTA_VIA);
+ -			if (nla && nlav) {
+ -				NL_SET_ERR_MSG(extack,
+ -					       "Nexthop configuration can not contain both GATEWAY and VIA");
+ -				return -EINVAL;
+ -			}
+ +			nexthop_nh->nh_gw = nla ? nla_get_in_addr(nla) : 0;
+ +#ifdef CONFIG_IP_ROUTE_CLASSID
+ +			nla = nla_find(attrs, attrlen, RTA_FLOW);
+ +			nexthop_nh->nh_tclassid = nla ? nla_get_u32(nla) : 0;
+ +			if (nexthop_nh->nh_tclassid)
+ +				fi->fib_net->ipv4.fib_num_tclassid_users++;
+ +#endif
+ +			nla = nla_find(attrs, attrlen, RTA_ENCAP);
+  			if (nla) {
+ -				ret = fib_gw_from_attr(&fib_cfg.fc_gw4, nla,
+ -						       extack);
+ -				if (ret)
+ -					goto errout;
+ +				struct lwtunnel_state *lwtstate;
+ +				struct nlattr *nla_entype;
+ +
+ +				nla_entype = nla_find(attrs, attrlen,
+ +						      RTA_ENCAP_TYPE);
+ +				if (!nla_entype) {
+ +					NL_SET_BAD_ATTR(extack, nla);
+ +					NL_SET_ERR_MSG(extack,
+ +						       "Encap type is missing");
+ +					goto err_inval;
+ +				}
+  
+ -				if (fib_cfg.fc_gw4)
+ -					fib_cfg.fc_gw_family = AF_INET;
+ -			} else if (nlav) {
+ -				ret = fib_gw_from_via(&fib_cfg, nlav, extack);
+ +				ret = lwtunnel_build_state(nla_get_u16(
+ +							   nla_entype),
+ +							   nla,  AF_INET, cfg,
+ +							   &lwtstate, extack);
+  				if (ret)
+  					goto errout;
+ +				nexthop_nh->nh_lwtstate =
+ +					lwtstate_get(lwtstate);
+  			}
+ -
+ -			nla = nla_find(attrs, attrlen, RTA_FLOW);
+ -			if (nla) {
+ -				if (nla_len(nla) < sizeof(u32)) {
+ -					NL_SET_ERR_MSG(extack, "Invalid RTA_FLOW");
+ -					return -EINVAL;
+ -				}
+ -				fib_cfg.fc_flow = nla_get_u32(nla);
+ -			}
+++<<<<<<< HEAD
+++=======
++ 
++ 			fib_cfg.fc_encap = nla_find(attrs, attrlen, RTA_ENCAP);
++ 			/* RTA_ENCAP_TYPE length checked in
++ 			 * lwtunnel_valid_encap_type_attr
++ 			 */
++ 			nla = nla_find(attrs, attrlen, RTA_ENCAP_TYPE);
++ 			if (nla)
++ 				fib_cfg.fc_encap_type = nla_get_u16(nla);
+++>>>>>>> 8bda81a4d400 (lwtunnel: Validate RTA_ENCAP_TYPE attribute length)
+  		}
+  
+ -		ret = fib_nh_init(net, nexthop_nh, &fib_cfg,
+ -				  rtnh->rtnh_hops + 1, extack);
+ -		if (ret)
+ -			goto errout;
+ -
+  		rtnh = rtnh_next(rtnh, &remaining);
+  	} endfor_nexthops(fi);
+  
+diff --git a/net/core/lwtunnel.c b/net/core/lwtunnel.c
+index 88f9ca7b7ecf..2f8d01e8f474 100644
+--- a/net/core/lwtunnel.c
++++ b/net/core/lwtunnel.c
+@@ -195,6 +195,10 @@ int lwtunnel_valid_encap_type_attr(struct nlattr *attr, int remaining,
+ 			nla_entype = nla_find(attrs, attrlen, RTA_ENCAP_TYPE);
+ 
+ 			if (nla_entype) {
++				if (nla_len(nla_entype) < sizeof(u16)) {
++					NL_SET_ERR_MSG(extack, "Invalid RTA_ENCAP_TYPE");
++					return -EINVAL;
++				}
+ 				encap_type = nla_get_u16(nla_entype);
+ 
+ 				if (lwtunnel_valid_encap_type(encap_type,
+* Unmerged path net/ipv4/fib_semantics.c
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 794d5a8e3d5b..eebc38de0a56 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -4489,6 +4489,10 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
+ 				r_cfg.fc_flags |= RTF_GATEWAY;
+ 			}
+ 			r_cfg.fc_encap = nla_find(attrs, attrlen, RTA_ENCAP);
++
++			/* RTA_ENCAP_TYPE length checked in
++			 * lwtunnel_valid_encap_type_attr
++			 */
+ 			nla = nla_find(attrs, attrlen, RTA_ENCAP_TYPE);
+ 			if (nla)
+ 				r_cfg.fc_encap_type = nla_get_u16(nla);
