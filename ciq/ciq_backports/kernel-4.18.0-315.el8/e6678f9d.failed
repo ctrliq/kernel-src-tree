@@ -1,0 +1,246 @@
+mt76: mt7915: rework mt7915_tm_set_tx_len()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Shayne Chen <shayne.chen@mediatek.com>
+commit e6678f9dc59ab1535ba29d8b28e80fad212156a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/e6678f9d.failed
+
+Rework mt7915_tm_set_tx_len() with mt76_testmode_alloc_skb() to support
+larger packet based on a longer tx_time.
+
+	Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit e6678f9dc59ab1535ba29d8b28e80fad212156a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+index fe56ab18e974,f9d81e36ef09..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+@@@ -130,15 -132,214 +130,216 @@@ mt7915_tm_set_trx(struct mt7915_dev *de
+  				 sizeof(req), false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mt7915_tm_clean_hwq(struct mt7915_phy *phy, u8 wcid)
++ {
++ 	struct mt7915_dev *dev = phy->dev;
++ 	struct mt7915_tm_cmd req = {
++ 		.testmode_en = 1,
++ 		.param_idx = MCU_ATE_CLEAN_TXQUEUE,
++ 		.param.clean.wcid = wcid,
++ 		.param.clean.band = phy != &dev->phy,
++ 	};
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(ATE_CTRL), &req,
++ 				 sizeof(req), false);
++ }
++ 
++ static int
++ mt7915_tm_set_slot_time(struct mt7915_phy *phy, u8 slot_time, u8 sifs)
++ {
++ 	struct mt7915_dev *dev = phy->dev;
++ 	struct mt7915_tm_cmd req = {
++ 		.testmode_en = !(phy->mt76->test.state == MT76_TM_STATE_OFF),
++ 		.param_idx = MCU_ATE_SET_SLOT_TIME,
++ 		.param.slot.slot_time = slot_time,
++ 		.param.slot.sifs = sifs,
++ 		.param.slot.rifs = 2,
++ 		.param.slot.eifs = cpu_to_le16(60),
++ 		.param.slot.band = phy != &dev->phy,
++ 	};
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(ATE_CTRL), &req,
++ 				 sizeof(req), false);
++ }
++ 
++ static int
++ mt7915_tm_set_wmm_qid(struct mt7915_dev *dev, u8 qid, u8 aifs, u8 cw_min,
++ 		      u16 cw_max, u16 txop)
++ {
++ 	struct mt7915_mcu_tx req = { .total = 1 };
++ 	struct edca *e = &req.edca[0];
++ 
++ 	e->queue = qid;
++ 	e->set = WMM_PARAM_SET;
++ 
++ 	e->aifs = aifs;
++ 	e->cw_min = cw_min;
++ 	e->cw_max = cpu_to_le16(cw_max);
++ 	e->txop = cpu_to_le16(txop);
++ 
++ 	return mt7915_mcu_update_edca(dev, &req);
++ }
++ 
++ static int
++ mt7915_tm_set_ipg_params(struct mt7915_phy *phy, u32 ipg, u8 mode)
++ {
++ #define TM_DEFAULT_SIFS	10
++ #define TM_MAX_SIFS	127
++ #define TM_MAX_AIFSN	0xf
++ #define TM_MIN_AIFSN	0x1
++ #define BBP_PROC_TIME	1500
++ 	struct mt7915_dev *dev = phy->dev;
++ 	u8 sig_ext = (mode == MT76_TM_TX_MODE_CCK) ? 0 : 6;
++ 	u8 slot_time = 9, sifs = TM_DEFAULT_SIFS;
++ 	u8 aifsn = TM_MIN_AIFSN;
++ 	u32 i2t_time, tr2t_time, txv_time;
++ 	bool ext_phy = phy != &dev->phy;
++ 	u16 cw = 0;
++ 
++ 	if (ipg < sig_ext + slot_time + sifs)
++ 		ipg = 0;
++ 
++ 	if (!ipg)
++ 		goto done;
++ 
++ 	ipg -= sig_ext;
++ 
++ 	if (ipg <= (TM_MAX_SIFS + slot_time)) {
++ 		sifs = ipg - slot_time;
++ 	} else {
++ 		u32 val = (ipg + slot_time) / slot_time;
++ 
++ 		while (val >>= 1)
++ 			cw++;
++ 
++ 		if (cw > 16)
++ 			cw = 16;
++ 
++ 		ipg -= ((1 << cw) - 1) * slot_time;
++ 
++ 		aifsn = ipg / slot_time;
++ 		if (aifsn > TM_MAX_AIFSN)
++ 			aifsn = TM_MAX_AIFSN;
++ 
++ 		ipg -= aifsn * slot_time;
++ 
++ 		if (ipg > TM_DEFAULT_SIFS) {
++ 			if (ipg < TM_MAX_SIFS)
++ 				sifs = ipg;
++ 			else
++ 				sifs = TM_MAX_SIFS;
++ 		}
++ 	}
++ done:
++ 	txv_time = mt76_get_field(dev, MT_TMAC_ATCR(ext_phy),
++ 				  MT_TMAC_ATCR_TXV_TOUT);
++ 	txv_time *= 50;	/* normal clock time */
++ 
++ 	i2t_time = (slot_time * 1000 - txv_time - BBP_PROC_TIME) / 50;
++ 	tr2t_time = (sifs * 1000 - txv_time - BBP_PROC_TIME) / 50;
++ 
++ 	mt76_set(dev, MT_TMAC_TRCR0(ext_phy),
++ 		 FIELD_PREP(MT_TMAC_TRCR0_TR2T_CHK, tr2t_time) |
++ 		 FIELD_PREP(MT_TMAC_TRCR0_I2T_CHK, i2t_time));
++ 
++ 	mt7915_tm_set_slot_time(phy, slot_time, sifs);
++ 
++ 	return mt7915_tm_set_wmm_qid(dev,
++ 				     mt7915_lmac_mapping(dev, IEEE80211_AC_BE),
++ 				     aifsn, cw, cw, 0);
++ }
++ 
++ static int
++ mt7915_tm_set_tx_len(struct mt7915_phy *phy, u32 tx_time)
++ {
++ 	struct mt76_phy *mphy = phy->mt76;
++ 	struct mt76_testmode_data *td = &mphy->test;
++ 	struct ieee80211_supported_band *sband;
++ 	struct rate_info rate = {};
++ 	u16 flags = 0, tx_len;
++ 	u32 bitrate;
++ 	int ret;
++ 
++ 	if (!tx_time)
++ 		return 0;
++ 
++ 	rate.mcs = td->tx_rate_idx;
++ 	rate.nss = td->tx_rate_nss;
++ 
++ 	switch (td->tx_rate_mode) {
++ 	case MT76_TM_TX_MODE_CCK:
++ 	case MT76_TM_TX_MODE_OFDM:
++ 		if (mphy->chandef.chan->band == NL80211_BAND_5GHZ)
++ 			sband = &mphy->sband_5g.sband;
++ 		else
++ 			sband = &mphy->sband_2g.sband;
++ 
++ 		rate.legacy = sband->bitrates[rate.mcs].bitrate;
++ 		break;
++ 	case MT76_TM_TX_MODE_HT:
++ 		rate.mcs += rate.nss * 8;
++ 		flags |= RATE_INFO_FLAGS_MCS;
++ 
++ 		if (td->tx_rate_sgi)
++ 			flags |= RATE_INFO_FLAGS_SHORT_GI;
++ 		break;
++ 	case MT76_TM_TX_MODE_VHT:
++ 		flags |= RATE_INFO_FLAGS_VHT_MCS;
++ 
++ 		if (td->tx_rate_sgi)
++ 			flags |= RATE_INFO_FLAGS_SHORT_GI;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_SU:
++ 	case MT76_TM_TX_MODE_HE_EXT_SU:
++ 	case MT76_TM_TX_MODE_HE_TB:
++ 	case MT76_TM_TX_MODE_HE_MU:
++ 		rate.he_gi = td->tx_rate_sgi;
++ 		flags |= RATE_INFO_FLAGS_HE_MCS;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	rate.flags = flags;
++ 
++ 	switch (mphy->chandef.width) {
++ 	case NL80211_CHAN_WIDTH_160:
++ 	case NL80211_CHAN_WIDTH_80P80:
++ 		rate.bw = RATE_INFO_BW_160;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_80:
++ 		rate.bw = RATE_INFO_BW_80;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_40:
++ 		rate.bw = RATE_INFO_BW_40;
++ 		break;
++ 	default:
++ 		rate.bw = RATE_INFO_BW_20;
++ 		break;
++ 	}
++ 
++ 	bitrate = cfg80211_calculate_bitrate(&rate);
++ 	tx_len = bitrate * tx_time / 10 / 8;
++ 
++ 	ret = mt76_testmode_alloc_skb(phy->mt76, tx_len);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e6678f9dc59a (mt76: mt7915: rework mt7915_tm_set_tx_len())
+  static void
+ -mt7915_tm_reg_backup_restore(struct mt7915_phy *phy)
+ +mt7915_tm_reg_backup_restore(struct mt7915_dev *dev, struct mt7915_phy *phy)
+  {
+  	int n_regs = ARRAY_SIZE(reg_backup_list);
+ -	struct mt7915_dev *dev = phy->dev;
+  	bool ext_phy = phy != &dev->phy;
+ -	u32 *b = phy->test.reg_backup;
+ +	u32 *b = dev->test.reg_backup;
+  	int i;
+  
+ -	if (phy->mt76->test.state == MT76_TM_STATE_OFF) {
+ +	if (dev->mt76.test.state == MT76_TM_STATE_OFF) {
+  		for (i = 0; i < n_regs; i++)
+  			mt76_wr(dev, reg_backup_list[i].band[ext_phy], b[i]);
+  		return;
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
