@@ -1,0 +1,118 @@
+mptcp: fix state tracking for fallback socket
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 26aa231439fef49f11284ea9d9245e074d69197a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/26aa2314.failed
+
+We need to cope with some more state transition for
+fallback sockets, or could still end-up moving to TCP_CLOSE
+too early and avoid spooling some pending data
+
+Fixes: e16163b6e2b7 ("mptcp: refactor shutdown and close")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 26aa231439fef49f11284ea9d9245e074d69197a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index d41791292d73,2d450865937d..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -540,6 -771,21 +540,24 @@@ static void mptcp_check_for_eof(struct 
+  		set_bit(MPTCP_DATA_READY, &msk->flags);
+  		sk->sk_data_ready(sk);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	switch (sk->sk_state) {
++ 	case TCP_ESTABLISHED:
++ 		inet_sk_state_store(sk, TCP_CLOSE_WAIT);
++ 		break;
++ 	case TCP_FIN_WAIT1:
++ 		inet_sk_state_store(sk, TCP_CLOSING);
++ 		break;
++ 	case TCP_FIN_WAIT2:
++ 		inet_sk_state_store(sk, TCP_CLOSE);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 	mptcp_close_wake_up(sk);
+++>>>>>>> 26aa231439fe (mptcp: fix state tracking for fallback socket)
+  }
+  
+  static bool mptcp_ext_cache_refill(struct mptcp_sock *msk)
+@@@ -1624,7 -2070,60 +1642,64 @@@ static int mptcp_close_state(struct soc
+  	return next & TCP_ACTION_FIN;
+  }
+  
+++<<<<<<< HEAD
+ +static void mptcp_close(struct sock *sk, long timeout)
+++=======
++ static void __mptcp_check_send_data_fin(struct sock *sk)
++ {
++ 	struct mptcp_subflow_context *subflow;
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	pr_debug("msk=%p snd_data_fin_enable=%d pending=%d snd_nxt=%llu write_seq=%llu",
++ 		 msk, msk->snd_data_fin_enable, !!mptcp_send_head(sk),
++ 		 msk->snd_nxt, msk->write_seq);
++ 
++ 	/* we still need to enqueue subflows or not really shutting down,
++ 	 * skip this
++ 	 */
++ 	if (!msk->snd_data_fin_enable || msk->snd_nxt + 1 != msk->write_seq ||
++ 	    mptcp_send_head(sk))
++ 		return;
++ 
++ 	WRITE_ONCE(msk->snd_nxt, msk->write_seq);
++ 
++ 	/* fallback socket will not get data_fin/ack, can move to the next
++ 	 * state now
++ 	 */
++ 	if (__mptcp_check_fallback(msk)) {
++ 		if ((1 << sk->sk_state) & (TCPF_CLOSING | TCPF_LAST_ACK)) {
++ 			inet_sk_state_store(sk, TCP_CLOSE);
++ 			mptcp_close_wake_up(sk);
++ 		} else if (sk->sk_state == TCP_FIN_WAIT1) {
++ 			inet_sk_state_store(sk, TCP_FIN_WAIT2);
++ 		}
++ 	}
++ 
++ 	__mptcp_flush_join_list(msk);
++ 	mptcp_for_each_subflow(msk, subflow) {
++ 		struct sock *tcp_sk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		mptcp_subflow_shutdown(sk, tcp_sk, SEND_SHUTDOWN);
++ 	}
++ }
++ 
++ static void __mptcp_wr_shutdown(struct sock *sk)
++ {
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	pr_debug("msk=%p snd_data_fin_enable=%d shutdown=%x state=%d pending=%d",
++ 		 msk, msk->snd_data_fin_enable, sk->sk_shutdown, sk->sk_state,
++ 		 !!mptcp_send_head(sk));
++ 
++ 	/* will be ignored by fallback sockets */
++ 	WRITE_ONCE(msk->write_seq, msk->write_seq + 1);
++ 	WRITE_ONCE(msk->snd_data_fin_enable, 1);
++ 
++ 	__mptcp_check_send_data_fin(sk);
++ }
++ 
++ static void __mptcp_destroy_sock(struct sock *sk)
+++>>>>>>> 26aa231439fe (mptcp: fix state tracking for fallback socket)
+  {
+  	struct mptcp_subflow_context *subflow, *tmp;
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+* Unmerged path net/mptcp/protocol.c
