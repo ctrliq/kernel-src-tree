@@ -1,0 +1,558 @@
+printk: introduce a kmsg_dump iterator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit f9f3f02db98bbe678a8e57fe9432b196174744a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f9f3f02d.failed
+
+Rather than storing the iterator information in the registered
+kmsg_dumper structure, create a separate iterator structure. The
+kmsg_dump_iter structure can reside on the stack of the caller, thus
+allowing lockless use of the kmsg_dump functions.
+
+Update code that accesses the kernel logs using the kmsg_dumper
+structure to use the new kmsg_dump_iter structure. For kmsg_dumpers,
+this also means adding a call to kmsg_dump_rewind() to initialize
+the iterator.
+
+All this is in preparation for removal of @logbuf_lock.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Kees Cook <keescook@chromium.org> # pstore
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-13-john.ogness@linutronix.de
+(cherry picked from commit f9f3f02db98bbe678a8e57fe9432b196174744a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/xmon/xmon.c
+#	arch/um/kernel/kmsg_dump.c
+#	include/linux/kmsg_dump.h
+#	kernel/debug/kdb/kdb_main.c
+#	kernel/printk/printk.c
+diff --cc arch/powerpc/xmon/xmon.c
+index feb327dbc17f,dbcf403b1d8d..000000000000
+--- a/arch/powerpc/xmon/xmon.c
++++ b/arch/powerpc/xmon/xmon.c
+@@@ -2947,10 -3002,10 +2947,14 @@@ print_address(unsigned long addr
+  	xmon_print_symbol(addr, "\t# ", "");
+  }
+  
+ -static void
+ +void
+  dump_log_buf(void)
+  {
+++<<<<<<< HEAD
+ +	struct kmsg_dumper dumper = { .active = 1 };
+++=======
++ 	struct kmsg_dump_iter iter;
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  	unsigned char buf[128];
+  	size_t len;
+  
+diff --cc arch/um/kernel/kmsg_dump.c
+index 98bdf69e4c2e,0224fcb36e22..000000000000
+--- a/arch/um/kernel/kmsg_dump.c
++++ b/arch/um/kernel/kmsg_dump.c
+@@@ -8,10 -10,12 +8,15 @@@
+  static void kmsg_dumper_stdout(struct kmsg_dumper *dumper,
+  				enum kmsg_dump_reason reason)
+  {
+++<<<<<<< HEAD
+++=======
++ 	static struct kmsg_dump_iter iter;
++ 	static DEFINE_SPINLOCK(lock);
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  	static char line[1024];
+ -	struct console *con;
+ -	unsigned long flags;
+ +
+  	size_t len = 0;
+ +	bool con_available = false;
+  
+  	/* only dump kmsg when no console is available */
+  	if (!console_trylock())
+@@@ -22,11 -30,16 +27,13 @@@
+  
+  	console_unlock();
+  
+ -	if (con)
+ -		return;
+ -
+ -	if (!spin_trylock_irqsave(&lock, flags))
+ +	if (con_available == true)
+  		return;
+  
++ 	kmsg_dump_rewind(&iter);
++ 
+  	printf("kmsg_dump:\n");
+- 	while (kmsg_dump_get_line(dumper, true, line, sizeof(line), &len)) {
++ 	while (kmsg_dump_get_line(&iter, true, line, sizeof(line), &len)) {
+  		line[len] = '\0';
+  		printf("%s", line);
+  	}
+diff --cc include/linux/kmsg_dump.h
+index b833daa05587,36c8c57e1051..000000000000
+--- a/include/linux/kmsg_dump.h
++++ b/include/linux/kmsg_dump.h
+@@@ -25,11 -25,20 +25,21 @@@ enum kmsg_dump_reason 
+  	KMSG_DUMP_PANIC,
+  	KMSG_DUMP_OOPS,
+  	KMSG_DUMP_EMERG,
+ -	KMSG_DUMP_SHUTDOWN,
+ -	KMSG_DUMP_MAX
+ +	KMSG_DUMP_RESTART,
+ +	KMSG_DUMP_HALT,
+ +	KMSG_DUMP_POWEROFF,
+  };
+  
++ /**
++  * struct kmsg_dump_iter - iterator for retrieving kernel messages
++  * @cur_seq:	Points to the oldest message to dump
++  * @next_seq:	Points after the newest message to dump
++  */
++ struct kmsg_dump_iter {
++ 	u64	cur_seq;
++ 	u64	next_seq;
++ };
++ 
+  /**
+   * struct kmsg_dumper - kernel crash message dumper structure
+   * @list:	Entry in the dumper list (private)
+@@@ -37,37 -46,29 +47,41 @@@
+   * 		through the record iterator
+   * @max_reason:	filter for highest reason number that should be dumped
+   * @registered:	Flag that specifies if this is already registered
+++<<<<<<< HEAD
+ + * @active:	Flag that specifies if this is currently dumping
+ + * @cur_seq:	Points to the oldest message to dump
+ + * @next_seq:	Points after the newest message to dump
+++=======
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+   */
+  struct kmsg_dumper {
+  	struct list_head list;
+  	void (*dump)(struct kmsg_dumper *dumper, enum kmsg_dump_reason reason);
+  	enum kmsg_dump_reason max_reason;
+ +	bool active;
+  	bool registered;
+- 
+- 	/* private state of the kmsg iterator */
+- 	u64 cur_seq;
+- 	u64 next_seq;
+  };
+  
+  #ifdef CONFIG_PRINTK
+  void kmsg_dump(enum kmsg_dump_reason reason);
+  
+- bool kmsg_dump_get_line_nolock(struct kmsg_dumper *dumper, bool syslog,
++ bool kmsg_dump_get_line_nolock(struct kmsg_dump_iter *iter, bool syslog,
+  			       char *line, size_t size, size_t *len);
+  
+- bool kmsg_dump_get_line(struct kmsg_dumper *dumper, bool syslog,
++ bool kmsg_dump_get_line(struct kmsg_dump_iter *iter, bool syslog,
+  			char *line, size_t size, size_t *len);
+  
+++<<<<<<< HEAD
+ +bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
+ +			  char *buf, size_t size, size_t *len);
+++=======
++ bool kmsg_dump_get_buffer(struct kmsg_dump_iter *iter, bool syslog,
++ 			  char *buf, size_t size, size_t *len_out);
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  
+- void kmsg_dump_rewind_nolock(struct kmsg_dumper *dumper);
++ void kmsg_dump_rewind_nolock(struct kmsg_dump_iter *iter);
+  
+- void kmsg_dump_rewind(struct kmsg_dumper *dumper);
++ void kmsg_dump_rewind(struct kmsg_dump_iter *iter);
+  
+  int kmsg_dump_register(struct kmsg_dumper *dumper);
+  
+diff --cc kernel/debug/kdb/kdb_main.c
+index f3aee10cce6f,8544d7a55a57..000000000000
+--- a/kernel/debug/kdb/kdb_main.c
++++ b/kernel/debug/kdb/kdb_main.c
+@@@ -2088,7 -2101,7 +2088,11 @@@ static int kdb_dmesg(int argc, const ch
+  	int adjust = 0;
+  	int n = 0;
+  	int skip = 0;
+++<<<<<<< HEAD
+ +	struct kmsg_dumper dumper = { .active = 1 };
+++=======
++ 	struct kmsg_dump_iter iter;
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  	size_t len;
+  	char buf[201];
+  
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,b49dee256947..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -3180,31 -3390,24 +3180,33 @@@ module_param_named(always_kmsg_dump, al
+  void kmsg_dump(enum kmsg_dump_reason reason)
+  {
+  	struct kmsg_dumper *dumper;
+- 	unsigned long flags;
+  
+ +	if ((reason > KMSG_DUMP_OOPS) && !always_kmsg_dump)
+ +		return;
+ +
+  	rcu_read_lock();
+  	list_for_each_entry_rcu(dumper, &dump_list, list) {
+ -		enum kmsg_dump_reason max_reason = dumper->max_reason;
+ -
+ -		/*
+ -		 * If client has not provided a specific max_reason, default
+ -		 * to KMSG_DUMP_OOPS, unless always_kmsg_dump was set.
+ -		 */
+ -		if (max_reason == KMSG_DUMP_UNDEF) {
+ -			max_reason = always_kmsg_dump ? KMSG_DUMP_MAX :
+ -							KMSG_DUMP_OOPS;
+ -		}
+ -		if (reason > max_reason)
+ +		if (dumper->max_reason && reason > dumper->max_reason)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		/* initialize iterator with data about the stored records */
+ +		dumper->active = true;
+ +
+ +		logbuf_lock_irqsave(flags);
+ +		dumper->cur_seq = clear_seq;
+ +		dumper->cur_idx = clear_idx;
+ +		dumper->next_seq = log_next_seq;
+ +		dumper->next_idx = log_next_idx;
+ +		logbuf_unlock_irqrestore(flags);
+ +
+++=======
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  		/* invoke dumper which will iterate over records */
+  		dumper->dump(dumper, reason);
+ +
+ +		/* reset iterator */
+ +		dumper->active = false;
+  	}
+  	rcu_read_unlock();
+  }
+@@@ -3228,31 -3431,37 +3230,62 @@@
+   *
+   * The function is similar to kmsg_dump_get_line(), but grabs no locks.
+   */
+- bool kmsg_dump_get_line_nolock(struct kmsg_dumper *dumper, bool syslog,
++ bool kmsg_dump_get_line_nolock(struct kmsg_dump_iter *iter, bool syslog,
+  			       char *line, size_t size, size_t *len)
+  {
+++<<<<<<< HEAD
+ +	struct printk_log *msg;
+ +	size_t l = 0;
+ +	bool ret = false;
+ +
+ +	if (!dumper->active)
+ +		goto out;
+++=======
++ 	u64 min_seq = latched_seq_read_nolock(&clear_seq);
++ 	struct printk_info info;
++ 	unsigned int line_count;
++ 	struct printk_record r;
++ 	size_t l = 0;
++ 	bool ret = false;
++ 
++ 	if (iter->cur_seq < min_seq)
++ 		iter->cur_seq = min_seq;
++ 
++ 	prb_rec_init_rd(&r, &info, line, size);
++ 
++ 	/* Read text or count text lines? */
++ 	if (line) {
++ 		if (!prb_read_valid(prb, iter->cur_seq, &r))
++ 			goto out;
++ 		l = record_print_text(&r, syslog, printk_time);
++ 	} else {
++ 		if (!prb_read_valid_info(prb, iter->cur_seq,
++ 					 &info, &line_count)) {
++ 			goto out;
++ 		}
++ 		l = get_record_print_text_size(&info, line_count, syslog,
++ 					       printk_time);
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  
+ +	if (dumper->cur_seq < log_first_seq) {
+ +		/* messages are gone, move to first available one */
+ +		dumper->cur_seq = log_first_seq;
+ +		dumper->cur_idx = log_first_idx;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* last entry */
+ +	if (dumper->cur_seq >= log_next_seq)
+ +		goto out;
+ +
+ +	msg = log_from_idx(dumper->cur_idx);
+ +	l = msg_print_text(msg, syslog, printk_time, line, size);
+ +
+ +	dumper->cur_idx = log_next(dumper->cur_idx);
+ +	dumper->cur_seq++;
+++=======
++ 	iter->cur_seq = r.info->seq + 1;
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  	ret = true;
+  out:
+  	if (len)
+@@@ -3310,26 -3519,31 +3343,46 @@@ EXPORT_SYMBOL_GPL(kmsg_dump_get_line)
+   * A return value of FALSE indicates that there are no more records to
+   * read.
+   */
+++<<<<<<< HEAD
+ +bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
+ +			  char *buf, size_t size, size_t *len)
+ +{
+++=======
++ bool kmsg_dump_get_buffer(struct kmsg_dump_iter *iter, bool syslog,
++ 			  char *buf, size_t size, size_t *len_out)
++ {
++ 	u64 min_seq = latched_seq_read_nolock(&clear_seq);
++ 	struct printk_info info;
++ 	struct printk_record r;
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  	unsigned long flags;
+  	u64 seq;
+ +	u32 idx;
+  	u64 next_seq;
+ -	size_t len = 0;
+ +	u32 next_idx;
+ +	size_t l = 0;
+  	bool ret = false;
+  	bool time = printk_time;
+  
+ -	if (!buf || !size)
+ +	if (!dumper->active)
+  		goto out;
+  
++ 	if (iter->cur_seq < min_seq)
++ 		iter->cur_seq = min_seq;
++ 
+  	logbuf_lock_irqsave(flags);
+++<<<<<<< HEAD
+ +	if (dumper->cur_seq < log_first_seq) {
+ +		/* messages are gone, move to first available one */
+ +		dumper->cur_seq = log_first_seq;
+ +		dumper->cur_idx = log_first_idx;
+++=======
++ 	if (prb_read_valid_info(prb, iter->cur_seq, &info, NULL)) {
++ 		if (info.seq != iter->cur_seq) {
++ 			/* messages are gone, move to first available one */
++ 			iter->cur_seq = info.seq;
++ 		}
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  	}
+  
+  	/* last entry */
+@@@ -3338,43 -3552,35 +3391,69 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* calculate length of entire buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+++=======
++ 	/*
++ 	 * Find first record that fits, including all following records,
++ 	 * into the user-provided buffer for this dump. Pass in size-1
++ 	 * because this function (by way of record_print_text()) will
++ 	 * not write more than size-1 bytes of text into @buf.
++ 	 */
++ 	seq = find_first_fitting_seq(iter->cur_seq, iter->next_seq,
++ 				     size - 1, syslog, time);
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  
+ -	/*
+ -	 * Next kmsg_dump_get_buffer() invocation will dump block of
+ -	 * older records stored right before this one.
+ -	 */
+ +		l += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+ +
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (l >= size && seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+ +		l -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+ +
+ +	/* last message in next interation */
+  	next_seq = seq;
+ +	next_idx = idx;
+ +
+ +	l = 0;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -	prb_rec_init_rd(&r, &info, buf, size);
+++<<<<<<< HEAD
+ +		l += msg_print_text(msg, syslog, time, buf + l, size - l);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+  
+ +	dumper->next_seq = next_seq;
+ +	dumper->next_idx = next_idx;
+++=======
++ 	len = 0;
++ 	prb_for_each_record(seq, prb, seq, &r) {
++ 		if (r.info->seq >= iter->next_seq)
++ 			break;
++ 
++ 		len += record_print_text(&r, syslog, time);
++ 
++ 		/* Adjust record to store to remaining buffer space. */
++ 		prb_rec_init_rd(&r, &info, buf + len, size - len);
++ 	}
++ 
++ 	iter->next_seq = next_seq;
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  	ret = true;
+  	logbuf_unlock_irqrestore(flags);
+  out:
+@@@ -3394,12 -3600,10 +3473,17 @@@ EXPORT_SYMBOL_GPL(kmsg_dump_get_buffer)
+   *
+   * The function is similar to kmsg_dump_rewind(), but grabs no locks.
+   */
+- void kmsg_dump_rewind_nolock(struct kmsg_dumper *dumper)
++ void kmsg_dump_rewind_nolock(struct kmsg_dump_iter *iter)
+  {
+++<<<<<<< HEAD
+ +	dumper->cur_seq = clear_seq;
+ +	dumper->cur_idx = clear_idx;
+ +	dumper->next_seq = log_next_seq;
+ +	dumper->next_idx = log_next_idx;
+++=======
++ 	iter->cur_seq = latched_seq_read_nolock(&clear_seq);
++ 	iter->next_seq = prb_next_seq(prb);
+++>>>>>>> f9f3f02db98b (printk: introduce a kmsg_dump iterator)
+  }
+  
+  /**
+diff --git a/arch/powerpc/kernel/nvram_64.c b/arch/powerpc/kernel/nvram_64.c
+index 667b97fcd131..6bfe757c9e60 100644
+--- a/arch/powerpc/kernel/nvram_64.c
++++ b/arch/powerpc/kernel/nvram_64.c
+@@ -657,6 +657,7 @@ static void oops_to_nvram(struct kmsg_dumper *dumper,
+ {
+ 	struct oops_log_info *oops_hdr = (struct oops_log_info *)oops_buf;
+ 	static unsigned int oops_count = 0;
++	static struct kmsg_dump_iter iter;
+ 	static bool panicking = false;
+ 	static DEFINE_SPINLOCK(lock);
+ 	unsigned long flags;
+@@ -693,13 +694,14 @@ static void oops_to_nvram(struct kmsg_dumper *dumper,
+ 		return;
+ 
+ 	if (big_oops_buf) {
+-		kmsg_dump_get_buffer(dumper, false,
++		kmsg_dump_rewind(&iter);
++		kmsg_dump_get_buffer(&iter, false,
+ 				     big_oops_buf, big_oops_buf_sz, &text_len);
+ 		rc = zip_oops(text_len);
+ 	}
+ 	if (rc != 0) {
+-		kmsg_dump_rewind(dumper);
+-		kmsg_dump_get_buffer(dumper, false,
++		kmsg_dump_rewind(&iter);
++		kmsg_dump_get_buffer(&iter, false,
+ 				     oops_data, oops_data_sz, &text_len);
+ 		err_type = ERR_TYPE_KERNEL_PANIC;
+ 		oops_hdr->version = cpu_to_be16(OOPS_HDR_VERSION);
+* Unmerged path arch/powerpc/xmon/xmon.c
+* Unmerged path arch/um/kernel/kmsg_dump.c
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index 0727fcbc8e77..47e4f15512f3 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -1412,6 +1412,7 @@ static irqreturn_t vmbus_percpu_isr(int irq, void *dev_id)
+ static void hv_kmsg_dump(struct kmsg_dumper *dumper,
+ 			 enum kmsg_dump_reason reason)
+ {
++	struct kmsg_dump_iter iter;
+ 	size_t bytes_written;
+ 
+ 	/* We are only interested in panics. */
+@@ -1422,7 +1423,8 @@ static void hv_kmsg_dump(struct kmsg_dumper *dumper,
+ 	 * Write dump contents to the page. No need to synchronize; panic should
+ 	 * be single-threaded.
+ 	 */
+-	kmsg_dump_get_buffer(dumper, false, hv_panic_page, HV_HYP_PAGE_SIZE,
++	kmsg_dump_rewind(&iter);
++	kmsg_dump_get_buffer(&iter, false, hv_panic_page, HV_HYP_PAGE_SIZE,
+ 			     &bytes_written);
+ 	if (!bytes_written)
+ 		return;
+diff --git a/drivers/mtd/mtdoops.c b/drivers/mtd/mtdoops.c
+index 09ecc9fcdffa..7f987089eed4 100644
+--- a/drivers/mtd/mtdoops.c
++++ b/drivers/mtd/mtdoops.c
+@@ -291,14 +291,17 @@ static void mtdoops_do_dump(struct kmsg_dumper *dumper,
+ {
+ 	struct mtdoops_context *cxt = container_of(dumper,
+ 			struct mtdoops_context, dump);
++	struct kmsg_dump_iter iter;
+ 
+ 	/* Only dump oopses if dump_oops is set */
+ 	if (reason == KMSG_DUMP_OOPS && !dump_oops)
+ 		return;
+ 
++	kmsg_dump_rewind(&iter);
++
+ 	if (test_and_set_bit(0, &cxt->oops_buf_busy))
+ 		return;
+-	kmsg_dump_get_buffer(dumper, true, cxt->oops_buf + MTDOOPS_HEADER_SIZE,
++	kmsg_dump_get_buffer(&iter, true, cxt->oops_buf + MTDOOPS_HEADER_SIZE,
+ 			     record_size - MTDOOPS_HEADER_SIZE, NULL);
+ 	clear_bit(0, &cxt->oops_buf_busy);
+ 
+diff --git a/fs/pstore/platform.c b/fs/pstore/platform.c
+index cee4de8ba844..9b41c914a623 100644
+--- a/fs/pstore/platform.c
++++ b/fs/pstore/platform.c
+@@ -340,6 +340,7 @@ void pstore_record_init(struct pstore_record *record,
+ static void pstore_dump(struct kmsg_dumper *dumper,
+ 			enum kmsg_dump_reason reason)
+ {
++	struct kmsg_dump_iter iter;
+ 	unsigned long	total = 0;
+ 	const char	*why;
+ 	unsigned int	part = 1;
+@@ -360,6 +361,8 @@ static void pstore_dump(struct kmsg_dumper *dumper,
+ 		}
+ 	}
+ 
++	kmsg_dump_rewind(&iter);
++
+ 	oopscount++;
+ 	while (total < kmsg_bytes) {
+ 		char *dst;
+@@ -390,7 +393,7 @@ static void pstore_dump(struct kmsg_dumper *dumper,
+ 		dst_size -= header_size;
+ 
+ 		/* Write dump contents. */
+-		if (!kmsg_dump_get_buffer(dumper, true, dst + header_size,
++		if (!kmsg_dump_get_buffer(&iter, true, dst + header_size,
+ 					  dst_size, &dump_size))
+ 			break;
+ 
+* Unmerged path include/linux/kmsg_dump.h
+* Unmerged path kernel/debug/kdb/kdb_main.c
+* Unmerged path kernel/printk/printk.c
