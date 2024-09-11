@@ -1,0 +1,137 @@
+powerpc/pmem: Add flush routines using new pmem store and sync instruction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit d358042793183a57094dac45a44116e1165ac593
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d3580427.failed
+
+Start using dcbstps; phwsync; sequence for flushing persistent memory range.
+The new instructions are implemented as a variant of dcbf and hwsync and on
+P8 and P9 they will be executed as those instructions. We avoid using them on
+older hardware. This helps to avoid difficult to debug bugs.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200701072235.223558-4-aneesh.kumar@linux.ibm.com
+(cherry picked from commit d358042793183a57094dac45a44116e1165ac593)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/cacheflush.h
+diff --cc arch/powerpc/include/asm/cacheflush.h
+index c3d1d798ef71,54764c6e922d..000000000000
+--- a/arch/powerpc/include/asm/cacheflush.h
++++ b/arch/powerpc/include/asm/cacheflush.h
+@@@ -12,18 -7,6 +12,21 @@@
+  #include <linux/mm.h>
+  #include <asm/cputable.h>
+  #include <asm/cpu_has_feature.h>
+++<<<<<<< HEAD
+ +
+ +/*
+ + * No cache flushing is required when address mappings are changed,
+ + * because the caches on PowerPCs are physically addressed.
+ + */
+ +#define flush_cache_all()			do { } while (0)
+ +#define flush_cache_mm(mm)			do { } while (0)
+ +#define flush_cache_dup_mm(mm)			do { } while (0)
+ +#define flush_cache_range(vma, start, end)	do { } while (0)
+ +#define flush_cache_page(vma, vmaddr, pfn)	do { } while (0)
+ +#define flush_icache_page(vma, page)		do { } while (0)
+ +#define flush_cache_vunmap(start, end)		do { } while (0)
+++=======
+++>>>>>>> d35804279318 (powerpc/pmem: Add flush routines using new pmem store and sync instruction)
+  
+  #ifdef CONFIG_PPC_BOOK3S_64
+  /*
+* Unmerged path arch/powerpc/include/asm/cacheflush.h
+diff --git a/arch/powerpc/lib/pmem.c b/arch/powerpc/lib/pmem.c
+index 36e08bf850e0..de11582f481a 100644
+--- a/arch/powerpc/lib/pmem.c
++++ b/arch/powerpc/lib/pmem.c
+@@ -17,20 +17,62 @@
+ 
+ #include <asm/cacheflush.h>
+ 
++static inline void __clean_pmem_range(unsigned long start, unsigned long stop)
++{
++	unsigned long shift = l1_dcache_shift();
++	unsigned long bytes = l1_dcache_bytes();
++	void *addr = (void *)(start & ~(bytes - 1));
++	unsigned long size = stop - (unsigned long)addr + (bytes - 1);
++	unsigned long i;
++
++	for (i = 0; i < size >> shift; i++, addr += bytes)
++		asm volatile(PPC_DCBSTPS(%0, %1): :"i"(0), "r"(addr): "memory");
++
++
++	asm volatile(PPC_PHWSYNC ::: "memory");
++}
++
++static inline void __flush_pmem_range(unsigned long start, unsigned long stop)
++{
++	unsigned long shift = l1_dcache_shift();
++	unsigned long bytes = l1_dcache_bytes();
++	void *addr = (void *)(start & ~(bytes - 1));
++	unsigned long size = stop - (unsigned long)addr + (bytes - 1);
++	unsigned long i;
++
++	for (i = 0; i < size >> shift; i++, addr += bytes)
++		asm volatile(PPC_DCBFPS(%0, %1): :"i"(0), "r"(addr): "memory");
++
++
++	asm volatile(PPC_PHWSYNC ::: "memory");
++}
++
++static inline void clean_pmem_range(unsigned long start, unsigned long stop)
++{
++	if (cpu_has_feature(CPU_FTR_ARCH_207S))
++		return __clean_pmem_range(start, stop);
++}
++
++static inline void flush_pmem_range(unsigned long start, unsigned long stop)
++{
++	if (cpu_has_feature(CPU_FTR_ARCH_207S))
++		return __flush_pmem_range(start, stop);
++}
++
+ /*
+  * CONFIG_ARCH_HAS_PMEM_API symbols
+  */
+ void arch_wb_cache_pmem(void *addr, size_t size)
+ {
+ 	unsigned long start = (unsigned long) addr;
+-	flush_dcache_range(start, start + size);
++	clean_pmem_range(start, start + size);
+ }
+ EXPORT_SYMBOL(arch_wb_cache_pmem);
+ 
+ void arch_invalidate_pmem(void *addr, size_t size)
+ {
+ 	unsigned long start = (unsigned long) addr;
+-	flush_dcache_range(start, start + size);
++	flush_pmem_range(start, start + size);
+ }
+ EXPORT_SYMBOL(arch_invalidate_pmem);
+ 
+@@ -43,7 +85,7 @@ long __copy_from_user_flushcache(void *dest, const void __user *src,
+ 	unsigned long copied, start = (unsigned long) dest;
+ 
+ 	copied = __copy_from_user(dest, src, size);
+-	flush_dcache_range(start, start + size);
++	clean_pmem_range(start, start + size);
+ 
+ 	return copied;
+ }
+@@ -53,7 +95,7 @@ void *memcpy_flushcache(void *dest, const void *src, size_t size)
+ 	unsigned long start = (unsigned long) dest;
+ 
+ 	memcpy(dest, src, size);
+-	flush_dcache_range(start, start + size);
++	clean_pmem_range(start, start + size);
+ 
+ 	return dest;
+ }
