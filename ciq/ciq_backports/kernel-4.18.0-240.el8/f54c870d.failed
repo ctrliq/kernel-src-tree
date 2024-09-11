@@ -1,0 +1,162 @@
+xprtrdma: Replace dprintk() in rpcrdma_update_connect_private()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit f54c870d326aa02b73b68d2e0a503ec81dd3a4e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f54c870d.failed
+
+Clean up: Use a single trace point to record each connection's
+negotiated inline thresholds and the computed maximum byte size
+of transport headers.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit f54c870d326aa02b73b68d2e0a503ec81dd3a4e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/rpcrdma.h
+diff --cc include/trace/events/rpcrdma.h
+index cfe761e490ec,0ca118bcc5ce..000000000000
+--- a/include/trace/events/rpcrdma.h
++++ b/include/trace/events/rpcrdma.h
+@@@ -333,13 -371,59 +333,63 @@@ TRACE_EVENT(xprtrdma_cm_event
+  	)
+  );
+  
+++<<<<<<< HEAD
+ +TRACE_EVENT(xprtrdma_disconnect,
+++=======
++ TRACE_EVENT(xprtrdma_inline_thresh,
++ 	TP_PROTO(
++ 		const struct rpcrdma_xprt *r_xprt
++ 	),
++ 
++ 	TP_ARGS(r_xprt),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(const void *, r_xprt)
++ 		__field(unsigned int, inline_send)
++ 		__field(unsigned int, inline_recv)
++ 		__field(unsigned int, max_send)
++ 		__field(unsigned int, max_recv)
++ 		__string(addr, rpcrdma_addrstr(r_xprt))
++ 		__string(port, rpcrdma_portstr(r_xprt))
++ 	),
++ 
++ 	TP_fast_assign(
++ 		const struct rpcrdma_ep *ep = &r_xprt->rx_ep;
++ 
++ 		__entry->r_xprt = r_xprt;
++ 		__entry->inline_send = ep->rep_inline_send;
++ 		__entry->inline_recv = ep->rep_inline_recv;
++ 		__entry->max_send = ep->rep_max_inline_send;
++ 		__entry->max_recv = ep->rep_max_inline_recv;
++ 		__assign_str(addr, rpcrdma_addrstr(r_xprt));
++ 		__assign_str(port, rpcrdma_portstr(r_xprt));
++ 	),
++ 
++ 	TP_printk("peer=[%s]:%s r_xprt=%p neg send/recv=%u/%u, calc send/recv=%u/%u",
++ 		__get_str(addr), __get_str(port), __entry->r_xprt,
++ 		__entry->inline_send, __entry->inline_recv,
++ 		__entry->max_send, __entry->max_recv
++ 	)
++ );
++ 
++ DEFINE_CONN_EVENT(connect);
++ DEFINE_CONN_EVENT(disconnect);
++ 
++ DEFINE_RXPRT_EVENT(xprtrdma_create);
++ DEFINE_RXPRT_EVENT(xprtrdma_op_destroy);
++ DEFINE_RXPRT_EVENT(xprtrdma_remove);
++ DEFINE_RXPRT_EVENT(xprtrdma_reinsert);
++ DEFINE_RXPRT_EVENT(xprtrdma_op_inject_dsc);
++ DEFINE_RXPRT_EVENT(xprtrdma_op_close);
++ 
++ TRACE_EVENT(xprtrdma_op_connect,
+++>>>>>>> f54c870d326a (xprtrdma: Replace dprintk() in rpcrdma_update_connect_private())
+  	TP_PROTO(
+  		const struct rpcrdma_xprt *r_xprt,
+ -		unsigned long delay
+ +		int status
+  	),
+  
+ -	TP_ARGS(r_xprt, delay),
+ +	TP_ARGS(r_xprt, status),
+  
+  	TP_STRUCT__entry(
+  		__field(const void *, r_xprt)
+* Unmerged path include/trace/events/rpcrdma.h
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index 5853a751b2e9..8b1d375ad636 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -78,8 +78,6 @@ static unsigned int rpcrdma_max_call_header_size(unsigned int maxsegs)
+ 	size += rpcrdma_segment_maxsz * sizeof(__be32);
+ 	size += sizeof(__be32);	/* list discriminator */
+ 
+-	dprintk("RPC:       %s: max call header size = %u\n",
+-		__func__, size);
+ 	return size;
+ }
+ 
+@@ -100,8 +98,6 @@ static unsigned int rpcrdma_max_reply_header_size(unsigned int maxsegs)
+ 	size += maxsegs * rpcrdma_segment_maxsz * sizeof(__be32);
+ 	size += sizeof(__be32);	/* list discriminator */
+ 
+-	dprintk("RPC:       %s: max reply header size = %u\n",
+-		__func__, size);
+ 	return size;
+ }
+ 
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index b85547dfac69..2ba086673322 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -174,11 +174,11 @@ rpcrdma_wc_receive(struct ib_cq *cq, struct ib_wc *wc)
+ 	rpcrdma_recv_buffer_put(rep);
+ }
+ 
+-static void
+-rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
+-			       struct rdma_conn_param *param)
++static void rpcrdma_update_cm_private(struct rpcrdma_xprt *r_xprt,
++				      struct rdma_conn_param *param)
+ {
+ 	const struct rpcrdma_connect_private *pmsg = param->private_data;
++	struct rpcrdma_ep *ep = &r_xprt->rx_ep;
+ 	unsigned int rsize, wsize;
+ 
+ 	/* Default settings for RPC-over-RDMA Version One */
+@@ -194,13 +194,11 @@ rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
+ 		wsize = rpcrdma_decode_buffer_size(pmsg->cp_recv_size);
+ 	}
+ 
+-	if (rsize < r_xprt->rx_ep.rep_inline_recv)
+-		r_xprt->rx_ep.rep_inline_recv = rsize;
+-	if (wsize < r_xprt->rx_ep.rep_inline_send)
+-		r_xprt->rx_ep.rep_inline_send = wsize;
+-	dprintk("RPC:       %s: max send %u, max recv %u\n", __func__,
+-		r_xprt->rx_ep.rep_inline_send,
+-		r_xprt->rx_ep.rep_inline_recv);
++	if (rsize < ep->rep_inline_recv)
++		ep->rep_inline_recv = rsize;
++	if (wsize < ep->rep_inline_send)
++		ep->rep_inline_send = wsize;
++
+ 	rpcrdma_set_max_header_sizes(r_xprt);
+ }
+ 
+@@ -254,7 +252,8 @@ rpcrdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
+ 	case RDMA_CM_EVENT_ESTABLISHED:
+ 		++xprt->connect_cookie;
+ 		ep->rep_connected = 1;
+-		rpcrdma_update_connect_private(r_xprt, &event->param.conn);
++		rpcrdma_update_cm_private(r_xprt, &event->param.conn);
++		trace_xprtrdma_inline_thresh(r_xprt);
+ 		wake_up_all(&ep->rep_connect_wait);
+ 		break;
+ 	case RDMA_CM_EVENT_CONNECT_ERROR:
