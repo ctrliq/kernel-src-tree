@@ -1,0 +1,141 @@
+x86/fpu: Add size and mask information to fpstate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 248452ce21aeb08da2d2af23d88f890886bd379f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/248452ce.failed
+
+Add state size and feature mask information to the fpstate container. This
+will be used for runtime checks with the upcoming support for dynamically
+enabled features and dynamically sized buffers. That avoids conditionals
+all over the place as the required information is accessible for both
+default and extended buffers.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211013145322.921388806@linutronix.de
+(cherry picked from commit 248452ce21aeb08da2d2af23d88f890886bd379f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/types.h
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/include/asm/fpu/types.h
+index 90d18383879a,3a12e97e475d..000000000000
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@@ -311,6 -309,25 +311,28 @@@ union fpregs_state 
+  	u8 __padding[PAGE_SIZE];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct fpstate {
++ 	/* @kernel_size: The size of the kernel register image */
++ 	unsigned int		size;
++ 
++ 	/* @user_size: The size in non-compacted UABI format */
++ 	unsigned int		user_size;
++ 
++ 	/* @xfeatures:		xfeatures for which the storage is sized */
++ 	u64			xfeatures;
++ 
++ 	/* @user_xfeatures:	xfeatures valid in UABI buffers */
++ 	u64			user_xfeatures;
++ 
++ 	/* @regs: The register state union for all supported formats */
++ 	union fpregs_state		regs;
++ 
++ 	/* @regs is dynamically sized! Don't add anything after @regs! */
++ } __aligned(64);
++ 
+++>>>>>>> 248452ce21ae (x86/fpu: Add size and mask information to fpstate)
+  /*
+   * Highest level per task FPU state data structure that
+   * contains the FPU register state plus various FPU
+diff --cc arch/x86/kernel/fpu/core.c
+index 3f16056105e8,a8cc20e90751..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -316,12 -330,24 +316,28 @@@ void fpstate_init_user(union fpregs_sta
+  		return;
+  	}
+  
+ -	xstate_init_xcomp_bv(&fpstate->regs.xsave, xfeatures_mask_uabi());
+ +	xstate_init_xcomp_bv(&state->xsave, xfeatures_mask_uabi());
+  
+  	if (cpu_feature_enabled(X86_FEATURE_FXSR))
+ -		fpstate_init_fxstate(fpstate);
+ +		fpstate_init_fxstate(&state->fxsave);
+  	else
+++<<<<<<< HEAD
+ +		fpstate_init_fstate(&state->fsave);
+++=======
++ 		fpstate_init_fstate(fpstate);
++ }
++ 
++ void fpstate_reset(struct fpu *fpu)
++ {
++ 	/* Set the fpstate pointer to the default fpstate */
++ 	fpu->fpstate = &fpu->__fpstate;
++ 
++ 	/* Initialize sizes and feature masks */
++ 	fpu->fpstate->size		= fpu_kernel_xstate_size;
++ 	fpu->fpstate->user_size		= fpu_user_xstate_size;
++ 	fpu->fpstate->xfeatures		= xfeatures_mask_all;
++ 	fpu->fpstate->user_xfeatures	= xfeatures_mask_uabi();
+++>>>>>>> 248452ce21ae (x86/fpu: Add size and mask information to fpstate)
+  }
+  
+  #if IS_ENABLED(CONFIG_KVM)
+* Unmerged path arch/x86/include/asm/fpu/types.h
+* Unmerged path arch/x86/kernel/fpu/core.c
+diff --git a/arch/x86/kernel/fpu/init.c b/arch/x86/kernel/fpu/init.c
+index 24873dfe2dba..3eecc5c6a811 100644
+--- a/arch/x86/kernel/fpu/init.c
++++ b/arch/x86/kernel/fpu/init.c
+@@ -210,6 +210,14 @@ static void __init fpu__init_system_xstate_size_legacy(void)
+ 	}
+ 
+ 	fpu_user_xstate_size = fpu_kernel_xstate_size;
++	fpstate_reset(&current->thread.fpu);
++}
++
++static void __init fpu__init_init_fpstate(void)
++{
++	/* Bring init_fpstate size and features up to date */
++	init_fpstate.size		= fpu_kernel_xstate_size;
++	init_fpstate.xfeatures		= xfeatures_mask_all;
+ }
+ 
+ /*
+@@ -230,4 +238,5 @@ void __init fpu__init_system(struct cpuinfo_x86 *c)
+ 	fpu__init_system_xstate_size_legacy();
+ 	fpu__init_system_xstate();
+ 	fpu__init_task_struct_size();
++	fpu__init_init_fpstate();
+ }
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 8c27dcecbad5..944be479e470 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -719,6 +719,7 @@ static void __init fpu__init_disable_system_xstate(void)
+ 	xfeatures_mask_all = 0;
+ 	cr4_clear_bits(X86_CR4_OSXSAVE);
+ 	setup_clear_cpu_cap(X86_FEATURE_XSAVE);
++	fpstate_reset(&current->thread.fpu);
+ }
+ 
+ /*
+@@ -791,6 +792,8 @@ void __init fpu__init_system_xstate(void)
+ 	if (err)
+ 		goto out_disable;
+ 
++	fpstate_reset(&current->thread.fpu);
++
+ 	/*
+ 	 * Update info used for ptrace frames; use standard-format size and no
+ 	 * supervisor xstates:
