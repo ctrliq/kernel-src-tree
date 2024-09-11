@@ -1,0 +1,382 @@
+net/mlx5e: VF tunnel TX traffic offloading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Vlad Buslov <vladbu@nvidia.com>
+commit 10742efc20a429b2040658af685d6bb2aa674a73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/10742efc.failed
+
+When tunnel endpoint is on VF, driver still assumes that endpoint is on
+uplink and incorrectly configures encap rule offload according to that
+assumption. As a result, traffic is sent directly to the uplink and rules
+installed on representor of tunnel endpoint VF are ignored.
+
+Implement following changes to allow offloading tx traffic with tunnel
+endpoint on VF:
+
+- For tunneling flows perform route lookup on route and out devices pair.
+If out device is uplink and route device is VF of same physical port, then
+modify packet reg_c_0 metadata register (source port) with the value of VF
+vport. Use eswitch vhca_id->vport mapping introduced in one of previous
+patches in the series to obtain vport from route netdevice.
+
+- Recirculate encapsulated packets to VF vport in order to apply any flow
+rules installed on VF representor that match on encapsulated traffic.
+
+Only enable support for this functionality when all following conditions
+are true:
+
+- Hardware advertises capability to preserve reg_c_0 value on packet
+recirculation.
+
+- Vport metadata matching is enabled.
+
+- Termination tables are to be used by the flow.
+
+Example TC rules for VF tunnel traffic:
+
+1. Rule that redirects packets from UL to VF rep that has the tunnel
+endpoint IP address:
+
+$ tc -s filter show dev enp8s0f0 ingress
+filter protocol ip pref 4 flower chain 0
+filter protocol ip pref 4 flower chain 0 handle 0x1
+  dst_mac 16:c9:a0:2d:69:2c
+  src_mac 0c:42:a1:58:ab:e4
+  eth_type ipv4
+  ip_flags nofrag
+  in_hw in_hw_count 1
+        action order 1: mirred (Egress Redirect to device enp8s0f0_0) stolen
+        index 3 ref 1 bind 1 installed 377 sec used 0 sec
+        Action statistics:
+        Sent 114096 bytes 952 pkt (dropped 0, overlimits 0 requeues 0)
+        Sent software 0 bytes 0 pkt
+        Sent hardware 114096 bytes 952 pkt
+        backlog 0b 0p requeues 0
+        cookie 878fa48d8c423fc08c3b6ca599b50a97
+        no_percpu
+        used_hw_stats delayed
+
+2. Rule that decapsulates the tunneled flow and redirects to destination VF
+representor:
+
+$ tc -s filter show dev vxlan_sys_4789 ingress
+filter protocol ip pref 4 flower chain 0
+filter protocol ip pref 4 flower chain 0 handle 0x1
+  dst_mac ca:2e:a7:3f:f5:0f
+  src_mac 0a:40:bd:30:89:99
+  eth_type ipv4
+  enc_dst_ip 7.7.7.5
+  enc_src_ip 7.7.7.1
+  enc_key_id 98
+  enc_dst_port 4789
+  enc_tos 0
+  ip_flags nofrag
+  in_hw in_hw_count 1
+        action order 1: tunnel_key  unset pipe
+         index 2 ref 1 bind 1 installed 434 sec used 434 sec
+        Action statistics:
+        Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)
+        backlog 0b 0p requeues 0
+        used_hw_stats delayed
+
+        action order 2: mirred (Egress Redirect to device enp8s0f0_1) stolen
+        index 4 ref 1 bind 1 installed 434 sec used 0 sec
+        Action statistics:
+        Sent 129936 bytes 1082 pkt (dropped 0, overlimits 0 requeues 0)
+        Sent software 0 bytes 0 pkt
+        Sent hardware 129936 bytes 1082 pkt
+        backlog 0b 0p requeues 0
+        cookie ac17cf398c4c69e4a5b2f7aabd1b88ff
+        no_percpu
+        used_hw_stats delayed
+
+Co-developed-by: Dmytro Linkin <dlinkin@nvidia.com>
+	Signed-off-by: Dmytro Linkin <dlinkin@nvidia.com>
+	Signed-off-by: Vlad Buslov <vladbu@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 10742efc20a429b2040658af685d6bb2aa674a73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+#	include/linux/mlx5/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index af6b06d1976e,1b18f624e04a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -2941,3 -3027,94 +3027,97 @@@ void mlx5_esw_offloads_sf_vport_disable
+  	mlx5_esw_devlink_sf_port_unregister(esw, vport_num);
+  	mlx5_esw_vport_disable(esw, vport_num);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int mlx5_esw_query_vport_vhca_id(struct mlx5_eswitch *esw, u16 vport_num, u16 *vhca_id)
++ {
++ 	int query_out_sz = MLX5_ST_SZ_BYTES(query_hca_cap_out);
++ 	void *query_ctx;
++ 	void *hca_caps;
++ 	int err;
++ 
++ 	*vhca_id = 0;
++ 	if (mlx5_esw_is_manager_vport(esw, vport_num) ||
++ 	    !MLX5_CAP_GEN(esw->dev, vhca_resource_manager))
++ 		return -EPERM;
++ 
++ 	query_ctx = kzalloc(query_out_sz, GFP_KERNEL);
++ 	if (!query_ctx)
++ 		return -ENOMEM;
++ 
++ 	err = mlx5_vport_get_other_func_cap(esw->dev, vport_num, query_ctx);
++ 	if (err)
++ 		goto out_free;
++ 
++ 	hca_caps = MLX5_ADDR_OF(query_hca_cap_out, query_ctx, capability);
++ 	*vhca_id = MLX5_GET(cmd_hca_cap, hca_caps, vhca_id);
++ 
++ out_free:
++ 	kfree(query_ctx);
++ 	return err;
++ }
++ 
++ int mlx5_esw_vport_vhca_id_set(struct mlx5_eswitch *esw, u16 vport_num)
++ {
++ 	u16 *old_entry, *vhca_map_entry, vhca_id;
++ 	int err;
++ 
++ 	err = mlx5_esw_query_vport_vhca_id(esw, vport_num, &vhca_id);
++ 	if (err) {
++ 		esw_warn(esw->dev, "Getting vhca_id for vport failed (vport=%u,err=%d)\n",
++ 			 vport_num, err);
++ 		return err;
++ 	}
++ 
++ 	vhca_map_entry = kmalloc(sizeof(*vhca_map_entry), GFP_KERNEL);
++ 	if (!vhca_map_entry)
++ 		return -ENOMEM;
++ 
++ 	*vhca_map_entry = vport_num;
++ 	old_entry = xa_store(&esw->offloads.vhca_map, vhca_id, vhca_map_entry, GFP_KERNEL);
++ 	if (xa_is_err(old_entry)) {
++ 		kfree(vhca_map_entry);
++ 		return xa_err(old_entry);
++ 	}
++ 	kfree(old_entry);
++ 	return 0;
++ }
++ 
++ void mlx5_esw_vport_vhca_id_clear(struct mlx5_eswitch *esw, u16 vport_num)
++ {
++ 	u16 *vhca_map_entry, vhca_id;
++ 	int err;
++ 
++ 	err = mlx5_esw_query_vport_vhca_id(esw, vport_num, &vhca_id);
++ 	if (err)
++ 		esw_warn(esw->dev, "Getting vhca_id for vport failed (vport=%hu,err=%d)\n",
++ 			 vport_num, err);
++ 
++ 	vhca_map_entry = xa_erase(&esw->offloads.vhca_map, vhca_id);
++ 	kfree(vhca_map_entry);
++ }
++ 
++ int mlx5_eswitch_vhca_id_to_vport(struct mlx5_eswitch *esw, u16 vhca_id, u16 *vport_num)
++ {
++ 	u16 *res = xa_load(&esw->offloads.vhca_map, vhca_id);
++ 
++ 	if (!res)
++ 		return -ENOENT;
++ 
++ 	*vport_num = *res;
++ 	return 0;
++ }
++ 
++ u32 mlx5_eswitch_get_vport_metadata_for_set(struct mlx5_eswitch *esw,
++ 					    u16 vport_num)
++ {
++ 	struct mlx5_vport *vport = mlx5_eswitch_get_vport(esw, vport_num);
++ 
++ 	if (WARN_ON_ONCE(IS_ERR(vport)))
++ 		return 0;
++ 
++ 	return vport->metadata;
++ }
++ EXPORT_SYMBOL(mlx5_eswitch_get_vport_metadata_for_set);
+++>>>>>>> 10742efc20a4 (net/mlx5e: VF tunnel TX traffic offloading)
+diff --cc include/linux/mlx5/eswitch.h
+index b0ae8020f13e,67e341274a22..000000000000
+--- a/include/linux/mlx5/eswitch.h
++++ b/include/linux/mlx5/eswitch.h
+@@@ -96,10 -96,12 +96,16 @@@ static inline u32 mlx5_eswitch_get_vpor
+  
+  u32 mlx5_eswitch_get_vport_metadata_for_match(struct mlx5_eswitch *esw,
+  					      u16 vport_num);
+++<<<<<<< HEAD
+ +u8 mlx5_eswitch_mode(struct mlx5_eswitch *esw);
+++=======
++ u32 mlx5_eswitch_get_vport_metadata_for_set(struct mlx5_eswitch *esw,
++ 					    u16 vport_num);
++ u8 mlx5_eswitch_mode(struct mlx5_core_dev *dev);
+++>>>>>>> 10742efc20a4 (net/mlx5e: VF tunnel TX traffic offloading)
+  #else  /* CONFIG_MLX5_ESWITCH */
+  
+ -static inline u8 mlx5_eswitch_mode(struct mlx5_core_dev *dev)
+ +static inline u8 mlx5_eswitch_mode(struct mlx5_eswitch *esw)
+  {
+  	return MLX5_ESWITCH_NONE;
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 00c2a6fd4471..dd05b2987b40 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -165,6 +165,11 @@ struct mlx5e_tc_attr_to_reg_mapping mlx5e_tc_attr_to_reg_mappings[] = {
+ 		.moffset = 0,
+ 		.mlen = 2,
+ 	},
++	[VPORT_TO_REG] = {
++		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_0,
++		.moffset = 2,
++		.mlen = 2,
++	},
+ 	[TUNNEL_TO_REG] = {
+ 		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_1,
+ 		.moffset = 1,
+@@ -1248,6 +1253,44 @@ static void remove_unready_flow(struct mlx5e_tc_flow *flow)
+ 	mutex_unlock(&uplink_priv->unready_flows_lock);
+ }
+ 
++static bool same_hw_devs(struct mlx5e_priv *priv, struct mlx5e_priv *peer_priv);
++
++static bool mlx5e_tc_is_vf_tunnel(struct net_device *out_dev, struct net_device *route_dev)
++{
++	struct mlx5_core_dev *out_mdev, *route_mdev;
++	struct mlx5e_priv *out_priv, *route_priv;
++
++	out_priv = netdev_priv(out_dev);
++	out_mdev = out_priv->mdev;
++	route_priv = netdev_priv(route_dev);
++	route_mdev = route_priv->mdev;
++
++	if (out_mdev->coredev_type != MLX5_COREDEV_PF ||
++	    route_mdev->coredev_type != MLX5_COREDEV_VF)
++		return false;
++
++	return same_hw_devs(out_priv, route_priv);
++}
++
++static int mlx5e_tc_query_route_vport(struct net_device *out_dev, struct net_device *route_dev,
++				      u16 *vport)
++{
++	struct mlx5e_priv *out_priv, *route_priv;
++	struct mlx5_core_dev *route_mdev;
++	struct mlx5_eswitch *esw;
++	u16 vhca_id;
++	int err;
++
++	out_priv = netdev_priv(out_dev);
++	esw = out_priv->mdev->priv.eswitch;
++	route_priv = netdev_priv(route_dev);
++	route_mdev = route_priv->mdev;
++
++	vhca_id = MLX5_CAP_GEN(route_mdev, vhca_id);
++	err = mlx5_eswitch_vhca_id_to_vport(esw, vhca_id, vport);
++	return err;
++}
++
+ static int
+ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
+ 		      struct mlx5e_tc_flow *flow,
+@@ -3646,6 +3689,45 @@ static bool is_duplicated_encap_entry(struct mlx5e_priv *priv,
+ 	return false;
+ }
+ 
++static int mlx5e_set_vf_tunnel(struct mlx5_eswitch *esw,
++			       struct mlx5_flow_attr *attr,
++			       struct mlx5e_tc_mod_hdr_acts *mod_hdr_acts,
++			       struct net_device *out_dev,
++			       int route_dev_ifindex,
++			       int out_index)
++{
++	struct mlx5_esw_flow_attr *esw_attr = attr->esw_attr;
++	struct net_device *route_dev;
++	u16 vport_num;
++	int err = 0;
++	u32 data;
++
++	route_dev = dev_get_by_index(dev_net(out_dev), route_dev_ifindex);
++
++	if (!route_dev || route_dev->netdev_ops != &mlx5e_netdev_ops ||
++	    !mlx5e_tc_is_vf_tunnel(out_dev, route_dev))
++		goto out;
++
++	err = mlx5e_tc_query_route_vport(out_dev, route_dev, &vport_num);
++	if (err)
++		goto out;
++
++	attr->dest_chain = 0;
++	attr->action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
++	esw_attr->dests[out_index].flags |= MLX5_ESW_DEST_CHAIN_WITH_SRC_PORT_CHANGE;
++	data = mlx5_eswitch_get_vport_metadata_for_set(esw_attr->in_mdev->priv.eswitch,
++						       vport_num);
++	err = mlx5e_tc_match_to_reg_set(esw->dev, mod_hdr_acts,
++					MLX5_FLOW_NAMESPACE_FDB, VPORT_TO_REG, data);
++	if (err)
++		goto out;
++
++out:
++	if (route_dev)
++		dev_put(route_dev);
++	return err;
++}
++
+ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ 			      struct mlx5e_tc_flow *flow,
+ 			      struct net_device *mirred_dev,
+@@ -3737,6 +3819,11 @@ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ 	e->compl_result = 1;
+ 
+ attach_flow:
++	err = mlx5e_set_vf_tunnel(esw, attr, &parse_attr->mod_hdr_acts, e->out_dev,
++				  e->route_dev_ifindex, out_index);
++	if (err)
++		goto out_err;
++
+ 	flow->encaps[out_index].e = e;
+ 	list_add(&flow->encaps[out_index].list, &e->flows);
+ 	flow->encaps[out_index].index = out_index;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index de40c4ed30f1..b92d9c9a1761 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@ -160,6 +160,7 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work);
+ 
+ enum mlx5e_tc_attr_to_reg {
+ 	CHAIN_TO_REG,
++	VPORT_TO_REG,
+ 	TUNNEL_TO_REG,
+ 	CTSTATE_TO_REG,
+ 	ZONE_TO_REG,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index e59f5fa24aca..bdcfe975ed34 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -386,12 +386,14 @@ enum mlx5_flow_match_level {
+ enum {
+ 	MLX5_ESW_DEST_ENCAP         = BIT(0),
+ 	MLX5_ESW_DEST_ENCAP_VALID   = BIT(1),
++	MLX5_ESW_DEST_CHAIN_WITH_SRC_PORT_CHANGE  = BIT(2),
+ };
+ 
+ enum {
+ 	MLX5_ESW_ATTR_FLAG_VLAN_HANDLED  = BIT(0),
+ 	MLX5_ESW_ATTR_FLAG_SLOW_PATH     = BIT(1),
+ 	MLX5_ESW_ATTR_FLAG_NO_IN_PORT    = BIT(2),
++	MLX5_ESW_ATTR_FLAG_SRC_REWRITE   = BIT(3),
+ };
+ 
+ struct mlx5_esw_flow_attr {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+* Unmerged path include/linux/mlx5/eswitch.h
