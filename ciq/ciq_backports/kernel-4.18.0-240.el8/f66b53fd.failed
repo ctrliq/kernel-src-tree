@@ -1,0 +1,180 @@
+openvswitch: New MPLS actions for layer 2 tunnelling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Martin Varghese <martin.varghese@nokia.com>
+commit f66b53fdbb22ced1a323b22b9de84a61aacd8d18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f66b53fd.failed
+
+The existing PUSH MPLS action inserts MPLS header between ethernet header
+and the IP header. Though this behaviour is fine for L3 VPN where an IP
+packet is encapsulated inside a MPLS tunnel, it does not suffice the L2
+VPN (l2 tunnelling) requirements. In L2 VPN the MPLS header should
+encapsulate the ethernet packet.
+
+The new mpls action ADD_MPLS inserts MPLS header at the start of the
+packet or at the start of the l3 header depending on the value of l3 tunnel
+flag in the ADD_MPLS arguments.
+
+POP_MPLS action is extended to support ethertype 0x6558.
+
+	Signed-off-by: Martin Varghese <martin.varghese@nokia.com>
+	Acked-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f66b53fdbb22ced1a323b22b9de84a61aacd8d18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/flow_netlink.c
+diff --cc net/openvswitch/flow_netlink.c
+index 3e70a3748e18,7da4230627f5..000000000000
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@@ -3097,8 -3137,21 +3126,24 @@@ static int __ovs_nla_copy_actions(struc
+  			 * Support for these actions is planned using packet
+  			 * recirculation.
+  			 */
+++<<<<<<< HEAD
+ +			eth_type = htons(0);
+++=======
++ 			proto = nla_get_be16(a);
++ 
++ 			if (proto == htons(ETH_P_TEB) &&
++ 			    mac_proto != MAC_PROTO_NONE)
++ 				return -EINVAL;
++ 
++ 			mpls_label_count--;
++ 
++ 			if (!eth_p_mpls(proto) || !mpls_label_count)
++ 				eth_type = htons(0);
++ 			else
++ 				eth_type =  proto;
++ 
+++>>>>>>> f66b53fdbb22 (openvswitch: New MPLS actions for layer 2 tunnelling)
+  			break;
+ -		}
+  
+  		case OVS_ACTION_ATTR_SET:
+  			err = validate_set(a, key, sfa,
+diff --git a/include/uapi/linux/openvswitch.h b/include/uapi/linux/openvswitch.h
+index 292e821b9a11..8aa1f5c16e27 100644
+--- a/include/uapi/linux/openvswitch.h
++++ b/include/uapi/linux/openvswitch.h
+@@ -672,6 +672,32 @@ struct ovs_action_push_mpls {
+ 	__be16 mpls_ethertype; /* Either %ETH_P_MPLS_UC or %ETH_P_MPLS_MC */
+ };
+ 
++/**
++ * struct ovs_action_add_mpls - %OVS_ACTION_ATTR_ADD_MPLS action
++ * argument.
++ * @mpls_lse: MPLS label stack entry to push.
++ * @mpls_ethertype: Ethertype to set in the encapsulating ethernet frame.
++ * @tun_flags: MPLS tunnel attributes.
++ *
++ * The only values @mpls_ethertype should ever be given are %ETH_P_MPLS_UC and
++ * %ETH_P_MPLS_MC, indicating MPLS unicast or multicast. Other are rejected.
++ */
++struct ovs_action_add_mpls {
++	__be32 mpls_lse;
++	__be16 mpls_ethertype; /* Either %ETH_P_MPLS_UC or %ETH_P_MPLS_MC */
++	__u16 tun_flags;
++};
++
++#define OVS_MPLS_L3_TUNNEL_FLAG_MASK  (1 << 0) /* Flag to specify the place of
++						* insertion of MPLS header.
++						* When false, the MPLS header
++						* will be inserted at the start
++						* of the packet.
++						* When true, the MPLS header
++						* will be inserted at the start
++						* of the l3 header.
++						*/
++
+ /**
+  * struct ovs_action_push_vlan - %OVS_ACTION_ATTR_PUSH_VLAN action argument.
+  * @vlan_tpid: Tag protocol identifier (TPID) to push.
+@@ -889,6 +915,10 @@ struct check_pkt_len_arg {
+  * @OVS_ACTION_ATTR_CHECK_PKT_LEN: Check the packet length and execute a set
+  * of actions if greater than the specified packet length, else execute
+  * another set of actions.
++ * @OVS_ACTION_ATTR_ADD_MPLS: Push a new MPLS label stack entry at the
++ * start of the packet or at the start of the l3 header depending on the value
++ * of l3 tunnel flag in the tun_flags field of OVS_ACTION_ATTR_ADD_MPLS
++ * argument.
+  *
+  * Only a single header can be set with a single %OVS_ACTION_ATTR_SET.  Not all
+  * fields within a header are modifiable, e.g. the IPv4 protocol and fragment
+@@ -924,6 +954,7 @@ enum ovs_action_attr {
+ 	OVS_ACTION_ATTR_METER,        /* u32 meter ID. */
+ 	OVS_ACTION_ATTR_CLONE,        /* Nested OVS_CLONE_ATTR_*.  */
+ 	OVS_ACTION_ATTR_CHECK_PKT_LEN, /* Nested OVS_CHECK_PKT_LEN_ATTR_*. */
++	OVS_ACTION_ATTR_ADD_MPLS,     /* struct ovs_action_add_mpls. */
+ 
+ 	__OVS_ACTION_ATTR_MAX,	      /* Nothing past this will be accepted
+ 				       * from userspace. */
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index f571f686dac6..37f00c92d104 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -174,16 +174,17 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 			      const struct nlattr *attr, int len);
+ 
+ static int push_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+-		     const struct ovs_action_push_mpls *mpls)
++		     __be32 mpls_lse, __be16 mpls_ethertype, __u16 mac_len)
+ {
+ 	int err;
+ 
+-	err = skb_mpls_push(skb, mpls->mpls_lse, mpls->mpls_ethertype,
+-			    skb->mac_len,
+-			    ovs_key_mac_proto(key) == MAC_PROTO_ETHERNET);
++	err = skb_mpls_push(skb, mpls_lse, mpls_ethertype, mac_len, !!mac_len);
+ 	if (err)
+ 		return err;
+ 
++	if (!mac_len)
++		key->mac_proto = MAC_PROTO_NONE;
++
+ 	invalidate_flow_key(key);
+ 	return 0;
+ }
+@@ -198,6 +199,9 @@ static int pop_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ 	if (err)
+ 		return err;
+ 
++	if (ethertype == htons(ETH_P_TEB))
++		key->mac_proto = MAC_PROTO_ETHERNET;
++
+ 	invalidate_flow_key(key);
+ 	return 0;
+ }
+@@ -1237,10 +1241,24 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 			execute_hash(skb, key, a);
+ 			break;
+ 
+-		case OVS_ACTION_ATTR_PUSH_MPLS:
+-			err = push_mpls(skb, key, nla_data(a));
++		case OVS_ACTION_ATTR_PUSH_MPLS: {
++			struct ovs_action_push_mpls *mpls = nla_data(a);
++
++			err = push_mpls(skb, key, mpls->mpls_lse,
++					mpls->mpls_ethertype, skb->mac_len);
+ 			break;
++		}
++		case OVS_ACTION_ATTR_ADD_MPLS: {
++			struct ovs_action_add_mpls *mpls = nla_data(a);
++			__u16 mac_len = 0;
++
++			if (mpls->tun_flags & OVS_MPLS_L3_TUNNEL_FLAG_MASK)
++				mac_len = skb->mac_len;
+ 
++			err = push_mpls(skb, key, mpls->mpls_lse,
++					mpls->mpls_ethertype, mac_len);
++			break;
++		}
+ 		case OVS_ACTION_ATTR_POP_MPLS:
+ 			err = pop_mpls(skb, key, nla_get_be16(a));
+ 			break;
+* Unmerged path net/openvswitch/flow_netlink.c
