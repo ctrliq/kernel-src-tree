@@ -1,0 +1,214 @@
+mt76: connac: use waitqueue for runtime-pm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit e5f35576c8a986c6456f7d0c7d0f1ff34ccaa165
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/e5f35576.failed
+
+Simplify the code using a wait_queue_head_t instead of a completion to
+wait the chip is fully awake in mt76_connac_pm_wake routine
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit e5f35576c8a986c6456f7d0c7d0f1ff34ccaa165)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt76_connac.h
+#	drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/init.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/init.c
+index a1cf9d52fcea,2d8dba000d0b..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/init.c
+@@@ -212,6 -219,15 +212,18 @@@ int mt7921_register_device(struct mt792
+  	dev->phy.dev = dev;
+  	dev->phy.mt76 = &dev->mt76.phy;
+  	dev->mt76.phy.priv = &dev->phy;
+++<<<<<<< HEAD
+++=======
++ 	dev->mt76.tx_worker.fn = mt7921_tx_worker;
++ 
++ 	INIT_DELAYED_WORK(&dev->pm.ps_work, mt7921_pm_power_save_work);
++ 	INIT_WORK(&dev->pm.wake_work, mt7921_pm_wake_work);
++ 	spin_lock_init(&dev->pm.wake.lock);
++ 	mutex_init(&dev->pm.mutex);
++ 	init_waitqueue_head(&dev->pm.wait);
++ 	spin_lock_init(&dev->pm.txq_lock);
++ 	set_bit(MT76_STATE_PM, &dev->mphy.state);
+++>>>>>>> e5f35576c8a9 (mt76: connac: use waitqueue for runtime-pm)
+  	INIT_LIST_HEAD(&dev->phy.stats_list);
+  	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt7921_mac_work);
+  	INIT_DELAYED_WORK(&dev->phy.scan_work, mt7921_scan_work);
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+index bcbd59a23f9b,7b5323181fac..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+@@@ -1368,8 -1506,125 +1368,129 @@@ void mt7921_mac_work(struct work_struc
+  		mt7921_mac_sta_stats_work(phy);
+  	}
+  
+ -	mt7921_mutex_release(phy->dev);
+ -	ieee80211_queue_delayed_work(phy->mt76->hw, &mphy->mac_work,
+ +	mutex_unlock(&mphy->dev->mutex);
+ +
+ +	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
+  				     MT7921_WATCHDOG_TIME);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void mt7921_pm_wake_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	struct mt76_phy *mphy;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						pm.wake_work);
++ 	mphy = dev->phy.mt76;
++ 
++ 	if (!mt7921_mcu_drv_pmctrl(dev)) {
++ 		int i;
++ 
++ 		mt76_for_each_q_rx(&dev->mt76, i)
++ 			napi_schedule(&dev->mt76.napi[i]);
++ 		mt76_connac_pm_dequeue_skbs(mphy, &dev->pm);
++ 		mt7921_tx_cleanup(dev);
++ 	}
++ 
++ 	ieee80211_wake_queues(mphy->hw);
++ 	wake_up(&dev->pm.wait);
++ }
++ 
++ void mt7921_pm_power_save_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	unsigned long delta;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						pm.ps_work.work);
++ 
++ 	delta = dev->pm.idle_timeout;
++ 	if (test_bit(MT76_HW_SCANNING, &dev->mphy.state) ||
++ 	    test_bit(MT76_HW_SCHED_SCANNING, &dev->mphy.state))
++ 		goto out;
++ 
++ 	if (time_is_after_jiffies(dev->pm.last_activity + delta)) {
++ 		delta = dev->pm.last_activity + delta - jiffies;
++ 		goto out;
++ 	}
++ 
++ 	if (!mt7921_mcu_fw_pmctrl(dev))
++ 		return;
++ out:
++ 	queue_delayed_work(dev->mt76.wq, &dev->pm.ps_work, delta);
++ }
++ 
++ int mt7921_mac_set_beacon_filter(struct mt7921_phy *phy,
++ 				 struct ieee80211_vif *vif,
++ 				 bool enable)
++ {
++ 	struct mt7921_dev *dev = phy->dev;
++ 	bool ext_phy = phy != &dev->phy;
++ 	int err;
++ 
++ 	if (!dev->pm.enable)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = mt7921_mcu_set_bss_pm(dev, vif, enable);
++ 	if (err)
++ 		return err;
++ 
++ 	if (enable) {
++ 		vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
++ 		mt76_set(dev, MT_WF_RFCR(ext_phy),
++ 			 MT_WF_RFCR_DROP_OTHER_BEACON);
++ 	} else {
++ 		vif->driver_flags &= ~IEEE80211_VIF_BEACON_FILTER;
++ 		mt76_clear(dev, MT_WF_RFCR(ext_phy),
++ 			   MT_WF_RFCR_DROP_OTHER_BEACON);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void mt7921_coredump_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	char *dump, *data;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						coredump.work.work);
++ 
++ 	if (time_is_after_jiffies(dev->coredump.last_activity +
++ 				  4 * MT76_CONNAC_COREDUMP_TIMEOUT)) {
++ 		queue_delayed_work(dev->mt76.wq, &dev->coredump.work,
++ 				   MT76_CONNAC_COREDUMP_TIMEOUT);
++ 		return;
++ 	}
++ 
++ 	dump = vzalloc(MT76_CONNAC_COREDUMP_SZ);
++ 	data = dump;
++ 
++ 	while (true) {
++ 		struct sk_buff *skb;
++ 
++ 		spin_lock_bh(&dev->mt76.lock);
++ 		skb = __skb_dequeue(&dev->coredump.msg_list);
++ 		spin_unlock_bh(&dev->mt76.lock);
++ 
++ 		if (!skb)
++ 			break;
++ 
++ 		skb_pull(skb, sizeof(struct mt7921_mcu_rxd));
++ 		if (data + skb->len - dump > MT76_CONNAC_COREDUMP_SZ) {
++ 			dev_kfree_skb(skb);
++ 			continue;
++ 		}
++ 
++ 		memcpy(data, skb->data, skb->len);
++ 		data += skb->len;
++ 
++ 		dev_kfree_skb(skb);
++ 	}
++ 	dev_coredumpv(dev->mt76.dev, dump, MT76_CONNAC_COREDUMP_SZ,
++ 		      GFP_KERNEL);
++ 	mt7921_reset(&dev->mt76);
++ }
+++>>>>>>> e5f35576c8a9 (mt76: connac: use waitqueue for runtime-pm)
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac.h
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/init.c b/drivers/net/wireless/mediatek/mt76/mt7615/init.c
+index a703029d5404..d33af890a74a 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/init.c
+@@ -489,7 +489,7 @@ void mt7615_init_device(struct mt7615_dev *dev)
+ 	INIT_WORK(&dev->pm.wake_work, mt7615_pm_wake_work);
+ 	spin_lock_init(&dev->pm.wake.lock);
+ 	mutex_init(&dev->pm.mutex);
+-	init_completion(&dev->pm.wake_cmpl);
++	init_waitqueue_head(&dev->pm.wait);
+ 	spin_lock_init(&dev->pm.txq_lock);
+ 	set_bit(MT76_STATE_PM, &dev->mphy.state);
+ 	INIT_DELAYED_WORK(&dev->phy.mac_work, mt7615_mac_work);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mac.c b/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+index 1b8b80e3739d..76d46d2781f8 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+@@ -1916,7 +1916,7 @@ void mt7615_pm_wake_work(struct work_struct *work)
+ 
+ out:
+ 	ieee80211_wake_queues(mphy->hw);
+-	complete_all(&dev->pm.wake_cmpl);
++	wake_up(&dev->pm.wait);
+ }
+ 
+ int mt7615_pm_wake(struct mt7615_dev *dev)
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac.h
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/init.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mac.c
