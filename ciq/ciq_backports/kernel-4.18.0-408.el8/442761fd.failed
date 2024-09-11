@@ -1,0 +1,333 @@
+dm: conditionally enable branching for less used features
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit 442761fd2b297d65d1cb5786249e1e07a19e9122
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/442761fd.failed
+
+Use jump_labels to further reduce cost of unlikely branches for zoned
+block devices, dm-stats and swap_bios throttling.
+
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 442761fd2b297d65d1cb5786249e1e07a19e9122)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-core.h
+#	drivers/md/dm-table.c
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-core.h
+index a9c78c74b3c7,8ba99eaa0872..000000000000
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@@ -11,8 -11,9 +11,13 @@@
+  
+  #include <linux/kthread.h>
+  #include <linux/ktime.h>
+ +#include <linux/genhd.h>
+  #include <linux/blk-mq.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/blk-crypto-profile.h>
++ #include <linux/jump_label.h>
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  
+  #include <trace/events/block.h>
+  
+@@@ -151,6 -155,17 +156,20 @@@ static inline struct dm_stats *dm_get_s
+  	return &md->stats;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ DECLARE_STATIC_KEY_FALSE(stats_enabled);
++ DECLARE_STATIC_KEY_FALSE(swap_bios_enabled);
++ DECLARE_STATIC_KEY_FALSE(zoned_enabled);
++ 
++ static inline bool dm_emulate_zone_append(struct mapped_device *md)
++ {
++ 	if (blk_queue_is_zoned(md->queue))
++ 		return test_bit(DMF_EMULATE_ZONE_APPEND, &md->flags);
++ 	return false;
++ }
++ 
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  #define DM_TABLE_MAX_DEPTH 16
+  
+  struct dm_table {
+diff --cc drivers/md/dm-table.c
+index 23f38af17df4,a37c7b763643..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -1877,18 -2036,35 +1880,26 @@@ void dm_table_set_restrictions(struct d
+  		blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, q);
+  
+  	/*
+ -	 * For a zoned target, setup the zones related queue attributes
+ -	 * and resources necessary for zone append emulation if necessary.
+ +	 * For a zoned target, the number of zones should be updated for the
+ +	 * correct value to be exposed in sysfs queue/nr_zones. For a BIO based
+ +	 * target, this is all that is needed.
+  	 */
+ +#ifdef CONFIG_BLK_DEV_ZONED
+  	if (blk_queue_is_zoned(q)) {
+++<<<<<<< HEAD
+ +		WARN_ON_ONCE(queue_is_mq(q));
+ +		q->nr_zones = blkdev_nr_zones(t->md->disk);
+++=======
++ 		r = dm_set_zones_restrictions(t, q);
++ 		if (r)
++ 			return r;
++ 		if (!static_key_enabled(&zoned_enabled.key))
++ 			static_branch_enable(&zoned_enabled);
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  	}
+ +#endif
+  
+ -	dm_update_crypto_profile(q, t);
+ -	disk_update_readahead(t->md->disk);
+ -
+ -	/*
+ -	 * Check for request-based device is left to
+ -	 * dm_mq_init_request_queue()->blk_mq_init_allocated_queue().
+ -	 *
+ -	 * For bio-based device, only set QUEUE_FLAG_POLL when all
+ -	 * underlying devices supporting polling.
+ -	 */
+ -	if (__table_type_bio_based(t->type)) {
+ -		if (dm_table_supports_poll(t))
+ -			blk_queue_flag_set(QUEUE_FLAG_POLL, q);
+ -		else
+ -			blk_queue_flag_clear(QUEUE_FLAG_POLL, q);
+ -	}
+ -
+ -	return 0;
+ +	blk_queue_update_readahead(q);
+  }
+  
+  unsigned int dm_table_get_num_targets(struct dm_table *t)
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,6304322a48f0..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -611,16 -581,18 +616,17 @@@ static struct dm_io *alloc_io(struct ma
+  
+  	io = container_of(tio, struct dm_io, tio);
+  	io->magic = DM_IO_MAGIC;
+ -	io->status = BLK_STS_OK;
+ +	io->status = 0;
+  	atomic_set(&io->io_count, 1);
+  	this_cpu_inc(*md->pending_io);
+ -	io->orig_bio = NULL;
+ +	io->orig_bio = bio;
+  	io->md = md;
+ -	io->map_task = current;
+ -	spin_lock_init(&io->lock);
+ +	spin_lock_init(&io->endio_lock);
+ +
+  	io->start_time = jiffies;
+ -	io->flags = 0;
+  
+- 	dm_stats_record_start(&md->stats, &io->stats_aux);
++ 	if (static_branch_unlikely(&stats_enabled))
++ 		dm_stats_record_start(&md->stats, &io->stats_aux);
+  
+  	return io;
+  }
+@@@ -985,24 -1018,27 +991,46 @@@ static void clone_endio(struct bio *bio
+  			disable_write_zeroes(md);
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * For zone-append bios get offset in zone of the written
+ +	 * sector and add that to the original bio sector pos.
+ +	 */
+ +	if (bio_op(orig_bio) == REQ_OP_ZONE_APPEND) {
+ +		sector_t written_sector = bio->bi_iter.bi_sector;
+ +		struct request_queue *q = orig_bio->bi_disk->queue;
+ +		u64 mask = (u64)blk_queue_zone_sectors(q) - 1;
+ +
+ +		orig_bio->bi_iter.bi_sector += written_sector & mask;
+ +	}
+++=======
++ 	if (static_branch_unlikely(&zoned_enabled) &&
++ 	    unlikely(blk_queue_is_zoned(q)))
++ 		dm_zone_endio(io, bio);
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  
+  	if (endio) {
+ -		int r = endio(ti, bio, &error);
+ +		int r = endio(tio->ti, bio, &error);
+  		switch (r) {
+  		case DM_ENDIO_REQUEUE:
+++<<<<<<< HEAD
+ +			error = BLK_STS_DM_REQUEUE;
+ +			/*FALLTHRU*/
+++=======
++ 			if (static_branch_unlikely(&zoned_enabled)) {
++ 				/*
++ 				 * Requeuing writes to a sequential zone of a zoned
++ 				 * target will break the sequential write pattern:
++ 				 * fail such IO.
++ 				 */
++ 				if (WARN_ON_ONCE(dm_is_zone_write(md, bio)))
++ 					error = BLK_STS_IOERR;
++ 				else
++ 					error = BLK_STS_DM_REQUEUE;
++ 			} else
++ 				error = BLK_STS_DM_REQUEUE;
++ 			fallthrough;
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  		case DM_ENDIO_DONE:
+  			break;
+  		case DM_ENDIO_INCOMPLETE:
+@@@ -1014,12 -1050,11 +1042,17 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(swap_bios_limit(tio->ti, bio))) {
+ +		struct mapped_device *md = io->md;
+++=======
++ 	if (static_branch_unlikely(&swap_bios_enabled) &&
++ 	    unlikely(swap_bios_limit(ti, bio)))
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  		up(&md->swap_bios_semaphore);
+ +	}
+  
+ -	free_tio(bio);
+ +	free_tio(tio);
+  	dm_io_dec_pending(io, error);
+  }
+  
+@@@ -1280,46 -1301,57 +1313,73 @@@ static blk_qc_t __map_bio(struct dm_tar
+  	clone->bi_end_io = clone_endio;
+  
+  	/*
+ -	 * Map the clone.
+ +	 * Map the clone.  If r == 0 we don't need to do
+ +	 * anything, the target has assumed ownership of
+ +	 * this io.
+  	 */
+  	dm_io_inc_pending(io);
+ -	tio->old_sector = clone->bi_iter.bi_sector;
+ +	sector = clone->bi_iter.bi_sector;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(swap_bios_limit(ti, clone))) {
+ +		struct mapped_device *md = io->md;
+++=======
++ 	if (static_branch_unlikely(&swap_bios_enabled) &&
++ 	    unlikely(swap_bios_limit(ti, clone))) {
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  		int latch = get_swap_bios();
+  		if (unlikely(latch != md->swap_bios))
+  			__set_swap_bios_limit(md, latch);
+  		down(&md->swap_bios_semaphore);
+  	}
+  
+++<<<<<<< HEAD
+ +	r = ti->type->map(ti, clone);
+++=======
++ 	if (static_branch_unlikely(&zoned_enabled)) {
++ 		/*
++ 		 * Check if the IO needs a special mapping due to zone append
++ 		 * emulation on zoned target. In this case, dm_zone_map_bio()
++ 		 * calls the target map operation.
++ 		 */
++ 		if (unlikely(dm_emulate_zone_append(md)))
++ 			r = dm_zone_map_bio(tio);
++ 		else
++ 			r = ti->type->map(ti, clone);
++ 	} else
++ 		r = ti->type->map(ti, clone);
++ 
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  	switch (r) {
+  	case DM_MAPIO_SUBMITTED:
+ -		/* target has assumed ownership of this io */
+ -		if (!ti->accounts_remapped_io)
+ -			dm_io_set_flag(io, DM_IO_START_ACCT);
+  		break;
+  	case DM_MAPIO_REMAPPED:
+ -		/*
+ -		 * the bio has been remapped so dispatch it, but defer
+ -		 * dm_start_io_acct() until after possible bio_split().
+ -		 */
+ -		__dm_submit_bio_remap(clone, disk_devt(md->disk),
+ -				      tio->old_sector);
+ -		dm_io_set_flag(io, DM_IO_START_ACCT);
+ +		/* the bio has been remapped so dispatch it */
+ +		trace_block_bio_remap(clone->bi_disk->queue, clone,
+ +				      bio_dev(io->orig_bio), sector);
+ +		ret = generic_make_request(clone);
+  		break;
+  	case DM_MAPIO_KILL:
+++<<<<<<< HEAD
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+++=======
++ 	case DM_MAPIO_REQUEUE:
++ 		if (static_branch_unlikely(&swap_bios_enabled) &&
++ 		    unlikely(swap_bios_limit(ti, clone)))
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  			up(&md->swap_bios_semaphore);
+ -		free_tio(clone);
+ -		if (r == DM_MAPIO_KILL)
+ -			dm_io_dec_pending(io, BLK_STS_IOERR);
+ -		else
+ -			dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_IOERR);
+ +		break;
+ +	case DM_MAPIO_REQUEUE:
+ +		if (unlikely(swap_bios_limit(ti, clone))) {
+ +			struct mapped_device *md = io->md;
+ +			up(&md->swap_bios_semaphore);
+ +		}
+ +		free_tio(tio);
+ +		dm_io_dec_pending(io, BLK_STS_DM_REQUEUE);
+  		break;
+  	default:
+  		DMWARN("unimplemented target map return value: %d", r);
+@@@ -1602,7 -1575,15 +1662,16 @@@ static void init_clone_info(struct clon
+  {
+  	ci->map = map;
+  	ci->io = alloc_io(md, bio);
+ -	ci->bio = bio;
+ -	ci->submit_as_polled = false;
+  	ci->sector = bio->bi_iter.bi_sector;
+++<<<<<<< HEAD
+++=======
++ 	ci->sector_count = bio_sectors(bio);
++ 
++ 	/* Shouldn't happen but sector_count was being set to 0 so... */
++ 	if (static_branch_unlikely(&zoned_enabled) &&
++ 	    WARN_ON_ONCE(op_is_zone_mgmt(bio_op(bio)) && ci->sector_count))
++ 		ci->sector_count = 0;
+++>>>>>>> 442761fd2b29 (dm: conditionally enable branching for less used features)
+  }
+  
+  /*
+* Unmerged path drivers/md/dm-core.h
+diff --git a/drivers/md/dm-stats.c b/drivers/md/dm-stats.c
+index 0e039a8c0bf2..86e0697330e8 100644
+--- a/drivers/md/dm-stats.c
++++ b/drivers/md/dm-stats.c
+@@ -396,6 +396,9 @@ static int dm_stats_create(struct dm_stats *stats, sector_t start, sector_t end,
+ 
+ 	dm_stats_recalc_precise_timestamps(stats);
+ 
++	if (!static_key_enabled(&stats_enabled.key))
++		static_branch_enable(&stats_enabled);
++
+ 	mutex_unlock(&stats->mutex);
+ 
+ 	resume_callback(md);
+* Unmerged path drivers/md/dm-table.c
+* Unmerged path drivers/md/dm.c
