@@ -1,0 +1,359 @@
+bpf: Add per-program recursion prevention mechanism
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit ca06f55b90020cd97f4cc6d52db95436162e7dcf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ca06f55b.failed
+
+Since both sleepable and non-sleepable programs execute under migrate_disable
+add recursion prevention mechanism to both types of programs when they're
+executed via bpf trampoline.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210210033634.62081-5-alexei.starovoitov@gmail.com
+(cherry picked from commit ca06f55b90020cd97f4cc6d52db95436162e7dcf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/net/bpf_jit_comp.c
+#	include/linux/bpf.h
+#	include/linux/filter.h
+#	kernel/bpf/core.c
+#	kernel/bpf/trampoline.c
+diff --cc arch/x86/net/bpf_jit_comp.c
+index e25326168f5b,79e7a0ec1da5..000000000000
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@@ -1758,18 -1740,26 +1758,35 @@@ static int invoke_bpf_prog(const struc
+  			   struct bpf_prog *p, int stack_size, bool mod_ret)
+  {
+  	u8 *prog = *pprog;
++ 	u8 *jmp_insn;
+  	int cnt = 0;
+  
+++<<<<<<< HEAD
+ +	if (p->aux->sleepable) {
+ +		if (emit_call(&prog, __bpf_prog_enter_sleepable, prog))
+++=======
++ 	/* arg1: mov rdi, progs[i] */
++ 	emit_mov_imm64(&prog, BPF_REG_1, (long) p >> 32, (u32) (long) p);
++ 	if (emit_call(&prog,
++ 		      p->aux->sleepable ? __bpf_prog_enter_sleepable :
++ 		      __bpf_prog_enter, prog))
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  			return -EINVAL;
+ -	/* remember prog start time returned by __bpf_prog_enter */
+ -	emit_mov_reg(&prog, true, BPF_REG_6, BPF_REG_0);
+ +	} else {
+ +		if (emit_call(&prog, __bpf_prog_enter, prog))
+ +			return -EINVAL;
+ +		/* remember prog start time returned by __bpf_prog_enter */
+ +		emit_mov_reg(&prog, true, BPF_REG_6, BPF_REG_0);
+ +	}
+  
++ 	/* if (__bpf_prog_enter*(prog) == 0)
++ 	 *	goto skip_exec_of_prog;
++ 	 */
++ 	EMIT3(0x48, 0x85, 0xC0);  /* test rax,rax */
++ 	/* emit 2 nops that will be replaced with JE insn */
++ 	jmp_insn = prog;
++ 	emit_nops(&prog, 2);
++ 
+  	/* arg1: lea rdi, [rbp - stack_size] */
+  	EMIT4(0x48, 0x8D, 0x7D, -stack_size);
+  	/* arg2: progs[i]->insnsi for interpreter */
+@@@ -1788,18 -1778,18 +1805,32 @@@
+  	if (mod_ret)
+  		emit_stx(&prog, BPF_DW, BPF_REG_FP, BPF_REG_0, -8);
+  
+++<<<<<<< HEAD
+ +	if (p->aux->sleepable) {
+ +		if (emit_call(&prog, __bpf_prog_exit_sleepable, prog))
+++=======
++ 	/* replace 2 nops with JE insn, since jmp target is known */
++ 	jmp_insn[0] = X86_JE;
++ 	jmp_insn[1] = prog - jmp_insn - 2;
++ 
++ 	/* arg1: mov rdi, progs[i] */
++ 	emit_mov_imm64(&prog, BPF_REG_1, (long) p >> 32, (u32) (long) p);
++ 	/* arg2: mov rsi, rbx <- start time in nsec */
++ 	emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_6);
++ 	if (emit_call(&prog,
++ 		      p->aux->sleepable ? __bpf_prog_exit_sleepable :
++ 		      __bpf_prog_exit, prog))
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+ +			return -EINVAL;
+ +	} else {
+ +		/* arg1: mov rdi, progs[i] */
+ +		emit_mov_imm64(&prog, BPF_REG_1, (long) p >> 32,
+ +			       (u32) (long) p);
+ +		/* arg2: mov rsi, rbx <- start time in nsec */
+ +		emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_6);
+ +		if (emit_call(&prog, __bpf_prog_exit, prog))
+  			return -EINVAL;
+ +	}
+  
+  	*pprog = prog;
+  	return 0;
+diff --cc include/linux/bpf.h
+index da13e0f46e30,1c8ea682c007..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -583,12 -561,10 +583,17 @@@ int arch_prepare_bpf_trampoline(struct 
+  				struct bpf_tramp_progs *tprogs,
+  				void *orig_call);
+  /* these two functions are called from generated trampoline */
+- u64 notrace __bpf_prog_enter(void);
++ u64 notrace __bpf_prog_enter(struct bpf_prog *prog);
+  void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start);
+++<<<<<<< HEAD
+ +void notrace __bpf_prog_enter_sleepable(void);
+ +void notrace __bpf_prog_exit_sleepable(void);
+ +void notrace __bpf_tramp_enter(struct bpf_tramp_image *tr);
+ +void notrace __bpf_tramp_exit(struct bpf_tramp_image *tr);
+++=======
++ u64 notrace __bpf_prog_enter_sleepable(struct bpf_prog *prog);
++ void notrace __bpf_prog_exit_sleepable(struct bpf_prog *prog, u64 start);
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  
+  struct bpf_ksym {
+  	unsigned long		 start;
+diff --cc include/linux/filter.h
+index d0df16c403ee,6a06f3c69f4e..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -579,15 -564,15 +579,22 @@@ struct bpf_prog 
+  	u32			len;		/* Number of filter blocks */
+  	u32			jited_len;	/* Size of jited insns in bytes */
+  	u8			tag[BPF_TAG_SIZE];
+++<<<<<<< HEAD
+++=======
++ 	struct bpf_prog_stats __percpu *stats;
++ 	int __percpu		*active;
++ 	unsigned int		(*bpf_func)(const void *ctx,
++ 					    const struct bpf_insn *insn);
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
+  	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+ +	unsigned int		(*bpf_func)(const void *ctx,
+ +					    const struct bpf_insn *insn);
+  	/* Instructions for interpreter */
+ -	struct sock_filter	insns[0];
+ -	struct bpf_insn		insnsi[];
+ +	union {
+ +		struct sock_filter	insns[0];
+ +		struct bpf_insn		insnsi[0];
+ +	};
+  };
+  
+  struct sk_filter {
+diff --cc kernel/bpf/core.c
+index 3853f5e27301,334070c4b8a1..000000000000
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@@ -120,8 -120,9 +126,14 @@@ struct bpf_prog *bpf_prog_alloc(unsigne
+  	if (!prog)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	prog->aux->stats = alloc_percpu_gfp(struct bpf_prog_stats, gfp_flags);
+ +	if (!prog->aux->stats) {
+++=======
++ 	prog->stats = alloc_percpu_gfp(struct bpf_prog_stats, gfp_flags);
++ 	if (!prog->stats) {
++ 		free_percpu(prog->active);
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  		kfree(prog->aux);
+  		vfree(prog);
+  		return NULL;
+@@@ -259,6 -259,8 +271,11 @@@ void __bpf_prog_free(struct bpf_prog *f
+  		kfree(fp->aux->poke_tab);
+  		kfree(fp->aux);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	free_percpu(fp->stats);
++ 	free_percpu(fp->active);
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  	vfree(fp);
+  }
+  
+diff --cc kernel/bpf/trampoline.c
+index e4f61015e2e7,89ef6320d19b..000000000000
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@@ -489,56 -381,85 +489,124 @@@ out
+  	mutex_unlock(&trampoline_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define NO_START_TIME 1
++ static u64 notrace bpf_prog_start_time(void)
++ {
++ 	u64 start = NO_START_TIME;
++ 
++ 	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
++ 		start = sched_clock();
++ 		if (unlikely(!start))
++ 			start = NO_START_TIME;
++ 	}
++ 	return start;
++ }
++ 
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  /* The logic is similar to BPF_PROG_RUN, but with an explicit
+   * rcu_read_lock() and migrate_disable() which are required
+   * for the trampoline. The macro is split into
+ - * call __bpf_prog_enter
+ + * call _bpf_prog_enter
+   * call prog->bpf_func
+   * call __bpf_prog_exit
++  *
++  * __bpf_prog_enter returns:
++  * 0 - skip execution of the bpf prog
++  * 1 - execute bpf prog
++  * [2..MAX_U64] - excute bpf prog and record execution time.
++  *     This is start time.
+   */
+- u64 notrace __bpf_prog_enter(void)
++ u64 notrace __bpf_prog_enter(struct bpf_prog *prog)
+  	__acquires(RCU)
+  {
+ +	u64 start = 0;
+ +
+  	rcu_read_lock();
+  	migrate_disable();
+++<<<<<<< HEAD
+ +	if (static_branch_unlikely(&bpf_stats_enabled_key))
+ +		start = sched_clock();
+ +	return start;
+++=======
++ 	if (unlikely(__this_cpu_inc_return(*(prog->active)) != 1))
++ 		return 0;
++ 	return bpf_prog_start_time();
++ }
++ 
++ static void notrace update_prog_stats(struct bpf_prog *prog,
++ 				      u64 start)
++ {
++ 	struct bpf_prog_stats *stats;
++ 
++ 	if (static_branch_unlikely(&bpf_stats_enabled_key) &&
++ 	    /* static_key could be enabled in __bpf_prog_enter*
++ 	     * and disabled in __bpf_prog_exit*.
++ 	     * And vice versa.
++ 	     * Hence check that 'start' is valid.
++ 	     */
++ 	    start > NO_START_TIME) {
++ 		stats = this_cpu_ptr(prog->stats);
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->cnt++;
++ 		stats->nsecs += sched_clock() - start;
++ 		u64_stats_update_end(&stats->syncp);
++ 	}
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  }
+  
+  void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
+  	__releases(RCU)
+  {
+++<<<<<<< HEAD
+ +	struct bpf_prog_stats *stats;
+ +
+ +	if (static_branch_unlikely(&bpf_stats_enabled_key) &&
+ +	    /* static_key could be enabled in __bpf_prog_enter
+ +	     * and disabled in __bpf_prog_exit.
+ +	     * And vice versa.
+ +	     * Hence check that 'start' is not zero.
+ +	     */
+ +	    start) {
+ +		stats = this_cpu_ptr(prog->aux->stats);
+ +		u64_stats_update_begin(&stats->syncp);
+ +		stats->cnt++;
+ +		stats->nsecs += sched_clock() - start;
+ +		u64_stats_update_end(&stats->syncp);
+ +	}
+++=======
++ 	update_prog_stats(prog, start);
++ 	__this_cpu_dec(*(prog->active));
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  	migrate_enable();
+  	rcu_read_unlock();
+  }
+  
+++<<<<<<< HEAD
+ +void notrace __bpf_prog_enter_sleepable(void)
+++=======
++ u64 notrace __bpf_prog_enter_sleepable(struct bpf_prog *prog)
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  {
+  	rcu_read_lock_trace();
+  	migrate_disable();
+  	might_fault();
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(__this_cpu_inc_return(*(prog->active)) != 1))
++ 		return 0;
++ 	return bpf_prog_start_time();
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  }
+  
+ -void notrace __bpf_prog_exit_sleepable(struct bpf_prog *prog, u64 start)
+ +void notrace __bpf_prog_exit_sleepable(void)
+  {
+++<<<<<<< HEAD
+++=======
++ 	update_prog_stats(prog, start);
++ 	__this_cpu_dec(*(prog->active));
+++>>>>>>> ca06f55b9002 (bpf: Add per-program recursion prevention mechanism)
+  	migrate_enable();
+  	rcu_read_unlock_trace();
+  }
+* Unmerged path arch/x86/net/bpf_jit_comp.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/filter.h
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/trampoline.c
+diff --git a/tools/testing/selftests/bpf/prog_tests/fexit_stress.c b/tools/testing/selftests/bpf/prog_tests/fexit_stress.c
+index 3b9dbf7433f0..7c9b62e971f1 100644
+--- a/tools/testing/selftests/bpf/prog_tests/fexit_stress.c
++++ b/tools/testing/selftests/bpf/prog_tests/fexit_stress.c
+@@ -2,8 +2,8 @@
+ /* Copyright (c) 2019 Facebook */
+ #include <test_progs.h>
+ 
+-/* x86-64 fits 55 JITed and 43 interpreted progs into half page */
+-#define CNT 40
++/* that's kernel internal BPF_MAX_TRAMP_PROGS define */
++#define CNT 38
+ 
+ void test_fexit_stress(void)
+ {
+diff --git a/tools/testing/selftests/bpf/prog_tests/trampoline_count.c b/tools/testing/selftests/bpf/prog_tests/trampoline_count.c
+index 781c8d11604b..f3022d934e2d 100644
+--- a/tools/testing/selftests/bpf/prog_tests/trampoline_count.c
++++ b/tools/testing/selftests/bpf/prog_tests/trampoline_count.c
+@@ -4,7 +4,7 @@
+ #include <sys/prctl.h>
+ #include <test_progs.h>
+ 
+-#define MAX_TRAMP_PROGS 40
++#define MAX_TRAMP_PROGS 38
+ 
+ struct inst {
+ 	struct bpf_object *obj;
+@@ -52,7 +52,7 @@ void test_trampoline_count(void)
+ 	struct bpf_link *link;
+ 	char comm[16] = {};
+ 
+-	/* attach 'allowed' 40 trampoline programs */
++	/* attach 'allowed' trampoline programs */
+ 	for (i = 0; i < MAX_TRAMP_PROGS; i++) {
+ 		obj = bpf_object__open_file(object, NULL);
+ 		if (CHECK(IS_ERR(obj), "obj_open_file", "err %ld\n", PTR_ERR(obj))) {
