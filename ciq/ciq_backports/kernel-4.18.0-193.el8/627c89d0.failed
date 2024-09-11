@@ -1,0 +1,283 @@
+bnxt_en: flow_offload: offload tunnel decap rules via indirect callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+commit 627c89d00fb969f9b3b4f3156716149631d2796c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/627c89d0.failed
+
+The decap (VXLAN tunnel) flow rules are not getting offloaded with
+upstream kernel. This is because TC block callback infrastructure has
+been updated to use indirect callbacks to get offloaded rules from
+other higher level devices (such as tunnels), instead of ndo_setup_tc().
+Since the decap rules are applied to the tunnel devices (e.g, vxlan_sys),
+the driver should register for indirect TC callback with tunnel devices
+to get the rules for offloading. This patch updates the driver to
+register and process indirect TC block callbacks from VXLAN tunnels.
+
+	Signed-off-by: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 627c89d00fb969f9b3b4f3156716149631d2796c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index beda4b5b2585,71f9c9c53301..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -9957,25 -10945,7 +9957,29 @@@ static int bnxt_setup_tc_block_cb(enum 
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int bnxt_setup_tc_block(struct net_device *dev,
+ +			       struct tc_block_offload *f)
+ +{
+ +	struct bnxt *bp = netdev_priv(dev);
+ +
+ +	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+ +		return -EOPNOTSUPP;
+ +
+ +	switch (f->command) {
+ +	case TC_BLOCK_BIND:
+ +		return tcf_block_cb_register(f->block, bnxt_setup_tc_block_cb,
+ +					     bp, bp, f->extack);
+ +	case TC_BLOCK_UNBIND:
+ +		tcf_block_cb_unregister(f->block, bnxt_setup_tc_block_cb, bp);
+ +		return 0;
+ +	default:
+ +		return -EOPNOTSUPP;
+ +	}
+ +}
+++=======
++ LIST_HEAD(bnxt_block_cb_list);
+++>>>>>>> 627c89d00fb9 (bnxt_en: flow_offload: offload tunnel decap rules via indirect callbacks)
+  
+  static int bnxt_setup_tc(struct net_device *dev, enum tc_setup_type type,
+  			 void *type_data)
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 7b36ae0bfd54,a3545c846bfb..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -24,7 -24,14 +24,18 @@@
+  #include <net/devlink.h>
+  #include <net/dst_metadata.h>
+  #include <net/xdp.h>
+++<<<<<<< HEAD
+ +#include <linux/net_dim.h>
+++=======
++ #include <linux/dim.h>
++ #ifdef CONFIG_TEE_BNXT_FW
++ #include <linux/firmware/broadcom/tee_bnxt_fw.h>
++ #endif
++ 
++ extern struct list_head bnxt_block_cb_list;
++ 
++ struct page_pool;
+++>>>>>>> 627c89d00fb9 (bnxt_en: flow_offload: offload tunnel decap rules via indirect callbacks)
+  
+  struct tx_bd {
+  	__le32 tx_bd_len_flags_type;
+@@@ -1714,8 -1831,9 +1733,10 @@@ struct bnxt 
+  	u16			*cfa_code_map; /* cfa_code -> vf_idx map */
+  	u8			switch_id[8];
+  	struct bnxt_tc_info	*tc_info;
++ 	struct list_head	tc_indr_block_list;
++ 	struct notifier_block	tc_netdev_nb;
+  	struct dentry		*debugfs_pdev;
+ +	struct dentry		*debugfs_dim;
+  	struct device		*hwmon_dev;
+  };
+  
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+index 9204cb198785..2d7099816929 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+@@ -17,6 +17,7 @@
+ #include <net/tc_act/tc_mirred.h>
+ #include <net/tc_act/tc_vlan.h>
+ #include <net/tc_act/tc_tunnel_key.h>
++#include <net/vxlan.h>
+ 
+ #include "bnxt_hsi.h"
+ #include "bnxt.h"
+@@ -1581,6 +1582,147 @@ int bnxt_tc_setup_flower(struct bnxt *bp, u16 src_fid,
+ 	}
+ }
+ 
++static int bnxt_tc_setup_indr_block_cb(enum tc_setup_type type,
++				       void *type_data, void *cb_priv)
++{
++	struct bnxt_flower_indr_block_cb_priv *priv = cb_priv;
++	struct flow_cls_offload *flower = type_data;
++	struct bnxt *bp = priv->bp;
++
++	if (flower->common.chain_index)
++		return -EOPNOTSUPP;
++
++	switch (type) {
++	case TC_SETUP_CLSFLOWER:
++		return bnxt_tc_setup_flower(bp, bp->pf.fw_fid, flower);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static struct bnxt_flower_indr_block_cb_priv *
++bnxt_tc_indr_block_cb_lookup(struct bnxt *bp, struct net_device *netdev)
++{
++	struct bnxt_flower_indr_block_cb_priv *cb_priv;
++
++	/* All callback list access should be protected by RTNL. */
++	ASSERT_RTNL();
++
++	list_for_each_entry(cb_priv, &bp->tc_indr_block_list, list)
++		if (cb_priv->tunnel_netdev == netdev)
++			return cb_priv;
++
++	return NULL;
++}
++
++static void bnxt_tc_setup_indr_rel(void *cb_priv)
++{
++	struct bnxt_flower_indr_block_cb_priv *priv = cb_priv;
++
++	list_del(&priv->list);
++	kfree(priv);
++}
++
++static int bnxt_tc_setup_indr_block(struct net_device *netdev, struct bnxt *bp,
++				    struct flow_block_offload *f)
++{
++	struct bnxt_flower_indr_block_cb_priv *cb_priv;
++	struct flow_block_cb *block_cb;
++
++	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++
++	switch (f->command) {
++	case FLOW_BLOCK_BIND:
++		cb_priv = kmalloc(sizeof(*cb_priv), GFP_KERNEL);
++		if (!cb_priv)
++			return -ENOMEM;
++
++		cb_priv->tunnel_netdev = netdev;
++		cb_priv->bp = bp;
++		list_add(&cb_priv->list, &bp->tc_indr_block_list);
++
++		block_cb = flow_block_cb_alloc(bnxt_tc_setup_indr_block_cb,
++					       cb_priv, cb_priv,
++					       bnxt_tc_setup_indr_rel);
++		if (IS_ERR(block_cb)) {
++			list_del(&cb_priv->list);
++			kfree(cb_priv);
++			return PTR_ERR(block_cb);
++		}
++
++		flow_block_cb_add(block_cb, f);
++		list_add_tail(&block_cb->driver_list, &bnxt_block_cb_list);
++		break;
++	case FLOW_BLOCK_UNBIND:
++		cb_priv = bnxt_tc_indr_block_cb_lookup(bp, netdev);
++		if (!cb_priv)
++			return -ENOENT;
++
++		block_cb = flow_block_cb_lookup(f->block,
++						bnxt_tc_setup_indr_block_cb,
++						cb_priv);
++		if (!block_cb)
++			return -ENOENT;
++
++		flow_block_cb_remove(block_cb, f);
++		list_del(&block_cb->driver_list);
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	return 0;
++}
++
++static int bnxt_tc_setup_indr_cb(struct net_device *netdev, void *cb_priv,
++				 enum tc_setup_type type, void *type_data)
++{
++	switch (type) {
++	case TC_SETUP_BLOCK:
++		return bnxt_tc_setup_indr_block(netdev, cb_priv, type_data);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static bool bnxt_is_netdev_indr_offload(struct net_device *netdev)
++{
++	return netif_is_vxlan(netdev);
++}
++
++static int bnxt_tc_indr_block_event(struct notifier_block *nb,
++				    unsigned long event, void *ptr)
++{
++	struct net_device *netdev;
++	struct bnxt *bp;
++	int rc;
++
++	netdev = netdev_notifier_info_to_dev(ptr);
++	if (!bnxt_is_netdev_indr_offload(netdev))
++		return NOTIFY_OK;
++
++	bp = container_of(nb, struct bnxt, tc_netdev_nb);
++
++	switch (event) {
++	case NETDEV_REGISTER:
++		rc = __flow_indr_block_cb_register(netdev, bp,
++						   bnxt_tc_setup_indr_cb,
++						   bp);
++		if (rc)
++			netdev_info(bp->dev,
++				    "Failed to register indirect blk: dev: %s",
++				    netdev->name);
++		break;
++	case NETDEV_UNREGISTER:
++		__flow_indr_block_cb_unregister(netdev,
++						bnxt_tc_setup_indr_cb,
++						bp);
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
+ static const struct rhashtable_params bnxt_tc_flow_ht_params = {
+ 	.head_offset = offsetof(struct bnxt_tc_flow_node, node),
+ 	.key_offset = offsetof(struct bnxt_tc_flow_node, cookie),
+@@ -1664,7 +1806,15 @@ int bnxt_init_tc(struct bnxt *bp)
+ 	bp->dev->hw_features |= NETIF_F_HW_TC;
+ 	bp->dev->features |= NETIF_F_HW_TC;
+ 	bp->tc_info = tc_info;
+-	return 0;
++
++	/* init indirect block notifications */
++	INIT_LIST_HEAD(&bp->tc_indr_block_list);
++	bp->tc_netdev_nb.notifier_call = bnxt_tc_indr_block_event;
++	rc = register_netdevice_notifier(&bp->tc_netdev_nb);
++	if (!rc)
++		return 0;
++
++	rhashtable_destroy(&tc_info->encap_table);
+ 
+ destroy_decap_table:
+ 	rhashtable_destroy(&tc_info->decap_table);
+@@ -1686,6 +1836,7 @@ void bnxt_shutdown_tc(struct bnxt *bp)
+ 	if (!bnxt_tc_flower_enabled(bp))
+ 		return;
+ 
++	unregister_netdevice_notifier(&bp->tc_netdev_nb);
+ 	rhashtable_destroy(&tc_info->flow_table);
+ 	rhashtable_destroy(&tc_info->l2_table);
+ 	rhashtable_destroy(&tc_info->decap_l2_table);
