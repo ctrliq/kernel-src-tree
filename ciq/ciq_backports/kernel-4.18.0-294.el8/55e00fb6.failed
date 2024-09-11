@@ -1,0 +1,197 @@
+x86/fpu/xstate: Restore supervisor states for signal return
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yu-cheng Yu <yu-cheng.yu@intel.com>
+commit 55e00fb66fd5048f4a3ee357018fd26fc527abca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/55e00fb6.failed
+
+The signal return fast path directly restores user states from the user
+buffer. Once that succeeds, restore supervisor states (but only when
+they are not yet restored).
+
+For the slow path, save supervisor states to preserve them across context
+switches, and restore after the user states are restored.
+
+The previous version has the overhead of an XSAVES in both the fast and the
+slow paths.  It is addressed as the following:
+
+- In the fast path, only do an XRSTORS.
+- In the slow path, do a supervisor-state-only XSAVES, and relocate the
+  buffer contents.
+
+Some thoughts in the implementation:
+
+- In the slow path, can any supervisor state become stale between
+  save/restore?
+
+  Answer: set_thread_flag(TIF_NEED_FPU_LOAD) protects the xstate buffer.
+
+- In the slow path, can any code reference a stale supervisor state
+  register between save/restore?
+
+  Answer: In the current lazy-restore scheme, any reference to xstate
+  registers needs fpregs_lock()/fpregs_unlock() and __fpregs_load_activate().
+
+- Are there other options?
+
+  One other option is eagerly restoring all supervisor states.
+
+  Currently, CET user-mode states and ENQCMD's PASID do not need to be
+  eagerly restored.  The upcoming CET kernel-mode states (24 bytes) need
+  to be eagerly restored.  To me, eagerly restoring all supervisor states
+  adds more overhead then benefit at this point.
+
+	Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+Link: https://lkml.kernel.org/r/20200512145444.15483-11-yu-cheng.yu@intel.com
+(cherry picked from commit 55e00fb66fd5048f4a3ee357018fd26fc527abca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/signal.c
+diff --cc arch/x86/kernel/fpu/signal.c
+index ae77c2653921,9393a445d73c..000000000000
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@@ -314,50 -331,78 +314,113 @@@ static int __fpu__restore_sig(void __us
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if ((unsigned long)buf_fx % 64)
++ 		fx_only = 1;
++ 
++ 	if (!ia32_fxstate) {
++ 		/*
++ 		 * Attempt to restore the FPU registers directly from user
++ 		 * memory. For that to succeed, the user access cannot cause
++ 		 * page faults. If it does, fall back to the slow path below,
++ 		 * going through the kernel buffer with the enabled pagefault
++ 		 * handler.
++ 		 */
++ 		fpregs_lock();
++ 		pagefault_disable();
++ 		ret = copy_user_to_fpregs_zeroing(buf_fx, user_xfeatures, fx_only);
++ 		pagefault_enable();
++ 		if (!ret) {
++ 
++ 			/*
++ 			 * Restore supervisor states: previous context switch
++ 			 * etc has done XSAVES and saved the supervisor states
++ 			 * in the kernel buffer from which they can be restored
++ 			 * now.
++ 			 *
++ 			 * We cannot do a single XRSTORS here - which would
++ 			 * be nice - because the rest of the FPU registers are
++ 			 * being restored from a user buffer directly. The
++ 			 * single XRSTORS happens below, when the user buffer
++ 			 * has been copied to the kernel one.
++ 			 */
++ 			if (test_thread_flag(TIF_NEED_FPU_LOAD) &&
++ 			    xfeatures_mask_supervisor())
++ 				copy_kernel_to_xregs(&fpu->state.xsave,
++ 						     xfeatures_mask_supervisor());
++ 			fpregs_mark_activate();
++ 			fpregs_unlock();
++ 			return 0;
++ 		}
++ 		fpregs_unlock();
++ 	} else {
++ 		/*
++ 		 * For 32-bit frames with fxstate, copy the fxstate so it can
++ 		 * be reconstructed later.
++ 		 */
++ 		ret = __copy_from_user(&env, buf, sizeof(env));
++ 		if (ret)
++ 			goto err_out;
++ 		envp = &env;
++ 	}
++ 
+++>>>>>>> 55e00fb66fd5 (x86/fpu/xstate: Restore supervisor states for signal return)
+  	/*
+- 	 * The current state of the FPU registers does not matter. By setting
+- 	 * TIF_NEED_FPU_LOAD unconditionally it is ensured that the our xstate
+- 	 * is not modified on context switch and that the xstate is considered
++ 	 * By setting TIF_NEED_FPU_LOAD it is ensured that our xstate is
++ 	 * not modified on context switch and that the xstate is considered
+  	 * to be loaded again on return to userland (overriding last_cpu avoids
+  	 * the optimisation).
+  	 */
+- 	set_thread_flag(TIF_NEED_FPU_LOAD);
++ 	fpregs_lock();
++ 
++ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
++ 
++ 		/*
++ 		 * Supervisor states are not modified by user space input.  Save
++ 		 * current supervisor states first and invalidate the FPU regs.
++ 		 */
++ 		if (xfeatures_mask_supervisor())
++ 			copy_supervisor_to_kernel(&fpu->state.xsave);
++ 		set_thread_flag(TIF_NEED_FPU_LOAD);
++ 	}
+  	__fpu_invalidate_fpregs_state(fpu);
++ 	fpregs_unlock();
+  
+ +	if ((unsigned long)buf_fx % 64)
+ +		fx_only = 1;
+ +	/*
+ +	 * For 32-bit frames with fxstate, copy the fxstate so it can be
+ +	 * reconstructed later.
+ +	 */
+ +	if (ia32_fxstate) {
+ +		ret = __copy_from_user(&env, buf, sizeof(env));
+ +		if (ret)
+ +			goto err_out;
+ +		envp = &env;
+ +	} else {
+ +		/*
+ +		 * Attempt to restore the FPU registers directly from user
+ +		 * memory. For that to succeed, the user access cannot cause
+ +		 * page faults. If it does, fall back to the slow path below,
+ +		 * going through the kernel buffer with the enabled pagefault
+ +		 * handler.
+ +		 */
+ +		fpregs_lock();
+ +		pagefault_disable();
+ +		ret = copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only);
+ +		pagefault_enable();
+ +		if (!ret) {
+ +			fpregs_mark_activate();
+ +			fpregs_unlock();
+ +			return 0;
+ +		}
+ +		fpregs_unlock();
+ +	}
+ +
+ +
+  	if (use_xsave() && !fx_only) {
+ -		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
+ +		u64 init_bv = xfeatures_mask & ~xfeatures;
+  
+  		if (using_compacted_format()) {
+  			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+@@@ -375,7 -421,13 +438,17 @@@
+  		fpregs_lock();
+  		if (unlikely(init_bv))
+  			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+++<<<<<<< HEAD
+ +		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, xfeatures);
+++=======
++ 
++ 		/*
++ 		 * Restore previously saved supervisor xstates along with
++ 		 * copied-in user xstates.
++ 		 */
++ 		ret = copy_kernel_to_xregs_err(&fpu->state.xsave,
++ 					       user_xfeatures | xfeatures_mask_supervisor());
+++>>>>>>> 55e00fb66fd5 (x86/fpu/xstate: Restore supervisor states for signal return)
+  
+  	} else if (use_fxsr()) {
+  		ret = __copy_from_user(&fpu->state.fxsave, buf_fx, state_size);
+* Unmerged path arch/x86/kernel/fpu/signal.c
