@@ -1,0 +1,147 @@
+x86/fpu: Provide a proper function for ex_handler_fprestore()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 079ec41b22b952cdf3126527d735e373c9125f6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/079ec41b.failed
+
+To make upcoming changes for support of dynamically enabled features
+simpler, provide a proper function for the exception handler which removes
+exposure of FPU internals.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211015011540.053515012@linutronix.de
+(cherry picked from commit 079ec41b22b952cdf3126527d735e373c9125f6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/api.h
+#	arch/x86/mm/extable.c
+diff --cc arch/x86/include/asm/fpu/api.h
+index f75d8cead081,9263d708dff9..000000000000
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@@ -95,6 -110,26 +95,29 @@@ extern int cpu_has_xfeatures(u64 xfeatu
+  
+  static inline void update_pasid(void) { }
+  
+++<<<<<<< HEAD
+++=======
++ /* Trap handling */
++ extern int  fpu__exception_code(struct fpu *fpu, int trap_nr);
++ extern void fpu_sync_fpstate(struct fpu *fpu);
++ extern void fpu_reset_from_exception_fixup(void);
++ 
++ /* Boot, hotplug and resume */
++ extern void fpu__init_cpu(void);
++ extern void fpu__init_system(struct cpuinfo_x86 *c);
++ extern void fpu__init_check_bugs(void);
++ extern void fpu__resume_cpu(void);
++ 
++ #ifdef CONFIG_MATH_EMULATION
++ extern void fpstate_init_soft(struct swregs_state *soft);
++ #else
++ static inline void fpstate_init_soft(struct swregs_state *soft) {}
++ #endif
++ 
++ /* State tracking */
++ DECLARE_PER_CPU(struct fpu *, fpu_fpregs_owner_ctx);
++ 
+++>>>>>>> 079ec41b22b9 (x86/fpu: Provide a proper function for ex_handler_fprestore())
+  /* fpstate-related functions which are exported to KVM */
+  extern void fpu_init_fpstate_user(struct fpu *fpu);
+  
+diff --cc arch/x86/mm/extable.c
+index f994c509e3ce,5cd2a88930a9..000000000000
+--- a/arch/x86/mm/extable.c
++++ b/arch/x86/mm/extable.c
+@@@ -3,7 -4,7 +3,11 @@@
+  #include <linux/sched/debug.h>
+  #include <xen/xen.h>
+  
+++<<<<<<< HEAD
+ +#include <asm/fpu/internal.h>
+++=======
++ #include <asm/fpu/api.h>
+++>>>>>>> 079ec41b22b9 (x86/fpu: Provide a proper function for ex_handler_fprestore())
+  #include <asm/sev.h>
+  #include <asm/traps.h>
+  #include <asm/kdebug.h>
+@@@ -104,31 -47,26 +108,31 @@@ __visible bool ex_handler_fprestore(con
+  	WARN_ONCE(1, "Bad FPU state detected at %pB, reinitializing FPU registers.",
+  		  (void *)instruction_pointer(regs));
+  
+- 	restore_fpregs_from_fpstate(&init_fpstate, xfeatures_mask_fpstate());
++ 	fpu_reset_from_exception_fixup();
+  	return true;
+  }
+ +EXPORT_SYMBOL_GPL(ex_handler_fprestore);
+  
+ -static bool ex_handler_uaccess(const struct exception_table_entry *fixup,
+ -			       struct pt_regs *regs, int trapnr)
+ +__visible bool ex_handler_uaccess(const struct exception_table_entry *fixup,
+ +				  struct pt_regs *regs, int trapnr)
+  {
+ -	WARN_ONCE(trapnr == X86_TRAP_GP, "General protection fault in user access. Non-canonical address?");
+ -	return ex_handler_default(fixup, regs);
+ +	regs->ip = ex_fixup_addr(fixup);
+ +	return true;
+  }
+ +EXPORT_SYMBOL(ex_handler_uaccess);
+  
+ -static bool ex_handler_copy(const struct exception_table_entry *fixup,
+ -			    struct pt_regs *regs, int trapnr)
+ +__visible bool ex_handler_ext(const struct exception_table_entry *fixup,
+ +			      struct pt_regs *regs, int trapnr)
+  {
+ -	WARN_ONCE(trapnr == X86_TRAP_GP, "General protection fault in user access. Non-canonical address?");
+ -	return ex_handler_fault(fixup, regs, trapnr);
+ +	/* Special hack for uaccess_err */
+ +	current->thread.uaccess_err = 1;
+ +	regs->ip = ex_fixup_addr(fixup);
+ +	return true;
+  }
+ +EXPORT_SYMBOL(ex_handler_ext);
+  
+ -static bool ex_handler_rdmsr_unsafe(const struct exception_table_entry *fixup,
+ -				    struct pt_regs *regs)
+ +__visible bool ex_handler_rdmsr_unsafe(const struct exception_table_entry *fixup,
+ +				       struct pt_regs *regs, int trapnr)
+  {
+  	if (pr_warn_once("unchecked MSR access error: RDMSR from 0x%x at rIP: 0x%lx (%pS)\n",
+  			 (unsigned int)regs->cx, regs->ip, (void *)regs->ip))
+* Unmerged path arch/x86/include/asm/fpu/api.h
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 349731518d67..66891104c74d 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -147,6 +147,11 @@ void restore_fpregs_from_fpstate(union fpregs_state *fpstate, u64 mask)
+ 	}
+ }
+ 
++void fpu_reset_from_exception_fixup(void)
++{
++	restore_fpregs_from_fpstate(&init_fpstate, xfeatures_mask_fpstate());
++}
++
+ #if IS_ENABLED(CONFIG_KVM)
+ void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask)
+ {
+diff --git a/arch/x86/kernel/fpu/internal.h b/arch/x86/kernel/fpu/internal.h
+index 5ddc09e03c2a..bf84f265cf79 100644
+--- a/arch/x86/kernel/fpu/internal.h
++++ b/arch/x86/kernel/fpu/internal.h
+@@ -2,6 +2,8 @@
+ #ifndef __X86_KERNEL_FPU_INTERNAL_H
+ #define __X86_KERNEL_FPU_INTERNAL_H
+ 
++extern union fpregs_state init_fpstate;
++
+ /* CPU feature check wrappers */
+ static __always_inline __pure bool use_xsave(void)
+ {
+* Unmerged path arch/x86/mm/extable.c
