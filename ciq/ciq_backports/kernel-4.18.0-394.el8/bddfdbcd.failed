@@ -1,0 +1,482 @@
+NFSD: Extract the svcxdr_init_encode() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit bddfdbcddbe267519cd36aeb115fdf8620980111
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/bddfdbcd.failed
+
+NFSD initializes an encode xdr_stream only after the RPC layer has
+already inserted the RPC Reply header. Thus it behaves differently
+than xdr_init_encode does, which assumes the passed-in xdr_buf is
+entirely devoid of content.
+
+nfs4proc.c has this server-side stream initialization helper, but
+it is visible only to the NFSv4 code. Move this helper to a place
+that can be accessed by NFSv2 and NFSv3 server XDR functions.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit bddfdbcddbe267519cd36aeb115fdf8620980111)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4proc.c
+#	fs/nfsd/nfs4xdr.c
+diff --cc fs/nfsd/nfs4proc.c
+index 47193e81d58e,c57cf09a8b60..000000000000
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@@ -1962,24 -2262,44 +1962,65 @@@ static bool need_wrongsec_check(struct 
+  	return !(nextd->op_flags & OP_HANDLES_WRONGSEC);
+  }
+  
+++<<<<<<< HEAD
+ +static void svcxdr_init_encode(struct svc_rqst *rqstp,
+ +			       struct nfsd4_compoundres *resp)
+ +{
+ +	struct xdr_stream *xdr = &resp->xdr;
+ +	struct xdr_buf *buf = &rqstp->rq_res;
+ +	struct kvec *head = buf->head;
+ +
+ +	xdr->buf = buf;
+ +	xdr->iov = head;
+ +	xdr->p   = head->iov_base + head->iov_len;
+ +	xdr->end = head->iov_base + PAGE_SIZE - rqstp->rq_auth_slack;
+ +	/* Tail and page_len should be zero at this point: */
+ +	buf->len = buf->head[0].iov_len;
+ +	xdr_reset_scratch_buffer(xdr);
+ +	xdr->page_ptr = buf->pages - 1;
+ +	buf->buflen = PAGE_SIZE * (1 + rqstp->rq_page_end - buf->pages)
+ +		- rqstp->rq_auth_slack;
+ +}
+++=======
++ #ifdef CONFIG_NFSD_V4_2_INTER_SSC
++ static void
++ check_if_stalefh_allowed(struct nfsd4_compoundargs *args)
++ {
++ 	struct nfsd4_op	*op, *current_op = NULL, *saved_op = NULL;
++ 	struct nfsd4_copy *copy;
++ 	struct nfsd4_putfh *putfh;
++ 	int i;
++ 
++ 	/* traverse all operation and if it's a COPY compound, mark the
++ 	 * source filehandle to skip verification
++ 	 */
++ 	for (i = 0; i < args->opcnt; i++) {
++ 		op = &args->ops[i];
++ 		if (op->opnum == OP_PUTFH)
++ 			current_op = op;
++ 		else if (op->opnum == OP_SAVEFH)
++ 			saved_op = current_op;
++ 		else if (op->opnum == OP_RESTOREFH)
++ 			current_op = saved_op;
++ 		else if (op->opnum == OP_COPY) {
++ 			copy = (struct nfsd4_copy *)&op->u;
++ 			if (!saved_op) {
++ 				op->status = nfserr_nofilehandle;
++ 				return;
++ 			}
++ 			putfh = (struct nfsd4_putfh *)&saved_op->u;
++ 			if (!copy->cp_intra)
++ 				putfh->no_verify = true;
++ 		}
++ 	}
++ }
++ #else
++ static void
++ check_if_stalefh_allowed(struct nfsd4_compoundargs *args)
++ {
++ }
++ #endif
+++>>>>>>> bddfdbcddbe2 (NFSD: Extract the svcxdr_init_encode() helper)
+  
+  /*
+   * COMPOUND call.
+diff --cc fs/nfsd/nfs4xdr.c
+index cf0d08d4c2a7,e0f06d3cbd44..000000000000
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@@ -3794,12 -3976,15 +3794,17 @@@ nfsd4_encode_read(struct nfsd4_compound
+  		  struct nfsd4_read *read)
+  {
+  	unsigned long maxcount;
+++<<<<<<< HEAD
+ +	struct xdr_stream *xdr = &resp->xdr;
+ +	struct file *file = read->rd_filp;
+++=======
++ 	struct xdr_stream *xdr = resp->xdr;
++ 	struct file *file;
+++>>>>>>> bddfdbcddbe2 (NFSD: Extract the svcxdr_init_encode() helper)
+  	int starting_len = xdr->buf->len;
+ +	struct raparms *ra = NULL;
+  	__be32 *p;
+  
+ -	if (nfserr)
+ -		return nfserr;
+ -	file = read->rd_nf->nf_file;
+ -
+  	p = xdr_reserve_space(xdr, 8); /* eof flag and byte count */
+  	if (!p) {
+  		WARN_ON_ONCE(test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags));
+@@@ -4484,6 -4663,46 +4489,49 @@@ nfsd42_encode_write_res(struct nfsd4_co
+  }
+  
+  static __be32
+++<<<<<<< HEAD
+++=======
++ nfsd42_encode_nl4_server(struct nfsd4_compoundres *resp, struct nl4_server *ns)
++ {
++ 	struct xdr_stream *xdr = resp->xdr;
++ 	struct nfs42_netaddr *addr;
++ 	__be32 *p;
++ 
++ 	p = xdr_reserve_space(xdr, 4);
++ 	*p++ = cpu_to_be32(ns->nl4_type);
++ 
++ 	switch (ns->nl4_type) {
++ 	case NL4_NETADDR:
++ 		addr = &ns->u.nl4_addr;
++ 
++ 		/* netid_len, netid, uaddr_len, uaddr (port included
++ 		 * in RPCBIND_MAXUADDRLEN)
++ 		 */
++ 		p = xdr_reserve_space(xdr,
++ 			4 /* netid len */ +
++ 			(XDR_QUADLEN(addr->netid_len) * 4) +
++ 			4 /* uaddr len */ +
++ 			(XDR_QUADLEN(addr->addr_len) * 4));
++ 		if (!p)
++ 			return nfserr_resource;
++ 
++ 		*p++ = cpu_to_be32(addr->netid_len);
++ 		p = xdr_encode_opaque_fixed(p, addr->netid,
++ 					    addr->netid_len);
++ 		*p++ = cpu_to_be32(addr->addr_len);
++ 		p = xdr_encode_opaque_fixed(p, addr->addr,
++ 					addr->addr_len);
++ 		break;
++ 	default:
++ 		WARN_ON_ONCE(ns->nl4_type != NL4_NETADDR);
++ 		return nfserr_inval;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static __be32
+++>>>>>>> bddfdbcddbe2 (NFSD: Extract the svcxdr_init_encode() helper)
+  nfsd4_encode_copy(struct nfsd4_compoundres *resp, __be32 nfserr,
+  		  struct nfsd4_copy *copy)
+  {
+@@@ -4512,11 -4731,194 +4560,200 @@@ nfsd4_encode_offload_status(struct nfsd
+  		return nfserr_resource;
+  	p = xdr_encode_hyper(p, os->count);
+  	*p++ = cpu_to_be32(0);
+++<<<<<<< HEAD
+++=======
++ 	return nfserr;
++ }
++ 
++ static __be32
++ nfsd4_encode_read_plus_data(struct nfsd4_compoundres *resp,
++ 			    struct nfsd4_read *read,
++ 			    unsigned long *maxcount, u32 *eof,
++ 			    loff_t *pos)
++ {
++ 	struct xdr_stream *xdr = resp->xdr;
++ 	struct file *file = read->rd_nf->nf_file;
++ 	int starting_len = xdr->buf->len;
++ 	loff_t hole_pos;
++ 	__be32 nfserr;
++ 	__be32 *p, tmp;
++ 	__be64 tmp64;
++ 
++ 	hole_pos = pos ? *pos : vfs_llseek(file, read->rd_offset, SEEK_HOLE);
++ 	if (hole_pos > read->rd_offset)
++ 		*maxcount = min_t(unsigned long, *maxcount, hole_pos - read->rd_offset);
++ 	*maxcount = min_t(unsigned long, *maxcount, (xdr->buf->buflen - xdr->buf->len));
++ 
++ 	/* Content type, offset, byte count */
++ 	p = xdr_reserve_space(xdr, 4 + 8 + 4);
++ 	if (!p)
++ 		return nfserr_resource;
++ 
++ 	read->rd_vlen = xdr_reserve_space_vec(xdr, resp->rqstp->rq_vec, *maxcount);
++ 	if (read->rd_vlen < 0)
++ 		return nfserr_resource;
++ 
++ 	nfserr = nfsd_readv(resp->rqstp, read->rd_fhp, file, read->rd_offset,
++ 			    resp->rqstp->rq_vec, read->rd_vlen, maxcount, eof);
++ 	if (nfserr)
++ 		return nfserr;
++ 	xdr_truncate_encode(xdr, starting_len + 16 + xdr_align_size(*maxcount));
++ 
++ 	tmp = htonl(NFS4_CONTENT_DATA);
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len,      &tmp,   4);
++ 	tmp64 = cpu_to_be64(read->rd_offset);
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len + 4,  &tmp64, 8);
++ 	tmp = htonl(*maxcount);
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len + 12, &tmp,   4);
++ 
++ 	tmp = xdr_zero;
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len + 16 + *maxcount, &tmp,
++ 			       xdr_pad_size(*maxcount));
++ 	return nfs_ok;
++ }
++ 
++ static __be32
++ nfsd4_encode_read_plus_hole(struct nfsd4_compoundres *resp,
++ 			    struct nfsd4_read *read,
++ 			    unsigned long *maxcount, u32 *eof)
++ {
++ 	struct file *file = read->rd_nf->nf_file;
++ 	loff_t data_pos = vfs_llseek(file, read->rd_offset, SEEK_DATA);
++ 	loff_t f_size = i_size_read(file_inode(file));
++ 	unsigned long count;
++ 	__be32 *p;
++ 
++ 	if (data_pos == -ENXIO)
++ 		data_pos = f_size;
++ 	else if (data_pos <= read->rd_offset || (data_pos < f_size && data_pos % PAGE_SIZE))
++ 		return nfsd4_encode_read_plus_data(resp, read, maxcount, eof, &f_size);
++ 	count = data_pos - read->rd_offset;
++ 
++ 	/* Content type, offset, byte count */
++ 	p = xdr_reserve_space(resp->xdr, 4 + 8 + 8);
++ 	if (!p)
++ 		return nfserr_resource;
++ 
++ 	*p++ = htonl(NFS4_CONTENT_HOLE);
++ 	 p   = xdr_encode_hyper(p, read->rd_offset);
++ 	 p   = xdr_encode_hyper(p, count);
++ 
++ 	*eof = (read->rd_offset + count) >= f_size;
++ 	*maxcount = min_t(unsigned long, count, *maxcount);
++ 	return nfs_ok;
++ }
++ 
++ static __be32
++ nfsd4_encode_read_plus(struct nfsd4_compoundres *resp, __be32 nfserr,
++ 		       struct nfsd4_read *read)
++ {
++ 	unsigned long maxcount, count;
++ 	struct xdr_stream *xdr = resp->xdr;
++ 	struct file *file;
++ 	int starting_len = xdr->buf->len;
++ 	int last_segment = xdr->buf->len;
++ 	int segments = 0;
++ 	__be32 *p, tmp;
++ 	bool is_data;
++ 	loff_t pos;
++ 	u32 eof;
++ 
++ 	if (nfserr)
++ 		return nfserr;
++ 	file = read->rd_nf->nf_file;
++ 
++ 	/* eof flag, segment count */
++ 	p = xdr_reserve_space(xdr, 4 + 4);
++ 	if (!p)
++ 		return nfserr_resource;
++ 	xdr_commit_encode(xdr);
++ 
++ 	maxcount = svc_max_payload(resp->rqstp);
++ 	maxcount = min_t(unsigned long, maxcount,
++ 			 (xdr->buf->buflen - xdr->buf->len));
++ 	maxcount = min_t(unsigned long, maxcount, read->rd_length);
++ 	count    = maxcount;
++ 
++ 	eof = read->rd_offset >= i_size_read(file_inode(file));
++ 	if (eof)
++ 		goto out;
++ 
++ 	pos = vfs_llseek(file, read->rd_offset, SEEK_HOLE);
++ 	is_data = pos > read->rd_offset;
++ 
++ 	while (count > 0 && !eof) {
++ 		maxcount = count;
++ 		if (is_data)
++ 			nfserr = nfsd4_encode_read_plus_data(resp, read, &maxcount, &eof,
++ 						segments == 0 ? &pos : NULL);
++ 		else
++ 			nfserr = nfsd4_encode_read_plus_hole(resp, read, &maxcount, &eof);
++ 		if (nfserr)
++ 			goto out;
++ 		count -= maxcount;
++ 		read->rd_offset += maxcount;
++ 		is_data = !is_data;
++ 		last_segment = xdr->buf->len;
++ 		segments++;
++ 	}
++ 
++ out:
++ 	if (nfserr && segments == 0)
++ 		xdr_truncate_encode(xdr, starting_len);
++ 	else {
++ 		if (nfserr) {
++ 			xdr_truncate_encode(xdr, last_segment);
++ 			nfserr = nfs_ok;
++ 			eof = 0;
++ 		}
++ 		tmp = htonl(eof);
++ 		write_bytes_to_xdr_buf(xdr->buf, starting_len,     &tmp, 4);
++ 		tmp = htonl(segments);
++ 		write_bytes_to_xdr_buf(xdr->buf, starting_len + 4, &tmp, 4);
++ 	}
+++>>>>>>> bddfdbcddbe2 (NFSD: Extract the svcxdr_init_encode() helper)
+  
+  	return nfserr;
+  }
+  
+  static __be32
+++<<<<<<< HEAD
+++=======
++ nfsd4_encode_copy_notify(struct nfsd4_compoundres *resp, __be32 nfserr,
++ 			 struct nfsd4_copy_notify *cn)
++ {
++ 	struct xdr_stream *xdr = resp->xdr;
++ 	__be32 *p;
++ 
++ 	if (nfserr)
++ 		return nfserr;
++ 
++ 	/* 8 sec, 4 nsec */
++ 	p = xdr_reserve_space(xdr, 12);
++ 	if (!p)
++ 		return nfserr_resource;
++ 
++ 	/* cnr_lease_time */
++ 	p = xdr_encode_hyper(p, cn->cpn_sec);
++ 	*p++ = cpu_to_be32(cn->cpn_nsec);
++ 
++ 	/* cnr_stateid */
++ 	nfserr = nfsd4_encode_stateid(xdr, &cn->cpn_cnr_stateid);
++ 	if (nfserr)
++ 		return nfserr;
++ 
++ 	/* cnr_src.nl_nsvr */
++ 	p = xdr_reserve_space(xdr, 4);
++ 	if (!p)
++ 		return nfserr_resource;
++ 
++ 	*p++ = cpu_to_be32(1);
++ 
++ 	return nfsd42_encode_nl4_server(resp, &cn->cpn_src);
++ }
++ 
++ static __be32
+++>>>>>>> bddfdbcddbe2 (NFSD: Extract the svcxdr_init_encode() helper)
+  nfsd4_encode_seek(struct nfsd4_compoundres *resp, __be32 nfserr,
+  		  struct nfsd4_seek *seek)
+  {
+* Unmerged path fs/nfsd/nfs4proc.c
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 6f6bdee77e66..c38fcfab4f81 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -2883,7 +2883,7 @@ gen_callback(struct nfs4_client *clp, struct nfsd4_setclientid *se, struct svc_r
+ static void
+ nfsd4_store_cache_entry(struct nfsd4_compoundres *resp)
+ {
+-	struct xdr_buf *buf = resp->xdr.buf;
++	struct xdr_buf *buf = resp->xdr->buf;
+ 	struct nfsd4_slot *slot = resp->cstate.slot;
+ 	unsigned int base;
+ 
+@@ -2953,7 +2953,7 @@ nfsd4_replay_cache_entry(struct nfsd4_compoundres *resp,
+ 			 struct nfsd4_sequence *seq)
+ {
+ 	struct nfsd4_slot *slot = resp->cstate.slot;
+-	struct xdr_stream *xdr = &resp->xdr;
++	struct xdr_stream *xdr = resp->xdr;
+ 	__be32 *p;
+ 	__be32 status;
+ 
+@@ -3691,7 +3691,7 @@ nfsd4_sequence(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ {
+ 	struct nfsd4_sequence *seq = &u->sequence;
+ 	struct nfsd4_compoundres *resp = rqstp->rq_resp;
+-	struct xdr_stream *xdr = &resp->xdr;
++	struct xdr_stream *xdr = resp->xdr;
+ 	struct nfsd4_session *session;
+ 	struct nfs4_client *clp;
+ 	struct nfsd4_slot *slot;
+* Unmerged path fs/nfsd/nfs4xdr.c
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index 5e028e1a2313..98da0ddf33d6 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -1027,7 +1027,7 @@ int nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
+ 	 * NFSv4 does some encoding while processing
+ 	 */
+ 	p = resv->iov_base + resv->iov_len;
+-	resv->iov_len += sizeof(__be32);
++	svcxdr_init_encode(rqstp);
+ 
+ 	*statp = proc->pc_func(rqstp);
+ 	if (*statp == rpc_drop_reply || test_bit(RQ_DROPME, &rqstp->rq_flags))
+@@ -1082,7 +1082,7 @@ int nfssvc_decode_voidarg(struct svc_rqst *rqstp, __be32 *p)
+  */
+ int nfssvc_encode_voidres(struct svc_rqst *rqstp, __be32 *p)
+ {
+-        return xdr_ressize_check(rqstp, p);
++	return 1;
+ }
+ 
+ int nfsd_pool_stats_open(struct inode *inode, struct file *file)
+diff --git a/fs/nfsd/xdr4.h b/fs/nfsd/xdr4.h
+index 4ef0f6d3f1d7..74e00aebc61e 100644
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -693,7 +693,7 @@ struct nfsd4_compoundargs {
+ 
+ struct nfsd4_compoundres {
+ 	/* scratch variables for XDR encode */
+-	struct xdr_stream		xdr;
++	struct xdr_stream		*xdr;
+ 	struct svc_rqst *		rqstp;
+ 
+ 	u32				taglen;
+diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
+index 550c5d680d0b..e5f29d3da929 100644
+--- a/include/linux/sunrpc/svc.h
++++ b/include/linux/sunrpc/svc.h
+@@ -249,6 +249,7 @@ struct svc_rqst {
+ 	size_t			rq_xprt_hlen;	/* xprt header len */
+ 	struct xdr_buf		rq_arg;
+ 	struct xdr_stream	rq_arg_stream;
++	struct xdr_stream	rq_res_stream;
+ 	struct page		*rq_scratch_page;
+ 	struct xdr_buf		rq_res;
+ 	struct page		*rq_pages[RPCSVC_MAXPAGES + 1];
+@@ -576,4 +577,28 @@ static inline void svcxdr_init_decode(struct svc_rqst *rqstp)
+ 	xdr_set_scratch_page(xdr, rqstp->rq_scratch_page);
+ }
+ 
++/**
++ * svcxdr_init_encode - Prepare an xdr_stream for svc Reply encoding
++ * @rqstp: controlling server RPC transaction context
++ *
++ */
++static inline void svcxdr_init_encode(struct svc_rqst *rqstp)
++{
++	struct xdr_stream *xdr = &rqstp->rq_res_stream;
++	struct xdr_buf *buf = &rqstp->rq_res;
++	struct kvec *resv = buf->head;
++
++	xdr_reset_scratch_buffer(xdr);
++
++	xdr->buf = buf;
++	xdr->iov = resv;
++	xdr->p   = resv->iov_base + resv->iov_len;
++	xdr->end = resv->iov_base + PAGE_SIZE - rqstp->rq_auth_slack;
++	buf->len = resv->iov_len;
++	xdr->page_ptr = buf->pages - 1;
++	buf->buflen = PAGE_SIZE * (1 + rqstp->rq_page_end - buf->pages);
++	buf->buflen -= rqstp->rq_auth_slack;
++	xdr->rqst = NULL;
++}
++
+ #endif /* SUNRPC_SVC_H */
