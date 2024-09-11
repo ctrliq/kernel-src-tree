@@ -30,8 +30,6 @@ struct nft_xt_match_priv {
 	void *info;
 };
 
-static refcount_t nft_compat_pending_destroy = REFCOUNT_INIT(1);
-
 static int nft_compat_chain_validate_dependency(const struct nft_ctx *ctx,
 						const char *tablename)
 {
@@ -218,6 +216,17 @@ static int nft_parse_compat(const struct nlattr *attr, u16 *proto, bool *inv)
 	return 0;
 }
 
+static void nft_compat_wait_for_destructors(void)
+{
+	/* xtables matches or targets can have side effects, e.g.
+	 * creation/destruction of /proc files.
+	 * The xt ->destroy functions are run asynchronously from
+	 * work queue.  If we have pending invocations we thus
+	 * need to wait for those to finish.
+	 */
+	nf_tables_trans_destroy_flush_work();
+}
+
 static int
 nft_target_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
 		const struct nlattr * const tb[])
@@ -241,14 +250,7 @@ nft_target_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
 
 	nft_target_set_tgchk_param(&par, ctx, target, info, &e, proto, inv);
 
-	/* xtables matches or targets can have side effects, e.g.
-	 * creation/destruction of /proc files.
-	 * The xt ->destroy functions are run asynchronously from
-	 * work queue.  If we have pending invocations we thus
-	 * need to wait for those to finish.
-	 */
-	if (refcount_read(&nft_compat_pending_destroy) > 1)
-		nf_tables_trans_destroy_flush_work();
+	nft_compat_wait_for_destructors();
 
 	ret = xt_check_target(&par, size, proto, inv);
 	if (ret < 0)
@@ -263,7 +265,6 @@ nft_target_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
 
 static void __nft_mt_tg_destroy(struct module *me, const struct nft_expr *expr)
 {
-	refcount_dec(&nft_compat_pending_destroy);
 	module_put(me);
 	kfree(expr->ops);
 }
@@ -470,6 +471,8 @@ __nft_match_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
 	}
 
 	nft_match_set_mtchk_param(&par, ctx, match, info, &e, proto, inv);
+
+	nft_compat_wait_for_destructors();
 
 	return xt_check_match(&par, size, proto, inv);
 }
@@ -719,14 +722,6 @@ static const struct nfnetlink_subsystem nfnl_compat_subsys = {
 
 static struct nft_expr_type nft_match_type;
 
-static void nft_mt_tg_deactivate(const struct nft_ctx *ctx,
-				 const struct nft_expr *expr,
-				 enum nft_trans_phase phase)
-{
-	if (phase == NFT_TRANS_COMMIT)
-		refcount_inc(&nft_compat_pending_destroy);
-}
-
 static const struct nft_expr_ops *
 nft_match_select_ops(const struct nft_ctx *ctx,
 		     const struct nlattr * const tb[])
@@ -765,7 +760,6 @@ nft_match_select_ops(const struct nft_ctx *ctx,
 	ops->type = &nft_match_type;
 	ops->eval = nft_match_eval;
 	ops->init = nft_match_init;
-	ops->deactivate = nft_mt_tg_deactivate,
 	ops->destroy = nft_match_destroy;
 	ops->dump = nft_match_dump;
 	ops->validate = nft_match_validate;
@@ -856,7 +850,6 @@ nft_target_select_ops(const struct nft_ctx *ctx,
 	ops->size = NFT_EXPR_SIZE(XT_ALIGN(target->targetsize));
 	ops->init = nft_target_init;
 	ops->destroy = nft_target_destroy;
-	ops->deactivate = nft_mt_tg_deactivate,
 	ops->dump = nft_target_dump;
 	ops->validate = nft_target_validate;
 	ops->data = target;
@@ -920,8 +913,6 @@ static void __exit nft_compat_module_exit(void)
 	nfnetlink_subsys_unregister(&nfnl_compat_subsys);
 	nft_unregister_expr(&nft_target_type);
 	nft_unregister_expr(&nft_match_type);
-
-	WARN_ON_ONCE(refcount_read(&nft_compat_pending_destroy) != 1);
 }
 
 MODULE_ALIAS_NFNL_SUBSYS(NFNL_SUBSYS_NFT_COMPAT);
