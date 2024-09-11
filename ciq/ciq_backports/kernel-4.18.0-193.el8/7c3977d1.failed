@@ -1,0 +1,150 @@
+libbpf: Fix sym->st_value print on 32-bit arches
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 7c3977d1e80401b1a25efded698b05d60ee26e31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7c3977d1.failed
+
+The st_value field is a 64-bit value and causing this error on 32-bit arches:
+
+In file included from libbpf.c:52:
+libbpf.c: In function 'bpf_program__record_reloc':
+libbpf_internal.h:59:22: error: format '%lu' expects argument of type 'long unsigned int', but argument 3 has type 'Elf64_Addr' {aka 'const long long unsigned int'} [-Werror=format=]
+
+Fix it with (__u64) cast.
+
+Fixes: 1f8e2bcb2cd5 ("libbpf: Refactor relocation handling")
+	Reported-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 7c3977d1e80401b1a25efded698b05d60ee26e31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index c4973b88b834,3f09772192f1..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -1724,6 -1793,115 +1724,118 @@@ bpf_object__section_to_libbpf_map_type(
+  		return LIBBPF_MAP_UNSPEC;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bpf_program__record_reloc(struct bpf_program *prog,
++ 				     struct reloc_desc *reloc_desc,
++ 				     __u32 insn_idx, const char *name,
++ 				     const GElf_Sym *sym, const GElf_Rel *rel)
++ {
++ 	struct bpf_insn *insn = &prog->insns[insn_idx];
++ 	size_t map_idx, nr_maps = prog->obj->nr_maps;
++ 	struct bpf_object *obj = prog->obj;
++ 	__u32 shdr_idx = sym->st_shndx;
++ 	enum libbpf_map_type type;
++ 	struct bpf_map *map;
++ 
++ 	/* sub-program call relocation */
++ 	if (insn->code == (BPF_JMP | BPF_CALL)) {
++ 		if (insn->src_reg != BPF_PSEUDO_CALL) {
++ 			pr_warn("incorrect bpf_call opcode\n");
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 		/* text_shndx can be 0, if no default "main" program exists */
++ 		if (!shdr_idx || shdr_idx != obj->efile.text_shndx) {
++ 			pr_warn("bad call relo against section %u\n", shdr_idx);
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 		if (sym->st_value % 8) {
++ 			pr_warn("bad call relo offset: %llu\n", (__u64)sym->st_value);
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 		reloc_desc->type = RELO_CALL;
++ 		reloc_desc->insn_idx = insn_idx;
++ 		reloc_desc->sym_off = sym->st_value;
++ 		obj->has_pseudo_calls = true;
++ 		return 0;
++ 	}
++ 
++ 	if (insn->code != (BPF_LD | BPF_IMM | BPF_DW)) {
++ 		pr_warn("invalid relo for insns[%d].code 0x%x\n",
++ 			insn_idx, insn->code);
++ 		return -LIBBPF_ERRNO__RELOC;
++ 	}
++ 	if (!shdr_idx || shdr_idx >= SHN_LORESERVE) {
++ 		pr_warn("invalid relo for \'%s\' in special section 0x%x; forgot to initialize global var?..\n",
++ 			name, shdr_idx);
++ 		return -LIBBPF_ERRNO__RELOC;
++ 	}
++ 
++ 	type = bpf_object__section_to_libbpf_map_type(obj, shdr_idx);
++ 
++ 	/* generic map reference relocation */
++ 	if (type == LIBBPF_MAP_UNSPEC) {
++ 		if (!bpf_object__shndx_is_maps(obj, shdr_idx)) {
++ 			pr_warn("bad map relo against section %u\n",
++ 				shdr_idx);
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 		for (map_idx = 0; map_idx < nr_maps; map_idx++) {
++ 			map = &obj->maps[map_idx];
++ 			if (map->libbpf_type != type ||
++ 			    map->sec_idx != sym->st_shndx ||
++ 			    map->sec_offset != sym->st_value)
++ 				continue;
++ 			pr_debug("found map %zd (%s, sec %d, off %zu) for insn %u\n",
++ 				 map_idx, map->name, map->sec_idx,
++ 				 map->sec_offset, insn_idx);
++ 			break;
++ 		}
++ 		if (map_idx >= nr_maps) {
++ 			pr_warn("map relo failed to find map for sec %u, off %llu\n",
++ 				shdr_idx, (__u64)sym->st_value);
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 		reloc_desc->type = RELO_LD64;
++ 		reloc_desc->insn_idx = insn_idx;
++ 		reloc_desc->map_idx = map_idx;
++ 		reloc_desc->sym_off = 0; /* sym->st_value determines map_idx */
++ 		return 0;
++ 	}
++ 
++ 	/* global data map relocation */
++ 	if (!bpf_object__shndx_is_data(obj, shdr_idx)) {
++ 		pr_warn("bad data relo against section %u\n", shdr_idx);
++ 		return -LIBBPF_ERRNO__RELOC;
++ 	}
++ 	if (!obj->caps.global_data) {
++ 		pr_warn("relocation: kernel does not support global \'%s\' variable access in insns[%d]\n",
++ 			name, insn_idx);
++ 		return -LIBBPF_ERRNO__RELOC;
++ 	}
++ 	for (map_idx = 0; map_idx < nr_maps; map_idx++) {
++ 		map = &obj->maps[map_idx];
++ 		if (map->libbpf_type != type)
++ 			continue;
++ 		pr_debug("found data map %zd (%s, sec %d, off %zu) for insn %u\n",
++ 			 map_idx, map->name, map->sec_idx, map->sec_offset,
++ 			 insn_idx);
++ 		break;
++ 	}
++ 	if (map_idx >= nr_maps) {
++ 		pr_warn("data relo failed to find map for sec %u\n",
++ 			shdr_idx);
++ 		return -LIBBPF_ERRNO__RELOC;
++ 	}
++ 
++ 	reloc_desc->type = RELO_DATA;
++ 	reloc_desc->insn_idx = insn_idx;
++ 	reloc_desc->map_idx = map_idx;
++ 	reloc_desc->sym_off = sym->st_value;
++ 	return 0;
++ }
++ 
+++>>>>>>> 7c3977d1e804 (libbpf: Fix sym->st_value print on 32-bit arches)
+  static int
+  bpf_program__collect_reloc(struct bpf_program *prog, GElf_Shdr *shdr,
+  			   Elf_Data *data, struct bpf_object *obj)
+* Unmerged path tools/lib/bpf/libbpf.c
