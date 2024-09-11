@@ -1,0 +1,167 @@
+x86/fpu: Make the EFI FPU calling convention explicit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andy Lutomirski <luto@kernel.org>
+commit b0dc553cfc9d3bc2c7b8672b0b2fcf0edf0c3b6e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/b0dc553c.failed
+
+EFI uses kernel_fpu_begin() to conform to the UEFI calling convention.
+This specifically requires initializing FCW (FPU Control Word), whereas
+no sane 64-bit kernel code should use legacy 387 operations that
+reference FCW.
+
+This should allow to safely change the default semantics of
+kernel_fpu_begin() to stop initializing FCW on 64-bit kernels.
+
+ [ bp: Massage commit message a little. ]
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/25d392fff64680e0f4bb8cf0b1003314dc29eafe.1611205691.git.luto@kernel.org
+(cherry picked from commit b0dc553cfc9d3bc2c7b8672b0b2fcf0edf0c3b6e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+diff --cc arch/x86/include/asm/efi.h
+index 070ac136a3a9,c81e68f00071..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -23,36 -27,77 +23,94 @@@
+  #define EFI32_LOADER_SIGNATURE	"EL32"
+  #define EFI64_LOADER_SIGNATURE	"EL64"
+  
+ +#define MAX_CMDLINE_ADDRESS	UINT_MAX
+ +
+  #define ARCH_EFI_IRQ_FLAGS_MASK	X86_EFLAGS_IF
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The EFI services are called through variadic functions in many cases. These
++  * functions are implemented in assembler and support only a fixed number of
++  * arguments. The macros below allows us to check at build time that we don't
++  * try to call them with too many arguments.
++  *
++  * __efi_nargs() will return the number of arguments if it is 7 or less, and
++  * cause a BUILD_BUG otherwise. The limitations of the C preprocessor make it
++  * impossible to calculate the exact number of arguments beyond some
++  * pre-defined limit. The maximum number of arguments currently supported by
++  * any of the thunks is 7, so this is good enough for now and can be extended
++  * in the obvious way if we ever need more.
++  */
++ 
++ #define __efi_nargs(...) __efi_nargs_(__VA_ARGS__)
++ #define __efi_nargs_(...) __efi_nargs__(0, ##__VA_ARGS__,	\
++ 	__efi_arg_sentinel(7), __efi_arg_sentinel(6),		\
++ 	__efi_arg_sentinel(5), __efi_arg_sentinel(4),		\
++ 	__efi_arg_sentinel(3), __efi_arg_sentinel(2),		\
++ 	__efi_arg_sentinel(1), __efi_arg_sentinel(0))
++ #define __efi_nargs__(_0, _1, _2, _3, _4, _5, _6, _7, n, ...)	\
++ 	__take_second_arg(n,					\
++ 		({ BUILD_BUG_ON_MSG(1, "__efi_nargs limit exceeded"); 8; }))
++ #define __efi_arg_sentinel(n) , n
++ 
++ /*
++  * __efi_nargs_check(f, n, ...) will cause a BUILD_BUG if the ellipsis
++  * represents more than n arguments.
++  */
++ 
++ #define __efi_nargs_check(f, n, ...)					\
++ 	__efi_nargs_check_(f, __efi_nargs(__VA_ARGS__), n)
++ #define __efi_nargs_check_(f, p, n) __efi_nargs_check__(f, p, n)
++ #define __efi_nargs_check__(f, p, n) ({					\
++ 	BUILD_BUG_ON_MSG(						\
++ 		(p) > (n),						\
++ 		#f " called with too many arguments (" #p ">" #n ")");	\
++ })
++ 
++ static inline void efi_fpu_begin(void)
++ {
++ 	/*
++ 	 * The UEFI calling convention (UEFI spec 2.3.2 and 2.3.4) requires
++ 	 * that FCW and MXCSR (64-bit) must be initialized prior to calling
++ 	 * UEFI code.  (Oddly the spec does not require that the FPU stack
++ 	 * be empty.)
++ 	 */
++ 	kernel_fpu_begin_mask(KFPU_387 | KFPU_MXCSR);
++ }
++ 
++ static inline void efi_fpu_end(void)
++ {
++ 	kernel_fpu_end();
++ }
++ 
+++>>>>>>> b0dc553cfc9d (x86/fpu: Make the EFI FPU calling convention explicit)
+  #ifdef CONFIG_X86_32
+ +
+ +extern asmlinkage unsigned long efi_call_phys(void *, ...);
+ +
+  #define arch_efi_call_virt_setup()					\
+  ({									\
+- 	kernel_fpu_begin();						\
++ 	efi_fpu_begin();						\
+  	firmware_restrict_branch_speculation_start();			\
+  })
+  
+  #define arch_efi_call_virt_teardown()					\
+  ({									\
+  	firmware_restrict_branch_speculation_end();			\
+- 	kernel_fpu_end();						\
++ 	efi_fpu_end();							\
+  })
+  
+ -#define arch_efi_call_virt(p, f, args...)	p->f(args)
+ +
+ +/*
+ + * Wrap all the virtual calls in a way that forces the parameters on the stack.
+ + */
+ +#define arch_efi_call_virt(p, f, args...)				\
+ +({									\
+ +	((efi_##f##_t __attribute__((regparm(0)))*) p->f)(args);	\
+ +})
+ +
+ +#define efi_ioremap(addr, size, type, attr)	ioremap_cache(addr, size)
+  
+  #else /* !CONFIG_X86_32 */
+  
+@@@ -85,12 -135,9 +143,12 @@@ struct efi_scratch 
+  ({									\
+  	efi_switch_mm(efi_scratch.prev_mm);				\
+  	firmware_restrict_branch_speculation_end();			\
+- 	kernel_fpu_end();						\
++ 	efi_fpu_end();							\
+  })
+  
+ +extern void __iomem *__init efi_ioremap(unsigned long addr, unsigned long size,
+ +					u32 type, u64 attribute);
+ +
+  #ifdef CONFIG_KASAN
+  /*
+   * CONFIG_KASAN may redefine memset to __memset.  __memset function is present
+* Unmerged path arch/x86/include/asm/efi.h
+diff --git a/arch/x86/platform/efi/efi_64.c b/arch/x86/platform/efi/efi_64.c
+index a2e265e68a9e..43c70df31add 100644
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@ -859,7 +859,7 @@ efi_set_virtual_address_map(unsigned long memory_map_size,
+ 							 virtual_map);
+ 	efi_switch_mm(&efi_mm);
+ 
+-	kernel_fpu_begin();
++	efi_fpu_begin();
+ 
+ 	/* Disable interrupts around EFI calls: */
+ 	local_irq_save(flags);
+@@ -868,7 +868,7 @@ efi_set_virtual_address_map(unsigned long memory_map_size,
+ 			  descriptor_version, virtual_map);
+ 	local_irq_restore(flags);
+ 
+-	kernel_fpu_end();
++	efi_fpu_end();
+ 
+ 	efi_switch_mm(efi_scratch.prev_mm);
+ 
