@@ -1,0 +1,285 @@
+tipc: add trace_events for tipc link
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Tuong Lien <tuong.t.lien@dektech.com.au>
+commit 26574db0c17fb29fac8b57f94ed1dfd46cc89887
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/26574db0.failed
+
+The commit adds the new trace_events for TIPC link object:
+
+trace_tipc_link_timeout()
+trace_tipc_link_fsm()
+trace_tipc_link_reset()
+trace_tipc_link_too_silent()
+trace_tipc_link_retrans()
+trace_tipc_link_bc_ack()
+trace_tipc_link_conges()
+
+And the traces for PROTOCOL messages at building and receiving:
+
+trace_tipc_proto_build()
+trace_tipc_proto_rcv()
+
+Note:
+a) The 'tipc_link_too_silent' event will only happen when the
+'silent_intv_cnt' is about to reach the 'abort_limit' value (and the
+event is enabled). The benefit for this kind of event is that we can
+get an early indication about TIPC link loss issue due to timeout, then
+can do some necessary actions for troubleshooting.
+
+For example: To trigger the 'tipc_proto_rcv' when the 'too_silent'
+event occurs:
+
+echo 'enable_event:tipc:tipc_proto_rcv' > \
+      events/tipc/tipc_link_too_silent/trigger
+
+And disable it when TIPC link is reset:
+
+echo 'disable_event:tipc:tipc_proto_rcv' > \
+      events/tipc/tipc_link_reset/trigger
+
+b) The 'tipc_link_retrans' or 'tipc_link_bc_ack' event is useful to
+trace TIPC retransmission issues.
+
+In addition, the commit adds the 'trace_tipc_list/link_dump()' at the
+'retransmission failure' case. Then, if the issue occurs, the link
+'transmq' along with the link data can be dumped for post-analysis.
+These dump events should be enabled by default since it will only take
+effect when the failure happens.
+
+The same approach is also applied for the faulty case that the
+validation of protocol message is failed.
+
+	Acked-by: Ying Xue <ying.xue@windriver.com>
+	Tested-by: Ying Xue <ying.xue@windriver.com>
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 26574db0c17fb29fac8b57f94ed1dfd46cc89887)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+#	net/tipc/node.c
+diff --cc net/tipc/link.c
+index edd19416f07a,55c44d867d4b..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -1538,17 -1603,15 +1565,26 @@@ static int tipc_link_proto_rcv(struct t
+  	hdr = buf_msg(skb);
+  	data = msg_data(hdr);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!tipc_link_validate_msg(l, hdr)) {
++ 		trace_tipc_skb_dump(skb, false, "PROTO invalid (1)!");
++ 		trace_tipc_link_dump(l, TIPC_DUMP_NONE, "PROTO invalid (1)!");
++ 		goto exit;
++ 	}
++ 
+++>>>>>>> 26574db0c17f (tipc: add trace_events for tipc link)
+  	switch (mtyp) {
+  	case RESET_MSG:
+ +
+ +		/* Ignore duplicate RESET with old session number */
+ +		if ((less_eq(msg_session(hdr), l->peer_session)) &&
+ +		    (l->peer_session != ANY_SESSION))
+ +			break;
+ +		/* fall thru' */
+ +
+  	case ACTIVATE_MSG:
+ +
+  		/* Complete own link name with peer's interface name */
+  		if_name =  strrchr(l->name, ':') + 1;
+  		if (sizeof(l->name) - (if_name - l->name) <= TIPC_MAX_IF_NAME)
+diff --cc net/tipc/node.c
+index ecb40d1c5036,1e13ea98b96c..000000000000
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@@ -1599,6 -1602,12 +1602,15 @@@ static bool tipc_node_check_state(struc
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!tipc_link_validate_msg(l, hdr)) {
++ 		trace_tipc_skb_dump(skb, false, "PROTO invalid (2)!");
++ 		trace_tipc_link_dump(l, TIPC_DUMP_NONE, "PROTO invalid (2)!");
++ 		return false;
++ 	}
++ 
+++>>>>>>> 26574db0c17f (tipc: add trace_events for tipc link)
+  	/* Check and update node accesibility if applicable */
+  	if (state == SELF_UP_PEER_COMING) {
+  		if (!tipc_link_is_up(l))
+* Unmerged path net/tipc/link.c
+diff --git a/net/tipc/link.h b/net/tipc/link.h
+index 8477d66526e6..405befd08fd2 100644
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@ -147,4 +147,5 @@ int tipc_link_bc_sync_rcv(struct tipc_link *l,   struct tipc_msg *hdr,
+ 			  struct sk_buff_head *xmitq);
+ int tipc_link_bc_nack_rcv(struct tipc_link *l, struct sk_buff *skb,
+ 			  struct sk_buff_head *xmitq);
++bool tipc_link_too_silent(struct tipc_link *l);
+ #endif
+* Unmerged path net/tipc/node.c
+diff --git a/net/tipc/trace.h b/net/tipc/trace.h
+index 4c74927df685..535c8958651f 100644
+--- a/net/tipc/trace.h
++++ b/net/tipc/trace.h
+@@ -74,6 +74,45 @@ enum {
+ };
+ #endif
+ 
++/* Link & Node FSM states: */
++#define state_sym(val)							  \
++	__print_symbolic(val,						  \
++			{(0xe),		"ESTABLISHED"			},\
++			{(0xe << 4),	"ESTABLISHING"			},\
++			{(0x1 << 8),	"RESET"				},\
++			{(0x2 << 12),	"RESETTING"			},\
++			{(0xd << 16),	"PEER_RESET"			},\
++			{(0xf << 20),	"FAILINGOVER"			},\
++			{(0xc << 24),	"SYNCHING"			},\
++			{(0xdd),	"SELF_DOWN_PEER_DOWN"		},\
++			{(0xaa),	"SELF_UP_PEER_UP"		},\
++			{(0xd1),	"SELF_DOWN_PEER_LEAVING"	},\
++			{(0xac),	"SELF_UP_PEER_COMING"		},\
++			{(0xca),	"SELF_COMING_PEER_UP"		},\
++			{(0x1d),	"SELF_LEAVING_PEER_DOWN"	},\
++			{(0xf0),	"FAILINGOVER"			},\
++			{(0xcc),	"SYNCHING"			})
++
++/* Link & Node FSM events: */
++#define evt_sym(val)							  \
++	__print_symbolic(val,						  \
++			{(0xec1ab1e),	"ESTABLISH_EVT"			},\
++			{(0x9eed0e),	"PEER_RESET_EVT"		},\
++			{(0xfa110e),	"FAILURE_EVT"			},\
++			{(0x10ca1d0e),	"RESET_EVT"			},\
++			{(0xfa110bee),	"FAILOVER_BEGIN_EVT"		},\
++			{(0xfa110ede),	"FAILOVER_END_EVT"		},\
++			{(0xc1ccbee),	"SYNCH_BEGIN_EVT"		},\
++			{(0xc1ccede),	"SYNCH_END_EVT"			},\
++			{(0xece),	"SELF_ESTABL_CONTACT_EVT"	},\
++			{(0x1ce),	"SELF_LOST_CONTACT_EVT"		},\
++			{(0x9ece),	"PEER_ESTABL_CONTACT_EVT"	},\
++			{(0x91ce),	"PEER_LOST_CONTACT_EVT"		},\
++			{(0xfbe),	"FAILOVER_BEGIN_EVT"		},\
++			{(0xfee),	"FAILOVER_END_EVT"		},\
++			{(0xcbe),	"SYNCH_BEGIN_EVT"		},\
++			{(0xcee),	"SYNCH_END_EVT"			})
++
+ int tipc_skb_dump(struct sk_buff *skb, bool more, char *buf);
+ int tipc_list_dump(struct sk_buff_head *list, bool more, char *buf);
+ int tipc_sk_dump(struct sock *sk, u16 dqueues, char *buf);
+@@ -104,6 +143,8 @@ DEFINE_EVENT(tipc_skb_class, name, \
+ 	TP_PROTO(struct sk_buff *skb, bool more, const char *header), \
+ 	TP_ARGS(skb, more, header))
+ DEFINE_SKB_EVENT(tipc_skb_dump);
++DEFINE_SKB_EVENT(tipc_proto_build);
++DEFINE_SKB_EVENT(tipc_proto_rcv);
+ 
+ DECLARE_EVENT_CLASS(tipc_list_class,
+ 
+@@ -192,6 +233,58 @@ DEFINE_EVENT(tipc_link_class, name, \
+ 	TP_PROTO(struct tipc_link *l, u16 dqueues, const char *header), \
+ 	TP_ARGS(l, dqueues, header))
+ DEFINE_LINK_EVENT(tipc_link_dump);
++DEFINE_LINK_EVENT(tipc_link_conges);
++DEFINE_LINK_EVENT(tipc_link_timeout);
++DEFINE_LINK_EVENT(tipc_link_reset);
++
++#define DEFINE_LINK_EVENT_COND(name, cond) \
++DEFINE_EVENT_CONDITION(tipc_link_class, name, \
++	TP_PROTO(struct tipc_link *l, u16 dqueues, const char *header), \
++	TP_ARGS(l, dqueues, header), \
++	TP_CONDITION(cond))
++DEFINE_LINK_EVENT_COND(tipc_link_too_silent, tipc_link_too_silent(l));
++
++DECLARE_EVENT_CLASS(tipc_link_transmq_class,
++
++	TP_PROTO(struct tipc_link *r, u16 f, u16 t, struct sk_buff_head *tq),
++
++	TP_ARGS(r, f, t, tq),
++
++	TP_STRUCT__entry(
++		__array(char, name, TIPC_MAX_LINK_NAME)
++		__field(u16, from)
++		__field(u16, to)
++		__field(u32, len)
++		__field(u16, fseqno)
++		__field(u16, lseqno)
++	),
++
++	TP_fast_assign(
++		tipc_link_name_ext(r, __entry->name);
++		__entry->from = f;
++		__entry->to = t;
++		__entry->len = skb_queue_len(tq);
++		__entry->fseqno = msg_seqno(buf_msg(skb_peek(tq)));
++		__entry->lseqno = msg_seqno(buf_msg(skb_peek_tail(tq)));
++	),
++
++	TP_printk("<%s> retrans req: [%u-%u] transmq: %u [%u-%u]\n",
++		  __entry->name, __entry->from, __entry->to,
++		  __entry->len, __entry->fseqno, __entry->lseqno)
++);
++
++DEFINE_EVENT(tipc_link_transmq_class, tipc_link_retrans,
++	TP_PROTO(struct tipc_link *r, u16 f, u16 t, struct sk_buff_head *tq),
++	TP_ARGS(r, f, t, tq)
++);
++
++DEFINE_EVENT_PRINT(tipc_link_transmq_class, tipc_link_bc_ack,
++	TP_PROTO(struct tipc_link *r, u16 f, u16 t, struct sk_buff_head *tq),
++	TP_ARGS(r, f, t, tq),
++	TP_printk("<%s> acked: [%u-%u] transmq: %u [%u-%u]\n",
++		  __entry->name, __entry->from, __entry->to,
++		  __entry->len, __entry->fseqno, __entry->lseqno)
++);
+ 
+ DECLARE_EVENT_CLASS(tipc_node_class,
+ 
+@@ -221,6 +314,37 @@ DEFINE_EVENT(tipc_node_class, name, \
+ 	TP_ARGS(n, more, header))
+ DEFINE_NODE_EVENT(tipc_node_dump);
+ 
++DECLARE_EVENT_CLASS(tipc_fsm_class,
++
++	TP_PROTO(const char *name, u32 os, u32 ns, int evt),
++
++	TP_ARGS(name, os, ns, evt),
++
++	TP_STRUCT__entry(
++		__string(name, name)
++		__field(u32, os)
++		__field(u32, ns)
++		__field(u32, evt)
++	),
++
++	TP_fast_assign(
++		__assign_str(name, name);
++		__entry->os = os;
++		__entry->ns = ns;
++		__entry->evt = evt;
++	),
++
++	TP_printk("<%s> %s--(%s)->%s\n", __get_str(name),
++		  state_sym(__entry->os), evt_sym(__entry->evt),
++		  state_sym(__entry->ns))
++);
++
++#define DEFINE_FSM_EVENT(fsm_name) \
++DEFINE_EVENT(tipc_fsm_class, fsm_name, \
++	TP_PROTO(const char *name, u32 os, u32 ns, int evt), \
++	TP_ARGS(name, os, ns, evt))
++DEFINE_FSM_EVENT(tipc_link_fsm);
++
+ #endif /* _TIPC_TRACE_H */
+ 
+ /* This part must be outside protection */
