@@ -1,0 +1,144 @@
+gfs2: Get rid of current_tail()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 5cb738b5fbd2f3ebe9dec0e428577a4f2128adbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/5cb738b5.failed
+
+Keep the current value of the updated log tail in the super block as
+sb_log_flush_tail instead of computing it on the fly.  This avoids
+unnecessary sd_ail_lock taking and cleans up the code.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 5cb738b5fbd2f3ebe9dec0e428577a4f2128adbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/incore.h
+index f42b0ae25288,51656b053170..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -855,9 -847,9 +853,15 @@@ struct gfs2_sbd 
+  	int sd_log_error; /* First log error */
+  	wait_queue_head_t sd_withdraw_wait;
+  
+++<<<<<<< HEAD
+ +	atomic_t sd_reserving_log;
+ +	wait_queue_head_t sd_reserving_log_wait;
+ +
+++=======
++ 	unsigned int sd_log_tail;
++ 	unsigned int sd_log_flush_tail;
++ 	unsigned int sd_log_head;
+++>>>>>>> 5cb738b5fbd2 (gfs2: Get rid of current_tail())
+  	unsigned int sd_log_flush_head;
+  
+  	spinlock_t sd_ail_lock;
+diff --cc fs/gfs2/log.c
+index 1a5aad0b1fab,6b5584fd8ff7..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -527,37 -567,16 +550,21 @@@ static unsigned int calc_reserved(struc
+  	return reserved;
+  }
+  
+- static unsigned int current_tail(struct gfs2_sbd *sdp)
++ static void log_pull_tail(struct gfs2_sbd *sdp)
+  {
+- 	struct gfs2_trans *tr;
+- 	unsigned int tail;
+- 
+- 	spin_lock(&sdp->sd_ail_lock);
+- 
+- 	if (list_empty(&sdp->sd_ail1_list)) {
+- 		tail = sdp->sd_log_head;
+- 	} else {
+- 		tr = list_last_entry(&sdp->sd_ail1_list, struct gfs2_trans,
+- 				tr_list);
+- 		tail = tr->tr_first;
+- 	}
+- 
+- 	spin_unlock(&sdp->sd_ail_lock);
+- 
+- 	return tail;
+- }
+- 
+- static void log_pull_tail(struct gfs2_sbd *sdp, unsigned int new_tail)
+- {
+- 	unsigned int dist = log_distance(sdp, new_tail, sdp->sd_log_tail);
++ 	unsigned int new_tail = sdp->sd_log_flush_tail;
++ 	unsigned int dist;
+  
++ 	if (new_tail == sdp->sd_log_tail)
++ 		return;
++ 	dist = log_distance(sdp, new_tail, sdp->sd_log_tail);
+  	ail2_empty(sdp, new_tail);
+ -	gfs2_log_release(sdp, dist);
+ +
+ +	atomic_add(dist, &sdp->sd_log_blks_free);
+ +	trace_gfs2_log_blocks(sdp, dist);
+ +	gfs2_assert_withdraw(sdp, atomic_read(&sdp->sd_log_blks_free) <=
+ +			     sdp->sd_jdesc->jd_blocks);
+ +
+  	sdp->sd_log_tail = new_tail;
+  }
+  
+@@@ -822,13 -839,13 +827,19 @@@ static void log_write_header(struct gfs
+  		log_flush_wait(sdp);
+  		op_flags = REQ_SYNC | REQ_META | REQ_PRIO;
+  	}
+- 	sdp->sd_log_idle = (tail == sdp->sd_log_flush_head);
+- 	gfs2_write_log_header(sdp, sdp->sd_jdesc, sdp->sd_log_sequence++, tail,
+- 			      sdp->sd_log_flush_head, flags, op_flags);
++ 	sdp->sd_log_idle = (sdp->sd_log_flush_tail == sdp->sd_log_flush_head);
++ 	gfs2_write_log_header(sdp, sdp->sd_jdesc, sdp->sd_log_sequence++,
++ 			      sdp->sd_log_flush_tail, sdp->sd_log_flush_head,
++ 			      flags, op_flags);
+  	gfs2_log_incr_head(sdp);
+++<<<<<<< HEAD
+ +
+ +	if (sdp->sd_log_tail != tail)
+ +		log_pull_tail(sdp, tail);
+++=======
++ 	log_flush_wait(sdp);
++ 	log_pull_tail(sdp);
+++>>>>>>> 5cb738b5fbd2 (gfs2: Get rid of current_tail())
+  }
+  
+  /**
+@@@ -960,8 -993,9 +971,12 @@@ void gfs2_log_flush(struct gfs2_sbd *sd
+  		goto out_withdraw;
+  
+  	if (sdp->sd_log_head != sdp->sd_log_flush_head) {
+ -		log_flush_wait(sdp);
+  		log_write_header(sdp, flags);
+++<<<<<<< HEAD
+ +	} else if (sdp->sd_log_tail != current_tail(sdp) && !sdp->sd_log_idle){
+++=======
++ 	} else if (sdp->sd_log_tail != sdp->sd_log_flush_tail && !sdp->sd_log_idle) {
+++>>>>>>> 5cb738b5fbd2 (gfs2: Get rid of current_tail())
+  		atomic_dec(&sdp->sd_log_blks_free); /* Adjust for unreserved buffer */
+  		trace_gfs2_log_blocks(sdp, -1);
+  		log_write_header(sdp, flags);
+* Unmerged path fs/gfs2/incore.h
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/log.h b/fs/gfs2/log.h
+index 0fb59261f18d..1745feb71920 100644
+--- a/fs/gfs2/log.h
++++ b/fs/gfs2/log.h
+@@ -46,7 +46,9 @@ static inline void gfs2_log_pointers_init(struct gfs2_sbd *sdp,
+ 	if (++value == sdp->sd_jdesc->jd_blocks) {
+ 		value = 0;
+ 	}
+-	sdp->sd_log_head = sdp->sd_log_tail = value;
++	sdp->sd_log_tail = value;
++	sdp->sd_log_flush_tail = value;
++	sdp->sd_log_head = value;
+ }
+ 
+ static inline void gfs2_ordered_add_inode(struct gfs2_inode *ip)
