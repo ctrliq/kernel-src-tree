@@ -1,0 +1,255 @@
+KVM: x86/mmu: bump mmu notifier count in kvm_zap_gfn_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit edb298c663fccad65fe99fcec6a4f96cc344520d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/edb298c6.failed
+
+This together with previous patch, ensures that
+kvm_zap_gfn_range doesn't race with page fault
+running on another vcpu, and will make this page fault code
+retry instead.
+
+This is based on a patch suggested by Sean Christopherson:
+https://lkml.org/lkml/2021/7/22/1025
+
+	Suggested-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20210810205251.424103-5-mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit edb298c663fccad65fe99fcec6a4f96cc344520d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	virt/kvm/kvm_main.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 4c612c0dc324,916083eb4036..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -5694,21 -5687,30 +5694,31 @@@ void kvm_zap_gfn_range(struct kvm *kvm
+  	bool flush = false;
+  
+  	write_lock(&kvm->mmu_lock);
+ -
+ +	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+ +		slots = __kvm_memslots(kvm, i);
+ +		kvm_for_each_memslot(memslot, slots) {
+ +			gfn_t start, end;
+ +
+++<<<<<<< HEAD
+ +			start = max(gfn_start, memslot->base_gfn);
+ +			end = min(gfn_end, memslot->base_gfn + memslot->npages);
+ +			if (start >= end)
+ +				continue;
+++=======
++ 	kvm_inc_notifier_count(kvm, gfn_start, gfn_end);
++ 
++ 	if (kvm_memslots_have_rmaps(kvm)) {
++ 		for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 			slots = __kvm_memslots(kvm, i);
++ 			kvm_for_each_memslot(memslot, slots) {
++ 				gfn_t start, end;
+++>>>>>>> edb298c663fc (KVM: x86/mmu: bump mmu notifier count in kvm_zap_gfn_range)
+  
+ -				start = max(gfn_start, memslot->base_gfn);
+ -				end = min(gfn_end, memslot->base_gfn + memslot->npages);
+ -				if (start >= end)
+ -					continue;
+ -
+ -				flush = slot_handle_level_range(kvm,
+ -						(const struct kvm_memory_slot *) memslot,
+ -						kvm_zap_rmapp, PG_LEVEL_4K,
+ -						KVM_MAX_HUGEPAGE_LEVEL, start,
+ -						end - 1, true, flush);
+ -			}
+ +			flush = slot_handle_level_range(kvm, memslot, kvm_zap_rmapp,
+ +							PG_LEVEL_4K,
+ +							KVM_MAX_HUGEPAGE_LEVEL,
+ +							start, end - 1, true, flush);
+  		}
+ -		if (flush)
+ -			kvm_flush_remote_tlbs_with_address(kvm, gfn_start,
+ -							   gfn_end - gfn_start);
+  	}
+  
+  	if (is_tdp_mmu_enabled(kvm)) {
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,8563d9b725af..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -493,35 -597,22 +493,40 @@@ static void kvm_mmu_notifier_change_pte
+  	trace_kvm_set_spte_hva(address);
+  
+  	/*
+ -	 * .change_pte() must be surrounded by .invalidate_range_{start,end}().
+ -	 * If mmu_notifier_count is zero, then no in-progress invalidations,
+ -	 * including this one, found a relevant memslot at start(); rechecking
+ -	 * memslots here is unnecessary.  Note, a false positive (count elevated
+ -	 * by a different invalidation) is sub-optimal but functionally ok.
+ +	 * .change_pte() must be surrounded by .invalidate_range_{start,end}(),
+ +	 * and so always runs with an elevated notifier count.  This obviates
+ +	 * the need to bump the sequence count.
+  	 */
+ -	WARN_ON_ONCE(!READ_ONCE(kvm->mn_active_invalidate_count));
+ -	if (!READ_ONCE(kvm->mmu_notifier_count))
+ -		return;
+ +	WARN_ON_ONCE(!kvm->mmu_notifier_count);
+ +
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +
+ +	KVM_MMU_LOCK(kvm);
+ +
+ +	if (kvm_set_spte_hva(kvm, address, pte))
+ +		kvm_flush_remote_tlbs(kvm);
+  
+ -	kvm_handle_hva_range(mn, address, address + 1, pte, kvm_set_spte_gfn);
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+ +static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						    struct mm_struct *mm,
+ +						    unsigned long start,
+ +						    unsigned long end)
+++=======
++ void kvm_inc_notifier_count(struct kvm *kvm, unsigned long start,
++ 				   unsigned long end)
+++>>>>>>> edb298c663fc (KVM: x86/mmu: bump mmu notifier count in kvm_zap_gfn_range)
+  {
+ +	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ +	int need_tlb_flush = 0, idx;
+ +
+ +	trace_kvm_unmap_hva_range(range->start, range->end);
+ +
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +	KVM_MMU_LOCK(kvm);
+  	/*
+  	 * The count increase must become visible at unlock time as no
+  	 * spte can be established without taking the mmu_lock and
+@@@ -546,23 -637,45 +551,49 @@@
+  		kvm->mmu_notifier_range_end =
+  			max(kvm->mmu_notifier_range_end, end);
+  	}
+ +	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end, 0);
+ +	/* we've to flush the tlb before the pages can be freed */
+ +	if (need_tlb_flush || kvm->tlbs_dirty)
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+  }
++ EXPORT_SYMBOL_GPL(kvm_inc_notifier_count);
+  
+ -static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ -					const struct mmu_notifier_range *range)
+ +static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+ +						  struct mm_struct *mm,
+ +						  unsigned long start,
+ +						  unsigned long end)
+  {
+  	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ -	const struct kvm_hva_range hva_range = {
+ -		.start		= range->start,
+ -		.end		= range->end,
+ -		.pte		= __pte(0),
+ -		.handler	= kvm_unmap_gfn_range,
+ -		.on_lock	= kvm_inc_notifier_count,
+ -		.flush_on_ret	= true,
+ -		.may_block	= mmu_notifier_range_blockable(range),
+ -	};
+  
+++<<<<<<< HEAD
+ +	KVM_MMU_LOCK(kvm);
+++=======
++ 	trace_kvm_unmap_hva_range(range->start, range->end);
++ 
++ 	/*
++ 	 * Prevent memslot modification between range_start() and range_end()
++ 	 * so that conditionally locking provides the same result in both
++ 	 * functions.  Without that guarantee, the mmu_notifier_count
++ 	 * adjustments will be imbalanced.
++ 	 *
++ 	 * Pairs with the decrement in range_end().
++ 	 */
++ 	spin_lock(&kvm->mn_invalidate_lock);
++ 	kvm->mn_active_invalidate_count++;
++ 	spin_unlock(&kvm->mn_invalidate_lock);
++ 
++ 	__kvm_handle_hva_range(kvm, &hva_range);
++ 
++ 	return 0;
++ }
++ 
++ void kvm_dec_notifier_count(struct kvm *kvm, unsigned long start,
++ 				   unsigned long end)
++ {
+++>>>>>>> edb298c663fc (KVM: x86/mmu: bump mmu notifier count in kvm_zap_gfn_range)
+  	/*
+  	 * This sequence increase will notify the kvm page fault that
+  	 * the page that is going to be mapped in the spte could have
+@@@ -576,7 -689,38 +607,42 @@@
+  	 * in conjunction with the smp_rmb in mmu_notifier_retry().
+  	 */
+  	kvm->mmu_notifier_count--;
+++<<<<<<< HEAD
+ +	KVM_MMU_UNLOCK(kvm);
+++=======
++ }
++ EXPORT_SYMBOL_GPL(kvm_dec_notifier_count);
++ 
++ 
++ static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
++ 					const struct mmu_notifier_range *range)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range hva_range = {
++ 		.start		= range->start,
++ 		.end		= range->end,
++ 		.pte		= __pte(0),
++ 		.handler	= (void *)kvm_null_fn,
++ 		.on_lock	= kvm_dec_notifier_count,
++ 		.flush_on_ret	= false,
++ 		.may_block	= mmu_notifier_range_blockable(range),
++ 	};
++ 	bool wake;
++ 
++ 	__kvm_handle_hva_range(kvm, &hva_range);
++ 
++ 	/* Pairs with the increment in range_start(). */
++ 	spin_lock(&kvm->mn_invalidate_lock);
++ 	wake = (--kvm->mn_active_invalidate_count == 0);
++ 	spin_unlock(&kvm->mn_invalidate_lock);
++ 
++ 	/*
++ 	 * There can only be one waiter, since the wait happens under
++ 	 * slots_lock.
++ 	 */
++ 	if (wake)
++ 		rcuwait_wake_up(&kvm->mn_memslots_update_rcuwait);
+++>>>>>>> edb298c663fc (KVM: x86/mmu: bump mmu notifier count in kvm_zap_gfn_range)
+  
+  	BUG_ON(kvm->mmu_notifier_count < 0);
+  }
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 20157fe0daad..bc9a4f3f969e 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -932,6 +932,11 @@ void kvm_mmu_free_memory_cache(struct kvm_mmu_memory_cache *mc);
+ void *kvm_mmu_memory_cache_alloc(struct kvm_mmu_memory_cache *mc);
+ #endif
+ 
++void kvm_inc_notifier_count(struct kvm *kvm, unsigned long start,
++				   unsigned long end);
++void kvm_dec_notifier_count(struct kvm *kvm, unsigned long start,
++				   unsigned long end);
++
+ long kvm_arch_dev_ioctl(struct file *filp,
+ 			unsigned int ioctl, unsigned long arg);
+ long kvm_arch_vcpu_ioctl(struct file *filp,
+* Unmerged path virt/kvm/kvm_main.c
