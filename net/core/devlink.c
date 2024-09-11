@@ -836,12 +836,11 @@ static int devlink_port_fn_hw_addr_fill(const struct devlink_ops *ops,
 }
 
 static int devlink_nl_rate_fill(struct sk_buff *msg,
-				struct devlink *devlink,
 				struct devlink_rate *devlink_rate,
-				enum devlink_command cmd, u32 portid,
-				u32 seq, int flags,
-				struct netlink_ext_ack *extack)
+				enum devlink_command cmd, u32 portid, u32 seq,
+				int flags, struct netlink_ext_ack *extack)
 {
+	struct devlink *devlink = devlink_rate->devlink;
 	void *hdr;
 
 	hdr = genlmsg_put(msg, portid, seq, &devlink_nl_family, flags, cmd);
@@ -963,12 +962,12 @@ out:
 	return err;
 }
 
-static int devlink_nl_port_fill(struct sk_buff *msg, struct devlink *devlink,
+static int devlink_nl_port_fill(struct sk_buff *msg,
 				struct devlink_port *devlink_port,
-				enum devlink_command cmd, u32 portid,
-				u32 seq, int flags,
-				struct netlink_ext_ack *extack)
+				enum devlink_command cmd, u32 portid, u32 seq,
+				int flags, struct netlink_ext_ack *extack)
 {
+	struct devlink *devlink = devlink_port->devlink;
 	void *hdr;
 
 	hdr = genlmsg_put(msg, portid, seq, &devlink_nl_family, flags, cmd);
@@ -1029,12 +1028,8 @@ nla_put_failure:
 static void devlink_port_notify(struct devlink_port *devlink_port,
 				enum devlink_command cmd)
 {
-	struct devlink *devlink = devlink_port->devlink;
 	struct sk_buff *msg;
 	int err;
-
-	if (!devlink_port->devlink)
-		return;
 
 	WARN_ON(cmd != DEVLINK_CMD_PORT_NEW && cmd != DEVLINK_CMD_PORT_DEL);
 
@@ -1042,40 +1037,38 @@ static void devlink_port_notify(struct devlink_port *devlink_port,
 	if (!msg)
 		return;
 
-	err = devlink_nl_port_fill(msg, devlink, devlink_port, cmd, 0, 0, 0,
-				   NULL);
+	err = devlink_nl_port_fill(msg, devlink_port, cmd, 0, 0, 0, NULL);
 	if (err) {
 		nlmsg_free(msg);
 		return;
 	}
 
-	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
-				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+	genlmsg_multicast_netns(&devlink_nl_family,
+				devlink_net(devlink_port->devlink), msg, 0,
+				DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
 }
 
 static void devlink_rate_notify(struct devlink_rate *devlink_rate,
 				enum devlink_command cmd)
 {
-	struct devlink *devlink = devlink_rate->devlink;
 	struct sk_buff *msg;
 	int err;
 
-	WARN_ON(cmd != DEVLINK_CMD_RATE_NEW &&
-		cmd != DEVLINK_CMD_RATE_DEL);
+	WARN_ON(cmd != DEVLINK_CMD_RATE_NEW && cmd != DEVLINK_CMD_RATE_DEL);
 
 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
 	if (!msg)
 		return;
 
-	err = devlink_nl_rate_fill(msg, devlink, devlink_rate,
-				   cmd, 0, 0, 0, NULL);
+	err = devlink_nl_rate_fill(msg, devlink_rate, cmd, 0, 0, 0, NULL);
 	if (err) {
 		nlmsg_free(msg);
 		return;
 	}
 
-	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
-				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+	genlmsg_multicast_netns(&devlink_nl_family,
+				devlink_net(devlink_rate->devlink), msg, 0,
+				DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
 }
 
 static int devlink_nl_cmd_rate_get_dumpit(struct sk_buff *msg,
@@ -1100,9 +1093,7 @@ static int devlink_nl_cmd_rate_get_dumpit(struct sk_buff *msg,
 				idx++;
 				continue;
 			}
-			err = devlink_nl_rate_fill(msg, devlink,
-						   devlink_rate,
-						   cmd, id,
+			err = devlink_nl_rate_fill(msg, devlink_rate, cmd, id,
 						   cb->nlh->nlmsg_seq,
 						   NLM_F_MULTI, NULL);
 			if (err) {
@@ -1126,7 +1117,6 @@ static int devlink_nl_cmd_rate_get_doit(struct sk_buff *skb,
 					struct genl_info *info)
 {
 	struct devlink_rate *devlink_rate = info->user_ptr[1];
-	struct devlink *devlink = devlink_rate->devlink;
 	struct sk_buff *msg;
 	int err;
 
@@ -1134,8 +1124,7 @@ static int devlink_nl_cmd_rate_get_doit(struct sk_buff *skb,
 	if (!msg)
 		return -ENOMEM;
 
-	err = devlink_nl_rate_fill(msg, devlink, devlink_rate,
-				   DEVLINK_CMD_RATE_NEW,
+	err = devlink_nl_rate_fill(msg, devlink_rate, DEVLINK_CMD_RATE_NEW,
 				   info->snd_portid, info->snd_seq, 0,
 				   info->extack);
 	if (err) {
@@ -1212,7 +1201,6 @@ static int devlink_nl_cmd_port_get_doit(struct sk_buff *skb,
 					struct genl_info *info)
 {
 	struct devlink_port *devlink_port = info->user_ptr[1];
-	struct devlink *devlink = devlink_port->devlink;
 	struct sk_buff *msg;
 	int err;
 
@@ -1220,8 +1208,7 @@ static int devlink_nl_cmd_port_get_doit(struct sk_buff *skb,
 	if (!msg)
 		return -ENOMEM;
 
-	err = devlink_nl_port_fill(msg, devlink, devlink_port,
-				   DEVLINK_CMD_PORT_NEW,
+	err = devlink_nl_port_fill(msg, devlink_port, DEVLINK_CMD_PORT_NEW,
 				   info->snd_portid, info->snd_seq, 0,
 				   info->extack);
 	if (err) {
@@ -1251,12 +1238,11 @@ static int devlink_nl_cmd_port_get_dumpit(struct sk_buff *msg,
 				idx++;
 				continue;
 			}
-			err = devlink_nl_port_fill(msg, devlink, devlink_port,
+			err = devlink_nl_port_fill(msg, devlink_port,
 						   DEVLINK_CMD_NEW,
 						   NETLINK_CB(cb->skb).portid,
 						   cb->nlh->nlmsg_seq,
-						   NLM_F_MULTI,
-						   cb->extack);
+						   NLM_F_MULTI, cb->extack);
 			if (err) {
 				mutex_unlock(&devlink->lock);
 				goto out;
@@ -1492,9 +1478,8 @@ static int devlink_port_new_notifiy(struct devlink *devlink,
 		goto out;
 	}
 
-	err = devlink_nl_port_fill(msg, devlink, devlink_port,
-				   DEVLINK_CMD_NEW, info->snd_portid,
-				   info->snd_seq, 0, NULL);
+	err = devlink_nl_port_fill(msg, devlink_port, DEVLINK_CMD_NEW,
+				   info->snd_portid, info->snd_seq, 0, NULL);
 	if (err)
 		goto out;
 
@@ -5080,7 +5065,6 @@ static void devlink_nl_region_notify(struct devlink_region *region,
 				     struct devlink_snapshot *snapshot,
 				     enum devlink_command cmd)
 {
-	struct devlink *devlink = region->devlink;
 	struct sk_buff *msg;
 
 	WARN_ON(cmd != DEVLINK_CMD_REGION_NEW && cmd != DEVLINK_CMD_REGION_DEL);
@@ -5089,8 +5073,9 @@ static void devlink_nl_region_notify(struct devlink_region *region,
 	if (IS_ERR(msg))
 		return;
 
-	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
-				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+	genlmsg_multicast_netns(&devlink_nl_family,
+				devlink_net(region->devlink), msg, 0,
+				DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
 }
 
 /**
@@ -6774,11 +6759,11 @@ EXPORT_SYMBOL_GPL(devlink_port_health_reporter_destroy);
 
 static int
 devlink_nl_health_reporter_fill(struct sk_buff *msg,
-				struct devlink *devlink,
 				struct devlink_health_reporter *reporter,
 				enum devlink_command cmd, u32 portid,
 				u32 seq, int flags)
 {
+	struct devlink *devlink = reporter->devlink;
 	struct nlattr *reporter_attr;
 	void *hdr;
 
@@ -6855,8 +6840,7 @@ static void devlink_recover_notify(struct devlink_health_reporter *reporter,
 	if (!msg)
 		return;
 
-	err = devlink_nl_health_reporter_fill(msg, reporter->devlink,
-					      reporter, cmd, 0, 0, 0);
+	err = devlink_nl_health_reporter_fill(msg, reporter, cmd, 0, 0, 0);
 	if (err) {
 		nlmsg_free(msg);
 		return;
@@ -7089,7 +7073,7 @@ static int devlink_nl_cmd_health_reporter_get_doit(struct sk_buff *skb,
 		goto out;
 	}
 
-	err = devlink_nl_health_reporter_fill(msg, devlink, reporter,
+	err = devlink_nl_health_reporter_fill(msg, reporter,
 					      DEVLINK_CMD_HEALTH_REPORTER_GET,
 					      info->snd_portid, info->snd_seq,
 					      0);
@@ -7126,12 +7110,10 @@ devlink_nl_cmd_health_reporter_get_dumpit(struct sk_buff *msg,
 				idx++;
 				continue;
 			}
-			err = devlink_nl_health_reporter_fill(msg, devlink,
-							      reporter,
-							      DEVLINK_CMD_HEALTH_REPORTER_GET,
-							      NETLINK_CB(cb->skb).portid,
-							      cb->nlh->nlmsg_seq,
-							      NLM_F_MULTI);
+			err = devlink_nl_health_reporter_fill(
+				msg, reporter, DEVLINK_CMD_HEALTH_REPORTER_GET,
+				NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
+				NLM_F_MULTI);
 			if (err) {
 				mutex_unlock(&devlink->reporters_lock);
 				goto out;
@@ -7152,11 +7134,11 @@ devlink_nl_cmd_health_reporter_get_dumpit(struct sk_buff *msg,
 					idx++;
 					continue;
 				}
-				err = devlink_nl_health_reporter_fill(msg, devlink, reporter,
-								      DEVLINK_CMD_HEALTH_REPORTER_GET,
-								      NETLINK_CB(cb->skb).portid,
-								      cb->nlh->nlmsg_seq,
-								      NLM_F_MULTI);
+				err = devlink_nl_health_reporter_fill(
+					msg, reporter,
+					DEVLINK_CMD_HEALTH_REPORTER_GET,
+					NETLINK_CB(cb->skb).portid,
+					cb->nlh->nlmsg_seq, NLM_F_MULTI);
 				if (err) {
 					mutex_unlock(&port->reporters_lock);
 					mutex_unlock(&devlink->lock);
