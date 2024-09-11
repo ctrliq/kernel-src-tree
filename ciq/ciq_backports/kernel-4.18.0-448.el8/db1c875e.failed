@@ -1,0 +1,458 @@
+KVM: s390: add KVM_S390_ZPCI_OP to manage guest zPCI devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Matthew Rosato <mjrosato@linux.ibm.com>
+commit db1c875e0539518e3d5fe9876ef50975cf4476bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/db1c875e.failed
+
+The KVM_S390_ZPCI_OP ioctl provides a mechanism for managing
+hardware-assisted virtualization features for s390x zPCI passthrough.
+Add the first 2 operations, which can be used to enable/disable
+the specified device for Adapter Event Notification interpretation.
+
+	Signed-off-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Acked-by: Pierre Morel <pmorel@linux.ibm.com>
+	Reviewed-by: Thomas Huth <thuth@redhat.com>
+Link: https://lore.kernel.org/r/20220606203325.110625-21-mjrosato@linux.ibm.com
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+(cherry picked from commit db1c875e0539518e3d5fe9876ef50975cf4476bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/pci.c
+#	arch/s390/kvm/pci.h
+#	include/uapi/linux/kvm.h
+diff --cc arch/s390/kvm/pci.c
+index b232c8cbaa81,4946fb7757d6..000000000000
+--- a/arch/s390/kvm/pci.c
++++ b/arch/s390/kvm/pci.c
+@@@ -423,6 -425,251 +423,254 @@@ static void kvm_s390_pci_dev_release(st
+  	kfree(kzdev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Register device with the specified KVM. If interpetation facilities are
++  * available, enable them and let userspace indicate whether or not they will
++  * be used (specify SHM bit to disable).
++  */
++ int kvm_s390_pci_register_kvm(struct zpci_dev *zdev, struct kvm *kvm)
++ {
++ 	int rc;
++ 
++ 	if (!zdev)
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&zdev->kzdev_lock);
++ 
++ 	if (zdev->kzdev || zdev->gisa != 0 || !kvm) {
++ 		mutex_unlock(&zdev->kzdev_lock);
++ 		return -EINVAL;
++ 	}
++ 
++ 	kvm_get_kvm(kvm);
++ 
++ 	mutex_lock(&kvm->lock);
++ 
++ 	rc = kvm_s390_pci_dev_open(zdev);
++ 	if (rc)
++ 		goto err;
++ 
++ 	/*
++ 	 * If interpretation facilities aren't available, add the device to
++ 	 * the kzdev list but don't enable for interpretation.
++ 	 */
++ 	if (!kvm_s390_pci_interp_allowed())
++ 		goto out;
++ 
++ 	/*
++ 	 * If this is the first request to use an interpreted device, make the
++ 	 * necessary vcpu changes
++ 	 */
++ 	if (!kvm->arch.use_zpci_interp)
++ 		kvm_s390_vcpu_pci_enable_interp(kvm);
++ 
++ 	if (zdev_enabled(zdev)) {
++ 		rc = zpci_disable_device(zdev);
++ 		if (rc)
++ 			goto err;
++ 	}
++ 
++ 	/*
++ 	 * Store information about the identity of the kvm guest allowed to
++ 	 * access this device via interpretation to be used by host CLP
++ 	 */
++ 	zdev->gisa = (u32)virt_to_phys(&kvm->arch.sie_page2->gisa);
++ 
++ 	rc = zpci_enable_device(zdev);
++ 	if (rc)
++ 		goto clear_gisa;
++ 
++ 	/* Re-register the IOMMU that was already created */
++ 	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++ 				virt_to_phys(zdev->dma_table));
++ 	if (rc)
++ 		goto clear_gisa;
++ 
++ out:
++ 	zdev->kzdev->kvm = kvm;
++ 
++ 	spin_lock(&kvm->arch.kzdev_list_lock);
++ 	list_add_tail(&zdev->kzdev->entry, &kvm->arch.kzdev_list);
++ 	spin_unlock(&kvm->arch.kzdev_list_lock);
++ 
++ 	mutex_unlock(&kvm->lock);
++ 	mutex_unlock(&zdev->kzdev_lock);
++ 	return 0;
++ 
++ clear_gisa:
++ 	zdev->gisa = 0;
++ err:
++ 	if (zdev->kzdev)
++ 		kvm_s390_pci_dev_release(zdev);
++ 	mutex_unlock(&kvm->lock);
++ 	mutex_unlock(&zdev->kzdev_lock);
++ 	kvm_put_kvm(kvm);
++ 	return rc;
++ }
++ EXPORT_SYMBOL_GPL(kvm_s390_pci_register_kvm);
++ 
++ void kvm_s390_pci_unregister_kvm(struct zpci_dev *zdev)
++ {
++ 	struct kvm *kvm;
++ 
++ 	if (!zdev)
++ 		return;
++ 
++ 	mutex_lock(&zdev->kzdev_lock);
++ 
++ 	if (WARN_ON(!zdev->kzdev)) {
++ 		mutex_unlock(&zdev->kzdev_lock);
++ 		return;
++ 	}
++ 
++ 	kvm = zdev->kzdev->kvm;
++ 	mutex_lock(&kvm->lock);
++ 
++ 	/*
++ 	 * A 0 gisa means interpretation was never enabled, just remove the
++ 	 * device from the list.
++ 	 */
++ 	if (zdev->gisa == 0)
++ 		goto out;
++ 
++ 	/* Forwarding must be turned off before interpretation */
++ 	if (zdev->kzdev->fib.fmt0.aibv != 0)
++ 		kvm_s390_pci_aif_disable(zdev, true);
++ 
++ 	/* Remove the host CLP guest designation */
++ 	zdev->gisa = 0;
++ 
++ 	if (zdev_enabled(zdev)) {
++ 		if (zpci_disable_device(zdev))
++ 			goto out;
++ 	}
++ 
++ 	if (zpci_enable_device(zdev))
++ 		goto out;
++ 
++ 	/* Re-register the IOMMU that was already created */
++ 	zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++ 			   virt_to_phys(zdev->dma_table));
++ 
++ out:
++ 	spin_lock(&kvm->arch.kzdev_list_lock);
++ 	list_del(&zdev->kzdev->entry);
++ 	spin_unlock(&kvm->arch.kzdev_list_lock);
++ 	kvm_s390_pci_dev_release(zdev);
++ 
++ 	mutex_unlock(&kvm->lock);
++ 	mutex_unlock(&zdev->kzdev_lock);
++ 
++ 	kvm_put_kvm(kvm);
++ }
++ EXPORT_SYMBOL_GPL(kvm_s390_pci_unregister_kvm);
++ 
++ void kvm_s390_pci_init_list(struct kvm *kvm)
++ {
++ 	spin_lock_init(&kvm->arch.kzdev_list_lock);
++ 	INIT_LIST_HEAD(&kvm->arch.kzdev_list);
++ }
++ 
++ void kvm_s390_pci_clear_list(struct kvm *kvm)
++ {
++ 	/*
++ 	 * This list should already be empty, either via vfio device closures
++ 	 * or kvm fd cleanup.
++ 	 */
++ 	spin_lock(&kvm->arch.kzdev_list_lock);
++ 	WARN_ON_ONCE(!list_empty(&kvm->arch.kzdev_list));
++ 	spin_unlock(&kvm->arch.kzdev_list_lock);
++ }
++ 
++ static struct zpci_dev *get_zdev_from_kvm_by_fh(struct kvm *kvm, u32 fh)
++ {
++ 	struct zpci_dev *zdev = NULL;
++ 	struct kvm_zdev *kzdev;
++ 
++ 	spin_lock(&kvm->arch.kzdev_list_lock);
++ 	list_for_each_entry(kzdev, &kvm->arch.kzdev_list, entry) {
++ 		if (kzdev->zdev->fh == fh) {
++ 			zdev = kzdev->zdev;
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock(&kvm->arch.kzdev_list_lock);
++ 
++ 	return zdev;
++ }
++ 
++ static int kvm_s390_pci_zpci_reg_aen(struct zpci_dev *zdev,
++ 				     struct kvm_s390_zpci_op *args)
++ {
++ 	struct zpci_fib fib = {};
++ 	bool hostflag;
++ 
++ 	fib.fmt0.aibv = args->u.reg_aen.ibv;
++ 	fib.fmt0.isc = args->u.reg_aen.isc;
++ 	fib.fmt0.noi = args->u.reg_aen.noi;
++ 	if (args->u.reg_aen.sb != 0) {
++ 		fib.fmt0.aisb = args->u.reg_aen.sb;
++ 		fib.fmt0.aisbo = args->u.reg_aen.sbo;
++ 		fib.fmt0.sum = 1;
++ 	} else {
++ 		fib.fmt0.aisb = 0;
++ 		fib.fmt0.aisbo = 0;
++ 		fib.fmt0.sum = 0;
++ 	}
++ 
++ 	hostflag = !(args->u.reg_aen.flags & KVM_S390_ZPCIOP_REGAEN_HOST);
++ 	return kvm_s390_pci_aif_enable(zdev, &fib, hostflag);
++ }
++ 
++ int kvm_s390_pci_zpci_op(struct kvm *kvm, struct kvm_s390_zpci_op *args)
++ {
++ 	struct kvm_zdev *kzdev;
++ 	struct zpci_dev *zdev;
++ 	int r;
++ 
++ 	zdev = get_zdev_from_kvm_by_fh(kvm, args->fh);
++ 	if (!zdev)
++ 		return -ENODEV;
++ 
++ 	mutex_lock(&zdev->kzdev_lock);
++ 	mutex_lock(&kvm->lock);
++ 
++ 	kzdev = zdev->kzdev;
++ 	if (!kzdev) {
++ 		r = -ENODEV;
++ 		goto out;
++ 	}
++ 	if (kzdev->kvm != kvm) {
++ 		r = -EPERM;
++ 		goto out;
++ 	}
++ 
++ 	switch (args->op) {
++ 	case KVM_S390_ZPCIOP_REG_AEN:
++ 		/* Fail on unknown flags */
++ 		if (args->u.reg_aen.flags & ~KVM_S390_ZPCIOP_REGAEN_HOST) {
++ 			r = -EINVAL;
++ 			break;
++ 		}
++ 		r = kvm_s390_pci_zpci_reg_aen(zdev, args);
++ 		break;
++ 	case KVM_S390_ZPCIOP_DEREG_AEN:
++ 		r = kvm_s390_pci_aif_disable(zdev, false);
++ 		break;
++ 	default:
++ 		r = -EINVAL;
++ 	}
++ 
++ out:
++ 	mutex_unlock(&kvm->lock);
++ 	mutex_unlock(&zdev->kzdev_lock);
++ 	return r;
++ }
++ 
+++>>>>>>> db1c875e0539 (KVM: s390: add KVM_S390_ZPCI_OP to manage guest zPCI devices)
+  int kvm_s390_pci_init(void)
+  {
+  	aift = kzalloc(sizeof(struct zpci_aift), GFP_KERNEL);
+diff --cc arch/s390/kvm/pci.h
+index 1c862c772281,0351382e990f..000000000000
+--- a/arch/s390/kvm/pci.h
++++ b/arch/s390/kvm/pci.h
+@@@ -44,6 -47,20 +44,14 @@@ extern struct zpci_aift *aift
+  int kvm_s390_pci_aen_init(u8 nisc);
+  void kvm_s390_pci_aen_exit(void);
+  
+++<<<<<<< HEAD
+++=======
++ void kvm_s390_pci_init_list(struct kvm *kvm);
++ void kvm_s390_pci_clear_list(struct kvm *kvm);
++ 
++ int kvm_s390_pci_zpci_op(struct kvm *kvm, struct kvm_s390_zpci_op *args);
++ 
+++>>>>>>> db1c875e0539 (KVM: s390: add KVM_S390_ZPCI_OP to manage guest zPCI devices)
+  int kvm_s390_pci_init(void);
+  void kvm_s390_pci_exit(void);
+  
+diff --cc include/uapi/linux/kvm.h
+index e287c95f13ed,2f302e2287d1..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1129,6 -1153,11 +1129,13 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_S390_MEM_OP_EXTENSION 211
+  #define KVM_CAP_PMU_CAPABILITY 212
+  #define KVM_CAP_DISABLE_QUIRKS2 213
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_VM_TSC_CONTROL 214
++ #define KVM_CAP_SYSTEM_EVENT_DATA 215
++ #define KVM_CAP_ARM_SYSTEM_SUSPEND 216
++ #define KVM_CAP_S390_ZPCI_OP 221
+++>>>>>>> db1c875e0539 (KVM: s390: add KVM_S390_ZPCI_OP to manage guest zPCI devices)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+@@@ -2094,7 -2119,34 +2101,39 @@@ struct kvm_stats_desc 
+  /* Available with KVM_CAP_XSAVE2 */
+  #define KVM_GET_XSAVE2		  _IOR(KVMIO,  0xcf, struct kvm_xsave)
+  
+++<<<<<<< HEAD
+ +/* Available with KVM_CAP_S390_PROTECTED_DUMP */
+ +#define KVM_S390_PV_CPU_COMMAND	_IOWR(KVMIO, 0xd0, struct kvm_pv_cmd)
+++=======
++ /* Available with KVM_CAP_S390_ZPCI_OP */
++ #define KVM_S390_ZPCI_OP         _IOW(KVMIO,  0xd1, struct kvm_s390_zpci_op)
++ 
++ struct kvm_s390_zpci_op {
++ 	/* in */
++ 	__u32 fh;               /* target device */
++ 	__u8  op;               /* operation to perform */
++ 	__u8  pad[3];
++ 	union {
++ 		/* for KVM_S390_ZPCIOP_REG_AEN */
++ 		struct {
++ 			__u64 ibv;      /* Guest addr of interrupt bit vector */
++ 			__u64 sb;       /* Guest addr of summary bit */
++ 			__u32 flags;
++ 			__u32 noi;      /* Number of interrupts */
++ 			__u8 isc;       /* Guest interrupt subclass */
++ 			__u8 sbo;       /* Offset of guest summary bit vector */
++ 			__u16 pad;
++ 		} reg_aen;
++ 		__u64 reserved[8];
++ 	} u;
++ };
++ 
++ /* types for kvm_s390_zpci_op->op */
++ #define KVM_S390_ZPCIOP_REG_AEN                0
++ #define KVM_S390_ZPCIOP_DEREG_AEN      1
++ 
++ /* flags for kvm_s390_zpci_op->u.reg_aen.flags */
++ #define KVM_S390_ZPCIOP_REGAEN_HOST    (1 << 0)
+++>>>>>>> db1c875e0539 (KVM: s390: add KVM_S390_ZPCI_OP to manage guest zPCI devices)
+  
+  #endif /* __LINUX_KVM_H */
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 30da84ac28c5..713d833388fc 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -5387,6 +5387,53 @@ The offsets of the state save areas in struct kvm_xsave follow the contents
+ of CPUID leaf 0xD on the host.
+ 
+ 
++4.137 KVM_S390_ZPCI_OP
++--------------------
++
++:Capability: KVM_CAP_S390_ZPCI_OP
++:Architectures: s390
++:Type: vm ioctl
++:Parameters: struct kvm_s390_zpci_op (in)
++:Returns: 0 on success, <0 on error
++
++Used to manage hardware-assisted virtualization features for zPCI devices.
++
++Parameters are specified via the following structure::
++
++  struct kvm_s390_zpci_op {
++	/* in */
++	__u32 fh;		/* target device */
++	__u8  op;		/* operation to perform */
++	__u8  pad[3];
++	union {
++		/* for KVM_S390_ZPCIOP_REG_AEN */
++		struct {
++			__u64 ibv;	/* Guest addr of interrupt bit vector */
++			__u64 sb;	/* Guest addr of summary bit */
++			__u32 flags;
++			__u32 noi;	/* Number of interrupts */
++			__u8 isc;	/* Guest interrupt subclass */
++			__u8 sbo;	/* Offset of guest summary bit vector */
++			__u16 pad;
++		} reg_aen;
++		__u64 reserved[8];
++	} u;
++  };
++
++The type of operation is specified in the "op" field.
++KVM_S390_ZPCIOP_REG_AEN is used to register the VM for adapter event
++notification interpretation, which will allow firmware delivery of adapter
++events directly to the vm, with KVM providing a backup delivery mechanism;
++KVM_S390_ZPCIOP_DEREG_AEN is used to subsequently disable interpretation of
++adapter event notifications.
++
++The target zPCI function must also be specified via the "fh" field.  For the
++KVM_S390_ZPCIOP_REG_AEN operation, additional information to establish firmware
++delivery must be provided via the "reg_aen" struct.
++
++The "pad" and "reserved" fields may be used for future extensions and should be
++set to 0s by userspace.
++
+ 5. The kvm_run structure
+ ========================
+ 
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index d9a77ff8733f..2081337e7e29 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -615,6 +615,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_S390_PROTECTED:
+ 		r = is_prot_virt_host();
+ 		break;
++	case KVM_CAP_S390_ZPCI_OP:
++		r = kvm_s390_pci_interp_allowed();
++		break;
+ 	default:
+ 		r = 0;
+ 	}
+@@ -2827,6 +2830,19 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 			r = -EFAULT;
+ 		break;
+ 	}
++	case KVM_S390_ZPCI_OP: {
++		struct kvm_s390_zpci_op args;
++
++		r = -EINVAL;
++		if (!IS_ENABLED(CONFIG_VFIO_PCI_ZDEV_KVM))
++			break;
++		if (copy_from_user(&args, argp, sizeof(args))) {
++			r = -EFAULT;
++			break;
++		}
++		r = kvm_s390_pci_zpci_op(kvm, &args);
++		break;
++	}
+ 	default:
+ 		r = -ENOTTY;
+ 	}
+* Unmerged path arch/s390/kvm/pci.c
+* Unmerged path arch/s390/kvm/pci.h
+* Unmerged path include/uapi/linux/kvm.h
