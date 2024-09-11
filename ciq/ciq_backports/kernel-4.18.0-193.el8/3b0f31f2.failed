@@ -1,0 +1,3425 @@
+genetlink: make policy common to family
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 3b0f31f2b8c9fb348e4530b88f6b64f9621f83d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3b0f31f2.failed
+
+Since maxattr is common, the policy can't really differ sanely,
+so make it common as well.
+
+The only user that did in fact manage to make a non-common policy
+is taskstats, which has to be really careful about it (since it's
+still using a common maxattr!). This is no longer supported, but
+we can fake it using pre_doit.
+
+This reduces the size of e.g. nl80211.o (which has lots of commands):
+
+   text	   data	    bss	    dec	    hex	filename
+ 398745	  14323	   2240	 415308	  6564c	net/wireless/nl80211.o (before)
+ 397913	  14331	   2240	 414484	  65314	net/wireless/nl80211.o (after)
+--------------------------------
+   -832      +8       0    -824
+
+Which is obviously just 8 bytes for each command, and an added 8
+bytes for the new policy pointer. I'm not sure why the ops list is
+counted as .text though.
+
+Most of the code transformations were done using the following spatch:
+    @ops@
+    identifier OPS;
+    expression POLICY;
+    @@
+    struct genl_ops OPS[] = {
+    ...,
+     {
+    -	.policy = POLICY,
+     },
+    ...
+    };
+
+    @@
+    identifier ops.OPS;
+    expression ops.POLICY;
+    identifier fam;
+    expression M;
+    @@
+    struct genl_family fam = {
+            .ops = OPS,
+            .maxattr = M,
+    +       .policy = POLICY,
+            ...
+    };
+
+This also gets rid of devlink_nl_cmd_region_read_dumpit() accessing
+the cb->data as ops, which we want to change in a later genl patch.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3b0f31f2b8c9fb348e4530b88f6b64f9621f83d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ieee802154/mac802154_hwsim.c
+#	net/batman-adv/netlink.c
+#	net/ncsi/ncsi-netlink.c
+diff --cc net/batman-adv/netlink.c
+index 0d9459b69bdb,d3033a3d2a63..000000000000
+--- a/net/batman-adv/netlink.c
++++ b/net/batman-adv/netlink.c
+@@@ -541,24 -1007,358 +541,29 @@@ batadv_netlink_dump_hardifs(struct sk_b
+  	return msg->len;
+  }
+  
+ -/**
+ - * batadv_netlink_vlan_fill() - Fill message with vlan attributes
+ - * @msg: Netlink message to dump into
+ - * @bat_priv: the bat priv with all the soft interface information
+ - * @vlan: vlan which was modified
+ - * @cmd: type of message to generate
+ - * @portid: Port making netlink request
+ - * @seq: sequence number for message
+ - * @flags: Additional flags for message
+ - *
+ - * Return: 0 on success or negative error number in case of failure
+ - */
+ -static int batadv_netlink_vlan_fill(struct sk_buff *msg,
+ -				    struct batadv_priv *bat_priv,
+ -				    struct batadv_softif_vlan *vlan,
+ -				    enum batadv_nl_commands cmd,
+ -				    u32 portid, u32 seq, int flags)
+ -{
+ -	void *hdr;
+ -
+ -	hdr = genlmsg_put(msg, portid, seq, &batadv_netlink_family, flags, cmd);
+ -	if (!hdr)
+ -		return -ENOBUFS;
+ -
+ -	if (nla_put_u32(msg, BATADV_ATTR_MESH_IFINDEX,
+ -			bat_priv->soft_iface->ifindex))
+ -		goto nla_put_failure;
+ -
+ -	if (nla_put_u32(msg, BATADV_ATTR_VLANID, vlan->vid & VLAN_VID_MASK))
+ -		goto nla_put_failure;
+ -
+ -	if (nla_put_u8(msg, BATADV_ATTR_AP_ISOLATION_ENABLED,
+ -		       !!atomic_read(&vlan->ap_isolation)))
+ -		goto nla_put_failure;
+ -
+ -	genlmsg_end(msg, hdr);
+ -	return 0;
+ -
+ -nla_put_failure:
+ -	genlmsg_cancel(msg, hdr);
+ -	return -EMSGSIZE;
+ -}
+ -
+ -/**
+ - * batadv_netlink_notify_vlan() - send vlan attributes to listener
+ - * @bat_priv: the bat priv with all the soft interface information
+ - * @vlan: vlan which was modified
+ - *
+ - * Return: 0 on success, < 0 on error
+ - */
+ -int batadv_netlink_notify_vlan(struct batadv_priv *bat_priv,
+ -			       struct batadv_softif_vlan *vlan)
+ -{
+ -	struct sk_buff *msg;
+ -	int ret;
+ -
+ -	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+ -	if (!msg)
+ -		return -ENOMEM;
+ -
+ -	ret = batadv_netlink_vlan_fill(msg, bat_priv, vlan,
+ -				       BATADV_CMD_SET_VLAN, 0, 0, 0);
+ -	if (ret < 0) {
+ -		nlmsg_free(msg);
+ -		return ret;
+ -	}
+ -
+ -	genlmsg_multicast_netns(&batadv_netlink_family,
+ -				dev_net(bat_priv->soft_iface), msg, 0,
+ -				BATADV_NL_MCGRP_CONFIG, GFP_KERNEL);
+ -
+ -	return 0;
+ -}
+ -
+ -/**
+ - * batadv_netlink_get_vlan() - Get vlan attributes
+ - * @skb: Netlink message with request data
+ - * @info: receiver information
+ - *
+ - * Return: 0 on success or negative error number in case of failure
+ - */
+ -static int batadv_netlink_get_vlan(struct sk_buff *skb, struct genl_info *info)
+ -{
+ -	struct batadv_softif_vlan *vlan = info->user_ptr[1];
+ -	struct batadv_priv *bat_priv = info->user_ptr[0];
+ -	struct sk_buff *msg;
+ -	int ret;
+ -
+ -	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+ -	if (!msg)
+ -		return -ENOMEM;
+ -
+ -	ret = batadv_netlink_vlan_fill(msg, bat_priv, vlan, BATADV_CMD_GET_VLAN,
+ -				       info->snd_portid, info->snd_seq, 0);
+ -	if (ret < 0) {
+ -		nlmsg_free(msg);
+ -		return ret;
+ -	}
+ -
+ -	ret = genlmsg_reply(msg, info);
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * batadv_netlink_set_vlan() - Get vlan attributes
+ - * @skb: Netlink message with request data
+ - * @info: receiver information
+ - *
+ - * Return: 0 on success or negative error number in case of failure
+ - */
+ -static int batadv_netlink_set_vlan(struct sk_buff *skb, struct genl_info *info)
+ -{
+ -	struct batadv_softif_vlan *vlan = info->user_ptr[1];
+ -	struct batadv_priv *bat_priv = info->user_ptr[0];
+ -	struct nlattr *attr;
+ -
+ -	if (info->attrs[BATADV_ATTR_AP_ISOLATION_ENABLED]) {
+ -		attr = info->attrs[BATADV_ATTR_AP_ISOLATION_ENABLED];
+ -
+ -		atomic_set(&vlan->ap_isolation, !!nla_get_u8(attr));
+ -	}
+ -
+ -	batadv_netlink_notify_vlan(bat_priv, vlan);
+ -
+ -	return 0;
+ -}
+ -
+ -/**
+ - * batadv_get_softif_from_info() - Retrieve soft interface from genl attributes
+ - * @net: the applicable net namespace
+ - * @info: receiver information
+ - *
+ - * Return: Pointer to soft interface (with increased refcnt) on success, error
+ - *  pointer on error
+ - */
+ -static struct net_device *
+ -batadv_get_softif_from_info(struct net *net, struct genl_info *info)
+ -{
+ -	struct net_device *soft_iface;
+ -	int ifindex;
+ -
+ -	if (!info->attrs[BATADV_ATTR_MESH_IFINDEX])
+ -		return ERR_PTR(-EINVAL);
+ -
+ -	ifindex = nla_get_u32(info->attrs[BATADV_ATTR_MESH_IFINDEX]);
+ -
+ -	soft_iface = dev_get_by_index(net, ifindex);
+ -	if (!soft_iface)
+ -		return ERR_PTR(-ENODEV);
+ -
+ -	if (!batadv_softif_is_valid(soft_iface))
+ -		goto err_put_softif;
+ -
+ -	return soft_iface;
+ -
+ -err_put_softif:
+ -	dev_put(soft_iface);
+ -
+ -	return ERR_PTR(-EINVAL);
+ -}
+ -
+ -/**
+ - * batadv_get_hardif_from_info() - Retrieve hardif from genl attributes
+ - * @bat_priv: the bat priv with all the soft interface information
+ - * @net: the applicable net namespace
+ - * @info: receiver information
+ - *
+ - * Return: Pointer to hard interface (with increased refcnt) on success, error
+ - *  pointer on error
+ - */
+ -static struct batadv_hard_iface *
+ -batadv_get_hardif_from_info(struct batadv_priv *bat_priv, struct net *net,
+ -			    struct genl_info *info)
+ -{
+ -	struct batadv_hard_iface *hard_iface;
+ -	struct net_device *hard_dev;
+ -	unsigned int hardif_index;
+ -
+ -	if (!info->attrs[BATADV_ATTR_HARD_IFINDEX])
+ -		return ERR_PTR(-EINVAL);
+ -
+ -	hardif_index = nla_get_u32(info->attrs[BATADV_ATTR_HARD_IFINDEX]);
+ -
+ -	hard_dev = dev_get_by_index(net, hardif_index);
+ -	if (!hard_dev)
+ -		return ERR_PTR(-ENODEV);
+ -
+ -	hard_iface = batadv_hardif_get_by_netdev(hard_dev);
+ -	if (!hard_iface)
+ -		goto err_put_harddev;
+ -
+ -	if (hard_iface->soft_iface != bat_priv->soft_iface)
+ -		goto err_put_hardif;
+ -
+ -	/* hard_dev is referenced by hard_iface and not needed here */
+ -	dev_put(hard_dev);
+ -
+ -	return hard_iface;
+ -
+ -err_put_hardif:
+ -	batadv_hardif_put(hard_iface);
+ -err_put_harddev:
+ -	dev_put(hard_dev);
+ -
+ -	return ERR_PTR(-EINVAL);
+ -}
+ -
+ -/**
+ - * batadv_get_vlan_from_info() - Retrieve vlan from genl attributes
+ - * @bat_priv: the bat priv with all the soft interface information
+ - * @net: the applicable net namespace
+ - * @info: receiver information
+ - *
+ - * Return: Pointer to vlan on success (with increased refcnt), error pointer
+ - *  on error
+ - */
+ -static struct batadv_softif_vlan *
+ -batadv_get_vlan_from_info(struct batadv_priv *bat_priv, struct net *net,
+ -			  struct genl_info *info)
+ -{
+ -	struct batadv_softif_vlan *vlan;
+ -	u16 vid;
+ -
+ -	if (!info->attrs[BATADV_ATTR_VLANID])
+ -		return ERR_PTR(-EINVAL);
+ -
+ -	vid = nla_get_u16(info->attrs[BATADV_ATTR_VLANID]);
+ -
+ -	vlan = batadv_softif_vlan_get(bat_priv, vid | BATADV_VLAN_HAS_TAG);
+ -	if (!vlan)
+ -		return ERR_PTR(-ENOENT);
+ -
+ -	return vlan;
+ -}
+ -
+ -/**
+ - * batadv_pre_doit() - Prepare batman-adv genl doit request
+ - * @ops: requested netlink operation
+ - * @skb: Netlink message with request data
+ - * @info: receiver information
+ - *
+ - * Return: 0 on success or negative error number in case of failure
+ - */
+ -static int batadv_pre_doit(const struct genl_ops *ops, struct sk_buff *skb,
+ -			   struct genl_info *info)
+ -{
+ -	struct net *net = genl_info_net(info);
+ -	struct batadv_hard_iface *hard_iface;
+ -	struct batadv_priv *bat_priv = NULL;
+ -	struct batadv_softif_vlan *vlan;
+ -	struct net_device *soft_iface;
+ -	u8 user_ptr1_flags;
+ -	u8 mesh_dep_flags;
+ -	int ret;
+ -
+ -	user_ptr1_flags = BATADV_FLAG_NEED_HARDIF | BATADV_FLAG_NEED_VLAN;
+ -	if (WARN_ON(hweight8(ops->internal_flags & user_ptr1_flags) > 1))
+ -		return -EINVAL;
+ -
+ -	mesh_dep_flags = BATADV_FLAG_NEED_HARDIF | BATADV_FLAG_NEED_VLAN;
+ -	if (WARN_ON((ops->internal_flags & mesh_dep_flags) &&
+ -		    (~ops->internal_flags & BATADV_FLAG_NEED_MESH)))
+ -		return -EINVAL;
+ -
+ -	if (ops->internal_flags & BATADV_FLAG_NEED_MESH) {
+ -		soft_iface = batadv_get_softif_from_info(net, info);
+ -		if (IS_ERR(soft_iface))
+ -			return PTR_ERR(soft_iface);
+ -
+ -		bat_priv = netdev_priv(soft_iface);
+ -		info->user_ptr[0] = bat_priv;
+ -	}
+ -
+ -	if (ops->internal_flags & BATADV_FLAG_NEED_HARDIF) {
+ -		hard_iface = batadv_get_hardif_from_info(bat_priv, net, info);
+ -		if (IS_ERR(hard_iface)) {
+ -			ret = PTR_ERR(hard_iface);
+ -			goto err_put_softif;
+ -		}
+ -
+ -		info->user_ptr[1] = hard_iface;
+ -	}
+ -
+ -	if (ops->internal_flags & BATADV_FLAG_NEED_VLAN) {
+ -		vlan = batadv_get_vlan_from_info(bat_priv, net, info);
+ -		if (IS_ERR(vlan)) {
+ -			ret = PTR_ERR(vlan);
+ -			goto err_put_softif;
+ -		}
+ -
+ -		info->user_ptr[1] = vlan;
+ -	}
+ -
+ -	return 0;
+ -
+ -err_put_softif:
+ -	if (bat_priv)
+ -		dev_put(bat_priv->soft_iface);
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * batadv_post_doit() - End batman-adv genl doit request
+ - * @ops: requested netlink operation
+ - * @skb: Netlink message with request data
+ - * @info: receiver information
+ - */
+ -static void batadv_post_doit(const struct genl_ops *ops, struct sk_buff *skb,
+ -			     struct genl_info *info)
+ -{
+ -	struct batadv_hard_iface *hard_iface;
+ -	struct batadv_softif_vlan *vlan;
+ -	struct batadv_priv *bat_priv;
+ -
+ -	if (ops->internal_flags & BATADV_FLAG_NEED_HARDIF &&
+ -	    info->user_ptr[1]) {
+ -		hard_iface = info->user_ptr[1];
+ -
+ -		batadv_hardif_put(hard_iface);
+ -	}
+ -
+ -	if (ops->internal_flags & BATADV_FLAG_NEED_VLAN && info->user_ptr[1]) {
+ -		vlan = info->user_ptr[1];
+ -		batadv_softif_vlan_put(vlan);
+ -	}
+ -
+ -	if (ops->internal_flags & BATADV_FLAG_NEED_MESH && info->user_ptr[0]) {
+ -		bat_priv = info->user_ptr[0];
+ -		dev_put(bat_priv->soft_iface);
+ -	}
+ -}
+ -
+  static const struct genl_ops batadv_netlink_ops[] = {
+  	{
+++<<<<<<< HEAD
+ +		.cmd = BATADV_CMD_GET_MESH_INFO,
+ +		.flags = GENL_ADMIN_PERM,
+ +		.policy = batadv_netlink_policy,
+ +		.doit = batadv_netlink_get_mesh_info,
+++=======
++ 		.cmd = BATADV_CMD_GET_MESH,
++ 		/* can be retrieved by unprivileged users */
++ 		.doit = batadv_netlink_get_mesh,
++ 		.internal_flags = BATADV_FLAG_NEED_MESH,
+++>>>>>>> 3b0f31f2b8c9 (genetlink: make policy common to family)
+  	},
+  	{
+  		.cmd = BATADV_CMD_TP_METER,
+  		.flags = GENL_ADMIN_PERM,
+- 		.policy = batadv_netlink_policy,
+  		.doit = batadv_netlink_tp_meter_start,
+ -		.internal_flags = BATADV_FLAG_NEED_MESH,
+  	},
+  	{
+  		.cmd = BATADV_CMD_TP_METER_CANCEL,
+  		.flags = GENL_ADMIN_PERM,
+- 		.policy = batadv_netlink_policy,
+  		.doit = batadv_netlink_tp_meter_cancel,
+ -		.internal_flags = BATADV_FLAG_NEED_MESH,
+  	},
+  	{
+  		.cmd = BATADV_CMD_GET_ROUTING_ALGOS,
+@@@ -566,11 -1366,12 +571,19 @@@
+  		.dumpit = batadv_algo_dump,
+  	},
+  	{
+++<<<<<<< HEAD
+ +		.cmd = BATADV_CMD_GET_HARDIFS,
+ +		.flags = GENL_ADMIN_PERM,
+ +		.policy = batadv_netlink_policy,
+ +		.dumpit = batadv_netlink_dump_hardifs,
+++=======
++ 		.cmd = BATADV_CMD_GET_HARDIF,
++ 		/* can be retrieved by unprivileged users */
++ 		.dumpit = batadv_netlink_dump_hardif,
++ 		.doit = batadv_netlink_get_hardif,
++ 		.internal_flags = BATADV_FLAG_NEED_MESH |
++ 				  BATADV_FLAG_NEED_HARDIF,
+++>>>>>>> 3b0f31f2b8c9 (genetlink: make policy common to family)
+  	},
+  	{
+  		.cmd = BATADV_CMD_GET_TRANSTABLE_LOCAL,
+@@@ -623,10 -1416,35 +628,39 @@@
+  	{
+  		.cmd = BATADV_CMD_GET_MCAST_FLAGS,
+  		.flags = GENL_ADMIN_PERM,
+- 		.policy = batadv_netlink_policy,
+  		.dumpit = batadv_mcast_flags_dump,
+  	},
+++<<<<<<< HEAD
+ +
+++=======
++ 	{
++ 		.cmd = BATADV_CMD_SET_MESH,
++ 		.flags = GENL_ADMIN_PERM,
++ 		.doit = batadv_netlink_set_mesh,
++ 		.internal_flags = BATADV_FLAG_NEED_MESH,
++ 	},
++ 	{
++ 		.cmd = BATADV_CMD_SET_HARDIF,
++ 		.flags = GENL_ADMIN_PERM,
++ 		.doit = batadv_netlink_set_hardif,
++ 		.internal_flags = BATADV_FLAG_NEED_MESH |
++ 				  BATADV_FLAG_NEED_HARDIF,
++ 	},
++ 	{
++ 		.cmd = BATADV_CMD_GET_VLAN,
++ 		/* can be retrieved by unprivileged users */
++ 		.doit = batadv_netlink_get_vlan,
++ 		.internal_flags = BATADV_FLAG_NEED_MESH |
++ 				  BATADV_FLAG_NEED_VLAN,
++ 	},
++ 	{
++ 		.cmd = BATADV_CMD_SET_VLAN,
++ 		.flags = GENL_ADMIN_PERM,
++ 		.doit = batadv_netlink_set_vlan,
++ 		.internal_flags = BATADV_FLAG_NEED_MESH |
++ 				  BATADV_FLAG_NEED_VLAN,
++ 	},
+++>>>>>>> 3b0f31f2b8c9 (genetlink: make policy common to family)
+  };
+  
+  struct genl_family batadv_netlink_family __ro_after_init = {
+@@@ -634,7 -1452,10 +668,8 @@@
+  	.name = BATADV_NL_NAME,
+  	.version = 1,
+  	.maxattr = BATADV_ATTR_MAX,
++ 	.policy = batadv_netlink_policy,
+  	.netnsok = true,
+ -	.pre_doit = batadv_pre_doit,
+ -	.post_doit = batadv_post_doit,
+  	.module = THIS_MODULE,
+  	.ops = batadv_netlink_ops,
+  	.n_ops = ARRAY_SIZE(batadv_netlink_ops),
+diff --cc net/ncsi/ncsi-netlink.c
+index 82e6edf9c5d9,367b2f6513e0..000000000000
+--- a/net/ncsi/ncsi-netlink.c
++++ b/net/ncsi/ncsi-netlink.c
+@@@ -385,7 -737,21 +383,24 @@@ static const struct genl_ops ncsi_ops[
+  		.doit = ncsi_clear_interface_nl,
+  		.flags = GENL_ADMIN_PERM,
+  	},
+++<<<<<<< HEAD
+++=======
++ 	{
++ 		.cmd = NCSI_CMD_SEND_CMD,
++ 		.doit = ncsi_send_cmd_nl,
++ 		.flags = GENL_ADMIN_PERM,
++ 	},
++ 	{
++ 		.cmd = NCSI_CMD_SET_PACKAGE_MASK,
++ 		.doit = ncsi_set_package_mask_nl,
++ 		.flags = GENL_ADMIN_PERM,
++ 	},
++ 	{
++ 		.cmd = NCSI_CMD_SET_CHANNEL_MASK,
++ 		.doit = ncsi_set_channel_mask_nl,
++ 		.flags = GENL_ADMIN_PERM,
++ 	},
+++>>>>>>> 3b0f31f2b8c9 (genetlink: make policy common to family)
+  };
+  
+  static struct genl_family ncsi_genl_family __ro_after_init = {
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index e769f4352e98..0f17b14536ff 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -2025,22 +2025,18 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
+ static const struct genl_ops nbd_connect_genl_ops[] = {
+ 	{
+ 		.cmd	= NBD_CMD_CONNECT,
+-		.policy	= nbd_attr_policy,
+ 		.doit	= nbd_genl_connect,
+ 	},
+ 	{
+ 		.cmd	= NBD_CMD_DISCONNECT,
+-		.policy	= nbd_attr_policy,
+ 		.doit	= nbd_genl_disconnect,
+ 	},
+ 	{
+ 		.cmd	= NBD_CMD_RECONFIGURE,
+-		.policy	= nbd_attr_policy,
+ 		.doit	= nbd_genl_reconfigure,
+ 	},
+ 	{
+ 		.cmd	= NBD_CMD_STATUS,
+-		.policy	= nbd_attr_policy,
+ 		.doit	= nbd_genl_status,
+ 	},
+ };
+@@ -2057,6 +2053,7 @@ static struct genl_family nbd_genl_family __ro_after_init = {
+ 	.ops		= nbd_connect_genl_ops,
+ 	.n_ops		= ARRAY_SIZE(nbd_connect_genl_ops),
+ 	.maxattr	= NBD_ATTR_MAX,
++	.policy = nbd_attr_policy,
+ 	.mcgrps		= nbd_mcast_grps,
+ 	.n_mcgrps	= ARRAY_SIZE(nbd_mcast_grps),
+ };
+diff --git a/drivers/net/gtp.c b/drivers/net/gtp.c
+index ec629a730005..61d28e17290f 100644
+--- a/drivers/net/gtp.c
++++ b/drivers/net/gtp.c
+@@ -1271,20 +1271,17 @@ static const struct genl_ops gtp_genl_ops[] = {
+ 	{
+ 		.cmd = GTP_CMD_NEWPDP,
+ 		.doit = gtp_genl_new_pdp,
+-		.policy = gtp_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = GTP_CMD_DELPDP,
+ 		.doit = gtp_genl_del_pdp,
+-		.policy = gtp_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = GTP_CMD_GETPDP,
+ 		.doit = gtp_genl_get_pdp,
+ 		.dumpit = gtp_genl_dump_pdp,
+-		.policy = gtp_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+@@ -1294,6 +1291,7 @@ static struct genl_family gtp_genl_family __ro_after_init = {
+ 	.version	= 0,
+ 	.hdrsize	= 0,
+ 	.maxattr	= GTPA_MAX,
++	.policy = gtp_genl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.ops		= gtp_genl_ops,
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+diff --git a/drivers/net/macsec.c b/drivers/net/macsec.c
+index 590f48f56360..b7704a11a4e5 100644
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@ -2638,60 +2638,50 @@ static const struct genl_ops macsec_genl_ops[] = {
+ 	{
+ 		.cmd = MACSEC_CMD_GET_TXSC,
+ 		.dumpit = macsec_dump_txsc,
+-		.policy = macsec_genl_policy,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_ADD_RXSC,
+ 		.doit = macsec_add_rxsc,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_DEL_RXSC,
+ 		.doit = macsec_del_rxsc,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_UPD_RXSC,
+ 		.doit = macsec_upd_rxsc,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_ADD_TXSA,
+ 		.doit = macsec_add_txsa,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_DEL_TXSA,
+ 		.doit = macsec_del_txsa,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_UPD_TXSA,
+ 		.doit = macsec_upd_txsa,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_ADD_RXSA,
+ 		.doit = macsec_add_rxsa,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_DEL_RXSA,
+ 		.doit = macsec_del_rxsa,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = MACSEC_CMD_UPD_RXSA,
+ 		.doit = macsec_upd_rxsa,
+-		.policy = macsec_genl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+@@ -2701,6 +2691,7 @@ static struct genl_family macsec_fam __ro_after_init = {
+ 	.hdrsize	= 0,
+ 	.version	= MACSEC_GENL_VERSION,
+ 	.maxattr	= MACSEC_ATTR_MAX,
++	.policy = macsec_genl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.ops		= macsec_genl_ops,
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 14f06bc02f1b..457e767fb161 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -2776,24 +2776,20 @@ static const struct genl_ops team_nl_ops[] = {
+ 	{
+ 		.cmd = TEAM_CMD_NOOP,
+ 		.doit = team_nl_cmd_noop,
+-		.policy = team_nl_policy,
+ 	},
+ 	{
+ 		.cmd = TEAM_CMD_OPTIONS_SET,
+ 		.doit = team_nl_cmd_options_set,
+-		.policy = team_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = TEAM_CMD_OPTIONS_GET,
+ 		.doit = team_nl_cmd_options_get,
+-		.policy = team_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = TEAM_CMD_PORT_LIST_GET,
+ 		.doit = team_nl_cmd_port_list_get,
+-		.policy = team_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+@@ -2806,6 +2802,7 @@ static struct genl_family team_nl_family __ro_after_init = {
+ 	.name		= TEAM_GENL_NAME,
+ 	.version	= TEAM_GENL_VERSION,
+ 	.maxattr	= TEAM_ATTR_MAX,
++	.policy = team_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.ops		= team_nl_ops,
+diff --git a/drivers/net/wireless/mac80211_hwsim.c b/drivers/net/wireless/mac80211_hwsim.c
+index d8266956df1f..7230ee7d2d88 100644
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@ -3387,35 +3387,29 @@ static int hwsim_dump_radio_nl(struct sk_buff *skb,
+ static const struct genl_ops hwsim_ops[] = {
+ 	{
+ 		.cmd = HWSIM_CMD_REGISTER,
+-		.policy = hwsim_genl_policy,
+ 		.doit = hwsim_register_received_nl,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = HWSIM_CMD_FRAME,
+-		.policy = hwsim_genl_policy,
+ 		.doit = hwsim_cloned_frame_received_nl,
+ 	},
+ 	{
+ 		.cmd = HWSIM_CMD_TX_INFO_FRAME,
+-		.policy = hwsim_genl_policy,
+ 		.doit = hwsim_tx_info_frame_received_nl,
+ 	},
+ 	{
+ 		.cmd = HWSIM_CMD_NEW_RADIO,
+-		.policy = hwsim_genl_policy,
+ 		.doit = hwsim_new_radio_nl,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = HWSIM_CMD_DEL_RADIO,
+-		.policy = hwsim_genl_policy,
+ 		.doit = hwsim_del_radio_nl,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = HWSIM_CMD_GET_RADIO,
+-		.policy = hwsim_genl_policy,
+ 		.doit = hwsim_get_radio_nl,
+ 		.dumpit = hwsim_dump_radio_nl,
+ 	},
+@@ -3425,6 +3419,7 @@ static struct genl_family hwsim_genl_family __ro_after_init = {
+ 	.name = "MAC80211_HWSIM",
+ 	.version = 1,
+ 	.maxattr = HWSIM_ATTR_MAX,
++	.policy = hwsim_genl_policy,
+ 	.netnsok = true,
+ 	.module = THIS_MODULE,
+ 	.ops = hwsim_ops,
+diff --git a/drivers/target/target_core_user.c b/drivers/target/target_core_user.c
+index 9704b135a7bc..481d371c4b01 100644
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@ -442,25 +442,21 @@ static const struct genl_ops tcmu_genl_ops[] = {
+ 	{
+ 		.cmd	= TCMU_CMD_SET_FEATURES,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= tcmu_attr_policy,
+ 		.doit	= tcmu_genl_set_features,
+ 	},
+ 	{
+ 		.cmd	= TCMU_CMD_ADDED_DEVICE_DONE,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= tcmu_attr_policy,
+ 		.doit	= tcmu_genl_add_dev_done,
+ 	},
+ 	{
+ 		.cmd	= TCMU_CMD_REMOVED_DEVICE_DONE,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= tcmu_attr_policy,
+ 		.doit	= tcmu_genl_rm_dev_done,
+ 	},
+ 	{
+ 		.cmd	= TCMU_CMD_RECONFIG_DEVICE_DONE,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= tcmu_attr_policy,
+ 		.doit	= tcmu_genl_reconfig_dev_done,
+ 	},
+ };
+@@ -472,6 +468,7 @@ static struct genl_family tcmu_genl_family __ro_after_init = {
+ 	.name = "TCM-USER",
+ 	.version = 2,
+ 	.maxattr = TCMU_ATTR_MAX,
++	.policy = tcmu_attr_policy,
+ 	.mcgrps = tcmu_mcgrps,
+ 	.n_mcgrps = ARRAY_SIZE(tcmu_mcgrps),
+ 	.netnsok = true,
+diff --git a/include/linux/genl_magic_func.h b/include/linux/genl_magic_func.h
+index 83f81ac53282..6cb82301d8e9 100644
+--- a/include/linux/genl_magic_func.h
++++ b/include/linux/genl_magic_func.h
+@@ -233,7 +233,6 @@ const char *CONCAT_(GENL_MAGIC_FAMILY, _genl_cmd_to_str)(__u8 cmd)
+ {								\
+ 	handler							\
+ 	.cmd = op_name,						\
+-	.policy	= CONCAT_(GENL_MAGIC_FAMILY, _tla_nl_policy),	\
+ },
+ 
+ #define ZZZ_genl_ops		CONCAT_(GENL_MAGIC_FAMILY, _genl_ops)
+@@ -290,7 +289,8 @@ static struct genl_family ZZZ_genl_family __ro_after_init = {
+ #ifdef GENL_MAGIC_FAMILY_HDRSZ
+ 	.hdrsize = NLA_ALIGN(GENL_MAGIC_FAMILY_HDRSZ),
+ #endif
+-	.maxattr = ARRAY_SIZE(drbd_tla_nl_policy)-1,
++	.maxattr = ARRAY_SIZE(CONCAT_(GENL_MAGIC_FAMILY, _tla_nl_policy))-1,
++	.policy	= CONCAT_(GENL_MAGIC_FAMILY, _tla_nl_policy),
+ 	.ops = ZZZ_genl_ops,
+ 	.n_ops = ARRAY_SIZE(ZZZ_genl_ops),
+ 	.mcgrps = ZZZ_genl_mcgrps,
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index 22f49598a574..ffd0d5ea157e 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -28,6 +28,7 @@ struct genl_info;
+  * @name: name of family
+  * @version: protocol version
+  * @maxattr: maximum number of attributes supported
++ * @policy: netlink policy
+  * @netnsok: set to true if the family can handle network
+  *	namespaces and should be presented in all of them
+  * @parallel_ops: operations can be called in parallel and aren't
+@@ -58,6 +59,7 @@ struct genl_family {
+ 	unsigned int		maxattr;
+ 	bool			netnsok;
+ 	bool			parallel_ops;
++	const struct nla_policy *policy;
+ 	int			(*pre_doit)(const struct genl_ops *ops,
+ 					    struct sk_buff *skb,
+ 					    struct genl_info *info);
+@@ -138,14 +140,12 @@ struct genl_ops_extended_rh {
+  * @cmd: command identifier
+  * @internal_flags: flags used by the family
+  * @flags: flags
+- * @policy: attribute validation policy
+  * @doit: standard command callback
+  * @start: start callback for dumps
+  * @dumpit: callback for dumpers
+  * @done: completion callback for dumps
+  */
+ struct genl_ops {
+-	const struct nla_policy	*policy;
+ 	int		       (*doit)(struct sk_buff *skb,
+ 				       struct genl_info *info);
+ 	int		       (*start)(struct netlink_callback *cb);
+diff --git a/kernel/taskstats.c b/kernel/taskstats.c
+index 4e62a4a8fa91..1b942a7caf26 100644
+--- a/kernel/taskstats.c
++++ b/kernel/taskstats.c
+@@ -650,16 +650,37 @@ static const struct genl_ops taskstats_ops[] = {
+ 	{
+ 		.cmd		= TASKSTATS_CMD_GET,
+ 		.doit		= taskstats_user_cmd,
+-		.policy		= taskstats_cmd_get_policy,
+-		.flags		= GENL_ADMIN_PERM,
++		/* policy enforced later */
++		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_HASPOL,
+ 	},
+ 	{
+ 		.cmd		= CGROUPSTATS_CMD_GET,
+ 		.doit		= cgroupstats_user_cmd,
+-		.policy		= cgroupstats_cmd_get_policy,
++		/* policy enforced later */
++		.flags		= GENL_CMD_CAP_HASPOL,
+ 	},
+ };
+ 
++static int taskstats_pre_doit(const struct genl_ops *ops, struct sk_buff *skb,
++			      struct genl_info *info)
++{
++	const struct nla_policy *policy = NULL;
++
++	switch (ops->cmd) {
++	case TASKSTATS_CMD_GET:
++		policy = taskstats_cmd_get_policy;
++		break;
++	case CGROUPSTATS_CMD_GET:
++		policy = cgroupstats_cmd_get_policy;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return nlmsg_validate(info->nlhdr, GENL_HDRLEN, TASKSTATS_CMD_ATTR_MAX,
++			      policy, info->extack);
++}
++
+ static struct genl_family family __ro_after_init = {
+ 	.name		= TASKSTATS_GENL_NAME,
+ 	.version	= TASKSTATS_GENL_VERSION,
+@@ -667,6 +688,7 @@ static struct genl_family family __ro_after_init = {
+ 	.module		= THIS_MODULE,
+ 	.ops		= taskstats_ops,
+ 	.n_ops		= ARRAY_SIZE(taskstats_ops),
++	.pre_doit	= taskstats_pre_doit,
+ };
+ 
+ /* Needed early in initialization */
+* Unmerged path net/batman-adv/netlink.c
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index d12ffdf1735e..e6e314666cb4 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -3653,7 +3653,6 @@ static int devlink_nl_cmd_region_read_dumpit(struct sk_buff *skb,
+ 					     struct netlink_callback *cb)
+ {
+ 	u64 ret_offset, start_offset, end_offset = 0;
+-	const struct genl_ops *ops = cb->data;
+ 	struct devlink_region *region;
+ 	struct nlattr *chunks_attr;
+ 	const char *region_name;
+@@ -3670,7 +3669,8 @@ static int devlink_nl_cmd_region_read_dumpit(struct sk_buff *skb,
+ 		return -ENOMEM;
+ 
+ 	err = nlmsg_parse(cb->nlh, GENL_HDRLEN + devlink_nl_family.hdrsize,
+-			  attrs, DEVLINK_ATTR_MAX, ops->policy, cb->extack);
++			  attrs, DEVLINK_ATTR_MAX, devlink_nl_family.policy,
++			  cb->extack);
+ 	if (err)
+ 		goto out_free;
+ 
+@@ -4942,7 +4942,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_GET,
+ 		.doit = devlink_nl_cmd_get_doit,
+ 		.dumpit = devlink_nl_cmd_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+@@ -4950,21 +4949,18 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_PORT_GET,
+ 		.doit = devlink_nl_cmd_port_get_doit,
+ 		.dumpit = devlink_nl_cmd_port_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_PORT_SET,
+ 		.doit = devlink_nl_cmd_port_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_PORT_SPLIT,
+ 		.doit = devlink_nl_cmd_port_split_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NO_LOCK,
+@@ -4972,7 +4968,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_PORT_UNSPLIT,
+ 		.doit = devlink_nl_cmd_port_unsplit_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NO_LOCK,
+@@ -4981,7 +4976,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_SB_GET,
+ 		.doit = devlink_nl_cmd_sb_get_doit,
+ 		.dumpit = devlink_nl_cmd_sb_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+ 		/* can be retrieved by unprivileged users */
+@@ -4990,7 +4984,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_SB_POOL_GET,
+ 		.doit = devlink_nl_cmd_sb_pool_get_doit,
+ 		.dumpit = devlink_nl_cmd_sb_pool_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+ 		/* can be retrieved by unprivileged users */
+@@ -4998,7 +4991,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_SB_POOL_SET,
+ 		.doit = devlink_nl_cmd_sb_pool_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+@@ -5007,7 +4999,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_SB_PORT_POOL_GET,
+ 		.doit = devlink_nl_cmd_sb_port_pool_get_doit,
+ 		.dumpit = devlink_nl_cmd_sb_port_pool_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+ 		/* can be retrieved by unprivileged users */
+@@ -5015,7 +5006,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_SB_PORT_POOL_SET,
+ 		.doit = devlink_nl_cmd_sb_port_pool_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+@@ -5024,7 +5014,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_SB_TC_POOL_BIND_GET,
+ 		.doit = devlink_nl_cmd_sb_tc_pool_bind_get_doit,
+ 		.dumpit = devlink_nl_cmd_sb_tc_pool_bind_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+ 		/* can be retrieved by unprivileged users */
+@@ -5032,7 +5021,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_SB_TC_POOL_BIND_SET,
+ 		.doit = devlink_nl_cmd_sb_tc_pool_bind_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+@@ -5040,7 +5028,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_SB_OCC_SNAPSHOT,
+ 		.doit = devlink_nl_cmd_sb_occ_snapshot_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+@@ -5048,7 +5035,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_SB_OCC_MAX_CLEAR,
+ 		.doit = devlink_nl_cmd_sb_occ_max_clear_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NEED_SB,
+@@ -5056,14 +5042,12 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_ESWITCH_GET,
+ 		.doit = devlink_nl_cmd_eswitch_get_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_ESWITCH_SET,
+ 		.doit = devlink_nl_cmd_eswitch_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NO_LOCK,
+@@ -5071,49 +5055,42 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_DPIPE_TABLE_GET,
+ 		.doit = devlink_nl_cmd_dpipe_table_get,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_DPIPE_ENTRIES_GET,
+ 		.doit = devlink_nl_cmd_dpipe_entries_get,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_DPIPE_HEADERS_GET,
+ 		.doit = devlink_nl_cmd_dpipe_headers_get,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_DPIPE_TABLE_COUNTERS_SET,
+ 		.doit = devlink_nl_cmd_dpipe_table_counters_set,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_RESOURCE_SET,
+ 		.doit = devlink_nl_cmd_resource_set,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_RESOURCE_DUMP,
+ 		.doit = devlink_nl_cmd_resource_dump,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_RELOAD,
+ 		.doit = devlink_nl_cmd_reload,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NO_LOCK,
+@@ -5122,14 +5099,12 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_PARAM_GET,
+ 		.doit = devlink_nl_cmd_param_get_doit,
+ 		.dumpit = devlink_nl_cmd_param_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_PARAM_SET,
+ 		.doit = devlink_nl_cmd_param_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+@@ -5137,14 +5112,12 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_PORT_PARAM_GET,
+ 		.doit = devlink_nl_cmd_port_param_get_doit,
+ 		.dumpit = devlink_nl_cmd_port_param_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_PORT_PARAM_SET,
+ 		.doit = devlink_nl_cmd_port_param_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_PORT,
+ 	},
+@@ -5152,21 +5125,18 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_REGION_GET,
+ 		.doit = devlink_nl_cmd_region_get_doit,
+ 		.dumpit = devlink_nl_cmd_region_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_REGION_DEL,
+ 		.doit = devlink_nl_cmd_region_del,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_REGION_READ,
+ 		.dumpit = devlink_nl_cmd_region_read_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+@@ -5174,7 +5144,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_INFO_GET,
+ 		.doit = devlink_nl_cmd_info_get_doit,
+ 		.dumpit = devlink_nl_cmd_info_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+@@ -5182,35 +5151,30 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 		.cmd = DEVLINK_CMD_HEALTH_REPORTER_GET,
+ 		.doit = devlink_nl_cmd_health_reporter_get_doit,
+ 		.dumpit = devlink_nl_cmd_health_reporter_get_dumpit,
+-		.policy = devlink_nl_policy,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_HEALTH_REPORTER_SET,
+ 		.doit = devlink_nl_cmd_health_reporter_set_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_HEALTH_REPORTER_RECOVER,
+ 		.doit = devlink_nl_cmd_health_reporter_recover_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_HEALTH_REPORTER_DIAGNOSE,
+ 		.doit = devlink_nl_cmd_health_reporter_diagnose_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+ 	{
+ 		.cmd = DEVLINK_CMD_HEALTH_REPORTER_DUMP_GET,
+ 		.doit = devlink_nl_cmd_health_reporter_dump_get_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NO_LOCK,
+@@ -5218,7 +5182,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_HEALTH_REPORTER_DUMP_CLEAR,
+ 		.doit = devlink_nl_cmd_health_reporter_dump_clear_doit,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+ 				  DEVLINK_NL_FLAG_NO_LOCK,
+@@ -5226,7 +5189,6 @@ static const struct genl_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_FLASH_UPDATE,
+ 		.doit = devlink_nl_cmd_flash_update,
+-		.policy = devlink_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+ 	},
+@@ -5236,6 +5198,7 @@ static struct genl_family devlink_nl_family __ro_after_init = {
+ 	.name		= DEVLINK_GENL_NAME,
+ 	.version	= DEVLINK_GENL_VERSION,
+ 	.maxattr	= DEVLINK_ATTR_MAX,
++	.policy = devlink_nl_policy,
+ 	.netnsok	= true,
+ 	.pre_doit	= devlink_nl_pre_doit,
+ 	.post_doit	= devlink_nl_post_doit,
+diff --git a/net/hsr/hsr_netlink.c b/net/hsr/hsr_netlink.c
+index b9cce0fd5696..bcc04d3e724f 100644
+--- a/net/hsr/hsr_netlink.c
++++ b/net/hsr/hsr_netlink.c
+@@ -449,14 +449,12 @@ static const struct genl_ops hsr_ops[] = {
+ 	{
+ 		.cmd = HSR_C_GET_NODE_STATUS,
+ 		.flags = 0,
+-		.policy = hsr_genl_policy,
+ 		.doit = hsr_get_node_status,
+ 		.dumpit = NULL,
+ 	},
+ 	{
+ 		.cmd = HSR_C_GET_NODE_LIST,
+ 		.flags = 0,
+-		.policy = hsr_genl_policy,
+ 		.doit = hsr_get_node_list,
+ 		.dumpit = NULL,
+ 	},
+@@ -467,6 +465,7 @@ static struct genl_family hsr_genl_family __ro_after_init = {
+ 	.name = "HSR",
+ 	.version = 1,
+ 	.maxattr = HSR_A_MAX,
++	.policy = hsr_genl_policy,
+ 	.module = THIS_MODULE,
+ 	.ops = hsr_ops,
+ 	.n_ops = ARRAY_SIZE(hsr_ops),
+diff --git a/net/ieee802154/ieee802154.h b/net/ieee802154/ieee802154.h
+index a5d7515b7f62..bc147bc8e36a 100644
+--- a/net/ieee802154/ieee802154.h
++++ b/net/ieee802154/ieee802154.h
+@@ -20,7 +20,6 @@ void ieee802154_nl_exit(void);
+ #define IEEE802154_OP(_cmd, _func)			\
+ 	{						\
+ 		.cmd	= _cmd,				\
+-		.policy	= ieee802154_policy,		\
+ 		.doit	= _func,			\
+ 		.dumpit	= NULL,				\
+ 		.flags	= GENL_ADMIN_PERM,		\
+@@ -29,7 +28,6 @@ void ieee802154_nl_exit(void);
+ #define IEEE802154_DUMP(_cmd, _func, _dump)		\
+ 	{						\
+ 		.cmd	= _cmd,				\
+-		.policy	= ieee802154_policy,		\
+ 		.doit	= _func,			\
+ 		.dumpit	= _dump,			\
+ 	}
+diff --git a/net/ieee802154/netlink.c b/net/ieee802154/netlink.c
+index 96636e3b7aa9..098d67439b6d 100644
+--- a/net/ieee802154/netlink.c
++++ b/net/ieee802154/netlink.c
+@@ -136,6 +136,7 @@ struct genl_family nl802154_family __ro_after_init = {
+ 	.name		= IEEE802154_NL_NAME,
+ 	.version	= 1,
+ 	.maxattr	= IEEE802154_ATTR_MAX,
++	.policy		= ieee802154_policy,
+ 	.module		= THIS_MODULE,
+ 	.ops		= ieee802154_ops,
+ 	.n_ops		= ARRAY_SIZE(ieee802154_ops),
+diff --git a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
+index 99f6c254ea77..308370cfd668 100644
+--- a/net/ieee802154/nl802154.c
++++ b/net/ieee802154/nl802154.c
+@@ -2220,7 +2220,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.doit = nl802154_get_wpan_phy,
+ 		.dumpit = nl802154_dump_wpan_phy,
+ 		.done = nl802154_dump_wpan_phy_done,
+-		.policy = nl802154_policy,
+ 		/* can be retrieved by unprivileged users */
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2229,7 +2228,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.cmd = NL802154_CMD_GET_INTERFACE,
+ 		.doit = nl802154_get_interface,
+ 		.dumpit = nl802154_dump_interface,
+-		.policy = nl802154_policy,
+ 		/* can be retrieved by unprivileged users */
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_DEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2237,7 +2235,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_NEW_INTERFACE,
+ 		.doit = nl802154_new_interface,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2245,7 +2242,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_DEL_INTERFACE,
+ 		.doit = nl802154_del_interface,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_DEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2253,7 +2249,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_CHANNEL,
+ 		.doit = nl802154_set_channel,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2261,7 +2256,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_CCA_MODE,
+ 		.doit = nl802154_set_cca_mode,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2269,7 +2263,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_CCA_ED_LEVEL,
+ 		.doit = nl802154_set_cca_ed_level,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2277,7 +2270,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_TX_POWER,
+ 		.doit = nl802154_set_tx_power,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2285,7 +2277,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_WPAN_PHY_NETNS,
+ 		.doit = nl802154_wpan_phy_netns,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_WPAN_PHY |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2293,7 +2284,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_PAN_ID,
+ 		.doit = nl802154_set_pan_id,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2301,7 +2291,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_SHORT_ADDR,
+ 		.doit = nl802154_set_short_addr,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2309,7 +2298,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_BACKOFF_EXPONENT,
+ 		.doit = nl802154_set_backoff_exponent,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2317,7 +2305,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_MAX_CSMA_BACKOFFS,
+ 		.doit = nl802154_set_max_csma_backoffs,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2325,7 +2312,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_MAX_FRAME_RETRIES,
+ 		.doit = nl802154_set_max_frame_retries,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2333,7 +2319,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_LBT_MODE,
+ 		.doit = nl802154_set_lbt_mode,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2341,7 +2326,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_ACKREQ_DEFAULT,
+ 		.doit = nl802154_set_ackreq_default,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2350,7 +2334,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_SET_SEC_PARAMS,
+ 		.doit = nl802154_set_llsec_params,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2359,7 +2342,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.cmd = NL802154_CMD_GET_SEC_KEY,
+ 		/* TODO .doit by matching key id? */
+ 		.dumpit = nl802154_dump_llsec_key,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2367,7 +2349,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_NEW_SEC_KEY,
+ 		.doit = nl802154_add_llsec_key,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2375,7 +2356,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_DEL_SEC_KEY,
+ 		.doit = nl802154_del_llsec_key,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2385,7 +2365,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.cmd = NL802154_CMD_GET_SEC_DEV,
+ 		/* TODO .doit by matching extended_addr? */
+ 		.dumpit = nl802154_dump_llsec_dev,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2393,7 +2372,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_NEW_SEC_DEV,
+ 		.doit = nl802154_add_llsec_dev,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2401,7 +2379,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_DEL_SEC_DEV,
+ 		.doit = nl802154_del_llsec_dev,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2411,7 +2388,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.cmd = NL802154_CMD_GET_SEC_DEVKEY,
+ 		/* TODO doit by matching ??? */
+ 		.dumpit = nl802154_dump_llsec_devkey,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2419,7 +2395,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_NEW_SEC_DEVKEY,
+ 		.doit = nl802154_add_llsec_devkey,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2427,7 +2402,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_DEL_SEC_DEVKEY,
+ 		.doit = nl802154_del_llsec_devkey,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2436,7 +2410,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.cmd = NL802154_CMD_GET_SEC_LEVEL,
+ 		/* TODO .doit by matching frame_type? */
+ 		.dumpit = nl802154_dump_llsec_seclevel,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2444,7 +2417,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 	{
+ 		.cmd = NL802154_CMD_NEW_SEC_LEVEL,
+ 		.doit = nl802154_add_llsec_seclevel,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2453,7 +2425,6 @@ static const struct genl_ops nl802154_ops[] = {
+ 		.cmd = NL802154_CMD_DEL_SEC_LEVEL,
+ 		/* TODO match frame_type only? */
+ 		.doit = nl802154_del_llsec_seclevel,
+-		.policy = nl802154_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL802154_FLAG_NEED_NETDEV |
+ 				  NL802154_FLAG_NEED_RTNL,
+@@ -2466,6 +2437,7 @@ static struct genl_family nl802154_fam __ro_after_init = {
+ 	.hdrsize = 0,			/* no private header */
+ 	.version = 1,			/* no particular meaning now */
+ 	.maxattr = NL802154_ATTR_MAX,
++	.policy = nl802154_policy,
+ 	.netnsok = true,
+ 	.pre_doit = nl802154_pre_doit,
+ 	.post_doit = nl802154_post_doit,
+diff --git a/net/ipv4/fou.c b/net/ipv4/fou.c
+index 665f11d7388e..9e5eead90672 100644
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@ -809,20 +809,17 @@ static const struct genl_ops fou_nl_ops[] = {
+ 	{
+ 		.cmd = FOU_CMD_ADD,
+ 		.doit = fou_nl_cmd_add_port,
+-		.policy = fou_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = FOU_CMD_DEL,
+ 		.doit = fou_nl_cmd_rm_port,
+-		.policy = fou_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = FOU_CMD_GET,
+ 		.doit = fou_nl_cmd_get_port,
+ 		.dumpit = fou_nl_dump,
+-		.policy = fou_nl_policy,
+ 	},
+ };
+ 
+@@ -831,6 +828,7 @@ static struct genl_family fou_nl_family __ro_after_init = {
+ 	.name		= FOU_GENL_NAME,
+ 	.version	= FOU_GENL_VERSION,
+ 	.maxattr	= FOU_ATTR_MAX,
++	.policy = fou_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.ops		= fou_nl_ops,
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index 03b51cdcc731..8ef3a585749e 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -953,12 +953,10 @@ static const struct genl_ops tcp_metrics_nl_ops[] = {
+ 		.cmd = TCP_METRICS_CMD_GET,
+ 		.doit = tcp_metrics_nl_cmd_get,
+ 		.dumpit = tcp_metrics_nl_dump,
+-		.policy = tcp_metrics_nl_policy,
+ 	},
+ 	{
+ 		.cmd = TCP_METRICS_CMD_DEL,
+ 		.doit = tcp_metrics_nl_cmd_del,
+-		.policy = tcp_metrics_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+@@ -968,6 +966,7 @@ static struct genl_family tcp_metrics_nl_family __ro_after_init = {
+ 	.name		= TCP_METRICS_GENL_NAME,
+ 	.version	= TCP_METRICS_GENL_VERSION,
+ 	.maxattr	= TCP_METRICS_ATTR_MAX,
++	.policy = tcp_metrics_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.ops		= tcp_metrics_nl_ops,
+diff --git a/net/ipv6/ila/ila_main.c b/net/ipv6/ila/ila_main.c
+index 18fac76b9520..8d31a5066d0c 100644
+--- a/net/ipv6/ila/ila_main.c
++++ b/net/ipv6/ila/ila_main.c
+@@ -17,19 +17,16 @@ static const struct genl_ops ila_nl_ops[] = {
+ 	{
+ 		.cmd = ILA_CMD_ADD,
+ 		.doit = ila_xlat_nl_cmd_add_mapping,
+-		.policy = ila_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = ILA_CMD_DEL,
+ 		.doit = ila_xlat_nl_cmd_del_mapping,
+-		.policy = ila_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = ILA_CMD_FLUSH,
+ 		.doit = ila_xlat_nl_cmd_flush,
+-		.policy = ila_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+@@ -38,7 +35,6 @@ static const struct genl_ops ila_nl_ops[] = {
+ 		.start = ila_xlat_nl_dump_start,
+ 		.dumpit = ila_xlat_nl_dump,
+ 		.done = ila_xlat_nl_dump_done,
+-		.policy = ila_nl_policy,
+ 	},
+ };
+ 
+@@ -49,6 +45,7 @@ struct genl_family ila_nl_family __ro_after_init = {
+ 	.name		= ILA_GENL_NAME,
+ 	.version	= ILA_GENL_VERSION,
+ 	.maxattr	= ILA_ATTR_MAX,
++	.policy = ila_nl_policy,
+ 	.netnsok	= true,
+ 	.parallel_ops	= true,
+ 	.module		= THIS_MODULE,
+diff --git a/net/ipv6/seg6.c b/net/ipv6/seg6.c
+index 9b2f272ca164..ceff773471e7 100644
+--- a/net/ipv6/seg6.c
++++ b/net/ipv6/seg6.c
+@@ -399,7 +399,6 @@ static const struct genl_ops seg6_genl_ops[] = {
+ 	{
+ 		.cmd	= SEG6_CMD_SETHMAC,
+ 		.doit	= seg6_genl_sethmac,
+-		.policy	= seg6_genl_policy,
+ 		.flags	= GENL_ADMIN_PERM,
+ 	},
+ 	{
+@@ -407,19 +406,16 @@ static const struct genl_ops seg6_genl_ops[] = {
+ 		.start	= seg6_genl_dumphmac_start,
+ 		.dumpit	= seg6_genl_dumphmac,
+ 		.done	= seg6_genl_dumphmac_done,
+-		.policy	= seg6_genl_policy,
+ 		.flags	= GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd	= SEG6_CMD_SET_TUNSRC,
+ 		.doit	= seg6_genl_set_tunsrc,
+-		.policy	= seg6_genl_policy,
+ 		.flags	= GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd	= SEG6_CMD_GET_TUNSRC,
+ 		.doit	= seg6_genl_get_tunsrc,
+-		.policy = seg6_genl_policy,
+ 		.flags	= GENL_ADMIN_PERM,
+ 	},
+ };
+@@ -429,6 +425,7 @@ static struct genl_family seg6_genl_family __ro_after_init = {
+ 	.name		= SEG6_GENL_NAME,
+ 	.version	= SEG6_GENL_VERSION,
+ 	.maxattr	= SEG6_ATTR_MAX,
++	.policy = seg6_genl_policy,
+ 	.netnsok	= true,
+ 	.parallel_ops	= true,
+ 	.ops		= seg6_genl_ops,
+diff --git a/net/l2tp/l2tp_netlink.c b/net/l2tp/l2tp_netlink.c
+index 5b9900889e31..e71a4d159a22 100644
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -945,57 +945,48 @@ static const struct genl_ops l2tp_nl_ops[] = {
+ 	{
+ 		.cmd = L2TP_CMD_NOOP,
+ 		.doit = l2tp_nl_cmd_noop,
+-		.policy = l2tp_nl_policy,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_TUNNEL_CREATE,
+ 		.doit = l2tp_nl_cmd_tunnel_create,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_TUNNEL_DELETE,
+ 		.doit = l2tp_nl_cmd_tunnel_delete,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_TUNNEL_MODIFY,
+ 		.doit = l2tp_nl_cmd_tunnel_modify,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_TUNNEL_GET,
+ 		.doit = l2tp_nl_cmd_tunnel_get,
+ 		.dumpit = l2tp_nl_cmd_tunnel_dump,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_SESSION_CREATE,
+ 		.doit = l2tp_nl_cmd_session_create,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_SESSION_DELETE,
+ 		.doit = l2tp_nl_cmd_session_delete,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_SESSION_MODIFY,
+ 		.doit = l2tp_nl_cmd_session_modify,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = L2TP_CMD_SESSION_GET,
+ 		.doit = l2tp_nl_cmd_session_get,
+ 		.dumpit = l2tp_nl_cmd_session_dump,
+-		.policy = l2tp_nl_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+@@ -1005,6 +996,7 @@ static struct genl_family l2tp_nl_family __ro_after_init = {
+ 	.version	= L2TP_GENL_VERSION,
+ 	.hdrsize	= 0,
+ 	.maxattr	= L2TP_ATTR_MAX,
++	.policy = l2tp_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.ops		= l2tp_nl_ops,
+* Unmerged path net/ncsi/ncsi-netlink.c
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index cba808405e0a..6095bd8b30f9 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -3764,19 +3764,16 @@ static const struct genl_ops ip_vs_genl_ops[] = {
+ 	{
+ 		.cmd	= IPVS_CMD_NEW_SERVICE,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_SET_SERVICE,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_DEL_SERVICE,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+@@ -3784,42 +3781,35 @@ static const struct genl_ops ip_vs_genl_ops[] = {
+ 		.flags	= GENL_ADMIN_PERM,
+ 		.doit	= ip_vs_genl_get_cmd,
+ 		.dumpit	= ip_vs_genl_dump_services,
+-		.policy	= ip_vs_cmd_policy,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_NEW_DEST,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_SET_DEST,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_DEL_DEST,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_GET_DEST,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.dumpit	= ip_vs_genl_dump_dests,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_NEW_DAEMON,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_daemon,
+ 	},
+ 	{
+ 		.cmd	= IPVS_CMD_DEL_DAEMON,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_daemon,
+ 	},
+ 	{
+@@ -3830,7 +3820,6 @@ static const struct genl_ops ip_vs_genl_ops[] = {
+ 	{
+ 		.cmd	= IPVS_CMD_SET_CONFIG,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+@@ -3846,7 +3835,6 @@ static const struct genl_ops ip_vs_genl_ops[] = {
+ 	{
+ 		.cmd	= IPVS_CMD_ZERO,
+ 		.flags	= GENL_ADMIN_PERM,
+-		.policy	= ip_vs_cmd_policy,
+ 		.doit	= ip_vs_genl_set_cmd,
+ 	},
+ 	{
+@@ -3861,6 +3849,7 @@ static struct genl_family ip_vs_genl_family __ro_after_init = {
+ 	.name		= IPVS_GENL_NAME,
+ 	.version	= IPVS_GENL_VERSION,
+ 	.maxattr	= IPVS_CMD_ATTR_MAX,
++	.policy = ip_vs_cmd_policy,
+ 	.netnsok        = true,         /* Make ipvsadm to work on netns */
+ 	.module		= THIS_MODULE,
+ 	.ops		= ip_vs_genl_ops,
+diff --git a/net/netlabel/netlabel_calipso.c b/net/netlabel/netlabel_calipso.c
+index 4d748975117d..80184513b2b2 100644
+--- a/net/netlabel/netlabel_calipso.c
++++ b/net/netlabel/netlabel_calipso.c
+@@ -322,28 +322,24 @@ static const struct genl_ops netlbl_calipso_ops[] = {
+ 	{
+ 	.cmd = NLBL_CALIPSO_C_ADD,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = calipso_genl_policy,
+ 	.doit = netlbl_calipso_add,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_CALIPSO_C_REMOVE,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = calipso_genl_policy,
+ 	.doit = netlbl_calipso_remove,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_CALIPSO_C_LIST,
+ 	.flags = 0,
+-	.policy = calipso_genl_policy,
+ 	.doit = netlbl_calipso_list,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_CALIPSO_C_LISTALL,
+ 	.flags = 0,
+-	.policy = calipso_genl_policy,
+ 	.doit = NULL,
+ 	.dumpit = netlbl_calipso_listall,
+ 	},
+@@ -354,6 +350,7 @@ static struct genl_family netlbl_calipso_gnl_family __ro_after_init = {
+ 	.name = NETLBL_NLTYPE_CALIPSO_NAME,
+ 	.version = NETLBL_PROTO_VERSION,
+ 	.maxattr = NLBL_CALIPSO_A_MAX,
++	.policy = calipso_genl_policy,
+ 	.module = THIS_MODULE,
+ 	.ops = netlbl_calipso_ops,
+ 	.n_ops = ARRAY_SIZE(netlbl_calipso_ops),
+diff --git a/net/netlabel/netlabel_cipso_v4.c b/net/netlabel/netlabel_cipso_v4.c
+index 9aacf2da3d98..ba7800f94ccc 100644
+--- a/net/netlabel/netlabel_cipso_v4.c
++++ b/net/netlabel/netlabel_cipso_v4.c
+@@ -734,28 +734,24 @@ static const struct genl_ops netlbl_cipsov4_ops[] = {
+ 	{
+ 	.cmd = NLBL_CIPSOV4_C_ADD,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_cipsov4_genl_policy,
+ 	.doit = netlbl_cipsov4_add,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_CIPSOV4_C_REMOVE,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_cipsov4_genl_policy,
+ 	.doit = netlbl_cipsov4_remove,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_CIPSOV4_C_LIST,
+ 	.flags = 0,
+-	.policy = netlbl_cipsov4_genl_policy,
+ 	.doit = netlbl_cipsov4_list,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_CIPSOV4_C_LISTALL,
+ 	.flags = 0,
+-	.policy = netlbl_cipsov4_genl_policy,
+ 	.doit = NULL,
+ 	.dumpit = netlbl_cipsov4_listall,
+ 	},
+@@ -766,6 +762,7 @@ static struct genl_family netlbl_cipsov4_gnl_family __ro_after_init = {
+ 	.name = NETLBL_NLTYPE_CIPSOV4_NAME,
+ 	.version = NETLBL_PROTO_VERSION,
+ 	.maxattr = NLBL_CIPSOV4_A_MAX,
++	.policy = netlbl_cipsov4_genl_policy,
+ 	.module = THIS_MODULE,
+ 	.ops = netlbl_cipsov4_ops,
+ 	.n_ops = ARRAY_SIZE(netlbl_cipsov4_ops),
+diff --git a/net/netlabel/netlabel_mgmt.c b/net/netlabel/netlabel_mgmt.c
+index 21e0095b1d14..a16eacfb2236 100644
+--- a/net/netlabel/netlabel_mgmt.c
++++ b/net/netlabel/netlabel_mgmt.c
+@@ -773,56 +773,48 @@ static const struct genl_ops netlbl_mgmt_genl_ops[] = {
+ 	{
+ 	.cmd = NLBL_MGMT_C_ADD,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = netlbl_mgmt_add,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_MGMT_C_REMOVE,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = netlbl_mgmt_remove,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_MGMT_C_LISTALL,
+ 	.flags = 0,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = NULL,
+ 	.dumpit = netlbl_mgmt_listall,
+ 	},
+ 	{
+ 	.cmd = NLBL_MGMT_C_ADDDEF,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = netlbl_mgmt_adddef,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_MGMT_C_REMOVEDEF,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = netlbl_mgmt_removedef,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_MGMT_C_LISTDEF,
+ 	.flags = 0,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = netlbl_mgmt_listdef,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_MGMT_C_PROTOCOLS,
+ 	.flags = 0,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = NULL,
+ 	.dumpit = netlbl_mgmt_protocols,
+ 	},
+ 	{
+ 	.cmd = NLBL_MGMT_C_VERSION,
+ 	.flags = 0,
+-	.policy = netlbl_mgmt_genl_policy,
+ 	.doit = netlbl_mgmt_version,
+ 	.dumpit = NULL,
+ 	},
+@@ -833,6 +825,7 @@ static struct genl_family netlbl_mgmt_gnl_family __ro_after_init = {
+ 	.name = NETLBL_NLTYPE_MGMT_NAME,
+ 	.version = NETLBL_PROTO_VERSION,
+ 	.maxattr = NLBL_MGMT_A_MAX,
++	.policy = netlbl_mgmt_genl_policy,
+ 	.module = THIS_MODULE,
+ 	.ops = netlbl_mgmt_genl_ops,
+ 	.n_ops = ARRAY_SIZE(netlbl_mgmt_genl_ops),
+diff --git a/net/netlabel/netlabel_unlabeled.c b/net/netlabel/netlabel_unlabeled.c
+index c92894c3e40a..6b1b6c2b5141 100644
+--- a/net/netlabel/netlabel_unlabeled.c
++++ b/net/netlabel/netlabel_unlabeled.c
+@@ -1318,56 +1318,48 @@ static const struct genl_ops netlbl_unlabel_genl_ops[] = {
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICADD,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = netlbl_unlabel_staticadd,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICREMOVE,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = netlbl_unlabel_staticremove,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICLIST,
+ 	.flags = 0,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = NULL,
+ 	.dumpit = netlbl_unlabel_staticlist,
+ 	},
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICADDDEF,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = netlbl_unlabel_staticadddef,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICREMOVEDEF,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = netlbl_unlabel_staticremovedef,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICLISTDEF,
+ 	.flags = 0,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = NULL,
+ 	.dumpit = netlbl_unlabel_staticlistdef,
+ 	},
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_ACCEPT,
+ 	.flags = GENL_ADMIN_PERM,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = netlbl_unlabel_accept,
+ 	.dumpit = NULL,
+ 	},
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_LIST,
+ 	.flags = 0,
+-	.policy = netlbl_unlabel_genl_policy,
+ 	.doit = netlbl_unlabel_list,
+ 	.dumpit = NULL,
+ 	},
+@@ -1378,6 +1370,7 @@ static struct genl_family netlbl_unlabel_gnl_family __ro_after_init = {
+ 	.name = NETLBL_NLTYPE_UNLABELED_NAME,
+ 	.version = NETLBL_PROTO_VERSION,
+ 	.maxattr = NLBL_UNLABEL_A_MAX,
++	.policy = netlbl_unlabel_genl_policy,
+ 	.module = THIS_MODULE,
+ 	.ops = netlbl_unlabel_genl_ops,
+ 	.n_ops = ARRAY_SIZE(netlbl_unlabel_genl_ops),
+diff --git a/net/netlink/genetlink.c b/net/netlink/genetlink.c
+index f0ec068e1d02..288456090710 100644
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@ -578,7 +578,7 @@ static int genl_family_rcv_msg(const struct genl_family *family,
+ 
+ 	if (attrbuf) {
+ 		err = nlmsg_parse(nlh, hdrlen, attrbuf, family->maxattr,
+-				  ops->policy, extack);
++				  family->policy, extack);
+ 		if (err < 0)
+ 			goto out;
+ 	}
+@@ -678,7 +678,7 @@ static int ctrl_fill_info(const struct genl_family *family, u32 portid, u32 seq,
+ 				op_flags |= GENL_CMD_CAP_DUMP;
+ 			if (ops->doit)
+ 				op_flags |= GENL_CMD_CAP_DO;
+-			if (ops->policy)
++			if (family->policy)
+ 				op_flags |= GENL_CMD_CAP_HASPOL;
+ 
+ 			nest = nla_nest_start(skb, i + 1);
+@@ -940,7 +940,6 @@ static const struct genl_ops genl_ctrl_ops[] = {
+ 		.cmd		= CTRL_CMD_GETFAMILY,
+ 		.doit		= ctrl_getfamily,
+ 		.dumpit		= ctrl_dumpfamily,
+-		.policy		= ctrl_policy,
+ 	},
+ };
+ 
+@@ -958,6 +957,7 @@ static struct genl_family genl_ctrl __ro_after_init = {
+ 	.name = "nlctrl",
+ 	.version = 0x2,
+ 	.maxattr = CTRL_ATTR_MAX,
++	.policy = ctrl_policy,
+ 	.netnsok = true,
+ };
+ 
+diff --git a/net/nfc/netlink.c b/net/nfc/netlink.c
+index 376181cc1def..4d9f3ac8d562 100644
+--- a/net/nfc/netlink.c
++++ b/net/nfc/netlink.c
+@@ -1670,99 +1670,80 @@ static const struct genl_ops nfc_genl_ops[] = {
+ 		.doit = nfc_genl_get_device,
+ 		.dumpit = nfc_genl_dump_devices,
+ 		.done = nfc_genl_dump_devices_done,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_DEV_UP,
+ 		.doit = nfc_genl_dev_up,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_DEV_DOWN,
+ 		.doit = nfc_genl_dev_down,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_START_POLL,
+ 		.doit = nfc_genl_start_poll,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_STOP_POLL,
+ 		.doit = nfc_genl_stop_poll,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_DEP_LINK_UP,
+ 		.doit = nfc_genl_dep_link_up,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_DEP_LINK_DOWN,
+ 		.doit = nfc_genl_dep_link_down,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_GET_TARGET,
+ 		.dumpit = nfc_genl_dump_targets,
+ 		.done = nfc_genl_dump_targets_done,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_LLC_GET_PARAMS,
+ 		.doit = nfc_genl_llc_get_params,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_LLC_SET_PARAMS,
+ 		.doit = nfc_genl_llc_set_params,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_LLC_SDREQ,
+ 		.doit = nfc_genl_llc_sdreq,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_FW_DOWNLOAD,
+ 		.doit = nfc_genl_fw_download,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_ENABLE_SE,
+ 		.doit = nfc_genl_enable_se,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_DISABLE_SE,
+ 		.doit = nfc_genl_disable_se,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_GET_SE,
+ 		.dumpit = nfc_genl_dump_ses,
+ 		.done = nfc_genl_dump_ses_done,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_SE_IO,
+ 		.doit = nfc_genl_se_io,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_ACTIVATE_TARGET,
+ 		.doit = nfc_genl_activate_target,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_VENDOR,
+ 		.doit = nfc_genl_vendor_cmd,
+-		.policy = nfc_genl_policy,
+ 	},
+ 	{
+ 		.cmd = NFC_CMD_DEACTIVATE_TARGET,
+ 		.doit = nfc_genl_deactivate_target,
+-		.policy = nfc_genl_policy,
+ 	},
+ };
+ 
+@@ -1771,6 +1752,7 @@ static struct genl_family nfc_genl_family __ro_after_init = {
+ 	.name = NFC_GENL_NAME,
+ 	.version = NFC_GENL_VERSION,
+ 	.maxattr = NFC_ATTR_MAX,
++	.policy = nfc_genl_policy,
+ 	.module = THIS_MODULE,
+ 	.ops = nfc_genl_ops,
+ 	.n_ops = ARRAY_SIZE(nfc_genl_ops),
+diff --git a/net/openvswitch/conntrack.c b/net/openvswitch/conntrack.c
+index f4b59fc63a75..fa57434a0541 100644
+--- a/net/openvswitch/conntrack.c
++++ b/net/openvswitch/conntrack.c
+@@ -2161,18 +2161,15 @@ static struct genl_ops ct_limit_genl_ops[] = {
+ 	{ .cmd = OVS_CT_LIMIT_CMD_SET,
+ 		.flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN
+ 					   * privilege. */
+-		.policy = ct_limit_policy,
+ 		.doit = ovs_ct_limit_cmd_set,
+ 	},
+ 	{ .cmd = OVS_CT_LIMIT_CMD_DEL,
+ 		.flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN
+ 					   * privilege. */
+-		.policy = ct_limit_policy,
+ 		.doit = ovs_ct_limit_cmd_del,
+ 	},
+ 	{ .cmd = OVS_CT_LIMIT_CMD_GET,
+ 		.flags = 0,		  /* OK for unprivileged users. */
+-		.policy = ct_limit_policy,
+ 		.doit = ovs_ct_limit_cmd_get,
+ 	},
+ };
+@@ -2186,6 +2183,7 @@ struct genl_family dp_ct_limit_genl_family __ro_after_init = {
+ 	.name = OVS_CT_LIMIT_FAMILY,
+ 	.version = OVS_CT_LIMIT_VERSION,
+ 	.maxattr = OVS_CT_LIMIT_ATTR_MAX,
++	.policy = ct_limit_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+ 	.ops = ct_limit_genl_ops,
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 40d80caa4367..828b9cb95621 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -642,7 +642,6 @@ static const struct nla_policy packet_policy[OVS_PACKET_ATTR_MAX + 1] = {
+ static const struct genl_ops dp_packet_genl_ops[] = {
+ 	{ .cmd = OVS_PACKET_CMD_EXECUTE,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = packet_policy,
+ 	  .doit = ovs_packet_cmd_execute
+ 	}
+ };
+@@ -652,6 +651,7 @@ static struct genl_family dp_packet_genl_family __ro_after_init = {
+ 	.name = OVS_PACKET_FAMILY,
+ 	.version = OVS_PACKET_VERSION,
+ 	.maxattr = OVS_PACKET_ATTR_MAX,
++	.policy = packet_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+ 	.ops = dp_packet_genl_ops,
+@@ -1427,23 +1427,19 @@ static const struct nla_policy flow_policy[OVS_FLOW_ATTR_MAX + 1] = {
+ static const struct genl_ops dp_flow_genl_ops[] = {
+ 	{ .cmd = OVS_FLOW_CMD_NEW,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = flow_policy,
+ 	  .doit = ovs_flow_cmd_new
+ 	},
+ 	{ .cmd = OVS_FLOW_CMD_DEL,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = flow_policy,
+ 	  .doit = ovs_flow_cmd_del
+ 	},
+ 	{ .cmd = OVS_FLOW_CMD_GET,
+ 	  .flags = 0,		    /* OK for unprivileged users. */
+-	  .policy = flow_policy,
+ 	  .doit = ovs_flow_cmd_get,
+ 	  .dumpit = ovs_flow_cmd_dump
+ 	},
+ 	{ .cmd = OVS_FLOW_CMD_SET,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = flow_policy,
+ 	  .doit = ovs_flow_cmd_set,
+ 	},
+ };
+@@ -1453,6 +1449,7 @@ static struct genl_family dp_flow_genl_family __ro_after_init = {
+ 	.name = OVS_FLOW_FAMILY,
+ 	.version = OVS_FLOW_VERSION,
+ 	.maxattr = OVS_FLOW_ATTR_MAX,
++	.policy = flow_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+ 	.ops = dp_flow_genl_ops,
+@@ -1820,23 +1817,19 @@ static const struct nla_policy datapath_policy[OVS_DP_ATTR_MAX + 1] = {
+ static const struct genl_ops dp_datapath_genl_ops[] = {
+ 	{ .cmd = OVS_DP_CMD_NEW,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = datapath_policy,
+ 	  .doit = ovs_dp_cmd_new
+ 	},
+ 	{ .cmd = OVS_DP_CMD_DEL,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = datapath_policy,
+ 	  .doit = ovs_dp_cmd_del
+ 	},
+ 	{ .cmd = OVS_DP_CMD_GET,
+ 	  .flags = 0,		    /* OK for unprivileged users. */
+-	  .policy = datapath_policy,
+ 	  .doit = ovs_dp_cmd_get,
+ 	  .dumpit = ovs_dp_cmd_dump
+ 	},
+ 	{ .cmd = OVS_DP_CMD_SET,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = datapath_policy,
+ 	  .doit = ovs_dp_cmd_set,
+ 	},
+ };
+@@ -1846,6 +1839,7 @@ static struct genl_family dp_datapath_genl_family __ro_after_init = {
+ 	.name = OVS_DATAPATH_FAMILY,
+ 	.version = OVS_DATAPATH_VERSION,
+ 	.maxattr = OVS_DP_ATTR_MAX,
++	.policy = datapath_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+ 	.ops = dp_datapath_genl_ops,
+@@ -2263,23 +2257,19 @@ static const struct nla_policy vport_policy[OVS_VPORT_ATTR_MAX + 1] = {
+ static const struct genl_ops dp_vport_genl_ops[] = {
+ 	{ .cmd = OVS_VPORT_CMD_NEW,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = vport_policy,
+ 	  .doit = ovs_vport_cmd_new
+ 	},
+ 	{ .cmd = OVS_VPORT_CMD_DEL,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = vport_policy,
+ 	  .doit = ovs_vport_cmd_del
+ 	},
+ 	{ .cmd = OVS_VPORT_CMD_GET,
+ 	  .flags = 0,		    /* OK for unprivileged users. */
+-	  .policy = vport_policy,
+ 	  .doit = ovs_vport_cmd_get,
+ 	  .dumpit = ovs_vport_cmd_dump
+ 	},
+ 	{ .cmd = OVS_VPORT_CMD_SET,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+-	  .policy = vport_policy,
+ 	  .doit = ovs_vport_cmd_set,
+ 	},
+ };
+@@ -2289,6 +2279,7 @@ struct genl_family dp_vport_genl_family __ro_after_init = {
+ 	.name = OVS_VPORT_FAMILY,
+ 	.version = OVS_VPORT_VERSION,
+ 	.maxattr = OVS_VPORT_ATTR_MAX,
++	.policy = vport_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+ 	.ops = dp_vport_genl_ops,
+diff --git a/net/openvswitch/meter.c b/net/openvswitch/meter.c
+index 43849d752a1e..0be3d097ae01 100644
+--- a/net/openvswitch/meter.c
++++ b/net/openvswitch/meter.c
+@@ -527,26 +527,22 @@ bool ovs_meter_execute(struct datapath *dp, struct sk_buff *skb,
+ static struct genl_ops dp_meter_genl_ops[] = {
+ 	{ .cmd = OVS_METER_CMD_FEATURES,
+ 		.flags = 0,		  /* OK for unprivileged users. */
+-		.policy = meter_policy,
+ 		.doit = ovs_meter_cmd_features
+ 	},
+ 	{ .cmd = OVS_METER_CMD_SET,
+ 		.flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN
+ 					   *  privilege.
+ 					   */
+-		.policy = meter_policy,
+ 		.doit = ovs_meter_cmd_set,
+ 	},
+ 	{ .cmd = OVS_METER_CMD_GET,
+ 		.flags = 0,		  /* OK for unprivileged users. */
+-		.policy = meter_policy,
+ 		.doit = ovs_meter_cmd_get,
+ 	},
+ 	{ .cmd = OVS_METER_CMD_DEL,
+ 		.flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN
+ 					   *  privilege.
+ 					   */
+-		.policy = meter_policy,
+ 		.doit = ovs_meter_cmd_del
+ 	},
+ };
+@@ -560,6 +556,7 @@ struct genl_family dp_meter_genl_family __ro_after_init = {
+ 	.name = OVS_METER_FAMILY,
+ 	.version = OVS_METER_VERSION,
+ 	.maxattr = OVS_METER_ATTR_MAX,
++	.policy = meter_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+ 	.ops = dp_meter_genl_ops,
+diff --git a/net/smc/smc_pnet.c b/net/smc/smc_pnet.c
+index e9b01f53c325..9f5d8f36f2d7 100644
+--- a/net/smc/smc_pnet.c
++++ b/net/smc/smc_pnet.c
+@@ -613,7 +613,6 @@ static const struct genl_ops smc_pnet_ops[] = {
+ 	{
+ 		.cmd = SMC_PNETID_GET,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = smc_pnet_policy,
+ 		.doit = smc_pnet_get,
+ 		.dumpit = smc_pnet_dump,
+ 		.start = smc_pnet_dump_start
+@@ -621,19 +620,16 @@ static const struct genl_ops smc_pnet_ops[] = {
+ 	{
+ 		.cmd = SMC_PNETID_ADD,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = smc_pnet_policy,
+ 		.doit = smc_pnet_add
+ 	},
+ 	{
+ 		.cmd = SMC_PNETID_DEL,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = smc_pnet_policy,
+ 		.doit = smc_pnet_del
+ 	},
+ 	{
+ 		.cmd = SMC_PNETID_FLUSH,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = smc_pnet_policy,
+ 		.doit = smc_pnet_flush
+ 	}
+ };
+@@ -644,6 +640,7 @@ static struct genl_family smc_pnet_nl_family __ro_after_init = {
+ 	.name = SMCR_GENL_FAMILY_NAME,
+ 	.version = SMCR_GENL_FAMILY_VERSION,
+ 	.maxattr = SMC_PNETID_MAX,
++	.policy = smc_pnet_policy,
+ 	.netnsok = true,
+ 	.module = THIS_MODULE,
+ 	.ops = smc_pnet_ops,
+diff --git a/net/tipc/netlink.c b/net/tipc/netlink.c
+index 5240f64e8ccc..2d178df0a89f 100644
+--- a/net/tipc/netlink.c
++++ b/net/tipc/netlink.c
+@@ -144,114 +144,93 @@ static const struct genl_ops tipc_genl_v2_ops[] = {
+ 	{
+ 		.cmd	= TIPC_NL_BEARER_DISABLE,
+ 		.doit	= tipc_nl_bearer_disable,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_BEARER_ENABLE,
+ 		.doit	= tipc_nl_bearer_enable,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_BEARER_GET,
+ 		.doit	= tipc_nl_bearer_get,
+ 		.dumpit	= tipc_nl_bearer_dump,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_BEARER_ADD,
+ 		.doit	= tipc_nl_bearer_add,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_BEARER_SET,
+ 		.doit	= tipc_nl_bearer_set,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_SOCK_GET,
+ 		.start = tipc_dump_start,
+ 		.dumpit	= tipc_nl_sk_dump,
+ 		.done	= tipc_dump_done,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_PUBL_GET,
+ 		.dumpit	= tipc_nl_publ_dump,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_LINK_GET,
+ 		.doit   = tipc_nl_node_get_link,
+ 		.dumpit	= tipc_nl_node_dump_link,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_LINK_SET,
+ 		.doit	= tipc_nl_node_set_link,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_LINK_RESET_STATS,
+ 		.doit   = tipc_nl_node_reset_link_stats,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_MEDIA_GET,
+ 		.doit	= tipc_nl_media_get,
+ 		.dumpit	= tipc_nl_media_dump,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_MEDIA_SET,
+ 		.doit	= tipc_nl_media_set,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_NODE_GET,
+ 		.dumpit	= tipc_nl_node_dump,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_NET_GET,
+ 		.dumpit	= tipc_nl_net_dump,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_NET_SET,
+ 		.doit	= tipc_nl_net_set,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_NAME_TABLE_GET,
+ 		.dumpit	= tipc_nl_name_table_dump,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_MON_SET,
+ 		.doit	= tipc_nl_node_set_monitor,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_MON_GET,
+ 		.doit	= tipc_nl_node_get_monitor,
+ 		.dumpit	= tipc_nl_node_dump_monitor,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_MON_PEER_GET,
+ 		.dumpit	= tipc_nl_node_dump_monitor_peer,
+-		.policy = tipc_nl_policy,
+ 	},
+ 	{
+ 		.cmd	= TIPC_NL_PEER_REMOVE,
+ 		.doit	= tipc_nl_peer_rm,
+-		.policy = tipc_nl_policy,
+ 	},
+ #ifdef CONFIG_TIPC_MEDIA_UDP
+ 	{
+ 		.cmd	= TIPC_NL_UDP_GET_REMOTEIP,
+ 		.dumpit	= tipc_udp_nl_dump_remoteip,
+-		.policy = tipc_nl_policy,
+ 	},
+ #endif
+ };
+@@ -261,6 +240,7 @@ struct genl_family tipc_genl_family __ro_after_init = {
+ 	.version	= TIPC_GENL_V2_VERSION,
+ 	.hdrsize	= 0,
+ 	.maxattr	= TIPC_NLA_MAX,
++	.policy = tipc_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.ops		= tipc_genl_v2_ops,
+diff --git a/net/wimax/stack.c b/net/wimax/stack.c
+index 5db731512014..ef95736efb5c 100644
+--- a/net/wimax/stack.c
++++ b/net/wimax/stack.c
+@@ -420,25 +420,21 @@ static const struct genl_ops wimax_gnl_ops[] = {
+ 	{
+ 		.cmd = WIMAX_GNL_OP_MSG_FROM_USER,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = wimax_gnl_policy,
+ 		.doit = wimax_gnl_doit_msg_from_user,
+ 	},
+ 	{
+ 		.cmd = WIMAX_GNL_OP_RESET,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = wimax_gnl_policy,
+ 		.doit = wimax_gnl_doit_reset,
+ 	},
+ 	{
+ 		.cmd = WIMAX_GNL_OP_RFKILL,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = wimax_gnl_policy,
+ 		.doit = wimax_gnl_doit_rfkill,
+ 	},
+ 	{
+ 		.cmd = WIMAX_GNL_OP_STATE_GET,
+ 		.flags = GENL_ADMIN_PERM,
+-		.policy = wimax_gnl_policy,
+ 		.doit = wimax_gnl_doit_state_get,
+ 	},
+ };
+@@ -581,6 +577,7 @@ struct genl_family wimax_gnl_family __ro_after_init = {
+ 	.version = WIMAX_GNL_VERSION,
+ 	.hdrsize = 0,
+ 	.maxattr = WIMAX_GNL_ATTR_MAX,
++	.policy = wimax_gnl_policy,
+ 	.module = THIS_MODULE,
+ 	.ops = wimax_gnl_ops,
+ 	.n_ops = ARRAY_SIZE(wimax_gnl_ops),
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 7727063700b0..9c71203f87ea 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -13741,7 +13741,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.doit = nl80211_get_wiphy,
+ 		.dumpit = nl80211_dump_wiphy,
+ 		.done = nl80211_dump_wiphy_done,
+-		.policy = nl80211_policy,
+ 		/* can be retrieved by unprivileged users */
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13749,7 +13748,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_WIPHY,
+ 		.doit = nl80211_set_wiphy,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_RTNL,
+ 	},
+@@ -13757,7 +13755,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.cmd = NL80211_CMD_GET_INTERFACE,
+ 		.doit = nl80211_get_interface,
+ 		.dumpit = nl80211_dump_interface,
+-		.policy = nl80211_policy,
+ 		/* can be retrieved by unprivileged users */
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13765,7 +13762,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_INTERFACE,
+ 		.doit = nl80211_set_interface,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13773,7 +13769,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_NEW_INTERFACE,
+ 		.doit = nl80211_new_interface,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13781,7 +13776,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_INTERFACE,
+ 		.doit = nl80211_del_interface,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13789,7 +13783,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_GET_KEY,
+ 		.doit = nl80211_get_key,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13797,7 +13790,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_KEY,
+ 		.doit = nl80211_set_key,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -13806,7 +13798,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_NEW_KEY,
+ 		.doit = nl80211_new_key,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -13815,14 +13806,12 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_KEY,
+ 		.doit = nl80211_del_key,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_SET_BEACON,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.doit = nl80211_set_beacon,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+@@ -13830,7 +13819,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_START_AP,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.doit = nl80211_start_ap,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+@@ -13838,7 +13826,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_STOP_AP,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.doit = nl80211_stop_ap,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+@@ -13848,14 +13835,12 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.cmd = NL80211_CMD_GET_STATION,
+ 		.doit = nl80211_get_station,
+ 		.dumpit = nl80211_dump_station,
+-		.policy = nl80211_policy,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_SET_STATION,
+ 		.doit = nl80211_set_station,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13863,7 +13848,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_NEW_STATION,
+ 		.doit = nl80211_new_station,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13871,7 +13855,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_STATION,
+ 		.doit = nl80211_del_station,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13880,7 +13863,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.cmd = NL80211_CMD_GET_MPATH,
+ 		.doit = nl80211_get_mpath,
+ 		.dumpit = nl80211_dump_mpath,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13889,7 +13871,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.cmd = NL80211_CMD_GET_MPP,
+ 		.doit = nl80211_get_mpp,
+ 		.dumpit = nl80211_dump_mpp,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13897,7 +13878,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_MPATH,
+ 		.doit = nl80211_set_mpath,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13905,7 +13885,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_NEW_MPATH,
+ 		.doit = nl80211_new_mpath,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13913,7 +13892,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_MPATH,
+ 		.doit = nl80211_del_mpath,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13921,7 +13899,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_BSS,
+ 		.doit = nl80211_set_bss,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13930,7 +13907,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.cmd = NL80211_CMD_GET_REG,
+ 		.doit = nl80211_get_reg_do,
+ 		.dumpit = nl80211_get_reg_dump,
+-		.policy = nl80211_policy,
+ 		.internal_flags = NL80211_FLAG_NEED_RTNL,
+ 		/* can be retrieved by unprivileged users */
+ 	},
+@@ -13938,7 +13914,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_REG,
+ 		.doit = nl80211_set_reg,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_RTNL,
+ 	},
+@@ -13946,19 +13921,16 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_REQ_SET_REG,
+ 		.doit = nl80211_req_set_reg,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_RELOAD_REGDB,
+ 		.doit = nl80211_reload_regdb,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_GET_MESH_CONFIG,
+ 		.doit = nl80211_get_mesh_config,
+-		.policy = nl80211_policy,
+ 		/* can be retrieved by unprivileged users */
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13966,7 +13938,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_MESH_CONFIG,
+ 		.doit = nl80211_update_mesh_config,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13974,7 +13945,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_TRIGGER_SCAN,
+ 		.doit = nl80211_trigger_scan,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -13982,20 +13952,17 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_ABORT_SCAN,
+ 		.doit = nl80211_abort_scan,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_GET_SCAN,
+-		.policy = nl80211_policy,
+ 		.dumpit = nl80211_dump_scan,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_START_SCHED_SCAN,
+ 		.doit = nl80211_start_sched_scan,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14003,7 +13970,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_STOP_SCHED_SCAN,
+ 		.doit = nl80211_stop_sched_scan,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14011,7 +13977,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_AUTHENTICATE,
+ 		.doit = nl80211_authenticate,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -14020,7 +13985,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_ASSOCIATE,
+ 		.doit = nl80211_associate,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -14029,7 +13993,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEAUTHENTICATE,
+ 		.doit = nl80211_deauthenticate,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14037,7 +14000,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DISASSOCIATE,
+ 		.doit = nl80211_disassociate,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14045,7 +14007,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_JOIN_IBSS,
+ 		.doit = nl80211_join_ibss,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14053,7 +14014,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_LEAVE_IBSS,
+ 		.doit = nl80211_leave_ibss,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14063,7 +14023,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.cmd = NL80211_CMD_TESTMODE,
+ 		.doit = nl80211_testmode_do,
+ 		.dumpit = nl80211_testmode_dump,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14072,7 +14031,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_CONNECT,
+ 		.doit = nl80211_connect,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -14081,7 +14039,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_UPDATE_CONNECT_PARAMS,
+ 		.doit = nl80211_update_connect_params,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -14090,7 +14047,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DISCONNECT,
+ 		.doit = nl80211_disconnect,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14098,20 +14054,17 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_WIPHY_NETNS,
+ 		.doit = nl80211_wiphy_netns,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_GET_SURVEY,
+-		.policy = nl80211_policy,
+ 		.dumpit = nl80211_dump_survey,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_SET_PMKSA,
+ 		.doit = nl80211_setdel_pmksa,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -14120,7 +14073,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_PMKSA,
+ 		.doit = nl80211_setdel_pmksa,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14128,7 +14080,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_FLUSH_PMKSA,
+ 		.doit = nl80211_flush_pmksa,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14136,7 +14087,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_REMAIN_ON_CHANNEL,
+ 		.doit = nl80211_remain_on_channel,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14144,7 +14094,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_CANCEL_REMAIN_ON_CHANNEL,
+ 		.doit = nl80211_cancel_remain_on_channel,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14152,7 +14101,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_TX_BITRATE_MASK,
+ 		.doit = nl80211_set_tx_bitrate_mask,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14160,7 +14108,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_REGISTER_FRAME,
+ 		.doit = nl80211_register_mgmt,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14168,7 +14115,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_FRAME,
+ 		.doit = nl80211_tx_mgmt,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14176,7 +14122,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_FRAME_WAIT_CANCEL,
+ 		.doit = nl80211_tx_mgmt_cancel_wait,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14184,7 +14129,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_POWER_SAVE,
+ 		.doit = nl80211_set_power_save,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14192,7 +14136,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_GET_POWER_SAVE,
+ 		.doit = nl80211_get_power_save,
+-		.policy = nl80211_policy,
+ 		/* can be retrieved by unprivileged users */
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14200,7 +14143,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_CQM,
+ 		.doit = nl80211_set_cqm,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14208,7 +14150,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_CHANNEL,
+ 		.doit = nl80211_set_channel,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14216,7 +14157,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_WDS_PEER,
+ 		.doit = nl80211_set_wds_peer,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14224,7 +14164,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_JOIN_MESH,
+ 		.doit = nl80211_join_mesh,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14232,7 +14171,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_LEAVE_MESH,
+ 		.doit = nl80211_leave_mesh,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14240,7 +14178,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_JOIN_OCB,
+ 		.doit = nl80211_join_ocb,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14248,7 +14185,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_LEAVE_OCB,
+ 		.doit = nl80211_leave_ocb,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14257,7 +14193,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_GET_WOWLAN,
+ 		.doit = nl80211_get_wowlan,
+-		.policy = nl80211_policy,
+ 		/* can be retrieved by unprivileged users */
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14265,7 +14200,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_WOWLAN,
+ 		.doit = nl80211_set_wowlan,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14274,7 +14208,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_REKEY_OFFLOAD,
+ 		.doit = nl80211_set_rekey_data,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -14283,7 +14216,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_TDLS_MGMT,
+ 		.doit = nl80211_tdls_mgmt,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14291,7 +14223,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_TDLS_OPER,
+ 		.doit = nl80211_tdls_oper,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14299,7 +14230,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_UNEXPECTED_FRAME,
+ 		.doit = nl80211_register_unexpected_frame,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14307,7 +14237,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_PROBE_CLIENT,
+ 		.doit = nl80211_probe_client,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14315,7 +14244,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_REGISTER_BEACONS,
+ 		.doit = nl80211_register_beacons,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14323,7 +14251,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_NOACK_MAP,
+ 		.doit = nl80211_set_noack_map,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14331,7 +14258,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_START_P2P_DEVICE,
+ 		.doit = nl80211_start_p2p_device,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14339,7 +14265,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_STOP_P2P_DEVICE,
+ 		.doit = nl80211_stop_p2p_device,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14347,7 +14272,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_START_NAN,
+ 		.doit = nl80211_start_nan,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14355,7 +14279,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_STOP_NAN,
+ 		.doit = nl80211_stop_nan,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14363,7 +14286,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_ADD_NAN_FUNCTION,
+ 		.doit = nl80211_nan_add_func,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14371,7 +14293,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_NAN_FUNCTION,
+ 		.doit = nl80211_nan_del_func,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14379,7 +14300,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_CHANGE_NAN_CONFIG,
+ 		.doit = nl80211_nan_change_config,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14387,7 +14307,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_MCAST_RATE,
+ 		.doit = nl80211_set_mcast_rate,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14395,7 +14314,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_MAC_ACL,
+ 		.doit = nl80211_set_mac_acl,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14403,7 +14321,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_RADAR_DETECT,
+ 		.doit = nl80211_start_radar_detection,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14411,12 +14328,10 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_GET_PROTOCOL_FEATURES,
+ 		.doit = nl80211_get_protocol_features,
+-		.policy = nl80211_policy,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_UPDATE_FT_IES,
+ 		.doit = nl80211_update_ft_ies,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14424,7 +14339,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_CRIT_PROTOCOL_START,
+ 		.doit = nl80211_crit_protocol_start,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14432,7 +14346,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_CRIT_PROTOCOL_STOP,
+ 		.doit = nl80211_crit_protocol_stop,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14440,14 +14353,12 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_GET_COALESCE,
+ 		.doit = nl80211_get_coalesce,
+-		.policy = nl80211_policy,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_SET_COALESCE,
+ 		.doit = nl80211_set_coalesce,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14455,7 +14366,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_CHANNEL_SWITCH,
+ 		.doit = nl80211_channel_switch,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14464,7 +14374,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.cmd = NL80211_CMD_VENDOR,
+ 		.doit = nl80211_vendor_cmd,
+ 		.dumpit = nl80211_vendor_cmd_dump,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL |
+@@ -14473,7 +14382,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_QOS_MAP,
+ 		.doit = nl80211_set_qos_map,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14481,7 +14389,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_ADD_TX_TS,
+ 		.doit = nl80211_add_tx_ts,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14489,7 +14396,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_TX_TS,
+ 		.doit = nl80211_del_tx_ts,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14497,7 +14403,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_TDLS_CHANNEL_SWITCH,
+ 		.doit = nl80211_tdls_channel_switch,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14505,7 +14410,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_TDLS_CANCEL_CHANNEL_SWITCH,
+ 		.doit = nl80211_tdls_cancel_channel_switch,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14513,7 +14417,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_MULTICAST_TO_UNICAST,
+ 		.doit = nl80211_set_multicast_to_unicast,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14521,7 +14424,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_PMK,
+ 		.doit = nl80211_set_pmk,
+-		.policy = nl80211_policy,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL |
+ 				  NL80211_FLAG_CLEAR_SKB,
+@@ -14529,14 +14431,12 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_DEL_PMK,
+ 		.doit = nl80211_del_pmk,
+-		.policy = nl80211_policy,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_EXTERNAL_AUTH,
+ 		.doit = nl80211_external_auth,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14544,7 +14444,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_CONTROL_PORT_FRAME,
+ 		.doit = nl80211_tx_control_port,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14552,14 +14451,12 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_GET_FTM_RESPONDER_STATS,
+ 		.doit = nl80211_get_ftm_responder_stats,
+-		.policy = nl80211_policy,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_PEER_MEASUREMENT_START,
+ 		.doit = nl80211_pmsr_start,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14567,7 +14464,6 @@ static const struct genl_ops nl80211_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_NOTIFY_RADAR,
+ 		.doit = nl80211_notify_radar_detection,
+-		.policy = nl80211_policy,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+@@ -14593,6 +14489,7 @@ static struct genl_family nl80211_fam __ro_after_init = {
+ 	.hdrsize = 0,			/* no private header */
+ 	.version = 1,			/* no particular meaning now */
+ 	.maxattr = NL80211_ATTR_MAX,
++	.policy = nl80211_policy,
+ 	.netnsok = true,
+ 	.pre_doit = nl80211_pre_doit,
+ 	.post_doit = nl80211_post_doit,
