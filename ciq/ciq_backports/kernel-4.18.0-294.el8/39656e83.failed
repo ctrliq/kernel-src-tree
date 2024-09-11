@@ -1,0 +1,208 @@
+mm: lift the x86_32 PAE version of gup_get_pte to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 39656e83dab918861931ef96e5c41731b0899e56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/39656e83.failed
+
+The split low/high access is the only non-READ_ONCE version of gup_get_pte
+that did show up in the various arch implemenations.  Lift it to common
+code and drop the ifdef based arch override.
+
+Link: http://lkml.kernel.org/r/20190625143715.1689-4-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: David Miller <davem@davemloft.net>
+	Cc: James Hogan <jhogan@kernel.org>
+	Cc: Khalid Aziz <khalid.aziz@oracle.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Nicholas Piggin <npiggin@gmail.com>
+	Cc: Paul Burton <paul.burton@mips.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Ralf Baechle <ralf@linux-mips.org>
+	Cc: Rich Felker <dalias@libc.org>
+	Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 39656e83dab918861931ef96e5c41731b0899e56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+diff --cc arch/x86/Kconfig
+index 3fc0a4c91af5,71c1f7864434..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -127,7 -122,8 +127,12 @@@ config X8
+  	select GENERIC_STRNCPY_FROM_USER
+  	select GENERIC_STRNLEN_USER
+  	select GENERIC_TIME_VSYSCALL
+++<<<<<<< HEAD
+ +	select HARDIRQS_SW_RESEND
+++=======
++ 	select GENERIC_GETTIMEOFDAY
++ 	select GUP_GET_PTE_LOW_HIGH		if X86_PAE
+++>>>>>>> 39656e83dab9 (mm: lift the x86_32 PAE version of gup_get_pte to common code)
+  	select HARDLOCKUP_CHECK_TIMESTAMP	if X86_64
+  	select HAVE_ACPI_APEI			if ACPI
+  	select HAVE_ACPI_APEI_NMI		if ACPI
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/include/asm/pgtable-3level.h b/arch/x86/include/asm/pgtable-3level.h
+index bb035a4cbc8c..e546c4973ffd 100644
+--- a/arch/x86/include/asm/pgtable-3level.h
++++ b/arch/x86/include/asm/pgtable-3level.h
+@@ -279,53 +279,6 @@ static inline pud_t native_pudp_get_and_clear(pud_t *pudp)
+ #define __pte_to_swp_entry(pte)	(__swp_entry(__pteval_swp_type(pte), \
+ 					     __pteval_swp_offset(pte)))
+ 
+-#define gup_get_pte gup_get_pte
+-/*
+- * WARNING: only to be used in the get_user_pages_fast() implementation.
+- *
+- * With get_user_pages_fast(), we walk down the pagetables without taking
+- * any locks.  For this we would like to load the pointers atomically,
+- * but that is not possible (without expensive cmpxchg8b) on PAE.  What
+- * we do have is the guarantee that a PTE will only either go from not
+- * present to present, or present to not present or both -- it will not
+- * switch to a completely different present page without a TLB flush in
+- * between; something that we are blocking by holding interrupts off.
+- *
+- * Setting ptes from not present to present goes:
+- *
+- *   ptep->pte_high = h;
+- *   smp_wmb();
+- *   ptep->pte_low = l;
+- *
+- * And present to not present goes:
+- *
+- *   ptep->pte_low = 0;
+- *   smp_wmb();
+- *   ptep->pte_high = 0;
+- *
+- * We must ensure here that the load of pte_low sees 'l' iff pte_high
+- * sees 'h'. We load pte_high *after* loading pte_low, which ensures we
+- * don't see an older value of pte_high.  *Then* we recheck pte_low,
+- * which ensures that we haven't picked up a changed pte high. We might
+- * have gotten rubbish values from pte_low and pte_high, but we are
+- * guaranteed that pte_low will not have the present bit set *unless*
+- * it is 'l'. Because get_user_pages_fast() only operates on present ptes
+- * we're safe.
+- */
+-static inline pte_t gup_get_pte(pte_t *ptep)
+-{
+-	pte_t pte;
+-
+-	do {
+-		pte.pte_low = ptep->pte_low;
+-		smp_rmb();
+-		pte.pte_high = ptep->pte_high;
+-		smp_rmb();
+-	} while (unlikely(pte.pte_low != ptep->pte_low));
+-
+-	return pte;
+-}
+-
+ #include <asm/pgtable-invert.h>
+ 
+ #endif /* _ASM_X86_PGTABLE_3LEVEL_H */
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 33b7773753bf..aca89718ac4d 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -388,7 +388,7 @@ static u64 __update_clear_spte_slow(u64 *sptep, u64 spte)
+ 
+ /*
+  * The idea using the light way get the spte on x86_32 guest is from
+- * gup_get_pte(arch/x86/mm/gup.c).
++ * gup_get_pte (mm/gup.c).
+  *
+  * An spte tlb flush may be pending, because kvm_set_pte_rmapp
+  * coalesces them and we are running out of the MMU lock.  Therefore
+diff --git a/mm/Kconfig b/mm/Kconfig
+index ba2bdef1230d..c2f9e8591017 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -741,6 +741,9 @@ config GUP_BENCHMARK
+ 
+ 	  See tools/testing/selftests/vm/gup_benchmark.c
+ 
++config GUP_GET_PTE_LOW_HIGH
++	bool
++
+ config ARCH_HAS_PTE_SPECIAL
+ 	bool
+ 
+diff --git a/mm/gup.c b/mm/gup.c
+index 3ba37043928a..8e85bb584b15 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -1679,17 +1679,60 @@ struct page *get_dump_page(unsigned long addr)
+  * This code is based heavily on the PowerPC implementation by Nick Piggin.
+  */
+ #ifdef CONFIG_HAVE_GENERIC_GUP
++#ifdef CONFIG_GUP_GET_PTE_LOW_HIGH
++/*
++ * WARNING: only to be used in the get_user_pages_fast() implementation.
++ *
++ * With get_user_pages_fast(), we walk down the pagetables without taking any
++ * locks.  For this we would like to load the pointers atomically, but sometimes
++ * that is not possible (e.g. without expensive cmpxchg8b on x86_32 PAE).  What
++ * we do have is the guarantee that a PTE will only either go from not present
++ * to present, or present to not present or both -- it will not switch to a
++ * completely different present page without a TLB flush in between; something
++ * that we are blocking by holding interrupts off.
++ *
++ * Setting ptes from not present to present goes:
++ *
++ *   ptep->pte_high = h;
++ *   smp_wmb();
++ *   ptep->pte_low = l;
++ *
++ * And present to not present goes:
++ *
++ *   ptep->pte_low = 0;
++ *   smp_wmb();
++ *   ptep->pte_high = 0;
++ *
++ * We must ensure here that the load of pte_low sees 'l' IFF pte_high sees 'h'.
++ * We load pte_high *after* loading pte_low, which ensures we don't see an older
++ * value of pte_high.  *Then* we recheck pte_low, which ensures that we haven't
++ * picked up a changed pte high. We might have gotten rubbish values from
++ * pte_low and pte_high, but we are guaranteed that pte_low will not have the
++ * present bit set *unless* it is 'l'. Because get_user_pages_fast() only
++ * operates on present ptes we're safe.
++ */
++static inline pte_t gup_get_pte(pte_t *ptep)
++{
++	pte_t pte;
+ 
+-#ifndef gup_get_pte
++	do {
++		pte.pte_low = ptep->pte_low;
++		smp_rmb();
++		pte.pte_high = ptep->pte_high;
++		smp_rmb();
++	} while (unlikely(pte.pte_low != ptep->pte_low));
++
++	return pte;
++}
++#else /* CONFIG_GUP_GET_PTE_LOW_HIGH */
+ /*
+- * We assume that the PTE can be read atomically. If this is not the case for
+- * your architecture, please provide the helper.
++ * We require that the PTE can be read atomically.
+  */
+ static inline pte_t gup_get_pte(pte_t *ptep)
+ {
+ 	return READ_ONCE(*ptep);
+ }
+-#endif
++#endif /* CONFIG_GUP_GET_PTE_LOW_HIGH */
+ 
+ static void undo_dev_pagemap(int *nr, int nr_start, struct page **pages)
+ {
