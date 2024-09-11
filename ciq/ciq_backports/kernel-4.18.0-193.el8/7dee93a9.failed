@@ -1,0 +1,552 @@
+powerpc/fadump: support holes in kernel boot memory area
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Hari Bathini <hbathini@linux.ibm.com>
+commit 7dee93a9a8808b3d8595e1cc79ccb8b1a7bc7a77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7dee93a9.failed
+
+With support to copy multiple kernel boot memory regions owing to copy
+size limitation, also handle holes in the memory area to be preserved.
+Support as many as 128 kernel boot memory regions. This allows having
+an adequate FADump capture kernel size for different scenarios.
+
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/156821385448.5656.6124791213910877759.stgit@hbathini.in.ibm.com
+(cherry picked from commit 7dee93a9a8808b3d8595e1cc79ccb8b1a7bc7a77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/fadump-internal.h
+#	arch/powerpc/kernel/fadump.c
+#	arch/powerpc/platforms/powernv/opal-fadump.c
+#	arch/powerpc/platforms/powernv/opal-fadump.h
+#	arch/powerpc/platforms/pseries/rtas-fadump.c
+diff --cc arch/powerpc/include/asm/fadump-internal.h
+index f8097510e03f,c814a2b55389..000000000000
+--- a/arch/powerpc/include/asm/fadump-internal.h
++++ b/arch/powerpc/include/asm/fadump-internal.h
+@@@ -9,24 -9,10 +9,31 @@@
+  #ifndef _ASM_POWERPC_FADUMP_INTERNAL_H
+  #define _ASM_POWERPC_FADUMP_INTERNAL_H
+  
+++<<<<<<< HEAD
+ +/*
+ + * The RMA region will be saved for later dumping when kernel crashes.
+ + * RMA is Real Mode Area, the first block of logical memory address owned
+ + * by logical partition, containing the storage that may be accessed with
+ + * translate off.
+ + */
+ +#define RMA_START	0x0
+ +#define RMA_END		(ppc64_rma_size)
+ +
+ +/*
+ + * On some Power systems where RMO is 128MB, it still requires minimum of
+ + * 256MB for kernel to boot successfully. When kdump infrastructure is
+ + * configured to save vmcore over network, we run into OOM issue while
+ + * loading modules related to network setup. Hence we need additional 64M
+ + * of memory to avoid OOM issue.
+ + */
+ +#define MIN_BOOT_MEM	(((RMA_END < (0x1UL << 28)) ? (0x1UL << 28) : RMA_END) \
+ +			+ (0x1UL << 26))
+++=======
++ /* Maximum number of memory regions kernel supports */
++ #define FADUMP_MAX_MEM_REGS			128
++ 
++ #ifndef CONFIG_PRESERVE_FA_DUMP
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  
+  /* The upper limit percentage for user specified boot memory size (25%) */
+  #define MAX_BOOT_MEM_RATIO			4
+@@@ -85,13 -83,30 +92,31 @@@ struct fw_dump 
+  	unsigned long	reserve_bootvar;
+  
+  	unsigned long	cpu_state_data_size;
+ -	u64		cpu_state_dest_vaddr;
+ -	u32		cpu_state_data_version;
+ -	u32		cpu_state_entry_size;
+ -
+  	unsigned long	hpte_region_size;
+ -
+  	unsigned long	boot_memory_size;
+++<<<<<<< HEAD
+++=======
++ 	u64		boot_mem_dest_addr;
++ 	u64		boot_mem_addr[FADUMP_MAX_MEM_REGS];
++ 	u64		boot_mem_sz[FADUMP_MAX_MEM_REGS];
++ 	u64		boot_mem_top;
++ 	u64		boot_mem_regs_cnt;
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  
+  	unsigned long	fadumphdr_addr;
+  	unsigned long	cpu_notes_buf_vaddr;
+  	unsigned long	cpu_notes_buf_size;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Maximum size supported by firmware to copy from source to
++ 	 * destination address per entry.
++ 	 */
++ 	u64		max_copy_size;
++ 	u64		kernel_metadata;
++ 
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  	int		ibm_configure_kernel_dump;
+  
+  	unsigned long	fadump_enabled:1;
+diff --cc arch/powerpc/kernel/fadump.c
+index 56526469b148,ed59855430b9..000000000000
+--- a/arch/powerpc/kernel/fadump.c
++++ b/arch/powerpc/kernel/fadump.c
+@@@ -198,7 -138,12 +198,11 @@@ int is_fadump_memory_area(u64 addr, ulo
+  	if (((addr + size) > d_start) && (addr <= d_end))
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	return (addr + size) > RMA_START && addr <= fw_dump.boot_memory_size;
+++=======
++ 	return (addr <= fw_dump.boot_mem_top);
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  }
+  
+  int should_fadump_crash(void)
+@@@ -281,64 -241,15 +300,70 @@@ static void fadump_show_config(void
+  	pr_debug("Dump section sizes:\n");
+  	pr_debug("    CPU state data size: %lx\n", fw_dump.cpu_state_data_size);
+  	pr_debug("    HPTE region size   : %lx\n", fw_dump.hpte_region_size);
+- 	pr_debug("Boot memory size  : %lx\n", fw_dump.boot_memory_size);
++ 	pr_debug("    Boot memory size   : %lx\n", fw_dump.boot_memory_size);
++ 	pr_debug("    Boot memory top    : %llx\n", fw_dump.boot_mem_top);
++ 	pr_debug("Boot memory regions cnt: %llx\n", fw_dump.boot_mem_regs_cnt);
++ 	for (i = 0; i < fw_dump.boot_mem_regs_cnt; i++) {
++ 		pr_debug("[%03d] base = %llx, size = %llx\n", i,
++ 			 fw_dump.boot_mem_addr[i], fw_dump.boot_mem_sz[i]);
++ 	}
+  }
+  
+ +static unsigned long init_fadump_mem_struct(struct rtas_fadump_mem_struct *fdm,
+ +				unsigned long addr)
+ +{
+ +	if (!fdm)
+ +		return 0;
+ +
+ +	memset(fdm, 0, sizeof(struct rtas_fadump_mem_struct));
+ +	addr = addr & PAGE_MASK;
+ +
+ +	fdm->header.dump_format_version = cpu_to_be32(0x00000001);
+ +	fdm->header.dump_num_sections = cpu_to_be16(3);
+ +	fdm->header.dump_status_flag = 0;
+ +	fdm->header.offset_first_dump_section =
+ +		cpu_to_be32((u32)offsetof(struct rtas_fadump_mem_struct, cpu_state_data));
+ +
+ +	/*
+ +	 * Fields for disk dump option.
+ +	 * We are not using disk dump option, hence set these fields to 0.
+ +	 */
+ +	fdm->header.dd_block_size = 0;
+ +	fdm->header.dd_block_offset = 0;
+ +	fdm->header.dd_num_blocks = 0;
+ +	fdm->header.dd_offset_disk_path = 0;
+ +
+ +	/* set 0 to disable an automatic dump-reboot. */
+ +	fdm->header.max_time_auto = 0;
+ +
+ +	/* Kernel dump sections */
+ +	/* cpu state data section. */
+ +	fdm->cpu_state_data.request_flag = cpu_to_be32(RTAS_FADUMP_REQUEST_FLAG);
+ +	fdm->cpu_state_data.source_data_type = cpu_to_be16(RTAS_FADUMP_CPU_STATE_DATA);
+ +	fdm->cpu_state_data.source_address = 0;
+ +	fdm->cpu_state_data.source_len = cpu_to_be64(fw_dump.cpu_state_data_size);
+ +	fdm->cpu_state_data.destination_address = cpu_to_be64(addr);
+ +	addr += fw_dump.cpu_state_data_size;
+ +
+ +	/* hpte region section */
+ +	fdm->hpte_region.request_flag = cpu_to_be32(RTAS_FADUMP_REQUEST_FLAG);
+ +	fdm->hpte_region.source_data_type = cpu_to_be16(RTAS_FADUMP_HPTE_REGION);
+ +	fdm->hpte_region.source_address = 0;
+ +	fdm->hpte_region.source_len = cpu_to_be64(fw_dump.hpte_region_size);
+ +	fdm->hpte_region.destination_address = cpu_to_be64(addr);
+ +	addr += fw_dump.hpte_region_size;
+ +
+ +	/* RMA region section */
+ +	fdm->rmr_region.request_flag = cpu_to_be32(RTAS_FADUMP_REQUEST_FLAG);
+ +	fdm->rmr_region.source_data_type = cpu_to_be16(RTAS_FADUMP_REAL_MODE_REGION);
+ +	fdm->rmr_region.source_address = cpu_to_be64(RMA_START);
+ +	fdm->rmr_region.source_len = cpu_to_be64(fw_dump.boot_memory_size);
+ +	fdm->rmr_region.destination_address = cpu_to_be64(addr);
+ +	addr += fw_dump.boot_memory_size;
+ +
+ +	return addr;
+ +}
+ +
+  /**
+   * fadump_calculate_reserve_size(): reserve variable boot area 5% of System RAM
+   *
+@@@ -431,24 -343,90 +456,107 @@@ static unsigned long get_fadump_area_si
+  	return size;
+  }
+  
+++<<<<<<< HEAD
+ +static void __init fadump_reserve_crash_area(unsigned long base,
+ +					     unsigned long size)
+ +{
+ +	struct memblock_region *reg;
+ +	unsigned long mstart, mend, msize;
+ +
+ +	for_each_memblock(memory, reg) {
+ +		mstart = max_t(unsigned long, base, reg->base);
+ +		mend = reg->base + reg->size;
+ +		mend = min(base + size, mend);
+ +
+ +		if (mstart < mend) {
+ +			msize = mend - mstart;
+ +			memblock_reserve(mstart, msize);
+ +			pr_info("Reserved %ldMB of memory at %#016lx for saving crash dump\n",
+ +				(msize >> 20), mstart);
+ +		}
+ +	}
+++=======
++ static int __init add_boot_mem_region(unsigned long rstart,
++ 				      unsigned long rsize)
++ {
++ 	int i = fw_dump.boot_mem_regs_cnt++;
++ 
++ 	if (fw_dump.boot_mem_regs_cnt > FADUMP_MAX_MEM_REGS) {
++ 		fw_dump.boot_mem_regs_cnt = FADUMP_MAX_MEM_REGS;
++ 		return 0;
++ 	}
++ 
++ 	pr_debug("Added boot memory range[%d] [%#016lx-%#016lx)\n",
++ 		 i, rstart, (rstart + rsize));
++ 	fw_dump.boot_mem_addr[i] = rstart;
++ 	fw_dump.boot_mem_sz[i] = rsize;
++ 	return 1;
++ }
++ 
++ /*
++  * Firmware usually has a hard limit on the data it can copy per region.
++  * Honour that by splitting a memory range into multiple regions.
++  */
++ static int __init add_boot_mem_regions(unsigned long mstart,
++ 				       unsigned long msize)
++ {
++ 	unsigned long rstart, rsize, max_size;
++ 	int ret = 1;
++ 
++ 	rstart = mstart;
++ 	max_size = fw_dump.max_copy_size ? fw_dump.max_copy_size : msize;
++ 	while (msize) {
++ 		if (msize > max_size)
++ 			rsize = max_size;
++ 		else
++ 			rsize = msize;
++ 
++ 		ret = add_boot_mem_region(rstart, rsize);
++ 		if (!ret)
++ 			break;
++ 
++ 		msize -= rsize;
++ 		rstart += rsize;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int __init fadump_get_boot_mem_regions(void)
++ {
++ 	unsigned long base, size, cur_size, hole_size, last_end;
++ 	unsigned long mem_size = fw_dump.boot_memory_size;
++ 	struct memblock_region *reg;
++ 	int ret = 1;
++ 
++ 	fw_dump.boot_mem_regs_cnt = 0;
++ 
++ 	last_end = 0;
++ 	hole_size = 0;
++ 	cur_size = 0;
++ 	for_each_memblock(memory, reg) {
++ 		base = reg->base;
++ 		size = reg->size;
++ 		hole_size += (base - last_end);
++ 
++ 		if ((cur_size + size) >= mem_size) {
++ 			size = (mem_size - cur_size);
++ 			ret = add_boot_mem_regions(base, size);
++ 			break;
++ 		}
++ 
++ 		mem_size -= size;
++ 		cur_size += size;
++ 		ret = add_boot_mem_regions(base, size);
++ 		if (!ret)
++ 			break;
++ 
++ 		last_end = base + size;
++ 	}
++ 	fw_dump.boot_mem_top = PAGE_ALIGN(fw_dump.boot_memory_size + hole_size);
++ 
++ 	return ret;
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  }
+  
+  int __init fadump_reserve_mem(void)
+@@@ -469,16 -448,28 +577,31 @@@
+  	 * If dump is active then we have already calculated the size during
+  	 * first kernel.
+  	 */
+ -	if (!fw_dump.dump_active) {
+ -		fw_dump.boot_memory_size =
+ -			PAGE_ALIGN(fadump_calculate_reserve_size());
+ +	if (fdm_active)
+ +		fw_dump.boot_memory_size = be64_to_cpu(fdm_active->rmr_region.source_len);
+ +	else {
+ +		fw_dump.boot_memory_size = fadump_calculate_reserve_size();
+  #ifdef CONFIG_CMA
+ -		if (!fw_dump.nocma) {
+ -			align = FADUMP_CMA_ALIGNMENT;
+ +		if (!fw_dump.nocma)
+  			fw_dump.boot_memory_size =
+ -				ALIGN(fw_dump.boot_memory_size, align);
+ -		}
+ +				ALIGN(fw_dump.boot_memory_size,
+ +							FADUMP_CMA_ALIGNMENT);
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ 		bootmem_min = fw_dump.ops->fadump_get_bootmem_min();
++ 		if (fw_dump.boot_memory_size < bootmem_min) {
++ 			pr_err("Can't enable fadump with boot memory size (0x%lx) less than 0x%llx\n",
++ 			       fw_dump.boot_memory_size, bootmem_min);
++ 			goto error_out;
++ 		}
++ 
++ 		if (!fadump_get_boot_mem_regions()) {
++ 			pr_err("Too many holes in boot memory area to enable fadump\n");
++ 			goto error_out;
++ 		}
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  	}
+  
+  	/*
+@@@ -498,10 -489,11 +621,14 @@@
+  				" dump, now %#016llx\n", memory_limit);
+  	}
+  	if (memory_limit)
+ -		mem_boundary = memory_limit;
+ +		memory_boundary = memory_limit;
+  	else
+ -		mem_boundary = memblock_end_of_DRAM();
+ +		memory_boundary = memblock_end_of_DRAM();
+  
+++<<<<<<< HEAD
+++=======
++ 	base = fw_dump.boot_mem_top;
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  	size = get_fadump_area_size();
+  	fw_dump.reserve_dump_area_size = size;
+  	if (fw_dump.dump_active) {
+@@@ -1137,36 -876,36 +1264,64 @@@ static int fadump_init_elfcore_header(c
+  static int fadump_setup_crash_memory_ranges(void)
+  {
+  	struct memblock_region *reg;
+++<<<<<<< HEAD
+ +	unsigned long long start, end;
+ +	int ret;
+++=======
++ 	u64 start, end;
++ 	int i, ret;
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  
+  	pr_debug("Setup crash memory ranges.\n");
+ -	crash_mrange_info.mem_range_cnt = 0;
+ +	crash_mem_ranges = 0;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * add the first memory chunk (RMA_START through boot_memory_size) as
+ +	 * a separate memory chunk. The reason is, at the time crash firmware
+ +	 * will move the content of this memory chunk to different location
+ +	 * specified during fadump registration. We need to create a separate
+ +	 * program header for this chunk with the correct offset.
+ +	 */
+ +	ret = fadump_add_crash_memory(RMA_START, fw_dump.boot_memory_size);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	 * Boot memory region(s) registered with firmware are moved to
++ 	 * different location at the time of crash. Create separate program
++ 	 * header(s) for this memory chunk(s) with the correct offset.
++ 	 */
++ 	for (i = 0; i < fw_dump.boot_mem_regs_cnt; i++) {
++ 		start = fw_dump.boot_mem_addr[i];
++ 		end = start + fw_dump.boot_mem_sz[i];
++ 		ret = fadump_add_mem_range(&crash_mrange_info, start, end);
++ 		if (ret)
++ 			return ret;
++ 	}
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  
+  	for_each_memblock(memory, reg) {
+ -		start = (u64)reg->base;
+ -		end = start + (u64)reg->size;
+ +		start = (unsigned long long)reg->base;
+ +		end = start + (unsigned long long)reg->size;
+  
+  		/*
+++<<<<<<< HEAD
+ +		 * skip the first memory chunk that is already added (RMA_START
+ +		 * through boot_memory_size). This logic needs a relook if and
+ +		 * when RMA_START changes to a non-zero value.
+ +		 */
+ +		BUILD_BUG_ON(RMA_START != 0);
+ +		if (start < fw_dump.boot_memory_size) {
+ +			if (end > fw_dump.boot_memory_size)
+ +				start = fw_dump.boot_memory_size;
+++=======
++ 		 * skip the memory chunk that is already added
++ 		 * (0 through boot_memory_top).
++ 		 */
++ 		if (start < fw_dump.boot_mem_top) {
++ 			if (end > fw_dump.boot_mem_top)
++ 				start = fw_dump.boot_mem_top;
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  			else
+  				continue;
+  		}
+@@@ -1187,10 -926,27 +1342,34 @@@
+   */
+  static inline unsigned long fadump_relocate(unsigned long paddr)
+  {
+++<<<<<<< HEAD
+ +	if (paddr > RMA_START && paddr < fw_dump.boot_memory_size)
+ +		return be64_to_cpu(fdm.rmr_region.destination_address) + paddr;
+ +	else
+ +		return paddr;
+++=======
++ 	unsigned long raddr, rstart, rend, rlast, hole_size;
++ 	int i;
++ 
++ 	hole_size = 0;
++ 	rlast = 0;
++ 	raddr = paddr;
++ 	for (i = 0; i < fw_dump.boot_mem_regs_cnt; i++) {
++ 		rstart = fw_dump.boot_mem_addr[i];
++ 		rend = rstart + fw_dump.boot_mem_sz[i];
++ 		hole_size += (rstart - rlast);
++ 
++ 		if (paddr >= rstart && paddr < rend) {
++ 			raddr += fw_dump.boot_mem_dest_addr - hole_size;
++ 			break;
++ 		}
++ 
++ 		rlast = rend;
++ 	}
++ 
++ 	pr_debug("vmcoreinfo: paddr = 0x%lx, raddr = 0x%lx\n", paddr, raddr);
++ 	return raddr;
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  }
+  
+  static int fadump_create_elfcore_headers(char *bufp)
+@@@ -1240,12 -997,14 +1420,20 @@@
+  	(elf->e_phnum)++;
+  
+  	/* setup PT_LOAD sections. */
+++<<<<<<< HEAD
+ +
+ +	for (i = 0; i < crash_mem_ranges; i++) {
+ +		unsigned long long mbase, msize;
+ +		mbase = crash_memory_ranges[i].base;
+ +		msize = crash_memory_ranges[i].size;
+++=======
++ 	j = 0;
++ 	offset = 0;
++ 	raddr = fw_dump.boot_mem_addr[0];
++ 	for (i = 0; i < crash_mrange_info.mem_range_cnt; i++) {
++ 		u64 mbase, msize;
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  
+ -		mbase = crash_mrange_info.mem_ranges[i].base;
+ -		msize = crash_mrange_info.mem_ranges[i].size;
+  		if (!msize)
+  			continue;
+  
+@@@ -1255,13 -1014,17 +1443,25 @@@
+  		phdr->p_flags	= PF_R|PF_W|PF_X;
+  		phdr->p_offset	= mbase;
+  
+++<<<<<<< HEAD
+ +		if (mbase == RMA_START) {
+++=======
++ 		if (mbase == raddr) {
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  			/*
+ -			 * The entire real memory region will be moved by
+ -			 * firmware to the specified destination_address.
+ -			 * Hence set the correct offset.
+ +			 * The entire RMA region will be moved by firmware
+ +			 * to the specified destination_address. Hence set
+ +			 * the correct offset.
+  			 */
+++<<<<<<< HEAD
+ +			phdr->p_offset = be64_to_cpu(fdm.rmr_region.destination_address);
+++=======
++ 			phdr->p_offset = fw_dump.boot_mem_dest_addr + offset;
++ 			if (j < (fw_dump.boot_mem_regs_cnt - 1)) {
++ 				offset += fw_dump.boot_mem_sz[j];
++ 				raddr = fw_dump.boot_mem_addr[++j];
++ 			}
+++>>>>>>> 7dee93a9a880 (powerpc/fadump: support holes in kernel boot memory area)
+  		}
+  
+  		phdr->p_paddr = mbase;
+@@@ -1470,11 -1310,17 +1670,11 @@@ static void fadump_invalidate_release_m
+  	fadump_cleanup();
+  	mutex_unlock(&fadump_mutex);
+  
+- 	fadump_release_memory(fw_dump.boot_memory_size, memblock_end_of_DRAM());
++ 	fadump_release_memory(fw_dump.boot_mem_top, memblock_end_of_DRAM());
+  	fadump_free_cpu_notes_buf();
+  
+ -	/*
+ -	 * Setup kernel metadata and initialize the kernel dump
+ -	 * memory structure for FADump re-registration.
+ -	 */
+ -	if (fw_dump.ops->fadump_setup_metadata &&
+ -	    (fw_dump.ops->fadump_setup_metadata(&fw_dump) < 0))
+ -		pr_warn("Failed to setup kernel metadata!\n");
+ -	fw_dump.ops->fadump_init_mem_struct(&fw_dump);
+ +	/* Initialize the kernel dump memory structure for FAD registration. */
+ +	init_fadump_mem_struct(&fdm, fw_dump.reserve_dump_area_start);
+  }
+  
+  static ssize_t fadump_release_memory_store(struct kobject *kobj,
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.c
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.h
+* Unmerged path arch/powerpc/platforms/pseries/rtas-fadump.c
+* Unmerged path arch/powerpc/include/asm/fadump-internal.h
+* Unmerged path arch/powerpc/kernel/fadump.c
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.c
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.h
+* Unmerged path arch/powerpc/platforms/pseries/rtas-fadump.c
+diff --git a/arch/powerpc/platforms/pseries/rtas-fadump.h b/arch/powerpc/platforms/pseries/rtas-fadump.h
+index 531f3f3e42b3..0ed2429631be 100644
+--- a/arch/powerpc/platforms/pseries/rtas-fadump.h
++++ b/arch/powerpc/platforms/pseries/rtas-fadump.h
+@@ -60,6 +60,11 @@ struct rtas_fadump_mem_struct {
+ 	/* Kernel dump sections */
+ 	struct rtas_fadump_section		cpu_state_data;
+ 	struct rtas_fadump_section		hpte_region;
++
++	/*
++	 * TODO: Extend multiple boot memory regions support in the kernel
++	 *       for this platform.
++	 */
+ 	struct rtas_fadump_section		rmr_region;
+ };
+ 
