@@ -1,0 +1,407 @@
+dm: switch dm_target_io booleans over to proper flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit 655f3aad7aa4858d06cdaca6c4b14635cc3c0eba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/655f3aad.failed
+
+Add flags to dm_target_io and manage them using the same pattern used
+for bi_flags in struct bio.
+
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 655f3aad7aa4858d06cdaca6c4b14635cc3c0eba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-core.h
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-core.h
+index a9c78c74b3c7,feb53232d777..000000000000
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@@ -202,7 -215,8 +202,12 @@@ struct dm_target_io 
+  	struct dm_io *io;
+  	struct dm_target *ti;
+  	unsigned int *len_ptr;
+++<<<<<<< HEAD
+ +	bool inside_dm_io;
+++=======
++ 	unsigned short flags;
++ 	sector_t old_sector;
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  	struct bio clone;
+  };
+  
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,cca11cf42cc3..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -75,10 -87,14 +75,14 @@@ struct clone_info 
+  #define DM_IO_BIO_OFFSET \
+  	(offsetof(struct dm_target_io, clone) + offsetof(struct dm_io, tio))
+  
+ -static inline struct dm_target_io *clone_to_tio(struct bio *clone)
+ -{
+ -	return container_of(clone, struct dm_target_io, clone);
+ -}
+ -
+  void *dm_per_bio_data(struct bio *bio, size_t data_size)
+  {
+++<<<<<<< HEAD
+ +	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+ +	if (!tio->inside_dm_io)
+++=======
++ 	if (!dm_tio_flagged(clone_to_tio(bio), DM_TIO_INSIDE_DM_IO))
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  		return (char *)bio - DM_TARGET_IO_BIO_OFFSET - data_size;
+  	return (char *)bio - DM_IO_BIO_OFFSET - data_size;
+  }
+@@@ -584,15 -526,41 +588,46 @@@ static void dm_io_acct(bool end, struc
+  		bio->bi_iter.bi_size = bi_size;
+  }
+  
+ -static void __dm_start_io_acct(struct dm_io *io, struct bio *bio)
+ +static void start_io_acct(struct dm_io *io)
+  {
+ -	dm_io_acct(false, io->md, bio, io->start_time, &io->stats_aux);
+ +	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+  }
+  
+ -static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+++<<<<<<< HEAD
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+++=======
++ 	/* Must account IO to DM device in terms of orig_bio */
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	/*
++ 	 * Ensure IO accounting is only ever started once.
++ 	 * Expect no possibility for race unless DM_TIO_IS_DUPLICATE_BIO.
++ 	 */
++ 	if (!clone ||
++ 	    likely(!dm_tio_flagged(clone_to_tio(clone), DM_TIO_IS_DUPLICATE_BIO))) {
++ 		if (WARN_ON_ONCE(dm_io_flagged(io, DM_IO_ACCOUNTED)))
++ 			return;
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 	} else {
++ 		unsigned long flags;
++ 		if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 			return;
++ 		/* Can afford locking given DM_TIO_IS_DUPLICATE_BIO */
++ 		spin_lock_irqsave(&io->startio_lock, flags);
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 		spin_unlock_irqrestore(&io->startio_lock, flags);
++ 	}
++ 
++ 	__dm_start_io_acct(io, bio);
++ }
++ 
++ static void dm_end_io_acct(struct dm_io *io, struct bio *bio)
++ {
++ 	dm_io_acct(true, io->md, bio, io->start_time, &io->stats_aux);
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+@@@ -601,12 -569,11 +636,18 @@@
+  	struct dm_target_io *tio;
+  	struct bio *clone;
+  
+ -	clone = bio_alloc_clone(bio->bi_bdev, bio, GFP_NOIO, &md->io_bs);
+ +	clone = bio_alloc_bioset(GFP_NOIO, 0, &md->io_bs);
+ +	if (!clone)
+ +		return NULL;
+  
+++<<<<<<< HEAD
+ +	tio = container_of(clone, struct dm_target_io, clone);
+ +	tio->inside_dm_io = true;
+++=======
++ 	tio = clone_to_tio(clone);
++ 	tio->flags = 0;
++ 	dm_tio_set_flag(tio, DM_TIO_INSIDE_DM_IO);
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  	tio->io = NULL;
+  
+  	io = container_of(tio, struct dm_io, tio);
+@@@ -643,23 -616,34 +684,40 @@@ static struct dm_target_io *alloc_tio(s
+  		if (!clone)
+  			return NULL;
+  
+++<<<<<<< HEAD
+ +		tio = container_of(clone, struct dm_target_io, clone);
+ +		tio->inside_dm_io = false;
+++=======
++ 		/* REQ_DM_POLL_LIST shouldn't be inherited */
++ 		clone->bi_opf &= ~REQ_DM_POLL_LIST;
++ 
++ 		tio = clone_to_tio(clone);
++ 		tio->flags = 0; /* also clears DM_TIO_INSIDE_DM_IO */
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  	}
+  
+  	tio->magic = DM_TIO_MAGIC;
+  	tio->io = ci->io;
+  	tio->ti = ti;
+  	tio->target_bio_nr = target_bio_nr;
+++<<<<<<< HEAD
+++=======
++ 	tio->len_ptr = len;
++ 	tio->old_sector = 0;
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  
+ -	if (len) {
+ -		clone->bi_iter.bi_size = to_bytes(*len);
+ -		if (bio_integrity(clone))
+ -			bio_integrity_trim(clone);
+ -	}
+ -
+ -	return clone;
+ +	return tio;
+  }
+  
+ -static void free_tio(struct bio *clone)
+ +static void free_tio(struct dm_target_io *tio)
+  {
+++<<<<<<< HEAD
+ +	if (tio->inside_dm_io)
+++=======
++ 	if (dm_tio_flagged(clone_to_tio(clone), DM_TIO_INSIDE_DM_IO))
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  		return;
+ -	bio_put(clone);
+ +	bio_put(&tio->clone);
+  }
+  
+  /*
+@@@ -866,6 -848,82 +924,85 @@@ static int __noflush_suspending(struct 
+  	return test_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dm_io_complete(struct dm_io *io)
++ {
++ 	blk_status_t io_error;
++ 	struct mapped_device *md = io->md;
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	if (io->status == BLK_STS_DM_REQUEUE) {
++ 		unsigned long flags;
++ 		/*
++ 		 * Target requested pushing back the I/O.
++ 		 */
++ 		spin_lock_irqsave(&md->deferred_lock, flags);
++ 		if (__noflush_suspending(md) &&
++ 		    !WARN_ON_ONCE(dm_is_zone_write(md, bio))) {
++ 			/* NOTE early return due to BLK_STS_DM_REQUEUE below */
++ 			bio_list_add_head(&md->deferred, bio);
++ 		} else {
++ 			/*
++ 			 * noflush suspend was interrupted or this is
++ 			 * a write to a zoned target.
++ 			 */
++ 			io->status = BLK_STS_IOERR;
++ 		}
++ 		spin_unlock_irqrestore(&md->deferred_lock, flags);
++ 	}
++ 
++ 	io_error = io->status;
++ 	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 		dm_end_io_acct(io, bio);
++ 	else if (!io_error) {
++ 		/*
++ 		 * Must handle target that DM_MAPIO_SUBMITTED only to
++ 		 * then bio_endio() rather than dm_submit_bio_remap()
++ 		 */
++ 		__dm_start_io_acct(io, bio);
++ 		dm_end_io_acct(io, bio);
++ 	}
++ 	free_io(io);
++ 	smp_wmb();
++ 	this_cpu_dec(*md->pending_io);
++ 
++ 	/* nudge anyone waiting on suspend queue */
++ 	if (unlikely(wq_has_sleeper(&md->wait)))
++ 		wake_up(&md->wait);
++ 
++ 	if (io_error == BLK_STS_DM_REQUEUE) {
++ 		/*
++ 		 * Upper layer won't help us poll split bio, io->orig_bio
++ 		 * may only reflect a subset of the pre-split original,
++ 		 * so clear REQ_POLLED in case of requeue
++ 		 */
++ 		bio->bi_opf &= ~REQ_POLLED;
++ 		return;
++ 	}
++ 
++ 	if (bio_is_flush_with_data(bio)) {
++ 		/*
++ 		 * Preflush done for flush with data, reissue
++ 		 * without REQ_PREFLUSH.
++ 		 */
++ 		bio->bi_opf &= ~REQ_PREFLUSH;
++ 		queue_io(md, bio);
++ 	} else {
++ 		/* done with normal IO or empty flush */
++ 		if (io_error)
++ 			bio->bi_status = io_error;
++ 		bio_endio(bio);
++ 	}
++ }
++ 
++ static inline bool dm_tio_is_normal(struct dm_target_io *tio)
++ {
++ 	return (dm_tio_flagged(tio, DM_TIO_INSIDE_DM_IO) &&
++ 		!dm_tio_flagged(tio, DM_TIO_IS_DUPLICATE_BIO));
++ }
++ 
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  /*
+   * Decrements the number of outstanding ios that a bio has been
+   * cloned into, completing the original io if necc.
+@@@ -1242,11 -1184,15 +1379,18 @@@ static int dm_dax_zero_page_range(struc
+   */
+  void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
+  {
+ -	struct dm_target_io *tio = clone_to_tio(bio);
+ +	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+  	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
+++<<<<<<< HEAD
+ +	BUG_ON(bio->bi_opf & REQ_PREFLUSH);
+++=======
++ 
++ 	BUG_ON(dm_tio_flagged(tio, DM_TIO_IS_DUPLICATE_BIO));
++ 	BUG_ON(op_is_zone_mgmt(bio_op(bio)));
++ 	BUG_ON(bio_op(bio) == REQ_OP_ZONE_APPEND);
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  	BUG_ON(bi_size > *tio->len_ptr);
+  	BUG_ON(n_sectors > bi_size);
+ -
+  	*tio->len_ptr -= bi_size - n_sectors;
+  	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
+  }
+@@@ -1428,14 -1362,23 +1572,32 @@@ static void __send_duplicate_bios(struc
+  				  unsigned num_bios, unsigned *len)
+  {
+  	struct bio_list blist = BIO_EMPTY_LIST;
+ -	struct bio *clone;
+ +	struct bio *bio;
+ +	struct dm_target_io *tio;
+ +
+++<<<<<<< HEAD
+ +	alloc_multiple_bios(&blist, ci, ti, num_bios);
+  
+ +	while ((bio = bio_list_pop(&blist))) {
+ +		tio = container_of(bio, struct dm_target_io, clone);
+ +		(void) __clone_and_map_simple_bio(ci, tio, len);
+++=======
++ 	switch (num_bios) {
++ 	case 0:
++ 		break;
++ 	case 1:
++ 		clone = alloc_tio(ci, ti, 0, len, GFP_NOIO);
++ 		dm_tio_set_flag(clone_to_tio(clone), DM_TIO_IS_DUPLICATE_BIO);
++ 		__map_bio(clone);
++ 		break;
++ 	default:
++ 		alloc_multiple_bios(&blist, ci, ti, num_bios, len);
++ 		while ((clone = bio_list_pop(&blist))) {
++ 			dm_tio_set_flag(clone_to_tio(clone), DM_TIO_IS_DUPLICATE_BIO);
++ 			__map_bio(clone);
++ 		}
++ 		break;
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  	}
+  }
+  
+@@@ -1679,33 -1645,61 +1841,37 @@@ static blk_qc_t dm_make_request(struct 
+  	 * otherwise associated queue_limits won't be imposed.
+  	 */
+  	if (is_abnormal_io(bio))
+ -		blk_queue_split(&bio);
+ +		blk_queue_split(md->queue, &bio);
+  
+ -	dm_split_and_process_bio(md, map, bio);
+ +	ret = __split_and_process_bio(md, map, bio);
+  out:
+  	dm_put_live_table(md, srcu_idx);
+ +	return ret;
+  }
+  
+ -static bool dm_poll_dm_io(struct dm_io *io, struct io_comp_batch *iob,
+ -			  unsigned int flags)
+ +static int dm_any_congested(void *congested_data, int bdi_bits)
+  {
+++<<<<<<< HEAD
+ +	int r = bdi_bits;
+ +	struct mapped_device *md = congested_data;
+ +	struct dm_table *map;
+++=======
++ 	WARN_ON_ONCE(!dm_tio_is_normal(&io->tio));
+++>>>>>>> 655f3aad7aa4 (dm: switch dm_target_io booleans over to proper flags)
+  
+ -	/* don't poll if the mapped io is done */
+ -	if (atomic_read(&io->io_count) > 1)
+ -		bio_poll(&io->tio.clone, iob, flags);
+ -
+ -	/* bio_poll holds the last reference */
+ -	return atomic_read(&io->io_count) == 1;
+ -}
+ -
+ -static int dm_poll_bio(struct bio *bio, struct io_comp_batch *iob,
+ -		       unsigned int flags)
+ -{
+ -	struct hlist_head *head = dm_get_bio_hlist_head(bio);
+ -	struct hlist_head tmp = HLIST_HEAD_INIT;
+ -	struct hlist_node *next;
+ -	struct dm_io *io;
+ -
+ -	/* Only poll normal bio which was marked as REQ_DM_POLL_LIST */
+ -	if (!(bio->bi_opf & REQ_DM_POLL_LIST))
+ -		return 0;
+ -
+ -	WARN_ON_ONCE(hlist_empty(head));
+ -
+ -	hlist_move_list(head, &tmp);
+ -
+ -	/*
+ -	 * Restore .bi_private before possibly completing dm_io.
+ -	 *
+ -	 * bio_poll() is only possible once @bio has been completely
+ -	 * submitted via submit_bio_noacct()'s depth-first submission.
+ -	 * So there is no dm_queue_poll_io() race associated with
+ -	 * clearing REQ_DM_POLL_LIST here.
+ -	 */
+ -	bio->bi_opf &= ~REQ_DM_POLL_LIST;
+ -	bio->bi_private = hlist_entry(tmp.first, struct dm_io, node)->data;
+ -
+ -	hlist_for_each_entry_safe(io, next, &tmp, node) {
+ -		if (dm_poll_dm_io(io, iob, flags)) {
+ -			hlist_del_init(&io->node);
+ +	if (!test_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags)) {
+ +		if (dm_request_based(md)) {
+  			/*
+ -			 * clone_endio() has already occurred, so passing
+ -			 * error as 0 here doesn't override io->status
+ +			 * With request-based DM we only need to check the
+ +			 * top-level queue for congestion.
+  			 */
+ -			dm_io_dec_pending(io, 0);
+ +			struct backing_dev_info *bdi = md->queue->backing_dev_info;
+ +			r = bdi->wb.congested->state & bdi_bits;
+ +		} else {
+ +			map = dm_get_live_table_fast(md);
+ +			if (map)
+ +				r = dm_table_any_congested(map, bdi_bits);
+ +			dm_put_live_table_fast(md);
+  		}
+  	}
+  
+* Unmerged path drivers/md/dm-core.h
+* Unmerged path drivers/md/dm.c
