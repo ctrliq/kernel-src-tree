@@ -1,0 +1,120 @@
+gfs2: add some much needed cleanup for log flushes that fail
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 462582b99b6079a6fbcdfc65bac49f5c2a27cfff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/462582b9.failed
+
+When a log flush fails due to io errors, it signals the failure but does
+not clean up after itself very well. This is because buffers are added to
+the transaction tr_buf and tr_databuf queue, but the io error causes
+gfs2_log_flush to bypass the "after_commit" functions responsible for
+dequeueing the bd elements. If the bd elements are added to the ail list
+before the error, function ail_drain takes care of dequeueing them.
+But if they haven't gotten that far, the elements are forgotten and
+make the transactions unable to be freed.
+
+This patch introduces new function trans_drain which drains the bd
+elements from the transaction so they can be freed properly.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 462582b99b6079a6fbcdfc65bac49f5c2a27cfff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/log.c
+index 031e207360df,3763c9ff1406..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -840,6 -880,58 +840,61 @@@ static void ail_drain(struct gfs2_sbd *
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * empty_ail1_list - try to start IO and empty the ail1 list
++  * @sdp: Pointer to GFS2 superblock
++  */
++ static void empty_ail1_list(struct gfs2_sbd *sdp)
++ {
++ 	unsigned long start = jiffies;
++ 
++ 	for (;;) {
++ 		if (time_after(jiffies, start + (HZ * 600))) {
++ 			fs_err(sdp, "Error: In %s for 10 minutes! t=%d\n",
++ 			       __func__, current->journal_info ? 1 : 0);
++ 			dump_ail_list(sdp);
++ 			return;
++ 		}
++ 		gfs2_ail1_start(sdp);
++ 		gfs2_ail1_wait(sdp);
++ 		if (gfs2_ail1_empty(sdp, 0))
++ 			return;
++ 	}
++ }
++ 
++ /**
++  * drain_bd - drain the buf and databuf queue for a failed transaction
++  * @tr: the transaction to drain
++  *
++  * When this is called, we're taking an error exit for a log write that failed
++  * but since we bypassed the after_commit functions, we need to remove the
++  * items from the buf and databuf queue.
++  */
++ static void trans_drain(struct gfs2_trans *tr)
++ {
++ 	struct gfs2_bufdata *bd;
++ 	struct list_head *head;
++ 
++ 	if (!tr)
++ 		return;
++ 
++ 	head = &tr->tr_buf;
++ 	while (!list_empty(head)) {
++ 		bd = list_first_entry(head, struct gfs2_bufdata, bd_list);
++ 		list_del_init(&bd->bd_list);
++ 		kmem_cache_free(gfs2_bufdata_cachep, bd);
++ 	}
++ 	head = &tr->tr_databuf;
++ 	while (!list_empty(head)) {
++ 		bd = list_first_entry(head, struct gfs2_bufdata, bd_list);
++ 		list_del_init(&bd->bd_list);
++ 		kmem_cache_free(gfs2_bufdata_cachep, bd);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 462582b99b60 (gfs2: add some much needed cleanup for log flushes that fail)
+   * gfs2_log_flush - flush incore transaction(s)
+   * @sdp: the filesystem
+   * @gl: The glock structure to flush.  If NULL, flush the whole incore log
+diff --cc fs/gfs2/trans.c
+index 2dcab8bc0ab6,6d4bf7ea7b3b..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -52,10 -64,12 +52,16 @@@ int gfs2_trans_begin(struct gfs2_sbd *s
+  	if (blocks)
+  		tr->tr_reserved += 6 + blocks;
+  	if (revokes)
+ -		tr->tr_reserved += gfs2_struct2blk(sdp, revokes);
+ +		tr->tr_reserved += gfs2_struct2blk(sdp, revokes,
+ +						   sizeof(u64));
+  	INIT_LIST_HEAD(&tr->tr_databuf);
+  	INIT_LIST_HEAD(&tr->tr_buf);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&tr->tr_list);
++ 	INIT_LIST_HEAD(&tr->tr_ail1_list);
++ 	INIT_LIST_HEAD(&tr->tr_ail2_list);
+++>>>>>>> 462582b99b60 (gfs2: add some much needed cleanup for log flushes that fail)
+  
+  	sb_start_intwrite(sdp->sd_vfs);
+  
+* Unmerged path fs/gfs2/log.c
+* Unmerged path fs/gfs2/trans.c
