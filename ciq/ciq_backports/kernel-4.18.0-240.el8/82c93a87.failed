@@ -1,0 +1,598 @@
+netdevsim: implement couple of testing devlink health reporters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 82c93a87bf8bc0cdb5ec2ab99da7d87715ff889f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/82c93a87.failed
+
+Implement "empty" and "dummy" reporters. The first one is really simple
+and does nothing. The other one has debugfs files to trigger breakage
+and it is able to do recovery. The ops also implement dummy fmsg
+content.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 82c93a87bf8bc0cdb5ec2ab99da7d87715ff889f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/netdevsim/dev.c
+diff --cc drivers/net/netdevsim/dev.c
+index 8eedf9620b5e,468e157a7cb1..000000000000
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@@ -815,7 -684,191 +815,195 @@@ static void nsim_dev_port_del_all(struc
+  	list_for_each_entry_safe(nsim_dev_port, tmp,
+  				 &nsim_dev->port_list, list)
+  		__nsim_dev_port_del(nsim_dev_port);
+++<<<<<<< HEAD
+ +	mutex_unlock(&nsim_dev->port_list_lock);
+++=======
++ }
++ 
++ static int nsim_dev_port_add_all(struct nsim_dev *nsim_dev,
++ 				 unsigned int port_count)
++ {
++ 	int i, err;
++ 
++ 	for (i = 0; i < port_count; i++) {
++ 		err = __nsim_dev_port_add(nsim_dev, i);
++ 		if (err)
++ 			goto err_port_del_all;
++ 	}
++ 	return 0;
++ 
++ err_port_del_all:
++ 	nsim_dev_port_del_all(nsim_dev);
++ 	return err;
++ }
++ 
++ static int nsim_dev_reload_create(struct nsim_dev *nsim_dev,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	struct nsim_bus_dev *nsim_bus_dev = nsim_dev->nsim_bus_dev;
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	devlink = priv_to_devlink(nsim_dev);
++ 	nsim_dev = devlink_priv(devlink);
++ 	INIT_LIST_HEAD(&nsim_dev->port_list);
++ 	mutex_init(&nsim_dev->port_list_lock);
++ 	nsim_dev->fw_update_status = true;
++ 
++ 	nsim_dev->fib_data = nsim_fib_create(devlink, extack);
++ 	if (IS_ERR(nsim_dev->fib_data))
++ 		return PTR_ERR(nsim_dev->fib_data);
++ 
++ 	nsim_devlink_param_load_driverinit_values(devlink);
++ 
++ 	err = nsim_dev_dummy_region_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_fib_destroy;
++ 
++ 	err = nsim_dev_traps_init(devlink);
++ 	if (err)
++ 		goto err_dummy_region_exit;
++ 
++ 	err = nsim_dev_health_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_traps_exit;
++ 
++ 	err = nsim_dev_port_add_all(nsim_dev, nsim_bus_dev->port_count);
++ 	if (err)
++ 		goto err_health_exit;
++ 
++ 	return 0;
++ 
++ err_health_exit:
++ 	nsim_dev_health_exit(nsim_dev);
++ err_traps_exit:
++ 	nsim_dev_traps_exit(devlink);
++ err_dummy_region_exit:
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ err_fib_destroy:
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ 	return err;
++ }
++ 
++ static struct nsim_dev *nsim_dev_create(struct nsim_bus_dev *nsim_bus_dev)
++ {
++ 	struct nsim_dev *nsim_dev;
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	devlink = devlink_alloc(&nsim_dev_devlink_ops, sizeof(*nsim_dev));
++ 	if (!devlink)
++ 		return ERR_PTR(-ENOMEM);
++ 	devlink_net_set(devlink, nsim_bus_dev->initial_net);
++ 	nsim_dev = devlink_priv(devlink);
++ 	nsim_dev->nsim_bus_dev = nsim_bus_dev;
++ 	nsim_dev->switch_id.id_len = sizeof(nsim_dev->switch_id.id);
++ 	get_random_bytes(nsim_dev->switch_id.id, nsim_dev->switch_id.id_len);
++ 	INIT_LIST_HEAD(&nsim_dev->port_list);
++ 	mutex_init(&nsim_dev->port_list_lock);
++ 	nsim_dev->fw_update_status = true;
++ 	nsim_dev->max_macs = NSIM_DEV_MAX_MACS_DEFAULT;
++ 	nsim_dev->test1 = NSIM_DEV_TEST1_DEFAULT;
++ 
++ 	err = nsim_dev_resources_register(devlink);
++ 	if (err)
++ 		goto err_devlink_free;
++ 
++ 	nsim_dev->fib_data = nsim_fib_create(devlink, NULL);
++ 	if (IS_ERR(nsim_dev->fib_data)) {
++ 		err = PTR_ERR(nsim_dev->fib_data);
++ 		goto err_resources_unregister;
++ 	}
++ 
++ 	err = devlink_register(devlink, &nsim_bus_dev->dev);
++ 	if (err)
++ 		goto err_fib_destroy;
++ 
++ 	err = devlink_params_register(devlink, nsim_devlink_params,
++ 				      ARRAY_SIZE(nsim_devlink_params));
++ 	if (err)
++ 		goto err_dl_unregister;
++ 	nsim_devlink_set_params_init_values(nsim_dev, devlink);
++ 
++ 	err = nsim_dev_dummy_region_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_params_unregister;
++ 
++ 	err = nsim_dev_traps_init(devlink);
++ 	if (err)
++ 		goto err_dummy_region_exit;
++ 
++ 	err = nsim_dev_debugfs_init(nsim_dev);
++ 	if (err)
++ 		goto err_traps_exit;
++ 
++ 	err = nsim_dev_health_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_debugfs_exit;
++ 
++ 	err = nsim_bpf_dev_init(nsim_dev);
++ 	if (err)
++ 		goto err_health_exit;
++ 
++ 	err = nsim_dev_port_add_all(nsim_dev, nsim_bus_dev->port_count);
++ 	if (err)
++ 		goto err_bpf_dev_exit;
++ 
++ 	devlink_params_publish(devlink);
++ 	return nsim_dev;
++ 
++ err_bpf_dev_exit:
++ 	nsim_bpf_dev_exit(nsim_dev);
++ err_health_exit:
++ 	nsim_dev_health_exit(nsim_dev);
++ err_debugfs_exit:
++ 	nsim_dev_debugfs_exit(nsim_dev);
++ err_traps_exit:
++ 	nsim_dev_traps_exit(devlink);
++ err_dummy_region_exit:
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ err_params_unregister:
++ 	devlink_params_unregister(devlink, nsim_devlink_params,
++ 				  ARRAY_SIZE(nsim_devlink_params));
++ err_dl_unregister:
++ 	devlink_unregister(devlink);
++ err_fib_destroy:
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ err_resources_unregister:
++ 	devlink_resources_unregister(devlink, NULL);
++ err_devlink_free:
++ 	devlink_free(devlink);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void nsim_dev_reload_destroy(struct nsim_dev *nsim_dev)
++ {
++ 	struct devlink *devlink = priv_to_devlink(nsim_dev);
++ 
++ 	if (devlink_is_reload_failed(devlink))
++ 		return;
++ 	nsim_dev_port_del_all(nsim_dev);
++ 	nsim_dev_health_exit(nsim_dev);
++ 	nsim_dev_traps_exit(devlink);
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ 	mutex_destroy(&nsim_dev->port_list_lock);
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ }
++ 
++ static void nsim_dev_destroy(struct nsim_dev *nsim_dev)
++ {
++ 	struct devlink *devlink = priv_to_devlink(nsim_dev);
++ 
++ 	nsim_dev_reload_destroy(nsim_dev);
++ 
++ 	nsim_bpf_dev_exit(nsim_dev);
++ 	nsim_dev_debugfs_exit(nsim_dev);
++ 	devlink_params_unregister(devlink, nsim_devlink_params,
++ 				  ARRAY_SIZE(nsim_devlink_params));
++ 	devlink_unregister(devlink);
++ 	devlink_resources_unregister(devlink, NULL);
++ 	devlink_free(devlink);
+++>>>>>>> 82c93a87bf8b (netdevsim: implement couple of testing devlink health reporters)
+  }
+  
+  int nsim_dev_probe(struct nsim_bus_dev *nsim_bus_dev)
+diff --git a/drivers/net/netdevsim/Makefile b/drivers/net/netdevsim/Makefile
+index 09f1315d2f2a..f4d8f62f28c2 100644
+--- a/drivers/net/netdevsim/Makefile
++++ b/drivers/net/netdevsim/Makefile
+@@ -3,7 +3,7 @@
+ obj-$(CONFIG_NETDEVSIM) += netdevsim.o
+ 
+ netdevsim-objs := \
+-	netdev.o dev.o fib.o bus.o
++	netdev.o dev.o fib.o bus.o health.o
+ 
+ ifeq ($(CONFIG_BPF_SYSCALL),y)
+ netdevsim-objs += \
+* Unmerged path drivers/net/netdevsim/dev.c
+diff --git a/drivers/net/netdevsim/health.c b/drivers/net/netdevsim/health.c
+new file mode 100644
+index 000000000000..2716235a0336
+--- /dev/null
++++ b/drivers/net/netdevsim/health.c
+@@ -0,0 +1,325 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2019 Mellanox Technologies. All rights reserved */
++
++#include <linux/debugfs.h>
++#include <linux/err.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++
++#include "netdevsim.h"
++
++static int
++nsim_dev_empty_reporter_dump(struct devlink_health_reporter *reporter,
++			     struct devlink_fmsg *fmsg, void *priv_ctx,
++			     struct netlink_ext_ack *extack)
++{
++	return 0;
++}
++
++static int
++nsim_dev_empty_reporter_diagnose(struct devlink_health_reporter *reporter,
++				 struct devlink_fmsg *fmsg,
++				 struct netlink_ext_ack *extack)
++{
++	return 0;
++}
++
++static const
++struct devlink_health_reporter_ops nsim_dev_empty_reporter_ops = {
++	.name = "empty",
++	.dump = nsim_dev_empty_reporter_dump,
++	.diagnose = nsim_dev_empty_reporter_diagnose,
++};
++
++struct nsim_dev_dummy_reporter_ctx {
++	char *break_msg;
++};
++
++static int
++nsim_dev_dummy_reporter_recover(struct devlink_health_reporter *reporter,
++				void *priv_ctx,
++				struct netlink_ext_ack *extack)
++{
++	struct nsim_dev_health *health = devlink_health_reporter_priv(reporter);
++	struct nsim_dev_dummy_reporter_ctx *ctx = priv_ctx;
++
++	if (health->fail_recover) {
++		/* For testing purposes, user set debugfs fail_recover
++		 * value to true. Fail right away.
++		 */
++		NL_SET_ERR_MSG_MOD(extack, "User setup the recover to fail for testing purposes");
++		return -EINVAL;
++	}
++	if (ctx) {
++		kfree(health->recovered_break_msg);
++		health->recovered_break_msg = kstrdup(ctx->break_msg,
++						      GFP_KERNEL);
++		if (!health->recovered_break_msg)
++			return -ENOMEM;
++	}
++	return 0;
++}
++
++static int nsim_dev_dummy_fmsg_put(struct devlink_fmsg *fmsg, u32 binary_len)
++{
++	char *binary;
++	int err;
++	int i;
++
++	err = devlink_fmsg_bool_pair_put(fmsg, "test_bool", true);
++	if (err)
++		return err;
++	err = devlink_fmsg_u8_pair_put(fmsg, "test_u8", 1);
++	if (err)
++		return err;
++	err = devlink_fmsg_u32_pair_put(fmsg, "test_u32", 3);
++	if (err)
++		return err;
++	err = devlink_fmsg_u64_pair_put(fmsg, "test_u64", 4);
++	if (err)
++		return err;
++	err = devlink_fmsg_string_pair_put(fmsg, "test_string", "somestring");
++	if (err)
++		return err;
++
++	err = devlink_fmsg_arr_pair_nest_start(fmsg, "test_binary");
++	if (err)
++		return err;
++	binary = kmalloc(binary_len, GFP_KERNEL);
++	if (!binary)
++		return -ENOMEM;
++	get_random_bytes(binary, binary_len);
++	err = devlink_fmsg_binary_put(fmsg, binary, binary_len);
++	kfree(binary);
++	if (err)
++		return err;
++	err = devlink_fmsg_arr_pair_nest_end(fmsg);
++	if (err)
++		return err;
++
++	err = devlink_fmsg_pair_nest_start(fmsg, "test_nest");
++	if (err)
++		return err;
++	err = devlink_fmsg_obj_nest_start(fmsg);
++	if (err)
++		return err;
++	err = devlink_fmsg_bool_pair_put(fmsg, "nested_test_bool", false);
++	if (err)
++		return err;
++	err = devlink_fmsg_u8_pair_put(fmsg, "nested_test_u8", false);
++	if (err)
++		return err;
++	err = devlink_fmsg_obj_nest_end(fmsg);
++	if (err)
++		return err;
++	err = devlink_fmsg_pair_nest_end(fmsg);
++	if (err)
++		return err;
++
++	err = devlink_fmsg_arr_pair_nest_start(fmsg, "test_bool_array");
++	if (err)
++		return err;
++	for (i = 0; i < 10; i++) {
++		err = devlink_fmsg_bool_put(fmsg, true);
++		if (err)
++			return err;
++	}
++	err = devlink_fmsg_arr_pair_nest_end(fmsg);
++	if (err)
++		return err;
++
++	err = devlink_fmsg_arr_pair_nest_start(fmsg, "test_u8_array");
++	if (err)
++		return err;
++	for (i = 0; i < 10; i++) {
++		err = devlink_fmsg_u8_put(fmsg, i);
++		if (err)
++			return err;
++	}
++	err = devlink_fmsg_arr_pair_nest_end(fmsg);
++	if (err)
++		return err;
++
++	err = devlink_fmsg_arr_pair_nest_start(fmsg, "test_u32_array");
++	if (err)
++		return err;
++	for (i = 0; i < 10; i++) {
++		err = devlink_fmsg_u32_put(fmsg, i);
++		if (err)
++			return err;
++	}
++	err = devlink_fmsg_arr_pair_nest_end(fmsg);
++	if (err)
++		return err;
++
++	err = devlink_fmsg_arr_pair_nest_start(fmsg, "test_u64_array");
++	if (err)
++		return err;
++	for (i = 0; i < 10; i++) {
++		err = devlink_fmsg_u64_put(fmsg, i);
++		if (err)
++			return err;
++	}
++	err = devlink_fmsg_arr_pair_nest_end(fmsg);
++	if (err)
++		return err;
++
++	err = devlink_fmsg_arr_pair_nest_start(fmsg, "test_array_of_objects");
++	if (err)
++		return err;
++	for (i = 0; i < 10; i++) {
++		err = devlink_fmsg_obj_nest_start(fmsg);
++		if (err)
++			return err;
++		err = devlink_fmsg_bool_pair_put(fmsg,
++						 "in_array_nested_test_bool",
++						 false);
++		if (err)
++			return err;
++		err = devlink_fmsg_u8_pair_put(fmsg,
++					       "in_array_nested_test_u8",
++					       i);
++		if (err)
++			return err;
++		err = devlink_fmsg_obj_nest_end(fmsg);
++		if (err)
++			return err;
++	}
++	return devlink_fmsg_arr_pair_nest_end(fmsg);
++}
++
++static int
++nsim_dev_dummy_reporter_dump(struct devlink_health_reporter *reporter,
++			     struct devlink_fmsg *fmsg, void *priv_ctx,
++			     struct netlink_ext_ack *extack)
++{
++	struct nsim_dev_health *health = devlink_health_reporter_priv(reporter);
++	struct nsim_dev_dummy_reporter_ctx *ctx = priv_ctx;
++	int err;
++
++	if (ctx) {
++		err = devlink_fmsg_string_pair_put(fmsg, "break_message",
++						   ctx->break_msg);
++		if (err)
++			return err;
++	}
++	return nsim_dev_dummy_fmsg_put(fmsg, health->binary_len);
++}
++
++static int
++nsim_dev_dummy_reporter_diagnose(struct devlink_health_reporter *reporter,
++				 struct devlink_fmsg *fmsg,
++				 struct netlink_ext_ack *extack)
++{
++	struct nsim_dev_health *health = devlink_health_reporter_priv(reporter);
++	int err;
++
++	if (health->recovered_break_msg) {
++		err = devlink_fmsg_string_pair_put(fmsg,
++						   "recovered_break_message",
++						   health->recovered_break_msg);
++		if (err)
++			return err;
++	}
++	return nsim_dev_dummy_fmsg_put(fmsg, health->binary_len);
++}
++
++static const
++struct devlink_health_reporter_ops nsim_dev_dummy_reporter_ops = {
++	.name = "dummy",
++	.recover = nsim_dev_dummy_reporter_recover,
++	.dump = nsim_dev_dummy_reporter_dump,
++	.diagnose = nsim_dev_dummy_reporter_diagnose,
++};
++
++static ssize_t nsim_dev_health_break_write(struct file *file,
++					   const char __user *data,
++					   size_t count, loff_t *ppos)
++{
++	struct nsim_dev_health *health = file->private_data;
++	struct nsim_dev_dummy_reporter_ctx ctx;
++	char *break_msg;
++	int err;
++
++	break_msg = kmalloc(count + 1, GFP_KERNEL);
++	if (!break_msg)
++		return -ENOMEM;
++
++	if (copy_from_user(break_msg, data, count)) {
++		err = -EFAULT;
++		goto out;
++	}
++	break_msg[count] = '\0';
++	if (break_msg[count - 1] == '\n')
++		break_msg[count - 1] = '\0';
++
++	ctx.break_msg = break_msg;
++	err = devlink_health_report(health->dummy_reporter, break_msg, &ctx);
++	if (err)
++		goto out;
++
++out:
++	kfree(break_msg);
++	return err ?: count;
++}
++
++static const struct file_operations nsim_dev_health_break_fops = {
++	.open = simple_open,
++	.write = nsim_dev_health_break_write,
++	.llseek = generic_file_llseek,
++};
++
++int nsim_dev_health_init(struct nsim_dev *nsim_dev, struct devlink *devlink)
++{
++	struct nsim_dev_health *health = &nsim_dev->health;
++	int err;
++
++	health->empty_reporter =
++		devlink_health_reporter_create(devlink,
++					       &nsim_dev_empty_reporter_ops,
++					       0, false, health);
++	if (IS_ERR(health->empty_reporter))
++		return PTR_ERR(health->empty_reporter);
++
++	health->dummy_reporter =
++		devlink_health_reporter_create(devlink,
++					       &nsim_dev_dummy_reporter_ops,
++					       0, false, health);
++	if (IS_ERR(health->dummy_reporter)) {
++		err = PTR_ERR(health->dummy_reporter);
++		goto err_empty_reporter_destroy;
++	}
++
++	health->ddir = debugfs_create_dir("health", nsim_dev->ddir);
++	if (IS_ERR_OR_NULL(health->ddir)) {
++		err = PTR_ERR_OR_ZERO(health->ddir) ?: -EINVAL;
++		goto err_dummy_reporter_destroy;
++	}
++
++	health->recovered_break_msg = NULL;
++	debugfs_create_file("break_health", 0200, health->ddir, health,
++			    &nsim_dev_health_break_fops);
++	health->binary_len = 16;
++	debugfs_create_u32("binary_len", 0600, health->ddir,
++			   &health->binary_len);
++	health->fail_recover = false;
++	debugfs_create_bool("fail_recover", 0600, health->ddir,
++			    &health->fail_recover);
++	return 0;
++
++err_dummy_reporter_destroy:
++	devlink_health_reporter_destroy(health->dummy_reporter);
++err_empty_reporter_destroy:
++	devlink_health_reporter_destroy(health->empty_reporter);
++	return err;
++}
++
++void nsim_dev_health_exit(struct nsim_dev *nsim_dev)
++{
++	struct nsim_dev_health *health = &nsim_dev->health;
++
++	debugfs_remove_recursive(health->ddir);
++	kfree(health->recovered_break_msg);
++	devlink_health_reporter_destroy(health->dummy_reporter);
++	devlink_health_reporter_destroy(health->empty_reporter);
++}
+diff --git a/drivers/net/netdevsim/netdevsim.h b/drivers/net/netdevsim/netdevsim.h
+index 4035af41eca9..690a4d38c55e 100644
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -134,6 +134,18 @@ enum nsim_resource_id {
+ 	NSIM_RESOURCE_IPV6_FIB_RULES,
+ };
+ 
++struct nsim_dev_health {
++	struct devlink_health_reporter *empty_reporter;
++	struct devlink_health_reporter *dummy_reporter;
++	struct dentry *ddir;
++	char *recovered_break_msg;
++	u32 binary_len;
++	bool fail_recover;
++};
++
++int nsim_dev_health_init(struct nsim_dev *nsim_dev, struct devlink *devlink);
++void nsim_dev_health_exit(struct nsim_dev *nsim_dev);
++
+ struct nsim_dev_port {
+ 	struct list_head list;
+ 	struct devlink_port devlink_port;
+@@ -162,6 +174,7 @@ struct nsim_dev {
+ 	u32 max_macs;
+ 	bool test1;
+ 	struct devlink_region *dummy_region;
++	struct nsim_dev_health health;
+ };
+ 
+ static inline struct net *nsim_dev_net(struct nsim_dev *nsim_dev)
