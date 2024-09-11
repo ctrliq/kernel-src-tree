@@ -4995,6 +4995,7 @@ int stmmac_resume(struct device *dev)
 
 	netif_device_attach(ndev);
 
+	rtnl_lock();
 	mutex_lock(&priv->lock);
 
 	stmmac_reset_queues_param(priv);
@@ -5008,6 +5009,7 @@ int stmmac_resume(struct device *dev)
 	stmmac_enable_all_queues(priv);
 
 	mutex_unlock(&priv->lock);
+	rtnl_unlock();
 
 	if (!device_may_wakeup(priv->device) || !priv->plat->pmt) {
 		rtnl_lock();
