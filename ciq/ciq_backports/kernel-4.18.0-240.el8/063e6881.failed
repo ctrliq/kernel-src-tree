@@ -1,0 +1,149 @@
+libbpf: Fix false uninitialized variable warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 063e688133914505ddb396cc33231f22f12e0685
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/063e6881.failed
+
+Some versions of GCC falsely detect that vi might not be initialized. That's
+not true, but let's silence it with NULL initialization.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20200430021436.1522502-1-andriin@fb.com
+(cherry picked from commit 063e688133914505ddb396cc33231f22f12e0685)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index e39f1837896b,977add1b73e2..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -3526,6 -4996,119 +3526,122 @@@ bpf_object__relocate(struct bpf_object 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bpf_object__collect_st_ops_relos(struct bpf_object *obj,
++ 					    GElf_Shdr *shdr, Elf_Data *data);
++ 
++ static int bpf_object__collect_map_relos(struct bpf_object *obj,
++ 					 GElf_Shdr *shdr, Elf_Data *data)
++ {
++ 	int i, j, nrels, new_sz, ptr_sz = sizeof(void *);
++ 	const struct btf_var_secinfo *vi = NULL;
++ 	const struct btf_type *sec, *var, *def;
++ 	const struct btf_member *member;
++ 	struct bpf_map *map, *targ_map;
++ 	const char *name, *mname;
++ 	Elf_Data *symbols;
++ 	unsigned int moff;
++ 	GElf_Sym sym;
++ 	GElf_Rel rel;
++ 	void *tmp;
++ 
++ 	if (!obj->efile.btf_maps_sec_btf_id || !obj->btf)
++ 		return -EINVAL;
++ 	sec = btf__type_by_id(obj->btf, obj->efile.btf_maps_sec_btf_id);
++ 	if (!sec)
++ 		return -EINVAL;
++ 
++ 	symbols = obj->efile.symbols;
++ 	nrels = shdr->sh_size / shdr->sh_entsize;
++ 	for (i = 0; i < nrels; i++) {
++ 		if (!gelf_getrel(data, i, &rel)) {
++ 			pr_warn(".maps relo #%d: failed to get ELF relo\n", i);
++ 			return -LIBBPF_ERRNO__FORMAT;
++ 		}
++ 		if (!gelf_getsym(symbols, GELF_R_SYM(rel.r_info), &sym)) {
++ 			pr_warn(".maps relo #%d: symbol %zx not found\n",
++ 				i, (size_t)GELF_R_SYM(rel.r_info));
++ 			return -LIBBPF_ERRNO__FORMAT;
++ 		}
++ 		name = elf_strptr(obj->efile.elf, obj->efile.strtabidx,
++ 				  sym.st_name) ? : "<?>";
++ 		if (sym.st_shndx != obj->efile.btf_maps_shndx) {
++ 			pr_warn(".maps relo #%d: '%s' isn't a BTF-defined map\n",
++ 				i, name);
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 
++ 		pr_debug(".maps relo #%d: for %zd value %zd rel.r_offset %zu name %d ('%s')\n",
++ 			 i, (ssize_t)(rel.r_info >> 32), (size_t)sym.st_value,
++ 			 (size_t)rel.r_offset, sym.st_name, name);
++ 
++ 		for (j = 0; j < obj->nr_maps; j++) {
++ 			map = &obj->maps[j];
++ 			if (map->sec_idx != obj->efile.btf_maps_shndx)
++ 				continue;
++ 
++ 			vi = btf_var_secinfos(sec) + map->btf_var_idx;
++ 			if (vi->offset <= rel.r_offset &&
++ 			    rel.r_offset + sizeof(void *) <= vi->offset + vi->size)
++ 				break;
++ 		}
++ 		if (j == obj->nr_maps) {
++ 			pr_warn(".maps relo #%d: cannot find map '%s' at rel.r_offset %zu\n",
++ 				i, name, (size_t)rel.r_offset);
++ 			return -EINVAL;
++ 		}
++ 
++ 		if (!bpf_map_type__is_map_in_map(map->def.type))
++ 			return -EINVAL;
++ 		if (map->def.type == BPF_MAP_TYPE_HASH_OF_MAPS &&
++ 		    map->def.key_size != sizeof(int)) {
++ 			pr_warn(".maps relo #%d: hash-of-maps '%s' should have key size %zu.\n",
++ 				i, map->name, sizeof(int));
++ 			return -EINVAL;
++ 		}
++ 
++ 		targ_map = bpf_object__find_map_by_name(obj, name);
++ 		if (!targ_map)
++ 			return -ESRCH;
++ 
++ 		var = btf__type_by_id(obj->btf, vi->type);
++ 		def = skip_mods_and_typedefs(obj->btf, var->type, NULL);
++ 		if (btf_vlen(def) == 0)
++ 			return -EINVAL;
++ 		member = btf_members(def) + btf_vlen(def) - 1;
++ 		mname = btf__name_by_offset(obj->btf, member->name_off);
++ 		if (strcmp(mname, "values"))
++ 			return -EINVAL;
++ 
++ 		moff = btf_member_bit_offset(def, btf_vlen(def) - 1) / 8;
++ 		if (rel.r_offset - vi->offset < moff)
++ 			return -EINVAL;
++ 
++ 		moff = rel.r_offset - vi->offset - moff;
++ 		if (moff % ptr_sz)
++ 			return -EINVAL;
++ 		moff /= ptr_sz;
++ 		if (moff >= map->init_slots_sz) {
++ 			new_sz = moff + 1;
++ 			tmp = realloc(map->init_slots, new_sz * ptr_sz);
++ 			if (!tmp)
++ 				return -ENOMEM;
++ 			map->init_slots = tmp;
++ 			memset(map->init_slots + map->init_slots_sz, 0,
++ 			       (new_sz - map->init_slots_sz) * ptr_sz);
++ 			map->init_slots_sz = new_sz;
++ 		}
++ 		map->init_slots[moff] = targ_map;
++ 
++ 		pr_debug(".maps relo #%d: map '%s' slot [%d] points to map '%s'\n",
++ 			 i, map->name, moff, name);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 063e68813391 (libbpf: Fix false uninitialized variable warning)
+  static int bpf_object__collect_reloc(struct bpf_object *obj)
+  {
+  	int i, err;
+* Unmerged path tools/lib/bpf/libbpf.c
