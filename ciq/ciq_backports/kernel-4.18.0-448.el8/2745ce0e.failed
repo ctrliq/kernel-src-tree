@@ -1,0 +1,371 @@
+scsi: mpi3mr: Refresh SAS ports during soft reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+commit 2745ce0e6d30e66a97bc6c236cde3356812a3496
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/2745ce0e.failed
+
+Update the host's SAS ports if there is change in port id or phys. If the
+port id is changed, then the driver updates it. If some phys are
+enabled/disabled during reset, then driver updates them in STL.
+
+Check for the responding expander devices and update the device handle if
+it got changed. Register the expander with STL if it got added during reset
+and unregister the expander device if it got removed during reset.
+
+[mkp: include fix for zeroday warning]
+
+Link: https://lore.kernel.org/r/20220804131226.16653-15-sreekanth.reddy@broadcom.com
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+	Signed-off-by: Sreekanth Reddy <sreekanth.reddy@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 2745ce0e6d30e66a97bc6c236cde3356812a3496)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpi3mr/mpi3mr.h
+#	drivers/scsi/mpi3mr/mpi3mr_os.c
+#	drivers/scsi/mpi3mr/mpi3mr_transport.c
+diff --cc drivers/scsi/mpi3mr/mpi3mr.h
+index 8de3e5650c79,0f47b451beb3..000000000000
+--- a/drivers/scsi/mpi3mr/mpi3mr.h
++++ b/drivers/scsi/mpi3mr/mpi3mr.h
+@@@ -425,6 -440,139 +425,142 @@@ struct mpi3mr_intr_info 
+  };
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * struct mpi3mr_throttle_group_info - Throttle group info
++  *
++  * @io_divert: Flag indicates io divert is on or off for the TG
++  * @need_qd_reduction: Flag to indicate QD reduction is needed
++  * @qd_reduction: Queue Depth reduction in units of 10%
++  * @fw_qd: QueueDepth value reported by the firmware
++  * @modified_qd: Modified QueueDepth value due to throttling
++  * @id: Throttle Group ID.
++  * @high: High limit to turn on throttling in 512 byte blocks
++  * @low: Low limit to turn off throttling in 512 byte blocks
++  * @pend_large_data_sz: Counter to track pending large data
++  */
++ struct mpi3mr_throttle_group_info {
++ 	u8 io_divert;
++ 	u8 need_qd_reduction;
++ 	u8 qd_reduction;
++ 	u16 fw_qd;
++ 	u16 modified_qd;
++ 	u16 id;
++ 	u32 high;
++ 	u32 low;
++ 	atomic_t pend_large_data_sz;
++ };
++ 
++ /* HBA port flags */
++ #define MPI3MR_HBA_PORT_FLAG_DIRTY	0x01
++ 
++ /**
++  * struct mpi3mr_hba_port - HBA's port information
++  * @port_id: Port number
++  * @flags: HBA port flags
++  */
++ struct mpi3mr_hba_port {
++ 	struct list_head list;
++ 	u8 port_id;
++ 	u8 flags;
++ };
++ 
++ /**
++  * struct mpi3mr_sas_port - Internal SAS port information
++  * @port_list: List of ports belonging to a SAS node
++  * @num_phys: Number of phys associated with port
++  * @marked_responding: used while refresing the sas ports
++  * @lowest_phy: lowest phy ID of current sas port
++  * @phy_mask: phy_mask of current sas port
++  * @hba_port: HBA port entry
++  * @remote_identify: Attached device identification
++  * @rphy: SAS transport layer rphy object
++  * @port: SAS transport layer port object
++  * @phy_list: mpi3mr_sas_phy objects belonging to this port
++  */
++ struct mpi3mr_sas_port {
++ 	struct list_head port_list;
++ 	u8 num_phys;
++ 	u8 marked_responding;
++ 	int lowest_phy;
++ 	u32 phy_mask;
++ 	struct mpi3mr_hba_port *hba_port;
++ 	struct sas_identify remote_identify;
++ 	struct sas_rphy *rphy;
++ 	struct sas_port *port;
++ 	struct list_head phy_list;
++ };
++ 
++ /**
++  * struct mpi3mr_sas_phy - Internal SAS Phy information
++  * @port_siblings: List of phys belonging to a port
++  * @identify: Phy identification
++  * @remote_identify: Attached device identification
++  * @phy: SAS transport layer Phy object
++  * @phy_id: Unique phy id within a port
++  * @handle: Firmware device handle for this phy
++  * @attached_handle: Firmware device handle for attached device
++  * @phy_belongs_to_port: Flag to indicate phy belongs to port
++    @hba_port: HBA port entry
++  */
++ struct mpi3mr_sas_phy {
++ 	struct list_head port_siblings;
++ 	struct sas_identify identify;
++ 	struct sas_identify remote_identify;
++ 	struct sas_phy *phy;
++ 	u8 phy_id;
++ 	u16 handle;
++ 	u16 attached_handle;
++ 	u8 phy_belongs_to_port;
++ 	struct mpi3mr_hba_port *hba_port;
++ };
++ 
++ /**
++  * struct mpi3mr_sas_node - SAS host/expander information
++  * @list: List of sas nodes in a controller
++  * @parent_dev: Parent device class
++  * @num_phys: Number phys belonging to sas_node
++  * @sas_address: SAS address of sas_node
++  * @handle: Firmware device handle for this sas_host/expander
++  * @sas_address_parent: SAS address of parent expander or host
++  * @enclosure_handle: Firmware handle of enclosure of this node
++  * @device_info: Capabilities of this sas_host/expander
++  * @non_responding: used to refresh the expander devices during reset
++  * @host_node: Flag to indicate this is a host_node
++  * @hba_port: HBA port entry
++  * @phy: A list of phys that make up this sas_host/expander
++  * @sas_port_list: List of internal ports of this node
++  * @rphy: sas_rphy object of this expander node
++  */
++ struct mpi3mr_sas_node {
++ 	struct list_head list;
++ 	struct device *parent_dev;
++ 	u8 num_phys;
++ 	u64 sas_address;
++ 	u16 handle;
++ 	u64 sas_address_parent;
++ 	u16 enclosure_handle;
++ 	u64 enclosure_logical_id;
++ 	u8 non_responding;
++ 	u8 host_node;
++ 	struct mpi3mr_hba_port *hba_port;
++ 	struct mpi3mr_sas_phy *phy;
++ 	struct list_head sas_port_list;
++ 	struct sas_rphy *rphy;
++ };
++ 
++ /**
++  * struct mpi3mr_enclosure_node - enclosure information
++  * @list: List of enclosures
++  * @pg0: Enclosure page 0;
++  */
++ struct mpi3mr_enclosure_node {
++ 	struct list_head list;
++ 	struct mpi3_enclosure_page0 pg0;
++ };
++ 
++ /**
+++>>>>>>> 2745ce0e6d30 (scsi: mpi3mr: Refresh SAS ports during soft reset)
+   * struct tgt_dev_sas_sata - SAS/SATA device specific
+   * information cached from firmware given data
+   *
+@@@ -1084,6 -1329,64 +1222,65 @@@ int mpi3mr_pel_get_seqnum_post(struct m
+  	struct mpi3mr_drv_cmd *drv_cmd);
+  void mpi3mr_app_save_logdata(struct mpi3mr_ioc *mrioc, char *event_data,
+  	u16 event_data_size);
+ -struct mpi3mr_enclosure_node *mpi3mr_enclosure_find_by_handle(
+ -	struct mpi3mr_ioc *mrioc, u16 handle);
+ -extern const struct attribute_group *mpi3mr_host_groups[];
+ +extern struct device_attribute *mpi3mr_host_attrs[];
+  extern const struct attribute_group *mpi3mr_dev_groups[];
+++<<<<<<< HEAD
+++=======
++ 
++ extern struct sas_function_template mpi3mr_transport_functions;
++ extern struct scsi_transport_template *mpi3mr_transport_template;
++ 
++ int mpi3mr_cfg_get_dev_pg0(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
++ 	struct mpi3_device_page0 *dev_pg0, u16 pg_sz, u32 form, u32 form_spec);
++ int mpi3mr_cfg_get_sas_phy_pg0(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
++ 	struct mpi3_sas_phy_page0 *phy_pg0, u16 pg_sz, u32 form,
++ 	u32 form_spec);
++ int mpi3mr_cfg_get_sas_phy_pg1(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
++ 	struct mpi3_sas_phy_page1 *phy_pg1, u16 pg_sz, u32 form,
++ 	u32 form_spec);
++ int mpi3mr_cfg_get_sas_exp_pg0(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
++ 	struct mpi3_sas_expander_page0 *exp_pg0, u16 pg_sz, u32 form,
++ 	u32 form_spec);
++ int mpi3mr_cfg_get_sas_exp_pg1(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
++ 	struct mpi3_sas_expander_page1 *exp_pg1, u16 pg_sz, u32 form,
++ 	u32 form_spec);
++ int mpi3mr_cfg_get_enclosure_pg0(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
++ 	struct mpi3_enclosure_page0 *encl_pg0, u16 pg_sz, u32 form,
++ 	u32 form_spec);
++ int mpi3mr_cfg_get_sas_io_unit_pg0(struct mpi3mr_ioc *mrioc,
++ 	struct mpi3_sas_io_unit_page0 *sas_io_unit_pg0, u16 pg_sz);
++ int mpi3mr_cfg_get_sas_io_unit_pg1(struct mpi3mr_ioc *mrioc,
++ 	struct mpi3_sas_io_unit_page1 *sas_io_unit_pg1, u16 pg_sz);
++ int mpi3mr_cfg_set_sas_io_unit_pg1(struct mpi3mr_ioc *mrioc,
++ 	struct mpi3_sas_io_unit_page1 *sas_io_unit_pg1, u16 pg_sz);
++ int mpi3mr_cfg_get_driver_pg1(struct mpi3mr_ioc *mrioc,
++ 	struct mpi3_driver_page1 *driver_pg1, u16 pg_sz);
++ 
++ u8 mpi3mr_is_expander_device(u16 device_info);
++ int mpi3mr_expander_add(struct mpi3mr_ioc *mrioc, u16 handle);
++ void mpi3mr_expander_remove(struct mpi3mr_ioc *mrioc, u64 sas_address,
++ 	struct mpi3mr_hba_port *hba_port);
++ struct mpi3mr_sas_node *__mpi3mr_expander_find_by_handle(struct mpi3mr_ioc
++ 	*mrioc, u16 handle);
++ struct mpi3mr_hba_port *mpi3mr_get_hba_port_by_id(struct mpi3mr_ioc *mrioc,
++ 	u8 port_id);
++ void mpi3mr_sas_host_refresh(struct mpi3mr_ioc *mrioc);
++ void mpi3mr_sas_host_add(struct mpi3mr_ioc *mrioc);
++ void mpi3mr_update_links(struct mpi3mr_ioc *mrioc,
++ 	u64 sas_address_parent, u16 handle, u8 phy_number, u8 link_rate,
++ 	struct mpi3mr_hba_port *hba_port);
++ void mpi3mr_remove_tgtdev_from_host(struct mpi3mr_ioc *mrioc,
++ 	struct mpi3mr_tgt_dev *tgtdev);
++ int mpi3mr_report_tgtdev_to_sas_transport(struct mpi3mr_ioc *mrioc,
++ 	struct mpi3mr_tgt_dev *tgtdev);
++ void mpi3mr_remove_tgtdev_from_sas_transport(struct mpi3mr_ioc *mrioc,
++ 	struct mpi3mr_tgt_dev *tgtdev);
++ struct mpi3mr_tgt_dev *__mpi3mr_get_tgtdev_by_addr_and_rphy(
++ 	struct mpi3mr_ioc *mrioc, u64 sas_address, struct sas_rphy *rphy);
++ void mpi3mr_print_device_event_notice(struct mpi3mr_ioc *mrioc,
++ 	bool device_add);
++ void mpi3mr_refresh_sas_ports(struct mpi3mr_ioc *mrioc);
++ void mpi3mr_refresh_expanders(struct mpi3mr_ioc *mrioc);
++ void mpi3mr_add_event_wait_for_device_refresh(struct mpi3mr_ioc *mrioc);
+++>>>>>>> 2745ce0e6d30 (scsi: mpi3mr: Refresh SAS ports during soft reset)
+  #endif /*MPI3MR_H_INCLUDED*/
+diff --cc drivers/scsi/mpi3mr/mpi3mr_os.c
+index c851b53cb9f5,d787d0f5a031..000000000000
+--- a/drivers/scsi/mpi3mr/mpi3mr_os.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_os.c
+@@@ -38,6 -38,10 +38,13 @@@ MODULE_PARM_DESC(logging_level
+  static void mpi3mr_send_event_ack(struct mpi3mr_ioc *mrioc, u8 event,
+  	struct mpi3mr_drv_cmd *cmdparam, u32 event_ctx);
+  
+++<<<<<<< HEAD
+++=======
++ #define MPI3MR_DRIVER_EVENT_TG_QD_REDUCTION	(0xFFFF)
++ 
++ #define MPI3_EVENT_WAIT_FOR_DEVICES_TO_REFRESH	(0xFFFE)
++ 
+++>>>>>>> 2745ce0e6d30 (scsi: mpi3mr: Refresh SAS ports during soft reset)
+  /**
+   * mpi3mr_host_tag_for_scmd - Get host tag for a scmd
+   * @mrioc: Adapter instance reference
+@@@ -994,6 -1101,16 +1001,19 @@@ static void mpi3mr_update_tgtdev(struc
+  		else if (!(dev_info & (MPI3_SAS_DEVICE_INFO_STP_SATA_TARGET |
+  		    MPI3_SAS_DEVICE_INFO_SSP_TARGET)))
+  			tgtdev->is_hidden = 1;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (((tgtdev->devpg0_flag &
++ 		    MPI3_DEVICE0_FLAGS_ATT_METHOD_DIR_ATTACHED)
++ 		    && (tgtdev->devpg0_flag &
++ 		    MPI3_DEVICE0_FLAGS_ATT_METHOD_VIRTUAL)) ||
++ 		    (tgtdev->parent_handle == 0xFFFF))
++ 			tgtdev->non_stl = 1;
++ 		if (tgtdev->dev_spec.sas_sata_inf.hba_port)
++ 			tgtdev->dev_spec.sas_sata_inf.hba_port->port_id =
++ 			    dev_pg0->io_unit_port;
+++>>>>>>> 2745ce0e6d30 (scsi: mpi3mr: Refresh SAS ports during soft reset)
+  		break;
+  	}
+  	case MPI3_DEVICE_DEVFORM_PCIE:
+@@@ -1492,6 -1870,36 +1512,39 @@@ static void mpi3mr_fwevt_bh(struct mpi3
+  		mpi3mr_logdata_evt_bh(mrioc, fwevt);
+  		break;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	case MPI3MR_DRIVER_EVENT_TG_QD_REDUCTION:
++ 	{
++ 		struct mpi3mr_throttle_group_info *tg;
++ 
++ 		tg = *(struct mpi3mr_throttle_group_info **)fwevt->event_data;
++ 		dprint_event_bh(mrioc,
++ 		    "qd reduction event processed for tg_id(%d) reduction_needed(%d)\n",
++ 		    tg->id, tg->need_qd_reduction);
++ 		if (tg->need_qd_reduction) {
++ 			mpi3mr_set_qd_for_all_vd_in_tg(mrioc, tg);
++ 			tg->need_qd_reduction = 0;
++ 		}
++ 		break;
++ 	}
++ 	case MPI3_EVENT_WAIT_FOR_DEVICES_TO_REFRESH:
++ 	{
++ 		while (mrioc->device_refresh_on)
++ 			msleep(500);
++ 
++ 		dprint_event_bh(mrioc,
++ 		    "scan for non responding and newly added devices after soft reset started\n");
++ 		if (mrioc->sas_transport_enabled) {
++ 			mpi3mr_refresh_sas_ports(mrioc);
++ 			mpi3mr_refresh_expanders(mrioc);
++ 		}
++ 		mpi3mr_rfresh_tgtdevs(mrioc);
++ 		ioc_info(mrioc,
++ 		    "scan for non responding and newly added devices after soft reset completed\n");
++ 		break;
++ 	}
+++>>>>>>> 2745ce0e6d30 (scsi: mpi3mr: Refresh SAS ports during soft reset)
+  	default:
+  		break;
+  	}
+* Unmerged path drivers/scsi/mpi3mr/mpi3mr_transport.c
+* Unmerged path drivers/scsi/mpi3mr/mpi3mr.h
+diff --git a/drivers/scsi/mpi3mr/mpi3mr_fw.c b/drivers/scsi/mpi3mr/mpi3mr_fw.c
+index a891e8c285f7..09a290b6c227 100644
+--- a/drivers/scsi/mpi3mr/mpi3mr_fw.c
++++ b/drivers/scsi/mpi3mr/mpi3mr_fw.c
+@@ -3909,6 +3909,11 @@ int mpi3mr_reinit_ioc(struct mpi3mr_ioc *mrioc, u8 is_resume)
+ 		goto out_failed;
+ 	}
+ 
++	if (!is_resume) {
++		mrioc->device_refresh_on = 1;
++		mpi3mr_add_event_wait_for_device_refresh(mrioc);
++	}
++
+ 	ioc_info(mrioc, "sending port enable\n");
+ 	retval = mpi3mr_issue_port_enable(mrioc, 0);
+ 	if (retval) {
+@@ -4637,6 +4642,7 @@ int mpi3mr_soft_reset_handler(struct mpi3mr_ioc *mrioc,
+ 	ioc_info(mrioc, "controller reset is triggered by %s\n",
+ 	    mpi3mr_reset_rc_name(reset_reason));
+ 
++	mrioc->device_refresh_on = 0;
+ 	mrioc->reset_in_progress = 1;
+ 	mrioc->stop_bsgs = 1;
+ 	mrioc->prev_reset_result = -1;
+@@ -4709,7 +4715,8 @@ int mpi3mr_soft_reset_handler(struct mpi3mr_ioc *mrioc,
+ 			mpi3mr_pel_wait_post(mrioc, &mrioc->pel_cmds);
+ 		}
+ 
+-		mpi3mr_rfresh_tgtdevs(mrioc);
++		mrioc->device_refresh_on = 0;
++
+ 		mrioc->ts_update_counter = 0;
+ 		spin_lock_irqsave(&mrioc->watchdog_lock, flags);
+ 		if (mrioc->watchdog_work_q)
+@@ -4723,6 +4730,7 @@ int mpi3mr_soft_reset_handler(struct mpi3mr_ioc *mrioc,
+ 	} else {
+ 		mpi3mr_issue_reset(mrioc,
+ 		    MPI3_SYSIF_HOST_DIAG_RESET_ACTION_DIAG_FAULT, reset_reason);
++		mrioc->device_refresh_on = 0;
+ 		mrioc->unrecoverable = 1;
+ 		mrioc->reset_in_progress = 0;
+ 		retval = -1;
+* Unmerged path drivers/scsi/mpi3mr/mpi3mr_os.c
+* Unmerged path drivers/scsi/mpi3mr/mpi3mr_transport.c
