@@ -1,0 +1,173 @@
+bridge: broute: make broute a real ebtables table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 223fd0adfa8af36d5d9b5d38016e579ee052f367
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/223fd0ad.failed
+
+This makes broute a normal ebtables table, hooking at PREROUTING.
+The broute hook is removed.
+
+It uses skb->cb to signal to bridge rx handler that the skb should be
+routed instead of being bridged.
+
+This change is backwards compatible with ebtables as no userspace visible
+parts are changed.
+
+This means we can also remove the !ops test in ebt_register_table,
+it was only there for broute table sake.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Acked-by: David S. Miller <davem@davemloft.net>
+	Acked-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 223fd0adfa8af36d5d9b5d38016e579ee052f367)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/netfilter/ebtable_broute.c
+#	net/bridge/netfilter/ebtables.c
+diff --cc net/bridge/netfilter/ebtable_broute.c
+index 85bd9e883d82,ec2652a459da..000000000000
+--- a/net/bridge/netfilter/ebtable_broute.c
++++ b/net/bridge/netfilter/ebtable_broute.c
+@@@ -71,7 -106,7 +106,11 @@@ static int __net_init broute_net_init(s
+  
+  static void __net_exit broute_net_exit(struct net *net)
+  {
+++<<<<<<< HEAD
+ +	ebt_unregister_table(net, net->xt.broute_table);
+++=======
++ 	ebt_unregister_table(net, net->xt.broute_table, &ebt_ops_broute);
+++>>>>>>> 223fd0adfa8a (bridge: broute: make broute a real ebtables table)
+  }
+  
+  static struct pernet_operations broute_net_ops = {
+diff --cc net/bridge/netfilter/ebtables.c
+index 12e602e6bc55,383f0328ff68..000000000000
+--- a/net/bridge/netfilter/ebtables.c
++++ b/net/bridge/netfilter/ebtables.c
+@@@ -1286,34 -1241,10 +1282,38 @@@ out
+  	return ret;
+  }
+  
+ -void ebt_unregister_table(struct net *net, struct ebt_table *table,
+ -			  const struct nf_hook_ops *ops)
+ +static struct ebt_table *__ebt_find_table(struct net *net, const char *name)
+  {
+++<<<<<<< HEAD
+ +	struct ebt_table *t;
+ +
+ +	mutex_lock(&ebt_mutex);
+ +
+ +	list_for_each_entry(t, &net->xt.tables[NFPROTO_BRIDGE], list) {
+ +		if (strcmp(t->name, name) == 0) {
+ +			mutex_unlock(&ebt_mutex);
+ +			return t;
+ +		}
+ +	}
+ +
+ +	mutex_unlock(&ebt_mutex);
+ +	return NULL;
+ +}
+ +
+ +void ebt_unregister_table_pre_exit(struct net *net, const char *name, const struct nf_hook_ops *ops)
+ +{
+ +	struct ebt_table *table = __ebt_find_table(net, name);
+ +
+ +	if (table)
+ +		nf_unregister_net_hooks(net, ops, hweight32(table->valid_hooks));
+ +}
+ +EXPORT_SYMBOL(ebt_unregister_table_pre_exit);
+ +
+ +void ebt_unregister_table(struct net *net, struct ebt_table *table)
+ +{
+++=======
++ 	nf_unregister_net_hooks(net, ops, hweight32(table->valid_hooks));
+++>>>>>>> 223fd0adfa8a (bridge: broute: make broute a real ebtables table)
+  	__ebt_unregister_table(net, table);
+  }
+  
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index 7be74150278b..c1c7ea3053d6 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -56,9 +56,6 @@ struct br_ip_list {
+ 
+ extern void brioctl_set(int (*ioctl_hook)(struct net *, unsigned int, void __user *));
+ 
+-typedef int br_should_route_hook_t(struct sk_buff *skb);
+-extern br_should_route_hook_t __rcu *br_should_route_hook;
+-
+ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_IGMP_SNOOPING)
+ int br_multicast_list_adjacent(struct net_device *dev,
+ 			       struct list_head *br_ip_list);
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 6c031437a251..baf461d3491f 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -24,10 +24,6 @@
+ #include "br_private.h"
+ #include "br_private_tunnel.h"
+ 
+-/* Hook for brouter */
+-br_should_route_hook_t __rcu *br_should_route_hook __read_mostly;
+-EXPORT_SYMBOL(br_should_route_hook);
+-
+ static int
+ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+@@ -227,6 +223,10 @@ static int nf_hook_bridge_pre(struct sk_buff *skb, struct sk_buff **pskb)
+ 		verdict = nf_hook_entry_hookfn(&e->hooks[i], skb, &state);
+ 		switch (verdict & NF_VERDICT_MASK) {
+ 		case NF_ACCEPT:
++			if (BR_INPUT_SKB_CB(skb)->br_netfilter_broute) {
++				*pskb = skb;
++				return RX_HANDLER_PASS;
++			}
+ 			break;
+ 		case NF_DROP:
+ 			kfree_skb(skb);
+@@ -258,7 +258,6 @@ rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
+ 	struct net_bridge_port *p;
+ 	struct sk_buff *skb = *pskb;
+ 	const unsigned char *dest = eth_hdr(skb)->h_dest;
+-	br_should_route_hook_t *rhook;
+ 
+ 	if (unlikely(skb->pkt_type == PACKET_LOOPBACK))
+ 		return RX_HANDLER_PASS;
+@@ -342,15 +341,6 @@ rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
+ forward:
+ 	switch (p->state) {
+ 	case BR_STATE_FORWARDING:
+-		rhook = rcu_dereference(br_should_route_hook);
+-		if (rhook) {
+-			if ((*rhook)(skb)) {
+-				*pskb = skb;
+-				return RX_HANDLER_PASS;
+-			}
+-			dest = eth_hdr(skb)->h_dest;
+-		}
+-		/* fall through */
+ 	case BR_STATE_LEARNING:
+ 		if (ether_addr_equal(p->br->dev->dev_addr, dest))
+ 			skb->pkt_type = PACKET_HOST;
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 58b478ffcd8c..0033706d6ac6 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -438,6 +438,9 @@ struct br_input_skb_cb {
+ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+ 	u8 vlan_filtered:1;
+ #endif
++#ifdef CONFIG_NETFILTER_FAMILY_BRIDGE
++	u8 br_netfilter_broute:1;
++#endif
+ 
+ #ifdef CONFIG_NET_SWITCHDEV
+ 	int offload_fwd_mark;
+* Unmerged path net/bridge/netfilter/ebtable_broute.c
+* Unmerged path net/bridge/netfilter/ebtables.c
