@@ -1,0 +1,119 @@
+virtiofs: implement FUSE_INIT map_alignment field
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Stefan Hajnoczi <stefanha@redhat.com>
+commit fd1a1dc6f5aa7361e3562790336e116935f8fcfa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fd1a1dc6.failed
+
+The device communicates FUSE_SETUPMAPPING/FUSE_REMOVMAPPING alignment
+constraints via the FUST_INIT map_alignment field.  Parse this field and
+ensure our DAX mappings meet the alignment constraints.
+
+We don't actually align anything differently since our mappings are
+already 2MB aligned.  Just check the value when the connection is
+established.  If it becomes necessary to honor arbitrary alignments in
+the future we'll have to adjust how mappings are sized.
+
+The upshot of this commit is that we can be confident that mappings will
+work even when emulating x86 on Power and similar combinations where the
+host page sizes are different.
+
+	Signed-off-by: Stefan Hajnoczi <stefanha@redhat.com>
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit fd1a1dc6f5aa7361e3562790336e116935f8fcfa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dax.c
+#	fs/fuse/fuse_i.h
+diff --cc fs/fuse/fuse_i.h
+index 50415774dba0,2f3f04aa64c7..000000000000
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@@ -1092,4 -1102,10 +1092,13 @@@ unsigned int fuse_len_args(unsigned in
+  u64 fuse_get_unique(struct fuse_iqueue *fiq);
+  void fuse_free_conn(struct fuse_conn *fc);
+  
+++<<<<<<< HEAD
+++=======
++ /* dax.c */
++ 
++ int fuse_dax_conn_alloc(struct fuse_conn *fc, struct dax_device *dax_dev);
++ void fuse_dax_conn_free(struct fuse_conn *fc);
++ bool fuse_dax_check_alignment(struct fuse_conn *fc, unsigned int map_alignment);
++ 
+++>>>>>>> fd1a1dc6f5aa (virtiofs: implement FUSE_INIT map_alignment field)
+  #endif /* _FS_FUSE_I_H */
+* Unmerged path fs/fuse/dax.c
+* Unmerged path fs/fuse/dax.c
+* Unmerged path fs/fuse/fuse_i.h
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 10b75246113a..134aed84211e 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -892,9 +892,10 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_args *args,
+ {
+ 	struct fuse_init_args *ia = container_of(args, typeof(*ia), args);
+ 	struct fuse_init_out *arg = &ia->out;
++	bool ok = true;
+ 
+ 	if (error || arg->major != FUSE_KERNEL_VERSION)
+-		fc->conn_error = 1;
++		ok = false;
+ 	else {
+ 		unsigned long ra_pages;
+ 
+@@ -957,6 +958,11 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_args *args,
+ 					min_t(unsigned int, FUSE_MAX_MAX_PAGES,
+ 					max_t(unsigned int, arg->max_pages, 1));
+ 			}
++			if (IS_ENABLED(CONFIG_FUSE_DAX) &&
++			    arg->flags & FUSE_MAP_ALIGNMENT &&
++			    !fuse_dax_check_alignment(fc, arg->map_alignment)) {
++				ok = false;
++			}
+ 		} else {
+ 			ra_pages = fc->max_read / PAGE_SIZE;
+ 			fc->no_lock = 1;
+@@ -972,6 +978,11 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_args *args,
+ 	}
+ 	kfree(ia);
+ 
++	if (!ok) {
++		fc->conn_init = 0;
++		fc->conn_error = 1;
++	}
++
+ 	fuse_set_initialized(fc);
+ 	wake_up_all(&fc->blocked_waitq);
+ }
+@@ -995,6 +1006,10 @@ void fuse_send_init(struct fuse_conn *fc)
+ 		FUSE_PARALLEL_DIROPS | FUSE_HANDLE_KILLPRIV | FUSE_POSIX_ACL |
+ 		FUSE_ABORT_ERROR | FUSE_MAX_PAGES | FUSE_CACHE_SYMLINKS |
+ 		FUSE_NO_OPENDIR_SUPPORT | FUSE_EXPLICIT_INVAL_DATA;
++#ifdef CONFIG_FUSE_DAX
++	if (fc->dax)
++		ia->in.flags |= FUSE_MAP_ALIGNMENT;
++#endif
+ 	ia->args.opcode = FUSE_INIT;
+ 	ia->args.in_numargs = 1;
+ 	ia->args.in_args[0].size = sizeof(ia->in);
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 0032a0ec2fcb..a4e51885648a 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -273,7 +273,9 @@ struct fuse_file_lock {
+  * FUSE_CACHE_SYMLINKS: cache READLINK responses
+  * FUSE_NO_OPENDIR_SUPPORT: kernel supports zero-message opendir
+  * FUSE_EXPLICIT_INVAL_DATA: only invalidate cached pages on explicit request
+- * FUSE_MAP_ALIGNMENT: map_alignment field is valid
++ * FUSE_MAP_ALIGNMENT: init_out.map_alignment contains log2(byte alignment) for
++ *		       foffset and moffset fields in struct
++ *		       fuse_setupmapping_out and fuse_removemapping_one.
+  */
+ #define FUSE_ASYNC_READ		(1 << 0)
+ #define FUSE_POSIX_LOCKS	(1 << 1)
