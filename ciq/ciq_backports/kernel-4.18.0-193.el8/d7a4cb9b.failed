@@ -1,0 +1,771 @@
+bpf: Introduce bpf_strtol and bpf_strtoul helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit d7a4cb9b6705a89937d12c8158a35a3145dc967a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d7a4cb9b.failed
+
+Add bpf_strtol and bpf_strtoul to convert a string to long and unsigned
+long correspondingly. It's similar to user space strtol(3) and
+strtoul(3) with a few changes to the API:
+
+* instead of NUL-terminated C string the helpers expect buffer and
+  buffer length;
+
+* resulting long or unsigned long is returned in a separate
+  result-argument;
+
+* return value is used to indicate success or failure, on success number
+  of consumed bytes is returned that can be used to identify position to
+  read next if the buffer is expected to contain multiple integers;
+
+* instead of *base* argument, *flags* is used that provides base in 5
+  LSB, other bits are reserved for future use;
+
+* number of supported bases is limited.
+
+Documentation for the new helpers is provided in bpf.h UAPI.
+
+The helpers are made available to BPF_PROG_TYPE_CGROUP_SYSCTL programs to
+be able to convert string input to e.g. "ulongvec" output.
+
+E.g. "net/ipv4/tcp_mem" consists of three ulong integers. They can be
+parsed by calling to bpf_strtoul three times.
+
+Implementation notes:
+
+Implementation includes "../../lib/kstrtox.h" to reuse integer parsing
+functions. It's done exactly same way as fs/proc/base.c already does.
+
+Unfortunately existing kstrtoX function can't be used directly since
+they fail if any invalid character is present right after integer in the
+string. Existing simple_strtoX functions can't be used either since
+they're obsolete and don't handle overflow properly.
+
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d7a4cb9b6705a89937d12c8158a35a3145dc967a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/cgroup.c
+diff --cc include/uapi/linux/bpf.h
+index 6d4bc9ebe78a,c26be24fd5e2..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2463,11 -2469,159 +2463,162 @@@ union bpf_attr 
+   *
+   * struct bpf_sock *bpf_get_listener_sock(struct bpf_sock *sk)
+   *	Description
+ - *		Return a **struct bpf_sock** pointer in **TCP_LISTEN** state.
+ - *		**bpf_sk_release**\ () is unnecessary and not allowed.
+ + *		Return a **struct bpf_sock** pointer in TCP_LISTEN state.
+ + *		bpf_sk_release() is unnecessary and not allowed.
+   *	Return
+ - *		A **struct bpf_sock** pointer on success, or **NULL** in
+ + *		A **struct bpf_sock** pointer on success, or NULL in
+   *		case of failure.
+++<<<<<<< HEAD
+++=======
++  *
++  * struct bpf_sock *bpf_skc_lookup_tcp(void *ctx, struct bpf_sock_tuple *tuple, u32 tuple_size, u64 netns, u64 flags)
++  *	Description
++  *		Look for TCP socket matching *tuple*, optionally in a child
++  *		network namespace *netns*. The return value must be checked,
++  *		and if non-**NULL**, released via **bpf_sk_release**\ ().
++  *
++  *		This function is identical to bpf_sk_lookup_tcp, except that it
++  *		also returns timewait or request sockets. Use bpf_sk_fullsock
++  *		or bpf_tcp_socket to access the full structure.
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		**CONFIG_NET** configuration option.
++  *	Return
++  *		Pointer to **struct bpf_sock**, or **NULL** in case of failure.
++  *		For sockets with reuseport option, the **struct bpf_sock**
++  *		result is from **reuse->socks**\ [] using the hash of the tuple.
++  *
++  * int bpf_tcp_check_syncookie(struct bpf_sock *sk, void *iph, u32 iph_len, struct tcphdr *th, u32 th_len)
++  * 	Description
++  * 		Check whether iph and th contain a valid SYN cookie ACK for
++  * 		the listening socket in sk.
++  *
++  * 		iph points to the start of the IPv4 or IPv6 header, while
++  * 		iph_len contains sizeof(struct iphdr) or sizeof(struct ip6hdr).
++  *
++  * 		th points to the start of the TCP header, while th_len contains
++  * 		sizeof(struct tcphdr).
++  *
++  * 	Return
++  * 		0 if iph and th are a valid SYN cookie ACK, or a negative error
++  * 		otherwise.
++  *
++  * int bpf_sysctl_get_name(struct bpf_sysctl *ctx, char *buf, size_t buf_len, u64 flags)
++  *	Description
++  *		Get name of sysctl in /proc/sys/ and copy it into provided by
++  *		program buffer *buf* of size *buf_len*.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *
++  *		If *flags* is zero, full name (e.g. "net/ipv4/tcp_mem") is
++  *		copied. Use **BPF_F_SYSCTL_BASE_NAME** flag to copy base name
++  *		only (e.g. "tcp_mem").
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  * int bpf_sysctl_get_current_value(struct bpf_sysctl *ctx, char *buf, size_t buf_len)
++  *	Description
++  *		Get current value of sysctl as it is presented in /proc/sys
++  *		(incl. newline, etc), and copy it as a string into provided
++  *		by program buffer *buf* of size *buf_len*.
++  *
++  *		The whole value is copied, no matter what file position user
++  *		space issued e.g. sys_read at.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  *		**-EINVAL** if current value was unavailable, e.g. because
++  *		sysctl is uninitialized and read returns -EIO for it.
++  *
++  * int bpf_sysctl_get_new_value(struct bpf_sysctl *ctx, char *buf, size_t buf_len)
++  *	Description
++  *		Get new value being written by user space to sysctl (before
++  *		the actual write happens) and copy it as a string into
++  *		provided by program buffer *buf* of size *buf_len*.
++  *
++  *		User space may write new value at file position > 0.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  *		**-EINVAL** if sysctl is being read.
++  *
++  * int bpf_sysctl_set_new_value(struct bpf_sysctl *ctx, const char *buf, size_t buf_len)
++  *	Description
++  *		Override new value being written by user space to sysctl with
++  *		value provided by program in buffer *buf* of size *buf_len*.
++  *
++  *		*buf* should contain a string in same form as provided by user
++  *		space on sysctl write.
++  *
++  *		User space may write new value at file position > 0. To override
++  *		the whole sysctl value file position should be set to zero.
++  *	Return
++  *		0 on success.
++  *
++  *		**-E2BIG** if the *buf_len* is too big.
++  *
++  *		**-EINVAL** if sysctl is being read.
++  *
++  * int bpf_strtol(const char *buf, size_t buf_len, u64 flags, long *res)
++  *	Description
++  *		Convert the initial part of the string from buffer *buf* of
++  *		size *buf_len* to a long integer according to the given base
++  *		and save the result in *res*.
++  *
++  *		The string may begin with an arbitrary amount of white space
++  *		(as determined by isspace(3)) followed by a single optional '-'
++  *		sign.
++  *
++  *		Five least significant bits of *flags* encode base, other bits
++  *		are currently unused.
++  *
++  *		Base must be either 8, 10, 16 or 0 to detect it automatically
++  *		similar to user space strtol(3).
++  *	Return
++  *		Number of characters consumed on success. Must be positive but
++  *		no more than buf_len.
++  *
++  *		**-EINVAL** if no valid digits were found or unsupported base
++  *		was provided.
++  *
++  *		**-ERANGE** if resulting value was out of range.
++  *
++  * int bpf_strtoul(const char *buf, size_t buf_len, u64 flags, unsigned long *res)
++  *	Description
++  *		Convert the initial part of the string from buffer *buf* of
++  *		size *buf_len* to an unsigned long integer according to the
++  *		given base and save the result in *res*.
++  *
++  *		The string may begin with an arbitrary amount of white space
++  *		(as determined by isspace(3)).
++  *
++  *		Five least significant bits of *flags* encode base, other bits
++  *		are currently unused.
++  *
++  *		Base must be either 8, 10, 16 or 0 to detect it automatically
++  *		similar to user space strtoul(3).
++  *	Return
++  *		Number of characters consumed on success. Must be positive but
++  *		no more than buf_len.
++  *
++  *		**-EINVAL** if no valid digits were found or unsupported base
++  *		was provided.
++  *
++  *		**-ERANGE** if resulting value was out of range.
+++>>>>>>> d7a4cb9b6705 (bpf: Introduce bpf_strtol and bpf_strtoul helpers)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -2568,7 -2722,15 +2719,19 @@@
+  	FN(sk_fullsock),		\
+  	FN(tcp_sock),			\
+  	FN(skb_ecn_set_ce),		\
+++<<<<<<< HEAD
+ +	FN(get_listener_sock),
+++=======
++ 	FN(get_listener_sock),		\
++ 	FN(skc_lookup_tcp),		\
++ 	FN(tcp_check_syncookie),	\
++ 	FN(sysctl_get_name),		\
++ 	FN(sysctl_get_current_value),	\
++ 	FN(sysctl_get_new_value),	\
++ 	FN(sysctl_set_new_value),	\
++ 	FN(strtol),			\
++ 	FN(strtoul),
+++>>>>>>> d7a4cb9b6705 (bpf: Introduce bpf_strtol and bpf_strtoul helpers)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+diff --cc kernel/bpf/cgroup.c
+index 7d9c426bf2c7,789d4ab2336e..000000000000
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@@ -811,3 -771,356 +811,359 @@@ const struct bpf_verifier_ops cg_dev_ve
+  	.get_func_proto		= cgroup_dev_func_proto,
+  	.is_valid_access	= cgroup_dev_is_valid_access,
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * __cgroup_bpf_run_filter_sysctl - Run a program on sysctl
++  *
++  * @head: sysctl table header
++  * @table: sysctl table
++  * @write: sysctl is being read (= 0) or written (= 1)
++  * @buf: pointer to buffer passed by user space
++  * @pcount: value-result argument: value is size of buffer pointed to by @buf,
++  *	result is size of @new_buf if program set new value, initial value
++  *	otherwise
++  * @ppos: value-result argument: value is position at which read from or write
++  *	to sysctl is happening, result is new position if program overrode it,
++  *	initial value otherwise
++  * @new_buf: pointer to pointer to new buffer that will be allocated if program
++  *	overrides new value provided by user space on sysctl write
++  *	NOTE: it's caller responsibility to free *new_buf if it was set
++  * @type: type of program to be executed
++  *
++  * Program is run when sysctl is being accessed, either read or written, and
++  * can allow or deny such access.
++  *
++  * This function will return %-EPERM if an attached program is found and
++  * returned value != 1 during execution. In all other cases 0 is returned.
++  */
++ int __cgroup_bpf_run_filter_sysctl(struct ctl_table_header *head,
++ 				   struct ctl_table *table, int write,
++ 				   void __user *buf, size_t *pcount,
++ 				   loff_t *ppos, void **new_buf,
++ 				   enum bpf_attach_type type)
++ {
++ 	struct bpf_sysctl_kern ctx = {
++ 		.head = head,
++ 		.table = table,
++ 		.write = write,
++ 		.ppos = ppos,
++ 		.cur_val = NULL,
++ 		.cur_len = PAGE_SIZE,
++ 		.new_val = NULL,
++ 		.new_len = 0,
++ 		.new_updated = 0,
++ 	};
++ 	struct cgroup *cgrp;
++ 	int ret;
++ 
++ 	ctx.cur_val = kmalloc_track_caller(ctx.cur_len, GFP_KERNEL);
++ 	if (ctx.cur_val) {
++ 		mm_segment_t old_fs;
++ 		loff_t pos = 0;
++ 
++ 		old_fs = get_fs();
++ 		set_fs(KERNEL_DS);
++ 		if (table->proc_handler(table, 0, (void __user *)ctx.cur_val,
++ 					&ctx.cur_len, &pos)) {
++ 			/* Let BPF program decide how to proceed. */
++ 			ctx.cur_len = 0;
++ 		}
++ 		set_fs(old_fs);
++ 	} else {
++ 		/* Let BPF program decide how to proceed. */
++ 		ctx.cur_len = 0;
++ 	}
++ 
++ 	if (write && buf && *pcount) {
++ 		/* BPF program should be able to override new value with a
++ 		 * buffer bigger than provided by user.
++ 		 */
++ 		ctx.new_val = kmalloc_track_caller(PAGE_SIZE, GFP_KERNEL);
++ 		ctx.new_len = min(PAGE_SIZE, *pcount);
++ 		if (!ctx.new_val ||
++ 		    copy_from_user(ctx.new_val, buf, ctx.new_len))
++ 			/* Let BPF program decide how to proceed. */
++ 			ctx.new_len = 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	cgrp = task_dfl_cgroup(current);
++ 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
++ 	rcu_read_unlock();
++ 
++ 	kfree(ctx.cur_val);
++ 
++ 	if (ret == 1 && ctx.new_updated) {
++ 		*new_buf = ctx.new_val;
++ 		*pcount = ctx.new_len;
++ 	} else {
++ 		kfree(ctx.new_val);
++ 	}
++ 
++ 	return ret == 1 ? 0 : -EPERM;
++ }
++ EXPORT_SYMBOL(__cgroup_bpf_run_filter_sysctl);
++ 
++ static ssize_t sysctl_cpy_dir(const struct ctl_dir *dir, char **bufp,
++ 			      size_t *lenp)
++ {
++ 	ssize_t tmp_ret = 0, ret;
++ 
++ 	if (dir->header.parent) {
++ 		tmp_ret = sysctl_cpy_dir(dir->header.parent, bufp, lenp);
++ 		if (tmp_ret < 0)
++ 			return tmp_ret;
++ 	}
++ 
++ 	ret = strscpy(*bufp, dir->header.ctl_table[0].procname, *lenp);
++ 	if (ret < 0)
++ 		return ret;
++ 	*bufp += ret;
++ 	*lenp -= ret;
++ 	ret += tmp_ret;
++ 
++ 	/* Avoid leading slash. */
++ 	if (!ret)
++ 		return ret;
++ 
++ 	tmp_ret = strscpy(*bufp, "/", *lenp);
++ 	if (tmp_ret < 0)
++ 		return tmp_ret;
++ 	*bufp += tmp_ret;
++ 	*lenp -= tmp_ret;
++ 
++ 	return ret + tmp_ret;
++ }
++ 
++ BPF_CALL_4(bpf_sysctl_get_name, struct bpf_sysctl_kern *, ctx, char *, buf,
++ 	   size_t, buf_len, u64, flags)
++ {
++ 	ssize_t tmp_ret = 0, ret;
++ 
++ 	if (!buf)
++ 		return -EINVAL;
++ 
++ 	if (!(flags & BPF_F_SYSCTL_BASE_NAME)) {
++ 		if (!ctx->head)
++ 			return -EINVAL;
++ 		tmp_ret = sysctl_cpy_dir(ctx->head->parent, &buf, &buf_len);
++ 		if (tmp_ret < 0)
++ 			return tmp_ret;
++ 	}
++ 
++ 	ret = strscpy(buf, ctx->table->procname, buf_len);
++ 
++ 	return ret < 0 ? ret : tmp_ret + ret;
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_name_proto = {
++ 	.func		= bpf_sysctl_get_name,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static int copy_sysctl_value(char *dst, size_t dst_len, char *src,
++ 			     size_t src_len)
++ {
++ 	if (!dst)
++ 		return -EINVAL;
++ 
++ 	if (!dst_len)
++ 		return -E2BIG;
++ 
++ 	if (!src || !src_len) {
++ 		memset(dst, 0, dst_len);
++ 		return -EINVAL;
++ 	}
++ 
++ 	memcpy(dst, src, min(dst_len, src_len));
++ 
++ 	if (dst_len > src_len) {
++ 		memset(dst + src_len, '\0', dst_len - src_len);
++ 		return src_len;
++ 	}
++ 
++ 	dst[dst_len - 1] = '\0';
++ 
++ 	return -E2BIG;
++ }
++ 
++ BPF_CALL_3(bpf_sysctl_get_current_value, struct bpf_sysctl_kern *, ctx,
++ 	   char *, buf, size_t, buf_len)
++ {
++ 	return copy_sysctl_value(buf, buf_len, ctx->cur_val, ctx->cur_len);
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_current_value_proto = {
++ 	.func		= bpf_sysctl_get_current_value,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ BPF_CALL_3(bpf_sysctl_get_new_value, struct bpf_sysctl_kern *, ctx, char *, buf,
++ 	   size_t, buf_len)
++ {
++ 	if (!ctx->write) {
++ 		if (buf && buf_len)
++ 			memset(buf, '\0', buf_len);
++ 		return -EINVAL;
++ 	}
++ 	return copy_sysctl_value(buf, buf_len, ctx->new_val, ctx->new_len);
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_new_value_proto = {
++ 	.func		= bpf_sysctl_get_new_value,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ BPF_CALL_3(bpf_sysctl_set_new_value, struct bpf_sysctl_kern *, ctx,
++ 	   const char *, buf, size_t, buf_len)
++ {
++ 	if (!ctx->write || !ctx->new_val || !ctx->new_len || !buf || !buf_len)
++ 		return -EINVAL;
++ 
++ 	if (buf_len > PAGE_SIZE - 1)
++ 		return -E2BIG;
++ 
++ 	memcpy(ctx->new_val, buf, buf_len);
++ 	ctx->new_len = buf_len;
++ 	ctx->new_updated = 1;
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_set_new_value_proto = {
++ 	.func		= bpf_sysctl_set_new_value,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ static const struct bpf_func_proto *
++ sysctl_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_strtol:
++ 		return &bpf_strtol_proto;
++ 	case BPF_FUNC_strtoul:
++ 		return &bpf_strtoul_proto;
++ 	case BPF_FUNC_sysctl_get_name:
++ 		return &bpf_sysctl_get_name_proto;
++ 	case BPF_FUNC_sysctl_get_current_value:
++ 		return &bpf_sysctl_get_current_value_proto;
++ 	case BPF_FUNC_sysctl_get_new_value:
++ 		return &bpf_sysctl_get_new_value_proto;
++ 	case BPF_FUNC_sysctl_set_new_value:
++ 		return &bpf_sysctl_set_new_value_proto;
++ 	default:
++ 		return cgroup_base_func_proto(func_id, prog);
++ 	}
++ }
++ 
++ static bool sysctl_is_valid_access(int off, int size, enum bpf_access_type type,
++ 				   const struct bpf_prog *prog,
++ 				   struct bpf_insn_access_aux *info)
++ {
++ 	const int size_default = sizeof(__u32);
++ 
++ 	if (off < 0 || off + size > sizeof(struct bpf_sysctl) || off % size)
++ 		return false;
++ 
++ 	switch (off) {
++ 	case offsetof(struct bpf_sysctl, write):
++ 		if (type != BPF_READ)
++ 			return false;
++ 		bpf_ctx_record_field_size(info, size_default);
++ 		return bpf_ctx_narrow_access_ok(off, size, size_default);
++ 	case offsetof(struct bpf_sysctl, file_pos):
++ 		if (type == BPF_READ) {
++ 			bpf_ctx_record_field_size(info, size_default);
++ 			return bpf_ctx_narrow_access_ok(off, size, size_default);
++ 		} else {
++ 			return size == size_default;
++ 		}
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static u32 sysctl_convert_ctx_access(enum bpf_access_type type,
++ 				     const struct bpf_insn *si,
++ 				     struct bpf_insn *insn_buf,
++ 				     struct bpf_prog *prog, u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct bpf_sysctl, write):
++ 		*insn++ = BPF_LDX_MEM(
++ 			BPF_SIZE(si->code), si->dst_reg, si->src_reg,
++ 			bpf_target_off(struct bpf_sysctl_kern, write,
++ 				       FIELD_SIZEOF(struct bpf_sysctl_kern,
++ 						    write),
++ 				       target_size));
++ 		break;
++ 	case offsetof(struct bpf_sysctl, file_pos):
++ 		/* ppos is a pointer so it should be accessed via indirect
++ 		 * loads and stores. Also for stores additional temporary
++ 		 * register is used since neither src_reg nor dst_reg can be
++ 		 * overridden.
++ 		 */
++ 		if (type == BPF_WRITE) {
++ 			int treg = BPF_REG_9;
++ 
++ 			if (si->src_reg == treg || si->dst_reg == treg)
++ 				--treg;
++ 			if (si->src_reg == treg || si->dst_reg == treg)
++ 				--treg;
++ 			*insn++ = BPF_STX_MEM(
++ 				BPF_DW, si->dst_reg, treg,
++ 				offsetof(struct bpf_sysctl_kern, tmp_reg));
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_FIELD_SIZEOF(struct bpf_sysctl_kern, ppos),
++ 				treg, si->dst_reg,
++ 				offsetof(struct bpf_sysctl_kern, ppos));
++ 			*insn++ = BPF_STX_MEM(
++ 				BPF_SIZEOF(u32), treg, si->src_reg, 0);
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_DW, treg, si->dst_reg,
++ 				offsetof(struct bpf_sysctl_kern, tmp_reg));
++ 		} else {
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_FIELD_SIZEOF(struct bpf_sysctl_kern, ppos),
++ 				si->dst_reg, si->src_reg,
++ 				offsetof(struct bpf_sysctl_kern, ppos));
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_SIZE(si->code), si->dst_reg, si->dst_reg, 0);
++ 		}
++ 		*target_size = sizeof(u32);
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ const struct bpf_verifier_ops cg_sysctl_verifier_ops = {
++ 	.get_func_proto		= sysctl_func_proto,
++ 	.is_valid_access	= sysctl_is_valid_access,
++ 	.convert_ctx_access	= sysctl_convert_ctx_access,
++ };
++ 
++ const struct bpf_prog_ops cg_sysctl_prog_ops = {
++ };
+++>>>>>>> d7a4cb9b6705 (bpf: Introduce bpf_strtol and bpf_strtoul helpers)
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 2e525f73d02e..f1aaeff71435 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -975,6 +975,8 @@ extern const struct bpf_func_proto bpf_sk_redirect_map_proto;
+ extern const struct bpf_func_proto bpf_spin_lock_proto;
+ extern const struct bpf_func_proto bpf_spin_unlock_proto;
+ extern const struct bpf_func_proto bpf_get_local_storage_proto;
++extern const struct bpf_func_proto bpf_strtol_proto;
++extern const struct bpf_func_proto bpf_strtoul_proto;
+ 
+ /* Shared helpers among cBPF and eBPF. */
+ void bpf_user_rnd_init_once(void);
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/cgroup.c
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 5549d73833e6..5e28718928ca 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -10,6 +10,9 @@
+ #include <linux/sched.h>
+ #include <linux/uidgid.h>
+ #include <linux/filter.h>
++#include <linux/ctype.h>
++
++#include "../../lib/kstrtox.h"
+ 
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+@@ -355,4 +358,132 @@ const struct bpf_func_proto bpf_get_local_storage_proto = {
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ #endif
++
++#define BPF_STRTOX_BASE_MASK 0x1F
++
++static int __bpf_strtoull(const char *buf, size_t buf_len, u64 flags,
++			  unsigned long long *res, bool *is_negative)
++{
++	unsigned int base = flags & BPF_STRTOX_BASE_MASK;
++	const char *cur_buf = buf;
++	size_t cur_len = buf_len;
++	unsigned int consumed;
++	size_t val_len;
++	char str[64];
++
++	if (!buf || !buf_len || !res || !is_negative)
++		return -EINVAL;
++
++	if (base != 0 && base != 8 && base != 10 && base != 16)
++		return -EINVAL;
++
++	if (flags & ~BPF_STRTOX_BASE_MASK)
++		return -EINVAL;
++
++	while (cur_buf < buf + buf_len && isspace(*cur_buf))
++		++cur_buf;
++
++	*is_negative = (cur_buf < buf + buf_len && *cur_buf == '-');
++	if (*is_negative)
++		++cur_buf;
++
++	consumed = cur_buf - buf;
++	cur_len -= consumed;
++	if (!cur_len)
++		return -EINVAL;
++
++	cur_len = min(cur_len, sizeof(str) - 1);
++	memcpy(str, cur_buf, cur_len);
++	str[cur_len] = '\0';
++	cur_buf = str;
++
++	cur_buf = _parse_integer_fixup_radix(cur_buf, &base);
++	val_len = _parse_integer(cur_buf, base, res);
++
++	if (val_len & KSTRTOX_OVERFLOW)
++		return -ERANGE;
++
++	if (val_len == 0)
++		return -EINVAL;
++
++	cur_buf += val_len;
++	consumed += cur_buf - str;
++
++	return consumed;
++}
++
++static int __bpf_strtoll(const char *buf, size_t buf_len, u64 flags,
++			 long long *res)
++{
++	unsigned long long _res;
++	bool is_negative;
++	int err;
++
++	err = __bpf_strtoull(buf, buf_len, flags, &_res, &is_negative);
++	if (err < 0)
++		return err;
++	if (is_negative) {
++		if ((long long)-_res > 0)
++			return -ERANGE;
++		*res = -_res;
++	} else {
++		if ((long long)_res < 0)
++			return -ERANGE;
++		*res = _res;
++	}
++	return err;
++}
++
++BPF_CALL_4(bpf_strtol, const char *, buf, size_t, buf_len, u64, flags,
++	   long *, res)
++{
++	long long _res;
++	int err;
++
++	err = __bpf_strtoll(buf, buf_len, flags, &_res);
++	if (err < 0)
++		return err;
++	if (_res != (long)_res)
++		return -ERANGE;
++	*res = _res;
++	return err;
++}
++
++const struct bpf_func_proto bpf_strtol_proto = {
++	.func		= bpf_strtol,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_CONST_SIZE,
++	.arg3_type	= ARG_ANYTHING,
++	.arg4_type	= ARG_PTR_TO_LONG,
++};
++
++BPF_CALL_4(bpf_strtoul, const char *, buf, size_t, buf_len, u64, flags,
++	   unsigned long *, res)
++{
++	unsigned long long _res;
++	bool is_negative;
++	int err;
++
++	err = __bpf_strtoull(buf, buf_len, flags, &_res, &is_negative);
++	if (err < 0)
++		return err;
++	if (is_negative)
++		return -EINVAL;
++	if (_res != (unsigned long)_res)
++		return -ERANGE;
++	*res = _res;
++	return err;
++}
++
++const struct bpf_func_proto bpf_strtoul_proto = {
++	.func		= bpf_strtoul,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_CONST_SIZE,
++	.arg3_type	= ARG_ANYTHING,
++	.arg4_type	= ARG_PTR_TO_LONG,
++};
+ #endif
