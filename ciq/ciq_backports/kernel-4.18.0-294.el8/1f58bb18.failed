@@ -1,0 +1,378 @@
+mount_pseudo(): drop 'name' argument, switch to d_make_root()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 1f58bb18f6f28d1df0b7144d90bc90ee5672416d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1f58bb18.failed
+
+Once upon a time we used to set ->d_name of e.g. pipefs root
+so that d_path() on pipes would work.  These days it's
+completely pointless - dentries of pipes are not even connected
+to pipefs root.  However, mount_pseudo() had set the root
+dentry name (passed as the second argument) and callers
+kept inventing names to pass to it.  Including those that
+didn't *have* any non-root dentries to start with...
+
+All of that had been pointless for about 8 years now; it's
+time to get rid of that cargo-culting...
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 1f58bb18f6f28d1df0b7144d90bc90ee5672416d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/z3fold.c
+diff --cc mm/z3fold.c
+index 4b366d181f35,abeb5bcbea57..000000000000
+--- a/mm/z3fold.c
++++ b/mm/z3fold.c
+@@@ -163,6 -189,105 +163,108 @@@ static int size_to_chunks(size_t size
+  
+  static void compact_page_work(struct work_struct *w);
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct z3fold_buddy_slots *alloc_slots(struct z3fold_pool *pool)
++ {
++ 	struct z3fold_buddy_slots *slots = kmem_cache_alloc(pool->c_handle,
++ 							GFP_KERNEL);
++ 
++ 	if (slots) {
++ 		memset(slots->slot, 0, sizeof(slots->slot));
++ 		slots->pool = (unsigned long)pool;
++ 	}
++ 
++ 	return slots;
++ }
++ 
++ static inline struct z3fold_pool *slots_to_pool(struct z3fold_buddy_slots *s)
++ {
++ 	return (struct z3fold_pool *)(s->pool & ~HANDLE_FLAG_MASK);
++ }
++ 
++ static inline struct z3fold_buddy_slots *handle_to_slots(unsigned long handle)
++ {
++ 	return (struct z3fold_buddy_slots *)(handle & ~(SLOTS_ALIGN - 1));
++ }
++ 
++ static inline void free_handle(unsigned long handle)
++ {
++ 	struct z3fold_buddy_slots *slots;
++ 	int i;
++ 	bool is_free;
++ 
++ 	if (handle & (1 << PAGE_HEADLESS))
++ 		return;
++ 
++ 	WARN_ON(*(unsigned long *)handle == 0);
++ 	*(unsigned long *)handle = 0;
++ 	slots = handle_to_slots(handle);
++ 	is_free = true;
++ 	for (i = 0; i <= BUDDY_MASK; i++) {
++ 		if (slots->slot[i]) {
++ 			is_free = false;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (is_free) {
++ 		struct z3fold_pool *pool = slots_to_pool(slots);
++ 
++ 		kmem_cache_free(pool->c_handle, slots);
++ 	}
++ }
++ 
++ static struct dentry *z3fold_do_mount(struct file_system_type *fs_type,
++ 				int flags, const char *dev_name, void *data)
++ {
++ 	return mount_pseudo(fs_type, NULL, NULL, 0x33);
++ }
++ 
++ static struct file_system_type z3fold_fs = {
++ 	.name		= "z3fold",
++ 	.mount		= z3fold_do_mount,
++ 	.kill_sb	= kill_anon_super,
++ };
++ 
++ static struct vfsmount *z3fold_mnt;
++ static int z3fold_mount(void)
++ {
++ 	int ret = 0;
++ 
++ 	z3fold_mnt = kern_mount(&z3fold_fs);
++ 	if (IS_ERR(z3fold_mnt))
++ 		ret = PTR_ERR(z3fold_mnt);
++ 
++ 	return ret;
++ }
++ 
++ static void z3fold_unmount(void)
++ {
++ 	kern_unmount(z3fold_mnt);
++ }
++ 
++ static const struct address_space_operations z3fold_aops;
++ static int z3fold_register_migration(struct z3fold_pool *pool)
++ {
++ 	pool->inode = alloc_anon_inode(z3fold_mnt->mnt_sb);
++ 	if (IS_ERR(pool->inode)) {
++ 		pool->inode = NULL;
++ 		return 1;
++ 	}
++ 
++ 	pool->inode->i_mapping->private_data = pool;
++ 	pool->inode->i_mapping->a_ops = &z3fold_aops;
++ 	return 0;
++ }
++ 
++ static void z3fold_unregister_migration(struct z3fold_pool *pool)
++ {
++ 	if (pool->inode)
++ 		iput(pool->inode);
++  }
++ 
+++>>>>>>> 1f58bb18f6f2 (mount_pseudo(): drop 'name' argument, switch to d_make_root())
+  /* Initializes the z3fold header of a newly allocated z3fold page */
+  static struct z3fold_header *init_z3fold_page(struct page *page,
+  					struct z3fold_pool *pool)
+diff --git a/arch/ia64/kernel/perfmon.c b/arch/ia64/kernel/perfmon.c
+index 46bff1661836..a980ff10c69a 100644
+--- a/arch/ia64/kernel/perfmon.c
++++ b/arch/ia64/kernel/perfmon.c
+@@ -613,7 +613,7 @@ static const struct dentry_operations pfmfs_dentry_operations;
+ static struct dentry *
+ pfmfs_mount(struct file_system_type *fs_type, int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "pfm:", NULL, &pfmfs_dentry_operations,
++	return mount_pseudo(fs_type, NULL, &pfmfs_dentry_operations,
+ 			PFMFS_MAGIC);
+ }
+ 
+diff --git a/drivers/dax/super.c b/drivers/dax/super.c
+index 8fbb9815eaa0..a107ef597c4e 100644
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@ -469,7 +469,7 @@ static const struct super_operations dax_sops = {
+ static struct dentry *dax_mount(struct file_system_type *fs_type,
+ 		int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "dax:", &dax_sops, NULL, DAXFS_MAGIC);
++	return mount_pseudo(fs_type, &dax_sops, NULL, DAXFS_MAGIC);
+ }
+ 
+ static struct file_system_type dax_fs_type = {
+diff --git a/drivers/misc/cxl/api.c b/drivers/misc/cxl/api.c
+index 6cd103a49268..13d89dacdd11 100644
+--- a/drivers/misc/cxl/api.c
++++ b/drivers/misc/cxl/api.c
+@@ -41,8 +41,7 @@ static struct vfsmount *cxl_vfs_mount;
+ static struct dentry *cxl_fs_mount(struct file_system_type *fs_type, int flags,
+ 				const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "cxl:", NULL, NULL,
+-			CXL_PSEUDO_FS_MAGIC);
++	return mount_pseudo(fs_type, NULL, NULL, CXL_PSEUDO_FS_MAGIC);
+ }
+ 
+ static struct file_system_type cxl_fs_type = {
+diff --git a/drivers/scsi/cxlflash/ocxl_hw.c b/drivers/scsi/cxlflash/ocxl_hw.c
+index c2786077c547..e661e8e3d20a 100644
+--- a/drivers/scsi/cxlflash/ocxl_hw.c
++++ b/drivers/scsi/cxlflash/ocxl_hw.c
+@@ -48,8 +48,7 @@ static struct dentry *ocxlflash_fs_mount(struct file_system_type *fs_type,
+ 					 int flags, const char *dev_name,
+ 					 void *data)
+ {
+-	return mount_pseudo(fs_type, "ocxlflash:", NULL, NULL,
+-			    OCXLFLASH_FS_MAGIC);
++	return mount_pseudo(fs_type, NULL, NULL, OCXLFLASH_FS_MAGIC);
+ }
+ 
+ static struct file_system_type ocxlflash_fs_type = {
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index a35cc162eecf..2d2343c4364c 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -541,8 +541,7 @@ static int virtballoon_migratepage(struct balloon_dev_info *vb_dev_info,
+ static struct dentry *balloon_mount(struct file_system_type *fs_type,
+ 		int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "balloon-kvm:", NULL, NULL,
+-				BALLOON_KVM_MAGIC);
++	return mount_pseudo(fs_type, NULL, NULL, BALLOON_KVM_MAGIC);
+ }
+ 
+ static struct file_system_type balloon_fs = {
+diff --git a/fs/aio.c b/fs/aio.c
+index e81c8583e055..b7bccaadb31f 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -222,8 +222,7 @@ static struct file *aio_private_file(struct kioctx *ctx, loff_t nr_pages)
+ static struct dentry *aio_mount(struct file_system_type *fs_type,
+ 				int flags, const char *dev_name, void *data)
+ {
+-	struct dentry *root = mount_pseudo(fs_type, "aio:", NULL, NULL,
+-					   AIO_RING_MAGIC);
++	struct dentry *root = mount_pseudo(fs_type, NULL, NULL, AIO_RING_MAGIC);
+ 
+ 	if (!IS_ERR(root))
+ 		root->d_sb->s_iflags |= SB_I_NOEXEC;
+diff --git a/fs/anon_inodes.c b/fs/anon_inodes.c
+index 6b235ab1df6c..4246e2865032 100644
+--- a/fs/anon_inodes.c
++++ b/fs/anon_inodes.c
+@@ -41,8 +41,8 @@ static const struct dentry_operations anon_inodefs_dentry_operations = {
+ static struct dentry *anon_inodefs_mount(struct file_system_type *fs_type,
+ 				int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "anon_inode:", NULL,
+-			&anon_inodefs_dentry_operations, ANON_INODE_FS_MAGIC);
++	return mount_pseudo(fs_type, NULL, &anon_inodefs_dentry_operations,
++			    ANON_INODE_FS_MAGIC);
+ }
+ 
+ static struct file_system_type anon_inode_fs_type = {
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 9233529a6f8f..e6f602c4f457 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -847,7 +847,7 @@ static struct dentry *bd_mount(struct file_system_type *fs_type,
+ 	int flags, const char *dev_name, void *data)
+ {
+ 	struct dentry *dent;
+-	dent = mount_pseudo(fs_type, "bdev:", &bdev_sops, NULL, BDEVFS_MAGIC);
++	dent = mount_pseudo(fs_type, &bdev_sops, NULL, BDEVFS_MAGIC);
+ 	if (!IS_ERR(dent))
+ 		dent->d_sb->s_iflags |= SB_I_CGROUPWB;
+ 	return dent;
+diff --git a/fs/btrfs/tests/btrfs-tests.c b/fs/btrfs/tests/btrfs-tests.c
+index db72b3b6209e..d4cd7f101719 100644
+--- a/fs/btrfs/tests/btrfs-tests.c
++++ b/fs/btrfs/tests/btrfs-tests.c
+@@ -26,7 +26,7 @@ static struct dentry *btrfs_test_mount(struct file_system_type *fs_type,
+ 				       int flags, const char *dev_name,
+ 				       void *data)
+ {
+-	return mount_pseudo(fs_type, "btrfs_test:", &btrfs_test_super_ops,
++	return mount_pseudo(fs_type, &btrfs_test_super_ops,
+ 			    NULL, BTRFS_TEST_MAGIC);
+ }
+ 
+diff --git a/fs/libfs.c b/fs/libfs.c
+index c96e2de7d47e..24b40d1c5954 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -243,14 +243,12 @@ static const struct super_operations simple_super_operations = {
+  * Common helper for pseudo-filesystems (sockfs, pipefs, bdev - stuff that
+  * will never be mountable)
+  */
+-struct dentry *mount_pseudo_xattr(struct file_system_type *fs_type, char *name,
++struct dentry *mount_pseudo_xattr(struct file_system_type *fs_type,
+ 	const struct super_operations *ops, const struct xattr_handler **xattr,
+ 	const struct dentry_operations *dops, unsigned long magic)
+ {
+ 	struct super_block *s;
+-	struct dentry *dentry;
+ 	struct inode *root;
+-	struct qstr d_name = QSTR_INIT(name, strlen(name));
+ 
+ 	s = sget_userns(fs_type, NULL, set_anon_super, SB_KERNMOUNT|SB_NOUSER,
+ 			&init_user_ns, NULL);
+@@ -275,13 +273,9 @@ struct dentry *mount_pseudo_xattr(struct file_system_type *fs_type, char *name,
+ 	root->i_ino = 1;
+ 	root->i_mode = S_IFDIR | S_IRUSR | S_IWUSR;
+ 	root->i_atime = root->i_mtime = root->i_ctime = current_time(root);
+-	dentry = __d_alloc(s, &d_name);
+-	if (!dentry) {
+-		iput(root);
++	s->s_root = d_make_root(root);
++	if (!s->s_root)
+ 		goto Enomem;
+-	}
+-	d_instantiate(dentry, root);
+-	s->s_root = dentry;
+ 	s->s_d_op = dops;
+ 	s->s_flags |= SB_ACTIVE;
+ 	return dget(s->s_root);
+diff --git a/fs/nsfs.c b/fs/nsfs.c
+index 93b6d0b8748d..653c7e0644ec 100644
+--- a/fs/nsfs.c
++++ b/fs/nsfs.c
+@@ -279,7 +279,7 @@ static const struct super_operations nsfs_ops = {
+ static struct dentry *nsfs_mount(struct file_system_type *fs_type,
+ 			int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "nsfs:", &nsfs_ops,
++	return mount_pseudo(fs_type, &nsfs_ops,
+ 			&ns_dentry_operations, NSFS_MAGIC);
+ }
+ static struct file_system_type nsfs = {
+diff --git a/fs/pipe.c b/fs/pipe.c
+index cac019cb19fc..87fba8e2bb04 100644
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@ -1179,7 +1179,7 @@ static const struct super_operations pipefs_ops = {
+ static struct dentry *pipefs_mount(struct file_system_type *fs_type,
+ 			 int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "pipe:", &pipefs_ops,
++	return mount_pseudo(fs_type, &pipefs_ops,
+ 			&pipefs_dentry_operations, PIPEFS_MAGIC);
+ }
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index feabaa0642d8..1257144c8a3b 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2279,18 +2279,18 @@ struct super_block *sget(struct file_system_type *type,
+ 			int (*test)(struct super_block *,void *),
+ 			int (*set)(struct super_block *,void *),
+ 			int flags, void *data);
+-extern struct dentry *mount_pseudo_xattr(struct file_system_type *, char *,
++extern struct dentry *mount_pseudo_xattr(struct file_system_type *,
+ 					 const struct super_operations *ops,
+ 					 const struct xattr_handler **xattr,
+ 					 const struct dentry_operations *dops,
+ 					 unsigned long);
+ 
+ static inline struct dentry *
+-mount_pseudo(struct file_system_type *fs_type, char *name,
++mount_pseudo(struct file_system_type *fs_type,
+ 	     const struct super_operations *ops,
+ 	     const struct dentry_operations *dops, unsigned long magic)
+ {
+-	return mount_pseudo_xattr(fs_type, name, ops, NULL, dops, magic);
++	return mount_pseudo_xattr(fs_type, ops, NULL, dops, magic);
+ }
+ 
+ /* Alas, no aliases. Too much hassle with bringing module.h everywhere */
+* Unmerged path mm/z3fold.c
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 6cfcb2b0c5da..f8d074d1101e 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1822,7 +1822,7 @@ static enum fullness_group putback_zspage(struct size_class *class,
+ static struct dentry *zs_mount(struct file_system_type *fs_type,
+ 				int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo(fs_type, "zsmalloc:", NULL, NULL, ZSMALLOC_MAGIC);
++	return mount_pseudo(fs_type, NULL, NULL, ZSMALLOC_MAGIC);
+ }
+ 
+ static struct file_system_type zsmalloc_fs = {
+diff --git a/net/socket.c b/net/socket.c
+index b6a667cf3569..351a4e64eca5 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -364,7 +364,7 @@ static const struct xattr_handler *sockfs_xattr_handlers[] = {
+ static struct dentry *sockfs_mount(struct file_system_type *fs_type,
+ 			 int flags, const char *dev_name, void *data)
+ {
+-	return mount_pseudo_xattr(fs_type, "socket:", &sockfs_ops,
++	return mount_pseudo_xattr(fs_type, &sockfs_ops,
+ 				  sockfs_xattr_handlers,
+ 				  &sockfs_dentry_operations, SOCKFS_MAGIC);
+ }
