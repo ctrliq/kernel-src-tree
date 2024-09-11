@@ -1,0 +1,466 @@
+io_uring: hide uring_fd in ctx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit b14cca0c84c760fbd39ad6bb7e1181e2df103d25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b14cca0c.failed
+
+req->ring_fd and req->ring_file are used only during the prep stage
+during submission, which is is protected by mutex. There is no need
+to store them per-request, place them in ctx.
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b14cca0c84c760fbd39ad6bb7e1181e2df103d25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 28a601d08266,46cc1bc48062..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -251,8 -249,10 +251,10 @@@ struct io_ring_ctx 
+  	 * readers must ensure that ->refs is alive as long as the file* is
+  	 * used. Only updated through io_uring_register(2).
+  	 */
+ -	struct fixed_file_data	*file_data;
+ +	struct file		**user_files;
+  	unsigned		nr_user_files;
++ 	int 			ring_fd;
++ 	struct file 		*ring_file;
+  
+  	/* if used, fixed mapped user buffers */
+  	unsigned		nr_user_bufs;
+@@@ -317,14 -461,36 +319,26 @@@ struct io_poll_iocb 
+  struct io_kiocb {
+  	union {
+  		struct file		*file;
+ -		struct io_rw		rw;
+ +		struct kiocb		rw;
+  		struct io_poll_iocb	poll;
+ -		struct io_accept	accept;
+ -		struct io_sync		sync;
+ -		struct io_cancel	cancel;
+ -		struct io_timeout	timeout;
+ -		struct io_connect	connect;
+ -		struct io_sr_msg	sr_msg;
+ -		struct io_open		open;
+ -		struct io_close		close;
+ -		struct io_files_update	files_update;
+ -		struct io_fadvise	fadvise;
+ -		struct io_madvise	madvise;
+  	};
+  
+++<<<<<<< HEAD
+ +	struct sqe_submit	submit;
+++=======
++ 	struct io_async_ctx		*io;
++ 	/*
++ 	 * llist_node is only used for poll deferred completions
++ 	 */
++ 	struct llist_node		llist_node;
++ 	bool				has_user;
++ 	bool				in_async;
++ 	bool				needs_fixed_file;
++ 	u8				opcode;
+++>>>>>>> b14cca0c84c7 (io_uring: hide uring_fd in ctx)
+  
+  	struct io_ring_ctx	*ctx;
+ -	union {
+ -		struct list_head	list;
+ -		struct hlist_node	hash_node;
+ -	};
+ +	struct list_head	list;
+  	struct list_head	link_list;
+  	unsigned int		flags;
+  	refcount_t		refs;
+@@@ -603,6 -1136,8 +617,11 @@@ static struct io_kiocb *io_get_req(stru
+  		state->cur_req++;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ got_it:
++ 	req->io = NULL;
+++>>>>>>> b14cca0c84c7 (io_uring: hide uring_fd in ctx)
+  	req->file = NULL;
+  	req->ctx = ctx;
+  	req->flags = 0;
+@@@ -1520,15 -2596,201 +1539,157 @@@ static int io_fsync(struct io_kiocb *re
+  	if (force_nonblock)
+  		return -EAGAIN;
+  
+ -	ret = do_madvise(ma->addr, ma->len, ma->advice);
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req_find_next(req, nxt);
+ -	return 0;
+ -#else
+ -	return -EOPNOTSUPP;
+ -#endif
+ -}
+ +	ret = vfs_fsync_range(req->rw.ki_filp, sqe_off,
+ +				end > 0 ? end : LLONG_MAX,
+ +				fsync_flags & IORING_FSYNC_DATASYNC);
+  
+++<<<<<<< HEAD
+ +	if (ret < 0 && (req->flags & REQ_F_LINK))
+ +		req->flags |= REQ_F_FAIL_LINK;
+ +	io_cqring_add_event(req->ctx, sqe->user_data, ret);
+++=======
++ static int io_fadvise_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	if (sqe->ioprio || sqe->buf_index || sqe->addr)
++ 		return -EINVAL;
++ 
++ 	req->fadvise.offset = READ_ONCE(sqe->off);
++ 	req->fadvise.len = READ_ONCE(sqe->len);
++ 	req->fadvise.advice = READ_ONCE(sqe->fadvise_advice);
++ 	return 0;
++ }
++ 
++ static int io_fadvise(struct io_kiocb *req, struct io_kiocb **nxt,
++ 		      bool force_nonblock)
++ {
++ 	struct io_fadvise *fa = &req->fadvise;
++ 	int ret;
++ 
++ 	/* DONTNEED may block, others _should_ not */
++ 	if (fa->advice == POSIX_FADV_DONTNEED && force_nonblock)
++ 		return -EAGAIN;
++ 
++ 	ret = vfs_fadvise(req->file, fa->offset, fa->len, fa->advice);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req_find_next(req, nxt);
++ 	return 0;
++ }
++ 
++ static int io_statx_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	const char __user *fname;
++ 	unsigned lookup_flags;
++ 	int ret;
++ 
++ 	if (sqe->ioprio || sqe->buf_index)
++ 		return -EINVAL;
++ 
++ 	req->open.dfd = READ_ONCE(sqe->fd);
++ 	req->open.mask = READ_ONCE(sqe->len);
++ 	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
++ 	req->open.buffer = u64_to_user_ptr(READ_ONCE(sqe->addr2));
++ 	req->open.how.flags = READ_ONCE(sqe->statx_flags);
++ 
++ 	if (vfs_stat_set_lookup_flags(&lookup_flags, req->open.how.flags))
++ 		return -EINVAL;
++ 
++ 	req->open.filename = getname_flags(fname, lookup_flags, NULL);
++ 	if (IS_ERR(req->open.filename)) {
++ 		ret = PTR_ERR(req->open.filename);
++ 		req->open.filename = NULL;
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int io_statx(struct io_kiocb *req, struct io_kiocb **nxt,
++ 		    bool force_nonblock)
++ {
++ 	struct io_open *ctx = &req->open;
++ 	unsigned lookup_flags;
++ 	struct path path;
++ 	struct kstat stat;
++ 	int ret;
++ 
++ 	if (force_nonblock)
++ 		return -EAGAIN;
++ 
++ 	if (vfs_stat_set_lookup_flags(&lookup_flags, ctx->how.flags))
++ 		return -EINVAL;
++ 
++ retry:
++ 	/* filename_lookup() drops it, keep a reference */
++ 	ctx->filename->refcnt++;
++ 
++ 	ret = filename_lookup(ctx->dfd, ctx->filename, lookup_flags, &path,
++ 				NULL);
++ 	if (ret)
++ 		goto err;
++ 
++ 	ret = vfs_getattr(&path, &stat, ctx->mask, ctx->how.flags);
++ 	path_put(&path);
++ 	if (retry_estale(ret, lookup_flags)) {
++ 		lookup_flags |= LOOKUP_REVAL;
++ 		goto retry;
++ 	}
++ 	if (!ret)
++ 		ret = cp_statx(&stat, ctx->buffer);
++ err:
++ 	putname(ctx->filename);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req_find_next(req, nxt);
++ 	return 0;
++ }
++ 
++ static int io_close_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	/*
++ 	 * If we queue this for async, it must not be cancellable. That would
++ 	 * leave the 'file' in an undeterminate state.
++ 	 */
++ 	req->work.flags |= IO_WQ_WORK_NO_CANCEL;
++ 
++ 	if (sqe->ioprio || sqe->off || sqe->addr || sqe->len ||
++ 	    sqe->rw_flags || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (sqe->flags & IOSQE_FIXED_FILE)
++ 		return -EINVAL;
++ 
++ 	req->close.fd = READ_ONCE(sqe->fd);
++ 	if (req->file->f_op == &io_uring_fops ||
++ 	    req->close.fd == req->ctx->ring_fd)
++ 		return -EBADF;
++ 
++ 	return 0;
++ }
++ 
++ static void io_close_finish(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 	struct io_kiocb *nxt = NULL;
++ 
++ 	/* Invoked with files, we need to do the close */
++ 	if (req->work.files) {
++ 		int ret;
++ 
++ 		ret = filp_close(req->close.put_file, req->work.files);
++ 		if (ret < 0) {
++ 			req_set_fail_links(req);
++ 		}
++ 		io_cqring_add_event(req, ret);
++ 	}
++ 
++ 	fput(req->close.put_file);
++ 
++ 	/* we bypassed the re-issue, drop the submission reference */
+++>>>>>>> b14cca0c84c7 (io_uring: hide uring_fd in ctx)
+  	io_put_req(req);
+ -	io_put_req_find_next(req, &nxt);
+ -	if (nxt)
+ -		io_wq_assign_next(workptr, nxt);
+ -}
+ -
+ -static int io_close(struct io_kiocb *req, struct io_kiocb **nxt,
+ -		    bool force_nonblock)
+ -{
+ -	int ret;
+ -
+ -	req->close.put_file = NULL;
+ -	ret = __close_fd_get_file(req->close.fd, &req->close.put_file);
+ -	if (ret < 0)
+ -		return ret;
+ -
+ -	/* if the file has a flush method, be safe and punt to async */
+ -	if (req->close.put_file->f_op->flush && !io_wq_current_is_worker()) {
+ -		req->work.flags |= IO_WQ_WORK_NEEDS_FILES;
+ -		goto eagain;
+ -	}
+ -
+ -	/*
+ -	 * No ->flush(), safely close from here and just punt the
+ -	 * fput() to async context.
+ -	 */
+ -	ret = filp_close(req->close.put_file, current->files);
+ -
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -
+ -	if (io_wq_current_is_worker()) {
+ -		struct io_wq_work *old_work, *work;
+ -
+ -		old_work = work = &req->work;
+ -		io_close_finish(&work);
+ -		if (work && work != old_work)
+ -			*nxt = container_of(work, struct io_kiocb, work);
+ -		return 0;
+ -	}
+ -
+ -eagain:
+ -	req->work.func = io_close_finish;
+ -	return -EAGAIN;
+ +	return 0;
+  }
+  
+  static int io_prep_sfr(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+@@@ -2178,47 -4386,30 +2339,66 @@@ static int io_req_set_file(struct io_ri
+  	return 0;
+  }
+  
+ -static int io_grab_files(struct io_kiocb *req)
+ +static int __io_queue_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			struct sqe_submit *s, bool force_nonblock)
+  {
+ -	int ret = -EBADF;
+ -	struct io_ring_ctx *ctx = req->ctx;
+ +	int ret;
+ +
+++<<<<<<< HEAD
+ +	ret = __io_submit_sqe(ctx, req, s, force_nonblock);
+ +	if (ret == -EAGAIN && !(req->flags & REQ_F_NOWAIT)) {
+ +		struct io_uring_sqe *sqe_copy;
+ +
+ +		sqe_copy = kmemdup(s->sqe, sizeof(*sqe_copy), GFP_KERNEL);
+ +		if (sqe_copy) {
+ +			struct async_list *list;
+ +
+ +			s->sqe = sqe_copy;
+ +			memcpy(&req->submit, s, sizeof(*s));
+ +			list = io_async_list_from_sqe(ctx, s->sqe);
+ +			if (!io_add_to_prev_work(list, req)) {
+ +				if (list)
+ +					atomic_inc(&list->cnt);
+ +				INIT_WORK(&req->work, io_sq_wq_submit_work);
+ +				io_queue_async_work(ctx, req);
+ +			}
+ +
+ +			/*
+ +			 * Queued up for async execution, worker will release
+ +			 * submit reference when the iocb is actually submitted.
+ +			 */
+ +			return 0;
+ +		}
+ +	}
+  
+ +	/* drop submission reference */
+ +	io_put_req(req);
+ +
+ +	/* and drop final reference, if we failed */
+ +	if (ret) {
+ +		io_cqring_add_event(ctx, req->user_data, ret);
+ +		if (req->flags & REQ_F_LINK)
+ +			req->flags |= REQ_F_FAIL_LINK;
+ +		io_put_req(req);
+++=======
++ 	if (!ctx->ring_file)
++ 		return -EBADF;
++ 
++ 	rcu_read_lock();
++ 	spin_lock_irq(&ctx->inflight_lock);
++ 	/*
++ 	 * We use the f_ops->flush() handler to ensure that we can flush
++ 	 * out work accessing these files if the fd is closed. Check if
++ 	 * the fd has changed since we started down this path, and disallow
++ 	 * this operation if it has.
++ 	 */
++ 	if (fcheck(ctx->ring_fd) == ctx->ring_file) {
++ 		list_add(&req->inflight_entry, &ctx->inflight_list);
++ 		req->flags |= REQ_F_INFLIGHT;
++ 		req->work.files = current->files;
++ 		ret = 0;
+++>>>>>>> b14cca0c84c7 (io_uring: hide uring_fd in ctx)
+  	}
+ -	spin_unlock_irq(&ctx->inflight_lock);
+ -	rcu_read_unlock();
+  
+  	return ret;
+  }
+@@@ -2438,45 -4774,54 +2618,58 @@@ static int io_submit_sqes(struct io_rin
+  		statep = &state;
+  	}
+  
++ 	ctx->ring_fd = ring_fd;
++ 	ctx->ring_file = ring_file;
++ 
+  	for (i = 0; i < nr; i++) {
+ -		const struct io_uring_sqe *sqe;
+ -		struct io_kiocb *req;
+ -
+ -		req = io_get_req(ctx, statep);
+ -		if (unlikely(!req)) {
+ -			if (!submitted)
+ -				submitted = -EAGAIN;
+ -			break;
+ -		}
+ -		if (!io_get_sqring(ctx, req, &sqe)) {
+ -			__io_req_do_free(req);
+ -			break;
+ -		}
+ -
+ -		/* will complete beyond this point, count as submitted */
+ -		submitted++;
+ -
+ -		if (unlikely(req->opcode >= IORING_OP_LAST)) {
+ -			io_cqring_add_event(req, -EINVAL);
+ -			io_double_put_req(req);
+ -			break;
+ +		/*
+ +		 * If previous wasn't linked and we have a linked command,
+ +		 * that's the end of the chain. Submit the previous link.
+ +		 */
+ +		if (!prev_was_link && link) {
+ +			io_queue_link_head(ctx, link, &link->submit, shadow_req,
+ +						true);
+ +			link = NULL;
+ +			shadow_req = NULL;
+  		}
+ -
+ -		if (io_op_defs[req->opcode].needs_mm && !*mm) {
+ -			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
+ -			if (!mm_fault) {
+ -				use_mm(ctx->sqo_mm);
+ -				*mm = ctx->sqo_mm;
+ +		prev_was_link = (sqes[i].sqe->flags & IOSQE_IO_LINK) != 0;
+ +
+ +		if (link && (sqes[i].sqe->flags & IOSQE_IO_DRAIN)) {
+ +			if (!shadow_req) {
+ +				shadow_req = io_get_req(ctx, NULL);
+ +				if (unlikely(!shadow_req))
+ +					goto out;
+ +				shadow_req->flags |= (REQ_F_IO_DRAIN | REQ_F_SHADOW_DRAIN);
+ +				refcount_dec(&shadow_req->refs);
+  			}
+ +			shadow_req->sequence = sqes[i].sequence;
+  		}
+  
+++<<<<<<< HEAD
+ +out:
+ +		if (unlikely(mm_fault)) {
+ +			io_cqring_add_event(ctx, sqes[i].sqe->user_data,
+ +						-EFAULT);
+ +		} else {
+ +			sqes[i].has_user = has_user;
+ +			sqes[i].needs_lock = true;
+ +			sqes[i].needs_fixed_file = true;
+ +			io_submit_sqe(ctx, &sqes[i], statep, &link, true);
+ +			submitted++;
+ +		}
+++=======
++ 		req->has_user = *mm != NULL;
++ 		req->in_async = async;
++ 		req->needs_fixed_file = async;
++ 		trace_io_uring_submit_sqe(ctx, req->opcode, req->user_data,
++ 						true, async);
++ 		if (!io_submit_sqe(req, sqe, statep, &link))
++ 			break;
+++>>>>>>> b14cca0c84c7 (io_uring: hide uring_fd in ctx)
+  	}
+  
+ -	if (submitted != nr)
+ -		percpu_ref_put_many(&ctx->refs, nr - submitted);
+  	if (link)
+ -		io_queue_link_head(link);
+ +		io_queue_link_head(ctx, link, &link->submit, shadow_req, true);
+  	if (statep)
+  		io_submit_state_end(&state);
+  
+* Unmerged path fs/io_uring.c
