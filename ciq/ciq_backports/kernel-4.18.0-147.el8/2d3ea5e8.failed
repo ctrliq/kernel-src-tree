@@ -1,0 +1,319 @@
+tools: bpftool: add probes for eBPF helper functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Quentin Monnet <quentin.monnet@netronome.com>
+commit 2d3ea5e85dd867712ba8747cb01c2d88376ead5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2d3ea5e8.failed
+
+Similarly to what was done for program types and map types, add a set of
+probes to test the availability of the different eBPF helper functions
+on the current system.
+
+For each known program type, all known helpers are tested, in order to
+establish a compatibility matrix. Output is provided as a set of lists
+of available helpers, one per program type.
+
+Sample output:
+
+    # bpftool feature probe kernel
+    ...
+    Scanning eBPF helper functions...
+    eBPF helpers supported for program type socket_filter:
+            - bpf_map_lookup_elem
+            - bpf_map_update_elem
+            - bpf_map_delete_elem
+    ...
+    eBPF helpers supported for program type kprobe:
+            - bpf_map_lookup_elem
+            - bpf_map_update_elem
+            - bpf_map_delete_elem
+    ...
+
+    # bpftool --json --pretty feature probe kernel
+    {
+        ...
+        "helpers": {
+            "socket_filter_available_helpers": ["bpf_map_lookup_elem", \
+                    "bpf_map_update_elem","bpf_map_delete_elem", ...
+            ],
+            "kprobe_available_helpers": ["bpf_map_lookup_elem", \
+                    "bpf_map_update_elem","bpf_map_delete_elem", ...
+            ],
+            ...
+        }
+    }
+
+v5:
+- In libbpf.map, move global symbol to the new LIBBPF_0.0.2 section.
+
+v4:
+- Use "enum bpf_func_id" instead of "__u32" in bpf_probe_helper()
+  declaration for the type of the argument used to pass the id of
+  the helper to probe.
+- Undef BPF_HELPER_MAKE_ENTRY after using it.
+
+v3:
+- Do not pass kernel version from bpftool to libbpf probes (kernel
+  version for testing program with kprobes is retrieved directly from
+  libbpf).
+- Dump one list of available helpers per program type (instead of one
+  list of compatible program types per helper).
+
+v2:
+- Move probes from bpftool to libbpf.
+- Test all program types for each helper, print a list of working prog
+  types for each helper.
+- Fall back on include/uapi/linux/bpf.h for names and ids of helpers.
+- Remove C-style macros output from this patch.
+
+	Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 2d3ea5e85dd867712ba8747cb01c2d88376ead5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/bpf/bpftool/feature.c
+#	tools/lib/bpf/libbpf.h
+#	tools/lib/bpf/libbpf.map
+#	tools/lib/bpf/libbpf_probes.c
+diff --cc tools/bpf/bpftool/feature.c
+index 4a2867439ab7,55c8d215ca44..000000000000
+--- a/tools/bpf/bpftool/feature.c
++++ b/tools/bpf/bpftool/feature.c
+@@@ -403,6 -423,86 +410,89 @@@ static bool probe_bpf_syscall(void
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void probe_prog_type(enum bpf_prog_type prog_type, bool *supported_types)
++ {
++ 	const char *plain_comment = "eBPF program_type ";
++ 	char feat_name[128], plain_desc[128];
++ 	size_t maxlen;
++ 	bool res;
++ 
++ 	res = bpf_probe_prog_type(prog_type, 0);
++ 
++ 	supported_types[prog_type] |= res;
++ 
++ 	maxlen = sizeof(plain_desc) - strlen(plain_comment) - 1;
++ 	if (strlen(prog_type_name[prog_type]) > maxlen) {
++ 		p_info("program type name too long");
++ 		return;
++ 	}
++ 
++ 	sprintf(feat_name, "have_%s_prog_type", prog_type_name[prog_type]);
++ 	sprintf(plain_desc, "%s%s", plain_comment, prog_type_name[prog_type]);
++ 	print_bool_feature(feat_name, plain_desc, res);
++ }
++ 
++ static void probe_map_type(enum bpf_map_type map_type)
++ {
++ 	const char *plain_comment = "eBPF map_type ";
++ 	char feat_name[128], plain_desc[128];
++ 	size_t maxlen;
++ 	bool res;
++ 
++ 	res = bpf_probe_map_type(map_type, 0);
++ 
++ 	maxlen = sizeof(plain_desc) - strlen(plain_comment) - 1;
++ 	if (strlen(map_type_name[map_type]) > maxlen) {
++ 		p_info("map type name too long");
++ 		return;
++ 	}
++ 
++ 	sprintf(feat_name, "have_%s_map_type", map_type_name[map_type]);
++ 	sprintf(plain_desc, "%s%s", plain_comment, map_type_name[map_type]);
++ 	print_bool_feature(feat_name, plain_desc, res);
++ }
++ 
++ static void
++ probe_helpers_for_progtype(enum bpf_prog_type prog_type, bool supported_type)
++ {
++ 	const char *ptype_name = prog_type_name[prog_type];
++ 	char feat_name[128];
++ 	unsigned int id;
++ 	bool res;
++ 
++ 	if (json_output) {
++ 		sprintf(feat_name, "%s_available_helpers", ptype_name);
++ 		jsonw_name(json_wtr, feat_name);
++ 		jsonw_start_array(json_wtr);
++ 	} else {
++ 		printf("eBPF helpers supported for program type %s:",
++ 		       ptype_name);
++ 	}
++ 
++ 	for (id = 1; id < ARRAY_SIZE(helper_name); id++) {
++ 		if (!supported_type)
++ 			res = false;
++ 		else
++ 			res = bpf_probe_helper(id, prog_type, 0);
++ 
++ 		if (json_output) {
++ 			if (res)
++ 				jsonw_string(json_wtr, helper_name[id]);
++ 		} else {
++ 			if (res)
++ 				printf("\n\t- %s", helper_name[id]);
++ 		}
++ 	}
++ 
++ 	if (json_output)
++ 		jsonw_end_array(json_wtr);
++ 	else
++ 		printf("\n");
++ }
++ 
+++>>>>>>> 2d3ea5e85dd8 (tools: bpftool: add probes for eBPF helper functions)
+  static int do_probe(int argc, char **argv)
+  {
+  	enum probe_component target = COMPONENT_UNSPEC;
+@@@ -460,8 -562,29 +550,30 @@@
+  	print_start_section("syscall_config",
+  			    "Scanning system call availability...");
+  
+ -	if (!probe_bpf_syscall())
+ -		/* bpf() syscall unavailable, don't probe other BPF features */
+ -		goto exit_close_json;
+ +	probe_bpf_syscall();
+  
+++<<<<<<< HEAD
+++=======
++ 	print_end_then_start_section("program_types",
++ 				     "Scanning eBPF program types...");
++ 
++ 	for (i = BPF_PROG_TYPE_UNSPEC + 1; i < ARRAY_SIZE(prog_type_name); i++)
++ 		probe_prog_type(i, supported_types);
++ 
++ 	print_end_then_start_section("map_types",
++ 				     "Scanning eBPF map types...");
++ 
++ 	for (i = BPF_MAP_TYPE_UNSPEC + 1; i < map_type_name_size; i++)
++ 		probe_map_type(i);
++ 
++ 	print_end_then_start_section("helpers",
++ 				     "Scanning eBPF helper functions...");
++ 
++ 	for (i = BPF_PROG_TYPE_UNSPEC + 1; i < ARRAY_SIZE(prog_type_name); i++)
++ 		probe_helpers_for_progtype(i, supported_types[i]);
++ 
++ exit_close_json:
+++>>>>>>> 2d3ea5e85dd8 (tools: bpftool: add probes for eBPF helper functions)
+  	if (json_output) {
+  		/* End current "section" of probes */
+  		jsonw_end_object(json_wtr);
+diff --cc tools/lib/bpf/libbpf.h
+index c8c168c73302,62ae6cb93da1..000000000000
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@@ -298,10 -321,56 +298,63 @@@ enum bpf_perf_event_ret 
+  	LIBBPF_PERF_EVENT_CONT	= -2,
+  };
+  
+++<<<<<<< HEAD
+ +typedef enum bpf_perf_event_ret (*bpf_perf_event_print_t)(void *event,
+ +							  void *priv);
+ +int bpf_perf_event_read_simple(void *mem, unsigned long size,
+ +			       unsigned long page_size,
+ +			       void **buf, size_t *buf_len,
+ +			       bpf_perf_event_print_t fn, void *priv);
+++=======
++ struct perf_event_header;
++ typedef enum bpf_perf_event_ret
++ 	(*bpf_perf_event_print_t)(struct perf_event_header *hdr,
++ 				  void *private_data);
++ LIBBPF_API enum bpf_perf_event_ret
++ bpf_perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
++ 			   void **copy_mem, size_t *copy_size,
++ 			   bpf_perf_event_print_t fn, void *private_data);
++ 
++ struct nlattr;
++ typedef int (*libbpf_dump_nlmsg_t)(void *cookie, void *msg, struct nlattr **tb);
++ int libbpf_netlink_open(unsigned int *nl_pid);
++ int libbpf_nl_get_link(int sock, unsigned int nl_pid,
++ 		       libbpf_dump_nlmsg_t dump_link_nlmsg, void *cookie);
++ int libbpf_nl_get_class(int sock, unsigned int nl_pid, int ifindex,
++ 			libbpf_dump_nlmsg_t dump_class_nlmsg, void *cookie);
++ int libbpf_nl_get_qdisc(int sock, unsigned int nl_pid, int ifindex,
++ 			libbpf_dump_nlmsg_t dump_qdisc_nlmsg, void *cookie);
++ int libbpf_nl_get_filter(int sock, unsigned int nl_pid, int ifindex, int handle,
++ 			 libbpf_dump_nlmsg_t dump_filter_nlmsg, void *cookie);
++ 
++ struct bpf_prog_linfo;
++ struct bpf_prog_info;
++ 
++ LIBBPF_API void bpf_prog_linfo__free(struct bpf_prog_linfo *prog_linfo);
++ LIBBPF_API struct bpf_prog_linfo *
++ bpf_prog_linfo__new(const struct bpf_prog_info *info);
++ LIBBPF_API const struct bpf_line_info *
++ bpf_prog_linfo__lfind_addr_func(const struct bpf_prog_linfo *prog_linfo,
++ 				__u64 addr, __u32 func_idx, __u32 nr_skip);
++ LIBBPF_API const struct bpf_line_info *
++ bpf_prog_linfo__lfind(const struct bpf_prog_linfo *prog_linfo,
++ 		      __u32 insn_off, __u32 nr_skip);
++ 
++ /*
++  * Probe for supported system features
++  *
++  * Note that running many of these probes in a short amount of time can cause
++  * the kernel to reach the maximal size of lockable memory allowed for the
++  * user, causing subsequent probes to fail. In this case, the caller may want
++  * to adjust that limit with setrlimit().
++  */
++ LIBBPF_API bool bpf_probe_prog_type(enum bpf_prog_type prog_type,
++ 				    __u32 ifindex);
++ LIBBPF_API bool bpf_probe_map_type(enum bpf_map_type map_type, __u32 ifindex);
++ LIBBPF_API bool bpf_probe_helper(enum bpf_func_id id,
++ 				 enum bpf_prog_type prog_type, __u32 ifindex);
++ 
++ #ifdef __cplusplus
++ } /* extern "C" */
+++>>>>>>> 2d3ea5e85dd8 (tools: bpftool: add probes for eBPF helper functions)
+  #endif
+ -
+ -#endif /* __LIBBPF_LIBBPF_H */
+diff --cc tools/lib/bpf/libbpf.map
+index 4fb29f6d7a80,266bc95d0142..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -119,3 -124,10 +119,13 @@@ LIBBPF_0.0.1 
+  	local:
+  		*;
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ LIBBPF_0.0.2 {
++ 	global:
++ 		bpf_probe_helper;
++ 		bpf_probe_map_type;
++ 		bpf_probe_prog_type;
++ } LIBBPF_0.0.1;
+++>>>>>>> 2d3ea5e85dd8 (tools: bpftool: add probes for eBPF helper functions)
+* Unmerged path tools/lib/bpf/libbpf_probes.c
+diff --git a/tools/bpf/bpftool/Documentation/bpftool-feature.rst b/tools/bpf/bpftool/Documentation/bpftool-feature.rst
+index 40ac13c0b782..255e3b3629a0 100644
+--- a/tools/bpf/bpftool/Documentation/bpftool-feature.rst
++++ b/tools/bpf/bpftool/Documentation/bpftool-feature.rst
+@@ -30,6 +30,10 @@ DESCRIPTION
+ 
+ 		  Keyword **kernel** can be omitted.
+ 
++		  Note that when probed, some eBPF helpers (e.g.
++		  **bpf_trace_printk**\ () or **bpf_probe_write_user**\ ()) may
++		  print warnings to kernel logs.
++
+ 	**bpftool feature help**
+ 		  Print short help message.
+ 
+* Unmerged path tools/bpf/bpftool/feature.c
+* Unmerged path tools/lib/bpf/libbpf.h
+* Unmerged path tools/lib/bpf/libbpf.map
+* Unmerged path tools/lib/bpf/libbpf_probes.c
