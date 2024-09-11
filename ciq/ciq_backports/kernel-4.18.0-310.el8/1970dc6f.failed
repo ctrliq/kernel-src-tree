@@ -1,0 +1,258 @@
+mm/gup: /proc/vmstat: pin_user_pages (FOLL_PIN) reporting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit 1970dc6f5226416957ad0cc70ab47386ed3195a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/1970dc6f.failed
+
+Now that pages are "DMA-pinned" via pin_user_page*(), and unpinned via
+unpin_user_pages*(), we need some visibility into whether all of this is
+working correctly.
+
+Add two new fields to /proc/vmstat:
+
+    nr_foll_pin_acquired
+    nr_foll_pin_released
+
+These are documented in Documentation/core-api/pin_user_pages.rst.  They
+represent the number of pages (since boot time) that have been pinned
+("nr_foll_pin_acquired") and unpinned ("nr_foll_pin_released"), via
+pin_user_pages*() and unpin_user_pages*().
+
+In the absence of long-running DMA or RDMA operations that hold pages
+pinned, the above two fields will normally be equal to each other.
+
+Also: update Documentation/core-api/pin_user_pages.rst, to remove an
+earlier (now confirmed untrue) claim about a performance problem with
+/proc/vmstat.
+
+Also: update Documentation/core-api/pin_user_pages.rst to rename the new
+/proc/vmstat entries, to the names listed here.
+
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+Link: http://lkml.kernel.org/r/20200211001536.1027652-9-jhubbard@nvidia.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1970dc6f5226416957ad0cc70ab47386ed3195a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	mm/gup.c
+diff --cc include/linux/mmzone.h
+index ae118ed2cb9b,4bca42eeb439..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -206,9 -242,9 +206,15 @@@ enum node_stat_item 
+  	NR_VMSCAN_IMMEDIATE,	/* Prioritise for reclaim when writeback ends */
+  	NR_DIRTIED,		/* page dirtyings since bootup */
+  	NR_WRITTEN,		/* page writings since bootup */
+++<<<<<<< HEAD
+ +	RH_KABI_RENAME(NR_INDIRECTLY_RECLAIMABLE_BYTES,
+ +		       NR_KERNEL_MISC_RECLAIMABLE),
+ +				/* reclaimable non-slab kernel pages */
+++=======
++ 	NR_KERNEL_MISC_RECLAIMABLE,	/* reclaimable non-slab kernel pages */
++ 	NR_FOLL_PIN_ACQUIRED,	/* via: pin_user_page(), gup flag: FOLL_PIN */
++ 	NR_FOLL_PIN_RELEASED,	/* pages returned via unpin_user_page() */
+++>>>>>>> 1970dc6f5226 (mm/gup: /proc/vmstat: pin_user_pages (FOLL_PIN) reporting)
+  	NR_VM_NODE_STAT_ITEMS
+  };
+  
+diff --cc mm/gup.c
+index eb225cc5e706,c560c9cc0ee5..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -69,8 -86,30 +69,35 @@@ static __maybe_unused struct page *try_
+  	if (flags & FOLL_GET)
+  		return try_get_compound_head(page, refs);
+  	else if (flags & FOLL_PIN) {
+++<<<<<<< HEAD
+ +		refs *= GUP_PIN_COUNTING_BIAS;
+ +		return try_get_compound_head(page, refs);
+++=======
++ 		int orig_refs = refs;
++ 
++ 		/*
++ 		 * When pinning a compound page of order > 1 (which is what
++ 		 * hpage_pincount_available() checks for), use an exact count to
++ 		 * track it, via hpage_pincount_add/_sub().
++ 		 *
++ 		 * However, be sure to *also* increment the normal page refcount
++ 		 * field at least once, so that the page really is pinned.
++ 		 */
++ 		if (!hpage_pincount_available(page))
++ 			refs *= GUP_PIN_COUNTING_BIAS;
++ 
++ 		page = try_get_compound_head(page, refs);
++ 		if (!page)
++ 			return NULL;
++ 
++ 		if (hpage_pincount_available(page))
++ 			hpage_pincount_add(page, refs);
++ 
++ 		mod_node_page_state(page_pgdat(page), NR_FOLL_PIN_ACQUIRED,
++ 				    orig_refs);
++ 
++ 		return page;
+++>>>>>>> 1970dc6f5226 (mm/gup: /proc/vmstat: pin_user_pages (FOLL_PIN) reporting)
+  	}
+  
+  	WARN_ON_ONCE(1);
+@@@ -110,7 -151,20 +137,24 @@@ bool __must_check try_grab_page(struct 
+  		if (WARN_ON_ONCE(page_ref_count(page) <= 0))
+  			return false;
+  
+++<<<<<<< HEAD
+ +		page_ref_add(page, GUP_PIN_COUNTING_BIAS);
+++=======
++ 		if (hpage_pincount_available(page))
++ 			hpage_pincount_add(page, 1);
++ 		else
++ 			refs = GUP_PIN_COUNTING_BIAS;
++ 
++ 		/*
++ 		 * Similar to try_grab_compound_head(): even if using the
++ 		 * hpage_pincount_add/_sub() routines, be sure to
++ 		 * *also* increment the normal page refcount field at least
++ 		 * once, so that the page really is pinned.
++ 		 */
++ 		page_ref_add(page, refs);
++ 
++ 		mod_node_page_state(page_pgdat(page), NR_FOLL_PIN_ACQUIRED, 1);
+++>>>>>>> 1970dc6f5226 (mm/gup: /proc/vmstat: pin_user_pages (FOLL_PIN) reporting)
+  	}
+  
+  	return true;
+@@@ -124,8 -178,14 +168,9 @@@ static bool __unpin_devmap_managed_user
+  	if (!page_is_devmap_managed(page))
+  		return false;
+  
+ -	if (hpage_pincount_available(page))
+ -		hpage_pincount_sub(page, 1);
+ -	else
+ -		refs = GUP_PIN_COUNTING_BIAS;
+ -
+ -	count = page_ref_sub_return(page, refs);
+ +	count = page_ref_sub_return(page, GUP_PIN_COUNTING_BIAS);
+  
++ 	mod_node_page_state(page_pgdat(page), NR_FOLL_PIN_RELEASED, 1);
+  	/*
+  	 * devmap page refcounts are 1-based, rather than 0-based: if
+  	 * refcount is 1, then the page is free and the refcount is
+@@@ -167,8 -229,15 +212,10 @@@ void unpin_user_page(struct page *page
+  	if (__unpin_devmap_managed_user_page(page))
+  		return;
+  
+ -	if (hpage_pincount_available(page))
+ -		hpage_pincount_sub(page, 1);
+ -	else
+ -		refs = GUP_PIN_COUNTING_BIAS;
+ -
+ -	if (page_ref_sub_and_test(page, refs))
+ +	if (page_ref_sub_and_test(page, GUP_PIN_COUNTING_BIAS))
+  		__put_page(page);
++ 
++ 	mod_node_page_state(page_pgdat(page), NR_FOLL_PIN_RELEASED, 1);
+  }
+  EXPORT_SYMBOL(unpin_user_page);
+  
+@@@ -2000,8 -2023,15 +2047,20 @@@ EXPORT_SYMBOL(get_user_pages_unlocked)
+  
+  static void put_compound_head(struct page *page, int refs, unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	if (flags & FOLL_PIN)
+ +		refs *= GUP_PIN_COUNTING_BIAS;
+++=======
++ 	if (flags & FOLL_PIN) {
++ 		mod_node_page_state(page_pgdat(page), NR_FOLL_PIN_RELEASED,
++ 				    refs);
++ 
++ 		if (hpage_pincount_available(page))
++ 			hpage_pincount_sub(page, refs);
++ 		else
++ 			refs *= GUP_PIN_COUNTING_BIAS;
++ 	}
+++>>>>>>> 1970dc6f5226 (mm/gup: /proc/vmstat: pin_user_pages (FOLL_PIN) reporting)
+  
+  	VM_BUG_ON_PAGE(page_ref_count(page) < refs, page);
+  	/*
+diff --git a/Documentation/core-api/pin_user_pages.rst b/Documentation/core-api/pin_user_pages.rst
+index 9829345428f8..bf39301de828 100644
+--- a/Documentation/core-api/pin_user_pages.rst
++++ b/Documentation/core-api/pin_user_pages.rst
+@@ -215,12 +215,35 @@ has the following new calls to exercise the new pin*() wrapper functions:
+ You can monitor how many total dma-pinned pages have been acquired and released
+ since the system was booted, via two new /proc/vmstat entries: ::
+ 
+-    /proc/vmstat/nr_foll_pin_requested
+-    /proc/vmstat/nr_foll_pin_requested
++    /proc/vmstat/nr_foll_pin_acquired
++    /proc/vmstat/nr_foll_pin_released
+ 
+-Those are both going to show zero, unless CONFIG_DEBUG_VM is set. This is
+-because there is a noticeable performance drop in unpin_user_page(), when they
+-are activated.
++Under normal conditions, these two values will be equal unless there are any
++long-term [R]DMA pins in place, or during pin/unpin transitions.
++
++* nr_foll_pin_acquired: This is the number of logical pins that have been
++  acquired since the system was powered on. For huge pages, the head page is
++  pinned once for each page (head page and each tail page) within the huge page.
++  This follows the same sort of behavior that get_user_pages() uses for huge
++  pages: the head page is refcounted once for each tail or head page in the huge
++  page, when get_user_pages() is applied to a huge page.
++
++* nr_foll_pin_released: The number of logical pins that have been released since
++  the system was powered on. Note that pages are released (unpinned) on a
++  PAGE_SIZE granularity, even if the original pin was applied to a huge page.
++  Becaused of the pin count behavior described above in "nr_foll_pin_acquired",
++  the accounting balances out, so that after doing this::
++
++    pin_user_pages(huge_page);
++    for (each page in huge_page)
++        unpin_user_page(page);
++
++...the following is expected::
++
++    nr_foll_pin_released == nr_foll_pin_acquired
++
++(...unless it was already out of balance due to a long-term RDMA pin being in
++place.)
+ 
+ References
+ ==========
+* Unmerged path include/linux/mmzone.h
+* Unmerged path mm/gup.c
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index d9662e48d82b..9bf3e911b9ff 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1209,6 +1209,8 @@ const char * const vmstat_text[] = {
+ 	"nr_dirtied",
+ 	"nr_written",
+ 	"nr_kernel_misc_reclaimable",
++	"nr_foll_pin_acquired",
++	"nr_foll_pin_released",
+ 
+ 	/* enum writeback_stat_item counters */
+ 	"nr_dirty_threshold",
