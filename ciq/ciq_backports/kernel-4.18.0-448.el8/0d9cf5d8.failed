@@ -1,0 +1,180 @@
+s390/pci: handle stale deconfiguration events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 0d9cf5d8c5d0bfa144236b5f2aeff02124940c56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/0d9cf5d8.failed
+
+The PCIs event with PEC 0x0303 or 0x0304 are a request to deconfigure
+a PCI function, respectively an indication that it was already
+deconfigured by the platform. If such an event is queued during boot it
+may happen that the platform has already adjusted the configuration flag
+of the relevant function in the CLP List PCI Functions result. In this
+case we might not have configured the PCI function at all and should
+thus ignore the event. Note that no locking is necessary as event
+handling only starts after we have fully initialized the zPCI subsystem
+and scanned all PCI devices listed in the CLP result.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Acked-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 0d9cf5d8c5d0bfa144236b5f2aeff02124940c56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_event.c
+diff --cc arch/s390/pci/pci_event.c
+index 4b2bb5dfb29a,cd447b96b4b1..000000000000
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@@ -73,15 -74,24 +73,36 @@@ void zpci_event_error(void *data
+  		__zpci_event_error(data);
+  }
+  
+++<<<<<<< HEAD
+ +static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+ +{
+ +	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
+ +	struct pci_dev *pdev = NULL;
+ +	enum zpci_state state;
+ +	int ret;
+ +
+ +	if (zdev && zdev->zbus->bus)
+ +		pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
+++=======
++ static void zpci_event_hard_deconfigured(struct zpci_dev *zdev, u32 fh)
++ {
++ 	zdev->fh = fh;
++ 	/* Give the driver a hint that the function is
++ 	 * already unusable.
++ 	 */
++ 	zpci_bus_remove_device(zdev, true);
++ 	/* Even though the device is already gone we still
++ 	 * need to free zPCI resources as part of the disable.
++ 	 */
++ 	zpci_disable_device(zdev);
++ 	zdev->state = ZPCI_FN_STATE_STANDBY;
++ }
++ 
++ static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
++ {
++ 	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
++ 	enum zpci_state state;
+++>>>>>>> 0d9cf5d8c5d0 (s390/pci: handle stale deconfiguration events)
+  
+  	zpci_err("avail CCDF:\n");
+  	zpci_err_hex(ccdf, sizeof(*ccdf));
+@@@ -89,70 -99,46 +110,95 @@@
+  	switch (ccdf->pec) {
+  	case 0x0301: /* Reserved|Standby -> Configured */
+  		if (!zdev) {
+ -			zdev = zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_CONFIGURED);
+ -			if (IS_ERR(zdev))
+ -				break;
+ -		} else {
+ -			/* the configuration request may be stale */
+ -			if (zdev->state != ZPCI_FN_STATE_STANDBY)
+ -				break;
+ -			zdev->state = ZPCI_FN_STATE_CONFIGURED;
+ +			ret = clp_add_pci_device(ccdf->fid, ccdf->fh, 1);
+ +			break;
+  		}
+ -		zpci_scan_configured_device(zdev, ccdf->fh);
+ +		/* the configuration request may be stale */
+ +		if (zdev->state != ZPCI_FN_STATE_STANDBY)
+ +			break;
+ +		zdev->fh = ccdf->fh;
+ +		zdev->state = ZPCI_FN_STATE_CONFIGURED;
+ +		ret = zpci_enable_device(zdev);
+ +		if (ret)
+ +			break;
+ +
+ +		/* the PCI function will be scanned once function 0 appears */
+ +		if (!zdev->zbus->bus)
+ +			break;
+ +
+ +		pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
+ +		if (!pdev)
+ +			break;
+ +
+ +		pci_bus_add_device(pdev);
+ +		pci_lock_rescan_remove();
+ +		pci_bus_add_devices(zdev->zbus->bus);
+ +		pci_unlock_rescan_remove();
+  		break;
+  	case 0x0302: /* Reserved -> Standby */
+ -		if (!zdev)
+ -			zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_STANDBY);
+ -		else
+ -			zdev->fh = ccdf->fh;
+ +		if (!zdev) {
+ +			clp_add_pci_device(ccdf->fid, ccdf->fh, 0);
+ +			break;
+ +		}
+ +		zdev->fh = ccdf->fh;
+  		break;
+  	case 0x0303: /* Deconfiguration requested */
+++<<<<<<< HEAD
+ +		if (!zdev)
+ +			break;
+ +		if (pdev)
+ +			zpci_remove_device(zdev);
+ +
+ +		ret = zpci_disable_device(zdev);
+ +		if (ret)
+ +			break;
+ +
+ +		ret = sclp_pci_deconfigure(zdev->fid);
+ +		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
+ +		if (!ret)
+ +			zdev->state = ZPCI_FN_STATE_STANDBY;
+ +
+ +		break;
+ +	case 0x0304: /* Configured -> Standby|Reserved */
+ +		if (!zdev)
+ +			break;
+ +		if (pdev) {
+ +			/* Give the driver a hint that the function is
+ +			 * already unusable. */
+ +			pdev->error_state = pci_channel_io_perm_failure;
+ +			zpci_remove_device(zdev);
+ +		}
+ +
+ +		zdev->fh = ccdf->fh;
+ +		zpci_disable_device(zdev);
+ +		zdev->state = ZPCI_FN_STATE_STANDBY;
+ +		if (!clp_get_state(ccdf->fid, &state) &&
+ +		    state == ZPCI_FN_STATE_RESERVED) {
+ +			zpci_device_reserved(zdev);
+++=======
++ 		if (zdev) {
++ 			/* The event may have been queued before we confirgured
++ 			 * the device.
++ 			 */
++ 			if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
++ 				break;
++ 			zdev->fh = ccdf->fh;
++ 			zpci_deconfigure_device(zdev);
++ 		}
++ 		break;
++ 	case 0x0304: /* Configured -> Standby|Reserved */
++ 		if (zdev) {
++ 			/* The event may have been queued before we confirgured
++ 			 * the device.:
++ 			 */
++ 			if (zdev->state == ZPCI_FN_STATE_CONFIGURED)
++ 				zpci_event_hard_deconfigured(zdev, ccdf->fh);
++ 			/* The 0x0304 event may immediately reserve the device */
++ 			if (!clp_get_state(zdev->fid, &state) &&
++ 			    state == ZPCI_FN_STATE_RESERVED) {
++ 				zpci_zdev_put(zdev);
++ 			}
+++>>>>>>> 0d9cf5d8c5d0 (s390/pci: handle stale deconfiguration events)
+  		}
+  		break;
+  	case 0x0306: /* 0x308 or 0x302 for multiple devices */
+* Unmerged path arch/s390/pci/pci_event.c
