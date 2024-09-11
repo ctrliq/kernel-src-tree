@@ -1,0 +1,148 @@
+KVM: x86/mmu: do not pass vcpu to root freeing functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 0c1c92f15f7600a03377e3211983f3571c08ad4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0c1c92f1.failed
+
+These functions only operate on a given MMU, of which there is more
+than one in a vCPU (we care about two, because the third does not have
+any roots and is only used to walk guest page tables).  They do need a
+struct kvm in order to lock the mmu_lock, but they do not needed anything
+else in the struct kvm_vcpu.  So, pass the vcpu->kvm directly to them.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0c1c92f15f7600a03377e3211983f3571c08ad4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 96ecf6f2c1a5,ccec837e520d..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1758,11 -1777,9 +1758,15 @@@ void kvm_inject_nmi(struct kvm_vcpu *vc
+  void kvm_update_dr7(struct kvm_vcpu *vcpu);
+  
+  int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn);
+- void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
++ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
+  			ulong roots_to_free);
+++<<<<<<< HEAD
+ +void kvm_mmu_free_guest_mode_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu);
+ +gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+ +			   struct x86_exception *exception);
+++=======
++ void kvm_mmu_free_guest_mode_roots(struct kvm *kvm, struct kvm_mmu *mmu);
+++>>>>>>> 0c1c92f15f76 (KVM: x86/mmu: do not pass vcpu to root freeing functions)
+  gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
+  			      struct x86_exception *exception);
+  gpa_t kvm_mmu_gva_to_gpa_fetch(struct kvm_vcpu *vcpu, gva_t gva,
+diff --cc arch/x86/kvm/mmu/mmu.c
+index bdbeb3101d0e,07cc9b155e6d..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -3271,13 -3218,12 +3271,12 @@@ static void mmu_free_root_page(struct k
+  }
+  
+  /* roots_to_free must be some combination of the KVM_MMU_ROOT_* flags */
+- void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
++ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
+  			ulong roots_to_free)
+  {
+- 	struct kvm *kvm = vcpu->kvm;
+  	int i;
+  	LIST_HEAD(invalid_list);
+ -	bool free_active_root;
+ +	bool free_active_root = roots_to_free & KVM_MMU_ROOT_CURRENT;
+  
+  	BUILD_BUG_ON(KVM_MMU_NUM_PREV_ROOTS >= BITS_PER_LONG);
+  
+@@@ -5048,10 -5064,12 +5049,19 @@@ out
+  
+  void kvm_mmu_unload(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	kvm_mmu_free_roots(vcpu, &vcpu->arch.root_mmu, KVM_MMU_ROOTS_ALL);
+ +	WARN_ON(VALID_PAGE(vcpu->arch.root_mmu.root_hpa));
+ +	kvm_mmu_free_roots(vcpu, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
+ +	WARN_ON(VALID_PAGE(vcpu->arch.guest_mmu.root_hpa));
+++=======
++ 	struct kvm *kvm = vcpu->kvm;
++ 
++ 	kvm_mmu_free_roots(kvm, &vcpu->arch.root_mmu, KVM_MMU_ROOTS_ALL);
++ 	WARN_ON(VALID_PAGE(vcpu->arch.root_mmu.root.hpa));
++ 	kvm_mmu_free_roots(kvm, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
++ 	WARN_ON(VALID_PAGE(vcpu->arch.guest_mmu.root.hpa));
+++>>>>>>> 0c1c92f15f76 (KVM: x86/mmu: do not pass vcpu to root freeing functions)
+  }
+  
+  static bool need_remote_flush(u64 old, u64 new)
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index f90142afce43..8545e2a28b1a 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -320,7 +320,7 @@ static void free_nested(struct kvm_vcpu *vcpu)
+ 	kvm_vcpu_unmap(vcpu, &vmx->nested.pi_desc_map, true);
+ 	vmx->nested.pi_desc = NULL;
+ 
+-	kvm_mmu_free_roots(vcpu, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
++	kvm_mmu_free_roots(vcpu->kvm, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
+ 
+ 	nested_release_evmcs(vcpu);
+ 
+@@ -5012,7 +5012,7 @@ static inline void nested_release_vmcs12(struct kvm_vcpu *vcpu)
+ 				  vmx->nested.current_vmptr >> PAGE_SHIFT,
+ 				  vmx->nested.cached_vmcs12, 0, VMCS12_SIZE);
+ 
+-	kvm_mmu_free_roots(vcpu, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
++	kvm_mmu_free_roots(vcpu->kvm, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
+ 
+ 	vmx->nested.current_vmptr = INVALID_GPA;
+ }
+@@ -5491,7 +5491,7 @@ static int handle_invept(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (roots_to_free)
+-		kvm_mmu_free_roots(vcpu, mmu, roots_to_free);
++		kvm_mmu_free_roots(vcpu->kvm, mmu, roots_to_free);
+ 
+ 	return nested_vmx_succeed(vcpu);
+ }
+@@ -5580,7 +5580,7 @@ static int handle_invvpid(struct kvm_vcpu *vcpu)
+ 	 * TODO: sync only the affected SPTEs for INVDIVIDUAL_ADDR.
+ 	 */
+ 	if (!enable_ept)
+-		kvm_mmu_free_guest_mode_roots(vcpu, &vcpu->arch.root_mmu);
++		kvm_mmu_free_guest_mode_roots(vcpu->kvm, &vcpu->arch.root_mmu);
+ 
+ 	return nested_vmx_succeed(vcpu);
+ }
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index bd9418884df2..ba216497b80c 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -848,7 +848,7 @@ int load_pdptrs(struct kvm_vcpu *vcpu, unsigned long cr3)
+ 	 * Shadow page roots need to be reconstructed instead.
+ 	 */
+ 	if (!tdp_enabled && memcmp(mmu->pdptrs, pdpte, sizeof(mmu->pdptrs)))
+-		kvm_mmu_free_roots(vcpu, mmu, KVM_MMU_ROOT_CURRENT);
++		kvm_mmu_free_roots(vcpu->kvm, mmu, KVM_MMU_ROOT_CURRENT);
+ 
+ 	memcpy(mmu->pdptrs, pdpte, sizeof(mmu->pdptrs));
+ 	kvm_register_mark_dirty(vcpu, VCPU_EXREG_PDPTR);
+@@ -1161,7 +1161,7 @@ static void kvm_invalidate_pcid(struct kvm_vcpu *vcpu, unsigned long pcid)
+ 		if (kvm_get_pcid(vcpu, mmu->prev_roots[i].pgd) == pcid)
+ 			roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
+ 
+-	kvm_mmu_free_roots(vcpu, mmu, roots_to_free);
++	kvm_mmu_free_roots(vcpu->kvm, mmu, roots_to_free);
+ }
+ 
+ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
