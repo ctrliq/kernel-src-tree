@@ -1,0 +1,1215 @@
+genetlink: move to smaller ops wherever possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 66a9b9287d2447a91cef2fafc648dee32186f708
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/66a9b928.failed
+
+Bulk of the genetlink users can use smaller ops, move them.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Johannes Berg <johannes@sipsolutions.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 66a9b9287d2447a91cef2fafc648dee32186f708)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/gtp.c
+#	drivers/net/ieee802154/mac802154_hwsim.c
+#	drivers/thermal/thermal_netlink.c
+#	net/batman-adv/netlink.c
+#	net/hsr/hsr_netlink.c
+#	net/mptcp/pm_netlink.c
+diff --cc drivers/net/gtp.c
+index 8a4c99665e79,c09fe18c6c52..000000000000
+--- a/drivers/net/gtp.c
++++ b/drivers/net/gtp.c
+@@@ -1297,8 -1369,10 +1297,15 @@@ static struct genl_family gtp_genl_fami
+  	.policy = gtp_genl_policy,
+  	.netnsok	= true,
+  	.module		= THIS_MODULE,
+++<<<<<<< HEAD
+ +	.ops		= gtp_genl_ops,
+ +	.n_ops		= ARRAY_SIZE(gtp_genl_ops),
+++=======
++ 	.small_ops	= gtp_genl_ops,
++ 	.n_small_ops	= ARRAY_SIZE(gtp_genl_ops),
++ 	.mcgrps		= gtp_genl_mcgrps,
++ 	.n_mcgrps	= ARRAY_SIZE(gtp_genl_mcgrps),
+++>>>>>>> 66a9b9287d24 (genetlink: move to smaller ops wherever possible)
+  };
+  
+  static int __net_init gtp_net_init(struct net *net)
+diff --cc net/batman-adv/netlink.c
+index aac652f2dcbb,c7a55647b520..000000000000
+--- a/net/batman-adv/netlink.c
++++ b/net/batman-adv/netlink.c
+@@@ -541,12 -1016,347 +541,350 @@@ batadv_netlink_dump_hardifs(struct sk_b
+  	return msg->len;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct genl_ops batadv_netlink_ops[] = {
+++=======
++ /**
++  * batadv_netlink_vlan_fill() - Fill message with vlan attributes
++  * @msg: Netlink message to dump into
++  * @bat_priv: the bat priv with all the soft interface information
++  * @vlan: vlan which was modified
++  * @cmd: type of message to generate
++  * @portid: Port making netlink request
++  * @seq: sequence number for message
++  * @flags: Additional flags for message
++  *
++  * Return: 0 on success or negative error number in case of failure
++  */
++ static int batadv_netlink_vlan_fill(struct sk_buff *msg,
++ 				    struct batadv_priv *bat_priv,
++ 				    struct batadv_softif_vlan *vlan,
++ 				    enum batadv_nl_commands cmd,
++ 				    u32 portid, u32 seq, int flags)
++ {
++ 	void *hdr;
++ 
++ 	hdr = genlmsg_put(msg, portid, seq, &batadv_netlink_family, flags, cmd);
++ 	if (!hdr)
++ 		return -ENOBUFS;
++ 
++ 	if (nla_put_u32(msg, BATADV_ATTR_MESH_IFINDEX,
++ 			bat_priv->soft_iface->ifindex))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u32(msg, BATADV_ATTR_VLANID, vlan->vid & VLAN_VID_MASK))
++ 		goto nla_put_failure;
++ 
++ 	if (nla_put_u8(msg, BATADV_ATTR_AP_ISOLATION_ENABLED,
++ 		       !!atomic_read(&vlan->ap_isolation)))
++ 		goto nla_put_failure;
++ 
++ 	genlmsg_end(msg, hdr);
++ 	return 0;
++ 
++ nla_put_failure:
++ 	genlmsg_cancel(msg, hdr);
++ 	return -EMSGSIZE;
++ }
++ 
++ /**
++  * batadv_netlink_notify_vlan() - send vlan attributes to listener
++  * @bat_priv: the bat priv with all the soft interface information
++  * @vlan: vlan which was modified
++  *
++  * Return: 0 on success, < 0 on error
++  */
++ int batadv_netlink_notify_vlan(struct batadv_priv *bat_priv,
++ 			       struct batadv_softif_vlan *vlan)
++ {
++ 	struct sk_buff *msg;
++ 	int ret;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 
++ 	ret = batadv_netlink_vlan_fill(msg, bat_priv, vlan,
++ 				       BATADV_CMD_SET_VLAN, 0, 0, 0);
++ 	if (ret < 0) {
++ 		nlmsg_free(msg);
++ 		return ret;
++ 	}
++ 
++ 	genlmsg_multicast_netns(&batadv_netlink_family,
++ 				dev_net(bat_priv->soft_iface), msg, 0,
++ 				BATADV_NL_MCGRP_CONFIG, GFP_KERNEL);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * batadv_netlink_get_vlan() - Get vlan attributes
++  * @skb: Netlink message with request data
++  * @info: receiver information
++  *
++  * Return: 0 on success or negative error number in case of failure
++  */
++ static int batadv_netlink_get_vlan(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct batadv_softif_vlan *vlan = info->user_ptr[1];
++ 	struct batadv_priv *bat_priv = info->user_ptr[0];
++ 	struct sk_buff *msg;
++ 	int ret;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 
++ 	ret = batadv_netlink_vlan_fill(msg, bat_priv, vlan, BATADV_CMD_GET_VLAN,
++ 				       info->snd_portid, info->snd_seq, 0);
++ 	if (ret < 0) {
++ 		nlmsg_free(msg);
++ 		return ret;
++ 	}
++ 
++ 	ret = genlmsg_reply(msg, info);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * batadv_netlink_set_vlan() - Get vlan attributes
++  * @skb: Netlink message with request data
++  * @info: receiver information
++  *
++  * Return: 0 on success or negative error number in case of failure
++  */
++ static int batadv_netlink_set_vlan(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct batadv_softif_vlan *vlan = info->user_ptr[1];
++ 	struct batadv_priv *bat_priv = info->user_ptr[0];
++ 	struct nlattr *attr;
++ 
++ 	if (info->attrs[BATADV_ATTR_AP_ISOLATION_ENABLED]) {
++ 		attr = info->attrs[BATADV_ATTR_AP_ISOLATION_ENABLED];
++ 
++ 		atomic_set(&vlan->ap_isolation, !!nla_get_u8(attr));
++ 	}
++ 
++ 	batadv_netlink_notify_vlan(bat_priv, vlan);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * batadv_get_softif_from_info() - Retrieve soft interface from genl attributes
++  * @net: the applicable net namespace
++  * @info: receiver information
++  *
++  * Return: Pointer to soft interface (with increased refcnt) on success, error
++  *  pointer on error
++  */
++ static struct net_device *
++ batadv_get_softif_from_info(struct net *net, struct genl_info *info)
++ {
++ 	struct net_device *soft_iface;
++ 	int ifindex;
++ 
++ 	if (!info->attrs[BATADV_ATTR_MESH_IFINDEX])
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	ifindex = nla_get_u32(info->attrs[BATADV_ATTR_MESH_IFINDEX]);
++ 
++ 	soft_iface = dev_get_by_index(net, ifindex);
++ 	if (!soft_iface)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	if (!batadv_softif_is_valid(soft_iface))
++ 		goto err_put_softif;
++ 
++ 	return soft_iface;
++ 
++ err_put_softif:
++ 	dev_put(soft_iface);
++ 
++ 	return ERR_PTR(-EINVAL);
++ }
++ 
++ /**
++  * batadv_get_hardif_from_info() - Retrieve hardif from genl attributes
++  * @bat_priv: the bat priv with all the soft interface information
++  * @net: the applicable net namespace
++  * @info: receiver information
++  *
++  * Return: Pointer to hard interface (with increased refcnt) on success, error
++  *  pointer on error
++  */
++ static struct batadv_hard_iface *
++ batadv_get_hardif_from_info(struct batadv_priv *bat_priv, struct net *net,
++ 			    struct genl_info *info)
++ {
++ 	struct batadv_hard_iface *hard_iface;
++ 	struct net_device *hard_dev;
++ 	unsigned int hardif_index;
++ 
++ 	if (!info->attrs[BATADV_ATTR_HARD_IFINDEX])
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	hardif_index = nla_get_u32(info->attrs[BATADV_ATTR_HARD_IFINDEX]);
++ 
++ 	hard_dev = dev_get_by_index(net, hardif_index);
++ 	if (!hard_dev)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	hard_iface = batadv_hardif_get_by_netdev(hard_dev);
++ 	if (!hard_iface)
++ 		goto err_put_harddev;
++ 
++ 	if (hard_iface->soft_iface != bat_priv->soft_iface)
++ 		goto err_put_hardif;
++ 
++ 	/* hard_dev is referenced by hard_iface and not needed here */
++ 	dev_put(hard_dev);
++ 
++ 	return hard_iface;
++ 
++ err_put_hardif:
++ 	batadv_hardif_put(hard_iface);
++ err_put_harddev:
++ 	dev_put(hard_dev);
++ 
++ 	return ERR_PTR(-EINVAL);
++ }
++ 
++ /**
++  * batadv_get_vlan_from_info() - Retrieve vlan from genl attributes
++  * @bat_priv: the bat priv with all the soft interface information
++  * @net: the applicable net namespace
++  * @info: receiver information
++  *
++  * Return: Pointer to vlan on success (with increased refcnt), error pointer
++  *  on error
++  */
++ static struct batadv_softif_vlan *
++ batadv_get_vlan_from_info(struct batadv_priv *bat_priv, struct net *net,
++ 			  struct genl_info *info)
++ {
++ 	struct batadv_softif_vlan *vlan;
++ 	u16 vid;
++ 
++ 	if (!info->attrs[BATADV_ATTR_VLANID])
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	vid = nla_get_u16(info->attrs[BATADV_ATTR_VLANID]);
++ 
++ 	vlan = batadv_softif_vlan_get(bat_priv, vid | BATADV_VLAN_HAS_TAG);
++ 	if (!vlan)
++ 		return ERR_PTR(-ENOENT);
++ 
++ 	return vlan;
++ }
++ 
++ /**
++  * batadv_pre_doit() - Prepare batman-adv genl doit request
++  * @ops: requested netlink operation
++  * @skb: Netlink message with request data
++  * @info: receiver information
++  *
++  * Return: 0 on success or negative error number in case of failure
++  */
++ static int batadv_pre_doit(const struct genl_ops *ops, struct sk_buff *skb,
++ 			   struct genl_info *info)
++ {
++ 	struct net *net = genl_info_net(info);
++ 	struct batadv_hard_iface *hard_iface;
++ 	struct batadv_priv *bat_priv = NULL;
++ 	struct batadv_softif_vlan *vlan;
++ 	struct net_device *soft_iface;
++ 	u8 user_ptr1_flags;
++ 	u8 mesh_dep_flags;
++ 	int ret;
++ 
++ 	user_ptr1_flags = BATADV_FLAG_NEED_HARDIF | BATADV_FLAG_NEED_VLAN;
++ 	if (WARN_ON(hweight8(ops->internal_flags & user_ptr1_flags) > 1))
++ 		return -EINVAL;
++ 
++ 	mesh_dep_flags = BATADV_FLAG_NEED_HARDIF | BATADV_FLAG_NEED_VLAN;
++ 	if (WARN_ON((ops->internal_flags & mesh_dep_flags) &&
++ 		    (~ops->internal_flags & BATADV_FLAG_NEED_MESH)))
++ 		return -EINVAL;
++ 
++ 	if (ops->internal_flags & BATADV_FLAG_NEED_MESH) {
++ 		soft_iface = batadv_get_softif_from_info(net, info);
++ 		if (IS_ERR(soft_iface))
++ 			return PTR_ERR(soft_iface);
++ 
++ 		bat_priv = netdev_priv(soft_iface);
++ 		info->user_ptr[0] = bat_priv;
++ 	}
++ 
++ 	if (ops->internal_flags & BATADV_FLAG_NEED_HARDIF) {
++ 		hard_iface = batadv_get_hardif_from_info(bat_priv, net, info);
++ 		if (IS_ERR(hard_iface)) {
++ 			ret = PTR_ERR(hard_iface);
++ 			goto err_put_softif;
++ 		}
++ 
++ 		info->user_ptr[1] = hard_iface;
++ 	}
++ 
++ 	if (ops->internal_flags & BATADV_FLAG_NEED_VLAN) {
++ 		vlan = batadv_get_vlan_from_info(bat_priv, net, info);
++ 		if (IS_ERR(vlan)) {
++ 			ret = PTR_ERR(vlan);
++ 			goto err_put_softif;
++ 		}
++ 
++ 		info->user_ptr[1] = vlan;
++ 	}
++ 
++ 	return 0;
++ 
++ err_put_softif:
++ 	if (bat_priv)
++ 		dev_put(bat_priv->soft_iface);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * batadv_post_doit() - End batman-adv genl doit request
++  * @ops: requested netlink operation
++  * @skb: Netlink message with request data
++  * @info: receiver information
++  */
++ static void batadv_post_doit(const struct genl_ops *ops, struct sk_buff *skb,
++ 			     struct genl_info *info)
++ {
++ 	struct batadv_hard_iface *hard_iface;
++ 	struct batadv_softif_vlan *vlan;
++ 	struct batadv_priv *bat_priv;
++ 
++ 	if (ops->internal_flags & BATADV_FLAG_NEED_HARDIF &&
++ 	    info->user_ptr[1]) {
++ 		hard_iface = info->user_ptr[1];
++ 
++ 		batadv_hardif_put(hard_iface);
++ 	}
++ 
++ 	if (ops->internal_flags & BATADV_FLAG_NEED_VLAN && info->user_ptr[1]) {
++ 		vlan = info->user_ptr[1];
++ 		batadv_softif_vlan_put(vlan);
++ 	}
++ 
++ 	if (ops->internal_flags & BATADV_FLAG_NEED_MESH && info->user_ptr[0]) {
++ 		bat_priv = info->user_ptr[0];
++ 		dev_put(bat_priv->soft_iface);
++ 	}
++ }
++ 
++ static const struct genl_small_ops batadv_netlink_ops[] = {
+++>>>>>>> 66a9b9287d24 (genetlink: move to smaller ops wherever possible)
+  	{
+ -		.cmd = BATADV_CMD_GET_MESH,
+ +		.cmd = BATADV_CMD_GET_MESH_INFO,
+  		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+ -		/* can be retrieved by unprivileged users */
+ -		.doit = batadv_netlink_get_mesh,
+ -		.internal_flags = BATADV_FLAG_NEED_MESH,
+ +		.flags = GENL_ADMIN_PERM,
+ +		.doit = batadv_netlink_get_mesh_info,
+  	},
+  	{
+  		.cmd = BATADV_CMD_TP_METER,
+@@@ -636,9 -1481,11 +974,9 @@@ struct genl_family batadv_netlink_famil
+  	.maxattr = BATADV_ATTR_MAX,
+  	.policy = batadv_netlink_policy,
+  	.netnsok = true,
+ -	.pre_doit = batadv_pre_doit,
+ -	.post_doit = batadv_post_doit,
+  	.module = THIS_MODULE,
+- 	.ops = batadv_netlink_ops,
+- 	.n_ops = ARRAY_SIZE(batadv_netlink_ops),
++ 	.small_ops = batadv_netlink_ops,
++ 	.n_small_ops = ARRAY_SIZE(batadv_netlink_ops),
+  	.mcgrps = batadv_netlink_mcgrps,
+  	.n_mcgrps = ARRAY_SIZE(batadv_netlink_mcgrps),
+  };
+diff --cc net/hsr/hsr_netlink.c
+index 2169d4d43c45,f3c8f91dbe2c..000000000000
+--- a/net/hsr/hsr_netlink.c
++++ b/net/hsr/hsr_netlink.c
+@@@ -444,8 -492,8 +444,12 @@@ fail
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +static const struct genl_ops hsr_ops[] = {
+++=======
++ static const struct genl_small_ops hsr_ops[] = {
+++>>>>>>> 66a9b9287d24 (genetlink: move to smaller ops wherever possible)
+  	{
+  		.cmd = HSR_C_GET_NODE_STATUS,
+  		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@@ -468,9 -516,10 +472,9 @@@ static struct genl_family hsr_genl_fami
+  	.version = 1,
+  	.maxattr = HSR_A_MAX,
+  	.policy = hsr_genl_policy,
+ -	.netnsok = true,
+  	.module = THIS_MODULE,
+- 	.ops = hsr_ops,
+- 	.n_ops = ARRAY_SIZE(hsr_ops),
++ 	.small_ops = hsr_ops,
++ 	.n_small_ops = ARRAY_SIZE(hsr_ops),
+  	.mcgrps = hsr_mcgrps,
+  	.n_mcgrps = ARRAY_SIZE(hsr_mcgrps),
+  };
+diff --cc net/mptcp/pm_netlink.c
+index 13d34019fe22,9f9cd41b7733..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -1164,67 -1054,7 +1164,71 @@@ fail
+  	return -EMSGSIZE;
+  }
+  
+++<<<<<<< HEAD
+ +static int mptcp_nl_addr_backup(struct net *net,
+ +				struct mptcp_addr_info *addr,
+ +				u8 bkup)
+ +{
+ +	long s_slot = 0, s_num = 0;
+ +	struct mptcp_sock *msk;
+ +	int ret = -EINVAL;
+ +
+ +	while ((msk = mptcp_token_iter_next(net, &s_slot, &s_num)) != NULL) {
+ +		struct sock *sk = (struct sock *)msk;
+ +
+ +		if (list_empty(&msk->conn_list))
+ +			goto next;
+ +
+ +		lock_sock(sk);
+ +		spin_lock_bh(&msk->pm.lock);
+ +		ret = mptcp_pm_nl_mp_prio_send_ack(msk, addr, bkup);
+ +		spin_unlock_bh(&msk->pm.lock);
+ +		release_sock(sk);
+ +
+ +next:
+ +		sock_put(sk);
+ +		cond_resched();
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+ +static int mptcp_nl_cmd_set_flags(struct sk_buff *skb, struct genl_info *info)
+ +{
+ +	struct nlattr *attr = info->attrs[MPTCP_PM_ATTR_ADDR];
+ +	struct pm_nl_pernet *pernet = genl_info_pm_nl(info);
+ +	struct mptcp_pm_addr_entry addr, *entry;
+ +	struct net *net = sock_net(skb->sk);
+ +	u8 bkup = 0;
+ +	int ret;
+ +
+ +	ret = mptcp_pm_parse_addr(attr, info, true, &addr);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	if (addr.addr.flags & MPTCP_PM_ADDR_FLAG_BACKUP)
+ +		bkup = 1;
+ +
+ +	list_for_each_entry(entry, &pernet->local_addr_list, list) {
+ +		if (addresses_equal(&entry->addr, &addr.addr, true)) {
+ +			ret = mptcp_nl_addr_backup(net, &entry->addr, bkup);
+ +			if (ret)
+ +				return ret;
+ +
+ +			if (bkup)
+ +				entry->addr.flags |= MPTCP_PM_ADDR_FLAG_BACKUP;
+ +			else
+ +				entry->addr.flags &= ~MPTCP_PM_ADDR_FLAG_BACKUP;
+ +		}
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static const struct genl_ops mptcp_pm_ops[] = {
+++=======
++ static struct genl_small_ops mptcp_pm_ops[] = {
+++>>>>>>> 66a9b9287d24 (genetlink: move to smaller ops wherever possible)
+  	{
+  		.cmd    = MPTCP_PM_CMD_ADD_ADDR,
+  		.doit   = mptcp_nl_cmd_add_addr,
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+* Unmerged path drivers/thermal/thermal_netlink.c
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index d393d6149779..72430f77680a 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -2198,7 +2198,7 @@ static int nbd_genl_reconfigure(struct sk_buff *skb, struct genl_info *info)
+ 	return ret;
+ }
+ 
+-static const struct genl_ops nbd_connect_genl_ops[] = {
++static const struct genl_small_ops nbd_connect_genl_ops[] = {
+ 	{
+ 		.cmd	= NBD_CMD_CONNECT,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -2230,8 +2230,8 @@ static struct genl_family nbd_genl_family __ro_after_init = {
+ 	.name		= NBD_GENL_FAMILY_NAME,
+ 	.version	= NBD_GENL_VERSION,
+ 	.module		= THIS_MODULE,
+-	.ops		= nbd_connect_genl_ops,
+-	.n_ops		= ARRAY_SIZE(nbd_connect_genl_ops),
++	.small_ops	= nbd_connect_genl_ops,
++	.n_small_ops	= ARRAY_SIZE(nbd_connect_genl_ops),
+ 	.maxattr	= NBD_ATTR_MAX,
+ 	.policy = nbd_attr_policy,
+ 	.mcgrps		= nbd_mcast_grps,
+* Unmerged path drivers/net/gtp.c
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+diff --git a/drivers/net/macsec.c b/drivers/net/macsec.c
+index a097bfaed9d6..78a3d5a82afb 100644
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@ -2635,7 +2635,7 @@ static int macsec_dump_txsc(struct sk_buff *skb, struct netlink_callback *cb)
+ 	return skb->len;
+ }
+ 
+-static const struct genl_ops macsec_genl_ops[] = {
++static const struct genl_small_ops macsec_genl_ops[] = {
+ 	{
+ 		.cmd = MACSEC_CMD_GET_TXSC,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -2705,8 +2705,8 @@ static struct genl_family macsec_fam __ro_after_init = {
+ 	.policy = macsec_genl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+-	.ops		= macsec_genl_ops,
+-	.n_ops		= ARRAY_SIZE(macsec_genl_ops),
++	.small_ops	= macsec_genl_ops,
++	.n_small_ops	= ARRAY_SIZE(macsec_genl_ops),
+ };
+ 
+ static netdev_tx_t macsec_start_xmit(struct sk_buff *skb,
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index d1c5e8a7729c..2ddb1929e2df 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -2801,7 +2801,7 @@ static int team_nl_cmd_port_list_get(struct sk_buff *skb,
+ 	return err;
+ }
+ 
+-static const struct genl_ops team_nl_ops[] = {
++static const struct genl_small_ops team_nl_ops[] = {
+ 	{
+ 		.cmd = TEAM_CMD_NOOP,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -2838,8 +2838,8 @@ static struct genl_family team_nl_family __ro_after_init = {
+ 	.policy = team_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+-	.ops		= team_nl_ops,
+-	.n_ops		= ARRAY_SIZE(team_nl_ops),
++	.small_ops	= team_nl_ops,
++	.n_small_ops	= ARRAY_SIZE(team_nl_ops),
+ 	.mcgrps		= team_nl_mcgrps,
+ 	.n_mcgrps	= ARRAY_SIZE(team_nl_mcgrps),
+ };
+diff --git a/drivers/net/wireless/mac80211_hwsim.c b/drivers/net/wireless/mac80211_hwsim.c
+index e6436d7b2ea2..55565a51ba6d 100644
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@ -3386,7 +3386,7 @@ static int hwsim_dump_radio_nl(struct sk_buff *skb,
+ }
+ 
+ /* Generic Netlink operations array */
+-static const struct genl_ops hwsim_ops[] = {
++static const struct genl_small_ops hwsim_ops[] = {
+ 	{
+ 		.cmd = HWSIM_CMD_REGISTER,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -3430,8 +3430,8 @@ static struct genl_family hwsim_genl_family __ro_after_init = {
+ 	.policy = hwsim_genl_policy,
+ 	.netnsok = true,
+ 	.module = THIS_MODULE,
+-	.ops = hwsim_ops,
+-	.n_ops = ARRAY_SIZE(hwsim_ops),
++	.small_ops = hwsim_ops,
++	.n_small_ops = ARRAY_SIZE(hwsim_ops),
+ 	.mcgrps = hwsim_mcgrps,
+ 	.n_mcgrps = ARRAY_SIZE(hwsim_mcgrps),
+ };
+diff --git a/drivers/target/target_core_user.c b/drivers/target/target_core_user.c
+index 5637c2960e9e..bdc1c2e966ce 100644
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@ -448,7 +448,7 @@ static int tcmu_genl_set_features(struct sk_buff *skb, struct genl_info *info)
+ 	return 0;
+ }
+ 
+-static const struct genl_ops tcmu_genl_ops[] = {
++static const struct genl_small_ops tcmu_genl_ops[] = {
+ 	{
+ 		.cmd	= TCMU_CMD_SET_FEATURES,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -486,8 +486,8 @@ static struct genl_family tcmu_genl_family __ro_after_init = {
+ 	.mcgrps = tcmu_mcgrps,
+ 	.n_mcgrps = ARRAY_SIZE(tcmu_mcgrps),
+ 	.netnsok = true,
+-	.ops = tcmu_genl_ops,
+-	.n_ops = ARRAY_SIZE(tcmu_genl_ops),
++	.small_ops = tcmu_genl_ops,
++	.n_small_ops = ARRAY_SIZE(tcmu_genl_ops),
+ };
+ 
+ #define tcmu_cmd_set_dbi_cur(cmd, index) ((cmd)->dbi_cur = (index))
+* Unmerged path drivers/thermal/thermal_netlink.c
+diff --git a/fs/dlm/netlink.c b/fs/dlm/netlink.c
+index d8e27defa89f..1575f14a9099 100644
+--- a/fs/dlm/netlink.c
++++ b/fs/dlm/netlink.c
+@@ -65,7 +65,7 @@ static int user_cmd(struct sk_buff *skb, struct genl_info *info)
+ 	return 0;
+ }
+ 
+-static const struct genl_ops dlm_nl_ops[] = {
++static const struct genl_small_ops dlm_nl_ops[] = {
+ 	{
+ 		.cmd	= DLM_CMD_HELLO,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -76,8 +76,8 @@ static const struct genl_ops dlm_nl_ops[] = {
+ static struct genl_family family __ro_after_init = {
+ 	.name		= DLM_GENL_NAME,
+ 	.version	= DLM_GENL_VERSION,
+-	.ops		= dlm_nl_ops,
+-	.n_ops		= ARRAY_SIZE(dlm_nl_ops),
++	.small_ops	= dlm_nl_ops,
++	.n_small_ops	= ARRAY_SIZE(dlm_nl_ops),
+ 	.module		= THIS_MODULE,
+ };
+ 
+diff --git a/kernel/taskstats.c b/kernel/taskstats.c
+index 5f852b8f59f7..683c9b17826f 100644
+--- a/kernel/taskstats.c
++++ b/kernel/taskstats.c
+@@ -646,7 +646,7 @@ void taskstats_exit(struct task_struct *tsk, int group_dead)
+ 	nlmsg_free(rep_skb);
+ }
+ 
+-static const struct genl_ops taskstats_ops[] = {
++static const struct genl_small_ops taskstats_ops[] = {
+ 	{
+ 		.cmd		= TASKSTATS_CMD_GET,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -689,8 +689,8 @@ static struct genl_family family __ro_after_init = {
+ 	.version	= TASKSTATS_GENL_VERSION,
+ 	.maxattr	= TASKSTATS_CMD_ATTR_MAX,
+ 	.module		= THIS_MODULE,
+-	.ops		= taskstats_ops,
+-	.n_ops		= ARRAY_SIZE(taskstats_ops),
++	.small_ops	= taskstats_ops,
++	.n_small_ops	= ARRAY_SIZE(taskstats_ops),
+ 	.pre_doit	= taskstats_pre_doit,
+ };
+ 
+* Unmerged path net/batman-adv/netlink.c
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index 769859288544..a642aabfd762 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -7129,7 +7129,7 @@ static const struct nla_policy devlink_nl_policy[DEVLINK_ATTR_MAX + 1] = {
+ 	[DEVLINK_ATTR_PORT_FUNCTION] = { .type = NLA_NESTED },
+ };
+ 
+-static const struct genl_ops devlink_nl_ops[] = {
++static const struct genl_small_ops devlink_nl_ops[] = {
+ 	{
+ 		.cmd = DEVLINK_CMD_GET,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -7452,8 +7452,8 @@ static struct genl_family devlink_nl_family __ro_after_init = {
+ 	.pre_doit	= devlink_nl_pre_doit,
+ 	.post_doit	= devlink_nl_post_doit,
+ 	.module		= THIS_MODULE,
+-	.ops		= devlink_nl_ops,
+-	.n_ops		= ARRAY_SIZE(devlink_nl_ops),
++	.small_ops	= devlink_nl_ops,
++	.n_small_ops	= ARRAY_SIZE(devlink_nl_ops),
+ 	.mcgrps		= devlink_nl_mcgrps,
+ 	.n_mcgrps	= ARRAY_SIZE(devlink_nl_mcgrps),
+ };
+diff --git a/net/core/drop_monitor.c b/net/core/drop_monitor.c
+index 0bad64162173..4a90704fba29 100644
+--- a/net/core/drop_monitor.c
++++ b/net/core/drop_monitor.c
+@@ -1544,7 +1544,7 @@ static const struct nla_policy net_dm_nl_policy[NET_DM_ATTR_MAX + 1] = {
+ 	[NET_DM_ATTR_HW_DROPS]	= {. type = NLA_FLAG },
+ };
+ 
+-static const struct genl_ops dropmon_ops[] = {
++static const struct genl_small_ops dropmon_ops[] = {
+ 	{
+ 		.cmd = NET_DM_CMD_CONFIG,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -1594,8 +1594,8 @@ static struct genl_family net_drop_monitor_family __ro_after_init = {
+ 	.pre_doit	= net_dm_nl_pre_doit,
+ 	.post_doit	= net_dm_nl_post_doit,
+ 	.module		= THIS_MODULE,
+-	.ops		= dropmon_ops,
+-	.n_ops		= ARRAY_SIZE(dropmon_ops),
++	.small_ops	= dropmon_ops,
++	.n_small_ops	= ARRAY_SIZE(dropmon_ops),
+ 	.mcgrps		= dropmon_mcgrps,
+ 	.n_mcgrps	= ARRAY_SIZE(dropmon_mcgrps),
+ };
+* Unmerged path net/hsr/hsr_netlink.c
+diff --git a/net/ieee802154/netlink.c b/net/ieee802154/netlink.c
+index 098d67439b6d..1396421b10ed 100644
+--- a/net/ieee802154/netlink.c
++++ b/net/ieee802154/netlink.c
+@@ -89,7 +89,7 @@ int ieee802154_nl_reply(struct sk_buff *msg, struct genl_info *info)
+ 	return genlmsg_reply(msg, info);
+ }
+ 
+-static const struct genl_ops ieee802154_ops[] = {
++static const struct genl_small_ops ieee802154_ops[] = {
+ 	/* see nl-phy.c */
+ 	IEEE802154_DUMP(IEEE802154_LIST_PHY, ieee802154_list_phy,
+ 			ieee802154_dump_phy),
+@@ -138,8 +138,8 @@ struct genl_family nl802154_family __ro_after_init = {
+ 	.maxattr	= IEEE802154_ATTR_MAX,
+ 	.policy		= ieee802154_policy,
+ 	.module		= THIS_MODULE,
+-	.ops		= ieee802154_ops,
+-	.n_ops		= ARRAY_SIZE(ieee802154_ops),
++	.small_ops	= ieee802154_ops,
++	.n_small_ops	= ARRAY_SIZE(ieee802154_ops),
+ 	.mcgrps		= ieee802154_mcgrps,
+ 	.n_mcgrps	= ARRAY_SIZE(ieee802154_mcgrps),
+ };
+diff --git a/net/ipv4/fou.c b/net/ipv4/fou.c
+index 8349f211b01f..58e5690f5064 100644
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@ -805,7 +805,7 @@ static int fou_nl_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	return skb->len;
+ }
+ 
+-static const struct genl_ops fou_nl_ops[] = {
++static const struct genl_small_ops fou_nl_ops[] = {
+ 	{
+ 		.cmd = FOU_CMD_ADD,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -834,8 +834,8 @@ static struct genl_family fou_nl_family __ro_after_init = {
+ 	.policy = fou_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+-	.ops		= fou_nl_ops,
+-	.n_ops		= ARRAY_SIZE(fou_nl_ops),
++	.small_ops	= fou_nl_ops,
++	.n_small_ops	= ARRAY_SIZE(fou_nl_ops),
+ };
+ 
+ size_t fou_encap_hlen(struct ip_tunnel_encap *e)
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index f262f2cace29..bcfd8b8bedf9 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -948,7 +948,7 @@ static int tcp_metrics_nl_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	return 0;
+ }
+ 
+-static const struct genl_ops tcp_metrics_nl_ops[] = {
++static const struct genl_small_ops tcp_metrics_nl_ops[] = {
+ 	{
+ 		.cmd = TCP_METRICS_CMD_GET,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -971,8 +971,8 @@ static struct genl_family tcp_metrics_nl_family __ro_after_init = {
+ 	.policy = tcp_metrics_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+-	.ops		= tcp_metrics_nl_ops,
+-	.n_ops		= ARRAY_SIZE(tcp_metrics_nl_ops),
++	.small_ops	= tcp_metrics_nl_ops,
++	.n_small_ops	= ARRAY_SIZE(tcp_metrics_nl_ops),
+ };
+ 
+ static unsigned int tcpmhash_entries;
+diff --git a/net/l2tp/l2tp_netlink.c b/net/l2tp/l2tp_netlink.c
+index e30c96040a68..812911253637 100644
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -941,7 +941,7 @@ static const struct nla_policy l2tp_nl_policy[L2TP_ATTR_MAX + 1] = {
+ 	},
+ };
+ 
+-static const struct genl_ops l2tp_nl_ops[] = {
++static const struct genl_small_ops l2tp_nl_ops[] = {
+ 	{
+ 		.cmd = L2TP_CMD_NOOP,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -1008,8 +1008,8 @@ static struct genl_family l2tp_nl_family __ro_after_init = {
+ 	.policy = l2tp_nl_policy,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+-	.ops		= l2tp_nl_ops,
+-	.n_ops		= ARRAY_SIZE(l2tp_nl_ops),
++	.small_ops	= l2tp_nl_ops,
++	.n_small_ops	= ARRAY_SIZE(l2tp_nl_ops),
+ 	.mcgrps		= l2tp_multicast_group,
+ 	.n_mcgrps	= ARRAY_SIZE(l2tp_multicast_group),
+ };
+* Unmerged path net/mptcp/pm_netlink.c
+diff --git a/net/ncsi/ncsi-netlink.c b/net/ncsi/ncsi-netlink.c
+index 88422753ee4c..bba750fe34dc 100644
+--- a/net/ncsi/ncsi-netlink.c
++++ b/net/ncsi/ncsi-netlink.c
+@@ -370,7 +370,7 @@ static int ncsi_clear_interface_nl(struct sk_buff *msg, struct genl_info *info)
+ 	return 0;
+ }
+ 
+-static const struct genl_ops ncsi_ops[] = {
++static const struct genl_small_ops ncsi_ops[] = {
+ 	{
+ 		.cmd = NCSI_CMD_PKG_INFO,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -398,8 +398,8 @@ static struct genl_family ncsi_genl_family __ro_after_init = {
+ 	.maxattr = NCSI_ATTR_MAX,
+ 	.policy = ncsi_genl_policy,
+ 	.module = THIS_MODULE,
+-	.ops = ncsi_ops,
+-	.n_ops = ARRAY_SIZE(ncsi_ops),
++	.small_ops = ncsi_ops,
++	.n_small_ops = ARRAY_SIZE(ncsi_ops),
+ };
+ 
+ int ncsi_init_netlink(struct net_device *dev)
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index 82aef7ec5ad3..24a5cd82366e 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -3744,7 +3744,7 @@ static int ip_vs_genl_get_cmd(struct sk_buff *skb, struct genl_info *info)
+ }
+ 
+ 
+-static const struct genl_ops ip_vs_genl_ops[] = {
++static const struct genl_small_ops ip_vs_genl_ops[] = {
+ 	{
+ 		.cmd	= IPVS_CMD_NEW_SERVICE,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -3852,8 +3852,8 @@ static struct genl_family ip_vs_genl_family __ro_after_init = {
+ 	.policy = ip_vs_cmd_policy,
+ 	.netnsok        = true,         /* Make ipvsadm to work on netns */
+ 	.module		= THIS_MODULE,
+-	.ops		= ip_vs_genl_ops,
+-	.n_ops		= ARRAY_SIZE(ip_vs_genl_ops),
++	.small_ops	= ip_vs_genl_ops,
++	.n_small_ops	= ARRAY_SIZE(ip_vs_genl_ops),
+ };
+ 
+ static int __init ip_vs_genl_register(void)
+diff --git a/net/netlabel/netlabel_calipso.c b/net/netlabel/netlabel_calipso.c
+index 1de87172885d..3a1cf66fa08b 100644
+--- a/net/netlabel/netlabel_calipso.c
++++ b/net/netlabel/netlabel_calipso.c
+@@ -318,7 +318,7 @@ static int netlbl_calipso_remove(struct sk_buff *skb, struct genl_info *info)
+ /* NetLabel Generic NETLINK Command Definitions
+  */
+ 
+-static const struct genl_ops netlbl_calipso_ops[] = {
++static const struct genl_small_ops netlbl_calipso_ops[] = {
+ 	{
+ 	.cmd = NLBL_CALIPSO_C_ADD,
+ 	.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -356,8 +356,8 @@ static struct genl_family netlbl_calipso_gnl_family __ro_after_init = {
+ 	.maxattr = NLBL_CALIPSO_A_MAX,
+ 	.policy = calipso_genl_policy,
+ 	.module = THIS_MODULE,
+-	.ops = netlbl_calipso_ops,
+-	.n_ops = ARRAY_SIZE(netlbl_calipso_ops),
++	.small_ops = netlbl_calipso_ops,
++	.n_small_ops = ARRAY_SIZE(netlbl_calipso_ops),
+ };
+ 
+ /* NetLabel Generic NETLINK Protocol Functions
+diff --git a/net/netlabel/netlabel_cipso_v4.c b/net/netlabel/netlabel_cipso_v4.c
+index 5d1121981d0b..c96cccb6373d 100644
+--- a/net/netlabel/netlabel_cipso_v4.c
++++ b/net/netlabel/netlabel_cipso_v4.c
+@@ -738,7 +738,7 @@ static int netlbl_cipsov4_remove(struct sk_buff *skb, struct genl_info *info)
+  * NetLabel Generic NETLINK Command Definitions
+  */
+ 
+-static const struct genl_ops netlbl_cipsov4_ops[] = {
++static const struct genl_small_ops netlbl_cipsov4_ops[] = {
+ 	{
+ 	.cmd = NLBL_CIPSOV4_C_ADD,
+ 	.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -776,8 +776,8 @@ static struct genl_family netlbl_cipsov4_gnl_family __ro_after_init = {
+ 	.maxattr = NLBL_CIPSOV4_A_MAX,
+ 	.policy = netlbl_cipsov4_genl_policy,
+ 	.module = THIS_MODULE,
+-	.ops = netlbl_cipsov4_ops,
+-	.n_ops = ARRAY_SIZE(netlbl_cipsov4_ops),
++	.small_ops = netlbl_cipsov4_ops,
++	.n_small_ops = ARRAY_SIZE(netlbl_cipsov4_ops),
+ };
+ 
+ /*
+diff --git a/net/netlabel/netlabel_mgmt.c b/net/netlabel/netlabel_mgmt.c
+index cae04f207782..ab0a9d738e6b 100644
+--- a/net/netlabel/netlabel_mgmt.c
++++ b/net/netlabel/netlabel_mgmt.c
+@@ -771,7 +771,7 @@ static int netlbl_mgmt_version(struct sk_buff *skb, struct genl_info *info)
+  * NetLabel Generic NETLINK Command Definitions
+  */
+ 
+-static const struct genl_ops netlbl_mgmt_genl_ops[] = {
++static const struct genl_small_ops netlbl_mgmt_genl_ops[] = {
+ 	{
+ 	.cmd = NLBL_MGMT_C_ADD,
+ 	.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -837,8 +837,8 @@ static struct genl_family netlbl_mgmt_gnl_family __ro_after_init = {
+ 	.maxattr = NLBL_MGMT_A_MAX,
+ 	.policy = netlbl_mgmt_genl_policy,
+ 	.module = THIS_MODULE,
+-	.ops = netlbl_mgmt_genl_ops,
+-	.n_ops = ARRAY_SIZE(netlbl_mgmt_genl_ops),
++	.small_ops = netlbl_mgmt_genl_ops,
++	.n_small_ops = ARRAY_SIZE(netlbl_mgmt_genl_ops),
+ };
+ 
+ /*
+diff --git a/net/netlabel/netlabel_unlabeled.c b/net/netlabel/netlabel_unlabeled.c
+index e1f28499c890..4b462ddc15fa 100644
+--- a/net/netlabel/netlabel_unlabeled.c
++++ b/net/netlabel/netlabel_unlabeled.c
+@@ -1321,7 +1321,7 @@ static int netlbl_unlabel_staticlistdef(struct sk_buff *skb,
+  * NetLabel Generic NETLINK Command Definitions
+  */
+ 
+-static const struct genl_ops netlbl_unlabel_genl_ops[] = {
++static const struct genl_small_ops netlbl_unlabel_genl_ops[] = {
+ 	{
+ 	.cmd = NLBL_UNLABEL_C_STATICADD,
+ 	.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -1387,8 +1387,8 @@ static struct genl_family netlbl_unlabel_gnl_family __ro_after_init = {
+ 	.maxattr = NLBL_UNLABEL_A_MAX,
+ 	.policy = netlbl_unlabel_genl_policy,
+ 	.module = THIS_MODULE,
+-	.ops = netlbl_unlabel_genl_ops,
+-	.n_ops = ARRAY_SIZE(netlbl_unlabel_genl_ops),
++	.small_ops = netlbl_unlabel_genl_ops,
++	.n_small_ops = ARRAY_SIZE(netlbl_unlabel_genl_ops),
+ };
+ 
+ /*
+diff --git a/net/openvswitch/conntrack.c b/net/openvswitch/conntrack.c
+index a0686a88634c..34d76c3f8fbb 100644
+--- a/net/openvswitch/conntrack.c
++++ b/net/openvswitch/conntrack.c
+@@ -2243,7 +2243,7 @@ static int ovs_ct_limit_cmd_get(struct sk_buff *skb, struct genl_info *info)
+ 	return err;
+ }
+ 
+-static struct genl_ops ct_limit_genl_ops[] = {
++static struct genl_small_ops ct_limit_genl_ops[] = {
+ 	{ .cmd = OVS_CT_LIMIT_CMD_SET,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+ 		.flags = GENL_ADMIN_PERM, /* Requires CAP_NET_ADMIN
+@@ -2275,8 +2275,8 @@ struct genl_family dp_ct_limit_genl_family __ro_after_init = {
+ 	.policy = ct_limit_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+-	.ops = ct_limit_genl_ops,
+-	.n_ops = ARRAY_SIZE(ct_limit_genl_ops),
++	.small_ops = ct_limit_genl_ops,
++	.n_small_ops = ARRAY_SIZE(ct_limit_genl_ops),
+ 	.mcgrps = &ovs_ct_limit_multicast_group,
+ 	.n_mcgrps = 1,
+ 	.module = THIS_MODULE,
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 56827933ba9a..15f3cf0fe4d2 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -664,7 +664,7 @@ static const struct nla_policy packet_policy[OVS_PACKET_ATTR_MAX + 1] = {
+ 	[OVS_PACKET_ATTR_HASH] = { .type = NLA_U64 },
+ };
+ 
+-static const struct genl_ops dp_packet_genl_ops[] = {
++static const struct genl_small_ops dp_packet_genl_ops[] = {
+ 	{ .cmd = OVS_PACKET_CMD_EXECUTE,
+ 	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+@@ -680,8 +680,8 @@ static struct genl_family dp_packet_genl_family __ro_after_init = {
+ 	.policy = packet_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+-	.ops = dp_packet_genl_ops,
+-	.n_ops = ARRAY_SIZE(dp_packet_genl_ops),
++	.small_ops = dp_packet_genl_ops,
++	.n_small_ops = ARRAY_SIZE(dp_packet_genl_ops),
+ 	.module = THIS_MODULE,
+ };
+ 
+@@ -1465,7 +1465,7 @@ static const struct nla_policy flow_policy[OVS_FLOW_ATTR_MAX + 1] = {
+ 	[OVS_FLOW_ATTR_UFID_FLAGS] = { .type = NLA_U32 },
+ };
+ 
+-static const struct genl_ops dp_flow_genl_ops[] = {
++static const struct genl_small_ops dp_flow_genl_ops[] = {
+ 	{ .cmd = OVS_FLOW_CMD_NEW,
+ 	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+@@ -1497,8 +1497,8 @@ static struct genl_family dp_flow_genl_family __ro_after_init = {
+ 	.policy = flow_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+-	.ops = dp_flow_genl_ops,
+-	.n_ops = ARRAY_SIZE(dp_flow_genl_ops),
++	.small_ops = dp_flow_genl_ops,
++	.n_small_ops = ARRAY_SIZE(dp_flow_genl_ops),
+ 	.mcgrps = &ovs_dp_flow_multicast_group,
+ 	.n_mcgrps = 1,
+ 	.module = THIS_MODULE,
+@@ -1930,7 +1930,7 @@ static const struct nla_policy datapath_policy[OVS_DP_ATTR_MAX + 1] = {
+ 		PCPU_MIN_UNIT_SIZE / sizeof(struct mask_cache_entry)),
+ };
+ 
+-static const struct genl_ops dp_datapath_genl_ops[] = {
++static const struct genl_small_ops dp_datapath_genl_ops[] = {
+ 	{ .cmd = OVS_DP_CMD_NEW,
+ 	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+@@ -1962,8 +1962,8 @@ static struct genl_family dp_datapath_genl_family __ro_after_init = {
+ 	.policy = datapath_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+-	.ops = dp_datapath_genl_ops,
+-	.n_ops = ARRAY_SIZE(dp_datapath_genl_ops),
++	.small_ops = dp_datapath_genl_ops,
++	.n_small_ops = ARRAY_SIZE(dp_datapath_genl_ops),
+ 	.mcgrps = &ovs_dp_datapath_multicast_group,
+ 	.n_mcgrps = 1,
+ 	.module = THIS_MODULE,
+@@ -2410,7 +2410,7 @@ static const struct nla_policy vport_policy[OVS_VPORT_ATTR_MAX + 1] = {
+ 	[OVS_VPORT_ATTR_NETNSID] = { .type = NLA_S32 },
+ };
+ 
+-static const struct genl_ops dp_vport_genl_ops[] = {
++static const struct genl_small_ops dp_vport_genl_ops[] = {
+ 	{ .cmd = OVS_VPORT_CMD_NEW,
+ 	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+ 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
+@@ -2442,8 +2442,8 @@ struct genl_family dp_vport_genl_family __ro_after_init = {
+ 	.policy = vport_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+-	.ops = dp_vport_genl_ops,
+-	.n_ops = ARRAY_SIZE(dp_vport_genl_ops),
++	.small_ops = dp_vport_genl_ops,
++	.n_small_ops = ARRAY_SIZE(dp_vport_genl_ops),
+ 	.mcgrps = &ovs_dp_vport_multicast_group,
+ 	.n_mcgrps = 1,
+ 	.module = THIS_MODULE,
+diff --git a/net/openvswitch/meter.c b/net/openvswitch/meter.c
+index 8a14e9e8f440..514eb898f445 100644
+--- a/net/openvswitch/meter.c
++++ b/net/openvswitch/meter.c
+@@ -675,7 +675,7 @@ bool ovs_meter_execute(struct datapath *dp, struct sk_buff *skb,
+ 	return false;
+ }
+ 
+-static struct genl_ops dp_meter_genl_ops[] = {
++static struct genl_small_ops dp_meter_genl_ops[] = {
+ 	{ .cmd = OVS_METER_CMD_FEATURES,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+ 		.flags = 0,		  /* OK for unprivileged users. */
+@@ -714,8 +714,8 @@ struct genl_family dp_meter_genl_family __ro_after_init = {
+ 	.policy = meter_policy,
+ 	.netnsok = true,
+ 	.parallel_ops = true,
+-	.ops = dp_meter_genl_ops,
+-	.n_ops = ARRAY_SIZE(dp_meter_genl_ops),
++	.small_ops = dp_meter_genl_ops,
++	.n_small_ops = ARRAY_SIZE(dp_meter_genl_ops),
+ 	.mcgrps = &ovs_meter_multicast_group,
+ 	.n_mcgrps = 1,
+ 	.module = THIS_MODULE,
+diff --git a/net/psample/psample.c b/net/psample/psample.c
+index 157348b50da5..9ab20c66cd79 100644
+--- a/net/psample/psample.c
++++ b/net/psample/psample.c
+@@ -97,7 +97,7 @@ static int psample_nl_cmd_get_group_dumpit(struct sk_buff *msg,
+ 	return msg->len;
+ }
+ 
+-static const struct genl_ops psample_nl_ops[] = {
++static const struct genl_small_ops psample_nl_ops[] = {
+ 	{
+ 		.cmd = PSAMPLE_CMD_GET_GROUP,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -113,8 +113,8 @@ static struct genl_family psample_nl_family __ro_after_init = {
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+ 	.mcgrps		= psample_nl_mcgrps,
+-	.ops		= psample_nl_ops,
+-	.n_ops		= ARRAY_SIZE(psample_nl_ops),
++	.small_ops	= psample_nl_ops,
++	.n_small_ops	= ARRAY_SIZE(psample_nl_ops),
+ 	.n_mcgrps	= ARRAY_SIZE(psample_nl_mcgrps),
+ };
+ 
+diff --git a/net/tipc/netlink_compat.c b/net/tipc/netlink_compat.c
+index 129333d44007..a4dffa369035 100644
+--- a/net/tipc/netlink_compat.c
++++ b/net/tipc/netlink_compat.c
+@@ -1337,7 +1337,7 @@ static int tipc_nl_compat_recv(struct sk_buff *skb, struct genl_info *info)
+ 	return err;
+ }
+ 
+-static const struct genl_ops tipc_genl_compat_ops[] = {
++static const struct genl_small_ops tipc_genl_compat_ops[] = {
+ 	{
+ 		.cmd		= TIPC_GENL_CMD,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -1352,8 +1352,8 @@ static struct genl_family tipc_genl_compat_family __ro_after_init = {
+ 	.maxattr	= 0,
+ 	.netnsok	= true,
+ 	.module		= THIS_MODULE,
+-	.ops		= tipc_genl_compat_ops,
+-	.n_ops		= ARRAY_SIZE(tipc_genl_compat_ops),
++	.small_ops	= tipc_genl_compat_ops,
++	.n_small_ops	= ARRAY_SIZE(tipc_genl_compat_ops),
+ };
+ 
+ int __init tipc_netlink_compat_start(void)
+diff --git a/net/wimax/stack.c b/net/wimax/stack.c
+index 554e0cfab0bf..941ad88bbfd6 100644
+--- a/net/wimax/stack.c
++++ b/net/wimax/stack.c
+@@ -416,7 +416,7 @@ static const struct nla_policy wimax_gnl_policy[WIMAX_GNL_ATTR_MAX + 1] = {
+ 	},
+ };
+ 
+-static const struct genl_ops wimax_gnl_ops[] = {
++static const struct genl_small_ops wimax_gnl_ops[] = {
+ 	{
+ 		.cmd = WIMAX_GNL_OP_MSG_FROM_USER,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -583,8 +583,8 @@ struct genl_family wimax_gnl_family __ro_after_init = {
+ 	.maxattr = WIMAX_GNL_ATTR_MAX,
+ 	.policy = wimax_gnl_policy,
+ 	.module = THIS_MODULE,
+-	.ops = wimax_gnl_ops,
+-	.n_ops = ARRAY_SIZE(wimax_gnl_ops),
++	.small_ops = wimax_gnl_ops,
++	.n_small_ops = ARRAY_SIZE(wimax_gnl_ops),
+ 	.mcgrps = wimax_gnl_mcgrps,
+ 	.n_mcgrps = ARRAY_SIZE(wimax_gnl_mcgrps),
+ };
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index b993eabc4b10..953ae3520781 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -14396,6 +14396,9 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
++};
++
++static const struct genl_small_ops nl80211_small_ops[] = {
+ 	{
+ 		.cmd = NL80211_CMD_SET_WIPHY,
+ 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+@@ -15257,6 +15260,8 @@ static struct genl_family nl80211_fam __ro_after_init = {
+ 	.module = THIS_MODULE,
+ 	.ops = nl80211_ops,
+ 	.n_ops = ARRAY_SIZE(nl80211_ops),
++	.small_ops = nl80211_small_ops,
++	.n_small_ops = ARRAY_SIZE(nl80211_small_ops),
+ 	.mcgrps = nl80211_mcgrps,
+ 	.n_mcgrps = ARRAY_SIZE(nl80211_mcgrps),
+ 	.parallel_ops = true,
