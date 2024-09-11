@@ -33,6 +33,7 @@ extern const char raid6_empty_zero_page[PAGE_SIZE];
 #include <errno.h>
 #include <inttypes.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -47,6 +48,9 @@ typedef uint64_t u64;
 
 #ifndef PAGE_SIZE
 # define PAGE_SIZE 4096
+#endif
+#ifndef PAGE_SHIFT
+# define PAGE_SHIFT 12
 #endif
 extern const char raid6_empty_zero_page[PAGE_SIZE];
 
