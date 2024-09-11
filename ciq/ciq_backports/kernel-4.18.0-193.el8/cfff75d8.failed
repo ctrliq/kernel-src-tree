@@ -1,0 +1,319 @@
+selinux: reorder hooks to make runtime disable less broken
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Ondrej Mosnacek <omosnace@redhat.com>
+commit cfff75d8973ae4a90b3df3ae7fbba1ce9af9c8f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/cfff75d8.failed
+
+Commit b1d9e6b0646d ("LSM: Switch to lists of hooks") switched the LSM
+infrastructure to use per-hook lists, which meant that removing the
+hooks for a given module was no longer atomic. Even though the commit
+clearly documents that modules implementing runtime revmoval of hooks
+(only SELinux attempts this madness) need to take special precautions to
+avoid race conditions, SELinux has never addressed this.
+
+By inserting an artificial delay between the loop iterations of
+security_delete_hooks() (I used 100 ms), booting to a state where
+SELinux is enabled, but policy is not yet loaded, and running these
+commands:
+
+    while true; do ping -c 1 <some IP>; done &
+    echo -n 1 >/sys/fs/selinux/disable
+    kill %1
+    wait
+
+...I was able to trigger NULL pointer dereferences in various places. I
+also have a report of someone getting panics on a stock RHEL-8 kernel
+after setting SELINUX=disabled in /etc/selinux/config and rebooting
+(without adding "selinux=0" to kernel command-line).
+
+Reordering the SELinux hooks such that those that allocate structures
+are removed last seems to prevent these panics. It is very much possible
+that this doesn't make the runtime disable completely race-free, but at
+least it makes the operation much less fragile.
+
+	Cc: stable@vger.kernel.org
+Fixes: b1d9e6b0646d ("LSM: Switch to lists of hooks")
+	Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+	Reviewed-by: Stephen Smalley <sds@tycho.nsa.gov>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit cfff75d8973ae4a90b3df3ae7fbba1ce9af9c8f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/hooks.c
+diff --cc security/selinux/hooks.c
+index a909fc7d8cf0,2c84b12d50bc..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -7000,6 -6795,118 +7000,121 @@@ static void selinux_bpf_prog_free(struc
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static int selinux_lockdown(enum lockdown_reason what)
++ {
++ 	struct common_audit_data ad;
++ 	u32 sid = current_sid();
++ 	int invalid_reason = (what <= LOCKDOWN_NONE) ||
++ 			     (what == LOCKDOWN_INTEGRITY_MAX) ||
++ 			     (what >= LOCKDOWN_CONFIDENTIALITY_MAX);
++ 
++ 	if (WARN(invalid_reason, "Invalid lockdown reason")) {
++ 		audit_log(audit_context(),
++ 			  GFP_ATOMIC, AUDIT_SELINUX_ERR,
++ 			  "lockdown_reason=invalid");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ad.type = LSM_AUDIT_DATA_LOCKDOWN;
++ 	ad.u.reason = what;
++ 
++ 	if (what <= LOCKDOWN_INTEGRITY_MAX)
++ 		return avc_has_perm(&selinux_state,
++ 				    sid, sid, SECCLASS_LOCKDOWN,
++ 				    LOCKDOWN__INTEGRITY, &ad);
++ 	else
++ 		return avc_has_perm(&selinux_state,
++ 				    sid, sid, SECCLASS_LOCKDOWN,
++ 				    LOCKDOWN__CONFIDENTIALITY, &ad);
++ }
++ 
++ struct lsm_blob_sizes selinux_blob_sizes __lsm_ro_after_init = {
++ 	.lbs_cred = sizeof(struct task_security_struct),
++ 	.lbs_file = sizeof(struct file_security_struct),
++ 	.lbs_inode = sizeof(struct inode_security_struct),
++ 	.lbs_ipc = sizeof(struct ipc_security_struct),
++ 	.lbs_msg_msg = sizeof(struct msg_security_struct),
++ };
++ 
++ #ifdef CONFIG_PERF_EVENTS
++ static int selinux_perf_event_open(struct perf_event_attr *attr, int type)
++ {
++ 	u32 requested, sid = current_sid();
++ 
++ 	if (type == PERF_SECURITY_OPEN)
++ 		requested = PERF_EVENT__OPEN;
++ 	else if (type == PERF_SECURITY_CPU)
++ 		requested = PERF_EVENT__CPU;
++ 	else if (type == PERF_SECURITY_KERNEL)
++ 		requested = PERF_EVENT__KERNEL;
++ 	else if (type == PERF_SECURITY_TRACEPOINT)
++ 		requested = PERF_EVENT__TRACEPOINT;
++ 	else
++ 		return -EINVAL;
++ 
++ 	return avc_has_perm(&selinux_state, sid, sid, SECCLASS_PERF_EVENT,
++ 			    requested, NULL);
++ }
++ 
++ static int selinux_perf_event_alloc(struct perf_event *event)
++ {
++ 	struct perf_event_security_struct *perfsec;
++ 
++ 	perfsec = kzalloc(sizeof(*perfsec), GFP_KERNEL);
++ 	if (!perfsec)
++ 		return -ENOMEM;
++ 
++ 	perfsec->sid = current_sid();
++ 	event->security = perfsec;
++ 
++ 	return 0;
++ }
++ 
++ static void selinux_perf_event_free(struct perf_event *event)
++ {
++ 	struct perf_event_security_struct *perfsec = event->security;
++ 
++ 	event->security = NULL;
++ 	kfree(perfsec);
++ }
++ 
++ static int selinux_perf_event_read(struct perf_event *event)
++ {
++ 	struct perf_event_security_struct *perfsec = event->security;
++ 	u32 sid = current_sid();
++ 
++ 	return avc_has_perm(&selinux_state, sid, perfsec->sid,
++ 			    SECCLASS_PERF_EVENT, PERF_EVENT__READ, NULL);
++ }
++ 
++ static int selinux_perf_event_write(struct perf_event *event)
++ {
++ 	struct perf_event_security_struct *perfsec = event->security;
++ 	u32 sid = current_sid();
++ 
++ 	return avc_has_perm(&selinux_state, sid, perfsec->sid,
++ 			    SECCLASS_PERF_EVENT, PERF_EVENT__WRITE, NULL);
++ }
++ #endif
++ 
++ /*
++  * IMPORTANT NOTE: When adding new hooks, please be careful to keep this order:
++  * 1. any hooks that don't belong to (2.) or (3.) below,
++  * 2. hooks that both access structures allocated by other hooks, and allocate
++  *    structures that can be later accessed by other hooks (mostly "cloning"
++  *    hooks),
++  * 3. hooks that only allocate structures that can be later accessed by other
++  *    hooks ("allocating" hooks).
++  *
++  * Please follow block comment delimiters in the list to keep this order.
++  *
++  * This ordering is needed for SELinux runtime disable to work at least somewhat
++  * safely. Breaking the ordering rules above might lead to NULL pointer derefs
++  * when disabling SELinux at runtime.
++  */
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+  	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
+  	LSM_HOOK_INIT(binder_transaction, selinux_binder_transaction),
+@@@ -7022,9 -6929,8 +7137,14 @@@
+  	LSM_HOOK_INIT(bprm_committing_creds, selinux_bprm_committing_creds),
+  	LSM_HOOK_INIT(bprm_committed_creds, selinux_bprm_committed_creds),
+  
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(sb_alloc_security, selinux_sb_alloc_security),
+ +	LSM_HOOK_INIT(sb_free_security, selinux_sb_free_security),
+ +	LSM_HOOK_INIT(sb_copy_data, selinux_sb_copy_data),
+++=======
++ 	LSM_HOOK_INIT(sb_free_security, selinux_sb_free_security),
++ 	LSM_HOOK_INIT(sb_free_mnt_opts, selinux_free_mnt_opts),
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  	LSM_HOOK_INIT(sb_remount, selinux_sb_remount),
+  	LSM_HOOK_INIT(sb_kern_mount, selinux_sb_kern_mount),
+  	LSM_HOOK_INIT(sb_show_options, selinux_sb_show_options),
+@@@ -7033,7 -6939,6 +7153,10 @@@
+  	LSM_HOOK_INIT(sb_umount, selinux_umount),
+  	LSM_HOOK_INIT(sb_set_mnt_opts, selinux_set_mnt_opts),
+  	LSM_HOOK_INIT(sb_clone_mnt_opts, selinux_sb_clone_mnt_opts),
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(sb_parse_opts_str, selinux_parse_opts_str),
+++=======
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  
+  	LSM_HOOK_INIT(dentry_init_security, selinux_dentry_init_security),
+  	LSM_HOOK_INIT(dentry_create_files_as, selinux_dentry_create_files_as),
+@@@ -7111,25 -7014,15 +7233,34 @@@
+  	LSM_HOOK_INIT(ipc_permission, selinux_ipc_permission),
+  	LSM_HOOK_INIT(ipc_getsecid, selinux_ipc_getsecid),
+  
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(msg_msg_alloc_security, selinux_msg_msg_alloc_security),
+ +	LSM_HOOK_INIT(msg_msg_free_security, selinux_msg_msg_free_security),
+ +
+ +	LSM_HOOK_INIT(msg_queue_alloc_security,
+ +			selinux_msg_queue_alloc_security),
+ +	LSM_HOOK_INIT(msg_queue_free_security, selinux_msg_queue_free_security),
+++=======
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  	LSM_HOOK_INIT(msg_queue_associate, selinux_msg_queue_associate),
+  	LSM_HOOK_INIT(msg_queue_msgctl, selinux_msg_queue_msgctl),
+  	LSM_HOOK_INIT(msg_queue_msgsnd, selinux_msg_queue_msgsnd),
+  	LSM_HOOK_INIT(msg_queue_msgrcv, selinux_msg_queue_msgrcv),
+  
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(shm_alloc_security, selinux_shm_alloc_security),
+ +	LSM_HOOK_INIT(shm_free_security, selinux_shm_free_security),
+++=======
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  	LSM_HOOK_INIT(shm_associate, selinux_shm_associate),
+  	LSM_HOOK_INIT(shm_shmctl, selinux_shm_shmctl),
+  	LSM_HOOK_INIT(shm_shmat, selinux_shm_shmat),
+  
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(sem_alloc_security, selinux_sem_alloc_security),
+ +	LSM_HOOK_INIT(sem_free_security, selinux_sem_free_security),
+++=======
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  	LSM_HOOK_INIT(sem_associate, selinux_sem_associate),
+  	LSM_HOOK_INIT(sem_semctl, selinux_sem_semctl),
+  	LSM_HOOK_INIT(sem_semop, selinux_sem_semop),
+@@@ -7234,8 -7115,63 +7353,66 @@@
+  	LSM_HOOK_INIT(bpf_map_free_security, selinux_bpf_map_free),
+  	LSM_HOOK_INIT(bpf_prog_free_security, selinux_bpf_prog_free),
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_PERF_EVENTS
++ 	LSM_HOOK_INIT(perf_event_open, selinux_perf_event_open),
++ 	LSM_HOOK_INIT(perf_event_free, selinux_perf_event_free),
++ 	LSM_HOOK_INIT(perf_event_read, selinux_perf_event_read),
++ 	LSM_HOOK_INIT(perf_event_write, selinux_perf_event_write),
++ #endif
++ 
++ 	LSM_HOOK_INIT(locked_down, selinux_lockdown),
++ 
++ 	/*
++ 	 * PUT "CLONING" (ACCESSING + ALLOCATING) HOOKS HERE
++ 	 */
++ 	LSM_HOOK_INIT(fs_context_dup, selinux_fs_context_dup),
++ 	LSM_HOOK_INIT(fs_context_parse_param, selinux_fs_context_parse_param),
++ 	LSM_HOOK_INIT(sb_eat_lsm_opts, selinux_sb_eat_lsm_opts),
++ 	LSM_HOOK_INIT(sb_add_mnt_opt, selinux_add_mnt_opt),
++ #ifdef CONFIG_SECURITY_NETWORK_XFRM
++ 	LSM_HOOK_INIT(xfrm_policy_clone_security, selinux_xfrm_policy_clone),
++ #endif
++ 
++ 	/*
++ 	 * PUT "ALLOCATING" HOOKS HERE
++ 	 */
++ 	LSM_HOOK_INIT(msg_msg_alloc_security, selinux_msg_msg_alloc_security),
++ 	LSM_HOOK_INIT(msg_queue_alloc_security,
++ 		      selinux_msg_queue_alloc_security),
++ 	LSM_HOOK_INIT(shm_alloc_security, selinux_shm_alloc_security),
++ 	LSM_HOOK_INIT(sb_alloc_security, selinux_sb_alloc_security),
++ 	LSM_HOOK_INIT(inode_alloc_security, selinux_inode_alloc_security),
++ 	LSM_HOOK_INIT(sem_alloc_security, selinux_sem_alloc_security),
++ 	LSM_HOOK_INIT(secid_to_secctx, selinux_secid_to_secctx),
++ 	LSM_HOOK_INIT(inode_getsecctx, selinux_inode_getsecctx),
++ 	LSM_HOOK_INIT(sk_alloc_security, selinux_sk_alloc_security),
++ 	LSM_HOOK_INIT(tun_dev_alloc_security, selinux_tun_dev_alloc_security),
++ #ifdef CONFIG_SECURITY_INFINIBAND
++ 	LSM_HOOK_INIT(ib_alloc_security, selinux_ib_alloc_security),
++ #endif
++ #ifdef CONFIG_SECURITY_NETWORK_XFRM
++ 	LSM_HOOK_INIT(xfrm_policy_alloc_security, selinux_xfrm_policy_alloc),
++ 	LSM_HOOK_INIT(xfrm_state_alloc, selinux_xfrm_state_alloc),
++ 	LSM_HOOK_INIT(xfrm_state_alloc_acquire,
++ 		      selinux_xfrm_state_alloc_acquire),
++ #endif
++ #ifdef CONFIG_KEYS
++ 	LSM_HOOK_INIT(key_alloc, selinux_key_alloc),
++ #endif
++ #ifdef CONFIG_AUDIT
++ 	LSM_HOOK_INIT(audit_rule_init, selinux_audit_rule_init),
++ #endif
++ #ifdef CONFIG_BPF_SYSCALL
++ 	LSM_HOOK_INIT(bpf_map_alloc_security, selinux_bpf_map_alloc),
++ 	LSM_HOOK_INIT(bpf_prog_alloc_security, selinux_bpf_prog_alloc),
++ #endif
++ #ifdef CONFIG_PERF_EVENTS
++ 	LSM_HOOK_INIT(perf_event_alloc, selinux_perf_event_alloc),
++ #endif
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  };
+  
+  static __init int selinux_init(void)
+@@@ -7422,7 -7350,12 +7599,16 @@@ int selinux_disable(struct selinux_stat
+  
+  	pr_info("SELinux:  Disabled at runtime.\n");
+  
+++<<<<<<< HEAD
+ +	selinux_enabled = 0;
+++=======
++ 	/*
++ 	 * Unregister netfilter hooks.
++ 	 * Must be done before security_delete_hooks() to avoid breaking
++ 	 * runtime disable.
++ 	 */
++ 	selinux_nf_ip_exit();
+++>>>>>>> cfff75d8973a (selinux: reorder hooks to make runtime disable less broken)
+  
+  	security_delete_hooks(selinux_hooks, ARRAY_SIZE(selinux_hooks));
+  
+* Unmerged path security/selinux/hooks.c
