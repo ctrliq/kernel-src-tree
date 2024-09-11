@@ -1,0 +1,267 @@
+s390/pci: Handling multifunctions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Pierre Morel <pmorel@linux.ibm.com>
+commit 44510d6fa0c00aa90b80075caa6b313b25927475
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/44510d6f.failed
+
+We allow multiple functions on a single bus.
+We suppress the ZPCI_DEVFN definition and replace its
+occurences with zpci->devfn.
+
+We verify the number of device during the registration.
+
+There can never be more domains in use than existing
+devices, so we do not need to verify the count of domain
+after having verified the count of devices.
+
+	Signed-off-by: Pierre Morel <pmorel@linux.ibm.com>
+	Reviewed-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 44510d6fa0c00aa90b80075caa6b313b25927475)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pci.h
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_bus.c
+#	arch/s390/pci/pci_bus.h
+#	arch/s390/pci/pci_event.c
+#	drivers/pci/hotplug/s390_pci_hpc.c
+diff --cc arch/s390/include/asm/pci.h
+index 2d7a8ea6c42b,c1558cf071b8..000000000000
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@@ -88,10 -99,26 +87,32 @@@ struct zpci_bar_struct 
+  
+  struct s390_domain;
+  
+++<<<<<<< HEAD
+++=======
++ #define ZPCI_FUNCTIONS_PER_BUS 256
++ struct zpci_bus {
++ 	struct kref		kref;
++ 	struct pci_bus		*bus;
++ 	struct zpci_dev		*function[ZPCI_FUNCTIONS_PER_BUS];
++ 	struct list_head	resources;
++ 	struct list_head	bus_next;
++ 	struct resource		bus_resource;
++ 	int			pchid;
++ 	int			domain_nr;
++ 	bool			multifunction;
++ 	enum pci_bus_speed	max_bus_speed;
++ };
++ 
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  /* Private data per function */
+  struct zpci_dev {
+ -	struct zpci_bus *zbus;
+ +	struct pci_bus	*bus;
+  	struct list_head entry;		/* list of all zpci_devices, needed for hotplug, etc. */
+++<<<<<<< HEAD
+++=======
++ 	struct list_head bus_next;
++ 	struct kref kref;
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  	struct hotplug_slot hotplug_slot;
+  
+  	enum zpci_state state;
+@@@ -101,10 -128,10 +122,11 @@@
+  	u16		pchid;		/* physical channel ID */
+  	u8		pfgid;		/* function group ID */
+  	u8		pft;		/* pci function type */
+ +	u16		domain;
+  	u8		port;
+  	u8		rid_available	: 1;
+- 	u8		reserved	: 7;
++ 	u8		has_hp_slot	: 1;
++ 	u8		reserved	: 6;
+  	unsigned int	devfn;		/* DEVFN part of the RID*/
+  
+  	struct mutex lock;
+@@@ -224,7 -253,14 +246,18 @@@ static inline void zpci_exit_slot(struc
+  /* Helpers */
+  static inline struct zpci_dev *to_zpci(struct pci_dev *pdev)
+  {
+++<<<<<<< HEAD
+ +	return pdev->sysdata;
+++=======
++ 	struct zpci_bus *zbus = pdev->sysdata;
++ 
++ 	return zbus->function[pdev->devfn];
++ }
++ 
++ static inline struct zpci_dev *to_zpci_dev(struct device *dev)
++ {
++ 	return to_zpci(to_pci_dev(dev));
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  }
+  
+  struct zpci_dev *get_zdev_by_fid(u32);
+diff --cc arch/s390/pci/pci.c
+index 3ca1c80f304d,3f6670613c57..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -782,32 -696,54 +770,68 @@@ int zpci_create_device(struct zpci_dev 
+  	if (rc)
+  		goto out_disable;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&zpci_list_lock);
+ +	list_add_tail(&zdev->entry, &zpci_list);
+ +	spin_unlock(&zpci_list_lock);
+ +
+ +	zpci_init_slot(zdev);
+ +
+++=======
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  	return 0;
+  
+  out_disable:
+  	if (zdev->state == ZPCI_FN_STATE_ONLINE)
+  		zpci_disable_device(zdev);
++ 
+  out_destroy_iommu:
+  	zpci_destroy_iommu(zdev);
+ +out_free:
+ +	zpci_free_domain(zdev);
+  out:
+ -	spin_lock(&zpci_list_lock);
+ -	list_del(&zdev->entry);
+ -	spin_unlock(&zpci_list_lock);
+  	return rc;
+  }
+  
+ -void zpci_release_device(struct kref *kref)
+ +void zpci_remove_device(struct zpci_dev *zdev)
+  {
+ -	struct zpci_dev *zdev = container_of(kref, struct zpci_dev, kref);
+ +	if (!zdev->bus)
+ +		return;
+  
+++<<<<<<< HEAD
+ +	pci_stop_root_bus(zdev->bus);
+ +	pci_remove_root_bus(zdev->bus);
+++=======
++ 	if (zdev->zbus->bus) {
++ 		struct pci_dev *pdev;
++ 
++ 		pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
++ 		if (pdev)
++ 			pci_stop_and_remove_bus_device_locked(pdev);
++ 	}
++ 
++ 	switch (zdev->state) {
++ 	case ZPCI_FN_STATE_ONLINE:
++ 	case ZPCI_FN_STATE_CONFIGURED:
++ 		zpci_disable_device(zdev);
++ 		fallthrough;
++ 	case ZPCI_FN_STATE_STANDBY:
++ 		if (zdev->has_hp_slot)
++ 			zpci_exit_slot(zdev);
++ 		zpci_cleanup_bus_resources(zdev);
++ 		zpci_bus_device_unregister(zdev);
++ 		zpci_destroy_iommu(zdev);
++ 		fallthrough;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	spin_lock(&zpci_list_lock);
++ 	list_del(&zdev->entry);
++ 	spin_unlock(&zpci_list_lock);
++ 	zpci_dbg(3, "rem fid:%x\n", zdev->fid);
++ 	kfree(zdev);
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  }
+  
+  int zpci_report_error(struct pci_dev *pdev,
+diff --cc arch/s390/pci/pci_event.c
+index 8d6ee4af4230,08e1d619398e..000000000000
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@@ -53,7 -55,7 +53,11 @@@ static void __zpci_event_error(struct z
+  	zpci_err_hex(ccdf, sizeof(*ccdf));
+  
+  	if (zdev)
+++<<<<<<< HEAD
+ +		pdev = pci_get_slot(zdev->bus, ZPCI_DEVFN);
+++=======
++ 		pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  
+  	pr_err("%s: Event 0x%x reports an error for PCI function 0x%x\n",
+  	       pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
+@@@ -78,11 -80,9 +82,16 @@@ static void __zpci_event_availability(s
+  	enum zpci_state state;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (zdev)
+ +		pdev = pci_get_slot(zdev->bus, ZPCI_DEVFN);
+++=======
++ 	if (zdev && zdev->zbus && zdev->zbus->bus)
++ 		pdev = pci_get_slot(zdev->zbus->bus, zdev->devfn);
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  
+ +	pr_info("%s: Event 0x%x reconfigured PCI function 0x%x\n",
+ +		pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
+  	zpci_err("avail CCDF:\n");
+  	zpci_err_hex(ccdf, sizeof(*ccdf));
+  
+diff --cc drivers/pci/hotplug/s390_pci_hpc.c
+index 39295d88f670,1579ba895edf..000000000000
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@@ -65,9 -66,9 +65,13 @@@ static int enable_slot(struct hotplug_s
+  	if (rc)
+  		goto out_deconfigure;
+  
+++<<<<<<< HEAD
+ +	pci_scan_slot(zdev->bus, ZPCI_DEVFN);
+++=======
++ 	pci_scan_slot(zbus->bus, zdev->devfn);
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  	pci_lock_rescan_remove();
+ -	pci_bus_add_devices(zbus->bus);
+ +	pci_bus_add_devices(zdev->bus);
+  	pci_unlock_rescan_remove();
+  
+  	return rc;
+@@@ -87,7 -89,7 +91,11 @@@ static int disable_slot(struct hotplug_
+  	if (!zpci_fn_configured(zdev->state))
+  		return -EIO;
+  
+++<<<<<<< HEAD
+ +	pdev = pci_get_slot(zdev->bus, ZPCI_DEVFN);
+++=======
++ 	pdev = pci_get_slot(zbus->bus, zdev->devfn);
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  	if (pdev) {
+  		pci_stop_and_remove_bus_device_locked(pdev);
+  		pci_dev_put(pdev);
+@@@ -137,8 -140,8 +145,13 @@@ int zpci_init_slot(struct zpci_dev *zde
+  	zdev->hotplug_slot.ops = &s390_hotplug_slot_ops;
+  
+  	snprintf(name, SLOT_NAME_SIZE, "%08x", zdev->fid);
+++<<<<<<< HEAD
+ +	return pci_hp_register(&zdev->hotplug_slot, zdev->bus,
+ +			       ZPCI_DEVFN, name);
+++=======
++ 	return pci_hp_register(&zdev->hotplug_slot, zbus->bus,
++ 			       zdev->devfn, name);
+++>>>>>>> 44510d6fa0c0 (s390/pci: Handling multifunctions)
+  }
+  
+  void zpci_exit_slot(struct zpci_dev *zdev)
+* Unmerged path arch/s390/pci/pci_bus.c
+* Unmerged path arch/s390/pci/pci_bus.h
+* Unmerged path arch/s390/include/asm/pci.h
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path arch/s390/pci/pci_bus.c
+* Unmerged path arch/s390/pci/pci_bus.h
+* Unmerged path arch/s390/pci/pci_event.c
+* Unmerged path drivers/pci/hotplug/s390_pci_hpc.c
