@@ -1,0 +1,160 @@
+audit: prepare audit_context for use in calling contexts beyond syscalls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paul Moore <paul@paul-moore.com>
+commit 12c5e81d3fd0a690c49dfe1c3a99bf80a24075c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/12c5e81d.failed
+
+This patch cleans up some of our audit_context handling by
+abstracting out the reset and return code fixup handling to dedicated
+functions.  Not only does this help make things easier to read and
+inspect, it allows for easier reuse by future patches.  We also
+convert the simple audit_context->in_syscall flag into an enum which
+can be used to by future patches to indicate a calling context other
+than the syscall context.
+
+Thanks to Richard Guy Briggs for review and feedback.
+
+	Acked-by: Richard Guy Briggs <rgb@redhat.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 12c5e81d3fd0a690c49dfe1c3a99bf80a24075c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/auditsc.c
+diff --cc kernel/auditsc.c
+index 753d55648216,f3d309b05c2d..000000000000
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@@ -931,8 -998,9 +1001,9 @@@ static inline struct audit_context *aud
+  	context = kzalloc(sizeof(*context), GFP_KERNEL);
+  	if (!context)
+  		return NULL;
++ 	context->context = AUDIT_CTX_UNUSED;
+  	context->state = state;
+ -	context->prio = state == AUDIT_STATE_RECORD ? ~0ULL : 0;
+ +	context->prio = state == AUDIT_RECORD_CONTEXT ? ~0ULL : 0;
+  	INIT_LIST_HEAD(&context->killed_trees);
+  	INIT_LIST_HEAD(&context->names_list);
+  	context->fds[0] = -1;
+@@@ -956,11 -1024,11 +1027,11 @@@ int audit_alloc(struct task_struct *tsk
+  	char *key = NULL;
+  
+  	if (likely(!audit_ever_enabled))
+- 		return 0; /* Return if not auditing. */
++ 		return 0;
+  
+  	state = audit_filter_task(tsk, &key);
+ -	if (state == AUDIT_STATE_DISABLED) {
+ -		clear_task_syscall_work(tsk, SYSCALL_AUDIT);
+ +	if (state == AUDIT_DISABLED) {
+ +		clear_tsk_thread_flag(tsk, TIF_SYSCALL_AUDIT);
+  		return 0;
+  	}
+  
+@@@ -1681,10 -1776,15 +1785,15 @@@ void __audit_syscall_entry(int major, u
+  	if (!audit_enabled || !context)
+  		return;
+  
+- 	BUG_ON(context->in_syscall || context->name_count);
++ 	WARN_ON(context->context != AUDIT_CTX_UNUSED);
++ 	WARN_ON(context->name_count);
++ 	if (context->context != AUDIT_CTX_UNUSED || context->name_count) {
++ 		audit_panic("unrecoverable error in audit_syscall_entry()");
++ 		return;
++ 	}
+  
+  	state = context->state;
+ -	if (state == AUDIT_STATE_DISABLED)
+ +	if (state == AUDIT_DISABLED)
+  		return;
+  
+  	context->dummy = !audit_n_rules;
+@@@ -1729,54 -1828,17 +1837,44 @@@ void __audit_syscall_exit(int success, 
+  	if (!list_empty(&context->killed_trees))
+  		audit_kill_trees(context);
+  
+- 	if (!context->dummy && context->in_syscall) {
+- 		if (success)
+- 			context->return_valid = AUDITSC_SUCCESS;
+- 		else
+- 			context->return_valid = AUDITSC_FAILURE;
+- 
+- 		/*
+- 		 * we need to fix up the return code in the audit logs if the
+- 		 * actual return codes are later going to be fixed up by the
+- 		 * arch specific signal handlers
+- 		 *
+- 		 * This is actually a test for:
+- 		 * (rc == ERESTARTSYS ) || (rc == ERESTARTNOINTR) ||
+- 		 * (rc == ERESTARTNOHAND) || (rc == ERESTART_RESTARTBLOCK)
+- 		 *
+- 		 * but is faster than a bunch of ||
+- 		 */
+- 		if (unlikely(return_code <= -ERESTARTSYS) &&
+- 		    (return_code >= -ERESTART_RESTARTBLOCK) &&
+- 		    (return_code != -ENOIOCTLCMD))
+- 			context->return_code = -EINTR;
+- 		else
+- 			context->return_code  = return_code;
++ 	/* run through both filters to ensure we set the filterkey properly */
++ 	audit_filter_syscall(current, context);
++ 	audit_filter_inodes(current, context);
++ 	if (context->current_state < AUDIT_STATE_RECORD)
++ 		goto out;
+  
++ 	audit_return_fixup(context, success, return_code);
++ 	audit_log_exit();
++ 
+++<<<<<<< HEAD
+ +		audit_filter_syscall(current, context);
+ +		audit_filter_inodes(current, context);
+ +		if (context->current_state == AUDIT_RECORD_CONTEXT)
+ +			audit_log_exit();
+ +	}
+ +
+ +	context->in_syscall = 0;
+ +	context->prio = context->state == AUDIT_RECORD_CONTEXT ? ~0ULL : 0;
+ +
+ +	audit_free_module(context);
+ +	audit_free_names(context);
+ +	unroll_tree_refs(context, NULL, 0);
+ +	audit_free_aux(context);
+ +	context->aux = NULL;
+ +	context->aux_pids = NULL;
+ +	context->target_pid = 0;
+ +	context->target_sid = 0;
+ +	context->sockaddr_len = 0;
+ +	context->type = 0;
+ +	context->fds[0] = -1;
+ +	if (context->state != AUDIT_RECORD_CONTEXT) {
+ +		kfree(context->filterkey);
+ +		context->filterkey = NULL;
+ +	}
+++=======
++ out:
++ 	audit_reset_context(context);
+++>>>>>>> 12c5e81d3fd0 (audit: prepare audit_context for use in calling contexts beyond syscalls)
+  }
+  
+  static inline void handle_one(const struct inode *inode)
+diff --git a/kernel/audit.h b/kernel/audit.h
+index 236d7d215bba..4c4ca357cef3 100644
+--- a/kernel/audit.h
++++ b/kernel/audit.h
+@@ -114,7 +114,10 @@ struct audit_proctitle {
+ /* The per-task audit context. */
+ struct audit_context {
+ 	int		    dummy;	/* must be the first element */
+-	int		    in_syscall;	/* 1 if task is in a syscall */
++	enum {
++		AUDIT_CTX_UNUSED,	/* audit_context is currently unused */
++		AUDIT_CTX_SYSCALL,	/* in use by syscall */
++	} context;
+ 	enum audit_state    state, current_state;
+ 	unsigned int	    serial;     /* serial number for record */
+ 	int		    major;      /* syscall number */
+* Unmerged path kernel/auditsc.c
