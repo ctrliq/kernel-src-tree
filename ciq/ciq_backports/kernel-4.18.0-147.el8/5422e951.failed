@@ -1,0 +1,256 @@
+KVM: PPC: Book3S HV: XIVE: Replace the 'destroy' method by a 'release' method
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Cédric Le Goater <clg@kaod.org>
+commit 5422e95103cf9663bc86cf1056a3ea44c2e2f09e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5422e951.failed
+
+When a P9 sPAPR VM boots, the CAS negotiation process determines which
+interrupt mode to use (XICS legacy or XIVE native) and invokes a
+machine reset to activate the chosen mode.
+
+We introduce 'release' methods for the XICS-on-XIVE and the XIVE
+native KVM devices which are called when the file descriptor of the
+device is closed after the TIMA and ESB pages have been unmapped.
+They perform the necessary cleanups : clear the vCPU interrupt
+presenters that could be attached and then destroy the device. The
+'release' methods replace the 'destroy' methods as 'destroy' is not
+called anymore once 'release' is. Compatibility with older QEMU is
+nevertheless maintained.
+
+This is not considered as a safe operation as the vCPUs are still
+running and could be referencing the KVM device through their
+presenters. To protect the system from any breakage, the kvmppc_xive
+objects representing both KVM devices are now stored in an array under
+the VM. Allocation is performed on first usage and memory is freed
+only when the VM exits.
+
+[paulus@ozlabs.org - Moved freeing of xive structures to book3s.c,
+ put it under #ifdef CONFIG_KVM_XICS.]
+
+	Signed-off-by: Cédric Le Goater <clg@kaod.org>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 5422e95103cf9663bc86cf1056a3ea44c2e2f09e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_xive.h
+#	arch/powerpc/kvm/book3s_xive_native.c
+diff --cc arch/powerpc/kvm/book3s_xive.h
+index a08ae6fd4c51,426146332984..000000000000
+--- a/arch/powerpc/kvm/book3s_xive.h
++++ b/arch/powerpc/kvm/book3s_xive.h
+@@@ -248,5 -272,18 +248,21 @@@ extern int (*__xive_vm_h_ipi)(struct kv
+  extern int (*__xive_vm_h_cppr)(struct kvm_vcpu *vcpu, unsigned long cppr);
+  extern int (*__xive_vm_h_eoi)(struct kvm_vcpu *vcpu, unsigned long xirr);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Common Xive routines for XICS-over-XIVE and XIVE native
++  */
++ void kvmppc_xive_disable_vcpu_interrupts(struct kvm_vcpu *vcpu);
++ int kvmppc_xive_debug_show_queues(struct seq_file *m, struct kvm_vcpu *vcpu);
++ struct kvmppc_xive_src_block *kvmppc_xive_create_src_block(
++ 	struct kvmppc_xive *xive, int irq);
++ void kvmppc_xive_free_sources(struct kvmppc_xive_src_block *sb);
++ int kvmppc_xive_select_target(struct kvm *kvm, u32 *server, u8 prio);
++ int kvmppc_xive_attach_escalation(struct kvm_vcpu *vcpu, u8 prio,
++ 				  bool single_escalation);
++ struct kvmppc_xive *kvmppc_xive_get_device(struct kvm *kvm, u32 type);
++ 
+++>>>>>>> 5422e95103cf (KVM: PPC: Book3S HV: XIVE: Replace the 'destroy' method by a 'release' method)
+  #endif /* CONFIG_KVM_XICS */
+  #endif /* _KVM_PPC_BOOK3S_XICS_H */
+diff --cc arch/powerpc/kvm/book3s_xive_native.c
+index 751259394150,0497272a72fa..000000000000
+--- a/arch/powerpc/kvm/book3s_xive_native.c
++++ b/arch/powerpc/kvm/book3s_xive_native.c
+@@@ -56,6 -971,8 +59,11 @@@ static void kvmppc_xive_native_release(
+  {
+  	struct kvmppc_xive *xive = dev->private;
+  	struct kvm *kvm = xive->kvm;
+++<<<<<<< HEAD
+++=======
++ 	struct kvm_vcpu *vcpu;
++ 	int i;
+++>>>>>>> 5422e95103cf (KVM: PPC: Book3S HV: XIVE: Replace the 'destroy' method by a 'release' method)
+  
+  	debugfs_remove(xive->dentry);
+  
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 008523224e7a..b5abdfb92157 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -313,7 +313,11 @@ struct kvm_arch {
+ #endif
+ #ifdef CONFIG_KVM_XICS
+ 	struct kvmppc_xics *xics;
+-	struct kvmppc_xive *xive;
++	struct kvmppc_xive *xive;    /* Current XIVE device in use */
++	struct {
++		struct kvmppc_xive *native;
++		struct kvmppc_xive *xics_on_xive;
++	} xive_devices;
+ 	struct kvmppc_passthru_irqmap *pimap;
+ #endif
+ 	struct kvmppc_ops *kvm_ops;
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index 3ca9dac20fad..3bc40aecfc61 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -892,6 +892,17 @@ void kvmppc_core_destroy_vm(struct kvm *kvm)
+ 	kvmppc_rtas_tokens_free(kvm);
+ 	WARN_ON(!list_empty(&kvm->arch.spapr_tce_tables));
+ #endif
++
++#ifdef CONFIG_KVM_XICS
++	/*
++	 * Free the XIVE devices which are not directly freed by the
++	 * device 'release' method
++	 */
++	kfree(kvm->arch.xive_devices.native);
++	kvm->arch.xive_devices.native = NULL;
++	kfree(kvm->arch.xive_devices.xics_on_xive);
++	kvm->arch.xive_devices.xics_on_xive = NULL;
++#endif /* CONFIG_KVM_XICS */
+ }
+ 
+ int kvmppc_h_logical_ci_load(struct kvm_vcpu *vcpu)
+diff --git a/arch/powerpc/kvm/book3s_xive.c b/arch/powerpc/kvm/book3s_xive.c
+index f78d002f0fe0..d4b2412200e9 100644
+--- a/arch/powerpc/kvm/book3s_xive.c
++++ b/arch/powerpc/kvm/book3s_xive.c
+@@ -1088,9 +1088,15 @@ static void kvmppc_xive_disable_vcpu_interrupts(struct kvm_vcpu *vcpu)
+ void kvmppc_xive_cleanup_vcpu(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvmppc_xive_vcpu *xc = vcpu->arch.xive_vcpu;
+-	struct kvmppc_xive *xive = xc->xive;
++	struct kvmppc_xive *xive = vcpu->kvm->arch.xive;
+ 	int i;
+ 
++	if (!kvmppc_xics_enabled(vcpu))
++		return;
++
++	if (!xc)
++		return;
++
+ 	pr_devel("cleanup_vcpu(cpu=%d)\n", xc->server_num);
+ 
+ 	/* Ensure no interrupt is still routed to that VP */
+@@ -1129,6 +1135,10 @@ void kvmppc_xive_cleanup_vcpu(struct kvm_vcpu *vcpu)
+ 	}
+ 	/* Free the VP */
+ 	kfree(xc);
++
++	/* Cleanup the vcpu */
++	vcpu->arch.irq_type = KVMPPC_IRQ_DEFAULT;
++	vcpu->arch.xive_vcpu = NULL;
+ }
+ 
+ int kvmppc_xive_connect_vcpu(struct kvm_device *dev,
+@@ -1146,7 +1156,7 @@ int kvmppc_xive_connect_vcpu(struct kvm_device *dev,
+ 	}
+ 	if (xive->kvm != vcpu->kvm)
+ 		return -EPERM;
+-	if (vcpu->arch.irq_type)
++	if (vcpu->arch.irq_type != KVMPPC_IRQ_DEFAULT)
+ 		return -EBUSY;
+ 	if (kvmppc_xive_find_server(vcpu->kvm, cpu)) {
+ 		pr_devel("Duplicate !\n");
+@@ -1810,12 +1820,26 @@ static void kvmppc_xive_free_sources(struct kvmppc_xive_src_block *sb)
+ 	}
+ }
+ 
+-static void kvmppc_xive_free(struct kvm_device *dev)
++/*
++ * Called when device fd is closed
++ */
++static void kvmppc_xive_release(struct kvm_device *dev)
+ {
+ 	struct kvmppc_xive *xive = dev->private;
+ 	struct kvm *kvm = xive->kvm;
++	struct kvm_vcpu *vcpu;
+ 	int i;
+ 
++	pr_devel("Releasing xive device\n");
++
++	/*
++	 * When releasing the KVM device fd, the vCPUs can still be
++	 * running and we should clean up the vCPU interrupt
++	 * presenters first.
++	 */
++	kvm_for_each_vcpu(i, vcpu, kvm)
++		kvmppc_xive_cleanup_vcpu(vcpu);
++
+ 	debugfs_remove(xive->dentry);
+ 
+ 	if (kvm)
+@@ -1832,11 +1856,42 @@ static void kvmppc_xive_free(struct kvm_device *dev)
+ 	if (xive->vp_base != XIVE_INVALID_VP)
+ 		xive_native_free_vp_block(xive->vp_base);
+ 
++	/*
++	 * A reference of the kvmppc_xive pointer is now kept under
++	 * the xive_devices struct of the machine for reuse. It is
++	 * freed when the VM is destroyed for now until we fix all the
++	 * execution paths.
++	 */
+ 
+-	kfree(xive);
+ 	kfree(dev);
+ }
+ 
++/*
++ * When the guest chooses the interrupt mode (XICS legacy or XIVE
++ * native), the VM will switch of KVM device. The previous device will
++ * be "released" before the new one is created.
++ *
++ * Until we are sure all execution paths are well protected, provide a
++ * fail safe (transitional) method for device destruction, in which
++ * the XIVE device pointer is recycled and not directly freed.
++ */
++struct kvmppc_xive *kvmppc_xive_get_device(struct kvm *kvm, u32 type)
++{
++	struct kvmppc_xive **kvm_xive_device = type == KVM_DEV_TYPE_XIVE ?
++		&kvm->arch.xive_devices.native :
++		&kvm->arch.xive_devices.xics_on_xive;
++	struct kvmppc_xive *xive = *kvm_xive_device;
++
++	if (!xive) {
++		xive = kzalloc(sizeof(*xive), GFP_KERNEL);
++		*kvm_xive_device = xive;
++	} else {
++		memset(xive, 0, sizeof(*xive));
++	}
++
++	return xive;
++}
++
+ static int kvmppc_xive_create(struct kvm_device *dev, u32 type)
+ {
+ 	struct kvmppc_xive *xive;
+@@ -1845,7 +1900,7 @@ static int kvmppc_xive_create(struct kvm_device *dev, u32 type)
+ 
+ 	pr_devel("Creating xive for partition\n");
+ 
+-	xive = kzalloc(sizeof(*xive), GFP_KERNEL);
++	xive = kvmppc_xive_get_device(kvm, type);
+ 	if (!xive)
+ 		return -ENOMEM;
+ 
+@@ -1999,7 +2054,7 @@ struct kvm_device_ops kvm_xive_ops = {
+ 	.name = "kvm-xive",
+ 	.create = kvmppc_xive_create,
+ 	.init = kvmppc_xive_init,
+-	.destroy = kvmppc_xive_free,
++	.release = kvmppc_xive_release,
+ 	.set_attr = xive_set_attr,
+ 	.get_attr = xive_get_attr,
+ 	.has_attr = xive_has_attr,
+* Unmerged path arch/powerpc/kvm/book3s_xive.h
+* Unmerged path arch/powerpc/kvm/book3s_xive_native.c
