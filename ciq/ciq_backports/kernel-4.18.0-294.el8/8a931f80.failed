@@ -1,0 +1,383 @@
+mm: memcontrol: recursive memory.low protection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 8a931f801340c2be10552c7b5622d5f4852f3a36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8a931f80.failed
+
+Right now, the effective protection of any given cgroup is capped by its
+own explicit memory.low setting, regardless of what the parent says.  The
+reasons for this are mostly historical and ease of implementation: to make
+delegation of memory.low safe, effective protection is the min() of all
+memory.low up the tree.
+
+Unfortunately, this limitation makes it impossible to protect an entire
+subtree from another without forcing the user to make explicit protection
+allocations all the way to the leaf cgroups - something that is highly
+undesirable in real life scenarios.
+
+Consider memory in a data center host.  At the cgroup top level, we have a
+distinction between system management software and the actual workload the
+system is executing.  Both branches are further subdivided into individual
+services, job components etc.
+
+We want to protect the workload as a whole from the system management
+software, but that doesn't mean we want to protect and prioritize
+individual workload wrt each other.  Their memory demand can vary over
+time, and we'd want the VM to simply cache the hottest data within the
+workload subtree.  Yet, the current memory.low limitations force us to
+allocate a fixed amount of protection to each workload component in order
+to get protection from system management software in general.  This
+results in very inefficient resource distribution.
+
+Another concern with mandating downward allocation is that, as the
+complexity of the cgroup tree grows, it gets harder for the lower levels
+to be informed about decisions made at the host-level.  Consider a
+container inside a namespace that in turn creates its own nested tree of
+cgroups to run multiple workloads.  It'd be extremely difficult to
+configure memory.low parameters in those leaf cgroups that on one hand
+balance pressure among siblings as the container desires, while also
+reflecting the host-level protection from e.g.  rpm upgrades, that lie
+beyond one or more delegation and namespacing points in the tree.
+
+It's highly unusual from a cgroup interface POV that nested levels have to
+be aware of and reflect decisions made at higher levels for them to be
+effective.
+
+To enable such use cases and scale configurability for complex trees, this
+patch implements a resource inheritance model for memory that is similar
+to how the CPU and the IO controller implement work-conserving resource
+allocations: a share of a resource allocated to a subree always applies to
+the entire subtree recursively, while allowing, but not mandating,
+children to further specify distribution rules.
+
+That means that if protection is explicitly allocated among siblings,
+those configured shares are being followed during page reclaim just like
+they are now.  However, if the memory.low set at a higher level is not
+fully claimed by the children in that subtree, the "floating" remainder is
+applied to each cgroup in the tree in proportion to its size.  Since
+reclaim pressure is applied in proportion to size as well, each child in
+that tree gets the same boost, and the effect is neutral among siblings -
+with respect to each other, they behave as if no memory control was
+enabled at all, and the VM simply balances the memory demands optimally
+within the subtree.  But collectively those cgroups enjoy a boost over the
+cgroups in neighboring trees.
+
+E.g.  a leaf cgroup with a memory.low setting of 0 no longer means that
+it's not getting a share of the hierarchically assigned resource, just
+that it doesn't claim a fixed amount of it to protect from its siblings.
+
+This allows us to recursively protect one subtree (workload) from another
+(system management), while letting subgroups compete freely among each
+other - without having to assign fixed shares to each leaf, and without
+nested groups having to echo higher-level settings.
+
+The floating protection composes naturally with fixed protection.
+Consider the following example tree:
+
+		A            A: low = 2G
+               / \          A1: low = 1G
+              A1 A2         A2: low = 0G
+
+As outside pressure is applied to this tree, A1 will enjoy a fixed
+protection from A2 of 1G, but the remaining, unclaimed 1G from A is split
+evenly among A1 and A2, coming out to 1.5G and 0.5G.
+
+There is a slight risk of regressing theoretical setups where the
+top-level cgroups don't know about the true budgeting and set bogusly high
+"bypass" values that are meaningfully allocated down the tree.  Such
+setups would rely on unclaimed protection to be discarded, and
+distributing it would change the intended behavior.  Be safe and hide the
+new behavior behind a mount option, 'memory_recursiveprot'.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Chris Down <chris@chrisdown.name>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Michal Koutný <mkoutny@suse.com>
+Link: http://lkml.kernel.org/r/20200227195606.46212-4-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8a931f801340c2be10552c7b5622d5f4852f3a36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/cgroup-v2.rst
+#	include/linux/cgroup-defs.h
+#	kernel/cgroup/cgroup.c
+diff --cc Documentation/admin-guide/cgroup-v2.rst
+index 45de03923c4f,bcc80269bb6a..000000000000
+--- a/Documentation/admin-guide/cgroup-v2.rst
++++ b/Documentation/admin-guide/cgroup-v2.rst
+@@@ -179,6 -179,26 +179,29 @@@ cgroup v2 currently supports the follow
+  	ignored on non-init namespace mounts.  Please refer to the
+  	Delegation section for details.
+  
+++<<<<<<< HEAD
+++=======
++   memory_localevents
++ 
++         Only populate memory.events with data for the current cgroup,
++         and not any subtrees. This is legacy behaviour, the default
++         behaviour without this option is to include subtree counts.
++         This option is system wide and can only be set on mount or
++         modified through remount from the init namespace. The mount
++         option is ignored on non-init namespace mounts.
++ 
++   memory_recursiveprot
++ 
++         Recursively apply memory.min and memory.low protection to
++         entire subtrees, without requiring explicit downward
++         propagation into leaf cgroups.  This allows protecting entire
++         subtrees from one another, while retaining free competition
++         within those subtrees.  This should have been the default
++         behavior but is a mount-option to avoid regressing setups
++         relying on the original semantics (e.g. specifying bogusly
++         high 'bypass' protection values at higher tree levels).
++ 
+++>>>>>>> 8a931f801340 (mm: memcontrol: recursive memory.low protection)
+  
+  Organizing Processes and Threads
+  --------------------------------
+diff --cc include/linux/cgroup-defs.h
+index 0110a26434e3,e1fafed22db1..000000000000
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@@ -89,6 -89,16 +89,19 @@@ enum 
+  	 * Enable cpuset controller in v1 cgroup to use v2 behavior.
+  	 */
+  	CGRP_ROOT_CPUSET_V2_MODE = (1 << 4),
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Enable legacy local memory.events.
++ 	 */
++ 	CGRP_ROOT_MEMORY_LOCAL_EVENTS = (1 << 5),
++ 
++ 	/*
++ 	 * Enable recursive subtree protection
++ 	 */
++ 	CGRP_ROOT_MEMORY_RECURSIVE_PROT = (1 << 6),
+++>>>>>>> 8a931f801340 (mm: memcontrol: recursive memory.low protection)
+  };
+  
+  /* cftype->flags */
+diff --cc kernel/cgroup/cgroup.c
+index 9e08519ae6db,755c07d845ce..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -1814,26 -1810,42 +1814,50 @@@ int cgroup_show_path(struct seq_file *s
+  	return len;
+  }
+  
+++<<<<<<< HEAD
+ +static int parse_cgroup_root_flags(char *data, unsigned int *root_flags)
+++=======
++ enum cgroup2_param {
++ 	Opt_nsdelegate,
++ 	Opt_memory_localevents,
++ 	Opt_memory_recursiveprot,
++ 	nr__cgroup2_params
++ };
++ 
++ static const struct fs_parameter_spec cgroup2_fs_parameters[] = {
++ 	fsparam_flag("nsdelegate",		Opt_nsdelegate),
++ 	fsparam_flag("memory_localevents",	Opt_memory_localevents),
++ 	fsparam_flag("memory_recursiveprot",	Opt_memory_recursiveprot),
++ 	{}
++ };
++ 
++ static int cgroup2_parse_param(struct fs_context *fc, struct fs_parameter *param)
+++>>>>>>> 8a931f801340 (mm: memcontrol: recursive memory.low protection)
+  {
+ -	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+ -	struct fs_parse_result result;
+ -	int opt;
+ +	char *token;
+  
+ -	opt = fs_parse(fc, cgroup2_fs_parameters, param, &result);
+ -	if (opt < 0)
+ -		return opt;
+ +	*root_flags = 0;
+  
+ -	switch (opt) {
+ -	case Opt_nsdelegate:
+ -		ctx->flags |= CGRP_ROOT_NS_DELEGATE;
+ -		return 0;
+ -	case Opt_memory_localevents:
+ -		ctx->flags |= CGRP_ROOT_MEMORY_LOCAL_EVENTS;
+ +	if (!data || *data == '\0')
+  		return 0;
+++<<<<<<< HEAD
+ +
+ +	while ((token = strsep(&data, ",")) != NULL) {
+ +		if (!strcmp(token, "nsdelegate")) {
+ +			*root_flags |= CGRP_ROOT_NS_DELEGATE;
+ +			continue;
+ +		}
+ +
+ +		pr_err("cgroup2: unknown option \"%s\"\n", token);
+ +		return -EINVAL;
+++=======
++ 	case Opt_memory_recursiveprot:
++ 		ctx->flags |= CGRP_ROOT_MEMORY_RECURSIVE_PROT;
++ 		return 0;
+++>>>>>>> 8a931f801340 (mm: memcontrol: recursive memory.low protection)
+  	}
+ -	return -EINVAL;
+ +
+ +	return 0;
+  }
+  
+  static void apply_cgroup_root_flags(unsigned int root_flags)
+@@@ -1843,6 -1855,16 +1867,19 @@@
+  			cgrp_dfl_root.flags |= CGRP_ROOT_NS_DELEGATE;
+  		else
+  			cgrp_dfl_root.flags &= ~CGRP_ROOT_NS_DELEGATE;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (root_flags & CGRP_ROOT_MEMORY_LOCAL_EVENTS)
++ 			cgrp_dfl_root.flags |= CGRP_ROOT_MEMORY_LOCAL_EVENTS;
++ 		else
++ 			cgrp_dfl_root.flags &= ~CGRP_ROOT_MEMORY_LOCAL_EVENTS;
++ 
++ 		if (root_flags & CGRP_ROOT_MEMORY_RECURSIVE_PROT)
++ 			cgrp_dfl_root.flags |= CGRP_ROOT_MEMORY_RECURSIVE_PROT;
++ 		else
++ 			cgrp_dfl_root.flags &= ~CGRP_ROOT_MEMORY_RECURSIVE_PROT;
+++>>>>>>> 8a931f801340 (mm: memcontrol: recursive memory.low protection)
+  	}
+  }
+  
+@@@ -1850,6 -1872,10 +1887,13 @@@ static int cgroup_show_options(struct s
+  {
+  	if (cgrp_dfl_root.flags & CGRP_ROOT_NS_DELEGATE)
+  		seq_puts(seq, ",nsdelegate");
+++<<<<<<< HEAD
+++=======
++ 	if (cgrp_dfl_root.flags & CGRP_ROOT_MEMORY_LOCAL_EVENTS)
++ 		seq_puts(seq, ",memory_localevents");
++ 	if (cgrp_dfl_root.flags & CGRP_ROOT_MEMORY_RECURSIVE_PROT)
++ 		seq_puts(seq, ",memory_recursiveprot");
+++>>>>>>> 8a931f801340 (mm: memcontrol: recursive memory.low protection)
+  	return 0;
+  }
+  
+@@@ -6309,7 -6424,10 +6353,14 @@@ static struct kobj_attribute cgroup_del
+  static ssize_t features_show(struct kobject *kobj, struct kobj_attribute *attr,
+  			     char *buf)
+  {
+++<<<<<<< HEAD
+ +	return snprintf(buf, PAGE_SIZE, "nsdelegate\n");
+++=======
++ 	return snprintf(buf, PAGE_SIZE,
++ 			"nsdelegate\n"
++ 			"memory_localevents\n"
++ 			"memory_recursiveprot\n");
+++>>>>>>> 8a931f801340 (mm: memcontrol: recursive memory.low protection)
+  }
+  static struct kobj_attribute cgroup_features_attr = __ATTR_RO(features);
+  
+* Unmerged path Documentation/admin-guide/cgroup-v2.rst
+* Unmerged path include/linux/cgroup-defs.h
+* Unmerged path kernel/cgroup/cgroup.c
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 71efd84f37cc..ac8dfd27ba32 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -6188,13 +6188,27 @@ struct cgroup_subsys memory_cgrp_subsys = {
+  *    budget is NOT proportional. A cgroup's protection from a sibling
+  *    is capped to its own memory.min/low setting.
+  *
++ * 5. However, to allow protecting recursive subtrees from each other
++ *    without having to declare each individual cgroup's fixed share
++ *    of the ancestor's claim to protection, any unutilized -
++ *    "floating" - protection from up the tree is distributed in
++ *    proportion to each cgroup's *usage*. This makes the protection
++ *    neutral wrt sibling cgroups and lets them compete freely over
++ *    the shared parental protection budget, but it protects the
++ *    subtree as a whole from neighboring subtrees.
++ *
++ * Note that 4. and 5. are not in conflict: 4. is about protecting
++ * against immediate siblings whereas 5. is about protecting against
++ * neighboring subtrees.
+  */
+ static unsigned long effective_protection(unsigned long usage,
++					  unsigned long parent_usage,
+ 					  unsigned long setting,
+ 					  unsigned long parent_effective,
+ 					  unsigned long siblings_protected)
+ {
+ 	unsigned long protected;
++	unsigned long ep;
+ 
+ 	protected = min(usage, setting);
+ 	/*
+@@ -6225,7 +6239,34 @@ static unsigned long effective_protection(unsigned long usage,
+ 	 * protection is always dependent on how memory is actually
+ 	 * consumed among the siblings anyway.
+ 	 */
+-	return protected;
++	ep = protected;
++
++	/*
++	 * If the children aren't claiming (all of) the protection
++	 * afforded to them by the parent, distribute the remainder in
++	 * proportion to the (unprotected) memory of each cgroup. That
++	 * way, cgroups that aren't explicitly prioritized wrt each
++	 * other compete freely over the allowance, but they are
++	 * collectively protected from neighboring trees.
++	 *
++	 * We're using unprotected memory for the weight so that if
++	 * some cgroups DO claim explicit protection, we don't protect
++	 * the same bytes twice.
++	 */
++	if (!(cgrp_dfl_root.flags & CGRP_ROOT_MEMORY_RECURSIVE_PROT))
++		return ep;
++
++	if (parent_effective > siblings_protected && usage > protected) {
++		unsigned long unclaimed;
++
++		unclaimed = parent_effective - siblings_protected;
++		unclaimed *= usage - protected;
++		unclaimed /= parent_usage - siblings_protected;
++
++		ep += unclaimed;
++	}
++
++	return ep;
+ }
+ 
+ /**
+@@ -6245,8 +6286,8 @@ static unsigned long effective_protection(unsigned long usage,
+ enum mem_cgroup_protection mem_cgroup_protected(struct mem_cgroup *root,
+ 						struct mem_cgroup *memcg)
+ {
++	unsigned long usage, parent_usage;
+ 	struct mem_cgroup *parent;
+-	unsigned long usage;
+ 
+ 	if (mem_cgroup_disabled())
+ 		return MEMCG_PROT_NONE;
+@@ -6271,11 +6312,13 @@ enum mem_cgroup_protection mem_cgroup_protected(struct mem_cgroup *root,
+ 		goto out;
+ 	}
+ 
+-	memcg->memory.emin = effective_protection(usage,
++	parent_usage = page_counter_read(&parent->memory);
++
++	memcg->memory.emin = effective_protection(usage, parent_usage,
+ 			memcg->memory.min, READ_ONCE(parent->memory.emin),
+ 			atomic_long_read(&parent->memory.children_min_usage));
+ 
+-	memcg->memory.elow = effective_protection(usage,
++	memcg->memory.elow = effective_protection(usage, parent_usage,
+ 			memcg->memory.low, READ_ONCE(parent->memory.elow),
+ 			atomic_long_read(&parent->memory.children_low_usage));
+ 
