@@ -94,6 +94,9 @@ struct bucket {
 	};
 };
 
+#define HASHTAB_MAP_LOCK_COUNT 8
+#define HASHTAB_MAP_LOCK_MASK (HASHTAB_MAP_LOCK_COUNT - 1)
+
 struct bpf_htab {
 	struct bpf_map map;
 	struct bucket *buckets;
@@ -108,6 +111,7 @@ struct bpf_htab {
 	u32 elem_size;	/* size of each element in bytes */
 	u32 hashrnd;
 	struct lock_class_key lockdep_key;
+	int __percpu *map_locked[HASHTAB_MAP_LOCK_COUNT];
 };
 
 /* each htab element is struct htab_elem + key + value */
@@ -160,26 +164,41 @@ static void htab_init_buckets(struct bpf_htab *htab)
 	}
 }
 
-static inline unsigned long htab_lock_bucket(const struct bpf_htab *htab,
-					     struct bucket *b)
+static inline int htab_lock_bucket(const struct bpf_htab *htab,
+				   struct bucket *b, u32 hash,
+				   unsigned long *pflags)
 {
 	unsigned long flags;
+
+	hash = hash & HASHTAB_MAP_LOCK_MASK;
+
+	migrate_disable();
+	if (unlikely(__this_cpu_inc_return(*(htab->map_locked[hash])) != 1)) {
+		__this_cpu_dec(*(htab->map_locked[hash]));
+		migrate_enable();
+		return -EBUSY;
+	}
 
 	if (htab_use_raw_lock(htab))
 		raw_spin_lock_irqsave(&b->raw_lock, flags);
 	else
 		spin_lock_irqsave(&b->lock, flags);
-	return flags;
+	*pflags = flags;
+
+	return 0;
 }
 
 static inline void htab_unlock_bucket(const struct bpf_htab *htab,
-				      struct bucket *b,
+				      struct bucket *b, u32 hash,
 				      unsigned long flags)
 {
+	hash = hash & HASHTAB_MAP_LOCK_MASK;
 	if (htab_use_raw_lock(htab))
 		raw_spin_unlock_irqrestore(&b->raw_lock, flags);
 	else
 		spin_unlock_irqrestore(&b->lock, flags);
+	__this_cpu_dec(*(htab->map_locked[hash]));
+	migrate_enable();
 }
 
 static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node);
@@ -437,8 +456,8 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 	bool percpu_lru = (attr->map_flags & BPF_F_NO_COMMON_LRU);
 	bool prealloc = !(attr->map_flags & BPF_F_NO_PREALLOC);
 	struct bpf_htab *htab;
+	int err, i;
 	u64 cost;
-	int err;
 
 	htab = kzalloc(sizeof(*htab), GFP_USER);
 	if (!htab)
@@ -495,6 +514,13 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 	if (!htab->buckets)
 		goto free_charge;
 
+	for (i = 0; i < HASHTAB_MAP_LOCK_COUNT; i++) {
+		htab->map_locked[i] = __alloc_percpu_gfp(sizeof(int),
+							 sizeof(int), GFP_USER);
+		if (!htab->map_locked[i])
+			goto free_map_locked;
+	}
+
 	if (htab->map.map_flags & BPF_F_ZERO_SEED)
 		htab->hashrnd = 0;
 	else
@@ -505,7 +531,7 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 	if (prealloc) {
 		err = prealloc_init(htab);
 		if (err)
-			goto free_buckets;
+			goto free_map_locked;
 
 		if (!percpu && !lru) {
 			/* lru itself can remove the least used element, so
@@ -521,7 +547,9 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 
 free_prealloc:
 	prealloc_destroy(htab);
-free_buckets:
+free_map_locked:
+	for (i = 0; i < HASHTAB_MAP_LOCK_COUNT; i++)
+		free_percpu(htab->map_locked[i]);
 	bpf_map_area_free(htab->buckets);
 free_charge:
 	bpf_map_charge_finish(&htab->map.memory);
@@ -702,12 +730,15 @@ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
 	struct hlist_nulls_node *n;
 	unsigned long flags;
 	struct bucket *b;
+	int ret;
 
 	tgt_l = container_of(node, struct htab_elem, lru_node);
 	b = __select_bucket(htab, tgt_l->hash);
 	head = &b->head;
 
-	flags = htab_lock_bucket(htab, b);
+	ret = htab_lock_bucket(htab, b, tgt_l->hash, &flags);
+	if (ret)
+		return false;
 
 	hlist_nulls_for_each_entry_rcu(l, n, head, hash_node)
 		if (l == tgt_l) {
@@ -715,7 +746,7 @@ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
 			break;
 		}
 
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, tgt_l->hash, flags);
 
 	return l == tgt_l;
 }
@@ -1013,7 +1044,9 @@ static int htab_map_update_elem(struct bpf_map *map, void *key, void *value,
 		 */
 	}
 
-	flags = htab_lock_bucket(htab, b);
+	ret = htab_lock_bucket(htab, b, hash, &flags);
+	if (ret)
+		return ret;
 
 	l_old = lookup_elem_raw(head, hash, key, key_size);
 
@@ -1054,7 +1087,7 @@ static int htab_map_update_elem(struct bpf_map *map, void *key, void *value,
 	}
 	ret = 0;
 err:
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, hash, flags);
 	return ret;
 }
 
@@ -1092,7 +1125,9 @@ static int htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value,
 		return -ENOMEM;
 	memcpy(l_new->key + round_up(map->key_size, 8), value, map->value_size);
 
-	flags = htab_lock_bucket(htab, b);
+	ret = htab_lock_bucket(htab, b, hash, &flags);
+	if (ret)
+		return ret;
 
 	l_old = lookup_elem_raw(head, hash, key, key_size);
 
@@ -1111,7 +1146,7 @@ static int htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value,
 	ret = 0;
 
 err:
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, hash, flags);
 
 	if (ret)
 		bpf_lru_push_free(&htab->lru, &l_new->lru_node);
@@ -1146,7 +1181,9 @@ static int __htab_percpu_map_update_elem(struct bpf_map *map, void *key,
 	b = __select_bucket(htab, hash);
 	head = &b->head;
 
-	flags = htab_lock_bucket(htab, b);
+	ret = htab_lock_bucket(htab, b, hash, &flags);
+	if (ret)
+		return ret;
 
 	l_old = lookup_elem_raw(head, hash, key, key_size);
 
@@ -1169,7 +1206,7 @@ static int __htab_percpu_map_update_elem(struct bpf_map *map, void *key,
 	}
 	ret = 0;
 err:
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, hash, flags);
 	return ret;
 }
 
@@ -1209,7 +1246,9 @@ static int __htab_lru_percpu_map_update_elem(struct bpf_map *map, void *key,
 			return -ENOMEM;
 	}
 
-	flags = htab_lock_bucket(htab, b);
+	ret = htab_lock_bucket(htab, b, hash, &flags);
+	if (ret)
+		return ret;
 
 	l_old = lookup_elem_raw(head, hash, key, key_size);
 
@@ -1231,7 +1270,7 @@ static int __htab_lru_percpu_map_update_elem(struct bpf_map *map, void *key,
 	}
 	ret = 0;
 err:
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, hash, flags);
 	if (l_new)
 		bpf_lru_push_free(&htab->lru, &l_new->lru_node);
 	return ret;
@@ -1259,7 +1298,7 @@ static int htab_map_delete_elem(struct bpf_map *map, void *key)
 	struct htab_elem *l;
 	unsigned long flags;
 	u32 hash, key_size;
-	int ret = -ENOENT;
+	int ret;
 
 	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
 
@@ -1269,17 +1308,20 @@ static int htab_map_delete_elem(struct bpf_map *map, void *key)
 	b = __select_bucket(htab, hash);
 	head = &b->head;
 
-	flags = htab_lock_bucket(htab, b);
+	ret = htab_lock_bucket(htab, b, hash, &flags);
+	if (ret)
+		return ret;
 
 	l = lookup_elem_raw(head, hash, key, key_size);
 
 	if (l) {
 		hlist_nulls_del_rcu(&l->hash_node);
 		free_htab_elem(htab, l);
-		ret = 0;
+	} else {
+		ret = -ENOENT;
 	}
 
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, hash, flags);
 	return ret;
 }
 
@@ -1291,7 +1333,7 @@ static int htab_lru_map_delete_elem(struct bpf_map *map, void *key)
 	struct htab_elem *l;
 	unsigned long flags;
 	u32 hash, key_size;
-	int ret = -ENOENT;
+	int ret;
 
 	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held());
 
@@ -1301,16 +1343,18 @@ static int htab_lru_map_delete_elem(struct bpf_map *map, void *key)
 	b = __select_bucket(htab, hash);
 	head = &b->head;
 
-	flags = htab_lock_bucket(htab, b);
+	ret = htab_lock_bucket(htab, b, hash, &flags);
+	if (ret)
+		return ret;
 
 	l = lookup_elem_raw(head, hash, key, key_size);
 
-	if (l) {
+	if (l)
 		hlist_nulls_del_rcu(&l->hash_node);
-		ret = 0;
-	}
+	else
+		ret = -ENOENT;
 
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, hash, flags);
 	if (l)
 		bpf_lru_push_free(&htab->lru, &l->lru_node);
 	return ret;
@@ -1336,6 +1380,7 @@ static void delete_all_elements(struct bpf_htab *htab)
 static void htab_map_free(struct bpf_map *map)
 {
 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+	int i;
 
 	/* bpf_free_used_maps() or close(map_fd) will trigger this map_free callback.
 	 * bpf_free_used_maps() is called after bpf prog is no longer executing.
@@ -1354,6 +1399,8 @@ static void htab_map_free(struct bpf_map *map)
 	free_percpu(htab->extra_elems);
 	bpf_map_area_free(htab->buckets);
 	lockdep_unregister_key(&htab->lockdep_key);
+	for (i = 0; i < HASHTAB_MAP_LOCK_COUNT; i++)
+		free_percpu(htab->map_locked[i]);
 	kfree(htab);
 }
 
@@ -1457,8 +1504,11 @@ again_nocopy:
 	b = &htab->buckets[batch];
 	head = &b->head;
 	/* do not grab the lock unless need it (bucket_cnt > 0). */
-	if (locked)
-		flags = htab_lock_bucket(htab, b);
+	if (locked) {
+		ret = htab_lock_bucket(htab, b, batch, &flags);
+		if (ret)
+			goto next_batch;
+	}
 
 	bucket_cnt = 0;
 	hlist_nulls_for_each_entry_rcu(l, n, head, hash_node)
@@ -1475,7 +1525,7 @@ again_nocopy:
 		/* Note that since bucket_cnt > 0 here, it is implicit
 		 * that the locked was grabbed, so release it.
 		 */
-		htab_unlock_bucket(htab, b, flags);
+		htab_unlock_bucket(htab, b, batch, flags);
 		rcu_read_unlock();
 		bpf_enable_instrumentation();
 		goto after_loop;
@@ -1486,7 +1536,7 @@ again_nocopy:
 		/* Note that since bucket_cnt > 0 here, it is implicit
 		 * that the locked was grabbed, so release it.
 		 */
-		htab_unlock_bucket(htab, b, flags);
+		htab_unlock_bucket(htab, b, batch, flags);
 		rcu_read_unlock();
 		bpf_enable_instrumentation();
 		kvfree(keys);
@@ -1539,7 +1589,7 @@ again_nocopy:
 		dst_val += value_size;
 	}
 
-	htab_unlock_bucket(htab, b, flags);
+	htab_unlock_bucket(htab, b, batch, flags);
 	locked = false;
 
 	while (node_to_free) {
