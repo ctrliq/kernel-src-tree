@@ -1,0 +1,190 @@
+mm/hmm: check the device private page owner in hmm_range_fault()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 08ddddda667b3b7aaac10641418283f78118c5cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/08ddddda.failed
+
+hmm_range_fault() will succeed for any kind of device private memory, even
+if it doesn't belong to the calling entity.  While nouveau has some crude
+checks for that, they are broken because they assume nouveau is the only
+user of device private memory.  Fix this by passing in an expected pgmap
+owner in the hmm_range_fault structure.
+
+If a device_private page is found and doesn't match the owner then it is
+treated as an non-present and non-faultable page.
+
+This prevents a bug in amdgpu, where it doesn't know how to handle
+device_private pages, but hmm_range_fault would return them anyhow.
+
+Fixes: 4ef589dc9b10 ("mm/hmm/devmem: device memory hotplug using ZONE_DEVICE")
+Link: https://lore.kernel.org/r/20200316193216.920734-5-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 08ddddda667b3b7aaac10641418283f78118c5cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nouveau_dmem.c
+#	include/linux/hmm.h
+#	mm/hmm.c
+diff --cc drivers/gpu/drm/nouveau/nouveau_dmem.c
+index 4e8112fde3e6,ad89e09a0be3..000000000000
+--- a/drivers/gpu/drm/nouveau/nouveau_dmem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_dmem.c
+@@@ -701,3 -671,28 +701,31 @@@ out_free_src
+  out:
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void
++ nouveau_dmem_convert_pfn(struct nouveau_drm *drm,
++ 			 struct hmm_range *range)
++ {
++ 	unsigned long i, npages;
++ 
++ 	npages = (range->end - range->start) >> PAGE_SHIFT;
++ 	for (i = 0; i < npages; ++i) {
++ 		struct page *page;
++ 		uint64_t addr;
++ 
++ 		page = hmm_device_entry_to_page(range, range->pfns[i]);
++ 		if (page == NULL)
++ 			continue;
++ 
++ 		if (!is_device_private_page(page))
++ 			continue;
++ 
++ 		addr = nouveau_dmem_page_addr(page);
++ 		range->pfns[i] &= ((1UL << range->pfn_shift) - 1);
++ 		range->pfns[i] |= (addr >> PAGE_SHIFT) << range->pfn_shift;
++ 		range->pfns[i] |= NVIF_VMM_PFNMAP_V0_VRAM;
++ 	}
++ }
+++>>>>>>> 08ddddda667b (mm/hmm: check the device private page owner in hmm_range_fault())
+diff --cc include/linux/hmm.h
+index 6a8157d67186,bb6be4428633..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -176,14 -130,13 +176,15 @@@ enum hmm_pfn_value_e 
+   * @values: pfn value for some special case (none, special, error, ...)
+   * @default_flags: default flags for the range (write, read, ... see hmm doc)
+   * @pfn_flags_mask: allows to mask pfn flags so that only default_flags matter
+ + * @page_shift: device virtual address shift value (should be >= PAGE_SHIFT)
+   * @pfn_shifts: pfn shift value (should be <= PAGE_SHIFT)
+   * @valid: pfns array did not change since it has been fill by an HMM function
++  * @dev_private_owner: owner of device private pages
+   */
+  struct hmm_range {
+ -	struct mmu_interval_notifier *notifier;
+ -	unsigned long		notifier_seq;
+ +	struct hmm		*hmm;
+ +	struct vm_area_struct	*vma;
+ +	struct list_head	list;
+  	unsigned long		start;
+  	unsigned long		end;
+  	uint64_t		*pfns;
+@@@ -191,54 -144,10 +192,58 @@@
+  	const uint64_t		*values;
+  	uint64_t		default_flags;
+  	uint64_t		pfn_flags_mask;
+ +	uint8_t			page_shift;
+  	uint8_t			pfn_shift;
+++<<<<<<< HEAD
+ +	bool			valid;
+++=======
++ 	void			*dev_private_owner;
+++>>>>>>> 08ddddda667b (mm/hmm: check the device private page owner in hmm_range_fault())
+  };
+  
+ +/*
+ + * hmm_range_page_shift() - return the page shift for the range
+ + * @range: range being queried
+ + * Return: page shift (page size = 1 << page shift) for the range
+ + */
+ +static inline unsigned hmm_range_page_shift(const struct hmm_range *range)
+ +{
+ +	return range->page_shift;
+ +}
+ +
+ +/*
+ + * hmm_range_page_size() - return the page size for the range
+ + * @range: range being queried
+ + * Return: page size for the range in bytes
+ + */
+ +static inline unsigned long hmm_range_page_size(const struct hmm_range *range)
+ +{
+ +	return 1UL << hmm_range_page_shift(range);
+ +}
+ +
+ +/*
+ + * hmm_range_wait_until_valid() - wait for range to be valid
+ + * @range: range affected by invalidation to wait on
+ + * @timeout: time out for wait in ms (ie abort wait after that period of time)
+ + * Return: true if the range is valid, false otherwise.
+ + */
+ +static inline bool hmm_range_wait_until_valid(struct hmm_range *range,
+ +					      unsigned long timeout)
+ +{
+ +	return wait_event_timeout(range->hmm->wq, range->valid,
+ +				  msecs_to_jiffies(timeout)) != 0;
+ +}
+ +
+ +/*
+ + * hmm_range_valid() - test if a range is valid or not
+ + * @range: range
+ + * Return: true if the range is valid, false otherwise.
+ + */
+ +static inline bool hmm_range_valid(struct hmm_range *range)
+ +{
+ +	return range->valid;
+ +}
+ +
+  /*
+   * hmm_device_entry_to_page() - return struct page pointed to by a device entry
+   * @range: range use to decode device entry value
+diff --cc mm/hmm.c
+index 0031a5d7b75b,a491d9aaafe4..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -548,21 -261,15 +556,25 @@@ static int hmm_vma_handle_pte(struct mm
+  		swp_entry_t entry = pte_to_swp_entry(pte);
+  
+  		/*
+ -		 * Never fault in device private pages pages, but just report
+ -		 * the PFN even if not present.
+ +		 * This is a special swap entry, ignore migration, use
+ +		 * device and report anything else as error.
+  		 */
+++<<<<<<< HEAD
+ +		if (is_device_private_entry(entry)) {
+ +			cpu_flags = range->flags[HMM_PFN_VALID] |
+ +				range->flags[HMM_PFN_DEVICE_PRIVATE];
+ +			cpu_flags |= is_write_device_private_entry(entry) ?
+ +				range->flags[HMM_PFN_WRITE] : 0;
+ +			hmm_pte_need_fault(hmm_vma_walk, orig_pfn, cpu_flags,
+ +					   &fault, &write_fault);
+ +			if (fault || write_fault)
+ +				goto fault;
+++=======
++ 		if (hmm_is_device_private_entry(range, entry)) {
+++>>>>>>> 08ddddda667b (mm/hmm: check the device private page owner in hmm_range_fault())
+  			*pfn = hmm_device_entry_from_pfn(range,
+  					    swp_offset(entry));
+ -			*pfn |= range->flags[HMM_PFN_VALID];
+ -			if (is_write_device_private_entry(entry))
+ -				*pfn |= range->flags[HMM_PFN_WRITE];
+ +			*pfn |= cpu_flags;
+  			return 0;
+  		}
+  
+* Unmerged path drivers/gpu/drm/nouveau/nouveau_dmem.c
+* Unmerged path include/linux/hmm.h
+* Unmerged path mm/hmm.c
