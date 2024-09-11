@@ -1,0 +1,322 @@
+bpf: Move lnode list node to struct bpf_ksym
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit ecb60d1c670e9b205197d8e4381b19e77bc2d834
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ecb60d1c.failed
+
+Adding lnode list node to 'struct bpf_ksym' object,
+so the struct bpf_ksym itself can be chained and used
+in other objects like bpf_trampoline and bpf_dispatcher.
+
+Changing iterator to bpf_ksym in bpf_get_kallsym function.
+
+The ksym->start is holding the prog->bpf_func value,
+so it's ok to use it as value in bpf_get_kallsym.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20200312195610.346362-6-jolsa@kernel.org
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit ecb60d1c670e9b205197d8e4381b19e77bc2d834)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/core.c
+diff --cc include/linux/bpf.h
+index c1c99fdb999a,4fad2fa4135c..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -389,23 -414,253 +389,248 @@@ struct bpf_prog_stats 
+  	struct u64_stats_sync syncp;
+  } __aligned(2 * sizeof(u64));
+  
+++<<<<<<< HEAD
+++=======
++ struct btf_func_model {
++ 	u8 ret_size;
++ 	u8 nr_args;
++ 	u8 arg_size[MAX_BPF_FUNC_ARGS];
++ };
++ 
++ /* Restore arguments before returning from trampoline to let original function
++  * continue executing. This flag is used for fentry progs when there are no
++  * fexit progs.
++  */
++ #define BPF_TRAMP_F_RESTORE_REGS	BIT(0)
++ /* Call original function after fentry progs, but before fexit progs.
++  * Makes sense for fentry/fexit, normal calls and indirect calls.
++  */
++ #define BPF_TRAMP_F_CALL_ORIG		BIT(1)
++ /* Skip current frame and return to parent.  Makes sense for fentry/fexit
++  * programs only. Should not be used with normal calls and indirect calls.
++  */
++ #define BPF_TRAMP_F_SKIP_FRAME		BIT(2)
++ 
++ /* Each call __bpf_prog_enter + call bpf_func + call __bpf_prog_exit is ~50
++  * bytes on x86.  Pick a number to fit into BPF_IMAGE_SIZE / 2
++  */
++ #define BPF_MAX_TRAMP_PROGS 40
++ 
++ struct bpf_tramp_progs {
++ 	struct bpf_prog *progs[BPF_MAX_TRAMP_PROGS];
++ 	int nr_progs;
++ };
++ 
++ /* Different use cases for BPF trampoline:
++  * 1. replace nop at the function entry (kprobe equivalent)
++  *    flags = BPF_TRAMP_F_RESTORE_REGS
++  *    fentry = a set of programs to run before returning from trampoline
++  *
++  * 2. replace nop at the function entry (kprobe + kretprobe equivalent)
++  *    flags = BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_SKIP_FRAME
++  *    orig_call = fentry_ip + MCOUNT_INSN_SIZE
++  *    fentry = a set of program to run before calling original function
++  *    fexit = a set of program to run after original function
++  *
++  * 3. replace direct call instruction anywhere in the function body
++  *    or assign a function pointer for indirect call (like tcp_congestion_ops->cong_avoid)
++  *    With flags = 0
++  *      fentry = a set of programs to run before returning from trampoline
++  *    With flags = BPF_TRAMP_F_CALL_ORIG
++  *      orig_call = original callback addr or direct function addr
++  *      fentry = a set of program to run before calling original function
++  *      fexit = a set of program to run after original function
++  */
++ int arch_prepare_bpf_trampoline(void *image, void *image_end,
++ 				const struct btf_func_model *m, u32 flags,
++ 				struct bpf_tramp_progs *tprogs,
++ 				void *orig_call);
++ /* these two functions are called from generated trampoline */
++ u64 notrace __bpf_prog_enter(void);
++ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start);
++ 
++ struct bpf_ksym {
++ 	unsigned long		 start;
++ 	unsigned long		 end;
++ 	char			 name[KSYM_NAME_LEN];
++ 	struct list_head	 lnode;
++ };
++ 
++ enum bpf_tramp_prog_type {
++ 	BPF_TRAMP_FENTRY,
++ 	BPF_TRAMP_FEXIT,
++ 	BPF_TRAMP_MODIFY_RETURN,
++ 	BPF_TRAMP_MAX,
++ 	BPF_TRAMP_REPLACE, /* more than MAX */
++ };
++ 
++ struct bpf_trampoline {
++ 	/* hlist for trampoline_table */
++ 	struct hlist_node hlist;
++ 	/* serializes access to fields of this trampoline */
++ 	struct mutex mutex;
++ 	refcount_t refcnt;
++ 	u64 key;
++ 	struct {
++ 		struct btf_func_model model;
++ 		void *addr;
++ 		bool ftrace_managed;
++ 	} func;
++ 	/* if !NULL this is BPF_PROG_TYPE_EXT program that extends another BPF
++ 	 * program by replacing one of its functions. func.addr is the address
++ 	 * of the function it replaced.
++ 	 */
++ 	struct bpf_prog *extension_prog;
++ 	/* list of BPF programs using this trampoline */
++ 	struct hlist_head progs_hlist[BPF_TRAMP_MAX];
++ 	/* Number of attached programs. A counter per kind. */
++ 	int progs_cnt[BPF_TRAMP_MAX];
++ 	/* Executable image of trampoline */
++ 	void *image;
++ 	u64 selector;
++ };
++ 
++ #define BPF_DISPATCHER_MAX 48 /* Fits in 2048B */
++ 
++ struct bpf_dispatcher_prog {
++ 	struct bpf_prog *prog;
++ 	refcount_t users;
++ };
++ 
++ struct bpf_dispatcher {
++ 	/* dispatcher mutex */
++ 	struct mutex mutex;
++ 	void *func;
++ 	struct bpf_dispatcher_prog progs[BPF_DISPATCHER_MAX];
++ 	int num_progs;
++ 	void *image;
++ 	u32 image_off;
++ };
++ 
++ static __always_inline unsigned int bpf_dispatcher_nop_func(
++ 	const void *ctx,
++ 	const struct bpf_insn *insnsi,
++ 	unsigned int (*bpf_func)(const void *,
++ 				 const struct bpf_insn *))
++ {
++ 	return bpf_func(ctx, insnsi);
++ }
++ #ifdef CONFIG_BPF_JIT
++ struct bpf_trampoline *bpf_trampoline_lookup(u64 key);
++ int bpf_trampoline_link_prog(struct bpf_prog *prog);
++ int bpf_trampoline_unlink_prog(struct bpf_prog *prog);
++ void bpf_trampoline_put(struct bpf_trampoline *tr);
++ #define BPF_DISPATCHER_INIT(name) {			\
++ 	.mutex = __MUTEX_INITIALIZER(name.mutex),	\
++ 	.func = &name##_func,				\
++ 	.progs = {},					\
++ 	.num_progs = 0,					\
++ 	.image = NULL,					\
++ 	.image_off = 0					\
++ }
++ 
++ #define DEFINE_BPF_DISPATCHER(name)					\
++ 	noinline unsigned int bpf_dispatcher_##name##_func(		\
++ 		const void *ctx,					\
++ 		const struct bpf_insn *insnsi,				\
++ 		unsigned int (*bpf_func)(const void *,			\
++ 					 const struct bpf_insn *))	\
++ 	{								\
++ 		return bpf_func(ctx, insnsi);				\
++ 	}								\
++ 	EXPORT_SYMBOL(bpf_dispatcher_##name##_func);			\
++ 	struct bpf_dispatcher bpf_dispatcher_##name =			\
++ 		BPF_DISPATCHER_INIT(bpf_dispatcher_##name);
++ #define DECLARE_BPF_DISPATCHER(name)					\
++ 	unsigned int bpf_dispatcher_##name##_func(			\
++ 		const void *ctx,					\
++ 		const struct bpf_insn *insnsi,				\
++ 		unsigned int (*bpf_func)(const void *,			\
++ 					 const struct bpf_insn *));	\
++ 	extern struct bpf_dispatcher bpf_dispatcher_##name;
++ #define BPF_DISPATCHER_FUNC(name) bpf_dispatcher_##name##_func
++ #define BPF_DISPATCHER_PTR(name) (&bpf_dispatcher_##name)
++ void bpf_dispatcher_change_prog(struct bpf_dispatcher *d, struct bpf_prog *from,
++ 				struct bpf_prog *to);
++ struct bpf_image {
++ 	struct latch_tree_node tnode;
++ 	unsigned char data[];
++ };
++ #define BPF_IMAGE_SIZE (PAGE_SIZE - sizeof(struct bpf_image))
++ bool is_bpf_image_address(unsigned long address);
++ void *bpf_image_alloc(void);
++ #else
++ static inline struct bpf_trampoline *bpf_trampoline_lookup(u64 key)
++ {
++ 	return NULL;
++ }
++ static inline int bpf_trampoline_link_prog(struct bpf_prog *prog)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int bpf_trampoline_unlink_prog(struct bpf_prog *prog)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline void bpf_trampoline_put(struct bpf_trampoline *tr) {}
++ #define DEFINE_BPF_DISPATCHER(name)
++ #define DECLARE_BPF_DISPATCHER(name)
++ #define BPF_DISPATCHER_FUNC(name) bpf_dispatcher_nop_func
++ #define BPF_DISPATCHER_PTR(name) NULL
++ static inline void bpf_dispatcher_change_prog(struct bpf_dispatcher *d,
++ 					      struct bpf_prog *from,
++ 					      struct bpf_prog *to) {}
++ static inline bool is_bpf_image_address(unsigned long address)
++ {
++ 	return false;
++ }
++ #endif
++ 
++ struct bpf_func_info_aux {
++ 	u16 linkage;
++ 	bool unreliable;
++ };
++ 
++ enum bpf_jit_poke_reason {
++ 	BPF_POKE_REASON_TAIL_CALL,
++ };
++ 
++ /* Descriptor of pokes pointing /into/ the JITed image. */
++ struct bpf_jit_poke_descriptor {
++ 	void *ip;
++ 	union {
++ 		struct {
++ 			struct bpf_map *map;
++ 			u32 key;
++ 		} tail_call;
++ 	};
++ 	bool ip_stable;
++ 	u8 adj_off;
++ 	u16 reason;
++ };
++ 
+++>>>>>>> ecb60d1c670e (bpf: Move lnode list node to struct bpf_ksym)
+  struct bpf_prog_aux {
+ -	atomic64_t refcnt;
+ +	atomic_t refcnt;
+  	u32 used_map_cnt;
+  	u32 max_ctx_offset;
+ -	u32 max_pkt_offset;
+ -	u32 max_tp_access;
+ +	/* not protected by KABI, safe to extend in the middle */
+ +	RH_KABI_BROKEN_INSERT(u32 max_pkt_offset)
+ +	RH_KABI_BROKEN_INSERT(u32 max_tp_access)
+  	u32 stack_depth;
+  	u32 id;
+  	u32 func_cnt; /* used by non-func prog as the number of func progs */
+ -	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
+ -	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
+ -	struct bpf_prog *linked_prog;
+ -	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
+ +	RH_KABI_BROKEN_INSERT(u32 func_idx) /* 0 for non-func prog, the index in func array for func prog */
+ +	RH_KABI_BROKEN_INSERT(bool verifier_zext) /* Zero extensions has been inserted by verifier. */
+  	bool offload_requested;
+ -	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
+ -	bool func_proto_unreliable;
+ -	enum bpf_tramp_prog_type trampoline_prog_type;
+ -	struct bpf_trampoline *trampoline;
+ -	struct hlist_node tramp_hlist;
+ -	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
+ -	const struct btf_type *attach_func_proto;
+ -	/* function name for valid attach_btf_id */
+ -	const char *attach_func_name;
+  	struct bpf_prog **func;
+  	void *jit_data; /* JIT specific data. arch dependent */
+ -	struct bpf_jit_poke_descriptor *poke_tab;
+ -	u32 size_poke_tab;
+  	struct latch_tree_node ksym_tnode;
+++<<<<<<< HEAD
+ +	struct list_head ksym_lnode;
+++=======
++ 	struct bpf_ksym ksym;
+++>>>>>>> ecb60d1c670e (bpf: Move lnode list node to struct bpf_ksym)
+  	const struct bpf_prog_ops *ops;
+  	struct bpf_map **used_maps;
+  	struct bpf_prog *prog;
+diff --cc kernel/bpf/core.c
+index 5381636b23b4,5eb5d5bb7a95..000000000000
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@@ -747,9 -741,9 +747,13 @@@ int bpf_get_kallsym(unsigned int symnum
+  		if (it++ != symnum)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		bpf_get_prog_name(aux->prog, sym);
+++=======
++ 		strncpy(sym, ksym->name, KSYM_NAME_LEN);
+++>>>>>>> ecb60d1c670e (bpf: Move lnode list node to struct bpf_ksym)
+  
+- 		*value = (unsigned long)aux->prog->bpf_func;
++ 		*value = ksym->start;
+  		*type  = BPF_SYM_ELF_TYPE;
+  
+  		ret = 0;
+* Unmerged path include/linux/bpf.h
+* Unmerged path kernel/bpf/core.c
