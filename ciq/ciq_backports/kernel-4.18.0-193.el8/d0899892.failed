@@ -1,0 +1,558 @@
+RDMA/device: Provide APIs from the core code to help unregistration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit d0899892edd089790eb17943ecf28254a909deae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d0899892.failed
+
+These APIs are intended to support drivers that exist outside the usual
+driver core probe()/remove() callbacks. Normally the driver core will
+prevent remove() from running concurrently with probe(), once this safety
+is lost drivers need more support to get the locking and lifetimes right.
+
+ib_unregister_driver() is intended to be used during module_exit of a
+driver using these APIs. It unregisters all the associated ib_devices.
+
+ib_unregister_device_and_put() is to be used by a driver-specific removal
+function (ie removal by name, removal from a netdev notifier, removal from
+netlink)
+
+ib_unregister_queued() is to be used from netdev notifier chains where
+RTNL is held.
+
+The locking is tricky here since once things become async it is possible
+to race unregister with registration. This is largely solved by relying on
+the registration refcount, unregistration will only ever work on something
+that has a positive registration refcount - and then an unregistration
+mutex serializes all competing unregistrations of the same device.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit d0899892edd089790eb17943ecf28254a909deae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/device.c
+index 8641d8bca5aa,e470fa651961..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -72,21 -94,54 +72,52 @@@ static LIST_HEAD(device_list)
+  static LIST_HEAD(client_list);
+  #define CLIENT_REGISTERED XA_MARK_1
+  static DEFINE_XARRAY_FLAGS(clients, XA_FLAGS_ALLOC);
+ -static DECLARE_RWSEM(clients_rwsem);
+  
+  /*
+ - * If client_data is registered then the corresponding client must also still
+ - * be registered.
+ - */
+ -#define CLIENT_DATA_REGISTERED XA_MARK_1
+ -/*
+ - * xarray has this behavior where it won't iterate over NULL values stored in
+ - * allocated arrays.  So we need our own iterator to see all values stored in
+ - * the array. This does the same thing as xa_for_each except that it also
+ - * returns NULL valued entries if the array is allocating. Simplified to only
+ - * work on simple xarrays.
+ + * device_mutex and lists_rwsem protect access to both device_list and
+ + * clients.  device_mutex protects writer access by device and client
+ + * registration / de-registration.  lists_rwsem protects reader access to
+ + * these lists.  Iterators of these lists must lock it for read, while updates
+ + * to the lists must be done with a write lock. A special case is when the
+ + * device_mutex is locked. In this case locking the lists for read access is
+ + * not necessary as the device_mutex implies it.
+ + *
+ + * lists_rwsem also protects access to the client data list.
+   */
+ -static void *xan_find_marked(struct xarray *xa, unsigned long *indexp,
+ -			     xa_mark_t filter)
+ -{
+ -	XA_STATE(xas, xa, *indexp);
+ -	void *entry;
+ +static DEFINE_MUTEX(device_mutex);
+ +static DECLARE_RWSEM(lists_rwsem);
+  
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_lock();
++ 	do {
++ 		entry = xas_find_marked(&xas, ULONG_MAX, filter);
++ 		if (xa_is_zero(entry))
++ 			break;
++ 	} while (xas_retry(&xas, entry));
++ 	rcu_read_unlock();
++ 
++ 	if (entry) {
++ 		*indexp = xas.xa_index;
++ 		if (xa_is_zero(entry))
++ 			return NULL;
++ 		return entry;
++ 	}
++ 	return XA_ERROR(-ENOENT);
++ }
++ #define xan_for_each_marked(xa, index, entry, filter)                          \
++ 	for (index = 0, entry = xan_find_marked(xa, &(index), filter);         \
++ 	     !xa_is_err(entry);                                                \
++ 	     (index)++, entry = xan_find_marked(xa, &(index), filter))
++ 
++ /* RCU hash table mapping netdevice pointers to struct ib_port_data */
++ static DEFINE_SPINLOCK(ndev_hash_lock);
++ static DECLARE_HASHTABLE(ndev_hash, 5);
++ 
++ static void free_netdevs(struct ib_device *ib_dev);
++ static void ib_unregister_work(struct work_struct *work);
++ static void __ib_unregister_device(struct ib_device *device);
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  static int ib_security_change(struct notifier_block *nb, unsigned long event,
+  			      void *lsm_data);
+  static void ib_policy_change_task(struct work_struct *work);
+@@@ -306,10 -368,16 +337,21 @@@ struct ib_device *_ib_alloc_device(size
+  
+  	INIT_LIST_HEAD(&device->event_handler_list);
+  	spin_lock_init(&device->event_handler_lock);
+++<<<<<<< HEAD
+ +	rwlock_init(&device->client_data_lock);
+ +	INIT_LIST_HEAD(&device->client_data_list);
+++=======
++ 	mutex_init(&device->unregistration_lock);
++ 	/*
++ 	 * client_data needs to be alloc because we don't want our mark to be
++ 	 * destroyed if the user stores NULL in the client data.
++ 	 */
++ 	xa_init_flags(&device->client_data, XA_FLAGS_ALLOC);
++ 	init_rwsem(&device->client_data_rwsem);
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  	INIT_LIST_HEAD(&device->port_list);
+  	init_completion(&device->unreg_completion);
++ 	INIT_WORK(&device->unregistration_work, ib_unregister_work);
+  
+  	return device;
+  }
+@@@ -323,7 -391,24 +365,28 @@@ EXPORT_SYMBOL(_ib_alloc_device)
+   */
+  void ib_dealloc_device(struct ib_device *device)
+  {
+++<<<<<<< HEAD
+ +	WARN_ON(!list_empty(&device->client_data_list));
+++=======
++ 	if (device->ops.dealloc_driver)
++ 		device->ops.dealloc_driver(device);
++ 
++ 	/*
++ 	 * ib_unregister_driver() requires all devices to remain in the xarray
++ 	 * while their ops are callable. The last op we call is dealloc_driver
++ 	 * above.  This is needed to create a fence on op callbacks prior to
++ 	 * allowing the driver module to unload.
++ 	 */
++ 	down_write(&devices_rwsem);
++ 	if (xa_load(&devices, device->index) == device)
++ 		xa_erase(&devices, device->index);
++ 	up_write(&devices_rwsem);
++ 
++ 	/* Expedite releasing netdev references */
++ 	free_netdevs(device);
++ 
++ 	WARN_ON(!xa_empty(&device->client_data));
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  	WARN_ON(refcount_read(&device->refcount));
+  	rdma_restrack_clean(device);
+  	/* Balances with device_initialize */
+@@@ -462,28 -616,47 +525,56 @@@ static int ib_security_change(struct no
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + *	__dev_new_index	-	allocate an device index
+ + *
+ + *	Returns a suitable unique value for a new device interface
+ + *	number.  It assumes that there are less than 2^32-1 ib devices
+ + *	will be present in the system.
+++=======
++ /*
++  * Assign the unique string device name and the unique device index. This is
++  * undone by ib_dealloc_device.
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+   */
+ -static int assign_name(struct ib_device *device, const char *name)
+ +static u32 __dev_new_index(void)
+  {
+ -	static u32 last_id;
+ -	int ret;
+ +	/*
+ +	 * The device index to allow stable naming.
+ +	 * Similar to struct net -> ifindex.
+ +	 */
+ +	static u32 index;
+  
+ -	down_write(&devices_rwsem);
+ -	/* Assign a unique name to the device */
+ -	if (strchr(name, '%'))
+ -		ret = alloc_name(device, name);
+ -	else
+ -		ret = dev_set_name(&device->dev, name);
+ -	if (ret)
+ -		goto out;
+ +	for (;;) {
+ +		if (!(++index))
+ +			index = 1;
+  
+ -	if (__ib_device_get_by_name(dev_name(&device->dev))) {
+ -		ret = -ENFILE;
+ -		goto out;
+ +		if (!__ib_device_get_by_index(index))
+ +			return index;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	strlcpy(device->name, dev_name(&device->dev), IB_DEVICE_NAME_MAX);
++ 
++ 	/* Cyclically allocate a user visible ID for the device */
++ 	device->index = last_id;
++ 	ret = xa_alloc(&devices, &device->index, INT_MAX, device, GFP_KERNEL);
++ 	if (ret == -ENOSPC) {
++ 		device->index = 0;
++ 		ret = xa_alloc(&devices, &device->index, INT_MAX, device,
++ 			       GFP_KERNEL);
++ 	}
++ 	if (ret)
++ 		goto out;
++ 	last_id = device->index + 1;
++ 
++ 	ret = 0;
++ 
++ out:
++ 	up_write(&devices_rwsem);
++ 	return ret;
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  }
+  
+  static void setup_dma_device(struct ib_device *device)
+@@@ -545,13 -724,66 +636,76 @@@ static int setup_device(struct ib_devic
+  		return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = setup_port_pkey_list(device);
+ +	if (ret) {
+ +		dev_warn(&device->dev, "Couldn't create per port_pkey_list\n");
+ +		return ret;
+ +	}
+ +
+ +	return 0;
+++=======
++ 	return 0;
++ }
++ 
++ static void disable_device(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 
++ 	WARN_ON(!refcount_read(&device->refcount));
++ 
++ 	down_write(&devices_rwsem);
++ 	xa_clear_mark(&devices, device->index, DEVICE_REGISTERED);
++ 	up_write(&devices_rwsem);
++ 
++ 	down_read(&clients_rwsem);
++ 	list_for_each_entry_reverse(client, &client_list, list)
++ 		remove_client_context(device, client->client_id);
++ 	up_read(&clients_rwsem);
++ 
++ 	/* Pairs with refcount_set in enable_device */
++ 	ib_device_put(device);
++ 	wait_for_completion(&device->unreg_completion);
++ 
++ 	/* Expedite removing unregistered pointers from the hash table */
++ 	free_netdevs(device);
++ }
++ 
++ /*
++  * An enabled device is visible to all clients and to all the public facing
++  * APIs that return a device pointer. This always returns with a new get, even
++  * if it fails.
++  */
++ static int enable_device_and_get(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * One ref belongs to the xa and the other belongs to this
++ 	 * thread. This is needed to guard against parallel unregistration.
++ 	 */
++ 	refcount_set(&device->refcount, 2);
++ 	down_write(&devices_rwsem);
++ 	xa_set_mark(&devices, device->index, DEVICE_REGISTERED);
++ 
++ 	/*
++ 	 * By using downgrade_write() we ensure that no other thread can clear
++ 	 * DEVICE_REGISTERED while we are completing the client setup.
++ 	 */
++ 	downgrade_write(&devices_rwsem);
++ 
++ 	down_read(&clients_rwsem);
++ 	xa_for_each_marked (&clients, index, client, CLIENT_REGISTERED) {
++ 		ret = add_client_context(device, client);
++ 		if (ret)
++ 			break;
++ 	}
++ 	up_read(&clients_rwsem);
++ 	up_read(&devices_rwsem);
++ 	return ret;
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  }
+  
+  /**
+@@@ -596,97 -815,108 +754,177 @@@ int ib_register_device(struct ib_devic
+  	if (ret) {
+  		dev_warn(&device->dev,
+  			 "Couldn't set up InfiniBand P_Key/GID cache\n");
+- 		goto out;
++ 		return ret;
+  	}
+  
+ -	ib_device_register_rdmacg(device);
+ +	device->index = __dev_new_index();
+  
+ -	ret = device_add(&device->dev);
+ -	if (ret)
+ -		goto cg_cleanup;
+ +	ret = ib_device_register_rdmacg(device);
+ +	if (ret) {
+ +		dev_warn(&device->dev,
+ +			 "Couldn't register device with rdma cgroup\n");
+ +		goto dev_cleanup;
+ +	}
+  
+  	ret = ib_device_register_sysfs(device);
+  	if (ret) {
+  		dev_warn(&device->dev,
+  			 "Couldn't register device with driver model\n");
+ -		goto dev_cleanup;
+ +		goto cg_cleanup;
+  	}
+  
+++<<<<<<< HEAD
+ +	refcount_set(&device->refcount, 1);
+++=======
++ 	ret = enable_device_and_get(device);
++ 	if (ret) {
++ 		void (*dealloc_fn)(struct ib_device *);
++ 
++ 		/*
++ 		 * If we hit this error flow then we don't want to
++ 		 * automatically dealloc the device since the caller is
++ 		 * expected to call ib_dealloc_device() after
++ 		 * ib_register_device() fails. This is tricky due to the
++ 		 * possibility for a parallel unregistration along with this
++ 		 * error flow. Since we have a refcount here we know any
++ 		 * parallel flow is stopped in disable_device and will see the
++ 		 * NULL pointers, causing the responsibility to
++ 		 * ib_dealloc_device() to revert back to this thread.
++ 		 */
++ 		dealloc_fn = device->ops.dealloc_driver;
++ 		device->ops.dealloc_driver = NULL;
++ 		ib_device_put(device);
++ 		__ib_unregister_device(device);
++ 		device->ops.dealloc_driver = dealloc_fn;
++ 		return ret;
++ 	}
++ 	ib_device_put(device);
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  
+ +	xa_for_each_marked (&clients, index, client, CLIENT_REGISTERED)
+ +		if (!add_client_context(device, client) && client->add)
+ +			client->add(device);
+ +
+ +	down_write(&lists_rwsem);
+ +	list_add_tail(&device->core_list, &device_list);
+ +	up_write(&lists_rwsem);
+ +	mutex_unlock(&device_mutex);
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ dev_cleanup:
++ 	device_del(&device->dev);
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  cg_cleanup:
+  	ib_device_unregister_rdmacg(device);
+ +dev_cleanup:
+  	ib_cache_cleanup_one(device);
+++<<<<<<< HEAD
+ +out:
+ +	mutex_unlock(&device_mutex);
+++=======
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  	return ret;
+  }
+  EXPORT_SYMBOL(ib_register_device);
+  
++ /* Callers must hold a get on the device. */
++ static void __ib_unregister_device(struct ib_device *ib_dev)
++ {
++ 	/*
++ 	 * We have a registration lock so that all the calls to unregister are
++ 	 * fully fenced, once any unregister returns the device is truely
++ 	 * unregistered even if multiple callers are unregistering it at the
++ 	 * same time. This also interacts with the registration flow and
++ 	 * provides sane semantics if register and unregister are racing.
++ 	 */
++ 	mutex_lock(&ib_dev->unregistration_lock);
++ 	if (!refcount_read(&ib_dev->refcount))
++ 		goto out;
++ 
++ 	disable_device(ib_dev);
++ 	ib_device_unregister_sysfs(ib_dev);
++ 	device_del(&ib_dev->dev);
++ 	ib_device_unregister_rdmacg(ib_dev);
++ 	ib_cache_cleanup_one(ib_dev);
++ 
++ 	/*
++ 	 * Drivers using the new flow may not call ib_dealloc_device except
++ 	 * in error unwind prior to registration success.
++ 	 */
++ 	if (ib_dev->ops.dealloc_driver) {
++ 		WARN_ON(kref_read(&ib_dev->dev.kobj.kref) <= 1);
++ 		ib_dealloc_device(ib_dev);
++ 	}
++ out:
++ 	mutex_unlock(&ib_dev->unregistration_lock);
++ }
++ 
+  /**
+   * ib_unregister_device - Unregister an IB device
+-  * @device:Device to unregister
++  * @device: The device to unregister
+   *
+   * Unregister an IB device.  All clients will receive a remove callback.
++  *
++  * Callers should call this routine only once, and protect against races with
++  * registration. Typically it should only be called as part of a remove
++  * callback in an implementation of driver core's struct device_driver and
++  * related.
++  *
++  * If ops.dealloc_driver is used then ib_dev will be freed upon return from
++  * this function.
+   */
+- void ib_unregister_device(struct ib_device *device)
++ void ib_unregister_device(struct ib_device *ib_dev)
+  {
+++<<<<<<< HEAD
+ +	struct ib_client_data *context, *tmp;
+ +	unsigned long flags;
+ +
+ +	/*
+ +	 * Wait for all netlink command callers to finish working on the
+ +	 * device.
+ +	 */
+ +	ib_device_put(device);
+ +	wait_for_completion(&device->unreg_completion);
+ +
+ +	mutex_lock(&device_mutex);
+ +
+ +	down_write(&lists_rwsem);
+ +	list_del(&device->core_list);
+ +	write_lock_irq(&device->client_data_lock);
+ +	list_for_each_entry(context, &device->client_data_list, list)
+ +		context->going_down = true;
+ +	write_unlock_irq(&device->client_data_lock);
+ +	downgrade_write(&lists_rwsem);
+ +
+ +	list_for_each_entry(context, &device->client_data_list, list) {
+ +		if (context->client->remove)
+ +			context->client->remove(device, context->data);
+ +	}
+ +	up_read(&lists_rwsem);
+ +
+ +	ib_device_unregister_sysfs(device);
+ +	ib_device_unregister_rdmacg(device);
+ +
+ +	mutex_unlock(&device_mutex);
+ +
+ +	ib_cache_cleanup_one(device);
+ +
+ +	down_write(&lists_rwsem);
+ +	write_lock_irqsave(&device->client_data_lock, flags);
+ +	list_for_each_entry_safe(context, tmp, &device->client_data_list,
+ +				 list) {
+ +		list_del(&context->list);
+ +		kfree(context);
+ +	}
+ +	write_unlock_irqrestore(&device->client_data_lock, flags);
+ +	up_write(&lists_rwsem);
+++=======
++ 	get_device(&ib_dev->dev);
++ 	__ib_unregister_device(ib_dev);
++ 	put_device(&ib_dev->dev);
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  }
+  EXPORT_SYMBOL(ib_unregister_device);
+  
+@@@ -1465,7 -1913,9 +1795,8 @@@ static void __exit ib_core_cleanup(void
+  	destroy_workqueue(ib_comp_wq);
+  	/* Make sure that any pending umem accounting work is done. */
+  	destroy_workqueue(ib_wq);
++ 	flush_workqueue(system_unbound_wq);
+  	WARN_ON(!xa_empty(&clients));
+ -	WARN_ON(!xa_empty(&devices));
+  }
+  
+  MODULE_ALIAS_RDMA_NETLINK(RDMA_NL_LS, 4);
+diff --cc include/rdma/ib_verbs.h
+index 2ff74f11eec0,ad83f8c38dc8..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2525,8 -2532,23 +2525,24 @@@ struct ib_device_ops 
+  	 */
+  	int (*init_port)(struct ib_device *device, u8 port_num,
+  			 struct kobject *port_sysfs);
+++<<<<<<< HEAD
+++=======
++ 	/**
++ 	 * Allows rdma drivers to add their own restrack attributes.
++ 	 */
++ 	int (*fill_res_entry)(struct sk_buff *msg,
++ 			      struct rdma_restrack_entry *entry);
++ 
++ 	/* Device lifecycle callbacks */
++ 	/*
++ 	 * This is called as part of ib_dealloc_device().
++ 	 */
++ 	void (*dealloc_driver)(struct ib_device *dev);
++ 
++ 	DECLARE_RDMA_OBJ_SIZE(ib_pd);
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  };
+  
+ -struct rdma_restrack_root;
+ -
+  struct ib_device {
+  	/* Do not access @dma_device directly from ULP nor from HW drivers. */
+  	struct device                *dma_device;
+@@@ -2536,12 -2559,9 +2552,18 @@@
+  	struct list_head              event_handler_list;
+  	spinlock_t                    event_handler_lock;
+  
+++<<<<<<< HEAD
+ +	rwlock_t			client_data_lock;
+ +	struct list_head              core_list;
+ +	/* Access to the client_data_list is protected by the client_data_lock
+ +	 * rwlock and the lists_rwsem read-write semaphore
+ +	 */
+ +	struct list_head              client_data_list;
+++=======
++ 	struct rw_semaphore	      client_data_rwsem;
++ 	struct xarray                 client_data;
++ 	struct mutex                  unregistration_lock;
+++>>>>>>> d0899892edd0 (RDMA/device: Provide APIs from the core code to help unregistration)
+  
+  	struct ib_cache               cache;
+  	/**
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path include/rdma/ib_verbs.h
