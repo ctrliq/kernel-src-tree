@@ -1,0 +1,296 @@
+xfs: support bulk loading of staged btrees
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 60e3d7070749554227fbb636a69a4282ab930f86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/60e3d707.failed
+
+Add a new btree function that enables us to bulk load a btree cursor.
+This will be used by the upcoming online repair patches to generate new
+btrees.  This avoids the programmatic inefficiency of calling
+xfs_btree_insert in a loop (which generates a lot of log traffic) in
+favor of stamping out new btree blocks with ordered buffers, and then
+committing both the new root and scheduling the removal of the old btree
+blocks in a single transaction commit.
+
+The design of this new generic code is based off the btree rebuilding
+code in xfs_repair's phase 5 code, with the explicit goal of enabling us
+to share that code between scrub and repair.  It has the additional
+feature of being able to control btree block loading factors.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit 60e3d7070749554227fbb636a69a4282ab930f86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_btree_staging.c
+#	fs/xfs/libxfs/xfs_btree_staging.h
+#	fs/xfs/xfs_trace.h
+diff --cc fs/xfs/xfs_trace.h
+index ca668ca52fc1,efc7751550d9..000000000000
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@@ -3605,6 -3606,151 +3606,154 @@@ TRACE_EVENT(xfs_check_new_dalign
+  		  __entry->calc_rootino)
+  )
+  
+++<<<<<<< HEAD
+++=======
++ TRACE_EVENT(xfs_btree_commit_afakeroot,
++ 	TP_PROTO(struct xfs_btree_cur *cur),
++ 	TP_ARGS(cur),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_btnum_t, btnum)
++ 		__field(xfs_agnumber_t, agno)
++ 		__field(xfs_agblock_t, agbno)
++ 		__field(unsigned int, levels)
++ 		__field(unsigned int, blocks)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = cur->bc_mp->m_super->s_dev;
++ 		__entry->btnum = cur->bc_btnum;
++ 		__entry->agno = cur->bc_ag.agno;
++ 		__entry->agbno = cur->bc_ag.afake->af_root;
++ 		__entry->levels = cur->bc_ag.afake->af_levels;
++ 		__entry->blocks = cur->bc_ag.afake->af_blocks;
++ 	),
++ 	TP_printk("dev %d:%d btree %s ag %u levels %u blocks %u root %u",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
++ 		  __entry->agno,
++ 		  __entry->levels,
++ 		  __entry->blocks,
++ 		  __entry->agbno)
++ )
++ 
++ TRACE_EVENT(xfs_btree_commit_ifakeroot,
++ 	TP_PROTO(struct xfs_btree_cur *cur),
++ 	TP_ARGS(cur),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_btnum_t, btnum)
++ 		__field(xfs_agnumber_t, agno)
++ 		__field(xfs_agino_t, agino)
++ 		__field(unsigned int, levels)
++ 		__field(unsigned int, blocks)
++ 		__field(int, whichfork)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = cur->bc_mp->m_super->s_dev;
++ 		__entry->btnum = cur->bc_btnum;
++ 		__entry->agno = XFS_INO_TO_AGNO(cur->bc_mp,
++ 					cur->bc_ino.ip->i_ino);
++ 		__entry->agino = XFS_INO_TO_AGINO(cur->bc_mp,
++ 					cur->bc_ino.ip->i_ino);
++ 		__entry->levels = cur->bc_ino.ifake->if_levels;
++ 		__entry->blocks = cur->bc_ino.ifake->if_blocks;
++ 		__entry->whichfork = cur->bc_ino.whichfork;
++ 	),
++ 	TP_printk("dev %d:%d btree %s ag %u agino %u whichfork %s levels %u blocks %u",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
++ 		  __entry->agno,
++ 		  __entry->agino,
++ 		  __entry->whichfork == XFS_ATTR_FORK ? "attr" : "data",
++ 		  __entry->levels,
++ 		  __entry->blocks)
++ )
++ 
++ TRACE_EVENT(xfs_btree_bload_level_geometry,
++ 	TP_PROTO(struct xfs_btree_cur *cur, unsigned int level,
++ 		 uint64_t nr_this_level, unsigned int nr_per_block,
++ 		 unsigned int desired_npb, uint64_t blocks,
++ 		 uint64_t blocks_with_extra),
++ 	TP_ARGS(cur, level, nr_this_level, nr_per_block, desired_npb, blocks,
++ 		blocks_with_extra),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_btnum_t, btnum)
++ 		__field(unsigned int, level)
++ 		__field(unsigned int, nlevels)
++ 		__field(uint64_t, nr_this_level)
++ 		__field(unsigned int, nr_per_block)
++ 		__field(unsigned int, desired_npb)
++ 		__field(unsigned long long, blocks)
++ 		__field(unsigned long long, blocks_with_extra)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = cur->bc_mp->m_super->s_dev;
++ 		__entry->btnum = cur->bc_btnum;
++ 		__entry->level = level;
++ 		__entry->nlevels = cur->bc_nlevels;
++ 		__entry->nr_this_level = nr_this_level;
++ 		__entry->nr_per_block = nr_per_block;
++ 		__entry->desired_npb = desired_npb;
++ 		__entry->blocks = blocks;
++ 		__entry->blocks_with_extra = blocks_with_extra;
++ 	),
++ 	TP_printk("dev %d:%d btree %s level %u/%u nr_this_level %llu nr_per_block %u desired_npb %u blocks %llu blocks_with_extra %llu",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
++ 		  __entry->level,
++ 		  __entry->nlevels,
++ 		  __entry->nr_this_level,
++ 		  __entry->nr_per_block,
++ 		  __entry->desired_npb,
++ 		  __entry->blocks,
++ 		  __entry->blocks_with_extra)
++ )
++ 
++ TRACE_EVENT(xfs_btree_bload_block,
++ 	TP_PROTO(struct xfs_btree_cur *cur, unsigned int level,
++ 		 uint64_t block_idx, uint64_t nr_blocks,
++ 		 union xfs_btree_ptr *ptr, unsigned int nr_records),
++ 	TP_ARGS(cur, level, block_idx, nr_blocks, ptr, nr_records),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_btnum_t, btnum)
++ 		__field(unsigned int, level)
++ 		__field(unsigned long long, block_idx)
++ 		__field(unsigned long long, nr_blocks)
++ 		__field(xfs_agnumber_t, agno)
++ 		__field(xfs_agblock_t, agbno)
++ 		__field(unsigned int, nr_records)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = cur->bc_mp->m_super->s_dev;
++ 		__entry->btnum = cur->bc_btnum;
++ 		__entry->level = level;
++ 		__entry->block_idx = block_idx;
++ 		__entry->nr_blocks = nr_blocks;
++ 		if (cur->bc_flags & XFS_BTREE_LONG_PTRS) {
++ 			xfs_fsblock_t	fsb = be64_to_cpu(ptr->l);
++ 
++ 			__entry->agno = XFS_FSB_TO_AGNO(cur->bc_mp, fsb);
++ 			__entry->agbno = XFS_FSB_TO_AGBNO(cur->bc_mp, fsb);
++ 		} else {
++ 			__entry->agno = cur->bc_ag.agno;
++ 			__entry->agbno = be32_to_cpu(ptr->s);
++ 		}
++ 		__entry->nr_records = nr_records;
++ 	),
++ 	TP_printk("dev %d:%d btree %s level %u block %llu/%llu fsb (%u/%u) recs %u",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
++ 		  __entry->level,
++ 		  __entry->block_idx,
++ 		  __entry->nr_blocks,
++ 		  __entry->agno,
++ 		  __entry->agbno,
++ 		  __entry->nr_records)
++ )
++ 
+++>>>>>>> 60e3d7070749 (xfs: support bulk loading of staged btrees)
+  #endif /* _TRACE_XFS_H */
+  
+  #undef TRACE_INCLUDE_PATH
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.c
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.h
+diff --git a/fs/xfs/libxfs/xfs_btree.c b/fs/xfs/libxfs/xfs_btree.c
+index 66c162ec3227..4e1ac7022832 100644
+--- a/fs/xfs/libxfs/xfs_btree.c
++++ b/fs/xfs/libxfs/xfs_btree.c
+@@ -1005,7 +1005,7 @@ xfs_btree_ptr_is_null(
+ 		return ptr->s == cpu_to_be32(NULLAGBLOCK);
+ }
+ 
+-STATIC void
++void
+ xfs_btree_set_ptr_null(
+ 	struct xfs_btree_cur	*cur,
+ 	union xfs_btree_ptr	*ptr)
+@@ -1041,7 +1041,7 @@ xfs_btree_get_sibling(
+ 	}
+ }
+ 
+-STATIC void
++void
+ xfs_btree_set_sibling(
+ 	struct xfs_btree_cur	*cur,
+ 	struct xfs_btree_block	*block,
+@@ -1119,7 +1119,7 @@ xfs_btree_init_block(
+ 				 btnum, level, numrecs, owner, 0);
+ }
+ 
+-STATIC void
++void
+ xfs_btree_init_block_cur(
+ 	struct xfs_btree_cur	*cur,
+ 	struct xfs_buf		*bp,
+@@ -1211,7 +1211,7 @@ xfs_btree_set_refs(
+ 	}
+ }
+ 
+-STATIC int
++int
+ xfs_btree_get_buf_block(
+ 	struct xfs_btree_cur	*cur,
+ 	union xfs_btree_ptr	*ptr,
+@@ -1271,7 +1271,7 @@ xfs_btree_read_buf_block(
+ /*
+  * Copy keys from one btree block to another.
+  */
+-STATIC void
++void
+ xfs_btree_copy_keys(
+ 	struct xfs_btree_cur	*cur,
+ 	union xfs_btree_key	*dst_key,
+@@ -1299,11 +1299,11 @@ xfs_btree_copy_recs(
+ /*
+  * Copy block pointers from one btree block to another.
+  */
+-STATIC void
++void
+ xfs_btree_copy_ptrs(
+ 	struct xfs_btree_cur	*cur,
+ 	union xfs_btree_ptr	*dst_ptr,
+-	union xfs_btree_ptr	*src_ptr,
++	const union xfs_btree_ptr *src_ptr,
+ 	int			numptrs)
+ {
+ 	ASSERT(numptrs >= 0);
+diff --git a/fs/xfs/libxfs/xfs_btree.h b/fs/xfs/libxfs/xfs_btree.h
+index 4a1c98bdfaad..8a47c231ac01 100644
+--- a/fs/xfs/libxfs/xfs_btree.h
++++ b/fs/xfs/libxfs/xfs_btree.h
+@@ -514,4 +514,20 @@ xfs_btree_islastblock(
+ 	return block->bb_u.s.bb_rightsib == cpu_to_be32(NULLAGBLOCK);
+ }
+ 
++void xfs_btree_set_ptr_null(struct xfs_btree_cur *cur,
++		union xfs_btree_ptr *ptr);
++int xfs_btree_get_buf_block(struct xfs_btree_cur *cur, union xfs_btree_ptr *ptr,
++		struct xfs_btree_block **block, struct xfs_buf **bpp);
++void xfs_btree_set_sibling(struct xfs_btree_cur *cur,
++		struct xfs_btree_block *block, union xfs_btree_ptr *ptr,
++		int lr);
++void xfs_btree_init_block_cur(struct xfs_btree_cur *cur,
++		struct xfs_buf *bp, int level, int numrecs);
++void xfs_btree_copy_ptrs(struct xfs_btree_cur *cur,
++		union xfs_btree_ptr *dst_ptr,
++		const union xfs_btree_ptr *src_ptr, int numptrs);
++void xfs_btree_copy_keys(struct xfs_btree_cur *cur,
++		union xfs_btree_key *dst_key, union xfs_btree_key *src_key,
++		int numkeys);
++
+ #endif	/* __XFS_BTREE_H__ */
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.c
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.h
+diff --git a/fs/xfs/xfs_trace.c b/fs/xfs/xfs_trace.c
+index bc85b89f88ca..9b5e58a92381 100644
+--- a/fs/xfs/xfs_trace.c
++++ b/fs/xfs/xfs_trace.c
+@@ -6,6 +6,7 @@
+ #include "xfs.h"
+ #include "xfs_fs.h"
+ #include "xfs_shared.h"
++#include "xfs_bit.h"
+ #include "xfs_format.h"
+ #include "xfs_log_format.h"
+ #include "xfs_trans_resv.h"
+* Unmerged path fs/xfs/xfs_trace.h
