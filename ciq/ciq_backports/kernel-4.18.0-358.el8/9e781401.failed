@@ -1,0 +1,149 @@
+net: bridge: propagate extack through store_bridge_parm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 9e781401cbfcd83c4d766b4c6c5efce8348d4d13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/9e781401.failed
+
+The bridge sysfs interface stores parameters for the STP, VLAN,
+multicast etc subsystems using a predefined function prototype.
+Sometimes the underlying function being called supports a netlink
+extended ack message, and we ignore it.
+
+Let's expand the store_bridge_parm function prototype to include the
+extack, and just print it to console, but at least propagate it where
+applicable. Where not applicable, create a shim function in the
+br_sysfs_br.c file that discards the extra function argument.
+
+This patch allows us to propagate the extack argument to
+br_vlan_set_default_pvid, br_vlan_set_proto and br_vlan_filter_toggle,
+and from there, further up in br_changelink from br_netlink.c.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9e781401cbfcd83c4d766b4c6c5efce8348d4d13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_sysfs_br.c
+diff --cc net/bridge/br_sysfs_br.c
+index 52b9892eb49f,072e29840082..000000000000
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@@ -330,6 -357,28 +361,31 @@@ static ssize_t flush_store(struct devic
+  }
+  static DEVICE_ATTR_WO(flush);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t no_linklocal_learn_show(struct device *d,
++ 				       struct device_attribute *attr,
++ 				       char *buf)
++ {
++ 	struct net_bridge *br = to_bridge(d);
++ 	return sprintf(buf, "%d\n", br_boolopt_get(br, BR_BOOLOPT_NO_LL_LEARN));
++ }
++ 
++ static int set_no_linklocal_learn(struct net_bridge *br, unsigned long val,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	return br_boolopt_toggle(br, BR_BOOLOPT_NO_LL_LEARN, !!val, extack);
++ }
++ 
++ static ssize_t no_linklocal_learn_store(struct device *d,
++ 					struct device_attribute *attr,
++ 					const char *buf, size_t len)
++ {
++ 	return store_bridge_parm(d, buf, len, set_no_linklocal_learn);
++ }
++ static DEVICE_ATTR_RW(no_linklocal_learn);
++ 
+++>>>>>>> 9e781401cbfc (net: bridge: propagate extack through store_bridge_parm)
+  #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+  static ssize_t multicast_router_show(struct device *d,
+  				     struct device_attribute *attr, char *buf)
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 1c6fc5cc1b5a..a3435dc9eb88 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -1178,7 +1178,7 @@ static int br_changelink(struct net_device *brdev, struct nlattr *tb[],
+ 	if (data[IFLA_BR_VLAN_FILTERING]) {
+ 		u8 vlan_filter = nla_get_u8(data[IFLA_BR_VLAN_FILTERING]);
+ 
+-		err = br_vlan_filter_toggle(br, vlan_filter);
++		err = br_vlan_filter_toggle(br, vlan_filter, extack);
+ 		if (err)
+ 			return err;
+ 	}
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index d65647185dbd..b0dac99c5c47 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -950,13 +950,16 @@ int br_vlan_delete(struct net_bridge *br, u16 vid);
+ void br_vlan_flush(struct net_bridge *br);
+ struct net_bridge_vlan *br_vlan_find(struct net_bridge_vlan_group *vg, u16 vid);
+ void br_recalculate_fwd_mask(struct net_bridge *br);
+-int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val);
++int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val,
++			  struct netlink_ext_ack *extack);
+ int __br_vlan_set_proto(struct net_bridge *br, __be16 proto);
+-int br_vlan_set_proto(struct net_bridge *br, unsigned long val);
++int br_vlan_set_proto(struct net_bridge *br, unsigned long val,
++		      struct netlink_ext_ack *extack);
+ int br_vlan_set_stats(struct net_bridge *br, unsigned long val);
+ int br_vlan_set_stats_per_port(struct net_bridge *br, unsigned long val);
+ int br_vlan_init(struct net_bridge *br);
+-int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val);
++int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val,
++			     struct netlink_ext_ack *extack);
+ int __br_vlan_set_default_pvid(struct net_bridge *br, u16 pvid,
+ 			       struct netlink_ext_ack *extack);
+ int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags,
+* Unmerged path net/bridge/br_sysfs_br.c
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index 33c6fc7fff45..ed8d5041004b 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -784,7 +784,8 @@ void br_recalculate_fwd_mask(struct net_bridge *br)
+ 					      ~(1u << br->group_addr[5]);
+ }
+ 
+-int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
++int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val,
++			  struct netlink_ext_ack *extack)
+ {
+ 	struct switchdev_attr attr = {
+ 		.orig_dev = br->dev,
+@@ -888,7 +889,8 @@ int __br_vlan_set_proto(struct net_bridge *br, __be16 proto)
+ 	return err;
+ }
+ 
+-int br_vlan_set_proto(struct net_bridge *br, unsigned long val)
++int br_vlan_set_proto(struct net_bridge *br, unsigned long val,
++		      struct netlink_ext_ack *extack)
+ {
+ 	if (!eth_type_vlan(htons(val)))
+ 		return -EPROTONOSUPPORT;
+@@ -1059,7 +1061,8 @@ int __br_vlan_set_default_pvid(struct net_bridge *br, u16 pvid,
+ 	goto out;
+ }
+ 
+-int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val)
++int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val,
++			     struct netlink_ext_ack *extack)
+ {
+ 	u16 pvid = val;
+ 	int err = 0;
+@@ -1076,7 +1079,7 @@ int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val)
+ 		err = -EPERM;
+ 		goto out;
+ 	}
+-	err = __br_vlan_set_default_pvid(br, pvid, NULL);
++	err = __br_vlan_set_default_pvid(br, pvid, extack);
+ out:
+ 	return err;
+ }
