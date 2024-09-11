@@ -1,0 +1,170 @@
+dma-mapping: move dma_common_{mmap,get_sgtable} out of mapping.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 545d29272f38ba4791cca2a5a86fe6766f462f18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/545d2927.failed
+
+Add a new file that contains helpers for misc DMA ops, which is only
+built when CONFIG_DMA_OPS is set.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+(cherry picked from commit 545d29272f38ba4791cca2a5a86fe6766f462f18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/Makefile
+diff --cc kernel/dma/Makefile
+index a779ec153210,dc755ab68aab..000000000000
+--- a/kernel/dma/Makefile
++++ b/kernel/dma/Makefile
+@@@ -1,8 -1,10 +1,14 @@@
+  # SPDX-License-Identifier: GPL-2.0
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_HAS_DMA)			+= mapping.o direct.o dummy.o
+++=======
++ obj-$(CONFIG_HAS_DMA)			+= mapping.o direct.o
++ obj-$(CONFIG_DMA_OPS)			+= ops_helpers.o
++ obj-$(CONFIG_DMA_OPS)			+= dummy.o
+++>>>>>>> 545d29272f38 (dma-mapping: move dma_common_{mmap,get_sgtable} out of mapping.c)
+  obj-$(CONFIG_DMA_CMA)			+= contiguous.o
+ -obj-$(CONFIG_DMA_DECLARE_COHERENT)	+= coherent.o
+ +obj-$(CONFIG_HAVE_GENERIC_DMA_COHERENT) += coherent.o
+  obj-$(CONFIG_DMA_VIRT_OPS)		+= virt.o
+  obj-$(CONFIG_DMA_API_DEBUG)		+= debug.o
+  obj-$(CONFIG_SWIOTLB)			+= swiotlb.o
+* Unmerged path kernel/dma/Makefile
+diff --git a/kernel/dma/mapping.c b/kernel/dma/mapping.c
+index e629f7315b65..944b489d93ee 100644
+--- a/kernel/dma/mapping.c
++++ b/kernel/dma/mapping.c
+@@ -8,7 +8,7 @@
+ #include <linux/memblock.h> /* for max_pfn */
+ #include <linux/acpi.h>
+ #include <linux/dma-direct.h>
+-#include <linux/dma-noncoherent.h>
++#include <linux/dma-mapping.h>
+ #include <linux/export.h>
+ #include <linux/gfp.h>
+ #include <linux/of_device.h>
+@@ -306,22 +306,6 @@ void dma_sync_sg_for_device(struct device *dev, struct scatterlist *sg,
+ }
+ EXPORT_SYMBOL(dma_sync_sg_for_device);
+ 
+-/*
+- * Create scatter-list for the already allocated DMA buffer.
+- */
+-int dma_common_get_sgtable(struct device *dev, struct sg_table *sgt,
+-		 void *cpu_addr, dma_addr_t dma_addr, size_t size,
+-		 unsigned long attrs)
+-{
+-	struct page *page = virt_to_page(cpu_addr);
+-	int ret;
+-
+-	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
+-	if (!ret)
+-		sg_set_page(sgt->sgl, page, PAGE_ALIGN(size), 0);
+-	return ret;
+-}
+-
+ /*
+  * The whole dma_get_sgtable() idea is fundamentally unsafe - it seems
+  * that the intention is to allow exporting memory allocated via the
+@@ -369,35 +353,6 @@ pgprot_t dma_pgprot(struct device *dev, pgprot_t prot, unsigned long attrs)
+ }
+ #endif /* CONFIG_MMU */
+ 
+-/*
+- * Create userspace mapping for the DMA-coherent memory.
+- */
+-int dma_common_mmap(struct device *dev, struct vm_area_struct *vma,
+-		void *cpu_addr, dma_addr_t dma_addr, size_t size,
+-		unsigned long attrs)
+-{
+-#ifdef CONFIG_MMU
+-	unsigned long user_count = vma_pages(vma);
+-	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
+-	unsigned long off = vma->vm_pgoff;
+-	int ret = -ENXIO;
+-
+-	vma->vm_page_prot = dma_pgprot(dev, vma->vm_page_prot, attrs);
+-
+-	if (dma_mmap_from_dev_coherent(dev, vma, cpu_addr, size, &ret))
+-		return ret;
+-
+-	if (off >= count || user_count > count - off)
+-		return -ENXIO;
+-
+-	return remap_pfn_range(vma, vma->vm_start,
+-			page_to_pfn(virt_to_page(cpu_addr)) + vma->vm_pgoff,
+-			user_count << PAGE_SHIFT, vma->vm_page_prot);
+-#else
+-	return -ENXIO;
+-#endif /* CONFIG_MMU */
+-}
+-
+ /**
+  * dma_can_mmap - check if a given device supports dma_mmap_*
+  * @dev: device to check
+diff --git a/kernel/dma/ops_helpers.c b/kernel/dma/ops_helpers.c
+new file mode 100644
+index 000000000000..e443c69be429
+--- /dev/null
++++ b/kernel/dma/ops_helpers.c
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Helpers for DMA ops implementations.  These generally rely on the fact that
++ * the allocated memory contains normal pages in the direct kernel mapping.
++ */
++#include <linux/dma-noncoherent.h>
++
++/*
++ * Create scatter-list for the already allocated DMA buffer.
++ */
++int dma_common_get_sgtable(struct device *dev, struct sg_table *sgt,
++		 void *cpu_addr, dma_addr_t dma_addr, size_t size,
++		 unsigned long attrs)
++{
++	struct page *page = virt_to_page(cpu_addr);
++	int ret;
++
++	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
++	if (!ret)
++		sg_set_page(sgt->sgl, page, PAGE_ALIGN(size), 0);
++	return ret;
++}
++
++/*
++ * Create userspace mapping for the DMA-coherent memory.
++ */
++int dma_common_mmap(struct device *dev, struct vm_area_struct *vma,
++		void *cpu_addr, dma_addr_t dma_addr, size_t size,
++		unsigned long attrs)
++{
++#ifdef CONFIG_MMU
++	unsigned long user_count = vma_pages(vma);
++	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
++	unsigned long off = vma->vm_pgoff;
++	int ret = -ENXIO;
++
++	vma->vm_page_prot = dma_pgprot(dev, vma->vm_page_prot, attrs);
++
++	if (dma_mmap_from_dev_coherent(dev, vma, cpu_addr, size, &ret))
++		return ret;
++
++	if (off >= count || user_count > count - off)
++		return -ENXIO;
++
++	return remap_pfn_range(vma, vma->vm_start,
++			page_to_pfn(virt_to_page(cpu_addr)) + vma->vm_pgoff,
++			user_count << PAGE_SHIFT, vma->vm_page_prot);
++#else
++	return -ENXIO;
++#endif /* CONFIG_MMU */
++}
