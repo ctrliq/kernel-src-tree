@@ -1,0 +1,192 @@
+mm, memcg: make memory.emin the baseline for utilisation determination
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chris Down <chris@chrisdown.name>
+commit 9de7ca46ad2688bd51e80f7119fefa301ad7f3fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9de7ca46.failed
+
+Roman points out that when when we do the low reclaim pass, we scale the
+reclaim pressure relative to position between 0 and the maximum
+protection threshold.
+
+However, if the maximum protection is based on memory.elow, and
+memory.emin is above zero, this means we still may get binary behaviour
+on second-pass low reclaim.  This is because we scale starting at 0, not
+starting at memory.emin, and since we don't scan at all below emin, we
+end up with cliff behaviour.
+
+This should be a fairly uncommon case since usually we don't go into the
+second pass, but it makes sense to scale our low reclaim pressure
+starting at emin.
+
+You can test this by catting two large sparse files, one in a cgroup
+with emin set to some moderate size compared to physical RAM, and
+another cgroup without any emin.  In both cgroups, set an elow larger
+than 50% of physical RAM.  The one with emin will have less page
+scanning, as reclaim pressure is lower.
+
+Rebase on top of and apply the same idea as what was applied to handle
+cgroup_memory=disable properly for the original proportional patch
+http://lkml.kernel.org/r/20190201045711.GA18302@chrisdown.name ("mm,
+memcg: Handle cgroup_disable=memory when getting memcg protection").
+
+Link: http://lkml.kernel.org/r/20190201051810.GA18895@chrisdown.name
+	Signed-off-by: Chris Down <chris@chrisdown.name>
+	Suggested-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Dennis Zhou <dennis@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 9de7ca46ad2688bd51e80f7119fefa301ad7f3fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/vmscan.c
+diff --cc include/linux/memcontrol.h
+index edfd7c1e1c27,1cbad1248e5a..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -339,6 -356,19 +339,22 @@@ static inline bool mem_cgroup_disabled(
+  	return !cgroup_subsys_enabled(memory_cgrp_subsys);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mem_cgroup_protection(struct mem_cgroup *memcg,
++ 					 unsigned long *min, unsigned long *low)
++ {
++ 	if (mem_cgroup_disabled()) {
++ 		*min = 0;
++ 		*low = 0;
++ 		return;
++ 	}
++ 
++ 	*min = READ_ONCE(memcg->memory.emin);
++ 	*low = READ_ONCE(memcg->memory.elow);
++ }
++ 
+++>>>>>>> 9de7ca46ad26 (mm, memcg: make memory.emin the baseline for utilisation determination)
+  enum mem_cgroup_protection mem_cgroup_protected(struct mem_cgroup *root,
+  						struct mem_cgroup *memcg);
+  
+@@@ -823,6 -844,13 +839,16 @@@ static inline void memcg_memory_event_m
+  {
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mem_cgroup_protection(struct mem_cgroup *memcg,
++ 					 unsigned long *min, unsigned long *low)
++ {
++ 	*min = 0;
++ 	*low = 0;
++ }
++ 
+++>>>>>>> 9de7ca46ad26 (mm, memcg: make memory.emin the baseline for utilisation determination)
+  static inline enum mem_cgroup_protection mem_cgroup_protected(
+  	struct mem_cgroup *root, struct mem_cgroup *memcg)
+  {
+diff --cc mm/vmscan.c
+index 52e40eb6d6d4,70347d626fb3..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -2423,11 -2459,85 +2423,90 @@@ out
+  	*lru_pages = 0;
+  	for_each_evictable_lru(lru) {
+  		int file = is_file_lru(lru);
+ -		unsigned long lruvec_size;
+ +		unsigned long size;
+  		unsigned long scan;
+++<<<<<<< HEAD
+++=======
++ 		unsigned long min, low;
++ 
++ 		lruvec_size = lruvec_lru_size(lruvec, lru, sc->reclaim_idx);
++ 		mem_cgroup_protection(memcg, &min, &low);
++ 
++ 		if (min || low) {
++ 			/*
++ 			 * Scale a cgroup's reclaim pressure by proportioning
++ 			 * its current usage to its memory.low or memory.min
++ 			 * setting.
++ 			 *
++ 			 * This is important, as otherwise scanning aggression
++ 			 * becomes extremely binary -- from nothing as we
++ 			 * approach the memory protection threshold, to totally
++ 			 * nominal as we exceed it.  This results in requiring
++ 			 * setting extremely liberal protection thresholds. It
++ 			 * also means we simply get no protection at all if we
++ 			 * set it too low, which is not ideal.
++ 			 */
++ 			unsigned long cgroup_size = mem_cgroup_size(memcg);
++ 
++ 			/*
++ 			 * If there is any protection in place, we adjust scan
++ 			 * pressure in proportion to how much a group's current
++ 			 * usage exceeds that, in percent.
++ 			 *
++ 			 * There is one special case: in the first reclaim pass,
++ 			 * we skip over all groups that are within their low
++ 			 * protection. If that fails to reclaim enough pages to
++ 			 * satisfy the reclaim goal, we come back and override
++ 			 * the best-effort low protection. However, we still
++ 			 * ideally want to honor how well-behaved groups are in
++ 			 * that case instead of simply punishing them all
++ 			 * equally. As such, we reclaim them based on how much
++ 			 * of their best-effort protection they are using. Usage
++ 			 * below memory.min is excluded from consideration when
++ 			 * calculating utilisation, as it isn't ever
++ 			 * reclaimable, so it might as well not exist for our
++ 			 * purposes.
++ 			 */
++ 			if (sc->memcg_low_reclaim && low > min) {
++ 				/*
++ 				 * Reclaim according to utilisation between min
++ 				 * and low
++ 				 */
++ 				scan = lruvec_size * (cgroup_size - min) /
++ 					(low - min);
++ 			} else {
++ 				/* Reclaim according to protection overage */
++ 				scan = lruvec_size * cgroup_size /
++ 					max(min, low) - lruvec_size;
++ 			}
++ 
++ 			/*
++ 			 * Don't allow the scan target to exceed the lruvec
++ 			 * size, which otherwise could happen if we have >200%
++ 			 * overage in the normal case, or >100% overage when
++ 			 * sc->memcg_low_reclaim is set.
++ 			 *
++ 			 * This is important because other cgroups without
++ 			 * memory.low have their scan target initially set to
++ 			 * their lruvec size, so allowing values >100% of the
++ 			 * lruvec size here could result in penalising cgroups
++ 			 * with memory.low set even *more* than their peers in
++ 			 * some cases in the case of large overages.
++ 			 *
++ 			 * Also, minimally target SWAP_CLUSTER_MAX pages to keep
++ 			 * reclaim moving forwards, avoiding decremeting
++ 			 * sc->priority further than desirable.
++ 			 */
++ 			scan = clamp(scan, SWAP_CLUSTER_MAX, lruvec_size);
++ 		} else {
++ 			scan = lruvec_size;
++ 		}
++ 
++ 		scan >>= sc->priority;
+++>>>>>>> 9de7ca46ad26 (mm, memcg: make memory.emin the baseline for utilisation determination)
+  
+ +		size = lruvec_lru_size(lruvec, lru, sc->reclaim_idx);
+ +		scan = size >> sc->priority;
+  		/*
+  		 * If the cgroup's already been deleted, make sure to
+  		 * scrape out the remaining cache.
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/vmscan.c
