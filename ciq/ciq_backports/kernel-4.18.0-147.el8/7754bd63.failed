@@ -1,0 +1,145 @@
+tls: Fix mixing between async capable and async
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit 7754bd63ed081fa7c0aedd79ae0e8003465b641b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7754bd63.failed
+
+Today, tls_sw_recvmsg is capable of using asynchronous mode to handle
+application data TLS records. Moreover, it assumes that if the cipher
+can be handled asynchronously, then all packets will be processed
+asynchronously.
+
+However, this assumption is not always true. Specifically, for AES-GCM
+in TLS1.2, it causes data corruption, and breaks user applications.
+
+This patch fixes this problem by separating the async capability from
+the decryption operation result.
+
+Fixes: c0ab4732d4c6 ("net/tls: Do not use async crypto for non-data records")
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Reviewed-by: Boris Pismenny <borisp@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7754bd63ed081fa7c0aedd79ae0e8003465b641b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,68cd026fa57c..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -1312,21 -1667,98 +1312,69 @@@ int tls_sw_recvmsg(struct sock *sk
+  	if (unlikely(flags & MSG_ERRQUEUE))
+  		return sock_recv_errqueue(sk, msg, len, SOL_IP, IP_RECVERR);
+  
+ -	psock = sk_psock_get(sk);
+  	lock_sock(sk);
+  
+ -	/* Process pending decrypted records. It must be non-zero-copy */
+ -	err = process_rx_list(ctx, msg, &control, &cmsg, 0, len, false,
+ -			      is_peek);
+ -	if (err < 0) {
+ -		tls_err_abort(sk, err);
+ -		goto end;
+ -	} else {
+ -		copied = err;
+ -	}
+ -
+ -	len = len - copied;
+ -	if (len) {
+ -		target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+ -		timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+ -	} else {
+ -		goto recv_end;
+ -	}
+ -
+ +	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+ +	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+  	do {
+ -		bool retain_skb = false;
+  		bool zc = false;
+ -		int to_decrypt;
+ +		bool async = false;
+  		int chunk = 0;
+++<<<<<<< HEAD
+++=======
++ 		bool async_capable;
++ 		bool async = false;
+++>>>>>>> 7754bd63ed08 (tls: Fix mixing between async capable and async)
+  
+ -		skb = tls_wait_data(sk, psock, flags, timeo, &err);
+ -		if (!skb) {
+ -			if (psock) {
+ -				int ret = __tcp_bpf_recvmsg(sk, psock,
+ -							    msg, len, flags);
+ -
+ -				if (ret > 0) {
+ -					decrypted += ret;
+ -					len -= ret;
+ -					continue;
+ -				}
+ -			}
+ +		skb = tls_wait_data(sk, flags, timeo, &err);
+ +		if (!skb)
+  			goto recv_end;
+ -		} else {
+ -			tlm = tls_msg(skb);
+ -			if (prot->version == TLS_1_3_VERSION)
+ -				tlm->control = 0;
+ -			else
+ -				tlm->control = ctx->control;
+ -		}
+  
+  		rxm = strp_msg(skb);
+  
+++<<<<<<< HEAD
+++=======
++ 		to_decrypt = rxm->full_len - prot->overhead_size;
++ 
++ 		if (to_decrypt <= len && !is_kvec && !is_peek &&
++ 		    ctx->control == TLS_RECORD_TYPE_DATA &&
++ 		    prot->version != TLS_1_3_VERSION)
++ 			zc = true;
++ 
++ 		/* Do not use async mode if record is non-data */
++ 		if (ctx->control == TLS_RECORD_TYPE_DATA)
++ 			async_capable = ctx->async_capable;
++ 		else
++ 			async_capable = false;
++ 
++ 		err = decrypt_skb_update(sk, skb, &msg->msg_iter,
++ 					 &chunk, &zc, async_capable);
++ 		if (err < 0 && err != -EINPROGRESS) {
++ 			tls_err_abort(sk, EBADMSG);
++ 			goto recv_end;
++ 		}
++ 
++ 		if (err == -EINPROGRESS) {
++ 			async = true;
++ 			num_async++;
++ 		} else if (prot->version == TLS_1_3_VERSION) {
++ 			tlm->control = ctx->control;
++ 		}
++ 
++ 		/* If the type of records being processed is not known yet,
++ 		 * set it to record type just dequeued. If it is already known,
++ 		 * but does not match the record type just dequeued, go to end.
++ 		 * We always get record type here since for tls1.2, record type
++ 		 * is known just after record is dequeued from stream parser.
++ 		 * For tls1.3, we disable async.
++ 		 */
++ 
++ 		if (!control)
++ 			control = tlm->control;
++ 		else if (control != tlm->control)
++ 			goto recv_end;
++ 
+++>>>>>>> 7754bd63ed08 (tls: Fix mixing between async capable and async)
+  		if (!cmsg) {
+  			int cerr;
+  
+* Unmerged path net/tls/tls_sw.c
