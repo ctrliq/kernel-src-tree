@@ -1,0 +1,302 @@
+bpf: Fix static checker warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit d0f010434124598988ba1c97fbb0e4e820ff5d8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d0f01043.failed
+
+kernel/bpf/btf.c:4023 btf_distill_func_proto()
+        error: potentially dereferencing uninitialized 't'.
+
+kernel/bpf/btf.c
+  4012          nargs = btf_type_vlen(func);
+  4013          if (nargs >= MAX_BPF_FUNC_ARGS) {
+  4014                  bpf_log(log,
+  4015                          "The function %s has %d arguments. Too many.\n",
+  4016                          tname, nargs);
+  4017                  return -EINVAL;
+  4018          }
+  4019          ret = __get_type_size(btf, func->type, &t);
+                                                       ^^
+t isn't initialized for the first -EINVAL return
+
+This is unlikely path, since BTF should have been validated at this point.
+Fix it by returning 'void' BTF.
+
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20191126230106.237179-1-ast@kernel.org
+(cherry picked from commit d0f010434124598988ba1c97fbb0e4e820ff5d8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/btf.c
+diff --cc kernel/bpf/btf.c
+index dc1f2324f36a,bd5e11881ba3..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -3763,6 -3873,256 +3763,259 @@@ again
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __btf_resolve_helper_id(struct bpf_verifier_log *log, void *fn,
++ 				   int arg)
++ {
++ 	char fnname[KSYM_SYMBOL_LEN + 4] = "btf_";
++ 	const struct btf_param *args;
++ 	const struct btf_type *t;
++ 	const char *tname, *sym;
++ 	u32 btf_id, i;
++ 
++ 	if (IS_ERR(btf_vmlinux)) {
++ 		bpf_log(log, "btf_vmlinux is malformed\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	sym = kallsyms_lookup((long)fn, NULL, NULL, NULL, fnname + 4);
++ 	if (!sym) {
++ 		bpf_log(log, "kernel doesn't have kallsyms\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	for (i = 1; i <= btf_vmlinux->nr_types; i++) {
++ 		t = btf_type_by_id(btf_vmlinux, i);
++ 		if (BTF_INFO_KIND(t->info) != BTF_KIND_TYPEDEF)
++ 			continue;
++ 		tname = __btf_name_by_offset(btf_vmlinux, t->name_off);
++ 		if (!strcmp(tname, fnname))
++ 			break;
++ 	}
++ 	if (i > btf_vmlinux->nr_types) {
++ 		bpf_log(log, "helper %s type is not found\n", fnname);
++ 		return -ENOENT;
++ 	}
++ 
++ 	t = btf_type_by_id(btf_vmlinux, t->type);
++ 	if (!btf_type_is_ptr(t))
++ 		return -EFAULT;
++ 	t = btf_type_by_id(btf_vmlinux, t->type);
++ 	if (!btf_type_is_func_proto(t))
++ 		return -EFAULT;
++ 
++ 	args = (const struct btf_param *)(t + 1);
++ 	if (arg >= btf_type_vlen(t)) {
++ 		bpf_log(log, "bpf helper %s doesn't have %d-th argument\n",
++ 			fnname, arg);
++ 		return -EINVAL;
++ 	}
++ 
++ 	t = btf_type_by_id(btf_vmlinux, args[arg].type);
++ 	if (!btf_type_is_ptr(t) || !t->type) {
++ 		/* anything but the pointer to struct is a helper config bug */
++ 		bpf_log(log, "ARG_PTR_TO_BTF is misconfigured\n");
++ 		return -EFAULT;
++ 	}
++ 	btf_id = t->type;
++ 	t = btf_type_by_id(btf_vmlinux, t->type);
++ 	/* skip modifiers */
++ 	while (btf_type_is_modifier(t)) {
++ 		btf_id = t->type;
++ 		t = btf_type_by_id(btf_vmlinux, t->type);
++ 	}
++ 	if (!btf_type_is_struct(t)) {
++ 		bpf_log(log, "ARG_PTR_TO_BTF is not a struct\n");
++ 		return -EFAULT;
++ 	}
++ 	bpf_log(log, "helper %s arg%d has btf_id %d struct %s\n", fnname + 4,
++ 		arg, btf_id, __btf_name_by_offset(btf_vmlinux, t->name_off));
++ 	return btf_id;
++ }
++ 
++ int btf_resolve_helper_id(struct bpf_verifier_log *log,
++ 			  const struct bpf_func_proto *fn, int arg)
++ {
++ 	int *btf_id = &fn->btf_id[arg];
++ 	int ret;
++ 
++ 	if (fn->arg_type[arg] != ARG_PTR_TO_BTF_ID)
++ 		return -EINVAL;
++ 
++ 	ret = READ_ONCE(*btf_id);
++ 	if (ret)
++ 		return ret;
++ 	/* ok to race the search. The result is the same */
++ 	ret = __btf_resolve_helper_id(log, fn->func, arg);
++ 	if (!ret) {
++ 		/* Function argument cannot be type 'void' */
++ 		bpf_log(log, "BTF resolution bug\n");
++ 		return -EFAULT;
++ 	}
++ 	WRITE_ONCE(*btf_id, ret);
++ 	return ret;
++ }
++ 
++ static int __get_type_size(struct btf *btf, u32 btf_id,
++ 			   const struct btf_type **bad_type)
++ {
++ 	const struct btf_type *t;
++ 
++ 	if (!btf_id)
++ 		/* void */
++ 		return 0;
++ 	t = btf_type_by_id(btf, btf_id);
++ 	while (t && btf_type_is_modifier(t))
++ 		t = btf_type_by_id(btf, t->type);
++ 	if (!t) {
++ 		*bad_type = btf->types[0];
++ 		return -EINVAL;
++ 	}
++ 	if (btf_type_is_ptr(t))
++ 		/* kernel size of pointer. Not BPF's size of pointer*/
++ 		return sizeof(void *);
++ 	if (btf_type_is_int(t) || btf_type_is_enum(t))
++ 		return t->size;
++ 	*bad_type = t;
++ 	return -EINVAL;
++ }
++ 
++ int btf_distill_func_proto(struct bpf_verifier_log *log,
++ 			   struct btf *btf,
++ 			   const struct btf_type *func,
++ 			   const char *tname,
++ 			   struct btf_func_model *m)
++ {
++ 	const struct btf_param *args;
++ 	const struct btf_type *t;
++ 	u32 i, nargs;
++ 	int ret;
++ 
++ 	if (!func) {
++ 		/* BTF function prototype doesn't match the verifier types.
++ 		 * Fall back to 5 u64 args.
++ 		 */
++ 		for (i = 0; i < 5; i++)
++ 			m->arg_size[i] = 8;
++ 		m->ret_size = 8;
++ 		m->nr_args = 5;
++ 		return 0;
++ 	}
++ 	args = (const struct btf_param *)(func + 1);
++ 	nargs = btf_type_vlen(func);
++ 	if (nargs >= MAX_BPF_FUNC_ARGS) {
++ 		bpf_log(log,
++ 			"The function %s has %d arguments. Too many.\n",
++ 			tname, nargs);
++ 		return -EINVAL;
++ 	}
++ 	ret = __get_type_size(btf, func->type, &t);
++ 	if (ret < 0) {
++ 		bpf_log(log,
++ 			"The function %s return type %s is unsupported.\n",
++ 			tname, btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 		return -EINVAL;
++ 	}
++ 	m->ret_size = ret;
++ 
++ 	for (i = 0; i < nargs; i++) {
++ 		ret = __get_type_size(btf, args[i].type, &t);
++ 		if (ret < 0) {
++ 			bpf_log(log,
++ 				"The function %s arg%d type %s is unsupported.\n",
++ 				tname, i, btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 			return -EINVAL;
++ 		}
++ 		m->arg_size[i] = ret;
++ 	}
++ 	m->nr_args = nargs;
++ 	return 0;
++ }
++ 
++ int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog)
++ {
++ 	struct bpf_verifier_state *st = env->cur_state;
++ 	struct bpf_func_state *func = st->frame[st->curframe];
++ 	struct bpf_reg_state *reg = func->regs;
++ 	struct bpf_verifier_log *log = &env->log;
++ 	struct bpf_prog *prog = env->prog;
++ 	struct btf *btf = prog->aux->btf;
++ 	const struct btf_param *args;
++ 	const struct btf_type *t;
++ 	u32 i, nargs, btf_id;
++ 	const char *tname;
++ 
++ 	if (!prog->aux->func_info)
++ 		return 0;
++ 
++ 	btf_id = prog->aux->func_info[subprog].type_id;
++ 	if (!btf_id)
++ 		return 0;
++ 
++ 	if (prog->aux->func_info_aux[subprog].unreliable)
++ 		return 0;
++ 
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t || !btf_type_is_func(t)) {
++ 		bpf_log(log, "BTF of subprog %d doesn't point to KIND_FUNC\n",
++ 			subprog);
++ 		return -EINVAL;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 
++ 	t = btf_type_by_id(btf, t->type);
++ 	if (!t || !btf_type_is_func_proto(t)) {
++ 		bpf_log(log, "Invalid type of func %s\n", tname);
++ 		return -EINVAL;
++ 	}
++ 	args = (const struct btf_param *)(t + 1);
++ 	nargs = btf_type_vlen(t);
++ 	if (nargs > 5) {
++ 		bpf_log(log, "Function %s has %d > 5 args\n", tname, nargs);
++ 		goto out;
++ 	}
++ 	/* check that BTF function arguments match actual types that the
++ 	 * verifier sees.
++ 	 */
++ 	for (i = 0; i < nargs; i++) {
++ 		t = btf_type_by_id(btf, args[i].type);
++ 		while (btf_type_is_modifier(t))
++ 			t = btf_type_by_id(btf, t->type);
++ 		if (btf_type_is_int(t) || btf_type_is_enum(t)) {
++ 			if (reg[i + 1].type == SCALAR_VALUE)
++ 				continue;
++ 			bpf_log(log, "R%d is not a scalar\n", i + 1);
++ 			goto out;
++ 		}
++ 		if (btf_type_is_ptr(t)) {
++ 			if (reg[i + 1].type == SCALAR_VALUE) {
++ 				bpf_log(log, "R%d is not a pointer\n", i + 1);
++ 				goto out;
++ 			}
++ 			/* If program is passing PTR_TO_CTX into subprogram
++ 			 * check that BTF type matches.
++ 			 */
++ 			if (reg[i + 1].type == PTR_TO_CTX &&
++ 			    !btf_get_prog_ctx_type(log, btf, t, prog->type))
++ 				goto out;
++ 			/* All other pointers are ok */
++ 			continue;
++ 		}
++ 		bpf_log(log, "Unrecognized argument type %s\n",
++ 			btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 		goto out;
++ 	}
++ 	return 0;
++ out:
++ 	/* LLVM optimizations can remove arguments from static functions. */
++ 	bpf_log(log,
++ 		"Type info disagrees with actual arguments due to compiler optimizations\n");
++ 	prog->aux->func_info_aux[subprog].unreliable = true;
++ 	return 0;
++ }
++ 
+++>>>>>>> d0f010434124 (bpf: Fix static checker warning)
+  void btf_type_seq_show(const struct btf *btf, u32 type_id, void *obj,
+  		       struct seq_file *m)
+  {
+* Unmerged path kernel/bpf/btf.c
