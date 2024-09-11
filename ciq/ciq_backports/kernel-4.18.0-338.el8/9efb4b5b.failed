@@ -1,0 +1,171 @@
+net: optimize GRO for the common case.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 9efb4b5baf6ce851b247288992b0632cb4d31c17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/9efb4b5b.failed
+
+After the previous patches, at GRO time, skb->slow_gro is
+usually 0, unless the packets comes from some H/W offload
+slowpath or tunnel.
+
+We can optimize the GRO code assuming !skb->slow_gro is likely.
+This remove multiple conditionals in the most common path, at the
+price of an additional one when we hit the above "slow-paths".
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9efb4b5baf6ce851b247288992b0632cb4d31c17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/core/skbuff.c
+diff --cc net/core/dev.c
+index 4f3813eeafe4,19565f7497ee..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5543,8 -6013,7 +5543,12 @@@ static void gro_list_prepare(struct nap
+  		diffs = (unsigned long)p->dev ^ (unsigned long)skb->dev;
+  		diffs |= skb_vlan_tag_present(p) ^ skb_vlan_tag_present(skb);
+  		if (skb_vlan_tag_present(p))
+++<<<<<<< HEAD
+ +			diffs |= p->vlan_tci ^ skb->vlan_tci;
+ +		diffs |= skb_metadata_dst_cmp(p, skb);
+++=======
++ 			diffs |= skb_vlan_tag_get(p) ^ skb_vlan_tag_get(skb);
+++>>>>>>> 9efb4b5baf6c (net: optimize GRO for the common case.)
+  		diffs |= skb_metadata_differs(p, skb);
+  		if (maclen == ETH_HLEN)
+  			diffs |= compare_ether_header(skb_mac_header(p),
+@@@ -5553,6 -6022,31 +5557,34 @@@
+  			diffs = memcmp(skb_mac_header(p),
+  				       skb_mac_header(skb),
+  				       maclen);
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* in most common scenarions _state is 0
++ 		 * otherwise we are already on some slower paths
++ 		 * either skip all the infrequent tests altogether or
++ 		 * avoid trying too hard to skip each of them individually
++ 		 */
++ 		if (!diffs && unlikely(skb->slow_gro | p->slow_gro)) {
++ #if IS_ENABLED(CONFIG_SKB_EXTENSIONS) && IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
++ 			struct tc_skb_ext *skb_ext;
++ 			struct tc_skb_ext *p_ext;
++ #endif
++ 
++ 			diffs |= skb_metadata_dst_cmp(p, skb);
++ 			diffs |= skb_get_nfct(p) ^ skb_get_nfct(skb);
++ 
++ #if IS_ENABLED(CONFIG_SKB_EXTENSIONS) && IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
++ 			skb_ext = skb_ext_find(skb, TC_SKB_EXT);
++ 			p_ext = skb_ext_find(p, TC_SKB_EXT);
++ 
++ 			diffs |= (!!p_ext) ^ (!!skb_ext);
++ 			if (!diffs && unlikely(skb_ext))
++ 				diffs |= p_ext->chain ^ skb_ext->chain;
++ #endif
++ 		}
++ 
+++>>>>>>> 9efb4b5baf6c (net: optimize GRO for the common case.)
+  		NAPI_GRO_CB(p)->same_flow = !diffs;
+  	}
+  }
+@@@ -5799,7 -6310,11 +5831,15 @@@ static void napi_reuse_skb(struct napi_
+  	skb->encapsulation = 0;
+  	skb_shinfo(skb)->gso_type = 0;
+  	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
+++<<<<<<< HEAD
+ +	skb_ext_reset(skb);
+++=======
++ 	if (unlikely(skb->slow_gro)) {
++ 		skb_ext_reset(skb);
++ 		nf_reset_ct(skb);
++ 		skb->slow_gro = 0;
++ 	}
+++>>>>>>> 9efb4b5baf6c (net: optimize GRO for the common case.)
+  
+  	napi->skb = skb;
+  }
+diff --cc net/core/skbuff.c
+index 11454d214ad6,d04e286149cc..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -760,43 -927,40 +760,59 @@@ void __consume_stateless_skb(struct sk_
+  	kfree_skbmem(skb);
+  }
+  
+ -static void napi_skb_cache_put(struct sk_buff *skb)
+ +void __kfree_skb_flush(void)
+  {
+  	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ -	u32 i;
+  
+ -	kasan_poison_object_data(skbuff_head_cache, skb);
+ +	/* flush skb_cache if containing objects */
+ +	if (nc->skb_count) {
+ +		kmem_cache_free_bulk(skbuff_head_cache, nc->skb_count,
+ +				     nc->skb_cache);
+ +		nc->skb_count = 0;
+ +	}
+ +}
+ +
+ +static inline void _kfree_skb_defer(struct sk_buff *skb)
+ +{
+ +	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ +
+ +	/* drop skb->head and call any destructors for packet */
+ +	skb_release_all(skb);
+ +
+ +	/* record skb to CPU local list */
+  	nc->skb_cache[nc->skb_count++] = skb;
+  
+ -	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ -		for (i = NAPI_SKB_CACHE_HALF; i < NAPI_SKB_CACHE_SIZE; i++)
+ -			kasan_unpoison_object_data(skbuff_head_cache,
+ -						   nc->skb_cache[i]);
+ +#ifdef CONFIG_SLUB
+ +	/* SLUB writes into objects when freeing */
+ +	prefetchw(skb);
+ +#endif
+  
+ -		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_HALF,
+ -				     nc->skb_cache + NAPI_SKB_CACHE_HALF);
+ -		nc->skb_count = NAPI_SKB_CACHE_HALF;
+ +	/* flush skb_cache if it is filled */
+ +	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ +		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE,
+ +				     nc->skb_cache);
+ +		nc->skb_count = 0;
+  	}
+  }
+ -
+  void __kfree_skb_defer(struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	_kfree_skb_defer(skb);
+++=======
++ 	skb_release_all(skb);
++ 	napi_skb_cache_put(skb);
++ }
++ 
++ void napi_skb_free_stolen_head(struct sk_buff *skb)
++ {
++ 	if (unlikely(skb->slow_gro)) {
++ 		nf_reset_ct(skb);
++ 		skb_dst_drop(skb);
++ 		skb_ext_put(skb);
++ 		skb->slow_gro = 0;
++ 	}
++ 	napi_skb_cache_put(skb);
+++>>>>>>> 9efb4b5baf6c (net: optimize GRO for the common case.)
+  }
+  
+  void napi_consume_skb(struct sk_buff *skb, int budget)
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/skbuff.c
