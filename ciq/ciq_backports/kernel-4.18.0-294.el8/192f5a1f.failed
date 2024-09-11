@@ -1,0 +1,260 @@
+libbpf: Generalize common logic for managing dynamically-sized arrays
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 192f5a1fe6894dca58d14dc883e6c7030e7267f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/192f5a1f.failed
+
+Managing dynamically-sized array is a common, but not trivial functionality,
+which significant amount of logic and code to implement properly. So instead
+of re-implementing it all the time, extract it into a helper function ans
+reuse.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200926011357.2366158-4-andriin@fb.com
+(cherry picked from commit 192f5a1fe6894dca58d14dc883e6c7030e7267f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+#	tools/lib/bpf/libbpf_internal.h
+diff --cc tools/lib/bpf/btf.c
+index 9ca048005e04,f5255e2bd222..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -30,17 -27,38 +30,45 @@@
+  static struct btf_type btf_void;
+  
+  struct btf {
+++<<<<<<< HEAD
+ +	union {
+ +		struct btf_header *hdr;
+ +		void *data;
+ +	};
+ +	struct btf_type **types;
+ +	const char *strings;
+ +	void *nohdr_data;
+++=======
++ 	void *raw_data;
++ 	__u32 raw_size;
++ 
++ 	/*
++ 	 * When BTF is loaded from ELF or raw memory it is stored
++ 	 * in contiguous memory block, pointed to by raw_data pointer, and
++ 	 * hdr, types_data, and strs_data point inside that memory region to
++ 	 * respective parts of BTF representation:
++ 	 *
++ 	 * +--------------------------------+
++ 	 * |  Header  |  Types  |  Strings  |
++ 	 * +--------------------------------+
++ 	 * ^          ^         ^
++ 	 * |          |         |
++ 	 * hdr        |         |
++ 	 * types_data-+         |
++ 	 * strs_data------------+
++ 	 */
++ 	struct btf_header *hdr;
++ 	void *types_data;
++ 	void *strs_data;
++ 
++ 	/* type ID to `struct btf_type *` lookup index */
++ 	__u32 *type_offs;
++ 	size_t type_offs_cap;
+++>>>>>>> 192f5a1fe689 (libbpf: Generalize common logic for managing dynamically-sized arrays)
+  	__u32 nr_types;
+ -
+ -	/* BTF object FD, if loaded into kernel */
+ +	__u32 types_size;
+ +	__u32 data_size;
+  	int fd;
+ -
+ -	/* Pointer size (in bytes) for a target architecture of this BTF */
+ -	int ptr_sz;
+  };
+  
+  static inline __u64 ptr_to_u64(const void *ptr)
+@@@ -48,31 -66,60 +76,87 @@@
+  	return (__u64) (unsigned long) ptr;
+  }
+  
+++<<<<<<< HEAD
+ +static int btf_add_type(struct btf *btf, struct btf_type *t)
+ +{
+ +	if (btf->types_size - btf->nr_types < 2) {
+ +		struct btf_type **new_types;
+ +		__u32 expand_by, new_size;
+ +
+ +		if (btf->types_size == BTF_MAX_NR_TYPES)
+ +			return -E2BIG;
+ +
+ +		expand_by = max(btf->types_size >> 2, 16U);
+ +		new_size = min(BTF_MAX_NR_TYPES, btf->types_size + expand_by);
+ +
+ +		new_types = realloc(btf->types, sizeof(*new_types) * new_size);
+ +		if (!new_types)
+ +			return -ENOMEM;
+ +
+ +		if (btf->nr_types == 0)
+ +			new_types[0] = &btf_void;
+ +
+ +		btf->types = new_types;
+ +		btf->types_size = new_size;
+ +	}
+ +
+ +	btf->types[++(btf->nr_types)] = t;
+++=======
++ /* Ensure given dynamically allocated memory region pointed to by *data* with
++  * capacity of *cap_cnt* elements each taking *elem_sz* bytes has enough
++  * memory to accomodate *add_cnt* new elements, assuming *cur_cnt* elements
++  * are already used. At most *max_cnt* elements can be ever allocated.
++  * If necessary, memory is reallocated and all existing data is copied over,
++  * new pointer to the memory region is stored at *data, new memory region
++  * capacity (in number of elements) is stored in *cap.
++  * On success, memory pointer to the beginning of unused memory is returned.
++  * On error, NULL is returned.
++  */
++ void *btf_add_mem(void **data, size_t *cap_cnt, size_t elem_sz,
++ 		  size_t cur_cnt, size_t max_cnt, size_t add_cnt)
++ {
++ 	size_t new_cnt;
++ 	void *new_data;
++ 
++ 	if (cur_cnt + add_cnt <= *cap_cnt)
++ 		return *data + cur_cnt * elem_sz;
++ 
++ 	/* requested more than the set limit */
++ 	if (cur_cnt + add_cnt > max_cnt)
++ 		return NULL;
++ 
++ 	new_cnt = *cap_cnt;
++ 	new_cnt += new_cnt / 4;		  /* expand by 25% */
++ 	if (new_cnt < 16)		  /* but at least 16 elements */
++ 		new_cnt = 16;
++ 	if (new_cnt > max_cnt)		  /* but not exceeding a set limit */
++ 		new_cnt = max_cnt;
++ 	if (new_cnt < cur_cnt + add_cnt)  /* also ensure we have enough memory */
++ 		new_cnt = cur_cnt + add_cnt;
++ 
++ 	new_data = libbpf_reallocarray(*data, new_cnt, elem_sz);
++ 	if (!new_data)
++ 		return NULL;
++ 
++ 	/* zero out newly allocated portion of memory */
++ 	memset(new_data + (*cap_cnt) * elem_sz, 0, (new_cnt - *cap_cnt) * elem_sz);
++ 
++ 	*data = new_data;
++ 	*cap_cnt = new_cnt;
++ 	return new_data + cur_cnt * elem_sz;
++ }
+  
++ static int btf_add_type_idx_entry(struct btf *btf, __u32 type_off)
++ {
++ 	__u32 *p;
++ 
++ 	p = btf_add_mem((void **)&btf->type_offs, &btf->type_offs_cap, sizeof(__u32),
++ 			btf->nr_types + 1, BTF_MAX_NR_TYPES, 1);
++ 	if (!p)
++ 		return -ENOMEM;
+++>>>>>>> 192f5a1fe689 (libbpf: Generalize common logic for managing dynamically-sized arrays)
++ 
++ 	*p = type_off;
+  	return 0;
+  }
+  
+@@@ -187,22 -230,29 +271,43 @@@ static int btf_type_size(struct btf_typ
+  static int btf_parse_type_sec(struct btf *btf)
+  {
+  	struct btf_header *hdr = btf->hdr;
+++<<<<<<< HEAD
+ +	void *nohdr_data = btf->nohdr_data;
+ +	void *next_type = nohdr_data + hdr->type_off;
+ +	void *end_type = nohdr_data + hdr->str_off;
+ +
+ +	while (next_type < end_type) {
+ +		struct btf_type *t = next_type;
+ +		int type_size;
+ +		int err;
+ +
+ +		type_size = btf_type_size(t);
+++=======
++ 	void *next_type = btf->types_data;
++ 	void *end_type = next_type + hdr->type_len;
++ 	int err, type_size;
++ 
++ 	/* VOID (type_id == 0) is specially handled by btf__get_type_by_id(),
++ 	 * so ensure we can never properly use its offset from index by
++ 	 * setting it to a large value
++ 	 */
++ 	err = btf_add_type_idx_entry(btf, UINT_MAX);
++ 	if (err)
++ 		return err;
++ 
++ 	while (next_type < end_type) {
++ 		err = btf_add_type_idx_entry(btf, next_type - btf->types_data);
++ 		if (err)
++ 			return err;
++ 
++ 		type_size = btf_type_size(next_type);
+++>>>>>>> 192f5a1fe689 (libbpf: Generalize common logic for managing dynamically-sized arrays)
+  		if (type_size < 0)
+  			return type_size;
+ -
+  		next_type += type_size;
+ -		btf->nr_types++;
+ +		err = btf_add_type(btf, t);
+ +		if (err)
+ +			return err;
+  	}
+  
+  	return 0;
+diff --cc tools/lib/bpf/libbpf_internal.h
+index b776a7125c92,eed5b624a784..000000000000
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@@ -63,6 -78,36 +63,39 @@@ do {				
+  #define pr_info(fmt, ...)	__pr(LIBBPF_INFO, fmt, ##__VA_ARGS__)
+  #define pr_debug(fmt, ...)	__pr(LIBBPF_DEBUG, fmt, ##__VA_ARGS__)
+  
+++<<<<<<< HEAD
+++=======
++ #ifndef __has_builtin
++ #define __has_builtin(x) 0
++ #endif
++ /*
++  * Re-implement glibc's reallocarray() for libbpf internal-only use.
++  * reallocarray(), unfortunately, is not available in all versions of glibc,
++  * so requires extra feature detection and using reallocarray() stub from
++  * <tools/libc_compat.h> and COMPAT_NEED_REALLOCARRAY. All this complicates
++  * build of libbpf unnecessarily and is just a maintenance burden. Instead,
++  * it's trivial to implement libbpf-specific internal version and use it
++  * throughout libbpf.
++  */
++ static inline void *libbpf_reallocarray(void *ptr, size_t nmemb, size_t size)
++ {
++ 	size_t total;
++ 
++ #if __has_builtin(__builtin_mul_overflow)
++ 	if (unlikely(__builtin_mul_overflow(nmemb, size, &total)))
++ 		return NULL;
++ #else
++ 	if (size == 0 || nmemb > ULONG_MAX / size)
++ 		return NULL;
++ 	total = nmemb * size;
++ #endif
++ 	return realloc(ptr, total);
++ }
++ 
++ void *btf_add_mem(void **data, size_t *cap_cnt, size_t elem_sz,
++ 		  size_t cur_cnt, size_t max_cnt, size_t add_cnt);
++ 
+++>>>>>>> 192f5a1fe689 (libbpf: Generalize common logic for managing dynamically-sized arrays)
+  static inline bool libbpf_validate_opts(const char *opts,
+  					size_t opts_sz, size_t user_sz,
+  					const char *type_name)
+* Unmerged path tools/lib/bpf/btf.c
+* Unmerged path tools/lib/bpf/libbpf_internal.h
