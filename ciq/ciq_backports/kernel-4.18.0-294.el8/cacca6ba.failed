@@ -1,0 +1,760 @@
+mm/vmalloc.c: remove "node" argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit cacca6baf0b0a2dfe8eb3430b5f81916f35284cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cacca6ba.failed
+
+Patch series "Some cleanups for the KVA/vmalloc", v5.
+
+This patch (of 4):
+
+Remove unused argument from the __alloc_vmap_area() function.
+
+Link: http://lkml.kernel.org/r/20190606120411.8298-2-urezki@gmail.com
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Roman Gushchin <guro@fb.com>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Oleksiy Avramchenko <oleksiy.avramchenko@sonymobile.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cacca6baf0b0a2dfe8eb3430b5f81916f35284cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmalloc.c
+diff --cc mm/vmalloc.c
+index c82a0db1aefc,b645686ef9b6..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -363,41 -418,610 +363,528 @@@ static struct vmap_area *__find_vmap_ar
+  	return NULL;
+  }
+  
+ -/*
+ - * This function returns back addresses of parent node
+ - * and its left or right link for further processing.
+ - */
+ -static __always_inline struct rb_node **
+ -find_va_links(struct vmap_area *va,
+ -	struct rb_root *root, struct rb_node *from,
+ -	struct rb_node **parent)
+ +static void __insert_vmap_area(struct vmap_area *va)
+  {
+ -	struct vmap_area *tmp_va;
+ -	struct rb_node **link;
+ +	struct rb_node **p = &vmap_area_root.rb_node;
+ +	struct rb_node *parent = NULL;
+ +	struct rb_node *tmp;
+  
+ -	if (root) {
+ -		link = &root->rb_node;
+ -		if (unlikely(!*link)) {
+ -			*parent = NULL;
+ -			return link;
+ -		}
+ -	} else {
+ -		link = &from;
+ -	}
+ +	while (*p) {
+ +		struct vmap_area *tmp_va;
+  
+ -	/*
+ -	 * Go to the bottom of the tree. When we hit the last point
+ -	 * we end up with parent rb_node and correct direction, i name
+ -	 * it link, where the new va->rb_node will be attached to.
+ -	 */
+ -	do {
+ -		tmp_va = rb_entry(*link, struct vmap_area, rb_node);
+ -
+ -		/*
+ -		 * During the traversal we also do some sanity check.
+ -		 * Trigger the BUG() if there are sides(left/right)
+ -		 * or full overlaps.
+ -		 */
+ -		if (va->va_start < tmp_va->va_end &&
+ -				va->va_end <= tmp_va->va_start)
+ -			link = &(*link)->rb_left;
+ -		else if (va->va_end > tmp_va->va_start &&
+ -				va->va_start >= tmp_va->va_end)
+ -			link = &(*link)->rb_right;
+ +		parent = *p;
+ +		tmp_va = rb_entry(parent, struct vmap_area, rb_node);
+ +		if (va->va_start < tmp_va->va_end)
+ +			p = &(*p)->rb_left;
+ +		else if (va->va_end > tmp_va->va_start)
+ +			p = &(*p)->rb_right;
+  		else
+  			BUG();
+ -	} while (*link);
+ -
+ -	*parent = &tmp_va->rb_node;
+ -	return link;
+ -}
+ -
+ -static __always_inline struct list_head *
+ -get_va_next_sibling(struct rb_node *parent, struct rb_node **link)
+ -{
+ -	struct list_head *list;
+ -
+ -	if (unlikely(!parent))
+ -		/*
+ -		 * The red-black tree where we try to find VA neighbors
+ -		 * before merging or inserting is empty, i.e. it means
+ -		 * there is no free vmap space. Normally it does not
+ -		 * happen but we handle this case anyway.
+ -		 */
+ -		return NULL;
+ -
+ -	list = &rb_entry(parent, struct vmap_area, rb_node)->list;
+ -	return (&parent->rb_right == link ? list->next : list);
+ -}
+ -
+ -static __always_inline void
+ -link_va(struct vmap_area *va, struct rb_root *root,
+ -	struct rb_node *parent, struct rb_node **link, struct list_head *head)
+ -{
+ -	/*
+ -	 * VA is still not in the list, but we can
+ -	 * identify its future previous list_head node.
+ -	 */
+ -	if (likely(parent)) {
+ -		head = &rb_entry(parent, struct vmap_area, rb_node)->list;
+ -		if (&parent->rb_right != link)
+ -			head = head->prev;
+  	}
+  
+ -	/* Insert to the rb-tree */
+ -	rb_link_node(&va->rb_node, parent, link);
+ -	if (root == &free_vmap_area_root) {
+ -		/*
+ -		 * Some explanation here. Just perform simple insertion
+ -		 * to the tree. We do not set va->subtree_max_size to
+ -		 * its current size before calling rb_insert_augmented().
+ -		 * It is because of we populate the tree from the bottom
+ -		 * to parent levels when the node _is_ in the tree.
+ -		 *
+ -		 * Therefore we set subtree_max_size to zero after insertion,
+ -		 * to let __augment_tree_propagate_from() puts everything to
+ -		 * the correct order later on.
+ -		 */
+ -		rb_insert_augmented(&va->rb_node,
+ -			root, &free_vmap_area_rb_augment_cb);
+ -		va->subtree_max_size = 0;
+ -	} else {
+ -		rb_insert_color(&va->rb_node, root);
+ -	}
+ +	rb_link_node(&va->rb_node, parent, p);
+ +	rb_insert_color(&va->rb_node, &vmap_area_root);
+  
+ -	/* Address-sort this list */
+ -	list_add(&va->list, head);
+ +	/* address-sort this list */
+ +	tmp = rb_prev(&va->rb_node);
+ +	if (tmp) {
+ +		struct vmap_area *prev;
+ +		prev = rb_entry(tmp, struct vmap_area, rb_node);
+ +		list_add_rcu(&va->list, &prev->list);
+ +	} else
+ +		list_add_rcu(&va->list, &vmap_area_list);
+  }
+  
+ -static __always_inline void
+ -unlink_va(struct vmap_area *va, struct rb_root *root)
+ -{
+ -	/*
+ -	 * During merging a VA node can be empty, therefore
+ -	 * not linked with the tree nor list. Just check it.
+ -	 */
+ -	if (!RB_EMPTY_NODE(&va->rb_node)) {
+ -		if (root == &free_vmap_area_root)
+ -			rb_erase_augmented(&va->rb_node,
+ -				root, &free_vmap_area_rb_augment_cb);
+ -		else
+ -			rb_erase(&va->rb_node, root);
+ +static void purge_vmap_area_lazy(void);
+  
+++<<<<<<< HEAD
+ +static BLOCKING_NOTIFIER_HEAD(vmap_notify_list);
+++=======
++ 		list_del(&va->list);
++ 		RB_CLEAR_NODE(&va->rb_node);
++ 	}
++ }
++ 
++ #if DEBUG_AUGMENT_PROPAGATE_CHECK
++ static void
++ augment_tree_propagate_check(struct rb_node *n)
++ {
++ 	struct vmap_area *va;
++ 	struct rb_node *node;
++ 	unsigned long size;
++ 	bool found = false;
++ 
++ 	if (n == NULL)
++ 		return;
++ 
++ 	va = rb_entry(n, struct vmap_area, rb_node);
++ 	size = va->subtree_max_size;
++ 	node = n;
++ 
++ 	while (node) {
++ 		va = rb_entry(node, struct vmap_area, rb_node);
++ 
++ 		if (get_subtree_max_size(node->rb_left) == size) {
++ 			node = node->rb_left;
++ 		} else {
++ 			if (va_size(va) == size) {
++ 				found = true;
++ 				break;
++ 			}
++ 
++ 			node = node->rb_right;
++ 		}
++ 	}
++ 
++ 	if (!found) {
++ 		va = rb_entry(n, struct vmap_area, rb_node);
++ 		pr_emerg("tree is corrupted: %lu, %lu\n",
++ 			va_size(va), va->subtree_max_size);
++ 	}
++ 
++ 	augment_tree_propagate_check(n->rb_left);
++ 	augment_tree_propagate_check(n->rb_right);
++ }
++ #endif
++ 
++ /*
++  * This function populates subtree_max_size from bottom to upper
++  * levels starting from VA point. The propagation must be done
++  * when VA size is modified by changing its va_start/va_end. Or
++  * in case of newly inserting of VA to the tree.
++  *
++  * It means that __augment_tree_propagate_from() must be called:
++  * - After VA has been inserted to the tree(free path);
++  * - After VA has been shrunk(allocation path);
++  * - After VA has been increased(merging path).
++  *
++  * Please note that, it does not mean that upper parent nodes
++  * and their subtree_max_size are recalculated all the time up
++  * to the root node.
++  *
++  *       4--8
++  *        /\
++  *       /  \
++  *      /    \
++  *    2--2  8--8
++  *
++  * For example if we modify the node 4, shrinking it to 2, then
++  * no any modification is required. If we shrink the node 2 to 1
++  * its subtree_max_size is updated only, and set to 1. If we shrink
++  * the node 8 to 6, then its subtree_max_size is set to 6 and parent
++  * node becomes 4--6.
++  */
++ static __always_inline void
++ augment_tree_propagate_from(struct vmap_area *va)
++ {
++ 	struct rb_node *node = &va->rb_node;
++ 	unsigned long new_va_sub_max_size;
++ 
++ 	while (node) {
++ 		va = rb_entry(node, struct vmap_area, rb_node);
++ 		new_va_sub_max_size = compute_subtree_max_size(va);
++ 
++ 		/*
++ 		 * If the newly calculated maximum available size of the
++ 		 * subtree is equal to the current one, then it means that
++ 		 * the tree is propagated correctly. So we have to stop at
++ 		 * this point to save cycles.
++ 		 */
++ 		if (va->subtree_max_size == new_va_sub_max_size)
++ 			break;
++ 
++ 		va->subtree_max_size = new_va_sub_max_size;
++ 		node = rb_parent(&va->rb_node);
++ 	}
++ 
++ #if DEBUG_AUGMENT_PROPAGATE_CHECK
++ 	augment_tree_propagate_check(free_vmap_area_root.rb_node);
++ #endif
++ }
++ 
++ static void
++ insert_vmap_area(struct vmap_area *va,
++ 	struct rb_root *root, struct list_head *head)
++ {
++ 	struct rb_node **link;
++ 	struct rb_node *parent;
++ 
++ 	link = find_va_links(va, root, NULL, &parent);
++ 	link_va(va, root, parent, link, head);
++ }
++ 
++ static void
++ insert_vmap_area_augment(struct vmap_area *va,
++ 	struct rb_node *from, struct rb_root *root,
++ 	struct list_head *head)
++ {
++ 	struct rb_node **link;
++ 	struct rb_node *parent;
++ 
++ 	if (from)
++ 		link = find_va_links(va, NULL, from, &parent);
++ 	else
++ 		link = find_va_links(va, root, NULL, &parent);
++ 
++ 	link_va(va, root, parent, link, head);
++ 	augment_tree_propagate_from(va);
++ }
++ 
++ /*
++  * Merge de-allocated chunk of VA memory with previous
++  * and next free blocks. If coalesce is not done a new
++  * free area is inserted. If VA has been merged, it is
++  * freed.
++  */
++ static __always_inline void
++ merge_or_add_vmap_area(struct vmap_area *va,
++ 	struct rb_root *root, struct list_head *head)
++ {
++ 	struct vmap_area *sibling;
++ 	struct list_head *next;
++ 	struct rb_node **link;
++ 	struct rb_node *parent;
++ 	bool merged = false;
++ 
++ 	/*
++ 	 * Find a place in the tree where VA potentially will be
++ 	 * inserted, unless it is merged with its sibling/siblings.
++ 	 */
++ 	link = find_va_links(va, root, NULL, &parent);
++ 
++ 	/*
++ 	 * Get next node of VA to check if merging can be done.
++ 	 */
++ 	next = get_va_next_sibling(parent, link);
++ 	if (unlikely(next == NULL))
++ 		goto insert;
++ 
++ 	/*
++ 	 * start            end
++ 	 * |                |
++ 	 * |<------VA------>|<-----Next----->|
++ 	 *                  |                |
++ 	 *                  start            end
++ 	 */
++ 	if (next != head) {
++ 		sibling = list_entry(next, struct vmap_area, list);
++ 		if (sibling->va_start == va->va_end) {
++ 			sibling->va_start = va->va_start;
++ 
++ 			/* Check and update the tree if needed. */
++ 			augment_tree_propagate_from(sibling);
++ 
++ 			/* Remove this VA, it has been merged. */
++ 			unlink_va(va, root);
++ 
++ 			/* Free vmap_area object. */
++ 			kmem_cache_free(vmap_area_cachep, va);
++ 
++ 			/* Point to the new merged area. */
++ 			va = sibling;
++ 			merged = true;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * start            end
++ 	 * |                |
++ 	 * |<-----Prev----->|<------VA------>|
++ 	 *                  |                |
++ 	 *                  start            end
++ 	 */
++ 	if (next->prev != head) {
++ 		sibling = list_entry(next->prev, struct vmap_area, list);
++ 		if (sibling->va_end == va->va_start) {
++ 			sibling->va_end = va->va_end;
++ 
++ 			/* Check and update the tree if needed. */
++ 			augment_tree_propagate_from(sibling);
++ 
++ 			/* Remove this VA, it has been merged. */
++ 			unlink_va(va, root);
++ 
++ 			/* Free vmap_area object. */
++ 			kmem_cache_free(vmap_area_cachep, va);
++ 
++ 			return;
++ 		}
++ 	}
++ 
++ insert:
++ 	if (!merged) {
++ 		link_va(va, root, parent, link, head);
++ 		augment_tree_propagate_from(va);
++ 	}
++ }
++ 
++ static __always_inline bool
++ is_within_this_va(struct vmap_area *va, unsigned long size,
++ 	unsigned long align, unsigned long vstart)
++ {
++ 	unsigned long nva_start_addr;
++ 
++ 	if (va->va_start > vstart)
++ 		nva_start_addr = ALIGN(va->va_start, align);
++ 	else
++ 		nva_start_addr = ALIGN(vstart, align);
++ 
++ 	/* Can be overflowed due to big size or alignment. */
++ 	if (nva_start_addr + size < nva_start_addr ||
++ 			nva_start_addr < vstart)
++ 		return false;
++ 
++ 	return (nva_start_addr + size <= va->va_end);
++ }
++ 
++ /*
++  * Find the first free block(lowest start address) in the tree,
++  * that will accomplish the request corresponding to passing
++  * parameters.
++  */
++ static __always_inline struct vmap_area *
++ find_vmap_lowest_match(unsigned long size,
++ 	unsigned long align, unsigned long vstart)
++ {
++ 	struct vmap_area *va;
++ 	struct rb_node *node;
++ 	unsigned long length;
++ 
++ 	/* Start from the root. */
++ 	node = free_vmap_area_root.rb_node;
++ 
++ 	/* Adjust the search size for alignment overhead. */
++ 	length = size + align - 1;
++ 
++ 	while (node) {
++ 		va = rb_entry(node, struct vmap_area, rb_node);
++ 
++ 		if (get_subtree_max_size(node->rb_left) >= length &&
++ 				vstart < va->va_start) {
++ 			node = node->rb_left;
++ 		} else {
++ 			if (is_within_this_va(va, size, align, vstart))
++ 				return va;
++ 
++ 			/*
++ 			 * Does not make sense to go deeper towards the right
++ 			 * sub-tree if it does not have a free block that is
++ 			 * equal or bigger to the requested search length.
++ 			 */
++ 			if (get_subtree_max_size(node->rb_right) >= length) {
++ 				node = node->rb_right;
++ 				continue;
++ 			}
++ 
++ 			/*
++ 			 * OK. We roll back and find the first right sub-tree,
++ 			 * that will satisfy the search criteria. It can happen
++ 			 * only once due to "vstart" restriction.
++ 			 */
++ 			while ((node = rb_parent(node))) {
++ 				va = rb_entry(node, struct vmap_area, rb_node);
++ 				if (is_within_this_va(va, size, align, vstart))
++ 					return va;
++ 
++ 				if (get_subtree_max_size(node->rb_right) >= length &&
++ 						vstart <= va->va_start) {
++ 					node = node->rb_right;
++ 					break;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ #if DEBUG_AUGMENT_LOWEST_MATCH_CHECK
++ #include <linux/random.h>
++ 
++ static struct vmap_area *
++ find_vmap_lowest_linear_match(unsigned long size,
++ 	unsigned long align, unsigned long vstart)
++ {
++ 	struct vmap_area *va;
++ 
++ 	list_for_each_entry(va, &free_vmap_area_list, list) {
++ 		if (!is_within_this_va(va, size, align, vstart))
++ 			continue;
++ 
++ 		return va;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static void
++ find_vmap_lowest_match_check(unsigned long size)
++ {
++ 	struct vmap_area *va_1, *va_2;
++ 	unsigned long vstart;
++ 	unsigned int rnd;
++ 
++ 	get_random_bytes(&rnd, sizeof(rnd));
++ 	vstart = VMALLOC_START + rnd;
++ 
++ 	va_1 = find_vmap_lowest_match(size, 1, vstart);
++ 	va_2 = find_vmap_lowest_linear_match(size, 1, vstart);
++ 
++ 	if (va_1 != va_2)
++ 		pr_emerg("not lowest: t: 0x%p, l: 0x%p, v: 0x%lx\n",
++ 			va_1, va_2, vstart);
++ }
++ #endif
++ 
++ enum fit_type {
++ 	NOTHING_FIT = 0,
++ 	FL_FIT_TYPE = 1,	/* full fit */
++ 	LE_FIT_TYPE = 2,	/* left edge fit */
++ 	RE_FIT_TYPE = 3,	/* right edge fit */
++ 	NE_FIT_TYPE = 4		/* no edge fit */
++ };
++ 
++ static __always_inline enum fit_type
++ classify_va_fit_type(struct vmap_area *va,
++ 	unsigned long nva_start_addr, unsigned long size)
++ {
++ 	enum fit_type type;
++ 
++ 	/* Check if it is within VA. */
++ 	if (nva_start_addr < va->va_start ||
++ 			nva_start_addr + size > va->va_end)
++ 		return NOTHING_FIT;
++ 
++ 	/* Now classify. */
++ 	if (va->va_start == nva_start_addr) {
++ 		if (va->va_end == nva_start_addr + size)
++ 			type = FL_FIT_TYPE;
++ 		else
++ 			type = LE_FIT_TYPE;
++ 	} else if (va->va_end == nva_start_addr + size) {
++ 		type = RE_FIT_TYPE;
++ 	} else {
++ 		type = NE_FIT_TYPE;
++ 	}
++ 
++ 	return type;
++ }
++ 
++ static __always_inline int
++ adjust_va_to_fit_type(struct vmap_area *va,
++ 	unsigned long nva_start_addr, unsigned long size,
++ 	enum fit_type type)
++ {
++ 	struct vmap_area *lva = NULL;
++ 
++ 	if (type == FL_FIT_TYPE) {
++ 		/*
++ 		 * No need to split VA, it fully fits.
++ 		 *
++ 		 * |               |
++ 		 * V      NVA      V
++ 		 * |---------------|
++ 		 */
++ 		unlink_va(va, &free_vmap_area_root);
++ 		kmem_cache_free(vmap_area_cachep, va);
++ 	} else if (type == LE_FIT_TYPE) {
++ 		/*
++ 		 * Split left edge of fit VA.
++ 		 *
++ 		 * |       |
++ 		 * V  NVA  V   R
++ 		 * |-------|-------|
++ 		 */
++ 		va->va_start += size;
++ 	} else if (type == RE_FIT_TYPE) {
++ 		/*
++ 		 * Split right edge of fit VA.
++ 		 *
++ 		 *         |       |
++ 		 *     L   V  NVA  V
++ 		 * |-------|-------|
++ 		 */
++ 		va->va_end = nva_start_addr;
++ 	} else if (type == NE_FIT_TYPE) {
++ 		/*
++ 		 * Split no edge of fit VA.
++ 		 *
++ 		 *     |       |
++ 		 *   L V  NVA  V R
++ 		 * |---|-------|---|
++ 		 */
++ 		lva = kmem_cache_alloc(vmap_area_cachep, GFP_NOWAIT);
++ 		if (unlikely(!lva))
++ 			return -1;
++ 
++ 		/*
++ 		 * Build the remainder.
++ 		 */
++ 		lva->va_start = va->va_start;
++ 		lva->va_end = nva_start_addr;
++ 
++ 		/*
++ 		 * Shrink this VA to remaining size.
++ 		 */
++ 		va->va_start = nva_start_addr + size;
++ 	} else {
++ 		return -1;
++ 	}
++ 
++ 	if (type != FL_FIT_TYPE) {
++ 		augment_tree_propagate_from(va);
++ 
++ 		if (lva)	/* type == NE_FIT_TYPE */
++ 			insert_vmap_area_augment(lva, &va->rb_node,
++ 				&free_vmap_area_root, &free_vmap_area_list);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Returns a start address of the newly allocated area, if success.
++  * Otherwise a vend is returned that indicates failure.
++  */
++ static __always_inline unsigned long
++ __alloc_vmap_area(unsigned long size, unsigned long align,
++ 	unsigned long vstart, unsigned long vend)
++ {
++ 	unsigned long nva_start_addr;
++ 	struct vmap_area *va;
++ 	enum fit_type type;
++ 	int ret;
++ 
++ 	va = find_vmap_lowest_match(size, align, vstart);
++ 	if (unlikely(!va))
++ 		return vend;
++ 
++ 	if (va->va_start > vstart)
++ 		nva_start_addr = ALIGN(va->va_start, align);
++ 	else
++ 		nva_start_addr = ALIGN(vstart, align);
++ 
++ 	/* Check the "vend" restriction. */
++ 	if (nva_start_addr + size > vend)
++ 		return vend;
++ 
++ 	/* Classify what we have found. */
++ 	type = classify_va_fit_type(va, nva_start_addr, size);
++ 	if (WARN_ON_ONCE(type == NOTHING_FIT))
++ 		return vend;
++ 
++ 	/* Update the free vmap_area. */
++ 	ret = adjust_va_to_fit_type(va, nva_start_addr, size, type);
++ 	if (ret)
++ 		return vend;
++ 
++ #if DEBUG_AUGMENT_LOWEST_MATCH_CHECK
++ 	find_vmap_lowest_match_check(size);
++ #endif
++ 
++ 	return nva_start_addr;
++ }
+++>>>>>>> cacca6baf0b0 (mm/vmalloc.c: remove "node" argument)
+  
+  /*
+   * Allocate a region of KVA of the specified size and alignment, within the
+@@@ -433,76 -1058,13 +920,81 @@@ static struct vmap_area *alloc_vmap_are
+  
+  retry:
+  	spin_lock(&vmap_area_lock);
+ -
+  	/*
+ -	 * If an allocation fails, the "vend" address is
+ -	 * returned. Therefore trigger the overflow path.
+ +	 * Invalidate cache if we have more permissive parameters.
+ +	 * cached_hole_size notes the largest hole noticed _below_
+ +	 * the vmap_area cached in free_vmap_cache: if size fits
+ +	 * into that hole, we want to scan from vstart to reuse
+ +	 * the hole instead of allocating above free_vmap_cache.
+ +	 * Note that __free_vmap_area may update free_vmap_cache
+ +	 * without updating cached_hole_size or cached_align.
+  	 */
+++<<<<<<< HEAD
+ +	if (!free_vmap_cache ||
+ +			size < cached_hole_size ||
+ +			vstart < cached_vstart ||
+ +			align < cached_align) {
+ +nocache:
+ +		cached_hole_size = 0;
+ +		free_vmap_cache = NULL;
+ +	}
+ +	/* record if we encounter less permissive parameters */
+ +	cached_vstart = vstart;
+ +	cached_align = align;
+ +
+ +	/* find starting point for our search */
+ +	if (free_vmap_cache) {
+ +		first = rb_entry(free_vmap_cache, struct vmap_area, rb_node);
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr < vstart)
+ +			goto nocache;
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +	} else {
+ +		addr = ALIGN(vstart, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +		n = vmap_area_root.rb_node;
+ +		first = NULL;
+ +
+ +		while (n) {
+ +			struct vmap_area *tmp;
+ +			tmp = rb_entry(n, struct vmap_area, rb_node);
+ +			if (tmp->va_end >= addr) {
+ +				first = tmp;
+ +				if (tmp->va_start <= addr)
+ +					break;
+ +				n = n->rb_left;
+ +			} else
+ +				n = n->rb_right;
+ +		}
+ +
+ +		if (!first)
+ +			goto found;
+ +	}
+ +
+ +	/* from the starting point, walk areas until a suitable hole is found */
+ +	while (addr + size > first->va_start && addr + size <= vend) {
+ +		if (addr + cached_hole_size < first->va_start)
+ +			cached_hole_size = first->va_start - addr;
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +		if (list_is_last(&first->list, &vmap_area_list))
+ +			goto found;
+ +
+ +		first = list_next_entry(first, list);
+ +	}
+ +
+ +found:
+ +	if (addr + size > vend)
+++=======
++ 	addr = __alloc_vmap_area(size, align, vstart, vend);
++ 	if (unlikely(addr == vend))
+++>>>>>>> cacca6baf0b0 (mm/vmalloc.c: remove "node" argument)
+  		goto overflow;
+  
+  	va->va_start = addr;
+* Unmerged path mm/vmalloc.c
