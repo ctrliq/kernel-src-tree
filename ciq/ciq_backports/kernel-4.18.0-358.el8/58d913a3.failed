@@ -1,0 +1,163 @@
+net: bridge: multicast: add context support for host-joined groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 58d913a32664fae5ac2ccd9a9c23b8e7037df740
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/58d913a3.failed
+
+Adding bridge multicast context support for host-joined groups is easy
+because we only need the proper timer value. We pass the already chosen
+context and use its timer value.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 58d913a32664fae5ac2ccd9a9c23b8e7037df740)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+diff --cc net/bridge/br_multicast.c
+index def6f1840985,470f1ec3b579..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -811,27 -1312,21 +811,40 @@@ struct net_bridge_port_group *br_multic
+  	return p;
+  }
+  
+++<<<<<<< HEAD
+ +static bool br_port_group_equal(struct net_bridge_port_group *p,
+ +				struct net_bridge_port *port,
+ +				const unsigned char *src)
+ +{
+ +	if (p->port != port)
+ +		return false;
+ +
+ +	if (!(port->flags & BR_MULTICAST_TO_UNICAST))
+ +		return true;
+ +
+ +	return ether_addr_equal(src, p->eth_addr);
+ +}
+ +
+ +void br_multicast_host_join(struct net_bridge_mdb_entry *mp, bool notify)
+++=======
++ void br_multicast_host_join(const struct net_bridge_mcast *brmctx,
++ 			    struct net_bridge_mdb_entry *mp, bool notify)
+++>>>>>>> 58d913a32664 (net: bridge: multicast: add context support for host-joined groups)
+  {
+  	if (!mp->host_joined) {
+  		mp->host_joined = true;
+  		if (notify)
+  			br_mdb_notify(mp->br->dev, mp, NULL, RTM_NEWMDB);
+  	}
+++<<<<<<< HEAD
+ +	mod_timer(&mp->timer, jiffies + mp->br->multicast_membership_interval);
+++=======
++ 
++ 	if (br_group_is_l2(&mp->addr))
++ 		return;
++ 
++ 	mod_timer(&mp->timer, jiffies + brmctx->multicast_membership_interval);
+++>>>>>>> 58d913a32664 (net: bridge: multicast: add context support for host-joined groups)
+  }
+  
+  void br_multicast_host_leave(struct net_bridge_mdb_entry *mp, bool notify)
+@@@ -844,8 -1341,63 +857,68 @@@
+  		br_mdb_notify(mp->br->dev, mp, NULL, RTM_DELMDB);
+  }
+  
+++<<<<<<< HEAD
+ +static int br_multicast_add_group(struct net_bridge *br,
+ +				  struct net_bridge_port *port,
+++=======
++ static struct net_bridge_port_group *
++ __br_multicast_add_group(struct net_bridge_mcast *brmctx,
++ 			 struct net_bridge_mcast_port *pmctx,
++ 			 struct br_ip *group,
++ 			 const unsigned char *src,
++ 			 u8 filter_mode,
++ 			 bool igmpv2_mldv1,
++ 			 bool blocked)
++ {
++ 	struct net_bridge_port_group __rcu **pp;
++ 	struct net_bridge_port_group *p = NULL;
++ 	struct net_bridge_mdb_entry *mp;
++ 	unsigned long now = jiffies;
++ 
++ 	if (!br_multicast_ctx_should_use(brmctx, pmctx))
++ 		goto out;
++ 
++ 	mp = br_multicast_new_group(brmctx->br, group);
++ 	if (IS_ERR(mp))
++ 		return ERR_CAST(mp);
++ 
++ 	if (!pmctx) {
++ 		br_multicast_host_join(brmctx, mp, true);
++ 		goto out;
++ 	}
++ 
++ 	for (pp = &mp->ports;
++ 	     (p = mlock_dereference(*pp, brmctx->br)) != NULL;
++ 	     pp = &p->next) {
++ 		if (br_port_group_equal(p, pmctx->port, src))
++ 			goto found;
++ 		if ((unsigned long)p->key.port < (unsigned long)pmctx->port)
++ 			break;
++ 	}
++ 
++ 	p = br_multicast_new_port_group(pmctx->port, group, *pp, 0, src,
++ 					filter_mode, RTPROT_KERNEL);
++ 	if (unlikely(!p)) {
++ 		p = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
++ 	rcu_assign_pointer(*pp, p);
++ 	if (blocked)
++ 		p->flags |= MDB_PG_FLAGS_BLOCKED;
++ 	br_mdb_notify(brmctx->br->dev, mp, p, RTM_NEWMDB);
++ 
++ found:
++ 	if (igmpv2_mldv1)
++ 		mod_timer(&p->timer,
++ 			  now + brmctx->multicast_membership_interval);
++ 
++ out:
++ 	return p;
++ }
++ 
++ static int br_multicast_add_group(struct net_bridge_mcast *brmctx,
++ 				  struct net_bridge_mcast_port *pmctx,
+++>>>>>>> 58d913a32664 (net: bridge: multicast: add context support for host-joined groups)
+  				  struct br_ip *group,
+  				  const unsigned char *src,
+  				  u8 filter_mode,
+diff --git a/net/bridge/br_mdb.c b/net/bridge/br_mdb.c
+index 5621f5510fd4..efbad8a6e5d5 100644
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@ -772,7 +772,7 @@ static int br_mdb_add_group(struct net_bridge *br, struct net_bridge_port *port,
+ 			return -EEXIST;
+ 		}
+ 
+-		br_multicast_host_join(mp, false);
++		br_multicast_host_join(brmctx, mp, false);
+ 		br_mdb_notify(br->dev, mp, NULL, RTM_NEWMDB);
+ 
+ 		return 0;
+* Unmerged path net/bridge/br_multicast.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 59db848b9ec6..3d9e656d4f8b 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -752,7 +752,8 @@ void br_multicast_get_stats(const struct net_bridge *br,
+ 			    struct br_mcast_stats *dest);
+ void br_mdb_init(void);
+ void br_mdb_uninit(void);
+-void br_multicast_host_join(struct net_bridge_mdb_entry *mp, bool notify);
++void br_multicast_host_join(const struct net_bridge_mcast *brmctx,
++			    struct net_bridge_mdb_entry *mp, bool notify);
+ void br_multicast_host_leave(struct net_bridge_mdb_entry *mp, bool notify);
+ 
+ #define mlock_dereference(X, br) \
