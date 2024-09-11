@@ -130,21 +130,22 @@ static void neigh_mark_dead(struct neighbour *n)
 
 static void neigh_update_gc_list(struct neighbour *n)
 {
-	bool on_gc_list, new_is_perm;
+	bool on_gc_list, exempt_from_gc;
 
 	write_lock_bh(&n->tbl->lock);
 	write_lock(&n->lock);
 
-	/* remove from the gc list if new state is permanent;
-	 * add to the gc list if new state is not permanent
+	/* remove from the gc list if new state is permanent or if neighbor
+	 * is externally learned; otherwise entry should be on the gc list
 	 */
-	new_is_perm = n->nud_state & NUD_PERMANENT;
+	exempt_from_gc = n->nud_state & NUD_PERMANENT ||
+			 n->flags & NTF_EXT_LEARNED;
 	on_gc_list = !list_empty(&n->gc_list);
 
-	if (new_is_perm && on_gc_list) {
+	if (exempt_from_gc && on_gc_list) {
 		list_del_init(&n->gc_list);
 		atomic_dec(&n->tbl->gc_entries);
-	} else if (!new_is_perm && !on_gc_list) {
+	} else if (!exempt_from_gc && !on_gc_list) {
 		/* add entries to the tail; cleaning removes from the front */
 		list_add_tail(&n->gc_list, &n->tbl->gc_list);
 		atomic_inc(&n->tbl->gc_entries);
@@ -154,13 +155,14 @@ static void neigh_update_gc_list(struct neighbour *n)
 	write_unlock_bh(&n->tbl->lock);
 }
 
-static void neigh_update_ext_learned(struct neighbour *neigh, u32 flags,
+static bool neigh_update_ext_learned(struct neighbour *neigh, u32 flags,
 				     int *notify)
 {
+	bool rc = false;
 	u8 ndm_flags;
 
 	if (!(flags & NEIGH_UPDATE_F_ADMIN))
-		return;
+		return rc;
 
 	ndm_flags = (flags & NEIGH_UPDATE_F_EXT_LEARNED) ? NTF_EXT_LEARNED : 0;
 	if ((neigh->flags ^ ndm_flags) & NTF_EXT_LEARNED) {
@@ -168,8 +170,11 @@ static void neigh_update_ext_learned(struct neighbour *neigh, u32 flags,
 			neigh->flags |= NTF_EXT_LEARNED;
 		else
 			neigh->flags &= ~NTF_EXT_LEARNED;
+		rc = true;
 		*notify = 1;
 	}
+
+	return rc;
 }
 
 static bool neigh_del(struct neighbour *n, struct neighbour __rcu **np,
@@ -220,7 +225,6 @@ static int neigh_forced_gc(struct neigh_table *tbl)
 {
 	int max_clean = atomic_read(&tbl->gc_entries) - tbl->gc_thresh2;
 	unsigned long tref = jiffies - 5 * HZ;
-	u8 flags = NTF_EXT_LEARNED;
 	struct neighbour *n, *tmp;
 	int shrunk = 0;
 
@@ -234,7 +238,7 @@ static int neigh_forced_gc(struct neigh_table *tbl)
 
 			write_lock(&n->lock);
 			if ((n->nud_state == NUD_FAILED) ||
-			    (!(n->flags & flags) && time_after(tref, n->updated)))
+			    time_after(tref, n->updated))
 				remove = true;
 			write_unlock(&n->lock);
 
@@ -372,13 +376,13 @@ EXPORT_SYMBOL(neigh_ifdown);
 
 static struct neighbour *neigh_alloc(struct neigh_table *tbl,
 				     struct net_device *dev,
-				     bool permanent)
+				     bool exempt_from_gc)
 {
 	struct neighbour *n = NULL;
 	unsigned long now = jiffies;
 	int entries;
 
-	if (permanent)
+	if (exempt_from_gc)
 		goto do_alloc;
 
 	entries = atomic_inc_return(&tbl->gc_entries) - 1;
@@ -420,7 +424,7 @@ out:
 	return n;
 
 out_entries:
-	if (!permanent)
+	if (!exempt_from_gc)
 		atomic_dec(&tbl->gc_entries);
 	goto out;
 }
@@ -567,9 +571,9 @@ EXPORT_SYMBOL(neigh_lookup_nodev);
 static struct neighbour *___neigh_create(struct neigh_table *tbl,
 					 const void *pkey,
 					 struct net_device *dev,
-					 bool permanent, bool want_ref)
+					 bool exempt_from_gc, bool want_ref)
 {
-	struct neighbour *n1, *rc, *n = neigh_alloc(tbl, dev, permanent);
+	struct neighbour *n1, *rc, *n = neigh_alloc(tbl, dev, exempt_from_gc);
 	u32 hash_val;
 	unsigned int key_len = tbl->key_len;
 	int error;
@@ -635,7 +639,7 @@ static struct neighbour *___neigh_create(struct neigh_table *tbl,
 	}
 
 	n->dead = 0;
-	if (!permanent)
+	if (!exempt_from_gc)
 		list_add_tail(&n->gc_list, &n->tbl->gc_list);
 
 	if (want_ref)
@@ -1214,6 +1218,7 @@ static int __neigh_update(struct neighbour *neigh, const u8 *lladdr,
 			  u8 new, u32 flags, u32 nlmsg_pid,
 			  struct netlink_ext_ack *extack)
 {
+	bool ext_learn_change = false;
 	u8 old;
 	int err;
 	int notify = 0;
@@ -1236,7 +1241,7 @@ static int __neigh_update(struct neighbour *neigh, const u8 *lladdr,
 		goto out;
 	}
 
-	neigh_update_ext_learned(neigh, flags, &notify);
+	ext_learn_change = neigh_update_ext_learned(neigh, flags, &notify);
 
 	if (!(new & NUD_VALID)) {
 		neigh_del_timer(neigh);
@@ -1379,7 +1384,7 @@ out:
 		neigh_update_is_router(neigh, flags, &notify);
 	write_unlock_bh(&neigh->lock);
 
-	if ((new ^ old) & NUD_PERMANENT)
+	if (((new ^ old) & NUD_PERMANENT) || ext_learn_change)
 		neigh_update_gc_list(neigh);
 
 	if (notify)
@@ -1911,14 +1916,16 @@ static int neigh_add(struct sk_buff *skb, struct nlmsghdr *nlh,
 
 	neigh = neigh_lookup(tbl, dst, dev);
 	if (neigh == NULL) {
+		bool exempt_from_gc;
+
 		if (!(nlh->nlmsg_flags & NLM_F_CREATE)) {
 			err = -ENOENT;
 			goto out;
 		}
 
-		neigh = ___neigh_create(tbl, dst, dev,
-					ndm->ndm_state & NUD_PERMANENT,
-					true);
+		exempt_from_gc = ndm->ndm_state & NUD_PERMANENT ||
+				 ndm->ndm_flags & NTF_EXT_LEARNED;
+		neigh = ___neigh_create(tbl, dst, dev, exempt_from_gc, true);
 		if (IS_ERR(neigh)) {
 			err = PTR_ERR(neigh);
 			goto out;
