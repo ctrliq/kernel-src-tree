@@ -1,0 +1,830 @@
+drm/i915/tc/tgl: Implement TC cold sequences
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author José Roberto de Souza <jose.souza@intel.com>
+commit 3c02934b24e37344b8c1c6f9df55efc8891e6251
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3c02934b.failed
+
+TC ports can enter in TCCOLD to save power and is required to request
+to PCODE to exit this state before use or read to TC registers.
+
+For TGL there is a new MBOX command to do that with a parameter to ask
+PCODE to exit and block TCCOLD entry or unblock TCCOLD entry.
+
+So adding a new power domain to reuse the refcount and only allow
+TC cold when all TC ports are not in use.
+
+v2:
+- fixed missing case in intel_display_power_domain_str()
+- moved tgl_tc_cold_request to intel_display_power.c
+- renamed TGL_TC_COLD_OFF to TGL_TC_COLD_OFF_POWER_DOMAINS
+- added all TC and TBT aux power domains to
+TGL_TC_COLD_OFF_POWER_DOMAINS
+
+v3:
+- added one msec sleep when PCODE returns -EAGAIN
+- added timeout of 5msec to not loop forever if
+sandybridge_pcode_write_timeout() keeps returning -EAGAIN
+
+v4:
+- Made failure to block or unblock TC cold a error
+- removed 5msec timeout, instead giving PCODE 1msec by up 3 times to
+recover from the internal error
+
+v5:
+- only sleeping 1msec when ret is -EAGAIN
+
+BSpec: 49294
+	Cc: Imre Deak <imre.deak@intel.com>
+	Cc: Cooper Chiou <cooper.chiou@intel.com>
+	Cc: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Reviewed-by: Imre Deak <imre.deak@intel.com>
+	Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200414194956.164323-6-jose.souza@intel.com
+(cherry picked from commit 3c02934b24e37344b8c1c6f9df55efc8891e6251)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display_power.c
+#	drivers/gpu/drm/i915/display/intel_display_power.h
+#	drivers/gpu/drm/i915/display/intel_tc.c
+diff --cc drivers/gpu/drm/i915/display/intel_display_power.c
+index dd1a43a366f2,ff76a5fdbdbe..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_power.c
++++ b/drivers/gpu/drm/i915/display/intel_display_power.c
+@@@ -117,6 -149,10 +117,13 @@@ intel_display_power_domain_str(enum int
+  		return "MODESET";
+  	case POWER_DOMAIN_GT_IRQ:
+  		return "GT_IRQ";
+++<<<<<<< HEAD
+++=======
++ 	case POWER_DOMAIN_DPLL_DC_OFF:
++ 		return "DPLL_DC_OFF";
++ 	case POWER_DOMAIN_TC_COLD_OFF:
++ 		return "TC_COLD_OFF";
+++>>>>>>> 3c02934b24e3 (drm/i915/tc/tgl: Implement TC cold sequences)
+  	default:
+  		MISSING_CASE(domain);
+  		return "?";
+@@@ -2388,23 -2748,136 +2395,38 @@@ void intel_display_power_put(struct drm
+  	BIT_ULL(POWER_DOMAIN_AUX_A))
+  #define ICL_AUX_B_IO_POWER_DOMAINS (			\
+  	BIT_ULL(POWER_DOMAIN_AUX_B))
+ -#define ICL_AUX_C_TC1_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_C))
+ -#define ICL_AUX_D_TC2_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_D))
+ -#define ICL_AUX_E_TC3_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_E))
+ -#define ICL_AUX_F_TC4_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_F))
+ -#define ICL_AUX_C_TBT1_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_C_TBT))
+ -#define ICL_AUX_D_TBT2_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_D_TBT))
+ -#define ICL_AUX_E_TBT3_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_E_TBT))
+ -#define ICL_AUX_F_TBT4_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_F_TBT))
+ -
+ -#define TGL_PW_5_POWER_DOMAINS (			\
+ -	BIT_ULL(POWER_DOMAIN_PIPE_D) |			\
+ -	BIT_ULL(POWER_DOMAIN_TRANSCODER_D) |		\
+ -	BIT_ULL(POWER_DOMAIN_PIPE_D_PANEL_FITTER) |     \
+ -	BIT_ULL(POWER_DOMAIN_INIT))
+ -
+ -#define TGL_PW_4_POWER_DOMAINS (			\
+ -	TGL_PW_5_POWER_DOMAINS |			\
+ -	BIT_ULL(POWER_DOMAIN_PIPE_C) |			\
+ -	BIT_ULL(POWER_DOMAIN_TRANSCODER_C) |		\
+ -	BIT_ULL(POWER_DOMAIN_PIPE_C_PANEL_FITTER) |	\
+ -	BIT_ULL(POWER_DOMAIN_INIT))
+ -
+ -#define TGL_PW_3_POWER_DOMAINS (			\
+ -	TGL_PW_4_POWER_DOMAINS |			\
+ -	BIT_ULL(POWER_DOMAIN_PIPE_B) |			\
+ -	BIT_ULL(POWER_DOMAIN_TRANSCODER_B) |		\
+ -	BIT_ULL(POWER_DOMAIN_PIPE_B_PANEL_FITTER) |	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_D_LANES) |	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_E_LANES) |	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_F_LANES) |	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_G_LANES) |	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_H_LANES) |	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_I_LANES) |	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_D) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_E) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_F) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_G) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_H) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_I) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_D_TBT) |		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_E_TBT) |		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_F_TBT) |		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_G_TBT) |		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_H_TBT) |		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_I_TBT) |		\
+ -	BIT_ULL(POWER_DOMAIN_VGA) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUDIO) |			\
+ -	BIT_ULL(POWER_DOMAIN_INIT))
+ -
+ -#define TGL_PW_2_POWER_DOMAINS (			\
+ -	TGL_PW_3_POWER_DOMAINS |			\
+ -	BIT_ULL(POWER_DOMAIN_TRANSCODER_VDSC_PW2) |	\
+ -	BIT_ULL(POWER_DOMAIN_INIT))
+ -
+ -#define TGL_DISPLAY_DC_OFF_POWER_DOMAINS (		\
+ -	TGL_PW_3_POWER_DOMAINS |			\
+ -	BIT_ULL(POWER_DOMAIN_MODESET) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_A) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_B) |			\
+ -	BIT_ULL(POWER_DOMAIN_AUX_C) |			\
+ -	BIT_ULL(POWER_DOMAIN_INIT))
+ -
+ -#define TGL_DDI_IO_D_TC1_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_D_IO))
+ -#define TGL_DDI_IO_E_TC2_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_E_IO))
+ -#define TGL_DDI_IO_F_TC3_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_F_IO))
+ -#define TGL_DDI_IO_G_TC4_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_G_IO))
+ -#define TGL_DDI_IO_H_TC5_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_H_IO))
+ -#define TGL_DDI_IO_I_TC6_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_PORT_DDI_I_IO))
+ -
+ -#define TGL_AUX_A_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_IO_A) |	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_A))
+ -#define TGL_AUX_B_IO_POWER_DOMAINS (		\
+ -	BIT_ULL(POWER_DOMAIN_AUX_B))
+ -#define TGL_AUX_C_IO_POWER_DOMAINS (		\
+ +#define ICL_AUX_C_IO_POWER_DOMAINS (			\
+  	BIT_ULL(POWER_DOMAIN_AUX_C))
+ -#define TGL_AUX_D_TC1_IO_POWER_DOMAINS (	\
+ +#define ICL_AUX_D_IO_POWER_DOMAINS (			\
+  	BIT_ULL(POWER_DOMAIN_AUX_D))
+ -#define TGL_AUX_E_TC2_IO_POWER_DOMAINS (	\
+ +#define ICL_AUX_E_IO_POWER_DOMAINS (			\
+  	BIT_ULL(POWER_DOMAIN_AUX_E))
+ -#define TGL_AUX_F_TC3_IO_POWER_DOMAINS (	\
+ +#define ICL_AUX_F_IO_POWER_DOMAINS (			\
+  	BIT_ULL(POWER_DOMAIN_AUX_F))
+ -#define TGL_AUX_G_TC4_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_G))
+ -#define TGL_AUX_H_TC5_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_H))
+ -#define TGL_AUX_I_TC6_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_I))
+ -#define TGL_AUX_D_TBT1_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_D_TBT))
+ -#define TGL_AUX_E_TBT2_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_E_TBT))
+ -#define TGL_AUX_F_TBT3_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_F_TBT))
+ -#define TGL_AUX_G_TBT4_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_G_TBT))
+ -#define TGL_AUX_H_TBT5_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_H_TBT))
+ -#define TGL_AUX_I_TBT6_IO_POWER_DOMAINS (	\
+ -	BIT_ULL(POWER_DOMAIN_AUX_I_TBT))
+ +#define ICL_AUX_TBT1_IO_POWER_DOMAINS (			\
+ +	BIT_ULL(POWER_DOMAIN_AUX_TBT1))
+ +#define ICL_AUX_TBT2_IO_POWER_DOMAINS (			\
+ +	BIT_ULL(POWER_DOMAIN_AUX_TBT2))
+ +#define ICL_AUX_TBT3_IO_POWER_DOMAINS (			\
+ +	BIT_ULL(POWER_DOMAIN_AUX_TBT3))
+ +#define ICL_AUX_TBT4_IO_POWER_DOMAINS (			\
+ +	BIT_ULL(POWER_DOMAIN_AUX_TBT4))
+  
++ #define TGL_TC_COLD_OFF_POWER_DOMAINS (		\
++ 	BIT_ULL(POWER_DOMAIN_AUX_D)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_E)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_F)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_G)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_H)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_I)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_D_TBT)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_E_TBT)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_F_TBT)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_G_TBT)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_H_TBT)	|	\
++ 	BIT_ULL(POWER_DOMAIN_AUX_I_TBT)	|	\
++ 	BIT_ULL(POWER_DOMAIN_TC_COLD_OFF))
++ 
+  static const struct i915_power_well_ops i9xx_always_on_power_well_ops = {
+  	.sync_hw = i9xx_power_well_sync_hw_noop,
+  	.enable = i9xx_always_on_power_well_noop,
+@@@ -3362,6 -3835,571 +3384,574 @@@ static const struct i915_power_well_des
+  	},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct i915_power_well_desc ehl_power_wells[] = {
++ 	{
++ 		.name = "always-on",
++ 		.always_on = true,
++ 		.domains = POWER_DOMAIN_MASK,
++ 		.ops = &i9xx_always_on_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 	},
++ 	{
++ 		.name = "power well 1",
++ 		/* Handled by the DMC firmware */
++ 		.always_on = true,
++ 		.domains = 0,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = SKL_DISP_PW_1,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_1,
++ 			.hsw.has_fuses = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "DC off",
++ 		.domains = ICL_DISPLAY_DC_OFF_POWER_DOMAINS,
++ 		.ops = &gen9_dc_off_power_well_ops,
++ 		.id = SKL_DISP_DC_OFF,
++ 	},
++ 	{
++ 		.name = "power well 2",
++ 		.domains = ICL_PW_2_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = SKL_DISP_PW_2,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_2,
++ 			.hsw.has_fuses = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "power well 3",
++ 		.domains = ICL_PW_3_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_3,
++ 			.hsw.irq_pipe_mask = BIT(PIPE_B),
++ 			.hsw.has_vga = true,
++ 			.hsw.has_fuses = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI A IO",
++ 		.domains = ICL_DDI_IO_A_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_DDI_A,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI B IO",
++ 		.domains = ICL_DDI_IO_B_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_DDI_B,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI C IO",
++ 		.domains = ICL_DDI_IO_C_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_DDI_C,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI D IO",
++ 		.domains = ICL_DDI_IO_D_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_DDI_D,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX A",
++ 		.domains = ICL_AUX_A_IO_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_AUX_A,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX B",
++ 		.domains = ICL_AUX_B_IO_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_AUX_B,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX C",
++ 		.domains = ICL_AUX_C_TC1_IO_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_AUX_C,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX D",
++ 		.domains = ICL_AUX_D_TC2_IO_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_AUX_D,
++ 		},
++ 	},
++ 	{
++ 		.name = "power well 4",
++ 		.domains = ICL_PW_4_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_4,
++ 			.hsw.has_fuses = true,
++ 			.hsw.irq_pipe_mask = BIT(PIPE_C),
++ 		},
++ 	},
++ };
++ 
++ static void
++ tgl_tc_cold_request(struct drm_i915_private *i915, bool block)
++ {
++ 	u8 tries = 0;
++ 	int ret;
++ 
++ 	while (1) {
++ 		u32 low_val = 0, high_val;
++ 
++ 		if (block)
++ 			high_val = TGL_PCODE_EXIT_TCCOLD_DATA_H_BLOCK_REQ;
++ 		else
++ 			high_val = TGL_PCODE_EXIT_TCCOLD_DATA_H_UNBLOCK_REQ;
++ 
++ 		/*
++ 		 * Spec states that we should timeout the request after 200us
++ 		 * but the function below will timeout after 500us
++ 		 */
++ 		ret = sandybridge_pcode_read(i915, TGL_PCODE_TCCOLD, &low_val,
++ 					     &high_val);
++ 		if (ret == 0) {
++ 			if (block &&
++ 			    (low_val & TGL_PCODE_EXIT_TCCOLD_DATA_L_EXIT_FAILED))
++ 				ret = -EIO;
++ 			else
++ 				break;
++ 		}
++ 
++ 		if (++tries == 3)
++ 			break;
++ 
++ 		if (ret == -EAGAIN)
++ 			msleep(1);
++ 	}
++ 
++ 	if (ret)
++ 		drm_err(&i915->drm, "TC cold %sblock failed\n",
++ 			block ? "" : "un");
++ 	else
++ 		drm_dbg_kms(&i915->drm, "TC cold %sblock succeeded\n",
++ 			    block ? "" : "un");
++ }
++ 
++ static void
++ tgl_tc_cold_off_power_well_enable(struct drm_i915_private *i915,
++ 				  struct i915_power_well *power_well)
++ {
++ 	tgl_tc_cold_request(i915, true);
++ }
++ 
++ static void
++ tgl_tc_cold_off_power_well_disable(struct drm_i915_private *i915,
++ 				   struct i915_power_well *power_well)
++ {
++ 	tgl_tc_cold_request(i915, false);
++ }
++ 
++ static void
++ tgl_tc_cold_off_power_well_sync_hw(struct drm_i915_private *i915,
++ 				   struct i915_power_well *power_well)
++ {
++ 	if (power_well->count > 0)
++ 		tgl_tc_cold_off_power_well_enable(i915, power_well);
++ 	else
++ 		tgl_tc_cold_off_power_well_disable(i915, power_well);
++ }
++ 
++ static bool
++ tgl_tc_cold_off_power_well_is_enabled(struct drm_i915_private *dev_priv,
++ 				      struct i915_power_well *power_well)
++ {
++ 	/*
++ 	 * Not the correctly implementation but there is no way to just read it
++ 	 * from PCODE, so returning count to avoid state mismatch errors
++ 	 */
++ 	return power_well->count;
++ }
++ 
++ static const struct i915_power_well_ops tgl_tc_cold_off_ops = {
++ 	.sync_hw = tgl_tc_cold_off_power_well_sync_hw,
++ 	.enable = tgl_tc_cold_off_power_well_enable,
++ 	.disable = tgl_tc_cold_off_power_well_disable,
++ 	.is_enabled = tgl_tc_cold_off_power_well_is_enabled,
++ };
++ 
++ static const struct i915_power_well_desc tgl_power_wells[] = {
++ 	{
++ 		.name = "always-on",
++ 		.always_on = true,
++ 		.domains = POWER_DOMAIN_MASK,
++ 		.ops = &i9xx_always_on_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 	},
++ 	{
++ 		.name = "power well 1",
++ 		/* Handled by the DMC firmware */
++ 		.always_on = true,
++ 		.domains = 0,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = SKL_DISP_PW_1,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_1,
++ 			.hsw.has_fuses = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "DC off",
++ 		.domains = TGL_DISPLAY_DC_OFF_POWER_DOMAINS,
++ 		.ops = &gen9_dc_off_power_well_ops,
++ 		.id = SKL_DISP_DC_OFF,
++ 	},
++ 	{
++ 		.name = "power well 2",
++ 		.domains = TGL_PW_2_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = SKL_DISP_PW_2,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_2,
++ 			.hsw.has_fuses = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "power well 3",
++ 		.domains = TGL_PW_3_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = ICL_DISP_PW_3,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_3,
++ 			.hsw.irq_pipe_mask = BIT(PIPE_B),
++ 			.hsw.has_vga = true,
++ 			.hsw.has_fuses = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI A IO",
++ 		.domains = ICL_DDI_IO_A_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_DDI_A,
++ 		}
++ 	},
++ 	{
++ 		.name = "DDI B IO",
++ 		.domains = ICL_DDI_IO_B_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_DDI_B,
++ 		}
++ 	},
++ 	{
++ 		.name = "DDI C IO",
++ 		.domains = ICL_DDI_IO_C_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_DDI_C,
++ 		}
++ 	},
++ 	{
++ 		.name = "DDI D TC1 IO",
++ 		.domains = TGL_DDI_IO_D_TC1_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_DDI_TC1,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI E TC2 IO",
++ 		.domains = TGL_DDI_IO_E_TC2_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_DDI_TC2,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI F TC3 IO",
++ 		.domains = TGL_DDI_IO_F_TC3_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_DDI_TC3,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI G TC4 IO",
++ 		.domains = TGL_DDI_IO_G_TC4_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_DDI_TC4,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI H TC5 IO",
++ 		.domains = TGL_DDI_IO_H_TC5_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_DDI_TC5,
++ 		},
++ 	},
++ 	{
++ 		.name = "DDI I TC6 IO",
++ 		.domains = TGL_DDI_IO_I_TC6_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_ddi_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_DDI_TC6,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX A",
++ 		.domains = TGL_AUX_A_IO_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_AUX_A,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX B",
++ 		.domains = TGL_AUX_B_IO_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_AUX_B,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX C",
++ 		.domains = TGL_AUX_C_IO_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_AUX_C,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX D TC1",
++ 		.domains = TGL_AUX_D_TC1_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TC1,
++ 			.hsw.is_tc_tbt = false,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX E TC2",
++ 		.domains = TGL_AUX_E_TC2_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TC2,
++ 			.hsw.is_tc_tbt = false,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX F TC3",
++ 		.domains = TGL_AUX_F_TC3_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TC3,
++ 			.hsw.is_tc_tbt = false,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX G TC4",
++ 		.domains = TGL_AUX_G_TC4_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TC4,
++ 			.hsw.is_tc_tbt = false,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX H TC5",
++ 		.domains = TGL_AUX_H_TC5_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TC5,
++ 			.hsw.is_tc_tbt = false,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX I TC6",
++ 		.domains = TGL_AUX_I_TC6_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TC6,
++ 			.hsw.is_tc_tbt = false,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX D TBT1",
++ 		.domains = TGL_AUX_D_TBT1_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TBT1,
++ 			.hsw.is_tc_tbt = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX E TBT2",
++ 		.domains = TGL_AUX_E_TBT2_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TBT2,
++ 			.hsw.is_tc_tbt = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX F TBT3",
++ 		.domains = TGL_AUX_F_TBT3_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TBT3,
++ 			.hsw.is_tc_tbt = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX G TBT4",
++ 		.domains = TGL_AUX_G_TBT4_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TBT4,
++ 			.hsw.is_tc_tbt = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX H TBT5",
++ 		.domains = TGL_AUX_H_TBT5_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TBT5,
++ 			.hsw.is_tc_tbt = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "AUX I TBT6",
++ 		.domains = TGL_AUX_I_TBT6_IO_POWER_DOMAINS,
++ 		.ops = &icl_tc_phy_aux_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &icl_aux_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_AUX_TBT6,
++ 			.hsw.is_tc_tbt = true,
++ 		},
++ 	},
++ 	{
++ 		.name = "power well 4",
++ 		.domains = TGL_PW_4_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = ICL_PW_CTL_IDX_PW_4,
++ 			.hsw.has_fuses = true,
++ 			.hsw.irq_pipe_mask = BIT(PIPE_C),
++ 		}
++ 	},
++ 	{
++ 		.name = "power well 5",
++ 		.domains = TGL_PW_5_POWER_DOMAINS,
++ 		.ops = &hsw_power_well_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 		{
++ 			.hsw.regs = &hsw_power_well_regs,
++ 			.hsw.idx = TGL_PW_CTL_IDX_PW_5,
++ 			.hsw.has_fuses = true,
++ 			.hsw.irq_pipe_mask = BIT(PIPE_D),
++ 		},
++ 	},
++ 	{
++ 		.name = "TC cold off",
++ 		.domains = TGL_TC_COLD_OFF_POWER_DOMAINS,
++ 		.ops = &tgl_tc_cold_off_ops,
++ 		.id = DISP_PW_ID_NONE,
++ 	},
++ };
++ 
+++>>>>>>> 3c02934b24e3 (drm/i915/tc/tgl: Implement TC cold sequences)
+  static int
+  sanitize_disable_power_well_option(const struct drm_i915_private *dev_priv,
+  				   int disable_power_well)
+diff --cc drivers/gpu/drm/i915/display/intel_display_power.h
+index ff57b0a7fe59,6c917699293b..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_power.h
++++ b/drivers/gpu/drm/i915/display/intel_display_power.h
+@@@ -59,6 -75,8 +59,11 @@@ enum intel_display_power_domain 
+  	POWER_DOMAIN_GMBUS,
+  	POWER_DOMAIN_MODESET,
+  	POWER_DOMAIN_GT_IRQ,
+++<<<<<<< HEAD
+++=======
++ 	POWER_DOMAIN_DPLL_DC_OFF,
++ 	POWER_DOMAIN_TC_COLD_OFF,
+++>>>>>>> 3c02934b24e3 (drm/i915/tc/tgl: Implement TC cold sequences)
+  	POWER_DOMAIN_INIT,
+  
+  	POWER_DOMAIN_NUM,
+* Unmerged path drivers/gpu/drm/i915/display/intel_tc.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_power.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_power.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_tc.c
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 32940dd2ebc5..c710a0663cdb 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -8826,6 +8826,10 @@ enum {
+ #define   GEN6_PCODE_WRITE_D_COMP		0x11
+ #define   HSW_PCODE_DE_WRITE_FREQ_REQ		0x17
+ #define   DISPLAY_IPS_CONTROL			0x19
++#define   TGL_PCODE_TCCOLD			0x26
++#define     TGL_PCODE_EXIT_TCCOLD_DATA_L_EXIT_FAILED	REG_BIT(0)
++#define     TGL_PCODE_EXIT_TCCOLD_DATA_H_BLOCK_REQ	0
++#define     TGL_PCODE_EXIT_TCCOLD_DATA_H_UNBLOCK_REQ	REG_BIT(0)
+             /* See also IPS_CTL */
+ #define     IPS_PCODE_CONTROL			(1 << 30)
+ #define   HSW_PCODE_DYNAMIC_DUTY_CYCLE_CONTROL	0x1A
