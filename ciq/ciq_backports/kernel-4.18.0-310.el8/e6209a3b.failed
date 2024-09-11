@@ -1,0 +1,220 @@
+KVM: vmx/pmu: Emulate legacy freezing LBRs on virtual PMI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Like Xu <like.xu@linux.intel.com>
+commit e6209a3bef793e8fe29c873a7612023916eaa611
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/e6209a3b.failed
+
+The current vPMU only supports Architecture Version 2. According to
+Intel SDM "17.4.7 Freezing LBR and Performance Counters on PMI", if
+IA32_DEBUGCTL.Freeze_LBR_On_PMI = 1, the LBR is frozen on the virtual
+PMI and the KVM would emulate to clear the LBR bit (bit 0) in
+IA32_DEBUGCTL. Also, guest needs to re-enable IA32_DEBUGCTL.LBR
+to resume recording branches.
+
+	Signed-off-by: Like Xu <like.xu@linux.intel.com>
+	Reviewed-by: Andi Kleen <ak@linux.intel.com>
+Message-Id: <20210201051039.255478-9-like.xu@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e6209a3bef793e8fe29c873a7612023916eaa611)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/capabilities.h
+#	arch/x86/kvm/vmx/pmu_intel.c
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/capabilities.h
+index 5ffeb1cfd45a,8e6179586e27..000000000000
+--- a/arch/x86/kvm/vmx/capabilities.h
++++ b/arch/x86/kvm/vmx/capabilities.h
+@@@ -382,7 -389,12 +384,16 @@@ static inline u64 vmx_get_perf_capabili
+  
+  static inline u64 vmx_supported_debugctl(void)
+  {
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	u64 debugctl = 0;
++ 
++ 	if (vmx_get_perf_capabilities() & PMU_CAP_LBR_FMT)
++ 		debugctl |= DEBUGCTLMSR_LBR_MASK;
++ 
++ 	return debugctl;
+++>>>>>>> e6209a3bef79 (KVM: vmx/pmu: Emulate legacy freezing LBRs on virtual PMI)
+  }
+  
+  #endif /* __KVM_X86_VMX_CAPS_H */
+diff --cc arch/x86/kvm/vmx/pmu_intel.c
+index 48690db4db6a,7928d6dee0a2..000000000000
+--- a/arch/x86/kvm/vmx/pmu_intel.c
++++ b/arch/x86/kvm/vmx/pmu_intel.c
+@@@ -517,6 -586,107 +517,110 @@@ static void intel_pmu_reset(struct kvm_
+  	intel_pmu_release_guest_lbr_event(vcpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Emulate LBR_On_PMI behavior for 1 < pmu.version < 4.
++  *
++  * If Freeze_LBR_On_PMI = 1, the LBR is frozen on PMI and
++  * the KVM emulates to clear the LBR bit (bit 0) in IA32_DEBUGCTL.
++  *
++  * Guest needs to re-enable LBR to resume branches recording.
++  */
++ static void intel_pmu_legacy_freezing_lbrs_on_pmi(struct kvm_vcpu *vcpu)
++ {
++ 	u64 data = vmcs_read64(GUEST_IA32_DEBUGCTL);
++ 
++ 	if (data & DEBUGCTLMSR_FREEZE_LBRS_ON_PMI) {
++ 		data &= ~DEBUGCTLMSR_LBR;
++ 		vmcs_write64(GUEST_IA32_DEBUGCTL, data);
++ 	}
++ }
++ 
++ static void intel_pmu_deliver_pmi(struct kvm_vcpu *vcpu)
++ {
++ 	u8 version = vcpu_to_pmu(vcpu)->version;
++ 
++ 	if (!intel_pmu_lbr_is_enabled(vcpu))
++ 		return;
++ 
++ 	if (version > 1 && version < 4)
++ 		intel_pmu_legacy_freezing_lbrs_on_pmi(vcpu);
++ }
++ 
++ static void vmx_update_intercept_for_lbr_msrs(struct kvm_vcpu *vcpu, bool set)
++ {
++ 	struct x86_pmu_lbr *lbr = vcpu_to_lbr_records(vcpu);
++ 	int i;
++ 
++ 	for (i = 0; i < lbr->nr; i++) {
++ 		vmx_set_intercept_for_msr(vcpu, lbr->from + i, MSR_TYPE_RW, set);
++ 		vmx_set_intercept_for_msr(vcpu, lbr->to + i, MSR_TYPE_RW, set);
++ 		if (lbr->info)
++ 			vmx_set_intercept_for_msr(vcpu, lbr->info + i, MSR_TYPE_RW, set);
++ 	}
++ 
++ 	vmx_set_intercept_for_msr(vcpu, MSR_LBR_SELECT, MSR_TYPE_RW, set);
++ 	vmx_set_intercept_for_msr(vcpu, MSR_LBR_TOS, MSR_TYPE_RW, set);
++ }
++ 
++ static inline void vmx_disable_lbr_msrs_passthrough(struct kvm_vcpu *vcpu)
++ {
++ 	struct lbr_desc *lbr_desc = vcpu_to_lbr_desc(vcpu);
++ 
++ 	if (!lbr_desc->msr_passthrough)
++ 		return;
++ 
++ 	vmx_update_intercept_for_lbr_msrs(vcpu, true);
++ 	lbr_desc->msr_passthrough = false;
++ }
++ 
++ static inline void vmx_enable_lbr_msrs_passthrough(struct kvm_vcpu *vcpu)
++ {
++ 	struct lbr_desc *lbr_desc = vcpu_to_lbr_desc(vcpu);
++ 
++ 	if (lbr_desc->msr_passthrough)
++ 		return;
++ 
++ 	vmx_update_intercept_for_lbr_msrs(vcpu, false);
++ 	lbr_desc->msr_passthrough = true;
++ }
++ 
++ /*
++  * Higher priority host perf events (e.g. cpu pinned) could reclaim the
++  * pmu resources (e.g. LBR) that were assigned to the guest. This is
++  * usually done via ipi calls (more details in perf_install_in_context).
++  *
++  * Before entering the non-root mode (with irq disabled here), double
++  * confirm that the pmu features enabled to the guest are not reclaimed
++  * by higher priority host events. Otherwise, disallow vcpu's access to
++  * the reclaimed features.
++  */
++ void vmx_passthrough_lbr_msrs(struct kvm_vcpu *vcpu)
++ {
++ 	struct lbr_desc *lbr_desc = vcpu_to_lbr_desc(vcpu);
++ 
++ 	if (!lbr_desc->event) {
++ 		vmx_disable_lbr_msrs_passthrough(vcpu);
++ 		if (vmcs_read64(GUEST_IA32_DEBUGCTL) & DEBUGCTLMSR_LBR)
++ 			goto warn;
++ 		return;
++ 	}
++ 
++ 	if (lbr_desc->event->state < PERF_EVENT_STATE_ACTIVE) {
++ 		vmx_disable_lbr_msrs_passthrough(vcpu);
++ 		goto warn;
++ 	} else
++ 		vmx_enable_lbr_msrs_passthrough(vcpu);
++ 
++ 	return;
++ 
++ warn:
++ 	pr_warn_ratelimited("kvm: vcpu-%d: fail to passthrough LBR.\n",
++ 		vcpu->vcpu_id);
++ }
++ 
+++>>>>>>> e6209a3bef79 (KVM: vmx/pmu: Emulate legacy freezing LBRs on virtual PMI)
+  struct kvm_pmu_ops intel_pmu_ops = {
+  	.find_arch_event = intel_find_arch_event,
+  	.find_fixed_event = intel_find_fixed_event,
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 08cdc15857f3,9169c700874e..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -1950,6 -1958,16 +1950,19 @@@ static u64 nested_vmx_truncate_sysenter
+  	return (unsigned long)data;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u64 vcpu_supported_debugctl(struct kvm_vcpu *vcpu)
++ {
++ 	u64 debugctl = vmx_supported_debugctl();
++ 
++ 	if (!intel_pmu_lbr_is_enabled(vcpu))
++ 		debugctl &= ~DEBUGCTLMSR_LBR_MASK;
++ 
++ 	return debugctl;
++ }
++ 
+++>>>>>>> e6209a3bef79 (KVM: vmx/pmu: Emulate legacy freezing LBRs on virtual PMI)
+  /*
+   * Writes msr value into the appropriate "register".
+   * Returns 0 on success, non-0 otherwise.
+diff --git a/arch/x86/kvm/pmu.c b/arch/x86/kvm/pmu.c
+index 88b8f072cbd9..a3749979a19e 100644
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@ -383,8 +383,11 @@ int kvm_pmu_rdpmc(struct kvm_vcpu *vcpu, unsigned idx, u64 *data)
+ 
+ void kvm_pmu_deliver_pmi(struct kvm_vcpu *vcpu)
+ {
+-	if (lapic_in_kernel(vcpu))
++	if (lapic_in_kernel(vcpu)) {
++		if (kvm_x86_ops.pmu_ops->deliver_pmi)
++			kvm_x86_ops.pmu_ops->deliver_pmi(vcpu);
+ 		kvm_apic_local_deliver(vcpu->arch.apic, APIC_LVTPC);
++	}
+ }
+ 
+ bool kvm_pmu_is_valid_msr(struct kvm_vcpu *vcpu, u32 msr)
+diff --git a/arch/x86/kvm/pmu.h b/arch/x86/kvm/pmu.h
+index 067fef51760c..742a4e98df8c 100644
+--- a/arch/x86/kvm/pmu.h
++++ b/arch/x86/kvm/pmu.h
+@@ -39,6 +39,7 @@ struct kvm_pmu_ops {
+ 	void (*refresh)(struct kvm_vcpu *vcpu);
+ 	void (*init)(struct kvm_vcpu *vcpu);
+ 	void (*reset)(struct kvm_vcpu *vcpu);
++	void (*deliver_pmi)(struct kvm_vcpu *vcpu);
+ };
+ 
+ static inline u64 pmc_bitmask(struct kvm_pmc *pmc)
+* Unmerged path arch/x86/kvm/vmx/capabilities.h
+* Unmerged path arch/x86/kvm/vmx/pmu_intel.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
