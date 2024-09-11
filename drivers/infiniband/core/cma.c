@@ -1472,10 +1472,9 @@ static bool cma_match_net_dev(const struct rdma_cm_id *id,
 	const struct rdma_addr *addr = &id->route.addr;
 
 	if (!net_dev)
-		/* This request is an AF_IB request or a RoCE request */
+		/* This request is an AF_IB request */
 		return (!id->port_num || id->port_num == port_num) &&
-		       (addr->src_addr.ss_family == AF_IB ||
-			rdma_protocol_roce(id->device, port_num));
+		       (addr->src_addr.ss_family == AF_IB);
 
 	/*
 	 * Net namespaces must match, and if the listner is listening
