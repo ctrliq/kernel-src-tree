@@ -1,0 +1,283 @@
+bpf: Eliminate rlimit-based memory accounting infra for bpf maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 80ee81e0403c48f4eb342f7c8d40477c89b8836a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/80ee81e0.failed
+
+Remove rlimit-based accounting infrastructure code, which is not used
+anymore.
+
+To provide a backward compatibility, use an approximation of the
+bpf map memory footprint as a "memlock" value, available to a user
+via map info. The approximation is based on the maximal number of
+elements and key and value sizes.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-33-guro@fb.com
+(cherry picked from commit 80ee81e0403c48f4eb342f7c8d40477c89b8836a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index e31890dda3c2,61331a148cde..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -132,16 -133,11 +132,11 @@@ struct bpf_map_ops 
+  	/* BTF name and id of struct allocated by map_alloc */
+  	const char * const map_btf_name;
+  	int *map_btf_id;
+ -
+  	/* bpf_iter info used to open a seq_file */
+  	const struct bpf_iter_seq_info *iter_seq_info;
+ +	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+  };
+  
+- struct bpf_map_memory {
+- 	u32 pages;
+- 	struct user_struct *user;
+- };
+- 
+  struct bpf_map {
+  	/* The first two cachelines with read-mostly members of which some
+  	 * are also accessed in fast-path (e.g. ops, max_entries).
+@@@ -163,11 -158,13 +158,21 @@@
+  	u32 btf_key_type_id;
+  	u32 btf_value_type_id;
+  	struct btf *btf;
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT(struct bpf_map_memory memory)
+ +	RH_KABI_BROKEN_INSERT(char name[BPF_OBJ_NAME_LEN])
+ +	RH_KABI_BROKEN_INSERT(u32 btf_vmlinux_value_type_id)
+ +	RH_KABI_REPLACE(bool unpriv_array, bool bypass_spec_v1)
+ +	RH_KABI_FILL_HOLE(bool frozen) /* write-once; write-protected by freeze_mutex*/
+++=======
++ #ifdef CONFIG_MEMCG_KMEM
++ 	struct mem_cgroup *memcg;
++ #endif
++ 	char name[BPF_OBJ_NAME_LEN];
++ 	u32 btf_vmlinux_value_type_id;
++ 	bool bypass_spec_v1;
++ 	bool frozen; /* write-once; write-protected by freeze_mutex */
+++>>>>>>> 80ee81e0403c (bpf: Eliminate rlimit-based memory accounting infra for bpf maps)
+  	/* 22 bytes hole */
+  
+  	/* The 3rd and 4th cacheline with misc members to avoid false sharing
+* Unmerged path include/linux/bpf.h
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index dd0ce9356ec3..d5f830f43803 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -154,7 +154,7 @@ static struct bpf_map *find_and_alloc_map(union bpf_attr *attr)
+ 	return map;
+ }
+ 
+-static u32 bpf_map_value_size(struct bpf_map *map)
++static u32 bpf_map_value_size(const struct bpf_map *map)
+ {
+ 	if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
+ 	    map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
+@@ -366,77 +366,6 @@ void bpf_map_init_from_attr(struct bpf_map *map, union bpf_attr *attr)
+ 	map->numa_node = bpf_map_attr_numa_node(attr);
+ }
+ 
+-static int bpf_charge_memlock(struct user_struct *user, u32 pages)
+-{
+-	unsigned long memlock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+-
+-	if (atomic_long_add_return(pages, &user->locked_vm) > memlock_limit) {
+-		atomic_long_sub(pages, &user->locked_vm);
+-		return -EPERM;
+-	}
+-	return 0;
+-}
+-
+-static void bpf_uncharge_memlock(struct user_struct *user, u32 pages)
+-{
+-	if (user)
+-		atomic_long_sub(pages, &user->locked_vm);
+-}
+-
+-int bpf_map_charge_init(struct bpf_map_memory *mem, u64 size)
+-{
+-	u32 pages = round_up(size, PAGE_SIZE) >> PAGE_SHIFT;
+-	struct user_struct *user;
+-	int ret;
+-
+-	if (size >= U32_MAX - PAGE_SIZE)
+-		return -E2BIG;
+-
+-	user = get_current_user();
+-	ret = bpf_charge_memlock(user, pages);
+-	if (ret) {
+-		free_uid(user);
+-		return ret;
+-	}
+-
+-	mem->pages = pages;
+-	mem->user = user;
+-
+-	return 0;
+-}
+-
+-void bpf_map_charge_finish(struct bpf_map_memory *mem)
+-{
+-	bpf_uncharge_memlock(mem->user, mem->pages);
+-	free_uid(mem->user);
+-}
+-
+-void bpf_map_charge_move(struct bpf_map_memory *dst,
+-			 struct bpf_map_memory *src)
+-{
+-	*dst = *src;
+-
+-	/* Make sure src will not be used for the redundant uncharging. */
+-	memset(src, 0, sizeof(struct bpf_map_memory));
+-}
+-
+-int bpf_map_charge_memlock(struct bpf_map *map, u32 pages)
+-{
+-	int ret;
+-
+-	ret = bpf_charge_memlock(map->memory.user, pages);
+-	if (ret)
+-		return ret;
+-	map->memory.pages += pages;
+-	return ret;
+-}
+-
+-void bpf_map_uncharge_memlock(struct bpf_map *map, u32 pages)
+-{
+-	bpf_uncharge_memlock(map->memory.user, pages);
+-	map->memory.pages -= pages;
+-}
+-
+ static int bpf_map_alloc_id(struct bpf_map *map)
+ {
+ 	int id;
+@@ -485,13 +414,10 @@ void bpf_map_free_id(struct bpf_map *map, bool do_idr_lock)
+ static void bpf_map_free_deferred(struct work_struct *work)
+ {
+ 	struct bpf_map *map = container_of(work, struct bpf_map, work);
+-	struct bpf_map_memory mem;
+ 
+-	bpf_map_charge_move(&mem, &map->memory);
+ 	security_bpf_map_free(map);
+ 	/* implementation dependent freeing */
+ 	map->ops->map_free(map);
+-	bpf_map_charge_finish(&mem);
+ }
+ 
+ static void bpf_map_put_uref(struct bpf_map *map)
+@@ -552,6 +478,19 @@ static fmode_t map_get_sys_perms(struct bpf_map *map, struct fd f)
+ }
+ 
+ #ifdef CONFIG_PROC_FS
++/* Provides an approximation of the map's memory footprint.
++ * Used only to provide a backward compatibility and display
++ * a reasonable "memlock" info.
++ */
++static unsigned long bpf_map_memory_footprint(const struct bpf_map *map)
++{
++	unsigned long size;
++
++	size = round_up(map->key_size + bpf_map_value_size(map), 8);
++
++	return round_up(map->max_entries * size, PAGE_SIZE);
++}
++
+ static void bpf_map_show_fdinfo(struct seq_file *m, struct file *filp)
+ {
+ 	const struct bpf_map *map = filp->private_data;
+@@ -570,7 +509,7 @@ static void bpf_map_show_fdinfo(struct seq_file *m, struct file *filp)
+ 		   "value_size:\t%u\n"
+ 		   "max_entries:\t%u\n"
+ 		   "map_flags:\t%#x\n"
+-		   "memlock:\t%llu\n"
++		   "memlock:\t%lu\n"
+ 		   "map_id:\t%u\n"
+ 		   "frozen:\t%u\n",
+ 		   map->map_type,
+@@ -578,7 +517,7 @@ static void bpf_map_show_fdinfo(struct seq_file *m, struct file *filp)
+ 		   map->value_size,
+ 		   map->max_entries,
+ 		   map->map_flags,
+-		   map->memory.pages * 1ULL << PAGE_SHIFT,
++		   bpf_map_memory_footprint(map),
+ 		   map->id,
+ 		   READ_ONCE(map->frozen));
+ 	if (type) {
+@@ -820,7 +759,6 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
+ static int map_create(union bpf_attr *attr)
+ {
+ 	int numa_node = bpf_map_attr_numa_node(attr);
+-	struct bpf_map_memory mem;
+ 	struct bpf_map *map;
+ 	int f_flags;
+ 	int err;
+@@ -922,9 +860,7 @@ static int map_create(union bpf_attr *attr)
+ 	security_bpf_map_free(map);
+ free_map:
+ 	btf_put(map->btf);
+-	bpf_map_charge_move(&mem, &map->memory);
+ 	map->ops->map_free(map);
+-	bpf_map_charge_finish(&mem);
+ 	return err;
+ }
+ 
+diff --git a/tools/testing/selftests/bpf/progs/bpf_iter_bpf_map.c b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_map.c
+index 08651b23edba..b83b5d2e17dc 100644
+--- a/tools/testing/selftests/bpf/progs/bpf_iter_bpf_map.c
++++ b/tools/testing/selftests/bpf/progs/bpf_iter_bpf_map.c
+@@ -23,6 +23,6 @@ int dump_bpf_map(struct bpf_iter__bpf_map *ctx)
+ 
+ 	BPF_SEQ_PRINTF(seq, "%8u %8ld %8ld %10lu\n", map->id, map->refcnt.counter,
+ 		       map->usercnt.counter,
+-		       map->memory.user->locked_vm.counter);
++		       0LLU);
+ 	return 0;
+ }
+diff --git a/tools/testing/selftests/bpf/progs/map_ptr_kern.c b/tools/testing/selftests/bpf/progs/map_ptr_kern.c
+index c325405751e2..d8850bc6a9f1 100644
+--- a/tools/testing/selftests/bpf/progs/map_ptr_kern.c
++++ b/tools/testing/selftests/bpf/progs/map_ptr_kern.c
+@@ -26,17 +26,12 @@ __u32 g_line = 0;
+ 		return 0;	\
+ })
+ 
+-struct bpf_map_memory {
+-	__u32 pages;
+-} __attribute__((preserve_access_index));
+-
+ struct bpf_map {
+ 	enum bpf_map_type map_type;
+ 	__u32 key_size;
+ 	__u32 value_size;
+ 	__u32 max_entries;
+ 	__u32 id;
+-	struct bpf_map_memory memory;
+ } __attribute__((preserve_access_index));
+ 
+ static inline int check_bpf_map_fields(struct bpf_map *map, __u32 key_size,
+@@ -47,7 +42,6 @@ static inline int check_bpf_map_fields(struct bpf_map *map, __u32 key_size,
+ 	VERIFY(map->value_size == value_size);
+ 	VERIFY(map->max_entries == max_entries);
+ 	VERIFY(map->id > 0);
+-	VERIFY(map->memory.pages > 0);
+ 
+ 	return 1;
+ }
+@@ -60,7 +54,6 @@ static inline int check_bpf_map_ptr(struct bpf_map *indirect,
+ 	VERIFY(indirect->value_size == direct->value_size);
+ 	VERIFY(indirect->max_entries == direct->max_entries);
+ 	VERIFY(indirect->id == direct->id);
+-	VERIFY(indirect->memory.pages == direct->memory.pages);
+ 
+ 	return 1;
+ }
