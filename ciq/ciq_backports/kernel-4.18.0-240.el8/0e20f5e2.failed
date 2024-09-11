@@ -1,0 +1,303 @@
+KVM: arm/arm64: Cleanup MMIO handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 0e20f5e25556c00ee813469d373b00abcf298708
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0e20f5e2.failed
+
+Our MMIO handling is a bit odd, in the sense that it uses an
+intermediate per-vcpu structure to store the various decoded
+information that describe the access.
+
+But the same information is readily available in the HSR/ESR_EL2
+field, and we actually use this field to populate the structure.
+
+Let's simplify the whole thing by getting rid of the superfluous
+structure and save a (tiny) bit of space in the vcpu structure.
+
+[32bit fix courtesy of Olof Johansson <olof@lixom.net>]
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 0e20f5e25556c00ee813469d373b00abcf298708)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/kvm_mmio.h
+#	arch/arm64/include/asm/kvm_mmio.h
+* Unmerged path arch/arm/include/asm/kvm_mmio.h
+* Unmerged path arch/arm64/include/asm/kvm_mmio.h
+diff --git a/arch/arm/include/asm/kvm_emulate.h b/arch/arm/include/asm/kvm_emulate.h
+index af493151580a..e1d519133505 100644
+--- a/arch/arm/include/asm/kvm_emulate.h
++++ b/arch/arm/include/asm/kvm_emulate.h
+@@ -21,7 +21,6 @@
+ 
+ #include <linux/kvm_host.h>
+ #include <asm/kvm_asm.h>
+-#include <asm/kvm_mmio.h>
+ #include <asm/kvm_arm.h>
+ #include <asm/cputype.h>
+ 
+@@ -232,7 +231,7 @@ static inline bool kvm_vcpu_dabt_is_cm(struct kvm_vcpu *vcpu)
+ }
+ 
+ /* Get Access Size from a data abort */
+-static inline int kvm_vcpu_dabt_get_as(struct kvm_vcpu *vcpu)
++static inline unsigned int kvm_vcpu_dabt_get_as(struct kvm_vcpu *vcpu)
+ {
+ 	switch ((kvm_vcpu_get_hsr(vcpu) >> 22) & 0x3) {
+ 	case 0:
+@@ -243,7 +242,7 @@ static inline int kvm_vcpu_dabt_get_as(struct kvm_vcpu *vcpu)
+ 		return 4;
+ 	default:
+ 		kvm_err("Hardware is weird: SAS 0b11 is reserved\n");
+-		return -EFAULT;
++		return 4;
+ 	}
+ }
+ 
+diff --git a/arch/arm/include/asm/kvm_host.h b/arch/arm/include/asm/kvm_host.h
+index e5c90cf571a6..b65855432bbf 100644
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@ -25,7 +25,6 @@
+ #include <asm/cputype.h>
+ #include <asm/kvm.h>
+ #include <asm/kvm_asm.h>
+-#include <asm/kvm_mmio.h>
+ #include <asm/fpstate.h>
+ #include <kvm/arm_arch_timer.h>
+ 
+@@ -212,9 +211,6 @@ struct kvm_vcpu_arch {
+ 	 /* Don't run the guest (internal implementation need) */
+ 	bool pause;
+ 
+-	/* IO related fields */
+-	struct kvm_decode mmio_decode;
+-
+ 	/* Cache some mmu pages needed inside spinlock regions */
+ 	struct kvm_mmu_memory_cache mmu_page_cache;
+ 
+@@ -283,6 +279,14 @@ int handle_exit(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ static inline void handle_exit_early(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 				     int exception_index) {}
+ 
++/* MMIO helpers */
++void kvm_mmio_write_buf(void *buf, unsigned int len, unsigned long data);
++unsigned long kvm_mmio_read_buf(const void *buf, unsigned int len);
++
++int kvm_handle_mmio_return(struct kvm_vcpu *vcpu, struct kvm_run *run);
++int io_mem_abort(struct kvm_vcpu *vcpu, struct kvm_run *run,
++		 phys_addr_t fault_ipa);
++
+ static inline void __cpu_init_hyp_mode(phys_addr_t pgd_ptr,
+ 				       unsigned long hyp_stack_ptr,
+ 				       unsigned long vector_ptr)
+diff --git a/arch/arm/include/asm/kvm_hyp.h b/arch/arm/include/asm/kvm_hyp.h
+index 059224fb14db..a1c3da58a84d 100644
+--- a/arch/arm/include/asm/kvm_hyp.h
++++ b/arch/arm/include/asm/kvm_hyp.h
+@@ -21,6 +21,7 @@
+ #include <linux/compiler.h>
+ #include <linux/kvm_host.h>
+ #include <asm/cp15.h>
++#include <asm/kvm_arm.h>
+ #include <asm/vfp.h>
+ 
+ #define __hyp_text __section(.hyp.text) notrace
+* Unmerged path arch/arm/include/asm/kvm_mmio.h
+diff --git a/arch/arm64/include/asm/kvm_emulate.h b/arch/arm64/include/asm/kvm_emulate.h
+index f5fbabb8b70d..787ca9e8061b 100644
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@ -28,7 +28,6 @@
+ #include <asm/esr.h>
+ #include <asm/kvm_arm.h>
+ #include <asm/kvm_hyp.h>
+-#include <asm/kvm_mmio.h>
+ #include <asm/ptrace.h>
+ #include <asm/cputype.h>
+ #include <asm/virt.h>
+@@ -352,7 +351,7 @@ static inline bool kvm_vcpu_dabt_is_cm(const struct kvm_vcpu *vcpu)
+ 	return !!(kvm_vcpu_get_hsr(vcpu) & ESR_ELx_CM);
+ }
+ 
+-static inline int kvm_vcpu_dabt_get_as(const struct kvm_vcpu *vcpu)
++static inline unsigned int kvm_vcpu_dabt_get_as(const struct kvm_vcpu *vcpu)
+ {
+ 	return 1 << ((kvm_vcpu_get_hsr(vcpu) & ESR_ELx_SAS) >> ESR_ELx_SAS_SHIFT);
+ }
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 4dd101adad0d..f24e86723fb9 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -34,7 +34,6 @@
+ #include <asm/fpsimd.h>
+ #include <asm/kvm.h>
+ #include <asm/kvm_asm.h>
+-#include <asm/kvm_mmio.h>
+ #include <asm/thread_info.h>
+ 
+ #define __KVM_HAVE_ARCH_INTC_INITIALIZED
+@@ -334,9 +333,6 @@ struct kvm_vcpu_arch {
+ 	/* Don't run the guest (internal implementation need) */
+ 	bool pause;
+ 
+-	/* IO related fields */
+-	struct kvm_decode mmio_decode;
+-
+ 	/* Cache some mmu pages needed inside spinlock regions */
+ 	struct kvm_mmu_memory_cache mmu_page_cache;
+ 
+@@ -491,6 +487,14 @@ int handle_exit(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ void handle_exit_early(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 		       int exception_index);
+ 
++/* MMIO helpers */
++void kvm_mmio_write_buf(void *buf, unsigned int len, unsigned long data);
++unsigned long kvm_mmio_read_buf(const void *buf, unsigned int len);
++
++int kvm_handle_mmio_return(struct kvm_vcpu *vcpu, struct kvm_run *run);
++int io_mem_abort(struct kvm_vcpu *vcpu, struct kvm_run *run,
++		 phys_addr_t fault_ipa);
++
+ int kvm_perf_init(void);
+ int kvm_perf_teardown(void);
+ 
+* Unmerged path arch/arm64/include/asm/kvm_mmio.h
+diff --git a/virt/kvm/arm/mmio.c b/virt/kvm/arm/mmio.c
+index 575016c1ceab..d0648bd111ad 100644
+--- a/virt/kvm/arm/mmio.c
++++ b/virt/kvm/arm/mmio.c
+@@ -17,7 +17,6 @@
+  */
+ 
+ #include <linux/kvm_host.h>
+-#include <asm/kvm_mmio.h>
+ #include <asm/kvm_emulate.h>
+ #include <trace/events/kvm.h>
+ 
+@@ -104,26 +103,23 @@ int kvm_handle_mmio_return(struct kvm_vcpu *vcpu, struct kvm_run *run)
+ 
+ 	vcpu->mmio_needed = 0;
+ 
+-	if (!run->mmio.is_write) {
+-		len = run->mmio.len;
+-		if (len > sizeof(unsigned long))
+-			return -EINVAL;
+-
++	if (!kvm_vcpu_dabt_iswrite(vcpu)) {
++		len = kvm_vcpu_dabt_get_as(vcpu);
+ 		data = kvm_mmio_read_buf(run->mmio.data, len);
+ 
+-		if (vcpu->arch.mmio_decode.sign_extend &&
++		if (kvm_vcpu_dabt_issext(vcpu) &&
+ 		    len < sizeof(unsigned long)) {
+ 			mask = 1U << ((len * 8) - 1);
+ 			data = (data ^ mask) - mask;
+ 		}
+ 
+-		if (!vcpu->arch.mmio_decode.sixty_four)
++		if (!kvm_vcpu_dabt_issf(vcpu))
+ 			data = data & 0xffffffff;
+ 
+ 		trace_kvm_mmio(KVM_TRACE_MMIO_READ, len, run->mmio.phys_addr,
+ 			       &data);
+ 		data = vcpu_data_host_to_guest(vcpu, data, len);
+-		vcpu_set_reg(vcpu, vcpu->arch.mmio_decode.rt, data);
++		vcpu_set_reg(vcpu, kvm_vcpu_dabt_get_rd(vcpu), data);
+ 	}
+ 
+ 	/*
+@@ -135,36 +131,6 @@ int kvm_handle_mmio_return(struct kvm_vcpu *vcpu, struct kvm_run *run)
+ 	return 0;
+ }
+ 
+-static int decode_hsr(struct kvm_vcpu *vcpu, bool *is_write, int *len)
+-{
+-	unsigned long rt;
+-	int access_size;
+-	bool sign_extend;
+-	bool sixty_four;
+-
+-	if (kvm_vcpu_dabt_iss1tw(vcpu)) {
+-		/* page table accesses IO mem: tell guest to fix its TTBR */
+-		kvm_inject_dabt(vcpu, kvm_vcpu_get_hfar(vcpu));
+-		return 1;
+-	}
+-
+-	access_size = kvm_vcpu_dabt_get_as(vcpu);
+-	if (unlikely(access_size < 0))
+-		return access_size;
+-
+-	*is_write = kvm_vcpu_dabt_iswrite(vcpu);
+-	sign_extend = kvm_vcpu_dabt_issext(vcpu);
+-	sixty_four = kvm_vcpu_dabt_issf(vcpu);
+-	rt = kvm_vcpu_dabt_get_rd(vcpu);
+-
+-	*len = access_size;
+-	vcpu->arch.mmio_decode.sign_extend = sign_extend;
+-	vcpu->arch.mmio_decode.rt = rt;
+-	vcpu->arch.mmio_decode.sixty_four = sixty_four;
+-
+-	return 0;
+-}
+-
+ int io_mem_abort(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 		 phys_addr_t fault_ipa)
+ {
+@@ -176,15 +142,10 @@ int io_mem_abort(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 	u8 data_buf[8];
+ 
+ 	/*
+-	 * Prepare MMIO operation. First decode the syndrome data we get
+-	 * from the CPU. Then try if some in-kernel emulation feels
+-	 * responsible, otherwise let user space do its magic.
++	 * No valid syndrome? Ask userspace for help if it has
++	 * voluntered to do so, and bail out otherwise.
+ 	 */
+-	if (kvm_vcpu_dabt_isvalid(vcpu)) {
+-		ret = decode_hsr(vcpu, &is_write, &len);
+-		if (ret)
+-			return ret;
+-	} else {
++	if (!kvm_vcpu_dabt_isvalid(vcpu)) {
+ 		if (vcpu->kvm->arch.return_nisv_io_abort_to_user) {
+ 			run->exit_reason = KVM_EXIT_ARM_NISV;
+ 			run->arm_nisv.esr_iss = kvm_vcpu_dabt_iss_nisv_sanitized(vcpu);
+@@ -196,7 +157,20 @@ int io_mem_abort(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 		return -ENOSYS;
+ 	}
+ 
+-	rt = vcpu->arch.mmio_decode.rt;
++	/* Page table accesses IO mem: tell guest to fix its TTBR */
++	if (kvm_vcpu_dabt_iss1tw(vcpu)) {
++		kvm_inject_dabt(vcpu, kvm_vcpu_get_hfar(vcpu));
++		return 1;
++	}
++
++	/*
++	 * Prepare MMIO operation. First decode the syndrome data we get
++	 * from the CPU. Then try if some in-kernel emulation feels
++	 * responsible, otherwise let user space do its magic.
++	 */
++	is_write = kvm_vcpu_dabt_iswrite(vcpu);
++	len = kvm_vcpu_dabt_get_as(vcpu);
++	rt = kvm_vcpu_dabt_get_rd(vcpu);
+ 
+ 	if (is_write) {
+ 		data = vcpu_data_guest_to_host(vcpu, vcpu_get_reg(vcpu, rt),
+diff --git a/virt/kvm/arm/mmu.c b/virt/kvm/arm/mmu.c
+index a0f9a14ad865..7136f530407b 100644
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@ -26,7 +26,6 @@
+ #include <asm/cacheflush.h>
+ #include <asm/kvm_arm.h>
+ #include <asm/kvm_mmu.h>
+-#include <asm/kvm_mmio.h>
+ #include <asm/kvm_ras.h>
+ #include <asm/kvm_asm.h>
+ #include <asm/kvm_emulate.h>
