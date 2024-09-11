@@ -1,0 +1,565 @@
+bpf: add queue and stack maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Mauricio Vasquez B <mauricio.vasquez@polito.it>
+commit f1a2e44a3aeccb3ff18d3ccc0b0203e70b95bd92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f1a2e44a.failed
+
+Queue/stack maps implement a FIFO/LIFO data storage for ebpf programs.
+These maps support peek, pop and push operations that are exposed to eBPF
+programs through the new bpf_map[peek/pop/push] helpers.  Those operations
+are exposed to userspace applications through the already existing
+syscalls in the following way:
+
+BPF_MAP_LOOKUP_ELEM            -> peek
+BPF_MAP_LOOKUP_AND_DELETE_ELEM -> pop
+BPF_MAP_UPDATE_ELEM            -> push
+
+Queue/stack maps are implemented using a buffer, tail and head indexes,
+hence BPF_F_NO_PREALLOC is not supported.
+
+As opposite to other maps, queue and stack do not use RCU for protecting
+maps values, the bpf_map[peek/pop] have a ARG_PTR_TO_UNINIT_MAP_VALUE
+argument that is a pointer to a memory zone where to save the value of a
+map.  Basically the same as ARG_PTR_TO_UNINIT_MEM, but the size has not
+be passed as an extra argument.
+
+Our main motivation for implementing queue/stack maps was to keep track
+of a pool of elements, like network ports in a SNAT, however we forsee
+other use cases, like for exampling saving last N kernel events in a map
+and then analysing from userspace.
+
+	Signed-off-by: Mauricio Vasquez B <mauricio.vasquez@polito.it>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit f1a2e44a3aeccb3ff18d3ccc0b0203e70b95bd92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/verifier.c
+diff --cc include/uapi/linux/bpf.h
+index 4bb4aa8c40e5,70082cb626b4..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2200,7 -2322,15 +2224,19 @@@ union bpf_attr 
+  	FN(rc_keydown),			\
+  	FN(skb_cgroup_id),		\
+  	FN(get_current_cgroup_id),	\
+++<<<<<<< HEAD
+ +	FN(get_local_storage),
+++=======
++ 	FN(get_local_storage),		\
++ 	FN(sk_select_reuseport),	\
++ 	FN(skb_ancestor_cgroup_id),	\
++ 	FN(sk_lookup_tcp),		\
++ 	FN(sk_lookup_udp),		\
++ 	FN(sk_release),			\
++ 	FN(map_push_elem),		\
++ 	FN(map_pop_elem),		\
++ 	FN(map_peek_elem),
+++>>>>>>> f1a2e44a3aec (bpf: add queue and stack maps)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+diff --cc kernel/bpf/verifier.c
+index 310be4d20cba,7d6d9cf9ebd5..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -2101,6 -2320,17 +2101,20 @@@ static int check_map_func_compatibility
+  		    func_id != BPF_FUNC_msg_redirect_hash)
+  			goto error;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case BPF_MAP_TYPE_REUSEPORT_SOCKARRAY:
++ 		if (func_id != BPF_FUNC_sk_select_reuseport)
++ 			goto error;
++ 		break;
++ 	case BPF_MAP_TYPE_QUEUE:
++ 	case BPF_MAP_TYPE_STACK:
++ 		if (func_id != BPF_FUNC_map_peek_elem &&
++ 		    func_id != BPF_FUNC_map_pop_elem &&
++ 		    func_id != BPF_FUNC_map_push_elem)
++ 			goto error;
++ 		break;
+++>>>>>>> f1a2e44a3aec (bpf: add queue and stack maps)
+  	default:
+  		break;
+  	}
+@@@ -2153,6 -2383,17 +2167,20 @@@
+  		    map->map_type != BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE)
+  			goto error;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case BPF_FUNC_sk_select_reuseport:
++ 		if (map->map_type != BPF_MAP_TYPE_REUSEPORT_SOCKARRAY)
++ 			goto error;
++ 		break;
++ 	case BPF_FUNC_map_peek_elem:
++ 	case BPF_FUNC_map_pop_elem:
++ 	case BPF_FUNC_map_push_elem:
++ 		if (map->map_type != BPF_MAP_TYPE_QUEUE &&
++ 		    map->map_type != BPF_MAP_TYPE_STACK)
++ 			goto error;
++ 		break;
+++>>>>>>> f1a2e44a3aec (bpf: add queue and stack maps)
+  	default:
+  		break;
+  	}
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 61250933b8d3..e3a66aa99160 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -39,6 +39,9 @@ struct bpf_map_ops {
+ 	void *(*map_lookup_elem)(struct bpf_map *map, void *key);
+ 	int (*map_update_elem)(struct bpf_map *map, void *key, void *value, u64 flags);
+ 	int (*map_delete_elem)(struct bpf_map *map, void *key);
++	int (*map_push_elem)(struct bpf_map *map, void *value, u64 flags);
++	int (*map_pop_elem)(struct bpf_map *map, void *value);
++	int (*map_peek_elem)(struct bpf_map *map, void *value);
+ 
+ 	/* funcs called by prog_array and perf_event_array map */
+ 	void *(*map_fd_get_ptr)(struct bpf_map *map, struct file *map_file,
+@@ -814,6 +817,9 @@ static inline int bpf_fd_reuseport_array_update_elem(struct bpf_map *map,
+ extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
+ extern const struct bpf_func_proto bpf_map_update_elem_proto;
+ extern const struct bpf_func_proto bpf_map_delete_elem_proto;
++extern const struct bpf_func_proto bpf_map_push_elem_proto;
++extern const struct bpf_func_proto bpf_map_pop_elem_proto;
++extern const struct bpf_func_proto bpf_map_peek_elem_proto;
+ 
+ extern const struct bpf_func_proto bpf_get_prandom_u32_proto;
+ extern const struct bpf_func_proto bpf_get_smp_processor_id_proto;
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index 29ab72523bac..3afac889ef5b 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -65,3 +65,5 @@ BPF_MAP_TYPE(BPF_MAP_TYPE_XSKMAP, xsk_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_REUSEPORT_SOCKARRAY, reuseport_array_ops)
+ #endif
+ #endif
++BPF_MAP_TYPE(BPF_MAP_TYPE_QUEUE, queue_map_ops)
++BPF_MAP_TYPE(BPF_MAP_TYPE_STACK, stack_map_ops)
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index 0488b8258321..17afae9e65f3 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -3,7 +3,7 @@ obj-y := core.o
+ 
+ obj-$(CONFIG_BPF_SYSCALL) += syscall.o verifier.o inode.o helpers.o tnum.o
+ obj-$(CONFIG_BPF_SYSCALL) += hashtab.o arraymap.o percpu_freelist.o bpf_lru_list.o lpm_trie.o map_in_map.o
+-obj-$(CONFIG_BPF_SYSCALL) += local_storage.o
++obj-$(CONFIG_BPF_SYSCALL) += local_storage.o queue_stack_maps.o
+ obj-$(CONFIG_BPF_SYSCALL) += disasm.o
+ obj-$(CONFIG_BPF_SYSCALL) += btf.o
+ ifeq ($(CONFIG_NET),y)
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 03fd11bf8b73..bb47bef1d8e5 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1785,6 +1785,9 @@ BPF_CALL_0(bpf_user_rnd_u32)
+ const struct bpf_func_proto bpf_map_lookup_elem_proto __weak;
+ const struct bpf_func_proto bpf_map_update_elem_proto __weak;
+ const struct bpf_func_proto bpf_map_delete_elem_proto __weak;
++const struct bpf_func_proto bpf_map_push_elem_proto __weak;
++const struct bpf_func_proto bpf_map_pop_elem_proto __weak;
++const struct bpf_func_proto bpf_map_peek_elem_proto __weak;
+ 
+ const struct bpf_func_proto bpf_get_prandom_u32_proto __weak;
+ const struct bpf_func_proto bpf_get_smp_processor_id_proto __weak;
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 6502115e8f55..ab0d5e3f9892 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -76,6 +76,49 @@ const struct bpf_func_proto bpf_map_delete_elem_proto = {
+ 	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+ };
+ 
++BPF_CALL_3(bpf_map_push_elem, struct bpf_map *, map, void *, value, u64, flags)
++{
++	return map->ops->map_push_elem(map, value, flags);
++}
++
++const struct bpf_func_proto bpf_map_push_elem_proto = {
++	.func		= bpf_map_push_elem,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_MAP_VALUE,
++	.arg3_type	= ARG_ANYTHING,
++};
++
++BPF_CALL_2(bpf_map_pop_elem, struct bpf_map *, map, void *, value)
++{
++	return map->ops->map_pop_elem(map, value);
++}
++
++const struct bpf_func_proto bpf_map_pop_elem_proto = {
++	.func		= bpf_map_pop_elem,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_UNINIT_MAP_VALUE,
++};
++
++BPF_CALL_2(bpf_map_peek_elem, struct bpf_map *, map, void *, value)
++{
++	return map->ops->map_peek_elem(map, value);
++}
++
++const struct bpf_func_proto bpf_map_peek_elem_proto = {
++	.func		= bpf_map_pop_elem,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_UNINIT_MAP_VALUE,
++};
++
+ const struct bpf_func_proto bpf_get_prandom_u32_proto = {
+ 	.func		= bpf_user_rnd_u32,
+ 	.gpl_only	= false,
+diff --git a/kernel/bpf/queue_stack_maps.c b/kernel/bpf/queue_stack_maps.c
+new file mode 100644
+index 000000000000..12a93fb37449
+--- /dev/null
++++ b/kernel/bpf/queue_stack_maps.c
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * queue_stack_maps.c: BPF queue and stack maps
++ *
++ * Copyright (c) 2018 Politecnico di Torino
++ */
++#include <linux/bpf.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++#include "percpu_freelist.h"
++
++#define QUEUE_STACK_CREATE_FLAG_MASK \
++	(BPF_F_NUMA_NODE | BPF_F_RDONLY | BPF_F_WRONLY)
++
++
++struct bpf_queue_stack {
++	struct bpf_map map;
++	raw_spinlock_t lock;
++	u32 head, tail;
++	u32 size; /* max_entries + 1 */
++
++	char elements[0] __aligned(8);
++};
++
++static struct bpf_queue_stack *bpf_queue_stack(struct bpf_map *map)
++{
++	return container_of(map, struct bpf_queue_stack, map);
++}
++
++static bool queue_stack_map_is_empty(struct bpf_queue_stack *qs)
++{
++	return qs->head == qs->tail;
++}
++
++static bool queue_stack_map_is_full(struct bpf_queue_stack *qs)
++{
++	u32 head = qs->head + 1;
++
++	if (unlikely(head >= qs->size))
++		head = 0;
++
++	return head == qs->tail;
++}
++
++/* Called from syscall */
++static int queue_stack_map_alloc_check(union bpf_attr *attr)
++{
++	/* check sanity of attributes */
++	if (attr->max_entries == 0 || attr->key_size != 0 ||
++	    attr->map_flags & ~QUEUE_STACK_CREATE_FLAG_MASK)
++		return -EINVAL;
++
++	if (attr->value_size > KMALLOC_MAX_SIZE)
++		/* if value_size is bigger, the user space won't be able to
++		 * access the elements.
++		 */
++		return -E2BIG;
++
++	return 0;
++}
++
++static struct bpf_map *queue_stack_map_alloc(union bpf_attr *attr)
++{
++	int ret, numa_node = bpf_map_attr_numa_node(attr);
++	struct bpf_queue_stack *qs;
++	u32 size, value_size;
++	u64 queue_size, cost;
++
++	size = attr->max_entries + 1;
++	value_size = attr->value_size;
++
++	queue_size = sizeof(*qs) + (u64) value_size * size;
++
++	cost = queue_size;
++	if (cost >= U32_MAX - PAGE_SIZE)
++		return ERR_PTR(-E2BIG);
++
++	cost = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
++
++	ret = bpf_map_precharge_memlock(cost);
++	if (ret < 0)
++		return ERR_PTR(ret);
++
++	qs = bpf_map_area_alloc(queue_size, numa_node);
++	if (!qs)
++		return ERR_PTR(-ENOMEM);
++
++	memset(qs, 0, sizeof(*qs));
++
++	bpf_map_init_from_attr(&qs->map, attr);
++
++	qs->map.pages = cost;
++	qs->size = size;
++
++	raw_spin_lock_init(&qs->lock);
++
++	return &qs->map;
++}
++
++/* Called when map->refcnt goes to zero, either from workqueue or from syscall */
++static void queue_stack_map_free(struct bpf_map *map)
++{
++	struct bpf_queue_stack *qs = bpf_queue_stack(map);
++
++	/* at this point bpf_prog->aux->refcnt == 0 and this map->refcnt == 0,
++	 * so the programs (can be more than one that used this map) were
++	 * disconnected from events. Wait for outstanding critical sections in
++	 * these programs to complete
++	 */
++	synchronize_rcu();
++
++	bpf_map_area_free(qs);
++}
++
++static int __queue_map_get(struct bpf_map *map, void *value, bool delete)
++{
++	struct bpf_queue_stack *qs = bpf_queue_stack(map);
++	unsigned long flags;
++	int err = 0;
++	void *ptr;
++
++	raw_spin_lock_irqsave(&qs->lock, flags);
++
++	if (queue_stack_map_is_empty(qs)) {
++		err = -ENOENT;
++		goto out;
++	}
++
++	ptr = &qs->elements[qs->tail * qs->map.value_size];
++	memcpy(value, ptr, qs->map.value_size);
++
++	if (delete) {
++		if (unlikely(++qs->tail >= qs->size))
++			qs->tail = 0;
++	}
++
++out:
++	raw_spin_unlock_irqrestore(&qs->lock, flags);
++	return err;
++}
++
++
++static int __stack_map_get(struct bpf_map *map, void *value, bool delete)
++{
++	struct bpf_queue_stack *qs = bpf_queue_stack(map);
++	unsigned long flags;
++	int err = 0;
++	void *ptr;
++	u32 index;
++
++	raw_spin_lock_irqsave(&qs->lock, flags);
++
++	if (queue_stack_map_is_empty(qs)) {
++		err = -ENOENT;
++		goto out;
++	}
++
++	index = qs->head - 1;
++	if (unlikely(index >= qs->size))
++		index = qs->size - 1;
++
++	ptr = &qs->elements[index * qs->map.value_size];
++	memcpy(value, ptr, qs->map.value_size);
++
++	if (delete)
++		qs->head = index;
++
++out:
++	raw_spin_unlock_irqrestore(&qs->lock, flags);
++	return err;
++}
++
++/* Called from syscall or from eBPF program */
++static int queue_map_peek_elem(struct bpf_map *map, void *value)
++{
++	return __queue_map_get(map, value, false);
++}
++
++/* Called from syscall or from eBPF program */
++static int stack_map_peek_elem(struct bpf_map *map, void *value)
++{
++	return __stack_map_get(map, value, false);
++}
++
++/* Called from syscall or from eBPF program */
++static int queue_map_pop_elem(struct bpf_map *map, void *value)
++{
++	return __queue_map_get(map, value, true);
++}
++
++/* Called from syscall or from eBPF program */
++static int stack_map_pop_elem(struct bpf_map *map, void *value)
++{
++	return __stack_map_get(map, value, true);
++}
++
++/* Called from syscall or from eBPF program */
++static int queue_stack_map_push_elem(struct bpf_map *map, void *value,
++				     u64 flags)
++{
++	struct bpf_queue_stack *qs = bpf_queue_stack(map);
++	unsigned long irq_flags;
++	int err = 0;
++	void *dst;
++
++	/* BPF_EXIST is used to force making room for a new element in case the
++	 * map is full
++	 */
++	bool replace = (flags & BPF_EXIST);
++
++	/* Check supported flags for queue and stack maps */
++	if (flags & BPF_NOEXIST || flags > BPF_EXIST)
++		return -EINVAL;
++
++	raw_spin_lock_irqsave(&qs->lock, irq_flags);
++
++	if (queue_stack_map_is_full(qs)) {
++		if (!replace) {
++			err = -E2BIG;
++			goto out;
++		}
++		/* advance tail pointer to overwrite oldest element */
++		if (unlikely(++qs->tail >= qs->size))
++			qs->tail = 0;
++	}
++
++	dst = &qs->elements[qs->head * qs->map.value_size];
++	memcpy(dst, value, qs->map.value_size);
++
++	if (unlikely(++qs->head >= qs->size))
++		qs->head = 0;
++
++out:
++	raw_spin_unlock_irqrestore(&qs->lock, irq_flags);
++	return err;
++}
++
++/* Called from syscall or from eBPF program */
++static void *queue_stack_map_lookup_elem(struct bpf_map *map, void *key)
++{
++	return NULL;
++}
++
++/* Called from syscall or from eBPF program */
++static int queue_stack_map_update_elem(struct bpf_map *map, void *key,
++				       void *value, u64 flags)
++{
++	return -EINVAL;
++}
++
++/* Called from syscall or from eBPF program */
++static int queue_stack_map_delete_elem(struct bpf_map *map, void *key)
++{
++	return -EINVAL;
++}
++
++/* Called from syscall */
++static int queue_stack_map_get_next_key(struct bpf_map *map, void *key,
++					void *next_key)
++{
++	return -EINVAL;
++}
++
++const struct bpf_map_ops queue_map_ops = {
++	.map_alloc_check = queue_stack_map_alloc_check,
++	.map_alloc = queue_stack_map_alloc,
++	.map_free = queue_stack_map_free,
++	.map_lookup_elem = queue_stack_map_lookup_elem,
++	.map_update_elem = queue_stack_map_update_elem,
++	.map_delete_elem = queue_stack_map_delete_elem,
++	.map_push_elem = queue_stack_map_push_elem,
++	.map_pop_elem = queue_map_pop_elem,
++	.map_peek_elem = queue_map_peek_elem,
++	.map_get_next_key = queue_stack_map_get_next_key,
++};
++
++const struct bpf_map_ops stack_map_ops = {
++	.map_alloc_check = queue_stack_map_alloc_check,
++	.map_alloc = queue_stack_map_alloc,
++	.map_free = queue_stack_map_free,
++	.map_lookup_elem = queue_stack_map_lookup_elem,
++	.map_update_elem = queue_stack_map_update_elem,
++	.map_delete_elem = queue_stack_map_delete_elem,
++	.map_push_elem = queue_stack_map_push_elem,
++	.map_pop_elem = stack_map_pop_elem,
++	.map_peek_elem = stack_map_peek_elem,
++	.map_get_next_key = queue_stack_map_get_next_key,
++};
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index c4dc742534e4..e483b90dddc3 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -748,6 +748,9 @@ static int map_lookup_elem(union bpf_attr *attr)
+ 		err = bpf_fd_htab_map_lookup_elem(map, key, value);
+ 	} else if (map->map_type == BPF_MAP_TYPE_REUSEPORT_SOCKARRAY) {
+ 		err = bpf_fd_reuseport_array_lookup_elem(map, key, value);
++	} else if (map->map_type == BPF_MAP_TYPE_QUEUE ||
++		   map->map_type == BPF_MAP_TYPE_STACK) {
++		err = map->ops->map_peek_elem(map, value);
+ 	} else {
+ 		rcu_read_lock();
+ 		ptr = map->ops->map_lookup_elem(map, key);
+@@ -878,6 +881,9 @@ static int map_update_elem(union bpf_attr *attr)
+ 		/* rcu_read_lock() is not needed */
+ 		err = bpf_fd_reuseport_array_update_elem(map, key, value,
+ 							 attr->flags);
++	} else if (map->map_type == BPF_MAP_TYPE_QUEUE ||
++		   map->map_type == BPF_MAP_TYPE_STACK) {
++		err = map->ops->map_push_elem(map, value, attr->flags);
+ 	} else {
+ 		rcu_read_lock();
+ 		err = map->ops->map_update_elem(map, key, value, attr->flags);
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 9215221d9011..bdca4c73a82c 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -4778,6 +4778,12 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 		return &bpf_map_update_elem_proto;
+ 	case BPF_FUNC_map_delete_elem:
+ 		return &bpf_map_delete_elem_proto;
++	case BPF_FUNC_map_push_elem:
++		return &bpf_map_push_elem_proto;
++	case BPF_FUNC_map_pop_elem:
++		return &bpf_map_pop_elem_proto;
++	case BPF_FUNC_map_peek_elem:
++		return &bpf_map_peek_elem_proto;
+ 	case BPF_FUNC_get_prandom_u32:
+ 		return &bpf_get_prandom_u32_proto;
+ 	case BPF_FUNC_get_smp_processor_id:
