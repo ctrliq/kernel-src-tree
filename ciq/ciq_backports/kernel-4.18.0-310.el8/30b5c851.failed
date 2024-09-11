@@ -1,0 +1,491 @@
+KVM: x86/xen: Add support for vCPU runstate information
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author David Woodhouse <dwmw@amazon.co.uk>
+commit 30b5c851af7991ad08abe90c1e7c31615fa98a1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/30b5c851.failed
+
+This is how Xen guests do steal time accounting. The hypervisor records
+the amount of time spent in each of running/runnable/blocked/offline
+states.
+
+In the Xen accounting, a vCPU is still in state RUNSTATE_running while
+in Xen for a hypercall or I/O trap, etc. Only if Xen explicitly schedules
+does the state become RUNSTATE_blocked. In KVM this means that even when
+the vCPU exits the kvm_run loop, the state remains RUNSTATE_running.
+
+The VMM can explicitly set the vCPU to RUNSTATE_blocked by using the
+KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_CURRENT attribute, and can also use
+KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADJUST to retrospectively add a given
+amount of time to the blocked state and subtract it from the running
+state.
+
+The state_entry_time corresponds to get_kvmclock_ns() at the time the
+vCPU entered the current state, and the total times of all four states
+should always add up to state_entry_time.
+
+Co-developed-by: Joao Martins <joao.m.martins@oracle.com>
+	Signed-off-by: Joao Martins <joao.m.martins@oracle.com>
+	Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Message-Id: <20210301125309.874953-2-dwmw2@infradead.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 30b5c851af7991ad08abe90c1e7c31615fa98a1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virt/kvm/api.rst
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/x86.c
+#	arch/x86/kvm/xen.c
+#	arch/x86/kvm/xen.h
+#	include/uapi/linux/kvm.h
+#	tools/testing/selftests/kvm/x86_64/xen_shinfo_test.c
+diff --cc Documentation/virt/kvm/api.rst
+index 0a23a80361e7,1a2b5210cdbf..000000000000
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@@ -4784,6 -4806,137 +4784,140 @@@ into user space
+  If a vCPU is in running state while this ioctl is invoked, the vCPU may
+  experience inconsistent filtering behavior on MSR accesses.
+  
+++<<<<<<< HEAD
+++=======
++ 4.127 KVM_XEN_HVM_SET_ATTR
++ --------------------------
++ 
++ :Capability: KVM_CAP_XEN_HVM / KVM_XEN_HVM_CONFIG_SHARED_INFO
++ :Architectures: x86
++ :Type: vm ioctl
++ :Parameters: struct kvm_xen_hvm_attr
++ :Returns: 0 on success, < 0 on error
++ 
++ ::
++ 
++   struct kvm_xen_hvm_attr {
++ 	__u16 type;
++ 	__u16 pad[3];
++ 	union {
++ 		__u8 long_mode;
++ 		__u8 vector;
++ 		struct {
++ 			__u64 gfn;
++ 		} shared_info;
++ 		__u64 pad[4];
++ 	} u;
++   };
++ 
++ type values:
++ 
++ KVM_XEN_ATTR_TYPE_LONG_MODE
++   Sets the ABI mode of the VM to 32-bit or 64-bit (long mode). This
++   determines the layout of the shared info pages exposed to the VM.
++ 
++ KVM_XEN_ATTR_TYPE_SHARED_INFO
++   Sets the guest physical frame number at which the Xen "shared info"
++   page resides. Note that although Xen places vcpu_info for the first
++   32 vCPUs in the shared_info page, KVM does not automatically do so
++   and instead requires that KVM_XEN_VCPU_ATTR_TYPE_VCPU_INFO be used
++   explicitly even when the vcpu_info for a given vCPU resides at the
++   "default" location in the shared_info page. This is because KVM is
++   not aware of the Xen CPU id which is used as the index into the
++   vcpu_info[] array, so cannot know the correct default location.
++ 
++ KVM_XEN_ATTR_TYPE_UPCALL_VECTOR
++   Sets the exception vector used to deliver Xen event channel upcalls.
++ 
++ 4.128 KVM_XEN_HVM_GET_ATTR
++ --------------------------
++ 
++ :Capability: KVM_CAP_XEN_HVM / KVM_XEN_HVM_CONFIG_SHARED_INFO
++ :Architectures: x86
++ :Type: vm ioctl
++ :Parameters: struct kvm_xen_hvm_attr
++ :Returns: 0 on success, < 0 on error
++ 
++ Allows Xen VM attributes to be read. For the structure and types,
++ see KVM_XEN_HVM_SET_ATTR above.
++ 
++ 4.129 KVM_XEN_VCPU_SET_ATTR
++ ---------------------------
++ 
++ :Capability: KVM_CAP_XEN_HVM / KVM_XEN_HVM_CONFIG_SHARED_INFO
++ :Architectures: x86
++ :Type: vcpu ioctl
++ :Parameters: struct kvm_xen_vcpu_attr
++ :Returns: 0 on success, < 0 on error
++ 
++ ::
++ 
++   struct kvm_xen_vcpu_attr {
++ 	__u16 type;
++ 	__u16 pad[3];
++ 	union {
++ 		__u64 gpa;
++ 		__u64 pad[4];
++ 		struct {
++ 			__u64 state;
++ 			__u64 state_entry_time;
++ 			__u64 time_running;
++ 			__u64 time_runnable;
++ 			__u64 time_blocked;
++ 			__u64 time_offline;
++ 		} runstate;
++ 	} u;
++   };
++ 
++ type values:
++ 
++ KVM_XEN_VCPU_ATTR_TYPE_VCPU_INFO
++   Sets the guest physical address of the vcpu_info for a given vCPU.
++ 
++ KVM_XEN_VCPU_ATTR_TYPE_VCPU_TIME_INFO
++   Sets the guest physical address of an additional pvclock structure
++   for a given vCPU. This is typically used for guest vsyscall support.
++ 
++ KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADDR
++   Sets the guest physical address of the vcpu_runstate_info for a given
++   vCPU. This is how a Xen guest tracks CPU state such as steal time.
++ 
++ KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_CURRENT
++   Sets the runstate (RUNSTATE_running/_runnable/_blocked/_offline) of
++   the given vCPU from the .u.runstate.state member of the structure.
++   KVM automatically accounts running and runnable time but blocked
++   and offline states are only entered explicitly.
++ 
++ KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_DATA
++   Sets all fields of the vCPU runstate data from the .u.runstate member
++   of the structure, including the current runstate. The state_entry_time
++   must equal the sum of the other four times.
++ 
++ KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADJUST
++   This *adds* the contents of the .u.runstate members of the structure
++   to the corresponding members of the given vCPU's runstate data, thus
++   permitting atomic adjustments to the runstate times. The adjustment
++   to the state_entry_time must equal the sum of the adjustments to the
++   other four times. The state field must be set to -1, or to a valid
++   runstate value (RUNSTATE_running, RUNSTATE_runnable, RUNSTATE_blocked
++   or RUNSTATE_offline) to set the current accounted state as of the
++   adjusted state_entry_time.
++ 
++ 4.130 KVM_XEN_VCPU_GET_ATTR
++ ---------------------------
++ 
++ :Capability: KVM_CAP_XEN_HVM / KVM_XEN_HVM_CONFIG_SHARED_INFO
++ :Architectures: x86
++ :Type: vcpu ioctl
++ :Parameters: struct kvm_xen_vcpu_attr
++ :Returns: 0 on success, < 0 on error
++ 
++ Allows Xen vCPU attributes to be read. For the structure and types,
++ see KVM_XEN_VCPU_SET_ATTR above.
+++>>>>>>> 30b5c851af79 (KVM: x86/xen: Add support for vCPU runstate information)
++ 
++ The KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADJUST type may not be used
++ with the KVM_XEN_VCPU_GET_ATTR ioctl.
+  
+  5. The kvm_run structure
+  ========================
+@@@ -6387,3 -6603,121 +6521,124 @@@ When enabled, KVM will disable paravirt
+  guest according to the bits in the KVM_CPUID_FEATURES CPUID leaf
+  (0x40000001). Otherwise, a guest may use the paravirtual features
+  regardless of what has actually been exposed through the CPUID leaf.
+++<<<<<<< HEAD
+++=======
++ 
++ 8.29 KVM_CAP_DIRTY_LOG_RING
++ ---------------------------
++ 
++ :Architectures: x86
++ :Parameters: args[0] - size of the dirty log ring
++ 
++ KVM is capable of tracking dirty memory using ring buffers that are
++ mmaped into userspace; there is one dirty ring per vcpu.
++ 
++ The dirty ring is available to userspace as an array of
++ ``struct kvm_dirty_gfn``.  Each dirty entry it's defined as::
++ 
++   struct kvm_dirty_gfn {
++           __u32 flags;
++           __u32 slot; /* as_id | slot_id */
++           __u64 offset;
++   };
++ 
++ The following values are defined for the flags field to define the
++ current state of the entry::
++ 
++   #define KVM_DIRTY_GFN_F_DIRTY           BIT(0)
++   #define KVM_DIRTY_GFN_F_RESET           BIT(1)
++   #define KVM_DIRTY_GFN_F_MASK            0x3
++ 
++ Userspace should call KVM_ENABLE_CAP ioctl right after KVM_CREATE_VM
++ ioctl to enable this capability for the new guest and set the size of
++ the rings.  Enabling the capability is only allowed before creating any
++ vCPU, and the size of the ring must be a power of two.  The larger the
++ ring buffer, the less likely the ring is full and the VM is forced to
++ exit to userspace. The optimal size depends on the workload, but it is
++ recommended that it be at least 64 KiB (4096 entries).
++ 
++ Just like for dirty page bitmaps, the buffer tracks writes to
++ all user memory regions for which the KVM_MEM_LOG_DIRTY_PAGES flag was
++ set in KVM_SET_USER_MEMORY_REGION.  Once a memory region is registered
++ with the flag set, userspace can start harvesting dirty pages from the
++ ring buffer.
++ 
++ An entry in the ring buffer can be unused (flag bits ``00``),
++ dirty (flag bits ``01``) or harvested (flag bits ``1X``).  The
++ state machine for the entry is as follows::
++ 
++           dirtied         harvested        reset
++      00 -----------> 01 -------------> 1X -------+
++       ^                                          |
++       |                                          |
++       +------------------------------------------+
++ 
++ To harvest the dirty pages, userspace accesses the mmaped ring buffer
++ to read the dirty GFNs.  If the flags has the DIRTY bit set (at this stage
++ the RESET bit must be cleared), then it means this GFN is a dirty GFN.
++ The userspace should harvest this GFN and mark the flags from state
++ ``01b`` to ``1Xb`` (bit 0 will be ignored by KVM, but bit 1 must be set
++ to show that this GFN is harvested and waiting for a reset), and move
++ on to the next GFN.  The userspace should continue to do this until the
++ flags of a GFN have the DIRTY bit cleared, meaning that it has harvested
++ all the dirty GFNs that were available.
++ 
++ It's not necessary for userspace to harvest the all dirty GFNs at once.
++ However it must collect the dirty GFNs in sequence, i.e., the userspace
++ program cannot skip one dirty GFN to collect the one next to it.
++ 
++ After processing one or more entries in the ring buffer, userspace
++ calls the VM ioctl KVM_RESET_DIRTY_RINGS to notify the kernel about
++ it, so that the kernel will reprotect those collected GFNs.
++ Therefore, the ioctl must be called *before* reading the content of
++ the dirty pages.
++ 
++ The dirty ring can get full.  When it happens, the KVM_RUN of the
++ vcpu will return with exit reason KVM_EXIT_DIRTY_LOG_FULL.
++ 
++ The dirty ring interface has a major difference comparing to the
++ KVM_GET_DIRTY_LOG interface in that, when reading the dirty ring from
++ userspace, it's still possible that the kernel has not yet flushed the
++ processor's dirty page buffers into the kernel buffer (with dirty bitmaps, the
++ flushing is done by the KVM_GET_DIRTY_LOG ioctl).  To achieve that, one
++ needs to kick the vcpu out of KVM_RUN using a signal.  The resulting
++ vmexit ensures that all dirty GFNs are flushed to the dirty rings.
++ 
++ NOTE: the capability KVM_CAP_DIRTY_LOG_RING and the corresponding
++ ioctl KVM_RESET_DIRTY_RINGS are mutual exclusive to the existing ioctls
++ KVM_GET_DIRTY_LOG and KVM_CLEAR_DIRTY_LOG.  After enabling
++ KVM_CAP_DIRTY_LOG_RING with an acceptable dirty ring size, the virtual
++ machine will switch to ring-buffer dirty page tracking and further
++ KVM_GET_DIRTY_LOG or KVM_CLEAR_DIRTY_LOG ioctls will fail.
++ 
++ 8.30 KVM_CAP_XEN_HVM
++ --------------------
++ 
++ :Architectures: x86
++ 
++ This capability indicates the features that Xen supports for hosting Xen
++ PVHVM guests. Valid flags are::
++ 
++   #define KVM_XEN_HVM_CONFIG_HYPERCALL_MSR	(1 << 0)
++   #define KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL	(1 << 1)
++   #define KVM_XEN_HVM_CONFIG_SHARED_INFO	(1 << 2)
++   #define KVM_XEN_HVM_CONFIG_RUNSTATE		(1 << 2)
++ 
++ The KVM_XEN_HVM_CONFIG_HYPERCALL_MSR flag indicates that the KVM_XEN_HVM_CONFIG
++ ioctl is available, for the guest to set its hypercall page.
++ 
++ If KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL is also set, the same flag may also be
++ provided in the flags to KVM_XEN_HVM_CONFIG, without providing hypercall page
++ contents, to request that KVM generate hypercall page content automatically
++ and also enable interception of guest hypercalls with KVM_EXIT_XEN.
++ 
++ The KVM_XEN_HVM_CONFIG_SHARED_INFO flag indicates the availability of the
++ KVM_XEN_HVM_SET_ATTR, KVM_XEN_HVM_GET_ATTR, KVM_XEN_VCPU_SET_ATTR and
++ KVM_XEN_VCPU_GET_ATTR ioctls, as well as the delivery of exception vectors
++ for event channel upcalls when the evtchn_upcall_pending field of a vcpu's
++ vcpu_info is set.
++ 
++ The KVM_XEN_HVM_CONFIG_RUNSTATE flag indicates that the runstate-related
++ features KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADDR/_CURRENT/_DATA/_ADJUST are
++ supported by the KVM_XEN_VCPU_SET_ATTR/KVM_XEN_VCPU_GET_ATTR ioctls.
+++>>>>>>> 30b5c851af79 (KVM: x86/xen: Add support for vCPU runstate information)
+diff --cc arch/x86/include/asm/kvm_host.h
+index 471adc1ebec2,877a4025d8da..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -531,6 -532,21 +531,24 @@@ struct kvm_vcpu_hv 
+  	cpumask_t tlb_flush;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Xen HVM per vcpu emulation context */
++ struct kvm_vcpu_xen {
++ 	u64 hypercall_rip;
++ 	u32 current_runstate;
++ 	bool vcpu_info_set;
++ 	bool vcpu_time_info_set;
++ 	bool runstate_set;
++ 	struct gfn_to_hva_cache vcpu_info_cache;
++ 	struct gfn_to_hva_cache vcpu_time_info_cache;
++ 	struct gfn_to_hva_cache runstate_cache;
++ 	u64 last_steal;
++ 	u64 runstate_entry_time;
++ 	u64 runstate_times[4];
++ };
++ 
+++>>>>>>> 30b5c851af79 (KVM: x86/xen: Add support for vCPU runstate information)
+  struct kvm_vcpu_arch {
+  	/*
+  	 * rip and regs accesses must go through
+diff --cc arch/x86/kvm/x86.c
+index 5b18614d5081,868213ca4f98..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -3777,6 -3760,15 +3782,18 @@@ int kvm_vm_ioctl_check_extension(struc
+  	case KVM_CAP_ENFORCE_PV_FEATURE_CPUID:
+  		r = 1;
+  		break;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_XEN
++ 	case KVM_CAP_XEN_HVM:
++ 		r = KVM_XEN_HVM_CONFIG_HYPERCALL_MSR |
++ 		    KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL |
++ 		    KVM_XEN_HVM_CONFIG_SHARED_INFO;
++ 		if (sched_info_on())
++ 			r |= KVM_XEN_HVM_CONFIG_RUNSTATE;
++ 		break;
++ #endif
+++>>>>>>> 30b5c851af79 (KVM: x86/xen: Add support for vCPU runstate information)
+  	case KVM_CAP_SYNC_REGS:
+  		r = KVM_SYNC_X86_VALID_FIELDS;
+  		break;
+@@@ -4034,19 -4043,15 +4051,28 @@@ static void kvm_steal_time_set_preempte
+  
+  void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+  {
+ -	if (vcpu->preempted && !vcpu->arch.guest_state_protected)
+ -		vcpu->arch.preempted_in_kernel = !static_call(kvm_x86_get_cpl)(vcpu);
+ +	int idx;
+ +
+++<<<<<<< HEAD
+ +	if (vcpu->preempted)
+ +		vcpu->arch.preempted_in_kernel = !kvm_x86_ops.get_cpl(vcpu);
+  
+ +	/*
+ +	 * kvm_memslots() will be called by
+ +	 * kvm_write_guest_offset_cached() so take the srcu lock.
+ +	 */
+ +	idx = srcu_read_lock(&vcpu->kvm->srcu);
+ +	kvm_steal_time_set_preempted(vcpu);
+ +	srcu_read_unlock(&vcpu->kvm->srcu, idx);
+ +	kvm_x86_ops.vcpu_put(vcpu);
+++=======
++ 	if (kvm_xen_msr_enabled(vcpu->kvm))
++ 		kvm_xen_runstate_set_preempted(vcpu);
++ 	else
++ 		kvm_steal_time_set_preempted(vcpu);
++ 
++ 	static_call(kvm_x86_vcpu_put)(vcpu);
+++>>>>>>> 30b5c851af79 (KVM: x86/xen: Add support for vCPU runstate information)
+  	vcpu->arch.last_host_tsc = rdtsc();
+  	/*
+  	 * If userspace has set any breakpoints or watchpoints, dr6 is restored
+diff --cc include/uapi/linux/kvm.h
+index a9fa79abd23a,f6afee209620..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1126,6 -1151,11 +1126,14 @@@ struct kvm_x86_mce 
+  #endif
+  
+  #ifdef KVM_CAP_XEN_HVM
+++<<<<<<< HEAD
+++=======
++ #define KVM_XEN_HVM_CONFIG_HYPERCALL_MSR	(1 << 0)
++ #define KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL	(1 << 1)
++ #define KVM_XEN_HVM_CONFIG_SHARED_INFO		(1 << 2)
++ #define KVM_XEN_HVM_CONFIG_RUNSTATE		(1 << 3)
++ 
+++>>>>>>> 30b5c851af79 (KVM: x86/xen: Add support for vCPU runstate information)
+  struct kvm_xen_hvm_config {
+  	__u32 flags;
+  	__u32 msr;
+@@@ -1556,6 -1587,60 +1564,63 @@@ struct kvm_pv_cmd 
+  /* Available with KVM_CAP_X86_MSR_FILTER */
+  #define KVM_X86_SET_MSR_FILTER	_IOW(KVMIO,  0xc6, struct kvm_msr_filter)
+  
+++<<<<<<< HEAD
+++=======
++ /* Available with KVM_CAP_DIRTY_LOG_RING */
++ #define KVM_RESET_DIRTY_RINGS		_IO(KVMIO, 0xc7)
++ 
++ /* Per-VM Xen attributes */
++ #define KVM_XEN_HVM_GET_ATTR	_IOWR(KVMIO, 0xc8, struct kvm_xen_hvm_attr)
++ #define KVM_XEN_HVM_SET_ATTR	_IOW(KVMIO,  0xc9, struct kvm_xen_hvm_attr)
++ 
++ struct kvm_xen_hvm_attr {
++ 	__u16 type;
++ 	__u16 pad[3];
++ 	union {
++ 		__u8 long_mode;
++ 		__u8 vector;
++ 		struct {
++ 			__u64 gfn;
++ 		} shared_info;
++ 		__u64 pad[8];
++ 	} u;
++ };
++ 
++ /* Available with KVM_CAP_XEN_HVM / KVM_XEN_HVM_CONFIG_SHARED_INFO */
++ #define KVM_XEN_ATTR_TYPE_LONG_MODE		0x0
++ #define KVM_XEN_ATTR_TYPE_SHARED_INFO		0x1
++ #define KVM_XEN_ATTR_TYPE_UPCALL_VECTOR		0x2
++ 
++ /* Per-vCPU Xen attributes */
++ #define KVM_XEN_VCPU_GET_ATTR	_IOWR(KVMIO, 0xca, struct kvm_xen_vcpu_attr)
++ #define KVM_XEN_VCPU_SET_ATTR	_IOW(KVMIO,  0xcb, struct kvm_xen_vcpu_attr)
++ 
++ struct kvm_xen_vcpu_attr {
++ 	__u16 type;
++ 	__u16 pad[3];
++ 	union {
++ 		__u64 gpa;
++ 		__u64 pad[8];
++ 		struct {
++ 			__u64 state;
++ 			__u64 state_entry_time;
++ 			__u64 time_running;
++ 			__u64 time_runnable;
++ 			__u64 time_blocked;
++ 			__u64 time_offline;
++ 		} runstate;
++ 	} u;
++ };
++ 
++ /* Available with KVM_CAP_XEN_HVM / KVM_XEN_HVM_CONFIG_SHARED_INFO */
++ #define KVM_XEN_VCPU_ATTR_TYPE_VCPU_INFO	0x0
++ #define KVM_XEN_VCPU_ATTR_TYPE_VCPU_TIME_INFO	0x1
++ #define KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADDR	0x2
++ #define KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_CURRENT	0x3
++ #define KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_DATA	0x4
++ #define KVM_XEN_VCPU_ATTR_TYPE_RUNSTATE_ADJUST	0x5
++ 
+++>>>>>>> 30b5c851af79 (KVM: x86/xen: Add support for vCPU runstate information)
+  /* Secure Encrypted Virtualization command */
+  enum sev_cmd_id {
+  	/* Guest initialization commands */
+* Unmerged path arch/x86/kvm/xen.c
+* Unmerged path arch/x86/kvm/xen.h
+* Unmerged path tools/testing/selftests/kvm/x86_64/xen_shinfo_test.c
+* Unmerged path Documentation/virt/kvm/api.rst
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path arch/x86/kvm/xen.c
+* Unmerged path arch/x86/kvm/xen.h
+* Unmerged path include/uapi/linux/kvm.h
+* Unmerged path tools/testing/selftests/kvm/x86_64/xen_shinfo_test.c
