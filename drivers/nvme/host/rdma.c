@@ -166,6 +166,7 @@ MODULE_PARM_DESC(rdma_pi_enable,
 static int nvme_rdma_cm_handler(struct rdma_cm_id *cm_id,
 		struct rdma_cm_event *event);
 static void nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc);
+static void nvme_rdma_complete_rq(struct request *rq);
 
 static const struct blk_mq_ops nvme_rdma_mq_ops;
 static const struct blk_mq_ops nvme_rdma_admin_mq_ops;
@@ -1224,7 +1225,8 @@ static void nvme_rdma_end_request(struct nvme_rdma_request *req)
 
 	if (!refcount_dec_and_test(&req->ref))
 		return;
-	nvme_end_request(rq, req->status, req->result);
+	if (!nvme_end_request(rq, req->status, req->result))
+		nvme_rdma_complete_rq(rq);
 }
 
 static void nvme_rdma_wr_error(struct ib_cq *cq, struct ib_wc *wc,
