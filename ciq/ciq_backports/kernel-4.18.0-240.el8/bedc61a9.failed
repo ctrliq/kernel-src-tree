@@ -1,0 +1,269 @@
+Drivers: hv: vmbus: Introduce table of VMBus protocol versions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [hv] hv: vmbus: Introduce table of VMBus protocol versions (Mohammed Gamal) [1828451 1815498]
+Rebuild_FUZZ: 92.17%
+commit-author Andrea Parri <parri.andrea@gmail.com>
+commit bedc61a922f9dbbe3bfb26ec2745f8cd63b57637
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bedc61a9.failed
+
+The technique used to get the next VMBus version seems increasisly
+clumsy as the number of VMBus versions increases.  Performance is
+not a concern since this is only done once during system boot; it's
+just that we'll end up with more lines of code than is really needed.
+
+As an alternative, introduce a table with the version numbers listed
+in order (from the most recent to the oldest).  vmbus_connect() loops
+through the versions listed in the table until it gets an accepted
+connection or gets to the end of the table (invalid version).
+
+	Suggested-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Andrea Parri <parri.andrea@gmail.com>
+	Reviewed-by: Wei Liu <wei.liu@kernel.org>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Sasha Levin <sashal@kernel.org>
+(cherry picked from commit bedc61a922f9dbbe3bfb26ec2745f8cd63b57637)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 698977f33670,0ac874faf720..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -2057,6 -2129,130 +2057,133 @@@ acpi_walk_err
+  	return ret_val;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM_SLEEP
++ static int vmbus_bus_suspend(struct device *dev)
++ {
++ 	struct vmbus_channel *channel, *sc;
++ 	unsigned long flags;
++ 
++ 	while (atomic_read(&vmbus_connection.offer_in_progress) != 0) {
++ 		/*
++ 		 * We wait here until the completion of any channel
++ 		 * offers that are currently in progress.
++ 		 */
++ 		msleep(1);
++ 	}
++ 
++ 	mutex_lock(&vmbus_connection.channel_mutex);
++ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++ 		if (!is_hvsock_channel(channel))
++ 			continue;
++ 
++ 		vmbus_force_channel_rescinded(channel);
++ 	}
++ 	mutex_unlock(&vmbus_connection.channel_mutex);
++ 
++ 	/*
++ 	 * Wait until all the sub-channels and hv_sock channels have been
++ 	 * cleaned up. Sub-channels should be destroyed upon suspend, otherwise
++ 	 * they would conflict with the new sub-channels that will be created
++ 	 * in the resume path. hv_sock channels should also be destroyed, but
++ 	 * a hv_sock channel of an established hv_sock connection can not be
++ 	 * really destroyed since it may still be referenced by the userspace
++ 	 * application, so we just force the hv_sock channel to be rescinded
++ 	 * by vmbus_force_channel_rescinded(), and the userspace application
++ 	 * will thoroughly destroy the channel after hibernation.
++ 	 *
++ 	 * Note: the counter nr_chan_close_on_suspend may never go above 0 if
++ 	 * the VM has no sub-channel and hv_sock channel, e.g. a 1-vCPU VM.
++ 	 */
++ 	if (atomic_read(&vmbus_connection.nr_chan_close_on_suspend) > 0)
++ 		wait_for_completion(&vmbus_connection.ready_for_suspend_event);
++ 
++ 	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) != 0);
++ 
++ 	mutex_lock(&vmbus_connection.channel_mutex);
++ 
++ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++ 		/*
++ 		 * Invalidate the field. Upon resume, vmbus_onoffer() will fix
++ 		 * up the field, and the other fields (if necessary).
++ 		 */
++ 		channel->offermsg.child_relid = INVALID_RELID;
++ 
++ 		if (is_hvsock_channel(channel)) {
++ 			if (!channel->rescind) {
++ 				pr_err("hv_sock channel not rescinded!\n");
++ 				WARN_ON_ONCE(1);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		spin_lock_irqsave(&channel->lock, flags);
++ 		list_for_each_entry(sc, &channel->sc_list, sc_list) {
++ 			pr_err("Sub-channel not deleted!\n");
++ 			WARN_ON_ONCE(1);
++ 		}
++ 		spin_unlock_irqrestore(&channel->lock, flags);
++ 
++ 		atomic_inc(&vmbus_connection.nr_chan_fixup_on_resume);
++ 	}
++ 
++ 	mutex_unlock(&vmbus_connection.channel_mutex);
++ 
++ 	vmbus_initiate_unload(false);
++ 
++ 	vmbus_connection.conn_state = DISCONNECTED;
++ 
++ 	/* Reset the event for the next resume. */
++ 	reinit_completion(&vmbus_connection.ready_for_resume_event);
++ 
++ 	return 0;
++ }
++ 
++ static int vmbus_bus_resume(struct device *dev)
++ {
++ 	struct vmbus_channel_msginfo *msginfo;
++ 	size_t msgsize;
++ 	int ret;
++ 
++ 	/*
++ 	 * We only use the 'vmbus_proto_version', which was in use before
++ 	 * hibernation, to re-negotiate with the host.
++ 	 */
++ 	if (!vmbus_proto_version) {
++ 		pr_err("Invalid proto version = 0x%x\n", vmbus_proto_version);
++ 		return -EINVAL;
++ 	}
++ 
++ 	msgsize = sizeof(*msginfo) +
++ 		  sizeof(struct vmbus_channel_initiate_contact);
++ 
++ 	msginfo = kzalloc(msgsize, GFP_KERNEL);
++ 
++ 	if (msginfo == NULL)
++ 		return -ENOMEM;
++ 
++ 	ret = vmbus_negotiate_version(msginfo, vmbus_proto_version);
++ 
++ 	kfree(msginfo);
++ 
++ 	if (ret != 0)
++ 		return ret;
++ 
++ 	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) == 0);
++ 
++ 	vmbus_request_offers();
++ 
++ 	wait_for_completion(&vmbus_connection.ready_for_resume_event);
++ 
++ 	/* Reset the event for the next suspend. */
++ 	reinit_completion(&vmbus_connection.ready_for_suspend_event);
++ 
++ 	return 0;
++ }
++ #endif /* CONFIG_PM_SLEEP */
++ 
+++>>>>>>> bedc61a922f9 (Drivers: hv: vmbus: Introduce table of VMBus protocol versions)
+  static const struct acpi_device_id vmbus_acpi_device_ids[] = {
+  	{"VMBUS", 0},
+  	{"VMBus", 0},
+diff --git a/drivers/hv/connection.c b/drivers/hv/connection.c
+index 4fe117b761ce..2662db940059 100644
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@ -48,29 +48,17 @@ EXPORT_SYMBOL_GPL(vmbus_connection);
+ __u32 vmbus_proto_version;
+ EXPORT_SYMBOL_GPL(vmbus_proto_version);
+ 
+-static __u32 vmbus_get_next_version(__u32 current_version)
+-{
+-	switch (current_version) {
+-	case (VERSION_WIN7):
+-		return VERSION_WS2008;
+-
+-	case (VERSION_WIN8):
+-		return VERSION_WIN7;
+-
+-	case (VERSION_WIN8_1):
+-		return VERSION_WIN8;
+-
+-	case (VERSION_WIN10):
+-		return VERSION_WIN8_1;
+-
+-	case (VERSION_WIN10_V5):
+-		return VERSION_WIN10;
+-
+-	case (VERSION_WS2008):
+-	default:
+-		return VERSION_INVAL;
+-	}
+-}
++/*
++ * Table of VMBus versions listed from newest to oldest.
++ */
++static __u32 vmbus_versions[] = {
++	VERSION_WIN10_V5,
++	VERSION_WIN10,
++	VERSION_WIN8_1,
++	VERSION_WIN8,
++	VERSION_WIN7,
++	VERSION_WS2008
++};
+ 
+ static int vmbus_negotiate_version(struct vmbus_channel_msginfo *msginfo,
+ 					__u32 version)
+@@ -178,8 +166,8 @@ static int vmbus_negotiate_version(struct vmbus_channel_msginfo *msginfo,
+  */
+ int vmbus_connect(void)
+ {
+-	int ret = 0;
+ 	struct vmbus_channel_msginfo *msginfo = NULL;
++	int i, ret = 0;
+ 	__u32 version;
+ 
+ 	/* Initialize the vmbus connection */
+@@ -253,21 +241,19 @@ int vmbus_connect(void)
+ 	 * version.
+ 	 */
+ 
+-	version = VERSION_CURRENT;
++	for (i = 0; ; i++) {
++		if (i == ARRAY_SIZE(vmbus_versions))
++			goto cleanup;
++
++		version = vmbus_versions[i];
+ 
+-	do {
+ 		ret = vmbus_negotiate_version(msginfo, version);
+ 		if (ret == -ETIMEDOUT)
+ 			goto cleanup;
+ 
+ 		if (vmbus_connection.conn_state == CONNECTED)
+ 			break;
+-
+-		version = vmbus_get_next_version(version);
+-	} while (version != VERSION_INVAL);
+-
+-	if (version == VERSION_INVAL)
+-		goto cleanup;
++	}
+ 
+ 	vmbus_proto_version = version;
+ 	pr_info("Vmbus version:%d.%d\n",
+* Unmerged path drivers/hv/vmbus_drv.c
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 203cb53db2a6..2a8b18d67ce2 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -205,10 +205,6 @@ static inline u32 hv_get_avail_to_write_percent(
+ #define VERSION_WIN10	((4 << 16) | (0))
+ #define VERSION_WIN10_V5 ((5 << 16) | (0))
+ 
+-#define VERSION_INVAL -1
+-
+-#define VERSION_CURRENT VERSION_WIN10_V5
+-
+ /* Make maximum size of pipe payload of 16K */
+ #define MAX_PIPE_DATA_PAYLOAD		(sizeof(u8) * 16384)
+ 
