@@ -1,0 +1,120 @@
+x86/kvm/svm: Use uninstrumented wrmsrl() to restore GS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit c3f08ed15047002677b8b1f9f5bc29ced3f87a6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/c3f08ed1.failed
+
+On guest exit MSR_GS_BASE contains whatever the guest wrote to it and the
+first action after returning from the ASM code is to set it to the host
+kernel value. This uses wrmsrl() which is interesting at least.
+
+wrmsrl() is either using native_write_msr() or the paravirt variant. The
+XEN_PV code is uninteresting as nested SVM in a XEN_PV guest does not work.
+
+But native_write_msr() can be placed out of line by the compiler especially
+when paravirtualization is enabled in the kernel configuration. The
+function is marked notrace, but still can be probed if
+CONFIG_KPROBE_EVENTS_ON_NOTRACE is enabled.
+
+That would be a fatal problem as kprobe events use per-CPU variables which
+are GS based and would be accessed with the guest GS. Depending on the GS
+value this would either explode in colorful ways or lead to completely
+undebugable data corruption.
+
+Aside of that native_write_msr() contains a tracepoint which objtool
+complains about as it is invoked from the noinstr section.
+
+As this cannot run inside a XEN_PV guest there is no point in using
+wrmsrl(). Use native_wrmsrl() instead which is just a plain native WRMSR
+without tracing or anything else attached.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Juergen Gross <jgross@suse.com>
+Message-Id: <20200708195322.244847377@linutronix.de>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c3f08ed15047002677b8b1f9f5bc29ced3f87a6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/svm.c
+index 189395610780,535ad311ad02..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -3667,12 -3343,65 +3667,69 @@@ static fastpath_t svm_exit_handlers_fas
+  
+  void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
+  
+ -static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu,
+ -					struct vcpu_svm *svm)
+ +static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * VMENTER enables interrupts (host state), but the kernel state is
++ 	 * interrupts disabled when this is invoked. Also tell RCU about
++ 	 * it. This is the same logic as for exit_to_user_mode().
++ 	 *
++ 	 * This ensures that e.g. latency analysis on the host observes
++ 	 * guest mode as interrupt enabled.
++ 	 *
++ 	 * guest_enter_irqoff() informs context tracking about the
++ 	 * transition to guest mode and if enabled adjusts RCU state
++ 	 * accordingly.
++ 	 */
++ 	instrumentation_begin();
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	instrumentation_end();
++ 
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ 
++ 	__svm_vcpu_run(svm->vmcb_pa, (unsigned long *)&svm->vcpu.arch.regs);
++ 
++ #ifdef CONFIG_X86_64
++ 	native_wrmsrl(MSR_GS_BASE, svm->host.gs_base);
++ #else
++ 	loadsegment(fs, svm->host.fs);
++ #ifndef CONFIG_X86_32_LAZY_GS
++ 	loadsegment(gs, svm->host.gs);
++ #endif
++ #endif
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ 
++ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
++ {
++ 	fastpath_t exit_fastpath;
+++>>>>>>> c3f08ed15047 (x86/kvm/svm: Use uninstrumented wrmsrl() to restore GS)
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+ +	trace_kvm_entry(vcpu);
+ +
+  	svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
+  	svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
+  	svm->vmcb->save.rip = vcpu->arch.regs[VCPU_REGS_RIP];
+* Unmerged path arch/x86/kvm/svm/svm.c
