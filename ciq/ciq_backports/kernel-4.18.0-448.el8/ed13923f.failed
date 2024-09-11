@@ -1,0 +1,197 @@
+ipv6: Add a sysctl to control multipath hash fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Ido Schimmel <idosch@OSS.NVIDIA.COM>
+commit ed13923f980ef84dde0b9010b9e09052dc31a909
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/ed13923f.failed
+
+A subsequent patch will add a new multipath hash policy where the packet
+fields used for multipath hash calculation are determined by user space.
+This patch adds a sysctl that allows user space to set these fields.
+
+The packet fields are represented using a bitmask and are common between
+IPv4 and IPv6 to allow user space to use the same numbering across both
+protocols. For example, to hash based on standard 5-tuple:
+
+ # sysctl -w net.ipv6.fib_multipath_hash_fields=0x0037
+ net.ipv6.fib_multipath_hash_fields = 0x0037
+
+To avoid introducing holes in 'struct netns_sysctl_ipv6', move the
+'bindv6only' field after the multipath hash fields.
+
+The kernel rejects unknown fields, for example:
+
+ # sysctl -w net.ipv6.fib_multipath_hash_fields=0x1000
+ sysctl: setting key "net.ipv6.fib_multipath_hash_fields": Invalid argument
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ed13923f980ef84dde0b9010b9e09052dc31a909)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/ipv6.h
+diff --cc include/net/netns/ipv6.h
+index a896fe1165a0,bde0b7adb4a3..000000000000
+--- a/include/net/netns/ipv6.h
++++ b/include/net/netns/ipv6.h
+@@@ -28,16 -28,23 +28,24 @@@ struct netns_sysctl_ipv6 
+  	int ip6_rt_gc_elasticity;
+  	int ip6_rt_mtu_expires;
+  	int ip6_rt_min_advmss;
+++<<<<<<< HEAD
+ +	int multipath_hash_policy;
+ +	int flowlabel_consistency;
+ +	int auto_flowlabels;
+++=======
++ 	u32 multipath_hash_fields;
++ 	u8 multipath_hash_policy;
++ 	u8 bindv6only;
++ 	u8 flowlabel_consistency;
++ 	u8 auto_flowlabels;
+++>>>>>>> ed13923f980e (ipv6: Add a sysctl to control multipath hash fields)
+  	int icmpv6_time;
+ -	u8 icmpv6_echo_ignore_all;
+ -	u8 icmpv6_echo_ignore_multicast;
+ -	u8 icmpv6_echo_ignore_anycast;
+ -	DECLARE_BITMAP(icmpv6_ratemask, ICMPV6_MSG_MAX + 1);
+ -	unsigned long *icmpv6_ratemask_ptr;
+ -	u8 anycast_src_echo_reply;
+ -	u8 ip_nonlocal_bind;
+ -	u8 fwmark_reflect;
+ -	u8 flowlabel_state_ranges;
+ +	int anycast_src_echo_reply;
+ +	int ip_nonlocal_bind;
+ +	int fwmark_reflect;
+  	int idgen_retries;
+  	int idgen_delay;
+ +	int flowlabel_state_ranges;
+  	int flowlabel_reflect;
+  	int max_dst_opts_cnt;
+  	int max_hbh_opts_cnt;
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index e84d1a075b75..b33e05b1a4b4 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -1418,6 +1418,33 @@ fib_multipath_hash_policy - INTEGER
+ 	1 - Layer 4 (standard 5-tuple)
+ 	2 - Layer 3 or inner Layer 3 if present
+ 
++fib_multipath_hash_fields - UNSIGNED INTEGER
++	When fib_multipath_hash_policy is set to 3 (custom multipath hash), the
++	fields used for multipath hash calculation are determined by this
++	sysctl.
++
++	This value is a bitmask which enables various fields for multipath hash
++	calculation.
++
++	Possible fields are:
++
++	====== ============================
++	0x0001 Source IP address
++	0x0002 Destination IP address
++	0x0004 IP protocol
++	0x0008 Flow Label
++	0x0010 Source port
++	0x0020 Destination port
++	0x0040 Inner source IP address
++	0x0080 Inner destination IP address
++	0x0100 Inner IP protocol
++	0x0200 Inner Flow Label
++	0x0400 Inner source port
++	0x0800 Inner destination port
++	====== ============================
++
++	Default: 0x0007 (source IP, destination IP and IP protocol)
++
+ anycast_src_echo_reply - BOOLEAN
+ 	Controls the use of anycast addresses as source addresses for ICMPv6
+ 	echo reply
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index 04b4d7eb6910..5b7ae473bccb 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -856,11 +856,19 @@ static inline int ip6_multipath_hash_policy(const struct net *net)
+ {
+ 	return net->ipv6.sysctl.multipath_hash_policy;
+ }
++static inline u32 ip6_multipath_hash_fields(const struct net *net)
++{
++	return net->ipv6.sysctl.multipath_hash_fields;
++}
+ #else
+ static inline int ip6_multipath_hash_policy(const struct net *net)
+ {
+ 	return 0;
+ }
++static inline u32 ip6_multipath_hash_fields(const struct net *net)
++{
++	return 0;
++}
+ #endif
+ 
+ /*
+* Unmerged path include/net/netns/ipv6.h
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index 7dfd21b51aa4..185d57595d75 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -36,6 +36,7 @@
+ #include <net/lwtunnel.h>
+ #include <net/fib_notifier.h>
+ 
++#include <net/ip_fib.h>
+ #include <net/ip6_fib.h>
+ #include <net/ip6_route.h>
+ 
+@@ -2312,6 +2313,10 @@ static int __net_init fib6_net_init(struct net *net)
+ 	if (err)
+ 		return err;
+ 
++	/* Default to 3-tuple */
++	net->ipv6.sysctl.multipath_hash_fields =
++		FIB_MULTIPATH_HASH_FIELD_DEFAULT_MASK;
++
+ 	spin_lock_init(&net->ipv6.fib6_gc_lock);
+ 	rwlock_init(&net->ipv6.fib6_walker_lock);
+ 	INIT_LIST_HEAD(&net->ipv6.fib6_walkers);
+diff --git a/net/ipv6/sysctl_net_ipv6.c b/net/ipv6/sysctl_net_ipv6.c
+index de15142a40ef..1da5c2bac970 100644
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@ -17,12 +17,15 @@
+ #include <net/addrconf.h>
+ #include <net/inet_frag.h>
+ #include <net/netevent.h>
++#include <net/ip_fib.h>
+ #ifdef CONFIG_NETLABEL
+ #include <net/calipso.h>
+ #endif
+ 
+ static int auto_flowlabels_min;
+ static int auto_flowlabels_max = IP6_AUTO_FLOW_LABEL_MAX;
++static u32 rt6_multipath_hash_fields_all_mask =
++	FIB_MULTIPATH_HASH_FIELD_ALL_MASK;
+ 
+ static int proc_rt6_multipath_hash_policy(struct ctl_table *table, int write,
+ 					  void __user *buffer, size_t *lenp,
+@@ -150,6 +153,15 @@ static struct ctl_table ipv6_table_template[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE,
+ 	},
++	{
++		.procname	= "fib_multipath_hash_fields",
++		.data		= &init_net.ipv6.sysctl.multipath_hash_fields,
++		.maxlen		= sizeof(u32),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++		.extra1		= SYSCTL_ONE,
++		.extra2		= &rt6_multipath_hash_fields_all_mask,
++	},
+ 	{
+ 		.procname	= "seg6_flowlabel",
+ 		.data		= &init_net.ipv6.sysctl.seg6_flowlabel,
