@@ -1,0 +1,608 @@
+KVM: PPC: Book3S: Rework TM save/restore code and make it C-callable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 7854f7545bff69567fc3fcd8831752138b892483
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/7854f754.failed
+
+This adds a parameter to __kvmppc_save_tm and __kvmppc_restore_tm
+which allows the caller to indicate whether it wants the nonvolatile
+register state to be preserved across the call, as required by the C
+calling conventions.  This parameter being non-zero also causes the
+MSR bits that enable TM, FP, VMX and VSX to be preserved.  The
+condition register and DSCR are now always preserved.
+
+With this, kvmppc_save_tm_hv and kvmppc_restore_tm_hv can be called
+from C code provided the 3rd parameter is non-zero.  So that these
+functions can be called from modules, they now include code to set
+the TOC pointer (r2) on entry, as they can call other built-in C
+functions which will assume the TOC to have been set.
+
+Also, the fake suspend code in kvmppc_save_tm_hv is modified here to
+assume that treclaim in fake-suspend state does not modify any registers,
+which is the case on POWER9.  This enables the code to be simplified
+quite a bit.
+
+_kvmppc_save_tm_pr and _kvmppc_restore_tm_pr become much simpler with
+this change, since they now only need to save and restore TAR and pass
+1 for the 3rd argument to __kvmppc_{save,restore}_tm.
+
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 7854f7545bff69567fc3fcd8831752138b892483)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/asm-prototypes.h
+diff --cc arch/powerpc/include/asm/asm-prototypes.h
+index 7841b8a60657,0c1a2b01512a..000000000000
+--- a/arch/powerpc/include/asm/asm-prototypes.h
++++ b/arch/powerpc/include/asm/asm-prototypes.h
+@@@ -143,4 -143,26 +143,29 @@@ struct kvm_vcpu
+  void _kvmppc_restore_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  void _kvmppc_save_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  
+++<<<<<<< HEAD
+++=======
++ /* Patch sites */
++ extern s32 patch__call_flush_count_cache;
++ extern s32 patch__flush_count_cache_return;
++ extern s32 patch__memset_nocache, patch__memcpy_nocache;
++ 
++ extern long flush_count_cache;
++ 
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
++ void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
++ #else
++ static inline void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr,
++ 				     bool preserve_nv) { }
++ static inline void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr,
++ 					bool preserve_nv) { }
++ #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
++ 
++ void kvmhv_save_host_pmu(void);
++ void kvmhv_load_host_pmu(void);
++ void kvmhv_save_guest_pmu(struct kvm_vcpu *vcpu, bool pmu_in_use);
++ void kvmhv_load_guest_pmu(struct kvm_vcpu *vcpu);
++ 
+++>>>>>>> 7854f7545bff (KVM: PPC: Book3S: Rework TM save/restore code and make it C-callable)
+  #endif /* _ASM_POWERPC_ASM_PROTOTYPES_H */
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index c946f3fa4aff..c073aceb2843 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -794,11 +794,13 @@ BEGIN_FTR_SECTION
+ 	b	91f
+ END_FTR_SECTION(CPU_FTR_TM | CPU_FTR_P9_TM_HV_ASSIST, 0)
+ 	/*
+-	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS INCLUDING CR
++	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS (but not CR)
+ 	 */
+ 	mr      r3, r4
+ 	ld      r4, VCPU_MSR(r3)
++	li	r5, 0			/* don't preserve non-vol regs */
+ 	bl	kvmppc_restore_tm_hv
++	nop
+ 	ld	r4, HSTATE_KVM_VCPU(r13)
+ 91:
+ #endif
+@@ -1683,11 +1685,13 @@ BEGIN_FTR_SECTION
+ 	b	91f
+ END_FTR_SECTION(CPU_FTR_TM | CPU_FTR_P9_TM_HV_ASSIST, 0)
+ 	/*
+-	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS INCLUDING CR
++	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS (but not CR)
+ 	 */
+ 	mr      r3, r9
+ 	ld      r4, VCPU_MSR(r3)
++	li	r5, 0			/* don't preserve non-vol regs */
+ 	bl	kvmppc_save_tm_hv
++	nop
+ 	ld	r9, HSTATE_KVM_VCPU(r13)
+ 91:
+ #endif
+@@ -2637,11 +2641,13 @@ BEGIN_FTR_SECTION
+ 	b	91f
+ END_FTR_SECTION(CPU_FTR_TM | CPU_FTR_P9_TM_HV_ASSIST, 0)
+ 	/*
+-	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS INCLUDING CR
++	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS (but not CR)
+ 	 */
+ 	ld	r3, HSTATE_KVM_VCPU(r13)
+ 	ld      r4, VCPU_MSR(r3)
++	li	r5, 0			/* don't preserve non-vol regs */
+ 	bl	kvmppc_save_tm_hv
++	nop
+ 91:
+ #endif
+ 
+@@ -2757,11 +2763,13 @@ BEGIN_FTR_SECTION
+ 	b	91f
+ END_FTR_SECTION(CPU_FTR_TM | CPU_FTR_P9_TM_HV_ASSIST, 0)
+ 	/*
+-	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS INCLUDING CR
++	 * NOTE THAT THIS TRASHES ALL NON-VOLATILE REGISTERS (but not CR)
+ 	 */
+ 	mr      r3, r4
+ 	ld      r4, VCPU_MSR(r3)
++	li	r5, 0			/* don't preserve non-vol regs */
+ 	bl	kvmppc_restore_tm_hv
++	nop
+ 	ld	r4, HSTATE_KVM_VCPU(r13)
+ 91:
+ #endif
+@@ -3094,10 +3102,12 @@ END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC)
+  * Save transactional state and TM-related registers.
+  * Called with r3 pointing to the vcpu struct and r4 containing
+  * the guest MSR value.
+- * This can modify all checkpointed registers, but
++ * r5 is non-zero iff non-volatile register state needs to be maintained.
++ * If r5 == 0, this can modify all checkpointed registers, but
+  * restores r1 and r2 before exit.
+  */
+-kvmppc_save_tm_hv:
++_GLOBAL_TOC(kvmppc_save_tm_hv)
++EXPORT_SYMBOL_GPL(kvmppc_save_tm_hv)
+ 	/* See if we need to handle fake suspend mode */
+ BEGIN_FTR_SECTION
+ 	b	__kvmppc_save_tm
+@@ -3125,12 +3135,6 @@ BEGIN_FTR_SECTION
+ END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_XER_SO_BUG)
+ 	nop
+ 
+-	std	r1, HSTATE_HOST_R1(r13)
+-
+-	/* Clear the MSR RI since r1, r13 may be foobar. */
+-	li	r5, 0
+-	mtmsrd	r5, 1
+-
+ 	/* We have to treclaim here because that's the only way to do S->N */
+ 	li	r3, TM_CAUSE_KVM_RESCHED
+ 	TRECLAIM(R3)
+@@ -3139,22 +3143,13 @@ END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_XER_SO_BUG)
+ 	 * We were in fake suspend, so we are not going to save the
+ 	 * register state as the guest checkpointed state (since
+ 	 * we already have it), therefore we can now use any volatile GPR.
++	 * In fact treclaim in fake suspend state doesn't modify
++	 * any registers.
+ 	 */
+-	/* Reload PACA pointer, stack pointer and TOC. */
+-	GET_PACA(r13)
+-	ld	r1, HSTATE_HOST_R1(r13)
+-	ld	r2, PACATOC(r13)
+ 
+-	/* Set MSR RI now we have r1 and r13 back. */
+-	li	r5, MSR_RI
+-	mtmsrd	r5, 1
+-
+-	HMT_MEDIUM
+-	ld	r6, HSTATE_DSCR(r13)
+-	mtspr	SPRN_DSCR, r6
+-BEGIN_FTR_SECTION_NESTED(96)
++BEGIN_FTR_SECTION
+ 	bl	pnv_power9_force_smt4_release
+-END_FTR_SECTION_NESTED(CPU_FTR_P9_TM_XER_SO_BUG, CPU_FTR_P9_TM_XER_SO_BUG, 96)
++END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_XER_SO_BUG)
+ 	nop
+ 
+ 4:
+@@ -3180,10 +3175,12 @@ END_FTR_SECTION_NESTED(CPU_FTR_P9_TM_XER_SO_BUG, CPU_FTR_P9_TM_XER_SO_BUG, 96)
+  * Restore transactional state and TM-related registers.
+  * Called with r3 pointing to the vcpu struct
+  * and r4 containing the guest MSR value.
++ * r5 is non-zero iff non-volatile register state needs to be maintained.
+  * This potentially modifies all checkpointed registers.
+  * It restores r1 and r2 from the PACA.
+  */
+-kvmppc_restore_tm_hv:
++_GLOBAL_TOC(kvmppc_restore_tm_hv)
++EXPORT_SYMBOL_GPL(kvmppc_restore_tm_hv)
+ 	/*
+ 	 * If we are doing TM emulation for the guest on a POWER9 DD2,
+ 	 * then we don't actually do a trechkpt -- we either set up
+diff --git a/arch/powerpc/kvm/tm.S b/arch/powerpc/kvm/tm.S
+index 90e330f21356..0531a1492fdf 100644
+--- a/arch/powerpc/kvm/tm.S
++++ b/arch/powerpc/kvm/tm.S
+@@ -28,17 +28,25 @@
+  * Save transactional state and TM-related registers.
+  * Called with:
+  * - r3 pointing to the vcpu struct
+- * - r4 points to the MSR with current TS bits:
++ * - r4 containing the MSR with current TS bits:
+  * 	(For HV KVM, it is VCPU_MSR ; For PR KVM, it is host MSR).
+- * This can modify all checkpointed registers, but
+- * restores r1, r2 before exit.
++ * - r5 containing a flag indicating that non-volatile registers
++ *	must be preserved.
++ * If r5 == 0, this can modify all checkpointed registers, but
++ * restores r1, r2 before exit.  If r5 != 0, this restores the
++ * MSR TM/FP/VEC/VSX bits to their state on entry.
+  */
+ _GLOBAL(__kvmppc_save_tm)
+ 	mflr	r0
+ 	std	r0, PPC_LR_STKOFF(r1)
++	stdu    r1, -SWITCH_FRAME_SIZE(r1)
++
++	mr	r9, r3
++	cmpdi	cr7, r5, 0
+ 
+ 	/* Turn on TM. */
+ 	mfmsr	r8
++	mr	r10, r8
+ 	li	r0, 1
+ 	rldimi	r8, r0, MSR_TM_LG, 63-MSR_TM_LG
+ 	ori     r8, r8, MSR_FP
+@@ -51,6 +59,27 @@ _GLOBAL(__kvmppc_save_tm)
+ 	std	r1, HSTATE_SCRATCH2(r13)
+ 	std	r3, HSTATE_SCRATCH1(r13)
+ 
++	/* Save CR on the stack - even if r5 == 0 we need to get cr7 back. */
++	mfcr	r6
++	SAVE_GPR(6, r1)
++
++	/* Save DSCR so we can restore it to avoid running with user value */
++	mfspr	r7, SPRN_DSCR
++	SAVE_GPR(7, r1)
++
++	/*
++	 * We are going to do treclaim., which will modify all checkpointed
++	 * registers.  Save the non-volatile registers on the stack if
++	 * preservation of non-volatile state has been requested.
++	 */
++	beq	cr7, 3f
++	SAVE_NVGPRS(r1)
++
++	/* MSR[TS] will be 0 (non-transactional) once we do treclaim. */
++	li	r0, 0
++	rldimi	r10, r0, MSR_TS_S_LG, 63 - MSR_TS_T_LG
++	SAVE_GPR(10, r1)	/* final MSR value */
++3:
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ BEGIN_FTR_SECTION
+ 	/* Emulation of the treclaim instruction needs TEXASR before treclaim */
+@@ -74,22 +103,25 @@ END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_HV_ASSIST)
+ 	std	r9, PACATMSCRATCH(r13)
+ 	ld	r9, HSTATE_SCRATCH1(r13)
+ 
+-	/* Get a few more GPRs free. */
+-	std	r29, VCPU_GPRS_TM(29)(r9)
+-	std	r30, VCPU_GPRS_TM(30)(r9)
+-	std	r31, VCPU_GPRS_TM(31)(r9)
+-
+-	/* Save away PPR and DSCR soon so don't run with user values. */
+-	mfspr	r31, SPRN_PPR
++	/* Save away PPR soon so we don't run with user value. */
++	std	r0, VCPU_GPRS_TM(0)(r9)
++	mfspr	r0, SPRN_PPR
+ 	HMT_MEDIUM
+-	mfspr	r30, SPRN_DSCR
+-#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+-	ld	r29, HSTATE_DSCR(r13)
+-	mtspr	SPRN_DSCR, r29
+-#endif
+ 
+-	/* Save all but r9, r13 & r29-r31 */
+-	reg = 0
++	/* Reload stack pointer. */
++	std	r1, VCPU_GPRS_TM(1)(r9)
++	ld	r1, HSTATE_SCRATCH2(r13)
++
++	/* Set MSR RI now we have r1 and r13 back. */
++	std	r2, VCPU_GPRS_TM(2)(r9)
++	li	r2, MSR_RI
++	mtmsrd	r2, 1
++
++	/* Reload TOC pointer. */
++	ld	r2, PACATOC(r13)
++
++	/* Save all but r0-r2, r9 & r13 */
++	reg = 3
+ 	.rept	29
+ 	.if (reg != 9) && (reg != 13)
+ 	std	reg, VCPU_GPRS_TM(reg)(r9)
+@@ -103,33 +135,29 @@ END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_HV_ASSIST)
+ 	ld	r4, PACATMSCRATCH(r13)
+ 	std	r4, VCPU_GPRS_TM(9)(r9)
+ 
+-	/* Reload stack pointer and TOC. */
+-	ld	r1, HSTATE_SCRATCH2(r13)
+-	ld	r2, PACATOC(r13)
+-
+-	/* Set MSR RI now we have r1 and r13 back. */
+-	li	r5, MSR_RI
+-	mtmsrd	r5, 1
++	/* Restore host DSCR and CR values, after saving guest values */
++	mfcr	r6
++	mfspr	r7, SPRN_DSCR
++	stw	r6, VCPU_CR_TM(r9)
++	std	r7, VCPU_DSCR_TM(r9)
++	REST_GPR(6, r1)
++	REST_GPR(7, r1)
++	mtcr	r6
++	mtspr	SPRN_DSCR, r7
+ 
+-	/* Save away checkpinted SPRs. */
+-	std	r31, VCPU_PPR_TM(r9)
+-	std	r30, VCPU_DSCR_TM(r9)
++	/* Save away checkpointed SPRs. */
++	std	r0, VCPU_PPR_TM(r9)
+ 	mflr	r5
+-	mfcr	r6
+ 	mfctr	r7
+ 	mfspr	r8, SPRN_AMR
+ 	mfspr	r10, SPRN_TAR
+ 	mfxer	r11
+ 	std	r5, VCPU_LR_TM(r9)
+-	stw	r6, VCPU_CR_TM(r9)
+ 	std	r7, VCPU_CTR_TM(r9)
+ 	std	r8, VCPU_AMR_TM(r9)
+ 	std	r10, VCPU_TAR_TM(r9)
+ 	std	r11, VCPU_XER_TM(r9)
+ 
+-	/* Restore r12 as trap number. */
+-	lwz	r12, VCPU_TRAP(r9)
+-
+ 	/* Save FP/VSX. */
+ 	addi	r3, r9, VCPU_FPRS_TM
+ 	bl	store_fp_state
+@@ -137,6 +165,11 @@ END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_HV_ASSIST)
+ 	bl	store_vr_state
+ 	mfspr	r6, SPRN_VRSAVE
+ 	stw	r6, VCPU_VRSAVE_TM(r9)
++
++	/* Restore non-volatile registers if requested to */
++	beq	cr7, 1f
++	REST_NVGPRS(r1)
++	REST_GPR(10, r1)
+ 1:
+ 	/*
+ 	 * We need to save these SPRs after the treclaim so that the software
+@@ -146,12 +179,16 @@ END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_HV_ASSIST)
+ 	 */
+ 	mfspr	r7, SPRN_TEXASR
+ 	std	r7, VCPU_TEXASR(r9)
+-11:
+ 	mfspr	r5, SPRN_TFHAR
+ 	mfspr	r6, SPRN_TFIAR
+ 	std	r5, VCPU_TFHAR(r9)
+ 	std	r6, VCPU_TFIAR(r9)
+ 
++	/* Restore MSR state if requested */
++	beq	cr7, 2f
++	mtmsrd	r10, 0
++2:
++	addi	r1, r1, SWITCH_FRAME_SIZE
+ 	ld	r0, PPC_LR_STKOFF(r1)
+ 	mtlr	r0
+ 	blr
+@@ -161,49 +198,22 @@ END_FTR_SECTION_IFSET(CPU_FTR_P9_TM_HV_ASSIST)
+  * be invoked from C function by PR KVM only.
+  */
+ _GLOBAL(_kvmppc_save_tm_pr)
+-	mflr	r5
+-	std	r5, PPC_LR_STKOFF(r1)
+-	stdu    r1, -SWITCH_FRAME_SIZE(r1)
+-	SAVE_NVGPRS(r1)
+-
+-	/* save MSR since TM/math bits might be impacted
+-	 * by __kvmppc_save_tm().
+-	 */
+-	mfmsr	r5
+-	SAVE_GPR(5, r1)
+-
+-	/* also save DSCR/CR/TAR so that it can be recovered later */
+-	mfspr   r6, SPRN_DSCR
+-	SAVE_GPR(6, r1)
+-
+-	mfcr    r7
+-	stw     r7, _CCR(r1)
++	mflr	r0
++	std	r0, PPC_LR_STKOFF(r1)
++	stdu    r1, -PPC_MIN_STKFRM(r1)
+ 
+ 	mfspr   r8, SPRN_TAR
+-	SAVE_GPR(8, r1)
++	std	r8, PPC_MIN_STKFRM-8(r1)
+ 
++	li	r5, 1		/* preserve non-volatile registers */
+ 	bl	__kvmppc_save_tm
+ 
+-	REST_GPR(8, r1)
++	ld	r8, PPC_MIN_STKFRM-8(r1)
+ 	mtspr   SPRN_TAR, r8
+ 
+-	ld      r7, _CCR(r1)
+-	mtcr	r7
+-
+-	REST_GPR(6, r1)
+-	mtspr   SPRN_DSCR, r6
+-
+-	/* need preserve current MSR's MSR_TS bits */
+-	REST_GPR(5, r1)
+-	mfmsr   r6
+-	rldicl  r6, r6, 64 - MSR_TS_S_LG, 62
+-	rldimi  r5, r6, MSR_TS_S_LG, 63 - MSR_TS_T_LG
+-	mtmsrd  r5
+-
+-	REST_NVGPRS(r1)
+-	addi    r1, r1, SWITCH_FRAME_SIZE
+-	ld	r5, PPC_LR_STKOFF(r1)
+-	mtlr	r5
++	addi    r1, r1, PPC_MIN_STKFRM
++	ld	r0, PPC_LR_STKOFF(r1)
++	mtlr	r0
+ 	blr
+ 
+ EXPORT_SYMBOL_GPL(_kvmppc_save_tm_pr);
+@@ -215,15 +225,21 @@ EXPORT_SYMBOL_GPL(_kvmppc_save_tm_pr);
+  *  - r4 is the guest MSR with desired TS bits:
+  * 	For HV KVM, it is VCPU_MSR
+  * 	For PR KVM, it is provided by caller
+- * This potentially modifies all checkpointed registers.
+- * It restores r1, r2 from the PACA.
++ * - r5 containing a flag indicating that non-volatile registers
++ *	must be preserved.
++ * If r5 == 0, this potentially modifies all checkpointed registers, but
++ * restores r1, r2 from the PACA before exit.
++ * If r5 != 0, this restores the MSR TM/FP/VEC/VSX bits to their state on entry.
+  */
+ _GLOBAL(__kvmppc_restore_tm)
+ 	mflr	r0
+ 	std	r0, PPC_LR_STKOFF(r1)
+ 
++	cmpdi	cr7, r5, 0
++
+ 	/* Turn on TM/FP/VSX/VMX so we can restore them. */
+ 	mfmsr	r5
++	mr	r10, r5
+ 	li	r6, MSR_TM >> 32
+ 	sldi	r6, r6, 32
+ 	or	r5, r5, r6
+@@ -244,8 +260,7 @@ _GLOBAL(__kvmppc_restore_tm)
+ 
+ 	mr	r5, r4
+ 	rldicl. r5, r5, 64 - MSR_TS_S_LG, 62
+-	beqlr		/* TM not active in guest */
+-	std	r1, HSTATE_SCRATCH2(r13)
++	beq	9f		/* TM not active in guest */
+ 
+ 	/* Make sure the failure summary is set, otherwise we'll program check
+ 	 * when we trechkpt.  It's possible that this might have been not set
+@@ -255,6 +270,26 @@ _GLOBAL(__kvmppc_restore_tm)
+ 	oris	r7, r7, (TEXASR_FS)@h
+ 	mtspr	SPRN_TEXASR, r7
+ 
++	/*
++	 * Make a stack frame and save non-volatile registers if requested.
++	 */
++	stdu	r1, -SWITCH_FRAME_SIZE(r1)
++	std	r1, HSTATE_SCRATCH2(r13)
++
++	mfcr	r6
++	mfspr	r7, SPRN_DSCR
++	SAVE_GPR(2, r1)
++	SAVE_GPR(6, r1)
++	SAVE_GPR(7, r1)
++
++	beq	cr7, 4f
++	SAVE_NVGPRS(r1)
++
++	/* MSR[TS] will be 1 (suspended) once we do trechkpt */
++	li	r0, 1
++	rldimi	r10, r0, MSR_TS_S_LG, 63 - MSR_TS_T_LG
++	SAVE_GPR(10, r1)	/* final MSR value */
++4:
+ 	/*
+ 	 * We need to load up the checkpointed state for the guest.
+ 	 * We need to do this early as it will blow away any GPRs, VSRs and
+@@ -291,8 +326,6 @@ _GLOBAL(__kvmppc_restore_tm)
+ 	ld	r29, VCPU_DSCR_TM(r3)
+ 	ld	r30, VCPU_PPR_TM(r3)
+ 
+-	std	r2, PACATMSCRATCH(r13) /* Save TOC */
+-
+ 	/* Clear the MSR RI since r1, r13 are all going to be foobar. */
+ 	li	r5, 0
+ 	mtmsrd	r5, 1
+@@ -318,18 +351,31 @@ _GLOBAL(__kvmppc_restore_tm)
+ 	/* Now let's get back the state we need. */
+ 	HMT_MEDIUM
+ 	GET_PACA(r13)
+-#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+-	ld	r29, HSTATE_DSCR(r13)
+-	mtspr	SPRN_DSCR, r29
+-#endif
+ 	ld	r1, HSTATE_SCRATCH2(r13)
+-	ld	r2, PACATMSCRATCH(r13)
++	REST_GPR(7, r1)
++	mtspr	SPRN_DSCR, r7
+ 
+ 	/* Set the MSR RI since we have our registers back. */
+ 	li	r5, MSR_RI
+ 	mtmsrd	r5, 1
++
++	/* Restore TOC pointer and CR */
++	REST_GPR(2, r1)
++	REST_GPR(6, r1)
++	mtcr	r6
++
++	/* Restore non-volatile registers if requested to. */
++	beq	cr7, 5f
++	REST_GPR(10, r1)
++	REST_NVGPRS(r1)
++
++5:	addi	r1, r1, SWITCH_FRAME_SIZE
+ 	ld	r0, PPC_LR_STKOFF(r1)
+ 	mtlr	r0
++
++9:	/* Restore MSR bits if requested */
++	beqlr	cr7
++	mtmsrd	r10, 0
+ 	blr
+ 
+ /*
+@@ -337,47 +383,23 @@ _GLOBAL(__kvmppc_restore_tm)
+  * can be invoked from C function by PR KVM only.
+  */
+ _GLOBAL(_kvmppc_restore_tm_pr)
+-	mflr	r5
+-	std	r5, PPC_LR_STKOFF(r1)
+-	stdu    r1, -SWITCH_FRAME_SIZE(r1)
+-	SAVE_NVGPRS(r1)
+-
+-	/* save MSR to avoid TM/math bits change */
+-	mfmsr	r5
+-	SAVE_GPR(5, r1)
+-
+-	/* also save DSCR/CR/TAR so that it can be recovered later */
+-	mfspr   r6, SPRN_DSCR
+-	SAVE_GPR(6, r1)
+-
+-	mfcr    r7
+-	stw     r7, _CCR(r1)
++	mflr	r0
++	std	r0, PPC_LR_STKOFF(r1)
++	stdu    r1, -PPC_MIN_STKFRM(r1)
+ 
++	/* save TAR so that it can be recovered later */
+ 	mfspr   r8, SPRN_TAR
+-	SAVE_GPR(8, r1)
++	std	r8, PPC_MIN_STKFRM-8(r1)
+ 
++	li	r5, 1
+ 	bl	__kvmppc_restore_tm
+ 
+-	REST_GPR(8, r1)
++	ld	r8, PPC_MIN_STKFRM-8(r1)
+ 	mtspr   SPRN_TAR, r8
+ 
+-	ld      r7, _CCR(r1)
+-	mtcr	r7
+-
+-	REST_GPR(6, r1)
+-	mtspr   SPRN_DSCR, r6
+-
+-	/* need preserve current MSR's MSR_TS bits */
+-	REST_GPR(5, r1)
+-	mfmsr   r6
+-	rldicl  r6, r6, 64 - MSR_TS_S_LG, 62
+-	rldimi  r5, r6, MSR_TS_S_LG, 63 - MSR_TS_T_LG
+-	mtmsrd  r5
+-
+-	REST_NVGPRS(r1)
+-	addi    r1, r1, SWITCH_FRAME_SIZE
+-	ld	r5, PPC_LR_STKOFF(r1)
+-	mtlr	r5
++	addi    r1, r1, PPC_MIN_STKFRM
++	ld	r0, PPC_LR_STKOFF(r1)
++	mtlr	r0
+ 	blr
+ 
+ EXPORT_SYMBOL_GPL(_kvmppc_restore_tm_pr);
