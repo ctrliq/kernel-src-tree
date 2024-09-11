@@ -620,11 +620,6 @@ struct acpi_device *acpi_bus_get_acpi_device(acpi_handle handle)
 	return adev;
 }
 
-void acpi_bus_put_acpi_device(struct acpi_device *adev)
-{
-	acpi_dev_put(adev);
-}
-
 static struct acpi_device_bus_id *acpi_device_bus_id_match(const char *dev_id)
 {
 	struct acpi_device_bus_id *acpi_device_bus_id;
