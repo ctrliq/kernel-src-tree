@@ -3284,12 +3284,9 @@ static void snd_soc_try_rebind_card(void)
 {
 	struct snd_soc_card *card, *c;
 
-	if (!list_empty(&unbind_card_list)) {
-		list_for_each_entry_safe(card, c, &unbind_card_list, list) {
-			if (!snd_soc_bind_card(card))
-				list_del(&card->list);
-		}
-	}
+	list_for_each_entry_safe(card, c, &unbind_card_list, list)
+		if (!snd_soc_bind_card(card))
+			list_del(&card->list);
 }
 
 int snd_soc_add_component(struct device *dev,
