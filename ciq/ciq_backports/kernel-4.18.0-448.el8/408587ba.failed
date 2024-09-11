@@ -1,0 +1,122 @@
+mm: page_counter: rearrange struct page_counter fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Shakeel Butt <shakeelb@google.com>
+commit 408587baee39753304dd572dacf374f75545d25a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/408587ba.failed
+
+With memcg v2 enabled, memcg->memory.usage is a very hot member for the
+workloads doing memcg charging on multiple CPUs concurrently. 
+Particularly the network intensive workloads.  In addition, there is a
+false cache sharing between memory.usage and memory.high on the charge
+path.  This patch moves the usage into a separate cacheline and move all
+the read most fields into separate cacheline.
+
+To evaluate the impact of this optimization, on a 72 CPUs machine, we ran
+the following workload in a three level of cgroup hierarchy.
+
+ $ netserver -6
+ # 36 instances of netperf with following params
+ $ netperf -6 -H ::1 -l 60 -t TCP_SENDFILE -- -m 10K
+
+Results (average throughput of netperf):
+Without (6.0-rc1)	10482.7 Mbps
+With patch		12413.7 Mbps (18.4% improvement)
+
+With the patch, the throughput improved by 18.4%.
+
+One side-effect of this patch is the increase in the size of struct
+mem_cgroup.  For example with this patch on 64 bit build, the size of
+struct mem_cgroup increased from 4032 bytes to 4416 bytes.  However for
+the performance improvement, this additional size is worth it.  In
+addition there are opportunities to reduce the size of struct mem_cgroup
+like deprecation of kmem and tcpmem page counters and better packing.
+
+Link: https://lkml.kernel.org/r/20220825000506.239406-3-shakeelb@google.com
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Reported-by: kernel test robot <oliver.sang@intel.com>
+	Reviewed-by: Feng Tang <feng.tang@intel.com>
+	Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+	Acked-by: Roman Gushchin <roman.gushchin@linux.dev>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: "Michal Koutný" <mkoutny@suse.com>
+	Cc: Muchun Song <songmuchun@bytedance.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 408587baee39753304dd572dacf374f75545d25a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/page_counter.h
+diff --cc include/linux/page_counter.h
+index 223601248408,78a1c934e416..000000000000
+--- a/include/linux/page_counter.h
++++ b/include/linux/page_counter.h
+@@@ -3,17 -3,26 +3,35 @@@
+  #define _LINUX_PAGE_COUNTER_H
+  
+  #include <linux/atomic.h>
++ #include <linux/cache.h>
+  #include <linux/kernel.h>
+ +#include <linux/rh_kabi.h>
+  #include <asm/page.h>
+  
++ #if defined(CONFIG_SMP)
++ struct pc_padding {
++ 	char x[0];
++ } ____cacheline_internodealigned_in_smp;
++ #define PC_PADDING(name)	struct pc_padding name
++ #else
++ #define PC_PADDING(name)
++ #endif
++ 
+  struct page_counter {
++ 	/*
++ 	 * Make sure 'usage' does not share cacheline with any other field. The
++ 	 * memcg->memory.usage is a hot member of struct mem_cgroup.
++ 	 */
+  	atomic_long_t usage;
+++<<<<<<< HEAD
+ +	unsigned long min;
+ +	unsigned long low;
+ +	RH_KABI_BROKEN_INSERT(unsigned long high)
+ +	unsigned long max;
+ +	RH_KABI_BROKEN_REMOVE(struct page_counter *parent)
+++=======
++ 	PC_PADDING(_pad1_);
+++>>>>>>> 408587baee39 (mm: page_counter: rearrange struct page_counter fields)
+  
+  	/* effective memory.min and memory.min usage tracking */
+  	unsigned long emin;
+@@@ -28,15 -37,15 +46,26 @@@
+  	unsigned long watermark;
+  	unsigned long failcnt;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * 'parent' is placed here to be far from 'usage' to reduce
+ +	 * cache false sharing, as 'usage' is written mostly while
+ +	 * parent is frequently read for cgroup's hierarchical
+ +	 * counting nature.
+ +	 */
+ +	RH_KABI_BROKEN_INSERT(struct page_counter *parent)
+ +};
+++=======
++ 	/* Keep all the read most fields in a separete cacheline. */
++ 	PC_PADDING(_pad2_);
++ 
++ 	unsigned long min;
++ 	unsigned long low;
++ 	unsigned long high;
++ 	unsigned long max;
++ 	struct page_counter *parent;
++ } ____cacheline_internodealigned_in_smp;
+++>>>>>>> 408587baee39 (mm: page_counter: rearrange struct page_counter fields)
+  
+  #if BITS_PER_LONG == 32
+  #define PAGE_COUNTER_MAX LONG_MAX
+* Unmerged path include/linux/page_counter.h
