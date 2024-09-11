@@ -319,7 +319,6 @@ void eeh_addr_cache_build(void);
 void eeh_add_device_early(struct pci_dn *);
 void eeh_add_device_tree_early(struct pci_dn *);
 void eeh_add_device_late(struct pci_dev *);
-void eeh_add_device_tree_late(struct pci_bus *);
 void eeh_remove_device(struct pci_dev *);
 int eeh_unfreeze_pe(struct eeh_pe *pe);
 int eeh_pe_reset_and_recover(struct eeh_pe *pe);
@@ -381,8 +380,6 @@ static inline void eeh_add_device_early(struct pci_dn *pdn) { }
 static inline void eeh_add_device_tree_early(struct pci_dn *pdn) { }
 
 static inline void eeh_add_device_late(struct pci_dev *dev) { }
-
-static inline void eeh_add_device_tree_late(struct pci_bus *bus) { }
 
 static inline void eeh_remove_device(struct pci_dev *dev) { }
 
