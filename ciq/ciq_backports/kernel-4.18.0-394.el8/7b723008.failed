@@ -1,0 +1,238 @@
+NFSD: Restore NFSv4 decoding's SAVEMEM functionality
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 7b723008f9c95624c848fad661c01b06e47b20da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/7b723008.failed
+
+While converting the NFSv4 decoder to use xdr_stream-based XDR
+processing, I removed the old SAVEMEM() macro. This macro wrapped
+a bit of logic that avoided a memory allocation by recognizing when
+the decoded item resides in a linear section of the Receive buffer.
+In that case, it returned a pointer into that buffer instead of
+allocating a bounce buffer.
+
+The bounce buffer is necessary only when xdr_inline_decode() has
+placed the decoded item in the xdr_stream's scratch buffer, which
+disappears the next time xdr_inline_decode() is called with that
+xdr_stream. That happens only if the data item crosses a page
+boundary in the receive buffer, an exceedingly rare occurrence.
+
+Allocating a bounce buffer every time results in a minor performance
+regression that was introduced by the recent NFSv4 decoder overhaul.
+Let's restore the previous behavior. On average, it saves about 1.5
+kmalloc() calls per COMPOUND.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 7b723008f9c95624c848fad661c01b06e47b20da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4xdr.c
+diff --cc fs/nfsd/nfs4xdr.c
+index cf0d08d4c2a7,eaaa1605b5b5..000000000000
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@@ -259,77 -147,87 +259,143 @@@ svcxdr_dupstr(struct nfsd4_compoundarg
+  	return p;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *
++ svcxdr_savemem(struct nfsd4_compoundargs *argp, __be32 *p, u32 len)
++ {
++ 	__be32 *tmp;
++ 
++ 	/*
++ 	 * The location of the decoded data item is stable,
++ 	 * so @p is OK to use. This is the common case.
++ 	 */
++ 	if (p != argp->xdr->scratch.iov_base)
++ 		return p;
++ 
++ 	tmp = svcxdr_tmpalloc(argp, len);
++ 	if (!tmp)
++ 		return NULL;
++ 	memcpy(tmp, p, len);
++ 	return tmp;
++ }
++ 
++ /*
++  * NFSv4 basic data type decoders
++  */
++ 
++ /*
++  * This helper handles variable-length opaques which belong to protocol
++  * elements that this implementation does not support.
++  */
+++>>>>>>> 7b723008f9c9 (NFSD: Restore NFSv4 decoding's SAVEMEM functionality)
+  static __be32
+ -nfsd4_decode_ignored_string(struct nfsd4_compoundargs *argp, u32 maxlen)
+ +svcxdr_construct_vector(struct nfsd4_compoundargs *argp, struct kvec *head,
+ +			struct page ***pagelist, u32 buflen)
+  {
+ -	u32 len;
+ +	int avail;
+ +	int len;
+ +	int pages;
+  
+ -	if (xdr_stream_decode_u32(argp->xdr, &len) < 0)
+ -		return nfserr_bad_xdr;
+ -	if (maxlen && len > maxlen)
+ -		return nfserr_bad_xdr;
+ -	if (!xdr_inline_decode(argp->xdr, len))
+ +	/* Sorry .. no magic macros for this.. *
+ +	 * READ_BUF(write->wr_buflen);
+ +	 * SAVEMEM(write->wr_buf, write->wr_buflen);
+ +	 */
+ +	avail = (char *)argp->end - (char *)argp->p;
+ +	if (avail + argp->pagelen < buflen) {
+ +		dprintk("NFSD: xdr error (%s:%d)\n",
+ +			       __FILE__, __LINE__);
+  		return nfserr_bad_xdr;
+ +	}
+ +	head->iov_base = argp->p;
+ +	head->iov_len = avail;
+ +	*pagelist = argp->pagelist;
+  
+ -	return nfs_ok;
+ +	len = XDR_QUADLEN(buflen) << 2;
+ +	if (len >= avail) {
+ +		len -= avail;
+ +
+ +		pages = len >> PAGE_SHIFT;
+ +		argp->pagelist += pages;
+ +		argp->pagelen -= pages * PAGE_SIZE;
+ +		len -= pages * PAGE_SIZE;
+ +
+ +		next_decode_page(argp);
+ +	}
+ +	argp->p += XDR_QUADLEN(len);
+ +
+ +	return 0;
+ +}
+ +
+ +/**
+ + * savemem - duplicate a chunk of memory for later processing
+ + * @argp: NFSv4 compound argument structure to be freed with
+ + * @p: pointer to be duplicated
+ + * @nbytes: length to be duplicated
+ + *
+ + * Returns a pointer to a copy of @nbytes bytes of memory at @p
+ + * that are preserved until processing of the NFSv4 compound
+ + * operation described by @argp finishes.
+ + */
+ +static char *savemem(struct nfsd4_compoundargs *argp, __be32 *p, int nbytes)
+ +{
+ +	void *ret;
+ +
+ +	ret = svcxdr_tmpalloc(argp, nbytes);
+ +	if (!ret)
+ +		return NULL;
+ +	memcpy(ret, p, nbytes);
+ +	return ret;
+  }
+  
+  static __be32
+ -nfsd4_decode_opaque(struct nfsd4_compoundargs *argp, struct xdr_netobj *o)
+ +nfsd4_decode_time(struct nfsd4_compoundargs *argp, struct timespec64 *tv)
+  {
+ -	__be32 *p;
+ -	u32 len;
+ +	DECODE_HEAD;
+ +
+++<<<<<<< HEAD
+ +	READ_BUF(12);
+ +	p = xdr_decode_hyper(p, &tv->tv_sec);
+ +	tv->tv_nsec = be32_to_cpup(p++);
+ +	if (tv->tv_nsec >= (u32)1000000000)
+ +		return nfserr_inval;
+  
+ +	DECODE_TAIL;
+++=======
++ 	if (xdr_stream_decode_u32(argp->xdr, &len) < 0)
++ 		return nfserr_bad_xdr;
++ 	if (len == 0 || len > NFS4_OPAQUE_LIMIT)
++ 		return nfserr_bad_xdr;
++ 	p = xdr_inline_decode(argp->xdr, len);
++ 	if (!p)
++ 		return nfserr_bad_xdr;
++ 	o->data = svcxdr_savemem(argp, p, len);
++ 	if (!o->data)
++ 		return nfserr_jukebox;
++ 	o->len = len;
++ 
++ 	return nfs_ok;
++ }
++ 
++ static __be32
++ nfsd4_decode_component4(struct nfsd4_compoundargs *argp, char **namp, u32 *lenp)
++ {
++ 	__be32 *p, status;
++ 
++ 	if (xdr_stream_decode_u32(argp->xdr, lenp) < 0)
++ 		return nfserr_bad_xdr;
++ 	p = xdr_inline_decode(argp->xdr, *lenp);
++ 	if (!p)
++ 		return nfserr_bad_xdr;
++ 	status = check_filename((char *)p, *lenp);
++ 	if (status)
++ 		return status;
++ 	*namp = svcxdr_savemem(argp, p, *lenp);
++ 	if (!*namp)
++ 		return nfserr_jukebox;
++ 
++ 	return nfs_ok;
+++>>>>>>> 7b723008f9c9 (NFSD: Restore NFSv4 decoding's SAVEMEM functionality)
+  }
+  
+  static __be32
+@@@ -2157,19 -2331,30 +2217,42 @@@ nfsd4_decode_compound(struct nfsd4_comp
+  	int max_reply = auth_slack + 8; /* opcnt, status */
+  	int readcount = 0;
+  	int readbytes = 0;
+ -	__be32 *p;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	READ_BUF(4);
+ +	argp->taglen = be32_to_cpup(p++);
+ +	READ_BUF(argp->taglen);
+ +	SAVEMEM(argp->tag, argp->taglen);
+ +	READ_BUF(8);
+ +	argp->minorversion = be32_to_cpup(p++);
+ +	argp->opcnt = be32_to_cpup(p++);
+ +	max_reply += 4 + (XDR_QUADLEN(argp->taglen) << 2);
+++=======
++ 	if (xdr_stream_decode_u32(argp->xdr, &argp->taglen) < 0)
++ 		return 0;
++ 	max_reply += XDR_UNIT;
++ 	argp->tag = NULL;
++ 	if (unlikely(argp->taglen)) {
++ 		if (argp->taglen > NFSD4_MAX_TAGLEN)
++ 			return 0;
++ 		p = xdr_inline_decode(argp->xdr, argp->taglen);
++ 		if (!p)
++ 			return 0;
++ 		argp->tag = svcxdr_savemem(argp, p, argp->taglen);
++ 		if (!argp->tag)
++ 			return 0;
++ 		max_reply += xdr_align_size(argp->taglen);
++ 	}
++ 
++ 	if (xdr_stream_decode_u32(argp->xdr, &argp->minorversion) < 0)
++ 		return 0;
++ 	if (xdr_stream_decode_u32(argp->xdr, &argp->opcnt) < 0)
++ 		return 0;
+++>>>>>>> 7b723008f9c9 (NFSD: Restore NFSv4 decoding's SAVEMEM functionality)
+  
+ +	if (argp->taglen > NFSD4_MAX_TAGLEN)
+ +		goto xdr_error;
+  	/*
+  	 * NFS4ERR_RESOURCE is a more helpful error than GARBAGE_ARGS
+  	 * here, so we return success at the xdr level so that
+* Unmerged path fs/nfsd/nfs4xdr.c
