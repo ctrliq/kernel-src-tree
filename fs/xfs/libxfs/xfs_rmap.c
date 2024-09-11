@@ -707,7 +707,7 @@ xfs_rmap_free(
 	if (!xfs_sb_version_hasrmapbt(&mp->m_sb))
 		return 0;
 
-	cur = xfs_rmapbt_init_cursor(mp, tp, agbp, agno);
+	cur = xfs_rmapbt_init_cursor(mp, tp, agbp, agno, NULL);
 
 	error = xfs_rmap_unmap(cur, bno, len, false, oinfo);
 
@@ -961,7 +961,7 @@ xfs_rmap_alloc(
 	if (!xfs_sb_version_hasrmapbt(&mp->m_sb))
 		return 0;
 
-	cur = xfs_rmapbt_init_cursor(mp, tp, agbp, agno);
+	cur = xfs_rmapbt_init_cursor(mp, tp, agbp, agno, NULL);
 	error = xfs_rmap_map(cur, bno, len, false, oinfo);
 
 	xfs_btree_del_cursor(cur, error);
@@ -2407,7 +2407,7 @@ xfs_rmap_finish_one(
 			goto out_drop;
 		}
 
-		rcur = xfs_rmapbt_init_cursor(mp, tp, agbp, pag->pag_agno);
+		rcur = xfs_rmapbt_init_cursor(mp, tp, agbp, pag->pag_agno, pag);
 	}
 	*pcur = rcur;
 
