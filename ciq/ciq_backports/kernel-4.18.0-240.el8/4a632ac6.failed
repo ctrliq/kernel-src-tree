@@ -1,0 +1,120 @@
+KVM: x86/mmu: Add separate override for MMU sync during fast CR3 switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 4a632ac6ca66fb29b94a16495624c58f4d313f2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4a632ac6.failed
+
+Add a separate "skip" override for MMU sync, a future change to avoid
+TLB flushes on nested VMX transitions may need to sync the MMU even if
+the TLB flush is unnecessary.
+
+	Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200320212833.3507-32-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4a632ac6ca66fb29b94a16495624c58f4d313f2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index dbd97923dc2c,97d1e9b80b8e..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -4396,17 -4303,42 +4396,48 @@@ static bool fast_cr3_switch(struct kvm_
+  
+  static void __kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3,
+  			      union kvm_mmu_page_role new_role,
+- 			      bool skip_tlb_flush)
++ 			      bool skip_tlb_flush, bool skip_mmu_sync)
+  {
+++<<<<<<< HEAD
+ +	if (!fast_cr3_switch(vcpu, new_cr3, new_role, skip_tlb_flush))
+ +		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu,
+ +				   KVM_MMU_ROOT_CURRENT);
+++=======
++ 	if (!fast_cr3_switch(vcpu, new_cr3, new_role)) {
++ 		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, KVM_MMU_ROOT_CURRENT);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * It's possible that the cached previous root page is obsolete because
++ 	 * of a change in the MMU generation number. However, changing the
++ 	 * generation number is accompanied by KVM_REQ_MMU_RELOAD, which will
++ 	 * free the root set here and allocate a new one.
++ 	 */
++ 	kvm_make_request(KVM_REQ_LOAD_MMU_PGD, vcpu);
++ 
++ 	if (!skip_mmu_sync)
++ 		kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
++ 	if (!skip_tlb_flush)
++ 		kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu);
++ 
++ 	/*
++ 	 * The last MMIO access's GVA and GPA are cached in the VCPU. When
++ 	 * switching to a new CR3, that GVA->GPA mapping may no longer be
++ 	 * valid. So clear any cached MMIO info even when we don't need to sync
++ 	 * the shadow page tables.
++ 	 */
++ 	vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
++ 
++ 	__clear_sp_write_flooding_count(page_header(vcpu->arch.mmu->root_hpa));
+++>>>>>>> 4a632ac6ca66 (KVM: x86/mmu: Add separate override for MMU sync during fast CR3 switch)
+  }
+  
+- void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush)
++ void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush,
++ 		     bool skip_mmu_sync)
+  {
+  	__kvm_mmu_new_cr3(vcpu, new_cr3, kvm_mmu_calc_root_page_role(vcpu),
+- 			  skip_tlb_flush);
++ 			  skip_tlb_flush, skip_mmu_sync);
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_new_cr3);
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 10275c160b4e..d49f5868a5c7 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1513,7 +1513,8 @@ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 error_code,
+ 		       void *insn, int insn_len);
+ void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva);
+ void kvm_mmu_invpcid_gva(struct kvm_vcpu *vcpu, gva_t gva, unsigned long pcid);
+-void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush);
++void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush,
++		     bool skip_mmu_sync);
+ 
+ void kvm_configure_mmu(bool enable_tdp);
+ 
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index cd775c31a62d..4a24756a6c34 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -1102,7 +1102,7 @@ static int nested_vmx_load_cr3(struct kvm_vcpu *vcpu, unsigned long cr3, bool ne
+ 	}
+ 
+ 	if (!nested_ept)
+-		kvm_mmu_new_cr3(vcpu, cr3, false);
++		kvm_mmu_new_cr3(vcpu, cr3, false, false);
+ 
+ 	vcpu->arch.cr3 = cr3;
+ 	kvm_register_mark_available(vcpu, VCPU_EXREG_CR3);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 0a8a4dd82886..e674fda0d9ab 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1006,7 +1006,7 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+ 		 !load_pdptrs(vcpu, vcpu->arch.walk_mmu, cr3))
+ 		return 1;
+ 
+-	kvm_mmu_new_cr3(vcpu, cr3, skip_tlb_flush);
++	kvm_mmu_new_cr3(vcpu, cr3, skip_tlb_flush, skip_tlb_flush);
+ 	vcpu->arch.cr3 = cr3;
+ 	kvm_register_mark_available(vcpu, VCPU_EXREG_CR3);
+ 
