@@ -1,0 +1,254 @@
+mlxsw: spectrum_router: Allow returning errors from mlxsw_sp_nexthop_group_refresh()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit e3ddfb45bacdc623eedea7f7bf9e7879257471d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/e3ddfb45.failed
+
+The function is responsible for allocating the adjacency entries used by
+the nexthop group and populating them with the adjacency information
+such as egress RIF and MAC address.
+
+Allow the function to return an error when it encounters a problem and
+have the relevant call sites check it.
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit e3ddfb45bacdc623eedea7f7bf9e7879257471d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index e9b6239efe36,147dd8fab2af..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -3552,17 -3562,16 +3552,16 @@@ mlxsw_sp_nexthop_group_refresh(struct m
+  	bool offload_change = false;
+  	u32 adj_index;
+  	bool old_adj_index_valid;
++ 	int i, err2, err = 0;
+  	u32 old_adj_index;
+- 	int i;
+- 	int err;
+  
+ -	if (!nhgi->gateway) {
+ +	if (!nh_grp->gateway) {
+  		mlxsw_sp_nexthop_fib_entries_update(mlxsw_sp, nh_grp);
+- 		return;
++ 		return 0;
+  	}
+  
+ -	for (i = 0; i < nhgi->count; i++) {
+ -		nh = &nhgi->nexthops[i];
+ +	for (i = 0; i < nh_grp->count; i++) {
+ +		nh = &nh_grp->nexthops[i];
+  
+  		if (nh->should_offload != nh->offloaded) {
+  			offload_change = true;
+@@@ -3579,10 -3588,10 +3578,10 @@@
+  			dev_warn(mlxsw_sp->bus_info->dev, "Failed to update neigh MAC in adjacency table.\n");
+  			goto set_trap;
+  		}
+- 		return;
++ 		return 0;
+  	}
+ -	mlxsw_sp_nexthop_group_normalize(nhgi);
+ -	if (!nhgi->sum_norm_weight)
+ +	mlxsw_sp_nexthop_group_normalize(nh_grp);
+ +	if (!nh_grp->sum_norm_weight)
+  		/* No neigh of this group is connected so we just set
+  		 * the trap and let everthing flow through kernel.
+  		 */
+@@@ -3639,22 -3648,23 +3638,27 @@@
+  		goto set_trap;
+  	}
+  
+- 	return;
++ 	return 0;
+  
+  set_trap:
+ -	old_adj_index_valid = nhgi->adj_index_valid;
+ -	nhgi->adj_index_valid = 0;
+ -	for (i = 0; i < nhgi->count; i++) {
+ -		nh = &nhgi->nexthops[i];
+ +	old_adj_index_valid = nh_grp->adj_index_valid;
+ +	nh_grp->adj_index_valid = 0;
+ +	for (i = 0; i < nh_grp->count; i++) {
+ +		nh = &nh_grp->nexthops[i];
+  		nh->offloaded = 0;
+  	}
+- 	err = mlxsw_sp_nexthop_fib_entries_update(mlxsw_sp, nh_grp);
+- 	if (err)
++ 	err2 = mlxsw_sp_nexthop_fib_entries_update(mlxsw_sp, nh_grp);
++ 	if (err2)
+  		dev_warn(mlxsw_sp->bus_info->dev, "Failed to set traps for fib entries.\n");
+  	mlxsw_sp_nexthop_group_offload_refresh(mlxsw_sp, nh_grp);
+  	if (old_adj_index_valid)
+  		mlxsw_sp_kvdl_free(mlxsw_sp, MLXSW_SP_KVDL_ENTRY_TYPE_ADJ,
+++<<<<<<< HEAD
+ +				   nh_grp->ecmp_size, nh_grp->adj_index);
+++=======
++ 				   nhgi->ecmp_size, nhgi->adj_index);
++ 	return err;
+++>>>>>>> e3ddfb45bacd (mlxsw: spectrum_router: Allow returning errors from mlxsw_sp_nexthop_group_refresh())
+  }
+  
+  static void __mlxsw_sp_nexthop_neigh_update(struct mlxsw_sp_nexthop *nh,
+@@@ -4087,10 -4089,71 +4091,76 @@@ static void mlxsw_sp_nexthop_rif_gone_s
+  }
+  
+  static bool mlxsw_sp_fi_is_gateway(const struct mlxsw_sp *mlxsw_sp,
+ -				   struct fib_info *fi)
+ +				   const struct fib_info *fi)
+  {
+++<<<<<<< HEAD
+ +	return fi->fib_nh->nh_scope == RT_SCOPE_LINK ||
+ +	       mlxsw_sp_nexthop4_ipip_type(mlxsw_sp, fi->fib_nh, NULL);
+++=======
++ 	const struct fib_nh *nh = fib_info_nh(fi, 0);
++ 
++ 	return nh->fib_nh_scope == RT_SCOPE_LINK ||
++ 	       mlxsw_sp_nexthop4_ipip_type(mlxsw_sp, nh, NULL);
++ }
++ 
++ static int
++ mlxsw_sp_nexthop4_group_info_init(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_nexthop_group *nh_grp)
++ {
++ 	unsigned int nhs = fib_info_num_path(nh_grp->ipv4.fi);
++ 	struct mlxsw_sp_nexthop_group_info *nhgi;
++ 	struct mlxsw_sp_nexthop *nh;
++ 	int err, i;
++ 
++ 	nhgi = kzalloc(struct_size(nhgi, nexthops, nhs), GFP_KERNEL);
++ 	if (!nhgi)
++ 		return -ENOMEM;
++ 	nh_grp->nhgi = nhgi;
++ 	nhgi->nh_grp = nh_grp;
++ 	nhgi->gateway = mlxsw_sp_fi_is_gateway(mlxsw_sp, nh_grp->ipv4.fi);
++ 	nhgi->count = nhs;
++ 	for (i = 0; i < nhgi->count; i++) {
++ 		struct fib_nh *fib_nh;
++ 
++ 		nh = &nhgi->nexthops[i];
++ 		fib_nh = fib_info_nh(nh_grp->ipv4.fi, i);
++ 		err = mlxsw_sp_nexthop4_init(mlxsw_sp, nh_grp, nh, fib_nh);
++ 		if (err)
++ 			goto err_nexthop4_init;
++ 	}
++ 	err = mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
++ 	if (err)
++ 		goto err_group_refresh;
++ 
++ 	return 0;
++ 
++ err_group_refresh:
++ 	i = nhgi->count;
++ err_nexthop4_init:
++ 	for (i--; i >= 0; i--) {
++ 		nh = &nhgi->nexthops[i];
++ 		mlxsw_sp_nexthop4_fini(mlxsw_sp, nh);
++ 	}
++ 	kfree(nhgi);
++ 	return err;
++ }
++ 
++ static void
++ mlxsw_sp_nexthop4_group_info_fini(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_nexthop_group *nh_grp)
++ {
++ 	struct mlxsw_sp_nexthop_group_info *nhgi = nh_grp->nhgi;
++ 	int i;
++ 
++ 	for (i = nhgi->count - 1; i >= 0; i--) {
++ 		struct mlxsw_sp_nexthop *nh = &nhgi->nexthops[i];
++ 
++ 		mlxsw_sp_nexthop4_fini(mlxsw_sp, nh);
++ 	}
++ 	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
++ 	WARN_ON_ONCE(nhgi->adj_index_valid);
++ 	kfree(nhgi);
+++>>>>>>> e3ddfb45bacd (mlxsw: spectrum_router: Allow returning errors from mlxsw_sp_nexthop_group_refresh())
+  }
+  
+  static struct mlxsw_sp_nexthop_group *
+@@@ -5401,6 -5407,70 +5471,73 @@@ static bool mlxsw_sp_rt6_is_gateway(con
+  	       mlxsw_sp_nexthop6_ipip_type(mlxsw_sp, rt, NULL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlxsw_sp_nexthop6_group_info_init(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_nexthop_group *nh_grp,
++ 				  struct mlxsw_sp_fib6_entry *fib6_entry)
++ {
++ 	struct mlxsw_sp_nexthop_group_info *nhgi;
++ 	struct mlxsw_sp_rt6 *mlxsw_sp_rt6;
++ 	struct mlxsw_sp_nexthop *nh;
++ 	int err, i;
++ 
++ 	nhgi = kzalloc(struct_size(nhgi, nexthops, fib6_entry->nrt6),
++ 		       GFP_KERNEL);
++ 	if (!nhgi)
++ 		return -ENOMEM;
++ 	nh_grp->nhgi = nhgi;
++ 	nhgi->nh_grp = nh_grp;
++ 	mlxsw_sp_rt6 = list_first_entry(&fib6_entry->rt6_list,
++ 					struct mlxsw_sp_rt6, list);
++ 	nhgi->gateway = mlxsw_sp_rt6_is_gateway(mlxsw_sp, mlxsw_sp_rt6->rt);
++ 	nhgi->count = fib6_entry->nrt6;
++ 	for (i = 0; i < nhgi->count; i++) {
++ 		struct fib6_info *rt = mlxsw_sp_rt6->rt;
++ 
++ 		nh = &nhgi->nexthops[i];
++ 		err = mlxsw_sp_nexthop6_init(mlxsw_sp, nh_grp, nh, rt);
++ 		if (err)
++ 			goto err_nexthop6_init;
++ 		mlxsw_sp_rt6 = list_next_entry(mlxsw_sp_rt6, list);
++ 	}
++ 	nh_grp->nhgi = nhgi;
++ 	err = mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
++ 	if (err)
++ 		goto err_group_refresh;
++ 
++ 	return 0;
++ 
++ err_group_refresh:
++ 	i = nhgi->count;
++ err_nexthop6_init:
++ 	for (i--; i >= 0; i--) {
++ 		nh = &nhgi->nexthops[i];
++ 		mlxsw_sp_nexthop6_fini(mlxsw_sp, nh);
++ 	}
++ 	kfree(nhgi);
++ 	return err;
++ }
++ 
++ static void
++ mlxsw_sp_nexthop6_group_info_fini(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_nexthop_group *nh_grp)
++ {
++ 	struct mlxsw_sp_nexthop_group_info *nhgi = nh_grp->nhgi;
++ 	int i;
++ 
++ 	for (i = nhgi->count - 1; i >= 0; i--) {
++ 		struct mlxsw_sp_nexthop *nh = &nhgi->nexthops[i];
++ 
++ 		mlxsw_sp_nexthop6_fini(mlxsw_sp, nh);
++ 	}
++ 	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
++ 	WARN_ON_ONCE(nhgi->adj_index_valid);
++ 	kfree(nhgi);
++ }
++ 
+++>>>>>>> e3ddfb45bacd (mlxsw: spectrum_router: Allow returning errors from mlxsw_sp_nexthop_group_refresh())
+  static struct mlxsw_sp_nexthop_group *
+  mlxsw_sp_nexthop6_group_create(struct mlxsw_sp *mlxsw_sp,
+  			       struct mlxsw_sp_fib6_entry *fib6_entry)
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
