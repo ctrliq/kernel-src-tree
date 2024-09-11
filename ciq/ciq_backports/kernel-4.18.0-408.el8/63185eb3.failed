@@ -1,0 +1,141 @@
+bnxt_en: Provide stored devlink "fw" version on older firmware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Vikas Gupta <vikas.gupta@broadcom.com>
+commit 63185eb3aa267f2844580bbd8c9c1c97516f5dbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/63185eb3.failed
+
+On older firmware that doesn't support the HWRM_NVM_GET_DEV_INFO
+command that returns detailed stored firmware versions, fallback
+to use the same firmware package version that is reported to ethtool.
+Refactor bnxt_get_pkgver() in bnxt_ethtool.c so that devlink can call
+and get the package version.
+
+	Signed-off-by: Vikas Gupta <vikas.gupta@broadcom.com>
+	Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 63185eb3aa267f2844580bbd8c9c1c97516f5dbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+index df9617aeea34,6aa44840f13a..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+@@@ -49,10 -49,13 +49,14 @@@ u32 bnxt_get_rxfh_indir_size(struct net
+  u32 _bnxt_fw_to_ethtool_adv_spds(u16, u8);
+  u32 bnxt_fw_to_ethtool_speed(u16);
+  u16 bnxt_get_fw_auto_link_speeds(u32);
+ -int bnxt_hwrm_nvm_get_dev_info(struct bnxt *bp,
+ -			       struct hwrm_nvm_get_dev_info_output *nvm_dev_info);
+ -int bnxt_hwrm_firmware_reset(struct net_device *dev, u8 proc_type,
+ -			     u8 self_reset, u8 flags);
+  int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware *fw,
+  				   u32 install_type);
+++<<<<<<< HEAD
+ +int bnxt_hwrm_nvm_get_dev_info(struct bnxt *bp,
+ +			       struct hwrm_nvm_get_dev_info_output *nvm_dev_info);
+++=======
++ int bnxt_get_pkginfo(struct net_device *dev, char *ver, int size);
+++>>>>>>> 63185eb3aa26 (bnxt_en: Provide stored devlink "fw" version on older firmware)
+  void bnxt_ethtool_init(struct bnxt *bp);
+  void bnxt_ethtool_free(struct bnxt *bp);
+  
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index d875469f72ce..a7f8f12d3c66 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@ -651,8 +651,13 @@ static int bnxt_dl_info_get(struct devlink *dl, struct devlink_info_req *req,
+ 
+ 	rc = bnxt_hwrm_nvm_get_dev_info(bp, &nvm_dev_info);
+ 	if (rc ||
+-	    !(nvm_dev_info.flags & NVM_GET_DEV_INFO_RESP_FLAGS_FW_VER_VALID))
++	    !(nvm_dev_info.flags & NVM_GET_DEV_INFO_RESP_FLAGS_FW_VER_VALID)) {
++		if (!bnxt_get_pkginfo(bp->dev, buf, sizeof(buf)))
++			return bnxt_dl_info_put(bp, req, BNXT_VERSION_STORED,
++						DEVLINK_INFO_VERSION_GENERIC_FW,
++						buf);
+ 		return 0;
++	}
+ 
+ 	buf[0] = 0;
+ 	strncat(buf, nvm_dev_info.pkg_name, HWRM_FW_VER_STR_LEN);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index e1aea0698aad..08a6bfb1b9e6 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -2827,39 +2827,56 @@ static char *bnxt_parse_pkglog(int desired_field, u8 *data, size_t datalen)
+ 	return retval;
+ }
+ 
+-static void bnxt_get_pkgver(struct net_device *dev)
++int bnxt_get_pkginfo(struct net_device *dev, char *ver, int size)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	u16 index = 0;
+ 	char *pkgver;
+ 	u32 pkglen;
+ 	u8 *pkgbuf;
+-	int len;
++	int rc;
+ 
+-	if (bnxt_find_nvram_item(dev, BNX_DIR_TYPE_PKG_LOG,
+-				 BNX_DIR_ORDINAL_FIRST, BNX_DIR_EXT_NONE,
+-				 &index, NULL, &pkglen) != 0)
+-		return;
++	rc = bnxt_find_nvram_item(dev, BNX_DIR_TYPE_PKG_LOG,
++				  BNX_DIR_ORDINAL_FIRST, BNX_DIR_EXT_NONE,
++				  &index, NULL, &pkglen);
++	if (rc)
++		return rc;
+ 
+ 	pkgbuf = kzalloc(pkglen, GFP_KERNEL);
+ 	if (!pkgbuf) {
+ 		dev_err(&bp->pdev->dev, "Unable to allocate memory for pkg version, length = %u\n",
+ 			pkglen);
+-		return;
++		return -ENOMEM;
+ 	}
+ 
+-	if (bnxt_get_nvram_item(dev, index, 0, pkglen, pkgbuf))
++	rc = bnxt_get_nvram_item(dev, index, 0, pkglen, pkgbuf);
++	if (rc)
+ 		goto err;
+ 
+ 	pkgver = bnxt_parse_pkglog(BNX_PKG_LOG_FIELD_IDX_PKG_VERSION, pkgbuf,
+ 				   pkglen);
+-	if (pkgver && *pkgver != 0 && isdigit(*pkgver)) {
++	if (pkgver && *pkgver != 0 && isdigit(*pkgver))
++		strscpy(ver, pkgver, size);
++	else
++		rc = -ENOENT;
++
++err:
++	kfree(pkgbuf);
++
++	return rc;
++}
++
++static void bnxt_get_pkgver(struct net_device *dev)
++{
++	struct bnxt *bp = netdev_priv(dev);
++	char buf[FW_VER_STR_LEN];
++	int len;
++
++	if (!bnxt_get_pkginfo(dev, buf, sizeof(buf))) {
+ 		len = strlen(bp->fw_ver_str);
+ 		snprintf(bp->fw_ver_str + len, FW_VER_STR_LEN - len - 1,
+-			 "/pkg %s", pkgver);
++			 "/pkg %s", buf);
+ 	}
+-err:
+-	kfree(pkgbuf);
+ }
+ 
+ static int bnxt_get_eeprom(struct net_device *dev,
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
