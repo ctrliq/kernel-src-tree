@@ -1,0 +1,151 @@
+printk: avoid prb_first_valid_seq() where possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 13791c80b0cdf54d92fc54221cdf490683b109de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/13791c80.failed
+
+If message sizes average larger than expected (more than 32
+characters), the data_ring will wrap before the desc_ring. Once the
+data_ring wraps, it will start invalidating descriptors. These
+invalid descriptors hang around until they are eventually recycled
+when the desc_ring wraps. Readers do not care about invalid
+descriptors, but they still need to iterate past them. If the
+average message size is much larger than 32 characters, then there
+will be many invalid descriptors preceding the valid descriptors.
+
+The function prb_first_valid_seq() always begins at the oldest
+descriptor and searches for the first valid descriptor. This can
+be rather expensive for the above scenario. And, in fact, because
+of its heavy usage in /dev/kmsg, there have been reports of long
+delays and even RCU stalls.
+
+For code that does not need to search from the oldest record,
+replace prb_first_valid_seq() usage with prb_read_valid_*()
+functions, which provide a start sequence number to search from.
+
+Fixes: 896fbe20b4e2333fb55 ("printk: use the lockless ringbuffer")
+	Reported-by: kernel test robot <oliver.sang@intel.com>
+	Reported-by: J. Avila <elavila@google.com>
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210211173152.1629-1-john.ogness@linutronix.de
+(cherry picked from commit 13791c80b0cdf54d92fc54221cdf490683b109de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,c7239d169bbe..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -907,10 -736,9 +907,16 @@@ static ssize_t devkmsg_read(struct fil
+  		logbuf_lock_irq();
+  	}
+  
+++<<<<<<< HEAD
+ +	if (user->seq < log_first_seq) {
+ +		/* our last seen message is gone, return error and reset */
+ +		user->idx = log_first_idx;
+ +		user->seq = log_first_seq;
+++=======
++ 	if (r->info->seq != user->seq) {
++ 		/* our last seen message is gone, return error and reset */
++ 		user->seq = r->info->seq;
+++>>>>>>> 13791c80b0cd (printk: avoid prb_first_valid_seq() where possible)
+  		ret = -EPIPE;
+  		logbuf_unlock_irq();
+  		goto out;
+@@@ -991,9 -822,9 +998,15 @@@ static __poll_t devkmsg_poll(struct fil
+  	poll_wait(file, &log_wait, wait);
+  
+  	logbuf_lock_irq();
+++<<<<<<< HEAD
+ +	if (user->seq < log_next_seq) {
+ +		/* return error when data has vanished underneath us */
+ +		if (user->seq < log_first_seq)
+++=======
++ 	if (prb_read_valid_info(prb, user->seq, &info, NULL)) {
++ 		/* return error when data has vanished underneath us */
++ 		if (info.seq != user->seq)
+++>>>>>>> 13791c80b0cd (printk: avoid prb_first_valid_seq() where possible)
+  			ret = EPOLLIN|EPOLLRDNORM|EPOLLERR|EPOLLPRI;
+  		else
+  			ret = EPOLLIN|EPOLLRDNORM;
+@@@ -1606,10 -1632,14 +1620,21 @@@ int do_syslog(int type, char __user *bu
+  	/* Number of chars in the log buffer */
+  	case SYSLOG_ACTION_SIZE_UNREAD:
+  		logbuf_lock_irq();
+++<<<<<<< HEAD
+ +		if (syslog_seq < log_first_seq) {
+ +			/* messages are gone, move to first one */
+ +			syslog_seq = log_first_seq;
+ +			syslog_idx = log_first_idx;
+++=======
++ 		if (!prb_read_valid_info(prb, syslog_seq, &info, NULL)) {
++ 			/* No unread messages. */
++ 			logbuf_unlock_irq();
++ 			return 0;
++ 		}
++ 		if (info.seq != syslog_seq) {
++ 			/* messages are gone, move to first one */
++ 			syslog_seq = info.seq;
+++>>>>>>> 13791c80b0cd (printk: avoid prb_first_valid_seq() where possible)
+  			syslog_partial = 0;
+  		}
+  		if (source == SYSLOG_FROM_PROC) {
+@@@ -1618,20 -1648,17 +1643,25 @@@
+  			 * for pending data, not the size; return the count of
+  			 * records, not the length.
+  			 */
+ -			error = prb_next_seq(prb) - syslog_seq;
+ +			error = log_next_seq - syslog_seq;
+  		} else {
+ +			u64 seq = syslog_seq;
+ +			u32 idx = syslog_idx;
+  			bool time = syslog_partial ? syslog_time : printk_time;
+++<<<<<<< HEAD
+++=======
++ 			unsigned int line_count;
++ 			u64 seq;
+++>>>>>>> 13791c80b0cd (printk: avoid prb_first_valid_seq() where possible)
+ +
+ +			while (seq < log_next_seq) {
+ +				struct printk_log *msg = log_from_idx(idx);
+  
+ -			prb_for_each_info(syslog_seq, prb, seq, &info,
+ -					  &line_count) {
+ -				error += get_record_print_text_size(&info, line_count,
+ -								    true, time);
+ +				error += msg_print_text(msg, true, time, NULL,
+ +							0);
+  				time = printk_time;
+ +				idx = log_next(idx);
+ +				seq++;
+  			}
+  			error -= syslog_partial;
+  		}
+@@@ -3326,10 -3431,11 +3356,18 @@@ bool kmsg_dump_get_buffer(struct kmsg_d
+  		goto out;
+  
+  	logbuf_lock_irqsave(flags);
+++<<<<<<< HEAD
+ +	if (dumper->cur_seq < log_first_seq) {
+ +		/* messages are gone, move to first available one */
+ +		dumper->cur_seq = log_first_seq;
+ +		dumper->cur_idx = log_first_idx;
+++=======
++ 	if (prb_read_valid_info(prb, dumper->cur_seq, &info, NULL)) {
++ 		if (info.seq != dumper->cur_seq) {
++ 			/* messages are gone, move to first available one */
++ 			dumper->cur_seq = info.seq;
++ 		}
+++>>>>>>> 13791c80b0cd (printk: avoid prb_first_valid_seq() where possible)
+  	}
+  
+  	/* last entry */
+* Unmerged path kernel/printk/printk.c
