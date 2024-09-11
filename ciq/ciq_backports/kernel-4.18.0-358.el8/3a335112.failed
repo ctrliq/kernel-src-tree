@@ -1,0 +1,120 @@
+x86/fpu: Simplify PTRACE_GETREGS code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 3a3351126ee8f1f1c86c4c79c60a650c1da89733
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/3a335112.failed
+
+ptrace() has interfaces that let a ptracer inspect a ptracee's register state.
+This includes XSAVE state.  The ptrace() ABI includes a hardware-format XSAVE
+buffer for both the SETREGS and GETREGS interfaces.
+
+In the old days, the kernel buffer and the ptrace() ABI buffer were the
+same boring non-compacted format.  But, since the advent of supervisor
+states and the compacted format, the kernel buffer has diverged from the
+format presented in the ABI.
+
+This leads to two paths in the kernel:
+1. Effectively a verbatim copy_to_user() which just copies the kernel buffer
+   out to userspace.  This is used when the kernel buffer is kept in the
+   non-compacted form which means that it shares a format with the ptrace
+   ABI.
+2. A one-state-at-a-time path: copy_xstate_to_kernel().  This is theoretically
+   slower since it does a bunch of piecemeal copies.
+
+Remove the verbatim copy case.  Speed probably does not matter in this path,
+and the vast majority of new hardware will use the one-state-at-a-time path
+anyway.  This ensures greater testing for the "slow" path.
+
+This also makes enabling PKRU in this interface easier since a single path
+can be patched instead of two.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Andy Lutomirski <luto@kernel.org>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121452.408457100@linutronix.de
+(cherry picked from commit 3a3351126ee8f1f1c86c4c79c60a650c1da89733)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/regset.c
+diff --cc arch/x86/kernel/fpu/regset.c
+index db1b7564c934,d60e77d39222..000000000000
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@@ -76,40 -74,17 +76,46 @@@ int xfpregs_set(struct task_struct *tar
+  }
+  
+  int xstateregs_get(struct task_struct *target, const struct user_regset *regset,
+ -		struct membuf to)
+ +		unsigned int pos, unsigned int count,
+ +		void *kbuf, void __user *ubuf)
+  {
+  	struct fpu *fpu = &target->thread.fpu;
+++<<<<<<< HEAD
+ +	struct xregs_state *xsave;
+ +	int ret;
+++=======
+++>>>>>>> 3a3351126ee8 (x86/fpu: Simplify PTRACE_GETREGS code)
+  
+- 	if (!boot_cpu_has(X86_FEATURE_XSAVE))
++ 	if (!cpu_feature_enabled(X86_FEATURE_XSAVE))
+  		return -ENODEV;
+  
+- 	xsave = &fpu->state.xsave;
+- 
+  	fpu__prepare_read(fpu);
+  
+++<<<<<<< HEAD
+ +	if (using_compacted_format()) {
+ +		if (kbuf)
+ +			ret = copy_xstate_to_kernel(kbuf, xsave, pos, count);
+ +		else
+ +			ret = copy_xstate_to_user(ubuf, xsave, pos, count);
+ +	} else {
+ +		fpstate_sanitize_xstate(fpu);
+ +		/*
+ +		 * Copy the 48 bytes defined by the software into the xsave
+ +		 * area in the thread struct, so that we can copy the whole
+ +		 * area to user using one user_regset_copyout().
+ +		 */
+ +		memcpy(&xsave->i387.sw_reserved, xstate_fx_sw_bytes, sizeof(xstate_fx_sw_bytes));
+ +
+ +		/*
+ +		 * Copy the xstate memory layout.
+ +		 */
+ +		ret = user_regset_copyout(&pos, &count, &kbuf, &ubuf, xsave, 0, -1);
+ +	}
+ +	return ret;
+++=======
++ 	copy_xstate_to_kernel(to, &fpu->state.xsave);
++ 	return 0;
+++>>>>>>> 3a3351126ee8 (x86/fpu: Simplify PTRACE_GETREGS code)
+  }
+  
+  int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+* Unmerged path arch/x86/kernel/fpu/regset.c
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index b679c5d6ee1e..ecf2f9871d35 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -1118,11 +1118,11 @@ static void copy_part(unsigned offset, unsigned size, void *from,
+ }
+ 
+ /*
+- * Convert from kernel XSAVES compacted format to standard format and copy
+- * to a kernel-space ptrace buffer.
++ * Convert from kernel XSAVE or XSAVES compacted format to UABI
++ * non-compacted format and copy to a kernel-space ptrace buffer.
+  *
+  * It supports partial copy but pos always starts from zero. This is called
+- * from xstateregs_get() and there we check the CPU has XSAVES.
++ * from xstateregs_get() and there we check the CPU has XSAVE.
+  */
+ int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int offset_start, unsigned int size_total)
+ {
