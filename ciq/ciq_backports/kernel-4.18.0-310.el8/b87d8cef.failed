@@ -1,0 +1,556 @@
+mm, memcg: rework remote charging API to support nesting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit b87d8cefe43c7f22e8aa13919c1dfa2b4b4b4e01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b87d8cef.failed
+
+Currently the remote memcg charging API consists of two functions:
+memalloc_use_memcg() and memalloc_unuse_memcg(), which set and clear the
+memcg value, which overwrites the memcg of the current task.
+
+  memalloc_use_memcg(target_memcg);
+  <...>
+  memalloc_unuse_memcg();
+
+It works perfectly for allocations performed from a normal context,
+however an attempt to call it from an interrupt context or just nest two
+remote charging blocks will lead to an incorrect accounting.  On exit from
+the inner block the active memcg will be cleared instead of being
+restored.
+
+  memalloc_use_memcg(target_memcg);
+
+  memalloc_use_memcg(target_memcg_2);
+    <...>
+    memalloc_unuse_memcg();
+
+    Error: allocation here are charged to the memcg of the current
+    process instead of target_memcg.
+
+  memalloc_unuse_memcg();
+
+This patch extends the remote charging API by switching to a single
+function: struct mem_cgroup *set_active_memcg(struct mem_cgroup *memcg),
+which sets the new value and returns the old one.  So a remote charging
+block will look like:
+
+  old_memcg = set_active_memcg(target_memcg);
+  <...>
+  set_active_memcg(old_memcg);
+
+This patch is heavily based on the patch by Johannes Weiner, which can be
+found here: https://lkml.org/lkml/2020/5/28/806 .
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Dan Schatzberg <dschatzberg@fb.com>
+Link: https://lkml.kernel.org/r/20200821212056.3769116-1-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b87d8cefe43c7f22e8aa13919c1dfa2b4b4b4e01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+diff --cc fs/notify/fanotify/fanotify.c
+index a7a779c62899,9167884a61ec..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -130,23 -277,297 +130,67 @@@ static u32 fanotify_group_event_mask(st
+  			continue;
+  
+  		marks_mask |= mark->mask;
+ +		marks_ignored_mask |= mark->ignored_mask;
+  	}
+  
+ -	test_mask = event_mask & marks_mask & ~marks_ignored_mask;
+ -
+ -	/*
+ -	 * For dirent modification events (create/delete/move) that do not carry
+ -	 * the child entry name information, we report FAN_ONDIR for mkdir/rmdir
+ -	 * so user can differentiate them from creat/unlink.
+ -	 *
+ -	 * For backward compatibility and consistency, do not report FAN_ONDIR
+ -	 * to user in legacy fanotify mode (reporting fd) and report FAN_ONDIR
+ -	 * to user in fid mode for all event types.
+ -	 *
+ -	 * We never report FAN_EVENT_ON_CHILD to user, but we do pass it in to
+ -	 * fanotify_alloc_event() when group is reporting fid as indication
+ -	 * that event happened on child.
+ -	 */
+ -	if (fid_mode) {
+ -		/* Do not report event flags without any event */
+ -		if (!(test_mask & ~FANOTIFY_EVENT_FLAGS))
+ -			return 0;
+ -	} else {
+ -		user_mask &= ~FANOTIFY_EVENT_FLAGS;
+ -	}
+ -
+ -	return test_mask & user_mask;
+ -}
+ -
+ -/*
+ - * Check size needed to encode fanotify_fh.
+ - *
+ - * Return size of encoded fh without fanotify_fh header.
+ - * Return 0 on failure to encode.
+ - */
+ -static int fanotify_encode_fh_len(struct inode *inode)
+ -{
+ -	int dwords = 0;
+ -
+ -	if (!inode)
+ +	if (event_mask & FS_ISDIR &&
+ +	    !(marks_mask & FS_ISDIR & ~marks_ignored_mask))
+  		return 0;
+  
+ -	exportfs_encode_inode_fh(inode, NULL, &dwords, NULL);
+ -
+ -	return dwords << 2;
+ -}
+ -
+ -/*
+ - * Encode fanotify_fh.
+ - *
+ - * Return total size of encoded fh including fanotify_fh header.
+ - * Return 0 on failure to encode.
+ - */
+ -static int fanotify_encode_fh(struct fanotify_fh *fh, struct inode *inode,
+ -			      unsigned int fh_len, gfp_t gfp)
+ -{
+ -	int dwords, type = 0;
+ -	char *ext_buf = NULL;
+ -	void *buf = fh->buf;
+ -	int err;
+ -
+ -	fh->type = FILEID_ROOT;
+ -	fh->len = 0;
+ -	fh->flags = 0;
+ -	if (!inode)
+ -		return 0;
+ -
+ -	/*
+ -	 * !gpf means preallocated variable size fh, but fh_len could
+ -	 * be zero in that case if encoding fh len failed.
+ -	 */
+ -	err = -ENOENT;
+ -	if (fh_len < 4 || WARN_ON_ONCE(fh_len % 4))
+ -		goto out_err;
+ -
+ -	/* No external buffer in a variable size allocated fh */
+ -	if (gfp && fh_len > FANOTIFY_INLINE_FH_LEN) {
+ -		/* Treat failure to allocate fh as failure to encode fh */
+ -		err = -ENOMEM;
+ -		ext_buf = kmalloc(fh_len, gfp);
+ -		if (!ext_buf)
+ -			goto out_err;
+ -
+ -		*fanotify_fh_ext_buf_ptr(fh) = ext_buf;
+ -		buf = ext_buf;
+ -		fh->flags |= FANOTIFY_FH_FLAG_EXT_BUF;
+ -	}
+ -
+ -	dwords = fh_len >> 2;
+ -	type = exportfs_encode_inode_fh(inode, buf, &dwords, NULL);
+ -	err = -EINVAL;
+ -	if (!type || type == FILEID_INVALID || fh_len != dwords << 2)
+ -		goto out_err;
+ -
+ -	fh->type = type;
+ -	fh->len = fh_len;
+ -
+ -	return FANOTIFY_FH_HDR_LEN + fh_len;
+ -
+ -out_err:
+ -	pr_warn_ratelimited("fanotify: failed to encode fid (type=%d, len=%d, err=%i)\n",
+ -			    type, fh_len, err);
+ -	kfree(ext_buf);
+ -	*fanotify_fh_ext_buf_ptr(fh) = NULL;
+ -	/* Report the event without a file identifier on encode error */
+ -	fh->type = FILEID_INVALID;
+ -	fh->len = 0;
+ -	return 0;
+ -}
+ -
+ -/*
+ - * The inode to use as identifier when reporting fid depends on the event.
+ - * Report the modified directory inode on dirent modification events.
+ - * Report the "victim" inode otherwise.
+ - * For example:
+ - * FS_ATTRIB reports the child inode even if reported on a watched parent.
+ - * FS_CREATE reports the modified dir inode and not the created inode.
+ - */
+ -static struct inode *fanotify_fid_inode(u32 event_mask, const void *data,
+ -					int data_type, struct inode *dir)
+ -{
+ -	if (event_mask & ALL_FSNOTIFY_DIRENT_EVENTS)
+ -		return dir;
+ -
+ -	return fsnotify_data_inode(data, data_type);
+ -}
+ -
+ -/*
+ - * The inode to use as identifier when reporting dir fid depends on the event.
+ - * Report the modified directory inode on dirent modification events.
+ - * Report the "victim" inode if "victim" is a directory.
+ - * Report the parent inode if "victim" is not a directory and event is
+ - * reported to parent.
+ - * Otherwise, do not report dir fid.
+ - */
+ -static struct inode *fanotify_dfid_inode(u32 event_mask, const void *data,
+ -					 int data_type, struct inode *dir)
+ -{
+ -	struct inode *inode = fsnotify_data_inode(data, data_type);
+ -
+ -	if (event_mask & ALL_FSNOTIFY_DIRENT_EVENTS)
+ -		return dir;
+ -
+ -	if (S_ISDIR(inode->i_mode))
+ -		return inode;
+ -
+ -	return dir;
+ -}
+ -
+ -static struct fanotify_event *fanotify_alloc_path_event(const struct path *path,
+ -							gfp_t gfp)
+ -{
+ -	struct fanotify_path_event *pevent;
+ -
+ -	pevent = kmem_cache_alloc(fanotify_path_event_cachep, gfp);
+ -	if (!pevent)
+ -		return NULL;
+ -
+ -	pevent->fae.type = FANOTIFY_EVENT_TYPE_PATH;
+ -	pevent->path = *path;
+ -	path_get(path);
+ -
+ -	return &pevent->fae;
+ -}
+ -
+ -static struct fanotify_event *fanotify_alloc_perm_event(const struct path *path,
+ -							gfp_t gfp)
+ -{
+ -	struct fanotify_perm_event *pevent;
+ -
+ -	pevent = kmem_cache_alloc(fanotify_perm_event_cachep, gfp);
+ -	if (!pevent)
+ -		return NULL;
+ -
+ -	pevent->fae.type = FANOTIFY_EVENT_TYPE_PATH_PERM;
+ -	pevent->response = 0;
+ -	pevent->state = FAN_EVENT_INIT;
+ -	pevent->path = *path;
+ -	path_get(path);
+ -
+ -	return &pevent->fae;
+ +	return event_mask & FANOTIFY_OUTGOING_EVENTS & marks_mask &
+ +		~marks_ignored_mask;
+  }
+  
+ -static struct fanotify_event *fanotify_alloc_fid_event(struct inode *id,
+ -						       __kernel_fsid_t *fsid,
+ -						       gfp_t gfp)
+ +struct fanotify_event_info *fanotify_alloc_event(struct fsnotify_group *group,
+ +						 struct inode *inode, u32 mask,
+ +						 const struct path *path)
+  {
+ -	struct fanotify_fid_event *ffe;
+ -
+ -	ffe = kmem_cache_alloc(fanotify_fid_event_cachep, gfp);
+ -	if (!ffe)
+ -		return NULL;
+ -
+ -	ffe->fae.type = FANOTIFY_EVENT_TYPE_FID;
+ -	ffe->fsid = *fsid;
+ -	fanotify_encode_fh(&ffe->object_fh, id, fanotify_encode_fh_len(id),
+ -			   gfp);
+ -
+ -	return &ffe->fae;
+ -}
+ -
+ -static struct fanotify_event *fanotify_alloc_name_event(struct inode *id,
+ -							__kernel_fsid_t *fsid,
+ -							const struct qstr *file_name,
+ -							struct inode *child,
+ -							gfp_t gfp)
+ -{
+ -	struct fanotify_name_event *fne;
+ -	struct fanotify_info *info;
+ -	struct fanotify_fh *dfh, *ffh;
+ -	unsigned int dir_fh_len = fanotify_encode_fh_len(id);
+ -	unsigned int child_fh_len = fanotify_encode_fh_len(child);
+ -	unsigned int size;
+ -
+ -	size = sizeof(*fne) + FANOTIFY_FH_HDR_LEN + dir_fh_len;
+ -	if (child_fh_len)
+ -		size += FANOTIFY_FH_HDR_LEN + child_fh_len;
+ -	if (file_name)
+ -		size += file_name->len + 1;
+ -	fne = kmalloc(size, gfp);
+ -	if (!fne)
+ -		return NULL;
+ -
+ -	fne->fae.type = FANOTIFY_EVENT_TYPE_FID_NAME;
+ -	fne->fsid = *fsid;
+ -	info = &fne->info;
+ -	fanotify_info_init(info);
+ -	dfh = fanotify_info_dir_fh(info);
+ -	info->dir_fh_totlen = fanotify_encode_fh(dfh, id, dir_fh_len, 0);
+ -	if (child_fh_len) {
+ -		ffh = fanotify_info_file_fh(info);
+ -		info->file_fh_totlen = fanotify_encode_fh(ffh, child, child_fh_len, 0);
+ -	}
+ -	if (file_name)
+ -		fanotify_info_copy_name(info, file_name);
+ -
+ -	pr_debug("%s: ino=%lu size=%u dir_fh_len=%u child_fh_len=%u name_len=%u name='%.*s'\n",
+ -		 __func__, id->i_ino, size, dir_fh_len, child_fh_len,
+ -		 info->name_len, info->name_len, fanotify_info_name(info));
+ -
+ -	return &fne->fae;
+ -}
+ -
+ -static struct fanotify_event *fanotify_alloc_event(struct fsnotify_group *group,
+ -						   u32 mask, const void *data,
+ -						   int data_type, struct inode *dir,
+ -						   const struct qstr *file_name,
+ -						   __kernel_fsid_t *fsid)
+ -{
+ -	struct fanotify_event *event = NULL;
+ +	struct fanotify_event_info *event = NULL;
+  	gfp_t gfp = GFP_KERNEL_ACCOUNT;
+++<<<<<<< HEAD
+++=======
++ 	struct inode *id = fanotify_fid_inode(mask, data, data_type, dir);
++ 	struct inode *dirid = fanotify_dfid_inode(mask, data, data_type, dir);
++ 	const struct path *path = fsnotify_data_path(data, data_type);
++ 	unsigned int fid_mode = FAN_GROUP_FLAG(group, FANOTIFY_FID_BITS);
++ 	struct mem_cgroup *old_memcg;
++ 	struct inode *child = NULL;
++ 	bool name_event = false;
++ 
++ 	if ((fid_mode & FAN_REPORT_DIR_FID) && dirid) {
++ 		/*
++ 		 * With both flags FAN_REPORT_DIR_FID and FAN_REPORT_FID, we
++ 		 * report the child fid for events reported on a non-dir child
++ 		 * in addition to reporting the parent fid and maybe child name.
++ 		 */
++ 		if ((fid_mode & FAN_REPORT_FID) &&
++ 		    id != dirid && !(mask & FAN_ONDIR))
++ 			child = id;
++ 
++ 		id = dirid;
++ 
++ 		/*
++ 		 * We record file name only in a group with FAN_REPORT_NAME
++ 		 * and when we have a directory inode to report.
++ 		 *
++ 		 * For directory entry modification event, we record the fid of
++ 		 * the directory and the name of the modified entry.
++ 		 *
++ 		 * For event on non-directory that is reported to parent, we
++ 		 * record the fid of the parent and the name of the child.
++ 		 *
++ 		 * Even if not reporting name, we need a variable length
++ 		 * fanotify_name_event if reporting both parent and child fids.
++ 		 */
++ 		if (!(fid_mode & FAN_REPORT_NAME)) {
++ 			name_event = !!child;
++ 			file_name = NULL;
++ 		} else if ((mask & ALL_FSNOTIFY_DIRENT_EVENTS) ||
++ 			   !(mask & FAN_ONDIR)) {
++ 			name_event = true;
++ 		}
++ 	}
+++>>>>>>> b87d8cefe43c (mm, memcg: rework remote charging API to support nesting)
+  
+  	/*
+  	 * For queues with unlimited length lost events are not expected and
+@@@ -160,36 -581,35 +204,36 @@@
+  		gfp |= __GFP_RETRY_MAYFAIL;
+  
+  	/* Whoever is interested in the event, pays for the allocation. */
+- 	memalloc_use_memcg(group->memcg);
++ 	old_memcg = set_active_memcg(group->memcg);
+  
+  	if (fanotify_is_perm_event(mask)) {
+ -		event = fanotify_alloc_perm_event(path, gfp);
+ -	} else if (name_event && (file_name || child)) {
+ -		event = fanotify_alloc_name_event(id, fsid, file_name, child,
+ -						  gfp);
+ -	} else if (fid_mode) {
+ -		event = fanotify_alloc_fid_event(id, fsid, gfp);
+ -	} else {
+ -		event = fanotify_alloc_path_event(path, gfp);
+ +		struct fanotify_perm_event_info *pevent;
+ +
+ +		pevent = kmem_cache_alloc(fanotify_perm_event_cachep, gfp);
+ +		if (!pevent)
+ +			goto out;
+ +		event = &pevent->fae;
+ +		pevent->response = 0;
+ +		goto init;
+  	}
+ -
+ +	event = kmem_cache_alloc(fanotify_event_cachep, gfp);
+  	if (!event)
+  		goto out;
+ -
+ -	/*
+ -	 * Use the victim inode instead of the watching inode as the id for
+ -	 * event queue, so event reported on parent is merged with event
+ -	 * reported on child when both directory and child watches exist.
+ -	 */
+ -	fanotify_init_event(event, (unsigned long)id, mask);
+ +init: __maybe_unused
+ +	fsnotify_init_event(&event->fse, inode, mask);
+  	if (FAN_GROUP_FLAG(group, FAN_REPORT_TID))
+  		event->pid = get_pid(task_pid(current));
+  	else
+  		event->pid = get_pid(task_tgid(current));
+ -
+ +	if (path) {
+ +		event->path = *path;
+ +		path_get(&event->path);
+ +	} else {
+ +		event->path.mnt = NULL;
+ +		event->path.dentry = NULL;
+ +	}
+  out:
+- 	memalloc_unuse_memcg();
++ 	set_active_memcg(old_memcg);
+  	return event;
+  }
+  
+diff --git a/fs/buffer.c b/fs/buffer.c
+index c60629756aca..b72139682009 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -816,13 +816,13 @@ struct buffer_head *alloc_page_buffers(struct page *page, unsigned long size,
+ 	struct buffer_head *bh, *head;
+ 	gfp_t gfp = GFP_NOFS | __GFP_ACCOUNT;
+ 	long offset;
+-	struct mem_cgroup *memcg;
++	struct mem_cgroup *memcg, *old_memcg;
+ 
+ 	if (retry)
+ 		gfp |= __GFP_NOFAIL;
+ 
+ 	memcg = get_mem_cgroup_from_page(page);
+-	memalloc_use_memcg(memcg);
++	old_memcg = set_active_memcg(memcg);
+ 
+ 	head = NULL;
+ 	offset = PAGE_SIZE;
+@@ -841,7 +841,7 @@ struct buffer_head *alloc_page_buffers(struct page *page, unsigned long size,
+ 		set_bh_page(bh, page, offset);
+ 	}
+ out:
+-	memalloc_unuse_memcg();
++	set_active_memcg(old_memcg);
+ 	mem_cgroup_put(memcg);
+ 	return head;
+ /*
+* Unmerged path fs/notify/fanotify/fanotify.c
+diff --git a/fs/notify/inotify/inotify_fsnotify.c b/fs/notify/inotify/inotify_fsnotify.c
+index 91b60f960ff9..faa1c649daf3 100644
+--- a/fs/notify/inotify/inotify_fsnotify.c
++++ b/fs/notify/inotify/inotify_fsnotify.c
+@@ -77,6 +77,7 @@ int inotify_handle_event(struct fsnotify_group *group,
+ 	int ret;
+ 	int len = 0;
+ 	int alloc_len = sizeof(struct inotify_event_info);
++	struct mem_cgroup *old_memcg;
+ 
+ 	if (WARN_ON(fsnotify_iter_vfsmount_mark(iter_info)))
+ 		return 0;
+@@ -104,9 +105,9 @@ int inotify_handle_event(struct fsnotify_group *group,
+ 	 * trigger OOM killer in the target monitoring memcg as it may have
+ 	 * security repercussion.
+ 	 */
+-	memalloc_use_memcg(group->memcg);
++	old_memcg = set_active_memcg(group->memcg);
+ 	event = kmalloc(alloc_len, GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL);
+-	memalloc_unuse_memcg();
++	set_active_memcg(old_memcg);
+ 
+ 	if (unlikely(!event)) {
+ 		/*
+diff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h
+index c49257a3b510..27ad1ad3210e 100644
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@ -309,38 +309,28 @@ static inline void memalloc_nocma_restore(unsigned int flags)
+ 
+ #ifdef CONFIG_MEMCG
+ /**
+- * memalloc_use_memcg - Starts the remote memcg charging scope.
++ * set_active_memcg - Starts the remote memcg charging scope.
+  * @memcg: memcg to charge.
+  *
+  * This function marks the beginning of the remote memcg charging scope. All the
+  * __GFP_ACCOUNT allocations till the end of the scope will be charged to the
+  * given memcg.
+  *
+- * NOTE: This function is not nesting safe.
++ * NOTE: This function can nest. Users must save the return value and
++ * reset the previous value after their own charging scope is over.
+  */
+-static inline void memalloc_use_memcg(struct mem_cgroup *memcg)
++static inline struct mem_cgroup *
++set_active_memcg(struct mem_cgroup *memcg)
+ {
+-	WARN_ON_ONCE(current->active_memcg);
++	struct mem_cgroup *old = current->active_memcg;
+ 	current->active_memcg = memcg;
+-}
+-
+-/**
+- * memalloc_unuse_memcg - Ends the remote memcg charging scope.
+- *
+- * This function marks the end of the remote memcg charging scope started by
+- * memalloc_use_memcg().
+- */
+-static inline void memalloc_unuse_memcg(void)
+-{
+-	current->active_memcg = NULL;
++	return old;
+ }
+ #else
+-static inline void memalloc_use_memcg(struct mem_cgroup *memcg)
+-{
+-}
+-
+-static inline void memalloc_unuse_memcg(void)
++static inline struct mem_cgroup *
++set_active_memcg(struct mem_cgroup *memcg)
+ {
++	return NULL;
+ }
+ #endif
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 99b152c12b07..a0a48accc7ff 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5295,12 +5295,12 @@ static struct cgroup_subsys_state * __ref
+ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ {
+ 	struct mem_cgroup *parent = mem_cgroup_from_css(parent_css);
+-	struct mem_cgroup *memcg;
++	struct mem_cgroup *memcg, *old_memcg;
+ 	long error = -ENOMEM;
+ 
+-	memalloc_use_memcg(parent);
++	old_memcg = set_active_memcg(parent);
+ 	memcg = mem_cgroup_alloc();
+-	memalloc_unuse_memcg();
++	set_active_memcg(old_memcg);
+ 	if (IS_ERR(memcg))
+ 		return ERR_CAST(memcg);
+ 
