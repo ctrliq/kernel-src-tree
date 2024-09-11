@@ -1,0 +1,230 @@
+arm64: Use common of_kexec_alloc_and_setup_fdt()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Rob Herring <robh@kernel.org>
+commit ac10be5cdbfa852139658d52c2f1c608782ce992
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/ac10be5c.failed
+
+The code for setting up the /chosen node in the device tree
+and updating the memory reservation for the next kernel has been
+moved to of_kexec_alloc_and_setup_fdt() defined in "drivers/of/kexec.c".
+
+Use the common of_kexec_alloc_and_setup_fdt() to setup the device tree
+and update the memory reservation for kexec for arm64.
+
+	Signed-off-by: Rob Herring <robh@kernel.org>
+	Signed-off-by: Lakshmi Ramasubramanian <nramas@linux.microsoft.com>
+	Reviewed-by: Thiago Jung Bauermann <bauerman@linux.ibm.com>
+	Signed-off-by: Rob Herring <robh@kernel.org>
+Link: https://lore.kernel.org/r/20210221174930.27324-7-nramas@linux.microsoft.com
+(cherry picked from commit ac10be5cdbfa852139658d52c2f1c608782ce992)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/machine_kexec_file.c
+diff --cc arch/arm64/kernel/machine_kexec_file.c
+index ebbbd493d254,63634b4d72c1..000000000000
+--- a/arch/arm64/kernel/machine_kexec_file.c
++++ b/arch/arm64/kernel/machine_kexec_file.c
+@@@ -21,15 -21,6 +21,18 @@@
+  #include <linux/string.h>
+  #include <linux/types.h>
+  #include <linux/vmalloc.h>
+++<<<<<<< HEAD
+ +#include <asm/byteorder.h>
+ +
+ +/* relevant device tree properties */
+ +#define FDT_PROP_KEXEC_ELFHDR	"linux,elfcorehdr"
+ +#define FDT_PROP_MEM_RANGE	"linux,usable-memory-range"
+ +#define FDT_PROP_INITRD_START	"linux,initrd-start"
+ +#define FDT_PROP_INITRD_END	"linux,initrd-end"
+ +#define FDT_PROP_BOOTARGS	"bootargs"
+ +#define FDT_PROP_KASLR_SEED	"kaslr-seed"
+++=======
+++>>>>>>> ac10be5cdbfa (arm64: Use common of_kexec_alloc_and_setup_fdt())
+  
+  const struct kexec_file_ops * const kexec_file_loaders[] = {
+  	&kexec_image_ops,
+@@@ -38,159 -29,16 +41,162 @@@
+  
+  int arch_kimage_file_post_load_cleanup(struct kimage *image)
+  {
+- 	vfree(image->arch.dtb);
++ 	kvfree(image->arch.dtb);
+  	image->arch.dtb = NULL;
+  
+ -	vfree(image->elf_headers);
+ -	image->elf_headers = NULL;
+ -	image->elf_headers_sz = 0;
+ +	vfree(image->arch.elf_headers);
+ +	image->arch.elf_headers = NULL;
+ +	image->arch.elf_headers_sz = 0;
+  
+  	return kexec_image_post_load_cleanup_default(image);
+  }
+  
+++<<<<<<< HEAD
+ +static int setup_dtb(struct kimage *image,
+ +		     unsigned long initrd_load_addr, unsigned long initrd_len,
+ +		     char *cmdline, void *dtb)
+ +{
+ +	int off, ret;
+ +
+ +	ret = fdt_path_offset(dtb, "/chosen");
+ +	if (ret < 0)
+ +		goto out;
+ +
+ +	off = ret;
+ +
+ +	ret = fdt_delprop(dtb, off, FDT_PROP_KEXEC_ELFHDR);
+ +	if (ret && ret != -FDT_ERR_NOTFOUND)
+ +		goto out;
+ +	ret = fdt_delprop(dtb, off, FDT_PROP_MEM_RANGE);
+ +	if (ret && ret != -FDT_ERR_NOTFOUND)
+ +		goto out;
+ +
+ +	if (image->type == KEXEC_TYPE_CRASH) {
+ +		/* add linux,elfcorehdr */
+ +		ret = fdt_appendprop_addrrange(dtb, 0, off,
+ +				FDT_PROP_KEXEC_ELFHDR,
+ +				image->arch.elf_headers_mem,
+ +				image->arch.elf_headers_sz);
+ +		if (ret)
+ +			return (ret == -FDT_ERR_NOSPACE ? -ENOMEM : -EINVAL);
+ +
+ +		/* add linux,usable-memory-range */
+ +		ret = fdt_appendprop_addrrange(dtb, 0, off,
+ +				FDT_PROP_MEM_RANGE,
+ +				crashk_res.start,
+ +				crashk_res.end - crashk_res.start + 1);
+ +		if (ret)
+ +			return (ret == -FDT_ERR_NOSPACE ? -ENOMEM : -EINVAL);
+ +	}
+ +
+ +	/* add bootargs */
+ +	if (cmdline) {
+ +		ret = fdt_setprop_string(dtb, off, FDT_PROP_BOOTARGS, cmdline);
+ +		if (ret)
+ +			goto out;
+ +	} else {
+ +		ret = fdt_delprop(dtb, off, FDT_PROP_BOOTARGS);
+ +		if (ret && (ret != -FDT_ERR_NOTFOUND))
+ +			goto out;
+ +	}
+ +
+ +	/* add initrd-* */
+ +	if (initrd_load_addr) {
+ +		ret = fdt_setprop_u64(dtb, off, FDT_PROP_INITRD_START,
+ +				      initrd_load_addr);
+ +		if (ret)
+ +			goto out;
+ +
+ +		ret = fdt_setprop_u64(dtb, off, FDT_PROP_INITRD_END,
+ +				      initrd_load_addr + initrd_len);
+ +		if (ret)
+ +			goto out;
+ +	} else {
+ +		ret = fdt_delprop(dtb, off, FDT_PROP_INITRD_START);
+ +		if (ret && (ret != -FDT_ERR_NOTFOUND))
+ +			goto out;
+ +
+ +		ret = fdt_delprop(dtb, off, FDT_PROP_INITRD_END);
+ +		if (ret && (ret != -FDT_ERR_NOTFOUND))
+ +			goto out;
+ +	}
+ +
+ +	/* add kaslr-seed */
+ +	ret = fdt_delprop(dtb, off, FDT_PROP_KASLR_SEED);
+ +	if (ret == -FDT_ERR_NOTFOUND)
+ +		ret = 0;
+ +	else if (ret)
+ +		goto out;
+ +
+ +	if (rng_is_initialized()) {
+ +		u64 seed = get_random_u64();
+ +		ret = fdt_setprop_u64(dtb, off, FDT_PROP_KASLR_SEED, seed);
+ +		if (ret)
+ +			goto out;
+ +	} else {
+ +		pr_notice("RNG is not initialised: omitting \"%s\" property\n",
+ +				FDT_PROP_KASLR_SEED);
+ +	}
+ +
+ +out:
+ +	if (ret)
+ +		return (ret == -FDT_ERR_NOSPACE) ? -ENOMEM : -EINVAL;
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * More space needed so that we can add initrd, bootargs, kaslr-seed,
+ + * rng-seed, userable-memory-range and elfcorehdr.
+ + */
+ +#define DTB_EXTRA_SPACE 0x1000
+ +
+ +static int create_dtb(struct kimage *image,
+ +		      unsigned long initrd_load_addr, unsigned long initrd_len,
+ +		      char *cmdline, void **dtb)
+ +{
+ +	void *buf;
+ +	size_t buf_size;
+ +	size_t cmdline_len;
+ +	int ret;
+ +
+ +	cmdline_len = cmdline ? strlen(cmdline) : 0;
+ +	buf_size = fdt_totalsize(initial_boot_params)
+ +			+ cmdline_len + DTB_EXTRA_SPACE;
+ +
+ +	for (;;) {
+ +		buf = vmalloc(buf_size);
+ +		if (!buf)
+ +			return -ENOMEM;
+ +
+ +		/* duplicate a device tree blob */
+ +		ret = fdt_open_into(initial_boot_params, buf, buf_size);
+ +		if (ret)
+ +			return -EINVAL;
+ +
+ +		ret = setup_dtb(image, initrd_load_addr, initrd_len,
+ +				cmdline, buf);
+ +		if (ret) {
+ +			vfree(buf);
+ +			if (ret == -ENOMEM) {
+ +				/* unlikely, but just in case */
+ +				buf_size += DTB_EXTRA_SPACE;
+ +				continue;
+ +			} else {
+ +				return ret;
+ +			}
+ +		}
+ +
+ +		/* trim it */
+ +		fdt_pack(buf);
+ +		*dtb = buf;
+ +
+ +		return 0;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> ac10be5cdbfa (arm64: Use common of_kexec_alloc_and_setup_fdt())
+  static int prepare_elf_headers(void **addr, unsigned long *sz)
+  {
+  	struct crash_mem *cmem;
+@@@ -322,6 -176,7 +331,11 @@@ int load_other_segments(struct kimage *
+  	return 0;
+  
+  out_err:
+++<<<<<<< HEAD
+ +	vfree(dtb);
+++=======
++ 	image->nr_segments = orig_segments;
++ 	kvfree(dtb);
+++>>>>>>> ac10be5cdbfa (arm64: Use common of_kexec_alloc_and_setup_fdt())
+  	return ret;
+  }
+* Unmerged path arch/arm64/kernel/machine_kexec_file.c
