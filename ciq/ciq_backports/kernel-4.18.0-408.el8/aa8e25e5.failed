@@ -1,0 +1,280 @@
+scsi: core: Use scsi_cmd_to_rq() instead of scsi_cmnd.request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit aa8e25e5006aac52c943c84e9056ab488630ee19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/aa8e25e5.failed
+
+Prepare for removal of the request pointer by using scsi_cmd_to_rq()
+instead. Cast away constness where necessary when passing a SCSI command
+pointer to scsi_cmd_to_rq(). This patch does not change any functionality.
+
+Link: https://lore.kernel.org/r/20210809230355.8186-3-bvanassche@acm.org
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit aa8e25e5006aac52c943c84e9056ab488630ee19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+#	include/scsi/scsi_cmnd.h
+diff --cc drivers/scsi/scsi_lib.c
+index 4fab3e007b39,909a422ec8f4..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1006,13 -979,24 +1008,20 @@@ void scsi_io_completion(struct scsi_cmn
+   */
+  blk_status_t scsi_alloc_sgtables(struct scsi_cmnd *cmd)
+  {
+++<<<<<<< HEAD
+ +	struct request *rq = cmd->request;
+++=======
++ 	struct scsi_device *sdev = cmd->device;
++ 	struct request *rq = scsi_cmd_to_rq(cmd);
++ 	unsigned short nr_segs = blk_rq_nr_phys_segments(rq);
++ 	struct scatterlist *last_sg = NULL;
+++>>>>>>> aa8e25e5006a (scsi: core: Use scsi_cmd_to_rq() instead of scsi_cmnd.request)
+  	blk_status_t ret;
+ -	bool need_drain = scsi_cmd_needs_dma_drain(sdev, rq);
+  	int count;
+  
+ -	if (WARN_ON_ONCE(!nr_segs))
+ +	if (WARN_ON_ONCE(!blk_rq_nr_phys_segments(rq)))
+  		return BLK_STS_IOERR;
+  
+ -	/*
+ -	 * Make sure there is space for the drain.  The driver must adjust
+ -	 * max_hw_segments to be prepared for this.
+ -	 */
+ -	if (need_drain)
+ -		nr_segs++;
+ -
+  	/*
+  	 * If sg table allocation fails, requeue request later.
+  	 */
+@@@ -1136,10 -1114,10 +1145,10 @@@ void scsi_init_command(struct scsi_devi
+  {
+  	void *buf = cmd->sense_buffer;
+  	void *prot = cmd->prot_sdb;
+- 	struct request *rq = blk_mq_rq_from_pdu(cmd);
++ 	struct request *rq = scsi_cmd_to_rq(cmd);
+  	unsigned int flags = cmd->flags & SCMD_PRESERVED_FLAGS;
+  	unsigned long jiffies_at_alloc;
+ -	int retries, to_clear;
+ +	int retries;
+  	bool in_flight;
+  	int budget_token = cmd->budget_token;
+  
+diff --cc include/scsi/scsi_cmnd.h
+index 7ef7e5064741,b9265b15d37a..000000000000
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@@ -186,10 -164,11 +186,12 @@@ static inline void *scsi_cmd_priv(struc
+  /* make sure not to use it with passthrough commands */
+  static inline struct scsi_driver *scsi_cmd_to_driver(struct scsi_cmnd *cmd)
+  {
+- 	return *(struct scsi_driver **)cmd->request->rq_disk->private_data;
++ 	struct request *rq = scsi_cmd_to_rq(cmd);
++ 
++ 	return *(struct scsi_driver **)rq->rq_disk->private_data;
+  }
+  
+ +extern void scsi_put_command(struct scsi_cmnd *);
+  extern void scsi_finish_command(struct scsi_cmnd *cmd);
+  
+  extern void *scsi_kmap_atomic_sg(struct scatterlist *sg, int sg_count,
+@@@ -249,6 -228,18 +251,21 @@@ static inline int scsi_sg_copy_to_buffe
+  				 buf, buflen);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline sector_t scsi_get_sector(struct scsi_cmnd *scmd)
++ {
++ 	return blk_rq_pos(scsi_cmd_to_rq(scmd));
++ }
++ 
++ static inline sector_t scsi_get_lba(struct scsi_cmnd *scmd)
++ {
++ 	unsigned int shift = ilog2(scmd->device->sector_size) - SECTOR_SHIFT;
++ 
++ 	return blk_rq_pos(scsi_cmd_to_rq(scmd)) >> shift;
++ }
++ 
+++>>>>>>> aa8e25e5006a (scsi: core: Use scsi_cmd_to_rq() instead of scsi_cmnd.request)
+  /*
+   * The operations below are hints that tell the controller driver how
+   * to handle I/Os with DIF or similar types of protection information.
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index 4ae39056dc81..1e6b864b1a0c 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -232,7 +232,7 @@ void scsi_finish_command(struct scsi_cmnd *cmd)
+ 				"(result %x)\n", cmd->result));
+ 
+ 	good_bytes = scsi_bufflen(cmd);
+-	if (!blk_rq_is_passthrough(cmd->request)) {
++	if (!blk_rq_is_passthrough(scsi_cmd_to_rq(cmd))) {
+ 		int old_good_bytes = good_bytes;
+ 		drv = scsi_cmd_to_driver(cmd);
+ 		if (drv->done)
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index 04670c98a190..4441d00f90cf 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -267,7 +267,7 @@ scsi_abort_command(struct scsi_cmnd *scmd)
+  */
+ static void scsi_eh_reset(struct scsi_cmnd *scmd)
+ {
+-	if (!blk_rq_is_passthrough(scmd->request)) {
++	if (!blk_rq_is_passthrough(scsi_cmd_to_rq(scmd))) {
+ 		struct scsi_driver *sdrv = scsi_cmd_to_driver(scmd);
+ 		if (sdrv->eh_reset)
+ 			sdrv->eh_reset(scmd);
+@@ -1212,7 +1212,7 @@ static int scsi_request_sense(struct scsi_cmnd *scmd)
+ 
+ static int scsi_eh_action(struct scsi_cmnd *scmd, int rtn)
+ {
+-	if (!blk_rq_is_passthrough(scmd->request)) {
++	if (!blk_rq_is_passthrough(scsi_cmd_to_rq(scmd))) {
+ 		struct scsi_driver *sdrv = scsi_cmd_to_driver(scmd);
+ 		if (sdrv->eh_action)
+ 			rtn = sdrv->eh_action(scmd, rtn);
+@@ -1778,22 +1778,24 @@ static void scsi_eh_offline_sdevs(struct list_head *work_q,
+  */
+ int scsi_noretry_cmd(struct scsi_cmnd *scmd)
+ {
++	struct request *req = scsi_cmd_to_rq(scmd);
++
+ 	switch (host_byte(scmd->result)) {
+ 	case DID_OK:
+ 		break;
+ 	case DID_TIME_OUT:
+ 		goto check_type;
+ 	case DID_BUS_BUSY:
+-		return (scmd->request->cmd_flags & REQ_FAILFAST_TRANSPORT);
++		return req->cmd_flags & REQ_FAILFAST_TRANSPORT;
+ 	case DID_PARITY:
+-		return (scmd->request->cmd_flags & REQ_FAILFAST_DEV);
++		return req->cmd_flags & REQ_FAILFAST_DEV;
+ 	case DID_ERROR:
+ 		if (msg_byte(scmd->result) == COMMAND_COMPLETE &&
+ 		    status_byte(scmd->result) == RESERVATION_CONFLICT)
+ 			return 0;
+ 		/* fall through */
+ 	case DID_SOFT_ERROR:
+-		return (scmd->request->cmd_flags & REQ_FAILFAST_DRIVER);
++		return req->cmd_flags & REQ_FAILFAST_DRIVER;
+ 	}
+ 
+ 	if (status_byte(scmd->result) != CHECK_CONDITION)
+@@ -1804,8 +1806,7 @@ int scsi_noretry_cmd(struct scsi_cmnd *scmd)
+ 	 * assume caller has checked sense and determined
+ 	 * the check condition was retryable.
+ 	 */
+-	if (scmd->request->cmd_flags & REQ_FAILFAST_DEV ||
+-	    blk_rq_is_passthrough(scmd->request))
++	if (req->cmd_flags & REQ_FAILFAST_DEV || blk_rq_is_passthrough(req))
+ 		return 1;
+ 
+ 	return 0;
+* Unmerged path drivers/scsi/scsi_lib.c
+diff --git a/drivers/scsi/scsi_logging.c b/drivers/scsi/scsi_logging.c
+index e11b88ac6207..61b0bc8c0ef4 100644
+--- a/drivers/scsi/scsi_logging.c
++++ b/drivers/scsi/scsi_logging.c
+@@ -28,8 +28,9 @@ static void scsi_log_release_buffer(char *bufptr)
+ 
+ static inline const char *scmd_name(const struct scsi_cmnd *scmd)
+ {
+-	return scmd->request->rq_disk ?
+-		scmd->request->rq_disk->disk_name : NULL;
++	struct request *rq = scsi_cmd_to_rq((struct scsi_cmnd *)scmd);
++
++	return rq->rq_disk ? rq->rq_disk->disk_name : NULL;
+ }
+ 
+ static size_t sdev_format_header(char *logbuf, size_t logbuf_len,
+@@ -91,7 +92,7 @@ void scmd_printk(const char *level, const struct scsi_cmnd *scmd,
+ 	if (!logbuf)
+ 		return;
+ 	off = sdev_format_header(logbuf, logbuf_len, scmd_name(scmd),
+-				 scmd->request->tag);
++				 scsi_cmd_to_rq((struct scsi_cmnd *)scmd)->tag);
+ 	if (off < logbuf_len) {
+ 		va_start(args, fmt);
+ 		off += vscnprintf(logbuf + off, logbuf_len - off, fmt, args);
+@@ -188,7 +189,7 @@ void scsi_print_command(struct scsi_cmnd *cmd)
+ 		return;
+ 
+ 	off = sdev_format_header(logbuf, logbuf_len,
+-				 scmd_name(cmd), cmd->request->tag);
++				 scmd_name(cmd), scsi_cmd_to_rq(cmd)->tag);
+ 	if (off >= logbuf_len)
+ 		goto out_printk;
+ 	off += scnprintf(logbuf + off, logbuf_len - off, "CDB: ");
+@@ -210,7 +211,7 @@ void scsi_print_command(struct scsi_cmnd *cmd)
+ 
+ 			off = sdev_format_header(logbuf, logbuf_len,
+ 						 scmd_name(cmd),
+-						 cmd->request->tag);
++						 scsi_cmd_to_rq(cmd)->tag);
+ 			if (!WARN_ON(off > logbuf_len - 58)) {
+ 				off += scnprintf(logbuf + off, logbuf_len - off,
+ 						 "CDB[%02x]: ", k);
+@@ -373,7 +374,8 @@ EXPORT_SYMBOL(__scsi_print_sense);
+ /* Normalize and print sense buffer in SCSI command */
+ void scsi_print_sense(const struct scsi_cmnd *cmd)
+ {
+-	scsi_log_print_sense(cmd->device, scmd_name(cmd), cmd->request->tag,
++	scsi_log_print_sense(cmd->device, scmd_name(cmd),
++			     scsi_cmd_to_rq((struct scsi_cmnd *)cmd)->tag,
+ 			     cmd->sense_buffer, SCSI_SENSE_BUFFERSIZE);
+ }
+ EXPORT_SYMBOL(scsi_print_sense);
+@@ -392,8 +394,8 @@ void scsi_print_result(const struct scsi_cmnd *cmd, const char *msg,
+ 	if (!logbuf)
+ 		return;
+ 
+-	off = sdev_format_header(logbuf, logbuf_len,
+-				 scmd_name(cmd), cmd->request->tag);
++	off = sdev_format_header(logbuf, logbuf_len, scmd_name(cmd),
++				 scsi_cmd_to_rq((struct scsi_cmnd *)cmd)->tag);
+ 
+ 	if (off >= logbuf_len)
+ 		goto out_printk;
+* Unmerged path include/scsi/scsi_cmnd.h
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 72e28ed30288..6f2d05d671bf 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -274,13 +274,15 @@ sdev_prefix_printk(const char *, const struct scsi_device *, const char *,
+ __printf(3, 4) void
+ scmd_printk(const char *, const struct scsi_cmnd *, const char *, ...);
+ 
+-#define scmd_dbg(scmd, fmt, a...)					   \
+-	do {								   \
+-		if ((scmd)->request->rq_disk)				   \
+-			sdev_dbg((scmd)->device, "[%s] " fmt,		   \
+-				 (scmd)->request->rq_disk->disk_name, ##a);\
+-		else							   \
+-			sdev_dbg((scmd)->device, fmt, ##a);		   \
++#define scmd_dbg(scmd, fmt, a...)					\
++	do {								\
++		struct request *__rq = scsi_cmd_to_rq((scmd));		\
++									\
++		if (__rq->rq_disk)					\
++			sdev_dbg((scmd)->device, "[%s] " fmt,		\
++				 __rq->rq_disk->disk_name, ##a);	\
++		else							\
++			sdev_dbg((scmd)->device, fmt, ##a);		\
+ 	} while (0)
+ 
+ enum scsi_target_state {
