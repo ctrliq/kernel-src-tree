@@ -1,0 +1,256 @@
+xdp: Make devmap flush_list common for all map instances
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit 96360004b8628541f5d05a845ea213267db0b1a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/96360004.failed
+
+The devmap flush list is used to track entries that need to flushed
+from via the xdp_do_flush_map() function. This list used to be
+per-map, but there is really no reason for that. Instead make the
+flush list global for all devmaps, which simplifies __dev_map_flush()
+and dev_map_init_map().
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20191219061006.21980-6-bjorn.topel@gmail.com
+(cherry picked from commit 96360004b8628541f5d05a845ea213267db0b1a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/devmap.c
+#	net/core/filter.c
+diff --cc include/linux/bpf.h
+index 7e979978776e,31191804ca09..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -753,7 -958,8 +753,12 @@@ struct xdp_buff
+  struct sk_buff;
+  
+  struct bpf_dtab_netdev *__dev_map_lookup_elem(struct bpf_map *map, u32 key);
+++<<<<<<< HEAD
+ +void __dev_map_flush(struct bpf_map *map);
+++=======
++ struct bpf_dtab_netdev *__dev_map_hash_lookup_elem(struct bpf_map *map, u32 key);
++ void __dev_map_flush(void);
+++>>>>>>> 96360004b862 (xdp: Make devmap flush_list common for all map instances)
+  int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp,
+  		    struct net_device *dev_rx);
+  int dev_map_generic_redirect(struct bpf_dtab_netdev *dst, struct sk_buff *skb,
+@@@ -847,7 -1062,13 +852,17 @@@ static inline struct net_device  *__dev
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void __dev_map_flush(struct bpf_map *map)
+++=======
++ static inline struct net_device  *__dev_map_hash_lookup_elem(struct bpf_map *map,
++ 							     u32 key)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void __dev_map_flush(void)
+++>>>>>>> 96360004b862 (xdp: Make devmap flush_list common for all map instances)
+  {
+  }
+  
+diff --cc kernel/bpf/devmap.c
+index cfc445b29247,da9c832fc5c8..000000000000
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@@ -75,18 -74,43 +75,23 @@@ struct bpf_dtab_netdev 
+  
+  struct bpf_dtab {
+  	struct bpf_map map;
+++<<<<<<< HEAD
+ +	struct bpf_dtab_netdev **netdev_map;
+ +	struct list_head __percpu *flush_list;
+++=======
++ 	struct bpf_dtab_netdev **netdev_map; /* DEVMAP type only */
+++>>>>>>> 96360004b862 (xdp: Make devmap flush_list common for all map instances)
+  	struct list_head list;
+ -
+ -	/* these are only used for DEVMAP_HASH type maps */
+ -	struct hlist_head *dev_index_head;
+ -	spinlock_t index_lock;
+ -	unsigned int items;
+ -	u32 n_buckets;
+  };
+  
++ static DEFINE_PER_CPU(struct list_head, dev_map_flush_list);
+  static DEFINE_SPINLOCK(dev_map_lock);
+  static LIST_HEAD(dev_map_list);
+  
+ -static struct hlist_head *dev_map_create_hash(unsigned int entries)
+ -{
+ -	int i;
+ -	struct hlist_head *hash;
+ -
+ -	hash = kmalloc_array(entries, sizeof(*hash), GFP_KERNEL);
+ -	if (hash != NULL)
+ -		for (i = 0; i < entries; i++)
+ -			INIT_HLIST_HEAD(&hash[i]);
+ -
+ -	return hash;
+ -}
+ -
+ -static inline struct hlist_head *dev_map_index_hash(struct bpf_dtab *dtab,
+ -						    int idx)
+ -{
+ -	return &dtab->dev_index_head[idx & (dtab->n_buckets - 1)];
+ -}
+ -
+  static int dev_map_init_map(struct bpf_dtab *dtab, union bpf_attr *attr)
+  {
+- 	int err, cpu;
+- 	u64 cost;
++ 	u64 cost = 0;
++ 	int err;
+  
+  	/* check sanity of attributes */
+  	if (attr->max_entries == 0 || attr->key_size != 4 ||
+@@@ -101,27 -125,34 +106,55 @@@
+  
+  	bpf_map_init_from_attr(&dtab->map, attr);
+  
+++<<<<<<< HEAD
+ +	/* make sure page count doesn't overflow */
+ +	cost = (u64) dtab->map.max_entries * sizeof(struct bpf_dtab_netdev *);
+ +	cost += sizeof(struct list_head) * num_possible_cpus();
+++=======
++ 	if (attr->map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
++ 		dtab->n_buckets = roundup_pow_of_two(dtab->map.max_entries);
++ 
++ 		if (!dtab->n_buckets) /* Overflow check */
++ 			return -EINVAL;
++ 		cost += (u64) sizeof(struct hlist_head) * dtab->n_buckets;
++ 	} else {
++ 		cost += (u64) dtab->map.max_entries * sizeof(struct bpf_dtab_netdev *);
++ 	}
+++>>>>>>> 96360004b862 (xdp: Make devmap flush_list common for all map instances)
+  
+  	/* if map size is larger than memlock limit, reject it */
+  	err = bpf_map_charge_init(&dtab->map.memory, cost);
+  	if (err)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	dtab->flush_list = alloc_percpu(struct list_head);
+ +	if (!dtab->flush_list)
+ +		goto free_charge;
+ +
+ +	for_each_possible_cpu(cpu)
+ +		INIT_LIST_HEAD(per_cpu_ptr(dtab->flush_list, cpu));
+ +
+ +	dtab->netdev_map = bpf_map_area_alloc(dtab->map.max_entries *
+ +					      sizeof(struct bpf_dtab_netdev *),
+ +					      dtab->map.numa_node);
+ +	if (!dtab->netdev_map)
+ +		goto free_percpu;
+++=======
++ 	if (attr->map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
++ 		dtab->dev_index_head = dev_map_create_hash(dtab->n_buckets);
++ 		if (!dtab->dev_index_head)
++ 			goto free_charge;
++ 
++ 		spin_lock_init(&dtab->index_lock);
++ 	} else {
++ 		dtab->netdev_map = bpf_map_area_alloc(dtab->map.max_entries *
++ 						      sizeof(struct bpf_dtab_netdev *),
++ 						      dtab->map.numa_node);
++ 		if (!dtab->netdev_map)
++ 			goto free_charge;
++ 	}
+++>>>>>>> 96360004b862 (xdp: Make devmap flush_list common for all map instances)
+  
+  	return 0;
+  
+@@@ -180,32 -209,39 +211,35 @@@ static void dev_map_free(struct bpf_ma
+  	/* Make sure prior __dev_map_entry_free() have completed. */
+  	rcu_barrier();
+  
+ -	if (dtab->map.map_type == BPF_MAP_TYPE_DEVMAP_HASH) {
+ -		for (i = 0; i < dtab->n_buckets; i++) {
+ -			struct bpf_dtab_netdev *dev;
+ -			struct hlist_head *head;
+ -			struct hlist_node *next;
+ -
+ -			head = dev_map_index_hash(dtab, i);
+ -
+ -			hlist_for_each_entry_safe(dev, next, head, index_hlist) {
+ -				hlist_del_rcu(&dev->index_hlist);
+ -				free_percpu(dev->bulkq);
+ -				dev_put(dev->dev);
+ -				kfree(dev);
+ -			}
+ -		}
+ +	/* To ensure all pending flush operations have completed wait for flush
+ +	 * list to empty on _all_ cpus.
+ +	 * Because the above synchronize_rcu() ensures the map is disconnected
+ +	 * from the program we can assume no new items will be added.
+ +	 */
+ +	for_each_online_cpu(cpu) {
+ +		struct list_head *flush_list = per_cpu_ptr(dtab->flush_list, cpu);
+  
+ -		kfree(dtab->dev_index_head);
+ -	} else {
+ -		for (i = 0; i < dtab->map.max_entries; i++) {
+ -			struct bpf_dtab_netdev *dev;
+ +		while (!list_empty(flush_list))
+ +			cond_resched();
+ +	}
+  
+ -			dev = dtab->netdev_map[i];
+ -			if (!dev)
+ -				continue;
+ +	for (i = 0; i < dtab->map.max_entries; i++) {
+ +		struct bpf_dtab_netdev *dev;
+  
+ -			free_percpu(dev->bulkq);
+ -			dev_put(dev->dev);
+ -			kfree(dev);
+ -		}
+ +		dev = dtab->netdev_map[i];
+ +		if (!dev)
+ +			continue;
+  
+ -		bpf_map_area_free(dtab->netdev_map);
+ +		free_percpu(dev->bulkq);
+ +		dev_put(dev->dev);
+ +		kfree(dev);
+  	}
+  
+++<<<<<<< HEAD
+ +	free_percpu(dtab->flush_list);
+ +	bpf_map_area_free(dtab->netdev_map);
+++=======
+++>>>>>>> 96360004b862 (xdp: Make devmap flush_list common for all map instances)
+  	kfree(dtab);
+  }
+  
+diff --cc net/core/filter.c
+index 190010f4836a,b7570cb84902..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -3567,7 -3554,8 +3567,12 @@@ void xdp_do_flush_map(void
+  	if (map) {
+  		switch (map->map_type) {
+  		case BPF_MAP_TYPE_DEVMAP:
+++<<<<<<< HEAD
+ +			__dev_map_flush(map);
+++=======
++ 		case BPF_MAP_TYPE_DEVMAP_HASH:
++ 			__dev_map_flush();
+++>>>>>>> 96360004b862 (xdp: Make devmap flush_list common for all map instances)
+  			break;
+  		case BPF_MAP_TYPE_CPUMAP:
+  			__cpu_map_flush(map);
+* Unmerged path include/linux/bpf.h
+* Unmerged path kernel/bpf/devmap.c
+* Unmerged path net/core/filter.c
