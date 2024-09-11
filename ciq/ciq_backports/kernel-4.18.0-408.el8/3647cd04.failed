@@ -1,0 +1,123 @@
+KVM: MMU: change kvm_faultin_pfn() arguments to kvm_page_fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 3647cd04b7d07c0c47d4dd11900a3d7bed8b9797
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/3647cd04.failed
+
+Add fields to struct kvm_page_fault corresponding to outputs of
+kvm_faultin_pfn().  For now they have to be extracted again from struct
+kvm_page_fault in the subsequent steps, but this is temporary until
+other functions in the chain are switched over as well.
+
+	Suggested-by: Isaku Yamahata <isaku.yamahata@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3647cd04b7d07c0c47d4dd11900a3d7bed8b9797)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index bc36e41e904d,c2d2d019634b..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -3906,9 -3939,9 +3905,15 @@@ static bool kvm_faultin_pfn(struct kvm_
+  			goto out_retry;
+  	}
+  
+++<<<<<<< HEAD
+ +	*pfn = __gfn_to_pfn_memslot(slot, gfn, false, NULL,
+ +				    write, writable, hva);
+ +	return false;
+++=======
++ 	fault->pfn = __gfn_to_pfn_memslot(slot, fault->gfn, false, NULL,
++ 					  fault->write, &fault->map_writable,
++ 					  &fault->hva);
+++>>>>>>> 3647cd04b7d0 (KVM: MMU: change kvm_faultin_pfn() arguments to kvm_page_fault)
+  
+  out_retry:
+  	*r = RET_PF_RETRY;
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index 58b438826461..fab42fbcbc31 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -134,6 +134,11 @@ struct kvm_page_fault {
+ 
+ 	/* Shifted addr, or result of guest page table walk if addr is a gva.  */
+ 	gfn_t gfn;
++
++	/* Outputs of kvm_faultin_pfn.  */
++	kvm_pfn_t pfn;
++	hva_t hva;
++	bool map_writable;
+ };
+ 
+ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index de3ee26beb48..f6c9e99f3c5e 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -839,10 +839,8 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	u32 error_code = fault->error_code;
+ 	struct guest_walker walker;
+ 	int r;
+-	kvm_pfn_t pfn;
+-	hva_t hva;
+ 	unsigned long mmu_seq;
+-	bool map_writable, is_self_change_mapping;
++	bool is_self_change_mapping;
+ 
+ 	pgprintk("%s: addr %lx err %x\n", __func__, addr, error_code);
+ 	WARN_ON_ONCE(fault->is_tdp);
+@@ -892,11 +890,10 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	mmu_seq = vcpu->kvm->mmu_notifier_seq;
+ 	smp_rmb();
+ 
+-	if (kvm_faultin_pfn(vcpu, fault->prefault, fault->gfn, addr, &pfn, &hva,
+-			    fault->write, &map_writable, &r))
++	if (kvm_faultin_pfn(vcpu, fault, &r))
+ 		return r;
+ 
+-	if (handle_abnormal_pfn(vcpu, addr, fault->gfn, pfn, walker.pte_access, &r))
++	if (handle_abnormal_pfn(vcpu, addr, fault->gfn, fault->pfn, walker.pte_access, &r))
+ 		return r;
+ 
+ 	/*
+@@ -904,7 +901,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	 * we will cache the incorrect access into mmio spte.
+ 	 */
+ 	if (fault->write && !(walker.pte_access & ACC_WRITE_MASK) &&
+-	    !is_cr0_wp(vcpu->arch.mmu) && !fault->user && !is_noslot_pfn(pfn)) {
++	    !is_cr0_wp(vcpu->arch.mmu) && !fault->user && !is_noslot_pfn(fault->pfn)) {
+ 		walker.pte_access |= ACC_WRITE_MASK;
+ 		walker.pte_access &= ~ACC_USER_MASK;
+ 
+@@ -920,20 +917,20 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 
+ 	r = RET_PF_RETRY;
+ 	write_lock(&vcpu->kvm->mmu_lock);
+-	if (!is_noslot_pfn(pfn) && mmu_notifier_retry_hva(vcpu->kvm, mmu_seq, hva))
++	if (!is_noslot_pfn(fault->pfn) && mmu_notifier_retry_hva(vcpu->kvm, mmu_seq, fault->hva))
+ 		goto out_unlock;
+ 
+ 	kvm_mmu_audit(vcpu, AUDIT_PRE_PAGE_FAULT);
+ 	r = make_mmu_pages_available(vcpu);
+ 	if (r)
+ 		goto out_unlock;
+-	r = FNAME(fetch)(vcpu, addr, &walker, error_code, fault->max_level, pfn,
+-			 map_writable, fault->prefault);
++	r = FNAME(fetch)(vcpu, addr, &walker, error_code, fault->max_level, fault->pfn,
++			 fault->map_writable, fault->prefault);
+ 	kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
+ 
+ out_unlock:
+ 	write_unlock(&vcpu->kvm->mmu_lock);
+-	kvm_release_pfn_clean(pfn);
++	kvm_release_pfn_clean(fault->pfn);
+ 	return r;
+ }
+ 
