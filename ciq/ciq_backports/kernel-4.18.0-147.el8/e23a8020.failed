@@ -1,0 +1,235 @@
+s390/kexec_file: Signature verification prototype
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Philipp Rudo <prudo@linux.ibm.com>
+commit e23a8020ce4e094e10d717d39a8ce799243bf8c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/e23a8020.failed
+
+Add kernel signature verification to kexec_file. The verification is based
+on module signature verification and works with kernel images signed via
+scripts/sign-file.
+
+	Signed-off-by: Philipp Rudo <prudo@linux.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit e23a8020ce4e094e10d717d39a8ce799243bf8c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/configs/debug_defconfig
+#	arch/s390/configs/performance_defconfig
+#	arch/s390/defconfig
+diff --cc arch/s390/configs/debug_defconfig
+index 941d8cc6c9f5,b0920b35f87b..000000000000
+--- a/arch/s390/configs/debug_defconfig
++++ b/arch/s390/configs/debug_defconfig
+@@@ -64,6 -64,9 +64,12 @@@ CONFIG_NUMA=
+  CONFIG_PREEMPT=y
+  CONFIG_HZ_100=y
+  CONFIG_KEXEC_FILE=y
+++<<<<<<< HEAD
+++=======
++ CONFIG_KEXEC_VERIFY_SIG=y
++ CONFIG_EXPOLINE=y
++ CONFIG_EXPOLINE_AUTO=y
+++>>>>>>> e23a8020ce4e (s390/kexec_file: Signature verification prototype)
+  CONFIG_MEMORY_HOTPLUG=y
+  CONFIG_MEMORY_HOTREMOVE=y
+  CONFIG_KSM=y
+diff --cc arch/s390/configs/performance_defconfig
+index eb6f75f24208,09aa5cb14873..000000000000
+--- a/arch/s390/configs/performance_defconfig
++++ b/arch/s390/configs/performance_defconfig
+@@@ -65,6 -65,9 +65,12 @@@ CONFIG_NR_CPUS=51
+  CONFIG_NUMA=y
+  CONFIG_HZ_100=y
+  CONFIG_KEXEC_FILE=y
+++<<<<<<< HEAD
+++=======
++ CONFIG_KEXEC_VERIFY_SIG=y
++ CONFIG_EXPOLINE=y
++ CONFIG_EXPOLINE_AUTO=y
+++>>>>>>> e23a8020ce4e (s390/kexec_file: Signature verification prototype)
+  CONFIG_MEMORY_HOTPLUG=y
+  CONFIG_MEMORY_HOTREMOVE=y
+  CONFIG_KSM=y
+diff --cc arch/s390/defconfig
+index 20add000dd6d,c59b922cb6c5..000000000000
+--- a/arch/s390/defconfig
++++ b/arch/s390/defconfig
+@@@ -34,6 -34,16 +34,19 @@@ CONFIG_BPF_SYSCALL=
+  CONFIG_USERFAULTFD=y
+  # CONFIG_COMPAT_BRK is not set
+  CONFIG_PROFILING=y
+++<<<<<<< HEAD
+++=======
++ CONFIG_LIVEPATCH=y
++ CONFIG_NR_CPUS=256
++ CONFIG_NUMA=y
++ CONFIG_HZ_100=y
++ CONFIG_KEXEC_FILE=y
++ CONFIG_KEXEC_VERIFY_SIG=y
++ CONFIG_CRASH_DUMP=y
++ CONFIG_HIBERNATION=y
++ CONFIG_PM_DEBUG=y
++ CONFIG_CMM=m
+++>>>>>>> e23a8020ce4e (s390/kexec_file: Signature verification prototype)
+  CONFIG_OPROFILE=y
+  CONFIG_KPROBES=y
+  CONFIG_JUMP_LABEL=y
+diff --git a/arch/s390/Kconfig b/arch/s390/Kconfig
+index 1f96a5c2db9f..68f256a3347f 100644
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -545,6 +545,17 @@ config ARCH_HAS_KEXEC_PURGATORY
+ 	def_bool y
+ 	depends on KEXEC_FILE
+ 
++config KEXEC_VERIFY_SIG
++	bool "Verify kernel signature during kexec_file_load() syscall"
++	depends on KEXEC_FILE && SYSTEM_DATA_VERIFICATION
++	help
++	  This option makes kernel signature verification mandatory for
++	  the kexec_file_load() syscall.
++
++	  In addition to that option, you need to enable signature
++	  verification for the corresponding kernel image type being
++	  loaded in order for this to work.
++
+ config ARCH_RANDOM
+ 	def_bool y
+ 	prompt "s390 architectural random number generation API"
+* Unmerged path arch/s390/configs/debug_defconfig
+* Unmerged path arch/s390/configs/performance_defconfig
+* Unmerged path arch/s390/defconfig
+diff --git a/arch/s390/include/asm/kexec.h b/arch/s390/include/asm/kexec.h
+index 9ec077b0fb4d..59026899e766 100644
+--- a/arch/s390/include/asm/kexec.h
++++ b/arch/s390/include/asm/kexec.h
+@@ -65,6 +65,7 @@ struct s390_load_data {
+ 	size_t memsz;
+ };
+ 
++int s390_verify_sig(const char *kernel, unsigned long kernel_len);
+ void *kexec_file_add_components(struct kimage *image,
+ 				int (*add_kernel)(struct kimage *image,
+ 						  struct s390_load_data *data));
+diff --git a/arch/s390/kernel/kexec_elf.c b/arch/s390/kernel/kexec_elf.c
+index 42bcd93f4318..01e45d89b636 100644
+--- a/arch/s390/kernel/kexec_elf.c
++++ b/arch/s390/kernel/kexec_elf.c
+@@ -125,4 +125,7 @@ static int s390_elf_probe(const char *buf, unsigned long len)
+ const struct kexec_file_ops s390_kexec_elf_ops = {
+ 	.probe = s390_elf_probe,
+ 	.load = s390_elf_load,
++#ifdef CONFIG_KEXEC_VERIFY_SIG
++	.verify_sig = s390_verify_sig,
++#endif /* CONFIG_KEXEC_VERIFY_SIG */
+ };
+diff --git a/arch/s390/kernel/kexec_image.c b/arch/s390/kernel/kexec_image.c
+index 7281540605b7..c378bbac5b35 100644
+--- a/arch/s390/kernel/kexec_image.c
++++ b/arch/s390/kernel/kexec_image.c
+@@ -54,4 +54,7 @@ static int s390_image_probe(const char *buf, unsigned long len)
+ const struct kexec_file_ops s390_kexec_image_ops = {
+ 	.probe = s390_image_probe,
+ 	.load = s390_image_load,
++#ifdef CONFIG_KEXEC_VERIFY_SIG
++	.verify_sig = s390_verify_sig,
++#endif /* CONFIG_KEXEC_VERIFY_SIG */
+ };
+diff --git a/arch/s390/kernel/machine_kexec_file.c b/arch/s390/kernel/machine_kexec_file.c
+index 0e2a5a7a1b7c..e0f6e618e1bf 100644
+--- a/arch/s390/kernel/machine_kexec_file.c
++++ b/arch/s390/kernel/machine_kexec_file.c
+@@ -8,7 +8,11 @@
+  */
+ 
+ #include <linux/elf.h>
++#include <linux/errno.h>
+ #include <linux/kexec.h>
++#include <linux/module.h>
++#include <linux/verification.h>
++#include <asm/ipl.h>
+ #include <asm/setup.h>
+ 
+ const struct kexec_file_ops * const kexec_file_loaders[] = {
+@@ -17,6 +21,76 @@ const struct kexec_file_ops * const kexec_file_loaders[] = {
+ 	NULL,
+ };
+ 
++#ifdef CONFIG_KEXEC_VERIFY_SIG
++/*
++ * Module signature information block.
++ *
++ * The constituents of the signature section are, in order:
++ *
++ *	- Signer's name
++ *	- Key identifier
++ *	- Signature data
++ *	- Information block
++ */
++struct module_signature {
++	u8	algo;		/* Public-key crypto algorithm [0] */
++	u8	hash;		/* Digest algorithm [0] */
++	u8	id_type;	/* Key identifier type [PKEY_ID_PKCS7] */
++	u8	signer_len;	/* Length of signer's name [0] */
++	u8	key_id_len;	/* Length of key identifier [0] */
++	u8	__pad[3];
++	__be32	sig_len;	/* Length of signature data */
++};
++
++#define PKEY_ID_PKCS7 2
++
++int s390_verify_sig(const char *kernel, unsigned long kernel_len)
++{
++	const unsigned long marker_len = sizeof(MODULE_SIG_STRING) - 1;
++	struct module_signature *ms;
++	unsigned long sig_len;
++
++	/* Skip signature verification when not secure IPLed. */
++	if (!ipl_secure_flag)
++		return 0;
++
++	if (marker_len > kernel_len)
++		return -EKEYREJECTED;
++
++	if (memcmp(kernel + kernel_len - marker_len, MODULE_SIG_STRING,
++		   marker_len))
++		return -EKEYREJECTED;
++	kernel_len -= marker_len;
++
++	ms = (void *)kernel + kernel_len - sizeof(*ms);
++	kernel_len -= sizeof(*ms);
++
++	sig_len = be32_to_cpu(ms->sig_len);
++	if (sig_len >= kernel_len)
++		return -EKEYREJECTED;
++	kernel_len -= sig_len;
++
++	if (ms->id_type != PKEY_ID_PKCS7)
++		return -EKEYREJECTED;
++
++	if (ms->algo != 0 ||
++	    ms->hash != 0 ||
++	    ms->signer_len != 0 ||
++	    ms->key_id_len != 0 ||
++	    ms->__pad[0] != 0 ||
++	    ms->__pad[1] != 0 ||
++	    ms->__pad[2] != 0) {
++		return -EBADMSG;
++	}
++
++	return verify_pkcs7_signature(kernel, kernel_len,
++				      kernel + kernel_len, sig_len,
++				      VERIFY_USE_PLATFORM_KEYRING,
++				      VERIFYING_MODULE_SIGNATURE,
++				      NULL, NULL);
++}
++#endif /* CONFIG_KEXEC_VERIFY_SIG */
++
+ static int kexec_file_update_purgatory(struct kimage *image,
+ 				       struct s390_load_data *data)
+ {
