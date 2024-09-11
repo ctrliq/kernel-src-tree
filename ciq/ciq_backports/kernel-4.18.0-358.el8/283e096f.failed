@@ -1,0 +1,168 @@
+serial: 8250: Deduplicate ->rs485_config() callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Lukas Wunner <lukas@wunner.de>
+commit 283e096ffb7077c2b677eee043ff36965e43d37b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/283e096f.failed
+
+Commit e490c9144cfa ("tty: Add software emulated RS485 support for 8250")
+introduced support to use RTS as an rs485 Transmit Enable signal.
+Drivers opt in to the feature by calling serial8250_em485_init() from
+their ->rs485_config() callback.
+
+So far there are two drivers doing that, 8250_omap.c and 8250_of.c.
+Both use an identical callback.  We're about to add a third user of that
+callback, therefore deduplicate it and move it to 8250_port.c.
+
+Drivers now opt in to rs485 software emulation by assigning the generic
+serial8250_rs485_config() callback introduced herein to their
+.rs485_config struct member.  This change allows unexporting
+serial8250_em485_init() and declaring it static.
+
+	Signed-off-by: Lukas Wunner <lukas@wunner.de>
+	Cc: Matwey V. Kornilov <matwey@sai.msu.ru>
+	Cc: Heiko Schocher <hs@denx.de>
+Link: https://lore.kernel.org/r/fcef63642dc4eae41ae7842d23747b2bf5d40285.1582895077.git.lukas@wunner.de
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 283e096ffb7077c2b677eee043ff36965e43d37b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/serial/8250/8250_of.c
+#	drivers/tty/serial/8250/8250_omap.c
+diff --cc drivers/tty/serial/8250/8250_of.c
+index f7e76c160d0a,4a68a8785caa..000000000000
+--- a/drivers/tty/serial/8250/8250_of.c
++++ b/drivers/tty/serial/8250/8250_of.c
+@@@ -150,6 -154,7 +150,10 @@@ static int of_platform_serial_setup(str
+  		port->flags |= UPF_SKIP_TEST;
+  
+  	port->dev = &ofdev->dev;
+++<<<<<<< HEAD
+++=======
++ 	port->rs485_config = serial8250_em485_config;
+++>>>>>>> 283e096ffb70 (serial: 8250: Deduplicate ->rs485_config() callback)
+  
+  	switch (type) {
+  	case PORT_RT2880:
+diff --cc drivers/tty/serial/8250/8250_omap.c
+index 23156d57d732,fff70cb25046..000000000000
+--- a/drivers/tty/serial/8250/8250_omap.c
++++ b/drivers/tty/serial/8250/8250_omap.c
+@@@ -1191,25 -1157,12 +1161,30 @@@ static int omap8250_probe(struct platfo
+  	up.port.shutdown = omap_8250_shutdown;
+  	up.port.throttle = omap_8250_throttle;
+  	up.port.unthrottle = omap_8250_unthrottle;
+++<<<<<<< HEAD
+ +	up.port.rs485_config = omap_8250_rs485_config;
+++=======
++ 	up.port.rs485_config = serial8250_em485_config;
++ 	up.port.has_sysrq = IS_ENABLED(CONFIG_SERIAL_8250_CONSOLE);
+++>>>>>>> 283e096ffb70 (serial: 8250: Deduplicate ->rs485_config() callback)
+ +
+ +	if (pdev->dev.of_node) {
+ +		const struct of_device_id *id;
+ +
+ +		ret = of_alias_get_id(pdev->dev.of_node, "serial");
+ +
+ +		of_property_read_u32(pdev->dev.of_node, "clock-frequency",
+ +				     &up.port.uartclk);
+ +		priv->wakeirq = irq_of_parse_and_map(pdev->dev.of_node, 1);
+  
+ -	ret = of_alias_get_id(np, "serial");
+ +		id = of_match_device(of_match_ptr(omap8250_dt_ids), &pdev->dev);
+ +		if (id && id->data)
+ +			priv->habit |= *(u8 *)id->data;
+ +	} else {
+ +		ret = pdev->id;
+ +	}
+  	if (ret < 0) {
+ -		dev_err(&pdev->dev, "failed to get alias\n");
+ +		dev_err(&pdev->dev, "failed to get alias/pdev id\n");
+  		return ret;
+  	}
+  	up.port.line = ret;
+diff --git a/drivers/tty/serial/8250/8250.h b/drivers/tty/serial/8250/8250.h
+index d58d44a7ebb6..48522b59abdb 100644
+--- a/drivers/tty/serial/8250/8250.h
++++ b/drivers/tty/serial/8250/8250.h
+@@ -136,7 +136,7 @@ void serial8250_rpm_put(struct uart_8250_port *p);
+ void serial8250_rpm_get_tx(struct uart_8250_port *p);
+ void serial8250_rpm_put_tx(struct uart_8250_port *p);
+ 
+-int serial8250_em485_init(struct uart_8250_port *p);
++int serial8250_em485_config(struct uart_port *port, struct serial_rs485 *rs485);
+ void serial8250_em485_destroy(struct uart_8250_port *p);
+ 
+ /* MCR <-> TIOCM conversion */
+* Unmerged path drivers/tty/serial/8250/8250_of.c
+* Unmerged path drivers/tty/serial/8250/8250_omap.c
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index df6900256379..f40aea952c85 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -627,7 +627,7 @@ EXPORT_SYMBOL_GPL(serial8250_rpm_put);
+  *
+  *	Return 0 - success, -errno - otherwise
+  */
+-int serial8250_em485_init(struct uart_8250_port *p)
++static int serial8250_em485_init(struct uart_8250_port *p)
+ {
+ 	if (p->em485)
+ 		return 0;
+@@ -648,7 +648,6 @@ int serial8250_em485_init(struct uart_8250_port *p)
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL_GPL(serial8250_em485_init);
+ 
+ /**
+  *	serial8250_em485_destroy() - put uart_8250_port into normal state
+@@ -676,6 +675,44 @@ void serial8250_em485_destroy(struct uart_8250_port *p)
+ }
+ EXPORT_SYMBOL_GPL(serial8250_em485_destroy);
+ 
++/**
++ * serial8250_em485_config() - generic ->rs485_config() callback
++ * @port: uart port
++ * @rs485: rs485 settings
++ *
++ * Generic callback usable by 8250 uart drivers to activate rs485 settings
++ * if the uart is incapable of driving RTS as a Transmit Enable signal in
++ * hardware, relying on software emulation instead.
++ */
++int serial8250_em485_config(struct uart_port *port, struct serial_rs485 *rs485)
++{
++	struct uart_8250_port *up = up_to_u8250p(port);
++
++	/* clamp the delays to [0, 100ms] */
++	rs485->delay_rts_before_send = min(rs485->delay_rts_before_send, 100U);
++	rs485->delay_rts_after_send  = min(rs485->delay_rts_after_send, 100U);
++
++	port->rs485 = *rs485;
++
++	/*
++	 * Both serial8250_em485_init() and serial8250_em485_destroy()
++	 * are idempotent.
++	 */
++	if (rs485->flags & SER_RS485_ENABLED) {
++		int ret = serial8250_em485_init(up);
++
++		if (ret) {
++			rs485->flags &= ~SER_RS485_ENABLED;
++			port->rs485.flags &= ~SER_RS485_ENABLED;
++		}
++		return ret;
++	}
++
++	serial8250_em485_destroy(up);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(serial8250_em485_config);
++
+ /*
+  * These two wrappers ensure that enable_runtime_pm_tx() can be called more than
+  * once and disable_runtime_pm_tx() will still disable RPM because the fifo is
