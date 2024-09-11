@@ -1,0 +1,152 @@
+RDMA/restrack: Convert internal DB from hash to XArray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit fd47c2f99f04249d1ba82c422d1818dcbe193908
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/fd47c2f9.failed
+
+The additions of .doit callbacks posses new access pattern to the resource
+entries by some user visible index. Back then, the legacy DB was
+implemented as hash because per-index access wasn't needed and XArray
+wasn't accepted yet.
+
+Acceptance of XArray together with per-index access requires the refresh
+of DB implementation.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit fd47c2f99f04249d1ba82c422d1818dcbe193908)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/restrack.c
+#	include/rdma/restrack.h
+diff --cc drivers/infiniband/core/restrack.c
+index bd7770ed4174,b4f302811858..000000000000
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@@ -12,10 -12,26 +12,33 @@@
+  
+  #include "cma_priv.h"
+  
+++<<<<<<< HEAD
+ +static int fill_res_noop(struct sk_buff *msg,
+ +			 struct rdma_restrack_entry *entry)
+ +{
+ +	return 0;
+++=======
++ static int rt_xa_alloc_cyclic(struct xarray *xa, u32 *id, void *entry,
++ 			      u32 *next)
++ {
++ 	int err;
++ 
++ 	*id = *next;
++ 	if (*next == U32_MAX)
++ 		*id = 0;
++ 
++ 	xa_lock(xa);
++ 	err = __xa_alloc(xa, id, U32_MAX, entry, GFP_KERNEL);
++ 	if (err && *next != U32_MAX) {
++ 		*id = 0;
++ 		err = __xa_alloc(xa, id, *next, entry, GFP_KERNEL);
++ 	}
++ 
++ 	if (!err)
++ 		*next = *id + 1;
++ 	xa_unlock(xa);
++ 	return err;
+++>>>>>>> fd47c2f99f04 (RDMA/restrack: Convert internal DB from hash to XArray)
+  }
+  
+  /**
+@@@ -25,9 -41,12 +48,13 @@@
+  void rdma_restrack_init(struct ib_device *dev)
+  {
+  	struct rdma_restrack_root *res = &dev->res;
++ 	int i;
++ 
++ 	for (i = 0 ; i < RDMA_RESTRACK_MAX; i++)
++ 		xa_init_flags(&res->xa[i], XA_FLAGS_ALLOC);
+  
+  	init_rwsem(&res->rwsem);
+ +	res->fill_res_entry = fill_res_noop;
+  }
+  
+  static const char *type2str(enum rdma_restrack_type type)
+diff --cc include/rdma/restrack.h
+index f756fc48eee5,16e11b4c3ec3..000000000000
+--- a/include/rdma/restrack.h
++++ b/include/rdma/restrack.h
+@@@ -62,16 -62,17 +62,28 @@@ struct rdma_restrack_root 
+  	 */
+  	struct rw_semaphore	rwsem;
+  	/**
+- 	 * @hash: global database for all resources per-device
++ 	 * @xa: Array of XArray structures to hold restrack entries.
++ 	 * We want to use array of XArrays because insertion is type
++ 	 * dependent. For types with xisiting unique ID (like QPN),
++ 	 * we will insert to that unique index. For other types,
++ 	 * we insert based on pointers and auto-allocate unique index.
+  	 */
+++<<<<<<< HEAD
+ +	DECLARE_HASHTABLE(hash, RDMA_RESTRACK_HASH_BITS);
+ +	/**
+ +	 * @fill_res_entry: driver-specific fill function
+ +	 *
+ +	 * Allows rdma drivers to add their own restrack attributes.
+ +	 */
+ +	int (*fill_res_entry)(struct sk_buff *msg,
+ +			      struct rdma_restrack_entry *entry);
+++=======
++ 	struct xarray xa[RDMA_RESTRACK_MAX];
++ 	/**
++ 	 * @next_id: Next ID to support cyclic allocation
++ 	 */
++ 	u32 next_id[RDMA_RESTRACK_MAX];
+++>>>>>>> fd47c2f99f04 (RDMA/restrack: Convert internal DB from hash to XArray)
+  };
+  
+  /**
+diff --git a/drivers/infiniband/core/nldev.c b/drivers/infiniband/core/nldev.c
+index efccd8e0fb77..91d88e958a48 100644
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -962,6 +962,7 @@ static int res_get_common_dumpit(struct sk_buff *skb,
+ 	int start = cb->args[0];
+ 	bool has_cap_net_admin;
+ 	struct nlmsghdr *nlh;
++	unsigned long id;
+ 	u32 index, port = 0;
+ 	bool filled = false;
+ 
+@@ -1012,7 +1013,12 @@ static int res_get_common_dumpit(struct sk_buff *skb,
+ 	has_cap_net_admin = netlink_capable(cb->skb, CAP_NET_ADMIN);
+ 
+ 	down_read(&device->res.rwsem);
+-	hash_for_each_possible(device->res.hash, res, node, res_type) {
++	/*
++	 * FIXME: if the skip ahead is something common this loop should
++	 * use xas_for_each & xas_pause to optimize, we can have a lot of
++	 * objects.
++	 */
++	xa_for_each(&device->res.xa[res_type], id, res) {
+ 		if (idx < start)
+ 			goto next;
+ 
+@@ -1039,11 +1045,6 @@ static int res_get_common_dumpit(struct sk_buff *skb,
+ 		rdma_restrack_put(res);
+ 
+ 		if (ret == -EMSGSIZE)
+-			/*
+-			 * There is a chance to optimize here.
+-			 * It can be done by using list_prepare_entry
+-			 * and list_for_each_entry_continue afterwards.
+-			 */
+ 			break;
+ 		if (ret)
+ 			goto res_err;
+* Unmerged path drivers/infiniband/core/restrack.c
+* Unmerged path include/rdma/restrack.h
