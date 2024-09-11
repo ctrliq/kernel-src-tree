@@ -1,0 +1,535 @@
+s390/vfio-ap: implement in-use callback for vfio_ap driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit 3f85d1df26a9d9b0d1a5237c580e085c41d6bf50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/3f85d1df.failed
+
+Let's implement the callback to indicate when an APQN
+is in use by the vfio_ap device driver. The callback is
+invoked whenever a change to the apmask or aqmask would
+result in one or more queue devices being removed from the driver. The
+vfio_ap device driver will indicate a resource is in use
+if the APQN of any of the queue devices to be removed are assigned to
+any of the matrix mdevs under the driver's control.
+
+There is potential for a deadlock condition between the
+matrix_dev->guests_lock used to lock the guest during assignment of
+adapters and domains and the ap_perms_mutex locked by the AP bus when
+changes are made to the sysfs apmask/aqmask attributes.
+
+The AP Perms lock controls access to the objects that store the adapter
+numbers (ap_perms) and domain numbers (aq_perms) for the sysfs
+/sys/bus/ap/apmask and /sys/bus/ap/aqmask attributes. These attributes
+identify which queues are reserved for the zcrypt default device drivers.
+Before allowing a bit to be removed from either mask, the AP bus must check
+with the vfio_ap device driver to verify that none of the queues are
+assigned to any of its mediated devices.
+
+The apmask/aqmask attributes can be written or read at any time from
+userspace, so care must be taken to prevent a deadlock with asynchronous
+operations that might be taking place in the vfio_ap device driver. For
+example, consider the following:
+
+1. A system administrator assigns an adapter to a mediated device under the
+   control of the vfio_ap device driver. The driver will need to first take
+   the matrix_dev->guests_lock to potentially hot plug the adapter into
+   the KVM guest.
+2. At the same time, a system administrator sets a bit in the sysfs
+   /sys/bus/ap/ap_mask attribute. To complete the operation, the AP bus
+   must:
+   a. Take the ap_perms_mutex lock to update the object storing the values
+      for the /sys/bus/ap/ap_mask attribute.
+   b. Call the vfio_ap device driver's in-use callback to verify that the
+      queues now being reserved for the default zcrypt drivers are not
+      assigned to a mediated device owned by the vfio_ap device driver. To
+      do the verification, the in-use callback function takes the
+      matrix_dev->guests_lock, but has to wait because it is already held
+      by the operation in 1 above.
+3. The vfio_ap device driver calls an AP bus function to verify that the
+   new queues resulting from the assignment of the adapter in step 1 are
+   not reserved for the default zcrypt device driver. This AP bus function
+   tries to take the ap_perms_mutex lock but gets stuck waiting for the
+   waiting for the lock due to step 2a above.
+
+Consequently, we have the following deadlock situation:
+
+matrix_dev->guests_lock locked (1)
+ap_perms_mutex lock locked (2a)
+Waiting for matrix_dev->gusts_lock (2b) which is currently held (1)
+Waiting for ap_perms_mutex lock (3) which is currently held (2a)
+
+To prevent this deadlock scenario, the function called in step 3 will no
+longer take the ap_perms_mutex lock and require the caller to take the
+lock. The lock will be the first taken by the adapter/domain assignment
+functions in the vfio_ap device driver to maintain the proper locking
+order.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 3f85d1df26a9d9b0d1a5237c580e085c41d6bf50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+#	drivers/s390/crypto/vfio_ap_drv.c
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 2a615a843237,7d5261113181..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -934,14 -853,10 +945,17 @@@ int ap_owned_by_def_drv(int card, int q
+  	if (card < 0 || card >= AP_DEVICES || queue < 0 || queue >= AP_DOMAINS)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ap_perms_mutex);
+ +
+ +	if (test_bit_inv(card, ap_perms.apm)
+ +	    && test_bit_inv(queue, ap_perms.aqm))
+++=======
++ 	if (test_bit_inv(card, ap_perms.apm) &&
++ 	    test_bit_inv(queue, ap_perms.aqm))
+++>>>>>>> 3f85d1df26a9 (s390/vfio-ap: implement in-use callback for vfio_ap driver)
+  		rc = 1;
+  
+- 	mutex_unlock(&ap_perms_mutex);
+- 
+  	return rc;
+  }
+  EXPORT_SYMBOL(ap_owned_by_def_drv);
+diff --cc drivers/s390/crypto/vfio_ap_drv.c
+index f3c2a490a1b5,2572fb0f0f54..000000000000
+--- a/drivers/s390/crypto/vfio_ap_drv.c
++++ b/drivers/s390/crypto/vfio_ap_drv.c
+@@@ -44,122 -43,10 +44,128 @@@ static struct ap_device_id ap_queue_ids
+  	{ /* end of sibling */ },
+  };
+  
+ +MODULE_DEVICE_TABLE(vfio_ap, ap_queue_ids);
+ +
+ +static struct ap_matrix_mdev *vfio_ap_mdev_for_queue(struct vfio_ap_queue *q)
+ +{
+ +	struct ap_matrix_mdev *matrix_mdev;
+ +	unsigned long apid = AP_QID_CARD(q->apqn);
+ +	unsigned long apqi = AP_QID_QUEUE(q->apqn);
+ +
+ +	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
+ +		if (test_bit_inv(apid, matrix_mdev->matrix.apm) &&
+ +		    test_bit_inv(apqi, matrix_mdev->matrix.aqm))
+ +			return matrix_mdev;
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+ +static ssize_t status_show(struct device *dev,
+ +			   struct device_attribute *attr,
+ +			   char *buf)
+ +{
+ +	ssize_t nchars = 0;
+ +	struct vfio_ap_queue *q;
+ +	struct ap_matrix_mdev *matrix_mdev;
+ +	struct ap_device *apdev = to_ap_dev(dev);
+ +
+ +	mutex_lock(&matrix_dev->lock);
+ +	q = dev_get_drvdata(&apdev->device);
+ +	matrix_mdev = vfio_ap_mdev_for_queue(q);
+ +
+ +	if (matrix_mdev) {
+ +		if (matrix_mdev->kvm)
+ +			nchars = scnprintf(buf, PAGE_SIZE, "%s\n",
+ +					   AP_QUEUE_IN_USE);
+ +		else
+ +			nchars = scnprintf(buf, PAGE_SIZE, "%s\n",
+ +					   AP_QUEUE_ASSIGNED);
+ +	} else {
+ +		nchars = scnprintf(buf, PAGE_SIZE, "%s\n",
+ +				   AP_QUEUE_UNASSIGNED);
+ +	}
+ +
+ +	mutex_unlock(&matrix_dev->lock);
+ +
+ +	return nchars;
+ +}
+ +
+ +static DEVICE_ATTR_RO(status);
+ +
+ +static struct attribute *vfio_queue_attrs[] = {
+ +	&dev_attr_status.attr,
+ +	NULL,
+ +};
+ +
+ +static const struct attribute_group vfio_queue_attr_group = {
+ +	.attrs = vfio_queue_attrs,
+ +};
+ +
+ +/**
+ + * vfio_ap_queue_dev_probe: Allocate a vfio_ap_queue structure and associate it
+ + *			    with the device as driver_data.
+ + *
+ + * @apdev: the AP device being probed
+ + *
+ + * Return: returns 0 if the probe succeeded; otherwise, returns an error if
+ + *	   storage could not be allocated for a vfio_ap_queue object or the
+ + *	   sysfs 'status' attribute could not be created for the queue device.
+ + */
+ +static int vfio_ap_queue_dev_probe(struct ap_device *apdev)
+ +{
+ +	int ret;
+ +	struct vfio_ap_queue *q;
+ +
+ +	q = kzalloc(sizeof(*q), GFP_KERNEL);
+ +	if (!q)
+ +		return -ENOMEM;
+ +
+ +	mutex_lock(&matrix_dev->lock);
+ +	dev_set_drvdata(&apdev->device, q);
+ +	q->apqn = to_ap_queue(&apdev->device)->qid;
+ +	q->saved_isc = VFIO_AP_ISC_INVALID;
+ +
+ +	ret = sysfs_create_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ +	if (ret) {
+ +		dev_set_drvdata(&apdev->device, NULL);
+ +		kfree(q);
+ +	}
+ +
+ +	mutex_unlock(&matrix_dev->lock);
+ +
+ +	return ret;
+ +}
+ +
+ +/**
+ + * vfio_ap_queue_dev_remove: Free the associated vfio_ap_queue structure.
+ + *
+ + * @apdev: the AP device being removed
+ + *
+ + * Takes the matrix lock to avoid actions on this device while doing the remove.
+ + */
+ +static void vfio_ap_queue_dev_remove(struct ap_device *apdev)
+ +{
+ +	struct vfio_ap_queue *q;
+ +
+ +	mutex_lock(&matrix_dev->lock);
+ +	sysfs_remove_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ +	q = dev_get_drvdata(&apdev->device);
+ +	vfio_ap_mdev_reset_queue(q, 1);
+ +	dev_set_drvdata(&apdev->device, NULL);
+ +	kfree(q);
+ +	mutex_unlock(&matrix_dev->lock);
+ +}
+ +
+  static struct ap_driver vfio_ap_drv = {
+++<<<<<<< HEAD
+ +	.probe = vfio_ap_queue_dev_probe,
+ +	.remove = vfio_ap_queue_dev_remove,
+++=======
++ 	.probe = vfio_ap_mdev_probe_queue,
++ 	.remove = vfio_ap_mdev_remove_queue,
++ 	.in_use = vfio_ap_mdev_resource_in_use,
+++>>>>>>> 3f85d1df26a9 (s390/vfio-ap: implement in-use callback for vfio_ap driver)
+  	.ids = ap_queue_ids,
+  };
+  
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index 69b05ef08538,4a864fc5b788..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -560,6 -906,41 +560,44 @@@ static int vfio_ap_mdev_verify_no_shari
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * vfio_ap_mdev_validate_masks - verify that the APQNs assigned to the mdev are
++  *				 not reserved for the default zcrypt driver and
++  *				 are not assigned to another mdev.
++  *
++  * @matrix_mdev: the mdev to which the APQNs being validated are assigned.
++  *
++  * Return: One of the following values:
++  * o the error returned from the ap_apqn_in_matrix_owned_by_def_drv() function,
++  *   most likely -EBUSY indicating the ap_perms_mutex lock is already held.
++  * o EADDRNOTAVAIL if an APQN assigned to @matrix_mdev is reserved for the
++  *		   zcrypt default driver.
++  * o EADDRINUSE if an APQN assigned to @matrix_mdev is assigned to another mdev
++  * o A zero indicating validation succeeded.
++  */
++ static int vfio_ap_mdev_validate_masks(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	if (ap_apqn_in_matrix_owned_by_def_drv(matrix_mdev->matrix.apm,
++ 					       matrix_mdev->matrix.aqm))
++ 		return -EADDRNOTAVAIL;
++ 
++ 	return vfio_ap_mdev_verify_no_sharing(matrix_mdev->matrix.apm,
++ 					      matrix_mdev->matrix.aqm);
++ }
++ 
++ static void vfio_ap_mdev_link_adapter(struct ap_matrix_mdev *matrix_mdev,
++ 				      unsigned long apid)
++ {
++ 	unsigned long apqi;
++ 
++ 	for_each_set_bit_inv(apqi, matrix_mdev->matrix.aqm, AP_DOMAINS)
++ 		vfio_ap_mdev_link_apqn(matrix_mdev,
++ 				       AP_MKQID(apid, apqi));
++ }
++ 
+++>>>>>>> 3f85d1df26a9 (s390/vfio-ap: implement in-use callback for vfio_ap driver)
+  /**
+   * assign_adapter_store - parses the APID from @buf and sets the
+   * corresponding bit in the mediated matrix device's APM
+@@@ -596,16 -981,11 +638,21 @@@ static ssize_t assign_adapter_store(str
+  {
+  	int ret;
+  	unsigned long apid;
+ -	DECLARE_BITMAP(apm_delta, AP_DEVICES);
+ -	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(dev);
+ +	struct mdev_device *mdev = mdev_from_dev(dev);
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&matrix_dev->lock);
+ +
+ +	/* If the KVM guest is running, disallow assignment of adapter */
+ +	if (matrix_mdev->kvm) {
+ +		ret = -EBUSY;
+ +		goto done;
+ +	}
+++=======
++ 	mutex_lock(&ap_perms_mutex);
++ 	get_update_locks_for_mdev(matrix_mdev);
+++>>>>>>> 3f85d1df26a9 (s390/vfio-ap: implement in-use callback for vfio_ap driver)
+  
+  	ret = kstrtoul(buf, 0, &apid);
+  	if (ret)
+@@@ -616,28 -996,26 +663,33 @@@
+  		goto done;
+  	}
+  
+ -	set_bit_inv(apid, matrix_mdev->matrix.apm);
+ -
+ -	ret = vfio_ap_mdev_validate_masks(matrix_mdev);
+ -	if (ret) {
+ -		clear_bit_inv(apid, matrix_mdev->matrix.apm);
+ +	/*
+ +	 * Set the bit in the AP mask (APM) corresponding to the AP adapter
+ +	 * number (APID). The bits in the mask, from most significant to least
+ +	 * significant bit, correspond to APIDs 0-255.
+ +	 */
+ +	ret = vfio_ap_mdev_verify_queues_reserved_for_apid(matrix_mdev, apid);
+ +	if (ret)
+  		goto done;
+ -	}
+  
+ -	vfio_ap_mdev_link_adapter(matrix_mdev, apid);
+ -	memset(apm_delta, 0, sizeof(apm_delta));
+ -	set_bit_inv(apid, apm_delta);
+ +	set_bit_inv(apid, matrix_mdev->matrix.apm);
+  
+ -	if (vfio_ap_mdev_filter_matrix(apm_delta,
+ -				       matrix_mdev->matrix.aqm, matrix_mdev))
+ -		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
+ +	ret = vfio_ap_mdev_verify_no_sharing(matrix_mdev);
+ +	if (ret)
+ +		goto share_err;
+  
+  	ret = count;
+ +	goto done;
+ +
+ +share_err:
+ +	clear_bit_inv(apid, matrix_mdev->matrix.apm);
+  done:
+++<<<<<<< HEAD
+ +	mutex_unlock(&matrix_dev->lock);
+++=======
++ 	release_update_locks_for_mdev(matrix_mdev);
++ 	mutex_unlock(&ap_perms_mutex);
+++>>>>>>> 3f85d1df26a9 (s390/vfio-ap: implement in-use callback for vfio_ap driver)
+  
+  	return ret;
+  }
+@@@ -748,17 -1180,11 +804,22 @@@ static ssize_t assign_domain_store(stru
+  {
+  	int ret;
+  	unsigned long apqi;
+ -	DECLARE_BITMAP(aqm_delta, AP_DOMAINS);
+ -	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(dev);
+ +	struct mdev_device *mdev = mdev_from_dev(dev);
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+ +	unsigned long max_apqi = matrix_mdev->matrix.aqm_max;
+ +
+++<<<<<<< HEAD
+ +	mutex_lock(&matrix_dev->lock);
+  
+ +	/* If the KVM guest is running, disallow assignment of domain */
+ +	if (matrix_mdev->kvm) {
+ +		ret = -EBUSY;
+ +		goto done;
+ +	}
+++=======
++ 	mutex_lock(&ap_perms_mutex);
++ 	get_update_locks_for_mdev(matrix_mdev);
+++>>>>>>> 3f85d1df26a9 (s390/vfio-ap: implement in-use callback for vfio_ap driver)
+  
+  	ret = kstrtoul(buf, 0, &apqi);
+  	if (ret)
+@@@ -768,23 -1195,26 +829,28 @@@
+  		goto done;
+  	}
+  
+ -	set_bit_inv(apqi, matrix_mdev->matrix.aqm);
+ -
+ -	ret = vfio_ap_mdev_validate_masks(matrix_mdev);
+ -	if (ret) {
+ -		clear_bit_inv(apqi, matrix_mdev->matrix.aqm);
+ +	ret = vfio_ap_mdev_verify_queues_reserved_for_apqi(matrix_mdev, apqi);
+ +	if (ret)
+  		goto done;
+ -	}
+  
+ -	vfio_ap_mdev_link_domain(matrix_mdev, apqi);
+ -	memset(aqm_delta, 0, sizeof(aqm_delta));
+ -	set_bit_inv(apqi, aqm_delta);
+ +	set_bit_inv(apqi, matrix_mdev->matrix.aqm);
+  
+ -	if (vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm, aqm_delta,
+ -				       matrix_mdev))
+ -		vfio_ap_mdev_update_guest_apcb(matrix_mdev);
+ +	ret = vfio_ap_mdev_verify_no_sharing(matrix_mdev);
+ +	if (ret)
+ +		goto share_err;
+  
+  	ret = count;
+ +	goto done;
+ +
+ +share_err:
+ +	clear_bit_inv(apqi, matrix_mdev->matrix.aqm);
+  done:
+++<<<<<<< HEAD
+ +	mutex_unlock(&matrix_dev->lock);
+++=======
++ 	release_update_locks_for_mdev(matrix_mdev);
++ 	mutex_unlock(&ap_perms_mutex);
+++>>>>>>> 3f85d1df26a9 (s390/vfio-ap: implement in-use callback for vfio_ap driver)
+  
+  	return ret;
+  }
+@@@ -1383,4 -1863,98 +1449,31 @@@ int vfio_ap_mdev_register(void
+  void vfio_ap_mdev_unregister(void)
+  {
+  	mdev_unregister_device(&matrix_dev->device);
+ -	mdev_unregister_driver(&vfio_ap_matrix_driver);
+ -}
+ -
+ -int vfio_ap_mdev_probe_queue(struct ap_device *apdev)
+ -{
+ -	int ret;
+ -	struct vfio_ap_queue *q;
+ -	struct ap_matrix_mdev *matrix_mdev;
+ -
+ -	ret = sysfs_create_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ -	if (ret)
+ -		return ret;
+ -
+ -	q = kzalloc(sizeof(*q), GFP_KERNEL);
+ -	if (!q)
+ -		return -ENOMEM;
+ -
+ -	q->apqn = to_ap_queue(&apdev->device)->qid;
+ -	q->saved_isc = VFIO_AP_ISC_INVALID;
+ -	matrix_mdev = get_update_locks_by_apqn(q->apqn);
+ -
+ -	if (matrix_mdev) {
+ -		vfio_ap_mdev_link_queue(matrix_mdev, q);
+ -
+ -		if (vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm,
+ -					       matrix_mdev->matrix.aqm,
+ -					       matrix_mdev))
+ -			vfio_ap_mdev_update_guest_apcb(matrix_mdev);
+ -	}
+ -	dev_set_drvdata(&apdev->device, q);
+ -	release_update_locks_for_mdev(matrix_mdev);
+ -
+ -	return 0;
+ -}
+ -
+ -void vfio_ap_mdev_remove_queue(struct ap_device *apdev)
+ -{
+ -	unsigned long apid, apqi;
+ -	struct vfio_ap_queue *q;
+ -	struct ap_matrix_mdev *matrix_mdev;
+ -
+ -	sysfs_remove_group(&apdev->device.kobj, &vfio_queue_attr_group);
+ -	q = dev_get_drvdata(&apdev->device);
+ -	get_update_locks_for_queue(q);
+ -	matrix_mdev = q->matrix_mdev;
+ -
+ -	if (matrix_mdev) {
+ -		vfio_ap_unlink_queue_fr_mdev(q);
+ -
+ -		apid = AP_QID_CARD(q->apqn);
+ -		apqi = AP_QID_QUEUE(q->apqn);
+ -
+ -		/*
+ -		 * If the queue is assigned to the guest's APCB, then remove
+ -		 * the adapter's APID from the APCB and hot it into the guest.
+ -		 */
+ -		if (test_bit_inv(apid, matrix_mdev->shadow_apcb.apm) &&
+ -		    test_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm)) {
+ -			clear_bit_inv(apid, matrix_mdev->shadow_apcb.apm);
+ -			vfio_ap_mdev_update_guest_apcb(matrix_mdev);
+ -		}
+ -	}
+ -
+ -	vfio_ap_mdev_reset_queue(q, 1);
+ -	dev_set_drvdata(&apdev->device, NULL);
+ -	kfree(q);
+ -	release_update_locks_for_mdev(matrix_mdev);
+  }
++ 
++ /**
++  * vfio_ap_mdev_resource_in_use: check whether any of a set of APQNs is
++  *				 assigned to a mediated device under the control
++  *				 of the vfio_ap device driver.
++  *
++  * @apm: a bitmap specifying a set of APIDs comprising the APQNs to check.
++  * @aqm: a bitmap specifying a set of APQIs comprising the APQNs to check.
++  *
++  * Return:
++  *	* -EADDRINUSE if one or more of the APQNs specified via @apm/@aqm are
++  *	  assigned to a mediated device under the control of the vfio_ap
++  *	  device driver.
++  *	* Otherwise, return 0.
++  */
++ int vfio_ap_mdev_resource_in_use(unsigned long *apm, unsigned long *aqm)
++ {
++ 	int ret;
++ 
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ 	ret = vfio_ap_mdev_verify_no_sharing(apm, aqm);
++ 	mutex_unlock(&matrix_dev->mdevs_lock);
++ 	mutex_unlock(&matrix_dev->guests_lock);
++ 
++ 	return ret;
++ }
+* Unmerged path drivers/s390/crypto/ap_bus.c
+* Unmerged path drivers/s390/crypto/vfio_ap_drv.c
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
+diff --git a/drivers/s390/crypto/vfio_ap_private.h b/drivers/s390/crypto/vfio_ap_private.h
+index 104c59398001..cabb7b519159 100644
+--- a/drivers/s390/crypto/vfio_ap_private.h
++++ b/drivers/s390/crypto/vfio_ap_private.h
+@@ -126,4 +126,6 @@ void vfio_ap_mdev_unregister(void);
+ int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q,
+ 			     unsigned int retry);
+ 
++int vfio_ap_mdev_resource_in_use(unsigned long *apm, unsigned long *aqm);
++
+ #endif /* _VFIO_AP_PRIVATE_H_ */
