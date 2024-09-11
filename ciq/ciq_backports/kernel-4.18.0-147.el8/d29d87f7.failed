@@ -1,0 +1,277 @@
+btf: separate btf creation and loading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit d29d87f7e61226c339d1212beff6b82f653acd67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d29d87f7.failed
+
+This change splits out previous btf__new functionality of constructing
+struct btf and loading it into kernel into two:
+- btf__new() just creates and initializes struct btf
+- btf__load() attempts to load existing struct btf into kernel
+
+btf__free will still close BTF fd, if it was ever loaded successfully
+into kernel.
+
+This change allows users of libbpf to manipulate BTF using its API,
+without the need to unnecessarily load it into kernel.
+
+One of the intended use cases is pahole, which will do DWARF to BTF
+conversion and then use libbpf to do type deduplication, while then
+handling ELF sections overwriting and other concerns on its own.
+
+Fixes: 2d3feca8c44f ("bpf: btf: print map dump and lookup with btf info")
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d29d87f7e61226c339d1212beff6b82f653acd67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+#	tools/lib/bpf/btf.h
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/btf.c
+index ad19a43e946a,46db0a3b5cb7..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -304,10 -365,8 +304,8 @@@ void btf__free(struct btf *btf
+  	free(btf);
+  }
+  
+ -struct btf *btf__new(__u8 *data, __u32 size)
+ +struct btf *btf__new(__u8 *data, __u32 size, btf_print_fn_t err_log)
+  {
+- 	__u32 log_buf_size = 0;
+- 	char *log_buf = NULL;
+  	struct btf *btf;
+  	int err;
+  
+@@@ -317,16 -376,6 +315,19 @@@
+  
+  	btf->fd = -1;
+  
+++<<<<<<< HEAD
+ +	if (err_log) {
+ +		log_buf = malloc(BPF_LOG_BUF_SIZE);
+ +		if (!log_buf) {
+ +			err = -ENOMEM;
+ +			goto done;
+ +		}
+ +		*log_buf = 0;
+ +		log_buf_size = BPF_LOG_BUF_SIZE;
+ +	}
+ +
+++=======
+++>>>>>>> d29d87f7e612 (btf: separate btf creation and loading)
+  	btf->data = malloc(size);
+  	if (!btf->data) {
+  		err = -ENOMEM;
+@@@ -336,18 -385,7 +337,22 @@@
+  	memcpy(btf->data, data, size);
+  	btf->data_size = size;
+  
+++<<<<<<< HEAD
+ +	btf->fd = bpf_load_btf(btf->data, btf->data_size,
+ +			       log_buf, log_buf_size, false);
+ +
+ +	if (btf->fd == -1) {
+ +		err = -errno;
+ +		elog("Error loading BTF: %s(%d)\n", strerror(errno), errno);
+ +		if (log_buf && *log_buf)
+ +			elog("%s\n", log_buf);
+ +		goto done;
+ +	}
+ +
+ +	err = btf_parse_hdr(btf, err_log);
+++=======
++ 	err = btf_parse_hdr(btf);
+++>>>>>>> d29d87f7e612 (btf: separate btf creation and loading)
+  	if (err)
+  		goto done;
+  
+@@@ -355,11 -393,9 +360,9 @@@
+  	if (err)
+  		goto done;
+  
+ -	err = btf_parse_type_sec(btf);
+ +	err = btf_parse_type_sec(btf, err_log);
+  
+  done:
+- 	free(log_buf);
+- 
+  	if (err) {
+  		btf__free(btf);
+  		return ERR_PTR(err);
+diff --cc tools/lib/bpf/btf.h
+index caac3a404dc5,f55b7bc98d9e..000000000000
+--- a/tools/lib/bpf/btf.h
++++ b/tools/lib/bpf/btf.h
+@@@ -6,19 -6,97 +6,64 @@@
+  
+  #include <linux/types.h>
+  
+ -#ifdef __cplusplus
+ -extern "C" {
+ -#endif
+ -
+ -#ifndef LIBBPF_API
+ -#define LIBBPF_API __attribute__((visibility("default")))
+ -#endif
+ -
+  #define BTF_ELF_SEC ".BTF"
+ -#define BTF_EXT_ELF_SEC ".BTF.ext"
+  
+  struct btf;
+ -struct btf_ext;
+  struct btf_type;
+  
+ -/*
+ - * The .BTF.ext ELF section layout defined as
+ - *   struct btf_ext_header
+ - *   func_info subsection
+ - *
+ - * The func_info subsection layout:
+ - *   record size for struct bpf_func_info in the func_info subsection
+ - *   struct btf_sec_func_info for section #1
+ - *   a list of bpf_func_info records for section #1
+ - *     where struct bpf_func_info mimics one in include/uapi/linux/bpf.h
+ - *     but may not be identical
+ - *   struct btf_sec_func_info for section #2
+ - *   a list of bpf_func_info records for section #2
+ - *   ......
+ - *
+ - * Note that the bpf_func_info record size in .BTF.ext may not
+ - * be the same as the one defined in include/uapi/linux/bpf.h.
+ - * The loader should ensure that record_size meets minimum
+ - * requirement and pass the record as is to the kernel. The
+ - * kernel will handle the func_info properly based on its contents.
+ - */
+ -struct btf_ext_header {
+ -	__u16	magic;
+ -	__u8	version;
+ -	__u8	flags;
+ -	__u32	hdr_len;
+ +typedef int (*btf_print_fn_t)(const char *, ...)
+ +	__attribute__((format(printf, 1, 2)));
+  
+ -	/* All offsets are in bytes relative to the end of this header */
+ -	__u32	func_info_off;
+ -	__u32	func_info_len;
+ -	__u32	line_info_off;
+ -	__u32	line_info_len;
+ -};
+ +void btf__free(struct btf *btf);
+ +struct btf *btf__new(__u8 *data, __u32 size, btf_print_fn_t err_log);
+ +__s32 btf__find_by_name(const struct btf *btf, const char *type_name);
+ +const struct btf_type *btf__type_by_id(const struct btf *btf, __u32 id);
+ +__s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
+ +int btf__fd(const struct btf *btf);
+  
+++<<<<<<< HEAD
+++=======
++ LIBBPF_API void btf__free(struct btf *btf);
++ LIBBPF_API struct btf *btf__new(__u8 *data, __u32 size);
++ LIBBPF_API int btf__load(struct btf *btf);
++ LIBBPF_API __s32 btf__find_by_name(const struct btf *btf,
++ 				   const char *type_name);
++ LIBBPF_API __u32 btf__get_nr_types(const struct btf *btf);
++ LIBBPF_API const struct btf_type *btf__type_by_id(const struct btf *btf,
++ 						  __u32 id);
++ LIBBPF_API __s64 btf__resolve_size(const struct btf *btf, __u32 type_id);
++ LIBBPF_API int btf__resolve_type(const struct btf *btf, __u32 type_id);
++ LIBBPF_API int btf__fd(const struct btf *btf);
++ LIBBPF_API void btf__get_strings(const struct btf *btf, const char **strings,
++ 				 __u32 *str_len);
++ LIBBPF_API const char *btf__name_by_offset(const struct btf *btf, __u32 offset);
++ LIBBPF_API int btf__get_from_id(__u32 id, struct btf **btf);
++ LIBBPF_API int btf__get_map_kv_tids(const struct btf *btf, const char *map_name,
++ 				    __u32 expected_key_size,
++ 				    __u32 expected_value_size,
++ 				    __u32 *key_type_id, __u32 *value_type_id);
++ 
++ LIBBPF_API struct btf_ext *btf_ext__new(__u8 *data, __u32 size);
++ LIBBPF_API void btf_ext__free(struct btf_ext *btf_ext);
++ LIBBPF_API int btf_ext__reloc_func_info(const struct btf *btf,
++ 					const struct btf_ext *btf_ext,
++ 					const char *sec_name, __u32 insns_cnt,
++ 					void **func_info, __u32 *cnt);
++ LIBBPF_API int btf_ext__reloc_line_info(const struct btf *btf,
++ 					const struct btf_ext *btf_ext,
++ 					const char *sec_name, __u32 insns_cnt,
++ 					void **line_info, __u32 *cnt);
++ LIBBPF_API __u32 btf_ext__func_info_rec_size(const struct btf_ext *btf_ext);
++ LIBBPF_API __u32 btf_ext__line_info_rec_size(const struct btf_ext *btf_ext);
++ 
++ struct btf_dedup_opts {
++ 	bool dont_resolve_fwds;
++ };
++ 
++ LIBBPF_API int btf__dedup(struct btf *btf, struct btf_ext *btf_ext,
++ 			  const struct btf_dedup_opts *opts);
++ 
++ #ifdef __cplusplus
++ } /* extern "C" */
+++>>>>>>> d29d87f7e612 (btf: separate btf creation and loading)
+  #endif
+ -
+ -#endif /* __LIBBPF_BTF_H */
+diff --cc tools/lib/bpf/libbpf.c
+index 38df8e0ed95d,e3c39edfb9d3..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -792,9 -835,8 +792,14 @@@ static int bpf_object__elf_collect(stru
+  		else if (strcmp(name, "maps") == 0)
+  			obj->efile.maps_shndx = idx;
+  		else if (strcmp(name, BTF_ELF_SEC) == 0) {
+++<<<<<<< HEAD
+ +			obj->btf = btf__new(data->d_buf, data->d_size,
+ +					    __pr_debug);
+ +			if (IS_ERR(obj->btf)) {
+++=======
++ 			obj->btf = btf__new(data->d_buf, data->d_size);
++ 			if (IS_ERR(obj->btf) || btf__load(obj->btf)) {
+++>>>>>>> d29d87f7e612 (btf: separate btf creation and loading)
+  				pr_warning("Error loading ELF section %s: %ld. Ignored and continue.\n",
+  					   BTF_ELF_SEC, PTR_ERR(obj->btf));
+  				obj->btf = NULL;
+diff --cc tools/lib/bpf/libbpf.map
+index 4fb29f6d7a80,f5372df143f4..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -119,3 -124,24 +119,27 @@@ LIBBPF_0.0.1 
+  	local:
+  		*;
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ LIBBPF_0.0.2 {
++ 	global:
++ 		bpf_probe_helper;
++ 		bpf_probe_map_type;
++ 		bpf_probe_prog_type;
++ 		bpf_map_lookup_elem_flags;
++ 		bpf_object__find_map_fd_by_name;
++ 		bpf_get_link_xdp_id;
++ 		btf__dedup;
++ 		btf__get_map_kv_tids;
++ 		btf__get_nr_types;
++ 		btf__get_strings;
++ 		btf__load;
++ 		btf_ext__free;
++ 		btf_ext__func_info_rec_size;
++ 		btf_ext__line_info_rec_size;
++ 		btf_ext__new;
++ 		btf_ext__reloc_func_info;
++ 		btf_ext__reloc_line_info;
++ } LIBBPF_0.0.1;
+++>>>>>>> d29d87f7e612 (btf: separate btf creation and loading)
+* Unmerged path tools/lib/bpf/btf.c
+* Unmerged path tools/lib/bpf/btf.h
+* Unmerged path tools/lib/bpf/libbpf.c
+* Unmerged path tools/lib/bpf/libbpf.map
