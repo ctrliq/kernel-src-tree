@@ -1,0 +1,137 @@
+mm/filemap.c: fix a data race in filemap_fault()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Kirill A. Shutemov <kirill@shutemov.name>
+commit e630bfac79456d3acd22c9286b50e83aafb7a07c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e630bfac.failed
+
+struct file_ra_state ra.mmap_miss could be accessed concurrently during
+page faults as noticed by KCSAN,
+
+ BUG: KCSAN: data-race in filemap_fault / filemap_map_pages
+
+ write to 0xffff9b1700a2c1b4 of 4 bytes by task 3292 on cpu 30:
+  filemap_fault+0x920/0xfc0
+  do_sync_mmap_readahead at mm/filemap.c:2384
+  (inlined by) filemap_fault at mm/filemap.c:2486
+  __xfs_filemap_fault+0x112/0x3e0 [xfs]
+  xfs_filemap_fault+0x74/0x90 [xfs]
+  __do_fault+0x9e/0x220
+  do_fault+0x4a0/0x920
+  __handle_mm_fault+0xc69/0xd00
+  handle_mm_fault+0xfc/0x2f0
+  do_page_fault+0x263/0x6f9
+  page_fault+0x34/0x40
+
+ read to 0xffff9b1700a2c1b4 of 4 bytes by task 3313 on cpu 32:
+  filemap_map_pages+0xc2e/0xd80
+  filemap_map_pages at mm/filemap.c:2625
+  do_fault+0x3da/0x920
+  __handle_mm_fault+0xc69/0xd00
+  handle_mm_fault+0xfc/0x2f0
+  do_page_fault+0x263/0x6f9
+  page_fault+0x34/0x40
+
+ Reported by Kernel Concurrency Sanitizer on:
+ CPU: 32 PID: 3313 Comm: systemd-udevd Tainted: G        W    L 5.5.0-next-20200210+ #1
+ Hardware name: HPE ProLiant DL385 Gen10/ProLiant DL385 Gen10, BIOS A40 07/10/2019
+
+ra.mmap_miss is used to contribute the readahead decisions, a data race
+could be undesirable.  Both the read and write is only under non-exclusive
+mmap_sem, two concurrent writers could even underflow the counter.  Fix
+the underflow by writing to a local variable before committing a final
+store to ra.mmap_miss given a small inaccuracy of the counter should be
+acceptable.
+
+	Signed-off-by: Kirill A. Shutemov <kirill@shutemov.name>
+	Signed-off-by: Qian Cai <cai@lca.pw>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Tested-by: Qian Cai <cai@lca.pw>
+	Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Cc: Marco Elver <elver@google.com>
+Link: http://lkml.kernel.org/r/20200211030134.1847-1-cai@lca.pw
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e630bfac79456d3acd22c9286b50e83aafb7a07c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/filemap.c
+diff --cc mm/filemap.c
+index c5561788ab4c,1aaea26556cc..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -2419,7 -2466,9 +2419,8 @@@ static void do_sync_mmap_readahead(stru
+  	struct file *file = vmf->vma->vm_file;
+  	struct file_ra_state *ra = &file->f_ra;
+  	struct address_space *mapping = file->f_mapping;
+ -	struct file *fpin = NULL;
+  	pgoff_t offset = vmf->pgoff;
++ 	unsigned int mmap_miss;
+  
+  	/* If we don't want any read-ahead, don't bother */
+  	if (vmf->vma->vm_flags & VM_RAND_READ)
+@@@ -2441,8 -2492,8 +2443,13 @@@
+  	 * Do we miss much more than hit in this file? If so,
+  	 * stop bothering with read-ahead. It will only hurt.
+  	 */
+++<<<<<<< HEAD
+ +	if (ra->mmap_miss > MMAP_LOTSAMISS)
+ +		return;
+++=======
++ 	if (mmap_miss > MMAP_LOTSAMISS)
++ 		return fpin;
+++>>>>>>> e630bfac7945 (mm/filemap.c: fix a data race in filemap_fault())
+  
+  	/*
+  	 * mmap read-around
+@@@ -2463,16 -2517,22 +2470,31 @@@ static void do_async_mmap_readahead(str
+  	struct file *file = vmf->vma->vm_file;
+  	struct file_ra_state *ra = &file->f_ra;
+  	struct address_space *mapping = file->f_mapping;
+++<<<<<<< HEAD
+ +	pgoff_t offset = vmf->pgoff;
+ +
+ +	/* If we don't want any read-ahead, don't bother */
+ +	if (vmf->vma->vm_flags & VM_RAND_READ)
+ +		return;
+ +	if (ra->mmap_miss > 0)
+ +		ra->mmap_miss--;
+ +	if (PageReadahead(page))
+++=======
++ 	struct file *fpin = NULL;
++ 	unsigned int mmap_miss;
++ 	pgoff_t offset = vmf->pgoff;
++ 
++ 	/* If we don't want any read-ahead, don't bother */
++ 	if (vmf->vma->vm_flags & VM_RAND_READ || !ra->ra_pages)
++ 		return fpin;
++ 	mmap_miss = READ_ONCE(ra->mmap_miss);
++ 	if (mmap_miss)
++ 		WRITE_ONCE(ra->mmap_miss, --mmap_miss);
++ 	if (PageReadahead(page)) {
++ 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+++>>>>>>> e630bfac7945 (mm/filemap.c: fix a data race in filemap_fault())
+  		page_cache_async_readahead(mapping, ra, file,
+  					   page, offset, ra->ra_pages);
+ -	}
+ -	return fpin;
+  }
+  
+  /**
+@@@ -2627,7 -2691,8 +2649,12 @@@ void filemap_map_pages(struct vm_fault 
+  	pgoff_t last_pgoff = start_pgoff;
+  	unsigned long max_idx;
+  	XA_STATE(xas, &mapping->i_pages, start_pgoff);
+++<<<<<<< HEAD
+ +	struct page *head, *page;
+++=======
++ 	struct page *page;
++ 	unsigned int mmap_miss = READ_ONCE(file->f_ra.mmap_miss);
+++>>>>>>> e630bfac7945 (mm/filemap.c: fix a data race in filemap_fault())
+  
+  	rcu_read_lock();
+  	xas_for_each(&xas, page, end_pgoff) {
+* Unmerged path mm/filemap.c
