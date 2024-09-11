@@ -1,0 +1,137 @@
+KVM: arm/arm64: Re-factor setting the Stage 2 entry to exec on fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Punit Agrawal <punit.agrawal@arm.com>
+commit 6396b852e46e562f4742ed0a9042b537eb26b8aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6396b852.failed
+
+Stage 2 fault handler marks a page as executable if it is handling an
+execution fault or if it was a permission fault in which case the
+executable bit needs to be preserved.
+
+The logic to decide if the page should be marked executable is
+duplicated for PMD and PTE entries. To avoid creating another copy
+when support for PUD hugepages is introduced refactor the code to
+share the checks needed to mark a page table entry as executable.
+
+	Signed-off-by: Punit Agrawal <punit.agrawal@arm.com>
+	Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Reviewed-by: Christoffer Dall <christoffer.dall@arm.com>
+	Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 6396b852e46e562f4742ed0a9042b537eb26b8aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/arm/mmu.c
+diff --cc virt/kvm/arm/mmu.c
+index 22e88cffe24c,6912529946fb..000000000000
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@@ -1528,7 -1475,8 +1528,12 @@@ static int user_mem_abort(struct kvm_vc
+  			  unsigned long fault_status)
+  {
+  	int ret;
+++<<<<<<< HEAD
+ +	bool write_fault, exec_fault, writable, hugetlb = false, force_pte = false;
+++=======
++ 	bool write_fault, writable, force_pte = false;
++ 	bool exec_fault, needs_exec;
+++>>>>>>> 6396b852e46e (KVM: arm/arm64: Re-factor setting the Stage 2 entry to exec on fault)
+  	unsigned long mmu_seq;
+  	gfn_t gfn = fault_ipa >> PAGE_SHIFT;
+  	struct kvm *kvm = vcpu->kvm;
+@@@ -1618,28 -1580,44 +1623,55 @@@
+  	if (mmu_notifier_retry(kvm, mmu_seq))
+  		goto out_unlock;
+  
+ -	if (vma_pagesize == PAGE_SIZE && !force_pte) {
+ -		/*
+ -		 * Only PMD_SIZE transparent hugepages(THP) are
+ -		 * currently supported. This code will need to be
+ -		 * updated to support other THP sizes.
+ -		 */
+ -		if (transparent_hugepage_adjust(&pfn, &fault_ipa))
+ -			vma_pagesize = PMD_SIZE;
+ -	}
+ +	if (!hugetlb && !force_pte)
+ +		hugetlb = transparent_hugepage_adjust(&pfn, &fault_ipa);
+  
+++<<<<<<< HEAD
+ +	if (hugetlb) {
+++=======
++ 	if (writable)
++ 		kvm_set_pfn_dirty(pfn);
++ 
++ 	if (fault_status != FSC_PERM)
++ 		clean_dcache_guest_page(pfn, vma_pagesize);
++ 
++ 	if (exec_fault)
++ 		invalidate_icache_guest_page(pfn, vma_pagesize);
++ 
++ 	/*
++ 	 * If we took an execution fault we have made the
++ 	 * icache/dcache coherent above and should now let the s2
++ 	 * mapping be executable.
++ 	 *
++ 	 * Write faults (!exec_fault && FSC_PERM) are orthogonal to
++ 	 * execute permissions, and we preserve whatever we have.
++ 	 */
++ 	needs_exec = exec_fault ||
++ 		(fault_status == FSC_PERM && stage2_is_exec(kvm, fault_ipa));
++ 
++ 	if (vma_pagesize == PMD_SIZE) {
+++>>>>>>> 6396b852e46e (KVM: arm/arm64: Re-factor setting the Stage 2 entry to exec on fault)
+  		pmd_t new_pmd = pfn_pmd(pfn, mem_type);
+  		new_pmd = pmd_mkhuge(new_pmd);
+ -		if (writable)
+ +		if (writable) {
+  			new_pmd = kvm_s2pmd_mkwrite(new_pmd);
+ +			kvm_set_pfn_dirty(pfn);
+ +		}
+ +
+ +		if (fault_status != FSC_PERM)
+ +			clean_dcache_guest_page(pfn, PMD_SIZE);
+  
+- 		if (exec_fault) {
++ 		if (needs_exec)
+  			new_pmd = kvm_s2pmd_mkexec(new_pmd);
+++<<<<<<< HEAD
+ +			invalidate_icache_guest_page(pfn, PMD_SIZE);
+ +		} else if (fault_status == FSC_PERM) {
+ +			/* Preserve execute if XN was already cleared */
+ +			if (stage2_is_exec(kvm, fault_ipa))
+ +				new_pmd = kvm_s2pmd_mkexec(new_pmd);
+ +		}
+++=======
+++>>>>>>> 6396b852e46e (KVM: arm/arm64: Re-factor setting the Stage 2 entry to exec on fault)
+  
+  		ret = stage2_set_pmd_huge(kvm, memcache, fault_ipa, &new_pmd);
+  	} else {
+@@@ -1651,17 -1628,8 +1683,22 @@@
+  			mark_page_dirty(kvm, gfn);
+  		}
+  
+++<<<<<<< HEAD
+ +		if (fault_status != FSC_PERM)
+ +			clean_dcache_guest_page(pfn, PAGE_SIZE);
+ +
+ +		if (exec_fault) {
+ +			new_pte = kvm_s2pte_mkexec(new_pte);
+ +			invalidate_icache_guest_page(pfn, PAGE_SIZE);
+ +		} else if (fault_status == FSC_PERM) {
+ +			/* Preserve execute if XN was already cleared */
+ +			if (stage2_is_exec(kvm, fault_ipa))
+ +				new_pte = kvm_s2pte_mkexec(new_pte);
+ +		}
+++=======
++ 		if (needs_exec)
++ 			new_pte = kvm_s2pte_mkexec(new_pte);
+++>>>>>>> 6396b852e46e (KVM: arm/arm64: Re-factor setting the Stage 2 entry to exec on fault)
+  
+  		ret = stage2_set_pte(kvm, memcache, fault_ipa, &new_pte, flags);
+  	}
+* Unmerged path virt/kvm/arm/mmu.c
