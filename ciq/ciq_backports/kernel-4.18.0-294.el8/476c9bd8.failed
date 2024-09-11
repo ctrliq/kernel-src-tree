@@ -1,0 +1,387 @@
+KVM: x86: Prepare MSR bitmaps for userspace tracked MSRs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Aaron Lewis <aaronlewis@google.com>
+commit 476c9bd8e997b495524500cd82471e59b3aac20e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/476c9bd8.failed
+
+Prepare vmx and svm for a subsequent change that ensures the MSR permission
+bitmap is set to allow an MSR that userspace is tracking to force a vmx_vmexit
+in the guest.
+
+	Signed-off-by: Aaron Lewis <aaronlewis@google.com>
+	Reviewed-by: Oliver Upton <oupton@google.com>
+[agraf: rebase, adapt SVM scheme to nested changes that came in between]
+	Signed-off-by: Alexander Graf <graf@amazon.com>
+Message-Id: <20200925143422.21718-5-graf@amazon.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 476c9bd8e997b495524500cd82471e59b3aac20e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.h
+diff --cc arch/x86/kvm/vmx/vmx.h
+index 131d638ba270,64fe6c91435f..000000000000
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@@ -331,8 -329,8 +331,13 @@@ bool vmx_interrupt_blocked(struct kvm_v
+  bool vmx_get_nmi_mask(struct kvm_vcpu *vcpu);
+  void vmx_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked);
+  void vmx_set_virtual_apic_mode(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+ +struct shared_msr_entry *find_msr_entry(struct vcpu_vmx *vmx, u32 msr);
+ +void pt_update_intercept_for_msr(struct vcpu_vmx *vmx);
+++=======
++ struct vmx_uret_msr *vmx_find_uret_msr(struct vcpu_vmx *vmx, u32 msr);
++ void pt_update_intercept_for_msr(struct kvm_vcpu *vcpu);
+++>>>>>>> 476c9bd8e997 (KVM: x86: Prepare MSR bitmaps for userspace tracked MSRs)
+  void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp);
+  int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr);
+  void vmx_ept_load_pdptrs(struct kvm_vcpu *vcpu);
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 5c26e59bd26e..d5fdd14ba3aa 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -564,7 +564,7 @@ static bool valid_msr_intercept(u32 index)
+ 	return false;
+ }
+ 
+-static bool msr_write_intercepted(struct kvm_vcpu *vcpu, unsigned msr)
++static bool msr_write_intercepted(struct kvm_vcpu *vcpu, u32 msr)
+ {
+ 	u8 bit_write;
+ 	unsigned long tmp;
+@@ -583,7 +583,7 @@ static bool msr_write_intercepted(struct kvm_vcpu *vcpu, unsigned msr)
+ 	return !!test_bit(bit_write,  &tmp);
+ }
+ 
+-static void set_msr_interception(u32 *msrpm, unsigned msr,
++static void set_msr_interception(struct kvm_vcpu *vcpu, u32 *msrpm, u32 msr,
+ 				 int read, int write)
+ {
+ 	u8 bit_read, bit_write;
+@@ -609,11 +609,10 @@ static void set_msr_interception(u32 *msrpm, unsigned msr,
+ 	msrpm[offset] = tmp;
+ }
+ 
+-static u32 *svm_vcpu_init_msrpm(void)
++static u32 *svm_vcpu_alloc_msrpm(void)
+ {
+-	int i;
+-	u32 *msrpm;
+ 	struct page *pages = alloc_pages(GFP_KERNEL_ACCOUNT, MSRPM_ALLOC_ORDER);
++	u32 *msrpm;
+ 
+ 	if (!pages)
+ 		return NULL;
+@@ -621,12 +620,18 @@ static u32 *svm_vcpu_init_msrpm(void)
+ 	msrpm = page_address(pages);
+ 	memset(msrpm, 0xff, PAGE_SIZE * (1 << MSRPM_ALLOC_ORDER));
+ 
++	return msrpm;
++}
++
++static void svm_vcpu_init_msrpm(struct kvm_vcpu *vcpu, u32 *msrpm)
++{
++	int i;
++
+ 	for (i = 0; direct_access_msrs[i].index != MSR_INVALID; i++) {
+ 		if (!direct_access_msrs[i].always)
+ 			continue;
+-		set_msr_interception(msrpm, direct_access_msrs[i].index, 1, 1);
++		set_msr_interception(vcpu, msrpm, direct_access_msrs[i].index, 1, 1);
+ 	}
+-	return msrpm;
+ }
+ 
+ static void svm_vcpu_free_msrpm(u32 *msrpm)
+@@ -677,26 +682,26 @@ static void init_msrpm_offsets(void)
+ 	}
+ }
+ 
+-static void svm_enable_lbrv(struct vcpu_svm *svm)
++static void svm_enable_lbrv(struct kvm_vcpu *vcpu)
+ {
+-	u32 *msrpm = svm->msrpm;
++	struct vcpu_svm *svm = to_svm(vcpu);
+ 
+ 	svm->vmcb->control.virt_ext |= LBR_CTL_ENABLE_MASK;
+-	set_msr_interception(msrpm, MSR_IA32_LASTBRANCHFROMIP, 1, 1);
+-	set_msr_interception(msrpm, MSR_IA32_LASTBRANCHTOIP, 1, 1);
+-	set_msr_interception(msrpm, MSR_IA32_LASTINTFROMIP, 1, 1);
+-	set_msr_interception(msrpm, MSR_IA32_LASTINTTOIP, 1, 1);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTBRANCHFROMIP, 1, 1);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTBRANCHTOIP, 1, 1);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTINTFROMIP, 1, 1);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTINTTOIP, 1, 1);
+ }
+ 
+-static void svm_disable_lbrv(struct vcpu_svm *svm)
++static void svm_disable_lbrv(struct kvm_vcpu *vcpu)
+ {
+-	u32 *msrpm = svm->msrpm;
++	struct vcpu_svm *svm = to_svm(vcpu);
+ 
+ 	svm->vmcb->control.virt_ext &= ~LBR_CTL_ENABLE_MASK;
+-	set_msr_interception(msrpm, MSR_IA32_LASTBRANCHFROMIP, 0, 0);
+-	set_msr_interception(msrpm, MSR_IA32_LASTBRANCHTOIP, 0, 0);
+-	set_msr_interception(msrpm, MSR_IA32_LASTINTFROMIP, 0, 0);
+-	set_msr_interception(msrpm, MSR_IA32_LASTINTTOIP, 0, 0);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTBRANCHFROMIP, 0, 0);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTBRANCHTOIP, 0, 0);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTINTFROMIP, 0, 0);
++	set_msr_interception(vcpu, svm->msrpm, MSR_IA32_LASTINTTOIP, 0, 0);
+ }
+ 
+ void disable_nmi_singlestep(struct vcpu_svm *svm)
+@@ -1218,14 +1223,19 @@ static int svm_create_vcpu(struct kvm_vcpu *vcpu)
+ 
+ 	svm->nested.hsave = page_address(hsave_page);
+ 
+-	svm->msrpm = svm_vcpu_init_msrpm();
++	svm->msrpm = svm_vcpu_alloc_msrpm();
+ 	if (!svm->msrpm)
+ 		goto error_free_hsave_page;
+ 
+-	svm->nested.msrpm = svm_vcpu_init_msrpm();
++	svm_vcpu_init_msrpm(vcpu, svm->msrpm);
++
++	svm->nested.msrpm = svm_vcpu_alloc_msrpm();
+ 	if (!svm->nested.msrpm)
+ 		goto error_free_msrpm;
+ 
++	/* We only need the L1 pass-through MSR state, so leave vcpu as NULL */
++	svm_vcpu_init_msrpm(vcpu, svm->nested.msrpm);
++
+ 	svm->vmcb = page_address(vmcb_page);
+ 	svm->vmcb_pa = __sme_set(page_to_pfn(vmcb_page) << PAGE_SHIFT);
+ 	svm->asid_generation = 0;
+@@ -2571,7 +2581,7 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 		 * We update the L1 MSR bit as well since it will end up
+ 		 * touching the MSR anyway now.
+ 		 */
+-		set_msr_interception(svm->msrpm, MSR_IA32_SPEC_CTRL, 1, 1);
++		set_msr_interception(vcpu, svm->msrpm, MSR_IA32_SPEC_CTRL, 1, 1);
+ 		break;
+ 	case MSR_IA32_PRED_CMD:
+ 		if (!msr->host_initiated &&
+@@ -2586,7 +2596,7 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 			break;
+ 
+ 		wrmsrl(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
+-		set_msr_interception(svm->msrpm, MSR_IA32_PRED_CMD, 0, 1);
++		set_msr_interception(vcpu, svm->msrpm, MSR_IA32_PRED_CMD, 0, 1);
+ 		break;
+ 	case MSR_AMD64_VIRT_SPEC_CTRL:
+ 		if (!msr->host_initiated &&
+@@ -2650,9 +2660,9 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 		svm->vmcb->save.dbgctl = data;
+ 		vmcb_mark_dirty(svm->vmcb, VMCB_LBR);
+ 		if (data & (1ULL<<0))
+-			svm_enable_lbrv(svm);
++			svm_enable_lbrv(vcpu);
+ 		else
+-			svm_disable_lbrv(svm);
++			svm_disable_lbrv(vcpu);
+ 		break;
+ 	case MSR_VM_HSAVE_PA:
+ 		svm->nested.hsave_msr = data;
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 581b2cd25413..4cf65ce42588 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -4776,7 +4776,7 @@ static int enter_vmx_operation(struct kvm_vcpu *vcpu)
+ 
+ 	if (vmx_pt_mode_is_host_guest()) {
+ 		vmx->pt_desc.guest.ctl = 0;
+-		pt_update_intercept_for_msr(vmx);
++		pt_update_intercept_for_msr(vcpu);
+ 	}
+ 
+ 	return 0;
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 985a4bfb7517..f33d7bbc028b 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -338,7 +338,7 @@ static const struct kernel_param_ops vmentry_l1d_flush_ops = {
+ module_param_cb(vmentry_l1d_flush, &vmentry_l1d_flush_ops, NULL, 0644);
+ 
+ static u32 vmx_segment_access_rights(struct kvm_segment *var);
+-static __always_inline void vmx_disable_intercept_for_msr(unsigned long *msr_bitmap,
++static __always_inline void vmx_disable_intercept_for_msr(struct kvm_vcpu *vcpu,
+ 							  u32 msr, int type);
+ 
+ void vmx_vmexit(void);
+@@ -1990,7 +1990,7 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		 * in the merging. We update the vmcs01 here for L1 as well
+ 		 * since it will end up touching the MSR anyway now.
+ 		 */
+-		vmx_disable_intercept_for_msr(vmx->vmcs01.msr_bitmap,
++		vmx_disable_intercept_for_msr(vcpu,
+ 					      MSR_IA32_SPEC_CTRL,
+ 					      MSR_TYPE_RW);
+ 		break;
+@@ -2026,8 +2026,7 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		 * vmcs02.msr_bitmap here since it gets completely overwritten
+ 		 * in the merging.
+ 		 */
+-		vmx_disable_intercept_for_msr(vmx->vmcs01.msr_bitmap, MSR_IA32_PRED_CMD,
+-					      MSR_TYPE_W);
++		vmx_disable_intercept_for_msr(vcpu, MSR_IA32_PRED_CMD, MSR_TYPE_W);
+ 		break;
+ 	case MSR_IA32_CR_PAT:
+ 		if (!kvm_pat_valid(data))
+@@ -2077,7 +2076,7 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 			return 1;
+ 		vmcs_write64(GUEST_IA32_RTIT_CTL, data);
+ 		vmx->pt_desc.guest.ctl = data;
+-		pt_update_intercept_for_msr(vmx);
++		pt_update_intercept_for_msr(vcpu);
+ 		break;
+ 	case MSR_IA32_RTIT_STATUS:
+ 		if (!pt_can_write_msr(vmx))
+@@ -3594,9 +3593,11 @@ void free_vpid(int vpid)
+ 	spin_unlock(&vmx_vpid_lock);
+ }
+ 
+-static __always_inline void vmx_disable_intercept_for_msr(unsigned long *msr_bitmap,
++static __always_inline void vmx_disable_intercept_for_msr(struct kvm_vcpu *vcpu,
+ 							  u32 msr, int type)
+ {
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	unsigned long *msr_bitmap = vmx->vmcs01.msr_bitmap;
+ 	int f = sizeof(unsigned long);
+ 
+ 	if (!cpu_has_vmx_msr_bitmap())
+@@ -3632,9 +3633,11 @@ static __always_inline void vmx_disable_intercept_for_msr(unsigned long *msr_bit
+ 	}
+ }
+ 
+-static __always_inline void vmx_enable_intercept_for_msr(unsigned long *msr_bitmap,
++static __always_inline void vmx_enable_intercept_for_msr(struct kvm_vcpu *vcpu,
+ 							 u32 msr, int type)
+ {
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	unsigned long *msr_bitmap = vmx->vmcs01.msr_bitmap;
+ 	int f = sizeof(unsigned long);
+ 
+ 	if (!cpu_has_vmx_msr_bitmap())
+@@ -3670,13 +3673,13 @@ static __always_inline void vmx_enable_intercept_for_msr(unsigned long *msr_bitm
+ 	}
+ }
+ 
+-static __always_inline void vmx_set_intercept_for_msr(unsigned long *msr_bitmap,
+-			     			      u32 msr, int type, bool value)
++static __always_inline void vmx_set_intercept_for_msr(struct kvm_vcpu *vcpu,
++						      u32 msr, int type, bool value)
+ {
+ 	if (value)
+-		vmx_enable_intercept_for_msr(msr_bitmap, msr, type);
++		vmx_enable_intercept_for_msr(vcpu, msr, type);
+ 	else
+-		vmx_disable_intercept_for_msr(msr_bitmap, msr, type);
++		vmx_disable_intercept_for_msr(vcpu, msr, type);
+ }
+ 
+ static u8 vmx_msr_bitmap_mode(struct kvm_vcpu *vcpu)
+@@ -3694,8 +3697,8 @@ static u8 vmx_msr_bitmap_mode(struct kvm_vcpu *vcpu)
+ 	return mode;
+ }
+ 
+-static void vmx_update_msr_bitmap_x2apic(unsigned long *msr_bitmap,
+-					 u8 mode)
++static void vmx_update_msr_bitmap_x2apic(struct kvm_vcpu *vcpu,
++					 unsigned long *msr_bitmap, u8 mode)
+ {
+ 	int msr;
+ 
+@@ -3710,11 +3713,11 @@ static void vmx_update_msr_bitmap_x2apic(unsigned long *msr_bitmap,
+ 		 * TPR reads and writes can be virtualized even if virtual interrupt
+ 		 * delivery is not in use.
+ 		 */
+-		vmx_disable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_TASKPRI), MSR_TYPE_RW);
++		vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_TASKPRI), MSR_TYPE_RW);
+ 		if (mode & MSR_BITMAP_MODE_X2APIC_APICV) {
+-			vmx_enable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_TMCCT), MSR_TYPE_R);
+-			vmx_disable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_EOI), MSR_TYPE_W);
+-			vmx_disable_intercept_for_msr(msr_bitmap, X2APIC_MSR(APIC_SELF_IPI), MSR_TYPE_W);
++			vmx_enable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_TMCCT), MSR_TYPE_RW);
++			vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_EOI), MSR_TYPE_W);
++			vmx_disable_intercept_for_msr(vcpu, X2APIC_MSR(APIC_SELF_IPI), MSR_TYPE_W);
+ 		}
+ 	}
+ }
+@@ -3730,30 +3733,24 @@ void vmx_update_msr_bitmap(struct kvm_vcpu *vcpu)
+ 		return;
+ 
+ 	if (changed & (MSR_BITMAP_MODE_X2APIC | MSR_BITMAP_MODE_X2APIC_APICV))
+-		vmx_update_msr_bitmap_x2apic(msr_bitmap, mode);
++		vmx_update_msr_bitmap_x2apic(vcpu, msr_bitmap, mode);
+ 
+ 	vmx->msr_bitmap_mode = mode;
+ }
+ 
+-void pt_update_intercept_for_msr(struct vcpu_vmx *vmx)
++void pt_update_intercept_for_msr(struct kvm_vcpu *vcpu)
+ {
+-	unsigned long *msr_bitmap = vmx->vmcs01.msr_bitmap;
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	bool flag = !(vmx->pt_desc.guest.ctl & RTIT_CTL_TRACEEN);
+ 	u32 i;
+ 
+-	vmx_set_intercept_for_msr(msr_bitmap, MSR_IA32_RTIT_STATUS,
+-							MSR_TYPE_RW, flag);
+-	vmx_set_intercept_for_msr(msr_bitmap, MSR_IA32_RTIT_OUTPUT_BASE,
+-							MSR_TYPE_RW, flag);
+-	vmx_set_intercept_for_msr(msr_bitmap, MSR_IA32_RTIT_OUTPUT_MASK,
+-							MSR_TYPE_RW, flag);
+-	vmx_set_intercept_for_msr(msr_bitmap, MSR_IA32_RTIT_CR3_MATCH,
+-							MSR_TYPE_RW, flag);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_RTIT_STATUS, MSR_TYPE_RW, flag);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_RTIT_OUTPUT_BASE, MSR_TYPE_RW, flag);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_RTIT_OUTPUT_MASK, MSR_TYPE_RW, flag);
++	vmx_set_intercept_for_msr(vcpu, MSR_IA32_RTIT_CR3_MATCH, MSR_TYPE_RW, flag);
+ 	for (i = 0; i < vmx->pt_desc.addr_range; i++) {
+-		vmx_set_intercept_for_msr(msr_bitmap,
+-			MSR_IA32_RTIT_ADDR0_A + i * 2, MSR_TYPE_RW, flag);
+-		vmx_set_intercept_for_msr(msr_bitmap,
+-			MSR_IA32_RTIT_ADDR0_B + i * 2, MSR_TYPE_RW, flag);
++		vmx_set_intercept_for_msr(vcpu, MSR_IA32_RTIT_ADDR0_A + i * 2, MSR_TYPE_RW, flag);
++		vmx_set_intercept_for_msr(vcpu, MSR_IA32_RTIT_ADDR0_B + i * 2, MSR_TYPE_RW, flag);
+ 	}
+ }
+ 
+@@ -6812,18 +6809,18 @@ static int vmx_create_vcpu(struct kvm_vcpu *vcpu)
+ 		goto free_pml;
+ 
+ 	msr_bitmap = vmx->vmcs01.msr_bitmap;
+-	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_TSC, MSR_TYPE_R);
+-	vmx_disable_intercept_for_msr(msr_bitmap, MSR_FS_BASE, MSR_TYPE_RW);
+-	vmx_disable_intercept_for_msr(msr_bitmap, MSR_GS_BASE, MSR_TYPE_RW);
+-	vmx_disable_intercept_for_msr(msr_bitmap, MSR_KERNEL_GS_BASE, MSR_TYPE_RW);
+-	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_CS, MSR_TYPE_RW);
+-	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_ESP, MSR_TYPE_RW);
+-	vmx_disable_intercept_for_msr(msr_bitmap, MSR_IA32_SYSENTER_EIP, MSR_TYPE_RW);
++	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_TSC, MSR_TYPE_R);
++	vmx_disable_intercept_for_msr(vcpu, MSR_FS_BASE, MSR_TYPE_RW);
++	vmx_disable_intercept_for_msr(vcpu, MSR_GS_BASE, MSR_TYPE_RW);
++	vmx_disable_intercept_for_msr(vcpu, MSR_KERNEL_GS_BASE, MSR_TYPE_RW);
++	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_CS, MSR_TYPE_RW);
++	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_ESP, MSR_TYPE_RW);
++	vmx_disable_intercept_for_msr(vcpu, MSR_IA32_SYSENTER_EIP, MSR_TYPE_RW);
+ 	if (kvm_cstate_in_guest(vcpu->kvm)) {
+-		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C1_RES, MSR_TYPE_R);
+-		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C3_RESIDENCY, MSR_TYPE_R);
+-		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C6_RESIDENCY, MSR_TYPE_R);
+-		vmx_disable_intercept_for_msr(msr_bitmap, MSR_CORE_C7_RESIDENCY, MSR_TYPE_R);
++		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C1_RES, MSR_TYPE_R);
++		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C3_RESIDENCY, MSR_TYPE_R);
++		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C6_RESIDENCY, MSR_TYPE_R);
++		vmx_disable_intercept_for_msr(vcpu, MSR_CORE_C7_RESIDENCY, MSR_TYPE_R);
+ 	}
+ 	vmx->msr_bitmap_mode = 0;
+ 
+* Unmerged path arch/x86/kvm/vmx/vmx.h
