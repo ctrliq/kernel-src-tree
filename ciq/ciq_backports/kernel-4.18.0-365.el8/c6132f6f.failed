@@ -1,0 +1,128 @@
+bnxt_en: Fix 64-bit doorbell operation on 32-bit kernels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit c6132f6f2e682c958f7022ecfd8bec35723a1a9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/c6132f6f.failed
+
+The driver requires 64-bit doorbell writes to be atomic on 32-bit
+architectures.  So we redefined writeq as a new macro with spinlock
+protection on 32-bit architectures.  This created a new warning when
+we added a new file in a recent patchset.  writeq is defined on many
+32-bit architectures to do the memory write non-atomically and it
+generated a new macro redefined warning.  This warning was fixed
+incorrectly in the recent patch.
+
+Fix this properly by adding a new bnxt_writeq() function that will
+do the non-atomic write under spinlock on 32-bit systems.  All callers
+in the driver will now call bnxt_writeq() instead.
+
+v2: Need to pass in bp to bnxt_writeq()
+    Use lo_hi_writeq() [suggested by Florian]
+
+	Reported-by: kernel test robot <lkp@intel.com>
+Fixes: f9ff578251dc ("bnxt_en: introduce new firmware message API based on DMA pools")
+	Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c6132f6f2e682c958f7022ecfd8bec35723a1a9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 50326e2ad60e,ec046e7a2484..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -2126,17 -2111,29 +2127,42 @@@ static inline u32 bnxt_tx_avail(struct 
+  		((txr->tx_prod - txr->tx_cons) & bp->tx_ring_mask);
+  }
+  
+++<<<<<<< HEAD
+ +#if BITS_PER_LONG == 32
+ +#define writeq(val64, db)			\
+ +do {						\
+ +	spin_lock(&bp->db_lock);		\
+ +	writel((val64) & 0xffffffff, db);	\
+ +	writel((val64) >> 32, (db) + 4);	\
+ +	spin_unlock(&bp->db_lock);		\
+ +} while (0)
+ +
+ +#define writeq_relaxed writeq
+++=======
++ static inline void bnxt_writeq(struct bnxt *bp, u64 val,
++ 			       volatile void __iomem *addr)
++ {
++ #if BITS_PER_LONG == 32
++ 	spin_lock(&bp->db_lock);
++ 	lo_hi_writeq(val, addr);
++ 	spin_unlock(&bp->db_lock);
++ #else
++ 	writeq(val, addr);
+++>>>>>>> c6132f6f2e68 (bnxt_en: Fix 64-bit doorbell operation on 32-bit kernels)
++ #endif
++ }
++ 
++ static inline void bnxt_writeq_relaxed(struct bnxt *bp, u64 val,
++ 				       volatile void __iomem *addr)
++ {
++ #if BITS_PER_LONG == 32
++ 	spin_lock(&bp->db_lock);
++ 	lo_hi_writeq_relaxed(val, addr);
++ 	spin_unlock(&bp->db_lock);
++ #else
++ 	writeq_relaxed(val, addr);
+  #endif
++ }
+  
+  /* For TX and RX ring doorbells with no ordering guarantee*/
+  static inline void bnxt_db_write_relaxed(struct bnxt *bp,
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 8cfaddda9936..530d02a6bbaf 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -302,13 +302,15 @@ static bool bnxt_vf_pciid(enum board_idx idx)
+ 	writel(DB_CP_FLAGS | RING_CMP(idx), (db)->doorbell)
+ 
+ #define BNXT_DB_NQ_P5(db, idx)						\
+-	writeq((db)->db_key64 | DBR_TYPE_NQ | RING_CMP(idx), (db)->doorbell)
++	bnxt_writeq(bp, (db)->db_key64 | DBR_TYPE_NQ | RING_CMP(idx),	\
++		    (db)->doorbell)
+ 
+ #define BNXT_DB_CQ_ARM(db, idx)						\
+ 	writel(DB_CP_REARM_FLAGS | RING_CMP(idx), (db)->doorbell)
+ 
+ #define BNXT_DB_NQ_ARM_P5(db, idx)					\
+-	writeq((db)->db_key64 | DBR_TYPE_NQ_ARM | RING_CMP(idx), (db)->doorbell)
++	bnxt_writeq(bp, (db)->db_key64 | DBR_TYPE_NQ_ARM | RING_CMP(idx),\
++		    (db)->doorbell)
+ 
+ static void bnxt_db_nq(struct bnxt *bp, struct bnxt_db_info *db, u32 idx)
+ {
+@@ -329,8 +331,8 @@ static void bnxt_db_nq_arm(struct bnxt *bp, struct bnxt_db_info *db, u32 idx)
+ static void bnxt_db_cq(struct bnxt *bp, struct bnxt_db_info *db, u32 idx)
+ {
+ 	if (bp->flags & BNXT_FLAG_CHIP_P5)
+-		writeq(db->db_key64 | DBR_TYPE_CQ_ARMALL | RING_CMP(idx),
+-		       db->doorbell);
++		bnxt_writeq(bp, db->db_key64 | DBR_TYPE_CQ_ARMALL |
++			    RING_CMP(idx), db->doorbell);
+ 	else
+ 		BNXT_DB_CQ(db, idx);
+ }
+@@ -2611,8 +2613,8 @@ static void __bnxt_poll_cqs_done(struct bnxt *bp, struct bnxt_napi *bnapi,
+ 
+ 		if (cpr2 && cpr2->had_work_done) {
+ 			db = &cpr2->cp_db;
+-			writeq(db->db_key64 | dbr_type |
+-			       RING_CMP(cpr2->cp_raw_cons), db->doorbell);
++			bnxt_writeq(bp, db->db_key64 | dbr_type |
++				    RING_CMP(cpr2->cp_raw_cons), db->doorbell);
+ 			cpr2->had_work_done = 0;
+ 		}
+ 	}
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
