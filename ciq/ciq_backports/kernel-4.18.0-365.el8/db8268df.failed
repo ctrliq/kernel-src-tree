@@ -1,0 +1,575 @@
+x86/arch_prctl: Add controls for dynamic XSTATE components
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Chang S. Bae <chang.seok.bae@intel.com>
+commit db8268df0983adc2bb1fb48c9e5f7bfbb5f617f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/db8268df.failed
+
+Dynamically enabled XSTATE features are by default disabled for all
+processes. A process has to request permission to use such a feature.
+
+To support this implement a architecture specific prctl() with the options:
+
+   - ARCH_GET_XCOMP_SUPP
+
+     Copies the supported feature bitmap into the user space provided
+     u64 storage. The pointer is handed in via arg2
+
+   - ARCH_GET_XCOMP_PERM
+
+     Copies the process wide permitted feature bitmap into the user space
+     provided u64 storage. The pointer is handed in via arg2
+
+   - ARCH_REQ_XCOMP_PERM
+
+     Request permission for a feature set. A feature set can be mapped to a
+     facility, e.g. AMX, and can require one or more XSTATE components to
+     be enabled.
+
+     The feature argument is the number of the highest XSTATE component
+     which is required for a facility to work.
+
+     The request argument is not a user supplied bitmap because that makes
+     filtering harder (think seccomp) and even impossible because to
+     support 32bit tasks the argument would have to be a pointer.
+
+The permission mechanism works this way:
+
+   Task asks for permission for a facility and kernel checks whether that's
+   supported. If supported it does:
+
+     1) Check whether permission has already been granted
+
+     2) Compute the size of the required kernel and user space buffer
+        (sigframe) size.
+
+     3) Validate that no task has a sigaltstack installed
+        which is smaller than the resulting sigframe size
+
+     4) Add the requested feature bit(s) to the permission bitmap of
+        current->group_leader->fpu and store the sizes in the group
+        leaders fpu struct as well.
+
+If that is successful then the feature is still not enabled for any of the
+tasks. The first usage of a related instruction will result in a #NM
+trap. The trap handler validates the permission bit of the tasks group
+leader and if permitted it installs a larger kernel buffer and transfers
+the permission and size info to the new fpstate container which makes all
+the FPU functions which require per task information aware of the extended
+feature set.
+
+  [ tglx: Adopted to new base code, added missing serialization,
+          massaged namings, comments and changelog ]
+
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211021225527.10184-7-chang.seok.bae@intel.com
+(cherry picked from commit db8268df0983adc2bb1fb48c9e5f7bfbb5f617f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/xstate.c
+#	arch/x86/kernel/fpu/xstate.h
+diff --cc arch/x86/kernel/fpu/xstate.c
+index f744359fb635,c837cffebd4a..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -13,13 -14,16 +14,15 @@@
+  #include <linux/proc_fs.h>
+  
+  #include <asm/fpu/api.h>
+ -#include <asm/fpu/regset.h>
+ +#include <asm/fpu/internal.h>
+  #include <asm/fpu/signal.h>
+ -#include <asm/fpu/xcr.h>
+ +#include <asm/fpu/regset.h>
+  
+  #include <asm/tlbflush.h>
++ #include <asm/prctl.h>
++ #include <asm/elf.h>
+  
+  #include "internal.h"
+ -#include "legacy.h"
+  #include "xstate.h"
+  
+  #define for_each_extended_xfeature(bit, mask)				\
+@@@ -1288,8 -1290,171 +1291,175 @@@ void xrstors(struct xregs_state *xstate
+  	WARN_ON_ONCE(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_KVM)
++ void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature)
++ {
++ 	void *addr = get_xsave_addr(&fps->regs.xsave, xfeature);
++ 
++ 	if (addr)
++ 		memset(addr, 0, xstate_sizes[xfeature]);
++ }
++ EXPORT_SYMBOL_GPL(fpstate_clear_xstate_component);
++ #endif
++ 
++ #ifdef CONFIG_X86_64
++ static int validate_sigaltstack(unsigned int usize)
++ {
++ 	struct task_struct *thread, *leader = current->group_leader;
++ 	unsigned long framesize = get_sigframe_size();
++ 
++ 	lockdep_assert_held(&current->sighand->siglock);
++ 
++ 	/* get_sigframe_size() is based on fpu_user_cfg.max_size */
++ 	framesize -= fpu_user_cfg.max_size;
++ 	framesize += usize;
++ 	for_each_thread(leader, thread) {
++ 		if (thread->sas_ss_size && thread->sas_ss_size < framesize)
++ 			return -ENOSPC;
++ 	}
++ 	return 0;
++ }
++ 
++ static int __xstate_request_perm(u64 permitted, u64 requested)
++ {
++ 	/*
++ 	 * This deliberately does not exclude !XSAVES as we still might
++ 	 * decide to optionally context switch XCR0 or talk the silicon
++ 	 * vendors into extending XFD for the pre AMX states.
++ 	 */
++ 	bool compacted = cpu_feature_enabled(X86_FEATURE_XSAVES);
++ 	struct fpu *fpu = &current->group_leader->thread.fpu;
++ 	unsigned int ksize, usize;
++ 	u64 mask;
++ 	int ret;
++ 
++ 	/* Check whether fully enabled */
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Calculate the resulting kernel state size */
++ 	mask = permitted | requested;
++ 	ksize = xstate_calculate_size(mask, compacted);
++ 
++ 	/* Calculate the resulting user state size */
++ 	mask &= XFEATURE_MASK_USER_SUPPORTED;
++ 	usize = xstate_calculate_size(mask, false);
++ 
++ 	ret = validate_sigaltstack(usize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Pairs with the READ_ONCE() in xstate_get_group_perm() */
++ 	WRITE_ONCE(fpu->perm.__state_perm, requested);
++ 	/* Protected by sighand lock */
++ 	fpu->perm.__state_size = ksize;
++ 	fpu->perm.__user_state_size = usize;
++ 	return ret;
++ }
++ 
++ /*
++  * Permissions array to map facilities with more than one component
++  */
++ static const u64 xstate_prctl_req[XFEATURE_MAX] = {
++ 	/* [XFEATURE_XTILE_DATA] = XFEATURE_MASK_XTILE, */
++ };
++ 
++ static int xstate_request_perm(unsigned long idx)
++ {
++ 	u64 permitted, requested;
++ 	int ret;
++ 
++ 	if (idx >= XFEATURE_MAX)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Look up the facility mask which can require more than
++ 	 * one xstate component.
++ 	 */
++ 	idx = array_index_nospec(idx, ARRAY_SIZE(xstate_prctl_req));
++ 	requested = xstate_prctl_req[idx];
++ 	if (!requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	if ((fpu_user_cfg.max_features & requested) != requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Lockless quick check */
++ 	permitted = xstate_get_host_group_perm();
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Protect against concurrent modifications */
++ 	spin_lock_irq(&current->sighand->siglock);
++ 	permitted = xstate_get_host_group_perm();
++ 	ret = __xstate_request_perm(permitted, requested);
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 	return ret;
++ }
++ #else /* CONFIG_X86_64 */
++ static inline int xstate_request_perm(unsigned long idx)
++ {
++ 	return -EPERM;
++ }
++ #endif  /* !CONFIG_X86_64 */
++ 
++ /**
++  * fpu_xstate_prctl - xstate permission operations
++  * @tsk:	Redundant pointer to current
++  * @option:	A subfunction of arch_prctl()
++  * @arg2:	option argument
++  * Return:	0 if successful; otherwise, an error code
++  *
++  * Option arguments:
++  *
++  * ARCH_GET_XCOMP_SUPP: Pointer to user space u64 to store the info
++  * ARCH_GET_XCOMP_PERM: Pointer to user space u64 to store the info
++  * ARCH_REQ_XCOMP_PERM: Facility number requested
++  *
++  * For facilities which require more than one XSTATE component, the request
++  * must be the highest state component number related to that facility,
++  * e.g. for AMX which requires XFEATURE_XTILE_CFG(17) and
++  * XFEATURE_XTILE_DATA(18) this would be XFEATURE_XTILE_DATA(18).
++  */
++ long fpu_xstate_prctl(struct task_struct *tsk, int option, unsigned long arg2)
++ {
++ 	u64 __user *uptr = (u64 __user *)arg2;
++ 	u64 permitted, supported;
++ 	unsigned long idx = arg2;
++ 
++ 	if (tsk != current)
++ 		return -EPERM;
++ 
++ 	switch (option) {
++ 	case ARCH_GET_XCOMP_SUPP:
++ 		supported = fpu_user_cfg.max_features |	fpu_user_cfg.legacy_features;
++ 		return put_user(supported, uptr);
++ 
++ 	case ARCH_GET_XCOMP_PERM:
++ 		/*
++ 		 * Lockless snapshot as it can also change right after the
++ 		 * dropping the lock.
++ 		 */
++ 		permitted = xstate_get_host_group_perm();
++ 		permitted &= XFEATURE_MASK_USER_SUPPORTED;
++ 		return put_user(permitted, uptr);
++ 
++ 	case ARCH_REQ_XCOMP_PERM:
++ 		if (!IS_ENABLED(CONFIG_X86_64))
++ 			return -EOPNOTSUPP;
++ 
++ 		return xstate_request_perm(idx);
++ 
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> db8268df0983 (x86/arch_prctl: Add controls for dynamic XSTATE components)
+  #ifdef CONFIG_PROC_PID_ARCH_STATUS
+ +
+  /*
+   * Report the amount of time elapsed in millisecond since last AVX512
+   * use in the task.
+diff --cc arch/x86/kernel/fpu/xstate.h
+index 0789a04ee705,4ce1dc030f38..000000000000
+--- a/arch/x86/kernel/fpu/xstate.h
++++ b/arch/x86/kernel/fpu/xstate.h
+@@@ -15,4 -15,217 +15,220 @@@ static inline void xstate_init_xcomp_bv
+  		xsave->header.xcomp_bv = mask | XCOMP_BV_COMPACTED_FORMAT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64 xstate_get_host_group_perm(void)
++ {
++ 	/* Pairs with WRITE_ONCE() in xstate_request_perm() */
++ 	return READ_ONCE(current->group_leader->thread.fpu.perm.__state_perm);
++ }
++ 
++ enum xstate_copy_mode {
++ 	XSTATE_COPY_FP,
++ 	XSTATE_COPY_FX,
++ 	XSTATE_COPY_XSAVE,
++ };
++ 
++ struct membuf;
++ extern void __copy_xstate_to_uabi_buf(struct membuf to, struct fpstate *fpstate,
++ 				      u32 pkru_val, enum xstate_copy_mode copy_mode);
++ extern void copy_xstate_to_uabi_buf(struct membuf to, struct task_struct *tsk,
++ 				    enum xstate_copy_mode mode);
++ extern int copy_uabi_from_kernel_to_xstate(struct fpstate *fpstate, const void *kbuf);
++ extern int copy_sigframe_from_user_to_xstate(struct fpstate *fpstate, const void __user *ubuf);
++ 
++ 
++ extern void fpu__init_cpu_xstate(void);
++ extern void fpu__init_system_xstate(unsigned int legacy_size);
++ 
++ extern void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
++ 
++ static inline u64 xfeatures_mask_supervisor(void)
++ {
++ 	return fpu_kernel_cfg.max_features & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
++ }
++ 
++ static inline u64 xfeatures_mask_independent(void)
++ {
++ 	if (!cpu_feature_enabled(X86_FEATURE_ARCH_LBR))
++ 		return XFEATURE_MASK_INDEPENDENT & ~XFEATURE_MASK_LBR;
++ 
++ 	return XFEATURE_MASK_INDEPENDENT;
++ }
++ 
++ /* XSAVE/XRSTOR wrapper functions */
++ 
++ #ifdef CONFIG_X86_64
++ #define REX_PREFIX	"0x48, "
++ #else
++ #define REX_PREFIX
++ #endif
++ 
++ /* These macros all use (%edi)/(%rdi) as the single memory argument. */
++ #define XSAVE		".byte " REX_PREFIX "0x0f,0xae,0x27"
++ #define XSAVEOPT	".byte " REX_PREFIX "0x0f,0xae,0x37"
++ #define XSAVES		".byte " REX_PREFIX "0x0f,0xc7,0x2f"
++ #define XRSTOR		".byte " REX_PREFIX "0x0f,0xae,0x2f"
++ #define XRSTORS		".byte " REX_PREFIX "0x0f,0xc7,0x1f"
++ 
++ /*
++  * After this @err contains 0 on success or the trap number when the
++  * operation raises an exception.
++  */
++ #define XSTATE_OP(op, st, lmask, hmask, err)				\
++ 	asm volatile("1:" op "\n\t"					\
++ 		     "xor %[err], %[err]\n"				\
++ 		     "2:\n\t"						\
++ 		     _ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_FAULT_MCE_SAFE)	\
++ 		     : [err] "=a" (err)					\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * If XSAVES is enabled, it replaces XSAVEOPT because it supports a compact
++  * format and supervisor states in addition to modified optimization in
++  * XSAVEOPT.
++  *
++  * Otherwise, if XSAVEOPT is enabled, XSAVEOPT replaces XSAVE because XSAVEOPT
++  * supports modified optimization which is not supported by XSAVE.
++  *
++  * We use XSAVE as a fallback.
++  *
++  * The 661 label is defined in the ALTERNATIVE* macros as the address of the
++  * original instruction which gets replaced. We need to use it here as the
++  * address of the instruction where we might get an exception at.
++  */
++ #define XSTATE_XSAVE(st, lmask, hmask, err)				\
++ 	asm volatile(ALTERNATIVE_2(XSAVE,				\
++ 				   XSAVEOPT, X86_FEATURE_XSAVEOPT,	\
++ 				   XSAVES,   X86_FEATURE_XSAVES)	\
++ 		     "\n"						\
++ 		     "xor %[err], %[err]\n"				\
++ 		     "3:\n"						\
++ 		     ".pushsection .fixup,\"ax\"\n"			\
++ 		     "4: movl $-2, %[err]\n"				\
++ 		     "jmp 3b\n"						\
++ 		     ".popsection\n"					\
++ 		     _ASM_EXTABLE(661b, 4b)				\
++ 		     : [err] "=r" (err)					\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * Use XRSTORS to restore context if it is enabled. XRSTORS supports compact
++  * XSAVE area format.
++  */
++ #define XSTATE_XRESTORE(st, lmask, hmask)				\
++ 	asm volatile(ALTERNATIVE(XRSTOR,				\
++ 				 XRSTORS, X86_FEATURE_XSAVES)		\
++ 		     "\n"						\
++ 		     "3:\n"						\
++ 		     _ASM_EXTABLE_TYPE(661b, 3b, EX_TYPE_FPU_RESTORE)	\
++ 		     :							\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * Save processor xstate to xsave area.
++  *
++  * Uses either XSAVE or XSAVEOPT or XSAVES depending on the CPU features
++  * and command line options. The choice is permanent until the next reboot.
++  */
++ static inline void os_xsave(struct fpstate *fpstate)
++ {
++ 	u64 mask = fpstate->xfeatures;
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	WARN_ON_FPU(!alternatives_patched);
++ 
++ 	XSTATE_XSAVE(&fpstate->regs.xsave, lmask, hmask, err);
++ 
++ 	/* We should never fault when copying to a kernel buffer: */
++ 	WARN_ON_FPU(err);
++ }
++ 
++ /*
++  * Restore processor xstate from xsave area.
++  *
++  * Uses XRSTORS when XSAVES is used, XRSTOR otherwise.
++  */
++ static inline void os_xrstor(struct xregs_state *xstate, u64 mask)
++ {
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 
++ 	XSTATE_XRESTORE(xstate, lmask, hmask);
++ }
++ 
++ /*
++  * Save xstate to user space xsave area.
++  *
++  * We don't use modified optimization because xrstor/xrstors might track
++  * a different application.
++  *
++  * We don't use compacted format xsave area for backward compatibility for
++  * old applications which don't understand the compacted format of the
++  * xsave area.
++  *
++  * The caller has to zero buf::header before calling this because XSAVE*
++  * does not touch the reserved fields in the header.
++  */
++ static inline int xsave_to_user_sigframe(struct xregs_state __user *buf)
++ {
++ 	/*
++ 	 * Include the features which are not xsaved/rstored by the kernel
++ 	 * internally, e.g. PKRU. That's user space ABI and also required
++ 	 * to allow the signal handler to modify PKRU.
++ 	 */
++ 	u64 mask = current->thread.fpu.fpstate->user_xfeatures;
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	stac();
++ 	XSTATE_OP(XSAVE, buf, lmask, hmask, err);
++ 	clac();
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Restore xstate from user space xsave area.
++  */
++ static inline int xrstor_from_user_sigframe(struct xregs_state __user *buf, u64 mask)
++ {
++ 	struct xregs_state *xstate = ((__force struct xregs_state *)buf);
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	stac();
++ 	XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++ 	clac();
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Restore xstate from kernel space xsave area, return an error code instead of
++  * an exception.
++  */
++ static inline int os_xrstor_safe(struct xregs_state *xstate, u64 mask)
++ {
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	if (cpu_feature_enabled(X86_FEATURE_XSAVES))
++ 		XSTATE_OP(XRSTORS, xstate, lmask, hmask, err);
++ 	else
++ 		XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++ 
++ 	return err;
++ }
++ 
++ 
+++>>>>>>> db8268df0983 (x86/arch_prctl: Add controls for dynamic XSTATE components)
+  #endif
+diff --git a/arch/x86/include/asm/fpu/api.h b/arch/x86/include/asm/fpu/api.h
+index 9833eb36228b..05d197a39f74 100644
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@ -104,4 +104,8 @@ extern void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_ma
+ extern int fpu_copy_kvm_uabi_to_fpstate(struct fpu *fpu, const void *buf, u64 xcr0, u32 *pkru);
+ extern void fpu_copy_fpstate_to_kvm_uabi(struct fpu *fpu, void *buf, unsigned int size, u32 pkru);
+ 
++/* prctl */
++struct task_struct;
++extern long fpu_xstate_prctl(struct task_struct *tsk, int option, unsigned long arg2);
++
+ #endif /* _ASM_X86_FPU_API_H */
+diff --git a/arch/x86/include/asm/proto.h b/arch/x86/include/asm/proto.h
+index 40f1f0cb73d7..a85190d97dab 100644
+--- a/arch/x86/include/asm/proto.h
++++ b/arch/x86/include/asm/proto.h
+@@ -37,6 +37,6 @@ void x86_report_nx(void);
+ extern int reboot_force;
+ 
+ long do_arch_prctl_common(struct task_struct *task, int option,
+-			  unsigned long cpuid_enabled);
++			  unsigned long arg2);
+ 
+ #endif /* _ASM_X86_PROTO_H */
+diff --git a/arch/x86/include/uapi/asm/prctl.h b/arch/x86/include/uapi/asm/prctl.h
+index 5a6aac9fa41f..754a07856817 100644
+--- a/arch/x86/include/uapi/asm/prctl.h
++++ b/arch/x86/include/uapi/asm/prctl.h
+@@ -10,6 +10,10 @@
+ #define ARCH_GET_CPUID		0x1011
+ #define ARCH_SET_CPUID		0x1012
+ 
++#define ARCH_GET_XCOMP_SUPP	0x1021
++#define ARCH_GET_XCOMP_PERM	0x1022
++#define ARCH_REQ_XCOMP_PERM	0x1023
++
+ #define ARCH_MAP_VDSO_X32	0x2001
+ #define ARCH_MAP_VDSO_32	0x2002
+ #define ARCH_MAP_VDSO_64	0x2003
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+* Unmerged path arch/x86/kernel/fpu/xstate.h
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index bb26f23ff9f8..ac865574061d 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -31,6 +31,7 @@
+ #include <asm/syscalls.h>
+ #include <linux/uaccess.h>
+ #include <asm/mwait.h>
++#include <asm/fpu/api.h>
+ #include <asm/fpu/sched.h>
+ #include <asm/debugreg.h>
+ #include <asm/nmi.h>
+@@ -981,13 +982,17 @@ unsigned long get_wchan(struct task_struct *p)
+ }
+ 
+ long do_arch_prctl_common(struct task_struct *task, int option,
+-			  unsigned long cpuid_enabled)
++			  unsigned long arg2)
+ {
+ 	switch (option) {
+ 	case ARCH_GET_CPUID:
+ 		return get_cpuid_mode();
+ 	case ARCH_SET_CPUID:
+-		return set_cpuid_mode(task, cpuid_enabled);
++		return set_cpuid_mode(task, arg2);
++	case ARCH_GET_XCOMP_SUPP:
++	case ARCH_GET_XCOMP_PERM:
++	case ARCH_REQ_XCOMP_PERM:
++		return fpu_xstate_prctl(task, option, arg2);
+ 	}
+ 
+ 	return -EINVAL;
