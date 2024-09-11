@@ -1,0 +1,120 @@
+KVM: SVM: Disable AVIC before setting V_IRQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit 7d611233b01613c866259d6e6f44c67f7f7eb2a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7d611233.failed
+
+The commit 64b5bd270426 ("KVM: nSVM: ignore L1 interrupt window
+while running L2 with V_INTR_MASKING=1") introduced a WARN_ON,
+which checks if AVIC is enabled when trying to set V_IRQ
+in the VMCB for enabling irq window.
+
+The following warning is triggered because the requesting vcpu
+(to deactivate AVIC) does not get to process APICv update request
+for itself until the next #vmexit.
+
+WARNING: CPU: 0 PID: 118232 at arch/x86/kvm/svm/svm.c:1372 enable_irq_window+0x6a/0xa0 [kvm_amd]
+ RIP: 0010:enable_irq_window+0x6a/0xa0 [kvm_amd]
+ Call Trace:
+  kvm_arch_vcpu_ioctl_run+0x6e3/0x1b50 [kvm]
+  ? kvm_vm_ioctl_irq_line+0x27/0x40 [kvm]
+  ? _copy_to_user+0x26/0x30
+  ? kvm_vm_ioctl+0xb3e/0xd90 [kvm]
+  ? set_next_entity+0x78/0xc0
+  kvm_vcpu_ioctl+0x236/0x610 [kvm]
+  ksys_ioctl+0x8a/0xc0
+  __x64_sys_ioctl+0x1a/0x20
+  do_syscall_64+0x58/0x210
+  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Fixes by sending APICV update request to all other vcpus, and
+immediately update APIC for itself.
+
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Link: https://lkml.org/lkml/2020/5/2/167
+Fixes: 64b5bd270426 ("KVM: nSVM: ignore L1 interrupt window while running L2 with V_INTR_MASKING=1")
+Message-Id: <1588818939-54264-1-git-send-email-suravee.suthikulpanit@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7d611233b01613c866259d6e6f44c67f7f7eb2a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 6f349bd6cdad,98176b80c481..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -7976,6 -8040,65 +7976,68 @@@ void kvm_make_scan_ioapic_request(struc
+  	kvm_make_all_cpus_request(kvm, KVM_REQ_SCAN_IOAPIC);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
++ {
++ 	if (!lapic_in_kernel(vcpu))
++ 		return;
++ 
++ 	vcpu->arch.apicv_active = kvm_apicv_activated(vcpu->kvm);
++ 	kvm_apic_update_apicv(vcpu);
++ 	kvm_x86_ops.refresh_apicv_exec_ctrl(vcpu);
++ }
++ EXPORT_SYMBOL_GPL(kvm_vcpu_update_apicv);
++ 
++ /*
++  * NOTE: Do not hold any lock prior to calling this.
++  *
++  * In particular, kvm_request_apicv_update() expects kvm->srcu not to be
++  * locked, because it calls __x86_set_memory_region() which does
++  * synchronize_srcu(&kvm->srcu).
++  */
++ void kvm_request_apicv_update(struct kvm *kvm, bool activate, ulong bit)
++ {
++ 	struct kvm_vcpu *except;
++ 	unsigned long old, new, expected;
++ 
++ 	if (!kvm_x86_ops.check_apicv_inhibit_reasons ||
++ 	    !kvm_x86_ops.check_apicv_inhibit_reasons(bit))
++ 		return;
++ 
++ 	old = READ_ONCE(kvm->arch.apicv_inhibit_reasons);
++ 	do {
++ 		expected = new = old;
++ 		if (activate)
++ 			__clear_bit(bit, &new);
++ 		else
++ 			__set_bit(bit, &new);
++ 		if (new == old)
++ 			break;
++ 		old = cmpxchg(&kvm->arch.apicv_inhibit_reasons, expected, new);
++ 	} while (old != expected);
++ 
++ 	if (!!old == !!new)
++ 		return;
++ 
++ 	trace_kvm_apicv_update_request(activate, bit);
++ 	if (kvm_x86_ops.pre_update_apicv_exec_ctrl)
++ 		kvm_x86_ops.pre_update_apicv_exec_ctrl(kvm, activate);
++ 
++ 	/*
++ 	 * Sending request to update APICV for all other vcpus,
++ 	 * while update the calling vcpu immediately instead of
++ 	 * waiting for another #VMEXIT to handle the request.
++ 	 */
++ 	except = kvm_get_running_vcpu();
++ 	kvm_make_all_cpus_request_except(kvm, KVM_REQ_APICV_UPDATE,
++ 					 except);
++ 	if (except)
++ 		kvm_vcpu_update_apicv(except);
++ }
++ EXPORT_SYMBOL_GPL(kvm_request_apicv_update);
++ 
+++>>>>>>> 7d611233b016 (KVM: SVM: Disable AVIC before setting V_IRQ)
+  static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+  {
+  	if (!kvm_apic_present(vcpu))
+* Unmerged path arch/x86/kvm/x86.c
