@@ -283,11 +283,11 @@ static void tcf_bpf_prog_fill_cfg(const struct tcf_bpf *prog,
 
 static int tcf_bpf_init(struct net *net, struct nlattr *nla,
 			struct nlattr *est, struct tc_action **act,
-			int replace, int bind, bool rtnl_held,
 			struct tcf_proto *tp, u32 flags,
 			struct netlink_ext_ack *extack)
 {
 	struct tc_action_net *tn = net_generic(net, bpf_net_id);
+	bool bind = flags & TCA_ACT_FLAGS_BIND;
 	struct nlattr *tb[TCA_ACT_BPF_MAX + 1];
 	struct tcf_chain *goto_ch = NULL;
 	struct tcf_bpf_cfg cfg, old;
@@ -325,7 +325,7 @@ static int tcf_bpf_init(struct net *net, struct nlattr *nla,
 		if (bind)
 			return 0;
 
-		if (!replace) {
+		if (!(flags & TCA_ACT_FLAGS_REPLACE)) {
 			tcf_idr_release(*act, bind);
 			return -EEXIST;
 		}
