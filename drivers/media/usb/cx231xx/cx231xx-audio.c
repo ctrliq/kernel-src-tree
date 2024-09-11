@@ -110,7 +110,7 @@ static void cx231xx_audio_isocirq(struct urb *urb)
 	case -ESHUTDOWN:
 		return;
 	default:		/* error */
-		dev_dbg(dev->dev, "urb completition error %d.\n",
+		dev_dbg(dev->dev, "urb completion error %d.\n",
 			urb->status);
 		break;
 	}
@@ -201,7 +201,7 @@ static void cx231xx_audio_bulkirq(struct urb *urb)
 	case -ESHUTDOWN:
 		return;
 	default:		/* error */
-		dev_dbg(dev->dev, "urb completition error %d.\n",
+		dev_dbg(dev->dev, "urb completion error %d.\n",
 			urb->status);
 		break;
 	}
