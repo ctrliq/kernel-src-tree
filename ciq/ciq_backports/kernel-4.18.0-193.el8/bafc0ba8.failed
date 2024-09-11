@@ -1,0 +1,400 @@
+selftests/bpf: add tests for bpf_tcp_check_syncookie and bpf_skc_lookup_tcp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Lorenz Bauer <lmb@cloudflare.com>
+commit bafc0ba8261e36e36b0b1e851749fd3712a2a6f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/bafc0ba8.failed
+
+Add tests which verify that the new helpers work for both IPv4 and
+IPv6, by forcing SYN cookies to always on. Use a new network namespace
+to avoid clobbering the global SYN cookie settings.
+
+	Signed-off-by: Lorenz Bauer <lmb@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit bafc0ba8261e36e36b0b1e851749fd3712a2a6f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/.gitignore
+#	tools/testing/selftests/bpf/Makefile
+#	tools/testing/selftests/bpf/bpf_helpers.h
+#	tools/testing/selftests/bpf/test_tcp_check_syncookie_kern.c
+diff --cc tools/testing/selftests/bpf/.gitignore
+index 159e0044042b,41e8a689aa77..000000000000
+--- a/tools/testing/selftests/bpf/.gitignore
++++ b/tools/testing/selftests/bpf/.gitignore
+@@@ -24,3 -24,11 +24,14 @@@ test_skb_cgroup_id_use
+  test_socket_cookie
+  test_cgroup_storage
+  test_select_reuseport
+++<<<<<<< HEAD
+++=======
++ test_flow_dissector
++ flow_dissector_load
++ test_netcnt
++ test_section_names
++ test_tcpnotify_user
++ test_libbpf
++ test_tcp_check_syncookie_user
++ alu32
+++>>>>>>> bafc0ba8261e (selftests/bpf: add tests for bpf_tcp_check_syncookie and bpf_skc_lookup_tcp)
+diff --cc tools/testing/selftests/bpf/Makefile
+index 37b01554670e,25d3939eb840..000000000000
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@@ -53,7 -50,9 +53,13 @@@ TEST_PROGS := test_kmod.sh 
+  	test_lirc_mode2.sh \
+  	test_skb_cgroup_id.sh \
+  	test_flow_dissector.sh \
+++<<<<<<< HEAD
+ +	test_xdp_vlan.sh
+++=======
++ 	test_xdp_vlan.sh \
++ 	test_lwt_ip_encap.sh \
++ 	test_tcp_check_syncookie.sh
+++>>>>>>> bafc0ba8261e (selftests/bpf: add tests for bpf_tcp_check_syncookie and bpf_skc_lookup_tcp)
+  
+  TEST_PROGS_EXTENDED := with_addr.sh \
+  	with_tunnels.sh \
+diff --cc tools/testing/selftests/bpf/bpf_helpers.h
+index f4aedf8b6643,97d140961438..000000000000
+--- a/tools/testing/selftests/bpf/bpf_helpers.h
++++ b/tools/testing/selftests/bpf/bpf_helpers.h
+@@@ -172,6 -177,21 +177,24 @@@ static int (*bpf_skb_vlan_pop)(void *ct
+  	(void *) BPF_FUNC_skb_vlan_pop;
+  static int (*bpf_rc_pointer_rel)(void *ctx, int rel_x, int rel_y) =
+  	(void *) BPF_FUNC_rc_pointer_rel;
+++<<<<<<< HEAD
+++=======
++ static void (*bpf_spin_lock)(struct bpf_spin_lock *lock) =
++ 	(void *) BPF_FUNC_spin_lock;
++ static void (*bpf_spin_unlock)(struct bpf_spin_lock *lock) =
++ 	(void *) BPF_FUNC_spin_unlock;
++ static struct bpf_sock *(*bpf_sk_fullsock)(struct bpf_sock *sk) =
++ 	(void *) BPF_FUNC_sk_fullsock;
++ static struct bpf_tcp_sock *(*bpf_tcp_sock)(struct bpf_sock *sk) =
++ 	(void *) BPF_FUNC_tcp_sock;
++ static struct bpf_sock *(*bpf_get_listener_sock)(struct bpf_sock *sk) =
++ 	(void *) BPF_FUNC_get_listener_sock;
++ static int (*bpf_skb_ecn_set_ce)(void *ctx) =
++ 	(void *) BPF_FUNC_skb_ecn_set_ce;
++ static int (*bpf_tcp_check_syncookie)(struct bpf_sock *sk,
++ 	    void *ip, int ip_len, void *tcp, int tcp_len) =
++ 	(void *) BPF_FUNC_tcp_check_syncookie;
+++>>>>>>> bafc0ba8261e (selftests/bpf: add tests for bpf_tcp_check_syncookie and bpf_skc_lookup_tcp)
+  
+  /* llvm builtin functions that eBPF C program may use to
+   * emit BPF_LD_ABS and BPF_LD_IND instructions
+* Unmerged path tools/testing/selftests/bpf/test_tcp_check_syncookie_kern.c
+* Unmerged path tools/testing/selftests/bpf/.gitignore
+* Unmerged path tools/testing/selftests/bpf/Makefile
+* Unmerged path tools/testing/selftests/bpf/bpf_helpers.h
+diff --git a/tools/testing/selftests/bpf/test_tcp_check_syncookie.sh b/tools/testing/selftests/bpf/test_tcp_check_syncookie.sh
+new file mode 100755
+index 000000000000..d48e51716d19
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_tcp_check_syncookie.sh
+@@ -0,0 +1,81 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0
++# Copyright (c) 2018 Facebook
++# Copyright (c) 2019 Cloudflare
++
++set -eu
++
++wait_for_ip()
++{
++	local _i
++	printf "Wait for IP %s to become available " "$1"
++	for _i in $(seq ${MAX_PING_TRIES}); do
++		printf "."
++		if ns1_exec ping -c 1 -W 1 "$1" >/dev/null 2>&1; then
++			echo " OK"
++			return
++		fi
++		sleep 1
++	done
++	echo 1>&2 "ERROR: Timeout waiting for test IP to become available."
++	exit 1
++}
++
++get_prog_id()
++{
++	awk '/ id / {sub(/.* id /, "", $0); print($1)}'
++}
++
++ns1_exec()
++{
++	ip netns exec ns1 "$@"
++}
++
++setup()
++{
++	ip netns add ns1
++	ns1_exec ip link set lo up
++
++	ns1_exec sysctl -w net.ipv4.tcp_syncookies=2
++
++	wait_for_ip 127.0.0.1
++	wait_for_ip ::1
++}
++
++cleanup()
++{
++	ip netns del ns1 2>/dev/null || :
++}
++
++main()
++{
++	trap cleanup EXIT 2 3 6 15
++	setup
++
++	printf "Testing clsact..."
++	ns1_exec tc qdisc add dev "${TEST_IF}" clsact
++	ns1_exec tc filter add dev "${TEST_IF}" ingress \
++		bpf obj "${BPF_PROG_OBJ}" sec "${CLSACT_SECTION}" da
++
++	BPF_PROG_ID=$(ns1_exec tc filter show dev "${TEST_IF}" ingress | \
++		      get_prog_id)
++	ns1_exec "${PROG}" "${BPF_PROG_ID}"
++	ns1_exec tc qdisc del dev "${TEST_IF}" clsact
++
++	printf "Testing XDP..."
++	ns1_exec ip link set "${TEST_IF}" xdp \
++		object "${BPF_PROG_OBJ}" section "${XDP_SECTION}"
++	BPF_PROG_ID=$(ns1_exec ip link show "${TEST_IF}" | get_prog_id)
++	ns1_exec "${PROG}" "${BPF_PROG_ID}"
++}
++
++DIR=$(dirname $0)
++TEST_IF=lo
++MAX_PING_TRIES=5
++BPF_PROG_OBJ="${DIR}/test_tcp_check_syncookie_kern.o"
++CLSACT_SECTION="clsact/check_syncookie"
++XDP_SECTION="xdp/check_syncookie"
++BPF_PROG_ID=0
++PROG="${DIR}/test_tcp_check_syncookie_user"
++
++main
+* Unmerged path tools/testing/selftests/bpf/test_tcp_check_syncookie_kern.c
+diff --git a/tools/testing/selftests/bpf/test_tcp_check_syncookie_user.c b/tools/testing/selftests/bpf/test_tcp_check_syncookie_user.c
+new file mode 100644
+index 000000000000..87829c86c746
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_tcp_check_syncookie_user.c
+@@ -0,0 +1,212 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2018 Facebook
++// Copyright (c) 2019 Cloudflare
++
++#include <string.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++
++#include <bpf/bpf.h>
++#include <bpf/libbpf.h>
++
++#include "bpf_rlimit.h"
++#include "cgroup_helpers.h"
++
++static int start_server(const struct sockaddr *addr, socklen_t len)
++{
++	int fd;
++
++	fd = socket(addr->sa_family, SOCK_STREAM, 0);
++	if (fd == -1) {
++		log_err("Failed to create server socket");
++		goto out;
++	}
++
++	if (bind(fd, addr, len) == -1) {
++		log_err("Failed to bind server socket");
++		goto close_out;
++	}
++
++	if (listen(fd, 128) == -1) {
++		log_err("Failed to listen on server socket");
++		goto close_out;
++	}
++
++	goto out;
++
++close_out:
++	close(fd);
++	fd = -1;
++out:
++	return fd;
++}
++
++static int connect_to_server(int server_fd)
++{
++	struct sockaddr_storage addr;
++	socklen_t len = sizeof(addr);
++	int fd = -1;
++
++	if (getsockname(server_fd, (struct sockaddr *)&addr, &len)) {
++		log_err("Failed to get server addr");
++		goto out;
++	}
++
++	fd = socket(addr.ss_family, SOCK_STREAM, 0);
++	if (fd == -1) {
++		log_err("Failed to create client socket");
++		goto out;
++	}
++
++	if (connect(fd, (const struct sockaddr *)&addr, len) == -1) {
++		log_err("Fail to connect to server");
++		goto close_out;
++	}
++
++	goto out;
++
++close_out:
++	close(fd);
++	fd = -1;
++out:
++	return fd;
++}
++
++static int get_map_fd_by_prog_id(int prog_id)
++{
++	struct bpf_prog_info info = {};
++	__u32 info_len = sizeof(info);
++	__u32 map_ids[1];
++	int prog_fd = -1;
++	int map_fd = -1;
++
++	prog_fd = bpf_prog_get_fd_by_id(prog_id);
++	if (prog_fd < 0) {
++		log_err("Failed to get fd by prog id %d", prog_id);
++		goto err;
++	}
++
++	info.nr_map_ids = 1;
++	info.map_ids = (__u64)(unsigned long)map_ids;
++
++	if (bpf_obj_get_info_by_fd(prog_fd, &info, &info_len)) {
++		log_err("Failed to get info by prog fd %d", prog_fd);
++		goto err;
++	}
++
++	if (!info.nr_map_ids) {
++		log_err("No maps found for prog fd %d", prog_fd);
++		goto err;
++	}
++
++	map_fd = bpf_map_get_fd_by_id(map_ids[0]);
++	if (map_fd < 0)
++		log_err("Failed to get fd by map id %d", map_ids[0]);
++err:
++	if (prog_fd >= 0)
++		close(prog_fd);
++	return map_fd;
++}
++
++static int run_test(int server_fd, int results_fd)
++{
++	int client = -1, srv_client = -1;
++	int ret = 0;
++	__u32 key = 0;
++	__u64 value = 0;
++
++	if (bpf_map_update_elem(results_fd, &key, &value, 0) < 0) {
++		log_err("Can't clear results");
++		goto err;
++	}
++
++	client = connect_to_server(server_fd);
++	if (client == -1)
++		goto err;
++
++	srv_client = accept(server_fd, NULL, 0);
++	if (srv_client == -1) {
++		log_err("Can't accept connection");
++		goto err;
++	}
++
++	if (bpf_map_lookup_elem(results_fd, &key, &value) < 0) {
++		log_err("Can't lookup result");
++		goto err;
++	}
++
++	if (value != 1) {
++		log_err("Didn't match syncookie: %llu", value);
++		goto err;
++	}
++
++	goto out;
++
++err:
++	ret = 1;
++out:
++	close(client);
++	close(srv_client);
++	return ret;
++}
++
++int main(int argc, char **argv)
++{
++	struct sockaddr_in addr4;
++	struct sockaddr_in6 addr6;
++	int server = -1;
++	int server_v6 = -1;
++	int results = -1;
++	int err = 0;
++
++	if (argc < 2) {
++		fprintf(stderr, "Usage: %s prog_id\n", argv[0]);
++		exit(1);
++	}
++
++	results = get_map_fd_by_prog_id(atoi(argv[1]));
++	if (results < 0) {
++		log_err("Can't get map");
++		goto err;
++	}
++
++	memset(&addr4, 0, sizeof(addr4));
++	addr4.sin_family = AF_INET;
++	addr4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++	addr4.sin_port = 0;
++
++	memset(&addr6, 0, sizeof(addr6));
++	addr6.sin6_family = AF_INET6;
++	addr6.sin6_addr = in6addr_loopback;
++	addr6.sin6_port = 0;
++
++	server = start_server((const struct sockaddr *)&addr4, sizeof(addr4));
++	if (server == -1)
++		goto err;
++
++	server_v6 = start_server((const struct sockaddr *)&addr6,
++				 sizeof(addr6));
++	if (server_v6 == -1)
++		goto err;
++
++	if (run_test(server, results))
++		goto err;
++
++	if (run_test(server_v6, results))
++		goto err;
++
++	printf("ok\n");
++	goto out;
++err:
++	err = 1;
++out:
++	close(server);
++	close(server_v6);
++	close(results);
++	return err;
++}
