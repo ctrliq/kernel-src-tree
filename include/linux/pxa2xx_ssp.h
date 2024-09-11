@@ -1,6 +1,4 @@
 /*
- *  pxa2xx_ssp.h
- *
  *  Copyright (C) 2003 Russell King, All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or modify
