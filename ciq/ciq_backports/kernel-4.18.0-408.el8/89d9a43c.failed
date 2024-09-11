@@ -1,0 +1,170 @@
+KVM: selftests: Wait for all vCPU to be created before entering guest mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 89d9a43c1d2d3d703fae25c990a1d98dd178dd17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/89d9a43c.failed
+
+Thread creation requires taking the mmap_sem in write mode, which causes
+vCPU threads running in guest mode to block while they are populating
+memory. Fix this by waiting for all vCPU threads to be created and start
+running before entering guest mode on any one vCPU thread.
+
+This substantially improves the "Populate memory time" when using 1GiB
+pages since it allows all vCPUs to zero pages in parallel rather than
+blocking because a writer is waiting (which is waiting for another vCPU
+that is busy zeroing a 1GiB page).
+
+Before:
+
+  $ ./dirty_log_perf_test -v256 -s anonymous_hugetlb_1gb
+  ...
+  Populate memory time: 52.811184013s
+
+After:
+
+  $ ./dirty_log_perf_test -v256 -s anonymous_hugetlb_1gb
+  ...
+  Populate memory time: 10.204573342s
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20211111001257.1446428-4-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 89d9a43c1d2d3d703fae25c990a1d98dd178dd17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/lib/perf_test_util.c
+diff --cc tools/testing/selftests/kvm/lib/perf_test_util.c
+index 0ef80dbdc116,722df3a28791..000000000000
+--- a/tools/testing/selftests/kvm/lib/perf_test_util.c
++++ b/tools/testing/selftests/kvm/lib/perf_test_util.c
+@@@ -18,6 -16,26 +18,29 @@@ uint64_t guest_test_phys_mem
+   */
+  static uint64_t guest_test_virt_mem = DEFAULT_GUEST_TEST_MEM;
+  
+++<<<<<<< HEAD
+++=======
++ struct vcpu_thread {
++ 	/* The id of the vCPU. */
++ 	int vcpu_id;
++ 
++ 	/* The pthread backing the vCPU. */
++ 	pthread_t thread;
++ 
++ 	/* Set to true once the vCPU thread is up and running. */
++ 	bool running;
++ };
++ 
++ /* The vCPU threads involved in this test. */
++ static struct vcpu_thread vcpu_threads[KVM_MAX_VCPUS];
++ 
++ /* The function run by each vCPU thread, as provided by the test. */
++ static void (*vcpu_thread_fn)(struct perf_test_vcpu_args *);
++ 
++ /* Set to true once all vCPU threads are up and running. */
++ static bool all_vcpu_threads_running;
++ 
+++>>>>>>> 89d9a43c1d2d (KVM: selftests: Wait for all vCPU to be created before entering guest mode)
+  /*
+   * Continuously write to the first 8 bytes of each page in the
+   * specified region.
+@@@ -124,36 -192,60 +147,84 @@@ void perf_test_destroy_vm(struct kvm_v
+  	kvm_vm_free(vm);
+  }
+  
+++<<<<<<< HEAD
+ +void perf_test_setup_vcpus(struct kvm_vm *vm, int vcpus,
+ +			   uint64_t vcpu_memory_bytes,
+ +			   bool partition_vcpu_memory_access)
+++=======
++ void perf_test_set_wr_fract(struct kvm_vm *vm, int wr_fract)
++ {
++ 	perf_test_args.wr_fract = wr_fract;
++ 	sync_global_to_guest(vm, perf_test_args);
++ }
++ 
++ static void *vcpu_thread_main(void *data)
++ {
++ 	struct vcpu_thread *vcpu = data;
++ 
++ 	WRITE_ONCE(vcpu->running, true);
++ 
++ 	/*
++ 	 * Wait for all vCPU threads to be up and running before calling the test-
++ 	 * provided vCPU thread function. This prevents thread creation (which
++ 	 * requires taking the mmap_sem in write mode) from interfering with the
++ 	 * guest faulting in its memory.
++ 	 */
++ 	while (!READ_ONCE(all_vcpu_threads_running))
++ 		;
++ 
++ 	vcpu_thread_fn(&perf_test_args.vcpu_args[vcpu->vcpu_id]);
++ 
++ 	return NULL;
++ }
++ 
++ void perf_test_start_vcpu_threads(int vcpus, void (*vcpu_fn)(struct perf_test_vcpu_args *))
+++>>>>>>> 89d9a43c1d2d (KVM: selftests: Wait for all vCPU to be created before entering guest mode)
+  {
+ +	vm_paddr_t vcpu_gpa;
+ +	struct perf_test_vcpu_args *vcpu_args;
+  	int vcpu_id;
+  
+++<<<<<<< HEAD
+++=======
++ 	vcpu_thread_fn = vcpu_fn;
++ 	WRITE_ONCE(all_vcpu_threads_running, false);
++ 
+++>>>>>>> 89d9a43c1d2d (KVM: selftests: Wait for all vCPU to be created before entering guest mode)
+  	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++) {
+ -		struct vcpu_thread *vcpu = &vcpu_threads[vcpu_id];
+ +		vcpu_args = &perf_test_args.vcpu_args[vcpu_id];
+  
+++<<<<<<< HEAD
+ +		vcpu_args->vcpu_id = vcpu_id;
+ +		if (partition_vcpu_memory_access) {
+ +			vcpu_args->gva = guest_test_virt_mem +
+ +					 (vcpu_id * vcpu_memory_bytes);
+ +			vcpu_args->pages = vcpu_memory_bytes /
+ +					   perf_test_args.guest_page_size;
+ +			vcpu_gpa = guest_test_phys_mem +
+ +				   (vcpu_id * vcpu_memory_bytes);
+ +		} else {
+ +			vcpu_args->gva = guest_test_virt_mem;
+ +			vcpu_args->pages = (vcpus * vcpu_memory_bytes) /
+ +					   perf_test_args.guest_page_size;
+ +			vcpu_gpa = guest_test_phys_mem;
+ +		}
+++=======
++ 		vcpu->vcpu_id = vcpu_id;
++ 		WRITE_ONCE(vcpu->running, false);
+++>>>>>>> 89d9a43c1d2d (KVM: selftests: Wait for all vCPU to be created before entering guest mode)
+ +
+ +		vcpu_args_set(vm, vcpu_id, 1, vcpu_id);
+  
+ -		pthread_create(&vcpu->thread, NULL, vcpu_thread_main, vcpu);
+ +		pr_debug("Added VCPU %d with test mem gpa [%lx, %lx)\n",
+ +			 vcpu_id, vcpu_gpa, vcpu_gpa +
+ +			 (vcpu_args->pages * perf_test_args.guest_page_size));
+  	}
++ 
++ 	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++) {
++ 		while (!READ_ONCE(vcpu_threads[vcpu_id].running))
++ 			;
++ 	}
++ 
++ 	WRITE_ONCE(all_vcpu_threads_running, true);
+  }
+ -
+ -void perf_test_join_vcpu_threads(int vcpus)
+ -{
+ -	int vcpu_id;
+ -
+ -	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++)
+ -		pthread_join(vcpu_threads[vcpu_id].thread, NULL);
+ -}
+* Unmerged path tools/testing/selftests/kvm/lib/perf_test_util.c
