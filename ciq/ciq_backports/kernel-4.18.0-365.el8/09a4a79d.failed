@@ -1,0 +1,151 @@
+swiotlb: fix implicit debugfs declarations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Claire Chang <tientzu@chromium.org>
+commit 09a4a79d42ced8ca7fc250b05e45ac1cb23a9c52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/09a4a79d.failed
+
+Factor out the debugfs bits from rmem_swiotlb_device_init() into a separate
+rmem_swiotlb_debugfs_init() to fix the implicit debugfs declarations.
+
+Fixes: 461021875c50 ("swiotlb: Add restricted DMA pool initialization")
+	Reported-by: kernel test robot <lkp@intel.com>
+	Signed-off-by: Claire Chang <tientzu@chromium.org>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit 09a4a79d42ced8ca7fc250b05e45ac1cb23a9c52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index be0e4e04c6fd,b7f76bca89bf..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -817,6 -707,119 +817,122 @@@ static int __init swiotlb_create_debugf
+  	return 0;
+  }
+  
+ -late_initcall(swiotlb_create_default_debugfs);
+ +late_initcall(swiotlb_create_debugfs);
+  
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_DMA_RESTRICTED_POOL
++ 
++ #ifdef CONFIG_DEBUG_FS
++ static void rmem_swiotlb_debugfs_init(struct reserved_mem *rmem)
++ {
++ 	struct io_tlb_mem *mem = rmem->priv;
++ 
++ 	mem->debugfs = debugfs_create_dir(rmem->name, debugfs_dir);
++ 	swiotlb_create_debugfs_files(mem);
++ }
++ #else
++ static void rmem_swiotlb_debugfs_init(struct reserved_mem *rmem)
++ {
++ }
++ #endif
++ 
++ struct page *swiotlb_alloc(struct device *dev, size_t size)
++ {
++ 	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
++ 	phys_addr_t tlb_addr;
++ 	int index;
++ 
++ 	if (!mem)
++ 		return NULL;
++ 
++ 	index = swiotlb_find_slots(dev, 0, size);
++ 	if (index == -1)
++ 		return NULL;
++ 
++ 	tlb_addr = slot_addr(mem->start, index);
++ 
++ 	return pfn_to_page(PFN_DOWN(tlb_addr));
++ }
++ 
++ bool swiotlb_free(struct device *dev, struct page *page, size_t size)
++ {
++ 	phys_addr_t tlb_addr = page_to_phys(page);
++ 
++ 	if (!is_swiotlb_buffer(dev, tlb_addr))
++ 		return false;
++ 
++ 	swiotlb_release_slots(dev, tlb_addr);
++ 
++ 	return true;
++ }
++ 
++ static int rmem_swiotlb_device_init(struct reserved_mem *rmem,
++ 				    struct device *dev)
++ {
++ 	struct io_tlb_mem *mem = rmem->priv;
++ 	unsigned long nslabs = rmem->size >> IO_TLB_SHIFT;
++ 
++ 	/*
++ 	 * Since multiple devices can share the same pool, the private data,
++ 	 * io_tlb_mem struct, will be initialized by the first device attached
++ 	 * to it.
++ 	 */
++ 	if (!mem) {
++ 		mem = kzalloc(struct_size(mem, slots, nslabs), GFP_KERNEL);
++ 		if (!mem)
++ 			return -ENOMEM;
++ 
++ 		set_memory_decrypted((unsigned long)phys_to_virt(rmem->base),
++ 				     rmem->size >> PAGE_SHIFT);
++ 		swiotlb_init_io_tlb_mem(mem, rmem->base, nslabs, false);
++ 		mem->force_bounce = true;
++ 		mem->for_alloc = true;
++ 
++ 		rmem->priv = mem;
++ 
++ 		rmem_swiotlb_debugfs_init(rmem);
++ 	}
++ 
++ 	dev->dma_io_tlb_mem = mem;
++ 
++ 	return 0;
++ }
++ 
++ static void rmem_swiotlb_device_release(struct reserved_mem *rmem,
++ 					struct device *dev)
++ {
++ 	dev->dma_io_tlb_mem = io_tlb_default_mem;
++ }
++ 
++ static const struct reserved_mem_ops rmem_swiotlb_ops = {
++ 	.device_init = rmem_swiotlb_device_init,
++ 	.device_release = rmem_swiotlb_device_release,
++ };
++ 
++ static int __init rmem_swiotlb_setup(struct reserved_mem *rmem)
++ {
++ 	unsigned long node = rmem->fdt_node;
++ 
++ 	if (of_get_flat_dt_prop(node, "reusable", NULL) ||
++ 	    of_get_flat_dt_prop(node, "linux,cma-default", NULL) ||
++ 	    of_get_flat_dt_prop(node, "linux,dma-default", NULL) ||
++ 	    of_get_flat_dt_prop(node, "no-map", NULL))
++ 		return -EINVAL;
++ 
++ 	if (PageHighMem(pfn_to_page(PHYS_PFN(rmem->base)))) {
++ 		pr_err("Restricted DMA pool must be accessible within the linear mapping.");
++ 		return -EINVAL;
++ 	}
++ 
++ 	rmem->ops = &rmem_swiotlb_ops;
++ 	pr_info("Reserved memory: created restricted DMA pool at %pa, size %ld MiB\n",
++ 		&rmem->base, (unsigned long)rmem->size / SZ_1M);
++ 	return 0;
++ }
++ 
++ RESERVEDMEM_OF_DECLARE(dma, "restricted-dma-pool", rmem_swiotlb_setup);
++ #endif /* CONFIG_DMA_RESTRICTED_POOL */
+++>>>>>>> 09a4a79d42ce (swiotlb: fix implicit debugfs declarations)
+* Unmerged path kernel/dma/swiotlb.c
