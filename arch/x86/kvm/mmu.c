@@ -5432,74 +5432,6 @@ void kvm_disable_tdp(void)
 }
 EXPORT_SYMBOL_GPL(kvm_disable_tdp);
 
-static void free_mmu_pages(struct kvm_vcpu *vcpu)
-{
-	free_page((unsigned long)vcpu->arch.mmu->pae_root);
-	free_page((unsigned long)vcpu->arch.mmu->lm_root);
-}
-
-static int alloc_mmu_pages(struct kvm_vcpu *vcpu)
-{
-	struct page *page;
-	int i;
-
-	if (tdp_enabled)
-		return 0;
-
-	/*
-	 * When emulating 32-bit mode, cr3 is only 32 bits even on x86_64.
-	 * Therefore we need to allocate shadow page tables in the first
-	 * 4GB of memory, which happens to fit the DMA32 zone.
-	 */
-	page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_DMA32);
-	if (!page)
-		return -ENOMEM;
-
-	vcpu->arch.mmu->pae_root = page_address(page);
-	for (i = 0; i < 4; ++i)
-		vcpu->arch.mmu->pae_root[i] = INVALID_PAGE;
-
-	return 0;
-}
-
-int kvm_mmu_create(struct kvm_vcpu *vcpu)
-{
-	uint i;
-
-	vcpu->arch.mmu = &vcpu->arch.root_mmu;
-	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
-	vcpu->arch.root_mmu.root_hpa = INVALID_PAGE;
-	vcpu->arch.root_mmu.translate_gpa = translate_gpa;
-	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
-		vcpu->arch.root_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
-
-	return alloc_mmu_pages(vcpu);
-}
-
-static void kvm_mmu_invalidate_zap_pages_in_memslot(struct kvm *kvm,
-			struct kvm_memory_slot *slot,
-			struct kvm_page_track_notifier_node *node)
-{
-	kvm_mmu_invalidate_zap_all_pages(kvm);
-}
-
-void kvm_mmu_init_vm(struct kvm *kvm)
-{
-	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
-
-	node->track_write = kvm_mmu_pte_write;
-	node->track_flush_slot = kvm_mmu_invalidate_zap_pages_in_memslot;
-	kvm_page_track_register_notifier(kvm, node);
-}
-
-void kvm_mmu_uninit_vm(struct kvm *kvm)
-{
-	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
-
-	kvm_page_track_unregister_notifier(kvm, node);
-}
 
 /* The return value indicates if tlb flush on all vcpus is needed. */
 typedef bool (*slot_level_handler) (struct kvm *kvm, struct kvm_rmap_head *rmap_head);
@@ -5568,6 +5500,75 @@ slot_handle_leaf(struct kvm *kvm, struct kvm_memory_slot *memslot,
 {
 	return slot_handle_level(kvm, memslot, fn, PT_PAGE_TABLE_LEVEL,
 				 PT_PAGE_TABLE_LEVEL, lock_flush_tlb);
+}
+
+static void free_mmu_pages(struct kvm_vcpu *vcpu)
+{
+	free_page((unsigned long)vcpu->arch.mmu->pae_root);
+	free_page((unsigned long)vcpu->arch.mmu->lm_root);
+}
+
+static int alloc_mmu_pages(struct kvm_vcpu *vcpu)
+{
+	struct page *page;
+	int i;
+
+	if (tdp_enabled)
+		return 0;
+
+	/*
+	 * When emulating 32-bit mode, cr3 is only 32 bits even on x86_64.
+	 * Therefore we need to allocate shadow page tables in the first
+	 * 4GB of memory, which happens to fit the DMA32 zone.
+	 */
+	page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_DMA32);
+	if (!page)
+		return -ENOMEM;
+
+	vcpu->arch.mmu->pae_root = page_address(page);
+	for (i = 0; i < 4; ++i)
+		vcpu->arch.mmu->pae_root[i] = INVALID_PAGE;
+
+	return 0;
+}
+
+int kvm_mmu_create(struct kvm_vcpu *vcpu)
+{
+	uint i;
+
+	vcpu->arch.mmu = &vcpu->arch.root_mmu;
+	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
+	vcpu->arch.root_mmu.root_hpa = INVALID_PAGE;
+	vcpu->arch.root_mmu.translate_gpa = translate_gpa;
+	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
+
+	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+		vcpu->arch.root_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
+
+	return alloc_mmu_pages(vcpu);
+}
+
+static void kvm_mmu_invalidate_zap_pages_in_memslot(struct kvm *kvm,
+			struct kvm_memory_slot *slot,
+			struct kvm_page_track_notifier_node *node)
+{
+	kvm_mmu_invalidate_zap_all_pages(kvm);
+}
+
+void kvm_mmu_init_vm(struct kvm *kvm)
+{
+	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
+
+	node->track_write = kvm_mmu_pte_write;
+	node->track_flush_slot = kvm_mmu_invalidate_zap_pages_in_memslot;
+	kvm_page_track_register_notifier(kvm, node);
+}
+
+void kvm_mmu_uninit_vm(struct kvm *kvm)
+{
+	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
+
+	kvm_page_track_unregister_notifier(kvm, node);
 }
 
 void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
