@@ -1,0 +1,141 @@
+iommu/vt-d: Remove deferred invalidation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] vt-d: Remove deferred invalidation (Jerry Snitselaar) [1724930]
+Rebuild_FUZZ: 91.89%
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 6d68b88e0993d67e9ebb1240f84240b712fbc8a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6d68b88e.failed
+
+Deferred invalidation is an ECS specific feature. It will not be
+supported when IOMMU works in scalable mode. As we deprecated the
+ECS support, remove deferred invalidation and cleanup the code.
+
+	Cc: Ashok Raj <ashok.raj@intel.com>
+	Cc: Jacob Pan <jacob.jun.pan@linux.intel.com>
+	Cc: Kevin Tian <kevin.tian@intel.com>
+	Cc: Liu Yi L <yi.l.liu@intel.com>
+	Cc: Sanjay Kumar <sanjay.k.kumar@intel.com>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Reviewed-by: Ashok Raj <ashok.raj@intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 6d68b88e0993d67e9ebb1240f84240b712fbc8a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-svm.c
+diff --cc drivers/iommu/intel-svm.c
+index 1797ae6439d7,5b2e3b2d593b..000000000000
+--- a/drivers/iommu/intel-svm.c
++++ b/drivers/iommu/intel-svm.c
+@@@ -29,21 -29,10 +29,14 @@@
+  
+  #include "intel-pasid.h"
+  
+ +#define PASID_ENTRY_P		BIT_ULL(0)
+ +#define PASID_ENTRY_FLPM_5LP	BIT_ULL(9)
+ +#define PASID_ENTRY_SRE		BIT_ULL(11)
+ +
+  static irqreturn_t prq_event_thread(int irq, void *d);
+  
+- struct pasid_state_entry {
+- 	u64 val;
+- };
+- 
+  int intel_svm_init(struct intel_iommu *iommu)
+  {
+- 	struct page *pages;
+- 	int order;
+- 
+  	if (cpu_feature_enabled(X86_FEATURE_GBPAGES) &&
+  			!cap_fl1gp_support(iommu->cap))
+  		return -EINVAL;
+@@@ -52,41 -41,6 +45,44 @@@
+  			!cap_5lp_support(iommu->cap))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	/* Start at 2 because it's defined as 2^(1+PSS) */
+ +	iommu->pasid_max = 2 << ecap_pss(iommu->ecap);
+ +
+ +	/* Eventually I'm promised we will get a multi-level PASID table
+ +	 * and it won't have to be physically contiguous. Until then,
+ +	 * limit the size because 8MiB contiguous allocations can be hard
+ +	 * to come by. The limit of 0x20000, which is 1MiB for each of
+ +	 * the PASID and PASID-state tables, is somewhat arbitrary. */
+ +	if (iommu->pasid_max > 0x20000)
+ +		iommu->pasid_max = 0x20000;
+ +
+ +	order = get_order(sizeof(struct pasid_entry) * iommu->pasid_max);
+ +	if (ecap_dis(iommu->ecap)) {
+ +		/* Just making it explicit... */
+ +		BUILD_BUG_ON(sizeof(struct pasid_entry) != sizeof(struct pasid_state_entry));
+ +		pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+ +		if (pages)
+ +			iommu->pasid_state_table = page_address(pages);
+ +		else
+ +			pr_warn("IOMMU: %s: Failed to allocate PASID state table\n",
+ +				iommu->name);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +int intel_svm_exit(struct intel_iommu *iommu)
+ +{
+ +	int order = get_order(sizeof(struct pasid_entry) * iommu->pasid_max);
+ +
+ +	if (iommu->pasid_state_table) {
+ +		free_pages((unsigned long)iommu->pasid_state_table, order);
+ +		iommu->pasid_state_table = NULL;
+ +	}
+ +
+++=======
+++>>>>>>> 6d68b88e0993 (iommu/vt-d: Remove deferred invalidation)
+  	return 0;
+  }
+  
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 123eb1289ade..1fe38ac69651 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -1711,7 +1711,6 @@ static void free_dmar_iommu(struct intel_iommu *iommu)
+ 	if (pasid_supported(iommu)) {
+ 		if (ecap_prs(iommu->ecap))
+ 			intel_svm_finish_prq(iommu);
+-		intel_svm_exit(iommu);
+ 	}
+ #endif
+ }
+* Unmerged path drivers/iommu/intel-svm.c
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index d83908420a83..c5cc134ae7e1 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -520,15 +520,8 @@ struct intel_iommu {
+ 	struct iommu_flush flush;
+ #endif
+ #ifdef CONFIG_INTEL_IOMMU_SVM
+-	/* These are large and need to be contiguous, so we allocate just
+-	 * one for now. We'll maybe want to rethink that if we truly give
+-	 * devices away to userspace processes (e.g. for DPDK) and don't
+-	 * want to trust that userspace will use *only* the PASID it was
+-	 * told to. But while it's all driver-arbitrated, we're fine. */
+-	struct pasid_state_entry *pasid_state_table;
+ 	struct page_req_dsc *prq;
+ 	unsigned char prq_name[16];    /* Name for PRQ interrupt */
+-	u32 pasid_max;
+ #endif
+ 	struct q_inval  *qi;            /* Queued invalidation info */
+ 	u32 *iommu_state; /* Store iommu states between suspend and resume.*/
+@@ -642,7 +635,6 @@ void iommu_flush_write_buffer(struct intel_iommu *iommu);
+ 
+ #ifdef CONFIG_INTEL_IOMMU_SVM
+ int intel_svm_init(struct intel_iommu *iommu);
+-int intel_svm_exit(struct intel_iommu *iommu);
+ extern int intel_svm_enable_prq(struct intel_iommu *iommu);
+ extern int intel_svm_finish_prq(struct intel_iommu *iommu);
+ 
