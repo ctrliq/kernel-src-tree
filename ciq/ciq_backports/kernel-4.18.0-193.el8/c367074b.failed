@@ -1,0 +1,315 @@
+RDMA/rxe: Use driver_unregister and new unregistration API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit c367074b6c37c2d2d45cb60a15b829eefbcee0f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c367074b.failed
+
+rxe does not have correct locking for its registration/unregistration
+paths, use the core code to handle it instead. In this mode
+ib_unregister_device will also do the dealloc, so rxe is required to do
+clean up from a callback.
+
+The core code ensures that unregistration is done only once, and generally
+takes care of locking and concurrency problems for rxe.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c367074b6c37c2d2d45cb60a15b829eefbcee0f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_pool.c
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.c
+index b5c91df22047,c9b8b8c6bfb5..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@@ -415,6 -423,39 +417,42 @@@ out_put_pool
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_entry *elem)
++ {
++ 	unsigned long flags;
++ 
++ 	might_sleep_if(!(pool->flags & RXE_POOL_ATOMIC));
++ 
++ 	read_lock_irqsave(&pool->pool_lock, flags);
++ 	if (pool->state != RXE_POOL_STATE_VALID) {
++ 		read_unlock_irqrestore(&pool->pool_lock, flags);
++ 		return -EINVAL;
++ 	}
++ 	kref_get(&pool->ref_cnt);
++ 	read_unlock_irqrestore(&pool->pool_lock, flags);
++ 
++ 	if (!ib_device_try_get(&pool->rxe->ib_dev))
++ 		goto out_put_pool;
++ 
++ 	if (atomic_inc_return(&pool->num_elem) > pool->max_elem)
++ 		goto out_cnt;
++ 
++ 	elem->pool = pool;
++ 	kref_init(&elem->ref_cnt);
++ 
++ 	return 0;
++ 
++ out_cnt:
++ 	atomic_dec(&pool->num_elem);
++ 	ib_device_put(&pool->rxe->ib_dev);
++ out_put_pool:
++ 	rxe_pool_put(pool);
++ 	return -EINVAL;
++ }
++ 
+++>>>>>>> c367074b6c37 (RDMA/rxe: Use driver_unregister and new unregistration API)
+  void rxe_elem_release(struct kref *kref)
+  {
+  	struct rxe_pool_entry *elem =
+@@@ -424,9 -465,10 +462,9 @@@
+  	if (pool->cleanup)
+  		pool->cleanup(elem);
+  
+ -	if (!(pool->flags & RXE_POOL_NO_ALLOC))
+ -		kmem_cache_free(pool_cache(pool), elem);
+ +	kmem_cache_free(pool_cache(pool), elem);
+  	atomic_dec(&pool->num_elem);
+- 	rxe_dev_put(pool->rxe);
++ 	ib_device_put(&pool->rxe->ib_dev);
+  	rxe_pool_put(pool);
+  }
+  
+diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
+index ce90da888b4b..fb0e79dc3056 100644
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -50,8 +50,10 @@ static void rxe_cleanup_ports(struct rxe_dev *rxe)
+ /* free resources for a rxe device all objects created for this device must
+  * have been destroyed
+  */
+-static void rxe_cleanup(struct rxe_dev *rxe)
++void rxe_dealloc(struct ib_device *ib_dev)
+ {
++	struct rxe_dev *rxe = container_of(ib_dev, struct rxe_dev, ib_dev);
++
+ 	rxe_pool_cleanup(&rxe->uc_pool);
+ 	rxe_pool_cleanup(&rxe->pd_pool);
+ 	rxe_pool_cleanup(&rxe->ah_pool);
+@@ -65,16 +67,10 @@ static void rxe_cleanup(struct rxe_dev *rxe)
+ 
+ 	rxe_cleanup_ports(rxe);
+ 
+-	crypto_free_shash(rxe->tfm);
+-}
++	if (rxe->tfm)
++		crypto_free_shash(rxe->tfm);
+ 
+-/* called when all references have been dropped */
+-void rxe_release(struct kref *kref)
+-{
+-	struct rxe_dev *rxe = container_of(kref, struct rxe_dev, ref_cnt);
+-
+-	rxe_cleanup(rxe);
+-	ib_dealloc_device(&rxe->ib_dev);
++	list_del(&rxe->list);
+ }
+ 
+ /* initialize rxe device parameters */
+@@ -312,31 +308,13 @@ int rxe_add(struct rxe_dev *rxe, unsigned int mtu)
+ {
+ 	int err;
+ 
+-	kref_init(&rxe->ref_cnt);
+-
+ 	err = rxe_init(rxe);
+ 	if (err)
+-		goto err1;
++		return err;
+ 
+ 	rxe_set_mtu(rxe, mtu);
+ 
+-	err = rxe_register_device(rxe);
+-	if (err)
+-		goto err1;
+-
+-	return 0;
+-
+-err1:
+-	rxe_dev_put(rxe);
+-	return err;
+-}
+-
+-/* called by the ifc layer to remove a device */
+-void rxe_remove(struct rxe_dev *rxe)
+-{
+-	rxe_unregister_device(rxe);
+-
+-	rxe_dev_put(rxe);
++	return rxe_register_device(rxe);
+ }
+ 
+ static int __init rxe_module_init(void)
+@@ -362,7 +340,7 @@ static int __init rxe_module_init(void)
+ 
+ static void __exit rxe_module_exit(void)
+ {
+-	rxe_remove_all();
++	ib_unregister_driver(RDMA_DRIVER_RXE);
+ 	rxe_net_exit();
+ 	rxe_cache_exit();
+ 
+diff --git a/drivers/infiniband/sw/rxe/rxe.h b/drivers/infiniband/sw/rxe/rxe.h
+index 2b875875962f..ce4bf05cd855 100644
+--- a/drivers/infiniband/sw/rxe/rxe.h
++++ b/drivers/infiniband/sw/rxe/rxe.h
+@@ -96,15 +96,9 @@ static inline u32 rxe_crc32(struct rxe_dev *rxe,
+ void rxe_set_mtu(struct rxe_dev *rxe, unsigned int dev_mtu);
+ 
+ int rxe_add(struct rxe_dev *rxe, unsigned int mtu);
+-void rxe_remove(struct rxe_dev *rxe);
+-void rxe_remove_all(void);
+ 
+ void rxe_rcv(struct sk_buff *skb);
+ 
+-static inline void rxe_dev_put(struct rxe_dev *rxe)
+-{
+-	kref_put(&rxe->ref_cnt, rxe_release);
+-}
+ struct rxe_dev *get_rxe_by_name(const char *name);
+ 
+ /* The caller must do a matching ib_device_put(&dev->ib_dev) */
+diff --git a/drivers/infiniband/sw/rxe/rxe_loc.h b/drivers/infiniband/sw/rxe/rxe_loc.h
+index b517a6c86922..3d8cef836f0d 100644
+--- a/drivers/infiniband/sw/rxe/rxe_loc.h
++++ b/drivers/infiniband/sw/rxe/rxe_loc.h
+@@ -232,7 +232,7 @@ int rxe_srq_from_attr(struct rxe_dev *rxe, struct rxe_srq *srq,
+ 		      struct ib_srq_attr *attr, enum ib_srq_attr_mask mask,
+ 		      struct rxe_modify_srq_cmd *ucmd);
+ 
+-void rxe_release(struct kref *kref);
++void rxe_dealloc(struct ib_device *ib_dev);
+ 
+ int rxe_completer(void *arg);
+ int rxe_requester(void *arg);
+diff --git a/drivers/infiniband/sw/rxe/rxe_net.c b/drivers/infiniband/sw/rxe/rxe_net.c
+index 56878453f1ae..d56a967ff90b 100644
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@ -559,21 +559,6 @@ struct rxe_dev *rxe_net_add(struct net_device *ndev)
+ 	return rxe;
+ }
+ 
+-void rxe_remove_all(void)
+-{
+-	spin_lock_bh(&dev_list_lock);
+-	while (!list_empty(&rxe_dev_list)) {
+-		struct rxe_dev *rxe =
+-			list_first_entry(&rxe_dev_list, struct rxe_dev, list);
+-
+-		list_del(&rxe->list);
+-		spin_unlock_bh(&dev_list_lock);
+-		rxe_remove(rxe);
+-		spin_lock_bh(&dev_list_lock);
+-	}
+-	spin_unlock_bh(&dev_list_lock);
+-}
+-
+ static void rxe_port_event(struct rxe_dev *rxe,
+ 			   enum ib_event_type event)
+ {
+@@ -631,10 +616,8 @@ static int rxe_notify(struct notifier_block *not_blk,
+ 
+ 	switch (event) {
+ 	case NETDEV_UNREGISTER:
+-		list_del(&rxe->list);
+-		ib_device_put(&rxe->ib_dev);
+-		rxe_remove(rxe);
+-		return NOTIFY_OK;
++		ib_unregister_device_queued(&rxe->ib_dev);
++		break;
+ 	case NETDEV_UP:
+ 		rxe_port_up(rxe);
+ 		break;
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_sysfs.c b/drivers/infiniband/sw/rxe/rxe_sysfs.c
+index 6802be71bf9b..c8630638cd57 100644
+--- a/drivers/infiniband/sw/rxe/rxe_sysfs.c
++++ b/drivers/infiniband/sw/rxe/rxe_sysfs.c
+@@ -111,7 +111,7 @@ static int rxe_param_set_remove(const char *val, const struct kernel_param *kp)
+ 
+ 	if (strncmp("all", intf, len) == 0) {
+ 		pr_info("rxe_sys: remove all");
+-		rxe_remove_all();
++		ib_unregister_driver(RDMA_DRIVER_RXE);
+ 		return 0;
+ 	}
+ 
+@@ -122,8 +122,7 @@ static int rxe_param_set_remove(const char *val, const struct kernel_param *kp)
+ 		return -EINVAL;
+ 	}
+ 
+-	list_del(&rxe->list);
+-	rxe_remove(rxe);
++	ib_unregister_device(&rxe->ib_dev);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index f3188f269481..b4d298e22aa1 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -1136,6 +1136,7 @@ static const struct ib_device_ops rxe_dev_ops = {
+ 	.create_cq = rxe_create_cq,
+ 	.create_qp = rxe_create_qp,
+ 	.create_srq = rxe_create_srq,
++	.dealloc_driver = rxe_dealloc,
+ 	.dealloc_pd = rxe_dealloc_pd,
+ 	.dealloc_ucontext = rxe_dealloc_ucontext,
+ 	.dereg_mr = rxe_dereg_mr,
+@@ -1241,22 +1242,8 @@ int rxe_register_device(struct rxe_dev *rxe)
+ 	rdma_set_device_sysfs_group(dev, &rxe_attr_group);
+ 	dev->driver_id = RDMA_DRIVER_RXE;
+ 	err = ib_register_device(dev, "rxe%d");
+-	if (err) {
++	if (err)
+ 		pr_warn("%s failed with error %d\n", __func__, err);
+-		goto err1;
+-	}
+-
+-	return 0;
+-
+-err1:
+-	crypto_free_shash(rxe->tfm);
+ 
+ 	return err;
+ }
+-
+-void rxe_unregister_device(struct rxe_dev *rxe)
+-{
+-	struct ib_device *dev = &rxe->ib_dev;
+-
+-	ib_unregister_device(dev);
+-}
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
+index 74e04801d34d..1c6c7c1b86db 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@ -385,7 +385,6 @@ struct rxe_dev {
+ 	struct ib_device_attr	attr;
+ 	int			max_ucontext;
+ 	int			max_inline_data;
+-	struct kref		ref_cnt;
+ 	struct mutex	usdev_lock;
+ 
+ 	struct net_device	*ndev;
+@@ -467,7 +466,6 @@ static inline struct rxe_mem *to_rmw(struct ib_mw *mw)
+ }
+ 
+ int rxe_register_device(struct rxe_dev *rxe);
+-void rxe_unregister_device(struct rxe_dev *rxe);
+ 
+ void rxe_mc_cleanup(struct rxe_pool_entry *arg);
+ 
