@@ -1,0 +1,461 @@
+perf copyfile: Move copyfile routines to separate files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 32ff3fec07b6d8e6c5cc2342f6cbbdcb224d484c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/32ff3fec.failed
+
+Further reducing the util.c hodgepodge files.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-0i62zh7ok25znibyebgq0qs4@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 32ff3fec07b6d8e6c5cc2342f6cbbdcb224d484c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/build-id.c
+#	tools/perf/util/util.c
+diff --cc tools/perf/util/build-id.c
+index 5943d897533c,c076fc7fe025..000000000000
+--- a/tools/perf/util/build-id.c
++++ b/tools/perf/util/build-id.c
+@@@ -7,7 -7,7 +7,11 @@@
+   * Copyright (C) 2009, 2010 Red Hat Inc.
+   * Copyright (C) 2009, 2010 Arnaldo Carvalho de Melo <acme@redhat.com>
+   */
+++<<<<<<< HEAD
+ +#include "util.h"
+++=======
++ #include "util.h" // lsdir(), mkdir_p(), rm_rf()
+++>>>>>>> 32ff3fec07b6 (perf copyfile: Move copyfile routines to separate files)
+  #include <dirent.h>
+  #include <errno.h>
+  #include <stdio.h>
+diff --cc tools/perf/util/util.c
+index b5fc44f33c1b,5eda6e19c947..000000000000
+--- a/tools/perf/util/util.c
++++ b/tools/perf/util/util.c
+@@@ -1,9 -1,8 +1,12 @@@
+  // SPDX-License-Identifier: GPL-2.0
+  #include "util.h"
+  #include "debug.h"
+++<<<<<<< HEAD
+ +#include "namespaces.h"
+++=======
++ #include "event.h"
+++>>>>>>> 32ff3fec07b6 (perf copyfile: Move copyfile routines to separate files)
+  #include <api/fs/fs.h>
+- #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <sys/utsname.h>
+  #include <dirent.h>
+@@@ -233,178 -230,6 +236,181 @@@ out
+  	return list;
+  }
+  
+++<<<<<<< HEAD
+ +static int slow_copyfile(const char *from, const char *to, struct nsinfo *nsi)
+ +{
+ +	int err = -1;
+ +	char *line = NULL;
+ +	size_t n;
+ +	FILE *from_fp, *to_fp;
+ +	struct nscookie nsc;
+ +
+ +	nsinfo__mountns_enter(nsi, &nsc);
+ +	from_fp = fopen(from, "r");
+ +	nsinfo__mountns_exit(&nsc);
+ +	if (from_fp == NULL)
+ +		goto out;
+ +
+ +	to_fp = fopen(to, "w");
+ +	if (to_fp == NULL)
+ +		goto out_fclose_from;
+ +
+ +	while (getline(&line, &n, from_fp) > 0)
+ +		if (fputs(line, to_fp) == EOF)
+ +			goto out_fclose_to;
+ +	err = 0;
+ +out_fclose_to:
+ +	fclose(to_fp);
+ +	free(line);
+ +out_fclose_from:
+ +	fclose(from_fp);
+ +out:
+ +	return err;
+ +}
+ +
+ +int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size)
+ +{
+ +	void *ptr;
+ +	loff_t pgoff;
+ +
+ +	pgoff = off_in & ~(page_size - 1);
+ +	off_in -= pgoff;
+ +
+ +	ptr = mmap(NULL, off_in + size, PROT_READ, MAP_PRIVATE, ifd, pgoff);
+ +	if (ptr == MAP_FAILED)
+ +		return -1;
+ +
+ +	while (size) {
+ +		ssize_t ret = pwrite(ofd, ptr + off_in, size, off_out);
+ +		if (ret < 0 && errno == EINTR)
+ +			continue;
+ +		if (ret <= 0)
+ +			break;
+ +
+ +		size -= ret;
+ +		off_in += ret;
+ +		off_out += ret;
+ +	}
+ +	munmap(ptr, off_in + size);
+ +
+ +	return size ? -1 : 0;
+ +}
+ +
+ +static int copyfile_mode_ns(const char *from, const char *to, mode_t mode,
+ +			    struct nsinfo *nsi)
+ +{
+ +	int fromfd, tofd;
+ +	struct stat st;
+ +	int err;
+ +	char *tmp = NULL, *ptr = NULL;
+ +	struct nscookie nsc;
+ +
+ +	nsinfo__mountns_enter(nsi, &nsc);
+ +	err = stat(from, &st);
+ +	nsinfo__mountns_exit(&nsc);
+ +	if (err)
+ +		goto out;
+ +	err = -1;
+ +
+ +	/* extra 'x' at the end is to reserve space for '.' */
+ +	if (asprintf(&tmp, "%s.XXXXXXx", to) < 0) {
+ +		tmp = NULL;
+ +		goto out;
+ +	}
+ +	ptr = strrchr(tmp, '/');
+ +	if (!ptr)
+ +		goto out;
+ +	ptr = memmove(ptr + 1, ptr, strlen(ptr) - 1);
+ +	*ptr = '.';
+ +
+ +	tofd = mkstemp(tmp);
+ +	if (tofd < 0)
+ +		goto out;
+ +
+ +	if (fchmod(tofd, mode))
+ +		goto out_close_to;
+ +
+ +	if (st.st_size == 0) { /* /proc? do it slowly... */
+ +		err = slow_copyfile(from, tmp, nsi);
+ +		goto out_close_to;
+ +	}
+ +
+ +	nsinfo__mountns_enter(nsi, &nsc);
+ +	fromfd = open(from, O_RDONLY);
+ +	nsinfo__mountns_exit(&nsc);
+ +	if (fromfd < 0)
+ +		goto out_close_to;
+ +
+ +	err = copyfile_offset(fromfd, 0, tofd, 0, st.st_size);
+ +
+ +	close(fromfd);
+ +out_close_to:
+ +	close(tofd);
+ +	if (!err)
+ +		err = link(tmp, to);
+ +	unlink(tmp);
+ +out:
+ +	free(tmp);
+ +	return err;
+ +}
+ +
+ +int copyfile_ns(const char *from, const char *to, struct nsinfo *nsi)
+ +{
+ +	return copyfile_mode_ns(from, to, 0755, nsi);
+ +}
+ +
+ +int copyfile_mode(const char *from, const char *to, mode_t mode)
+ +{
+ +	return copyfile_mode_ns(from, to, mode, NULL);
+ +}
+ +
+ +int copyfile(const char *from, const char *to)
+ +{
+ +	return copyfile_mode(from, to, 0755);
+ +}
+ +
+ +static ssize_t ion(bool is_read, int fd, void *buf, size_t n)
+ +{
+ +	void *buf_start = buf;
+ +	size_t left = n;
+ +
+ +	while (left) {
+ +		/* buf must be treated as const if !is_read. */
+ +		ssize_t ret = is_read ? read(fd, buf, left) :
+ +					write(fd, buf, left);
+ +
+ +		if (ret < 0 && errno == EINTR)
+ +			continue;
+ +		if (ret <= 0)
+ +			return ret;
+ +
+ +		left -= ret;
+ +		buf  += ret;
+ +	}
+ +
+ +	BUG_ON((size_t)(buf - buf_start) != n);
+ +	return n;
+ +}
+ +
+ +/*
+ + * Read exactly 'n' bytes or return an error.
+ + */
+ +ssize_t readn(int fd, void *buf, size_t n)
+ +{
+ +	return ion(true, fd, buf, n);
+ +}
+ +
+ +/*
+ + * Write exactly 'n' bytes or return an error.
+ + */
+ +ssize_t writen(int fd, const void *buf, size_t n)
+ +{
+ +	/* ion does not modify buf. */
+ +	return ion(false, fd, (void *)buf, n);
+ +}
+ +
+++=======
+++>>>>>>> 32ff3fec07b6 (perf copyfile: Move copyfile routines to separate files)
+  size_t hex_width(u64 v)
+  {
+  	size_t n = 1;
+diff --git a/tools/perf/util/Build b/tools/perf/util/Build
+index d4bfbe7a4761..8f19c0cb69dd 100644
+--- a/tools/perf/util/Build
++++ b/tools/perf/util/Build
+@@ -3,6 +3,7 @@ perf-y += block-range.o
+ perf-y += build-id.o
+ perf-y += cacheline.o
+ perf-y += config.o
++perf-y += copyfile.o
+ perf-y += ctype.o
+ perf-y += db-export.o
+ perf-y += env.o
+* Unmerged path tools/perf/util/build-id.c
+diff --git a/tools/perf/util/copyfile.c b/tools/perf/util/copyfile.c
+new file mode 100644
+index 000000000000..3fa0db136667
+--- /dev/null
++++ b/tools/perf/util/copyfile.c
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "util/copyfile.h"
++#include "util/namespaces.h"
++#include <internal/lib.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++static int slow_copyfile(const char *from, const char *to, struct nsinfo *nsi)
++{
++	int err = -1;
++	char *line = NULL;
++	size_t n;
++	FILE *from_fp, *to_fp;
++	struct nscookie nsc;
++
++	nsinfo__mountns_enter(nsi, &nsc);
++	from_fp = fopen(from, "r");
++	nsinfo__mountns_exit(&nsc);
++	if (from_fp == NULL)
++		goto out;
++
++	to_fp = fopen(to, "w");
++	if (to_fp == NULL)
++		goto out_fclose_from;
++
++	while (getline(&line, &n, from_fp) > 0)
++		if (fputs(line, to_fp) == EOF)
++			goto out_fclose_to;
++	err = 0;
++out_fclose_to:
++	fclose(to_fp);
++	free(line);
++out_fclose_from:
++	fclose(from_fp);
++out:
++	return err;
++}
++
++int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size)
++{
++	void *ptr;
++	loff_t pgoff;
++
++	pgoff = off_in & ~(page_size - 1);
++	off_in -= pgoff;
++
++	ptr = mmap(NULL, off_in + size, PROT_READ, MAP_PRIVATE, ifd, pgoff);
++	if (ptr == MAP_FAILED)
++		return -1;
++
++	while (size) {
++		ssize_t ret = pwrite(ofd, ptr + off_in, size, off_out);
++		if (ret < 0 && errno == EINTR)
++			continue;
++		if (ret <= 0)
++			break;
++
++		size -= ret;
++		off_in += ret;
++		off_out += ret;
++	}
++	munmap(ptr, off_in + size);
++
++	return size ? -1 : 0;
++}
++
++static int copyfile_mode_ns(const char *from, const char *to, mode_t mode,
++			    struct nsinfo *nsi)
++{
++	int fromfd, tofd;
++	struct stat st;
++	int err;
++	char *tmp = NULL, *ptr = NULL;
++	struct nscookie nsc;
++
++	nsinfo__mountns_enter(nsi, &nsc);
++	err = stat(from, &st);
++	nsinfo__mountns_exit(&nsc);
++	if (err)
++		goto out;
++	err = -1;
++
++	/* extra 'x' at the end is to reserve space for '.' */
++	if (asprintf(&tmp, "%s.XXXXXXx", to) < 0) {
++		tmp = NULL;
++		goto out;
++	}
++	ptr = strrchr(tmp, '/');
++	if (!ptr)
++		goto out;
++	ptr = memmove(ptr + 1, ptr, strlen(ptr) - 1);
++	*ptr = '.';
++
++	tofd = mkstemp(tmp);
++	if (tofd < 0)
++		goto out;
++
++	if (fchmod(tofd, mode))
++		goto out_close_to;
++
++	if (st.st_size == 0) { /* /proc? do it slowly... */
++		err = slow_copyfile(from, tmp, nsi);
++		goto out_close_to;
++	}
++
++	nsinfo__mountns_enter(nsi, &nsc);
++	fromfd = open(from, O_RDONLY);
++	nsinfo__mountns_exit(&nsc);
++	if (fromfd < 0)
++		goto out_close_to;
++
++	err = copyfile_offset(fromfd, 0, tofd, 0, st.st_size);
++
++	close(fromfd);
++out_close_to:
++	close(tofd);
++	if (!err)
++		err = link(tmp, to);
++	unlink(tmp);
++out:
++	free(tmp);
++	return err;
++}
++
++int copyfile_ns(const char *from, const char *to, struct nsinfo *nsi)
++{
++	return copyfile_mode_ns(from, to, 0755, nsi);
++}
++
++int copyfile_mode(const char *from, const char *to, mode_t mode)
++{
++	return copyfile_mode_ns(from, to, mode, NULL);
++}
++
++int copyfile(const char *from, const char *to)
++{
++	return copyfile_mode(from, to, 0755);
++}
+diff --git a/tools/perf/util/copyfile.h b/tools/perf/util/copyfile.h
+new file mode 100644
+index 000000000000..e85d2f22f3cc
+--- /dev/null
++++ b/tools/perf/util/copyfile.h
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: GPL-2.0
++#ifndef PERF_COPYFILE_H_
++#define PERF_COPYFILE_H_
++
++#include <linux/types.h>
++#include <sys/types.h>
++#include <fcntl.h>
++
++struct nsinfo;
++
++int copyfile(const char *from, const char *to);
++int copyfile_mode(const char *from, const char *to, mode_t mode);
++int copyfile_ns(const char *from, const char *to, struct nsinfo *nsi);
++int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size);
++
++#endif // PERF_COPYFILE_H_
+diff --git a/tools/perf/util/symbol-elf.c b/tools/perf/util/symbol-elf.c
+index 4cb4e9ec9421..8905f7b0461d 100644
+--- a/tools/perf/util/symbol-elf.c
++++ b/tools/perf/util/symbol-elf.c
+@@ -17,7 +17,7 @@
+ #include "machine.h"
+ #include "vdso.h"
+ #include "debug.h"
+-#include "util.h"
++#include "util/copyfile.h"
+ #include <linux/ctype.h>
+ #include <linux/zalloc.h>
+ #include <symbol/kallsyms.h>
+* Unmerged path tools/perf/util/util.c
+diff --git a/tools/perf/util/util.h b/tools/perf/util/util.h
+index d0d96eb3a962..fe76154573da 100644
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@ -17,7 +17,6 @@ void usage(const char *err) __noreturn;
+ void die(const char *err, ...) __noreturn __printf(1, 2);
+ 
+ struct dirent;
+-struct nsinfo;
+ struct strlist;
+ 
+ int mkdir_p(char *path, mode_t mode);
+@@ -25,10 +24,6 @@ int rm_rf(const char *path);
+ int rm_rf_perf_data(const char *path);
+ struct strlist *lsdir(const char *name, bool (*filter)(const char *, struct dirent *));
+ bool lsdir_no_dot_filter(const char *name, struct dirent *d);
+-int copyfile(const char *from, const char *to);
+-int copyfile_mode(const char *from, const char *to, mode_t mode);
+-int copyfile_ns(const char *from, const char *to, struct nsinfo *nsi);
+-int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size);
+ 
+ ssize_t readn(int fd, void *buf, size_t n);
+ ssize_t writen(int fd, const void *buf, size_t n);
