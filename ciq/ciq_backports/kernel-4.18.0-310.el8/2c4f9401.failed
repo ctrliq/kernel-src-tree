@@ -1,0 +1,157 @@
+sysfs: add sysfs_change_owner()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christian Brauner <christian.brauner@ubuntu.com>
+commit 2c4f9401ceb00167a3bfd322a28aa87b646a253f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/2c4f9401.failed
+
+Add a helper to change the owner of sysfs objects.
+This function will be used to correctly account for kobject ownership
+changes, e.g. when moving network devices between network namespaces.
+
+This mirrors how a kobject is added through driver core which in its guts is
+done via kobject_add_internal() which in summary creates the main directory via
+create_dir(), populates that directory with the groups associated with the
+ktype of the kobject (if any) and populates the directory with the basic
+attributes associated with the ktype of the kobject (if any). These are the
+basic steps that are associated with adding a kobject in sysfs.
+Any additional properties are added by the specific subsystem itself (not by
+driver core) after it has registered the device. So for the example of network
+devices, a network device will e.g. register a queue subdirectory under the
+basic sysfs directory for the network device and than further subdirectories
+within that queues subdirectory.  But that is all specific to network devices
+and they call the corresponding sysfs functions to do that directly when they
+create those queue objects. So anything that a subsystem adds outside of what
+driver core does must also be changed by it (That's already true for removal of
+files it created outside of driver core.) and it's the same for ownership
+changes.
+
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2c4f9401ceb00167a3bfd322a28aa87b646a253f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sysfs.h
+diff --cc include/linux/sysfs.h
+index 4cf71d5eb0b3,9e531ec76274..000000000000
+--- a/include/linux/sysfs.h
++++ b/include/linux/sysfs.h
+@@@ -323,8 -312,15 +323,9 @@@ static inline void sysfs_enable_ns(stru
+  
+  int sysfs_file_change_owner(struct kobject *kobj, const char *name, kuid_t kuid,
+  			    kgid_t kgid);
++ int sysfs_change_owner(struct kobject *kobj, kuid_t kuid, kgid_t kgid);
+  int sysfs_link_change_owner(struct kobject *kobj, struct kobject *targ,
+  			    const char *name, kuid_t kuid, kgid_t kgid);
+ -int sysfs_groups_change_owner(struct kobject *kobj,
+ -			      const struct attribute_group **groups,
+ -			      kuid_t kuid, kgid_t kgid);
+ -int sysfs_group_change_owner(struct kobject *kobj,
+ -			     const struct attribute_group *groups, kuid_t kuid,
+ -			     kgid_t kgid);
+  
+  #else /* CONFIG_SYSFS */
+  
+@@@ -561,6 -549,25 +562,28 @@@ static inline int sysfs_link_change_own
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int sysfs_change_owner(struct kobject *kobj, kuid_t kuid, kgid_t kgid)
++ {
++ 	return 0;
++ }
++ 
++ static inline int sysfs_groups_change_owner(struct kobject *kobj,
++ 			  const struct attribute_group **groups,
++ 			  kuid_t kuid, kgid_t kgid)
++ {
++ 	return 0;
++ }
++ 
++ static inline int sysfs_group_change_owner(struct kobject *kobj,
++ 			 const struct attribute_group **groups,
++ 			 kuid_t kuid, kgid_t kgid)
++ {
++ 	return 0;
++ }
++ 
+++>>>>>>> 2c4f9401ceb0 (sysfs: add sysfs_change_owner())
+  #endif /* CONFIG_SYSFS */
+  
+  static inline int __must_check sysfs_create_file(struct kobject *kobj,
+diff --git a/fs/sysfs/file.c b/fs/sysfs/file.c
+index 0b432666bf49..53f33742e52b 100644
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -636,3 +636,63 @@ int sysfs_file_change_owner(struct kobject *kobj, const char *name, kuid_t kuid,
+ 	return error;
+ }
+ EXPORT_SYMBOL_GPL(sysfs_file_change_owner);
++
++/**
++ *	sysfs_change_owner - change owner of the given object.
++ *	@kobj:	object.
++ *	@kuid:	new owner's kuid
++ *	@kgid:	new owner's kgid
++ *
++ * Change the owner of the default directory, files, groups, and attributes of
++ * @kobj to @kuid/@kgid. Note that sysfs_change_owner mirrors how the sysfs
++ * entries for a kobject are added by driver core. In summary,
++ * sysfs_change_owner() takes care of the default directory entry for @kobj,
++ * the default attributes associated with the ktype of @kobj and the default
++ * attributes associated with the ktype of @kobj.
++ * Additional properties not added by driver core have to be changed by the
++ * driver or subsystem which created them. This is similar to how
++ * driver/subsystem specific entries are removed.
++ *
++ * Returns 0 on success or error code on failure.
++ */
++int sysfs_change_owner(struct kobject *kobj, kuid_t kuid, kgid_t kgid)
++{
++	int error;
++	const struct kobj_type *ktype;
++
++	if (!kobj->state_in_sysfs)
++		return -EINVAL;
++
++	/* Change the owner of the kobject itself. */
++	error = internal_change_owner(kobj->sd, kuid, kgid);
++	if (error)
++		return error;
++
++	ktype = get_ktype(kobj);
++	if (ktype) {
++		struct attribute **kattr;
++
++		/*
++		 * Change owner of the default attributes associated with the
++		 * ktype of @kobj.
++		 */
++		for (kattr = ktype->default_attrs; kattr && *kattr; kattr++) {
++			error = sysfs_file_change_owner(kobj, (*kattr)->name,
++							kuid, kgid);
++			if (error)
++				return error;
++		}
++
++		/*
++		 * Change owner of the default groups associated with the
++		 * ktype of @kobj.
++		 */
++		error = sysfs_groups_change_owner(kobj, ktype->default_groups,
++						  kuid, kgid);
++		if (error)
++			return error;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sysfs_change_owner);
+* Unmerged path include/linux/sysfs.h
