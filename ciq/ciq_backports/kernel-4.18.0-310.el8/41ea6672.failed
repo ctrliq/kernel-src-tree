@@ -1,0 +1,158 @@
+x86, sched: Calculate frequency invariance for AMD systems
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Nathan Fontenot <nathan.fontenot@amd.com>
+commit 41ea667227bad5c247d76e6605054e96e4d95f51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/41ea6672.failed
+
+This is the first pass in creating the ability to calculate the
+frequency invariance on AMD systems. This approach uses the CPPC
+highest performance and nominal performance values that range from
+0 - 255 instead of a high and base frquency. This is because we do
+not have the ability on AMD to get a highest frequency value.
+
+On AMD systems the highest performance and nominal performance
+vaues do correspond to the highest and base frequencies for the system
+so using them should produce an appropriate ratio but some tweaking
+is likely necessary.
+
+Due to CPPC being initialized later in boot than when the frequency
+invariant calculation is currently made, I had to create a callback
+from the CPPC init code to do the calculation after we have CPPC
+data.
+
+Special thanks to "kernel test robot <lkp@intel.com>" for reporting that
+compilation of drivers/acpi/cppc_acpi.c is conditional to
+CONFIG_ACPI_CPPC_LIB, not just CONFIG_ACPI.
+
+[ ggherdovich@suse.cz: made safe under CPU hotplug, edited changelog. ]
+
+	Signed-off-by: Nathan Fontenot <nathan.fontenot@amd.com>
+	Signed-off-by: Giovanni Gherdovich <ggherdovich@suse.cz>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lkml.kernel.org/r/20201112182614.10700-2-ggherdovich@suse.cz
+(cherry picked from commit 41ea667227bad5c247d76e6605054e96e4d95f51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/kernel/smpboot.c
+index 5372dd4de0e8,a4ab5cf6aeab..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -82,7 -80,12 +82,11 @@@
+  #include <asm/cpu_device_id.h>
+  #include <asm/spec-ctrl.h>
+  #include <asm/hw_irq.h>
+ -#include <asm/stackprotector.h>
+  
++ #ifdef CONFIG_ACPI_CPPC_LIB
++ #include <acpi/cppc_acpi.h>
++ #endif
++ 
+  /* representing HT siblings of each logical CPU */
+  DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_sibling_map);
+  EXPORT_PER_CPU_SYMBOL(cpu_sibling_map);
+@@@ -2059,6 -2113,30 +2109,33 @@@ static void init_freq_invariance(bool s
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ACPI_CPPC_LIB
++ static DEFINE_MUTEX(freq_invariance_lock);
++ 
++ void init_freq_invariance_cppc(void)
++ {
++ 	static bool secondary;
++ 
++ 	mutex_lock(&freq_invariance_lock);
++ 
++ 	init_freq_invariance(secondary, true);
++ 	secondary = true;
++ 
++ 	mutex_unlock(&freq_invariance_lock);
++ }
++ #endif
++ 
++ static void disable_freq_invariance_workfn(struct work_struct *work)
++ {
++ 	static_branch_disable(&arch_scale_freq_key);
++ }
++ 
++ static DECLARE_WORK(disable_freq_invariance_work,
++ 		    disable_freq_invariance_workfn);
++ 
+++>>>>>>> 41ea667227ba (x86, sched: Calculate frequency invariance for AMD systems)
+  DEFINE_PER_CPU(unsigned long, arch_freq_scale) = SCHED_CAPACITY_SCALE;
+  
+  void arch_scale_freq_tick(void)
+@@@ -2090,4 -2171,14 +2167,12 @@@
+  		freq_scale = SCHED_CAPACITY_SCALE;
+  
+  	this_cpu_write(arch_freq_scale, freq_scale);
+ -	return;
+ -
+ -error:
+ -	pr_warn("Scheduler frequency invariance went wobbly, disabling!\n");
+ -	schedule_work(&disable_freq_invariance_work);
+  }
+++<<<<<<< HEAD
+++=======
++ #else
++ static inline void init_freq_invariance(bool secondary, bool cppc_ready)
++ {
++ }
++ #endif /* CONFIG_X86_64 */
+++>>>>>>> 41ea667227ba (x86, sched: Calculate frequency invariance for AMD systems)
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index cdf7aedf4232..40593f4d09e7 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -220,4 +220,9 @@ static inline void arch_set_max_freq_ratio(bool turbo_disabled)
+ }
+ #endif
+ 
++#ifdef CONFIG_ACPI_CPPC_LIB
++void init_freq_invariance_cppc(void);
++#define init_freq_invariance_cppc init_freq_invariance_cppc
++#endif
++
+ #endif /* _ASM_X86_TOPOLOGY_H */
+* Unmerged path arch/x86/kernel/smpboot.c
+diff --git a/drivers/acpi/cppc_acpi.c b/drivers/acpi/cppc_acpi.c
+index d6b845f2e880..e8eeb594e0f9 100644
+--- a/drivers/acpi/cppc_acpi.c
++++ b/drivers/acpi/cppc_acpi.c
+@@ -43,6 +43,7 @@
+ #include <linux/ktime.h>
+ #include <linux/rwsem.h>
+ #include <linux/wait.h>
++#include <linux/topology.h>
+ 
+ #include <acpi/cppc_acpi.h>
+ 
+@@ -692,6 +693,10 @@ static bool is_cppc_supported(int revision, int num_ent)
+  *	}
+  */
+ 
++#ifndef init_freq_invariance_cppc
++static inline void init_freq_invariance_cppc(void) { }
++#endif
++
+ /**
+  * acpi_cppc_processor_probe - Search for per CPU _CPC objects.
+  * @pr: Ptr to acpi_processor containing this CPU's logical ID.
+@@ -854,6 +859,8 @@ int acpi_cppc_processor_probe(struct acpi_processor *pr)
+ 		goto out_free;
+ 	}
+ 
++	init_freq_invariance_cppc();
++
+ 	kfree(output.pointer);
+ 	return 0;
+ 
