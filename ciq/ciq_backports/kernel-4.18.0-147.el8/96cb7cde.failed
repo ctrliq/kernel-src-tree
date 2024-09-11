@@ -1,0 +1,248 @@
+drm/i915: Don't pass pipe_wm around so much
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 96cb7cde1a3009663918b69ab5f8000c67f0a7b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/96cb7cde.failed
+
+{skl,icl}_build_plane_wm() don't need to be passed the pipe_wm, so
+don't. And skl_build_pipe_wm() can easily dig it out itself.
+
+	Cc: Neel Desai <neel.desai@intel.com>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190312205844.6339-9-ville.syrjala@linux.intel.com
+	Reviewed-by: Matt Roper <matthew.d.roper@intel.com>
+(cherry picked from commit 96cb7cde1a3009663918b69ab5f8000c67f0a7b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index a1b763e0c3a9,fca5cdd599e1..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -4859,28 -4976,125 +4859,138 @@@ static void skl_compute_transition_wm(s
+  
+  	}
+  
+ -	/*
+ -	 * Just assume we can enable the transition watermark.  After
+ -	 * computing the DDB we'll come back and disable it if that
+ -	 * assumption turns out to be false.
+ -	 */
+ -	wm->trans_wm.plane_res_b = res_blocks + 1;
+ -	wm->trans_wm.plane_en = true;
+ +	res_blocks += 1;
+ +
+++<<<<<<< HEAD
+ +	if (res_blocks < ddb_allocation) {
+ +		trans_wm->plane_res_b = res_blocks;
+ +		trans_wm->plane_en = true;
+ +		return;
+ +	}
+ +
+ +exit:
+ +	trans_wm->plane_en = false;
+  }
+  
+ +static int skl_build_pipe_wm(struct intel_crtc_state *cstate,
+ +			     struct skl_ddb_allocation *ddb,
+ +			     struct skl_pipe_wm *pipe_wm)
+ +{
+ +	struct drm_device *dev = cstate->base.crtc->dev;
+++=======
++ static int skl_build_plane_wm_single(struct intel_crtc_state *crtc_state,
++ 				     const struct intel_plane_state *plane_state,
++ 				     enum plane_id plane_id, int color_plane)
++ {
++ 	struct skl_plane_wm *wm = &crtc_state->wm.skl.optimal.planes[plane_id];
++ 	struct skl_wm_params wm_params;
++ 	int ret;
++ 
++ 	ret = skl_compute_plane_wm_params(crtc_state, plane_state,
++ 					  &wm_params, color_plane);
++ 	if (ret)
++ 		return ret;
++ 
++ 	skl_compute_wm_levels(crtc_state, &wm_params, wm->wm);
++ 	skl_compute_transition_wm(crtc_state, &wm_params, wm);
++ 
++ 	return 0;
++ }
++ 
++ static int skl_build_plane_wm_uv(struct intel_crtc_state *crtc_state,
++ 				 const struct intel_plane_state *plane_state,
++ 				 enum plane_id plane_id)
++ {
++ 	struct skl_plane_wm *wm = &crtc_state->wm.skl.optimal.planes[plane_id];
++ 	struct skl_wm_params wm_params;
++ 	int ret;
++ 
++ 	wm->is_planar = true;
++ 
++ 	/* uv plane watermarks must also be validated for NV12/Planar */
++ 	ret = skl_compute_plane_wm_params(crtc_state, plane_state,
++ 					  &wm_params, 1);
++ 	if (ret)
++ 		return ret;
++ 
++ 	skl_compute_wm_levels(crtc_state, &wm_params, wm->uv_wm);
++ 
++ 	return 0;
++ }
++ 
++ static int skl_build_plane_wm(struct intel_crtc_state *crtc_state,
++ 			      const struct intel_plane_state *plane_state)
++ {
++ 	struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	enum plane_id plane_id = plane->id;
++ 	int ret;
++ 
++ 	if (!intel_wm_plane_visible(crtc_state, plane_state))
++ 		return 0;
++ 
++ 	ret = skl_build_plane_wm_single(crtc_state, plane_state,
++ 					plane_id, 0);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (fb->format->is_yuv && fb->format->num_planes > 1) {
++ 		ret = skl_build_plane_wm_uv(crtc_state, plane_state,
++ 					    plane_id);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int icl_build_plane_wm(struct intel_crtc_state *crtc_state,
++ 			      const struct intel_plane_state *plane_state)
++ {
++ 	enum plane_id plane_id = to_intel_plane(plane_state->base.plane)->id;
++ 	int ret;
++ 
++ 	/* Watermarks calculated in master */
++ 	if (plane_state->slave)
++ 		return 0;
++ 
++ 	if (plane_state->linked_plane) {
++ 		const struct drm_framebuffer *fb = plane_state->base.fb;
++ 		enum plane_id y_plane_id = plane_state->linked_plane->id;
++ 
++ 		WARN_ON(!intel_wm_plane_visible(crtc_state, plane_state));
++ 		WARN_ON(!fb->format->is_yuv ||
++ 			fb->format->num_planes == 1);
++ 
++ 		ret = skl_build_plane_wm_single(crtc_state, plane_state,
++ 						y_plane_id, 0);
++ 		if (ret)
++ 			return ret;
++ 
++ 		ret = skl_build_plane_wm_single(crtc_state, plane_state,
++ 						plane_id, 1);
++ 		if (ret)
++ 			return ret;
++ 	} else if (intel_wm_plane_visible(crtc_state, plane_state)) {
++ 		ret = skl_build_plane_wm_single(crtc_state, plane_state,
++ 						plane_id, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int skl_build_pipe_wm(struct intel_crtc_state *cstate)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(cstate->base.crtc->dev);
++ 	struct skl_pipe_wm *pipe_wm = &cstate->wm.skl.optimal;
+++>>>>>>> 96cb7cde1a30 (drm/i915: Don't pass pipe_wm around so much)
+  	struct drm_crtc_state *crtc_state = &cstate->base;
+ +	const struct drm_i915_private *dev_priv = to_i915(dev);
+  	struct drm_plane *plane;
+  	const struct drm_plane_state *pstate;
+ +	struct skl_plane_wm *wm;
+  	int ret;
+  
+  	/*
+@@@ -4892,44 -5106,13 +5002,51 @@@
+  	drm_atomic_crtc_state_for_each_plane_state(plane, pstate, crtc_state) {
+  		const struct intel_plane_state *intel_pstate =
+  						to_intel_plane_state(pstate);
+ +		enum plane_id plane_id = to_intel_plane(plane)->id;
+ +		struct skl_wm_params wm_params;
+ +		enum pipe pipe = to_intel_crtc(cstate->base.crtc)->pipe;
+ +		uint16_t ddb_blocks;
+ +
+++<<<<<<< HEAD
+ +		wm = &pipe_wm->planes[plane_id];
+ +		ddb_blocks = skl_ddb_entry_size(&ddb->plane[pipe][plane_id]);
+  
+ +		ret = skl_compute_plane_wm_params(dev_priv, cstate,
+ +						  intel_pstate, &wm_params, 0);
+++=======
++ 		if (INTEL_GEN(dev_priv) >= 11)
++ 			ret = icl_build_plane_wm(cstate, intel_pstate);
++ 		else
++ 			ret = skl_build_plane_wm(cstate, intel_pstate);
+++>>>>>>> 96cb7cde1a30 (drm/i915: Don't pass pipe_wm around so much)
+  		if (ret)
+  			return ret;
+ +
+ +		ret = skl_compute_wm_levels(dev_priv, ddb, cstate,
+ +					    intel_pstate, &wm_params, wm, 0);
+ +		if (ret)
+ +			return ret;
+ +
+ +		skl_compute_transition_wm(cstate, &wm_params, &wm->wm[0],
+ +					  ddb_blocks, &wm->trans_wm);
+ +
+ +		/* uv plane watermarks must also be validated for NV12/Planar */
+ +		if (wm_params.is_planar) {
+ +			memset(&wm_params, 0, sizeof(struct skl_wm_params));
+ +			wm->is_planar = true;
+ +
+ +			ret = skl_compute_plane_wm_params(dev_priv, cstate,
+ +							  intel_pstate,
+ +							  &wm_params, 1);
+ +			if (ret)
+ +				return ret;
+ +
+ +			ret = skl_compute_wm_levels(dev_priv, ddb, cstate,
+ +						    intel_pstate, &wm_params,
+ +						    wm, 1);
+ +			if (ret)
+ +				return ret;
+ +		}
+  	}
+  
+  	pipe_wm->linetime = skl_compute_linetime_wm(cstate);
+@@@ -5055,16 -5265,15 +5172,20 @@@ bool skl_ddb_allocation_overlaps(struc
+  	return false;
+  }
+  
+ -static int skl_update_pipe_wm(struct intel_crtc_state *cstate,
+ +static int skl_update_pipe_wm(struct drm_crtc_state *cstate,
+  			      const struct skl_pipe_wm *old_pipe_wm,
+  			      struct skl_pipe_wm *pipe_wm, /* out */
+ +			      struct skl_ddb_allocation *ddb, /* out */
+  			      bool *changed /* out */)
+  {
+ -	struct intel_crtc *crtc = to_intel_crtc(cstate->base.crtc);
+ +	struct intel_crtc_state *intel_cstate = to_intel_crtc_state(cstate);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = skl_build_pipe_wm(intel_cstate, ddb, pipe_wm);
+++=======
++ 	ret = skl_build_pipe_wm(cstate);
+++>>>>>>> 96cb7cde1a30 (drm/i915: Don't pass pipe_wm around so much)
+  	if (ret)
+  		return ret;
+  
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
