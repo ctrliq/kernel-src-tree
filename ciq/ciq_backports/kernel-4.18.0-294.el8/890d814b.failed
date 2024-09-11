@@ -1,0 +1,157 @@
+iwlwifi: mvm: location: set the HLTK when PASN station is added
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Avraham Stern <avraham.stern@intel.com>
+commit 890d814b1837a7f7d38261f84cd7af160c1ffe98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/890d814b.failed
+
+When a PASN station is added, set the HLTK to FW.
+
+	Signed-off-by: Avraham Stern <avraham.stern@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Link: https://lore.kernel.org/r/iwlwifi.20200930161256.1c7a59fd3164.I68005f0015ad04e53d0239e2d2ee85d5ffdeaa37@changeid
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+(cherry picked from commit 890d814b1837a7f7d38261f84cd7af160c1ffe98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/mvm/ftm-responder.c
+diff --cc drivers/net/wireless/intel/iwlwifi/mvm/ftm-responder.c
+index 2c2ec2538d37,e940ef138f55..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ftm-responder.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ftm-responder.c
+@@@ -213,6 -219,103 +213,106 @@@ iwl_mvm_ftm_responder_dyn_cfg_cmd(struc
+  	return iwl_mvm_send_cmd(mvm, &hcmd);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ iwl_mvm_ftm_responder_dyn_cfg_v3(struct iwl_mvm *mvm,
++ 				 struct ieee80211_vif *vif,
++ 				 struct ieee80211_ftm_responder_params *params,
++ 				 struct iwl_mvm_pasn_hltk_data *hltk_data)
++ {
++ 	struct iwl_tof_responder_dyn_config_cmd cmd;
++ 	struct iwl_host_cmd hcmd = {
++ 		.id = iwl_cmd_id(TOF_RESPONDER_DYN_CONFIG_CMD,
++ 				 LOCATION_GROUP, 0),
++ 		.data[0] = &cmd,
++ 		.len[0] = sizeof(cmd),
++ 		/* may not be able to DMA from stack */
++ 		.dataflags[0] = IWL_HCMD_DFL_DUP,
++ 	};
++ 
++ 	lockdep_assert_held(&mvm->mutex);
++ 
++ 	cmd.valid_flags = 0;
++ 
++ 	if (params) {
++ 		if (params->lci_len + 2 > sizeof(cmd.lci_buf) ||
++ 		    params->civicloc_len + 2 > sizeof(cmd.civic_buf)) {
++ 			IWL_ERR(mvm,
++ 				"LCI/civic data too big (lci=%zd, civic=%zd)\n",
++ 				params->lci_len, params->civicloc_len);
++ 			return -ENOBUFS;
++ 		}
++ 
++ 		cmd.lci_buf[0] = WLAN_EID_MEASURE_REPORT;
++ 		cmd.lci_buf[1] = params->lci_len;
++ 		memcpy(cmd.lci_buf + 2, params->lci, params->lci_len);
++ 		cmd.lci_len = params->lci_len + 2;
++ 
++ 		cmd.civic_buf[0] = WLAN_EID_MEASURE_REPORT;
++ 		cmd.civic_buf[1] = params->civicloc_len;
++ 		memcpy(cmd.civic_buf + 2, params->civicloc,
++ 		       params->civicloc_len);
++ 		cmd.civic_len = params->civicloc_len + 2;
++ 
++ 		cmd.valid_flags |= IWL_RESPONDER_DYN_CFG_VALID_LCI |
++ 			IWL_RESPONDER_DYN_CFG_VALID_CIVIC;
++ 	}
++ 
++ 	if (hltk_data) {
++ 		if (hltk_data->cipher > IWL_LOCATION_CIPHER_GCMP_256) {
++ 			IWL_ERR(mvm, "invalid cipher: %u\n",
++ 				hltk_data->cipher);
++ 			return -EINVAL;
++ 		}
++ 
++ 		cmd.cipher = hltk_data->cipher;
++ 		memcpy(cmd.addr, hltk_data->addr, sizeof(cmd.addr));
++ 		memcpy(cmd.hltk_buf, hltk_data->hltk, sizeof(cmd.hltk_buf));
++ 		cmd.valid_flags |= IWL_RESPONDER_DYN_CFG_VALID_PASN_STA;
++ 	}
++ 
++ 	return iwl_mvm_send_cmd(mvm, &hcmd);
++ }
++ 
++ static int
++ iwl_mvm_ftm_responder_dyn_cfg_cmd(struct iwl_mvm *mvm,
++ 				  struct ieee80211_vif *vif,
++ 				  struct ieee80211_ftm_responder_params *params)
++ {
++ 	int ret;
++ 	u8 cmd_ver = iwl_fw_lookup_cmd_ver(mvm->fw, LOCATION_GROUP,
++ 					   TOF_RESPONDER_DYN_CONFIG_CMD, 2);
++ 
++ 	switch (cmd_ver) {
++ 	case 2:
++ 		ret = iwl_mvm_ftm_responder_dyn_cfg_v2(mvm, vif,
++ 						       params);
++ 		break;
++ 	case 3:
++ 		ret = iwl_mvm_ftm_responder_dyn_cfg_v3(mvm, vif,
++ 						       params, NULL);
++ 		break;
++ 	default:
++ 		IWL_ERR(mvm, "Unsupported DYN_CONFIG_CMD version %u\n",
++ 			cmd_ver);
++ 		ret = -ENOTSUPP;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void iwl_mvm_resp_del_pasn_sta(struct iwl_mvm *mvm,
++ 				      struct ieee80211_vif *vif,
++ 				      struct iwl_mvm_pasn_sta *sta)
++ {
++ 	list_del(&sta->list);
++ 	iwl_mvm_rm_sta_id(mvm, vif, sta->int_sta.sta_id);
++ 	iwl_mvm_dealloc_int_sta(mvm, &sta->int_sta);
++ 	kfree(sta);
++ }
++ 
+++>>>>>>> 890d814b1837 (iwlwifi: mvm: location: set the HLTK when PASN station is added)
+  int iwl_mvm_ftm_respoder_add_pasn_sta(struct iwl_mvm *mvm,
+  				      struct ieee80211_vif *vif,
+  				      u8 *addr, u32 cipher, u8 *tk, u32 tk_len,
+* Unmerged path drivers/net/wireless/intel/iwlwifi/mvm/ftm-responder.c
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index 7d48e81fb503..c129e99a7b26 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@ -2159,4 +2159,19 @@ static inline int iwl_umac_scan_get_max_profiles(const struct iwl_fw *fw)
+ 	return (ver == IWL_FW_CMD_VER_UNKNOWN || ver < 3) ?
+ 		IWL_SCAN_MAX_PROFILES : IWL_SCAN_MAX_PROFILES_V2;
+ }
++
++static inline
++enum iwl_location_cipher iwl_mvm_cipher_to_location_cipher(u32 cipher)
++{
++	switch (cipher) {
++	case WLAN_CIPHER_SUITE_CCMP:
++		return IWL_LOCATION_CIPHER_CCMP_128;
++	case WLAN_CIPHER_SUITE_GCMP:
++		return IWL_LOCATION_CIPHER_GCMP_128;
++	case WLAN_CIPHER_SUITE_GCMP_256:
++		return IWL_LOCATION_CIPHER_GCMP_256;
++	default:
++		return IWL_LOCATION_CIPHER_INVALID;
++	}
++}
+ #endif /* __IWL_MVM_H__ */
