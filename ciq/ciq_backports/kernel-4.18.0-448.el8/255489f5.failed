@@ -1,0 +1,177 @@
+gve: Add a jumbo-frame device option.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Shailend Chand <shailend@google.com>
+commit 255489f5b33ccec046be689dd45b5ccdec2b2a32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/255489f5.failed
+
+A widely deployed driver has a bug that will cause the driver not
+to load when a max_mtu > 2048 is present in the device descriptor.
+
+To avoid this bug while still enabling jumbo frames, we present a lower
+max_mtu in the device descriptor and pass the actual max_mtu in
+a separate device option.
+
+The driver supports 2 different queue formats. To enable features
+on one queue format, but not the other, a supported_features mask
+was added to the device options in the device descriptor.
+
+	Signed-off-by: Shailend Chand <shailend@google.com>
+	Signed-off-by: Jeroen de Borst <jeroendb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 255489f5b33ccec046be689dd45b5ccdec2b2a32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve_adminq.c
+diff --cc drivers/net/ethernet/google/gve/gve_adminq.c
+index 69a76038cb46,83ae56c310d3..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_adminq.c
++++ b/drivers/net/ethernet/google/gve/gve_adminq.c
+@@@ -600,8 -647,60 +620,63 @@@ int gve_adminq_destroy_rx_queues(struc
+  	return gve_adminq_kick_and_wait(priv);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int gve_set_desc_cnt(struct gve_priv *priv,
++ 			    struct gve_device_descriptor *descriptor)
++ {
++ 	priv->tx_desc_cnt = be16_to_cpu(descriptor->tx_queue_entries);
++ 	if (priv->tx_desc_cnt * sizeof(priv->tx->desc[0]) < PAGE_SIZE) {
++ 		dev_err(&priv->pdev->dev, "Tx desc count %d too low\n",
++ 			priv->tx_desc_cnt);
++ 		return -EINVAL;
++ 	}
++ 	priv->rx_desc_cnt = be16_to_cpu(descriptor->rx_queue_entries);
++ 	if (priv->rx_desc_cnt * sizeof(priv->rx->desc.desc_ring[0])
++ 	    < PAGE_SIZE) {
++ 		dev_err(&priv->pdev->dev, "Rx desc count %d too low\n",
++ 			priv->rx_desc_cnt);
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
++ static int
++ gve_set_desc_cnt_dqo(struct gve_priv *priv,
++ 		     const struct gve_device_descriptor *descriptor,
++ 		     const struct gve_device_option_dqo_rda *dev_op_dqo_rda)
++ {
++ 	priv->tx_desc_cnt = be16_to_cpu(descriptor->tx_queue_entries);
++ 	priv->options_dqo_rda.tx_comp_ring_entries =
++ 		be16_to_cpu(dev_op_dqo_rda->tx_comp_ring_entries);
++ 	priv->rx_desc_cnt = be16_to_cpu(descriptor->rx_queue_entries);
++ 	priv->options_dqo_rda.rx_buff_ring_entries =
++ 		be16_to_cpu(dev_op_dqo_rda->rx_buff_ring_entries);
++ 
++ 	return 0;
++ }
++ 
++ static void gve_enable_supported_features(struct gve_priv *priv,
++ 					  u32 supported_features_mask,
++ 					  const struct gve_device_option_jumbo_frames
++ 						  *dev_op_jumbo_frames)
++ {
++ 	/* Before control reaches this point, the page-size-capped max MTU from
++ 	 * the gve_device_descriptor field has already been stored in
++ 	 * priv->dev->max_mtu. We overwrite it with the true max MTU below.
++ 	 */
++ 	if (dev_op_jumbo_frames &&
++ 	    (supported_features_mask & GVE_SUP_JUMBO_FRAMES_MASK)) {
++ 		dev_info(&priv->pdev->dev,
++ 			 "JUMBO FRAMES device option enabled.\n");
++ 		priv->dev->max_mtu = be16_to_cpu(dev_op_jumbo_frames->max_mtu);
++ 	}
++ }
++ 
+++>>>>>>> 255489f5b33c (gve: Add a jumbo-frame device option.)
+  int gve_adminq_describe_device(struct gve_priv *priv)
+  {
++ 	struct gve_device_option_jumbo_frames *dev_op_jumbo_frames = NULL;
+  	struct gve_device_option_gqi_rda *dev_op_gqi_rda = NULL;
+  	struct gve_device_option_gqi_qpl *dev_op_gqi_qpl = NULL;
+  	struct gve_device_option_dqo_rda *dev_op_dqo_rda = NULL;
+@@@ -628,9 -728,9 +704,10 @@@
+  	if (err)
+  		goto free_device_descriptor;
+  
+ +	priv->raw_addressing = 0;
+  	err = gve_process_device_options(priv, descriptor, &dev_op_gqi_rda,
+- 					 &dev_op_gqi_qpl, &dev_op_dqo_rda);
++ 					 &dev_op_gqi_qpl, &dev_op_dqo_rda,
++ 					 &dev_op_jumbo_frames);
+  	if (err)
+  		goto free_device_descriptor;
+  
+@@@ -642,13 -742,22 +719,25 @@@
+  		dev_info(&priv->pdev->dev,
+  			 "Driver is running with GQI RDA queue format.\n");
+  	} else if (dev_op_dqo_rda) {
+ -		priv->queue_format = GVE_DQO_RDA_FORMAT;
+  		dev_info(&priv->pdev->dev,
+  			 "Driver is running with DQO RDA queue format.\n");
++ 		supported_features_mask =
++ 			be32_to_cpu(dev_op_dqo_rda->supported_features_mask);
+  	} else if (dev_op_gqi_rda) {
+ -		priv->queue_format = GVE_GQI_RDA_FORMAT;
+  		dev_info(&priv->pdev->dev,
+  			 "Driver is running with GQI RDA queue format.\n");
+++<<<<<<< HEAD
+ +		priv->raw_addressing = 1;
+ +	} else {
+++=======
++ 		supported_features_mask =
++ 			be32_to_cpu(dev_op_gqi_rda->supported_features_mask);
++ 	} else {
++ 		priv->queue_format = GVE_GQI_QPL_FORMAT;
++ 		if (dev_op_gqi_qpl)
++ 			supported_features_mask =
++ 				be32_to_cpu(dev_op_gqi_qpl->supported_features_mask);
+++>>>>>>> 255489f5b33c (gve: Add a jumbo-frame device option.)
+  		dev_info(&priv->pdev->dev,
+  			 "Driver is running with GQI QPL queue format.\n");
+  	}
+* Unmerged path drivers/net/ethernet/google/gve/gve_adminq.c
+diff --git a/drivers/net/ethernet/google/gve/gve_adminq.h b/drivers/net/ethernet/google/gve/gve_adminq.h
+index e09ae81676cc..c33e394c221a 100644
+--- a/drivers/net/ethernet/google/gve/gve_adminq.h
++++ b/drivers/net/ethernet/google/gve/gve_adminq.h
+@@ -107,6 +107,14 @@ struct gve_device_option_dqo_rda {
+ 
+ static_assert(sizeof(struct gve_device_option_dqo_rda) == 8);
+ 
++struct gve_device_option_jumbo_frames {
++	__be32 supported_features_mask;
++	__be16 max_mtu;
++	u8 padding[2];
++};
++
++static_assert(sizeof(struct gve_device_option_jumbo_frames) == 8);
++
+ /* Terminology:
+  *
+  * RDA - Raw DMA Addressing - Buffers associated with SKBs are directly DMA
+@@ -120,6 +128,7 @@ enum gve_dev_opt_id {
+ 	GVE_DEV_OPT_ID_GQI_RDA = 0x2,
+ 	GVE_DEV_OPT_ID_GQI_QPL = 0x3,
+ 	GVE_DEV_OPT_ID_DQO_RDA = 0x4,
++	GVE_DEV_OPT_ID_JUMBO_FRAMES = 0x8,
+ };
+ 
+ enum gve_dev_opt_req_feat_mask {
+@@ -127,6 +136,11 @@ enum gve_dev_opt_req_feat_mask {
+ 	GVE_DEV_OPT_REQ_FEAT_MASK_GQI_RDA = 0x0,
+ 	GVE_DEV_OPT_REQ_FEAT_MASK_GQI_QPL = 0x0,
+ 	GVE_DEV_OPT_REQ_FEAT_MASK_DQO_RDA = 0x0,
++	GVE_DEV_OPT_REQ_FEAT_MASK_JUMBO_FRAMES = 0x0,
++};
++
++enum gve_sup_feature_mask {
++	GVE_SUP_JUMBO_FRAMES_MASK = 1 << 2,
+ };
+ 
+ #define GVE_DEV_OPT_LEN_GQI_RAW_ADDRESSING 0x0
