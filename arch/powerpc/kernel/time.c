@@ -178,7 +178,7 @@ static void calc_cputime_factors(void)
  * Read the SPURR on systems that have it, otherwise the PURR,
  * or if that doesn't exist return the timebase value passed in.
  */
-static unsigned long read_spurr(unsigned long tb)
+static inline unsigned long read_spurr(unsigned long tb)
 {
 	if (cpu_has_feature(CPU_FTR_SPURR))
 		return mfspr(SPRN_SPURR);
@@ -289,7 +289,8 @@ static inline u64 calculate_stolen_time(u64 stop_tb)
 static unsigned long vtime_delta_scaled(struct cpu_accounting_data *acct,
 					unsigned long now, unsigned long stime)
 {
-	unsigned long stime_scaled;
+	unsigned long stime_scaled = 0;
+#ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
 	unsigned long nowscaled, deltascaled;
 	unsigned long utime, utime_scaled;
 
@@ -320,6 +321,7 @@ static unsigned long vtime_delta_scaled(struct cpu_accounting_data *acct,
 		}
 	}
 	acct->utime_scaled += utime_scaled;
+#endif
 
 	return stime_scaled;
 }
@@ -356,7 +358,9 @@ void vtime_account_kernel(struct task_struct *tsk)
 
 	if ((tsk->flags & PF_VCPU) && !irq_count()) {
 		acct->gtime += stime;
+#ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
 		acct->utime_scaled += stime_scaled;
+#endif
 	} else {
 		if (hardirq_count())
 			acct->hardirq_time += stime;
@@ -365,7 +369,9 @@ void vtime_account_kernel(struct task_struct *tsk)
 		else
 			acct->stime += stime;
 
+#ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
 		acct->stime_scaled += stime_scaled;
+#endif
 	}
 }
 EXPORT_SYMBOL_GPL(vtime_account_kernel);
@@ -382,6 +388,7 @@ void vtime_account_idle(struct task_struct *tsk)
 static void vtime_flush_scaled(struct task_struct *tsk,
 			       struct cpu_accounting_data *acct)
 {
+#ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
 	if (acct->utime_scaled)
 		tsk->utimescaled += cputime_to_nsecs(acct->utime_scaled);
 	if (acct->stime_scaled)
@@ -390,6 +397,7 @@ static void vtime_flush_scaled(struct task_struct *tsk,
 	acct->utime_scaled = 0;
 	acct->utime_sspurr = 0;
 	acct->stime_scaled = 0;
+#endif
 }
 
 /*
