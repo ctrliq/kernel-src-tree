@@ -1,0 +1,171 @@
+drm/i915: Use Engine1 instance for gen11 pm interrupts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Mika Kuoppala <mika.kuoppala@linux.intel.com>
+commit 917dc6b53c273dd7e026f158ad4894ae366da326
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/917dc6b5.failed
+
+With gen11 the interrupt registers are shared between 2 engines,
+with Engine1 instance being upper word and Engine0 instance being
+lower. Annoyingly gen11 selected the pm interrupts to be in the
+Engine1 instance.
+
+Rectify the situation by shifting the access accordingly,
+based on gen.
+
+v2: comments, warn on overzealous rps_events
+
+Bugzilla: https://bugzilla.freedesktop.org/show_bug.cgi?id=108059
+Testcase: igt/i915_pm_rps@min-max-config-loaded
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Signed-off-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+	Acked-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190410105923.18546-6-mika.kuoppala@linux.intel.com
+(cherry picked from commit 917dc6b53c273dd7e026f158ad4894ae366da326)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_reg.h
+diff --cc drivers/gpu/drm/i915/i915_reg.h
+index a78c6ef1f608,8ad2f0a03f28..000000000000
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@@ -8137,15 -8702,22 +8137,34 @@@ enum 
+  #define GEN6_PMIMR				_MMIO(0x44024) /* rps_lock */
+  #define GEN6_PMIIR				_MMIO(0x44028)
+  #define GEN6_PMIER				_MMIO(0x4402C)
+++<<<<<<< HEAD
+ +#define  GEN6_PM_MBOX_EVENT			(1<<25)
+ +#define  GEN6_PM_THERMAL_EVENT			(1<<24)
+ +#define  GEN6_PM_RP_DOWN_TIMEOUT		(1<<6)
+ +#define  GEN6_PM_RP_UP_THRESHOLD		(1<<5)
+ +#define  GEN6_PM_RP_DOWN_THRESHOLD		(1<<4)
+ +#define  GEN6_PM_RP_UP_EI_EXPIRED		(1<<2)
+ +#define  GEN6_PM_RP_DOWN_EI_EXPIRED		(1<<1)
+ +#define  GEN6_PM_RPS_EVENTS			(GEN6_PM_RP_UP_THRESHOLD | \
+ +						 GEN6_PM_RP_DOWN_THRESHOLD | \
+++=======
++ #define  GEN6_PM_MBOX_EVENT			(1 << 25)
++ #define  GEN6_PM_THERMAL_EVENT			(1 << 24)
++ 
++ /*
++  * For Gen11 these are in the upper word of the GPM_WGBOXPERF
++  * registers. Shifting is handled on accessing the imr and ier.
++  */
++ #define  GEN6_PM_RP_DOWN_TIMEOUT		(1 << 6)
++ #define  GEN6_PM_RP_UP_THRESHOLD		(1 << 5)
++ #define  GEN6_PM_RP_DOWN_THRESHOLD		(1 << 4)
++ #define  GEN6_PM_RP_UP_EI_EXPIRED		(1 << 2)
++ #define  GEN6_PM_RP_DOWN_EI_EXPIRED		(1 << 1)
++ #define  GEN6_PM_RPS_EVENTS			(GEN6_PM_RP_UP_EI_EXPIRED   | \
++ 						 GEN6_PM_RP_UP_THRESHOLD    | \
++ 						 GEN6_PM_RP_DOWN_EI_EXPIRED | \
++ 						 GEN6_PM_RP_DOWN_THRESHOLD  | \
+++>>>>>>> 917dc6b53c27 (drm/i915: Use Engine1 instance for gen11 pm interrupts)
+  						 GEN6_PM_RP_DOWN_TIMEOUT)
+  
+  #define GEN7_GT_SCRATCH(i)			_MMIO(0x4F100 + (i) * 4)
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index ac963122dea0..3ccb2f838ef7 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -348,24 +348,41 @@ static i915_reg_t gen6_pm_iir(struct drm_i915_private *dev_priv)
+ 	return INTEL_GEN(dev_priv) >= 8 ? GEN8_GT_IIR(2) : GEN6_PMIIR;
+ }
+ 
+-static i915_reg_t gen6_pm_imr(struct drm_i915_private *dev_priv)
++static void write_pm_imr(struct drm_i915_private *dev_priv)
+ {
+-	if (INTEL_GEN(dev_priv) >= 11)
+-		return GEN11_GPM_WGBOXPERF_INTR_MASK;
+-	else if (INTEL_GEN(dev_priv) >= 8)
+-		return GEN8_GT_IMR(2);
+-	else
+-		return GEN6_PMIMR;
++	i915_reg_t reg;
++	u32 mask = dev_priv->pm_imr;
++
++	if (INTEL_GEN(dev_priv) >= 11) {
++		reg = GEN11_GPM_WGBOXPERF_INTR_MASK;
++		/* pm is in upper half */
++		mask = mask << 16;
++	} else if (INTEL_GEN(dev_priv) >= 8) {
++		reg = GEN8_GT_IMR(2);
++	} else {
++		reg = GEN6_PMIMR;
++	}
++
++	I915_WRITE(reg, mask);
++	POSTING_READ(reg);
+ }
+ 
+-static i915_reg_t gen6_pm_ier(struct drm_i915_private *dev_priv)
++static void write_pm_ier(struct drm_i915_private *dev_priv)
+ {
+-	if (INTEL_GEN(dev_priv) >= 11)
+-		return GEN11_GPM_WGBOXPERF_INTR_ENABLE;
+-	else if (INTEL_GEN(dev_priv) >= 8)
+-		return GEN8_GT_IER(2);
+-	else
+-		return GEN6_PMIER;
++	i915_reg_t reg;
++	u32 mask = dev_priv->pm_ier;
++
++	if (INTEL_GEN(dev_priv) >= 11) {
++		reg = GEN11_GPM_WGBOXPERF_INTR_ENABLE;
++		/* pm is in upper half */
++		mask = mask << 16;
++	} else if (INTEL_GEN(dev_priv) >= 8) {
++		reg = GEN8_GT_IER(2);
++	} else {
++		reg = GEN6_PMIER;
++	}
++
++	I915_WRITE(reg, mask);
+ }
+ 
+ /**
+@@ -390,8 +407,7 @@ static void snb_update_pm_irq(struct drm_i915_private *dev_priv,
+ 
+ 	if (new_val != dev_priv->pm_imr) {
+ 		dev_priv->pm_imr = new_val;
+-		I915_WRITE(gen6_pm_imr(dev_priv), dev_priv->pm_imr);
+-		POSTING_READ(gen6_pm_imr(dev_priv));
++		write_pm_imr(dev_priv);
+ 	}
+ }
+ 
+@@ -432,7 +448,7 @@ static void gen6_enable_pm_irq(struct drm_i915_private *dev_priv, u32 enable_mas
+ 	lockdep_assert_held(&dev_priv->irq_lock);
+ 
+ 	dev_priv->pm_ier |= enable_mask;
+-	I915_WRITE(gen6_pm_ier(dev_priv), dev_priv->pm_ier);
++	write_pm_ier(dev_priv);
+ 	gen6_unmask_pm_irq(dev_priv, enable_mask);
+ 	/* unmask_pm_irq provides an implicit barrier (POSTING_READ) */
+ }
+@@ -443,7 +459,7 @@ static void gen6_disable_pm_irq(struct drm_i915_private *dev_priv, u32 disable_m
+ 
+ 	dev_priv->pm_ier &= ~disable_mask;
+ 	__gen6_mask_pm_irq(dev_priv, disable_mask);
+-	I915_WRITE(gen6_pm_ier(dev_priv), dev_priv->pm_ier);
++	write_pm_ier(dev_priv);
+ 	/* though a barrier is missing here, but don't really need a one */
+ }
+ 
+@@ -4448,6 +4464,10 @@ void intel_irq_init(struct drm_i915_private *dev_priv)
+ 	else
+ 		dev_priv->pm_rps_events = GEN6_PM_RPS_EVENTS;
+ 
++	/* We share the register with other engine */
++	if (INTEL_GEN(dev_priv) > 9)
++		GEM_WARN_ON(dev_priv->pm_rps_events & 0xffff0000);
++
+ 	rps->pm_intrmsk_mbz = 0;
+ 
+ 	/*
+* Unmerged path drivers/gpu/drm/i915/i915_reg.h
