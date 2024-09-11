@@ -1,0 +1,144 @@
+block: nr_sects_write(): Disable preemption on seqcount write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ahmed S. Darwish <a.darwish@linutronix.de>
+commit 15b81ce5abdc4b502aa31dff2d415b79d2349d2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/15b81ce5.failed
+
+For optimized block readers not holding a mutex, the "number of sectors"
+64-bit value is protected from tearing on 32-bit architectures by a
+sequence counter.
+
+Disable preemption before entering that sequence counter's write side
+critical section. Otherwise, the read side can preempt the write side
+section and spin for the entire scheduler tick. If the reader belongs to
+a real-time scheduling class, it can spin forever and the kernel will
+livelock.
+
+Fixes: c83f6bf98dc1 ("block: add partition resize function to blkpg ioctl")
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Ahmed S. Darwish <a.darwish@linutronix.de>
+	Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 15b81ce5abdc4b502aa31dff2d415b79d2349d2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+diff --cc block/blk.h
+index 0fea53c91ae4,b5d1f0fc6547..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -318,10 -342,102 +318,85 @@@ void blk_queue_free_zone_bitmaps(struc
+  static inline void blk_queue_free_zone_bitmaps(struct request_queue *q) {}
+  #endif
+  
+ -struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector);
+ -
+ -int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
+ -void blk_free_devt(dev_t devt);
+ -void blk_invalidate_devt(dev_t devt);
+ -char *disk_name(struct gendisk *hd, int partno, char *buf);
+ -#define ADDPART_FLAG_NONE	0
+ -#define ADDPART_FLAG_RAID	1
+ -#define ADDPART_FLAG_WHOLEDISK	2
+ -void delete_partition(struct gendisk *disk, struct hd_struct *part);
+ -int bdev_add_partition(struct block_device *bdev, int partno,
+ -		sector_t start, sector_t length);
+ -int bdev_del_partition(struct block_device *bdev, int partno);
+ -int bdev_resize_partition(struct block_device *bdev, int partno,
+ -		sector_t start, sector_t length);
+ -int disk_expand_part_tbl(struct gendisk *disk, int target);
+ -int hd_ref_init(struct hd_struct *part);
+ -
+ -/* no need to get/put refcount of part0 */
+ -static inline int hd_struct_try_get(struct hd_struct *part)
+ +/* internal helper for accessing request_aux  */
+ +static inline struct request_aux *rq_aux(const struct request *rq)
+  {
+ -	if (part->partno)
+ -		return percpu_ref_tryget_live(&part->ref);
+ -	return 1;
+ +	return (struct request_aux *)((void *)rq - sizeof(struct request_aux));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void hd_struct_put(struct hd_struct *part)
++ {
++ 	if (part->partno)
++ 		percpu_ref_put(&part->ref);
++ }
++ 
++ static inline void hd_free_part(struct hd_struct *part)
++ {
++ 	free_percpu(part->dkstats);
++ 	kfree(part->info);
++ 	percpu_ref_exit(&part->ref);
++ }
++ 
++ /*
++  * Any access of part->nr_sects which is not protected by partition
++  * bd_mutex or gendisk bdev bd_mutex, should be done using this
++  * accessor function.
++  *
++  * Code written along the lines of i_size_read() and i_size_write().
++  * CONFIG_PREEMPTION case optimizes the case of UP kernel with preemption
++  * on.
++  */
++ static inline sector_t part_nr_sects_read(struct hd_struct *part)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	sector_t nr_sects;
++ 	unsigned seq;
++ 	do {
++ 		seq = read_seqcount_begin(&part->nr_sects_seq);
++ 		nr_sects = part->nr_sects;
++ 	} while (read_seqcount_retry(&part->nr_sects_seq, seq));
++ 	return nr_sects;
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	sector_t nr_sects;
++ 
++ 	preempt_disable();
++ 	nr_sects = part->nr_sects;
++ 	preempt_enable();
++ 	return nr_sects;
++ #else
++ 	return part->nr_sects;
++ #endif
++ }
++ 
++ /*
++  * Should be called with mutex lock held (typically bd_mutex) of partition
++  * to provide mutual exlusion among writers otherwise seqcount might be
++  * left in wrong state leaving the readers spinning infinitely.
++  */
++ static inline void part_nr_sects_write(struct hd_struct *part, sector_t size)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	preempt_disable();
++ 	write_seqcount_begin(&part->nr_sects_seq);
++ 	part->nr_sects = size;
++ 	write_seqcount_end(&part->nr_sects_seq);
++ 	preempt_enable();
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	preempt_disable();
++ 	part->nr_sects = size;
++ 	preempt_enable();
++ #else
++ 	part->nr_sects = size;
++ #endif
++ }
++ 
++ struct request_queue *__blk_alloc_queue(int node_id);
++ 
++ int bio_add_hw_page(struct request_queue *q, struct bio *bio,
++ 		struct page *page, unsigned int len, unsigned int offset,
++ 		unsigned int max_sectors, bool *same_page);
++ 
+++>>>>>>> 15b81ce5abdc (block: nr_sects_write(): Disable preemption on seqcount write)
+  #endif /* BLK_INTERNAL_H */
+* Unmerged path block/blk.h
