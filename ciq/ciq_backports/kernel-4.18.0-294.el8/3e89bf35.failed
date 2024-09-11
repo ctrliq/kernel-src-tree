@@ -1,0 +1,167 @@
+x86/vdso: Move cycle_last handling into the caller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 3e89bf35ebf59c12e8c1476f6681fae0ebdcb2a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3e89bf35.failed
+
+Dereferencing gtod->cycle_last all over the place and foing the cycles <
+last comparison in the vclock read functions generates horrible code. Doing
+it at the call site is much better and gains a few cycles both for TSC and
+pvclock.
+
+Caveat: This adds the comparison to the hyperv vclock as well, but I have
+no way to test that.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Andy Lutomirski <luto@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Matt Rickard <matt@softrans.com.au>
+	Cc: Stephen Boyd <sboyd@kernel.org>
+	Cc: John Stultz <john.stultz@linaro.org>
+	Cc: Florian Weimer <fweimer@redhat.com>
+	Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+	Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: devel@linuxdriverproject.org
+	Cc: virtualization@lists.linux-foundation.org
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Juergen Gross <jgross@suse.com>
+Link: https://lkml.kernel.org/r/20180917130707.741440803@linutronix.de
+
+(cherry picked from commit 3e89bf35ebf59c12e8c1476f6681fae0ebdcb2a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/vdso/vclock_gettime.c
+diff --cc arch/x86/entry/vdso/vclock_gettime.c
+index f94186cf5962,b7ccbff26a3f..000000000000
+--- a/arch/x86/entry/vdso/vclock_gettime.c
++++ b/arch/x86/entry/vdso/vclock_gettime.c
+@@@ -100,12 -74,11 +100,11 @@@ static notrace const struct pvclock_vsy
+  	return (const struct pvclock_vsyscall_time_info *)&pvclock_page;
+  }
+  
+ -static notrace u64 vread_pvclock(void)
+ +static notrace u64 vread_pvclock(int *mode)
+  {
+  	const struct pvclock_vcpu_time_info *pvti = &get_pvti0()->pvti;
+- 	u64 ret;
+- 	u64 last;
+  	u32 version;
++ 	u64 ret;
+  
+  	/*
+  	 * Note: The kernel and hypervisor must guarantee that cpu ID
+@@@ -140,17 -111,11 +139,11 @@@
+  		ret = __pvclock_read_cycles(pvti, rdtsc_ordered());
+  	} while (pvclock_read_retry(pvti, version));
+  
+- 	/* refer to vread_tsc() comment for rationale */
+- 	last = gtod->cycle_last;
+- 
+- 	if (likely(ret >= last))
+- 		return ret;
+- 
+- 	return last;
++ 	return ret;
+  }
+  #endif
+ -#ifdef CONFIG_HYPERV_TSCPAGE
+ -static notrace u64 vread_hvclock(void)
+ +#ifdef CONFIG_HYPERV_TIMER
+ +static notrace u64 vread_hvclock(int *mode)
+  {
+  	const struct ms_hyperv_tsc_page *tsc_pg =
+  		(const struct ms_hyperv_tsc_page *)&hvclock_page;
+@@@ -164,60 -124,37 +157,80 @@@
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +notrace static u64 vread_tsc(void)
+ +{
+ +	u64 ret = (u64)rdtsc_ordered();
+ +	u64 last = gtod->cycle_last;
+ +
+ +	if (likely(ret >= last))
+ +		return ret;
+ +
+ +	/*
+ +	 * GCC likes to generate cmov here, but this branch is extremely
+ +	 * predictable (it's just a function of time and the likely is
+ +	 * very likely) and there's a data dependence, so force GCC
+ +	 * to generate a branch instead.  I don't barrier() because
+ +	 * we don't actually need a barrier, and if this function
+ +	 * ever gets inlined it will generate worse code.
+ +	 */
+ +	asm volatile ("");
+ +	return last;
+ +}
+ +
+ +notrace static inline u64 vgetsns(int *mode)
+ +{
+ +	u64 v;
+ +	cycles_t cycles;
+ +
+ +	if (gtod->vclock_mode == VCLOCK_TSC)
+ +		cycles = vread_tsc();
+++=======
++ notrace static inline u64 vgetcyc(int mode)
++ {
++ 	if (mode == VCLOCK_TSC)
++ 		return (u64)rdtsc_ordered();
+++>>>>>>> 3e89bf35ebf5 (x86/vdso: Move cycle_last handling into the caller)
+  #ifdef CONFIG_PARAVIRT_CLOCK
+ -	else if (mode == VCLOCK_PVCLOCK)
+ -		return vread_pvclock();
+ +	else if (gtod->vclock_mode == VCLOCK_PVCLOCK)
+ +		cycles = vread_pvclock(mode);
+  #endif
+ -#ifdef CONFIG_HYPERV_TSCPAGE
+ -	else if (mode == VCLOCK_HVCLOCK)
+ -		return vread_hvclock();
+ +#ifdef CONFIG_HYPERV_TIMER
+ +	else if (gtod->vclock_mode == VCLOCK_HVCLOCK)
+ +		cycles = vread_hvclock(mode);
+  #endif
+ -	return U64_MAX;
+ +	else
+ +		return 0;
+ +	v = cycles - gtod->cycle_last;
+ +	return v * gtod->mult;
+  }
+  
+  notrace static int do_hres(clockid_t clk, struct timespec *ts)
+  {
+  	struct vgtod_ts *base = &gtod->basetime[clk];
++ 	u64 cycles, last, ns;
+  	unsigned int seq;
+++<<<<<<< HEAD
+ +	int mode;
+ +	u64 ns;
+++=======
+++>>>>>>> 3e89bf35ebf5 (x86/vdso: Move cycle_last handling into the caller)
+  
+  	do {
+  		seq = gtod_read_begin(gtod);
+ +		mode = gtod->vclock_mode;
+  		ts->tv_sec = base->sec;
+  		ns = base->nsec;
+++<<<<<<< HEAD
+ +		ns += vgetsns(&mode);
+++=======
++ 		last = gtod->cycle_last;
++ 		cycles = vgetcyc(gtod->vclock_mode);
++ 		if (unlikely((s64)cycles < 0))
++ 			return vdso_fallback_gettime(clk, ts);
++ 		if (cycles > last)
++ 			ns += (cycles - last) * gtod->mult;
+++>>>>>>> 3e89bf35ebf5 (x86/vdso: Move cycle_last handling into the caller)
+  		ns >>= gtod->shift;
+  	} while (unlikely(gtod_read_retry(gtod, seq)));
+  
+* Unmerged path arch/x86/entry/vdso/vclock_gettime.c
