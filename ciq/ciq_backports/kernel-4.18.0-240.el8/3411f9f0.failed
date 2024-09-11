@@ -1,0 +1,143 @@
+RDMA/core: Create mmap database and cookie helper functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Michal Kalderon <michal.kalderon@marvell.com>
+commit 3411f9f01b76bd88aa6e0e013847ab6479cb4f24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3411f9f0.failed
+
+Create some common API's for adding entries to a xa_mmap. Searching for
+an entry and freeing one.
+
+The general approach is copied from the EFA driver and improved to be more
+general and do more to help the drivers. Integration with the core allows
+a reference counted scheme with a free function so that the driver can
+know when its mmaps are all gone.
+
+This significant new functionality will be helpful for drivers to have the
+correct lifetime model for mmap objects.
+
+Link: https://lore.kernel.org/r/20191030094417.16866-3-michal.kalderon@marvell.com
+	Signed-off-by: Ariel Elior <ariel.elior@marvell.com>
+	Signed-off-by: Michal Kalderon <michal.kalderon@marvell.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 3411f9f01b76bd88aa6e0e013847ab6479cb4f24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/ib_core_uverbs.c
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index bb8b71cc3821,06ed32c8662f..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -252,8 -252,7 +252,12 @@@ static int ib_uverbs_get_context(struc
+  	ucontext->closing = false;
+  	ucontext->cleanup_retryable = false;
+  
+++<<<<<<< HEAD
+ +	mutex_init(&ucontext->per_mm_list_lock);
+ +	INIT_LIST_HEAD(&ucontext->per_mm_list);
+++=======
++ 	xa_init_flags(&ucontext->mmap_xa, XA_FLAGS_ALLOC);
+++>>>>>>> 3411f9f01b76 (RDMA/core: Create mmap database and cookie helper functions)
+  
+  	ret = get_unused_fd_flags(O_CLOEXEC);
+  	if (ret < 0)
+* Unmerged path drivers/infiniband/core/ib_core_uverbs.c
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index fdb90c593979..0888f13862b7 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -2629,6 +2629,7 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
+ 	SET_DEVICE_OP(dev_ops, map_mr_sg_pi);
+ 	SET_DEVICE_OP(dev_ops, map_phys_fmr);
+ 	SET_DEVICE_OP(dev_ops, mmap);
++	SET_DEVICE_OP(dev_ops, mmap_free);
+ 	SET_DEVICE_OP(dev_ops, modify_ah);
+ 	SET_DEVICE_OP(dev_ops, modify_cq);
+ 	SET_DEVICE_OP(dev_ops, modify_device);
+* Unmerged path drivers/infiniband/core/ib_core_uverbs.c
+diff --git a/drivers/infiniband/core/rdma_core.c b/drivers/infiniband/core/rdma_core.c
+index 2a8337209ee0..ff7294bcfa66 100644
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -817,6 +817,7 @@ static void ufile_destroy_ucontext(struct ib_uverbs_file *ufile,
+ 	rdma_restrack_del(&ucontext->res);
+ 
+ 	ib_dev->ops.dealloc_ucontext(ucontext);
++	WARN_ON(!xa_empty(&ucontext->mmap_xa));
+ 	kfree(ucontext);
+ 
+ 	ufile->ucontext = NULL;
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index b2f13568889f..6087babd5599 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1439,6 +1439,7 @@ struct ib_ucontext {
+ 	 * Implementation details of the RDMA core, don't use in drivers:
+ 	 */
+ 	struct rdma_restrack_entry res;
++	struct xarray mmap_xa;
+ };
+ 
+ struct ib_uobject {
+@@ -2223,6 +2224,21 @@ struct iw_cm_conn_param;
+ 
+ #define DECLARE_RDMA_OBJ_SIZE(ib_struct) size_t size_##ib_struct
+ 
++struct rdma_user_mmap_entry {
++	struct kref ref;
++	struct ib_ucontext *ucontext;
++	unsigned long start_pgoff;
++	size_t npages;
++	bool driver_removed;
++};
++
++/* Return the offset (in bytes) the user should pass to libc's mmap() */
++static inline u64
++rdma_user_mmap_get_offset(const struct rdma_user_mmap_entry *entry)
++{
++	return (u64)entry->start_pgoff << PAGE_SHIFT;
++}
++
+ /**
+  * struct ib_device_ops - InfiniBand device operations
+  * This structure defines all the InfiniBand device operations, providers will
+@@ -2335,6 +2351,13 @@ struct ib_device_ops {
+ 			      struct ib_udata *udata);
+ 	void (*dealloc_ucontext)(struct ib_ucontext *context);
+ 	int (*mmap)(struct ib_ucontext *context, struct vm_area_struct *vma);
++	/**
++	 * This will be called once refcount of an entry in mmap_xa reaches
++	 * zero. The type of the memory that was mapped may differ between
++	 * entries and is opaque to the rdma_user_mmap interface.
++	 * Therefore needs to be implemented by the driver in mmap_free.
++	 */
++	void (*mmap_free)(struct rdma_user_mmap_entry *entry);
+ 	void (*disassociate_ucontext)(struct ib_ucontext *ibcontext);
+ 	int (*alloc_pd)(struct ib_pd *pd, struct ib_udata *udata);
+ 	void (*dealloc_pd)(struct ib_pd *pd, struct ib_udata *udata);
+@@ -2782,6 +2805,18 @@ static inline int rdma_user_mmap_io(struct ib_ucontext *ucontext,
+ 	return -EINVAL;
+ }
+ #endif
++int rdma_user_mmap_entry_insert(struct ib_ucontext *ucontext,
++				struct rdma_user_mmap_entry *entry,
++				size_t length);
++struct rdma_user_mmap_entry *
++rdma_user_mmap_entry_get_pgoff(struct ib_ucontext *ucontext,
++			       unsigned long pgoff);
++struct rdma_user_mmap_entry *
++rdma_user_mmap_entry_get(struct ib_ucontext *ucontext,
++			 struct vm_area_struct *vma);
++void rdma_user_mmap_entry_put(struct rdma_user_mmap_entry *entry);
++
++void rdma_user_mmap_entry_remove(struct rdma_user_mmap_entry *entry);
+ 
+ static inline int ib_copy_from_udata(void *dest, struct ib_udata *udata, size_t len)
+ {
