@@ -1,0 +1,185 @@
+ice: wait for reset before reporting devlink info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 1c08052ec49e4ef4549ebbc7a43f27694e08935d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/1c08052e.failed
+
+Requesting device firmware information while the device is busy cleaning
+up after a reset can result in an unexpected failure:
+
+This occurs because the command is attempting to access the device
+AdminQ while it is down. Resolve this by having the command wait for
+a while until the reset is complete. To do this, introduce
+a reset_wait_queue and associated helper function "ice_wait_for_reset".
+
+This helper will use the wait queue to sleep until the driver is done
+rebuilding. Use of a wait queue is preferred because the potential sleep
+duration can be several seconds.
+
+To ensure that the thread wakes up properly, a new wake_up call is added
+during all code paths which clear the reset state bits associated with
+the driver rebuild flow.
+
+Using this ensures that tools can request device information without
+worrying about whether the driver is cleaning up from a reset.
+Specifically, it is expected that a flash update could result in
+a device reset, and it is better to delay the response for information
+until the reset is complete rather than exit with an immediate failure.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Tony Brelinski <tonyx.brelinski@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 1c08052ec49e4ef4549ebbc7a43f27694e08935d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_main.c
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 4d9dc76890e0,a89ca799109f..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -507,12 -497,13 +507,22 @@@ static void ice_do_reset(struct ice_pf 
+  	/* trigger the reset */
+  	if (ice_reset(hw, reset_type)) {
+  		dev_err(dev, "reset %d failed\n", reset_type);
+++<<<<<<< HEAD
+ +		set_bit(__ICE_RESET_FAILED, pf->state);
+ +		clear_bit(__ICE_RESET_OICR_RECV, pf->state);
+ +		clear_bit(__ICE_PREPARED_FOR_RESET, pf->state);
+ +		clear_bit(__ICE_PFR_REQ, pf->state);
+ +		clear_bit(__ICE_CORER_REQ, pf->state);
+ +		clear_bit(__ICE_GLOBR_REQ, pf->state);
+++=======
++ 		set_bit(ICE_RESET_FAILED, pf->state);
++ 		clear_bit(ICE_RESET_OICR_RECV, pf->state);
++ 		clear_bit(ICE_PREPARED_FOR_RESET, pf->state);
++ 		clear_bit(ICE_PFR_REQ, pf->state);
++ 		clear_bit(ICE_CORER_REQ, pf->state);
++ 		clear_bit(ICE_GLOBR_REQ, pf->state);
++ 		wake_up(&pf->reset_wait_queue);
+++>>>>>>> 1c08052ec49e (ice: wait for reset before reporting devlink info)
+  		return;
+  	}
+  
+@@@ -523,8 -514,9 +533,14 @@@
+  	if (reset_type == ICE_RESET_PFR) {
+  		pf->pfr_count++;
+  		ice_rebuild(pf, reset_type);
+++<<<<<<< HEAD
+ +		clear_bit(__ICE_PREPARED_FOR_RESET, pf->state);
+ +		clear_bit(__ICE_PFR_REQ, pf->state);
+++=======
++ 		clear_bit(ICE_PREPARED_FOR_RESET, pf->state);
++ 		clear_bit(ICE_PFR_REQ, pf->state);
++ 		wake_up(&pf->reset_wait_queue);
+++>>>>>>> 1c08052ec49e (ice: wait for reset before reporting devlink info)
+  		ice_reset_all_vfs(pf, true);
+  	}
+  }
+@@@ -570,11 -562,12 +586,20 @@@ static void ice_reset_subtask(struct ic
+  			/* clear bit to resume normal operations, but
+  			 * ICE_NEEDS_RESTART bit is set in case rebuild failed
+  			 */
+++<<<<<<< HEAD
+ +			clear_bit(__ICE_RESET_OICR_RECV, pf->state);
+ +			clear_bit(__ICE_PREPARED_FOR_RESET, pf->state);
+ +			clear_bit(__ICE_PFR_REQ, pf->state);
+ +			clear_bit(__ICE_CORER_REQ, pf->state);
+ +			clear_bit(__ICE_GLOBR_REQ, pf->state);
+++=======
++ 			clear_bit(ICE_RESET_OICR_RECV, pf->state);
++ 			clear_bit(ICE_PREPARED_FOR_RESET, pf->state);
++ 			clear_bit(ICE_PFR_REQ, pf->state);
++ 			clear_bit(ICE_CORER_REQ, pf->state);
++ 			clear_bit(ICE_GLOBR_REQ, pf->state);
++ 			wake_up(&pf->reset_wait_queue);
+++>>>>>>> 1c08052ec49e (ice: wait for reset before reporting devlink info)
+  			ice_reset_all_vfs(pf, true);
+  		}
+  
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 5e29f3ac887e..c40802f46ed9 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -450,6 +450,8 @@ struct ice_pf {
+ 	struct hlist_head aq_wait_list;
+ 	wait_queue_head_t aq_wait_queue;
+ 
++	wait_queue_head_t reset_wait_queue;
++
+ 	u32 hw_csum_rx_error;
+ 	u16 oicr_idx;		/* Other interrupt cause MSIX vector index */
+ 	u16 num_avail_sw_msix;	/* remaining MSIX SW vectors left unclaimed */
+diff --git a/drivers/net/ethernet/intel/ice/ice_devlink.c b/drivers/net/ethernet/intel/ice/ice_devlink.c
+index 2923591d01ea..91b545ab8b8f 100644
+--- a/drivers/net/ethernet/intel/ice/ice_devlink.c
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.c
+@@ -276,6 +276,12 @@ static int ice_devlink_info_get(struct devlink *devlink,
+ 	size_t i;
+ 	int err;
+ 
++	err = ice_wait_for_reset(pf, 10 * HZ);
++	if (err) {
++		NL_SET_ERR_MSG_MOD(extack, "Device is busy resetting");
++		return err;
++	}
++
+ 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+ 		return -ENOMEM;
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 32fa5958c216..6995e88f44ab 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -3215,6 +3215,34 @@ bool ice_is_reset_in_progress(unsigned long *state)
+ 	       test_bit(__ICE_GLOBR_REQ, state);
+ }
+ 
++/**
++ * ice_wait_for_reset - Wait for driver to finish reset and rebuild
++ * @pf: pointer to the PF structure
++ * @timeout: length of time to wait, in jiffies
++ *
++ * Wait (sleep) for a short time until the driver finishes cleaning up from
++ * a device reset. The caller must be able to sleep. Use this to delay
++ * operations that could fail while the driver is cleaning up after a device
++ * reset.
++ *
++ * Returns 0 on success, -EBUSY if the reset is not finished within the
++ * timeout, and -ERESTARTSYS if the thread was interrupted.
++ */
++int ice_wait_for_reset(struct ice_pf *pf, unsigned long timeout)
++{
++	long ret;
++
++	ret = wait_event_interruptible_timeout(pf->reset_wait_queue,
++					       !ice_is_reset_in_progress(pf->state),
++					       timeout);
++	if (ret < 0)
++		return ret;
++	else if (!ret)
++		return -EBUSY;
++	else
++		return 0;
++}
++
+ #ifdef CONFIG_DCB
+ /**
+  * ice_vsi_update_q_map - update our copy of the VSI info with new queue map
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.h b/drivers/net/ethernet/intel/ice/ice_lib.h
+index 15be79dbdada..a60ba382859a 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_lib.h
+@@ -77,6 +77,7 @@ ice_get_res(struct ice_pf *pf, struct ice_res_tracker *res, u16 needed, u16 id);
+ int ice_vsi_rebuild(struct ice_vsi *vsi, bool init_vsi);
+ 
+ bool ice_is_reset_in_progress(unsigned long *state);
++int ice_wait_for_reset(struct ice_pf *pf, unsigned long timeout);
+ 
+ void
+ ice_write_qrxflxp_cntxt(struct ice_hw *hw, u16 pf_q, u32 rxdid, u32 prio,
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
