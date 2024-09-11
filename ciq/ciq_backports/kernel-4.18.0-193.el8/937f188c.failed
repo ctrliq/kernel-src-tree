@@ -1,0 +1,705 @@
+bnxt_en: Fix the logic that creates the health reporters.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Fix the logic that creates the health reporters (Jonathan Toppins) [1801868]
+Rebuild_FUZZ: 99.12%
+commit-author Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+commit 937f188c1f4f89b3fa93ba31fc8587dc1fb14a22
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/937f188c.failed
+
+Fix the logic to properly check the fw capabilities and create the
+devlink health reporters only when needed.  The current code creates
+the reporters unconditionally as long as bp->fw_health is valid, and
+that's not correct.
+
+Call bnxt_dl_fw_reporters_create() directly from the init and reset
+code path instead of from bnxt_dl_register().  This allows the
+reporters to be adjusted when capabilities change.  The same
+applies to bnxt_dl_fw_reporters_destroy().
+
+Fixes: 6763c779c2d8 ("bnxt_en: Add new FW devlink_health_reporter")
+	Signed-off-by: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 937f188c1f4f89b3fa93ba31fc8587dc1fb14a22)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index f7c9d57ddad5,819b7d72f9de..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -9780,6 -10480,364 +9780,367 @@@ static void bnxt_init_dflt_coal(struct 
+  	bp->stats_coal_ticks = BNXT_DEF_STATS_COAL_TICKS;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void bnxt_alloc_fw_health(struct bnxt *bp)
++ {
++ 	if (bp->fw_health)
++ 		return;
++ 
++ 	if (!(bp->fw_cap & BNXT_FW_CAP_HOT_RESET) &&
++ 	    !(bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY))
++ 		return;
++ 
++ 	bp->fw_health = kzalloc(sizeof(*bp->fw_health), GFP_KERNEL);
++ 	if (!bp->fw_health) {
++ 		netdev_warn(bp->dev, "Failed to allocate fw_health\n");
++ 		bp->fw_cap &= ~BNXT_FW_CAP_HOT_RESET;
++ 		bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
++ 	}
++ }
++ 
++ static int bnxt_fw_init_one_p1(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	bp->fw_cap = 0;
++ 	rc = bnxt_hwrm_ver_get(bp);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL) {
++ 		rc = bnxt_alloc_kong_hwrm_resources(bp);
++ 		if (rc)
++ 			bp->fw_cap &= ~BNXT_FW_CAP_KONG_MB_CHNL;
++ 	}
++ 
++ 	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
++ 	    bp->hwrm_max_ext_req_len > BNXT_HWRM_MAX_REQ_LEN) {
++ 		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	rc = bnxt_hwrm_func_reset(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_fw_set_time(bp);
++ 	return 0;
++ }
++ 
++ static int bnxt_fw_init_one_p2(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	/* Get the MAX capabilities for this function */
++ 	rc = bnxt_hwrm_func_qcaps(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "hwrm query capability failure rc: %x\n",
++ 			   rc);
++ 		return -ENODEV;
++ 	}
++ 
++ 	rc = bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query adv flow mgnt failure rc: %d\n",
++ 			    rc);
++ 
++ 	bnxt_alloc_fw_health(bp);
++ 	rc = bnxt_hwrm_error_recovery_qcfg(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query error recovery failure rc: %d\n",
++ 			    rc);
++ 
++ 	rc = bnxt_hwrm_func_drv_rgtr(bp, NULL, 0, false);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_func_qcfg(bp);
++ 	bnxt_hwrm_vnic_qcaps(bp);
++ 	bnxt_hwrm_port_led_qcaps(bp);
++ 	bnxt_ethtool_init(bp);
++ 	bnxt_dcb_init(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_set_dflt_rss_hash_type(struct bnxt *bp)
++ {
++ 	bp->flags &= ~BNXT_FLAG_UDP_RSS_CAP;
++ 	bp->rss_hash_cfg = VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_IPV6 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV6;
++ 	if (BNXT_CHIP_P4(bp) && bp->hwrm_spec_code >= 0x10501) {
++ 		bp->flags |= BNXT_FLAG_UDP_RSS_CAP;
++ 		bp->rss_hash_cfg |= VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV4 |
++ 				    VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV6;
++ 	}
++ }
++ 
++ static void bnxt_set_dflt_rfs(struct bnxt *bp)
++ {
++ 	struct net_device *dev = bp->dev;
++ 
++ 	dev->hw_features &= ~NETIF_F_NTUPLE;
++ 	dev->features &= ~NETIF_F_NTUPLE;
++ 	bp->flags &= ~BNXT_FLAG_RFS;
++ 	if (bnxt_rfs_supported(bp)) {
++ 		dev->hw_features |= NETIF_F_NTUPLE;
++ 		if (bnxt_rfs_capable(bp)) {
++ 			bp->flags |= BNXT_FLAG_RFS;
++ 			dev->features |= NETIF_F_NTUPLE;
++ 		}
++ 	}
++ }
++ 
++ static void bnxt_fw_init_one_p3(struct bnxt *bp)
++ {
++ 	struct pci_dev *pdev = bp->pdev;
++ 
++ 	bnxt_set_dflt_rss_hash_type(bp);
++ 	bnxt_set_dflt_rfs(bp);
++ 
++ 	bnxt_get_wol_settings(bp);
++ 	if (bp->flags & BNXT_FLAG_WOL_CAP)
++ 		device_set_wakeup_enable(&pdev->dev, bp->wol);
++ 	else
++ 		device_set_wakeup_capable(&pdev->dev, false);
++ 
++ 	bnxt_hwrm_set_cache_line_size(bp, cache_line_size());
++ 	bnxt_hwrm_coal_params_qcaps(bp);
++ }
++ 
++ static int bnxt_fw_init_one(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	rc = bnxt_fw_init_one_p1(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 1 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_fw_init_one_p2(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 2 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_approve_mac(bp, bp->dev->dev_addr, false);
++ 	if (rc)
++ 		return rc;
++ 
++ 	/* In case fw capabilities have changed, destroy the unneeded
++ 	 * reporters and create newly capable ones.
++ 	 */
++ 	bnxt_dl_fw_reporters_destroy(bp, false);
++ 	bnxt_dl_fw_reporters_create(bp);
++ 	bnxt_fw_init_one_p3(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_fw_reset_writel(struct bnxt *bp, int reg_idx)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	u32 reg = fw_health->fw_reset_seq_regs[reg_idx];
++ 	u32 val = fw_health->fw_reset_seq_vals[reg_idx];
++ 	u32 reg_type, reg_off, delay_msecs;
++ 
++ 	delay_msecs = fw_health->fw_reset_seq_delay_msec[reg_idx];
++ 	reg_type = BNXT_FW_HEALTH_REG_TYPE(reg);
++ 	reg_off = BNXT_FW_HEALTH_REG_OFF(reg);
++ 	switch (reg_type) {
++ 	case BNXT_FW_HEALTH_REG_TYPE_CFG:
++ 		pci_write_config_dword(bp->pdev, reg_off, val);
++ 		break;
++ 	case BNXT_FW_HEALTH_REG_TYPE_GRC:
++ 		writel(reg_off & BNXT_GRC_BASE_MASK,
++ 		       bp->bar0 + BNXT_GRCPF_REG_WINDOW_BASE_OUT + 4);
++ 		reg_off = (reg_off & BNXT_GRC_OFFSET_MASK) + 0x2000;
++ 		/* fall through */
++ 	case BNXT_FW_HEALTH_REG_TYPE_BAR0:
++ 		writel(val, bp->bar0 + reg_off);
++ 		break;
++ 	case BNXT_FW_HEALTH_REG_TYPE_BAR1:
++ 		writel(val, bp->bar1 + reg_off);
++ 		break;
++ 	}
++ 	if (delay_msecs) {
++ 		pci_read_config_dword(bp->pdev, 0, &val);
++ 		msleep(delay_msecs);
++ 	}
++ }
++ 
++ static void bnxt_reset_all(struct bnxt *bp)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	int i, rc;
++ 
++ 	if (bp->fw_cap & BNXT_FW_CAP_ERR_RECOVER_RELOAD) {
++ #ifdef CONFIG_TEE_BNXT_FW
++ 		rc = tee_bnxt_fw_load();
++ 		if (rc)
++ 			netdev_err(bp->dev, "Unable to reset FW rc=%d\n", rc);
++ 		bp->fw_reset_timestamp = jiffies;
++ #endif
++ 		return;
++ 	}
++ 
++ 	if (fw_health->flags & ERROR_RECOVERY_QCFG_RESP_FLAGS_HOST) {
++ 		for (i = 0; i < fw_health->fw_reset_seq_cnt; i++)
++ 			bnxt_fw_reset_writel(bp, i);
++ 	} else if (fw_health->flags & ERROR_RECOVERY_QCFG_RESP_FLAGS_CO_CPU) {
++ 		struct hwrm_fw_reset_input req = {0};
++ 
++ 		bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FW_RESET, -1, -1);
++ 		req.resp_addr = cpu_to_le64(bp->hwrm_cmd_kong_resp_dma_addr);
++ 		req.embedded_proc_type = FW_RESET_REQ_EMBEDDED_PROC_TYPE_CHIP;
++ 		req.selfrst_status = FW_RESET_REQ_SELFRST_STATUS_SELFRSTASAP;
++ 		req.flags = FW_RESET_REQ_FLAGS_RESET_GRACEFUL;
++ 		rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++ 		if (rc)
++ 			netdev_warn(bp->dev, "Unable to reset FW rc=%d\n", rc);
++ 	}
++ 	bp->fw_reset_timestamp = jiffies;
++ }
++ 
++ static void bnxt_fw_reset_task(struct work_struct *work)
++ {
++ 	struct bnxt *bp = container_of(work, struct bnxt, fw_reset_task.work);
++ 	int rc;
++ 
++ 	if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
++ 		netdev_err(bp->dev, "bnxt_fw_reset_task() called when not in fw reset mode!\n");
++ 		return;
++ 	}
++ 
++ 	switch (bp->fw_reset_state) {
++ 	case BNXT_FW_RESET_STATE_POLL_VF: {
++ 		int n = bnxt_get_registered_vfs(bp);
++ 		int tmo;
++ 
++ 		if (n < 0) {
++ 			netdev_err(bp->dev, "Firmware reset aborted, subsequent func_qcfg cmd failed, rc = %d, %d msecs since reset timestamp\n",
++ 				   n, jiffies_to_msecs(jiffies -
++ 				   bp->fw_reset_timestamp));
++ 			goto fw_reset_abort;
++ 		} else if (n > 0) {
++ 			if (time_after(jiffies, bp->fw_reset_timestamp +
++ 				       (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 				clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 				bp->fw_reset_state = 0;
++ 				netdev_err(bp->dev, "Firmware reset aborted, bnxt_get_registered_vfs() returns %d\n",
++ 					   n);
++ 				return;
++ 			}
++ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 			return;
++ 		}
++ 		bp->fw_reset_timestamp = jiffies;
++ 		rtnl_lock();
++ 		bnxt_fw_reset_close(bp);
++ 		if (bp->fw_cap & BNXT_FW_CAP_ERR_RECOVER_RELOAD) {
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_POLL_FW_DOWN;
++ 			tmo = HZ / 10;
++ 		} else {
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 			tmo = bp->fw_reset_min_dsecs * HZ / 10;
++ 		}
++ 		rtnl_unlock();
++ 		bnxt_queue_fw_reset_work(bp, tmo);
++ 		return;
++ 	}
++ 	case BNXT_FW_RESET_STATE_POLL_FW_DOWN: {
++ 		u32 val;
++ 
++ 		val = bnxt_fw_health_readl(bp, BNXT_FW_HEALTH_REG);
++ 		if (!(val & BNXT_FW_STATUS_SHUTDOWN) &&
++ 		    !time_after(jiffies, bp->fw_reset_timestamp +
++ 		    (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 			bnxt_queue_fw_reset_work(bp, HZ / 5);
++ 			return;
++ 		}
++ 
++ 		if (!bp->fw_health->master) {
++ 			u32 wait_dsecs = bp->fw_health->normal_func_wait_dsecs;
++ 
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 			bnxt_queue_fw_reset_work(bp, wait_dsecs * HZ / 10);
++ 			return;
++ 		}
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_RESET_FW;
++ 	}
++ 	/* fall through */
++ 	case BNXT_FW_RESET_STATE_RESET_FW:
++ 		bnxt_reset_all(bp);
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 		bnxt_queue_fw_reset_work(bp, bp->fw_reset_min_dsecs * HZ / 10);
++ 		return;
++ 	case BNXT_FW_RESET_STATE_ENABLE_DEV:
++ 		if (test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state)) {
++ 			u32 val;
++ 
++ 			val = bnxt_fw_health_readl(bp,
++ 						   BNXT_FW_RESET_INPROG_REG);
++ 			if (val)
++ 				netdev_warn(bp->dev, "FW reset inprog %x after min wait time.\n",
++ 					    val);
++ 		}
++ 		clear_bit(BNXT_STATE_FW_FATAL_COND, &bp->state);
++ 		if (pci_enable_device(bp->pdev)) {
++ 			netdev_err(bp->dev, "Cannot re-enable PCI device\n");
++ 			goto fw_reset_abort;
++ 		}
++ 		pci_set_master(bp->pdev);
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_POLL_FW;
++ 		/* fall through */
++ 	case BNXT_FW_RESET_STATE_POLL_FW:
++ 		bp->hwrm_cmd_timeout = SHORT_HWRM_CMD_TIMEOUT;
++ 		rc = __bnxt_hwrm_ver_get(bp, true);
++ 		if (rc) {
++ 			if (time_after(jiffies, bp->fw_reset_timestamp +
++ 				       (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 				netdev_err(bp->dev, "Firmware reset aborted\n");
++ 				goto fw_reset_abort;
++ 			}
++ 			bnxt_queue_fw_reset_work(bp, HZ / 5);
++ 			return;
++ 		}
++ 		bp->hwrm_cmd_timeout = DFLT_HWRM_CMD_TIMEOUT;
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_OPENING;
++ 		/* fall through */
++ 	case BNXT_FW_RESET_STATE_OPENING:
++ 		while (!rtnl_trylock()) {
++ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 			return;
++ 		}
++ 		rc = bnxt_open(bp->dev);
++ 		if (rc) {
++ 			netdev_err(bp->dev, "bnxt_open_nic() failed\n");
++ 			clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 			dev_close(bp->dev);
++ 		}
++ 
++ 		bp->fw_reset_state = 0;
++ 		/* Make sure fw_reset_state is 0 before clearing the flag */
++ 		smp_mb__before_atomic();
++ 		clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 		bnxt_ulp_start(bp, rc);
++ 		bnxt_dl_health_status_update(bp, true);
++ 		rtnl_unlock();
++ 		break;
++ 	}
++ 	return;
++ 
++ fw_reset_abort:
++ 	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF)
++ 		bnxt_dl_health_status_update(bp, false);
++ 	bp->fw_reset_state = 0;
++ 	rtnl_lock();
++ 	dev_close(bp->dev);
++ 	rtnl_unlock();
++ }
++ 
+++>>>>>>> 937f188c1f4f (bnxt_en: Fix the logic that creates the health reporters.)
+  static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
+  {
+  	int rc;
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 336fbceafb45,136953a0ecaa..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -14,6 -14,253 +14,256 @@@
+  #include "bnxt.h"
+  #include "bnxt_vfr.h"
+  #include "bnxt_devlink.h"
+++<<<<<<< HEAD
+++=======
++ #include "bnxt_ethtool.h"
++ 
++ static int
++ bnxt_dl_flash_update(struct devlink *dl, const char *filename,
++ 		     const char *region, struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = bnxt_get_bp_from_dl(dl);
++ 
++ 	if (region)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (!BNXT_PF(bp)) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "flash update not supported from a VF");
++ 		return -EPERM;
++ 	}
++ 
++ 	return bnxt_flash_package_from_file(bp->dev, filename, 0);
++ }
++ 
++ static int bnxt_fw_reporter_diagnose(struct devlink_health_reporter *reporter,
++ 				     struct devlink_fmsg *fmsg,
++ 				     struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 	u32 val, health_status;
++ 	int rc;
++ 
++ 	if (test_bit(BNXT_STATE_IN_FW_RESET, &bp->state))
++ 		return 0;
++ 
++ 	val = bnxt_fw_health_readl(bp, BNXT_FW_HEALTH_REG);
++ 	health_status = val & 0xffff;
++ 
++ 	if (health_status < BNXT_FW_STATUS_HEALTHY) {
++ 		rc = devlink_fmsg_string_pair_put(fmsg, "Description",
++ 						  "Not yet completed initialization");
++ 		if (rc)
++ 			return rc;
++ 	} else if (health_status > BNXT_FW_STATUS_HEALTHY) {
++ 		rc = devlink_fmsg_string_pair_put(fmsg, "Description",
++ 						  "Encountered fatal error and cannot recover");
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	if (val >> 16) {
++ 		rc = devlink_fmsg_u32_pair_put(fmsg, "Error code", val >> 16);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	val = bnxt_fw_health_readl(bp, BNXT_FW_RESET_CNT_REG);
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "Reset count", val);
++ 	if (rc)
++ 		return rc;
++ 
++ 	return 0;
++ }
++ 
++ static const struct devlink_health_reporter_ops bnxt_dl_fw_reporter_ops = {
++ 	.name = "fw",
++ 	.diagnose = bnxt_fw_reporter_diagnose,
++ };
++ 
++ static int bnxt_fw_reset_recover(struct devlink_health_reporter *reporter,
++ 				 void *priv_ctx,
++ 				 struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 
++ 	if (!priv_ctx)
++ 		return -EOPNOTSUPP;
++ 
++ 	bnxt_fw_reset(bp);
++ 	return 0;
++ }
++ 
++ static const
++ struct devlink_health_reporter_ops bnxt_dl_fw_reset_reporter_ops = {
++ 	.name = "fw_reset",
++ 	.recover = bnxt_fw_reset_recover,
++ };
++ 
++ static int bnxt_fw_fatal_recover(struct devlink_health_reporter *reporter,
++ 				 void *priv_ctx,
++ 				 struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 	struct bnxt_fw_reporter_ctx *fw_reporter_ctx = priv_ctx;
++ 	unsigned long event;
++ 
++ 	if (!priv_ctx)
++ 		return -EOPNOTSUPP;
++ 
++ 	bp->fw_health->fatal = true;
++ 	event = fw_reporter_ctx->sp_event;
++ 	if (event == BNXT_FW_RESET_NOTIFY_SP_EVENT)
++ 		bnxt_fw_reset(bp);
++ 	else if (event == BNXT_FW_EXCEPTION_SP_EVENT)
++ 		bnxt_fw_exception(bp);
++ 
++ 	return 0;
++ }
++ 
++ static const
++ struct devlink_health_reporter_ops bnxt_dl_fw_fatal_reporter_ops = {
++ 	.name = "fw_fatal",
++ 	.recover = bnxt_fw_fatal_recover,
++ };
++ 
++ void bnxt_dl_fw_reporters_create(struct bnxt *bp)
++ {
++ 	struct bnxt_fw_health *health = bp->fw_health;
++ 
++ 	if (!bp->dl || !health)
++ 		return;
++ 
++ 	if (!(bp->fw_cap & BNXT_FW_CAP_HOT_RESET) || health->fw_reset_reporter)
++ 		goto err_recovery;
++ 
++ 	health->fw_reset_reporter =
++ 		devlink_health_reporter_create(bp->dl,
++ 					       &bnxt_dl_fw_reset_reporter_ops,
++ 					       0, true, bp);
++ 	if (IS_ERR(health->fw_reset_reporter)) {
++ 		netdev_warn(bp->dev, "Failed to create FW fatal health reporter, rc = %ld\n",
++ 			    PTR_ERR(health->fw_reset_reporter));
++ 		health->fw_reset_reporter = NULL;
++ 		bp->fw_cap &= ~BNXT_FW_CAP_HOT_RESET;
++ 	}
++ 
++ err_recovery:
++ 	if (!(bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY))
++ 		return;
++ 
++ 	if (!health->fw_reporter) {
++ 		health->fw_reporter =
++ 			devlink_health_reporter_create(bp->dl,
++ 						       &bnxt_dl_fw_reporter_ops,
++ 						       0, false, bp);
++ 		if (IS_ERR(health->fw_reporter)) {
++ 			netdev_warn(bp->dev, "Failed to create FW health reporter, rc = %ld\n",
++ 				    PTR_ERR(health->fw_reporter));
++ 			health->fw_reporter = NULL;
++ 			bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
++ 			return;
++ 		}
++ 	}
++ 
++ 	if (health->fw_fatal_reporter)
++ 		return;
++ 
++ 	health->fw_fatal_reporter =
++ 		devlink_health_reporter_create(bp->dl,
++ 					       &bnxt_dl_fw_fatal_reporter_ops,
++ 					       0, true, bp);
++ 	if (IS_ERR(health->fw_fatal_reporter)) {
++ 		netdev_warn(bp->dev, "Failed to create FW fatal health reporter, rc = %ld\n",
++ 			    PTR_ERR(health->fw_fatal_reporter));
++ 		health->fw_fatal_reporter = NULL;
++ 		bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
++ 	}
++ }
++ 
++ void bnxt_dl_fw_reporters_destroy(struct bnxt *bp, bool all)
++ {
++ 	struct bnxt_fw_health *health = bp->fw_health;
++ 
++ 	if (!bp->dl || !health)
++ 		return;
++ 
++ 	if ((all || !(bp->fw_cap & BNXT_FW_CAP_HOT_RESET)) &&
++ 	    health->fw_reset_reporter) {
++ 		devlink_health_reporter_destroy(health->fw_reset_reporter);
++ 		health->fw_reset_reporter = NULL;
++ 	}
++ 
++ 	if ((bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY) && !all)
++ 		return;
++ 
++ 	if (health->fw_reporter) {
++ 		devlink_health_reporter_destroy(health->fw_reporter);
++ 		health->fw_reporter = NULL;
++ 	}
++ 
++ 	if (health->fw_fatal_reporter) {
++ 		devlink_health_reporter_destroy(health->fw_fatal_reporter);
++ 		health->fw_fatal_reporter = NULL;
++ 	}
++ }
++ 
++ void bnxt_devlink_health_report(struct bnxt *bp, unsigned long event)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	struct bnxt_fw_reporter_ctx fw_reporter_ctx;
++ 
++ 	fw_reporter_ctx.sp_event = event;
++ 	switch (event) {
++ 	case BNXT_FW_RESET_NOTIFY_SP_EVENT:
++ 		if (test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state)) {
++ 			if (!fw_health->fw_fatal_reporter)
++ 				return;
++ 
++ 			devlink_health_report(fw_health->fw_fatal_reporter,
++ 					      "FW fatal async event received",
++ 					      &fw_reporter_ctx);
++ 			return;
++ 		}
++ 		if (!fw_health->fw_reset_reporter)
++ 			return;
++ 
++ 		devlink_health_report(fw_health->fw_reset_reporter,
++ 				      "FW non-fatal reset event received",
++ 				      &fw_reporter_ctx);
++ 		return;
++ 
++ 	case BNXT_FW_EXCEPTION_SP_EVENT:
++ 		if (!fw_health->fw_fatal_reporter)
++ 			return;
++ 
++ 		devlink_health_report(fw_health->fw_fatal_reporter,
++ 				      "FW fatal error reported",
++ 				      &fw_reporter_ctx);
++ 		return;
++ 	}
++ }
++ 
++ void bnxt_dl_health_status_update(struct bnxt *bp, bool healthy)
++ {
++ 	struct bnxt_fw_health *health = bp->fw_health;
++ 	u8 state;
++ 
++ 	if (healthy)
++ 		state = DEVLINK_HEALTH_REPORTER_STATE_HEALTHY;
++ 	else
++ 		state = DEVLINK_HEALTH_REPORTER_STATE_ERROR;
++ 
++ 	if (health->fatal)
++ 		devlink_health_reporter_state_update(health->fw_fatal_reporter,
++ 						     state);
++ 	else
++ 		devlink_health_reporter_state_update(health->fw_reset_reporter,
++ 						     state);
++ 
++ 	health->fatal = false;
++ }
+++>>>>>>> 937f188c1f4f (bnxt_en: Fix the logic that creates the health reporters.)
+  
+  static const struct devlink_ops bnxt_dl_ops = {
+  #ifdef CONFIG_BNXT_SRIOV
+@@@ -244,6 -551,9 +494,12 @@@ void bnxt_dl_unregister(struct bnxt *bp
+  	if (!dl)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	devlink_port_params_unregister(&bp->dl_port, bnxt_dl_port_params,
++ 				       ARRAY_SIZE(bnxt_dl_port_params));
++ 	devlink_port_unregister(&bp->dl_port);
+++>>>>>>> 937f188c1f4f (bnxt_en: Fix the logic that creates the health reporters.)
+  	devlink_params_unregister(dl, bnxt_dl_params,
+  				  ARRAY_SIZE(bnxt_dl_params));
+  	devlink_unregister(dl);
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+index 5b6b2c7d97cf,6db6c3dac472..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+@@@ -52,9 -52,14 +52,16 @@@ struct bnxt_dl_nvm_param 
+  	u16 id;
+  	u16 offset;
+  	u16 dir_type;
+ -	u16 nvm_num_bits;
+ -	u8 dl_num_bytes;
+ +	u16 num_bits;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ void bnxt_devlink_health_report(struct bnxt *bp, unsigned long event);
++ void bnxt_dl_health_status_update(struct bnxt *bp, bool healthy);
++ void bnxt_dl_fw_reporters_create(struct bnxt *bp);
++ void bnxt_dl_fw_reporters_destroy(struct bnxt *bp, bool all);
+++>>>>>>> 937f188c1f4f (bnxt_en: Fix the logic that creates the health reporters.)
+  int bnxt_dl_register(struct bnxt *bp);
+  void bnxt_dl_unregister(struct bnxt *bp);
+  
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
