@@ -1,0 +1,102 @@
+fuse: separate fuse device allocation and installation in fuse_conn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 0cd1eb9a4160a96e0ec9b93b2e7b489f449bf22d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0cd1eb9a.failed
+
+As of now fuse_dev_alloc() both allocates a fuse device and installs it in
+fuse_conn list.  fuse_dev_alloc() can fail if fuse_device allocation fails.
+
+virtio-fs needs to initialize multiple fuse devices (one per virtio queue).
+It initializes one fuse device as part of call to fuse_fill_super_common()
+and rest of the devices are allocated and installed after that.
+
+But, we can't afford to fail after calling fuse_fill_super_common() as we
+don't have a way to undo all the actions done by fuse_fill_super_common().
+So to avoid failures after the call to fuse_fill_super_common(),
+pre-allocate all fuse devices early and install them into fuse connection
+later.
+
+This patch provides two separate helpers for fuse device allocation and
+fuse device installation in fuse_conn.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 0cd1eb9a4160a96e0ec9b93b2e7b489f449bf22d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/inode.c
+diff --cc fs/fuse/inode.c
+index 523a1f18c557,6a0f31faaeaa..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -1145,17 -1149,9 +1162,21 @@@ static int fuse_fill_super(struct super
+  	if (sb->s_user_ns != &init_user_ns)
+  		sb->s_xattr = fuse_no_acl_xattr_handlers;
+  
+++<<<<<<< HEAD
+ +	fc = kmalloc(sizeof(*fc), GFP_KERNEL);
+ +	err = -ENOMEM;
+ +	if (!fc)
+ +		goto err_fput;
+ +
+ +	fuse_conn_init(fc, sb->s_user_ns);
+ +	fc->release = fuse_free_conn;
+ +
+ +	fud = fuse_dev_alloc(fc);
+++=======
++ 	fud = fuse_dev_alloc_install(fc);
+++>>>>>>> 0cd1eb9a4160 (fuse: separate fuse device allocation and installation in fuse_conn)
+  	if (!fud)
+ -		goto err;
+ +		goto err_put_conn;
+  
+  	fc->dev = sb->s_dev;
+  	fc->sb = sb;
+diff --git a/fs/fuse/cuse.c b/fs/fuse/cuse.c
+index e9e6bfbea74c..5e12d32c52e0 100644
+--- a/fs/fuse/cuse.c
++++ b/fs/fuse/cuse.c
+@@ -509,7 +509,7 @@ static int cuse_channel_open(struct inode *inode, struct file *file)
+ 	 */
+ 	fuse_conn_init(&cc->fc, file->f_cred->user_ns);
+ 
+-	fud = fuse_dev_alloc(&cc->fc);
++	fud = fuse_dev_alloc_install(&cc->fc);
+ 	if (!fud) {
+ 		kfree(cc);
+ 		return -ENOMEM;
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index 702b724c7ddf..eff4b593ac72 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -2287,7 +2287,7 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
+ 	if (new->private_data)
+ 		return -EINVAL;
+ 
+-	fud = fuse_dev_alloc(fc);
++	fud = fuse_dev_alloc_install(fc);
+ 	if (!fud)
+ 		return -ENOMEM;
+ 
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index b9287760b32a..51ae0cf5f26a 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -901,7 +901,9 @@ void fuse_conn_init(struct fuse_conn *fc, struct user_namespace *user_ns);
+  */
+ void fuse_conn_put(struct fuse_conn *fc);
+ 
+-struct fuse_dev *fuse_dev_alloc(struct fuse_conn *fc);
++struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc);
++struct fuse_dev *fuse_dev_alloc(void);
++void fuse_dev_install(struct fuse_dev *fud, struct fuse_conn *fc);
+ void fuse_dev_free(struct fuse_dev *fud);
+ 
+ /**
+* Unmerged path fs/fuse/inode.c
