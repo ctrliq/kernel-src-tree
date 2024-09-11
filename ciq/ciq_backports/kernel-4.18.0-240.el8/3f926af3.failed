@@ -1,0 +1,116 @@
+net: use skb_queue_empty_lockless() in busy poll contexts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] use skb_queue_empty_lockless() in busy poll contexts (Sabrina Dubroca) [1446392]
+Rebuild_FUZZ: 95.41%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 3f926af3f4d688e2e11e7f8ed04e277a14d4d4a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3f926af3.failed
+
+Busy polling usually runs without locks.
+Let's use skb_queue_empty_lockless() instead of skb_queue_empty()
+
+Also uses READ_ONCE() in __skb_try_recv_datagram() to address
+a similar potential problem.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3f926af3f4d688e2e11e7f8ed04e277a14d4d4a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/tcp.c
+diff --cc drivers/nvme/host/tcp.c
+index 2f452c9819e7,7544be84ab35..000000000000
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@@ -2245,6 -2214,17 +2245,20 @@@ static int nvme_tcp_map_queues(struct b
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nvme_tcp_poll(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct nvme_tcp_queue *queue = hctx->driver_data;
++ 	struct sock *sk = queue->sock->sk;
++ 
++ 	if (sk_can_busy_loop(sk) && skb_queue_empty_lockless(&sk->sk_receive_queue))
++ 		sk_busy_loop(sk, true);
++ 	nvme_tcp_try_recv(queue);
++ 	return queue->nr_cqe;
++ }
++ 
+++>>>>>>> 3f926af3f4d6 (net: use skb_queue_empty_lockless() in busy poll contexts)
+  static struct blk_mq_ops nvme_tcp_mq_ops = {
+  	.queue_rq	= nvme_tcp_queue_rq,
+  	.complete	= nvme_complete_rq,
+diff --git a/drivers/crypto/chelsio/chtls/chtls_io.c b/drivers/crypto/chelsio/chtls/chtls_io.c
+index 18f553fcc167..1f3e6000a106 100644
+--- a/drivers/crypto/chelsio/chtls/chtls_io.c
++++ b/drivers/crypto/chelsio/chtls/chtls_io.c
+@@ -1712,7 +1712,7 @@ int chtls_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		return peekmsg(sk, msg, len, nonblock, flags);
+ 
+ 	if (sk_can_busy_loop(sk) &&
+-	    skb_queue_empty(&sk->sk_receive_queue) &&
++	    skb_queue_empty_lockless(&sk->sk_receive_queue) &&
+ 	    sk->sk_state == TCP_ESTABLISHED)
+ 		sk_busy_loop(sk, nonblock);
+ 
+* Unmerged path drivers/nvme/host/tcp.c
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index 98a524a31eb3..bed13146c9a4 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -279,7 +279,7 @@ struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned int flags,
+ 			break;
+ 
+ 		sk_busy_loop(sk, flags & MSG_DONTWAIT);
+-	} while (sk->sk_receive_queue.prev != *last);
++	} while (READ_ONCE(sk->sk_receive_queue.prev) != *last);
+ 
+ 	error = -EAGAIN;
+ 
+diff --git a/net/core/sock.c b/net/core/sock.c
+index b6c8c5efd981..00bc17e3bedc 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -3516,7 +3516,7 @@ bool sk_busy_loop_end(void *p, unsigned long start_time)
+ {
+ 	struct sock *sk = p;
+ 
+-	return !skb_queue_empty(&sk->sk_receive_queue) ||
++	return !skb_queue_empty_lockless(&sk->sk_receive_queue) ||
+ 	       sk_busy_loop_timeout(sk, start_time);
+ }
+ EXPORT_SYMBOL(sk_busy_loop_end);
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 96323da05ba6..2bcde5b6058a 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1953,7 +1953,7 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
+ 	if (unlikely(flags & MSG_ERRQUEUE))
+ 		return inet_recv_error(sk, msg, len, addr_len);
+ 
+-	if (sk_can_busy_loop(sk) && skb_queue_empty(&sk->sk_receive_queue) &&
++	if (sk_can_busy_loop(sk) && skb_queue_empty_lockless(&sk->sk_receive_queue) &&
+ 	    (sk->sk_state == TCP_ESTABLISHED))
+ 		sk_busy_loop(sk, nonblock);
+ 
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index bf039a42a8f9..3793aafdc2a1 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -8901,7 +8901,7 @@ struct sk_buff *sctp_skb_recv_datagram(struct sock *sk, int flags,
+ 		if (sk_can_busy_loop(sk)) {
+ 			sk_busy_loop(sk, noblock);
+ 
+-			if (!skb_queue_empty(&sk->sk_receive_queue))
++			if (!skb_queue_empty_lockless(&sk->sk_receive_queue))
+ 				continue;
+ 		}
+ 
