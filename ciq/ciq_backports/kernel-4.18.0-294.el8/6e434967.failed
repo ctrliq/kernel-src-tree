@@ -1,0 +1,156 @@
+net: add sock_set_priority
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6e43496745e75ac49d644df984d2f4ee5b5b6b4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6e434967.failed
+
+Add a helper to directly set the SO_PRIORITY sockopt from kernel space
+without going through a fake uaccess.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6e43496745e75ac49d644df984d2f4ee5b5b6b4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/tcp.c
+#	include/net/sock.h
+#	net/core/sock.c
+diff --cc drivers/nvme/target/tcp.c
+index 5df58ae96c0c,f3088156d01d..000000000000
+--- a/drivers/nvme/target/tcp.c
++++ b/drivers/nvme/target/tcp.c
+@@@ -1454,17 -1446,10 +1454,13 @@@ static int nvmet_tcp_set_queue_sock(str
+  	 * close. This is done to prevent stale data from being sent should
+  	 * the network connection be restored before TCP times out.
+  	 */
+ -	sock_no_linger(sock->sk);
+ +	ret = kernel_setsockopt(sock, SOL_SOCKET, SO_LINGER,
+ +			(char *)&sol, sizeof(sol));
+ +	if (ret)
+ +		return ret;
+  
+- 	if (so_priority > 0) {
+- 		ret = kernel_setsockopt(sock, SOL_SOCKET, SO_PRIORITY,
+- 				(char *)&so_priority, sizeof(so_priority));
+- 		if (ret)
+- 			return ret;
+- 	}
++ 	if (so_priority > 0)
++ 		sock_set_priority(sock->sk, so_priority);
+  
+  	/* Set socket type of service */
+  	if (inet->rcv_tos > 0) {
+@@@ -1648,21 -1634,8 +1644,26 @@@ static int nvmet_tcp_add_port(struct nv
+  		goto err_sock;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = kernel_setsockopt(port->sock, SOL_SOCKET, SO_REUSEADDR,
+ +			(char *)&opt, sizeof(opt));
+ +	if (ret) {
+ +		pr_err("failed to set SO_REUSEADDR sock opt %d\n", ret);
+ +		goto err_sock;
+ +	}
+ +
+ +	if (so_priority > 0) {
+ +		ret = kernel_setsockopt(port->sock, SOL_SOCKET, SO_PRIORITY,
+ +				(char *)&so_priority, sizeof(so_priority));
+ +		if (ret) {
+ +			pr_err("failed to set SO_PRIORITY sock opt %d\n", ret);
+ +			goto err_sock;
+ +		}
+ +	}
+++=======
++ 	if (so_priority > 0)
++ 		sock_set_priority(port->sock->sk, so_priority);
+++>>>>>>> 6e43496745e7 (net: add sock_set_priority)
+  
+  	ret = kernel_bind(port->sock, (struct sockaddr *)&port->addr,
+  			sizeof(port->addr));
+diff --cc include/net/sock.h
+index 17eac20f03d5,a3a43141a4be..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -2615,4 -2688,8 +2615,11 @@@ static inline bool sk_dev_equal_l3scope
+  
+  void sock_def_readable(struct sock *sk);
+  
+++<<<<<<< HEAD
+++=======
++ void sock_no_linger(struct sock *sk);
++ void sock_set_priority(struct sock *sk, u32 priority);
++ void sock_set_reuseaddr(struct sock *sk);
++ 
+++>>>>>>> 6e43496745e7 (net: add sock_set_priority)
+  #endif	/* _SOCK_H */
+diff --cc net/core/sock.c
+index 3d930173b56d,ceda1a9248b3..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -691,6 -712,31 +691,34 @@@ bool sk_mc_loop(struct sock *sk
+  }
+  EXPORT_SYMBOL(sk_mc_loop);
+  
+++<<<<<<< HEAD
+++=======
++ void sock_set_reuseaddr(struct sock *sk)
++ {
++ 	lock_sock(sk);
++ 	sk->sk_reuse = SK_CAN_REUSE;
++ 	release_sock(sk);
++ }
++ EXPORT_SYMBOL(sock_set_reuseaddr);
++ 
++ void sock_no_linger(struct sock *sk)
++ {
++ 	lock_sock(sk);
++ 	sk->sk_lingertime = 0;
++ 	sock_set_flag(sk, SOCK_LINGER);
++ 	release_sock(sk);
++ }
++ EXPORT_SYMBOL(sock_no_linger);
++ 
++ void sock_set_priority(struct sock *sk, u32 priority)
++ {
++ 	lock_sock(sk);
++ 	sk->sk_priority = priority;
++ 	release_sock(sk);
++ }
++ EXPORT_SYMBOL(sock_set_priority);
++ 
+++>>>>>>> 6e43496745e7 (net: add sock_set_priority)
+  /*
+   *	This is meant for all protocols to use and covers goings on
+   *	at the socket level. Everything here is generic.
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index 0e08ae5f3142..7c29a96376db 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -1396,16 +1396,8 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl,
+ 		goto err_sock;
+ 	}
+ 
+-	if (so_priority > 0) {
+-		ret = kernel_setsockopt(queue->sock, SOL_SOCKET, SO_PRIORITY,
+-				(char *)&so_priority, sizeof(so_priority));
+-		if (ret) {
+-			dev_err(ctrl->ctrl.device,
+-				"failed to set SO_PRIORITY sock opt, ret %d\n",
+-				ret);
+-			goto err_sock;
+-		}
+-	}
++	if (so_priority > 0)
++		sock_set_priority(queue->sock->sk, so_priority);
+ 
+ 	/* Set socket type of service */
+ 	if (nctrl->opts->tos >= 0) {
+* Unmerged path drivers/nvme/target/tcp.c
+* Unmerged path include/net/sock.h
+* Unmerged path net/core/sock.c
