@@ -1,0 +1,145 @@
+dax: Reinstate RCU protection of inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit c5bbd4515a05f8acb7e6ab6297044a529762cbf5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c5bbd451.failed
+
+For the device-dax case, it is possible that the inode can go away
+underneath us.  The rcu_read_lock() was there to prevent it from
+being freed, and not (as I thought) to protect the tree.  Bring back
+the rcu_read_lock() protection.  Also add a little kernel-doc; while
+this function is not exported to modules, it is used from outside dax.c
+
+	Reported-by: Dan Williams <dan.j.williams@intel.com>
+Fixes: 9f32d221301c ("dax: Convert dax_lock_mapping_entry to XArray")
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit c5bbd4515a05f8acb7e6ab6297044a529762cbf5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index b89ab8b5e700,ce87d21b3805..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -489,31 -353,25 +489,49 @@@ static struct page *dax_busy_page(void 
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static bool entry_wait_revalidate(void)
+ +{
+ +	rcu_read_unlock();
+ +	schedule();
+ +	rcu_read_lock();
+ +
+ +	/*
+ +	 * Tell __get_unlocked_mapping_entry() to take a break, we need
+ +	 * to revalidate page->mapping after dropping locks
+ +	 */
+ +	return true;
+ +}
+ +
+ +bool dax_lock_mapping_entry(struct page *page)
+ +{
+ +	pgoff_t index;
+ +	struct inode *inode;
+ +	bool did_lock = false;
+ +	void *entry = NULL, **slot;
+ +	struct address_space *mapping;
+ +
+++=======
++ /*
++  * dax_lock_mapping_entry - Lock the DAX entry corresponding to a page
++  * @page: The page whose entry we want to lock
++  *
++  * Context: Process context.
++  * Return: %true if the entry was locked or does not need to be locked.
++  */
++ bool dax_lock_mapping_entry(struct page *page)
++ {
++ 	XA_STATE(xas, NULL, 0);
++ 	void *entry;
++ 	bool locked;
++ 
++ 	/* Ensure page->mapping isn't freed while we look at it */
+++>>>>>>> c5bbd4515a05 (dax: Reinstate RCU protection of inode)
+  	rcu_read_lock();
+  	for (;;) {
+ -		struct address_space *mapping = READ_ONCE(page->mapping);
+ +		mapping = READ_ONCE(page->mapping);
+  
++ 		locked = false;
+  		if (!dax_mapping(mapping))
+  			break;
+  
+@@@ -524,37 -382,31 +542,61 @@@
+  		 * otherwise we would not have a valid pfn_to_page()
+  		 * translation.
+  		 */
+++<<<<<<< HEAD
+ +		inode = mapping->host;
+ +		if (S_ISCHR(inode->i_mode)) {
+ +			did_lock = true;
+ +			break;
+ +		}
+++=======
++ 		locked = true;
++ 		if (S_ISCHR(mapping->host->i_mode))
++ 			break;
+++>>>>>>> c5bbd4515a05 (dax: Reinstate RCU protection of inode)
+  
+ -		xas.xa = &mapping->i_pages;
+ -		xas_lock_irq(&xas);
+ +		xa_lock_irq(&mapping->i_pages);
+  		if (mapping != page->mapping) {
+ -			xas_unlock_irq(&xas);
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			continue;
+ +		}
+++<<<<<<< HEAD
+ +		index = page->index;
+ +
+ +		entry = __get_unlocked_mapping_entry(mapping, index, &slot,
+ +				entry_wait_revalidate);
+ +		if (!entry) {
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			break;
+ +		} else if (IS_ERR(entry)) {
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			WARN_ON_ONCE(PTR_ERR(entry) != -EAGAIN);
+  			continue;
+  		}
+ +		lock_slot(mapping, slot);
+ +		did_lock = true;
+ +		xa_unlock_irq(&mapping->i_pages);
+ +		break;
+ +	}
+ +	rcu_read_unlock();
+ +
+ +	return did_lock;
+++=======
++ 		xas_set(&xas, page->index);
++ 		entry = xas_load(&xas);
++ 		if (dax_is_locked(entry)) {
++ 			rcu_read_unlock();
++ 			entry = get_unlocked_entry(&xas);
++ 			xas_unlock_irq(&xas);
++ 			rcu_read_lock();
++ 			continue;
++ 		}
++ 		dax_lock_entry(&xas, entry);
++ 		xas_unlock_irq(&xas);
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 	return locked;
+++>>>>>>> c5bbd4515a05 (dax: Reinstate RCU protection of inode)
+  }
+  
+  void dax_unlock_mapping_entry(struct page *page)
+* Unmerged path fs/dax.c
