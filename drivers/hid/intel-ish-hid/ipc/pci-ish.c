@@ -198,6 +198,7 @@ static void ish_remove(struct pci_dev *pdev)
 	struct ish_hw *hw = to_ish_hw(ishtp_dev);
 
 	ishtp_bus_remove_all_clients(ishtp_dev, false);
+	pdev->dev_flags &= ~PCI_DEV_FLAGS_NO_D3;
 	ish_device_disable(ishtp_dev);
 
 	free_irq(pdev->irq, ishtp_dev);
