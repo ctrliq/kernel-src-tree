@@ -1646,7 +1646,7 @@ static int phylink_sfp_module_insert(void *upstream,
 
 	linkmode_copy(support1, support);
 
-	iface = sfp_select_interface(pl->sfp_bus, id, config.advertising);
+	iface = sfp_select_interface(pl->sfp_bus, config.advertising);
 	if (iface == PHY_INTERFACE_MODE_NA) {
 		netdev_err(pl->netdev,
 			   "selection of interface failed, advertisement %*pb\n",
