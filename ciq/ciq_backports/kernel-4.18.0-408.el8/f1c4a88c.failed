@@ -1,0 +1,103 @@
+KVM: X86: Don't unsync pagetables when speculative
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Lai Jiangshan <laijs@linux.alibaba.com>
+commit f1c4a88c41ea04a7036409a37e17cf22a8dbe9e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/f1c4a88c.failed
+
+We'd better only unsync the pagetable when there just was a really
+write fault on a level-1 pagetable.
+
+	Signed-off-by: Lai Jiangshan <laijs@linux.alibaba.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20210918005636.3675-10-jiangshanlai@gmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f1c4a88c41ea04a7036409a37e17cf22a8dbe9e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 2b6b45f02f2a,73aa15e89311..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2581,9 -2582,11 +2581,10 @@@ static void kvm_unsync_page(struct kvm_
+   * were marked unsync (or if there is no shadow page), -EPERM if the SPTE must
+   * be write-protected.
+   */
+- int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync)
++ int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync,
++ 			    bool speculative)
+  {
+  	struct kvm_mmu_page *sp;
+ -	bool locked = false;
+  
+  	/*
+  	 * Force write-protection if the page is being tracked.  Note, the page
+@@@ -2606,6 -2609,32 +2607,35 @@@
+  		if (sp->unsync)
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		if (speculative)
++ 			return -EEXIST;
++ 
++ 		/*
++ 		 * TDP MMU page faults require an additional spinlock as they
++ 		 * run with mmu_lock held for read, not write, and the unsync
++ 		 * logic is not thread safe.  Take the spinklock regardless of
++ 		 * the MMU type to avoid extra conditionals/parameters, there's
++ 		 * no meaningful penalty if mmu_lock is held for write.
++ 		 */
++ 		if (!locked) {
++ 			locked = true;
++ 			spin_lock(&vcpu->kvm->arch.mmu_unsync_pages_lock);
++ 
++ 			/*
++ 			 * Recheck after taking the spinlock, a different vCPU
++ 			 * may have since marked the page unsync.  A false
++ 			 * positive on the unprotected check above is not
++ 			 * possible as clearing sp->unsync _must_ hold mmu_lock
++ 			 * for write, i.e. unsync cannot transition from 0->1
++ 			 * while this CPU holds mmu_lock for read (or write).
++ 			 */
++ 			if (READ_ONCE(sp->unsync))
++ 				continue;
++ 		}
++ 
+++>>>>>>> f1c4a88c41ea (KVM: X86: Don't unsync pagetables when speculative)
+  		WARN_ON(sp->role.level != PG_LEVEL_4K);
+  		kvm_unsync_page(vcpu, sp);
+  	}
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index 5ac367b7f49f..4ce0d790341b 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -125,7 +125,8 @@ static inline bool is_nx_huge_page_enabled(void)
+ 	return READ_ONCE(nx_huge_pages);
+ }
+ 
+-int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync);
++int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync,
++			    bool speculative);
+ 
+ void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+ void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+diff --git a/arch/x86/kvm/mmu/spte.c b/arch/x86/kvm/mmu/spte.c
+index 3e97cdb13eb7..b68a580f3510 100644
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@ -159,7 +159,7 @@ int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ 		 * e.g. it's write-tracked (upper-level SPs) or has one or more
+ 		 * shadow pages and unsync'ing pages is not allowed.
+ 		 */
+-		if (mmu_try_to_unsync_pages(vcpu, gfn, can_unsync)) {
++		if (mmu_try_to_unsync_pages(vcpu, gfn, can_unsync, speculative)) {
+ 			pgprintk("%s: found shadow page for %llx, marking ro\n",
+ 				 __func__, gfn);
+ 			ret |= SET_SPTE_WRITE_PROTECTED_PT;
