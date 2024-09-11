@@ -1,0 +1,219 @@
+ASoC: SOF: Intel: hda: allow operation without i915 gfx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: SOF: Intel: hda: allow operation without i915 gfx (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 94.83%
+commit-author Kai Vehmanen <kai.vehmanen@linux.intel.com>
+commit 71cc8abb6ec705ce4efbb54e401004687d40a641
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/71cc8abb.failed
+
+Add support to configure the HDA controller with an external HDA
+codec even if iDisp codec in i915 is not available.
+
+This can happen for multiple reasons:
+ - internal graphics is disabled on the system
+ - i915 driver is not enabled in kernel or it fails to init
+ - i915 codec reports error in HDA codec probe
+ - HDA codec driver probe fails
+
+Address all these scenarios, but keep using the existing topology.
+In case failures occur, HDMI PCM nodes are created, but they will
+report error if application tries to use them. No ALSA mixer controls
+are created. If the external HDA codec init fails as well, SOF probe
+will return error as before.
+
+	Signed-off-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+BugLink: https://bugzilla.kernel.org/show_bug.cgi?id=206085
+BugLink: https://bugzilla.opensuse.org/show_bug.cgi?id=1163677
+BugLink: https://github.com/thesofproject/linux/issues/1658
+Link: https://lore.kernel.org/r/20200220171028.22023-3-kai.vehmanen@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 71cc8abb6ec705ce4efbb54e401004687d40a641)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda-codec.c
+#	sound/soc/sof/intel/hda.c
+diff --cc sound/soc/sof/intel/hda-codec.c
+index 9eae2be41b28,3041fbbb010a..000000000000
+--- a/sound/soc/sof/intel/hda-codec.c
++++ b/sound/soc/sof/intel/hda-codec.c
+@@@ -209,7 -209,11 +215,15 @@@ int hda_codec_i915_exit(struct snd_sof_
+  	struct hdac_bus *bus = sof_to_bus(sdev);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	hda_codec_i915_put(sdev);
+++=======
++ 	if (!bus->audio_component)
++ 		return 0;
++ 
++ 	/* power down unconditionally */
++ 	snd_hdac_display_power(bus, HDA_CODEC_IDX_CONTROLLER, false);
+++>>>>>>> 71cc8abb6ec7 (ASoC: SOF: Intel: hda: allow operation without i915 gfx)
+  
+  	ret = snd_hdac_i915_exit(bus);
+  
+diff --cc sound/soc/sof/intel/hda.c
+index e20431686d1c,7ca887041a34..000000000000
+--- a/sound/soc/sof/intel/hda.c
++++ b/sound/soc/sof/intel/hda.c
+@@@ -475,7 -373,8 +470,12 @@@ static int hda_init_caps(struct snd_sof
+  	/* create codec instances */
+  	hda_codec_probe_bus(sdev, hda_codec_use_common_hdmi);
+  
+++<<<<<<< HEAD
+ +	hda_codec_i915_put(sdev);
+++=======
++ 	if (!HDA_IDISP_CODEC(bus->codec_mask))
++ 		hda_codec_i915_display_power(sdev, false);
+++>>>>>>> 71cc8abb6ec7 (ASoC: SOF: Intel: hda: allow operation without i915 gfx)
+  
+  	/*
+  	 * we are done probing so decrement link counts
+@@@ -761,4 -665,135 +761,135 @@@ int hda_dsp_remove(struct snd_sof_dev *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
++ static int hda_generic_machine_select(struct snd_sof_dev *sdev)
++ {
++ 	struct hdac_bus *bus = sof_to_bus(sdev);
++ 	struct snd_soc_acpi_mach_params *mach_params;
++ 	struct snd_soc_acpi_mach *hda_mach;
++ 	struct snd_sof_pdata *pdata = sdev->pdata;
++ 	const char *tplg_filename;
++ 	const char *idisp_str;
++ 	const char *dmic_str;
++ 	int dmic_num = 0;
++ 	int codec_num = 0;
++ 	int i;
++ 
++ 	/* codec detection */
++ 	if (!bus->codec_mask) {
++ 		dev_info(bus->dev, "no hda codecs found!\n");
++ 	} else {
++ 		dev_info(bus->dev, "hda codecs found, mask %lx\n",
++ 			 bus->codec_mask);
++ 
++ 		for (i = 0; i < HDA_MAX_CODECS; i++) {
++ 			if (bus->codec_mask & (1 << i))
++ 				codec_num++;
++ 		}
++ 
++ 		/*
++ 		 * If no machine driver is found, then:
++ 		 *
++ 		 * generic hda machine driver can handle:
++ 		 *  - one HDMI codec, and/or
++ 		 *  - one external HDAudio codec
++ 		 */
++ 		if (!pdata->machine && codec_num <= 2) {
++ 			hda_mach = snd_soc_acpi_intel_hda_machines;
++ 
++ 			/* topology: use the info from hda_machines */
++ 			pdata->tplg_filename =
++ 				hda_mach->sof_tplg_filename;
++ 
++ 			dev_info(bus->dev, "using HDA machine driver %s now\n",
++ 				 hda_mach->drv_name);
++ 
++ 			if (codec_num == 1 && HDA_IDISP_CODEC(bus->codec_mask))
++ 				idisp_str = "-idisp";
++ 			else
++ 				idisp_str = "";
++ 
++ 			/* first check NHLT for DMICs */
++ 			dmic_num = check_nhlt_dmic(sdev);
++ 
++ 			/* allow for module parameter override */
++ 			if (hda_dmic_num != -1)
++ 				dmic_num = hda_dmic_num;
++ 
++ 			switch (dmic_num) {
++ 			case 2:
++ 				dmic_str = "-2ch";
++ 				break;
++ 			case 4:
++ 				dmic_str = "-4ch";
++ 				break;
++ 			default:
++ 				dmic_num = 0;
++ 				dmic_str = "";
++ 				break;
++ 			}
++ 
++ 			tplg_filename = pdata->tplg_filename;
++ 			tplg_filename = fixup_tplg_name(sdev, tplg_filename,
++ 							idisp_str, dmic_str);
++ 			if (!tplg_filename)
++ 				return -EINVAL;
++ 
++ 			pdata->machine = hda_mach;
++ 			pdata->tplg_filename = tplg_filename;
++ 		}
++ 	}
++ 
++ 	/* used by hda machine driver to create dai links */
++ 	if (pdata->machine) {
++ 		mach_params = (struct snd_soc_acpi_mach_params *)
++ 			&pdata->machine->mach_params;
++ 		mach_params->codec_mask = bus->codec_mask;
++ 		mach_params->common_hdmi_codec_drv = hda_codec_use_common_hdmi;
++ 		mach_params->dmic_num = dmic_num;
++ 	}
++ 
++ 	return 0;
++ }
++ #else
++ static int hda_generic_machine_select(struct snd_sof_dev *sdev)
++ {
++ 	return 0;
++ }
++ #endif
++ 
++ void hda_set_mach_params(const struct snd_soc_acpi_mach *mach,
++ 			 struct device *dev)
++ {
++ 	struct snd_soc_acpi_mach_params *mach_params;
++ 
++ 	mach_params = (struct snd_soc_acpi_mach_params *)&mach->mach_params;
++ 	mach_params->platform = dev_name(dev);
++ }
++ 
++ void hda_machine_select(struct snd_sof_dev *sdev)
++ {
++ 	struct snd_sof_pdata *sof_pdata = sdev->pdata;
++ 	const struct sof_dev_desc *desc = sof_pdata->desc;
++ 	struct snd_soc_acpi_mach *mach;
++ 
++ 	mach = snd_soc_acpi_find_machine(desc->machines);
++ 	if (mach) {
++ 		sof_pdata->tplg_filename = mach->sof_tplg_filename;
++ 		sof_pdata->machine = mach;
++ 	}
++ 
++ 	/*
++ 	 * Choose HDA generic machine driver if mach is NULL.
++ 	 * Otherwise, set certain mach params.
++ 	 */
++ 	hda_generic_machine_select(sdev);
++ 
++ 	if (!sof_pdata->machine)
++ 		dev_warn(sdev->dev, "warning: No matching ASoC machine driver found\n");
++ }
++ 
+++>>>>>>> 71cc8abb6ec7 (ASoC: SOF: Intel: hda: allow operation without i915 gfx)
+  MODULE_LICENSE("Dual BSD/GPL");
+ -MODULE_IMPORT_NS(SND_SOC_SOF_HDA_AUDIO_CODEC);
+ -MODULE_IMPORT_NS(SND_SOC_SOF_HDA_AUDIO_CODEC_I915);
+ -MODULE_IMPORT_NS(SND_SOC_SOF_XTENSA);
+* Unmerged path sound/soc/sof/intel/hda-codec.c
+* Unmerged path sound/soc/sof/intel/hda.c
