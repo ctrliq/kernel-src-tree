@@ -1,0 +1,215 @@
+swiotlb: Use is_swiotlb_force_bounce for swiotlb data bouncing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Claire Chang <tientzu@chromium.org>
+commit 903cd0f315fe426c6a64c54ed389de0becb663dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/903cd0f3.failed
+
+Propagate the swiotlb_force into io_tlb_default_mem->force_bounce and
+use it to determine whether to bounce the data or not. This will be
+useful later to allow for different pools.
+
+	Signed-off-by: Claire Chang <tientzu@chromium.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Stefano Stabellini <sstabellini@kernel.org>
+	Tested-by: Will Deacon <will@kernel.org>
+	Acked-by: Stefano Stabellini <sstabellini@kernel.org>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+[v2: Includes Will's fix]
+
+(cherry picked from commit 903cd0f315fe426c6a64c54ed389de0becb663dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swiotlb.h
+#	kernel/dma/direct.c
+#	kernel/dma/direct.h
+#	kernel/dma/swiotlb.c
+diff --cc include/linux/swiotlb.h
+index 5857a937c637,da348671b0d5..000000000000
+--- a/include/linux/swiotlb.h
++++ b/include/linux/swiotlb.h
+@@@ -71,13 -62,62 +71,65 @@@ dma_addr_t swiotlb_map(struct device *d
+  
+  #ifdef CONFIG_SWIOTLB
+  extern enum swiotlb_force swiotlb_force;
+ +extern phys_addr_t io_tlb_start, io_tlb_end;
+  
+++<<<<<<< HEAD
+ +static inline bool is_swiotlb_buffer(phys_addr_t paddr)
+++=======
++ /**
++  * struct io_tlb_mem - IO TLB Memory Pool Descriptor
++  *
++  * @start:	The start address of the swiotlb memory pool. Used to do a quick
++  *		range check to see if the memory was in fact allocated by this
++  *		API.
++  * @end:	The end address of the swiotlb memory pool. Used to do a quick
++  *		range check to see if the memory was in fact allocated by this
++  *		API.
++  * @nslabs:	The number of IO TLB blocks (in groups of 64) between @start and
++  *		@end. This is command line adjustable via setup_io_tlb_npages.
++  * @used:	The number of used IO TLB block.
++  * @list:	The free list describing the number of free entries available
++  *		from each index.
++  * @index:	The index to start searching in the next round.
++  * @orig_addr:	The original address corresponding to a mapped entry.
++  * @alloc_size:	Size of the allocated buffer.
++  * @lock:	The lock to protect the above data structures in the map and
++  *		unmap calls.
++  * @debugfs:	The dentry to debugfs.
++  * @late_alloc:	%true if allocated using the page allocator
++  * @force_bounce: %true if swiotlb bouncing is forced
++  */
++ struct io_tlb_mem {
++ 	phys_addr_t start;
++ 	phys_addr_t end;
++ 	unsigned long nslabs;
++ 	unsigned long used;
++ 	unsigned int index;
++ 	spinlock_t lock;
++ 	struct dentry *debugfs;
++ 	bool late_alloc;
++ 	bool force_bounce;
++ 	struct io_tlb_slot {
++ 		phys_addr_t orig_addr;
++ 		size_t alloc_size;
++ 		unsigned int list;
++ 	} slots[];
++ };
++ extern struct io_tlb_mem *io_tlb_default_mem;
++ 
++ static inline bool is_swiotlb_buffer(struct device *dev, phys_addr_t paddr)
+++>>>>>>> 903cd0f315fe (swiotlb: Use is_swiotlb_force_bounce for swiotlb data bouncing)
+  {
+ -	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
+ -
+ -	return mem && paddr >= mem->start && paddr < mem->end;
+ +	return paddr >= io_tlb_start && paddr < io_tlb_end;
+  }
+  
++ static inline bool is_swiotlb_force_bounce(struct device *dev)
++ {
++ 	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
++ 
++ 	return mem && mem->force_bounce;
++ }
++ 
+  void __init swiotlb_exit(void);
+  unsigned int swiotlb_max_segment(void);
+  size_t swiotlb_max_mapping_size(struct device *dev);
+diff --cc kernel/dma/direct.c
+index 7d488b64b9de,a92465b4eb12..000000000000
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@@ -487,8 -495,8 +487,13 @@@ int dma_direct_supported(struct device 
+  size_t dma_direct_max_mapping_size(struct device *dev)
+  {
+  	/* If SWIOTLB is active, use its maximum mapping size */
+++<<<<<<< HEAD
+ +	if (is_swiotlb_active() &&
+ +	    (dma_addressing_limited(dev) || swiotlb_force == SWIOTLB_FORCE))
+++=======
++ 	if (is_swiotlb_active(dev) &&
++ 	    (dma_addressing_limited(dev) || is_swiotlb_force_bounce(dev)))
+++>>>>>>> 903cd0f315fe (swiotlb: Use is_swiotlb_force_bounce for swiotlb data bouncing)
+  		return swiotlb_max_mapping_size(dev);
+  	return SIZE_MAX;
+  }
+diff --cc kernel/dma/swiotlb.c
+index be0e4e04c6fd,04319dd22d28..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -223,35 -168,45 +223,62 @@@ void __init swiotlb_update_mem_attribut
+  	memset(vaddr, 0, bytes);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void swiotlb_init_io_tlb_mem(struct io_tlb_mem *mem, phys_addr_t start,
++ 				    unsigned long nslabs, bool late_alloc)
++ {
++ 	void *vaddr = phys_to_virt(start);
++ 	unsigned long bytes = nslabs << IO_TLB_SHIFT, i;
++ 
++ 	mem->nslabs = nslabs;
++ 	mem->start = start;
++ 	mem->end = mem->start + bytes;
++ 	mem->index = 0;
++ 	mem->late_alloc = late_alloc;
++ 
++ 	if (swiotlb_force == SWIOTLB_FORCE)
++ 		mem->force_bounce = true;
++ 
++ 	spin_lock_init(&mem->lock);
++ 	for (i = 0; i < mem->nslabs; i++) {
++ 		mem->slots[i].list = IO_TLB_SEGSIZE - io_tlb_offset(i);
++ 		mem->slots[i].orig_addr = INVALID_PHYS_ADDR;
++ 		mem->slots[i].alloc_size = 0;
++ 	}
++ 	memset(vaddr, 0, bytes);
++ }
++ 
+++>>>>>>> 903cd0f315fe (swiotlb: Use is_swiotlb_force_bounce for swiotlb data bouncing)
+  int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
+  {
+ -	struct io_tlb_mem *mem;
+ +	unsigned long i, bytes;
+  	size_t alloc_size;
+  
+ -	if (swiotlb_force == SWIOTLB_NO_FORCE)
+ -		return 0;
+ -
+  	/* protect against double initialization */
+ -	if (WARN_ON_ONCE(io_tlb_default_mem))
+ +	if (WARN_ON_ONCE(io_tlb_start))
+  		return -ENOMEM;
+  
+ -	alloc_size = PAGE_ALIGN(struct_size(mem, slots, nslabs));
+ -	mem = memblock_alloc(alloc_size, PAGE_SIZE);
+ -	if (!mem)
+ +	bytes = nslabs << IO_TLB_SHIFT;
+ +
+ +	io_tlb_nslabs = nslabs;
+ +	io_tlb_start = __pa(tlb);
+ +	io_tlb_end = io_tlb_start + bytes;
+ +
+ +	/*
+ +	 * Allocate and initialize the free list array.  This array is used
+ +	 * to find contiguous free memory regions of size up to IO_TLB_SEGSIZE
+ +	 * between io_tlb_start and io_tlb_end.
+ +	 */
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(int));
+ +	io_tlb_list = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_list)
+ +		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+ +		      __func__, alloc_size, PAGE_SIZE);
+ +
+ +	alloc_size = PAGE_ALIGN(io_tlb_nslabs * sizeof(phys_addr_t));
+ +	io_tlb_orig_addr = memblock_alloc(alloc_size, PAGE_SIZE);
+ +	if (!io_tlb_orig_addr)
+  		panic("%s: Failed to allocate %zu bytes align=0x%lx\n",
+  		      __func__, alloc_size, PAGE_SIZE);
+  
+* Unmerged path kernel/dma/direct.h
+diff --git a/drivers/xen/swiotlb-xen.c b/drivers/xen/swiotlb-xen.c
+index 8ccd85660984..5af5f570af13 100644
+--- a/drivers/xen/swiotlb-xen.c
++++ b/drivers/xen/swiotlb-xen.c
+@@ -369,7 +369,7 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
+ 	if (dma_capable(dev, dev_addr, size, true) &&
+ 	    !range_straddles_page_boundary(phys, size) &&
+ 		!xen_arch_need_swiotlb(dev, phys, dev_addr) &&
+-		swiotlb_force != SWIOTLB_FORCE)
++		!is_swiotlb_force_bounce(dev))
+ 		goto done;
+ 
+ 	/*
+* Unmerged path include/linux/swiotlb.h
+* Unmerged path kernel/dma/direct.c
+* Unmerged path kernel/dma/direct.h
+* Unmerged path kernel/dma/swiotlb.c
