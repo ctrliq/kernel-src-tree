@@ -1,0 +1,149 @@
+mm/gup: reorganize internal_get_user_pages_fast()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit c28b1fc70390df32e29991eedd52bd86e7aba080
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/c28b1fc7.failed
+
+Patch series "Add a seqcount between gup_fast and copy_page_range()", v4.
+
+As discussed and suggested by Linus use a seqcount to close the small race
+between gup_fast and copy_page_range().
+
+Ahmed confirms that raw_write_seqcount_begin() is the correct API to use
+in this case and it doesn't trigger any lockdeps.
+
+I was able to test it using two threads, one forking and the other using
+ibv_reg_mr() to trigger GUP fast.  Modifying copy_page_range() to sleep
+made the window large enough to reliably hit to test the logic.
+
+This patch (of 2):
+
+The next patch in this series makes the lockless flow a little more
+complex, so move the entire block into a new function and remove a level
+of indention.  Tidy a bit of cruft:
+
+ - addr is always the same as start, so use start
+
+ - Use the modern check_add_overflow() for computing end = start + len
+
+ - nr_pinned/pages << PAGE_SHIFT needs the LHS to be unsigned long to
+   avoid shift overflow, make the variables unsigned long to avoid coding
+   casts in both places. nr_pinned was missing its cast
+
+ - The handling of ret and nr_pinned can be streamlined a bit
+
+No functional change.
+
+Link: https://lkml.kernel.org/r/0-v4-908497cf359a+4782-gup_fork_jgg@nvidia.com
+Link: https://lkml.kernel.org/r/1-v4-908497cf359a+4782-gup_fork_jgg@nvidia.com
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c28b1fc70390df32e29991eedd52bd86e7aba080)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index ca1a0594a30a,c7e24301860a..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -2621,59 -2724,44 +2651,48 @@@ static int internal_get_user_pages_fast
+  		atomic_set(&current->mm->has_pinned, 1);
+  
+  	if (!(gup_flags & FOLL_FAST_ONLY))
+ -		might_lock_read(&current->mm->mmap_lock);
+ +		might_lock_read(&current->mm->mmap_sem);
+  
+  	start = untagged_addr(start) & PAGE_MASK;
+- 	addr = start;
+- 	len = (unsigned long) nr_pages << PAGE_SHIFT;
+- 	end = start + len;
+- 
+- 	if (end <= start)
++ 	len = nr_pages << PAGE_SHIFT;
++ 	if (check_add_overflow(start, len, &end))
+  		return 0;
+  	if (unlikely(!access_ok((void __user *)start, len)))
+  		return -EFAULT;
+  
+- 	/*
+- 	 * Disable interrupts. The nested form is used, in order to allow
+- 	 * full, general purpose use of this routine.
+- 	 *
+- 	 * With interrupts disabled, we block page table pages from being
+- 	 * freed from under us. See struct mmu_table_batch comments in
+- 	 * include/asm-generic/tlb.h for more details.
+- 	 *
+- 	 * We do not adopt an rcu_read_lock(.) here as we also want to
+- 	 * block IPIs that come from THPs splitting.
+- 	 */
+- 	if (IS_ENABLED(CONFIG_HAVE_FAST_GUP) && gup_fast_permitted(start, end)) {
+- 		unsigned long fast_flags = gup_flags;
+- 
+- 		local_irq_save(flags);
+- 		gup_pgd_range(addr, end, fast_flags, pages, &nr_pinned);
+- 		local_irq_restore(flags);
+- 		ret = nr_pinned;
+- 	}
+- 
+- 	if (nr_pinned < nr_pages && !(gup_flags & FOLL_FAST_ONLY)) {
+- 		/* Try to get the remaining pages with get_user_pages */
+- 		start += nr_pinned << PAGE_SHIFT;
+- 		pages += nr_pinned;
+- 
+- 		ret = __gup_longterm_unlocked(start, nr_pages - nr_pinned,
+- 					      gup_flags, pages);
++ 	nr_pinned = lockless_pages_from_mm(start, end, gup_flags, pages);
++ 	if (nr_pinned == nr_pages || gup_flags & FOLL_FAST_ONLY)
++ 		return nr_pinned;
+  
+- 		/* Have to be a bit careful with return values */
+- 		if (nr_pinned > 0) {
+- 			if (ret < 0)
+- 				ret = nr_pinned;
+- 			else
+- 				ret += nr_pinned;
+- 		}
++ 	/* Slow path: try to get the remaining pages with get_user_pages */
++ 	start += nr_pinned << PAGE_SHIFT;
++ 	pages += nr_pinned;
++ 	ret = __gup_longterm_unlocked(start, nr_pages - nr_pinned, gup_flags,
++ 				      pages);
++ 	if (ret < 0) {
++ 		/*
++ 		 * The caller has to unpin the pages we already pinned so
++ 		 * returning -errno is not an option
++ 		 */
++ 		if (nr_pinned)
++ 			return nr_pinned;
++ 		return ret;
+  	}
+- 
+- 	return ret;
++ 	return ret + nr_pinned;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+++=======
++ /**
++  * get_user_pages_fast_only() - pin user pages in memory
++  * @start:      starting user address
++  * @nr_pages:   number of pages from start to pin
++  * @gup_flags:  flags modifying pin behaviour
++  * @pages:      array that receives pointers to the pages pinned.
++  *              Should be at least nr_pages long.
++  *
+++>>>>>>> c28b1fc70390 (mm/gup: reorganize internal_get_user_pages_fast())
+   * Like get_user_pages_fast() except it's IRQ-safe in that it won't fall back to
+   * the regular GUP.
+   * Note a difference with get_user_pages_fast: this always returns the
+* Unmerged path mm/gup.c
