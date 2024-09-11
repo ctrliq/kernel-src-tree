@@ -3079,7 +3079,7 @@ replay:
 			if (ops->maxtype && linkinfo[IFLA_INFO_DATA]) {
 				err = nla_parse_nested(attr, ops->maxtype,
 						       linkinfo[IFLA_INFO_DATA],
-						       ops->policy, NULL);
+						       ops->policy, extack);
 				if (err < 0)
 					return err;
 				data = attr;
@@ -3101,7 +3101,7 @@ replay:
 						       m_ops->slave_maxtype,
 						       linkinfo[IFLA_INFO_SLAVE_DATA],
 						       m_ops->slave_policy,
-						       NULL);
+						       extack);
 				if (err < 0)
 					return err;
 				slave_data = slave_attr;
@@ -3165,6 +3165,7 @@ replay:
 					goto replay;
 			}
 #endif
+			NL_SET_ERR_MSG(extack, "Unknown device type");
 			return -EOPNOTSUPP;
 		}
 
@@ -3185,6 +3186,7 @@ replay:
 
 			link_net = get_net_ns_by_id(dest_net, id);
 			if (!link_net) {
+				NL_SET_ERR_MSG(extack, "Unknown network namespace id");
 				err =  -EINVAL;
 				goto out;
 			}
