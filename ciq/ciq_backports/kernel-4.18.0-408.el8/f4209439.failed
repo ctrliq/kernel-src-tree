@@ -1,0 +1,207 @@
+KVM: Optimize gfn lookup in kvm_zap_gfn_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+commit f4209439b522432d140d33393d4a3f12e695527b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/f4209439.failed
+
+Introduce a memslots gfn upper bound operation and use it to optimize
+kvm_zap_gfn_range().
+This way this handler can do a quick lookup for intersecting gfns and won't
+have to do a linear scan of the whole memslot set.
+
+	Signed-off-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+Message-Id: <ef242146a87a335ee93b441dcf01665cb847c902.1638817641.git.maciej.szmigiero@oracle.com>
+(cherry picked from commit f4209439b522432d140d33393d4a3f12e695527b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 970fc4a0eb93,b83ae4804176..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -5678,34 -5724,54 +5678,71 @@@ void kvm_mmu_uninit_vm(struct kvm *kvm
+  	kvm_mmu_uninit_tdp_mmu(kvm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __kvm_zap_rmaps(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
++ {
++ 	const struct kvm_memory_slot *memslot;
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memslot_iter iter;
++ 	bool flush = false;
++ 	gfn_t start, end;
++ 	int i;
++ 
++ 	if (!kvm_memslots_have_rmaps(kvm))
++ 		return flush;
++ 
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 
++ 		kvm_for_each_memslot_in_gfn_range(&iter, slots, gfn_start, gfn_end) {
++ 			memslot = iter.slot;
++ 			start = max(gfn_start, memslot->base_gfn);
++ 			end = min(gfn_end, memslot->base_gfn + memslot->npages);
++ 			if (WARN_ON_ONCE(start >= end))
++ 				continue;
++ 
++ 			flush = slot_handle_level_range(kvm, memslot, kvm_zap_rmapp,
++ 							PG_LEVEL_4K, KVM_MAX_HUGEPAGE_LEVEL,
++ 							start, end - 1, true, flush);
++ 		}
++ 	}
++ 
++ 	return flush;
++ }
++ 
+++>>>>>>> f4209439b522 (KVM: Optimize gfn lookup in kvm_zap_gfn_range())
+  /*
+   * Invalidate (zap) SPTEs that cover GFNs from gfn_start and up to gfn_end
+   * (not including it)
+   */
+  void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
+  {
+ -	bool flush;
+ +	struct kvm_memslots *slots;
+ +	struct kvm_memory_slot *memslot;
+  	int i;
+ +	bool flush = false;
+  
++ 	if (WARN_ON_ONCE(gfn_end <= gfn_start))
++ 		return;
++ 
+  	write_lock(&kvm->mmu_lock);
+ +	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+ +		slots = __kvm_memslots(kvm, i);
+ +		kvm_for_each_memslot(memslot, slots) {
+ +			gfn_t start, end;
+  
+ -	kvm_inc_notifier_count(kvm, gfn_start, gfn_end);
+ +			start = max(gfn_start, memslot->base_gfn);
+ +			end = min(gfn_end, memslot->base_gfn + memslot->npages);
+ +			if (start >= end)
+ +				continue;
+  
+ -	flush = __kvm_zap_rmaps(kvm, gfn_start, gfn_end);
+ +			flush = slot_handle_level_range(kvm, memslot, kvm_zap_rmapp,
+ +							PG_LEVEL_4K,
+ +							KVM_MAX_HUGEPAGE_LEVEL,
+ +							start, end - 1, true, flush);
+ +		}
+ +	}
+  
+  	if (is_tdp_mmu_enabled(kvm)) {
+  		for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++)
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 5a84e8a20ec4..bb6920224821 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -755,6 +755,100 @@ struct kvm_memory_slot *id_to_memslot(struct kvm_memslots *slots, int id)
+ 	return slot;
+ }
+ 
++/* Iterator used for walking memslots that overlap a gfn range. */
++struct kvm_memslot_iter {
++	struct kvm_memslots *slots;
++	struct rb_node *node;
++	struct kvm_memory_slot *slot;
++};
++
++static inline void kvm_memslot_iter_next(struct kvm_memslot_iter *iter)
++{
++	iter->node = rb_next(iter->node);
++	if (!iter->node)
++		return;
++
++	iter->slot = container_of(iter->node, struct kvm_memory_slot, gfn_node[iter->slots->node_idx]);
++}
++
++static inline void kvm_memslot_iter_start(struct kvm_memslot_iter *iter,
++					  struct kvm_memslots *slots,
++					  gfn_t start)
++{
++	int idx = slots->node_idx;
++	struct rb_node *tmp;
++	struct kvm_memory_slot *slot;
++
++	iter->slots = slots;
++
++	/*
++	 * Find the so called "upper bound" of a key - the first node that has
++	 * its key strictly greater than the searched one (the start gfn in our case).
++	 */
++	iter->node = NULL;
++	for (tmp = slots->gfn_tree.rb_node; tmp; ) {
++		slot = container_of(tmp, struct kvm_memory_slot, gfn_node[idx]);
++		if (start < slot->base_gfn) {
++			iter->node = tmp;
++			tmp = tmp->rb_left;
++		} else {
++			tmp = tmp->rb_right;
++		}
++	}
++
++	/*
++	 * Find the slot with the lowest gfn that can possibly intersect with
++	 * the range, so we'll ideally have slot start <= range start
++	 */
++	if (iter->node) {
++		/*
++		 * A NULL previous node means that the very first slot
++		 * already has a higher start gfn.
++		 * In this case slot start > range start.
++		 */
++		tmp = rb_prev(iter->node);
++		if (tmp)
++			iter->node = tmp;
++	} else {
++		/* a NULL node below means no slots */
++		iter->node = rb_last(&slots->gfn_tree);
++	}
++
++	if (iter->node) {
++		iter->slot = container_of(iter->node, struct kvm_memory_slot, gfn_node[idx]);
++
++		/*
++		 * It is possible in the slot start < range start case that the
++		 * found slot ends before or at range start (slot end <= range start)
++		 * and so it does not overlap the requested range.
++		 *
++		 * In such non-overlapping case the next slot (if it exists) will
++		 * already have slot start > range start, otherwise the logic above
++		 * would have found it instead of the current slot.
++		 */
++		if (iter->slot->base_gfn + iter->slot->npages <= start)
++			kvm_memslot_iter_next(iter);
++	}
++}
++
++static inline bool kvm_memslot_iter_is_valid(struct kvm_memslot_iter *iter, gfn_t end)
++{
++	if (!iter->node)
++		return false;
++
++	/*
++	 * If this slot starts beyond or at the end of the range so does
++	 * every next one
++	 */
++	return iter->slot->base_gfn < end;
++}
++
++/* Iterate over each memslot at least partially intersecting [start, end) range */
++#define kvm_for_each_memslot_in_gfn_range(iter, slots, start, end)	\
++	for (kvm_memslot_iter_start(iter, slots, start);		\
++	     kvm_memslot_iter_is_valid(iter, end);			\
++	     kvm_memslot_iter_next(iter))
++
+ /*
+  * KVM_SET_USER_MEMORY_REGION ioctl allows the following operations:
+  * - create a new memory slot
