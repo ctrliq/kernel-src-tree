@@ -1,0 +1,435 @@
+scsi: sbitmap: Move allocation hint into sbitmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit c548e62bcf6adc7066ff201e9ecc88e536dd8890
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/c548e62b.failed
+
+Allocation hint should have belonged to sbitmap. Also, when sbitmap's depth
+is high and there is no need to use mulitple wakeup queues, user can
+benefit from percpu allocation hint too.
+
+Move allocation hint into sbitmap, then SCSI device queue can benefit from
+allocation hint when converting to plain sbitmap.
+
+Convert vhost/scsi.c to use sbitmap allocation with percpu alloc hint. This
+is more efficient than the previous approach.
+
+Link: https://lore.kernel.org/r/20210122023317.687987-5-ming.lei@redhat.com
+	Cc: Omar Sandoval <osandov@fb.com>
+	Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+	Cc: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+	Cc: Ewan D. Milne <emilne@redhat.com>
+	Cc: Mike Christie <michael.christie@oracle.com>
+	Cc: virtualization@lists.linux-foundation.org
+	Tested-by: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c548e62bcf6adc7066ff201e9ecc88e536dd8890)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	block/kyber-iosched.c
+#	drivers/vhost/scsi.c
+#	include/linux/sbitmap.h
+#	lib/sbitmap.c
+diff --cc block/blk-mq.c
+index 2c7e4bee30bc,2e8c94e00f58..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -2800,7 -2702,7 +2800,11 @@@ blk_mq_alloc_hctx(struct request_queue 
+  		goto free_cpumask;
+  
+  	if (sbitmap_init_node(&hctx->ctx_map, nr_cpu_ids, ilog2(8),
+++<<<<<<< HEAD
+ +				gfp, node))
+++=======
++ 				gfp, node, false, false))
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  		goto free_ctxs;
+  	hctx->nr_ctx = 0;
+  
+diff --cc block/kyber-iosched.c
+index 338c991ee47e,8969e122f081..000000000000
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@@ -487,7 -478,8 +487,12 @@@ static int kyber_init_hctx(struct blk_m
+  
+  	for (i = 0; i < KYBER_NUM_DOMAINS; i++) {
+  		if (sbitmap_init_node(&khd->kcq_map[i], hctx->nr_ctx,
+++<<<<<<< HEAD
+ +				      ilog2(8), GFP_KERNEL, hctx->numa_node)) {
+++=======
++ 				      ilog2(8), GFP_KERNEL, hctx->numa_node,
++ 				      false, false)) {
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  			while (--i >= 0)
+  				sbitmap_free(&khd->kcq_map[i]);
+  			goto err_kcqs;
+diff --cc drivers/vhost/scsi.c
+index 227271ef91e4,936584250a0b..000000000000
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@@ -569,9 -613,8 +569,13 @@@ vhost_scsi_get_tag(struct vhost_virtque
+  		pr_err("Unable to locate active struct vhost_scsi_nexus\n");
+  		return ERR_PTR(-EIO);
+  	}
+ +	se_sess = tv_nexus->tvn_se_sess;
+  
+++<<<<<<< HEAD
+ +	tag = sbitmap_queue_get(&se_sess->sess_tag_pool, &cpu);
+++=======
++ 	tag = sbitmap_get(&svq->scsi_tags);
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  	if (tag < 0) {
+  		pr_err("Unable to obtain tag for vhost_scsi_cmd\n");
+  		return ERR_PTR(-ENOMEM);
+@@@ -1137,6 -1478,83 +1141,86 @@@ static void vhost_scsi_flush(struct vho
+  		wait_for_completion(&old_inflight[i]->comp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vhost_scsi_destroy_vq_cmds(struct vhost_virtqueue *vq)
++ {
++ 	struct vhost_scsi_virtqueue *svq = container_of(vq,
++ 					struct vhost_scsi_virtqueue, vq);
++ 	struct vhost_scsi_cmd *tv_cmd;
++ 	unsigned int i;
++ 
++ 	if (!svq->scsi_cmds)
++ 		return;
++ 
++ 	for (i = 0; i < svq->max_cmds; i++) {
++ 		tv_cmd = &svq->scsi_cmds[i];
++ 
++ 		kfree(tv_cmd->tvc_sgl);
++ 		kfree(tv_cmd->tvc_prot_sgl);
++ 		kfree(tv_cmd->tvc_upages);
++ 	}
++ 
++ 	sbitmap_free(&svq->scsi_tags);
++ 	kfree(svq->scsi_cmds);
++ 	svq->scsi_cmds = NULL;
++ }
++ 
++ static int vhost_scsi_setup_vq_cmds(struct vhost_virtqueue *vq, int max_cmds)
++ {
++ 	struct vhost_scsi_virtqueue *svq = container_of(vq,
++ 					struct vhost_scsi_virtqueue, vq);
++ 	struct vhost_scsi_cmd *tv_cmd;
++ 	unsigned int i;
++ 
++ 	if (svq->scsi_cmds)
++ 		return 0;
++ 
++ 	if (sbitmap_init_node(&svq->scsi_tags, max_cmds, -1, GFP_KERNEL,
++ 			      NUMA_NO_NODE, false, true))
++ 		return -ENOMEM;
++ 	svq->max_cmds = max_cmds;
++ 
++ 	svq->scsi_cmds = kcalloc(max_cmds, sizeof(*tv_cmd), GFP_KERNEL);
++ 	if (!svq->scsi_cmds) {
++ 		sbitmap_free(&svq->scsi_tags);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0; i < max_cmds; i++) {
++ 		tv_cmd = &svq->scsi_cmds[i];
++ 
++ 		tv_cmd->tvc_sgl = kcalloc(VHOST_SCSI_PREALLOC_SGLS,
++ 					  sizeof(struct scatterlist),
++ 					  GFP_KERNEL);
++ 		if (!tv_cmd->tvc_sgl) {
++ 			pr_err("Unable to allocate tv_cmd->tvc_sgl\n");
++ 			goto out;
++ 		}
++ 
++ 		tv_cmd->tvc_upages = kcalloc(VHOST_SCSI_PREALLOC_UPAGES,
++ 					     sizeof(struct page *),
++ 					     GFP_KERNEL);
++ 		if (!tv_cmd->tvc_upages) {
++ 			pr_err("Unable to allocate tv_cmd->tvc_upages\n");
++ 			goto out;
++ 		}
++ 
++ 		tv_cmd->tvc_prot_sgl = kcalloc(VHOST_SCSI_PREALLOC_PROT_SGLS,
++ 					       sizeof(struct scatterlist),
++ 					       GFP_KERNEL);
++ 		if (!tv_cmd->tvc_prot_sgl) {
++ 			pr_err("Unable to allocate tv_cmd->tvc_prot_sgl\n");
++ 			goto out;
++ 		}
++ 	}
++ 	return 0;
++ out:
++ 	vhost_scsi_destroy_vq_cmds(vq);
++ 	return -ENOMEM;
++ }
++ 
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  /*
+   * Called from vhost_scsi_ioctl() context to walk the list of available
+   * vhost_scsi_tpg with an active struct vhost_scsi_nexus
+diff --cc include/linux/sbitmap.h
+index 0d021ecff388,247776fcc02c..000000000000
+--- a/include/linux/sbitmap.h
++++ b/include/linux/sbitmap.h
+@@@ -160,11 -144,16 +160,23 @@@ struct sbitmap_queue 
+   *         given, a good default is chosen.
+   * @flags: Allocation flags.
+   * @node: Memory node to allocate on.
+++<<<<<<< HEAD
+++=======
++  * @round_robin: If true, be stricter about allocation order; always allocate
++  *               starting from the last allocated bit. This is less efficient
++  *               than the default behavior (false).
++  * @alloc_hint: If true, apply percpu hint for where to start searching for
++  *              a free bit.
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+   *
+   * Return: Zero on success or negative errno on failure.
+   */
+  int sbitmap_init_node(struct sbitmap *sb, unsigned int depth, int shift,
+++<<<<<<< HEAD
+ +		      gfp_t flags, int node);
+++=======
++ 		      gfp_t flags, int node, bool round_robin, bool alloc_hint);
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  
+  /**
+   * sbitmap_free() - Free memory used by a &struct sbitmap.
+@@@ -189,16 -179,12 +202,23 @@@ void sbitmap_resize(struct sbitmap *sb
+  /**
+   * sbitmap_get() - Try to allocate a free bit from a &struct sbitmap.
+   * @sb: Bitmap to allocate from.
+++<<<<<<< HEAD
+ + * @alloc_hint: Hint for where to start searching for a free bit.
+ + * @round_robin: If true, be stricter about allocation order; always allocate
+ + *               starting from the last allocated bit. This is less efficient
+ + *               than the default behavior (false).
+++=======
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+   *
+   * This operation provides acquire barrier semantics if it succeeds.
+   *
+   * Return: Non-negative allocated bit number if successful, -1 otherwise.
+   */
+++<<<<<<< HEAD
+ +int sbitmap_get(struct sbitmap *sb, unsigned int alloc_hint, bool round_robin);
+++=======
++ int sbitmap_get(struct sbitmap *sb);
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  
+  /**
+   * sbitmap_get_shallow() - Try to allocate a free bit from a &struct sbitmap,
+diff --cc lib/sbitmap.c
+index d69d338697cf,e395435654aa..000000000000
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@@ -20,6 -9,54 +20,57 @@@
+  #include <linux/sbitmap.h>
+  #include <linux/seq_file.h>
+  
+++<<<<<<< HEAD
+++=======
++ static int init_alloc_hint(struct sbitmap *sb, gfp_t flags)
++ {
++ 	unsigned depth = sb->depth;
++ 
++ 	sb->alloc_hint = alloc_percpu_gfp(unsigned int, flags);
++ 	if (!sb->alloc_hint)
++ 		return -ENOMEM;
++ 
++ 	if (depth && !sb->round_robin) {
++ 		int i;
++ 
++ 		for_each_possible_cpu(i)
++ 			*per_cpu_ptr(sb->alloc_hint, i) = prandom_u32() % depth;
++ 	}
++ 	return 0;
++ }
++ 
++ static inline unsigned update_alloc_hint_before_get(struct sbitmap *sb,
++ 						    unsigned int depth)
++ {
++ 	unsigned hint;
++ 
++ 	hint = this_cpu_read(*sb->alloc_hint);
++ 	if (unlikely(hint >= depth)) {
++ 		hint = depth ? prandom_u32() % depth : 0;
++ 		this_cpu_write(*sb->alloc_hint, hint);
++ 	}
++ 
++ 	return hint;
++ }
++ 
++ static inline void update_alloc_hint_after_get(struct sbitmap *sb,
++ 					       unsigned int depth,
++ 					       unsigned int hint,
++ 					       unsigned int nr)
++ {
++ 	if (nr == -1) {
++ 		/* If the map is full, a hint won't do us much good. */
++ 		this_cpu_write(*sb->alloc_hint, 0);
++ 	} else if (nr == hint || unlikely(sb->round_robin)) {
++ 		/* Only update the hint if we used it. */
++ 		hint = nr + 1;
++ 		if (hint >= depth - 1)
++ 			hint = 0;
++ 		this_cpu_write(*sb->alloc_hint, hint);
++ 	}
++ }
++ 
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  /*
+   * See if we have deferred clears that we can batch move
+   */
+@@@ -44,7 -81,8 +95,12 @@@ static inline bool sbitmap_deferred_cle
+  }
+  
+  int sbitmap_init_node(struct sbitmap *sb, unsigned int depth, int shift,
+++<<<<<<< HEAD
+ +		      gfp_t flags, int node)
+++=======
++ 		      gfp_t flags, int node, bool round_robin,
++ 		      bool alloc_hint)
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  {
+  	unsigned int bits_per_word;
+  	unsigned int i;
+@@@ -155,7 -205,7 +220,11 @@@ static int sbitmap_find_bit_in_index(st
+  	return nr;
+  }
+  
+++<<<<<<< HEAD
+ +int sbitmap_get(struct sbitmap *sb, unsigned int alloc_hint, bool round_robin)
+++=======
++ static int __sbitmap_get(struct sbitmap *sb, unsigned int alloc_hint)
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  {
+  	unsigned int i, index;
+  	int nr = -1;
+@@@ -359,21 -441,11 +461,29 @@@ int sbitmap_queue_init_node(struct sbit
+  	int ret;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	ret = sbitmap_init_node(&sbq->sb, depth, shift, flags, node);
+ +	if (ret)
+ +		return ret;
+ +
+ +	sbq->alloc_hint = alloc_percpu_gfp(unsigned int, flags);
+ +	if (!sbq->alloc_hint) {
+ +		sbitmap_free(&sbq->sb);
+ +		return -ENOMEM;
+ +	}
+ +
+ +	if (depth && !round_robin) {
+ +		for_each_possible_cpu(i)
+ +			*per_cpu_ptr(sbq->alloc_hint, i) = prandom_u32() % depth;
+ +	}
+ +
+++=======
++ 	ret = sbitmap_init_node(&sbq->sb, depth, shift, flags, node,
++ 				round_robin, true);
++ 	if (ret)
++ 		return ret;
++ 
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  	sbq->min_shallow_depth = UINT_MAX;
+  	sbq->wake_batch = sbq_calc_wake_batch(sbq, depth);
+  	atomic_set(&sbq->wake_index, 0);
+@@@ -424,60 -494,16 +533,65 @@@ EXPORT_SYMBOL_GPL(sbitmap_queue_resize)
+  
+  int __sbitmap_queue_get(struct sbitmap_queue *sbq)
+  {
+++<<<<<<< HEAD
+ +	unsigned int hint, depth;
+ +	int nr;
+ +
+ +	hint = this_cpu_read(*sbq->alloc_hint);
+ +	depth = READ_ONCE(sbq->sb.depth);
+ +	if (unlikely(hint >= depth)) {
+ +		hint = depth ? prandom_u32() % depth : 0;
+ +		this_cpu_write(*sbq->alloc_hint, hint);
+ +	}
+ +	nr = sbitmap_get(&sbq->sb, hint, sbq->round_robin);
+ +
+ +	if (nr == -1) {
+ +		/* If the map is full, a hint won't do us much good. */
+ +		this_cpu_write(*sbq->alloc_hint, 0);
+ +	} else if (nr == hint || unlikely(sbq->round_robin)) {
+ +		/* Only update the hint if we used it. */
+ +		hint = nr + 1;
+ +		if (hint >= depth - 1)
+ +			hint = 0;
+ +		this_cpu_write(*sbq->alloc_hint, hint);
+ +	}
+ +
+ +	return nr;
+++=======
++ 	return sbitmap_get(&sbq->sb);
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  }
+  EXPORT_SYMBOL_GPL(__sbitmap_queue_get);
+  
+  int __sbitmap_queue_get_shallow(struct sbitmap_queue *sbq,
+  				unsigned int shallow_depth)
+  {
+- 	unsigned int hint, depth;
+- 	int nr;
+- 
+  	WARN_ON_ONCE(shallow_depth < sbq->min_shallow_depth);
+  
+++<<<<<<< HEAD
+ +	hint = this_cpu_read(*sbq->alloc_hint);
+ +	depth = READ_ONCE(sbq->sb.depth);
+ +	if (unlikely(hint >= depth)) {
+ +		hint = depth ? prandom_u32() % depth : 0;
+ +		this_cpu_write(*sbq->alloc_hint, hint);
+ +	}
+ +	nr = sbitmap_get_shallow(&sbq->sb, hint, shallow_depth);
+ +
+ +	if (nr == -1) {
+ +		/* If the map is full, a hint won't do us much good. */
+ +		this_cpu_write(*sbq->alloc_hint, 0);
+ +	} else if (nr == hint || unlikely(sbq->round_robin)) {
+ +		/* Only update the hint if we used it. */
+ +		hint = nr + 1;
+ +		if (hint >= depth - 1)
+ +			hint = 0;
+ +		this_cpu_write(*sbq->alloc_hint, hint);
+ +	}
+ +
+ +	return nr;
+++=======
++ 	return sbitmap_get_shallow(&sbq->sb, shallow_depth);
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  }
+  EXPORT_SYMBOL_GPL(__sbitmap_queue_get_shallow);
+  
+@@@ -585,8 -611,8 +699,13 @@@ void sbitmap_queue_clear(struct sbitmap
+  	smp_mb__after_atomic();
+  	sbitmap_queue_wake_up(sbq);
+  
+++<<<<<<< HEAD
+ +	if (likely(!sbq->round_robin && nr < sbq->sb.depth))
+ +		*per_cpu_ptr(sbq->alloc_hint, cpu) = nr;
+++=======
++ 	if (likely(!sbq->sb.round_robin && nr < sbq->sb.depth))
++ 		*per_cpu_ptr(sbq->sb.alloc_hint, cpu) = nr;
+++>>>>>>> c548e62bcf6a (scsi: sbitmap: Move allocation hint into sbitmap)
+  }
+  EXPORT_SYMBOL_GPL(sbitmap_queue_clear);
+  
+* Unmerged path block/blk-mq.c
+* Unmerged path block/kyber-iosched.c
+* Unmerged path drivers/vhost/scsi.c
+* Unmerged path include/linux/sbitmap.h
+* Unmerged path lib/sbitmap.c
