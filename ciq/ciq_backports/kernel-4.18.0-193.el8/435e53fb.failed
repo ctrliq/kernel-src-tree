@@ -1,0 +1,156 @@
+arm64: KVM: Enable VHE support for :G/:H perf event modifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [arm64] kvm: Enable VHE support for :G/:H perf event modifiers (Auger Eric) [1749501]
+Rebuild_FUZZ: 93.91%
+commit-author Andrew Murray <andrew.murray@arm.com>
+commit 435e53fb5e21ad1820c5c69f208304c0e5623d01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/435e53fb.failed
+
+With VHE different exception levels are used between the host (EL2) and
+guest (EL1) with a shared exception level for userpace (EL0). We can take
+advantage of this and use the PMU's exception level filtering to avoid
+enabling/disabling counters in the world-switch code. Instead we just
+modify the counter type to include or exclude EL0 at vcpu_{load,put} time.
+
+We also ensure that trapped PMU system register writes do not re-enable
+EL0 when reconfiguring the backing perf events.
+
+This approach completely avoids blackout windows seen with !VHE.
+
+	Suggested-by: Christoffer Dall <christoffer.dall@arm.com>
+	Signed-off-by: Andrew Murray <andrew.murray@arm.com>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 435e53fb5e21ad1820c5c69f208304c0e5623d01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/pmu.c
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 90427baf5f4c,2a8d3f8ca22c..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -548,11 -578,28 +548,34 @@@ void kvm_arch_vcpu_load_fp(struct kvm_v
+  void kvm_arch_vcpu_ctxsync_fp(struct kvm_vcpu *vcpu);
+  void kvm_arch_vcpu_put_fp(struct kvm_vcpu *vcpu);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool kvm_pmu_counter_deferred(struct perf_event_attr *attr)
++ {
++ 	return (!has_vhe() && attr->exclude_host);
++ }
++ 
+++>>>>>>> 435e53fb5e21 (arm64: KVM: Enable VHE support for :G/:H perf event modifiers)
+  #ifdef CONFIG_KVM /* Avoid conflicts with core headers if CONFIG_KVM=n */
+  static inline int kvm_arch_vcpu_run_pid_change(struct kvm_vcpu *vcpu)
+  {
+  	return kvm_arch_vcpu_run_map_fp(vcpu);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void kvm_set_pmu_events(u32 set, struct perf_event_attr *attr);
++ void kvm_clr_pmu_events(u32 clr);
++ 
++ void __pmu_switch_to_host(struct kvm_cpu_context *host_ctxt);
++ bool __pmu_switch_to_guest(struct kvm_cpu_context *host_ctxt);
++ 
++ void kvm_vcpu_pmu_restore_guest(struct kvm_vcpu *vcpu);
++ void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu);
++ #else
++ static inline void kvm_set_pmu_events(u32 set, struct perf_event_attr *attr) {}
++ static inline void kvm_clr_pmu_events(u32 clr) {}
+++>>>>>>> 435e53fb5e21 (arm64: KVM: Enable VHE support for :G/:H perf event modifiers)
+  #endif
+  
+  static inline void kvm_arm_vhe_guest_enter(void)
+* Unmerged path arch/arm64/kvm/pmu.c
+diff --git a/arch/arm/include/asm/kvm_host.h b/arch/arm/include/asm/kvm_host.h
+index 516193804b39..fce19bb77c42 100644
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@ -339,6 +339,9 @@ static inline void kvm_arch_vcpu_load_fp(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_arch_vcpu_ctxsync_fp(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_arch_vcpu_put_fp(struct kvm_vcpu *vcpu) {}
+ 
++static inline void kvm_vcpu_pmu_restore_guest(struct kvm_vcpu *vcpu) {}
++static inline void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu) {}
++
+ static inline void kvm_arm_vhe_guest_enter(void) {}
+ static inline void kvm_arm_vhe_guest_exit(void) {}
+ 
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm64/kernel/perf_event.c b/arch/arm64/kernel/perf_event.c
+index 019a00051790..af882926b3da 100644
+--- a/arch/arm64/kernel/perf_event.c
++++ b/arch/arm64/kernel/perf_event.c
+@@ -816,8 +816,12 @@ static int armv8pmu_set_event_filter(struct hw_perf_event *event,
+ 	 * with other architectures (x86 and Power).
+ 	 */
+ 	if (is_kernel_in_hyp_mode()) {
+-		if (!attr->exclude_kernel)
++		if (!attr->exclude_kernel && !attr->exclude_host)
+ 			config_base |= ARMV8_PMU_INCLUDE_EL2;
++		if (attr->exclude_guest)
++			config_base |= ARMV8_PMU_EXCLUDE_EL1;
++		if (attr->exclude_host)
++			config_base |= ARMV8_PMU_EXCLUDE_EL0;
+ 	} else {
+ 		if (attr->exclude_kernel)
+ 			config_base |= ARMV8_PMU_EXCLUDE_EL1;
+* Unmerged path arch/arm64/kvm/pmu.c
+diff --git a/arch/arm64/kvm/sys_regs.c b/arch/arm64/kvm/sys_regs.c
+index 7046c7686321..1ef2548ca90a 100644
+--- a/arch/arm64/kvm/sys_regs.c
++++ b/arch/arm64/kvm/sys_regs.c
+@@ -695,6 +695,7 @@ static bool access_pmcr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+ 		val |= p->regval & ARMV8_PMU_PMCR_MASK;
+ 		__vcpu_sys_reg(vcpu, PMCR_EL0) = val;
+ 		kvm_pmu_handle_pmcr(vcpu, val);
++		kvm_vcpu_pmu_restore_guest(vcpu);
+ 	} else {
+ 		/* PMCR.P & PMCR.C are RAZ */
+ 		val = __vcpu_sys_reg(vcpu, PMCR_EL0)
+@@ -850,6 +851,7 @@ static bool access_pmu_evtyper(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+ 	if (p->is_write) {
+ 		kvm_pmu_set_counter_event_type(vcpu, p->regval, idx);
+ 		__vcpu_sys_reg(vcpu, reg) = p->regval & ARMV8_PMU_EVTYPE_MASK;
++		kvm_vcpu_pmu_restore_guest(vcpu);
+ 	} else {
+ 		p->regval = __vcpu_sys_reg(vcpu, reg) & ARMV8_PMU_EVTYPE_MASK;
+ 	}
+@@ -875,6 +877,7 @@ static bool access_pmcnten(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+ 			/* accessing PMCNTENSET_EL0 */
+ 			__vcpu_sys_reg(vcpu, PMCNTENSET_EL0) |= val;
+ 			kvm_pmu_enable_counter(vcpu, val);
++			kvm_vcpu_pmu_restore_guest(vcpu);
+ 		} else {
+ 			/* accessing PMCNTENCLR_EL0 */
+ 			__vcpu_sys_reg(vcpu, PMCNTENSET_EL0) &= ~val;
+diff --git a/virt/kvm/arm/arm.c b/virt/kvm/arm/arm.c
+index 2482b77e6427..8eb18494e923 100644
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@ -380,6 +380,7 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	kvm_timer_vcpu_load(vcpu);
+ 	kvm_vcpu_load_sysregs(vcpu);
+ 	kvm_arch_vcpu_load_fp(vcpu);
++	kvm_vcpu_pmu_restore_guest(vcpu);
+ 
+ 	if (single_task_running())
+ 		vcpu_clear_wfe_traps(vcpu);
+@@ -393,6 +394,7 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+ 	kvm_vcpu_put_sysregs(vcpu);
+ 	kvm_timer_vcpu_put(vcpu);
+ 	kvm_vgic_put(vcpu);
++	kvm_vcpu_pmu_restore_host(vcpu);
+ 
+ 	vcpu->cpu = -1;
+ 
