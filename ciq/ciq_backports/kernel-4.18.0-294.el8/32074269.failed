@@ -1,0 +1,236 @@
+x86/exceptions: Disconnect IST index and stack order
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 3207426925d2b4da390be8068df1d1c2b36e5918
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/32074269.failed
+
+The entry order of the TSS.IST array and the order of the stack
+storage/mapping are not required to be the same.
+
+With the upcoming split of the debug stack this is going to fall apart as
+the number of TSS.IST array entries stays the same while the actual stacks
+are increasing.
+
+Make them separate so that code like dumpstack can just utilize the mapping
+order. The IST index is solely required for the actual TSS.IST array
+initialization.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: "Chang S. Bae" <chang.seok.bae@intel.com>
+	Cc: Dominik Brodowski <linux@dominikbrodowski.net>
+	Cc: Dou Liyang <douly.fnst@cn.fujitsu.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Nicolai Stange <nstange@suse.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Qian Cai <cai@lca.pw>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190414160145.241588113@linutronix.de
+(cherry picked from commit 3207426925d2b4da390be8068df1d1c2b36e5918)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_64.S
+#	arch/x86/include/asm/cpu_entry_area.h
+#	arch/x86/include/asm/page_64_types.h
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/idt.c
+diff --cc arch/x86/entry/entry_64.S
+index 00e63c77d5d4,5c0348504a4b..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -1175,8 -1129,8 +1175,13 @@@ apicinterrupt3 HYPERV_STIMER0_VECTOR 
+  	hv_stimer0_callback_vector hv_stimer0_vector_handler
+  #endif /* CONFIG_HYPERV */
+  
+++<<<<<<< HEAD
+ +idtentry debug			do_debug		has_error_code=0	paranoid=1 shift_ist=DEBUG_STACK
+ +idtentry int3			do_int3			has_error_code=0	create_gap=1
+++=======
++ idtentry debug			do_debug		has_error_code=0	paranoid=1 shift_ist=IST_INDEX_DB
++ idtentry int3			do_int3			has_error_code=0
+++>>>>>>> 3207426925d2 (x86/exceptions: Disconnect IST index and stack order)
+  idtentry stack_segment		do_stack_segment	has_error_code=1
+  
+  #ifdef CONFIG_XEN_PV
+diff --cc arch/x86/include/asm/cpu_entry_area.h
+index 29c706415443,310eeb62d418..000000000000
+--- a/arch/x86/include/asm/cpu_entry_area.h
++++ b/arch/x86/include/asm/cpu_entry_area.h
+@@@ -7,6 -7,62 +7,65 @@@
+  #include <asm/processor.h>
+  #include <asm/intel_ds.h>
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_64
++ 
++ /* Macro to enforce the same ordering and stack sizes */
++ #define ESTACKS_MEMBERS(guardsize)		\
++ 	char	DF_stack_guard[guardsize];	\
++ 	char	DF_stack[EXCEPTION_STKSZ];	\
++ 	char	NMI_stack_guard[guardsize];	\
++ 	char	NMI_stack[EXCEPTION_STKSZ];	\
++ 	char	DB_stack_guard[guardsize];	\
++ 	char	DB_stack[DEBUG_STKSZ];		\
++ 	char	MCE_stack_guard[guardsize];	\
++ 	char	MCE_stack[EXCEPTION_STKSZ];	\
++ 	char	IST_top_guard[guardsize];	\
++ 
++ /* The exception stacks' physical storage. No guard pages required */
++ struct exception_stacks {
++ 	ESTACKS_MEMBERS(0)
++ };
++ 
++ /*
++  * The effective cpu entry area mapping with guard pages. Guard size is
++  * zero until the code which makes assumptions about linear mappings is
++  * cleaned up.
++  */
++ struct cea_exception_stacks {
++ 	ESTACKS_MEMBERS(0)
++ };
++ 
++ /*
++  * The exception stack ordering in [cea_]exception_stacks
++  */
++ enum exception_stack_ordering {
++ 	ESTACK_DF,
++ 	ESTACK_NMI,
++ 	ESTACK_DB,
++ 	ESTACK_MCE,
++ 	N_EXCEPTION_STACKS
++ };
++ 
++ #define CEA_ESTACK_SIZE(st)					\
++ 	sizeof(((struct cea_exception_stacks *)0)->st## _stack)
++ 
++ #define CEA_ESTACK_BOT(ceastp, st)				\
++ 	((unsigned long)&(ceastp)->st## _stack)
++ 
++ #define CEA_ESTACK_TOP(ceastp, st)				\
++ 	(CEA_ESTACK_BOT(ceastp, st) + CEA_ESTACK_SIZE(st))
++ 
++ #define CEA_ESTACK_OFFS(st)					\
++ 	offsetof(struct cea_exception_stacks, st## _stack)
++ 
++ #define CEA_ESTACK_PAGES					\
++ 	(sizeof(struct cea_exception_stacks) / PAGE_SIZE)
++ 
++ #endif
++ 
+++>>>>>>> 3207426925d2 (x86/exceptions: Disconnect IST index and stack order)
+  /*
+   * cpu_entry_area is a percpu region that contains things needed by the CPU
+   * and early entry/exit code.  Real types aren't used for all fields here
+diff --cc arch/x86/include/asm/page_64_types.h
+index 24fbc1126554,056de887b220..000000000000
+--- a/arch/x86/include/asm/page_64_types.h
++++ b/arch/x86/include/asm/page_64_types.h
+@@@ -24,11 -24,13 +24,21 @@@
+  #define IRQ_STACK_ORDER (2 + KASAN_STACK_ORDER)
+  #define IRQ_STACK_SIZE (PAGE_SIZE << IRQ_STACK_ORDER)
+  
+++<<<<<<< HEAD
+ +#define DOUBLEFAULT_STACK 1
+ +#define NMI_STACK 2
+ +#define DEBUG_STACK 3
+ +#define MCE_STACK 4
+ +#define N_EXCEPTION_STACKS 4  /* hw limit: 7 */
+++=======
++ /*
++  * The index for the tss.ist[] array. The hardware limit is 7 entries.
++  */
++ #define	IST_INDEX_DF		0
++ #define	IST_INDEX_NMI		1
++ #define	IST_INDEX_DB		2
++ #define	IST_INDEX_MCE		3
+++>>>>>>> 3207426925d2 (x86/exceptions: Disconnect IST index and stack order)
+  
+  /*
+   * Set __PAGE_OFFSET to the most negative possible address +
+diff --cc arch/x86/kernel/cpu/common.c
+index 180f821f5d4d,143aceaf9a9a..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -1836,16 -1730,12 +1836,25 @@@ void cpu_init(void
+  	/*
+  	 * set up and load the per-CPU TSS
+  	 */
+++<<<<<<< HEAD
+ +	if (!oist->ist[0]) {
+ +		char *estacks = get_cpu_entry_area(cpu)->exception_stacks;
+ +
+ +		for (v = 0; v < N_EXCEPTION_STACKS; v++) {
+ +			estacks += exception_stack_sizes[v];
+ +			oist->ist[v] = t->x86_tss.ist[v] =
+ +					(unsigned long)estacks;
+ +			if (v == DEBUG_STACK-1)
+ +				per_cpu(debug_stack_addr, cpu) = (unsigned long)estacks;
+ +		}
+++=======
++ 	if (!t->x86_tss.ist[0]) {
++ 		t->x86_tss.ist[IST_INDEX_DF] = __this_cpu_ist_top_va(DF);
++ 		t->x86_tss.ist[IST_INDEX_NMI] = __this_cpu_ist_top_va(NMI);
++ 		t->x86_tss.ist[IST_INDEX_DB] = __this_cpu_ist_top_va(DB);
++ 		t->x86_tss.ist[IST_INDEX_MCE] = __this_cpu_ist_top_va(MCE);
++ 		per_cpu(debug_stack_addr, cpu) = t->x86_tss.ist[IST_INDEX_DB];
+++>>>>>>> 3207426925d2 (x86/exceptions: Disconnect IST index and stack order)
+  	}
+  
+  	t->x86_tss.io_bitmap_base = IO_BITMAP_OFFSET;
+diff --cc arch/x86/kernel/idt.c
+index cdf4700ac5e2,6d8917875f44..000000000000
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@@ -180,11 -183,11 +180,19 @@@ gate_desc debug_idt_table[IDT_ENTRIES] 
+   * cpu_init() when the TSS has been initialized.
+   */
+  static const __initconst struct idt_data ist_idts[] = {
+++<<<<<<< HEAD
+ +	ISTG(X86_TRAP_DB,	debug,		DEBUG_STACK),
+ +	ISTG(X86_TRAP_NMI,	nmi,		NMI_STACK),
+ +	ISTG(X86_TRAP_DF,	double_fault,	DOUBLEFAULT_STACK),
+ +#ifdef CONFIG_X86_MCE
+ +	ISTG(X86_TRAP_MC,	&machine_check,	MCE_STACK),
+++=======
++ 	ISTG(X86_TRAP_DB,	debug,		IST_INDEX_DB),
++ 	ISTG(X86_TRAP_NMI,	nmi,		IST_INDEX_NMI),
++ 	ISTG(X86_TRAP_DF,	double_fault,	IST_INDEX_DF),
++ #ifdef CONFIG_X86_MCE
++ 	ISTG(X86_TRAP_MC,	&machine_check,	IST_INDEX_MCE),
+++>>>>>>> 3207426925d2 (x86/exceptions: Disconnect IST index and stack order)
+  #endif
+  };
+  
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/include/asm/cpu_entry_area.h
+* Unmerged path arch/x86/include/asm/page_64_types.h
+diff --git a/arch/x86/include/asm/stacktrace.h b/arch/x86/include/asm/stacktrace.h
+index beef7ad9e43a..a8d0cdf48616 100644
+--- a/arch/x86/include/asm/stacktrace.h
++++ b/arch/x86/include/asm/stacktrace.h
+@@ -9,6 +9,8 @@
+ 
+ #include <linux/uaccess.h>
+ #include <linux/ptrace.h>
++
++#include <asm/cpu_entry_area.h>
+ #include <asm/switch_to.h>
+ 
+ enum stack_type {
+* Unmerged path arch/x86/kernel/cpu/common.c
+* Unmerged path arch/x86/kernel/idt.c
