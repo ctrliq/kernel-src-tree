@@ -1,0 +1,149 @@
+xfs: separate read-only variables in struct xfs_mount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit b0dff466c00975a3e3ec97e6b0266bfd3e4805d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/b0dff466.failed
+
+Seeing massive cpu usage from xfs_agino_range() on one machine;
+instruction level profiles look similar to another machine running
+the same workload, only one machine is consuming 10x as much CPU as
+the other and going much slower. The only real difference between
+the two machines is core count per socket. Both are running
+identical 16p/16GB virtual machine configurations
+
+Machine A:
+
+  25.83%  [k] xfs_agino_range
+  12.68%  [k] __xfs_dir3_data_check
+   6.95%  [k] xfs_verify_ino
+   6.78%  [k] xfs_dir2_data_entry_tag_p
+   3.56%  [k] xfs_buf_find
+   2.31%  [k] xfs_verify_dir_ino
+   2.02%  [k] xfs_dabuf_map.constprop.0
+   1.65%  [k] xfs_ag_block_count
+
+And takes around 13 minutes to remove 50 million inodes.
+
+Machine B:
+
+  13.90%  [k] __pv_queued_spin_lock_slowpath
+   3.76%  [k] do_raw_spin_lock
+   2.83%  [k] xfs_dir3_leaf_check_int
+   2.75%  [k] xfs_agino_range
+   2.51%  [k] __raw_callee_save___pv_queued_spin_unlock
+   2.18%  [k] __xfs_dir3_data_check
+   2.02%  [k] xfs_log_commit_cil
+
+And takes around 5m30s to remove 50 million inodes.
+
+Suspect is cacheline contention on m_sectbb_log which is used in one
+of the macros in xfs_agino_range. This is a read-only variable but
+shares a cacheline with m_active_trans which is a global atomic that
+gets bounced all around the machine.
+
+The workload is trying to run hundreds of thousands of transactions
+per second and hence cacheline contention will be occurring on this
+atomic counter. Hence xfs_agino_range() is likely just be an
+innocent bystander as the cache coherency protocol fights over the
+cacheline between CPU cores and sockets.
+
+On machine A, this rearrangement of the struct xfs_mount
+results in the profile changing to:
+
+   9.77%  [kernel]  [k] xfs_agino_range
+   6.27%  [kernel]  [k] __xfs_dir3_data_check
+   5.31%  [kernel]  [k] __pv_queued_spin_lock_slowpath
+   4.54%  [kernel]  [k] xfs_buf_find
+   3.79%  [kernel]  [k] do_raw_spin_lock
+   3.39%  [kernel]  [k] xfs_verify_ino
+   2.73%  [kernel]  [k] __raw_callee_save___pv_queued_spin_unlock
+
+Vastly less CPU usage in xfs_agino_range(), but still 3x the amount
+of machine B and still runs substantially slower than it should.
+
+Current rm -rf of 50 million files:
+
+		vanilla		patched
+machine A	13m20s		6m42s
+machine B	5m30s		5m02s
+
+It's an improvement, hence indicating that separation and further
+optimisation of read-only global filesystem data is worthwhile, but
+it clearly isn't the underlying issue causing this specific
+performance degradation.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit b0dff466c00975a3e3ec97e6b0266bfd3e4805d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_mount.h
+diff --cc fs/xfs/xfs_mount.h
+index 6bc49943ff28,c1f92c1847bb..000000000000
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@@ -55,42 -55,19 +55,39 @@@ struct xfs_error_cfg 
+  	long		retry_timeout;	/* in jiffies, -1 = infinite */
+  };
+  
++ /*
++  * The struct xfsmount layout is optimised to separate read-mostly variables
++  * from variables that are frequently modified. We put the read-mostly variables
++  * first, then place all the other variables at the end.
++  *
++  * Typically, read-mostly variables are those that are set at mount time and
++  * never changed again, or only change rarely as a result of things like sysfs
++  * knobs being tweaked.
++  */
+  typedef struct xfs_mount {
+- 	struct super_block	*m_super;
+- 
+- 	/*
+- 	 * Bitsets of per-fs metadata that have been checked and/or are sick.
+- 	 * Callers must hold m_sb_lock to access these two fields.
+- 	 */
+- 	uint8_t			m_fs_checked;
+- 	uint8_t			m_fs_sick;
+- 	/*
+- 	 * Bitsets of rt metadata that have been checked and/or are sick.
+- 	 * Callers must hold m_sb_lock to access this field.
+- 	 */
+- 	uint8_t			m_rt_checked;
+- 	uint8_t			m_rt_sick;
+- 
+- 	struct xfs_ail		*m_ail;		/* fs active log item list */
+- 
+  	struct xfs_sb		m_sb;		/* copy of fs superblock */
+++<<<<<<< HEAD
+ +	spinlock_t		m_sb_lock;	/* sb counter lock */
+ +	struct percpu_counter	m_icount;	/* allocated inodes counter */
+ +	struct percpu_counter	m_ifree;	/* free inodes counter */
+ +	struct percpu_counter	m_fdblocks;	/* free block counter */
+ +	/*
+ +	 * Count of data device blocks reserved for delayed allocations,
+ +	 * including indlen blocks.  Does not include allocated CoW staging
+ +	 * extents or anything related to the rt device.
+ +	 */
+ +	struct percpu_counter	m_delalloc_blks;
+ +	/*
+ +	 * Global count of allocation btree blocks in use across all AGs. Only
+ +	 * used when perag reservation is enabled. Helps prevent block
+ +	 * reservation from attempting to reserve allocation btree blocks.
+ +	 */
+ +	atomic64_t		m_allocbt_blks;
+ +
+++=======
++ 	struct super_block	*m_super;
++ 	struct xfs_ail		*m_ail;		/* fs active log item list */
+++>>>>>>> b0dff466c009 (xfs: separate read-only variables in struct xfs_mount)
+  	struct xfs_buf		*m_sb_bp;	/* buffer for superblock */
+  	char			*m_rtname;	/* realtime device name */
+  	char			*m_logname;	/* external log device name */
+* Unmerged path fs/xfs/xfs_mount.h
