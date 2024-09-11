@@ -21,6 +21,8 @@
  *
  */
 
+#include <linux/ceph/ceph_debug.h>
+
 #include "super.h"
 #include "cache.h"
 
