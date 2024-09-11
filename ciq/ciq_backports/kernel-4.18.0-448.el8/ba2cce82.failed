@@ -1,0 +1,149 @@
+dm verity: conditionally enable branching for "try_verify_in_tasklet"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit ba2cce82ba1ba74cd83bb3fd0e47849af4f2a605
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/ba2cce82.failed
+
+Use jump_label to limit the need for branching unless the optional
+"try_verify_in_tasklet" feature is used.
+
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit ba2cce82ba1ba74cd83bb3fd0e47849af4f2a605)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-verity-target.c
+diff --cc drivers/md/dm-verity-target.c
+index 8f0dc33763bb,d287d01b7684..000000000000
+--- a/drivers/md/dm-verity-target.c
++++ b/drivers/md/dm-verity-target.c
+@@@ -19,6 -18,8 +19,11 @@@
+  #include "dm-verity-verify-sig.h"
+  #include <linux/module.h>
+  #include <linux/reboot.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/scatterlist.h>
++ #include <linux/jump_label.h>
+++>>>>>>> ba2cce82ba1b (dm verity: conditionally enable branching for "try_verify_in_tasklet")
+  
+  #define DM_MSG_PREFIX			"verity"
+  
+@@@ -286,7 -290,19 +293,23 @@@ static int verity_verify_level(struct d
+  
+  	verity_hash_at_level(v, block, level, &hash_block, &offset);
+  
+++<<<<<<< HEAD
+ +	data = dm_bufio_read(v->bufio, hash_block, &buf);
+++=======
++ 	if (static_branch_unlikely(&use_tasklet_enabled) && io->in_tasklet) {
++ 		data = dm_bufio_get(v->bufio, hash_block, &buf);
++ 		if (data == NULL) {
++ 			/*
++ 			 * In tasklet and the hash was not in the bufio cache.
++ 			 * Return early and resume execution from a work-queue
++ 			 * to read the hash from disk.
++ 			 */
++ 			return -EAGAIN;
++ 		}
++ 	} else
++ 		data = dm_bufio_read(v->bufio, hash_block, &buf);
++ 
+++>>>>>>> ba2cce82ba1b (dm verity: conditionally enable branching for "try_verify_in_tasklet")
+  	if (IS_ERR(data))
+  		return PTR_ERR(data);
+  
+@@@ -307,6 -323,15 +330,18 @@@
+  		if (likely(memcmp(verity_io_real_digest(v, io), want_digest,
+  				  v->digest_size) == 0))
+  			aux->hash_verified = 1;
+++<<<<<<< HEAD
+++=======
++ 		else if (static_branch_unlikely(&use_tasklet_enabled) &&
++ 			 io->in_tasklet) {
++ 			/*
++ 			 * Error handling code (FEC included) cannot be run in a
++ 			 * tasklet since it may sleep, so fallback to work-queue.
++ 			 */
++ 			r = -EAGAIN;
++ 			goto release_ret_r;
++ 		}
+++>>>>>>> ba2cce82ba1b (dm verity: conditionally enable branching for "try_verify_in_tasklet")
+  		else if (verity_fec_decode(v, io,
+  					   DM_VERITY_BLOCK_TYPE_METADATA,
+  					   hash_block, data, NULL) == 0)
+@@@ -527,8 -557,15 +562,18 @@@ static int verity_verify_io(struct dm_v
+  			if (v->validated_blocks)
+  				set_bit(cur_block, v->validated_blocks);
+  			continue;
+++<<<<<<< HEAD
+++=======
++ 		} else if (static_branch_unlikely(&use_tasklet_enabled) &&
++ 			   io->in_tasklet) {
++ 			/*
++ 			 * Error handling code (FEC included) cannot be run in a
++ 			 * tasklet since it may sleep, so fallback to work-queue.
++ 			 */
++ 			return -EAGAIN;
+++>>>>>>> ba2cce82ba1b (dm verity: conditionally enable branching for "try_verify_in_tasklet")
+  		} else if (verity_fec_decode(v, io, DM_VERITY_BLOCK_TYPE_DATA,
+ -					     cur_block, NULL, &start) == 0) {
+ +					   cur_block, NULL, &start) == 0) {
+  			continue;
+  		} else {
+  			if (bio->bi_status) {
+@@@ -566,7 -603,8 +611,12 @@@ static void verity_finish_io(struct dm_
+  	bio->bi_end_io = io->orig_bi_end_io;
+  	bio->bi_status = status;
+  
+++<<<<<<< HEAD
+ +	verity_fec_finish_io(io);
+++=======
++ 	if (!static_branch_unlikely(&use_tasklet_enabled) || !io->in_tasklet)
++ 		verity_fec_finish_io(io);
+++>>>>>>> ba2cce82ba1b (dm verity: conditionally enable branching for "try_verify_in_tasklet")
+  
+  	bio_endio(bio);
+  }
+@@@ -588,8 -646,13 +638,18 @@@ static void verity_end_io(struct bio *b
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_WORK(&io->work, verity_work);
+ +	queue_work(io->v->verify_wq, &io->work);
+++=======
++ 	if (static_branch_unlikely(&use_tasklet_enabled) && io->v->use_tasklet) {
++ 		tasklet_init(&io->tasklet, verity_tasklet, (unsigned long)io);
++ 		tasklet_schedule(&io->tasklet);
++ 	} else {
++ 		INIT_WORK(&io->work, verity_work);
++ 		queue_work(io->v->verify_wq, &io->work);
++ 	}
+++>>>>>>> ba2cce82ba1b (dm verity: conditionally enable branching for "try_verify_in_tasklet")
+  }
+  
+  /*
+@@@ -969,7 -1086,14 +1032,15 @@@ static int verity_parse_opt_args(struc
+  				return r;
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		} else if (!strcasecmp(arg_name, DM_VERITY_OPT_TASKLET_VERIFY)) {
++ 			v->use_tasklet = true;
++ 			static_branch_inc(&use_tasklet_enabled);
++ 			continue;
++ 
+++>>>>>>> ba2cce82ba1b (dm verity: conditionally enable branching for "try_verify_in_tasklet")
+  		} else if (verity_is_fec_opt_arg(arg_name)) {
+ -			if (only_modifier_opts)
+ -				continue;
+  			r = verity_fec_parse_opt_args(as, v, &argc, arg_name);
+  			if (r)
+  				return r;
+* Unmerged path drivers/md/dm-verity-target.c
