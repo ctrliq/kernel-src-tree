@@ -238,7 +238,10 @@ static void ilk_load_csc_matrix(struct drm_crtc_state *crtc_state)
 		I915_WRITE(PIPE_CSC_POSTOFF_ME(pipe), postoff);
 		I915_WRITE(PIPE_CSC_POSTOFF_LO(pipe), postoff);
 
-		I915_WRITE(PIPE_CSC_MODE(pipe), 0);
+		if (INTEL_GEN(dev_priv) >= 11)
+			I915_WRITE(PIPE_CSC_MODE(pipe), ICL_CSC_ENABLE);
+		else
+			I915_WRITE(PIPE_CSC_MODE(pipe), 0);
 	} else {
 		uint32_t mode = CSC_MODE_YUV_TO_RGB;
 
