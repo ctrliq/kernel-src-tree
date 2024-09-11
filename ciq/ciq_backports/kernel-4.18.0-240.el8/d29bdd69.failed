@@ -1,0 +1,213 @@
+net: schedule: add action gate offloading
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] schedule: add action gate offloading (Ivan Vecera) [1824071]
+Rebuild_FUZZ: 93.51%
+commit-author Po Liu <Po.Liu@nxp.com>
+commit d29bdd69ecdd70e8e3c2268fc8e188d6ab55e54a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d29bdd69.failed
+
+Add the gate action to the flow action entry. Add the gate parameters to
+the tc_setup_flow_action() queueing to the entries of flow_action_entry
+array provide to the driver.
+
+	Signed-off-by: Po Liu <Po.Liu@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d29bdd69ecdd70e8e3c2268fc8e188d6ab55e54a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow_offload.h
+diff --cc include/net/flow_offload.h
+index 8e8fd14301d6,94a30fe02e6d..000000000000
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@@ -145,6 -146,9 +145,11 @@@ enum flow_action_id 
+  	FLOW_ACTION_MPLS_PUSH,
+  	FLOW_ACTION_MPLS_POP,
+  	FLOW_ACTION_MPLS_MANGLE,
+++<<<<<<< HEAD
+++=======
++ 	FLOW_ACTION_GATE,
++ 	NUM_FLOW_ACTIONS,
+++>>>>>>> d29bdd69ecdd (net: schedule: add action gate offloading)
+  };
+  
+  /* This is mirroring enum pedit_header_type definition for easy mapping between
+* Unmerged path include/net/flow_offload.h
+diff --git a/include/net/tc_act/tc_gate.h b/include/net/tc_act/tc_gate.h
+index 330ad8b02495..8bc6be81a7ad 100644
+--- a/include/net/tc_act/tc_gate.h
++++ b/include/net/tc_act/tc_gate.h
+@@ -7,6 +7,13 @@
+ #include <net/act_api.h>
+ #include <linux/tc_act/tc_gate.h>
+ 
++struct action_gate_entry {
++	u8			gate_state;
++	u32			interval;
++	s32			ipv;
++	s32			maxoctets;
++};
++
+ struct tcfg_gate_entry {
+ 	int			index;
+ 	u8			gate_state;
+@@ -44,4 +51,96 @@ struct tcf_gate {
+ 
+ #define to_gate(a) ((struct tcf_gate *)a)
+ 
++static inline bool is_tcf_gate(const struct tc_action *a)
++{
++#ifdef CONFIG_NET_CLS_ACT
++	if (a->ops && a->ops->id == TCA_ID_GATE)
++		return true;
++#endif
++	return false;
++}
++
++static inline u32 tcf_gate_index(const struct tc_action *a)
++{
++	return a->tcfa_index;
++}
++
++static inline s32 tcf_gate_prio(const struct tc_action *a)
++{
++	s32 tcfg_prio;
++
++	tcfg_prio = to_gate(a)->param.tcfg_priority;
++
++	return tcfg_prio;
++}
++
++static inline u64 tcf_gate_basetime(const struct tc_action *a)
++{
++	u64 tcfg_basetime;
++
++	tcfg_basetime = to_gate(a)->param.tcfg_basetime;
++
++	return tcfg_basetime;
++}
++
++static inline u64 tcf_gate_cycletime(const struct tc_action *a)
++{
++	u64 tcfg_cycletime;
++
++	tcfg_cycletime = to_gate(a)->param.tcfg_cycletime;
++
++	return tcfg_cycletime;
++}
++
++static inline u64 tcf_gate_cycletimeext(const struct tc_action *a)
++{
++	u64 tcfg_cycletimeext;
++
++	tcfg_cycletimeext = to_gate(a)->param.tcfg_cycletime_ext;
++
++	return tcfg_cycletimeext;
++}
++
++static inline u32 tcf_gate_num_entries(const struct tc_action *a)
++{
++	u32 num_entries;
++
++	num_entries = to_gate(a)->param.num_entries;
++
++	return num_entries;
++}
++
++static inline struct action_gate_entry
++			*tcf_gate_get_list(const struct tc_action *a)
++{
++	struct action_gate_entry *oe;
++	struct tcf_gate_params *p;
++	struct tcfg_gate_entry *entry;
++	u32 num_entries;
++	int i = 0;
++
++	p = &to_gate(a)->param;
++	num_entries = p->num_entries;
++
++	list_for_each_entry(entry, &p->entries, list)
++		i++;
++
++	if (i != num_entries)
++		return NULL;
++
++	oe = kcalloc(num_entries, sizeof(*oe), GFP_ATOMIC);
++	if (!oe)
++		return NULL;
++
++	i = 0;
++	list_for_each_entry(entry, &p->entries, list) {
++		oe[i].gate_state = entry->gate_state;
++		oe[i].interval = entry->interval;
++		oe[i].ipv = entry->ipv;
++		oe[i].maxoctets = entry->maxoctets;
++		i++;
++	}
++
++	return oe;
++}
+ #endif
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index af60dafe4e7f..79783e4c794c 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -44,6 +44,7 @@
+ #include <net/tc_act/tc_skbedit.h>
+ #include <net/tc_act/tc_ct.h>
+ #include <net/tc_act/tc_mpls.h>
++#include <net/tc_act/tc_gate.h>
+ #include <net/flow_offload.h>
+ 
+ extern const struct nla_policy rtm_tca_policy[TCA_MAX + 1];
+@@ -3531,6 +3532,27 @@ static void tcf_sample_get_group(struct flow_action_entry *entry,
+ #endif
+ }
+ 
++static void tcf_gate_entry_destructor(void *priv)
++{
++	struct action_gate_entry *oe = priv;
++
++	kfree(oe);
++}
++
++static int tcf_gate_get_entries(struct flow_action_entry *entry,
++				const struct tc_action *act)
++{
++	entry->gate.entries = tcf_gate_get_list(act);
++
++	if (!entry->gate.entries)
++		return -EINVAL;
++
++	entry->destructor = tcf_gate_entry_destructor;
++	entry->destructor_priv = entry->gate.entries;
++
++	return 0;
++}
++
+ int tc_setup_flow_action(struct flow_action *flow_action,
+ 			 const struct tcf_exts *exts)
+ {
+@@ -3676,6 +3698,17 @@ int tc_setup_flow_action(struct flow_action *flow_action,
+ 		} else if (is_tcf_skbedit_priority(act)) {
+ 			entry->id = FLOW_ACTION_PRIORITY;
+ 			entry->priority = tcf_skbedit_priority(act);
++		} else if (is_tcf_gate(act)) {
++			entry->id = FLOW_ACTION_GATE;
++			entry->gate.index = tcf_gate_index(act);
++			entry->gate.prio = tcf_gate_prio(act);
++			entry->gate.basetime = tcf_gate_basetime(act);
++			entry->gate.cycletime = tcf_gate_cycletime(act);
++			entry->gate.cycletimeext = tcf_gate_cycletimeext(act);
++			entry->gate.num_entries = tcf_gate_num_entries(act);
++			err = tcf_gate_get_entries(entry, act);
++			if (err)
++				goto err_out;
+ 		} else {
+ 			err = -EOPNOTSUPP;
+ 			goto err_out_locked;
