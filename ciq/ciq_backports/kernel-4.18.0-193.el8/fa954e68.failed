@@ -1,0 +1,329 @@
+iommu/vt-d: Delegate the dma domain to upper layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] vt-d: Delegate the dma domain to upper layer (Jerry Snitselaar) [1742234]
+Rebuild_FUZZ: 93.62%
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit fa954e683178949e3c50a7d40c176e7b951bb22d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/fa954e68.failed
+
+This allows the iommu generic layer to allocate a dma domain and
+attach it to a device through the iommu api's. With all types of
+domains being delegated to upper layer, we can remove an internal
+flag which was used to distinguish domains mananged internally or
+externally.
+
+	Signed-off-by: James Sewart <jamessewart@arista.com>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit fa954e683178949e3c50a7d40c176e7b951bb22d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 844e71353b6d,479fb60aaad0..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -4543,10 -4560,7 +4505,14 @@@ static int device_notifier(struct notif
+  		if (!domain)
+  			return 0;
+  
+++<<<<<<< HEAD
+ +		dmar_remove_one_dev_info(domain, dev);
+ +		if (!domain_type_is_vm_or_si(domain) &&
+ +		    list_empty(&domain->devices))
+ +			domain_exit(domain);
+++=======
++ 		dmar_remove_one_dev_info(dev);
+++>>>>>>> fa954e683178 (iommu/vt-d: Delegate the dma domain to upper layer)
+  	} else if (action == BUS_NOTIFY_ADD_DEVICE) {
+  		if (iommu_should_identity_map(dev, 1))
+  			domain_add_dev_info(si_domain, dev);
+@@@ -5015,62 -5028,184 +4981,88 @@@ static struct iommu_domain *intel_iommu
+  	struct dmar_domain *dmar_domain;
+  	struct iommu_domain *domain;
+  
+++<<<<<<< HEAD
+ +	if (type != IOMMU_DOMAIN_UNMANAGED)
+ +		return NULL;
+++=======
++ 	switch (type) {
++ 	case IOMMU_DOMAIN_DMA:
++ 	/* fallthrough */
++ 	case IOMMU_DOMAIN_UNMANAGED:
++ 		dmar_domain = alloc_domain(0);
++ 		if (!dmar_domain) {
++ 			pr_err("Can't allocate dmar_domain\n");
++ 			return NULL;
++ 		}
++ 		if (md_domain_init(dmar_domain, DEFAULT_DOMAIN_ADDRESS_WIDTH)) {
++ 			pr_err("Domain initialization failed\n");
++ 			domain_exit(dmar_domain);
++ 			return NULL;
++ 		}
++ 
++ 		if (type == IOMMU_DOMAIN_DMA &&
++ 		    init_iova_flush_queue(&dmar_domain->iovad,
++ 					  iommu_flush_iova, iova_entry_free)) {
++ 			pr_warn("iova flush queue initialization failed\n");
++ 			intel_iommu_strict = 1;
++ 		}
++ 
++ 		domain_update_iommu_cap(dmar_domain);
+++>>>>>>> fa954e683178 (iommu/vt-d: Delegate the dma domain to upper layer)
+  
+ -		domain = &dmar_domain->domain;
+ -		domain->geometry.aperture_start = 0;
+ -		domain->geometry.aperture_end   =
+ -				__DOMAIN_MAX_ADDR(dmar_domain->gaw);
+ -		domain->geometry.force_aperture = true;
+ -
+ -		return domain;
+ -	case IOMMU_DOMAIN_IDENTITY:
+ -		return &si_domain->domain;
+ -	default:
+ +	dmar_domain = alloc_domain(DOMAIN_FLAG_VIRTUAL_MACHINE);
+ +	if (!dmar_domain) {
+ +		pr_err("Can't allocate dmar_domain\n");
+  		return NULL;
+  	}
+ +	if (md_domain_init(dmar_domain, DEFAULT_DOMAIN_ADDRESS_WIDTH)) {
+ +		pr_err("Domain initialization failed\n");
+ +		domain_exit(dmar_domain);
+ +		return NULL;
+ +	}
+ +	domain_update_iommu_cap(dmar_domain);
+  
+ -	return NULL;
+ -}
+ -
+ -static void intel_iommu_domain_free(struct iommu_domain *domain)
+ -{
+ -	if (domain != &si_domain->domain)
+ -		domain_exit(to_dmar_domain(domain));
+ -}
+ -
+ -/*
+ - * Check whether a @domain could be attached to the @dev through the
+ - * aux-domain attach/detach APIs.
+ - */
+ -static inline bool
+ -is_aux_domain(struct device *dev, struct iommu_domain *domain)
+ -{
+ -	struct device_domain_info *info = dev->archdata.iommu;
+ -
+ -	return info && info->auxd_enabled &&
+ -			domain->type == IOMMU_DOMAIN_UNMANAGED;
+ -}
+ -
+ -static void auxiliary_link_device(struct dmar_domain *domain,
+ -				  struct device *dev)
+ -{
+ -	struct device_domain_info *info = dev->archdata.iommu;
+ -
+ -	assert_spin_locked(&device_domain_lock);
+ -	if (WARN_ON(!info))
+ -		return;
+ +	domain = &dmar_domain->domain;
+ +	domain->geometry.aperture_start = 0;
+ +	domain->geometry.aperture_end   = __DOMAIN_MAX_ADDR(dmar_domain->gaw);
+ +	domain->geometry.force_aperture = true;
+  
+ -	domain->auxd_refcnt++;
+ -	list_add(&domain->auxd, &info->auxiliary_domains);
+ +	return domain;
+  }
+  
+ -static void auxiliary_unlink_device(struct dmar_domain *domain,
+ -				    struct device *dev)
+ +static void intel_iommu_domain_free(struct iommu_domain *domain)
+  {
+ -	struct device_domain_info *info = dev->archdata.iommu;
+ -
+ -	assert_spin_locked(&device_domain_lock);
+ -	if (WARN_ON(!info))
+ -		return;
+ -
+ -	list_del(&domain->auxd);
+ -	domain->auxd_refcnt--;
+ -
+ -	if (!domain->auxd_refcnt && domain->default_pasid > 0)
+ -		intel_pasid_free_id(domain->default_pasid);
+ +	domain_exit(to_dmar_domain(domain));
+  }
+  
+ -static int aux_domain_add_dev(struct dmar_domain *domain,
+ -			      struct device *dev)
+ +static int intel_iommu_attach_device(struct iommu_domain *domain,
+ +				     struct device *dev)
+  {
+ -	int ret;
+ -	u8 bus, devfn;
+ -	unsigned long flags;
+ +	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
+  	struct intel_iommu *iommu;
+ +	int addr_width;
+ +	u8 bus, devfn;
+  
+ -	iommu = device_to_iommu(dev, &bus, &devfn);
+ -	if (!iommu)
+ -		return -ENODEV;
+ -
+ -	if (domain->default_pasid <= 0) {
+ -		int pasid;
+ -
+ -		pasid = intel_pasid_alloc_id(domain, PASID_MIN,
+ -					     pci_max_pasids(to_pci_dev(dev)),
+ -					     GFP_KERNEL);
+ -		if (pasid <= 0) {
+ -			pr_err("Can't allocate default pasid\n");
+ -			return -ENODEV;
+ -		}
+ -		domain->default_pasid = pasid;
+ +	if (device_is_rmrr_locked(dev)) {
+ +		dev_warn(dev, "Device is ineligible for IOMMU domain attach due to platform RMRR requirement.  Contact your platform vendor.\n");
+ +		return -EPERM;
+  	}
+  
+ -	spin_lock_irqsave(&device_domain_lock, flags);
+ -	/*
+ -	 * iommu->lock must be held to attach domain to iommu and setup the
+ -	 * pasid entry for second level translation.
+ -	 */
+ -	spin_lock(&iommu->lock);
+ -	ret = domain_attach_iommu(domain, iommu);
+ -	if (ret)
+ -		goto attach_failed;
+ -
+ -	/* Setup the PASID entry for mediated devices: */
+ -	ret = intel_pasid_setup_second_level(iommu, domain, dev,
+ -					     domain->default_pasid);
+ -	if (ret)
+ -		goto table_failed;
+ -	spin_unlock(&iommu->lock);
+ -
+ -	auxiliary_link_device(domain, dev);
+ -
+ -	spin_unlock_irqrestore(&device_domain_lock, flags);
+ -
+ -	return 0;
+ -
+ -table_failed:
+ -	domain_detach_iommu(domain, iommu);
+ -attach_failed:
+ -	spin_unlock(&iommu->lock);
+ -	spin_unlock_irqrestore(&device_domain_lock, flags);
+ -	if (!domain->auxd_refcnt && domain->default_pasid > 0)
+ -		intel_pasid_free_id(domain->default_pasid);
+ -
+ -	return ret;
+ -}
+ -
+ -static void aux_domain_remove_dev(struct dmar_domain *domain,
+ -				  struct device *dev)
+ -{
+ -	struct device_domain_info *info;
+ -	struct intel_iommu *iommu;
+ -	unsigned long flags;
+ -
+ -	if (!is_aux_domain(dev, &domain->domain))
+ -		return;
+ -
+ -	spin_lock_irqsave(&device_domain_lock, flags);
+ -	info = dev->archdata.iommu;
+ -	iommu = info->iommu;
+ -
+ -	auxiliary_unlink_device(domain, dev);
+ -
+ -	spin_lock(&iommu->lock);
+ -	intel_pasid_tear_down_entry(iommu, dev, domain->default_pasid);
+ -	domain_detach_iommu(domain, iommu);
+ -	spin_unlock(&iommu->lock);
+ +	/* normally dev is not mapped */
+ +	if (unlikely(domain_context_mapped(dev))) {
+ +		struct dmar_domain *old_domain;
+  
+ -	spin_unlock_irqrestore(&device_domain_lock, flags);
+ -}
+ +		old_domain = find_domain(dev);
+ +		if (old_domain) {
+ +			rcu_read_lock();
+ +			dmar_remove_one_dev_info(old_domain, dev);
+ +			rcu_read_unlock();
+  
+ -static int prepare_domain_attach_device(struct iommu_domain *domain,
+ -					struct device *dev)
+ -{
+ -	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
+ -	struct intel_iommu *iommu;
+ -	int addr_width;
+ -	u8 bus, devfn;
+ +			if (!domain_type_is_vm_or_si(old_domain) &&
+ +			     list_empty(&old_domain->devices))
+ +				domain_exit(old_domain);
+ +		}
+ +	}
+  
+  	iommu = device_to_iommu(dev, &bus, &devfn);
+  	if (!iommu)
+@@@ -5104,7 -5239,51 +5096,55 @@@
+  		dmar_domain->agaw--;
+  	}
+  
+++<<<<<<< HEAD
+ +	return domain_add_dev_info(dmar_domain, dev);
+++=======
++ 	return 0;
++ }
++ 
++ static int intel_iommu_attach_device(struct iommu_domain *domain,
++ 				     struct device *dev)
++ {
++ 	int ret;
++ 
++ 	if (device_is_rmrr_locked(dev)) {
++ 		dev_warn(dev, "Device is ineligible for IOMMU domain attach due to platform RMRR requirement.  Contact your platform vendor.\n");
++ 		return -EPERM;
++ 	}
++ 
++ 	if (is_aux_domain(dev, domain))
++ 		return -EPERM;
++ 
++ 	/* normally dev is not mapped */
++ 	if (unlikely(domain_context_mapped(dev))) {
++ 		struct dmar_domain *old_domain;
++ 
++ 		old_domain = find_domain(dev);
++ 		if (old_domain)
++ 			dmar_remove_one_dev_info(dev);
++ 	}
++ 
++ 	ret = prepare_domain_attach_device(domain, dev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return domain_add_dev_info(to_dmar_domain(domain), dev);
++ }
++ 
++ static int intel_iommu_aux_attach_device(struct iommu_domain *domain,
++ 					 struct device *dev)
++ {
++ 	int ret;
++ 
++ 	if (!is_aux_domain(dev, domain))
++ 		return -EPERM;
++ 
++ 	ret = prepare_domain_attach_device(domain, dev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return aux_domain_add_dev(to_dmar_domain(domain), dev);
+++>>>>>>> fa954e683178 (iommu/vt-d: Delegate the dma domain to upper layer)
+  }
+  
+  static void intel_iommu_detach_device(struct iommu_domain *domain,
+* Unmerged path drivers/iommu/intel-iommu.c
