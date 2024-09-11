@@ -1,0 +1,496 @@
+LSM: Infrastructure management of the file security
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Casey Schaufler <casey@schaufler-ca.com>
+commit 33bf60cabcc7687b194a689b068b65e9ecd556be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/33bf60ca.failed
+
+Move management of the file->f_security blob out of the
+individual security modules and into the infrastructure.
+The modules no longer allocate or free the data, instead
+they tell the infrastructure how much space they require.
+
+	Signed-off-by: Casey Schaufler <casey@schaufler-ca.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+[kees: adjusted for ordered init series]
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit 33bf60cabcc7687b194a689b068b65e9ecd556be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/lsm_hooks.h
+#	security/apparmor/lsm.c
+#	security/security.c
+#	security/selinux/hooks.c
+#	security/smack/smack.h
+#	security/smack/smack_lsm.c
+diff --cc include/linux/lsm_hooks.h
+index 84380f3a8dab,e8cef019b645..000000000000
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@@ -1479,10 -2028,12 +1479,17 @@@ struct security_hook_list 
+  } __randomize_layout;
+  
+  /*
+ - * Security blob size or offset data.
+ + * LSM_RET_VOID is used as the default value in LSM_HOOK definitions for void
+ + * LSM hooks (in include/linux/lsm_hook_defs.h).
+   */
+++<<<<<<< HEAD
+ +#define LSM_RET_VOID ((void) 0)
+++=======
++ struct lsm_blob_sizes {
++ 	int	lbs_cred;
++ 	int	lbs_file;
++ };
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  
+  /*
+   * Initializing a security_hook_list structure takes
+diff --cc security/apparmor/lsm.c
+index 85c05989635b,6821187b06ad..000000000000
+--- a/security/apparmor/lsm.c
++++ b/security/apparmor/lsm.c
+@@@ -1126,6 -1137,28 +1126,31 @@@ static void apparmor_sock_graft(struct 
+  		ctx->label = aa_get_current_label();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NETWORK_SECMARK
++ static int apparmor_inet_conn_request(struct sock *sk, struct sk_buff *skb,
++ 				      struct request_sock *req)
++ {
++ 	struct aa_sk_ctx *ctx = SK_CTX(sk);
++ 
++ 	if (!skb->secmark)
++ 		return 0;
++ 
++ 	return apparmor_secmark_check(ctx->label, OP_CONNECT, AA_MAY_CONNECT,
++ 				      skb->secmark, sk);
++ }
++ #endif
++ 
++ /*
++  * The cred blob is a pointer to, not an instance of, an aa_task_ctx.
++  */
++ struct lsm_blob_sizes apparmor_blob_sizes __lsm_ro_after_init = {
++ 	.lbs_cred = sizeof(struct aa_task_ctx *),
++ 	.lbs_file = sizeof(struct aa_file_ctx),
++ };
++ 
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  static struct security_hook_list apparmor_hooks[] __lsm_ro_after_init = {
+  	LSM_HOOK_INIT(ptrace_access_check, apparmor_ptrace_access_check),
+  	LSM_HOOK_INIT(ptrace_traceme, apparmor_ptrace_traceme),
+diff --cc security/security.c
+index 8555aece1bce,f32d7d2075c6..000000000000
+--- a/security/security.c
++++ b/security/security.c
+@@@ -41,9 -38,13 +41,11 @@@
+  #define LSM_COUNT (__end_lsm_info - __start_lsm_info)
+  
+  struct security_hook_heads security_hook_heads __lsm_ro_after_init;
+ -static ATOMIC_NOTIFIER_HEAD(lsm_notifier_chain);
+ +static BLOCKING_NOTIFIER_HEAD(blocking_lsm_notifier_chain);
+  
++ static struct kmem_cache *lsm_file_cache;
++ 
+  char *lsm_names;
+ -static struct lsm_blob_sizes blob_sizes __lsm_ro_after_init;
+ -
+  /* Boot-time LSM user choice */
+  static __initdata const char *chosen_lsm_order;
+  static __initdata const char *chosen_major_lsm;
+@@@ -142,6 -143,26 +144,29 @@@ static bool __init lsm_allowed(struct l
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __init lsm_set_blob_size(int *need, int *lbs)
++ {
++ 	int offset;
++ 
++ 	if (*need > 0) {
++ 		offset = *lbs;
++ 		*lbs += *need;
++ 		*need = offset;
++ 	}
++ }
++ 
++ static void __init lsm_set_blob_sizes(struct lsm_blob_sizes *needed)
++ {
++ 	if (!needed)
++ 		return;
++ 
++ 	lsm_set_blob_size(&needed->lbs_cred, &blob_sizes.lbs_cred);
++ 	lsm_set_blob_size(&needed->lbs_file, &blob_sizes.lbs_file);
++ }
++ 
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  /* Prepare LSM for initialization. */
+  static void __init prepare_lsm(struct lsm_info *lsm)
+  {
+@@@ -262,6 -281,17 +287,20 @@@ static void __init ordered_lsm_init(voi
+  	for (lsm = ordered_lsms; *lsm; lsm++)
+  		prepare_lsm(*lsm);
+  
+++<<<<<<< HEAD
+++=======
++ 	init_debug("cred blob size     = %d\n", blob_sizes.lbs_cred);
++ 	init_debug("file blob size     = %d\n", blob_sizes.lbs_file);
++ 
++ 	/*
++ 	 * Create any kmem_caches needed for blobs
++ 	 */
++ 	if (blob_sizes.lbs_file)
++ 		lsm_file_cache = kmem_cache_create("lsm_file_cache",
++ 						   blob_sizes.lbs_file, 0,
++ 						   SLAB_PANIC, NULL);
++ 
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  	for (lsm = ordered_lsms; *lsm; lsm++)
+  		initialize_lsm(*lsm);
+  
+@@@ -371,46 -401,86 +410,67 @@@ void __init security_add_hooks(struct s
+  		panic("%s - Cannot get early memory.\n", __func__);
+  }
+  
+ -int call_lsm_notifier(enum lsm_event event, void *data)
+ +int call_blocking_lsm_notifier(enum lsm_event event, void *data)
+  {
+ -	return atomic_notifier_call_chain(&lsm_notifier_chain, event, data);
+ +	return blocking_notifier_call_chain(&blocking_lsm_notifier_chain,
+ +					    event, data);
+  }
+ -EXPORT_SYMBOL(call_lsm_notifier);
+ +EXPORT_SYMBOL(call_blocking_lsm_notifier);
+  
+ -int register_lsm_notifier(struct notifier_block *nb)
+ +int register_blocking_lsm_notifier(struct notifier_block *nb)
+  {
+ -	return atomic_notifier_chain_register(&lsm_notifier_chain, nb);
+ +	return blocking_notifier_chain_register(&blocking_lsm_notifier_chain,
+ +						nb);
+  }
+ -EXPORT_SYMBOL(register_lsm_notifier);
+ +EXPORT_SYMBOL(register_blocking_lsm_notifier);
+  
+ -int unregister_lsm_notifier(struct notifier_block *nb)
+ +int unregister_blocking_lsm_notifier(struct notifier_block *nb)
+  {
+ -	return atomic_notifier_chain_unregister(&lsm_notifier_chain, nb);
+ +	return blocking_notifier_chain_unregister(&blocking_lsm_notifier_chain,
+ +						  nb);
+  }
+ -EXPORT_SYMBOL(unregister_lsm_notifier);
+ +EXPORT_SYMBOL(unregister_blocking_lsm_notifier);
+  
+ -/**
+ - * lsm_cred_alloc - allocate a composite cred blob
+ - * @cred: the cred that needs a blob
+ - * @gfp: allocation type
+ +/*
+ + * The default value of the LSM hook is defined in linux/lsm_hook_defs.h and
+ + * can be accessed with:
+   *
+ - * Allocate the cred blob for all the modules
+ + *	LSM_RET_DEFAULT(<hook_name>)
+   *
+ - * Returns 0, or -ENOMEM if memory can't be allocated.
+ + * The macros below define static constants for the default value of each
+ + * LSM hook.
+   */
+ -static int lsm_cred_alloc(struct cred *cred, gfp_t gfp)
+ -{
+ -	if (blob_sizes.lbs_cred == 0) {
+ -		cred->security = NULL;
+ -		return 0;
+ -	}
+ +#define LSM_RET_DEFAULT(NAME) (NAME##_default)
+ +#define DECLARE_LSM_RET_DEFAULT_void(DEFAULT, NAME)
+ +#define DECLARE_LSM_RET_DEFAULT_int(DEFAULT, NAME) \
+ +	static const int LSM_RET_DEFAULT(NAME) = (DEFAULT);
+ +#define LSM_HOOK(RET, DEFAULT, NAME, ...) \
+ +	DECLARE_LSM_RET_DEFAULT_##RET(DEFAULT, NAME)
+  
+ -	cred->security = kzalloc(blob_sizes.lbs_cred, gfp);
+ -	if (cred->security == NULL)
+ -		return -ENOMEM;
+ -	return 0;
+ -}
+ -
+ -/**
+ - * lsm_early_cred - during initialization allocate a composite cred blob
+ - * @cred: the cred that needs a blob
+ - *
+ - * Allocate the cred blob for all the modules if it's not already there
+ - */
+ -void __init lsm_early_cred(struct cred *cred)
+ -{
+ -	int rc;
+ -
+ -	if (cred == NULL)
+ -		panic("%s: NULL cred.\n", __func__);
+ -	if (cred->security != NULL)
+ -		return;
+ -	rc = lsm_cred_alloc(cred, GFP_KERNEL);
+ -	if (rc)
+ -		panic("%s: Early cred alloc failed.\n", __func__);
+ -}
+ +#include <linux/lsm_hook_defs.h>
+ +#undef LSM_HOOK
+  
++ /**
++  * lsm_file_alloc - allocate a composite file blob
++  * @file: the file that needs a blob
++  *
++  * Allocate the file blob for all the modules
++  *
++  * Returns 0, or -ENOMEM if memory can't be allocated.
++  */
++ static int lsm_file_alloc(struct file *file)
++ {
++ 	if (!lsm_file_cache) {
++ 		file->f_security = NULL;
++ 		return 0;
++ 	}
++ 
++ 	file->f_security = kmem_cache_zalloc(lsm_file_cache, GFP_KERNEL);
++ 	if (file->f_security == NULL)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
+  /*
+   * Hook list operation macros.
+   *
+@@@ -1257,7 -1309,15 +1332,19 @@@ void security_task_free(struct task_str
+  
+  int security_cred_alloc_blank(struct cred *cred, gfp_t gfp)
+  {
+++<<<<<<< HEAD
+ +	return call_int_hook(cred_alloc_blank, 0, cred, gfp);
+++=======
++ 	int rc = lsm_cred_alloc(cred, gfp);
++ 
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = call_int_hook(cred_alloc_blank, 0, cred, gfp);
++ 	if (unlikely(rc))
++ 		security_cred_free(cred);
++ 	return rc;
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  }
+  
+  void security_cred_free(struct cred *cred)
+@@@ -1274,7 -1330,15 +1361,19 @@@
+  
+  int security_prepare_creds(struct cred *new, const struct cred *old, gfp_t gfp)
+  {
+++<<<<<<< HEAD
+ +	return call_int_hook(cred_prepare, 0, new, old, gfp);
+++=======
++ 	int rc = lsm_cred_alloc(new, gfp);
++ 
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = call_int_hook(cred_prepare, 0, new, old, gfp);
++ 	if (unlikely(rc))
++ 		security_cred_free(new);
++ 	return rc;
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  }
+  
+  void security_transfer_creds(struct cred *new, const struct cred *old)
+diff --cc security/selinux/hooks.c
+index 02238a76d816,632813821da6..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -7000,82 -6626,10 +6982,89 @@@ static void selinux_bpf_prog_free(struc
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +/*
+ + * IMPORTANT NOTE: When adding new hooks, please be careful to keep this order:
+ + * 1. any hooks that don't belong to (2.) or (3.) below,
+ + * 2. hooks that both access structures allocated by other hooks, and allocate
+ + *    structures that can be later accessed by other hooks (mostly "cloning"
+ + *    hooks),
+ + * 3. hooks that only allocate structures that can be later accessed by other
+ + *    hooks ("allocating" hooks).
+ + *
+ + * Please follow block comment delimiters in the list to keep this order.
+ + *
+ + * This ordering is needed for SELinux runtime disable to work at least somewhat
+ + * safely. Breaking the ordering rules above might lead to NULL pointer derefs
+ + * when disabling SELinux at runtime.
+ + */
+ +
+ +#ifdef CONFIG_PERF_EVENTS
+ +static int selinux_perf_event_open(struct perf_event_attr *attr, int type)
+ +{
+ +	u32 requested, sid = current_sid();
+ +
+ +	if (type == PERF_SECURITY_OPEN)
+ +		requested = PERF_EVENT__OPEN;
+ +	else if (type == PERF_SECURITY_CPU)
+ +		requested = PERF_EVENT__CPU;
+ +	else if (type == PERF_SECURITY_KERNEL)
+ +		requested = PERF_EVENT__KERNEL;
+ +	else if (type == PERF_SECURITY_TRACEPOINT)
+ +		requested = PERF_EVENT__TRACEPOINT;
+ +	else
+ +		return -EINVAL;
+ +
+ +	return avc_has_perm(&selinux_state, sid, sid, SECCLASS_PERF_EVENT,
+ +			    requested, NULL);
+ +}
+ +
+ +static int selinux_perf_event_alloc(struct perf_event *event)
+ +{
+ +	struct perf_event_security_struct *perfsec;
+ +
+ +	perfsec = kzalloc(sizeof(*perfsec), GFP_KERNEL);
+ +	if (!perfsec)
+ +		return -ENOMEM;
+ +
+ +	perfsec->sid = current_sid();
+ +	event->security = perfsec;
+ +
+ +	return 0;
+ +}
+ +
+ +static void selinux_perf_event_free(struct perf_event *event)
+ +{
+ +	struct perf_event_security_struct *perfsec = event->security;
+ +
+ +	event->security = NULL;
+ +	kfree(perfsec);
+ +}
+ +
+ +static int selinux_perf_event_read(struct perf_event *event)
+ +{
+ +	struct perf_event_security_struct *perfsec = event->security;
+ +	u32 sid = current_sid();
+ +
+ +	return avc_has_perm(&selinux_state, sid, perfsec->sid,
+ +			    SECCLASS_PERF_EVENT, PERF_EVENT__READ, NULL);
+ +}
+ +
+ +static int selinux_perf_event_write(struct perf_event *event)
+ +{
+ +	struct perf_event_security_struct *perfsec = event->security;
+ +	u32 sid = current_sid();
+ +
+ +	return avc_has_perm(&selinux_state, sid, perfsec->sid,
+ +			    SECCLASS_PERF_EVENT, PERF_EVENT__WRITE, NULL);
+ +}
+ +#endif
+++=======
++ struct lsm_blob_sizes selinux_blob_sizes __lsm_ro_after_init = {
++ 	.lbs_cred = sizeof(struct task_security_struct),
++ 	.lbs_file = sizeof(struct file_security_struct),
++ };
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  
+  static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+  	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
+@@@ -7142,11 -6698,8 +7131,10 @@@
+  	LSM_HOOK_INIT(inode_copy_up, selinux_inode_copy_up),
+  	LSM_HOOK_INIT(inode_copy_up_xattr, selinux_inode_copy_up_xattr),
+  
+ +	LSM_HOOK_INIT(kernfs_init_security, selinux_kernfs_init_security),
+ +
+  	LSM_HOOK_INIT(file_permission, selinux_file_permission),
+  	LSM_HOOK_INIT(file_alloc_security, selinux_file_alloc_security),
+- 	LSM_HOOK_INIT(file_free_security, selinux_file_free_security),
+  	LSM_HOOK_INIT(file_ioctl, selinux_file_ioctl),
+  	LSM_HOOK_INIT(mmap_file, selinux_mmap_file),
+  	LSM_HOOK_INIT(mmap_addr, selinux_mmap_addr),
+diff --cc security/smack/smack.h
+index f7db791fb566,2007d38d0e46..000000000000
+--- a/security/smack/smack.h
++++ b/security/smack/smack.h
+@@@ -356,6 -357,17 +356,20 @@@ extern struct list_head smack_onlycap_l
+  #define SMACK_HASH_SLOTS 16
+  extern struct hlist_head smack_known_hash[SMACK_HASH_SLOTS];
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct task_smack *smack_cred(const struct cred *cred)
++ {
++ 	return cred->security + smack_blob_sizes.lbs_cred;
++ }
++ 
++ static inline struct smack_known **smack_file(const struct file *file)
++ {
++ 	return (struct smack_known **)(file->f_security +
++ 				       smack_blob_sizes.lbs_file);
++ }
++ 
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  /*
+   * Is the directory transmuting?
+   */
+diff --cc security/smack/smack_lsm.c
+index 922e3ab09003,7c76668ea3a6..000000000000
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@@ -4641,6 -4545,11 +4629,14 @@@ static int smack_dentry_create_files_as
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct lsm_blob_sizes smack_blob_sizes __lsm_ro_after_init = {
++ 	.lbs_cred = sizeof(struct task_smack),
++ 	.lbs_file = sizeof(struct smack_known *),
++ };
++ 
+++>>>>>>> 33bf60cabcc7 (LSM: Infrastructure management of the file security)
+  static struct security_hook_list smack_hooks[] __lsm_ro_after_init = {
+  	LSM_HOOK_INIT(ptrace_access_check, smack_ptrace_access_check),
+  	LSM_HOOK_INIT(ptrace_traceme, smack_ptrace_traceme),
+* Unmerged path include/linux/lsm_hooks.h
+diff --git a/security/apparmor/include/file.h b/security/apparmor/include/file.h
+index 2e3a67b2f44d..d8d81870ecca 100644
+--- a/security/apparmor/include/file.h
++++ b/security/apparmor/include/file.h
+@@ -32,7 +32,10 @@ struct path;
+ 				 AA_MAY_CHMOD | AA_MAY_CHOWN | AA_MAY_LOCK | \
+ 				 AA_EXEC_MMAP | AA_MAY_LINK)
+ 
+-#define file_ctx(X) ((struct aa_file_ctx *)(X)->f_security)
++static inline struct aa_file_ctx *file_ctx(struct file *file)
++{
++	return file->f_security + apparmor_blob_sizes.lbs_file;
++}
+ 
+ /* struct aa_file_ctx - the AppArmor context the file was opened in
+  * @lock: lock to update the ctx
+* Unmerged path security/apparmor/lsm.c
+* Unmerged path security/security.c
+* Unmerged path security/selinux/hooks.c
+diff --git a/security/selinux/include/objsec.h b/security/selinux/include/objsec.h
+index e4f7d53cbff2..78eb1c8bac3e 100644
+--- a/security/selinux/include/objsec.h
++++ b/security/selinux/include/objsec.h
+@@ -160,7 +160,7 @@ static inline struct task_security_struct *selinux_cred(const struct cred *cred)
+ 
+ static inline struct file_security_struct *selinux_file(const struct file *file)
+ {
+-	return file->f_security;
++	return file->f_security + selinux_blob_sizes.lbs_file;
+ }
+ 
+ static inline struct inode_security_struct *selinux_inode(
+* Unmerged path security/smack/smack.h
+* Unmerged path security/smack/smack_lsm.c
