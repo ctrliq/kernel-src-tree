@@ -1,0 +1,212 @@
+net/mlx5e: kTLS, Fix RX counters atomicity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Tariq Toukan <tariqt@nvidia.com>
+commit 6f4fdd530a09c8e2c7368ba5a5b1711e6e5ced10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/6f4fdd53.failed
+
+Some TLS RX counters increment per socket/connection, and are not
+protected against parallel modifications from several cores.
+Switch them to atomic counters by taking them out of the RQ stats into
+the global atomic TLS stats.
+
+In this patch, we touch 'rx_tls_ctx/del' that count the number of
+device-offloaded RX TLS connections added/deleted.
+These counters are updated in the add/del callbacks, out of the fast
+data-path.
+
+This change is not needed for counters that increment only in NAPI
+context, as they are protected by the NAPI mechanism.
+Keep them as tls_* counters under 'struct mlx5e_rq_stats'.
+
+Fixes: 76c1e1ac2aae ("net/mlx5e: kTLS, Add kTLS RX stats")
+	Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 6f4fdd530a09c8e2c7368ba5a5b1711e6e5ced10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_stats.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_stats.c
+index b949b9a7538b,29463bdb7715..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_stats.c
+@@@ -45,6 -45,12 +45,15 @@@ static const struct counter_desc mlx5e_
+  	{ MLX5E_DECLARE_STAT(struct mlx5e_tls_sw_stats, tx_tls_drop_bypass_required) },
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct counter_desc mlx5e_ktls_sw_stats_desc[] = {
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_tls_sw_stats, tx_tls_ctx) },
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_tls_sw_stats, rx_tls_ctx) },
++ 	{ MLX5E_DECLARE_STAT(struct mlx5e_tls_sw_stats, rx_tls_del) },
++ };
++ 
+++>>>>>>> 6f4fdd530a09 (net/mlx5e: kTLS, Fix RX counters atomicity)
+  #define MLX5E_READ_CTR_ATOMIC64(ptr, dsc, i) \
+  	atomic64_read((atomic64_t *)((char *)(ptr) + (dsc)[i].offset))
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
+index c973866c4219..5ae71c5793ff 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_rx.c
+@@ -46,7 +46,8 @@ struct mlx5e_ktls_offload_context_rx {
+ 	struct tls12_crypto_info_aes_gcm_128 crypto_info;
+ 	struct accel_rule rule;
+ 	struct sock *sk;
+-	struct mlx5e_rq_stats *stats;
++	struct mlx5e_rq_stats *rq_stats;
++	struct mlx5e_tls_sw_stats *sw_stats;
+ 	struct completion add_ctx;
+ 	u32 tirn;
+ 	u32 key_id;
+@@ -218,7 +219,7 @@ static int post_rx_param_wqes(struct mlx5e_channel *c,
+ 	return err;
+ 
+ err_out:
+-	priv_rx->stats->tls_resync_req_skip++;
++	priv_rx->rq_stats->tls_resync_req_skip++;
+ 	err = PTR_ERR(cseg);
+ 	complete(&priv_rx->add_ctx);
+ 	goto unlock;
+@@ -322,7 +323,7 @@ resync_post_get_progress_params(struct mlx5e_icosq *sq,
+ err_free:
+ 	kfree(buf);
+ err_out:
+-	priv_rx->stats->tls_resync_req_skip++;
++	priv_rx->rq_stats->tls_resync_req_skip++;
+ 	return err;
+ }
+ 
+@@ -378,13 +379,13 @@ static int resync_handle_seq_match(struct mlx5e_ktls_offload_context_rx *priv_rx
+ 
+ 	cseg = post_static_params(sq, priv_rx);
+ 	if (IS_ERR(cseg)) {
+-		priv_rx->stats->tls_resync_res_skip++;
++		priv_rx->rq_stats->tls_resync_res_skip++;
+ 		err = PTR_ERR(cseg);
+ 		goto unlock;
+ 	}
+ 	/* Do not increment priv_rx refcnt, CQE handling is empty */
+ 	mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, cseg);
+-	priv_rx->stats->tls_resync_res_ok++;
++	priv_rx->rq_stats->tls_resync_res_ok++;
+ unlock:
+ 	spin_unlock_bh(&c->async_icosq_lock);
+ 
+@@ -420,13 +421,13 @@ void mlx5e_ktls_handle_get_psv_completion(struct mlx5e_icosq_wqe_info *wi,
+ 	auth_state = MLX5_GET(tls_progress_params, ctx, auth_state);
+ 	if (tracker_state != MLX5E_TLS_PROGRESS_PARAMS_RECORD_TRACKER_STATE_TRACKING ||
+ 	    auth_state != MLX5E_TLS_PROGRESS_PARAMS_AUTH_STATE_NO_OFFLOAD) {
+-		priv_rx->stats->tls_resync_req_skip++;
++		priv_rx->rq_stats->tls_resync_req_skip++;
+ 		goto out;
+ 	}
+ 
+ 	hw_seq = MLX5_GET(tls_progress_params, ctx, hw_resync_tcp_sn);
+ 	tls_offload_rx_resync_async_request_end(priv_rx->sk, cpu_to_be32(hw_seq));
+-	priv_rx->stats->tls_resync_req_end++;
++	priv_rx->rq_stats->tls_resync_req_end++;
+ out:
+ 	mlx5e_ktls_priv_rx_put(priv_rx);
+ 	dma_unmap_single(dev, buf->dma_addr, PROGRESS_PARAMS_PADDED_SIZE, DMA_FROM_DEVICE);
+@@ -609,7 +610,8 @@ int mlx5e_ktls_add_rx(struct net_device *netdev, struct sock *sk,
+ 	priv_rx->rxq = rxq;
+ 	priv_rx->sk = sk;
+ 
+-	priv_rx->stats = &priv->channel_stats[rxq].rq;
++	priv_rx->rq_stats = &priv->channel_stats[rxq].rq;
++	priv_rx->sw_stats = &priv->tls->sw_stats;
+ 	mlx5e_set_ktls_rx_priv_ctx(tls_ctx, priv_rx);
+ 
+ 	rqtn = priv->direct_tir[rxq].rqt.rqtn;
+@@ -630,7 +632,7 @@ int mlx5e_ktls_add_rx(struct net_device *netdev, struct sock *sk,
+ 	if (err)
+ 		goto err_post_wqes;
+ 
+-	priv_rx->stats->tls_ctx++;
++	atomic64_inc(&priv_rx->sw_stats->rx_tls_ctx);
+ 
+ 	return 0;
+ 
+@@ -666,7 +668,7 @@ void mlx5e_ktls_del_rx(struct net_device *netdev, struct tls_context *tls_ctx)
+ 	if (cancel_work_sync(&resync->work))
+ 		mlx5e_ktls_priv_rx_put(priv_rx);
+ 
+-	priv_rx->stats->tls_del++;
++	atomic64_inc(&priv_rx->sw_stats->rx_tls_del);
+ 	if (priv_rx->rule.rule)
+ 		mlx5e_accel_fs_del_sk(priv_rx->rule.rule);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h
+index bd270a85c804..d0739ca47fe9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls.h
+@@ -45,6 +45,8 @@ struct mlx5e_tls_sw_stats {
+ 	atomic64_t tx_tls_drop_resync_alloc;
+ 	atomic64_t tx_tls_drop_no_sync_data;
+ 	atomic64_t tx_tls_drop_bypass_required;
++	atomic64_t rx_tls_ctx;
++	atomic64_t rx_tls_del;
+ 	atomic64_t rx_tls_drop_resync_request;
+ 	atomic64_t rx_tls_resync_request;
+ 	atomic64_t rx_tls_resync_reply;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_stats.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index ebfb47a09128..4431b68bdb17 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -180,8 +180,6 @@ static const struct counter_desc sw_stats_desc[] = {
+ #ifdef CONFIG_MLX5_EN_TLS
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_tls_decrypted_packets) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_tls_decrypted_bytes) },
+-	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_tls_ctx) },
+-	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_tls_del) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_tls_resync_req_pkt) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_tls_resync_req_start) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_tls_resync_req_end) },
+@@ -342,8 +340,6 @@ static void mlx5e_stats_grp_sw_update_stats_rq_stats(struct mlx5e_sw_stats *s,
+ #ifdef CONFIG_MLX5_EN_TLS
+ 	s->rx_tls_decrypted_packets   += rq_stats->tls_decrypted_packets;
+ 	s->rx_tls_decrypted_bytes     += rq_stats->tls_decrypted_bytes;
+-	s->rx_tls_ctx                 += rq_stats->tls_ctx;
+-	s->rx_tls_del                 += rq_stats->tls_del;
+ 	s->rx_tls_resync_req_pkt      += rq_stats->tls_resync_req_pkt;
+ 	s->rx_tls_resync_req_start    += rq_stats->tls_resync_req_start;
+ 	s->rx_tls_resync_req_end      += rq_stats->tls_resync_req_end;
+@@ -1583,8 +1579,6 @@ static const struct counter_desc rq_stats_desc[] = {
+ #ifdef CONFIG_MLX5_EN_TLS
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, tls_decrypted_packets) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, tls_decrypted_bytes) },
+-	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, tls_ctx) },
+-	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, tls_del) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, tls_resync_req_pkt) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, tls_resync_req_start) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, tls_resync_req_end) },
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 162daaadb0d8..844c91abc744 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -196,8 +196,6 @@ struct mlx5e_sw_stats {
+ 
+ 	u64 rx_tls_decrypted_packets;
+ 	u64 rx_tls_decrypted_bytes;
+-	u64 rx_tls_ctx;
+-	u64 rx_tls_del;
+ 	u64 rx_tls_resync_req_pkt;
+ 	u64 rx_tls_resync_req_start;
+ 	u64 rx_tls_resync_req_end;
+@@ -328,8 +326,6 @@ struct mlx5e_rq_stats {
+ #ifdef CONFIG_MLX5_EN_TLS
+ 	u64 tls_decrypted_packets;
+ 	u64 tls_decrypted_bytes;
+-	u64 tls_ctx;
+-	u64 tls_del;
+ 	u64 tls_resync_req_pkt;
+ 	u64 tls_resync_req_start;
+ 	u64 tls_resync_req_end;
