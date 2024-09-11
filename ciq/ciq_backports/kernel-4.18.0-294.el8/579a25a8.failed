@@ -1,0 +1,181 @@
+net: stmmac: Initial support for TBS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jose Abreu <Jose.Abreu@synopsys.com>
+commit 579a25a854d482bc9d0f9ab0e07ba32fb66bd9e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/579a25a8.failed
+
+Adds the initial hooks for TBS support. This needs a 32 byte descriptor
+in order for it to work with current HW. Adds all the logic for Enhanced
+Descriptors in main core but no HW related logic for now.
+
+Changes from v2:
+- Use bitfield for TBS status / support (Jakub)
+- Remove unneeded cache alignment (Jakub)
+- Fix checkpatch issues
+
+	Signed-off-by: Jose Abreu <Jose.Abreu@synopsys.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 579a25a854d482bc9d0f9ab0e07ba32fb66bd9e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index fb0f537dd644,baffb4e8d99a..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -1648,25 -1651,26 +1667,48 @@@ static int alloc_dma_tx_desc_resources(
+  		if (!tx_q->tx_skbuff)
+  			goto err_dma;
+  
+++<<<<<<< HEAD
+ +		if (priv->extend_desc) {
+ +			tx_q->dma_etx = dma_zalloc_coherent(priv->device,
+ +							    DMA_TX_SIZE *
+ +							    sizeof(struct
+ +							    dma_extended_desc),
+ +							    &tx_q->dma_tx_phy,
+ +							    GFP_KERNEL);
+ +			if (!tx_q->dma_etx)
+ +				goto err_dma;
+ +		} else {
+ +			tx_q->dma_tx = dma_zalloc_coherent(priv->device,
+ +							   DMA_TX_SIZE *
+ +							   sizeof(struct
+ +								  dma_desc),
+ +							   &tx_q->dma_tx_phy,
+ +							   GFP_KERNEL);
+ +			if (!tx_q->dma_tx)
+ +				goto err_dma;
+ +		}
+++=======
++ 		if (priv->extend_desc)
++ 			size = sizeof(struct dma_extended_desc);
++ 		else if (tx_q->tbs & STMMAC_TBS_AVAIL)
++ 			size = sizeof(struct dma_edesc);
++ 		else
++ 			size = sizeof(struct dma_desc);
++ 
++ 		size *= DMA_TX_SIZE;
++ 
++ 		addr = dma_alloc_coherent(priv->device, size,
++ 					  &tx_q->dma_tx_phy, GFP_KERNEL);
++ 		if (!addr)
++ 			goto err_dma;
++ 
++ 		if (priv->extend_desc)
++ 			tx_q->dma_etx = addr;
++ 		else if (tx_q->tbs & STMMAC_TBS_AVAIL)
++ 			tx_q->dma_entx = addr;
++ 		else
++ 			tx_q->dma_tx = addr;
+++>>>>>>> 579a25a854d4 (net: stmmac: Initial support for TBS)
+  	}
+  
+  	return 0;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/descs.h b/drivers/net/ethernet/stmicro/stmmac/descs.h
+index 1ff402484831..1c04da6c408e 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/descs.h
++++ b/drivers/net/ethernet/stmicro/stmmac/descs.h
+@@ -181,6 +181,15 @@ struct dma_extended_desc {
+ 	__le32 des7;	/* Tx/Rx Timestamp High */
+ };
+ 
++/* Enhanced descriptor for TBS */
++struct dma_edesc {
++	__le32 des4;
++	__le32 des5;
++	__le32 des6;
++	__le32 des7;
++	struct dma_desc basic;
++};
++
+ /* Transmit checksum insertion control */
+ #define	TX_CIC_FULL	3	/* Include IP header and pseudoheader */
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/hwif.h b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+index 59108f05df14..a43f67c5e9d3 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/hwif.h
++++ b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+@@ -29,6 +29,7 @@ struct stmmac_extra_stats;
+ struct stmmac_safety_stats;
+ struct dma_desc;
+ struct dma_extended_desc;
++struct dma_edesc;
+ 
+ /* Descriptors helpers */
+ struct stmmac_desc_ops {
+@@ -95,6 +96,7 @@ struct stmmac_desc_ops {
+ 	void (*set_vlan_tag)(struct dma_desc *p, u16 tag, u16 inner_tag,
+ 			     u32 inner_type);
+ 	void (*set_vlan)(struct dma_desc *p, u32 type);
++	void (*set_tbs)(struct dma_edesc *p, u32 sec, u32 nsec);
+ };
+ 
+ #define stmmac_init_rx_desc(__priv, __args...) \
+@@ -157,6 +159,8 @@ struct stmmac_desc_ops {
+ 	stmmac_do_void_callback(__priv, desc, set_vlan_tag, __args)
+ #define stmmac_set_desc_vlan(__priv, __args...) \
+ 	stmmac_do_void_callback(__priv, desc, set_vlan, __args)
++#define stmmac_set_desc_tbs(__priv, __args...) \
++	stmmac_do_void_callback(__priv, desc, set_tbs, __args)
+ 
+ struct stmmac_dma_cfg;
+ struct dma_features;
+@@ -209,6 +213,7 @@ struct stmmac_dma_ops {
+ 	void (*enable_tso)(void __iomem *ioaddr, bool en, u32 chan);
+ 	void (*set_bfsize)(void __iomem *ioaddr, int bfsize, u32 chan);
+ 	void (*enable_sph)(void __iomem *ioaddr, bool en, u32 chan);
++	int (*enable_tbs)(void __iomem *ioaddr, bool en, u32 chan);
+ };
+ 
+ #define stmmac_reset(__priv, __args...) \
+@@ -265,6 +270,8 @@ struct stmmac_dma_ops {
+ 	stmmac_do_void_callback(__priv, dma, set_bfsize, __args)
+ #define stmmac_enable_sph(__priv, __args...) \
+ 	stmmac_do_void_callback(__priv, dma, enable_sph, __args)
++#define stmmac_enable_tbs(__priv, __args...) \
++	stmmac_do_callback(__priv, dma, enable_tbs, __args)
+ 
+ struct mac_device_info;
+ struct net_device;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index a73a7e14984d..554086865b4a 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -49,13 +49,18 @@ struct stmmac_tx_info {
+ 	bool is_jumbo;
+ };
+ 
++#define STMMAC_TBS_AVAIL	BIT(0)
++#define STMMAC_TBS_EN		BIT(1)
++
+ /* Frequently used values are kept adjacent for cache effect */
+ struct stmmac_tx_queue {
+ 	u32 tx_count_frames;
++	int tbs;
+ 	struct timer_list txtimer;
+ 	u32 queue_index;
+ 	struct stmmac_priv *priv_data;
+ 	struct dma_extended_desc *dma_etx ____cacheline_aligned_in_smp;
++	struct dma_edesc *dma_entx;
+ 	struct dma_desc *dma_tx;
+ 	struct sk_buff **tx_skbuff;
+ 	struct stmmac_tx_info *tx_skbuff_dma;
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+diff --git a/include/linux/stmmac.h b/include/linux/stmmac.h
+index 7bba6bd261ea..33de18d5da24 100644
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -139,6 +139,7 @@ struct stmmac_txq_cfg {
+ 	u32 low_credit;
+ 	bool use_prio;
+ 	u32 prio;
++	int tbs_en;
+ };
+ 
+ struct plat_stmmacenet_data {
