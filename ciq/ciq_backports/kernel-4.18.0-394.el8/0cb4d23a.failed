@@ -1,0 +1,265 @@
+NFSD: Fix the behavior of READ near OFFSET_MAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 0cb4d23ae08c48f6bf3c29a8e5c4a74b8388b960
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/0cb4d23a.failed
+
+Dan Aloni reports:
+> Due to commit 8cfb9015280d ("NFS: Always provide aligned buffers to
+> the RPC read layers") on the client, a read of 0xfff is aligned up
+> to server rsize of 0x1000.
+>
+> As a result, in a test where the server has a file of size
+> 0x7fffffffffffffff, and the client tries to read from the offset
+> 0x7ffffffffffff000, the read causes loff_t overflow in the server
+> and it returns an NFS code of EINVAL to the client. The client as
+> a result indefinitely retries the request.
+
+The Linux NFS client does not handle NFS?ERR_INVAL, even though all
+NFS specifications permit servers to return that status code for a
+READ.
+
+Instead of NFS?ERR_INVAL, have out-of-range READ requests succeed
+and return a short result. Set the EOF flag in the result to prevent
+the client from retrying the READ request. This behavior appears to
+be consistent with Solaris NFS servers.
+
+Note that NFSv3 and NFSv4 use u64 offset values on the wire. These
+must be converted to loff_t internally before use -- an implicit
+type cast is not adequate for this purpose. Otherwise VFS checks
+against sb->s_maxbytes do not work properly.
+
+	Reported-by: Dan Aloni <dan.aloni@vastdata.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 0cb4d23ae08c48f6bf3c29a8e5c4a74b8388b960)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4proc.c
+#	fs/nfsd/nfs4xdr.c
+diff --cc fs/nfsd/nfs4proc.c
+index 64ce01620a25,71d735b125a0..000000000000
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@@ -759,9 -781,7 +759,13 @@@ nfsd4_read(struct svc_rqst *rqstp, stru
+  	struct nfsd4_read *read = &u->read;
+  	__be32 status;
+  
+++<<<<<<< HEAD
+ +	read->rd_filp = NULL;
+ +	if (read->rd_offset >= OFFSET_MAX)
+ +		return nfserr_inval;
+++=======
++ 	read->rd_nf = NULL;
+++>>>>>>> 0cb4d23ae08c (NFSD: Fix the behavior of READ near OFFSET_MAX)
+  
+  	trace_nfsd_read_start(rqstp, &cstate->current_fh,
+  			      read->rd_offset, read->rd_length);
+diff --cc fs/nfsd/nfs4xdr.c
+index cf0d08d4c2a7,f5e3430bb6ff..000000000000
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@@ -3812,14 -3986,9 +3812,12 @@@ nfsd4_encode_read(struct nfsd4_compound
+  	}
+  	xdr_commit_encode(xdr);
+  
+- 	maxcount = svc_max_payload(resp->rqstp);
+- 	maxcount = min_t(unsigned long, maxcount,
++ 	maxcount = min_t(unsigned long, read->rd_length,
+  			 (xdr->buf->buflen - xdr->buf->len));
+- 	maxcount = min_t(unsigned long, maxcount, read->rd_length);
+  
+ +	if (read->rd_tmp_file)
+ +		ra = nfsd_init_raparms(file);
+ +
+  	if (file->f_op->splice_read &&
+  	    test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags))
+  		nfserr = nfsd4_encode_splice_read(resp, read, file, maxcount);
+@@@ -4512,6 -4718,153 +4510,156 @@@ nfsd4_encode_offload_status(struct nfsd
+  		return nfserr_resource;
+  	p = xdr_encode_hyper(p, os->count);
+  	*p++ = cpu_to_be32(0);
+++<<<<<<< HEAD
+++=======
++ 	return nfserr;
++ }
++ 
++ static __be32
++ nfsd4_encode_read_plus_data(struct nfsd4_compoundres *resp,
++ 			    struct nfsd4_read *read,
++ 			    unsigned long *maxcount, u32 *eof,
++ 			    loff_t *pos)
++ {
++ 	struct xdr_stream *xdr = resp->xdr;
++ 	struct file *file = read->rd_nf->nf_file;
++ 	int starting_len = xdr->buf->len;
++ 	loff_t hole_pos;
++ 	__be32 nfserr;
++ 	__be32 *p, tmp;
++ 	__be64 tmp64;
++ 
++ 	hole_pos = pos ? *pos : vfs_llseek(file, read->rd_offset, SEEK_HOLE);
++ 	if (hole_pos > read->rd_offset)
++ 		*maxcount = min_t(unsigned long, *maxcount, hole_pos - read->rd_offset);
++ 	*maxcount = min_t(unsigned long, *maxcount, (xdr->buf->buflen - xdr->buf->len));
++ 
++ 	/* Content type, offset, byte count */
++ 	p = xdr_reserve_space(xdr, 4 + 8 + 4);
++ 	if (!p)
++ 		return nfserr_resource;
++ 
++ 	read->rd_vlen = xdr_reserve_space_vec(xdr, resp->rqstp->rq_vec, *maxcount);
++ 	if (read->rd_vlen < 0)
++ 		return nfserr_resource;
++ 
++ 	nfserr = nfsd_readv(resp->rqstp, read->rd_fhp, file, read->rd_offset,
++ 			    resp->rqstp->rq_vec, read->rd_vlen, maxcount, eof);
++ 	if (nfserr)
++ 		return nfserr;
++ 	xdr_truncate_encode(xdr, starting_len + 16 + xdr_align_size(*maxcount));
++ 
++ 	tmp = htonl(NFS4_CONTENT_DATA);
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len,      &tmp,   4);
++ 	tmp64 = cpu_to_be64(read->rd_offset);
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len + 4,  &tmp64, 8);
++ 	tmp = htonl(*maxcount);
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len + 12, &tmp,   4);
++ 
++ 	tmp = xdr_zero;
++ 	write_bytes_to_xdr_buf(xdr->buf, starting_len + 16 + *maxcount, &tmp,
++ 			       xdr_pad_size(*maxcount));
++ 	return nfs_ok;
++ }
++ 
++ static __be32
++ nfsd4_encode_read_plus_hole(struct nfsd4_compoundres *resp,
++ 			    struct nfsd4_read *read,
++ 			    unsigned long *maxcount, u32 *eof)
++ {
++ 	struct file *file = read->rd_nf->nf_file;
++ 	loff_t data_pos = vfs_llseek(file, read->rd_offset, SEEK_DATA);
++ 	loff_t f_size = i_size_read(file_inode(file));
++ 	unsigned long count;
++ 	__be32 *p;
++ 
++ 	if (data_pos == -ENXIO)
++ 		data_pos = f_size;
++ 	else if (data_pos <= read->rd_offset || (data_pos < f_size && data_pos % PAGE_SIZE))
++ 		return nfsd4_encode_read_plus_data(resp, read, maxcount, eof, &f_size);
++ 	count = data_pos - read->rd_offset;
++ 
++ 	/* Content type, offset, byte count */
++ 	p = xdr_reserve_space(resp->xdr, 4 + 8 + 8);
++ 	if (!p)
++ 		return nfserr_resource;
++ 
++ 	*p++ = htonl(NFS4_CONTENT_HOLE);
++ 	p = xdr_encode_hyper(p, read->rd_offset);
++ 	p = xdr_encode_hyper(p, count);
++ 
++ 	*eof = (read->rd_offset + count) >= f_size;
++ 	*maxcount = min_t(unsigned long, count, *maxcount);
++ 	return nfs_ok;
++ }
++ 
++ static __be32
++ nfsd4_encode_read_plus(struct nfsd4_compoundres *resp, __be32 nfserr,
++ 		       struct nfsd4_read *read)
++ {
++ 	unsigned long maxcount, count;
++ 	struct xdr_stream *xdr = resp->xdr;
++ 	struct file *file;
++ 	int starting_len = xdr->buf->len;
++ 	int last_segment = xdr->buf->len;
++ 	int segments = 0;
++ 	__be32 *p, tmp;
++ 	bool is_data;
++ 	loff_t pos;
++ 	u32 eof;
++ 
++ 	if (nfserr)
++ 		return nfserr;
++ 	file = read->rd_nf->nf_file;
++ 
++ 	/* eof flag, segment count */
++ 	p = xdr_reserve_space(xdr, 4 + 4);
++ 	if (!p)
++ 		return nfserr_resource;
++ 	xdr_commit_encode(xdr);
++ 
++ 	maxcount = min_t(unsigned long, read->rd_length,
++ 			 (xdr->buf->buflen - xdr->buf->len));
++ 	count    = maxcount;
++ 
++ 	eof = read->rd_offset >= i_size_read(file_inode(file));
++ 	if (eof)
++ 		goto out;
++ 
++ 	pos = vfs_llseek(file, read->rd_offset, SEEK_HOLE);
++ 	is_data = pos > read->rd_offset;
++ 
++ 	while (count > 0 && !eof) {
++ 		maxcount = count;
++ 		if (is_data)
++ 			nfserr = nfsd4_encode_read_plus_data(resp, read, &maxcount, &eof,
++ 						segments == 0 ? &pos : NULL);
++ 		else
++ 			nfserr = nfsd4_encode_read_plus_hole(resp, read, &maxcount, &eof);
++ 		if (nfserr)
++ 			goto out;
++ 		count -= maxcount;
++ 		read->rd_offset += maxcount;
++ 		is_data = !is_data;
++ 		last_segment = xdr->buf->len;
++ 		segments++;
++ 	}
++ 
++ out:
++ 	if (nfserr && segments == 0)
++ 		xdr_truncate_encode(xdr, starting_len);
++ 	else {
++ 		if (nfserr) {
++ 			xdr_truncate_encode(xdr, last_segment);
++ 			nfserr = nfs_ok;
++ 			eof = 0;
++ 		}
++ 		tmp = htonl(eof);
++ 		write_bytes_to_xdr_buf(xdr->buf, starting_len,     &tmp, 4);
++ 		tmp = htonl(segments);
++ 		write_bytes_to_xdr_buf(xdr->buf, starting_len + 4, &tmp, 4);
++ 	}
+++>>>>>>> 0cb4d23ae08c (NFSD: Fix the behavior of READ near OFFSET_MAX)
+  
+  	return nfserr;
+  }
+diff --git a/fs/nfsd/nfs3proc.c b/fs/nfsd/nfs3proc.c
+index 24c93358935f..936ae98b9512 100644
+--- a/fs/nfsd/nfs3proc.c
++++ b/fs/nfsd/nfs3proc.c
+@@ -150,13 +150,17 @@ nfsd3_proc_read(struct svc_rqst *rqstp)
+ 	unsigned int len;
+ 	int v;
+ 
+-	argp->count = min_t(u32, argp->count, max_blocksize);
+-
+ 	dprintk("nfsd: READ(3) %s %lu bytes at %Lu\n",
+ 				SVCFH_fmt(&argp->fh),
+ 				(unsigned long) argp->count,
+ 				(unsigned long long) argp->offset);
+ 
++	argp->count = min_t(u32, argp->count, max_blocksize);
++	if (argp->offset > (u64)OFFSET_MAX)
++		argp->offset = (u64)OFFSET_MAX;
++	if (argp->offset + argp->count > (u64)OFFSET_MAX)
++		argp->count = (u64)OFFSET_MAX - argp->offset;
++
+ 	v = 0;
+ 	len = argp->count;
+ 	resp->pages = rqstp->rq_next_page;
+* Unmerged path fs/nfsd/nfs4proc.c
+* Unmerged path fs/nfsd/nfs4xdr.c
