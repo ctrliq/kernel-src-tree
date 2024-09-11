@@ -1,0 +1,275 @@
+x86/split_lock: Provide handle_guest_split_lock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit d7e94dbdac1a40924626b0efc7ff530c8baf5e4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d7e94dbd.failed
+
+Without at least minimal handling for split lock detection induced #AC,
+VMX will just run into the same problem as the VMWare hypervisor, which
+was reported by Kenneth.
+
+It will inject the #AC blindly into the guest whether the guest is
+prepared or not.
+
+Provide a function for guest mode which acts depending on the host
+SLD mode. If mode == sld_warn, treat it like user space, i.e. emit a
+warning, disable SLD and mark the task accordingly. Otherwise force
+SIGBUS.
+
+ [ bp: Add a !CPU_SUP_INTEL stub for handle_guest_split_lock(). ]
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+Link: https://lkml.kernel.org/r/20200410115516.978037132@linutronix.de
+Link: https://lkml.kernel.org/r/20200402123258.895628824@linutronix.de
+(cherry picked from commit d7e94dbdac1a40924626b0efc7ff530c8baf5e4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpu.h
+#	arch/x86/kernel/cpu/intel.c
+diff --cc arch/x86/include/asm/cpu.h
+index adc6cc86b062,dd17c2da1af5..000000000000
+--- a/arch/x86/include/asm/cpu.h
++++ b/arch/x86/include/asm/cpu.h
+@@@ -40,4 -40,22 +40,25 @@@ int mwait_usable(const struct cpuinfo_x
+  unsigned int x86_family(unsigned int sig);
+  unsigned int x86_model(unsigned int sig);
+  unsigned int x86_stepping(unsigned int sig);
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CPU_SUP_INTEL
++ extern void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c);
++ extern void switch_to_sld(unsigned long tifn);
++ extern bool handle_user_split_lock(struct pt_regs *regs, long error_code);
++ extern bool handle_guest_split_lock(unsigned long ip);
++ #else
++ static inline void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c) {}
++ static inline void switch_to_sld(unsigned long tifn) {}
++ static inline bool handle_user_split_lock(struct pt_regs *regs, long error_code)
++ {
++ 	return false;
++ }
++ 
++ static inline bool handle_guest_split_lock(unsigned long ip)
++ {
++ 	return false;
++ }
++ #endif
+++>>>>>>> d7e94dbdac1a (x86/split_lock: Provide handle_guest_split_lock())
+  #endif /* _ASM_X86_CPU_H */
+diff --cc arch/x86/kernel/cpu/intel.c
+index ae064a2ca368,bf08d4508ecb..000000000000
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@@ -19,6 -19,9 +19,12 @@@
+  #include <asm/microcode_intel.h>
+  #include <asm/hwcap2.h>
+  #include <asm/elf.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/cpu_device_id.h>
++ #include <asm/cmdline.h>
++ #include <asm/traps.h>
+++>>>>>>> d7e94dbdac1a (x86/split_lock: Provide handle_guest_split_lock())
+  
+  #ifdef CONFIG_X86_64
+  #include <linux/topology.h>
+@@@ -1034,3 -967,187 +1040,190 @@@ static const struct cpu_dev intel_cpu_d
+  
+  cpu_dev_register(intel_cpu_dev);
+  
+++<<<<<<< HEAD
+++=======
++ #undef pr_fmt
++ #define pr_fmt(fmt) "x86/split lock detection: " fmt
++ 
++ static const struct {
++ 	const char			*option;
++ 	enum split_lock_detect_state	state;
++ } sld_options[] __initconst = {
++ 	{ "off",	sld_off   },
++ 	{ "warn",	sld_warn  },
++ 	{ "fatal",	sld_fatal },
++ };
++ 
++ static inline bool match_option(const char *arg, int arglen, const char *opt)
++ {
++ 	int len = strlen(opt);
++ 
++ 	return len == arglen && !strncmp(arg, opt, len);
++ }
++ 
++ static bool split_lock_verify_msr(bool on)
++ {
++ 	u64 ctrl, tmp;
++ 
++ 	if (rdmsrl_safe(MSR_TEST_CTRL, &ctrl))
++ 		return false;
++ 	if (on)
++ 		ctrl |= MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
++ 	else
++ 		ctrl &= ~MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
++ 	if (wrmsrl_safe(MSR_TEST_CTRL, ctrl))
++ 		return false;
++ 	rdmsrl(MSR_TEST_CTRL, tmp);
++ 	return ctrl == tmp;
++ }
++ 
++ static void __init split_lock_setup(void)
++ {
++ 	enum split_lock_detect_state state = sld_warn;
++ 	char arg[20];
++ 	int i, ret;
++ 
++ 	if (!split_lock_verify_msr(false)) {
++ 		pr_info("MSR access failed: Disabled\n");
++ 		return;
++ 	}
++ 
++ 	ret = cmdline_find_option(boot_command_line, "split_lock_detect",
++ 				  arg, sizeof(arg));
++ 	if (ret >= 0) {
++ 		for (i = 0; i < ARRAY_SIZE(sld_options); i++) {
++ 			if (match_option(arg, ret, sld_options[i].option)) {
++ 				state = sld_options[i].state;
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	switch (state) {
++ 	case sld_off:
++ 		pr_info("disabled\n");
++ 		return;
++ 	case sld_warn:
++ 		pr_info("warning about user-space split_locks\n");
++ 		break;
++ 	case sld_fatal:
++ 		pr_info("sending SIGBUS on user-space split_locks\n");
++ 		break;
++ 	}
++ 
++ 	rdmsrl(MSR_TEST_CTRL, msr_test_ctrl_cache);
++ 
++ 	if (!split_lock_verify_msr(true)) {
++ 		pr_info("MSR access failed: Disabled\n");
++ 		return;
++ 	}
++ 
++ 	sld_state = state;
++ 	setup_force_cpu_cap(X86_FEATURE_SPLIT_LOCK_DETECT);
++ }
++ 
++ /*
++  * MSR_TEST_CTRL is per core, but we treat it like a per CPU MSR. Locking
++  * is not implemented as one thread could undo the setting of the other
++  * thread immediately after dropping the lock anyway.
++  */
++ static void sld_update_msr(bool on)
++ {
++ 	u64 test_ctrl_val = msr_test_ctrl_cache;
++ 
++ 	if (on)
++ 		test_ctrl_val |= MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
++ 
++ 	wrmsrl(MSR_TEST_CTRL, test_ctrl_val);
++ }
++ 
++ static void split_lock_init(void)
++ {
++ 	split_lock_verify_msr(sld_state != sld_off);
++ }
++ 
++ static void split_lock_warn(unsigned long ip)
++ {
++ 	pr_warn_ratelimited("#AC: %s/%d took a split_lock trap at address: 0x%lx\n",
++ 			    current->comm, current->pid, ip);
++ 
++ 	/*
++ 	 * Disable the split lock detection for this task so it can make
++ 	 * progress and set TIF_SLD so the detection is re-enabled via
++ 	 * switch_to_sld() when the task is scheduled out.
++ 	 */
++ 	sld_update_msr(false);
++ 	set_tsk_thread_flag(current, TIF_SLD);
++ }
++ 
++ bool handle_guest_split_lock(unsigned long ip)
++ {
++ 	if (sld_state == sld_warn) {
++ 		split_lock_warn(ip);
++ 		return true;
++ 	}
++ 
++ 	pr_warn_once("#AC: %s/%d %s split_lock trap at address: 0x%lx\n",
++ 		     current->comm, current->pid,
++ 		     sld_state == sld_fatal ? "fatal" : "bogus", ip);
++ 
++ 	current->thread.error_code = 0;
++ 	current->thread.trap_nr = X86_TRAP_AC;
++ 	force_sig_fault(SIGBUS, BUS_ADRALN, NULL);
++ 	return false;
++ }
++ EXPORT_SYMBOL_GPL(handle_guest_split_lock);
++ 
++ bool handle_user_split_lock(struct pt_regs *regs, long error_code)
++ {
++ 	if ((regs->flags & X86_EFLAGS_AC) || sld_state == sld_fatal)
++ 		return false;
++ 	split_lock_warn(regs->ip);
++ 	return true;
++ }
++ 
++ /*
++  * This function is called only when switching between tasks with
++  * different split-lock detection modes. It sets the MSR for the
++  * mode of the new task. This is right most of the time, but since
++  * the MSR is shared by hyperthreads on a physical core there can
++  * be glitches when the two threads need different modes.
++  */
++ void switch_to_sld(unsigned long tifn)
++ {
++ 	sld_update_msr(!(tifn & _TIF_SLD));
++ }
++ 
++ #define SPLIT_LOCK_CPU(model) {X86_VENDOR_INTEL, 6, model, X86_FEATURE_ANY}
++ 
++ /*
++  * The following processors have the split lock detection feature. But
++  * since they don't have the IA32_CORE_CAPABILITIES MSR, the feature cannot
++  * be enumerated. Enable it by family and model matching on these
++  * processors.
++  */
++ static const struct x86_cpu_id split_lock_cpu_ids[] __initconst = {
++ 	SPLIT_LOCK_CPU(INTEL_FAM6_ICELAKE_X),
++ 	SPLIT_LOCK_CPU(INTEL_FAM6_ICELAKE_L),
++ 	{}
++ };
++ 
++ void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c)
++ {
++ 	u64 ia32_core_caps = 0;
++ 
++ 	if (c->x86_vendor != X86_VENDOR_INTEL)
++ 		return;
++ 	if (cpu_has(c, X86_FEATURE_CORE_CAPABILITIES)) {
++ 		/* Enumerate features reported in IA32_CORE_CAPABILITIES MSR. */
++ 		rdmsrl(MSR_IA32_CORE_CAPS, ia32_core_caps);
++ 	} else if (!boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
++ 		/* Enumerate split lock detection by family and model. */
++ 		if (x86_match_cpu(split_lock_cpu_ids))
++ 			ia32_core_caps |= MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT;
++ 	}
++ 
++ 	if (ia32_core_caps & MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT)
++ 		split_lock_setup();
++ }
+++>>>>>>> d7e94dbdac1a (x86/split_lock: Provide handle_guest_split_lock())
+* Unmerged path arch/x86/include/asm/cpu.h
+* Unmerged path arch/x86/kernel/cpu/intel.c
