@@ -1,0 +1,158 @@
+ASoC: cs35l41: Correct DSP power down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Charles Keepax <ckeepax@opensource.cirrus.com>
+commit 56852cf4b2179fb90068a49538501f31c2de18ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/56852cf4.failed
+
+The wm_adsp_event should be called before the early_event on power
+down, event stops the core running and early_event then powers down
+the core. Additionally, the core should only be stopped if it was
+actually running in the first place.
+
+	Signed-off-by: Charles Keepax <ckeepax@opensource.cirrus.com>
+Link: https://lore.kernel.org/r/20220105113026.18955-4-ckeepax@opensource.cirrus.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 56852cf4b2179fb90068a49538501f31c2de18ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/codecs/cs35l41.c
+diff --cc sound/soc/codecs/cs35l41.c
+index c3f8e8d776e3,05839fabf97b..000000000000
+--- a/sound/soc/codecs/cs35l41.c
++++ b/sound/soc/codecs/cs35l41.c
+@@@ -197,6 -178,126 +197,129 @@@ static SOC_ENUM_SINGLE_DECL(pcm_sft_ram
+  			    CS35L41_AMP_DIG_VOL_CTRL, 0,
+  			    cs35l41_pcm_sftramp_text);
+  
+++<<<<<<< HEAD
+++=======
++ static int cs35l41_dsp_preload_ev(struct snd_soc_dapm_widget *w,
++ 				  struct snd_kcontrol *kcontrol, int event)
++ {
++ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++ 	int ret;
++ 
++ 	switch (event) {
++ 	case SND_SOC_DAPM_PRE_PMU:
++ 		return wm_adsp_early_event(w, kcontrol, event);
++ 	case SND_SOC_DAPM_PRE_PMD:
++ 		if (cs35l41->dsp.cs_dsp.running) {
++ 			ret = wm_adsp_event(w, kcontrol, event);
++ 			if (ret)
++ 				return ret;
++ 		}
++ 
++ 		return wm_adsp_early_event(w, kcontrol, event);
++ 	default:
++ 		return 0;
++ 	}
++ }
++ 
++ static bool cs35l41_check_cspl_mbox_sts(enum cs35l41_cspl_mbox_cmd cmd,
++ 					enum cs35l41_cspl_mbox_status sts)
++ {
++ 	switch (cmd) {
++ 	case CSPL_MBOX_CMD_NONE:
++ 	case CSPL_MBOX_CMD_UNKNOWN_CMD:
++ 		return true;
++ 	case CSPL_MBOX_CMD_PAUSE:
++ 		return (sts == CSPL_MBOX_STS_PAUSED);
++ 	case CSPL_MBOX_CMD_RESUME:
++ 		return (sts == CSPL_MBOX_STS_RUNNING);
++ 	case CSPL_MBOX_CMD_REINIT:
++ 		return (sts == CSPL_MBOX_STS_RUNNING);
++ 	case CSPL_MBOX_CMD_STOP_PRE_REINIT:
++ 		return (sts == CSPL_MBOX_STS_RDY_FOR_REINIT);
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static int cs35l41_set_cspl_mbox_cmd(struct cs35l41_private *cs35l41,
++ 				     enum cs35l41_cspl_mbox_cmd cmd)
++ {
++ 	unsigned int sts = 0, i;
++ 	int ret;
++ 
++ 	// Set mailbox cmd
++ 	ret = regmap_write(cs35l41->regmap, CS35L41_DSP_VIRT1_MBOX_1, cmd);
++ 	if (ret < 0) {
++ 		dev_err(cs35l41->dev, "Failed to write MBOX: %d\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	// Read mailbox status and verify it is appropriate for the given cmd
++ 	for (i = 0; i < 5; i++) {
++ 		usleep_range(1000, 1100);
++ 
++ 		ret = regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2, &sts);
++ 		if (ret < 0) {
++ 			dev_err(cs35l41->dev, "Failed to read MBOX STS: %d\n", ret);
++ 			continue;
++ 		}
++ 
++ 		if (!cs35l41_check_cspl_mbox_sts(cmd, sts)) {
++ 			dev_dbg(cs35l41->dev,
++ 				"[%u] cmd %u returned invalid sts %u",
++ 				i, cmd, sts);
++ 		} else {
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	dev_err(cs35l41->dev,
++ 		"Failed to set mailbox cmd %u (status %u)\n",
++ 		cmd, sts);
++ 
++ 	return -ENOMSG;
++ }
++ 
++ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
++ 				struct snd_kcontrol *kcontrol, int event)
++ {
++ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++ 	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(component);
++ 	unsigned int fw_status;
++ 	int ret;
++ 
++ 	switch (event) {
++ 	case SND_SOC_DAPM_POST_PMU:
++ 		if (!cs35l41->dsp.cs_dsp.running)
++ 			return wm_adsp_event(w, kcontrol, event);
++ 
++ 		ret = regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2, &fw_status);
++ 		if (ret < 0) {
++ 			dev_err(cs35l41->dev,
++ 				"Failed to read firmware status: %d\n", ret);
++ 			return ret;
++ 		}
++ 
++ 		switch (fw_status) {
++ 		case CSPL_MBOX_STS_RUNNING:
++ 		case CSPL_MBOX_STS_PAUSED:
++ 			break;
++ 		default:
++ 			dev_err(cs35l41->dev, "Firmware status is invalid: %u\n",
++ 				fw_status);
++ 			return -EINVAL;
++ 		}
++ 
++ 		return cs35l41_set_cspl_mbox_cmd(cs35l41, CSPL_MBOX_CMD_RESUME);
++ 	case SND_SOC_DAPM_PRE_PMD:
++ 		return cs35l41_set_cspl_mbox_cmd(cs35l41, CSPL_MBOX_CMD_PAUSE);
++ 	default:
++ 		return 0;
++ 	}
++ }
++ 
+++>>>>>>> 56852cf4b217 (ASoC: cs35l41: Correct DSP power down)
+  static const char * const cs35l41_pcm_source_texts[] = {"ASP", "DSP"};
+  static const unsigned int cs35l41_pcm_source_values[] = {0x08, 0x32};
+  static SOC_VALUE_ENUM_SINGLE_DECL(cs35l41_pcm_source_enum,
+* Unmerged path sound/soc/codecs/cs35l41.c
