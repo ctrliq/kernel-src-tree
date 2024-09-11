@@ -405,6 +405,7 @@ static LIST_HEAD(pmus);
 static DEFINE_MUTEX(pmus_lock);
 static struct srcu_struct pmus_srcu;
 static cpumask_var_t perf_online_mask;
+static struct kmem_cache *perf_event_cache;
 
 /*
  * perf event paranoia level:
@@ -4641,7 +4642,7 @@ static void free_event_rcu(struct rcu_head *head)
 	if (event->ns)
 		put_pid_ns(event->ns);
 	perf_event_free_filter(event);
-	kfree(event);
+	kmem_cache_free(perf_event_cache, event);
 }
 
 static void ring_buffer_attach(struct perf_event *event,
@@ -11310,7 +11311,7 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 			return ERR_PTR(-EINVAL);
 	}
 
-	event = kzalloc(sizeof(*event), GFP_KERNEL);
+	event = kmem_cache_zalloc(perf_event_cache, GFP_KERNEL);
 	if (!event)
 		return ERR_PTR(-ENOMEM);
 
@@ -11514,7 +11515,7 @@ err_ns:
 		put_pid_ns(event->ns);
 	if (event->hw.target)
 		put_task_struct(event->hw.target);
-	kfree(event);
+	kmem_cache_free(perf_event_cache, event);
 
 	return ERR_PTR(err);
 }
@@ -13168,6 +13169,8 @@ void __init perf_event_init(void)
 
 	ret = init_hw_breakpoint();
 	WARN(ret, "hw_breakpoint initialization failed with: %d", ret);
+
+	perf_event_cache = KMEM_CACHE(perf_event, SLAB_PANIC);
 
 	/*
 	 * Build time assertion that we keep the data_head at the intended
