@@ -1,0 +1,242 @@
+KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit be01e8e2c632c41c69bb30e7196661ec6e8fdc10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/be01e8e2.failed
+
+Rename functions and variables in kvm_mmu_new_cr3() and related code to
+replace "cr3" with "pgd", i.e. continue the work started by commit
+727a7e27cf88a ("KVM: x86: rename set_cr3 callback and related flags to
+load_mmu_pgd").  kvm_mmu_new_cr3() and company are not always loading a
+new CR3, e.g. when nested EPT is enabled "cr3" is actually an EPTP.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200320212833.3507-37-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit be01e8e2c632c41c69bb30e7196661ec6e8fdc10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/vmx/nested.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 10275c160b4e,d099749168f0..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1512,10 -1521,13 +1512,15 @@@ int kvm_emulate_hypercall(struct kvm_vc
+  int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 error_code,
+  		       void *insn, int insn_len);
+  void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva);
+ -void kvm_mmu_invalidate_gva(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+ -			    gva_t gva, hpa_t root_hpa);
+  void kvm_mmu_invpcid_gva(struct kvm_vcpu *vcpu, gva_t gva, unsigned long pcid);
+++<<<<<<< HEAD
+ +void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush);
+++=======
++ void kvm_mmu_new_pgd(struct kvm_vcpu *vcpu, gpa_t new_pgd, bool skip_tlb_flush,
++ 		     bool skip_mmu_sync);
+++>>>>>>> be01e8e2c632 (KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code)
+  
+ -void kvm_configure_mmu(bool enable_tdp, int tdp_page_level);
+ +void kvm_configure_mmu(bool enable_tdp);
+  
+  static inline gpa_t translate_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+  				  struct x86_exception *exception)
+diff --cc arch/x86/kvm/mmu/mmu.c
+index dbd97923dc2c,3385d6dde541..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -4345,9 -4286,8 +4345,14 @@@ static bool cached_root_available(struc
+  	return i < KVM_MMU_NUM_PREV_ROOTS;
+  }
+  
+++<<<<<<< HEAD
+ +static bool fast_cr3_switch(struct kvm_vcpu *vcpu, gpa_t new_cr3,
+ +			    union kvm_mmu_page_role new_role,
+ +			    bool skip_tlb_flush)
+++=======
++ static bool fast_pgd_switch(struct kvm_vcpu *vcpu, gpa_t new_pgd,
++ 			    union kvm_mmu_page_role new_role)
+++>>>>>>> be01e8e2c632 (KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code)
+  {
+  	struct kvm_mmu *mmu = vcpu->arch.mmu;
+  
+@@@ -4357,58 -4297,53 +4362,101 @@@
+  	 * later if necessary.
+  	 */
+  	if (mmu->shadow_root_level >= PT64_ROOT_4LEVEL &&
+++<<<<<<< HEAD
+ +	    mmu->root_level >= PT64_ROOT_4LEVEL) {
+ +		if (mmu_check_root(vcpu, new_cr3 >> PAGE_SHIFT))
+ +			return false;
+ +
+ +		if (cached_root_available(vcpu, new_cr3, new_role)) {
+ +			/*
+ +			 * It is possible that the cached previous root page is
+ +			 * obsolete because of a change in the MMU generation
+ +			 * number. However, changing the generation number is
+ +			 * accompanied by KVM_REQ_MMU_RELOAD, which will free
+ +			 * the root set here and allocate a new one.
+ +			 */
+ +			kvm_make_request(KVM_REQ_LOAD_CR3, vcpu);
+ +			if (!skip_tlb_flush) {
+ +				kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
+ +				kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
+ +			}
+ +
+ +			/*
+ +			 * The last MMIO access's GVA and GPA are cached in the
+ +			 * VCPU. When switching to a new CR3, that GVA->GPA
+ +			 * mapping may no longer be valid. So clear any cached
+ +			 * MMIO info even when we don't need to sync the shadow
+ +			 * page tables.
+ +			 */
+ +			vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
+ +
+ +			__clear_sp_write_flooding_count(
+ +				page_header(mmu->root_hpa));
+ +
+ +			return true;
+ +		}
+ +	}
+++=======
++ 	    mmu->root_level >= PT64_ROOT_4LEVEL)
++ 		return !mmu_check_root(vcpu, new_pgd >> PAGE_SHIFT) &&
++ 		       cached_root_available(vcpu, new_pgd, new_role);
+++>>>>>>> be01e8e2c632 (KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code)
+  
+  	return false;
+  }
+  
+- static void __kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3,
++ static void __kvm_mmu_new_pgd(struct kvm_vcpu *vcpu, gpa_t new_pgd,
+  			      union kvm_mmu_page_role new_role,
+ -			      bool skip_tlb_flush, bool skip_mmu_sync)
+ +			      bool skip_tlb_flush)
+ +{
+++<<<<<<< HEAD
+ +	if (!fast_cr3_switch(vcpu, new_cr3, new_role, skip_tlb_flush))
+ +		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu,
+ +				   KVM_MMU_ROOT_CURRENT);
+ +}
+ +
+ +void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush)
+  {
+ +	__kvm_mmu_new_cr3(vcpu, new_cr3, kvm_mmu_calc_root_page_role(vcpu),
+ +			  skip_tlb_flush);
+++=======
++ 	if (!fast_pgd_switch(vcpu, new_pgd, new_role)) {
++ 		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, KVM_MMU_ROOT_CURRENT);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * It's possible that the cached previous root page is obsolete because
++ 	 * of a change in the MMU generation number. However, changing the
++ 	 * generation number is accompanied by KVM_REQ_MMU_RELOAD, which will
++ 	 * free the root set here and allocate a new one.
++ 	 */
++ 	kvm_make_request(KVM_REQ_LOAD_MMU_PGD, vcpu);
++ 
++ 	if (!skip_mmu_sync || force_flush_and_sync_on_reuse)
++ 		kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
++ 	if (!skip_tlb_flush || force_flush_and_sync_on_reuse)
++ 		kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu);
++ 
++ 	/*
++ 	 * The last MMIO access's GVA and GPA are cached in the VCPU. When
++ 	 * switching to a new CR3, that GVA->GPA mapping may no longer be
++ 	 * valid. So clear any cached MMIO info even when we don't need to sync
++ 	 * the shadow page tables.
++ 	 */
++ 	vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
++ 
++ 	__clear_sp_write_flooding_count(page_header(vcpu->arch.mmu->root_hpa));
++ }
++ 
++ void kvm_mmu_new_pgd(struct kvm_vcpu *vcpu, gpa_t new_pgd, bool skip_tlb_flush,
++ 		     bool skip_mmu_sync)
++ {
++ 	__kvm_mmu_new_pgd(vcpu, new_pgd, kvm_mmu_calc_root_page_role(vcpu),
++ 			  skip_tlb_flush, skip_mmu_sync);
+++>>>>>>> be01e8e2c632 (KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code)
+  }
+- EXPORT_SYMBOL_GPL(kvm_mmu_new_cr3);
++ EXPORT_SYMBOL_GPL(kvm_mmu_new_pgd);
+  
+  static unsigned long get_cr3(struct kvm_vcpu *vcpu)
+  {
+@@@ -5099,7 -5034,7 +5147,11 @@@ void kvm_init_shadow_ept_mmu(struct kvm
+  		kvm_calc_shadow_ept_root_page_role(vcpu, accessed_dirty,
+  						   execonly, level);
+  
+++<<<<<<< HEAD
+ +	__kvm_mmu_new_cr3(vcpu, new_eptp, new_role.base, false);
+++=======
++ 	__kvm_mmu_new_pgd(vcpu, new_eptp, new_role.base, true, true);
+++>>>>>>> be01e8e2c632 (KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code)
+  
+  	if (new_role.as_u64 == context->mmu_role.as_u64)
+  		return;
+diff --cc arch/x86/kvm/vmx/nested.c
+index 760296c07825,aca57d8da400..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -1101,8 -1142,14 +1101,13 @@@ static int nested_vmx_load_cr3(struct k
+  		}
+  	}
+  
+ -	/*
+ -	 * Unconditionally skip the TLB flush on fast CR3 switch, all TLB
+ -	 * flushes are handled by nested_vmx_transition_tlb_flush().  See
+ -	 * nested_vmx_transition_mmu_sync for details on skipping the MMU sync.
+ -	 */
+  	if (!nested_ept)
+++<<<<<<< HEAD
+ +		kvm_mmu_new_cr3(vcpu, cr3, false);
+++=======
++ 		kvm_mmu_new_pgd(vcpu, cr3, true,
++ 				!nested_vmx_transition_mmu_sync(vcpu));
+++>>>>>>> be01e8e2c632 (KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code)
+  
+  	vcpu->arch.cr3 = cr3;
+  	kvm_register_mark_available(vcpu, VCPU_EXREG_CR3);
+diff --cc arch/x86/kvm/x86.c
+index 0a8a4dd82886,de77bc9bd0d7..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1006,7 -1031,7 +1006,11 @@@ int kvm_set_cr3(struct kvm_vcpu *vcpu, 
+  		 !load_pdptrs(vcpu, vcpu->arch.walk_mmu, cr3))
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	kvm_mmu_new_cr3(vcpu, cr3, skip_tlb_flush);
+++=======
++ 	kvm_mmu_new_pgd(vcpu, cr3, skip_tlb_flush, skip_tlb_flush);
+++>>>>>>> be01e8e2c632 (KVM: x86: Replace "cr3" with "pgd" in "new cr3/pgd" related code)
+  	vcpu->arch.cr3 = cr3;
+  	kvm_register_mark_available(vcpu, VCPU_EXREG_CR3);
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/vmx/nested.c
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index dbadf7ce3b2f..baaadddd676c 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -5556,7 +5556,7 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
+ 		}
+ 
+ 		for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+-			if (kvm_get_pcid(vcpu, vcpu->arch.mmu->prev_roots[i].cr3)
++			if (kvm_get_pcid(vcpu, vcpu->arch.mmu->prev_roots[i].pgd)
+ 			    == operand.pcid)
+ 				roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
+ 
+* Unmerged path arch/x86/kvm/x86.c
