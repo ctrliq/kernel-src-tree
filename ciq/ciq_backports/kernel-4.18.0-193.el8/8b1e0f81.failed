@@ -1,0 +1,379 @@
+mm/pgtable: drop pgtable_t variable from pte_fn_t functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Anshuman Khandual <anshuman.khandual@arm.com>
+commit 8b1e0f81fb6fcf3109465a168b2e2da3f711fa86
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8b1e0f81.failed
+
+Drop the pgtable_t variable from all implementation for pte_fn_t as none
+of them use it.  apply_to_pte_range() should stop computing it as well.
+Should help us save some cycles.
+
+Link: http://lkml.kernel.org/r/1556803126-26596-1-git-send-email-anshuman.khandual@arm.com
+	Signed-off-by: Anshuman Khandual <anshuman.khandual@arm.com>
+	Acked-by: Matthew Wilcox <willy@infradead.org>
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Logan Gunthorpe <logang@deltatee.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: <jglisse@redhat.com>
+	Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8b1e0f81fb6fcf3109465a168b2e2da3f711fa86)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/xen/mmu_pv.c
+diff --cc arch/x86/xen/mmu_pv.c
+index 283841f8d9fa,f6e5eeecfc69..000000000000
+--- a/arch/x86/xen/mmu_pv.c
++++ b/arch/x86/xen/mmu_pv.c
+@@@ -2670,6 -2672,137 +2670,140 @@@ void xen_destroy_contiguous_region(phys
+  }
+  EXPORT_SYMBOL_GPL(xen_destroy_contiguous_region);
+  
+++<<<<<<< HEAD
+++=======
++ static noinline void xen_flush_tlb_all(void)
++ {
++ 	struct mmuext_op *op;
++ 	struct multicall_space mcs;
++ 
++ 	preempt_disable();
++ 
++ 	mcs = xen_mc_entry(sizeof(*op));
++ 
++ 	op = mcs.args;
++ 	op->cmd = MMUEXT_TLB_FLUSH_ALL;
++ 	MULTI_mmuext_op(mcs.mc, op, 1, NULL, DOMID_SELF);
++ 
++ 	xen_mc_issue(PARAVIRT_LAZY_MMU);
++ 
++ 	preempt_enable();
++ }
++ 
++ #define REMAP_BATCH_SIZE 16
++ 
++ struct remap_data {
++ 	xen_pfn_t *pfn;
++ 	bool contiguous;
++ 	bool no_translate;
++ 	pgprot_t prot;
++ 	struct mmu_update *mmu_update;
++ };
++ 
++ static int remap_area_pfn_pte_fn(pte_t *ptep, unsigned long addr, void *data)
++ {
++ 	struct remap_data *rmd = data;
++ 	pte_t pte = pte_mkspecial(mfn_pte(*rmd->pfn, rmd->prot));
++ 
++ 	/*
++ 	 * If we have a contiguous range, just update the pfn itself,
++ 	 * else update pointer to be "next pfn".
++ 	 */
++ 	if (rmd->contiguous)
++ 		(*rmd->pfn)++;
++ 	else
++ 		rmd->pfn++;
++ 
++ 	rmd->mmu_update->ptr = virt_to_machine(ptep).maddr;
++ 	rmd->mmu_update->ptr |= rmd->no_translate ?
++ 		MMU_PT_UPDATE_NO_TRANSLATE :
++ 		MMU_NORMAL_PT_UPDATE;
++ 	rmd->mmu_update->val = pte_val_ma(pte);
++ 	rmd->mmu_update++;
++ 
++ 	return 0;
++ }
++ 
++ int xen_remap_pfn(struct vm_area_struct *vma, unsigned long addr,
++ 		  xen_pfn_t *pfn, int nr, int *err_ptr, pgprot_t prot,
++ 		  unsigned int domid, bool no_translate, struct page **pages)
++ {
++ 	int err = 0;
++ 	struct remap_data rmd;
++ 	struct mmu_update mmu_update[REMAP_BATCH_SIZE];
++ 	unsigned long range;
++ 	int mapped = 0;
++ 
++ 	BUG_ON(!((vma->vm_flags & (VM_PFNMAP | VM_IO)) == (VM_PFNMAP | VM_IO)));
++ 
++ 	rmd.pfn = pfn;
++ 	rmd.prot = prot;
++ 	/*
++ 	 * We use the err_ptr to indicate if there we are doing a contiguous
++ 	 * mapping or a discontigious mapping.
++ 	 */
++ 	rmd.contiguous = !err_ptr;
++ 	rmd.no_translate = no_translate;
++ 
++ 	while (nr) {
++ 		int index = 0;
++ 		int done = 0;
++ 		int batch = min(REMAP_BATCH_SIZE, nr);
++ 		int batch_left = batch;
++ 
++ 		range = (unsigned long)batch << PAGE_SHIFT;
++ 
++ 		rmd.mmu_update = mmu_update;
++ 		err = apply_to_page_range(vma->vm_mm, addr, range,
++ 					  remap_area_pfn_pte_fn, &rmd);
++ 		if (err)
++ 			goto out;
++ 
++ 		/*
++ 		 * We record the error for each page that gives an error, but
++ 		 * continue mapping until the whole set is done
++ 		 */
++ 		do {
++ 			int i;
++ 
++ 			err = HYPERVISOR_mmu_update(&mmu_update[index],
++ 						    batch_left, &done, domid);
++ 
++ 			/*
++ 			 * @err_ptr may be the same buffer as @gfn, so
++ 			 * only clear it after each chunk of @gfn is
++ 			 * used.
++ 			 */
++ 			if (err_ptr) {
++ 				for (i = index; i < index + done; i++)
++ 					err_ptr[i] = 0;
++ 			}
++ 			if (err < 0) {
++ 				if (!err_ptr)
++ 					goto out;
++ 				err_ptr[i] = err;
++ 				done++; /* Skip failed frame. */
++ 			} else
++ 				mapped += done;
++ 			batch_left -= done;
++ 			index += done;
++ 		} while (batch_left);
++ 
++ 		nr -= batch;
++ 		addr += range;
++ 		if (err_ptr)
++ 			err_ptr += batch;
++ 		cond_resched();
++ 	}
++ out:
++ 
++ 	xen_flush_tlb_all();
++ 
++ 	return err < 0 ? err : mapped;
++ }
++ EXPORT_SYMBOL_GPL(xen_remap_pfn);
++ 
+++>>>>>>> 8b1e0f81fb6f (mm/pgtable: drop pgtable_t variable from pte_fn_t functions)
+  #ifdef CONFIG_KEXEC_CORE
+  phys_addr_t paddr_vmcoreinfo_note(void)
+  {
+diff --git a/arch/arm/kernel/efi.c b/arch/arm/kernel/efi.c
+index 9f43ba012d10..b1f142a01f2f 100644
+--- a/arch/arm/kernel/efi.c
++++ b/arch/arm/kernel/efi.c
+@@ -11,8 +11,7 @@
+ #include <asm/mach/map.h>
+ #include <asm/mmu_context.h>
+ 
+-static int __init set_permissions(pte_t *ptep, pgtable_t token,
+-				  unsigned long addr, void *data)
++static int __init set_permissions(pte_t *ptep, unsigned long addr, void *data)
+ {
+ 	efi_memory_desc_t *md = data;
+ 	pte_t pte = *ptep;
+diff --git a/arch/arm/mm/dma-mapping.c b/arch/arm/mm/dma-mapping.c
+index 121c6c3ba9e0..ed17026d70f8 100644
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@ -502,8 +502,7 @@ void __init dma_contiguous_remap(void)
+ 	}
+ }
+ 
+-static int __dma_update_pte(pte_t *pte, pgtable_t token, unsigned long addr,
+-			    void *data)
++static int __dma_update_pte(pte_t *pte, unsigned long addr, void *data)
+ {
+ 	struct page *page = virt_to_page(addr);
+ 	pgprot_t prot = *(pgprot_t *)data;
+diff --git a/arch/arm/mm/pageattr.c b/arch/arm/mm/pageattr.c
+index 1403cb4a0c3d..c8b500940e1f 100644
+--- a/arch/arm/mm/pageattr.c
++++ b/arch/arm/mm/pageattr.c
+@@ -22,8 +22,7 @@ struct page_change_data {
+ 	pgprot_t clear_mask;
+ };
+ 
+-static int change_page_range(pte_t *ptep, pgtable_t token, unsigned long addr,
+-			void *data)
++static int change_page_range(pte_t *ptep, unsigned long addr, void *data)
+ {
+ 	struct page_change_data *cdata = data;
+ 	pte_t pte = *ptep;
+diff --git a/arch/arm64/kernel/efi.c b/arch/arm64/kernel/efi.c
+index 4f9acb5fbe97..230cff073a08 100644
+--- a/arch/arm64/kernel/efi.c
++++ b/arch/arm64/kernel/efi.c
+@@ -86,8 +86,7 @@ int __init efi_create_mapping(struct mm_struct *mm, efi_memory_desc_t *md)
+ 	return 0;
+ }
+ 
+-static int __init set_permissions(pte_t *ptep, pgtable_t token,
+-				  unsigned long addr, void *data)
++static int __init set_permissions(pte_t *ptep, unsigned long addr, void *data)
+ {
+ 	efi_memory_desc_t *md = data;
+ 	pte_t pte = READ_ONCE(*ptep);
+diff --git a/arch/arm64/mm/pageattr.c b/arch/arm64/mm/pageattr.c
+index 9c6b9039ec8f..2534a79cade5 100644
+--- a/arch/arm64/mm/pageattr.c
++++ b/arch/arm64/mm/pageattr.c
+@@ -27,8 +27,7 @@ struct page_change_data {
+ 
+ bool rodata_full __ro_after_init = IS_ENABLED(CONFIG_RODATA_FULL_DEFAULT_ENABLED);
+ 
+-static int change_page_range(pte_t *ptep, pgtable_t token, unsigned long addr,
+-			void *data)
++static int change_page_range(pte_t *ptep, unsigned long addr, void *data)
+ {
+ 	struct page_change_data *cdata = data;
+ 	pte_t pte = READ_ONCE(*ptep);
+* Unmerged path arch/x86/xen/mmu_pv.c
+diff --git a/drivers/gpu/drm/i915/i915_mm.c b/drivers/gpu/drm/i915/i915_mm.c
+index e4935dd1fd37..c23bb29e6d3e 100644
+--- a/drivers/gpu/drm/i915/i915_mm.c
++++ b/drivers/gpu/drm/i915/i915_mm.c
+@@ -35,8 +35,7 @@ struct remap_pfn {
+ 	pgprot_t prot;
+ };
+ 
+-static int remap_pfn(pte_t *pte, pgtable_t token,
+-		     unsigned long addr, void *data)
++static int remap_pfn(pte_t *pte, unsigned long addr, void *data)
+ {
+ 	struct remap_pfn *r = data;
+ 
+diff --git a/drivers/xen/gntdev.c b/drivers/xen/gntdev.c
+index bd56653b9bbc..f6ccd0a4a3e1 100644
+--- a/drivers/xen/gntdev.c
++++ b/drivers/xen/gntdev.c
+@@ -236,8 +236,7 @@ static void gntdev_put_map(struct gntdev_priv *priv, struct grant_map *map)
+ 
+ /* ------------------------------------------------------------------ */
+ 
+-static int find_grant_ptes(pte_t *pte, pgtable_t token,
+-		unsigned long addr, void *data)
++static int find_grant_ptes(pte_t *pte, unsigned long addr, void *data)
+ {
+ 	struct grant_map *map = data;
+ 	unsigned int pgnr = (addr - map->vma->vm_start) >> PAGE_SHIFT;
+@@ -264,8 +263,7 @@ static int find_grant_ptes(pte_t *pte, pgtable_t token,
+ }
+ 
+ #ifdef CONFIG_X86
+-static int set_grant_ptes_as_special(pte_t *pte, pgtable_t token,
+-				     unsigned long addr, void *data)
++static int set_grant_ptes_as_special(pte_t *pte, unsigned long addr, void *data)
+ {
+ 	set_pte_at(current->mm, addr, pte, pte_mkspecial(*pte));
+ 	return 0;
+diff --git a/drivers/xen/privcmd.c b/drivers/xen/privcmd.c
+index b24ddac1604b..4c7268869e2c 100644
+--- a/drivers/xen/privcmd.c
++++ b/drivers/xen/privcmd.c
+@@ -730,8 +730,7 @@ struct remap_pfn {
+ 	unsigned long i;
+ };
+ 
+-static int remap_pfn_fn(pte_t *ptep, pgtable_t token, unsigned long addr,
+-			void *data)
++static int remap_pfn_fn(pte_t *ptep, unsigned long addr, void *data)
+ {
+ 	struct remap_pfn *r = data;
+ 	struct page *page = r->pages[r->i];
+@@ -965,8 +964,7 @@ static int privcmd_mmap(struct file *file, struct vm_area_struct *vma)
+  * on a per pfn/pte basis. Mapping calls that fail with ENOENT
+  * can be then retried until success.
+  */
+-static int is_mapped_fn(pte_t *pte, struct page *pmd_page,
+-	                unsigned long addr, void *data)
++static int is_mapped_fn(pte_t *pte, unsigned long addr, void *data)
+ {
+ 	return pte_none(*pte) ? 0 : -EBUSY;
+ }
+diff --git a/drivers/xen/xlate_mmu.c b/drivers/xen/xlate_mmu.c
+index 23f1387b3ef7..5d46ec5a80ca 100644
+--- a/drivers/xen/xlate_mmu.c
++++ b/drivers/xen/xlate_mmu.c
+@@ -92,8 +92,7 @@ static void setup_hparams(unsigned long gfn, void *data)
+ 	info->fgfn++;
+ }
+ 
+-static int remap_pte_fn(pte_t *ptep, pgtable_t token, unsigned long addr,
+-			void *data)
++static int remap_pte_fn(pte_t *ptep, unsigned long addr, void *data)
+ {
+ 	struct remap_data *info = data;
+ 	struct page *page = info->pages[info->index++];
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index d0cd419aec89..dc41e5cf4fd5 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2656,8 +2656,7 @@ static inline int vm_fault_to_errno(int vm_fault, int foll_flags)
+ 	return 0;
+ }
+ 
+-typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
+-			void *data);
++typedef int (*pte_fn_t)(pte_t *pte, unsigned long addr, void *data);
+ extern int apply_to_page_range(struct mm_struct *mm, unsigned long address,
+ 			       unsigned long size, pte_fn_t fn, void *data);
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index d4172eb72cef..3d766f9a1b7c 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2287,7 +2287,6 @@ static int apply_to_pte_range(struct mm_struct *mm, pmd_t *pmd,
+ {
+ 	pte_t *pte;
+ 	int err;
+-	pgtable_t token;
+ 	spinlock_t *uninitialized_var(ptl);
+ 
+ 	pte = (mm == &init_mm) ?
+@@ -2300,10 +2299,8 @@ static int apply_to_pte_range(struct mm_struct *mm, pmd_t *pmd,
+ 
+ 	arch_enter_lazy_mmu_mode();
+ 
+-	token = pmd_pgtable(*pmd);
+-
+ 	do {
+-		err = fn(pte++, token, addr, data);
++		err = fn(pte++, addr, data);
+ 		if (err)
+ 			break;
+ 	} while (addr += PAGE_SIZE, addr != end);
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 79ea0c5f46db..2ee9f1677a60 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2383,7 +2383,7 @@ void __weak vmalloc_sync_all(void)
+ }
+ 
+ 
+-static int f(pte_t *pte, pgtable_t table, unsigned long addr, void *data)
++static int f(pte_t *pte, unsigned long addr, void *data)
+ {
+ 	pte_t ***p = data;
+ 
