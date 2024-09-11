@@ -1,0 +1,158 @@
+io_uring: allow use of offset == -1 to mean file position
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit ba04291eb66ed895f194ae5abd3748d72bf8aaea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ba04291e.failed
+
+This behaves like preadv2/pwritev2 with offset == -1, it'll use (and
+update) the current file position. This obviously comes with the caveat
+that if the application has multiple read/writes in flight, then the
+end result will not be as expected. This is similar to threads sharing
+a file descriptor and doing IO using the current file position.
+
+Since this feature isn't easily detectable by doing a read or write,
+add a feature flags, IORING_FEAT_RW_CUR_POS, to allow applications to
+detect presence of this feature.
+
+	Reported-by: 李通洲 <carter.li@eoitek.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit ba04291eb66ed895f194ae5abd3748d72bf8aaea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+#	include/uapi/linux/io_uring.h
+diff --cc fs/io_uring.c
+index eb3b77d5111e,5286620e4e46..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -334,9 -483,19 +334,22 @@@ struct io_kiocb 
+  #define REQ_F_IO_DRAIN		16	/* drain existing IO first */
+  #define REQ_F_IO_DRAINED	32	/* drain done */
+  #define REQ_F_LINK		64	/* linked sqes */
+ -#define REQ_F_LINK_TIMEOUT	128	/* has linked timeout */
+ +#define REQ_F_LINK_DONE		128	/* linked sqes done */
+  #define REQ_F_FAIL_LINK		256	/* fail rest of links */
+++<<<<<<< HEAD
+ +#define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+++=======
++ #define REQ_F_DRAIN_LINK	512	/* link should be fully drained */
++ #define REQ_F_TIMEOUT		1024	/* timeout request */
++ #define REQ_F_ISREG		2048	/* regular file */
++ #define REQ_F_MUST_PUNT		4096	/* must be punted even for NONBLOCK */
++ #define REQ_F_TIMEOUT_NOSEQ	8192	/* no timeout sequence */
++ #define REQ_F_INFLIGHT		16384	/* on inflight list */
++ #define REQ_F_COMP_LOCKED	32768	/* completion under lock */
++ #define REQ_F_HARDLINK		65536	/* doesn't sever on completion < 0 */
++ #define REQ_F_FORCE_ASYNC	131072	/* IOSQE_ASYNC */
++ #define REQ_F_CUR_POS		262144	/* read/write uses file position */
+++>>>>>>> ba04291eb66e (io_uring: allow use of offset == -1 to mean file position)
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+@@@ -1036,10 -1708,14 +1049,14 @@@ static int io_prep_rw(struct io_kiocb *
+  	if (!req->file)
+  		return -EBADF;
+  
+ -	if (S_ISREG(file_inode(req->file)->i_mode))
+ -		req->flags |= REQ_F_ISREG;
+ +	if (force_nonblock && !io_file_supports_async(req->file))
+ +		force_nonblock = false;
+  
+  	kiocb->ki_pos = READ_ONCE(sqe->off);
++ 	if (kiocb->ki_pos == -1 && !(req->file->f_mode & FMODE_STREAM)) {
++ 		req->flags |= REQ_F_CUR_POS;
++ 		kiocb->ki_pos = req->file->f_pos;
++ 	}
+  	kiocb->ki_flags = iocb_flags(kiocb->ki_filp);
+  	kiocb->ki_hint = ki_hint_validate(file_write_hint(kiocb->ki_filp));
+  
+@@@ -1101,11 -1784,24 +1118,29 @@@ static inline void io_rw_done(struct ki
+  	}
+  }
+  
+ -static void kiocb_done(struct kiocb *kiocb, ssize_t ret, struct io_kiocb **nxt,
+ -		       bool in_async)
+ +static int io_import_fixed(struct io_ring_ctx *ctx, int rw,
+ +			   const struct io_uring_sqe *sqe,
+ +			   struct iov_iter *iter)
+  {
+++<<<<<<< HEAD
+ +	size_t len = READ_ONCE(sqe->len);
+++=======
++ 	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw.kiocb);
++ 
++ 	if (req->flags & REQ_F_CUR_POS)
++ 		req->file->f_pos = kiocb->ki_pos;
++ 	if (in_async && ret >= 0 && kiocb->ki_complete == io_complete_rw)
++ 		*nxt = __io_complete_rw(kiocb, ret);
++ 	else
++ 		io_rw_done(kiocb, ret);
++ }
++ 
++ static ssize_t io_import_fixed(struct io_kiocb *req, int rw,
++ 			       struct iov_iter *iter)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	size_t len = req->rw.len;
+++>>>>>>> ba04291eb66e (io_uring: allow use of offset == -1 to mean file position)
+  	struct io_mapped_ubuf *imu;
+  	unsigned index, buf_index;
+  	size_t offset;
+@@@ -3856,22 -6162,9 +3891,28 @@@ static int io_uring_create(unsigned ent
+  	if (ret < 0)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	memset(&p->sq_off, 0, sizeof(p->sq_off));
+ +	p->sq_off.head = offsetof(struct io_sq_ring, r.head);
+ +	p->sq_off.tail = offsetof(struct io_sq_ring, r.tail);
+ +	p->sq_off.ring_mask = offsetof(struct io_sq_ring, ring_mask);
+ +	p->sq_off.ring_entries = offsetof(struct io_sq_ring, ring_entries);
+ +	p->sq_off.flags = offsetof(struct io_sq_ring, flags);
+ +	p->sq_off.dropped = offsetof(struct io_sq_ring, dropped);
+ +	p->sq_off.array = offsetof(struct io_sq_ring, array);
+ +
+ +	memset(&p->cq_off, 0, sizeof(p->cq_off));
+ +	p->cq_off.head = offsetof(struct io_cq_ring, r.head);
+ +	p->cq_off.tail = offsetof(struct io_cq_ring, r.tail);
+ +	p->cq_off.ring_mask = offsetof(struct io_cq_ring, ring_mask);
+ +	p->cq_off.ring_entries = offsetof(struct io_cq_ring, ring_entries);
+ +	p->cq_off.overflow = offsetof(struct io_cq_ring, overflow);
+ +	p->cq_off.cqes = offsetof(struct io_cq_ring, cqes);
+++=======
++ 	p->features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP |
++ 			IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS;
++ 	trace_io_uring_create(ret, ctx, p->sq_entries, p->cq_entries, p->flags);
+++>>>>>>> ba04291eb66e (io_uring: allow use of offset == -1 to mean file position)
+  	return ret;
+  err:
+  	io_ring_ctx_wait_and_kill(ctx);
+diff --cc include/uapi/linux/io_uring.h
+index 22b1c5919fbd,1f96136eb6ee..000000000000
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@@ -135,6 -169,14 +135,17 @@@ struct io_uring_params 
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * io_uring_params->features flags
++  */
++ #define IORING_FEAT_SINGLE_MMAP		(1U << 0)
++ #define IORING_FEAT_NODROP		(1U << 1)
++ #define IORING_FEAT_SUBMIT_STABLE	(1U << 2)
++ #define IORING_FEAT_RW_CUR_POS		(1U << 3)
++ 
++ /*
+++>>>>>>> ba04291eb66e (io_uring: allow use of offset == -1 to mean file position)
+   * io_uring_register(2) opcodes and arguments
+   */
+  #define IORING_REGISTER_BUFFERS		0
+* Unmerged path fs/io_uring.c
+* Unmerged path include/uapi/linux/io_uring.h
