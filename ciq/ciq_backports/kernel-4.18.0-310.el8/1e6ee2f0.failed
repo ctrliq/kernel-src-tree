@@ -1,0 +1,149 @@
+kcsan: Add option to assume plain aligned writes up to word size are atomic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Marco Elver <elver@google.com>
+commit 1e6ee2f0fe8ae682757960edf455e99f611268a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/1e6ee2f0.failed
+
+This adds option KCSAN_ASSUME_PLAIN_WRITES_ATOMIC. If enabled, plain
+aligned writes up to word size are assumed to be atomic, and also not
+subject to other unsafe compiler optimizations resulting in data races.
+
+This option has been enabled by default to reflect current kernel-wide
+preferences.
+
+	Signed-off-by: Marco Elver <elver@google.com>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1e6ee2f0fe8ae682757960edf455e99f611268a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kcsan/core.c
+#	lib/Kconfig.kcsan
+diff --cc kernel/kcsan/core.c
+index bd5367587563,e3c7d8f34f2f..000000000000
+--- a/kernel/kcsan/core.c
++++ b/kernel/kcsan/core.c
+@@@ -175,10 -170,20 +176,24 @@@ static inline struct kcsan_ctx *get_ctx
+  	return in_task() ? &current->kcsan_ctx : raw_cpu_ptr(&kcsan_cpu_ctx);
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool is_atomic(const volatile void *ptr)
+++=======
++ static __always_inline bool
++ is_atomic(const volatile void *ptr, size_t size, int type)
+++>>>>>>> 1e6ee2f0fe8a (kcsan: Add option to assume plain aligned writes up to word size are atomic)
+  {
+- 	struct kcsan_ctx *ctx = get_ctx();
++ 	struct kcsan_ctx *ctx;
+  
++ 	if ((type & KCSAN_ACCESS_ATOMIC) != 0)
++ 		return true;
++ 
++ 	if (IS_ENABLED(CONFIG_KCSAN_ASSUME_PLAIN_WRITES_ATOMIC) &&
++ 	    (type & KCSAN_ACCESS_WRITE) != 0 && size <= sizeof(long) &&
++ 	    IS_ALIGNED((unsigned long)ptr, size))
++ 		return true; /* Assume aligned writes up to word size are atomic. */
++ 
++ 	ctx = get_ctx();
+  	if (unlikely(ctx->atomic_next > 0)) {
+  		/*
+  		 * Because we do not have separate contexts for nested
+@@@ -199,7 -204,8 +214,12 @@@
+  	return kcsan_is_atomic(ptr);
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool should_watch(const volatile void *ptr, int type)
+++=======
++ static __always_inline bool
++ should_watch(const volatile void *ptr, size_t size, int type)
+++>>>>>>> 1e6ee2f0fe8a (kcsan: Add option to assume plain aligned writes up to word size are atomic)
+  {
+  	/*
+  	 * Never set up watchpoints when memory operations are atomic.
+@@@ -462,10 -470,10 +482,15 @@@ static __always_inline void check_acces
+  	 */
+  
+  	if (unlikely(watchpoint != NULL))
+ -		kcsan_found_watchpoint(ptr, size, type, watchpoint,
+ +		kcsan_found_watchpoint(ptr, size, is_write, watchpoint,
+  				       encoded_watchpoint);
+++<<<<<<< HEAD
+ +	else if (unlikely(should_watch(ptr, type)))
+ +		kcsan_setup_watchpoint(ptr, size, is_write);
+++=======
++ 	else if (unlikely(should_watch(ptr, size, type)))
++ 		kcsan_setup_watchpoint(ptr, size, type);
+++>>>>>>> 1e6ee2f0fe8a (kcsan: Add option to assume plain aligned writes up to word size are atomic)
+  }
+  
+  /* === Public interface ===================================================== */
+diff --cc lib/Kconfig.kcsan
+index 40794f884f31,66126853dab0..000000000000
+--- a/lib/Kconfig.kcsan
++++ b/lib/Kconfig.kcsan
+@@@ -103,13 -81,23 +103,33 @@@ config KCSAN_SKIP_WATCH_RANDOMIZ
+  	  KCSAN_WATCH_SKIP. If false, the chosen value is always
+  	  KCSAN_WATCH_SKIP.
+  
+++<<<<<<< HEAD
+ +# Note that, while some of the below options could be turned into boot
+ +# parameters, to optimize for the common use-case, we avoid this because: (a)
+ +# it would impact performance (and we want to avoid static branch for all
+ +# {READ,WRITE}_ONCE, atomic_*, bitops, etc.), and (b) complicate the design
+ +# without real benefit. The main purpose of the below options are for use in
+ +# fuzzer configs to control reported data races, and are not expected to be
+ +# switched frequently by a user.
+++=======
++ config KCSAN_REPORT_ONCE_IN_MS
++ 	int "Duration in milliseconds, in which any given data race is only reported once"
++ 	default 3000
++ 	help
++ 	  Any given data race is only reported once in the defined time window.
++ 	  Different data races may still generate reports within a duration
++ 	  that is smaller than the duration defined here. This allows rate
++ 	  limiting reporting to avoid flooding the console with reports.
++ 	  Setting this to 0 disables rate limiting.
++ 
++ # The main purpose of the below options is to control reported data races (e.g.
++ # in fuzzer configs), and are not expected to be switched frequently by other
++ # users. We could turn some of them into boot parameters, but given they should
++ # not be switched normally, let's keep them here to simplify configuration.
++ #
++ # The defaults below are chosen to be very conservative, and may miss certain
++ # bugs.
+++>>>>>>> 1e6ee2f0fe8a (kcsan: Add option to assume plain aligned writes up to word size are atomic)
+  
+  config KCSAN_REPORT_RACE_UNKNOWN_ORIGIN
+  	bool "Report races of unknown origin"
+@@@ -128,9 -116,21 +148,22 @@@ config KCSAN_REPORT_VALUE_CHANGE_ONL
+  	  the data value of the memory location was observed to remain
+  	  unchanged, do not report the data race.
+  
++ config KCSAN_ASSUME_PLAIN_WRITES_ATOMIC
++ 	bool "Assume that plain aligned writes up to word size are atomic"
++ 	default y
++ 	help
++ 	  Assume that plain aligned writes up to word size are atomic by
++ 	  default, and also not subject to other unsafe compiler optimizations
++ 	  resulting in data races. This will cause KCSAN to not report data
++ 	  races due to conflicts where the only plain accesses are aligned
++ 	  writes up to word size: conflicts between marked reads and plain
++ 	  aligned writes up to word size will not be reported as data races;
++ 	  notice that data races between two conflicting plain aligned writes
++ 	  will also not be reported.
++ 
+  config KCSAN_IGNORE_ATOMICS
+  	bool "Do not instrument marked atomic accesses"
+ +	default n
+  	help
+  	  If enabled, never instruments marked atomic accesses. This results in
+  	  not reporting data races where one access is atomic and the other is
+* Unmerged path kernel/kcsan/core.c
+* Unmerged path lib/Kconfig.kcsan
