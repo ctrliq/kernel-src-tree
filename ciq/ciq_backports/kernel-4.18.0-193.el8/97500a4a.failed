@@ -1,0 +1,194 @@
+mm: maintain randomization of page free lists
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] maintain randomization of page free lists (Rafael Aquini) [1620349]
+Rebuild_FUZZ: 95.35%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 97500a4a54876d3d6d2d1b8419223eb4e69b32d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/97500a4a.failed
+
+When freeing a page with an order >= shuffle_page_order randomly select
+the front or back of the list for insertion.
+
+While the mm tries to defragment physical pages into huge pages this can
+tend to make the page allocator more predictable over time.  Inject the
+front-back randomness to preserve the initial randomness established by
+shuffle_free_memory() when the kernel was booted.
+
+The overhead of this manipulation is constrained by only being applied
+for MAX_ORDER sized pages by default.
+
+[akpm@linux-foundation.org: coding-style fixes]
+Link: http://lkml.kernel.org/r/154899812788.3165233.9066631950746578517.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Keith Busch <keith.busch@intel.com>
+	Cc: Robert Elliott <elliott@hpe.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 97500a4a54876d3d6d2d1b8419223eb4e69b32d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	mm/page_alloc.c
+diff --cc include/linux/mmzone.h
+index 749ff0d98490,70394cabaf4e..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -99,6 -100,62 +99,65 @@@ struct free_area 
+  	unsigned long		nr_free;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Used for pages not on another list */
++ static inline void add_to_free_area(struct page *page, struct free_area *area,
++ 			     int migratetype)
++ {
++ 	list_add(&page->lru, &area->free_list[migratetype]);
++ 	area->nr_free++;
++ }
++ 
++ /* Used for pages not on another list */
++ static inline void add_to_free_area_tail(struct page *page, struct free_area *area,
++ 				  int migratetype)
++ {
++ 	list_add_tail(&page->lru, &area->free_list[migratetype]);
++ 	area->nr_free++;
++ }
++ 
++ #ifdef CONFIG_SHUFFLE_PAGE_ALLOCATOR
++ /* Used to preserve page allocation order entropy */
++ void add_to_free_area_random(struct page *page, struct free_area *area,
++ 		int migratetype);
++ #else
++ static inline void add_to_free_area_random(struct page *page,
++ 		struct free_area *area, int migratetype)
++ {
++ 	add_to_free_area(page, area, migratetype);
++ }
++ #endif
++ 
++ /* Used for pages which are on another list */
++ static inline void move_to_free_area(struct page *page, struct free_area *area,
++ 			     int migratetype)
++ {
++ 	list_move(&page->lru, &area->free_list[migratetype]);
++ }
++ 
++ static inline struct page *get_page_from_free_area(struct free_area *area,
++ 					    int migratetype)
++ {
++ 	return list_first_entry_or_null(&area->free_list[migratetype],
++ 					struct page, lru);
++ }
++ 
++ static inline void del_page_from_free_area(struct page *page,
++ 		struct free_area *area)
++ {
++ 	list_del(&page->lru);
++ 	__ClearPageBuddy(page);
++ 	set_page_private(page, 0);
++ 	area->nr_free--;
++ }
++ 
++ static inline bool free_area_empty(struct free_area *area, int migratetype)
++ {
++ 	return list_empty(&area->free_list[migratetype]);
++ }
++ 
+++>>>>>>> 97500a4a5487 (mm: maintain randomization of page free lists)
+  struct pglist_data;
+  
+  /*
+diff --cc mm/page_alloc.c
+index 408ce1a15e62,3b13d3914176..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -895,9 -974,12 +897,18 @@@ done_merging
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	list_add(&page->lru, &zone->free_area[order].free_list[migratetype]);
+ +out:
+ +	zone->free_area[order].nr_free++;
+++=======
++ 	if (is_shuffle_order(order))
++ 		add_to_free_area_random(page, &zone->free_area[order],
++ 				migratetype);
++ 	else
++ 		add_to_free_area(page, &zone->free_area[order], migratetype);
++ 
+++>>>>>>> 97500a4a5487 (mm: maintain randomization of page free lists)
+  }
+  
+  /*
+* Unmerged path include/linux/mmzone.h
+* Unmerged path mm/page_alloc.c
+diff --git a/mm/shuffle.c b/mm/shuffle.c
+index bc0419a61fbe..3ce12481b1dc 100644
+--- a/mm/shuffle.c
++++ b/mm/shuffle.c
+@@ -182,3 +182,26 @@ void __meminit __shuffle_free_memory(pg_data_t *pgdat)
+ 	for (z = pgdat->node_zones; z < pgdat->node_zones + MAX_NR_ZONES; z++)
+ 		shuffle_zone(z);
+ }
++
++void add_to_free_area_random(struct page *page, struct free_area *area,
++		int migratetype)
++{
++	static u64 rand;
++	static u8 rand_bits;
++
++	/*
++	 * The lack of locking is deliberate. If 2 threads race to
++	 * update the rand state it just adds to the entropy.
++	 */
++	if (rand_bits == 0) {
++		rand_bits = 64;
++		rand = get_random_u64();
++	}
++
++	if (rand & 1)
++		add_to_free_area(page, area, migratetype);
++	else
++		add_to_free_area_tail(page, area, migratetype);
++	rand_bits--;
++	rand >>= 1;
++}
+diff --git a/mm/shuffle.h b/mm/shuffle.h
+index 644c8ee97b9e..777a257a0d2f 100644
+--- a/mm/shuffle.h
++++ b/mm/shuffle.h
+@@ -36,6 +36,13 @@ static inline void shuffle_zone(struct zone *z)
+ 		return;
+ 	__shuffle_zone(z);
+ }
++
++static inline bool is_shuffle_order(int order)
++{
++	if (!static_branch_unlikely(&page_alloc_shuffle_key))
++		return false;
++	return order >= SHUFFLE_ORDER;
++}
+ #else
+ static inline void shuffle_free_memory(pg_data_t *pgdat)
+ {
+@@ -48,5 +55,10 @@ static inline void shuffle_zone(struct zone *z)
+ static inline void page_alloc_shuffle(enum mm_shuffle_ctl ctl)
+ {
+ }
++
++static inline bool is_shuffle_order(int order)
++{
++	return false;
++}
+ #endif
+ #endif /* _MM_SHUFFLE_H */
