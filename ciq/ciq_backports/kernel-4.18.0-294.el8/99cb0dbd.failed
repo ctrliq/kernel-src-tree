@@ -1,0 +1,500 @@
+mm,thp: add read-only THP support for (non-shmem) FS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [mm] mm, thp: add read-only THP support for (non-shmem) FS (Waiman Long) [1877019]
+Rebuild_FUZZ: 99.05%
+commit-author Song Liu <songliubraving@fb.com>
+commit 99cb0dbd47a15d395bf3faa78dc122bc5efe3fc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/99cb0dbd.failed
+
+This patch is (hopefully) the first step to enable THP for non-shmem
+filesystems.
+
+This patch enables an application to put part of its text sections to THP
+via madvise, for example:
+
+    madvise((void *)0x600000, 0x200000, MADV_HUGEPAGE);
+
+We tried to reuse the logic for THP on tmpfs.
+
+Currently, write is not supported for non-shmem THP.  khugepaged will only
+process vma with VM_DENYWRITE.  sys_mmap() ignores VM_DENYWRITE requests
+(see ksys_mmap_pgoff).  The only way to create vma with VM_DENYWRITE is
+execve().  This requirement limits non-shmem THP to text sections.
+
+The next patch will handle writes, which would only happen when the all
+the vmas with VM_DENYWRITE are unmapped.
+
+An EXPERIMENTAL config, READ_ONLY_THP_FOR_FS, is added to gate this
+feature.
+
+[songliubraving@fb.com: fix build without CONFIG_SHMEM]
+  Link: http://lkml.kernel.org/r/F53407FB-96CC-42E8-9862-105C92CC2B98@fb.com
+[songliubraving@fb.com: fix double unlock in collapse_file()]
+  Link: http://lkml.kernel.org/r/B960CBFA-8EFC-4DA4-ABC5-1977FFF2CA57@fb.com
+Link: http://lkml.kernel.org/r/20190801184244.3169074-7-songliubraving@fb.com
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Acked-by: Rik van Riel <riel@surriel.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 99cb0dbd47a15d395bf3faa78dc122bc5efe3fc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/Kconfig
+#	mm/khugepaged.c
+diff --cc mm/Kconfig
+index ba2bdef1230d,a5dae9a7eb51..000000000000
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@@ -741,6 -709,20 +741,23 @@@ config GUP_BENCHMAR
+  
+  	  See tools/testing/selftests/vm/gup_benchmark.c
+  
+++<<<<<<< HEAD
+++=======
++ config GUP_GET_PTE_LOW_HIGH
++ 	bool
++ 
++ config READ_ONLY_THP_FOR_FS
++ 	bool "Read-only THP for filesystems (EXPERIMENTAL)"
++ 	depends on TRANSPARENT_HUGE_PAGECACHE && SHMEM
++ 
++ 	help
++ 	  Allow khugepaged to put read-only file-backed pages in THP.
++ 
++ 	  This is marked experimental because it is a new feature. Write
++ 	  support of file THPs will be developed in the next few release
++ 	  cycles.
++ 
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+  config ARCH_HAS_PTE_SPECIAL
+  	bool
+  
+diff --cc mm/khugepaged.c
+index 34da5213cf13,8607c77431b3..000000000000
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@@ -1288,22 -1293,22 +1294,28 @@@ static void retract_page_tables(struct 
+  }
+  
+  /**
+-  * collapse_file - collapse small tmpfs/shmem pages into huge one.
++  * collapse_file - collapse filemap/tmpfs/shmem pages into huge one.
+   *
+   * Basic scheme is simple, details are more complex:
+++<<<<<<< HEAD
+ + *  - allocate and freeze a new huge page;
+ + *  - scan over radix tree replacing old pages the new one
+ + *    + swap in pages if necessary;
+++=======
++  *  - allocate and lock a new huge page;
++  *  - scan page cache replacing old pages with the new one
++  *    + swap/gup in pages if necessary;
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+   *    + fill in gaps;
+ - *    + keep old pages around in case rollback is required;
+ - *  - if replacing succeeds:
+ + *    + keep old pages around in case if rollback is required;
+ + *  - if replacing succeed:
+   *    + copy data over;
+   *    + free old pages;
+ - *    + unlock huge page;
+ + *    + unfreeze huge page;
+   *  - if replacing failed;
+   *    + put all pages back and unfreeze them;
+ - *    + restore gaps in the page cache;
+ - *    + unlock and free huge page;
+ + *    + restore gaps in the radix-tree;
+ + *    + free huge page;
+   */
+  static void collapse_file(struct mm_struct *mm,
+  		struct file *file, pgoff_t start,
+@@@ -1315,10 -1320,11 +1327,12 @@@
+  	struct mem_cgroup *memcg;
+  	pgoff_t index, end = start + HPAGE_PMD_NR;
+  	LIST_HEAD(pagelist);
+ -	XA_STATE_ORDER(xas, &mapping->i_pages, start, HPAGE_PMD_ORDER);
+ +	struct radix_tree_iter iter;
+ +	void **slot;
+  	int nr_none = 0, result = SCAN_SUCCEED;
++ 	bool is_shmem = shmem_file(file);
+  
++ 	VM_BUG_ON(!IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) && !is_shmem);
+  	VM_BUG_ON(start & (HPAGE_PMD_NR - 1));
+  
+  	/* Only allocate from the target node */
+@@@ -1335,59 -1341,106 +1349,152 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* This will be less messy when we use multi-index entries */
++ 	do {
++ 		xas_lock_irq(&xas);
++ 		xas_create_range(&xas);
++ 		if (!xas_error(&xas))
++ 			break;
++ 		xas_unlock_irq(&xas);
++ 		if (!xas_nomem(&xas, GFP_KERNEL)) {
++ 			mem_cgroup_cancel_charge(new_page, memcg, true);
++ 			result = SCAN_FAIL;
++ 			goto out;
++ 		}
++ 	} while (1);
++ 
++ 	__SetPageLocked(new_page);
++ 	if (is_shmem)
++ 		__SetPageSwapBacked(new_page);
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+  	new_page->index = start;
+  	new_page->mapping = mapping;
+ +	__SetPageSwapBacked(new_page);
+ +	__SetPageLocked(new_page);
+ +	BUG_ON(!page_ref_freeze(new_page, 1));
+ +
+  
+  	/*
+ -	 * At this point the new_page is locked and not up-to-date.
+ -	 * It's safe to insert it into the page cache, because nobody would
+ -	 * be able to map it or use it in another way until we unlock it.
+ +	 * At this point the new_page is 'frozen' (page_count() is zero), locked
+ +	 * and not up-to-date. It's safe to insert it into radix tree, because
+ +	 * nobody would be able to map it or use it in other way until we
+ +	 * unfreeze it.
+  	 */
+  
+ -	xas_set(&xas, start);
+ -	for (index = start; index < end; index++) {
+ -		struct page *page = xas_next(&xas);
+ +	index = start;
+ +	xa_lock_irq(&mapping->i_pages);
+ +	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
+ +		int n = min(iter.index, end) - index;
+ +
+++<<<<<<< HEAD
+ +		/*
+ +		 * Handle holes in the radix tree: charge it from shmem and
+ +		 * insert relevant subpage of new_page into the radix-tree.
+ +		 */
+ +		if (n && !shmem_charge(mapping->host, n)) {
+ +			result = SCAN_FAIL;
+ +			break;
+ +		}
+ +		nr_none += n;
+ +		for (; index < min(iter.index, end); index++) {
+ +			radix_tree_insert(&mapping->i_pages, index,
+ +					new_page + (index % HPAGE_PMD_NR));
+ +		}
+ +
+ +		/* We are done. */
+ +		if (index >= end)
+ +			break;
+  
+ +		page = radix_tree_deref_slot_protected(slot,
+ +				&mapping->i_pages.xa_lock);
+ +		if (xa_is_value(page) || !PageUptodate(page)) {
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			/* swap in or instantiate fallocated page */
+ +			if (shmem_getpage(mapping->host, index, &page,
+ +						SGP_NOHUGE)) {
+ +				result = SCAN_FAIL;
+ +				goto tree_unlocked;
+ +			}
+ +			xa_lock_irq(&mapping->i_pages);
+ +		} else if (trylock_page(page)) {
+ +			get_page(page);
+ +		} else {
+ +			result = SCAN_PAGE_LOCK;
+ +			break;
+++=======
++ 		VM_BUG_ON(index != xas.xa_index);
++ 		if (is_shmem) {
++ 			if (!page) {
++ 				/*
++ 				 * Stop if extent has been truncated or
++ 				 * hole-punched, and is now completely
++ 				 * empty.
++ 				 */
++ 				if (index == start) {
++ 					if (!xas_next_entry(&xas, end - 1)) {
++ 						result = SCAN_TRUNCATED;
++ 						goto xa_locked;
++ 					}
++ 					xas_set(&xas, index);
++ 				}
++ 				if (!shmem_charge(mapping->host, 1)) {
++ 					result = SCAN_FAIL;
++ 					goto xa_locked;
++ 				}
++ 				xas_store(&xas, new_page);
++ 				nr_none++;
++ 				continue;
++ 			}
++ 
++ 			if (xa_is_value(page) || !PageUptodate(page)) {
++ 				xas_unlock_irq(&xas);
++ 				/* swap in or instantiate fallocated page */
++ 				if (shmem_getpage(mapping->host, index, &page,
++ 						  SGP_NOHUGE)) {
++ 					result = SCAN_FAIL;
++ 					goto xa_unlocked;
++ 				}
++ 			} else if (trylock_page(page)) {
++ 				get_page(page);
++ 				xas_unlock_irq(&xas);
++ 			} else {
++ 				result = SCAN_PAGE_LOCK;
++ 				goto xa_locked;
++ 			}
++ 		} else {	/* !is_shmem */
++ 			if (!page || xa_is_value(page)) {
++ 				xas_unlock_irq(&xas);
++ 				page_cache_sync_readahead(mapping, &file->f_ra,
++ 							  file, index,
++ 							  PAGE_SIZE);
++ 				/* drain pagevecs to help isolate_lru_page() */
++ 				lru_add_drain();
++ 				page = find_lock_page(mapping, index);
++ 				if (unlikely(page == NULL)) {
++ 					result = SCAN_FAIL;
++ 					goto xa_unlocked;
++ 				}
++ 			} else if (!PageUptodate(page)) {
++ 				xas_unlock_irq(&xas);
++ 				wait_on_page_locked(page);
++ 				if (!trylock_page(page)) {
++ 					result = SCAN_PAGE_LOCK;
++ 					goto xa_unlocked;
++ 				}
++ 				get_page(page);
++ 			} else if (PageDirty(page)) {
++ 				result = SCAN_FAIL;
++ 				goto xa_locked;
++ 			} else if (trylock_page(page)) {
++ 				get_page(page);
++ 				xas_unlock_irq(&xas);
++ 			} else {
++ 				result = SCAN_PAGE_LOCK;
++ 				goto xa_locked;
++ 			}
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+  		}
+  
+  		/*
+@@@ -1414,9 -1466,15 +1521,15 @@@
+  
+  		if (isolate_lru_page(page)) {
+  			result = SCAN_DEL_PAGE_LRU;
+ -			goto out_unlock;
+ +			goto out_isolate_failed;
+  		}
+  
++ 		if (page_has_private(page) &&
++ 		    !try_to_release_page(page, GFP_KERNEL)) {
++ 			result = SCAN_PAGE_HAS_PRIVATE;
++ 			goto out_unlock;
++ 		}
++ 
+  		if (page_mapped(page))
+  			unmap_mapping_pages(mapping, index, 1, false);
+  
+@@@ -1461,40 -1509,33 +1574,55 @@@ out_isolate_failed
+  out_unlock:
+  		unlock_page(page);
+  		put_page(page);
+ -		goto xa_unlocked;
+ +		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Handle hole in radix tree at the end of the range.
+ +	 * This code only triggers if there's nothing in radix tree
+ +	 * beyond 'end'.
+ +	 */
+ +	if (result == SCAN_SUCCEED && index < end) {
+ +		int n = end - index;
+ +
+ +		if (!shmem_charge(mapping->host, n)) {
+ +			result = SCAN_FAIL;
+ +			goto tree_locked;
+ +		}
+ +
+ +		for (; index < end; index++) {
+ +			radix_tree_insert(&mapping->i_pages, index,
+ +					new_page + (index % HPAGE_PMD_NR));
+ +		}
+ +		nr_none += n;
+++=======
++ 	if (is_shmem)
++ 		__inc_node_page_state(new_page, NR_SHMEM_THPS);
++ 	else
++ 		__inc_node_page_state(new_page, NR_FILE_THPS);
++ 
++ 	if (nr_none) {
++ 		struct zone *zone = page_zone(new_page);
++ 
++ 		__mod_node_page_state(zone->zone_pgdat, NR_FILE_PAGES, nr_none);
++ 		if (is_shmem)
++ 			__mod_node_page_state(zone->zone_pgdat,
++ 					      NR_SHMEM, nr_none);
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+  	}
+  
+ -xa_locked:
+ -	xas_unlock_irq(&xas);
+ -xa_unlocked:
+ +tree_locked:
+ +	xa_unlock_irq(&mapping->i_pages);
+ +tree_unlocked:
+  
+  	if (result == SCAN_SUCCEED) {
+ -		struct page *page, *tmp;
+ +		unsigned long flags;
+ +		struct zone *zone = page_zone(new_page);
+  
+  		/*
+ -		 * Replacing old pages with new one has succeeded, now we
+ -		 * need to copy the content and free the old pages.
+ +		 * Replacing old pages with new one has succeed, now we need to
+ +		 * copy the content and free old pages.
+  		 */
+  		index = start;
+  		list_for_each_entry_safe(page, tmp, &pagelist, lru) {
+@@@ -1518,43 -1559,40 +1646,67 @@@
+  			index++;
+  		}
+  
+++<<<<<<< HEAD
+ +		local_irq_save(flags);
+ +		__inc_node_page_state(new_page, NR_SHMEM_THPS);
+ +		if (nr_none) {
+ +			__mod_node_page_state(zone->zone_pgdat, NR_FILE_PAGES, nr_none);
+ +			__mod_node_page_state(zone->zone_pgdat, NR_SHMEM, nr_none);
+ +		}
+ +		local_irq_restore(flags);
+ +
+ +		/*
+ +		 * Remove pte page tables, so we can re-faulti
+ +		 * the page as huge.
+ +		 */
+ +		retract_page_tables(mapping, start);
+ +
+ +		/* Everything is ready, let's unfreeze the new_page */
+ +		set_page_dirty(new_page);
+ +		SetPageUptodate(new_page);
+ +		page_ref_unfreeze(new_page, HPAGE_PMD_NR);
+++=======
++ 		SetPageUptodate(new_page);
++ 		page_ref_add(new_page, HPAGE_PMD_NR - 1);
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+  		mem_cgroup_commit_charge(new_page, memcg, false, true);
++ 
++ 		if (is_shmem) {
++ 			set_page_dirty(new_page);
++ 			lru_cache_add_anon(new_page);
++ 		} else {
++ 			lru_cache_add_file(new_page);
++ 		}
+  		count_memcg_events(memcg, THP_COLLAPSE_ALLOC, 1);
+++<<<<<<< HEAD
+ +		lru_cache_add_anon(new_page);
+ +		unlock_page(new_page);
+++=======
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+  
+ -		/*
+ -		 * Remove pte page tables, so we can re-fault the page as huge.
+ -		 */
+ -		retract_page_tables(mapping, start);
+  		*hpage = NULL;
+  
+  		khugepaged_pages_collapsed++;
+  	} else {
+ -		struct page *page;
+ -
+ -		/* Something went wrong: roll back page cache changes */
+ -		xas_lock_irq(&xas);
+ +		/* Something went wrong: rollback changes to the radix-tree */
+ +		xa_lock_irq(&mapping->i_pages);
+  		mapping->nrpages -= nr_none;
+++<<<<<<< HEAD
+ +		shmem_uncharge(mapping->host, nr_none);
+ +		radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
+ +			if (iter.index >= end)
+ +				break;
+++=======
++ 
++ 		if (is_shmem)
++ 			shmem_uncharge(mapping->host, nr_none);
++ 
++ 		xas_set(&xas, start);
++ 		xas_for_each(&xas, page, end - 1) {
+++>>>>>>> 99cb0dbd47a1 (mm,thp: add read-only THP support for (non-shmem) FS)
+  			page = list_first_entry_or_null(&pagelist,
+  					struct page, lru);
+ -			if (!page || xas.xa_index < page->index) {
+ +			if (!page || iter.index < page->index) {
+  				if (!nr_none)
+  					break;
+  				nr_none--;
+* Unmerged path mm/Kconfig
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 3bea6c21eec7..f90d69c4bef1 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -203,8 +203,8 @@ static void unaccount_page_cache_page(struct address_space *mapping,
+ 		__mod_node_page_state(page_pgdat(page), NR_SHMEM, -nr);
+ 		if (PageTransHuge(page))
+ 			__dec_node_page_state(page, NR_SHMEM_THPS);
+-	} else {
+-		VM_BUG_ON_PAGE(PageTransHuge(page), page);
++	} else if (PageTransHuge(page)) {
++		__dec_node_page_state(page, NR_FILE_THPS);
+ 	}
+ 
+ 	/*
+* Unmerged path mm/khugepaged.c
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 884554872969..d995eb2855d2 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1195,8 +1195,10 @@ void page_add_file_rmap(struct page *page, bool compound)
+ 		}
+ 		if (!atomic_inc_and_test(compound_mapcount_ptr(page)))
+ 			goto out;
+-		VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
+-		__inc_node_page_state(page, NR_SHMEM_PMDMAPPED);
++		if (PageSwapBacked(page))
++			__inc_node_page_state(page, NR_SHMEM_PMDMAPPED);
++		else
++			__inc_node_page_state(page, NR_FILE_PMDMAPPED);
+ 	} else {
+ 		if (PageTransCompound(page) && page_mapping(page)) {
+ 			VM_WARN_ON_ONCE(!PageLocked(page));
+@@ -1235,8 +1237,10 @@ static void page_remove_file_rmap(struct page *page, bool compound)
+ 		}
+ 		if (!atomic_add_negative(-1, compound_mapcount_ptr(page)))
+ 			goto out;
+-		VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
+-		__dec_node_page_state(page, NR_SHMEM_PMDMAPPED);
++		if (PageSwapBacked(page))
++			__dec_node_page_state(page, NR_SHMEM_PMDMAPPED);
++		else
++			__dec_node_page_state(page, NR_FILE_PMDMAPPED);
+ 	} else {
+ 		if (!atomic_add_negative(-1, &page->_mapcount))
+ 			goto out;
