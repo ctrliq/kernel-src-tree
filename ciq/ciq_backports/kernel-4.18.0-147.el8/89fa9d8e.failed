@@ -1,0 +1,400 @@
+acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 89fa9d8ea7bdfa841d19044485cec5f4171069e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/89fa9d8e.failed
+
+With Intel DSM 1.8 [1] two new security DSMs are introduced. Enable/update
+master passphrase and master secure erase. The master passphrase allows
+a secure erase to be performed without the user passphrase that is set on
+the NVDIMM. The commands of master_update and master_erase are added to
+the sysfs knob in order to initiate the DSMs. They are similar in opeartion
+mechanism compare to update and erase.
+
+[1]: http://pmem.io/documents/NVDIMM_DSM_Interface-V1.8.pdf
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 89fa9d8ea7bdfa841d19044485cec5f4171069e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/nfit/core.c
+#	drivers/acpi/nfit/intel.c
+#	drivers/nvdimm/dimm_devs.c
+#	drivers/nvdimm/nd-core.h
+#	drivers/nvdimm/security.c
+#	include/linux/libnvdimm.h
+diff --cc drivers/acpi/nfit/core.c
+index 3ff1f14c05c6,c246e71c5345..000000000000
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@@ -380,6 -381,16 +380,19 @@@ static u8 nfit_dsm_revid(unsigned famil
+  			[NVDIMM_INTEL_QUERY_FWUPDATE] = 2,
+  			[NVDIMM_INTEL_SET_THRESHOLD] = 2,
+  			[NVDIMM_INTEL_INJECT_ERROR] = 2,
+++<<<<<<< HEAD
+++=======
++ 			[NVDIMM_INTEL_GET_SECURITY_STATE] = 2,
++ 			[NVDIMM_INTEL_SET_PASSPHRASE] = 2,
++ 			[NVDIMM_INTEL_DISABLE_PASSPHRASE] = 2,
++ 			[NVDIMM_INTEL_UNLOCK_UNIT] = 2,
++ 			[NVDIMM_INTEL_FREEZE_LOCK] = 2,
++ 			[NVDIMM_INTEL_SECURE_ERASE] = 2,
++ 			[NVDIMM_INTEL_OVERWRITE] = 2,
++ 			[NVDIMM_INTEL_QUERY_OVERWRITE] = 2,
++ 			[NVDIMM_INTEL_SET_MASTER_PASSPHRASE] = 2,
++ 			[NVDIMM_INTEL_MASTER_SECURE_ERASE] = 2,
+++>>>>>>> 89fa9d8ea7bd (acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support)
+  		},
+  	};
+  	u8 id;
+diff --cc drivers/nvdimm/dimm_devs.c
+index 508dd405f84f,bd3f156463b1..000000000000
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@@ -370,6 -370,134 +370,137 @@@ static ssize_t available_slots_show(str
+  }
+  static DEVICE_ATTR_RO(available_slots);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t security_show(struct device *dev,
++ 		struct device_attribute *attr, char *buf)
++ {
++ 	struct nvdimm *nvdimm = to_nvdimm(dev);
++ 
++ 	switch (nvdimm->sec.state) {
++ 	case NVDIMM_SECURITY_DISABLED:
++ 		return sprintf(buf, "disabled\n");
++ 	case NVDIMM_SECURITY_UNLOCKED:
++ 		return sprintf(buf, "unlocked\n");
++ 	case NVDIMM_SECURITY_LOCKED:
++ 		return sprintf(buf, "locked\n");
++ 	case NVDIMM_SECURITY_FROZEN:
++ 		return sprintf(buf, "frozen\n");
++ 	case NVDIMM_SECURITY_OVERWRITE:
++ 		return sprintf(buf, "overwrite\n");
++ 	default:
++ 		return -ENOTTY;
++ 	}
++ 
++ 	return -ENOTTY;
++ }
++ 
++ #define OPS							\
++ 	C( OP_FREEZE,		"freeze",		1),	\
++ 	C( OP_DISABLE,		"disable",		2),	\
++ 	C( OP_UPDATE,		"update",		3),	\
++ 	C( OP_ERASE,		"erase",		2),	\
++ 	C( OP_OVERWRITE,	"overwrite",		2),	\
++ 	C( OP_MASTER_UPDATE,	"master_update",	3),	\
++ 	C( OP_MASTER_ERASE,	"master_erase",		2)
++ #undef C
++ #define C(a, b, c) a
++ enum nvdimmsec_op_ids { OPS };
++ #undef C
++ #define C(a, b, c) { b, c }
++ static struct {
++ 	const char *name;
++ 	int args;
++ } ops[] = { OPS };
++ #undef C
++ 
++ #define SEC_CMD_SIZE 32
++ #define KEY_ID_SIZE 10
++ 
++ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
++ {
++ 	struct nvdimm *nvdimm = to_nvdimm(dev);
++ 	ssize_t rc;
++ 	char cmd[SEC_CMD_SIZE+1], keystr[KEY_ID_SIZE+1],
++ 		nkeystr[KEY_ID_SIZE+1];
++ 	unsigned int key, newkey;
++ 	int i;
++ 
++ 	if (atomic_read(&nvdimm->busy))
++ 		return -EBUSY;
++ 
++ 	rc = sscanf(buf, "%"__stringify(SEC_CMD_SIZE)"s"
++ 			" %"__stringify(KEY_ID_SIZE)"s"
++ 			" %"__stringify(KEY_ID_SIZE)"s",
++ 			cmd, keystr, nkeystr);
++ 	if (rc < 1)
++ 		return -EINVAL;
++ 	for (i = 0; i < ARRAY_SIZE(ops); i++)
++ 		if (sysfs_streq(cmd, ops[i].name))
++ 			break;
++ 	if (i >= ARRAY_SIZE(ops))
++ 		return -EINVAL;
++ 	if (ops[i].args > 1)
++ 		rc = kstrtouint(keystr, 0, &key);
++ 	if (rc >= 0 && ops[i].args > 2)
++ 		rc = kstrtouint(nkeystr, 0, &newkey);
++ 	if (rc < 0)
++ 		return rc;
++ 
++ 	if (i == OP_FREEZE) {
++ 		dev_dbg(dev, "freeze\n");
++ 		rc = nvdimm_security_freeze(nvdimm);
++ 	} else if (i == OP_DISABLE) {
++ 		dev_dbg(dev, "disable %u\n", key);
++ 		rc = nvdimm_security_disable(nvdimm, key);
++ 	} else if (i == OP_UPDATE) {
++ 		dev_dbg(dev, "update %u %u\n", key, newkey);
++ 		rc = nvdimm_security_update(nvdimm, key, newkey, NVDIMM_USER);
++ 	} else if (i == OP_ERASE) {
++ 		dev_dbg(dev, "erase %u\n", key);
++ 		rc = nvdimm_security_erase(nvdimm, key, NVDIMM_USER);
++ 	} else if (i == OP_OVERWRITE) {
++ 		dev_dbg(dev, "overwrite %u\n", key);
++ 		rc = nvdimm_security_overwrite(nvdimm, key);
++ 	} else if (i == OP_MASTER_UPDATE) {
++ 		dev_dbg(dev, "master_update %u %u\n", key, newkey);
++ 		rc = nvdimm_security_update(nvdimm, key, newkey,
++ 				NVDIMM_MASTER);
++ 	} else if (i == OP_MASTER_ERASE) {
++ 		dev_dbg(dev, "master_erase %u\n", key);
++ 		rc = nvdimm_security_erase(nvdimm, key,
++ 				NVDIMM_MASTER);
++ 	} else
++ 		return -EINVAL;
++ 
++ 	if (rc == 0)
++ 		rc = len;
++ 	return rc;
++ }
++ 
++ static ssize_t security_store(struct device *dev,
++ 		struct device_attribute *attr, const char *buf, size_t len)
++ 
++ {
++ 	ssize_t rc;
++ 
++ 	/*
++ 	 * Require all userspace triggered security management to be
++ 	 * done while probing is idle and the DIMM is not in active use
++ 	 * in any region.
++ 	 */
++ 	device_lock(dev);
++ 	nvdimm_bus_lock(dev);
++ 	wait_nvdimm_bus_probe_idle(dev);
++ 	rc = __security_store(dev, buf, len);
++ 	nvdimm_bus_unlock(dev);
++ 	device_unlock(dev);
++ 
++ 	return rc;
++ }
++ static DEVICE_ATTR_RW(security);
++ 
+++>>>>>>> 89fa9d8ea7bd (acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support)
+  static struct attribute *nvdimm_attributes[] = {
+  	&dev_attr_state.attr,
+  	&dev_attr_flags.attr,
+@@@ -413,12 -562,61 +544,67 @@@ struct nvdimm *__nvdimm_create(struct n
+  	dev->type = &nvdimm_device_type;
+  	dev->devt = MKDEV(nvdimm_major, nvdimm->id);
+  	dev->groups = groups;
+++<<<<<<< HEAD
+++=======
++ 	nvdimm->sec.ops = sec_ops;
++ 	nvdimm->sec.overwrite_tmo = 0;
++ 	INIT_DELAYED_WORK(&nvdimm->dwork, nvdimm_security_overwrite_query);
++ 	/*
++ 	 * Security state must be initialized before device_add() for
++ 	 * attribute visibility.
++ 	 */
++ 	/* get security state and extended (master) state */
++ 	nvdimm->sec.state = nvdimm_security_state(nvdimm, NVDIMM_USER);
++ 	nvdimm->sec.ext_state = nvdimm_security_state(nvdimm, NVDIMM_MASTER);
+++>>>>>>> 89fa9d8ea7bd (acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support)
+  	nd_device_register(dev);
+  
+  	return nvdimm;
+  }
+  EXPORT_SYMBOL_GPL(__nvdimm_create);
+  
+++<<<<<<< HEAD
+++=======
++ int nvdimm_security_setup_events(struct nvdimm *nvdimm)
++ {
++ 	nvdimm->sec.overwrite_state = sysfs_get_dirent(nvdimm->dev.kobj.sd,
++ 			"security");
++ 	if (!nvdimm->sec.overwrite_state)
++ 		return -ENODEV;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nvdimm_security_setup_events);
++ 
++ int nvdimm_in_overwrite(struct nvdimm *nvdimm)
++ {
++ 	return test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags);
++ }
++ EXPORT_SYMBOL_GPL(nvdimm_in_overwrite);
++ 
++ int nvdimm_security_freeze(struct nvdimm *nvdimm)
++ {
++ 	int rc;
++ 
++ 	WARN_ON_ONCE(!is_nvdimm_bus_locked(&nvdimm->dev));
++ 
++ 	if (!nvdimm->sec.ops || !nvdimm->sec.ops->freeze)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (nvdimm->sec.state < 0)
++ 		return -EIO;
++ 
++ 	if (test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags)) {
++ 		dev_warn(&nvdimm->dev, "Overwrite operation in progress.\n");
++ 		return -EBUSY;
++ 	}
++ 
++ 	rc = nvdimm->sec.ops->freeze(nvdimm);
++ 	nvdimm->sec.state = nvdimm_security_state(nvdimm, NVDIMM_USER);
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> 89fa9d8ea7bd (acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support)
+  int alias_dpa_busy(struct device *dev, void *data)
+  {
+  	resource_size_t map_end, blk_start, new;
+diff --cc drivers/nvdimm/nd-core.h
+index a5977b369651,52d20d9f39f6..000000000000
+--- a/drivers/nvdimm/nd-core.h
++++ b/drivers/nvdimm/nd-core.h
+@@@ -42,8 -43,63 +42,68 @@@ struct nvdimm 
+  	int id, num_flush;
+  	struct resource *flush_wpq;
+  	const char *dimm_id;
+++<<<<<<< HEAD
+ +};
+ +
+++=======
++ 	struct {
++ 		const struct nvdimm_security_ops *ops;
++ 		enum nvdimm_security_state state;
++ 		enum nvdimm_security_state ext_state;
++ 		unsigned int overwrite_tmo;
++ 		struct kernfs_node *overwrite_state;
++ 	} sec;
++ 	struct delayed_work dwork;
++ };
++ 
++ static inline enum nvdimm_security_state nvdimm_security_state(
++ 		struct nvdimm *nvdimm, bool master)
++ {
++ 	if (!nvdimm->sec.ops)
++ 		return -ENXIO;
++ 
++ 	return nvdimm->sec.ops->state(nvdimm, master);
++ }
++ int nvdimm_security_freeze(struct nvdimm *nvdimm);
++ #if IS_ENABLED(CONFIG_NVDIMM_KEYS)
++ int nvdimm_security_disable(struct nvdimm *nvdimm, unsigned int keyid);
++ int nvdimm_security_update(struct nvdimm *nvdimm, unsigned int keyid,
++ 		unsigned int new_keyid,
++ 		enum nvdimm_passphrase_type pass_type);
++ int nvdimm_security_erase(struct nvdimm *nvdimm, unsigned int keyid,
++ 		enum nvdimm_passphrase_type pass_type);
++ int nvdimm_security_overwrite(struct nvdimm *nvdimm, unsigned int keyid);
++ void nvdimm_security_overwrite_query(struct work_struct *work);
++ #else
++ static inline int nvdimm_security_disable(struct nvdimm *nvdimm,
++ 		unsigned int keyid)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int nvdimm_security_update(struct nvdimm *nvdimm,
++ 		unsigned int keyid,
++ 		unsigned int new_keyid,
++ 		enum nvdimm_passphrase_type pass_type)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int nvdimm_security_erase(struct nvdimm *nvdimm,
++ 		unsigned int keyid,
++ 		enum nvdimm_passphrase_type pass_type)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int nvdimm_security_overwrite(struct nvdimm *nvdimm,
++ 		unsigned int keyid)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline void nvdimm_security_overwrite_query(struct work_struct *work)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 89fa9d8ea7bd (acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support)
+  /**
+   * struct blk_alloc_info - tracking info for BLK dpa scanning
+   * @nd_mapping: blk region mapping boundaries
+diff --cc include/linux/libnvdimm.h
+index c0e66496e33c,5440f11b0907..000000000000
+--- a/include/linux/libnvdimm.h
++++ b/include/linux/libnvdimm.h
+@@@ -155,6 -159,46 +155,49 @@@ static inline struct nd_blk_region_des
+  
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum nvdimm_security_state {
++ 	NVDIMM_SECURITY_DISABLED,
++ 	NVDIMM_SECURITY_UNLOCKED,
++ 	NVDIMM_SECURITY_LOCKED,
++ 	NVDIMM_SECURITY_FROZEN,
++ 	NVDIMM_SECURITY_OVERWRITE,
++ };
++ 
++ #define NVDIMM_PASSPHRASE_LEN		32
++ #define NVDIMM_KEY_DESC_LEN		22
++ 
++ struct nvdimm_key_data {
++ 	u8 data[NVDIMM_PASSPHRASE_LEN];
++ };
++ 
++ enum nvdimm_passphrase_type {
++ 	NVDIMM_USER,
++ 	NVDIMM_MASTER,
++ };
++ 
++ struct nvdimm_security_ops {
++ 	enum nvdimm_security_state (*state)(struct nvdimm *nvdimm,
++ 			enum nvdimm_passphrase_type pass_type);
++ 	int (*freeze)(struct nvdimm *nvdimm);
++ 	int (*change_key)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *old_data,
++ 			const struct nvdimm_key_data *new_data,
++ 			enum nvdimm_passphrase_type pass_type);
++ 	int (*unlock)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data);
++ 	int (*disable)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data);
++ 	int (*erase)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data,
++ 			enum nvdimm_passphrase_type pass_type);
++ 	int (*overwrite)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data);
++ 	int (*query_overwrite)(struct nvdimm *nvdimm);
++ };
++ 
+++>>>>>>> 89fa9d8ea7bd (acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support)
+  void badrange_init(struct badrange *badrange);
+  int badrange_add(struct badrange *badrange, u64 addr, u64 length);
+  void badrange_forget(struct badrange *badrange, phys_addr_t start,
+* Unmerged path drivers/acpi/nfit/intel.c
+* Unmerged path drivers/nvdimm/security.c
+* Unmerged path drivers/acpi/nfit/core.c
+* Unmerged path drivers/acpi/nfit/intel.c
+* Unmerged path drivers/nvdimm/dimm_devs.c
+* Unmerged path drivers/nvdimm/nd-core.h
+* Unmerged path drivers/nvdimm/security.c
+* Unmerged path include/linux/libnvdimm.h
