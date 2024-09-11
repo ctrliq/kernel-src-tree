@@ -1,0 +1,250 @@
+cgroup: account for memory_recursiveprot in test_memcg_low()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author David Vernet <void@manifault.com>
+commit cdc69458a5f3d4cf31372efd45fe92cec6b167e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/cdc69458.failed
+
+The test_memcg_low() testcase in test_memcontrol.c verifies the expected
+behavior of groups using the memory.low knob.  Part of the testcase
+verifies that a group with memory.low that experiences reclaim due to
+memory pressure elsewhere in the system, observes memory.events.low events
+as a result of that reclaim.
+
+In commit 8a931f801340 ("mm: memcontrol: recursive memory.low
+protection"), the memory controller was updated to propagate memory.low
+and memory.min protection from a parent group to its children via a
+configurable memory_recursiveprot mount option.  This unfortunately broke
+the memcg tests, which asserts that a sibling that experienced reclaim but
+had a memory.low value of 0, would not observe any memory.low events. 
+This patch updates test_memcg_low() to account for the new behavior
+introduced by memory_recursiveprot.
+
+So as to make the test resilient to multiple configurations, the patch
+also adds a new proc_mount_contains() helper that checks for a string in
+/proc/mounts, and is used to toggle behavior based on whether the default
+memory_recursiveprot was present.
+
+Link: https://lkml.kernel.org/r/20220423155619.3669555-3-void@manifault.com
+	Signed-off-by: David Vernet <void@manifault.com>
+	Acked-by: Roman Gushchin <roman.gushchin@linux.dev>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit cdc69458a5f3d4cf31372efd45fe92cec6b167e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/cgroup/cgroup_util.c
+#	tools/testing/selftests/cgroup/cgroup_util.h
+diff --cc tools/testing/selftests/cgroup/cgroup_util.c
+index 4cb8e4717357,b4d7027a44c3..000000000000
+--- a/tools/testing/selftests/cgroup/cgroup_util.c
++++ b/tools/testing/selftests/cgroup/cgroup_util.c
+@@@ -358,3 -527,118 +358,121 @@@ int set_oom_adj_score(int pid, int scor
+  	close(fd);
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int proc_mount_contains(const char *option)
++ {
++ 	char buf[4 * PAGE_SIZE];
++ 	ssize_t read;
++ 
++ 	read = read_text("/proc/mounts", buf, sizeof(buf));
++ 	if (read < 0)
++ 		return read;
++ 
++ 	return strstr(buf, option) != NULL;
++ }
++ 
++ ssize_t proc_read_text(int pid, bool thread, const char *item, char *buf, size_t size)
++ {
++ 	char path[PATH_MAX];
++ 
++ 	if (!pid)
++ 		snprintf(path, sizeof(path), "/proc/%s/%s",
++ 			 thread ? "thread-self" : "self", item);
++ 	else
++ 		snprintf(path, sizeof(path), "/proc/%d/%s", pid, item);
++ 
++ 	size = read_text(path, buf, size);
++ 	return size < 0 ? -1 : size;
++ }
++ 
++ int proc_read_strstr(int pid, bool thread, const char *item, const char *needle)
++ {
++ 	char buf[PAGE_SIZE];
++ 
++ 	if (proc_read_text(pid, thread, item, buf, sizeof(buf)) < 0)
++ 		return -1;
++ 
++ 	return strstr(buf, needle) ? 0 : -1;
++ }
++ 
++ int clone_into_cgroup_run_wait(const char *cgroup)
++ {
++ 	int cgroup_fd;
++ 	pid_t pid;
++ 
++ 	cgroup_fd =  dirfd_open_opath(cgroup);
++ 	if (cgroup_fd < 0)
++ 		return -1;
++ 
++ 	pid = clone_into_cgroup(cgroup_fd);
++ 	close_prot_errno(cgroup_fd);
++ 	if (pid < 0)
++ 		return -1;
++ 
++ 	if (pid == 0)
++ 		exit(EXIT_SUCCESS);
++ 
++ 	/*
++ 	 * We don't care whether this fails. We only care whether the initial
++ 	 * clone succeeded.
++ 	 */
++ 	(void)clone_reap(pid, WEXITED);
++ 	return 0;
++ }
++ 
++ static int __prepare_for_wait(const char *cgroup, const char *filename)
++ {
++ 	int fd, ret = -1;
++ 
++ 	fd = inotify_init1(0);
++ 	if (fd == -1)
++ 		return fd;
++ 
++ 	ret = inotify_add_watch(fd, cg_control(cgroup, filename), IN_MODIFY);
++ 	if (ret == -1) {
++ 		close(fd);
++ 		fd = -1;
++ 	}
++ 
++ 	return fd;
++ }
++ 
++ int cg_prepare_for_wait(const char *cgroup)
++ {
++ 	return __prepare_for_wait(cgroup, "cgroup.events");
++ }
++ 
++ int memcg_prepare_for_wait(const char *cgroup)
++ {
++ 	return __prepare_for_wait(cgroup, "memory.events");
++ }
++ 
++ int cg_wait_for(int fd)
++ {
++ 	int ret = -1;
++ 	struct pollfd fds = {
++ 		.fd = fd,
++ 		.events = POLLIN,
++ 	};
++ 
++ 	while (true) {
++ 		ret = poll(&fds, 1, 10000);
++ 
++ 		if (ret == -1) {
++ 			if (errno == EINTR)
++ 				continue;
++ 
++ 			break;
++ 		}
++ 
++ 		if (ret > 0 && fds.revents & POLLIN) {
++ 			ret = 0;
++ 			break;
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
+++>>>>>>> cdc69458a5f3 (cgroup: account for memory_recursiveprot in test_memcg_low())
+diff --cc tools/testing/selftests/cgroup/cgroup_util.h
+index cabd43fd137a,756f76052b44..000000000000
+--- a/tools/testing/selftests/cgroup/cgroup_util.h
++++ b/tools/testing/selftests/cgroup/cgroup_util.h
+@@@ -40,3 -46,15 +40,18 @@@ extern int alloc_pagecache(int fd, size
+  extern int alloc_anon(const char *cgroup, void *arg);
+  extern int is_swap_enabled(void);
+  extern int set_oom_adj_score(int pid, int score);
+++<<<<<<< HEAD
+++=======
++ extern int cg_wait_for_proc_count(const char *cgroup, int count);
++ extern int cg_killall(const char *cgroup);
++ int proc_mount_contains(const char *option);
++ extern ssize_t proc_read_text(int pid, bool thread, const char *item, char *buf, size_t size);
++ extern int proc_read_strstr(int pid, bool thread, const char *item, const char *needle);
++ extern pid_t clone_into_cgroup(int cgroup_fd);
++ extern int clone_reap(pid_t pid, int options);
++ extern int clone_into_cgroup_run_wait(const char *cgroup);
++ extern int dirfd_open_opath(const char *dir);
++ extern int cg_prepare_for_wait(const char *cgroup);
++ extern int memcg_prepare_for_wait(const char *cgroup);
++ extern int cg_wait_for(int fd);
+++>>>>>>> cdc69458a5f3 (cgroup: account for memory_recursiveprot in test_memcg_low())
+* Unmerged path tools/testing/selftests/cgroup/cgroup_util.c
+* Unmerged path tools/testing/selftests/cgroup/cgroup_util.h
+diff --git a/tools/testing/selftests/cgroup/test_memcontrol.c b/tools/testing/selftests/cgroup/test_memcontrol.c
+index 10053377ccef..4d303c819956 100644
+--- a/tools/testing/selftests/cgroup/test_memcontrol.c
++++ b/tools/testing/selftests/cgroup/test_memcontrol.c
+@@ -20,6 +20,8 @@
+ #include "../kselftest.h"
+ #include "cgroup_util.h"
+ 
++static bool has_recursiveprot;
++
+ /*
+  * This test creates two nested cgroups with and without enabling
+  * the memory controller.
+@@ -520,15 +522,18 @@ static int test_memcg_low(const char *root)
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(children); i++) {
++		int no_low_events_index = has_recursiveprot ? 2 : 1;
++
+ 		oom = cg_read_key_long(children[i], "memory.events", "oom ");
+ 		low = cg_read_key_long(children[i], "memory.events", "low ");
+ 
+ 		if (oom)
+ 			goto cleanup;
+-		if (i < 2 && low <= 0)
++		if (i <= no_low_events_index && low <= 0)
+ 			goto cleanup;
+-		if (i >= 2 && low)
++		if (i > no_low_events_index && low)
+ 			goto cleanup;
++
+ 	}
+ 
+ 	ret = KSFT_PASS;
+@@ -1300,7 +1305,7 @@ struct memcg_test {
+ int main(int argc, char **argv)
+ {
+ 	char root[PATH_MAX];
+-	int i, ret = EXIT_SUCCESS;
++	int i, proc_status, ret = EXIT_SUCCESS;
+ 
+ 	if (cg_find_unified_root(root, sizeof(root)))
+ 		ksft_exit_skip("cgroup v2 isn't mounted\n");
+@@ -1316,6 +1321,11 @@ int main(int argc, char **argv)
+ 		if (cg_write(root, "cgroup.subtree_control", "+memory"))
+ 			ksft_exit_skip("Failed to set memory controller\n");
+ 
++	proc_status = proc_mount_contains("memory_recursiveprot");
++	if (proc_status < 0)
++		ksft_exit_skip("Failed to query cgroup mount option\n");
++	has_recursiveprot = proc_status;
++
+ 	for (i = 0; i < ARRAY_SIZE(tests); i++) {
+ 		switch (tests[i].fn(root)) {
+ 		case KSFT_PASS:
