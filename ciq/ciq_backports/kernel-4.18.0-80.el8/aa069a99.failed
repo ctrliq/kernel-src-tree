@@ -1,0 +1,156 @@
+KVM: PPC: Book3S HV: Add a VM capability to enable nested virtualization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit aa069a996951f3e2e38437ef0316685a5893fc7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/aa069a99.failed
+
+With this, userspace can enable a KVM-HV guest to run nested guests
+under it.
+
+The administrator can control whether any nested guests can be run;
+setting the "nested" module parameter to false prevents any guests
+becoming nested hypervisors (that is, any attempt to enable the nested
+capability on a guest will fail).  Guests which are already nested
+hypervisors will continue to be so.
+
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit aa069a996951f3e2e38437ef0316685a5893fc7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+#	arch/powerpc/kvm/book3s_hv.c
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virtual/kvm/api.txt
+index b5d7b819641b,fde48b6708f1..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -4464,6 -4523,29 +4464,32 @@@ hpage module parameter is not set to 1
+  While it is generally possible to create a huge page backed VM without
+  this capability, the VM will not be able to run.
+  
+++<<<<<<< HEAD
+++=======
++ 7.14 KVM_CAP_MSR_PLATFORM_INFO
++ 
++ Architectures: x86
++ Parameters: args[0] whether feature should be enabled or not
++ 
++ With this capability, a guest may read the MSR_PLATFORM_INFO MSR. Otherwise,
++ a #GP would be raised when the guest tries to access. Currently, this
++ capability does not enable write permissions of this MSR for the guest.
++ 
++ 7.16 KVM_CAP_PPC_NESTED_HV
++ 
++ Architectures: ppc
++ Parameters: none
++ Returns: 0 on success, -EINVAL when the implementation doesn't support
++ 	 nested-HV virtualization.
++ 
++ HV-KVM on POWER9 and later systems allows for "nested-HV"
++ virtualization, which provides a way for a guest VM to run guests that
++ can run using the CPU's supervisor mode (privileged non-hypervisor
++ state).  Enabling this capability on a VM depends on the CPU having
++ the necessary functionality and on the facility being enabled with a
++ kvm-hv module parameter.
++ 
+++>>>>>>> aa069a996951 (KVM: PPC: Book3S HV: Add a VM capability to enable nested virtualization)
+  8. Other capabilities.
+  ----------------------
+  
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 399189cf18d7,89bcf923d542..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -946,9 -978,18 +956,24 @@@ int kvmppc_pseries_do_hcall(struct kvm_
+  		break;
+  	case H_ENTER_NESTED:
+  		ret = H_FUNCTION;
+++<<<<<<< HEAD
+++		break;
+++	case H_TLB_INVALIDATE:
+++		ret = H_FUNCTION;
+++=======
++ 		if (!nesting_enabled(vcpu->kvm))
++ 			break;
++ 		ret = kvmhv_enter_nested_guest(vcpu);
++ 		if (ret == H_INTERRUPT) {
++ 			kvmppc_set_gpr(vcpu, 3, 0);
++ 			return -EINTR;
++ 		}
+  		break;
+  	case H_TLB_INVALIDATE:
+  		ret = H_FUNCTION;
++ 		if (nesting_enabled(vcpu->kvm))
++ 			ret = kvmhv_do_nested_tlbie(vcpu);
+++>>>>>>> aa069a996951 (KVM: PPC: Book3S HV: Add a VM capability to enable nested virtualization)
+  		break;
+  
+  	default:
+diff --cc include/uapi/linux/kvm.h
+index 3cf632839337,d9cec6b5cb37..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -951,6 -951,9 +951,12 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_HYPERV_TLBFLUSH 155
+  #define KVM_CAP_S390_HPAGE_1M 156
+  #define KVM_CAP_NESTED_STATE 157
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ARM_INJECT_SERROR_ESR 158
++ #define KVM_CAP_MSR_PLATFORM_INFO 159
++ #define KVM_CAP_PPC_NESTED_HV 160
+++>>>>>>> aa069a996951 (KVM: PPC: Book3S HV: Add a VM capability to enable nested virtualization)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+* Unmerged path Documentation/virtual/kvm/api.txt
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index 83d61b8327b2..fc8f1a366cef 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -327,6 +327,7 @@ struct kvmppc_ops {
+ 	int (*set_smt_mode)(struct kvm *kvm, unsigned long mode,
+ 			    unsigned long flags);
+ 	void (*giveup_ext)(struct kvm_vcpu *vcpu, ulong msr);
++	int (*enable_nested)(struct kvm *kvm);
+ };
+ 
+ extern struct kvmppc_ops *kvmppc_hv_ops;
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index aa275e747df8..dfc53110ea56 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -598,6 +598,10 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 		r = !!(hv_enabled && cpu_has_feature(CPU_FTR_ARCH_300) &&
+ 		       cpu_has_feature(CPU_FTR_HVMODE));
+ 		break;
++	case KVM_CAP_PPC_NESTED_HV:
++		r = !!(hv_enabled && kvmppc_hv_ops->enable_nested &&
++		       !kvmppc_hv_ops->enable_nested(NULL));
++		break;
+ #endif
+ 	case KVM_CAP_SYNC_MMU:
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+@@ -2116,6 +2120,14 @@ static int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 			r = kvm->arch.kvm_ops->set_smt_mode(kvm, mode, flags);
+ 		break;
+ 	}
++
++	case KVM_CAP_PPC_NESTED_HV:
++		r = -EINVAL;
++		if (!is_kvmppc_hv_enabled(kvm) ||
++		    !kvm->arch.kvm_ops->enable_nested)
++			break;
++		r = kvm->arch.kvm_ops->enable_nested(kvm);
++		break;
+ #endif
+ 	default:
+ 		r = -EINVAL;
+* Unmerged path include/uapi/linux/kvm.h
