@@ -1,0 +1,279 @@
+ALSA: firewire-lib: replace ack callback to flush isoc contexts in AMDTP domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Takashi Sakamoto <o-takashi@sakamocchi.jp>
+commit e6dcc92fcea07f23c13996b7bb6a2a32ed4c6ed5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e6dcc92f.failed
+
+An isoc context for AMDTP stream is flushed to queue packet
+by a call of pcm.ack. This commit extends this for AMDTP
+domain.
+
+	Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Link: https://lore.kernel.org/r/20191018061911.24909-4-o-takashi@sakamocchi.jp
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit e6dcc92fcea07f23c13996b7bb6a2a32ed4c6ed5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/firewire/amdtp-stream.h
+diff --cc sound/firewire/amdtp-stream.h
+index 7032772c4f90,470e77ca0061..000000000000
+--- a/sound/firewire/amdtp-stream.h
++++ b/sound/firewire/amdtp-stream.h
+@@@ -187,8 -198,6 +187,11 @@@ int amdtp_stream_add_pcm_hw_constraints
+  					struct snd_pcm_runtime *runtime);
+  
+  void amdtp_stream_pcm_prepare(struct amdtp_stream *s);
+++<<<<<<< HEAD
+ +unsigned long amdtp_stream_pcm_pointer(struct amdtp_stream *s);
+ +int amdtp_stream_pcm_ack(struct amdtp_stream *s);
+++=======
+++>>>>>>> e6dcc92fcea0 (ALSA: firewire-lib: replace ack callback to flush isoc contexts in AMDTP domain)
+  void amdtp_stream_pcm_abort(struct amdtp_stream *s);
+  
+  extern const unsigned int amdtp_syt_intervals[CIP_SFC_COUNT];
+@@@ -270,4 -284,24 +273,27 @@@ struct amdtp_domain 
+  int amdtp_domain_init(struct amdtp_domain *d);
+  void amdtp_domain_destroy(struct amdtp_domain *d);
+  
+++<<<<<<< HEAD
+++=======
++ int amdtp_domain_add_stream(struct amdtp_domain *d, struct amdtp_stream *s,
++ 			    int channel, int speed);
++ 
++ int amdtp_domain_start(struct amdtp_domain *d);
++ void amdtp_domain_stop(struct amdtp_domain *d);
++ 
++ static inline int amdtp_domain_set_events_per_period(struct amdtp_domain *d,
++ 						unsigned int events_per_period,
++ 						unsigned int events_per_buffer)
++ {
++ 	d->events_per_period = events_per_period;
++ 	d->events_per_buffer = events_per_buffer;
++ 
++ 	return 0;
++ }
++ 
++ unsigned long amdtp_domain_stream_pcm_pointer(struct amdtp_domain *d,
++ 					      struct amdtp_stream *s);
++ int amdtp_domain_stream_pcm_ack(struct amdtp_domain *d, struct amdtp_stream *s);
++ 
+++>>>>>>> e6dcc92fcea0 (ALSA: firewire-lib: replace ack callback to flush isoc contexts in AMDTP domain)
+  #endif
+diff --git a/sound/firewire/amdtp-stream.c b/sound/firewire/amdtp-stream.c
+index 6e1b83a082a2..02b962cf6c38 100644
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@ -1030,23 +1030,29 @@ unsigned long amdtp_stream_pcm_pointer(struct amdtp_stream *s)
+ EXPORT_SYMBOL(amdtp_stream_pcm_pointer);
+ 
+ /**
+- * amdtp_stream_pcm_ack - acknowledge queued PCM frames
++ * amdtp_domain_stream_pcm_ack - acknowledge queued PCM frames
++ * @d: the AMDTP domain.
+  * @s: the AMDTP stream that transfers the PCM frames
+  *
+  * Returns zero always.
+  */
+-int amdtp_stream_pcm_ack(struct amdtp_stream *s)
++int amdtp_domain_stream_pcm_ack(struct amdtp_domain *d, struct amdtp_stream *s)
+ {
+-	/*
+-	 * Process isochronous packets for recent isochronous cycle to handle
+-	 * queued PCM frames.
+-	 */
+-	if (amdtp_stream_running(s))
+-		fw_iso_context_flush_completions(s->context);
++	struct amdtp_stream *irq_target = d->irq_target;
++
++	// Process isochronous packets for recent isochronous cycle to handle
++	// queued PCM frames.
++	if (irq_target && amdtp_stream_running(irq_target)) {
++		// Queued packet should be processed without any kernel
++		// preemption to keep latency against bus cycle.
++		preempt_disable();
++		fw_iso_context_flush_completions(irq_target->context);
++		preempt_enable();
++	}
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(amdtp_stream_pcm_ack);
++EXPORT_SYMBOL_GPL(amdtp_domain_stream_pcm_ack);
+ 
+ /**
+  * amdtp_stream_update - update the stream after a bus reset
+* Unmerged path sound/firewire/amdtp-stream.h
+diff --git a/sound/firewire/bebob/bebob_pcm.c b/sound/firewire/bebob/bebob_pcm.c
+index 516c9874f4a1..2845c8633a61 100644
+--- a/sound/firewire/bebob/bebob_pcm.c
++++ b/sound/firewire/bebob/bebob_pcm.c
+@@ -320,14 +320,14 @@ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_bebob *bebob = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&bebob->tx_stream);
++	return amdtp_domain_stream_pcm_ack(&bebob->domain, &bebob->tx_stream);
+ }
+ 
+ static int pcm_playback_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_bebob *bebob = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&bebob->rx_stream);
++	return amdtp_domain_stream_pcm_ack(&bebob->domain, &bebob->rx_stream);
+ }
+ 
+ int snd_bebob_create_pcm_devices(struct snd_bebob *bebob)
+diff --git a/sound/firewire/dice/dice-pcm.c b/sound/firewire/dice/dice-pcm.c
+index 813c9ffbeced..a70fcbb2489f 100644
+--- a/sound/firewire/dice/dice-pcm.c
++++ b/sound/firewire/dice/dice-pcm.c
+@@ -380,7 +380,7 @@ static int capture_ack(struct snd_pcm_substream *substream)
+ 	struct snd_dice *dice = substream->private_data;
+ 	struct amdtp_stream *stream = &dice->tx_stream[substream->pcm->device];
+ 
+-	return amdtp_stream_pcm_ack(stream);
++	return amdtp_domain_stream_pcm_ack(&dice->domain, stream);
+ }
+ 
+ static int playback_ack(struct snd_pcm_substream *substream)
+@@ -388,7 +388,7 @@ static int playback_ack(struct snd_pcm_substream *substream)
+ 	struct snd_dice *dice = substream->private_data;
+ 	struct amdtp_stream *stream = &dice->rx_stream[substream->pcm->device];
+ 
+-	return amdtp_stream_pcm_ack(stream);
++	return amdtp_domain_stream_pcm_ack(&dice->domain, stream);
+ }
+ 
+ int snd_dice_create_pcm(struct snd_dice *dice)
+diff --git a/sound/firewire/digi00x/digi00x-pcm.c b/sound/firewire/digi00x/digi00x-pcm.c
+index 8dbfb3ff17f6..75775bf2fad8 100644
+--- a/sound/firewire/digi00x/digi00x-pcm.c
++++ b/sound/firewire/digi00x/digi00x-pcm.c
+@@ -305,14 +305,14 @@ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_dg00x *dg00x = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&dg00x->tx_stream);
++	return amdtp_domain_stream_pcm_ack(&dg00x->domain, &dg00x->tx_stream);
+ }
+ 
+ static int pcm_playback_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_dg00x *dg00x = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&dg00x->rx_stream);
++	return amdtp_domain_stream_pcm_ack(&dg00x->domain, &dg00x->rx_stream);
+ }
+ 
+ int snd_dg00x_create_pcm_devices(struct snd_dg00x *dg00x)
+diff --git a/sound/firewire/fireface/ff-pcm.c b/sound/firewire/fireface/ff-pcm.c
+index 415bc9ccd1c7..0b9d9cc9ed29 100644
+--- a/sound/firewire/fireface/ff-pcm.c
++++ b/sound/firewire/fireface/ff-pcm.c
+@@ -344,14 +344,14 @@ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_ff *ff = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&ff->tx_stream);
++	return amdtp_domain_stream_pcm_ack(&ff->domain, &ff->tx_stream);
+ }
+ 
+ static int pcm_playback_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_ff *ff = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&ff->rx_stream);
++	return amdtp_domain_stream_pcm_ack(&ff->domain, &ff->rx_stream);
+ }
+ 
+ int snd_ff_create_pcm_devices(struct snd_ff *ff)
+diff --git a/sound/firewire/fireworks/fireworks_pcm.c b/sound/firewire/fireworks/fireworks_pcm.c
+index 314d1f8b8344..e3c1ea7182ea 100644
+--- a/sound/firewire/fireworks/fireworks_pcm.c
++++ b/sound/firewire/fireworks/fireworks_pcm.c
+@@ -350,14 +350,14 @@ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_efw *efw = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&efw->tx_stream);
++	return amdtp_domain_stream_pcm_ack(&efw->domain, &efw->tx_stream);
+ }
+ 
+ static int pcm_playback_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_efw *efw = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&efw->rx_stream);
++	return amdtp_domain_stream_pcm_ack(&efw->domain, &efw->rx_stream);
+ }
+ 
+ int snd_efw_create_pcm_devices(struct snd_efw *efw)
+diff --git a/sound/firewire/motu/motu-pcm.c b/sound/firewire/motu/motu-pcm.c
+index 7bbf8b86a33d..ebbb9947cdd0 100644
+--- a/sound/firewire/motu/motu-pcm.c
++++ b/sound/firewire/motu/motu-pcm.c
+@@ -323,14 +323,14 @@ static int capture_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_motu *motu = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&motu->tx_stream);
++	return amdtp_domain_stream_pcm_ack(&motu->domain, &motu->tx_stream);
+ }
+ 
+ static int playback_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_motu *motu = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&motu->rx_stream);
++	return amdtp_domain_stream_pcm_ack(&motu->domain, &motu->rx_stream);
+ }
+ 
+ int snd_motu_create_pcm_devices(struct snd_motu *motu)
+diff --git a/sound/firewire/oxfw/oxfw-pcm.c b/sound/firewire/oxfw/oxfw-pcm.c
+index f3e25898d270..76862011bc00 100644
+--- a/sound/firewire/oxfw/oxfw-pcm.c
++++ b/sound/firewire/oxfw/oxfw-pcm.c
+@@ -393,14 +393,14 @@ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_oxfw *oxfw = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&oxfw->tx_stream);
++	return amdtp_domain_stream_pcm_ack(&oxfw->domain, &oxfw->tx_stream);
+ }
+ 
+ static int pcm_playback_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_oxfw *oxfw = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&oxfw->rx_stream);
++	return amdtp_domain_stream_pcm_ack(&oxfw->domain, &oxfw->rx_stream);
+ }
+ 
+ int snd_oxfw_create_pcm(struct snd_oxfw *oxfw)
+diff --git a/sound/firewire/tascam/tascam-pcm.c b/sound/firewire/tascam/tascam-pcm.c
+index 6cd3a420fbdf..6ed535348c7a 100644
+--- a/sound/firewire/tascam/tascam-pcm.c
++++ b/sound/firewire/tascam/tascam-pcm.c
+@@ -234,14 +234,14 @@ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_tscm *tscm = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&tscm->tx_stream);
++	return amdtp_domain_stream_pcm_ack(&tscm->domain, &tscm->tx_stream);
+ }
+ 
+ static int pcm_playback_ack(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_tscm *tscm = substream->private_data;
+ 
+-	return amdtp_stream_pcm_ack(&tscm->rx_stream);
++	return amdtp_domain_stream_pcm_ack(&tscm->domain, &tscm->rx_stream);
+ }
+ 
+ int snd_tscm_create_pcm_devices(struct snd_tscm *tscm)
