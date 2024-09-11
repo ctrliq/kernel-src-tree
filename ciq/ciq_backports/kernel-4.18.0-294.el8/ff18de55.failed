@@ -1,0 +1,128 @@
+dmaengine: idxd: add command status to idxd sysfs attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit ff18de55a62f0e8f0dcf11bfa7f69b23e6e951b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ff18de55.failed
+
+Export admin command status to sysfs attribute in order to allow user to
+retrieve configuration error. Allows user tooling to retrieve the command
+error and provide more user friendly error messages.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/159865278770.29455.8026892329182750127.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit ff18de55a62f0e8f0dcf11bfa7f69b23e6e951b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/device.c
+diff --cc drivers/dma/idxd/device.c
+index 49ce865471f7,22f6c871baa9..000000000000
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@@ -359,11 -358,37 +359,36 @@@ static int idxd_cmd_send(struct idxd_de
+  	memset(&cmd, 0, sizeof(cmd));
+  	cmd.cmd = cmd_code;
+  	cmd.operand = operand;
+ -	cmd.int_req = 1;
+ -
+ -	spin_lock_irqsave(&idxd->dev_lock, flags);
+ -	wait_event_lock_irq(idxd->cmd_waitq,
+ -			    !test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags),
+ -			    idxd->dev_lock);
+ -
+  	dev_dbg(&idxd->pdev->dev, "%s: sending cmd: %#x op: %#x\n",
+  		__func__, cmd_code, operand);
+++<<<<<<< HEAD
+ +	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
+ +
+ +	return 0;
+++=======
++ 
++ 	idxd->cmd_status = 0;
++ 	__set_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
++ 	idxd->cmd_done = &done;
++ 	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
++ 
++ 	/*
++ 	 * After command submitted, release lock and go to sleep until
++ 	 * the command completes via interrupt.
++ 	 */
++ 	spin_unlock_irqrestore(&idxd->dev_lock, flags);
++ 	wait_for_completion(&done);
++ 	spin_lock_irqsave(&idxd->dev_lock, flags);
++ 	if (status) {
++ 		*status = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
++ 		idxd->cmd_status = *status & GENMASK(7, 0);
++ 	}
++ 
++ 	__clear_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
++ 	/* Wake up other pending commands */
++ 	wake_up(&idxd->cmd_waitq);
++ 	spin_unlock_irqrestore(&idxd->dev_lock, flags);
+++>>>>>>> ff18de55a62f (dmaengine: idxd: add command status to idxd sysfs attribute)
+  }
+  
+  int idxd_device_enable(struct idxd_device *idxd)
+diff --git a/Documentation/ABI/stable/sysfs-driver-dma-idxd b/Documentation/ABI/stable/sysfs-driver-dma-idxd
+index a2bc4afbe308..b44183880935 100644
+--- a/Documentation/ABI/stable/sysfs-driver-dma-idxd
++++ b/Documentation/ABI/stable/sysfs-driver-dma-idxd
+@@ -116,6 +116,12 @@ Description:    The maximum number of bandwidth tokens that may be in use at
+ 		one time by operations that access low bandwidth memory in the
+ 		device.
+ 
++What:		/sys/bus/dsa/devices/dsa<m>/cmd_status
++Date:		Aug 28, 2020
++KernelVersion:	5.10.0
++Contact:	dmaengine@vger.kernel.org
++Description:	The last executed device administrative command's status/error.
++
+ What:           /sys/bus/dsa/devices/wq<m>.<n>/group_id
+ Date:           Oct 25, 2019
+ KernelVersion:  5.6.0
+* Unmerged path drivers/dma/idxd/device.c
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index d3eb6d08ae1a..c0cbf28b9d7c 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -155,6 +155,7 @@ struct idxd_device {
+ 	unsigned long flags;
+ 	int id;
+ 	int major;
++	u8 cmd_status;
+ 
+ 	struct pci_dev *pdev;
+ 	void __iomem *reg_base;
+diff --git a/drivers/dma/idxd/sysfs.c b/drivers/dma/idxd/sysfs.c
+index 7c9102128ce3..fc02548a22ef 100644
+--- a/drivers/dma/idxd/sysfs.c
++++ b/drivers/dma/idxd/sysfs.c
+@@ -1412,6 +1412,15 @@ static ssize_t cdev_major_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(cdev_major);
+ 
++static ssize_t cmd_status_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct idxd_device *idxd = container_of(dev, struct idxd_device, conf_dev);
++
++	return sprintf(buf, "%#x\n", idxd->cmd_status);
++}
++static DEVICE_ATTR_RO(cmd_status);
++
+ static struct attribute *idxd_device_attributes[] = {
+ 	&dev_attr_version.attr,
+ 	&dev_attr_max_groups.attr,
+@@ -1430,6 +1439,7 @@ static struct attribute *idxd_device_attributes[] = {
+ 	&dev_attr_max_tokens.attr,
+ 	&dev_attr_token_limit.attr,
+ 	&dev_attr_cdev_major.attr,
++	&dev_attr_cmd_status.attr,
+ 	NULL,
+ };
+ 
