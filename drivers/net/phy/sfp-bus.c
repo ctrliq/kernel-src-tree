@@ -23,7 +23,6 @@ struct sfp_bus {
 
 	const struct sfp_upstream_ops *upstream_ops;
 	void *upstream;
-	struct net_device *netdev;
 	struct phy_device *phydev;
 
 	bool registered;
@@ -442,13 +441,11 @@ static void sfp_upstream_clear(struct sfp_bus *bus)
 {
 	bus->upstream_ops = NULL;
 	bus->upstream = NULL;
-	bus->netdev = NULL;
 }
 
 /**
  * sfp_register_upstream() - Register the neighbouring device
  * @fwnode: firmware node for the SFP bus
- * @ndev: network device associated with the interface
  * @upstream: the upstream private data
  * @ops: the upstream's &struct sfp_upstream_ops
  *
@@ -459,7 +456,7 @@ static void sfp_upstream_clear(struct sfp_bus *bus)
  * On error, returns %NULL.
  */
 struct sfp_bus *sfp_register_upstream(struct fwnode_handle *fwnode,
-				      struct net_device *ndev, void *upstream,
+				      void *upstream,
 				      const struct sfp_upstream_ops *ops)
 {
 	struct sfp_bus *bus = sfp_bus_get(fwnode);
@@ -469,7 +466,6 @@ struct sfp_bus *sfp_register_upstream(struct fwnode_handle *fwnode,
 		rtnl_lock();
 		bus->upstream_ops = ops;
 		bus->upstream = upstream;
-		bus->netdev = ndev;
 
 		if (bus->sfp) {
 			ret = sfp_register_bus(bus);
@@ -591,7 +587,7 @@ struct sfp_bus *sfp_register_socket(struct device *dev, struct sfp *sfp,
 		bus->sfp = sfp;
 		bus->socket_ops = ops;
 
-		if (bus->netdev) {
+		if (bus->upstream_ops) {
 			ret = sfp_register_bus(bus);
 			if (ret)
 				sfp_socket_clear(bus);
@@ -611,7 +607,7 @@ EXPORT_SYMBOL_GPL(sfp_register_socket);
 void sfp_unregister_socket(struct sfp_bus *bus)
 {
 	rtnl_lock();
-	if (bus->netdev)
+	if (bus->upstream_ops)
 		sfp_unregister_bus(bus);
 	sfp_socket_clear(bus);
 	rtnl_unlock();
