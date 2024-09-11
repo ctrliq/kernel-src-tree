@@ -1,0 +1,153 @@
+block: simplify block device syncing in bdev_del_partition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit d5f3178ec9ab8a3a71763310d260e1d2a047baf1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d5f3178e.failed
+
+We just checked a little above that the block device for the partition
+im busy.  That implies no file system is mounted, and thus the only
+thing in fsync_bdev that actually is used is sync_blockdev.  Just call
+sync_blockdev directly.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d5f3178ec9ab8a3a71763310d260e1d2a047baf1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/partition-generic.c
+diff --cc block/partition-generic.c
+index 9e8a0148da7e,c085bf85509b..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -437,6 -472,121 +437,124 @@@ out_put
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD:block/partition-generic.c
+++=======
++ static bool partition_overlaps(struct gendisk *disk, sector_t start,
++ 		sector_t length, int skip_partno)
++ {
++ 	struct disk_part_iter piter;
++ 	struct hd_struct *part;
++ 	bool overlap = false;
++ 
++ 	disk_part_iter_init(&piter, disk, DISK_PITER_INCL_EMPTY);
++ 	while ((part = disk_part_iter_next(&piter))) {
++ 		if (part->partno == skip_partno ||
++ 		    start >= part->start_sect + part->nr_sects ||
++ 		    start + length <= part->start_sect)
++ 			continue;
++ 		overlap = true;
++ 		break;
++ 	}
++ 
++ 	disk_part_iter_exit(&piter);
++ 	return overlap;
++ }
++ 
++ int bdev_add_partition(struct block_device *bdev, int partno,
++ 		sector_t start, sector_t length)
++ {
++ 	struct hd_struct *part;
++ 
++ 	mutex_lock(&bdev->bd_mutex);
++ 	if (partition_overlaps(bdev->bd_disk, start, length, -1)) {
++ 		mutex_unlock(&bdev->bd_mutex);
++ 		return -EBUSY;
++ 	}
++ 
++ 	part = add_partition(bdev->bd_disk, partno, start, length,
++ 			ADDPART_FLAG_NONE, NULL);
++ 	mutex_unlock(&bdev->bd_mutex);
++ 	return PTR_ERR_OR_ZERO(part);
++ }
++ 
++ int bdev_del_partition(struct block_device *bdev, int partno)
++ {
++ 	struct block_device *bdevp;
++ 	struct hd_struct *part;
++ 	int ret = 0;
++ 
++ 	part = disk_get_part(bdev->bd_disk, partno);
++ 	if (!part)
++ 		return -ENXIO;
++ 
++ 	ret = -ENOMEM;
++ 	bdevp = bdget(part_devt(part));
++ 	if (!bdevp)
++ 		goto out_put_part;
++ 
++ 	mutex_lock(&bdevp->bd_mutex);
++ 
++ 	ret = -EBUSY;
++ 	if (bdevp->bd_openers)
++ 		goto out_unlock;
++ 
++ 	sync_blockdev(bdevp);
++ 	invalidate_bdev(bdevp);
++ 
++ 	mutex_lock_nested(&bdev->bd_mutex, 1);
++ 	delete_partition(bdev->bd_disk, part);
++ 	mutex_unlock(&bdev->bd_mutex);
++ 
++ 	ret = 0;
++ out_unlock:
++ 	mutex_unlock(&bdevp->bd_mutex);
++ 	bdput(bdevp);
++ out_put_part:
++ 	disk_put_part(part);
++ 	return ret;
++ }
++ 
++ int bdev_resize_partition(struct block_device *bdev, int partno,
++ 		sector_t start, sector_t length)
++ {
++ 	struct block_device *bdevp;
++ 	struct hd_struct *part;
++ 	int ret = 0;
++ 
++ 	part = disk_get_part(bdev->bd_disk, partno);
++ 	if (!part)
++ 		return -ENXIO;
++ 
++ 	ret = -ENOMEM;
++ 	bdevp = bdget(part_devt(part));
++ 	if (!bdevp)
++ 		goto out_put_part;
++ 
++ 	mutex_lock(&bdevp->bd_mutex);
++ 	mutex_lock_nested(&bdev->bd_mutex, 1);
++ 
++ 	ret = -EINVAL;
++ 	if (start != part->start_sect)
++ 		goto out_unlock;
++ 
++ 	ret = -EBUSY;
++ 	if (partition_overlaps(bdev->bd_disk, start, length, partno))
++ 		goto out_unlock;
++ 
++ 	part_nr_sects_write(part, (sector_t)length);
++ 	i_size_write(bdevp->bd_inode, length << SECTOR_SHIFT);
++ 
++ 	ret = 0;
++ out_unlock:
++ 	mutex_unlock(&bdevp->bd_mutex);
++ 	mutex_unlock(&bdev->bd_mutex);
++ 	bdput(bdevp);
++ out_put_part:
++ 	disk_put_part(part);
++ 	return ret;
++ }
++ 
+++>>>>>>> d5f3178ec9ab (block: simplify block device syncing in bdev_del_partition):block/partitions/core.c
+  static bool disk_unlock_native_capacity(struct gendisk *disk)
+  {
+  	const struct block_device_operations *bdops = disk->fops;
+* Unmerged path block/partition-generic.c
