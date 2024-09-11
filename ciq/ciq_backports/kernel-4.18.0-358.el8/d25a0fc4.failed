@@ -1,0 +1,272 @@
+ice: Initialize RDMA support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Dave Ertman <david.m.ertman@intel.com>
+commit d25a0fc41c1f927bb914e72a03c1898052557406
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/d25a0fc4.failed
+
+Probe the device's capabilities to see if it supports RDMA. If so, allocate
+and reserve resources to support its operation; populate structures with
+initial values.
+
+	Signed-off-by: Dave Ertman <david.m.ertman@intel.com>
+	Signed-off-by: Shiraz Saleem <shiraz.saleem@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit d25a0fc41c1f927bb914e72a03c1898052557406)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice.h
+#	drivers/net/ethernet/intel/ice/ice_lag.c
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_type.h
+diff --cc drivers/net/ethernet/intel/ice/ice.h
+index 5e29f3ac887e,64e3633493c1..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@@ -381,8 -383,7 +385,12 @@@ enum ice_pf_flags 
+  	ICE_FLAG_DCB_CAPABLE,
+  	ICE_FLAG_DCB_ENA,
+  	ICE_FLAG_FD_ENA,
+++<<<<<<< HEAD
+ +	ICE_FLAG_PTP_SUPPORTED,		/* PTP is supported by NVM */
+ +	ICE_FLAG_PTP,			/* PTP is enabled by software */
+++=======
++ 	ICE_FLAG_AUX_ENA,
+++>>>>>>> d25a0fc41c1f (ice: Initialize RDMA support)
+  	ICE_FLAG_ADV_FEATURES,
+  	ICE_FLAG_LINK_DOWN_ON_CLOSE_ENA,
+  	ICE_FLAG_TOTAL_PORT_SHUTDOWN_ENA,
+@@@ -443,7 -444,8 +451,12 @@@ struct ice_pf 
+  	struct mutex sw_mutex;		/* lock for protecting VSI alloc flow */
+  	struct mutex tc_mutex;		/* lock to protect TC changes */
+  	u32 msg_enable;
+++<<<<<<< HEAD
+ +	struct ice_ptp ptp;
+++=======
++ 	u16 num_rdma_msix;		/* Total MSIX vectors for RDMA driver */
++ 	u16 rdma_base_vector;
+++>>>>>>> d25a0fc41c1f (ice: Initialize RDMA support)
+  
+  	/* spinlock to protect the AdminQ wait list */
+  	spinlock_t aq_wait_lock;
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 4d9dc76890e0,e307317e819a..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -4321,7 -4317,24 +4371,28 @@@ probe_done
+  		goto err_netdev_reg;
+  
+  	/* ready to go, so clear down state bit */
+++<<<<<<< HEAD
+ +	clear_bit(__ICE_DOWN, pf->state);
+++=======
++ 	clear_bit(ICE_DOWN, pf->state);
++ 	if (ice_is_aux_ena(pf)) {
++ 		pf->aux_idx = ida_alloc(&ice_aux_ida, GFP_KERNEL);
++ 		if (pf->aux_idx < 0) {
++ 			dev_err(dev, "Failed to allocate device ID for AUX driver\n");
++ 			err = -ENOMEM;
++ 			goto err_netdev_reg;
++ 		}
++ 
++ 		err = ice_init_rdma(pf);
++ 		if (err) {
++ 			dev_err(dev, "Failed to initialize RDMA: %d\n", err);
++ 			err = -EIO;
++ 			goto err_init_aux_unroll;
++ 		}
++ 	} else {
++ 		dev_warn(dev, "RDMA is not supported on this device\n");
++ 	}
+++>>>>>>> d25a0fc41c1f (ice: Initialize RDMA support)
+  
+  	return 0;
+  
+@@@ -4438,10 -4454,10 +4512,11 @@@ static void ice_remove(struct pci_dev *
+  	ice_service_task_stop(pf);
+  
+  	ice_aq_cancel_waiting_tasks(pf);
++ 	ida_free(&ice_aux_ida, pf->aux_idx);
+  
+  	mutex_destroy(&(&pf->hw)->fdir_fltr_lock);
+ -	ice_deinit_lag(pf);
+ +	if (test_bit(ICE_FLAG_PTP_SUPPORTED, pf->flags))
+ +		ice_ptp_release(pf);
+  	if (!ice_is_safe_mode(pf))
+  		ice_remove_arfs(pf);
+  	ice_setup_mc_magic_wake(pf);
+diff --cc drivers/net/ethernet/intel/ice/ice_type.h
+index 7d1978fe9ab1,b86ae7910a02..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@@ -264,7 -262,7 +264,11 @@@ struct ice_hw_common_caps 
+  	u8 rss_table_entry_width;	/* RSS Entry width in bits */
+  
+  	u8 dcb;
+++<<<<<<< HEAD
+ +	u8 ieee_1588;
+++=======
++ 	u8 rdma;
+++>>>>>>> d25a0fc41c1f (ice: Initialize RDMA support)
+  
+  	bool nvm_update_pending_nvm;
+  	bool nvm_update_pending_orom;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lag.c
+diff --git a/drivers/net/ethernet/intel/ice/Makefile b/drivers/net/ethernet/intel/ice/Makefile
+index 314fc07d496e..606ce8b8dd98 100644
+--- a/drivers/net/ethernet/intel/ice/Makefile
++++ b/drivers/net/ethernet/intel/ice/Makefile
+@@ -22,6 +22,7 @@ ice-y := ice_main.o	\
+ 	 ice_ethtool_fdir.o \
+ 	 ice_flex_pipe.o \
+ 	 ice_flow.o	\
++	 ice_idc.o	\
+ 	 ice_devlink.o	\
+ 	 ice_fw_update.o \
+ 	 ice_ethtool.o
+* Unmerged path drivers/net/ethernet/intel/ice/ice.h
+diff --git a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+index e05c459ff117..46badc4482e9 100644
+--- a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
++++ b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+@@ -116,6 +116,7 @@ struct ice_aqc_list_caps_elem {
+ #define ICE_AQC_CAPS_PENDING_OROM_VER			0x004B
+ #define ICE_AQC_CAPS_NET_VER				0x004C
+ #define ICE_AQC_CAPS_PENDING_NET_VER			0x004D
++#define ICE_AQC_CAPS_RDMA				0x0051
+ #define ICE_AQC_CAPS_NVM_MGMT				0x0080
+ 
+ 	u8 major_ver;
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.c b/drivers/net/ethernet/intel/ice/ice_common.c
+index 75e405425816..2568fc3bb585 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -1074,7 +1074,8 @@ enum ice_status ice_check_reset(struct ice_hw *hw)
+ 				 GLNVM_ULD_POR_DONE_1_M |\
+ 				 GLNVM_ULD_PCIER_DONE_2_M)
+ 
+-	uld_mask = ICE_RESET_DONE_MASK;
++	uld_mask = ICE_RESET_DONE_MASK | (hw->func_caps.common_cap.rdma ?
++					  GLNVM_ULD_PE_DONE_M : 0);
+ 
+ 	/* Device is Active; check Global Reset processes are done */
+ 	for (cnt = 0; cnt < ICE_PF_RESET_WAIT_COUNT; cnt++) {
+@@ -2008,6 +2009,10 @@ ice_parse_common_caps(struct ice_hw *hw, struct ice_hw_common_caps *caps,
+ 		ice_debug(hw, ICE_DBG_INIT, "%s: nvm_unified_update = %d\n", prefix,
+ 			  caps->nvm_unified_update);
+ 		break;
++	case ICE_AQC_CAPS_RDMA:
++		caps->rdma = (number == 1);
++		ice_debug(hw, ICE_DBG_INIT, "%s: rdma = %d\n", prefix, caps->rdma);
++		break;
+ 	case ICE_AQC_CAPS_MAX_MTU:
+ 		caps->max_mtu = number;
+ 		ice_debug(hw, ICE_DBG_INIT, "%s: max_mtu = %d\n",
+@@ -2041,6 +2046,16 @@ ice_recalc_port_limited_caps(struct ice_hw *hw, struct ice_hw_common_caps *caps)
+ 		caps->maxtc = 4;
+ 		ice_debug(hw, ICE_DBG_INIT, "reducing maxtc to %d (based on #ports)\n",
+ 			  caps->maxtc);
++		if (caps->rdma) {
++			ice_debug(hw, ICE_DBG_INIT, "forcing RDMA off\n");
++			caps->rdma = 0;
++		}
++
++		/* print message only when processing device capabilities
++		 * during initialization.
++		 */
++		if (caps == &hw->dev_caps.common_cap)
++			dev_info(ice_hw_to_dev(hw), "RDMA functionality is not available with the current device configuration.\n");
+ 	}
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_idc.c b/drivers/net/ethernet/intel/ice/ice_idc.c
+new file mode 100644
+index 000000000000..c419c9cb316d
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_idc.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2021, Intel Corporation. */
++
++/* Inter-Driver Communication */
++#include "ice.h"
++#include "ice_lib.h"
++#include "ice_dcb_lib.h"
++
++/**
++ * ice_reserve_rdma_qvector - Reserve vector resources for RDMA driver
++ * @pf: board private structure to initialize
++ */
++static int ice_reserve_rdma_qvector(struct ice_pf *pf)
++{
++	if (test_bit(ICE_FLAG_RDMA_ENA, pf->flags)) {
++		int index;
++
++		index = ice_get_res(pf, pf->irq_tracker, pf->num_rdma_msix,
++				    ICE_RES_RDMA_VEC_ID);
++		if (index < 0)
++			return index;
++		pf->num_avail_sw_msix -= pf->num_rdma_msix;
++		pf->rdma_base_vector = (u16)index;
++	}
++	return 0;
++}
++
++/**
++ * ice_init_rdma - initializes PF for RDMA use
++ * @pf: ptr to ice_pf
++ */
++int ice_init_rdma(struct ice_pf *pf)
++{
++	struct device *dev = &pf->pdev->dev;
++	int ret;
++
++	/* Reserve vector resources */
++	ret = ice_reserve_rdma_qvector(pf);
++	if (ret < 0)
++		dev_err(dev, "failed to reserve vectors for RDMA\n");
++
++	return ret;
++}
+* Unmerged path drivers/net/ethernet/intel/ice/ice_lag.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 107321e83064..3f61668ae389 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -628,6 +628,17 @@ bool ice_is_safe_mode(struct ice_pf *pf)
+ 	return !test_bit(ICE_FLAG_ADV_FEATURES, pf->flags);
+ }
+ 
++/**
++ * ice_is_aux_ena
++ * @pf: pointer to the PF struct
++ *
++ * returns true if AUX devices/drivers are supported, false otherwise
++ */
++bool ice_is_aux_ena(struct ice_pf *pf)
++{
++	return test_bit(ICE_FLAG_AUX_ENA, pf->flags);
++}
++
+ /**
+  * ice_vsi_clean_rss_flow_fld - Delete RSS configuration
+  * @vsi: the VSI being cleaned up
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.h b/drivers/net/ethernet/intel/ice/ice_lib.h
+index 39e7539bce37..358cf06ae038 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_lib.h
+@@ -103,7 +103,7 @@ enum ice_status
+ ice_vsi_cfg_mac_fltr(struct ice_vsi *vsi, const u8 *macaddr, bool set);
+ 
+ bool ice_is_safe_mode(struct ice_pf *pf);
+-
++bool ice_is_aux_ena(struct ice_pf *pf);
+ bool ice_is_dflt_vsi_in_use(struct ice_sw *sw);
+ 
+ bool ice_is_vsi_dflt_vsi(struct ice_sw *sw, struct ice_vsi *vsi);
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_type.h
