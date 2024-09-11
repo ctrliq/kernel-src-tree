@@ -1,0 +1,231 @@
+driver core: Rename dev_links_info.defer_sync to defer_hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Saravana Kannan <saravanak@google.com>
+commit ec7bd78498f29680f536451fbdf9464e851273ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ec7bd784.failed
+
+The defer_sync field is used as a hook to add the device to the
+deferred_sync list. Rename it so that it's more meaningful for the next
+patch that'll also use this field as a hook to a deferred_fw_devlink
+list.
+
+	Signed-off-by: Saravana Kannan <saravanak@google.com>
+	Reviewed-by: Rafael J. Wysocki <rafael@kernel.org>
+	Tested-by: Geert Uytterhoeven <geert+renesas@glider.be>
+Link: https://lore.kernel.org/r/20200701194259.3337652-3-saravanak@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ec7bd78498f29680f536451fbdf9464e851273ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/core.c
+#	include/linux/device.h
+diff --cc drivers/base/core.c
+index 7ffd5023ca95,d1d2cdc3a8d8..000000000000
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@@ -611,6 -713,143 +611,146 @@@ int device_links_check_suppliers(struc
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * __device_links_queue_sync_state - Queue a device for sync_state() callback
++  * @dev: Device to call sync_state() on
++  * @list: List head to queue the @dev on
++  *
++  * Queues a device for a sync_state() callback when the device links write lock
++  * isn't held. This allows the sync_state() execution flow to use device links
++  * APIs.  The caller must ensure this function is called with
++  * device_links_write_lock() held.
++  *
++  * This function does a get_device() to make sure the device is not freed while
++  * on this list.
++  *
++  * So the caller must also ensure that device_links_flush_sync_list() is called
++  * as soon as the caller releases device_links_write_lock().  This is necessary
++  * to make sure the sync_state() is called in a timely fashion and the
++  * put_device() is called on this device.
++  */
++ static void __device_links_queue_sync_state(struct device *dev,
++ 					    struct list_head *list)
++ {
++ 	struct device_link *link;
++ 
++ 	if (!dev_has_sync_state(dev))
++ 		return;
++ 	if (dev->state_synced)
++ 		return;
++ 
++ 	list_for_each_entry(link, &dev->links.consumers, s_node) {
++ 		if (!(link->flags & DL_FLAG_MANAGED))
++ 			continue;
++ 		if (link->status != DL_STATE_ACTIVE)
++ 			return;
++ 	}
++ 
++ 	/*
++ 	 * Set the flag here to avoid adding the same device to a list more
++ 	 * than once. This can happen if new consumers get added to the device
++ 	 * and probed before the list is flushed.
++ 	 */
++ 	dev->state_synced = true;
++ 
++ 	if (WARN_ON(!list_empty(&dev->links.defer_hook)))
++ 		return;
++ 
++ 	get_device(dev);
++ 	list_add_tail(&dev->links.defer_hook, list);
++ }
++ 
++ /**
++  * device_links_flush_sync_list - Call sync_state() on a list of devices
++  * @list: List of devices to call sync_state() on
++  * @dont_lock_dev: Device for which lock is already held by the caller
++  *
++  * Calls sync_state() on all the devices that have been queued for it. This
++  * function is used in conjunction with __device_links_queue_sync_state(). The
++  * @dont_lock_dev parameter is useful when this function is called from a
++  * context where a device lock is already held.
++  */
++ static void device_links_flush_sync_list(struct list_head *list,
++ 					 struct device *dont_lock_dev)
++ {
++ 	struct device *dev, *tmp;
++ 
++ 	list_for_each_entry_safe(dev, tmp, list, links.defer_hook) {
++ 		list_del_init(&dev->links.defer_hook);
++ 
++ 		if (dev != dont_lock_dev)
++ 			device_lock(dev);
++ 
++ 		if (dev->bus->sync_state)
++ 			dev->bus->sync_state(dev);
++ 		else if (dev->driver && dev->driver->sync_state)
++ 			dev->driver->sync_state(dev);
++ 
++ 		if (dev != dont_lock_dev)
++ 			device_unlock(dev);
++ 
++ 		put_device(dev);
++ 	}
++ }
++ 
++ void device_links_supplier_sync_state_pause(void)
++ {
++ 	device_links_write_lock();
++ 	defer_sync_state_count++;
++ 	device_links_write_unlock();
++ }
++ 
++ void device_links_supplier_sync_state_resume(void)
++ {
++ 	struct device *dev, *tmp;
++ 	LIST_HEAD(sync_list);
++ 
++ 	device_links_write_lock();
++ 	if (!defer_sync_state_count) {
++ 		WARN(true, "Unmatched sync_state pause/resume!");
++ 		goto out;
++ 	}
++ 	defer_sync_state_count--;
++ 	if (defer_sync_state_count)
++ 		goto out;
++ 
++ 	list_for_each_entry_safe(dev, tmp, &deferred_sync, links.defer_hook) {
++ 		/*
++ 		 * Delete from deferred_sync list before queuing it to
++ 		 * sync_list because defer_hook is used for both lists.
++ 		 */
++ 		list_del_init(&dev->links.defer_hook);
++ 		__device_links_queue_sync_state(dev, &sync_list);
++ 	}
++ out:
++ 	device_links_write_unlock();
++ 
++ 	device_links_flush_sync_list(&sync_list, NULL);
++ }
++ 
++ static int sync_state_resume_initcall(void)
++ {
++ 	device_links_supplier_sync_state_resume();
++ 	return 0;
++ }
++ late_initcall(sync_state_resume_initcall);
++ 
++ static void __device_links_supplier_defer_sync(struct device *sup)
++ {
++ 	if (list_empty(&sup->links.defer_hook) && dev_has_sync_state(sup))
++ 		list_add_tail(&sup->links.defer_hook, &deferred_sync);
++ }
++ 
++ static void device_link_drop_managed(struct device_link *link)
++ {
++ 	link->flags &= ~DL_FLAG_MANAGED;
++ 	WRITE_ONCE(link->status, DL_STATE_NONE);
++ 	kref_put(&link->kref, __device_link_del);
++ }
++ 
++ /**
+++>>>>>>> ec7bd78498f2 (driver core: Rename dev_links_info.defer_sync to defer_hook)
+   * device_links_driver_bound - Update device links after probing its driver.
+   * @dev: Device to update the links for.
+   *
+@@@ -780,6 -1052,7 +920,10 @@@ void device_links_driver_cleanup(struc
+  		WRITE_ONCE(link->status, DL_STATE_DORMANT);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	list_del_init(&dev->links.defer_hook);
+++>>>>>>> ec7bd78498f2 (driver core: Rename dev_links_info.defer_sync to defer_hook)
+  	__device_links_no_driver(dev);
+  
+  	device_links_write_unlock();
+@@@ -1762,6 -2170,8 +1906,11 @@@ void device_initialize(struct device *d
+  #endif
+  	INIT_LIST_HEAD(&dev->links.consumers);
+  	INIT_LIST_HEAD(&dev->links.suppliers);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&dev->links.needs_suppliers);
++ 	INIT_LIST_HEAD(&dev->links.defer_hook);
+++>>>>>>> ec7bd78498f2 (driver core: Rename dev_links_info.defer_sync to defer_hook)
+  	dev->links.status = DL_DEV_NO_DRIVER;
+  }
+  EXPORT_SYMBOL_GPL(device_initialize);
+diff --cc include/linux/device.h
+index 8ea0baac3c21,9bb2bc7bb8e3..000000000000
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@@ -1037,11 -432,18 +1037,24 @@@ enum dl_dev_state 
+   * struct dev_links_info - Device data related to device links.
+   * @suppliers: List of links to supplier devices.
+   * @consumers: List of links to consumer devices.
+++<<<<<<< HEAD
+++=======
++  * @needs_suppliers: Hook to global list of devices waiting for suppliers.
++  * @defer_hook: Hook to global list of devices that have deferred sync_state.
++  * @need_for_probe: If needs_suppliers is on a list, this indicates if the
++  *		    suppliers are needed for probe or not.
+++>>>>>>> ec7bd78498f2 (driver core: Rename dev_links_info.defer_sync to defer_hook)
+   * @status: Driver status information.
+   */
+  struct dev_links_info {
+  	struct list_head suppliers;
+  	struct list_head consumers;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head needs_suppliers;
++ 	struct list_head defer_hook;
++ 	bool need_for_probe;
+++>>>>>>> ec7bd78498f2 (driver core: Rename dev_links_info.defer_sync to defer_hook)
+  	enum dl_dev_state status;
+  };
+  
+* Unmerged path drivers/base/core.c
+* Unmerged path include/linux/device.h
