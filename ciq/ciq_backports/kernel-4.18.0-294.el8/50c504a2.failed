@@ -1,0 +1,248 @@
+mptcp: parse and act on incoming FASTCLOSE option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 50c504a20a754ca37b5e1f4e660cd687769a7dca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/50c504a2.failed
+
+parse the MPTCP FASTCLOSE subtype.
+
+If provided key matches the local one, schedule the work queue to close
+(with tcp reset) all subflows.
+
+The MPTCP socket moves to closed state immediately.
+
+	Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 50c504a20a754ca37b5e1f4e660cd687769a7dca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 75ee5f9fd199,cb8b7adf218a..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1425,24 -2153,124 +1425,132 @@@ static unsigned int mptcp_sync_mss(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void pm_work(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_pm_data *pm = &msk->pm;
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 
++ 	pr_debug("msk=%p status=%x", msk, pm->status);
++ 	if (pm->status & BIT(MPTCP_PM_ADD_ADDR_RECEIVED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ADD_ADDR_RECEIVED);
++ 		mptcp_pm_nl_add_addr_received(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_ADD_ADDR_SEND_ACK)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ADD_ADDR_SEND_ACK);
++ 		mptcp_pm_nl_add_addr_send_ack(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_RM_ADDR_RECEIVED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_RM_ADDR_RECEIVED);
++ 		mptcp_pm_nl_rm_addr_received(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_ESTABLISHED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ESTABLISHED);
++ 		mptcp_pm_nl_fully_established(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_SUBFLOW_ESTABLISHED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_SUBFLOW_ESTABLISHED);
++ 		mptcp_pm_nl_subflow_established(msk);
++ 	}
++ 
++ 	spin_unlock_bh(&msk->pm.lock);
++ }
++ 
++ static void __mptcp_close_subflow(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow, *tmp;
++ 
++ 	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		if (inet_sk_state_load(ssk) != TCP_CLOSE)
++ 			continue;
++ 
++ 		__mptcp_close_ssk((struct sock *)msk, ssk, subflow);
++ 	}
++ }
++ 
++ static bool mptcp_check_close_timeout(const struct sock *sk)
++ {
++ 	s32 delta = tcp_jiffies32 - inet_csk(sk)->icsk_mtup.probe_timestamp;
++ 	struct mptcp_subflow_context *subflow;
++ 
++ 	if (delta >= TCP_TIMEWAIT_LEN)
++ 		return true;
++ 
++ 	/* if all subflows are in closed status don't bother with additional
++ 	 * timeout
++ 	 */
++ 	mptcp_for_each_subflow(mptcp_sk(sk), subflow) {
++ 		if (inet_sk_state_load(mptcp_subflow_tcp_sock(subflow)) !=
++ 		    TCP_CLOSE)
++ 			return false;
++ 	}
++ 	return true;
++ }
++ 
++ static void mptcp_check_fastclose(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow, *tmp;
++ 	struct sock *sk = &msk->sk.icsk_inet.sk;
++ 
++ 	if (likely(!READ_ONCE(msk->rcv_fastclose)))
++ 		return;
++ 
++ 	mptcp_token_destroy(msk);
++ 
++ 	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
++ 		struct sock *tcp_sk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		lock_sock(tcp_sk);
++ 		if (tcp_sk->sk_state != TCP_CLOSE) {
++ 			tcp_send_active_reset(tcp_sk, GFP_ATOMIC);
++ 			tcp_set_state(tcp_sk, TCP_CLOSE);
++ 		}
++ 		release_sock(tcp_sk);
++ 	}
++ 
++ 	inet_sk_state_store(sk, TCP_CLOSE);
++ 	sk->sk_shutdown = SHUTDOWN_MASK;
++ 	smp_mb__before_atomic(); /* SHUTDOWN must be visible first */
++ 	set_bit(MPTCP_DATA_READY, &msk->flags);
++ 	set_bit(MPTCP_WORK_CLOSE_SUBFLOW, &msk->flags);
++ 
++ 	mptcp_close_wake_up(sk);
++ }
++ 
+++>>>>>>> 50c504a20a75 (mptcp: parse and act on incoming FASTCLOSE option)
+  static void mptcp_worker(struct work_struct *work)
+  {
+  	struct mptcp_sock *msk = container_of(work, struct mptcp_sock, work);
+  	struct sock *ssk, *sk = &msk->sk.icsk_inet.sk;
+ -	struct mptcp_sendmsg_info info = {};
+ +	int orig_len, orig_offset, mss_now = 0, size_goal = 0;
+  	struct mptcp_data_frag *dfrag;
+ +	u64 orig_write_seq;
+  	size_t copied = 0;
+ -	int state, ret;
+ +	struct msghdr msg = {
+ +		.msg_flags = MSG_DONTWAIT,
+ +	};
+ +	long timeo = 0;
+  
+  	lock_sock(sk);
+ -	state = sk->sk_state;
+ -	if (unlikely(state == TCP_CLOSE))
+ -		goto unlock;
+ -
+ +	mptcp_clean_una_wakeup(sk);
+  	mptcp_check_data_fin_ack(sk);
+  	__mptcp_flush_join_list(msk);
+++<<<<<<< HEAD
+ +	__mptcp_move_skbs(msk);
+++=======
++ 
++ 	mptcp_check_fastclose(msk);
++ 
++ 	if (test_and_clear_bit(MPTCP_WORK_CLOSE_SUBFLOW, &msk->flags))
++ 		__mptcp_close_subflow(msk);
++ 
++ 	if (msk->pm.status)
++ 		pm_work(msk);
+++>>>>>>> 50c504a20a75 (mptcp: parse and act on incoming FASTCLOSE option)
+  
+  	if (test_and_clear_bit(MPTCP_WORK_EOF, &msk->flags))
+  		mptcp_check_for_eof(msk);
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index af3f2e566740..d0e9b1237f43 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -279,6 +279,16 @@ static void mptcp_parse_option(const struct sk_buff *skb,
+ 		pr_debug("RM_ADDR: id=%d", mp_opt->rm_id);
+ 		break;
+ 
++	case MPTCPOPT_MP_FASTCLOSE:
++		if (opsize != TCPOLEN_MPTCP_FASTCLOSE)
++			break;
++
++		ptr += 2;
++		mp_opt->rcvr_key = get_unaligned_be64(ptr);
++		ptr += 8;
++		mp_opt->fastclose = 1;
++		break;
++
+ 	default:
+ 		break;
+ 	}
+@@ -296,6 +306,7 @@ void mptcp_get_options(const struct sk_buff *skb,
+ 	mp_opt->mp_join = 0;
+ 	mp_opt->add_addr = 0;
+ 	mp_opt->ahmac = 0;
++	mp_opt->fastclose = 0;
+ 	mp_opt->port = 0;
+ 	mp_opt->rm_addr = 0;
+ 	mp_opt->dss = 0;
+@@ -840,6 +851,12 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+ 	if (!check_fully_established(msk, sk, subflow, skb, &mp_opt))
+ 		return;
+ 
++	if (mp_opt.fastclose &&
++	    msk->local_key == mp_opt.rcvr_key) {
++		WRITE_ONCE(msk->rcv_fastclose, true);
++		mptcp_schedule_work((struct sock *)msk);
++	}
++
+ 	if (mp_opt.add_addr && add_addr_hmac_valid(msk, &mp_opt)) {
+ 		struct mptcp_addr_info addr;
+ 
+* Unmerged path net/mptcp/protocol.c
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 46bdc749922f..afa0574bf70f 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -23,6 +23,7 @@
+ #define OPTION_MPTCP_ADD_ADDR	BIT(6)
+ #define OPTION_MPTCP_ADD_ADDR6	BIT(7)
+ #define OPTION_MPTCP_RM_ADDR	BIT(8)
++#define OPTION_MPTCP_FASTCLOSE	BIT(9)
+ 
+ /* MPTCP option subtypes */
+ #define MPTCPOPT_MP_CAPABLE	0
+@@ -58,6 +59,7 @@
+ #define TCPOLEN_MPTCP_ADD_ADDR6_BASE_PORT	24
+ #define TCPOLEN_MPTCP_PORT_LEN		4
+ #define TCPOLEN_MPTCP_RM_ADDR_BASE	4
++#define TCPOLEN_MPTCP_FASTCLOSE		12
+ 
+ /* MPTCP MP_JOIN flags */
+ #define MPTCPOPT_BACKUP		BIT(0)
+@@ -107,6 +109,7 @@ struct mptcp_options_received {
+ 	u16	data_len;
+ 	u16	mp_capable : 1,
+ 		mp_join : 1,
++		fastclose : 1,
+ 		dss : 1,
+ 		add_addr : 1,
+ 		rm_addr : 1,
+@@ -212,6 +215,7 @@ struct mptcp_sock {
+ 	bool		fully_established;
+ 	bool		rcv_data_fin;
+ 	bool		snd_data_fin_enable;
++	bool		rcv_fastclose;
+ 	bool		use_64bit_ack; /* Set when we received a 64-bit DSN */
+ 	spinlock_t	join_list_lock;
+ 	struct work_struct work;
