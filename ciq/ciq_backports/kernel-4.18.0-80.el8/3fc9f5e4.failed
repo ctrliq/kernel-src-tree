@@ -1,0 +1,217 @@
+xfs: remove xfs_reflink_remap_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 3fc9f5e409319e994d113cf1327ba6ab147423c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/3fc9f5e4.failed
+
+Since xfs_file_remap_range is a thin wrapper, move the contents of
+xfs_reflink_remap_range into the shell.  This cuts down on the vfs
+calls being made from internal xfs code.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 3fc9f5e409319e994d113cf1327ba6ab147423c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_reflink.c
+diff --cc fs/xfs/xfs_file.c
+index 61a5ad2600e8,53c9ab8fb777..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -919,28 -919,67 +919,92 @@@ out_unlock
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +STATIC int
+ +xfs_file_clone_range(
+ +	struct file	*file_in,
+ +	loff_t		pos_in,
+ +	struct file	*file_out,
+ +	loff_t		pos_out,
+ +	u64		len)
+ +{
+ +	return xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +				     len, false);
+ +}
+ +
+ +STATIC int
+ +xfs_file_dedupe_range(
+ +	struct file	*file_in,
+ +	loff_t		pos_in,
+ +	struct file	*file_out,
+ +	loff_t		pos_out,
+ +	u64		len)
+ +{
+ +	return xfs_reflink_remap_range(file_in, pos_in, file_out, pos_out,
+ +				     len, true);
+++=======
++ 
++ loff_t
++ xfs_file_remap_range(
++ 	struct file		*file_in,
++ 	loff_t			pos_in,
++ 	struct file		*file_out,
++ 	loff_t			pos_out,
++ 	loff_t			len,
++ 	unsigned int		remap_flags)
++ {
++ 	struct inode		*inode_in = file_inode(file_in);
++ 	struct xfs_inode	*src = XFS_I(inode_in);
++ 	struct inode		*inode_out = file_inode(file_out);
++ 	struct xfs_inode	*dest = XFS_I(inode_out);
++ 	struct xfs_mount	*mp = src->i_mount;
++ 	loff_t			remapped = 0;
++ 	xfs_extlen_t		cowextsize;
++ 	int			ret;
++ 
++ 	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_ADVISORY))
++ 		return -EINVAL;
++ 
++ 	if (!xfs_sb_version_hasreflink(&mp->m_sb))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	/* Prepare and then clone file data. */
++ 	ret = xfs_reflink_remap_prep(file_in, pos_in, file_out, pos_out,
++ 			&len, remap_flags);
++ 	if (ret < 0 || len == 0)
++ 		return ret;
++ 
++ 	trace_xfs_reflink_remap_range(src, pos_in, len, dest, pos_out);
++ 
++ 	ret = xfs_reflink_remap_blocks(src, pos_in, dest, pos_out, len,
++ 			&remapped);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * Carry the cowextsize hint from src to dest if we're sharing the
++ 	 * entire source file to the entire destination file, the source file
++ 	 * has a cowextsize hint, and the destination file does not.
++ 	 */
++ 	cowextsize = 0;
++ 	if (pos_in == 0 && len == i_size_read(inode_in) &&
++ 	    (src->i_d.di_flags2 & XFS_DIFLAG2_COWEXTSIZE) &&
++ 	    pos_out == 0 && len >= i_size_read(inode_out) &&
++ 	    !(dest->i_d.di_flags2 & XFS_DIFLAG2_COWEXTSIZE))
++ 		cowextsize = src->i_d.di_cowextsize;
++ 
++ 	ret = xfs_reflink_update_dest(dest, pos_out + len, cowextsize,
++ 			remap_flags);
++ 
++ out_unlock:
++ 	xfs_reflink_remap_unlock(file_in, file_out);
++ 	if (ret)
++ 		trace_xfs_reflink_remap_range_error(dest, ret, _RET_IP_);
++ 	return remapped > 0 ? remapped : ret;
+++>>>>>>> 3fc9f5e40931 (xfs: remove xfs_reflink_remap_range)
+  }
+  
+  STATIC int
+diff --cc fs/xfs/xfs_reflink.c
+index c17089911875,84f372f7ea04..000000000000
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@@ -1407,66 -1371,6 +1407,69 @@@ out_unlock
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Link a range of blocks from one file to another.
+ + */
+ +int
+ +xfs_reflink_remap_range(
+ +	struct file		*file_in,
+ +	loff_t			pos_in,
+ +	struct file		*file_out,
+ +	loff_t			pos_out,
+ +	u64			len,
+ +	bool			is_dedupe)
+ +{
+ +	struct inode		*inode_in = file_inode(file_in);
+ +	struct xfs_inode	*src = XFS_I(inode_in);
+ +	struct inode		*inode_out = file_inode(file_out);
+ +	struct xfs_inode	*dest = XFS_I(inode_out);
+ +	struct xfs_mount	*mp = src->i_mount;
+ +	xfs_extlen_t		cowextsize;
+ +	ssize_t			ret;
+ +
+ +	if (!xfs_sb_version_hasreflink(&mp->m_sb))
+ +		return -EOPNOTSUPP;
+ +
+ +	if (XFS_FORCED_SHUTDOWN(mp))
+ +		return -EIO;
+ +
+ +	/* Prepare and then clone file data. */
+ +	ret = xfs_reflink_remap_prep(file_in, pos_in, file_out, pos_out,
+ +			&len, is_dedupe);
+ +	if (ret <= 0)
+ +		return ret;
+ +
+ +	trace_xfs_reflink_remap_range(src, pos_in, len, dest, pos_out);
+ +
+ +	ret = xfs_reflink_remap_blocks(src, pos_in, dest, pos_out, len);
+ +	if (ret)
+ +		goto out_unlock;
+ +
+ +	/*
+ +	 * Carry the cowextsize hint from src to dest if we're sharing the
+ +	 * entire source file to the entire destination file, the source file
+ +	 * has a cowextsize hint, and the destination file does not.
+ +	 */
+ +	cowextsize = 0;
+ +	if (pos_in == 0 && len == i_size_read(inode_in) &&
+ +	    (src->i_d.di_flags2 & XFS_DIFLAG2_COWEXTSIZE) &&
+ +	    pos_out == 0 && len >= i_size_read(inode_out) &&
+ +	    !(dest->i_d.di_flags2 & XFS_DIFLAG2_COWEXTSIZE))
+ +		cowextsize = src->i_d.di_cowextsize;
+ +
+ +	ret = xfs_reflink_update_dest(dest, pos_out + len, cowextsize,
+ +			is_dedupe);
+ +
+ +out_unlock:
+ +	xfs_reflink_remap_unlock(file_in, file_out);
+ +	if (ret)
+ +		trace_xfs_reflink_remap_range_error(dest, ret, _RET_IP_);
+ +	return ret;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 3fc9f5e40931 (xfs: remove xfs_reflink_remap_range)
+   * The user wants to preemptively CoW all shared blocks in this file,
+   * which enables us to turn off the reflink flag.  Iterate all
+   * extents which are not prealloc/delalloc to see which ranges are
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_reflink.c
+diff --git a/fs/xfs/xfs_reflink.h b/fs/xfs/xfs_reflink.h
+index c585ad9552b2..a8085965f578 100644
+--- a/fs/xfs/xfs_reflink.h
++++ b/fs/xfs/xfs_reflink.h
+@@ -35,5 +35,15 @@ extern int xfs_reflink_clear_inode_flag(struct xfs_inode *ip,
+ 		struct xfs_trans **tpp);
+ extern int xfs_reflink_unshare(struct xfs_inode *ip, xfs_off_t offset,
+ 		xfs_off_t len);
++extern int xfs_reflink_remap_prep(struct file *file_in, loff_t pos_in,
++		struct file *file_out, loff_t pos_out, loff_t *len,
++		unsigned int remap_flags);
++extern int xfs_reflink_remap_blocks(struct xfs_inode *src, loff_t pos_in,
++		struct xfs_inode *dest, loff_t pos_out, loff_t remap_len,
++		loff_t *remapped);
++extern int xfs_reflink_update_dest(struct xfs_inode *dest, xfs_off_t newlen,
++		xfs_extlen_t cowextsize, unsigned int remap_flags);
++extern void xfs_reflink_remap_unlock(struct file *file_in,
++		struct file *file_out);
+ 
+ #endif /* __XFS_REFLINK_H */
