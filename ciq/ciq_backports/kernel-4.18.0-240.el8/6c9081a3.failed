@@ -1,0 +1,214 @@
+tipc: add loopback device tracking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author John Rutherford <john.rutherford@dektech.com.au>
+commit 6c9081a3915dc0782a8f1424343b794f2cf53d9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6c9081a3.failed
+
+Since node internal messages are passed directly to the socket, it is not
+possible to observe those messages via tcpdump or wireshark.
+
+We now remedy this by making it possible to clone such messages and send
+the clones to the loopback interface.  The clones are dropped at reception
+and have no functional role except making the traffic visible.
+
+The feature is enabled if network taps are active for the loopback device.
+pcap filtering restrictions require the messages to be presented to the
+receiving side of the loopback device.
+
+v3 - Function dev_nit_active used to check for network taps.
+   - Procedure netif_rx_ni used to send cloned messages to loopback device.
+
+	Signed-off-by: John Rutherford <john.rutherford@dektech.com.au>
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+	Acked-by: Ying Xue <ying.xue@windriver.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6c9081a3915dc0782a8f1424343b794f2cf53d9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/node.c
+diff --cc net/tipc/node.c
+index 3fe27ab13350,1bdcf0fc1a4d..000000000000
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@@ -1454,7 -1443,7 +1454,11 @@@ int tipc_node_xmit(struct net *net, str
+  	int rc;
+  
+  	if (in_own_node(net, dnode)) {
+++<<<<<<< HEAD
+ +		spin_lock_init(&list->lock);
+++=======
++ 		tipc_loopback_trace(net, list);
+++>>>>>>> 6c9081a3915d (tipc: add loopback device tracking)
+  		tipc_sk_rcv(net, list);
+  		return 0;
+  	}
+diff --git a/net/tipc/bcast.c b/net/tipc/bcast.c
+index 588c2709f7d2..52854ac9b03f 100644
+--- a/net/tipc/bcast.c
++++ b/net/tipc/bcast.c
+@@ -412,8 +412,10 @@ int tipc_mcast_xmit(struct net *net, struct sk_buff_head *pkts,
+ 			rc = tipc_bcast_xmit(net, pkts, cong_link_cnt);
+ 	}
+ 
+-	if (dests->local)
++	if (dests->local) {
++		tipc_loopback_trace(net, &localq);
+ 		tipc_sk_mcast_rcv(net, &localq, &inputq);
++	}
+ exit:
+ 	/* This queue should normally be empty by now */
+ 	__skb_queue_purge(pkts);
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index 8ed9df7c7806..7e810bfc68d2 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -679,6 +679,65 @@ void tipc_bearer_stop(struct net *net)
+ 	}
+ }
+ 
++void tipc_clone_to_loopback(struct net *net, struct sk_buff_head *pkts)
++{
++	struct net_device *dev = net->loopback_dev;
++	struct sk_buff *skb, *_skb;
++	int exp;
++
++	skb_queue_walk(pkts, _skb) {
++		skb = pskb_copy(_skb, GFP_ATOMIC);
++		if (!skb)
++			continue;
++
++		exp = SKB_DATA_ALIGN(dev->hard_header_len - skb_headroom(skb));
++		if (exp > 0 && pskb_expand_head(skb, exp, 0, GFP_ATOMIC)) {
++			kfree_skb(skb);
++			continue;
++		}
++
++		skb_reset_network_header(skb);
++		dev_hard_header(skb, dev, ETH_P_TIPC, dev->dev_addr,
++				dev->dev_addr, skb->len);
++		skb->dev = dev;
++		skb->pkt_type = PACKET_HOST;
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		skb->protocol = eth_type_trans(skb, dev);
++		netif_rx_ni(skb);
++	}
++}
++
++static int tipc_loopback_rcv_pkt(struct sk_buff *skb, struct net_device *dev,
++				 struct packet_type *pt, struct net_device *od)
++{
++	consume_skb(skb);
++	return NET_RX_SUCCESS;
++}
++
++int tipc_attach_loopback(struct net *net)
++{
++	struct net_device *dev = net->loopback_dev;
++	struct tipc_net *tn = tipc_net(net);
++
++	if (!dev)
++		return -ENODEV;
++
++	dev_hold(dev);
++	tn->loopback_pt.dev = dev;
++	tn->loopback_pt.type = htons(ETH_P_TIPC);
++	tn->loopback_pt.func = tipc_loopback_rcv_pkt;
++	dev_add_pack(&tn->loopback_pt);
++	return 0;
++}
++
++void tipc_detach_loopback(struct net *net)
++{
++	struct tipc_net *tn = tipc_net(net);
++
++	dev_remove_pack(&tn->loopback_pt);
++	dev_put(net->loopback_dev);
++}
++
+ /* Caller should hold rtnl_lock to protect the bearer */
+ static int __tipc_nl_add_bearer(struct tipc_nl_msg *msg,
+ 				struct tipc_bearer *bearer, int nlflags)
+diff --git a/net/tipc/bearer.h b/net/tipc/bearer.h
+index 7f4c569594a5..ea0f3c49cbed 100644
+--- a/net/tipc/bearer.h
++++ b/net/tipc/bearer.h
+@@ -232,6 +232,16 @@ void tipc_bearer_xmit(struct net *net, u32 bearer_id,
+ 		      struct tipc_media_addr *dst);
+ void tipc_bearer_bc_xmit(struct net *net, u32 bearer_id,
+ 			 struct sk_buff_head *xmitq);
++void tipc_clone_to_loopback(struct net *net, struct sk_buff_head *pkts);
++int tipc_attach_loopback(struct net *net);
++void tipc_detach_loopback(struct net *net);
++
++static inline void tipc_loopback_trace(struct net *net,
++				       struct sk_buff_head *pkts)
++{
++	if (unlikely(dev_nit_active(net->loopback_dev)))
++		tipc_clone_to_loopback(net, pkts);
++}
+ 
+ /* check if device MTU is too low for tipc headers */
+ static inline bool tipc_mtu_bad(struct net_device *dev, unsigned int reserve)
+diff --git a/net/tipc/core.c b/net/tipc/core.c
+index 10d5b888a9c1..69f81e32380c 100644
+--- a/net/tipc/core.c
++++ b/net/tipc/core.c
+@@ -82,6 +82,10 @@ static int __net_init tipc_init_net(struct net *net)
+ 	if (err)
+ 		goto out_bclink;
+ 
++	err = tipc_attach_loopback(net);
++	if (err)
++		goto out_bclink;
++
+ 	return 0;
+ 
+ out_bclink:
+@@ -94,6 +98,7 @@ static int __net_init tipc_init_net(struct net *net)
+ 
+ static void __net_exit tipc_exit_net(struct net *net)
+ {
++	tipc_detach_loopback(net);
+ 	tipc_net_stop(net);
+ 	tipc_bcast_stop(net);
+ 	tipc_nametbl_stop(net);
+diff --git a/net/tipc/core.h b/net/tipc/core.h
+index 7a68e1b6a066..60d829581068 100644
+--- a/net/tipc/core.h
++++ b/net/tipc/core.h
+@@ -125,6 +125,9 @@ struct tipc_net {
+ 
+ 	/* Cluster capabilities */
+ 	u16 capabilities;
++
++	/* Tracing of node internal messages */
++	struct packet_type loopback_pt;
+ };
+ 
+ static inline struct tipc_net *tipc_net(struct net *net)
+* Unmerged path net/tipc/node.c
+diff --git a/net/tipc/topsrv.c b/net/tipc/topsrv.c
+index ca8ac96d22a9..3a12fc18239b 100644
+--- a/net/tipc/topsrv.c
++++ b/net/tipc/topsrv.c
+@@ -40,6 +40,7 @@
+ #include "socket.h"
+ #include "addr.h"
+ #include "msg.h"
++#include "bearer.h"
+ #include <net/sock.h>
+ #include <linux/module.h>
+ 
+@@ -608,6 +609,7 @@ static void tipc_topsrv_kern_evt(struct net *net, struct tipc_event *evt)
+ 	memcpy(msg_data(buf_msg(skb)), evt, sizeof(*evt));
+ 	skb_queue_head_init(&evtq);
+ 	__skb_queue_tail(&evtq, skb);
++	tipc_loopback_trace(net, &evtq);
+ 	tipc_sk_rcv(net, &evtq);
+ }
+ 
