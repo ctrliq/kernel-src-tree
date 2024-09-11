@@ -1,0 +1,146 @@
+rcu/nocb: De-offloading GP kthread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Frederic Weisbecker <frederic@kernel.org>
+commit 5bb39dc956f3d4f1bb75b5962b503426c45340ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5bb39dc9.failed
+
+To de-offload callback processing back onto a CPU, it is necessary
+to clear SEGCBLIST_OFFLOAD and notify the nocb GP kthread, which will
+then clear its own bit flag and ignore this CPU until further notice.
+Whichever of the nocb CB and nocb GP kthreads is last to clear its own
+bit notifies the de-offloading worker kthread.  Once notified, this
+worker kthread can proceed safe in the knowledge that the nocb CB and
+GP kthreads will no longer be manipulating this CPU's RCU callback list.
+
+This commit makes this change.
+
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+	Cc: Joel Fernandes <joel@joelfernandes.org>
+	Cc: Neeraj Upadhyay <neeraju@codeaurora.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Inspired-by: Paul E. McKenney <paulmck@kernel.org>
+	Tested-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 5bb39dc956f3d4f1bb75b5962b503426c45340ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree_plugin.h
+diff --cc kernel/rcu/tree_plugin.h
+index 10e9e427ecfe,fe46e7008667..000000000000
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@@ -2187,6 -2254,87 +2223,90 @@@ static void do_nocb_deferred_wakeup(str
+  		do_nocb_deferred_wakeup_common(rdp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __rcu_nocb_rdp_deoffload(struct rcu_data *rdp)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	struct rcu_data *rdp_gp = rdp->nocb_gp_rdp;
++ 	bool wake_cb = false, wake_gp = false;
++ 	unsigned long flags;
++ 
++ 	printk("De-offloading %d\n", rdp->cpu);
++ 
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	/*
++ 	 * If there are still pending work offloaded, the offline
++ 	 * CPU won't help much handling them.
++ 	 */
++ 	if (cpu_is_offline(rdp->cpu) && !rcu_segcblist_empty(&rdp->cblist)) {
++ 		rcu_nocb_unlock_irqrestore(rdp, flags);
++ 		return -EBUSY;
++ 	}
++ 
++ 	rcu_segcblist_offload(cblist, false);
++ 
++ 	if (rdp->nocb_cb_sleep) {
++ 		rdp->nocb_cb_sleep = false;
++ 		wake_cb = true;
++ 	}
++ 	rcu_nocb_unlock_irqrestore(rdp, flags);
++ 
++ 	if (wake_cb)
++ 		swake_up_one(&rdp->nocb_cb_wq);
++ 
++ 	raw_spin_lock_irqsave(&rdp_gp->nocb_gp_lock, flags);
++ 	if (rdp_gp->nocb_gp_sleep) {
++ 		rdp_gp->nocb_gp_sleep = false;
++ 		wake_gp = true;
++ 	}
++ 	raw_spin_unlock_irqrestore(&rdp_gp->nocb_gp_lock, flags);
++ 
++ 	if (wake_gp)
++ 		wake_up_process(rdp_gp->nocb_gp_kthread);
++ 
++ 	swait_event_exclusive(rdp->nocb_state_wq,
++ 			      !rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB |
++ 							SEGCBLIST_KTHREAD_GP));
++ 	return 0;
++ }
++ 
++ static long rcu_nocb_rdp_deoffload(void *arg)
++ {
++ 	struct rcu_data *rdp = arg;
++ 
++ 	WARN_ON_ONCE(rdp->cpu != raw_smp_processor_id());
++ 	return __rcu_nocb_rdp_deoffload(rdp);
++ }
++ 
++ int rcu_nocb_cpu_deoffload(int cpu)
++ {
++ 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
++ 	int ret = 0;
++ 
++ 	if (rdp == rdp->nocb_gp_rdp) {
++ 		pr_info("Can't deoffload an rdp GP leader (yet)\n");
++ 		return -EINVAL;
++ 	}
++ 	mutex_lock(&rcu_state.barrier_mutex);
++ 	cpus_read_lock();
++ 	if (rcu_segcblist_is_offloaded(&rdp->cblist)) {
++ 		if (cpu_online(cpu)) {
++ 			ret = work_on_cpu(cpu, rcu_nocb_rdp_deoffload, rdp);
++ 		} else {
++ 			ret = __rcu_nocb_rdp_deoffload(rdp);
++ 		}
++ 		if (!ret)
++ 			cpumask_clear_cpu(cpu, rcu_nocb_mask);
++ 	}
++ 	cpus_read_unlock();
++ 	mutex_unlock(&rcu_state.barrier_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(rcu_nocb_cpu_deoffload);
++ 
+++>>>>>>> 5bb39dc956f3 (rcu/nocb: De-offloading GP kthread)
+  void __init rcu_init_nohz(void)
+  {
+  	int cpu;
+@@@ -2229,7 -2377,9 +2349,13 @@@
+  		rdp = per_cpu_ptr(&rcu_data, cpu);
+  		if (rcu_segcblist_empty(&rdp->cblist))
+  			rcu_segcblist_init(&rdp->cblist);
+++<<<<<<< HEAD
+ +		rcu_segcblist_offload(&rdp->cblist);
+++=======
++ 		rcu_segcblist_offload(&rdp->cblist, true);
++ 		rcu_segcblist_set_flags(&rdp->cblist, SEGCBLIST_KTHREAD_CB);
++ 		rcu_segcblist_set_flags(&rdp->cblist, SEGCBLIST_KTHREAD_GP);
+++>>>>>>> 5bb39dc956f3 (rcu/nocb: De-offloading GP kthread)
+  	}
+  	rcu_organize_nocb_kthreads();
+  }
+* Unmerged path kernel/rcu/tree_plugin.h
