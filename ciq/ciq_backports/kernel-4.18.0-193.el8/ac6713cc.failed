@@ -1,0 +1,345 @@
+ceph: add selinux support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Yan, Zheng <zyan@redhat.com>
+commit ac6713ccb5a6d13b59a2e3fda4fb049a2c4e0af2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ac6713cc.failed
+
+When creating new file/directory, use security_dentry_init_security() to
+prepare selinux context for the new inode, then send openc/mkdir request
+to MDS, together with selinux xattr.
+
+security_dentry_init_security() only supports single security module and
+only selinux has dentry_init_security hook. So only selinux is supported
+for now. We can add support for other security modules once kernel has a
+generic version of dentry_init_security()
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit ac6713ccb5a6d13b59a2e3fda4fb049a2c4e0af2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/super.h
+#	fs/ceph/xattr.c
+diff --cc fs/ceph/super.h
+index b4ea39a31838,81bbb197fc3c..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -925,6 -929,18 +925,21 @@@ extern void __ceph_build_xattrs_blob(st
+  extern void __ceph_destroy_xattrs(struct ceph_inode_info *ci);
+  extern const struct xattr_handler *ceph_xattr_handlers[];
+  
+++<<<<<<< HEAD
+++=======
++ struct ceph_acl_sec_ctx {
++ #ifdef CONFIG_CEPH_FS_POSIX_ACL
++ 	void *default_acl;
++ 	void *acl;
++ #endif
++ #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
++ 	void *sec_ctx;
++ 	u32 sec_ctxlen;
++ #endif
++ 	struct ceph_pagelist *pagelist;
++ };
++ 
+++>>>>>>> ac6713ccb5a6 (ceph: add selinux support)
+  #ifdef CONFIG_SECURITY
+  extern bool ceph_security_xattr_deadlock(struct inode *in);
+  extern bool ceph_security_xattr_wanted(struct inode *in);
+@@@ -939,13 -955,24 +954,33 @@@ static inline bool ceph_security_xattr_
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
++ extern int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
++ 				     struct ceph_acl_sec_ctx *ctx);
++ extern void ceph_security_invalidate_secctx(struct inode *inode);
++ #else
++ static inline int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
++ 					    struct ceph_acl_sec_ctx *ctx)
++ {
++ 	return 0;
++ }
++ static inline void ceph_security_invalidate_secctx(struct inode *inode)
++ {
++ }
++ #endif
++ 
++ void ceph_release_acl_sec_ctx(struct ceph_acl_sec_ctx *as_ctx);
++ 
+++>>>>>>> ac6713ccb5a6 (ceph: add selinux support)
+  /* acl.c */
+ +struct ceph_acls_info {
+ +	void *default_acl;
+ +	void *acl;
+ +	struct ceph_pagelist *pagelist;
+ +};
+ +
+  #ifdef CONFIG_CEPH_FS_POSIX_ACL
+  
+  struct posix_acl *ceph_get_acl(struct inode *, int);
+diff --cc fs/ceph/xattr.c
+index 7eff619f7ac8,6621d27e64f5..000000000000
+--- a/fs/ceph/xattr.c
++++ b/fs/ceph/xattr.c
+@@@ -1196,4 -1180,138 +1180,141 @@@ bool ceph_security_xattr_deadlock(struc
+  	spin_unlock(&ci->i_ceph_lock);
+  	return ret;
+  }
++ 
++ #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
++ int ceph_security_init_secctx(struct dentry *dentry, umode_t mode,
++ 			   struct ceph_acl_sec_ctx *as_ctx)
++ {
++ 	struct ceph_pagelist *pagelist = as_ctx->pagelist;
++ 	const char *name;
++ 	size_t name_len;
++ 	int err;
++ 
++ 	err = security_dentry_init_security(dentry, mode, &dentry->d_name,
++ 					    &as_ctx->sec_ctx,
++ 					    &as_ctx->sec_ctxlen);
++ 	if (err < 0) {
++ 		WARN_ON_ONCE(err != -EOPNOTSUPP);
++ 		err = 0; /* do nothing */
++ 		goto out;
++ 	}
++ 
++ 	err = -ENOMEM;
++ 	if (!pagelist) {
++ 		pagelist = ceph_pagelist_alloc(GFP_KERNEL);
++ 		if (!pagelist)
++ 			goto out;
++ 		err = ceph_pagelist_reserve(pagelist, PAGE_SIZE);
++ 		if (err)
++ 			goto out;
++ 		ceph_pagelist_encode_32(pagelist, 1);
++ 	}
++ 
++ 	/*
++ 	 * FIXME: Make security_dentry_init_security() generic. Currently
++ 	 * It only supports single security module and only selinux has
++ 	 * dentry_init_security hook.
++ 	 */
++ 	name = XATTR_NAME_SELINUX;
++ 	name_len = strlen(name);
++ 	err = ceph_pagelist_reserve(pagelist,
++ 				    4 * 2 + name_len + as_ctx->sec_ctxlen);
++ 	if (err)
++ 		goto out;
++ 
++ 	if (as_ctx->pagelist) {
++ 		/* update count of KV pairs */
++ 		BUG_ON(pagelist->length <= sizeof(__le32));
++ 		if (list_is_singular(&pagelist->head)) {
++ 			le32_add_cpu((__le32*)pagelist->mapped_tail, 1);
++ 		} else {
++ 			struct page *page = list_first_entry(&pagelist->head,
++ 							     struct page, lru);
++ 			void *addr = kmap_atomic(page);
++ 			le32_add_cpu((__le32*)addr, 1);
++ 			kunmap_atomic(addr);
++ 		}
++ 	} else {
++ 		as_ctx->pagelist = pagelist;
++ 	}
++ 
++ 	ceph_pagelist_encode_32(pagelist, name_len);
++ 	ceph_pagelist_append(pagelist, name, name_len);
++ 
++ 	ceph_pagelist_encode_32(pagelist, as_ctx->sec_ctxlen);
++ 	ceph_pagelist_append(pagelist, as_ctx->sec_ctx, as_ctx->sec_ctxlen);
++ 
++ 	err = 0;
++ out:
++ 	if (pagelist && !as_ctx->pagelist)
++ 		ceph_pagelist_release(pagelist);
++ 	return err;
++ }
++ 
++ void ceph_security_invalidate_secctx(struct inode *inode)
++ {
++ 	security_inode_invalidate_secctx(inode);
++ }
++ 
++ static int ceph_xattr_set_security_label(const struct xattr_handler *handler,
++ 				    struct dentry *unused, struct inode *inode,
++ 				    const char *key, const void *buf,
++ 				    size_t buflen, int flags)
++ {
++ 	if (security_ismaclabel(key)) {
++ 		const char *name = xattr_full_name(handler, key);
++ 		return __ceph_setxattr(inode, name, buf, buflen, flags);
++ 	}
++ 	return  -EOPNOTSUPP;
++ }
++ 
++ static int ceph_xattr_get_security_label(const struct xattr_handler *handler,
++ 				    struct dentry *unused, struct inode *inode,
++ 				    const char *key, void *buf, size_t buflen)
++ {
++ 	if (security_ismaclabel(key)) {
++ 		const char *name = xattr_full_name(handler, key);
++ 		return __ceph_getxattr(inode, name, buf, buflen);
++ 	}
++ 	return  -EOPNOTSUPP;
++ }
++ 
++ static const struct xattr_handler ceph_security_label_handler = {
++ 	.prefix = XATTR_SECURITY_PREFIX,
++ 	.get    = ceph_xattr_get_security_label,
++ 	.set    = ceph_xattr_set_security_label,
++ };
++ #endif
++ #endif
+++<<<<<<< HEAD
+++=======
++ 
++ void ceph_release_acl_sec_ctx(struct ceph_acl_sec_ctx *as_ctx)
++ {
++ #ifdef CONFIG_CEPH_FS_POSIX_ACL
++ 	posix_acl_release(as_ctx->acl);
++ 	posix_acl_release(as_ctx->default_acl);
++ #endif
++ #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
++ 	security_release_secctx(as_ctx->sec_ctx, as_ctx->sec_ctxlen);
++ #endif
++ 	if (as_ctx->pagelist)
++ 		ceph_pagelist_release(as_ctx->pagelist);
++ }
++ 
++ /*
++  * List of handlers for synthetic system.* attributes. Other
++  * attributes are handled directly.
++  */
++ const struct xattr_handler *ceph_xattr_handlers[] = {
++ #ifdef CONFIG_CEPH_FS_POSIX_ACL
++ 	&posix_acl_access_xattr_handler,
++ 	&posix_acl_default_xattr_handler,
+  #endif
++ #ifdef CONFIG_CEPH_FS_SECURITY_LABEL
++ 	&ceph_security_label_handler,
++ #endif
++ 	&ceph_other_xattr_handler,
++ 	NULL,
++ };
+++>>>>>>> ac6713ccb5a6 (ceph: add selinux support)
+diff --git a/fs/ceph/Kconfig b/fs/ceph/Kconfig
+index 52095f473464..5a665c126a7c 100644
+--- a/fs/ceph/Kconfig
++++ b/fs/ceph/Kconfig
+@@ -35,3 +35,15 @@ config CEPH_FS_POSIX_ACL
+ 	  groups beyond the owner/group/world scheme.
+ 
+ 	  If you don't know what Access Control Lists are, say N
++
++config CEPH_FS_SECURITY_LABEL
++	bool "CephFS Security Labels"
++	depends on CEPH_FS && SECURITY
++	help
++	  Security labels support alternative access control models
++	  implemented by security modules like SELinux. This option
++	  enables an extended attribute handler for file security
++	  labels in the Ceph filesystem.
++
++	  If you are not using a security module that requires using
++	  extended attributes for file security labels, say N.
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 7754d7679122..50409d9fdc90 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -3156,6 +3156,7 @@ static void handle_cap_grant(struct inode *inode,
+ 			ci->i_xattrs.blob = ceph_buffer_get(xattr_buf);
+ 			ci->i_xattrs.version = version;
+ 			ceph_forget_all_cached_acls(inode);
++			ceph_security_invalidate_secctx(inode);
+ 		}
+ 	}
+ 
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index 602c97dad1f3..e971f87c1eac 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -837,6 +837,9 @@ static int ceph_mknod(struct inode *dir, struct dentry *dentry,
+ 	}
+ 
+ 	err = ceph_pre_init_acls(dir, &mode, &acls);
++	if (err < 0)
++		goto out;
++	err = ceph_security_init_secctx(dentry, mode, &as_ctx);
+ 	if (err < 0)
+ 		goto out;
+ 
+@@ -884,6 +887,7 @@ static int ceph_symlink(struct inode *dir, struct dentry *dentry,
+ 	struct ceph_fs_client *fsc = ceph_sb_to_client(dir->i_sb);
+ 	struct ceph_mds_client *mdsc = fsc->mdsc;
+ 	struct ceph_mds_request *req;
++	struct ceph_acl_sec_ctx as_ctx = {};
+ 	int err;
+ 
+ 	if (ceph_snap(dir) != CEPH_NOSNAP)
+@@ -894,6 +898,10 @@ static int ceph_symlink(struct inode *dir, struct dentry *dentry,
+ 		goto out;
+ 	}
+ 
++	err = ceph_security_init_secctx(dentry, S_IFLNK | 0777, &as_ctx);
++	if (err < 0)
++		goto out;
++
+ 	dout("symlink in dir %p dentry %p to '%s'\n", dir, dentry, dest);
+ 	req = ceph_mdsc_create_request(mdsc, CEPH_MDS_OP_SYMLINK, USE_AUTH_MDS);
+ 	if (IS_ERR(req)) {
+@@ -919,6 +927,7 @@ static int ceph_symlink(struct inode *dir, struct dentry *dentry,
+ out:
+ 	if (err)
+ 		d_drop(dentry);
++	ceph_release_acl_sec_ctx(&as_ctx);
+ 	return err;
+ }
+ 
+@@ -951,6 +960,9 @@ static int ceph_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 
+ 	mode |= S_IFDIR;
+ 	err = ceph_pre_init_acls(dir, &mode, &acls);
++	if (err < 0)
++		goto out;
++	err = ceph_security_init_secctx(dentry, mode, &as_ctx);
+ 	if (err < 0)
+ 		goto out;
+ 
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 8b2ff9490783..113a77d9ad1e 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -453,6 +453,9 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
+ 		err = ceph_pre_init_acls(dir, &mode, &acls);
+ 		if (err < 0)
+ 			return err;
++		err = ceph_security_init_secctx(dentry, mode, &as_ctx);
++		if (err < 0)
++			goto out_ctx;
+ 	}
+ 
+ 	/* do the open */
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 30d0cdc21035..125ac54b5841 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -891,6 +891,7 @@ static int fill_inode(struct inode *inode, struct page *locked_page,
+ 			       iinfo->xattr_data, iinfo->xattr_len);
+ 		ci->i_xattrs.version = le64_to_cpu(info->xattr_version);
+ 		ceph_forget_all_cached_acls(inode);
++		ceph_security_invalidate_secctx(inode);
+ 		xattr_blob = NULL;
+ 	}
+ 
+* Unmerged path fs/ceph/super.h
+* Unmerged path fs/ceph/xattr.c
