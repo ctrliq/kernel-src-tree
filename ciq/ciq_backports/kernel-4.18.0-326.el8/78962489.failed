@@ -1,0 +1,181 @@
+mptcp: add skeleton to sync msk socket options to subflows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 7896248983ef4eec18c8bd301a81d8672dbc9955
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/78962489.failed
+
+Handle following cases:
+1. setsockopt is called with multiple subflows.
+   Change might have to be mirrored to all of them.
+   This is done directly in process context/setsockopt call.
+2. Outgoing subflow is created after one or several setsockopt()
+   calls have been made.  Old setsockopt changes should be
+   synced to the new socket.
+3. Incoming subflow, after setsockopt call(s).
+
+Cases 2 and 3 are handled right after the join list is spliced to the conn
+list.
+
+Not all sockopt values can be just be copied by value, some require
+helper calls.  Those can acquire socket lock (which can sleep).
+
+If the join->conn list splicing is done from preemptible context,
+synchronization can be done right away, otherwise its deferred to work
+queue.
+
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7896248983ef4eec18c8bd301a81d8672dbc9955)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/sockopt.c
+* Unmerged path net/mptcp/sockopt.c
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 72f56efe7a44..cbb1ec0f2be6 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -740,18 +740,42 @@ void mptcp_data_ready(struct sock *sk, struct sock *ssk)
+ 		sk->sk_data_ready(sk);
+ }
+ 
+-void __mptcp_flush_join_list(struct mptcp_sock *msk)
++static bool mptcp_do_flush_join_list(struct mptcp_sock *msk)
+ {
+ 	struct mptcp_subflow_context *subflow;
+ 
+ 	if (likely(list_empty(&msk->join_list)))
+-		return;
++		return false;
+ 
+ 	spin_lock_bh(&msk->join_list_lock);
+ 	list_for_each_entry(subflow, &msk->join_list, node)
+ 		mptcp_propagate_sndbuf((struct sock *)msk, mptcp_subflow_tcp_sock(subflow));
++
+ 	list_splice_tail_init(&msk->join_list, &msk->conn_list);
+ 	spin_unlock_bh(&msk->join_list_lock);
++
++	return true;
++}
++
++void __mptcp_flush_join_list(struct mptcp_sock *msk)
++{
++	if (likely(!mptcp_do_flush_join_list(msk)))
++		return;
++
++	if (!test_and_set_bit(MPTCP_WORK_SYNC_SETSOCKOPT, &msk->flags))
++		mptcp_schedule_work((struct sock *)msk);
++}
++
++static void mptcp_flush_join_list(struct mptcp_sock *msk)
++{
++	bool sync_needed = test_and_clear_bit(MPTCP_WORK_SYNC_SETSOCKOPT, &msk->flags);
++
++	might_sleep();
++
++	if (!mptcp_do_flush_join_list(msk) && !sync_needed)
++		return;
++
++	mptcp_sockopt_sync_all(msk);
+ }
+ 
+ static bool mptcp_timer_pending(struct sock *sk)
+@@ -1467,7 +1491,7 @@ static void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+ 			int ret = 0;
+ 
+ 			prev_ssk = ssk;
+-			__mptcp_flush_join_list(msk);
++			mptcp_flush_join_list(msk);
+ 			ssk = mptcp_subflow_get_send(msk);
+ 
+ 			/* try to keep the subflow socket lock across
+@@ -1893,7 +1917,7 @@ static bool __mptcp_move_skbs(struct mptcp_sock *msk)
+ 	unsigned int moved = 0;
+ 	bool ret, done;
+ 
+-	__mptcp_flush_join_list(msk);
++	mptcp_flush_join_list(msk);
+ 	do {
+ 		struct sock *ssk = mptcp_subflow_recv_lookup(msk);
+ 		bool slowpath;
+@@ -2317,7 +2341,7 @@ static void mptcp_worker(struct work_struct *work)
+ 		goto unlock;
+ 
+ 	mptcp_check_data_fin_ack(sk);
+-	__mptcp_flush_join_list(msk);
++	mptcp_flush_join_list(msk);
+ 
+ 	mptcp_check_fastclose(msk);
+ 
+@@ -2523,7 +2547,7 @@ static void __mptcp_check_send_data_fin(struct sock *sk)
+ 		}
+ 	}
+ 
+-	__mptcp_flush_join_list(msk);
++	mptcp_flush_join_list(msk);
+ 	mptcp_for_each_subflow(msk, subflow) {
+ 		struct sock *tcp_sk = mptcp_subflow_tcp_sock(subflow);
+ 
+@@ -2660,7 +2684,8 @@ static int mptcp_disconnect(struct sock *sk, int flags)
+ 	struct mptcp_subflow_context *subflow;
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+ 
+-	__mptcp_flush_join_list(msk);
++	mptcp_do_flush_join_list(msk);
++
+ 	mptcp_for_each_subflow(msk, subflow) {
+ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ 
+@@ -3337,7 +3362,7 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 		/* set ssk->sk_socket of accept()ed flows to mptcp socket.
+ 		 * This is needed so NOSPACE flag can be set from tcp stack.
+ 		 */
+-		__mptcp_flush_join_list(msk);
++		mptcp_flush_join_list(msk);
+ 		mptcp_for_each_subflow(msk, subflow) {
+ 			struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ 
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index d8de1e961ab0..57c20d6dd960 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -108,6 +108,7 @@
+ #define MPTCP_CLEAN_UNA		7
+ #define MPTCP_ERROR_REPORT	8
+ #define MPTCP_RETRANSMIT	9
++#define MPTCP_WORK_SYNC_SETSOCKOPT 10
+ 
+ static inline bool before64(__u64 seq1, __u64 seq2)
+ {
+@@ -730,6 +731,12 @@ unsigned int mptcp_pm_get_add_addr_accept_max(struct mptcp_sock *msk);
+ unsigned int mptcp_pm_get_subflows_max(struct mptcp_sock *msk);
+ unsigned int mptcp_pm_get_local_addr_max(struct mptcp_sock *msk);
+ 
++int mptcp_setsockopt(struct sock *sk, int level, int optname,
++		     sockptr_t optval, unsigned int optlen);
++
++void mptcp_sockopt_sync(struct mptcp_sock *msk, struct sock *ssk);
++void mptcp_sockopt_sync_all(struct mptcp_sock *msk);
++
+ static inline struct mptcp_ext *mptcp_get_ext(const struct sk_buff *skb)
+ {
+ 	return (struct mptcp_ext *)skb_ext_find(skb, SKB_EXT_MPTCP);
+* Unmerged path net/mptcp/sockopt.c
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index daf4617487df..6ffc337e1880 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -1325,6 +1325,7 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+ 	mptcp_info2sockaddr(remote, &addr, ssk->sk_family);
+ 
+ 	mptcp_add_pending_subflow(msk, subflow);
++	mptcp_sockopt_sync(msk, ssk);
+ 	err = kernel_connect(sf, (struct sockaddr *)&addr, addrlen, O_NONBLOCK);
+ 	if (err && err != -EINPROGRESS)
+ 		goto failed_unlink;
