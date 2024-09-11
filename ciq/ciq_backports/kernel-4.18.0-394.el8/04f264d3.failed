@@ -1,0 +1,146 @@
+compiler.h: Allow arch-specific asm/compiler.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Paul Burton <paul.burton@mips.com>
+commit 04f264d3a8b0eb25d378127bd78c3c9a0261c828
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/04f264d3.failed
+
+We have a need to override the definition of
+barrier_before_unreachable() for MIPS, which means we either need to add
+architecture-specific code into linux/compiler-gcc.h or we need to allow
+the architecture to provide a header that can define the macro before
+the generic definition. The latter seems like the better approach.
+
+A straightforward approach to the per-arch header is to make use of
+asm-generic to provide a default empty header & adjust architectures
+which don't need anything specific to make use of that by adding the
+header to generic-y. Unfortunately this doesn't work so well due to
+commit 28128c61e08e ("kconfig.h: Include compiler types to avoid missed
+struct attributes") which caused linux/compiler_types.h to be included
+in the compilation of every C file via the -include linux/kconfig.h flag
+in c_flags.
+
+Because the -include flag is present for all C files we compile, we need
+the architecture-provided header to be present before any C files are
+compiled. If any C files can be compiled prior to the asm-generic header
+wrappers being generated then we hit a build failure due to missing
+header. Such cases do exist - one pointed out by the kbuild test robot
+is the compilation of arch/ia64/kernel/nr-irqs.c, which occurs as part
+of the archprepare target [1].
+
+This leaves us with a few options:
+
+  1) Use generic-y & fix any build failures we find by enforcing
+     ordering such that the asm-generic target occurs before any C
+     compilation, such that linux/compiler_types.h can always include
+     the generated asm-generic wrapper which in turn includes the empty
+     asm-generic header. This would rely on us finding all the
+     problematic cases - I don't know for sure that the ia64 issue is
+     the only one.
+
+  2) Add an actual empty header to each architecture, so that we don't
+     need the generated asm-generic wrapper. This seems messy.
+
+  3) Give up & add #ifdef CONFIG_MIPS or similar to
+     linux/compiler_types.h. This seems messy too.
+
+  4) Include the arch header only when it's actually needed, removing
+     the need for the asm-generic wrapper for all other architectures.
+
+This patch allows us to use approach 4, by including an asm/compiler.h
+header from linux/compiler_types.h after the inclusion of the
+compiler-specific linux/compiler-*.h header(s). We do this
+conditionally, only when CONFIG_HAVE_ARCH_COMPILER_H is selected, in
+order to avoid the need for asm-generic wrappers & the associated build
+ordering issue described above. The asm/compiler.h header is included
+after the generic linux/compiler-*.h header(s) for consistency with the
+way linux/compiler-intel.h & linux/compiler-clang.h are included after
+the linux/compiler-gcc.h header that they override.
+
+[1] https://lists.01.org/pipermail/kbuild-all/2018-August/051175.html
+
+	Signed-off-by: Paul Burton <paul.burton@mips.com>
+	Reviewed-by: Masahiro Yamada <yamada.masahiro@socionext.com>
+Patchwork: https://patchwork.linux-mips.org/patch/20269/
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: James Hogan <jhogan@kernel.org>
+	Cc: Masahiro Yamada <yamada.masahiro@socionext.com>
+	Cc: Ralf Baechle <ralf@linux-mips.org>
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-kbuild@vger.kernel.org
+	Cc: linux-mips@linux-mips.org
+(cherry picked from commit 04f264d3a8b0eb25d378127bd78c3c9a0261c828)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/Kconfig
+diff --cc arch/Kconfig
+index ee4c7617dc67,5c7c48e7b727..000000000000
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@@ -1045,28 -971,12 +1045,38 @@@ config REFCOUNT_FUL
+  	  against various use-after-free conditions that can be used in
+  	  security flaw exploits.
+  
+++<<<<<<< HEAD
+ +config LOCK_EVENT_COUNTS
+ +	bool "Locking event counts collection"
+ +	depends on DEBUG_FS
+ +	---help---
+ +	  Enable light-weight counting of various locking related events
+ +	  in the system with minimal performance impact. This reduces
+ +	  the chance of application behavior change because of timing
+ +	  differences. The counts are reported via debugfs.
+ +
+ +config ARCH_HAS_MEM_ENCRYPT
+ +	bool
+ +
+ +config ARCH_HAS_VDSO_DATA
+ +	bool
+ +
+ +config ARCH_SUPPORTS_DEBUG_PAGEALLOC
+ +	bool
+ +
+ +config HAVE_STATIC_CALL
+ +	bool
+ +
+ +config DYNAMIC_SIGFRAME
+ +	bool
+++=======
++ config HAVE_ARCH_COMPILER_H
++ 	bool
++ 	help
++ 	  An architecture can select this if it provides an
++ 	  asm/compiler.h header that should be included after
++ 	  linux/compiler-*.h in order to override macro definitions that those
++ 	  headers generally provide.
+++>>>>>>> 04f264d3a8b0 (compiler.h: Allow arch-specific asm/compiler.h)
+  
+  source "kernel/gcov/Kconfig"
+* Unmerged path arch/Kconfig
+diff --git a/include/linux/compiler_types.h b/include/linux/compiler_types.h
+index ba200dd0060d..d44b41a8d8cc 100644
+--- a/include/linux/compiler_types.h
++++ b/include/linux/compiler_types.h
+@@ -78,6 +78,18 @@ extern void __chk_io_ptr(const volatile void __iomem *);
+ #include <linux/compiler-clang.h>
+ #endif
+ 
++/*
++ * Some architectures need to provide custom definitions of macros provided
++ * by linux/compiler-*.h, and can do so using asm/compiler.h. We include that
++ * conditionally rather than using an asm-generic wrapper in order to avoid
++ * build failures if any C compilation, which will include this file via an
++ * -include argument in c_flags, occurs prior to the asm-generic wrappers being
++ * generated.
++ */
++#ifdef CONFIG_HAVE_ARCH_COMPILER_H
++#include <asm/compiler.h>
++#endif
++
+ /*
+  * Generic compiler-dependent macros required for kernel
+  * build go below this comment. Actual compiler/compiler version
