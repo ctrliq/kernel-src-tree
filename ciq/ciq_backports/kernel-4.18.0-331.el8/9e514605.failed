@@ -1,0 +1,141 @@
+gfs2: Add local resource group locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 9e514605c77451745ea9fca5a26fc3153893686a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/9e514605.failed
+
+Prepare for treating resource group glocks as exclusive among nodes but
+shared among all tasks running on a node: introduce another layer of
+node-specific locking that the local tasks can use to coordinate their
+accesses.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 9e514605c77451745ea9fca5a26fc3153893686a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/rgrp.c
+diff --cc fs/gfs2/rgrp.c
+index a6a372fdf25a,f45b787307d0..000000000000
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@@ -2515,14 -2518,13 +2529,19 @@@ rgrp_error
+   *
+   */
+  
+ -void __gfs2_free_blocks(struct gfs2_inode *ip, struct gfs2_rgrpd *rgd,
+ -			u64 bstart, u32 blen, int meta)
+ +void __gfs2_free_blocks(struct gfs2_inode *ip, u64 bstart, u32 blen, int meta)
+  {
+  	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+ +	struct gfs2_rgrpd *rgd;
+  
+++<<<<<<< HEAD
+ +	rgd = rgblk_free(sdp, bstart, blen, GFS2_BLKST_FREE);
+ +	if (!rgd)
+ +		return;
+++=======
++ 	rgrp_lock_local(rgd);
++ 	rgblk_free(sdp, rgd, bstart, blen, GFS2_BLKST_FREE);
+++>>>>>>> 9e514605c774 (gfs2: Add local resource group locking)
+  	trace_gfs2_block_alloc(ip, rgd, bstart, blen, GFS2_BLKST_FREE);
+  	rgd->rd_free += blen;
+  	rgd->rd_flags &= ~GFS2_RGF_TRIMMED;
+@@@ -2558,9 -2563,11 +2578,14 @@@ void gfs2_unlink_di(struct inode *inode
+  	struct gfs2_rgrpd *rgd;
+  	u64 blkno = ip->i_no_addr;
+  
+ -	rgd = gfs2_blk2rgrpd(sdp, blkno, true);
+ +	rgd = rgblk_free(sdp, blkno, 1, GFS2_BLKST_UNLINKED);
+  	if (!rgd)
+  		return;
+++<<<<<<< HEAD
+++=======
++ 	rgrp_lock_local(rgd);
++ 	rgblk_free(sdp, rgd, blkno, 1, GFS2_BLKST_UNLINKED);
+++>>>>>>> 9e514605c774 (gfs2: Add local resource group locking)
+  	trace_gfs2_block_alloc(ip, rgd, blkno, 1, GFS2_BLKST_UNLINKED);
+  	gfs2_trans_add_meta(rgd->rd_gl, rgd->rd_bits[0].bi_bh);
+  	gfs2_rgrp_out(rgd, rgd->rd_bits[0].bi_bh->b_data);
+@@@ -2570,13 -2578,9 +2596,18 @@@
+  void gfs2_free_di(struct gfs2_rgrpd *rgd, struct gfs2_inode *ip)
+  {
+  	struct gfs2_sbd *sdp = rgd->rd_sbd;
+ +	struct gfs2_rgrpd *tmp_rgd;
+ +
+ +	tmp_rgd = rgblk_free(sdp, ip->i_no_addr, 1, GFS2_BLKST_FREE);
+ +	if (!tmp_rgd)
+ +		return;
+ +	gfs2_assert_withdraw(sdp, rgd == tmp_rgd);
+  
+++<<<<<<< HEAD
+++=======
++ 	rgrp_lock_local(rgd);
++ 	rgblk_free(sdp, rgd, ip->i_no_addr, 1, GFS2_BLKST_FREE);
+++>>>>>>> 9e514605c774 (gfs2: Add local resource group locking)
+  	if (!rgd->rd_dinodes)
+  		gfs2_consist_rgrpd(rgd);
+  	rgd->rd_dinodes--;
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 87c8935eafd0..f9ab81de7fe9 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -23,6 +23,7 @@
+ #include <linux/percpu.h>
+ #include <linux/lockref.h>
+ #include <linux/rhashtable.h>
++#include <linux/mutex.h>
+ 
+ #define DIO_WAIT	0x00000010
+ #define DIO_METADATA	0x00000020
+@@ -126,6 +127,7 @@ struct gfs2_rgrpd {
+ #define GFS2_RDF_PREFERRED	0x80000000 /* This rgrp is preferred */
+ #define GFS2_RDF_MASK		0xf0000000 /* mask for internal flags */
+ 	spinlock_t rd_rsspin;           /* protects reservation related vars */
++	struct mutex rd_mutex;
+ 	struct rb_root rd_rstree;       /* multi-block reservation tree */
+ };
+ 
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index 92c9d0f68ac6..1a63c5040280 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -79,8 +79,9 @@ static void maybe_release_space(struct gfs2_bufdata *bd)
+ 	unsigned int index = bd->bd_bh->b_blocknr - gl->gl_name.ln_number;
+ 	struct gfs2_bitmap *bi = rgd->rd_bits + index;
+ 
++	rgrp_lock_local(rgd);
+ 	if (bi->bi_clone == NULL)
+-		return;
++		goto out;
+ 	if (sdp->sd_args.ar_discard)
+ 		gfs2_rgrp_send_discards(sdp, rgd->rd_data0, bd->bd_bh, bi, 1, NULL);
+ 	memcpy(bi->bi_clone + bi->bi_offset,
+@@ -89,6 +90,9 @@ static void maybe_release_space(struct gfs2_bufdata *bd)
+ 	rgd->rd_free_clone = rgd->rd_free;
+ 	BUG_ON(rgd->rd_free_clone < rgd->rd_reserved);
+ 	rgd->rd_extfail_pt = rgd->rd_free;
++
++out:
++	rgrp_unlock_local(rgd);
+ }
+ 
+ /**
+* Unmerged path fs/gfs2/rgrp.c
+diff --git a/fs/gfs2/rgrp.h b/fs/gfs2/rgrp.h
+index b3949e61ca0b..49dc79b4a27a 100644
+--- a/fs/gfs2/rgrp.h
++++ b/fs/gfs2/rgrp.h
+@@ -89,4 +89,8 @@ static inline int rgrp_contains_block(struct gfs2_rgrpd *rgd, u64 block)
+ }
+ 
+ extern void check_and_update_goal(struct gfs2_inode *ip);
++
++extern void rgrp_lock_local(struct gfs2_rgrpd *rgd);
++extern void rgrp_unlock_local(struct gfs2_rgrpd *rgd);
++
+ #endif /* __RGRP_DOT_H__ */
