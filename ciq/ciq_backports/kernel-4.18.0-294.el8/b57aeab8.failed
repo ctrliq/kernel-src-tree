@@ -1,0 +1,137 @@
+powerpc/watchpoint: Fix length calculation for unaligned target
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit b57aeab811db07295f646808b1b17c312d17f57d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b57aeab8.failed
+
+Watchpoint match range is always doubleword(8 bytes) aligned on
+powerpc. If the given range is crossing doubleword boundary, we need
+to increase the length such that next doubleword also get
+covered. Ex,
+
+          address   len = 6 bytes
+                |=========.
+   |------------v--|------v--------|
+   | | | | | | | | | | | | | | | | |
+   |---------------|---------------|
+    <---8 bytes--->
+
+In such case, current code configures hw as:
+  start_addr = address & ~HW_BREAKPOINT_ALIGN
+  len = 8 bytes
+
+And thus read/write in last 4 bytes of the given range is ignored.
+Fix this by including next doubleword in the length.
+
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20191017093204.7511-3-ravi.bangoria@linux.ibm.com
+(cherry picked from commit b57aeab811db07295f646808b1b17c312d17f57d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/dawr.c
+#	arch/powerpc/kernel/hw_breakpoint.c
+#	arch/powerpc/kernel/ptrace.c
+diff --cc arch/powerpc/kernel/hw_breakpoint.c
+index 90c5c77a5704,f36274d426ed..000000000000
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@@ -391,26 -198,10 +434,25 @@@ int hw_breakpoint_arch_parse(struct per
+  	hw->address = attr->bp_addr;
+  	hw->len = attr->bp_len;
+  
+- 	/*
+- 	 * Since breakpoint length can be a maximum of HW_BREAKPOINT_LEN(8)
+- 	 * and breakpoint addresses are aligned to nearest double-word
+- 	 * HW_BREAKPOINT_ALIGN by rounding off to the lower address, the
+- 	 * 'symbolsize' should satisfy the check below.
+- 	 */
+  	if (!ppc_breakpoint_available())
+  		return -ENODEV;
+++<<<<<<< HEAD
+ +	length_max = 8; /* DABR */
+ +	if (cpu_has_feature(CPU_FTR_DAWR)) {
+ +		length_max = 512 ; /* 64 doublewords */
+ +		/* DAWR region can't cross 512 boundary */
+ +		if ((attr->bp_addr >> 9) !=
+ +		    ((attr->bp_addr + attr->bp_len - 1) >> 9))
+ +			return -EINVAL;
+ +	}
+ +	if (hw->len >
+ +	    (length_max - (hw->address & HW_BREAKPOINT_ALIGN)))
+ +		return -EINVAL;
+ +	return 0;
+++=======
++ 
++ 	return hw_breakpoint_validate_len(hw);
+++>>>>>>> b57aeab811db (powerpc/watchpoint: Fix length calculation for unaligned target)
+  }
+  
+  /*
+diff --cc arch/powerpc/kernel/ptrace.c
+index c48b84f0c17a,c2dc93157b99..000000000000
+--- a/arch/powerpc/kernel/ptrace.c
++++ b/arch/powerpc/kernel/ptrace.c
+@@@ -2394,7 -2425,8 +2394,12 @@@ static int ptrace_set_debugreg(struct t
+  		return -EIO;
+  	hw_brk.address = data & (~HW_BRK_TYPE_DABR);
+  	hw_brk.type = (data & HW_BRK_TYPE_DABR) | HW_BRK_TYPE_PRIV_ALL;
+++<<<<<<< HEAD
+ +	hw_brk.len = 8;
+++=======
++ 	hw_brk.len = DABR_MAX_LEN;
++ 	hw_brk.hw_len = DABR_MAX_LEN;
+++>>>>>>> b57aeab811db (powerpc/watchpoint: Fix length calculation for unaligned target)
+  	set_bp = (data) && (hw_brk.type & HW_BRK_TYPE_RDWR);
+  #ifdef CONFIG_HAVE_HW_BREAKPOINT
+  	bp = thread->ptrace_bps[0];
+* Unmerged path arch/powerpc/kernel/dawr.c
+diff --git a/arch/powerpc/include/asm/hw_breakpoint.h b/arch/powerpc/include/asm/hw_breakpoint.h
+index f0b028781c74..438a846d0b92 100644
+--- a/arch/powerpc/include/asm/hw_breakpoint.h
++++ b/arch/powerpc/include/asm/hw_breakpoint.h
+@@ -28,6 +28,7 @@ struct arch_hw_breakpoint {
+ 	unsigned long	address;
+ 	u16		type;
+ 	u16		len; /* length of the target data symbol */
++	u16		hw_len; /* length programmed in hw */
+ };
+ 
+ /* Note: Don't change the first 6 bits below as they are in the same order
+@@ -82,6 +83,7 @@ static inline void hw_breakpoint_disable(void)
+ 	brk.address = 0;
+ 	brk.type = 0;
+ 	brk.len = 0;
++	brk.hw_len = 0;
+ 	if (ppc_breakpoint_available())
+ 		__set_breakpoint(&brk);
+ }
+* Unmerged path arch/powerpc/kernel/dawr.c
+* Unmerged path arch/powerpc/kernel/hw_breakpoint.c
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index 6ca2453dede4..26c7867342e3 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -710,6 +710,8 @@ static void set_debug_reg_defaults(struct thread_struct *thread)
+ {
+ 	thread->hw_brk.address = 0;
+ 	thread->hw_brk.type = 0;
++	thread->hw_brk.len = 0;
++	thread->hw_brk.hw_len = 0;
+ 	if (ppc_breakpoint_available())
+ 		set_breakpoint(&thread->hw_brk);
+ }
+@@ -839,6 +841,7 @@ static inline bool hw_brk_match(struct arch_hw_breakpoint *a,
+ 		return false;
+ 	if (a->len != b->len)
+ 		return false;
++	/* no need to check hw_len. it's calculated from address and len */
+ 	return true;
+ }
+ 
+* Unmerged path arch/powerpc/kernel/ptrace.c
