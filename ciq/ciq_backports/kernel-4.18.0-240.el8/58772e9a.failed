@@ -1,0 +1,127 @@
+KVM: arm64: Provide VCPU attributes for stolen time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Steven Price <steven.price@arm.com>
+commit 58772e9a3db72d032eeb12bc011bc5184a3925f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/58772e9a.failed
+
+Allow user space to inform the KVM host where in the physical memory
+map the paravirtualized time structures should be located.
+
+User space can set an attribute on the VCPU providing the IPA base
+address of the stolen time structure for that VCPU. This must be
+repeated for every VCPU in the VM.
+
+The address is given in terms of the physical address visible to
+the guest and must be 64 byte aligned. The guest will discover the
+address via a hypercall.
+
+	Signed-off-by: Steven Price <steven.price@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 58772e9a3db72d032eeb12bc011bc5184a3925f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+#	virt/kvm/arm/pvtime.c
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 4dd101adad0d,eb1f33af45aa..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -494,6 -486,27 +494,30 @@@ void handle_exit_early(struct kvm_vcpu 
+  int kvm_perf_init(void);
+  int kvm_perf_teardown(void);
+  
+++<<<<<<< HEAD
+++=======
++ long kvm_hypercall_pv_features(struct kvm_vcpu *vcpu);
++ gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu);
++ void kvm_update_stolen_time(struct kvm_vcpu *vcpu);
++ 
++ int kvm_arm_pvtime_set_attr(struct kvm_vcpu *vcpu,
++ 			    struct kvm_device_attr *attr);
++ int kvm_arm_pvtime_get_attr(struct kvm_vcpu *vcpu,
++ 			    struct kvm_device_attr *attr);
++ int kvm_arm_pvtime_has_attr(struct kvm_vcpu *vcpu,
++ 			    struct kvm_device_attr *attr);
++ 
++ static inline void kvm_arm_pvtime_vcpu_init(struct kvm_vcpu_arch *vcpu_arch)
++ {
++ 	vcpu_arch->steal.base = GPA_INVALID;
++ }
++ 
++ static inline bool kvm_arm_is_pvtime_enabled(struct kvm_vcpu_arch *vcpu_arch)
++ {
++ 	return (vcpu_arch->steal.base != GPA_INVALID);
++ }
++ 
+++>>>>>>> 58772e9a3db7 (KVM: arm64: Provide VCPU attributes for stolen time)
+  void kvm_set_sei_esr(struct kvm_vcpu *vcpu, u64 syndrome);
+  
+  struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr);
+* Unmerged path virt/kvm/arm/pvtime.c
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm64/include/uapi/asm/kvm.h b/arch/arm64/include/uapi/asm/kvm.h
+index d49c17a80491..820e5751ada7 100644
+--- a/arch/arm64/include/uapi/asm/kvm.h
++++ b/arch/arm64/include/uapi/asm/kvm.h
+@@ -324,6 +324,8 @@ struct kvm_vcpu_events {
+ #define KVM_ARM_VCPU_TIMER_CTRL		1
+ #define   KVM_ARM_VCPU_TIMER_IRQ_VTIMER		0
+ #define   KVM_ARM_VCPU_TIMER_IRQ_PTIMER		1
++#define KVM_ARM_VCPU_PVTIME_CTRL	2
++#define   KVM_ARM_VCPU_PVTIME_IPA	0
+ 
+ /* KVM_IRQ_LINE irq field index values */
+ #define KVM_ARM_IRQ_VCPU2_SHIFT		28
+diff --git a/arch/arm64/kvm/guest.c b/arch/arm64/kvm/guest.c
+index 0c87a2298a8c..c7af3b57b8b8 100644
+--- a/arch/arm64/kvm/guest.c
++++ b/arch/arm64/kvm/guest.c
+@@ -879,6 +879,9 @@ int kvm_arm_vcpu_arch_set_attr(struct kvm_vcpu *vcpu,
+ 	case KVM_ARM_VCPU_TIMER_CTRL:
+ 		ret = kvm_arm_timer_set_attr(vcpu, attr);
+ 		break;
++	case KVM_ARM_VCPU_PVTIME_CTRL:
++		ret = kvm_arm_pvtime_set_attr(vcpu, attr);
++		break;
+ 	default:
+ 		ret = -ENXIO;
+ 		break;
+@@ -899,6 +902,9 @@ int kvm_arm_vcpu_arch_get_attr(struct kvm_vcpu *vcpu,
+ 	case KVM_ARM_VCPU_TIMER_CTRL:
+ 		ret = kvm_arm_timer_get_attr(vcpu, attr);
+ 		break;
++	case KVM_ARM_VCPU_PVTIME_CTRL:
++		ret = kvm_arm_pvtime_get_attr(vcpu, attr);
++		break;
+ 	default:
+ 		ret = -ENXIO;
+ 		break;
+@@ -919,6 +925,9 @@ int kvm_arm_vcpu_arch_has_attr(struct kvm_vcpu *vcpu,
+ 	case KVM_ARM_VCPU_TIMER_CTRL:
+ 		ret = kvm_arm_timer_has_attr(vcpu, attr);
+ 		break;
++	case KVM_ARM_VCPU_PVTIME_CTRL:
++		ret = kvm_arm_pvtime_has_attr(vcpu, attr);
++		break;
+ 	default:
+ 		ret = -ENXIO;
+ 		break;
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 8e4c64ff9f98..4113ace277b1 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1232,6 +1232,8 @@ enum kvm_device_type {
+ #define KVM_DEV_TYPE_ARM_VGIC_ITS	KVM_DEV_TYPE_ARM_VGIC_ITS
+ 	KVM_DEV_TYPE_XIVE,
+ #define KVM_DEV_TYPE_XIVE		KVM_DEV_TYPE_XIVE
++	KVM_DEV_TYPE_ARM_PV_TIME,
++#define KVM_DEV_TYPE_ARM_PV_TIME	KVM_DEV_TYPE_ARM_PV_TIME
+ 	KVM_DEV_TYPE_MAX,
+ };
+ 
+* Unmerged path virt/kvm/arm/pvtime.c
