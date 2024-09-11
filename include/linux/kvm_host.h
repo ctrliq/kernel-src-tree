@@ -13,6 +13,7 @@
 #include <linux/spinlock.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
+#include <linux/sched/stat.h>
 #include <linux/bug.h>
 #include <linux/minmax.h>
 #include <linux/mm.h>
@@ -252,6 +253,11 @@ struct kvm_host_map {
 static inline bool kvm_vcpu_mapped(struct kvm_host_map *map)
 {
 	return !!map->hva;
+}
+
+static inline bool kvm_vcpu_can_poll(ktime_t cur, ktime_t stop)
+{
+	return single_task_running() && !need_resched() && ktime_before(cur, stop);
 }
 
 /*
