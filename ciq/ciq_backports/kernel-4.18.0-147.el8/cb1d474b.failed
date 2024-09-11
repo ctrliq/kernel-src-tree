@@ -1,0 +1,390 @@
+KVM: VMX: Move VMCS definitions to dedicated file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit cb1d474b322550630841a58ea960a448fe8ddce3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/cb1d474b.failed
+
+This isn't intended to be a pure reflection of hardware, e.g. struct
+loaded_vmcs and struct vmcs_host_state are KVM-defined constructs.
+Similar to capabilities.h, this is a standalone file to avoid circular
+dependencies between yet-to-be-created vmx.h and nested.h files.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cb1d474b322550630841a58ea960a448fe8ddce3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 461e3698b5ee,d2bafc22d594..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -16,49 -16,50 +16,54 @@@
+   *
+   */
+  
+ -#include <linux/frame.h>
+ -#include <linux/highmem.h>
+ -#include <linux/hrtimer.h>
+ -#include <linux/kernel.h>
+ +#include "irq.h"
+ +#include "mmu.h"
+ +#include "cpuid.h"
+ +#include "lapic.h"
+ +
+  #include <linux/kvm_host.h>
+  #include <linux/module.h>
+ -#include <linux/moduleparam.h>
+ -#include <linux/mod_devicetable.h>
+ +#include <linux/kernel.h>
+  #include <linux/mm.h>
+ -#include <linux/nospec.h>
+ +#include <linux/highmem.h>
+  #include <linux/sched.h>
+ +#include <linux/sched/smt.h>
+ +#include <linux/moduleparam.h>
+ +#include <linux/mod_devicetable.h>
+ +#include <linux/trace_events.h>
+  #include <linux/slab.h>
+  #include <linux/tboot.h>
+ -#include <linux/trace_events.h>
+ +#include <linux/hrtimer.h>
+ +#include <linux/frame.h>
+ +#include <linux/nospec.h>
+ +#include "kvm_cache_regs.h"
+ +#include "x86.h"
+  
+ -#include <asm/apic.h>
+  #include <asm/asm.h>
+  #include <asm/cpu.h>
+ -#include <asm/debugreg.h>
+ +#include <asm/io.h>
+  #include <asm/desc.h>
+ +#include <asm/vmx.h>
+ +#include <asm/virtext.h>
+ +#include <asm/mce.h>
+  #include <asm/fpu/internal.h>
+ -#include <asm/io.h>
+ -#include <asm/irq_remapping.h>
+ -#include <asm/kexec.h>
+  #include <asm/perf_event.h>
+ -#include <asm/mce.h>
+ +#include <asm/debugreg.h>
+ +#include <asm/kexec.h>
+ +#include <asm/apic.h>
+ +#include <asm/irq_remapping.h>
+  #include <asm/mmu_context.h>
+ -#include <asm/mshyperv.h>
+  #include <asm/spec-ctrl.h>
+ -#include <asm/virtext.h>
+ -#include <asm/vmx.h>
+ +#include <asm/mshyperv.h>
+  
+ -#include "capabilities.h"
+ -#include "cpuid.h"
+ -#include "evmcs.h"
+ -#include "hyperv.h"
+ -#include "irq.h"
+ -#include "kvm_cache_regs.h"
+ -#include "lapic.h"
+ -#include "mmu.h"
+ -#include "pmu.h"
+  #include "trace.h"
+++<<<<<<< HEAD
+ +#include "pmu.h"
+ +#include "vmx_evmcs.h"
+++=======
++ #include "vmcs.h"
++ #include "x86.h"
+++>>>>>>> cb1d474b3225 (KVM: VMX: Move VMCS definitions to dedicated file)
+  
+  #define __ex(x) __kvm_handle_fault_on_reboot(x)
+  #define __ex_clear(x, reg) \
+@@@ -1594,113 -1511,33 +1550,143 @@@ static inline void evmcs_sanitize_exec_
+  static inline void evmcs_touch_msr_bitmap(void) {}
+  #endif /* IS_ENABLED(CONFIG_HYPERV) */
+  
+++<<<<<<< HEAD
+ +static inline bool is_exception_n(u32 intr_info, u8 vector)
+ +{
+ +	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
+ +			     INTR_INFO_VALID_MASK)) ==
+ +		(INTR_TYPE_HARD_EXCEPTION | vector | INTR_INFO_VALID_MASK);
+ +}
+ +
+ +static inline bool is_debug(u32 intr_info)
+ +{
+ +	return is_exception_n(intr_info, DB_VECTOR);
+ +}
+ +
+ +static inline bool is_breakpoint(u32 intr_info)
+ +{
+ +	return is_exception_n(intr_info, BP_VECTOR);
+ +}
+ +
+ +static inline bool is_page_fault(u32 intr_info)
+ +{
+ +	return is_exception_n(intr_info, PF_VECTOR);
+ +}
+ +
+ +static inline bool is_invalid_opcode(u32 intr_info)
+ +{
+ +	return is_exception_n(intr_info, UD_VECTOR);
+ +}
+ +
+ +static inline bool is_gp_fault(u32 intr_info)
+ +{
+ +	return is_exception_n(intr_info, GP_VECTOR);
+ +}
+ +
+ +static inline bool is_machine_check(u32 intr_info)
+ +{
+ +	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
+ +			     INTR_INFO_VALID_MASK)) ==
+ +		(INTR_TYPE_HARD_EXCEPTION | MC_VECTOR | INTR_INFO_VALID_MASK);
+ +}
+ +
+ +/* Undocumented: icebp/int1 */
+ +static inline bool is_icebp(u32 intr_info)
+ +{
+ +	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
+ +		== (INTR_TYPE_PRIV_SW_EXCEPTION | INTR_INFO_VALID_MASK);
+ +}
+ +
+ +static inline bool cpu_has_load_ia32_efer(void)
+ +{
+ +	return (vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_IA32_EFER) &&
+ +	       (vmcs_config.vmexit_ctrl & VM_EXIT_LOAD_IA32_EFER);
+ +}
+ +
+ +static inline bool cpu_has_load_perf_global_ctrl(void)
+ +{
+ +	return (vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL) &&
+ +	       (vmcs_config.vmexit_ctrl & VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL);
+ +}
+ +
+ +static inline bool cpu_has_vmx_msr_bitmap(void)
+ +{
+ +	return vmcs_config.cpu_based_exec_ctrl & CPU_BASED_USE_MSR_BITMAPS;
+ +}
+ +
+ +static inline bool cpu_has_vmx_tpr_shadow(void)
+ +{
+ +	return vmcs_config.cpu_based_exec_ctrl & CPU_BASED_TPR_SHADOW;
+ +}
+ +
+ +static inline bool cpu_need_tpr_shadow(struct kvm_vcpu *vcpu)
+ +{
+ +	return cpu_has_vmx_tpr_shadow() && lapic_in_kernel(vcpu);
+ +}
+ +
+ +static inline bool cpu_has_secondary_exec_ctrls(void)
+ +{
+ +	return vmcs_config.cpu_based_exec_ctrl &
+ +		CPU_BASED_ACTIVATE_SECONDARY_CONTROLS;
+ +}
+ +
+ +static inline bool cpu_has_vmx_virtualize_apic_accesses(void)
+ +{
+ +	return vmcs_config.cpu_based_2nd_exec_ctrl &
+ +		SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
+ +}
+ +
+ +static inline bool cpu_has_vmx_virtualize_x2apic_mode(void)
+ +{
+ +	return vmcs_config.cpu_based_2nd_exec_ctrl &
+ +		SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE;
+ +}
+ +
+ +static inline bool cpu_has_vmx_apic_register_virt(void)
+ +{
+ +	return vmcs_config.cpu_based_2nd_exec_ctrl &
+ +		SECONDARY_EXEC_APIC_REGISTER_VIRT;
+ +}
+ +
+ +static inline bool cpu_has_vmx_virtual_intr_delivery(void)
+ +{
+ +	return vmcs_config.cpu_based_2nd_exec_ctrl &
+ +		SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY;
+ +}
+ +
+ +static inline bool cpu_has_vmx_encls_vmexit(void)
+ +{
+ +	return vmcs_config.cpu_based_2nd_exec_ctrl &
+ +		SECONDARY_EXEC_ENCLS_EXITING;
+++=======
++ static int nested_enable_evmcs(struct kvm_vcpu *vcpu,
++ 			       uint16_t *vmcs_version)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	/*
++ 	 * vmcs_version represents the range of supported Enlightened VMCS
++ 	 * versions: lower 8 bits is the minimal version, higher 8 bits is the
++ 	 * maximum supported version. KVM supports versions from 1 to
++ 	 * KVM_EVMCS_VERSION.
++ 	 */
++ 	if (vmcs_version)
++ 		*vmcs_version = (KVM_EVMCS_VERSION << 8) | 1;
++ 
++ 	/* We don't support disabling the feature for simplicity. */
++ 	if (vmx->nested.enlightened_vmcs_enabled)
++ 		return 0;
++ 
++ 	vmx->nested.enlightened_vmcs_enabled = true;
++ 
++ 	vmx->nested.msrs.pinbased_ctls_high &= ~EVMCS1_UNSUPPORTED_PINCTRL;
++ 	vmx->nested.msrs.entry_ctls_high &= ~EVMCS1_UNSUPPORTED_VMENTRY_CTRL;
++ 	vmx->nested.msrs.exit_ctls_high &= ~EVMCS1_UNSUPPORTED_VMEXIT_CTRL;
++ 	vmx->nested.msrs.secondary_ctls_high &= ~EVMCS1_UNSUPPORTED_2NDEXEC;
++ 	vmx->nested.msrs.vmfunc_controls &= ~EVMCS1_UNSUPPORTED_VMFUNC;
++ 
++ 	return 0;
+++>>>>>>> cb1d474b3225 (KVM: VMX: Move VMCS definitions to dedicated file)
+  }
+  
+  /*
+diff --git a/arch/x86/kvm/vmx/vmcs.h b/arch/x86/kvm/vmx/vmcs.h
+new file mode 100644
+index 000000000000..4112190feac1
+--- /dev/null
++++ b/arch/x86/kvm/vmx/vmcs.h
+@@ -0,0 +1,132 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __KVM_X86_VMX_VMCS_H
++#define __KVM_X86_VMX_VMCS_H
++
++#include <linux/list.h>
++#include <linux/ktime.h>
++
++#include <asm/vmx.h>
++
++#include "capabilities.h"
++
++struct vmcs_hdr {
++	u32 revision_id:31;
++	u32 shadow_vmcs:1;
++};
++
++struct vmcs {
++	struct vmcs_hdr hdr;
++	u32 abort;
++	char data[0];
++};
++
++/*
++ * vmcs_host_state tracks registers that are loaded from the VMCS on VMEXIT
++ * and whose values change infrequently, but are not constant.  I.e. this is
++ * used as a write-through cache of the corresponding VMCS fields.
++ */
++struct vmcs_host_state {
++	unsigned long cr3;	/* May not match real cr3 */
++	unsigned long cr4;	/* May not match real cr4 */
++	unsigned long gs_base;
++	unsigned long fs_base;
++
++	u16           fs_sel, gs_sel, ldt_sel;
++#ifdef CONFIG_X86_64
++	u16           ds_sel, es_sel;
++#endif
++};
++
++/*
++ * Track a VMCS that may be loaded on a certain CPU. If it is (cpu!=-1), also
++ * remember whether it was VMLAUNCHed, and maintain a linked list of all VMCSs
++ * loaded on this CPU (so we can clear them if the CPU goes down).
++ */
++struct loaded_vmcs {
++	struct vmcs *vmcs;
++	struct vmcs *shadow_vmcs;
++	int cpu;
++	bool launched;
++	bool nmi_known_unmasked;
++	bool hv_timer_armed;
++	/* Support for vnmi-less CPUs */
++	int soft_vnmi_blocked;
++	ktime_t entry_time;
++	s64 vnmi_blocked_time;
++	unsigned long *msr_bitmap;
++	struct list_head loaded_vmcss_on_cpu_link;
++	struct vmcs_host_state host_state;
++};
++
++static inline bool is_exception_n(u32 intr_info, u8 vector)
++{
++	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
++			     INTR_INFO_VALID_MASK)) ==
++		(INTR_TYPE_HARD_EXCEPTION | vector | INTR_INFO_VALID_MASK);
++}
++
++static inline bool is_debug(u32 intr_info)
++{
++	return is_exception_n(intr_info, DB_VECTOR);
++}
++
++static inline bool is_breakpoint(u32 intr_info)
++{
++	return is_exception_n(intr_info, BP_VECTOR);
++}
++
++static inline bool is_page_fault(u32 intr_info)
++{
++	return is_exception_n(intr_info, PF_VECTOR);
++}
++
++static inline bool is_invalid_opcode(u32 intr_info)
++{
++	return is_exception_n(intr_info, UD_VECTOR);
++}
++
++static inline bool is_gp_fault(u32 intr_info)
++{
++	return is_exception_n(intr_info, GP_VECTOR);
++}
++
++static inline bool is_machine_check(u32 intr_info)
++{
++	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
++			     INTR_INFO_VALID_MASK)) ==
++		(INTR_TYPE_HARD_EXCEPTION | MC_VECTOR | INTR_INFO_VALID_MASK);
++}
++
++/* Undocumented: icebp/int1 */
++static inline bool is_icebp(u32 intr_info)
++{
++	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
++		== (INTR_TYPE_PRIV_SW_EXCEPTION | INTR_INFO_VALID_MASK);
++}
++
++static inline bool is_nmi(u32 intr_info)
++{
++	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
++		== (INTR_TYPE_NMI_INTR | INTR_INFO_VALID_MASK);
++}
++
++enum vmcs_field_width {
++	VMCS_FIELD_WIDTH_U16 = 0,
++	VMCS_FIELD_WIDTH_U64 = 1,
++	VMCS_FIELD_WIDTH_U32 = 2,
++	VMCS_FIELD_WIDTH_NATURAL_WIDTH = 3
++};
++
++static inline int vmcs_field_width(unsigned long field)
++{
++	if (0x1 & field)	/* the *_HIGH fields are all 32 bit */
++		return VMCS_FIELD_WIDTH_U32;
++	return (field >> 13) & 0x3;
++}
++
++static inline int vmcs_field_readonly(unsigned long field)
++{
++	return (((field >> 10) & 0x3) == 1);
++}
++
++#endif /* __KVM_X86_VMX_VMCS_H */
+* Unmerged path arch/x86/kvm/vmx/vmx.c
