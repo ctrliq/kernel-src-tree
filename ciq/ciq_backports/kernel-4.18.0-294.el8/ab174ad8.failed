@@ -1,0 +1,177 @@
+mptcp: move ooo skbs into msk out of order queue.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit ab174ad8ef76276cadfdae98731d31797d265927
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ab174ad8.failed
+
+Add an RB-tree to cope with OoO (at MPTCP level) data.
+__mptcp_move_skb() insert into the RB tree "future"
+data, eventually coalescing skb as allowed by the
+MPTCP DSN.
+
+To simplify sequence accounting, move the DSN inside
+the cb.
+
+After successfully enqueuing in sequence data, check
+if we can use any data from the RB tree.
+
+Additionally move the data_fin check after spooling
+data from the OoO tree, otherwise we could miss shutdown
+events.
+
+The RB tree code is copied as verbatim as possible
+from tcp_data_queue_ofo(), with a few simplifications
+due to the fact that MPTCP doesn't need to cope with
+sacks. All bugs here are added by me.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ab174ad8ef76276cadfdae98731d31797d265927)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/protocol.c
+index 691a71ca323f,6fbfbab51660..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -121,14 -107,17 +123,20 @@@ static struct socket *__mptcp_socket_cr
+  	/* accept() will wait on first subflow sk_wq, and we always wakes up
+  	 * via msk->sk_socket
+  	 */
+ -	RCU_INIT_POINTER(msk->first->sk_wq, &sk->sk_socket->wq);
+ +	RCU_INIT_POINTER(msk->first->sk_wq, sk->sk_socket->wq);
+  
+ -	return 0;
+ +set_state:
+ +	if (state != MPTCP_SAME_STATE)
+ +		inet_sk_state_store(sk, state);
+ +	return ssock;
+  }
+  
++ static void mptcp_drop(struct sock *sk, struct sk_buff *skb)
++ {
++ 	sk_drops_add(sk, skb);
++ 	__kfree_skb(skb);
++ }
++ 
+  static bool mptcp_try_coalesce(struct sock *sk, struct sk_buff *to,
+  			       struct sk_buff *from)
+  {
+@@@ -175,27 -295,6 +314,30 @@@ static void mptcp_stop_timer(struct soc
+  	mptcp_sk(sk)->timer_ival = 0;
+  }
+  
+++<<<<<<< HEAD
+ +/* both sockets must be locked */
+ +static bool mptcp_subflow_dsn_valid(const struct mptcp_sock *msk,
+ +				    struct sock *ssk)
+ +{
+ +	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+ +	u64 dsn = mptcp_subflow_get_mapped_dsn(subflow);
+ +
+ +	/* revalidate data sequence number.
+ +	 *
+ +	 * mptcp_subflow_data_available() is usually called
+ +	 * without msk lock.  Its unlikely (but possible)
+ +	 * that msk->ack_seq has been advanced since the last
+ +	 * call found in-sequence data.
+ +	 */
+ +	if (likely(dsn == msk->ack_seq))
+ +		return true;
+ +
+ +	subflow->data_avail = 0;
+ +	return mptcp_subflow_data_available(ssk);
+ +}
+ +
+++=======
+++>>>>>>> ab174ad8ef76 (mptcp: move ooo skbs into msk out of order queue.)
+  static void mptcp_check_data_fin_ack(struct sock *sk)
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+@@@ -340,11 -438,7 +482,15 @@@ static bool __mptcp_move_skbs_from_subf
+  	struct tcp_sock *tp;
+  	bool done = false;
+  
+++<<<<<<< HEAD
+ +	if (!mptcp_subflow_dsn_valid(msk, ssk)) {
+ +		*bytes = 0;
+ +		return false;
+ +	}
+ +
+++=======
++ 	pr_debug("msk=%p ssk=%p", msk, ssk);
+++>>>>>>> ab174ad8ef76 (mptcp: move ooo skbs into msk out of order queue.)
+  	tp = tcp_sk(ssk);
+  	do {
+  		u32 map_remaining, offset;
+@@@ -403,17 -497,8 +549,8 @@@
+  		}
+  	} while (more_data_avail);
+  
+ -	*bytes += moved;
+ +	*bytes = moved;
+  
+- 	/* If the moves have caught up with the DATA_FIN sequence number
+- 	 * it's time to ack the DATA_FIN and change socket state, but
+- 	 * this is not a good place to change state. Let the workqueue
+- 	 * do it.
+- 	 */
+- 	if (mptcp_pending_data_fin(sk, NULL) &&
+- 	    schedule_work(&msk->work))
+- 		sock_hold(sk);
+- 
+  	return done;
+  }
+  
+@@@ -1857,7 -2020,8 +2048,12 @@@ static void mptcp_destroy(struct sock *
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+  
+++<<<<<<< HEAD
+ +	mptcp_token_destroy(msk->token);
+++=======
++ 	skb_rbtree_purge(&msk->out_of_order_queue);
++ 	mptcp_token_destroy(msk);
+++>>>>>>> ab174ad8ef76 (mptcp: move ooo skbs into msk out of order queue.)
+  	if (msk->cached_ext)
+  		__skb_ext_put(msk->cached_ext);
+  
+diff --cc net/mptcp/subflow.c
+index 750f1161d6e1,0b1d73a69daf..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -399,7 -434,8 +399,12 @@@ static void mptcp_sock_destruct(struct 
+  		sock_orphan(sk);
+  	}
+  
+++<<<<<<< HEAD
+ +	mptcp_token_destroy(mptcp_sk(sk)->token);
+++=======
++ 	skb_rbtree_purge(&mptcp_sk(sk)->out_of_order_queue);
++ 	mptcp_token_destroy(mptcp_sk(sk));
+++>>>>>>> ab174ad8ef76 (mptcp: move ooo skbs into msk out of order queue.)
+  	inet_sock_destruct(sk);
+  }
+  
+* Unmerged path net/mptcp/protocol.c
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 223e4fb33f77..163d0c9658ae 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -206,6 +206,8 @@ struct mptcp_sock {
+ 	bool		snd_data_fin_enable;
+ 	spinlock_t	join_list_lock;
+ 	struct work_struct work;
++	struct sk_buff  *ooo_last_skb;
++	struct rb_root  out_of_order_queue;
+ 	struct list_head conn_list;
+ 	struct list_head rtx_queue;
+ 	struct list_head join_list;
+* Unmerged path net/mptcp/subflow.c
