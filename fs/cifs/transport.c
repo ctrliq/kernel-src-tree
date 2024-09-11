@@ -514,10 +514,11 @@ wait_for_free_request(struct TCP_Server_Info *server, const int timeout,
 
 int
 cifs_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
-		      unsigned int *num, unsigned int *credits)
+		      unsigned int *num, struct cifs_credits *credits)
 {
 	*num = size;
-	*credits = 0;
+	credits->value = 0;
+	credits->instance = server->reconnect_instance;
 	return 0;
 }
 
@@ -608,7 +609,7 @@ cifs_call_async(struct TCP_Server_Info *server, struct smb_rqst *rqst,
 {
 	int rc, timeout, optype;
 	struct mid_q_entry *mid;
-	unsigned int credits = 0;
+	struct cifs_credits credits = { .value = 0, .instance = 0 };
 
 	timeout = flags & CIFS_TIMEOUT_MASK;
 	optype = flags & CIFS_OP_MASK;
@@ -617,14 +618,14 @@ cifs_call_async(struct TCP_Server_Info *server, struct smb_rqst *rqst,
 		rc = wait_for_free_request(server, timeout, optype);
 		if (rc)
 			return rc;
-		credits = 1;
+		credits.value = 1;
 	}
 
 	mutex_lock(&server->srv_mutex);
 	mid = server->ops->setup_async_request(server, rqst);
 	if (IS_ERR(mid)) {
 		mutex_unlock(&server->srv_mutex);
-		add_credits_and_wake_if(server, credits, optype);
+		add_credits_and_wake_if(server, &credits, optype);
 		return PTR_ERR(mid);
 	}
 
@@ -659,7 +660,7 @@ cifs_call_async(struct TCP_Server_Info *server, struct smb_rqst *rqst,
 	if (rc == 0)
 		return 0;
 
-	add_credits_and_wake_if(server, credits, optype);
+	add_credits_and_wake_if(server, &credits, optype);
 	return rc;
 }
 
