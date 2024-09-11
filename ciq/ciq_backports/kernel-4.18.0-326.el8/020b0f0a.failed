@@ -1,0 +1,259 @@
+scsi: core: Replace sdev->device_busy with sbitmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 020b0f0a31920e5b7e7e120d4560453b67b70733
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/020b0f0a.failed
+
+SCSI currently uses an atomic variable to track queue depth for each
+attached device. The queue depth depends on many factors such as transport
+type and device implementation. In addition, the SCSI device queue depth is
+not a static entity but changes over time as a result of congestion
+management.
+
+While blk-mq currently tracks queue depth for each hctx, it can't easily be
+changed to accommodate the SCSI per-device requirement.
+
+The current approach of using an atomic variable doesn't scale well when
+there are lots of CPU cores and the disk is very fast. IOPS can be
+substantially impacted by the atomic in the hot path.
+
+Replace the atomic variable sdev->device_busy with an sbitmap for tracking
+the SCSI device queue depth.
+
+It has been observed that IOPS is improved ~30% by this patchset in the
+following test:
+
+1) test machine(32 logical CPU cores)
+	Thread(s) per core:  2
+	Core(s) per socket:  8
+	Socket(s):           2
+	NUMA node(s):        2
+	Model name:          Intel(R) Xeon(R) Silver 4110 CPU @ 2.10GHz
+
+2) setup scsi_debug:
+modprobe scsi_debug virtual_gb=128 max_luns=1 submit_queues=32 delay=0 max_queue=256
+
+3) fio script:
+fio --rw=randread --size=128G --direct=1 --ioengine=libaio --iodepth=2048 \
+	--numjobs=32 --bs=4k --group_reporting=1 --group_reporting=1 --runtime=60 \
+	--loops=10000 --name=job1 --filename=/dev/sdN
+
+[mkp: fix device_busy reference in mpt3sas]
+
+Link: https://lore.kernel.org/r/20210122023317.687987-14-ming.lei@redhat.com
+Link: https://lore.kernel.org/linux-block/20200119071432.18558-6-ming.lei@redhat.com/
+	Cc: Omar Sandoval <osandov@fb.com>
+	Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+	Cc: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+	Cc: Ewan D. Milne <emilne@redhat.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Tested-by: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 020b0f0a31920e5b7e7e120d4560453b67b70733)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index d64d9b0ccfa2,ffe824782647..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -327,7 -328,8 +327,12 @@@ void scsi_device_unbusy(struct scsi_dev
+  	if (starget->can_queue > 0)
+  		atomic_dec(&starget->target_busy);
+  
+++<<<<<<< HEAD
+ +	atomic_dec(&sdev->device_busy);
+++=======
++ 	sbitmap_put(&sdev->budget_map, cmd->budget_token);
++ 	cmd->budget_token = -1;
+++>>>>>>> 020b0f0a3192 (scsi: core: Replace sdev->device_busy with sbitmap)
+  }
+  
+  static void scsi_kick_queue(struct request_queue *q)
+@@@ -1582,21 -1608,20 +1587,27 @@@ static void scsi_mq_done(struct scsi_cm
+  	blk_mq_complete_request(cmd->request);
+  }
+  
+ -static void scsi_mq_put_budget(struct request_queue *q, int budget_token)
+ +static void scsi_mq_put_budget(struct blk_mq_hw_ctx *hctx)
+  {
+ +	struct request_queue *q = hctx->queue;
+  	struct scsi_device *sdev = q->queuedata;
+  
+- 	atomic_dec(&sdev->device_busy);
++ 	sbitmap_put(&sdev->budget_map, budget_token);
+  }
+  
+ -static int scsi_mq_get_budget(struct request_queue *q)
+ +static bool scsi_mq_get_budget(struct blk_mq_hw_ctx *hctx)
+  {
+ +	struct request_queue *q = hctx->queue;
+  	struct scsi_device *sdev = q->queuedata;
++ 	int token = scsi_dev_queue_ready(q, sdev);
+  
+++<<<<<<< HEAD
+ +	if (scsi_dev_queue_ready(q, sdev))
+ +		return true;
+++=======
++ 	if (token >= 0)
++ 		return token;
+++>>>>>>> 020b0f0a3192 (scsi: core: Replace sdev->device_busy with sbitmap)
+  
+  	atomic_inc(&sdev->restarts);
+  
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index 89a3a4fe58e9..b6846e70a146 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -3677,8 +3677,7 @@ _base_get_high_iops_msix_index(struct MPT3SAS_ADAPTER *ioc,
+ 	 * IOs on the target device is >=8.
+ 	 */
+ 
+-	if (atomic_read(&scmd->device->device_busy) >
+-	    MPT3SAS_DEVICE_HIGH_IOPS_DEPTH)
++	if (scsi_device_busy(scmd->device) > MPT3SAS_DEVICE_HIGH_IOPS_DEPTH)
+ 		return base_mod64((
+ 		    atomic64_add_return(1, &ioc->high_iops_outstanding) /
+ 		    MPT3SAS_HIGH_IOPS_BATCH_COUNT),
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index 41307fc69dcd..79cb855cc727 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -253,7 +253,7 @@ void scsi_finish_command(struct scsi_cmnd *cmd)
+ /*
+  * 1024 is big enough for saturating the fast scsi LUN now
+  */
+-static int scsi_device_max_queue_depth(struct scsi_device *sdev)
++int scsi_device_max_queue_depth(struct scsi_device *sdev)
+ {
+ 	return max_t(int, sdev->host->can_queue, 1024);
+ }
+@@ -277,6 +277,8 @@ int scsi_change_queue_depth(struct scsi_device *sdev, int depth)
+ 	if (sdev->request_queue)
+ 		blk_set_queue_depth(sdev->request_queue, depth);
+ 
++	sbitmap_resize(&sdev->budget_map, sdev->queue_depth);
++
+ 	return sdev->queue_depth;
+ }
+ EXPORT_SYMBOL(scsi_change_queue_depth);
+* Unmerged path drivers/scsi/scsi_lib.c
+diff --git a/drivers/scsi/scsi_priv.h b/drivers/scsi/scsi_priv.h
+index b3e2aa9d319e..32bd92821297 100644
+--- a/drivers/scsi/scsi_priv.h
++++ b/drivers/scsi/scsi_priv.h
+@@ -5,6 +5,7 @@
+ #include <linux/device.h>
+ #include <linux/async.h>
+ #include <scsi/scsi_device.h>
++#include <linux/sbitmap.h>
+ 
+ struct request_queue;
+ struct request;
+@@ -186,6 +187,8 @@ static inline void scsi_dh_add_device(struct scsi_device *sdev) { }
+ static inline void scsi_dh_release_device(struct scsi_device *sdev) { }
+ #endif
+ 
++extern int scsi_device_max_queue_depth(struct scsi_device *sdev);
++
+ /* 
+  * internal scsi timeout functions: for use by mid-layer and transport
+  * classes.
+diff --git a/drivers/scsi/scsi_scan.c b/drivers/scsi/scsi_scan.c
+index 79232cef1af1..813d492d9086 100644
+--- a/drivers/scsi/scsi_scan.c
++++ b/drivers/scsi/scsi_scan.c
+@@ -215,6 +215,7 @@ static void scsi_unlock_floptical(struct scsi_device *sdev,
+ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
+ 					   u64 lun, void *hostdata)
+ {
++	unsigned int depth;
+ 	struct scsi_device *sdev;
+ 	int display_failure_msg = 1, ret;
+ 	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
+@@ -277,8 +278,25 @@ static struct scsi_device *scsi_alloc_sdev(struct scsi_target *starget,
+ 	WARN_ON_ONCE(!blk_get_queue(sdev->request_queue));
+ 	sdev->request_queue->queuedata = sdev;
+ 
+-	scsi_change_queue_depth(sdev, sdev->host->cmd_per_lun ?
+-					sdev->host->cmd_per_lun : 1);
++	depth = sdev->host->cmd_per_lun ?: 1;
++
++	/*
++	 * Use .can_queue as budget map's depth because we have to
++	 * support adjusting queue depth from sysfs. Meantime use
++	 * default device queue depth to figure out sbitmap shift
++	 * since we use this queue depth most of times.
++	 */
++	if (sbitmap_init_node(&sdev->budget_map,
++				scsi_device_max_queue_depth(sdev),
++				sbitmap_calculate_shift(depth),
++				GFP_KERNEL, sdev->request_queue->node,
++				false, true)) {
++		put_device(&starget->dev);
++		kfree(sdev);
++		goto out;
++	}
++
++	scsi_change_queue_depth(sdev, depth);
+ 
+ 	scsi_sysfs_device_initialize(sdev);
+ 
+@@ -980,6 +998,7 @@ static int scsi_add_lun(struct scsi_device *sdev, unsigned char *inq_result,
+ 		scsi_attach_vpd(sdev);
+ 
+ 	sdev->max_queue_depth = sdev->queue_depth;
++	WARN_ON_ONCE(sdev->max_queue_depth > sdev->budget_map.depth);
+ 	sdev->sdev_bflags = *bflags;
+ 
+ 	/*
+diff --git a/drivers/scsi/scsi_sysfs.c b/drivers/scsi/scsi_sysfs.c
+index 8b19ac77430a..76e87668fab1 100644
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -477,6 +477,8 @@ static void scsi_device_dev_release_usercontext(struct work_struct *work)
+ 	/* NULL queue means the device can't be used */
+ 	sdev->request_queue = NULL;
+ 
++	sbitmap_free(&sdev->budget_map);
++
+ 	mutex_lock(&sdev->inquiry_mutex);
+ 	vpd_pg0 = rcu_replace_pointer(sdev->vpd_pg0, vpd_pg0,
+ 				       lockdep_is_held(&sdev->inquiry_mutex));
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index e1b9dbe62699..4d53e2ec42ae 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -8,6 +8,7 @@
+ #include <linux/blkdev.h>
+ #include <scsi/scsi.h>
+ #include <linux/atomic.h>
++#include <linux/sbitmap.h>
+ 
+ #include <linux/rh_kabi.h>
+ 
+@@ -108,7 +109,7 @@ struct scsi_device {
+ 	struct list_head    siblings;   /* list of all devices on this host */
+ 	struct list_head    same_target_siblings; /* just the devices sharing same target id */
+ 
+-	atomic_t device_busy;		/* commands actually active on LLDD */
++	struct sbitmap budget_map;
+ 	atomic_t device_blocked;	/* Device returned QUEUE_FULL. */
+ 
+ 	spinlock_t list_lock;
+@@ -611,7 +612,7 @@ static inline int scsi_device_supports_vpd(struct scsi_device *sdev)
+ 
+ static inline int scsi_device_busy(struct scsi_device *sdev)
+ {
+-	return atomic_read(&sdev->device_busy);
++	return sbitmap_weight(&sdev->budget_map);
+ }
+ 
+ #define MODULE_ALIAS_SCSI_DEVICE(type) \
