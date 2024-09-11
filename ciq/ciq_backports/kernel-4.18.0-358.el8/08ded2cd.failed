@@ -1,0 +1,137 @@
+x86/fpu: Get rid of the FNSAVE optimization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 08ded2cd18a09749e67a14426aa7fd1b04ab1dc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/08ded2cd.failed
+
+The FNSAVE support requires conditionals in quite some call paths because
+FNSAVE reinitializes the FPU hardware. If the save has to preserve the FPU
+register state then the caller has to conditionally restore it from memory
+when FNSAVE is in use.
+
+This also requires a conditional in context switch because the restore
+avoidance optimization cannot work with FNSAVE. As this only affects 20+
+years old CPUs there is really no reason to keep this optimization
+effective for FNSAVE. It's about time to not optimize for antiques anymore.
+
+Just unconditionally FRSTOR the save content to the registers and clean up
+the conditionals all over the place.
+
+	Suggested-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121454.617369268@linutronix.de
+(cherry picked from commit 08ded2cd18a09749e67a14426aa7fd1b04ab1dc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/kernel/fpu/core.c
+index 1e27c69db876,c290ba27ffef..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -82,25 -83,36 +82,46 @@@ bool irq_fpu_usable(void
+  EXPORT_SYMBOL(irq_fpu_usable);
+  
+  /*
+-  * These must be called with preempt disabled. Returns
+-  * 'true' if the FPU state is still intact and we can
+-  * keep registers active.
++  * Save the FPU register state in fpu->state. The register state is
++  * preserved.
+   *
+-  * The legacy FNSAVE instruction cleared all FPU state
+-  * unconditionally, so registers are essentially destroyed.
+-  * Modern FPU state can be kept in registers, if there are
+-  * no pending FP exceptions.
++  * Must be called with fpregs_lock() held.
++  *
++  * The legacy FNSAVE instruction clears all FPU state unconditionally, so
++  * register state has to be reloaded. That might be a pointless exercise
++  * when the FPU is going to be used by another task right after that. But
++  * this only affects 20+ years old 32bit systems and avoids conditionals all
++  * over the place.
++  *
++  * FXSAVE and all XSAVE variants preserve the FPU register state.
+   */
+- int save_fpregs_to_fpstate(struct fpu *fpu)
++ void save_fpregs_to_fpstate(struct fpu *fpu)
+  {
+  	if (likely(use_xsave())) {
+++<<<<<<< HEAD
+ +		copy_xregs_to_kernel(&fpu->state.xsave);
+ +		return 1;
+ +	}
+ +
+ +	if (likely(use_fxsr())) {
+ +		copy_fxregs_to_kernel(fpu);
+ +		return 1;
+++=======
++ 		os_xsave(&fpu->state.xsave);
++ 
++ 		/*
++ 		 * AVX512 state is tracked here because its use is
++ 		 * known to slow the max clock speed of the core.
++ 		 */
++ 		if (fpu->state.xsave.header.xfeatures & XFEATURE_MASK_AVX512)
++ 			fpu->avx512_timestamp = jiffies;
++ 		return;
++ 	}
++ 
++ 	if (likely(use_fxsr())) {
++ 		fxsave(&fpu->state.fxsave);
++ 		return;
+++>>>>>>> 08ded2cd18a0 (x86/fpu: Get rid of the FNSAVE optimization)
+  	}
+  
+  	/*
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 25c5f10d80a4..cad963fa37f7 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -85,6 +85,7 @@ extern void fpstate_init_soft(struct swregs_state *soft);
+ #else
+ static inline void fpstate_init_soft(struct swregs_state *soft) {}
+ #endif
++extern void save_fpregs_to_fpstate(struct fpu *fpu);
+ 
+ #define user_insn(insn, output, input...)				\
+ ({									\
+@@ -377,8 +378,6 @@ static inline int copy_kernel_to_xregs_err(struct xregs_state *xstate, u64 mask)
+ 	return err;
+ }
+ 
+-extern int save_fpregs_to_fpstate(struct fpu *fpu);
+-
+ static inline void __copy_kernel_to_fpregs(union fpregs_state *fpstate, u64 mask)
+ {
+ 	if (use_xsave()) {
+@@ -509,12 +508,17 @@ static inline void __fpregs_load_activate(void)
+ static inline void switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+ {
+ 	if (static_cpu_has(X86_FEATURE_FPU) && !(current->flags & PF_KTHREAD)) {
+-		if (!save_fpregs_to_fpstate(old_fpu))
+-			old_fpu->last_cpu = -1;
+-		else
+-			old_fpu->last_cpu = cpu;
++		save_fpregs_to_fpstate(old_fpu);
++		/*
++		 * The save operation preserved register state, so the
++		 * fpu_fpregs_owner_ctx is still @old_fpu. Store the
++		 * current CPU number in @old_fpu, so the next return
++		 * to user space can avoid the FPU register restore
++		 * when is returns on the same CPU and still owns the
++		 * context.
++		 */
++		old_fpu->last_cpu = cpu;
+ 
+-		/* But leave fpu_fpregs_owner_ctx! */
+ 		trace_x86_fpu_regs_deactivated(old_fpu);
+ 	}
+ }
+* Unmerged path arch/x86/kernel/fpu/core.c
