@@ -1,0 +1,608 @@
+mt76: mt7915: rework mcu API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit c203dd621780842f7aff5fa10956dface8b6dc16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/c203dd62.failed
+
+Add support for passing flags for selecting the MCU target and query type
+instead of trying to detect it based on the command id
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit c203dd621780842f7aff5fa10956dface8b6dc16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7915/main.c
+#	drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
+#	drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7915/main.c
+index 142b59238584,8b8d0d2d532b..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/main.c
+@@@ -46,8 -46,8 +46,13 @@@ static int mt7915_start(struct ieee8021
+  		mt7915_mac_enable_nf(dev, 1);
+  	}
+  
+++<<<<<<< HEAD
+ +	mt7915_mcu_set_sku_en(phy, !mt76_testmode_enabled(&dev->mt76));
+ +	mt7915_mcu_set_chan_info(phy, MCU_EXT_CMD_SET_RX_PATH);
+++=======
++ 	mt7915_mcu_set_sku_en(phy, true);
++ 	mt7915_mcu_set_chan_info(phy, MCU_EXT_CMD(SET_RX_PATH));
+++>>>>>>> c203dd621780 (mt76: mt7915: rework mcu API)
+  
+  	set_bit(MT76_STATE_RUNNING, &phy->mt76->state);
+  
+diff --cc drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
+index 22c9252267db,59a5ef2a0139..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
+@@@ -264,8 -260,8 +260,13 @@@ mt7915_mcu_send_message(struct mt76_de
+  	if (!seq)
+  		seq = ++dev->mt76.mcu.msg_seq & 0xf;
+  
+++<<<<<<< HEAD
+ +	if (cmd == -MCU_CMD_FW_SCATTER) {
+ +		qid = MT_MCUQ_FWDL;
+++=======
++ 	if (cmd == MCU_CMD(FW_SCATTER)) {
++ 		txq = MT_MCUQ_FWDL;
+++>>>>>>> c203dd621780 (mt76: mt7915: rework mcu API)
+  		goto exit;
+  	}
+  
+@@@ -2007,10 -2000,10 +2004,10 @@@ mt7915_mcu_add_txbf(struct mt7915_dev *
+  		if (IS_ERR(skb))
+  			return PTR_ERR(skb);
+  
+ -		mt7915_mcu_sta_bfer_tlv(skb, sta, vif, phy, enable, ebf);
+ +		mt7915_mcu_sta_bfer_tlv(skb, sta, vif, phy, enable);
+  
+  		r = mt76_mcu_skb_send_msg(&dev->mt76, skb,
+- 					  MCU_EXT_CMD_STA_REC_UPDATE, true);
++ 					  MCU_EXT_CMD(STA_REC_UPDATE), true);
+  		if (r)
+  			return r;
+  	}
+@@@ -3185,18 -3185,58 +3182,69 @@@ int mt7915_mcu_set_chan_info(struct mt7
+  	return mt76_mcu_send_msg(&dev->mt76, cmd, &req, sizeof(req), true);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mt7915_mcu_set_eeprom_flash(struct mt7915_dev *dev)
++ {
++ #define TOTAL_PAGE_MASK		GENMASK(7, 5)
++ #define PAGE_IDX_MASK		GENMASK(4, 2)
++ #define PER_PAGE_SIZE		0x400
++ 	struct mt7915_mcu_eeprom req = { .buffer_mode = EE_MODE_BUFFER };
++ 	u8 total = MT7915_EEPROM_SIZE / PER_PAGE_SIZE;
++ 	u8 *eep = (u8 *)dev->mt76.eeprom.data;
++ 	int eep_len;
++ 	int i;
++ 
++ 	for (i = 0; i <= total; i++, eep += eep_len) {
++ 		struct sk_buff *skb;
++ 		int ret;
++ 
++ 		if (i == total)
++ 			eep_len = MT7915_EEPROM_SIZE % PER_PAGE_SIZE;
++ 		else
++ 			eep_len = PER_PAGE_SIZE;
++ 
++ 		skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
++ 					 sizeof(req) + eep_len);
++ 		if (!skb)
++ 			return -ENOMEM;
++ 
++ 		req.format = FIELD_PREP(TOTAL_PAGE_MASK, total) |
++ 			     FIELD_PREP(PAGE_IDX_MASK, i) | EE_FORMAT_WHOLE;
++ 		req.len = cpu_to_le16(eep_len);
++ 
++ 		skb_put_data(skb, &req, sizeof(req));
++ 		skb_put_data(skb, eep, eep_len);
++ 
++ 		ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
++ 					    MCU_EXT_CMD(EFUSE_BUFFER_MODE), true);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c203dd621780 (mt76: mt7915: rework mcu API)
+  int mt7915_mcu_set_eeprom(struct mt7915_dev *dev)
+  {
+ -	struct mt7915_mcu_eeprom req = {
+ +	struct req_hdr {
+ +		u8 buffer_mode;
+ +		u8 format;
+ +		__le16 len;
+ +	} __packed req = {
+  		.buffer_mode = EE_MODE_EFUSE,
+  		.format = EE_FORMAT_WHOLE,
+  	};
+  
+++<<<<<<< HEAD
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EFUSE_BUFFER_MODE,
+++=======
++ 	if (dev->flash_mode)
++ 		return mt7915_mcu_set_eeprom_flash(dev);
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(EFUSE_BUFFER_MODE),
+++>>>>>>> c203dd621780 (mt76: mt7915: rework mcu API)
+  				 &req, sizeof(req), true);
+  }
+  
+@@@ -3355,10 -3395,10 +3403,10 @@@ int mt7915_mcu_set_txbf_type(struct mt7
+  	} __packed req = {
+  		.action = MT_BF_TYPE_UPDATE,
+  		.ebf = true,
+ -		.ibf = dev->ibf,
+ +		.ibf = false,
+  	};
+  
+- 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_TXBF_ACTION, &req,
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(TXBF_ACTION), &req,
+  				 sizeof(req), true);
+  }
+  
+diff --cc drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+index fe56ab18e974,7fb2170a9561..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
+@@@ -130,15 -132,226 +130,228 @@@ mt7915_tm_set_trx(struct mt7915_dev *de
+  				 sizeof(req), false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mt7915_tm_clean_hwq(struct mt7915_phy *phy, u8 wcid)
++ {
++ 	struct mt7915_dev *dev = phy->dev;
++ 	struct mt7915_tm_cmd req = {
++ 		.testmode_en = 1,
++ 		.param_idx = MCU_ATE_CLEAN_TXQUEUE,
++ 		.param.clean.wcid = wcid,
++ 		.param.clean.band = phy != &dev->phy,
++ 	};
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(ATE_CTRL), &req,
++ 				 sizeof(req), false);
++ }
++ 
++ static int
++ mt7915_tm_set_slot_time(struct mt7915_phy *phy, u8 slot_time, u8 sifs)
++ {
++ 	struct mt7915_dev *dev = phy->dev;
++ 	struct mt7915_tm_cmd req = {
++ 		.testmode_en = !(phy->mt76->test.state == MT76_TM_STATE_OFF),
++ 		.param_idx = MCU_ATE_SET_SLOT_TIME,
++ 		.param.slot.slot_time = slot_time,
++ 		.param.slot.sifs = sifs,
++ 		.param.slot.rifs = 2,
++ 		.param.slot.eifs = cpu_to_le16(60),
++ 		.param.slot.band = phy != &dev->phy,
++ 	};
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(ATE_CTRL), &req,
++ 				 sizeof(req), false);
++ }
++ 
++ static int
++ mt7915_tm_set_wmm_qid(struct mt7915_dev *dev, u8 qid, u8 aifs, u8 cw_min,
++ 		      u16 cw_max, u16 txop)
++ {
++ 	struct mt7915_mcu_tx req = { .total = 1 };
++ 	struct edca *e = &req.edca[0];
++ 
++ 	e->queue = qid;
++ 	e->set = WMM_PARAM_SET;
++ 
++ 	e->aifs = aifs;
++ 	e->cw_min = cw_min;
++ 	e->cw_max = cpu_to_le16(cw_max);
++ 	e->txop = cpu_to_le16(txop);
++ 
++ 	return mt7915_mcu_update_edca(dev, &req);
++ }
++ 
++ static int
++ mt7915_tm_set_ipg_params(struct mt7915_phy *phy, u32 ipg, u8 mode)
++ {
++ #define TM_DEFAULT_SIFS	10
++ #define TM_MAX_SIFS	127
++ #define TM_MAX_AIFSN	0xf
++ #define TM_MIN_AIFSN	0x1
++ #define BBP_PROC_TIME	1500
++ 	struct mt7915_dev *dev = phy->dev;
++ 	u8 sig_ext = (mode == MT76_TM_TX_MODE_CCK) ? 0 : 6;
++ 	u8 slot_time = 9, sifs = TM_DEFAULT_SIFS;
++ 	u8 aifsn = TM_MIN_AIFSN;
++ 	u32 i2t_time, tr2t_time, txv_time;
++ 	bool ext_phy = phy != &dev->phy;
++ 	u16 cw = 0;
++ 
++ 	if (ipg < sig_ext + slot_time + sifs)
++ 		ipg = 0;
++ 
++ 	if (!ipg)
++ 		goto done;
++ 
++ 	ipg -= sig_ext;
++ 
++ 	if (ipg <= (TM_MAX_SIFS + slot_time)) {
++ 		sifs = ipg - slot_time;
++ 	} else {
++ 		u32 val = (ipg + slot_time) / slot_time;
++ 
++ 		while (val >>= 1)
++ 			cw++;
++ 
++ 		if (cw > 16)
++ 			cw = 16;
++ 
++ 		ipg -= ((1 << cw) - 1) * slot_time;
++ 
++ 		aifsn = ipg / slot_time;
++ 		if (aifsn > TM_MAX_AIFSN)
++ 			aifsn = TM_MAX_AIFSN;
++ 
++ 		ipg -= aifsn * slot_time;
++ 
++ 		if (ipg > TM_DEFAULT_SIFS) {
++ 			if (ipg < TM_MAX_SIFS)
++ 				sifs = ipg;
++ 			else
++ 				sifs = TM_MAX_SIFS;
++ 		}
++ 	}
++ done:
++ 	txv_time = mt76_get_field(dev, MT_TMAC_ATCR(ext_phy),
++ 				  MT_TMAC_ATCR_TXV_TOUT);
++ 	txv_time *= 50;	/* normal clock time */
++ 
++ 	i2t_time = (slot_time * 1000 - txv_time - BBP_PROC_TIME) / 50;
++ 	tr2t_time = (sifs * 1000 - txv_time - BBP_PROC_TIME) / 50;
++ 
++ 	mt76_set(dev, MT_TMAC_TRCR0(ext_phy),
++ 		 FIELD_PREP(MT_TMAC_TRCR0_TR2T_CHK, tr2t_time) |
++ 		 FIELD_PREP(MT_TMAC_TRCR0_I2T_CHK, i2t_time));
++ 
++ 	mt7915_tm_set_slot_time(phy, slot_time, sifs);
++ 
++ 	return mt7915_tm_set_wmm_qid(dev,
++ 				     mt7915_lmac_mapping(dev, IEEE80211_AC_BE),
++ 				     aifsn, cw, cw, 0);
++ }
++ 
++ static int
++ mt7915_tm_set_tx_len(struct mt7915_phy *phy, u32 tx_time)
++ {
++ 	struct mt76_phy *mphy = phy->mt76;
++ 	struct mt76_testmode_data *td = &mphy->test;
++ 	struct sk_buff *old = td->tx_skb, *new;
++ 	struct ieee80211_supported_band *sband;
++ 	struct rate_info rate = {};
++ 	u16 flags = 0, tx_len;
++ 	u32 bitrate;
++ 
++ 	if (!tx_time || !old)
++ 		return 0;
++ 
++ 	rate.mcs = td->tx_rate_idx;
++ 	rate.nss = td->tx_rate_nss;
++ 
++ 	switch (td->tx_rate_mode) {
++ 	case MT76_TM_TX_MODE_CCK:
++ 	case MT76_TM_TX_MODE_OFDM:
++ 		if (mphy->chandef.chan->band == NL80211_BAND_5GHZ)
++ 			sband = &mphy->sband_5g.sband;
++ 		else
++ 			sband = &mphy->sband_2g.sband;
++ 
++ 		rate.legacy = sband->bitrates[rate.mcs].bitrate;
++ 		break;
++ 	case MT76_TM_TX_MODE_HT:
++ 		rate.mcs += rate.nss * 8;
++ 		flags |= RATE_INFO_FLAGS_MCS;
++ 
++ 		if (td->tx_rate_sgi)
++ 			flags |= RATE_INFO_FLAGS_SHORT_GI;
++ 		break;
++ 	case MT76_TM_TX_MODE_VHT:
++ 		flags |= RATE_INFO_FLAGS_VHT_MCS;
++ 
++ 		if (td->tx_rate_sgi)
++ 			flags |= RATE_INFO_FLAGS_SHORT_GI;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_SU:
++ 	case MT76_TM_TX_MODE_HE_EXT_SU:
++ 	case MT76_TM_TX_MODE_HE_TB:
++ 	case MT76_TM_TX_MODE_HE_MU:
++ 		rate.he_gi = td->tx_rate_sgi;
++ 		flags |= RATE_INFO_FLAGS_HE_MCS;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	rate.flags = flags;
++ 
++ 	switch (mphy->chandef.width) {
++ 	case NL80211_CHAN_WIDTH_160:
++ 	case NL80211_CHAN_WIDTH_80P80:
++ 		rate.bw = RATE_INFO_BW_160;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_80:
++ 		rate.bw = RATE_INFO_BW_80;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_40:
++ 		rate.bw = RATE_INFO_BW_40;
++ 		break;
++ 	default:
++ 		rate.bw = RATE_INFO_BW_20;
++ 		break;
++ 	}
++ 
++ 	bitrate = cfg80211_calculate_bitrate(&rate);
++ 	tx_len = bitrate * tx_time / 10 / 8;
++ 
++ 	if (tx_len < sizeof(struct ieee80211_hdr))
++ 		tx_len = sizeof(struct ieee80211_hdr);
++ 	else if (tx_len > IEEE80211_MAX_FRAME_LEN)
++ 		tx_len = IEEE80211_MAX_FRAME_LEN;
++ 
++ 	new = alloc_skb(tx_len, GFP_KERNEL);
++ 	if (!new)
++ 		return -ENOMEM;
++ 
++ 	skb_copy_header(new, old);
++ 	__skb_put_zero(new, tx_len);
++ 	memcpy(new->data, old->data, sizeof(struct ieee80211_hdr));
++ 
++ 	dev_kfree_skb(old);
++ 	td->tx_skb = new;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c203dd621780 (mt76: mt7915: rework mcu API)
+  static void
+ -mt7915_tm_reg_backup_restore(struct mt7915_phy *phy)
+ +mt7915_tm_reg_backup_restore(struct mt7915_dev *dev, struct mt7915_phy *phy)
+  {
+  	int n_regs = ARRAY_SIZE(reg_backup_list);
+ -	struct mt7915_dev *dev = phy->dev;
+  	bool ext_phy = phy != &dev->phy;
+ -	u32 *b = phy->test.reg_backup;
+ +	u32 *b = dev->test.reg_backup;
+  	int i;
+  
+ -	if (phy->mt76->test.state == MT76_TM_STATE_OFF) {
+ +	if (dev->mt76.test.state == MT76_TM_STATE_OFF) {
+  		for (i = 0; i < n_regs; i++)
+  			mt76_wr(dev, reg_backup_list[i].band[ext_phy], b[i]);
+  		return;
+@@@ -197,7 -412,17 +410,21 @@@ mt7915_tm_init(struct mt7915_dev *dev
+  }
+  
+  static void
+++<<<<<<< HEAD
+ +mt7915_tm_set_tx_frames(struct mt7915_dev *dev, bool en)
+++=======
++ mt7915_tm_update_channel(struct mt7915_phy *phy)
++ {
++ 	mutex_unlock(&phy->dev->mt76.mutex);
++ 	mt7915_set_channel(phy);
++ 	mutex_lock(&phy->dev->mt76.mutex);
++ 
++ 	mt7915_mcu_set_chan_info(phy, MCU_EXT_CMD(SET_RX_PATH));
++ }
++ 
++ static void
++ mt7915_tm_set_tx_frames(struct mt7915_phy *phy, bool en)
+++>>>>>>> c203dd621780 (mt76: mt7915: rework mcu API)
+  {
+  	static const u8 spe_idx_map[] = {0, 0, 1, 0, 3, 2, 4, 0,
+  					 9, 8, 6, 10, 16, 12, 18, 0};
+@@@ -227,17 -474,146 +454,155 @@@
+  }
+  
+  static void
+ -mt7915_tm_set_rx_frames(struct mt7915_phy *phy, bool en)
+ +mt7915_tm_set_rx_frames(struct mt7915_dev *dev, bool en)
+  {
+ -	if (en)
+ -		mt7915_tm_update_channel(phy);
+ +	if (en) {
+ +		mutex_unlock(&dev->mt76.mutex);
+ +		mt7915_set_channel(&dev->phy);
+ +		mutex_lock(&dev->mt76.mutex);
+ +
+++<<<<<<< HEAD
+ +		mt7915_mcu_set_chan_info(&dev->phy, MCU_EXT_CMD_SET_RX_PATH);
+ +	}
+  
+ +	mt7915_tm_set_trx(dev, &dev->phy, TM_MAC_RX_RXV, en);
+++=======
++ 	mt7915_tm_set_trx(phy, TM_MAC_RX_RXV, en);
++ }
++ 
++ static int
++ mt7915_tm_rf_switch_mode(struct mt7915_dev *dev, u32 oper)
++ {
++ 	struct mt7915_tm_rf_test req = {
++ 		.op.op_mode = cpu_to_le32(oper),
++ 	};
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), &req,
++ 				 sizeof(req), true);
++ }
++ 
++ static int
++ mt7915_tm_set_tx_cont(struct mt7915_phy *phy, bool en)
++ {
++ #define TX_CONT_START	0x05
++ #define TX_CONT_STOP	0x06
++ 	struct mt7915_dev *dev = phy->dev;
++ 	struct cfg80211_chan_def *chandef = &phy->mt76->chandef;
++ 	int freq1 = ieee80211_frequency_to_channel(chandef->center_freq1);
++ 	struct mt76_testmode_data *td = &phy->mt76->test;
++ 	u32 func_idx = en ? TX_CONT_START : TX_CONT_STOP;
++ 	u8 rate_idx = td->tx_rate_idx, mode;
++ 	u16 rateval;
++ 	struct mt7915_tm_rf_test req = {
++ 		.action = 1,
++ 		.icap_len = 120,
++ 		.op.rf.func_idx = cpu_to_le32(func_idx),
++ 	};
++ 	struct tm_tx_cont *tx_cont = &req.op.rf.param.tx_cont;
++ 
++ 	tx_cont->control_ch = chandef->chan->hw_value;
++ 	tx_cont->center_ch = freq1;
++ 	tx_cont->tx_ant = td->tx_antenna_mask;
++ 	tx_cont->band = phy != &dev->phy;
++ 
++ 	switch (chandef->width) {
++ 	case NL80211_CHAN_WIDTH_40:
++ 		tx_cont->bw = CMD_CBW_40MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_80:
++ 		tx_cont->bw = CMD_CBW_80MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_80P80:
++ 		tx_cont->bw = CMD_CBW_8080MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_160:
++ 		tx_cont->bw = CMD_CBW_160MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_5:
++ 		tx_cont->bw = CMD_CBW_5MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_10:
++ 		tx_cont->bw = CMD_CBW_10MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_20:
++ 		tx_cont->bw = CMD_CBW_20MHZ;
++ 		break;
++ 	case NL80211_CHAN_WIDTH_20_NOHT:
++ 		tx_cont->bw = CMD_CBW_20MHZ;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	if (!en) {
++ 		req.op.rf.param.func_data = cpu_to_le32(phy != &dev->phy);
++ 		goto out;
++ 	}
++ 
++ 	if (td->tx_rate_mode <= MT76_TM_TX_MODE_OFDM) {
++ 		struct ieee80211_supported_band *sband;
++ 		u8 idx = rate_idx;
++ 
++ 		if (chandef->chan->band == NL80211_BAND_5GHZ)
++ 			sband = &phy->mt76->sband_5g.sband;
++ 		else
++ 			sband = &phy->mt76->sband_2g.sband;
++ 
++ 		if (td->tx_rate_mode == MT76_TM_TX_MODE_OFDM)
++ 			idx += 4;
++ 		rate_idx = sband->bitrates[idx].hw_value & 0xff;
++ 	}
++ 
++ 	switch (td->tx_rate_mode) {
++ 	case MT76_TM_TX_MODE_CCK:
++ 		mode = MT_PHY_TYPE_CCK;
++ 		break;
++ 	case MT76_TM_TX_MODE_OFDM:
++ 		mode = MT_PHY_TYPE_OFDM;
++ 		break;
++ 	case MT76_TM_TX_MODE_HT:
++ 		mode = MT_PHY_TYPE_HT;
++ 		break;
++ 	case MT76_TM_TX_MODE_VHT:
++ 		mode = MT_PHY_TYPE_VHT;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_SU:
++ 		mode = MT_PHY_TYPE_HE_SU;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_EXT_SU:
++ 		mode = MT_PHY_TYPE_HE_EXT_SU;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_TB:
++ 		mode = MT_PHY_TYPE_HE_TB;
++ 		break;
++ 	case MT76_TM_TX_MODE_HE_MU:
++ 		mode = MT_PHY_TYPE_HE_MU;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	rateval =  mode << 6 | rate_idx;
++ 	tx_cont->rateval = cpu_to_le16(rateval);
++ 
++ out:
++ 	if (!en) {
++ 		int ret;
++ 
++ 		ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), &req,
++ 					sizeof(req), true);
++ 		if (ret)
++ 			return ret;
++ 
++ 		return mt7915_tm_rf_switch_mode(dev, RF_OPER_NORMAL);
++ 	}
++ 
++ 	mt7915_tm_rf_switch_mode(dev, RF_OPER_RF_TEST);
++ 	mt7915_tm_update_channel(phy);
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_TEST), &req,
++ 				 sizeof(req), true);
+++>>>>>>> c203dd621780 (mt76: mt7915: rework mcu API)
+  }
+  
+  static void
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7915/main.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7915/mcu.h b/drivers/net/wireless/mediatek/mt76/mt7915/mcu.h
+index 983973e5182c..885348a1d435 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/mcu.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/mcu.h
+@@ -217,6 +217,12 @@ enum {
+ 	MCU_S2D_H2CN
+ };
+ 
++
++#define __MCU_CMD_FIELD_ID	GENMASK(7, 0)
++#define __MCU_CMD_FIELD_EXT_ID	GENMASK(15, 8)
++#define __MCU_CMD_FIELD_QUERY	BIT(16)
++#define __MCU_CMD_FIELD_WA	BIT(17)
++
+ enum {
+ 	MCU_CMD_TARGET_ADDRESS_LEN_REQ = 0x01,
+ 	MCU_CMD_FW_START_REQ = 0x02,
+@@ -262,6 +268,15 @@ enum {
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
+ };
+ 
++#define MCU_CMD(_t)		FIELD_PREP(__MCU_CMD_FIELD_ID, MCU_CMD_##_t)
++#define MCU_EXT_CMD(_t)		(MCU_CMD(EXT_CID) | \
++				 FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, \
++					    MCU_EXT_CMD_##_t))
++#define MCU_EXT_QUERY(_t)	(MCU_EXT_CMD(_t) | __MCU_CMD_FIELD_QUERY)
++
++#define MCU_WA_CMD(_t)		(MCU_CMD(_t) | __MCU_CMD_FIELD_WA)
++#define MCU_WA_EXT_CMD(_t)	(MCU_EXT_CMD(_t) | __MCU_CMD_FIELD_WA)
++
+ enum {
+ 	PATCH_SEM_RELEASE,
+ 	PATCH_SEM_GET
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7915/testmode.c
