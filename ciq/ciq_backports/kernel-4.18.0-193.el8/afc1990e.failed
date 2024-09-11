@@ -1,0 +1,148 @@
+RDMA/core: Fix a WARN() message
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit afc1990e089f501d686bb95b98146fc7ba23347f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/afc1990e.failed
+
+The first parameter of WARN_ONCE() is a condition, then following
+parameters are the message.  In this case, we left out the condition so it
+will just print the ops->type string.
+
+Fixes: 3856ec4b93c9 ("RDMA/core: Add RDMA_NLDEV_CMD_NEWLINK/DELLINK support")
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Majd Dibbiny <majd@mellanox.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit afc1990e089f501d686bb95b98146fc7ba23347f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/nldev.c
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,11ed58d3fce5..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -1090,6 -1203,115 +1090,118 @@@ RES_GET_FUNCS(cq, RDMA_RESTRACK_CQ)
+  RES_GET_FUNCS(pd, RDMA_RESTRACK_PD);
+  RES_GET_FUNCS(mr, RDMA_RESTRACK_MR);
+  
+++<<<<<<< HEAD
+++=======
++ static LIST_HEAD(link_ops);
++ static DECLARE_RWSEM(link_ops_rwsem);
++ 
++ static const struct rdma_link_ops *link_ops_get(const char *type)
++ {
++ 	const struct rdma_link_ops *ops;
++ 
++ 	list_for_each_entry(ops, &link_ops, list) {
++ 		if (!strcmp(ops->type, type))
++ 			goto out;
++ 	}
++ 	ops = NULL;
++ out:
++ 	return ops;
++ }
++ 
++ void rdma_link_register(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	if (WARN_ON_ONCE(link_ops_get(ops->type)))
++ 		goto out;
++ 	list_add(&ops->list, &link_ops);
++ out:
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_register);
++ 
++ void rdma_link_unregister(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	list_del(&ops->list);
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_unregister);
++ 
++ static int nldev_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	char ibdev_name[IB_DEVICE_NAME_MAX];
++ 	const struct rdma_link_ops *ops;
++ 	char ndev_name[IFNAMSIZ];
++ 	struct net_device *ndev;
++ 	char type[IFNAMSIZ];
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_NAME] ||
++ 	    !tb[RDMA_NLDEV_ATTR_LINK_TYPE] || !tb[RDMA_NLDEV_ATTR_NDEV_NAME])
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(ibdev_name, tb[RDMA_NLDEV_ATTR_DEV_NAME],
++ 		    sizeof(ibdev_name));
++ 	if (strchr(ibdev_name, '%'))
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(type, tb[RDMA_NLDEV_ATTR_LINK_TYPE], sizeof(type));
++ 	nla_strlcpy(ndev_name, tb[RDMA_NLDEV_ATTR_NDEV_NAME],
++ 		    sizeof(ndev_name));
++ 
++ 	ndev = dev_get_by_name(&init_net, ndev_name);
++ 	if (!ndev)
++ 		return -ENODEV;
++ 
++ 	down_read(&link_ops_rwsem);
++ 	ops = link_ops_get(type);
++ #ifdef CONFIG_MODULES
++ 	if (!ops) {
++ 		up_read(&link_ops_rwsem);
++ 		request_module("rdma-link-%s", type);
++ 		down_read(&link_ops_rwsem);
++ 		ops = link_ops_get(type);
++ 	}
++ #endif
++ 	err = ops ? ops->newlink(ibdev_name, ndev) : -EINVAL;
++ 	up_read(&link_ops_rwsem);
++ 	dev_put(ndev);
++ 
++ 	return err;
++ }
++ 
++ static int nldev_dellink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct ib_device *device;
++ 	u32 index;
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_INDEX])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (!(device->attrs.device_cap_flags & IB_DEVICE_ALLOW_USER_UNREG)) {
++ 		ib_device_put(device);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ib_unregister_device_and_put(device);
++ 	return 0;
++ }
++ 
+++>>>>>>> afc1990e089f (RDMA/core: Fix a WARN() message)
+  static const struct rdma_nl_cbs nldev_cb_table[RDMA_NLDEV_NUM_OPS] = {
+  	[RDMA_NLDEV_CMD_GET] = {
+  		.doit = nldev_get_doit,
+* Unmerged path drivers/infiniband/core/nldev.c
