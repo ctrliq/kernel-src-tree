@@ -539,6 +539,7 @@ enum qeth_prot_versions {
 enum qeth_cmd_buffer_state {
 	BUF_STATE_FREE,
 	BUF_STATE_LOCKED,
+	BUF_STATE_MALLOC,
 };
 
 enum qeth_cq {
@@ -558,6 +559,7 @@ struct qeth_channel;
 
 struct qeth_cmd_buffer {
 	enum qeth_cmd_buffer_state state;
+	unsigned int length;
 	struct qeth_channel *channel;
 	struct qeth_reply *reply;
 	long timeout;
@@ -586,6 +588,13 @@ struct qeth_channel {
 	atomic_t irq_pending;
 	int io_buf_no;
 };
+
+static inline struct ccw1 *__ccw_from_cmd(struct qeth_cmd_buffer *iob)
+{
+	if (iob->state != BUF_STATE_MALLOC)
+		return iob->channel->ccw;
+	return (struct ccw1 *)(iob->data + ALIGN(iob->length, 8));
+}
 
 static inline bool qeth_trylock_channel(struct qeth_channel *channel)
 {
