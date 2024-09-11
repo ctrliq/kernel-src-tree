@@ -48,12 +48,6 @@ static void kernel_fpu_disable(void)
 	this_cpu_write(in_kernel_fpu, true);
 }
 
-static void kernel_fpu_enable(void)
-{
-	WARN_ON_FPU(!this_cpu_read(in_kernel_fpu));
-	this_cpu_write(in_kernel_fpu, false);
-}
-
 static bool kernel_fpu_disabled(void)
 {
 	return this_cpu_read(in_kernel_fpu);
@@ -120,11 +114,6 @@ static void __kernel_fpu_begin(void)
 		asm volatile ("fninit");
 }
 
-static void __kernel_fpu_end(void)
-{
-	kernel_fpu_enable();
-}
-
 void kernel_fpu_begin(void)
 {
 	preempt_disable();
@@ -134,7 +123,9 @@ EXPORT_SYMBOL_GPL(kernel_fpu_begin);
 
 void kernel_fpu_end(void)
 {
-	__kernel_fpu_end();
+	WARN_ON_FPU(!this_cpu_read(in_kernel_fpu));
+
+	this_cpu_write(in_kernel_fpu, false);
 	preempt_enable();
 }
 EXPORT_SYMBOL_GPL(kernel_fpu_end);
