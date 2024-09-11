@@ -182,12 +182,6 @@ retry:
 	order = get_order(bytes);
 
 	/*
-	 * IO TLB memory already allocated. Just use it.
-	 */
-	if (io_tlb_start != 0)
-		goto end;
-
-	/*
 	 * Get IO TLB memory from any location.
 	 */
 	if (early) {
@@ -241,7 +235,6 @@ retry:
 	} else
 		rc = swiotlb_late_init_with_tbl(start, nslabs);
 
-end:
 	if (!rc)
 		swiotlb_set_max_segment(PAGE_SIZE);
 
