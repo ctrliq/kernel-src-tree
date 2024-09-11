@@ -1,0 +1,91 @@
+nvme: prevent warning triggered by nvme_stop_keep_alive
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Nigel Kirkland <nigel.kirkland@broadcom.com>
+commit 97b2512ad000a409b4073dd1a71e4157d76675cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/97b2512a.failed
+
+Delayed keep alive work is queued on system workqueue and may be cancelled
+via nvme_stop_keep_alive from nvme_reset_wq, nvme_fc_wq or nvme_wq.
+
+Check_flush_dependency detects mismatched attributes between the work-queue
+context used to cancel the keep alive work and system-wq. Specifically
+system-wq does not have the WQ_MEM_RECLAIM flag, whereas the contexts used
+to cancel keep alive work have WQ_MEM_RECLAIM flag.
+
+Example warning:
+
+  workqueue: WQ_MEM_RECLAIM nvme-reset-wq:nvme_fc_reset_ctrl_work [nvme_fc]
+	is flushing !WQ_MEM_RECLAIM events:nvme_keep_alive_work [nvme_core]
+
+To avoid the flags mismatch, delayed keep alive work is queued on nvme_wq.
+
+However this creates a secondary concern where work and a request to cancel
+that work may be in the same work queue - namely err_work in the rdma and
+tcp transports, which will want to flush/cancel the keep alive work which
+will now be on nvme_wq.
+
+After reviewing the transports, it looks like err_work can be moved to
+nvme_reset_wq. In fact that aligns them better with transition into
+RESETTING and performing related reset work in nvme_reset_wq.
+
+Change nvme-rdma and nvme-tcp to perform err_work in nvme_reset_wq.
+
+	Signed-off-by: Nigel Kirkland <nigel.kirkland@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 97b2512ad000a409b4073dd1a71e4157d76675cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index cd49032171bb,7f05deada7f4..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -980,8 -1023,7 +980,12 @@@ static void nvme_start_keep_alive(struc
+  	if (unlikely(ctrl->kato == 0))
+  		return;
+  
+++<<<<<<< HEAD
+ +	ctrl->comp_seen = false;
+ +	schedule_delayed_work(&ctrl->ka_work, ctrl->kato * HZ);
+++=======
++ 	queue_delayed_work(nvme_wq, &ctrl->ka_work, ctrl->kato * HZ);
+++>>>>>>> 97b2512ad000 (nvme: prevent warning triggered by nvme_stop_keep_alive)
+  }
+  
+  void nvme_stop_keep_alive(struct nvme_ctrl *ctrl)
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 6a22a3430e5b..f1462a64b486 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1101,7 +1101,7 @@ static void nvme_rdma_error_recovery(struct nvme_rdma_ctrl *ctrl)
+ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RESETTING))
+ 		return;
+ 
+-	queue_work(nvme_wq, &ctrl->err_work);
++	queue_work(nvme_reset_wq, &ctrl->err_work);
+ }
+ 
+ static void nvme_rdma_wr_error(struct ib_cq *cq, struct ib_wc *wc,
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index 9f351b3075e3..d8dd5c610a66 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -420,7 +420,7 @@ static void nvme_tcp_error_recovery(struct nvme_ctrl *ctrl)
+ 	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_RESETTING))
+ 		return;
+ 
+-	queue_work(nvme_wq, &to_tcp_ctrl(ctrl)->err_work);
++	queue_work(nvme_reset_wq, &to_tcp_ctrl(ctrl)->err_work);
+ }
+ 
+ static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
