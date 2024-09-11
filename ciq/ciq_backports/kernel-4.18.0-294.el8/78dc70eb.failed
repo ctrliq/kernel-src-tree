@@ -1,0 +1,175 @@
+tcp_bbr: adapt cwnd based on ack aggregation estimation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Priyaranjan Jha <priyarjha@google.com>
+commit 78dc70ebaa38aa303274e333be6c98eef87619e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/78dc70eb.failed
+
+Aggregation effects are extremely common with wifi, cellular, and cable
+modem link technologies, ACK decimation in middleboxes, and LRO and GRO
+in receiving hosts. The aggregation can happen in either direction,
+data or ACKs, but in either case the aggregation effect is visible
+to the sender in the ACK stream.
+
+Previously BBR's sending was often limited by cwnd under severe ACK
+aggregation/decimation because BBR sized the cwnd at 2*BDP. If packets
+were acked in bursts after long delays (e.g. one ACK acking 5*BDP after
+5*RTT), BBR's sending was halted after sending 2*BDP over 2*RTT, leaving
+the bottleneck idle for potentially long periods. Note that loss-based
+congestion control does not have this issue because when facing
+aggregation it continues increasing cwnd after bursts of ACKs, growing
+cwnd until the buffer is full.
+
+To achieve good throughput in the presence of aggregation effects, this
+algorithm allows the BBR sender to put extra data in flight to keep the
+bottleneck utilized during silences in the ACK stream that it has evidence
+to suggest were caused by aggregation.
+
+A summary of the algorithm: when a burst of packets are acked by a
+stretched ACK or a burst of ACKs or both, BBR first estimates the expected
+amount of data that should have been acked, based on its estimated
+bandwidth. Then the surplus ("extra_acked") is recorded in a windowed-max
+filter to estimate the recent level of observed ACK aggregation. Then cwnd
+is increased by the ACK aggregation estimate. The larger cwnd avoids BBR
+being cwnd-limited in the face of ACK silences that recent history suggests
+were caused by aggregation. As a sanity check, the ACK aggregation degree
+is upper-bounded by the cwnd (at the time of measurement) and a global max
+of BW * 100ms. The algorithm is further described by the following
+presentation:
+https://datatracker.ietf.org/meeting/101/materials/slides-101-iccrg-an-update-on-bbr-work-at-google-00
+
+In our internal testing, we observed a significant increase in BBR
+throughput (measured using netperf), in a basic wifi setup.
+- Host1 (sender on ethernet) -> AP -> Host2 (receiver on wifi)
+- 2.4 GHz -> BBR before: ~73 Mbps; BBR after: ~102 Mbps; CUBIC: ~100 Mbps
+- 5.0 GHz -> BBR before: ~362 Mbps; BBR after: ~593 Mbps; CUBIC: ~601 Mbps
+
+Also, this code is running globally on YouTube TCP connections and produced
+significant bandwidth increases for YouTube traffic.
+
+This is based on Ian Swett's max_ack_height_ algorithm from the
+QUIC BBR implementation.
+
+	Signed-off-by: Priyaranjan Jha <priyarjha@google.com>
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 78dc70ebaa38aa303274e333be6c98eef87619e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_bbr.c
+diff --cc net/ipv4/tcp_bbr.c
+index fa143b97bd50,56be7d27f208..000000000000
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@@ -374,6 -403,66 +403,69 @@@ static u32 bbr_quantization_budget(stru
+  	return cwnd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Find inflight based on min RTT and the estimated bottleneck bandwidth. */
++ static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
++ {
++ 	u32 inflight;
++ 
++ 	inflight = bbr_bdp(sk, bw, gain);
++ 	inflight = bbr_quantization_budget(sk, inflight, gain);
++ 
++ 	return inflight;
++ }
++ 
++ /* With pacing at lower layers, there's often less data "in the network" than
++  * "in flight". With TSQ and departure time pacing at lower layers (e.g. fq),
++  * we often have several skbs queued in the pacing layer with a pre-scheduled
++  * earliest departure time (EDT). BBR adapts its pacing rate based on the
++  * inflight level that it estimates has already been "baked in" by previous
++  * departure time decisions. We calculate a rough estimate of the number of our
++  * packets that might be in the network at the earliest departure time for the
++  * next skb scheduled:
++  *   in_network_at_edt = inflight_at_edt - (EDT - now) * bw
++  * If we're increasing inflight, then we want to know if the transmit of the
++  * EDT skb will push inflight above the target, so inflight_at_edt includes
++  * bbr_tso_segs_goal() from the skb departing at EDT. If decreasing inflight,
++  * then estimate if inflight will sink too low just before the EDT transmit.
++  */
++ static u32 bbr_packets_in_net_at_edt(struct sock *sk, u32 inflight_now)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 	struct bbr *bbr = inet_csk_ca(sk);
++ 	u64 now_ns, edt_ns, interval_us;
++ 	u32 interval_delivered, inflight_at_edt;
++ 
++ 	now_ns = tp->tcp_clock_cache;
++ 	edt_ns = max(tp->tcp_wstamp_ns, now_ns);
++ 	interval_us = div_u64(edt_ns - now_ns, NSEC_PER_USEC);
++ 	interval_delivered = (u64)bbr_bw(sk) * interval_us >> BW_SCALE;
++ 	inflight_at_edt = inflight_now;
++ 	if (bbr->pacing_gain > BBR_UNIT)              /* increasing inflight */
++ 		inflight_at_edt += bbr_tso_segs_goal(sk);  /* include EDT skb */
++ 	if (interval_delivered >= inflight_at_edt)
++ 		return 0;
++ 	return inflight_at_edt - interval_delivered;
++ }
++ 
++ /* Find the cwnd increment based on estimate of ack aggregation */
++ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
++ {
++ 	u32 max_aggr_cwnd, aggr_cwnd = 0;
++ 
++ 	if (bbr_extra_acked_gain && bbr_full_bw_reached(sk)) {
++ 		max_aggr_cwnd = ((u64)bbr_bw(sk) * bbr_extra_acked_max_us)
++ 				/ BW_UNIT;
++ 		aggr_cwnd = (bbr_extra_acked_gain * bbr_extra_acked(sk))
++ 			     >> BBR_SCALE;
++ 		aggr_cwnd = min(aggr_cwnd, max_aggr_cwnd);
++ 	}
++ 
++ 	return aggr_cwnd;
++ }
++ 
+++>>>>>>> 78dc70ebaa38 (tcp_bbr: adapt cwnd based on ack aggregation estimation)
+  /* An optimization in BBR to reduce losses: On the first round of recovery, we
+   * follow the packet conservation principle: send P packets per P packets acked.
+   * After that, we slow-start and send at most 2*P packets per P packets acked.
+@@@ -445,9 -523,15 +537,19 @@@ static void bbr_set_cwnd(struct sock *s
+  	if (bbr_set_cwnd_to_recover_or_restore(sk, rs, acked, &cwnd))
+  		goto done;
+  
+- 	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
+  	target_cwnd = bbr_bdp(sk, bw, gain);
+++<<<<<<< HEAD
+ +	target_cwnd = bbr_quantization_budget(sk, target_cwnd);
+++=======
++ 
++ 	/* Increment the cwnd to account for excess ACKed data that seems
++ 	 * due to aggregation (of data and/or ACKs) visible in the ACK stream.
++ 	 */
++ 	target_cwnd += bbr_ack_aggregation_cwnd(sk);
++ 	target_cwnd = bbr_quantization_budget(sk, target_cwnd, gain);
++ 
++ 	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
+++>>>>>>> 78dc70ebaa38 (tcp_bbr: adapt cwnd based on ack aggregation estimation)
+  	if (bbr_full_bw_reached(sk))  /* only cut cwnd if we filled the pipe */
+  		cwnd = min(cwnd + acked, target_cwnd);
+  	else if (cwnd < target_cwnd || tp->delivered < TCP_INIT_CWND)
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index bcfefea637b6..555914c56834 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -138,8 +138,8 @@ struct inet_connection_sock {
+ 	} icsk_mtup;
+ 	u32			  icsk_user_timeout;
+ 
+-	u64			  icsk_ca_priv[88 / sizeof(u64)];
+-#define ICSK_CA_PRIV_SIZE      (11 * sizeof(u64))
++	u64			  icsk_ca_priv[104 / sizeof(u64)];
++#define ICSK_CA_PRIV_SIZE      (13 * sizeof(u64))
+ };
+ 
+ #define ICSK_TIME_RETRANS	1	/* Retransmit timer */
+* Unmerged path net/ipv4/tcp_bbr.c
