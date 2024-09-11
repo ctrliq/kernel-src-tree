@@ -1,0 +1,157 @@
+x86/msi: Move compose message callback where it belongs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] msi: Move compose message callback where it belongs (Vitaly Kuznetsov) [1903823]
+Rebuild_FUZZ: 96.23%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit b0a19555efd098183db0ee3ad52a3cd3bfbd1ba2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b0a19555.failed
+
+Composing the MSI message at the MSI chip level is wrong because the
+underlying parent domain is the one which knows how the message should be
+composed for the direct vector delivery or the interrupt remapping table
+entry.
+
+The interrupt remapping aware PCI/MSI chip does that already. Make the
+direct delivery chip do the same and move the composition of the direct
+delivery MSI message to the vector domain irq chip.
+
+This prepares for the upcoming device MSI support to avoid having
+architecture specific knowledge in the device MSI domain irq chips.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20200826112331.157603198@linutronix.de
+
+(cherry picked from commit b0a19555efd098183db0ee3ad52a3cd3bfbd1ba2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/apic.h
+diff --cc arch/x86/include/asm/apic.h
+index 988121175909,1c129abb7f09..000000000000
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@@ -516,42 -513,19 +516,52 @@@ extern int default_check_phys_apicid_pr
+  
+  #ifdef CONFIG_SMP
+  bool apic_id_is_primary_thread(unsigned int id);
+ -void apic_smt_update(void);
+  #else
+  static inline bool apic_id_is_primary_thread(unsigned int id) { return false; }
+ -static inline void apic_smt_update(void) { }
+  #endif
+  
+++<<<<<<< HEAD
+ +extern void irq_enter(void);
+ +extern void irq_exit(void);
+ +
+ +static inline void entering_irq(void)
+ +{
+ +	irq_enter();
+ +	kvm_set_cpu_l1tf_flush_l1d();
+ +}
+ +
+ +static inline void entering_ack_irq(void)
+ +{
+ +	entering_irq();
+ +	ack_APIC_irq();
+ +}
+ +
+ +static inline void ipi_entering_ack_irq(void)
+ +{
+ +	irq_enter();
+ +	ack_APIC_irq();
+ +	kvm_set_cpu_l1tf_flush_l1d();
+ +}
+ +
+ +static inline void exiting_irq(void)
+ +{
+ +	irq_exit();
+ +}
+ +
+ +static inline void exiting_ack_irq(void)
+ +{
+ +	ack_APIC_irq();
+ +	irq_exit();
+ +}
+++=======
++ struct msi_msg;
++ 
++ #ifdef CONFIG_PCI_MSI
++ void x86_vector_msi_compose_msg(struct irq_data *data, struct msi_msg *msg);
++ #else
++ # define x86_vector_msi_compose_msg NULL
++ #endif
+++>>>>>>> b0a19555efd0 (x86/msi: Move compose message callback where it belongs)
+  
+  extern void ioapic_zap_locks(void);
+  
+* Unmerged path arch/x86/include/asm/apic.h
+diff --git a/arch/x86/kernel/apic/msi.c b/arch/x86/kernel/apic/msi.c
+index b97f36407a88..8dd3a043fe0c 100644
+--- a/arch/x86/kernel/apic/msi.c
++++ b/arch/x86/kernel/apic/msi.c
+@@ -48,7 +48,7 @@ static void __irq_msi_compose_msg(struct irq_cfg *cfg, struct msi_msg *msg)
+ 		MSI_DATA_VECTOR(cfg->vector);
+ }
+ 
+-static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
++void x86_vector_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+ {
+ 	__irq_msi_compose_msg(irqd_cfg(data), msg);
+ }
+@@ -179,7 +179,6 @@ static struct irq_chip pci_msi_controller = {
+ 	.irq_mask		= pci_msi_mask_irq,
+ 	.irq_ack		= irq_chip_ack_parent,
+ 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+-	.irq_compose_msi_msg	= irq_msi_compose_msg,
+ 	.irq_set_affinity	= msi_set_affinity,
+ 	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+@@ -321,7 +320,6 @@ static struct irq_chip dmar_msi_controller = {
+ 	.irq_ack		= irq_chip_ack_parent,
+ 	.irq_set_affinity	= msi_domain_set_affinity,
+ 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+-	.irq_compose_msi_msg	= irq_msi_compose_msg,
+ 	.irq_write_msi_msg	= dmar_msi_write_msg,
+ 	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+@@ -418,7 +416,6 @@ static struct irq_chip hpet_msi_controller __ro_after_init = {
+ 	.irq_ack = irq_chip_ack_parent,
+ 	.irq_set_affinity = msi_domain_set_affinity,
+ 	.irq_retrigger = irq_chip_retrigger_hierarchy,
+-	.irq_compose_msi_msg = irq_msi_compose_msg,
+ 	.irq_write_msi_msg = hpet_msi_write_msg,
+ 	.flags = IRQCHIP_SKIP_SET_WAKE,
+ };
+@@ -478,13 +475,10 @@ struct irq_domain *hpet_create_irq_domain(int hpet_id)
+ 	info.type = X86_IRQ_ALLOC_TYPE_HPET;
+ 	info.hpet_id = hpet_id;
+ 	parent = irq_remapping_get_ir_irq_domain(&info);
+-	if (parent == NULL) {
++	if (parent == NULL)
+ 		parent = x86_vector_domain;
+-	} else {
++	else
+ 		hpet_msi_controller.name = "IR-HPET-MSI";
+-		/* Temporary fix: Will go away */
+-		hpet_msi_controller.irq_compose_msi_msg = NULL;
+-	}
+ 
+ 	fn = irq_domain_alloc_named_id_fwnode(hpet_msi_controller.name,
+ 					      hpet_id);
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index 6867afa5d6e0..e3e199d3b6af 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -843,6 +843,7 @@ static struct irq_chip lapic_controller = {
+ 	.name			= "APIC",
+ 	.irq_ack		= apic_ack_edge,
+ 	.irq_set_affinity	= apic_set_affinity,
++	.irq_compose_msi_msg	= x86_vector_msi_compose_msg,
+ 	.irq_retrigger		= apic_retrigger_irq,
+ };
+ 
