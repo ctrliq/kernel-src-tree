@@ -1,0 +1,124 @@
+RDMA/rxe: Remove references to ib_device and pool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit 6cde3e8ec16f8318bab119ad1e16dd90677bc897
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/6cde3e8e.failed
+
+rxe_pool.c takes references to the pool and ib_device structs for each
+object allocated and also keeps an atomic num_elem count in each
+pool. This is more work than is needed. Pool allocation is only called
+from verbs APIs which already have references to ib_device and pools are
+only diasbled when the driver is removed so no protection of the pool
+addresses are needed. The elem count is used to warn if elements are still
+present in a pool when it is cleaned up which is useful.
+
+This patch eliminates the references to the ib_device and pool structs.
+
+Link: https://lore.kernel.org/r/20210125211641.2694-5-rpearson@hpe.com
+	Signed-off-by: Bob Pearson <rpearson@hpe.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 6cde3e8ec16f8318bab119ad1e16dd90677bc897)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_pool.c
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.c
+index 3727f20dbe87,5f85a90e5a5a..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@@ -365,23 -322,48 +351,55 @@@ void __rxe_drop_index(struct rxe_pool_e
+  	write_unlock_irqrestore(&pool->pool_lock, flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void *rxe_alloc_locked(struct rxe_pool *pool)
++ {
++ 	struct rxe_type_info *info = &rxe_type_info[pool->type];
++ 	struct rxe_pool_entry *elem;
++ 	u8 *obj;
++ 
++ 	if (pool->state != RXE_POOL_STATE_VALID)
++ 		return NULL;
++ 
++ 	if (atomic_inc_return(&pool->num_elem) > pool->max_elem)
++ 		goto out_cnt;
++ 
++ 	obj = kzalloc(info->size, GFP_ATOMIC);
++ 	if (!obj)
++ 		goto out_cnt;
++ 
++ 	elem = (struct rxe_pool_entry *)(obj + info->elem_offset);
++ 
++ 	elem->pool = pool;
++ 	kref_init(&elem->ref_cnt);
++ 
++ 	return obj;
++ 
++ out_cnt:
++ 	atomic_dec(&pool->num_elem);
++ 	return NULL;
++ }
++ 
+++>>>>>>> 6cde3e8ec16f (RDMA/rxe: Remove references to ib_device and pool)
+  void *rxe_alloc(struct rxe_pool *pool)
+  {
+ -	unsigned long flags;
+ -	struct rxe_type_info *info = &rxe_type_info[pool->type];
+  	struct rxe_pool_entry *elem;
+ -	u8 *obj;
+ +	unsigned long flags;
+ +
+ +	might_sleep_if(!(pool->flags & RXE_POOL_ATOMIC));
+  
+  	read_lock_irqsave(&pool->pool_lock, flags);
+  	if (pool->state != RXE_POOL_STATE_VALID) {
+  		read_unlock_irqrestore(&pool->pool_lock, flags);
+  		return NULL;
+  	}
+++<<<<<<< HEAD
+ +	kref_get(&pool->ref_cnt);
+- 	read_unlock_irqrestore(&pool->pool_lock, flags);
+++=======
+  
+- 	if (!ib_device_try_get(&pool->rxe->ib_dev))
+- 		goto out_put_pool;
+++>>>>>>> 6cde3e8ec16f (RDMA/rxe: Remove references to ib_device and pool)
++ 	read_unlock_irqrestore(&pool->pool_lock, flags);
+  
+  	if (atomic_inc_return(&pool->num_elem) > pool->max_elem)
+  		goto out_cnt;
+@@@ -447,11 -419,12 +455,9 @@@ void rxe_elem_release(struct kref *kref
+  	if (pool->cleanup)
+  		pool->cleanup(elem);
+  
+ -	if (!(pool->flags & RXE_POOL_NO_ALLOC)) {
+ -		obj = (u8 *)elem - info->elem_offset;
+ -		kfree(obj);
+ -	}
+ -
+ +	if (!(pool->flags & RXE_POOL_NO_ALLOC))
+ +		kmem_cache_free(pool_cache(pool), elem);
+  	atomic_dec(&pool->num_elem);
+- 	ib_device_put(&pool->rxe->ib_dev);
+- 	rxe_pool_put(pool);
+  }
+  
+  void *rxe_pool_get_index(struct rxe_pool *pool, u32 index)
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_pool.h b/drivers/infiniband/sw/rxe/rxe_pool.h
+index e1a24bca99de..02fe58320556 100644
+--- a/drivers/infiniband/sw/rxe/rxe_pool.h
++++ b/drivers/infiniband/sw/rxe/rxe_pool.h
+@@ -70,7 +70,6 @@ struct rxe_pool {
+ 	struct rxe_dev		*rxe;
+ 	rwlock_t		pool_lock; /* protects pool add/del/search */
+ 	size_t			elem_size;
+-	struct kref		ref_cnt;
+ 	void			(*cleanup)(struct rxe_pool_entry *obj);
+ 	enum rxe_pool_state	state;
+ 	enum rxe_pool_flags	flags;
