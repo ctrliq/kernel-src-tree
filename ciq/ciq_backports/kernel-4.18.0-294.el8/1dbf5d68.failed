@@ -1,0 +1,89 @@
+KVM: VMX: Add guest physical address check in EPT violation and misconfig
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mohammed Gamal <mgamal@redhat.com>
+commit 1dbf5d68af6ffdb1c8b0d38ee565768e22e2c3ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1dbf5d68.failed
+
+Check guest physical address against its maximum, which depends on the
+guest MAXPHYADDR. If the guest's physical address exceeds the
+maximum (i.e. has reserved bits set), inject a guest page fault with
+PFERR_RSVD_MASK set.
+
+This has to be done both in the EPT violation and page fault paths, as
+there are complications in both cases with respect to the computation
+of the correct error code.
+
+For EPT violations, unfortunately the only possibility is to emulate,
+because the access type in the exit qualification might refer to an
+access to a paging structure, rather than to the access performed by
+the program.
+
+Trapping page faults instead is needed in order to correct the error code,
+but the access type can be obtained from the original error code and
+passed to gva_to_gpa.  The corrections required in the error code are
+subtle. For example, imagine that a PTE for a supervisor page has a reserved
+bit set.  On a supervisor-mode access, the EPT violation path would trigger.
+However, on a user-mode access, the processor will not notice the reserved
+bit and not include PFERR_RSVD_MASK in the error code.
+
+Co-developed-by: Mohammed Gamal <mgamal@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20200710154811.418214-8-mgamal@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1dbf5d68af6ffdb1c8b0d38ee565768e22e2c3ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 236befaa0ef3,5518f75c9b19..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -4790,9 -4791,15 +4790,21 @@@ static int handle_exception_nmi(struct 
+  
+  	if (is_page_fault(intr_info)) {
+  		cr2 = vmx_get_exit_qual(vcpu);
+++<<<<<<< HEAD
+ +		/* EPT won't cause page fault directly */
+ +		WARN_ON_ONCE(!vcpu->arch.apf.host_apf_reason && enable_ept);
+ +		return kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0);
+++=======
++ 		if (enable_ept && !vcpu->arch.apf.host_apf_flags) {
++ 			/*
++ 			 * EPT will cause page fault only if we need to
++ 			 * detect illegal GPAs.
++ 			 */
++ 			kvm_fixup_and_inject_pf_error(vcpu, cr2, error_code);
++ 			return 1;
++ 		} else
++ 			return kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0);
+++>>>>>>> 1dbf5d68af6f (KVM: VMX: Add guest physical address check in EPT violation and misconfig)
+  	}
+  
+  	ex_no = intr_info & INTR_INFO_VECTOR_MASK;
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 405c3bc71f7d..d4720d3b7182 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -11,6 +11,7 @@
+ #include "kvm_cache_regs.h"
+ #include "ops.h"
+ #include "vmcs.h"
++#include "cpuid.h"
+ 
+ extern const u32 vmx_msr_index[];
+ 
+@@ -555,7 +556,7 @@ static inline bool vmx_has_waitpkg(struct vcpu_vmx *vmx)
+ 
+ static inline bool vmx_need_pf_intercept(struct kvm_vcpu *vcpu)
+ {
+-	return !enable_ept;
++	return !enable_ept || cpuid_maxphyaddr(vcpu) < boot_cpu_data.x86_phys_bits;
+ }
+ 
+ void dump_vmcs(void);
