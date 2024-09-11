@@ -1,0 +1,147 @@
+net: phy: improve pause handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit 22c0ef6b1475aef4765efc4aa764b8580018123c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/22c0ef6b.failed
+
+When probing the phy device we set sym and asym pause in the "supported"
+bitmap (unless the PHY tells us otherwise). However we don't know yet
+whether the MAC supports pause. Simply copying phy->supported to
+phy->advertising will trigger advertising pause, and that's not
+what we want. Therefore add phy_advertise_supported() that copies all
+modes but doesn't touch the pause bits.
+
+In phy_support_(a)sym_pause we shouldn't set any bits in the supported
+bitmap because we may set a bit the PHY intentionally disabled.
+Effective pause support should be the AND-combined PHY and MAC pause
+capabilities. If the MAC supports everything, then it's only relevant
+what the PHY supports. If MAC supports sym pause only, then we have to
+clear the asym bit in phydev->supported.
+Copy the pause flags only and don't touch the modes, because a driver
+may have intentionally removed a mode from phydev->advertising.
+
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 22c0ef6b1475aef4765efc4aa764b8580018123c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/fixed_phy.c
+diff --cc drivers/net/phy/fixed_phy.c
+index be93c55c899c,3ffe46df249e..000000000000
+--- a/drivers/net/phy/fixed_phy.c
++++ b/drivers/net/phy/fixed_phy.c
+@@@ -242,6 -301,8 +242,11 @@@ struct phy_device *fixed_phy_register(u
+  				 phy->supported);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	phy_advertise_supported(phy);
++ 
+++>>>>>>> 22c0ef6b1475 (net: phy: improve pause handling)
+  	ret = phy_device_register(phy);
+  	if (ret) {
+  		phy_device_free(phy);
+* Unmerged path drivers/net/phy/fixed_phy.c
+diff --git a/drivers/net/phy/phy-core.c b/drivers/net/phy/phy-core.c
+index 0017cdb8c9fa..b146a535223d 100644
+--- a/drivers/net/phy/phy-core.c
++++ b/drivers/net/phy/phy-core.c
+@@ -366,7 +366,7 @@ int phy_set_max_speed(struct phy_device *phydev, u32 max_speed)
+ 	if (err)
+ 		return err;
+ 
+-	linkmode_copy(phydev->advertising, phydev->supported);
++	phy_advertise_supported(phydev);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/phy/phy_device.c b/drivers/net/phy/phy_device.c
+index adee25896926..e49e4799b779 100644
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -1957,10 +1957,35 @@ EXPORT_SYMBOL(genphy_loopback);
+ void phy_remove_link_mode(struct phy_device *phydev, u32 link_mode)
+ {
+ 	linkmode_clear_bit(link_mode, phydev->supported);
+-	linkmode_copy(phydev->advertising, phydev->supported);
++	phy_advertise_supported(phydev);
+ }
+ EXPORT_SYMBOL(phy_remove_link_mode);
+ 
++static void phy_copy_pause_bits(unsigned long *dst, unsigned long *src)
++{
++	linkmode_mod_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, dst,
++		linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, src));
++	linkmode_mod_bit(ETHTOOL_LINK_MODE_Pause_BIT, dst,
++		linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT, src));
++}
++
++/**
++ * phy_advertise_supported - Advertise all supported modes
++ * @phydev: target phy_device struct
++ *
++ * Description: Called to advertise all supported modes, doesn't touch
++ * pause mode advertising.
++ */
++void phy_advertise_supported(struct phy_device *phydev)
++{
++	__ETHTOOL_DECLARE_LINK_MODE_MASK(new);
++
++	linkmode_copy(new, phydev->supported);
++	phy_copy_pause_bits(new, phydev->advertising);
++	linkmode_copy(phydev->advertising, new);
++}
++EXPORT_SYMBOL(phy_advertise_supported);
++
+ /**
+  * phy_support_sym_pause - Enable support of symmetrical pause
+  * @phydev: target phy_device struct
+@@ -1971,8 +1996,7 @@ EXPORT_SYMBOL(phy_remove_link_mode);
+ void phy_support_sym_pause(struct phy_device *phydev)
+ {
+ 	linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->supported);
+-	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->supported);
+-	linkmode_copy(phydev->advertising, phydev->supported);
++	phy_copy_pause_bits(phydev->advertising, phydev->supported);
+ }
+ EXPORT_SYMBOL(phy_support_sym_pause);
+ 
+@@ -1984,9 +2008,7 @@ EXPORT_SYMBOL(phy_support_sym_pause);
+  */
+ void phy_support_asym_pause(struct phy_device *phydev)
+ {
+-	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->supported);
+-	linkmode_set_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->supported);
+-	linkmode_copy(phydev->advertising, phydev->supported);
++	phy_copy_pause_bits(phydev->advertising, phydev->supported);
+ }
+ EXPORT_SYMBOL(phy_support_asym_pause);
+ 
+@@ -2161,7 +2183,7 @@ static int phy_probe(struct device *dev)
+ 		goto out;
+ 
+ 	of_set_phy_supported(phydev);
+-	linkmode_copy(phydev->advertising, phydev->supported);
++	phy_advertise_supported(phydev);
+ 
+ 	/* Get the EEE modes we want to prohibit. We will ask
+ 	 * the PHY stop advertising these mode later on
+diff --git a/include/linux/phy.h b/include/linux/phy.h
+index 6890feedaa9c..d3bffd4770fb 100644
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -1112,6 +1112,7 @@ int phy_start_interrupts(struct phy_device *phydev);
+ void phy_print_status(struct phy_device *phydev);
+ int phy_set_max_speed(struct phy_device *phydev, u32 max_speed);
+ void phy_remove_link_mode(struct phy_device *phydev, u32 link_mode);
++void phy_advertise_supported(struct phy_device *phydev);
+ void phy_support_sym_pause(struct phy_device *phydev);
+ void phy_support_asym_pause(struct phy_device *phydev);
+ void phy_set_sym_pause(struct phy_device *phydev, bool rx, bool tx,
