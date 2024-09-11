@@ -1,0 +1,134 @@
+net/mlx5: Use a single IRQ for all async EQs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Use a single IRQ for all async EQs (Alaa Hleihel) [1724308 1724336]
+Rebuild_FUZZ: 95.24%
+commit-author Ariel Levkovich <lariel@mellanox.com>
+commit 81bfa206032a67f0700459a64a5493c246629604
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/81bfa206.failed
+
+The patch modifies the IRQ allocation so that all async EQs are
+assigned to the same IRQ resulting in more available IRQs for
+completion EQs.
+
+The changes are using the support for IRQ sharing and EQ polling budget
+that was introduced in previous patches so when the shared interrupt is
+triggered, the kernel will serially call the handler of each of the
+sharing EQs with a certain budget of EQEs to poll in order to prevent
+starvation.
+
+	Signed-off-by: Ariel Levkovich <lariel@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 81bfa206032a67f0700459a64a5493c246629604)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eq.c
+#	drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index c00cfa7a9ba0,0f5846a34928..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@@ -887,15 -729,10 +888,20 @@@ static int create_comp_eqs(struct mlx5_
+  	int i;
+  
+  	INIT_LIST_HEAD(&table->comp_eqs_list);
+ -	ncomp_eqs = table->num_comp_eqs;
+ +	ncomp_vec = table->num_comp_vectors;
+  	nent = MLX5_COMP_EQ_SIZE;
+++<<<<<<< HEAD
+ +#ifdef CONFIG_RFS_ACCEL
+ +	table->rmap = alloc_irq_cpu_rmap(ncomp_vec);
+ +	if (!table->rmap)
+ +		return -ENOMEM;
+ +#endif
+ +	for (i = 0; i < ncomp_vec; i++) {
+ +		int vecidx = i + MLX5_EQ_VEC_COMP_BASE;
+++=======
++ 	for (i = 0; i < ncomp_eqs; i++) {
++ 		int vecidx = i + MLX5_IRQ_VEC_COMP_BASE;
+++>>>>>>> 81bfa206032a (net/mlx5: Use a single IRQ for all async EQs)
+  		struct mlx5_eq_param param = {};
+  
+  		eq = kzalloc(sizeof(*eq), GFP_KERNEL);
+@@@ -910,12 -747,9 +916,12 @@@
+  		tasklet_init(&eq->tasklet_ctx.task, mlx5_cq_tasklet_cb,
+  			     (unsigned long)&eq->tasklet_ctx);
+  
+ +#ifdef CONFIG_RFS_ACCEL
+ +		irq_cpu_rmap_add(table->rmap, pci_irq_vector(dev->pdev, vecidx));
+ +#endif
+  		eq->irq_nb.notifier_call = mlx5_eq_comp_int;
+  		param = (struct mlx5_eq_param) {
+- 			.index = vecidx,
++ 			.irq_index = vecidx,
+  			.mask = 0,
+  			.nent = nent,
+  			.nb = &eq->irq_nb,
+@@@ -973,8 -801,10 +979,15 @@@ EXPORT_SYMBOL(mlx5_comp_vectors_count)
+  struct cpumask *
+  mlx5_comp_irq_get_affinity_mask(struct mlx5_core_dev *dev, int vector)
+  {
+++<<<<<<< HEAD
+ +	/* TODO: consider irq_get_affinity_mask(irq) */
+ +	return dev->priv.eq_table->irq_info[vector + MLX5_EQ_VEC_COMP_BASE].mask;
+++=======
++ 	int vecidx = vector + MLX5_IRQ_VEC_COMP_BASE;
++ 
++ 	return mlx5_irq_get_affinity_mask(dev->priv.eq_table->irq_table,
++ 					  vecidx);
+++>>>>>>> 81bfa206032a (net/mlx5: Use a single IRQ for all async EQs)
+  }
+  EXPORT_SYMBOL(mlx5_comp_irq_get_affinity_mask);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
+diff --git a/drivers/infiniband/hw/mlx5/odp.c b/drivers/infiniband/hw/mlx5/odp.c
+index 48a5074fbdc2..0f7e0c2331a0 100644
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@ -1556,7 +1556,7 @@ mlx5_ib_create_pf_eq(struct mlx5_ib_dev *dev, struct mlx5_ib_pf_eq *eq)
+ 
+ 	eq->irq_nb.notifier_call = mlx5_ib_eq_pf_int;
+ 	param = (struct mlx5_eq_param) {
+-		.index = MLX5_EQ_PFAULT_IDX,
++		.irq_index = 0,
+ 		.mask = 1 << MLX5_EVENT_TYPE_PAGE_FAULT,
+ 		.nent = MLX5_IB_NUM_PF_EQE,
+ 		.nb = &eq->irq_nb,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eq.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/pci_irq.c
+diff --git a/include/linux/mlx5/eq.h b/include/linux/mlx5/eq.h
+index 73ab658af764..4a94e04eff0a 100644
+--- a/include/linux/mlx5/eq.h
++++ b/include/linux/mlx5/eq.h
+@@ -4,17 +4,7 @@
+ #ifndef MLX5_CORE_EQ_H
+ #define MLX5_CORE_EQ_H
+ 
+-enum {
+-	MLX5_EQ_PAGEREQ_IDX        = 0,
+-	MLX5_EQ_CMD_IDX            = 1,
+-	MLX5_EQ_ASYNC_IDX          = 2,
+-	/* reserved to be used by mlx5_core ulps (mlx5e/mlx5_ib) */
+-	MLX5_EQ_PFAULT_IDX         = 3,
+-	MLX5_EQ_MAX_ASYNC_EQS,
+-	/* completion eqs vector indices start here */
+-	MLX5_EQ_VEC_COMP_BASE = MLX5_EQ_MAX_ASYNC_EQS,
+-};
+-
++#define MLX5_IRQ_VEC_COMP_BASE 1
+ #define MLX5_NUM_CMD_EQE   (32)
+ #define MLX5_NUM_ASYNC_EQE (0x1000)
+ #define MLX5_NUM_SPARE_EQE (0x80)
+@@ -23,7 +13,7 @@ struct mlx5_eq;
+ struct mlx5_core_dev;
+ 
+ struct mlx5_eq_param {
+-	u8             index;
++	u8             irq_index;
+ 	int            nent;
+ 	u64            mask;
+ 	struct notifier_block *nb;
