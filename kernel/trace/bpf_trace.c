@@ -1345,6 +1345,20 @@ int bpf_get_perf_event_info(const struct perf_event *event, u32 *prog_id,
 	return err;
 }
 
+static int __init send_signal_irq_work_init(void)
+{
+	int cpu;
+	struct send_signal_irq_work *work;
+
+	for_each_possible_cpu(cpu) {
+		work = per_cpu_ptr(&send_signal_work, cpu);
+		init_irq_work(&work->irq_work, do_bpf_send_signal);
+	}
+	return 0;
+}
+
+subsys_initcall(send_signal_irq_work_init);
+
 #ifdef CONFIG_MODULES
 static int bpf_event_notify(struct notifier_block *nb, unsigned long op,
 			    void *module)
