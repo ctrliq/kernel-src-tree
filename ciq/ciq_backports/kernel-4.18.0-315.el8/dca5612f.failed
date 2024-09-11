@@ -1,0 +1,297 @@
+libbpf: Add perf_buffer APIs for better integration with outside epoll loop
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit dca5612f8eb9d0cf1dc254eb2adff1f16a588a7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/dca5612f.failed
+
+Add a set of APIs to perf_buffer manage to allow applications to integrate
+perf buffer polling into existing epoll-based infrastructure. One example is
+applications using libevent already and wanting to plug perf_buffer polling,
+instead of relying on perf_buffer__poll() and waste an extra thread to do it.
+But perf_buffer is still extremely useful to set up and consume perf buffer
+rings even for such use cases.
+
+So to accomodate such new use cases, add three new APIs:
+  - perf_buffer__buffer_cnt() returns number of per-CPU buffers maintained by
+    given instance of perf_buffer manager;
+  - perf_buffer__buffer_fd() returns FD of perf_event corresponding to
+    a specified per-CPU buffer; this FD is then polled independently;
+  - perf_buffer__consume_buffer() consumes data from single per-CPU buffer,
+    identified by its slot index.
+
+To support a simpler, but less efficient, way to integrate perf_buffer into
+external polling logic, also expose underlying epoll FD through
+perf_buffer__epoll_fd() API. It will need to be followed by
+perf_buffer__poll(), wasting extra syscall, or perf_buffer__consume(), wasting
+CPU to iterate buffers with no data. But could be simpler and more convenient
+for some cases.
+
+These APIs allow for great flexiblity, but do not sacrifice general usability
+of perf_buffer.
+
+Also exercise and check new APIs in perf_buffer selftest.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Alan Maguire <alan.maguire@oracle.com>
+Link: https://lore.kernel.org/bpf/20200821165927.849538-1-andriin@fb.com
+(cherry picked from commit dca5612f8eb9d0cf1dc254eb2adff1f16a588a7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.map
+index 0db77fbd2de9,66a6286d0716..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -334,30 -302,8 +334,37 @@@ LIBBPF_0.1.0 
+  
+  LIBBPF_0.2.0 {
+  	global:
+++<<<<<<< HEAD
+ +		bpf_program__attach_freplace;
+ +		btf__add_array;
+ +		btf__add_const;
+ +		btf__add_enum;
+ +		btf__add_enum_value;
+ +		btf__add_datasec;
+ +		btf__add_datasec_var_info;
+ +		btf__add_field;
+ +		btf__add_func;
+ +		btf__add_func_param;
+ +		btf__add_func_proto;
+ +		btf__add_fwd;
+ +		btf__add_int;
+ +		btf__add_ptr;
+ +		btf__add_restrict;
+ +		btf__add_str;
+ +		btf__add_struct;
+ +		btf__add_typedef;
+ +		btf__add_union;
+ +		btf__add_var;
+ +		btf__add_volatile;
+ +		btf__endianness;
+ +		btf__find_str;
+ +		btf__new_empty;
+ +		btf__set_endianness;
+ +		btf__str_by_offset;
+++=======
++ 		perf_buffer__buffer_cnt;
++ 		perf_buffer__buffer_fd;
++ 		perf_buffer__epoll_fd;
++ 		perf_buffer__consume_buffer;
+++>>>>>>> dca5612f8eb9 (libbpf: Add perf_buffer APIs for better integration with outside epoll loop)
+  } LIBBPF_0.1.0;
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index e8a159519d3d..98da58dae121 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -9408,6 +9408,11 @@ static int perf_buffer__process_records(struct perf_buffer *pb,
+ 	return 0;
+ }
+ 
++int perf_buffer__epoll_fd(const struct perf_buffer *pb)
++{
++	return pb->epoll_fd;
++}
++
+ int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms)
+ {
+ 	int i, cnt, err;
+@@ -9425,6 +9430,55 @@ int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms)
+ 	return cnt < 0 ? -errno : cnt;
+ }
+ 
++/* Return number of PERF_EVENT_ARRAY map slots set up by this perf_buffer
++ * manager.
++ */
++size_t perf_buffer__buffer_cnt(const struct perf_buffer *pb)
++{
++	return pb->cpu_cnt;
++}
++
++/*
++ * Return perf_event FD of a ring buffer in *buf_idx* slot of
++ * PERF_EVENT_ARRAY BPF map. This FD can be polled for new data using
++ * select()/poll()/epoll() Linux syscalls.
++ */
++int perf_buffer__buffer_fd(const struct perf_buffer *pb, size_t buf_idx)
++{
++	struct perf_cpu_buf *cpu_buf;
++
++	if (buf_idx >= pb->cpu_cnt)
++		return -EINVAL;
++
++	cpu_buf = pb->cpu_bufs[buf_idx];
++	if (!cpu_buf)
++		return -ENOENT;
++
++	return cpu_buf->fd;
++}
++
++/*
++ * Consume data from perf ring buffer corresponding to slot *buf_idx* in
++ * PERF_EVENT_ARRAY BPF map without waiting/polling. If there is no data to
++ * consume, do nothing and return success.
++ * Returns:
++ *   - 0 on success;
++ *   - <0 on failure.
++ */
++int perf_buffer__consume_buffer(struct perf_buffer *pb, size_t buf_idx)
++{
++	struct perf_cpu_buf *cpu_buf;
++
++	if (buf_idx >= pb->cpu_cnt)
++		return -EINVAL;
++
++	cpu_buf = pb->cpu_bufs[buf_idx];
++	if (!cpu_buf)
++		return -ENOENT;
++
++	return perf_buffer__process_records(pb, cpu_buf);
++}
++
+ int perf_buffer__consume(struct perf_buffer *pb)
+ {
+ 	int i, err;
+@@ -9437,7 +9491,7 @@ int perf_buffer__consume(struct perf_buffer *pb)
+ 
+ 		err = perf_buffer__process_records(pb, cpu_buf);
+ 		if (err) {
+-			pr_warn("error while processing records: %d\n", err);
++			pr_warn("perf_buffer: failed to process records in buffer #%d: %d\n", i, err);
+ 			return err;
+ 		}
+ 	}
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index 3bed37161627..cc3f1f54fed0 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -623,8 +623,12 @@ perf_buffer__new_raw(int map_fd, size_t page_cnt,
+ 		     const struct perf_buffer_raw_opts *opts);
+ 
+ LIBBPF_API void perf_buffer__free(struct perf_buffer *pb);
++LIBBPF_API int perf_buffer__epoll_fd(const struct perf_buffer *pb);
+ LIBBPF_API int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms);
+ LIBBPF_API int perf_buffer__consume(struct perf_buffer *pb);
++LIBBPF_API int perf_buffer__consume_buffer(struct perf_buffer *pb, size_t buf_idx);
++LIBBPF_API size_t perf_buffer__buffer_cnt(const struct perf_buffer *pb);
++LIBBPF_API int perf_buffer__buffer_fd(const struct perf_buffer *pb, size_t buf_idx);
+ 
+ typedef enum bpf_perf_event_ret
+ 	(*bpf_perf_event_print_t)(struct perf_event_header *hdr,
+* Unmerged path tools/lib/bpf/libbpf.map
+diff --git a/tools/testing/selftests/bpf/prog_tests/perf_buffer.c b/tools/testing/selftests/bpf/prog_tests/perf_buffer.c
+index c33ec180b3f2..ca9f0895ec84 100644
+--- a/tools/testing/selftests/bpf/prog_tests/perf_buffer.c
++++ b/tools/testing/selftests/bpf/prog_tests/perf_buffer.c
+@@ -7,6 +7,8 @@
+ #include "test_perf_buffer.skel.h"
+ #include "bpf/libbpf_internal.h"
+ 
++static int duration;
++
+ /* AddressSanitizer sometimes crashes due to data dereference below, due to
+  * this being mmap()'ed memory. Disable instrumentation with
+  * no_sanitize_address attribute
+@@ -24,13 +26,31 @@ static void on_sample(void *ctx, int cpu, void *data, __u32 size)
+ 	CPU_SET(cpu, cpu_seen);
+ }
+ 
++int trigger_on_cpu(int cpu)
++{
++	cpu_set_t cpu_set;
++	int err;
++
++	CPU_ZERO(&cpu_set);
++	CPU_SET(cpu, &cpu_set);
++
++	err = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set);
++	if (err && CHECK(err, "set_affinity", "cpu #%d, err %d\n", cpu, err))
++		return err;
++
++	usleep(1);
++
++	return 0;
++}
++
+ void test_perf_buffer(void)
+ {
+-	int err, on_len, nr_on_cpus = 0,  nr_cpus, i, duration = 0;
++	int err, on_len, nr_on_cpus = 0, nr_cpus, i;
+ 	struct perf_buffer_opts pb_opts = {};
+ 	struct test_perf_buffer *skel;
+-	cpu_set_t cpu_set, cpu_seen;
++	cpu_set_t cpu_seen;
+ 	struct perf_buffer *pb;
++	int last_fd = -1, fd;
+ 	bool *online;
+ 
+ 	nr_cpus = libbpf_num_possible_cpus();
+@@ -63,6 +83,9 @@ void test_perf_buffer(void)
+ 	if (CHECK(IS_ERR(pb), "perf_buf__new", "err %ld\n", PTR_ERR(pb)))
+ 		goto out_close;
+ 
++	CHECK(perf_buffer__epoll_fd(pb) < 0, "epoll_fd",
++	      "bad fd: %d\n", perf_buffer__epoll_fd(pb));
++
+ 	/* trigger kprobe on every CPU */
+ 	CPU_ZERO(&cpu_seen);
+ 	for (i = 0; i < nr_cpus; i++) {
+@@ -71,16 +94,8 @@ void test_perf_buffer(void)
+ 			continue;
+ 		}
+ 
+-		CPU_ZERO(&cpu_set);
+-		CPU_SET(i, &cpu_set);
+-
+-		err = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set),
+-					     &cpu_set);
+-		if (err && CHECK(err, "set_affinity", "cpu #%d, err %d\n",
+-				 i, err))
++		if (trigger_on_cpu(i))
+ 			goto out_close;
+-
+-		usleep(1);
+ 	}
+ 
+ 	/* read perf buffer */
+@@ -92,6 +107,34 @@ void test_perf_buffer(void)
+ 		  "expect %d, seen %d\n", nr_on_cpus, CPU_COUNT(&cpu_seen)))
+ 		goto out_free_pb;
+ 
++	if (CHECK(perf_buffer__buffer_cnt(pb) != nr_cpus, "buf_cnt",
++		  "got %zu, expected %d\n", perf_buffer__buffer_cnt(pb), nr_cpus))
++		goto out_close;
++
++	for (i = 0; i < nr_cpus; i++) {
++		if (i >= on_len || !online[i])
++			continue;
++
++		fd = perf_buffer__buffer_fd(pb, i);
++		CHECK(fd < 0 || last_fd == fd, "fd_check", "last fd %d == fd %d\n", last_fd, fd);
++		last_fd = fd;
++
++		err = perf_buffer__consume_buffer(pb, i);
++		if (CHECK(err, "drain_buf", "cpu %d, err %d\n", i, err))
++			goto out_close;
++
++		CPU_CLR(i, &cpu_seen);
++		if (trigger_on_cpu(i))
++			goto out_close;
++
++		err = perf_buffer__consume_buffer(pb, i);
++		if (CHECK(err, "consume_buf", "cpu %d, err %d\n", i, err))
++			goto out_close;
++
++		if (CHECK(!CPU_ISSET(i, &cpu_seen), "cpu_seen", "cpu %d not seen\n", i))
++			goto out_close;
++	}
++
+ out_free_pb:
+ 	perf_buffer__free(pb);
+ out_close:
