@@ -338,7 +338,6 @@ static inline void *phys_to_virt(phys_addr_t x)
 
 #ifndef CONFIG_SPARSEMEM_VMEMMAP
 #define virt_to_page(kaddr)	pfn_to_page(__pa(kaddr) >> PAGE_SHIFT)
-#define _virt_addr_valid(kaddr)	pfn_valid(__pa(kaddr) >> PAGE_SHIFT)
 #else
 #define __virt_to_pgoff(kaddr)	(((u64)(kaddr) - PAGE_OFFSET) / PAGE_SIZE * sizeof(struct page))
 #define __page_to_voff(kaddr)	(((u64)(kaddr) - VMEMMAP_START) * PAGE_SIZE / sizeof(struct page))
@@ -352,15 +351,14 @@ static inline void *phys_to_virt(phys_addr_t x)
 })
 
 #define virt_to_page(vaddr)	((struct page *)((__virt_to_pgoff(vaddr)) + VMEMMAP_START))
-
-#define _virt_addr_valid(kaddr)	pfn_valid(__virt_to_phys((u64)(kaddr)) >> PAGE_SHIFT)
 #endif
 #endif
 
 #define _virt_addr_is_linear(kaddr)	\
 	(__tag_reset((u64)(kaddr)) >= PAGE_OFFSET)
+
 #define virt_addr_valid(kaddr)		\
-	(_virt_addr_is_linear(kaddr) && _virt_addr_valid(kaddr))
+	(_virt_addr_is_linear(kaddr) && pfn_valid(virt_to_pfn(kaddr)))
 
 #include <asm-generic/memory_model.h>
 
