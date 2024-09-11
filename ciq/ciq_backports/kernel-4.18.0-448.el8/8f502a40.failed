@@ -1,0 +1,652 @@
+xfs: Add delay ready attr set routines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Allison Henderson <allison.henderson@oracle.com>
+commit 8f502a4009822a6972772ae65b34078645b3ba16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/8f502a40.failed
+
+This patch modifies the attr set routines to be delay ready. This means
+they no longer roll or commit transactions, but instead return -EAGAIN
+to have the calling routine roll and refresh the transaction.  In this
+series, xfs_attr_set_args has become xfs_attr_set_iter, which uses a
+state machine like switch to keep track of where it was when EAGAIN was
+returned. See xfs_attr.h for a more detailed diagram of the states.
+
+Two new helper functions have been added: xfs_attr_rmtval_find_space and
+xfs_attr_rmtval_set_blk.  They provide a subset of logic similar to
+xfs_attr_rmtval_set, but they store the current block in the delay attr
+context to allow the caller to roll the transaction between allocations.
+This helps to simplify and consolidate code used by
+xfs_attr_leaf_addname and xfs_attr_node_addname. xfs_attr_set_args has
+now become a simple loop to refresh the transaction until the operation
+is completed.  Lastly, xfs_attr_rmtval_remove is no longer used, and is
+removed.
+
+	Signed-off-by: Allison Henderson <allison.henderson@oracle.com>
+	Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit 8f502a4009822a6972772ae65b34078645b3ba16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr.c
+#	fs/xfs/libxfs/xfs_attr.h
+#	fs/xfs/libxfs/xfs_attr_remote.c
+#	fs/xfs/libxfs/xfs_attr_remote.h
+diff --cc fs/xfs/libxfs/xfs_attr.c
+index bc11a1b3959d,df20537c5533..000000000000
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@@ -53,12 -53,10 +53,19 @@@ STATIC int xfs_attr_leaf_try_add(struc
+   */
+  STATIC int xfs_attr_node_get(xfs_da_args_t *args);
+  STATIC void xfs_attr_restore_rmt_blk(struct xfs_da_args *args);
+++<<<<<<< HEAD
+ +STATIC int xfs_attr_node_addname(struct xfs_da_args *args,
+ +				 struct xfs_da_state *state);
+ +STATIC int xfs_attr_node_addname_find_attr(struct xfs_da_args *args,
+ +				 struct xfs_da_state **state);
+ +STATIC int xfs_attr_node_removename(xfs_da_args_t *args);
+ +STATIC int xfs_attr_node_addname_clear_incomplete(struct xfs_da_args *args);
+++=======
++ STATIC int xfs_attr_node_addname(struct xfs_delattr_context *dac);
++ STATIC int xfs_attr_node_addname_find_attr(struct xfs_delattr_context *dac);
++ STATIC int xfs_attr_node_addname_clear_incomplete(
++ 				struct xfs_delattr_context *dac);
+++>>>>>>> 8f502a400982 (xfs: Add delay ready attr set routines)
+  STATIC int xfs_attr_node_hasname(xfs_da_args_t *args,
+  				 struct xfs_da_state **state);
+  STATIC int xfs_attr_fillstate(xfs_da_state_t *state);
+@@@ -241,13 -241,68 +250,71 @@@ xfs_attr_is_shortform
+  		ip->i_afp->if_nextents == 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Checks to see if a delayed attribute transaction should be rolled.  If so,
++  * transaction is finished or rolled as needed.
++  */
++ STATIC int
++ xfs_attr_trans_roll(
++ 	struct xfs_delattr_context	*dac)
++ {
++ 	struct xfs_da_args		*args = dac->da_args;
++ 	int				error;
++ 
++ 	if (dac->flags & XFS_DAC_DEFER_FINISH) {
++ 		/*
++ 		 * The caller wants us to finish all the deferred ops so that we
++ 		 * avoid pinning the log tail with a large number of deferred
++ 		 * ops.
++ 		 */
++ 		dac->flags &= ~XFS_DAC_DEFER_FINISH;
++ 		error = xfs_defer_finish(&args->trans);
++ 	} else
++ 		error = xfs_trans_roll_inode(&args->trans, args->dp);
++ 
++ 	return error;
++ }
++ 
++ /*
++  * Set the attribute specified in @args.
++  */
++ int
++ xfs_attr_set_args(
++ 	struct xfs_da_args		*args)
++ {
++ 	struct xfs_buf			*leaf_bp = NULL;
++ 	int				error = 0;
++ 	struct xfs_delattr_context	dac = {
++ 		.da_args	= args,
++ 	};
++ 
++ 	do {
++ 		error = xfs_attr_set_iter(&dac, &leaf_bp);
++ 		if (error != -EAGAIN)
++ 			break;
++ 
++ 		error = xfs_attr_trans_roll(&dac);
++ 		if (error) {
++ 			if (leaf_bp)
++ 				xfs_trans_brelse(args->trans, leaf_bp);
++ 			return error;
++ 		}
++ 	} while (true);
++ 
++ 	return error;
++ }
++ 
+++>>>>>>> 8f502a400982 (xfs: Add delay ready attr set routines)
+  STATIC int
+  xfs_attr_set_fmt(
+- 	struct xfs_da_args	*args)
++ 	struct xfs_delattr_context	*dac,
++ 	struct xfs_buf			**leaf_bp)
+  {
+- 	struct xfs_buf          *leaf_bp = NULL;
+- 	struct xfs_inode	*dp = args->dp;
+- 	int			error, error2 = 0;
++ 	struct xfs_da_args		*args = dac->da_args;
++ 	struct xfs_inode		*dp = args->dp;
++ 	int				error = 0;
+  
+  	/*
+  	 * Try to add the attr to the attribute list in the inode.
+diff --cc fs/xfs/libxfs/xfs_attr.h
+index 2b1f61987a9d,8de5d1d2733e..000000000000
+--- a/fs/xfs/libxfs/xfs_attr.h
++++ b/fs/xfs/libxfs/xfs_attr.h
+@@@ -74,6 -74,406 +74,409 @@@ struct xfs_attr_list_context 
+  };
+  
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * ========================================================================
++  * Structure used to pass context around among the delayed routines.
++  * ========================================================================
++  */
++ 
++ /*
++  * Below is a state machine diagram for attr remove operations. The  XFS_DAS_*
++  * states indicate places where the function would return -EAGAIN, and then
++  * immediately resume from after being called by the calling function. States
++  * marked as a "subroutine state" indicate that they belong to a subroutine, and
++  * so the calling function needs to pass them back to that subroutine to allow
++  * it to finish where it left off. But they otherwise do not have a role in the
++  * calling function other than just passing through.
++  *
++  * xfs_attr_remove_iter()
++  *              │
++  *              v
++  *        have attr to remove? ──n──> done
++  *              │
++  *              y
++  *              │
++  *              v
++  *        are we short form? ──y──> xfs_attr_shortform_remove ──> done
++  *              │
++  *              n
++  *              │
++  *              V
++  *        are we leaf form? ──y──> xfs_attr_leaf_removename ──> done
++  *              │
++  *              n
++  *              │
++  *              V
++  *   ┌── need to setup state?
++  *   │          │
++  *   n          y
++  *   │          │
++  *   │          v
++  *   │ find attr and get state
++  *   │ attr has remote blks? ──n─┐
++  *   │          │                v
++  *   │          │         find and invalidate
++  *   │          y         the remote blocks.
++  *   │          │         mark attr incomplete
++  *   │          ├────────────────┘
++  *   └──────────┤
++  *              │
++  *              v
++  *   Have remote blks to remove? ───y─────┐
++  *              │        ^          remove the blks
++  *              │        │                │
++  *              │        │                v
++  *              │  XFS_DAS_RMTBLK <─n── done?
++  *              │  re-enter with          │
++  *              │  one less blk to        y
++  *              │      remove             │
++  *              │                         V
++  *              │                  refill the state
++  *              n                         │
++  *              │                         v
++  *              │                   XFS_DAS_RM_NAME
++  *              │                         │
++  *              ├─────────────────────────┘
++  *              │
++  *              v
++  *       remove leaf and
++  *       update hash with
++  *   xfs_attr_node_remove_cleanup
++  *              │
++  *              v
++  *           need to
++  *        shrink tree? ─n─┐
++  *              │         │
++  *              y         │
++  *              │         │
++  *              v         │
++  *          join leaf     │
++  *              │         │
++  *              v         │
++  *      XFS_DAS_RM_SHRINK │
++  *              │         │
++  *              v         │
++  *       do the shrink    │
++  *              │         │
++  *              v         │
++  *          free state <──┘
++  *              │
++  *              v
++  *            done
++  *
++  *
++  * Below is a state machine diagram for attr set operations.
++  *
++  * It seems the challenge with understanding this system comes from trying to
++  * absorb the state machine all at once, when really one should only be looking
++  * at it with in the context of a single function. Once a state sensitive
++  * function is called, the idea is that it "takes ownership" of the
++  * state machine. It isn't concerned with the states that may have belonged to
++  * it's calling parent. Only the states relevant to itself or any other
++  * subroutines there in. Once a calling function hands off the state machine to
++  * a subroutine, it needs to respect the simple rule that it doesn't "own" the
++  * state machine anymore, and it's the responsibility of that calling function
++  * to propagate the -EAGAIN back up the call stack. Upon reentry, it is
++  * committed to re-calling that subroutine until it returns something other than
++  * -EAGAIN. Once that subroutine signals completion (by returning anything other
++  * than -EAGAIN), the calling function can resume using the state machine.
++  *
++  *  xfs_attr_set_iter()
++  *              │
++  *              v
++  *   ┌─y─ has an attr fork?
++  *   │          |
++  *   │          n
++  *   │          |
++  *   │          V
++  *   │       add a fork
++  *   │          │
++  *   └──────────┤
++  *              │
++  *              V
++  *   ┌─── is shortform?
++  *   │          │
++  *   │          y
++  *   │          │
++  *   │          V
++  *   │   xfs_attr_set_fmt
++  *   │          |
++  *   │          V
++  *   │ xfs_attr_try_sf_addname
++  *   │          │
++  *   │          V
++  *   │      had enough ──y──> done
++  *   │        space?
++  *   n          │
++  *   │          n
++  *   │          │
++  *   │          V
++  *   │   transform to leaf
++  *   │          │
++  *   │          V
++  *   │   hold the leaf buffer
++  *   │          │
++  *   │          V
++  *   │     return -EAGAIN
++  *   │      Re-enter in
++  *   │       leaf form
++  *   │
++  *   └─> release leaf buffer
++  *          if needed
++  *              │
++  *              V
++  *   ┌───n── fork has
++  *   │      only 1 blk?
++  *   │          │
++  *   │          y
++  *   │          │
++  *   │          v
++  *   │ xfs_attr_leaf_try_add()
++  *   │          │
++  *   │          v
++  *   │      had enough ──────────────y─────────────┐
++  *   │        space?                               │
++  *   │          │                                  │
++  *   │          n                                  │
++  *   │          │                                  │
++  *   │          v                                  │
++  *   │    return -EAGAIN                           │
++  *   │      re-enter in                            │
++  *   │        node form                            │
++  *   │          │                                  │
++  *   └──────────┤                                  │
++  *              │                                  │
++  *              V                                  │
++  * xfs_attr_node_addname_find_attr                 │
++  *        determines if this                       │
++  *       is create or rename                       │
++  *     find space to store attr                    │
++  *              │                                  │
++  *              v                                  │
++  *     xfs_attr_node_addname                       │
++  *              │                                  │
++  *              v                                  │
++  *   fits in a node leaf? ────n─────┐              │
++  *              │     ^             v              │
++  *              │     │       single leaf node?    │
++  *              │     │         │            │     │
++  *              y     │         y            n     │
++  *              │     │         │            │     │
++  *              v     │         v            v     │
++  *            update  │    grow the leaf  split if │
++  *           hashvals └── return -EAGAIN   needed  │
++  *              │         retry leaf add     │     │
++  *              │           on reentry       │     │
++  *              ├────────────────────────────┘     │
++  *              │                                  │
++  *              v                                  │
++  *         need to alloc                           │
++  *   ┌─y── or flip flag?                           │
++  *   │          │                                  │
++  *   │          n                                  │
++  *   │          │                                  │
++  *   │          v                                  │
++  *   │         done                                │
++  *   │                                             │
++  *   │                                             │
++  *   │         XFS_DAS_FOUND_LBLK <────────────────┘
++  *   │                  │
++  *   │                  V
++  *   │        xfs_attr_leaf_addname()
++  *   │                  │
++  *   │                  v
++  *   │      ┌──first time through?
++  *   │      │          │
++  *   │      │          y
++  *   │      │          │
++  *   │      n          v
++  *   │      │    if we have rmt blks
++  *   │      │    find space for them
++  *   │      │          │
++  *   │      └──────────┤
++  *   │                 │
++  *   │                 v
++  *   │            still have
++  *   │      ┌─n─ blks to alloc? <──┐
++  *   │      │          │           │
++  *   │      │          y           │
++  *   │      │          │           │
++  *   │      │          v           │
++  *   │      │     alloc one blk    │
++  *   │      │     return -EAGAIN ──┘
++  *   │      │    re-enter with one
++  *   │      │    less blk to alloc
++  *   │      │
++  *   │      │
++  *   │      └───> set the rmt
++  *   │               value
++  *   │                 │
++  *   │                 v
++  *   │               was this
++  *   │              a rename? ──n─┐
++  *   │                 │          │
++  *   │                 y          │
++  *   │                 │          │
++  *   │                 v          │
++  *   │           flip incomplete  │
++  *   │               flag         │
++  *   │                 │          │
++  *   │                 v          │
++  *   │         XFS_DAS_FLIP_LFLAG │
++  *   │                 │          │
++  *   │                 v          │
++  *   │          need to remove    │
++  *   │              old bks? ──n──┤
++  *   │                 │          │
++  *   │                 y          │
++  *   │                 │          │
++  *   │                 V          │
++  *   │               remove       │
++  *   │        ┌───> old blks      │
++  *   │        │        │          │
++  *   │ XFS_DAS_RM_LBLK │          │
++  *   │        ^        │          │
++  *   │        │        v          │
++  *   │        └──y── more to      │
++  *   │              remove?       │
++  *   │                 │          │
++  *   │                 n          │
++  *   │                 │          │
++  *   │                 v          │
++  *   │          XFS_DAS_RD_LEAF   │
++  *   │                 │          │
++  *   │                 v          │
++  *   │            remove leaf     │
++  *   │                 │          │
++  *   │                 v          │
++  *   │            shrink to sf    │
++  *   │             if needed      │
++  *   │                 │          │
++  *   │                 v          │
++  *   │                done <──────┘
++  *   │
++  *   └──────> XFS_DAS_FOUND_NBLK
++  *                     │
++  *                     v
++  *       ┌─────n──  need to
++  *       │        alloc blks?
++  *       │             │
++  *       │             y
++  *       │             │
++  *       │             v
++  *       │        find space
++  *       │             │
++  *       │             v
++  *       │  ┌─>XFS_DAS_ALLOC_NODE
++  *       │  │          │
++  *       │  │          v
++  *       │  │      alloc blk
++  *       │  │          │
++  *       │  │          v
++  *       │  └──y── need to alloc
++  *       │         more blocks?
++  *       │             │
++  *       │             n
++  *       │             │
++  *       │             v
++  *       │      set the rmt value
++  *       │             │
++  *       │             v
++  *       │          was this
++  *       └────────> a rename? ──n─┐
++  *                     │          │
++  *                     y          │
++  *                     │          │
++  *                     v          │
++  *               flip incomplete  │
++  *                   flag         │
++  *                     │          │
++  *                     v          │
++  *             XFS_DAS_FLIP_NFLAG │
++  *                     │          │
++  *                     v          │
++  *                 need to        │
++  *               remove blks? ─n──┤
++  *                     │          │
++  *                     y          │
++  *                     │          │
++  *                     v          │
++  *                   remove       │
++  *        ┌────────> old blks     │
++  *        │            │          │
++  *  XFS_DAS_RM_NBLK    │          │
++  *        ^            │          │
++  *        │            v          │
++  *        └──────y── more to      │
++  *                   remove       │
++  *                     │          │
++  *                     n          │
++  *                     │          │
++  *                     v          │
++  *              XFS_DAS_CLR_FLAG  │
++  *                     │          │
++  *                     v          │
++  *                clear flags     │
++  *                     │          │
++  *                     ├──────────┘
++  *                     │
++  *                     v
++  *                   done
++  */
++ 
++ /*
++  * Enum values for xfs_delattr_context.da_state
++  *
++  * These values are used by delayed attribute operations to keep track  of where
++  * they were before they returned -EAGAIN.  A return code of -EAGAIN signals the
++  * calling function to roll the transaction, and then call the subroutine to
++  * finish the operation.  The enum is then used by the subroutine to jump back
++  * to where it was and resume executing where it left off.
++  */
++ enum xfs_delattr_state {
++ 	XFS_DAS_UNINIT		= 0,  /* No state has been set yet */
++ 	XFS_DAS_RMTBLK,		      /* Removing remote blks */
++ 	XFS_DAS_RM_NAME,	      /* Remove attr name */
++ 	XFS_DAS_RM_SHRINK,	      /* We are shrinking the tree */
++ 	XFS_DAS_FOUND_LBLK,	      /* We found leaf blk for attr */
++ 	XFS_DAS_FOUND_NBLK,	      /* We found node blk for attr */
++ 	XFS_DAS_FLIP_LFLAG,	      /* Flipped leaf INCOMPLETE attr flag */
++ 	XFS_DAS_RM_LBLK,	      /* A rename is removing leaf blocks */
++ 	XFS_DAS_RD_LEAF,	      /* Read in the new leaf */
++ 	XFS_DAS_ALLOC_NODE,	      /* We are allocating node blocks */
++ 	XFS_DAS_FLIP_NFLAG,	      /* Flipped node INCOMPLETE attr flag */
++ 	XFS_DAS_RM_NBLK,	      /* A rename is removing node blocks */
++ 	XFS_DAS_CLR_FLAG,	      /* Clear incomplete flag */
++ };
++ 
++ /*
++  * Defines for xfs_delattr_context.flags
++  */
++ #define XFS_DAC_DEFER_FINISH		0x01 /* finish the transaction */
++ #define XFS_DAC_LEAF_ADDNAME_INIT	0x02 /* xfs_attr_leaf_addname init*/
++ 
++ /*
++  * Context used for keeping track of delayed attribute operations
++  */
++ struct xfs_delattr_context {
++ 	struct xfs_da_args      *da_args;
++ 
++ 	/* Used in xfs_attr_rmtval_set_blk to roll through allocating blocks */
++ 	struct xfs_bmbt_irec	map;
++ 	xfs_dablk_t		lblkno;
++ 	int			blkcnt;
++ 
++ 	/* Used in xfs_attr_node_removename to roll through removing blocks */
++ 	struct xfs_da_state     *da_state;
++ 
++ 	/* Used to keep track of current state of delayed operation */
++ 	unsigned int            flags;
++ 	enum xfs_delattr_state  dela_state;
++ };
++ 
+++>>>>>>> 8f502a400982 (xfs: Add delay ready attr set routines)
+  /*========================================================================
+   * Function prototypes for the kernel.
+   *========================================================================*/
+@@@ -92,6 -492,9 +495,10 @@@ int xfs_attr_set(struct xfs_da_args *ar
+  int xfs_attr_set_args(struct xfs_da_args *args);
+  int xfs_has_attr(struct xfs_da_args *args);
+  int xfs_attr_remove_args(struct xfs_da_args *args);
+++<<<<<<< HEAD
+++=======
++ int xfs_attr_remove_iter(struct xfs_delattr_context *dac);
+++>>>>>>> 8f502a400982 (xfs: Add delay ready attr set routines)
+  bool xfs_attr_namecheck(const void *name, size_t length);
+ -void xfs_delattr_context_init(struct xfs_delattr_context *dac,
+ -			      struct xfs_da_args *args);
+  
+  #endif	/* __XFS_ATTR_H__ */
+diff --cc fs/xfs/libxfs/xfs_attr_remote.c
+index 48d8e9caf86f,c1b09fa64ea7..000000000000
+--- a/fs/xfs/libxfs/xfs_attr_remote.c
++++ b/fs/xfs/libxfs/xfs_attr_remote.c
+@@@ -669,41 -732,10 +732,44 @@@ xfs_attr_rmtval_invalidate
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Remove the value associated with an attribute by deleting the
+ + * out-of-line buffer that it is stored on.
+ + */
+ +int
+ +xfs_attr_rmtval_remove(
+ +	struct xfs_da_args      *args)
+ +{
+ +	int			error;
+ +	int			retval;
+ +
+ +	trace_xfs_attr_rmtval_remove(args);
+ +
+ +	/*
+ +	 * Keep de-allocating extents until the remote-value region is gone.
+ +	 */
+ +	do {
+ +		retval = __xfs_attr_rmtval_remove(args);
+ +		if (retval && retval != -EAGAIN)
+ +			return retval;
+ +
+ +		/*
+ +		 * Close out trans and start the next one in the chain.
+ +		 */
+ +		error = xfs_trans_roll_inode(&args->trans, args->dp);
+ +		if (error)
+ +			return error;
+ +	} while (retval == -EAGAIN);
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 8f502a400982 (xfs: Add delay ready attr set routines)
+   * Remove the value associated with an attribute by deleting the out-of-line
+ - * buffer that it is stored on. Returns -EAGAIN for the caller to refresh the
+ - * transaction and re-call the function.  Callers should keep calling this
+ - * routine until it returns something other than -EAGAIN.
+ + * buffer that it is stored on. Returns EAGAIN for the caller to refresh the
+ + * transaction and re-call the function
+   */
+  int
+  __xfs_attr_rmtval_remove(
+diff --cc fs/xfs/libxfs/xfs_attr_remote.h
+index 9eee615da156,8ad68d5d4cc2..000000000000
+--- a/fs/xfs/libxfs/xfs_attr_remote.h
++++ b/fs/xfs/libxfs/xfs_attr_remote.h
+@@@ -13,6 -13,9 +13,13 @@@ int xfs_attr_rmtval_set(struct xfs_da_a
+  int xfs_attr_rmtval_stale(struct xfs_inode *ip, struct xfs_bmbt_irec *map,
+  		xfs_buf_flags_t incore_flags);
+  int xfs_attr_rmtval_invalidate(struct xfs_da_args *args);
+++<<<<<<< HEAD
+ +int __xfs_attr_rmtval_remove(struct xfs_da_args *args);
+++=======
++ int __xfs_attr_rmtval_remove(struct xfs_delattr_context *dac);
++ int xfs_attr_rmt_find_hole(struct xfs_da_args *args);
++ int xfs_attr_rmtval_set_value(struct xfs_da_args *args);
++ int xfs_attr_rmtval_set_blk(struct xfs_delattr_context *dac);
++ int xfs_attr_rmtval_find_space(struct xfs_delattr_context *dac);
+++>>>>>>> 8f502a400982 (xfs: Add delay ready attr set routines)
+  #endif /* __XFS_ATTR_REMOTE_H__ */
+* Unmerged path fs/xfs/libxfs/xfs_attr.c
+* Unmerged path fs/xfs/libxfs/xfs_attr.h
+* Unmerged path fs/xfs/libxfs/xfs_attr_remote.c
+* Unmerged path fs/xfs/libxfs/xfs_attr_remote.h
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 23e872dc3544..73a86a223031 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -1943,7 +1943,6 @@ DEFINE_ATTR_EVENT(xfs_attr_refillstate);
+ 
+ DEFINE_ATTR_EVENT(xfs_attr_rmtval_get);
+ DEFINE_ATTR_EVENT(xfs_attr_rmtval_set);
+-DEFINE_ATTR_EVENT(xfs_attr_rmtval_remove);
+ 
+ #define DEFINE_DA_EVENT(name) \
+ DEFINE_EVENT(xfs_da_class, name, \
