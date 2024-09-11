@@ -218,9 +218,9 @@ const struct nla_policy ethnl_cable_test_tdr_act_policy[] = {
 };
 
 /* CABLE_TEST_TDR_ACT */
-int ethnl_act_cable_test_tdr_cfg(const struct nlattr *nest,
-				 struct genl_info *info,
-				 struct phy_tdr_config *cfg)
+static int ethnl_act_cable_test_tdr_cfg(const struct nlattr *nest,
+					struct genl_info *info,
+					struct phy_tdr_config *cfg)
 {
 	struct nlattr *tb[ARRAY_SIZE(cable_test_tdr_act_cfg_policy)];
 	int ret;
