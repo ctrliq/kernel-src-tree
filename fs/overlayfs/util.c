@@ -551,7 +551,7 @@ bool ovl_check_origin_xattr(struct dentry *dentry)
 {
 	int res;
 
-	res = vfs_getxattr(dentry, OVL_XATTR_ORIGIN, NULL, 0);
+	res = ovl_do_getxattr(dentry, OVL_XATTR_ORIGIN, NULL, 0);
 
 	/* Zero size value means "copied up but origin unknown" */
 	if (res >= 0)
@@ -568,7 +568,7 @@ bool ovl_check_dir_xattr(struct dentry *dentry, const char *name)
 	if (!d_is_dir(dentry))
 		return false;
 
-	res = vfs_getxattr(dentry, name, &val, 1);
+	res = ovl_do_getxattr(dentry, name, &val, 1);
 	if (res == 1 && val == 'y')
 		return true;
 
@@ -856,7 +856,7 @@ int ovl_check_metacopy_xattr(struct dentry *dentry)
 	if (!S_ISREG(d_inode(dentry)->i_mode))
 		return 0;
 
-	res = vfs_getxattr(dentry, OVL_XATTR_METACOPY, NULL, 0);
+	res = ovl_do_getxattr(dentry, OVL_XATTR_METACOPY, NULL, 0);
 	if (res < 0) {
 		if (res == -ENODATA || res == -EOPNOTSUPP)
 			return 0;
@@ -890,7 +890,7 @@ char *ovl_get_redirect_xattr(struct dentry *dentry, int padding)
 	int res;
 	char *s, *next, *buf = NULL;
 
-	res = vfs_getxattr(dentry, OVL_XATTR_REDIRECT, NULL, 0);
+	res = ovl_do_getxattr(dentry, OVL_XATTR_REDIRECT, NULL, 0);
 	if (res == -ENODATA || res == -EOPNOTSUPP)
 		return NULL;
 	if (res < 0)
@@ -902,7 +902,7 @@ char *ovl_get_redirect_xattr(struct dentry *dentry, int padding)
 	if (!buf)
 		return ERR_PTR(-ENOMEM);
 
-	res = vfs_getxattr(dentry, OVL_XATTR_REDIRECT, buf, res);
+	res = ovl_do_getxattr(dentry, OVL_XATTR_REDIRECT, buf, res);
 	if (res < 0)
 		goto fail;
 	if (res == 0)
