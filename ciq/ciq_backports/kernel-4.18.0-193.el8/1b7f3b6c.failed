@@ -1,0 +1,141 @@
+powerpc/eeh: Fix build with STACKTRACE=n
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [powerpc] eeh: Fix build with STACKTRACE=n (Gustavo Duarte) [1524642]
+Rebuild_FUZZ: 88.89%
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit 1b7f3b6c43675ef2cfb9d8f48bde057794820f7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1b7f3b6c.failed
+
+The build breaks when STACKTRACE=n, eg. skiroot_defconfig:
+
+  arch/powerpc/kernel/eeh_event.c:124:23: error: implicit declaration of function 'stack_trace_save'
+
+Fix it with some ifdefs for now.
+
+Fixes: 25baf3d81614 ("powerpc/eeh: Defer printing stack trace")
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 1b7f3b6c43675ef2cfb9d8f48bde057794820f7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/eeh.h
+#	arch/powerpc/kernel/eeh_driver.c
+#	arch/powerpc/kernel/eeh_event.c
+diff --cc arch/powerpc/include/asm/eeh.h
+index 68163ac6f924,6f9b2a12540a..000000000000
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@@ -99,8 -86,21 +99,24 @@@ struct eeh_pe 
+  	struct eeh_pe *parent;		/* Parent PE			*/
+  	void *data;			/* PE auxillary data		*/
+  	struct list_head child_list;	/* List of PEs below this PE	*/
+ -	struct list_head child;		/* Memb. child_list/eeh_phb_pe	*/
+  	struct list_head edevs;		/* List of eeh_dev in this PE	*/
+++<<<<<<< HEAD
+ +	struct list_head child;		/* Memb. child_list/eeh_phb_pe	*/
+++=======
++ 
++ #ifdef CONFIG_STACKTRACE
++ 	/*
++ 	 * Saved stack trace. When we find a PE freeze in eeh_dev_check_failure
++ 	 * the stack trace is saved here so we can print it in the recovery
++ 	 * thread if it turns out to due to a real problem rather than
++ 	 * a hot-remove.
++ 	 *
++ 	 * A max of 64 entries might be overkill, but it also might not be.
++ 	 */
++ 	unsigned long stack_trace[64];
++ 	int trace_entries;
++ #endif /* CONFIG_STACKTRACE */
+++>>>>>>> 1b7f3b6c4367 (powerpc/eeh: Fix build with STACKTRACE=n)
+  };
+  
+  #define eeh_pe_for_each_dev(pe, edev, tmp) \
+diff --cc arch/powerpc/kernel/eeh_driver.c
+index a131952967c1,d9279d0ee9f5..000000000000
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@@ -899,8 -889,45 +899,46 @@@ void eeh_handle_normal_event(struct eeh
+  			if (eeh_slot_presence_check(edev->pdev))
+  				devices++;
+  
+ -	if (!devices) {
+ -		pr_debug("EEH: Frozen PHB#%x-PE#%x is empty!\n",
+ -			pe->phb->global_number, pe->addr);
+ +	if (!devices)
+  		goto out; /* nothing to recover */
+++<<<<<<< HEAD
+++=======
++ 	}
++ 
++ 	/* Log the event */
++ 	if (pe->type & EEH_PE_PHB) {
++ 		pr_err("EEH: PHB#%x failure detected, location: %s\n",
++ 			pe->phb->global_number, eeh_pe_loc_get(pe));
++ 	} else {
++ 		struct eeh_pe *phb_pe = eeh_phb_pe_get(pe->phb);
++ 
++ 		pr_err("EEH: Frozen PHB#%x-PE#%x detected\n",
++ 		       pe->phb->global_number, pe->addr);
++ 		pr_err("EEH: PE location: %s, PHB location: %s\n",
++ 		       eeh_pe_loc_get(pe), eeh_pe_loc_get(phb_pe));
++ 	}
++ 
++ #ifdef CONFIG_STACKTRACE
++ 	/*
++ 	 * Print the saved stack trace now that we've verified there's
++ 	 * something to recover.
++ 	 */
++ 	if (pe->trace_entries) {
++ 		void **ptrs = (void **) pe->stack_trace;
++ 		int i;
++ 
++ 		pr_err("EEH: Frozen PHB#%x-PE#%x detected\n",
++ 		       pe->phb->global_number, pe->addr);
++ 
++ 		/* FIXME: Use the same format as dump_stack() */
++ 		pr_err("EEH: Call Trace:\n");
++ 		for (i = 0; i < pe->trace_entries; i++)
++ 			pr_err("EEH: [%pK] %pS\n", ptrs[i], ptrs[i]);
++ 
++ 		pe->trace_entries = 0;
++ 	}
++ #endif /* CONFIG_STACKTRACE */
+++>>>>>>> 1b7f3b6c4367 (powerpc/eeh: Fix build with STACKTRACE=n)
+  
+  	eeh_pe_update_time_stamp(pe);
+  	pe->freeze_count++;
+diff --cc arch/powerpc/kernel/eeh_event.c
+index 80d1ea541fef,a7a8dc182efb..000000000000
+--- a/arch/powerpc/kernel/eeh_event.c
++++ b/arch/powerpc/kernel/eeh_event.c
+@@@ -141,8 -116,18 +141,21 @@@ int eeh_send_failure_event(struct eeh_p
+  	 * This prevents the PE from being free()ed by a hotplug driver
+  	 * while the PE is sitting in the event queue.
+  	 */
+++<<<<<<< HEAD
+ +	if (pe)
+++=======
++ 	if (pe) {
++ #ifdef CONFIG_STACKTRACE
++ 		/*
++ 		 * Save the current stack trace so we can dump it from the
++ 		 * event handler thread.
++ 		 */
++ 		pe->trace_entries = stack_trace_save(pe->stack_trace,
++ 					 ARRAY_SIZE(pe->stack_trace), 0);
++ #endif /* CONFIG_STACKTRACE */
++ 
+++>>>>>>> 1b7f3b6c4367 (powerpc/eeh: Fix build with STACKTRACE=n)
+  		eeh_pe_state_mark(pe, EEH_PE_RECOVERING);
+ -	}
+  
+  	/* We may or may not be called in an interrupt context */
+  	spin_lock_irqsave(&eeh_eventlist_lock, flags);
+* Unmerged path arch/powerpc/include/asm/eeh.h
+* Unmerged path arch/powerpc/kernel/eeh_driver.c
+* Unmerged path arch/powerpc/kernel/eeh_event.c
