@@ -1,0 +1,199 @@
+net: flow_offload: skip hw stats check for FLOW_ACTION_HW_STATS_DONT_CARE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] flow_offload: skip hw stats check for FLOW_ACTION_HW_STATS_DONT_CARE (Ivan Vecera) [1824071]
+Rebuild_FUZZ: 96.45%
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 16f8036086a929694c3c62f577bb5925fe4fd607
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/16f80360.failed
+
+This patch adds FLOW_ACTION_HW_STATS_DONT_CARE which tells the driver
+that the frontend does not need counters, this hw stats type request
+never fails. The FLOW_ACTION_HW_STATS_DISABLED type explicitly requests
+the driver to disable the stats, however, if the driver cannot disable
+counters, it bails out.
+
+TCA_ACT_HW_STATS_* maintains the 1:1 mapping with FLOW_ACTION_HW_STATS_*
+except by disabled which is mapped to FLOW_ACTION_HW_STATS_DISABLED
+(this is 0 in tc). Add tc_act_hw_stats() to perform the mapping between
+TCA_ACT_HW_STATS_* and FLOW_ACTION_HW_STATS_*.
+
+Fixes: 319a1d19471e ("flow_offload: check for basic action hw stats type")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 16f8036086a929694c3c62f577bb5925fe4fd607)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+#	include/net/flow_offload.h
+#	net/sched/cls_api.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+index 95387525a11b,890b078851c9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+@@@ -35,7 -36,8 +35,12 @@@ static int mlxsw_sp_flower_parse_action
+  		err = mlxsw_sp_acl_rulei_act_count(mlxsw_sp, rulei, extack);
+  		if (err)
+  			return err;
+++<<<<<<< HEAD
+ +	} else {
+++=======
++ 	} else if (act->hw_stats != FLOW_ACTION_HW_STATS_DISABLED &&
++ 		   act->hw_stats != FLOW_ACTION_HW_STATS_DONT_CARE) {
+++>>>>>>> 16f8036086a9 (net: flow_offload: skip hw stats check for FLOW_ACTION_HW_STATS_DONT_CARE)
+  		NL_SET_ERR_MSG_MOD(extack, "Unsupported action HW stats type");
+  		return -EOPNOTSUPP;
+  	}
+diff --cc include/net/flow_offload.h
+index 8e8fd14301d6,efc8350b42fb..000000000000
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@@ -160,8 -163,22 +160,27 @@@ enum flow_action_mangle_base 
+  	FLOW_ACT_MANGLE_HDR_TYPE_UDP,
+  };
+  
+++<<<<<<< HEAD
+ +#define FLOW_ACTION_HW_STATS_TYPE_IMMEDIATE BIT(0)
+ +#define FLOW_ACTION_HW_STATS_TYPE_ANY FLOW_ACTION_HW_STATS_TYPE_IMMEDIATE
+++=======
++ enum flow_action_hw_stats_bit {
++ 	FLOW_ACTION_HW_STATS_IMMEDIATE_BIT,
++ 	FLOW_ACTION_HW_STATS_DELAYED_BIT,
++ 	FLOW_ACTION_HW_STATS_DISABLED_BIT,
++ };
++ 
++ enum flow_action_hw_stats {
++ 	FLOW_ACTION_HW_STATS_DONT_CARE = 0,
++ 	FLOW_ACTION_HW_STATS_IMMEDIATE =
++ 		BIT(FLOW_ACTION_HW_STATS_IMMEDIATE_BIT),
++ 	FLOW_ACTION_HW_STATS_DELAYED = BIT(FLOW_ACTION_HW_STATS_DELAYED_BIT),
++ 	FLOW_ACTION_HW_STATS_ANY = FLOW_ACTION_HW_STATS_IMMEDIATE |
++ 				   FLOW_ACTION_HW_STATS_DELAYED,
++ 	FLOW_ACTION_HW_STATS_DISABLED =
++ 		BIT(FLOW_ACTION_HW_STATS_DISABLED_BIT),
++ };
+++>>>>>>> 16f8036086a9 (net: flow_offload: skip hw stats check for FLOW_ACTION_HW_STATS_DONT_CARE)
+  
+  typedef void (*action_destr)(void *priv);
+  
+@@@ -261,7 -284,81 +280,85 @@@ static inline bool flow_offload_has_one
+  }
+  
+  #define flow_action_for_each(__i, __act, __actions)			\
+++<<<<<<< HEAD
+ +        for (__i = 0, __act = &(__actions)->entries[0]; __i < (__actions)->num_entries; __act = &(__actions)->entries[++__i])
+++=======
++         for (__i = 0, __act = &(__actions)->entries[0];			\
++ 	     __i < (__actions)->num_entries;				\
++ 	     __act = &(__actions)->entries[++__i])
++ 
++ static inline bool
++ flow_action_mixed_hw_stats_check(const struct flow_action *action,
++ 				 struct netlink_ext_ack *extack)
++ {
++ 	const struct flow_action_entry *action_entry;
++ 	u8 uninitialized_var(last_hw_stats);
++ 	int i;
++ 
++ 	if (flow_offload_has_one_action(action))
++ 		return true;
++ 
++ 	flow_action_for_each(i, action_entry, action) {
++ 		if (i && action_entry->hw_stats != last_hw_stats) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Mixing HW stats types for actions is not supported");
++ 			return false;
++ 		}
++ 		last_hw_stats = action_entry->hw_stats;
++ 	}
++ 	return true;
++ }
++ 
++ static inline const struct flow_action_entry *
++ flow_action_first_entry_get(const struct flow_action *action)
++ {
++ 	WARN_ON(!flow_action_has_entries(action));
++ 	return &action->entries[0];
++ }
++ 
++ static inline bool
++ __flow_action_hw_stats_check(const struct flow_action *action,
++ 			     struct netlink_ext_ack *extack,
++ 			     bool check_allow_bit,
++ 			     enum flow_action_hw_stats_bit allow_bit)
++ {
++ 	const struct flow_action_entry *action_entry;
++ 
++ 	if (!flow_action_has_entries(action))
++ 		return true;
++ 	if (!flow_action_mixed_hw_stats_check(action, extack))
++ 		return false;
++ 
++ 	action_entry = flow_action_first_entry_get(action);
++ 	if (action_entry->hw_stats == FLOW_ACTION_HW_STATS_DONT_CARE)
++ 		return true;
++ 
++ 	if (!check_allow_bit &&
++ 	    action_entry->hw_stats != FLOW_ACTION_HW_STATS_ANY) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Driver supports only default HW stats type \"any\"");
++ 		return false;
++ 	} else if (check_allow_bit &&
++ 		   !(action_entry->hw_stats & BIT(allow_bit))) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Driver does not support selected HW stats type");
++ 		return false;
++ 	}
++ 	return true;
++ }
++ 
++ static inline bool
++ flow_action_hw_stats_check(const struct flow_action *action,
++ 			   struct netlink_ext_ack *extack,
++ 			   enum flow_action_hw_stats_bit allow_bit)
++ {
++ 	return __flow_action_hw_stats_check(action, extack, true, allow_bit);
++ }
++ 
++ static inline bool
++ flow_action_basic_hw_stats_check(const struct flow_action *action,
++ 				 struct netlink_ext_ack *extack)
++ {
++ 	return __flow_action_hw_stats_check(action, extack, false, 0);
++ }
+++>>>>>>> 16f8036086a9 (net: flow_offload: skip hw stats check for FLOW_ACTION_HW_STATS_DONT_CARE)
+  
+  struct flow_rule {
+  	struct flow_match	match;
+diff --cc net/sched/cls_api.c
+index ae1da1dc7e57,0a7ecc292bd3..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -3551,7 -3556,7 +3561,11 @@@ int tc_setup_flow_action(struct flow_ac
+  		if (err)
+  			goto err_out_locked;
+  
+++<<<<<<< HEAD
+ +		entry->hw_stats_type = act->hw_stats_type;
+++=======
++ 		entry->hw_stats = tc_act_hw_stats(act->hw_stats);
+++>>>>>>> 16f8036086a9 (net: flow_offload: skip hw stats check for FLOW_ACTION_HW_STATS_DONT_CARE)
+  
+  		if (is_tcf_gact_ok(act)) {
+  			entry->id = FLOW_ACTION_ACCEPT;
+@@@ -3619,7 -3624,7 +3633,11 @@@
+  				entry->mangle.mask = tcf_pedit_mask(act, k);
+  				entry->mangle.val = tcf_pedit_val(act, k);
+  				entry->mangle.offset = tcf_pedit_offset(act, k);
+++<<<<<<< HEAD
+ +				entry->hw_stats_type = act->hw_stats_type;
+++=======
++ 				entry->hw_stats = tc_act_hw_stats(act->hw_stats);
+++>>>>>>> 16f8036086a9 (net: flow_offload: skip hw stats check for FLOW_ACTION_HW_STATS_DONT_CARE)
+  				entry = &flow_action->entries[++j];
+  			}
+  		} else if (is_tcf_csum(act)) {
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+* Unmerged path include/net/flow_offload.h
+* Unmerged path net/sched/cls_api.c
