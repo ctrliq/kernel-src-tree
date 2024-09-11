@@ -1,0 +1,233 @@
+kasan: inline HW_TAGS helper functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit c80a03664e154b7263af1c4dd53f42221d0c8283
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/c80a0366.failed
+
+Mark all static functions in common.c and kasan.h that are used for
+hardware tag-based KASAN as inline to avoid unnecessary function calls.
+
+Link: https://lkml.kernel.org/r/2c94a2af0657f2b95b9337232339ff5ffa643ab5.1612546384.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c80a03664e154b7263af1c4dd53f42221d0c8283)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+diff --cc mm/kasan/common.c
+index 0d0cb20ec1a4,b5e08d4cefec..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -338,17 -279,11 +338,22 @@@ void kasan_poison_object_data(struct km
+   *    based on objects indexes, so that objects that are next to each other
+   *    get different tags.
+   */
+++<<<<<<< HEAD
+ +static u8 assign_tag(struct kmem_cache *cache, const void *object,
+ +			bool init, bool keep_tag)
+++=======
++ static inline u8 assign_tag(struct kmem_cache *cache,
++ 					const void *object, bool init)
+++>>>>>>> c80a03664e15 (kasan: inline HW_TAGS helper functions)
+  {
+ -	if (IS_ENABLED(CONFIG_KASAN_GENERIC))
+ -		return 0xff;
+ +	/*
+ +	 * 1. When an object is kmalloc()'ed, two hooks are called:
+ +	 *    kasan_slab_alloc() and kasan_kmalloc(). We assign the
+ +	 *    tag only in the first one.
+ +	 * 2. We reuse the same tag for krealloc'ed objects.
+ +	 */
+ +	if (keep_tag)
+ +		return get_tag(object);
+  
+  	/*
+  	 * If the cache neither has a constructor nor has SLAB_TYPESAFE_BY_RCU
+@@@ -388,28 -322,11 +393,33 @@@ void * __must_check kasan_init_slab_obj
+  	return (void *)object;
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool shadow_invalid(u8 tag, s8 shadow_byte)
+ +{
+ +	if (IS_ENABLED(CONFIG_KASAN_GENERIC))
+ +		return shadow_byte < 0 ||
+ +			shadow_byte >= KASAN_SHADOW_SCALE_SIZE;
+ +
+ +	/* else CONFIG_KASAN_SW_TAGS: */
+ +	if ((u8)shadow_byte == KASAN_TAG_INVALID)
+ +		return true;
+ +	if ((tag != KASAN_TAG_KERNEL) && (tag != (u8)shadow_byte))
+ +		return true;
+ +
+ +	return false;
+ +}
+ +
+ +static bool __kasan_slab_free(struct kmem_cache *cache, void *object,
+ +			      unsigned long ip, bool quarantine)
+++=======
++ static inline bool ____kasan_slab_free(struct kmem_cache *cache,
++ 				void *object, unsigned long ip, bool quarantine)
+++>>>>>>> c80a03664e15 (kasan: inline HW_TAGS helper functions)
+  {
+ +	s8 shadow_byte;
+  	u8 tag;
+  	void *tagged_object;
+ +	unsigned long rounded_up_size;
+  
+  	tag = get_tag(object);
+  	tagged_object = object;
+@@@ -431,27 -350,120 +441,127 @@@
+  		return true;
+  	}
+  
+ -	kasan_poison(object, round_up(cache->object_size, KASAN_GRANULE_SIZE),
+ -			KASAN_KMALLOC_FREE);
+ +	rounded_up_size = round_up(cache->object_size, KASAN_SHADOW_SCALE_SIZE);
+ +	kasan_poison_shadow(object, rounded_up_size, KASAN_KMALLOC_FREE);
+  
+ -	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine))
+ +	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine) ||
+ +			unlikely(!(cache->flags & SLAB_KASAN)))
+  		return false;
+  
+ -	if (kasan_stack_collection_enabled())
+ -		kasan_set_free_info(cache, object, tag);
+ +	kasan_set_free_info(cache, object, tag);
+ +
+ +	quarantine_put(cache, object);
+  
+ -	return kasan_quarantine_put(cache, object);
+ +	return IS_ENABLED(CONFIG_KASAN_GENERIC);
+  }
+  
+ -bool __kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+ +bool kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+  {
+ -	return ____kasan_slab_free(cache, object, ip, true);
+ +	return __kasan_slab_free(cache, object, ip, true);
+  }
+  
+++<<<<<<< HEAD
+ +static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +				size_t size, gfp_t flags, bool keep_tag)
+++=======
++ static inline bool ____kasan_kfree_large(void *ptr, unsigned long ip)
++ {
++ 	if (ptr != page_address(virt_to_head_page(ptr))) {
++ 		kasan_report_invalid_free(ptr, ip);
++ 		return true;
++ 	}
++ 
++ 	if (!kasan_byte_accessible(ptr)) {
++ 		kasan_report_invalid_free(ptr, ip);
++ 		return true;
++ 	}
++ 
++ 	/*
++ 	 * The object will be poisoned by kasan_free_pages() or
++ 	 * kasan_slab_free_mempool().
++ 	 */
++ 
++ 	return false;
++ }
++ 
++ void __kasan_kfree_large(void *ptr, unsigned long ip)
++ {
++ 	____kasan_kfree_large(ptr, ip);
++ }
++ 
++ void __kasan_slab_free_mempool(void *ptr, unsigned long ip)
++ {
++ 	struct page *page;
++ 
++ 	page = virt_to_head_page(ptr);
++ 
++ 	/*
++ 	 * Even though this function is only called for kmem_cache_alloc and
++ 	 * kmalloc backed mempool allocations, those allocations can still be
++ 	 * !PageSlab() when the size provided to kmalloc is larger than
++ 	 * KMALLOC_MAX_SIZE, and kmalloc falls back onto page_alloc.
++ 	 */
++ 	if (unlikely(!PageSlab(page))) {
++ 		if (____kasan_kfree_large(ptr, ip))
++ 			return;
++ 		kasan_poison(ptr, page_size(page), KASAN_FREE_PAGE);
++ 	} else {
++ 		____kasan_slab_free(page->slab_cache, ptr, ip, false);
++ 	}
++ }
++ 
++ static void set_alloc_info(struct kmem_cache *cache, void *object,
++ 				gfp_t flags, bool is_kmalloc)
++ {
++ 	struct kasan_alloc_meta *alloc_meta;
++ 
++ 	/* Don't save alloc info for kmalloc caches in kasan_slab_alloc(). */
++ 	if (cache->kasan_info.is_kmalloc && !is_kmalloc)
++ 		return;
++ 
++ 	alloc_meta = kasan_get_alloc_meta(cache, object);
++ 	if (alloc_meta)
++ 		kasan_set_track(&alloc_meta->alloc_track, flags);
++ }
++ 
++ void * __must_check __kasan_slab_alloc(struct kmem_cache *cache,
++ 					void *object, gfp_t flags)
++ {
++ 	u8 tag;
++ 	void *tagged_object;
++ 
++ 	if (gfpflags_allow_blocking(flags))
++ 		kasan_quarantine_reduce();
++ 
++ 	if (unlikely(object == NULL))
++ 		return NULL;
++ 
++ 	if (is_kfence_address(object))
++ 		return (void *)object;
++ 
++ 	/*
++ 	 * Generate and assign random tag for tag-based modes.
++ 	 * Tag is ignored in set_tag() for the generic mode.
++ 	 */
++ 	tag = assign_tag(cache, object, false);
++ 	tagged_object = set_tag(object, tag);
++ 
++ 	/*
++ 	 * Unpoison the whole object.
++ 	 * For kmalloc() allocations, kasan_kmalloc() will do precise poisoning.
++ 	 */
++ 	kasan_unpoison(tagged_object, cache->object_size);
++ 
++ 	/* Save alloc info (if possible) for non-kmalloc() allocations. */
++ 	if (kasan_stack_collection_enabled())
++ 		set_alloc_info(cache, (void *)object, flags, false);
++ 
++ 	return tagged_object;
++ }
++ 
++ static inline void *____kasan_kmalloc(struct kmem_cache *cache,
++ 				const void *object, size_t size, gfp_t flags)
+++>>>>>>> c80a03664e15 (kasan: inline HW_TAGS helper functions)
+  {
+  	unsigned long redzone_start;
+  	unsigned long redzone_end;
+* Unmerged path mm/kasan/common.c
