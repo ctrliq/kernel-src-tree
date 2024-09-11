@@ -1,0 +1,368 @@
+iommu/vt-d: trace: Extend map_sg trace event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 984d03adc9bdfb1bea408f9cc41a67214ccdffd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/984d03ad.failed
+
+Current map_sg stores trace message in a coarse manner. This
+extends it so that more detailed messages could be traced.
+
+The map_sg trace message looks like:
+
+map_sg: dev=0000:00:17.0 [1/9] dev_addr=0xf8f90000 phys_addr=0x158051000 size=4096
+map_sg: dev=0000:00:17.0 [2/9] dev_addr=0xf8f91000 phys_addr=0x15a858000 size=4096
+map_sg: dev=0000:00:17.0 [3/9] dev_addr=0xf8f92000 phys_addr=0x15aa13000 size=4096
+map_sg: dev=0000:00:17.0 [4/9] dev_addr=0xf8f93000 phys_addr=0x1570f1000 size=8192
+map_sg: dev=0000:00:17.0 [5/9] dev_addr=0xf8f95000 phys_addr=0x15c6d0000 size=4096
+map_sg: dev=0000:00:17.0 [6/9] dev_addr=0xf8f96000 phys_addr=0x157194000 size=4096
+map_sg: dev=0000:00:17.0 [7/9] dev_addr=0xf8f97000 phys_addr=0x169552000 size=4096
+map_sg: dev=0000:00:17.0 [8/9] dev_addr=0xf8f98000 phys_addr=0x169dde000 size=4096
+map_sg: dev=0000:00:17.0 [9/9] dev_addr=0xf8f99000 phys_addr=0x148351000 size=4096
+
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 984d03adc9bdfb1bea408f9cc41a67214ccdffd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 2ab9e23807cd,fb21a7745db2..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -3787,8 -3797,260 +3787,263 @@@ static const struct dma_map_ops intel_d
+  	.map_page = intel_map_page,
+  	.unmap_page = intel_unmap_page,
+  	.map_resource = intel_map_resource,
+ -	.unmap_resource = intel_unmap_resource,
+ +	.unmap_resource = intel_unmap_page,
+  	.dma_supported = dma_direct_supported,
+++<<<<<<< HEAD
+++=======
++ 	.mmap = dma_common_mmap,
++ 	.get_sgtable = dma_common_get_sgtable,
++ 	.get_required_mask = intel_get_required_mask,
++ };
++ 
++ static void
++ bounce_sync_single(struct device *dev, dma_addr_t addr, size_t size,
++ 		   enum dma_data_direction dir, enum dma_sync_target target)
++ {
++ 	struct dmar_domain *domain;
++ 	phys_addr_t tlb_addr;
++ 
++ 	domain = find_domain(dev);
++ 	if (WARN_ON(!domain))
++ 		return;
++ 
++ 	tlb_addr = intel_iommu_iova_to_phys(&domain->domain, addr);
++ 	if (is_swiotlb_buffer(tlb_addr))
++ 		swiotlb_tbl_sync_single(dev, tlb_addr, size, dir, target);
++ }
++ 
++ static dma_addr_t
++ bounce_map_single(struct device *dev, phys_addr_t paddr, size_t size,
++ 		  enum dma_data_direction dir, unsigned long attrs,
++ 		  u64 dma_mask)
++ {
++ 	size_t aligned_size = ALIGN(size, VTD_PAGE_SIZE);
++ 	struct dmar_domain *domain;
++ 	struct intel_iommu *iommu;
++ 	unsigned long iova_pfn;
++ 	unsigned long nrpages;
++ 	phys_addr_t tlb_addr;
++ 	int prot = 0;
++ 	int ret;
++ 
++ 	domain = deferred_attach_domain(dev);
++ 	if (WARN_ON(dir == DMA_NONE || !domain))
++ 		return DMA_MAPPING_ERROR;
++ 
++ 	iommu = domain_get_iommu(domain);
++ 	if (WARN_ON(!iommu))
++ 		return DMA_MAPPING_ERROR;
++ 
++ 	nrpages = aligned_nrpages(0, size);
++ 	iova_pfn = intel_alloc_iova(dev, domain,
++ 				    dma_to_mm_pfn(nrpages), dma_mask);
++ 	if (!iova_pfn)
++ 		return DMA_MAPPING_ERROR;
++ 
++ 	/*
++ 	 * Check if DMAR supports zero-length reads on write only
++ 	 * mappings..
++ 	 */
++ 	if (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL ||
++ 			!cap_zlr(iommu->cap))
++ 		prot |= DMA_PTE_READ;
++ 	if (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL)
++ 		prot |= DMA_PTE_WRITE;
++ 
++ 	/*
++ 	 * If both the physical buffer start address and size are
++ 	 * page aligned, we don't need to use a bounce page.
++ 	 */
++ 	if (!IS_ALIGNED(paddr | size, VTD_PAGE_SIZE)) {
++ 		tlb_addr = swiotlb_tbl_map_single(dev,
++ 				__phys_to_dma(dev, io_tlb_start),
++ 				paddr, size, aligned_size, dir, attrs);
++ 		if (tlb_addr == DMA_MAPPING_ERROR) {
++ 			goto swiotlb_error;
++ 		} else {
++ 			/* Cleanup the padding area. */
++ 			void *padding_start = phys_to_virt(tlb_addr);
++ 			size_t padding_size = aligned_size;
++ 
++ 			if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++ 			    (dir == DMA_TO_DEVICE ||
++ 			     dir == DMA_BIDIRECTIONAL)) {
++ 				padding_start += size;
++ 				padding_size -= size;
++ 			}
++ 
++ 			memset(padding_start, 0, padding_size);
++ 		}
++ 	} else {
++ 		tlb_addr = paddr;
++ 	}
++ 
++ 	ret = domain_pfn_mapping(domain, mm_to_dma_pfn(iova_pfn),
++ 				 tlb_addr >> VTD_PAGE_SHIFT, nrpages, prot);
++ 	if (ret)
++ 		goto mapping_error;
++ 
++ 	trace_bounce_map_single(dev, iova_pfn << PAGE_SHIFT, paddr, size);
++ 
++ 	return (phys_addr_t)iova_pfn << PAGE_SHIFT;
++ 
++ mapping_error:
++ 	if (is_swiotlb_buffer(tlb_addr))
++ 		swiotlb_tbl_unmap_single(dev, tlb_addr, size,
++ 					 aligned_size, dir, attrs);
++ swiotlb_error:
++ 	free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(nrpages));
++ 	dev_err(dev, "Device bounce map: %zx@%llx dir %d --- failed\n",
++ 		size, (unsigned long long)paddr, dir);
++ 
++ 	return DMA_MAPPING_ERROR;
++ }
++ 
++ static void
++ bounce_unmap_single(struct device *dev, dma_addr_t dev_addr, size_t size,
++ 		    enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	size_t aligned_size = ALIGN(size, VTD_PAGE_SIZE);
++ 	struct dmar_domain *domain;
++ 	phys_addr_t tlb_addr;
++ 
++ 	domain = find_domain(dev);
++ 	if (WARN_ON(!domain))
++ 		return;
++ 
++ 	tlb_addr = intel_iommu_iova_to_phys(&domain->domain, dev_addr);
++ 	if (WARN_ON(!tlb_addr))
++ 		return;
++ 
++ 	intel_unmap(dev, dev_addr, size);
++ 	if (is_swiotlb_buffer(tlb_addr))
++ 		swiotlb_tbl_unmap_single(dev, tlb_addr, size,
++ 					 aligned_size, dir, attrs);
++ 
++ 	trace_bounce_unmap_single(dev, dev_addr, size);
++ }
++ 
++ static dma_addr_t
++ bounce_map_page(struct device *dev, struct page *page, unsigned long offset,
++ 		size_t size, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	return bounce_map_single(dev, page_to_phys(page) + offset,
++ 				 size, dir, attrs, *dev->dma_mask);
++ }
++ 
++ static dma_addr_t
++ bounce_map_resource(struct device *dev, phys_addr_t phys_addr, size_t size,
++ 		    enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	return bounce_map_single(dev, phys_addr, size,
++ 				 dir, attrs, *dev->dma_mask);
++ }
++ 
++ static void
++ bounce_unmap_page(struct device *dev, dma_addr_t dev_addr, size_t size,
++ 		  enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	bounce_unmap_single(dev, dev_addr, size, dir, attrs);
++ }
++ 
++ static void
++ bounce_unmap_resource(struct device *dev, dma_addr_t dev_addr, size_t size,
++ 		      enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	bounce_unmap_single(dev, dev_addr, size, dir, attrs);
++ }
++ 
++ static void
++ bounce_unmap_sg(struct device *dev, struct scatterlist *sglist, int nelems,
++ 		enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	for_each_sg(sglist, sg, nelems, i)
++ 		bounce_unmap_page(dev, sg->dma_address,
++ 				  sg_dma_len(sg), dir, attrs);
++ }
++ 
++ static int
++ bounce_map_sg(struct device *dev, struct scatterlist *sglist, int nelems,
++ 	      enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	int i;
++ 	struct scatterlist *sg;
++ 
++ 	for_each_sg(sglist, sg, nelems, i) {
++ 		sg->dma_address = bounce_map_page(dev, sg_page(sg),
++ 						  sg->offset, sg->length,
++ 						  dir, attrs);
++ 		if (sg->dma_address == DMA_MAPPING_ERROR)
++ 			goto out_unmap;
++ 		sg_dma_len(sg) = sg->length;
++ 	}
++ 
++ 	for_each_sg(sglist, sg, nelems, i)
++ 		trace_bounce_map_sg(dev, i + 1, nelems, sg);
++ 
++ 	return nelems;
++ 
++ out_unmap:
++ 	bounce_unmap_sg(dev, sglist, i, dir, attrs | DMA_ATTR_SKIP_CPU_SYNC);
++ 	return 0;
++ }
++ 
++ static void
++ bounce_sync_single_for_cpu(struct device *dev, dma_addr_t addr,
++ 			   size_t size, enum dma_data_direction dir)
++ {
++ 	bounce_sync_single(dev, addr, size, dir, SYNC_FOR_CPU);
++ }
++ 
++ static void
++ bounce_sync_single_for_device(struct device *dev, dma_addr_t addr,
++ 			      size_t size, enum dma_data_direction dir)
++ {
++ 	bounce_sync_single(dev, addr, size, dir, SYNC_FOR_DEVICE);
++ }
++ 
++ static void
++ bounce_sync_sg_for_cpu(struct device *dev, struct scatterlist *sglist,
++ 		       int nelems, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	for_each_sg(sglist, sg, nelems, i)
++ 		bounce_sync_single(dev, sg_dma_address(sg),
++ 				   sg_dma_len(sg), dir, SYNC_FOR_CPU);
++ }
++ 
++ static void
++ bounce_sync_sg_for_device(struct device *dev, struct scatterlist *sglist,
++ 			  int nelems, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	for_each_sg(sglist, sg, nelems, i)
++ 		bounce_sync_single(dev, sg_dma_address(sg),
++ 				   sg_dma_len(sg), dir, SYNC_FOR_DEVICE);
++ }
++ 
++ static const struct dma_map_ops bounce_dma_ops = {
++ 	.alloc			= intel_alloc_coherent,
++ 	.free			= intel_free_coherent,
++ 	.map_sg			= bounce_map_sg,
++ 	.unmap_sg		= bounce_unmap_sg,
++ 	.map_page		= bounce_map_page,
++ 	.unmap_page		= bounce_unmap_page,
++ 	.sync_single_for_cpu	= bounce_sync_single_for_cpu,
++ 	.sync_single_for_device	= bounce_sync_single_for_device,
++ 	.sync_sg_for_cpu	= bounce_sync_sg_for_cpu,
++ 	.sync_sg_for_device	= bounce_sync_sg_for_device,
++ 	.map_resource		= bounce_map_resource,
++ 	.unmap_resource		= bounce_unmap_resource,
++ 	.dma_supported		= dma_direct_supported,
+++>>>>>>> 984d03adc9bd (iommu/vt-d: trace: Extend map_sg trace event)
+  };
+  
+  static inline int iommu_domain_cache_init(void)
+* Unmerged path drivers/iommu/intel-iommu.c
+diff --git a/include/trace/events/intel_iommu.h b/include/trace/events/intel_iommu.h
+index 54e61d456cdf..112bd06487bf 100644
+--- a/include/trace/events/intel_iommu.h
++++ b/include/trace/events/intel_iommu.h
+@@ -49,12 +49,6 @@ DEFINE_EVENT(dma_map, map_single,
+ 	TP_ARGS(dev, dev_addr, phys_addr, size)
+ );
+ 
+-DEFINE_EVENT(dma_map, map_sg,
+-	TP_PROTO(struct device *dev, dma_addr_t dev_addr, phys_addr_t phys_addr,
+-		 size_t size),
+-	TP_ARGS(dev, dev_addr, phys_addr, size)
+-);
+-
+ DEFINE_EVENT(dma_map, bounce_map_single,
+ 	TP_PROTO(struct device *dev, dma_addr_t dev_addr, phys_addr_t phys_addr,
+ 		 size_t size),
+@@ -99,6 +93,48 @@ DEFINE_EVENT(dma_unmap, bounce_unmap_single,
+ 	TP_ARGS(dev, dev_addr, size)
+ );
+ 
++DECLARE_EVENT_CLASS(dma_map_sg,
++	TP_PROTO(struct device *dev, int index, int total,
++		 struct scatterlist *sg),
++
++	TP_ARGS(dev, index, total, sg),
++
++	TP_STRUCT__entry(
++		__string(dev_name, dev_name(dev))
++		__field(dma_addr_t, dev_addr)
++		__field(phys_addr_t, phys_addr)
++		__field(size_t,	size)
++		__field(int, index)
++		__field(int, total)
++	),
++
++	TP_fast_assign(
++		__assign_str(dev_name, dev_name(dev));
++		__entry->dev_addr = sg->dma_address;
++		__entry->phys_addr = sg_phys(sg);
++		__entry->size = sg->dma_length;
++		__entry->index = index;
++		__entry->total = total;
++	),
++
++	TP_printk("dev=%s [%d/%d] dev_addr=0x%llx phys_addr=0x%llx size=%zu",
++		  __get_str(dev_name), __entry->index, __entry->total,
++		  (unsigned long long)__entry->dev_addr,
++		  (unsigned long long)__entry->phys_addr,
++		  __entry->size)
++);
++
++DEFINE_EVENT(dma_map_sg, map_sg,
++	TP_PROTO(struct device *dev, int index, int total,
++		 struct scatterlist *sg),
++	TP_ARGS(dev, index, total, sg)
++);
++
++DEFINE_EVENT(dma_map_sg, bounce_map_sg,
++	TP_PROTO(struct device *dev, int index, int total,
++		 struct scatterlist *sg),
++	TP_ARGS(dev, index, total, sg)
++);
+ #endif /* _TRACE_INTEL_IOMMU_H */
+ 
+ /* This part must be outside protection */
