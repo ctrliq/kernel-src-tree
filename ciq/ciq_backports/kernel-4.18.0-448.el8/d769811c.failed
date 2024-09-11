@@ -1,0 +1,142 @@
+perf/x86: Add support for perf text poke event for text_poke_bp_batch() callers
+
+jira LE-1907
+cve CVE-2021-26341
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit d769811ca93303deb1d8729d20cceaca7051a6f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d769811c.failed
+
+Add support for perf text poke event for text_poke_bp_batch() callers. That
+includes jump labels. See comments for more details.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200512121922.8997-3-adrian.hunter@intel.com
+(cherry picked from commit d769811ca93303deb1d8729d20cceaca7051a6f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/alternative.c
+diff --cc arch/x86/kernel/alternative.c
+index 0b65a0cb501d,f94c9f371411..000000000000
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@@ -782,14 -1002,40 +783,15 @@@ struct text_poke_loc 
+  	s32 rel32;
+  	u8 opcode;
+  	const u8 text[POKE_MAX_OPCODE_SIZE];
++ 	u8 old;
+  };
+  
+ -struct bp_patching_desc {
+ +static struct bp_patching_desc {
+  	struct text_poke_loc *vec;
+  	int nr_entries;
+ -	atomic_t refs;
+ -};
+ -
+ -static struct bp_patching_desc *bp_desc;
+ +} bp_patching;
+  
+ -static __always_inline
+ -struct bp_patching_desc *try_get_desc(struct bp_patching_desc **descp)
+ -{
+ -	struct bp_patching_desc *desc = __READ_ONCE(*descp); /* rcu_dereference */
+ -
+ -	if (!desc || !arch_atomic_inc_not_zero(&desc->refs))
+ -		return NULL;
+ -
+ -	return desc;
+ -}
+ -
+ -static __always_inline void put_desc(struct bp_patching_desc *desc)
+ -{
+ -	smp_mb__before_atomic();
+ -	arch_atomic_dec(&desc->refs);
+ -}
+ -
+ -static __always_inline void *text_poke_addr(struct text_poke_loc *tp)
+ -{
+ -	return _stext + tp->rel_addr;
+ -}
+ -
+ -static __always_inline int patch_cmp(const void *key, const void *elt)
+ +static int patch_cmp(const void *key, const void *elt)
+  {
+  	struct text_poke_loc *tp = (struct text_poke_loc *) elt;
+  
+@@@ -918,23 -1170,56 +920,68 @@@ static void text_poke_bp_batch(struct t
+  	/*
+  	 * First step: add a int3 trap to the address that will be patched.
+  	 */
+++<<<<<<< HEAD
+ +	for (i = 0; i < nr_entries; i++)
+ +		text_poke(tp[i].addr, &int3, sizeof(int3));
+++=======
++ 	for (i = 0; i < nr_entries; i++) {
++ 		tp[i].old = *(u8 *)text_poke_addr(&tp[i]);
++ 		text_poke(text_poke_addr(&tp[i]), &int3, INT3_INSN_SIZE);
++ 	}
+++>>>>>>> d769811ca933 (perf/x86: Add support for perf text poke event for text_poke_bp_batch() callers)
+  
+ -	text_poke_sync();
+ +	on_each_cpu(do_sync_core, NULL, 1);
+  
+  	/*
+  	 * Second step: update all but the first byte of the patched range.
+  	 */
+  	for (do_sync = 0, i = 0; i < nr_entries; i++) {
++ 		u8 old[POKE_MAX_OPCODE_SIZE] = { tp[i].old, };
+  		int len = text_opcode_size(tp[i].opcode);
+  
+++<<<<<<< HEAD
+ +		if (len - sizeof(int3) > 0) {
+ +			text_poke((char *)tp[i].addr + sizeof(int3),
+ +				  (const char *)tp[i].text + sizeof(int3),
+ +				  len - sizeof(int3));
+++=======
++ 		if (len - INT3_INSN_SIZE > 0) {
++ 			memcpy(old + INT3_INSN_SIZE,
++ 			       text_poke_addr(&tp[i]) + INT3_INSN_SIZE,
++ 			       len - INT3_INSN_SIZE);
++ 			text_poke(text_poke_addr(&tp[i]) + INT3_INSN_SIZE,
++ 				  (const char *)tp[i].text + INT3_INSN_SIZE,
++ 				  len - INT3_INSN_SIZE);
+++>>>>>>> d769811ca933 (perf/x86: Add support for perf text poke event for text_poke_bp_batch() callers)
+  			do_sync++;
+  		}
++ 
++ 		/*
++ 		 * Emit a perf event to record the text poke, primarily to
++ 		 * support Intel PT decoding which must walk the executable code
++ 		 * to reconstruct the trace. The flow up to here is:
++ 		 *   - write INT3 byte
++ 		 *   - IPI-SYNC
++ 		 *   - write instruction tail
++ 		 * At this point the actual control flow will be through the
++ 		 * INT3 and handler and not hit the old or new instruction.
++ 		 * Intel PT outputs FUP/TIP packets for the INT3, so the flow
++ 		 * can still be decoded. Subsequently:
++ 		 *   - emit RECORD_TEXT_POKE with the new instruction
++ 		 *   - IPI-SYNC
++ 		 *   - write first byte
++ 		 *   - IPI-SYNC
++ 		 * So before the text poke event timestamp, the decoder will see
++ 		 * either the old instruction flow or FUP/TIP of INT3. After the
++ 		 * text poke event timestamp, the decoder will see either the
++ 		 * new instruction flow or FUP/TIP of INT3. Thus decoders can
++ 		 * use the timestamp as the point at which to modify the
++ 		 * executable code.
++ 		 * The old instruction is recorded so that the event can be
++ 		 * processed forwards or backwards.
++ 		 */
++ 		perf_event_text_poke(text_poke_addr(&tp[i]), old, len,
++ 				     tp[i].text, len);
+  	}
+  
+  	if (do_sync) {
+* Unmerged path arch/x86/kernel/alternative.c
