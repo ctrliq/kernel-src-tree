@@ -1,0 +1,115 @@
+x86/realmode: Setup AP jump table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] realmode: Setup AP jump table (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 93.55%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 8940ac9ced8bc1c48c4e28b0784e3234c9d14469
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8940ac9c.failed
+
+As part of the GHCB specification, the booting of APs under SEV-ES
+requires an AP jump table when transitioning from one layer of code to
+another (e.g. when going from UEFI to the OS). As a result, each layer
+that parks an AP must provide the physical address of an AP jump table
+to the next layer via the hypervisor.
+
+Upon booting of the kernel, read the AP jump table address from the
+hypervisor. Under SEV-ES, APs are started using the INIT-SIPI-SIPI
+sequence. Before issuing the first SIPI request for an AP, the start
+CS and IP is programmed into the AP jump table. Upon issuing the SIPI
+request, the AP will awaken and jump to that start CS:IP address.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+[ jroedel@suse.de: - Adapted to different code base
+                   - Moved AP table setup from SIPI sending path to
+		     real-mode setup code
+		   - Fix sparse warnings ]
+Co-developed-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200907131613.12703-67-joro@8bytes.org
+(cherry picked from commit 8940ac9ced8bc1c48c4e28b0784e3234c9d14469)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/sev-es.h
+#	arch/x86/include/uapi/asm/svm.h
+#	arch/x86/kernel/sev-es.c
+diff --cc arch/x86/include/uapi/asm/svm.h
+index 522d42dfc28c,346b8a7155e8..000000000000
+--- a/arch/x86/include/uapi/asm/svm.h
++++ b/arch/x86/include/uapi/asm/svm.h
+@@@ -81,6 -81,14 +81,17 @@@
+  #define SVM_EXIT_AVIC_INCOMPLETE_IPI		0x401
+  #define SVM_EXIT_AVIC_UNACCELERATED_ACCESS	0x402
+  
+++<<<<<<< HEAD
+++=======
++ /* SEV-ES software-defined VMGEXIT events */
++ #define SVM_VMGEXIT_MMIO_READ			0x80000001
++ #define SVM_VMGEXIT_MMIO_WRITE			0x80000002
++ #define SVM_VMGEXIT_AP_JUMP_TABLE		0x80000005
++ #define SVM_VMGEXIT_SET_AP_JUMP_TABLE		0
++ #define SVM_VMGEXIT_GET_AP_JUMP_TABLE		1
++ #define SVM_VMGEXIT_UNSUPPORTED_EVENT		0x8000ffff
++ 
+++>>>>>>> 8940ac9ced8b (x86/realmode: Setup AP jump table)
+  #define SVM_EXIT_ERR           -1
+  
+  #define SVM_EXIT_REASONS \
+* Unmerged path arch/x86/include/asm/sev-es.h
+* Unmerged path arch/x86/kernel/sev-es.c
+* Unmerged path arch/x86/include/asm/sev-es.h
+* Unmerged path arch/x86/include/uapi/asm/svm.h
+* Unmerged path arch/x86/kernel/sev-es.c
+diff --git a/arch/x86/realmode/init.c b/arch/x86/realmode/init.c
+index 262f83cad355..38b6eb754846 100644
+--- a/arch/x86/realmode/init.c
++++ b/arch/x86/realmode/init.c
+@@ -9,6 +9,7 @@
+ #include <asm/realmode.h>
+ #include <asm/tlbflush.h>
+ #include <asm/crash.h>
++#include <asm/sev-es.h>
+ 
+ struct real_mode_header *real_mode_header;
+ u32 *trampoline_cr4_features;
+@@ -38,6 +39,19 @@ void __init reserve_real_mode(void)
+ 	crash_reserve_low_1M();
+ }
+ 
++static void sme_sev_setup_real_mode(struct trampoline_header *th)
++{
++#ifdef CONFIG_AMD_MEM_ENCRYPT
++	if (sme_active())
++		th->flags |= TH_FLAGS_SME_ACTIVE;
++
++	if (sev_es_active()) {
++		if (sev_es_setup_ap_jump_table(real_mode_header))
++			panic("Failed to get/update SEV-ES AP Jump Table");
++	}
++#endif
++}
++
+ static void __init setup_real_mode(void)
+ {
+ 	u16 real_mode_seg;
+@@ -104,13 +118,13 @@ static void __init setup_real_mode(void)
+ 	*trampoline_cr4_features = mmu_cr4_features;
+ 
+ 	trampoline_header->flags = 0;
+-	if (sme_active())
+-		trampoline_header->flags |= TH_FLAGS_SME_ACTIVE;
+ 
+ 	trampoline_pgd = (u64 *) __va(real_mode_header->trampoline_pgd);
+ 	trampoline_pgd[0] = trampoline_pgd_entry.pgd;
+ 	trampoline_pgd[511] = init_top_pgt[511].pgd;
+ #endif
++
++	sme_sev_setup_real_mode(trampoline_header);
+ }
+ 
+ /*
