@@ -1,0 +1,255 @@
+RDMA/mlx5: Add missing synchronize_srcu() for MW cases
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 0417791536ae1e28d7f0418f1d20048ec4d3c6cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/04177915.failed
+
+While MR uses live as the SRCU 'update', the MW case uses the xarray
+directly, xa_erase() causes the MW to become inaccessible to the pagefault
+thread.
+
+Thus whenever a MW is removed from the xarray we must synchronize_srcu()
+before freeing it.
+
+This must be done before freeing the mkey as re-use of the mkey while the
+pagefault thread is using the stale mkey is undesirable.
+
+Add the missing synchronizes to MW and DEVX indirect mkey and delete the
+bogus protection against double destroy in mlx5_core_destroy_mkey()
+
+Fixes: 534fd7aac56a ("IB/mlx5: Manage indirection mkey upon DEVX flow for ODP")
+Fixes: 6aec21f6a832 ("IB/mlx5: Page faults handling infrastructure")
+Link: https://lore.kernel.org/r/20191001153821.23621-7-jgg@ziepe.ca
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0417791536ae1e28d7f0418f1d20048ec4d3c6cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+diff --cc drivers/infiniband/hw/mlx5/devx.c
+index b380b1b3cb05,d609f4659afb..000000000000
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@@ -1081,54 -1298,74 +1081,107 @@@ static int devx_handle_mkey_create(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void devx_free_indirect_mkey(struct rcu_head *rcu)
+ +{
+ +	kfree(container_of(rcu, struct devx_obj, devx_mr.rcu));
+ +}
+ +
+ +/* This function to delete from the radix tree needs to be called before
+ + * destroying the underlying mkey. Otherwise a race might occur in case that
+ + * other thread will get the same mkey before this one will be deleted,
+ + * in that case it will fail via inserting to the tree its own data.
+ + *
+ + * Note:
+ + * An error in the destroy is not expected unless there is some other indirect
+ + * mkey which points to this one. In a kernel cleanup flow it will be just
+ + * destroyed in the iterative destruction call. In a user flow, in case
+ + * the application didn't close in the expected order it's its own problem,
+ + * the mkey won't be part of the tree, in both cases the kernel is safe.
+ + */
+ +static void devx_cleanup_mkey(struct devx_obj *obj)
+ +{
+ +	xa_erase(&obj->mdev->priv.mkey_table,
+ +		 mlx5_base_mkey(obj->devx_mr.mmkey.key));
+++=======
++ static void devx_cleanup_subscription(struct mlx5_ib_dev *dev,
++ 				      struct devx_event_subscription *sub)
++ {
++ 	struct devx_event *event;
++ 	struct devx_obj_event *xa_val_level2;
++ 
++ 	if (sub->is_cleaned)
++ 		return;
++ 
++ 	sub->is_cleaned = 1;
++ 	list_del_rcu(&sub->xa_list);
++ 
++ 	if (list_empty(&sub->obj_list))
++ 		return;
++ 
++ 	list_del_rcu(&sub->obj_list);
++ 	/* check whether key level 1 for this obj_sub_list is empty */
++ 	event = xa_load(&dev->devx_event_table.event_xa,
++ 			sub->xa_key_level1);
++ 	WARN_ON(!event);
++ 
++ 	xa_val_level2 = xa_load(&event->object_ids, sub->xa_key_level2);
++ 	if (list_empty(&xa_val_level2->obj_sub_list)) {
++ 		xa_erase(&event->object_ids,
++ 			 sub->xa_key_level2);
++ 		kfree_rcu(xa_val_level2, rcu);
++ 	}
+++>>>>>>> 0417791536ae (RDMA/mlx5: Add missing synchronize_srcu() for MW cases)
+  }
+  
+  static int devx_obj_cleanup(struct ib_uobject *uobject,
+ -			    enum rdma_remove_reason why,
+ -			    struct uverbs_attr_bundle *attrs)
+ +			    enum rdma_remove_reason why)
+  {
+  	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)];
+ -	struct mlx5_devx_event_table *devx_event_table;
+  	struct devx_obj *obj = uobject->object;
+ -	struct devx_event_subscription *sub_entry, *tmp;
+ -	struct mlx5_ib_dev *dev;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY)
+ +		devx_cleanup_mkey(obj);
+++=======
++ 	dev = mlx5_udata_to_mdev(&attrs->driver_udata);
++ 	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY) {
++ 		/*
++ 		 * The pagefault_single_data_segment() does commands against
++ 		 * the mmkey, we must wait for that to stop before freeing the
++ 		 * mkey, as another allocation could get the same mkey #.
++ 		 */
++ 		xa_erase(&obj->ib_dev->mdev->priv.mkey_table,
++ 			 mlx5_base_mkey(obj->devx_mr.mmkey.key));
++ 		synchronize_srcu(&dev->mr_srcu);
++ 	}
+++>>>>>>> 0417791536ae (RDMA/mlx5: Add missing synchronize_srcu() for MW cases)
+  
+  	if (obj->flags & DEVX_OBJ_FLAGS_DCT)
+ -		ret = mlx5_core_destroy_dct(obj->ib_dev->mdev, &obj->core_dct);
+ -	else if (obj->flags & DEVX_OBJ_FLAGS_CQ)
+ -		ret = mlx5_core_destroy_cq(obj->ib_dev->mdev, &obj->core_cq);
+ +		ret = mlx5_core_destroy_dct(obj->mdev, &obj->core_dct);
+  	else
+ -		ret = mlx5_cmd_exec(obj->ib_dev->mdev, obj->dinbox,
+ -				    obj->dinlen, out, sizeof(out));
+ +		ret = mlx5_cmd_exec(obj->mdev, obj->dinbox, obj->dinlen, out,
+ +				    sizeof(out));
+  	if (ib_is_destroy_retryable(ret, why, uobject))
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY) {
+ +		struct mlx5_ib_dev *dev = to_mdev(uobject->context->device);
+ +
+ +		call_srcu(&dev->mr_srcu, &obj->devx_mr.rcu,
+ +			  devx_free_indirect_mkey);
+ +		return ret;
+ +	}
+++=======
++ 	devx_event_table = &dev->devx_event_table;
++ 
++ 	mutex_lock(&devx_event_table->event_xa_lock);
++ 	list_for_each_entry_safe(sub_entry, tmp, &obj->event_sub, obj_list)
++ 		devx_cleanup_subscription(dev, sub_entry);
++ 	mutex_unlock(&devx_event_table->event_xa_lock);
+++>>>>>>> 0417791536ae (RDMA/mlx5: Add missing synchronize_srcu() for MW cases)
+  
+  	kfree(obj);
+  	return ret;
+@@@ -1211,19 -1476,22 +1258,20 @@@ static int UVERBS_HANDLER(MLX5_IB_METHO
+  
+  	if (opcode == MLX5_CMD_OP_CREATE_GENERAL_OBJECT)
+  		obj_type = MLX5_GET(general_obj_in_cmd_hdr, cmd_in, obj_type);
+- 
+  	obj->obj_id = get_enc_obj_id(opcode | obj_type << 16, obj_id);
+  
++ 	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY) {
++ 		err = devx_handle_mkey_indirect(obj, dev, cmd_in, cmd_out);
++ 		if (err)
++ 			goto obj_destroy;
++ 	}
+  	return 0;
+  
+- err_copy:
+- 	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY)
+- 		devx_cleanup_mkey(obj);
+  obj_destroy:
+  	if (obj->flags & DEVX_OBJ_FLAGS_DCT)
+ -		mlx5_core_destroy_dct(obj->ib_dev->mdev, &obj->core_dct);
+ -	else if (obj->flags & DEVX_OBJ_FLAGS_CQ)
+ -		mlx5_core_destroy_cq(obj->ib_dev->mdev, &obj->core_cq);
+ +		mlx5_core_destroy_dct(obj->mdev, &obj->core_dct);
+  	else
+ -		mlx5_cmd_exec(obj->ib_dev->mdev, obj->dinbox, obj->dinlen, out,
+ +		mlx5_cmd_exec(obj->mdev, obj->dinbox, obj->dinlen, out,
+  			      sizeof(out));
+  obj_free:
+  	kfree(obj);
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 4c2d9432d3fc..2162e4180260 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -610,7 +610,6 @@ struct mlx5_ib_mw {
+ struct mlx5_ib_devx_mr {
+ 	struct mlx5_core_mkey	mmkey;
+ 	int			ndescs;
+-	struct rcu_head		rcu;
+ };
+ 
+ struct mlx5_ib_umr_context {
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index 3f87cef78c09..2d4449d396fa 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1850,14 +1850,25 @@ struct ib_mw *mlx5_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
+ 
+ int mlx5_ib_dealloc_mw(struct ib_mw *mw)
+ {
++	struct mlx5_ib_dev *dev = to_mdev(mw->device);
+ 	struct mlx5_ib_mw *mmw = to_mmw(mw);
+ 	int err;
+ 
+-	err =  mlx5_core_destroy_mkey((to_mdev(mw->device))->mdev,
+-				      &mmw->mmkey);
+-	if (!err)
+-		kfree(mmw);
+-	return err;
++	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
++		xa_erase(&dev->mdev->priv.mkey_table,
++			 mlx5_base_mkey(mmw->mmkey.key));
++		/*
++		 * pagefault_single_data_segment() may be accessing mmw under
++		 * SRCU if the user bound an ODP MR to this MW.
++		 */
++		synchronize_srcu(&dev->mr_srcu);
++	}
++
++	err = mlx5_core_destroy_mkey(dev->mdev, &mmw->mmkey);
++	if (err)
++		return err;
++	kfree(mmw);
++	return 0;
+ }
+ 
+ int mlx5_ib_check_mr_status(struct ib_mr *ibmr, u32 check_mask,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/mr.c b/drivers/net/ethernet/mellanox/mlx5/core/mr.c
+index 9231b39d18b2..c501bf2a0252 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mr.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mr.c
+@@ -112,17 +112,11 @@ int mlx5_core_destroy_mkey(struct mlx5_core_dev *dev,
+ 	u32 out[MLX5_ST_SZ_DW(destroy_mkey_out)] = {0};
+ 	u32 in[MLX5_ST_SZ_DW(destroy_mkey_in)]   = {0};
+ 	struct xarray *mkeys = &dev->priv.mkey_table;
+-	struct mlx5_core_mkey *deleted_mkey;
+ 	unsigned long flags;
+ 
+ 	xa_lock_irqsave(mkeys, flags);
+-	deleted_mkey = __xa_erase(mkeys, mlx5_base_mkey(mkey->key));
++	__xa_erase(mkeys, mlx5_base_mkey(mkey->key));
+ 	xa_unlock_irqrestore(mkeys, flags);
+-	if (!deleted_mkey) {
+-		mlx5_core_dbg(dev, "failed xarray delete of mkey 0x%x\n",
+-			      mlx5_base_mkey(mkey->key));
+-		return -ENOENT;
+-	}
+ 
+ 	MLX5_SET(destroy_mkey_in, in, opcode, MLX5_CMD_OP_DESTROY_MKEY);
+ 	MLX5_SET(destroy_mkey_in, in, mkey_index, mlx5_mkey_to_idx(mkey->key));
