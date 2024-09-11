@@ -1,0 +1,166 @@
+arm64/mm: wire up CONFIG_ARCH_HAS_SET_DIRECT_MAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ard Biesheuvel <ard.biesheuvel@arm.com>
+commit 4739d53fcd1df8a9f6f72bb02a3a1d852ad252b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4739d53f.failed
+
+Wire up the special helper functions to manipulate aliases of vmalloc
+regions in the linear map.
+
+	Acked-by: Will Deacon <will@kernel.org>
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@arm.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 4739d53fcd1df8a9f6f72bb02a3a1d852ad252b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/Kconfig
+#	mm/vmalloc.c
+diff --cc arch/arm64/Kconfig
+index 0d2c3c889667,61b4a2d35508..000000000000
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@@ -18,12 -20,14 +18,17 @@@ config ARM6
+  	select ARCH_HAS_FAST_MULTIPLIER
+  	select ARCH_HAS_FORTIFY_SOURCE
+  	select ARCH_HAS_GCOV_PROFILE_ALL
+ -	select ARCH_HAS_GIGANTIC_PAGE
+ +	select ARCH_HAS_GIGANTIC_PAGE if (MEMORY_ISOLATION && COMPACTION) || CMA
+  	select ARCH_HAS_KCOV
+ -	select ARCH_HAS_KEEPINITRD
+  	select ARCH_HAS_MEMBARRIER_SYNC_CORE
+  	select ARCH_HAS_PTE_SPECIAL
+++<<<<<<< HEAD
+++=======
++ 	select ARCH_HAS_SETUP_DMA_OPS
++ 	select ARCH_HAS_SET_DIRECT_MAP
+++>>>>>>> 4739d53fcd1d (arm64/mm: wire up CONFIG_ARCH_HAS_SET_DIRECT_MAP)
+  	select ARCH_HAS_SET_MEMORY
+ +	select ARCH_HAS_SG_CHAIN
+  	select ARCH_HAS_STRICT_KERNEL_RWX
+  	select ARCH_HAS_STRICT_MODULE_RWX
+  	select ARCH_HAS_SYNC_DMA_FOR_DEVICE
+diff --cc mm/vmalloc.c
+index a32f48884a43,6bd7b515995c..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -1514,22 -2123,11 +1514,25 @@@ static inline void set_area_direct_map(
+  /* Handle removing and resetting vm mappings related to the vm_struct. */
+  static void vm_remove_mappings(struct vm_struct *area, int deallocate_pages)
+  {
+ -	unsigned long addr = (unsigned long)area->addr;
+  	unsigned long start = ULONG_MAX, end = 0;
+  	int flush_reset = area->flags & VM_FLUSH_RESET_PERMS;
+ +	int flush_dmap = 0;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * The below block can be removed when all architectures that have
+ +	 * direct map permissions also have set_direct_map_() implementations.
+ +	 * This is concerned with resetting the direct map any an vm alias with
+ +	 * execute permissions, without leaving a RW+X window.
+ +	 */
+ +	if (flush_reset && !IS_ENABLED(CONFIG_ARCH_HAS_SET_DIRECT_MAP)) {
+ +		set_memory_nx((unsigned long)area->addr, area->nr_pages);
+ +		set_memory_rw((unsigned long)area->addr, area->nr_pages);
+ +	}
+ +
+++=======
+++>>>>>>> 4739d53fcd1d (arm64/mm: wire up CONFIG_ARCH_HAS_SET_DIRECT_MAP)
+  	remove_vm_area(area->addr);
+  
+  	/* If this is not VM_FLUSH_RESET_PERMS memory, no need for the below. */
+* Unmerged path arch/arm64/Kconfig
+diff --git a/arch/arm64/include/asm/cacheflush.h b/arch/arm64/include/asm/cacheflush.h
+index d264a7274811..7ecd6df567d8 100644
+--- a/arch/arm64/include/asm/cacheflush.h
++++ b/arch/arm64/include/asm/cacheflush.h
+@@ -162,4 +162,7 @@ static inline void flush_cache_vunmap(unsigned long start, unsigned long end)
+ 
+ int set_memory_valid(unsigned long addr, int numpages, int enable);
+ 
++int set_direct_map_invalid_noflush(struct page *page);
++int set_direct_map_default_noflush(struct page *page);
++
+ #endif
+diff --git a/arch/arm64/mm/pageattr.c b/arch/arm64/mm/pageattr.c
+index 6cd645edcf35..9c6b9039ec8f 100644
+--- a/arch/arm64/mm/pageattr.c
++++ b/arch/arm64/mm/pageattr.c
+@@ -159,17 +159,48 @@ int set_memory_valid(unsigned long addr, int numpages, int enable)
+ 					__pgprot(PTE_VALID));
+ }
+ 
+-#ifdef CONFIG_DEBUG_PAGEALLOC
++int set_direct_map_invalid_noflush(struct page *page)
++{
++	struct page_change_data data = {
++		.set_mask = __pgprot(0),
++		.clear_mask = __pgprot(PTE_VALID),
++	};
++
++	if (!rodata_full)
++		return 0;
++
++	return apply_to_page_range(&init_mm,
++				   (unsigned long)page_address(page),
++				   PAGE_SIZE, change_page_range, &data);
++}
++
++int set_direct_map_default_noflush(struct page *page)
++{
++	struct page_change_data data = {
++		.set_mask = __pgprot(PTE_VALID | PTE_WRITE),
++		.clear_mask = __pgprot(PTE_RDONLY),
++	};
++
++	if (!rodata_full)
++		return 0;
++
++	return apply_to_page_range(&init_mm,
++				   (unsigned long)page_address(page),
++				   PAGE_SIZE, change_page_range, &data);
++}
++
+ void __kernel_map_pages(struct page *page, int numpages, int enable)
+ {
++	if (!debug_pagealloc_enabled() && !rodata_full)
++		return;
++
+ 	set_memory_valid((unsigned long)page_address(page), numpages, enable);
+ }
+-#ifdef CONFIG_HIBERNATION
++
+ /*
+- * When built with CONFIG_DEBUG_PAGEALLOC and CONFIG_HIBERNATION, this function
+- * is used to determine if a linear map page has been marked as not-valid by
+- * CONFIG_DEBUG_PAGEALLOC. Walk the page table and check the PTE_VALID bit.
+- * This is based on kern_addr_valid(), which almost does what we need.
++ * This function is used to determine if a linear map page has been marked as
++ * not-valid. Walk the page table and check the PTE_VALID bit. This is based
++ * on kern_addr_valid(), which almost does what we need.
+  *
+  * Because this is only called on the kernel linear map,  p?d_sect() implies
+  * p?d_present(). When debug_pagealloc is enabled, sections mappings are
+@@ -183,6 +214,9 @@ bool kernel_page_present(struct page *page)
+ 	pte_t *ptep;
+ 	unsigned long addr = (unsigned long)page_address(page);
+ 
++	if (!debug_pagealloc_enabled() && !rodata_full)
++		return true;
++
+ 	pgdp = pgd_offset_k(addr);
+ 	if (pgd_none(READ_ONCE(*pgdp)))
+ 		return false;
+@@ -204,5 +238,3 @@ bool kernel_page_present(struct page *page)
+ 	ptep = pte_offset_kernel(pmdp, addr);
+ 	return pte_valid(READ_ONCE(*ptep));
+ }
+-#endif /* CONFIG_HIBERNATION */
+-#endif /* CONFIG_DEBUG_PAGEALLOC */
+* Unmerged path mm/vmalloc.c
