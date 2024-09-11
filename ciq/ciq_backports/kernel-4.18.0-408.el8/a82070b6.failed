@@ -1,0 +1,140 @@
+KVM: x86/mmu: Separate TDP MMU shadow page allocation and initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit a82070b6e71a6642f87ef9e483ddc062c3571678
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/a82070b6.failed
+
+Separate the allocation of shadow pages from their initialization.  This
+is in preparation for splitting huge pages outside of the vCPU fault
+context, which requires a different allocation mechanism.
+
+No functional changed intended.
+
+	Reviewed-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20220119230739.2234394-15-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a82070b6e71a6642f87ef9e483ddc062c3571678)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 00e34bc04af0,4c9a98a28e1d..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -147,38 -171,45 +147,64 @@@ static struct kvm_mmu_page *tdp_mmu_nex
+  		if (kvm_mmu_page_as_id(_root) != _as_id) {		\
+  		} else
+  
+++<<<<<<< HEAD
+ +static union kvm_mmu_page_role page_role_for_level(struct kvm_vcpu *vcpu,
+ +						   int level)
+ +{
+ +	union kvm_mmu_page_role role;
+ +
+ +	role = vcpu->arch.mmu->mmu_role.base;
+ +	role.level = level;
+ +
+ +	return role;
+ +}
+ +
+ +static struct kvm_mmu_page *alloc_tdp_mmu_page(struct kvm_vcpu *vcpu, gfn_t gfn,
+ +					       int level)
+++=======
++ static struct kvm_mmu_page *tdp_mmu_alloc_sp(struct kvm_vcpu *vcpu)
+++>>>>>>> a82070b6e71a (KVM: x86/mmu: Separate TDP MMU shadow page allocation and initialization)
+  {
+  	struct kvm_mmu_page *sp;
+  
+  	sp = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache);
+  	sp->spt = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_shadow_page_cache);
++ 
++ 	return sp;
++ }
++ 
++ static void tdp_mmu_init_sp(struct kvm_mmu_page *sp, gfn_t gfn,
++ 			      union kvm_mmu_page_role role)
++ {
+  	set_page_private(virt_to_page(sp->spt), (unsigned long)sp);
+  
+ -	sp->role = role;
+ +	sp->role.word = page_role_for_level(vcpu, level).word;
+  	sp->gfn = gfn;
+  	sp->tdp_mmu_page = true;
+  
+  	trace_kvm_mmu_get_page(sp, true);
++ }
+  
+- 	return sp;
+++<<<<<<< HEAD
+++=======
++ static void tdp_mmu_init_child_sp(struct kvm_mmu_page *child_sp,
++ 				  struct tdp_iter *iter)
++ {
++ 	struct kvm_mmu_page *parent_sp;
++ 	union kvm_mmu_page_role role;
++ 
++ 	parent_sp = sptep_to_sp(rcu_dereference(iter->sptep));
++ 
++ 	role = parent_sp->role;
++ 	role.level--;
++ 
++ 	tdp_mmu_init_sp(child_sp, iter->gfn, role);
+  }
+  
+++>>>>>>> a82070b6e71a (KVM: x86/mmu: Separate TDP MMU shadow page allocation and initialization)
+  hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu)
+  {
+ -	union kvm_mmu_page_role role = vcpu->arch.mmu->mmu_role.base;
+ +	union kvm_mmu_page_role role;
+  	struct kvm *kvm = vcpu->kvm;
+  	struct kvm_mmu_page *root;
+  
+@@@ -196,7 -225,9 +222,13 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	root = alloc_tdp_mmu_page(vcpu, 0, vcpu->arch.mmu->shadow_root_level);
+++=======
++ 	root = tdp_mmu_alloc_sp(vcpu);
++ 	tdp_mmu_init_sp(root, 0, role);
++ 
+++>>>>>>> a82070b6e71a (KVM: x86/mmu: Separate TDP MMU shadow page allocation and initialization)
+  	refcount_set(&root->tdp_mmu_root_count, 1);
+  
+  	spin_lock(&kvm->arch.tdp_mmu_pages_lock);
+@@@ -982,20 -1048,10 +1014,27 @@@ int kvm_tdp_mmu_map(struct kvm_vcpu *vc
+  			if (is_removed_spte(iter.old_spte))
+  				break;
+  
+++<<<<<<< HEAD
+ +			sp = alloc_tdp_mmu_page(vcpu, iter.gfn, iter.level - 1);
+ +			child_pt = sp->spt;
+ +
+ +			new_spte = make_nonleaf_spte(child_pt,
+ +						     !shadow_accessed_mask);
+ +
+ +			if (tdp_mmu_set_spte_atomic(vcpu->kvm, &iter,
+ +						    new_spte)) {
+ +				tdp_mmu_link_page(vcpu->kvm, sp, true,
+ +						  huge_page_disallowed &&
+ +						  req_level >= iter.level);
+ +
+ +				trace_kvm_mmu_get_page(sp, true);
+ +			} else {
+++=======
++ 			sp = tdp_mmu_alloc_sp(vcpu);
++ 			tdp_mmu_init_child_sp(sp, &iter);
++ 
++ 			if (tdp_mmu_link_sp_atomic(vcpu->kvm, &iter, sp, account_nx)) {
+++>>>>>>> a82070b6e71a (KVM: x86/mmu: Separate TDP MMU shadow page allocation and initialization)
+  				tdp_mmu_free_sp(sp);
+  				break;
+  			}
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
