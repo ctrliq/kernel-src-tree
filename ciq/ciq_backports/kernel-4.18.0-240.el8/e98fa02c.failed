@@ -1,0 +1,78 @@
+sched/fair: Eliminate bandwidth race between throttling and distribution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paul Turner <pjt@google.com>
+commit e98fa02c4f2ea4991dae422ac7e34d102d2f0599
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e98fa02c.failed
+
+There is a race window in which an entity begins throttling before quota
+is added to the pool, but does not finish throttling until after we have
+finished with distribute_cfs_runtime(). This entity is not observed by
+distribute_cfs_runtime() because it was not on the throttled list at the
+time that distribution was running. This race manifests as rare
+period-length statlls for such entities.
+
+Rather than heavy-weight the synchronization with the progress of
+distribution, we can fix this by aborting throttling if bandwidth has
+become available. Otherwise, we immediately add the entity to the
+throttled list so that it can be observed by a subsequent distribution.
+
+Additionally, we can remove the case of adding the throttled entity to
+the head of the throttled list, and simply always add to the tail.
+Thanks to 26a8b12747c97, distribute_cfs_runtime() no longer holds onto
+its own pool of runtime. This means that if we do hit the !assign and
+distribute_running case, we know that distribution is about to end.
+
+	Signed-off-by: Paul Turner <pjt@google.com>
+	Signed-off-by: Ben Segall <bsegall@google.com>
+	Signed-off-by: Josh Don <joshdon@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Phil Auld <pauld@redhat.com>
+Link: https://lkml.kernel.org/r/20200410225208.109717-2-joshdon@google.com
+(cherry picked from commit e98fa02c4f2ea4991dae422ac7e34d102d2f0599)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index ddfdbf5667cc,0c13a41bde81..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -4490,8 -4721,28 +4502,33 @@@ static bool throttle_cfs_rq(struct cfs_
+  	struct rq *rq = rq_of(cfs_rq);
+  	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+  	struct sched_entity *se;
+++<<<<<<< HEAD
+ +	long task_delta, dequeue = 1;
+ +	bool empty;
+++=======
++ 	long task_delta, idle_task_delta, dequeue = 1;
++ 
++ 	raw_spin_lock(&cfs_b->lock);
++ 	/* This will start the period timer if necessary */
++ 	if (__assign_cfs_rq_runtime(cfs_b, cfs_rq, 1)) {
++ 		/*
++ 		 * We have raced with bandwidth becoming available, and if we
++ 		 * actually throttled the timer might not unthrottle us for an
++ 		 * entire period. We additionally needed to make sure that any
++ 		 * subsequent check_cfs_rq_runtime calls agree not to throttle
++ 		 * us, as we may commit to do cfs put_prev+pick_next, so we ask
++ 		 * for 1ns of runtime rather than just check cfs_b.
++ 		 */
++ 		dequeue = 0;
++ 	} else {
++ 		list_add_tail_rcu(&cfs_rq->throttled_list,
++ 				  &cfs_b->throttled_cfs_rq);
++ 	}
++ 	raw_spin_unlock(&cfs_b->lock);
++ 
++ 	if (!dequeue)
++ 		return false;  /* Throttle no longer required. */
+++>>>>>>> e98fa02c4f2e (sched/fair: Eliminate bandwidth race between throttling and distribution)
+  
+  	se = cfs_rq->tg->se[cpu_of(rq_of(cfs_rq))];
+  
+* Unmerged path kernel/sched/fair.c
