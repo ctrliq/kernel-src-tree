@@ -1,0 +1,145 @@
+kvm: x86: Add "last CPU" to some KVM_EXIT information
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jim Mattson <jmattson@google.com>
+commit 1aa561b1a4c0ae2a9a9b9c21a84b5ca66b4775d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1aa561b1.failed
+
+More often than not, a failed VM-entry in an x86 production
+environment is induced by a defective CPU. To help identify the bad
+hardware, include the id of the last logical CPU to run a vCPU in the
+information provided to userspace on a KVM exit for failed VM-entry or
+for KVM internal errors not associated with emulation. The presence of
+this additional information is indicated by a new capability,
+KVM_CAP_LAST_CPU.
+
+	Signed-off-by: Jim Mattson <jmattson@google.com>
+	Reviewed-by: Oliver Upton <oupton@google.com>
+	Reviewed-by: Peter Shier <pshier@google.com>
+Message-Id: <20200603235623.245638-5-jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1aa561b1a4c0ae2a9a9b9c21a84b5ca66b4775d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index f2c3051a98e4,ff9b335620d0..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1030,6 -1031,8 +1031,11 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_S390_PROTECTED 180
+  #define KVM_CAP_PPC_SECURE_GUEST 181
+  #define KVM_CAP_HALT_POLL 182
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ASYNC_PF_INT 183
++ #define KVM_CAP_LAST_CPU 184
+++>>>>>>> 1aa561b1a4c0 (kvm: x86: Add "last CPU" to some KVM_EXIT information)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 1470e34e9afe..181a5d522dca 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -4795,6 +4795,7 @@ hardware_exit_reason.
+ 		/* KVM_EXIT_FAIL_ENTRY */
+ 		struct {
+ 			__u64 hardware_entry_failure_reason;
++			__u32 cpu; /* if KVM_LAST_CPU */
+ 		} fail_entry;
+ 
+ If exit_reason is KVM_EXIT_FAIL_ENTRY, the vcpu could not be run due
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 733f139091ec..140e9a4c023e 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -2950,6 +2950,7 @@ static int handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 		kvm_run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+ 		kvm_run->fail_entry.hardware_entry_failure_reason
+ 			= svm->vmcb->control.exit_code;
++		kvm_run->fail_entry.cpu = svm->last_cpu;
+ 		dump_vmcb(vcpu);
+ 		return 0;
+ 	}
+@@ -2973,8 +2974,9 @@ static int handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 		vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+ 		vcpu->run->internal.suberror =
+ 			KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
+-		vcpu->run->internal.ndata = 1;
++		vcpu->run->internal.ndata = 2;
+ 		vcpu->run->internal.data[0] = exit_code;
++		vcpu->run->internal.data[1] = svm->last_cpu;
+ 		return 0;
+ 	}
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 916d18c00f08..60724ba58a41 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -4781,10 +4781,11 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
+ 	    !(is_page_fault(intr_info) && !(error_code & PFERR_RSVD_MASK))) {
+ 		vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+ 		vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_SIMUL_EX;
+-		vcpu->run->internal.ndata = 3;
++		vcpu->run->internal.ndata = 4;
+ 		vcpu->run->internal.data[0] = vect_info;
+ 		vcpu->run->internal.data[1] = intr_info;
+ 		vcpu->run->internal.data[2] = error_code;
++		vcpu->run->internal.data[3] = vmx->last_cpu;
+ 		return 0;
+ 	}
+ 
+@@ -6006,6 +6007,7 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 		vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+ 		vcpu->run->fail_entry.hardware_entry_failure_reason
+ 			= exit_reason;
++		vcpu->run->fail_entry.cpu = vmx->last_cpu;
+ 		return 0;
+ 	}
+ 
+@@ -6014,6 +6016,7 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 		vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+ 		vcpu->run->fail_entry.hardware_entry_failure_reason
+ 			= vmcs_read32(VM_INSTRUCTION_ERROR);
++		vcpu->run->fail_entry.cpu = vmx->last_cpu;
+ 		return 0;
+ 	}
+ 
+@@ -6040,6 +6043,8 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 			vcpu->run->internal.data[3] =
+ 				vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+ 		}
++		vcpu->run->internal.data[vcpu->run->internal.ndata++] =
++			vmx->last_cpu;
+ 		return 0;
+ 	}
+ 
+@@ -6095,8 +6100,9 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+ 	vcpu->run->internal.suberror =
+ 			KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
+-	vcpu->run->internal.ndata = 1;
++	vcpu->run->internal.ndata = 2;
+ 	vcpu->run->internal.data[0] = exit_reason;
++	vcpu->run->internal.data[1] = vmx->last_cpu;
+ 	return 0;
+ }
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index eb1ec384b288..10171ab9437e 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3462,6 +3462,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_MSR_PLATFORM_INFO:
+ 	case KVM_CAP_EXCEPTION_PAYLOAD:
+ 	case KVM_CAP_SET_GUEST_DEBUG:
++	case KVM_CAP_LAST_CPU:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_SYNC_REGS:
+* Unmerged path include/uapi/linux/kvm.h
