@@ -1,0 +1,138 @@
+driver/base/memory.c: validate memory block size early
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 902ce63b337381092ff865f542e854ff3d0ebe2b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/902ce63b.failed
+
+Let's validate the memory block size early, when initializing the memory
+device infrastructure.  Fail hard in case the value is not suitable.
+
+As nobody checks the return value of memory_dev_init(), turn it into a
+void function and fail with a panic in all scenarios instead.  Otherwise,
+we'll crash later during boot when core/drivers expect that the memory
+device infrastructure (including memory_block_size_bytes()) works as
+expected.
+
+I think long term, we should move the whole memory block size
+configuration (set_memory_block_size_order() and
+memory_block_size_bytes()) into drivers/base/memory.c.
+
+Link: http://lkml.kernel.org/r/20190806090142.22709-1-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "Rafael J. Wysocki" <rafael@kernel.org>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 902ce63b337381092ff865f542e854ff3d0ebe2b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memory.h
+diff --cc include/linux/memory.h
+index e1dc1bb2b787,b3d9df060626..000000000000
+--- a/include/linux/memory.h
++++ b/include/linux/memory.h
+@@@ -111,16 -111,15 +111,22 @@@ extern int register_memory_notifier(str
+  extern void unregister_memory_notifier(struct notifier_block *nb);
+  extern int register_memory_isolate_notifier(struct notifier_block *nb);
+  extern void unregister_memory_isolate_notifier(struct notifier_block *nb);
+++<<<<<<< HEAD
+ +int hotplug_memory_register(int nid, struct mem_section *section);
+ +#ifdef CONFIG_MEMORY_HOTREMOVE
+ +extern void unregister_memory_section(struct mem_section *);
+ +#endif
+ +extern int memory_dev_init(void);
+++=======
++ int create_memory_block_devices(unsigned long start, unsigned long size);
++ void remove_memory_block_devices(unsigned long start, unsigned long size);
++ extern void memory_dev_init(void);
+++>>>>>>> 902ce63b3373 (driver/base/memory.c: validate memory block size early)
+  extern int memory_notify(unsigned long val, void *v);
+  extern int memory_isolate_notify(unsigned long val, void *v);
+ +extern struct memory_block *find_memory_block_hinted(struct mem_section *,
+ +							struct memory_block *);
+  extern struct memory_block *find_memory_block(struct mem_section *);
+ -typedef int (*walk_memory_blocks_func_t)(struct memory_block *, void *);
+ -extern int walk_memory_blocks(unsigned long start, unsigned long size,
+ -			      void *arg, walk_memory_blocks_func_t func);
+  #define CONFIG_MEM_BLOCK_SIZE	(PAGES_PER_SECTION<<PAGE_SHIFT)
+  #endif /* CONFIG_MEMORY_HOTPLUG_SPARSE */
+  
+diff --git a/drivers/base/memory.c b/drivers/base/memory.c
+index bce3c13a7be5..804045daeb9e 100644
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -89,21 +89,6 @@ unsigned long __weak memory_block_size_bytes(void)
+ 	return MIN_MEMORY_BLOCK_SIZE;
+ }
+ 
+-static unsigned long get_memory_block_size(void)
+-{
+-	unsigned long block_sz;
+-
+-	block_sz = memory_block_size_bytes();
+-
+-	/* Validate blk_sz is a power of 2 and not less than section size */
+-	if ((block_sz & (block_sz - 1)) || (block_sz < MIN_MEMORY_BLOCK_SIZE)) {
+-		WARN_ON(1);
+-		block_sz = MIN_MEMORY_BLOCK_SIZE;
+-	}
+-
+-	return block_sz;
+-}
+-
+ /*
+  * use this as the physical section index that this memsection
+  * uses.
+@@ -449,7 +434,7 @@ static DEVICE_ATTR_RO(removable);
+ static ssize_t block_size_bytes_show(struct device *dev,
+ 				     struct device_attribute *attr, char *buf)
+ {
+-	return sprintf(buf, "%lx\n", get_memory_block_size());
++	return sprintf(buf, "%lx\n", memory_block_size_bytes());
+ }
+ 
+ static DEVICE_ATTR_RO(block_size_bytes);
+@@ -799,19 +784,22 @@ static const struct attribute_group *memory_root_attr_groups[] = {
+ /*
+  * Initialize the sysfs support for memory devices...
+  */
+-int __init memory_dev_init(void)
++void __init memory_dev_init(void)
+ {
+ 	int ret;
+ 	int err;
+ 	unsigned long block_sz, nr;
+ 
++	/* Validate the configured memory block size */
++	block_sz = memory_block_size_bytes();
++	if (!is_power_of_2(block_sz) || block_sz < MIN_MEMORY_BLOCK_SIZE)
++		panic("Memory block size not suitable: 0x%lx\n", block_sz);
++	sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
++
+ 	ret = subsys_system_register(&memory_subsys, memory_root_attr_groups);
+ 	if (ret)
+ 		goto out;
+ 
+-	block_sz = get_memory_block_size();
+-	sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
+-
+ 	/*
+ 	 * Create entries for memory sections that were found
+ 	 * during boot and have been initialized
+@@ -827,6 +815,5 @@ int __init memory_dev_init(void)
+ 
+ out:
+ 	if (ret)
+-		printk(KERN_ERR "%s() failed: %d\n", __func__, ret);
+-	return ret;
++		panic("%s() failed: %d\n", __func__, ret);
+ }
+* Unmerged path include/linux/memory.h
