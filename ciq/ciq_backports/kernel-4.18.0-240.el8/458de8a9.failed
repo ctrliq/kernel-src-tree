@@ -1,0 +1,913 @@
+net: page_pool: API cleanup and comments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] page_pool: API cleanup and comments (Jiri Benc) [1838075]
+Rebuild_FUZZ: 93.33%
+commit-author Ilias Apalodimas <ilias.apalodimas@linaro.org>
+commit 458de8a97f107e1b6120d608b93ae9e3de019a2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/458de8a9.failed
+
+Functions starting with __ usually indicate those which are exported,
+but should not be called directly. Update some of those declared in the
+API and make it more readable.
+
+page_pool_unmap_page() and page_pool_release_page() were doing
+exactly the same thing calling __page_pool_clean_page().  Let's
+rename __page_pool_clean_page() to page_pool_release_page() and
+export it in order to show up on perf logs and get rid of
+page_pool_unmap_page().
+
+Finally rename __page_pool_put_page() to page_pool_put_page() since we
+can now directly call it from drivers and rename the existing
+page_pool_put_page() to page_pool_put_full_page() since they do the same
+thing but the latter is trying to sync the full DMA area.
+
+This patch also updates netsec, mvneta and stmmac drivers which use
+those functions.
+
+	Suggested-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 458de8a97f107e1b6120d608b93ae9e3de019a2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/marvell/mvneta.c
+#	drivers/net/ethernet/socionext/netsec.c
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+#	include/net/page_pool.h
+#	net/core/page_pool.c
+diff --cc drivers/net/ethernet/marvell/mvneta.c
+index e9e0d8fc3a1f,1c391f63a26f..000000000000
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@@ -1893,11 -1953,344 +1893,349 @@@ static void mvneta_rxq_drop_pkts(struc
+  	for (i = 0; i < rxq->size; i++) {
+  		struct mvneta_rx_desc *rx_desc = rxq->descs + i;
+  		void *data = rxq->buf_virt_addr[i];
+ -		if (!data || !(rx_desc->buf_phys_addr))
+ -			continue;
+  
+++<<<<<<< HEAD
+ +		dma_unmap_single(pp->dev->dev.parent, rx_desc->buf_phys_addr,
+ +				 MVNETA_RX_BUF_SIZE(pp->pkt_size), DMA_FROM_DEVICE);
+ +		mvneta_frag_free(pp->frag_size, data);
+ +	}
+++=======
++ 		page_pool_put_full_page(rxq->page_pool, data, false);
++ 	}
++ 	if (xdp_rxq_info_is_reg(&rxq->xdp_rxq))
++ 		xdp_rxq_info_unreg(&rxq->xdp_rxq);
++ 	page_pool_destroy(rxq->page_pool);
++ 	rxq->page_pool = NULL;
++ }
++ 
++ static void
++ mvneta_update_stats(struct mvneta_port *pp,
++ 		    struct mvneta_stats *ps)
++ {
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->es.ps.rx_packets += ps->rx_packets;
++ 	stats->es.ps.rx_bytes += ps->rx_bytes;
++ 	/* xdp */
++ 	stats->es.ps.xdp_redirect += ps->xdp_redirect;
++ 	stats->es.ps.xdp_pass += ps->xdp_pass;
++ 	stats->es.ps.xdp_drop += ps->xdp_drop;
++ 	u64_stats_update_end(&stats->syncp);
++ }
++ 
++ static inline
++ int mvneta_rx_refill_queue(struct mvneta_port *pp, struct mvneta_rx_queue *rxq)
++ {
++ 	struct mvneta_rx_desc *rx_desc;
++ 	int curr_desc = rxq->first_to_refill;
++ 	int i;
++ 
++ 	for (i = 0; (i < rxq->refill_num) && (i < 64); i++) {
++ 		rx_desc = rxq->descs + curr_desc;
++ 		if (!(rx_desc->buf_phys_addr)) {
++ 			if (mvneta_rx_refill(pp, rx_desc, rxq, GFP_ATOMIC)) {
++ 				struct mvneta_pcpu_stats *stats;
++ 
++ 				pr_err("Can't refill queue %d. Done %d from %d\n",
++ 				       rxq->id, i, rxq->refill_num);
++ 
++ 				stats = this_cpu_ptr(pp->stats);
++ 				u64_stats_update_begin(&stats->syncp);
++ 				stats->es.refill_error++;
++ 				u64_stats_update_end(&stats->syncp);
++ 				break;
++ 			}
++ 		}
++ 		curr_desc = MVNETA_QUEUE_NEXT_DESC(rxq, curr_desc);
++ 	}
++ 	rxq->refill_num -= i;
++ 	rxq->first_to_refill = curr_desc;
++ 
++ 	return i;
++ }
++ 
++ static int
++ mvneta_xdp_submit_frame(struct mvneta_port *pp, struct mvneta_tx_queue *txq,
++ 			struct xdp_frame *xdpf, bool dma_map)
++ {
++ 	struct mvneta_tx_desc *tx_desc;
++ 	struct mvneta_tx_buf *buf;
++ 	dma_addr_t dma_addr;
++ 
++ 	if (txq->count >= txq->tx_stop_threshold)
++ 		return MVNETA_XDP_DROPPED;
++ 
++ 	tx_desc = mvneta_txq_next_desc_get(txq);
++ 
++ 	buf = &txq->buf[txq->txq_put_index];
++ 	if (dma_map) {
++ 		/* ndo_xdp_xmit */
++ 		dma_addr = dma_map_single(pp->dev->dev.parent, xdpf->data,
++ 					  xdpf->len, DMA_TO_DEVICE);
++ 		if (dma_mapping_error(pp->dev->dev.parent, dma_addr)) {
++ 			mvneta_txq_desc_put(txq);
++ 			return MVNETA_XDP_DROPPED;
++ 		}
++ 		buf->type = MVNETA_TYPE_XDP_NDO;
++ 	} else {
++ 		struct page *page = virt_to_page(xdpf->data);
++ 
++ 		dma_addr = page_pool_get_dma_addr(page) +
++ 			   sizeof(*xdpf) + xdpf->headroom;
++ 		dma_sync_single_for_device(pp->dev->dev.parent, dma_addr,
++ 					   xdpf->len, DMA_BIDIRECTIONAL);
++ 		buf->type = MVNETA_TYPE_XDP_TX;
++ 	}
++ 	buf->xdpf = xdpf;
++ 
++ 	tx_desc->command = MVNETA_TXD_FLZ_DESC;
++ 	tx_desc->buf_phys_addr = dma_addr;
++ 	tx_desc->data_size = xdpf->len;
++ 
++ 	mvneta_txq_inc_put(txq);
++ 	txq->pending++;
++ 	txq->count++;
++ 
++ 	return MVNETA_XDP_TX;
++ }
++ 
++ static int
++ mvneta_xdp_xmit_back(struct mvneta_port *pp, struct xdp_buff *xdp)
++ {
++ 	struct mvneta_tx_queue *txq;
++ 	struct netdev_queue *nq;
++ 	struct xdp_frame *xdpf;
++ 	int cpu;
++ 	u32 ret;
++ 
++ 	xdpf = convert_to_xdp_frame(xdp);
++ 	if (unlikely(!xdpf))
++ 		return MVNETA_XDP_DROPPED;
++ 
++ 	cpu = smp_processor_id();
++ 	txq = &pp->txqs[cpu % txq_number];
++ 	nq = netdev_get_tx_queue(pp->dev, txq->id);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	ret = mvneta_xdp_submit_frame(pp, txq, xdpf, false);
++ 	if (ret == MVNETA_XDP_TX) {
++ 		struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->es.ps.tx_bytes += xdpf->len;
++ 		stats->es.ps.tx_packets++;
++ 		stats->es.ps.xdp_tx++;
++ 		u64_stats_update_end(&stats->syncp);
++ 
++ 		mvneta_txq_pend_desc_add(pp, txq, 0);
++ 	}
++ 	__netif_tx_unlock(nq);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ mvneta_xdp_xmit(struct net_device *dev, int num_frame,
++ 		struct xdp_frame **frames, u32 flags)
++ {
++ 	struct mvneta_port *pp = netdev_priv(dev);
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 	int i, nxmit_byte = 0, nxmit = num_frame;
++ 	int cpu = smp_processor_id();
++ 	struct mvneta_tx_queue *txq;
++ 	struct netdev_queue *nq;
++ 	u32 ret;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	txq = &pp->txqs[cpu % txq_number];
++ 	nq = netdev_get_tx_queue(pp->dev, txq->id);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	for (i = 0; i < num_frame; i++) {
++ 		ret = mvneta_xdp_submit_frame(pp, txq, frames[i], true);
++ 		if (ret == MVNETA_XDP_TX) {
++ 			nxmit_byte += frames[i]->len;
++ 		} else {
++ 			xdp_return_frame_rx_napi(frames[i]);
++ 			nxmit--;
++ 		}
++ 	}
++ 
++ 	if (unlikely(flags & XDP_XMIT_FLUSH))
++ 		mvneta_txq_pend_desc_add(pp, txq, 0);
++ 	__netif_tx_unlock(nq);
++ 
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->es.ps.tx_bytes += nxmit_byte;
++ 	stats->es.ps.tx_packets += nxmit;
++ 	stats->es.ps.xdp_xmit += nxmit;
++ 	u64_stats_update_end(&stats->syncp);
++ 
++ 	return nxmit;
++ }
++ 
++ static int
++ mvneta_run_xdp(struct mvneta_port *pp, struct mvneta_rx_queue *rxq,
++ 	       struct bpf_prog *prog, struct xdp_buff *xdp,
++ 	       struct mvneta_stats *stats)
++ {
++ 	unsigned int len;
++ 	u32 ret, act;
++ 
++ 	len = xdp->data_end - xdp->data_hard_start - pp->rx_offset_correction;
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		stats->xdp_pass++;
++ 		return MVNETA_XDP_PASS;
++ 	case XDP_REDIRECT: {
++ 		int err;
++ 
++ 		err = xdp_do_redirect(pp->dev, xdp, prog);
++ 		if (err) {
++ 			ret = MVNETA_XDP_DROPPED;
++ 			page_pool_put_page(rxq->page_pool,
++ 					   virt_to_head_page(xdp->data), len,
++ 					   true);
++ 		} else {
++ 			ret = MVNETA_XDP_REDIR;
++ 			stats->xdp_redirect++;
++ 		}
++ 		break;
++ 	}
++ 	case XDP_TX:
++ 		ret = mvneta_xdp_xmit_back(pp, xdp);
++ 		if (ret != MVNETA_XDP_TX)
++ 			page_pool_put_page(rxq->page_pool,
++ 					   virt_to_head_page(xdp->data), len,
++ 					   true);
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		/* fall through */
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(pp->dev, prog, act);
++ 		/* fall through */
++ 	case XDP_DROP:
++ 		page_pool_put_page(rxq->page_pool,
++ 				   virt_to_head_page(xdp->data), len, true);
++ 		ret = MVNETA_XDP_DROPPED;
++ 		stats->xdp_drop++;
++ 		break;
++ 	}
++ 
++ 	stats->rx_bytes += xdp->data_end - xdp->data;
++ 	stats->rx_packets++;
++ 
++ 	return ret;
++ }
++ 
++ static int
++ mvneta_swbm_rx_frame(struct mvneta_port *pp,
++ 		     struct mvneta_rx_desc *rx_desc,
++ 		     struct mvneta_rx_queue *rxq,
++ 		     struct xdp_buff *xdp,
++ 		     struct bpf_prog *xdp_prog,
++ 		     struct page *page,
++ 		     struct mvneta_stats *stats)
++ {
++ 	unsigned char *data = page_address(page);
++ 	int data_len = -MVNETA_MH_SIZE, len;
++ 	struct net_device *dev = pp->dev;
++ 	enum dma_data_direction dma_dir;
++ 	int ret = 0;
++ 
++ 	if (MVNETA_SKB_SIZE(rx_desc->data_size) > PAGE_SIZE) {
++ 		len = MVNETA_MAX_RX_BUF_SIZE;
++ 		data_len += len;
++ 	} else {
++ 		len = rx_desc->data_size;
++ 		data_len += len - ETH_FCS_LEN;
++ 	}
++ 
++ 	dma_dir = page_pool_get_dma_dir(rxq->page_pool);
++ 	dma_sync_single_for_cpu(dev->dev.parent,
++ 				rx_desc->buf_phys_addr,
++ 				len, dma_dir);
++ 
++ 	/* Prefetch header */
++ 	prefetch(data);
++ 
++ 	xdp->data_hard_start = data;
++ 	xdp->data = data + pp->rx_offset_correction + MVNETA_MH_SIZE;
++ 	xdp->data_end = xdp->data + data_len;
++ 	xdp_set_data_meta_invalid(xdp);
++ 
++ 	if (xdp_prog) {
++ 		ret = mvneta_run_xdp(pp, rxq, xdp_prog, xdp, stats);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	rxq->skb = build_skb(xdp->data_hard_start, PAGE_SIZE);
++ 	if (unlikely(!rxq->skb)) {
++ 		struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 
++ 		netdev_err(dev, "Can't allocate skb on queue %d\n", rxq->id);
++ 
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->es.skb_alloc_error++;
++ 		stats->rx_dropped++;
++ 		u64_stats_update_end(&stats->syncp);
++ 
++ 		return -ENOMEM;
++ 	}
++ 	page_pool_release_page(rxq->page_pool, page);
++ 
++ 	skb_reserve(rxq->skb,
++ 		    xdp->data - xdp->data_hard_start);
++ 	skb_put(rxq->skb, xdp->data_end - xdp->data);
++ 	mvneta_rx_csum(pp, rx_desc->status, rxq->skb);
++ 
++ 	rxq->left_size = rx_desc->data_size - len;
++ 
++ out:
++ 	rx_desc->buf_phys_addr = 0;
++ 
++ 	return ret;
++ }
++ 
++ static void
++ mvneta_swbm_add_rx_fragment(struct mvneta_port *pp,
++ 			    struct mvneta_rx_desc *rx_desc,
++ 			    struct mvneta_rx_queue *rxq,
++ 			    struct page *page)
++ {
++ 	struct net_device *dev = pp->dev;
++ 	enum dma_data_direction dma_dir;
++ 	int data_len, len;
++ 
++ 	if (rxq->left_size > MVNETA_MAX_RX_BUF_SIZE) {
++ 		len = MVNETA_MAX_RX_BUF_SIZE;
++ 		data_len = len;
++ 	} else {
++ 		len = rxq->left_size;
++ 		data_len = len - ETH_FCS_LEN;
++ 	}
++ 	dma_dir = page_pool_get_dma_dir(rxq->page_pool);
++ 	dma_sync_single_for_cpu(dev->dev.parent,
++ 				rx_desc->buf_phys_addr,
++ 				len, dma_dir);
++ 	if (data_len > 0) {
++ 		/* refill descriptor with new buffer later */
++ 		skb_add_rx_frag(rxq->skb,
++ 				skb_shinfo(rxq->skb)->nr_frags,
++ 				page, pp->rx_offset_correction, data_len,
++ 				PAGE_SIZE);
++ 	}
++ 	page_pool_release_page(rxq->page_pool, page);
++ 	rx_desc->buf_phys_addr = 0;
++ 	rxq->left_size -= len;
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
+  }
+  
+  /* Main rx processing when using software buffer management */
+diff --cc drivers/net/ethernet/socionext/netsec.c
+index e080d3e7c582,58b9b7ce7195..000000000000
+--- a/drivers/net/ethernet/socionext/netsec.c
++++ b/drivers/net/ethernet/socionext/netsec.c
+@@@ -851,6 -807,314 +851,317 @@@ static void netsec_set_tx_de(struct net
+  	dring->head = (dring->head + 1) % DESC_NUM;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* The current driver only supports 1 Txq, this should run under spin_lock() */
++ static u32 netsec_xdp_queue_one(struct netsec_priv *priv,
++ 				struct xdp_frame *xdpf, bool is_ndo)
++ 
++ {
++ 	struct netsec_desc_ring *tx_ring = &priv->desc_ring[NETSEC_RING_TX];
++ 	struct page *page = virt_to_page(xdpf->data);
++ 	struct netsec_tx_pkt_ctrl tx_ctrl = {};
++ 	struct netsec_desc tx_desc;
++ 	dma_addr_t dma_handle;
++ 	u16 filled;
++ 
++ 	if (tx_ring->head >= tx_ring->tail)
++ 		filled = tx_ring->head - tx_ring->tail;
++ 	else
++ 		filled = tx_ring->head + DESC_NUM - tx_ring->tail;
++ 
++ 	if (DESC_NUM - filled <= 1)
++ 		return NETSEC_XDP_CONSUMED;
++ 
++ 	if (is_ndo) {
++ 		/* this is for ndo_xdp_xmit, the buffer needs mapping before
++ 		 * sending
++ 		 */
++ 		dma_handle = dma_map_single(priv->dev, xdpf->data, xdpf->len,
++ 					    DMA_TO_DEVICE);
++ 		if (dma_mapping_error(priv->dev, dma_handle))
++ 			return NETSEC_XDP_CONSUMED;
++ 		tx_desc.buf_type = TYPE_NETSEC_XDP_NDO;
++ 	} else {
++ 		/* This is the device Rx buffer from page_pool. No need to remap
++ 		 * just sync and send it
++ 		 */
++ 		struct netsec_desc_ring *rx_ring =
++ 			&priv->desc_ring[NETSEC_RING_RX];
++ 		enum dma_data_direction dma_dir =
++ 			page_pool_get_dma_dir(rx_ring->page_pool);
++ 
++ 		dma_handle = page_pool_get_dma_addr(page) + xdpf->headroom +
++ 			sizeof(*xdpf);
++ 		dma_sync_single_for_device(priv->dev, dma_handle, xdpf->len,
++ 					   dma_dir);
++ 		tx_desc.buf_type = TYPE_NETSEC_XDP_TX;
++ 	}
++ 
++ 	tx_desc.dma_addr = dma_handle;
++ 	tx_desc.addr = xdpf->data;
++ 	tx_desc.len = xdpf->len;
++ 
++ 	netdev_sent_queue(priv->ndev, xdpf->len);
++ 	netsec_set_tx_de(priv, tx_ring, &tx_ctrl, &tx_desc, xdpf);
++ 
++ 	return NETSEC_XDP_TX;
++ }
++ 
++ static u32 netsec_xdp_xmit_back(struct netsec_priv *priv, struct xdp_buff *xdp)
++ {
++ 	struct netsec_desc_ring *tx_ring = &priv->desc_ring[NETSEC_RING_TX];
++ 	struct xdp_frame *xdpf = convert_to_xdp_frame(xdp);
++ 	u32 ret;
++ 
++ 	if (unlikely(!xdpf))
++ 		return NETSEC_XDP_CONSUMED;
++ 
++ 	spin_lock(&tx_ring->lock);
++ 	ret = netsec_xdp_queue_one(priv, xdpf, false);
++ 	spin_unlock(&tx_ring->lock);
++ 
++ 	return ret;
++ }
++ 
++ static u32 netsec_run_xdp(struct netsec_priv *priv, struct bpf_prog *prog,
++ 			  struct xdp_buff *xdp)
++ {
++ 	struct netsec_desc_ring *dring = &priv->desc_ring[NETSEC_RING_RX];
++ 	unsigned int len = xdp->data_end - xdp->data;
++ 	u32 ret = NETSEC_XDP_PASS;
++ 	int err;
++ 	u32 act;
++ 
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		ret = NETSEC_XDP_PASS;
++ 		break;
++ 	case XDP_TX:
++ 		ret = netsec_xdp_xmit_back(priv, xdp);
++ 		if (ret != NETSEC_XDP_TX)
++ 			page_pool_put_page(dring->page_pool,
++ 					   virt_to_head_page(xdp->data), len,
++ 					   true);
++ 		break;
++ 	case XDP_REDIRECT:
++ 		err = xdp_do_redirect(priv->ndev, xdp, prog);
++ 		if (!err) {
++ 			ret = NETSEC_XDP_REDIR;
++ 		} else {
++ 			ret = NETSEC_XDP_CONSUMED;
++ 			page_pool_put_page(dring->page_pool,
++ 					   virt_to_head_page(xdp->data), len,
++ 					   true);
++ 		}
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		/* fall through */
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(priv->ndev, prog, act);
++ 		/* fall through -- handle aborts by dropping packet */
++ 	case XDP_DROP:
++ 		ret = NETSEC_XDP_CONSUMED;
++ 		page_pool_put_page(dring->page_pool,
++ 				   virt_to_head_page(xdp->data), len, true);
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int netsec_process_rx(struct netsec_priv *priv, int budget)
++ {
++ 	struct netsec_desc_ring *dring = &priv->desc_ring[NETSEC_RING_RX];
++ 	struct net_device *ndev = priv->ndev;
++ 	struct netsec_rx_pkt_info rx_info;
++ 	enum dma_data_direction dma_dir;
++ 	struct bpf_prog *xdp_prog;
++ 	u16 xdp_xmit = 0;
++ 	u32 xdp_act = 0;
++ 	int done = 0;
++ 
++ 	rcu_read_lock();
++ 	xdp_prog = READ_ONCE(priv->xdp_prog);
++ 	dma_dir = page_pool_get_dma_dir(dring->page_pool);
++ 
++ 	while (done < budget) {
++ 		u16 idx = dring->tail;
++ 		struct netsec_de *de = dring->vaddr + (DESC_SZ * idx);
++ 		struct netsec_desc *desc = &dring->desc[idx];
++ 		struct page *page = virt_to_page(desc->addr);
++ 		u32 xdp_result = NETSEC_XDP_PASS;
++ 		struct sk_buff *skb = NULL;
++ 		u16 pkt_len, desc_len;
++ 		dma_addr_t dma_handle;
++ 		struct xdp_buff xdp;
++ 		void *buf_addr;
++ 
++ 		if (de->attr & (1U << NETSEC_RX_PKT_OWN_FIELD)) {
++ 			/* reading the register clears the irq */
++ 			netsec_read(priv, NETSEC_REG_NRM_RX_PKTCNT);
++ 			break;
++ 		}
++ 
++ 		/* This  barrier is needed to keep us from reading
++ 		 * any other fields out of the netsec_de until we have
++ 		 * verified the descriptor has been written back
++ 		 */
++ 		dma_rmb();
++ 		done++;
++ 
++ 		pkt_len = de->buf_len_info >> 16;
++ 		rx_info.err_code = (de->attr >> NETSEC_RX_PKT_ERR_FIELD) &
++ 			NETSEC_RX_PKT_ERR_MASK;
++ 		rx_info.err_flag = (de->attr >> NETSEC_RX_PKT_ER_FIELD) & 1;
++ 		if (rx_info.err_flag) {
++ 			netif_err(priv, drv, priv->ndev,
++ 				  "%s: rx fail err(%d)\n", __func__,
++ 				  rx_info.err_code);
++ 			ndev->stats.rx_dropped++;
++ 			dring->tail = (dring->tail + 1) % DESC_NUM;
++ 			/* reuse buffer page frag */
++ 			netsec_rx_fill(priv, idx, 1);
++ 			continue;
++ 		}
++ 		rx_info.rx_cksum_result =
++ 			(de->attr >> NETSEC_RX_PKT_CO_FIELD) & 3;
++ 
++ 		/* allocate a fresh buffer and map it to the hardware.
++ 		 * This will eventually replace the old buffer in the hardware
++ 		 */
++ 		buf_addr = netsec_alloc_rx_data(priv, &dma_handle, &desc_len);
++ 
++ 		if (unlikely(!buf_addr))
++ 			break;
++ 
++ 		dma_sync_single_for_cpu(priv->dev, desc->dma_addr, pkt_len,
++ 					dma_dir);
++ 		prefetch(desc->addr);
++ 
++ 		xdp.data_hard_start = desc->addr;
++ 		xdp.data = desc->addr + NETSEC_RXBUF_HEADROOM;
++ 		xdp_set_data_meta_invalid(&xdp);
++ 		xdp.data_end = xdp.data + pkt_len;
++ 		xdp.rxq = &dring->xdp_rxq;
++ 
++ 		if (xdp_prog) {
++ 			xdp_result = netsec_run_xdp(priv, xdp_prog, &xdp);
++ 			if (xdp_result != NETSEC_XDP_PASS) {
++ 				xdp_act |= xdp_result;
++ 				if (xdp_result == NETSEC_XDP_TX)
++ 					xdp_xmit++;
++ 				goto next;
++ 			}
++ 		}
++ 		skb = build_skb(desc->addr, desc->len + NETSEC_RX_BUF_NON_DATA);
++ 
++ 		if (unlikely(!skb)) {
++ 			/* If skb fails recycle_direct will either unmap and
++ 			 * free the page or refill the cache depending on the
++ 			 * cache state. Since we paid the allocation cost if
++ 			 * building an skb fails try to put the page into cache
++ 			 */
++ 			page_pool_put_page(dring->page_pool, page, pkt_len,
++ 					   true);
++ 			netif_err(priv, drv, priv->ndev,
++ 				  "rx failed to build skb\n");
++ 			break;
++ 		}
++ 		page_pool_release_page(dring->page_pool, page);
++ 
++ 		skb_reserve(skb, xdp.data - xdp.data_hard_start);
++ 		skb_put(skb, xdp.data_end - xdp.data);
++ 		skb->protocol = eth_type_trans(skb, priv->ndev);
++ 
++ 		if (priv->rx_cksum_offload_flag &&
++ 		    rx_info.rx_cksum_result == NETSEC_RX_CKSUM_OK)
++ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 
++ next:
++ 		if ((skb && napi_gro_receive(&priv->napi, skb) != GRO_DROP) ||
++ 		    xdp_result) {
++ 			ndev->stats.rx_packets++;
++ 			ndev->stats.rx_bytes += xdp.data_end - xdp.data;
++ 		}
++ 
++ 		/* Update the descriptor with fresh buffers */
++ 		desc->len = desc_len;
++ 		desc->dma_addr = dma_handle;
++ 		desc->addr = buf_addr;
++ 
++ 		netsec_rx_fill(priv, idx, 1);
++ 		dring->tail = (dring->tail + 1) % DESC_NUM;
++ 	}
++ 	netsec_finalize_xdp_rx(priv, xdp_act, xdp_xmit);
++ 
++ 	rcu_read_unlock();
++ 
++ 	return done;
++ }
++ 
++ static int netsec_napi_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct netsec_priv *priv;
++ 	int done;
++ 
++ 	priv = container_of(napi, struct netsec_priv, napi);
++ 
++ 	netsec_process_tx(priv);
++ 	done = netsec_process_rx(priv, budget);
++ 
++ 	if (done < budget && napi_complete_done(napi, done)) {
++ 		unsigned long flags;
++ 
++ 		spin_lock_irqsave(&priv->reglock, flags);
++ 		netsec_write(priv, NETSEC_REG_INTEN_SET,
++ 			     NETSEC_IRQ_RX | NETSEC_IRQ_TX);
++ 		spin_unlock_irqrestore(&priv->reglock, flags);
++ 	}
++ 
++ 	return done;
++ }
++ 
++ 
++ static int netsec_desc_used(struct netsec_desc_ring *dring)
++ {
++ 	int used;
++ 
++ 	if (dring->head >= dring->tail)
++ 		used = dring->head - dring->tail;
++ 	else
++ 		used = dring->head + DESC_NUM - dring->tail;
++ 
++ 	return used;
++ }
++ 
++ static int netsec_check_stop_tx(struct netsec_priv *priv, int used)
++ {
++ 	struct netsec_desc_ring *dring = &priv->desc_ring[NETSEC_RING_TX];
++ 
++ 	/* keep tail from touching the queue */
++ 	if (DESC_NUM - used < 2) {
++ 		netif_stop_queue(priv->ndev);
++ 
++ 		/* Make sure we read the updated value in case
++ 		 * descriptors got freed
++ 		 */
++ 		smp_rmb();
++ 
++ 		used = netsec_desc_used(dring);
++ 		if (DESC_NUM - used < 2)
++ 			return NETDEV_TX_BUSY;
++ 
++ 		netif_wake_queue(priv->ndev);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
+  static netdev_tx_t netsec_netdev_start_xmit(struct sk_buff *skb,
+  					    struct net_device *ndev)
+  {
+@@@ -933,10 -1191,22 +1244,29 @@@ static void netsec_uninit_pkt_dring(str
+  		if (!desc->addr)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		dma_unmap_single(priv->dev, desc->dma_addr, desc->len,
+ +				 id == NETSEC_RING_RX ? DMA_FROM_DEVICE :
+ +							      DMA_TO_DEVICE);
+ +		dev_kfree_skb(desc->skb);
+++=======
++ 		if (id == NETSEC_RING_RX) {
++ 			struct page *page = virt_to_page(desc->addr);
++ 
++ 			page_pool_put_full_page(dring->page_pool, page, false);
++ 		} else if (id == NETSEC_RING_TX) {
++ 			dma_unmap_single(priv->dev, desc->dma_addr, desc->len,
++ 					 DMA_TO_DEVICE);
++ 			dev_kfree_skb(desc->skb);
++ 		}
++ 	}
++ 
++ 	/* Rx is currently using page_pool */
++ 	if (id == NETSEC_RING_RX) {
++ 		if (xdp_rxq_info_is_reg(&dring->xdp_rxq))
++ 			xdp_rxq_info_unreg(&dring->xdp_rxq);
++ 		page_pool_destroy(dring->page_pool);
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
+  	}
+  
+  	memset(dring->desc, 0, sizeof(struct netsec_desc) * DESC_NUM);
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 20365ad53956,37920b4da091..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -1188,13 -1248,15 +1188,23 @@@ static int stmmac_init_rx_buffers(struc
+  static void stmmac_free_rx_buffer(struct stmmac_priv *priv, u32 queue, int i)
+  {
+  	struct stmmac_rx_queue *rx_q = &priv->rx_queue[queue];
+ -	struct stmmac_rx_buffer *buf = &rx_q->buf_pool[i];
+  
+++<<<<<<< HEAD
+ +	if (rx_q->rx_skbuff[i]) {
+ +		dma_unmap_single(priv->device, rx_q->rx_skbuff_dma[i],
+ +				 priv->dma_buf_sz, DMA_FROM_DEVICE);
+ +		dev_kfree_skb_any(rx_q->rx_skbuff[i]);
+ +	}
+ +	rx_q->rx_skbuff[i] = NULL;
+++=======
++ 	if (buf->page)
++ 		page_pool_put_full_page(rx_q->page_pool, buf->page, false);
++ 	buf->page = NULL;
++ 
++ 	if (buf->sec_page)
++ 		page_pool_put_full_page(rx_q->page_pool, buf->sec_page, false);
++ 	buf->sec_page = NULL;
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
+  }
+  
+  /**
+diff --cc include/net/page_pool.h
+index e2e1b7b1e8ba,81d7773f96cd..000000000000
+--- a/include/net/page_pool.h
++++ b/include/net/page_pool.h
+@@@ -148,41 -161,32 +149,60 @@@ static inline void page_pool_use_xdp_me
+  					 void (*disconnect)(void *))
+  {
+  }
++ static inline void page_pool_release_page(struct page_pool *pool,
++ 					  struct page *page)
++ {
++ }
+  #endif
+  
+++<<<<<<< HEAD
+ +/* Never call this directly, use helpers below */
+ +void __page_pool_put_page(struct page_pool *pool,
+ +			  struct page *page, bool allow_direct);
+- 
+- static inline void page_pool_put_page(struct page_pool *pool,
+- 				      struct page *page, bool allow_direct)
+++=======
++ void page_pool_put_page(struct page_pool *pool, struct page *page,
++ 			unsigned int dma_sync_size, bool allow_direct);
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
++ 
++ /* Same as above but will try to sync the entire area pool->max_len */
++ static inline void page_pool_put_full_page(struct page_pool *pool,
++ 					   struct page *page, bool allow_direct)
+  {
+  	/* When page_pool isn't compiled-in, net/core/xdp.c doesn't
+  	 * allow registering MEM_TYPE_PAGE_POOL, but shield linker.
+  	 */
+  #ifdef CONFIG_PAGE_POOL
+++<<<<<<< HEAD
+ +	__page_pool_put_page(pool, page, allow_direct);
+++=======
++ 	page_pool_put_page(pool, page, -1, allow_direct);
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
+  #endif
+  }
+- /* Very limited use-cases allow recycle direct */
++ 
++ /* Same as above but the caller must guarantee safe context. e.g NAPI */
+  static inline void page_pool_recycle_direct(struct page_pool *pool,
+  					    struct page *page)
+  {
+++<<<<<<< HEAD
+ +	__page_pool_put_page(pool, page, true);
+ +}
+ +
+ +/* Disconnects a page (from a page_pool).  API users can have a need
+ + * to disconnect a page (from a page_pool), to allow it to be used as
+ + * a regular page (that will eventually be returned to the normal
+ + * page-allocator via put_page).
+ + */
+ +void page_pool_unmap_page(struct page_pool *pool, struct page *page);
+ +static inline void page_pool_release_page(struct page_pool *pool,
+ +					  struct page *page)
+ +{
+ +#ifdef CONFIG_PAGE_POOL
+ +	page_pool_unmap_page(pool, page);
+ +#endif
+++=======
++ 	page_pool_put_full_page(pool, page, true);
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
+  }
+  
+  static inline dma_addr_t page_pool_get_dma_addr(struct page *page)
+diff --cc net/core/page_pool.c
+index 57bc3cc2f25a,626db912fce4..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -329,8 -354,14 +326,19 @@@ static bool pool_page_reusable(struct p
+  	return !page_is_pfmemalloc(page);
+  }
+  
+++<<<<<<< HEAD
+ +void __page_pool_put_page(struct page_pool *pool,
+ +			  struct page *page, bool allow_direct)
+++=======
++ /* If the page refcnt == 1, this will try to recycle the page.
++  * if PP_FLAG_DMA_SYNC_DEV is set, we'll try to sync the DMA area for
++  * the configured size min(dma_sync_size, pool->max_len).
++  * If the page refcnt != 1, then the page will be returned to memory
++  * subsystem.
++  */
++ void page_pool_put_page(struct page_pool *pool, struct page *page,
++ 			unsigned int dma_sync_size, bool allow_direct)
+++>>>>>>> 458de8a97f10 (net: page_pool: API cleanup and comments)
+  {
+  	/* This allocator is optimized for the XDP mode that uses
+  	 * one-frame-per-page, but have fallbacks that act like the
+@@@ -342,13 -373,17 +350,13 @@@
+  		   pool_page_reusable(pool, page))) {
+  		/* Read barrier done in page_ref_count / READ_ONCE */
+  
+ -		if (pool->p.flags & PP_FLAG_DMA_SYNC_DEV)
+ -			page_pool_dma_sync_for_device(pool, page,
+ -						      dma_sync_size);
+ -
+  		if (allow_direct && in_serving_softirq())
+- 			if (__page_pool_recycle_direct(page, pool))
++ 			if (page_pool_recycle_in_cache(page, pool))
+  				return;
+  
+- 		if (!__page_pool_recycle_into_ring(pool, page)) {
++ 		if (!page_pool_recycle_in_ring(pool, page)) {
+  			/* Cache full, fallback to free pages */
+- 			__page_pool_return_page(pool, page);
++ 			page_pool_return_page(pool, page);
+  		}
+  		return;
+  	}
+* Unmerged path drivers/net/ethernet/marvell/mvneta.c
+* Unmerged path drivers/net/ethernet/socionext/netsec.c
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+* Unmerged path include/net/page_pool.h
+* Unmerged path net/core/page_pool.c
+diff --git a/net/core/xdp.c b/net/core/xdp.c
+index 3ca331cbb841..31a0f1a0f325 100644
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -372,7 +372,7 @@ static void __xdp_return(void *data, struct xdp_mem_info *mem, bool napi_direct,
+ 		xa = rhashtable_lookup(mem_id_ht, &mem->id, mem_id_rht_params);
+ 		page = virt_to_head_page(data);
+ 		napi_direct &= !xdp_return_frame_no_direct();
+-		page_pool_put_page(xa->page_pool, page, napi_direct);
++		page_pool_put_full_page(xa->page_pool, page, napi_direct);
+ 		rcu_read_unlock();
+ 		break;
+ 	case MEM_TYPE_PAGE_SHARED:
