@@ -1,0 +1,151 @@
+devlink: track snapshot id usage count using an xarray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 12102436acf949b5e6eb087846b47488db2aa440
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/12102436.failed
+
+Each snapshot created for a devlink region must have an id. These ids
+are supposed to be unique per "event" that caused the snapshot to be
+created. Drivers call devlink_region_snapshot_id_get to obtain a new id
+to use for a new event trigger. The id values are tracked per devlink,
+so that the same id number can be used if a triggering event creates
+multiple snapshots on different regions.
+
+There is no mechanism for snapshot ids to ever be reused. Introduce an
+xarray to store the count of how many snapshots are using a given id,
+replacing the snapshot_id field previously used for picking the next id.
+
+The devlink_region_snapshot_id_get() function will use xa_alloc to
+insert an initial value of 1 value at an available slot between 0 and
+U32_MAX.
+
+The new __devlink_snapshot_id_increment() and
+__devlink_snapshot_id_decrement() functions will be used to track how
+many snapshots currently use an id.
+
+Drivers must now call devlink_snapshot_id_put() in order to release
+their reference of the snapshot id after adding region snapshots.
+
+By tracking the total number of snapshots using a given id, it is
+possible for the decrement() function to erase the id from the xarray
+when it is not in use.
+
+With this method, a snapshot id can become reused again once all
+snapshots that referred to it have been deleted via
+DEVLINK_CMD_REGION_DEL, and the driver has finished adding snapshots.
+
+This work also paves the way to introduce a mechanism for userspace to
+request a snapshot.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 12102436acf949b5e6eb087846b47488db2aa440)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/devlink.c
+diff --cc net/core/devlink.c
+index a66f1417ec7a,76b22593d188..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -6392,7 -6589,8 +6486,12 @@@ struct devlink *devlink_alloc(const str
+  	if (!devlink)
+  		return NULL;
+  	devlink->ops = ops;
+++<<<<<<< HEAD
+ +	devlink_net_set(devlink, &init_net);
+++=======
++ 	xa_init_flags(&devlink->snapshot_ids, XA_FLAGS_ALLOC);
++ 	__devlink_net_set(devlink, &init_net);
+++>>>>>>> 12102436acf9 (devlink: track snapshot id usage count using an xarray)
+  	INIT_LIST_HEAD(&devlink->port_list);
+  	INIT_LIST_HEAD(&devlink->sb_list);
+  	INIT_LIST_HEAD_RCU(&devlink->dpipe_table_list);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/crdump.c b/drivers/net/ethernet/mellanox/mlx4/crdump.c
+index 792951f6df0d..2700628f1689 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/crdump.c
++++ b/drivers/net/ethernet/mellanox/mlx4/crdump.c
+@@ -203,6 +203,9 @@ int mlx4_crdump_collect(struct mlx4_dev *dev)
+ 	mlx4_crdump_collect_crspace(dev, cr_space, id);
+ 	mlx4_crdump_collect_fw_health(dev, cr_space, id);
+ 
++	/* Release reference on the snapshot id */
++	devlink_region_snapshot_id_put(devlink, id);
++
+ 	crdump_disable_crspace_access(dev, cr_space);
+ 
+ 	iounmap(cr_space);
+diff --git a/drivers/net/netdevsim/dev.c b/drivers/net/netdevsim/dev.c
+index eff772f604d1..666316759eac 100644
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@ -43,23 +43,27 @@ static ssize_t nsim_dev_take_snapshot_write(struct file *file,
+ 					    size_t count, loff_t *ppos)
+ {
+ 	struct nsim_dev *nsim_dev = file->private_data;
++	struct devlink *devlink;
+ 	void *dummy_data;
+ 	int err;
+ 	u32 id;
+ 
++	devlink = priv_to_devlink(nsim_dev);
++
+ 	dummy_data = kmalloc(NSIM_DEV_DUMMY_REGION_SIZE, GFP_KERNEL);
+ 	if (!dummy_data)
+ 		return -ENOMEM;
+ 
+ 	get_random_bytes(dummy_data, NSIM_DEV_DUMMY_REGION_SIZE);
+ 
+-	err = devlink_region_snapshot_id_get(priv_to_devlink(nsim_dev), &id);
++	err = devlink_region_snapshot_id_get(devlink, &id);
+ 	if (err) {
+ 		pr_err("Failed to get snapshot id\n");
+ 		return err;
+ 	}
+ 	err = devlink_region_snapshot_create(nsim_dev->dummy_region,
+ 					     dummy_data, id);
++	devlink_region_snapshot_id_put(devlink, id);
+ 	if (err) {
+ 		pr_err("Failed to create region snapshot\n");
+ 		kfree(dummy_data);
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 64ff6066eb41..50aeb7313980 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -21,6 +21,7 @@
+ #include <linux/refcount.h>
+ #include <net/net_namespace.h>
+ #include <uapi/linux/devlink.h>
++#include <linux/xarray.h>
+ 
+ struct devlink_ops;
+ 
+@@ -32,13 +33,13 @@ struct devlink {
+ 	struct list_head resource_list;
+ 	struct list_head param_list;
+ 	struct list_head region_list;
+-	u32 snapshot_id;
+ 	struct list_head reporter_list;
+ 	struct mutex reporters_lock; /* protects reporter_list */
+ 	struct devlink_dpipe_headers *dpipe_headers;
+ 	struct list_head trap_list;
+ 	struct list_head trap_group_list;
+ 	const struct devlink_ops *ops;
++	struct xarray snapshot_ids;
+ 	struct device *dev;
+ 	possible_net_t _net;
+ 	struct mutex lock;
+@@ -898,6 +899,7 @@ devlink_region_create(struct devlink *devlink,
+ 		      u32 region_max_snapshots, u64 region_size);
+ void devlink_region_destroy(struct devlink_region *region);
+ int devlink_region_snapshot_id_get(struct devlink *devlink, u32 *id);
++void devlink_region_snapshot_id_put(struct devlink *devlink, u32 id);
+ int devlink_region_snapshot_create(struct devlink_region *region,
+ 				   u8 *data, u32 snapshot_id);
+ int devlink_info_serial_number_put(struct devlink_info_req *req,
+* Unmerged path net/core/devlink.c
