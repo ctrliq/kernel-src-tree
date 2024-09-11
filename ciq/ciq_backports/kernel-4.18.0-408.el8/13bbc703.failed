@@ -1,0 +1,222 @@
+KVM: selftests: Sync perf_test_args to guest during VM creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 13bbc70329c8df003e64c4fbea8678f9db0e75d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/13bbc703.failed
+
+Copy perf_test_args to the guest during VM creation instead of relying on
+the caller to do so at their leisure.  Ideally, tests wouldn't even be
+able to modify perf_test_args, i.e. they would have no motivation to do
+the sync, but enforcing that is arguably a net negative for readability.
+
+No functional change intended.
+
+[Set wr_fract=1 by default and add helper to override it since the new
+ access_tracking_perf_test needs to set it dynamically.]
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20211111000310.1435032-13-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 13bbc70329c8df003e64c4fbea8678f9db0e75d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/dirty_log_perf_test.c
+#	tools/testing/selftests/kvm/lib/perf_test_util.c
+#	tools/testing/selftests/kvm/memslot_modification_stress_test.c
+diff --cc tools/testing/selftests/kvm/dirty_log_perf_test.c
+index 7ffab5bd5ce5,583b4d95aa98..000000000000
+--- a/tools/testing/selftests/kvm/dirty_log_perf_test.c
++++ b/tools/testing/selftests/kvm/dirty_log_perf_test.c
+@@@ -186,9 -186,10 +186,9 @@@ static void run_test(enum vm_guest_mod
+  	struct timespec clear_dirty_log_total = (struct timespec){0};
+  
+  	vm = perf_test_create_vm(mode, nr_vcpus, guest_percpu_mem_size,
+ -				 p->slots, p->backing_src,
+ -				 p->partition_vcpu_memory_access);
+ +				 p->slots, p->backing_src);
+  
+- 	perf_test_args.wr_fract = p->wr_fract;
++ 	perf_test_set_wr_fract(vm, p->wr_fract);
+  
+  	guest_num_pages = (nr_vcpus * guest_percpu_mem_size) >> vm_get_page_shift(vm);
+  	guest_num_pages = vm_adjust_num_guest_pages(mode, guest_num_pages);
+@@@ -206,11 -207,6 +206,14 @@@
+  	vcpu_threads = malloc(nr_vcpus * sizeof(*vcpu_threads));
+  	TEST_ASSERT(vcpu_threads, "Memory allocation failed");
+  
+++<<<<<<< HEAD
+ +	perf_test_setup_vcpus(vm, nr_vcpus, guest_percpu_mem_size,
+ +			      p->partition_vcpu_memory_access);
+ +
+ +	sync_global_to_guest(vm, perf_test_args);
+ +
+++=======
+++>>>>>>> 13bbc70329c8 (KVM: selftests: Sync perf_test_args to guest during VM creation)
+  	/* Start the iterations */
+  	iteration = 0;
+  	host_quit = false;
+diff --cc tools/testing/selftests/kvm/lib/perf_test_util.c
+index 0ef80dbdc116,77f9eb5667c9..000000000000
+--- a/tools/testing/selftests/kvm/lib/perf_test_util.c
++++ b/tools/testing/selftests/kvm/lib/perf_test_util.c
+@@@ -59,15 -94,21 +59,26 @@@ struct kvm_vm *perf_test_create_vm(enu
+  
+  	pr_info("Testing guest mode: %s\n", vm_guest_mode_string(mode));
+  
+++<<<<<<< HEAD
+ +	perf_test_args.host_page_size = getpagesize();
+ +	perf_test_args.guest_page_size = vm_guest_mode_params[mode].page_size;
+++=======
++ 	/* By default vCPUs will write to memory. */
++ 	pta->wr_fract = 1;
++ 
++ 	/*
++ 	 * Snapshot the non-huge page size.  This is used by the guest code to
++ 	 * access/dirty pages at the logging granularity.
++ 	 */
++ 	pta->guest_page_size = vm_guest_mode_params[mode].page_size;
+++>>>>>>> 13bbc70329c8 (KVM: selftests: Sync perf_test_args to guest during VM creation)
+  
+  	guest_num_pages = vm_adjust_num_guest_pages(mode,
+ -				(vcpus * vcpu_memory_bytes) / pta->guest_page_size);
+ +				(vcpus * vcpu_memory_bytes) / perf_test_args.guest_page_size);
+  
+ -	TEST_ASSERT(vcpu_memory_bytes % getpagesize() == 0,
+ +	TEST_ASSERT(vcpu_memory_bytes % perf_test_args.host_page_size == 0,
+  		    "Guest memory size is not host page size aligned.");
+ -	TEST_ASSERT(vcpu_memory_bytes % pta->guest_page_size == 0,
+ +	TEST_ASSERT(vcpu_memory_bytes % perf_test_args.guest_page_size == 0,
+  		    "Guest memory size is not guest page size aligned.");
+  	TEST_ASSERT(guest_num_pages % slots == 0,
+  		    "Guest memory cannot be evenly divided into %d slots.",
+@@@ -124,36 -172,8 +138,43 @@@ void perf_test_destroy_vm(struct kvm_v
+  	kvm_vm_free(vm);
+  }
+  
+++<<<<<<< HEAD
+ +void perf_test_setup_vcpus(struct kvm_vm *vm, int vcpus,
+ +			   uint64_t vcpu_memory_bytes,
+ +			   bool partition_vcpu_memory_access)
+ +{
+ +	vm_paddr_t vcpu_gpa;
+ +	struct perf_test_vcpu_args *vcpu_args;
+ +	int vcpu_id;
+ +
+ +	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++) {
+ +		vcpu_args = &perf_test_args.vcpu_args[vcpu_id];
+ +
+ +		vcpu_args->vcpu_id = vcpu_id;
+ +		if (partition_vcpu_memory_access) {
+ +			vcpu_args->gva = guest_test_virt_mem +
+ +					 (vcpu_id * vcpu_memory_bytes);
+ +			vcpu_args->pages = vcpu_memory_bytes /
+ +					   perf_test_args.guest_page_size;
+ +			vcpu_gpa = guest_test_phys_mem +
+ +				   (vcpu_id * vcpu_memory_bytes);
+ +		} else {
+ +			vcpu_args->gva = guest_test_virt_mem;
+ +			vcpu_args->pages = (vcpus * vcpu_memory_bytes) /
+ +					   perf_test_args.guest_page_size;
+ +			vcpu_gpa = guest_test_phys_mem;
+ +		}
+ +
+ +		vcpu_args_set(vm, vcpu_id, 1, vcpu_id);
+ +
+ +		pr_debug("Added VCPU %d with test mem gpa [%lx, %lx)\n",
+ +			 vcpu_id, vcpu_gpa, vcpu_gpa +
+ +			 (vcpu_args->pages * perf_test_args.guest_page_size));
+ +	}
+++=======
++ void perf_test_set_wr_fract(struct kvm_vm *vm, int wr_fract)
++ {
++ 	perf_test_args.wr_fract = wr_fract;
++ 	sync_global_to_guest(vm, perf_test_args);
+++>>>>>>> 13bbc70329c8 (KVM: selftests: Sync perf_test_args to guest during VM creation)
+  }
+diff --cc tools/testing/selftests/kvm/memslot_modification_stress_test.c
+index 4cfcafea9f5a,df431d0da1ee..000000000000
+--- a/tools/testing/selftests/kvm/memslot_modification_stress_test.c
++++ b/tools/testing/selftests/kvm/memslot_modification_stress_test.c
+@@@ -105,19 -105,12 +105,20 @@@ static void run_test(enum vm_guest_mod
+  	int vcpu_id;
+  
+  	vm = perf_test_create_vm(mode, nr_vcpus, guest_percpu_mem_size, 1,
+ -				 VM_MEM_SRC_ANONYMOUS,
+ -				 p->partition_vcpu_memory_access);
+ +				 VM_MEM_SRC_ANONYMOUS);
+  
+- 	perf_test_args.wr_fract = 1;
+- 
+  	vcpu_threads = malloc(nr_vcpus * sizeof(*vcpu_threads));
+  	TEST_ASSERT(vcpu_threads, "Memory allocation failed");
+  
+++<<<<<<< HEAD
+ +	perf_test_setup_vcpus(vm, nr_vcpus, guest_percpu_mem_size,
+ +			      p->partition_vcpu_memory_access);
+ +
+ +	/* Export the shared variables to the guest */
+ +	sync_global_to_guest(vm, perf_test_args);
+ +
+++=======
+++>>>>>>> 13bbc70329c8 (KVM: selftests: Sync perf_test_args to guest during VM creation)
+  	pr_info("Finished creating vCPUs\n");
+  
+  	for (vcpu_id = 0; vcpu_id < nr_vcpus; vcpu_id++)
+diff --git a/tools/testing/selftests/kvm/access_tracking_perf_test.c b/tools/testing/selftests/kvm/access_tracking_perf_test.c
+index 8964fe69d998..5733dab08c40 100644
+--- a/tools/testing/selftests/kvm/access_tracking_perf_test.c
++++ b/tools/testing/selftests/kvm/access_tracking_perf_test.c
+@@ -277,8 +277,7 @@ static void run_iteration(struct kvm_vm *vm, int vcpus, const char *description)
+ static void access_memory(struct kvm_vm *vm, int vcpus, enum access_type access,
+ 			  const char *description)
+ {
+-	perf_test_args.wr_fract = (access == ACCESS_READ) ? INT_MAX : 1;
+-	sync_global_to_guest(vm, perf_test_args);
++	perf_test_set_wr_fract(vm, (access == ACCESS_READ) ? INT_MAX : 1);
+ 	iteration_work = ITERATION_ACCESS_MEMORY;
+ 	run_iteration(vm, vcpus, description);
+ }
+diff --git a/tools/testing/selftests/kvm/demand_paging_test.c b/tools/testing/selftests/kvm/demand_paging_test.c
+index 52bd44288de9..3afa8e6419ee 100644
+--- a/tools/testing/selftests/kvm/demand_paging_test.c
++++ b/tools/testing/selftests/kvm/demand_paging_test.c
+@@ -259,8 +259,6 @@ static void run_test(enum vm_guest_mode mode, void *arg)
+ 	vm = perf_test_create_vm(mode, nr_vcpus, guest_percpu_mem_size, 1,
+ 				 p->src_type);
+ 
+-	perf_test_args.wr_fract = 1;
+-
+ 	demand_paging_size = get_backing_src_pagesz(p->src_type);
+ 
+ 	guest_data_prototype = malloc(demand_paging_size);
+@@ -320,9 +318,6 @@ static void run_test(enum vm_guest_mode mode, void *arg)
+ 		}
+ 	}
+ 
+-	/* Export the shared variables to the guest */
+-	sync_global_to_guest(vm, perf_test_args);
+-
+ 	pr_info("Finished creating vCPUs and starting uffd threads\n");
+ 
+ 	clock_gettime(CLOCK_MONOTONIC, &start);
+* Unmerged path tools/testing/selftests/kvm/dirty_log_perf_test.c
+diff --git a/tools/testing/selftests/kvm/include/perf_test_util.h b/tools/testing/selftests/kvm/include/perf_test_util.h
+index df9f1a3a3ffb..9275e4376658 100644
+--- a/tools/testing/selftests/kvm/include/perf_test_util.h
++++ b/tools/testing/selftests/kvm/include/perf_test_util.h
+@@ -51,4 +51,6 @@ void perf_test_setup_vcpus(struct kvm_vm *vm, int vcpus,
+ 			   uint64_t vcpu_memory_bytes,
+ 			   bool partition_vcpu_memory_access);
+ 
++void perf_test_set_wr_fract(struct kvm_vm *vm, int wr_fract);
++
+ #endif /* SELFTEST_KVM_PERF_TEST_UTIL_H */
+* Unmerged path tools/testing/selftests/kvm/lib/perf_test_util.c
+* Unmerged path tools/testing/selftests/kvm/memslot_modification_stress_test.c
