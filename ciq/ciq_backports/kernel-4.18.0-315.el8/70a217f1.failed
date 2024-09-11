@@ -1,0 +1,158 @@
+tcp: Use a struct to represent a saved_syn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 70a217f1976f75a6cfe8223e5669ad7b405daaad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/70a217f1.failed
+
+The TCP_SAVE_SYN has both the network header and tcp header.
+The total length of the saved syn packet is currently stored in
+the first 4 bytes (u32) of an array and the actual packet data is
+stored after that.
+
+A later patch will add a bpf helper that allows to get the tcp header
+alone from the saved syn without the network header.  It will be more
+convenient to have a direct offset to a specific header instead of
+re-parsing it.  This requires to separately store the network hdrlen.
+The total header length (i.e. network + tcp) is still needed for the
+current usage in getsockopt.  Although this total length can be obtained
+by looking into the tcphdr and then get the (th->doff << 2), this patch
+chooses to directly store the tcp hdrlen in the second four bytes of
+this newly created "struct saved_syn".  By using a new struct, it can
+give a readable name to each individual header length.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200820190014.2883694-1-kafai@fb.com
+(cherry picked from commit 70a217f1976f75a6cfe8223e5669ad7b405daaad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/tcp.h
+diff --cc include/linux/tcp.h
+index f0380127bbb8,2088d5a079af..000000000000
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@@ -483,7 -484,13 +483,17 @@@ static inline void tcp_saved_syn_free(s
+  	tp->saved_syn = NULL;
+  }
+  
+++<<<<<<< HEAD
+ +struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk);
+++=======
++ static inline u32 tcp_saved_syn_len(const struct saved_syn *saved_syn)
++ {
++ 	return saved_syn->network_hdrlen + saved_syn->tcp_hdrlen;
++ }
++ 
++ struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk,
++ 					       const struct sk_buff *orig_skb);
+++>>>>>>> 70a217f1976f (tcp: Use a struct to represent a saved_syn)
+  
+  static inline u16 tcp_mss_clamp(const struct tcp_sock *tp, u16 mss)
+  {
+* Unmerged path include/linux/tcp.h
+diff --git a/include/net/request_sock.h b/include/net/request_sock.h
+index 17b56556eb43..eff1d6e60925 100644
+--- a/include/net/request_sock.h
++++ b/include/net/request_sock.h
+@@ -45,6 +45,12 @@ struct request_sock_ops {
+ 
+ int inet_rtx_syn_ack(const struct sock *parent, struct request_sock *req);
+ 
++struct saved_syn {
++	u32 network_hdrlen;
++	u32 tcp_hdrlen;
++	u8 data[];
++};
++
+ /* struct request_sock - mini sock to represent a connection request
+  */
+ struct request_sock {
+@@ -65,7 +71,7 @@ struct request_sock {
+ 	struct timer_list		rsk_timer;
+ 	const struct request_sock_ops	*rsk_ops;
+ 	struct sock			*sk;
+-	u32				*saved_syn;
++	struct saved_syn		*saved_syn;
+ 	u32				secid;
+ 	u32				peer_secid;
+ };
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 80033c579790..649b3c5aebb0 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -4601,9 +4601,9 @@ static int _bpf_getsockopt(struct sock *sk, int level, int optname,
+ 			tp = tcp_sk(sk);
+ 
+ 			if (optlen <= 0 || !tp->saved_syn ||
+-			    optlen > tp->saved_syn[0])
++			    optlen > tcp_saved_syn_len(tp->saved_syn))
+ 				goto err_clear;
+-			memcpy(optval, tp->saved_syn + 1, optlen);
++			memcpy(optval, tp->saved_syn->data, optlen);
+ 			break;
+ 		default:
+ 			goto err_clear;
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 98852debb36e..817da3227982 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -3633,20 +3633,21 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
+ 
+ 		lock_sock(sk);
+ 		if (tp->saved_syn) {
+-			if (len < tp->saved_syn[0]) {
+-				if (put_user(tp->saved_syn[0], optlen)) {
++			if (len < tcp_saved_syn_len(tp->saved_syn)) {
++				if (put_user(tcp_saved_syn_len(tp->saved_syn),
++					     optlen)) {
+ 					release_sock(sk);
+ 					return -EFAULT;
+ 				}
+ 				release_sock(sk);
+ 				return -EINVAL;
+ 			}
+-			len = tp->saved_syn[0];
++			len = tcp_saved_syn_len(tp->saved_syn);
+ 			if (put_user(len, optlen)) {
+ 				release_sock(sk);
+ 				return -EFAULT;
+ 			}
+-			if (copy_to_user(optval, tp->saved_syn + 1, len)) {
++			if (copy_to_user(optval, tp->saved_syn->data, len)) {
+ 				release_sock(sk);
+ 				return -EFAULT;
+ 			}
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 78925b138f7d..49d9789534b6 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -6471,13 +6471,15 @@ static void tcp_reqsk_record_syn(const struct sock *sk,
+ {
+ 	if (tcp_sk(sk)->save_syn) {
+ 		u32 len = skb_network_header_len(skb) + tcp_hdrlen(skb);
+-		u32 *copy;
+-
+-		copy = kmalloc(len + sizeof(u32), GFP_ATOMIC);
+-		if (copy) {
+-			copy[0] = len;
+-			memcpy(&copy[1], skb_network_header(skb), len);
+-			req->saved_syn = copy;
++		struct saved_syn *saved_syn;
++
++		saved_syn = kmalloc(struct_size(saved_syn, data, len),
++				    GFP_ATOMIC);
++		if (saved_syn) {
++			saved_syn->network_hdrlen = skb_network_header_len(skb);
++			saved_syn->tcp_hdrlen = tcp_hdrlen(skb);
++			memcpy(saved_syn->data, skb_network_header(skb), len);
++			req->saved_syn = saved_syn;
+ 		}
+ 	}
+ }
