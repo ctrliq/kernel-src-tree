@@ -1,0 +1,255 @@
+io_uring: ensure openat sets O_LARGEFILE if needed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 08a1d26eb894a9dcf79f674558a284ad1ffef517
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/08a1d26e.failed
+
+OPENAT2 correctly sets O_LARGEFILE if it has to, but that escaped the
+OPENAT opcode. Dmitry reports that his test case that compares openat()
+and IORING_OP_OPENAT sees failures on large files:
+
+*** sync openat
+openat succeeded
+sync write at offset 0
+write succeeded
+sync write at offset 4294967296
+write succeeded
+
+*** sync openat
+openat succeeded
+io_uring write at offset 0
+write succeeded
+io_uring write at offset 4294967296
+write succeeded
+
+*** io_uring openat
+openat succeeded
+sync write at offset 0
+write succeeded
+sync write at offset 4294967296
+write failed: File too large
+
+*** io_uring openat
+openat succeeded
+io_uring write at offset 0
+write succeeded
+io_uring write at offset 4294967296
+write failed: File too large
+
+Ensure we set O_LARGEFILE, if force_o_largefile() is true.
+
+	Cc: stable@vger.kernel.org # v5.6
+Fixes: 15b71abe7b52 ("io_uring: add support for IORING_OP_OPENAT")
+	Reported-by: Dmitry Kadashev <dkadashev@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 08a1d26eb894a9dcf79f674558a284ad1ffef517)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,e71aa42e102a..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1510,24 -2839,187 +1510,163 @@@ static int io_prep_fsync(struct io_kioc
+  	return 0;
+  }
+  
+ -static bool io_req_cancelled(struct io_kiocb *req)
+ -{
+ -	if (req->work.flags & IO_WQ_WORK_CANCEL) {
+ -		req_set_fail_links(req);
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -static void __io_fsync(struct io_kiocb *req)
+ +static int io_fsync(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +		    bool force_nonblock)
+  {
+ -	loff_t end = req->sync.off + req->sync.len;
+ +	loff_t sqe_off = READ_ONCE(sqe->off);
+ +	loff_t sqe_len = READ_ONCE(sqe->len);
+ +	loff_t end = sqe_off + sqe_len;
+ +	unsigned fsync_flags;
+  	int ret;
+  
+ -	ret = vfs_fsync_range(req->file, req->sync.off,
+ -				end > 0 ? end : LLONG_MAX,
+ -				req->sync.flags & IORING_FSYNC_DATASYNC);
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req(req);
+ -}
+ -
+ -static void io_fsync_finish(struct io_wq_work **workptr)
+ -{
+ -	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
+ +	fsync_flags = READ_ONCE(sqe->fsync_flags);
+ +	if (unlikely(fsync_flags & ~IORING_FSYNC_DATASYNC))
+ +		return -EINVAL;
+  
+ -	if (io_req_cancelled(req))
+ -		return;
+ -	__io_fsync(req);
+ -	io_steal_work(req, workptr);
+ -}
+ +	ret = io_prep_fsync(req, sqe);
+ +	if (ret)
+ +		return ret;
+  
+ -static int io_fsync(struct io_kiocb *req, bool force_nonblock)
+ -{
+  	/* fsync always requires a blocking context */
+++<<<<<<< HEAD
+++=======
++ 	if (force_nonblock) {
++ 		req->work.func = io_fsync_finish;
++ 		return -EAGAIN;
++ 	}
++ 	__io_fsync(req);
++ 	return 0;
++ }
++ 
++ static void __io_fallocate(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = req->fsize;
++ 	ret = vfs_fallocate(req->file, req->sync.mode, req->sync.off,
++ 				req->sync.len);
++ 	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ }
++ 
++ static void io_fallocate_finish(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 
++ 	if (io_req_cancelled(req))
++ 		return;
++ 	__io_fallocate(req);
++ 	io_steal_work(req, workptr);
++ }
++ 
++ static int io_fallocate_prep(struct io_kiocb *req,
++ 			     const struct io_uring_sqe *sqe)
++ {
++ 	if (sqe->ioprio || sqe->buf_index || sqe->rw_flags)
++ 		return -EINVAL;
++ 
++ 	req->sync.off = READ_ONCE(sqe->off);
++ 	req->sync.len = READ_ONCE(sqe->addr);
++ 	req->sync.mode = READ_ONCE(sqe->len);
++ 	req->fsize = rlimit(RLIMIT_FSIZE);
++ 	return 0;
++ }
++ 
++ static int io_fallocate(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	/* fallocate always requiring blocking context */
++ 	if (force_nonblock) {
++ 		req->work.func = io_fallocate_finish;
++ 		return -EAGAIN;
++ 	}
++ 
++ 	__io_fallocate(req);
++ 	return 0;
++ }
++ 
++ static int io_openat_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	const char __user *fname;
++ 	int ret;
++ 
++ 	if (sqe->ioprio || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (sqe->flags & IOSQE_FIXED_FILE)
++ 		return -EBADF;
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	req->open.dfd = READ_ONCE(sqe->fd);
++ 	req->open.how.mode = READ_ONCE(sqe->len);
++ 	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
++ 	req->open.how.flags = READ_ONCE(sqe->open_flags);
++ 	if (force_o_largefile())
++ 		req->open.how.flags |= O_LARGEFILE;
++ 
++ 	req->open.filename = getname(fname);
++ 	if (IS_ERR(req->open.filename)) {
++ 		ret = PTR_ERR(req->open.filename);
++ 		req->open.filename = NULL;
++ 		return ret;
++ 	}
++ 
++ 	req->open.nofile = rlimit(RLIMIT_NOFILE);
++ 	req->flags |= REQ_F_NEED_CLEANUP;
++ 	return 0;
++ }
++ 
++ static int io_openat2_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	struct open_how __user *how;
++ 	const char __user *fname;
++ 	size_t len;
++ 	int ret;
++ 
++ 	if (sqe->ioprio || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (sqe->flags & IOSQE_FIXED_FILE)
++ 		return -EBADF;
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	req->open.dfd = READ_ONCE(sqe->fd);
++ 	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
++ 	how = u64_to_user_ptr(READ_ONCE(sqe->addr2));
++ 	len = READ_ONCE(sqe->len);
++ 
++ 	if (len < OPEN_HOW_SIZE_VER0)
++ 		return -EINVAL;
++ 
++ 	ret = copy_struct_from_user(&req->open.how, sizeof(req->open.how), how,
++ 					len);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!(req->open.how.flags & O_PATH) && force_o_largefile())
++ 		req->open.how.flags |= O_LARGEFILE;
++ 
++ 	req->open.filename = getname(fname);
++ 	if (IS_ERR(req->open.filename)) {
++ 		ret = PTR_ERR(req->open.filename);
++ 		req->open.filename = NULL;
++ 		return ret;
++ 	}
++ 
++ 	req->open.nofile = rlimit(RLIMIT_NOFILE);
++ 	req->flags |= REQ_F_NEED_CLEANUP;
++ 	return 0;
++ }
++ 
++ static int io_openat2(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct open_flags op;
++ 	struct file *file;
++ 	int ret;
++ 
+++>>>>>>> 08a1d26eb894 (io_uring: ensure openat sets O_LARGEFILE if needed)
+  	if (force_nonblock)
+  		return -EAGAIN;
+  
+* Unmerged path fs/io_uring.c
