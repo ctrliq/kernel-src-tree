@@ -1,0 +1,218 @@
+drm/amd/display: add pipe lock during stream update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Wenjing Liu <Wenjing.Liu@amd.com>
+commit e6bddf6c67f9a3abf6f1ef75e52bc1cd228dfe4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/e6bddf6c.failed
+
+[why]
+Stream update will adjust both info packets and stream params,
+need to make sure all things are applied togather.
+
+[how]
+add pipe lock during stream update
+
+	Signed-off-by: Wenjing Liu <Wenjing.Liu@amd.com>
+	Reviewed-by: Jun Lei <Jun.Lei@amd.com>
+	Acked-by: Leo Li <sunpeng.li@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit e6bddf6c67f9a3abf6f1ef75e52bc1cd228dfe4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/display/dc/core/dc.c
+diff --cc drivers/gpu/drm/amd/display/dc/core/dc.c
+index 644b2187507b,260a01ebd888..000000000000
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@@ -1235,6 -1519,183 +1235,186 @@@ static struct dc_stream_status *stream_
+  
+  static const enum surface_update_type update_surface_trace_level = UPDATE_TYPE_FULL;
+  
+++<<<<<<< HEAD
+++=======
++ static void copy_surface_update_to_plane(
++ 		struct dc_plane_state *surface,
++ 		struct dc_surface_update *srf_update)
++ {
++ 	if (srf_update->flip_addr) {
++ 		surface->address = srf_update->flip_addr->address;
++ 		surface->flip_immediate =
++ 			srf_update->flip_addr->flip_immediate;
++ 		surface->time.time_elapsed_in_us[surface->time.index] =
++ 			srf_update->flip_addr->flip_timestamp_in_us -
++ 				surface->time.prev_update_time_in_us;
++ 		surface->time.prev_update_time_in_us =
++ 			srf_update->flip_addr->flip_timestamp_in_us;
++ 		surface->time.index++;
++ 		if (surface->time.index >= DC_PLANE_UPDATE_TIMES_MAX)
++ 			surface->time.index = 0;
++ 	}
++ 
++ 	if (srf_update->scaling_info) {
++ 		surface->scaling_quality =
++ 				srf_update->scaling_info->scaling_quality;
++ 		surface->dst_rect =
++ 				srf_update->scaling_info->dst_rect;
++ 		surface->src_rect =
++ 				srf_update->scaling_info->src_rect;
++ 		surface->clip_rect =
++ 				srf_update->scaling_info->clip_rect;
++ 	}
++ 
++ 	if (srf_update->plane_info) {
++ 		surface->color_space =
++ 				srf_update->plane_info->color_space;
++ 		surface->format =
++ 				srf_update->plane_info->format;
++ 		surface->plane_size =
++ 				srf_update->plane_info->plane_size;
++ 		surface->rotation =
++ 				srf_update->plane_info->rotation;
++ 		surface->horizontal_mirror =
++ 				srf_update->plane_info->horizontal_mirror;
++ 		surface->stereo_format =
++ 				srf_update->plane_info->stereo_format;
++ 		surface->tiling_info =
++ 				srf_update->plane_info->tiling_info;
++ 		surface->visible =
++ 				srf_update->plane_info->visible;
++ 		surface->per_pixel_alpha =
++ 				srf_update->plane_info->per_pixel_alpha;
++ 		surface->global_alpha =
++ 				srf_update->plane_info->global_alpha;
++ 		surface->global_alpha_value =
++ 				srf_update->plane_info->global_alpha_value;
++ 		surface->dcc =
++ 				srf_update->plane_info->dcc;
++ 		surface->sdr_white_level =
++ 				srf_update->plane_info->sdr_white_level;
++ 	}
++ 
++ 	if (srf_update->gamma &&
++ 			(surface->gamma_correction !=
++ 					srf_update->gamma)) {
++ 		memcpy(&surface->gamma_correction->entries,
++ 			&srf_update->gamma->entries,
++ 			sizeof(struct dc_gamma_entries));
++ 		surface->gamma_correction->is_identity =
++ 			srf_update->gamma->is_identity;
++ 		surface->gamma_correction->num_entries =
++ 			srf_update->gamma->num_entries;
++ 		surface->gamma_correction->type =
++ 			srf_update->gamma->type;
++ 	}
++ 
++ 	if (srf_update->in_transfer_func &&
++ 			(surface->in_transfer_func !=
++ 				srf_update->in_transfer_func)) {
++ 		surface->in_transfer_func->sdr_ref_white_level =
++ 			srf_update->in_transfer_func->sdr_ref_white_level;
++ 		surface->in_transfer_func->tf =
++ 			srf_update->in_transfer_func->tf;
++ 		surface->in_transfer_func->type =
++ 			srf_update->in_transfer_func->type;
++ 		memcpy(&surface->in_transfer_func->tf_pts,
++ 			&srf_update->in_transfer_func->tf_pts,
++ 			sizeof(struct dc_transfer_func_distributed_points));
++ 	}
++ 
++ 	if (srf_update->input_csc_color_matrix)
++ 		surface->input_csc_color_matrix =
++ 			*srf_update->input_csc_color_matrix;
++ 
++ 	if (srf_update->coeff_reduction_factor)
++ 		surface->coeff_reduction_factor =
++ 			*srf_update->coeff_reduction_factor;
++ }
++ 
++ static void commit_planes_do_stream_update(struct dc *dc,
++ 		struct dc_stream_state *stream,
++ 		struct dc_stream_update *stream_update,
++ 		enum surface_update_type update_type,
++ 		struct dc_state *context)
++ {
++ 	int j;
++ 
++ 	// Stream updates
++ 	for (j = 0; j < dc->res_pool->pipe_count; j++) {
++ 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[j];
++ 
++ 		if (!pipe_ctx->top_pipe &&
++ 			pipe_ctx->stream &&
++ 			pipe_ctx->stream == stream) {
++ 
++ 			/* Fast update*/
++ 			// VRR program can be done as part of FAST UPDATE
++ 			if (stream_update->adjust)
++ 				dc->hwss.set_drr(&pipe_ctx, 1,
++ 					stream_update->adjust->v_total_min,
++ 					stream_update->adjust->v_total_max);
++ 
++ 			if (stream_update->periodic_interrupt0 &&
++ 					dc->hwss.setup_periodic_interrupt)
++ 				dc->hwss.setup_periodic_interrupt(pipe_ctx, VLINE0);
++ 
++ 			if (stream_update->periodic_interrupt1 &&
++ 					dc->hwss.setup_periodic_interrupt)
++ 				dc->hwss.setup_periodic_interrupt(pipe_ctx, VLINE1);
++ 
++ 			if ((stream_update->hdr_static_metadata && !stream->use_dynamic_meta) ||
++ 					stream_update->vrr_infopacket ||
++ 					stream_update->vsc_infopacket ||
++ 					stream_update->vsp_infopacket) {
++ 				resource_build_info_frame(pipe_ctx);
++ 				dc->hwss.update_info_frame(pipe_ctx);
++ 			}
++ 
++ 			if (stream_update->gamut_remap)
++ 				dc_stream_set_gamut_remap(dc, stream);
++ 
++ 			if (stream_update->output_csc_transform)
++ 				dc_stream_program_csc_matrix(dc, stream);
++ 
++ 			if (stream_update->dither_option) {
++ 				resource_build_bit_depth_reduction_params(pipe_ctx->stream,
++ 									&pipe_ctx->stream->bit_depth_params);
++ 				pipe_ctx->stream_res.opp->funcs->opp_program_fmt(pipe_ctx->stream_res.opp,
++ 						&stream->bit_depth_params,
++ 						&stream->clamping);
++ 			}
++ 
++ 			/* Full fe update*/
++ 			if (update_type == UPDATE_TYPE_FAST)
++ 				continue;
++ 
++ 			if (stream_update->dpms_off) {
++ 				dc->hwss.pipe_control_lock(dc, pipe_ctx, true);
++ 				if (*stream_update->dpms_off) {
++ 					core_link_disable_stream(pipe_ctx, KEEP_ACQUIRED_RESOURCE);
++ 					dc->hwss.optimize_bandwidth(dc, dc->current_state);
++ 				} else {
++ 					dc->hwss.prepare_bandwidth(dc, dc->current_state);
++ 					core_link_enable_stream(dc->current_state, pipe_ctx);
++ 				}
++ 				dc->hwss.pipe_control_lock(dc, pipe_ctx, false);
++ 			}
++ 
++ 			if (stream_update->abm_level && pipe_ctx->stream_res.abm) {
++ 				if (pipe_ctx->stream_res.tg->funcs->is_blanked) {
++ 					// if otg funcs defined check if blanked before programming
++ 					if (!pipe_ctx->stream_res.tg->funcs->is_blanked(pipe_ctx->stream_res.tg))
++ 						pipe_ctx->stream_res.abm->funcs->set_abm_level(
++ 							pipe_ctx->stream_res.abm, stream->abm_level);
++ 				} else
++ 					pipe_ctx->stream_res.abm->funcs->set_abm_level(
++ 						pipe_ctx->stream_res.abm, stream->abm_level);
++ 			}
++ 		}
++ 	}
++ }
+++>>>>>>> e6bddf6c67f9 (drm/amd/display: add pipe lock during stream update)
+  
+  static void commit_planes_for_stream(struct dc *dc,
+  		struct dc_surface_update *srf_updates,
+* Unmerged path drivers/gpu/drm/amd/display/dc/core/dc.c
