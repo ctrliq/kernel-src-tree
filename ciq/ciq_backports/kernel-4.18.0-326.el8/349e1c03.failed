@@ -1,0 +1,183 @@
+xfs: introduce fake roots for inode-rooted btrees
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 349e1c0380dbb7f552e4ea61b479c293eb076b3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/349e1c03.failed
+
+Create an in-core fake root for inode-rooted btree types so that callers
+can generate a whole new btree using the upcoming btree bulk load
+function without making the new tree accessible from the rest of the
+filesystem.  It is up to the individual btree type to provide a function
+to create a staged cursor (presumably with the appropriate callouts to
+update the fakeroot) and then commit the staged root back into the
+filesystem.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit 349e1c0380dbb7f552e4ea61b479c293eb076b3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_btree.c
+#	fs/xfs/libxfs/xfs_btree.h
+#	fs/xfs/libxfs/xfs_btree_staging.c
+#	fs/xfs/libxfs/xfs_btree_staging.h
+#	fs/xfs/xfs_trace.h
+diff --cc fs/xfs/libxfs/xfs_btree.c
+index 66c162ec3227,88223c3cc751..000000000000
+--- a/fs/xfs/libxfs/xfs_btree.c
++++ b/fs/xfs/libxfs/xfs_btree.c
+@@@ -643,9 -666,8 +654,12 @@@ STATIC struct xfs_btree_block 
+  xfs_btree_get_iroot(
+  	struct xfs_btree_cur	*cur)
+  {
+- 	struct xfs_ifork	*ifp;
++ 	struct xfs_ifork	*ifp = xfs_btree_ifork_ptr(cur);
+  
+++<<<<<<< HEAD
+ +	ifp = XFS_IFORK_PTR(cur->bc_private.b.ip, cur->bc_private.b.whichfork);
+++=======
+++>>>>>>> 349e1c0380db (xfs: introduce fake roots for inode-rooted btrees)
+  	return (struct xfs_btree_block *)ifp->if_broot;
+  }
+  
+diff --cc fs/xfs/libxfs/xfs_btree.h
+index 4a1c98bdfaad,69a76a0da5d0..000000000000
+--- a/fs/xfs/libxfs/xfs_btree.h
++++ b/fs/xfs/libxfs/xfs_btree.h
+@@@ -177,15 -178,37 +178,49 @@@ union xfs_btree_irec 
+  	struct xfs_refcount_irec	rc;
+  };
+  
+++<<<<<<< HEAD
+ +/* Per-AG btree private information. */
+ +union xfs_btree_cur_private {
+ +	struct {
+ +		unsigned long	nr_ops;		/* # record updates */
+ +		int		shape_changes;	/* # of extent splits */
+ +	} refc;
+ +	struct {
+ +		bool		active;		/* allocation cursor state */
+ +	} abt;
+++=======
++ /* Per-AG btree information. */
++ struct xfs_btree_cur_ag {
++ 	union {
++ 		struct xfs_buf		*agbp;
++ 		struct xbtree_afakeroot	*afake;	/* for staging cursor */
++ 	};
++ 	xfs_agnumber_t		agno;
++ 	union {
++ 		struct {
++ 			unsigned long nr_ops;	/* # record updates */
++ 			int	shape_changes;	/* # of extent splits */
++ 		} refc;
++ 		struct {
++ 			bool	active;		/* allocation cursor state */
++ 		} abt;
++ 	};
++ };
++ 
++ /* Btree-in-inode cursor information */
++ struct xfs_btree_cur_ino {
++ 	struct xfs_inode		*ip;
++ 	struct xbtree_ifakeroot		*ifake;	/* for staging cursor */
++ 	int				allocated;
++ 	short				forksize;
++ 	char				whichfork;
++ 	char				flags;
++ /* We are converting a delalloc reservation */
++ #define	XFS_BTCUR_BMBT_WASDEL		(1 << 0)
++ 
++ /* For extent swap, ignore owner check in verifier */
++ #define	XFS_BTCUR_BMBT_INVALID_OWNER	(1 << 1)
+++>>>>>>> 349e1c0380db (xfs: introduce fake roots for inode-rooted btrees)
+  };
+  
+  /*
+diff --cc fs/xfs/xfs_trace.h
+index ca668ca52fc1,05db0398f040..000000000000
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@@ -3605,6 -3605,67 +3605,70 @@@ TRACE_EVENT(xfs_check_new_dalign
+  		  __entry->calc_rootino)
+  )
+  
+++<<<<<<< HEAD
+++=======
++ TRACE_EVENT(xfs_btree_commit_afakeroot,
++ 	TP_PROTO(struct xfs_btree_cur *cur),
++ 	TP_ARGS(cur),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_btnum_t, btnum)
++ 		__field(xfs_agnumber_t, agno)
++ 		__field(xfs_agblock_t, agbno)
++ 		__field(unsigned int, levels)
++ 		__field(unsigned int, blocks)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = cur->bc_mp->m_super->s_dev;
++ 		__entry->btnum = cur->bc_btnum;
++ 		__entry->agno = cur->bc_ag.agno;
++ 		__entry->agbno = cur->bc_ag.afake->af_root;
++ 		__entry->levels = cur->bc_ag.afake->af_levels;
++ 		__entry->blocks = cur->bc_ag.afake->af_blocks;
++ 	),
++ 	TP_printk("dev %d:%d btree %s ag %u levels %u blocks %u root %u",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
++ 		  __entry->agno,
++ 		  __entry->levels,
++ 		  __entry->blocks,
++ 		  __entry->agbno)
++ )
++ 
++ TRACE_EVENT(xfs_btree_commit_ifakeroot,
++ 	TP_PROTO(struct xfs_btree_cur *cur),
++ 	TP_ARGS(cur),
++ 	TP_STRUCT__entry(
++ 		__field(dev_t, dev)
++ 		__field(xfs_btnum_t, btnum)
++ 		__field(xfs_agnumber_t, agno)
++ 		__field(xfs_agino_t, agino)
++ 		__field(unsigned int, levels)
++ 		__field(unsigned int, blocks)
++ 		__field(int, whichfork)
++ 	),
++ 	TP_fast_assign(
++ 		__entry->dev = cur->bc_mp->m_super->s_dev;
++ 		__entry->btnum = cur->bc_btnum;
++ 		__entry->agno = XFS_INO_TO_AGNO(cur->bc_mp,
++ 					cur->bc_ino.ip->i_ino);
++ 		__entry->agino = XFS_INO_TO_AGINO(cur->bc_mp,
++ 					cur->bc_ino.ip->i_ino);
++ 		__entry->levels = cur->bc_ino.ifake->if_levels;
++ 		__entry->blocks = cur->bc_ino.ifake->if_blocks;
++ 		__entry->whichfork = cur->bc_ino.whichfork;
++ 	),
++ 	TP_printk("dev %d:%d btree %s ag %u agino %u whichfork %s levels %u blocks %u",
++ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
++ 		  __print_symbolic(__entry->btnum, XFS_BTNUM_STRINGS),
++ 		  __entry->agno,
++ 		  __entry->agino,
++ 		  __entry->whichfork == XFS_ATTR_FORK ? "attr" : "data",
++ 		  __entry->levels,
++ 		  __entry->blocks)
++ )
++ 
+++>>>>>>> 349e1c0380db (xfs: introduce fake roots for inode-rooted btrees)
+  #endif /* _TRACE_XFS_H */
+  
+  #undef TRACE_INCLUDE_PATH
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.c
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.h
+* Unmerged path fs/xfs/libxfs/xfs_btree.c
+* Unmerged path fs/xfs/libxfs/xfs_btree.h
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.c
+* Unmerged path fs/xfs/libxfs/xfs_btree_staging.h
+* Unmerged path fs/xfs/xfs_trace.h
