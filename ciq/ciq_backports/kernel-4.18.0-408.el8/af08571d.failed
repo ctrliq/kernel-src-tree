@@ -1,0 +1,180 @@
+iwlwifi: pcie: support Bz suspend/resume trigger
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Haim Dreyfuss <haim.dreyfuss@intel.com>
+commit af08571d39254a8ef71422e213f59baf38351d55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/af08571d.failed
+
+Instead of using two bits in the doorbell interrupt, the new Bz
+devices have a new CSR_IPC_SLEEP_CONTROL register to let drivers
+indicate the desired transition before triggering the doorbell
+interrupt.
+
+	Signed-off-by: Haim Dreyfuss <haim.dreyfuss@intel.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Link: https://lore.kernel.org/r/iwlwifi.20211204083238.63f3d150689a.Iaeb6f9b007e81b1a5a02144b0281935e4613cb78@changeid
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+(cherry picked from commit af08571d39254a8ef71422e213f59baf38351d55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/iwl-csr.h
+diff --cc drivers/net/wireless/intel/iwlwifi/iwl-csr.h
+index b5976f0068b9,21d8249980fa..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-csr.h
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-csr.h
+@@@ -105,10 -105,13 +105,18 @@@
+  /* GIO Chicken Bits (PCI Express bus link power management) */
+  #define CSR_GIO_CHICKEN_BITS    (CSR_BASE+0x100)
+  
+++<<<<<<< HEAD
+ +/* Doorbell - since Bz
+ + * connected to UREG_DOORBELL_TO_ISR6 (lower 16 bits only)
+ + */
+++=======
++ #define CSR_IPC_SLEEP_CONTROL	(CSR_BASE + 0x114)
++ #define CSR_IPC_SLEEP_CONTROL_SUSPEND	0x3
++ #define CSR_IPC_SLEEP_CONTROL_RESUME	0
++ 
++ /* Doorbell NMI (since Bz) */
+++>>>>>>> af08571d3925 (iwlwifi: pcie: support Bz suspend/resume trigger)
+  #define CSR_DOORBELL_VECTOR	(CSR_BASE + 0x130)
+ -#define CSR_DOORBELL_VECTOR_NMI	BIT(1)
+  
+  /* host chicken bits */
+  #define CSR_HOST_CHICKEN	(CSR_BASE + 0x204)
+* Unmerged path drivers/net/wireless/intel/iwlwifi/iwl-csr.h
+diff --git a/drivers/net/wireless/intel/iwlwifi/iwl-prph.h b/drivers/net/wireless/intel/iwlwifi/iwl-prph.h
+index cf3062803cab..95b3dae7b504 100644
+--- a/drivers/net/wireless/intel/iwlwifi/iwl-prph.h
++++ b/drivers/net/wireless/intel/iwlwifi/iwl-prph.h
+@@ -453,6 +453,13 @@ enum {
+ #define UREG_DOORBELL_TO_ISR6_RESUME	BIT(19)
+ #define UREG_DOORBELL_TO_ISR6_PNVM	BIT(20)
+ 
++/*
++ * From BZ family driver triggers this bit for suspend and resume
++ * The driver should update CSR_IPC_SLEEP_CONTROL before triggering
++ * this interrupt with suspend/resume value
++ */
++#define UREG_DOORBELL_TO_ISR6_SLEEP_CTRL	BIT(31)
++
+ #define CNVI_MBOX_C			0xA3400C
+ 
+ #define FSEQ_ERROR_CODE			0xA340C8
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+index f607edd41baa..0aeab8acc247 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+@@ -1499,33 +1499,54 @@ void iwl_pcie_d3_complete_suspend(struct iwl_trans *trans,
+ 	iwl_pcie_set_pwr(trans, true);
+ }
+ 
++static int iwl_pcie_d3_handshake(struct iwl_trans *trans, bool suspend)
++{
++	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
++	int ret;
++
++	if (trans->trans_cfg->device_family == IWL_DEVICE_FAMILY_AX210) {
++		iwl_write_umac_prph(trans, UREG_DOORBELL_TO_ISR6,
++				    suspend ? UREG_DOORBELL_TO_ISR6_SUSPEND :
++					      UREG_DOORBELL_TO_ISR6_RESUME);
++	} else if (trans->trans_cfg->device_family >= IWL_DEVICE_FAMILY_BZ) {
++		iwl_write32(trans, CSR_IPC_SLEEP_CONTROL,
++			    suspend ? CSR_IPC_SLEEP_CONTROL_SUSPEND :
++				      CSR_IPC_SLEEP_CONTROL_RESUME);
++		iwl_write_umac_prph(trans, UREG_DOORBELL_TO_ISR6,
++				    UREG_DOORBELL_TO_ISR6_SLEEP_CTRL);
++	} else {
++		return 0;
++	}
++
++	ret = wait_event_timeout(trans_pcie->sx_waitq,
++				 trans_pcie->sx_complete, 2 * HZ);
++
++	/* Invalidate it toward next suspend or resume */
++	trans_pcie->sx_complete = false;
++
++	if (!ret) {
++		IWL_ERR(trans, "Timeout %s D3\n",
++			suspend ? "entering" : "exiting");
++		return -ETIMEDOUT;
++	}
++
++	return 0;
++}
++
+ static int iwl_trans_pcie_d3_suspend(struct iwl_trans *trans, bool test,
+ 				     bool reset)
+ {
+ 	int ret;
+-	struct iwl_trans_pcie *trans_pcie =  IWL_TRANS_GET_PCIE_TRANS(trans);
+ 
+ 	if (!reset)
+ 		/* Enable persistence mode to avoid reset */
+ 		iwl_set_bit(trans, CSR_HW_IF_CONFIG_REG,
+ 			    CSR_HW_IF_CONFIG_REG_PERSIST_MODE);
+ 
+-	if (trans->trans_cfg->device_family >= IWL_DEVICE_FAMILY_AX210) {
+-		iwl_write_umac_prph(trans, UREG_DOORBELL_TO_ISR6,
+-				    UREG_DOORBELL_TO_ISR6_SUSPEND);
+-
+-		ret = wait_event_timeout(trans_pcie->sx_waitq,
+-					 trans_pcie->sx_complete, 2 * HZ);
+-		/*
+-		 * Invalidate it toward resume.
+-		 */
+-		trans_pcie->sx_complete = false;
++	ret = iwl_pcie_d3_handshake(trans, true);
++	if (ret)
++		return ret;
+ 
+-		if (!ret) {
+-			IWL_ERR(trans, "Timeout entering D3\n");
+-			return -ETIMEDOUT;
+-		}
+-	}
+ 	iwl_pcie_d3_complete_suspend(trans, test, reset);
+ 
+ 	return 0;
+@@ -1542,6 +1563,7 @@ static int iwl_trans_pcie_d3_resume(struct iwl_trans *trans,
+ 	if (test) {
+ 		iwl_enable_interrupts(trans);
+ 		*status = IWL_D3_STATUS_ALIVE;
++		ret = 0;
+ 		goto out;
+ 	}
+ 
+@@ -1590,25 +1612,10 @@ static int iwl_trans_pcie_d3_resume(struct iwl_trans *trans,
+ 		*status = IWL_D3_STATUS_ALIVE;
+ 
+ out:
+-	if (*status == IWL_D3_STATUS_ALIVE &&
+-	    trans->trans_cfg->device_family >= IWL_DEVICE_FAMILY_AX210) {
+-		trans_pcie->sx_complete = false;
+-		iwl_write_umac_prph(trans, UREG_DOORBELL_TO_ISR6,
+-				    UREG_DOORBELL_TO_ISR6_RESUME);
++	if (*status == IWL_D3_STATUS_ALIVE)
++		ret = iwl_pcie_d3_handshake(trans, false);
+ 
+-		ret = wait_event_timeout(trans_pcie->sx_waitq,
+-					 trans_pcie->sx_complete, 2 * HZ);
+-		/*
+-		 * Invalidate it toward next suspend.
+-		 */
+-		trans_pcie->sx_complete = false;
+-
+-		if (!ret) {
+-			IWL_ERR(trans, "Timeout exiting D3\n");
+-			return -ETIMEDOUT;
+-		}
+-	}
+-	return 0;
++	return ret;
+ }
+ 
+ static void
