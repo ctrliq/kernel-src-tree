@@ -1,0 +1,293 @@
+bpf: enable program stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 492ecee892c2a4ba6a14903d5d586ff750b7e805
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/492ecee8.failed
+
+JITed BPF programs are indistinguishable from kernel functions, but unlike
+kernel code BPF code can be changed often.
+Typical approach of "perf record" + "perf report" profiling and tuning of
+kernel code works just as well for BPF programs, but kernel code doesn't
+need to be monitored whereas BPF programs do.
+Users load and run large amount of BPF programs.
+These BPF stats allow tools monitor the usage of BPF on the server.
+The monitoring tools will turn sysctl kernel.bpf_stats_enabled
+on and off for few seconds to sample average cost of the programs.
+Aggregated data over hours and days will provide an insight into cost of BPF
+and alarms can trigger in case given program suddenly gets more expensive.
+
+The cost of two sched_clock() per program invocation adds ~20 nsec.
+Fast BPF progs (like selftests/bpf/progs/test_pkt_access.c) will slow down
+from ~10 nsec to ~30 nsec.
+static_key minimizes the cost of the stats collection.
+There is no measurable difference before/after this patch
+with kernel.bpf_stats_enabled=0
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 492ecee892c2a4ba6a14903d5d586ff750b7e805)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index 8eb17ea80e98,a2132e09dc1c..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -388,7 -395,8 +395,12 @@@ struct bpf_prog_aux 
+  	 * jited_linfo.
+  	 * main prog always has linfo_idx == 0
+  	 */
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(u32 linfo_idx)
+++=======
++ 	u32 linfo_idx;
++ 	struct bpf_prog_stats __percpu *stats;
+++>>>>>>> 492ecee892c2 (bpf: enable program stats)
+  	union {
+  		struct work_struct work;
+  		struct rcu_head	rcu;
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 2fa0f17cbf20..44076b5ef1fd 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -533,7 +533,24 @@ struct sk_filter {
+ 	struct bpf_prog	*prog;
+ };
+ 
+-#define BPF_PROG_RUN(filter, ctx)  ({ cant_sleep(); (*(filter)->bpf_func)(ctx, (filter)->insnsi); })
++DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
++
++#define BPF_PROG_RUN(prog, ctx)	({				\
++	u32 ret;						\
++	cant_sleep();						\
++	if (static_branch_unlikely(&bpf_stats_enabled_key)) {	\
++		struct bpf_prog_stats *stats;			\
++		u64 start = sched_clock();			\
++		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
++		stats = this_cpu_ptr(prog->aux->stats);		\
++		u64_stats_update_begin(&stats->syncp);		\
++		stats->cnt++;					\
++		stats->nsecs += sched_clock() - start;		\
++		u64_stats_update_end(&stats->syncp);		\
++	} else {						\
++		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
++	}							\
++	ret; })
+ 
+ #define BPF_SKB_CB_LEN QDISC_CB_PRIV_LEN
+ 
+@@ -764,6 +781,7 @@ void bpf_prog_free_jited_linfo(struct bpf_prog *prog);
+ void bpf_prog_free_unused_jited_linfo(struct bpf_prog *prog);
+ 
+ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags);
++struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flags);
+ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
+ 				  gfp_t gfp_extra_flags);
+ void __bpf_prog_free(struct bpf_prog *fp);
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 3abb1fce17b6..dbcc50d82470 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -78,7 +78,7 @@ void *bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb, int k, uns
+ 	return NULL;
+ }
+ 
+-struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
++struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flags)
+ {
+ 	gfp_t gfp_flags = GFP_KERNEL | __GFP_ZERO | gfp_extra_flags;
+ 	struct bpf_prog_aux *aux;
+@@ -104,6 +104,26 @@ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
+ 
+ 	return fp;
+ }
++
++struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
++{
++	gfp_t gfp_flags = GFP_KERNEL | __GFP_ZERO | gfp_extra_flags;
++	struct bpf_prog *prog;
++
++	prog = bpf_prog_alloc_no_stats(size, gfp_extra_flags);
++	if (!prog)
++		return NULL;
++
++	prog->aux->stats = alloc_percpu_gfp(struct bpf_prog_stats, gfp_flags);
++	if (!prog->aux->stats) {
++		kfree(prog->aux);
++		vfree(prog);
++		return NULL;
++	}
++
++	u64_stats_init(&prog->aux->stats->syncp);
++	return prog;
++}
+ EXPORT_SYMBOL_GPL(bpf_prog_alloc);
+ 
+ int bpf_prog_alloc_jited_linfo(struct bpf_prog *prog)
+@@ -231,7 +251,10 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
+ 
+ void __bpf_prog_free(struct bpf_prog *fp)
+ {
+-	kfree(fp->aux);
++	if (fp->aux) {
++		free_percpu(fp->aux->stats);
++		kfree(fp->aux);
++	}
+ 	vfree(fp);
+ }
+ 
+@@ -2071,6 +2094,10 @@ int __weak skb_copy_bits(const struct sk_buff *skb, int offset, void *to,
+ 	return -EFAULT;
+ }
+ 
++DEFINE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
++EXPORT_SYMBOL(bpf_stats_enabled_key);
++int sysctl_bpf_stats_enabled __read_mostly;
++
+ /* All definitions of tracepoints related to BPF. */
+ #define CREATE_TRACE_POINTS
+ #include <linux/bpf_trace.h>
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 3a88c2585916..a42ee8564f65 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1296,24 +1296,54 @@ static int bpf_prog_release(struct inode *inode, struct file *filp)
+ 	return 0;
+ }
+ 
++static void bpf_prog_get_stats(const struct bpf_prog *prog,
++			       struct bpf_prog_stats *stats)
++{
++	u64 nsecs = 0, cnt = 0;
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		const struct bpf_prog_stats *st;
++		unsigned int start;
++		u64 tnsecs, tcnt;
++
++		st = per_cpu_ptr(prog->aux->stats, cpu);
++		do {
++			start = u64_stats_fetch_begin_irq(&st->syncp);
++			tnsecs = st->nsecs;
++			tcnt = st->cnt;
++		} while (u64_stats_fetch_retry_irq(&st->syncp, start));
++		nsecs += tnsecs;
++		cnt += tcnt;
++	}
++	stats->nsecs = nsecs;
++	stats->cnt = cnt;
++}
++
+ #ifdef CONFIG_PROC_FS
+ static void bpf_prog_show_fdinfo(struct seq_file *m, struct file *filp)
+ {
+ 	const struct bpf_prog *prog = filp->private_data;
+ 	char prog_tag[sizeof(prog->tag) * 2 + 1] = { };
++	struct bpf_prog_stats stats;
+ 
++	bpf_prog_get_stats(prog, &stats);
+ 	bin2hex(prog_tag, prog->tag, sizeof(prog->tag));
+ 	seq_printf(m,
+ 		   "prog_type:\t%u\n"
+ 		   "prog_jited:\t%u\n"
+ 		   "prog_tag:\t%s\n"
+ 		   "memlock:\t%llu\n"
+-		   "prog_id:\t%u\n",
++		   "prog_id:\t%u\n"
++		   "run_time_ns:\t%llu\n"
++		   "run_cnt:\t%llu\n",
+ 		   prog->type,
+ 		   prog->jited,
+ 		   prog_tag,
+ 		   prog->pages * 1ULL << PAGE_SHIFT,
+-		   prog->aux->id);
++		   prog->aux->id,
++		   stats.nsecs,
++		   stats.cnt);
+ }
+ #endif
+ 
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 1828f29ab7ea..f15d0f5ccdc8 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -7308,7 +7308,12 @@ static int jit_subprogs(struct bpf_verifier_env *env)
+ 		subprog_end = env->subprog_info[i + 1].start;
+ 
+ 		len = subprog_end - subprog_start;
+-		func[i] = bpf_prog_alloc(bpf_prog_size(len), GFP_USER);
++		/* BPF_PROG_RUN doesn't call subprogs directly,
++		 * hence main prog stats include the runtime of subprogs.
++		 * subprogs don't have IDs and not reachable via prog_get_next_id
++		 * func[i]->aux->stats will never be accessed and stays NULL
++		 */
++		func[i] = bpf_prog_alloc_no_stats(bpf_prog_size(len), GFP_USER);
+ 		if (!func[i])
+ 			goto out_free;
+ 		memcpy(func[i]->insnsi, &prog->insnsi[subprog_start],
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 04c2181c0df5..e1fe4d90926f 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -224,6 +224,9 @@ static int proc_dostring_coredump(struct ctl_table *table, int write,
+ #endif
+ static int proc_dopipe_max_size(struct ctl_table *table, int write,
+ 		void __user *buffer, size_t *lenp, loff_t *ppos);
++static int proc_dointvec_minmax_bpf_stats(struct ctl_table *table, int write,
++					  void __user *buffer, size_t *lenp,
++					  loff_t *ppos);
+ 
+ #ifdef CONFIG_MAGIC_SYSRQ
+ /* Note: sysrq code uses it's own private copy */
+@@ -1222,6 +1225,15 @@ static struct ctl_table kern_table[] = {
+ 		.extra2		= &one,
+ 	},
+ #endif
++	{
++		.procname	= "bpf_stats_enabled",
++		.data		= &sysctl_bpf_stats_enabled,
++		.maxlen		= sizeof(sysctl_bpf_stats_enabled),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax_bpf_stats,
++		.extra1		= &zero,
++		.extra2		= &one,
++	},
+ #if defined(CONFIG_TREE_RCU) || defined(CONFIG_PREEMPT_RCU)
+ 	{
+ 		.procname	= "panic_on_rcu_stall",
+@@ -3281,6 +3293,28 @@ int proc_doulongvec_ms_jiffies_minmax(struct ctl_table *table, int write,
+ 
+ #endif /* CONFIG_PROC_SYSCTL */
+ 
++static int proc_dointvec_minmax_bpf_stats(struct ctl_table *table, int write,
++					  void __user *buffer, size_t *lenp,
++					  loff_t *ppos)
++{
++	int ret, bpf_stats = *(int *)table->data;
++	struct ctl_table tmp = *table;
++
++	if (write && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	tmp.data = &bpf_stats;
++	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
++	if (write && !ret) {
++		*(int *)table->data = bpf_stats;
++		if (bpf_stats)
++			static_branch_enable(&bpf_stats_enabled_key);
++		else
++			static_branch_disable(&bpf_stats_enabled_key);
++	}
++	return ret;
++}
++
+ /*
+  * No sense putting this after each symbol definition, twice,
+  * exception granted :-)
