@@ -338,7 +338,14 @@ replay:
 		return kfree_skb(skb);
 	}
 
+	if (!try_module_get(ss->owner)) {
+		nfnl_unlock(subsys_id);
+		netlink_ack(oskb, nlh, -EOPNOTSUPP, NULL);
+		return kfree_skb(skb);
+	}
+
 	if (!ss->valid_genid(net, genid)) {
+		module_put(ss->owner);
 		nfnl_unlock(subsys_id);
 		netlink_ack(oskb, nlh, -ERESTART, NULL);
 		return kfree_skb(skb);
@@ -475,6 +482,7 @@ done:
 		nfnl_err_reset(&err_list);
 		nfnl_unlock(subsys_id);
 		kfree_skb(skb);
+		module_put(ss->owner);
 		goto replay;
 	} else if (status == NFNL_BATCH_DONE) {
 		err = ss->commit(net, oskb);
@@ -494,6 +502,7 @@ done:
 	nfnl_err_deliver(&err_list, oskb);
 	nfnl_unlock(subsys_id);
 	kfree_skb(skb);
+	module_put(ss->owner);
 }
 
 static const struct nla_policy nfnl_batch_policy[NFNL_BATCH_MAX + 1] = {
