@@ -1,0 +1,136 @@
+KVM: Pre-allocate 1 cpumask variable per cpu for both pv tlb and pv ipis
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Wanpeng Li <wanpengli@tencent.com>
+commit 8a9442f49c72bde43f982e53b74526ac37d3565b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8a9442f4.failed
+
+Nick Desaulniers Reported:
+
+  When building with:
+  $ make CC=clang arch/x86/ CFLAGS=-Wframe-larger-than=1000
+  The following warning is observed:
+  arch/x86/kernel/kvm.c:494:13: warning: stack frame size of 1064 bytes in
+  function 'kvm_send_ipi_mask_allbutself' [-Wframe-larger-than=]
+  static void kvm_send_ipi_mask_allbutself(const struct cpumask *mask, int
+  vector)
+              ^
+  Debugging with:
+  https://github.com/ClangBuiltLinux/frame-larger-than
+  via:
+  $ python3 frame_larger_than.py arch/x86/kernel/kvm.o \
+    kvm_send_ipi_mask_allbutself
+  points to the stack allocated `struct cpumask newmask` in
+  `kvm_send_ipi_mask_allbutself`. The size of a `struct cpumask` is
+  potentially large, as it's CONFIG_NR_CPUS divided by BITS_PER_LONG for
+  the target architecture. CONFIG_NR_CPUS for X86_64 can be as high as
+  8192, making a single instance of a `struct cpumask` 1024 B.
+
+This patch fixes it by pre-allocate 1 cpumask variable per cpu and use it for
+both pv tlb and pv ipis..
+
+	Reported-by: Nick Desaulniers <ndesaulniers@google.com>
+	Acked-by: Nick Desaulniers <ndesaulniers@google.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Nick Desaulniers <ndesaulniers@google.com>
+	Signed-off-by: Wanpeng Li <wanpengli@tencent.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8a9442f49c72bde43f982e53b74526ac37d3565b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kvm.c
+diff --cc arch/x86/kernel/kvm.c
+index c64795383341,6efe0410fb72..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -441,7 -425,29 +441,19 @@@ static void __init sev_map_percpu_data(
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool pv_tlb_flush_supported(void)
++ {
++ 	return (kvm_para_has_feature(KVM_FEATURE_PV_TLB_FLUSH) &&
++ 		!kvm_para_has_hint(KVM_HINTS_REALTIME) &&
++ 		kvm_para_has_feature(KVM_FEATURE_STEAL_TIME));
++ }
++ 
++ static DEFINE_PER_CPU(cpumask_var_t, __pv_cpu_mask);
++ 
+++>>>>>>> 8a9442f49c72 (KVM: Pre-allocate 1 cpumask variable per cpu for both pv tlb and pv ipis)
+  #ifdef CONFIG_SMP
+ -
+ -static bool pv_ipi_supported(void)
+ -{
+ -	return kvm_para_has_feature(KVM_FEATURE_PV_SEND_IPI);
+ -}
+ -
+ -static bool pv_sched_yield_supported(void)
+ -{
+ -	return (kvm_para_has_feature(KVM_FEATURE_PV_SCHED_YIELD) &&
+ -		!kvm_para_has_hint(KVM_HINTS_REALTIME) &&
+ -	    kvm_para_has_feature(KVM_FEATURE_STEAL_TIME));
+ -}
+ -
+  #define KVM_IPI_CLUSTER_SIZE	(2 * BITS_PER_LONG)
+  
+  static void __send_ipi_mask(const struct cpumask *mask, int vector)
+@@@ -632,14 -637,13 +643,21 @@@ static void __init kvm_guest_init(void
+  
+  	if (kvm_para_has_feature(KVM_FEATURE_STEAL_TIME)) {
+  		has_steal_clock = 1;
+ -		pv_ops.time.steal_clock = kvm_steal_clock;
+ +		pv_time_ops.steal_clock = kvm_steal_clock;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (kvm_para_has_feature(KVM_FEATURE_PV_TLB_FLUSH) &&
+ +	    !kvm_para_has_hint(KVM_HINTS_REALTIME) &&
+ +	    kvm_para_has_feature(KVM_FEATURE_STEAL_TIME)) {
+ +		pv_mmu_ops.flush_tlb_others = kvm_flush_tlb_others;
+ +		pv_mmu_ops.tlb_remove_table = tlb_remove_table;
+++=======
++ 	if (pv_tlb_flush_supported()) {
++ 		pv_ops.mmu.flush_tlb_others = kvm_flush_tlb_others;
++ 		pv_ops.mmu.tlb_remove_table = tlb_remove_table;
++ 		pr_info("KVM setup pv remote TLB flush\n");
+++>>>>>>> 8a9442f49c72 (KVM: Pre-allocate 1 cpumask variable per cpu for both pv tlb and pv ipis)
+  	}
+  
+  	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
+@@@ -755,15 -758,19 +774,25 @@@ static __init int kvm_alloc_cpumask(voi
+  	if (!kvm_para_available() || nopv)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (kvm_para_has_feature(KVM_FEATURE_PV_TLB_FLUSH) &&
+ +	    !kvm_para_has_hint(KVM_HINTS_REALTIME) &&
+ +	    kvm_para_has_feature(KVM_FEATURE_STEAL_TIME)) {
+++=======
++ 	if (pv_tlb_flush_supported())
++ 		alloc = true;
++ 
++ #if defined(CONFIG_SMP)
++ 	if (pv_ipi_supported())
++ 		alloc = true;
++ #endif
++ 
++ 	if (alloc)
+++>>>>>>> 8a9442f49c72 (KVM: Pre-allocate 1 cpumask variable per cpu for both pv tlb and pv ipis)
+  		for_each_possible_cpu(cpu) {
+- 			zalloc_cpumask_var_node(per_cpu_ptr(&__pv_tlb_mask, cpu),
++ 			zalloc_cpumask_var_node(per_cpu_ptr(&__pv_cpu_mask, cpu),
+  				GFP_KERNEL, cpu_to_node(cpu));
+  		}
+- 		pr_info("KVM setup pv remote TLB flush\n");
+- 	}
+  
+  	return 0;
+  }
+* Unmerged path arch/x86/kernel/kvm.c
