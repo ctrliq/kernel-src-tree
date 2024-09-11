@@ -1,0 +1,314 @@
+tools/power/cpupower: Read energy_perf_bias from sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Borislav Petkov <bp@suse.de>
+commit 8113ab20e850491b4144a1a64246f07a2d737a49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/8113ab20.failed
+
+... instead of poking at the MSR. For that, move the accessor functions
+to misc.c and add a sysfs-writing function too.
+
+There should be no functional changes resulting from this.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Shuah Khan <skhan@linuxfoundation.org>
+	Cc: Thomas Renninger <trenn@suse.com>
+Link: https://lkml.kernel.org/r/20201029190259.3476-2-bp@alien8.de
+(cherry picked from commit 8113ab20e850491b4144a1a64246f07a2d737a49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/power/cpupower/utils/helpers/misc.c
+diff --cc tools/power/cpupower/utils/helpers/misc.c
+index 15afd2c907cd,e8f8f643a627..000000000000
+--- a/tools/power/cpupower/utils/helpers/misc.c
++++ b/tools/power/cpupower/utils/helpers/misc.c
+@@@ -1,12 -1,16 +1,22 @@@
+  // SPDX-License-Identifier: GPL-2.0
+  
+  #include <stdio.h>
+++<<<<<<< HEAD
+ +#include <stdlib.h>
+++=======
++ #include <errno.h>
++ #include <stdlib.h>
++ 
++ #if defined(__i386__) || defined(__x86_64__)
+++>>>>>>> 8113ab20e850 (tools/power/cpupower: Read energy_perf_bias from sysfs)
+  
+  #include "helpers/helpers.h"
++ #include "helpers/sysfs.h"
++ 
++ #include "cpupower_intern.h"
+  
+ +#if defined(__i386__) || defined(__x86_64__)
+ +
+  #define MSR_AMD_HWCR	0xc0010015
+  
+  int cpufreq_has_boost_support(unsigned int cpu, int *support, int *active,
+@@@ -44,64 -48,44 +54,104 @@@
+  		*support = *active = 1;
+  	return 0;
+  }
++ 
++ int cpupower_intel_get_perf_bias(unsigned int cpu)
++ {
++ 	char linebuf[MAX_LINE_LEN];
++ 	char path[SYSFS_PATH_MAX];
++ 	unsigned long val;
++ 	char *endp;
++ 
++ 	if (!(cpupower_cpu_info.caps & CPUPOWER_CAP_PERF_BIAS))
++ 		return -1;
++ 
++ 	snprintf(path, sizeof(path), PATH_TO_CPU "cpu%u/power/energy_perf_bias", cpu);
++ 
++ 	if (cpupower_read_sysfs(path, linebuf, MAX_LINE_LEN) == 0)
++ 		return -1;
++ 
++ 	val = strtol(linebuf, &endp, 0);
++ 	if (endp == linebuf || errno == ERANGE)
++ 		return -1;
++ 
++ 	return val;
++ }
++ 
++ int cpupower_intel_set_perf_bias(unsigned int cpu, unsigned int val)
++ {
++ 	char path[SYSFS_PATH_MAX];
++ 	char linebuf[3] = {};
++ 
++ 	if (!(cpupower_cpu_info.caps & CPUPOWER_CAP_PERF_BIAS))
++ 		return -1;
++ 
++ 	snprintf(path, sizeof(path), PATH_TO_CPU "cpu%u/power/energy_perf_bias", cpu);
++ 	snprintf(linebuf, sizeof(linebuf), "%d", val);
++ 
++ 	if (cpupower_write_sysfs(path, linebuf, 3) <= 0)
++ 		return -1;
++ 
++ 	return 0;
++ }
++ 
+  #endif /* #if defined(__i386__) || defined(__x86_64__) */
+ +
+ +/* get_cpustate
+ + *
+ + * Gather the information of all online CPUs into bitmask struct
+ + */
+ +void get_cpustate(void)
+ +{
+ +	unsigned int cpu = 0;
+ +
+ +	bitmask_clearall(online_cpus);
+ +	bitmask_clearall(offline_cpus);
+ +
+ +	for (cpu = bitmask_first(cpus_chosen);
+ +		cpu <= bitmask_last(cpus_chosen); cpu++) {
+ +
+ +		if (cpupower_is_cpu_online(cpu) == 1)
+ +			bitmask_setbit(online_cpus, cpu);
+ +		else
+ +			bitmask_setbit(offline_cpus, cpu);
+ +
+ +		continue;
+ +	}
+ +}
+ +
+ +/* print_online_cpus
+ + *
+ + * Print the CPU numbers of all CPUs that are online currently
+ + */
+ +void print_online_cpus(void)
+ +{
+ +	int str_len = 0;
+ +	char *online_cpus_str = NULL;
+ +
+ +	str_len = online_cpus->size * 5;
+ +	online_cpus_str = (void *)malloc(sizeof(char) * str_len);
+ +
+ +	if (!bitmask_isallclear(online_cpus)) {
+ +		bitmask_displaylist(online_cpus_str, str_len, online_cpus);
+ +		printf(_("Following CPUs are online:\n%s\n"), online_cpus_str);
+ +	}
+ +}
+ +
+ +/* print_offline_cpus
+ + *
+ + * Print the CPU numbers of all CPUs that are offline currently
+ + */
+ +void print_offline_cpus(void)
+ +{
+ +	int str_len = 0;
+ +	char *offline_cpus_str = NULL;
+ +
+ +	str_len = offline_cpus->size * 5;
+ +	offline_cpus_str = (void *)malloc(sizeof(char) * str_len);
+ +
+ +	if (!bitmask_isallclear(offline_cpus)) {
+ +		bitmask_displaylist(offline_cpus_str, str_len, offline_cpus);
+ +		printf(_("Following CPUs are offline:\n%s\n"), offline_cpus_str);
+ +		printf(_("cpupower set operation was not performed on them\n"));
+ +	}
+ +}
+diff --git a/tools/power/cpupower/lib/cpupower.c b/tools/power/cpupower/lib/cpupower.c
+index 3656e697537e..3f7d0c0c5067 100644
+--- a/tools/power/cpupower/lib/cpupower.c
++++ b/tools/power/cpupower/lib/cpupower.c
+@@ -16,8 +16,8 @@
+ 
+ unsigned int cpupower_read_sysfs(const char *path, char *buf, size_t buflen)
+ {
+-	int fd;
+ 	ssize_t numread;
++	int fd;
+ 
+ 	fd = open(path, O_RDONLY);
+ 	if (fd == -1)
+@@ -35,6 +35,27 @@ unsigned int cpupower_read_sysfs(const char *path, char *buf, size_t buflen)
+ 	return (unsigned int) numread;
+ }
+ 
++unsigned int cpupower_write_sysfs(const char *path, char *buf, size_t buflen)
++{
++	ssize_t numwritten;
++	int fd;
++
++	fd = open(path, O_WRONLY);
++	if (fd == -1)
++		return 0;
++
++	numwritten = write(fd, buf, buflen - 1);
++	if (numwritten < 1) {
++		perror(path);
++		close(fd);
++		return -1;
++	}
++
++	close(fd);
++
++	return (unsigned int) numwritten;
++}
++
+ /*
+  * Detect whether a CPU is online
+  *
+diff --git a/tools/power/cpupower/lib/cpupower_intern.h b/tools/power/cpupower/lib/cpupower_intern.h
+index 4887c76d23f8..ac1112b956ec 100644
+--- a/tools/power/cpupower/lib/cpupower_intern.h
++++ b/tools/power/cpupower/lib/cpupower_intern.h
+@@ -1,6 +1,11 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ #define PATH_TO_CPU "/sys/devices/system/cpu/"
++
++#ifndef MAX_LINE_LEN
+ #define MAX_LINE_LEN 4096
++#endif
++
+ #define SYSFS_PATH_MAX 255
+ 
+ unsigned int cpupower_read_sysfs(const char *path, char *buf, size_t buflen);
++unsigned int cpupower_write_sysfs(const char *path, char *buf, size_t buflen);
+diff --git a/tools/power/cpupower/utils/cpupower-info.c b/tools/power/cpupower/utils/cpupower-info.c
+index 0ba61a2c4d81..06345b543786 100644
+--- a/tools/power/cpupower/utils/cpupower-info.c
++++ b/tools/power/cpupower/utils/cpupower-info.c
+@@ -101,7 +101,7 @@ int cmd_info(int argc, char **argv)
+ 		}
+ 
+ 		if (params.perf_bias) {
+-			ret = msr_intel_get_perf_bias(cpu);
++			ret = cpupower_intel_get_perf_bias(cpu);
+ 			if (ret < 0) {
+ 				fprintf(stderr,
+ 			_("Could not read perf-bias value[%d]\n"), ret);
+diff --git a/tools/power/cpupower/utils/cpupower-set.c b/tools/power/cpupower/utils/cpupower-set.c
+index 052044d7e012..180d5ba877e6 100644
+--- a/tools/power/cpupower/utils/cpupower-set.c
++++ b/tools/power/cpupower/utils/cpupower-set.c
+@@ -95,7 +95,7 @@ int cmd_set(int argc, char **argv)
+ 		}
+ 
+ 		if (params.perf_bias) {
+-			ret = msr_intel_set_perf_bias(cpu, perf_bias);
++			ret = cpupower_intel_set_perf_bias(cpu, perf_bias);
+ 			if (ret) {
+ 				fprintf(stderr, _("Error setting perf-bias "
+ 						  "value on CPU %d\n"), cpu);
+diff --git a/tools/power/cpupower/utils/helpers/helpers.h b/tools/power/cpupower/utils/helpers/helpers.h
+index a30c7f757ca2..f0f3a55e44da 100644
+--- a/tools/power/cpupower/utils/helpers/helpers.h
++++ b/tools/power/cpupower/utils/helpers/helpers.h
+@@ -107,8 +107,8 @@ extern struct cpupower_cpu_info cpupower_cpu_info;
+ extern int read_msr(int cpu, unsigned int idx, unsigned long long *val);
+ extern int write_msr(int cpu, unsigned int idx, unsigned long long val);
+ 
+-extern int msr_intel_set_perf_bias(unsigned int cpu, unsigned int val);
+-extern int msr_intel_get_perf_bias(unsigned int cpu);
++extern int cpupower_intel_set_perf_bias(unsigned int cpu, unsigned int val);
++extern int cpupower_intel_get_perf_bias(unsigned int cpu);
+ extern unsigned long long msr_intel_get_turbo_ratio(unsigned int cpu);
+ 
+ /* Read/Write msr ****************************/
+@@ -152,9 +152,9 @@ static inline int read_msr(int cpu, unsigned int idx, unsigned long long *val)
+ { return -1; };
+ static inline int write_msr(int cpu, unsigned int idx, unsigned long long val)
+ { return -1; };
+-static inline int msr_intel_set_perf_bias(unsigned int cpu, unsigned int val)
++static inline int cpupower_intel_set_perf_bias(unsigned int cpu, unsigned int val)
+ { return -1; };
+-static inline int msr_intel_get_perf_bias(unsigned int cpu)
++static inline int cpupower_intel_get_perf_bias(unsigned int cpu)
+ { return -1; };
+ static inline unsigned long long msr_intel_get_turbo_ratio(unsigned int cpu)
+ { return 0; };
+* Unmerged path tools/power/cpupower/utils/helpers/misc.c
+diff --git a/tools/power/cpupower/utils/helpers/msr.c b/tools/power/cpupower/utils/helpers/msr.c
+index ab9950748838..8b0b6be74bb8 100644
+--- a/tools/power/cpupower/utils/helpers/msr.c
++++ b/tools/power/cpupower/utils/helpers/msr.c
+@@ -11,7 +11,6 @@
+ /* Intel specific MSRs */
+ #define MSR_IA32_PERF_STATUS		0x198
+ #define MSR_IA32_MISC_ENABLES		0x1a0
+-#define MSR_IA32_ENERGY_PERF_BIAS	0x1b0
+ #define MSR_NEHALEM_TURBO_RATIO_LIMIT	0x1ad
+ 
+ /*
+@@ -73,33 +72,6 @@ int write_msr(int cpu, unsigned int idx, unsigned long long val)
+ 	return -1;
+ }
+ 
+-int msr_intel_get_perf_bias(unsigned int cpu)
+-{
+-	unsigned long long val;
+-	int ret;
+-
+-	if (!(cpupower_cpu_info.caps & CPUPOWER_CAP_PERF_BIAS))
+-		return -1;
+-
+-	ret = read_msr(cpu, MSR_IA32_ENERGY_PERF_BIAS, &val);
+-	if (ret)
+-		return ret;
+-	return val;
+-}
+-
+-int msr_intel_set_perf_bias(unsigned int cpu, unsigned int val)
+-{
+-	int ret;
+-
+-	if (!(cpupower_cpu_info.caps & CPUPOWER_CAP_PERF_BIAS))
+-		return -1;
+-
+-	ret = write_msr(cpu, MSR_IA32_ENERGY_PERF_BIAS, val);
+-	if (ret)
+-		return ret;
+-	return 0;
+-}
+-
+ unsigned long long msr_intel_get_turbo_ratio(unsigned int cpu)
+ {
+ 	unsigned long long val;
