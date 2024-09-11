@@ -1,0 +1,103 @@
+tcp_bbr: refactor bbr_target_cwnd() for general inflight provisioning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Priyaranjan Jha <priyarjha@google.com>
+commit 232aa8ec3ed979d4716891540c03a806ecab0c37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/232aa8ec.failed
+
+Because bbr_target_cwnd() is really a general-purpose BBR helper for
+computing some volume of inflight data as a function of the estimated
+BDP, refactor it into following helper functions:
+- bbr_bdp()
+- bbr_quantization_budget()
+- bbr_inflight()
+
+	Signed-off-by: Priyaranjan Jha <priyarjha@google.com>
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 232aa8ec3ed979d4716891540c03a806ecab0c37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_bbr.c
+diff --cc net/ipv4/tcp_bbr.c
+index f2d5ee3c7777,6b6c7f14ccf9..000000000000
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@@ -364,6 -374,50 +370,53 @@@ static u32 bbr_quantization_budget(stru
+  	return cwnd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Find inflight based on min RTT and the estimated bottleneck bandwidth. */
++ static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
++ {
++ 	u32 inflight;
++ 
++ 	inflight = bbr_bdp(sk, bw, gain);
++ 	inflight = bbr_quantization_budget(sk, inflight, gain);
++ 
++ 	return inflight;
++ }
++ 
++ /* With pacing at lower layers, there's often less data "in the network" than
++  * "in flight". With TSQ and departure time pacing at lower layers (e.g. fq),
++  * we often have several skbs queued in the pacing layer with a pre-scheduled
++  * earliest departure time (EDT). BBR adapts its pacing rate based on the
++  * inflight level that it estimates has already been "baked in" by previous
++  * departure time decisions. We calculate a rough estimate of the number of our
++  * packets that might be in the network at the earliest departure time for the
++  * next skb scheduled:
++  *   in_network_at_edt = inflight_at_edt - (EDT - now) * bw
++  * If we're increasing inflight, then we want to know if the transmit of the
++  * EDT skb will push inflight above the target, so inflight_at_edt includes
++  * bbr_tso_segs_goal() from the skb departing at EDT. If decreasing inflight,
++  * then estimate if inflight will sink too low just before the EDT transmit.
++  */
++ static u32 bbr_packets_in_net_at_edt(struct sock *sk, u32 inflight_now)
++ {
++ 	struct tcp_sock *tp = tcp_sk(sk);
++ 	struct bbr *bbr = inet_csk_ca(sk);
++ 	u64 now_ns, edt_ns, interval_us;
++ 	u32 interval_delivered, inflight_at_edt;
++ 
++ 	now_ns = tp->tcp_clock_cache;
++ 	edt_ns = max(tp->tcp_wstamp_ns, now_ns);
++ 	interval_us = div_u64(edt_ns - now_ns, NSEC_PER_USEC);
++ 	interval_delivered = (u64)bbr_bw(sk) * interval_us >> BW_SCALE;
++ 	inflight_at_edt = inflight_now;
++ 	if (bbr->pacing_gain > BBR_UNIT)              /* increasing inflight */
++ 		inflight_at_edt += bbr_tso_segs_goal(sk);  /* include EDT skb */
++ 	if (interval_delivered >= inflight_at_edt)
++ 		return 0;
++ 	return inflight_at_edt - interval_delivered;
++ }
++ 
+++>>>>>>> 232aa8ec3ed9 (tcp_bbr: refactor bbr_target_cwnd() for general inflight provisioning)
+  /* An optimization in BBR to reduce losses: On the first round of recovery, we
+   * follow the packet conservation principle: send P packets per P packets acked.
+   * After that, we slow-start and send at most 2*P packets per P packets acked.
+@@@ -725,11 -780,11 +779,16 @@@ static void bbr_check_drain(struct soc
+  	if (bbr->mode == BBR_STARTUP && bbr_full_bw_reached(sk)) {
+  		bbr->mode = BBR_DRAIN;	/* drain queue we created */
+  		tcp_sk(sk)->snd_ssthresh =
+- 				bbr_target_cwnd(sk, bbr_max_bw(sk), BBR_UNIT);
++ 				bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT);
+  	}	/* fall through to check if in-flight is already small: */
+  	if (bbr->mode == BBR_DRAIN &&
+++<<<<<<< HEAD
+ +	    tcp_packets_in_flight(tcp_sk(sk)) <=
+ +	    bbr_target_cwnd(sk, bbr_max_bw(sk), BBR_UNIT))
+++=======
++ 	    bbr_packets_in_net_at_edt(sk, tcp_packets_in_flight(tcp_sk(sk))) <=
++ 	    bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT))
+++>>>>>>> 232aa8ec3ed9 (tcp_bbr: refactor bbr_target_cwnd() for general inflight provisioning)
+  		bbr_reset_probe_bw_mode(sk);  /* we estimate queue is drained */
+  }
+  
+* Unmerged path net/ipv4/tcp_bbr.c
