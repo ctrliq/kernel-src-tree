@@ -1,0 +1,235 @@
+IB/mlx5: Support adding flow steering rule by raw description
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit d4be3f4466b8a770ea2c3b57b942efd057fe1c19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d4be3f44.failed
+
+Add support to set a public flow steering rule when its destination is a
+TIR by using raw specification data.
+
+The logic follows the verbs API but instead of using ib_spec(s) the raw,
+device specific, description is used.
+
+This allows supporting specialty matchers without having to define new
+matches in the verbs struct based language.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit d4be3f4466b8a770ea2c3b57b942efd057fe1c19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 6d899fc16add,68d2801b79c6..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3640,6 -3651,187 +3651,189 @@@ free_ucmd
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mlx5_ib_flow_prio *_get_flow_table(struct mlx5_ib_dev *dev,
++ 						 int priority, bool mcast)
++ {
++ 	int max_table_size;
++ 	struct mlx5_flow_namespace *ns = NULL;
++ 	struct mlx5_ib_flow_prio *prio;
++ 
++ 	max_table_size = BIT(MLX5_CAP_FLOWTABLE_NIC_RX(dev->mdev,
++ 			     log_max_ft_size));
++ 	if (max_table_size < MLX5_FS_MAX_ENTRIES)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (mcast)
++ 		priority = MLX5_IB_FLOW_MCAST_PRIO;
++ 	else
++ 		priority = ib_prio_to_core_prio(priority, false);
++ 
++ 	ns = mlx5_get_flow_namespace(dev->mdev, MLX5_FLOW_NAMESPACE_BYPASS);
++ 	if (!ns)
++ 		return ERR_PTR(-ENOTSUPP);
++ 
++ 	prio = &dev->flow_db->prios[priority];
++ 
++ 	if (prio->flow_table)
++ 		return prio;
++ 
++ 	return _get_prio(ns, prio, priority, MLX5_FS_MAX_ENTRIES,
++ 			 MLX5_FS_MAX_TYPES);
++ }
++ 
++ static struct mlx5_ib_flow_handler *
++ _create_raw_flow_rule(struct mlx5_ib_dev *dev,
++ 		      struct mlx5_ib_flow_prio *ft_prio,
++ 		      struct mlx5_flow_destination *dst,
++ 		      struct mlx5_ib_flow_matcher  *fs_matcher,
++ 		      void *cmd_in, int inlen)
++ {
++ 	struct mlx5_ib_flow_handler *handler;
++ 	struct mlx5_flow_act flow_act = {.flow_tag = MLX5_FS_DEFAULT_FLOW_TAG};
++ 	struct mlx5_flow_spec *spec;
++ 	struct mlx5_flow_table *ft = ft_prio->flow_table;
++ 	int err = 0;
++ 
++ 	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++ 	handler = kzalloc(sizeof(*handler), GFP_KERNEL);
++ 	if (!handler || !spec) {
++ 		err = -ENOMEM;
++ 		goto free;
++ 	}
++ 
++ 	INIT_LIST_HEAD(&handler->list);
++ 
++ 	memcpy(spec->match_value, cmd_in, inlen);
++ 	memcpy(spec->match_criteria, fs_matcher->matcher_mask.match_params,
++ 	       fs_matcher->mask_len);
++ 	spec->match_criteria_enable = fs_matcher->match_criteria_enable;
++ 
++ 	flow_act.action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 	handler->rule = mlx5_add_flow_rules(ft, spec,
++ 					    &flow_act, dst, 1);
++ 
++ 	if (IS_ERR(handler->rule)) {
++ 		err = PTR_ERR(handler->rule);
++ 		goto free;
++ 	}
++ 
++ 	ft_prio->refcount++;
++ 	handler->prio = ft_prio;
++ 	handler->dev = dev;
++ 	ft_prio->flow_table = ft;
++ 
++ free:
++ 	if (err)
++ 		kfree(handler);
++ 	kvfree(spec);
++ 	return err ? ERR_PTR(err) : handler;
++ }
++ 
++ static bool raw_fs_is_multicast(struct mlx5_ib_flow_matcher *fs_matcher,
++ 				void *match_v)
++ {
++ 	void *match_c;
++ 	void *match_v_set_lyr_2_4, *match_c_set_lyr_2_4;
++ 	void *dmac, *dmac_mask;
++ 	void *ipv4, *ipv4_mask;
++ 
++ 	if (!(fs_matcher->match_criteria_enable &
++ 	      (1 << MATCH_CRITERIA_ENABLE_OUTER_BIT)))
++ 		return false;
++ 
++ 	match_c = fs_matcher->matcher_mask.match_params;
++ 	match_v_set_lyr_2_4 = MLX5_ADDR_OF(fte_match_param, match_v,
++ 					   outer_headers);
++ 	match_c_set_lyr_2_4 = MLX5_ADDR_OF(fte_match_param, match_c,
++ 					   outer_headers);
++ 
++ 	dmac = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_v_set_lyr_2_4,
++ 			    dmac_47_16);
++ 	dmac_mask = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_c_set_lyr_2_4,
++ 				 dmac_47_16);
++ 
++ 	if (is_multicast_ether_addr(dmac) &&
++ 	    is_multicast_ether_addr(dmac_mask))
++ 		return true;
++ 
++ 	ipv4 = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_v_set_lyr_2_4,
++ 			    dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++ 
++ 	ipv4_mask = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_c_set_lyr_2_4,
++ 				 dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++ 
++ 	if (ipv4_is_multicast(*(__be32 *)(ipv4)) &&
++ 	    ipv4_is_multicast(*(__be32 *)(ipv4_mask)))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ struct mlx5_ib_flow_handler *
++ mlx5_ib_raw_fs_rule_add(struct mlx5_ib_dev *dev,
++ 			struct mlx5_ib_flow_matcher *fs_matcher,
++ 			void *cmd_in, int inlen, int dest_id,
++ 			int dest_type)
++ {
++ 	struct mlx5_flow_destination *dst;
++ 	struct mlx5_ib_flow_prio *ft_prio;
++ 	int priority = fs_matcher->priority;
++ 	struct mlx5_ib_flow_handler *handler;
++ 	bool mcast;
++ 	int err;
++ 
++ 	if (fs_matcher->flow_type != MLX5_IB_FLOW_TYPE_NORMAL)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (fs_matcher->priority > MLX5_IB_FLOW_LAST_PRIO)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (dest_type != MLX5_FLOW_DESTINATION_TYPE_TIR)
++ 		return ERR_PTR(-ENOTSUPP);
++ 
++ 	dst = kzalloc(sizeof(*dst), GFP_KERNEL);
++ 	if (!dst)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	mcast = raw_fs_is_multicast(fs_matcher, cmd_in);
++ 	mutex_lock(&dev->flow_db->lock);
++ 
++ 	ft_prio = _get_flow_table(dev, priority, mcast);
++ 	if (IS_ERR(ft_prio)) {
++ 		err = PTR_ERR(ft_prio);
++ 		goto unlock;
++ 	}
++ 
++ 	dst->type = dest_type;
++ 	dst->tir_num = dest_id;
++ 	handler = _create_raw_flow_rule(dev, ft_prio, dst, fs_matcher, cmd_in,
++ 					inlen);
++ 
++ 	if (IS_ERR(handler)) {
++ 		err = PTR_ERR(handler);
++ 		goto destroy_ft;
++ 	}
++ 
++ 	mutex_unlock(&dev->flow_db->lock);
++ 	atomic_inc(&fs_matcher->usecnt);
++ 	handler->flow_matcher = fs_matcher;
++ 
++ 	kfree(dst);
++ 
++ 	return handler;
++ 
++ destroy_ft:
++ 	put_flow_table(dev, ft_prio, false);
++ unlock:
++ 	mutex_unlock(&dev->flow_db->lock);
++ 	kfree(dst);
++ 
++ 	return ERR_PTR(err);
++ }
++ 
+++>>>>>>> d4be3f4466b8 (IB/mlx5: Support adding flow steering rule by raw description)
+  static u32 mlx5_ib_flow_action_flags_to_accel_xfrm_flags(u32 mlx5_flags)
+  {
+  	u32 flags = 0;
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index dc133aa987e9..167cdb491a38 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -171,6 +171,8 @@ struct mlx5_ib_flow_handler {
+ 	struct mlx5_ib_flow_prio	*prio;
+ 	struct mlx5_flow_handle		*rule;
+ 	struct ib_counters		*ibcounters;
++	struct mlx5_ib_dev		*dev;
++	struct mlx5_ib_flow_matcher	*flow_matcher;
+ };
+ 
+ struct mlx5_ib_flow_db {
