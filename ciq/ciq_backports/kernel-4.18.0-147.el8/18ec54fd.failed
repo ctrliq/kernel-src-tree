@@ -1,0 +1,198 @@
+x86/speculation: Prepare entry code for Spectre v1 swapgs mitigations
+
+jira LE-1907
+cve CVE-2019-1125
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit 18ec54fdd6d18d92025af097cd042a75cf0ea24c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/18ec54fd.failed
+
+
+Spectre v1 isn't only about array bounds checks.  It can affect any
+conditional checks.  The kernel entry code interrupt, exception, and NMI
+handlers all have conditional swapgs checks.  Those may be problematic in
+the context of Spectre v1, as kernel code can speculatively run with a user
+GS.
+
+For example:
+
+	if (coming from user space)
+		swapgs
+	mov %gs:<percpu_offset>, %reg
+	mov (%reg), %reg1
+
+When coming from user space, the CPU can speculatively skip the swapgs, and
+then do a speculative percpu load using the user GS value.  So the user can
+speculatively force a read of any kernel value.  If a gadget exists which
+uses the percpu value as an address in another load/store, then the
+contents of the kernel value may become visible via an L1 side channel
+attack.
+
+A similar attack exists when coming from kernel space.  The CPU can
+speculatively do the swapgs, causing the user GS to get used for the rest
+of the speculative window.
+
+The mitigation is similar to a traditional Spectre v1 mitigation, except:
+
+  a) index masking isn't possible; because the index (percpu offset)
+     isn't user-controlled; and
+
+  b) an lfence is needed in both the "from user" swapgs path and the
+     "from kernel" non-swapgs path (because of the two attacks described
+     above).
+
+The user entry swapgs paths already have SWITCH_TO_KERNEL_CR3, which has a
+CR3 write when PTI is enabled.  Since CR3 writes are serializing, the
+lfences can be skipped in those cases.
+
+On the other hand, the kernel entry swapgs paths don't depend on PTI.
+
+To avoid unnecessary lfences for the user entry case, create two separate
+features for alternative patching:
+
+  X86_FEATURE_FENCE_SWAPGS_USER
+  X86_FEATURE_FENCE_SWAPGS_KERNEL
+
+Use these features in entry code to patch in lfences where needed.
+
+The features aren't enabled yet, so there's no functional change.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+
+(cherry picked from commit 18ec54fdd6d18d92025af097cd042a75cf0ea24c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/calling.h
+#	arch/x86/entry/entry_64.S
+diff --cc arch/x86/entry/calling.h
+index 352e70cd33e8,7ce7ac9d9d3f..000000000000
+--- a/arch/x86/entry/calling.h
++++ b/arch/x86/entry/calling.h
+@@@ -329,8 -314,39 +329,36 @@@ For 32-bit we have the following conven
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Mitigate Spectre v1 for conditional swapgs code paths.
++  *
++  * FENCE_SWAPGS_USER_ENTRY is used in the user entry swapgs code path, to
++  * prevent a speculative swapgs when coming from kernel space.
++  *
++  * FENCE_SWAPGS_KERNEL_ENTRY is used in the kernel entry non-swapgs code path,
++  * to prevent the swapgs from getting speculatively skipped when coming from
++  * user space.
++  */
++ .macro FENCE_SWAPGS_USER_ENTRY
++ 	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_USER
++ .endm
++ .macro FENCE_SWAPGS_KERNEL_ENTRY
++ 	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_KERNEL
++ .endm
++ 
++ .macro STACKLEAK_ERASE_NOCLOBBER
++ #ifdef CONFIG_GCC_PLUGIN_STACKLEAK
++ 	PUSH_AND_CLEAR_REGS
++ 	call stackleak_erase
++ 	POP_REGS
++ #endif
++ .endm
++ 
+++>>>>>>> 18ec54fdd6d1 (x86/speculation: Prepare entry code for Spectre v1 swapgs mitigations)
+  #endif /* CONFIG_X86_64 */
+  
+ -.macro STACKLEAK_ERASE
+ -#ifdef CONFIG_GCC_PLUGIN_STACKLEAK
+ -	call stackleak_erase
+ -#endif
+ -.endm
+ -
+  /*
+   * This does 'call enter_from_user_mode' unless we can avoid it based on
+   * kernel config or using the static jump infrastructure.
+diff --cc arch/x86/entry/entry_64.S
+index 3f0b37b3dbfd,57a0d96d6beb..000000000000
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@@ -1167,8 -1211,25 +1169,19 @@@ ENTRY(paranoid_entry
+  	xorl	%ebx, %ebx
+  
+  1:
+ -	/*
+ -	 * Always stash CR3 in %r14.  This value will be restored,
+ -	 * verbatim, at exit.  Needed if paranoid_entry interrupted
+ -	 * another entry that already switched to the user CR3 value
+ -	 * but has not yet returned to userspace.
+ -	 *
+ -	 * This is also why CS (stashed in the "iret frame" by the
+ -	 * hardware at entry) can not be used: this may be a return
+ -	 * to kernel code, but with a user CR3 value.
+ -	 */
+  	SAVE_AND_SWITCH_TO_KERNEL_CR3 scratch_reg=%rax save_reg=%r14
+++<<<<<<< HEAD
+ +	IBRS_ENTRY_SAVE_AND_CLOBBER  save_reg=%r13d
+++=======
++ 
++ 	/*
++ 	 * The above SAVE_AND_SWITCH_TO_KERNEL_CR3 macro doesn't do an
++ 	 * unconditional CR3 write, even in the PTI case.  So do an lfence
++ 	 * to prevent GS speculation, regardless of whether PTI is enabled.
++ 	 */
++ 	FENCE_SWAPGS_KERNEL_ENTRY
++ 
+++>>>>>>> 18ec54fdd6d1 (x86/speculation: Prepare entry code for Spectre v1 swapgs mitigations)
+  	ret
+  END(paranoid_entry)
+  
+@@@ -1218,9 -1280,9 +1231,10 @@@ ENTRY(error_entry
+  	 * from user mode due to an IRET fault.
+  	 */
+  	SWAPGS
++ 	FENCE_SWAPGS_USER_ENTRY
+  	/* We have user CR3.  Change to kernel CR3. */
+  	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+ +	IBRS_ENTRY_CLOBBER
+  
+  .Lerror_entry_from_usermode_after_swapgs:
+  	/* Put us onto the real thread stack. */
+@@@ -1266,8 -1330,8 +1282,9 @@@
+  	 * .Lgs_change's error handler with kernel gsbase.
+  	 */
+  	SWAPGS
++ 	FENCE_SWAPGS_USER_ENTRY
+  	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+ +	IBRS_ENTRY
+  	jmp .Lerror_entry_done
+  
+  .Lbstep_iret:
+@@@ -1281,8 -1345,8 +1298,9 @@@
+  	 * gsbase and CR3.  Switch to kernel gsbase and CR3:
+  	 */
+  	SWAPGS
++ 	FENCE_SWAPGS_USER_ENTRY
+  	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+ +	IBRS_ENTRY
+  
+  	/*
+  	 * Pretend that the exception came from user mode: set up pt_regs
+* Unmerged path arch/x86/entry/calling.h
+* Unmerged path arch/x86/entry/entry_64.S
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index 4f3178083106..9e3efa49d3aa 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -279,6 +279,8 @@
+ #define X86_FEATURE_CQM_OCCUP_LLC	(11*32+ 1) /* LLC occupancy monitoring */
+ #define X86_FEATURE_CQM_MBM_TOTAL	(11*32+ 2) /* LLC Total MBM monitoring */
+ #define X86_FEATURE_CQM_MBM_LOCAL	(11*32+ 3) /* LLC Local MBM monitoring */
++#define X86_FEATURE_FENCE_SWAPGS_USER	(11*32+ 4) /* "" LFENCE in user entry SWAPGS path */
++#define X86_FEATURE_FENCE_SWAPGS_KERNEL	(11*32+ 5) /* "" LFENCE in kernel entry SWAPGS path */
+ 
+ /* AMD-defined CPU features, CPUID level 0x80000008 (EBX), word 13 */
+ #define X86_FEATURE_CLZERO		(13*32+ 0) /* CLZERO instruction */
