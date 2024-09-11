@@ -212,8 +212,8 @@ static int tcf_xt_init(struct net *net, struct nlattr *nla,
 			      bind);
 }
 
-static int tcf_ipt(struct sk_buff *skb, const struct tc_action *a,
-		   struct tcf_result *res)
+static int tcf_ipt_act(struct sk_buff *skb, const struct tc_action *a,
+		       struct tcf_result *res)
 {
 	int ret = 0, result = 0;
 	struct tcf_ipt *ipt = to_ipt(a);
@@ -338,7 +338,7 @@ static struct tc_action_ops act_ipt_ops = {
 	.kind		=	"ipt",
 	.type		=	TCA_ACT_IPT,
 	.owner		=	THIS_MODULE,
-	.act		=	tcf_ipt,
+	.act		=	tcf_ipt_act,
 	.dump		=	tcf_ipt_dump,
 	.cleanup	=	tcf_ipt_release,
 	.init		=	tcf_ipt_init,
@@ -396,7 +396,7 @@ static struct tc_action_ops act_xt_ops = {
 	.kind		=	"xt",
 	.type		=	TCA_ACT_XT,
 	.owner		=	THIS_MODULE,
-	.act		=	tcf_ipt,
+	.act		=	tcf_ipt_act,
 	.dump		=	tcf_ipt_dump,
 	.cleanup	=	tcf_ipt_release,
 	.init		=	tcf_xt_init,
