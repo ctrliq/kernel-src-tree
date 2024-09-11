@@ -1,0 +1,320 @@
+block: move queues types to the block layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit e20ba6e1da029136ded295f33076483d65ddf50a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/e20ba6e1.failed
+
+Having another indirect all in the fast path doesn't really help
+in our post-spectre world.  Also having too many queue type is just
+going to create confusion, so I'd rather manage them centrally.
+
+Note that the queue type naming and ordering changes a bit - the
+first index now is the default queue for everything not explicitly
+marked, the optional ones are read and poll queues.
+
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e20ba6e1da029136ded295f33076483d65ddf50a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.h
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.h
+index 7a8828f8b01e,a664ea44ffd4..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -78,19 -78,40 +78,55 @@@ void blk_mq_try_issue_list_directly(str
+   */
+  extern int blk_mq_hw_queue_to_node(struct blk_mq_queue_map *qmap, unsigned int);
+  
+++<<<<<<< HEAD
+ +static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
+ +						     unsigned int cpu)
+ +{
+ +	struct blk_mq_tag_set *set = q->tag_set;
+ +
+ +	return q->queue_hw_ctx[set->map[0].mq_map[cpu]];
+ +}
+ +
+++=======
++ /*
++  * blk_mq_map_queue_type() - map (hctx_type,cpu) to hardware queue
++  * @q: request queue
++  * @type: the hctx type index
++  * @cpu: CPU
++  */
+++>>>>>>> e20ba6e1da02 (block: move queues types to the block layer)
+  static inline struct blk_mq_hw_ctx *blk_mq_map_queue_type(struct request_queue *q,
+- 							  unsigned int hctx_type,
++ 							  enum hctx_type type,
+  							  unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	return blk_mq_map_queue(q, cpu);
+++=======
++ 	return q->queue_hw_ctx[q->tag_set->map[type].mq_map[cpu]];
++ }
++ 
++ /*
++  * blk_mq_map_queue() - map (cmd_flags,type) to hardware queue
++  * @q: request queue
++  * @flags: request command flags
++  * @cpu: CPU
++  */
++ static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
++ 						     unsigned int flags,
++ 						     unsigned int cpu)
++ {
++ 	enum hctx_type type = HCTX_TYPE_DEFAULT;
++ 
++ 	if (q->tag_set->nr_maps > HCTX_TYPE_POLL &&
++ 	    ((flags & REQ_HIPRI) && test_bit(QUEUE_FLAG_POLL, &q->queue_flags)))
++ 		type = HCTX_TYPE_POLL;
++ 
++ 	else if (q->tag_set->nr_maps > HCTX_TYPE_READ &&
++ 		 ((flags & REQ_OP_MASK) == REQ_OP_READ))
++ 		type = HCTX_TYPE_READ;
++ 
++ 	return blk_mq_map_queue_type(q, type, cpu);
+++>>>>>>> e20ba6e1da02 (block: move queues types to the block layer)
+  }
+  
+  /*
+diff --cc include/linux/blk-mq.h
+index f7a641aa7f19,57eda7b20243..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -109,6 -121,7 +113,10 @@@ struct blk_mq_queue_data 
+  
+  typedef blk_status_t (queue_rq_fn)(struct blk_mq_hw_ctx *,
+  		const struct blk_mq_queue_data *);
+++<<<<<<< HEAD
+++=======
++ typedef void (commit_rqs_fn)(struct blk_mq_hw_ctx *);
+++>>>>>>> e20ba6e1da02 (block: move queues types to the block layer)
+  typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
+  typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
+  typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+@@@ -134,6 -148,15 +142,18 @@@ struct blk_mq_ops 
+  	queue_rq_fn		*queue_rq;
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * If a driver uses bd->last to judge when to submit requests to
++ 	 * hardware, it must define this function. In case of errors that
++ 	 * make us stop issuing further requests, this hook serves the
++ 	 * purpose of kicking the hardware (which the last request otherwise
++ 	 * would have done).
++ 	 */
++ 	commit_rqs_fn		*commit_rqs;
++ 
++ 	/*
+++>>>>>>> e20ba6e1da02 (block: move queues types to the block layer)
+  	 * Reserve budget before queue request, once .queue_rq is
+  	 * run, it is driver's responsibility to release the
+  	 * reserved budget. Also we have to handle failure case
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index 6efef1f679f0..9c2df137256a 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -173,9 +173,16 @@ static ssize_t blk_mq_hw_sysfs_cpus_show(struct blk_mq_hw_ctx *hctx, char *page)
+ 	return ret;
+ }
+ 
++static const char *const hctx_types[] = {
++	[HCTX_TYPE_DEFAULT]	= "default",
++	[HCTX_TYPE_READ]	= "read",
++	[HCTX_TYPE_POLL]	= "poll",
++};
++
+ static ssize_t blk_mq_hw_sysfs_type_show(struct blk_mq_hw_ctx *hctx, char *page)
+ {
+-	return sprintf(page, "%u\n", hctx->type);
++	BUILD_BUG_ON(ARRAY_SIZE(hctx_types) != HCTX_MAX_TYPES);
++	return sprintf(page, "%s\n", hctx_types[hctx->type]);
+ }
+ 
+ static struct attribute *default_ctx_attrs[] = {
+* Unmerged path block/blk-mq.h
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 591b8babfd74..53111d7bfb48 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -95,13 +95,6 @@ struct nvme_queue;
+ 
+ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
+ 
+-enum {
+-	NVMEQ_TYPE_READ,
+-	NVMEQ_TYPE_WRITE,
+-	NVMEQ_TYPE_POLL,
+-	NVMEQ_TYPE_NR,
+-};
+-
+ /*
+  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
+  */
+@@ -115,7 +108,7 @@ struct nvme_dev {
+ 	struct dma_pool *prp_small_pool;
+ 	unsigned online_queues;
+ 	unsigned max_qid;
+-	unsigned io_queues[NVMEQ_TYPE_NR];
++	unsigned io_queues[HCTX_MAX_TYPES];
+ 	unsigned int num_vecs;
+ 	int q_depth;
+ 	u32 db_stride;
+@@ -489,10 +482,10 @@ static int nvme_pci_map_queues(struct blk_mq_tag_set *set)
+ 
+ 		map->nr_queues = dev->io_queues[i];
+ 		if (!map->nr_queues) {
+-			BUG_ON(i == NVMEQ_TYPE_READ);
++			BUG_ON(i == HCTX_TYPE_DEFAULT);
+ 
+ 			/* shared set, resuse read set parameters */
+-			map->nr_queues = dev->io_queues[NVMEQ_TYPE_READ];
++			map->nr_queues = dev->io_queues[HCTX_TYPE_DEFAULT];
+ 			qoff = 0;
+ 			offset = queue_irq_offset(dev);
+ 		}
+@@ -502,7 +495,7 @@ static int nvme_pci_map_queues(struct blk_mq_tag_set *set)
+ 		 * affinity), so use the regular blk-mq cpu mapping
+ 		 */
+ 		map->queue_offset = qoff;
+-		if (i != NVMEQ_TYPE_POLL)
++		if (i != HCTX_TYPE_POLL)
+ 			blk_mq_pci_map_queues(map, to_pci_dev(dev->dev), offset);
+ 		else
+ 			blk_mq_map_queues(map);
+@@ -951,16 +944,6 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	return ret;
+ }
+ 
+-static int nvme_rq_flags_to_type(struct request_queue *q, unsigned int flags)
+-{
+-	if ((flags & REQ_HIPRI) && test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+-		return NVMEQ_TYPE_POLL;
+-	if ((flags & REQ_OP_MASK) == REQ_OP_READ)
+-		return NVMEQ_TYPE_READ;
+-
+-	return NVMEQ_TYPE_WRITE;
+-}
+-
+ static void nvme_pci_complete_rq(struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+@@ -1624,7 +1607,6 @@ static const struct blk_mq_ops nvme_mq_admin_ops = {
+ #define NVME_SHARED_MQ_OPS					\
+ 	.queue_rq		= nvme_queue_rq,		\
+ 	.commit_rqs		= nvme_commit_rqs,		\
+-	.rq_flags_to_type	= nvme_rq_flags_to_type,	\
+ 	.complete		= nvme_pci_complete_rq,		\
+ 	.init_hctx		= nvme_init_hctx,		\
+ 	.init_request		= nvme_init_request,		\
+@@ -1775,9 +1757,9 @@ static int nvme_create_io_queues(struct nvme_dev *dev)
+ 	}
+ 
+ 	max = min(dev->max_qid, dev->ctrl.queue_count - 1);
+-	if (max != 1 && dev->io_queues[NVMEQ_TYPE_POLL]) {
+-		rw_queues = dev->io_queues[NVMEQ_TYPE_READ] +
+-				dev->io_queues[NVMEQ_TYPE_WRITE];
++	if (max != 1 && dev->io_queues[HCTX_TYPE_POLL]) {
++		rw_queues = dev->io_queues[HCTX_TYPE_DEFAULT] +
++				dev->io_queues[HCTX_TYPE_READ];
+ 	} else {
+ 		rw_queues = max;
+ 	}
+@@ -2066,9 +2048,9 @@ static void nvme_calc_io_queues(struct nvme_dev *dev, unsigned int nr_io_queues)
+ 	 * Setup read/write queue split
+ 	 */
+ 	if (nr_io_queues == 1) {
+-		dev->io_queues[NVMEQ_TYPE_READ] = 1;
+-		dev->io_queues[NVMEQ_TYPE_WRITE] = 0;
+-		dev->io_queues[NVMEQ_TYPE_POLL] = 0;
++		dev->io_queues[HCTX_TYPE_DEFAULT] = 1;
++		dev->io_queues[HCTX_TYPE_READ] = 0;
++		dev->io_queues[HCTX_TYPE_POLL] = 0;
+ 		return;
+ 	}
+ 
+@@ -2085,10 +2067,10 @@ static void nvme_calc_io_queues(struct nvme_dev *dev, unsigned int nr_io_queues)
+ 			this_p_queues = nr_io_queues - 1;
+ 		}
+ 
+-		dev->io_queues[NVMEQ_TYPE_POLL] = this_p_queues;
++		dev->io_queues[HCTX_TYPE_POLL] = this_p_queues;
+ 		nr_io_queues -= this_p_queues;
+ 	} else
+-		dev->io_queues[NVMEQ_TYPE_POLL] = 0;
++		dev->io_queues[HCTX_TYPE_POLL] = 0;
+ 
+ 	/*
+ 	 * If 'write_queues' is set, ensure it leaves room for at least
+@@ -2102,11 +2084,11 @@ static void nvme_calc_io_queues(struct nvme_dev *dev, unsigned int nr_io_queues)
+ 	 * a queue set.
+ 	 */
+ 	if (!this_w_queues) {
+-		dev->io_queues[NVMEQ_TYPE_WRITE] = 0;
+-		dev->io_queues[NVMEQ_TYPE_READ] = nr_io_queues;
++		dev->io_queues[HCTX_TYPE_DEFAULT] = nr_io_queues;
++		dev->io_queues[HCTX_TYPE_READ] = 0;
+ 	} else {
+-		dev->io_queues[NVMEQ_TYPE_WRITE] = this_w_queues;
+-		dev->io_queues[NVMEQ_TYPE_READ] = nr_io_queues - this_w_queues;
++		dev->io_queues[HCTX_TYPE_DEFAULT] = this_w_queues;
++		dev->io_queues[HCTX_TYPE_READ] = nr_io_queues - this_w_queues;
+ 	}
+ }
+ 
+@@ -2128,8 +2110,8 @@ static int nvme_setup_irqs(struct nvme_dev *dev, int nr_io_queues)
+ 	 */
+ 	do {
+ 		nvme_calc_io_queues(dev, nr_io_queues);
+-		irq_sets[0] = dev->io_queues[NVMEQ_TYPE_READ];
+-		irq_sets[1] = dev->io_queues[NVMEQ_TYPE_WRITE];
++		irq_sets[0] = dev->io_queues[HCTX_TYPE_DEFAULT];
++		irq_sets[1] = dev->io_queues[HCTX_TYPE_READ];
+ 		if (!irq_sets[1])
+ 			affd.nr_sets = 1;
+ 
+@@ -2216,12 +2198,12 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
+ 
+ 	dev->num_vecs = result;
+ 	result = max(result - 1, 1);
+-	dev->max_qid = result + dev->io_queues[NVMEQ_TYPE_POLL];
++	dev->max_qid = result + dev->io_queues[HCTX_TYPE_POLL];
+ 
+-	dev_info(dev->ctrl.device, "%d/%d/%d read/write/poll queues\n",
+-					dev->io_queues[NVMEQ_TYPE_READ],
+-					dev->io_queues[NVMEQ_TYPE_WRITE],
+-					dev->io_queues[NVMEQ_TYPE_POLL]);
++	dev_info(dev->ctrl.device, "%d/%d/%d default/read/poll queues\n",
++					dev->io_queues[HCTX_TYPE_DEFAULT],
++					dev->io_queues[HCTX_TYPE_READ],
++					dev->io_queues[HCTX_TYPE_POLL]);
+ 
+ 	/*
+ 	 * Should investigate if there's a performance win from allocating
+@@ -2322,13 +2304,13 @@ static int nvme_dev_add(struct nvme_dev *dev)
+ 	int ret;
+ 
+ 	if (!dev->ctrl.tagset) {
+-		if (!dev->io_queues[NVMEQ_TYPE_POLL])
++		if (!dev->io_queues[HCTX_TYPE_POLL])
+ 			dev->tagset.ops = &nvme_mq_ops;
+ 		else
+ 			dev->tagset.ops = &nvme_mq_poll_noirq_ops;
+ 
+ 		dev->tagset.nr_hw_queues = dev->online_queues - 1;
+-		dev->tagset.nr_maps = NVMEQ_TYPE_NR;
++		dev->tagset.nr_maps = HCTX_MAX_TYPES;
+ 		dev->tagset.timeout = NVME_IO_TIMEOUT;
+ 		dev->tagset.numa_node = dev_to_node(dev->dev);
+ 		dev->tagset.queue_depth =
+* Unmerged path include/linux/blk-mq.h
