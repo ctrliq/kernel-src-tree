@@ -1,0 +1,138 @@
+s390: move vmalloc option parsing to startup code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Vasily Gorbik <gor@linux.ibm.com>
+commit 59793c5ab93fed9661deaf6d8ba054af681c0a6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/59793c5a.failed
+
+Few other crucial memory setup options are already handled in
+the startup code. Those values are needed by kaslr and kasan
+implementations. "vmalloc" is the last piece required for future
+improvements such as early decision on kernel page levels depth required
+for actual memory setup, as well as vmalloc memory area access monitoring
+in kasan.
+
+	Reviewed-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 59793c5ab93fed9661deaf6d8ba054af681c0a6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/boot/ipl_parm.c
+diff --cc arch/s390/boot/ipl_parm.c
+index f7e202478969,449d26a42f3f..000000000000
+--- a/arch/s390/boot/ipl_parm.c
++++ b/arch/s390/boot/ipl_parm.c
+@@@ -5,14 -6,16 +5,20 @@@
+  #include <asm/sclp.h>
+  #include <asm/sections.h>
+  #include <asm/boot_data.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/facility.h>
++ #include <asm/pgtable.h>
+++>>>>>>> 59793c5ab93f (s390: move vmalloc option parsing to startup code)
+  #include <asm/uv.h>
+  #include "boot.h"
+  
+  char __bootdata(early_command_line)[COMMAND_LINE_SIZE];
+  struct ipl_parameter_block __bootdata_preserved(ipl_block);
+  int __bootdata_preserved(ipl_block_valid);
+ +unsigned int __bootdata_preserved(zlib_dfltcc_support) = ZLIB_DFLTCC_FULL;
+  
++ unsigned long __bootdata(vmalloc_size) = VMALLOC_DEFAULT_SIZE;
+  unsigned long __bootdata(memory_end);
+  int __bootdata(memory_end_set);
+  int __bootdata(noexec_disabled);
+@@@ -180,18 -228,8 +186,23 @@@ static void parse_mem_opt(void
+  			memory_end_set = 1;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (!strcmp(param, "dfltcc")) {
+ +			if (!strcmp(val, "off"))
+ +				zlib_dfltcc_support = ZLIB_DFLTCC_DISABLED;
+ +			else if (!strcmp(val, "on"))
+ +				zlib_dfltcc_support = ZLIB_DFLTCC_FULL;
+ +			else if (!strcmp(val, "def_only"))
+ +				zlib_dfltcc_support = ZLIB_DFLTCC_DEFLATE_ONLY;
+ +			else if (!strcmp(val, "inf_only"))
+ +				zlib_dfltcc_support = ZLIB_DFLTCC_INFLATE_ONLY;
+ +			else if (!strcmp(val, "always"))
+ +				zlib_dfltcc_support = ZLIB_DFLTCC_FULL_DEBUG;
+ +		}
+++=======
++ 		if (!strcmp(param, "vmalloc"))
++ 			vmalloc_size = round_up(memparse(val, NULL), PAGE_SIZE);
+++>>>>>>> 59793c5ab93f (s390: move vmalloc option parsing to startup code)
+  
+  		if (!strcmp(param, "noexec")) {
+  			rc = kstrtobool(val, &enabled);
+* Unmerged path arch/s390/boot/ipl_parm.c
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index 31d0929b742a..b2450b2bb995 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -87,6 +87,7 @@ extern unsigned long zero_page_mask;
+  */
+ extern unsigned long VMALLOC_START;
+ extern unsigned long VMALLOC_END;
++#define VMALLOC_DEFAULT_SIZE	((128UL << 30) - MODULES_LEN)
+ extern struct page *vmemmap;
+ 
+ #define VMEM_MAX_PHYS ((unsigned long) vmemmap)
+diff --git a/arch/s390/include/asm/setup.h b/arch/s390/include/asm/setup.h
+index d75f0e4ddcb6..267097ab1968 100644
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -87,6 +87,7 @@ extern unsigned int zlib_dfltcc_support;
+ extern int noexec_disabled;
+ extern int memory_end_set;
+ extern unsigned long memory_end;
++extern unsigned long vmalloc_size;
+ extern unsigned long max_physmem_end;
+ extern unsigned long __swsusp_reset_dma;
+ 
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 60b0a458c7d4..970053978d08 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -96,6 +96,7 @@ unsigned long int_hwcap = 0;
+ int __bootdata(noexec_disabled);
+ int __bootdata(memory_end_set);
+ unsigned long __bootdata(memory_end);
++unsigned long __bootdata(vmalloc_size);
+ unsigned long __bootdata(max_physmem_end);
+ struct mem_detect_info __bootdata(mem_detect);
+ 
+@@ -301,15 +302,6 @@ void machine_power_off(void)
+ void (*pm_power_off)(void) = machine_power_off;
+ EXPORT_SYMBOL_GPL(pm_power_off);
+ 
+-static int __init parse_vmalloc(char *arg)
+-{
+-	if (!arg)
+-		return -EINVAL;
+-	VMALLOC_END = (memparse(arg, &arg) + PAGE_SIZE - 1) & PAGE_MASK;
+-	return 0;
+-}
+-early_param("vmalloc", parse_vmalloc);
+-
+ void *restart_stack __section(.data);
+ 
+ static void __init setup_lowcore_dat_off(void)
+@@ -493,10 +485,9 @@ static void __init setup_resources(void)
+ 
+ static void __init setup_memory_end(void)
+ {
+-	unsigned long vmax, vmalloc_size, tmp;
++	unsigned long vmax, tmp;
+ 
+ 	/* Choose kernel address space layout: 3 or 4 levels. */
+-	vmalloc_size = VMALLOC_END ?: (128UL << 30) - MODULES_LEN;
+ 	if (IS_ENABLED(CONFIG_KASAN)) {
+ 		vmax = IS_ENABLED(CONFIG_KASAN_S390_4_LEVEL_PAGING)
+ 			   ? _REGION1_SIZE
