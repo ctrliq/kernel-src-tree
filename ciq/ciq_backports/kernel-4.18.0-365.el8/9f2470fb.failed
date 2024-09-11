@@ -1,0 +1,254 @@
+skmsg: Improve udp_bpf_recvmsg() accuracy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit 9f2470fbc4cb4583c080bb729a998933ba61aca4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/9f2470fb.failed
+
+I tried to reuse sk_msg_wait_data() for different protocols,
+but it turns out it can not be simply reused. For example,
+UDP actually uses two queues to receive skb:
+udp_sk(sk)->reader_queue and sk->sk_receive_queue. So we have
+to check both of them to know whether we have received any
+packet.
+
+Also, UDP does not lock the sock during BH Rx path, it makes
+no sense for its ->recvmsg() to lock the sock. It is always
+possible for ->recvmsg() to be called before packets actually
+arrive in the receive queue, we just use best effort to make
+it accurate here.
+
+Fixes: 1f5be6b3b063 ("udp: Implement udp_bpf_recvmsg() for sockmap")
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+Link: https://lore.kernel.org/bpf/20210615021342.7416-2-xiyou.wangcong@gmail.com
+(cherry picked from commit 9f2470fbc4cb4583c080bb729a998933ba61aca4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	net/core/skmsg.c
+#	net/ipv4/tcp_bpf.c
+diff --cc include/linux/skmsg.h
+index a85cacd89635,e3d080c299f6..000000000000
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@@ -127,6 -126,8 +127,11 @@@ int sk_msg_zerocopy_from_iter(struct so
+  			      struct sk_msg *msg, u32 bytes);
+  int sk_msg_memcopy_from_iter(struct sock *sk, struct iov_iter *from,
+  			     struct sk_msg *msg, u32 bytes);
+++<<<<<<< HEAD
+++=======
++ int sk_msg_recvmsg(struct sock *sk, struct sk_psock *psock, struct msghdr *msg,
++ 		   int len, int flags);
+++>>>>>>> 9f2470fbc4cb (skmsg: Improve udp_bpf_recvmsg() accuracy)
+  
+  static inline void sk_msg_check_to_free(struct sk_msg *msg, u32 i, u32 bytes)
+  {
+diff --cc net/core/skmsg.c
+index cfa6fc7cc1e0,f9a81b314e4c..000000000000
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@@ -399,6 -399,81 +399,84 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(sk_msg_memcopy_from_iter);
+  
+++<<<<<<< HEAD
+++=======
++ /* Receive sk_msg from psock->ingress_msg to @msg. */
++ int sk_msg_recvmsg(struct sock *sk, struct sk_psock *psock, struct msghdr *msg,
++ 		   int len, int flags)
++ {
++ 	struct iov_iter *iter = &msg->msg_iter;
++ 	int peek = flags & MSG_PEEK;
++ 	struct sk_msg *msg_rx;
++ 	int i, copied = 0;
++ 
++ 	msg_rx = sk_psock_peek_msg(psock);
++ 	while (copied != len) {
++ 		struct scatterlist *sge;
++ 
++ 		if (unlikely(!msg_rx))
++ 			break;
++ 
++ 		i = msg_rx->sg.start;
++ 		do {
++ 			struct page *page;
++ 			int copy;
++ 
++ 			sge = sk_msg_elem(msg_rx, i);
++ 			copy = sge->length;
++ 			page = sg_page(sge);
++ 			if (copied + copy > len)
++ 				copy = len - copied;
++ 			copy = copy_page_to_iter(page, sge->offset, copy, iter);
++ 			if (!copy)
++ 				return copied ? copied : -EFAULT;
++ 
++ 			copied += copy;
++ 			if (likely(!peek)) {
++ 				sge->offset += copy;
++ 				sge->length -= copy;
++ 				if (!msg_rx->skb)
++ 					sk_mem_uncharge(sk, copy);
++ 				msg_rx->sg.size -= copy;
++ 
++ 				if (!sge->length) {
++ 					sk_msg_iter_var_next(i);
++ 					if (!msg_rx->skb)
++ 						put_page(page);
++ 				}
++ 			} else {
++ 				/* Lets not optimize peek case if copy_page_to_iter
++ 				 * didn't copy the entire length lets just break.
++ 				 */
++ 				if (copy != sge->length)
++ 					return copied;
++ 				sk_msg_iter_var_next(i);
++ 			}
++ 
++ 			if (copied == len)
++ 				break;
++ 		} while (i != msg_rx->sg.end);
++ 
++ 		if (unlikely(peek)) {
++ 			msg_rx = sk_psock_next_msg(psock, msg_rx);
++ 			if (!msg_rx)
++ 				break;
++ 			continue;
++ 		}
++ 
++ 		msg_rx->sg.start = i;
++ 		if (!sge->length && msg_rx->sg.start == msg_rx->sg.end) {
++ 			msg_rx = sk_psock_dequeue_msg(psock);
++ 			kfree_sk_msg(msg_rx);
++ 		}
++ 		msg_rx = sk_psock_peek_msg(psock);
++ 	}
++ 
++ 	return copied;
++ }
++ EXPORT_SYMBOL_GPL(sk_msg_recvmsg);
++ 
+++>>>>>>> 9f2470fbc4cb (skmsg: Improve udp_bpf_recvmsg() accuracy)
+  static struct sk_msg *sk_psock_create_ingress_msg(struct sock *sk,
+  						  struct sk_buff *skb)
+  {
+diff --cc net/ipv4/tcp_bpf.c
+index bc7d2a586e18,bb49b52d7be8..000000000000
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@@ -243,8 -163,8 +243,13 @@@ static bool tcp_bpf_stream_read(const s
+  	return !empty;
+  }
+  
+++<<<<<<< HEAD
+ +static int tcp_bpf_wait_data(struct sock *sk, struct sk_psock *psock,
+ +			     int flags, long timeo, int *err)
+++=======
++ static int tcp_msg_wait_data(struct sock *sk, struct sk_psock *psock, int flags,
++ 			     long timeo, int *err)
+++>>>>>>> 9f2470fbc4cb (skmsg: Improve udp_bpf_recvmsg() accuracy)
+  {
+  	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+  	int ret = 0;
+@@@ -290,7 -210,7 +295,11 @@@ msg_bytes_ready
+  		long timeo;
+  
+  		timeo = sock_rcvtimeo(sk, nonblock);
+++<<<<<<< HEAD
+ +		data = tcp_bpf_wait_data(sk, psock, flags, timeo, &err);
+++=======
++ 		data = tcp_msg_wait_data(sk, psock, flags, timeo, &err);
+++>>>>>>> 9f2470fbc4cb (skmsg: Improve udp_bpf_recvmsg() accuracy)
+  		if (data) {
+  			if (!sk_psock_queue_empty(psock))
+  				goto msg_bytes_ready;
+* Unmerged path include/linux/skmsg.h
+* Unmerged path net/core/skmsg.c
+* Unmerged path net/ipv4/tcp_bpf.c
+diff --git a/net/ipv4/udp_bpf.c b/net/ipv4/udp_bpf.c
+index 51c5328e9dc1..0d9f6c454f40 100644
+--- a/net/ipv4/udp_bpf.c
++++ b/net/ipv4/udp_bpf.c
+@@ -21,6 +21,45 @@ static int sk_udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 	return udp_prot.recvmsg(sk, msg, len, noblock, flags, addr_len);
+ }
+ 
++static bool udp_sk_has_data(struct sock *sk)
++{
++	return !skb_queue_empty(&udp_sk(sk)->reader_queue) ||
++	       !skb_queue_empty(&sk->sk_receive_queue);
++}
++
++static bool psock_has_data(struct sk_psock *psock)
++{
++	return !skb_queue_empty(&psock->ingress_skb) ||
++	       !sk_psock_queue_empty(psock);
++}
++
++#define udp_msg_has_data(__sk, __psock)	\
++		({ udp_sk_has_data(__sk) || psock_has_data(__psock); })
++
++static int udp_msg_wait_data(struct sock *sk, struct sk_psock *psock, int flags,
++			     long timeo, int *err)
++{
++	DEFINE_WAIT_FUNC(wait, woken_wake_function);
++	int ret = 0;
++
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
++		return 1;
++
++	if (!timeo)
++		return ret;
++
++	add_wait_queue(sk_sleep(sk), &wait);
++	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	ret = udp_msg_has_data(sk, psock);
++	if (!ret) {
++		wait_woken(&wait, TASK_INTERRUPTIBLE, timeo);
++		ret = udp_msg_has_data(sk, psock);
++	}
++	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	remove_wait_queue(sk_sleep(sk), &wait);
++	return ret;
++}
++
+ static int udp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 			   int nonblock, int flags, int *addr_len)
+ {
+@@ -34,8 +73,7 @@ static int udp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 	if (unlikely(!psock))
+ 		return sk_udp_recvmsg(sk, msg, len, nonblock, flags, addr_len);
+ 
+-	lock_sock(sk);
+-	if (sk_psock_queue_empty(psock)) {
++	if (!psock_has_data(psock)) {
+ 		ret = sk_udp_recvmsg(sk, msg, len, nonblock, flags, addr_len);
+ 		goto out;
+ 	}
+@@ -47,9 +85,9 @@ static int udp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		long timeo;
+ 
+ 		timeo = sock_rcvtimeo(sk, nonblock);
+-		data = sk_msg_wait_data(sk, psock, flags, timeo, &err);
++		data = udp_msg_wait_data(sk, psock, flags, timeo, &err);
+ 		if (data) {
+-			if (!sk_psock_queue_empty(psock))
++			if (psock_has_data(psock))
+ 				goto msg_bytes_ready;
+ 			ret = sk_udp_recvmsg(sk, msg, len, nonblock, flags, addr_len);
+ 			goto out;
+@@ -62,7 +100,6 @@ static int udp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 	}
+ 	ret = copied;
+ out:
+-	release_sock(sk);
+ 	sk_psock_put(sk, psock);
+ 	return ret;
+ }
