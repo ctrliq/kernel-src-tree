@@ -1,0 +1,153 @@
+KVM: SVM: Drop vcpu_svm.vmcb_pa
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit d1788191fdb03691059ab7aeed36206977f2d784
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/d1788191.failed
+
+Remove vmcb_pa from vcpu_svm and simply read current_vmcb->pa directly in
+the one path where it is consumed.  Unlike svm->vmcb, use of the current
+vmcb's address is very limited, as evidenced by the fact that its use
+can be trimmed to a single dereference.
+
+Opportunistically add a comment about using vmcb01 for VMLOAD/VMSAVE, at
+first glance using vmcb01 instead of vmcb_pa looks wrong.
+
+No functional change intended.
+
+	Cc: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210406171811.4043363-3-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d1788191fdb03691059ab7aeed36206977f2d784)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/svm.c
+index b60ae08fb034,1207526cf8e7..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -1305,6 -1306,12 +1305,15 @@@ static void svm_vcpu_reset(struct kvm_v
+  		avic_update_vapic_bar(svm, APIC_DEFAULT_PHYS_BASE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void svm_switch_vmcb(struct vcpu_svm *svm, struct kvm_vmcb_info *target_vmcb)
++ {
++ 	svm->current_vmcb = target_vmcb;
++ 	svm->vmcb = target_vmcb->ptr;
++ }
++ 
+++>>>>>>> d1788191fdb0 (KVM: SVM: Drop vcpu_svm.vmcb_pa)
+  static int svm_create_vcpu(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm;
+@@@ -3668,9 -3700,70 +3677,76 @@@ static fastpath_t svm_exit_handlers_fas
+  	return EXIT_FASTPATH_NONE;
+  }
+  
+++<<<<<<< HEAD
+ +void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
+ +
+ +static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++=======
++ static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	unsigned long vmcb_pa = svm->current_vmcb->pa;
++ 
++ 	/*
++ 	 * VMENTER enables interrupts (host state), but the kernel state is
++ 	 * interrupts disabled when this is invoked. Also tell RCU about
++ 	 * it. This is the same logic as for exit_to_user_mode().
++ 	 *
++ 	 * This ensures that e.g. latency analysis on the host observes
++ 	 * guest mode as interrupt enabled.
++ 	 *
++ 	 * guest_enter_irqoff() informs context tracking about the
++ 	 * transition to guest mode and if enabled adjusts RCU state
++ 	 * accordingly.
++ 	 */
++ 	instrumentation_begin();
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	instrumentation_end();
++ 
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ 
++ 	if (sev_es_guest(vcpu->kvm)) {
++ 		__svm_sev_es_vcpu_run(vmcb_pa);
++ 	} else {
++ 		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
++ 
++ 		/*
++ 		 * Use a single vmcb (vmcb01 because it's always valid) for
++ 		 * context switching guest state via VMLOAD/VMSAVE, that way
++ 		 * the state doesn't need to be copied between vmcb01 and
++ 		 * vmcb02 when switching vmcbs for nested virtualization.
++ 		 */
++ 		vmload(svm->vmcb01.pa);
++ 		__svm_vcpu_run(vmcb_pa, (unsigned long *)&vcpu->arch.regs);
++ 		vmsave(svm->vmcb01.pa);
++ 
++ 		vmload(__sme_page_pa(sd->save_area));
++ 	}
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ 
++ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++>>>>>>> d1788191fdb0 (KVM: SVM: Drop vcpu_svm.vmcb_pa)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+diff --cc arch/x86/kvm/svm/svm.h
+index de600f536464,04e21ff8deeb..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -106,12 -111,12 +106,17 @@@ struct svm_nested_state 
+  struct vcpu_svm {
+  	struct kvm_vcpu vcpu;
+  	struct vmcb *vmcb;
+++<<<<<<< HEAD
+ +	unsigned long vmcb_pa;
+++=======
++ 	struct kvm_vmcb_info vmcb01;
++ 	struct kvm_vmcb_info *current_vmcb;
+++>>>>>>> d1788191fdb0 (KVM: SVM: Drop vcpu_svm.vmcb_pa)
+  	struct svm_cpu_data *svm_data;
+  	u32 asid;
+ -	u32 sysenter_esp_hi;
+ -	u32 sysenter_eip_hi;
+ +	uint64_t asid_generation;
+ +	uint64_t sysenter_esp;
+ +	uint64_t sysenter_eip;
+  	uint64_t tsc_aux;
+  
+  	u64 msr_decfg;
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
