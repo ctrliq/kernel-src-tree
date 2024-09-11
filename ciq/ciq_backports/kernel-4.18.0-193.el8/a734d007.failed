@@ -1,0 +1,223 @@
+net/mlx5e: Allow concurrent creation of mod_hdr entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Allow concurrent creation of mod_hdr entries (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 96.23%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit a734d007173119fe8e7bde1689ee4123c529e238
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a734d007.failed
+
+Mod_hdr entries creation is fully synchronized by mod_hdr_tbl->lock. In
+order to allow concurrent allocation of hardware resources used to offload
+header rewrite, extend mlx5e_mod_hdr_entry with 'res_ready' completion.
+Move call to mlx5_modify_header_alloc() out of mod_hdr_tbl->lock critical
+section. Modify code that attaches new flows to existing mh to wait for
+'res_ready' completion before using the entry. Insert mh to mod_hdr table
+before provisioning it to hardware and modify all users of mod_hdr table to
+verify that mh was fully initialized by checking completion result for
+negative value (and to wait for 'res_ready' completion, if necessary).
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit a734d007173119fe8e7bde1689ee4123c529e238)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c033e0d4fc59,fcaf9ab9e373..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -181,6 -197,10 +181,13 @@@ struct mlx5e_mod_hdr_entry 
+  	struct mod_hdr_key key;
+  
+  	u32 mod_hdr_id;
+++<<<<<<< HEAD
+++=======
++ 
++ 	refcount_t refcnt;
++ 	struct completion res_ready;
++ 	int compl_result;
+++>>>>>>> a734d0071731 (net/mlx5e: Allow concurrent creation of mod_hdr entries)
+  };
+  
+  #define MLX5_MH_ACT_SZ MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto)
+@@@ -200,6 -291,54 +207,57 @@@ static inline int cmp_mod_hdr_info(stru
+  	return memcmp(a->actions, b->actions, a->num_actions * MLX5_MH_ACT_SZ);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mod_hdr_tbl *
++ get_mod_hdr_table(struct mlx5e_priv *priv, int namespace)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 
++ 	return namespace == MLX5_FLOW_NAMESPACE_FDB ? &esw->offloads.mod_hdr :
++ 		&priv->fs.tc.mod_hdr;
++ }
++ 
++ static struct mlx5e_mod_hdr_entry *
++ mlx5e_mod_hdr_get(struct mod_hdr_tbl *tbl, struct mod_hdr_key *key, u32 hash_key)
++ {
++ 	struct mlx5e_mod_hdr_entry *mh, *found = NULL;
++ 
++ 	hash_for_each_possible(tbl->hlist, mh, mod_hdr_hlist, hash_key) {
++ 		if (!cmp_mod_hdr_info(&mh->key, key)) {
++ 			refcount_inc(&mh->refcnt);
++ 			found = mh;
++ 			break;
++ 		}
++ 	}
++ 
++ 	return found;
++ }
++ 
++ static void mlx5e_mod_hdr_put(struct mlx5e_priv *priv,
++ 			      struct mlx5e_mod_hdr_entry *mh,
++ 			      int namespace)
++ {
++ 	struct mod_hdr_tbl *tbl = get_mod_hdr_table(priv, namespace);
++ 
++ 	if (!refcount_dec_and_mutex_lock(&mh->refcnt, &tbl->lock))
++ 		return;
++ 	hash_del(&mh->mod_hdr_hlist);
++ 	mutex_unlock(&tbl->lock);
++ 
++ 	WARN_ON(!list_empty(&mh->flows));
++ 	if (mh->compl_result > 0)
++ 		mlx5_modify_header_dealloc(priv->mdev, mh->mod_hdr_id);
++ 
++ 	kfree(mh);
++ }
++ 
++ static int get_flow_name_space(struct mlx5e_tc_flow *flow)
++ {
++ 	return mlx5e_is_eswitch_flow(flow) ?
++ 		MLX5_FLOW_NAMESPACE_FDB : MLX5_FLOW_NAMESPACE_KERNEL;
++ }
+++>>>>>>> a734d0071731 (net/mlx5e: Allow concurrent creation of mod_hdr entries)
+  static int mlx5e_attach_mod_hdr(struct mlx5e_priv *priv,
+  				struct mlx5e_tc_flow *flow,
+  				struct mlx5e_tc_flow_parse_attr *parse_attr)
+@@@ -219,61 -357,66 +277,110 @@@
+  
+  	hash_key = hash_mod_hdr_info(&key);
+  
+ -	namespace = get_flow_name_space(flow);
+ -	tbl = get_mod_hdr_table(priv, namespace);
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
+ +		namespace = MLX5_FLOW_NAMESPACE_FDB;
+ +		hash_for_each_possible(esw->offloads.mod_hdr_tbl, mh,
+ +				       mod_hdr_hlist, hash_key) {
+ +			if (!cmp_mod_hdr_info(&mh->key, &key)) {
+ +				found = true;
+ +				break;
+ +			}
+ +		}
+ +	} else {
+ +		namespace = MLX5_FLOW_NAMESPACE_KERNEL;
+ +		hash_for_each_possible(priv->fs.tc.mod_hdr_tbl, mh,
+ +				       mod_hdr_hlist, hash_key) {
+ +			if (!cmp_mod_hdr_info(&mh->key, &key)) {
+ +				found = true;
+ +				break;
+ +			}
+ +		}
+ +	}
+  
+++<<<<<<< HEAD
+ +	if (found)
+++=======
++ 	mutex_lock(&tbl->lock);
++ 	mh = mlx5e_mod_hdr_get(tbl, &key, hash_key);
++ 	if (mh) {
++ 		mutex_unlock(&tbl->lock);
++ 		wait_for_completion(&mh->res_ready);
++ 
++ 		if (mh->compl_result < 0) {
++ 			err = -EREMOTEIO;
++ 			goto attach_header_err;
++ 		}
+++>>>>>>> a734d0071731 (net/mlx5e: Allow concurrent creation of mod_hdr entries)
+  		goto attach_flow;
++ 	}
+  
+  	mh = kzalloc(sizeof(*mh) + actions_size, GFP_KERNEL);
+++<<<<<<< HEAD
+ +	if (!mh)
+ +		return -ENOMEM;
+++=======
++ 	if (!mh) {
++ 		mutex_unlock(&tbl->lock);
++ 		return -ENOMEM;
++ 	}
+++>>>>>>> a734d0071731 (net/mlx5e: Allow concurrent creation of mod_hdr entries)
+  
+  	mh->key.actions = (void *)mh + sizeof(*mh);
+  	memcpy(mh->key.actions, key.actions, actions_size);
+  	mh->key.num_actions = num_actions;
+ -	spin_lock_init(&mh->flows_lock);
+  	INIT_LIST_HEAD(&mh->flows);
+++<<<<<<< HEAD
+++=======
++ 	refcount_set(&mh->refcnt, 1);
++ 	init_completion(&mh->res_ready);
++ 
++ 	hash_add(tbl->hlist, &mh->mod_hdr_hlist, hash_key);
++ 	mutex_unlock(&tbl->lock);
+++>>>>>>> a734d0071731 (net/mlx5e: Allow concurrent creation of mod_hdr entries)
+  
+  	err = mlx5_modify_header_alloc(priv->mdev, namespace,
+  				       mh->key.num_actions,
+  				       mh->key.actions,
+  				       &mh->mod_hdr_id);
+++<<<<<<< HEAD
+ +	if (err)
+ +		goto out_err;
+ +
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH)
+ +		hash_add(esw->offloads.mod_hdr_tbl, &mh->mod_hdr_hlist, hash_key);
+ +	else
+ +		hash_add(priv->fs.tc.mod_hdr_tbl, &mh->mod_hdr_hlist, hash_key);
+ +
+ +attach_flow:
+++=======
++ 	if (err) {
++ 		mh->compl_result = err;
++ 		goto alloc_header_err;
++ 	}
++ 	mh->compl_result = 1;
++ 	complete_all(&mh->res_ready);
++ 
++ attach_flow:
++ 	flow->mh = mh;
++ 	spin_lock(&mh->flows_lock);
+++>>>>>>> a734d0071731 (net/mlx5e: Allow concurrent creation of mod_hdr entries)
+  	list_add(&flow->mod_hdr, &mh->flows);
+ -	spin_unlock(&mh->flows_lock);
+ -	if (mlx5e_is_eswitch_flow(flow))
+ +	if (flow->flags & MLX5E_TC_FLOW_ESWITCH)
+  		flow->esw_attr->mod_hdr_id = mh->mod_hdr_id;
+  	else
+  		flow->nic_attr->mod_hdr_id = mh->mod_hdr_id;
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +out_err:
+ +	kfree(mh);
+++=======
++ alloc_header_err:
++ 	complete_all(&mh->res_ready);
++ attach_header_err:
++ 	mlx5e_mod_hdr_put(priv, mh, namespace);
+++>>>>>>> a734d0071731 (net/mlx5e: Allow concurrent creation of mod_hdr entries)
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
