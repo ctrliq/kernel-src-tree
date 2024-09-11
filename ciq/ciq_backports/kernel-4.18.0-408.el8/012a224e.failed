@@ -1,0 +1,405 @@
+s390/uaccess: introduce bit field for OAC specifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Nico Boehr <nrb@linux.ibm.com>
+commit 012a224e1fa31fc256aab921f691598e03db6018
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/012a224e.failed
+
+Previously, we've used  magic values to specify the OAC
+(operand-access control) for mvcos.
+
+Instead we introduce a bit field for it.
+
+When using a bit field, we cannot use an immediate value with K
+constraint anymore, since GCC older than 10 doesn't recognize
+the bit field union as a compile time constant.
+To make things work with older compilers,
+load the OAC value through a register.
+
+Bloat-o-meter reports a slight increase in kernel size with this change:
+Total: Before=15692135, After=15693015, chg +0.01%
+
+	Signed-off-by: Nico Boehr <nrb@linux.ibm.com>
+Co-developed-by: Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+	Signed-off-by: Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220111100003.743116-1-scgl@linux.ibm.com
+	Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+	Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Sven Schnelle <svens@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 012a224e1fa31fc256aab921f691598e03db6018)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/uaccess.h
+#	arch/s390/lib/uaccess.c
+diff --cc arch/s390/include/asm/uaccess.h
+index 21ece00e3129,147cb3534ce4..000000000000
+--- a/arch/s390/include/asm/uaccess.h
++++ b/arch/s390/include/asm/uaccess.h
+@@@ -61,54 -44,93 +61,137 @@@ raw_copy_to_user(void __user *to, cons
+  #define INLINE_COPY_TO_USER
+  #endif
+  
+ -int __put_user_bad(void) __attribute__((noreturn));
+ -int __get_user_bad(void) __attribute__((noreturn));
+ -
+  #ifdef CONFIG_HAVE_MARCH_Z10_FEATURES
+  
+++<<<<<<< HEAD
+ +#define __put_get_user_asm(to, from, size, spec)		\
+ +({								\
+ +	register unsigned long __reg0 asm("0") = spec;		\
+ +	int __rc;						\
+ +								\
+ +	asm volatile(						\
+ +		"0:	mvcos	%1,%3,%2\n"			\
+ +		"1:	xr	%0,%0\n"			\
+ +		"2:\n"						\
+ +		".pushsection .fixup, \"ax\"\n"			\
+ +		"3:	lhi	%0,%5\n"			\
+ +		"	jg	2b\n"				\
+ +		".popsection\n"					\
+ +		EX_TABLE(0b,3b) EX_TABLE(1b,3b)			\
+ +		: "=d" (__rc), "+Q" (*(to))			\
+ +		: "d" (size), "Q" (*(from)),			\
+ +		  "d" (__reg0), "K" (-EFAULT)			\
+ +		: "cc");					\
+ +	__rc;							\
+ +})
+ +
+ +static inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
+++=======
++ union oac {
++ 	unsigned int val;
++ 	struct {
++ 		struct {
++ 			unsigned short key : 4;
++ 			unsigned short	   : 4;
++ 			unsigned short as  : 2;
++ 			unsigned short	   : 4;
++ 			unsigned short k   : 1;
++ 			unsigned short a   : 1;
++ 		} oac1;
++ 		struct {
++ 			unsigned short key : 4;
++ 			unsigned short	   : 4;
++ 			unsigned short as  : 2;
++ 			unsigned short	   : 4;
++ 			unsigned short k   : 1;
++ 			unsigned short a   : 1;
++ 		} oac2;
++ 	};
++ };
++ 
++ #define __put_get_user_asm(to, from, size, oac_spec)			\
++ ({									\
++ 	int __rc;							\
++ 									\
++ 	asm volatile(							\
++ 		"	lr	0,%[spec]\n"				\
++ 		"0:	mvcos	%[_to],%[_from],%[_size]\n"		\
++ 		"1:	xr	%[rc],%[rc]\n"				\
++ 		"2:\n"							\
++ 		".pushsection .fixup, \"ax\"\n"				\
++ 		"3:	lhi	%[rc],%[retval]\n"			\
++ 		"	jg	2b\n"					\
++ 		".popsection\n"						\
++ 		EX_TABLE(0b,3b) EX_TABLE(1b,3b)				\
++ 		: [rc] "=&d" (__rc), [_to] "+Q" (*(to))			\
++ 		: [_size] "d" (size), [_from] "Q" (*(from)),		\
++ 		  [retval] "K" (-EFAULT), [spec] "d" (oac_spec.val)	\
++ 		: "cc", "0");						\
++ 	__rc;								\
++ })
++ 
++ #define __put_user_asm(to, from, size)				\
++ 	__put_get_user_asm(to, from, size, ((union oac) {	\
++ 		.oac1.as = PSW_BITS_AS_SECONDARY,		\
++ 		.oac1.a = 1					\
++ 	}))
++ 
++ #define __get_user_asm(to, from, size)				\
++ 	__put_get_user_asm(to, from, size, ((union oac) {	\
++ 		.oac2.as = PSW_BITS_AS_SECONDARY,		\
++ 		.oac2.a = 1					\
++ 	}))							\
++ 
++ static __always_inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  {
+ +	unsigned long spec = 0x010000UL;
+  	int rc;
+  
+  	switch (size) {
+  	case 1:
+++<<<<<<< HEAD
+ +		rc = __put_get_user_asm((unsigned char __user *)ptr,
+ +					(unsigned char *)x,
+ +					size, spec);
+ +		break;
+ +	case 2:
+ +		rc = __put_get_user_asm((unsigned short __user *)ptr,
+ +					(unsigned short *)x,
+ +					size, spec);
+ +		break;
+ +	case 4:
+ +		rc = __put_get_user_asm((unsigned int __user *)ptr,
+ +					(unsigned int *)x,
+ +					size, spec);
+ +		break;
+ +	case 8:
+ +		rc = __put_get_user_asm((unsigned long __user *)ptr,
+ +					(unsigned long *)x,
+ +					size, spec);
+++=======
++ 		rc = __put_user_asm((unsigned char __user *)ptr,
++ 				    (unsigned char *)x,
++ 				    size);
++ 		break;
++ 	case 2:
++ 		rc = __put_user_asm((unsigned short __user *)ptr,
++ 				    (unsigned short *)x,
++ 				    size);
++ 		break;
++ 	case 4:
++ 		rc = __put_user_asm((unsigned int __user *)ptr,
++ 				    (unsigned int *)x,
++ 				    size);
++ 		break;
++ 	case 8:
++ 		rc = __put_user_asm((unsigned long __user *)ptr,
++ 				    (unsigned long *)x,
++ 				    size);
++ 		break;
++ 	default:
++ 		__put_user_bad();
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  		break;
+  	}
+  	return rc;
+@@@ -121,24 -142,27 +204,48 @@@ static inline int __get_user_fn(void *x
+  
+  	switch (size) {
+  	case 1:
+++<<<<<<< HEAD
+ +		rc = __put_get_user_asm((unsigned char *)x,
+ +					(unsigned char __user *)ptr,
+ +					size, spec);
+ +		break;
+ +	case 2:
+ +		rc = __put_get_user_asm((unsigned short *)x,
+ +					(unsigned short __user *)ptr,
+ +					size, spec);
+ +		break;
+ +	case 4:
+ +		rc = __put_get_user_asm((unsigned int *)x,
+ +					(unsigned int __user *)ptr,
+ +					size, spec);
+ +		break;
+ +	case 8:
+ +		rc = __put_get_user_asm((unsigned long *)x,
+ +					(unsigned long __user *)ptr,
+ +					size, spec);
+++=======
++ 		rc = __get_user_asm((unsigned char *)x,
++ 				    (unsigned char __user *)ptr,
++ 				    size);
++ 		break;
++ 	case 2:
++ 		rc = __get_user_asm((unsigned short *)x,
++ 				    (unsigned short __user *)ptr,
++ 				    size);
++ 		break;
++ 	case 4:
++ 		rc = __get_user_asm((unsigned int *)x,
++ 				    (unsigned int __user *)ptr,
++ 				    size);
++ 		break;
++ 	case 8:
++ 		rc = __get_user_asm((unsigned long *)x,
++ 				    (unsigned long __user *)ptr,
++ 				    size);
++ 		break;
++ 	default:
++ 		__get_user_bad();
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  		break;
+  	}
+  	return rc;
+diff --cc arch/s390/lib/uaccess.c
+index 0267405ab7c6,8a5d21461889..000000000000
+--- a/arch/s390/lib/uaccess.c
++++ b/arch/s390/lib/uaccess.c
+@@@ -104,11 -61,15 +104,19 @@@ EXPORT_SYMBOL(disable_sacf_uaccess)
+  static inline unsigned long copy_from_user_mvcos(void *x, const void __user *ptr,
+  						 unsigned long size)
+  {
+ +	register unsigned long reg0 asm("0") = 0x01UL;
+  	unsigned long tmp1, tmp2;
++ 	union oac spec = {
++ 		.oac2.as = PSW_BITS_AS_SECONDARY,
++ 		.oac2.a = 1,
++ 	};
+  
+  	tmp1 = -4096UL;
+  	asm volatile(
+++<<<<<<< HEAD
+++=======
++ 		"   lr	  0,%[spec]\n"
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  		"0: .insn ss,0xc80000000000,0(%0,%2),0(%1),0\n"
+  		"6: jz    4f\n"
+  		"1: algr  %0,%3\n"
+@@@ -127,7 -88,8 +135,12 @@@
+  		"5:\n"
+  		EX_TABLE(0b,2b) EX_TABLE(3b,5b) EX_TABLE(6b,2b) EX_TABLE(7b,5b)
+  		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
+++<<<<<<< HEAD
+ +		: "d" (reg0) : "cc", "memory");
+++=======
++ 		: [spec] "d" (spec.val)
++ 		: "cc", "memory", "0");
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  	return size;
+  }
+  
+@@@ -179,11 -138,15 +192,19 @@@ EXPORT_SYMBOL(raw_copy_from_user)
+  static inline unsigned long copy_to_user_mvcos(void __user *ptr, const void *x,
+  					       unsigned long size)
+  {
+ +	register unsigned long reg0 asm("0") = 0x010000UL;
+  	unsigned long tmp1, tmp2;
++ 	union oac spec = {
++ 		.oac1.as = PSW_BITS_AS_SECONDARY,
++ 		.oac1.a = 1,
++ 	};
+  
+  	tmp1 = -4096UL;
+  	asm volatile(
+++<<<<<<< HEAD
+++=======
++ 		"   lr	  0,%[spec]\n"
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  		"0: .insn ss,0xc80000000000,0(%0,%1),0(%2),0\n"
+  		"6: jz    4f\n"
+  		"1: algr  %0,%3\n"
+@@@ -202,7 -165,8 +223,12 @@@
+  		"5:\n"
+  		EX_TABLE(0b,2b) EX_TABLE(3b,5b) EX_TABLE(6b,2b) EX_TABLE(7b,5b)
+  		: "+a" (size), "+a" (ptr), "+a" (x), "+a" (tmp1), "=a" (tmp2)
+++<<<<<<< HEAD
+ +		: "d" (reg0) : "cc", "memory");
+++=======
++ 		: [spec] "d" (spec.val)
++ 		: "cc", "memory", "0");
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  	return size;
+  }
+  
+@@@ -251,78 -212,17 +277,86 @@@ unsigned long raw_copy_to_user(void __u
+  }
+  EXPORT_SYMBOL(raw_copy_to_user);
+  
+ +static inline unsigned long copy_in_user_mvcos(void __user *to, const void __user *from,
+ +					       unsigned long size)
+ +{
+ +	register unsigned long reg0 asm("0") = 0x010001UL;
+ +	unsigned long tmp1, tmp2;
+ +
+ +	tmp1 = -4096UL;
+ +	/* FIXME: copy with reduced length. */
+ +	asm volatile(
+ +		"0: .insn ss,0xc80000000000,0(%0,%1),0(%2),0\n"
+ +		"   jz	  2f\n"
+ +		"1: algr  %0,%3\n"
+ +		"   slgr  %1,%3\n"
+ +		"   slgr  %2,%3\n"
+ +		"   j	  0b\n"
+ +		"2:slgr  %0,%0\n"
+ +		"3: \n"
+ +		EX_TABLE(0b,3b)
+ +		: "+a" (size), "+a" (to), "+a" (from), "+a" (tmp1), "=a" (tmp2)
+ +		: "d" (reg0) : "cc", "memory");
+ +	return size;
+ +}
+ +
+ +static inline unsigned long copy_in_user_mvc(void __user *to, const void __user *from,
+ +					     unsigned long size)
+ +{
+ +	mm_segment_t old_fs;
+ +	unsigned long tmp1;
+ +
+ +	old_fs = enable_sacf_uaccess();
+ +	asm volatile(
+ +		"   sacf  256\n"
+ +		"   aghi  %0,-1\n"
+ +		"   jo	  5f\n"
+ +		"   bras  %3,3f\n"
+ +		"0: aghi  %0,257\n"
+ +		"1: mvc	  0(1,%1),0(%2)\n"
+ +		"   la	  %1,1(%1)\n"
+ +		"   la	  %2,1(%2)\n"
+ +		"   aghi  %0,-1\n"
+ +		"   jnz	  1b\n"
+ +		"   j	  5f\n"
+ +		"2: mvc	  0(256,%1),0(%2)\n"
+ +		"   la	  %1,256(%1)\n"
+ +		"   la	  %2,256(%2)\n"
+ +		"3: aghi  %0,-256\n"
+ +		"   jnm	  2b\n"
+ +		"4: ex	  %0,1b-0b(%3)\n"
+ +		"5: slgr  %0,%0\n"
+ +		"6: sacf  768\n"
+ +		EX_TABLE(1b,6b) EX_TABLE(2b,0b) EX_TABLE(4b,0b)
+ +		: "+a" (size), "+a" (to), "+a" (from), "=a" (tmp1)
+ +		: : "cc", "memory");
+ +	disable_sacf_uaccess(old_fs);
+ +	return size;
+ +}
+ +
+ +unsigned long raw_copy_in_user(void __user *to, const void __user *from, unsigned long n)
+ +{
+ +	if (copy_with_mvcos())
+ +		return copy_in_user_mvcos(to, from, n);
+ +	return copy_in_user_mvc(to, from, n);
+ +}
+ +EXPORT_SYMBOL(raw_copy_in_user);
+ +
+  static inline unsigned long clear_user_mvcos(void __user *to, unsigned long size)
+  {
+ +	register unsigned long reg0 asm("0") = 0x010000UL;
+  	unsigned long tmp1, tmp2;
++ 	union oac spec = {
++ 		.oac1.as = PSW_BITS_AS_SECONDARY,
++ 		.oac1.a = 1,
++ 	};
+  
+  	tmp1 = -4096UL;
+  	asm volatile(
+++<<<<<<< HEAD
+++=======
++ 		"   lr	  0,%[spec]\n"
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  		"0: .insn ss,0xc80000000000,0(%0,%1),0(%4),0\n"
+  		"   jz	  4f\n"
+  		"1: algr  %0,%2\n"
+@@@ -340,7 -240,8 +374,12 @@@
+  		"5:\n"
+  		EX_TABLE(0b,2b) EX_TABLE(3b,5b)
+  		: "+a" (size), "+a" (to), "+a" (tmp1), "=a" (tmp2)
+++<<<<<<< HEAD
+ +		: "a" (empty_zero_page), "d" (reg0) : "cc", "memory");
+++=======
++ 		: "a" (empty_zero_page), [spec] "d" (spec.val)
++ 		: "cc", "memory", "0");
+++>>>>>>> 012a224e1fa3 (s390/uaccess: introduce bit field for OAC specifier)
+  	return size;
+  }
+  
+* Unmerged path arch/s390/include/asm/uaccess.h
+* Unmerged path arch/s390/lib/uaccess.c
