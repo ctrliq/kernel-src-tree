@@ -1,0 +1,211 @@
+KVM: SVM: Provide an updated VMRUN invocation for SEV-ES guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 16809ecdc1e8ab7278f1d60021ac809edd17d060
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/16809ecd.failed
+
+The run sequence is different for an SEV-ES guest compared to a legacy or
+even an SEV guest. The guest vCPU register state of an SEV-ES guest will
+be restored on VMRUN and saved on VMEXIT. There is no need to restore the
+guest registers directly and through VMLOAD before VMRUN and no need to
+save the guest registers directly and through VMSAVE on VMEXIT.
+
+Update the svm_vcpu_run() function to skip register state saving and
+restoring and provide an alternative function for running an SEV-ES guest
+in vmenter.S
+
+Additionally, certain host state is restored across an SEV-ES VMRUN. As
+a result certain register states are not required to be restored upon
+VMEXIT (e.g. FS, GS, etc.), so only do that if the guest is not an SEV-ES
+guest.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Message-Id: <fb1c66d32f2194e171b95fc1a8affd6d326e10c1.1607620209.git.thomas.lendacky@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 16809ecdc1e8ab7278f1d60021ac809edd17d060)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/vmenter.S
+diff --cc arch/x86/kvm/svm/svm.c
+index 189395610780,941e5251e13f..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -3667,7 -3677,65 +3667,69 @@@ static fastpath_t svm_exit_handlers_fas
+  
+  void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
+  
+++<<<<<<< HEAD
+ +static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++=======
++ static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu,
++ 					struct vcpu_svm *svm)
++ {
++ 	/*
++ 	 * VMENTER enables interrupts (host state), but the kernel state is
++ 	 * interrupts disabled when this is invoked. Also tell RCU about
++ 	 * it. This is the same logic as for exit_to_user_mode().
++ 	 *
++ 	 * This ensures that e.g. latency analysis on the host observes
++ 	 * guest mode as interrupt enabled.
++ 	 *
++ 	 * guest_enter_irqoff() informs context tracking about the
++ 	 * transition to guest mode and if enabled adjusts RCU state
++ 	 * accordingly.
++ 	 */
++ 	instrumentation_begin();
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	instrumentation_end();
++ 
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ 
++ 	if (sev_es_guest(svm->vcpu.kvm)) {
++ 		__svm_sev_es_vcpu_run(svm->vmcb_pa);
++ 	} else {
++ 		__svm_vcpu_run(svm->vmcb_pa, (unsigned long *)&svm->vcpu.arch.regs);
++ 
++ #ifdef CONFIG_X86_64
++ 		native_wrmsrl(MSR_GS_BASE, svm->host.gs_base);
++ #else
++ 		loadsegment(fs, svm->host.fs);
++ #ifndef CONFIG_X86_32_LAZY_GS
++ 		loadsegment(gs, svm->host.gs);
++ #endif
++ #endif
++ 	}
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ 
++ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++>>>>>>> 16809ecdc1e8 (KVM: SVM: Provide an updated VMRUN invocation for SEV-ES guests)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+diff --cc arch/x86/kvm/svm/vmenter.S
+index 850bdb9dc08c,6feb8c08f45a..000000000000
+--- a/arch/x86/kvm/svm/vmenter.S
++++ b/arch/x86/kvm/svm/vmenter.S
+@@@ -167,4 -167,54 +167,58 @@@ ENTRY(__svm_vcpu_run
+  #endif
+  	pop %_ASM_BP
+  	ret
+++<<<<<<< HEAD
+ +ENDPROC(__svm_vcpu_run)
+++=======
++ SYM_FUNC_END(__svm_vcpu_run)
++ 
++ /**
++  * __svm_sev_es_vcpu_run - Run a SEV-ES vCPU via a transition to SVM guest mode
++  * @vmcb_pa:	unsigned long
++  */
++ SYM_FUNC_START(__svm_sev_es_vcpu_run)
++ 	push %_ASM_BP
++ #ifdef CONFIG_X86_64
++ 	push %r15
++ 	push %r14
++ 	push %r13
++ 	push %r12
++ #else
++ 	push %edi
++ 	push %esi
++ #endif
++ 	push %_ASM_BX
++ 
++ 	/* Enter guest mode */
++ 	mov %_ASM_ARG1, %_ASM_AX
++ 	sti
++ 
++ 1:	vmrun %_ASM_AX
++ 	jmp 3f
++ 2:	cmpb $0, kvm_rebooting
++ 	jne 3f
++ 	ud2
++ 	_ASM_EXTABLE(1b, 2b)
++ 
++ 3:	cli
++ 
++ #ifdef CONFIG_RETPOLINE
++ 	/* IMPORTANT: Stuff the RSB immediately after VM-Exit, before RET! */
++ 	FILL_RETURN_BUFFER %_ASM_AX, RSB_CLEAR_LOOPS, X86_FEATURE_RETPOLINE
++ #endif
++ 
++ 	pop %_ASM_BX
++ 
++ #ifdef CONFIG_X86_64
++ 	pop %r12
++ 	pop %r13
++ 	pop %r14
++ 	pop %r15
++ #else
++ 	pop %esi
++ 	pop %edi
++ #endif
++ 	pop %_ASM_BP
++ 	ret
++ SYM_FUNC_END(__svm_sev_es_vcpu_run)
+++>>>>>>> 16809ecdc1e8 (KVM: SVM: Provide an updated VMRUN invocation for SEV-ES guests)
+* Unmerged path arch/x86/kvm/svm/svm.c
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 603a54d1695e..ddce4dad8db8 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -510,4 +510,9 @@ void pre_sev_run(struct vcpu_svm *svm, int cpu);
+ int __init sev_hardware_setup(void);
+ void sev_hardware_teardown(void);
+ 
++/* vmenter.S */
++
++void __svm_sev_es_vcpu_run(unsigned long vmcb_pa);
++void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
++
+ #endif
+* Unmerged path arch/x86/kvm/svm/vmenter.S
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 7b090f49a5e7..9a0d3ff11719 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -879,6 +879,9 @@ EXPORT_SYMBOL_GPL(kvm_lmsw);
+ 
+ void kvm_load_guest_xsave_state(struct kvm_vcpu *vcpu)
+ {
++	if (vcpu->arch.guest_state_protected)
++		return;
++
+ 	if (kvm_read_cr4_bits(vcpu, X86_CR4_OSXSAVE)) {
+ 
+ 		if (vcpu->arch.xcr0 != host_xcr0)
+@@ -899,6 +902,9 @@ EXPORT_SYMBOL_GPL(kvm_load_guest_xsave_state);
+ 
+ void kvm_load_host_xsave_state(struct kvm_vcpu *vcpu)
+ {
++	if (vcpu->arch.guest_state_protected)
++		return;
++
+ 	if (static_cpu_has(X86_FEATURE_PKU) &&
+ 	    (kvm_read_cr4_bits(vcpu, X86_CR4_PKE) ||
+ 	     (vcpu->arch.xcr0 & XFEATURE_MASK_PKRU))) {
