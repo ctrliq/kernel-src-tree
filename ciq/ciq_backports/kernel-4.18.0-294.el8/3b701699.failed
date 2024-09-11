@@ -1,0 +1,189 @@
+flow_dissector: Pull BPF program assignment up to bpf-netns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit 3b7016996c4c44db5d499d98759b82fb714bb912
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3b701699.failed
+
+Prepare for using bpf_prog_array to store attached programs by moving out
+code that updates the attached program out of flow dissector.
+
+Managing bpf_prog_array is more involved than updating a single bpf_prog
+pointer. This will let us do it all from one place, bpf/net_namespace.c, in
+the subsequent patch.
+
+No functional change intended.
+
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20200625141357.910330-2-jakub@cloudflare.com
+(cherry picked from commit 3b7016996c4c44db5d499d98759b82fb714bb912)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow_dissector.h
+#	kernel/bpf/net_namespace.c
+#	net/core/flow_dissector.c
+diff --cc include/net/flow_dissector.h
+index 180b52658c68,4b6e36288ddd..000000000000
+--- a/include/net/flow_dissector.h
++++ b/include/net/flow_dissector.h
+@@@ -359,4 -371,9 +359,12 @@@ flow_dissector_init_keys(struct flow_di
+  	memset(key_basic, 0, sizeof(*key_basic));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ int flow_dissector_bpf_prog_attach_check(struct net *net,
++ 					 struct bpf_prog *prog);
++ #endif /* CONFIG_BPF_SYSCALL */
++ 
+++>>>>>>> 3b7016996c4c (flow_dissector: Pull BPF program assignment up to bpf-netns)
+  #endif
+diff --cc net/core/flow_dissector.c
+index 4f65dd7a24e0,b57fb1359395..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -71,56 -69,11 +71,64 @@@ void skb_flow_dissector_init(struct flo
+  }
+  EXPORT_SYMBOL(skb_flow_dissector_init);
+  
+++<<<<<<< HEAD
+ +int skb_flow_dissector_prog_query(const union bpf_attr *attr,
+ +				  union bpf_attr __user *uattr)
+ +{
+ +	__u32 __user *prog_ids = u64_to_user_ptr(attr->query.prog_ids);
+ +	u32 prog_id, prog_cnt = 0, flags = 0;
+ +	struct bpf_prog *attached;
+ +	struct net *net;
+ +
+ +	if (attr->query.query_flags)
+ +		return -EINVAL;
+ +
+ +	net = get_net_ns_by_fd(attr->query.target_fd);
+ +	if (IS_ERR(net))
+ +		return PTR_ERR(net);
+ +
+ +	rcu_read_lock();
+ +	attached = rcu_dereference(net->flow_dissector_prog);
+ +	if (attached) {
+ +		prog_cnt = 1;
+ +		prog_id = attached->aux->id;
+ +	}
+ +	rcu_read_unlock();
+ +
+ +	put_net(net);
+ +
+ +	if (copy_to_user(&uattr->query.attach_flags, &flags, sizeof(flags)))
+ +		return -EFAULT;
+ +	if (copy_to_user(&uattr->query.prog_cnt, &prog_cnt, sizeof(prog_cnt)))
+ +		return -EFAULT;
+ +
+ +	if (!attr->query.prog_cnt || !prog_ids || !prog_cnt)
+ +		return 0;
+ +
+ +	if (copy_to_user(prog_ids, &prog_id, sizeof(u32)))
+ +		return -EFAULT;
+ +
+ +	return 0;
+ +}
+ +
+ +int skb_flow_dissector_bpf_prog_attach(const union bpf_attr *attr,
+ +				       struct bpf_prog *prog)
+ +{
+ +	struct bpf_prog *attached;
+ +	struct net *net;
+ +	int ret = 0;
+ +
+ +	rh_mark_used_feature("eBPF/flowdissector");
+ +
+ +	net = current->nsproxy->net_ns;
+ +	mutex_lock(&flow_dissector_mutex);
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ int flow_dissector_bpf_prog_attach_check(struct net *net,
++ 					 struct bpf_prog *prog)
++ {
++ 	enum netns_bpf_attach_type type = NETNS_BPF_FLOW_DISSECTOR;
+++>>>>>>> 3b7016996c4c (flow_dissector: Pull BPF program assignment up to bpf-netns)
+  
+  	if (net == &init_net) {
+  		/* BPF flow dissector in the root namespace overrides
+@@@ -142,61 -93,13 +150,64 @@@
+  		/* Make sure root flow dissector is not attached
+  		 * when attaching to the non-root namespace.
+  		 */
+ -		if (rcu_access_pointer(init_net.bpf.progs[type]))
+ -			return -EEXIST;
+ +		if (rcu_access_pointer(init_net.flow_dissector_prog)) {
+ +			ret = -EEXIST;
+ +			goto out;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	attached = rcu_dereference_protected(net->flow_dissector_prog,
+ +					     lockdep_is_held(&flow_dissector_mutex));
+ +	if (attached == prog) {
+ +		/* The same program cannot be attached twice */
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +	rcu_assign_pointer(net->flow_dissector_prog, prog);
+ +	if (attached)
+ +		bpf_prog_put(attached);
+ +out:
+ +	mutex_unlock(&flow_dissector_mutex);
+ +	return ret;
+ +}
+ +
+ +static int flow_dissector_bpf_prog_detach(struct net *net)
+ +{
+ +	struct bpf_prog *attached;
+ +
+ +	mutex_lock(&flow_dissector_mutex);
+ +	attached = rcu_dereference_protected(net->flow_dissector_prog,
+ +					     lockdep_is_held(&flow_dissector_mutex));
+ +	if (!attached) {
+ +		mutex_unlock(&flow_dissector_mutex);
+ +		return -ENOENT;
+ +	}
+ +	RCU_INIT_POINTER(net->flow_dissector_prog, NULL);
+ +	bpf_prog_put(attached);
+ +	mutex_unlock(&flow_dissector_mutex);
+++=======
+++>>>>>>> 3b7016996c4c (flow_dissector: Pull BPF program assignment up to bpf-netns)
+  	return 0;
+  }
+ -#endif /* CONFIG_BPF_SYSCALL */
+ +
+ +int skb_flow_dissector_bpf_prog_detach(const union bpf_attr *attr)
+ +{
+ +	return flow_dissector_bpf_prog_detach(current->nsproxy->net_ns);
+ +}
+ +
+ +static void __net_exit flow_dissector_pernet_pre_exit(struct net *net)
+ +{
+ +	/* We're not racing with attach/detach because there are no
+ +	 * references to netns left when pre_exit gets called.
+ +	 */
+ +	if (rcu_access_pointer(net->flow_dissector_prog))
+ +		flow_dissector_bpf_prog_detach(net);
+ +}
+ +
+ +static struct pernet_operations flow_dissector_pernet_ops __net_initdata = {
+ +	.pre_exit = flow_dissector_pernet_pre_exit,
+ +};
+  
+  /**
+   * __skb_flow_get_ports - extract the upper layer ports and return them
+* Unmerged path kernel/bpf/net_namespace.c
+* Unmerged path include/net/flow_dissector.h
+* Unmerged path kernel/bpf/net_namespace.c
+* Unmerged path net/core/flow_dissector.c
