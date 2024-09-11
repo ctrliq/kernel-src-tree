@@ -1,0 +1,174 @@
+xhci: handle stop endpoint command completion with endpoint in running state.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Mathias Nyman <mathias.nyman@linux.intel.com>
+commit 1174d44906d517ddb4f98bbe58a44d4554d0ef90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/1174d449.failed
+
+Handle race where a stop endpoint command fails with "context state error"
+as hardware hasn't actually started the ring yet after a previous urb
+cancellation completed and restarted the endpoint.
+Flushing the doorbell write that restart the endpoint reduced these cases,
+but didn't completely resolve them.
+
+Check if the ring is running in the stop endpoint completion handler, and
+issue a new stop endpoint command in this case.
+
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20210129130044.206855-24-mathias.nyman@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 1174d44906d517ddb4f98bbe58a44d4554d0ef90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/xhci-ring.c
+diff --cc drivers/usb/host/xhci-ring.c
+index bd30ef5cce7a,307ccd40ccac..000000000000
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@@ -812,16 -976,14 +812,22 @@@ static int xhci_invalidate_cancelled_td
+   *     bit cleared) so that the HW will skip over them.
+   */
+  static void xhci_handle_cmd_stop_ep(struct xhci_hcd *xhci, int slot_id,
+ -				    union xhci_trb *trb, u32 comp_code)
+ +		union xhci_trb *trb)
+  {
+  	unsigned int ep_index;
+ +	struct xhci_ring *ep_ring;
+  	struct xhci_virt_ep *ep;
+ +	struct xhci_td *cur_td = NULL;
+ +	struct xhci_td *last_unlinked_td;
+  	struct xhci_ep_ctx *ep_ctx;
+++<<<<<<< HEAD
+ +	struct xhci_virt_device *vdev;
+ +	struct xhci_dequeue_state deq_state;
+++=======
++ 	struct xhci_td *td = NULL;
++ 	enum xhci_ep_reset_type reset_type;
++ 	struct xhci_command *command;
+++>>>>>>> 1174d44906d5 (xhci: handle stop endpoint command completion with endpoint in running state.)
+  
+  	if (unlikely(TRB_TO_SUSPEND_PORT(le32_to_cpu(trb->generic.field[3])))) {
+  		if (!xhci->devs[slot_id])
+@@@ -838,62 -997,63 +844,110 @@@
+  	if (!ep)
+  		return;
+  
+ -	ep_ctx = xhci_get_ep_ctx(xhci, ep->vdev->out_ctx, ep_index);
+ -
+ +	vdev = ep->vdev;
+ +	ep_ctx = xhci_get_ep_ctx(xhci, vdev->out_ctx, ep_index);
+  	trace_xhci_handle_cmd_stop_ep(ep_ctx);
+  
+++<<<<<<< HEAD
+ +	last_unlinked_td = list_last_entry(&ep->cancelled_td_list,
+ +			struct xhci_td, cancelled_td_list);
+ +
+ +	if (list_empty(&ep->cancelled_td_list)) {
+ +		xhci_stop_watchdog_timer_in_irq(xhci, ep);
+ +		ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+ +		return;
+++=======
++ 	if (comp_code == COMP_CONTEXT_STATE_ERROR) {
++ 	/*
++ 	 * If stop endpoint command raced with a halting endpoint we need to
++ 	 * reset the host side endpoint first.
++ 	 * If the TD we halted on isn't cancelled the TD should be given back
++ 	 * with a proper error code, and the ring dequeue moved past the TD.
++ 	 * If streams case we can't find hw_deq, or the TD we halted on so do a
++ 	 * soft reset.
++ 	 *
++ 	 * Proper error code is unknown here, it would be -EPIPE if device side
++ 	 * of enadpoit halted (aka STALL), and -EPROTO if not (transaction error)
++ 	 * We use -EPROTO, if device is stalled it should return a stall error on
++ 	 * next transfer, which then will return -EPIPE, and device side stall is
++ 	 * noted and cleared by class driver.
++ 	 */
++ 		switch (GET_EP_CTX_STATE(ep_ctx)) {
++ 		case EP_STATE_HALTED:
++ 			xhci_dbg(xhci, "Stop ep completion raced with stall, reset ep\n");
++ 			if (ep->ep_state & EP_HAS_STREAMS) {
++ 				reset_type = EP_SOFT_RESET;
++ 			} else {
++ 				reset_type = EP_HARD_RESET;
++ 				td = find_halted_td(ep);
++ 				if (td)
++ 					td->status = -EPROTO;
++ 			}
++ 			/* reset ep, reset handler cleans up cancelled tds */
++ 			xhci_handle_halted_endpoint(xhci, ep, 0, td, reset_type);
++ 			xhci_stop_watchdog_timer_in_irq(xhci, ep);
++ 			return;
++ 		case EP_STATE_RUNNING:
++ 			/* Race, HW handled stop ep cmd before ep was running */
++ 			command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
++ 			if (!command)
++ 				xhci_stop_watchdog_timer_in_irq(xhci, ep);
++ 
++ 			mod_timer(&ep->stop_cmd_timer,
++ 				  jiffies + XHCI_STOP_EP_CMD_TIMEOUT * HZ);
++ 			xhci_queue_stop_endpoint(xhci, command, slot_id, ep_index, 0);
++ 			xhci_ring_cmd_db(xhci);
++ 
++ 			return;
++ 		default:
++ 			break;
++ 		}
+++>>>>>>> 1174d44906d5 (xhci: handle stop endpoint command completion with endpoint in running state.)
+  	}
+ -	/* will queue a set TR deq if stopped on a cancelled, uncleared TD */
+ -	xhci_invalidate_cancelled_tds(ep);
+ +
+ +	xhci_invalidate_cancelled_tds(ep, &deq_state);
+ +
+  	xhci_stop_watchdog_timer_in_irq(xhci, ep);
+  
+ -	/* Otherwise ring the doorbell(s) to restart queued transfers */
+ -	xhci_giveback_invalidated_tds(ep);
+ -	ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+ +	/* If necessary, queue a Set Transfer Ring Dequeue Pointer command */
+ +	if (deq_state.new_deq_ptr && deq_state.new_deq_seg) {
+ +		xhci_queue_new_dequeue_state(xhci, slot_id, ep_index,
+ +					     &deq_state);
+ +		xhci_ring_cmd_db(xhci);
+ +	} else {
+ +		/* Otherwise ring the doorbell(s) to restart queued transfers */
+ +		ring_doorbell_for_active_rings(xhci, slot_id, ep_index);
+ +	}
+ +
+ +	/*
+ +	 * Drop the lock and complete the URBs in the cancelled TD list.
+ +	 * New TDs to be cancelled might be added to the end of the list before
+ +	 * we can complete all the URBs for the TDs we already unlinked.
+ +	 * So stop when we've completed the URB for the last TD we unlinked.
+ +	 */
+ +	do {
+ +		cur_td = list_first_entry(&ep->cancelled_td_list,
+ +				struct xhci_td, cancelled_td_list);
+ +		list_del_init(&cur_td->cancelled_td_list);
+ +
+ +		/* Clean up the cancelled URB */
+ +		/* Doesn't matter what we pass for status, since the core will
+ +		 * just overwrite it (because the URB has been unlinked).
+ +		 */
+ +		ep_ring = xhci_urb_to_transfer_ring(xhci, cur_td->urb);
+ +		xhci_unmap_td_bounce_buffer(xhci, ep_ring, cur_td);
+ +		inc_td_cnt(cur_td->urb);
+ +		if (last_td_in_urb(cur_td))
+ +			xhci_giveback_urb_in_irq(xhci, cur_td, 0);
+ +
+ +		/* Stop processing the cancelled list if the watchdog timer is
+ +		 * running.
+ +		 */
+ +		if (xhci->xhc_state & XHCI_STATE_DYING)
+ +			return;
+ +	} while (cur_td != last_unlinked_td);
+ +
+ +	/* Return to the event handler with xhci->lock re-acquired */
+  }
+  
+  static void xhci_kill_ring_urbs(struct xhci_hcd *xhci, struct xhci_ring *ring)
+* Unmerged path drivers/usb/host/xhci-ring.c
