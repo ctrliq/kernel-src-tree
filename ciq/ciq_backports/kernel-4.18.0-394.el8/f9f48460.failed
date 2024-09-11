@@ -1,0 +1,127 @@
+RDMA/rxe: Enforce IBA o10-2.2.3
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit f9f484605779fbdc1dcbb820834ace80d8211cad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/f9f48460.failed
+
+Add code to check if a QP is attached to one or more multicast groups
+when destroy_qp is called and return an error if so.
+
+Link: https://lore.kernel.org/r/20220127213755.31697-5-rpearsonhpe@gmail.com
+	Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit f9f484605779fbdc1dcbb820834ace80d8211cad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_loc.h
+diff --cc drivers/infiniband/sw/rxe/rxe_loc.h
+index 9b2391b4090f,052beaaacf43..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_loc.h
++++ b/drivers/infiniband/sw/rxe/rxe_loc.h
+@@@ -115,22 -105,16 +114,21 @@@ int rxe_qp_from_init(struct rxe_dev *rx
+  		     struct ib_qp_init_attr *init,
+  		     struct rxe_create_qp_resp __user *uresp,
+  		     struct ib_pd *ibpd, struct ib_udata *udata);
+- 
+  int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init);
+- 
+  int rxe_qp_chk_attr(struct rxe_dev *rxe, struct rxe_qp *qp,
+  		    struct ib_qp_attr *attr, int mask);
+- 
+  int rxe_qp_from_attr(struct rxe_qp *qp, struct ib_qp_attr *attr,
+  		     int mask, struct ib_udata *udata);
+- 
+  int rxe_qp_to_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask);
+- 
+  void rxe_qp_error(struct rxe_qp *qp);
+- 
++ int rxe_qp_chk_destroy(struct rxe_qp *qp);
+  void rxe_qp_destroy(struct rxe_qp *qp);
+++<<<<<<< HEAD
+ +
+ +void rxe_qp_cleanup(struct rxe_pool_entry *arg);
+++=======
++ void rxe_qp_cleanup(struct rxe_pool_elem *elem);
+++>>>>>>> f9f484605779 (RDMA/rxe: Enforce IBA o10-2.2.3)
+  
+  static inline int qp_num(struct rxe_qp *qp)
+  {
+* Unmerged path drivers/infiniband/sw/rxe/rxe_loc.h
+diff --git a/drivers/infiniband/sw/rxe/rxe_mcast.c b/drivers/infiniband/sw/rxe/rxe_mcast.c
+index 5f1c72c1473c..a44a2c70137a 100644
+--- a/drivers/infiniband/sw/rxe/rxe_mcast.c
++++ b/drivers/infiniband/sw/rxe/rxe_mcast.c
+@@ -115,6 +115,7 @@ int rxe_mcast_add_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ 	grp->num_qp++;
+ 	elem->qp = qp;
+ 	elem->grp = grp;
++	atomic_inc(&qp->mcg_num);
+ 
+ 	list_add(&elem->qp_list, &grp->qp_list);
+ 	list_add(&elem->grp_list, &qp->grp_list);
+@@ -144,6 +145,7 @@ int rxe_mcast_drop_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ 			list_del(&elem->qp_list);
+ 			list_del(&elem->grp_list);
+ 			grp->num_qp--;
++			atomic_dec(&qp->mcg_num);
+ 
+ 			spin_unlock_bh(&grp->mcg_lock);
+ 			spin_unlock_bh(&qp->grp_lock);
+diff --git a/drivers/infiniband/sw/rxe/rxe_qp.c b/drivers/infiniband/sw/rxe/rxe_qp.c
+index cab1b2bbcdf3..a399d73a8b52 100644
+--- a/drivers/infiniband/sw/rxe/rxe_qp.c
++++ b/drivers/infiniband/sw/rxe/rxe_qp.c
+@@ -777,6 +777,20 @@ int rxe_qp_to_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask)
+ 	return 0;
+ }
+ 
++int rxe_qp_chk_destroy(struct rxe_qp *qp)
++{
++	/* See IBA o10-2.2.3
++	 * An attempt to destroy a QP while attached to a mcast group
++	 * will fail immediately.
++	 */
++	if (atomic_read(&qp->mcg_num)) {
++		pr_debug("Attempt to destroy QP while attached to multicast group\n");
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
+ /* called by the destroy qp verb */
+ void rxe_qp_destroy(struct rxe_qp *qp)
+ {
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index e2250e9584ce..7b1973184d14 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -512,6 +512,11 @@ static int rxe_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ static int rxe_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
+ {
+ 	struct rxe_qp *qp = to_rqp(ibqp);
++	int ret;
++
++	ret = rxe_qp_chk_destroy(qp);
++	if (ret)
++		return ret;
+ 
+ 	rxe_qp_destroy(qp);
+ 	rxe_drop_index(qp);
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
+index 2fd73c878e17..9fa6be1de156 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@ -235,6 +235,7 @@ struct rxe_qp {
+ 	/* list of mcast groups qp has joined (for cleanup) */
+ 	struct list_head	grp_list;
+ 	spinlock_t		grp_lock; /* guard grp_list */
++	atomic_t		mcg_num;
+ 
+ 	struct sk_buff_head	req_pkts;
+ 	struct sk_buff_head	resp_pkts;
