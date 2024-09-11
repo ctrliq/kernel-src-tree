@@ -1,0 +1,223 @@
+Bluetooth: hci_qca: Don't vote for specific voltage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bjorn Andersson <bjorn.andersson@linaro.org>
+commit f2edd66e515b9944a7e516510a54959e5004181b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f2edd66e.failed
+
+Devices with specific voltage requirements should not request voltage
+from the driver, but instead rely on the system configuration to define
+appropriate voltages for each rail.
+
+This ensures that PMIC and board variations are accounted for, something
+that the 0.1V range in the hci_qca driver currently tries to address.
+But on the Lenovo Yoga C630 (with wcn3990) vddch0 is 3.1V, which means
+the driver will fail to set the voltage.
+
+	Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit f2edd66e515b9944a7e516510a54959e5004181b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+diff --cc drivers/bluetooth/hci_qca.c
+index c7723b08787d,0a397cd7280e..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -119,6 -119,36 +119,39 @@@ struct qca_data 
+  	u64 votes_off;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum qca_speed_type {
++ 	QCA_INIT_SPEED = 1,
++ 	QCA_OPER_SPEED
++ };
++ 
++ /*
++  * Voltage regulator information required for configuring the
++  * QCA Bluetooth chipset
++  */
++ struct qca_vreg {
++ 	const char *name;
++ 	unsigned int load_uA;
++ };
++ 
++ struct qca_vreg_data {
++ 	enum qca_btsoc_type soc_type;
++ 	struct qca_vreg *vregs;
++ 	size_t num_vregs;
++ };
++ 
++ /*
++  * Platform data for the QCA Bluetooth power driver.
++  */
++ struct qca_power {
++ 	struct device *dev;
++ 	const struct qca_vreg_data *vreg_data;
++ 	struct regulator_bulk_data *vreg_bulk;
++ 	bool vregs_on;
++ };
++ 
+++>>>>>>> f2edd66e515b (Bluetooth: hci_qca: Don't vote for specific voltage)
+  struct qca_serdev {
+  	struct hci_uart	 serdev_hu;
+  	struct gpio_desc *bt_en;
+@@@ -988,6 -1329,148 +1021,151 @@@ static const struct hci_uart_proto qca_
+  	.dequeue	= qca_dequeue,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct qca_vreg_data qca_soc_data_wcn3990 = {
++ 	.soc_type = QCA_WCN3990,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 15000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static const struct qca_vreg_data qca_soc_data_wcn3998 = {
++ 	.soc_type = QCA_WCN3998,
++ 	.vregs = (struct qca_vreg []) {
++ 		{ "vddio", 10000  },
++ 		{ "vddxo", 80000  },
++ 		{ "vddrf", 300000 },
++ 		{ "vddch0", 450000 },
++ 	},
++ 	.num_vregs = 4,
++ };
++ 
++ static void qca_power_shutdown(struct hci_uart *hu)
++ {
++ 	struct qca_data *qca = hu->priv;
++ 	unsigned long flags;
++ 
++ 	/* From this point we go into power off state. But serial port is
++ 	 * still open, stop queueing the IBS data and flush all the buffered
++ 	 * data in skb's.
++ 	 */
++ 	spin_lock_irqsave(&qca->hci_ibs_lock, flags);
++ 	clear_bit(QCA_IBS_ENABLED, &qca->flags);
++ 	qca_flush(hu);
++ 	spin_unlock_irqrestore(&qca->hci_ibs_lock, flags);
++ 
++ 	host_set_baudrate(hu, 2400);
++ 	qca_send_power_pulse(hu, false);
++ 	qca_power_setup(hu, false);
++ }
++ 
++ static int qca_power_off(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 
++ 	/* Perform pre shutdown command */
++ 	qca_send_pre_shutdown_cmd(hdev);
++ 
++ 	usleep_range(8000, 10000);
++ 
++ 	qca_power_shutdown(hu);
++ 	return 0;
++ }
++ 
++ static int qca_enable_regulator(struct qca_vreg vregs,
++ 				struct regulator *regulator)
++ {
++ 	return regulator_enable(regulator);
++ 
++ }
++ 
++ static void qca_disable_regulator(struct qca_vreg vregs,
++ 				  struct regulator *regulator)
++ {
++ 	regulator_disable(regulator);
++ 
++ }
++ 
++ static int qca_power_setup(struct hci_uart *hu, bool on)
++ {
++ 	struct qca_vreg *vregs;
++ 	struct regulator_bulk_data *vreg_bulk;
++ 	struct qca_serdev *qcadev;
++ 	int i, num_vregs, ret = 0;
++ 
++ 	qcadev = serdev_device_get_drvdata(hu->serdev);
++ 	if (!qcadev || !qcadev->bt_power || !qcadev->bt_power->vreg_data ||
++ 	    !qcadev->bt_power->vreg_bulk)
++ 		return -EINVAL;
++ 
++ 	vregs = qcadev->bt_power->vreg_data->vregs;
++ 	vreg_bulk = qcadev->bt_power->vreg_bulk;
++ 	num_vregs = qcadev->bt_power->vreg_data->num_vregs;
++ 	BT_DBG("on: %d", on);
++ 	if (on && !qcadev->bt_power->vregs_on) {
++ 		for (i = 0; i < num_vregs; i++) {
++ 			ret = qca_enable_regulator(vregs[i],
++ 						   vreg_bulk[i].consumer);
++ 			if (ret)
++ 				break;
++ 		}
++ 
++ 		if (ret) {
++ 			BT_ERR("failed to enable regulator:%s", vregs[i].name);
++ 			/* turn off regulators which are enabled */
++ 			for (i = i - 1; i >= 0; i--)
++ 				qca_disable_regulator(vregs[i],
++ 						      vreg_bulk[i].consumer);
++ 		} else {
++ 			qcadev->bt_power->vregs_on = true;
++ 		}
++ 	} else if (!on && qcadev->bt_power->vregs_on) {
++ 		/* turn off regulator in reverse order */
++ 		i = qcadev->bt_power->vreg_data->num_vregs - 1;
++ 		for ( ; i >= 0; i--)
++ 			qca_disable_regulator(vregs[i], vreg_bulk[i].consumer);
++ 
++ 		qcadev->bt_power->vregs_on = false;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int qca_init_regulators(struct qca_power *qca,
++ 				const struct qca_vreg *vregs, size_t num_vregs)
++ {
++ 	struct regulator_bulk_data *bulk;
++ 	int ret;
++ 	int i;
++ 
++ 	bulk = devm_kcalloc(qca->dev, num_vregs, sizeof(*bulk), GFP_KERNEL);
++ 	if (!bulk)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < num_vregs; i++)
++ 		bulk[i].supply = vregs[i].name;
++ 
++ 	ret = devm_regulator_bulk_get(qca->dev, num_vregs, bulk);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	for (i = 0; i < num_vregs; i++) {
++ 		ret = regulator_set_load(bulk[i].consumer, vregs[i].load_uA);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	qca->vreg_bulk = bulk;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f2edd66e515b (Bluetooth: hci_qca: Don't vote for specific voltage)
+  static int qca_serdev_probe(struct serdev_device *serdev)
+  {
+  	struct qca_serdev *qcadev;
+* Unmerged path drivers/bluetooth/hci_qca.c
