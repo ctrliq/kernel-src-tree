@@ -1,0 +1,221 @@
+arm64: entry: convert el0_sync to C
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 582f95835a8fc812cd38dce0447fe9386b78913e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/582f9583.failed
+
+This is largely a 1-1 conversion of asm to C, with a couple of caveats.
+
+The el0_sync{_compat} switches explicitly handle all the EL0 debug
+cases, so el0_dbg doesn't have to try to bail out for unexpected EL1
+debug ESR values. This also means that an unexpected vector catch from
+AArch32 is routed to el0_inv.
+
+We *could* merge the native and compat switches, which would make the
+diffstat negative, but I've tried to stay as close to the existing
+assembly as possible for the moment.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+[split out of a bigger series, added nokprobes. removed irq trace
+ calls as the C helpers do this. renamed el0_dbg's use of FAR]
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Julien Thierry <julien.thierry.kdev@gmail.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 582f95835a8fc812cd38dce0447fe9386b78913e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/asm-uaccess.h
+#	arch/arm64/kernel/entry-common.c
+#	arch/arm64/kernel/entry.S
+diff --cc arch/arm64/include/asm/asm-uaccess.h
+index c764cc8fb3b6,a70575edae8e..000000000000
+--- a/arch/arm64/include/asm/asm-uaccess.h
++++ b/arch/arm64/include/asm/asm-uaccess.h
+@@@ -59,11 -59,19 +59,29 @@@ alternative_else_nop_endi
+  #endif
+  
+  /*
+++<<<<<<< HEAD
+ + * Remove the address tag from a virtual address, if present.
+ + */
+ +	.macro	untagged_addr, dst, addr
+ +	sbfx	\dst, \addr, #0, #56
+ +	and	\dst, \dst, \addr
+ +	.endm
+ +
+++=======
++  * These macros are no-ops when UAO is present.
++  */
++ 	.macro	uaccess_disable_not_uao, tmp1, tmp2
++ 	uaccess_ttbr0_disable \tmp1, \tmp2
++ alternative_if ARM64_ALT_PAN_NOT_UAO
++ 	SET_PSTATE_PAN(1)
++ alternative_else_nop_endif
++ 	.endm
++ 
++ 	.macro	uaccess_enable_not_uao, tmp1, tmp2, tmp3
++ 	uaccess_ttbr0_enable \tmp1, \tmp2, \tmp3
++ alternative_if ARM64_ALT_PAN_NOT_UAO
++ 	SET_PSTATE_PAN(0)
++ alternative_else_nop_endif
++ 	.endm
+++>>>>>>> 582f95835a8f (arm64: entry: convert el0_sync to C)
+  #endif
+diff --cc arch/arm64/kernel/entry.S
+index 72d2069e52b9,15822a0fe37f..000000000000
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@@ -807,140 -668,8 +754,132 @@@ el0_irq_compat
+  el0_error_compat:
+  	kernel_entry 0, 32
+  	b	el0_error_naked
+- 
+- el0_cp15:
+- 	/*
+- 	 * Trapped CP15 (MRC, MCR, MRRC, MCRR) instructions
+- 	 */
+- 	ct_user_exit_irqoff
+- 	enable_daif
+- 	mov	x0, x25
+- 	mov	x1, sp
+- 	bl	do_cp15instr
+- 	b	ret_to_user
+  #endif
+  
+++<<<<<<< HEAD
+ +el0_da:
+ +	/*
+ +	 * Data abort handling
+ +	 */
+ +	mrs	x26, far_el1
+ +	ct_user_exit_irqoff
+ +	enable_daif
+ +	untagged_addr	x0, x26
+ +	mov	x1, x25
+ +	mov	x2, sp
+ +	bl	do_mem_abort
+ +	b	ret_to_user
+ +el0_ia:
+ +	/*
+ +	 * Instruction abort handling
+ +	 */
+ +	mrs	x26, far_el1
+ +	gic_prio_kentry_setup tmp=x0
+ +	ct_user_exit_irqoff
+ +	enable_da_f
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +	bl	trace_hardirqs_off
+ +#endif
+ +	mov	x0, x26
+ +	mov	x1, x25
+ +	mov	x2, sp
+ +	bl	do_el0_ia_bp_hardening
+ +	b	ret_to_user
+ +el0_fpsimd_acc:
+ +	/*
+ +	 * Floating Point or Advanced SIMD access
+ +	 */
+ +	ct_user_exit_irqoff
+ +	enable_daif
+ +	mov	x0, x25
+ +	mov	x1, sp
+ +	bl	do_fpsimd_acc
+ +	b	ret_to_user
+ +el0_sve_acc:
+ +	/*
+ +	 * Scalable Vector Extension access
+ +	 */
+ +	ct_user_exit_irqoff
+ +	enable_daif
+ +	mov	x0, x25
+ +	mov	x1, sp
+ +	bl	do_sve_acc
+ +	b	ret_to_user
+ +el0_fpsimd_exc:
+ +	/*
+ +	 * Floating Point, Advanced SIMD or SVE exception
+ +	 */
+ +	ct_user_exit_irqoff
+ +	enable_daif
+ +	mov	x0, x25
+ +	mov	x1, sp
+ +	bl	do_fpsimd_exc
+ +	b	ret_to_user
+ +el0_sp:
+ +	ldr	x26, [sp, #S_SP]
+ +	b	el0_sp_pc
+ +el0_pc:
+ +	mrs	x26, far_el1
+ +el0_sp_pc:
+ +	/*
+ +	 * Stack or PC alignment exception handling
+ +	 */
+ +	gic_prio_kentry_setup tmp=x0
+ +	ct_user_exit_irqoff
+ +	enable_da_f
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +	bl	trace_hardirqs_off
+ +#endif
+ +	mov	x0, x26
+ +	mov	x1, x25
+ +	mov	x2, sp
+ +	bl	do_sp_pc_abort
+ +	b	ret_to_user
+ +el0_undef:
+ +	/*
+ +	 * Undefined instruction
+ +	 */
+ +	ct_user_exit_irqoff
+ +	enable_daif
+ +	mov	x0, sp
+ +	bl	do_undefinstr
+ +	b	ret_to_user
+ +el0_sys:
+ +	/*
+ +	 * System instructions, for trapped cache maintenance instructions
+ +	 */
+ +	ct_user_exit_irqoff
+ +	enable_daif
+ +	mov	x0, x25
+ +	mov	x1, sp
+ +	bl	do_sysinstr
+ +	b	ret_to_user
+ +el0_dbg:
+ +	/*
+ +	 * Debug exception handling
+ +	 */
+ +	tbnz	x24, #0, el0_inv		// EL0 only
+ +	mrs	x24, far_el1
+ +	gic_prio_kentry_setup tmp=x3
+ +	ct_user_exit_irqoff
+ +	mov	x0, x24
+ +	mov	x1, x25
+ +	mov	x2, sp
+ +	bl	do_debug_exception
+ +	enable_da_f
+ +	b	ret_to_user
+ +el0_inv:
+ +	ct_user_exit_irqoff
+ +	enable_daif
+ +	mov	x0, sp
+ +	mov	x1, #BAD_SYNC
+ +	mov	x2, x25
+ +	bl	bad_el0_sync
+ +	b	ret_to_user
+ +ENDPROC(el0_sync)
+ +
+++=======
+++>>>>>>> 582f95835a8f (arm64: entry: convert el0_sync to C)
+  	.align	6
+  el0_irq:
+  	kernel_entry 0
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/include/asm/asm-uaccess.h
+* Unmerged path arch/arm64/kernel/entry-common.c
+* Unmerged path arch/arm64/kernel/entry.S
