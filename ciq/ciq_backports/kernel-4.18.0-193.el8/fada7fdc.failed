@@ -1,0 +1,173 @@
+bpf: Allow bpf_map_lookup_elem() on an xskmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jonathan Lemon <jonathan.lemon@gmail.com>
+commit fada7fdc83c0bf8755956bff707c42b609223301
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/fada7fdc.failed
+
+Currently, the AF_XDP code uses a separate map in order to
+determine if an xsk is bound to a queue.  Instead of doing this,
+have bpf_map_lookup_elem() return a xdp_sock.
+
+Rearrange some xdp_sock members to eliminate structure holes.
+
+Remove selftest - will be added back in later patch.
+
+	Signed-off-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit fada7fdc83c0bf8755956bff707c42b609223301)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/verifier.c
+#	tools/testing/selftests/bpf/verifier/prevent_map_lookup.c
+diff --cc include/linux/bpf.h
+index 987bb6c2e407,1fe137afa898..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -270,6 -279,8 +270,11 @@@ enum bpf_reg_type 
+  	PTR_TO_SOCK_COMMON_OR_NULL, /* reg points to sock_common or NULL */
+  	PTR_TO_TCP_SOCK,	 /* reg points to struct tcp_sock */
+  	PTR_TO_TCP_SOCK_OR_NULL, /* reg points to struct tcp_sock or NULL */
+++<<<<<<< HEAD
+++=======
++ 	PTR_TO_TP_BUFFER,	 /* reg points to a writable raw tp's buffer */
++ 	PTR_TO_XDP_SOCK,	 /* reg points to struct xdp_sock */
+++>>>>>>> fada7fdc83c0 (bpf: Allow bpf_map_lookup_elem() on an xskmap)
+  };
+  
+  /* The information passed from prog-specific *_is_valid_access
+diff --cc kernel/bpf/verifier.c
+index 94cc6169c9d2,8d1786357a09..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -396,6 -406,8 +397,11 @@@ static const char * const reg_type_str[
+  	[PTR_TO_SOCK_COMMON_OR_NULL] = "sock_common_or_null",
+  	[PTR_TO_TCP_SOCK]	= "tcp_sock",
+  	[PTR_TO_TCP_SOCK_OR_NULL] = "tcp_sock_or_null",
+++<<<<<<< HEAD
+++=======
++ 	[PTR_TO_TP_BUFFER]	= "tp_buffer",
++ 	[PTR_TO_XDP_SOCK]	= "xdp_sock",
+++>>>>>>> fada7fdc83c0 (bpf: Allow bpf_map_lookup_elem() on an xskmap)
+  };
+  
+  static char slot_type_char[] = {
+* Unmerged path tools/testing/selftests/bpf/verifier/prevent_map_lookup.c
+* Unmerged path include/linux/bpf.h
+diff --git a/include/net/xdp_sock.h b/include/net/xdp_sock.h
+index 675f2c5814ca..7b355fbabbb3 100644
+--- a/include/net/xdp_sock.h
++++ b/include/net/xdp_sock.h
+@@ -58,11 +58,11 @@ struct xdp_sock {
+ 	struct xdp_umem *umem;
+ 	struct list_head flush_node;
+ 	u16 queue_id;
+-	struct xsk_queue *tx ____cacheline_aligned_in_smp;
+-	struct list_head list;
+ 	bool zc;
+ 	/* Protects multiple processes in the control path */
+ 	struct mutex mutex;
++	struct xsk_queue *tx ____cacheline_aligned_in_smp;
++	struct list_head list;
+ 	/* Mutual exclusion of NAPI TX thread and sendmsg error paths
+ 	 * in the SKB destructor callback.
+ 	 */
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index d421ae5c0fec..a590d66452a8 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -2837,6 +2837,10 @@ struct bpf_sock_tuple {
+ 	};
+ };
+ 
++struct bpf_xdp_sock {
++	__u32 queue_id;
++};
++
+ #define XDP_PACKET_HEADROOM 256
+ 
+ /* User return codes for XDP prog type.
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/kernel/bpf/xskmap.c b/kernel/bpf/xskmap.c
+index 22bd4dd1aadc..9e8b9d4f85f9 100644
+--- a/kernel/bpf/xskmap.c
++++ b/kernel/bpf/xskmap.c
+@@ -153,6 +153,12 @@ void __xsk_map_flush(struct bpf_map *map)
+ }
+ 
+ static void *xsk_map_lookup_elem(struct bpf_map *map, void *key)
++{
++	WARN_ON_ONCE(!rcu_read_lock_held());
++	return __xsk_map_lookup_elem(map, *(u32 *)key);
++}
++
++static void *xsk_map_lookup_elem_sys_only(struct bpf_map *map, void *key)
+ {
+ 	return ERR_PTR(-EOPNOTSUPP);
+ }
+@@ -220,6 +226,7 @@ const struct bpf_map_ops xsk_map_ops = {
+ 	.map_free = xsk_map_free,
+ 	.map_get_next_key = xsk_map_get_next_key,
+ 	.map_lookup_elem = xsk_map_lookup_elem,
++	.map_lookup_elem_sys_only = xsk_map_lookup_elem_sys_only,
+ 	.map_update_elem = xsk_map_update_elem,
+ 	.map_delete_elem = xsk_map_delete_elem,
+ 	.map_check_btf = map_check_no_btf,
+diff --git a/net/core/filter.c b/net/core/filter.c
+index ee9df4cecb0d..ca41c7c0ebb0 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -5568,6 +5568,46 @@ BPF_CALL_1(bpf_skb_ecn_set_ce, struct sk_buff *, skb)
+ 	return INET_ECN_set_ce(skb);
+ }
+ 
++bool bpf_xdp_sock_is_valid_access(int off, int size, enum bpf_access_type type,
++				  struct bpf_insn_access_aux *info)
++{
++	if (off < 0 || off >= offsetofend(struct bpf_xdp_sock, queue_id))
++		return false;
++
++	if (off % size != 0)
++		return false;
++
++	switch (off) {
++	default:
++		return size == sizeof(__u32);
++	}
++}
++
++u32 bpf_xdp_sock_convert_ctx_access(enum bpf_access_type type,
++				    const struct bpf_insn *si,
++				    struct bpf_insn *insn_buf,
++				    struct bpf_prog *prog, u32 *target_size)
++{
++	struct bpf_insn *insn = insn_buf;
++
++#define BPF_XDP_SOCK_GET(FIELD)						\
++	do {								\
++		BUILD_BUG_ON(FIELD_SIZEOF(struct xdp_sock, FIELD) >	\
++			     FIELD_SIZEOF(struct bpf_xdp_sock, FIELD));	\
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_sock, FIELD),\
++				      si->dst_reg, si->src_reg,		\
++				      offsetof(struct xdp_sock, FIELD)); \
++	} while (0)
++
++	switch (si->off) {
++	case offsetof(struct bpf_xdp_sock, queue_id):
++		BPF_XDP_SOCK_GET(queue_id);
++		break;
++	}
++
++	return insn - insn_buf;
++}
++
+ static const struct bpf_func_proto bpf_skb_ecn_set_ce_proto = {
+ 	.func           = bpf_skb_ecn_set_ce,
+ 	.gpl_only       = false,
+* Unmerged path tools/testing/selftests/bpf/verifier/prevent_map_lookup.c
