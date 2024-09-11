@@ -323,15 +323,18 @@ int nfp_flower_compile_flow_match(struct nfp_app *app,
 				  struct nfp_fl_key_ls *key_ls,
 				  struct net_device *netdev,
 				  struct nfp_fl_payload *nfp_flow,
-				  enum nfp_flower_tun_type tun_type);
+				  enum nfp_flower_tun_type tun_type,
+				  struct netlink_ext_ack *extack);
 int nfp_flower_compile_action(struct nfp_app *app,
 			      struct tc_cls_flower_offload *flow,
 			      struct net_device *netdev,
-			      struct nfp_fl_payload *nfp_flow);
+			      struct nfp_fl_payload *nfp_flow,
+			      struct netlink_ext_ack *extack);
 int nfp_compile_flow_metadata(struct nfp_app *app,
 			      struct tc_cls_flower_offload *flow,
 			      struct nfp_fl_payload *nfp_flow,
-			      struct net_device *netdev);
+			      struct net_device *netdev,
+			      struct netlink_ext_ack *extack);
 void __nfp_modify_flow_metadata(struct nfp_flower_priv *priv,
 				struct nfp_fl_payload *nfp_flow);
 int nfp_modify_flow_metadata(struct nfp_app *app,
@@ -365,7 +368,8 @@ int nfp_flower_lag_netdev_event(struct nfp_flower_priv *priv,
 bool nfp_flower_lag_unprocessed_msg(struct nfp_app *app, struct sk_buff *skb);
 int nfp_flower_lag_populate_pre_action(struct nfp_app *app,
 				       struct net_device *master,
-				       struct nfp_fl_pre_lag *pre_act);
+				       struct nfp_fl_pre_lag *pre_act,
+				       struct netlink_ext_ack *extack);
 int nfp_flower_lag_get_output_id(struct nfp_app *app,
 				 struct net_device *master);
 int nfp_flower_reg_indir_block_handler(struct nfp_app *app,
