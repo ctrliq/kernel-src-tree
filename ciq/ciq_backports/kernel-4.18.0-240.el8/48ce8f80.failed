@@ -1,0 +1,153 @@
+arm64: irqflags: Introduce explicit debugging for IRQ priorities
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Julien Thierry <julien.thierry@arm.com>
+commit 48ce8f80f5901f1f031b00be66d659d39f33b0a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/48ce8f80.failed
+
+Using IRQ priority masking to enable/disable interrupts is a bit
+sensitive as it requires to deal with both ICC_PMR_EL1 and PSR.I.
+
+Introduce some validity checks to both highlight the states in which
+functions dealing with IRQ enabling/disabling can (not) be called, and
+bark a warning when called in an unexpected state.
+
+Since these checks are done on hotpaths, introduce a build option to
+choose whether to do the checking.
+
+	Cc: Will Deacon <will.deacon@arm.com>
+	Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+	Signed-off-by: Julien Thierry <julien.thierry@arm.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 48ce8f80f5901f1f031b00be66d659d39f33b0a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/Kconfig
+#	arch/arm64/include/asm/cpufeature.h
+diff --cc arch/arm64/Kconfig
+index df530ef3b952,bd3915ae7b53..000000000000
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@@ -1398,6 -1421,32 +1398,35 @@@ config ARM64_MODULE_PLT
+  	bool
+  	select HAVE_MOD_ARCH_SPECIFIC
+  
+++<<<<<<< HEAD
+++=======
++ config ARM64_PSEUDO_NMI
++ 	bool "Support for NMI-like interrupts"
++ 	depends on BROKEN # 1556553607-46531-1-git-send-email-julien.thierry@arm.com
++ 	select CONFIG_ARM_GIC_V3
++ 	help
++ 	  Adds support for mimicking Non-Maskable Interrupts through the use of
++ 	  GIC interrupt priority. This support requires version 3 or later of
++ 	  ARM GIC.
++ 
++ 	  This high priority configuration for interrupts needs to be
++ 	  explicitly enabled by setting the kernel parameter
++ 	  "irqchip.gicv3_pseudo_nmi" to 1.
++ 
++ 	  If unsure, say N
++ 
++ if ARM64_PSEUDO_NMI
++ config ARM64_DEBUG_PRIORITY_MASKING
++ 	bool "Debug interrupt priority masking"
++ 	help
++ 	  This adds runtime checks to functions enabling/disabling
++ 	  interrupts when using priority masking. The additional checks verify
++ 	  the validity of ICC_PMR_EL1 when calling concerned functions.
++ 
++ 	  If unsure, say N
++ endif
++ 
+++>>>>>>> 48ce8f80f590 (arm64: irqflags: Introduce explicit debugging for IRQ priorities)
+  config RELOCATABLE
+  	bool
+  	help
+diff --cc arch/arm64/include/asm/cpufeature.h
+index f80474c17899,693a086e2148..000000000000
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@@ -622,6 -611,18 +622,21 @@@ static inline bool system_supports_gene
+  		 cpus_have_const_cap(ARM64_HAS_GENERIC_AUTH_IMP_DEF));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool system_uses_irq_prio_masking(void)
++ {
++ 	return IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) &&
++ 	       cpus_have_const_cap(ARM64_HAS_IRQ_PRIO_MASKING);
++ }
++ 
++ static inline bool system_has_prio_mask_debugging(void)
++ {
++ 	return IS_ENABLED(CONFIG_ARM64_DEBUG_PRIORITY_MASKING) &&
++ 	       system_uses_irq_prio_masking();
++ }
++ 
+++>>>>>>> 48ce8f80f590 (arm64: irqflags: Introduce explicit debugging for IRQ priorities)
+  #define ARM64_SSBD_UNKNOWN		-1
+  #define ARM64_SSBD_FORCE_DISABLE	0
+  #define ARM64_SSBD_KERNEL		1
+* Unmerged path arch/arm64/Kconfig
+* Unmerged path arch/arm64/include/asm/cpufeature.h
+diff --git a/arch/arm64/include/asm/daifflags.h b/arch/arm64/include/asm/daifflags.h
+index db452aa9e651..aafff0c6542a 100644
+--- a/arch/arm64/include/asm/daifflags.h
++++ b/arch/arm64/include/asm/daifflags.h
+@@ -27,6 +27,10 @@
+ /* mask/save/unmask/restore all exceptions, including interrupts. */
+ static inline void local_daif_mask(void)
+ {
++	WARN_ON(system_has_prio_mask_debugging() &&
++		(read_sysreg_s(SYS_ICC_PMR_EL1) == (GIC_PRIO_IRQOFF |
++						    GIC_PRIO_PSR_I_SET)));
++
+ 	asm volatile(
+ 		"msr	daifset, #0xf		// local_daif_mask\n"
+ 		:
+@@ -56,6 +60,9 @@ static inline void local_daif_restore(unsigned long flags)
+ {
+ 	bool irq_disabled = flags & PSR_I_BIT;
+ 
++	WARN_ON(system_has_prio_mask_debugging() &&
++		!(read_sysreg(daif) & PSR_I_BIT));
++
+ 	if (!irq_disabled) {
+ 		trace_hardirqs_on();
+ 
+diff --git a/arch/arm64/include/asm/irqflags.h b/arch/arm64/include/asm/irqflags.h
+index a8de82f177b1..1eeffc73a880 100644
+--- a/arch/arm64/include/asm/irqflags.h
++++ b/arch/arm64/include/asm/irqflags.h
+@@ -40,6 +40,12 @@
+  */
+ static inline void arch_local_irq_enable(void)
+ {
++	if (system_has_prio_mask_debugging()) {
++		u32 pmr = read_sysreg_s(SYS_ICC_PMR_EL1);
++
++		WARN_ON_ONCE(pmr != GIC_PRIO_IRQON && pmr != GIC_PRIO_IRQOFF);
++	}
++
+ 	asm volatile(ALTERNATIVE(
+ 		"msr	daifclr, #2		// arch_local_irq_enable\n"
+ 		"nop",
+@@ -53,6 +59,12 @@ static inline void arch_local_irq_enable(void)
+ 
+ static inline void arch_local_irq_disable(void)
+ {
++	if (system_has_prio_mask_debugging()) {
++		u32 pmr = read_sysreg_s(SYS_ICC_PMR_EL1);
++
++		WARN_ON_ONCE(pmr != GIC_PRIO_IRQON && pmr != GIC_PRIO_IRQOFF);
++	}
++
+ 	asm volatile(ALTERNATIVE(
+ 		"msr	daifset, #2		// arch_local_irq_disable",
+ 		"msr_s  " __stringify(SYS_ICC_PMR_EL1) ", %0",
