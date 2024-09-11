@@ -1,0 +1,109 @@
+bpf: offload: allow program and map sharing per-ASIC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit fd4f227dea0f24d89f52f7c4eb3207f84ddcbcbd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/fd4f227d.failed
+
+Allow programs and maps to be re-used across different netdevs,
+as long as they belong to the same struct bpf_offload_dev.
+Update the bpf_offload_prog_map_match() helper for the verifier
+and export a new helper for the drivers to use when checking
+programs at attachment time.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit fd4f227dea0f24d89f52f7c4eb3207f84ddcbcbd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index 99f88355177e,5b5ad95cf339..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -650,6 -651,14 +650,17 @@@ int bpf_map_offload_get_next_key(struc
+  
+  bool bpf_offload_prog_map_match(struct bpf_prog *prog, struct bpf_map *map);
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_offload_dev *bpf_offload_dev_create(void);
++ void bpf_offload_dev_destroy(struct bpf_offload_dev *offdev);
++ int bpf_offload_dev_netdev_register(struct bpf_offload_dev *offdev,
++ 				    struct net_device *netdev);
++ void bpf_offload_dev_netdev_unregister(struct bpf_offload_dev *offdev,
++ 				       struct net_device *netdev);
++ bool bpf_offload_dev_match(struct bpf_prog *prog, struct net_device *netdev);
++ 
+++>>>>>>> fd4f227dea0f (bpf: offload: allow program and map sharing per-ASIC)
+  #if defined(CONFIG_NET) && defined(CONFIG_BPF_SYSCALL)
+  int bpf_prog_offload_init(struct bpf_prog *prog, union bpf_attr *attr);
+  
+* Unmerged path include/linux/bpf.h
+diff --git a/kernel/bpf/offload.c b/kernel/bpf/offload.c
+index 6184e48703f4..7bec09555336 100644
+--- a/kernel/bpf/offload.c
++++ b/kernel/bpf/offload.c
+@@ -468,22 +468,50 @@ int bpf_map_offload_info_fill(struct bpf_map_info *info, struct bpf_map *map)
+ 	return 0;
+ }
+ 
+-bool bpf_offload_prog_map_match(struct bpf_prog *prog, struct bpf_map *map)
++static bool __bpf_offload_dev_match(struct bpf_prog *prog,
++				    struct net_device *netdev)
+ {
+-	struct bpf_offloaded_map *offmap;
++	struct bpf_offload_netdev *ondev1, *ondev2;
+ 	struct bpf_prog_offload *offload;
+-	bool ret;
+ 
+ 	if (!bpf_prog_is_dev_bound(prog->aux))
+ 		return false;
+-	if (!bpf_map_is_dev_bound(map))
+-		return bpf_map_offload_neutral(map);
+ 
+-	down_read(&bpf_devs_lock);
+ 	offload = prog->aux->offload;
++	if (!offload)
++		return false;
++	if (offload->netdev == netdev)
++		return true;
++
++	ondev1 = bpf_offload_find_netdev(offload->netdev);
++	ondev2 = bpf_offload_find_netdev(netdev);
++
++	return ondev1 && ondev2 && ondev1->offdev == ondev2->offdev;
++}
++
++bool bpf_offload_dev_match(struct bpf_prog *prog, struct net_device *netdev)
++{
++	bool ret;
++
++	down_read(&bpf_devs_lock);
++	ret = __bpf_offload_dev_match(prog, netdev);
++	up_read(&bpf_devs_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(bpf_offload_dev_match);
++
++bool bpf_offload_prog_map_match(struct bpf_prog *prog, struct bpf_map *map)
++{
++	struct bpf_offloaded_map *offmap;
++	bool ret;
++
++	if (!bpf_map_is_dev_bound(map))
++		return bpf_map_offload_neutral(map);
+ 	offmap = map_to_offmap(map);
+ 
+-	ret = offload && offload->netdev == offmap->netdev;
++	down_read(&bpf_devs_lock);
++	ret = __bpf_offload_dev_match(prog, offmap->netdev);
+ 	up_read(&bpf_devs_lock);
+ 
+ 	return ret;
