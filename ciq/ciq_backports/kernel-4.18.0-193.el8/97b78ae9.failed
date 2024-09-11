@@ -1,0 +1,110 @@
+SUNRPC: Ensure we respect the RPCSEC_GSS sequence number limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trondmy@gmail.com>
+commit 97b78ae96ba76f4ca2d8f5afee6a2e567ccb8f45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/97b78ae9.failed
+
+According to RFC2203, the RPCSEC_GSS sequence numbers are bounded to
+an upper limit of MAXSEQ = 0x80000000. Ensure that we handle that
+correctly.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 97b78ae96ba76f4ca2d8f5afee6a2e567ccb8f45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/clnt.c
+diff --cc net/sunrpc/clnt.c
+index ad758528f586,d7ec6132c046..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -1761,7 -1751,42 +1758,46 @@@ rpc_xdr_encode(struct rpc_task *task
+  	task->tk_status = rpcauth_wrap_req(task, encode, req, p,
+  			task->tk_msg.rpc_argp);
+  	if (task->tk_status == 0)
+++<<<<<<< HEAD
+ +		set_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+++=======
++ 		xprt_request_prepare(req);
++ }
++ 
++ /*
++  * 3.	Encode arguments of an RPC call
++  */
++ static void
++ call_encode(struct rpc_task *task)
++ {
++ 	if (!rpc_task_need_encode(task))
++ 		goto out;
++ 	/* Encode here so that rpcsec_gss can use correct sequence number. */
++ 	rpc_xdr_encode(task);
++ 	/* Did the encode result in an error condition? */
++ 	if (task->tk_status != 0) {
++ 		/* Was the error nonfatal? */
++ 		switch (task->tk_status) {
++ 		case -EAGAIN:
++ 		case -ENOMEM:
++ 			rpc_delay(task, HZ >> 4);
++ 			break;
++ 		case -EKEYEXPIRED:
++ 			task->tk_action = call_refresh;
++ 			break;
++ 		default:
++ 			rpc_exit(task, task->tk_status);
++ 		}
++ 		return;
++ 	}
++ 
++ 	/* Add task to reply queue before transmission to avoid races */
++ 	if (rpc_reply_expected(task))
++ 		xprt_request_enqueue_receive(task);
++ 	xprt_request_enqueue_transmit(task);
++ out:
++ 	task->tk_action = call_bind;
+++>>>>>>> 97b78ae96ba7 (SUNRPC: Ensure we respect the RPCSEC_GSS sequence number limit)
+  }
+  
+  /*
+diff --git a/net/sunrpc/auth_gss/auth_gss.c b/net/sunrpc/auth_gss/auth_gss.c
+index c0333d2bd01c..e6cdc37888f2 100644
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@ -1549,8 +1549,10 @@ gss_marshal(struct rpc_task *task, __be32 *p)
+ 	cred_len = p++;
+ 
+ 	spin_lock(&ctx->gc_seq_lock);
+-	req->rq_seqno = ctx->gc_seq++;
++	req->rq_seqno = (ctx->gc_seq < MAXSEQ) ? ctx->gc_seq++ : MAXSEQ;
+ 	spin_unlock(&ctx->gc_seq_lock);
++	if (req->rq_seqno == MAXSEQ)
++		goto out_expired;
+ 
+ 	*p++ = htonl((u32) RPC_GSS_VERSION);
+ 	*p++ = htonl((u32) ctx->gc_proc);
+@@ -1572,14 +1574,18 @@ gss_marshal(struct rpc_task *task, __be32 *p)
+ 	mic.data = (u8 *)(p + 1);
+ 	maj_stat = gss_get_mic(ctx->gc_gss_ctx, &verf_buf, &mic);
+ 	if (maj_stat == GSS_S_CONTEXT_EXPIRED) {
+-		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
++		goto out_expired;
+ 	} else if (maj_stat != 0) {
+-		printk("gss_marshal: gss_get_mic FAILED (%d)\n", maj_stat);
++		pr_warn("gss_marshal: gss_get_mic FAILED (%d)\n", maj_stat);
++		task->tk_status = -EIO;
+ 		goto out_put_ctx;
+ 	}
+ 	p = xdr_encode_opaque(p, NULL, mic.len);
+ 	gss_put_ctx(ctx);
+ 	return p;
++out_expired:
++	clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
++	task->tk_status = -EKEYEXPIRED;
+ out_put_ctx:
+ 	gss_put_ctx(ctx);
+ 	return NULL;
+* Unmerged path net/sunrpc/clnt.c
