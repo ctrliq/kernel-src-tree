@@ -1,0 +1,307 @@
+ice: Support IPv6 Flow Director filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Henry Tieman <henry.w.tieman@intel.com>
+commit 165d80d6adab51b6a2f9c40ad0c8d3dec18d7bef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/165d80d6.failed
+
+Extend supported filters to allow for IPv6 filters.
+
+Supported fields are: src-ip, dst-ip, src-port, and dst-port
+Supported flow-types are: tcp6, udp6, sctp6, ip6
+
+Example usage:
+
+ethtool -N eth0 flow-type tcp6 src-port 12 dst-port 13 \
+src-ip fce0::1:34 dst-ip fce0::1:35 action 32
+
+	Signed-off-by: Henry Tieman <henry.w.tieman@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 165d80d6adab51b6a2f9c40ad0c8d3dec18d7bef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+#	drivers/net/ethernet/intel/ice/ice_fdir.c
+#	drivers/net/ethernet/intel/ice/ice_fdir.h
+#	drivers/net/ethernet/intel/ice/ice_flex_pipe.c
+#	drivers/net/ethernet/intel/ice/ice_type.h
+diff --cc drivers/net/ethernet/intel/ice/ice_flex_pipe.c
+index 285db9da3af2,da82783d1571..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_flex_pipe.c
++++ b/drivers/net/ethernet/intel/ice/ice_flex_pipe.c
+@@@ -3441,6 -3488,212 +3441,215 @@@ error_tmp
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_update_fd_mask - set Flow Director Field Vector mask for a profile
++  * @hw: pointer to the HW struct
++  * @prof_id: profile ID
++  * @mask_sel: mask select
++  *
++  * This function enable any of the masks selected by the mask select parameter
++  * for the profile specified.
++  */
++ static void ice_update_fd_mask(struct ice_hw *hw, u16 prof_id, u32 mask_sel)
++ {
++ 	wr32(hw, GLQF_FDMASK_SEL(prof_id), mask_sel);
++ 
++ 	ice_debug(hw, ICE_DBG_INIT, "fd mask(%d): %x = %x\n", prof_id,
++ 		  GLQF_FDMASK_SEL(prof_id), mask_sel);
++ }
++ 
++ struct ice_fd_src_dst_pair {
++ 	u8 prot_id;
++ 	u8 count;
++ 	u16 off;
++ };
++ 
++ static const struct ice_fd_src_dst_pair ice_fd_pairs[] = {
++ 	/* These are defined in pairs */
++ 	{ ICE_PROT_IPV4_OF_OR_S, 2, 12 },
++ 	{ ICE_PROT_IPV4_OF_OR_S, 2, 16 },
++ 
++ 	{ ICE_PROT_IPV4_IL, 2, 12 },
++ 	{ ICE_PROT_IPV4_IL, 2, 16 },
++ 
++ 	{ ICE_PROT_IPV6_OF_OR_S, 8, 8 },
++ 	{ ICE_PROT_IPV6_OF_OR_S, 8, 24 },
++ 
++ 	{ ICE_PROT_IPV6_IL, 8, 8 },
++ 	{ ICE_PROT_IPV6_IL, 8, 24 },
++ 
++ 	{ ICE_PROT_TCP_IL, 1, 0 },
++ 	{ ICE_PROT_TCP_IL, 1, 2 },
++ 
++ 	{ ICE_PROT_UDP_OF, 1, 0 },
++ 	{ ICE_PROT_UDP_OF, 1, 2 },
++ 
++ 	{ ICE_PROT_UDP_IL_OR_S, 1, 0 },
++ 	{ ICE_PROT_UDP_IL_OR_S, 1, 2 },
++ 
++ 	{ ICE_PROT_SCTP_IL, 1, 0 },
++ 	{ ICE_PROT_SCTP_IL, 1, 2 }
++ };
++ 
++ #define ICE_FD_SRC_DST_PAIR_COUNT	ARRAY_SIZE(ice_fd_pairs)
++ 
++ /**
++  * ice_update_fd_swap - set register appropriately for a FD FV extraction
++  * @hw: pointer to the HW struct
++  * @prof_id: profile ID
++  * @es: extraction sequence (length of array is determined by the block)
++  */
++ static enum ice_status
++ ice_update_fd_swap(struct ice_hw *hw, u16 prof_id, struct ice_fv_word *es)
++ {
++ 	DECLARE_BITMAP(pair_list, ICE_FD_SRC_DST_PAIR_COUNT);
++ 	u8 pair_start[ICE_FD_SRC_DST_PAIR_COUNT] = { 0 };
++ #define ICE_FD_FV_NOT_FOUND (-2)
++ 	s8 first_free = ICE_FD_FV_NOT_FOUND;
++ 	u8 used[ICE_MAX_FV_WORDS] = { 0 };
++ 	s8 orig_free, si;
++ 	u32 mask_sel = 0;
++ 	u8 i, j, k;
++ 
++ 	bitmap_zero(pair_list, ICE_FD_SRC_DST_PAIR_COUNT);
++ 
++ 	/* This code assumes that the Flow Director field vectors are assigned
++ 	 * from the end of the FV indexes working towards the zero index, that
++ 	 * only complete fields will be included and will be consecutive, and
++ 	 * that there are no gaps between valid indexes.
++ 	 */
++ 
++ 	/* Determine swap fields present */
++ 	for (i = 0; i < hw->blk[ICE_BLK_FD].es.fvw; i++) {
++ 		/* Find the first free entry, assuming right to left population.
++ 		 * This is where we can start adding additional pairs if needed.
++ 		 */
++ 		if (first_free == ICE_FD_FV_NOT_FOUND && es[i].prot_id !=
++ 		    ICE_PROT_INVALID)
++ 			first_free = i - 1;
++ 
++ 		for (j = 0; j < ICE_FD_SRC_DST_PAIR_COUNT; j++)
++ 			if (es[i].prot_id == ice_fd_pairs[j].prot_id &&
++ 			    es[i].off == ice_fd_pairs[j].off) {
++ 				set_bit(j, pair_list);
++ 				pair_start[j] = i;
++ 			}
++ 	}
++ 
++ 	orig_free = first_free;
++ 
++ 	/* determine missing swap fields that need to be added */
++ 	for (i = 0; i < ICE_FD_SRC_DST_PAIR_COUNT; i += 2) {
++ 		u8 bit1 = test_bit(i + 1, pair_list);
++ 		u8 bit0 = test_bit(i, pair_list);
++ 
++ 		if (bit0 ^ bit1) {
++ 			u8 index;
++ 
++ 			/* add the appropriate 'paired' entry */
++ 			if (!bit0)
++ 				index = i;
++ 			else
++ 				index = i + 1;
++ 
++ 			/* check for room */
++ 			if (first_free + 1 < (s8)ice_fd_pairs[index].count)
++ 				return ICE_ERR_MAX_LIMIT;
++ 
++ 			/* place in extraction sequence */
++ 			for (k = 0; k < ice_fd_pairs[index].count; k++) {
++ 				es[first_free - k].prot_id =
++ 					ice_fd_pairs[index].prot_id;
++ 				es[first_free - k].off =
++ 					ice_fd_pairs[index].off + (k * 2);
++ 
++ 				if (k > first_free)
++ 					return ICE_ERR_OUT_OF_RANGE;
++ 
++ 				/* keep track of non-relevant fields */
++ 				mask_sel |= BIT(first_free - k);
++ 			}
++ 
++ 			pair_start[index] = first_free;
++ 			first_free -= ice_fd_pairs[index].count;
++ 		}
++ 	}
++ 
++ 	/* fill in the swap array */
++ 	si = hw->blk[ICE_BLK_FD].es.fvw - 1;
++ 	while (si >= 0) {
++ 		u8 indexes_used = 1;
++ 
++ 		/* assume flat at this index */
++ #define ICE_SWAP_VALID	0x80
++ 		used[si] = si | ICE_SWAP_VALID;
++ 
++ 		if (orig_free == ICE_FD_FV_NOT_FOUND || si <= orig_free) {
++ 			si -= indexes_used;
++ 			continue;
++ 		}
++ 
++ 		/* check for a swap location */
++ 		for (j = 0; j < ICE_FD_SRC_DST_PAIR_COUNT; j++)
++ 			if (es[si].prot_id == ice_fd_pairs[j].prot_id &&
++ 			    es[si].off == ice_fd_pairs[j].off) {
++ 				u8 idx;
++ 
++ 				/* determine the appropriate matching field */
++ 				idx = j + ((j % 2) ? -1 : 1);
++ 
++ 				indexes_used = ice_fd_pairs[idx].count;
++ 				for (k = 0; k < indexes_used; k++) {
++ 					used[si - k] = (pair_start[idx] - k) |
++ 						ICE_SWAP_VALID;
++ 				}
++ 
++ 				break;
++ 			}
++ 
++ 		si -= indexes_used;
++ 	}
++ 
++ 	/* for each set of 4 swap and 4 inset indexes, write the appropriate
++ 	 * register
++ 	 */
++ 	for (j = 0; j < hw->blk[ICE_BLK_FD].es.fvw / 4; j++) {
++ 		u32 raw_swap = 0;
++ 		u32 raw_in = 0;
++ 
++ 		for (k = 0; k < 4; k++) {
++ 			u8 idx;
++ 
++ 			idx = (j * 4) + k;
++ 			if (used[idx] && !(mask_sel & BIT(idx))) {
++ 				raw_swap |= used[idx] << (k * BITS_PER_BYTE);
++ #define ICE_INSET_DFLT 0x9f
++ 				raw_in |= ICE_INSET_DFLT << (k * BITS_PER_BYTE);
++ 			}
++ 		}
++ 
++ 		/* write the appropriate swap register set */
++ 		wr32(hw, GLQF_FDSWAP(prof_id, j), raw_swap);
++ 
++ 		ice_debug(hw, ICE_DBG_INIT, "swap wr(%d, %d): %x = %08x\n",
++ 			  prof_id, j, GLQF_FDSWAP(prof_id, j), raw_swap);
++ 
++ 		/* write the appropriate inset register set */
++ 		wr32(hw, GLQF_FDINSET(prof_id, j), raw_in);
++ 
++ 		ice_debug(hw, ICE_DBG_INIT, "inset wr(%d, %d): %x = %08x\n",
++ 			  prof_id, j, GLQF_FDINSET(prof_id, j), raw_in);
++ 	}
++ 
++ 	/* initially clear the mask select for this profile */
++ 	ice_update_fd_mask(hw, prof_id, 0);
++ 
++ 	return 0;
++ }
++ 
++ /**
+++>>>>>>> 165d80d6adab (ice: Support IPv6 Flow Director filters)
+   * ice_add_prof - add profile
+   * @hw: pointer to the HW struct
+   * @blk: hardware block
+diff --cc drivers/net/ethernet/intel/ice/ice_type.h
+index 7074afdaa83b,f1bfe8c94f1f..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@@ -161,6 -162,38 +161,41 @@@ struct ice_phy_info 
+  	u8 get_link_info;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* protocol enumeration for filters */
++ enum ice_fltr_ptype {
++ 	/* NONE - used for undef/error */
++ 	ICE_FLTR_PTYPE_NONF_NONE = 0,
++ 	ICE_FLTR_PTYPE_NONF_IPV4_UDP,
++ 	ICE_FLTR_PTYPE_NONF_IPV4_TCP,
++ 	ICE_FLTR_PTYPE_NONF_IPV4_SCTP,
++ 	ICE_FLTR_PTYPE_NONF_IPV4_OTHER,
++ 	ICE_FLTR_PTYPE_FRAG_IPV4,
++ 	ICE_FLTR_PTYPE_NONF_IPV6_UDP,
++ 	ICE_FLTR_PTYPE_NONF_IPV6_TCP,
++ 	ICE_FLTR_PTYPE_NONF_IPV6_SCTP,
++ 	ICE_FLTR_PTYPE_NONF_IPV6_OTHER,
++ 	ICE_FLTR_PTYPE_MAX,
++ };
++ 
++ enum ice_fd_hw_seg {
++ 	ICE_FD_HW_SEG_NON_TUN = 0,
++ 	ICE_FD_HW_SEG_TUN,
++ 	ICE_FD_HW_SEG_MAX,
++ };
++ 
++ /* 2 VSI = 1 ICE_VSI_PF + 1 ICE_VSI_CTRL */
++ #define ICE_MAX_FDIR_VSI_PER_FILTER	2
++ 
++ struct ice_fd_hw_prof {
++ 	struct ice_flow_seg_info *fdir_seg[ICE_FD_HW_SEG_MAX];
++ 	int cnt;
++ 	u64 entry_h[ICE_MAX_FDIR_VSI_PER_FILTER][ICE_FD_HW_SEG_MAX];
++ 	u16 vsi_h[ICE_MAX_FDIR_VSI_PER_FILTER];
++ };
++ 
+++>>>>>>> 165d80d6adab (ice: Support IPv6 Flow Director filters)
+  /* Common HW capabilities for SW use */
+  struct ice_hw_common_caps {
+  	u32 valid_functions;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.h
+* Unmerged path drivers/net/ethernet/intel/ice/ice_ethtool_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_fdir.h
+* Unmerged path drivers/net/ethernet/intel/ice/ice_flex_pipe.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_type.h
