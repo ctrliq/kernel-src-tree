@@ -1,0 +1,207 @@
+NFSD: COMMIT operations must not return NFS?ERR_INVAL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3f965021c8bc38965ecb1924f570c4842b33d408
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/3f965021.failed
+
+Since, well, forever, the Linux NFS server's nfsd_commit() function
+has returned nfserr_inval when the passed-in byte range arguments
+were non-sensical.
+
+However, according to RFC 1813 section 3.3.21, NFSv3 COMMIT requests
+are permitted to return only the following non-zero status codes:
+
+      NFS3ERR_IO
+      NFS3ERR_STALE
+      NFS3ERR_BADHANDLE
+      NFS3ERR_SERVERFAULT
+
+NFS3ERR_INVAL is not included in that list. Likewise, NFS4ERR_INVAL
+is not listed in the COMMIT row of Table 6 in RFC 8881.
+
+RFC 7530 does permit COMMIT to return NFS4ERR_INVAL, but does not
+specify when it can or should be used.
+
+Instead of dropping or failing a COMMIT request in a byte range that
+is not supported, turn it into a valid request by treating one or
+both arguments as zero. Offset zero means start-of-file, count zero
+means until-end-of-file, so we only ever extend the commit range.
+NFS servers are always allowed to commit more and sooner than
+requested.
+
+The range check is no longer bounded by NFS_OFFSET_MAX, but rather
+by the value that is returned in the maxfilesize field of the NFSv3
+FSINFO procedure or the NFSv4 maxfilesize file attribute.
+
+Note that this change results in a new pynfs failure:
+
+CMT4     st_commit.testCommitOverflow                             : RUNNING
+CMT4     st_commit.testCommitOverflow                             : FAILURE
+           COMMIT with offset + count overflow should return
+           NFS4ERR_INVAL, instead got NFS4_OK
+
+IMO the test is not correct as written: RFC 8881 does not allow the
+COMMIT operation to return NFS4ERR_INVAL.
+
+	Reported-by: Dan Aloni <dan.aloni@vastdata.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Reviewed-by: Bruce Fields <bfields@fieldses.org>
+(cherry picked from commit 3f965021c8bc38965ecb1924f570c4842b33d408)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs3proc.c
+#	fs/nfsd/vfs.c
+#	fs/nfsd/vfs.h
+diff --cc fs/nfsd/nfs3proc.c
+index ac940834a717,52ad1972cc33..000000000000
+--- a/fs/nfsd/nfs3proc.c
++++ b/fs/nfsd/nfs3proc.c
+@@@ -683,14 -663,9 +683,14 @@@ nfsd3_proc_commit(struct svc_rqst *rqst
+  				argp->count,
+  				(unsigned long long) argp->offset);
+  
+- 	if (argp->offset > NFS_OFFSET_MAX) {
+- 		resp->status = nfserr_inval;
+- 		goto out;
+- 	}
+- 
+  	fh_copy(&resp->fh, &argp->fh);
+++<<<<<<< HEAD
+ +	resp->status = nfsd_commit(rqstp, &resp->fh, argp->offset, argp->count);
+ +out:
+++=======
++ 	resp->status = nfsd_commit(rqstp, &resp->fh, argp->offset,
++ 				   argp->count, resp->verf);
+++>>>>>>> 3f965021c8bc (NFSD: COMMIT operations must not return NFS?ERR_INVAL)
+  	return rpc_success;
+  }
+  
+diff --cc fs/nfsd/vfs.c
+index 8086e322a414,91600e71be19..000000000000
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@@ -1146,37 -1129,64 +1153,82 @@@ out
+   *
+   * Unfortunately we cannot lock the file to make sure we return full WCC
+   * data to the client, as locking happens lower down in the filesystem.
++  *
++  * Return values:
++  *   An nfsstat value in network byte order.
+   */
+  __be32
+++<<<<<<< HEAD
+ +nfsd_commit(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ +               loff_t offset, unsigned long count)
+ +{
+ +	struct file	*file;
+ +	loff_t		end = LLONG_MAX;
+ +	__be32		err = nfserr_inval;
+ +
+ +	if (offset < 0)
+ +		goto out;
+ +	if (count != 0) {
+ +		end = offset + (loff_t)count - 1;
+ +		if (end < offset)
+ +			goto out;
+ +	}
+++=======
++ nfsd_commit(struct svc_rqst *rqstp, struct svc_fh *fhp, u64 offset,
++ 	    u32 count, __be32 *verf)
++ {
++ 	u64			maxbytes;
++ 	loff_t			start, end;
++ 	struct nfsd_net		*nn;
++ 	struct nfsd_file	*nf;
++ 	__be32			err;
+++>>>>>>> 3f965021c8bc (NFSD: COMMIT operations must not return NFS?ERR_INVAL)
+  
+ -	err = nfsd_file_acquire(rqstp, fhp,
+ -			NFSD_MAY_WRITE|NFSD_MAY_NOT_BREAK_LEASE, &nf);
+ +	err = nfsd_open(rqstp, fhp, S_IFREG,
+ +			NFSD_MAY_WRITE|NFSD_MAY_NOT_BREAK_LEASE, &file);
+  	if (err)
+  		goto out;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Convert the client-provided (offset, count) range to a
++ 	 * (start, end) range. If the client-provided range falls
++ 	 * outside the maximum file size of the underlying FS,
++ 	 * clamp the sync range appropriately.
++ 	 */
++ 	start = 0;
++ 	end = LLONG_MAX;
++ 	maxbytes = (u64)fhp->fh_dentry->d_sb->s_maxbytes;
++ 	if (offset < maxbytes) {
++ 		start = offset;
++ 		if (count && (offset + count - 1 < maxbytes))
++ 			end = offset + count - 1;
++ 	}
++ 
++ 	nn = net_generic(nf->nf_net, nfsd_net_id);
+++>>>>>>> 3f965021c8bc (NFSD: COMMIT operations must not return NFS?ERR_INVAL)
+  	if (EX_ISSYNC(fhp->fh_export)) {
+ -		errseq_t since = READ_ONCE(nf->nf_file->f_wb_err);
+ -		int err2;
+ +		int err2 = vfs_fsync_range(file, offset, end, 0);
+  
+++<<<<<<< HEAD
+ +		if (err2 != -EINVAL)
+ +			err = nfserrno(err2);
+ +		else
+++=======
++ 		err2 = vfs_fsync_range(nf->nf_file, start, end, 0);
++ 		switch (err2) {
++ 		case 0:
++ 			nfsd_copy_write_verifier(verf, nn);
++ 			err2 = filemap_check_wb_err(nf->nf_file->f_mapping,
++ 						    since);
++ 			break;
++ 		case -EINVAL:
+++>>>>>>> 3f965021c8bc (NFSD: COMMIT operations must not return NFS?ERR_INVAL)
+  			err = nfserr_notsupp;
+ -			break;
+ -		default:
+ -			nfsd_reset_write_verifier(nn);
+ -			trace_nfsd_writeverf_reset(nn, rqstp, err2);
+ -		}
+ -		err = nfserrno(err2);
+ -	} else
+ -		nfsd_copy_write_verifier(verf, nn);
+ +	}
+  
+ -	nfsd_file_put(nf);
+ +	fput(file);
+  out:
+  	return err;
+  }
+diff --cc fs/nfsd/vfs.h
+index 99b855a6d9eb,2c43d10e3cab..000000000000
+--- a/fs/nfsd/vfs.h
++++ b/fs/nfsd/vfs.h
+@@@ -72,10 -74,9 +72,15 @@@ __be32		do_nfsd_create(struct svc_rqst 
+  				char *name, int len, struct iattr *attrs,
+  				struct svc_fh *res, int createmode,
+  				u32 *verifier, bool *truncp, bool *created);
+++<<<<<<< HEAD
+ +__be32		nfsd_commit(struct svc_rqst *, struct svc_fh *,
+ +				loff_t, unsigned long);
+++=======
++ __be32		nfsd_commit(struct svc_rqst *rqst, struct svc_fh *fhp,
++ 				u64 offset, u32 count, __be32 *verf);
+++>>>>>>> 3f965021c8bc (NFSD: COMMIT operations must not return NFS?ERR_INVAL)
+  #endif /* CONFIG_NFSD_V3 */
+ +int 		nfsd_open_break_lease(struct inode *, int);
+  #ifdef CONFIG_NFSD_V4
+  __be32		nfsd_getxattr(struct svc_rqst *rqstp, struct svc_fh *fhp,
+  			    char *name, void **bufp, int *lenp);
+* Unmerged path fs/nfsd/nfs3proc.c
+* Unmerged path fs/nfsd/vfs.c
+* Unmerged path fs/nfsd/vfs.h
