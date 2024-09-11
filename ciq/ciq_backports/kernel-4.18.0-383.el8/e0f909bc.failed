@@ -1,0 +1,629 @@
+net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Russell King <rmk+kernel@armlinux.org.uk>
+commit e0f909bc3a242296da9ccff78277f26d4883a79d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/e0f909bc.failed
+
+Switch network drivers, phy drivers, and SFP/phylink over to use the
+more correct 10GBASE-R, rather than 10GBASE-KR. 10GBASE-KR is backplane
+ethernet, which is 10GBASE-R with autonegotiation on top, which our
+current usage on the affected platforms does not have.
+
+The only remaining user of PHY_INTERFACE_MODE_10GKR is the Aquantia
+PHY, which has a separate mode for 10GBASE-KR.
+
+For Marvell mvpp2, we detect 10GBASE-KR, and rewrite it to 10GBASE-R
+for compatibility with existing DT - this is the only network driver
+at present that makes use of PHY_INTERFACE_MODE_10GKR.
+
+	Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e0f909bc3a242296da9ccff78277f26d4883a79d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+#	drivers/phy/marvell/phy-mvebu-cp110-comphy.c
+diff --cc drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 9638dce58ba2,72133cbe55d4..000000000000
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@@ -945,6 -1112,11 +945,14 @@@ mvpp2_shared_interrupt_mask_unmask(stru
+  }
+  
+  /* Port configuration routines */
+++<<<<<<< HEAD
+++=======
++ static bool mvpp2_is_xlg(phy_interface_t interface)
++ {
++ 	return interface == PHY_INTERFACE_MODE_10GBASER ||
++ 	       interface == PHY_INTERFACE_MODE_XAUI;
++ }
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  
+  static void mvpp22_gop_init_rgmii(struct mvpp2_port *port)
+  {
+@@@ -1366,22 -1600,70 +1374,81 @@@ static int mvpp2_ethtool_get_sset_count
+  	return -EOPNOTSUPP;
+  }
+  
+ -static void mvpp2_mac_reset_assert(struct mvpp2_port *port)
+ +static void mvpp2_port_reset(struct mvpp2_port *port)
+  {
+  	u32 val;
+ +	unsigned int i;
+ +
+ +	/* Read the GOP statistics to reset the hardware counters */
+ +	for (i = 0; i < ARRAY_SIZE(mvpp2_ethtool_regs); i++)
+ +		mvpp2_read_count(port, &mvpp2_ethtool_regs[i]);
+  
+ -	val = readl(port->base + MVPP2_GMAC_CTRL_2_REG) |
+ -	      MVPP2_GMAC_PORT_RESET_MASK;
+ +	val = readl(port->base + MVPP2_GMAC_CTRL_2_REG) &
+ +		    ~MVPP2_GMAC_PORT_RESET_MASK;
+  	writel(val, port->base + MVPP2_GMAC_CTRL_2_REG);
+  
+++<<<<<<< HEAD
+ +	while (readl(port->base + MVPP2_GMAC_CTRL_2_REG) &
+ +	       MVPP2_GMAC_PORT_RESET_MASK)
+ +		continue;
+++=======
++ 	if (port->priv->hw_version == MVPP22 && port->gop_id == 0) {
++ 		val = readl(port->base + MVPP22_XLG_CTRL0_REG) &
++ 		      ~MVPP22_XLG_CTRL0_MAC_RESET_DIS;
++ 		writel(val, port->base + MVPP22_XLG_CTRL0_REG);
++ 	}
++ }
++ 
++ static void mvpp22_pcs_reset_assert(struct mvpp2_port *port)
++ {
++ 	struct mvpp2 *priv = port->priv;
++ 	void __iomem *mpcs, *xpcs;
++ 	u32 val;
++ 
++ 	if (port->priv->hw_version != MVPP22 || port->gop_id != 0)
++ 		return;
++ 
++ 	mpcs = priv->iface_base + MVPP22_MPCS_BASE(port->gop_id);
++ 	xpcs = priv->iface_base + MVPP22_XPCS_BASE(port->gop_id);
++ 
++ 	val = readl(mpcs + MVPP22_MPCS_CLK_RESET);
++ 	val &= ~(MAC_CLK_RESET_MAC | MAC_CLK_RESET_SD_RX | MAC_CLK_RESET_SD_TX);
++ 	val |= MVPP22_MPCS_CLK_RESET_DIV_SET;
++ 	writel(val, mpcs + MVPP22_MPCS_CLK_RESET);
++ 
++ 	val = readl(xpcs + MVPP22_XPCS_CFG0);
++ 	writel(val & ~MVPP22_XPCS_CFG0_RESET_DIS, xpcs + MVPP22_XPCS_CFG0);
++ }
++ 
++ static void mvpp22_pcs_reset_deassert(struct mvpp2_port *port)
++ {
++ 	struct mvpp2 *priv = port->priv;
++ 	void __iomem *mpcs, *xpcs;
++ 	u32 val;
++ 
++ 	if (port->priv->hw_version != MVPP22 || port->gop_id != 0)
++ 		return;
++ 
++ 	mpcs = priv->iface_base + MVPP22_MPCS_BASE(port->gop_id);
++ 	xpcs = priv->iface_base + MVPP22_XPCS_BASE(port->gop_id);
++ 
++ 	switch (port->phy_interface) {
++ 	case PHY_INTERFACE_MODE_10GBASER:
++ 		val = readl(mpcs + MVPP22_MPCS_CLK_RESET);
++ 		val |= MAC_CLK_RESET_MAC | MAC_CLK_RESET_SD_RX |
++ 		       MAC_CLK_RESET_SD_TX;
++ 		val &= ~MVPP22_MPCS_CLK_RESET_DIV_SET;
++ 		writel(val, mpcs + MVPP22_MPCS_CLK_RESET);
++ 		break;
++ 	case PHY_INTERFACE_MODE_XAUI:
++ 	case PHY_INTERFACE_MODE_RXAUI:
++ 		val = readl(xpcs + MVPP22_XPCS_CFG0);
++ 		writel(val | MVPP22_XPCS_CFG0_RESET_DIS, xpcs + MVPP22_XPCS_CFG0);
++ 		break;
++ 	default:
++ 		break;
++ 	}
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  }
+  
+  /* Change maximum receive size of the port */
+@@@ -4167,21 -4756,50 +4234,59 @@@ static void mvpp2_phylink_validate(stru
+  					       phylink_config);
+  	__ETHTOOL_DECLARE_LINK_MODE_MASK(mask) = { 0, };
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Invalid combinations */
++ 	switch (state->interface) {
++ 	case PHY_INTERFACE_MODE_10GBASER:
++ 	case PHY_INTERFACE_MODE_XAUI:
++ 		if (port->gop_id != 0)
++ 			goto empty_set;
++ 		break;
++ 	case PHY_INTERFACE_MODE_RGMII:
++ 	case PHY_INTERFACE_MODE_RGMII_ID:
++ 	case PHY_INTERFACE_MODE_RGMII_RXID:
++ 	case PHY_INTERFACE_MODE_RGMII_TXID:
++ 		if (port->priv->hw_version == MVPP22 && port->gop_id == 0)
++ 			goto empty_set;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  	phylink_set(mask, Autoneg);
+  	phylink_set_port_modes(mask);
+  	phylink_set(mask, Pause);
+  	phylink_set(mask, Asym_Pause);
+  
+  	switch (state->interface) {
+++<<<<<<< HEAD
+ +	case PHY_INTERFACE_MODE_10GKR:
+ +		phylink_set(mask, 10000baseCR_Full);
+ +		phylink_set(mask, 10000baseSR_Full);
+ +		phylink_set(mask, 10000baseLR_Full);
+ +		phylink_set(mask, 10000baseLRM_Full);
+ +		phylink_set(mask, 10000baseER_Full);
+ +		phylink_set(mask, 10000baseKR_Full);
+++=======
++ 	case PHY_INTERFACE_MODE_10GBASER:
++ 	case PHY_INTERFACE_MODE_XAUI:
++ 	case PHY_INTERFACE_MODE_NA:
++ 		if (port->gop_id == 0) {
++ 			phylink_set(mask, 10000baseT_Full);
++ 			phylink_set(mask, 10000baseCR_Full);
++ 			phylink_set(mask, 10000baseSR_Full);
++ 			phylink_set(mask, 10000baseLR_Full);
++ 			phylink_set(mask, 10000baseLRM_Full);
++ 			phylink_set(mask, 10000baseER_Full);
++ 			phylink_set(mask, 10000baseKR_Full);
++ 		}
++ 		if (state->interface != PHY_INTERFACE_MODE_NA)
++ 			break;
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  		/* Fall-through */
+ -	case PHY_INTERFACE_MODE_RGMII:
+ -	case PHY_INTERFACE_MODE_RGMII_ID:
+ -	case PHY_INTERFACE_MODE_RGMII_RXID:
+ -	case PHY_INTERFACE_MODE_RGMII_TXID:
+ -	case PHY_INTERFACE_MODE_SGMII:
+ +	default:
+  		phylink_set(mask, 10baseT_Half);
+  		phylink_set(mask, 10baseT_Full);
+  		phylink_set(mask, 100baseT_Half);
+diff --cc drivers/phy/marvell/phy-mvebu-cp110-comphy.c
+index 4ef429250d7b,e41367f36ee1..000000000000
+--- a/drivers/phy/marvell/phy-mvebu-cp110-comphy.c
++++ b/drivers/phy/marvell/phy-mvebu-cp110-comphy.c
+@@@ -129,31 -199,56 +129,54 @@@ struct mvebu_comhy_conf 
+  		.lane = _lane,				\
+  		.port = _port,				\
+  		.mode = _mode,				\
+ -		.submode = PHY_INTERFACE_MODE_NA,	\
+ -		.mux = -1,				\
+ -		.fw_mode = _fw,				\
+ +		.mux = _mux,				\
+  	}
+  
+ -static const struct mvebu_comphy_conf mvebu_comphy_cp110_modes[] = {
+ +static const struct mvebu_comhy_conf mvebu_comphy_cp110_modes[] = {
+  	/* lane 0 */
+ -	GEN_CONF(0, 0, PHY_MODE_PCIE, COMPHY_FW_MODE_PCIE),
+ -	ETH_CONF(0, 1, PHY_INTERFACE_MODE_SGMII, 0x1, COMPHY_FW_MODE_SGMII),
+ -	ETH_CONF(0, 1, PHY_INTERFACE_MODE_2500BASEX, 0x1, COMPHY_FW_MODE_HS_SGMII),
+ -	GEN_CONF(0, 1, PHY_MODE_SATA, COMPHY_FW_MODE_SATA),
+ +	MVEBU_COMPHY_CONF(0, 1, PHY_MODE_SGMII, 0x1),
+ +	MVEBU_COMPHY_CONF(0, 1, PHY_MODE_2500SGMII, 0x1),
+  	/* lane 1 */
+ -	GEN_CONF(1, 0, PHY_MODE_USB_HOST_SS, COMPHY_FW_MODE_USB3H),
+ -	GEN_CONF(1, 0, PHY_MODE_USB_DEVICE_SS, COMPHY_FW_MODE_USB3D),
+ -	GEN_CONF(1, 0, PHY_MODE_SATA, COMPHY_FW_MODE_SATA),
+ -	GEN_CONF(1, 0, PHY_MODE_PCIE, COMPHY_FW_MODE_PCIE),
+ -	ETH_CONF(1, 2, PHY_INTERFACE_MODE_SGMII, 0x1, COMPHY_FW_MODE_SGMII),
+ -	ETH_CONF(1, 2, PHY_INTERFACE_MODE_2500BASEX, 0x1, COMPHY_FW_MODE_HS_SGMII),
+ +	MVEBU_COMPHY_CONF(1, 2, PHY_MODE_SGMII, 0x1),
+ +	MVEBU_COMPHY_CONF(1, 2, PHY_MODE_2500SGMII, 0x1),
+  	/* lane 2 */
+++<<<<<<< HEAD
+ +	MVEBU_COMPHY_CONF(2, 0, PHY_MODE_SGMII, 0x1),
+ +	MVEBU_COMPHY_CONF(2, 0, PHY_MODE_2500SGMII, 0x1),
+ +	MVEBU_COMPHY_CONF(2, 0, PHY_MODE_10GKR, 0x1),
+++=======
++ 	ETH_CONF(2, 0, PHY_INTERFACE_MODE_SGMII, 0x1, COMPHY_FW_MODE_SGMII),
++ 	ETH_CONF(2, 0, PHY_INTERFACE_MODE_2500BASEX, 0x1, COMPHY_FW_MODE_HS_SGMII),
++ 	ETH_CONF(2, 0, PHY_INTERFACE_MODE_RXAUI, 0x1, COMPHY_FW_MODE_RXAUI),
++ 	ETH_CONF(2, 0, PHY_INTERFACE_MODE_10GBASER, 0x1, COMPHY_FW_MODE_XFI),
++ 	GEN_CONF(2, 0, PHY_MODE_USB_HOST_SS, COMPHY_FW_MODE_USB3H),
++ 	GEN_CONF(2, 0, PHY_MODE_SATA, COMPHY_FW_MODE_SATA),
++ 	GEN_CONF(2, 0, PHY_MODE_PCIE, COMPHY_FW_MODE_PCIE),
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  	/* lane 3 */
+ -	GEN_CONF(3, 0, PHY_MODE_PCIE, COMPHY_FW_MODE_PCIE),
+ -	ETH_CONF(3, 1, PHY_INTERFACE_MODE_SGMII, 0x2, COMPHY_FW_MODE_SGMII),
+ -	ETH_CONF(3, 1, PHY_INTERFACE_MODE_2500BASEX, 0x2, COMPHY_FW_MODE_HS_SGMII),
+ -	ETH_CONF(3, 1, PHY_INTERFACE_MODE_RXAUI, 0x1, COMPHY_FW_MODE_RXAUI),
+ -	GEN_CONF(3, 1, PHY_MODE_USB_HOST_SS, COMPHY_FW_MODE_USB3H),
+ -	GEN_CONF(3, 1, PHY_MODE_SATA, COMPHY_FW_MODE_SATA),
+ +	MVEBU_COMPHY_CONF(3, 1, PHY_MODE_SGMII, 0x2),
+ +	MVEBU_COMPHY_CONF(3, 1, PHY_MODE_2500SGMII, 0x2),
+  	/* lane 4 */
+++<<<<<<< HEAD
+ +	MVEBU_COMPHY_CONF(4, 0, PHY_MODE_SGMII, 0x2),
+ +	MVEBU_COMPHY_CONF(4, 0, PHY_MODE_2500SGMII, 0x2),
+ +	MVEBU_COMPHY_CONF(4, 0, PHY_MODE_10GKR, 0x2),
+ +	MVEBU_COMPHY_CONF(4, 1, PHY_MODE_SGMII, 0x1),
+++=======
++ 	ETH_CONF(4, 0, PHY_INTERFACE_MODE_SGMII, 0x2, COMPHY_FW_MODE_SGMII),
++ 	ETH_CONF(4, 0, PHY_INTERFACE_MODE_2500BASEX, 0x2, COMPHY_FW_MODE_HS_SGMII),
++ 	ETH_CONF(4, 0, PHY_INTERFACE_MODE_10GBASER, 0x2, COMPHY_FW_MODE_XFI),
++ 	ETH_CONF(4, 0, PHY_INTERFACE_MODE_RXAUI, 0x2, COMPHY_FW_MODE_RXAUI),
++ 	GEN_CONF(4, 0, PHY_MODE_USB_DEVICE_SS, COMPHY_FW_MODE_USB3D),
++ 	GEN_CONF(4, 1, PHY_MODE_USB_HOST_SS, COMPHY_FW_MODE_USB3H),
++ 	GEN_CONF(4, 1, PHY_MODE_PCIE, COMPHY_FW_MODE_PCIE),
++ 	ETH_CONF(4, 1, PHY_INTERFACE_MODE_SGMII, 0x1, COMPHY_FW_MODE_SGMII),
++ 	ETH_CONF(4, 1, PHY_INTERFACE_MODE_2500BASEX, -1, COMPHY_FW_MODE_HS_SGMII),
++ 	ETH_CONF(4, 1, PHY_INTERFACE_MODE_10GBASER, -1, COMPHY_FW_MODE_XFI),
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  	/* lane 5 */
+ -	ETH_CONF(5, 1, PHY_INTERFACE_MODE_RXAUI, 0x2, COMPHY_FW_MODE_RXAUI),
+ -	GEN_CONF(5, 1, PHY_MODE_SATA, COMPHY_FW_MODE_SATA),
+ -	ETH_CONF(5, 2, PHY_INTERFACE_MODE_SGMII, 0x1, COMPHY_FW_MODE_SGMII),
+ -	ETH_CONF(5, 2, PHY_INTERFACE_MODE_2500BASEX, 0x1, COMPHY_FW_MODE_HS_SGMII),
+ -	GEN_CONF(5, 2, PHY_MODE_PCIE, COMPHY_FW_MODE_PCIE),
+ +	MVEBU_COMPHY_CONF(5, 2, PHY_MODE_SGMII, 0x1),
+ +	MVEBU_COMPHY_CONF(5, 2, PHY_MODE_2500SGMII, 0x1),
+  };
+  
+  struct mvebu_comphy_priv {
+@@@ -208,11 -338,20 +231,19 @@@ static void mvebu_comphy_ethernet_init_
+  		 MVEBU_COMPHY_SERDES_CFG0_PU_TX |
+  		 MVEBU_COMPHY_SERDES_CFG0_HALF_BUS |
+  		 MVEBU_COMPHY_SERDES_CFG0_GEN_RX(0xf) |
+++<<<<<<< HEAD
+ +		 MVEBU_COMPHY_SERDES_CFG0_GEN_TX(0xf));
+ +	if (mode == PHY_MODE_10GKR)
+++=======
++ 		 MVEBU_COMPHY_SERDES_CFG0_GEN_TX(0xf) |
++ 		 MVEBU_COMPHY_SERDES_CFG0_RXAUI_MODE);
++ 
++ 	switch (lane->submode) {
++ 	case PHY_INTERFACE_MODE_10GBASER:
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  		val |= MVEBU_COMPHY_SERDES_CFG0_GEN_RX(0xe) |
+  		       MVEBU_COMPHY_SERDES_CFG0_GEN_TX(0xe);
+ -		break;
+ -	case PHY_INTERFACE_MODE_RXAUI:
+ -		val |= MVEBU_COMPHY_SERDES_CFG0_GEN_RX(0xb) |
+ -		       MVEBU_COMPHY_SERDES_CFG0_GEN_TX(0xb) |
+ -		       MVEBU_COMPHY_SERDES_CFG0_RXAUI_MODE;
+ -		break;
+ -	case PHY_INTERFACE_MODE_2500BASEX:
+ +	else if (mode == PHY_MODE_2500SGMII)
+  		val |= MVEBU_COMPHY_SERDES_CFG0_GEN_RX(0x8) |
+  		       MVEBU_COMPHY_SERDES_CFG0_GEN_TX(0x8) |
+  		       MVEBU_COMPHY_SERDES_CFG0_HALF_BUS;
+@@@ -246,7 -417,7 +277,11 @@@
+  	/* refclk selection */
+  	val = readl(priv->base + MVEBU_COMPHY_MISC_CTRL0(lane->id));
+  	val &= ~MVEBU_COMPHY_MISC_CTRL0_REFCLK_SEL;
+++<<<<<<< HEAD
+ +	if (mode == PHY_MODE_10GKR)
+++=======
++ 	if (lane->submode == PHY_INTERFACE_MODE_10GBASER)
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  		val |= MVEBU_COMPHY_MISC_CTRL0_ICP_FORCE;
+  	writel(val, priv->base + MVEBU_COMPHY_MISC_CTRL0(lane->id));
+  
+@@@ -333,10 -508,63 +368,10 @@@ static int mvebu_comphy_set_mode_sgmii(
+  	val |= MVEBU_COMPHY_GEN1_S0_TX_EMPH(0x1);
+  	writel(val, priv->base + MVEBU_COMPHY_GEN1_S0(lane->id));
+  
+ -	return mvebu_comphy_init_plls(lane);
+ -}
+ -
+ -static int mvebu_comphy_set_mode_rxaui(struct phy *phy)
+ -{
+ -	struct mvebu_comphy_lane *lane = phy_get_drvdata(phy);
+ -	struct mvebu_comphy_priv *priv = lane->priv;
+ -	u32 val;
+ -	int err;
+ -
+ -	err = mvebu_comphy_ethernet_init_reset(lane);
+ -	if (err)
+ -		return err;
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_RX_CTRL1(lane->id));
+ -	val |= MVEBU_COMPHY_RX_CTRL1_RXCLK2X_SEL |
+ -	       MVEBU_COMPHY_RX_CTRL1_CLK8T_EN;
+ -	writel(val, priv->base + MVEBU_COMPHY_RX_CTRL1(lane->id));
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_DTL_CTRL(lane->id));
+ -	val |= MVEBU_COMPHY_DTL_CTRL_DTL_FLOOP_EN;
+ -	writel(val, priv->base + MVEBU_COMPHY_DTL_CTRL(lane->id));
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_SERDES_CFG2(lane->id));
+ -	val |= MVEBU_COMPHY_SERDES_CFG2_DFE_EN;
+ -	writel(val, priv->base + MVEBU_COMPHY_SERDES_CFG2(lane->id));
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_DFE_RES(lane->id));
+ -	val |= MVEBU_COMPHY_DFE_RES_FORCE_GEN_TBL;
+ -	writel(val, priv->base + MVEBU_COMPHY_DFE_RES(lane->id));
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_GEN1_S0(lane->id));
+ -	val &= ~MVEBU_COMPHY_GEN1_S0_TX_EMPH(0xf);
+ -	val |= MVEBU_COMPHY_GEN1_S0_TX_EMPH(0xd);
+ -	writel(val, priv->base + MVEBU_COMPHY_GEN1_S0(lane->id));
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_GEN1_S1(lane->id));
+ -	val &= ~(MVEBU_COMPHY_GEN1_S1_RX_MUL_PI(0x7) |
+ -		 MVEBU_COMPHY_GEN1_S1_RX_MUL_PF(0x7));
+ -	val |= MVEBU_COMPHY_GEN1_S1_RX_MUL_PI(0x1) |
+ -	       MVEBU_COMPHY_GEN1_S1_RX_MUL_PF(0x1) |
+ -	       MVEBU_COMPHY_GEN1_S1_RX_DFE_EN;
+ -	writel(val, priv->base + MVEBU_COMPHY_GEN1_S1(lane->id));
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_COEF(lane->id));
+ -	val &= ~(MVEBU_COMPHY_COEF_DFE_EN | MVEBU_COMPHY_COEF_DFE_CTRL);
+ -	writel(val, priv->base + MVEBU_COMPHY_COEF(lane->id));
+ -
+ -	val = readl(priv->base + MVEBU_COMPHY_GEN1_S4(lane->id));
+ -	val &= ~MVEBU_COMPHY_GEN1_S4_DFE_RES(0x3);
+ -	val |= MVEBU_COMPHY_GEN1_S4_DFE_RES(0x1);
+ -	writel(val, priv->base + MVEBU_COMPHY_GEN1_S4(lane->id));
+ -
+ -	return mvebu_comphy_init_plls(lane);
+ +	return mvebu_comphy_init_plls(lane, PHY_MODE_SGMII);
+  }
+  
+- static int mvebu_comphy_set_mode_10gkr(struct phy *phy)
++ static int mvebu_comphy_set_mode_10gbaser(struct phy *phy)
+  {
+  	struct mvebu_comphy_lane *lane = phy_get_drvdata(phy);
+  	struct mvebu_comphy_priv *priv = lane->priv;
+@@@ -495,13 -727,16 +530,21 @@@ static int mvebu_comphy_power_on(struc
+  	val |= mux << MVEBU_COMPHY_SELECTOR_PHY(lane->id);
+  	regmap_write(priv->regmap, MVEBU_COMPHY_SELECTOR, val);
+  
+ -	switch (lane->submode) {
+ -	case PHY_INTERFACE_MODE_SGMII:
+ -	case PHY_INTERFACE_MODE_2500BASEX:
+ -		ret = mvebu_comphy_set_mode_sgmii(phy);
+ +	switch (lane->mode) {
+ +	case PHY_MODE_SGMII:
+ +	case PHY_MODE_2500SGMII:
+ +		ret = mvebu_comphy_set_mode_sgmii(phy, lane->mode);
+  		break;
+++<<<<<<< HEAD
+ +	case PHY_MODE_10GKR:
+ +		ret = mvebu_comphy_set_mode_10gkr(phy);
+++=======
++ 	case PHY_INTERFACE_MODE_RXAUI:
++ 		ret = mvebu_comphy_set_mode_rxaui(phy);
++ 		break;
++ 	case PHY_INTERFACE_MODE_10GBASER:
++ 		ret = mvebu_comphy_set_mode_10gbaser(phy);
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  		break;
+  	default:
+  		return -ENOTSUPP;
+@@@ -515,7 -750,90 +558,94 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int mvebu_comphy_set_mode(struct phy *phy, enum phy_mode mode)
+++=======
++ static int mvebu_comphy_power_on(struct phy *phy)
++ {
++ 	struct mvebu_comphy_lane *lane = phy_get_drvdata(phy);
++ 	struct mvebu_comphy_priv *priv = lane->priv;
++ 	int fw_mode, fw_speed;
++ 	u32 fw_param = 0;
++ 	int ret;
++ 
++ 	fw_mode = mvebu_comphy_get_fw_mode(lane->id, lane->port,
++ 					   lane->mode, lane->submode);
++ 	if (fw_mode < 0)
++ 		goto try_legacy;
++ 
++ 	/* Try SMC flow first */
++ 	switch (lane->mode) {
++ 	case PHY_MODE_ETHERNET:
++ 		switch (lane->submode) {
++ 		case PHY_INTERFACE_MODE_RXAUI:
++ 			dev_dbg(priv->dev, "set lane %d to RXAUI mode\n",
++ 				lane->id);
++ 			fw_speed = 0;
++ 			break;
++ 		case PHY_INTERFACE_MODE_SGMII:
++ 			dev_dbg(priv->dev, "set lane %d to 1000BASE-X mode\n",
++ 				lane->id);
++ 			fw_speed = COMPHY_FW_SPEED_1250;
++ 			break;
++ 		case PHY_INTERFACE_MODE_2500BASEX:
++ 			dev_dbg(priv->dev, "set lane %d to 2500BASE-X mode\n",
++ 				lane->id);
++ 			fw_speed = COMPHY_FW_SPEED_3125;
++ 			break;
++ 		case PHY_INTERFACE_MODE_10GBASER:
++ 			dev_dbg(priv->dev, "set lane %d to 10GBASE-R mode\n",
++ 				lane->id);
++ 			fw_speed = COMPHY_FW_SPEED_103125;
++ 			break;
++ 		default:
++ 			dev_err(priv->dev, "unsupported Ethernet mode (%d)\n",
++ 				lane->submode);
++ 			return -ENOTSUPP;
++ 		}
++ 		fw_param = COMPHY_FW_PARAM_ETH(fw_mode, lane->port, fw_speed);
++ 		break;
++ 	case PHY_MODE_USB_HOST_SS:
++ 	case PHY_MODE_USB_DEVICE_SS:
++ 		dev_dbg(priv->dev, "set lane %d to USB3 mode\n", lane->id);
++ 		fw_param = COMPHY_FW_PARAM(fw_mode, lane->port);
++ 		break;
++ 	case PHY_MODE_SATA:
++ 		dev_dbg(priv->dev, "set lane %d to SATA mode\n", lane->id);
++ 		fw_param = COMPHY_FW_PARAM(fw_mode, lane->port);
++ 		break;
++ 	case PHY_MODE_PCIE:
++ 		dev_dbg(priv->dev, "set lane %d to PCIe mode (x%d)\n", lane->id,
++ 			lane->submode);
++ 		fw_param = COMPHY_FW_PARAM_PCIE(fw_mode, lane->port,
++ 						lane->submode);
++ 		break;
++ 	default:
++ 		dev_err(priv->dev, "unsupported PHY mode (%d)\n", lane->mode);
++ 		return -ENOTSUPP;
++ 	}
++ 
++ 	ret = mvebu_comphy_smc(COMPHY_SIP_POWER_ON, priv->cp_phys, lane->id,
++ 			       fw_param);
++ 	if (!ret)
++ 		return ret;
++ 
++ 	if (ret == COMPHY_FW_NOT_SUPPORTED)
++ 		dev_err(priv->dev,
++ 			"unsupported SMC call, try updating your firmware\n");
++ 
++ 	dev_warn(priv->dev,
++ 		 "Firmware could not configure PHY %d with mode %d (ret: %d), trying legacy method\n",
++ 		 lane->id, lane->mode, ret);
++ 
++ try_legacy:
++ 	/* Fallback to Linux's implementation */
++ 	return mvebu_comphy_power_on_legacy(phy);
++ }
++ 
++ static int mvebu_comphy_set_mode(struct phy *phy,
++ 				 enum phy_mode mode, int submode)
+++>>>>>>> e0f909bc3a24 (net: switch to using PHY_INTERFACE_MODE_10GBASER rather than 10GKR)
+  {
+  	struct mvebu_comphy_lane *lane = phy_get_drvdata(phy);
+  
+* Unmerged path drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+diff --git a/drivers/net/phy/aquantia_main.c b/drivers/net/phy/aquantia_main.c
+index beac2a18c89d..968dd43a2b1e 100644
+--- a/drivers/net/phy/aquantia_main.c
++++ b/drivers/net/phy/aquantia_main.c
+@@ -376,9 +376,11 @@ static int aqr107_read_status(struct phy_device *phydev)
+ 
+ 	switch (FIELD_GET(MDIO_PHYXS_VEND_IF_STATUS_TYPE_MASK, val)) {
+ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_KR:
+-	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_XFI:
+ 		phydev->interface = PHY_INTERFACE_MODE_10GKR;
+ 		break;
++	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_XFI:
++		phydev->interface = PHY_INTERFACE_MODE_10GBASER;
++		break;
+ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_USXGMII:
+ 		phydev->interface = PHY_INTERFACE_MODE_USXGMII;
+ 		break;
+@@ -500,7 +502,8 @@ static int aqr107_config_init(struct phy_device *phydev)
+ 	    phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
+ 	    phydev->interface != PHY_INTERFACE_MODE_XGMII &&
+ 	    phydev->interface != PHY_INTERFACE_MODE_USXGMII &&
+-	    phydev->interface != PHY_INTERFACE_MODE_10GKR)
++	    phydev->interface != PHY_INTERFACE_MODE_10GKR &&
++	    phydev->interface != PHY_INTERFACE_MODE_10GBASER)
+ 		return -ENODEV;
+ 
+ 	WARN(phydev->interface == PHY_INTERFACE_MODE_XGMII,
+diff --git a/drivers/net/phy/bcm84881.c b/drivers/net/phy/bcm84881.c
+index 98af3e4da9f9..9717a1626f3f 100644
+--- a/drivers/net/phy/bcm84881.c
++++ b/drivers/net/phy/bcm84881.c
+@@ -34,7 +34,7 @@ static int bcm84881_config_init(struct phy_device *phydev)
+ 	switch (phydev->interface) {
+ 	case PHY_INTERFACE_MODE_SGMII:
+ 	case PHY_INTERFACE_MODE_2500BASEX:
+-	case PHY_INTERFACE_MODE_10GKR:
++	case PHY_INTERFACE_MODE_10GBASER:
+ 		break;
+ 	default:
+ 		return -ENODEV;
+@@ -199,7 +199,7 @@ static int bcm84881_read_status(struct phy_device *phydev)
+ 	if (mode == 1 || mode == 2)
+ 		phydev->interface = PHY_INTERFACE_MODE_SGMII;
+ 	else if (mode == 3)
+-		phydev->interface = PHY_INTERFACE_MODE_10GKR;
++		phydev->interface = PHY_INTERFACE_MODE_10GBASER;
+ 	else if (mode == 4)
+ 		phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
+ 	switch (mode & 7) {
+diff --git a/drivers/net/phy/marvell10g.c b/drivers/net/phy/marvell10g.c
+index 4530845f270a..04540289d0a5 100644
+--- a/drivers/net/phy/marvell10g.c
++++ b/drivers/net/phy/marvell10g.c
+@@ -345,7 +345,7 @@ static int mv3310_sfp_insert(void *upstream, const struct sfp_eeprom_id *id)
+ 	sfp_parse_support(phydev->sfp_bus, id, support);
+ 	iface = sfp_select_interface(phydev->sfp_bus, support);
+ 
+-	if (iface != PHY_INTERFACE_MODE_10GKR) {
++	if (iface != PHY_INTERFACE_MODE_10GBASER) {
+ 		dev_err(&phydev->mdio.dev, "incompatible SFP module inserted\n");
+ 		return -EINVAL;
+ 	}
+@@ -459,7 +459,7 @@ static int mv3310_config_init(struct phy_device *phydev)
+ 	    phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
+ 	    phydev->interface != PHY_INTERFACE_MODE_XAUI &&
+ 	    phydev->interface != PHY_INTERFACE_MODE_RXAUI &&
+-	    phydev->interface != PHY_INTERFACE_MODE_10GKR)
++	    phydev->interface != PHY_INTERFACE_MODE_10GBASER)
+ 		return -ENODEV;
+ 
+ 	phydev->mdix_ctrl = ETH_TP_MDI_AUTO;
+@@ -577,16 +577,17 @@ static void mv3310_update_interface(struct phy_device *phydev)
+ {
+ 	if ((phydev->interface == PHY_INTERFACE_MODE_SGMII ||
+ 	     phydev->interface == PHY_INTERFACE_MODE_2500BASEX ||
+-	     phydev->interface == PHY_INTERFACE_MODE_10GKR) && phydev->link) {
++	     phydev->interface == PHY_INTERFACE_MODE_10GBASER) &&
++	    phydev->link) {
+ 		/* The PHY automatically switches its serdes interface (and
+-		 * active PHYXS instance) between Cisco SGMII, 10GBase-KR and
++		 * active PHYXS instance) between Cisco SGMII, 10GBase-R and
+ 		 * 2500BaseX modes according to the speed.  Florian suggests
+ 		 * setting phydev->interface to communicate this to the MAC.
+ 		 * Only do this if we are already in one of the above modes.
+ 		 */
+ 		switch (phydev->speed) {
+ 		case SPEED_10000:
+-			phydev->interface = PHY_INTERFACE_MODE_10GKR;
++			phydev->interface = PHY_INTERFACE_MODE_10GBASER;
+ 			break;
+ 		case SPEED_2500:
+ 			phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index aa4980b7e71f..82b6d090ede6 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -309,6 +309,7 @@ static int phylink_parse_mode(struct phylink *pl, struct fwnode_handle *fwnode)
+ 
+ 		case PHY_INTERFACE_MODE_USXGMII:
+ 		case PHY_INTERFACE_MODE_10GKR:
++		case PHY_INTERFACE_MODE_10GBASER:
+ 			phylink_set(pl->supported, 10baseT_Half);
+ 			phylink_set(pl->supported, 10baseT_Full);
+ 			phylink_set(pl->supported, 100baseT_Half);
+diff --git a/drivers/net/phy/sfp-bus.c b/drivers/net/phy/sfp-bus.c
+index 6124776a39f8..c4b6b8cfead1 100644
+--- a/drivers/net/phy/sfp-bus.c
++++ b/drivers/net/phy/sfp-bus.c
+@@ -372,7 +372,7 @@ phy_interface_t sfp_select_interface(struct sfp_bus *bus,
+ 	    phylink_test(link_modes, 10000baseLRM_Full) ||
+ 	    phylink_test(link_modes, 10000baseER_Full) ||
+ 	    phylink_test(link_modes, 10000baseT_Full))
+-		return PHY_INTERFACE_MODE_10GKR;
++		return PHY_INTERFACE_MODE_10GBASER;
+ 
+ 	if (phylink_test(link_modes, 2500baseX_Full))
+ 		return PHY_INTERFACE_MODE_2500BASEX;
+* Unmerged path drivers/phy/marvell/phy-mvebu-cp110-comphy.c
