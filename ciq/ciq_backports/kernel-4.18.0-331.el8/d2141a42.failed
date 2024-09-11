@@ -1,0 +1,868 @@
+mlxsw: spectrum_router: Track nexthop group virtual router membership
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit d2141a42b96ad8bbc221bf6e0706764d5c4440fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/d2141a42.failed
+
+For each nexthop group, track in which virtual routers (VRs) the group is
+used. This is going to be used by the next patch to perform a more
+efficient adjacency index update whenever the group's adjacency index
+changes.
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit d2141a42b96ad8bbc221bf6e0706764d5c4440fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index cfa089299405,9e3dfd2f7f45..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -2888,6 -2889,36 +2888,39 @@@ struct mlxsw_sp_nexthop_group 
+  #define nh_rif	nexthops[0].rif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlxsw_sp_nexthop_group_vr_key {
++ 	u16 vr_id;
++ 	enum mlxsw_sp_l3proto proto;
++ };
++ 
++ struct mlxsw_sp_nexthop_group_vr_entry {
++ 	struct list_head list; /* member in vr_list */
++ 	struct rhash_head ht_node; /* member in vr_ht */
++ 	refcount_t ref_count;
++ 	struct mlxsw_sp_nexthop_group_vr_key key;
++ };
++ 
++ struct mlxsw_sp_nexthop_group {
++ 	struct rhash_head ht_node;
++ 	struct list_head fib_list; /* list of fib entries that use this group */
++ 	union {
++ 		struct {
++ 			struct fib_info *fi;
++ 		} ipv4;
++ 		struct {
++ 			u32 id;
++ 		} obj;
++ 	};
++ 	struct mlxsw_sp_nexthop_group_info *nhgi;
++ 	struct list_head vr_list;
++ 	struct rhashtable vr_ht;
++ 	enum mlxsw_sp_nexthop_group_type type;
++ 	bool can_destroy;
++ };
++ 
+++>>>>>>> d2141a42b96a (mlxsw: spectrum_router: Track nexthop group virtual router membership)
+  void mlxsw_sp_nexthop_counter_alloc(struct mlxsw_sp *mlxsw_sp,
+  				    struct mlxsw_sp_nexthop *nh)
+  {
+@@@ -2995,12 -3026,101 +3028,102 @@@ bool mlxsw_sp_nexthop_group_has_ipip(st
+  	return false;
+  }
+  
+ -bool mlxsw_sp_nexthop_is_discard(const struct mlxsw_sp_nexthop *nh)
+ +static struct fib_info *
+ +mlxsw_sp_nexthop4_group_fi(const struct mlxsw_sp_nexthop_group *nh_grp)
+  {
+ -	return nh->discard;
+ +	return nh_grp->priv;
+  }
+  
++ static const struct rhashtable_params mlxsw_sp_nexthop_group_vr_ht_params = {
++ 	.key_offset = offsetof(struct mlxsw_sp_nexthop_group_vr_entry, key),
++ 	.head_offset = offsetof(struct mlxsw_sp_nexthop_group_vr_entry, ht_node),
++ 	.key_len = sizeof(struct mlxsw_sp_nexthop_group_vr_key),
++ 	.automatic_shrinking = true,
++ };
++ 
++ static struct mlxsw_sp_nexthop_group_vr_entry *
++ mlxsw_sp_nexthop_group_vr_entry_lookup(struct mlxsw_sp_nexthop_group *nh_grp,
++ 				       const struct mlxsw_sp_fib *fib)
++ {
++ 	struct mlxsw_sp_nexthop_group_vr_key key;
++ 
++ 	memset(&key, 0, sizeof(key));
++ 	key.vr_id = fib->vr->id;
++ 	key.proto = fib->proto;
++ 	return rhashtable_lookup_fast(&nh_grp->vr_ht, &key,
++ 				      mlxsw_sp_nexthop_group_vr_ht_params);
++ }
++ 
++ static int
++ mlxsw_sp_nexthop_group_vr_entry_create(struct mlxsw_sp_nexthop_group *nh_grp,
++ 				       const struct mlxsw_sp_fib *fib)
++ {
++ 	struct mlxsw_sp_nexthop_group_vr_entry *vr_entry;
++ 	int err;
++ 
++ 	vr_entry = kzalloc(sizeof(*vr_entry), GFP_KERNEL);
++ 	if (!vr_entry)
++ 		return -ENOMEM;
++ 
++ 	vr_entry->key.vr_id = fib->vr->id;
++ 	vr_entry->key.proto = fib->proto;
++ 	refcount_set(&vr_entry->ref_count, 1);
++ 
++ 	err = rhashtable_insert_fast(&nh_grp->vr_ht, &vr_entry->ht_node,
++ 				     mlxsw_sp_nexthop_group_vr_ht_params);
++ 	if (err)
++ 		goto err_hashtable_insert;
++ 
++ 	list_add(&vr_entry->list, &nh_grp->vr_list);
++ 
++ 	return 0;
++ 
++ err_hashtable_insert:
++ 	kfree(vr_entry);
++ 	return err;
++ }
++ 
++ static void
++ mlxsw_sp_nexthop_group_vr_entry_destroy(struct mlxsw_sp_nexthop_group *nh_grp,
++ 					struct mlxsw_sp_nexthop_group_vr_entry *vr_entry)
++ {
++ 	list_del(&vr_entry->list);
++ 	rhashtable_remove_fast(&nh_grp->vr_ht, &vr_entry->ht_node,
++ 			       mlxsw_sp_nexthop_group_vr_ht_params);
++ 	kfree(vr_entry);
++ }
++ 
++ static int
++ mlxsw_sp_nexthop_group_vr_link(struct mlxsw_sp_nexthop_group *nh_grp,
++ 			       const struct mlxsw_sp_fib *fib)
++ {
++ 	struct mlxsw_sp_nexthop_group_vr_entry *vr_entry;
++ 
++ 	vr_entry = mlxsw_sp_nexthop_group_vr_entry_lookup(nh_grp, fib);
++ 	if (vr_entry) {
++ 		refcount_inc(&vr_entry->ref_count);
++ 		return 0;
++ 	}
++ 
++ 	return mlxsw_sp_nexthop_group_vr_entry_create(nh_grp, fib);
++ }
++ 
++ static void
++ mlxsw_sp_nexthop_group_vr_unlink(struct mlxsw_sp_nexthop_group *nh_grp,
++ 				 const struct mlxsw_sp_fib *fib)
++ {
++ 	struct mlxsw_sp_nexthop_group_vr_entry *vr_entry;
++ 
++ 	vr_entry = mlxsw_sp_nexthop_group_vr_entry_lookup(nh_grp, fib);
++ 	if (WARN_ON_ONCE(!vr_entry))
++ 		return;
++ 
++ 	if (!refcount_dec_and_test(&vr_entry->ref_count))
++ 		return;
++ 
++ 	mlxsw_sp_nexthop_group_vr_entry_destroy(nh_grp, vr_entry);
++ }
++ 
+  struct mlxsw_sp_nexthop_group_cmp_arg {
+  	enum mlxsw_sp_nexthop_group_type type;
+  	union {
+@@@ -4101,41 -4248,537 +4224,492 @@@ static void mlxsw_sp_nexthop_rif_gone_s
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlxsw_sp_nexthop_obj_single_validate(struct mlxsw_sp *mlxsw_sp,
++ 				     const struct nh_notifier_single_info *nh,
++ 				     struct netlink_ext_ack *extack)
++ {
++ 	int err = -EINVAL;
++ 
++ 	if (nh->is_fdb)
++ 		NL_SET_ERR_MSG_MOD(extack, "FDB nexthops are not supported");
++ 	else if (nh->has_encap)
++ 		NL_SET_ERR_MSG_MOD(extack, "Encapsulating nexthops are not supported");
++ 	else
++ 		err = 0;
++ 
++ 	return err;
++ }
++ 
++ static int
++ mlxsw_sp_nexthop_obj_group_validate(struct mlxsw_sp *mlxsw_sp,
++ 				    const struct nh_notifier_grp_info *nh_grp,
++ 				    struct netlink_ext_ack *extack)
++ {
++ 	int i;
++ 
++ 	if (nh_grp->is_fdb) {
++ 		NL_SET_ERR_MSG_MOD(extack, "FDB nexthop groups are not supported");
++ 		return -EINVAL;
++ 	}
++ 
++ 	for (i = 0; i < nh_grp->num_nh; i++) {
++ 		const struct nh_notifier_single_info *nh;
++ 		int err;
++ 
++ 		nh = &nh_grp->nh_entries[i].nh;
++ 		err = mlxsw_sp_nexthop_obj_single_validate(mlxsw_sp, nh,
++ 							   extack);
++ 		if (err)
++ 			return err;
++ 
++ 		/* Device only nexthops with an IPIP device are programmed as
++ 		 * encapsulating adjacency entries.
++ 		 */
++ 		if (!nh->gw_family && !nh->is_reject &&
++ 		    !mlxsw_sp_netdev_ipip_type(mlxsw_sp, nh->dev, NULL)) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Nexthop group entry does not have a gateway");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int mlxsw_sp_nexthop_obj_validate(struct mlxsw_sp *mlxsw_sp,
++ 					 unsigned long event,
++ 					 struct nh_notifier_info *info)
++ {
++ 	if (event != NEXTHOP_EVENT_REPLACE)
++ 		return 0;
++ 
++ 	if (!info->is_grp)
++ 		return mlxsw_sp_nexthop_obj_single_validate(mlxsw_sp, info->nh,
++ 							    info->extack);
++ 	return mlxsw_sp_nexthop_obj_group_validate(mlxsw_sp, info->nh_grp,
++ 						   info->extack);
++ }
++ 
++ static bool mlxsw_sp_nexthop_obj_is_gateway(struct mlxsw_sp *mlxsw_sp,
++ 					    const struct nh_notifier_info *info)
++ {
++ 	const struct net_device *dev;
++ 
++ 	if (info->is_grp)
++ 		/* Already validated earlier. */
++ 		return true;
++ 
++ 	dev = info->nh->dev;
++ 	return info->nh->gw_family || info->nh->is_reject ||
++ 	       mlxsw_sp_netdev_ipip_type(mlxsw_sp, dev, NULL);
++ }
++ 
++ static void mlxsw_sp_nexthop_obj_blackhole_init(struct mlxsw_sp *mlxsw_sp,
++ 						struct mlxsw_sp_nexthop *nh)
++ {
++ 	u16 lb_rif_index = mlxsw_sp->router->lb_rif_index;
++ 
++ 	nh->discard = 1;
++ 	nh->should_offload = 1;
++ 	/* While nexthops that discard packets do not forward packets
++ 	 * via an egress RIF, they still need to be programmed using a
++ 	 * valid RIF, so use the loopback RIF created during init.
++ 	 */
++ 	nh->rif = mlxsw_sp->router->rifs[lb_rif_index];
++ }
++ 
++ static void mlxsw_sp_nexthop_obj_blackhole_fini(struct mlxsw_sp *mlxsw_sp,
++ 						struct mlxsw_sp_nexthop *nh)
++ {
++ 	nh->rif = NULL;
++ 	nh->should_offload = 0;
++ }
++ 
++ static int
++ mlxsw_sp_nexthop_obj_init(struct mlxsw_sp *mlxsw_sp,
++ 			  struct mlxsw_sp_nexthop_group *nh_grp,
++ 			  struct mlxsw_sp_nexthop *nh,
++ 			  struct nh_notifier_single_info *nh_obj, int weight)
++ {
++ 	struct net_device *dev = nh_obj->dev;
++ 	int err;
++ 
++ 	nh->nhgi = nh_grp->nhgi;
++ 	nh->nh_weight = weight;
++ 
++ 	switch (nh_obj->gw_family) {
++ 	case AF_INET:
++ 		memcpy(&nh->gw_addr, &nh_obj->ipv4, sizeof(nh_obj->ipv4));
++ 		nh->neigh_tbl = &arp_tbl;
++ 		break;
++ 	case AF_INET6:
++ 		memcpy(&nh->gw_addr, &nh_obj->ipv6, sizeof(nh_obj->ipv6));
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		nh->neigh_tbl = &nd_tbl;
++ #endif
++ 		break;
++ 	}
++ 
++ 	mlxsw_sp_nexthop_counter_alloc(mlxsw_sp, nh);
++ 	list_add_tail(&nh->router_list_node, &mlxsw_sp->router->nexthop_list);
++ 	nh->ifindex = dev->ifindex;
++ 
++ 	err = mlxsw_sp_nexthop_type_init(mlxsw_sp, nh, dev);
++ 	if (err)
++ 		goto err_type_init;
++ 
++ 	if (nh_obj->is_reject)
++ 		mlxsw_sp_nexthop_obj_blackhole_init(mlxsw_sp, nh);
++ 
++ 	return 0;
++ 
++ err_type_init:
++ 	list_del(&nh->router_list_node);
++ 	mlxsw_sp_nexthop_counter_free(mlxsw_sp, nh);
++ 	return err;
++ }
++ 
++ static void mlxsw_sp_nexthop_obj_fini(struct mlxsw_sp *mlxsw_sp,
++ 				      struct mlxsw_sp_nexthop *nh)
++ {
++ 	if (nh->discard)
++ 		mlxsw_sp_nexthop_obj_blackhole_fini(mlxsw_sp, nh);
++ 	mlxsw_sp_nexthop_type_fini(mlxsw_sp, nh);
++ 	list_del(&nh->router_list_node);
++ 	mlxsw_sp_nexthop_counter_free(mlxsw_sp, nh);
++ }
++ 
++ static int
++ mlxsw_sp_nexthop_obj_group_info_init(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_nexthop_group *nh_grp,
++ 				     struct nh_notifier_info *info)
++ {
++ 	unsigned int nhs = info->is_grp ? info->nh_grp->num_nh : 1;
++ 	struct mlxsw_sp_nexthop_group_info *nhgi;
++ 	struct mlxsw_sp_nexthop *nh;
++ 	int err, i;
++ 
++ 	nhgi = kzalloc(struct_size(nhgi, nexthops, nhs), GFP_KERNEL);
++ 	if (!nhgi)
++ 		return -ENOMEM;
++ 	nh_grp->nhgi = nhgi;
++ 	nhgi->nh_grp = nh_grp;
++ 	nhgi->gateway = mlxsw_sp_nexthop_obj_is_gateway(mlxsw_sp, info);
++ 	nhgi->count = nhs;
++ 	for (i = 0; i < nhgi->count; i++) {
++ 		struct nh_notifier_single_info *nh_obj;
++ 		int weight;
++ 
++ 		nh = &nhgi->nexthops[i];
++ 		if (info->is_grp) {
++ 			nh_obj = &info->nh_grp->nh_entries[i].nh;
++ 			weight = info->nh_grp->nh_entries[i].weight;
++ 		} else {
++ 			nh_obj = info->nh;
++ 			weight = 1;
++ 		}
++ 		err = mlxsw_sp_nexthop_obj_init(mlxsw_sp, nh_grp, nh, nh_obj,
++ 						weight);
++ 		if (err)
++ 			goto err_nexthop_obj_init;
++ 	}
++ 	err = mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
++ 	if (err) {
++ 		NL_SET_ERR_MSG_MOD(info->extack, "Failed to write adjacency entries to the device");
++ 		goto err_group_refresh;
++ 	}
++ 
++ 	return 0;
++ 
++ err_group_refresh:
++ 	i = nhgi->count;
++ err_nexthop_obj_init:
++ 	for (i--; i >= 0; i--) {
++ 		nh = &nhgi->nexthops[i];
++ 		mlxsw_sp_nexthop_obj_fini(mlxsw_sp, nh);
++ 	}
++ 	kfree(nhgi);
++ 	return err;
++ }
++ 
++ static void
++ mlxsw_sp_nexthop_obj_group_info_fini(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_nexthop_group *nh_grp)
++ {
++ 	struct mlxsw_sp_nexthop_group_info *nhgi = nh_grp->nhgi;
++ 	int i;
++ 
++ 	for (i = nhgi->count - 1; i >= 0; i--) {
++ 		struct mlxsw_sp_nexthop *nh = &nhgi->nexthops[i];
++ 
++ 		mlxsw_sp_nexthop_obj_fini(mlxsw_sp, nh);
++ 	}
++ 	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
++ 	WARN_ON_ONCE(nhgi->adj_index_valid);
++ 	kfree(nhgi);
++ }
++ 
++ static struct mlxsw_sp_nexthop_group *
++ mlxsw_sp_nexthop_obj_group_create(struct mlxsw_sp *mlxsw_sp,
++ 				  struct nh_notifier_info *info)
++ {
++ 	struct mlxsw_sp_nexthop_group *nh_grp;
++ 	int err;
++ 
++ 	nh_grp = kzalloc(sizeof(*nh_grp), GFP_KERNEL);
++ 	if (!nh_grp)
++ 		return ERR_PTR(-ENOMEM);
++ 	INIT_LIST_HEAD(&nh_grp->vr_list);
++ 	err = rhashtable_init(&nh_grp->vr_ht,
++ 			      &mlxsw_sp_nexthop_group_vr_ht_params);
++ 	if (err)
++ 		goto err_nexthop_group_vr_ht_init;
++ 	INIT_LIST_HEAD(&nh_grp->fib_list);
++ 	nh_grp->type = MLXSW_SP_NEXTHOP_GROUP_TYPE_OBJ;
++ 	nh_grp->obj.id = info->id;
++ 
++ 	err = mlxsw_sp_nexthop_obj_group_info_init(mlxsw_sp, nh_grp, info);
++ 	if (err)
++ 		goto err_nexthop_group_info_init;
++ 
++ 	nh_grp->can_destroy = false;
++ 
++ 	return nh_grp;
++ 
++ err_nexthop_group_info_init:
++ 	rhashtable_destroy(&nh_grp->vr_ht);
++ err_nexthop_group_vr_ht_init:
++ 	kfree(nh_grp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void
++ mlxsw_sp_nexthop_obj_group_destroy(struct mlxsw_sp *mlxsw_sp,
++ 				   struct mlxsw_sp_nexthop_group *nh_grp)
++ {
++ 	if (!nh_grp->can_destroy)
++ 		return;
++ 	mlxsw_sp_nexthop_obj_group_info_fini(mlxsw_sp, nh_grp);
++ 	WARN_ON_ONCE(!list_empty(&nh_grp->fib_list));
++ 	WARN_ON_ONCE(!list_empty(&nh_grp->vr_list));
++ 	rhashtable_destroy(&nh_grp->vr_ht);
++ 	kfree(nh_grp);
++ }
++ 
++ static struct mlxsw_sp_nexthop_group *
++ mlxsw_sp_nexthop_obj_group_lookup(struct mlxsw_sp *mlxsw_sp, u32 id)
++ {
++ 	struct mlxsw_sp_nexthop_group_cmp_arg cmp_arg;
++ 
++ 	cmp_arg.type = MLXSW_SP_NEXTHOP_GROUP_TYPE_OBJ;
++ 	cmp_arg.id = id;
++ 	return rhashtable_lookup_fast(&mlxsw_sp->router->nexthop_group_ht,
++ 				      &cmp_arg,
++ 				      mlxsw_sp_nexthop_group_ht_params);
++ }
++ 
++ static int mlxsw_sp_nexthop_obj_group_add(struct mlxsw_sp *mlxsw_sp,
++ 					  struct mlxsw_sp_nexthop_group *nh_grp)
++ {
++ 	return mlxsw_sp_nexthop_group_insert(mlxsw_sp, nh_grp);
++ }
++ 
++ static int
++ mlxsw_sp_nexthop_obj_group_replace(struct mlxsw_sp *mlxsw_sp,
++ 				   struct mlxsw_sp_nexthop_group *nh_grp,
++ 				   struct mlxsw_sp_nexthop_group *old_nh_grp,
++ 				   struct netlink_ext_ack *extack)
++ {
++ 	struct mlxsw_sp_nexthop_group_info *old_nhgi = old_nh_grp->nhgi;
++ 	struct mlxsw_sp_nexthop_group_info *new_nhgi = nh_grp->nhgi;
++ 	int err;
++ 
++ 	old_nh_grp->nhgi = new_nhgi;
++ 	new_nhgi->nh_grp = old_nh_grp;
++ 	nh_grp->nhgi = old_nhgi;
++ 	old_nhgi->nh_grp = nh_grp;
++ 
++ 	if (old_nhgi->adj_index_valid && new_nhgi->adj_index_valid) {
++ 		/* Both the old adjacency index and the new one are valid.
++ 		 * Routes are currently using the old one. Tell the device to
++ 		 * replace the old adjacency index with the new one.
++ 		 */
++ 		err = mlxsw_sp_adj_index_mass_update(mlxsw_sp, old_nh_grp,
++ 						     old_nhgi->adj_index,
++ 						     old_nhgi->ecmp_size);
++ 		if (err) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Failed to replace old adjacency index with new one");
++ 			goto err_out;
++ 		}
++ 	} else if (old_nhgi->adj_index_valid && !new_nhgi->adj_index_valid) {
++ 		/* The old adjacency index is valid, while the new one is not.
++ 		 * Iterate over all the routes using the group and change them
++ 		 * to trap packets to the CPU.
++ 		 */
++ 		err = mlxsw_sp_nexthop_fib_entries_update(mlxsw_sp, old_nh_grp);
++ 		if (err) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Failed to update routes to trap packets");
++ 			goto err_out;
++ 		}
++ 	} else if (!old_nhgi->adj_index_valid && new_nhgi->adj_index_valid) {
++ 		/* The old adjacency index is invalid, while the new one is.
++ 		 * Iterate over all the routes using the group and change them
++ 		 * to forward packets using the new valid index.
++ 		 */
++ 		err = mlxsw_sp_nexthop_fib_entries_update(mlxsw_sp, old_nh_grp);
++ 		if (err) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Failed to update routes to forward packets");
++ 			goto err_out;
++ 		}
++ 	}
++ 
++ 	/* Make sure the flags are set / cleared based on the new nexthop group
++ 	 * information.
++ 	 */
++ 	mlxsw_sp_nexthop_obj_group_offload_refresh(mlxsw_sp, old_nh_grp);
++ 
++ 	/* At this point 'nh_grp' is just a shell that is not used by anyone
++ 	 * and its nexthop group info is the old info that was just replaced
++ 	 * with the new one. Remove it.
++ 	 */
++ 	nh_grp->can_destroy = true;
++ 	mlxsw_sp_nexthop_obj_group_destroy(mlxsw_sp, nh_grp);
++ 
++ 	return 0;
++ 
++ err_out:
++ 	old_nhgi->nh_grp = old_nh_grp;
++ 	nh_grp->nhgi = new_nhgi;
++ 	new_nhgi->nh_grp = nh_grp;
++ 	old_nh_grp->nhgi = old_nhgi;
++ 	return err;
++ }
++ 
++ static int mlxsw_sp_nexthop_obj_new(struct mlxsw_sp *mlxsw_sp,
++ 				    struct nh_notifier_info *info)
++ {
++ 	struct mlxsw_sp_nexthop_group *nh_grp, *old_nh_grp;
++ 	struct netlink_ext_ack *extack = info->extack;
++ 	int err;
++ 
++ 	nh_grp = mlxsw_sp_nexthop_obj_group_create(mlxsw_sp, info);
++ 	if (IS_ERR(nh_grp))
++ 		return PTR_ERR(nh_grp);
++ 
++ 	old_nh_grp = mlxsw_sp_nexthop_obj_group_lookup(mlxsw_sp, info->id);
++ 	if (!old_nh_grp)
++ 		err = mlxsw_sp_nexthop_obj_group_add(mlxsw_sp, nh_grp);
++ 	else
++ 		err = mlxsw_sp_nexthop_obj_group_replace(mlxsw_sp, nh_grp,
++ 							 old_nh_grp, extack);
++ 
++ 	if (err) {
++ 		nh_grp->can_destroy = true;
++ 		mlxsw_sp_nexthop_obj_group_destroy(mlxsw_sp, nh_grp);
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static void mlxsw_sp_nexthop_obj_del(struct mlxsw_sp *mlxsw_sp,
++ 				     struct nh_notifier_info *info)
++ {
++ 	struct mlxsw_sp_nexthop_group *nh_grp;
++ 
++ 	nh_grp = mlxsw_sp_nexthop_obj_group_lookup(mlxsw_sp, info->id);
++ 	if (!nh_grp)
++ 		return;
++ 
++ 	nh_grp->can_destroy = true;
++ 	mlxsw_sp_nexthop_group_remove(mlxsw_sp, nh_grp);
++ 
++ 	/* If the group still has routes using it, then defer the delete
++ 	 * operation until the last route using it is deleted.
++ 	 */
++ 	if (!list_empty(&nh_grp->fib_list))
++ 		return;
++ 	mlxsw_sp_nexthop_obj_group_destroy(mlxsw_sp, nh_grp);
++ }
++ 
++ static int mlxsw_sp_nexthop_obj_event(struct notifier_block *nb,
++ 				      unsigned long event, void *ptr)
++ {
++ 	struct nh_notifier_info *info = ptr;
++ 	struct mlxsw_sp_router *router;
++ 	int err = 0;
++ 
++ 	router = container_of(nb, struct mlxsw_sp_router, nexthop_nb);
++ 	err = mlxsw_sp_nexthop_obj_validate(router->mlxsw_sp, event, info);
++ 	if (err)
++ 		goto out;
++ 
++ 	mutex_lock(&router->lock);
++ 
++ 	ASSERT_RTNL();
++ 
++ 	switch (event) {
++ 	case NEXTHOP_EVENT_REPLACE:
++ 		err = mlxsw_sp_nexthop_obj_new(router->mlxsw_sp, info);
++ 		break;
++ 	case NEXTHOP_EVENT_DEL:
++ 		mlxsw_sp_nexthop_obj_del(router->mlxsw_sp, info);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	mutex_unlock(&router->lock);
++ 
++ out:
++ 	return notifier_from_errno(err);
++ }
++ 
+++>>>>>>> d2141a42b96a (mlxsw: spectrum_router: Track nexthop group virtual router membership)
+  static bool mlxsw_sp_fi_is_gateway(const struct mlxsw_sp *mlxsw_sp,
+ -				   struct fib_info *fi)
+ +				   const struct fib_info *fi)
+  {
+ -	const struct fib_nh *nh = fib_info_nh(fi, 0);
+ -
+ -	return nh->fib_nh_scope == RT_SCOPE_LINK ||
+ -	       mlxsw_sp_nexthop4_ipip_type(mlxsw_sp, nh, NULL);
+ -}
+ -
+ -static int
+ -mlxsw_sp_nexthop4_group_info_init(struct mlxsw_sp *mlxsw_sp,
+ -				  struct mlxsw_sp_nexthop_group *nh_grp)
+ -{
+ -	unsigned int nhs = fib_info_num_path(nh_grp->ipv4.fi);
+ -	struct mlxsw_sp_nexthop_group_info *nhgi;
+ -	struct mlxsw_sp_nexthop *nh;
+ -	int err, i;
+ -
+ -	nhgi = kzalloc(struct_size(nhgi, nexthops, nhs), GFP_KERNEL);
+ -	if (!nhgi)
+ -		return -ENOMEM;
+ -	nh_grp->nhgi = nhgi;
+ -	nhgi->nh_grp = nh_grp;
+ -	nhgi->gateway = mlxsw_sp_fi_is_gateway(mlxsw_sp, nh_grp->ipv4.fi);
+ -	nhgi->count = nhs;
+ -	for (i = 0; i < nhgi->count; i++) {
+ -		struct fib_nh *fib_nh;
+ -
+ -		nh = &nhgi->nexthops[i];
+ -		fib_nh = fib_info_nh(nh_grp->ipv4.fi, i);
+ -		err = mlxsw_sp_nexthop4_init(mlxsw_sp, nh_grp, nh, fib_nh);
+ -		if (err)
+ -			goto err_nexthop4_init;
+ -	}
+ -	err = mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
+ -	if (err)
+ -		goto err_group_refresh;
+ -
+ -	return 0;
+ -
+ -err_group_refresh:
+ -	i = nhgi->count;
+ -err_nexthop4_init:
+ -	for (i--; i >= 0; i--) {
+ -		nh = &nhgi->nexthops[i];
+ -		mlxsw_sp_nexthop4_fini(mlxsw_sp, nh);
+ -	}
+ -	kfree(nhgi);
+ -	return err;
+ -}
+ -
+ -static void
+ -mlxsw_sp_nexthop4_group_info_fini(struct mlxsw_sp *mlxsw_sp,
+ -				  struct mlxsw_sp_nexthop_group *nh_grp)
+ -{
+ -	struct mlxsw_sp_nexthop_group_info *nhgi = nh_grp->nhgi;
+ -	int i;
+ -
+ -	for (i = nhgi->count - 1; i >= 0; i--) {
+ -		struct mlxsw_sp_nexthop *nh = &nhgi->nexthops[i];
+ -
+ -		mlxsw_sp_nexthop4_fini(mlxsw_sp, nh);
+ -	}
+ -	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
+ -	WARN_ON_ONCE(nhgi->adj_index_valid);
+ -	kfree(nhgi);
+ +	return fi->fib_nh->nh_scope == RT_SCOPE_LINK ||
+ +	       mlxsw_sp_nexthop4_ipip_type(mlxsw_sp, fi->fib_nh, NULL);
+  }
+  
+  static struct mlxsw_sp_nexthop_group *
+  mlxsw_sp_nexthop4_group_create(struct mlxsw_sp *mlxsw_sp, struct fib_info *fi)
+  {
+  	struct mlxsw_sp_nexthop_group *nh_grp;
+ +	struct mlxsw_sp_nexthop *nh;
+ +	struct fib_nh *fib_nh;
+ +	int i;
+  	int err;
+  
+ -	nh_grp = kzalloc(sizeof(*nh_grp), GFP_KERNEL);
+ +	nh_grp = kzalloc(struct_size(nh_grp, nexthops, fi->fib_nhs),
+ +			 GFP_KERNEL);
+  	if (!nh_grp)
+  		return ERR_PTR(-ENOMEM);
+++<<<<<<< HEAD
+ +	nh_grp->priv = fi;
+++=======
++ 	INIT_LIST_HEAD(&nh_grp->vr_list);
++ 	err = rhashtable_init(&nh_grp->vr_ht,
++ 			      &mlxsw_sp_nexthop_group_vr_ht_params);
++ 	if (err)
++ 		goto err_nexthop_group_vr_ht_init;
+++>>>>>>> d2141a42b96a (mlxsw: spectrum_router: Track nexthop group virtual router membership)
+  	INIT_LIST_HEAD(&nh_grp->fib_list);
+ +	nh_grp->neigh_tbl = &arp_tbl;
+  	nh_grp->type = MLXSW_SP_NEXTHOP_GROUP_TYPE_IPV4;
+ -	nh_grp->ipv4.fi = fi;
+ -	fib_info_hold(fi);
+ -
+ -	err = mlxsw_sp_nexthop4_group_info_init(mlxsw_sp, nh_grp);
+ -	if (err)
+ -		goto err_nexthop_group_info_init;
+  
+ +	nh_grp->gateway = mlxsw_sp_fi_is_gateway(mlxsw_sp, fi);
+ +	nh_grp->count = fi->fib_nhs;
+ +	fib_info_hold(fi);
+ +	for (i = 0; i < nh_grp->count; i++) {
+ +		nh = &nh_grp->nexthops[i];
+ +		fib_nh = &fi->fib_nh[i];
+ +		err = mlxsw_sp_nexthop4_init(mlxsw_sp, nh_grp, nh, fib_nh);
+ +		if (err)
+ +			goto err_nexthop4_init;
+ +	}
+  	err = mlxsw_sp_nexthop_group_insert(mlxsw_sp, nh_grp);
+  	if (err)
+  		goto err_nexthop_group_insert;
+@@@ -4143,12 -4788,11 +4717,14 @@@
+  	return nh_grp;
+  
+  err_nexthop_group_insert:
+ -	mlxsw_sp_nexthop4_group_info_fini(mlxsw_sp, nh_grp);
+ -err_nexthop_group_info_init:
+ +err_nexthop4_init:
+ +	for (i--; i >= 0; i--) {
+ +		nh = &nh_grp->nexthops[i];
+ +		mlxsw_sp_nexthop4_fini(mlxsw_sp, nh);
+ +	}
+  	fib_info_put(fi);
++ 	rhashtable_destroy(&nh_grp->vr_ht);
++ err_nexthop_group_vr_ht_init:
+  	kfree(nh_grp);
+  	return ERR_PTR(err);
+  }
+@@@ -4157,17 -4801,13 +4733,24 @@@ static voi
+  mlxsw_sp_nexthop4_group_destroy(struct mlxsw_sp *mlxsw_sp,
+  				struct mlxsw_sp_nexthop_group *nh_grp)
+  {
+ -	if (!nh_grp->can_destroy)
+ -		return;
+ +	struct mlxsw_sp_nexthop *nh;
+ +	int i;
+ +
+  	mlxsw_sp_nexthop_group_remove(mlxsw_sp, nh_grp);
+++<<<<<<< HEAD
+ +	for (i = 0; i < nh_grp->count; i++) {
+ +		nh = &nh_grp->nexthops[i];
+ +		mlxsw_sp_nexthop4_fini(mlxsw_sp, nh);
+ +	}
+ +	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
+ +	WARN_ON_ONCE(nh_grp->adj_index_valid);
+ +	fib_info_put(mlxsw_sp_nexthop4_group_fi(nh_grp));
+++=======
++ 	mlxsw_sp_nexthop4_group_info_fini(mlxsw_sp, nh_grp);
++ 	fib_info_put(nh_grp->ipv4.fi);
++ 	WARN_ON_ONCE(!list_empty(&nh_grp->vr_list));
++ 	rhashtable_destroy(&nh_grp->vr_ht);
+++>>>>>>> d2141a42b96a (mlxsw: spectrum_router: Track nexthop group virtual router membership)
+  	kfree(nh_grp);
+  }
+  
+@@@ -5422,33 -6112,22 +6016,38 @@@ mlxsw_sp_nexthop6_group_create(struct m
+  			       struct mlxsw_sp_fib6_entry *fib6_entry)
+  {
+  	struct mlxsw_sp_nexthop_group *nh_grp;
+ +	struct mlxsw_sp_rt6 *mlxsw_sp_rt6;
+ +	struct mlxsw_sp_nexthop *nh;
+ +	int i = 0;
+  	int err;
+  
+ -	nh_grp = kzalloc(sizeof(*nh_grp), GFP_KERNEL);
+ +	nh_grp = kzalloc(struct_size(nh_grp, nexthops, fib6_entry->nrt6),
+ +			 GFP_KERNEL);
+  	if (!nh_grp)
+  		return ERR_PTR(-ENOMEM);
++ 	INIT_LIST_HEAD(&nh_grp->vr_list);
++ 	err = rhashtable_init(&nh_grp->vr_ht,
++ 			      &mlxsw_sp_nexthop_group_vr_ht_params);
++ 	if (err)
++ 		goto err_nexthop_group_vr_ht_init;
+  	INIT_LIST_HEAD(&nh_grp->fib_list);
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	nh_grp->neigh_tbl = &nd_tbl;
+ +#endif
+  	nh_grp->type = MLXSW_SP_NEXTHOP_GROUP_TYPE_IPV6;
+ +	mlxsw_sp_rt6 = list_first_entry(&fib6_entry->rt6_list,
+ +					struct mlxsw_sp_rt6, list);
+ +	nh_grp->gateway = mlxsw_sp_rt6_is_gateway(mlxsw_sp, mlxsw_sp_rt6->rt);
+ +	nh_grp->count = fib6_entry->nrt6;
+ +	for (i = 0; i < nh_grp->count; i++) {
+ +		struct fib6_info *rt = mlxsw_sp_rt6->rt;
+  
+ -	err = mlxsw_sp_nexthop6_group_info_init(mlxsw_sp, nh_grp, fib6_entry);
+ -	if (err)
+ -		goto err_nexthop_group_info_init;
+ +		nh = &nh_grp->nexthops[i];
+ +		err = mlxsw_sp_nexthop6_init(mlxsw_sp, nh_grp, nh, rt);
+ +		if (err)
+ +			goto err_nexthop6_init;
+ +		mlxsw_sp_rt6 = list_next_entry(mlxsw_sp_rt6, list);
+ +	}
+  
+  	err = mlxsw_sp_nexthop_group_insert(mlxsw_sp, nh_grp);
+  	if (err)
+@@@ -5458,11 -6138,10 +6057,18 @@@
+  	return nh_grp;
+  
+  err_nexthop_group_insert:
+++<<<<<<< HEAD
+ +err_nexthop6_init:
+ +	for (i--; i >= 0; i--) {
+ +		nh = &nh_grp->nexthops[i];
+ +		mlxsw_sp_nexthop6_fini(mlxsw_sp, nh);
+ +	}
+++=======
++ 	mlxsw_sp_nexthop6_group_info_fini(mlxsw_sp, nh_grp);
++ err_nexthop_group_info_init:
++ 	rhashtable_destroy(&nh_grp->vr_ht);
++ err_nexthop_group_vr_ht_init:
+++>>>>>>> d2141a42b96a (mlxsw: spectrum_router: Track nexthop group virtual router membership)
+  	kfree(nh_grp);
+  	return ERR_PTR(err);
+  }
+@@@ -5471,16 -6150,12 +6077,22 @@@ static voi
+  mlxsw_sp_nexthop6_group_destroy(struct mlxsw_sp *mlxsw_sp,
+  				struct mlxsw_sp_nexthop_group *nh_grp)
+  {
+ -	if (!nh_grp->can_destroy)
+ -		return;
+ +	struct mlxsw_sp_nexthop *nh;
+ +	int i = nh_grp->count;
+ +
+  	mlxsw_sp_nexthop_group_remove(mlxsw_sp, nh_grp);
+++<<<<<<< HEAD
+ +	for (i--; i >= 0; i--) {
+ +		nh = &nh_grp->nexthops[i];
+ +		mlxsw_sp_nexthop6_fini(mlxsw_sp, nh);
+ +	}
+ +	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
+ +	WARN_ON(nh_grp->adj_index_valid);
+++=======
++ 	mlxsw_sp_nexthop6_group_info_fini(mlxsw_sp, nh_grp);
++ 	WARN_ON_ONCE(!list_empty(&nh_grp->vr_list));
++ 	rhashtable_destroy(&nh_grp->vr_ht);
+++>>>>>>> d2141a42b96a (mlxsw: spectrum_router: Track nexthop group virtual router membership)
+  	kfree(nh_grp);
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
