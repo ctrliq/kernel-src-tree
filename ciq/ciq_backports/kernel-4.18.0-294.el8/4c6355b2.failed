@@ -1,0 +1,262 @@
+mm: memcontrol: charge swapin pages on instantiation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 4c6355b25e8bb83c3cb455f532b7542089699d98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4c6355b2.failed
+
+Right now, users that are otherwise memory controlled can easily escape
+their containment and allocate significant amounts of memory that they're
+not being charged for.  That's because swap readahead pages are not being
+charged until somebody actually faults them into their page table.  This
+can be exploited with MADV_WILLNEED, which triggers arbitrary readahead
+allocations without charging the pages.
+
+There are additional problems with the delayed charging of swap pages:
+
+1. To implement refault/workingset detection for anonymous pages, we
+   need to have a target LRU available at swapin time, but the LRU is not
+   determinable until the page has been charged.
+
+2. To implement per-cgroup LRU locking, we need page->mem_cgroup to be
+   stable when the page is isolated from the LRU; otherwise, the locks
+   change under us.  But swapcache gets charged after it's already on the
+   LRU, and even if we cannot isolate it ourselves (since charging is not
+   exactly optional).
+
+The previous patch ensured we always maintain cgroup ownership records for
+swap pages.  This patch moves the swapcache charging point from the fault
+handler to swapin time to fix all of the above problems.
+
+v2: simplify swapin error checking (Joonsoo)
+
+[hughd@google.com: fix livelock in __read_swap_cache_async()]
+  Link: http://lkml.kernel.org/r/alpine.LSU.2.11.2005212246080.8458@eggly.anvils
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Alex Shi <alex.shi@linux.alibaba.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+	Cc: Rafael Aquini <aquini@redhat.com>
+	Cc: Alex Shi <alex.shi@linux.alibaba.com>
+Link: http://lkml.kernel.org/r/20200508183105.225460-17-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4c6355b25e8bb83c3cb455f532b7542089699d98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+#	mm/shmem.c
+#	mm/swap_state.c
+#	mm/swapfile.c
+diff --cc mm/memory.c
+index 583eb7e0dd7f,9c886e4207a2..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3106,11 -3200,7 +3117,15 @@@ vm_fault_t do_swap_page(struct vm_faul
+  		goto out_page;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge_delay(page, vma->vm_mm, GFP_KERNEL,
+ +					&memcg, false)) {
+ +		ret = VM_FAULT_OOM;
+ +		goto out_page;
+ +	}
+++=======
++ 	cgroup_throttle_swaprate(page, GFP_KERNEL);
+++>>>>>>> 4c6355b25e8b (mm: memcontrol: charge swapin pages on instantiation)
+  
+  	/*
+  	 * Back out if somebody else already faulted in this pte.
+diff --cc mm/shmem.c
+index 10f03436a6bf,b79116185046..000000000000
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@@ -615,6 -623,18 +615,21 @@@ static int shmem_add_to_page_cache(stru
+  	page->mapping = mapping;
+  	page->index = index;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!PageSwapCache(page)) {
++ 		error = mem_cgroup_charge(page, charge_mm, gfp, false);
++ 		if (error) {
++ 			if (PageTransHuge(page)) {
++ 				count_vm_event(THP_FILE_FALLBACK);
++ 				count_vm_event(THP_FILE_FALLBACK_CHARGE);
++ 			}
++ 			goto error;
++ 		}
++ 	}
++ 	cgroup_throttle_swaprate(page, gfp);
++ 
+++>>>>>>> 4c6355b25e8b (mm: memcontrol: charge swapin pages on instantiation)
+  	do {
+  		void *entry;
+  		xas_lock_irq(&xas);
+diff --cc mm/swap_state.c
+index e2aded84261e,f841257a3014..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -408,69 -390,66 +409,114 @@@ struct page *__read_swap_cache_async(sw
+  		 * else swap_off will be aborted if we return NULL.
+  		 */
+  		if (!__swp_swapcount(entry) && swap_slot_cache_enabled)
+- 			break;
++ 			return NULL;
+  
+  		/*
+- 		 * Get a new page to read into from swap.
++ 		 * Get a new page to read into from swap.  Allocate it now,
++ 		 * before marking swap_map SWAP_HAS_CACHE, when -EEXIST will
++ 		 * cause any racers to loop around until we add it to cache.
+  		 */
+- 		if (!new_page) {
+- 			new_page = alloc_page_vma(gfp_mask, vma, addr);
+- 			if (!new_page)
+- 				break;		/* Out of memory */
+- 		}
++ 		page = alloc_page_vma(gfp_mask, vma, addr);
++ 		if (!page)
++ 			return NULL;
+  
+ +		/*
+ +		 * call radix_tree_preload() while we can wait.
+ +		 */
+ +		err = radix_tree_maybe_preload(gfp_mask & GFP_KERNEL);
+ +		if (err)
+ +			break;
+ +
+  		/*
+  		 * Swap entry may have been freed since our caller observed it.
+  		 */
+  		err = swapcache_prepare(entry);
+++<<<<<<< HEAD
+ +		if (err == -EEXIST) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * We might race against get_swap_page() and stumble
+ +			 * across a SWAP_HAS_CACHE swap_map entry whose page
+ +			 * has not been brought into the swapcache yet.
+ +			 */
+ +			cond_resched();
+ +			continue;
+ +		}
+ +		if (err) {		/* swp entry is obsolete ? */
+ +			radix_tree_preload_end();
+++=======
++ 		if (!err)
+++>>>>>>> 4c6355b25e8b (mm: memcontrol: charge swapin pages on instantiation)
+  			break;
+ +		}
+  
+++<<<<<<< HEAD
+ +		/* May fail (-ENOMEM) if radix-tree node allocation failed. */
+ +		__SetPageLocked(new_page);
+ +		__SetPageSwapBacked(new_page);
+ +		err = __add_to_swap_cache(new_page, entry);
+ +		if (likely(!err)) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * Initiate read into locked page and return.
+ +			 */
+ +			SetPageWorkingset(new_page);
+ +			lru_cache_add_anon(new_page);
+ +			*new_page_allocated = true;
+ +			return new_page;
+ +		}
+ +		radix_tree_preload_end();
+ +		__ClearPageLocked(new_page);
+ +		/*
+ +		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
+ +		 * clear SWAP_HAS_CACHE flag.
+ +		 */
+ +		put_swap_page(new_page, entry);
+ +	} while (err != -ENOMEM);
+++=======
++ 		put_page(page);
++ 		if (err != -EEXIST)
++ 			return NULL;
+++>>>>>>> 4c6355b25e8b (mm: memcontrol: charge swapin pages on instantiation)
++ 
++ 		/*
++ 		 * We might race against __delete_from_swap_cache(), and
++ 		 * stumble across a swap_map entry whose SWAP_HAS_CACHE
++ 		 * has not yet been cleared.  Or race against another
++ 		 * __read_swap_cache_async(), which has set SWAP_HAS_CACHE
++ 		 * in swap_map, but not yet added its page to swap cache.
++ 		 */
++ 		cond_resched();
++ 	}
++ 
++ 	/*
++ 	 * The swap entry is ours to swap in. Prepare the new page.
++ 	 */
++ 
++ 	__SetPageLocked(page);
++ 	__SetPageSwapBacked(page);
++ 
++ 	/* May fail (-ENOMEM) if XArray node allocation failed. */
++ 	if (add_to_swap_cache(page, entry, gfp_mask & GFP_KERNEL)) {
++ 		put_swap_page(page, entry);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	if (mem_cgroup_charge(page, NULL, gfp_mask, false)) {
++ 		delete_from_swap_cache(page);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	/* Caller will initiate read into locked page */
++ 	SetPageWorkingset(page);
++ 	lru_cache_add_anon(page);
++ 	*new_page_allocated = true;
++ 	return page;
+  
+- 	if (new_page)
+- 		put_page(new_page);
+- 	return found_page;
++ fail_unlock:
++ 	unlock_page(page);
++ 	put_page(page);
++ 	return NULL;
+  }
+  
+  /*
+diff --cc mm/swapfile.c
+index b77fb155eaf4,a3d191e205f2..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -1927,15 -1901,8 +1927,18 @@@ static int unuse_pte(struct vm_area_str
+  	if (unlikely(!page))
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge(page, vma->vm_mm, GFP_KERNEL,
+ +				&memcg, false)) {
+ +		ret = -ENOMEM;
+ +		goto out_nolock;
+ +	}
+ +
+++=======
+++>>>>>>> 4c6355b25e8b (mm: memcontrol: charge swapin pages on instantiation)
+  	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+  	if (unlikely(!pte_same_as_swp(*pte, swp_entry_to_pte(entry)))) {
+ +		mem_cgroup_cancel_charge(page, memcg, false);
+  		ret = 0;
+  		goto out;
+  	}
+* Unmerged path mm/memory.c
+* Unmerged path mm/shmem.c
+* Unmerged path mm/swap_state.c
+* Unmerged path mm/swapfile.c
