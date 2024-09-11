@@ -294,12 +294,6 @@ struct sof_arch_ops {
 
 #define sof_arch_ops(sdev) ((sdev)->pdata->desc->ops->arch_ops)
 
-/* DSP device HW descriptor mapping between bus ID and ops */
-struct sof_ops_table {
-	const struct sof_dev_desc *desc;
-	const struct snd_sof_dsp_ops *ops;
-};
-
 /* FS entry for debug files that can expose DSP memories, registers */
 struct snd_sof_dfsentry {
 	struct dentry *dfsentry;
