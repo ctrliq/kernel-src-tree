@@ -1,0 +1,97 @@
+net/smc: nonblocking connect rework
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ursula Braun <ubraun@linux.ibm.com>
+commit 50717a37db032ce783f50685a73bb2ac68471a5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/50717a37.failed
+
+For nonblocking sockets move the kernel_connect() from the connect
+worker into the initial smc_connect part to return kernel_connect()
+errors other than -EINPROGRESS to user space.
+
+	Reviewed-by: Karsten Graul <kgraul@linux.ibm.com>
+	Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 50717a37db032ce783f50685a73bb2ac68471a5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/af_smc.c
+diff --cc net/smc/af_smc.c
+index 82f1eb6ac6ed,e1b7b5bdb440..000000000000
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@@ -456,9 -447,10 +454,10 @@@ static void smc_switch_to_fallback(stru
+  /* fall back during connect */
+  static int smc_connect_fallback(struct smc_sock *smc, int reason_code)
+  {
+ -	smc->use_fallback = true;
+ +	smc_switch_to_fallback(smc);
+  	smc->fallback_rsn = reason_code;
+  	smc_copy_sock_settings_to_clc(smc);
++ 	smc->connect_nonblock = 0;
+  	if (smc->sk.sk_state == SMC_INIT)
+  		smc->sk.sk_state = SMC_ACTIVE;
+  	return 0;
+@@@ -782,16 -790,10 +797,23 @@@ static void smc_connect_work(struct wor
+  		smc->sk.sk_err = -rc;
+  
+  out:
+++<<<<<<< HEAD
+ +	if (!sock_flag(&smc->sk, SOCK_DEAD)) {
+ +		if (smc->sk.sk_err) {
+ +			smc->sk.sk_state_change(&smc->sk);
+ +		} else { /* allow polling before and after fallback decision */
+ +			smc->clcsock->sk->sk_write_space(smc->clcsock->sk);
+ +			smc->sk.sk_write_space(&smc->sk);
+ +		}
+ +	}
+ +	kfree(smc->connect_info);
+ +	smc->connect_info = NULL;
+++=======
++ 	if (smc->sk.sk_err)
++ 		smc->sk.sk_state_change(&smc->sk);
++ 	else
++ 		smc->sk.sk_write_space(&smc->sk);
+++>>>>>>> 50717a37db03 (net/smc: nonblocking connect rework)
+  	release_sock(&smc->sk);
+  }
+  
+* Unmerged path net/smc/af_smc.c
+diff --git a/net/smc/smc.h b/net/smc/smc.h
+index adbdf195eb08..878313f8d6c1 100644
+--- a/net/smc/smc.h
++++ b/net/smc/smc.h
+@@ -190,18 +190,11 @@ struct smc_connection {
+ 	u64			peer_token;	/* SMC-D token of peer */
+ };
+ 
+-struct smc_connect_info {
+-	int			flags;
+-	int			alen;
+-	struct sockaddr		addr;
+-};
+-
+ struct smc_sock {				/* smc sock container */
+ 	struct sock		sk;
+ 	struct socket		*clcsock;	/* internal tcp socket */
+ 	struct smc_connection	conn;		/* smc connection */
+ 	struct smc_sock		*listen_smc;	/* listen parent */
+-	struct smc_connect_info *connect_info;	/* connect address & flags */
+ 	struct work_struct	connect_work;	/* handle non-blocking connect*/
+ 	struct work_struct	tcp_listen_work;/* handle tcp socket accepts */
+ 	struct work_struct	smc_listen_work;/* prepare new accept socket */
+@@ -219,6 +212,10 @@ struct smc_sock {				/* smc sock container */
+ 						 * started, waiting for unsent
+ 						 * data to be sent
+ 						 */
++	u8			connect_nonblock : 1;
++						/* non-blocking connect in
++						 * flight
++						 */
+ 	struct mutex            clcsock_release_lock;
+ 						/* protects clcsock of a listen
+ 						 * socket
