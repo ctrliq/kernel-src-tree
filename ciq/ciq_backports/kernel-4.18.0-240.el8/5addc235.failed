@@ -1,0 +1,307 @@
+KVM: VMX: Cache vmcs.EXIT_QUALIFICATION using arch avail_reg flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 5addc235199f15ae964e7ac6b20cf43f4a661573
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5addc235.failed
+
+Introduce a new "extended register" type, EXIT_INFO_1 (to pair with the
+nomenclature in .get_exit_info()), and use it to cache VMX's
+vmcs.EXIT_QUALIFICATION.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200415203454.8296-5-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 5addc235199f15ae964e7ac6b20cf43f4a661573)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.c
+diff --cc arch/x86/kvm/vmx/nested.c
+index 24c45b5f5739,dc16b2f8ce97..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -5413,6 -5461,24 +5413,27 @@@ static bool nested_vmx_exit_handled_io(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool nested_vmx_exit_handled_io(struct kvm_vcpu *vcpu,
++ 				       struct vmcs12 *vmcs12)
++ {
++ 	unsigned long exit_qualification;
++ 	unsigned short port;
++ 	int size;
++ 
++ 	if (!nested_cpu_has(vmcs12, CPU_BASED_USE_IO_BITMAPS))
++ 		return nested_cpu_has(vmcs12, CPU_BASED_UNCOND_IO_EXITING);
++ 
++ 	exit_qualification = vmx_get_exit_qual(vcpu);
++ 
++ 	port = exit_qualification >> 16;
++ 	size = (exit_qualification & 7) + 1;
++ 
++ 	return nested_vmx_check_io_bitmaps(vcpu, port, size);
++ }
++ 
+++>>>>>>> 5addc235199f (KVM: VMX: Cache vmcs.EXIT_QUALIFICATION using arch avail_reg flags)
+  /*
+   * Return 1 if we should exit from L2 to L1 to handle an MSR access,
+   * rather than handle it ourselves in L0. I.e., check whether L1 expressed
+@@@ -5762,6 -5823,66 +5783,69 @@@ bool nested_vmx_exit_reflected(struct k
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Conditionally reflect a VM-Exit into L1.  Returns %true if the VM-Exit was
++  * reflected into L1.
++  */
++ bool nested_vmx_reflect_vmexit(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	u32 exit_reason = vmx->exit_reason;
++ 	u32 exit_intr_info, exit_qual;
++ 
++ 	WARN_ON_ONCE(vmx->nested.nested_run_pending);
++ 
++ 	/*
++ 	 * Late nested VM-Fail shares the same flow as nested VM-Exit since KVM
++ 	 * has already loaded L2's state.
++ 	 */
++ 	if (unlikely(vmx->fail)) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"hardware VM-instruction error: ",
++ 			vmcs_read32(VM_INSTRUCTION_ERROR));
++ 		exit_intr_info = 0;
++ 		exit_qual = 0;
++ 		goto reflect_vmexit;
++ 	}
++ 
++ 	exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
++ 	exit_qual = vmx_get_exit_qual(vcpu);
++ 
++ 	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason, exit_qual,
++ 				vmx->idt_vectoring_info, exit_intr_info,
++ 				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
++ 				KVM_ISA_VMX);
++ 
++ 	/* If L0 (KVM) wants the exit, it trumps L1's desires. */
++ 	if (nested_vmx_l0_wants_exit(vcpu, exit_reason))
++ 		return false;
++ 
++ 	/* If L1 doesn't want the exit, handle it in L0. */
++ 	if (!nested_vmx_l1_wants_exit(vcpu, exit_reason))
++ 		return false;
++ 
++ 	/*
++ 	 * vmcs.VM_EXIT_INTR_INFO is only valid for EXCEPTION_NMI exits.  For
++ 	 * EXTERNAL_INTERRUPT, the value for vmcs12->vm_exit_intr_info would
++ 	 * need to be synthesized by querying the in-kernel LAPIC, but external
++ 	 * interrupts are never reflected to L1 so it's a non-issue.
++ 	 */
++ 	if ((exit_intr_info &
++ 	     (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) ==
++ 	    (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) {
++ 		struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 
++ 		vmcs12->vm_exit_intr_error_code =
++ 			vmcs_read32(VM_EXIT_INTR_ERROR_CODE);
++ 	}
++ 
++ reflect_vmexit:
++ 	nested_vmx_vmexit(vcpu, exit_reason, exit_intr_info, exit_qual);
++ 	return true;
++ }
+++>>>>>>> 5addc235199f (KVM: VMX: Cache vmcs.EXIT_QUALIFICATION using arch avail_reg flags)
+  
+  static int vmx_get_nested_state(struct kvm_vcpu *vcpu,
+  				struct kvm_nested_state __user *user_kvm_nested_state,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 10275c160b4e..e53cd2aabd85 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -168,6 +168,7 @@ enum kvm_reg {
+ 	VCPU_EXREG_CR3,
+ 	VCPU_EXREG_RFLAGS,
+ 	VCPU_EXREG_SEGMENTS,
++	VCPU_EXREG_EXIT_INFO_1,
+ };
+ 
+ enum {
+* Unmerged path arch/x86/kvm/vmx/nested.c
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 9c2aa83f6305..6b504eb2a5ba 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -4772,7 +4772,7 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (is_page_fault(intr_info)) {
+-		cr2 = vmcs_readl(EXIT_QUALIFICATION);
++		cr2 = vmx_get_exit_qual(vcpu);
+ 		/* EPT won't cause page fault directly */
+ 		WARN_ON_ONCE(!vcpu->arch.apf.host_apf_reason && enable_ept);
+ 		return kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0);
+@@ -4788,7 +4788,7 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
+ 		kvm_queue_exception_e(vcpu, AC_VECTOR, error_code);
+ 		return 1;
+ 	case DB_VECTOR:
+-		dr6 = vmcs_readl(EXIT_QUALIFICATION);
++		dr6 = vmx_get_exit_qual(vcpu);
+ 		if (!(vcpu->guest_debug &
+ 		      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))) {
+ 			vcpu->arch.dr6 &= ~DR_TRAP_BITS;
+@@ -4843,7 +4843,7 @@ static int handle_io(struct kvm_vcpu *vcpu)
+ 	int size, in, string;
+ 	unsigned port;
+ 
+-	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	exit_qualification = vmx_get_exit_qual(vcpu);
+ 	string = (exit_qualification & 16) != 0;
+ 
+ 	++vcpu->stat.io_exits;
+@@ -4934,7 +4934,7 @@ static int handle_cr(struct kvm_vcpu *vcpu)
+ 	int err;
+ 	int ret;
+ 
+-	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	exit_qualification = vmx_get_exit_qual(vcpu);
+ 	cr = exit_qualification & 15;
+ 	reg = (exit_qualification >> 8) & 15;
+ 	switch ((exit_qualification >> 4) & 3) {
+@@ -5011,7 +5011,7 @@ static int handle_dr(struct kvm_vcpu *vcpu)
+ 	unsigned long exit_qualification;
+ 	int dr, dr7, reg;
+ 
+-	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	exit_qualification = vmx_get_exit_qual(vcpu);
+ 	dr = exit_qualification & DEBUG_REG_ACCESS_NUM;
+ 
+ 	/* First, if DR does not exist, trigger UD */
+@@ -5124,7 +5124,7 @@ static int handle_invd(struct kvm_vcpu *vcpu)
+ 
+ static int handle_invlpg(struct kvm_vcpu *vcpu)
+ {
+-	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
+ 
+ 	kvm_mmu_invlpg(vcpu, exit_qualification);
+ 	return kvm_skip_emulated_instruction(vcpu);
+@@ -5156,7 +5156,7 @@ static int handle_xsetbv(struct kvm_vcpu *vcpu)
+ static int handle_apic_access(struct kvm_vcpu *vcpu)
+ {
+ 	if (likely(fasteoi)) {
+-		unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++		unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
+ 		int access_type, offset;
+ 
+ 		access_type = exit_qualification & APIC_ACCESS_TYPE;
+@@ -5177,7 +5177,7 @@ static int handle_apic_access(struct kvm_vcpu *vcpu)
+ 
+ static int handle_apic_eoi_induced(struct kvm_vcpu *vcpu)
+ {
+-	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
+ 	int vector = exit_qualification & 0xff;
+ 
+ 	/* EOI-induced VM exit is trap-like and thus no need to adjust IP */
+@@ -5187,7 +5187,7 @@ static int handle_apic_eoi_induced(struct kvm_vcpu *vcpu)
+ 
+ static int handle_apic_write(struct kvm_vcpu *vcpu)
+ {
+-	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
+ 	u32 offset = exit_qualification & 0xfff;
+ 
+ 	/* APIC-write VM exit is trap-like and thus no need to adjust IP */
+@@ -5208,7 +5208,7 @@ static int handle_task_switch(struct kvm_vcpu *vcpu)
+ 	idt_index = (vmx->idt_vectoring_info & VECTORING_INFO_VECTOR_MASK);
+ 	type = (vmx->idt_vectoring_info & VECTORING_INFO_TYPE_MASK);
+ 
+-	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	exit_qualification = vmx_get_exit_qual(vcpu);
+ 
+ 	reason = (u32)exit_qualification >> 30;
+ 	if (reason == TASK_SWITCH_GATE && idt_v) {
+@@ -5258,7 +5258,7 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
+ 	gpa_t gpa;
+ 	u64 error_code;
+ 
+-	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	exit_qualification = vmx_get_exit_qual(vcpu);
+ 
+ 	/*
+ 	 * EPT violation happened while executing iret from NMI,
+@@ -5518,7 +5518,7 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
+ 	/* According to the Intel instruction reference, the memory operand
+ 	 * is read even if it isn't needed (e.g., for type==all)
+ 	 */
+-	if (get_vmx_mem_address(vcpu, vmcs_readl(EXIT_QUALIFICATION),
++	if (get_vmx_mem_address(vcpu, vmx_get_exit_qual(vcpu),
+ 				vmx_instruction_info, false,
+ 				sizeof(operand), &gva))
+ 		return 1;
+@@ -5594,7 +5594,7 @@ static int handle_pml_full(struct kvm_vcpu *vcpu)
+ 
+ 	trace_kvm_pml_full(vcpu->vcpu_id);
+ 
+-	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	exit_qualification = vmx_get_exit_qual(vcpu);
+ 
+ 	/*
+ 	 * PML buffer FULL happened while executing iret from NMI,
+@@ -5708,7 +5708,7 @@ static const int kvm_vmx_max_exit_handlers =
+ 
+ static void vmx_get_exit_info(struct kvm_vcpu *vcpu, u64 *info1, u64 *info2)
+ {
+-	*info1 = vmcs_readl(EXIT_QUALIFICATION);
++	*info1 = vmx_get_exit_qual(vcpu);
+ 	*info2 = vmcs_read32(VM_EXIT_INTR_INFO);
+ }
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 2860db4335ad..6712086f2ad8 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -212,6 +212,7 @@ struct vcpu_vmx {
+ 	 */
+ 	bool		      guest_state_loaded;
+ 
++	unsigned long         exit_qualification;
+ 	u32                   exit_intr_info;
+ 	u32                   idt_vectoring_info;
+ 	ulong                 rflags;
+@@ -456,7 +457,8 @@ static inline void vmx_register_cache_reset(struct kvm_vcpu *vcpu)
+ 				  | (1 << VCPU_EXREG_RFLAGS)
+ 				  | (1 << VCPU_EXREG_PDPTR)
+ 				  | (1 << VCPU_EXREG_SEGMENTS)
+-				  | (1 << VCPU_EXREG_CR3));
++				  | (1 << VCPU_EXREG_CR3)
++				  | (1 << VCPU_EXREG_EXIT_INFO_1));
+ 	vcpu->arch.regs_dirty = 0;
+ }
+ 
+@@ -500,6 +502,17 @@ static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
+ 	return &(to_vmx(vcpu)->pi_desc);
+ }
+ 
++static inline unsigned long vmx_get_exit_qual(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++	if (!kvm_register_is_available(vcpu, VCPU_EXREG_EXIT_INFO_1)) {
++		kvm_register_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_1);
++		vmx->exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	}
++	return vmx->exit_qualification;
++}
++
+ struct vmcs *alloc_vmcs_cpu(bool shadow, int cpu, gfp_t flags);
+ void free_vmcs(struct vmcs *vmcs);
+ int alloc_loaded_vmcs(struct loaded_vmcs *loaded_vmcs);
