@@ -87,6 +87,13 @@ void check_mpx_erratum(struct cpuinfo_x86 *c)
 }
 
 /*
+ * With a name like MSR_TEST_CTL it should go without saying, but don't touch
+ * MSR_TEST_CTL unless the CPU is one of the whitelisted models.  Writing it
+ * on CPUs that do not support SLD can cause fireworks, even when writing '0'.
+ */
+static bool cpu_model_supports_sld __ro_after_init;
+
+/*
  * Processors which have self-snooping capability can handle conflicting
  * memory type across CPUs by snooping its own cache. However, there exists
  * CPU models in which having conflicting memory types still leads to
@@ -1141,7 +1148,8 @@ static void sld_update_msr(bool on)
 
 static void split_lock_init(void)
 {
-	split_lock_verify_msr(sld_state != sld_off);
+	if (cpu_model_supports_sld)
+		split_lock_verify_msr(sld_state != sld_off);
 }
 
 /* RHEL8 only split_lock enable/disable sysfs file */
@@ -1313,5 +1321,6 @@ void __init cpu_set_core_cap_bits(struct cpuinfo_x86 *c)
 		return;
 	}
 
+	cpu_model_supports_sld = true;
 	split_lock_setup();
 }
