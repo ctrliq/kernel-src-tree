@@ -555,7 +555,7 @@ static void *__iommu_alloc_attrs(struct device *dev, size_t size,
 			return NULL;
 
 		*handle = iommu_dma_map_page(dev, page, 0, iosize, ioprot);
-		if (iommu_dma_mapping_error(dev, *handle)) {
+		if (*handle == DMA_MAPPING_ERROR) {
 			if (coherent)
 				__free_pages(page, get_order(size));
 			else
@@ -572,7 +572,7 @@ static void *__iommu_alloc_attrs(struct device *dev, size_t size,
 			return NULL;
 
 		*handle = iommu_dma_map_page(dev, page, 0, iosize, ioprot);
-		if (iommu_dma_mapping_error(dev, *handle)) {
+		if (*handle == DMA_MAPPING_ERROR) {
 			dma_release_from_contiguous(dev, page,
 						    size >> PAGE_SHIFT);
 			return NULL;
@@ -733,7 +733,7 @@ static dma_addr_t __iommu_map_page(struct device *dev, struct page *page,
 	dma_addr_t dev_addr = iommu_dma_map_page(dev, page, offset, size, prot);
 
 	if (!coherent && !(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
-	    !iommu_dma_mapping_error(dev, dev_addr))
+	    dev_addr != DMA_MAPPING_ERROR)
 		__dma_map_area(page_address(page) + offset, size, dir);
 
 	return dev_addr;
@@ -816,7 +816,6 @@ static const struct dma_map_ops iommu_dma_ops = {
 	.sync_sg_for_device = __iommu_sync_sg_for_device,
 	.map_resource = iommu_dma_map_resource,
 	.unmap_resource = iommu_dma_unmap_resource,
-	.mapping_error = iommu_dma_mapping_error,
 };
 
 static int __init __iommu_dma_init(void)
