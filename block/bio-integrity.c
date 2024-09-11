@@ -28,8 +28,6 @@
 #include <linux/slab.h>
 #include "blk.h"
 
-#define BIP_INLINE_VECS	4
-
 static struct kmem_cache *bip_slab;
 static struct workqueue_struct *kintegrityd_wq;
 
@@ -75,7 +73,7 @@ struct bio_integrity_payload *bio_integrity_alloc(struct bio *bio,
 		inline_vecs = nr_vecs;
 	} else {
 		bip = mempool_alloc(&bs->bio_integrity_pool, gfp_mask);
-		inline_vecs = BIP_INLINE_VECS;
+		inline_vecs = BIO_INLINE_VECS;
 	}
 
 	if (unlikely(!bip))
@@ -484,6 +482,6 @@ void __init bio_integrity_init(void)
 
 	bip_slab = kmem_cache_create("bio_integrity_payload",
 				     sizeof(struct bio_integrity_payload) +
-				     sizeof(struct bio_vec) * BIP_INLINE_VECS,
+				     sizeof(struct bio_vec) * BIO_INLINE_VECS,
 				     0, SLAB_HWCACHE_ALIGN|SLAB_PANIC, NULL);
 }
