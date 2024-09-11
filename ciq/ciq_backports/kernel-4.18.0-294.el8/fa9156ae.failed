@@ -1,0 +1,472 @@
+block: refactor blkpg_ioctl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit fa9156ae597c244df4e12891dc8329f649970d9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fa9156ae.failed
+
+Split each sub-command out into a separate helper, and move those helpers
+to block/partitions/core.c instead of having a lot of partition
+manipulation logic open coded in block/ioctl.c.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit fa9156ae597c244df4e12891dc8329f649970d9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+#	block/ioctl.c
+diff --cc block/blk.h
+index 5c44b4751a29,305e0ac22bf7..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -342,10 -375,119 +342,37 @@@ void blk_queue_free_zone_bitmaps(struc
+  static inline void blk_queue_free_zone_bitmaps(struct request_queue *q) {}
+  #endif
+  
+++<<<<<<< HEAD
+ +/* internal helper for accessing request_aux  */
+ +static inline struct request_aux *rq_aux(const struct request *rq)
+++=======
++ void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
++ void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
++ void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
++ struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector);
++ 
++ int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
++ void blk_free_devt(dev_t devt);
++ void blk_invalidate_devt(dev_t devt);
++ char *disk_name(struct gendisk *hd, int partno, char *buf);
++ #define ADDPART_FLAG_NONE	0
++ #define ADDPART_FLAG_RAID	1
++ #define ADDPART_FLAG_WHOLEDISK	2
++ void __delete_partition(struct percpu_ref *ref);
++ void delete_partition(struct gendisk *disk, int partno);
++ int bdev_add_partition(struct block_device *bdev, int partno,
++ 		sector_t start, sector_t length);
++ int bdev_del_partition(struct block_device *bdev, int partno);
++ int bdev_resize_partition(struct block_device *bdev, int partno,
++ 		sector_t start, sector_t length);
++ int disk_expand_part_tbl(struct gendisk *disk, int target);
++ 
++ static inline int hd_ref_init(struct hd_struct *part)
+++>>>>>>> fa9156ae597c (block: refactor blkpg_ioctl)
+  {
+ -	if (percpu_ref_init(&part->ref, __delete_partition, 0,
+ -				GFP_KERNEL))
+ -		return -ENOMEM;
+ -	return 0;
+ -}
+ -
+ -static inline void hd_struct_get(struct hd_struct *part)
+ -{
+ -	percpu_ref_get(&part->ref);
+ -}
+ -
+ -static inline int hd_struct_try_get(struct hd_struct *part)
+ -{
+ -	return percpu_ref_tryget_live(&part->ref);
+ +	return (struct request_aux *)((void *)rq - sizeof(struct request_aux));
+  }
+  
+ -static inline void hd_struct_put(struct hd_struct *part)
+ -{
+ -	percpu_ref_put(&part->ref);
+ -}
+ -
+ -static inline void hd_struct_kill(struct hd_struct *part)
+ -{
+ -	percpu_ref_kill(&part->ref);
+ -}
+ -
+ -static inline void hd_free_part(struct hd_struct *part)
+ -{
+ -	free_part_stats(part);
+ -	kfree(part->info);
+ -	percpu_ref_exit(&part->ref);
+ -}
+ -
+ -/*
+ - * Any access of part->nr_sects which is not protected by partition
+ - * bd_mutex or gendisk bdev bd_mutex, should be done using this
+ - * accessor function.
+ - *
+ - * Code written along the lines of i_size_read() and i_size_write().
+ - * CONFIG_PREEMPTION case optimizes the case of UP kernel with preemption
+ - * on.
+ - */
+ -static inline sector_t part_nr_sects_read(struct hd_struct *part)
+ -{
+ -#if BITS_PER_LONG==32 && defined(CONFIG_SMP)
+ -	sector_t nr_sects;
+ -	unsigned seq;
+ -	do {
+ -		seq = read_seqcount_begin(&part->nr_sects_seq);
+ -		nr_sects = part->nr_sects;
+ -	} while (read_seqcount_retry(&part->nr_sects_seq, seq));
+ -	return nr_sects;
+ -#elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
+ -	sector_t nr_sects;
+ -
+ -	preempt_disable();
+ -	nr_sects = part->nr_sects;
+ -	preempt_enable();
+ -	return nr_sects;
+ -#else
+ -	return part->nr_sects;
+ -#endif
+ -}
+ -
+ -/*
+ - * Should be called with mutex lock held (typically bd_mutex) of partition
+ - * to provide mutual exlusion among writers otherwise seqcount might be
+ - * left in wrong state leaving the readers spinning infinitely.
+ - */
+ -static inline void part_nr_sects_write(struct hd_struct *part, sector_t size)
+ -{
+ -#if BITS_PER_LONG==32 && defined(CONFIG_SMP)
+ -	write_seqcount_begin(&part->nr_sects_seq);
+ -	part->nr_sects = size;
+ -	write_seqcount_end(&part->nr_sects_seq);
+ -#elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
+ -	preempt_disable();
+ -	part->nr_sects = size;
+ -	preempt_enable();
+ -#else
+ -	part->nr_sects = size;
+ -#endif
+ -}
+ -
+ -struct request_queue *__blk_alloc_queue(int node_id);
+ -
+ -int __bio_add_pc_page(struct request_queue *q, struct bio *bio,
+ -		struct page *page, unsigned int len, unsigned int offset,
+ -		bool *same_page);
+ -
+  #endif /* BLK_INTERNAL_H */
+diff --cc block/ioctl.c
+index f8f8a81c640e,75c64811b534..000000000000
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@@ -9,148 -11,49 +9,74 @@@
+  #include <linux/blktrace_api.h>
+  #include <linux/pr.h>
+  #include <linux/uaccess.h>
+ -#include "blk.h"
+  
+ -static int blkpg_do_ioctl(struct block_device *bdev,
+ -			  struct blkpg_partition __user *upart, int op)
+ +static int blkpg_ioctl(struct block_device *bdev, struct blkpg_ioctl_arg __user *arg)
+  {
+++<<<<<<< HEAD
+ +	struct block_device *bdevp;
+ +	struct gendisk *disk;
+ +	struct hd_struct *part, *lpart;
+ +	struct blkpg_ioctl_arg a;
+++=======
+++>>>>>>> fa9156ae597c (block: refactor blkpg_ioctl)
+  	struct blkpg_partition p;
+- 	struct disk_part_iter piter;
+  	long long start, length;
+- 	int partno;
+  
+  	if (!capable(CAP_SYS_ADMIN))
+  		return -EACCES;
+ -	if (copy_from_user(&p, upart, sizeof(struct blkpg_partition)))
+ +	if (copy_from_user(&a, arg, sizeof(struct blkpg_ioctl_arg)))
+ +		return -EFAULT;
+ +	if (copy_from_user(&p, a.data, sizeof(struct blkpg_partition)))
+  		return -EFAULT;
+- 	disk = bdev->bd_disk;
+  	if (bdev != bdev->bd_contains)
+  		return -EINVAL;
+- 	partno = p.pno;
+- 	if (partno <= 0)
++ 
++ 	if (p.pno <= 0)
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	switch (a.op) {
+ +		case BLKPG_ADD_PARTITION:
+ +			start = p.start >> 9;
+ +			length = p.length >> 9;
+ +			/* check for fit in a hd_struct */
+ +			if (sizeof(sector_t) == sizeof(long) &&
+ +			    sizeof(long long) > sizeof(long)) {
+ +				long pstart = start, plength = length;
+ +				if (pstart != start || plength != length
+ +				    || pstart < 0 || plength < 0 || partno > 65535)
+ +					return -EINVAL;
+ +			}
+ +			/* check if partition is aligned to blocksize */
+ +			if (p.start & (bdev_logical_block_size(bdev) - 1))
+ +				return -EINVAL;
+++=======
+++>>>>>>> fa9156ae597c (block: refactor blkpg_ioctl)
+  
+- 			mutex_lock(&bdev->bd_mutex);
+- 
+- 			/* overlap? */
+- 			disk_part_iter_init(&piter, disk,
+- 					    DISK_PITER_INCL_EMPTY);
+- 			while ((part = disk_part_iter_next(&piter))) {
+- 				if (!(start + length <= part->start_sect ||
+- 				      start >= part->start_sect + part->nr_sects)) {
+- 					disk_part_iter_exit(&piter);
+- 					mutex_unlock(&bdev->bd_mutex);
+- 					return -EBUSY;
+- 				}
+- 			}
+- 			disk_part_iter_exit(&piter);
+- 
+- 			/* all seems OK */
+- 			part = add_partition(disk, partno, start, length,
+- 					     ADDPART_FLAG_NONE, NULL);
+- 			mutex_unlock(&bdev->bd_mutex);
+- 			return PTR_ERR_OR_ZERO(part);
+- 		case BLKPG_DEL_PARTITION:
+- 			part = disk_get_part(disk, partno);
+- 			if (!part)
+- 				return -ENXIO;
++ 	if (op == BLKPG_DEL_PARTITION)
++ 		return bdev_del_partition(bdev, p.pno);
+  
+- 			bdevp = bdget(part_devt(part));
+- 			disk_put_part(part);
+- 			if (!bdevp)
+- 				return -ENOMEM;
++ 	start = p.start >> SECTOR_SHIFT;
++ 	length = p.length >> SECTOR_SHIFT;
+  
+- 			mutex_lock(&bdevp->bd_mutex);
+- 			if (bdevp->bd_openers) {
+- 				mutex_unlock(&bdevp->bd_mutex);
+- 				bdput(bdevp);
+- 				return -EBUSY;
+- 			}
+- 			/* all seems OK */
+- 			fsync_bdev(bdevp);
+- 			invalidate_bdev(bdevp);
++ 	/* check for fit in a hd_struct */
++ 	if (sizeof(sector_t) < sizeof(long long)) {
++ 		long pstart = start, plength = length;
+  
+- 			mutex_lock_nested(&bdev->bd_mutex, 1);
+- 			delete_partition(disk, partno);
+- 			mutex_unlock(&bdev->bd_mutex);
+- 			mutex_unlock(&bdevp->bd_mutex);
+- 			bdput(bdevp);
++ 		if (pstart != start || plength != length || pstart < 0 ||
++ 		    plength < 0 || p.pno > 65535)
++ 			return -EINVAL;
++ 	}
+  
+- 			return 0;
+- 		case BLKPG_RESIZE_PARTITION:
+- 			start = p.start >> 9;
+- 			/* new length of partition in bytes */
+- 			length = p.length >> 9;
+- 			/* check for fit in a hd_struct */
+- 			if (sizeof(sector_t) == sizeof(long) &&
+- 			    sizeof(long long) > sizeof(long)) {
+- 				long pstart = start, plength = length;
+- 				if (pstart != start || plength != length
+- 				    || pstart < 0 || plength < 0)
+- 					return -EINVAL;
+- 			}
+- 			part = disk_get_part(disk, partno);
+- 			if (!part)
+- 				return -ENXIO;
+- 			bdevp = bdget(part_devt(part));
+- 			if (!bdevp) {
+- 				disk_put_part(part);
+- 				return -ENOMEM;
+- 			}
+- 			mutex_lock(&bdevp->bd_mutex);
+- 			mutex_lock_nested(&bdev->bd_mutex, 1);
+- 			if (start != part->start_sect) {
+- 				mutex_unlock(&bdevp->bd_mutex);
+- 				mutex_unlock(&bdev->bd_mutex);
+- 				bdput(bdevp);
+- 				disk_put_part(part);
+- 				return -EINVAL;
+- 			}
+- 			/* overlap? */
+- 			disk_part_iter_init(&piter, disk,
+- 					    DISK_PITER_INCL_EMPTY);
+- 			while ((lpart = disk_part_iter_next(&piter))) {
+- 				if (lpart->partno != partno &&
+- 				   !(start + length <= lpart->start_sect ||
+- 				   start >= lpart->start_sect + lpart->nr_sects)
+- 				   ) {
+- 					disk_part_iter_exit(&piter);
+- 					mutex_unlock(&bdevp->bd_mutex);
+- 					mutex_unlock(&bdev->bd_mutex);
+- 					bdput(bdevp);
+- 					disk_put_part(part);
+- 					return -EBUSY;
+- 				}
+- 			}
+- 			disk_part_iter_exit(&piter);
+- 			part_nr_sects_write(part, (sector_t)length);
+- 			i_size_write(bdevp->bd_inode, p.length);
+- 			mutex_unlock(&bdevp->bd_mutex);
+- 			mutex_unlock(&bdev->bd_mutex);
+- 			bdput(bdevp);
+- 			disk_put_part(part);
+- 			return 0;
+- 		default:
++ 	switch (op) {
++ 	case BLKPG_ADD_PARTITION:
++ 		/* check if partition is aligned to blocksize */
++ 		if (p.start & (bdev_logical_block_size(bdev) - 1))
+  			return -EINVAL;
++ 		return bdev_add_partition(bdev, p.pno, start, length);
++ 	case BLKPG_RESIZE_PARTITION:
++ 		return bdev_resize_partition(bdev, p.pno, start, length);
++ 	default:
++ 		return -EINVAL;
+  	}
+  }
+  
+* Unmerged path block/blk.h
+* Unmerged path block/ioctl.c
+diff --git a/block/partition-generic.c b/block/partition-generic.c
+index 459e9684cfbb..113bdc62277d 100644
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@ -302,7 +302,7 @@ static DEVICE_ATTR(whole_disk, 0444, whole_disk_show, NULL);
+  * Must be called either with bd_mutex held, before a disk can be opened or
+  * after all disk users are gone.
+  */
+-struct hd_struct *add_partition(struct gendisk *disk, int partno,
++static struct hd_struct *add_partition(struct gendisk *disk, int partno,
+ 				sector_t start, sector_t len, int flags,
+ 				struct partition_meta_info *info)
+ {
+@@ -437,6 +437,119 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
+ 	return ERR_PTR(err);
+ }
+ 
++static bool partition_overlaps(struct gendisk *disk, sector_t start,
++		sector_t length, int skip_partno)
++{
++	struct disk_part_iter piter;
++	struct hd_struct *part;
++	bool overlap = false;
++
++	disk_part_iter_init(&piter, disk, DISK_PITER_INCL_EMPTY);
++	while ((part = disk_part_iter_next(&piter))) {
++		if (part->partno == skip_partno ||
++		    start >= part->start_sect + part->nr_sects ||
++		    start + length <= part->start_sect)
++			continue;
++		overlap = true;
++		break;
++	}
++
++	disk_part_iter_exit(&piter);
++	return overlap;
++}
++
++int bdev_add_partition(struct block_device *bdev, int partno,
++		sector_t start, sector_t length)
++{
++	struct hd_struct *part;
++
++	mutex_lock(&bdev->bd_mutex);
++	if (partition_overlaps(bdev->bd_disk, start, length, -1)) {
++		mutex_unlock(&bdev->bd_mutex);
++		return -EBUSY;
++	}
++
++	part = add_partition(bdev->bd_disk, partno, start, length,
++			ADDPART_FLAG_NONE, NULL);
++	mutex_unlock(&bdev->bd_mutex);
++	return PTR_ERR_OR_ZERO(part);
++}
++
++int bdev_del_partition(struct block_device *bdev, int partno)
++{
++	struct block_device *bdevp;
++	struct hd_struct *part;
++	int ret = 0;
++
++	part = disk_get_part(bdev->bd_disk, partno);
++	if (!part)
++		return -ENXIO;
++
++	bdevp = bdget(part_devt(part));
++	disk_put_part(part);
++	if (!bdevp)
++		return -ENOMEM;
++
++	mutex_lock(&bdevp->bd_mutex);
++
++	ret = -EBUSY;
++	if (bdevp->bd_openers)
++		goto out_unlock;
++
++	fsync_bdev(bdevp);
++	invalidate_bdev(bdevp);
++
++	mutex_lock_nested(&bdev->bd_mutex, 1);
++	delete_partition(bdev->bd_disk, partno);
++	mutex_unlock(&bdev->bd_mutex);
++
++	ret = 0;
++out_unlock:
++	mutex_unlock(&bdevp->bd_mutex);
++	bdput(bdevp);
++	return ret;
++}
++
++int bdev_resize_partition(struct block_device *bdev, int partno,
++		sector_t start, sector_t length)
++{
++	struct block_device *bdevp;
++	struct hd_struct *part;
++	int ret = 0;
++
++	part = disk_get_part(bdev->bd_disk, partno);
++	if (!part)
++		return -ENXIO;
++
++	ret = -ENOMEM;
++	bdevp = bdget(part_devt(part));
++	if (!bdevp)
++		goto out_put_part;
++
++	mutex_lock(&bdevp->bd_mutex);
++	mutex_lock_nested(&bdev->bd_mutex, 1);
++
++	ret = -EINVAL;
++	if (start != part->start_sect)
++		goto out_unlock;
++
++	ret = -EBUSY;
++	if (partition_overlaps(bdev->bd_disk, start, length, partno))
++		goto out_unlock;
++
++	part_nr_sects_write(part, (sector_t)length);
++	i_size_write(bdevp->bd_inode, length << SECTOR_SHIFT);
++
++	ret = 0;
++out_unlock:
++	mutex_unlock(&bdevp->bd_mutex);
++	mutex_unlock(&bdev->bd_mutex);
++	bdput(bdevp);
++out_put_part:
++	disk_put_part(part);
++	return ret;
++}
++
+ static bool disk_unlock_native_capacity(struct gendisk *disk)
+ {
+ 	const struct block_device_operations *bdops = disk->fops;
