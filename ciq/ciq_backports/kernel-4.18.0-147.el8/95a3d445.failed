@@ -1,0 +1,151 @@
+x86/kvmclock: Switch kvmclock data to a PER_CPU variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 95a3d4454bb1cf5bfd666c27fdd2dc188e17c14d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/95a3d445.failed
+
+The previous removal of the memblock dependency from kvmclock introduced a
+static data array sized 64bytes * CONFIG_NR_CPUS. That's wasteful on large
+systems when kvmclock is not used.
+
+Replace it with:
+
+ - A static page sized array of pvclock data. It's page sized because the
+   pvclock data of the boot cpu is mapped into the VDSO so otherwise random
+   other data would be exposed to the vDSO
+
+ - A PER_CPU variable of pvclock data pointers. This is used to access the
+   pcvlock data storage on each CPU.
+
+The setup is done in two stages:
+
+ - Early boot stores the pointer to the static page for the boot CPU in
+   the per cpu data.
+
+ - In the preparatory stage of CPU hotplug assign either an element of
+   the static array (when the CPU number is in that range) or allocate
+   memory and initialize the per cpu pointer.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
+	Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: steven.sistare@oracle.com
+	Cc: daniel.m.jordan@oracle.com
+	Cc: linux@armlinux.org.uk
+	Cc: schwidefsky@de.ibm.com
+	Cc: heiko.carstens@de.ibm.com
+	Cc: john.stultz@linaro.org
+	Cc: sboyd@codeaurora.org
+	Cc: hpa@zytor.com
+	Cc: douly.fnst@cn.fujitsu.com
+	Cc: peterz@infradead.org
+	Cc: prarit@redhat.com
+	Cc: feng.tang@intel.com
+	Cc: pmladek@suse.com
+	Cc: gnomes@lxorguk.ukuu.org.uk
+	Cc: linux-s390@vger.kernel.org
+	Cc: boris.ostrovsky@oracle.com
+	Cc: jgross@suse.com
+Link: https://lkml.kernel.org/r/20180719205545.16512-8-pasha.tatashin@oracle.com
+
+(cherry picked from commit 95a3d4454bb1cf5bfd666c27fdd2dc188e17c14d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kvmclock.c
+diff --cc arch/x86/kernel/kvmclock.c
+index 78aec160f5e0,91b94c0ae4e3..000000000000
+--- a/arch/x86/kernel/kvmclock.c
++++ b/arch/x86/kernel/kvmclock.c
+@@@ -44,14 -47,32 +45,25 @@@ static int __init parse_no_kvmclock(cha
+  }
+  early_param("no-kvmclock", parse_no_kvmclock);
+  
+ -static int __init parse_no_kvmclock_vsyscall(char *arg)
+ -{
+ -	kvmclock_vsyscall = 0;
+ -	return 0;
+ -}
+ -early_param("no-kvmclock-vsyscall", parse_no_kvmclock_vsyscall);
+ -
+  /* Aligned to page sizes to match whats mapped via vsyscalls to userspace */
+  #define HV_CLOCK_SIZE	(sizeof(struct pvclock_vsyscall_time_info) * NR_CPUS)
++ #define HVC_BOOT_ARRAY_SIZE \
++ 	(PAGE_SIZE / sizeof(struct pvclock_vsyscall_time_info))
+  
+- static u8 hv_clock_mem[PAGE_ALIGN(HV_CLOCK_SIZE)] __aligned(PAGE_SIZE);
+- 
+- /* The hypervisor will put information about time periodically here */
+- static struct pvclock_vsyscall_time_info *hv_clock __ro_after_init;
++ static struct pvclock_vsyscall_time_info
++ 			hv_clock_boot[HVC_BOOT_ARRAY_SIZE] __aligned(PAGE_SIZE);
+  static struct pvclock_wall_clock wall_clock;
++ static DEFINE_PER_CPU(struct pvclock_vsyscall_time_info *, hv_clock_per_cpu);
++ 
++ static inline struct pvclock_vcpu_time_info *this_cpu_pvti(void)
++ {
++ 	return &this_cpu_read(hv_clock_per_cpu)->pvti;
++ }
++ 
++ static inline struct pvclock_vsyscall_time_info *this_cpu_hvclock(void)
++ {
++ 	return this_cpu_read(hv_clock_per_cpu);
++ }
+  
+  /*
+   * The wallclock is the time of day when we booted. Since then, some time may
+@@@ -228,6 -235,46 +226,49 @@@ static void kvm_shutdown(void
+  	native_machine_shutdown();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __init kvm_setup_vsyscall_timeinfo(void)
++ {
++ #ifdef CONFIG_X86_64
++ 	u8 flags;
++ 
++ 	if (!per_cpu(hv_clock_per_cpu, 0) || !kvmclock_vsyscall)
++ 		return 0;
++ 
++ 	flags = pvclock_read_flags(&hv_clock_boot[0].pvti);
++ 	if (!(flags & PVCLOCK_TSC_STABLE_BIT))
++ 		return 0;
++ 
++ 	kvm_clock.archdata.vclock_mode = VCLOCK_PVCLOCK;
++ #endif
++ 	return 0;
++ }
++ early_initcall(kvm_setup_vsyscall_timeinfo);
++ 
++ static int kvmclock_setup_percpu(unsigned int cpu)
++ {
++ 	struct pvclock_vsyscall_time_info *p = per_cpu(hv_clock_per_cpu, cpu);
++ 
++ 	/*
++ 	 * The per cpu area setup replicates CPU0 data to all cpu
++ 	 * pointers. So carefully check. CPU0 has been set up in init
++ 	 * already.
++ 	 */
++ 	if (!cpu || (p && p != per_cpu(hv_clock_per_cpu, 0)))
++ 		return 0;
++ 
++ 	/* Use the static page for the first CPUs, allocate otherwise */
++ 	if (cpu < HVC_BOOT_ARRAY_SIZE)
++ 		p = &hv_clock_boot[cpu];
++ 	else
++ 		p = kzalloc(sizeof(*p), GFP_KERNEL);
++ 
++ 	per_cpu(hv_clock_per_cpu, cpu) = p;
++ 	return p ? 0 : -ENOMEM;
++ }
++ 
+++>>>>>>> 95a3d4454bb1 (x86/kvmclock: Switch kvmclock data to a PER_CPU variable)
+  void __init kvmclock_init(void)
+  {
+  	u8 flags;
+* Unmerged path arch/x86/kernel/kvmclock.c
