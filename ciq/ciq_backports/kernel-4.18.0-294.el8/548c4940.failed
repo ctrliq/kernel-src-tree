@@ -1,0 +1,189 @@
+net: ena: Implement XDP_TX action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sameeh Jubran <sameehj@amazon.com>
+commit 548c4940b9f1f527f81509468dd60b61418880b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/548c4940.failed
+
+This commit implements the XDP_TX action in the ena driver. We allocate
+separate tx queues for the XDP_TX. We currently allow xdp only when
+there is enough queues to allocate for xdp.
+
+	Signed-off-by: Sameeh Jubran <sameehj@amazon.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 548c4940b9f1f527f81509468dd60b61418880b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amazon/ena/ena_netdev.c
+diff --cc drivers/net/ethernet/amazon/ena/ena_netdev.c
+index 0ebd58ecc79d,55eeaab7956c..000000000000
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@@ -78,10 -77,38 +78,38 @@@ static int ena_rss_init_default(struct 
+  static void check_for_admin_com_state(struct ena_adapter *adapter);
+  static void ena_destroy_device(struct ena_adapter *adapter, bool graceful);
+  static int ena_restore_device(struct ena_adapter *adapter);
+- static void ena_down(struct ena_adapter *adapter);
++ 
++ static void ena_init_io_rings(struct ena_adapter *adapter,
++ 			      int first_index, int count);
++ static void ena_init_napi_in_range(struct ena_adapter *adapter, int first_index,
++ 				   int count);
++ static void ena_del_napi_in_range(struct ena_adapter *adapter, int first_index,
++ 				  int count);
++ static int ena_setup_tx_resources(struct ena_adapter *adapter, int qid);
++ static int ena_setup_tx_resources_in_range(struct ena_adapter *adapter,
++ 					   int first_index,
++ 					   int count);
++ static int ena_create_io_tx_queue(struct ena_adapter *adapter, int qid);
++ static void ena_free_tx_resources(struct ena_adapter *adapter, int qid);
++ static int ena_clean_xdp_irq(struct ena_ring *xdp_ring, u32 budget);
++ static void ena_destroy_all_tx_queues(struct ena_adapter *adapter);
++ static void ena_free_all_io_tx_resources(struct ena_adapter *adapter);
++ static void ena_napi_disable_in_range(struct ena_adapter *adapter,
++ 				      int first_index, int count);
++ static void ena_napi_enable_in_range(struct ena_adapter *adapter,
++ 				     int first_index, int count);
+  static int ena_up(struct ena_adapter *adapter);
++ static void ena_down(struct ena_adapter *adapter);
++ static void ena_unmask_interrupt(struct ena_ring *tx_ring,
++ 				 struct ena_ring *rx_ring);
++ static void ena_update_ring_numa_node(struct ena_ring *tx_ring,
++ 				      struct ena_ring *rx_ring);
++ static void ena_unmap_tx_buff(struct ena_ring *tx_ring,
++ 			      struct ena_tx_buffer *tx_info);
++ static int ena_create_io_tx_queues_in_range(struct ena_adapter *adapter,
++ 					    int first_index, int count);
+  
+ -static void ena_tx_timeout(struct net_device *dev)
+ +static void ena_tx_timeout(struct net_device *dev, unsigned int txqueue)
+  {
+  	struct ena_adapter *adapter = netdev_priv(dev);
+  
+@@@ -1390,9 -1860,8 +1861,14 @@@ static int ena_io_poll(struct napi_stru
+  {
+  	struct ena_napi *ena_napi = container_of(napi, struct ena_napi, napi);
+  	struct ena_ring *tx_ring, *rx_ring;
+++<<<<<<< HEAD
+ +
+ +	int tx_work_done;
+ +	int rx_work_done = 0;
+++=======
++ 	u32 tx_work_done;
++ 	u32 rx_work_done;
+++>>>>>>> 548c4940b9f1 (net: ena: Implement XDP_TX action)
+  	int tx_budget;
+  	int napi_comp_call = 0;
+  	int ret;
+diff --git a/drivers/net/ethernet/amazon/ena/ena_ethtool.c b/drivers/net/ethernet/amazon/ena/ena_ethtool.c
+index a3250dcf7d53..745fffd422aa 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_ethtool.c
++++ b/drivers/net/ethernet/amazon/ena/ena_ethtool.c
+@@ -744,7 +744,9 @@ static int ena_set_channels(struct net_device *netdev,
+ 	struct ena_adapter *adapter = netdev_priv(netdev);
+ 	u32 count = channels->combined_count;
+ 	/* The check for max value is already done in ethtool */
+-	if (count < ENA_MIN_NUM_IO_QUEUES)
++	if (count < ENA_MIN_NUM_IO_QUEUES ||
++	    (ena_xdp_present(adapter) &&
++	    !ena_xdp_legal_queue_count(adapter, channels->combined_count)))
+ 		return -EINVAL;
+ 
+ 	return ena_update_queue_count(adapter, count);
+* Unmerged path drivers/net/ethernet/amazon/ena/ena_netdev.c
+diff --git a/drivers/net/ethernet/amazon/ena/ena_netdev.h b/drivers/net/ethernet/amazon/ena/ena_netdev.h
+index c9016014b86d..9bfb275b2514 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.h
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.h
+@@ -152,6 +152,9 @@
+ #define ENA_XDP_MAX_MTU (ENA_PAGE_SIZE - ETH_HLEN - ETH_FCS_LEN - \
+ 				VLAN_HLEN - XDP_PACKET_HEADROOM)
+ 
++#define ENA_IS_XDP_INDEX(adapter, index) (((index) >= (adapter)->xdp_first_ring) && \
++	((index) < (adapter)->xdp_first_ring + (adapter)->xdp_num_queues))
++
+ struct ena_irq {
+ 	irq_handler_t handler;
+ 	void *data;
+@@ -165,6 +168,7 @@ struct ena_napi {
+ 	struct napi_struct napi ____cacheline_aligned;
+ 	struct ena_ring *tx_ring;
+ 	struct ena_ring *rx_ring;
++	struct ena_ring *xdp_ring;
+ 	u32 qid;
+ 	struct dim dim;
+ };
+@@ -190,6 +194,17 @@ struct ena_tx_buffer {
+ 	/* num of buffers used by this skb */
+ 	u32 num_of_bufs;
+ 
++	/* XDP buffer structure which is used for sending packets in
++	 * the xdp queues
++	 */
++	struct xdp_frame *xdpf;
++	/* The rx page for the rx buffer that was received in rx and
++	 * re transmitted on xdp tx queues as a result of XDP_TX action.
++	 * We need to free the page once we finished cleaning the buffer in
++	 * clean_xdp_irq()
++	 */
++	struct page *xdp_rx_page;
++
+ 	/* Indicate if bufs[0] map the linear data of the skb. */
+ 	u8 map_linear_data;
+ 
+@@ -394,6 +409,8 @@ struct ena_adapter {
+ 	enum ena_regs_reset_reason_types reset_reason;
+ 
+ 	struct bpf_prog *xdp_bpf_prog;
++	u32 xdp_first_ring;
++	u32 xdp_num_queues;
+ };
+ 
+ void ena_set_ethtool_ops(struct net_device *netdev);
+@@ -410,6 +427,17 @@ int ena_update_queue_count(struct ena_adapter *adapter, u32 new_channel_count);
+ 
+ int ena_get_sset_count(struct net_device *netdev, int sset);
+ 
++enum ena_xdp_errors_t {
++	ENA_XDP_ALLOWED = 0,
++	ENA_XDP_CURRENT_MTU_TOO_LARGE,
++	ENA_XDP_NO_ENOUGH_QUEUES,
++};
++
++static inline bool ena_xdp_queues_present(struct ena_adapter *adapter)
++{
++	return adapter->xdp_first_ring != 0;
++}
++
+ static inline bool ena_xdp_present(struct ena_adapter *adapter)
+ {
+ 	return !!adapter->xdp_bpf_prog;
+@@ -420,9 +448,22 @@ static inline bool ena_xdp_present_ring(struct ena_ring *ring)
+ 	return !!ring->xdp_bpf_prog;
+ }
+ 
+-static inline bool ena_xdp_allowed(struct ena_adapter *adapter)
++static inline int ena_xdp_legal_queue_count(struct ena_adapter *adapter,
++					    u32 queues)
+ {
+-	return adapter->netdev->mtu <= ENA_XDP_MAX_MTU;
++	return 2 * queues <= adapter->max_num_io_queues;
++}
++
++static inline enum ena_xdp_errors_t ena_xdp_allowed(struct ena_adapter *adapter)
++{
++	enum ena_xdp_errors_t rc = ENA_XDP_ALLOWED;
++
++	if (adapter->netdev->mtu > ENA_XDP_MAX_MTU)
++		rc = ENA_XDP_CURRENT_MTU_TOO_LARGE;
++	else if (!ena_xdp_legal_queue_count(adapter, adapter->num_io_queues))
++		rc = ENA_XDP_NO_ENOUGH_QUEUES;
++
++	return rc;
+ }
+ 
+ #endif /* !(ENA_H) */
