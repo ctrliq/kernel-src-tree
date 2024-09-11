@@ -1,0 +1,151 @@
+sctp: do asoc update earlier in sctp_sf_do_dupcook_b
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 51eac7f2f06b5f60d22dfb06c48d98a227507b8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/51eac7f2.failed
+
+The same thing should be done for sctp_sf_do_dupcook_b().
+Meanwhile, SCTP_CMD_UPDATE_ASSOC cmd can be removed.
+
+v1->v2:
+  - Fix the return value in sctp_sf_do_assoc_update().
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 51eac7f2f06b5f60d22dfb06c48d98a227507b8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/sm_sideeffect.c
+diff --cc net/sctp/sm_sideeffect.c
+index a0591dd130f3,ce15d590a615..000000000000
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@@ -845,28 -826,6 +845,31 @@@ static void sctp_cmd_setup_t2(struct sc
+  	asoc->timeouts[SCTP_EVENT_TIMEOUT_T2_SHUTDOWN] = t->rto;
+  }
+  
+++<<<<<<< HEAD
+ +static void sctp_cmd_assoc_update(struct sctp_cmd_seq *cmds,
+ +				  struct sctp_association *asoc,
+ +				  struct sctp_association *new)
+ +{
+ +	struct net *net = sock_net(asoc->base.sk);
+ +	struct sctp_chunk *abort;
+ +
+ +	if (!sctp_assoc_update(asoc, new))
+ +		return;
+ +
+ +	abort = sctp_make_abort(asoc, NULL, sizeof(struct sctp_errhdr));
+ +	if (abort) {
+ +		sctp_init_cause(abort, SCTP_ERROR_RSRC_LOW, 0);
+ +		sctp_add_cmd_sf(cmds, SCTP_CMD_REPLY, SCTP_CHUNK(abort));
+ +	}
+ +	sctp_add_cmd_sf(cmds, SCTP_CMD_SET_SK_ERR, SCTP_ERROR(ECONNABORTED));
+ +	sctp_add_cmd_sf(cmds, SCTP_CMD_ASSOC_FAILED,
+ +			SCTP_PERR(SCTP_ERROR_RSRC_LOW));
+ +	SCTP_INC_STATS(net, SCTP_MIB_ABORTEDS);
+ +	SCTP_DEC_STATS(net, SCTP_MIB_CURRESTAB);
+ +}
+ +
+++=======
+++>>>>>>> 51eac7f2f06b (sctp: do asoc update earlier in sctp_sf_do_dupcook_b)
+  /* Helper function to change the state of an association. */
+  static void sctp_cmd_new_state(struct sctp_cmd_seq *cmds,
+  			       struct sctp_association *asoc,
+diff --git a/include/net/sctp/command.h b/include/net/sctp/command.h
+index 6d5beac29bc1..aa8b396133b4 100644
+--- a/include/net/sctp/command.h
++++ b/include/net/sctp/command.h
+@@ -83,7 +83,6 @@ enum sctp_verb {
+ 	SCTP_CMD_ASSOC_FAILED,	 /* Handle association failure. */
+ 	SCTP_CMD_DISCARD_PACKET, /* Discard the whole packet. */
+ 	SCTP_CMD_GEN_SHUTDOWN,   /* Generate a SHUTDOWN chunk. */
+-	SCTP_CMD_UPDATE_ASSOC,   /* Update association information. */
+ 	SCTP_CMD_PURGE_OUTQUEUE, /* Purge all data waiting to be sent. */
+ 	SCTP_CMD_SETUP_T2,       /* Hi-level, setup T2-shutdown parms.  */
+ 	SCTP_CMD_RTO_PENDING,	 /* Set transport's rto_pending. */
+* Unmerged path net/sctp/sm_sideeffect.c
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+index 6aa3d201c8d9..e68fc57fc787 100644
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -1777,6 +1777,30 @@ enum sctp_disposition sctp_sf_do_5_2_3_initack(
+ 		return sctp_sf_discard_chunk(net, ep, asoc, type, arg, commands);
+ }
+ 
++static int sctp_sf_do_assoc_update(struct sctp_association *asoc,
++				   struct sctp_association *new,
++				   struct sctp_cmd_seq *cmds)
++{
++	struct net *net = asoc->base.net;
++	struct sctp_chunk *abort;
++
++	if (!sctp_assoc_update(asoc, new))
++		return 0;
++
++	abort = sctp_make_abort(asoc, NULL, sizeof(struct sctp_errhdr));
++	if (abort) {
++		sctp_init_cause(abort, SCTP_ERROR_RSRC_LOW, 0);
++		sctp_add_cmd_sf(cmds, SCTP_CMD_REPLY, SCTP_CHUNK(abort));
++	}
++	sctp_add_cmd_sf(cmds, SCTP_CMD_SET_SK_ERR, SCTP_ERROR(ECONNABORTED));
++	sctp_add_cmd_sf(cmds, SCTP_CMD_ASSOC_FAILED,
++			SCTP_PERR(SCTP_ERROR_RSRC_LOW));
++	SCTP_INC_STATS(net, SCTP_MIB_ABORTEDS);
++	SCTP_DEC_STATS(net, SCTP_MIB_CURRESTAB);
++
++	return -ENOMEM;
++}
++
+ /* Unexpected COOKIE-ECHO handler for peer restart (Table 2, action 'A')
+  *
+  * Section 5.2.4
+@@ -1857,21 +1881,8 @@ static enum sctp_disposition sctp_sf_do_dupcook_a(
+ 	sctp_add_cmd_sf(commands, SCTP_CMD_PURGE_ASCONF_QUEUE, SCTP_NULL());
+ 
+ 	/* Update the content of current association. */
+-	if (sctp_assoc_update((struct sctp_association *)asoc, new_asoc)) {
+-		struct sctp_chunk *abort;
+-
+-		abort = sctp_make_abort(asoc, NULL, sizeof(struct sctp_errhdr));
+-		if (abort) {
+-			sctp_init_cause(abort, SCTP_ERROR_RSRC_LOW, 0);
+-			sctp_add_cmd_sf(commands, SCTP_CMD_REPLY, SCTP_CHUNK(abort));
+-		}
+-		sctp_add_cmd_sf(commands, SCTP_CMD_SET_SK_ERR, SCTP_ERROR(ECONNABORTED));
+-		sctp_add_cmd_sf(commands, SCTP_CMD_ASSOC_FAILED,
+-				SCTP_PERR(SCTP_ERROR_RSRC_LOW));
+-		SCTP_INC_STATS(net, SCTP_MIB_ABORTEDS);
+-		SCTP_DEC_STATS(net, SCTP_MIB_CURRESTAB);
++	if (sctp_sf_do_assoc_update((struct sctp_association *)asoc, new_asoc, commands))
+ 		goto nomem;
+-	}
+ 
+ 	repl = sctp_make_cookie_ack(asoc, chunk);
+ 	if (!repl)
+@@ -1944,14 +1955,16 @@ static enum sctp_disposition sctp_sf_do_dupcook_b(
+ 	if (!sctp_auth_chunk_verify(net, chunk, new_asoc))
+ 		return SCTP_DISPOSITION_DISCARD;
+ 
+-	/* Update the content of current association.  */
+-	sctp_add_cmd_sf(commands, SCTP_CMD_UPDATE_ASSOC, SCTP_ASOC(new_asoc));
+ 	sctp_add_cmd_sf(commands, SCTP_CMD_NEW_STATE,
+ 			SCTP_STATE(SCTP_STATE_ESTABLISHED));
+ 	SCTP_INC_STATS(net, SCTP_MIB_CURRESTAB);
+ 	sctp_add_cmd_sf(commands, SCTP_CMD_HB_TIMERS_START, SCTP_NULL());
+ 
+-	repl = sctp_make_cookie_ack(new_asoc, chunk);
++	/* Update the content of current association.  */
++	if (sctp_sf_do_assoc_update((struct sctp_association *)asoc, new_asoc, commands))
++		goto nomem;
++
++	repl = sctp_make_cookie_ack(asoc, chunk);
+ 	if (!repl)
+ 		goto nomem;
+ 
