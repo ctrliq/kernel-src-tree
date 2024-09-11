@@ -1,0 +1,216 @@
+radix tree: Remove radix_tree_update_node_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-305.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 1cf56f9d670b88b2e947a7ccdb8ba32e6477915d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-305.el8/1cf56f9d.failed
+
+The only user of this functionality was the workingset code, and it's
+now been converted to the XArray.  Remove __radix_tree_delete_node()
+entirely as it was also only used by the workingset code.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit 1cf56f9d670b88b2e947a7ccdb8ba32e6477915d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/radix-tree/multiorder.c
+diff --cc tools/testing/radix-tree/multiorder.c
+index 9d7e2fa0e30a,0e0ff26c9bcb..000000000000
+--- a/tools/testing/radix-tree/multiorder.c
++++ b/tools/testing/radix-tree/multiorder.c
+@@@ -393,6 -601,29 +393,32 @@@ static void multiorder_split(void
+  		}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void multiorder_account(void)
++ {
++ 	RADIX_TREE(tree, GFP_KERNEL);
++ 	struct radix_tree_node *node;
++ 	void **slot;
++ 
++ 	item_insert_order(&tree, 0, 5);
++ 
++ 	__radix_tree_insert(&tree, 1 << 5, 5, xa_mk_value(5));
++ 	__radix_tree_lookup(&tree, 0, &node, NULL);
++ 	assert(node->count == node->nr_values * 2);
++ 	radix_tree_delete(&tree, 1 << 5);
++ 	assert(node->nr_values == 0);
++ 
++ 	__radix_tree_insert(&tree, 1 << 5, 5, xa_mk_value(5));
++ 	__radix_tree_lookup(&tree, 1 << 5, &node, &slot);
++ 	assert(node->count == node->nr_values * 2);
++ 	__radix_tree_replace(&tree, node, slot, NULL);
++ 	assert(node->nr_values == 0);
++ 
++ 	item_kill_tree(&tree);
++ }
++ 
+++>>>>>>> 1cf56f9d670b (radix tree: Remove radix_tree_update_node_t)
+  bool stop_iteration = false;
+  
+  static void *creator_func(void *ptr)
+diff --git a/include/linux/radix-tree.h b/include/linux/radix-tree.h
+index 92ea043e8158..1f7f251eb33e 100644
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@ -265,17 +265,12 @@ void *__radix_tree_lookup(const struct radix_tree_root *, unsigned long index,
+ void *radix_tree_lookup(const struct radix_tree_root *, unsigned long);
+ void __rcu **radix_tree_lookup_slot(const struct radix_tree_root *,
+ 					unsigned long index);
+-typedef void (*radix_tree_update_node_t)(struct radix_tree_node *);
+ void __radix_tree_replace(struct radix_tree_root *, struct radix_tree_node *,
+-			  void __rcu **slot, void *entry,
+-			  radix_tree_update_node_t update_node);
++			  void __rcu **slot, void *entry);
+ void radix_tree_iter_replace(struct radix_tree_root *,
+ 		const struct radix_tree_iter *, void __rcu **slot, void *entry);
+ void radix_tree_replace_slot(struct radix_tree_root *,
+ 			     void __rcu **slot, void *entry);
+-void __radix_tree_delete_node(struct radix_tree_root *,
+-			      struct radix_tree_node *,
+-			      radix_tree_update_node_t update_node);
+ void radix_tree_iter_delete(struct radix_tree_root *,
+ 			struct radix_tree_iter *iter, void __rcu **slot);
+ void *radix_tree_delete_item(struct radix_tree_root *, unsigned long, void *);
+diff --git a/lib/idr.c b/lib/idr.c
+index fe67b38887ae..8e0e676d9292 100644
+--- a/lib/idr.c
++++ b/lib/idr.c
+@@ -301,7 +301,7 @@ void *idr_replace(struct idr *idr, void *ptr, unsigned long id)
+ 	if (!slot || radix_tree_tag_get(&idr->idr_rt, id, IDR_FREE))
+ 		return ERR_PTR(-ENOENT);
+ 
+-	__radix_tree_replace(&idr->idr_rt, node, slot, ptr, NULL);
++	__radix_tree_replace(&idr->idr_rt, node, slot, ptr);
+ 
+ 	return entry;
+ }
+diff --git a/lib/radix-tree.c b/lib/radix-tree.c
+index 43beea2aecfa..68bc52613c94 100644
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@ -512,8 +512,7 @@ static int radix_tree_extend(struct radix_tree_root *root, gfp_t gfp,
+  *	radix_tree_shrink    -    shrink radix tree to minimum height
+  *	@root		radix tree root
+  */
+-static inline bool radix_tree_shrink(struct radix_tree_root *root,
+-				     radix_tree_update_node_t update_node)
++static inline bool radix_tree_shrink(struct radix_tree_root *root)
+ {
+ 	bool shrunk = false;
+ 
+@@ -581,8 +580,6 @@ static inline bool radix_tree_shrink(struct radix_tree_root *root,
+ 		node->count = 0;
+ 		if (!radix_tree_is_internal_node(child)) {
+ 			node->slots[0] = (void __rcu *)RADIX_TREE_RETRY;
+-			if (update_node)
+-				update_node(node);
+ 		}
+ 
+ 		WARN_ON_ONCE(!list_empty(&node->private_list));
+@@ -594,8 +591,7 @@ static inline bool radix_tree_shrink(struct radix_tree_root *root,
+ }
+ 
+ static bool delete_node(struct radix_tree_root *root,
+-			struct radix_tree_node *node,
+-			radix_tree_update_node_t update_node)
++			struct radix_tree_node *node)
+ {
+ 	bool deleted = false;
+ 
+@@ -605,7 +601,7 @@ static bool delete_node(struct radix_tree_root *root,
+ 		if (node->count) {
+ 			if (node_to_entry(node) ==
+ 					rcu_dereference_raw(root->xa_head))
+-				deleted |= radix_tree_shrink(root, update_node);
++				deleted |= radix_tree_shrink(root);
+ 			return deleted;
+ 		}
+ 
+@@ -1011,15 +1007,13 @@ static int calculate_count(struct radix_tree_root *root,
+  * @node:		pointer to tree node
+  * @slot:		pointer to slot in @node
+  * @item:		new item to store in the slot.
+- * @update_node:	callback for changing leaf nodes
+  *
+  * For use with __radix_tree_lookup().  Caller must hold tree write locked
+  * across slot lookup and replacement.
+  */
+ void __radix_tree_replace(struct radix_tree_root *root,
+ 			  struct radix_tree_node *node,
+-			  void __rcu **slot, void *item,
+-			  radix_tree_update_node_t update_node)
++			  void __rcu **slot, void *item)
+ {
+ 	void *old = rcu_dereference_raw(*slot);
+ 	int values = !!xa_is_value(item) - !!xa_is_value(old);
+@@ -1037,10 +1031,7 @@ void __radix_tree_replace(struct radix_tree_root *root,
+ 	if (!node)
+ 		return;
+ 
+-	if (update_node)
+-		update_node(node);
+-
+-	delete_node(root, node, update_node);
++	delete_node(root, node);
+ }
+ 
+ /**
+@@ -1062,7 +1053,7 @@ void __radix_tree_replace(struct radix_tree_root *root,
+ void radix_tree_replace_slot(struct radix_tree_root *root,
+ 			     void __rcu **slot, void *item)
+ {
+-	__radix_tree_replace(root, NULL, slot, item, NULL);
++	__radix_tree_replace(root, NULL, slot, item);
+ }
+ EXPORT_SYMBOL(radix_tree_replace_slot);
+ 
+@@ -1079,7 +1070,7 @@ void radix_tree_iter_replace(struct radix_tree_root *root,
+ 				const struct radix_tree_iter *iter,
+ 				void __rcu **slot, void *item)
+ {
+-	__radix_tree_replace(root, iter->node, slot, item, NULL);
++	__radix_tree_replace(root, iter->node, slot, item);
+ }
+ 
+ #ifdef CONFIG_RADIX_TREE_MULTIORDER
+@@ -1762,23 +1753,6 @@ radix_tree_gang_lookup_tag_slot(const struct radix_tree_root *root,
+ }
+ EXPORT_SYMBOL(radix_tree_gang_lookup_tag_slot);
+ 
+-/**
+- *	__radix_tree_delete_node    -    try to free node after clearing a slot
+- *	@root:		radix tree root
+- *	@node:		node containing @index
+- *	@update_node:	callback for changing leaf nodes
+- *
+- *	After clearing the slot at @index in @node from radix tree
+- *	rooted at @root, call this function to attempt freeing the
+- *	node and shrinking the tree.
+- */
+-void __radix_tree_delete_node(struct radix_tree_root *root,
+-			      struct radix_tree_node *node,
+-			      radix_tree_update_node_t update_node)
+-{
+-	delete_node(root, node, update_node);
+-}
+-
+ static bool __radix_tree_delete(struct radix_tree_root *root,
+ 				struct radix_tree_node *node, void __rcu **slot)
+ {
+@@ -1794,7 +1768,7 @@ static bool __radix_tree_delete(struct radix_tree_root *root,
+ 			node_tag_clear(root, node, tag, offset);
+ 
+ 	replace_slot(slot, NULL, node, -1, values);
+-	return node && delete_node(root, node, NULL);
++	return node && delete_node(root, node);
+ }
+ 
+ /**
+* Unmerged path tools/testing/radix-tree/multiorder.c
