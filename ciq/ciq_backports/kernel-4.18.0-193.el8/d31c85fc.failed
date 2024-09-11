@@ -1,0 +1,206 @@
+snd/hda, drm/i915: Track the display_power_status using a cookie
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit d31c85fc864269ab8e6fb6ed36c87f2fc33a9430
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d31c85fc.failed
+
+drm/i915 is tracking all wakeref owners with a cookie in order to
+identify leaks. To that end, each rpm acquisition ops->get_power is
+assigned a cookie which should be passed to ops->put_power to signify
+its release (and removal from the list of wakeref owners). As snd/hda is
+already using a bool to track current status of display_power extending
+that to an unsigned long to hold the boolean cookie is a trivial
+extension, and will quell all doubt that snd/hda is the cause of the
+device runtime pm leaks.
+
+v2: Keep using the power abstraction for local wakeref tracking.
+v3: BUILD_BUG_ON impedance mismatch
+
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Takashi Iwai <tiwai@suse.de>
+	Cc: Jani Nikula <jani.nikula@intel.com>
+	Acked-by: Takashi Iwai <tiwai@suse.de>
+	Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190213152109.16997-1-chris@chris-wilson.co.uk
+(cherry picked from commit d31c85fc864269ab8e6fb6ed36c87f2fc33a9430)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_audio.c
+diff --cc drivers/gpu/drm/i915/intel_audio.c
+index 2f3fd5bf0f11,32dfd41a93ed..000000000000
+--- a/drivers/gpu/drm/i915/intel_audio.c
++++ b/drivers/gpu/drm/i915/intel_audio.c
+@@@ -741,71 -741,18 +741,85 @@@ void intel_init_audio_hooks(struct drm_
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void glk_force_audio_cdclk(struct drm_i915_private *dev_priv,
+ +				  bool enable)
+ +{
+ +	struct drm_modeset_acquire_ctx ctx;
+ +	struct drm_atomic_state *state;
+ +	int ret;
+ +
+ +	drm_modeset_acquire_init(&ctx, 0);
+ +	state = drm_atomic_state_alloc(&dev_priv->drm);
+ +	if (WARN_ON(!state))
+ +		return;
+ +
+ +	state->acquire_ctx = &ctx;
+ +
+ +retry:
+ +	to_intel_atomic_state(state)->cdclk.force_min_cdclk_changed = true;
+ +	to_intel_atomic_state(state)->cdclk.force_min_cdclk =
+ +		enable ? 2 * 96000 : 0;
+ +
+ +	/*
+ +	 * Protects dev_priv->cdclk.force_min_cdclk
+ +	 * Need to lock this here in case we have no active pipes
+ +	 * and thus wouldn't lock it during the commit otherwise.
+ +	 */
+ +	ret = drm_modeset_lock(&dev_priv->drm.mode_config.connection_mutex,
+ +			       &ctx);
+ +	if (!ret)
+ +		ret = drm_atomic_commit(state);
+ +
+ +	if (ret == -EDEADLK) {
+ +		drm_atomic_state_clear(state);
+ +		drm_modeset_backoff(&ctx);
+ +		goto retry;
+ +	}
+ +
+ +	WARN_ON(ret);
+ +
+ +	drm_atomic_state_put(state);
+ +
+ +	drm_modeset_drop_locks(&ctx);
+ +	drm_modeset_acquire_fini(&ctx);
+ +}
+ +
+ +static void i915_audio_component_get_power(struct device *kdev)
+ +{
+ +	struct drm_i915_private *dev_priv = kdev_to_i915(kdev);
+ +
+ +	intel_display_power_get(dev_priv, POWER_DOMAIN_AUDIO);
+ +
+ +	/* Force CDCLK to 2*BCLK as long as we need audio to be powered. */
+ +	if (dev_priv->audio_power_refcount++ == 0)
+ +		if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv))
+ +			glk_force_audio_cdclk(dev_priv, true);
+++=======
++ static unsigned long i915_audio_component_get_power(struct device *kdev)
++ {
++ 	/* Catch potential impedance mismatches before they occur! */
++ 	BUILD_BUG_ON(sizeof(intel_wakeref_t) > sizeof(unsigned long));
++ 
++ 	return intel_display_power_get(kdev_to_i915(kdev), POWER_DOMAIN_AUDIO);
+++>>>>>>> d31c85fc8642 (snd/hda, drm/i915: Track the display_power_status using a cookie)
+  }
+  
+- static void i915_audio_component_put_power(struct device *kdev)
++ static void i915_audio_component_put_power(struct device *kdev,
++ 					   unsigned long cookie)
+  {
+++<<<<<<< HEAD
+ +	struct drm_i915_private *dev_priv = kdev_to_i915(kdev);
+ +
+ +	/* Stop forcing CDCLK to 2*BCLK if no need for audio to be powered. */
+ +	if (--dev_priv->audio_power_refcount == 0)
+ +		if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv))
+ +			glk_force_audio_cdclk(dev_priv, false);
+ +
+ +	intel_display_power_put_unchecked(dev_priv, POWER_DOMAIN_AUDIO);
+++=======
++ 	intel_display_power_put(kdev_to_i915(kdev), POWER_DOMAIN_AUDIO, cookie);
+++>>>>>>> d31c85fc8642 (snd/hda, drm/i915: Track the display_power_status using a cookie)
+  }
+  
+  static void i915_audio_component_codec_wake_override(struct device *kdev,
+* Unmerged path drivers/gpu/drm/i915/intel_audio.c
+diff --git a/include/drm/drm_audio_component.h b/include/drm/drm_audio_component.h
+index 93a386be38fa..a45f93487039 100644
+--- a/include/drm/drm_audio_component.h
++++ b/include/drm/drm_audio_component.h
+@@ -19,14 +19,17 @@ struct drm_audio_component_ops {
+ 	 * @get_power: get the POWER_DOMAIN_AUDIO power well
+ 	 *
+ 	 * Request the power well to be turned on.
++	 *
++	 * Returns a wakeref cookie to be passed back to the corresponding
++	 * call to @put_power.
+ 	 */
+-	void (*get_power)(struct device *);
++	unsigned long (*get_power)(struct device *);
+ 	/**
+ 	 * @put_power: put the POWER_DOMAIN_AUDIO power well
+ 	 *
+ 	 * Allow the power well to be turned off.
+ 	 */
+-	void (*put_power)(struct device *);
++	void (*put_power)(struct device *, unsigned long);
+ 	/**
+ 	 * @codec_wake_override: Enable/disable codec wake signal
+ 	 */
+diff --git a/include/sound/hdaudio.h b/include/sound/hdaudio.h
+index 8aba7302842d..20549def0a27 100644
+--- a/include/sound/hdaudio.h
++++ b/include/sound/hdaudio.h
+@@ -368,7 +368,7 @@ struct hdac_bus {
+ 	/* DRM component interface */
+ 	struct drm_audio_component *audio_component;
+ 	long display_power_status;
+-	bool display_power_active;
++	unsigned long display_power_active;
+ 
+ 	/* parameters required for enhanced capabilities */
+ 	int num_streams;
+diff --git a/sound/hda/hdac_component.c b/sound/hda/hdac_component.c
+index 1ea51e3b942a..dfe7e755f594 100644
+--- a/sound/hda/hdac_component.c
++++ b/sound/hda/hdac_component.c
+@@ -81,17 +81,23 @@ void snd_hdac_display_power(struct hdac_bus *bus, unsigned int idx, bool enable)
+ 
+ 	if (bus->display_power_status) {
+ 		if (!bus->display_power_active) {
++			unsigned long cookie = -1;
++
+ 			if (acomp->ops->get_power)
+-				acomp->ops->get_power(acomp->dev);
++				cookie = acomp->ops->get_power(acomp->dev);
++
+ 			snd_hdac_set_codec_wakeup(bus, true);
+ 			snd_hdac_set_codec_wakeup(bus, false);
+-			bus->display_power_active = true;
++			bus->display_power_active = cookie;
+ 		}
+ 	} else {
+ 		if (bus->display_power_active) {
++			unsigned long cookie = bus->display_power_active;
++
+ 			if (acomp->ops->put_power)
+-				acomp->ops->put_power(acomp->dev);
+-			bus->display_power_active = false;
++				acomp->ops->put_power(acomp->dev, cookie);
++
++			bus->display_power_active = 0;
+ 		}
+ 	}
+  unlock:
+@@ -329,9 +335,9 @@ int snd_hdac_acomp_exit(struct hdac_bus *bus)
+ 		return 0;
+ 
+ 	if (WARN_ON(bus->display_power_active) && acomp->ops)
+-		acomp->ops->put_power(acomp->dev);
++		acomp->ops->put_power(acomp->dev, bus->display_power_active);
+ 
+-	bus->display_power_active = false;
++	bus->display_power_active = 0;
+ 	bus->display_power_status = 0;
+ 
+ 	component_master_del(dev, &hdac_component_master_ops);
