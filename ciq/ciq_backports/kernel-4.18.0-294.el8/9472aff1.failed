@@ -1,0 +1,137 @@
+USB: rio500: Fix lockdep violation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Alan Stern <stern@rowland.harvard.edu>
+commit 9472aff16ca0fd9351eea7773facef364743088f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9472aff1.failed
+
+The syzbot fuzzer found a lockdep violation in the rio500 driver:
+
+	======================================================
+	WARNING: possible circular locking dependency detected
+	5.3.0-rc2+ #23 Not tainted
+	------------------------------------------------------
+	syz-executor.2/20386 is trying to acquire lock:
+	00000000772249c6 (rio500_mutex){+.+.}, at: open_rio+0x16/0xc0
+	drivers/usb/misc/rio500.c:64
+
+	but task is already holding lock:
+	00000000d3e8f4b9 (minor_rwsem){++++}, at: usb_open+0x23/0x270
+	drivers/usb/core/file.c:39
+
+	which lock already depends on the new lock.
+
+The problem is that the driver's open_rio() routine is called while
+the usbcore's minor_rwsem is locked for reading, and it acquires the
+rio500_mutex; whereas conversely, probe_rio() and disconnect_rio()
+first acquire the rio500_mutex and then call usb_register_dev() or
+usb_deregister_dev(), which lock minor_rwsem for writing.
+
+The correct ordering of acquisition should be: minor_rwsem first, then
+rio500_mutex (since the locking in open_rio() cannot be changed).
+Thus, the probe and disconnect routines should avoid holding
+rio500_mutex while doing their registration and deregistration.
+
+This patch adjusts the code in those two routines to do just that.  It
+also relies on the fact that the probe and disconnect routines are
+protected by the device mutex, so the initial test of rio->present
+needs no extra locking.
+
+	Reported-by: syzbot+7bbcbe9c9ff0cd49592a@syzkaller.appspotmail.com
+	Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Fixes: d710734b0677 ("USB: rio500: simplify locking")
+	Acked-by: Oliver Neukum <oneukum@suse.com>
+CC: <stable@vger.kernel.org>
+
+Link: https://lore.kernel.org/r/Pine.LNX.4.44L0.1908081329240.1319-100000@iolanthe.rowland.org
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9472aff16ca0fd9351eea7773facef364743088f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/misc/rio500.c
+diff --cc drivers/usb/misc/rio500.c
+index a32d61a79ab8,30cae5e1954d..000000000000
+--- a/drivers/usb/misc/rio500.c
++++ b/drivers/usb/misc/rio500.c
+@@@ -475,38 -490,19 +496,46 @@@ static int probe_rio(struct usb_interfa
+  	if (retval) {
+  		dev_err(&dev->dev,
+  			"Not able to get a minor for this device.\n");
+- 		retval = -ENOMEM;
+- 		goto bail_out;
++ 		goto err_register;
+  	}
+  
+- 	rio->rio_dev = dev;
++ 	usb_set_intfdata(intf, rio);
++ 	return retval;
+  
+++<<<<<<< HEAD
+ +	if (!(rio->obuf = kmalloc(OBUF_SIZE, GFP_KERNEL))) {
+ +		dev_err(&dev->dev,
+ +			"probe_rio: Not enough memory for the output buffer\n");
+ +		usb_deregister_dev(intf, &usb_rio_class);
+ +		retval = -ENOMEM;
+ +		goto bail_out;
+ +	}
+ +	dev_dbg(&intf->dev, "obuf address:%p\n", rio->obuf);
+ +
+ +	if (!(rio->ibuf = kmalloc(IBUF_SIZE, GFP_KERNEL))) {
+ +		dev_err(&dev->dev,
+ +			"probe_rio: Not enough memory for the input buffer\n");
+ +		usb_deregister_dev(intf, &usb_rio_class);
+ +		kfree(rio->obuf);
+ +		retval = -ENOMEM;
+ +		goto bail_out;
+ +	}
+ +	dev_dbg(&intf->dev, "ibuf address:%p\n", rio->ibuf);
+ +
+ +	mutex_init(&(rio->lock));
+ +
+ +	usb_set_intfdata (intf, rio);
+ +	rio->present = 1;
+ +bail_out:
+++=======
++  err_register:
++ 	mutex_lock(&rio500_mutex);
++ 	rio->present = 0;
+++>>>>>>> 9472aff16ca0 (USB: rio500: Fix lockdep violation)
+  	mutex_unlock(&rio500_mutex);
+- 
++  err_ibuf:
++ 	kfree(obuf);
++  err_obuf:
+  	return retval;
+  }
+  
+@@@ -518,8 -514,7 +547,11 @@@ static void disconnect_rio(struct usb_i
+  	if (rio) {
+  		usb_deregister_dev(intf, &usb_rio_class);
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&(rio->lock));
+++=======
++ 		mutex_lock(&rio500_mutex);
+++>>>>>>> 9472aff16ca0 (USB: rio500: Fix lockdep violation)
+  		if (rio->isopen) {
+  			rio->isopen = 0;
+  			/* better let it finish - the release will do whats needed */
+@@@ -534,9 -528,8 +566,12 @@@
+  		dev_info(&intf->dev, "USB Rio disconnected.\n");
+  
+  		rio->present = 0;
+++<<<<<<< HEAD
+ +		mutex_unlock(&(rio->lock));
+++=======
++ 		mutex_unlock(&rio500_mutex);
+++>>>>>>> 9472aff16ca0 (USB: rio500: Fix lockdep violation)
+  	}
+- 	mutex_unlock(&rio500_mutex);
+  }
+  
+  static const struct usb_device_id rio_table[] = {
+* Unmerged path drivers/usb/misc/rio500.c
