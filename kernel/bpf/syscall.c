@@ -30,7 +30,6 @@
 #include <linux/cred.h>
 #include <linux/timekeeping.h>
 #include <linux/ctype.h>
-#include <linux/btf.h>
 #include <linux/nospec.h>
 #include <linux/init.h>
 
