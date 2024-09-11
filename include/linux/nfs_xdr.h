@@ -859,7 +859,7 @@ struct nfs3_sattrargs {
 	struct nfs_fh *		fh;
 	struct iattr *		sattr;
 	unsigned int		guard;
-	struct timespec		guardtime;
+	struct timespec64	guardtime;
 };
 
 struct nfs3_diropargs {
