@@ -1,0 +1,259 @@
+thermal/drivers/cpufreq_cooling: Fix return of cpufreq_set_cur_state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Willy Wolff <willy.mh.wolff.ml@gmail.com>
+commit ff44f672d74178b3be19d41a169b98b3e391d4ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ff44f672.failed
+
+When setting the cooling device current state from userspace via sysfs,
+the operation fails by returning an -EINVAL.
+
+It appears the recent changes with the per-policy frequency QoS
+introduced a regression as reported by:
+
+ https://lkml.org/lkml/2020/3/20/599
+
+The function freq_qos_update_request returns 0 or 1 describing update
+effectiveness, and a negative error code on failure. However,
+cpufreq_set_cur_state returns 0 on success or an error code otherwise.
+
+Consider the QoS update as successful if the function does not return
+an error.
+
+Fixes: 3000ce3c52f8b ("cpufreq: Use per-policy frequency QoS")
+	Signed-off-by: Willy Wolff <willy.mh.wolff.ml@gmail.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+Link: https://lore.kernel.org/r/20200321092740.7vvwfxsebcrznydh@macmini.local
+(cherry picked from commit ff44f672d74178b3be19d41a169b98b3e391d4ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/thermal/cpu_cooling.c
+diff --cc drivers/thermal/cpu_cooling.c
+index dfd23245f778,af55ac08e1bd..000000000000
+--- a/drivers/thermal/cpu_cooling.c
++++ b/drivers/thermal/cpu_cooling.c
+@@@ -333,80 -179,6 +333,85 @@@ static u32 get_dynamic_power(struct cpu
+  	return (raw_cpu_power * cpufreq_cdev->last_load) / 100;
+  }
+  
+ +/* cpufreq cooling device callback functions are defined below */
+ +
+ +/**
+ + * cpufreq_get_max_state - callback function to get the max cooling state.
+ + * @cdev: thermal cooling device pointer.
+ + * @state: fill this variable with the max cooling state.
+ + *
+ + * Callback for the thermal cooling device to return the cpufreq
+ + * max cooling state.
+ + *
+ + * Return: 0 on success, an error code otherwise.
+ + */
+ +static int cpufreq_get_max_state(struct thermal_cooling_device *cdev,
+ +				 unsigned long *state)
+ +{
+ +	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+ +
+ +	*state = cpufreq_cdev->max_level;
+ +	return 0;
+ +}
+ +
+ +/**
+ + * cpufreq_get_cur_state - callback function to get the current cooling state.
+ + * @cdev: thermal cooling device pointer.
+ + * @state: fill this variable with the current cooling state.
+ + *
+ + * Callback for the thermal cooling device to return the cpufreq
+ + * current cooling state.
+ + *
+ + * Return: 0 on success, an error code otherwise.
+ + */
+ +static int cpufreq_get_cur_state(struct thermal_cooling_device *cdev,
+ +				 unsigned long *state)
+ +{
+ +	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+ +
+ +	*state = cpufreq_cdev->cpufreq_state;
+ +
+ +	return 0;
+ +}
+ +
+ +/**
+ + * cpufreq_set_cur_state - callback function to set the current cooling state.
+ + * @cdev: thermal cooling device pointer.
+ + * @state: set this variable to the current cooling state.
+ + *
+ + * Callback for the thermal cooling device to change the cpufreq
+ + * current cooling state.
+ + *
+ + * Return: 0 on success, an error code otherwise.
+ + */
+ +static int cpufreq_set_cur_state(struct thermal_cooling_device *cdev,
+ +				 unsigned long state)
+ +{
+ +	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+++<<<<<<< HEAD:drivers/thermal/cpu_cooling.c
+ +	unsigned int clip_freq;
+++=======
+++	int ret;
+++>>>>>>> ff44f672d741 (thermal/drivers/cpufreq_cooling: Fix return of cpufreq_set_cur_state):drivers/thermal/cpufreq_cooling.c
+ +
+ +	/* Request state should be less than max_level */
+ +	if (WARN_ON(state > cpufreq_cdev->max_level))
+ +		return -EINVAL;
+ +
+ +	/* Check if the old cooling action is same as new cooling action */
+ +	if (cpufreq_cdev->cpufreq_state == state)
+ +		return 0;
+ +
+ +	clip_freq = cpufreq_cdev->freq_table[state].frequency;
+ +	cpufreq_cdev->cpufreq_state = state;
+ +	cpufreq_cdev->clipped_freq = clip_freq;
+ +
+++<<<<<<< HEAD:drivers/thermal/cpu_cooling.c
+ +	cpufreq_update_policy(cpufreq_cdev->policy->cpu);
+ +
+ +	return 0;
+ +}
+ +
+  /**
+   * cpufreq_get_requested_power() - get the current power
+   * @cdev:	&thermal_cooling_device pointer
+@@@ -551,6 -322,130 +556,11 @@@ static int cpufreq_power2state(struct t
+  	trace_thermal_power_cpu_limit(policy->related_cpus, target_freq, *state,
+  				      power);
+  	return 0;
+ -}
+ -
+ -static inline bool em_is_sane(struct cpufreq_cooling_device *cpufreq_cdev,
+ -			      struct em_perf_domain *em) {
+ -	struct cpufreq_policy *policy;
+ -	unsigned int nr_levels;
+ -
+ -	if (!em)
+ -		return false;
+ -
+ -	policy = cpufreq_cdev->policy;
+ -	if (!cpumask_equal(policy->related_cpus, to_cpumask(em->cpus))) {
+ -		pr_err("The span of pd %*pbl is misaligned with cpufreq policy %*pbl\n",
+ -			cpumask_pr_args(to_cpumask(em->cpus)),
+ -			cpumask_pr_args(policy->related_cpus));
+ -		return false;
+ -	}
+ -
+ -	nr_levels = cpufreq_cdev->max_level + 1;
+ -	if (em->nr_cap_states != nr_levels) {
+ -		pr_err("The number of cap states in pd %*pbl (%u) doesn't match the number of cooling levels (%u)\n",
+ -			cpumask_pr_args(to_cpumask(em->cpus)),
+ -			em->nr_cap_states, nr_levels);
+ -		return false;
+ -	}
+ -
+ -	return true;
+ -}
+ -#endif /* CONFIG_THERMAL_GOV_POWER_ALLOCATOR */
+ -
+ -static unsigned int get_state_freq(struct cpufreq_cooling_device *cpufreq_cdev,
+ -				   unsigned long state)
+ -{
+ -	struct cpufreq_policy *policy;
+ -	unsigned long idx;
+ -
+ -#ifdef CONFIG_THERMAL_GOV_POWER_ALLOCATOR
+ -	/* Use the Energy Model table if available */
+ -	if (cpufreq_cdev->em) {
+ -		idx = cpufreq_cdev->max_level - state;
+ -		return cpufreq_cdev->em->table[idx].frequency;
+ -	}
+ -#endif
+ -
+ -	/* Otherwise, fallback on the CPUFreq table */
+ -	policy = cpufreq_cdev->policy;
+ -	if (policy->freq_table_sorted == CPUFREQ_TABLE_SORTED_ASCENDING)
+ -		idx = cpufreq_cdev->max_level - state;
+ -	else
+ -		idx = state;
+ -
+ -	return policy->freq_table[idx].frequency;
+ -}
+ -
+ -/* cpufreq cooling device callback functions are defined below */
+ -
+ -/**
+ - * cpufreq_get_max_state - callback function to get the max cooling state.
+ - * @cdev: thermal cooling device pointer.
+ - * @state: fill this variable with the max cooling state.
+ - *
+ - * Callback for the thermal cooling device to return the cpufreq
+ - * max cooling state.
+ - *
+ - * Return: 0 on success, an error code otherwise.
+ - */
+ -static int cpufreq_get_max_state(struct thermal_cooling_device *cdev,
+ -				 unsigned long *state)
+ -{
+ -	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+ -
+ -	*state = cpufreq_cdev->max_level;
+ -	return 0;
+ -}
+ -
+ -/**
+ - * cpufreq_get_cur_state - callback function to get the current cooling state.
+ - * @cdev: thermal cooling device pointer.
+ - * @state: fill this variable with the current cooling state.
+ - *
+ - * Callback for the thermal cooling device to return the cpufreq
+ - * current cooling state.
+ - *
+ - * Return: 0 on success, an error code otherwise.
+ - */
+ -static int cpufreq_get_cur_state(struct thermal_cooling_device *cdev,
+ -				 unsigned long *state)
+ -{
+ -	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+ -
+ -	*state = cpufreq_cdev->cpufreq_state;
+ -
+ -	return 0;
+ -}
+ -
+ -/**
+ - * cpufreq_set_cur_state - callback function to set the current cooling state.
+ - * @cdev: thermal cooling device pointer.
+ - * @state: set this variable to the current cooling state.
+ - *
+ - * Callback for the thermal cooling device to change the cpufreq
+ - * current cooling state.
+ - *
+ - * Return: 0 on success, an error code otherwise.
+ - */
+ -static int cpufreq_set_cur_state(struct thermal_cooling_device *cdev,
+ -				 unsigned long state)
+ -{
+ -	struct cpufreq_cooling_device *cpufreq_cdev = cdev->devdata;
+ -	int ret;
+ -
+ -	/* Request state should be less than max_level */
+ -	if (WARN_ON(state > cpufreq_cdev->max_level))
+ -		return -EINVAL;
+ -
+ -	/* Check if the old cooling action is same as new cooling action */
+ -	if (cpufreq_cdev->cpufreq_state == state)
+ -		return 0;
+ -
+ -	cpufreq_cdev->cpufreq_state = state;
+ -
+++=======
++ 	ret = freq_qos_update_request(&cpufreq_cdev->qos_req,
++ 				      get_state_freq(cpufreq_cdev, state));
++ 	return ret < 0 ? ret : 0;
+++>>>>>>> ff44f672d741 (thermal/drivers/cpufreq_cooling: Fix return of cpufreq_set_cur_state):drivers/thermal/cpufreq_cooling.c
+  }
+  
+  /* Bind cpufreq callbacks to thermal cooling device ops */
+* Unmerged path drivers/thermal/cpu_cooling.c
