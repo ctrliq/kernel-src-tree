@@ -3592,7 +3592,7 @@ static int s_show(struct seq_file *m, void *p)
 			(void *)va->va_start, (void *)va->va_end,
 			va->va_end - va->va_start);
 
-		return 0;
+		goto final;
 	}
 
 	v = va->vm;
@@ -3636,6 +3636,7 @@ static int s_show(struct seq_file *m, void *p)
 	 * be address sorted, because the purge list is not
 	 * sorted.
 	 */
+final:
 	if (list_is_last(&va->list, &vmap_area_list))
 		show_purge_info(m);
 
