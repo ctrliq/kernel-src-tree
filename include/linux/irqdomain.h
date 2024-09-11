@@ -38,6 +38,7 @@
 #include <linux/rh_kabi.h>
 
 struct device_node;
+struct fwnode_handle;
 struct irq_domain;
 struct irq_chip;
 struct irq_data;
