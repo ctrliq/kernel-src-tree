@@ -1,0 +1,476 @@
+net: bridge: convert multicast to generic rhashtable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] bridge: convert multicast to generic rhashtable (Ivan Vecera) [1859244]
+Rebuild_FUZZ: 94.95%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 19e3a9c90c53479fecaa02307bf2db5ab8b3ffe3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/19e3a9c9.failed
+
+The bridge multicast code currently uses a custom resizable hashtable
+which predates the generic rhashtable interface. It has many
+shortcomings compared and duplicates functionality that is presently
+available via the generic rhashtable, so this patch removes the custom
+rhashtable implementation in favor of the kernel's generic rhashtable.
+The hash maximum is kept and the rhashtable's size is used to do a loose
+check if it's reached in which case we revert to the old behaviour and
+disable further bridge multicast processing. Also now we can support any
+hash maximum, doesn't need to be a power of 2.
+
+v3: add non-rcu br_mdb_get variant and use it where multicast_lock is
+    held to avoid RCU splat, drop hash_max function and just set it
+    directly
+
+v2: handle when IGMP snooping is undefined, add br_mdb_init/uninit
+    placeholders
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 19e3a9c90c53479fecaa02307bf2db5ab8b3ffe3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mdb.c
+#	net/bridge/br_multicast.c
+diff --cc net/bridge/br_mdb.c
+index b629ecde1ced,ea8abdb56df3..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -87,11 -86,7 +86,15 @@@ static int br_mdb_fill_info(struct sk_b
+  	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	mdb = rcu_dereference(br->mdb);
+ +	if (!mdb)
+ +		return 0;
+ +
+ +	nest = nla_nest_start_noflag(skb, MDBA_MDB);
+++=======
++ 	nest = nla_nest_start(skb, MDBA_MDB);
+++>>>>>>> 19e3a9c90c53 (net: bridge: convert multicast to generic rhashtable)
+  	if (nest == NULL)
+  		return -EMSGSIZE;
+  
+@@@ -101,59 -95,55 +103,102 @@@
+  		struct net_bridge_port_group __rcu **pp;
+  		struct net_bridge_port *port;
+  
+- 		hlist_for_each_entry_rcu(mp, &mdb->mhash[i], hlist[mdb->ver]) {
+- 			if (idx < s_idx)
+- 				goto skip;
++ 		if (idx < s_idx)
++ 			goto skip;
+  
+++<<<<<<< HEAD
+ +			nest2 = nla_nest_start_noflag(skb, MDBA_MDB_ENTRY);
+ +			if (nest2 == NULL) {
+ +				err = -EMSGSIZE;
+ +				goto out;
+ +			}
+ +
+ +			for (pp = &mp->ports;
+ +			     (p = rcu_dereference(*pp)) != NULL;
+ +			      pp = &p->next) {
+ +				struct nlattr *nest_ent;
+ +				struct br_mdb_entry e;
+ +
+ +				port = p->port;
+ +				if (!port)
+ +					continue;
+ +
+ +				memset(&e, 0, sizeof(e));
+ +				e.ifindex = port->dev->ifindex;
+ +				e.vid = p->addr.vid;
+ +				__mdb_entry_fill_flags(&e, p->flags);
+ +				if (p->addr.proto == htons(ETH_P_IP))
+ +					e.addr.u.ip4 = p->addr.u.ip4;
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +				if (p->addr.proto == htons(ETH_P_IPV6))
+ +					e.addr.u.ip6 = p->addr.u.ip6;
+ +#endif
+ +				e.addr.proto = p->addr.proto;
+ +				nest_ent = nla_nest_start_noflag(skb,
+ +							  MDBA_MDB_ENTRY_INFO);
+ +				if (!nest_ent) {
+ +					nla_nest_cancel(skb, nest2);
+ +					err = -EMSGSIZE;
+ +					goto out;
+ +				}
+ +				if (nla_put_nohdr(skb, sizeof(e), &e) ||
+ +				    nla_put_u32(skb,
+ +						MDBA_MDB_EATTR_TIMER,
+ +						br_timer_value(&p->timer))) {
+ +					nla_nest_cancel(skb, nest_ent);
+ +					nla_nest_cancel(skb, nest2);
+ +					err = -EMSGSIZE;
+ +					goto out;
+ +				}
+ +				nla_nest_end(skb, nest_ent);
+++=======
++ 		nest2 = nla_nest_start(skb, MDBA_MDB_ENTRY);
++ 		if (!nest2) {
++ 			err = -EMSGSIZE;
++ 			break;
++ 		}
++ 
++ 		for (pp = &mp->ports; (p = rcu_dereference(*pp)) != NULL;
++ 		      pp = &p->next) {
++ 			struct nlattr *nest_ent;
++ 			struct br_mdb_entry e;
++ 
++ 			port = p->port;
++ 			if (!port)
++ 				continue;
++ 
++ 			memset(&e, 0, sizeof(e));
++ 			e.ifindex = port->dev->ifindex;
++ 			e.vid = p->addr.vid;
++ 			__mdb_entry_fill_flags(&e, p->flags);
++ 			if (p->addr.proto == htons(ETH_P_IP))
++ 				e.addr.u.ip4 = p->addr.u.ip4;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 			if (p->addr.proto == htons(ETH_P_IPV6))
++ 				e.addr.u.ip6 = p->addr.u.ip6;
++ #endif
++ 			e.addr.proto = p->addr.proto;
++ 			nest_ent = nla_nest_start(skb, MDBA_MDB_ENTRY_INFO);
++ 			if (!nest_ent) {
++ 				nla_nest_cancel(skb, nest2);
++ 				err = -EMSGSIZE;
++ 				goto out;
+  			}
+- 			nla_nest_end(skb, nest2);
+- 		skip:
+- 			idx++;
++ 			if (nla_put_nohdr(skb, sizeof(e), &e) ||
++ 			    nla_put_u32(skb,
++ 					MDBA_MDB_EATTR_TIMER,
++ 					br_timer_value(&p->timer))) {
++ 				nla_nest_cancel(skb, nest_ent);
++ 				nla_nest_cancel(skb, nest2);
++ 				err = -EMSGSIZE;
++ 				goto out;
+++>>>>>>> 19e3a9c90c53 (net: bridge: convert multicast to generic rhashtable)
++ 			}
++ 			nla_nest_end(skb, nest_ent);
+  		}
++ 		nla_nest_end(skb, nest2);
++ skip:
++ 		idx++;
+  	}
+  
+  out:
+diff --cc net/bridge/br_multicast.c
+index 24aa4991cef4,83a5931a7784..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -255,12 -191,11 +191,11 @@@ static void br_multicast_group_expired(
+  	if (mp->ports)
+  		goto out;
+  
+- 	mdb = mlock_dereference(br->mdb, br);
+- 
+- 	hlist_del_rcu(&mp->hlist[mdb->ver]);
+- 	mdb->size--;
++ 	rhashtable_remove_fast(&br->mdb_hash_tbl, &mp->rhnode,
++ 			       br_mdb_rht_params);
++ 	hlist_del_rcu(&mp->mdb_node);
+  
+ -	call_rcu_bh(&mp->rcu, br_multicast_free_group);
+ +	call_rcu(&mp->rcu, br_multicast_free_group);
+  
+  out:
+  	spin_unlock(&br->multicast_lock);
+@@@ -319,53 -251,6 +251,56 @@@ out
+  	spin_unlock(&br->multicast_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static int br_mdb_rehash(struct net_bridge_mdb_htable __rcu **mdbp, int max,
+ +			 int elasticity)
+ +{
+ +	struct net_bridge_mdb_htable *old = rcu_dereference_protected(*mdbp, 1);
+ +	struct net_bridge_mdb_htable *mdb;
+ +	int err;
+ +
+ +	mdb = kmalloc(sizeof(*mdb), GFP_ATOMIC);
+ +	if (!mdb)
+ +		return -ENOMEM;
+ +
+ +	mdb->max = max;
+ +	mdb->old = old;
+ +
+ +	mdb->mhash = kcalloc(max, sizeof(*mdb->mhash), GFP_ATOMIC);
+ +	if (!mdb->mhash) {
+ +		kfree(mdb);
+ +		return -ENOMEM;
+ +	}
+ +
+ +	mdb->size = old ? old->size : 0;
+ +	mdb->ver = old ? old->ver ^ 1 : 0;
+ +
+ +	if (!old || elasticity)
+ +		get_random_bytes(&mdb->secret, sizeof(mdb->secret));
+ +	else
+ +		mdb->secret = old->secret;
+ +
+ +	if (!old)
+ +		goto out;
+ +
+ +	err = br_mdb_copy(mdb, old, elasticity);
+ +	if (err) {
+ +		kfree(mdb->mhash);
+ +		kfree(mdb);
+ +		return err;
+ +	}
+ +
+ +	br_mdb_rehash_seq++;
+ +	call_rcu(&mdb->rcu, br_mdb_free);
+ +
+ +out:
+ +	rcu_assign_pointer(*mdbp, mdb);
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 19e3a9c90c53 (net: bridge: convert multicast to generic rhashtable)
+  static struct sk_buff *br_ip4_multicast_alloc_query(struct net_bridge *br,
+  						    __be32 group,
+  						    u8 *igmp_type)
+@@@ -2030,40 -1830,20 +1877,49 @@@ void br_multicast_stop(struct net_bridg
+  
+  void br_multicast_dev_del(struct net_bridge *br)
+  {
+- 	struct net_bridge_mdb_htable *mdb;
+  	struct net_bridge_mdb_entry *mp;
+- 	struct hlist_node *n;
+- 	u32 ver;
+- 	int i;
++ 	struct hlist_node *tmp;
+  
+  	spin_lock_bh(&br->multicast_lock);
+++<<<<<<< HEAD
+ +	mdb = mlock_dereference(br->mdb, br);
+ +	if (!mdb)
+ +		goto out;
+ +
+ +	br->mdb = NULL;
+ +
+ +	ver = mdb->ver;
+ +	for (i = 0; i < mdb->max; i++) {
+ +		hlist_for_each_entry_safe(mp, n, &mdb->mhash[i],
+ +					  hlist[ver]) {
+ +			del_timer(&mp->timer);
+ +			call_rcu(&mp->rcu, br_multicast_free_group);
+ +		}
+ +	}
+ +
+ +	if (mdb->old) {
+ +		spin_unlock_bh(&br->multicast_lock);
+ +		rcu_barrier();
+ +		spin_lock_bh(&br->multicast_lock);
+ +		WARN_ON(mdb->old);
+ +	}
+ +
+ +	mdb->old = mdb;
+ +	call_rcu(&mdb->rcu, br_mdb_free);
+ +
+ +out:
+++=======
++ 	hlist_for_each_entry_safe(mp, tmp, &br->mdb_list, mdb_node) {
++ 		del_timer(&mp->timer);
++ 		rhashtable_remove_fast(&br->mdb_hash_tbl, &mp->rhnode,
++ 				       br_mdb_rht_params);
++ 		hlist_del_rcu(&mp->mdb_node);
++ 		call_rcu_bh(&mp->rcu, br_multicast_free_group);
++ 	}
+++>>>>>>> 19e3a9c90c53 (net: bridge: convert multicast to generic rhashtable)
+  	spin_unlock_bh(&br->multicast_lock);
++ 
++ 	rcu_barrier_bh();
+  }
+  
+  int br_multicast_set_router(struct net_bridge *br, unsigned long val)
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index a515521ffa96..afc016d9253d 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -124,9 +124,17 @@ static int br_dev_init(struct net_device *dev)
+ 		return err;
+ 	}
+ 
++	err = br_mdb_hash_init(br);
++	if (err) {
++		free_percpu(br->stats);
++		br_fdb_hash_fini(br);
++		return err;
++	}
++
+ 	err = br_vlan_init(br);
+ 	if (err) {
+ 		free_percpu(br->stats);
++		br_mdb_hash_fini(br);
+ 		br_fdb_hash_fini(br);
+ 		return err;
+ 	}
+@@ -135,6 +143,7 @@ static int br_dev_init(struct net_device *dev)
+ 	if (err) {
+ 		free_percpu(br->stats);
+ 		br_vlan_flush(br);
++		br_mdb_hash_fini(br);
+ 		br_fdb_hash_fini(br);
+ 	}
+ 
+@@ -148,6 +157,7 @@ static void br_dev_uninit(struct net_device *dev)
+ 	br_multicast_dev_del(br);
+ 	br_multicast_uninit_stats(br);
+ 	br_vlan_flush(br);
++	br_mdb_hash_fini(br);
+ 	br_fdb_hash_fini(br);
+ 	free_percpu(br->stats);
+ }
+* Unmerged path net/bridge/br_mdb.c
+* Unmerged path net/bridge/br_multicast.c
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 97b55a9d2715..8a90d5573c11 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -1173,13 +1173,8 @@ static int br_changelink(struct net_device *brdev, struct nlattr *tb[],
+ 		br->hash_elasticity = val;
+ 	}
+ 
+-	if (data[IFLA_BR_MCAST_HASH_MAX]) {
+-		u32 hash_max = nla_get_u32(data[IFLA_BR_MCAST_HASH_MAX]);
+-
+-		err = br_multicast_set_hash_max(br, hash_max);
+-		if (err)
+-			return err;
+-	}
++	if (data[IFLA_BR_MCAST_HASH_MAX])
++		br->hash_max = nla_get_u32(data[IFLA_BR_MCAST_HASH_MAX]);
+ 
+ 	if (data[IFLA_BR_MCAST_LAST_MEMBER_CNT]) {
+ 		u32 val = nla_get_u32(data[IFLA_BR_MCAST_LAST_MEMBER_CNT]);
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 315031269bb0..9436a3385d89 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -214,23 +214,14 @@ struct net_bridge_port_group {
+ };
+ 
+ struct net_bridge_mdb_entry {
+-	struct hlist_node		hlist[2];
++	struct rhash_head		rhnode;
+ 	struct net_bridge		*br;
+ 	struct net_bridge_port_group __rcu *ports;
+ 	struct rcu_head			rcu;
+ 	struct timer_list		timer;
+ 	struct br_ip			addr;
+ 	bool				host_joined;
+-};
+-
+-struct net_bridge_mdb_htable {
+-	struct hlist_head		*mhash;
+-	struct rcu_head			rcu;
+-	struct net_bridge_mdb_htable	*old;
+-	u32				size;
+-	u32				max;
+-	u32				secret;
+-	u32				ver;
++	struct hlist_node		mdb_node;
+ };
+ 
+ struct net_bridge_port {
+@@ -396,7 +387,9 @@ struct net_bridge {
+ 	unsigned long			multicast_query_response_interval;
+ 	unsigned long			multicast_startup_query_interval;
+ 
+-	struct net_bridge_mdb_htable __rcu *mdb;
++	struct rhashtable		mdb_hash_tbl;
++
++	struct hlist_head		mdb_list;
+ 	struct hlist_head		router_list;
+ 
+ 	struct timer_list		multicast_router_timer;
+@@ -647,7 +640,6 @@ int br_ioctl_deviceless_stub(struct net *net, unsigned int cmd,
+ 
+ /* br_multicast.c */
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+-extern unsigned int br_mdb_rehash_seq;
+ int br_multicast_rcv(struct net_bridge *br, struct net_bridge_port *port,
+ 		     struct sk_buff *skb, u16 vid);
+ struct net_bridge_mdb_entry *br_mdb_get(struct net_bridge *br,
+@@ -672,17 +664,16 @@ int br_multicast_set_igmp_version(struct net_bridge *br, unsigned long val);
+ int br_multicast_set_mld_version(struct net_bridge *br, unsigned long val);
+ #endif
+ struct net_bridge_mdb_entry *
+-br_mdb_ip_get(struct net_bridge_mdb_htable *mdb, struct br_ip *dst);
++br_mdb_ip_get(struct net_bridge *br, struct br_ip *dst);
+ struct net_bridge_mdb_entry *
+-br_multicast_new_group(struct net_bridge *br, struct net_bridge_port *port,
+-		       struct br_ip *group);
++br_multicast_new_group(struct net_bridge *br, struct br_ip *group);
+ void br_multicast_free_pg(struct rcu_head *head);
+ struct net_bridge_port_group *
+ br_multicast_new_port_group(struct net_bridge_port *port, struct br_ip *group,
+ 			    struct net_bridge_port_group __rcu *next,
+ 			    unsigned char flags, const unsigned char *src);
+-void br_mdb_init(void);
+-void br_mdb_uninit(void);
++int br_mdb_hash_init(struct net_bridge *br);
++void br_mdb_hash_fini(struct net_bridge *br);
+ void br_mdb_notify(struct net_device *dev, struct net_bridge_port *port,
+ 		   struct br_ip *group, int type, u8 flags);
+ void br_rtr_notify(struct net_device *dev, struct net_bridge_port *port,
+@@ -694,6 +685,8 @@ void br_multicast_uninit_stats(struct net_bridge *br);
+ void br_multicast_get_stats(const struct net_bridge *br,
+ 			    const struct net_bridge_port *p,
+ 			    struct br_mcast_stats *dest);
++void br_mdb_init(void);
++void br_mdb_uninit(void);
+ 
+ #define mlock_dereference(X, br) \
+ 	rcu_dereference_protected(X, lockdep_is_held(&br->multicast_lock))
+@@ -819,6 +812,15 @@ static inline void br_mdb_uninit(void)
+ {
+ }
+ 
++static inline int br_mdb_hash_init(struct net_bridge *br)
++{
++	return 0;
++}
++
++static inline void br_mdb_hash_fini(struct net_bridge *br)
++{
++}
++
+ static inline void br_multicast_count(struct net_bridge *br,
+ 				      const struct net_bridge_port *p,
+ 				      const struct sk_buff *skb,
+diff --git a/net/bridge/br_sysfs_br.c b/net/bridge/br_sysfs_br.c
+index 60182bef6341..cc3b565dfd8c 100644
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@ -428,10 +428,16 @@ static ssize_t hash_max_show(struct device *d, struct device_attribute *attr,
+ 	return sprintf(buf, "%u\n", br->hash_max);
+ }
+ 
++static int set_hash_max(struct net_bridge *br, unsigned long val)
++{
++	br->hash_max = val;
++	return 0;
++}
++
+ static ssize_t hash_max_store(struct device *d, struct device_attribute *attr,
+ 			      const char *buf, size_t len)
+ {
+-	return store_bridge_parm(d, buf, len, br_multicast_set_hash_max);
++	return store_bridge_parm(d, buf, len, set_hash_max);
+ }
+ static DEVICE_ATTR_RW(hash_max);
+ 
