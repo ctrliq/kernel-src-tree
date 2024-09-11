@@ -1,0 +1,206 @@
+binder: fix use-after-free due to ksys_close() during fdget()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Todd Kjos <tkjos@android.com>
+commit 80cd795630d6526ba729a089a435bf74a57af927
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/80cd7956.failed
+
+44d8047f1d8 ("binder: use standard functions to allocate fds")
+exposed a pre-existing issue in the binder driver.
+
+fdget() is used in ksys_ioctl() as a performance optimization.
+One of the rules associated with fdget() is that ksys_close() must
+not be called between the fdget() and the fdput(). There is a case
+where this requirement is not met in the binder driver which results
+in the reference count dropping to 0 when the device is still in
+use. This can result in use-after-free or other issues.
+
+If userpace has passed a file-descriptor for the binder driver using
+a BINDER_TYPE_FDA object, then kys_close() is called on it when
+handling a binder_ioctl(BC_FREE_BUFFER) command. This violates
+the assumptions for using fdget().
+
+The problem is fixed by deferring the close using task_work_add(). A
+new variant of __close_fd() was created that returns a struct file
+with a reference. The fput() is deferred instead of using ksys_close().
+
+Fixes: 44d8047f1d87a ("binder: use standard functions to allocate fds")
+	Suggested-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Todd Kjos <tkjos@google.com>
+	Cc: stable <stable@vger.kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 80cd795630d6526ba729a089a435bf74a57af927)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/android/binder.c
+diff --cc drivers/android/binder.c
+index 95283f3bb51c,210940bd0457..000000000000
+--- a/drivers/android/binder.c
++++ b/drivers/android/binder.c
+@@@ -71,8 -70,14 +71,14 @@@
+  #include <linux/pid_namespace.h>
+  #include <linux/security.h>
+  #include <linux/spinlock.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/ratelimit.h>
++ #include <linux/syscalls.h>
++ #include <linux/task_work.h>
+++>>>>>>> 80cd795630d6 (binder: fix use-after-free due to ksys_close() during fdget())
+  
+  #include <uapi/linux/android/binder.h>
+ -
+ -#include <asm/cacheflush.h>
+ -
+  #include "binder_alloc.h"
+  #include "binder_trace.h"
+  
+@@@ -2312,7 -2368,7 +2376,11 @@@ static void binder_transaction_buffer_r
+  			}
+  			fd_array = (u32 *)(parent_buffer + (uintptr_t)fda->parent_offset);
+  			for (fd_index = 0; fd_index < fda->num_fds; fd_index++)
+++<<<<<<< HEAD
+ +				task_close_fd(proc, fd_array[fd_index]);
+++=======
++ 				binder_deferred_fd_close(fd_array[fd_index]);
+++>>>>>>> 80cd795630d6 (binder: fix use-after-free due to ksys_close() during fdget())
+  		} break;
+  		default:
+  			pr_err("transaction release %d bad object type %x\n",
+@@@ -3826,6 -3926,76 +3894,79 @@@ static int binder_wait_for_work(struct 
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * binder_apply_fd_fixups() - finish fd translation
++  * @t:	binder transaction with list of fd fixups
++  *
++  * Now that we are in the context of the transaction target
++  * process, we can allocate and install fds. Process the
++  * list of fds to translate and fixup the buffer with the
++  * new fds.
++  *
++  * If we fail to allocate an fd, then free the resources by
++  * fput'ing files that have not been processed and ksys_close'ing
++  * any fds that have already been allocated.
++  */
++ static int binder_apply_fd_fixups(struct binder_transaction *t)
++ {
++ 	struct binder_txn_fd_fixup *fixup, *tmp;
++ 	int ret = 0;
++ 
++ 	list_for_each_entry(fixup, &t->fd_fixups, fixup_entry) {
++ 		int fd = get_unused_fd_flags(O_CLOEXEC);
++ 		u32 *fdp;
++ 
++ 		if (fd < 0) {
++ 			binder_debug(BINDER_DEBUG_TRANSACTION,
++ 				     "failed fd fixup txn %d fd %d\n",
++ 				     t->debug_id, fd);
++ 			ret = -ENOMEM;
++ 			break;
++ 		}
++ 		binder_debug(BINDER_DEBUG_TRANSACTION,
++ 			     "fd fixup txn %d fd %d\n",
++ 			     t->debug_id, fd);
++ 		trace_binder_transaction_fd_recv(t, fd, fixup->offset);
++ 		fd_install(fd, fixup->file);
++ 		fixup->file = NULL;
++ 		fdp = (u32 *)(t->buffer->data + fixup->offset);
++ 		/*
++ 		 * This store can cause problems for CPUs with a
++ 		 * VIVT cache (eg ARMv5) since the cache cannot
++ 		 * detect virtual aliases to the same physical cacheline.
++ 		 * To support VIVT, this address and the user-space VA
++ 		 * would both need to be flushed. Since this kernel
++ 		 * VA is not constructed via page_to_virt(), we can't
++ 		 * use flush_dcache_page() on it, so we'd have to use
++ 		 * an internal function. If devices with VIVT ever
++ 		 * need to run Android, we'll either need to go back
++ 		 * to patching the translated fd from the sender side
++ 		 * (using the non-standard kernel functions), or rework
++ 		 * how the kernel uses the buffer to use page_to_virt()
++ 		 * addresses instead of allocating in our own vm area.
++ 		 *
++ 		 * For now, we disable compilation if CONFIG_CPU_CACHE_VIVT.
++ 		 */
++ 		*fdp = fd;
++ 	}
++ 	list_for_each_entry_safe(fixup, tmp, &t->fd_fixups, fixup_entry) {
++ 		if (fixup->file) {
++ 			fput(fixup->file);
++ 		} else if (ret) {
++ 			u32 *fdp = (u32 *)(t->buffer->data + fixup->offset);
++ 
++ 			binder_deferred_fd_close(*fdp);
++ 		}
++ 		list_del(&fixup->fixup_entry);
++ 		kfree(fixup);
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 80cd795630d6 (binder: fix use-after-free due to ksys_close() during fdget())
+  static int binder_thread_read(struct binder_proc *proc,
+  			      struct binder_thread *thread,
+  			      binder_uintptr_t binder_buffer, size_t size,
+* Unmerged path drivers/android/binder.c
+diff --git a/fs/file.c b/fs/file.c
+index 701ef29b0a6b..97df385d6ab0 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -640,6 +640,35 @@ int __close_fd(struct files_struct *files, unsigned fd)
+ }
+ EXPORT_SYMBOL(__close_fd); /* for ksys_close() */
+ 
++/*
++ * variant of __close_fd that gets a ref on the file for later fput
++ */
++int __close_fd_get_file(unsigned int fd, struct file **res)
++{
++	struct files_struct *files = current->files;
++	struct file *file;
++	struct fdtable *fdt;
++
++	spin_lock(&files->file_lock);
++	fdt = files_fdtable(files);
++	if (fd >= fdt->max_fds)
++		goto out_unlock;
++	file = fdt->fd[fd];
++	if (!file)
++		goto out_unlock;
++	rcu_assign_pointer(fdt->fd[fd], NULL);
++	__put_unused_fd(files, fd);
++	spin_unlock(&files->file_lock);
++	get_file(file);
++	*res = file;
++	return filp_close(file, files);
++
++out_unlock:
++	spin_unlock(&files->file_lock);
++	*res = NULL;
++	return -ENOENT;
++}
++
+ void do_close_on_exec(struct files_struct *files)
+ {
+ 	unsigned i;
+diff --git a/include/linux/fdtable.h b/include/linux/fdtable.h
+index 41615f38bcff..f07c55ea0c22 100644
+--- a/include/linux/fdtable.h
++++ b/include/linux/fdtable.h
+@@ -121,6 +121,7 @@ extern void __fd_install(struct files_struct *files,
+ 		      unsigned int fd, struct file *file);
+ extern int __close_fd(struct files_struct *files,
+ 		      unsigned int fd);
++extern int __close_fd_get_file(unsigned int fd, struct file **res);
+ 
+ extern struct kmem_cache *files_cachep;
+ 
