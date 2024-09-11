@@ -1,0 +1,116 @@
+team: fix nested locking lockdep warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Taehee Yoo <ap420073@gmail.com>
+commit 369f61bee0f584aee09f0736431eb9b330c98571
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/369f61be.failed
+
+team interface could be nested and it's lock variable could be nested too.
+But this lock uses static lockdep key and there is no nested locking
+handling code such as mutex_lock_nested() and so on.
+so the Lockdep would warn about the circular locking scenario that
+couldn't happen.
+In order to fix, this patch makes the team module to use dynamic lock key
+instead of static key.
+
+Test commands:
+    ip link add team0 type team
+    ip link add team1 type team
+    ip link set team0 master team1
+    ip link set team0 nomaster
+    ip link set team1 master team0
+    ip link set team1 nomaster
+
+Splat that looks like:
+[   40.364352] WARNING: possible recursive locking detected
+[   40.364964] 5.4.0-rc3+ #96 Not tainted
+[   40.365405] --------------------------------------------
+[   40.365973] ip/750 is trying to acquire lock:
+[   40.366542] ffff888060b34c40 (&team->lock){+.+.}, at: team_set_mac_address+0x151/0x290 [team]
+[   40.367689]
+	       but task is already holding lock:
+[   40.368729] ffff888051201c40 (&team->lock){+.+.}, at: team_del_slave+0x29/0x60 [team]
+[   40.370280]
+	       other info that might help us debug this:
+[   40.371159]  Possible unsafe locking scenario:
+
+[   40.371942]        CPU0
+[   40.372338]        ----
+[   40.372673]   lock(&team->lock);
+[   40.373115]   lock(&team->lock);
+[   40.373549]
+	       *** DEADLOCK ***
+
+[   40.374432]  May be due to missing lock nesting notation
+
+[   40.375338] 2 locks held by ip/750:
+[   40.375851]  #0: ffffffffabcc42b0 (rtnl_mutex){+.+.}, at: rtnetlink_rcv_msg+0x466/0x8a0
+[   40.376927]  #1: ffff888051201c40 (&team->lock){+.+.}, at: team_del_slave+0x29/0x60 [team]
+[   40.377989]
+	       stack backtrace:
+[   40.378650] CPU: 0 PID: 750 Comm: ip Not tainted 5.4.0-rc3+ #96
+[   40.379368] Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS VirtualBox 12/01/2006
+[   40.380574] Call Trace:
+[   40.381208]  dump_stack+0x7c/0xbb
+[   40.381959]  __lock_acquire+0x269d/0x3de0
+[   40.382817]  ? register_lock_class+0x14d0/0x14d0
+[   40.383784]  ? check_chain_key+0x236/0x5d0
+[   40.384518]  lock_acquire+0x164/0x3b0
+[   40.385074]  ? team_set_mac_address+0x151/0x290 [team]
+[   40.385805]  __mutex_lock+0x14d/0x14c0
+[   40.386371]  ? team_set_mac_address+0x151/0x290 [team]
+[   40.387038]  ? team_set_mac_address+0x151/0x290 [team]
+[   40.387632]  ? mutex_lock_io_nested+0x1380/0x1380
+[   40.388245]  ? team_del_slave+0x60/0x60 [team]
+[   40.388752]  ? rcu_read_lock_sched_held+0x90/0xc0
+[   40.389304]  ? rcu_read_lock_bh_held+0xa0/0xa0
+[   40.389819]  ? lock_acquire+0x164/0x3b0
+[   40.390285]  ? lockdep_rtnl_is_held+0x16/0x20
+[   40.390797]  ? team_port_get_rtnl+0x90/0xe0 [team]
+[   40.391353]  ? __module_text_address+0x13/0x140
+[   40.391886]  ? team_set_mac_address+0x151/0x290 [team]
+[   40.392547]  team_set_mac_address+0x151/0x290 [team]
+[   40.393111]  dev_set_mac_address+0x1f0/0x3f0
+[ ... ]
+
+Fixes: 3d249d4ca7d0 ("net: introduce ethernet teaming device")
+	Signed-off-by: Taehee Yoo <ap420073@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 369f61bee0f584aee09f0736431eb9b330c98571)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/team/team.c
+diff --cc drivers/net/team/team.c
+index a22a639b570b,8156b33ee3e7..000000000000
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@@ -1648,7 -1641,8 +1647,12 @@@ static int team_init(struct net_device 
+  		goto err_options_register;
+  	netif_carrier_off(dev);
+  
+++<<<<<<< HEAD
+ +	netdev_lockdep_set_classes(dev);
+++=======
++ 	lockdep_register_key(&team->team_lock_key);
++ 	__mutex_init(&team->lock, "team->team_lock_key", &team->team_lock_key);
+++>>>>>>> 369f61bee0f5 (team: fix nested locking lockdep warning)
+  
+  	return 0;
+  
+* Unmerged path drivers/net/team/team.c
+diff --git a/include/linux/if_team.h b/include/linux/if_team.h
+index ac42da56f7a2..7aafe7be2d3b 100644
+--- a/include/linux/if_team.h
++++ b/include/linux/if_team.h
+@@ -227,6 +227,7 @@ struct team {
+ 		atomic_t count_pending;
+ 		struct delayed_work dw;
+ 	} mcast_rejoin;
++	struct lock_class_key team_lock_key;
+ 	long mode_priv[TEAM_MODE_PRIV_LONGS];
+ };
+ 
