@@ -1,0 +1,235 @@
+netdevsim: create devlink and netdev instances in namespace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 7b60027bbc6738b067bb9ed732a8c56b0ac430b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7b60027b.failed
+
+When user does create new netdevsim instance using sysfs bus file,
+create the devlink instance and related netdev instance in the namespace
+of the caller.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7b60027bbc6738b067bb9ed732a8c56b0ac430b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/netdevsim/dev.c
+diff --cc drivers/net/netdevsim/dev.c
+index 863a10803cdb,fbc4cdcfe551..000000000000
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@@ -807,7 -656,178 +807,182 @@@ static void nsim_dev_port_del_all(struc
+  	list_for_each_entry_safe(nsim_dev_port, tmp,
+  				 &nsim_dev->port_list, list)
+  		__nsim_dev_port_del(nsim_dev_port);
+++<<<<<<< HEAD
+ +	mutex_unlock(&nsim_dev->port_list_lock);
+++=======
++ }
++ 
++ static int nsim_dev_port_add_all(struct nsim_dev *nsim_dev,
++ 				 unsigned int port_count)
++ {
++ 	int i, err;
++ 
++ 	for (i = 0; i < port_count; i++) {
++ 		err = __nsim_dev_port_add(nsim_dev, i);
++ 		if (err)
++ 			goto err_port_del_all;
++ 	}
++ 	return 0;
++ 
++ err_port_del_all:
++ 	nsim_dev_port_del_all(nsim_dev);
++ 	return err;
++ }
++ 
++ static int nsim_dev_reload_create(struct nsim_dev *nsim_dev,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	struct nsim_bus_dev *nsim_bus_dev = nsim_dev->nsim_bus_dev;
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	devlink = priv_to_devlink(nsim_dev);
++ 	nsim_dev = devlink_priv(devlink);
++ 	INIT_LIST_HEAD(&nsim_dev->port_list);
++ 	mutex_init(&nsim_dev->port_list_lock);
++ 	nsim_dev->fw_update_status = true;
++ 
++ 	nsim_dev->fib_data = nsim_fib_create(devlink, extack);
++ 	if (IS_ERR(nsim_dev->fib_data))
++ 		return PTR_ERR(nsim_dev->fib_data);
++ 
++ 	nsim_devlink_param_load_driverinit_values(devlink);
++ 
++ 	err = nsim_dev_dummy_region_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_fib_destroy;
++ 
++ 	err = nsim_dev_traps_init(devlink);
++ 	if (err)
++ 		goto err_dummy_region_exit;
++ 
++ 	err = nsim_dev_port_add_all(nsim_dev, nsim_bus_dev->port_count);
++ 	if (err)
++ 		goto err_traps_exit;
++ 
++ 	return 0;
++ 
++ err_traps_exit:
++ 	nsim_dev_traps_exit(devlink);
++ err_dummy_region_exit:
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ err_fib_destroy:
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ 	return err;
++ }
++ 
++ static struct nsim_dev *nsim_dev_create(struct nsim_bus_dev *nsim_bus_dev)
++ {
++ 	struct nsim_dev *nsim_dev;
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	devlink = devlink_alloc(&nsim_dev_devlink_ops, sizeof(*nsim_dev));
++ 	if (!devlink)
++ 		return ERR_PTR(-ENOMEM);
++ 	devlink_net_set(devlink, nsim_bus_dev->initial_net);
++ 	nsim_dev = devlink_priv(devlink);
++ 	nsim_dev->nsim_bus_dev = nsim_bus_dev;
++ 	nsim_dev->switch_id.id_len = sizeof(nsim_dev->switch_id.id);
++ 	get_random_bytes(nsim_dev->switch_id.id, nsim_dev->switch_id.id_len);
++ 	INIT_LIST_HEAD(&nsim_dev->port_list);
++ 	mutex_init(&nsim_dev->port_list_lock);
++ 	nsim_dev->fw_update_status = true;
++ 	nsim_dev->max_macs = NSIM_DEV_MAX_MACS_DEFAULT;
++ 	nsim_dev->test1 = NSIM_DEV_TEST1_DEFAULT;
++ 
++ 	err = nsim_dev_resources_register(devlink);
++ 	if (err)
++ 		goto err_devlink_free;
++ 
++ 	nsim_dev->fib_data = nsim_fib_create(devlink, NULL);
++ 	if (IS_ERR(nsim_dev->fib_data)) {
++ 		err = PTR_ERR(nsim_dev->fib_data);
++ 		goto err_resources_unregister;
++ 	}
++ 
++ 	err = devlink_register(devlink, &nsim_bus_dev->dev);
++ 	if (err)
++ 		goto err_fib_destroy;
++ 
++ 	err = devlink_params_register(devlink, nsim_devlink_params,
++ 				      ARRAY_SIZE(nsim_devlink_params));
++ 	if (err)
++ 		goto err_dl_unregister;
++ 	nsim_devlink_set_params_init_values(nsim_dev, devlink);
++ 
++ 	err = nsim_dev_dummy_region_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_params_unregister;
++ 
++ 	err = nsim_dev_traps_init(devlink);
++ 	if (err)
++ 		goto err_dummy_region_exit;
++ 
++ 	err = nsim_dev_debugfs_init(nsim_dev);
++ 	if (err)
++ 		goto err_traps_exit;
++ 
++ 	err = nsim_bpf_dev_init(nsim_dev);
++ 	if (err)
++ 		goto err_debugfs_exit;
++ 
++ 	err = nsim_dev_port_add_all(nsim_dev, nsim_bus_dev->port_count);
++ 	if (err)
++ 		goto err_bpf_dev_exit;
++ 
++ 	devlink_params_publish(devlink);
++ 	return nsim_dev;
++ 
++ err_bpf_dev_exit:
++ 	nsim_bpf_dev_exit(nsim_dev);
++ err_debugfs_exit:
++ 	nsim_dev_debugfs_exit(nsim_dev);
++ err_traps_exit:
++ 	nsim_dev_traps_exit(devlink);
++ err_dummy_region_exit:
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ err_params_unregister:
++ 	devlink_params_unregister(devlink, nsim_devlink_params,
++ 				  ARRAY_SIZE(nsim_devlink_params));
++ err_dl_unregister:
++ 	devlink_unregister(devlink);
++ err_fib_destroy:
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ err_resources_unregister:
++ 	devlink_resources_unregister(devlink, NULL);
++ err_devlink_free:
++ 	devlink_free(devlink);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void nsim_dev_reload_destroy(struct nsim_dev *nsim_dev)
++ {
++ 	struct devlink *devlink = priv_to_devlink(nsim_dev);
++ 
++ 	if (devlink_is_reload_failed(devlink))
++ 		return;
++ 	nsim_dev_port_del_all(nsim_dev);
++ 	nsim_dev_traps_exit(devlink);
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ 	mutex_destroy(&nsim_dev->port_list_lock);
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ }
++ 
++ static void nsim_dev_destroy(struct nsim_dev *nsim_dev)
++ {
++ 	struct devlink *devlink = priv_to_devlink(nsim_dev);
++ 
++ 	nsim_dev_reload_destroy(nsim_dev);
++ 
++ 	nsim_bpf_dev_exit(nsim_dev);
++ 	nsim_dev_debugfs_exit(nsim_dev);
++ 	devlink_params_unregister(devlink, nsim_devlink_params,
++ 				  ARRAY_SIZE(nsim_devlink_params));
++ 	devlink_unregister(devlink);
++ 	devlink_resources_unregister(devlink, NULL);
++ 	devlink_free(devlink);
+++>>>>>>> 7b60027bbc67 (netdevsim: create devlink and netdev instances in namespace)
+  }
+  
+  int nsim_dev_probe(struct nsim_bus_dev *nsim_bus_dev)
+diff --git a/drivers/net/netdevsim/bus.c b/drivers/net/netdevsim/bus.c
+index 1a0ff3d7747b..6aeed0c600f8 100644
+--- a/drivers/net/netdevsim/bus.c
++++ b/drivers/net/netdevsim/bus.c
+@@ -283,6 +283,7 @@ nsim_bus_dev_new(unsigned int id, unsigned int port_count)
+ 	nsim_bus_dev->dev.bus = &nsim_bus;
+ 	nsim_bus_dev->dev.type = &nsim_bus_dev_type;
+ 	nsim_bus_dev->port_count = port_count;
++	nsim_bus_dev->initial_net = current->nsproxy->net_ns;
+ 
+ 	err = device_register(&nsim_bus_dev->dev);
+ 	if (err)
+* Unmerged path drivers/net/netdevsim/dev.c
+diff --git a/drivers/net/netdevsim/netdevsim.h b/drivers/net/netdevsim/netdevsim.h
+index 4035af41eca9..2c5f09e6993a 100644
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -220,6 +220,9 @@ struct nsim_bus_dev {
+ 	struct device dev;
+ 	struct list_head list;
+ 	unsigned int port_count;
++	struct net *initial_net; /* Purpose of this is to carry net pointer
++				  * during the probe time only.
++				  */
+ 	unsigned int num_vfs;
+ 	struct nsim_vf_config *vfconfigs;
+ };
