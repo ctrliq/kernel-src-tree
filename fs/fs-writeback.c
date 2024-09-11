@@ -509,6 +509,8 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
 	if (!isw)
 		return;
 
+	atomic_inc(&isw_nr_in_flight);
+
 	/* find and pin the new wb */
 	rcu_read_lock();
 	memcg_css = css_from_id(new_wb_id, &memory_cgrp_subsys);
@@ -544,6 +546,7 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
 	return;
 
 out_free:
+	atomic_dec(&isw_nr_in_flight);
 	if (isw->new_wb)
 		wb_put(isw->new_wb);
 	kfree(isw);
