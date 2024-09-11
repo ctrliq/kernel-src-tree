@@ -6427,7 +6427,6 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, u32 budget
 {
 	unsigned int cur_rx, rx_left;
 	unsigned int count;
-	LIST_HEAD(rx_list);
 
 	cur_rx = tp->cur_rx;
 
@@ -6503,7 +6502,7 @@ process_pkt:
 			if (skb->pkt_type == PACKET_MULTICAST)
 				dev->stats.multicast++;
 
-			list_add_tail(&skb->list, &rx_list);
+			napi_gro_receive(&tp->napi, skb);
 
 			u64_stats_update_begin(&tp->rx_stats.syncp);
 			tp->rx_stats.packets++;
@@ -6517,8 +6516,6 @@ release_descriptor:
 
 	count = cur_rx - tp->cur_rx;
 	tp->cur_rx = cur_rx;
-
-	netif_receive_skb_list(&rx_list);
 
 	return count;
 }
