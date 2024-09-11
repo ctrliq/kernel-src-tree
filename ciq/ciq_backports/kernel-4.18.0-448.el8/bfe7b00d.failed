@@ -1,0 +1,93 @@
+mm, thp: introduce FOLL_SPLIT_PMD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Song Liu <songliubraving@fb.com>
+commit bfe7b00de6d1e25fee08484c4fbf1c1ed175be78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/bfe7b00d.failed
+
+Introduce a new foll_flag: FOLL_SPLIT_PMD.  As the name says
+FOLL_SPLIT_PMD splits huge pmd for given mm_struct, the underlining huge
+page stays as-is.
+
+FOLL_SPLIT_PMD is useful for cases where we need to use regular pages, but
+would switch back to huge page and huge pmd on.  One of such example is
+uprobe.  The following patches use FOLL_SPLIT_PMD in uprobe.
+
+Link: http://lkml.kernel.org/r/20190815164525.1848545-4-songliubraving@fb.com
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit bfe7b00de6d1e25fee08484c4fbf1c1ed175be78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+diff --cc include/linux/mm.h
+index e3b1a16638a0,233ad11938db..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -2717,18 -2591,14 +2717,22 @@@ struct page *follow_page(struct vm_area
+  #define FOLL_COW	0x4000	/* internal GUP flag */
+  #define FOLL_ANON	0x8000	/* don't do file mappings */
+  #define FOLL_LONGTERM	0x10000	/* mapping lifetime is indefinite: see below */
+++<<<<<<< HEAD
+ +#define FOLL_PIN	0x40000	/* pages must be released via unpin_user_page */
+ +#define FOLL_FAST_ONLY	0x80000	/* gup_fast: prevent fall-back to slow gup */
+ +#define FOLL_NOFAULT	0x100000  /* do not fault in pages */
+ +#define FOLL_NOUNSHARE	0x80000000/* gup: don't trigger a COR fault */
+++=======
++ #define FOLL_SPLIT_PMD	0x20000	/* split huge pmd before returning */
+++>>>>>>> bfe7b00de6d1 (mm, thp: introduce FOLL_SPLIT_PMD)
+  
+  /*
+ - * NOTE on FOLL_LONGTERM:
+ + * FOLL_PIN and FOLL_LONGTERM may be used in various combinations with each
+ + * other. Here is what they mean, and how to use them:
+   *
+   * FOLL_LONGTERM indicates that the page will be held for an indefinite time
+ - * period _often_ under userspace control.  This is contrasted with
+ - * iov_iter_get_pages() where usages which are transient.
+ + * period _often_ under userspace control.  This is in contrast to
+ + * iov_iter_get_pages(), whose usages are transient.
+   *
+   * FIXME: For pages which are part of a filesystem, mappings are subject to the
+   * lifetime enforced by the filesystem and we need guarantees that longterm
+* Unmerged path include/linux/mm.h
+diff --git a/mm/gup.c b/mm/gup.c
+index b6ca92e3db6b..1c976cdb5871 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -829,7 +829,7 @@ static struct page *follow_pmd_mask(struct vm_area_struct *vma,
+ 		spin_unlock(ptl);
+ 		return follow_page_pte(vma, address, pmd, flags, &ctx->pgmap);
+ 	}
+-	if (flags & FOLL_SPLIT) {
++	if (flags & (FOLL_SPLIT | FOLL_SPLIT_PMD)) {
+ 		int ret;
+ 		page = pmd_page(*pmd);
+ 		if (is_huge_zero_page(page)) {
+@@ -838,7 +838,7 @@ static struct page *follow_pmd_mask(struct vm_area_struct *vma,
+ 			split_huge_pmd(vma, pmd, address);
+ 			if (pmd_trans_unstable(pmd))
+ 				ret = -EBUSY;
+-		} else {
++		} else if (flags & FOLL_SPLIT) {
+ 			if (unlikely(!try_get_page(page))) {
+ 				spin_unlock(ptl);
+ 				return ERR_PTR(-ENOMEM);
+@@ -850,6 +850,10 @@ static struct page *follow_pmd_mask(struct vm_area_struct *vma,
+ 			put_page(page);
+ 			if (pmd_none(*pmd))
+ 				return no_page_table(vma, flags);
++		} else {  /* flags & FOLL_SPLIT_PMD */
++			spin_unlock(ptl);
++			split_huge_pmd(vma, pmd, address);
++			ret = pte_alloc(mm, pmd) ? -ENOMEM : 0;
+ 		}
+ 
+ 		return ret ? ERR_PTR(ret) :
