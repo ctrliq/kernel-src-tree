@@ -345,7 +345,7 @@ static void nvmf_log_connect_error(struct nvme_ctrl *ctrl,
 			"Connect command failed, error wo/DNR bit: %d\n",
 			err_sctype);
 		break;
-	} /* switch (err_sctype) */
+	}
 }
 
 /**
