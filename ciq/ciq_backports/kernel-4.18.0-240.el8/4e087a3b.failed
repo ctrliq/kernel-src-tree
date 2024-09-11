@@ -1,0 +1,157 @@
+xfs: use a struct iomap in xfs_writepage_ctx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 4e087a3b313cc664057279b1e40372fc97e3e212
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4e087a3b.failed
+
+In preparation for moving the XFS writeback code to fs/iomap.c, switch
+it to use struct iomap instead of the XFS-specific struct xfs_bmbt_irec.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 4e087a3b313cc664057279b1e40372fc97e3e212)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index add26533d923,91899de2be09..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -753,15 -762,10 +754,17 @@@ xfs_add_to_ioend
+  	struct writeback_control *wbc,
+  	struct list_head	*iolist)
+  {
+- 	struct xfs_inode	*ip = XFS_I(inode);
+- 	struct xfs_mount	*mp = ip->i_mount;
+- 	struct block_device	*bdev = xfs_find_bdev_for_inode(inode);
++ 	sector_t		sector = iomap_sector(&wpc->iomap, offset);
+  	unsigned		len = i_blocksize(inode);
+  	unsigned		poff = offset & (PAGE_SIZE - 1);
+++<<<<<<< HEAD
+ +	sector_t		sector;
+ +
+ +	sector = xfs_fsb_to_db(ip, wpc->imap.br_startblock) +
+ +		((offset - XFS_FSB_TO_B(mp, wpc->imap.br_startoff)) >> 9);
+++=======
++ 	bool			merged, same_page = false;
+++>>>>>>> 4e087a3b313c (xfs: use a struct iomap in xfs_writepage_ctx)
+  
+  	if (!wpc->ioend ||
+  	    wpc->fork != wpc->ioend->io_fork ||
+@@@ -770,16 -774,19 +773,15 @@@
+  	    offset != wpc->ioend->io_offset + wpc->ioend->io_size) {
+  		if (wpc->ioend)
+  			list_add(&wpc->ioend->io_list, iolist);
+- 		wpc->ioend = xfs_alloc_ioend(inode, wpc->fork,
+- 				wpc->imap.br_state, offset, bdev, sector, wbc);
++ 		wpc->ioend = xfs_alloc_ioend(inode, wpc, offset, sector, wbc);
+  	}
+  
+ -	merged = __bio_try_merge_page(wpc->ioend->io_bio, page, len, poff,
+ -			&same_page);
+ -
+ -	if (iop && !same_page)
+ -		atomic_inc(&iop->write_count);
+ -
+ -	if (!merged) {
+ -		if (bio_full(wpc->ioend->io_bio, len))
+ +	if (!__bio_try_merge_page(wpc->ioend->io_bio, page, len, poff)) {
+ +		if (iop)
+ +			atomic_inc(&iop->write_count);
+ +		if (bio_full(wpc->ioend->io_bio))
+  			wpc->ioend->io_bio = xfs_chain_bio(wpc->ioend->io_bio);
+ -		bio_add_page(wpc->ioend->io_bio, page, len, poff);
+ +		__bio_add_page(wpc->ioend->io_bio, page, len, poff);
+  	}
+  
+  	wpc->ioend->io_size += len;
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index 03ad33d9db4c..15a5e3af7d15 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -39,6 +39,7 @@
+ #include "xfs_ag_resv.h"
+ #include "xfs_refcount.h"
+ #include "xfs_icache.h"
++#include "xfs_iomap.h"
+ 
+ 
+ kmem_zone_t		*xfs_bmap_free_item_zone;
+@@ -4473,16 +4474,21 @@ int
+ xfs_bmapi_convert_delalloc(
+ 	struct xfs_inode	*ip,
+ 	int			whichfork,
+-	xfs_fileoff_t		offset_fsb,
+-	struct xfs_bmbt_irec	*imap,
++	xfs_off_t		offset,
++	struct iomap		*iomap,
+ 	unsigned int		*seq)
+ {
+ 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
+ 	struct xfs_mount	*mp = ip->i_mount;
++	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
+ 	struct xfs_bmalloca	bma = { NULL };
++	u16			flags = 0;
+ 	struct xfs_trans	*tp;
+ 	int			error;
+ 
++	if (whichfork == XFS_COW_FORK)
++		flags |= IOMAP_F_SHARED;
++
+ 	/*
+ 	 * Space for the extent and indirect blocks was reserved when the
+ 	 * delalloc extent was created so there's no need to do so here.
+@@ -4512,7 +4518,7 @@ xfs_bmapi_convert_delalloc(
+ 	 * the extent.  Just return the real extent at this offset.
+ 	 */
+ 	if (!isnullstartblock(bma.got.br_startblock)) {
+-		*imap = bma.got;
++		xfs_bmbt_to_iomap(ip, iomap, &bma.got, flags);
+ 		*seq = READ_ONCE(ifp->if_seq);
+ 		goto out_trans_cancel;
+ 	}
+@@ -4545,7 +4551,7 @@ xfs_bmapi_convert_delalloc(
+ 	XFS_STATS_INC(mp, xs_xstrat_quick);
+ 
+ 	ASSERT(!isnullstartblock(bma.got.br_startblock));
+-	*imap = bma.got;
++	xfs_bmbt_to_iomap(ip, iomap, &bma.got, flags);
+ 	*seq = READ_ONCE(ifp->if_seq);
+ 
+ 	if (whichfork == XFS_COW_FORK) {
+diff --git a/fs/xfs/libxfs/xfs_bmap.h b/fs/xfs/libxfs/xfs_bmap.h
+index e9544e770ff5..f0a2ea81e5fa 100644
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@ -221,8 +221,7 @@ int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, int whichfork,
+ 		struct xfs_bmbt_irec *got, struct xfs_iext_cursor *cur,
+ 		int eof);
+ int	xfs_bmapi_convert_delalloc(struct xfs_inode *ip, int whichfork,
+-		xfs_fileoff_t offset_fsb, struct xfs_bmbt_irec *imap,
+-		unsigned int *seq);
++		xfs_off_t offset, struct iomap *iomap, unsigned int *seq);
+ int	xfs_bmap_add_extent_unwritten_real(struct xfs_trans *tp,
+ 		struct xfs_inode *ip, int whichfork,
+ 		struct xfs_iext_cursor *icur, struct xfs_btree_cur **curp,
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/fs/xfs/xfs_aops.h b/fs/xfs/xfs_aops.h
+index f62b03186c62..72e30d1c3bdf 100644
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@ -14,7 +14,7 @@ extern struct bio_set xfs_ioend_bioset;
+ struct xfs_ioend {
+ 	struct list_head	io_list;	/* next ioend in chain */
+ 	int			io_fork;	/* inode fork written back */
+-	xfs_exntst_t		io_state;	/* extent state */
++	u16			io_type;
+ 	struct inode		*io_inode;	/* file being written to */
+ 	size_t			io_size;	/* size of the extent */
+ 	xfs_off_t		io_offset;	/* offset in the file */
