@@ -1,0 +1,252 @@
+hardirq/nmi: Allow nested nmi_enter()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 69ea03b56ed2c7189ccd0b5910ad39f3cad1df21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/69ea03b5.failed
+
+Since there are already a number of sites (ARM64, PowerPC) that effectively
+nest nmi_enter(), make the primitive support this before adding even more.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+	Acked-by: Will Deacon <will@kernel.org>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lkml.kernel.org/r/20200505134100.864179229@linutronix.de
+
+
+(cherry picked from commit 69ea03b56ed2c7189ccd0b5910ad39f3cad1df21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/traps.c
+diff --cc arch/powerpc/kernel/traps.c
+index 7b3619c07d86,b44dd75de517..000000000000
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@@ -350,18 -370,97 +350,25 @@@ void _exception(int signr, struct pt_re
+  	if (!exception_common(signr, regs, code, addr))
+  		return;
+  
+ -	force_sig_fault(signr, code, (void __user *)addr);
+ +	force_sig_fault(signr, code, (void __user *)addr, current);
+  }
+  
+ -/*
+ - * The interrupt architecture has a quirk in that the HV interrupts excluding
+ - * the NMIs (0x100 and 0x200) do not clear MSR[RI] at entry. The first thing
+ - * that an interrupt handler must do is save off a GPR into a scratch register,
+ - * and all interrupts on POWERNV (HV=1) use the HSPRG1 register as scratch.
+ - * Therefore an NMI can clobber an HV interrupt's live HSPRG1 without noticing
+ - * that it is non-reentrant, which leads to random data corruption.
+ - *
+ - * The solution is for NMI interrupts in HV mode to check if they originated
+ - * from these critical HV interrupt regions. If so, then mark them not
+ - * recoverable.
+ - *
+ - * An alternative would be for HV NMIs to use SPRG for scratch to avoid the
+ - * HSPRG1 clobber, however this would cause guest SPRG to be clobbered. Linux
+ - * guests should always have MSR[RI]=0 when its scratch SPRG is in use, so
+ - * that would work. However any other guest OS that may have the SPRG live
+ - * and MSR[RI]=1 could encounter silent corruption.
+ - *
+ - * Builds that do not support KVM could take this second option to increase
+ - * the recoverability of NMIs.
+ - */
+ -void hv_nmi_check_nonrecoverable(struct pt_regs *regs)
+ +void system_reset_exception(struct pt_regs *regs)
+  {
+ -#ifdef CONFIG_PPC_POWERNV
+ -	unsigned long kbase = (unsigned long)_stext;
+ -	unsigned long nip = regs->nip;
+ -
+ -	if (!(regs->msr & MSR_RI))
+ -		return;
+ -	if (!(regs->msr & MSR_HV))
+ -		return;
+ -	if (regs->msr & MSR_PR)
+ -		return;
+ -
+++<<<<<<< HEAD
+  	/*
+ -	 * Now test if the interrupt has hit a range that may be using
+ -	 * HSPRG1 without having RI=0 (i.e., an HSRR interrupt). The
+ -	 * problem ranges all run un-relocated. Test real and virt modes
+ -	 * at the same time by droping the high bit of the nip (virt mode
+ -	 * entry points still have the +0x4000 offset).
+ +	 * Avoid crashes in case of nested NMI exceptions. Recoverability
+ +	 * is determined by RI and in_nmi
+  	 */
+ -	nip &= ~0xc000000000000000ULL;
+ -	if ((nip >= 0x500 && nip < 0x600) || (nip >= 0x4500 && nip < 0x4600))
+ -		goto nonrecoverable;
+ -	if ((nip >= 0x980 && nip < 0xa00) || (nip >= 0x4980 && nip < 0x4a00))
+ -		goto nonrecoverable;
+ -	if ((nip >= 0xe00 && nip < 0xec0) || (nip >= 0x4e00 && nip < 0x4ec0))
+ -		goto nonrecoverable;
+ -	if ((nip >= 0xf80 && nip < 0xfa0) || (nip >= 0x4f80 && nip < 0x4fa0))
+ -		goto nonrecoverable;
+ -
+ -	/* Trampoline code runs un-relocated so subtract kbase. */
+ -	if (nip >= (unsigned long)(start_real_trampolines - kbase) &&
+ -			nip < (unsigned long)(end_real_trampolines - kbase))
+ -		goto nonrecoverable;
+ -	if (nip >= (unsigned long)(start_virt_trampolines - kbase) &&
+ -			nip < (unsigned long)(end_virt_trampolines - kbase))
+ -		goto nonrecoverable;
+ -	return;
+ -
+ -nonrecoverable:
+ -	regs->msr &= ~MSR_RI;
+ -#endif
+ -}
+ -
+ -void system_reset_exception(struct pt_regs *regs)
+ -{
+ +	bool nested = in_nmi();
+ +	if (!nested)
+ +		nmi_enter();
+++=======
++ 	unsigned long hsrr0, hsrr1;
++ 	bool saved_hsrrs = false;
++ 
++ 	nmi_enter();
+ -
+ -	/*
+ -	 * System reset can interrupt code where HSRRs are live and MSR[RI]=1.
+ -	 * The system reset interrupt itself may clobber HSRRs (e.g., to call
+ -	 * OPAL), so save them here and restore them before returning.
+ -	 *
+ -	 * Machine checks don't need to save HSRRs, as the real mode handler
+ -	 * is careful to avoid them, and the regular handler is not delivered
+ -	 * as an NMI.
+ -	 */
+ -	if (cpu_has_feature(CPU_FTR_HVMODE)) {
+ -		hsrr0 = mfspr(SPRN_HSRR0);
+ -		hsrr1 = mfspr(SPRN_HSRR1);
+ -		saved_hsrrs = true;
+ -	}
+ -
+ -	hv_nmi_check_nonrecoverable(regs);
+++>>>>>>> 69ea03b56ed2 (hardirq/nmi: Allow nested nmi_enter())
+  
+  	__this_cpu_inc(irq_stat.sreset_irqs);
+  
+@@@ -411,8 -510,12 +418,17 @@@ out
+  	if (!(regs->msr & MSR_RI))
+  		nmi_panic(regs, "Unrecoverable System Reset");
+  
+++<<<<<<< HEAD
+ +	if (!nested)
+ +		nmi_exit();
+++=======
++ 	if (saved_hsrrs) {
++ 		mtspr(SPRN_HSRR0, hsrr0);
++ 		mtspr(SPRN_HSRR1, hsrr1);
++ 	}
++ 
++ 	nmi_exit();
+++>>>>>>> 69ea03b56ed2 (hardirq/nmi: Allow nested nmi_enter())
+  
+  	/* What should we do here? We could issue a shutdown or hard reset. */
+  }
+diff --git a/arch/arm64/kernel/sdei.c b/arch/arm64/kernel/sdei.c
+index ea94cf8f9dc6..0f33e606cfef 100644
+--- a/arch/arm64/kernel/sdei.c
++++ b/arch/arm64/kernel/sdei.c
+@@ -250,22 +250,12 @@ asmlinkage __kprobes notrace unsigned long
+ __sdei_handler(struct pt_regs *regs, struct sdei_registered_event *arg)
+ {
+ 	unsigned long ret;
+-	bool do_nmi_exit = false;
+ 
+-	/*
+-	 * nmi_enter() deals with printk() re-entrance and use of RCU when
+-	 * RCU believed this CPU was idle. Because critical events can
+-	 * interrupt normal events, we may already be in_nmi().
+-	 */
+-	if (!in_nmi()) {
+-		nmi_enter();
+-		do_nmi_exit = true;
+-	}
++	nmi_enter();
+ 
+ 	ret = _sdei_handler(regs, arg);
+ 
+-	if (do_nmi_exit)
+-		nmi_exit();
++	nmi_exit();
+ 
+ 	return ret;
+ }
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index 1adc7f74440c..d82d7fcce042 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -727,17 +727,13 @@ bool arm64_is_fatal_ras_serror(struct pt_regs *regs, unsigned int esr)
+ 
+ asmlinkage void do_serror(struct pt_regs *regs, unsigned int esr)
+ {
+-	const bool was_in_nmi = in_nmi();
+-
+-	if (!was_in_nmi)
+-		nmi_enter();
++	nmi_enter();
+ 
+ 	/* non-RAS errors are not containable */
+ 	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(regs, esr))
+ 		arm64_serror_panic(regs, esr);
+ 
+-	if (!was_in_nmi)
+-		nmi_exit();
++	nmi_exit();
+ }
+ 
+ void __pte_error(const char *file, int line, unsigned long val)
+* Unmerged path arch/powerpc/kernel/traps.c
+diff --git a/include/linux/hardirq.h b/include/linux/hardirq.h
+index 7c8b82f69288..a043ad826c67 100644
+--- a/include/linux/hardirq.h
++++ b/include/linux/hardirq.h
+@@ -65,13 +65,16 @@ extern void irq_exit(void);
+ #define arch_nmi_exit()		do { } while (0)
+ #endif
+ 
++/*
++ * nmi_enter() can nest up to 15 times; see NMI_BITS.
++ */
+ #define nmi_enter()						\
+ 	do {							\
+ 		arch_nmi_enter();				\
+ 		printk_nmi_enter();				\
+ 		lockdep_off();					\
+ 		ftrace_nmi_enter();				\
+-		BUG_ON(in_nmi());				\
++		BUG_ON(in_nmi() == NMI_MASK);			\
+ 		preempt_count_add(NMI_OFFSET + HARDIRQ_OFFSET);	\
+ 		rcu_nmi_enter();				\
+ 		lockdep_hardirq_enter();			\
+diff --git a/include/linux/preempt.h b/include/linux/preempt.h
+index bc3f1aecaa19..7d9c1c0e149c 100644
+--- a/include/linux/preempt.h
++++ b/include/linux/preempt.h
+@@ -26,13 +26,13 @@
+  *         PREEMPT_MASK:	0x000000ff
+  *         SOFTIRQ_MASK:	0x0000ff00
+  *         HARDIRQ_MASK:	0x000f0000
+- *             NMI_MASK:	0x00100000
++ *             NMI_MASK:	0x00f00000
+  * PREEMPT_NEED_RESCHED:	0x80000000
+  */
+ #define PREEMPT_BITS	8
+ #define SOFTIRQ_BITS	8
+ #define HARDIRQ_BITS	4
+-#define NMI_BITS	1
++#define NMI_BITS	4
+ 
+ #define PREEMPT_SHIFT	0
+ #define SOFTIRQ_SHIFT	(PREEMPT_SHIFT + PREEMPT_BITS)
