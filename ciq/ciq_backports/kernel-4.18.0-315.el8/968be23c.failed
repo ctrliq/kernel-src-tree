@@ -1,0 +1,93 @@
+xsk: Fix possible segfault at xskmap entry insertion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Magnus Karlsson <magnus.karlsson@intel.com>
+commit 968be23ceaca1f402dfad0a30a8da4649ee32940
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/968be23c.failed
+
+Fix possible segfault when entry is inserted into xskmap. This can
+happen if the socket is in a state where the umem has been set up, the
+Rx ring created but it has yet to be bound to a device. In this case
+the pool has not yet been created and we cannot reference it for the
+existence of the fill ring. Fix this by removing the whole
+xsk_is_setup_for_bpf_map function. Once upon a time, it was used to
+make sure that the Rx and fill rings where set up before the driver
+could call xsk_rcv, since there are no tests for the existence of
+these rings in the data path. But these days, we have a state variable
+that we test instead. When it is XSK_BOUND, everything has been set up
+correctly and the socket has been bound. So no reason to have the
+xsk_is_setup_for_bpf_map function anymore.
+
+Fixes: 7361f9c3d719 ("xsk: Move fill and completion rings to buffer pool")
+	Reported-by: syzbot+febe51d44243fbc564ee@syzkaller.appspotmail.com
+	Signed-off-by: Magnus Karlsson <magnus.karlsson@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/1599037569-26690-1-git-send-email-magnus.karlsson@intel.com
+(cherry picked from commit 968be23ceaca1f402dfad0a30a8da4649ee32940)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xdp/xsk.c
+diff --cc net/xdp/xsk.c
+index 10c97cce9e3d,07c32276c527..000000000000
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@@ -35,19 -33,13 +35,23 @@@
+  
+  static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
+  
+++<<<<<<< HEAD
+ +bool xsk_is_setup_for_bpf_map(struct xdp_sock *xs)
+ +{
+ +	return READ_ONCE(xs->rx) &&  READ_ONCE(xs->umem) &&
+ +		READ_ONCE(xs->umem->fq);
+ +}
+ +
+ +void xsk_set_rx_need_wakeup(struct xdp_umem *umem)
+++=======
++ void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
+++>>>>>>> 968be23ceaca (xsk: Fix possible segfault at xskmap entry insertion)
+  {
+ -	if (pool->cached_need_wakeup & XDP_WAKEUP_RX)
+ +	if (umem->need_wakeup & XDP_WAKEUP_RX)
+  		return;
+  
+ -	pool->fq->ring->flags |= XDP_RING_NEED_WAKEUP;
+ -	pool->cached_need_wakeup |= XDP_WAKEUP_RX;
+ +	umem->fq->ring->flags |= XDP_RING_NEED_WAKEUP;
+ +	umem->need_wakeup |= XDP_WAKEUP_RX;
+  }
+  EXPORT_SYMBOL(xsk_set_rx_need_wakeup);
+  
+* Unmerged path net/xdp/xsk.c
+diff --git a/net/xdp/xsk.h b/net/xdp/xsk.h
+index 455ddd480f3d..bb62abe81c81 100644
+--- a/net/xdp/xsk.h
++++ b/net/xdp/xsk.h
+@@ -46,7 +46,6 @@ static inline struct xdp_sock *xdp_sk(struct sock *sk)
+ 	return (struct xdp_sock *)sk;
+ }
+ 
+-bool xsk_is_setup_for_bpf_map(struct xdp_sock *xs);
+ void xsk_map_try_sock_delete(struct xsk_map *map, struct xdp_sock *xs,
+ 			     struct xdp_sock **map_entry);
+ int xsk_map_inc(struct xsk_map *map);
+diff --git a/net/xdp/xskmap.c b/net/xdp/xskmap.c
+index 8367adbbe9df..1d5765f0d3b8 100644
+--- a/net/xdp/xskmap.c
++++ b/net/xdp/xskmap.c
+@@ -185,11 +185,6 @@ static int xsk_map_update_elem(struct bpf_map *map, void *key, void *value,
+ 
+ 	xs = (struct xdp_sock *)sock->sk;
+ 
+-	if (!xsk_is_setup_for_bpf_map(xs)) {
+-		sockfd_put(sock);
+-		return -EOPNOTSUPP;
+-	}
+-
+ 	map_entry = &m->xsk_map[i];
+ 	node = xsk_map_node_alloc(m, map_entry);
+ 	if (IS_ERR(node)) {
