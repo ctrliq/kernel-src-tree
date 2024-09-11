@@ -1,0 +1,106 @@
+iommu/vt-d: Setup pasid entries for iova over first level
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit ddf09b6d43ece8e4d5591e4957e89c4fe7714792
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ddf09b6d.failed
+
+Intel VT-d in scalable mode supports two types of page tables for
+IOVA translation: first level and second level. The IOMMU driver
+can choose one from both for IOVA translation according to the use
+case. This sets up the pasid entry if a domain is selected to use
+the first-level page table for iova translation.
+
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit ddf09b6d43ece8e4d5591e4957e89c4fe7714792)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 83167a4a394f,071cbc172ce8..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -2471,10 -2525,34 +2481,41 @@@ dmar_search_domain_by_dev_info(int segm
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static bool dev_is_real_dma_subdevice(struct device *dev)
+ +{
+ +	return dev && dev_is_pci(dev) &&
+ +	       pci_real_dma_dev(to_pci_dev(dev)) != to_pci_dev(dev);
+++=======
++ static int domain_setup_first_level(struct intel_iommu *iommu,
++ 				    struct dmar_domain *domain,
++ 				    struct device *dev,
++ 				    int pasid)
++ {
++ 	int flags = PASID_FLAG_SUPERVISOR_MODE;
++ 	struct dma_pte *pgd = domain->pgd;
++ 	int agaw, level;
++ 
++ 	/*
++ 	 * Skip top levels of page tables for iommu which has
++ 	 * less agaw than default. Unnecessary for PT mode.
++ 	 */
++ 	for (agaw = domain->agaw; agaw > iommu->agaw; agaw--) {
++ 		pgd = phys_to_virt(dma_pte_addr(pgd));
++ 		if (!dma_pte_present(pgd))
++ 			return -ENOMEM;
++ 	}
++ 
++ 	level = agaw_to_level(agaw);
++ 	if (level != 4 && level != 5)
++ 		return -EINVAL;
++ 
++ 	flags |= (level == 5) ? PASID_FLAG_FL5LP : 0;
++ 
++ 	return intel_pasid_setup_first_level(iommu, dev, (pgd_t *)pgd, pasid,
++ 					     domain->iommu_did[iommu->seq_id],
++ 					     flags);
+++>>>>>>> ddf09b6d43ec (iommu/vt-d: Setup pasid entries for iova over first level)
+  }
+  
+  static struct dmar_domain *dmar_insert_one_dev_info(struct intel_iommu *iommu,
+* Unmerged path drivers/iommu/intel-iommu.c
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index 20ac0ba90201..84cd38d89dfc 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -46,10 +46,13 @@
+ #define VTD_STRIDE_SHIFT        (9)
+ #define VTD_STRIDE_MASK         (((u64)-1) << VTD_STRIDE_SHIFT)
+ 
+-#define DMA_PTE_READ (1)
+-#define DMA_PTE_WRITE (2)
+-#define DMA_PTE_LARGE_PAGE (1 << 7)
+-#define DMA_PTE_SNP (1 << 11)
++#define DMA_PTE_READ		BIT_ULL(0)
++#define DMA_PTE_WRITE		BIT_ULL(1)
++#define DMA_PTE_LARGE_PAGE	BIT_ULL(7)
++#define DMA_PTE_SNP		BIT_ULL(11)
++
++#define DMA_FL_PTE_PRESENT	BIT_ULL(0)
++#define DMA_FL_PTE_XD		BIT_ULL(63)
+ 
+ #define CONTEXT_TT_MULTI_LEVEL	0
+ #define CONTEXT_TT_DEV_IOTLB	1
+@@ -627,10 +630,11 @@ static inline void dma_clear_pte(struct dma_pte *pte)
+ static inline u64 dma_pte_addr(struct dma_pte *pte)
+ {
+ #ifdef CONFIG_64BIT
+-	return pte->val & VTD_PAGE_MASK;
++	return pte->val & VTD_PAGE_MASK & (~DMA_FL_PTE_XD);
+ #else
+ 	/* Must have a full atomic 64-bit read */
+-	return  __cmpxchg64(&pte->val, 0ULL, 0ULL) & VTD_PAGE_MASK;
++	return  __cmpxchg64(&pte->val, 0ULL, 0ULL) &
++			VTD_PAGE_MASK & (~DMA_FL_PTE_XD);
+ #endif
+ }
+ 
