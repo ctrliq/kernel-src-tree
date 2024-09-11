@@ -1,0 +1,118 @@
+x86/hyperv: Properly suspend/resume reenlightenment notifications
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [x86] hyperv: Properly suspend/resume reenlightenment notifications (Mohammed Gamal) [1815475]
+Rebuild_FUZZ: 96.83%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 38dce4195f0daefb566279fd9fd51e1fbd62ae1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/38dce419.failed
+
+Errors during hibernation with reenlightenment notifications enabled were
+reported:
+
+ [   51.730435] PM: hibernation entry
+ [   51.737435] PM: Syncing filesystems ...
+ ...
+ [   54.102216] Disabling non-boot CPUs ...
+ [   54.106633] smpboot: CPU 1 is now offline
+ [   54.110006] unchecked MSR access error: WRMSR to 0x40000106 (tried to
+     write 0x47c72780000100ee) at rIP: 0xffffffff90062f24
+     native_write_msr+0x4/0x20)
+ [   54.110006] Call Trace:
+ [   54.110006]  hv_cpu_die+0xd9/0xf0
+ ...
+
+Normally, hv_cpu_die() just reassigns reenlightenment notifications to some
+other CPU when the CPU receiving them goes offline. Upon hibernation, there
+is no other CPU which is still online so cpumask_any_but(cpu_online_mask)
+returns >= nr_cpu_ids and using it as hv_vp_index index is incorrect.
+Disable the feature when cpumask_any_but() fails.
+
+Also, as we now disable reenlightenment notifications upon hibernation we
+need to restore them on resume. Check if hv_reenlightenment_cb was
+previously set and restore from hv_resume().
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Dexuan Cui <decui@microsoft.com>
+	Reviewed-by: Tianyu Lan <Tianyu.Lan@microsoft.com>
+Link: https://lore.kernel.org/r/20200512160153.134467-1-vkuznets@redhat.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 38dce4195f0daefb566279fd9fd51e1fbd62ae1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+diff --cc arch/x86/hyperv/hv_init.c
+index 346ed6001be8,acf76b466db6..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -307,6 -260,62 +315,65 @@@ static int __init hv_pci_init(void
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int hv_suspend(void)
++ {
++ 	union hv_x64_msr_hypercall_contents hypercall_msr;
++ 	int ret;
++ 
++ 	/*
++ 	 * Reset the hypercall page as it is going to be invalidated
++ 	 * accross hibernation. Setting hv_hypercall_pg to NULL ensures
++ 	 * that any subsequent hypercall operation fails safely instead of
++ 	 * crashing due to an access of an invalid page. The hypercall page
++ 	 * pointer is restored on resume.
++ 	 */
++ 	hv_hypercall_pg_saved = hv_hypercall_pg;
++ 	hv_hypercall_pg = NULL;
++ 
++ 	/* Disable the hypercall page in the hypervisor */
++ 	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 	hypercall_msr.enable = 0;
++ 	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 
++ 	ret = hv_cpu_die(0);
++ 	return ret;
++ }
++ 
++ static void hv_resume(void)
++ {
++ 	union hv_x64_msr_hypercall_contents hypercall_msr;
++ 	int ret;
++ 
++ 	ret = hv_cpu_init(0);
++ 	WARN_ON(ret);
++ 
++ 	/* Re-enable the hypercall page */
++ 	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 	hypercall_msr.enable = 1;
++ 	hypercall_msr.guest_physical_address =
++ 		vmalloc_to_pfn(hv_hypercall_pg_saved);
++ 	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 
++ 	hv_hypercall_pg = hv_hypercall_pg_saved;
++ 	hv_hypercall_pg_saved = NULL;
++ 
++ 	/*
++ 	 * Reenlightenment notifications are disabled by hv_cpu_die(0),
++ 	 * reenable them here if hv_reenlightenment_cb was previously set.
++ 	 */
++ 	if (hv_reenlightenment_cb)
++ 		set_hv_tscchange_cb(hv_reenlightenment_cb);
++ }
++ 
++ /* Note: when the ops are called, only CPU0 is online and IRQs are disabled. */
++ static struct syscore_ops hv_syscore_ops = {
++ 	.suspend	= hv_suspend,
++ 	.resume		= hv_resume,
++ };
++ 
+++>>>>>>> 38dce4195f0d (x86/hyperv: Properly suspend/resume reenlightenment notifications)
+  /*
+   * This function is to be invoked early in the boot sequence after the
+   * hypervisor has been detected.
+* Unmerged path arch/x86/hyperv/hv_init.c
