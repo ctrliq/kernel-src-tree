@@ -1,0 +1,171 @@
+xfs: cleanup xfs_idestroy_fork
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit ef8385128d4b31a382d496b1c433697993bd0bfb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/ef838512.failed
+
+Move freeing the dynamically allocated attr and COW fork, as well
+as zeroing the pointers where actually needed into the callers, and
+just pass the xfs_ifork structure to xfs_idestroy_fork.  Also simplify
+the kmem_free calls by not checking for NULL first.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit ef8385128d4b31a382d496b1c433697993bd0bfb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr_leaf.c
+#	fs/xfs/libxfs/xfs_inode_fork.c
+diff --cc fs/xfs/libxfs/xfs_attr_leaf.c
+index 28f5fdba7aaf,f3d18a1f5b20..000000000000
+--- a/fs/xfs/libxfs/xfs_attr_leaf.c
++++ b/fs/xfs/libxfs/xfs_attr_leaf.c
+@@@ -718,13 -715,12 +718,22 @@@ xfs_attr_fork_remove
+  	struct xfs_inode	*ip,
+  	struct xfs_trans	*tp)
+  {
+++<<<<<<< HEAD
+ +	xfs_idestroy_fork(ip, XFS_ATTR_FORK);
+ +	ip->i_d.di_forkoff = 0;
+ +	ip->i_d.di_aformat = XFS_DINODE_FMT_EXTENTS;
+ +
+ +	ASSERT(ip->i_d.di_anextents == 0);
+ +	ASSERT(ip->i_afp == NULL);
+ +
+++=======
++ 	ASSERT(ip->i_afp->if_nextents == 0);
++ 
++ 	xfs_idestroy_fork(ip->i_afp);
++ 	kmem_cache_free(xfs_ifork_zone, ip->i_afp);
++ 	ip->i_afp = NULL;
++ 	ip->i_d.di_forkoff = 0;
+++>>>>>>> ef8385128d4b (xfs: cleanup xfs_idestroy_fork)
+  	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+  }
+  
+diff --cc fs/xfs/libxfs/xfs_inode_fork.c
+index 6c24c27f5f44,28b366275ae0..000000000000
+--- a/fs/xfs/libxfs/xfs_inode_fork.c
++++ b/fs/xfs/libxfs/xfs_inode_fork.c
+@@@ -500,26 -511,16 +496,34 @@@ xfs_idestroy_fork
+  	}
+  
+  	/*
+- 	 * If the format is local, then we can't have an extents
+- 	 * array so just look for an inline data array.  If we're
+- 	 * not local then we may or may not have an extents list,
+- 	 * so check and free it up if we do.
++ 	 * If the format is local, then we can't have an extents array so just
++ 	 * look for an inline data array.  If we're not local then we may or may
++ 	 * not have an extents list, so check and free it up if we do.
+  	 */
+++<<<<<<< HEAD
+ +	if (XFS_IFORK_FORMAT(ip, whichfork) == XFS_DINODE_FMT_LOCAL) {
+ +		if (ifp->if_u1.if_data != NULL) {
+ +			kmem_free(ifp->if_u1.if_data);
+ +			ifp->if_u1.if_data = NULL;
+ +		}
+ +	} else if ((ifp->if_flags & XFS_IFEXTENTS) && ifp->if_height) {
+ +		xfs_iext_destroy(ifp);
+ +	}
+ +
+ +	if (whichfork == XFS_ATTR_FORK) {
+ +		kmem_cache_free(xfs_ifork_zone, ip->i_afp);
+ +		ip->i_afp = NULL;
+ +	} else if (whichfork == XFS_COW_FORK) {
+ +		kmem_cache_free(xfs_ifork_zone, ip->i_cowfp);
+ +		ip->i_cowfp = NULL;
+++=======
++ 	if (ifp->if_format == XFS_DINODE_FMT_LOCAL) {
++ 		kmem_free(ifp->if_u1.if_data);
++ 		ifp->if_u1.if_data = NULL;
++ 	} else if (ifp->if_flags & XFS_IFEXTENTS) {
++ 		if (ifp->if_height)
++ 			xfs_iext_destroy(ifp);
+++>>>>>>> ef8385128d4b (xfs: cleanup xfs_idestroy_fork)
+  	}
+  }
+  
+* Unmerged path fs/xfs/libxfs/xfs_attr_leaf.c
+diff --git a/fs/xfs/libxfs/xfs_inode_buf.c b/fs/xfs/libxfs/xfs_inode_buf.c
+index b3ebee7d9765..c899692df4b6 100644
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@ -275,7 +275,7 @@ xfs_inode_from_disk(
+ 	return 0;
+ 
+ out_destroy_data_fork:
+-	xfs_idestroy_fork(ip, XFS_DATA_FORK);
++	xfs_idestroy_fork(&ip->i_df);
+ 	return error;
+ }
+ 
+* Unmerged path fs/xfs/libxfs/xfs_inode_fork.c
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.h b/fs/xfs/libxfs/xfs_inode_fork.h
+index f46a8c1db596..79cc9e4e804a 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.h
++++ b/fs/xfs/libxfs/xfs_inode_fork.h
+@@ -92,7 +92,7 @@ int		xfs_iformat_data_fork(struct xfs_inode *, struct xfs_dinode *);
+ int		xfs_iformat_attr_fork(struct xfs_inode *, struct xfs_dinode *);
+ void		xfs_iflush_fork(struct xfs_inode *, struct xfs_dinode *,
+ 				struct xfs_inode_log_item *, int);
+-void		xfs_idestroy_fork(struct xfs_inode *, int);
++void		xfs_idestroy_fork(struct xfs_ifork *ifp);
+ void		xfs_idata_realloc(struct xfs_inode *ip, int64_t byte_diff,
+ 				int whichfork);
+ void		xfs_iroot_realloc(struct xfs_inode *, int, int);
+diff --git a/fs/xfs/xfs_attr_inactive.c b/fs/xfs/xfs_attr_inactive.c
+index c42f90e16b4f..48a78d75430f 100644
+--- a/fs/xfs/xfs_attr_inactive.c
++++ b/fs/xfs/xfs_attr_inactive.c
+@@ -388,8 +388,11 @@ xfs_attr_inactive(
+ 	xfs_trans_cancel(trans);
+ out_destroy_fork:
+ 	/* kill the in-core attr fork before we drop the inode lock */
+-	if (dp->i_afp)
+-		xfs_idestroy_fork(dp, XFS_ATTR_FORK);
++	if (dp->i_afp) {
++		xfs_idestroy_fork(dp->i_afp);
++		kmem_cache_free(xfs_ifork_zone, dp->i_afp);
++		dp->i_afp = NULL;
++	}
+ 	if (lock_mode)
+ 		xfs_iunlock(dp, lock_mode);
+ 	return error;
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index da696ab941c9..d3fc14fce4ef 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -89,15 +89,18 @@ xfs_inode_free_callback(
+ 	case S_IFREG:
+ 	case S_IFDIR:
+ 	case S_IFLNK:
+-		xfs_idestroy_fork(ip, XFS_DATA_FORK);
++		xfs_idestroy_fork(&ip->i_df);
+ 		break;
+ 	}
+ 
+-	if (ip->i_afp)
+-		xfs_idestroy_fork(ip, XFS_ATTR_FORK);
+-	if (ip->i_cowfp)
+-		xfs_idestroy_fork(ip, XFS_COW_FORK);
+-
++	if (ip->i_afp) {
++		xfs_idestroy_fork(ip->i_afp);
++		kmem_cache_free(xfs_ifork_zone, ip->i_afp);
++	}
++	if (ip->i_cowfp) {
++		xfs_idestroy_fork(ip->i_cowfp);
++		kmem_cache_free(xfs_ifork_zone, ip->i_cowfp);
++	}
+ 	if (ip->i_itemp) {
+ 		ASSERT(!test_bit(XFS_LI_IN_AIL,
+ 				 &ip->i_itemp->ili_item.li_flags));
