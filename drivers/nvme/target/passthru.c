@@ -233,7 +233,6 @@ static void nvmet_passthru_execute_cmd(struct nvmet_req *req)
 
 	rq = nvme_alloc_request(q, req->cmd, BLK_MQ_REQ_NOWAIT, NVME_QID_ANY);
 	if (IS_ERR(rq)) {
-		rq = NULL;
 		status = NVME_SC_INTERNAL;
 		goto out_put_ns;
 	}
@@ -242,7 +241,7 @@ static void nvmet_passthru_execute_cmd(struct nvmet_req *req)
 		ret = nvmet_passthru_map_sg(req, rq);
 		if (unlikely(ret)) {
 			status = NVME_SC_INTERNAL;
-			goto out_put_ns;
+			goto out_put_req;
 		}
 	}
 
@@ -269,12 +268,13 @@ static void nvmet_passthru_execute_cmd(struct nvmet_req *req)
 
 	return;
 
+out_put_req:
+	blk_put_request(rq);
 out_put_ns:
 	if (ns)
 		nvme_put_ns(ns);
 out:
 	nvmet_req_complete(req, status);
-	blk_put_request(rq);
 }
 
 /*
