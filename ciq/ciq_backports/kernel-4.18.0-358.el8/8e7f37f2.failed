@@ -1,0 +1,330 @@
+mm: Add mem_dump_obj() to print source of memory block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Paul E. McKenney <paulmck@kernel.org>
+commit 8e7f37f2aaa56b723a24f6872817cf9c6410b613
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/8e7f37f2.failed
+
+There are kernel facilities such as per-CPU reference counts that give
+error messages in generic handlers or callbacks, whose messages are
+unenlightening.  In the case of per-CPU reference-count underflow, this
+is not a problem when creating a new use of this facility because in that
+case the bug is almost certainly in the code implementing that new use.
+However, trouble arises when deploying across many systems, which might
+exercise corner cases that were not seen during development and testing.
+Here, it would be really nice to get some kind of hint as to which of
+several uses the underflow was caused by.
+
+This commit therefore exposes a mem_dump_obj() function that takes
+a pointer to memory (which must still be allocated if it has been
+dynamically allocated) and prints available information on where that
+memory came from.  This pointer can reference the middle of the block as
+well as the beginning of the block, as needed by things like RCU callback
+functions and timer handlers that might not know where the beginning of
+the memory block is.  These functions and handlers can use mem_dump_obj()
+to print out better hints as to where the problem might lie.
+
+The information printed can depend on kernel configuration.  For example,
+the allocation return address can be printed only for slab and slub,
+and even then only when the necessary debug has been enabled.  For slab,
+build with CONFIG_DEBUG_SLAB=y, and either use sizes with ample space
+to the next power of two or use the SLAB_STORE_USER when creating the
+kmem_cache structure.  For slub, build with CONFIG_SLUB_DEBUG=y and
+boot with slub_debug=U, or pass SLAB_STORE_USER to kmem_cache_create()
+if more focused use is desired.  Also for slub, use CONFIG_STACKTRACE
+to enable printing of the allocation-time stack trace.
+
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: <linux-mm@kvack.org>
+	Reported-by: Andrii Nakryiko <andrii@kernel.org>
+[ paulmck: Convert to printing and change names per Joonsoo Kim. ]
+[ paulmck: Move slab definition per Stephen Rothwell and kbuild test robot. ]
+[ paulmck: Handle CONFIG_MMU=n case where vmalloc() is kmalloc(). ]
+[ paulmck: Apply Vlastimil Babka feedback on slab.c kmem_provenance(). ]
+[ paulmck: Extract more info from !SLUB_DEBUG per Joonsoo Kim. ]
+[ paulmck: Explicitly check for small pointers per Naresh Kamboju. ]
+	Acked-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Tested-by: Naresh Kamboju <naresh.kamboju@linaro.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 8e7f37f2aaa56b723a24f6872817cf9c6410b613)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+diff --cc include/linux/mm.h
+index 1965121bdf3c,af7d050900e7..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -3120,5 -3167,9 +3120,12 @@@ unsigned long wp_shared_mapping_range(s
+  				      pgoff_t first_index, pgoff_t nr);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ extern int sysctl_nr_trim_pages;
++ 
++ void mem_dump_obj(void *object);
++ 
+++>>>>>>> 8e7f37f2aaa5 (mm: Add mem_dump_obj() to print source of memory block)
+  #endif /* __KERNEL__ */
+  #endif /* _LINUX_MM_H */
+* Unmerged path include/linux/mm.h
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 6d3a90a68b01..52029fceae75 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -187,6 +187,8 @@ void kfree(const void *);
+ void kfree_sensitive(const void *);
+ size_t __ksize(const void *);
+ size_t ksize(const void *);
++bool kmem_valid_obj(void *object);
++void kmem_dump_obj(void *object);
+ 
+ #define kzfree(x)	kfree_sensitive(x)	/* For backward compatibility */
+ 
+diff --git a/mm/slab.c b/mm/slab.c
+index cf97d8cb25da..cb85a274c922 100644
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -3660,6 +3660,26 @@ void *__kmalloc_node_track_caller(size_t size, gfp_t flags,
+ EXPORT_SYMBOL(__kmalloc_node_track_caller);
+ #endif /* CONFIG_NUMA */
+ 
++void kmem_obj_info(struct kmem_obj_info *kpp, void *object, struct page *page)
++{
++	struct kmem_cache *cachep;
++	unsigned int objnr;
++	void *objp;
++
++	kpp->kp_ptr = object;
++	kpp->kp_page = page;
++	cachep = page->slab_cache;
++	kpp->kp_slab_cache = cachep;
++	objp = object - obj_offset(cachep);
++	kpp->kp_data_offset = obj_offset(cachep);
++	page = virt_to_head_page(objp);
++	objnr = obj_to_index(cachep, page, objp);
++	objp = index_to_obj(cachep, page, objnr);
++	kpp->kp_objp = objp;
++	if (DEBUG && cachep->flags & SLAB_STORE_USER)
++		kpp->kp_ret = *dbg_userword(cachep, objp);
++}
++
+ /**
+  * __do_kmalloc - allocate memory
+  * @size: how many bytes of memory are required.
+diff --git a/mm/slab.h b/mm/slab.h
+index f86010a972df..db7a3c9e2c9d 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -636,4 +636,16 @@ static inline bool slab_want_init_on_free(struct kmem_cache *c)
+ 	return false;
+ }
+ 
++#define KS_ADDRS_COUNT 16
++struct kmem_obj_info {
++	void *kp_ptr;
++	struct page *kp_page;
++	void *kp_objp;
++	unsigned long kp_data_offset;
++	struct kmem_cache *kp_slab_cache;
++	void *kp_ret;
++	void *kp_stack[KS_ADDRS_COUNT];
++};
++void kmem_obj_info(struct kmem_obj_info *kpp, void *object, struct page *page);
++
+ #endif /* MM_SLAB_H */
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index 3b3a1a123e49..aa61e3383ad7 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -542,6 +542,81 @@ bool slab_is_available(void)
+ 	return slab_state >= UP;
+ }
+ 
++/**
++ * kmem_valid_obj - does the pointer reference a valid slab object?
++ * @object: pointer to query.
++ *
++ * Return: %true if the pointer is to a not-yet-freed object from
++ * kmalloc() or kmem_cache_alloc(), either %true or %false if the pointer
++ * is to an already-freed object, and %false otherwise.
++ */
++bool kmem_valid_obj(void *object)
++{
++	struct page *page;
++
++	/* Some arches consider ZERO_SIZE_PTR to be a valid address. */
++	if (object < (void *)PAGE_SIZE || !virt_addr_valid(object))
++		return false;
++	page = virt_to_head_page(object);
++	return PageSlab(page);
++}
++
++/**
++ * kmem_dump_obj - Print available slab provenance information
++ * @object: slab object for which to find provenance information.
++ *
++ * This function uses pr_cont(), so that the caller is expected to have
++ * printed out whatever preamble is appropriate.  The provenance information
++ * depends on the type of object and on how much debugging is enabled.
++ * For a slab-cache object, the fact that it is a slab object is printed,
++ * and, if available, the slab name, return address, and stack trace from
++ * the allocation of that object.
++ *
++ * This function will splat if passed a pointer to a non-slab object.
++ * If you are not sure what type of object you have, you should instead
++ * use mem_dump_obj().
++ */
++void kmem_dump_obj(void *object)
++{
++	char *cp = IS_ENABLED(CONFIG_MMU) ? "" : "/vmalloc";
++	int i;
++	struct page *page;
++	unsigned long ptroffset;
++	struct kmem_obj_info kp = { };
++
++	if (WARN_ON_ONCE(!virt_addr_valid(object)))
++		return;
++	page = virt_to_head_page(object);
++	if (WARN_ON_ONCE(!PageSlab(page))) {
++		pr_cont(" non-slab memory.\n");
++		return;
++	}
++	kmem_obj_info(&kp, object, page);
++	if (kp.kp_slab_cache)
++		pr_cont(" slab%s %s", cp, kp.kp_slab_cache->name);
++	else
++		pr_cont(" slab%s", cp);
++	if (kp.kp_objp)
++		pr_cont(" start %px", kp.kp_objp);
++	if (kp.kp_data_offset)
++		pr_cont(" data offset %lu", kp.kp_data_offset);
++	if (kp.kp_objp) {
++		ptroffset = ((char *)object - (char *)kp.kp_objp) - kp.kp_data_offset;
++		pr_cont(" pointer offset %lu", ptroffset);
++	}
++	if (kp.kp_slab_cache && kp.kp_slab_cache->usersize)
++		pr_cont(" size %u", kp.kp_slab_cache->usersize);
++	if (kp.kp_ret)
++		pr_cont(" allocated at %pS\n", kp.kp_ret);
++	else
++		pr_cont("\n");
++	for (i = 0; i < ARRAY_SIZE(kp.kp_stack); i++) {
++		if (!kp.kp_stack[i])
++			break;
++		pr_info("    %pS\n", kp.kp_stack[i]);
++	}
++}
++
+ #ifndef CONFIG_SLOB
+ /* Create a cache during boot when no slab services are available yet */
+ void __init create_boot_cache(struct kmem_cache *s, const char *name,
+diff --git a/mm/slob.c b/mm/slob.c
+index ffb34600b48c..0578429b991b 100644
+--- a/mm/slob.c
++++ b/mm/slob.c
+@@ -461,6 +461,12 @@ static void slob_free(void *block, int size)
+ 	spin_unlock_irqrestore(&slob_lock, flags);
+ }
+ 
++void kmem_obj_info(struct kmem_obj_info *kpp, void *object, struct page *page)
++{
++	kpp->kp_ptr = object;
++	kpp->kp_page = page;
++}
++
+ /*
+  * End of slob allocator proper. Begin kmem_cache_alloc and kmalloc frontend.
+  */
+diff --git a/mm/slub.c b/mm/slub.c
+index 1ecd959b48cb..bdcbf663b41c 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3936,6 +3936,46 @@ int __kmem_cache_shutdown(struct kmem_cache *s)
+ 	return 0;
+ }
+ 
++void kmem_obj_info(struct kmem_obj_info *kpp, void *object, struct page *page)
++{
++	void *base;
++	int __maybe_unused i;
++	unsigned int objnr;
++	void *objp;
++	void *objp0;
++	struct kmem_cache *s = page->slab_cache;
++	struct track __maybe_unused *trackp;
++
++	kpp->kp_ptr = object;
++	kpp->kp_page = page;
++	kpp->kp_slab_cache = s;
++	base = page_address(page);
++	objp0 = kasan_reset_tag(object);
++#ifdef CONFIG_SLUB_DEBUG
++	objp = restore_red_left(s, objp0);
++#else
++	objp = objp0;
++#endif
++	objnr = obj_to_index(s, page, objp);
++	kpp->kp_data_offset = (unsigned long)((char *)objp0 - (char *)objp);
++	objp = base + s->size * objnr;
++	kpp->kp_objp = objp;
++	if (WARN_ON_ONCE(objp < base || objp >= base + page->objects * s->size || (objp - base) % s->size) ||
++	    !(s->flags & SLAB_STORE_USER))
++		return;
++#ifdef CONFIG_SLUB_DEBUG
++	trackp = get_track(s, objp, TRACK_ALLOC);
++	kpp->kp_ret = (void *)trackp->addr;
++#ifdef CONFIG_STACKTRACE
++	for (i = 0; i < KS_ADDRS_COUNT && i < TRACK_ADDRS_COUNT; i++) {
++		kpp->kp_stack[i] = (void *)trackp->addrs[i];
++		if (!kpp->kp_stack[i])
++			break;
++	}
++#endif
++#endif
++}
++
+ /********************************************************************
+  *		Kmalloc subsystem
+  *******************************************************************/
+diff --git a/mm/util.c b/mm/util.c
+index cfebce329d05..4e89cd21d13a 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -839,3 +839,27 @@ int memcmp_pages(struct page *page1, struct page *page2)
+ 	kunmap_atomic(addr1);
+ 	return ret;
+ }
++
++/**
++ * mem_dump_obj - Print available provenance information
++ * @object: object for which to find provenance information.
++ *
++ * This function uses pr_cont(), so that the caller is expected to have
++ * printed out whatever preamble is appropriate.  The provenance information
++ * depends on the type of object and on how much debugging is enabled.
++ * For example, for a slab-cache object, the slab name is printed, and,
++ * if available, the return address and stack trace from the allocation
++ * of that object.
++ */
++void mem_dump_obj(void *object)
++{
++	if (!virt_addr_valid(object)) {
++		pr_cont(" non-paged (local) memory.\n");
++		return;
++	}
++	if (kmem_valid_obj(object)) {
++		kmem_dump_obj(object);
++		return;
++	}
++	pr_cont(" non-slab memory.\n");
++}
