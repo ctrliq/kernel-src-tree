@@ -1,0 +1,178 @@
+drm/i915/gen8+: Add RC6 CTX corruption WA
+
+jira LE-1907
+cve CVE-2019-0154
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Imre Deak <imre.deak@intel.com>
+commit 7e34f4e4aad3fd34c02b294a3cf2321adf5b4438
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7e34f4e4.failed
+
+In some circumstances the RC6 context can get corrupted. We can detect
+this and take the required action, that is disable RC6 and runtime PM.
+The HW recovers from the corrupted state after a system suspend/resume
+cycle, so detect the recovery and re-enable RC6 and runtime PM.
+
+v2: rebase (Mika)
+v3:
+- Move intel_suspend_gt_powersave() to the end of the GEM suspend
+  sequence.
+- Add commit message.
+v4:
+- Rebased on intel_uncore_forcewake_put(i915->uncore, ...) API
+  change.
+v5: rebased on gem/gt split (Mika)
+
+	Signed-off-by: Imre Deak <imre.deak@intel.com>
+	Signed-off-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+(cherry picked from commit 7e34f4e4aad3fd34c02b294a3cf2321adf5b4438)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gt/intel_gt_pm.c
+#	drivers/gpu/drm/i915/i915_drv.c
+#	drivers/gpu/drm/i915/intel_pm.c
+#	drivers/gpu/drm/i915/intel_pm.h
+diff --cc drivers/gpu/drm/i915/i915_drv.c
+index 5fde05038258,fe4d7cabfdf1..000000000000
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@@ -2104,7 -1850,9 +2104,13 @@@ static int i915_drm_suspend_late(struc
+  
+  	i915_gem_suspend_late(dev_priv);
+  
+++<<<<<<< HEAD
+ +	intel_uncore_suspend(dev_priv);
+++=======
++ 	i915_rc6_ctx_wa_suspend(dev_priv);
++ 
++ 	intel_uncore_suspend(&dev_priv->uncore);
+++>>>>>>> 7e34f4e4aad3 (drm/i915/gen8+: Add RC6 CTX corruption WA)
+  
+  	intel_power_domains_suspend(dev_priv,
+  				    get_suspend_mode(dev_priv, hibernation));
+@@@ -2313,9 -2055,11 +2319,15 @@@ static int i915_drm_resume_early(struc
+  
+  	intel_power_domains_resume(dev_priv);
+  
+++<<<<<<< HEAD
+ +	intel_engines_sanitize(dev_priv, true);
+++=======
++ 	i915_rc6_ctx_wa_resume(dev_priv);
++ 
++ 	intel_gt_sanitize(&dev_priv->gt, true);
+++>>>>>>> 7e34f4e4aad3 (drm/i915/gen8+: Add RC6 CTX corruption WA)
+  
+ -	enable_rpm_wakeref_asserts(&dev_priv->runtime_pm);
+ +	enable_rpm_wakeref_asserts(dev_priv);
+  
+  	return ret;
+  }
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 066762ef636f,2efe1d12d5a9..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -8522,7 -8659,7 +8616,11 @@@ void intel_init_gt_powersave(struct drm
+  		pm_runtime_get(&dev_priv->drm.pdev->dev);
+  	}
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&dev_priv->pcu_lock);
+++=======
++ 	i915_rc6_ctx_wa_init(dev_priv);
+++>>>>>>> 7e34f4e4aad3 (drm/i915/gen8+: Add RC6 CTX corruption WA)
+  
+  	/* Initialize RPS limits (for userspace) */
+  	if (IS_CHERRYVIEW(dev_priv))
+@@@ -8615,9 -8729,9 +8715,9 @@@ static inline void intel_disable_llc_ps
+  	i915->gt_pm.llc_pstate.enabled = false;
+  }
+  
+- static void intel_disable_rc6(struct drm_i915_private *dev_priv)
++ static void __intel_disable_rc6(struct drm_i915_private *dev_priv)
+  {
+ -	lockdep_assert_held(&dev_priv->gt_pm.rps.lock);
+ +	lockdep_assert_held(&dev_priv->pcu_lock);
+  
+  	if (!dev_priv->gt_pm.rc6.enabled)
+  		return;
+@@@ -8634,9 -8748,18 +8734,18 @@@
+  	dev_priv->gt_pm.rc6.enabled = false;
+  }
+  
++ static void intel_disable_rc6(struct drm_i915_private *dev_priv)
++ {
++ 	struct intel_rps *rps = &dev_priv->gt_pm.rps;
++ 
++ 	mutex_lock(&rps->lock);
++ 	__intel_disable_rc6(dev_priv);
++ 	mutex_unlock(&rps->lock);
++ }
++ 
+  static void intel_disable_rps(struct drm_i915_private *dev_priv)
+  {
+ -	lockdep_assert_held(&dev_priv->gt_pm.rps.lock);
+ +	lockdep_assert_held(&dev_priv->pcu_lock);
+  
+  	if (!dev_priv->gt_pm.rps.enabled)
+  		return;
+@@@ -8657,9 -8780,9 +8766,9 @@@
+  
+  void intel_disable_gt_powersave(struct drm_i915_private *dev_priv)
+  {
+ -	mutex_lock(&dev_priv->gt_pm.rps.lock);
+ +	mutex_lock(&dev_priv->pcu_lock);
+  
+- 	intel_disable_rc6(dev_priv);
++ 	__intel_disable_rc6(dev_priv);
+  	intel_disable_rps(dev_priv);
+  	if (HAS_LLC(dev_priv))
+  		intel_disable_llc_pstate(dev_priv);
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_pm.c
+* Unmerged path drivers/gpu/drm/i915/intel_pm.h
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_pm.c
+* Unmerged path drivers/gpu/drm/i915/i915_drv.c
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 2a3ce817328c..ffbd089cb046 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -703,6 +703,8 @@ struct intel_rps {
+ 
+ struct intel_rc6 {
+ 	bool enabled;
++	bool ctx_corrupted;
++	intel_wakeref_t ctx_corrupted_wakeref;
+ 	u64 prev_hw_residency[4];
+ 	u64 cur_residency[4];
+ };
+@@ -2498,10 +2500,12 @@ static inline unsigned int i915_sg_segment_size(void)
+ /* Early gen2 have a totally busted CS tlb and require pinned batches. */
+ #define HAS_BROKEN_CS_TLB(dev_priv)	(IS_I830(dev_priv) || IS_I845G(dev_priv))
+ 
++#define NEEDS_RC6_CTX_CORRUPTION_WA(dev_priv)	\
++	(IS_BROADWELL(dev_priv) || IS_GEN(dev_priv, 9))
++
+ /* WaRsDisableCoarsePowerGating:skl,cnl */
+ #define NEEDS_WaRsDisableCoarsePowerGating(dev_priv) \
+-	(IS_CANNONLAKE(dev_priv) || \
+-	 IS_SKL_GT3(dev_priv) || IS_SKL_GT4(dev_priv))
++	(IS_CANNONLAKE(dev_priv) || IS_GEN(dev_priv, 9))
+ 
+ #define HAS_GMBUS_IRQ(dev_priv) (INTEL_GEN(dev_priv) >= 4)
+ #define HAS_GMBUS_BURST_READ(dev_priv) (INTEL_GEN(dev_priv) >= 10 || \
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index a264c5771e2f..af025fe01bb6 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -458,6 +458,8 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
+ #define   ECOCHK_PPGTT_WT_HSW		(0x2 << 3)
+ #define   ECOCHK_PPGTT_WB_HSW		(0x3 << 3)
+ 
++#define GEN8_RC6_CTX_INFO		_MMIO(0x8504)
++
+ #define GAC_ECO_BITS			_MMIO(0x14090)
+ #define   ECOBITS_SNB_BIT		(1 << 13)
+ #define   ECOBITS_PPGTT_CACHE64B	(3 << 8)
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
+* Unmerged path drivers/gpu/drm/i915/intel_pm.h
