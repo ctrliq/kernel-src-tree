@@ -1,0 +1,111 @@
+perf stat: Use affinity for closing file descriptors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 7736627b865defff2430e95df235b4aa2450bc37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7736627b.failed
+
+Closing a perf fd can also trigger an IPI to the target CPU.
+
+Use the same affinity technique as we use for reading/enabling events to
+closing to optimize the CPU transitions.
+
+Before on a large test case with 94 CPUs:
+
+  % time     seconds  usecs/call     calls    errors syscall
+  ------ ----------- ----------- --------- --------- ----------------
+   32.56    3.085463          50     61483           close
+
+  After:
+
+   10.54    0.735704          11     61485           close
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lore.kernel.org/lkml/20191121001522.180827-8-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 7736627b865defff2430e95df235b4aa2450bc37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evlist.c
+diff --cc tools/perf/util/evlist.c
+index 29a998d183ce,2e8d38a324be..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -17,8 -17,12 +17,14 @@@
+  #include "evsel.h"
+  #include "debug.h"
+  #include "units.h"
+++<<<<<<< HEAD
+++=======
++ #include <internal/lib.h> // page_size
++ #include "affinity.h"
++ #include "../perf.h"
+++>>>>>>> 7736627b865d (perf stat: Use affinity for closing file descriptors)
+  #include "asm/bug.h"
+  #include "bpf-event.h"
+ -#include "util/string2.h"
+  #include <signal.h>
+  #include <unistd.h>
+  #include <sched.h>
+@@@ -1352,18 -1167,44 +1358,51 @@@ void perf_evlist__set_selected(struct p
+  	evlist->selected = evsel;
+  }
+  
+ -void evlist__close(struct evlist *evlist)
+ +void perf_evlist__close(struct perf_evlist *evlist)
+  {
+++<<<<<<< HEAD
+ +	struct perf_evsel *evsel;
+ +
+ +	evlist__for_each_entry_reverse(evlist, evsel)
+ +		perf_evsel__close(evsel);
+++=======
++ 	struct evsel *evsel;
++ 	struct affinity affinity;
++ 	int cpu, i;
++ 
++ 	/*
++ 	 * With perf record core.cpus is usually NULL.
++ 	 * Use the old method to handle this for now.
++ 	 */
++ 	if (!evlist->core.cpus) {
++ 		evlist__for_each_entry_reverse(evlist, evsel)
++ 			evsel__close(evsel);
++ 		return;
++ 	}
++ 
++ 	if (affinity__setup(&affinity) < 0)
++ 		return;
++ 	evlist__for_each_cpu(evlist, i, cpu) {
++ 		affinity__set(&affinity, cpu);
++ 
++ 		evlist__for_each_entry_reverse(evlist, evsel) {
++ 			if (evsel__cpu_iter_skip(evsel, cpu))
++ 			    continue;
++ 			perf_evsel__close_cpu(&evsel->core, evsel->cpu_iter - 1);
++ 		}
++ 	}
++ 	affinity__cleanup(&affinity);
++ 	evlist__for_each_entry_reverse(evlist, evsel) {
++ 		perf_evsel__free_fd(&evsel->core);
++ 		perf_evsel__free_id(&evsel->core);
++ 	}
+++>>>>>>> 7736627b865d (perf stat: Use affinity for closing file descriptors)
+  }
+  
+ -static int perf_evlist__create_syswide_maps(struct evlist *evlist)
+ +static int perf_evlist__create_syswide_maps(struct perf_evlist *evlist)
+  {
+ -	struct perf_cpu_map *cpus;
+ -	struct perf_thread_map *threads;
+ +	struct cpu_map	  *cpus;
+ +	struct thread_map *threads;
+  	int err = -ENOMEM;
+  
+  	/*
+* Unmerged path tools/perf/util/evlist.c
