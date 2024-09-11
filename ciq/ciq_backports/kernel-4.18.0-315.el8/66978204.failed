@@ -1,0 +1,161 @@
+mt76: mt7615: always add rx header translation tlv when adding stations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit 66978204f71b36c2c0240e50c5789fae2d8b87a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/66978204.failed
+
+Ensures that header translation is disabled for interfaces that do not support
+it.
+
+Fixes: d4b98c63d7a7 ("mt76: mt7615: add support for rx decapsulation offload")
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 66978204f71b36c2c0240e50c5789fae2d8b87a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+#	drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+#	drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
+diff --cc drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+index fd14f53386e3,9b9f8d88e9bb..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+@@@ -1388,9 -1003,13 +1388,16 @@@ mt7615_mcu_wtbl_sta_add(struct mt7615_d
+  		return PTR_ERR(wtbl_hdr);
+  
+  	if (enable) {
+ -		mt76_connac_mcu_wtbl_generic_tlv(&dev->mt76, wskb, vif, sta,
+ -						 NULL, wtbl_hdr);
+ +		mt7615_mcu_wtbl_generic_tlv(wskb, vif, sta, NULL, wtbl_hdr);
+  		if (sta)
+++<<<<<<< HEAD
+ +			mt7615_mcu_wtbl_ht_tlv(wskb, sta, NULL, wtbl_hdr);
+++=======
++ 			mt76_connac_mcu_wtbl_ht_tlv(&dev->mt76, wskb, sta,
++ 						    NULL, wtbl_hdr);
++ 		mt76_connac_mcu_wtbl_hdr_trans_tlv(wskb, &msta->wcid, NULL,
++ 						   wtbl_hdr);
+++>>>>>>> 66978204f71b (mt76: mt7615: always add rx header translation tlv when adding stations)
+  	}
+  
+  	cmd = enable ? MCU_EXT_CMD_WTBL_UPDATE : MCU_EXT_CMD_STA_REC_UPDATE;
+@@@ -1520,94 -1125,23 +1527,98 @@@ static const struct mt7615_mcu_ops sta_
+  	.set_fw_ctrl = mt7615_mcu_fw_pmctrl,
+  };
+  
+ -int mt7615_mcu_sta_update_hdr_trans(struct mt7615_dev *dev,
+ -				    struct ieee80211_vif *vif,
+ -				    struct ieee80211_sta *sta)
+ +static int
+ +mt7615_mcu_uni_add_dev(struct mt7615_dev *dev,
+ +		       struct ieee80211_vif *vif, bool enable)
+  {
+ -	struct mt7615_sta *msta = (struct mt7615_sta *)sta->drv_priv;
+ -	struct wtbl_req_hdr *wtbl_hdr;
+ -	struct sk_buff *skb = NULL;
+ +	struct mt7615_vif *mvif = (struct mt7615_vif *)vif->drv_priv;
+ +	struct {
+ +		struct {
+ +			u8 omac_idx;
+ +			u8 band_idx;
+ +			__le16 pad;
+ +		} __packed hdr;
+ +		struct req_tlv {
+ +			__le16 tag;
+ +			__le16 len;
+ +			u8 active;
+ +			u8 pad;
+ +			u8 omac_addr[ETH_ALEN];
+ +		} __packed tlv;
+ +	} dev_req = {
+ +		.hdr = {
+ +			.omac_idx = mvif->omac_idx,
+ +			.band_idx = mvif->band_idx,
+ +		},
+ +		.tlv = {
+ +			.tag = cpu_to_le16(DEV_INFO_ACTIVE),
+ +			.len = cpu_to_le16(sizeof(struct req_tlv)),
+ +			.active = enable,
+ +		},
+ +	};
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7615_bss_basic_tlv basic;
+ +	} basic_req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->idx,
+ +		},
+ +		.basic = {
+ +			.tag = cpu_to_le16(UNI_BSS_INFO_BASIC),
+ +			.len = cpu_to_le16(sizeof(struct mt7615_bss_basic_tlv)),
+ +			.omac_idx = mvif->omac_idx,
+ +			.band_idx = mvif->band_idx,
+ +			.wmm_idx = mvif->wmm_idx,
+ +			.active = enable,
+ +			.bmc_tx_wlan_idx = cpu_to_le16(mvif->sta.wcid.idx),
+ +			.sta_idx = cpu_to_le16(mvif->sta.wcid.idx),
+ +			.conn_state = 1,
+ +		},
+ +	};
+ +	int err, idx, cmd, len;
+ +	void *data;
+  
+ -	wtbl_hdr = mt76_connac_mcu_alloc_wtbl_req(&dev->mt76, &msta->wcid,
+ -						  WTBL_SET, NULL, &skb);
+ -	if (IS_ERR(wtbl_hdr))
+ -		return PTR_ERR(wtbl_hdr);
+ +	switch (vif->type) {
+ +	case NL80211_IFTYPE_MESH_POINT:
+ +	case NL80211_IFTYPE_AP:
+ +		basic_req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_AP);
+ +		break;
+ +	case NL80211_IFTYPE_STATION:
+ +		basic_req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
+ +		break;
+ +	case NL80211_IFTYPE_ADHOC:
+ +		basic_req.basic.conn_type = cpu_to_le32(CONNECTION_IBSS_ADHOC);
+ +		break;
+ +	default:
+ +		WARN_ON(1);
+ +		break;
+ +	}
+  
+++<<<<<<< HEAD
+ +	idx = mvif->omac_idx > EXT_BSSID_START ? HW_BSSID_0 : mvif->omac_idx;
+ +	basic_req.basic.hw_bss_idx = idx;
+++=======
++ 	mt76_connac_mcu_wtbl_hdr_trans_tlv(skb, &msta->wcid, NULL, wtbl_hdr);
+++>>>>>>> 66978204f71b (mt76: mt7615: always add rx header translation tlv when adding stations)
+  
+ -	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_EXT_CMD_WTBL_UPDATE,
+ -				     true);
+ +	memcpy(dev_req.tlv.omac_addr, vif->addr, ETH_ALEN);
+ +
+ +	cmd = enable ? MCU_UNI_CMD_DEV_INFO_UPDATE : MCU_UNI_CMD_BSS_INFO_UPDATE;
+ +	data = enable ? (void *)&dev_req : (void *)&basic_req;
+ +	len = enable ? sizeof(dev_req) : sizeof(basic_req);
+ +
+ +	err = mt76_mcu_send_msg(&dev->mt76, cmd, data, len, true);
+ +	if (err < 0)
+ +		return err;
+ +
+ +	cmd = enable ? MCU_UNI_CMD_BSS_INFO_UPDATE : MCU_UNI_CMD_DEV_INFO_UPDATE;
+ +	data = enable ? (void *)&basic_req : (void *)&dev_req;
+ +	len = enable ? sizeof(basic_req) : sizeof(dev_req);
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, cmd, data, len, true);
+  }
+  
+  static int
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
