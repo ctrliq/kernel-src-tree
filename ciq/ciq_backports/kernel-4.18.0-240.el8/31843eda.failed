@@ -1,0 +1,80 @@
+dm integrity: improve discard in journal mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 31843edab7cb3924006544b901c9cab33941b684
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/31843eda.failed
+
+When we discard something that is present in the journal, we flush the
+journal first, so that discarded blocks are not overwritten by the journal
+content.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 31843edab7cb3924006544b901c9cab33941b684)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-integrity.c
+diff --cc drivers/md/dm-integrity.c
+index cb7c54aa4969,b989d109d55d..000000000000
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@@ -1660,7 -1943,10 +1660,14 @@@ static void dm_integrity_map_continue(s
+  	unsigned journal_section, journal_entry;
+  	unsigned journal_read_pos;
+  	struct completion read_comp;
+++<<<<<<< HEAD
+ +	bool need_sync_io = ic->internal_hash && !dio->write;
+++=======
++ 	bool discard_retried = false;
++ 	bool need_sync_io = ic->internal_hash && dio->op == REQ_OP_READ;
++ 	if (unlikely(dio->op == REQ_OP_DISCARD) && ic->mode != 'D')
++ 		need_sync_io = true;
+++>>>>>>> 31843edab7cb (dm integrity: improve discard in journal mode)
+  
+  	if (need_sync_io && from_map) {
+  		INIT_WORK(&dio->work, integrity_bio_wait);
+@@@ -1757,8 -2043,38 +1764,23 @@@ offload_to_thread
+  			queue_work(ic->wait_wq, &dio->work);
+  			return;
+  		}
+ -		if (journal_read_pos != NOT_FOUND)
+ -			dio->range.n_sectors = ic->sectors_per_block;
+  		wait_and_add_new_range(ic, &dio->range);
+ -		/*
+ -		 * wait_and_add_new_range drops the spinlock, so the journal
+ -		 * may have been changed arbitrarily. We need to recheck.
+ -		 * To simplify the code, we restrict I/O size to just one block.
+ -		 */
+ -		if (journal_read_pos != NOT_FOUND) {
+ -			sector_t next_sector;
+ -			unsigned new_pos = find_journal_node(ic, dio->range.logical_sector, &next_sector);
+ -			if (unlikely(new_pos != journal_read_pos)) {
+ -				remove_range_unlocked(ic, &dio->range);
+ -				goto retry;
+ -			}
+ -		}
+  	}
++ 	if (ic->mode == 'J' && likely(dio->op == REQ_OP_DISCARD) && !discard_retried) {
++ 		sector_t next_sector;
++ 		unsigned new_pos = find_journal_node(ic, dio->range.logical_sector, &next_sector);
++ 		if (unlikely(new_pos != NOT_FOUND) ||
++ 		    unlikely(next_sector < dio->range.logical_sector - dio->range.n_sectors)) {
++ 			remove_range_unlocked(ic, &dio->range);
++ 			spin_unlock_irq(&ic->endio_wait.lock);
++ 			queue_work(ic->commit_wq, &ic->commit_work);
++ 			flush_workqueue(ic->commit_wq);
++ 			queue_work(ic->writer_wq, &ic->writer_work);
++ 			flush_workqueue(ic->writer_wq);
++ 			discard_retried = true;
++ 			goto lock_retry;
++ 		}
++ 	}
+  	spin_unlock_irq(&ic->endio_wait.lock);
+  
+  	if (unlikely(journal_read_pos != NOT_FOUND)) {
+* Unmerged path drivers/md/dm-integrity.c
