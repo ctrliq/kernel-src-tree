@@ -1,0 +1,386 @@
+perf record: Implement COMPRESSED event record and its attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Alexey Budankov <alexey.budankov@linux.intel.com>
+commit 42e1fd80a5b8bf9188ddb502b788433ece189aae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/42e1fd80.failed
+
+Implemented PERF_RECORD_COMPRESSED event, related data types, header
+feature and functions to write, read and print feature attributes from
+the trace header section.
+
+comp_mmap_len preserves the size of mmaped kernel buffer that was used
+during collection. comp_mmap_len size is used on loading stage as the
+size of decomp buffer for decompression of COMPRESSED events content.
+
+Committer notes:
+
+Fixed up conflict with BPF_PROG_INFO and BTF_BTF header features.
+
+	Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/ebbaf031-8dda-3864-ebc6-7922d43ee515@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 42e1fd80a5b8bf9188ddb502b788433ece189aae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/header.c
+#	tools/perf/util/header.h
+diff --cc tools/perf/util/header.c
+index 5b16579df3db,847ae51a524b..000000000000
+--- a/tools/perf/util/header.c
++++ b/tools/perf/util/header.c
+@@@ -2624,6 -2576,149 +2655,152 @@@ static int process_dir_format(struct fe
+  	return do_read_u64(ff, &data->dir.version);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef HAVE_LIBBPF_SUPPORT
++ static int process_bpf_prog_info(struct feat_fd *ff, void *data __maybe_unused)
++ {
++ 	struct bpf_prog_info_linear *info_linear;
++ 	struct bpf_prog_info_node *info_node;
++ 	struct perf_env *env = &ff->ph->env;
++ 	u32 count, i;
++ 	int err = -1;
++ 
++ 	if (ff->ph->needs_swap) {
++ 		pr_warning("interpreting bpf_prog_info from systems with endianity is not yet supported\n");
++ 		return 0;
++ 	}
++ 
++ 	if (do_read_u32(ff, &count))
++ 		return -1;
++ 
++ 	down_write(&env->bpf_progs.lock);
++ 
++ 	for (i = 0; i < count; ++i) {
++ 		u32 info_len, data_len;
++ 
++ 		info_linear = NULL;
++ 		info_node = NULL;
++ 		if (do_read_u32(ff, &info_len))
++ 			goto out;
++ 		if (do_read_u32(ff, &data_len))
++ 			goto out;
++ 
++ 		if (info_len > sizeof(struct bpf_prog_info)) {
++ 			pr_warning("detected invalid bpf_prog_info\n");
++ 			goto out;
++ 		}
++ 
++ 		info_linear = malloc(sizeof(struct bpf_prog_info_linear) +
++ 				     data_len);
++ 		if (!info_linear)
++ 			goto out;
++ 		info_linear->info_len = sizeof(struct bpf_prog_info);
++ 		info_linear->data_len = data_len;
++ 		if (do_read_u64(ff, (u64 *)(&info_linear->arrays)))
++ 			goto out;
++ 		if (__do_read(ff, &info_linear->info, info_len))
++ 			goto out;
++ 		if (info_len < sizeof(struct bpf_prog_info))
++ 			memset(((void *)(&info_linear->info)) + info_len, 0,
++ 			       sizeof(struct bpf_prog_info) - info_len);
++ 
++ 		if (__do_read(ff, info_linear->data, data_len))
++ 			goto out;
++ 
++ 		info_node = malloc(sizeof(struct bpf_prog_info_node));
++ 		if (!info_node)
++ 			goto out;
++ 
++ 		/* after reading from file, translate offset to address */
++ 		bpf_program__bpil_offs_to_addr(info_linear);
++ 		info_node->info_linear = info_linear;
++ 		perf_env__insert_bpf_prog_info(env, info_node);
++ 	}
++ 
++ 	up_write(&env->bpf_progs.lock);
++ 	return 0;
++ out:
++ 	free(info_linear);
++ 	free(info_node);
++ 	up_write(&env->bpf_progs.lock);
++ 	return err;
++ }
++ #else // HAVE_LIBBPF_SUPPORT
++ static int process_bpf_prog_info(struct feat_fd *ff __maybe_unused, void *data __maybe_unused)
++ {
++ 	return 0;
++ }
++ #endif // HAVE_LIBBPF_SUPPORT
++ 
++ static int process_bpf_btf(struct feat_fd *ff, void *data __maybe_unused)
++ {
++ 	struct perf_env *env = &ff->ph->env;
++ 	struct btf_node *node = NULL;
++ 	u32 count, i;
++ 	int err = -1;
++ 
++ 	if (ff->ph->needs_swap) {
++ 		pr_warning("interpreting btf from systems with endianity is not yet supported\n");
++ 		return 0;
++ 	}
++ 
++ 	if (do_read_u32(ff, &count))
++ 		return -1;
++ 
++ 	down_write(&env->bpf_progs.lock);
++ 
++ 	for (i = 0; i < count; ++i) {
++ 		u32 id, data_size;
++ 
++ 		if (do_read_u32(ff, &id))
++ 			goto out;
++ 		if (do_read_u32(ff, &data_size))
++ 			goto out;
++ 
++ 		node = malloc(sizeof(struct btf_node) + data_size);
++ 		if (!node)
++ 			goto out;
++ 
++ 		node->id = id;
++ 		node->data_size = data_size;
++ 
++ 		if (__do_read(ff, node->data, data_size))
++ 			goto out;
++ 
++ 		perf_env__insert_btf(env, node);
++ 		node = NULL;
++ 	}
++ 
++ 	err = 0;
++ out:
++ 	up_write(&env->bpf_progs.lock);
++ 	free(node);
++ 	return err;
++ }
++ 
++ static int process_compressed(struct feat_fd *ff,
++ 			      void *data __maybe_unused)
++ {
++ 	if (do_read_u32(ff, &(ff->ph->env.comp_ver)))
++ 		return -1;
++ 
++ 	if (do_read_u32(ff, &(ff->ph->env.comp_type)))
++ 		return -1;
++ 
++ 	if (do_read_u32(ff, &(ff->ph->env.comp_level)))
++ 		return -1;
++ 
++ 	if (do_read_u32(ff, &(ff->ph->env.comp_ratio)))
++ 		return -1;
++ 
++ 	if (do_read_u32(ff, &(ff->ph->env.comp_mmap_len)))
++ 		return -1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 42e1fd80a5b8 (perf record: Implement COMPRESSED event record and its attributes)
+  struct feature_ops {
+  	int (*write)(struct feat_fd *ff, struct perf_evlist *evlist);
+  	void (*print)(struct feat_fd *ff, FILE *fp);
+@@@ -2684,7 -2779,10 +2861,14 @@@ static const struct feature_ops feat_op
+  	FEAT_OPR(SAMPLE_TIME,	sample_time,	false),
+  	FEAT_OPR(MEM_TOPOLOGY,	mem_topology,	true),
+  	FEAT_OPR(CLOCKID,	clockid,	false),
+++<<<<<<< HEAD
+ +	FEAT_OPN(DIR_FORMAT,	dir_format,	false)
+++=======
++ 	FEAT_OPN(DIR_FORMAT,	dir_format,	false),
++ 	FEAT_OPR(BPF_PROG_INFO, bpf_prog_info,  false),
++ 	FEAT_OPR(BPF_BTF,       bpf_btf,        false),
++ 	FEAT_OPR(COMPRESSED,	compressed,	false),
+++>>>>>>> 42e1fd80a5b8 (perf record: Implement COMPRESSED event record and its attributes)
+  };
+  
+  struct header_print_data {
+diff --cc tools/perf/util/header.h
+index 6a231340238d,5b3abe4172e2..000000000000
+--- a/tools/perf/util/header.h
++++ b/tools/perf/util/header.h
+@@@ -40,6 -40,9 +40,12 @@@ enum 
+  	HEADER_MEM_TOPOLOGY,
+  	HEADER_CLOCKID,
+  	HEADER_DIR_FORMAT,
+++<<<<<<< HEAD
+++=======
++ 	HEADER_BPF_PROG_INFO,
++ 	HEADER_BPF_BTF,
++ 	HEADER_COMPRESSED,
+++>>>>>>> 42e1fd80a5b8 (perf record: Implement COMPRESSED event record and its attributes)
+  	HEADER_LAST_FEATURE,
+  	HEADER_FEAT_BITS	= 256,
+  };
+diff --git a/tools/perf/Documentation/perf.data-file-format.txt b/tools/perf/Documentation/perf.data-file-format.txt
+index 593ef49b273c..6967e9b02be5 100644
+--- a/tools/perf/Documentation/perf.data-file-format.txt
++++ b/tools/perf/Documentation/perf.data-file-format.txt
+@@ -272,6 +272,19 @@ struct {
+ 
+ Two uint64_t for the time of first sample and the time of last sample.
+ 
++        HEADER_COMPRESSED = 27,
++
++struct {
++	u32	version;
++	u32	type;
++	u32	level;
++	u32	ratio;
++	u32	mmap_len;
++};
++
++Indicates that trace contains records of PERF_RECORD_COMPRESSED type
++that have perf_events records in compressed form.
++
+ 	other bits are reserved and should ignored for now
+ 	HEADER_FEAT_BITS	= 256,
+ 
+@@ -437,6 +450,17 @@ struct auxtrace_error_event {
+ Describes a header feature. These are records used in pipe-mode that
+ contain information that otherwise would be in perf.data file's header.
+ 
++	PERF_RECORD_COMPRESSED 			= 81,
++
++struct compressed_event {
++	struct perf_event_header	header;
++	char				data[];
++};
++
++The header is followed by compressed data frame that can be decompressed
++into array of perf trace records. The size of the entire compressed event
++record including the header is limited by the max value of header.size.
++
+ Event types
+ 
+ Define the event attributes with their IDs.
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 386e665a166f..45a80b3584ad 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -372,6 +372,11 @@ static int record__mmap_flush_parse(const struct option *opt,
+ 	return 0;
+ }
+ 
++static int record__comp_enabled(struct record *rec)
++{
++	return rec->opts.comp_level > 0;
++}
++
+ static int process_synthesized_event(struct perf_tool *tool,
+ 				     union perf_event *event,
+ 				     struct perf_sample *sample __maybe_unused,
+@@ -888,6 +893,8 @@ static void record__init_features(struct record *rec)
+ 		perf_header__clear_feat(&session->header, HEADER_CLOCKID);
+ 
+ 	perf_header__clear_feat(&session->header, HEADER_DIR_FORMAT);
++	if (!record__comp_enabled(rec))
++		perf_header__clear_feat(&session->header, HEADER_COMPRESSED);
+ 
+ 	perf_header__clear_feat(&session->header, HEADER_STAT);
+ }
+@@ -1245,6 +1252,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
+ 		err = -1;
+ 		goto out_child;
+ 	}
++	session->header.env.comp_mmap_len = session->evlist->mmap_len;
+ 
+ 	err = bpf__apply_obj_config();
+ 	if (err) {
+diff --git a/tools/perf/perf.h b/tools/perf/perf.h
+index 7c8bf6433abf..a26555baf692 100644
+--- a/tools/perf/perf.h
++++ b/tools/perf/perf.h
+@@ -86,6 +86,7 @@ struct record_opts {
+ 	int	     nr_cblocks;
+ 	int	     affinity;
+ 	int	     mmap_flush;
++	unsigned int comp_level;
+ };
+ 
+ enum perf_affinity {
+diff --git a/tools/perf/util/env.h b/tools/perf/util/env.h
+index 34868ca7efd1..271a90b326c4 100644
+--- a/tools/perf/util/env.h
++++ b/tools/perf/util/env.h
+@@ -63,6 +63,10 @@ struct perf_env {
+ 	struct cpu_cache_level	*caches;
+ 	int			 caches_cnt;
+ 	u32			comp_ratio;
++	u32			comp_ver;
++	u32			comp_type;
++	u32			comp_level;
++	u32			comp_mmap_len;
+ 	struct numa_node	*numa_nodes;
+ 	struct memory_node	*memory_nodes;
+ 	unsigned long long	 memory_bsize;
+@@ -81,6 +85,12 @@ struct perf_env {
+ 	} bpf_progs;
+ };
+ 
++enum perf_compress_type {
++	PERF_COMP_NONE = 0,
++	PERF_COMP_ZSTD,
++	PERF_COMP_MAX
++};
++
+ struct bpf_prog_info_node;
+ struct btf_node;
+ 
+diff --git a/tools/perf/util/event.c b/tools/perf/util/event.c
+index ba7be74fad6e..d1ad6c419724 100644
+--- a/tools/perf/util/event.c
++++ b/tools/perf/util/event.c
+@@ -68,6 +68,7 @@ static const char *perf_event__names[] = {
+ 	[PERF_RECORD_EVENT_UPDATE]		= "EVENT_UPDATE",
+ 	[PERF_RECORD_TIME_CONV]			= "TIME_CONV",
+ 	[PERF_RECORD_HEADER_FEATURE]		= "FEATURE",
++	[PERF_RECORD_COMPRESSED]		= "COMPRESSED",
+ };
+ 
+ static const char *perf_ns__names[] = {
+diff --git a/tools/perf/util/event.h b/tools/perf/util/event.h
+index 4e908ec1ef64..9e999550f247 100644
+--- a/tools/perf/util/event.h
++++ b/tools/perf/util/event.h
+@@ -255,6 +255,7 @@ enum perf_user_event_type { /* above any possible kernel type */
+ 	PERF_RECORD_EVENT_UPDATE		= 78,
+ 	PERF_RECORD_TIME_CONV			= 79,
+ 	PERF_RECORD_HEADER_FEATURE		= 80,
++	PERF_RECORD_COMPRESSED			= 81,
+ 	PERF_RECORD_HEADER_MAX
+ };
+ 
+@@ -627,6 +628,11 @@ struct feature_event {
+ 	char				data[];
+ };
+ 
++struct compressed_event {
++	struct perf_event_header	header;
++	char				data[];
++};
++
+ union perf_event {
+ 	struct perf_event_header	header;
+ 	struct mmap_event		mmap;
+@@ -660,6 +666,7 @@ union perf_event {
+ 	struct feature_event		feat;
+ 	struct ksymbol_event		ksymbol_event;
+ 	struct bpf_event		bpf_event;
++	struct compressed_event		pack;
+ };
+ 
+ void perf_event__print_totals(void);
+* Unmerged path tools/perf/util/header.c
+* Unmerged path tools/perf/util/header.h
