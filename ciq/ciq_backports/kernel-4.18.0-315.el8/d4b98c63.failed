@@ -1,0 +1,213 @@
+mt76: mt7615: add support for rx decapsulation offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Ryder Lee <ryder.lee@mediatek.com>
+commit d4b98c63d7a772cfc2ed68c646915d5b3988e934
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/d4b98c63.failed
+
+For AP and Client mode, the hardware can pass received packets
+as 802.3 frames that can be passed to the network stack as-is.
+
+	Tested-by: Frank Wunderlich <frank-w@public-files.de>
+	Signed-off-by: Ryder Lee <ryder.lee@mediatek.com>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit d4b98c63d7a772cfc2ed68c646915d5b3988e934)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+#	drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+#	drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
+diff --cc drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+index ae80b6868e2d,f2dd56674acb..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+@@@ -472,9 -496,9 +494,15 @@@ static int mt7615_mac_fill_rx(struct mt
+  		return 0;
+  
+  	status->aggr = unicast &&
+++<<<<<<< HEAD
+ +		       !ieee80211_is_qos_nullfunc(hdr->frame_control);
+ +	status->tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
+ +	status->seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
+++=======
++ 		       !ieee80211_is_qos_nullfunc(fc);
++ 	status->qos_ctl = qos_ctl;
++ 	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
+++>>>>>>> d4b98c63d7a7 (mt76: mt7615: add support for rx decapsulation offload)
+  
+  	return 0;
+  }
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/init.c b/drivers/net/wireless/mediatek/mt76/mt7615/init.c
+index 510756083bf6..5e95c742543c 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/init.c
+@@ -117,7 +117,8 @@ mt7615_mac_init(struct mt7615_dev *dev)
+ 
+ 	mt76_wr(dev, MT_DMA_DCR0,
+ 		FIELD_PREP(MT_DMA_DCR0_MAX_RX_LEN, 3072) |
+-		MT_DMA_DCR0_RX_VEC_DROP | MT_DMA_DCR0_DAMSDU_EN);
++		MT_DMA_DCR0_RX_VEC_DROP | MT_DMA_DCR0_DAMSDU_EN |
++		MT_DMA_DCR0_RX_HDR_TRANS_EN);
+ 	/* disable TDLS filtering */
+ 	mt76_clear(dev, MT_WF_PFCR, MT_WF_PFCR_TDLS_EN);
+ 	mt76_set(dev, MT_WF_MIB_SCR0, MT_MIB_SCR0_AGG_CNT_RANGE_EN);
+@@ -127,6 +128,7 @@ mt7615_mac_init(struct mt7615_dev *dev)
+ 	} else {
+ 		mt7615_init_mac_chain(dev, 1);
+ 	}
++	mt7615_mcu_set_rx_hdr_trans_blacklist(dev);
+ }
+ 
+ static void
+@@ -357,6 +359,7 @@ mt7615_init_wiphy(struct ieee80211_hw *hw)
+ 	ieee80211_hw_set(hw, SINGLE_SCAN_ON_ALL_BANDS);
+ 	ieee80211_hw_set(hw, TX_STATUS_NO_AMPDU_LEN);
+ 	ieee80211_hw_set(hw, WANT_MONITOR_VIF);
++	ieee80211_hw_set(hw, SUPPORTS_RX_DECAP_OFFLOAD);
+ 
+ 	if (is_mt7615(&phy->dev->mt76))
+ 		hw->max_tx_fragments = MT_TXP_MAX_BUF_NUM;
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7615/mac.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mac.h b/drivers/net/wireless/mediatek/mt76/mt7615/mac.h
+index ed009d085a53..6bf9da040196 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mac.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mac.h
+@@ -81,6 +81,11 @@ enum rx_pkt_type {
+ #define MT_RXD3_NORMAL_TSF_COMPARE_LOSS	BIT(8)
+ #define MT_RXD3_NORMAL_RXV_SEQ		GENMASK(7, 0)
+ 
++#define MT_RXD4_FRAME_CONTROL		GENMASK(15, 0)
++
++#define MT_RXD6_SEQ_CTRL		GENMASK(15, 0)
++#define MT_RXD6_QOS_CTL			GENMASK(31, 16)
++
+ #define MT_RXV1_ACID_DET_H		BIT(31)
+ #define MT_RXV1_ACID_DET_L		BIT(30)
+ #define MT_RXV1_VHTA2_B8_B3		GENMASK(29, 24)
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/main.c b/drivers/net/wireless/mediatek/mt76/mt7615/main.c
+index 7c631520e8f4..59ff41e68a8c 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/main.c
+@@ -1101,6 +1101,22 @@ static int mt7615_cancel_remain_on_channel(struct ieee80211_hw *hw,
+ 	return 0;
+ }
+ 
++static void mt7615_sta_set_decap_offload(struct ieee80211_hw *hw,
++				 struct ieee80211_vif *vif,
++				 struct ieee80211_sta *sta,
++				 bool enabled)
++{
++	struct mt7615_dev *dev = mt7615_hw_dev(hw);
++	struct mt7615_sta *msta = (struct mt7615_sta *)sta->drv_priv;
++
++	if (enabled)
++		set_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
++	else
++		clear_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
++
++	mt7615_mcu_sta_update_hdr_trans(dev, vif, sta);
++}
++
+ #ifdef CONFIG_PM
+ static int mt7615_suspend(struct ieee80211_hw *hw,
+ 			  struct cfg80211_wowlan *wowlan)
+@@ -1199,6 +1215,7 @@ const struct ieee80211_ops mt7615_ops = {
+ 	.sta_remove = mt7615_sta_remove,
+ 	.sta_pre_rcu_remove = mt76_sta_pre_rcu_remove,
+ 	.set_key = mt7615_set_key,
++	.sta_set_decap_offload = mt7615_sta_set_decap_offload,
+ 	.ampdu_action = mt7615_ampdu_action,
+ 	.set_rts_threshold = mt7615_set_rts_threshold,
+ 	.wake_tx_queue = mt7615_wake_tx_queue,
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+index bb481662d3c5..14ddac4d7251 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+@@ -1500,6 +1500,25 @@ static const struct mt7615_mcu_ops sta_update_ops = {
+ 	.set_fw_ctrl = mt7615_mcu_fw_pmctrl,
+ };
+ 
++int mt7615_mcu_sta_update_hdr_trans(struct mt7615_dev *dev,
++				    struct ieee80211_vif *vif,
++				    struct ieee80211_sta *sta)
++{
++	struct mt7615_sta *msta = (struct mt7615_sta *)sta->drv_priv;
++	struct wtbl_req_hdr *wtbl_hdr;
++	struct sk_buff *skb = NULL;
++
++	wtbl_hdr = mt76_connac_mcu_alloc_wtbl_req(&dev->mt76, &msta->wcid,
++						  WTBL_SET, NULL, &skb);
++	if (IS_ERR(wtbl_hdr))
++		return PTR_ERR(wtbl_hdr);
++
++	mt76_connac_mcu_wtbl_hdr_trans_tlv(skb, vif, sta, NULL, wtbl_hdr);
++
++	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_EXT_CMD_WTBL_UPDATE,
++				     true);
++}
++
+ static int
+ mt7615_mcu_uni_add_dev(struct mt7615_dev *dev,
+ 		       struct ieee80211_vif *vif, bool enable)
+@@ -3532,6 +3551,26 @@ int mt7615_mcu_apply_tx_dpd(struct mt7615_phy *phy)
+ 	return ret;
+ }
+ 
++int mt7615_mcu_set_rx_hdr_trans_blacklist(struct mt7615_dev *dev)
++{
++	struct {
++		u8 operation;
++		u8 count;
++		u8 _rsv[2];
++		u8 index;
++		u8 enable;
++		__le16 etype;
++	} req = {
++		.operation = 1,
++		.count = 1,
++		.enable = 1,
++		.etype = cpu_to_le16(ETH_P_PAE),
++	};
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_RX_HDR_TRANS,
++				 &req, sizeof(req), false);
++}
++
+ int mt7615_mcu_set_bss_pm(struct mt7615_dev *dev, struct ieee80211_vif *vif,
+ 			  bool enable)
+ {
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h b/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
+index 8e80331c345e..28f0e048f04d 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mt7615.h
+@@ -592,6 +592,10 @@ void mt7615_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ void mt7615_mac_work(struct work_struct *work);
+ void mt7615_txp_skb_unmap(struct mt76_dev *dev,
+ 			  struct mt76_txwi_cache *txwi);
++int mt7615_mcu_sta_update_hdr_trans(struct mt7615_dev *dev,
++				    struct ieee80211_vif *vif,
++				    struct ieee80211_sta *sta);
++int mt7615_mcu_set_rx_hdr_trans_blacklist(struct mt7615_dev *dev);
+ int mt7615_mcu_set_fcc5_lpn(struct mt7615_dev *dev, int val);
+ int mt7615_mcu_set_pulse_th(struct mt7615_dev *dev,
+ 			    const struct mt7615_dfs_pulse *pulse);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/regs.h b/drivers/net/wireless/mediatek/mt76/mt7615/regs.h
+index 4ebffe52cb8e..1fd7f183629e 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/regs.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/regs.h
+@@ -370,6 +370,7 @@ enum mt7615_reg_base {
+ #define MT_DMA_DCR0_MAX_RX_LEN		GENMASK(15, 2)
+ #define MT_DMA_DCR0_DAMSDU_EN		BIT(16)
+ #define MT_DMA_DCR0_RX_VEC_DROP		BIT(17)
++#define MT_DMA_DCR0_RX_HDR_TRANS_EN	BIT(19)
+ 
+ #define MT_DMA_RCFR0(_band)		MT_WF_DMA(0x070 + (_band) * 0x40)
+ #define MT_DMA_RCFR0_MCU_RX_MGMT	BIT(2)
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
