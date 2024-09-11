@@ -541,12 +541,6 @@ static struct qed_dev *qed_probe(struct pci_dev *pdev,
 	}
 	DP_INFO(cdev, "PCI init completed successfully\n");
 
-	rc = qed_devlink_register(cdev);
-	if (rc) {
-		DP_INFO(cdev, "Failed to register devlink.\n");
-		goto err2;
-	}
-
 	rc = qed_hw_prepare(cdev, QED_PCI_DEFAULT);
 	if (rc) {
 		DP_ERR(cdev, "hw prepare failed\n");
@@ -575,8 +569,6 @@ static void qed_remove(struct qed_dev *cdev)
 	qed_free_pci(cdev);
 
 	qed_set_power_state(cdev, PCI_D3hot);
-
-	qed_devlink_unregister(cdev);
 
 	qed_free_cdev(cdev);
 }
@@ -3014,6 +3006,8 @@ const struct qed_common_ops qed_common_ops_pass = {
 	.get_link = &qed_get_current_link,
 	.drain = &qed_drain,
 	.update_msglvl = &qed_init_dp,
+	.devlink_register = qed_devlink_register,
+	.devlink_unregister = qed_devlink_unregister,
 	.dbg_all_data = &qed_dbg_all_data,
 	.dbg_all_data_size = &qed_dbg_all_data_size,
 	.chain_alloc = &qed_chain_alloc,
