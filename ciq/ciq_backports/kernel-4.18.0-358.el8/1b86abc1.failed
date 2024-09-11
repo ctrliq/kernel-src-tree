@@ -1,0 +1,142 @@
+sched_clock: Expose struct clock_read_data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 1b86abc1c645ad5c9c7bf70910cb3ce73939d2d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/1b86abc1.failed
+
+In order to support perf_event_mmap_page::cap_time features, an
+architecture needs, aside from a userspace readable counter register,
+to expose the exact clock data so that userspace can convert the
+counter register into a correct timestamp.
+
+Provide struct clock_read_data and two (seqcount) helpers so that
+architectures (arm64 in specific) can expose the numbers to userspace.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Leo Yan <leo.yan@linaro.org>
+Link: https://lore.kernel.org/r/20200716051130.4359-2-leo.yan@linaro.org
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 1b86abc1c645ad5c9c7bf70910cb3ce73939d2d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched_clock.h
+diff --cc include/linux/sched_clock.h
+index 411b52e424e1,528718e4ed52..000000000000
+--- a/include/linux/sched_clock.h
++++ b/include/linux/sched_clock.h
+@@@ -9,7 -6,35 +9,39 @@@
+  #define LINUX_SCHED_CLOCK
+  
+  #ifdef CONFIG_GENERIC_SCHED_CLOCK
+++<<<<<<< HEAD
+ +extern void sched_clock_postinit(void);
+++=======
++ /**
++  * struct clock_read_data - data required to read from sched_clock()
++  *
++  * @epoch_ns:		sched_clock() value at last update
++  * @epoch_cyc:		Clock cycle value at last update.
++  * @sched_clock_mask:   Bitmask for two's complement subtraction of non 64bit
++  *			clocks.
++  * @read_sched_clock:	Current clock source (or dummy source when suspended).
++  * @mult:		Multipler for scaled math conversion.
++  * @shift:		Shift value for scaled math conversion.
++  *
++  * Care must be taken when updating this structure; it is read by
++  * some very hot code paths. It occupies <=40 bytes and, when combined
++  * with the seqcount used to synchronize access, comfortably fits into
++  * a 64 byte cache line.
++  */
++ struct clock_read_data {
++ 	u64 epoch_ns;
++ 	u64 epoch_cyc;
++ 	u64 sched_clock_mask;
++ 	u64 (*read_sched_clock)(void);
++ 	u32 mult;
++ 	u32 shift;
++ };
++ 
++ extern struct clock_read_data *sched_clock_read_begin(unsigned int *seq);
++ extern int sched_clock_read_retry(unsigned int seq);
++ 
++ extern void generic_sched_clock_init(void);
+++>>>>>>> 1b86abc1c645 (sched_clock: Expose struct clock_read_data)
+  
+  extern void sched_clock_register(u64 (*read)(void), int bits,
+  				 unsigned long rate);
+* Unmerged path include/linux/sched_clock.h
+diff --git a/kernel/time/sched_clock.c b/kernel/time/sched_clock.c
+index d1dcfcebc1c4..ee8fa9d954cf 100644
+--- a/kernel/time/sched_clock.c
++++ b/kernel/time/sched_clock.c
+@@ -22,31 +22,6 @@
+ 
+ #include "timekeeping.h"
+ 
+-/**
+- * struct clock_read_data - data required to read from sched_clock()
+- *
+- * @epoch_ns:		sched_clock() value at last update
+- * @epoch_cyc:		Clock cycle value at last update.
+- * @sched_clock_mask:   Bitmask for two's complement subtraction of non 64bit
+- *			clocks.
+- * @read_sched_clock:	Current clock source (or dummy source when suspended).
+- * @mult:		Multipler for scaled math conversion.
+- * @shift:		Shift value for scaled math conversion.
+- *
+- * Care must be taken when updating this structure; it is read by
+- * some very hot code paths. It occupies <=40 bytes and, when combined
+- * with the seqcount used to synchronize access, comfortably fits into
+- * a 64 byte cache line.
+- */
+-struct clock_read_data {
+-	u64 epoch_ns;
+-	u64 epoch_cyc;
+-	u64 sched_clock_mask;
+-	u64 (*read_sched_clock)(void);
+-	u32 mult;
+-	u32 shift;
+-};
+-
+ /**
+  * struct clock_data - all data needed for sched_clock() (including
+  *                     registration of a new clock source)
+@@ -96,6 +71,17 @@ static inline u64 notrace cyc_to_ns(u64 cyc, u32 mult, u32 shift)
+ 	return (cyc * mult) >> shift;
+ }
+ 
++struct clock_read_data *sched_clock_read_begin(unsigned int *seq)
++{
++	*seq = raw_read_seqcount(&cd.seq);
++	return cd.read_data + (*seq & 1);
++}
++
++int sched_clock_read_retry(unsigned int seq)
++{
++	return read_seqcount_retry(&cd.seq, seq);
++}
++
+ unsigned long long notrace sched_clock(void)
+ {
+ 	u64 cyc, res;
+@@ -103,13 +89,12 @@ unsigned long long notrace sched_clock(void)
+ 	struct clock_read_data *rd;
+ 
+ 	do {
+-		seq = raw_read_seqcount(&cd.seq);
+-		rd = cd.read_data + (seq & 1);
++		rd = sched_clock_read_begin(&seq);
+ 
+ 		cyc = (rd->read_sched_clock() - rd->epoch_cyc) &
+ 		      rd->sched_clock_mask;
+ 		res = rd->epoch_ns + cyc_to_ns(cyc, rd->mult, rd->shift);
+-	} while (read_seqcount_retry(&cd.seq, seq));
++	} while (sched_clock_read_retry(seq));
+ 
+ 	return res;
+ }
