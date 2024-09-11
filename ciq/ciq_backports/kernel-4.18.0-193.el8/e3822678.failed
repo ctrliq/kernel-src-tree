@@ -1,0 +1,328 @@
+net: sched: update action implementations to support flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: update action implementations to support flags (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 95.50%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit e38226786022d2d8e5876ab7bc37e82b0eb57e65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e3822678.failed
+
+Extend struct tc_action with new "tcfa_flags" field. Set the field in
+tcf_idr_create() function and provide new helper
+tcf_idr_create_from_flags() that derives 'cpustats' boolean from flags
+value. Update individual hardware-offloaded actions init() to pass their
+"flags" argument to new helper in order to skip percpu stats allocation
+when user requested it through flags.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e38226786022d2d8e5876ab7bc37e82b0eb57e65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+#	net/sched/act_ct.c
+#	net/sched/act_ctinfo.c
+#	net/sched/act_mpls.c
+diff --cc net/sched/act_api.c
+index d35eb0b8379b,6284c552e943..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -779,7 -785,15 +791,19 @@@ tcf_action_dump_1(struct sk_buff *skb, 
+  	}
+  	rcu_read_unlock();
+  
+++<<<<<<< HEAD
+ +	nest = nla_nest_start(skb, TCA_OPTIONS);
+++=======
++ 	if (a->tcfa_flags) {
++ 		struct nla_bitfield32 flags = { a->tcfa_flags,
++ 						a->tcfa_flags, };
++ 
++ 		if (nla_put(skb, TCA_ACT_FLAGS, sizeof(flags), &flags))
++ 			goto nla_put_failure;
++ 	}
++ 
++ 	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+++>>>>>>> e38226786022 (net: sched: update action implementations to support flags)
+  	if (nest == NULL)
+  		goto nla_put_failure;
+  	err = tcf_action_dump_old(skb, a, bind, ref);
+diff --cc net/sched/act_ctinfo.c
+index 10eb2bb99861,b1e601007242..000000000000
+--- a/net/sched/act_ctinfo.c
++++ b/net/sched/act_ctinfo.c
+@@@ -206,12 -206,13 +206,17 @@@ static int tcf_ctinfo_init(struct net *
+  	}
+  
+  	/* done the validation:now to the actual action allocation */
+ -	index = actparm->index;
+ -	err = tcf_idr_check_alloc(tn, &index, a, bind);
+ +	err = tcf_idr_check_alloc(tn, &actparm->index, a, bind);
+  	if (!err) {
+++<<<<<<< HEAD
+ +		ret = tcf_idr_create(tn, actparm->index, est, a,
+ +				     &act_ctinfo_ops, bind, false);
+++=======
++ 		ret = tcf_idr_create(tn, index, est, a,
++ 				     &act_ctinfo_ops, bind, false, 0);
+++>>>>>>> e38226786022 (net: sched: update action implementations to support flags)
+  		if (ret) {
+ -			tcf_idr_cleanup(tn, index);
+ +			tcf_idr_cleanup(tn, actparm->index);
+  			return ret;
+  		}
+  		ret = ACT_P_CREATED;
+* Unmerged path net/sched/act_ct.c
+* Unmerged path net/sched/act_mpls.c
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index c61a1bf4e3de..044f38965b87 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -40,6 +40,7 @@ struct tc_action {
+ 	struct gnet_stats_queue __percpu *cpu_qstats;
+ 	struct tc_cookie	__rcu *act_cookie;
+ 	struct tcf_chain	__rcu *goto_chain;
++	u32			tcfa_flags;
+ };
+ #define tcf_index	common.tcfa_index
+ #define tcf_refcnt	common.tcfa_refcnt
+@@ -147,7 +148,11 @@ int tcf_generic_walker(struct tc_action_net *tn, struct sk_buff *skb,
+ int tcf_idr_search(struct tc_action_net *tn, struct tc_action **a, u32 index);
+ int tcf_idr_create(struct tc_action_net *tn, u32 index, struct nlattr *est,
+ 		   struct tc_action **a, const struct tc_action_ops *ops,
+-		   int bind, bool cpustats);
++		   int bind, bool cpustats, u32 flags);
++int tcf_idr_create_from_flags(struct tc_action_net *tn, u32 index,
++			      struct nlattr *est, struct tc_action **a,
++			      const struct tc_action_ops *ops, int bind,
++			      u32 flags);
+ void tcf_idr_insert(struct tc_action_net *tn, struct tc_action *a);
+ 
+ void tcf_idr_cleanup(struct tc_action_net *tn, u32 index);
+* Unmerged path net/sched/act_api.c
+diff --git a/net/sched/act_bpf.c b/net/sched/act_bpf.c
+index d8f218efec81..7e6cd9bd3969 100644
+--- a/net/sched/act_bpf.c
++++ b/net/sched/act_bpf.c
+@@ -310,7 +310,7 @@ static int tcf_bpf_init(struct net *net, struct nlattr *nla,
+ 	ret = tcf_idr_check_alloc(tn, &index, act, bind);
+ 	if (!ret) {
+ 		ret = tcf_idr_create(tn, index, est, act,
+-				     &act_bpf_ops, bind, true);
++				     &act_bpf_ops, bind, true, 0);
+ 		if (ret < 0) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_connmark.c b/net/sched/act_connmark.c
+index 10de4b1e0c1a..9f757efd3f92 100644
+--- a/net/sched/act_connmark.c
++++ b/net/sched/act_connmark.c
+@@ -125,7 +125,7 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
+ 	ret = tcf_idr_check_alloc(tn, &index, a, bind);
+ 	if (!ret) {
+ 		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_connmark_ops, bind, false);
++				     &act_connmark_ops, bind, false, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_csum.c b/net/sched/act_csum.c
+index 209377dabe2f..d4c8e2c908d5 100644
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@ -72,8 +72,8 @@ static int tcf_csum_init(struct net *net, struct nlattr *nla,
+ 	index = parm->index;
+ 	err = tcf_idr_check_alloc(tn, &index, a, bind);
+ 	if (!err) {
+-		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_csum_ops, bind, true);
++		ret = tcf_idr_create_from_flags(tn, index, est, a,
++						&act_csum_ops, bind, flags);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+* Unmerged path net/sched/act_ct.c
+* Unmerged path net/sched/act_ctinfo.c
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index c0e921d63e64..09ba4fcb5960 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -102,8 +102,8 @@ static int tcf_gact_init(struct net *net, struct nlattr *nla,
+ 
+ 	err = tcf_idr_check_alloc(tn, &index, a, bind);
+ 	if (!err) {
+-		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_gact_ops, bind, true);
++		ret = tcf_idr_create_from_flags(tn, index, est, a,
++						&act_gact_ops, bind, flags);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_ife.c b/net/sched/act_ife.c
+index 575a19b4b575..0314ff126a68 100644
+--- a/net/sched/act_ife.c
++++ b/net/sched/act_ife.c
+@@ -521,7 +521,7 @@ static int tcf_ife_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, est, a, &act_ife_ops,
+-				     bind, true);
++				     bind, true, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			kfree(p);
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 04a0b5c61194..309ab87b1ee7 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -146,7 +146,7 @@ static int __tcf_ipt_init(struct net *net, unsigned int id, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, est, a, ops, bind,
+-				     false);
++				     false, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 4bcf631eaf3d..691eb455c69d 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -152,8 +152,8 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 			NL_SET_ERR_MSG_MOD(extack, "Specified device does not exist");
+ 			return -EINVAL;
+ 		}
+-		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_mirred_ops, bind, true);
++		ret = tcf_idr_create_from_flags(tn, index, est, a,
++						&act_mirred_ops, bind, flags);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+* Unmerged path net/sched/act_mpls.c
+diff --git a/net/sched/act_nat.c b/net/sched/act_nat.c
+index 14fdf25f3540..568446afc09d 100644
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@ -64,7 +64,7 @@ static int tcf_nat_init(struct net *net, struct nlattr *nla, struct nlattr *est,
+ 	err = tcf_idr_check_alloc(tn, &index, a, bind);
+ 	if (!err) {
+ 		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_nat_ops, bind, false);
++				     &act_nat_ops, bind, false, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
+index 14225288f643..3f4740947998 100644
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@ -191,7 +191,7 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
+ 			goto out_free;
+ 		}
+ 		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_pedit_ops, bind, false);
++				     &act_pedit_ops, bind, false, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			goto out_free;
+diff --git a/net/sched/act_police.c b/net/sched/act_police.c
+index 84f634a16d3f..6a56a9d4cd44 100644
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -90,7 +90,7 @@ static int tcf_police_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, NULL, a,
+-				     &act_police_ops, bind, true);
++				     &act_police_ops, bind, true, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index 820d3c6ae8f1..fc54ac5ebc83 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -71,7 +71,7 @@ static int tcf_sample_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_sample_ops, bind, true);
++				     &act_sample_ops, bind, true, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_simple.c b/net/sched/act_simple.c
+index 4c3010e90ad6..4d0b6bbf5f04 100644
+--- a/net/sched/act_simple.c
++++ b/net/sched/act_simple.c
+@@ -131,7 +131,7 @@ static int tcf_simp_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_simp_ops, bind, false);
++				     &act_simp_ops, bind, false, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_skbedit.c b/net/sched/act_skbedit.c
+index 88132693a629..8225943e1193 100644
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@ -175,7 +175,7 @@ static int tcf_skbedit_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_skbedit_ops, bind, true);
++				     &act_skbedit_ops, bind, true, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_skbmod.c b/net/sched/act_skbmod.c
+index 5cb3726f71a9..4b813f5f292b 100644
+--- a/net/sched/act_skbmod.c
++++ b/net/sched/act_skbmod.c
+@@ -146,7 +146,7 @@ static int tcf_skbmod_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_skbmod_ops, bind, true);
++				     &act_skbmod_ops, bind, true, 0);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
+diff --git a/net/sched/act_tunnel_key.c b/net/sched/act_tunnel_key.c
+index 2e1c7c13ae7a..bb6a21649922 100644
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@ -350,8 +350,9 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
+ 	}
+ 
+ 	if (!exists) {
+-		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_tunnel_key_ops, bind, true);
++		ret = tcf_idr_create_from_flags(tn, index, est, a,
++						&act_tunnel_key_ops, bind,
++						act_flags);
+ 		if (ret) {
+ 			NL_SET_ERR_MSG(extack, "Cannot create TC IDR");
+ 			goto release_tun_meta;
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index 40cc935e5146..501127ef8426 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -191,8 +191,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 	action = parm->v_action;
+ 
+ 	if (!exists) {
+-		ret = tcf_idr_create(tn, index, est, a,
+-				     &act_vlan_ops, bind, true);
++		ret = tcf_idr_create_from_flags(tn, index, est, a,
++						&act_vlan_ops, bind, flags);
+ 		if (ret) {
+ 			tcf_idr_cleanup(tn, index);
+ 			return ret;
