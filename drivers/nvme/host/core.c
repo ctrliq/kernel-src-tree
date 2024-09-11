@@ -2953,7 +2953,7 @@ static struct attribute *nvme_subsys_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group nvme_subsys_attrs_group = {
+static const struct attribute_group nvme_subsys_attrs_group = {
 	.attrs = nvme_subsys_attrs,
 };
 
@@ -3788,7 +3788,7 @@ static umode_t nvme_dev_attrs_are_visible(struct kobject *kobj,
 	return a->mode;
 }
 
-static struct attribute_group nvme_dev_attrs_group = {
+static const struct attribute_group nvme_dev_attrs_group = {
 	.attrs		= nvme_dev_attrs,
 	.is_visible	= nvme_dev_attrs_are_visible,
 };
