@@ -1,0 +1,343 @@
+libbpf: Allow modification of BTF and add btf__add_str API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 919d2b1dbb074d438027135ba644411931179a59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/919d2b1d.failed
+
+Allow internal BTF representation to switch from default read-only mode, in
+which raw BTF data is a single non-modifiable block of memory with BTF header,
+types, and strings layed out sequentially and contiguously in memory, into
+a writable representation with types and strings data split out into separate
+memory regions, that can be dynamically expanded.
+
+Such writable internal representation is transparent to users of libbpf APIs,
+but allows to append new types and strings at the end of BTF, which is
+a typical use case when generating BTF programmatically. All the basic
+guarantees of BTF types and strings layout is preserved, i.e., user can get
+`struct btf_type *` pointer and read it directly. Such btf_type pointers might
+be invalidated if BTF is modified, so some care is required in such mixed
+read/write scenarios.
+
+Switch from read-only to writable configuration happens automatically the
+first time when user attempts to modify BTF by either adding a new type or new
+string. It is still possible to get raw BTF data, which is a single piece of
+memory that can be persisted in ELF section or into a file as raw BTF. Such
+raw data memory is also still owned by BTF and will be freed either when BTF
+object is freed or if another modification to BTF happens, as any modification
+invalidates BTF raw representation.
+
+This patch adds the first two BTF manipulation APIs: btf__add_str(), which
+allows to add arbitrary strings to BTF string section, and btf__find_str()
+which allows to find existing string offset, but not add it if it's missing.
+All the added strings are automatically deduplicated. This is achieved by
+maintaining an additional string lookup index for all unique strings. Such
+index is built when BTF is switched to modifiable mode. If at that time BTF
+strings section contained duplicate strings, they are not de-duplicated. This
+is done specifically to not modify the existing content of BTF (types, their
+string offsets, etc), which can cause confusion and is especially important
+property if there is struct btf_ext associated with struct btf. By following
+this "imperfect deduplication" process, btf_ext is kept consitent and correct.
+If deduplication of strings is necessary, it can be forced by doing BTF
+deduplication, at which point all the strings will be eagerly deduplicated and
+all string offsets both in struct btf and struct btf_ext will be updated.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200926011357.2366158-6-andriin@fb.com
+(cherry picked from commit 919d2b1dbb074d438027135ba644411931179a59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/btf.c
+index 9ca048005e04,040f3b8ee39f..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -30,17 -27,68 +30,78 @@@
+  static struct btf_type btf_void;
+  
+  struct btf {
+++<<<<<<< HEAD
+ +	union {
+ +		struct btf_header *hdr;
+ +		void *data;
+ +	};
+ +	struct btf_type **types;
+ +	const char *strings;
+ +	void *nohdr_data;
+ +	__u32 nr_types;
+ +	__u32 types_size;
+ +	__u32 data_size;
+++=======
++ 	void *raw_data;
++ 	__u32 raw_size;
++ 
++ 	/*
++ 	 * When BTF is loaded from ELF or raw memory it is stored
++ 	 * in contiguous memory block, pointed to by raw_data pointer, and
++ 	 * hdr, types_data, and strs_data point inside that memory region to
++ 	 * respective parts of BTF representation:
++ 	 *
++ 	 * +--------------------------------+
++ 	 * |  Header  |  Types  |  Strings  |
++ 	 * +--------------------------------+
++ 	 * ^          ^         ^
++ 	 * |          |         |
++ 	 * hdr        |         |
++ 	 * types_data-+         |
++ 	 * strs_data------------+
++ 	 *
++ 	 * If BTF data is later modified, e.g., due to types added or
++ 	 * removed, BTF deduplication performed, etc, this contiguous
++ 	 * representation is broken up into three independently allocated
++ 	 * memory regions to be able to modify them independently.
++ 	 * raw_data is nulled out at that point, but can be later allocated
++ 	 * and cached again if user calls btf__get_raw_data(), at which point
++ 	 * raw_data will contain a contiguous copy of header, types, and
++ 	 * strings:
++ 	 *
++ 	 * +----------+  +---------+  +-----------+
++ 	 * |  Header  |  |  Types  |  |  Strings  |
++ 	 * +----------+  +---------+  +-----------+
++ 	 * ^             ^            ^
++ 	 * |             |            |
++ 	 * hdr           |            |
++ 	 * types_data----+            |
++ 	 * strs_data------------------+
++ 	 *
++ 	 *               +----------+---------+-----------+
++ 	 *               |  Header  |  Types  |  Strings  |
++ 	 * raw_data----->+----------+---------+-----------+
++ 	 */
++ 	struct btf_header *hdr;
++ 
++ 	void *types_data;
++ 	size_t types_data_cap; /* used size stored in hdr->type_len */
++ 
++ 	/* type ID to `struct btf_type *` lookup index */
++ 	__u32 *type_offs;
++ 	size_t type_offs_cap;
++ 	__u32 nr_types;
++ 
++ 	void *strs_data;
++ 	size_t strs_data_cap; /* used size stored in hdr->str_len */
++ 
++ 	/* lookup index for each unique string in strings section */
++ 	struct hashmap *strs_hash;
++ 	/* whether strings are already deduplicated */
++ 	bool strs_deduped;
++ 	/* BTF object FD, if loaded into kernel */
+++>>>>>>> 919d2b1dbb07 (libbpf: Allow modification of BTF and add btf__add_str API)
+  	int fd;
+ -
+ -	/* Pointer size (in bytes) for a target architecture of this BTF */
+ -	int ptr_sz;
+  };
+  
+  static inline __u64 ptr_to_u64(const void *ptr)
+@@@ -389,11 -546,22 +455,27 @@@ void btf__free(struct btf *btf
+  	if (IS_ERR_OR_NULL(btf))
+  		return;
+  
+ -	if (btf->fd >= 0)
+ +	if (btf->fd != -1)
+  		close(btf->fd);
+  
+++<<<<<<< HEAD
+ +	free(btf->data);
+ +	free(btf->types);
+++=======
++ 	if (btf_is_modifiable(btf)) {
++ 		/* if BTF was modified after loading, it will have a split
++ 		 * in-memory representation for header, types, and strings
++ 		 * sections, so we need to free all of them individually. It
++ 		 * might still have a cached contiguous raw data present,
++ 		 * which will be unconditionally freed below.
++ 		 */
++ 		free(btf->hdr);
++ 		free(btf->types_data);
++ 		free(btf->strs_data);
++ 	}
++ 	free(btf->raw_data);
++ 	free(btf->type_offs);
+++>>>>>>> 919d2b1dbb07 (libbpf: Allow modification of BTF and add btf__add_str API)
+  	free(btf);
+  }
+  
+@@@ -700,10 -963,36 +782,43 @@@ int btf__fd(const struct btf *btf
+  	return btf->fd;
+  }
+  
+++<<<<<<< HEAD
+ +const void *btf__get_raw_data(const struct btf *btf, __u32 *size)
+ +{
+ +	*size = btf->data_size;
+ +	return btf->data;
+++=======
++ void btf__set_fd(struct btf *btf, int fd)
++ {
++ 	btf->fd = fd;
++ }
++ 
++ const void *btf__get_raw_data(const struct btf *btf_ro, __u32 *size)
++ {
++ 	struct btf *btf = (struct btf *)btf_ro;
++ 
++ 	if (!btf->raw_data) {
++ 		struct btf_header *hdr = btf->hdr;
++ 		void *data;
++ 
++ 		btf->raw_size = hdr->hdr_len + hdr->type_len + hdr->str_len;
++ 		btf->raw_data = calloc(1, btf->raw_size);
++ 		if (!btf->raw_data)
++ 			return NULL;
++ 		data = btf->raw_data;
++ 
++ 		memcpy(data, hdr, hdr->hdr_len);
++ 		data += hdr->hdr_len;
++ 
++ 		memcpy(data, btf->types_data, hdr->type_len);
++ 		data += hdr->type_len;
++ 
++ 		memcpy(data, btf->strs_data, hdr->str_len);
++ 		data += hdr->str_len;
++ 	}
++ 	*size = btf->raw_size;
++ 	return btf->raw_data;
+++>>>>>>> 919d2b1dbb07 (libbpf: Allow modification of BTF and add btf__add_str API)
+  }
+  
+  const char *btf__name_by_offset(const struct btf *btf, __u32 offset)
+@@@ -2795,21 -3263,15 +3092,27 @@@ static int btf_dedup_compact_types(stru
+  
+  	/* shrink struct btf's internal types index and update btf_header */
+  	d->btf->nr_types = next_type_id - 1;
+ -	d->btf->type_offs_cap = d->btf->nr_types + 1;
+ -	d->btf->hdr->type_len = p - d->btf->types_data;
+ -	new_offs = libbpf_reallocarray(d->btf->type_offs, d->btf->type_offs_cap,
+ -				       sizeof(*new_offs));
+ -	if (!new_offs)
+ +	d->btf->types_size = d->btf->nr_types;
+ +	d->btf->hdr->type_len = p - types_start;
+ +	new_types = realloc(d->btf->types,
+ +			    (1 + d->btf->nr_types) * sizeof(struct btf_type *));
+ +	if (!new_types)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+ +	d->btf->types = new_types;
+ +
+ +	/* make sure string section follows type information without gaps */
+ +	d->btf->hdr->str_off = p - (char *)d->btf->nohdr_data;
+ +	memmove(p, d->btf->strings, d->btf->hdr->str_len);
+ +	d->btf->strings = p;
+ +	p += d->btf->hdr->str_len;
+ +
+ +	d->btf->data_size = p - (char *)d->btf->data;
+++=======
++ 	d->btf->type_offs = new_offs;
++ 	d->btf->hdr->str_off = d->btf->hdr->type_len;
++ 	d->btf->raw_size = d->btf->hdr->hdr_len + d->btf->hdr->type_len + d->btf->hdr->str_len;
+++>>>>>>> 919d2b1dbb07 (libbpf: Allow modification of BTF and add btf__add_str API)
+  	return 0;
+  }
+  
+diff --cc tools/lib/bpf/libbpf.map
+index 69599528ddbe,f1518c51d2e5..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -286,3 -254,62 +286,65 @@@ LIBBPF_0.0.8 
+  		bpf_program__set_lsm;
+  		bpf_set_link_xdp_fd_opts;
+  } LIBBPF_0.0.7;
+++<<<<<<< HEAD
+++=======
++ 
++ LIBBPF_0.0.9 {
++ 	global:
++ 		bpf_enable_stats;
++ 		bpf_iter_create;
++ 		bpf_link_get_fd_by_id;
++ 		bpf_link_get_next_id;
++ 		bpf_program__attach_iter;
++ 		bpf_program__attach_netns;
++ 		perf_buffer__consume;
++ 		ring_buffer__add;
++ 		ring_buffer__consume;
++ 		ring_buffer__free;
++ 		ring_buffer__new;
++ 		ring_buffer__poll;
++ } LIBBPF_0.0.8;
++ 
++ LIBBPF_0.1.0 {
++ 	global:
++ 		bpf_link__detach;
++ 		bpf_link_detach;
++ 		bpf_map__ifindex;
++ 		bpf_map__key_size;
++ 		bpf_map__map_flags;
++ 		bpf_map__max_entries;
++ 		bpf_map__numa_node;
++ 		bpf_map__set_key_size;
++ 		bpf_map__set_map_flags;
++ 		bpf_map__set_max_entries;
++ 		bpf_map__set_numa_node;
++ 		bpf_map__set_type;
++ 		bpf_map__set_value_size;
++ 		bpf_map__type;
++ 		bpf_map__value_size;
++ 		bpf_program__attach_xdp;
++ 		bpf_program__autoload;
++ 		bpf_program__is_sk_lookup;
++ 		bpf_program__set_autoload;
++ 		bpf_program__set_sk_lookup;
++ 		btf__parse;
++ 		btf__parse_raw;
++ 		btf__pointer_size;
++ 		btf__set_fd;
++ 		btf__set_pointer_size;
++ } LIBBPF_0.0.9;
++ 
++ LIBBPF_0.2.0 {
++ 	global:
++ 		bpf_prog_bind_map;
++ 		bpf_prog_test_run_opts;
++ 		bpf_program__section_name;
++ 		btf__add_str;
++ 		btf__find_str;
++ 		perf_buffer__buffer_cnt;
++ 		perf_buffer__buffer_fd;
++ 		perf_buffer__epoll_fd;
++ 		perf_buffer__consume_buffer;
++ 		xsk_socket__create_shared;
++ } LIBBPF_0.1.0;
+++>>>>>>> 919d2b1dbb07 (libbpf: Allow modification of BTF and add btf__add_str API)
+* Unmerged path tools/lib/bpf/btf.c
+diff --git a/tools/lib/bpf/btf.h b/tools/lib/bpf/btf.h
+index d511de1e95f1..c1a2f39dc074 100644
+--- a/tools/lib/bpf/btf.h
++++ b/tools/lib/bpf/btf.h
+@@ -5,6 +5,7 @@
+ #define __LIBBPF_BTF_H
+ 
+ #include <stdarg.h>
++#include <stdbool.h>
+ #include <linux/btf.h>
+ #include <linux/types.h>
+ 
+@@ -66,6 +67,9 @@ LIBBPF_API __u32 btf_ext__line_info_rec_size(const struct btf_ext *btf_ext);
+ 
+ LIBBPF_API struct btf *libbpf_find_kernel_btf(void);
+ 
++LIBBPF_API int btf__find_str(struct btf *btf, const char *s);
++LIBBPF_API int btf__add_str(struct btf *btf, const char *s);
++
+ struct btf_dedup_opts {
+ 	unsigned int dedup_table_size;
+ 	bool dont_resolve_fwds;
+* Unmerged path tools/lib/bpf/libbpf.map
