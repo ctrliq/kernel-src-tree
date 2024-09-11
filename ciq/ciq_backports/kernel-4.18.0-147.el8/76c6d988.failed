@@ -1,0 +1,228 @@
+sctp: add sock_reuseport for the sock in __sctp_hash_endpoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 76c6d988aeb3c15d57ea0c245a3b5f27802c1fbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/76c6d988.failed
+
+This is a part of sk_reuseport support for sctp. It defines a helper
+sctp_bind_addrs_check() to check if the bind_addrs in two socks are
+matched. It will add sock_reuseport if they are completely matched,
+and return err if they are partly matched, and alloc sock_reuseport
+if all socks are not matched at all.
+
+It will work until sk_reuseport support is added in
+sctp_get_port_local() in the next patch.
+
+v1->v2:
+  - use 'laddr->valid && laddr2->valid' check instead as Marcelo
+    pointed in sctp_bind_addrs_check().
+
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 76c6d988aeb3c15d57ea0c245a3b5f27802c1fbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/sctp.h
+diff --cc include/net/sctp/sctp.h
+index ab9242e51d9e,cdf2e80abc44..000000000000
+--- a/include/net/sctp/sctp.h
++++ b/include/net/sctp/sctp.h
+@@@ -151,8 -151,8 +151,13 @@@ int sctp_primitive_RECONF(struct net *n
+   * sctp/input.c
+   */
+  int sctp_rcv(struct sk_buff *skb);
+++<<<<<<< HEAD
+ +void sctp_v4_err(struct sk_buff *skb, u32 info);
+ +void sctp_hash_endpoint(struct sctp_endpoint *);
+++=======
++ int sctp_v4_err(struct sk_buff *skb, u32 info);
++ int sctp_hash_endpoint(struct sctp_endpoint *ep);
+++>>>>>>> 76c6d988aeb3 (sctp: add sock_reuseport for the sock in __sctp_hash_endpoint)
+  void sctp_unhash_endpoint(struct sctp_endpoint *);
+  struct sock *sctp_err_lookup(struct net *net, int family, struct sk_buff *,
+  			     struct sctphdr *, struct sctp_association **,
+* Unmerged path include/net/sctp/sctp.h
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index fbe992ce36ef..25a46736be85 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -1189,6 +1189,8 @@ int sctp_bind_addr_conflict(struct sctp_bind_addr *, const union sctp_addr *,
+ 			 struct sctp_sock *, struct sctp_sock *);
+ int sctp_bind_addr_state(const struct sctp_bind_addr *bp,
+ 			 const union sctp_addr *addr);
++int sctp_bind_addrs_check(struct sctp_sock *sp,
++			  struct sctp_sock *sp2, int cnt2);
+ union sctp_addr *sctp_find_unmatch_addr(struct sctp_bind_addr	*bp,
+ 					const union sctp_addr	*addrs,
+ 					int			addrcnt,
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 064acb04be0f..aad1ca1e82c8 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -151,6 +151,7 @@ int reuseport_add_sock(struct sock *sk, struct sock *sk2)
+ 		call_rcu(&old_reuse->rcu, reuseport_free_rcu);
+ 	return 0;
+ }
++EXPORT_SYMBOL(reuseport_add_sock);
+ 
+ void reuseport_detach_sock(struct sock *sk)
+ {
+diff --git a/net/sctp/bind_addr.c b/net/sctp/bind_addr.c
+index 7df3704982f5..ebf28adba789 100644
+--- a/net/sctp/bind_addr.c
++++ b/net/sctp/bind_addr.c
+@@ -337,6 +337,34 @@ int sctp_bind_addr_match(struct sctp_bind_addr *bp,
+ 	return match;
+ }
+ 
++int sctp_bind_addrs_check(struct sctp_sock *sp,
++			  struct sctp_sock *sp2, int cnt2)
++{
++	struct sctp_bind_addr *bp2 = &sp2->ep->base.bind_addr;
++	struct sctp_bind_addr *bp = &sp->ep->base.bind_addr;
++	struct sctp_sockaddr_entry *laddr, *laddr2;
++	bool exist = false;
++	int cnt = 0;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(laddr, &bp->address_list, list) {
++		list_for_each_entry_rcu(laddr2, &bp2->address_list, list) {
++			if (sp->pf->af->cmp_addr(&laddr->a, &laddr2->a) &&
++			    laddr->valid && laddr2->valid) {
++				exist = true;
++				goto next;
++			}
++		}
++		cnt = 0;
++		break;
++next:
++		cnt++;
++	}
++	rcu_read_unlock();
++
++	return (cnt == cnt2) ? 0 : (exist ? -EEXIST : 1);
++}
++
+ /* Does the address 'addr' conflict with any addresses in
+  * the bp.
+  */
+diff --git a/net/sctp/input.c b/net/sctp/input.c
+index a981dbec88c7..19db91faee3a 100644
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@ -719,43 +719,87 @@ static int sctp_rcv_ootb(struct sk_buff *skb)
+ }
+ 
+ /* Insert endpoint into the hash table.  */
+-static void __sctp_hash_endpoint(struct sctp_endpoint *ep)
++static int __sctp_hash_endpoint(struct sctp_endpoint *ep)
+ {
+-	struct net *net = sock_net(ep->base.sk);
+-	struct sctp_ep_common *epb;
++	struct sock *sk = ep->base.sk;
++	struct net *net = sock_net(sk);
+ 	struct sctp_hashbucket *head;
++	struct sctp_ep_common *epb;
+ 
+ 	epb = &ep->base;
+-
+ 	epb->hashent = sctp_ep_hashfn(net, epb->bind_addr.port);
+ 	head = &sctp_ep_hashtable[epb->hashent];
+ 
++	if (sk->sk_reuseport) {
++		bool any = sctp_is_ep_boundall(sk);
++		struct sctp_ep_common *epb2;
++		struct list_head *list;
++		int cnt = 0, err = 1;
++
++		list_for_each(list, &ep->base.bind_addr.address_list)
++			cnt++;
++
++		sctp_for_each_hentry(epb2, &head->chain) {
++			struct sock *sk2 = epb2->sk;
++
++			if (!net_eq(sock_net(sk2), net) || sk2 == sk ||
++			    !uid_eq(sock_i_uid(sk2), sock_i_uid(sk)) ||
++			    !sk2->sk_reuseport)
++				continue;
++
++			err = sctp_bind_addrs_check(sctp_sk(sk2),
++						    sctp_sk(sk), cnt);
++			if (!err) {
++				err = reuseport_add_sock(sk, sk2, any);
++				if (err)
++					return err;
++				break;
++			} else if (err < 0) {
++				return err;
++			}
++		}
++
++		if (err) {
++			err = reuseport_alloc(sk, any);
++			if (err)
++				return err;
++		}
++	}
++
+ 	write_lock(&head->lock);
+ 	hlist_add_head(&epb->node, &head->chain);
+ 	write_unlock(&head->lock);
++	return 0;
+ }
+ 
+ /* Add an endpoint to the hash. Local BH-safe. */
+-void sctp_hash_endpoint(struct sctp_endpoint *ep)
++int sctp_hash_endpoint(struct sctp_endpoint *ep)
+ {
++	int err;
++
+ 	local_bh_disable();
+-	__sctp_hash_endpoint(ep);
++	err = __sctp_hash_endpoint(ep);
+ 	local_bh_enable();
++
++	return err;
+ }
+ 
+ /* Remove endpoint from the hash table.  */
+ static void __sctp_unhash_endpoint(struct sctp_endpoint *ep)
+ {
+-	struct net *net = sock_net(ep->base.sk);
++	struct sock *sk = ep->base.sk;
+ 	struct sctp_hashbucket *head;
+ 	struct sctp_ep_common *epb;
+ 
+ 	epb = &ep->base;
+ 
+-	epb->hashent = sctp_ep_hashfn(net, epb->bind_addr.port);
++	epb->hashent = sctp_ep_hashfn(sock_net(sk), epb->bind_addr.port);
+ 
+ 	head = &sctp_ep_hashtable[epb->hashent];
+ 
++	if (rcu_access_pointer(sk->sk_reuseport_cb))
++		reuseport_detach_sock(sk);
++
+ 	write_lock(&head->lock);
+ 	hlist_del_init(&epb->node);
+ 	write_unlock(&head->lock);
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 5306003533bf..2ba5ae5f1dc7 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -7835,8 +7835,7 @@ static int sctp_listen_start(struct sock *sk, int backlog)
+ 	}
+ 
+ 	sk->sk_max_ack_backlog = backlog;
+-	sctp_hash_endpoint(ep);
+-	return 0;
++	return sctp_hash_endpoint(ep);
+ }
+ 
+ /*
