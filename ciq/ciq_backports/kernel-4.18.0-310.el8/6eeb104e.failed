@@ -1,0 +1,174 @@
+fs: buffer: use raw page_memcg() on locked page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 6eeb104e114cb6b7391c2d69ff873403858c1f35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/6eeb104e.failed
+
+alloc_page_buffers() currently uses get_mem_cgroup_from_page() for
+charging the buffers to the page owner, which does an rcu-protected
+page->memcg lookup and acquires a reference.  But buffer allocation has
+the page lock held throughout, which pins the page to the memcg and
+thereby the memcg - neither rcu nor holding an extra reference during the
+allocation are necessary.  Use a raw page_memcg() instead.
+
+This was the last user of get_mem_cgroup_from_page(), delete it.
+
+Link: https://lkml.kernel.org/r/20210209190126.97842-1-hannes@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reported-by: Muchun Song <songmuchun@bytedance.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6eeb104e114cb6b7391c2d69ff873403858c1f35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/buffer.c
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+diff --cc fs/buffer.c
+index c60629756aca,0cb7ffd4977c..000000000000
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@@ -821,8 -847,9 +821,14 @@@ struct buffer_head *alloc_page_buffers(
+  	if (retry)
+  		gfp |= __GFP_NOFAIL;
+  
+++<<<<<<< HEAD
+ +	memcg = get_mem_cgroup_from_page(page);
+ +	memalloc_use_memcg(memcg);
+++=======
++ 	/* The page lock pins the memcg */
++ 	memcg = page_memcg(page);
++ 	old_memcg = set_active_memcg(memcg);
+++>>>>>>> 6eeb104e114c (fs: buffer: use raw page_memcg() on locked page)
+  
+  	head = NULL;
+  	offset = PAGE_SIZE;
+@@@ -841,8 -868,7 +847,12 @@@
+  		set_bh_page(bh, page, offset);
+  	}
+  out:
+++<<<<<<< HEAD
+ +	memalloc_unuse_memcg();
+ +	mem_cgroup_put(memcg);
+++=======
++ 	set_active_memcg(old_memcg);
+++>>>>>>> 6eeb104e114c (fs: buffer: use raw page_memcg() on locked page)
+  	return head;
+  /*
+   * In case anything failed, we just free everything we got.
+diff --cc include/linux/memcontrol.h
+index 3926e67f2ee6,e6dc793d587d..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -531,7 -680,18 +531,22 @@@ struct mem_cgroup *mem_cgroup_from_task
+  
+  struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm);
+  
+++<<<<<<< HEAD
+ +struct mem_cgroup *get_mem_cgroup_from_page(struct page *page);
+++=======
++ struct lruvec *lock_page_lruvec(struct page *page);
++ struct lruvec *lock_page_lruvec_irq(struct page *page);
++ struct lruvec *lock_page_lruvec_irqsave(struct page *page,
++ 						unsigned long *flags);
++ 
++ #ifdef CONFIG_DEBUG_VM
++ void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page);
++ #else
++ static inline void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page)
++ {
++ }
++ #endif
+++>>>>>>> 6eeb104e114c (fs: buffer: use raw page_memcg() on locked page)
+  
+  static inline
+  struct mem_cgroup *mem_cgroup_from_css(struct cgroup_subsys_state *css){
+diff --cc mm/memcontrol.c
+index b2ef364998e2,7fdc001ce15f..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -1059,31 -1047,47 +1059,72 @@@ struct mem_cgroup *get_mem_cgroup_from_
+  }
+  EXPORT_SYMBOL(get_mem_cgroup_from_mm);
+  
+++<<<<<<< HEAD
+ +/**
+ + * get_mem_cgroup_from_page: Obtain a reference on given page's memcg.
+ + * @page: page from which memcg should be extracted.
+ + *
+ + * Obtain a reference on page->memcg and returns it if successful. Otherwise
+ + * root_mem_cgroup is returned.
+ + */
+ +struct mem_cgroup *get_mem_cgroup_from_page(struct page *page)
+ +{
+ +	struct mem_cgroup *memcg = page->mem_cgroup;
+ +
+ +	if (mem_cgroup_disabled())
+ +		return NULL;
+ +
+ +	rcu_read_lock();
+ +	/* Page should not get uncharged and freed memcg under us. */
+ +	if (!memcg || WARN_ON_ONCE(!css_tryget(&memcg->css)))
+ +		memcg = root_mem_cgroup;
+ +	rcu_read_unlock();
+ +	return memcg;
+ +}
+ +EXPORT_SYMBOL(get_mem_cgroup_from_page);
+++=======
++ static __always_inline struct mem_cgroup *active_memcg(void)
++ {
++ 	if (in_interrupt())
++ 		return this_cpu_read(int_active_memcg);
++ 	else
++ 		return current->active_memcg;
++ }
++ 
++ static __always_inline struct mem_cgroup *get_active_memcg(void)
++ {
++ 	struct mem_cgroup *memcg;
++ 
++ 	rcu_read_lock();
++ 	memcg = active_memcg();
++ 	if (memcg) {
++ 		/* current->active_memcg must hold a ref. */
++ 		if (WARN_ON_ONCE(!css_tryget(&memcg->css)))
++ 			memcg = root_mem_cgroup;
++ 		else
++ 			memcg = current->active_memcg;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return memcg;
++ }
++ 
++ static __always_inline bool memcg_kmem_bypass(void)
++ {
++ 	/* Allow remote memcg charging from any context. */
++ 	if (unlikely(active_memcg()))
++ 		return false;
++ 
++ 	/* Memcg to charge can't be determined. */
++ 	if (in_interrupt() || !current->mm || (current->flags & PF_KTHREAD))
++ 		return true;
++ 
++ 	return false;
++ }
+++>>>>>>> 6eeb104e114c (fs: buffer: use raw page_memcg() on locked page)
+  
+  /**
+ - * If active memcg is set, do not fallback to current->mm->memcg.
+ + * If current->active_memcg is non-NULL, do not fallback to current->mm->memcg.
+   */
+  static __always_inline struct mem_cgroup *get_mem_cgroup_from_current(void)
+  {
+* Unmerged path fs/buffer.c
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/memcontrol.c
