@@ -1,0 +1,167 @@
+KVM: arm/arm64: Fix unintended stage 2 PMD mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoffer Dall <christoffer.dall@arm.com>
+commit 6794ad5443a2118243e13879f94228524a1a2b92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/6794ad54.failed
+
+There are two things we need to take care of when we create block
+mappings in the stage 2 page tables:
+
+  (1) The alignment within a PMD between the host address range and the
+  guest IPA range must be the same, since otherwise we end up mapping
+  pages with the wrong offset.
+
+  (2) The head and tail of a memory slot may not cover a full block
+  size, and we have to take care to not map those with block
+  descriptors, since we could expose memory to the guest that the host
+  did not intend to expose.
+
+So far, we have been taking care of (1), but not (2), and our commentary
+describing (1) was somewhat confusing.
+
+This commit attempts to factor out the checks of both into a common
+function, and if we don't pass the check, we won't attempt any PMD
+mappings for neither hugetlbfs nor THP.
+
+Note that we used to only check the alignment for THP, not for
+hugetlbfs, but as far as I can tell the check needs to be applied to
+both scenarios.
+
+	Cc: Ralph Palutke <ralph.palutke@fau.de>
+	Cc: Lukas Braun <koomi@moshbit.net>
+	Reported-by: Lukas Braun <koomi@moshbit.net>
+	Signed-off-by: Christoffer Dall <christoffer.dall@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 6794ad5443a2118243e13879f94228524a1a2b92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/arm/mmu.c
+diff --cc virt/kvm/arm/mmu.c
+index 63fd98753163,dee3dbd98712..000000000000
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@@ -1456,22 -1585,73 +1456,79 @@@ static void invalidate_icache_guest_pag
+  static void kvm_send_hwpoison_signal(unsigned long address,
+  				     struct vm_area_struct *vma)
+  {
+ -	short lsb;
+ +	siginfo_t info;
+ +
+ +	clear_siginfo(&info);
+ +	info.si_signo   = SIGBUS;
+ +	info.si_errno   = 0;
+ +	info.si_code    = BUS_MCEERR_AR;
+ +	info.si_addr    = (void __user *)address;
+  
+  	if (is_vm_hugetlb_page(vma))
+ -		lsb = huge_page_shift(hstate_vma(vma));
+ +		info.si_addr_lsb = huge_page_shift(hstate_vma(vma));
+  	else
+ -		lsb = PAGE_SHIFT;
+ +		info.si_addr_lsb = PAGE_SHIFT;
+  
+ -	send_sig_mceerr(BUS_MCEERR_AR, (void __user *)address, lsb, current);
+ +	send_sig_info(SIGBUS, &info, current);
+  }
+  
++ static bool fault_supports_stage2_pmd_mappings(struct kvm_memory_slot *memslot,
++ 					       unsigned long hva)
++ {
++ 	gpa_t gpa_start, gpa_end;
++ 	hva_t uaddr_start, uaddr_end;
++ 	size_t size;
++ 
++ 	size = memslot->npages * PAGE_SIZE;
++ 
++ 	gpa_start = memslot->base_gfn << PAGE_SHIFT;
++ 	gpa_end = gpa_start + size;
++ 
++ 	uaddr_start = memslot->userspace_addr;
++ 	uaddr_end = uaddr_start + size;
++ 
++ 	/*
++ 	 * Pages belonging to memslots that don't have the same alignment
++ 	 * within a PMD for userspace and IPA cannot be mapped with stage-2
++ 	 * PMD entries, because we'll end up mapping the wrong pages.
++ 	 *
++ 	 * Consider a layout like the following:
++ 	 *
++ 	 *    memslot->userspace_addr:
++ 	 *    +-----+--------------------+--------------------+---+
++ 	 *    |abcde|fgh  Stage-1 PMD    |    Stage-1 PMD   tv|xyz|
++ 	 *    +-----+--------------------+--------------------+---+
++ 	 *
++ 	 *    memslot->base_gfn << PAGE_SIZE:
++ 	 *      +---+--------------------+--------------------+-----+
++ 	 *      |abc|def  Stage-2 PMD    |    Stage-2 PMD     |tvxyz|
++ 	 *      +---+--------------------+--------------------+-----+
++ 	 *
++ 	 * If we create those stage-2 PMDs, we'll end up with this incorrect
++ 	 * mapping:
++ 	 *   d -> f
++ 	 *   e -> g
++ 	 *   f -> h
++ 	 */
++ 	if ((gpa_start & ~S2_PMD_MASK) != (uaddr_start & ~S2_PMD_MASK))
++ 		return false;
++ 
++ 	/*
++ 	 * Next, let's make sure we're not trying to map anything not covered
++ 	 * by the memslot. This means we have to prohibit PMD size mappings
++ 	 * for the beginning and end of a non-PMD aligned and non-PMD sized
++ 	 * memory slot (illustrated by the head and tail parts of the
++ 	 * userspace view above containing pages 'abcde' and 'xyz',
++ 	 * respectively).
++ 	 *
++ 	 * Note that it doesn't matter if we do the check using the
++ 	 * userspace_addr or the base_gfn, as both are equally aligned (per
++ 	 * the check above) and equally sized.
++ 	 */
++ 	return (hva & S2_PMD_MASK) >= uaddr_start &&
++ 	       (hva & S2_PMD_MASK) + S2_PMD_SIZE <= uaddr_end;
++ }
++ 
+  static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
+  			  struct kvm_memory_slot *memslot, unsigned long hva,
+  			  unsigned long fault_status)
+@@@ -1506,22 -1693,15 +1569,34 @@@
+  		return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vma_kernel_pagesize(vma) == PMD_SIZE && !logging_active) {
+ +		hugetlb = true;
+ +		gfn = (fault_ipa & PMD_MASK) >> PAGE_SHIFT;
+ +	} else {
+ +		/*
+ +		 * Pages belonging to memslots that don't have the same
+ +		 * alignment for userspace and IPA cannot be mapped using
+ +		 * block descriptors even if the pages belong to a THP for
+ +		 * the process, because the stage-2 block descriptor will
+ +		 * cover more than a single THP and we loose atomicity for
+ +		 * unmapping, updates, and splits of the THP or other pages
+ +		 * in the stage-2 block range.
+ +		 */
+ +		if ((memslot->userspace_addr & ~PMD_MASK) !=
+ +		    ((memslot->base_gfn << PAGE_SHIFT) & ~PMD_MASK))
+ +			force_pte = true;
+++=======
++ 	vma_pagesize = vma_kernel_pagesize(vma);
++ 	/*
++ 	 * PUD level may not exist for a VM but PMD is guaranteed to
++ 	 * exist.
++ 	 */
++ 	if ((vma_pagesize == PMD_SIZE ||
++ 	     (vma_pagesize == PUD_SIZE && kvm_stage2_has_pud(kvm))) &&
++ 	    !force_pte) {
++ 		gfn = (fault_ipa & huge_page_mask(hstate_vma(vma))) >> PAGE_SHIFT;
+++>>>>>>> 6794ad5443a2 (KVM: arm/arm64: Fix unintended stage 2 PMD mappings)
+  	}
+  	up_read(&current->mm->mmap_sem);
+  
+* Unmerged path virt/kvm/arm/mmu.c
