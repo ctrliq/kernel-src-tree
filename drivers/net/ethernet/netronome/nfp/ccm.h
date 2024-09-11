@@ -83,6 +83,8 @@ enum nfp_ccm_mbox_tlv_type {
 
 /**
  * struct nfp_ccm - common control message handling
+ * @app:		APP handle
+ *
  * @tag_allocator:	bitmap of control message tags in use
  * @tag_alloc_next:	next tag bit to allocate
  * @tag_alloc_last:	next tag bit to be freed
