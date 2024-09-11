@@ -1,0 +1,156 @@
+KVM: x86/mmu: Remove spurious TLB flushes in TDP MMU zap collapsible path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 4b85c921cd393764d22c0cdab6d7d5d120aa0980
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4b85c921.failed
+
+Drop the "flush" param and return values to/from the TDP MMU's helper for
+zapping collapsible SPTEs.  Because the helper runs with mmu_lock held
+for read, not write, it uses tdp_mmu_zap_spte_atomic(), and the atomic
+zap handles the necessary remote TLB flush.
+
+Similarly, because mmu_lock is dropped and re-acquired between zapping
+legacy MMUs and zapping TDP MMUs, kvm_mmu_zap_collapsible_sptes() must
+handle remote TLB flushes from the legacy MMU before calling into the TDP
+MMU.
+
+Fixes: e2209710ccc5d ("KVM: x86/mmu: Skip rmap operations if rmaps not allocated")
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20211120045046.3940942-4-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4b85c921cd393764d22c0cdab6d7d5d120aa0980)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index be3dd69fe476,1b3a7cc9d595..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -5796,22 -5846,25 +5796,42 @@@ restart
+  }
+  
+  void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ -				   const struct kvm_memory_slot *slot)
+ +				   const struct kvm_memory_slot *memslot)
+  {
+++<<<<<<< HEAD
+ +	/* FIXME: const-ify all uses of struct kvm_memory_slot.  */
+ +	struct kvm_memory_slot *slot = (struct kvm_memory_slot *)memslot;
+ +	bool flush = false;
+ +
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_leaf(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
+ +
+ +	if (is_tdp_mmu_enabled(kvm))
+ +		flush = kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot, flush);
+ +
+ +	if (flush)
+ +		kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+ +
+ +	write_unlock(&kvm->mmu_lock);
+++=======
++ 	if (kvm_memslots_have_rmaps(kvm)) {
++ 		write_lock(&kvm->mmu_lock);
++ 		/*
++ 		 * Zap only 4k SPTEs since the legacy MMU only supports dirty
++ 		 * logging at a 4k granularity and never creates collapsible
++ 		 * 2m SPTEs during dirty logging.
++ 		 */
++ 		if (slot_handle_level_4k(kvm, slot, kvm_mmu_zap_collapsible_spte, true))
++ 			kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
++ 		write_unlock(&kvm->mmu_lock);
++ 	}
++ 
++ 	if (is_tdp_mmu_enabled(kvm)) {
++ 		read_lock(&kvm->mmu_lock);
++ 		kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot);
++ 		read_unlock(&kvm->mmu_lock);
++ 	}
+++>>>>>>> 4b85c921cd39 (KVM: x86/mmu: Remove spurious TLB flushes in TDP MMU zap collapsible path)
+  }
+  
+  void kvm_arch_flush_remote_tlbs_memslot(struct kvm *kvm,
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 968568d642d2,1db8496259ad..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -1402,10 -1374,9 +1401,14 @@@ static void zap_collapsible_spte_range(
+  	rcu_read_lock();
+  
+  	tdp_root_for_each_pte(iter, root, start, end) {
+++<<<<<<< HEAD
+ +		if (tdp_mmu_iter_cond_resched(kvm, &iter, flush)) {
+ +			flush = false;
+++=======
++ retry:
++ 		if (tdp_mmu_iter_cond_resched(kvm, &iter, false, true))
+++>>>>>>> 4b85c921cd39 (KVM: x86/mmu: Remove spurious TLB flushes in TDP MMU zap collapsible path)
+  			continue;
+- 		}
+  
+  		if (!is_shadow_present_pte(iter.old_spte) ||
+  		    !is_last_spte(iter.old_spte, iter.level))
+@@@ -1417,9 -1388,15 +1420,21 @@@
+  							    pfn, PG_LEVEL_NUM))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte(kvm, &iter, 0);
+ +
+ +		flush = true;
+++=======
++ 		/* Note, a successful atomic zap also does a remote TLB flush. */
++ 		if (!tdp_mmu_zap_spte_atomic(kvm, &iter)) {
++ 			/*
++ 			 * The iter must explicitly re-read the SPTE because
++ 			 * the atomic cmpxchg failed.
++ 			 */
++ 			iter.old_spte = READ_ONCE(*rcu_dereference(iter.sptep));
++ 			goto retry;
++ 		}
+++>>>>>>> 4b85c921cd39 (KVM: x86/mmu: Remove spurious TLB flushes in TDP MMU zap collapsible path)
+  	}
+  
+  	rcu_read_unlock();
+@@@ -1437,10 -1411,10 +1449,17 @@@ void kvm_tdp_mmu_zap_collapsible_sptes(
+  {
+  	struct kvm_mmu_page *root;
+  
+++<<<<<<< HEAD
+ +	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id)
+ +		flush = zap_collapsible_spte_range(kvm, root, slot, flush);
+ +
+ +	return flush;
+++=======
++ 	lockdep_assert_held_read(&kvm->mmu_lock);
++ 
++ 	for_each_tdp_mmu_root_yield_safe(kvm, root, slot->as_id, true)
++ 		zap_collapsible_spte_range(kvm, root, slot);
+++>>>>>>> 4b85c921cd39 (KVM: x86/mmu: Remove spurious TLB flushes in TDP MMU zap collapsible path)
+  }
+  
+  /*
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 4a73a04d420c..56aa0c0d534c 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -69,9 +69,8 @@ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
+ 				       struct kvm_memory_slot *slot,
+ 				       gfn_t gfn, unsigned long mask,
+ 				       bool wrprot);
+-bool kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+-				       const struct kvm_memory_slot *slot,
+-				       bool flush);
++void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
++				       const struct kvm_memory_slot *slot);
+ 
+ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 				   struct kvm_memory_slot *slot, gfn_t gfn,
