@@ -1,0 +1,262 @@
+KVM: x86: Introduce cpuid_entry_{change,set,clear}() mutators
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [x86] kvm: x86: Introduce cpuid_entry_{change, set, clear}() mutators (Vitaly Kuznetsov) [1813987]
+Rebuild_FUZZ: 98.39%
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit b32666b13a72a1fd9f5078d8142bd7325022520f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b32666b1.failed
+
+Introduce mutators to modify feature bits in CPUID entries and use the
+new mutators where applicable.  Using the mutators eliminates the need
+to manually specify the register to modify query at no extra cost and
+will allow adding runtime consistency checks on the function/index in a
+future patch.
+
+No functional change intended.
+
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b32666b13a72a1fd9f5078d8142bd7325022520f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/kvm/svm.c
+index 2c7c88ef7253,9ec7952fecb0..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -6041,21 -6016,29 +6041,25 @@@ static void svm_cpuid_update(struct kvm
+  	if (!kvm_vcpu_apicv_active(vcpu))
+  		return;
+  
+ -	/*
+ -	 * AVIC does not work with an x2APIC mode guest. If the X2APIC feature
+ -	 * is exposed to the guest, disable AVIC.
+ -	 */
+ -	if (guest_cpuid_has(vcpu, X86_FEATURE_X2APIC))
+ -		kvm_request_apicv_update(vcpu->kvm, false,
+ -					 APICV_INHIBIT_REASON_X2APIC);
+ -
+ -	/*
+ -	 * Currently, AVIC does not work with nested virtualization.
+ -	 * So, we disable AVIC when cpuid for SVM is set in the L1 guest.
+ -	 */
+ -	if (nested && guest_cpuid_has(vcpu, X86_FEATURE_SVM))
+ -		kvm_request_apicv_update(vcpu->kvm, false,
+ -					 APICV_INHIBIT_REASON_NESTED);
+ +	guest_cpuid_clear(vcpu, X86_FEATURE_X2APIC);
+  }
+  
+++<<<<<<< HEAD
+ +#define F feature_bit
+ +
+ +static void svm_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry)
+++=======
++ static void svm_set_supported_cpuid(struct kvm_cpuid_entry2 *entry)
+++>>>>>>> b32666b13a72 (KVM: x86: Introduce cpuid_entry_{change,set,clear}() mutators)
+  {
+ -	switch (entry->function) {
+ +	switch (func) {
+ +	case 0x1:
+ +		if (avic)
+ +			entry->ecx &= ~F(X2APIC);
+ +		break;
+  	case 0x80000001:
+  		if (nested)
+- 			entry->ecx |= (1 << 2); /* Set SVM bit */
++ 			cpuid_entry_set(entry, X86_FEATURE_SVM);
+  		break;
+  	case 0x80000008:
+  		if (boot_cpu_has(X86_FEATURE_LS_CFG_SSBD) ||
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index d4472786ed92..feda27b23b2a 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -77,15 +77,12 @@ int kvm_update_cpuid(struct kvm_vcpu *vcpu)
+ 		return 0;
+ 
+ 	/* Update OSXSAVE bit */
+-	if (boot_cpu_has(X86_FEATURE_XSAVE) && best->function == 0x1) {
+-		best->ecx &= ~F(OSXSAVE);
+-		if (kvm_read_cr4_bits(vcpu, X86_CR4_OSXSAVE))
+-			best->ecx |= F(OSXSAVE);
+-	}
++	if (boot_cpu_has(X86_FEATURE_XSAVE) && best->function == 0x1)
++		cpuid_entry_change(best, X86_FEATURE_OSXSAVE,
++				   kvm_read_cr4_bits(vcpu, X86_CR4_OSXSAVE));
+ 
+-	best->edx &= ~F(APIC);
+-	if (vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE)
+-		best->edx |= F(APIC);
++	cpuid_entry_change(best, X86_FEATURE_APIC,
++			   vcpu->arch.apic_base & MSR_IA32_APICBASE_ENABLE);
+ 
+ 	if (apic) {
+ 		if (cpuid_entry_has(best, X86_FEATURE_TSC_DEADLINE_TIMER))
+@@ -95,14 +92,9 @@ int kvm_update_cpuid(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+-	if (best) {
+-		/* Update OSPKE bit */
+-		if (boot_cpu_has(X86_FEATURE_PKU) && best->function == 0x7) {
+-			best->ecx &= ~F(OSPKE);
+-			if (kvm_read_cr4_bits(vcpu, X86_CR4_PKE))
+-				best->ecx |= F(OSPKE);
+-		}
+-	}
++	if (best && boot_cpu_has(X86_FEATURE_PKU) && best->function == 0x7)
++		cpuid_entry_change(best, X86_FEATURE_OSPKE,
++				   kvm_read_cr4_bits(vcpu, X86_CR4_PKE));
+ 
+ 	best = kvm_find_cpuid_entry(vcpu, 0xD, 0);
+ 	if (!best) {
+@@ -140,12 +132,10 @@ int kvm_update_cpuid(struct kvm_vcpu *vcpu)
+ 
+ 	if (!kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_MISC_ENABLE_NO_MWAIT)) {
+ 		best = kvm_find_cpuid_entry(vcpu, 0x1, 0);
+-		if (best) {
+-			if (vcpu->arch.ia32_misc_enable_msr & MSR_IA32_MISC_ENABLE_MWAIT)
+-				best->ecx |= F(MWAIT);
+-			else
+-				best->ecx &= ~F(MWAIT);
+-		}
++		if (best)
++			cpuid_entry_change(best, X86_FEATURE_MWAIT,
++					   vcpu->arch.ia32_misc_enable_msr &
++					   MSR_IA32_MISC_ENABLE_MWAIT);
+ 	}
+ 
+ 	/* Update physical-address width */
+@@ -178,7 +168,7 @@ static void cpuid_fix_nx_cap(struct kvm_vcpu *vcpu)
+ 		}
+ 	}
+ 	if (entry && cpuid_entry_has(entry, X86_FEATURE_NX) && !is_efer_nx()) {
+-		entry->edx &= ~F(NX);
++		cpuid_entry_clear(entry, X86_FEATURE_NX);
+ 		printk(KERN_INFO "kvm: guest NX capability removed\n");
+ 	}
+ }
+@@ -406,7 +396,7 @@ static inline void do_cpuid_7_mask(struct kvm_cpuid_entry2 *entry)
+ 		entry->ebx &= kvm_cpuid_7_0_ebx_x86_features;
+ 		cpuid_mask(&entry->ebx, CPUID_7_0_EBX);
+ 		/* TSC_ADJUST is emulated */
+-		entry->ebx |= F(TSC_ADJUST);
++		cpuid_entry_set(entry, X86_FEATURE_TSC_ADJUST);
+ 
+ 		entry->ecx &= kvm_cpuid_7_0_ecx_x86_features;
+ 		f_la57 = cpuid_entry_get(entry, X86_FEATURE_LA57);
+@@ -417,21 +407,21 @@ static inline void do_cpuid_7_mask(struct kvm_cpuid_entry2 *entry)
+ 		entry->ecx |= f_pku;
+ 		/* PKU is not yet implemented for shadow paging. */
+ 		if (!tdp_enabled || !boot_cpu_has(X86_FEATURE_OSPKE))
+-			entry->ecx &= ~F(PKU);
++			cpuid_entry_clear(entry, X86_FEATURE_PKU);
+ 
+ 		entry->edx &= kvm_cpuid_7_0_edx_x86_features;
+ 		cpuid_mask(&entry->edx, CPUID_7_EDX);
+ 		if (boot_cpu_has(X86_FEATURE_IBPB) && boot_cpu_has(X86_FEATURE_IBRS))
+-			entry->edx |= F(SPEC_CTRL);
++			cpuid_entry_set(entry, X86_FEATURE_SPEC_CTRL);
+ 		if (boot_cpu_has(X86_FEATURE_STIBP))
+-			entry->edx |= F(INTEL_STIBP);
++			cpuid_entry_set(entry, X86_FEATURE_INTEL_STIBP);
+ 		if (boot_cpu_has(X86_FEATURE_AMD_SSBD))
+-			entry->edx |= F(SPEC_CTRL_SSBD);
++			cpuid_entry_set(entry, X86_FEATURE_SPEC_CTRL_SSBD);
+ 		/*
+ 		 * We emulate ARCH_CAPABILITIES in software even
+ 		 * if the host doesn't support it.
+ 		 */
+-		entry->edx |= F(ARCH_CAPABILITIES);
++		cpuid_entry_set(entry, X86_FEATURE_ARCH_CAPABILITIES);
+ 		break;
+ 	case 1:
+ 		entry->eax &= kvm_cpuid_7_1_eax_x86_features;
+@@ -543,7 +533,7 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		cpuid_mask(&entry->ecx, CPUID_1_ECX);
+ 		/* we support x2apic emulation even if host does not support
+ 		 * it since we emulate x2apic in software */
+-		entry->ecx |= F(X2APIC);
++		cpuid_entry_set(entry, X86_FEATURE_X2APIC);
+ 		break;
+ 	/* function 2 entries are STATEFUL. That is, repeated cpuid commands
+ 	 * may return different values. This forces us to get_cpu() before
+@@ -761,22 +751,22 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		 * record that in cpufeatures so use them.
+ 		 */
+ 		if (boot_cpu_has(X86_FEATURE_IBPB))
+-			entry->ebx |= F(AMD_IBPB);
++			cpuid_entry_set(entry, X86_FEATURE_AMD_IBPB);
+ 		if (boot_cpu_has(X86_FEATURE_IBRS))
+-			entry->ebx |= F(AMD_IBRS);
++			cpuid_entry_set(entry, X86_FEATURE_AMD_IBRS);
+ 		if (boot_cpu_has(X86_FEATURE_STIBP))
+-			entry->ebx |= F(AMD_STIBP);
++			cpuid_entry_set(entry, X86_FEATURE_AMD_STIBP);
+ 		if (boot_cpu_has(X86_FEATURE_SPEC_CTRL_SSBD))
+-			entry->ebx |= F(AMD_SSBD);
++			cpuid_entry_set(entry, X86_FEATURE_AMD_SSBD);
+ 		if (!boot_cpu_has_bug(X86_BUG_SPEC_STORE_BYPASS))
+-			entry->ebx |= F(AMD_SSB_NO);
++			cpuid_entry_set(entry, X86_FEATURE_AMD_SSB_NO);
+ 		/*
+ 		 * The preference is to use SPEC CTRL MSR instead of the
+ 		 * VIRT_SPEC MSR.
+ 		 */
+ 		if (boot_cpu_has(X86_FEATURE_LS_CFG_SSBD) &&
+ 		    !boot_cpu_has(X86_FEATURE_AMD_SSBD))
+-			entry->ebx |= F(VIRT_SSBD);
++			cpuid_entry_set(entry, X86_FEATURE_VIRT_SSBD);
+ 		break;
+ 	}
+ 	case 0x80000019:
+diff --git a/arch/x86/kvm/cpuid.h b/arch/x86/kvm/cpuid.h
+index a2335b92a9a0..71c3509afafd 100644
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -136,6 +136,38 @@ static __always_inline bool cpuid_entry_has(struct kvm_cpuid_entry2 *entry,
+ 	return cpuid_entry_get(entry, x86_feature);
+ }
+ 
++static __always_inline void cpuid_entry_clear(struct kvm_cpuid_entry2 *entry,
++					      unsigned int x86_feature)
++{
++	u32 *reg = cpuid_entry_get_reg(entry, x86_feature);
++
++	*reg &= ~__feature_bit(x86_feature);
++}
++
++static __always_inline void cpuid_entry_set(struct kvm_cpuid_entry2 *entry,
++					    unsigned int x86_feature)
++{
++	u32 *reg = cpuid_entry_get_reg(entry, x86_feature);
++
++	*reg |= __feature_bit(x86_feature);
++}
++
++static __always_inline void cpuid_entry_change(struct kvm_cpuid_entry2 *entry,
++					       unsigned int x86_feature,
++					       bool set)
++{
++	u32 *reg = cpuid_entry_get_reg(entry, x86_feature);
++
++	/*
++	 * Open coded instead of using cpuid_entry_{clear,set}() to coerce the
++	 * compiler into using CMOV instead of Jcc when possible.
++	 */
++	if (set)
++		*reg |= __feature_bit(x86_feature);
++	else
++		*reg &= ~__feature_bit(x86_feature);
++}
++
+ static __always_inline u32 *guest_cpuid_get_register(struct kvm_vcpu *vcpu,
+ 						     unsigned int x86_feature)
+ {
+* Unmerged path arch/x86/kvm/svm.c
