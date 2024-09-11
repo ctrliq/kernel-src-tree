@@ -1,0 +1,127 @@
+libbpf: Support safe subset of load/store instruction resizing with CO-RE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit a66345bcbdf0c5070479c26103f7cb33da9e4969
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/a66345bc.failed
+
+Add support for patching instructions of the following form:
+  - rX = *(T *)(rY + <off>);
+  - *(T *)(rX + <off>) = rY;
+  - *(T *)(rX + <off>) = <imm>, where T is one of {u8, u16, u32, u64}.
+
+For such instructions, if the actual kernel field recorded in CO-RE relocation
+has a different size than the one recorded locally (e.g., from vmlinux.h),
+then libbpf will adjust T to an appropriate 1-, 2-, 4-, or 8-byte loads.
+
+In general, such transformation is not always correct and could lead to
+invalid final value being loaded or stored. But two classes of cases are
+always safe:
+  - if both local and target (kernel) types are unsigned integers, but of
+  different sizes, then it's OK to adjust load/store instruction according to
+  the necessary memory size. Zero-extending nature of such instructions and
+  unsignedness make sure that the final value is always correct;
+  - pointer size mismatch between BPF target architecture (which is always
+  64-bit) and 32-bit host kernel architecture can be similarly resolved
+  automatically, because pointer is essentially an unsigned integer. Loading
+  32-bit pointer into 64-bit BPF register with zero extension will leave
+  correct pointer in the register.
+
+Both cases are necessary to support CO-RE on 32-bit kernels, as `unsigned
+long` in vmlinux.h generated from 32-bit kernel is 32-bit, but when compiled
+with BPF program for BPF target it will be treated by compiler as 64-bit
+integer. Similarly, pointers in vmlinux.h are 32-bit for kernel, but treated
+as 64-bit values by compiler for BPF target. Both problems are now resolved by
+libbpf for direct memory reads.
+
+But similar transformations are useful in general when kernel fields are
+"resized" from, e.g., unsigned int to unsigned long (or vice versa).
+
+Now, similar transformations for signed integers are not safe to perform as
+they will result in incorrect sign extension of the value. If such situation
+is detected, libbpf will emit helpful message and will poison the instruction.
+Not failing immediately means that it's possible to guard the instruction
+based on kernel version (or other conditions) and make sure it's not
+reachable.
+
+If there is a need to read signed integers that change sizes between different
+kernels, it's possible to use BPF_CORE_READ_BITFIELD() macro, which works both
+with bitfields and non-bitfield integers of any signedness and handles
+sign-extension properly. Also, bpf_core_read() with proper size and/or use of
+bpf_core_field_size() relocation could allow to deal with such complicated
+situations explicitly, if not so conventiently as direct memory reads.
+
+Selftests added in a separate patch in progs/test_core_autosize.c demonstrate
+both direct memory and probed use cases.
+
+BPF_CORE_READ() is not changed and it won't deal with such situations as
+automatically as direct memory reads due to the signedness integer
+limitations, which are much harder to detect and control with compiler macro
+magic. So it's encouraged to utilize direct memory reads as much as possible.
+
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201008001025.292064-3-andrii@kernel.org
+(cherry picked from commit a66345bcbdf0c5070479c26103f7cb33da9e4969)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 6b3d1475cbfd,032cf0049ddb..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -5136,15 -5465,42 +5235,48 @@@ poison
+  		}
+  		if (new_val > SHRT_MAX) {
+  			pr_warn("prog '%s': relo #%d: insn #%d (LDX/ST/STX) value too big: %u\n",
+ -				prog->name, relo_idx, insn_idx, new_val);
+ +				bpf_program__title(prog, false), relo_idx,
+ +				insn_idx, new_val);
+  			return -ERANGE;
+  		}
++ 		if (res->fail_memsz_adjust) {
++ 			pr_warn("prog '%s': relo #%d: insn #%d (LDX/ST/STX) accesses field incorrectly. "
++ 				"Make sure you are accessing pointers, unsigned integers, or fields of matching type and size.\n",
++ 				prog->name, relo_idx, insn_idx);
++ 			goto poison;
++ 		}
++ 
+  		orig_val = insn->off;
+  		insn->off = new_val;
+  		pr_debug("prog '%s': relo #%d: patched insn #%d (LDX/ST/STX) off %u -> %u\n",
+++<<<<<<< HEAD
+ +			 bpf_program__title(prog, false), relo_idx, insn_idx,
+ +			 orig_val, new_val);
+++=======
++ 			 prog->name, relo_idx, insn_idx, orig_val, new_val);
++ 
++ 		if (res->new_sz != res->orig_sz) {
++ 			int insn_bytes_sz, insn_bpf_sz;
++ 
++ 			insn_bytes_sz = insn_bpf_size_to_bytes(insn);
++ 			if (insn_bytes_sz != res->orig_sz) {
++ 				pr_warn("prog '%s': relo #%d: insn #%d (LDX/ST/STX) unexpected mem size: got %d, exp %u\n",
++ 					prog->name, relo_idx, insn_idx, insn_bytes_sz, res->orig_sz);
++ 				return -EINVAL;
++ 			}
++ 
++ 			insn_bpf_sz = insn_bytes_to_bpf_size(res->new_sz);
++ 			if (insn_bpf_sz < 0) {
++ 				pr_warn("prog '%s': relo #%d: insn #%d (LDX/ST/STX) invalid new mem size: %u\n",
++ 					prog->name, relo_idx, insn_idx, res->new_sz);
++ 				return -EINVAL;
++ 			}
++ 
++ 			insn->code = BPF_MODE(insn->code) | insn_bpf_sz | BPF_CLASS(insn->code);
++ 			pr_debug("prog '%s': relo #%d: patched insn #%d (LDX/ST/STX) mem_sz %u -> %u\n",
++ 				 prog->name, relo_idx, insn_idx, res->orig_sz, res->new_sz);
++ 		}
+++>>>>>>> a66345bcbdf0 (libbpf: Support safe subset of load/store instruction resizing with CO-RE)
+  		break;
+  	case BPF_LD: {
+  		__u64 imm;
+* Unmerged path tools/lib/bpf/libbpf.c
