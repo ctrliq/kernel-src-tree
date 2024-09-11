@@ -1,0 +1,315 @@
+Revert "mm, mmu_notifier: annotate mmu notifiers with blockable invalidate callbacks"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Michal Hocko <mhocko@suse.com>
+commit 4e15a073a168b62311db911a55c4d4f1500c2821
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4e15a073.failed
+
+Revert 5ff7091f5a2ca ("mm, mmu_notifier: annotate mmu notifiers with
+blockable invalidate callbacks").
+
+MMU_INVALIDATE_DOES_NOT_BLOCK flags was the only one used and it is no
+longer needed since 93065ac753e4 ("mm, oom: distinguish blockable mode for
+mmu notifiers").  We now have a full support for per range !blocking
+behavior so we can drop the stop gap workaround which the per notifier
+flag was used for.
+
+Link: http://lkml.kernel.org/r/20180827112623.8992-4-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4e15a073a168b62311db911a55c4d4f1500c2821)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-svm.c
+#	include/linux/mmu_notifier.h
+#	mm/mmu_notifier.c
+#	virt/kvm/kvm_main.c
+diff --cc include/linux/mmu_notifier.h
+index d924803cea7c,9893a6432adf..000000000000
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@@ -5,56 -5,12 +5,59 @@@
+  #include <linux/list.h>
+  #include <linux/spinlock.h>
+  #include <linux/mm_types.h>
+ +#include <linux/mmap_lock.h>
+  #include <linux/srcu.h>
+ +#include <linux/interval_tree.h>
+ +#include <linux/rh_kabi.h>
+  
+  struct mmu_notifier;
+ +struct mmu_notifier_range;
+  struct mmu_notifier_ops;
+  
+++<<<<<<< HEAD
+ +/* mmu_notifier_ops flags */
+ +#define MMU_INVALIDATE_DOES_NOT_BLOCK	(0x01)
+ +
+ +/**
+ + * enum mmu_notifier_event - reason for the mmu notifier callback
+ + * @MMU_NOTIFY_UNMAP: either munmap() that unmap the range or a mremap() that
+ + * move the range
+ + *
+ + * @MMU_NOTIFY_CLEAR: clear page table entry (many reasons for this like
+ + * madvise() or replacing a page by another one, ...).
+ + *
+ + * @MMU_NOTIFY_PROTECTION_VMA: update is due to protection change for the range
+ + * ie using the vma access permission (vm_page_prot) to update the whole range
+ + * is enough no need to inspect changes to the CPU page table (mprotect()
+ + * syscall)
+ + *
+ + * @MMU_NOTIFY_PROTECTION_PAGE: update is due to change in read/write flag for
+ + * pages in the range so to mirror those changes the user must inspect the CPU
+ + * page table (from the end callback).
+ + *
+ + * @MMU_NOTIFY_SOFT_DIRTY: soft dirty accounting (still same page and same
+ + * access flags). User should soft dirty the page in the end callback to make
+ + * sure that anyone relying on soft dirtyness catch pages that might be written
+ + * through non CPU mappings.
+ + *
+ + * @MMU_NOTIFY_RELEASE: used during mmu_interval_notifier invalidate to signal
+ + * that the mm refcount is zero and the range is no longer accessible.
+ + */
+ +enum mmu_notifier_event {
+ +	MMU_NOTIFY_UNMAP = 0,
+ +	MMU_NOTIFY_CLEAR,
+ +	MMU_NOTIFY_PROTECTION_VMA,
+ +	MMU_NOTIFY_PROTECTION_PAGE,
+ +	MMU_NOTIFY_SOFT_DIRTY,
+ +	MMU_NOTIFY_RELEASE,
+ +};
+ +
+ +#ifdef CONFIG_LOCKDEP
+ +extern struct lockdep_map __mmu_notifier_invalidate_range_start_map;
+ +#endif
+++=======
++ #ifdef CONFIG_MMU_NOTIFIER
+++>>>>>>> 4e15a073a168 (Revert "mm, mmu_notifier: annotate mmu notifiers with blockable invalidate callbacks")
+  
+  /*
+   * The mmu notifier_mm structure is allocated and installed in
+@@@ -62,31 -18,14 +65,22 @@@
+   * critical section and it's released only when mm_count reaches zero
+   * in mmdrop().
+   */
+ +#ifdef __GENKSYMS__
+  struct mmu_notifier_mm {
+ -	/* all mmu notifiers registerd in this mm are queued in this list */
+ +	/* all mmu notifiers registered in this mm are queued in this list */
+  	struct hlist_head list;
+ -	/* to serialize the list modifications and hlist_unhashed */
+  	spinlock_t lock;
+  };
+ +#else
+ +struct mmu_notifier_mm;
+ +#endif
+ +struct mmu_interval_notifier;
+ +/* mmu_notifier_ops flags */
+ +#define MMU_INVALIDATE_DOES_NOT_BLOCK	(0x01)
+ +
+ +#define MMU_NOTIFIER_RANGE_BLOCKABLE (1 << 0)
+  
+  struct mmu_notifier_ops {
+- 	/*
+- 	 * Flags to specify behavior of callbacks for this MMU notifier.
+- 	 * Used to determine which context an operation may be called.
+- 	 *
+- 	 * MMU_INVALIDATE_DOES_NOT_BLOCK: invalidate_range_* callbacks do not
+- 	 *	block
+- 	 */
+- 	int flags;
+- 
+  	/*
+  	 * Called either by mmu_notifier_unregister or when the mm is
+  	 * being destroyed by exit_mmap, always before all pages are
+@@@ -425,14 -224,7 +415,13 @@@ extern void __mmu_notifier_invalidate_r
+  				  bool only_end);
+  extern void __mmu_notifier_invalidate_range(struct mm_struct *mm,
+  				  unsigned long start, unsigned long end);
+- extern bool mm_has_blockable_invalidate_notifiers(struct mm_struct *mm);
+  
+ +static inline bool
+ +mmu_notifier_range_blockable(const struct mmu_notifier_range *range)
+ +{
+ +	return range->blockable;
+ +}
+ +
+  static inline void mmu_notifier_release(struct mm_struct *mm)
+  {
+  	if (mm_has_notifiers(mm))
+diff --cc mm/mmu_notifier.c
+index 4361d699fa34,5119ff846769..000000000000
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@@ -533,83 -247,34 +533,89 @@@ void __mmu_notifier_invalidate_range(st
+  }
+  EXPORT_SYMBOL_GPL(__mmu_notifier_invalidate_range);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Must be called while holding mm->mmap_sem for either read or write.
+ + * The result is guaranteed to be valid until mm->mmap_sem is dropped.
+ + */
+ +bool mm_has_blockable_invalidate_notifiers(struct mm_struct *mm)
+ +{
+ +	struct mmu_notifier *mn;
+ +	int id;
+ +	bool ret = false;
+ +
+ +	WARN_ON_ONCE(!rwsem_is_locked(&mm->mmap_sem));
+ +
+ +	if (!mm_has_notifiers(mm))
+ +		return ret;
+ +
+ +	id = srcu_read_lock(&srcu);
+ +	hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list, hlist) {
+ +		if (!mn->ops->invalidate_range &&
+ +		    !mn->ops->invalidate_range_start &&
+ +		    !mn->ops->invalidate_range_end)
+ +				continue;
+ +
+ +		if (!(mn->ops->flags & MMU_INVALIDATE_DOES_NOT_BLOCK)) {
+ +			ret = true;
+ +			break;
+ +		}
+ +	}
+ +	srcu_read_unlock(&srcu, id);
+ +	return ret;
+ +}
+ +
+ +/*
+ + * Same as mmu_notifier_register but here the caller must hold the mmap_lock in
+ + * write mode. A NULL mn signals the notifier is being registered for itree
+ + * mode.
+ + */
+ +int __mmu_notifier_register(struct mmu_notifier *mn, struct mm_struct *mm)
+++=======
++ static int do_mmu_notifier_register(struct mmu_notifier *mn,
++ 				    struct mm_struct *mm,
++ 				    int take_mmap_sem)
+++>>>>>>> 4e15a073a168 (Revert "mm, mmu_notifier: annotate mmu notifiers with blockable invalidate callbacks")
+  {
+ -	struct mmu_notifier_mm *mmu_notifier_mm;
+ +	struct mmu_notifier_mm *mmu_notifier_mm = NULL;
+  	int ret;
+  
+ +	mmap_assert_write_locked(mm);
+  	BUG_ON(atomic_read(&mm->mm_users) <= 0);
+  
+ -	ret = -ENOMEM;
+ -	mmu_notifier_mm = kmalloc(sizeof(struct mmu_notifier_mm), GFP_KERNEL);
+ -	if (unlikely(!mmu_notifier_mm))
+ -		goto out;
+ +	if (mn) {
+ +		mn->_rh = kmalloc(sizeof(*mn->_rh), GFP_KERNEL);
+ +		if (!mn->_rh) {
+ +			return -ENOMEM;
+ +		}
+ +		mn->_rh->back_ptr = mn;
+ +		RH_KABI_AUX_SET_SIZE(mn, mmu_notifier);
+ +	}
+  
+ -	if (take_mmap_sem)
+ -		down_write(&mm->mmap_sem);
+ -	ret = mm_take_all_locks(mm);
+ -	if (unlikely(ret))
+ -		goto out_clean;
+ +	if (!mm->mmu_notifier_mm) {
+ +		/*
+ +		 * kmalloc cannot be called under mm_take_all_locks(), but we
+ +		 * know that mm->mmu_notifier_mm can't change while we hold
+ +		 * the write side of the mmap_sem.
+ +		 */
+ +		mmu_notifier_mm =
+ +			kzalloc(sizeof(struct mmu_notifier_mm), GFP_KERNEL);
+ +		if (!mmu_notifier_mm) {
+ +			ret = -ENOMEM;
+ +			goto out_free_rh;
+ +		}
+  
+ -	if (!mm_has_notifiers(mm)) {
+  		INIT_HLIST_HEAD(&mmu_notifier_mm->list);
+  		spin_lock_init(&mmu_notifier_mm->lock);
+ -
+ -		mm->mmu_notifier_mm = mmu_notifier_mm;
+ -		mmu_notifier_mm = NULL;
+ +		mmu_notifier_mm->invalidate_seq = 2;
+ +		mmu_notifier_mm->itree = RB_ROOT_CACHED;
+ +		init_waitqueue_head(&mmu_notifier_mm->wq);
+ +		INIT_HLIST_HEAD(&mmu_notifier_mm->deferred_list);
+  	}
+ -	mmgrab(mm);
+ +
+ +	ret = mm_take_all_locks(mm);
+ +	if (unlikely(ret))
+ +		goto out_clean;
+  
+  	/*
+  	 * Serialize the update against mmu_notifier_unregister. A
+diff --cc virt/kvm/kvm_main.c
+index 5bc5158b0adb,2679e476b6c3..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -625,8 -497,6 +625,11 @@@ static void kvm_mmu_notifier_release(st
+  }
+  
+  static const struct mmu_notifier_ops kvm_mmu_notifier_ops = {
+++<<<<<<< HEAD
+ +	.flags			= MMU_INVALIDATE_DOES_NOT_BLOCK,
+ +	.invalidate_range	= kvm_mmu_notifier_invalidate_range,
+++=======
+++>>>>>>> 4e15a073a168 (Revert "mm, mmu_notifier: annotate mmu notifiers with blockable invalidate callbacks")
+  	.invalidate_range_start	= kvm_mmu_notifier_invalidate_range_start,
+  	.invalidate_range_end	= kvm_mmu_notifier_invalidate_range_end,
+  	.clear_flush_young	= kvm_mmu_notifier_clear_flush_young,
+* Unmerged path drivers/iommu/intel-svm.c
+diff --git a/drivers/infiniband/hw/hfi1/mmu_rb.c b/drivers/infiniband/hw/hfi1/mmu_rb.c
+index 268aec04d3d4..e619be29ecd9 100644
+--- a/drivers/infiniband/hw/hfi1/mmu_rb.c
++++ b/drivers/infiniband/hw/hfi1/mmu_rb.c
+@@ -66,7 +66,6 @@ static void do_remove(struct mmu_rb_handler *handler,
+ static void handle_remove(struct work_struct *work);
+ 
+ static const struct mmu_notifier_ops mn_opts = {
+-	.flags = MMU_INVALIDATE_DOES_NOT_BLOCK,
+ 	.invalidate_range_start = mmu_notifier_range_start,
+ };
+ 
+diff --git a/drivers/iommu/amd/iommu_v2.c b/drivers/iommu/amd/iommu_v2.c
+index c3488536dbba..803094b2f7d5 100644
+--- a/drivers/iommu/amd/iommu_v2.c
++++ b/drivers/iommu/amd/iommu_v2.c
+@@ -405,7 +405,6 @@ static void mn_release(struct mmu_notifier *mn, struct mm_struct *mm)
+ }
+ 
+ static const struct mmu_notifier_ops iommu_mn = {
+-	.flags			= MMU_INVALIDATE_DOES_NOT_BLOCK,
+ 	.release		= mn_release,
+ 	.invalidate_range       = mn_invalidate_range,
+ };
+* Unmerged path drivers/iommu/intel-svm.c
+diff --git a/drivers/misc/sgi-gru/grutlbpurge.c b/drivers/misc/sgi-gru/grutlbpurge.c
+index efb7c0a71ee6..86d70307cc72 100644
+--- a/drivers/misc/sgi-gru/grutlbpurge.c
++++ b/drivers/misc/sgi-gru/grutlbpurge.c
+@@ -268,7 +268,6 @@ static void gru_free_notifier(struct mmu_notifier *mn)
+ }
+ 
+ static const struct mmu_notifier_ops gru_mmuops = {
+-	.flags			= MMU_INVALIDATE_DOES_NOT_BLOCK,
+ 	.invalidate_range_start	= gru_invalidate_range_start,
+ 	.invalidate_range_end	= gru_invalidate_range_end,
+ 	.alloc_notifier		= gru_alloc_notifier,
+* Unmerged path include/linux/mmu_notifier.h
+* Unmerged path mm/mmu_notifier.c
+* Unmerged path virt/kvm/kvm_main.c
