@@ -1,0 +1,147 @@
+net: ena: introduce XDP redirect implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Shay Agroskin <shayagr@amazon.com>
+commit a318c70ad152b24f92870dfe5d93b7675498c68f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/a318c70a.failed
+
+This patch adds a partial support for the XDP_REDIRECT directive which
+instructs the driver to pass the packet to an interface specified by the
+program. The directive is passed to the driver by calling bpf_redirect()
+or bpf_redirect_map() functions from the eBPF program.
+
+To lay the ground for integration with the existing XDP TX
+implementation the patch removes the redundant page ref count increase
+in ena_xdp_xmit_frame() and then decrease in ena_clean_rx_irq(). Instead
+it only DMA unmaps descriptors for which XDP TX or REDIRECT directive
+was received.
+
+The XDP Redirect support is still missing .ndo_xdp_xmit function
+implementation, which allows to redirect packet to an ENA interface,
+which would be added in a later patch.
+
+	Signed-off-by: Shay Agroskin <shayagr@amazon.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit a318c70ad152b24f92870dfe5d93b7675498c68f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amazon/ena/ena_netdev.c
+diff --cc drivers/net/ethernet/amazon/ena/ena_netdev.c
+index a34982bbddb7,d47814b16834..000000000000
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@@ -295,10 -299,9 +295,14 @@@ static int ena_xdp_xmit_buff(struct net
+  	req_id = xdp_ring->free_ids[next_to_use];
+  	tx_info = &xdp_ring->tx_buffer_info[req_id];
+  	tx_info->num_of_bufs = 0;
+++<<<<<<< HEAD
+ +	page_ref_inc(rx_info->page);
+ +	tx_info->xdp_rx_page = rx_info->page;
+++=======
++ 	tx_info->xdp_rx_page = virt_to_page(xdpf->data);
+++>>>>>>> a318c70ad152 (net: ena: introduce XDP redirect implementation)
+  
+ -	rc = ena_xdp_tx_map_frame(xdp_ring, tx_info, xdpf, &push_hdr, &push_len);
+ +	rc = ena_xdp_tx_map_buff(xdp_ring, tx_info, xdp, &push_hdr, &push_len);
+  	if (unlikely(rc))
+  		goto error_drop_packet;
+  
+@@@ -350,21 -350,36 +354,47 @@@ static int ena_xdp_execute(struct ena_r
+  
+  	verdict = bpf_prog_run_xdp(xdp_prog, xdp);
+  
+++<<<<<<< HEAD
+ +	if (verdict == XDP_TX) {
+ +		ena_xdp_xmit_buff(rx_ring->netdev,
+ +				  xdp,
+ +				  rx_ring->qid + rx_ring->adapter->num_io_queues,
+ +				  rx_info);
+ +
+ +		xdp_stat = &rx_ring->rx_stats.xdp_tx;
+ +	} else if (unlikely(verdict == XDP_ABORTED)) {
+++=======
++ 	switch (verdict) {
++ 	case XDP_TX:
++ 		xdpf = xdp_convert_buff_to_frame(xdp);
++ 		if (unlikely(!xdpf)) {
++ 			trace_xdp_exception(rx_ring->netdev, xdp_prog, verdict);
++ 			xdp_stat = &rx_ring->rx_stats.xdp_aborted;
++ 			break;
++ 		}
++ 
++ 		ena_xdp_xmit_frame(rx_ring->netdev, xdpf,
++ 				   rx_ring->qid + rx_ring->adapter->num_io_queues);
++ 		xdp_stat = &rx_ring->rx_stats.xdp_tx;
++ 		break;
++ 	case XDP_REDIRECT:
++ 		if (likely(!xdp_do_redirect(rx_ring->netdev, xdp, xdp_prog))) {
++ 			xdp_stat = &rx_ring->rx_stats.xdp_redirect;
++ 			break;
++ 		}
++ 		fallthrough;
++ 	case XDP_ABORTED:
+++>>>>>>> a318c70ad152 (net: ena: introduce XDP redirect implementation)
+  		trace_xdp_exception(rx_ring->netdev, xdp_prog, verdict);
+  		xdp_stat = &rx_ring->rx_stats.xdp_aborted;
+- 	} else if (unlikely(verdict == XDP_DROP)) {
++ 		break;
++ 	case XDP_DROP:
+  		xdp_stat = &rx_ring->rx_stats.xdp_drop;
+- 	} else if (unlikely(verdict == XDP_PASS)) {
++ 		break;
++ 	case XDP_PASS:
+  		xdp_stat = &rx_ring->rx_stats.xdp_pass;
+- 	} else {
++ 		break;
++ 	default:
+  		bpf_warn_invalid_xdp_action(verdict);
+  		xdp_stat = &rx_ring->rx_stats.xdp_invalid;
+  	}
+@@@ -1608,12 -1616,10 +1644,16 @@@ static int ena_clean_rx_irq(struct ena_
+  					 &next_to_clean);
+  
+  		if (unlikely(!skb)) {
+++<<<<<<< HEAD
+ +			if (xdp_verdict == XDP_TX)
+ +				ena_free_rx_page(rx_ring,
+ +						 &rx_ring->rx_buffer_info[rx_ring->ena_bufs[0].req_id]);
+++=======
+++>>>>>>> a318c70ad152 (net: ena: introduce XDP redirect implementation)
+  			for (i = 0; i < ena_rx_ctx.descs; i++) {
+- 				rx_ring->free_ids[next_to_clean] =
+- 					rx_ring->ena_bufs[i].req_id;
++ 				int req_id = rx_ring->ena_bufs[i].req_id;
++ 
++ 				rx_ring->free_ids[next_to_clean] = req_id;
+  				next_to_clean =
+  					ENA_RX_RING_IDX_NEXT(next_to_clean,
+  							     rx_ring->ring_size);
+diff --git a/drivers/net/ethernet/amazon/ena/ena_ethtool.c b/drivers/net/ethernet/amazon/ena/ena_ethtool.c
+index 91339c165ab4..3efe699281d5 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_ethtool.c
++++ b/drivers/net/ethernet/amazon/ena/ena_ethtool.c
+@@ -94,6 +94,7 @@ static const struct ena_stats ena_stats_rx_strings[] = {
+ 	ENA_STAT_RX_ENTRY(xdp_pass),
+ 	ENA_STAT_RX_ENTRY(xdp_tx),
+ 	ENA_STAT_RX_ENTRY(xdp_invalid),
++	ENA_STAT_RX_ENTRY(xdp_redirect),
+ };
+ 
+ static const struct ena_stats ena_stats_ena_com_strings[] = {
+* Unmerged path drivers/net/ethernet/amazon/ena/ena_netdev.c
+diff --git a/drivers/net/ethernet/amazon/ena/ena_netdev.h b/drivers/net/ethernet/amazon/ena/ena_netdev.h
+index f43877889011..278edb83ccac 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.h
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.h
+@@ -245,6 +245,7 @@ struct ena_stats_rx {
+ 	u64 xdp_pass;
+ 	u64 xdp_tx;
+ 	u64 xdp_invalid;
++	u64 xdp_redirect;
+ };
+ 
+ struct ena_ring {
