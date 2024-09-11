@@ -1,0 +1,393 @@
+iommu/vt-d: Use put_pages_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 87f60cc65d24939353b40aa1d9297fea080cdf8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/87f60cc6.failed
+
+page->freelist is for the use of slab.  We already have the ability
+to free a list of pages in the core mm, but it requires the use of a
+list_head and for the pages to be chained together through page->lru.
+Switch the Intel IOMMU and IOVA code over to using free_pages_list().
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+[rm: split from original patch, cosmetic tweaks, fix fq entries]
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/2115b560d9a0ce7cd4b948bd51a2b7bde8fdfd59.1639753638.git.robin.murphy@arm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 87f60cc65d24939353b40aa1d9297fea080cdf8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+#	drivers/iommu/iova.c
+#	include/linux/iova.h
+diff --cc drivers/iommu/dma-iommu.c
+index 223a46c79116,ccacd0f71443..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -469,10 -444,10 +469,14 @@@ static void iommu_dma_free_iova(struct 
+  	/* The MSI case is only ever cleaning up its most recent allocation */
+  	if (cookie->type == IOMMU_DMA_MSI_COOKIE)
+  		cookie->msi_iova -= size;
+ -	else if (gather && gather->queued)
+ +	else if (cookie->fq_domain)	/* non-strict mode */
+  		queue_iova(iovad, iova_pfn(iovad, iova),
+  				size >> iova_shift(iovad),
+++<<<<<<< HEAD
+ +				(unsigned long)freelist);
+++=======
++ 				&gather->freelist);
+++>>>>>>> 87f60cc65d24 (iommu/vt-d: Use put_pages_list)
+  	else
+  		free_iova_fast(iovad, iova_pfn(iovad, iova),
+  				size >> iova_shift(iovad));
+diff --cc drivers/iommu/iova.c
+index 1c18cdc4d102,962614c7afbb..000000000000
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@@ -102,15 -90,13 +102,15 @@@ static void free_iova_flush_queue(struc
+  	free_percpu(iovad->fq);
+  
+  	iovad->fq         = NULL;
+ -	iovad->fq_domain  = NULL;
+ +	iovad->flush_cb   = NULL;
+ +	iovad->entry_dtor = NULL;
+  }
+  
+ -int init_iova_flush_queue(struct iova_domain *iovad, struct iommu_domain *fq_domain)
+ +int init_iova_flush_queue(struct iova_domain *iovad,
+ +			  iova_flush_cb flush_cb, iova_entry_dtor entry_dtor)
+  {
+  	struct iova_fq __percpu *queue;
+- 	int cpu;
++ 	int i, cpu;
+  
+  	atomic64_set(&iovad->fq_flush_start_cnt,  0);
+  	atomic64_set(&iovad->fq_flush_finish_cnt, 0);
+@@@ -130,10 -113,12 +130,13 @@@
+  		fq->tail = 0;
+  
+  		spin_lock_init(&fq->lock);
++ 
++ 		for (i = 0; i < IOVA_FQ_SIZE; i++)
++ 			INIT_LIST_HEAD(&fq->entries[i].freelist);
+  	}
+  
+ -	iovad->fq_domain = fq_domain;
+ +	smp_wmb();
+ +
+  	iovad->fq = queue;
+  
+  	timer_setup(&iovad->fq_timer, fq_flush_timeout, 0);
+@@@ -584,9 -578,7 +587,13 @@@ static void fq_ring_free(struct iova_do
+  		if (fq->entries[idx].counter >= counter)
+  			break;
+  
+++<<<<<<< HEAD
+ +		if (iovad->entry_dtor)
+ +			iovad->entry_dtor(fq->entries[idx].data);
+ +
+++=======
++ 		put_pages_list(&fq->entries[idx].freelist);
+++>>>>>>> 87f60cc65d24 (iommu/vt-d: Use put_pages_list)
+  		free_iova_fast(iovad,
+  			       fq->entries[idx].iova_pfn,
+  			       fq->entries[idx].pages);
+@@@ -608,18 -600,14 +615,21 @@@ static void fq_destroy_all_entries(stru
+  
+  	/*
+  	 * This code runs when the iova_domain is being detroyed, so don't
+- 	 * bother to free iovas, just call the entry_dtor on all remaining
+- 	 * entries.
++ 	 * bother to free iovas, just free any remaining pagetable pages.
+  	 */
+ +	if (!iovad->entry_dtor)
+ +		return;
+ +
+  	for_each_possible_cpu(cpu) {
+  		struct iova_fq *fq = per_cpu_ptr(iovad->fq, cpu);
+  		int idx;
+  
+  		fq_ring_for_each(idx, fq)
+++<<<<<<< HEAD
+ +			iovad->entry_dtor(fq->entries[idx].data);
+++=======
++ 			put_pages_list(&fq->entries[idx].freelist);
+++>>>>>>> 87f60cc65d24 (iommu/vt-d: Use put_pages_list)
+  	}
+  }
+  
+@@@ -644,9 -632,9 +654,13 @@@ static void fq_flush_timeout(struct tim
+  
+  void queue_iova(struct iova_domain *iovad,
+  		unsigned long pfn, unsigned long pages,
+++<<<<<<< HEAD
+ +		unsigned long data)
+++=======
++ 		struct list_head *freelist)
+++>>>>>>> 87f60cc65d24 (iommu/vt-d: Use put_pages_list)
+  {
+ -	struct iova_fq *fq;
+ +	struct iova_fq *fq = raw_cpu_ptr(iovad->fq);
+  	unsigned long flags;
+  	unsigned idx;
+  
+@@@ -675,8 -666,8 +689,12 @@@
+  
+  	fq->entries[idx].iova_pfn = pfn;
+  	fq->entries[idx].pages    = pages;
+++<<<<<<< HEAD
+ +	fq->entries[idx].data     = data;
+++=======
+++>>>>>>> 87f60cc65d24 (iommu/vt-d: Use put_pages_list)
+  	fq->entries[idx].counter  = atomic64_read(&iovad->fq_flush_start_cnt);
++ 	list_splice(freelist, &fq->entries[idx].freelist);
+  
+  	spin_unlock_irqrestore(&fq->lock, flags);
+  
+diff --cc include/linux/iova.h
+index 4512ea4f00b8,072a09c06e8a..000000000000
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@@ -55,7 -46,7 +55,11 @@@ typedef void (* iova_entry_dtor)(unsign
+  struct iova_fq_entry {
+  	unsigned long iova_pfn;
+  	unsigned long pages;
+++<<<<<<< HEAD
+ +	unsigned long data;
+++=======
++ 	struct list_head freelist;
+++>>>>>>> 87f60cc65d24 (iommu/vt-d: Use put_pages_list)
+  	u64 counter; /* Flush counter when this entrie was added */
+  };
+  
+@@@ -148,7 -135,7 +152,11 @@@ void free_iova_fast(struct iova_domain 
+  		    unsigned long size);
+  void queue_iova(struct iova_domain *iovad,
+  		unsigned long pfn, unsigned long pages,
+++<<<<<<< HEAD
+ +		unsigned long data);
+++=======
++ 		struct list_head *freelist);
+++>>>>>>> 87f60cc65d24 (iommu/vt-d: Use put_pages_list)
+  unsigned long alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
+  			      unsigned long limit_pfn, bool flush_rcache);
+  struct iova *reserve_iova(struct iova_domain *iovad, unsigned long pfn_lo,
+* Unmerged path drivers/iommu/dma-iommu.c
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 0da3626cffb5..4a52ba76fb7e 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -1307,35 +1307,30 @@ static void dma_pte_free_pagetable(struct dmar_domain *domain,
+    know the hardware page-walk will no longer touch them.
+    The 'pte' argument is the *parent* PTE, pointing to the page that is to
+    be freed. */
+-static struct page *dma_pte_list_pagetables(struct dmar_domain *domain,
+-					    int level, struct dma_pte *pte,
+-					    struct page *freelist)
++static void dma_pte_list_pagetables(struct dmar_domain *domain,
++				    int level, struct dma_pte *pte,
++				    struct list_head *freelist)
+ {
+ 	struct page *pg;
+ 
+ 	pg = pfn_to_page(dma_pte_addr(pte) >> PAGE_SHIFT);
+-	pg->freelist = freelist;
+-	freelist = pg;
++	list_add_tail(&pg->lru, freelist);
+ 
+ 	if (level == 1)
+-		return freelist;
++		return;
+ 
+ 	pte = page_address(pg);
+ 	do {
+ 		if (dma_pte_present(pte) && !dma_pte_superpage(pte))
+-			freelist = dma_pte_list_pagetables(domain, level - 1,
+-							   pte, freelist);
++			dma_pte_list_pagetables(domain, level - 1, pte, freelist);
+ 		pte++;
+ 	} while (!first_pte_in_page(pte));
+-
+-	return freelist;
+ }
+ 
+-static struct page *dma_pte_clear_level(struct dmar_domain *domain, int level,
+-					struct dma_pte *pte, unsigned long pfn,
+-					unsigned long start_pfn,
+-					unsigned long last_pfn,
+-					struct page *freelist)
++static void dma_pte_clear_level(struct dmar_domain *domain, int level,
++				struct dma_pte *pte, unsigned long pfn,
++				unsigned long start_pfn, unsigned long last_pfn,
++				struct list_head *freelist)
+ {
+ 	struct dma_pte *first_pte = NULL, *last_pte = NULL;
+ 
+@@ -1354,7 +1349,7 @@ static struct page *dma_pte_clear_level(struct dmar_domain *domain, int level,
+ 			/* These suborbinate page tables are going away entirely. Don't
+ 			   bother to clear them; we're just going to *free* them. */
+ 			if (level > 1 && !dma_pte_superpage(pte))
+-				freelist = dma_pte_list_pagetables(domain, level - 1, pte, freelist);
++				dma_pte_list_pagetables(domain, level - 1, pte, freelist);
+ 
+ 			dma_clear_pte(pte);
+ 			if (!first_pte)
+@@ -1362,10 +1357,10 @@ static struct page *dma_pte_clear_level(struct dmar_domain *domain, int level,
+ 			last_pte = pte;
+ 		} else if (level > 1) {
+ 			/* Recurse down into a level that isn't *entirely* obsolete */
+-			freelist = dma_pte_clear_level(domain, level - 1,
+-						       phys_to_virt(dma_pte_addr(pte)),
+-						       level_pfn, start_pfn, last_pfn,
+-						       freelist);
++			dma_pte_clear_level(domain, level - 1,
++					    phys_to_virt(dma_pte_addr(pte)),
++					    level_pfn, start_pfn, last_pfn,
++					    freelist);
+ 		}
+ next:
+ 		pfn = level_pfn + level_size(level);
+@@ -1374,47 +1369,28 @@ static struct page *dma_pte_clear_level(struct dmar_domain *domain, int level,
+ 	if (first_pte)
+ 		domain_flush_cache(domain, first_pte,
+ 				   (void *)++last_pte - (void *)first_pte);
+-
+-	return freelist;
+ }
+ 
+ /* We can't just free the pages because the IOMMU may still be walking
+    the page tables, and may have cached the intermediate levels. The
+    pages can only be freed after the IOTLB flush has been done. */
+-static struct page *domain_unmap(struct dmar_domain *domain,
+-				 unsigned long start_pfn,
+-				 unsigned long last_pfn,
+-				 struct page *freelist)
++static void domain_unmap(struct dmar_domain *domain, unsigned long start_pfn,
++			 unsigned long last_pfn, struct list_head *freelist)
+ {
+ 	BUG_ON(!domain_pfn_supported(domain, start_pfn));
+ 	BUG_ON(!domain_pfn_supported(domain, last_pfn));
+ 	BUG_ON(start_pfn > last_pfn);
+ 
+ 	/* we don't need lock here; nobody else touches the iova range */
+-	freelist = dma_pte_clear_level(domain, agaw_to_level(domain->agaw),
+-				       domain->pgd, 0, start_pfn, last_pfn,
+-				       freelist);
++	dma_pte_clear_level(domain, agaw_to_level(domain->agaw),
++			    domain->pgd, 0, start_pfn, last_pfn, freelist);
+ 
+ 	/* free pgd */
+ 	if (start_pfn == 0 && last_pfn == DOMAIN_MAX_PFN(domain->gaw)) {
+ 		struct page *pgd_page = virt_to_page(domain->pgd);
+-		pgd_page->freelist = freelist;
+-		freelist = pgd_page;
+-
++		list_add_tail(&pgd_page->lru, freelist);
+ 		domain->pgd = NULL;
+ 	}
+-
+-	return freelist;
+-}
+-
+-static void dma_free_pagelist(struct page *freelist)
+-{
+-	struct page *pg;
+-
+-	while ((pg = freelist)) {
+-		freelist = pg->freelist;
+-		free_pgtable_page(page_address(pg));
+-	}
+ }
+ 
+ /* iommu handling */
+@@ -2120,11 +2096,10 @@ static void domain_exit(struct dmar_domain *domain)
+ 	domain_remove_dev_info(domain);
+ 
+ 	if (domain->pgd) {
+-		struct page *freelist;
++		LIST_HEAD(freelist);
+ 
+-		freelist = domain_unmap(domain, 0,
+-					DOMAIN_MAX_PFN(domain->gaw), NULL);
+-		dma_free_pagelist(freelist);
++		domain_unmap(domain, 0, DOMAIN_MAX_PFN(domain->gaw), &freelist);
++		put_pages_list(&freelist);
+ 	}
+ 
+ 	free_domain_mem(domain);
+@@ -4255,19 +4230,17 @@ static int intel_iommu_memory_notifier(struct notifier_block *nb,
+ 		{
+ 			struct dmar_drhd_unit *drhd;
+ 			struct intel_iommu *iommu;
+-			struct page *freelist;
++			LIST_HEAD(freelist);
+ 
+-			freelist = domain_unmap(si_domain,
+-						start_vpfn, last_vpfn,
+-						NULL);
++			domain_unmap(si_domain, start_vpfn, last_vpfn, &freelist);
+ 
+ 			rcu_read_lock();
+ 			for_each_active_iommu(iommu, drhd)
+ 				iommu_flush_iotlb_psi(iommu, si_domain,
+ 					start_vpfn, mhp->nr_pages,
+-					!freelist, 0);
++					list_empty(&freelist), 0);
+ 			rcu_read_unlock();
+-			dma_free_pagelist(freelist);
++			put_pages_list(&freelist);
+ 		}
+ 		break;
+ 	}
+@@ -5275,8 +5248,7 @@ static size_t intel_iommu_unmap(struct iommu_domain *domain,
+ 	start_pfn = iova >> VTD_PAGE_SHIFT;
+ 	last_pfn = (iova + size - 1) >> VTD_PAGE_SHIFT;
+ 
+-	gather->freelist = domain_unmap(dmar_domain, start_pfn,
+-					last_pfn, gather->freelist);
++	domain_unmap(dmar_domain, start_pfn, last_pfn, &gather->freelist);
+ 
+ 	if (dmar_domain->max_addr == iova + size)
+ 		dmar_domain->max_addr = iova;
+@@ -5312,9 +5284,10 @@ static void intel_iommu_tlb_sync(struct iommu_domain *domain,
+ 
+ 	for_each_domain_iommu(iommu_id, dmar_domain)
+ 		iommu_flush_iotlb_psi(g_iommus[iommu_id], dmar_domain,
+-				      start_pfn, nrpages, !gather->freelist, 0);
++				      start_pfn, nrpages,
++				      list_empty(&gather->freelist), 0);
+ 
+-	dma_free_pagelist(gather->freelist);
++	put_pages_list(&gather->freelist);
+ }
+ 
+ static phys_addr_t intel_iommu_iova_to_phys(struct iommu_domain *domain,
+* Unmerged path drivers/iommu/iova.c
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index b00fb18b7995..078e15261531 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -215,7 +215,7 @@ struct iommu_iotlb_gather {
+ 	unsigned long		start;
+ 	unsigned long		end;
+ 	size_t			pgsize;
+-	struct page		*freelist;
++	struct list_head	freelist;
+ 	bool			queued;
+ };
+ 
+@@ -450,6 +450,7 @@ static inline void iommu_iotlb_gather_init(struct iommu_iotlb_gather *gather)
+ {
+ 	*gather = (struct iommu_iotlb_gather) {
+ 		.start	= ULONG_MAX,
++		.freelist = LIST_HEAD_INIT(gather->freelist),
+ 	};
+ }
+ 
+* Unmerged path include/linux/iova.h
