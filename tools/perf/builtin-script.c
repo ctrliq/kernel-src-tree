@@ -1558,7 +1558,8 @@ struct metric_ctx {
 	FILE 			*fp;
 };
 
-static void script_print_metric(void *ctx, const char *color,
+static void script_print_metric(struct perf_stat_config *config __maybe_unused,
+				void *ctx, const char *color,
 			        const char *fmt,
 			        const char *unit, double val)
 {
@@ -1576,7 +1577,8 @@ static void script_print_metric(void *ctx, const char *color,
 	fprintf(mctx->fp, " %s\n", unit);
 }
 
-static void script_new_line(void *ctx)
+static void script_new_line(struct perf_stat_config *config __maybe_unused,
+			    void *ctx)
 {
 	struct metric_ctx *mctx = ctx;
 
@@ -1622,7 +1624,7 @@ static void perf_sample__fprint_metric(struct perf_script *script,
 	evsel_script(evsel)->val = val;
 	if (evsel_script(evsel->leader)->gnum == evsel->leader->nr_members) {
 		for_each_group_member (ev2, evsel->leader) {
-			perf_stat__print_shadow_stats(ev2,
+			perf_stat__print_shadow_stats(&stat_config, ev2,
 						      evsel_script(ev2)->val,
 						      sample->cpu,
 						      &ctx,
