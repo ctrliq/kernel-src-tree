@@ -1,0 +1,226 @@
+Revert "KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range()"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 873dd122172f8cce329113cfb0dfe3d2344d80c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/873dd122.failed
+
+This reverts commit cf3e26427c08ad9015956293ab389004ac6a338e.
+
+Multi-vCPU Hyper-V guests started crashing randomly on boot with the
+latest kvm/queue and the problem can be bisected the problem to this
+particular patch. Basically, I'm not able to boot e.g. 16-vCPU guest
+successfully anymore. Both Intel and AMD seem to be affected. Reverting
+the commit saves the day.
+
+	Reported-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 873dd122172f8cce329113cfb0dfe3d2344d80c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+#	arch/x86/kvm/mmu/tdp_mmu.h
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 97bb57fe39ca,e7e7876251b3..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -705,6 -910,7 +705,10 @@@ static inline bool __must_check tdp_mmu
+   * non-root pages mapping GFNs strictly within that range. Returns true if
+   * SPTEs have been cleared and a TLB flush is needed before releasing the
+   * MMU lock.
+++<<<<<<< HEAD
+++=======
++  *
+++>>>>>>> 873dd122172f (Revert "KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range()")
+   * If can_yield is true, will release the MMU lock and reschedule if the
+   * scheduler needs the CPU or there is contention on the MMU lock. If this
+   * function cannot yield, it will not release the MMU lock or reschedule and
+@@@ -716,13 -920,24 +720,30 @@@
+  static bool zap_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
+  			  gfn_t start, gfn_t end, bool can_yield, bool flush)
+  {
++ 	bool zap_all = (start == 0 && end >= tdp_mmu_max_gfn_host());
+  	struct tdp_iter iter;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +
+ +	tdp_root_for_each_pte(iter, root, start, end) {
+++=======
++ 	/*
++ 	 * No need to try to step down in the iterator when zapping all SPTEs,
++ 	 * zapping the top-level non-leaf SPTEs will recurse on their children.
++ 	 */
++ 	int min_level = zap_all ? root->role.level : PG_LEVEL_4K;
++ 
++ 	end = min(end, tdp_mmu_max_gfn_host());
++ 
++ 	lockdep_assert_held_write(&kvm->mmu_lock);
++ 
++ 	rcu_read_lock();
++ 
++ 	for_each_tdp_pte_min_level(iter, root, min_level, start, end) {
+++>>>>>>> 873dd122172f (Revert "KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range()")
+  		if (can_yield &&
+ -		    tdp_mmu_iter_cond_resched(kvm, &iter, flush, false)) {
+ +		    tdp_mmu_iter_cond_resched(kvm, &iter, flush)) {
+  			flush = false;
+  			continue;
+  		}
+@@@ -733,9 -948,10 +754,16 @@@
+  		/*
+  		 * If this is a non-last-level SPTE that covers a larger range
+  		 * than should be zapped, continue, and zap the mappings at a
+++<<<<<<< HEAD
+ +		 * lower level.
+ +		 */
+ +		if ((iter.gfn < start ||
+++=======
++ 		 * lower level, except when zapping all SPTEs.
++ 		 */
++ 		if (!zap_all &&
++ 		    (iter.gfn < start ||
+++>>>>>>> 873dd122172f (Revert "KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range()")
+  		     iter.gfn + KVM_PAGES_PER_HPAGE(iter.level) > end) &&
+  		    !is_last_spte(iter.old_spte, iter.level))
+  			continue;
+@@@ -1032,71 -1230,38 +1060,80 @@@ int kvm_tdp_mmu_map(struct kvm_vcpu *vc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +typedef int (*tdp_handler_t)(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			     struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+ +			     unsigned long data);
+++=======
++ bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
++ 				 bool flush)
++ {
++ 	return __kvm_tdp_mmu_zap_gfn_range(kvm, range->slot->as_id, range->start,
++ 					   range->end, range->may_block, flush);
++ }
+++>>>>>>> 873dd122172f (Revert "KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range()")
+  
+ -typedef bool (*tdp_handler_t)(struct kvm *kvm, struct tdp_iter *iter,
+ -			      struct kvm_gfn_range *range);
+ -
+ -static __always_inline bool kvm_tdp_mmu_handle_gfn(struct kvm *kvm,
+ -						   struct kvm_gfn_range *range,
+ -						   tdp_handler_t handler)
+ +static __always_inline int kvm_tdp_mmu_handle_hva_range(struct kvm *kvm,
+ +							unsigned long start,
+ +							unsigned long end,
+ +							unsigned long data,
+ +							tdp_handler_t handler)
+  {
+ +	struct kvm_memslots *slots;
+ +	struct kvm_memory_slot *memslot;
+  	struct kvm_mmu_page *root;
+ -	struct tdp_iter iter;
+ -	bool ret = false;
+ +	int ret = 0;
+ +	int as_id;
+ +
+ +	for (as_id = 0; as_id < KVM_ADDRESS_SPACE_NUM; as_id++) {
+ +		for_each_tdp_mmu_root_yield_safe(kvm, root, as_id) {
+ +			slots = __kvm_memslots(kvm, as_id);
+ +			kvm_for_each_memslot(memslot, slots) {
+ +				unsigned long hva_start, hva_end;
+ +				gfn_t gfn_start, gfn_end;
+ +
+ +				hva_start = max(start, memslot->userspace_addr);
+ +				hva_end = min(end, memslot->userspace_addr +
+ +					(memslot->npages << PAGE_SHIFT));
+ +				if (hva_start >= hva_end)
+ +					continue;
+ +				/*
+ +				 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+ +				 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+ +				 */
+ +				gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+ +				gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+ +
+ +				ret |= handler(kvm, memslot, root, gfn_start,
+ +					gfn_end, data);
+ +			}
+ +		}
+ +	}
+  
+ -	/*
+ -	 * Don't support rescheduling, none of the MMU notifiers that funnel
+ -	 * into this helper allow blocking; it'd be dead, wasteful code.
+ -	 */
+ -	for_each_tdp_mmu_root(kvm, root, range->slot->as_id) {
+ -		rcu_read_lock();
+ +	return ret;
+ +}
+  
+ -		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end)
+ -			ret |= handler(kvm, &iter, range);
+ +static __always_inline int kvm_tdp_mmu_handle_hva(struct kvm *kvm,
+ +						  unsigned long addr,
+ +						  unsigned long data,
+ +						  tdp_handler_t handler)
+ +{
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, addr, addr + 1, data, handler);
+ +}
+  
+ -		rcu_read_unlock();
+ -	}
+ +static int zap_gfn_range_hva_wrapper(struct kvm *kvm,
+ +				     struct kvm_memory_slot *slot,
+ +				     struct kvm_mmu_page *root, gfn_t start,
+ +				     gfn_t end, unsigned long unused)
+ +{
+ +	return zap_gfn_range(kvm, root, start, end, false, false);
+ +}
+  
+ -	return ret;
+ +int kvm_tdp_mmu_zap_hva_range(struct kvm *kvm, unsigned long start,
+ +			      unsigned long end)
+ +{
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, start, end, 0,
+ +					    zap_gfn_range_hva_wrapper);
+  }
+  
+  /*
+diff --cc arch/x86/kvm/mmu/tdp_mmu.h
+index e1f1ae8ec3e2,5e5ef2576c81..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@@ -22,24 -22,8 +22,29 @@@ static inline bool kvm_tdp_mmu_zap_gfn_
+  {
+  	return __kvm_tdp_mmu_zap_gfn_range(kvm, as_id, start, end, true, flush);
+  }
+++<<<<<<< HEAD
+ +static inline bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+ +{
+ +	gfn_t end = sp->gfn + KVM_PAGES_PER_HPAGE(sp->role.level + 1);
+ +
+ +	/*
+ +	 * Don't allow yielding, as the caller may have a flush pending.  Note,
+ +	 * if mmu_lock is held for write, zapping will never yield in this case,
+ +	 * but explicitly disallow it for safety.  The TDP MMU does not yield
+ +	 * until it has made forward progress (steps sideways), and when zapping
+ +	 * a single shadow page that it's guaranteed to see (thus the mmu_lock
+ +	 * requirement), its "step sideways" will always step beyond the bounds
+ +	 * of the shadow page's gfn range and stop iterating before yielding.
+ +	 */
+ +	lockdep_assert_held_write(&kvm->mmu_lock);
+ +	return __kvm_tdp_mmu_zap_gfn_range(kvm, kvm_mmu_page_as_id(sp),
+ +					   sp->gfn, end, false, false);
+ +}
+ +
+++=======
++ 
++ bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp);
+++>>>>>>> 873dd122172f (Revert "KVM: x86/mmu: Zap only TDP MMU leafs in kvm_zap_gfn_range()")
+  void kvm_tdp_mmu_zap_all(struct kvm *kvm);
+  void kvm_tdp_mmu_invalidate_all_roots(struct kvm *kvm);
+  void kvm_tdp_mmu_zap_invalidated_roots(struct kvm *kvm);
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.h
