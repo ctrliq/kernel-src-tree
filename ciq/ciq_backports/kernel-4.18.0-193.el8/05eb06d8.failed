@@ -1,0 +1,165 @@
+xprtrdma: Fix occasional transport deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 05eb06d86685e7d9dac60e6bbb46d7f4c30b056e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/05eb06d8.failed
+
+Under high I/O workloads, I've noticed that an RPC/RDMA transport
+occasionally deadlocks (IOPS goes to zero, and doesn't recover).
+Diagnosis shows that the sendctx queue is empty, but when sendctxs
+are returned to the queue, the xprt_write_space wake-up never
+occurs. The wake-up logic in rpcrdma_sendctx_put_locked is racy.
+
+I noticed that both EMPTY_SCQ and XPRT_WRITE_SPACE are implemented
+via an atomic bit. Just one of those is sufficient. Removing
+EMPTY_SCQ in favor of the generic bit mechanism makes the deadlock
+un-reproducible.
+
+Without EMPTY_SCQ, rpcrdma_buffer::rb_flags is no longer used and
+is therefore removed.
+
+Unfortunately this patch does not apply cleanly to stable. If
+needed, someone will have to port it and test it.
+
+Fixes: 2fad659209d5 ("xprtrdma: Wait on empty sendctx queue")
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 05eb06d86685e7d9dac60e6bbb46d7f4c30b056e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 44e8afd6abd7,59b214ba8813..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -872,15 -883,7 +878,19 @@@ rpcrdma_marshal_req(struct rpcrdma_xpr
+  
+  out_err:
+  	trace_xprtrdma_marshal_failed(rqst, ret);
+++<<<<<<< HEAD
+ +	switch (ret) {
+ +	case -EAGAIN:
+ +		xprt_wait_for_buffer_space(rqst->rq_task, NULL);
+ +		break;
+ +	case -ENOBUFS:
+ +		break;
+ +	default:
+ +		r_xprt->rx_stats.failed_marshal_count++;
+ +	}
+++=======
++ 	r_xprt->rx_stats.failed_marshal_count++;
+++>>>>>>> 05eb06d86685 (xprtrdma: Fix occasional transport deadlock)
+  	return ret;
+  }
+  
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index a585b191fe98,0be5a36cacb6..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1078,8 -1085,7 +1074,12 @@@ rpcrdma_buffer_create(struct rpcrdma_xp
+  	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+  	int i, rc;
+  
+++<<<<<<< HEAD
+ +	buf->rb_flags = 0;
+ +	buf->rb_max_requests = r_xprt->rx_data.max_requests;
+++=======
++ 	buf->rb_max_requests = r_xprt->rx_ep.rep_max_requests;
+++>>>>>>> 05eb06d86685 (xprtrdma: Fix occasional transport deadlock)
+  	buf->rb_bc_srv_max_requests = 0;
+  	spin_lock_init(&buf->rb_mrlock);
+  	spin_lock_init(&buf->rb_lock);
+diff --git a/include/trace/events/rpcrdma.h b/include/trace/events/rpcrdma.h
+index bfa903f6b855..ec9136afa7d6 100644
+--- a/include/trace/events/rpcrdma.h
++++ b/include/trace/events/rpcrdma.h
+@@ -539,6 +539,33 @@ TRACE_EVENT(xprtrdma_marshal_failed,
+ 	)
+ );
+ 
++TRACE_EVENT(xprtrdma_prepsend_failed,
++	TP_PROTO(const struct rpc_rqst *rqst,
++		 int ret
++	),
++
++	TP_ARGS(rqst, ret),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, xid)
++		__field(int, ret)
++	),
++
++	TP_fast_assign(
++		__entry->task_id = rqst->rq_task->tk_pid;
++		__entry->client_id = rqst->rq_task->tk_client->cl_clid;
++		__entry->xid = be32_to_cpu(rqst->rq_xid);
++		__entry->ret = ret;
++	),
++
++	TP_printk("task:%u@%u xid=0x%08x: ret=%d",
++		__entry->task_id, __entry->client_id, __entry->xid,
++		__entry->ret
++	)
++);
++
+ TRACE_EVENT(xprtrdma_post_send,
+ 	TP_PROTO(
+ 		const struct rpcrdma_req *req,
+diff --git a/net/sunrpc/xprtrdma/frwr_ops.c b/net/sunrpc/xprtrdma/frwr_ops.c
+index 4f4311900f93..eb1e7df8023c 100644
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -394,7 +394,7 @@ struct rpcrdma_mr_seg *frwr_map(struct rpcrdma_xprt *r_xprt,
+ 			rpcrdma_mr_recycle(mr);
+ 		mr = rpcrdma_mr_get(r_xprt);
+ 		if (!mr)
+-			return ERR_PTR(-EAGAIN);
++			goto out_getmr_err;
+ 	} while (mr->frwr.fr_state != FRWR_IS_INVALID);
+ 	frwr = &mr->frwr;
+ 	frwr->fr_state = FRWR_IS_VALID;
+@@ -451,6 +451,10 @@ struct rpcrdma_mr_seg *frwr_map(struct rpcrdma_xprt *r_xprt,
+ 	*out = mr;
+ 	return seg;
+ 
++out_getmr_err:
++	xprt_wait_for_buffer_space(&r_xprt->rx_xprt);
++	return ERR_PTR(-EAGAIN);
++
+ out_dmamap_err:
+ 	mr->mr_dir = DMA_NONE;
+ 	trace_xprtrdma_frwr_sgerr(mr, i);
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index a87b219925aa..cc0f6802659d 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -388,7 +388,6 @@ struct rpcrdma_buffer {
+ 	struct list_head	rb_recv_bufs;
+ 	struct list_head	rb_allreqs;
+ 
+-	unsigned long		rb_flags;
+ 	u32			rb_max_requests;
+ 	u32			rb_credits;	/* most recent credit grant */
+ 
+@@ -399,11 +398,6 @@ struct rpcrdma_buffer {
+ 	struct delayed_work	rb_refresh_worker;
+ };
+ 
+-/* rb_flags */
+-enum {
+-	RPCRDMA_BUF_F_EMPTY_SCQ = 0,
+-};
+-
+ /*
+  * Internal structure for transport instance creation. This
+  * exists primarily for modularity.
