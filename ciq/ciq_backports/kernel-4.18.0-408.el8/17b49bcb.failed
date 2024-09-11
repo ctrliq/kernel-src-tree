@@ -1,0 +1,151 @@
+scsi: core: Fix scsi_mode_sense() buffer length handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit 17b49bcbf8351d3dbe57204468ac34f033ed60bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/17b49bcb.failed
+
+Several problems exist with scsi_mode_sense() buffer length handling:
+
+ 1) The allocation length field of the MODE SENSE(10) command is 16-bits,
+    occupying bytes 7 and 8 of the CDB. With this command, access to mode
+    pages larger than 255 bytes is thus possible. However, the CDB
+    allocation length field is set by assigning len to byte 8 only, thus
+    truncating buffer length larger than 255.
+
+ 2) If scsi_mode_sense() is called with len smaller than 8 with
+    sdev->use_10_for_ms set, or smaller than 4 otherwise, the buffer length
+    is increased to 8 and 4 respectively, and the buffer is zero filled
+    with these increased values, thus corrupting the memory following the
+    buffer.
+
+Fix these 2 problems by using put_unaligned_be16() to set the allocation
+length field of MODE SENSE(10) CDB and by returning an error when len is
+too small.
+
+Furthermore, if len is larger than 255B, always try MODE SENSE(10) first,
+even if the device driver did not set sdev->use_10_for_ms. In case of
+invalid opcode error for MODE SENSE(10), access to mode pages larger than
+255 bytes are not retried using MODE SENSE(6). To avoid buffer length
+overflows for the MODE_SENSE(10) case, check that len is smaller than 65535
+bytes.
+
+While at it, also fix the folowing:
+
+ * Use get_unaligned_be16() to retrieve the mode data length and block
+   descriptor length fields of the mode sense reply header instead of using
+   an open coded calculation.
+
+ * Fix the kdoc dbd argument explanation: the DBD bit stands for Disable
+   Block Descriptor, which is the opposite of what the dbd argument
+   description was.
+
+Link: https://lore.kernel.org/r/20210820070255.682775-2-damien.lemoal@wdc.com
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 17b49bcbf8351d3dbe57204468ac34f033ed60bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index 4fab3e007b39,701d8e8480f2..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -2162,46 -2145,52 +2162,89 @@@ scsi_mode_sense(struct scsi_device *sde
+  			if ((sshdr->sense_key == ILLEGAL_REQUEST) &&
+  			    (sshdr->asc == 0x20) && (sshdr->ascq == 0)) {
+  				/*
+- 				 * Invalid command operation code
++ 				 * Invalid command operation code: retry using
++ 				 * MODE SENSE(6) if this was a MODE SENSE(10)
++ 				 * request, except if the request mode page is
++ 				 * too large for MODE SENSE single byte
++ 				 * allocation length field.
+  				 */
+++<<<<<<< HEAD
+ +				sdev->use_10_for_ms = 0;
+++=======
++ 				if (use_10_for_ms) {
++ 					if (len > 255)
++ 						return -EIO;
++ 					sdev->use_10_for_ms = 0;
++ 					goto retry;
++ 				}
++ 			}
++ 			if (scsi_status_is_check_condition(result) &&
++ 			    sshdr->sense_key == UNIT_ATTENTION &&
++ 			    retry_count) {
++ 				retry_count--;
+++>>>>>>> 17b49bcbf835 (scsi: core: Fix scsi_mode_sense() buffer length handling)
+  				goto retry;
+  			}
+  		}
+ -		return -EIO;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(buffer[0] == 0x86 && buffer[1] == 0x0b &&
++ 		     (modepage == 6 || modepage == 8))) {
++ 		/* Initio breakage? */
++ 		header_length = 0;
++ 		data->length = 13;
++ 		data->medium_type = 0;
++ 		data->device_specific = 0;
++ 		data->longlba = 0;
++ 		data->block_descriptor_length = 0;
++ 	} else if (use_10_for_ms) {
++ 		data->length = get_unaligned_be16(&buffer[0]) + 2;
++ 		data->medium_type = buffer[2];
++ 		data->device_specific = buffer[3];
++ 		data->longlba = buffer[4] & 0x01;
++ 		data->block_descriptor_length = get_unaligned_be16(&buffer[6]);
++ 	} else {
++ 		data->length = buffer[0] + 1;
++ 		data->medium_type = buffer[1];
++ 		data->device_specific = buffer[2];
++ 		data->block_descriptor_length = buffer[3];
++ 	}
++ 	data->header_length = header_length;
+++>>>>>>> 17b49bcbf835 (scsi: core: Fix scsi_mode_sense() buffer length handling)
+ +
+ +	if (scsi_status_is_good(result)) {
+ +		if (unlikely(buffer[0] == 0x86 && buffer[1] == 0x0b &&
+ +			     (modepage == 6 || modepage == 8))) {
+ +			/* Initio breakage? */
+ +			header_length = 0;
+ +			data->length = 13;
+ +			data->medium_type = 0;
+ +			data->device_specific = 0;
+ +			data->longlba = 0;
+ +			data->block_descriptor_length = 0;
+ +		} else if (use_10_for_ms) {
+ +			data->length = buffer[0]*256 + buffer[1] + 2;
+ +			data->medium_type = buffer[2];
+ +			data->device_specific = buffer[3];
+ +			data->longlba = buffer[4] & 0x01;
+ +			data->block_descriptor_length = buffer[6]*256
+ +				+ buffer[7];
+ +		} else {
+ +			data->length = buffer[0] + 1;
+ +			data->medium_type = buffer[1];
+ +			data->device_specific = buffer[2];
+ +			data->block_descriptor_length = buffer[3];
+ +		}
+ +		data->header_length = header_length;
+ +	} else if ((status_byte(result) == CHECK_CONDITION) &&
+ +		   scsi_sense_valid(sshdr) &&
+ +		   sshdr->sense_key == UNIT_ATTENTION && retry_count) {
+ +		retry_count--;
+ +		goto retry;
+ +	}
+  
+ -	return 0;
+ +	return result;
+  }
+  EXPORT_SYMBOL(scsi_mode_sense);
+  
+* Unmerged path drivers/scsi/scsi_lib.c
