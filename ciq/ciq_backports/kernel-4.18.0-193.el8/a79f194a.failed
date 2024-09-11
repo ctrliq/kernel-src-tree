@@ -1,0 +1,217 @@
+NFSv4/flexfiles: Abort I/O early if the layout segment was invalidated
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit a79f194aa4879e9baad118c3f8bb2ca24dbef765
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a79f194a.failed
+
+If a layout segment gets invalidated while a pNFS I/O operation
+is queued for transmission, then we ideally want to abort
+immediately. This is particularly the case when there is a large
+number of I/O related RPCs queued in the RPC layer, and the layout
+segment gets invalidated due to an ENOSPC error, or an EACCES (because
+the client was fenced). We may end up forced to spam the MDS with a
+lot of otherwise unnecessary LAYOUTERRORs after that I/O fails.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit a79f194aa4879e9baad118c3f8bb2ca24dbef765)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index c4d4cd12e49e,e096c5a725df..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -995,59 -1302,63 +995,80 @@@ void xprt_end_transmit(struct rpc_task 
+  }
+  
+  /**
+ - * xprt_request_transmit - send an RPC request on a transport
+ - * @req: pointer to request to transmit
+ - * @snd_task: RPC task that owns the transport lock
+ + * xprt_transmit - send an RPC request on a transport
+ + * @task: controlling RPC task
+   *
+ - * This performs the transmission of a single request.
+ - * Note that if the request is not the same as snd_task, then it
+ - * does need to be pinned.
+ - * Returns '0' on success.
+ + * We have to copy the iovec because sendmsg fiddles with its contents.
+   */
+ -static int
+ -xprt_request_transmit(struct rpc_rqst *req, struct rpc_task *snd_task)
+ +void xprt_transmit(struct rpc_task *task)
+  {
+ -	struct rpc_xprt *xprt = req->rq_xprt;
+ -	struct rpc_task *task = req->rq_task;
+ +	struct rpc_rqst	*req = task->tk_rqstp;
+ +	struct rpc_xprt	*xprt = req->rq_xprt;
+  	unsigned int connect_cookie;
+ -	int is_retrans = RPC_WAS_SENT(task);
+  	int status;
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC: %5u xprt_transmit(%u)\n", task->tk_pid, req->rq_slen);
+++=======
++ 	if (!req->rq_bytes_sent) {
++ 		if (xprt_request_data_received(task)) {
++ 			status = 0;
++ 			goto out_dequeue;
++ 		}
++ 		/* Verify that our message lies in the RPCSEC_GSS window */
++ 		if (rpcauth_xmit_need_reencode(task)) {
++ 			status = -EBADMSG;
++ 			goto out_dequeue;
++ 		}
++ 		if (task->tk_ops->rpc_call_prepare_transmit) {
++ 			task->tk_ops->rpc_call_prepare_transmit(task,
++ 					task->tk_calldata);
++ 			status = task->tk_status;
++ 			if (status < 0)
++ 				goto out_dequeue;
++ 		}
++ 	}
+++>>>>>>> a79f194aa487 (NFSv4/flexfiles: Abort I/O early if the layout segment was invalidated)
+ +
+ +	if (!req->rq_reply_bytes_recvd) {
+ +
+ +		/* Verify that our message lies in the RPCSEC_GSS window */
+ +		if (!req->rq_bytes_sent && rpcauth_xmit_need_reencode(task)) {
+ +			task->tk_status = -EBADMSG;
+ +			return;
+ +		}
+  
+ -	/*
+ -	 * Update req->rq_ntrans before transmitting to avoid races with
+ -	 * xprt_update_rtt(), which needs to know that it is recording a
+ -	 * reply to the first transmission.
+ -	 */
+ -	req->rq_ntrans++;
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+  
+  	connect_cookie = xprt->connect_cookie;
+ -	status = xprt->ops->send_request(req);
+ +	status = xprt->ops->send_request(req, task);
+ +	trace_xprt_transmit(xprt, req->rq_xid, status);
+  	if (status != 0) {
+ -		req->rq_ntrans--;
+ -		trace_xprt_transmit(req, status);
+ -		return status;
+ +		task->tk_status = status;
+ +		return;
+  	}
+  
+ -	if (is_retrans)
+ -		task->tk_client->cl_stats->rpcretrans++;
+ -
+  	xprt_inject_disconnect(xprt);
+  
+ +	dprintk("RPC: %5u xmit complete\n", task->tk_pid);
+ +	clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+  	task->tk_flags |= RPC_TASK_SENT;
+  	spin_lock_bh(&xprt->transport_lock);
+  
+diff --git a/fs/nfs/flexfilelayout/flexfilelayout.c b/fs/nfs/flexfilelayout/flexfilelayout.c
+index e36367f79c13..55ce274deb74 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@ -1082,6 +1082,8 @@ static int ff_layout_async_handle_error_v4(struct rpc_task *task,
+ 		break;
+ 	case -NFS4ERR_RETRY_UNCACHED_REP:
+ 		break;
++	case -EAGAIN:
++		return -NFS4ERR_RESET_TO_PNFS;
+ 	/* Invalidate Layout errors */
+ 	case -NFS4ERR_PNFS_NO_LAYOUT:
+ 	case -ESTALE:           /* mapped NFS4ERR_STALE */
+@@ -1142,6 +1144,7 @@ static int ff_layout_async_handle_error_v3(struct rpc_task *task,
+ 	case -EBADHANDLE:
+ 	case -ELOOP:
+ 	case -ENOSPC:
++	case -EAGAIN:
+ 		break;
+ 	case -EJUKEBOX:
+ 		nfs_inc_stats(lseg->pls_layout->plh_inode, NFSIOS_DELAY);
+@@ -1380,6 +1383,16 @@ static void ff_layout_read_prepare_v4(struct rpc_task *task, void *data)
+ 	ff_layout_read_prepare_common(task, hdr);
+ }
+ 
++static void
++ff_layout_io_prepare_transmit(struct rpc_task *task,
++		void *data)
++{
++	struct nfs_pgio_header *hdr = data;
++
++	if (!pnfs_is_valid_lseg(hdr->lseg))
++		rpc_exit(task, -EAGAIN);
++}
++
+ static void ff_layout_read_call_done(struct rpc_task *task, void *data)
+ {
+ 	struct nfs_pgio_header *hdr = data;
+@@ -1668,6 +1681,7 @@ static void ff_layout_commit_release(void *data)
+ 
+ static const struct rpc_call_ops ff_layout_read_call_ops_v3 = {
+ 	.rpc_call_prepare = ff_layout_read_prepare_v3,
++	.rpc_call_prepare_transmit = ff_layout_io_prepare_transmit,
+ 	.rpc_call_done = ff_layout_read_call_done,
+ 	.rpc_count_stats = ff_layout_read_count_stats,
+ 	.rpc_release = ff_layout_read_release,
+@@ -1675,6 +1689,7 @@ static const struct rpc_call_ops ff_layout_read_call_ops_v3 = {
+ 
+ static const struct rpc_call_ops ff_layout_read_call_ops_v4 = {
+ 	.rpc_call_prepare = ff_layout_read_prepare_v4,
++	.rpc_call_prepare_transmit = ff_layout_io_prepare_transmit,
+ 	.rpc_call_done = ff_layout_read_call_done,
+ 	.rpc_count_stats = ff_layout_read_count_stats,
+ 	.rpc_release = ff_layout_read_release,
+@@ -1682,6 +1697,7 @@ static const struct rpc_call_ops ff_layout_read_call_ops_v4 = {
+ 
+ static const struct rpc_call_ops ff_layout_write_call_ops_v3 = {
+ 	.rpc_call_prepare = ff_layout_write_prepare_v3,
++	.rpc_call_prepare_transmit = ff_layout_io_prepare_transmit,
+ 	.rpc_call_done = ff_layout_write_call_done,
+ 	.rpc_count_stats = ff_layout_write_count_stats,
+ 	.rpc_release = ff_layout_write_release,
+@@ -1689,6 +1705,7 @@ static const struct rpc_call_ops ff_layout_write_call_ops_v3 = {
+ 
+ static const struct rpc_call_ops ff_layout_write_call_ops_v4 = {
+ 	.rpc_call_prepare = ff_layout_write_prepare_v4,
++	.rpc_call_prepare_transmit = ff_layout_io_prepare_transmit,
+ 	.rpc_call_done = ff_layout_write_call_done,
+ 	.rpc_count_stats = ff_layout_write_count_stats,
+ 	.rpc_release = ff_layout_write_release,
+diff --git a/include/linux/sunrpc/sched.h b/include/linux/sunrpc/sched.h
+index 4e2b893b83a8..fa1faa10af26 100644
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@ -97,6 +97,7 @@ typedef void			(*rpc_action)(struct rpc_task *);
+ 
+ struct rpc_call_ops {
+ 	void (*rpc_call_prepare)(struct rpc_task *, void *);
++	void (*rpc_call_prepare_transmit)(struct rpc_task *, void *);
+ 	void (*rpc_call_done)(struct rpc_task *, void *);
+ 	void (*rpc_count_stats)(struct rpc_task *, void *);
+ 	void (*rpc_release)(void *);
+* Unmerged path net/sunrpc/xprt.c
