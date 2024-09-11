@@ -1,0 +1,140 @@
+mptcp: tag sequence_seq with socket state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit df00b087da24c0b5341178bbd5353101c7cef98f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/df00b087.failed
+
+Paolo Abeni suggested to avoid re-syncing new subflows because
+they inherit options from listener. In case options were set on
+listener but are not set on mptcp-socket there is no need to
+do any synchronisation for new subflows.
+
+This change sets sockopt_seq of new mptcp sockets to the seq of
+the mptcp listener sock.
+
+Subflow sequence is set to the embedded tcp listener sk.
+Add a comment explaing why sk_state is involved in sockopt_seq
+generation.
+
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df00b087da24c0b5341178bbd5353101c7cef98f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+#	net/mptcp/sockopt.c
+diff --cc net/mptcp/protocol.c
+index 72f56efe7a44,5cba90948a7e..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -740,18 -730,47 +740,54 @@@ wake
+  		sk->sk_data_ready(sk);
+  }
+  
+ -static bool mptcp_do_flush_join_list(struct mptcp_sock *msk)
+ +void __mptcp_flush_join_list(struct mptcp_sock *msk)
+  {
+  	struct mptcp_subflow_context *subflow;
++ 	bool ret = false;
+  
+  	if (likely(list_empty(&msk->join_list)))
+ -		return false;
+ +		return;
+  
+  	spin_lock_bh(&msk->join_list_lock);
+++<<<<<<< HEAD
+ +	list_for_each_entry(subflow, &msk->join_list, node)
+ +		mptcp_propagate_sndbuf((struct sock *)msk, mptcp_subflow_tcp_sock(subflow));
+ +	list_splice_tail_init(&msk->join_list, &msk->conn_list);
+ +	spin_unlock_bh(&msk->join_list_lock);
+++=======
++ 	list_for_each_entry(subflow, &msk->join_list, node) {
++ 		u32 sseq = READ_ONCE(subflow->setsockopt_seq);
++ 
++ 		mptcp_propagate_sndbuf((struct sock *)msk, mptcp_subflow_tcp_sock(subflow));
++ 		if (READ_ONCE(msk->setsockopt_seq) != sseq)
++ 			ret = true;
++ 	}
++ 	list_splice_tail_init(&msk->join_list, &msk->conn_list);
++ 	spin_unlock_bh(&msk->join_list_lock);
++ 
++ 	return ret;
++ }
++ 
++ void __mptcp_flush_join_list(struct mptcp_sock *msk)
++ {
++ 	if (likely(!mptcp_do_flush_join_list(msk)))
++ 		return;
++ 
++ 	if (!test_and_set_bit(MPTCP_WORK_SYNC_SETSOCKOPT, &msk->flags))
++ 		mptcp_schedule_work((struct sock *)msk);
++ }
++ 
++ static void mptcp_flush_join_list(struct mptcp_sock *msk)
++ {
++ 	bool sync_needed = test_and_clear_bit(MPTCP_WORK_SYNC_SETSOCKOPT, &msk->flags);
++ 
++ 	might_sleep();
++ 
++ 	if (!mptcp_do_flush_join_list(msk) && !sync_needed)
++ 		return;
++ 
++ 	mptcp_sockopt_sync_all(msk);
+++>>>>>>> df00b087da24 (mptcp: tag sequence_seq with socket state)
+  }
+  
+  static bool mptcp_timer_pending(struct sock *sk)
+* Unmerged path net/mptcp/sockopt.c
+* Unmerged path net/mptcp/protocol.c
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index d8de1e961ab0..aaca79ea427d 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -255,6 +255,8 @@ struct mptcp_sock {
+ 		u64	time;	/* start time of measurement window */
+ 		u64	rtt_us; /* last maximum rtt of subflows */
+ 	} rcvq_space;
++
++	u32 setsockopt_seq;
+ };
+ 
+ #define mptcp_lock_sock(___sk, cb) do {					\
+@@ -413,6 +415,8 @@ struct mptcp_subflow_context {
+ 	long	delegated_status;
+ 	struct	list_head delegated_node;   /* link into delegated_action, protected by local BH */
+ 
++	u32 setsockopt_seq;
++
+ 	struct	sock *tcp_sock;	    /* tcp sk backpointer */
+ 	struct	sock *conn;	    /* parent mptcp_sock */
+ 	const	struct inet_connection_sock_af_ops *icsk_af_ops;
+* Unmerged path net/mptcp/sockopt.c
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index daf4617487df..00d798a796d7 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -687,6 +687,9 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 			goto out;
+ 		}
+ 
++		/* ssk inherits options of listener sk */
++		ctx->setsockopt_seq = listener->setsockopt_seq;
++
+ 		if (ctx->mp_capable) {
+ 			/* this can't race with mptcp_close(), as the msk is
+ 			 * not yet exposted to user-space
+@@ -702,6 +705,7 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 			 * created mptcp socket
+ 			 */
+ 			new_msk->sk_destruct = mptcp_sock_destruct;
++			mptcp_sk(new_msk)->setsockopt_seq = ctx->setsockopt_seq;
+ 			mptcp_pm_new_connection(mptcp_sk(new_msk), child, 1);
+ 			mptcp_token_accept(subflow_req, mptcp_sk(new_msk));
+ 			ctx->conn = new_msk;
