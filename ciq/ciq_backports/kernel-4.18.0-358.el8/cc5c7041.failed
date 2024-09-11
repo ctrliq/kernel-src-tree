@@ -1,0 +1,234 @@
+printk: ringbuffer: clear initial reserved fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit cc5c7041c6e1fe8c02fe9e16f28a5e52f7a6957c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/cc5c7041.failed
+
+prb_reserve() will set some meta data values and leave others
+uninitialized (or rather, containing the values of the previous
+wrap). Simplify the API by always clearing out all the fields.
+Only the sequence number is filled in. The caller is now
+responsible for filling in the rest of the meta data fields.
+In particular, for correctly filling in text and dict lengths.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20200914123354.832-4-john.ogness@linutronix.de
+(cherry picked from commit cc5c7041c6e1fe8c02fe9e16f28a5e52f7a6957c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index c1fedccb5ed4,964b5701688f..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -634,44 -516,28 +634,58 @@@ static int log_store(u32 caller_id, in
+  			return 0;
+  	}
+  
+ +	if (log_next_idx + size + sizeof(struct printk_log) > log_buf_len) {
+ +		/*
+ +		 * This message + an additional empty header does not fit
+ +		 * at the end of the buffer. Add an empty header with len == 0
+ +		 * to signify a wrap around.
+ +		 */
+ +		memset(log_buf + log_next_idx, 0, sizeof(struct printk_log));
+ +		log_next_idx = 0;
+ +	}
+ +
+  	/* fill message */
+++<<<<<<< HEAD
+ +	msg = (struct printk_log *)(log_buf + log_next_idx);
+ +	memcpy(log_text(msg), text, text_len);
+ +	msg->text_len = text_len;
+ +	if (trunc_msg_len) {
+ +		memcpy(log_text(msg) + text_len, trunc_msg, trunc_msg_len);
+ +		msg->text_len += trunc_msg_len;
+ +	}
+ +	memcpy(log_dict(msg), dict, dict_len);
+ +	msg->dict_len = dict_len;
+ +	msg->facility = facility;
+ +	msg->level = level & 7;
+ +	msg->flags = flags & 0x1f;
+++=======
++ 	memcpy(&r.text_buf[0], text, text_len);
++ 	if (trunc_msg_len)
++ 		memcpy(&r.text_buf[text_len], trunc_msg, trunc_msg_len);
++ 	r.info->text_len = text_len + trunc_msg_len;
++ 	if (r.dict_buf) {
++ 		memcpy(&r.dict_buf[0], dict, dict_len);
++ 		r.info->dict_len = dict_len;
++ 	}
++ 	r.info->facility = facility;
++ 	r.info->level = level & 7;
++ 	r.info->flags = flags & 0x1f;
+++>>>>>>> cc5c7041c6e1 (printk: ringbuffer: clear initial reserved fields)
+  	if (ts_nsec > 0)
+ -		r.info->ts_nsec = ts_nsec;
+ +		msg->ts_nsec = ts_nsec;
+  	else
+ -		r.info->ts_nsec = local_clock();
+ -	r.info->caller_id = caller_id;
+ +		msg->ts_nsec = local_clock();
+ +#ifdef CONFIG_PRINTK_CALLER
+ +	msg->caller_id = caller_id;
+ +#endif
+ +	memset(log_dict(msg) + dict_len, 0, pad_len);
+ +	msg->len = size;
+  
+  	/* insert message */
+ -	prb_commit(&e);
+ +	log_next_idx += msg->len;
+ +	log_next_seq++;
+  
+ -	return (text_len + trunc_msg_len);
+ +	return msg->text_len;
+  }
+  
+  int dmesg_restrict = IS_ENABLED(CONFIG_SECURITY_DMESG_RESTRICT);
+@@@ -1166,11 -1061,49 +1180,45 @@@ static void __init set_percpu_data_read
+  	__printk_percpu_data_ready = true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int __init add_to_rb(struct printk_ringbuffer *rb,
++ 				     struct printk_record *r)
++ {
++ 	struct prb_reserved_entry e;
++ 	struct printk_record dest_r;
++ 
++ 	prb_rec_init_wr(&dest_r, r->info->text_len, r->info->dict_len);
++ 
++ 	if (!prb_reserve(&e, rb, &dest_r))
++ 		return 0;
++ 
++ 	memcpy(&dest_r.text_buf[0], &r->text_buf[0], r->info->text_len);
++ 	dest_r.info->text_len = r->info->text_len;
++ 	if (dest_r.dict_buf) {
++ 		memcpy(&dest_r.dict_buf[0], &r->dict_buf[0], r->info->dict_len);
++ 		dest_r.info->dict_len = r->info->dict_len;
++ 	}
++ 	dest_r.info->facility = r->info->facility;
++ 	dest_r.info->level = r->info->level;
++ 	dest_r.info->flags = r->info->flags;
++ 	dest_r.info->ts_nsec = r->info->ts_nsec;
++ 	dest_r.info->caller_id = r->info->caller_id;
++ 
++ 	prb_commit(&e);
++ 
++ 	return prb_record_text_space(&e);
++ }
++ 
++ static char setup_text_buf[CONSOLE_EXT_LOG_MAX] __initdata;
++ static char setup_dict_buf[CONSOLE_EXT_LOG_MAX] __initdata;
++ 
+++>>>>>>> cc5c7041c6e1 (printk: ringbuffer: clear initial reserved fields)
+  void __init setup_log_buf(int early)
+  {
+ -	unsigned int new_descs_count;
+ -	struct prb_desc *new_descs;
+ -	struct printk_info info;
+ -	struct printk_record r;
+ -	size_t new_descs_size;
+  	unsigned long flags;
+ -	char *new_dict_buf;
+  	char *new_log_buf;
+  	unsigned int free;
+ -	u64 seq;
+  
+  	/*
+  	 * Some archs call setup_log_buf() multiple times - first is very
+* Unmerged path kernel/printk/printk.c
+diff --git a/kernel/printk/printk_ringbuffer.c b/kernel/printk/printk_ringbuffer.c
+index 195e6f4d4df6..5a9c7c8cff7b 100644
+--- a/kernel/printk/printk_ringbuffer.c
++++ b/kernel/printk/printk_ringbuffer.c
+@@ -146,10 +146,13 @@
+  *
+  *	if (prb_reserve(&e, &test_rb, &r)) {
+  *		snprintf(r.text_buf, r.text_buf_size, "%s", textstr);
++ *		r.info->text_len = strlen(textstr);
+  *
+  *		// dictionary allocation may have failed
+- *		if (r.dict_buf)
++ *		if (r.dict_buf) {
+  *			snprintf(r.dict_buf, r.dict_buf_size, "%s", dictstr);
++ *			r.info->dict_len = strlen(dictstr);
++ *		}
+  *
+  *		r.info->ts_nsec = local_clock();
+  *
+@@ -1142,9 +1145,9 @@ static const char *get_data(struct prb_data_ring *data_ring,
+  * @dict_buf_size is set to 0. Writers must check this before writing to
+  * dictionary space.
+  *
+- * @info->text_len and @info->dict_len will already be set to @text_buf_size
+- * and @dict_buf_size, respectively. If dictionary space reservation fails,
+- * @info->dict_len is set to 0.
++ * Important: @info->text_len and @info->dict_len need to be set correctly by
++ *            the writer in order for data to be readable and/or extended.
++ *            Their values are initialized to 0.
+  */
+ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+ 		 struct printk_record *r)
+@@ -1152,6 +1155,7 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+ 	struct prb_desc_ring *desc_ring = &rb->desc_ring;
+ 	struct prb_desc *d;
+ 	unsigned long id;
++	u64 seq;
+ 
+ 	if (!data_check_size(&rb->text_data_ring, r->text_buf_size))
+ 		goto fail;
+@@ -1176,6 +1180,14 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+ 
+ 	d = to_desc(desc_ring, id);
+ 
++	/*
++	 * All @info fields (except @seq) are cleared and must be filled in
++	 * by the writer. Save @seq before clearing because it is used to
++	 * determine the new sequence number.
++	 */
++	seq = d->info.seq;
++	memset(&d->info, 0, sizeof(d->info));
++
+ 	/*
+ 	 * Set the @e fields here so that prb_commit() can be used if
+ 	 * text data allocation fails.
+@@ -1194,17 +1206,15 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+ 	 * See the "Bootstrap" comment block in printk_ringbuffer.h for
+ 	 * details about how the initializer bootstraps the descriptors.
+ 	 */
+-	if (d->info.seq == 0 && DESC_INDEX(desc_ring, id) != 0)
++	if (seq == 0 && DESC_INDEX(desc_ring, id) != 0)
+ 		d->info.seq = DESC_INDEX(desc_ring, id);
+ 	else
+-		d->info.seq += DESCS_COUNT(desc_ring);
++		d->info.seq = seq + DESCS_COUNT(desc_ring);
+ 
+ 	r->text_buf = data_alloc(rb, &rb->text_data_ring, r->text_buf_size,
+ 				 &d->text_blk_lpos, id);
+ 	/* If text data allocation fails, a data-less record is committed. */
+ 	if (r->text_buf_size && !r->text_buf) {
+-		d->info.text_len = 0;
+-		d->info.dict_len = 0;
+ 		prb_commit(e);
+ 		/* prb_commit() re-enabled interrupts. */
+ 		goto fail;
+@@ -1221,10 +1231,6 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+ 
+ 	r->info = &d->info;
+ 
+-	/* Set default values for the sizes. */
+-	d->info.text_len = r->text_buf_size;
+-	d->info.dict_len = r->dict_buf_size;
+-
+ 	/* Record full text space used by record. */
+ 	e->text_space = space_used(&rb->text_data_ring, &d->text_blk_lpos);
+ 
