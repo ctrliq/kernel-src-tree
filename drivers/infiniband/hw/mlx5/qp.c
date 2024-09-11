@@ -3194,10 +3194,10 @@ static int mlx5_set_path(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 
 	if (ah_flags & IB_AH_GRH) {
 		if (grh->sgid_index >=
-		    dev->mdev->port_caps[port - 1].gid_table_len) {
+		    dev->port_caps[port - 1].gid_table_len) {
 			pr_err("sgid_index (%u) too large. max is %d\n",
 			       grh->sgid_index,
-			       dev->mdev->port_caps[port - 1].gid_table_len);
+			       dev->port_caps[port - 1].gid_table_len);
 			return -EINVAL;
 		}
 	}
@@ -4328,7 +4328,7 @@ int mlx5_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	if (attr_mask & IB_QP_PKEY_INDEX) {
 		port = attr_mask & IB_QP_PORT ? attr->port_num : qp->port;
 		if (attr->pkey_index >=
-		    dev->mdev->port_caps[port - 1].pkey_table_len) {
+		    dev->port_caps[port - 1].pkey_table_len) {
 			mlx5_ib_dbg(dev, "invalid pkey index %d\n",
 				    attr->pkey_index);
 			goto out;
