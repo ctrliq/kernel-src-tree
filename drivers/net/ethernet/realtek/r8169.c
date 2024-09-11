@@ -625,6 +625,10 @@ struct rtl8169_stats {
 	struct u64_stats_sync	syncp;
 };
 
+struct rtl8169_private;
+typedef void (*rtl_fw_write_t)(struct rtl8169_private *tp, int reg, int val);
+typedef int (*rtl_fw_read_t)(struct rtl8169_private *tp, int reg);
+
 struct rtl8169_private {
 	void __iomem *mmio_addr;	/* memory map physical address */
 	struct pci_dev *pci_dev;
@@ -678,6 +682,10 @@ struct rtl8169_private {
 
 	const char *fw_name;
 	struct rtl_fw {
+		rtl_fw_write_t phy_write;
+		rtl_fw_read_t phy_read;
+		rtl_fw_write_t mac_mcu_write;
+		rtl_fw_read_t mac_mcu_read;
 		const struct firmware *fw;
 
 #define RTL_VER_SIZE		32
@@ -1008,7 +1016,7 @@ static int r8168dp_2_mdio_read(struct rtl8169_private *tp, int reg)
 	return value;
 }
 
-static void rtl_writephy(struct rtl8169_private *tp, int location, u32 val)
+static void rtl_writephy(struct rtl8169_private *tp, int location, int val)
 {
 	tp->mdio_ops.write(tp, location, val);
 }
@@ -2426,16 +2434,14 @@ out:
 	return rc;
 }
 
-static void rtl_phy_write_fw(struct rtl8169_private *tp, struct rtl_fw *rtl_fw)
+static void rtl_fw_write_firmware(struct rtl8169_private *tp,
+				  struct rtl_fw *rtl_fw)
 {
 	struct rtl_fw_phy_action *pa = &rtl_fw->phy_action;
-	struct mdio_ops org, *ops = &tp->mdio_ops;
-	u32 predata, count;
+	rtl_fw_write_t fw_write = rtl_fw->phy_write;
+	rtl_fw_read_t fw_read = rtl_fw->phy_read;
+	int predata = 0, count = 0;
 	size_t index;
-
-	predata = count = 0;
-	org.write = ops->write;
-	org.read = ops->read;
 
 	for (index = 0; index < pa->size; ) {
 		u32 action = le32_to_cpu(pa->code[index]);
@@ -2447,7 +2453,7 @@ static void rtl_phy_write_fw(struct rtl8169_private *tp, struct rtl_fw *rtl_fw)
 
 		switch(action & 0xf0000000) {
 		case PHY_READ:
-			predata = rtl_readphy(tp, regno);
+			predata = fw_read(tp, regno);
 			count++;
 			index++;
 			break;
@@ -2464,11 +2470,11 @@ static void rtl_phy_write_fw(struct rtl8169_private *tp, struct rtl_fw *rtl_fw)
 			break;
 		case PHY_MDIO_CHG:
 			if (data == 0) {
-				ops->write = org.write;
-				ops->read = org.read;
+				fw_write = rtl_fw->phy_write;
+				fw_read = rtl_fw->phy_read;
 			} else if (data == 1) {
-				ops->write = mac_mcu_write;
-				ops->read = mac_mcu_read;
+				fw_write = rtl_fw->mac_mcu_write;
+				fw_read = rtl_fw->mac_mcu_read;
 			}
 
 			index++;
@@ -2478,7 +2484,7 @@ static void rtl_phy_write_fw(struct rtl8169_private *tp, struct rtl_fw *rtl_fw)
 			index++;
 			break;
 		case PHY_WRITE:
-			rtl_writephy(tp, regno, data);
+			fw_write(tp, regno, data);
 			index++;
 			break;
 		case PHY_READCOUNT_EQ_SKIP:
@@ -2495,7 +2501,7 @@ static void rtl_phy_write_fw(struct rtl8169_private *tp, struct rtl_fw *rtl_fw)
 			index++;
 			break;
 		case PHY_WRITE_PREVIOUS:
-			rtl_writephy(tp, regno, predata);
+			fw_write(tp, regno, predata);
 			index++;
 			break;
 		case PHY_SKIPN:
@@ -2510,9 +2516,6 @@ static void rtl_phy_write_fw(struct rtl8169_private *tp, struct rtl_fw *rtl_fw)
 			BUG();
 		}
 	}
-
-	ops->write = org.write;
-	ops->read = org.read;
 }
 
 static void rtl_release_firmware(struct rtl8169_private *tp)
@@ -2526,9 +2529,9 @@ static void rtl_release_firmware(struct rtl8169_private *tp)
 
 static void rtl_apply_firmware(struct rtl8169_private *tp)
 {
-	/* TODO: release firmware once rtl_phy_write_fw signals failures. */
+	/* TODO: release firmware if rtl_fw_write_firmware signals failure. */
 	if (tp->rtl_fw)
-		rtl_phy_write_fw(tp, tp->rtl_fw);
+		rtl_fw_write_firmware(tp, tp->rtl_fw);
 }
 
 static void rtl_apply_firmware_cond(struct rtl8169_private *tp, u8 reg, u16 val)
@@ -4357,6 +4360,11 @@ static void rtl_request_firmware(struct rtl8169_private *tp)
 	rtl_fw = kzalloc(sizeof(*rtl_fw), GFP_KERNEL);
 	if (!rtl_fw)
 		goto err_warn;
+
+	rtl_fw->phy_write = rtl_writephy;
+	rtl_fw->phy_read = rtl_readphy;
+	rtl_fw->mac_mcu_write = mac_mcu_write;
+	rtl_fw->mac_mcu_read = mac_mcu_read;
 
 	rc = request_firmware(&rtl_fw->fw, tp->fw_name, tp_to_dev(tp));
 	if (rc < 0)
