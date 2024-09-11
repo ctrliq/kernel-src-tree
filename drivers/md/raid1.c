@@ -70,7 +70,8 @@ static int check_and_add_serial(struct md_rdev *rdev, sector_t lo, sector_t hi)
 	unsigned long flags;
 	int ret = 0;
 	struct mddev *mddev = rdev->mddev;
-	struct serial_in_rdev *serial = rdev->serial;
+	int idx = sector_to_idx(lo);
+	struct serial_in_rdev *serial = &rdev->serial[idx];
 
 	si = mempool_alloc(mddev->serial_info_pool, GFP_NOIO);
 
@@ -95,7 +96,8 @@ static void remove_serial(struct md_rdev *rdev, sector_t lo, sector_t hi)
 	unsigned long flags;
 	int found = 0;
 	struct mddev *mddev = rdev->mddev;
-	struct serial_in_rdev *serial = rdev->serial;
+	int idx = sector_to_idx(lo);
+	struct serial_in_rdev *serial = &rdev->serial[idx];
 
 	spin_lock_irqsave(&serial->serial_lock, flags);
 	for (si = raid1_rb_iter_first(&serial->serial_rb, lo, hi);
@@ -1494,7 +1496,8 @@ static void raid1_write_request(struct mddev *mddev, struct bio *bio,
 	for (i = 0; i < disks; i++) {
 		struct bio *mbio = NULL;
 		struct md_rdev *rdev = conf->mirrors[i].rdev;
-		struct serial_in_rdev *serial = rdev->serial;
+		int idx = sector_to_idx(lo);
+		struct serial_in_rdev *serial = &rdev->serial[idx];
 		if (!r1_bio->bios[i])
 			continue;
 
