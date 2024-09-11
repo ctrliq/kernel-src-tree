@@ -1,0 +1,253 @@
+xfs: add a xfs_inode_buftarg helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 30fa529e3b2e6f1da277ef8525e4ce7979c57c57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/30fa529e.failed
+
+Add a new xfs_inode_buftarg helper that gets the data I/O buftarg for a
+given inode.  Replace the existing xfs_find_bdev_for_inode and
+xfs_find_daxdev_for_inode helpers with this new general one and cleanup
+some of the callers.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 30fa529e3b2e6f1da277ef8525e4ce7979c57c57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index a00a3cc98633,ee4ebb7904f6..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -1242,19 -1229,22 +1242,29 @@@ static const struct vm_operations_struc
+  
+  STATIC int
+  xfs_file_mmap(
+- 	struct file	*filp,
+- 	struct vm_area_struct *vma)
++ 	struct file		*file,
++ 	struct vm_area_struct	*vma)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct inode		*inode = file_inode(file);
++ 	struct xfs_buftarg	*target = xfs_inode_buftarg(XFS_I(inode));
++ 
+++>>>>>>> 30fa529e3b2e (xfs: add a xfs_inode_buftarg helper)
+  	/*
+ -	 * We don't support synchronous mappings for non-DAX files and
+ -	 * for DAX files if underneath dax_device is not synchronous.
+ +	 * We don't support synchronous mappings for non-DAX files. At least
+ +	 * until someone comes with a sensible use case.
+  	 */
+++<<<<<<< HEAD
+ +	if (!IS_DAX(file_inode(filp)) && (vma->vm_flags & VM_SYNC))
+++=======
++ 	if (!daxdev_mapping_supported(vma, target->bt_daxdev))
+++>>>>>>> 30fa529e3b2e (xfs: add a xfs_inode_buftarg helper)
+  		return -EOPNOTSUPP;
+  
+- 	file_accessed(filp);
++ 	file_accessed(file);
+  	vma->vm_ops = &xfs_file_vm_ops;
+- 	if (IS_DAX(file_inode(filp)))
++ 	if (IS_DAX(inode))
+  		vma->vm_flags |= VM_HUGEPAGE;
+  	return 0;
+  }
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 5d3503f6412a..3a688eb5c5ae 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -30,32 +30,6 @@ XFS_WPC(struct iomap_writepage_ctx *ctx)
+ 	return container_of(ctx, struct xfs_writepage_ctx, ctx);
+ }
+ 
+-struct block_device *
+-xfs_find_bdev_for_inode(
+-	struct inode		*inode)
+-{
+-	struct xfs_inode	*ip = XFS_I(inode);
+-	struct xfs_mount	*mp = ip->i_mount;
+-
+-	if (XFS_IS_REALTIME_INODE(ip))
+-		return mp->m_rtdev_targp->bt_bdev;
+-	else
+-		return mp->m_ddev_targp->bt_bdev;
+-}
+-
+-struct dax_device *
+-xfs_find_daxdev_for_inode(
+-	struct inode		*inode)
+-{
+-	struct xfs_inode	*ip = XFS_I(inode);
+-	struct xfs_mount	*mp = ip->i_mount;
+-
+-	if (XFS_IS_REALTIME_INODE(ip))
+-		return mp->m_rtdev_targp->bt_daxdev;
+-	else
+-		return mp->m_ddev_targp->bt_daxdev;
+-}
+-
+ /*
+  * Fast and loose check if this write could update the on-disk inode size.
+  */
+@@ -609,9 +583,11 @@ xfs_dax_writepages(
+ 	struct address_space	*mapping,
+ 	struct writeback_control *wbc)
+ {
+-	xfs_iflags_clear(XFS_I(mapping->host), XFS_ITRUNCATED);
++	struct xfs_inode	*ip = XFS_I(mapping->host);
++
++	xfs_iflags_clear(ip, XFS_ITRUNCATED);
+ 	return dax_writeback_mapping_range(mapping,
+-			xfs_find_bdev_for_inode(mapping->host), wbc);
++			xfs_inode_buftarg(ip)->bt_bdev, wbc);
+ }
+ 
+ STATIC sector_t
+@@ -661,7 +637,7 @@ xfs_iomap_swapfile_activate(
+ 	struct file			*swap_file,
+ 	sector_t			*span)
+ {
+-	sis->bdev = xfs_find_bdev_for_inode(file_inode(swap_file));
++	sis->bdev = xfs_inode_buftarg(XFS_I(file_inode(swap_file)))->bt_bdev;
+ 	return iomap_swapfile_activate(sis, swap_file, span,
+ 			&xfs_read_iomap_ops);
+ }
+diff --git a/fs/xfs/xfs_aops.h b/fs/xfs/xfs_aops.h
+index 687b11f34fa2..e0bd68419764 100644
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@ -11,7 +11,4 @@ extern const struct address_space_operations xfs_dax_aops;
+ 
+ int	xfs_setfilesize(struct xfs_inode *ip, xfs_off_t offset, size_t size);
+ 
+-extern struct block_device *xfs_find_bdev_for_inode(struct inode *);
+-extern struct dax_device *xfs_find_daxdev_for_inode(struct inode *);
+-
+ #endif /* __XFS_AOPS_H__ */
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 7b9ed655300c..795ea600638f 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -53,15 +53,16 @@ xfs_fsb_to_db(struct xfs_inode *ip, xfs_fsblock_t fsb)
+  */
+ int
+ xfs_zero_extent(
+-	struct xfs_inode *ip,
+-	xfs_fsblock_t	start_fsb,
+-	xfs_off_t	count_fsb)
++	struct xfs_inode	*ip,
++	xfs_fsblock_t		start_fsb,
++	xfs_off_t		count_fsb)
+ {
+-	struct xfs_mount *mp = ip->i_mount;
+-	xfs_daddr_t	sector = xfs_fsb_to_db(ip, start_fsb);
+-	sector_t	block = XFS_BB_TO_FSBT(mp, sector);
++	struct xfs_mount	*mp = ip->i_mount;
++	struct xfs_buftarg	*target = xfs_inode_buftarg(ip);
++	xfs_daddr_t		sector = xfs_fsb_to_db(ip, start_fsb);
++	sector_t		block = XFS_BB_TO_FSBT(mp, sector);
+ 
+-	return blkdev_issue_zeroout(xfs_find_bdev_for_inode(VFS_I(ip)),
++	return blkdev_issue_zeroout(target->bt_bdev,
+ 		block << (mp->m_super->s_blocksize_bits - 9),
+ 		count_fsb << (mp->m_super->s_blocksize_bits - 9),
+ 		GFP_NOFS, 0);
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index e493d491b7cc..931e7cd0e412 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -219,6 +219,13 @@ static inline bool xfs_inode_has_cow_data(struct xfs_inode *ip)
+ 	return ip->i_cowfp && ip->i_cowfp->if_bytes;
+ }
+ 
++/*
++ * Return the buftarg used for data allocations on a given inode.
++ */
++#define xfs_inode_buftarg(ip) \
++	(XFS_IS_REALTIME_INODE(ip) ? \
++		(ip)->i_mount->m_rtdev_targp : (ip)->i_mount->m_ddev_targp)
++
+ /*
+  * In-core inode flags.
+  */
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index fb3149d359c4..9b6f059dd64b 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -1340,10 +1340,9 @@ xfs_ioctl_setattr_dax_invalidate(
+ 	 * have to check the device for dax support or flush pagecache.
+ 	 */
+ 	if (fa->fsx_xflags & FS_XFLAG_DAX) {
+-		if (!(S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode)))
+-			return -EINVAL;
+-		if (!bdev_dax_supported(xfs_find_bdev_for_inode(VFS_I(ip)),
+-				sb->s_blocksize))
++		struct xfs_buftarg	*target = xfs_inode_buftarg(ip);
++
++		if (!bdev_dax_supported(target->bt_bdev, sb->s_blocksize))
+ 			return -EINVAL;
+ 	}
+ 
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 379cfe375512..8ccf37f37885 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -57,6 +57,7 @@ xfs_bmbt_to_iomap(
+ 	u16			flags)
+ {
+ 	struct xfs_mount	*mp = ip->i_mount;
++	struct xfs_buftarg	*target = xfs_inode_buftarg(ip);
+ 
+ 	if (unlikely(!xfs_valid_startblock(ip, imap->br_startblock)))
+ 		return xfs_alert_fsblock_zero(ip, imap);
+@@ -77,8 +78,8 @@ xfs_bmbt_to_iomap(
+ 	}
+ 	iomap->offset = XFS_FSB_TO_B(mp, imap->br_startoff);
+ 	iomap->length = XFS_FSB_TO_B(mp, imap->br_blockcount);
+-	iomap->bdev = xfs_find_bdev_for_inode(VFS_I(ip));
+-	iomap->dax_dev = xfs_find_daxdev_for_inode(VFS_I(ip));
++	iomap->bdev = target->bt_bdev;
++	iomap->dax_dev = target->bt_daxdev;
+ 	iomap->flags = flags;
+ 
+ 	if (xfs_ipincount(ip) &&
+@@ -94,12 +95,14 @@ xfs_hole_to_iomap(
+ 	xfs_fileoff_t		offset_fsb,
+ 	xfs_fileoff_t		end_fsb)
+ {
++	struct xfs_buftarg	*target = xfs_inode_buftarg(ip);
++
+ 	iomap->addr = IOMAP_NULL_ADDR;
+ 	iomap->type = IOMAP_HOLE;
+ 	iomap->offset = XFS_FSB_TO_B(ip->i_mount, offset_fsb);
+ 	iomap->length = XFS_FSB_TO_B(ip->i_mount, end_fsb - offset_fsb);
+-	iomap->bdev = xfs_find_bdev_for_inode(VFS_I(ip));
+-	iomap->dax_dev = xfs_find_daxdev_for_inode(VFS_I(ip));
++	iomap->bdev = target->bt_bdev;
++	iomap->dax_dev = target->bt_daxdev;
+ }
+ 
+ static inline xfs_fileoff_t
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index fcf573df2621..e2788624fb03 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -1227,7 +1227,7 @@ xfs_inode_supports_dax(
+ 		return false;
+ 
+ 	/* Device has to support DAX too. */
+-	return xfs_find_daxdev_for_inode(VFS_I(ip)) != NULL;
++	return xfs_inode_buftarg(ip)->bt_daxdev != NULL;
+ }
+ 
+ STATIC void
