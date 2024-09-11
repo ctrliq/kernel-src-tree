@@ -1,0 +1,398 @@
+s390/qeth: Translate address events into switchdev notifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Alexandra Winter <wintera@linux.ibm.com>
+commit 10a6cfc0fc8208eff3d1dd8dce1487754213e337
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/10a6cfc0.failed
+
+A qeth-l2 HiperSockets card can show switch-ish behaviour in the sense,
+that it can report all MACs that are reachable via this interface. Just
+like a switch device, it can notify the software bridge about changes
+to its fdb. This patch exploits this device-to-bridge-notification and
+extracts the relevant information from the hardware events to generate
+notifications to an attached software bridge.
+
+There are 2 sources for this information:
+1) The reply message of Perform-Network-Subchannel-Operations (PNSO)
+(operation code ADDR_INFO) reports all addresses that are currently
+reachable (implemented in a later patch).
+2) As long as device-to-bridge-notification is enabled, hardware will
+generate address change notification events, whenever the content of
+the hardware fdb changes (this patch).
+
+The bridge_hostnotify feature (PNSO operation code BRIDGE_INFO) uses
+the same address change notification events. We need to distinguish
+between qeth_pnso_mode QETH_PNSO_BRIDGEPORT and QETH_PNSO_ADDR_INFO
+and call a different handler. In both cases deadlocks must be
+prevented, if the workqueue is drained under lock and QETH_PNSO_NONE,
+when notification is disabled.
+
+bridge_hostnotify generates udev events, there is no intend to do the same
+for dev2br. Instead this patch will generate SWITCHDEV_FDB_ADD_TO_BRIDGE
+and SWITCHDEV_FDB_DEL_TO_BRIDGE notifications, that will cause the
+software bridge to add (or delete) entries to its fdb as 'extern_learn
+offload'.
+
+Documentation/networking/switchdev.txt proposes to add
+"depends NET_SWITCHDEV" to driver's Kconfig. This is not done here,
+so even in absence of the NET_SWITCHDEV module, the QETH_L2 module will
+still be built, but then the switchdev notifiers will have no effect.
+
+No VLAN filtering is done on the entries and VLAN information is not
+passed on to the bridge fdb entries. This could be added later.
+For now VLAN interfaces can be defined on the upper bridge interface.
+
+Multicast entries are not passed on to the bridge fdb.
+This could be added later. For now mcast flooding can be used in the
+bridge.
+
+The card reports all MACs that are in its FDB, but we must not pass on
+MACs that are registered for this interface.
+
+	Signed-off-by: Alexandra Winter <wintera@linux.ibm.com>
+	Reviewed-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 10a6cfc0fc8208eff3d1dd8dce1487754213e337)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_l2_main.c
+diff --cc drivers/s390/net/qeth_core.h
+index 7c464101b646,4c8134a953c9..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -674,6 -674,12 +674,15 @@@ struct qeth_card_blkt 
+  	int inter_packet_jumbo;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum qeth_pnso_mode {
++ 	QETH_PNSO_NONE,
++ 	QETH_PNSO_BRIDGEPORT,
++ 	QETH_PNSO_ADDR_INFO,
++ };
++ 
+++>>>>>>> 10a6cfc0fc82 (s390/qeth: Translate address events into switchdev notifiers)
+  #define QETH_BROADCAST_WITH_ECHO    0x01
+  #define QETH_BROADCAST_WITHOUT_ECHO 0x02
+  struct qeth_card_info {
+diff --cc drivers/s390/net/qeth_l2_main.c
+index 88261c8e41f6,fffbc50cadc6..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -20,6 -20,10 +20,12 @@@
+  #include <linux/list.h>
+  #include <linux/hash.h>
+  #include <linux/hashtable.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/switchdev.h>
++ #include <asm/chsc.h>
++ #include <asm/css_chars.h>
+++>>>>>>> 10a6cfc0fc82 (s390/qeth: Translate address events into switchdev notifiers)
+  #include <asm/setup.h>
+  #include "qeth_core.h"
+  #include "qeth_l2.h"
+@@@ -669,6 -642,136 +675,139 @@@ static void qeth_l2_set_rx_mode(struct 
+  	schedule_work(&card->rx_mode_work);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  *	qeth_l2_pnso() - perform network subchannel operation
++  *	@card: qeth_card structure pointer
++  *	@oc: Operation Code
++  *	@cnc: Boolean Change-Notification Control
++  *	@cb: Callback function will be executed for each element
++  *		of the address list
++  *	@priv: Pointer to pass to the callback function.
++  *
++  *	Collects network information in a network address list and calls the
++  *	callback function for every entry in the list. If "change-notification-
++  *	control" is set, further changes in the address list will be reported
++  *	via the IPA command.
++  */
++ static int qeth_l2_pnso(struct qeth_card *card, u8 oc, int cnc,
++ 			void (*cb)(void *priv, struct chsc_pnso_naid_l2 *entry),
++ 			void *priv)
++ {
++ 	struct ccw_device *ddev = CARD_DDEV(card);
++ 	struct chsc_pnso_area *rr;
++ 	u32 prev_instance = 0;
++ 	int isfirstblock = 1;
++ 	int i, size, elems;
++ 	int rc;
++ 
++ 	rr = (struct chsc_pnso_area *)get_zeroed_page(GFP_KERNEL);
++ 	if (rr == NULL)
++ 		return -ENOMEM;
++ 	do {
++ 		QETH_CARD_TEXT(card, 2, "PNSO");
++ 		/* on the first iteration, naihdr.resume_token will be zero */
++ 		rc = ccw_device_pnso(ddev, rr, oc, rr->naihdr.resume_token,
++ 				     cnc);
++ 		if (rc)
++ 			continue;
++ 		if (cb == NULL)
++ 			continue;
++ 
++ 		size = rr->naihdr.naids;
++ 		if (size != sizeof(struct chsc_pnso_naid_l2)) {
++ 			WARN_ON_ONCE(1);
++ 			continue;
++ 		}
++ 
++ 		elems = (rr->response.length - sizeof(struct chsc_header) -
++ 			 sizeof(struct chsc_pnso_naihdr)) / size;
++ 
++ 		if (!isfirstblock && (rr->naihdr.instance != prev_instance)) {
++ 			/* Inform the caller that they need to scrap */
++ 			/* the data that was already reported via cb */
++ 			rc = -EAGAIN;
++ 			break;
++ 		}
++ 		isfirstblock = 0;
++ 		prev_instance = rr->naihdr.instance;
++ 		for (i = 0; i < elems; i++)
++ 			(*cb)(priv, &rr->entries[i]);
++ 	} while ((rc == -EBUSY) || (!rc && /* list stored */
++ 		   /* resume token is non-zero => list incomplete */
++ 		   (rr->naihdr.resume_token.t1 || rr->naihdr.resume_token.t2)));
++ 
++ 	if (rc)
++ 		QETH_CARD_TEXT_(card, 2, "PNrp%04x", rr->response.code);
++ 
++ 	free_page((unsigned long)rr);
++ 	return rc;
++ }
++ 
++ static bool qeth_is_my_net_if_token(struct qeth_card *card,
++ 				    struct net_if_token *token)
++ {
++ 	return ((card->info.ddev_devno == token->devnum) &&
++ 		(card->info.cssid == token->cssid) &&
++ 		(card->info.iid == token->iid) &&
++ 		(card->info.ssid == token->ssid) &&
++ 		(card->info.chpid == token->chpid) &&
++ 		(card->info.chid == token->chid));
++ }
++ 
++ /**
++  *	qeth_l2_dev2br_fdb_notify() - update fdb of master bridge
++  *	@card:	qeth_card structure pointer
++  *	@code:	event bitmask: high order bit 0x80 set to
++  *				1 - removal of an object
++  *				0 - addition of an object
++  *			       Object type(s):
++  *				0x01 - VLAN, 0x02 - MAC, 0x03 - VLAN and MAC
++  *	@token: "network token" structure identifying 'physical' location
++  *		of the target
++  *	@addr_lnid: structure with MAC address and VLAN ID of the target
++  */
++ static void qeth_l2_dev2br_fdb_notify(struct qeth_card *card, u8 code,
++ 				      struct net_if_token *token,
++ 				      struct mac_addr_lnid *addr_lnid)
++ {
++ 	struct switchdev_notifier_fdb_info info;
++ 	u8 ntfy_mac[ETH_ALEN];
++ 
++ 	ether_addr_copy(ntfy_mac, addr_lnid->mac);
++ 	/* Ignore VLAN only changes */
++ 	if (!(code & IPA_ADDR_CHANGE_CODE_MACADDR))
++ 		return;
++ 	/* Ignore mcast entries */
++ 	if (is_multicast_ether_addr(ntfy_mac))
++ 		return;
++ 	/* Ignore my own addresses */
++ 	if (qeth_is_my_net_if_token(card, token))
++ 		return;
++ 
++ 	info.addr = ntfy_mac;
++ 	/* don't report VLAN IDs */
++ 	info.vid = 0;
++ 	info.added_by_user = false;
++ 	info.offloaded = true;
++ 
++ 	if (code & IPA_ADDR_CHANGE_CODE_REMOVAL) {
++ 		call_switchdev_notifiers(SWITCHDEV_FDB_DEL_TO_BRIDGE,
++ 					 card->dev, &info.info, NULL);
++ 		QETH_CARD_TEXT(card, 4, "andelmac");
++ 		QETH_CARD_TEXT_(card, 4,
++ 				"mc%012lx", ether_addr_to_u64(ntfy_mac));
++ 	} else {
++ 		call_switchdev_notifiers(SWITCHDEV_FDB_ADD_TO_BRIDGE,
++ 					 card->dev, &info.info, NULL);
++ 		QETH_CARD_TEXT(card, 4, "anaddmac");
++ 		QETH_CARD_TEXT_(card, 4,
++ 				"mc%012lx", ether_addr_to_u64(ntfy_mac));
++ 	}
++ }
++ 
+++>>>>>>> 10a6cfc0fc82 (s390/qeth: Translate address events into switchdev notifiers)
+  static const struct net_device_ops qeth_l2_netdev_ops = {
+  	.ndo_open		= qeth_open,
+  	.ndo_stop		= qeth_stop,
+@@@ -1202,41 -1273,103 +1341,87 @@@ static void qeth_bridge_state_change(st
+  	queue_work(card->event_wq, &data->worker);
+  }
+  
+ -struct qeth_addr_change_data {
+ -	struct delayed_work dwork;
+ +struct qeth_bridge_host_data {
+ +	struct work_struct worker;
+  	struct qeth_card *card;
+ -	struct qeth_ipacmd_addr_change ac_event;
+ +	struct qeth_ipacmd_addr_change hostevs;
+  };
+  
+++<<<<<<< HEAD
+ +static void qeth_bridge_host_event_worker(struct work_struct *work)
+++=======
++ static void qeth_l2_dev2br_worker(struct work_struct *work)
++ {
++ 	struct delayed_work *dwork = to_delayed_work(work);
++ 	struct qeth_addr_change_data *data;
++ 	struct qeth_card *card;
++ 	unsigned int i;
++ 
++ 	data = container_of(dwork, struct qeth_addr_change_data, dwork);
++ 	card = data->card;
++ 
++ 	QETH_CARD_TEXT(card, 4, "dev2brew");
++ 
++ 	if (READ_ONCE(card->info.pnso_mode) == QETH_PNSO_NONE)
++ 		goto free;
++ 
++ 	/* Potential re-config in progress, try again later: */
++ 	if (!rtnl_trylock()) {
++ 		queue_delayed_work(card->event_wq, dwork,
++ 				   msecs_to_jiffies(100));
++ 		return;
++ 	}
++ 
++ 	if (data->ac_event.lost_event_mask) {
++ 		QETH_DBF_MESSAGE(3,
++ 				 "Address change notification overflow on device %x\n",
++ 				 CARD_DEVID(card));
++ 	} else {
++ 		for (i = 0; i < data->ac_event.num_entries; i++) {
++ 			struct qeth_ipacmd_addr_change_entry *entry =
++ 					&data->ac_event.entry[i];
++ 			qeth_l2_dev2br_fdb_notify(card,
++ 						  entry->change_code,
++ 						  &entry->token,
++ 						  &entry->addr_lnid);
++ 		}
++ 	}
++ 	rtnl_unlock();
++ 
++ free:
++ 	kfree(data);
++ }
++ 
++ static void qeth_addr_change_event_worker(struct work_struct *work)
+++>>>>>>> 10a6cfc0fc82 (s390/qeth: Translate address events into switchdev notifiers)
+  {
+ -	struct delayed_work *dwork = to_delayed_work(work);
+ -	struct qeth_addr_change_data *data;
+ -	struct qeth_card *card;
+ +	struct qeth_bridge_host_data *data =
+ +		container_of(work, struct qeth_bridge_host_data, worker);
+  	int i;
+  
+ -	data = container_of(dwork, struct qeth_addr_change_data, dwork);
+ -	card = data->card;
+ -
+ -	QETH_CARD_TEXT(data->card, 4, "adrchgew");
+ -
+ -	if (READ_ONCE(card->info.pnso_mode) == QETH_PNSO_NONE)
+ -		goto free;
+ -
+ -	if (data->ac_event.lost_event_mask) {
+ -		/* Potential re-config in progress, try again later: */
+ -		if (!mutex_trylock(&card->sbp_lock)) {
+ -			queue_delayed_work(card->event_wq, dwork,
+ -					   msecs_to_jiffies(100));
+ -			return;
+ -		}
+ -
+ +	if (data->hostevs.lost_event_mask) {
+  		dev_info(&data->card->gdev->dev,
+ -			 "Address change notification stopped on %s (%s)\n",
+ -			 data->card->dev->name,
+ -			(data->ac_event.lost_event_mask == 0x01)
+ +"Address notification from the Bridge Port stopped %s (%s)\n",
+ +			data->card->dev->name,
+ +			(data->hostevs.lost_event_mask == 0x01)
+  			? "Overflow"
+ -			: (data->ac_event.lost_event_mask == 0x02)
+ +			: (data->hostevs.lost_event_mask == 0x02)
+  			? "Bridge port state change"
+  			: "Unknown reason");
+ -
+ +		mutex_lock(&data->card->sbp_lock);
+  		data->card->options.sbp.hostnotification = 0;
+ -		card->info.pnso_mode = QETH_PNSO_NONE;
+  		mutex_unlock(&data->card->sbp_lock);
+  		qeth_bridge_emit_host_event(data->card, anev_abort,
+ -					    0, NULL, NULL);
+ +			0, NULL, NULL);
+  	} else
+ -		for (i = 0; i < data->ac_event.num_entries; i++) {
+ +		for (i = 0; i < data->hostevs.num_entries; i++) {
+  			struct qeth_ipacmd_addr_change_entry *entry =
+ -					&data->ac_event.entry[i];
+ +					&data->hostevs.entry[i];
+  			qeth_bridge_emit_host_event(data->card,
+ -						    anev_reg_unreg,
+ -						    entry->change_code,
+ -						    &entry->token,
+ -						    &entry->addr_lnid);
+ +					anev_reg_unreg,
+ +					entry->change_code,
+ +					&entry->token, &entry->addr_lnid);
+  		}
+ -
+ -free:
+  	kfree(data);
+  }
+  
+@@@ -1261,17 -1397,20 +1446,24 @@@ static void qeth_bridge_host_event(stru
+  	}
+  	extrasize = sizeof(struct qeth_ipacmd_addr_change_entry) *
+  						hostevs->num_entries;
+ -	data = kzalloc(sizeof(struct qeth_addr_change_data) + extrasize,
+ -		       GFP_ATOMIC);
+ +	data = kzalloc(sizeof(struct qeth_bridge_host_data) + extrasize,
+ +		GFP_ATOMIC);
+  	if (!data) {
+ -		QETH_CARD_TEXT(card, 2, "ACNalloc");
+ +		QETH_CARD_TEXT(card, 2, "BPHalloc");
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	INIT_WORK(&data->worker, qeth_bridge_host_event_worker);
+++=======
++ 	if (card->info.pnso_mode == QETH_PNSO_BRIDGEPORT)
++ 		INIT_DELAYED_WORK(&data->dwork, qeth_addr_change_event_worker);
++ 	else
++ 		INIT_DELAYED_WORK(&data->dwork, qeth_l2_dev2br_worker);
+++>>>>>>> 10a6cfc0fc82 (s390/qeth: Translate address events into switchdev notifiers)
+  	data->card = card;
+ -	memcpy(&data->ac_event, hostevs,
+ +	memcpy(&data->hostevs, hostevs,
+  			sizeof(struct qeth_ipacmd_addr_change) + extrasize);
+ -	queue_delayed_work(card->event_wq, &data->dwork, 0);
+ +	queue_work(card->event_wq, &data->worker);
+  }
+  
+  /* SETBRIDGEPORT support; sending commands */
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_l2_main.c
