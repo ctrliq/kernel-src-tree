@@ -1,0 +1,250 @@
+block/diskstats: replace time_in_queue with sum of request times
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+commit 8cd5b8fc00716fb71f6b32d594b38a8f286d6c20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8cd5b8fc.failed
+
+Column "time_in_queue" in diskstats is supposed to show total waiting time
+of all requests. I.e. value should be equal to the sum of times from other
+columns. But this is not true, because column "time_in_queue" is counted
+separately in jiffies rather than in nanoseconds as other times.
+
+This patch removes redundant counter for "time_in_queue" and shows total
+time of read, write, discard and flush requests.
+
+	Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 8cd5b8fc00716fb71f6b32d594b38a8f286d6c20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+diff --cc block/genhd.c
+index b777d4d99066,792356e922a1..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -68,6 -70,54 +68,57 @@@ void set_capacity_revalidate_and_notify
+  
+  EXPORT_SYMBOL_GPL(set_capacity_revalidate_and_notify);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Format the device name of the indicated disk into the supplied buffer and
++  * return a pointer to that same buffer for convenience.
++  */
++ char *disk_name(struct gendisk *hd, int partno, char *buf)
++ {
++ 	if (!partno)
++ 		snprintf(buf, BDEVNAME_SIZE, "%s", hd->disk_name);
++ 	else if (isdigit(hd->disk_name[strlen(hd->disk_name)-1]))
++ 		snprintf(buf, BDEVNAME_SIZE, "%sp%d", hd->disk_name, partno);
++ 	else
++ 		snprintf(buf, BDEVNAME_SIZE, "%s%d", hd->disk_name, partno);
++ 
++ 	return buf;
++ }
++ 
++ const char *bdevname(struct block_device *bdev, char *buf)
++ {
++ 	return disk_name(bdev->bd_disk, bdev->bd_part->partno, buf);
++ }
++ EXPORT_SYMBOL(bdevname);
++ 
++ #ifdef CONFIG_SMP
++ static void part_stat_read_all(struct hd_struct *part, struct disk_stats *stat)
++ {
++ 	int cpu;
++ 
++ 	memset(stat, 0, sizeof(struct disk_stats));
++ 	for_each_possible_cpu(cpu) {
++ 		struct disk_stats *ptr = per_cpu_ptr(part->dkstats, cpu);
++ 		int group;
++ 
++ 		for (group = 0; group < NR_STAT_GROUPS; group++) {
++ 			stat->nsecs[group] += ptr->nsecs[group];
++ 			stat->sectors[group] += ptr->sectors[group];
++ 			stat->ios[group] += ptr->ios[group];
++ 			stat->merges[group] += ptr->merges[group];
++ 		}
++ 
++ 		stat->io_ticks += ptr->io_ticks;
++ 	}
++ }
++ #else /* CONFIG_SMP */
++ static void part_stat_read_all(struct hd_struct *part, struct disk_stats *stat)
++ {
++ 	memcpy(stat, &part->dkstats, sizeof(struct disk_stats));
++ }
++ #endif /* CONFIG_SMP */
+++>>>>>>> 8cd5b8fc0071 (block/diskstats: replace time_in_queue with sum of request times)
+  
+  void part_inc_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+  {
+@@@ -1247,6 -1227,67 +1298,70 @@@ static ssize_t disk_ro_show(struct devi
+  	return sprintf(buf, "%d\n", get_disk_ro(disk) ? 1 : 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ ssize_t part_size_show(struct device *dev,
++ 		       struct device_attribute *attr, char *buf)
++ {
++ 	struct hd_struct *p = dev_to_part(dev);
++ 
++ 	return sprintf(buf, "%llu\n",
++ 		(unsigned long long)part_nr_sects_read(p));
++ }
++ 
++ ssize_t part_stat_show(struct device *dev,
++ 		       struct device_attribute *attr, char *buf)
++ {
++ 	struct hd_struct *p = dev_to_part(dev);
++ 	struct request_queue *q = part_to_disk(p)->queue;
++ 	struct disk_stats stat;
++ 	unsigned int inflight;
++ 
++ 	part_stat_read_all(p, &stat);
++ 	inflight = part_in_flight(q, p);
++ 
++ 	return sprintf(buf,
++ 		"%8lu %8lu %8llu %8u "
++ 		"%8lu %8lu %8llu %8u "
++ 		"%8u %8u %8u "
++ 		"%8lu %8lu %8llu %8u "
++ 		"%8lu %8u"
++ 		"\n",
++ 		stat.ios[STAT_READ],
++ 		stat.merges[STAT_READ],
++ 		(unsigned long long)stat.sectors[STAT_READ],
++ 		(unsigned int)div_u64(stat.nsecs[STAT_READ], NSEC_PER_MSEC),
++ 		stat.ios[STAT_WRITE],
++ 		stat.merges[STAT_WRITE],
++ 		(unsigned long long)stat.sectors[STAT_WRITE],
++ 		(unsigned int)div_u64(stat.nsecs[STAT_WRITE], NSEC_PER_MSEC),
++ 		inflight,
++ 		jiffies_to_msecs(stat.io_ticks),
++ 		(unsigned int)div_u64(stat.nsecs[STAT_READ] +
++ 				      stat.nsecs[STAT_WRITE] +
++ 				      stat.nsecs[STAT_DISCARD] +
++ 				      stat.nsecs[STAT_FLUSH],
++ 						NSEC_PER_MSEC),
++ 		stat.ios[STAT_DISCARD],
++ 		stat.merges[STAT_DISCARD],
++ 		(unsigned long long)stat.sectors[STAT_DISCARD],
++ 		(unsigned int)div_u64(stat.nsecs[STAT_DISCARD], NSEC_PER_MSEC),
++ 		stat.ios[STAT_FLUSH],
++ 		(unsigned int)div_u64(stat.nsecs[STAT_FLUSH], NSEC_PER_MSEC));
++ }
++ 
++ ssize_t part_inflight_show(struct device *dev, struct device_attribute *attr,
++ 			   char *buf)
++ {
++ 	struct hd_struct *p = dev_to_part(dev);
++ 	struct request_queue *q = part_to_disk(p)->queue;
++ 	unsigned int inflight[2];
++ 
++ 	part_in_flight_rw(q, p, inflight);
++ 	return sprintf(buf, "%8u %8u\n", inflight[0], inflight[1]);
++ }
++ 
+++>>>>>>> 8cd5b8fc0071 (block/diskstats: replace time_in_queue with sum of request times)
+  static ssize_t disk_capability_show(struct device *dev,
+  				    struct device_attribute *attr, char *buf)
+  {
+@@@ -1499,24 -1545,36 +1614,41 @@@ static int diskstats_show(struct seq_fi
+  			   "%lu %lu %lu %u "
+  			   "%lu %lu %lu %u "
+  			   "%u %u %u "
+ -			   "%lu %lu %lu %u "
+ -			   "%lu %u"
+ -			   "\n",
+ +			   "%lu %lu %lu %u\n",
+  			   MAJOR(part_devt(hd)), MINOR(part_devt(hd)),
+  			   disk_name(gp, hd->partno, buf),
+ -			   stat.ios[STAT_READ],
+ -			   stat.merges[STAT_READ],
+ -			   stat.sectors[STAT_READ],
+ -			   (unsigned int)div_u64(stat.nsecs[STAT_READ],
+ -							NSEC_PER_MSEC),
+ -			   stat.ios[STAT_WRITE],
+ -			   stat.merges[STAT_WRITE],
+ -			   stat.sectors[STAT_WRITE],
+ -			   (unsigned int)div_u64(stat.nsecs[STAT_WRITE],
+ -							NSEC_PER_MSEC),
+ +			   part_stat_read(hd, ios[STAT_READ]),
+ +			   part_stat_read(hd, merges[STAT_READ]),
+ +			   part_stat_read(hd, sectors[STAT_READ]),
+ +			   (unsigned int)part_stat_read_msecs(hd, STAT_READ),
+ +			   part_stat_read(hd, ios[STAT_WRITE]),
+ +			   part_stat_read(hd, merges[STAT_WRITE]),
+ +			   part_stat_read(hd, sectors[STAT_WRITE]),
+ +			   (unsigned int)part_stat_read_msecs(hd, STAT_WRITE),
+  			   inflight,
+++<<<<<<< HEAD
+ +			   jiffies_to_msecs(part_stat_read(hd, io_ticks)),
+ +			   jiffies_to_msecs(part_stat_read(hd, time_in_queue)),
+ +			   part_stat_read(hd, ios[STAT_DISCARD]),
+ +			   part_stat_read(hd, merges[STAT_DISCARD]),
+ +			   part_stat_read(hd, sectors[STAT_DISCARD]),
+ +			   (unsigned int)part_stat_read_msecs(hd, STAT_DISCARD)
+++=======
++ 			   jiffies_to_msecs(stat.io_ticks),
++ 			   (unsigned int)div_u64(stat.nsecs[STAT_READ] +
++ 						 stat.nsecs[STAT_WRITE] +
++ 						 stat.nsecs[STAT_DISCARD] +
++ 						 stat.nsecs[STAT_FLUSH],
++ 							NSEC_PER_MSEC),
++ 			   stat.ios[STAT_DISCARD],
++ 			   stat.merges[STAT_DISCARD],
++ 			   stat.sectors[STAT_DISCARD],
++ 			   (unsigned int)div_u64(stat.nsecs[STAT_DISCARD],
++ 						 NSEC_PER_MSEC),
++ 			   stat.ios[STAT_FLUSH],
++ 			   (unsigned int)div_u64(stat.nsecs[STAT_FLUSH],
++ 						 NSEC_PER_MSEC)
+++>>>>>>> 8cd5b8fc0071 (block/diskstats: replace time_in_queue with sum of request times)
+  			);
+  	}
+  	disk_part_iter_exit(&piter);
+diff --git a/block/bio.c b/block/bio.c
+index 79cc1ab17bc5..830b393adc3d 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1849,7 +1849,6 @@ void generic_end_io_acct(struct request_queue *q, int req_op,
+ 
+ 	update_io_ticks(part, now, true);
+ 	part_stat_add(part, nsecs[sgrp], jiffies_to_nsecs(duration));
+-	part_stat_add(part, time_in_queue, duration);
+ 	part_dec_in_flight(q, part, op_is_write(req_op));
+ 
+ 	part_stat_unlock();
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 18766cd76af5..55a52483818f 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1334,7 +1334,6 @@ void blk_account_io_done(struct request *req, u64 now)
+ 		update_io_ticks(part, jiffies, true);
+ 		part_stat_inc(part, ios[sgrp]);
+ 		part_stat_add(part, nsecs[sgrp], now - req->start_time_ns);
+-		part_stat_add(part, time_in_queue, nsecs_to_jiffies64(now - req->start_time_ns));
+ 		part_dec_in_flight(req->q, part, rq_data_dir(req));
+ 
+ 		hd_struct_put(part);
+* Unmerged path block/genhd.c
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index cc06a16154eb..3dcb49c25788 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -89,7 +89,6 @@ struct disk_stats {
+ 	unsigned long ios[NR_STAT_GROUPS];
+ 	unsigned long merges[NR_STAT_GROUPS];
+ 	unsigned long io_ticks;
+-	unsigned long time_in_queue;
+ 	local_t in_flight[2];
+ };
+ 
