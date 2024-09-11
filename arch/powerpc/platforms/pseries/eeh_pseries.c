@@ -81,7 +81,6 @@ void pseries_pcibios_bus_add_device(struct pci_dev *pdev)
 	}
 #endif
 	eeh_add_device_early(pdn);
-	eeh_add_device_late(pdev);
 #ifdef CONFIG_PCI_IOV
 	if (pdev->is_virtfn) {
 		struct eeh_dev *edev = pdn_to_eeh_dev(pdn);
@@ -91,7 +90,7 @@ void pseries_pcibios_bus_add_device(struct pci_dev *pdev)
 		eeh_add_to_parent_pe(edev);   /* Add as VF PE type */
 	}
 #endif
-	eeh_sysfs_add_device(pdev);
+	eeh_add_device_late(pdev);
 }
 
 /*
