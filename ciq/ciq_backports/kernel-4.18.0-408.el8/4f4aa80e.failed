@@ -1,0 +1,130 @@
+KVM: X86: Handle implicit supervisor access with SMAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Lai Jiangshan <jiangshan.ljs@antgroup.com>
+commit 4f4aa80e3b882cbbafdf95ebc018c72b10879dbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4f4aa80e.failed
+
+There are two kinds of implicit supervisor access
+	implicit supervisor access when CPL = 3
+	implicit supervisor access when CPL < 3
+
+Current permission_fault() handles only the first kind for SMAP.
+
+But if the access is implicit when SMAP is on, data may not be read
+nor write from any user-mode address regardless the current CPL.
+
+So the second kind should be also supported.
+
+The first kind can be detect via CPL and access mode: if it is
+supervisor access and CPL = 3, it must be implicit supervisor access.
+
+But it is not possible to detect the second kind without extra
+information, so this patch adds an artificial PFERR_EXPLICIT_ACCESS
+into @access. This extra information also works for the first kind, so
+the logic is changed to use this information for both cases.
+
+The value of PFERR_EXPLICIT_ACCESS is deliberately chosen to be bit 48
+which is in the most significant 16 bits of u64 and less likely to be
+forced to change due to future hardware uses it.
+
+This patch removes the call to ->get_cpl() for access mode is determined
+by @access.  Not only does it reduce a function call, but also remove
+confusions when the permission is checked for nested TDP.  The nested
+TDP shouldn't have SMAP checking nor even the L2's CPL have any bearing
+on it.  The original code works just because it is always user walk for
+NPT and SMAP fault is not set for EPT in update_permission_bitmask.
+
+	Signed-off-by: Lai Jiangshan <jiangshan.ljs@antgroup.com>
+Message-Id: <20220311070346.45023-5-jiangshanlai@gmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4f4aa80e3b882cbbafdf95ebc018c72b10879dbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.h
+diff --cc arch/x86/kvm/mmu.h
+index aa216128806e,e6cae6f22683..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -174,9 -214,10 +174,14 @@@ static inline int kvm_mmu_do_page_fault
+   */
+  static inline u8 permission_fault(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+  				  unsigned pte_access, unsigned pte_pkey,
+ -				  u64 access)
+ +				  unsigned pfec)
+  {
+++<<<<<<< HEAD
+ +	int cpl = static_call(kvm_x86_get_cpl)(vcpu);
+++=======
++ 	/* strip nested paging fault error codes */
++ 	unsigned int pfec = access;
+++>>>>>>> 4f4aa80e3b88 (KVM: X86: Handle implicit supervisor access with SMAP)
+  	unsigned long rflags = static_call(kvm_x86_get_rflags)(vcpu);
+  
+  	/*
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 24742b8ee038..f6c57478579a 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -246,6 +246,7 @@ enum x86_intercept_stage;
+ #define PFERR_SGX_BIT 15
+ #define PFERR_GUEST_FINAL_BIT 32
+ #define PFERR_GUEST_PAGE_BIT 33
++#define PFERR_IMPLICIT_ACCESS_BIT 48
+ 
+ #define PFERR_PRESENT_MASK (1U << PFERR_PRESENT_BIT)
+ #define PFERR_WRITE_MASK (1U << PFERR_WRITE_BIT)
+@@ -256,6 +257,7 @@ enum x86_intercept_stage;
+ #define PFERR_SGX_MASK (1U << PFERR_SGX_BIT)
+ #define PFERR_GUEST_FINAL_MASK (1ULL << PFERR_GUEST_FINAL_BIT)
+ #define PFERR_GUEST_PAGE_MASK (1ULL << PFERR_GUEST_PAGE_BIT)
++#define PFERR_IMPLICIT_ACCESS (1ULL << PFERR_IMPLICIT_ACCESS_BIT)
+ 
+ #define PFERR_NESTED_GUEST_PAGE (PFERR_GUEST_PAGE_MASK |	\
+ 				 PFERR_WRITE_MASK |		\
+* Unmerged path arch/x86/kvm/mmu.h
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 978c125f417f..e7b90f875d6f 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4529,8 +4529,8 @@ static void update_permission_bitmask(struct kvm_mmu *mmu, bool ept)
+ 			 *   - X86_CR4_SMAP is set in CR4
+ 			 *   - A user page is accessed
+ 			 *   - The access is not a fetch
+-			 *   - Page fault in kernel mode
+-			 *   - if CPL = 3 or X86_EFLAGS_AC is clear
++			 *   - The access is supervisor mode
++			 *   - If implicit supervisor access or X86_EFLAGS_AC is clear
+ 			 *
+ 			 * Here, we cover the first four conditions.
+ 			 * The fifth is computed dynamically in permission_fault();
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e014b7ea74df..749c6181eb1d 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6774,7 +6774,9 @@ static int emulator_read_std(struct x86_emulate_ctxt *ctxt,
+ 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+ 	u32 access = 0;
+ 
+-	if (!system && static_call(kvm_x86_get_cpl)(vcpu) == 3)
++	if (system)
++		access |= PFERR_IMPLICIT_ACCESS;
++	else if (static_call(kvm_x86_get_cpl)(vcpu) == 3)
+ 		access |= PFERR_USER_MASK;
+ 
+ 	return kvm_read_guest_virt_helper(addr, val, bytes, vcpu, access, exception);
+@@ -6826,7 +6828,9 @@ static int emulator_write_std(struct x86_emulate_ctxt *ctxt, gva_t addr, void *v
+ 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+ 	u32 access = PFERR_WRITE_MASK;
+ 
+-	if (!system && static_call(kvm_x86_get_cpl)(vcpu) == 3)
++	if (system)
++		access |= PFERR_IMPLICIT_ACCESS;
++	else if (static_call(kvm_x86_get_cpl)(vcpu) == 3)
+ 		access |= PFERR_USER_MASK;
+ 
+ 	return kvm_write_guest_virt_helper(addr, val, bytes, vcpu,
