@@ -1,0 +1,98 @@
+igb: avoid premature Rx buffer reuse
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Li RongQing <lirongqing@baidu.com>
+commit 98dfb02aa22280bd8833836d1b00ab0488fa951f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/98dfb02a.failed
+
+Igb needs a similar fix as commit 75aab4e10ae6a ("i40e: avoid
+premature Rx buffer reuse")
+
+The page recycle code, incorrectly, relied on that a page fragment
+could not be freed inside xdp_do_redirect(). This assumption leads to
+that page fragments that are used by the stack/XDP redirect can be
+reused and overwritten.
+
+To avoid this, store the page count prior invoking xdp_do_redirect().
+
+Longer explanation:
+
+Intel NICs have a recycle mechanism. The main idea is that a page is
+split into two parts. One part is owned by the driver, one part might
+be owned by someone else, such as the stack.
+
+t0: Page is allocated, and put on the Rx ring
+              +---------------
+used by NIC ->| upper buffer
+(rx_buffer)   +---------------
+              | lower buffer
+              +---------------
+  page count  == USHRT_MAX
+  rx_buffer->pagecnt_bias == USHRT_MAX
+
+t1: Buffer is received, and passed to the stack (e.g.)
+              +---------------
+              | upper buff (skb)
+              +---------------
+used by NIC ->| lower buffer
+(rx_buffer)   +---------------
+  page count  == USHRT_MAX
+  rx_buffer->pagecnt_bias == USHRT_MAX - 1
+
+t2: Buffer is received, and redirected
+              +---------------
+              | upper buff (skb)
+              +---------------
+used by NIC ->| lower buffer
+(rx_buffer)   +---------------
+
+Now, prior calling xdp_do_redirect():
+  page count  == USHRT_MAX
+  rx_buffer->pagecnt_bias == USHRT_MAX - 2
+
+This means that buffer *cannot* be flipped/reused, because the skb is
+still using it.
+
+The problem arises when xdp_do_redirect() actually frees the
+segment. Then we get:
+  page count  == USHRT_MAX - 1
+  rx_buffer->pagecnt_bias == USHRT_MAX - 2
+
+From a recycle perspective, the buffer can be flipped and reused,
+which means that the skb data area is passed to the Rx HW ring!
+
+To work around this, the page count is stored prior calling
+xdp_do_redirect().
+
+Fixes: 9cbc948b5a20 ("igb: add XDP support")
+	Signed-off-by: Li RongQing <lirongqing@baidu.com>
+	Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+	Tested-by: Vishakha Jambekar <vishakha.jambekar@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 98dfb02aa22280bd8833836d1b00ab0488fa951f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igb/igb_main.c
+diff --cc drivers/net/ethernet/intel/igb/igb_main.c
+index a95663704ccd,d3b37761f637..000000000000
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@@ -8665,8 -8670,8 +8672,13 @@@ static int igb_clean_rx_irq(struct igb_
+  	u16 cleaned_count = igb_desc_unused(rx_ring);
+  	unsigned int xdp_xmit = 0;
+  	struct xdp_buff xdp;
+++<<<<<<< HEAD
+ +
+ +	xdp.rxq = &rx_ring->xdp_rxq;
+++=======
++ 	u32 frame_sz = 0;
++ 	int rx_buf_pgcnt;
+++>>>>>>> 98dfb02aa222 (igb: avoid premature Rx buffer reuse)
+  
+  	/* Frame size depend on rx_ring setup when PAGE_SIZE=4K */
+  #if (PAGE_SIZE < 8192)
+* Unmerged path drivers/net/ethernet/intel/igb/igb_main.c
