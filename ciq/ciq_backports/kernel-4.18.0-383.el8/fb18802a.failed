@@ -1,0 +1,116 @@
+media: v4l: ioctl: Fix memory leak in video_usercopy
+
+jira LE-1907
+cve CVE-2021-30002
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Sakari Ailus <sakari.ailus@linux.intel.com>
+commit fb18802a338b36f675a388fc03d2aa504a0d0899
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/fb18802a.failed
+
+When an IOCTL with argument size larger than 128 that also used array
+arguments were handled, two memory allocations were made but alas, only
+the latter one of them was released. This happened because there was only
+a single local variable to hold such a temporary allocation.
+
+Fix this by adding separate variables to hold the pointers to the
+temporary allocations.
+
+	Reported-by: Arnd Bergmann <arnd@kernel.org>
+	Reported-by: syzbot+1115e79c8df6472c612b@syzkaller.appspotmail.com
+Fixes: d14e6d76ebf7 ("[media] v4l: Add multi-planar ioctl handling code")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+	Acked-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+	Signed-off-by: Mauro Carvalho Chehab <mchehab+huawei@kernel.org>
+(cherry picked from commit fb18802a338b36f675a388fc03d2aa504a0d0899)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/v4l2-core/v4l2-ioctl.c
+diff --cc drivers/media/v4l2-core/v4l2-ioctl.c
+index 110c55b528d1,9906b41004e9..000000000000
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@@ -2963,20 -3318,21 +2963,25 @@@ video_usercopy(struct file *file, unsig
+  	has_array_args = err;
+  
+  	if (has_array_args) {
+- 		/*
+- 		 * When adding new types of array args, make sure that the
+- 		 * parent argument to ioctl (which contains the pointer to the
+- 		 * array) fits into sbuf (so that mbuf will still remain
+- 		 * unused up to here).
+- 		 */
+- 		mbuf = kvmalloc(array_size, GFP_KERNEL);
++ 		array_buf = kvmalloc(array_size, GFP_KERNEL);
+  		err = -ENOMEM;
+- 		if (NULL == mbuf)
++ 		if (array_buf == NULL)
+  			goto out_array_args;
+  		err = -EFAULT;
+++<<<<<<< HEAD
+ +		if (copy_from_user(mbuf, user_ptr, array_size))
+++=======
++ 		if (in_compat_syscall())
++ 			err = v4l2_compat_get_array_args(file, array_buf,
++ 							 user_ptr, array_size,
++ 							 orig_cmd, parg);
++ 		else
++ 			err = copy_from_user(array_buf, user_ptr, array_size) ?
++ 								-EFAULT : 0;
++ 		if (err)
+++>>>>>>> fb18802a338b (media: v4l: ioctl: Fix memory leak in video_usercopy)
+  			goto out_array_args;
+- 		*kernel_ptr = mbuf;
++ 		*kernel_ptr = array_buf;
+  	}
+  
+  	/* Handles IOCTL */
+@@@ -2995,8 -3351,18 +3000,21 @@@
+  
+  	if (has_array_args) {
+  		*kernel_ptr = (void __force *)user_ptr;
+++<<<<<<< HEAD
+ +		if (copy_to_user(user_ptr, mbuf, array_size))
+++=======
++ 		if (in_compat_syscall()) {
++ 			int put_err;
++ 
++ 			put_err = v4l2_compat_put_array_args(file, user_ptr,
++ 							     array_buf,
++ 							     array_size,
++ 							     orig_cmd, parg);
++ 			if (put_err)
++ 				err = put_err;
++ 		} else if (copy_to_user(user_ptr, array_buf, array_size)) {
+++>>>>>>> fb18802a338b (media: v4l: ioctl: Fix memory leak in video_usercopy)
+  			err = -EFAULT;
+ -		}
+  		goto out_array_args;
+  	}
+  	/*
+@@@ -3007,16 -3373,10 +3025,17 @@@
+  		goto out;
+  
+  out_array_args:
+ -	if (video_put_user((void __user *)arg, parg, cmd, orig_cmd))
+ -		err = -EFAULT;
+ +	/*  Copy results into user buffer  */
+ +	switch (_IOC_DIR(cmd)) {
+ +	case _IOC_READ:
+ +	case (_IOC_WRITE | _IOC_READ):
+ +		if (copy_to_user((void __user *)arg, parg, ioc_size))
+ +			err = -EFAULT;
+ +		break;
+ +	}
+ +
+  out:
++ 	kvfree(array_buf);
+  	kvfree(mbuf);
+  	return err;
+  }
+* Unmerged path drivers/media/v4l2-core/v4l2-ioctl.c
