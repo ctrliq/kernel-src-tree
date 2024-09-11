@@ -1,0 +1,340 @@
+SUNRPC: Add a transmission queue for RPC requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 944b042921a17d1a4e51bb05f8edf2b93d26e36f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/944b0429.failed
+
+Add the queue that will enforce the ordering of RPC task transmission.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 944b042921a17d1a4e51bb05f8edf2b93d26e36f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/xprt.h
+#	net/sunrpc/clnt.c
+#	net/sunrpc/xprt.c
+diff --cc include/linux/sunrpc/xprt.h
+index bd743c51a865,81a6c2c8dfc7..000000000000
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@@ -82,8 -82,14 +82,10 @@@ struct rpc_rqst 
+  	struct page		**rq_enc_pages;	/* scratch pages for use by
+  						   gss privacy code */
+  	void (*rq_release_snd_buf)(struct rpc_rqst *); /* release rq_enc_pages */
+ -
+ -	union {
+ -		struct list_head	rq_list;	/* Slot allocation list */
+ -		struct list_head	rq_recv;	/* Receive queue */
+ -	};
+ +	struct list_head	rq_list;
+  
++ 	struct list_head	rq_xmit;	/* Send queue */
++ 
+  	void			*rq_buffer;	/* Call XDR encode buffer */
+  	size_t			rq_callsize;
+  	void			*rq_rbuffer;	/* Reply XDR decode buffer */
+@@@ -235,9 -241,12 +237,12 @@@ struct rpc_xprt 
+  	 */
+  	spinlock_t		transport_lock;	/* lock transport info */
+  	spinlock_t		reserve_lock;	/* lock slot table */
+ -	spinlock_t		queue_lock;	/* send/receive queue lock */
+ +	spinlock_t		recv_lock;	/* lock receive list */
+  	u32			xid;		/* Next XID value to use */
+  	struct rpc_task *	snd_task;	/* Task blocked in send */
++ 
++ 	struct list_head	xmit_queue;	/* Send queue */
++ 
+  	struct svc_xprt		*bc_xprt;	/* NFSv4.1 backchannel */
+  #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+  	struct svc_serv		*bc_serv;       /* The RPC service which will */
+@@@ -334,6 -344,9 +339,12 @@@ void			xprt_free_slot(struct rpc_xprt *
+  				       struct rpc_rqst *req);
+  void			xprt_lock_and_alloc_slot(struct rpc_xprt *xprt, struct rpc_task *task);
+  bool			xprt_prepare_transmit(struct rpc_task *task);
+++<<<<<<< HEAD
+++=======
++ void			xprt_request_enqueue_transmit(struct rpc_task *task);
++ void			xprt_request_enqueue_receive(struct rpc_task *task);
++ void			xprt_request_wait_receive(struct rpc_task *task);
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+  void			xprt_transmit(struct rpc_task *task);
+  void			xprt_end_transmit(struct rpc_task *task);
+  int			xprt_adjust_timeout(struct rpc_rqst *req);
+diff --cc net/sunrpc/clnt.c
+index d6ca4ed0e072,c1a19a3e1356..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -1960,6 -1958,12 +1958,15 @@@ call_transmit(struct rpc_task *task
+  			return;
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Add task to reply queue before transmission to avoid races */
++ 	if (rpc_reply_expected(task))
++ 		xprt_request_enqueue_receive(task);
++ 	xprt_request_enqueue_transmit(task);
++ 
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+  	if (!xprt_prepare_transmit(task))
+  		return;
+  	xprt_transmit(task);
+diff --cc net/sunrpc/xprt.c
+index cc25632c1df5,1f69d9f219af..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -956,6 -1026,105 +956,108 @@@ static void xprt_timer(struct rpc_task 
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * xprt_request_wait_receive - wait for the reply to an RPC request
++  * @task: RPC task about to send a request
++  *
++  */
++ void xprt_request_wait_receive(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (!test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate))
++ 		return;
++ 	/*
++ 	 * Sleep on the pending queue if we're expecting a reply.
++ 	 * The spinlock ensures atomicity between the test of
++ 	 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
++ 	 */
++ 	spin_lock(&xprt->queue_lock);
++ 	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
++ 		xprt->ops->set_retrans_timeout(task);
++ 		rpc_sleep_on(&xprt->pending, task, xprt_timer);
++ 		/*
++ 		 * Send an extra queue wakeup call if the
++ 		 * connection was dropped in case the call to
++ 		 * rpc_sleep_on() raced.
++ 		 */
++ 		if (xprt_request_retransmit_after_disconnect(task))
++ 			rpc_wake_up_queued_task_set_status(&xprt->pending,
++ 					task, -ENOTCONN);
++ 	}
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ static bool
++ xprt_request_need_transmit(struct rpc_task *task)
++ {
++ 	return !(task->tk_flags & RPC_TASK_NO_RETRANS_TIMEOUT) ||
++ 		xprt_request_retransmit_after_disconnect(task);
++ }
++ 
++ static bool
++ xprt_request_need_enqueue_transmit(struct rpc_task *task, struct rpc_rqst *req)
++ {
++ 	return xprt_request_need_transmit(task) &&
++ 		!test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ }
++ 
++ /**
++  * xprt_request_enqueue_transmit - queue a task for transmission
++  * @task: pointer to rpc_task
++  *
++  * Add a task to the transmission queue.
++  */
++ void
++ xprt_request_enqueue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (xprt_request_need_enqueue_transmit(task, req)) {
++ 		spin_lock(&xprt->queue_lock);
++ 		list_add_tail(&req->rq_xmit, &xprt->xmit_queue);
++ 		set_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ 		spin_unlock(&xprt->queue_lock);
++ 	}
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit_locked - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  * Caller must hold xprt->queue_lock
++  */
++ static void
++ xprt_request_dequeue_transmit_locked(struct rpc_task *task)
++ {
++ 	xprt_task_clear_bytes_sent(task);
++ 	if (test_and_clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 		list_del(&task->tk_rqstp->rq_xmit);
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  */
++ static void
++ xprt_request_dequeue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	xprt_request_dequeue_transmit_locked(task);
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ /**
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+   * xprt_prepare_transmit - reserve the transport before sending a request
+   * @task: RPC task about to send a request
+   *
+@@@ -974,13 -1143,8 +1076,16 @@@ bool xprt_prepare_transmit(struct rpc_t
+  			task->tk_status = req->rq_reply_bytes_recvd;
+  			goto out_unlock;
+  		}
+++<<<<<<< HEAD
+ +		if ((task->tk_flags & RPC_TASK_NO_RETRANS_TIMEOUT)
+ +		    && xprt_connected(xprt)
+ +		    && req->rq_connect_cookie == xprt->connect_cookie) {
+ +			xprt->ops->set_retrans_timeout(task);
+ +			rpc_sleep_on(&xprt->pending, task, xprt_timer);
+++=======
++ 		if (!test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+  			goto out_unlock;
+- 		}
+  	}
+  	if (!xprt->ops->reserve_xprt(xprt, task)) {
+  		task->tk_status = -EAGAIN;
+@@@ -1012,32 -1176,15 +1117,38 @@@ void xprt_transmit(struct rpc_task *tas
+  
+  	dprintk("RPC: %5u xprt_transmit(%u)\n", task->tk_pid, req->rq_slen);
+  
+++<<<<<<< HEAD
+ +	if (!req->rq_reply_bytes_recvd) {
+ +
+++=======
++ 	if (!req->rq_bytes_sent) {
++ 		if (xprt_request_data_received(task))
++ 			goto out_dequeue;
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+  		/* Verify that our message lies in the RPCSEC_GSS window */
+ -		if (rpcauth_xmit_need_reencode(task)) {
+ +		if (!req->rq_bytes_sent && rpcauth_xmit_need_reencode(task)) {
+  			task->tk_status = -EBADMSG;
+- 			return;
++ 			goto out_dequeue;
+  		}
+ -	}
+ +
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+  
+  	connect_cookie = xprt->connect_cookie;
+  	status = xprt->ops->send_request(task);
+@@@ -1064,22 -1208,8 +1174,27 @@@
+  	spin_unlock_bh(&xprt->transport_lock);
+  
+  	req->rq_connect_cookie = connect_cookie;
+++<<<<<<< HEAD
+ +	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +		/*
+ +		 * Sleep on the pending queue if we're expecting a reply.
+ +		 * The spinlock ensures atomicity between the test of
+ +		 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
+ +		 */
+ +		spin_lock(&xprt->recv_lock);
+ +		if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +			rpc_sleep_on(&xprt->pending, task, xprt_timer);
+ +			/* Wake up immediately if the connection was dropped */
+ +			if (!xprt_connected(xprt))
+ +				rpc_wake_up_queued_task_set_status(&xprt->pending,
+ +						task, -ENOTCONN);
+ +		}
+ +		spin_unlock(&xprt->recv_lock);
+ +	}
+++=======
++ out_dequeue:
++ 	xprt_request_dequeue_transmit(task);
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+  }
+  
+  static void xprt_add_backlog(struct rpc_xprt *xprt, struct rpc_task *task)
+@@@ -1349,6 -1478,28 +1464,31 @@@ void xprt_retry_reserve(struct rpc_tas
+  	xprt_do_reserve(xprt, task);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ xprt_request_dequeue_all(struct rpc_task *task, struct rpc_rqst *req)
++ {
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate) ||
++ 	    test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate) ||
++ 	    xprt_is_pinned_rqst(req)) {
++ 		spin_lock(&xprt->queue_lock);
++ 		xprt_request_dequeue_transmit_locked(task);
++ 		xprt_request_dequeue_receive_locked(task);
++ 		while (xprt_is_pinned_rqst(req)) {
++ 			set_bit(RPC_TASK_MSG_PIN_WAIT, &task->tk_runstate);
++ 			spin_unlock(&xprt->queue_lock);
++ 			xprt_wait_on_pinned_rqst(req);
++ 			spin_lock(&xprt->queue_lock);
++ 			clear_bit(RPC_TASK_MSG_PIN_WAIT, &task->tk_runstate);
++ 		}
++ 		spin_unlock(&xprt->queue_lock);
++ 	}
++ }
++ 
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+  /**
+   * xprt_release - release an RPC request slot
+   * @task: task which is finished with the slot
+@@@ -1414,10 -1554,11 +1554,15 @@@ static void xprt_init(struct rpc_xprt *
+  
+  	spin_lock_init(&xprt->transport_lock);
+  	spin_lock_init(&xprt->reserve_lock);
+ -	spin_lock_init(&xprt->queue_lock);
+ +	spin_lock_init(&xprt->recv_lock);
+  
+  	INIT_LIST_HEAD(&xprt->free);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&xprt->recv);
+++=======
++ 	INIT_LIST_HEAD(&xprt->recv_queue);
++ 	INIT_LIST_HEAD(&xprt->xmit_queue);
+++>>>>>>> 944b042921a1 (SUNRPC: Add a transmission queue for RPC requests)
+  #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+  	spin_lock_init(&xprt->bc_pa_lock);
+  	INIT_LIST_HEAD(&xprt->bc_pa_list);
+* Unmerged path include/linux/sunrpc/xprt.h
+* Unmerged path net/sunrpc/clnt.c
+* Unmerged path net/sunrpc/xprt.c
