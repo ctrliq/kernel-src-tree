@@ -1,0 +1,158 @@
+x86/kvm: Drop L1TF MSR list approach
+
+jira LE-1907
+cve CVE-2018-3646
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 2f055947ae5e2741fb2dc5bba1033c417ccf4faa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/2f055947.failed
+
+The VMX module parameter to control the L1D flush should become
+writeable.
+
+The MSR list is set up at VM init per guest VCPU, but the run time
+switching is based on a static key which is global. Toggling the MSR list
+at run time might be feasible, but for now drop this optimization and use
+the regular MSR write to make run-time switching possible.
+
+The default mitigation is the conditional flush anyway, so for extra
+paranoid setups this will add some small overhead, but the extra code
+executed is in the noise compared to the flush itself.
+
+Aside of that the EPT disabled case is not handled correctly at the moment
+and the MSR list magic is in the way for fixing that as well.
+
+If it's really providing a significant advantage, then this needs to be
+revisited after the code is correct and the control is writable.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Jiri Kosina <jkosina@suse.cz>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Link: https://lkml.kernel.org/r/20180713142322.516940445@linutronix.de
+
+(cherry picked from commit 2f055947ae5e2741fb2dc5bba1033c417ccf4faa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index d9e0ef7725c0,e553e43a114c..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9950,6 -9582,65 +9950,68 @@@ static int vmx_handle_exit(struct kvm_v
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Software based L1D cache flush which is used when microcode providing
++  * the cache control MSR is not loaded.
++  *
++  * The L1D cache is 32 KiB on Nehalem and later microarchitectures, but to
++  * flush it is required to read in 64 KiB because the replacement algorithm
++  * is not exactly LRU. This could be sized at runtime via topology
++  * information but as all relevant affected CPUs have 32KiB L1D cache size
++  * there is no point in doing so.
++  */
++ #define L1D_CACHE_ORDER 4
++ static void *vmx_l1d_flush_pages;
++ 
++ static void vmx_l1d_flush(struct kvm_vcpu *vcpu)
++ {
++ 	int size = PAGE_SIZE << L1D_CACHE_ORDER;
++ 	bool always;
++ 
++ 	/*
++ 	 * This code is only executed when the the flush mode is 'cond' or
++ 	 * 'always'
++ 	 *
++ 	 * If 'flush always', keep the flush bit set, otherwise clear
++ 	 * it. The flush bit gets set again either from vcpu_run() or from
++ 	 * one of the unsafe VMEXIT handlers.
++ 	 */
++ 	always = vmentry_l1d_flush == VMENTER_L1D_FLUSH_ALWAYS;
++ 	vcpu->arch.l1tf_flush_l1d = always;
++ 
++ 	vcpu->stat.l1d_flush++;
++ 
++ 	if (static_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
++ 		return;
++ 	}
++ 
++ 	asm volatile(
++ 		/* First ensure the pages are in the TLB */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lpopulate_tlb:\n\t"
++ 		"movzbl	(%[empty_zp], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$4096, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lpopulate_tlb\n\t"
++ 		"xorl	%%eax, %%eax\n\t"
++ 		"cpuid\n\t"
++ 		/* Now fill the cache */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lfill_cache:\n"
++ 		"movzbl	(%[empty_zp], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$64, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lfill_cache\n\t"
++ 		"lfence\n"
++ 		:: [empty_zp] "r" (vmx_l1d_flush_pages),
++ 		    [size] "r" (size)
++ 		: "eax", "ebx", "ecx", "edx");
++ }
++ 
+++>>>>>>> 2f055947ae5e (x86/kvm: Drop L1TF MSR list approach)
+  static void update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+@@@ -13877,6 -13197,39 +13939,42 @@@ static struct kvm_x86_ops vmx_x86_ops _
+  	.enable_smi_window = enable_smi_window,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int __init vmx_setup_l1d_flush(void)
++ {
++ 	struct page *page;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_L1TF))
++ 		return 0;
++ 
++ 	l1tf_vmx_mitigation = vmentry_l1d_flush;
++ 
++ 	if (vmentry_l1d_flush == VMENTER_L1D_FLUSH_NEVER)
++ 		return 0;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		page = alloc_pages(GFP_KERNEL, L1D_CACHE_ORDER);
++ 		if (!page)
++ 			return -ENOMEM;
++ 		vmx_l1d_flush_pages = page_address(page);
++ 	}
++ 
++ 	static_branch_enable(&vmx_l1d_should_flush);
++ 	return 0;
++ }
++ 
++ static void vmx_cleanup_l1d_flush(void)
++ {
++ 	if (vmx_l1d_flush_pages) {
++ 		free_pages((unsigned long)vmx_l1d_flush_pages, L1D_CACHE_ORDER);
++ 		vmx_l1d_flush_pages = NULL;
++ 	}
++ 	/* Restore state so sysfs ignores VMX */
++ 	l1tf_vmx_mitigation = VMENTER_L1D_FLUSH_AUTO;
++ }
++ 
+++>>>>>>> 2f055947ae5e (x86/kvm: Drop L1TF MSR list approach)
+  static int __init vmx_init(void)
+  {
+  	int r;
+* Unmerged path arch/x86/kvm/vmx.c
