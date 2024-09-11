@@ -1,0 +1,308 @@
+drm: allow limiting the scatter list size.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [drm] drm: allow limiting the scatter list size (Lyude Paul) [1876018 1851790]
+Rebuild_FUZZ: 98.80%
+commit-author Gerd Hoffmann <kraxel@redhat.com>
+commit 707d561f77b5e2a6f90c9786bee44ee7a8dedc7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/707d561f.failed
+
+Add drm_device argument to drm_prime_pages_to_sg(), so we can
+call dma_max_mapping_size() to figure the segment size limit
+and call into __sg_alloc_table_from_pages() with the correct
+limit.
+
+This fixes virtio-gpu with sev.  Possibly it'll fix other bugs
+too given that drm seems to totaly ignore segment size limits
+so far ...
+
+v2: place max_segment in drm driver not gem object.
+v3: move max_segment next to the other gem fields.
+v4: just use dma_max_mapping_size().
+
+	Signed-off-by: Gerd Hoffmann <kraxel@redhat.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/20200907112425.15610-2-kraxel@redhat.com
+(cherry picked from commit 707d561f77b5e2a6f90c9786bee44ee7a8dedc7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+#	drivers/gpu/drm/drm_gem_shmem_helper.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+index a59cd47aa6c1,d7050ab95946..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+@@@ -244,17 -279,49 +244,47 @@@ static struct sg_table *amdgpu_dma_buf_
+  	struct sg_table *sgt;
+  	long r;
+  
+ -	if (!bo->pin_count) {
+ -		/* move buffer into GTT or VRAM */
+ -		struct ttm_operation_ctx ctx = { false, false };
+ -		unsigned domains = AMDGPU_GEM_DOMAIN_GTT;
+ +	r = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_GTT);
+ +	if (r)
+ +		return ERR_PTR(r);
+  
+ -		if (bo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM &&
+ -		    attach->peer2peer) {
+ -			bo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+ -			domains |= AMDGPU_GEM_DOMAIN_VRAM;
+ -		}
+ -		amdgpu_bo_placement_from_domain(bo, domains);
+ -		r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+ -		if (r)
+ -			return ERR_PTR(r);
+ +	sgt = drm_prime_pages_to_sg(bo->tbo.ttm->pages, bo->tbo.num_pages);
+ +	if (IS_ERR(sgt))
+ +		return sgt;
+  
+++<<<<<<< HEAD
+ +	if (!dma_map_sg_attrs(attach->dev, sgt->sgl, sgt->nents, dir,
+ +			      DMA_ATTR_SKIP_CPU_SYNC))
+ +		goto error_free;
+++=======
++ 	} else if (!(amdgpu_mem_type_to_domain(bo->tbo.mem.mem_type) &
++ 		     AMDGPU_GEM_DOMAIN_GTT)) {
++ 		return ERR_PTR(-EBUSY);
++ 	}
++ 
++ 	switch (bo->tbo.mem.mem_type) {
++ 	case TTM_PL_TT:
++ 		sgt = drm_prime_pages_to_sg(obj->dev,
++ 					    bo->tbo.ttm->pages,
++ 					    bo->tbo.num_pages);
++ 		if (IS_ERR(sgt))
++ 			return sgt;
++ 
++ 		if (dma_map_sgtable(attach->dev, sgt, dir,
++ 				    DMA_ATTR_SKIP_CPU_SYNC))
++ 			goto error_free;
++ 		break;
++ 
++ 	case TTM_PL_VRAM:
++ 		r = amdgpu_vram_mgr_alloc_sgt(adev, &bo->tbo.mem, attach->dev,
++ 					      dir, &sgt);
++ 		if (r)
++ 			return ERR_PTR(r);
++ 		break;
++ 	default:
++ 		return ERR_PTR(-EINVAL);
++ 	}
+++>>>>>>> 707d561f77b5 (drm: allow limiting the scatter list size.)
+  
+  	return sgt;
+  
+diff --cc drivers/gpu/drm/drm_gem_shmem_helper.c
+index df31e5782eed,0a952f27c184..000000000000
+--- a/drivers/gpu/drm/drm_gem_shmem_helper.c
++++ b/drivers/gpu/drm/drm_gem_shmem_helper.c
+@@@ -586,7 -654,9 +586,13 @@@ struct sg_table *drm_gem_shmem_get_sg_t
+  {
+  	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+  
+++<<<<<<< HEAD
+ +	return drm_prime_pages_to_sg(shmem->pages, obj->size >> PAGE_SHIFT);
+++=======
++ 	WARN_ON(shmem->base.import_attach);
++ 
++ 	return drm_prime_pages_to_sg(obj->dev, shmem->pages, obj->size >> PAGE_SHIFT);
+++>>>>>>> 707d561f77b5 (drm: allow limiting the scatter list size.)
+  }
+  EXPORT_SYMBOL_GPL(drm_gem_shmem_get_sg_table);
+  
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c
+* Unmerged path drivers/gpu/drm/drm_gem_shmem_helper.c
+diff --git a/drivers/gpu/drm/drm_prime.c b/drivers/gpu/drm/drm_prime.c
+index 7e1ae688575a..97854dbffdf5 100644
+--- a/drivers/gpu/drm/drm_prime.c
++++ b/drivers/gpu/drm/drm_prime.c
+@@ -802,9 +802,11 @@ static const struct dma_buf_ops drm_gem_prime_dmabuf_ops =  {
+  *
+  * This is useful for implementing &drm_gem_object_funcs.get_sg_table.
+  */
+-struct sg_table *drm_prime_pages_to_sg(struct page **pages, unsigned int nr_pages)
++struct sg_table *drm_prime_pages_to_sg(struct drm_device *dev,
++				       struct page **pages, unsigned int nr_pages)
+ {
+ 	struct sg_table *sg = NULL;
++	size_t max_segment = 0;
+ 	int ret;
+ 
+ 	sg = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
+@@ -813,8 +815,13 @@ struct sg_table *drm_prime_pages_to_sg(struct page **pages, unsigned int nr_page
+ 		goto out;
+ 	}
+ 
+-	ret = sg_alloc_table_from_pages(sg, pages, nr_pages, 0,
+-				nr_pages << PAGE_SHIFT, GFP_KERNEL);
++	if (dev)
++		max_segment = dma_max_mapping_size(dev->dev);
++	if (max_segment == 0 || max_segment > SCATTERLIST_MAX_SEGMENT)
++		max_segment = SCATTERLIST_MAX_SEGMENT;
++	ret = __sg_alloc_table_from_pages(sg, pages, nr_pages, 0,
++					  nr_pages << PAGE_SHIFT,
++					  max_segment, GFP_KERNEL);
+ 	if (ret)
+ 		goto out;
+ 
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem.c b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+index 209ef1274b80..ba55618bef21 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem.c
+@@ -102,7 +102,8 @@ struct page **etnaviv_gem_get_pages(struct etnaviv_gem_object *etnaviv_obj)
+ 		int npages = etnaviv_obj->base.size >> PAGE_SHIFT;
+ 		struct sg_table *sgt;
+ 
+-		sgt = drm_prime_pages_to_sg(etnaviv_obj->pages, npages);
++		sgt = drm_prime_pages_to_sg(etnaviv_obj->base.dev,
++					    etnaviv_obj->pages, npages);
+ 		if (IS_ERR(sgt)) {
+ 			dev_err(dev->dev, "failed to allocate sgt: %ld\n",
+ 				PTR_ERR(sgt));
+diff --git a/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c b/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c
+index 0566171f8df2..2a14fe45a687 100644
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem_prime.c
+@@ -17,7 +17,7 @@ struct sg_table *etnaviv_gem_prime_get_sg_table(struct drm_gem_object *obj)
+ 	if (WARN_ON(!etnaviv_obj->pages))  /* should have already pinned! */
+ 		return NULL;
+ 
+-	return drm_prime_pages_to_sg(etnaviv_obj->pages, npages);
++	return drm_prime_pages_to_sg(obj->dev, etnaviv_obj->pages, npages);
+ }
+ 
+ void *etnaviv_gem_prime_vmap(struct drm_gem_object *obj)
+diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
+index f583bb4222f9..7a1d9f26e64c 100644
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -95,7 +95,7 @@ static struct page **get_pages(struct drm_gem_object *obj)
+ 
+ 		msm_obj->pages = p;
+ 
+-		msm_obj->sgt = drm_prime_pages_to_sg(p, npages);
++		msm_obj->sgt = drm_prime_pages_to_sg(obj->dev, p, npages);
+ 		if (IS_ERR(msm_obj->sgt)) {
+ 			void *ptr = ERR_CAST(msm_obj->sgt);
+ 
+diff --git a/drivers/gpu/drm/msm/msm_gem_prime.c b/drivers/gpu/drm/msm/msm_gem_prime.c
+index 13403c6da6c7..4d34bfb107a6 100644
+--- a/drivers/gpu/drm/msm/msm_gem_prime.c
++++ b/drivers/gpu/drm/msm/msm_gem_prime.c
+@@ -28,7 +28,7 @@ struct sg_table *msm_gem_prime_get_sg_table(struct drm_gem_object *obj)
+ 	if (WARN_ON(!msm_obj->pages))  /* should have already pinned! */
+ 		return NULL;
+ 
+-	return drm_prime_pages_to_sg(msm_obj->pages, npages);
++	return drm_prime_pages_to_sg(obj->dev, msm_obj->pages, npages);
+ }
+ 
+ void *msm_gem_prime_vmap(struct drm_gem_object *obj)
+diff --git a/drivers/gpu/drm/nouveau/nouveau_prime.c b/drivers/gpu/drm/nouveau/nouveau_prime.c
+index bae6a3eccee0..7766b810653f 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_prime.c
++++ b/drivers/gpu/drm/nouveau/nouveau_prime.c
+@@ -32,7 +32,7 @@ struct sg_table *nouveau_gem_prime_get_sg_table(struct drm_gem_object *obj)
+ 	struct nouveau_bo *nvbo = nouveau_gem_object(obj);
+ 	int npages = nvbo->bo.num_pages;
+ 
+-	return drm_prime_pages_to_sg(nvbo->bo.ttm->pages, npages);
++	return drm_prime_pages_to_sg(obj->dev, nvbo->bo.ttm->pages, npages);
+ }
+ 
+ void *nouveau_gem_prime_vmap(struct drm_gem_object *obj)
+diff --git a/drivers/gpu/drm/radeon/radeon_prime.c b/drivers/gpu/drm/radeon/radeon_prime.c
+index b906e8fbd5f3..ea4c900e7c41 100644
+--- a/drivers/gpu/drm/radeon/radeon_prime.c
++++ b/drivers/gpu/drm/radeon/radeon_prime.c
+@@ -36,7 +36,7 @@ struct sg_table *radeon_gem_prime_get_sg_table(struct drm_gem_object *obj)
+ 	struct radeon_bo *bo = gem_to_radeon_bo(obj);
+ 	int npages = bo->tbo.num_pages;
+ 
+-	return drm_prime_pages_to_sg(bo->tbo.ttm->pages, npages);
++	return drm_prime_pages_to_sg(obj->dev, bo->tbo.ttm->pages, npages);
+ }
+ 
+ void *radeon_gem_prime_vmap(struct drm_gem_object *obj)
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+index a8db758d523e..6858dbcaa230 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+@@ -92,7 +92,8 @@ static int rockchip_gem_get_pages(struct rockchip_gem_object *rk_obj)
+ 
+ 	rk_obj->num_pages = rk_obj->base.size >> PAGE_SHIFT;
+ 
+-	rk_obj->sgt = drm_prime_pages_to_sg(rk_obj->pages, rk_obj->num_pages);
++	rk_obj->sgt = drm_prime_pages_to_sg(rk_obj->base.dev,
++					    rk_obj->pages, rk_obj->num_pages);
+ 	if (IS_ERR(rk_obj->sgt)) {
+ 		ret = PTR_ERR(rk_obj->sgt);
+ 		goto err_put_pages;
+@@ -462,7 +463,7 @@ struct sg_table *rockchip_gem_prime_get_sg_table(struct drm_gem_object *obj)
+ 	int ret;
+ 
+ 	if (rk_obj->pages)
+-		return drm_prime_pages_to_sg(rk_obj->pages, rk_obj->num_pages);
++		return drm_prime_pages_to_sg(obj->dev, rk_obj->pages, rk_obj->num_pages);
+ 
+ 	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+ 	if (!sgt)
+diff --git a/drivers/gpu/drm/tegra/gem.c b/drivers/gpu/drm/tegra/gem.c
+index 8f42141ddba6..42050ebe18ea 100644
+--- a/drivers/gpu/drm/tegra/gem.c
++++ b/drivers/gpu/drm/tegra/gem.c
+@@ -195,7 +195,7 @@ static int tegra_bo_get_pages(struct drm_device *drm, struct tegra_bo *bo)
+ 
+ 	bo->num_pages = bo->gem.size >> PAGE_SHIFT;
+ 
+-	bo->sgt = drm_prime_pages_to_sg(bo->pages, bo->num_pages);
++	bo->sgt = drm_prime_pages_to_sg(bo->gem.dev, bo->pages, bo->num_pages);
+ 	if (IS_ERR(bo->sgt)) {
+ 		err = PTR_ERR(bo->sgt);
+ 		goto put_pages;
+diff --git a/drivers/gpu/drm/vgem/vgem_drv.c b/drivers/gpu/drm/vgem/vgem_drv.c
+index 909eba43664a..1fd74aea2ee2 100644
+--- a/drivers/gpu/drm/vgem/vgem_drv.c
++++ b/drivers/gpu/drm/vgem/vgem_drv.c
+@@ -346,7 +346,7 @@ static struct sg_table *vgem_prime_get_sg_table(struct drm_gem_object *obj)
+ {
+ 	struct drm_vgem_gem_object *bo = to_vgem_bo(obj);
+ 
+-	return drm_prime_pages_to_sg(bo->pages, bo->base.size >> PAGE_SHIFT);
++	return drm_prime_pages_to_sg(obj->dev, bo->pages, bo->base.size >> PAGE_SHIFT);
+ }
+ 
+ static struct drm_gem_object* vgem_prime_import(struct drm_device *dev,
+diff --git a/drivers/gpu/drm/xen/xen_drm_front_gem.c b/drivers/gpu/drm/xen/xen_drm_front_gem.c
+index f0b85e094111..9742c0b562f7 100644
+--- a/drivers/gpu/drm/xen/xen_drm_front_gem.c
++++ b/drivers/gpu/drm/xen/xen_drm_front_gem.c
+@@ -179,7 +179,8 @@ struct sg_table *xen_drm_front_gem_get_sg_table(struct drm_gem_object *gem_obj)
+ 	if (!xen_obj->pages)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	return drm_prime_pages_to_sg(xen_obj->pages, xen_obj->num_pages);
++	return drm_prime_pages_to_sg(gem_obj->dev,
++				     xen_obj->pages, xen_obj->num_pages);
+ }
+ 
+ struct drm_gem_object *
+diff --git a/include/drm/drm_prime.h b/include/drm/drm_prime.h
+index 9af7422b44cf..bf141e74a1c2 100644
+--- a/include/drm/drm_prime.h
++++ b/include/drm/drm_prime.h
+@@ -88,7 +88,8 @@ void drm_gem_dmabuf_vunmap(struct dma_buf *dma_buf, void *vaddr);
+ int drm_gem_prime_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma);
+ int drm_gem_dmabuf_mmap(struct dma_buf *dma_buf, struct vm_area_struct *vma);
+ 
+-struct sg_table *drm_prime_pages_to_sg(struct page **pages, unsigned int nr_pages);
++struct sg_table *drm_prime_pages_to_sg(struct drm_device *dev,
++				       struct page **pages, unsigned int nr_pages);
+ struct dma_buf *drm_gem_prime_export(struct drm_gem_object *obj,
+ 				     int flags);
+ 
