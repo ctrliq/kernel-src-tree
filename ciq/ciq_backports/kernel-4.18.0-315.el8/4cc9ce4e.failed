@@ -1,0 +1,179 @@
+bpf: Generalize caching for sk_storage.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author KP Singh <kpsingh@google.com>
+commit 4cc9ce4e739961a7b9e6b2f3b27a72124d356373
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/4cc9ce4e.failed
+
+Provide the a ability to define local storage caches on a per-object
+type basis. The caches and caching indices for different objects should
+not be inter-mixed as suggested in:
+
+  https://lore.kernel.org/bpf/20200630193441.kdwnkestulg5erii@kafai-mbp.dhcp.thefacebook.com/
+
+  "Caching a sk-storage at idx=0 of a sk should not stop an
+  inode-storage to be cached at the same idx of a inode."
+
+	Signed-off-by: KP Singh <kpsingh@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20200825182919.1118197-3-kpsingh@chromium.org
+(cherry picked from commit 4cc9ce4e739961a7b9e6b2f3b27a72124d356373)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/bpf_sk_storage.c
+diff --cc net/core/bpf_sk_storage.c
+index 281200dc0a01,ec61ee7c7ee4..000000000000
+--- a/net/core/bpf_sk_storage.c
++++ b/net/core/bpf_sk_storage.c
+@@@ -12,10 -12,11 +12,16 @@@
+  #include <uapi/linux/sock_diag.h>
+  #include <uapi/linux/btf.h>
+  
+ -#define BPF_LOCAL_STORAGE_CREATE_FLAG_MASK (BPF_F_NO_PREALLOC | BPF_F_CLONE)
+ +#define SK_STORAGE_CREATE_FLAG_MASK					\
+ +	(BPF_F_NO_PREALLOC | BPF_F_CLONE)
+  
+++<<<<<<< HEAD
+ +struct bucket {
+++=======
++ DEFINE_BPF_STORAGE_CACHE(sk_cache);
++ 
++ struct bpf_local_storage_map_bucket {
+++>>>>>>> 4cc9ce4e7399 (bpf: Generalize caching for sk_storage.)
+  	struct hlist_head list;
+  	raw_spinlock_t lock;
+  };
+@@@ -73,21 -74,18 +79,24 @@@ struct bpf_sk_storage_elem 
+  	/* The data is stored in aother cacheline to minimize
+  	 * the number of cachelines access during a cache hit.
+  	 */
+ -	struct bpf_local_storage_data sdata ____cacheline_aligned;
+ +	struct bpf_sk_storage_data sdata ____cacheline_aligned;
+  };
+  
+ -#define SELEM(_SDATA)							\
+ -	container_of((_SDATA), struct bpf_local_storage_elem, sdata)
+ +#define SELEM(_SDATA) container_of((_SDATA), struct bpf_sk_storage_elem, sdata)
+  #define SDATA(_SELEM) (&(_SELEM)->sdata)
+ -
+ -struct bpf_local_storage {
+ -	struct bpf_local_storage_data __rcu *cache[BPF_LOCAL_STORAGE_CACHE_SIZE];
+ -	struct hlist_head list; /* List of bpf_local_storage_elem */
+ -	struct sock *owner;	/* The object that owns the above "list" of
+ -				 * bpf_local_storage_elem.
+++<<<<<<< HEAD
+ +#define BPF_SK_STORAGE_CACHE_SIZE	16
+ +
+ +static DEFINE_SPINLOCK(cache_idx_lock);
+ +static u64 cache_idx_usage_counts[BPF_SK_STORAGE_CACHE_SIZE];
+++=======
+++>>>>>>> 4cc9ce4e7399 (bpf: Generalize caching for sk_storage.)
+ +
+ +struct bpf_sk_storage {
+ +	struct bpf_sk_storage_data __rcu *cache[BPF_SK_STORAGE_CACHE_SIZE];
+ +	struct hlist_head list;	/* List of bpf_sk_storage_elem */
+ +	struct sock *sk;	/* The sk that owns the the above "list" of
+ +				 * bpf_sk_storage_elem.
+  				 */
+  	struct rcu_head rcu;
+  	raw_spinlock_t lock;	/* Protect adding/removing from the "list" */
+@@@ -519,11 -524,11 +528,17 @@@ u16 bpf_local_storage_cache_idx_get(str
+  	u64 min_usage = U64_MAX;
+  	u16 i, res = 0;
+  
+- 	spin_lock(&cache_idx_lock);
++ 	spin_lock(&cache->idx_lock);
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < BPF_SK_STORAGE_CACHE_SIZE; i++) {
+ +		if (cache_idx_usage_counts[i] < min_usage) {
+ +			min_usage = cache_idx_usage_counts[i];
+++=======
++ 	for (i = 0; i < BPF_LOCAL_STORAGE_CACHE_SIZE; i++) {
++ 		if (cache->idx_usage_counts[i] < min_usage) {
++ 			min_usage = cache->idx_usage_counts[i];
+++>>>>>>> 4cc9ce4e7399 (bpf: Generalize caching for sk_storage.)
+  			res = i;
+  
+  			/* Found a free cache_idx */
+@@@ -584,16 -591,16 +600,16 @@@ void bpf_sk_storage_free(struct sock *s
+  		kfree_rcu(sk_storage, rcu);
+  }
+  
+ -static void bpf_local_storage_map_free(struct bpf_map *map)
+ +static void bpf_sk_storage_map_free(struct bpf_map *map)
+  {
+ -	struct bpf_local_storage_elem *selem;
+ -	struct bpf_local_storage_map *smap;
+ -	struct bpf_local_storage_map_bucket *b;
+ +	struct bpf_sk_storage_elem *selem;
+ +	struct bpf_sk_storage_map *smap;
+ +	struct bucket *b;
+  	unsigned int i;
+  
+ -	smap = (struct bpf_local_storage_map *)map;
+ +	smap = (struct bpf_sk_storage_map *)map;
+  
+- 	cache_idx_free(smap->cache_idx);
++ 	bpf_local_storage_cache_idx_free(&sk_cache, smap->cache_idx);
+  
+  	/* Note that this map might be concurrently cloned from
+  	 * bpf_sk_storage_clone. Wait for any existing bpf_sk_storage_clone
+@@@ -707,8 -715,9 +723,14 @@@ static struct bpf_map *bpf_sk_storage_m
+  		raw_spin_lock_init(&smap->buckets[i].lock);
+  	}
+  
+++<<<<<<< HEAD
+ +	smap->elem_size = sizeof(struct bpf_sk_storage_elem) + attr->value_size;
+ +	smap->cache_idx = cache_idx_get();
+++=======
++ 	smap->elem_size =
++ 		sizeof(struct bpf_local_storage_elem) + attr->value_size;
++ 	smap->cache_idx = bpf_local_storage_cache_idx_get(&sk_cache);
+++>>>>>>> 4cc9ce4e7399 (bpf: Generalize caching for sk_storage.)
+  
+  	return &smap->map;
+  }
+diff --git a/include/net/bpf_sk_storage.h b/include/net/bpf_sk_storage.h
+index 5036c94c0503..950c5aaba15e 100644
+--- a/include/net/bpf_sk_storage.h
++++ b/include/net/bpf_sk_storage.h
+@@ -3,6 +3,9 @@
+ #ifndef _BPF_SK_STORAGE_H
+ #define _BPF_SK_STORAGE_H
+ 
++#include <linux/types.h>
++#include <linux/spinlock.h>
++
+ struct sock;
+ 
+ void bpf_sk_storage_free(struct sock *sk);
+@@ -15,6 +18,22 @@ struct sk_buff;
+ struct nlattr;
+ struct sock;
+ 
++#define BPF_LOCAL_STORAGE_CACHE_SIZE	16
++
++struct bpf_local_storage_cache {
++	spinlock_t idx_lock;
++	u64 idx_usage_counts[BPF_LOCAL_STORAGE_CACHE_SIZE];
++};
++
++#define DEFINE_BPF_STORAGE_CACHE(name)				\
++static struct bpf_local_storage_cache name = {			\
++	.idx_lock = __SPIN_LOCK_UNLOCKED(name.idx_lock),	\
++}
++
++u16 bpf_local_storage_cache_idx_get(struct bpf_local_storage_cache *cache);
++void bpf_local_storage_cache_idx_free(struct bpf_local_storage_cache *cache,
++				      u16 idx);
++
+ #ifdef CONFIG_BPF_SYSCALL
+ int bpf_sk_storage_clone(const struct sock *sk, struct sock *newsk);
+ struct bpf_sk_storage_diag *
+* Unmerged path net/core/bpf_sk_storage.c
