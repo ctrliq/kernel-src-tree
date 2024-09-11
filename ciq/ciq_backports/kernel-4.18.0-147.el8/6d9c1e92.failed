@@ -1,0 +1,484 @@
+drm/i915: Extract DIMM info on cnl+
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 6d9c1e92038507d03f6a25332719ad4b0ad00279
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6d9c1e92.failed
+
+We'll need information about the memory configuration on cnl+ too.
+Extend the code to parse the slightly changed register layout.
+
+v2: Document what cnl_get_dimm_size() returns (Jani)
+
+	Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190306203551.24592-12-ville.syrjala@linux.intel.com
+(cherry picked from commit 6d9c1e92038507d03f6a25332719ad4b0ad00279)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_drv.c
+#	drivers/gpu/drm/i915/i915_reg.h
+diff --cc drivers/gpu/drm/i915/i915_drv.c
+index 07735f386eab,611e15edcd66..000000000000
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@@ -1054,6 -1068,371 +1054,374 @@@ static void intel_sanitize_options(stru
+  	intel_gvt_sanitize_options(dev_priv);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int intel_dimm_num_devices(const struct dram_dimm_info *dimm)
++ {
++ 	return dimm->ranks * 64 / (dimm->width ?: 1);
++ }
++ 
++ /* Returns total GB for the whole DIMM */
++ static int skl_get_dimm_size(u16 val)
++ {
++ 	return val & SKL_DRAM_SIZE_MASK;
++ }
++ 
++ static int skl_get_dimm_width(u16 val)
++ {
++ 	if (skl_get_dimm_size(val) == 0)
++ 		return 0;
++ 
++ 	switch (val & SKL_DRAM_WIDTH_MASK) {
++ 	case SKL_DRAM_WIDTH_X8:
++ 	case SKL_DRAM_WIDTH_X16:
++ 	case SKL_DRAM_WIDTH_X32:
++ 		val = (val & SKL_DRAM_WIDTH_MASK) >> SKL_DRAM_WIDTH_SHIFT;
++ 		return 8 << val;
++ 	default:
++ 		MISSING_CASE(val);
++ 		return 0;
++ 	}
++ }
++ 
++ static int skl_get_dimm_ranks(u16 val)
++ {
++ 	if (skl_get_dimm_size(val) == 0)
++ 		return 0;
++ 
++ 	val = (val & SKL_DRAM_RANK_MASK) >> SKL_DRAM_RANK_SHIFT;
++ 
++ 	return val + 1;
++ }
++ 
++ /* Returns total GB for the whole DIMM */
++ static int cnl_get_dimm_size(u16 val)
++ {
++ 	return (val & CNL_DRAM_SIZE_MASK) / 2;
++ }
++ 
++ static int cnl_get_dimm_width(u16 val)
++ {
++ 	if (cnl_get_dimm_size(val) == 0)
++ 		return 0;
++ 
++ 	switch (val & CNL_DRAM_WIDTH_MASK) {
++ 	case CNL_DRAM_WIDTH_X8:
++ 	case CNL_DRAM_WIDTH_X16:
++ 	case CNL_DRAM_WIDTH_X32:
++ 		val = (val & CNL_DRAM_WIDTH_MASK) >> CNL_DRAM_WIDTH_SHIFT;
++ 		return 8 << val;
++ 	default:
++ 		MISSING_CASE(val);
++ 		return 0;
++ 	}
++ }
++ 
++ static int cnl_get_dimm_ranks(u16 val)
++ {
++ 	if (cnl_get_dimm_size(val) == 0)
++ 		return 0;
++ 
++ 	val = (val & CNL_DRAM_RANK_MASK) >> CNL_DRAM_RANK_SHIFT;
++ 
++ 	return val + 1;
++ }
++ 
++ static bool
++ skl_is_16gb_dimm(const struct dram_dimm_info *dimm)
++ {
++ 	/* Convert total GB to Gb per DRAM device */
++ 	return 8 * dimm->size / (intel_dimm_num_devices(dimm) ?: 1) == 16;
++ }
++ 
++ static void
++ skl_dram_get_dimm_info(struct drm_i915_private *dev_priv,
++ 		       struct dram_dimm_info *dimm,
++ 		       int channel, char dimm_name, u16 val)
++ {
++ 	if (INTEL_GEN(dev_priv) >= 10) {
++ 		dimm->size = cnl_get_dimm_size(val);
++ 		dimm->width = cnl_get_dimm_width(val);
++ 		dimm->ranks = cnl_get_dimm_ranks(val);
++ 	} else {
++ 		dimm->size = skl_get_dimm_size(val);
++ 		dimm->width = skl_get_dimm_width(val);
++ 		dimm->ranks = skl_get_dimm_ranks(val);
++ 	}
++ 
++ 	DRM_DEBUG_KMS("CH%u DIMM %c size: %u GB, width: X%u, ranks: %u, 16Gb DIMMs: %s\n",
++ 		      channel, dimm_name, dimm->size, dimm->width, dimm->ranks,
++ 		      yesno(skl_is_16gb_dimm(dimm)));
++ }
++ 
++ static int
++ skl_dram_get_channel_info(struct drm_i915_private *dev_priv,
++ 			  struct dram_channel_info *ch,
++ 			  int channel, u32 val)
++ {
++ 	skl_dram_get_dimm_info(dev_priv, &ch->dimm_l,
++ 			       channel, 'L', val & 0xffff);
++ 	skl_dram_get_dimm_info(dev_priv, &ch->dimm_s,
++ 			       channel, 'S', val >> 16);
++ 
++ 	if (ch->dimm_l.size == 0 && ch->dimm_s.size == 0) {
++ 		DRM_DEBUG_KMS("CH%u not populated\n", channel);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ch->dimm_l.ranks == 2 || ch->dimm_s.ranks == 2)
++ 		ch->ranks = 2;
++ 	else if (ch->dimm_l.ranks == 1 && ch->dimm_s.ranks == 1)
++ 		ch->ranks = 2;
++ 	else
++ 		ch->ranks = 1;
++ 
++ 	ch->is_16gb_dimm =
++ 		skl_is_16gb_dimm(&ch->dimm_l) ||
++ 		skl_is_16gb_dimm(&ch->dimm_s);
++ 
++ 	DRM_DEBUG_KMS("CH%u ranks: %u, 16Gb DIMMs: %s\n",
++ 		      channel, ch->ranks, yesno(ch->is_16gb_dimm));
++ 
++ 	return 0;
++ }
++ 
++ static bool
++ intel_is_dram_symmetric(const struct dram_channel_info *ch0,
++ 			const struct dram_channel_info *ch1)
++ {
++ 	return !memcmp(ch0, ch1, sizeof(*ch0)) &&
++ 		(ch0->dimm_s.size == 0 ||
++ 		 !memcmp(&ch0->dimm_l, &ch0->dimm_s, sizeof(ch0->dimm_l)));
++ }
++ 
++ static int
++ skl_dram_get_channels_info(struct drm_i915_private *dev_priv)
++ {
++ 	struct dram_info *dram_info = &dev_priv->dram_info;
++ 	struct dram_channel_info ch0 = {}, ch1 = {};
++ 	u32 val;
++ 	int ret;
++ 
++ 	val = I915_READ(SKL_MAD_DIMM_CH0_0_0_0_MCHBAR_MCMAIN);
++ 	ret = skl_dram_get_channel_info(dev_priv, &ch0, 0, val);
++ 	if (ret == 0)
++ 		dram_info->num_channels++;
++ 
++ 	val = I915_READ(SKL_MAD_DIMM_CH1_0_0_0_MCHBAR_MCMAIN);
++ 	ret = skl_dram_get_channel_info(dev_priv, &ch1, 1, val);
++ 	if (ret == 0)
++ 		dram_info->num_channels++;
++ 
++ 	if (dram_info->num_channels == 0) {
++ 		DRM_INFO("Number of memory channels is zero\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/*
++ 	 * If any of the channel is single rank channel, worst case output
++ 	 * will be same as if single rank memory, so consider single rank
++ 	 * memory.
++ 	 */
++ 	if (ch0.ranks == 1 || ch1.ranks == 1)
++ 		dram_info->ranks = 1;
++ 	else
++ 		dram_info->ranks = max(ch0.ranks, ch1.ranks);
++ 
++ 	if (dram_info->ranks == 0) {
++ 		DRM_INFO("couldn't get memory rank information\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	dram_info->is_16gb_dimm = ch0.is_16gb_dimm || ch1.is_16gb_dimm;
++ 
++ 	dram_info->symmetric_memory = intel_is_dram_symmetric(&ch0, &ch1);
++ 
++ 	DRM_DEBUG_KMS("Memory configuration is symmetric? %s\n",
++ 		      yesno(dram_info->symmetric_memory));
++ 	return 0;
++ }
++ 
++ static int
++ skl_get_dram_info(struct drm_i915_private *dev_priv)
++ {
++ 	struct dram_info *dram_info = &dev_priv->dram_info;
++ 	u32 mem_freq_khz, val;
++ 	int ret;
++ 
++ 	ret = skl_dram_get_channels_info(dev_priv);
++ 	if (ret)
++ 		return ret;
++ 
++ 	val = I915_READ(SKL_MC_BIOS_DATA_0_0_0_MCHBAR_PCU);
++ 	mem_freq_khz = DIV_ROUND_UP((val & SKL_REQ_DATA_MASK) *
++ 				    SKL_MEMORY_FREQ_MULTIPLIER_HZ, 1000);
++ 
++ 	dram_info->bandwidth_kbps = dram_info->num_channels *
++ 							mem_freq_khz * 8;
++ 
++ 	if (dram_info->bandwidth_kbps == 0) {
++ 		DRM_INFO("Couldn't get system memory bandwidth\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	dram_info->valid = true;
++ 	return 0;
++ }
++ 
++ /* Returns Gb per DRAM device */
++ static int bxt_get_dimm_size(u32 val)
++ {
++ 	switch (val & BXT_DRAM_SIZE_MASK) {
++ 	case BXT_DRAM_SIZE_4GBIT:
++ 		return 4;
++ 	case BXT_DRAM_SIZE_6GBIT:
++ 		return 6;
++ 	case BXT_DRAM_SIZE_8GBIT:
++ 		return 8;
++ 	case BXT_DRAM_SIZE_12GBIT:
++ 		return 12;
++ 	case BXT_DRAM_SIZE_16GBIT:
++ 		return 16;
++ 	default:
++ 		MISSING_CASE(val);
++ 		return 0;
++ 	}
++ }
++ 
++ static int bxt_get_dimm_width(u32 val)
++ {
++ 	if (!bxt_get_dimm_size(val))
++ 		return 0;
++ 
++ 	val = (val & BXT_DRAM_WIDTH_MASK) >> BXT_DRAM_WIDTH_SHIFT;
++ 
++ 	return 8 << val;
++ }
++ 
++ static int bxt_get_dimm_ranks(u32 val)
++ {
++ 	if (!bxt_get_dimm_size(val))
++ 		return 0;
++ 
++ 	switch (val & BXT_DRAM_RANK_MASK) {
++ 	case BXT_DRAM_RANK_SINGLE:
++ 		return 1;
++ 	case BXT_DRAM_RANK_DUAL:
++ 		return 2;
++ 	default:
++ 		MISSING_CASE(val);
++ 		return 0;
++ 	}
++ }
++ 
++ static void bxt_get_dimm_info(struct dram_dimm_info *dimm,
++ 			      u32 val)
++ {
++ 	dimm->width = bxt_get_dimm_width(val);
++ 	dimm->ranks = bxt_get_dimm_ranks(val);
++ 
++ 	/*
++ 	 * Size in register is Gb per DRAM device. Convert to total
++ 	 * GB to match the way we report this for non-LP platforms.
++ 	 */
++ 	dimm->size = bxt_get_dimm_size(val) * intel_dimm_num_devices(dimm) / 8;
++ }
++ 
++ static int
++ bxt_get_dram_info(struct drm_i915_private *dev_priv)
++ {
++ 	struct dram_info *dram_info = &dev_priv->dram_info;
++ 	u32 dram_channels;
++ 	u32 mem_freq_khz, val;
++ 	u8 num_active_channels;
++ 	int i;
++ 
++ 	val = I915_READ(BXT_P_CR_MC_BIOS_REQ_0_0_0);
++ 	mem_freq_khz = DIV_ROUND_UP((val & BXT_REQ_DATA_MASK) *
++ 				    BXT_MEMORY_FREQ_MULTIPLIER_HZ, 1000);
++ 
++ 	dram_channels = val & BXT_DRAM_CHANNEL_ACTIVE_MASK;
++ 	num_active_channels = hweight32(dram_channels);
++ 
++ 	/* Each active bit represents 4-byte channel */
++ 	dram_info->bandwidth_kbps = (mem_freq_khz * num_active_channels * 4);
++ 
++ 	if (dram_info->bandwidth_kbps == 0) {
++ 		DRM_INFO("Couldn't get system memory bandwidth\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/*
++ 	 * Now read each DUNIT8/9/10/11 to check the rank of each dimms.
++ 	 */
++ 	for (i = BXT_D_CR_DRP0_DUNIT_START; i <= BXT_D_CR_DRP0_DUNIT_END; i++) {
++ 		struct dram_dimm_info dimm;
++ 
++ 		val = I915_READ(BXT_D_CR_DRP0_DUNIT(i));
++ 		if (val == 0xFFFFFFFF)
++ 			continue;
++ 
++ 		dram_info->num_channels++;
++ 
++ 		bxt_get_dimm_info(&dimm, val);
++ 
++ 		DRM_DEBUG_KMS("CH%u DIMM size: %u GB, width: X%u, ranks: %u\n",
++ 			      i - BXT_D_CR_DRP0_DUNIT_START,
++ 			      dimm.size, dimm.width, dimm.ranks);
++ 
++ 		/*
++ 		 * If any of the channel is single rank channel,
++ 		 * worst case output will be same as if single rank
++ 		 * memory, so consider single rank memory.
++ 		 */
++ 		if (dram_info->ranks == 0)
++ 			dram_info->ranks = dimm.ranks;
++ 		else if (dimm.ranks == 1)
++ 			dram_info->ranks = 1;
++ 	}
++ 
++ 	if (dram_info->ranks == 0) {
++ 		DRM_INFO("couldn't get memory rank information\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	dram_info->valid = true;
++ 	return 0;
++ }
++ 
++ static void
++ intel_get_dram_info(struct drm_i915_private *dev_priv)
++ {
++ 	struct dram_info *dram_info = &dev_priv->dram_info;
++ 	int ret;
++ 
++ 	/*
++ 	 * Assume 16Gb DIMMs are present until proven otherwise.
++ 	 * This is only used for the level 0 watermark latency
++ 	 * w/a which does not apply to bxt/glk.
++ 	 */
++ 	dram_info->is_16gb_dimm = !IS_GEN9_LP(dev_priv);
++ 
++ 	if (INTEL_GEN(dev_priv) < 9)
++ 		return;
++ 
++ 	if (IS_GEN9_LP(dev_priv))
++ 		ret = bxt_get_dram_info(dev_priv);
++ 	else
++ 		ret = skl_get_dram_info(dev_priv);
++ 	if (ret)
++ 		return;
++ 
++ 	DRM_DEBUG_KMS("DRAM bandwidth: %u kBps, channels: %u\n",
++ 		      dram_info->bandwidth_kbps,
++ 		      dram_info->num_channels);
++ 
++ 	DRM_DEBUG_KMS("DRAM ranks: %u, 16Gb DIMMs: %s\n",
++ 		      dram_info->ranks, yesno(dram_info->is_16gb_dimm));
++ }
++ 
+++>>>>>>> 6d9c1e920385 (drm/i915: Extract DIMM info on cnl+)
+  /**
+   * i915_driver_init_hw - setup state requiring device access
+   * @dev_priv: device private
+diff --cc drivers/gpu/drm/i915/i915_reg.h
+index a78c6ef1f608,695eb3ec7187..000000000000
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@@ -9151,8 -9829,69 +9151,74 @@@ enum skl_power_gate 
+  #define  DC_STATE_EN_UPTO_DC5_DC6_MASK   0x3
+  
+  #define  DC_STATE_DEBUG                  _MMIO(0x45520)
+++<<<<<<< HEAD
+ +#define  DC_STATE_DEBUG_MASK_CORES	(1<<0)
+ +#define  DC_STATE_DEBUG_MASK_MEMORY_UP	(1<<1)
+++=======
++ #define  DC_STATE_DEBUG_MASK_CORES	(1 << 0)
++ #define  DC_STATE_DEBUG_MASK_MEMORY_UP	(1 << 1)
++ 
++ #define BXT_P_CR_MC_BIOS_REQ_0_0_0	_MMIO(MCHBAR_MIRROR_BASE_SNB + 0x7114)
++ #define  BXT_REQ_DATA_MASK			0x3F
++ #define  BXT_DRAM_CHANNEL_ACTIVE_SHIFT		12
++ #define  BXT_DRAM_CHANNEL_ACTIVE_MASK		(0xF << 12)
++ #define  BXT_MEMORY_FREQ_MULTIPLIER_HZ		133333333
++ 
++ #define BXT_D_CR_DRP0_DUNIT8			0x1000
++ #define BXT_D_CR_DRP0_DUNIT9			0x1200
++ #define  BXT_D_CR_DRP0_DUNIT_START		8
++ #define  BXT_D_CR_DRP0_DUNIT_END		11
++ #define BXT_D_CR_DRP0_DUNIT(x)	_MMIO(MCHBAR_MIRROR_BASE_SNB + \
++ 				      _PICK_EVEN((x) - 8, BXT_D_CR_DRP0_DUNIT8,\
++ 						 BXT_D_CR_DRP0_DUNIT9))
++ #define  BXT_DRAM_RANK_MASK			0x3
++ #define  BXT_DRAM_RANK_SINGLE			0x1
++ #define  BXT_DRAM_RANK_DUAL			0x3
++ #define  BXT_DRAM_WIDTH_MASK			(0x3 << 4)
++ #define  BXT_DRAM_WIDTH_SHIFT			4
++ #define  BXT_DRAM_WIDTH_X8			(0x0 << 4)
++ #define  BXT_DRAM_WIDTH_X16			(0x1 << 4)
++ #define  BXT_DRAM_WIDTH_X32			(0x2 << 4)
++ #define  BXT_DRAM_WIDTH_X64			(0x3 << 4)
++ #define  BXT_DRAM_SIZE_MASK			(0x7 << 6)
++ #define  BXT_DRAM_SIZE_SHIFT			6
++ #define  BXT_DRAM_SIZE_4GBIT			(0x0 << 6)
++ #define  BXT_DRAM_SIZE_6GBIT			(0x1 << 6)
++ #define  BXT_DRAM_SIZE_8GBIT			(0x2 << 6)
++ #define  BXT_DRAM_SIZE_12GBIT			(0x3 << 6)
++ #define  BXT_DRAM_SIZE_16GBIT			(0x4 << 6)
++ 
++ #define SKL_MEMORY_FREQ_MULTIPLIER_HZ		266666666
++ #define SKL_MC_BIOS_DATA_0_0_0_MCHBAR_PCU	_MMIO(MCHBAR_MIRROR_BASE_SNB + 0x5E04)
++ #define  SKL_REQ_DATA_MASK			(0xF << 0)
++ 
++ #define SKL_MAD_DIMM_CH0_0_0_0_MCHBAR_MCMAIN	_MMIO(MCHBAR_MIRROR_BASE_SNB + 0x500C)
++ #define SKL_MAD_DIMM_CH1_0_0_0_MCHBAR_MCMAIN	_MMIO(MCHBAR_MIRROR_BASE_SNB + 0x5010)
++ #define  SKL_DRAM_S_SHIFT			16
++ #define  SKL_DRAM_SIZE_MASK			0x3F
++ #define  SKL_DRAM_WIDTH_MASK			(0x3 << 8)
++ #define  SKL_DRAM_WIDTH_SHIFT			8
++ #define  SKL_DRAM_WIDTH_X8			(0x0 << 8)
++ #define  SKL_DRAM_WIDTH_X16			(0x1 << 8)
++ #define  SKL_DRAM_WIDTH_X32			(0x2 << 8)
++ #define  SKL_DRAM_RANK_MASK			(0x1 << 10)
++ #define  SKL_DRAM_RANK_SHIFT			10
++ #define  SKL_DRAM_RANK_1			(0x0 << 10)
++ #define  SKL_DRAM_RANK_2			(0x1 << 10)
++ #define  SKL_DRAM_RANK_MASK			(0x1 << 10)
++ #define  CNL_DRAM_SIZE_MASK			0x7F
++ #define  CNL_DRAM_WIDTH_MASK			(0x3 << 7)
++ #define  CNL_DRAM_WIDTH_SHIFT			7
++ #define  CNL_DRAM_WIDTH_X8			(0x0 << 7)
++ #define  CNL_DRAM_WIDTH_X16			(0x1 << 7)
++ #define  CNL_DRAM_WIDTH_X32			(0x2 << 7)
++ #define  CNL_DRAM_RANK_MASK			(0x3 << 9)
++ #define  CNL_DRAM_RANK_SHIFT			9
++ #define  CNL_DRAM_RANK_1			(0x0 << 9)
++ #define  CNL_DRAM_RANK_2			(0x1 << 9)
++ #define  CNL_DRAM_RANK_3			(0x2 << 9)
++ #define  CNL_DRAM_RANK_4			(0x3 << 9)
+++>>>>>>> 6d9c1e920385 (drm/i915: Extract DIMM info on cnl+)
+  
+  /* Please see hsw_read_dcomp() and hsw_write_dcomp() before using this register,
+   * since on HSW we can't write to it using I915_WRITE. */
+* Unmerged path drivers/gpu/drm/i915/i915_drv.c
+* Unmerged path drivers/gpu/drm/i915/i915_reg.h
