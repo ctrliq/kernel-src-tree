@@ -1,0 +1,278 @@
+mlx5: avoid 64-bit division
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Michal Kubecek <mkubecek@suse.cz>
+commit 37eb86c4507abcb14fc346863e83aa8751aa4675
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/37eb86c4.failed
+
+Commit 25c13324d03d ("IB/mlx5: Add steering SW ICM device memory type")
+breaks i386 build by introducing three 64-bit divisions. As the divisor is
+MLX5_SW_ICM_BLOCK_SIZE() which is always a power of 2, we can replace the
+division with bit operations.
+
+Fixes: 25c13324d03d ("IB/mlx5: Add steering SW ICM device memory type")
+	Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 37eb86c4507abcb14fc346863e83aa8751aa4675)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/cmd.c
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/cmd.c
+index be95ac5aeb30,6c8645033102..000000000000
+--- a/drivers/infiniband/hw/mlx5/cmd.c
++++ b/drivers/infiniband/hw/mlx5/cmd.c
+@@@ -186,6 -186,136 +186,139 @@@ int mlx5_cmd_dealloc_memic(struct mlx5_
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_cmd_alloc_sw_icm(struct mlx5_dm *dm, int type, u64 length,
++ 			  u16 uid, phys_addr_t *addr, u32 *obj_id)
++ {
++ 	struct mlx5_core_dev *dev = dm->dev;
++ 	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)] = {};
++ 	u32 in[MLX5_ST_SZ_DW(create_sw_icm_in)] = {};
++ 	unsigned long *block_map;
++ 	u64 icm_start_addr;
++ 	u32 log_icm_size;
++ 	u32 num_blocks;
++ 	u32 max_blocks;
++ 	u64 block_idx;
++ 	void *sw_icm;
++ 	int ret;
++ 
++ 	MLX5_SET(general_obj_in_cmd_hdr, in, opcode,
++ 		 MLX5_CMD_OP_CREATE_GENERAL_OBJECT);
++ 	MLX5_SET(general_obj_in_cmd_hdr, in, obj_type, MLX5_OBJ_TYPE_SW_ICM);
++ 	MLX5_SET(general_obj_in_cmd_hdr, in, uid, uid);
++ 
++ 	switch (type) {
++ 	case MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM:
++ 		icm_start_addr = MLX5_CAP64_DEV_MEM(dev,
++ 						steering_sw_icm_start_address);
++ 		log_icm_size = MLX5_CAP_DEV_MEM(dev, log_steering_sw_icm_size);
++ 		block_map = dm->steering_sw_icm_alloc_blocks;
++ 		break;
++ 	case MLX5_IB_UAPI_DM_TYPE_HEADER_MODIFY_SW_ICM:
++ 		icm_start_addr = MLX5_CAP64_DEV_MEM(dev,
++ 					header_modify_sw_icm_start_address);
++ 		log_icm_size = MLX5_CAP_DEV_MEM(dev,
++ 						log_header_modify_sw_icm_size);
++ 		block_map = dm->header_modify_sw_icm_alloc_blocks;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	num_blocks = (length + MLX5_SW_ICM_BLOCK_SIZE(dev) - 1) >>
++ 		     MLX5_LOG_SW_ICM_BLOCK_SIZE(dev);
++ 	max_blocks = BIT(log_icm_size - MLX5_LOG_SW_ICM_BLOCK_SIZE(dev));
++ 	spin_lock(&dm->lock);
++ 	block_idx = bitmap_find_next_zero_area(block_map,
++ 					       max_blocks,
++ 					       0,
++ 					       num_blocks, 0);
++ 
++ 	if (block_idx < max_blocks)
++ 		bitmap_set(block_map,
++ 			   block_idx, num_blocks);
++ 
++ 	spin_unlock(&dm->lock);
++ 
++ 	if (block_idx >= max_blocks)
++ 		return -ENOMEM;
++ 
++ 	sw_icm = MLX5_ADDR_OF(create_sw_icm_in, in, sw_icm);
++ 	icm_start_addr += block_idx << MLX5_LOG_SW_ICM_BLOCK_SIZE(dev);
++ 	MLX5_SET64(sw_icm, sw_icm, sw_icm_start_addr,
++ 		   icm_start_addr);
++ 	MLX5_SET(sw_icm, sw_icm, log_sw_icm_size, ilog2(length));
++ 
++ 	ret = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ 	if (ret) {
++ 		spin_lock(&dm->lock);
++ 		bitmap_clear(block_map,
++ 			     block_idx, num_blocks);
++ 		spin_unlock(&dm->lock);
++ 
++ 		return ret;
++ 	}
++ 
++ 	*addr = icm_start_addr;
++ 	*obj_id = MLX5_GET(general_obj_out_cmd_hdr, out, obj_id);
++ 
++ 	return 0;
++ }
++ 
++ int mlx5_cmd_dealloc_sw_icm(struct mlx5_dm *dm, int type, u64 length,
++ 			    u16 uid, phys_addr_t addr, u32 obj_id)
++ {
++ 	struct mlx5_core_dev *dev = dm->dev;
++ 	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)] = {};
++ 	u32 in[MLX5_ST_SZ_DW(general_obj_in_cmd_hdr)] = {};
++ 	unsigned long *block_map;
++ 	u32 num_blocks;
++ 	u64 start_idx;
++ 	int err;
++ 
++ 	num_blocks = (length + MLX5_SW_ICM_BLOCK_SIZE(dev) - 1) >>
++ 		     MLX5_LOG_SW_ICM_BLOCK_SIZE(dev);
++ 
++ 	switch (type) {
++ 	case MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM:
++ 		start_idx =
++ 			(addr - MLX5_CAP64_DEV_MEM(
++ 					dev, steering_sw_icm_start_address)) >>
++ 			MLX5_LOG_SW_ICM_BLOCK_SIZE(dev);
++ 		block_map = dm->steering_sw_icm_alloc_blocks;
++ 		break;
++ 	case MLX5_IB_UAPI_DM_TYPE_HEADER_MODIFY_SW_ICM:
++ 		start_idx =
++ 			(addr -
++ 			 MLX5_CAP64_DEV_MEM(
++ 				 dev, header_modify_sw_icm_start_address)) >>
++ 			MLX5_LOG_SW_ICM_BLOCK_SIZE(dev);
++ 		block_map = dm->header_modify_sw_icm_alloc_blocks;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	MLX5_SET(general_obj_in_cmd_hdr, in, opcode,
++ 		 MLX5_CMD_OP_DESTROY_GENERAL_OBJECT);
++ 	MLX5_SET(general_obj_in_cmd_hdr, in, obj_type, MLX5_OBJ_TYPE_SW_ICM);
++ 	MLX5_SET(general_obj_in_cmd_hdr, in, obj_id, obj_id);
++ 	MLX5_SET(general_obj_in_cmd_hdr, in, uid, uid);
++ 
++ 	err =  mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ 	if (err)
++ 		return err;
++ 
++ 	spin_lock(&dm->lock);
++ 	bitmap_clear(block_map,
++ 		     start_idx, num_blocks);
++ 	spin_unlock(&dm->lock);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 37eb86c4507a (mlx5: avoid 64-bit division)
+  int mlx5_cmd_query_ext_ppcnt_counters(struct mlx5_core_dev *dev, void *out)
+  {
+  	u32 in[MLX5_ST_SZ_DW(ppcnt_reg)] = {};
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index e4be98e9109a,340290b883fe..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -2312,10 -2320,95 +2312,102 @@@ struct ib_dm *mlx5_ib_alloc_dm(struct i
+  	if (err)
+  		goto err_dealloc;
+  
+ +	bitmap_set(to_mucontext(context)->dm_pages, page_idx,
+ +		   DIV_ROUND_UP(act_size, PAGE_SIZE));
+ +
+++<<<<<<< HEAD
+ +	dm->dev_addr = memic_addr;
+++=======
++ 	bitmap_set(to_mucontext(ctx)->dm_pages, page_idx,
++ 		   DIV_ROUND_UP(dm->size, PAGE_SIZE));
++ 
++ 	return 0;
++ 
++ err_dealloc:
++ 	mlx5_cmd_dealloc_memic(dm_db, dm->dev_addr, dm->size);
++ 
++ 	return err;
++ }
++ 
++ static int handle_alloc_dm_sw_icm(struct ib_ucontext *ctx,
++ 				  struct mlx5_ib_dm *dm,
++ 				  struct ib_dm_alloc_attr *attr,
++ 				  struct uverbs_attr_bundle *attrs,
++ 				  int type)
++ {
++ 	struct mlx5_dm *dm_db = &to_mdev(ctx->device)->dm;
++ 	u64 act_size;
++ 	int err;
++ 
++ 	/* Allocation size must a multiple of the basic block size
++ 	 * and a power of 2.
++ 	 */
++ 	act_size = round_up(attr->length, MLX5_SW_ICM_BLOCK_SIZE(dm_db->dev));
++ 	act_size = roundup_pow_of_two(act_size);
++ 
++ 	dm->size = act_size;
++ 	err = mlx5_cmd_alloc_sw_icm(dm_db, type, act_size,
++ 				    to_mucontext(ctx)->devx_uid, &dm->dev_addr,
++ 				    &dm->icm_dm.obj_id);
++ 	if (err)
++ 		return err;
++ 
++ 	err = uverbs_copy_to(attrs,
++ 			     MLX5_IB_ATTR_ALLOC_DM_RESP_START_OFFSET,
++ 			     &dm->dev_addr, sizeof(dm->dev_addr));
++ 	if (err)
++ 		mlx5_cmd_dealloc_sw_icm(dm_db, type, dm->size,
++ 					to_mucontext(ctx)->devx_uid,
++ 					dm->dev_addr, dm->icm_dm.obj_id);
++ 
++ 	return err;
++ }
++ 
++ struct ib_dm *mlx5_ib_alloc_dm(struct ib_device *ibdev,
++ 			       struct ib_ucontext *context,
++ 			       struct ib_dm_alloc_attr *attr,
++ 			       struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_dm *dm;
++ 	enum mlx5_ib_uapi_dm_type type;
++ 	int err;
++ 
++ 	err = uverbs_get_const_default(&type, attrs,
++ 				       MLX5_IB_ATTR_ALLOC_DM_REQ_TYPE,
++ 				       MLX5_IB_UAPI_DM_TYPE_MEMIC);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	mlx5_ib_dbg(to_mdev(ibdev), "alloc_dm req: dm_type=%d user_length=0x%llx log_alignment=%d\n",
++ 		    type, attr->length, attr->alignment);
++ 
++ 	err = check_dm_type_support(to_mdev(ibdev), type);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	dm = kzalloc(sizeof(*dm), GFP_KERNEL);
++ 	if (!dm)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	dm->type = type;
++ 
++ 	switch (type) {
++ 	case MLX5_IB_UAPI_DM_TYPE_MEMIC:
++ 		err = handle_alloc_dm_memic(context, dm,
++ 					    attr,
++ 					    attrs);
++ 		break;
++ 	case MLX5_IB_UAPI_DM_TYPE_STEERING_SW_ICM:
++ 	case MLX5_IB_UAPI_DM_TYPE_HEADER_MODIFY_SW_ICM:
++ 		err = handle_alloc_dm_sw_icm(context, dm, attr, attrs, type);
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 	}
++ 
++ 	if (err)
++ 		goto err_free;
+++>>>>>>> 37eb86c4507a (mlx5: avoid 64-bit division)
+  
+  	return &dm->ibdm;
+  
+* Unmerged path drivers/infiniband/hw/mlx5/cmd.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
