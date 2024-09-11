@@ -1,0 +1,778 @@
+libbpf: Add low level TC-BPF management API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Kumar Kartikeya Dwivedi <memxor@gmail.com>
+commit 715c5ce454a6a9b94a1a4a3360de6a87eaf0d833
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/715c5ce4.failed
+
+This adds functions that wrap the netlink API used for adding, manipulating,
+and removing traffic control filters.
+
+The API summary:
+
+A bpf_tc_hook represents a location where a TC-BPF filter can be attached.
+This means that creating a hook leads to creation of the backing qdisc,
+while destruction either removes all filters attached to a hook, or destroys
+qdisc if requested explicitly (as discussed below).
+
+The TC-BPF API functions operate on this bpf_tc_hook to attach, replace,
+query, and detach tc filters. All functions return 0 on success, and a
+negative error code on failure.
+
+bpf_tc_hook_create - Create a hook
+Parameters:
+	@hook - Cannot be NULL, ifindex > 0, attach_point must be set to
+		proper enum constant. Note that parent must be unset when
+		attach_point is one of BPF_TC_INGRESS or BPF_TC_EGRESS. Note
+		that as an exception BPF_TC_INGRESS|BPF_TC_EGRESS is also a
+		valid value for attach_point.
+
+		Returns -EOPNOTSUPP when hook has attach_point as BPF_TC_CUSTOM.
+
+bpf_tc_hook_destroy - Destroy a hook
+Parameters:
+	@hook - Cannot be NULL. The behaviour depends on value of
+		attach_point. If BPF_TC_INGRESS, all filters attached to
+		the ingress hook will be detached. If BPF_TC_EGRESS, all
+		filters attached to the egress hook will be detached. If
+		BPF_TC_INGRESS|BPF_TC_EGRESS, the clsact qdisc will be
+		deleted, also detaching all filters. As before, parent must
+		be unset for these attach_points, and set for BPF_TC_CUSTOM.
+
+		It is advised that if the qdisc is operated on by many programs,
+		then the program at least check that there are no other existing
+		filters before deleting the clsact qdisc. An example is shown
+		below:
+
+		DECLARE_LIBBPF_OPTS(bpf_tc_hook, .ifindex = if_nametoindex("lo"),
+				    .attach_point = BPF_TC_INGRESS);
+		/* set opts as NULL, as we're not really interested in
+		 * getting any info for a particular filter, but just
+	 	 * detecting its presence.
+		 */
+		r = bpf_tc_query(&hook, NULL);
+		if (r == -ENOENT) {
+			/* no filters */
+			hook.attach_point = BPF_TC_INGRESS|BPF_TC_EGREESS;
+			return bpf_tc_hook_destroy(&hook);
+		} else {
+			/* failed or r == 0, the latter means filters do exist */
+			return r;
+		}
+
+		Note that there is a small race between checking for no
+		filters and deleting the qdisc. This is currently unavoidable.
+
+		Returns -EOPNOTSUPP when hook has attach_point as BPF_TC_CUSTOM.
+
+bpf_tc_attach - Attach a filter to a hook
+Parameters:
+	@hook - Cannot be NULL. Represents the hook the filter will be
+		attached to. Requirements for ifindex and attach_point are
+		same as described in bpf_tc_hook_create, but BPF_TC_CUSTOM
+		is also supported.  In that case, parent must be set to the
+		handle where the filter will be attached (using BPF_TC_PARENT).
+		E.g. to set parent to 1:16 like in tc command line, the
+		equivalent would be BPF_TC_PARENT(1, 16).
+
+	@opts - Cannot be NULL. The following opts are optional:
+		* handle   - The handle of the filter
+		* priority - The priority of the filter
+			     Must be >= 0 and <= UINT16_MAX
+		Note that when left unset, they will be auto-allocated by
+		the kernel. The following opts must be set:
+		* prog_fd - The fd of the loaded SCHED_CLS prog
+		The following opts must be unset:
+		* prog_id - The ID of the BPF prog
+		The following opts are optional:
+		* flags - Currently only BPF_TC_F_REPLACE is allowed. It
+			  allows replacing an existing filter instead of
+			  failing with -EEXIST.
+		The following opts will be filled by bpf_tc_attach on a
+		successful attach operation if they are unset:
+		* handle   - The handle of the attached filter
+		* priority - The priority of the attached filter
+		* prog_id  - The ID of the attached SCHED_CLS prog
+		This way, the user can know what the auto allocated values
+		for optional opts like handle and priority are for the newly
+		attached filter, if they were unset.
+
+		Note that some other attributes are set to fixed default
+		values listed below (this holds for all bpf_tc_* APIs):
+		protocol as ETH_P_ALL, direct action mode, chain index of 0,
+		and class ID of 0 (this can be set by writing to the
+		skb->tc_classid field from the BPF program).
+
+bpf_tc_detach
+Parameters:
+	@hook - Cannot be NULL. Represents the hook the filter will be
+		detached from. Requirements are same as described above
+		in bpf_tc_attach.
+
+	@opts - Cannot be NULL. The following opts must be set:
+		* handle, priority
+		The following opts must be unset:
+		* prog_fd, prog_id, flags
+
+bpf_tc_query
+Parameters:
+	@hook - Cannot be NULL. Represents the hook where the filter lookup will
+		be performed. Requirements are same as described above in
+		bpf_tc_attach().
+
+	@opts - Cannot be NULL. The following opts must be set:
+		* handle, priority
+		The following opts must be unset:
+		* prog_fd, prog_id, flags
+		The following fields will be filled by bpf_tc_query upon a
+		successful lookup:
+		* prog_id
+
+Some usage examples (using BPF skeleton infrastructure):
+
+BPF program (test_tc_bpf.c):
+
+	#include <linux/bpf.h>
+	#include <bpf/bpf_helpers.h>
+
+	SEC("classifier")
+	int cls(struct __sk_buff *skb)
+	{
+		return 0;
+	}
+
+Userspace loader:
+
+	struct test_tc_bpf *skel = NULL;
+	int fd, r;
+
+	skel = test_tc_bpf__open_and_load();
+	if (!skel)
+		return -ENOMEM;
+
+	fd = bpf_program__fd(skel->progs.cls);
+
+	DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex =
+			    if_nametoindex("lo"), .attach_point =
+			    BPF_TC_INGRESS);
+	/* Create clsact qdisc */
+	r = bpf_tc_hook_create(&hook);
+	if (r < 0)
+		goto end;
+
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts, .prog_fd = fd);
+	r = bpf_tc_attach(&hook, &opts);
+	if (r < 0)
+		goto end;
+	/* Print the auto allocated handle and priority */
+	printf("Handle=%u", opts.handle);
+	printf("Priority=%u", opts.priority);
+
+	opts.prog_fd = opts.prog_id = 0;
+	bpf_tc_detach(&hook, &opts);
+end:
+	test_tc_bpf__destroy(skel);
+
+This is equivalent to doing the following using tc command line:
+  # tc qdisc add dev lo clsact
+  # tc filter add dev lo ingress bpf obj foo.o sec classifier da
+  # tc filter del dev lo ingress handle <h> prio <p> bpf
+... where the handle and priority can be found using:
+  # tc filter show dev lo ingress
+
+Another example replacing a filter (extending prior example):
+
+	/* We can also choose both (or one), let's try replacing an
+	 * existing filter.
+	 */
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, replace_opts, .handle =
+			    opts.handle, .priority = opts.priority,
+			    .prog_fd = fd);
+	r = bpf_tc_attach(&hook, &replace_opts);
+	if (r == -EEXIST) {
+		/* Expected, now use BPF_TC_F_REPLACE to replace it */
+		replace_opts.flags = BPF_TC_F_REPLACE;
+		return bpf_tc_attach(&hook, &replace_opts);
+	} else if (r < 0) {
+		return r;
+	}
+	/* There must be no existing filter with these
+	 * attributes, so cleanup and return an error.
+	 */
+	replace_opts.prog_fd = replace_opts.prog_id = 0;
+	bpf_tc_detach(&hook, &replace_opts);
+	return -1;
+
+To obtain info of a particular filter:
+
+	/* Find info for filter with handle 1 and priority 50 */
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, info_opts, .handle = 1,
+			    .priority = 50);
+	r = bpf_tc_query(&hook, &info_opts);
+	if (r == -ENOENT)
+		printf("Filter not found");
+	else if (r < 0)
+		return r;
+	printf("Prog ID: %u", info_opts.prog_id);
+	return 0;
+
+	Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Co-developed-by: Daniel Borkmann <daniel@iogearbox.net> # libbpf API design
+[ Daniel: also did major patch cleanup ]
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20210512103451.989420-3-memxor@gmail.com
+(cherry picked from commit 715c5ce454a6a9b94a1a4a3360de6a87eaf0d833)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/netlink.c
+diff --cc tools/lib/bpf/netlink.c
+index 4676dcf5eae8,47444588e0d2..000000000000
+--- a/tools/lib/bpf/netlink.c
++++ b/tools/lib/bpf/netlink.c
+@@@ -73,9 -76,20 +76,26 @@@ cleanup
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int bpf_netlink_recv(int sock, __u32 nl_pid, int seq,
+ +			    __dump_nlmsg_t _fn, libbpf_dump_nlmsg_t fn,
+ +			    void *cookie)
+++=======
++ static void libbpf_netlink_close(int sock)
++ {
++ 	close(sock);
++ }
++ 
++ enum {
++ 	NL_CONT,
++ 	NL_NEXT,
++ 	NL_DONE,
++ };
++ 
++ static int libbpf_netlink_recv(int sock, __u32 nl_pid, int seq,
++ 			       __dump_nlmsg_t _fn, libbpf_dump_nlmsg_t fn,
++ 			       void *cookie)
+++>>>>>>> 715c5ce454a6 (libbpf: Add low level TC-BPF management API)
+  {
+  	bool multipart = true;
+  	struct nlmsgerr *err;
+@@@ -349,34 -372,403 +378,437 @@@ int bpf_get_link_xdp_id(int ifindex, __
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +int libbpf_nl_get_link(int sock, unsigned int nl_pid,
+ +		       libbpf_dump_nlmsg_t dump_link_nlmsg, void *cookie)
+ +{
+ +	struct {
+ +		struct nlmsghdr nlh;
+ +		struct ifinfomsg ifm;
+ +	} req = {
+ +		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
+ +		.nlh.nlmsg_type = RTM_GETLINK,
+ +		.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
+ +		.ifm.ifi_family = AF_PACKET,
+ +	};
+ +	int seq = time(NULL);
+ +
+ +	req.nlh.nlmsg_seq = seq;
+ +	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0)
+ +		return -errno;
+ +
+ +	return bpf_netlink_recv(sock, nl_pid, seq, __dump_link_nlmsg,
+ +				dump_link_nlmsg, cookie);
+ +}
+ +
+ +/* RHEL-only, libbpf version workaround */
+ +extern int bpf_get_link_xdp_info_v0_0_6(int ifindex, struct xdp_link_info *info,
+ +					size_t info_size, __u32 flags)
+ +	__attribute__((alias("bpf_get_link_xdp_info_v0_0_4")));
+ +
+ +COMPAT_VERSION(bpf_get_link_xdp_info_v0_0_4,
+ +	       bpf_get_link_xdp_info, LIBBPF_0.0.4)
+ +DEFAULT_VERSION(bpf_get_link_xdp_info_v0_0_6,
+ +	        bpf_get_link_xdp_info, LIBBPF_0.0.6)
+++=======
++ typedef int (*qdisc_config_t)(struct nlmsghdr *nh, struct tcmsg *t,
++ 			      size_t maxsz);
++ 
++ static int clsact_config(struct nlmsghdr *nh, struct tcmsg *t, size_t maxsz)
++ {
++ 	t->tcm_parent = TC_H_CLSACT;
++ 	t->tcm_handle = TC_H_MAKE(TC_H_CLSACT, 0);
++ 
++ 	return nlattr_add(nh, maxsz, TCA_KIND, "clsact", sizeof("clsact"));
++ }
++ 
++ static int attach_point_to_config(struct bpf_tc_hook *hook,
++ 				  qdisc_config_t *config)
++ {
++ 	switch (OPTS_GET(hook, attach_point, 0)) {
++ 	case BPF_TC_INGRESS:
++ 	case BPF_TC_EGRESS:
++ 	case BPF_TC_INGRESS | BPF_TC_EGRESS:
++ 		if (OPTS_GET(hook, parent, 0))
++ 			return -EINVAL;
++ 		*config = &clsact_config;
++ 		return 0;
++ 	case BPF_TC_CUSTOM:
++ 		return -EOPNOTSUPP;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int tc_get_tcm_parent(enum bpf_tc_attach_point attach_point,
++ 			     __u32 *parent)
++ {
++ 	switch (attach_point) {
++ 	case BPF_TC_INGRESS:
++ 	case BPF_TC_EGRESS:
++ 		if (*parent)
++ 			return -EINVAL;
++ 		*parent = TC_H_MAKE(TC_H_CLSACT,
++ 				    attach_point == BPF_TC_INGRESS ?
++ 				    TC_H_MIN_INGRESS : TC_H_MIN_EGRESS);
++ 		break;
++ 	case BPF_TC_CUSTOM:
++ 		if (!*parent)
++ 			return -EINVAL;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
++ static int tc_qdisc_modify(struct bpf_tc_hook *hook, int cmd, int flags)
++ {
++ 	qdisc_config_t config;
++ 	int ret;
++ 	struct {
++ 		struct nlmsghdr nh;
++ 		struct tcmsg tc;
++ 		char buf[256];
++ 	} req;
++ 
++ 	ret = attach_point_to_config(hook, &config);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	memset(&req, 0, sizeof(req));
++ 	req.nh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct tcmsg));
++ 	req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | flags;
++ 	req.nh.nlmsg_type  = cmd;
++ 	req.tc.tcm_family  = AF_UNSPEC;
++ 	req.tc.tcm_ifindex = OPTS_GET(hook, ifindex, 0);
++ 
++ 	ret = config(&req.nh, &req.tc, sizeof(req));
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	return libbpf_netlink_send_recv(&req.nh, NULL, NULL, NULL);
++ }
++ 
++ static int tc_qdisc_create_excl(struct bpf_tc_hook *hook)
++ {
++ 	return tc_qdisc_modify(hook, RTM_NEWQDISC, NLM_F_CREATE);
++ }
++ 
++ static int tc_qdisc_delete(struct bpf_tc_hook *hook)
++ {
++ 	return tc_qdisc_modify(hook, RTM_DELQDISC, 0);
++ }
++ 
++ int bpf_tc_hook_create(struct bpf_tc_hook *hook)
++ {
++ 	if (!hook || !OPTS_VALID(hook, bpf_tc_hook) ||
++ 	    OPTS_GET(hook, ifindex, 0) <= 0)
++ 		return -EINVAL;
++ 
++ 	return tc_qdisc_create_excl(hook);
++ }
++ 
++ static int __bpf_tc_detach(const struct bpf_tc_hook *hook,
++ 			   const struct bpf_tc_opts *opts,
++ 			   const bool flush);
++ 
++ int bpf_tc_hook_destroy(struct bpf_tc_hook *hook)
++ {
++ 	if (!hook || !OPTS_VALID(hook, bpf_tc_hook) ||
++ 	    OPTS_GET(hook, ifindex, 0) <= 0)
++ 		return -EINVAL;
++ 
++ 	switch (OPTS_GET(hook, attach_point, 0)) {
++ 	case BPF_TC_INGRESS:
++ 	case BPF_TC_EGRESS:
++ 		return __bpf_tc_detach(hook, NULL, true);
++ 	case BPF_TC_INGRESS | BPF_TC_EGRESS:
++ 		return tc_qdisc_delete(hook);
++ 	case BPF_TC_CUSTOM:
++ 		return -EOPNOTSUPP;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ struct bpf_cb_ctx {
++ 	struct bpf_tc_opts *opts;
++ 	bool processed;
++ };
++ 
++ static int __get_tc_info(void *cookie, struct tcmsg *tc, struct nlattr **tb,
++ 			 bool unicast)
++ {
++ 	struct nlattr *tbb[TCA_BPF_MAX + 1];
++ 	struct bpf_cb_ctx *info = cookie;
++ 
++ 	if (!info || !info->opts)
++ 		return -EINVAL;
++ 	if (unicast && info->processed)
++ 		return -EINVAL;
++ 	if (!tb[TCA_OPTIONS])
++ 		return NL_CONT;
++ 
++ 	libbpf_nla_parse_nested(tbb, TCA_BPF_MAX, tb[TCA_OPTIONS], NULL);
++ 	if (!tbb[TCA_BPF_ID])
++ 		return -EINVAL;
++ 
++ 	OPTS_SET(info->opts, prog_id, libbpf_nla_getattr_u32(tbb[TCA_BPF_ID]));
++ 	OPTS_SET(info->opts, handle, tc->tcm_handle);
++ 	OPTS_SET(info->opts, priority, TC_H_MAJ(tc->tcm_info) >> 16);
++ 
++ 	info->processed = true;
++ 	return unicast ? NL_NEXT : NL_DONE;
++ }
++ 
++ static int get_tc_info(struct nlmsghdr *nh, libbpf_dump_nlmsg_t fn,
++ 		       void *cookie)
++ {
++ 	struct tcmsg *tc = NLMSG_DATA(nh);
++ 	struct nlattr *tb[TCA_MAX + 1];
++ 
++ 	libbpf_nla_parse(tb, TCA_MAX,
++ 			 (struct nlattr *)((char *)tc + NLMSG_ALIGN(sizeof(*tc))),
++ 			 NLMSG_PAYLOAD(nh, sizeof(*tc)), NULL);
++ 	if (!tb[TCA_KIND])
++ 		return NL_CONT;
++ 	return __get_tc_info(cookie, tc, tb, nh->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static int tc_add_fd_and_name(struct nlmsghdr *nh, size_t maxsz, int fd)
++ {
++ 	struct bpf_prog_info info = {};
++ 	__u32 info_len = sizeof(info);
++ 	char name[256];
++ 	int len, ret;
++ 
++ 	ret = bpf_obj_get_info_by_fd(fd, &info, &info_len);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	ret = nlattr_add(nh, maxsz, TCA_BPF_FD, &fd, sizeof(fd));
++ 	if (ret < 0)
++ 		return ret;
++ 	len = snprintf(name, sizeof(name), "%s:[%u]", info.name, info.id);
++ 	if (len < 0)
++ 		return -errno;
++ 	if (len >= sizeof(name))
++ 		return -ENAMETOOLONG;
++ 	return nlattr_add(nh, maxsz, TCA_BPF_NAME, name, len + 1);
++ }
++ 
++ int bpf_tc_attach(const struct bpf_tc_hook *hook, struct bpf_tc_opts *opts)
++ {
++ 	__u32 protocol, bpf_flags, handle, priority, parent, prog_id, flags;
++ 	int ret, ifindex, attach_point, prog_fd;
++ 	struct bpf_cb_ctx info = {};
++ 	struct nlattr *nla;
++ 	struct {
++ 		struct nlmsghdr nh;
++ 		struct tcmsg tc;
++ 		char buf[256];
++ 	} req;
++ 
++ 	if (!hook || !opts ||
++ 	    !OPTS_VALID(hook, bpf_tc_hook) ||
++ 	    !OPTS_VALID(opts, bpf_tc_opts))
++ 		return -EINVAL;
++ 
++ 	ifindex      = OPTS_GET(hook, ifindex, 0);
++ 	parent       = OPTS_GET(hook, parent, 0);
++ 	attach_point = OPTS_GET(hook, attach_point, 0);
++ 
++ 	handle       = OPTS_GET(opts, handle, 0);
++ 	priority     = OPTS_GET(opts, priority, 0);
++ 	prog_fd      = OPTS_GET(opts, prog_fd, 0);
++ 	prog_id      = OPTS_GET(opts, prog_id, 0);
++ 	flags        = OPTS_GET(opts, flags, 0);
++ 
++ 	if (ifindex <= 0 || !prog_fd || prog_id)
++ 		return -EINVAL;
++ 	if (priority > UINT16_MAX)
++ 		return -EINVAL;
++ 	if (flags & ~BPF_TC_F_REPLACE)
++ 		return -EINVAL;
++ 
++ 	flags = (flags & BPF_TC_F_REPLACE) ? NLM_F_REPLACE : NLM_F_EXCL;
++ 	protocol = ETH_P_ALL;
++ 
++ 	memset(&req, 0, sizeof(req));
++ 	req.nh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct tcmsg));
++ 	req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE |
++ 			     NLM_F_ECHO | flags;
++ 	req.nh.nlmsg_type  = RTM_NEWTFILTER;
++ 	req.tc.tcm_family  = AF_UNSPEC;
++ 	req.tc.tcm_ifindex = ifindex;
++ 	req.tc.tcm_handle  = handle;
++ 	req.tc.tcm_info    = TC_H_MAKE(priority << 16, htons(protocol));
++ 
++ 	ret = tc_get_tcm_parent(attach_point, &parent);
++ 	if (ret < 0)
++ 		return ret;
++ 	req.tc.tcm_parent = parent;
++ 
++ 	ret = nlattr_add(&req.nh, sizeof(req), TCA_KIND, "bpf", sizeof("bpf"));
++ 	if (ret < 0)
++ 		return ret;
++ 	nla = nlattr_begin_nested(&req.nh, sizeof(req), TCA_OPTIONS);
++ 	if (!nla)
++ 		return -EMSGSIZE;
++ 	ret = tc_add_fd_and_name(&req.nh, sizeof(req), prog_fd);
++ 	if (ret < 0)
++ 		return ret;
++ 	bpf_flags = TCA_BPF_FLAG_ACT_DIRECT;
++ 	ret = nlattr_add(&req.nh, sizeof(req), TCA_BPF_FLAGS, &bpf_flags,
++ 			 sizeof(bpf_flags));
++ 	if (ret < 0)
++ 		return ret;
++ 	nlattr_end_nested(&req.nh, nla);
++ 
++ 	info.opts = opts;
++ 
++ 	ret = libbpf_netlink_send_recv(&req.nh, get_tc_info, NULL, &info);
++ 	if (ret < 0)
++ 		return ret;
++ 	if (!info.processed)
++ 		return -ENOENT;
++ 	return ret;
++ }
++ 
++ static int __bpf_tc_detach(const struct bpf_tc_hook *hook,
++ 			   const struct bpf_tc_opts *opts,
++ 			   const bool flush)
++ {
++ 	__u32 protocol = 0, handle, priority, parent, prog_id, flags;
++ 	int ret, ifindex, attach_point, prog_fd;
++ 	struct {
++ 		struct nlmsghdr nh;
++ 		struct tcmsg tc;
++ 		char buf[256];
++ 	} req;
++ 
++ 	if (!hook ||
++ 	    !OPTS_VALID(hook, bpf_tc_hook) ||
++ 	    !OPTS_VALID(opts, bpf_tc_opts))
++ 		return -EINVAL;
++ 
++ 	ifindex      = OPTS_GET(hook, ifindex, 0);
++ 	parent       = OPTS_GET(hook, parent, 0);
++ 	attach_point = OPTS_GET(hook, attach_point, 0);
++ 
++ 	handle       = OPTS_GET(opts, handle, 0);
++ 	priority     = OPTS_GET(opts, priority, 0);
++ 	prog_fd      = OPTS_GET(opts, prog_fd, 0);
++ 	prog_id      = OPTS_GET(opts, prog_id, 0);
++ 	flags        = OPTS_GET(opts, flags, 0);
++ 
++ 	if (ifindex <= 0 || flags || prog_fd || prog_id)
++ 		return -EINVAL;
++ 	if (priority > UINT16_MAX)
++ 		return -EINVAL;
++ 	if (flags & ~BPF_TC_F_REPLACE)
++ 		return -EINVAL;
++ 	if (!flush) {
++ 		if (!handle || !priority)
++ 			return -EINVAL;
++ 		protocol = ETH_P_ALL;
++ 	} else {
++ 		if (handle || priority)
++ 			return -EINVAL;
++ 	}
++ 
++ 	memset(&req, 0, sizeof(req));
++ 	req.nh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct tcmsg));
++ 	req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
++ 	req.nh.nlmsg_type  = RTM_DELTFILTER;
++ 	req.tc.tcm_family  = AF_UNSPEC;
++ 	req.tc.tcm_ifindex = ifindex;
++ 	if (!flush) {
++ 		req.tc.tcm_handle = handle;
++ 		req.tc.tcm_info   = TC_H_MAKE(priority << 16, htons(protocol));
++ 	}
++ 
++ 	ret = tc_get_tcm_parent(attach_point, &parent);
++ 	if (ret < 0)
++ 		return ret;
++ 	req.tc.tcm_parent = parent;
++ 
++ 	if (!flush) {
++ 		ret = nlattr_add(&req.nh, sizeof(req), TCA_KIND,
++ 				 "bpf", sizeof("bpf"));
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	return libbpf_netlink_send_recv(&req.nh, NULL, NULL, NULL);
++ }
++ 
++ int bpf_tc_detach(const struct bpf_tc_hook *hook,
++ 		  const struct bpf_tc_opts *opts)
++ {
++ 	return !opts ? -EINVAL : __bpf_tc_detach(hook, opts, false);
++ }
++ 
++ int bpf_tc_query(const struct bpf_tc_hook *hook, struct bpf_tc_opts *opts)
++ {
++ 	__u32 protocol, handle, priority, parent, prog_id, flags;
++ 	int ret, ifindex, attach_point, prog_fd;
++ 	struct bpf_cb_ctx info = {};
++ 	struct {
++ 		struct nlmsghdr nh;
++ 		struct tcmsg tc;
++ 		char buf[256];
++ 	} req;
++ 
++ 	if (!hook || !opts ||
++ 	    !OPTS_VALID(hook, bpf_tc_hook) ||
++ 	    !OPTS_VALID(opts, bpf_tc_opts))
++ 		return -EINVAL;
++ 
++ 	ifindex      = OPTS_GET(hook, ifindex, 0);
++ 	parent       = OPTS_GET(hook, parent, 0);
++ 	attach_point = OPTS_GET(hook, attach_point, 0);
++ 
++ 	handle       = OPTS_GET(opts, handle, 0);
++ 	priority     = OPTS_GET(opts, priority, 0);
++ 	prog_fd      = OPTS_GET(opts, prog_fd, 0);
++ 	prog_id      = OPTS_GET(opts, prog_id, 0);
++ 	flags        = OPTS_GET(opts, flags, 0);
++ 
++ 	if (ifindex <= 0 || flags || prog_fd || prog_id ||
++ 	    !handle || !priority)
++ 		return -EINVAL;
++ 	if (priority > UINT16_MAX)
++ 		return -EINVAL;
++ 
++ 	protocol = ETH_P_ALL;
++ 
++ 	memset(&req, 0, sizeof(req));
++ 	req.nh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct tcmsg));
++ 	req.nh.nlmsg_flags = NLM_F_REQUEST;
++ 	req.nh.nlmsg_type  = RTM_GETTFILTER;
++ 	req.tc.tcm_family  = AF_UNSPEC;
++ 	req.tc.tcm_ifindex = ifindex;
++ 	req.tc.tcm_handle  = handle;
++ 	req.tc.tcm_info    = TC_H_MAKE(priority << 16, htons(protocol));
++ 
++ 	ret = tc_get_tcm_parent(attach_point, &parent);
++ 	if (ret < 0)
++ 		return ret;
++ 	req.tc.tcm_parent = parent;
++ 
++ 	ret = nlattr_add(&req.nh, sizeof(req), TCA_KIND, "bpf", sizeof("bpf"));
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	info.opts = opts;
++ 
++ 	ret = libbpf_netlink_send_recv(&req.nh, get_tc_info, NULL, &info);
++ 	if (ret < 0)
++ 		return ret;
++ 	if (!info.processed)
++ 		return -ENOENT;
++ 	return ret;
++ }
+++>>>>>>> 715c5ce454a6 (libbpf: Add low level TC-BPF management API)
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index 7d40fdbaf4fd..e83b36c3c7d1 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -526,6 +526,7 @@ LIBBPF_API int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
+ LIBBPF_API int bpf_prog_load(const char *file, enum bpf_prog_type type,
+ 			     struct bpf_object **pobj, int *prog_fd);
+ 
++/* XDP related API */
+ struct xdp_link_info {
+ 	__u32 prog_id;
+ 	__u32 drv_prog_id;
+@@ -552,6 +553,49 @@ LIBBPF_API int bpf_get_link_xdp_info_v0_0_4(int ifindex, struct xdp_link_info *i
+ LIBBPF_API int bpf_get_link_xdp_info_v0_0_6(int ifindex, struct xdp_link_info *info,
+ 					    size_t info_size, __u32 flags);
+ 
++/* TC related API */
++enum bpf_tc_attach_point {
++	BPF_TC_INGRESS = 1 << 0,
++	BPF_TC_EGRESS  = 1 << 1,
++	BPF_TC_CUSTOM  = 1 << 2,
++};
++
++#define BPF_TC_PARENT(a, b) 	\
++	((((a) << 16) & 0xFFFF0000U) | ((b) & 0x0000FFFFU))
++
++enum bpf_tc_flags {
++	BPF_TC_F_REPLACE = 1 << 0,
++};
++
++struct bpf_tc_hook {
++	size_t sz;
++	int ifindex;
++	enum bpf_tc_attach_point attach_point;
++	__u32 parent;
++	size_t :0;
++};
++#define bpf_tc_hook__last_field parent
++
++struct bpf_tc_opts {
++	size_t sz;
++	int prog_fd;
++	__u32 flags;
++	__u32 prog_id;
++	__u32 handle;
++	__u32 priority;
++	size_t :0;
++};
++#define bpf_tc_opts__last_field priority
++
++LIBBPF_API int bpf_tc_hook_create(struct bpf_tc_hook *hook);
++LIBBPF_API int bpf_tc_hook_destroy(struct bpf_tc_hook *hook);
++LIBBPF_API int bpf_tc_attach(const struct bpf_tc_hook *hook,
++			     struct bpf_tc_opts *opts);
++LIBBPF_API int bpf_tc_detach(const struct bpf_tc_hook *hook,
++			     const struct bpf_tc_opts *opts);
++LIBBPF_API int bpf_tc_query(const struct bpf_tc_hook *hook,
++			    struct bpf_tc_opts *opts);
++
+ /* Ring buffer APIs */
+ struct ring_buffer;
+ 
+diff --git a/tools/lib/bpf/libbpf.map b/tools/lib/bpf/libbpf.map
+index 3b635fcaa7a8..465b450291c1 100644
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -393,4 +393,9 @@ LIBBPF_0.4.0 {
+ 		bpf_linker__free;
+ 		bpf_linker__new;
+ 		bpf_object__set_kversion;
++		bpf_tc_attach;
++		bpf_tc_detach;
++		bpf_tc_hook_create;
++		bpf_tc_hook_destroy;
++		bpf_tc_query;
+ } LIBBPF_0.3.0;
+* Unmerged path tools/lib/bpf/netlink.c
