@@ -1,0 +1,144 @@
+KVM: x86/mmu: Improve TLB flush comment in kvm_mmu_slot_remove_write_access()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 6ff94f27fd47847d6ecb9302f9d3bd1ca991a17f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/6ff94f27.failed
+
+Rewrite the comment in kvm_mmu_slot_remove_write_access() that explains
+why it is safe to flush TLBs outside of the MMU lock after
+write-protecting SPTEs for dirty logging. The current comment is a long
+run-on sentence that was difficult to understand. In addition it was
+specific to the shadow MMU (mentioning mmu_spte_update()) when the TDP
+MMU has to handle this as well.
+
+The new comment explains:
+ - Why the TLB flush is necessary at all.
+ - Why it is desirable to do the TLB flush outside of the MMU lock.
+ - Why it is safe to do the TLB flush outside of the MMU lock.
+
+No functional change intended.
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20220113233020.3986005-5-dmatlack@google.com>
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 6ff94f27fd47847d6ecb9302f9d3bd1ca991a17f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index c9cd8efee6c0,593093b52395..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -5682,6 -5733,38 +5682,41 @@@ void kvm_mmu_uninit_vm(struct kvm *kvm
+  	kvm_mmu_uninit_tdp_mmu(kvm);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __kvm_zap_rmaps(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
++ {
++ 	const struct kvm_memory_slot *memslot;
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memslot_iter iter;
++ 	bool flush = false;
++ 	gfn_t start, end;
++ 	int i;
++ 
++ 	if (!kvm_memslots_have_rmaps(kvm))
++ 		return flush;
++ 
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 
++ 		kvm_for_each_memslot_in_gfn_range(&iter, slots, gfn_start, gfn_end) {
++ 			memslot = iter.slot;
++ 			start = max(gfn_start, memslot->base_gfn);
++ 			end = min(gfn_end, memslot->base_gfn + memslot->npages);
++ 			if (WARN_ON_ONCE(start >= end))
++ 				continue;
++ 
++ 			flush = slot_handle_level_range(kvm, memslot, kvm_zap_rmapp,
++ 
++ 							PG_LEVEL_4K, KVM_MAX_HUGEPAGE_LEVEL,
++ 							start, end - 1, true, flush);
++ 		}
++ 	}
++ 
++ 	return flush;
++ }
++ 
+++>>>>>>> 6ff94f27fd47 (KVM: x86/mmu: Improve TLB flush comment in kvm_mmu_slot_remove_write_access())
+  /*
+   * Invalidate (zap) SPTEs that cover GFNs from gfn_start and up to gfn_end
+   * (not including it)
+@@@ -5732,28 -5806,47 +5767,40 @@@ static bool slot_rmap_write_protect(str
+  }
+  
+  void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ -				      const struct kvm_memory_slot *memslot,
+ +				      struct kvm_memory_slot *memslot,
+  				      int start_level)
+  {
+ -	bool flush = false;
+ -
+ -	if (kvm_memslots_have_rmaps(kvm)) {
+ -		write_lock(&kvm->mmu_lock);
+ -		flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ -					  start_level, KVM_MAX_HUGEPAGE_LEVEL,
+ -					  false);
+ -		write_unlock(&kvm->mmu_lock);
+ -	}
+ +	bool flush;
+  
+ -	if (is_tdp_mmu_enabled(kvm)) {
+ -		read_lock(&kvm->mmu_lock);
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ +				start_level, KVM_MAX_HUGEPAGE_LEVEL, false);
+ +	if (is_tdp_mmu_enabled(kvm))
+  		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, start_level);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_unlock(&kvm->mmu_lock);
+  
+  	/*
+- 	 * We can flush all the TLBs out of the mmu lock without TLB
+- 	 * corruption since we just change the spte from writable to
+- 	 * readonly so that we only need to care the case of changing
+- 	 * spte from present to present (changing the spte from present
+- 	 * to nonpresent will flush all the TLBs immediately), in other
+- 	 * words, the only case we care is mmu_spte_update() where we
+- 	 * have checked Host-writable | MMU-writable instead of
+- 	 * PT_WRITABLE_MASK, that means it does not depend on PT_WRITABLE_MASK
+- 	 * anymore.
++ 	 * Flush TLBs if any SPTEs had to be write-protected to ensure that
++ 	 * guest writes are reflected in the dirty bitmap before the memslot
++ 	 * update completes, i.e. before enabling dirty logging is visible to
++ 	 * userspace.
++ 	 *
++ 	 * Perform the TLB flush outside the mmu_lock to reduce the amount of
++ 	 * time the lock is held. However, this does mean that another CPU can
++ 	 * now grab mmu_lock and encounter a write-protected SPTE while CPUs
++ 	 * still have a writable mapping for the associated GFN in their TLB.
++ 	 *
++ 	 * This is safe but requires KVM to be careful when making decisions
++ 	 * based on the write-protection status of an SPTE. Specifically, KVM
++ 	 * also write-protects SPTEs to monitor changes to guest page tables
++ 	 * during shadow paging, and must guarantee no CPUs can write to those
++ 	 * page before the lock is dropped. As mentioned in the previous
++ 	 * paragraph, a write-protected SPTE is no guarantee that CPU cannot
++ 	 * perform writes. So to determine if a TLB flush is truly required, KVM
++ 	 * will clear a separate software-only bit (MMU-writable) and skip the
++ 	 * flush if-and-only-if this bit was already clear.
++ 	 *
++ 	 * See DEFAULT_SPTE_MMU_WRITEABLE for more details.
+  	 */
+  	if (flush)
+  		kvm_arch_flush_remote_tlbs_memslot(kvm, memslot);
+* Unmerged path arch/x86/kvm/mmu/mmu.c
