@@ -1,0 +1,132 @@
+drivers/base/node: rename link_mem_sections() to register_memory_block_under_node()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit cc6515591b25f08ce199e9379844a964f52a27f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/cc651559.failed
+
+Patch series "drivers/base/memory: determine and store zone for single-zone memory blocks", v2.
+
+I remember talking to Michal in the past about removing
+test_pages_in_a_zone(), which we use for:
+* verifying that a memory block we intend to offline is really only managed
+  by a single zone. We don't support offlining of memory blocks that are
+  managed by multiple zones (e.g., multiple nodes, DMA and DMA32)
+* exposing that zone to user space via
+  /sys/devices/system/memory/memory*/valid_zones
+
+Now that I identified some more cases where test_pages_in_a_zone() might
+go wrong, and we received an UBSAN report (see patch #3), let's get rid of
+this PFN walker.
+
+So instead of detecting the zone at runtime with test_pages_in_a_zone() by
+scanning the memmap, let's determine and remember for each memory block if
+it's managed by a single zone.  The stored zone can then be used for the
+above two cases, avoiding a manual lookup using test_pages_in_a_zone().
+
+This avoids eventually stumbling over uninitialized memmaps in corner
+cases, especially when ZONE_DEVICE ranges partly fall into memory block
+(that are responsible for managing System RAM).
+
+Handling memory onlining is easy, because we online to exactly one zone.
+Handling boot memory is more tricky, because we want to avoid scanning all
+zones of all nodes to detect possible zones that overlap with the physical
+memory region of interest.  Fortunately, we already have code that
+determines the applicable nodes for a memory block, to create sysfs links
+-- we'll hook into that.
+
+Patch #1 is a simple cleanup I had laying around for a longer time.
+Patch #2 contains the main logic to remove test_pages_in_a_zone() and
+further details.
+
+[1] https://lkml.kernel.org/r/20220128144540.153902-1-david@redhat.com
+[2] https://lkml.kernel.org/r/20220203105212.30385-1-david@redhat.com
+
+This patch (of 2):
+
+Let's adjust the stale terminology, making it match
+unregister_memory_block_under_nodes() and
+do_register_memory_block_under_node().  We're dealing with memory block
+devices, which span 1..X memory sections.
+
+Link: https://lkml.kernel.org/r/20220210184359.235565-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20220210184359.235565-2-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Acked-by: Oscar Salvador <osalvador@suse.de>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: "Rafael J. Wysocki" <rafael@kernel.org>
+	Cc: Rafael Parra <rparrazo@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cc6515591b25f08ce199e9379844a964f52a27f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/node.h
+diff --cc include/linux/node.h
+index 8e5a29897936,40d641a8bfb0..000000000000
+--- a/include/linux/node.h
++++ b/include/linux/node.h
+@@@ -98,14 -98,14 +98,21 @@@ struct memory_block
+  extern struct node *node_devices[];
+  typedef  void (*node_registration_func_t)(struct node *);
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_MEMORY_HOTPLUG_SPARSE) && defined(CONFIG_NUMA)
+ +void link_mem_sections(int nid, unsigned long start_pfn,
+ +		       unsigned long end_pfn,
+ +		       enum meminit_context context);
+++=======
++ #if defined(CONFIG_MEMORY_HOTPLUG) && defined(CONFIG_NUMA)
++ void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
++ 				       unsigned long end_pfn,
++ 				       enum meminit_context context);
+++>>>>>>> cc6515591b25 (drivers/base/node: rename link_mem_sections() to register_memory_block_under_node())
+  #else
+- static inline void link_mem_sections(int nid, unsigned long start_pfn,
+- 				     unsigned long end_pfn,
+- 				     enum meminit_context context)
++ static inline void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
++ 						     unsigned long end_pfn,
++ 						     enum meminit_context context)
+  {
+  }
+  #endif
+diff --git a/drivers/base/node.c b/drivers/base/node.c
+index c69b28522c92..d369e4fea88c 100644
+--- a/drivers/base/node.c
++++ b/drivers/base/node.c
+@@ -893,8 +893,9 @@ void unregister_memory_block_under_nodes(struct memory_block *mem_blk)
+ 			  kobject_name(&node_devices[mem_blk->nid]->dev.kobj));
+ }
+ 
+-void link_mem_sections(int nid, unsigned long start_pfn, unsigned long end_pfn,
+-		       enum meminit_context context)
++void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
++				       unsigned long end_pfn,
++				       enum meminit_context context)
+ {
+ 	walk_memory_blocks_func_t func;
+ 
+* Unmerged path include/linux/node.h
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 73cbc6ea1fee..92afc2a6bb64 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1108,9 +1108,9 @@ int __ref add_memory_resource(int nid, struct resource *res)
+ 		BUG_ON(ret);
+ 	}
+ 
+-	/* link memory sections under this node.*/
+-	link_mem_sections(nid, PFN_DOWN(start), PFN_UP(start + size - 1),
+-			  MEMINIT_HOTPLUG);
++	register_memory_blocks_under_node(nid, PFN_DOWN(start),
++					  PFN_UP(start + size - 1),
++					  MEMINIT_HOTPLUG);
+ 
+ 	/* create new memmap entry */
+ 	if (!strcmp(res->name, "System RAM"))
