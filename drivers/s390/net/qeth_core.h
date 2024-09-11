@@ -708,7 +708,6 @@ struct qeth_card_options {
 	struct qeth_ipa_caps adp; /* Adapter parameters */
 	struct qeth_sbp_info sbp; /* SETBRIDGEPORT options */
 	struct qeth_vnicc_info vnicc; /* VNICC options */
-	int fake_broadcast;
 	enum qeth_discipline_id layer;
 	int rx_sg_cb;
 	enum qeth_ipa_isolation_modes isolation;
