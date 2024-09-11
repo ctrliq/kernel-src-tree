@@ -715,8 +715,6 @@ static bool check_fully_established(struct mptcp_sock *msk, struct sock *sk,
 		goto fully_established;
 	}
 
-	WARN_ON_ONCE(subflow->can_ack);
-
 	/* If the first established packet does not contain MP_CAPABLE + data
 	 * then fallback to TCP
 	 */
@@ -726,6 +724,8 @@ static bool check_fully_established(struct mptcp_sock *msk, struct sock *sk,
 		return false;
 	}
 
+	if (unlikely(!READ_ONCE(msk->pm.server_side)))
+		pr_warn_once("bogus mpc option on established client sk");
 	subflow->fully_established = 1;
 	subflow->remote_key = mp_opt->sndr_key;
 	subflow->can_ack = 1;
