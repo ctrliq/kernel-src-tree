@@ -3005,6 +3005,7 @@ static void __rbd_lock(struct rbd_device *rbd_dev, const char *cookie)
 {
 	struct rbd_client_id cid = rbd_get_cid(rbd_dev);
 
+	rbd_dev->lock_state = RBD_LOCK_STATE_LOCKED;
 	strcpy(rbd_dev->lock_cookie, cookie);
 	rbd_set_owner_cid(rbd_dev, &cid);
 	queue_work(rbd_dev->task_wq, &rbd_dev->acquired_lock_work);
@@ -3029,7 +3030,6 @@ static int rbd_lock(struct rbd_device *rbd_dev)
 	if (ret)
 		return ret;
 
-	rbd_dev->lock_state = RBD_LOCK_STATE_LOCKED;
 	__rbd_lock(rbd_dev, cookie);
 	return 0;
 }
@@ -3412,13 +3412,11 @@ again:
 	}
 }
 
-/*
- * lock_rwsem must be held for write
- */
-static bool rbd_release_lock(struct rbd_device *rbd_dev)
+static bool rbd_quiesce_lock(struct rbd_device *rbd_dev)
 {
-	dout("%s rbd_dev %p read lock_state %d\n", __func__, rbd_dev,
-	     rbd_dev->lock_state);
+	dout("%s rbd_dev %p\n", __func__, rbd_dev);
+	lockdep_assert_held_exclusive(&rbd_dev->lock_rwsem);
+
 	if (rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED)
 		return false;
 
@@ -3434,12 +3432,22 @@ static bool rbd_release_lock(struct rbd_device *rbd_dev)
 	up_read(&rbd_dev->lock_rwsem);
 
 	down_write(&rbd_dev->lock_rwsem);
-	dout("%s rbd_dev %p write lock_state %d\n", __func__, rbd_dev,
-	     rbd_dev->lock_state);
 	if (rbd_dev->lock_state != RBD_LOCK_STATE_RELEASING)
 		return false;
 
+	return true;
+}
+
+/*
+ * lock_rwsem must be held for write
+ */
+static void rbd_release_lock(struct rbd_device *rbd_dev)
+{
+	if (!rbd_quiesce_lock(rbd_dev))
+		return;
+
 	rbd_unlock(rbd_dev);
+
 	/*
 	 * Give others a chance to grab the lock - we would re-acquire
 	 * almost immediately if we got new IO during ceph_osdc_sync()
@@ -3448,7 +3456,6 @@ static bool rbd_release_lock(struct rbd_device *rbd_dev)
 	 * after wake_requests() in rbd_handle_released_lock().
 	 */
 	cancel_delayed_work(&rbd_dev->lock_dwork);
-	return true;
 }
 
 static void rbd_release_lock_work(struct work_struct *work)
@@ -3796,7 +3803,8 @@ static void rbd_reacquire_lock(struct rbd_device *rbd_dev)
 	char cookie[32];
 	int ret;
 
-	WARN_ON(rbd_dev->lock_state != RBD_LOCK_STATE_LOCKED);
+	if (!rbd_quiesce_lock(rbd_dev))
+		return;
 
 	format_lock_cookie(rbd_dev, cookie);
 	ret = ceph_cls_set_cookie(osdc, &rbd_dev->header_oid,
@@ -3812,9 +3820,8 @@ static void rbd_reacquire_lock(struct rbd_device *rbd_dev)
 		 * Lock cookie cannot be updated on older OSDs, so do
 		 * a manual release and queue an acquire.
 		 */
-		if (rbd_release_lock(rbd_dev))
-			queue_delayed_work(rbd_dev->task_wq,
-					   &rbd_dev->lock_dwork, 0);
+		rbd_unlock(rbd_dev);
+		queue_delayed_work(rbd_dev->task_wq, &rbd_dev->lock_dwork, 0);
 	} else {
 		__rbd_lock(rbd_dev, cookie);
 	}
