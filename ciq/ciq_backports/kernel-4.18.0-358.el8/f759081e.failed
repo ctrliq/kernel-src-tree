@@ -1,0 +1,423 @@
+rcu/nocb: Code-style nits in callback-offloading toggling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Paul E. McKenney <paulmck@kernel.org>
+commit f759081e8f5ac640df1c7125540759bbcb4eb0e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f759081e.failed
+
+This commit addresses a few code-style nits in callback-offloading
+toggling, including one that predates this toggling.
+
+	Cc: Frederic Weisbecker <frederic@kernel.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit f759081e8f5ac640df1c7125540759bbcb4eb0e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/rcu_segcblist.h
+#	kernel/rcu/tree_plugin.h
+#	kernel/time/timer.c
+diff --cc kernel/rcu/rcu_segcblist.h
+index 5d8792588a10,9a19328ff251..000000000000
+--- a/kernel/rcu/rcu_segcblist.h
++++ b/kernel/rcu/rcu_segcblist.h
+@@@ -69,13 -77,17 +69,21 @@@ static inline long rcu_segcblist_n_cbs(
+   */
+  static inline bool rcu_segcblist_is_enabled(struct rcu_segcblist *rsclp)
+  {
+ -	return rcu_segcblist_test_flags(rsclp, SEGCBLIST_ENABLED);
+ +	return rsclp->enabled;
+  }
+  
+- /* Is the specified rcu_segcblist offloaded?  */
++ /* Is the specified rcu_segcblist offloaded, or is SEGCBLIST_SOFTIRQ_ONLY set? */
+  static inline bool rcu_segcblist_is_offloaded(struct rcu_segcblist *rsclp)
+  {
+++<<<<<<< HEAD
+ +	return IS_ENABLED(CONFIG_RCU_NOCB_CPU) && rsclp->offloaded;
+++=======
++ 	if (IS_ENABLED(CONFIG_RCU_NOCB_CPU) &&
++ 	    !rcu_segcblist_test_flags(rsclp, SEGCBLIST_SOFTIRQ_ONLY))
++ 		return true;
++ 
++ 	return false;
+++>>>>>>> f759081e8f5a (rcu/nocb: Code-style nits in callback-offloading toggling)
+  }
+  
+  static inline bool rcu_segcblist_completely_offloaded(struct rcu_segcblist *rsclp)
+diff --cc kernel/rcu/tree_plugin.h
+index acd610dbf4d9,6f56f9e51e67..000000000000
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@@ -1929,6 -1931,52 +1929,55 @@@ static void do_nocb_bypass_wakeup_timer
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Check if we ignore this rdp.
++  *
++  * We check that without holding the nocb lock but
++  * we make sure not to miss a freshly offloaded rdp
++  * with the current ordering:
++  *
++  *  rdp_offload_toggle()        nocb_gp_enabled_cb()
++  * -------------------------   ----------------------------
++  *    WRITE flags                 LOCK nocb_gp_lock
++  *    LOCK nocb_gp_lock           READ/WRITE nocb_gp_sleep
++  *    READ/WRITE nocb_gp_sleep    UNLOCK nocb_gp_lock
++  *    UNLOCK nocb_gp_lock         READ flags
++  */
++ static inline bool nocb_gp_enabled_cb(struct rcu_data *rdp)
++ {
++ 	u8 flags = SEGCBLIST_OFFLOADED | SEGCBLIST_KTHREAD_GP;
++ 
++ 	return rcu_segcblist_test_flags(&rdp->cblist, flags);
++ }
++ 
++ static inline bool nocb_gp_update_state(struct rcu_data *rdp, bool *needwake_state)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 
++ 	if (rcu_segcblist_test_flags(cblist, SEGCBLIST_OFFLOADED)) {
++ 		if (!rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_GP)) {
++ 			rcu_segcblist_set_flags(cblist, SEGCBLIST_KTHREAD_GP);
++ 			if (rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB))
++ 				*needwake_state = true;
++ 		}
++ 		return true;
++ 	}
++ 
++ 	/*
++ 	 * De-offloading. Clear our flag and notify the de-offload worker.
++ 	 * We will ignore this rdp until it ever gets re-offloaded.
++ 	 */
++ 	WARN_ON_ONCE(!rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_GP));
++ 	rcu_segcblist_clear_flags(cblist, SEGCBLIST_KTHREAD_GP);
++ 	if (!rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB))
++ 		*needwake_state = true;
++ 	return false;
++ }
++ 
++ 
++ /*
+++>>>>>>> f759081e8f5a (rcu/nocb: Code-style nits in callback-offloading toggling)
+   * No-CBs GP kthreads come here to wait for additional callbacks to show up
+   * or for grace periods to end.
+   */
+@@@ -1956,8 -2004,18 +2005,15 @@@ static void nocb_gp_wait(struct rcu_dat
+  	 */
+  	WARN_ON_ONCE(my_rdp->nocb_gp_rdp != my_rdp);
+  	for (rdp = my_rdp; rdp; rdp = rdp->nocb_next_cb_rdp) {
+++<<<<<<< HEAD
+++=======
++ 		bool needwake_state = false;
++ 
++ 		if (!nocb_gp_enabled_cb(rdp))
++ 			continue;
+++>>>>>>> f759081e8f5a (rcu/nocb: Code-style nits in callback-offloading toggling)
+  		trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("Check"));
+  		rcu_nocb_lock_irqsave(rdp, flags);
+ -		if (!nocb_gp_update_state(rdp, &needwake_state)) {
+ -			rcu_nocb_unlock_irqrestore(rdp, flags);
+ -			if (needwake_state)
+ -				swake_up_one(&rdp->nocb_state_wq);
+ -			continue;
+ -		}
+  		bypass_ncbs = rcu_cblist_n_cbs(&rdp->nocb_bypass);
+  		if (bypass_ncbs &&
+  		    (time_after(j, READ_ONCE(rdp->nocb_bypass_first) + 1) ||
+@@@ -2087,8 -2160,10 +2143,15 @@@ static int rcu_nocb_gp_kthread(void *ar
+   */
+  static void nocb_cb_wait(struct rcu_data *rdp)
+  {
+++<<<<<<< HEAD
+ +	unsigned long cur_gp_seq;
+ +	unsigned long flags;
+++=======
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	unsigned long cur_gp_seq;
++ 	unsigned long flags;
++ 	bool needwake_state = false;
+++>>>>>>> f759081e8f5a (rcu/nocb: Code-style nits in callback-offloading toggling)
+  	bool needwake_gp = false;
+  	struct rcu_node *rnp = rdp->mynode;
+  
+@@@ -2118,14 -2210,20 +2181,31 @@@
+  	rcu_nocb_unlock_irqrestore(rdp, flags);
+  	if (needwake_gp)
+  		rcu_gp_kthread_wake();
+++<<<<<<< HEAD
+ +	swait_event_interruptible_exclusive(rdp->nocb_cb_wq,
+ +				 !READ_ONCE(rdp->nocb_cb_sleep));
+ +	if (!smp_load_acquire(&rdp->nocb_cb_sleep)) { /* VVV */
+ +		/* ^^^ Ensure CB invocation follows _sleep test. */
+ +		return;
+ +	}
+ +	WARN_ON(signal_pending(current));
+ +	trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("WokeEmpty"));
+++=======
++ 
++ 	if (needwake_state)
++ 		swake_up_one(&rdp->nocb_state_wq);
++ 
++ 	do {
++ 		swait_event_interruptible_exclusive(rdp->nocb_cb_wq,
++ 						    nocb_cb_wait_cond(rdp));
++ 
++ 		// VVV Ensure CB invocation follows _sleep test.
++ 		if (smp_load_acquire(&rdp->nocb_cb_sleep)) { // ^^^
++ 			WARN_ON(signal_pending(current));
++ 			trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("WokeEmpty"));
++ 		}
++ 	} while (!nocb_cb_can_run(rdp));
+++>>>>>>> f759081e8f5a (rcu/nocb: Code-style nits in callback-offloading toggling)
+  }
+  
+  /*
+@@@ -2187,6 -2285,195 +2267,198 @@@ static void do_nocb_deferred_wakeup(str
+  		do_nocb_deferred_wakeup_common(rdp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int rdp_offload_toggle(struct rcu_data *rdp,
++ 			       bool offload, unsigned long flags)
++ 	__releases(rdp->nocb_lock)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	struct rcu_data *rdp_gp = rdp->nocb_gp_rdp;
++ 	bool wake_gp = false;
++ 
++ 	rcu_segcblist_offload(cblist, offload);
++ 
++ 	if (rdp->nocb_cb_sleep)
++ 		rdp->nocb_cb_sleep = false;
++ 	rcu_nocb_unlock_irqrestore(rdp, flags);
++ 
++ 	/*
++ 	 * Ignore former value of nocb_cb_sleep and force wake up as it could
++ 	 * have been spuriously set to false already.
++ 	 */
++ 	swake_up_one(&rdp->nocb_cb_wq);
++ 
++ 	raw_spin_lock_irqsave(&rdp_gp->nocb_gp_lock, flags);
++ 	if (rdp_gp->nocb_gp_sleep) {
++ 		rdp_gp->nocb_gp_sleep = false;
++ 		wake_gp = true;
++ 	}
++ 	raw_spin_unlock_irqrestore(&rdp_gp->nocb_gp_lock, flags);
++ 
++ 	if (wake_gp)
++ 		wake_up_process(rdp_gp->nocb_gp_kthread);
++ 
++ 	return 0;
++ }
++ 
++ static int __rcu_nocb_rdp_deoffload(struct rcu_data *rdp)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	pr_info("De-offloading %d\n", rdp->cpu);
++ 
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	/*
++ 	 * If there are still pending work offloaded, the offline
++ 	 * CPU won't help much handling them.
++ 	 */
++ 	if (cpu_is_offline(rdp->cpu) && !rcu_segcblist_empty(&rdp->cblist)) {
++ 		rcu_nocb_unlock_irqrestore(rdp, flags);
++ 		return -EBUSY;
++ 	}
++ 
++ 	ret = rdp_offload_toggle(rdp, false, flags);
++ 	swait_event_exclusive(rdp->nocb_state_wq,
++ 			      !rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB |
++ 							SEGCBLIST_KTHREAD_GP));
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	/* Make sure nocb timer won't stay around */
++ 	WRITE_ONCE(rdp->nocb_defer_wakeup, RCU_NOCB_WAKE_OFF);
++ 	rcu_nocb_unlock_irqrestore(rdp, flags);
++ 	del_timer_sync(&rdp->nocb_timer);
++ 
++ 	/*
++ 	 * Flush bypass. While IRQs are disabled and once we set
++ 	 * SEGCBLIST_SOFTIRQ_ONLY, no callback is supposed to be
++ 	 * enqueued on bypass.
++ 	 */
++ 	rcu_nocb_lock_irqsave(rdp, flags);
++ 	rcu_nocb_flush_bypass(rdp, NULL, jiffies);
++ 	rcu_segcblist_set_flags(cblist, SEGCBLIST_SOFTIRQ_ONLY);
++ 	/*
++ 	 * With SEGCBLIST_SOFTIRQ_ONLY, we can't use
++ 	 * rcu_nocb_unlock_irqrestore() anymore. Theoretically we
++ 	 * could set SEGCBLIST_SOFTIRQ_ONLY with cb unlocked and IRQs
++ 	 * disabled now, but let's be paranoid.
++ 	 */
++ 	raw_spin_unlock_irqrestore(&rdp->nocb_lock, flags);
++ 
++ 	return ret;
++ }
++ 
++ static long rcu_nocb_rdp_deoffload(void *arg)
++ {
++ 	struct rcu_data *rdp = arg;
++ 
++ 	WARN_ON_ONCE(rdp->cpu != raw_smp_processor_id());
++ 	return __rcu_nocb_rdp_deoffload(rdp);
++ }
++ 
++ int rcu_nocb_cpu_deoffload(int cpu)
++ {
++ 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
++ 	int ret = 0;
++ 
++ 	if (rdp == rdp->nocb_gp_rdp) {
++ 		pr_info("Can't deoffload an rdp GP leader (yet)\n");
++ 		return -EINVAL;
++ 	}
++ 	mutex_lock(&rcu_state.barrier_mutex);
++ 	cpus_read_lock();
++ 	if (rcu_segcblist_is_offloaded(&rdp->cblist)) {
++ 		if (cpu_online(cpu))
++ 			ret = work_on_cpu(cpu, rcu_nocb_rdp_deoffload, rdp);
++ 		else
++ 			ret = __rcu_nocb_rdp_deoffload(rdp);
++ 		if (!ret)
++ 			cpumask_clear_cpu(cpu, rcu_nocb_mask);
++ 	}
++ 	cpus_read_unlock();
++ 	mutex_unlock(&rcu_state.barrier_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(rcu_nocb_cpu_deoffload);
++ 
++ static int __rcu_nocb_rdp_offload(struct rcu_data *rdp)
++ {
++ 	struct rcu_segcblist *cblist = &rdp->cblist;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	/*
++ 	 * For now we only support re-offload, ie: the rdp must have been
++ 	 * offloaded on boot first.
++ 	 */
++ 	if (!rdp->nocb_gp_rdp)
++ 		return -EINVAL;
++ 
++ 	pr_info("Offloading %d\n", rdp->cpu);
++ 	/*
++ 	 * Can't use rcu_nocb_lock_irqsave() while we are in
++ 	 * SEGCBLIST_SOFTIRQ_ONLY mode.
++ 	 */
++ 	raw_spin_lock_irqsave(&rdp->nocb_lock, flags);
++ 	/* Re-enable nocb timer */
++ 	WRITE_ONCE(rdp->nocb_defer_wakeup, RCU_NOCB_WAKE_NOT);
++ 	/*
++ 	 * We didn't take the nocb lock while working on the
++ 	 * rdp->cblist in SEGCBLIST_SOFTIRQ_ONLY mode.
++ 	 * Every modifications that have been done previously on
++ 	 * rdp->cblist must be visible remotely by the nocb kthreads
++ 	 * upon wake up after reading the cblist flags.
++ 	 *
++ 	 * The layout against nocb_lock enforces that ordering:
++ 	 *
++ 	 *  __rcu_nocb_rdp_offload()   nocb_cb_wait()/nocb_gp_wait()
++ 	 * -------------------------   ----------------------------
++ 	 *      WRITE callbacks           rcu_nocb_lock()
++ 	 *      rcu_nocb_lock()           READ flags
++ 	 *      WRITE flags               READ callbacks
++ 	 *      rcu_nocb_unlock()         rcu_nocb_unlock()
++ 	 */
++ 	ret = rdp_offload_toggle(rdp, true, flags);
++ 	swait_event_exclusive(rdp->nocb_state_wq,
++ 			      rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_CB) &&
++ 			      rcu_segcblist_test_flags(cblist, SEGCBLIST_KTHREAD_GP));
++ 
++ 	return ret;
++ }
++ 
++ static long rcu_nocb_rdp_offload(void *arg)
++ {
++ 	struct rcu_data *rdp = arg;
++ 
++ 	WARN_ON_ONCE(rdp->cpu != raw_smp_processor_id());
++ 	return __rcu_nocb_rdp_offload(rdp);
++ }
++ 
++ int rcu_nocb_cpu_offload(int cpu)
++ {
++ 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
++ 	int ret = 0;
++ 
++ 	mutex_lock(&rcu_state.barrier_mutex);
++ 	cpus_read_lock();
++ 	if (!rcu_segcblist_is_offloaded(&rdp->cblist)) {
++ 		if (cpu_online(cpu))
++ 			ret = work_on_cpu(cpu, rcu_nocb_rdp_offload, rdp);
++ 		else
++ 			ret = __rcu_nocb_rdp_offload(rdp);
++ 		if (!ret)
++ 			cpumask_set_cpu(cpu, rcu_nocb_mask);
++ 	}
++ 	cpus_read_unlock();
++ 	mutex_unlock(&rcu_state.barrier_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(rcu_nocb_cpu_offload);
++ 
+++>>>>>>> f759081e8f5a (rcu/nocb: Code-style nits in callback-offloading toggling)
+  void __init rcu_init_nohz(void)
+  {
+  	int cpu;
+diff --cc kernel/time/timer.c
+index 57d7778a2640,f475f1a027c8..000000000000
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@@ -1238,6 -1237,20 +1238,23 @@@ int try_to_del_timer_sync(struct timer_
+  }
+  EXPORT_SYMBOL(try_to_del_timer_sync);
+  
+++<<<<<<< HEAD
+++=======
++ bool timer_curr_running(struct timer_list *timer)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < NR_BASES; i++) {
++ 		struct timer_base *base = this_cpu_ptr(&timer_bases[i]);
++ 
++ 		if (base->running_timer == timer)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> f759081e8f5a (rcu/nocb: Code-style nits in callback-offloading toggling)
+  #ifdef CONFIG_PREEMPT_RT
+  static __init void timer_base_init_expiry_lock(struct timer_base *base)
+  {
+* Unmerged path kernel/rcu/rcu_segcblist.h
+diff --git a/kernel/rcu/rcutorture.c b/kernel/rcu/rcutorture.c
+index c010bbdbc87b..c927c084168b 100644
+--- a/kernel/rcu/rcutorture.c
++++ b/kernel/rcu/rcutorture.c
+@@ -1611,7 +1611,7 @@ rcu_torture_stats_print(void)
+ 		data_race(n_barrier_successes),
+ 		data_race(n_barrier_attempts),
+ 		data_race(n_rcu_torture_barrier_error));
+-	pr_cont("read-exits: %ld ", data_race(n_read_exits));
++	pr_cont("read-exits: %ld ", data_race(n_read_exits)); // Statistic.
+ 	pr_cont("nocb-toggles: %ld:%ld\n",
+ 		atomic_long_read(&n_nocb_offload), atomic_long_read(&n_nocb_deoffload));
+ 
+* Unmerged path kernel/rcu/tree_plugin.h
+* Unmerged path kernel/time/timer.c
