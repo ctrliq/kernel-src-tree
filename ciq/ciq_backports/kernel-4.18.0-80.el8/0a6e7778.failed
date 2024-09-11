@@ -1,0 +1,389 @@
+net/sched: allow flower to match tunnel options
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: allow flower to match tunnel options (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 95.56%
+commit-author Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+commit 0a6e77784f490912d81b92cfd48424541c04691e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0a6e7778.failed
+
+Allow matching on options in Geneve tunnel headers.
+This makes use of existing tunnel metadata support.
+
+The options can be described in the form
+CLASS:TYPE:DATA/CLASS_MASK:TYPE_MASK:DATA_MASK, where CLASS is
+represented as a 16bit hexadecimal value, TYPE as an 8bit
+hexadecimal value and DATA as a variable length hexadecimal value.
+
+e.g.
+ # ip link add name geneve0 type geneve dstport 0 external
+ # tc qdisc add dev geneve0 ingress
+ # tc filter add dev geneve0 protocol ip parent ffff: \
+     flower \
+       enc_src_ip 10.0.99.192 \
+       enc_dst_ip 10.0.99.193 \
+       enc_key_id 11 \
+       geneve_opts 0102:80:1122334421314151/ffff:ff:ffffffffffffffff \
+       ip_proto udp \
+       action mirred egress redirect dev eth1
+
+This patch adds support for matching Geneve options in the order
+supplied by the user. This leads to an efficient implementation in
+the software datapath (and in our opinion hardware datapaths that
+offload this feature). It is also compatible with Geneve options
+matching provided by the Open vSwitch kernel datapath which is
+relevant here as the Flower classifier may be used as a mechanism
+to program flows into hardware as a form of Open vSwitch datapath
+offload (sometimes referred to as OVS-TC). The netlink
+Kernel/Userspace API may be extended, for example by adding a flag,
+if other matching options are desired, for example matching given
+options in any order. This would require an implementation in the
+TC software datapath. And be done in a way that drivers that
+facilitate offload of the Flower classifier can reject or accept
+such flows based on hardware datapath capabilities.
+
+This approach was discussed and agreed on at Netconf 2017 in Seoul.
+
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0a6e77784f490912d81b92cfd48424541c04691e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/pkt_cls.h
+#	net/sched/cls_flower.c
+diff --cc include/uapi/linux/pkt_cls.h
+index c8a24861d4c8,be382fb0592d..000000000000
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@@ -475,6 -475,14 +475,17 @@@ enum 
+  	TCA_FLOWER_KEY_CVLAN_PRIO,	/* u8   */
+  	TCA_FLOWER_KEY_CVLAN_ETH_TYPE,	/* be16 */
+  
+++<<<<<<< HEAD
+++=======
++ 	TCA_FLOWER_KEY_ENC_IP_TOS,	/* u8 */
++ 	TCA_FLOWER_KEY_ENC_IP_TOS_MASK,	/* u8 */
++ 	TCA_FLOWER_KEY_ENC_IP_TTL,	/* u8 */
++ 	TCA_FLOWER_KEY_ENC_IP_TTL_MASK,	/* u8 */
++ 
++ 	TCA_FLOWER_KEY_ENC_OPTS,
++ 	TCA_FLOWER_KEY_ENC_OPTS_MASK,
++ 
+++>>>>>>> 0a6e77784f49 (net/sched: allow flower to match tunnel options)
+  	__TCA_FLOWER_MAX,
+  };
+  
+diff --cc net/sched/cls_flower.c
+index 3dac61f8b53a,9da244235170..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -52,6 -53,8 +53,11 @@@ struct fl_flow_key 
+  	struct flow_dissector_key_mpls mpls;
+  	struct flow_dissector_key_tcp tcp;
+  	struct flow_dissector_key_ip ip;
+++<<<<<<< HEAD
+++=======
++ 	struct flow_dissector_key_ip enc_ip;
++ 	struct flow_dissector_key_enc_opts enc_opts;
+++>>>>>>> 0a6e77784f49 (net/sched: allow flower to match tunnel options)
+  } __aligned(BITS_PER_LONG / 8); /* Ensure that we can do comparisons as longs. */
+  
+  struct fl_flow_mask_range {
+@@@ -477,6 -480,25 +483,28 @@@ static const struct nla_policy fl_polic
+  	[TCA_FLOWER_KEY_CVLAN_ID]	= { .type = NLA_U16 },
+  	[TCA_FLOWER_KEY_CVLAN_PRIO]	= { .type = NLA_U8 },
+  	[TCA_FLOWER_KEY_CVLAN_ETH_TYPE]	= { .type = NLA_U16 },
+++<<<<<<< HEAD
+++=======
++ 	[TCA_FLOWER_KEY_ENC_IP_TOS]	= { .type = NLA_U8 },
++ 	[TCA_FLOWER_KEY_ENC_IP_TOS_MASK] = { .type = NLA_U8 },
++ 	[TCA_FLOWER_KEY_ENC_IP_TTL]	 = { .type = NLA_U8 },
++ 	[TCA_FLOWER_KEY_ENC_IP_TTL_MASK] = { .type = NLA_U8 },
++ 	[TCA_FLOWER_KEY_ENC_OPTS]	= { .type = NLA_NESTED },
++ 	[TCA_FLOWER_KEY_ENC_OPTS_MASK]	= { .type = NLA_NESTED },
++ };
++ 
++ static const struct nla_policy
++ enc_opts_policy[TCA_FLOWER_KEY_ENC_OPTS_MAX + 1] = {
++ 	[TCA_FLOWER_KEY_ENC_OPTS_GENEVE]        = { .type = NLA_NESTED },
++ };
++ 
++ static const struct nla_policy
++ geneve_opt_policy[TCA_FLOWER_KEY_ENC_OPT_GENEVE_MAX + 1] = {
++ 	[TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS]      = { .type = NLA_U16 },
++ 	[TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE]       = { .type = NLA_U8 },
++ 	[TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA]       = { .type = NLA_BINARY,
++ 						       .len = 128 },
+++>>>>>>> 0a6e77784f49 (net/sched: allow flower to match tunnel options)
+  };
+  
+  static void fl_set_key_val(struct nlattr **tb,
+@@@ -589,15 -611,154 +617,154 @@@ static void fl_set_key_ip(struct nlatt
+  			  struct flow_dissector_key_ip *key,
+  			  struct flow_dissector_key_ip *mask)
+  {
+ -	int tos_key = encap ? TCA_FLOWER_KEY_ENC_IP_TOS : TCA_FLOWER_KEY_IP_TOS;
+ -	int ttl_key = encap ? TCA_FLOWER_KEY_ENC_IP_TTL : TCA_FLOWER_KEY_IP_TTL;
+ -	int tos_mask = encap ? TCA_FLOWER_KEY_ENC_IP_TOS_MASK : TCA_FLOWER_KEY_IP_TOS_MASK;
+ -	int ttl_mask = encap ? TCA_FLOWER_KEY_ENC_IP_TTL_MASK : TCA_FLOWER_KEY_IP_TTL_MASK;
+ +		fl_set_key_val(tb, &key->tos, TCA_FLOWER_KEY_IP_TOS,
+ +			       &mask->tos, TCA_FLOWER_KEY_IP_TOS_MASK,
+ +			       sizeof(key->tos));
+  
+ -	fl_set_key_val(tb, &key->tos, tos_key, &mask->tos, tos_mask, sizeof(key->tos));
+ -	fl_set_key_val(tb, &key->ttl, ttl_key, &mask->ttl, ttl_mask, sizeof(key->ttl));
+ +		fl_set_key_val(tb, &key->ttl, TCA_FLOWER_KEY_IP_TTL,
+ +			       &mask->ttl, TCA_FLOWER_KEY_IP_TTL_MASK,
+ +			       sizeof(key->ttl));
+  }
+  
++ static int fl_set_geneve_opt(const struct nlattr *nla, struct fl_flow_key *key,
++ 			     int depth, int option_len,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_MAX + 1];
++ 	struct nlattr *class = NULL, *type = NULL, *data = NULL;
++ 	struct geneve_opt *opt;
++ 	int err, data_len = 0;
++ 
++ 	if (option_len > sizeof(struct geneve_opt))
++ 		data_len = option_len - sizeof(struct geneve_opt);
++ 
++ 	opt = (struct geneve_opt *)&key->enc_opts.data[key->enc_opts.len];
++ 	memset(opt, 0xff, option_len);
++ 	opt->length = data_len / 4;
++ 	opt->r1 = 0;
++ 	opt->r2 = 0;
++ 	opt->r3 = 0;
++ 
++ 	/* If no mask has been prodived we assume an exact match. */
++ 	if (!depth)
++ 		return sizeof(struct geneve_opt) + data_len;
++ 
++ 	if (nla_type(nla) != TCA_FLOWER_KEY_ENC_OPTS_GENEVE) {
++ 		NL_SET_ERR_MSG(extack, "Non-geneve option type for mask");
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = nla_parse_nested(tb, TCA_FLOWER_KEY_ENC_OPT_GENEVE_MAX,
++ 			       nla, geneve_opt_policy, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	/* We are not allowed to omit any of CLASS, TYPE or DATA
++ 	 * fields from the key.
++ 	 */
++ 	if (!option_len &&
++ 	    (!tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS] ||
++ 	     !tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE] ||
++ 	     !tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA])) {
++ 		NL_SET_ERR_MSG(extack, "Missing tunnel key geneve option class, type or data");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Omitting any of CLASS, TYPE or DATA fields is allowed
++ 	 * for the mask.
++ 	 */
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA]) {
++ 		int new_len = key->enc_opts.len;
++ 
++ 		data = tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA];
++ 		data_len = nla_len(data);
++ 		if (data_len < 4) {
++ 			NL_SET_ERR_MSG(extack, "Tunnel key geneve option data is less than 4 bytes long");
++ 			return -ERANGE;
++ 		}
++ 		if (data_len % 4) {
++ 			NL_SET_ERR_MSG(extack, "Tunnel key geneve option data is not a multiple of 4 bytes long");
++ 			return -ERANGE;
++ 		}
++ 
++ 		new_len += sizeof(struct geneve_opt) + data_len;
++ 		BUILD_BUG_ON(FLOW_DIS_TUN_OPTS_MAX != IP_TUNNEL_OPTS_MAX);
++ 		if (new_len > FLOW_DIS_TUN_OPTS_MAX) {
++ 			NL_SET_ERR_MSG(extack, "Tunnel options exceeds max size");
++ 			return -ERANGE;
++ 		}
++ 		opt->length = data_len / 4;
++ 		memcpy(opt->opt_data, nla_data(data), data_len);
++ 	}
++ 
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS]) {
++ 		class = tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS];
++ 		opt->opt_class = nla_get_be16(class);
++ 	}
++ 
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE]) {
++ 		type = tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE];
++ 		opt->type = nla_get_u8(type);
++ 	}
++ 
++ 	return sizeof(struct geneve_opt) + data_len;
++ }
++ 
++ static int fl_set_enc_opt(struct nlattr **tb, struct fl_flow_key *key,
++ 			  struct fl_flow_key *mask,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	const struct nlattr *nla_enc_key, *nla_opt_key, *nla_opt_msk = NULL;
++ 	int option_len, key_depth, msk_depth = 0;
++ 
++ 	nla_enc_key = nla_data(tb[TCA_FLOWER_KEY_ENC_OPTS]);
++ 
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPTS_MASK]) {
++ 		nla_opt_msk = nla_data(tb[TCA_FLOWER_KEY_ENC_OPTS_MASK]);
++ 		msk_depth = nla_len(tb[TCA_FLOWER_KEY_ENC_OPTS_MASK]);
++ 	}
++ 
++ 	nla_for_each_attr(nla_opt_key, nla_enc_key,
++ 			  nla_len(tb[TCA_FLOWER_KEY_ENC_OPTS]), key_depth) {
++ 		switch (nla_type(nla_opt_key)) {
++ 		case TCA_FLOWER_KEY_ENC_OPTS_GENEVE:
++ 			option_len = 0;
++ 			key->enc_opts.dst_opt_type = TUNNEL_GENEVE_OPT;
++ 			option_len = fl_set_geneve_opt(nla_opt_key, key,
++ 						       key_depth, option_len,
++ 						       extack);
++ 			if (option_len < 0)
++ 				return option_len;
++ 
++ 			key->enc_opts.len += option_len;
++ 			/* At the same time we need to parse through the mask
++ 			 * in order to verify exact and mask attribute lengths.
++ 			 */
++ 			mask->enc_opts.dst_opt_type = TUNNEL_GENEVE_OPT;
++ 			option_len = fl_set_geneve_opt(nla_opt_msk, mask,
++ 						       msk_depth, option_len,
++ 						       extack);
++ 			if (option_len < 0)
++ 				return option_len;
++ 
++ 			mask->enc_opts.len += option_len;
++ 			if (key->enc_opts.len != mask->enc_opts.len) {
++ 				NL_SET_ERR_MSG(extack, "Key and mask miss aligned");
++ 				return -EINVAL;
++ 			}
++ 
++ 			if (msk_depth)
++ 				nla_opt_msk = nla_next(nla_opt_msk, &msk_depth);
++ 			break;
++ 		default:
++ 			NL_SET_ERR_MSG(extack, "Unknown tunnel option type");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+  static int fl_set_key(struct net *net, struct nlattr **tb,
+  		      struct fl_flow_key *key, struct fl_flow_key *mask,
+  		      struct netlink_ext_ack *extack)
+@@@ -792,6 -953,14 +959,17 @@@
+  		       &mask->enc_tp.dst, TCA_FLOWER_KEY_ENC_UDP_DST_PORT_MASK,
+  		       sizeof(key->enc_tp.dst));
+  
+++<<<<<<< HEAD
+++=======
++ 	fl_set_key_ip(tb, true, &key->enc_ip, &mask->enc_ip);
++ 
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPTS]) {
++ 		ret = fl_set_enc_opt(tb, key, mask, extack);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
+++>>>>>>> 0a6e77784f49 (net/sched: allow flower to match tunnel options)
+  	if (tb[TCA_FLOWER_KEY_FLAGS])
+  		ret = fl_set_key_flags(tb, &key->control.flags, &mask->control.flags);
+  
+@@@ -850,42 -1020,46 +1028,49 @@@ static void fl_init_dissector(struct fl
+  
+  	FL_KEY_SET(keys, cnt, FLOW_DISSECTOR_KEY_CONTROL, control);
+  	FL_KEY_SET(keys, cnt, FLOW_DISSECTOR_KEY_BASIC, basic);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ETH_ADDRS, eth);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_IPV4_ADDRS, ipv4);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_IPV6_ADDRS, ipv6);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_PORTS, tp);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_IP, ip);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_TCP, tcp);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ICMP, icmp);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ARP, arp);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_MPLS, mpls);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_VLAN, vlan);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_CVLAN, cvlan);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ENC_KEYID, enc_key_id);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS, enc_ipv4);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS, enc_ipv6);
+ -	if (FL_KEY_IS_MASKED(mask, enc_ipv4) ||
+ -	    FL_KEY_IS_MASKED(mask, enc_ipv6))
+ +	if (FL_KEY_IS_MASKED(&mask->key, enc_ipv4) ||
+ +	    FL_KEY_IS_MASKED(&mask->key, enc_ipv6))
+  		FL_KEY_SET(keys, cnt, FLOW_DISSECTOR_KEY_ENC_CONTROL,
+  			   enc_control);
+ -	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ENC_PORTS, enc_tp);
+++<<<<<<< HEAD
+++=======
++ 	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
++ 			     FLOW_DISSECTOR_KEY_ENC_IP, enc_ip);
++ 	FL_KEY_SET_IF_MASKED(mask, keys, cnt,
++ 			     FLOW_DISSECTOR_KEY_ENC_OPTS, enc_opts);
+++>>>>>>> 0a6e77784f49 (net/sched: allow flower to match tunnel options)
+  
+ -	skb_flow_dissector_init(dissector, keys, cnt);
+ +	skb_flow_dissector_init(&mask->dissector, keys, cnt);
+  }
+  
+  static struct fl_flow_mask *fl_create_new_mask(struct cls_fl_head *head,
+@@@ -1580,7 -1834,9 +1842,13 @@@ static int fl_dump_key(struct sk_buff *
+  			    TCA_FLOWER_KEY_ENC_UDP_DST_PORT,
+  			    &mask->enc_tp.dst,
+  			    TCA_FLOWER_KEY_ENC_UDP_DST_PORT_MASK,
+++<<<<<<< HEAD
+ +			    sizeof(key->enc_tp.dst)))
+++=======
++ 			    sizeof(key->enc_tp.dst)) ||
++ 	    fl_dump_key_ip(skb, true, &key->enc_ip, &mask->enc_ip) ||
++ 	    fl_dump_key_enc_opt(skb, &key->enc_opts, &mask->enc_opts))
+++>>>>>>> 0a6e77784f49 (net/sched: allow flower to match tunnel options)
+  		goto nla_put_failure;
+  
+  	if (fl_dump_key_flags(skb, key->control.flags, mask->control.flags))
+* Unmerged path include/uapi/linux/pkt_cls.h
+* Unmerged path net/sched/cls_flower.c
