@@ -1,0 +1,147 @@
+KVM: arm64: Remove the target table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author James Morse <james.morse@arm.com>
+commit 750ed56693803e992ed09ac9c46e07226dd4d350
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/750ed566.failed
+
+Finally, remove the target table. Merge the code that checks the
+tables into kvm_reset_sys_regs() as there is now only one table.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20200622113317.20477-6-james.morse@arm.com
+(cherry picked from commit 750ed56693803e992ed09ac9c46e07226dd4d350)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/sys_regs_generic_v8.c
+* Unmerged path arch/arm64/kvm/sys_regs_generic_v8.c
+diff --git a/arch/arm64/include/asm/kvm_coproc.h b/arch/arm64/include/asm/kvm_coproc.h
+index d93ff2968881..7fdd5a63a8ad 100644
+--- a/arch/arm64/include/asm/kvm_coproc.h
++++ b/arch/arm64/include/asm/kvm_coproc.h
+@@ -30,13 +30,6 @@ struct kvm_sys_reg_table {
+ 	size_t num;
+ };
+ 
+-struct kvm_sys_reg_target_table {
+-	struct kvm_sys_reg_table table64;
+-	struct kvm_sys_reg_table table32;
+-};
+-
+-void kvm_check_target_sys_reg_table(struct kvm_sys_reg_target_table *table);
+-
+ int kvm_handle_cp14_load_store(struct kvm_vcpu *vcpu, struct kvm_run *run);
+ int kvm_handle_cp14_32(struct kvm_vcpu *vcpu, struct kvm_run *run);
+ int kvm_handle_cp14_64(struct kvm_vcpu *vcpu, struct kvm_run *run);
+diff --git a/arch/arm64/kvm/Makefile b/arch/arm64/kvm/Makefile
+index 8d3d9513cbfe..48cda50aa225 100644
+--- a/arch/arm64/kvm/Makefile
++++ b/arch/arm64/kvm/Makefile
+@@ -14,7 +14,7 @@ kvm-y := $(KVM)/kvm_main.o $(KVM)/coalesced_mmio.o $(KVM)/eventfd.o \
+ 	 $(KVM)/vfio.o $(KVM)/irqchip.o \
+ 	 arm.o mmu.o mmio.o psci.o perf.o hypercalls.o pvtime.o \
+ 	 inject_fault.o regmap.o va_layout.o hyp.o hyp-init.o handle_exit.o \
+-	 guest.o debug.o reset.o sys_regs.o sys_regs_generic_v8.o \
++	 guest.o debug.o reset.o sys_regs.o \
+ 	 vgic-sys-reg-v3.o fpsimd.o pmu.o \
+ 	 aarch32.o arch_timer.o \
+ 	 vgic/vgic.o vgic/vgic-init.o \
+diff --git a/arch/arm64/kvm/sys_regs.c b/arch/arm64/kvm/sys_regs.c
+index e5e0994edc55..2790e8a90c7b 100644
+--- a/arch/arm64/kvm/sys_regs.c
++++ b/arch/arm64/kvm/sys_regs.c
+@@ -2148,28 +2148,6 @@ static int check_sysreg_table(const struct sys_reg_desc *table, unsigned int n,
+ 	return 0;
+ }
+ 
+-void kvm_check_target_sys_reg_table(struct kvm_sys_reg_target_table *table)
+-{
+-	BUG_ON(check_sysreg_table(table->table64.table, table->table64.num, false));
+-	BUG_ON(check_sysreg_table(table->table32.table, table->table32.num, true));
+-}
+-
+-/* Get specific register table for this target. */
+-static const struct sys_reg_desc *get_target_table(unsigned target,
+-						   bool mode_is_64,
+-						   size_t *num)
+-{
+-	struct kvm_sys_reg_target_table *table = &genericv8_target_table;
+-
+-	if (mode_is_64) {
+-		*num = table->table64.num;
+-		return table->table64.table;
+-	} else {
+-		*num = table->table32.num;
+-		return table->table32.table;
+-	}
+-}
+-
+ static int match_sys_reg(const void *key, const void *elt)
+ {
+ 	const unsigned long pval = (unsigned long)key;
+@@ -2404,14 +2382,20 @@ static int emulate_sys_reg(struct kvm_vcpu *vcpu,
+ 	return 1;
+ }
+ 
+-static void reset_sys_reg_descs(struct kvm_vcpu *vcpu,
+-				const struct sys_reg_desc *table, size_t num)
++/**
++ * kvm_reset_sys_regs - sets system registers to reset value
++ * @vcpu: The VCPU pointer
++ *
++ * This function finds the right table above and sets the registers on the
++ * virtual CPU struct to their architecturally defined reset values.
++ */
++void kvm_reset_sys_regs(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long i;
+ 
+-	for (i = 0; i < num; i++)
+-		if (table[i].reset)
+-			table[i].reset(vcpu, &table[i]);
++	for (i = 0; i < ARRAY_SIZE(sys_reg_descs); i++)
++		if (sys_reg_descs[i].reset)
++			sys_reg_descs[i].reset(vcpu, &sys_reg_descs[i]);
+ }
+ 
+ /**
+@@ -2880,22 +2864,3 @@ void kvm_sys_reg_table_init(void)
+ 	/* Clear all higher bits. */
+ 	cache_levels &= (1 << (i*3))-1;
+ }
+-
+-/**
+- * kvm_reset_sys_regs - sets system registers to reset value
+- * @vcpu: The VCPU pointer
+- *
+- * This function finds the right table above and sets the registers on the
+- * virtual CPU struct to their architecturally defined reset values.
+- */
+-void kvm_reset_sys_regs(struct kvm_vcpu *vcpu)
+-{
+-	size_t num;
+-	const struct sys_reg_desc *table;
+-
+-	/* Generic chip reset first (so target could override). */
+-	reset_sys_reg_descs(vcpu, sys_reg_descs, ARRAY_SIZE(sys_reg_descs));
+-
+-	table = get_target_table(vcpu->arch.target, true, &num);
+-	reset_sys_reg_descs(vcpu, table, num);
+-}
+diff --git a/arch/arm64/kvm/sys_regs.h b/arch/arm64/kvm/sys_regs.h
+index 5c0c94d34bf9..d7fd4d9345a8 100644
+--- a/arch/arm64/kvm/sys_regs.h
++++ b/arch/arm64/kvm/sys_regs.h
+@@ -176,6 +176,4 @@ const struct sys_reg_desc *find_reg_by_id(u64 id,
+ 	CRn(sys_reg_CRn(reg)), CRm(sys_reg_CRm(reg)),	\
+ 	Op2(sys_reg_Op2(reg))
+ 
+-extern struct kvm_sys_reg_target_table genericv8_target_table;
+-
+ #endif /* __ARM64_KVM_SYS_REGS_LOCAL_H__ */
+* Unmerged path arch/arm64/kvm/sys_regs_generic_v8.c
