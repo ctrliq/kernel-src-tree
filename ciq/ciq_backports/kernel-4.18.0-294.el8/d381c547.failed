@@ -1,0 +1,183 @@
+mm: only report isolation failures when offlining memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Michal Hocko <mhocko@suse.com>
+commit d381c54760dcfad23743da40516e7e003d73952a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d381c547.failed
+
+Heiko has complained that his log is swamped by warnings from
+has_unmovable_pages
+
+[   20.536664] page dumped because: has_unmovable_pages
+[   20.536792] page:000003d081ff4080 count:1 mapcount:0 mapping:000000008ff88600 index:0x0 compound_mapcount: 0
+[   20.536794] flags: 0x3fffe0000010200(slab|head)
+[   20.536795] raw: 03fffe0000010200 0000000000000100 0000000000000200 000000008ff88600
+[   20.536796] raw: 0000000000000000 0020004100000000 ffffffff00000001 0000000000000000
+[   20.536797] page dumped because: has_unmovable_pages
+[   20.536814] page:000003d0823b0000 count:1 mapcount:0 mapping:0000000000000000 index:0x0
+[   20.536815] flags: 0x7fffe0000000000()
+[   20.536817] raw: 07fffe0000000000 0000000000000100 0000000000000200 0000000000000000
+[   20.536818] raw: 0000000000000000 0000000000000000 ffffffff00000001 0000000000000000
+
+which are not triggered by the memory hotplug but rather CMA allocator.
+The original idea behind dumping the page state for all call paths was
+that these messages will be helpful debugging failures.  From the above it
+seems that this is not the case for the CMA path because we are lacking
+much more context.  E.g the second reported page might be a CMA allocated
+page.  It is still interesting to see a slab page in the CMA area but it
+is hard to tell whether this is bug from the above output alone.
+
+Address this issue by dumping the page state only on request.  Both
+start_isolate_page_range and has_unmovable_pages already have an argument
+to ignore hwpoison pages so make this argument more generic and turn it
+into flags and allow callers to combine non-default modes into a mask.
+While we are at it, has_unmovable_pages call from
+is_pageblock_removable_nolock (sysfs removable file) is questionable to
+report the failure so drop it from there as well.
+
+Link: http://lkml.kernel.org/r/20181218092802.31429-1-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Reported-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d381c54760dcfad23743da40516e7e003d73952a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/page-isolation.h
+#	mm/memory_hotplug.c
+#	mm/page_alloc.c
+#	mm/page_isolation.c
+diff --cc include/linux/page-isolation.h
+index 6e9e72274b0d,4eb26d278046..000000000000
+--- a/include/linux/page-isolation.h
++++ b/include/linux/page-isolation.h
+@@@ -38,6 -41,16 +41,19 @@@ int move_freepages_block(struct zone *z
+  
+  /*
+   * Changes migrate type in [start_pfn, end_pfn) to be MIGRATE_ISOLATE.
+++<<<<<<< HEAD
+++=======
++  * If specified range includes migrate types other than MOVABLE or CMA,
++  * this will fail with -EBUSY.
++  *
++  * For isolating all pages in the range finally, the caller have to
++  * free all pages in the range. test_page_isolated() can be used for
++  * test it.
++  *
++  * The following flags are allowed (they can be combined in a bit mask)
++  * SKIP_HWPOISON - ignore hwpoison pages
++  * REPORT_FAILURE - report details about the failure to isolate the range
+++>>>>>>> d381c54760dc (mm: only report isolation failures when offlining memory)
+   */
+  int
+  start_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn,
+diff --cc mm/memory_hotplug.c
+index a089a7544722,8537429d33a6..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -1547,8 -1577,9 +1547,14 @@@ static int __ref __offline_pages(unsign
+  
+  	/* set above range as isolated */
+  	ret = start_isolate_page_range(start_pfn, end_pfn,
+++<<<<<<< HEAD
+ +				       MIGRATE_MOVABLE, true);
+ +	if (ret < 0) {
+++=======
++ 				       MIGRATE_MOVABLE,
++ 				       SKIP_HWPOISON | REPORT_FAILURE);
++ 	if (ret) {
+++>>>>>>> d381c54760dc (mm: only report isolation failures when offlining memory)
+  		mem_hotplug_done();
+  		reason = "failure to isolate range";
+  		goto failed_removal;
+diff --cc mm/page_alloc.c
+index 1e1ccb5cdb17,ce9e88577bde..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -8067,9 -7996,8 +8067,14 @@@ int alloc_contig_range(unsigned long st
+  	 */
+  
+  	ret = start_isolate_page_range(pfn_max_align_down(start),
+++<<<<<<< HEAD
+ +				       pfn_max_align_up(end), migratetype,
+ +				       false);
+ +	if (ret < 0)
+++=======
++ 				       pfn_max_align_up(end), migratetype, 0);
++ 	if (ret)
+++>>>>>>> d381c54760dc (mm: only report isolation failures when offlining memory)
+  		return ret;
+  
+  	/*
+diff --cc mm/page_isolation.c
+index 4be9ddcdf5eb,ce323e56b34d..000000000000
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@@ -171,24 -169,21 +169,24 @@@ __first_valid_page(unsigned long pfn, u
+   *
+   * Making page-allocation-type to be MIGRATE_ISOLATE means free pages in
+   * the range will never be allocated. Any free pages and pages freed in the
+ - * future will not be allocated again.
+ - *
+ - * start_pfn/end_pfn must be aligned to pageblock_order.
+ - * Return 0 on success and -EBUSY if any part of range cannot be isolated.
+ + * future will not be allocated again. If specified range includes migrate types
+ + * other than MOVABLE or CMA, this will fail with -EBUSY. For isolating all
+ + * pages in the range finally, the caller have to free all pages in the range.
+ + * test_page_isolated() can be used for test it.
+   *
+   * There is no high level synchronization mechanism that prevents two threads
+ - * from trying to isolate overlapping ranges.  If this happens, one thread
+ + * from trying to isolate overlapping ranges. If this happens, one thread
+   * will notice pageblocks in the overlapping range already set to isolate.
+   * This happens in set_migratetype_isolate, and set_migratetype_isolate
+ - * returns an error.  We then clean up by restoring the migration type on
+ - * pageblocks we may have modified and return -EBUSY to caller.  This
+ + * returns an error. We then clean up by restoring the migration type on
+ + * pageblocks we may have modified and return -EBUSY to caller. This
+   * prevents two threads from simultaneously working on overlapping ranges.
+ + *
+ + * Return: the number of isolated pageblocks on success and -EBUSY if any part
+ + * of range cannot be isolated.
+   */
+  int start_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn,
+- 			     unsigned migratetype, bool skip_hwpoisoned_pages)
++ 			     unsigned migratetype, int flags)
+  {
+  	unsigned long pfn;
+  	unsigned long undo_pfn;
+@@@ -202,15 -196,13 +200,22 @@@
+  	     pfn < end_pfn;
+  	     pfn += pageblock_nr_pages) {
+  		page = __first_valid_page(pfn, pageblock_nr_pages);
+++<<<<<<< HEAD
+ +		if (page) {
+ +			if (set_migratetype_isolate(page, migratetype, skip_hwpoisoned_pages)) {
+ +				undo_pfn = pfn;
+ +				goto undo;
+ +			}
+ +			nr_isolate_pageblock++;
+++=======
++ 		if (page &&
++ 		    set_migratetype_isolate(page, migratetype, flags)) {
++ 			undo_pfn = pfn;
++ 			goto undo;
+++>>>>>>> d381c54760dc (mm: only report isolation failures when offlining memory)
+  		}
+  	}
+ -	return 0;
+ +	return nr_isolate_pageblock;
+  undo:
+  	for (pfn = start_pfn;
+  	     pfn < undo_pfn;
+* Unmerged path include/linux/page-isolation.h
+* Unmerged path mm/memory_hotplug.c
+* Unmerged path mm/page_alloc.c
+* Unmerged path mm/page_isolation.c
