@@ -1,0 +1,321 @@
+selftests: bpf: add trivial JSET tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 5a8d5209ac0228c9cf8f335dfdfffa71c54b3201
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5a8d5209.failed
+
+We seem to have no JSET instruction test, and LLVM does not
+generate it at all, so let's add a simple hand-coded test
+to make sure JIT implementations are correct.
+
+v2:
+ - extend test_verifier to handle multiple inputs and
+   add the sample there (Daniel)
+ - add a sign extension case
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 5a8d5209ac0228c9cf8f335dfdfffa71c54b3201)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/test_verifier.c
+diff --cc tools/testing/selftests/bpf/test_verifier.c
+index 5fb2ccc840f1,580fc9429147..000000000000
+--- a/tools/testing/selftests/bpf/test_verifier.c
++++ b/tools/testing/selftests/bpf/test_verifier.c
+@@@ -14101,33 -14139,132 +14110,128 @@@ static struct bpf_test tests[] = 
+  		.result = ACCEPT,
+  	},
+  	{
+ -		"check wire_len is not readable by sockets",
+ +		"calls: cross frame pruning",
+  		.insns = {
+ -			BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_1,
+ -				    offsetof(struct __sk_buff, wire_len)),
+ -			BPF_EXIT_INSN(),
+ -		},
+ -		.errstr = "invalid bpf_context access",
+ -		.result = REJECT,
+ -	},
+ -	{
+ -		"check wire_len is readable by tc classifier",
+ -		.insns = {
+ -			BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_1,
+ -				    offsetof(struct __sk_buff, wire_len)),
+ +			/* r8 = !!random();
+ +			 * call pruner()
+ +			 * if (r8)
+ +			 *     do something bad;
+ +			 */
+ +			BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0,
+ +				     BPF_FUNC_get_prandom_u32),
+ +			BPF_MOV64_IMM(BPF_REG_8, 0),
+ +			BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),
+ +			BPF_MOV64_IMM(BPF_REG_8, 1),
+ +			BPF_MOV64_REG(BPF_REG_1, BPF_REG_8),
+ +			BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 1, 0, 4),
+ +			BPF_JMP_IMM(BPF_JEQ, BPF_REG_8, 1, 1),
+ +			BPF_LDX_MEM(BPF_B, BPF_REG_9, BPF_REG_1, 0),
+ +			BPF_MOV64_IMM(BPF_REG_0, 0),
+  			BPF_EXIT_INSN(),
+ -		},
+ -		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+ -		.result = ACCEPT,
+ -	},
+ -	{
+ -		"check wire_len is not writable by tc classifier",
+ -		.insns = {
+ -			BPF_STX_MEM(BPF_W, BPF_REG_1, BPF_REG_1,
+ -				    offsetof(struct __sk_buff, wire_len)),
+ +			BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 0),
+  			BPF_EXIT_INSN(),
+  		},
+ -		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+ -		.errstr = "invalid bpf_context access",
+ -		.errstr_unpriv = "R1 leaks addr",
+ +		.prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
+ +		.errstr_unpriv = "function calls to other bpf functions are allowed for root only",
+ +		.result_unpriv = REJECT,
+ +		.errstr = "!read_ok",
+  		.result = REJECT,
+  	},
++ 	{
++ 		"jset: functional",
++ 		.insns = {
++ 			/* r0 = 0 */
++ 			BPF_MOV64_IMM(BPF_REG_0, 0),
++ 			/* prep for direct packet access via r2 */
++ 			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1,
++ 				    offsetof(struct __sk_buff, data)),
++ 			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1,
++ 				    offsetof(struct __sk_buff, data_end)),
++ 			BPF_MOV64_REG(BPF_REG_4, BPF_REG_2),
++ 			BPF_ALU64_IMM(BPF_ADD, BPF_REG_4, 8),
++ 			BPF_JMP_REG(BPF_JLE, BPF_REG_4, BPF_REG_3, 1),
++ 			BPF_EXIT_INSN(),
++ 
++ 			BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_2, 0),
++ 
++ 			/* reg, bit 63 or bit 0 set, taken */
++ 			BPF_LD_IMM64(BPF_REG_8, 0x8000000000000001),
++ 			BPF_JMP_REG(BPF_JSET, BPF_REG_7, BPF_REG_8, 1),
++ 			BPF_EXIT_INSN(),
++ 
++ 			/* reg, bit 62, not taken */
++ 			BPF_LD_IMM64(BPF_REG_8, 0x4000000000000000),
++ 			BPF_JMP_REG(BPF_JSET, BPF_REG_7, BPF_REG_8, 1),
++ 			BPF_JMP_IMM(BPF_JA, 0, 0, 1),
++ 			BPF_EXIT_INSN(),
++ 
++ 			/* imm, any bit set, taken */
++ 			BPF_JMP_IMM(BPF_JSET, BPF_REG_7, -1, 1),
++ 			BPF_EXIT_INSN(),
++ 
++ 			/* imm, bit 31 set, taken */
++ 			BPF_JMP_IMM(BPF_JSET, BPF_REG_7, 0x80000000, 1),
++ 			BPF_EXIT_INSN(),
++ 
++ 			/* all good - return r0 == 2 */
++ 			BPF_MOV64_IMM(BPF_REG_0, 2),
++ 			BPF_EXIT_INSN(),
++ 		},
++ 		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
++ 		.result = ACCEPT,
++ 		.runs = 7,
++ 		.retvals = {
++ 			{ .retval = 2,
++ 			  .data64 = { (1ULL << 63) | (1U << 31) | (1U << 0), }
++ 			},
++ 			{ .retval = 2,
++ 			  .data64 = { (1ULL << 63) | (1U << 31), }
++ 			},
++ 			{ .retval = 2,
++ 			  .data64 = { (1ULL << 31) | (1U << 0), }
++ 			},
++ 			{ .retval = 2,
++ 			  .data64 = { (__u32)-1, }
++ 			},
++ 			{ .retval = 2,
++ 			  .data64 = { ~0x4000000000000000ULL, }
++ 			},
++ 			{ .retval = 0,
++ 			  .data64 = { 0, }
++ 			},
++ 			{ .retval = 0,
++ 			  .data64 = { ~0ULL, }
++ 			},
++ 		},
++ 	},
++ 	{
++ 		"jset: sign-extend",
++ 		.insns = {
++ 			/* r0 = 0 */
++ 			BPF_MOV64_IMM(BPF_REG_0, 0),
++ 			/* prep for direct packet access via r2 */
++ 			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1,
++ 				    offsetof(struct __sk_buff, data)),
++ 			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1,
++ 				    offsetof(struct __sk_buff, data_end)),
++ 			BPF_MOV64_REG(BPF_REG_4, BPF_REG_2),
++ 			BPF_ALU64_IMM(BPF_ADD, BPF_REG_4, 8),
++ 			BPF_JMP_REG(BPF_JLE, BPF_REG_4, BPF_REG_3, 1),
++ 			BPF_EXIT_INSN(),
++ 
++ 			BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_2, 0),
++ 
++ 			BPF_JMP_IMM(BPF_JSET, BPF_REG_7, 0x80000000, 1),
++ 			BPF_EXIT_INSN(),
++ 
++ 			BPF_MOV64_IMM(BPF_REG_0, 2),
++ 			BPF_EXIT_INSN(),
++ 		},
++ 		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
++ 		.result = ACCEPT,
++ 		.retval = 2,
++ 		.data = { 1, 0, 0, 0, 0, 0, 0, 1, },
++ 	},
+  };
+  
+  static int probe_filter_length(const struct bpf_insn *fp)
+@@@ -14413,13 -14577,13 +14544,18 @@@ static int do_prog_test_run(int fd_prog
+  static void do_test_single(struct bpf_test *test, bool unpriv,
+  			   int *passes, int *errors)
+  {
+ -	int fd_prog, expected_ret, alignment_prevented_execution;
+ +	int fd_prog, expected_ret, reject_from_alignment;
+  	int prog_len, prog_type = test->prog_type;
+  	struct bpf_insn *prog = test->insns;
++ 	int run_errs, run_successes;
+  	int map_fds[MAX_NR_MAPS];
+  	const char *expected_err;
+++<<<<<<< HEAD
+ +	uint32_t expected_val;
+ +	uint32_t retval;
+++=======
++ 	__u32 pflags;
+++>>>>>>> 5a8d5209ac02 (selftests: bpf: add trivial JSET tests)
+  	int i, err;
+  
+  	for (i = 0; i < MAX_NR_MAPS; i++)
+@@@ -14438,25 -14606,20 +14574,31 @@@
+  		       test->result_unpriv : test->result;
+  	expected_err = unpriv && test->errstr_unpriv ?
+  		       test->errstr_unpriv : test->errstr;
+- 	expected_val = unpriv && test->retval_unpriv ?
+- 		       test->retval_unpriv : test->retval;
+  
+ -	alignment_prevented_execution = 0;
+ -
+ +	reject_from_alignment = fd_prog < 0 &&
+ +				(test->flags & F_NEEDS_EFFICIENT_UNALIGNED_ACCESS) &&
+ +				strstr(bpf_vlog, "misaligned");
+ +#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ +	if (reject_from_alignment) {
+ +		printf("FAIL\nFailed due to alignment despite having efficient unaligned access: '%s'!\n",
+ +		       strerror(errno));
+ +		goto fail_log;
+ +	}
+ +#endif
+  	if (expected_ret == ACCEPT) {
+ -		if (fd_prog < 0) {
+ +		if (fd_prog < 0 && !reject_from_alignment) {
+  			printf("FAIL\nFailed to load prog '%s'!\n",
+  			       strerror(errno));
+  			goto fail_log;
+  		}
+++<<<<<<< HEAD
+++=======
++ #ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
++ 		if (fd_prog >= 0 &&
++ 		    (test->flags & F_NEEDS_EFFICIENT_UNALIGNED_ACCESS))
++ 			alignment_prevented_execution = 1;
++ #endif
+++>>>>>>> 5a8d5209ac02 (selftests: bpf: add trivial JSET tests)
+  	} else {
+  		if (fd_prog >= 0) {
+  			printf("FAIL\nUnexpected success to load!\n");
+@@@ -14482,30 -14645,54 +14624,60 @@@
+  		}
+  	}
+  
+- 	if (fd_prog >= 0) {
+- 		__u8 tmp[TEST_DATA_LEN << 2];
+- 		__u32 size_tmp = sizeof(tmp);
+- 
+- 		if (unpriv)
+- 			set_admin(true);
+- 		err = bpf_prog_test_run(fd_prog, 1, test->data,
+- 					sizeof(test->data), tmp, &size_tmp,
+- 					&retval, NULL);
+- 		if (unpriv)
+- 			set_admin(false);
+- 		if (err && errno != 524/*ENOTSUPP*/ && errno != EPERM) {
+- 			printf("Unexpected bpf_prog_test_run error\n");
+- 			goto fail_log;
++ 	run_errs = 0;
++ 	run_successes = 0;
++ 	if (!alignment_prevented_execution && fd_prog >= 0) {
++ 		uint32_t expected_val;
++ 		int i;
++ 
++ 		if (!test->runs) {
++ 			expected_val = unpriv && test->retval_unpriv ?
++ 				test->retval_unpriv : test->retval;
++ 
++ 			err = do_prog_test_run(fd_prog, unpriv, expected_val,
++ 					       test->data, sizeof(test->data));
++ 			if (err)
++ 				run_errs++;
++ 			else
++ 				run_successes++;
+  		}
+- 		if (!err && retval != expected_val &&
+- 		    expected_val != POINTER_VALUE) {
+- 			printf("FAIL retval %d != %d\n", retval, expected_val);
+- 			goto fail_log;
++ 
++ 		for (i = 0; i < test->runs; i++) {
++ 			if (unpriv && test->retvals[i].retval_unpriv)
++ 				expected_val = test->retvals[i].retval_unpriv;
++ 			else
++ 				expected_val = test->retvals[i].retval;
++ 
++ 			err = do_prog_test_run(fd_prog, unpriv, expected_val,
++ 					       test->retvals[i].data,
++ 					       sizeof(test->retvals[i].data));
++ 			if (err) {
++ 				printf("(run %d/%d) ", i + 1, test->runs);
++ 				run_errs++;
++ 			} else {
++ 				run_successes++;
++ 			}
+  		}
+  	}
+++<<<<<<< HEAD
+ +	(*passes)++;
+ +	printf("OK%s\n", reject_from_alignment ?
+ +	       " (NOTE: reject due to unknown alignment)" : "");
+++=======
++ 
++ 	if (!run_errs) {
++ 		(*passes)++;
++ 		if (run_successes > 1)
++ 			printf("%d cases ", run_successes);
++ 		printf("OK");
++ 		if (alignment_prevented_execution)
++ 			printf(" (NOTE: not executed due to unknown alignment)");
++ 		printf("\n");
++ 	} else {
++ 		printf("\n");
++ 		goto fail_log;
++ 	}
+++>>>>>>> 5a8d5209ac02 (selftests: bpf: add trivial JSET tests)
+  close_fds:
+  	close(fd_prog);
+  	for (i = 0; i < MAX_NR_MAPS; i++)
+* Unmerged path tools/testing/selftests/bpf/test_verifier.c
