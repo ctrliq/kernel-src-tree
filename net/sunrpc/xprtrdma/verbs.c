@@ -144,7 +144,6 @@ void rpcrdma_flush_disconnect(struct rpcrdma_xprt *r_xprt, struct ib_wc *wc)
 	if (wc->status != IB_WC_SUCCESS &&
 	    r_xprt->rx_ep->re_connect_status == 1) {
 		r_xprt->rx_ep->re_connect_status = -ECONNABORTED;
-		trace_xprtrdma_flush_dct(r_xprt, wc->status);
 		xprt_force_disconnect(xprt);
 	}
 }
