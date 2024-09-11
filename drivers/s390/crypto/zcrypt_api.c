@@ -717,6 +717,8 @@ static long zcrypt_rsa_modexpo(struct ap_perms *perms,
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
+		ZCRYPT_DBF_DBG("%s no matching queue found => ENODEV\n",
+			       __func__);
 		rc = -ENODEV;
 		goto out;
 	}
@@ -825,6 +827,8 @@ static long zcrypt_rsa_crt(struct ap_perms *perms,
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
+		ZCRYPT_DBF_DBG("%s no matching queue found => ENODEV\n",
+			       __func__);
 		rc = -ENODEV;
 		goto out;
 	}
@@ -944,6 +948,8 @@ static long _zcrypt_send_cprb(bool userspace, struct ap_perms *perms,
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
+		ZCRYPT_DBF_DBG("%s no match for address %02x.%04x => ENODEV\n",
+			       __func__, xcRB->user_defined, *domain);
 		rc = -ENODEV;
 		goto out;
 	}
@@ -1116,6 +1122,17 @@ static long _zcrypt_send_ep11_cprb(bool userspace, struct ap_perms *perms,
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
+		if (targets && target_num == 1) {
+			ZCRYPT_DBF_DBG("%s no match for address %02x.%04x => ENODEV\n",
+				       __func__, (int) targets->ap_id,
+				       (int) targets->dom_id);
+		} else if (targets) {
+			ZCRYPT_DBF_DBG("%s no match for %d target addrs => ENODEV\n",
+				       __func__, (int) target_num);
+		} else {
+			ZCRYPT_DBF_DBG("%s no match for address ff.ffff => ENODEV\n",
+				       __func__);
+		}
 		rc = -ENODEV;
 		goto out_free;
 	}
@@ -1192,6 +1209,8 @@ static long zcrypt_rng(char *buffer)
 	spin_unlock(&zcrypt_list_lock);
 
 	if (!pref_zq) {
+		ZCRYPT_DBF_DBG("%s no matching queue found => ENODEV\n",
+			__func__);
 		rc = -ENODEV;
 		goto out;
 	}
