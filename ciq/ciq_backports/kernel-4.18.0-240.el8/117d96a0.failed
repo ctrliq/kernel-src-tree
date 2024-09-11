@@ -1,0 +1,464 @@
+libceph: support for balanced and localized reads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 117d96a04f007ce8fc2e292369056c3bd09f6f63
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/117d96a0.failed
+
+OSD-side issues with reads from replica have been resolved in
+Octopus.  Reading from replica should be safe wrt. unstable or
+uncommitted state now, so add support for balanced and localized
+reads.
+
+There are two cases when a read from replica can't be served:
+
+- OSD may silently drop the request, expecting the client to
+  notice that the acting set has changed and resend via the usual
+  means (handled with t->used_replica)
+
+- OSD may return EAGAIN, expecting the client to resend to the
+  primary, ignoring replica read flags (see handle_reply())
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+(cherry picked from commit 117d96a04f007ce8fc2e292369056c3bd09f6f63)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ceph/osdmap.h
+#	net/ceph/osdmap.c
+diff --cc include/linux/ceph/osdmap.h
+index 5e601975745f,3f4498fef6ad..000000000000
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@@ -302,9 -302,26 +302,30 @@@ bool ceph_pg_to_primary_shard(struct ce
+  int ceph_pg_to_acting_primary(struct ceph_osdmap *osdmap,
+  			      const struct ceph_pg *raw_pgid);
+  
+++<<<<<<< HEAD
+++=======
++ struct crush_loc {
++ 	char *cl_type_name;
++ 	char *cl_name;
++ };
++ 
++ struct crush_loc_node {
++ 	struct rb_node cl_node;
++ 	struct crush_loc cl_loc;  /* pointers into cl_data */
++ 	char cl_data[];
++ };
++ 
++ int ceph_parse_crush_location(char *crush_location, struct rb_root *locs);
++ int ceph_compare_crush_locs(struct rb_root *locs1, struct rb_root *locs2);
++ void ceph_clear_crush_locs(struct rb_root *locs);
++ 
++ int ceph_get_crush_locality(struct ceph_osdmap *osdmap, int id,
++ 			    struct rb_root *locs);
++ 
+++>>>>>>> 117d96a04f00 (libceph: support for balanced and localized reads)
+  extern struct ceph_pg_pool_info *ceph_pg_pool_by_id(struct ceph_osdmap *map,
+  						    u64 id);
+ +
+  extern const char *ceph_pg_pool_name_by_id(struct ceph_osdmap *map, u64 id);
+  extern int ceph_pg_poolid_by_name(struct ceph_osdmap *map, const char *name);
+  u64 ceph_pg_pool_flags(struct ceph_osdmap *map, u64 id);
+diff --cc net/ceph/osdmap.c
+index e74130876d3a,96c25f5e064a..000000000000
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@@ -2715,3 -2715,221 +2715,224 @@@ int ceph_pg_to_acting_primary(struct ce
+  	return acting.primary;
+  }
+  EXPORT_SYMBOL(ceph_pg_to_acting_primary);
+++<<<<<<< HEAD
+++=======
++ 
++ static struct crush_loc_node *alloc_crush_loc(size_t type_name_len,
++ 					      size_t name_len)
++ {
++ 	struct crush_loc_node *loc;
++ 
++ 	loc = kmalloc(sizeof(*loc) + type_name_len + name_len + 2, GFP_NOIO);
++ 	if (!loc)
++ 		return NULL;
++ 
++ 	RB_CLEAR_NODE(&loc->cl_node);
++ 	return loc;
++ }
++ 
++ static void free_crush_loc(struct crush_loc_node *loc)
++ {
++ 	WARN_ON(!RB_EMPTY_NODE(&loc->cl_node));
++ 
++ 	kfree(loc);
++ }
++ 
++ static int crush_loc_compare(const struct crush_loc *loc1,
++ 			     const struct crush_loc *loc2)
++ {
++ 	return strcmp(loc1->cl_type_name, loc2->cl_type_name) ?:
++ 	       strcmp(loc1->cl_name, loc2->cl_name);
++ }
++ 
++ DEFINE_RB_FUNCS2(crush_loc, struct crush_loc_node, cl_loc, crush_loc_compare,
++ 		 RB_BYPTR, const struct crush_loc *, cl_node)
++ 
++ /*
++  * Parses a set of <bucket type name>':'<bucket name> pairs separated
++  * by '|', e.g. "rack:foo1|rack:foo2|datacenter:bar".
++  *
++  * Note that @crush_location is modified by strsep().
++  */
++ int ceph_parse_crush_location(char *crush_location, struct rb_root *locs)
++ {
++ 	struct crush_loc_node *loc;
++ 	const char *type_name, *name, *colon;
++ 	size_t type_name_len, name_len;
++ 
++ 	dout("%s '%s'\n", __func__, crush_location);
++ 	while ((type_name = strsep(&crush_location, "|"))) {
++ 		colon = strchr(type_name, ':');
++ 		if (!colon)
++ 			return -EINVAL;
++ 
++ 		type_name_len = colon - type_name;
++ 		if (type_name_len == 0)
++ 			return -EINVAL;
++ 
++ 		name = colon + 1;
++ 		name_len = strlen(name);
++ 		if (name_len == 0)
++ 			return -EINVAL;
++ 
++ 		loc = alloc_crush_loc(type_name_len, name_len);
++ 		if (!loc)
++ 			return -ENOMEM;
++ 
++ 		loc->cl_loc.cl_type_name = loc->cl_data;
++ 		memcpy(loc->cl_loc.cl_type_name, type_name, type_name_len);
++ 		loc->cl_loc.cl_type_name[type_name_len] = '\0';
++ 
++ 		loc->cl_loc.cl_name = loc->cl_data + type_name_len + 1;
++ 		memcpy(loc->cl_loc.cl_name, name, name_len);
++ 		loc->cl_loc.cl_name[name_len] = '\0';
++ 
++ 		if (!__insert_crush_loc(locs, loc)) {
++ 			free_crush_loc(loc);
++ 			return -EEXIST;
++ 		}
++ 
++ 		dout("%s type_name '%s' name '%s'\n", __func__,
++ 		     loc->cl_loc.cl_type_name, loc->cl_loc.cl_name);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int ceph_compare_crush_locs(struct rb_root *locs1, struct rb_root *locs2)
++ {
++ 	struct rb_node *n1 = rb_first(locs1);
++ 	struct rb_node *n2 = rb_first(locs2);
++ 	int ret;
++ 
++ 	for ( ; n1 && n2; n1 = rb_next(n1), n2 = rb_next(n2)) {
++ 		struct crush_loc_node *loc1 =
++ 		    rb_entry(n1, struct crush_loc_node, cl_node);
++ 		struct crush_loc_node *loc2 =
++ 		    rb_entry(n2, struct crush_loc_node, cl_node);
++ 
++ 		ret = crush_loc_compare(&loc1->cl_loc, &loc2->cl_loc);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (!n1 && n2)
++ 		return -1;
++ 	if (n1 && !n2)
++ 		return 1;
++ 	return 0;
++ }
++ 
++ void ceph_clear_crush_locs(struct rb_root *locs)
++ {
++ 	while (!RB_EMPTY_ROOT(locs)) {
++ 		struct crush_loc_node *loc =
++ 		    rb_entry(rb_first(locs), struct crush_loc_node, cl_node);
++ 
++ 		erase_crush_loc(locs, loc);
++ 		free_crush_loc(loc);
++ 	}
++ }
++ 
++ /*
++  * [a-zA-Z0-9-_.]+
++  */
++ static bool is_valid_crush_name(const char *name)
++ {
++ 	do {
++ 		if (!('a' <= *name && *name <= 'z') &&
++ 		    !('A' <= *name && *name <= 'Z') &&
++ 		    !('0' <= *name && *name <= '9') &&
++ 		    *name != '-' && *name != '_' && *name != '.')
++ 			return false;
++ 	} while (*++name != '\0');
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Gets the parent of an item.  Returns its id (<0 because the
++  * parent is always a bucket), type id (>0 for the same reason,
++  * via @parent_type_id) and location (via @parent_loc).  If no
++  * parent, returns 0.
++  *
++  * Does a linear search, as there are no parent pointers of any
++  * kind.  Note that the result is ambigous for items that occur
++  * multiple times in the map.
++  */
++ static int get_immediate_parent(struct crush_map *c, int id,
++ 				u16 *parent_type_id,
++ 				struct crush_loc *parent_loc)
++ {
++ 	struct crush_bucket *b;
++ 	struct crush_name_node *type_cn, *cn;
++ 	int i, j;
++ 
++ 	for (i = 0; i < c->max_buckets; i++) {
++ 		b = c->buckets[i];
++ 		if (!b)
++ 			continue;
++ 
++ 		/* ignore per-class shadow hierarchy */
++ 		cn = lookup_crush_name(&c->names, b->id);
++ 		if (!cn || !is_valid_crush_name(cn->cn_name))
++ 			continue;
++ 
++ 		for (j = 0; j < b->size; j++) {
++ 			if (b->items[j] != id)
++ 				continue;
++ 
++ 			*parent_type_id = b->type;
++ 			type_cn = lookup_crush_name(&c->type_names, b->type);
++ 			parent_loc->cl_type_name = type_cn->cn_name;
++ 			parent_loc->cl_name = cn->cn_name;
++ 			return b->id;
++ 		}
++ 	}
++ 
++ 	return 0;  /* no parent */
++ }
++ 
++ /*
++  * Calculates the locality/distance from an item to a client
++  * location expressed in terms of CRUSH hierarchy as a set of
++  * (bucket type name, bucket name) pairs.  Specifically, looks
++  * for the lowest-valued bucket type for which the location of
++  * @id matches one of the locations in @locs, so for standard
++  * bucket types (host = 1, rack = 3, datacenter = 8, zone = 9)
++  * a matching host is closer than a matching rack and a matching
++  * data center is closer than a matching zone.
++  *
++  * Specifying multiple locations (a "multipath" location) such
++  * as "rack=foo1 rack=foo2 datacenter=bar" is allowed -- @locs
++  * is a multimap.  The locality will be:
++  *
++  * - 3 for OSDs in racks foo1 and foo2
++  * - 8 for OSDs in data center bar
++  * - -1 for all other OSDs
++  *
++  * The lowest possible bucket type is 1, so the best locality
++  * for an OSD is 1 (i.e. a matching host).  Locality 0 would be
++  * the OSD itself.
++  */
++ int ceph_get_crush_locality(struct ceph_osdmap *osdmap, int id,
++ 			    struct rb_root *locs)
++ {
++ 	struct crush_loc loc;
++ 	u16 type_id;
++ 
++ 	/*
++ 	 * Instead of repeated get_immediate_parent() calls,
++ 	 * the location of @id could be obtained with a single
++ 	 * depth-first traversal.
++ 	 */
++ 	for (;;) {
++ 		id = get_immediate_parent(osdmap->crush, id, &type_id, &loc);
++ 		if (id >= 0)
++ 			return -1;  /* not local */
++ 
++ 		if (lookup_crush_loc(locs, &loc))
++ 			return type_id;
++ 	}
++ }
+++>>>>>>> 117d96a04f00 (libceph: support for balanced and localized reads)
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index bd2f5c638d73..445f5c977606 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -164,6 +164,7 @@ struct ceph_osd_request_target {
+ 	bool recovery_deletes;
+ 
+ 	unsigned int flags;                /* CEPH_OSD_FLAG_* */
++	bool used_replica;
+ 	bool paused;
+ 
+ 	u32 epoch;
+* Unmerged path include/linux/ceph/osdmap.h
+diff --git a/net/ceph/debugfs.c b/net/ceph/debugfs.c
+index 1344f232ecc5..409d505ff320 100644
+--- a/net/ceph/debugfs.c
++++ b/net/ceph/debugfs.c
+@@ -81,11 +81,13 @@ static int osdmap_show(struct seq_file *s, void *p)
+ 		u32 state = map->osd_state[i];
+ 		char sb[64];
+ 
+-		seq_printf(s, "osd%d\t%s\t%3d%%\t(%s)\t%3d%%\n",
++		seq_printf(s, "osd%d\t%s\t%3d%%\t(%s)\t%3d%%\t%2d\n",
+ 			   i, ceph_pr_addr(addr),
+ 			   ((map->osd_weight[i]*100) >> 16),
+ 			   ceph_osdmap_state_str(sb, sizeof(sb), state),
+-			   ((ceph_get_primary_affinity(map, i)*100) >> 16));
++			   ((ceph_get_primary_affinity(map, i)*100) >> 16),
++			   ceph_get_crush_locality(map, i,
++					   &client->options->crush_locs));
+ 	}
+ 	for (n = rb_first(&map->pg_temp); n; n = rb_next(n)) {
+ 		struct ceph_pg_mapping *pg =
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index f1dcf63f4ec8..cb831f1021b2 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1497,6 +1497,45 @@ static bool target_should_be_paused(struct ceph_osd_client *osdc,
+ 	       (osdc->osdmap->epoch < osdc->epoch_barrier);
+ }
+ 
++static int pick_random_replica(const struct ceph_osds *acting)
++{
++	int i = prandom_u32() % acting->size;
++
++	dout("%s picked osd%d, primary osd%d\n", __func__,
++	     acting->osds[i], acting->primary);
++	return i;
++}
++
++/*
++ * Picks the closest replica based on client's location given by
++ * crush_location option.  Prefers the primary if the locality is
++ * the same.
++ */
++static int pick_closest_replica(struct ceph_osd_client *osdc,
++				const struct ceph_osds *acting)
++{
++	struct ceph_options *opt = osdc->client->options;
++	int best_i, best_locality;
++	int i = 0, locality;
++
++	do {
++		locality = ceph_get_crush_locality(osdc->osdmap,
++						   acting->osds[i],
++						   &opt->crush_locs);
++		if (i == 0 ||
++		    (locality >= 0 && best_locality < 0) ||
++		    (locality >= 0 && best_locality >= 0 &&
++		     locality < best_locality)) {
++			best_i = i;
++			best_locality = locality;
++		}
++	} while (++i < acting->size);
++
++	dout("%s picked osd%d with locality %d, primary osd%d\n", __func__,
++	     acting->osds[best_i], best_locality, acting->primary);
++	return best_i;
++}
++
+ enum calc_target_result {
+ 	CALC_TARGET_NO_ACTION = 0,
+ 	CALC_TARGET_NEED_RESEND,
+@@ -1510,6 +1549,8 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 	struct ceph_pg_pool_info *pi;
+ 	struct ceph_pg pgid, last_pgid;
+ 	struct ceph_osds up, acting;
++	bool is_read = t->flags & CEPH_OSD_FLAG_READ;
++	bool is_write = t->flags & CEPH_OSD_FLAG_WRITE;
+ 	bool force_resend = false;
+ 	bool unpaused = false;
+ 	bool legacy_change = false;
+@@ -1540,9 +1581,9 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 	ceph_oid_copy(&t->target_oid, &t->base_oid);
+ 	ceph_oloc_copy(&t->target_oloc, &t->base_oloc);
+ 	if ((t->flags & CEPH_OSD_FLAG_IGNORE_OVERLAY) == 0) {
+-		if (t->flags & CEPH_OSD_FLAG_READ && pi->read_tier >= 0)
++		if (is_read && pi->read_tier >= 0)
+ 			t->target_oloc.pool = pi->read_tier;
+-		if (t->flags & CEPH_OSD_FLAG_WRITE && pi->write_tier >= 0)
++		if (is_write && pi->write_tier >= 0)
+ 			t->target_oloc.pool = pi->write_tier;
+ 
+ 		pi = ceph_pg_pool_by_id(osdc->osdmap, t->target_oloc.pool);
+@@ -1581,7 +1622,8 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 		unpaused = true;
+ 	}
+ 	legacy_change = ceph_pg_compare(&t->pgid, &pgid) ||
+-			ceph_osds_changed(&t->acting, &acting, any_change);
++			ceph_osds_changed(&t->acting, &acting,
++					  t->used_replica || any_change);
+ 	if (t->pg_num)
+ 		split = ceph_pg_is_split(&last_pgid, t->pg_num, pi->pg_num);
+ 
+@@ -1597,7 +1639,24 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 		t->sort_bitwise = sort_bitwise;
+ 		t->recovery_deletes = recovery_deletes;
+ 
+-		t->osd = acting.primary;
++		if ((t->flags & (CEPH_OSD_FLAG_BALANCE_READS |
++				 CEPH_OSD_FLAG_LOCALIZE_READS)) &&
++		    !is_write && pi->type == CEPH_POOL_TYPE_REP &&
++		    acting.size > 1) {
++			int pos;
++
++			WARN_ON(!is_read || acting.osds[0] != acting.primary);
++			if (t->flags & CEPH_OSD_FLAG_BALANCE_READS) {
++				pos = pick_random_replica(&acting);
++			} else {
++				pos = pick_closest_replica(osdc, &acting);
++			}
++			t->osd = acting.osds[pos];
++			t->used_replica = pos > 0;
++		} else {
++			t->osd = acting.primary;
++			t->used_replica = false;
++		}
+ 	}
+ 
+ 	if (unpaused || legacy_change || force_resend || split)
+@@ -3655,6 +3714,26 @@ static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
+ 		goto out_unlock_osdc;
+ 	}
+ 
++	if (m.result == -EAGAIN) {
++		dout("req %p tid %llu EAGAIN\n", req, req->r_tid);
++		unlink_request(osd, req);
++		mutex_unlock(&osd->lock);
++
++		/*
++		 * The object is missing on the replica or not (yet)
++		 * readable.  Clear pgid to force a resend to the primary
++		 * via legacy_change.
++		 */
++		req->r_t.pgid.pool = 0;
++		req->r_t.pgid.seed = 0;
++		WARN_ON(!req->r_t.used_replica);
++		req->r_flags &= ~(CEPH_OSD_FLAG_BALANCE_READS |
++				  CEPH_OSD_FLAG_LOCALIZE_READS);
++		req->r_tid = 0;
++		__submit_request(req, false);
++		goto out_unlock_osdc;
++	}
++
+ 	if (m.num_ops != req->r_num_ops) {
+ 		pr_err("num_ops %d != %d for tid %llu\n", m.num_ops,
+ 		       req->r_num_ops, req->r_tid);
+* Unmerged path net/ceph/osdmap.c
