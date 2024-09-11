@@ -2109,7 +2109,7 @@ int bpf_object__pin_maps(struct bpf_object *obj, const char *path)
 	if (err)
 		return err;
 
-	bpf_map__for_each(map, obj) {
+	bpf_object__for_each_map(map, obj) {
 		char buf[PATH_MAX];
 		int len;
 
@@ -2156,7 +2156,7 @@ int bpf_object__unpin_maps(struct bpf_object *obj, const char *path)
 	if (!obj)
 		return -ENOENT;
 
-	bpf_map__for_each(map, obj) {
+	bpf_object__for_each_map(map, obj) {
 		char buf[PATH_MAX];
 		int len;
 
@@ -2844,7 +2844,7 @@ bpf_object__find_map_by_name(struct bpf_object *obj, const char *name)
 {
 	struct bpf_map *pos;
 
-	bpf_map__for_each(pos, obj) {
+	bpf_object__for_each_map(pos, obj) {
 		if (pos->name && !strcmp(pos->name, name))
 			return pos;
 	}
@@ -2937,7 +2937,7 @@ int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
 			first_prog = prog;
 	}
 
-	bpf_map__for_each(map, obj) {
+	bpf_object__for_each_map(map, obj) {
 		if (!bpf_map__is_offload_neutral(map))
 			map->map_ifindex = attr->ifindex;
 	}
