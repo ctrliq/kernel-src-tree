@@ -1,0 +1,202 @@
+drm/amd/display: Initialize stream_update with memset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Nicholas Kazlauskas <nicholas.kazlauskas@amd.com>
+commit 2aa632c5ffbedb2ee0e68857683466ea788f17eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2aa632c5.failed
+
+The brace initialization used here generates warnings on some
+compilers. For example, on GCC 4.9:
+
+[...] In function ‘dm_determine_update_type_for_commit’:
+[...] error: missing braces around initializer [-Werror=missing-braces]
+   struct dc_stream_update stream_update = { 0 };
+          ^
+
+Use memset to make this more portable.
+
+v2: Specify the compiler / diagnostic in the commit message (Paul)
+
+	Cc: Sun peng Li <Sunpeng.Li@amd.com>
+	Cc: Harry Wentland <Harry.Wentland@amd.com>
+	Signed-off-by: Nicholas Kazlauskas <nicholas.kazlauskas@amd.com>
+	Reviewed-by: Leo Li <sunpeng.li@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 2aa632c5ffbedb2ee0e68857683466ea788f17eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+diff --cc drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 770c6b24be0b,06f58cd9e984..000000000000
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@@ -4988,6 -6091,161 +4988,164 @@@ static int dm_update_planes_state(struc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ dm_determine_update_type_for_commit(struct dc *dc,
++ 				    struct drm_atomic_state *state,
++ 				    enum surface_update_type *out_type)
++ {
++ 	struct dm_atomic_state *dm_state = NULL, *old_dm_state = NULL;
++ 	int i, j, num_plane, ret = 0;
++ 	struct drm_plane_state *old_plane_state, *new_plane_state;
++ 	struct dm_plane_state *new_dm_plane_state, *old_dm_plane_state;
++ 	struct drm_crtc *new_plane_crtc, *old_plane_crtc;
++ 	struct drm_plane *plane;
++ 
++ 	struct drm_crtc *crtc;
++ 	struct drm_crtc_state *new_crtc_state, *old_crtc_state;
++ 	struct dm_crtc_state *new_dm_crtc_state, *old_dm_crtc_state;
++ 	struct dc_stream_status *status = NULL;
++ 
++ 	struct dc_surface_update *updates;
++ 	struct dc_plane_state *surface;
++ 	enum surface_update_type update_type = UPDATE_TYPE_FAST;
++ 
++ 	updates = kcalloc(MAX_SURFACES, sizeof(*updates), GFP_KERNEL);
++ 	surface = kcalloc(MAX_SURFACES, sizeof(*surface), GFP_KERNEL);
++ 
++ 	if (!updates || !surface) {
++ 		DRM_ERROR("Plane or surface update failed to allocate");
++ 		/* Set type to FULL to avoid crashing in DC*/
++ 		update_type = UPDATE_TYPE_FULL;
++ 		goto cleanup;
++ 	}
++ 
++ 	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
++ 		struct dc_stream_update stream_update;
++ 
++ 		memset(&stream_update, 0, sizeof(stream_update));
++ 
++ 		new_dm_crtc_state = to_dm_crtc_state(new_crtc_state);
++ 		old_dm_crtc_state = to_dm_crtc_state(old_crtc_state);
++ 		num_plane = 0;
++ 
++ 		if (new_dm_crtc_state->stream != old_dm_crtc_state->stream) {
++ 			update_type = UPDATE_TYPE_FULL;
++ 			goto cleanup;
++ 		}
++ 
++ 		if (!new_dm_crtc_state->stream)
++ 			continue;
++ 
++ 		for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, j) {
++ 			new_plane_crtc = new_plane_state->crtc;
++ 			old_plane_crtc = old_plane_state->crtc;
++ 			new_dm_plane_state = to_dm_plane_state(new_plane_state);
++ 			old_dm_plane_state = to_dm_plane_state(old_plane_state);
++ 
++ 			if (plane->type == DRM_PLANE_TYPE_CURSOR)
++ 				continue;
++ 
++ 			if (new_dm_plane_state->dc_state != old_dm_plane_state->dc_state) {
++ 				update_type = UPDATE_TYPE_FULL;
++ 				goto cleanup;
++ 			}
++ 
++ 			if (!state->allow_modeset)
++ 				continue;
++ 
++ 			if (crtc != new_plane_crtc)
++ 				continue;
++ 
++ 			updates[num_plane].surface = &surface[num_plane];
++ 
++ 			if (new_crtc_state->mode_changed) {
++ 				updates[num_plane].surface->src_rect =
++ 						new_dm_plane_state->dc_state->src_rect;
++ 				updates[num_plane].surface->dst_rect =
++ 						new_dm_plane_state->dc_state->dst_rect;
++ 				updates[num_plane].surface->rotation =
++ 						new_dm_plane_state->dc_state->rotation;
++ 				updates[num_plane].surface->in_transfer_func =
++ 						new_dm_plane_state->dc_state->in_transfer_func;
++ 				stream_update.dst = new_dm_crtc_state->stream->dst;
++ 				stream_update.src = new_dm_crtc_state->stream->src;
++ 			}
++ 
++ 			if (new_crtc_state->color_mgmt_changed) {
++ 				updates[num_plane].gamma =
++ 						new_dm_plane_state->dc_state->gamma_correction;
++ 				updates[num_plane].in_transfer_func =
++ 						new_dm_plane_state->dc_state->in_transfer_func;
++ 				stream_update.gamut_remap =
++ 						&new_dm_crtc_state->stream->gamut_remap_matrix;
++ 				stream_update.out_transfer_func =
++ 						new_dm_crtc_state->stream->out_transfer_func;
++ 			}
++ 
++ 			num_plane++;
++ 		}
++ 
++ 		if (num_plane == 0)
++ 			continue;
++ 
++ 		ret = dm_atomic_get_state(state, &dm_state);
++ 		if (ret)
++ 			goto cleanup;
++ 
++ 		old_dm_state = dm_atomic_get_old_state(state);
++ 		if (!old_dm_state) {
++ 			ret = -EINVAL;
++ 			goto cleanup;
++ 		}
++ 
++ 		status = dc_stream_get_status_from_state(old_dm_state->context,
++ 							 new_dm_crtc_state->stream);
++ 
++ 		update_type = dc_check_update_surfaces_for_stream(dc, updates, num_plane,
++ 								  &stream_update, status);
++ 
++ 		if (update_type > UPDATE_TYPE_MED) {
++ 			update_type = UPDATE_TYPE_FULL;
++ 			goto cleanup;
++ 		}
++ 	}
++ 
++ cleanup:
++ 	kfree(updates);
++ 	kfree(surface);
++ 
++ 	*out_type = update_type;
++ 	return ret;
++ }
++ 
++ /**
++  * amdgpu_dm_atomic_check() - Atomic check implementation for AMDgpu DM.
++  * @dev: The DRM device
++  * @state: The atomic state to commit
++  *
++  * Validate that the given atomic state is programmable by DC into hardware.
++  * This involves constructing a &struct dc_state reflecting the new hardware
++  * state we wish to commit, then querying DC to see if it is programmable. It's
++  * important not to modify the existing DC state. Otherwise, atomic_check
++  * may unexpectedly commit hardware changes.
++  *
++  * When validating the DC state, it's important that the right locks are
++  * acquired. For full updates case which removes/adds/updates streams on one
++  * CRTC while flipping on another CRTC, acquiring global lock will guarantee
++  * that any such full update commit will wait for completion of any outstanding
++  * flip using DRMs synchronization events. See
++  * dm_determine_update_type_for_commit()
++  *
++  * Note that DM adds the affected connectors for all CRTCs in state, when that
++  * might not seem necessary. This is because DC stream creation requires the
++  * DC sink, which is tied to the DRM connector state. Cleaning this up should
++  * be possible but non-trivial - a possible TODO item.
++  *
++  * Return: -Error code if validation failed.
++  */
+++>>>>>>> 2aa632c5ffbe (drm/amd/display: Initialize stream_update with memset)
+  static int amdgpu_dm_atomic_check(struct drm_device *dev,
+  				  struct drm_atomic_state *state)
+  {
+* Unmerged path drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
