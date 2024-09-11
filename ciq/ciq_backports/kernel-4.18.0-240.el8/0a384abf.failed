@@ -1,0 +1,165 @@
+net: abstract out normal and compat msghdr import
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 0a384abfae66651b28e4bbe16883b1ff046ba3b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0a384abf.failed
+
+This splits it into two parts, one that imports the message, and one
+that imports the iovec. This allows a caller to only do the first part,
+and import the iovec manually afterwards.
+
+No functional changes in this patch.
+
+	Acked-by: David Miller <davem@davemloft.net>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 0a384abfae66651b28e4bbe16883b1ff046ba3b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/socket.h
+diff --cc include/linux/socket.h
+index 29e5d23681ed,fc59ac825561..000000000000
+--- a/include/linux/socket.h
++++ b/include/linux/socket.h
+@@@ -367,12 -378,23 +367,26 @@@ extern int __sys_recvmmsg(int fd, struc
+  extern int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg,
+  			  unsigned int vlen, unsigned int flags,
+  			  bool forbid_cmsg_compat);
+ -extern long __sys_sendmsg_sock(struct socket *sock, struct msghdr *msg,
+ +extern long __sys_sendmsg_sock(struct socket *sock,
+ +			       struct user_msghdr __user *msg,
+  			       unsigned int flags);
+ -extern long __sys_recvmsg_sock(struct socket *sock, struct msghdr *msg,
+ -			       struct user_msghdr __user *umsg,
+ -			       struct sockaddr __user *uaddr,
+ +extern long __sys_recvmsg_sock(struct socket *sock,
+ +			       struct user_msghdr __user *msg,
+  			       unsigned int flags);
+++<<<<<<< HEAD
+++=======
++ extern int sendmsg_copy_msghdr(struct msghdr *msg,
++ 			       struct user_msghdr __user *umsg, unsigned flags,
++ 			       struct iovec **iov);
++ extern int recvmsg_copy_msghdr(struct msghdr *msg,
++ 			       struct user_msghdr __user *umsg, unsigned flags,
++ 			       struct sockaddr __user **uaddr,
++ 			       struct iovec **iov);
++ extern int __copy_msghdr_from_user(struct msghdr *kmsg,
++ 				   struct user_msghdr __user *umsg,
++ 				   struct sockaddr __user **save_addr,
++ 				   struct iovec __user **uiov, size_t *nsegs);
+++>>>>>>> 0a384abfae66 (net: abstract out normal and compat msghdr import)
+  
+  /* helpers which do the actual work for syscalls */
+  extern int __sys_recvfrom(int fd, void __user *ubuf, size_t size,
+* Unmerged path include/linux/socket.h
+diff --git a/include/net/compat.h b/include/net/compat.h
+index 4c6d75612b6c..2f861518cc89 100644
+--- a/include/net/compat.h
++++ b/include/net/compat.h
+@@ -41,6 +41,9 @@ int compat_sock_get_timestampns(struct sock *, struct timespec __user *);
+ #define compat_mmsghdr	mmsghdr
+ #endif /* defined(CONFIG_COMPAT) */
+ 
++int __get_compat_msghdr(struct msghdr *kmsg, struct compat_msghdr __user *umsg,
++			struct sockaddr __user **save_addr, compat_uptr_t *ptr,
++			compat_size_t *len);
+ int get_compat_msghdr(struct msghdr *, struct compat_msghdr __user *,
+ 		      struct sockaddr __user **, struct iovec **);
+ struct sock_fprog __user *get_compat_bpf_fprog(char __user *optval);
+diff --git a/net/compat.c b/net/compat.c
+index f44825efe279..a37b2e7f803f 100644
+--- a/net/compat.c
++++ b/net/compat.c
+@@ -32,10 +32,10 @@
+ #include <linux/uaccess.h>
+ #include <net/compat.h>
+ 
+-int get_compat_msghdr(struct msghdr *kmsg,
+-		      struct compat_msghdr __user *umsg,
+-		      struct sockaddr __user **save_addr,
+-		      struct iovec **iov)
++int __get_compat_msghdr(struct msghdr *kmsg,
++			struct compat_msghdr __user *umsg,
++			struct sockaddr __user **save_addr,
++			compat_uptr_t *ptr, compat_size_t *len)
+ {
+ 	struct compat_msghdr msg;
+ 	ssize_t err;
+@@ -78,10 +78,26 @@ int get_compat_msghdr(struct msghdr *kmsg,
+ 		return -EMSGSIZE;
+ 
+ 	kmsg->msg_iocb = NULL;
++	*ptr = msg.msg_iov;
++	*len = msg.msg_iovlen;
++	return 0;
++}
++
++int get_compat_msghdr(struct msghdr *kmsg,
++		      struct compat_msghdr __user *umsg,
++		      struct sockaddr __user **save_addr,
++		      struct iovec **iov)
++{
++	compat_uptr_t ptr;
++	compat_size_t len;
++	ssize_t err;
++
++	err = __get_compat_msghdr(kmsg, umsg, save_addr, &ptr, &len);
++	if (err)
++		return err;
+ 
+-	err = compat_import_iovec(save_addr ? READ : WRITE,
+-				   compat_ptr(msg.msg_iov), msg.msg_iovlen,
+-				   UIO_FASTIOV, iov, &kmsg->msg_iter);
++	err = compat_import_iovec(save_addr ? READ : WRITE, compat_ptr(ptr),
++				   len, UIO_FASTIOV, iov, &kmsg->msg_iter);
+ 	return err < 0 ? err : 0;
+ }
+ 
+diff --git a/net/socket.c b/net/socket.c
+index 4226b678d7d3..2c80f47466c9 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -2176,10 +2176,10 @@ struct used_address {
+ 	unsigned int name_len;
+ };
+ 
+-static int copy_msghdr_from_user(struct msghdr *kmsg,
+-				 struct user_msghdr __user *umsg,
+-				 struct sockaddr __user **save_addr,
+-				 struct iovec **iov)
++int __copy_msghdr_from_user(struct msghdr *kmsg,
++			    struct user_msghdr __user *umsg,
++			    struct sockaddr __user **save_addr,
++			    struct iovec __user **uiov, size_t *nsegs)
+ {
+ 	struct user_msghdr msg;
+ 	ssize_t err;
+@@ -2221,6 +2221,23 @@ static int copy_msghdr_from_user(struct msghdr *kmsg,
+ 		return -EMSGSIZE;
+ 
+ 	kmsg->msg_iocb = NULL;
++	*uiov = msg.msg_iov;
++	*nsegs = msg.msg_iovlen;
++	return 0;
++}
++
++static int copy_msghdr_from_user(struct msghdr *kmsg,
++				 struct user_msghdr __user *umsg,
++				 struct sockaddr __user **save_addr,
++				 struct iovec **iov)
++{
++	struct user_msghdr msg;
++	ssize_t err;
++
++	err = __copy_msghdr_from_user(kmsg, umsg, save_addr, &msg.msg_iov,
++					&msg.msg_iovlen);
++	if (err)
++		return err;
+ 
+ 	err = import_iovec(save_addr ? READ : WRITE,
+ 			    msg.msg_iov, msg.msg_iovlen,
