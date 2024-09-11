@@ -1,0 +1,199 @@
+tracing: Add trace_export support for trace_marker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Tingwei Zhang <tingwei@codeaurora.org>
+commit 458999c6f67b0ffcc704a4892041dd700adf7d83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/458999c6.failed
+
+Add the support to route trace_marker buffer to other destination
+via trace_export.
+
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Reviewed-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Tingwei Zhang <tingwei@codeaurora.org>
+	Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Link: https://lore.kernel.org/r/20201005071319.78508-5-alexander.shishkin@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 458999c6f67b0ffcc704a4892041dd700adf7d83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/trace.h
+#	kernel/trace/trace.c
+diff --cc include/linux/trace.h
+index b95ffb2188ab,886a4ffd9d45..000000000000
+--- a/include/linux/trace.h
++++ b/include/linux/trace.h
+@@@ -3,6 -3,11 +3,14 @@@
+  #define _LINUX_TRACE_H
+  
+  #ifdef CONFIG_TRACING
+++<<<<<<< HEAD
+++=======
++ 
++ #define TRACE_EXPORT_FUNCTION	BIT(0)
++ #define TRACE_EXPORT_EVENT	BIT(1)
++ #define TRACE_EXPORT_MARKER	BIT(2)
++ 
+++>>>>>>> 458999c6f67b (tracing: Add trace_export support for trace_marker)
+  /*
+   * The trace export - an export of Ftrace output. The trace_export
+   * can process traces and export them to a registered destination as
+diff --cc kernel/trace/trace.c
+index 3871b23923fc,6048fba2f590..000000000000
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@@ -246,6 -251,145 +246,148 @@@ unsigned long long ns2usecs(u64 nsec
+  	return nsec;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ trace_process_export(struct trace_export *export,
++ 	       struct ring_buffer_event *event, int flag)
++ {
++ 	struct trace_entry *entry;
++ 	unsigned int size = 0;
++ 
++ 	if (export->flags & flag) {
++ 		entry = ring_buffer_event_data(event);
++ 		size = ring_buffer_event_length(event);
++ 		export->write(export, entry, size);
++ 	}
++ }
++ 
++ static DEFINE_MUTEX(ftrace_export_lock);
++ 
++ static struct trace_export __rcu *ftrace_exports_list __read_mostly;
++ 
++ static DEFINE_STATIC_KEY_FALSE(trace_function_exports_enabled);
++ static DEFINE_STATIC_KEY_FALSE(trace_event_exports_enabled);
++ static DEFINE_STATIC_KEY_FALSE(trace_marker_exports_enabled);
++ 
++ static inline void ftrace_exports_enable(struct trace_export *export)
++ {
++ 	if (export->flags & TRACE_EXPORT_FUNCTION)
++ 		static_branch_inc(&trace_function_exports_enabled);
++ 
++ 	if (export->flags & TRACE_EXPORT_EVENT)
++ 		static_branch_inc(&trace_event_exports_enabled);
++ 
++ 	if (export->flags & TRACE_EXPORT_MARKER)
++ 		static_branch_inc(&trace_marker_exports_enabled);
++ }
++ 
++ static inline void ftrace_exports_disable(struct trace_export *export)
++ {
++ 	if (export->flags & TRACE_EXPORT_FUNCTION)
++ 		static_branch_dec(&trace_function_exports_enabled);
++ 
++ 	if (export->flags & TRACE_EXPORT_EVENT)
++ 		static_branch_dec(&trace_event_exports_enabled);
++ 
++ 	if (export->flags & TRACE_EXPORT_MARKER)
++ 		static_branch_dec(&trace_marker_exports_enabled);
++ }
++ 
++ static void ftrace_exports(struct ring_buffer_event *event, int flag)
++ {
++ 	struct trace_export *export;
++ 
++ 	preempt_disable_notrace();
++ 
++ 	export = rcu_dereference_raw_check(ftrace_exports_list);
++ 	while (export) {
++ 		trace_process_export(export, event, flag);
++ 		export = rcu_dereference_raw_check(export->next);
++ 	}
++ 
++ 	preempt_enable_notrace();
++ }
++ 
++ static inline void
++ add_trace_export(struct trace_export **list, struct trace_export *export)
++ {
++ 	rcu_assign_pointer(export->next, *list);
++ 	/*
++ 	 * We are entering export into the list but another
++ 	 * CPU might be walking that list. We need to make sure
++ 	 * the export->next pointer is valid before another CPU sees
++ 	 * the export pointer included into the list.
++ 	 */
++ 	rcu_assign_pointer(*list, export);
++ }
++ 
++ static inline int
++ rm_trace_export(struct trace_export **list, struct trace_export *export)
++ {
++ 	struct trace_export **p;
++ 
++ 	for (p = list; *p != NULL; p = &(*p)->next)
++ 		if (*p == export)
++ 			break;
++ 
++ 	if (*p != export)
++ 		return -1;
++ 
++ 	rcu_assign_pointer(*p, (*p)->next);
++ 
++ 	return 0;
++ }
++ 
++ static inline void
++ add_ftrace_export(struct trace_export **list, struct trace_export *export)
++ {
++ 	ftrace_exports_enable(export);
++ 
++ 	add_trace_export(list, export);
++ }
++ 
++ static inline int
++ rm_ftrace_export(struct trace_export **list, struct trace_export *export)
++ {
++ 	int ret;
++ 
++ 	ret = rm_trace_export(list, export);
++ 	ftrace_exports_disable(export);
++ 
++ 	return ret;
++ }
++ 
++ int register_ftrace_export(struct trace_export *export)
++ {
++ 	if (WARN_ON_ONCE(!export->write))
++ 		return -1;
++ 
++ 	mutex_lock(&ftrace_export_lock);
++ 
++ 	add_ftrace_export(&ftrace_exports_list, export);
++ 
++ 	mutex_unlock(&ftrace_export_lock);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(register_ftrace_export);
++ 
++ int unregister_ftrace_export(struct trace_export *export)
++ {
++ 	int ret;
++ 
++ 	mutex_lock(&ftrace_export_lock);
++ 
++ 	ret = rm_ftrace_export(&ftrace_exports_list, export);
++ 
++ 	mutex_unlock(&ftrace_export_lock);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(unregister_ftrace_export);
++ 
+++>>>>>>> 458999c6f67b (tracing: Add trace_export support for trace_marker)
+  /* trace_flags holds trace_options default values */
+  #define TRACE_DEFAULT_FLAGS						\
+  	(FUNCTION_DEFAULT_FLAGS |					\
+* Unmerged path include/linux/trace.h
+* Unmerged path kernel/trace/trace.c
