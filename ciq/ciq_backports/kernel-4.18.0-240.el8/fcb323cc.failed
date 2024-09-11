@@ -1,0 +1,271 @@
+io_uring: io_uring: add support for async work inheriting files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit fcb323cc53e29d9cc696d606bb42736b32dd9825
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/fcb323cc.failed
+
+This is in preparation for adding opcodes that need to add new files
+in a process file table, system calls like open(2) or accept4(2).
+
+If an opcode needs this, it must set IO_WQ_WORK_NEEDS_FILES in the work
+item. If work that needs to get punted to async context have this
+set, the async worker will assume the original task file table before
+executing the work.
+
+Note that opcodes that need access to the current files of an
+application cannot be done through IORING_SETUP_SQPOLL.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit fcb323cc53e29d9cc696d606bb42736b32dd9825)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io-wq.c
+#	fs/io-wq.h
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7f974c7eddcc,6e1523567920..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -225,6 -194,10 +225,12 @@@ struct io_ring_ctx 
+  		struct io_uring_sqe	*sq_sqes;
+  
+  		struct list_head	defer_list;
+++<<<<<<< HEAD
+++=======
++ 		struct list_head	timeout_list;
++ 
++ 		wait_queue_head_t	inflight_wait;
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  	} ____cacheline_aligned_in_smp;
+  
+  	/* IO offload */
+@@@ -277,10 -252,11 +283,13 @@@
+  		 */
+  		struct list_head	poll_list;
+  		struct list_head	cancel_list;
++ 
++ 		spinlock_t		inflight_lock;
++ 		struct list_head	inflight_list;
+  	} ____cacheline_aligned_in_smp;
+  
+ +	struct async_list	pending_async[2];
+ +
+  #if defined(CONFIG_UNIX)
+  	struct socket		*ring_sock;
+  #endif
+@@@ -288,9 -264,11 +297,11 @@@
+  
+  struct sqe_submit {
+  	const struct io_uring_sqe	*sqe;
++ 	struct file			*ring_file;
++ 	int				ring_fd;
+  	u32				sequence;
+  	bool				has_user;
+ -	bool				in_async;
+ +	bool				needs_lock;
+  	bool				needs_fixed_file;
+  };
+  
+@@@ -337,11 -321,17 +348,24 @@@ struct io_kiocb 
+  #define REQ_F_LINK_DONE		128	/* linked sqes done */
+  #define REQ_F_FAIL_LINK		256	/* fail rest of links */
+  #define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+++<<<<<<< HEAD
+++=======
++ #define REQ_F_TIMEOUT		1024	/* timeout request */
++ #define REQ_F_ISREG		2048	/* regular file */
++ #define REQ_F_MUST_PUNT		4096	/* must be punted even for NONBLOCK */
++ #define REQ_F_INFLIGHT		8192	/* on inflight list */
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+  
+++<<<<<<< HEAD
+ +	struct work_struct	work;
+++=======
++ 	struct list_head	inflight_entry;
++ 
++ 	struct io_wq_work	work;
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  };
+  
+  #define IO_PLUG_THRESHOLD		2
+@@@ -424,6 -410,10 +448,13 @@@ static struct io_ring_ctx *io_ring_ctx_
+  	INIT_LIST_HEAD(&ctx->poll_list);
+  	INIT_LIST_HEAD(&ctx->cancel_list);
+  	INIT_LIST_HEAD(&ctx->defer_list);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&ctx->timeout_list);
++ 	init_waitqueue_head(&ctx->inflight_wait);
++ 	spin_lock_init(&ctx->inflight_lock);
++ 	INIT_LIST_HEAD(&ctx->inflight_list);
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  	return ctx;
+  }
+  
+@@@ -2160,8 -2300,32 +2202,32 @@@ static int io_req_set_file(struct io_ri
+  	return 0;
+  }
+  
++ static int io_grab_files(struct io_ring_ctx *ctx, struct io_kiocb *req)
++ {
++ 	int ret = -EBADF;
++ 
++ 	rcu_read_lock();
++ 	spin_lock_irq(&ctx->inflight_lock);
++ 	/*
++ 	 * We use the f_ops->flush() handler to ensure that we can flush
++ 	 * out work accessing these files if the fd is closed. Check if
++ 	 * the fd has changed since we started down this path, and disallow
++ 	 * this operation if it has.
++ 	 */
++ 	if (fcheck(req->submit.ring_fd) == req->submit.ring_file) {
++ 		list_add(&req->inflight_entry, &ctx->inflight_list);
++ 		req->flags |= REQ_F_INFLIGHT;
++ 		req->work.files = current->files;
++ 		ret = 0;
++ 	}
++ 	spin_unlock_irq(&ctx->inflight_lock);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
+  static int __io_queue_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ -			struct sqe_submit *s)
+ +			struct sqe_submit *s, bool force_nonblock)
+  {
+  	int ret;
+  
+@@@ -2171,16 -2341,14 +2237,25 @@@
+  
+  		sqe_copy = kmemdup(s->sqe, sizeof(*sqe_copy), GFP_KERNEL);
+  		if (sqe_copy) {
+ +			struct async_list *list;
+ +
+  			s->sqe = sqe_copy;
+  			memcpy(&req->submit, s, sizeof(*s));
+++<<<<<<< HEAD
+ +			list = io_async_list_from_sqe(ctx, s->sqe);
+ +			if (!io_add_to_prev_work(list, req)) {
+ +				if (list)
+ +					atomic_inc(&list->cnt);
+ +				INIT_WORK(&req->work, io_sq_wq_submit_work);
+ +				io_queue_async_work(ctx, req);
+++=======
++ 			if (req->work.flags & IO_WQ_WORK_NEEDS_FILES) {
++ 				ret = io_grab_files(ctx, req);
++ 				if (ret) {
++ 					kfree(sqe_copy);
++ 					goto err;
++ 				}
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  			}
+  
+  			/*
+@@@ -2192,7 -2361,8 +2268,12 @@@
+  	}
+  
+  	/* drop submission reference */
+++<<<<<<< HEAD
+ +	io_put_req(req);
+++=======
++ err:
++ 	io_put_req(req, NULL);
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  
+  	/* and drop final reference, if we failed */
+  	if (ret) {
+@@@ -2389,11 -2560,12 +2470,12 @@@ static bool io_get_sqring(struct io_rin
+  	 */
+  	head = ctx->cached_sq_head;
+  	/* make sure SQ entry isn't read before tail */
+ -	if (head == smp_load_acquire(&rings->sq.tail))
+ +	if (head == smp_load_acquire(&ring->r.tail))
+  		return false;
+  
+ -	head = READ_ONCE(sq_array[head & ctx->sq_mask]);
+ +	head = READ_ONCE(ring->array[head & ctx->sq_mask]);
+  	if (head < ctx->sq_entries) {
++ 		s->ring_file = NULL;
+  		s->sqe = &ctx->sq_sqes[head];
+  		s->sequence = ctx->cached_sq_head;
+  		ctx->cached_sq_head++;
+@@@ -2604,7 -2766,7 +2686,11 @@@ static int io_sq_thread(void *data
+  }
+  
+  static int io_ring_submit(struct io_ring_ctx *ctx, unsigned int to_submit,
+++<<<<<<< HEAD
+ +			  bool block_for_last)
+++=======
++ 			  struct file *ring_file, int ring_fd)
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  {
+  	struct io_submit_state state, *statep = NULL;
+  	struct io_kiocb *link = NULL;
+@@@ -2648,22 -2808,14 +2734,24 @@@
+  		}
+  
+  out:
++ 		s.ring_file = ring_file;
+  		s.has_user = true;
+ -		s.in_async = false;
+ +		s.needs_lock = false;
+  		s.needs_fixed_file = false;
++ 		s.ring_fd = ring_fd;
+  		submit++;
+ -		trace_io_uring_submit_sqe(ctx, true, false);
+ -		io_submit_sqe(ctx, &s, statep, &link);
+ +
+ +		/*
+ +		 * The caller will block for events after submit, submit the
+ +		 * last IO non-blocking. This is either the only IO it's
+ +		 * submitting, or it already submitted the previous ones. This
+ +		 * improves performance by avoiding an async punt that we don't
+ +		 * need to do.
+ +		 */
+ +		if (block_for_last && submit == to_submit)
+ +			force_nonblock = false;
+ +
+ +		io_submit_sqe(ctx, &s, statep, &link, force_nonblock);
+  	}
+  
+  	if (link)
+@@@ -3629,21 -3886,10 +3764,25 @@@ SYSCALL_DEFINE6(io_uring_enter, unsigne
+  			wake_up(&ctx->sqo_wait);
+  		submitted = to_submit;
+  	} else if (to_submit) {
+ +		bool block_for_last = false;
+ +
+  		to_submit = min(to_submit, ctx->sq_entries);
+  
+ +		/*
+ +		 * Allow last submission to block in a series, IFF the caller
+ +		 * asked to wait for events and we don't currently have
+ +		 * enough. This potentially avoids an async punt.
+ +		 */
+ +		if (to_submit == min_complete &&
+ +		    io_cqring_events(ctx->rings) < min_complete)
+ +			block_for_last = true;
+ +
+  		mutex_lock(&ctx->uring_lock);
+++<<<<<<< HEAD
+ +		submitted = io_ring_submit(ctx, to_submit, block_for_last);
+++=======
++ 		submitted = io_ring_submit(ctx, to_submit, f.file, fd);
+++>>>>>>> fcb323cc53e2 (io_uring: io_uring: add support for async work inheriting files)
+  		mutex_unlock(&ctx->uring_lock);
+  	}
+  	if (flags & IORING_ENTER_GETEVENTS) {
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io_uring.c
