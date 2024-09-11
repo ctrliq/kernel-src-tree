@@ -1,0 +1,127 @@
+drm/amdgpu: Resolve RAS GFX error count issue after cold boot on Arcturus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Candice Li <candice.li@amd.com>
+commit 2a460963350ec6b1534d28d7f943b5f84815aff2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/2a460963.failed
+
+Adjust the sequence for ras late init and separate ras reset error status
+from query status.
+
+v2: squash in fix from Candice
+
+	Signed-off-by: Candice Li <candice.li@amd.com>
+	Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 2a460963350ec6b1534d28d7f943b5f84815aff2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 1795d448c700,16699158e00d..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@@ -622,32 -591,11 +622,35 @@@ int amdgpu_get_gfx_off_status(struct am
+  	return r;
+  }
+  
+ -int amdgpu_gfx_ras_late_init(struct amdgpu_device *adev, struct ras_common_if *ras_block)
+ +int amdgpu_gfx_ras_late_init(struct amdgpu_device *adev)
+  {
+  	int r;
+++<<<<<<< HEAD
+ +	struct ras_fs_if fs_info = {
+ +		.sysfs_name = "gfx_err_count",
+ +	};
+ +	struct ras_ih_if ih_info = {
+ +		.cb = amdgpu_gfx_process_ras_data_cb,
+ +	};
+++=======
+++>>>>>>> 2a460963350e (drm/amdgpu: Resolve RAS GFX error count issue after cold boot on Arcturus)
+ +
+ +	if (!adev->gfx.ras_if) {
+ +		adev->gfx.ras_if = kmalloc(sizeof(struct ras_common_if), GFP_KERNEL);
+ +		if (!adev->gfx.ras_if)
+ +			return -ENOMEM;
+ +		adev->gfx.ras_if->block = AMDGPU_RAS_BLOCK__GFX;
+ +		adev->gfx.ras_if->type = AMDGPU_RAS_ERROR__MULTI_UNCORRECTABLE;
+ +		adev->gfx.ras_if->sub_block_index = 0;
+ +		strcpy(adev->gfx.ras_if->name, "gfx");
+ +	}
+ +	fs_info.head = ih_info.head = *adev->gfx.ras_if;
+ +	r = amdgpu_ras_late_init(adev, adev->gfx.ras_if,
+ +				 &fs_info, &ih_info);
+ +	if (r)
+ +		goto free;
+  
+ -	if (amdgpu_ras_is_supported(adev, ras_block->block)) {
+ +	if (amdgpu_ras_is_supported(adev, adev->gfx.ras_if->block)) {
+  		if (!amdgpu_persistent_edc_harvesting_supported(adev))
+  			amdgpu_ras_reset_error_status(adev, AMDGPU_RAS_BLOCK__GFX);
+  
+@@@ -655,9 -607,7 +662,13 @@@
+  		if (r)
+  			goto late_fini;
+  	} else {
+++<<<<<<< HEAD
+ +		/* free gfx ras_if if ras is not supported */
+ +		r = 0;
+ +		goto free;
+++=======
++ 		amdgpu_ras_feature_enable_on_boot(adev, ras_block, 0);
+++>>>>>>> 2a460963350e (drm/amdgpu: Resolve RAS GFX error count issue after cold boot on Arcturus)
+  	}
+  
+  	return 0;
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+index 95d5842385b3,dac202ae864d..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
+@@@ -506,10 -557,10 +513,15 @@@ static ssize_t amdgpu_ras_sysfs_read(st
+  	if (amdgpu_ras_query_error_status(obj->adev, &info))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +
+ +	if (obj->adev->asic_type == CHIP_ALDEBARAN) {
+++=======
++ 	if (obj->adev->ip_versions[MP0_HWIP][0] != IP_VERSION(11, 0, 2) &&
++ 	    obj->adev->ip_versions[MP0_HWIP][0] != IP_VERSION(11, 0, 4)) {
+++>>>>>>> 2a460963350e (drm/amdgpu: Resolve RAS GFX error count issue after cold boot on Arcturus)
+  		if (amdgpu_ras_reset_error_status(obj->adev, info.head.block))
+- 			DRM_WARN("Failed to reset error counter and error status");
++ 			dev_warn(obj->adev->dev, "Failed to reset error counter and error status");
+  	}
+  
+  	return sysfs_emit(buf, "%s: %lu\n%s: %lu\n", "ue", info.ue_count,
+@@@ -1619,7 -1792,23 +1637,13 @@@ static void amdgpu_ras_log_on_err_count
+  		if (info.head.block == AMDGPU_RAS_BLOCK__PCIE_BIF)
+  			continue;
+  
+ -		/*
+ -		 * this is a workaround for aldebaran, skip send msg to
+ -		 * smu to get ecc_info table due to smu handle get ecc
+ -		 * info table failed temporarily.
+ -		 * should be removed until smu fix handle ecc_info table.
+ -		 */
+ -		if ((info.head.block == AMDGPU_RAS_BLOCK__UMC) &&
+ -			(adev->ip_versions[MP1_HWIP][0] == IP_VERSION(13, 0, 2)))
+ -			continue;
+ -
+  		amdgpu_ras_query_error_status(adev, &info);
++ 
++ 		if (adev->ip_versions[MP0_HWIP][0] != IP_VERSION(11, 0, 2) &&
++ 		    adev->ip_versions[MP0_HWIP][0] != IP_VERSION(11, 0, 4)) {
++ 			if (amdgpu_ras_reset_error_status(adev, info.head.block))
++ 				dev_warn(adev->dev, "Failed to reset error counter and error status");
++ 		}
+  	}
+  }
+  
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c
