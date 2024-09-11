@@ -1,0 +1,135 @@
+s390/qeth: clean up error handling for isolation mode cmds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 65878fd95261d3a831e085e2c6f1e8a6d7979b14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/65878fd9.failed
+
+As the cmd IO path has learned to propagate errnos back to its callers,
+let them deal with errors instead of trying to restore their previous
+configuration from within the IO error path.
+
+Also translate the HW error to a meaningful errno, instead of returning
+-EIO for all cases (and don't map this to -EOPNOTSUPP later on...).
+
+While at it, add a READ_ONCE() / WRITE_ONCE() pair to ensure that the
+data path always sees a valid isolation mode during reconfiguration.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 65878fd95261d3a831e085e2c6f1e8a6d7979b14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 5e420377007e,bd6489d87ede..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -6593,6 -6825,36 +6564,39 @@@ netdev_features_t qeth_features_check(s
+  				      struct net_device *dev,
+  				      netdev_features_t features)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	/* Traffic with local next-hop is not eligible for some offloads: */
++ 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
++ 	    READ_ONCE(card->options.isolation) != ISOLATION_MODE_FWD) {
++ 		netdev_features_t restricted = 0;
++ 
++ 		if (skb_is_gso(skb) && !netif_needs_gso(skb, features))
++ 			restricted |= NETIF_F_ALL_TSO;
++ 
++ 		switch (vlan_get_protocol(skb)) {
++ 		case htons(ETH_P_IP):
++ 			if (!card->info.has_lp2lp_cso_v4)
++ 				restricted |= NETIF_F_IP_CSUM;
++ 
++ 			if (restricted && qeth_next_hop_is_local_v4(card, skb))
++ 				features &= ~restricted;
++ 			break;
++ 		case htons(ETH_P_IPV6):
++ 			if (!card->info.has_lp2lp_cso_v6)
++ 				restricted |= NETIF_F_IPV6_CSUM;
++ 
++ 			if (restricted && qeth_next_hop_is_local_v6(card, skb))
++ 				features &= ~restricted;
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
+++>>>>>>> 65878fd95261 (s390/qeth: clean up error handling for isolation mode cmds)
+  	/* GSO segmentation builds skbs with
+  	 *	a (small) linear part for the headers, and
+  	 *	page frags for the data.
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 37711dff7476..aaa3f87492d0 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -722,7 +722,6 @@ struct qeth_card_options {
+ 	enum qeth_discipline_id layer;
+ 	int rx_sg_cb;
+ 	enum qeth_ipa_isolation_modes isolation;
+-	enum qeth_ipa_isolation_modes prev_isolation;
+ 	int sniffer;
+ 	enum qeth_cq cq;
+ 	char hsuid[9];
+@@ -1067,6 +1066,9 @@ int qeth_query_switch_attributes(struct qeth_card *card,
+ 				  struct qeth_switch_info *sw_info);
+ int qeth_query_card_info(struct qeth_card *card,
+ 			 struct carrier_info *carrier_info);
++int qeth_setadpparms_set_access_ctrl(struct qeth_card *card,
++				     enum qeth_ipa_isolation_modes mode);
++
+ unsigned int qeth_count_elements(struct sk_buff *skb, unsigned int data_offset);
+ int qeth_do_send_packet(struct qeth_card *card, struct qeth_qdio_out_q *queue,
+ 			struct sk_buff *skb, struct qeth_hdr *hdr,
+@@ -1074,7 +1076,6 @@ int qeth_do_send_packet(struct qeth_card *card, struct qeth_qdio_out_q *queue,
+ 			int elements_needed);
+ int qeth_do_ioctl(struct net_device *dev, struct ifreq *rq, int cmd);
+ void qeth_dbf_longtext(debug_info_t *id, int level, char *text, ...);
+-int qeth_set_access_ctrl_online(struct qeth_card *card, int fallback);
+ int qeth_configure_cq(struct qeth_card *, enum qeth_cq);
+ int qeth_hw_trap(struct qeth_card *, enum qeth_diags_trap_action);
+ void qeth_trace_features(struct qeth_card *);
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/net/qeth_core_sys.c b/drivers/s390/net/qeth_core_sys.c
+index baf27152141b..72af184fe37c 100644
+--- a/drivers/s390/net/qeth_core_sys.c
++++ b/drivers/s390/net/qeth_core_sys.c
+@@ -447,19 +447,17 @@ static ssize_t qeth_dev_isolation_store(struct device *dev,
+ 		rc = -EINVAL;
+ 		goto out;
+ 	}
+-	rc = count;
+-
+-	/* defer IP assist if device is offline (until discipline->set_online)*/
+-	card->options.prev_isolation = card->options.isolation;
+-	card->options.isolation = isolation;
+-	if (qeth_card_hw_is_reachable(card)) {
+-		int ipa_rc = qeth_set_access_ctrl_online(card, 1);
+-		if (ipa_rc != 0)
+-			rc = ipa_rc;
+-	}
++
++	if (qeth_card_hw_is_reachable(card))
++		rc = qeth_setadpparms_set_access_ctrl(card, isolation);
++
++	if (!rc)
++		WRITE_ONCE(card->options.isolation, isolation);
++
+ out:
+ 	mutex_unlock(&card->conf_mutex);
+-	return rc;
++
++	return rc ? rc : count;
+ }
+ 
+ static DEVICE_ATTR(isolation, 0644, qeth_dev_isolation_show,
