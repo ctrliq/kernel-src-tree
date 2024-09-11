@@ -1,0 +1,223 @@
+bpf: btf: fix struct/union/fwd types with kind_flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit 9d5f9f701b1891466fb3dbb1806ad97716f95cc3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/9d5f9f70.failed
+
+This patch fixed two issues with BTF. One is related to
+struct/union bitfield encoding and the other is related to
+forward type.
+
+Issue #1 and solution:
+
+======================
+
+Current btf encoding of bitfield follows what pahole generates.
+For each bitfield, pahole will duplicate the type chain and
+put the bitfield size at the final int or enum type.
+Since the BTF enum type cannot encode bit size,
+pahole workarounds the issue by generating
+an int type whenever the enum bit size is not 32.
+
+For example,
+  -bash-4.4$ cat t.c
+  typedef int ___int;
+  enum A { A1, A2, A3 };
+  struct t {
+    int a[5];
+    ___int b:4;
+    volatile enum A c:4;
+  } g;
+  -bash-4.4$ gcc -c -O2 -g t.c
+The current kernel supports the following BTF encoding:
+  $ pahole -JV t.o
+  [1] TYPEDEF ___int type_id=2
+  [2] INT int size=4 bit_offset=0 nr_bits=32 encoding=SIGNED
+  [3] ENUM A size=4 vlen=3
+        A1 val=0
+        A2 val=1
+        A3 val=2
+  [4] STRUCT t size=24 vlen=3
+        a type_id=5 bits_offset=0
+        b type_id=9 bits_offset=160
+        c type_id=11 bits_offset=164
+  [5] ARRAY (anon) type_id=2 index_type_id=2 nr_elems=5
+  [6] INT sizetype size=8 bit_offset=0 nr_bits=64 encoding=(none)
+  [7] VOLATILE (anon) type_id=3
+  [8] INT int size=1 bit_offset=0 nr_bits=4 encoding=(none)
+  [9] TYPEDEF ___int type_id=8
+  [10] INT (anon) size=1 bit_offset=0 nr_bits=4 encoding=SIGNED
+  [11] VOLATILE (anon) type_id=10
+
+Two issues are in the above:
+  . by changing enum type to int, we lost the original
+    type information and this will not be ideal later
+    when we try to convert BTF to a header file.
+  . the type duplication for bitfields will cause
+    BTF bloat. Duplicated types cannot be deduplicated
+    later if the bitfield size is different.
+
+To fix this issue, this patch implemented a compatible
+change for BTF struct type encoding:
+  . the bit 31 of struct_type->info, previously reserved,
+    now is used to indicate whether bitfield_size is
+    encoded in btf_member or not.
+  . if bit 31 of struct_type->info is set,
+    btf_member->offset will encode like:
+      bit 0 - 23: bit offset
+      bit 24 - 31: bitfield size
+    if bit 31 is not set, the old behavior is preserved:
+      bit 0 - 31: bit offset
+
+So if the struct contains a bit field, the maximum bit offset
+will be reduced to (2^24 - 1) instead of MAX_UINT. The maximum
+bitfield size will be 256 which is enough for today as maximum
+bitfield in compiler can be 128 where int128 type is supported.
+
+This kernel patch intends to support the new BTF encoding:
+  $ pahole -JV t.o
+  [1] TYPEDEF ___int type_id=2
+  [2] INT int size=4 bit_offset=0 nr_bits=32 encoding=SIGNED
+  [3] ENUM A size=4 vlen=3
+        A1 val=0
+        A2 val=1
+        A3 val=2
+  [4] STRUCT t kind_flag=1 size=24 vlen=3
+        a type_id=5 bitfield_size=0 bits_offset=0
+        b type_id=1 bitfield_size=4 bits_offset=160
+        c type_id=7 bitfield_size=4 bits_offset=164
+  [5] ARRAY (anon) type_id=2 index_type_id=2 nr_elems=5
+  [6] INT sizetype size=8 bit_offset=0 nr_bits=64 encoding=(none)
+  [7] VOLATILE (anon) type_id=3
+
+Issue #2 and solution:
+======================
+
+Current forward type in BTF does not specify whether the original
+type is struct or union. This will not work for type pretty print
+and BTF-to-header-file conversion as struct/union must be specified.
+  $ cat tt.c
+  struct t;
+  union u;
+  int foo(struct t *t, union u *u) { return 0; }
+  $ gcc -c -g -O2 tt.c
+  $ pahole -JV tt.o
+  [1] INT int size=4 bit_offset=0 nr_bits=32 encoding=SIGNED
+  [2] FWD t type_id=0
+  [3] PTR (anon) type_id=2
+  [4] FWD u type_id=0
+  [5] PTR (anon) type_id=4
+
+To fix this issue, similar to issue #1, type->info bit 31
+is used. If the bit is set, it is union type. Otherwise, it is
+a struct type.
+
+  $ pahole -JV tt.o
+  [1] INT int size=4 bit_offset=0 nr_bits=32 encoding=SIGNED
+  [2] FWD t kind_flag=0 type_id=0
+  [3] PTR (anon) kind_flag=0 type_id=2
+  [4] FWD u kind_flag=1 type_id=0
+  [5] PTR (anon) kind_flag=0 type_id=4
+
+Pahole/LLVM change:
+===================
+
+The new kind_flag functionality has been implemented in pahole
+and llvm:
+  https://github.com/yonghong-song/pahole/tree/bitfield
+  https://github.com/yonghong-song/llvm/tree/bitfield
+
+Note that pahole hasn't implemented func/func_proto kind
+and .BTF.ext. So to print function signature with bpftool,
+the llvm compiler should be used.
+
+Fixes: 69b693f0aefa ("bpf: btf: Introduce BPF Type Format (BTF)")
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 9d5f9f701b1891466fb3dbb1806ad97716f95cc3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/btf.c
+diff --cc kernel/bpf/btf.c
+index 0357a9e2e51e,93b6905e3a9b..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -597,9 -650,17 +620,23 @@@ static void btf_verifier_log_member(str
+  	if (env->phase != CHECK_META)
+  		btf_verifier_log_type(env, struct_type, NULL);
+  
+++<<<<<<< HEAD
+ +	__btf_verifier_log(log, "\t%s type_id=%u bits_offset=%u",
+ +			   btf_name_by_offset(btf, member->name_off),
+ +			   member->type, member->offset);
+++=======
++ 	if (btf_type_kflag(struct_type))
++ 		__btf_verifier_log(log,
++ 				   "\t%s type_id=%u bitfield_size=%u bits_offset=%u",
++ 				   __btf_name_by_offset(btf, member->name_off),
++ 				   member->type,
++ 				   BTF_MEMBER_BITFIELD_SIZE(member->offset),
++ 				   BTF_MEMBER_BIT_OFFSET(member->offset));
++ 	else
++ 		__btf_verifier_log(log, "\t%s type_id=%u bits_offset=%u",
++ 				   __btf_name_by_offset(btf, member->name_off),
++ 				   member->type, member->offset);
+++>>>>>>> 9d5f9f701b18 (bpf: btf: fix struct/union/fwd types with kind_flag)
+  
+  	if (fmt && *fmt) {
+  		__btf_verifier_log(log, " ");
+diff --git a/include/uapi/linux/btf.h b/include/uapi/linux/btf.h
+index 14f66948fc95..7b7475ef2f17 100644
+--- a/include/uapi/linux/btf.h
++++ b/include/uapi/linux/btf.h
+@@ -34,7 +34,9 @@ struct btf_type {
+ 	 * bits  0-15: vlen (e.g. # of struct's members)
+ 	 * bits 16-23: unused
+ 	 * bits 24-27: kind (e.g. int, ptr, array...etc)
+-	 * bits 28-31: unused
++	 * bits 28-30: unused
++	 * bit     31: kind_flag, currently used by
++	 *             struct, union and fwd
+ 	 */
+ 	__u32 info;
+ 	/* "size" is used by INT, ENUM, STRUCT and UNION.
+@@ -52,6 +54,7 @@ struct btf_type {
+ 
+ #define BTF_INFO_KIND(info)	(((info) >> 24) & 0x0f)
+ #define BTF_INFO_VLEN(info)	((info) & 0xffff)
++#define BTF_INFO_KFLAG(info)	((info) >> 31)
+ 
+ #define BTF_KIND_UNKN		0	/* Unknown	*/
+ #define BTF_KIND_INT		1	/* Integer	*/
+@@ -110,9 +113,22 @@ struct btf_array {
+ struct btf_member {
+ 	__u32	name_off;
+ 	__u32	type;
+-	__u32	offset;	/* offset in bits */
++	/* If the type info kind_flag is set, the btf_member offset
++	 * contains both member bitfield size and bit offset. The
++	 * bitfield size is set for bitfield members. If the type
++	 * info kind_flag is not set, the offset contains only bit
++	 * offset.
++	 */
++	__u32	offset;
+ };
+ 
++/* If the struct/union type info kind_flag is set, the
++ * following two macros are used to access bitfield_size
++ * and bit_offset from btf_member.offset.
++ */
++#define BTF_MEMBER_BITFIELD_SIZE(val)	((val) >> 24)
++#define BTF_MEMBER_BIT_OFFSET(val)	((val) & 0xffffff)
++
+ /* BTF_KIND_FUNC_PROTO is followed by multiple "struct btf_param".
+  * The exact number of btf_param is stored in the vlen (of the
+  * info in "struct btf_type").
+* Unmerged path kernel/bpf/btf.c
