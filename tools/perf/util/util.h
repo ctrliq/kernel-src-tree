@@ -63,10 +63,6 @@ const char *perf_tip(const char *dirpath);
 int sched_getcpu(void);
 #endif
 
-#ifndef HAVE_SETNS_SUPPORT
-int setns(int fd, int nstype);
-#endif
-
 extern bool perf_singlethreaded;
 
 void perf_set_singlethreaded(void);
