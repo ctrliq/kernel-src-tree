@@ -2893,7 +2893,7 @@ nvkm_device_ctor(const struct nvkm_device_func *func,
 	struct nvkm_subdev *subdev;
 	u64 mmio_base, mmio_size;
 	u32 boot0, strap;
-	void __iomem *map;
+	void __iomem *map = NULL;
 	int ret = -EEXIST, i;
 	unsigned chipset;
 
@@ -2919,12 +2919,17 @@ nvkm_device_ctor(const struct nvkm_device_func *func,
 	mmio_base = device->func->resource_addr(device, 0);
 	mmio_size = device->func->resource_size(device, 0);
 
+	if (detect || mmio) {
+		map = ioremap(mmio_base, mmio_size);
+		if (map == NULL) {
+			nvdev_error(device, "unable to map PRI\n");
+			ret = -ENOMEM;
+			goto done;
+		}
+	}
+
 	/* identify the chipset, and determine classes of subdev/engines */
 	if (detect) {
-		map = ioremap(mmio_base, 0x102000);
-		if (ret = -ENOMEM, map == NULL)
-			goto done;
-
 		/* switch mmio to cpu's native endianness */
 #ifndef __BIG_ENDIAN
 		if (ioread32_native(map + 0x000004) != 0x00000000) {
@@ -2938,7 +2943,6 @@ nvkm_device_ctor(const struct nvkm_device_func *func,
 		/* read boot0 and strapping information */
 		boot0 = ioread32_native(map + 0x000000);
 		strap = ioread32_native(map + 0x101000);
-		iounmap(map);
 
 		/* chipset can be overridden for devel/testing purposes */
 		chipset = nvkm_longopt(device->cfgopt, "NvChipset", 0);
@@ -3117,12 +3121,7 @@ nvkm_device_ctor(const struct nvkm_device_func *func,
 		device->name = device->chip->name;
 
 	if (mmio) {
-		device->pri = ioremap(mmio_base, mmio_size);
-		if (!device->pri) {
-			nvdev_error(device, "unable to map PRI\n");
-			ret = -ENOMEM;
-			goto done;
-		}
+		device->pri = map;
 	}
 
 	mutex_init(&device->mutex);
@@ -3212,6 +3211,10 @@ nvkm_device_ctor(const struct nvkm_device_func *func,
 
 	ret = 0;
 done:
+	if (map && (!mmio || ret)) {
+		device->pri = NULL;
+		iounmap(map);
+	}
 	mutex_unlock(&nv_devices_mutex);
 	return ret;
 }
