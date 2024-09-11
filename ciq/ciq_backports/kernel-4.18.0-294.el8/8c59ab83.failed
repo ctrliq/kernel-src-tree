@@ -1,0 +1,213 @@
+lib/vdso: Enable common headers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vincenzo Frascino <vincenzo.frascino@arm.com>
+commit 8c59ab839f526437831ff6d1405c9a6d93f475eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8c59ab83.failed
+
+The vDSO library should only include the necessary headers required for
+a userspace library (UAPI and a minimal set of kernel headers). To make
+this possible it is necessary to isolate from the kernel headers the
+common parts that are strictly necessary to build the library.
+
+Refactor the unified vdso code to use the common headers.
+
+	Signed-off-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20200320145351.32292-26-vincenzo.frascino@arm.com
+
+(cherry picked from commit 8c59ab839f526437831ff6d1405c9a6d93f475eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/vdso/gettimeofday.c
+diff --cc lib/vdso/gettimeofday.c
+index 632c43443888,a2909af4b924..000000000000
+--- a/lib/vdso/gettimeofday.c
++++ b/lib/vdso/gettimeofday.c
+@@@ -2,32 -2,101 +2,130 @@@
+  /*
+   * Generic userspace implementations of gettimeofday() and similar.
+   */
+++<<<<<<< HEAD
+ +#include <linux/compiler.h>
+ +#include <linux/math64.h>
+ +#include <linux/time.h>
+ +#include <linux/kernel.h>
+ +#include <linux/hrtimer_defs.h>
+ +#include <vdso/datapage.h>
+ +#include <vdso/helpers.h>
+ +
+ +/*
+ + * The generic vDSO implementation requires that gettimeofday.h
+ + * provides:
+ + * - __arch_get_vdso_data(): to get the vdso datapage.
+ + * - __arch_get_hw_counter(): to get the hw counter based on the
+ + *   clock_mode.
+ + * - gettimeofday_fallback(): fallback for gettimeofday.
+ + * - clock_gettime_fallback(): fallback for clock_gettime.
+ + * - clock_getres_fallback(): fallback for clock_getres.
+ + */
+ +#ifdef ENABLE_COMPAT_VDSO
+ +#include <asm/vdso/compat_gettimeofday.h>
+ +#else
+ +#include <asm/vdso/gettimeofday.h>
+ +#endif /* ENABLE_COMPAT_VDSO */
+ +
+ +static int do_hres(const struct vdso_data *vd, clockid_t clk,
+ +		   struct __kernel_timespec *ts)
+++=======
++ #include <vdso/datapage.h>
++ #include <vdso/helpers.h>
++ 
++ #ifndef vdso_calc_delta
++ /*
++  * Default implementation which works for all sane clocksources. That
++  * obviously excludes x86/TSC.
++  */
++ static __always_inline
++ u64 vdso_calc_delta(u64 cycles, u64 last, u64 mask, u32 mult)
++ {
++ 	return ((cycles - last) & mask) * mult;
++ }
++ #endif
++ 
++ #ifndef vdso_shift_ns
++ static __always_inline u64 vdso_shift_ns(u64 ns, u32 shift)
++ {
++ 	return ns >> shift;
++ }
++ #endif
++ 
++ #ifndef __arch_vdso_hres_capable
++ static inline bool __arch_vdso_hres_capable(void)
++ {
++ 	return true;
++ }
++ #endif
++ 
++ #ifndef vdso_clocksource_ok
++ static inline bool vdso_clocksource_ok(const struct vdso_data *vd)
++ {
++ 	return vd->clock_mode != VDSO_CLOCKMODE_NONE;
++ }
++ #endif
++ 
++ #ifdef CONFIG_TIME_NS
++ static int do_hres_timens(const struct vdso_data *vdns, clockid_t clk,
++ 			  struct __kernel_timespec *ts)
++ {
++ 	const struct vdso_data *vd = __arch_get_timens_vdso_data();
++ 	const struct timens_offset *offs = &vdns->offset[clk];
++ 	const struct vdso_timestamp *vdso_ts;
++ 	u64 cycles, last, ns;
++ 	u32 seq;
++ 	s64 sec;
++ 
++ 	if (clk != CLOCK_MONOTONIC_RAW)
++ 		vd = &vd[CS_HRES_COARSE];
++ 	else
++ 		vd = &vd[CS_RAW];
++ 	vdso_ts = &vd->basetime[clk];
++ 
++ 	do {
++ 		seq = vdso_read_begin(vd);
++ 
++ 		if (unlikely(!vdso_clocksource_ok(vd)))
++ 			return -1;
++ 
++ 		cycles = __arch_get_hw_counter(vd->clock_mode);
++ 		ns = vdso_ts->nsec;
++ 		last = vd->cycle_last;
++ 		ns += vdso_calc_delta(cycles, last, vd->mask, vd->mult);
++ 		ns = vdso_shift_ns(ns, vd->shift);
++ 		sec = vdso_ts->sec;
++ 	} while (unlikely(vdso_read_retry(vd, seq)));
++ 
++ 	/* Add the namespace offset */
++ 	sec += offs->sec;
++ 	ns += offs->nsec;
++ 
++ 	/*
++ 	 * Do this outside the loop: a race inside the loop could result
++ 	 * in __iter_div_u64_rem() being extremely slow.
++ 	 */
++ 	ts->tv_sec = sec + __iter_div_u64_rem(ns, NSEC_PER_SEC, &ns);
++ 	ts->tv_nsec = ns;
++ 
++ 	return 0;
++ }
++ #else
++ static __always_inline const struct vdso_data *__arch_get_timens_vdso_data(void)
++ {
++ 	return NULL;
++ }
++ 
++ static int do_hres_timens(const struct vdso_data *vdns, clockid_t clk,
++ 			  struct __kernel_timespec *ts)
++ {
++ 	return -EINVAL;
++ }
++ #endif
++ 
++ static __always_inline int do_hres(const struct vdso_data *vd, clockid_t clk,
++ 				   struct __kernel_timespec *ts)
+++>>>>>>> 8c59ab839f52 (lib/vdso: Enable common headers)
+  {
+  	const struct vdso_timestamp *vdso_ts = &vd->basetime[clk];
+  	u64 cycles, last, sec, ns;
+diff --git a/include/vdso/datapage.h b/include/vdso/datapage.h
+index 2e302c0f41f7..62484113b313 100644
+--- a/include/vdso/datapage.h
++++ b/include/vdso/datapage.h
+@@ -4,9 +4,20 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
+-#include <linux/bits.h>
+-#include <linux/time.h>
+-#include <linux/types.h>
++#include <linux/compiler.h>
++#include <uapi/linux/time.h>
++#include <uapi/linux/types.h>
++#include <uapi/asm-generic/errno-base.h>
++
++#include <vdso/bits.h>
++#include <vdso/clocksource.h>
++#include <vdso/ktime.h>
++#include <vdso/limits.h>
++#include <vdso/math64.h>
++#include <vdso/processor.h>
++#include <vdso/time.h>
++#include <vdso/time32.h>
++#include <vdso/time64.h>
+ 
+ #define VDSO_BASES	(CLOCK_TAI + 1)
+ #define VDSO_HRES	(BIT(CLOCK_REALTIME)		| \
+@@ -84,6 +95,22 @@ struct vdso_data {
+  */
+ extern struct vdso_data _vdso_data[CS_BASES] __attribute__((visibility("hidden")));
+ 
++/*
++ * The generic vDSO implementation requires that gettimeofday.h
++ * provides:
++ * - __arch_get_vdso_data(): to get the vdso datapage.
++ * - __arch_get_hw_counter(): to get the hw counter based on the
++ *   clock_mode.
++ * - gettimeofday_fallback(): fallback for gettimeofday.
++ * - clock_gettime_fallback(): fallback for clock_gettime.
++ * - clock_getres_fallback(): fallback for clock_getres.
++ */
++#ifdef ENABLE_COMPAT_VDSO
++#include <asm/vdso/compat_gettimeofday.h>
++#else
++#include <asm/vdso/gettimeofday.h>
++#endif /* ENABLE_COMPAT_VDSO */
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* __VDSO_DATAPAGE_H */
+* Unmerged path lib/vdso/gettimeofday.c
