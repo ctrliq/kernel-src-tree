@@ -1,0 +1,174 @@
+powerpc/book3s64: Fix link stack flush on context switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [powerpc] book3s64: Fix link stack flush on context switch (Gustavo Duarte) [1777686]
+Rebuild_FUZZ: 92.31%
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit 39e72bf96f5847ba87cc5bd7a3ce0fed813dc9ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/39e72bf9.failed
+
+In commit ee13cb249fab ("powerpc/64s: Add support for software count
+cache flush"), I added support for software to flush the count
+cache (indirect branch cache) on context switch if firmware told us
+that was the required mitigation for Spectre v2.
+
+As part of that code we also added a software flush of the link
+stack (return address stack), which protects against Spectre-RSB
+between user processes.
+
+That is all correct for CPUs that activate that mitigation, which is
+currently Power9 Nimbus DD2.3.
+
+What I got wrong is that on older CPUs, where firmware has disabled
+the count cache, we also need to flush the link stack on context
+switch.
+
+To fix it we create a new feature bit which is not set by firmware,
+which tells us we need to flush the link stack. We set that when
+firmware tells us that either of the existing Spectre v2 mitigations
+are enabled.
+
+Then we adjust the patching code so that if we see that feature bit we
+enable the link stack flush. If we're also told to flush the count
+cache in software then we fall through and do that also.
+
+On the older CPUs we don't need to do do the software count cache
+flush, firmware has disabled it, so in that case we patch in an early
+return after the link stack flush.
+
+The naming of some of the functions is awkward after this patch,
+because they're called "count cache" but they also do link stack. But
+we'll fix that up in a later commit to ease backporting.
+
+This is the fix for CVE-2019-18660.
+
+	Reported-by: Anthony Steinhauser <asteinhauser@google.com>
+Fixes: ee13cb249fab ("powerpc/64s: Add support for software count cache flush")
+	Cc: stable@vger.kernel.org # v4.4+
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 39e72bf96f5847ba87cc5bd7a3ce0fed813dc9ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/asm-prototypes.h
+#	arch/powerpc/kernel/security.c
+diff --cc arch/powerpc/include/asm/asm-prototypes.h
+index 0e6f7a839bcf,3ee92f692e64..000000000000
+--- a/arch/powerpc/include/asm/asm-prototypes.h
++++ b/arch/powerpc/include/asm/asm-prototypes.h
+@@@ -141,6 -149,14 +141,17 @@@ struct kvm_vcpu
+  void _kvmppc_restore_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  void _kvmppc_save_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  
+++<<<<<<< HEAD
+++=======
++ /* Patch sites */
++ extern s32 patch__call_flush_count_cache;
++ extern s32 patch__flush_count_cache_return;
++ extern s32 patch__flush_link_stack_return;
++ extern s32 patch__memset_nocache, patch__memcpy_nocache;
++ 
++ extern long flush_count_cache;
++ 
+++>>>>>>> 39e72bf96f58 (powerpc/book3s64: Fix link stack flush on context switch)
+  #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+  void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
+  void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
+diff --cc arch/powerpc/kernel/security.c
+index d465307cccdd,a3138e7d71bb..000000000000
+--- a/arch/powerpc/kernel/security.c
++++ b/arch/powerpc/kernel/security.c
+@@@ -185,8 -222,15 +190,18 @@@ ssize_t cpu_show_spectre_v2(struct devi
+  
+  		if (count_cache_flush_type == COUNT_CACHE_FLUSH_HW)
+  			seq_buf_printf(&s, " (hardware accelerated)");
+++<<<<<<< HEAD
+ +	} else
+++=======
++ 
++ 		if (link_stack_flush_enabled)
++ 			seq_buf_printf(&s, ", Software link stack flush");
++ 
++ 	} else if (btb_flush_enabled) {
++ 		seq_buf_printf(&s, "Mitigation: Branch predictor state flush");
++ 	} else {
+++>>>>>>> 39e72bf96f58 (powerpc/book3s64: Fix link stack flush on context switch)
+  		seq_buf_printf(&s, "Vulnerable");
+ -	}
+  
+  	seq_buf_printf(&s, "\n");
+  
+@@@ -366,7 -433,26 +403,30 @@@ static void toggle_count_cache_flush(bo
+  
+  void setup_count_cache_flush(void)
+  {
+++<<<<<<< HEAD
+ +	toggle_count_cache_flush(true);
+++=======
++ 	bool enable = true;
++ 
++ 	if (no_spectrev2 || cpu_mitigations_off()) {
++ 		if (security_ftr_enabled(SEC_FTR_BCCTRL_SERIALISED) ||
++ 		    security_ftr_enabled(SEC_FTR_COUNT_CACHE_DISABLED))
++ 			pr_warn("Spectre v2 mitigations not fully under software control, can't disable\n");
++ 
++ 		enable = false;
++ 	}
++ 
++ 	/*
++ 	 * There's no firmware feature flag/hypervisor bit to tell us we need to
++ 	 * flush the link stack on context switch. So we set it here if we see
++ 	 * either of the Spectre v2 mitigations that aim to protect userspace.
++ 	 */
++ 	if (security_ftr_enabled(SEC_FTR_COUNT_CACHE_DISABLED) ||
++ 	    security_ftr_enabled(SEC_FTR_FLUSH_COUNT_CACHE))
++ 		security_ftr_set(SEC_FTR_FLUSH_LINK_STACK);
++ 
++ 	toggle_count_cache_flush(enable);
+++>>>>>>> 39e72bf96f58 (powerpc/book3s64: Fix link stack flush on context switch)
+  }
+  
+  #ifdef CONFIG_DEBUG_FS
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+diff --git a/arch/powerpc/include/asm/security_features.h b/arch/powerpc/include/asm/security_features.h
+index 759597bf0fd8..ccf44c135389 100644
+--- a/arch/powerpc/include/asm/security_features.h
++++ b/arch/powerpc/include/asm/security_features.h
+@@ -81,6 +81,9 @@ static inline bool security_ftr_enabled(unsigned long feature)
+ // Software required to flush count cache on context switch
+ #define SEC_FTR_FLUSH_COUNT_CACHE	0x0000000000000400ull
+ 
++// Software required to flush link stack on context switch
++#define SEC_FTR_FLUSH_LINK_STACK	0x0000000000001000ull
++
+ 
+ // Features enabled by default
+ #define SEC_FTR_DEFAULT \
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 1c0602ebf8b6..c978aff671d9 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -526,6 +526,7 @@ flush_count_cache:
+ 	/* Save LR into r9 */
+ 	mflr	r9
+ 
++	// Flush the link stack
+ 	.rept 64
+ 	bl	.+4
+ 	.endr
+@@ -535,6 +536,11 @@ flush_count_cache:
+ 	.balign 32
+ 	/* Restore LR */
+ 1:	mtlr	r9
++
++	// If we're just flushing the link stack, return here
++3:	nop
++	patch_site 3b patch__flush_link_stack_return
++
+ 	li	r9,0x7fff
+ 	mtctr	r9
+ 
+* Unmerged path arch/powerpc/kernel/security.c
