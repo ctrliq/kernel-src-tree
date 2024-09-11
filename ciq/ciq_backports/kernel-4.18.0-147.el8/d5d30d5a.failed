@@ -1,0 +1,151 @@
+libnvdimm/dimm: Add a no-BLK quirk based on NVDIMM family
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit d5d30d5a5c60628de5e77e3f292a8f9012d51350
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d5d30d5a.failed
+
+As Dexuan reports the NVDIMM_FAMILY_HYPERV platform is incompatible with
+the existing Linux namespace implementation because it uses
+NSLABEL_FLAG_LOCAL for x1-width PMEM interleave sets. Quirk it as an
+platform / DIMM that does not provide BLK-aperture access. Allow the
+libnvdimm core to assume no potential for aliasing. In case other
+implementations make the same mistake, provide a "noblk" module
+parameter to force-enable the quirk.
+
+Link: https://lkml.kernel.org/r/PU1P153MB0169977604493B82B662A01CBF920@PU1P153MB0169.APCP153.PROD.OUTLOOK.COM
+	Reported-by: Dexuan Cui <decui@microsoft.com>
+	Tested-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit d5d30d5a5c60628de5e77e3f292a8f9012d51350)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/libnvdimm.h
+diff --cc include/linux/libnvdimm.h
+index c0e66496e33c,7da406ae3a2b..000000000000
+--- a/include/linux/libnvdimm.h
++++ b/include/linux/libnvdimm.h
+@@@ -38,6 -38,12 +38,15 @@@ enum 
+  	NDD_UNARMED = 1,
+  	/* locked memory devices should not be accessed */
+  	NDD_LOCKED = 2,
+++<<<<<<< HEAD
+++=======
++ 	/* memory under security wipes should not be accessed */
++ 	NDD_SECURITY_OVERWRITE = 3,
++ 	/*  tracking whether or not there is a pending device reference */
++ 	NDD_WORK_PENDING = 4,
++ 	/* ignore / filter NSLABEL_FLAG_LOCAL for this DIMM, i.e. no aliasing */
++ 	NDD_NOBLK = 5,
+++>>>>>>> d5d30d5a5c60 (libnvdimm/dimm: Add a no-BLK quirk based on NVDIMM family)
+  
+  	/* need to set a limit somewhere, but yes, this is likely overkill */
+  	ND_IOCTL_MAX_BUFLEN = SZ_4M,
+diff --git a/drivers/acpi/nfit/core.c b/drivers/acpi/nfit/core.c
+index 4f8661a52924..46f0eb0e1749 100644
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@ -2013,6 +2013,10 @@ static int acpi_nfit_register_dimms(struct acpi_nfit_desc *acpi_desc)
+ 			cmd_mask |= nfit_mem->dsm_mask & NVDIMM_STANDARD_CMDMASK;
+ 		}
+ 
++		/* Quirk to ignore LOCAL for labels on HYPERV DIMMs */
++		if (nfit_mem->family == NVDIMM_FAMILY_HYPERV)
++			set_bit(NDD_NOBLK, &flags);
++
+ 		if (test_bit(NFIT_MEM_LSR, &nfit_mem->flags)) {
+ 			set_bit(ND_CMD_GET_CONFIG_SIZE, &cmd_mask);
+ 			set_bit(ND_CMD_GET_CONFIG_DATA, &cmd_mask);
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 508dd405f84f..c8ffc8c163e5 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -11,6 +11,7 @@
+  * General Public License for more details.
+  */
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#include <linux/moduleparam.h>
+ #include <linux/vmalloc.h>
+ #include <linux/device.h>
+ #include <linux/ndctl.h>
+@@ -25,6 +26,10 @@
+ 
+ static DEFINE_IDA(dimm_ida);
+ 
++static bool noblk;
++module_param(noblk, bool, 0444);
++MODULE_PARM_DESC(noblk, "force disable BLK / local alias support");
++
+ /*
+  * Retrieve bus and dimm handle and return if this bus supports
+  * get_config_data commands
+@@ -402,6 +407,8 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 
+ 	nvdimm->dimm_id = dimm_id;
+ 	nvdimm->provider_data = provider_data;
++	if (noblk)
++		flags |= 1 << NDD_NOBLK;
+ 	nvdimm->flags = flags;
+ 	nvdimm->cmd_mask = cmd_mask;
+ 	nvdimm->num_flush = num_flush;
+diff --git a/drivers/nvdimm/label.c b/drivers/nvdimm/label.c
+index 6d6e9a12150b..f3d753d3169c 100644
+--- a/drivers/nvdimm/label.c
++++ b/drivers/nvdimm/label.c
+@@ -392,6 +392,7 @@ int nd_label_reserve_dpa(struct nvdimm_drvdata *ndd)
+ 		return 0; /* no label, nothing to reserve */
+ 
+ 	for_each_clear_bit_le(slot, free, nslot) {
++		struct nvdimm *nvdimm = to_nvdimm(ndd->dev);
+ 		struct nd_namespace_label *nd_label;
+ 		struct nd_region *nd_region = NULL;
+ 		u8 label_uuid[NSLABEL_UUID_LEN];
+@@ -406,6 +407,8 @@ int nd_label_reserve_dpa(struct nvdimm_drvdata *ndd)
+ 
+ 		memcpy(label_uuid, nd_label->uuid, NSLABEL_UUID_LEN);
+ 		flags = __le32_to_cpu(nd_label->flags);
++		if (test_bit(NDD_NOBLK, &nvdimm->flags))
++			flags &= ~NSLABEL_FLAG_LOCAL;
+ 		nd_label_gen_id(&label_id, label_uuid, flags);
+ 		res = nvdimm_allocate_dpa(ndd, &label_id,
+ 				__le64_to_cpu(nd_label->dpa),
+diff --git a/drivers/nvdimm/namespace_devs.c b/drivers/nvdimm/namespace_devs.c
+index 57cb0962daf6..080a56d20c3f 100644
+--- a/drivers/nvdimm/namespace_devs.c
++++ b/drivers/nvdimm/namespace_devs.c
+@@ -2469,6 +2469,12 @@ static int init_active_labels(struct nd_region *nd_region)
+ 			if (!label_ent)
+ 				break;
+ 			label = nd_label_active(ndd, j);
++			if (test_bit(NDD_NOBLK, &nvdimm->flags)) {
++				u32 flags = __le32_to_cpu(label->flags);
++
++				flags &= ~NSLABEL_FLAG_LOCAL;
++				label->flags = __cpu_to_le32(flags);
++			}
+ 			label_ent->label = label;
+ 
+ 			mutex_lock(&nd_mapping->lock);
+diff --git a/drivers/nvdimm/region_devs.c b/drivers/nvdimm/region_devs.c
+index e7377f1028ef..07d0293b0c28 100644
+--- a/drivers/nvdimm/region_devs.c
++++ b/drivers/nvdimm/region_devs.c
+@@ -998,6 +998,13 @@ static struct nd_region *nd_region_create(struct nvdimm_bus *nvdimm_bus,
+ 
+ 		if (test_bit(NDD_UNARMED, &nvdimm->flags))
+ 			ro = 1;
++
++		if (test_bit(NDD_NOBLK, &nvdimm->flags)
++				&& dev_type == &nd_blk_device_type) {
++			dev_err(&nvdimm_bus->dev, "%s: %s mapping%d is not BLK capable\n",
++					caller, dev_name(&nvdimm->dev), i);
++			return NULL;
++		}
+ 	}
+ 
+ 	if (dev_type == &nd_blk_device_type) {
+* Unmerged path include/linux/libnvdimm.h
