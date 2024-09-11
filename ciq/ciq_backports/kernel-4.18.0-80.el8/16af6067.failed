@@ -1,0 +1,90 @@
+net: sched: implement reference counted action release
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: implement reference counted action release (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 95.15%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 16af6067392c40e454e49eec834843ab03643d96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/16af6067.failed
+
+Implement helper delete function that uses new action ops 'delete', instead
+of destroying action directly. This is required so act API could delete
+actions by index, without holding any references to action that is being
+deleted.
+
+Implement function __tcf_action_put() that releases reference to action and
+frees it, if necessary. Refactor action deletion code to use new put
+function and not to rely on rtnl lock. Remove rtnl lock assertions that are
+no longer needed.
+
+	Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 16af6067392c40e454e49eec834843ab03643d96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index d445f144d9dc,a023873db713..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -103,21 -123,24 +123,40 @@@ int __tcf_idr_release(struct tc_action 
+  {
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	ASSERT_RTNL();
+ +
+ +	if (p) {
+ +		if (bind)
+ +			p->tcfa_bindcnt--;
+ +		else if (strict && p->tcfa_bindcnt > 0)
+ +			return -EPERM;
+ +
+ +		p->tcfa_refcnt--;
+ +		if (p->tcfa_bindcnt <= 0 && p->tcfa_refcnt <= 0) {
+ +			if (p->ops->cleanup)
+ +				p->ops->cleanup(p);
+ +			tcf_idr_remove(p->idrinfo, p);
+++=======
++ 	/* Release with strict==1 and bind==0 is only called through act API
++ 	 * interface (classifiers always bind). Only case when action with
++ 	 * positive reference count and zero bind count can exist is when it was
++ 	 * also created with act API (unbinding last classifier will destroy the
++ 	 * action if it was created by classifier). So only case when bind count
++ 	 * can be changed after initial check is when unbound action is
++ 	 * destroyed by act API while classifier binds to action with same id
++ 	 * concurrently. This result either creation of new action(same behavior
++ 	 * as before), or reusing existing action if concurrent process
++ 	 * increments reference count before action is deleted. Both scenarios
++ 	 * are acceptable.
++ 	 */
++ 	if (p) {
++ 		if (!bind && strict && atomic_read(&p->tcfa_bindcnt) > 0)
++ 			return -EPERM;
++ 
++ 		if (__tcf_action_put(p, bind))
+++>>>>>>> 16af6067392c (net: sched: implement reference counted action release)
+  			ret = ACT_P_DELETED;
+- 		}
+  	}
+  
+  	return ret;
+* Unmerged path net/sched/act_api.c
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 5f21c8808404..8e63021cb457 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -1611,7 +1611,6 @@ void tcf_exts_destroy(struct tcf_exts *exts)
+ #ifdef CONFIG_NET_CLS_ACT
+ 	LIST_HEAD(actions);
+ 
+-	ASSERT_RTNL();
+ 	tcf_exts_to_list(exts, &actions);
+ 	tcf_action_destroy(&actions, TCA_ACT_UNBIND);
+ 	kfree(exts->actions);
