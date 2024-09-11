@@ -9,6 +9,8 @@ TEST_PROGS := mptcp_connect.sh pm_netlink.sh mptcp_join.sh
 
 TEST_GEN_FILES = mptcp_connect pm_nl_ctl
 
+TEST_FILES := settings
+
 EXTRA_CLEAN := *.pcap
 
 include ../../lib.mk
