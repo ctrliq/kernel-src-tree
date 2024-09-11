@@ -1,0 +1,300 @@
+mm/hmm: remove the page_shift member from struct hmm_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7f08263d9bc6627382da14f9e81d643d0329d5d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/7f08263d.failed
+
+All users pass PAGE_SIZE here, and if we wanted to support single entries
+for huge pages we should really just add a HMM_FAULT_HUGEPAGE flag instead
+that uses the huge page size instead of having the caller calculate that
+size once, just for the hmm code to verify it.
+
+Link: https://lore.kernel.org/r/20190806160554.14046-8-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 7f08263d9bc6627382da14f9e81d643d0329d5d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+#	drivers/gpu/drm/nouveau/nouveau_svm.c
+#	mm/hmm.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index b7fd0cdffce0,8bf79288c4e2..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@@ -936,46 -812,43 +936,57 @@@ int amdgpu_ttm_tt_get_user_pages(struc
+  		goto out_free_ranges;
+  	}
+  
+++<<<<<<< HEAD
+ +	mmap_read_lock(mm);
+ +	vma = find_vma(mm, start);
+ +	if (unlikely(!vma || start < vma->vm_start)) {
+ +		r = -EFAULT;
+ +		goto out_unlock;
+ +	}
+ +	if (unlikely((gtt->userflags & AMDGPU_GEM_USERPTR_ANONONLY) &&
+ +		vma->vm_file)) {
+ +		r = -EPERM;
+ +		goto out_unlock;
+ +	}
+ +	mmap_read_unlock(mm);
+ +	timeout = jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+++=======
++ 	amdgpu_hmm_init_range(range);
++ 	range->default_flags = range->flags[HMM_PFN_VALID];
++ 	range->default_flags |= amdgpu_ttm_tt_is_readonly(ttm) ?
++ 				0 : range->flags[HMM_PFN_WRITE];
++ 	range->pfn_flags_mask = 0;
++ 	range->pfns = pfns;
++ 	range->start = start;
++ 	range->end = start + ttm->num_pages * PAGE_SIZE;
+++>>>>>>> 7f08263d9bc6 (mm/hmm: remove the page_shift member from struct hmm_range)
+  
+ -	hmm_range_register(range, mirror);
+ -
+ -	/*
+ -	 * Just wait for range to be valid, safe to ignore return value as we
+ -	 * will use the return value of hmm_range_fault() below under the
+ -	 * mmap_sem to ascertain the validity of the range.
+ -	 */
+ -	hmm_range_wait_until_valid(range, HMM_RANGE_DEFAULT_TIMEOUT);
+ -
+ -	down_read(&mm->mmap_sem);
+ -	r = hmm_range_fault(range, 0);
+ -	up_read(&mm->mmap_sem);
+ +retry:
+ +	range->notifier_seq = mmu_interval_read_begin(&bo->notifier);
+  
+ -	if (unlikely(r < 0))
+ +	mmap_read_lock(mm);
+ +	r = hmm_range_fault(range);
+ +	mmap_read_unlock(mm);
+ +	if (unlikely(r)) {
+ +		/*
+ +		 * FIXME: This timeout should encompass the retry from
+ +		 * mmu_interval_read_retry() as well.
+ +		 */
+ +		if (r == -EBUSY && !time_after(jiffies, timeout))
+ +			goto retry;
+  		goto out_free_pfns;
+ -
+ -	for (i = 0; i < ttm->num_pages; i++) {
+ -		pages[i] = hmm_device_entry_to_page(range, pfns[i]);
+ -		if (unlikely(!pages[i])) {
+ -			pr_err("Page fault failed for pfn[%lu] = 0x%llx\n",
+ -			       i, pfns[i]);
+ -			r = -ENOMEM;
+ -
+ -			goto out_free_pfns;
+ -		}
+  	}
+  
+ +	/*
+ +	 * Due to default_flags, all pages are HMM_PFN_VALID or
+ +	 * hmm_range_fault() fails. FIXME: The pages cannot be touched outside
+ +	 * the notifier_lock, and mmu_interval_read_retry() must be done first.
+ +	 */
+ +	for (i = 0; i < ttm->num_pages; i++)
+ +		pages[i] = hmm_pfn_to_page(range->hmm_pfns[i]);
+ +
+  	gtt->range = range;
+ +	mmput(mm);
+  
+  	return 0;
+  
+diff --cc drivers/gpu/drm/nouveau/nouveau_svm.c
+index 4f69e4c3dafd,668d4bd0c118..000000000000
+--- a/drivers/gpu/drm/nouveau/nouveau_svm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_svm.c
+@@@ -741,29 -654,76 +741,72 @@@ nouveau_svm_fault(struct nvif_notify *n
+  			 *
+  			 * ie. WRITE faults appear first, thus any handling of
+  			 * pending READ faults will already be satisfied.
+ +			 * But if a large page is mapped, make sure subsequent
+ +			 * fault addresses have sufficient access permission.
+  			 */
+ -			while (++fn < buffer->fault_nr &&
+ -			       buffer->fault[fn]->svmm == svmm &&
+ -			       buffer->fault[fn    ]->addr ==
+ -			       buffer->fault[fn - 1]->addr);
+ -
+ -			/* If the next fault is outside the window, or all GPU
+ -			 * faults have been dealt with, we're done here.
+ -			 */
+ -			if (fn >= buffer->fault_nr ||
+ -			    buffer->fault[fn]->svmm != svmm ||
+ -			    buffer->fault[fn]->addr >= limit)
+ +			if (buffer->fault[fn]->svmm != svmm ||
+ +			    buffer->fault[fn]->addr >= limit ||
+ +			    (buffer->fault[fi]->access == 0 /* READ. */ &&
+ +			     !(args.phys[0] & NVIF_VMM_PFNMAP_V0_V)) ||
+ +			    (buffer->fault[fi]->access != 0 /* READ. */ &&
+ +			     buffer->fault[fi]->access != 3 /* PREFETCH. */ &&
+ +			     !(args.phys[0] & NVIF_VMM_PFNMAP_V0_W)))
+  				break;
+ -
+ -			/* Fill in the gap between this fault and the next. */
+ -			fill = (buffer->fault[fn    ]->addr -
+ -				buffer->fault[fn - 1]->addr) >> PAGE_SHIFT;
+ -			while (--fill)
+ -				args.phys[pi++] = NVIF_VMM_PFNMAP_V0_NONE;
+  		}
+  
+ -		SVMM_DBG(svmm, "wndw %016llx-%016llx covering %d fault(s)",
+ -			 args.i.p.addr,
+ -			 args.i.p.addr + args.i.p.size, fn - fi);
+ +		/* If handling failed completely, cancel all faults. */
+ +		if (ret) {
+ +			while (fi < fn) {
+ +				struct nouveau_svm_fault *fault =
+ +					buffer->fault[fi++];
+  
+++<<<<<<< HEAD
+++=======
++ 		/* Have HMM fault pages within the fault window to the GPU. */
++ 		range.start = args.i.p.addr;
++ 		range.end = args.i.p.addr + args.i.p.size;
++ 		range.pfns = args.phys;
++ 		range.flags = nouveau_svm_pfn_flags;
++ 		range.values = nouveau_svm_pfn_values;
++ 		range.pfn_shift = NVIF_VMM_PFNMAP_V0_ADDR_SHIFT;
++ again:
++ 		ret = nouveau_range_fault(svmm, &range);
++ 		if (ret == 0) {
++ 			mutex_lock(&svmm->mutex);
++ 			if (!nouveau_range_done(&range)) {
++ 				mutex_unlock(&svmm->mutex);
++ 				goto again;
++ 			}
++ 
++ 			nouveau_dmem_convert_pfn(svm->drm, &range);
++ 
++ 			svmm->vmm->vmm.object.client->super = true;
++ 			ret = nvif_object_ioctl(&svmm->vmm->vmm.object,
++ 						&args, sizeof(args.i) +
++ 						pi * sizeof(args.phys[0]),
++ 						NULL);
++ 			svmm->vmm->vmm.object.client->super = false;
++ 			mutex_unlock(&svmm->mutex);
++ 			up_read(&svmm->mm->mmap_sem);
++ 		}
++ 
++ 		/* Cancel any faults in the window whose pages didn't manage
++ 		 * to keep their valid bit, or stay writeable when required.
++ 		 *
++ 		 * If handling failed completely, cancel all faults.
++ 		 */
++ 		while (fi < fn) {
++ 			struct nouveau_svm_fault *fault = buffer->fault[fi++];
++ 			pi = (fault->addr - range.start) >> PAGE_SHIFT;
++ 			if (ret ||
++ 			     !(range.pfns[pi] & NVIF_VMM_PFNMAP_V0_V) ||
++ 			    (!(range.pfns[pi] & NVIF_VMM_PFNMAP_V0_W) &&
++ 			     fault->access != 0 && fault->access != 3)) {
+++>>>>>>> 7f08263d9bc6 (mm/hmm: remove the page_shift member from struct hmm_range)
+  				nouveau_svm_fault_cancel_fault(svm, fault);
+ -				continue;
+  			}
+ +		} else
+  			replay++;
+ -		}
+  	}
+  
+  	/* Issue fault replay to the GPU. */
+diff --cc mm/hmm.c
+index fc893fc2d462,9e0052e037fe..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -894,28 -842,19 +881,35 @@@ static void hmm_pfns_clear(struct hmm_r
+   *
+   * Track updates to the CPU page table see include/linux/hmm.h
+   */
+ -int hmm_range_register(struct hmm_range *range, struct hmm_mirror *mirror)
+ +int hmm_range_register(struct hmm_range *range,
+ +		       struct hmm_mirror *mirror,
+ +		       unsigned long start,
+ +		       unsigned long end,
+ +		       unsigned page_shift)
+  {
+++<<<<<<< HEAD
+ +	unsigned long mask = ((1UL << page_shift) - 1UL);
+++=======
+++>>>>>>> 7f08263d9bc6 (mm/hmm: remove the page_shift member from struct hmm_range)
+  	struct hmm *hmm = mirror->hmm;
+  	unsigned long flags;
+  
+  	range->valid = false;
+  	range->hmm = NULL;
+  
+++<<<<<<< HEAD
+ +	if ((start & mask) || (end & mask))
+++=======
++ 	if ((range->start & (PAGE_SIZE - 1)) || (range->end & (PAGE_SIZE - 1)))
+++>>>>>>> 7f08263d9bc6 (mm/hmm: remove the page_shift member from struct hmm_range)
+  		return -EINVAL;
+ -	if (range->start >= range->end)
+ +	if (start >= end)
+  		return -EINVAL;
+  
+ +	range->page_shift = page_shift;
+ +	range->start = start;
+ +	range->end = end;
+ +
+  	/* Prevent hmm_release() from running while the range is valid */
+  	if (!mmget_not_zero(hmm->mm))
+  		return -EFAULT;
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+* Unmerged path drivers/gpu/drm/nouveau/nouveau_svm.c
+diff --git a/include/linux/hmm.h b/include/linux/hmm.h
+index 6a8157d67186..74de24ed3d01 100644
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@ -176,7 +176,6 @@ enum hmm_pfn_value_e {
+  * @values: pfn value for some special case (none, special, error, ...)
+  * @default_flags: default flags for the range (write, read, ... see hmm doc)
+  * @pfn_flags_mask: allows to mask pfn flags so that only default_flags matter
+- * @page_shift: device virtual address shift value (should be >= PAGE_SHIFT)
+  * @pfn_shifts: pfn shift value (should be <= PAGE_SHIFT)
+  * @valid: pfns array did not change since it has been fill by an HMM function
+  */
+@@ -191,31 +190,10 @@ struct hmm_range {
+ 	const uint64_t		*values;
+ 	uint64_t		default_flags;
+ 	uint64_t		pfn_flags_mask;
+-	uint8_t			page_shift;
+ 	uint8_t			pfn_shift;
+ 	bool			valid;
+ };
+ 
+-/*
+- * hmm_range_page_shift() - return the page shift for the range
+- * @range: range being queried
+- * Return: page shift (page size = 1 << page shift) for the range
+- */
+-static inline unsigned hmm_range_page_shift(const struct hmm_range *range)
+-{
+-	return range->page_shift;
+-}
+-
+-/*
+- * hmm_range_page_size() - return the page size for the range
+- * @range: range being queried
+- * Return: page size for the range in bytes
+- */
+-static inline unsigned long hmm_range_page_size(const struct hmm_range *range)
+-{
+-	return 1UL << hmm_range_page_shift(range);
+-}
+-
+ /*
+  * hmm_range_wait_until_valid() - wait for range to be valid
+  * @range: range affected by invalidation to wait on
+* Unmerged path mm/hmm.c
