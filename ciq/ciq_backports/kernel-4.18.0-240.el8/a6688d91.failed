@@ -1,0 +1,157 @@
+net/smc: enqueue all received LLC messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit a6688d919b220bd714948e03bb3caa8a66895005
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a6688d91.failed
+
+Introduce smc_llc_enqueue() to enqueue LLC messages, and adapt
+smc_llc_rx_handler() to enqueue all received LLC messages.
+smc_llc_enqueue() also makes it possible to enqueue LLC messages from
+local code.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6688d919b220bd714948e03bb3caa8a66895005)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_llc.c
+diff --cc net/smc/smc_llc.c
+index 4119cdb6b6bf,a146b3b43580..000000000000
+--- a/net/smc/smc_llc.c
++++ b/net/smc/smc_llc.c
+@@@ -588,6 -684,125 +588,128 @@@ static void smc_llc_rx_handler(struct i
+  		smc_llc_rx_delete_rkey(link, &llc->delete_rkey);
+  		break;
+  	}
+++<<<<<<< HEAD
+++=======
++ out:
++ 	kfree(qentry);
++ }
++ 
++ /* worker to process llc messages on the event queue */
++ static void smc_llc_event_work(struct work_struct *work)
++ {
++ 	struct smc_link_group *lgr = container_of(work, struct smc_link_group,
++ 						  llc_event_work);
++ 	struct smc_llc_qentry *qentry;
++ 
++ 	if (!lgr->llc_flow_lcl.type && lgr->delayed_event) {
++ 		if (smc_link_usable(lgr->delayed_event->link)) {
++ 			smc_llc_event_handler(lgr->delayed_event);
++ 		} else {
++ 			qentry = lgr->delayed_event;
++ 			lgr->delayed_event = NULL;
++ 			kfree(qentry);
++ 		}
++ 	}
++ 
++ again:
++ 	spin_lock_bh(&lgr->llc_event_q_lock);
++ 	if (!list_empty(&lgr->llc_event_q)) {
++ 		qentry = list_first_entry(&lgr->llc_event_q,
++ 					  struct smc_llc_qentry, list);
++ 		list_del_init(&qentry->list);
++ 		spin_unlock_bh(&lgr->llc_event_q_lock);
++ 		smc_llc_event_handler(qentry);
++ 		goto again;
++ 	}
++ 	spin_unlock_bh(&lgr->llc_event_q_lock);
++ }
++ 
++ /* process llc responses in tasklet context */
++ static void smc_llc_rx_response(struct smc_link *link,
++ 				struct smc_llc_qentry *qentry)
++ {
++ 	u8 llc_type = qentry->msg.raw.hdr.common.type;
++ 	union smc_llc_msg *llc = &qentry->msg;
++ 	int rc = 0;
++ 
++ 	switch (llc_type) {
++ 	case SMC_LLC_TEST_LINK:
++ 		if (link->state == SMC_LNK_ACTIVE)
++ 			complete(&link->llc_testlink_resp);
++ 		break;
++ 	case SMC_LLC_CONFIRM_LINK:
++ 		if (!(llc->raw.hdr.flags & SMC_LLC_FLAG_NO_RMBE_EYEC))
++ 			rc = ENOTSUPP;
++ 		if (link->lgr->role == SMC_SERV &&
++ 		    link->state == SMC_LNK_ACTIVATING) {
++ 			link->llc_confirm_resp_rc = rc;
++ 			complete(&link->llc_confirm_resp);
++ 		}
++ 		break;
++ 	case SMC_LLC_ADD_LINK:
++ 		if (link->state == SMC_LNK_ACTIVATING)
++ 			complete(&link->llc_add_resp);
++ 		break;
++ 	case SMC_LLC_DELETE_LINK:
++ 		if (link->lgr->role == SMC_SERV)
++ 			smc_lgr_schedule_free_work_fast(link->lgr);
++ 		break;
++ 	case SMC_LLC_CONFIRM_RKEY:
++ 		link->llc_confirm_rkey_resp_rc = llc->raw.hdr.flags &
++ 						 SMC_LLC_FLAG_RKEY_NEG;
++ 		complete(&link->llc_confirm_rkey_resp);
++ 		break;
++ 	case SMC_LLC_CONFIRM_RKEY_CONT:
++ 		/* unused as long as we don't send this type of msg */
++ 		break;
++ 	case SMC_LLC_DELETE_RKEY:
++ 		link->llc_delete_rkey_resp_rc = llc->raw.hdr.flags &
++ 						SMC_LLC_FLAG_RKEY_NEG;
++ 		complete(&link->llc_delete_rkey_resp);
++ 		break;
++ 	}
++ 	kfree(qentry);
++ }
++ 
++ static void smc_llc_enqueue(struct smc_link *link, union smc_llc_msg *llc)
++ {
++ 	struct smc_link_group *lgr = link->lgr;
++ 	struct smc_llc_qentry *qentry;
++ 	unsigned long flags;
++ 
++ 	qentry = kmalloc(sizeof(*qentry), GFP_ATOMIC);
++ 	if (!qentry)
++ 		return;
++ 	qentry->link = link;
++ 	INIT_LIST_HEAD(&qentry->list);
++ 	memcpy(&qentry->msg, llc, sizeof(union smc_llc_msg));
++ 
++ 	/* process responses immediately */
++ 	if (llc->raw.hdr.flags & SMC_LLC_FLAG_RESP) {
++ 		smc_llc_rx_response(link, qentry);
++ 		return;
++ 	}
++ 
++ 	/* add requests to event queue */
++ 	spin_lock_irqsave(&lgr->llc_event_q_lock, flags);
++ 	list_add_tail(&qentry->list, &lgr->llc_event_q);
++ 	spin_unlock_irqrestore(&lgr->llc_event_q_lock, flags);
++ 	schedule_work(&link->lgr->llc_event_work);
+++>>>>>>> a6688d919b22 (net/smc: enqueue all received LLC messages)
++ }
++ 
++ /* copy received msg and add it to the event queue */
++ static void smc_llc_rx_handler(struct ib_wc *wc, void *buf)
++ {
++ 	struct smc_link *link = (struct smc_link *)wc->qp->qp_context;
++ 	union smc_llc_msg *llc = buf;
++ 
++ 	if (wc->byte_len < sizeof(*llc))
++ 		return; /* short message */
++ 	if (llc->raw.hdr.length != sizeof(*llc))
++ 		return; /* invalid message */
++ 
++ 	smc_llc_enqueue(link, llc);
+  }
+  
+  /***************************** worker, utils *********************************/
+* Unmerged path net/smc/smc_llc.c
