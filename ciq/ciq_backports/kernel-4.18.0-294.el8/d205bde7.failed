@@ -1,0 +1,182 @@
+null_blk: Cleanup zoned device initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit d205bde78fa53e1ce256b1f7f65ede9696d73ee5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d205bde7.failed
+
+Move all zoned mode related code from null_blk_main.c to
+null_blk_zoned.c, avoiding an ugly #ifdef in the process.
+Rename null_zone_init() into null_init_zoned_dev(), null_zone_exit()
+into null_free_zoned_dev() and add the new function
+null_register_zoned_dev() to finalize the zoned dev setup before
+add_disk().
+
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d205bde78fa53e1ce256b1f7f65ede9696d73ee5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/null_blk.h
+diff --cc drivers/block/null_blk.h
+index 0881d6a9b73a,81b311c9d781..000000000000
+--- a/drivers/block/null_blk.h
++++ b/drivers/block/null_blk.h
+@@@ -85,14 -85,19 +85,15 @@@ struct nullb 
+  	char disk_name[DISK_NAME_LEN];
+  };
+  
+ -blk_status_t null_process_cmd(struct nullb_cmd *cmd,
+ -			      enum req_opf op, sector_t sector,
+ -			      unsigned int nr_sectors);
+ -
+  #ifdef CONFIG_BLK_DEV_ZONED
+- int null_zone_init(struct nullb_device *dev);
+- void null_zone_exit(struct nullb_device *dev);
++ int null_init_zoned_dev(struct nullb_device *dev, struct request_queue *q);
++ int null_register_zoned_dev(struct nullb *nullb);
++ void null_free_zoned_dev(struct nullb_device *dev);
+  int null_report_zones(struct gendisk *disk, sector_t sector,
+  		      unsigned int nr_zones, report_zones_cb cb, void *data);
+ -blk_status_t null_process_zoned_cmd(struct nullb_cmd *cmd,
+ -				    enum req_opf op, sector_t sector,
+ -				    sector_t nr_sectors);
+ +blk_status_t null_handle_zoned(struct nullb_cmd *cmd,
+ +			       enum req_opf op, sector_t sector,
+ +			       sector_t nr_sectors);
+  size_t null_zone_valid_read_len(struct nullb *nullb,
+  				sector_t sector, unsigned int len);
+  #else
+@@@ -101,10 -107,13 +103,20 @@@ static inline int null_init_zoned_dev(s
+  	pr_err("CONFIG_BLK_DEV_ZONED not enabled\n");
+  	return -EINVAL;
+  }
+++<<<<<<< HEAD
+ +static inline void null_zone_exit(struct nullb_device *dev) {}
+ +static inline blk_status_t null_handle_zoned(struct nullb_cmd *cmd,
+ +					     enum req_opf op, sector_t sector,
+ +					     sector_t nr_sectors)
+++=======
++ static inline int null_register_zoned_dev(struct nullb *nullb)
++ {
++ 	return -ENODEV;
++ }
++ static inline void null_free_zoned_dev(struct nullb_device *dev) {}
++ static inline blk_status_t null_process_zoned_cmd(struct nullb_cmd *cmd,
++ 			enum req_opf op, sector_t sector, sector_t nr_sectors)
+++>>>>>>> d205bde78fa5 (null_blk: Cleanup zoned device initialization)
+  {
+  	return BLK_STS_NOTSUPP;
+  }
+* Unmerged path drivers/block/null_blk.h
+diff --git a/drivers/block/null_blk_main.c b/drivers/block/null_blk_main.c
+index d95264dae84e..f39024062203 100644
+--- a/drivers/block/null_blk_main.c
++++ b/drivers/block/null_blk_main.c
+@@ -579,7 +579,7 @@ static void null_free_dev(struct nullb_device *dev)
+ 	if (!dev)
+ 		return;
+ 
+-	null_zone_exit(dev);
++	null_free_zoned_dev(dev);
+ 	badblocks_exit(&dev->badblocks);
+ 	kfree(dev);
+ }
+@@ -1604,19 +1604,12 @@ static int null_gendisk_register(struct nullb *nullb)
+ 	disk->queue		= nullb->q;
+ 	strncpy(disk->disk_name, nullb->disk_name, DISK_NAME_LEN);
+ 
+-#ifdef CONFIG_BLK_DEV_ZONED
+ 	if (nullb->dev->zoned) {
+-		if (queue_is_mq(nullb->q)) {
+-			int ret = blk_revalidate_disk_zones(disk);
+-			if (ret)
+-				return ret;
+-		} else {
+-			blk_queue_chunk_sectors(nullb->q,
+-					nullb->dev->zone_size_sects);
+-			nullb->q->nr_zones = blkdev_nr_zones(disk);
+-		}
++		int ret = null_register_zoned_dev(nullb);
++
++		if (ret)
++			return ret;
+ 	}
+-#endif
+ 
+ 	add_disk(disk);
+ 	return 0;
+@@ -1773,14 +1766,9 @@ static int null_add_dev(struct nullb_device *dev)
+ 	}
+ 
+ 	if (dev->zoned) {
+-		rv = null_zone_init(dev);
++		rv = null_init_zoned_dev(dev, nullb->q);
+ 		if (rv)
+ 			goto out_cleanup_blk_queue;
+-
+-		nullb->q->limits.zoned = BLK_ZONED_HM;
+-		blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, nullb->q);
+-		blk_queue_required_elevator_features(nullb->q,
+-						ELEVATOR_F_ZBD_SEQ_WRITE);
+ 	}
+ 
+ 	nullb->q->queuedata = nullb;
+@@ -1809,8 +1797,7 @@ static int null_add_dev(struct nullb_device *dev)
+ 
+ 	return 0;
+ out_cleanup_zone:
+-	if (dev->zoned)
+-		null_zone_exit(dev);
++	null_free_zoned_dev(dev);
+ out_cleanup_blk_queue:
+ 	blk_cleanup_queue(nullb->q);
+ out_cleanup_tags:
+diff --git a/drivers/block/null_blk_zoned.c b/drivers/block/null_blk_zoned.c
+index 673618d8222a..82ad9e82bca9 100644
+--- a/drivers/block/null_blk_zoned.c
++++ b/drivers/block/null_blk_zoned.c
+@@ -13,7 +13,7 @@ static inline unsigned int null_zone_no(struct nullb_device *dev, sector_t sect)
+ 	return sect >> ilog2(dev->zone_size_sects);
+ }
+ 
+-int null_zone_init(struct nullb_device *dev)
++int null_init_zoned_dev(struct nullb_device *dev, struct request_queue *q)
+ {
+ 	sector_t dev_size = (sector_t)dev->size * 1024 * 1024;
+ 	sector_t sector = 0;
+@@ -61,10 +61,27 @@ int null_zone_init(struct nullb_device *dev)
+ 		sector += dev->zone_size_sects;
+ 	}
+ 
++	q->limits.zoned = BLK_ZONED_HM;
++	blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
++	blk_queue_required_elevator_features(q, ELEVATOR_F_ZBD_SEQ_WRITE);
++
++	return 0;
++}
++
++int null_register_zoned_dev(struct nullb *nullb)
++{
++	struct request_queue *q = nullb->q;
++
++	if (queue_is_mq(q))
++		return blk_revalidate_disk_zones(nullb->disk);
++
++	blk_queue_chunk_sectors(q, nullb->dev->zone_size_sects);
++	q->nr_zones = blkdev_nr_zones(nullb->disk);
++
+ 	return 0;
+ }
+ 
+-void null_zone_exit(struct nullb_device *dev)
++void null_free_zoned_dev(struct nullb_device *dev)
+ {
+ 	kvfree(dev->zones);
+ }
