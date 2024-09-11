@@ -1,0 +1,185 @@
+locking/percpu-rwsem: Fix a task_struct refcount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Qian Cai <cai@lca.pw>
+commit d22cc7f67d55ebf2d5be865453971c783e9fb21a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d22cc7f6.failed
+
+The following commit:
+
+  7f26482a872c ("locking/percpu-rwsem: Remove the embedded rwsem")
+
+introduced task_struct memory leaks due to messing up the task_struct
+refcount.
+
+At the beginning of percpu_rwsem_wake_function(), it calls get_task_struct(),
+but if the trylock failed, it will remain in the waitqueue. However, it
+will run percpu_rwsem_wake_function() again with get_task_struct() to
+increase the refcount but then only call put_task_struct() once the trylock
+succeeded.
+
+Fix it by adjusting percpu_rwsem_wake_function() a bit to guard against
+when percpu_rwsem_wait() observing !private, terminating the wait and
+doing a quick exit() while percpu_rwsem_wake_function() then doing
+wake_up_process(p) as a use-after-free.
+
+Fixes: 7f26482a872c ("locking/percpu-rwsem: Remove the embedded rwsem")
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Qian Cai <cai@lca.pw>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lkml.kernel.org/r/20200330213002.2374-1-cai@lca.pw
+(cherry picked from commit d22cc7f67d55ebf2d5be865453971c783e9fb21a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/percpu-rwsem.c
+diff --cc kernel/locking/percpu-rwsem.c
+index eb5134b6ac21,8bbafe3e5203..000000000000
+--- a/kernel/locking/percpu-rwsem.c
++++ b/kernel/locking/percpu-rwsem.c
+@@@ -62,36 -65,116 +62,113 @@@ int __percpu_down_read(struct percpu_rw
+  	smp_mb(); /* A matches D */
+  
+  	/*
+ -	 * If !sem->block the critical section starts here, matched by the
+ +	 * If !readers_block the critical section starts here, matched by the
+  	 * release in percpu_up_write().
+  	 */
+++<<<<<<< HEAD
+ +	if (likely(!smp_load_acquire(&sem->readers_block)))
+ +		return 1;
+ +
+++=======
++ 	if (likely(!atomic_read_acquire(&sem->block)))
++ 		return true;
++ 
++ 	__this_cpu_dec(*sem->read_count);
++ 
++ 	/* Prod writer to re-evaluate readers_active_check() */
++ 	rcuwait_wake_up(&sem->writer);
++ 
++ 	return false;
++ }
++ 
++ static inline bool __percpu_down_write_trylock(struct percpu_rw_semaphore *sem)
++ {
++ 	if (atomic_read(&sem->block))
++ 		return false;
++ 
++ 	return atomic_xchg(&sem->block, 1) == 0;
++ }
++ 
++ static bool __percpu_rwsem_trylock(struct percpu_rw_semaphore *sem, bool reader)
++ {
++ 	if (reader) {
++ 		bool ret;
++ 
++ 		preempt_disable();
++ 		ret = __percpu_down_read_trylock(sem);
++ 		preempt_enable();
++ 
++ 		return ret;
++ 	}
++ 	return __percpu_down_write_trylock(sem);
++ }
++ 
++ /*
++  * The return value of wait_queue_entry::func means:
++  *
++  *  <0 - error, wakeup is terminated and the error is returned
++  *   0 - no wakeup, a next waiter is tried
++  *  >0 - woken, if EXCLUSIVE, counted towards @nr_exclusive.
++  *
++  * We use EXCLUSIVE for both readers and writers to preserve FIFO order,
++  * and play games with the return value to allow waking multiple readers.
++  *
++  * Specifically, we wake readers until we've woken a single writer, or until a
++  * trylock fails.
++  */
++ static int percpu_rwsem_wake_function(struct wait_queue_entry *wq_entry,
++ 				      unsigned int mode, int wake_flags,
++ 				      void *key)
++ {
++ 	bool reader = wq_entry->flags & WQ_FLAG_CUSTOM;
++ 	struct percpu_rw_semaphore *sem = key;
++ 	struct task_struct *p;
++ 
++ 	/* concurrent against percpu_down_write(), can get stolen */
++ 	if (!__percpu_rwsem_trylock(sem, reader))
++ 		return 1;
++ 
++ 	p = get_task_struct(wq_entry->private);
++ 	list_del_init(&wq_entry->entry);
++ 	smp_store_release(&wq_entry->private, NULL);
++ 
++ 	wake_up_process(p);
++ 	put_task_struct(p);
++ 
++ 	return !reader; /* wake (readers until) 1 writer */
++ }
++ 
++ static void percpu_rwsem_wait(struct percpu_rw_semaphore *sem, bool reader)
++ {
++ 	DEFINE_WAIT_FUNC(wq_entry, percpu_rwsem_wake_function);
++ 	bool wait;
++ 
++ 	spin_lock_irq(&sem->waiters.lock);
+++>>>>>>> d22cc7f67d55 (locking/percpu-rwsem: Fix a task_struct refcount)
+  	/*
+ -	 * Serialize against the wakeup in percpu_up_write(), if we fail
+ -	 * the trylock, the wakeup must see us on the list.
+ +	 * Per the above comment; we still have preemption disabled and
+ +	 * will thus decrement on the same CPU as we incremented.
+  	 */
+ -	wait = !__percpu_rwsem_trylock(sem, reader);
+ -	if (wait) {
+ -		wq_entry.flags |= WQ_FLAG_EXCLUSIVE | reader * WQ_FLAG_CUSTOM;
+ -		__add_wait_queue_entry_tail(&sem->waiters, &wq_entry);
+ -	}
+ -	spin_unlock_irq(&sem->waiters.lock);
+ +	__percpu_up_read(sem);
+  
+ -	while (wait) {
+ -		set_current_state(TASK_UNINTERRUPTIBLE);
+ -		if (!smp_load_acquire(&wq_entry.private))
+ -			break;
+ -		schedule();
+ -	}
+ -	__set_current_state(TASK_RUNNING);
+ -}
+ +	if (try)
+ +		return 0;
+  
+ -bool __percpu_down_read(struct percpu_rw_semaphore *sem, bool try)
+ -{
+ -	if (__percpu_down_read_trylock(sem))
+ -		return true;
+ +	/*
+ +	 * We either call schedule() in the wait, or we'll fall through
+ +	 * and reschedule on the preempt_enable() in percpu_down_read().
+ +	 */
+ +	preempt_enable_no_resched();
+  
+ -	if (try)
+ -		return false;
+ +	/*
+ +	 * Avoid lockdep for the down/up_read() we already have them.
+ +	 */
+ +	__down_read(&sem->rw_sem);
+ +	this_cpu_inc(*sem->read_count);
+ +	__up_read(&sem->rw_sem);
+  
+ -	preempt_enable();
+ -	percpu_rwsem_wait(sem, /* .reader = */ true);
+  	preempt_disable();
+ -
+ -	return true;
+ +	return 1;
+  }
+  EXPORT_SYMBOL_GPL(__percpu_down_read);
+  
+* Unmerged path kernel/locking/percpu-rwsem.c
