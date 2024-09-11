@@ -251,7 +251,7 @@ static int i2c_dw_pci_probe(struct pci_dev *pdev,
 		}
 	}
 
-	i2c_dw_configure_master(dev);
+	i2c_dw_configure(dev);
 
 	if (controller->scl_sda_cfg) {
 		cfg = controller->scl_sda_cfg;
