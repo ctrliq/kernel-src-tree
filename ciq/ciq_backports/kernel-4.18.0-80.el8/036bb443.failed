@@ -1,0 +1,377 @@
+net: sched: change type of reference and bind counters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: change type of reference and bind counters (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 95.15%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 036bb44327f50273e85ee4a2c9b56eebce1c0838
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/036bb443.failed
+
+Change type of action reference counter to refcount_t.
+
+Change type of action bind counter to atomic_t.
+This type is used to allow decrementing bind counter without testing
+for 0 result.
+
+	Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 036bb44327f50273e85ee4a2c9b56eebce1c0838)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_csum.c
+#	net/sched/act_tunnel_key.c
+diff --cc net/sched/act_csum.c
+index 6e7124e57918,da865f7b390a..000000000000
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@@ -597,9 -597,8 +597,14 @@@ static int tcf_csum_dump(struct sk_buf
+  	struct tcf_csum_params *params;
+  	struct tc_csum opt = {
+  		.index   = p->tcf_index,
+++<<<<<<< HEAD
+ +		.refcnt  = p->tcf_refcnt - ref,
+ +		.bindcnt = p->tcf_bindcnt - bind,
+ +		.action  = p->tcf_action,
+++=======
++ 		.refcnt  = refcount_read(&p->tcf_refcnt) - ref,
++ 		.bindcnt = atomic_read(&p->tcf_bindcnt) - bind,
+++>>>>>>> 036bb44327f5 (net: sched: change type of reference and bind counters)
+  	};
+  	struct tcf_t t;
+  
+diff --cc net/sched/act_tunnel_key.c
+index 59196556b7ca,2354f07eba15..000000000000
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@@ -484,9 -474,8 +484,14 @@@ static int tunnel_key_dump(struct sk_bu
+  	struct tcf_tunnel_key_params *params;
+  	struct tc_tunnel_key opt = {
+  		.index    = t->tcf_index,
+++<<<<<<< HEAD
+ +		.refcnt   = t->tcf_refcnt - ref,
+ +		.bindcnt  = t->tcf_bindcnt - bind,
+ +		.action   = t->tcf_action,
+++=======
++ 		.refcnt   = refcount_read(&t->tcf_refcnt) - ref,
++ 		.bindcnt  = atomic_read(&t->tcf_bindcnt) - bind,
+++>>>>>>> 036bb44327f5 (net: sched: change type of reference and bind counters)
+  	};
+  	struct tcf_t tm;
+  
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index ffc3ef321776..2759226527a2 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -6,6 +6,7 @@
+  * Public action API for classifiers/qdiscs
+ */
+ 
++#include <linux/refcount.h>
+ #include <net/sch_generic.h>
+ #include <net/pkt_sched.h>
+ #include <net/net_namespace.h>
+@@ -26,8 +27,8 @@ struct tc_action {
+ 	struct tcf_idrinfo		*idrinfo;
+ 
+ 	u32				tcfa_index;
+-	int				tcfa_refcnt;
+-	int				tcfa_bindcnt;
++	refcount_t			tcfa_refcnt;
++	atomic_t			tcfa_bindcnt;
+ 	u32				tcfa_capab;
+ 	int				tcfa_action;
+ 	struct tcf_t			tcfa_tm;
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index 02670c7489e3..4f064ecab882 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -105,14 +105,26 @@ int __tcf_idr_release(struct tc_action *p, bool bind, bool strict)
+ 
+ 	ASSERT_RTNL();
+ 
++	/* Release with strict==1 and bind==0 is only called through act API
++	 * interface (classifiers always bind). Only case when action with
++	 * positive reference count and zero bind count can exist is when it was
++	 * also created with act API (unbinding last classifier will destroy the
++	 * action if it was created by classifier). So only case when bind count
++	 * can be changed after initial check is when unbound action is
++	 * destroyed by act API while classifier binds to action with same id
++	 * concurrently. This result either creation of new action(same behavior
++	 * as before), or reusing existing action if concurrent process
++	 * increments reference count before action is deleted. Both scenarios
++	 * are acceptable.
++	 */
+ 	if (p) {
+ 		if (bind)
+-			p->tcfa_bindcnt--;
+-		else if (strict && p->tcfa_bindcnt > 0)
++			atomic_dec(&p->tcfa_bindcnt);
++		else if (strict && atomic_read(&p->tcfa_bindcnt) > 0)
+ 			return -EPERM;
+ 
+-		p->tcfa_refcnt--;
+-		if (p->tcfa_bindcnt <= 0 && p->tcfa_refcnt <= 0) {
++		if (atomic_read(&p->tcfa_bindcnt) <= 0 &&
++		    refcount_dec_and_test(&p->tcfa_refcnt)) {
+ 			if (p->ops->cleanup)
+ 				p->ops->cleanup(p);
+ 			tcf_idr_remove(p->idrinfo, p);
+@@ -304,8 +316,8 @@ bool tcf_idr_check(struct tc_action_net *tn, u32 index, struct tc_action **a,
+ 
+ 	if (index && p) {
+ 		if (bind)
+-			p->tcfa_bindcnt++;
+-		p->tcfa_refcnt++;
++			atomic_inc(&p->tcfa_bindcnt);
++		refcount_inc(&p->tcfa_refcnt);
+ 		*a = p;
+ 		return true;
+ 	}
+@@ -324,9 +336,9 @@ int tcf_idr_create(struct tc_action_net *tn, u32 index, struct nlattr *est,
+ 
+ 	if (unlikely(!p))
+ 		return -ENOMEM;
+-	p->tcfa_refcnt = 1;
++	refcount_set(&p->tcfa_refcnt, 1);
+ 	if (bind)
+-		p->tcfa_bindcnt = 1;
++		atomic_set(&p->tcfa_bindcnt, 1);
+ 
+ 	if (cpustats) {
+ 		p->cpu_bstats = netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
+@@ -782,7 +794,7 @@ static void cleanup_a(struct list_head *actions, int ovr)
+ 		return;
+ 
+ 	list_for_each_entry(a, actions, list)
+-		a->tcfa_refcnt--;
++		refcount_dec(&a->tcfa_refcnt);
+ }
+ 
+ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+@@ -810,7 +822,7 @@ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+ 		act->order = i;
+ 		sz += tcf_action_fill_size(act);
+ 		if (ovr)
+-			act->tcfa_refcnt++;
++			refcount_inc(&act->tcfa_refcnt);
+ 		list_add_tail(&act->list, actions);
+ 	}
+ 
+diff --git a/net/sched/act_bpf.c b/net/sched/act_bpf.c
+index 18089c02e557..15a2a53cbde1 100644
+--- a/net/sched/act_bpf.c
++++ b/net/sched/act_bpf.c
+@@ -141,8 +141,8 @@ static int tcf_bpf_dump(struct sk_buff *skb, struct tc_action *act,
+ 	struct tcf_bpf *prog = to_bpf(act);
+ 	struct tc_act_bpf opt = {
+ 		.index   = prog->tcf_index,
+-		.refcnt  = prog->tcf_refcnt - ref,
+-		.bindcnt = prog->tcf_bindcnt - bind,
++		.refcnt  = refcount_read(&prog->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&prog->tcf_bindcnt) - bind,
+ 		.action  = prog->tcf_action,
+ 	};
+ 	struct tcf_t tm;
+diff --git a/net/sched/act_connmark.c b/net/sched/act_connmark.c
+index e4b880fa51fe..188865034f9a 100644
+--- a/net/sched/act_connmark.c
++++ b/net/sched/act_connmark.c
+@@ -154,8 +154,8 @@ static inline int tcf_connmark_dump(struct sk_buff *skb, struct tc_action *a,
+ 
+ 	struct tc_connmark opt = {
+ 		.index   = ci->tcf_index,
+-		.refcnt  = ci->tcf_refcnt - ref,
+-		.bindcnt = ci->tcf_bindcnt - bind,
++		.refcnt  = refcount_read(&ci->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&ci->tcf_bindcnt) - bind,
+ 		.action  = ci->tcf_action,
+ 		.zone   = ci->zone,
+ 	};
+* Unmerged path net/sched/act_csum.c
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index 4dc4f153cad8..ca83debd5a70 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -169,8 +169,8 @@ static int tcf_gact_dump(struct sk_buff *skb, struct tc_action *a,
+ 	struct tcf_gact *gact = to_gact(a);
+ 	struct tc_gact opt = {
+ 		.index   = gact->tcf_index,
+-		.refcnt  = gact->tcf_refcnt - ref,
+-		.bindcnt = gact->tcf_bindcnt - bind,
++		.refcnt  = refcount_read(&gact->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&gact->tcf_bindcnt) - bind,
+ 		.action  = gact->tcf_action,
+ 	};
+ 	struct tcf_t t;
+diff --git a/net/sched/act_ife.c b/net/sched/act_ife.c
+index 20d7d36b2fc9..3536a23f46b5 100644
+--- a/net/sched/act_ife.c
++++ b/net/sched/act_ife.c
+@@ -596,8 +596,8 @@ static int tcf_ife_dump(struct sk_buff *skb, struct tc_action *a, int bind,
+ 	struct tcf_ife_params *p = rtnl_dereference(ife->params);
+ 	struct tc_ife opt = {
+ 		.index = ife->tcf_index,
+-		.refcnt = ife->tcf_refcnt - ref,
+-		.bindcnt = ife->tcf_bindcnt - bind,
++		.refcnt = refcount_read(&ife->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&ife->tcf_bindcnt) - bind,
+ 		.action = ife->tcf_action,
+ 		.flags = p->flags,
+ 	};
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 14c312d7908f..7bce88dc11c9 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -280,8 +280,8 @@ static int tcf_ipt_dump(struct sk_buff *skb, struct tc_action *a, int bind,
+ 	if (unlikely(!t))
+ 		goto nla_put_failure;
+ 
+-	c.bindcnt = ipt->tcf_bindcnt - bind;
+-	c.refcnt = ipt->tcf_refcnt - ref;
++	c.bindcnt = atomic_read(&ipt->tcf_bindcnt) - bind;
++	c.refcnt = refcount_read(&ipt->tcf_refcnt) - ref;
+ 	strcpy(t->u.user.name, ipt->tcfi_t->u.kernel.target->name);
+ 
+ 	if (nla_put(skb, TCA_IPT_TARG, ipt->tcfi_t->u.user.target_size, t) ||
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index fd34015331ab..82a8bdd67c47 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -250,8 +250,8 @@ static int tcf_mirred_dump(struct sk_buff *skb, struct tc_action *a, int bind,
+ 	struct tc_mirred opt = {
+ 		.index   = m->tcf_index,
+ 		.action  = m->tcf_action,
+-		.refcnt  = m->tcf_refcnt - ref,
+-		.bindcnt = m->tcf_bindcnt - bind,
++		.refcnt  = refcount_read(&m->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&m->tcf_bindcnt) - bind,
+ 		.eaction = m->tcfm_eaction,
+ 		.ifindex = dev ? dev->ifindex : 0,
+ 	};
+diff --git a/net/sched/act_nat.c b/net/sched/act_nat.c
+index 4b5848b6c252..457c2ae3de46 100644
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@ -257,8 +257,8 @@ static int tcf_nat_dump(struct sk_buff *skb, struct tc_action *a,
+ 
+ 		.index    = p->tcf_index,
+ 		.action   = p->tcf_action,
+-		.refcnt   = p->tcf_refcnt - ref,
+-		.bindcnt  = p->tcf_bindcnt - bind,
++		.refcnt   = refcount_read(&p->tcf_refcnt) - ref,
++		.bindcnt  = atomic_read(&p->tcf_bindcnt) - bind,
+ 	};
+ 	struct tcf_t t;
+ 
+diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
+index e43aef28fdac..889690e0ec39 100644
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@ -409,8 +409,8 @@ static int tcf_pedit_dump(struct sk_buff *skb, struct tc_action *a,
+ 	opt->nkeys = p->tcfp_nkeys;
+ 	opt->flags = p->tcfp_flags;
+ 	opt->action = p->tcf_action;
+-	opt->refcnt = p->tcf_refcnt - ref;
+-	opt->bindcnt = p->tcf_bindcnt - bind;
++	opt->refcnt = refcount_read(&p->tcf_refcnt) - ref;
++	opt->bindcnt = atomic_read(&p->tcf_bindcnt) - bind;
+ 
+ 	if (p->tcfp_keys_ex) {
+ 		tcf_pedit_key_ex_dump(skb, p->tcfp_keys_ex, p->tcfp_nkeys);
+diff --git a/net/sched/act_police.c b/net/sched/act_police.c
+index 4e72bc2a0dfb..a789b8060968 100644
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -274,8 +274,8 @@ static int tcf_act_police_dump(struct sk_buff *skb, struct tc_action *a,
+ 		.action = police->tcf_action,
+ 		.mtu = police->tcfp_mtu,
+ 		.burst = PSCHED_NS2TICKS(police->tcfp_burst),
+-		.refcnt = police->tcf_refcnt - ref,
+-		.bindcnt = police->tcf_bindcnt - bind,
++		.refcnt = refcount_read(&police->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&police->tcf_bindcnt) - bind,
+ 	};
+ 	struct tcf_t t;
+ 
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index 5db358497c9e..4a46978db092 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -173,8 +173,8 @@ static int tcf_sample_dump(struct sk_buff *skb, struct tc_action *a,
+ 	struct tc_sample opt = {
+ 		.index      = s->tcf_index,
+ 		.action     = s->tcf_action,
+-		.refcnt     = s->tcf_refcnt - ref,
+-		.bindcnt    = s->tcf_bindcnt - bind,
++		.refcnt     = refcount_read(&s->tcf_refcnt) - ref,
++		.bindcnt    = atomic_read(&s->tcf_bindcnt) - bind,
+ 	};
+ 	struct tcf_t t;
+ 
+diff --git a/net/sched/act_simple.c b/net/sched/act_simple.c
+index 98c4afe7c15b..c3a761097b01 100644
+--- a/net/sched/act_simple.c
++++ b/net/sched/act_simple.c
+@@ -145,8 +145,8 @@ static int tcf_simp_dump(struct sk_buff *skb, struct tc_action *a,
+ 	struct tcf_defact *d = to_defact(a);
+ 	struct tc_defact opt = {
+ 		.index   = d->tcf_index,
+-		.refcnt  = d->tcf_refcnt - ref,
+-		.bindcnt = d->tcf_bindcnt - bind,
++		.refcnt  = refcount_read(&d->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&d->tcf_bindcnt) - bind,
+ 		.action  = d->tcf_action,
+ 	};
+ 	struct tcf_t t;
+diff --git a/net/sched/act_skbedit.c b/net/sched/act_skbedit.c
+index dfaf5d8028dd..cfd20d3d2ca9 100644
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@ -208,8 +208,8 @@ static int tcf_skbedit_dump(struct sk_buff *skb, struct tc_action *a,
+ 	struct tcf_skbedit *d = to_skbedit(a);
+ 	struct tc_skbedit opt = {
+ 		.index   = d->tcf_index,
+-		.refcnt  = d->tcf_refcnt - ref,
+-		.bindcnt = d->tcf_bindcnt - bind,
++		.refcnt  = refcount_read(&d->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&d->tcf_bindcnt) - bind,
+ 		.action  = d->tcf_action,
+ 	};
+ 	struct tcf_t t;
+diff --git a/net/sched/act_skbmod.c b/net/sched/act_skbmod.c
+index ad050d7d4b46..ff90d720eda3 100644
+--- a/net/sched/act_skbmod.c
++++ b/net/sched/act_skbmod.c
+@@ -205,8 +205,8 @@ static int tcf_skbmod_dump(struct sk_buff *skb, struct tc_action *a,
+ 	struct tcf_skbmod_params  *p = rtnl_dereference(d->skbmod_p);
+ 	struct tc_skbmod opt = {
+ 		.index   = d->tcf_index,
+-		.refcnt  = d->tcf_refcnt - ref,
+-		.bindcnt = d->tcf_bindcnt - bind,
++		.refcnt  = refcount_read(&d->tcf_refcnt) - ref,
++		.bindcnt = atomic_read(&d->tcf_bindcnt) - bind,
+ 		.action  = d->tcf_action,
+ 	};
+ 	struct tcf_t t;
+* Unmerged path net/sched/act_tunnel_key.c
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index 1fb39e1f9d07..799e3deb44ac 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -239,8 +239,8 @@ static int tcf_vlan_dump(struct sk_buff *skb, struct tc_action *a,
+ 	struct tcf_vlan_params *p = rtnl_dereference(v->vlan_p);
+ 	struct tc_vlan opt = {
+ 		.index    = v->tcf_index,
+-		.refcnt   = v->tcf_refcnt - ref,
+-		.bindcnt  = v->tcf_bindcnt - bind,
++		.refcnt   = refcount_read(&v->tcf_refcnt) - ref,
++		.bindcnt  = atomic_read(&v->tcf_bindcnt) - bind,
+ 		.action   = v->tcf_action,
+ 		.v_action = p->tcfv_action,
+ 	};
