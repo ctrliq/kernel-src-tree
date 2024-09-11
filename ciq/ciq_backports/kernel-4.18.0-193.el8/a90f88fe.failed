@@ -1,0 +1,166 @@
+net/mlx5e: Don't refresh TIRs when updating representor SQs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Don't refresh TIRs when updating representor SQs (Alaa Hleihel) [1724336]
+Rebuild_FUZZ: 96.49%
+commit-author Gavi Teitz <gavi@mellanox.com>
+commit a90f88fe557d7f2318b724a93875dcaac45b5f05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a90f88fe.failed
+
+Refreshing TIRs is done in order to update the TIRs with the current
+state of SQs in the transport domain, so that the TIRs can filter out
+undesired self-loopback packets based on the source SQ of the packet.
+
+Representor TIRs will only receive packets that originate from their
+associated vport, due to dedicated steering, and therefore will never
+receive self-loopback packets, whose source vport will be the vport of
+the E-Switch manager, and therefore not the vport associated with the
+representor. As such, it is not necessary to refresh the representors'
+TIRs, since self-loopback packets can't reach them.
+
+Since representors only exist in switchdev mode, and there is no
+scenario in which a representor will exist in the transport domain
+alongside a non-representor, it is not necessary to refresh the
+transport domain's TIRs upon changing the state of a representor's
+queues. Therefore, do not refresh TIRs upon such a change. Achieve
+this by adding an update_rx callback to the mlx5e_profile, which
+refreshes TIRs for non-representors and does nothing for representors,
+and replace instances of mlx5e_refresh_tirs() upon changing the state
+of the queues with update_rx().
+
+	Signed-off-by: Gavi Teitz <gavi@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit a90f88fe557d7f2318b724a93875dcaac45b5f05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 1ddcc10576ec,fce3814bdb2f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -1732,8 -1717,9 +1737,14 @@@ static const struct mlx5e_profile mlx5e
+  	.cleanup_rx		= mlx5e_cleanup_rep_rx,
+  	.init_tx		= mlx5e_init_rep_tx,
+  	.cleanup_tx		= mlx5e_cleanup_rep_tx,
+++<<<<<<< HEAD
+ +	.enable		        = mlx5e_vf_rep_enable,
+ +	.update_stats           = mlx5e_vf_rep_update_hw_counters,
+++=======
++ 	.enable		        = mlx5e_rep_enable,
++ 	.update_rx		= mlx5e_update_rep_rx,
++ 	.update_stats           = mlx5e_rep_update_hw_counters,
+++>>>>>>> a90f88fe557d (net/mlx5e: Don't refresh TIRs when updating representor SQs)
+  	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+  	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
+  	.max_tc			= 1,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index be6c10bfc6f6..cd867ec942b5 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -808,6 +808,7 @@ struct mlx5e_profile {
+ 	void	(*cleanup_tx)(struct mlx5e_priv *priv);
+ 	void	(*enable)(struct mlx5e_priv *priv);
+ 	void	(*disable)(struct mlx5e_priv *priv);
++	int	(*update_rx)(struct mlx5e_priv *priv);
+ 	void	(*update_stats)(struct mlx5e_priv *priv);
+ 	void	(*update_carrier)(struct mlx5e_priv *priv);
+ 	struct {
+@@ -1081,6 +1082,7 @@ int mlx5e_create_tis(struct mlx5_core_dev *mdev, int tc,
+ void mlx5e_destroy_tis(struct mlx5_core_dev *mdev, u32 tisn);
+ 
+ int mlx5e_create_tises(struct mlx5e_priv *priv);
++int mlx5e_update_nic_rx(struct mlx5e_priv *priv);
+ void mlx5e_update_carrier(struct mlx5e_priv *priv);
+ int mlx5e_close(struct net_device *netdev);
+ int mlx5e_open(struct net_device *netdev);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index bfec84e64a0c..bf549cbfc998 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2847,7 +2847,7 @@ static void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
+ 	if (hw_modify)
+ 		hw_modify(priv);
+ 
+-	mlx5e_refresh_tirs(priv, false);
++	priv->profile->update_rx(priv);
+ 	mlx5e_activate_priv_channels(priv);
+ 
+ 	/* return carrier back if needed */
+@@ -2894,7 +2894,7 @@ int mlx5e_open_locked(struct net_device *netdev)
+ 	if (err)
+ 		goto err_clear_state_opened_flag;
+ 
+-	mlx5e_refresh_tirs(priv, false);
++	priv->profile->update_rx(priv);
+ 	mlx5e_activate_priv_channels(priv);
+ 	if (priv->profile->update_carrier)
+ 		priv->profile->update_carrier(priv);
+@@ -4938,6 +4938,11 @@ static void mlx5e_nic_disable(struct mlx5e_priv *priv)
+ 	mlx5_lag_remove(mdev);
+ }
+ 
++int mlx5e_update_nic_rx(struct mlx5e_priv *priv)
++{
++	return mlx5e_refresh_tirs(priv, false);
++}
++
+ static const struct mlx5e_profile mlx5e_nic_profile = {
+ 	.init		   = mlx5e_nic_init,
+ 	.cleanup	   = mlx5e_nic_cleanup,
+@@ -4947,6 +4952,7 @@ static const struct mlx5e_profile mlx5e_nic_profile = {
+ 	.cleanup_tx	   = mlx5e_cleanup_nic_tx,
+ 	.enable		   = mlx5e_nic_enable,
+ 	.disable	   = mlx5e_nic_disable,
++	.update_rx	   = mlx5e_update_nic_rx,
+ 	.update_stats	   = mlx5e_update_ndo_stats,
+ 	.update_carrier	   = mlx5e_update_carrier,
+ 	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 9ca492b430d8..e68d124eb625 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -418,6 +418,7 @@ static const struct mlx5e_profile mlx5i_nic_profile = {
+ 	.cleanup_rx	   = mlx5i_cleanup_rx,
+ 	.enable		   = NULL, /* mlx5i_enable */
+ 	.disable	   = NULL, /* mlx5i_disable */
++	.update_rx	   = mlx5e_update_nic_rx,
+ 	.update_stats	   = NULL, /* mlx5i_update_stats */
+ 	.update_carrier    = NULL, /* no HW update in IB link */
+ 	.rx_handlers.handle_rx_cqe       = mlx5i_handle_rx_cqe,
+@@ -526,7 +527,7 @@ static int mlx5i_open(struct net_device *netdev)
+ 	if (err)
+ 		goto err_remove_fs_underlay_qp;
+ 
+-	mlx5e_refresh_tirs(epriv, false);
++	epriv->profile->update_rx(epriv);
+ 	mlx5e_activate_priv_channels(epriv);
+ 
+ 	mutex_unlock(&epriv->state_lock);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+index b491b8f5fd6b..e05186ada721 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+@@ -221,7 +221,7 @@ static int mlx5i_pkey_open(struct net_device *netdev)
+ 		mlx5_core_warn(mdev, "opening child channels failed, %d\n", err);
+ 		goto err_clear_state_opened_flag;
+ 	}
+-	mlx5e_refresh_tirs(epriv, false);
++	epriv->profile->update_rx(epriv);
+ 	mlx5e_activate_priv_channels(epriv);
+ 	mutex_unlock(&epriv->state_lock);
+ 
+@@ -350,6 +350,7 @@ static const struct mlx5e_profile mlx5i_pkey_nic_profile = {
+ 	.cleanup_rx	   = mlx5i_pkey_cleanup_rx,
+ 	.enable		   = NULL,
+ 	.disable	   = NULL,
++	.update_rx	   = mlx5e_update_nic_rx,
+ 	.update_stats	   = NULL,
+ 	.rx_handlers.handle_rx_cqe       = mlx5i_handle_rx_cqe,
+ 	.rx_handlers.handle_rx_cqe_mpwqe = NULL, /* Not supported */
