@@ -1,0 +1,242 @@
+bpf: fix building without CONFIG_INET
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit df3f94a0bbeb6cb6a02eb16b8e76f16b33cb2f8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/df3f94a0.failed
+
+The newly added TCP and UDP handling fails to link when CONFIG_INET
+is disabled:
+
+net/core/filter.o: In function `sk_lookup':
+filter.c:(.text+0x7ff8): undefined reference to `tcp_hashinfo'
+filter.c:(.text+0x7ffc): undefined reference to `tcp_hashinfo'
+filter.c:(.text+0x8020): undefined reference to `__inet_lookup_established'
+filter.c:(.text+0x8058): undefined reference to `__inet_lookup_listener'
+filter.c:(.text+0x8068): undefined reference to `udp_table'
+filter.c:(.text+0x8070): undefined reference to `udp_table'
+filter.c:(.text+0x808c): undefined reference to `__udp4_lib_lookup'
+net/core/filter.o: In function `bpf_sk_release':
+filter.c:(.text+0x82e8): undefined reference to `sock_gen_put'
+
+Wrap the related sections of code in #ifdefs for the config option.
+
+Furthermore, sk_lookup() should always have been marked 'static', this
+also avoids a warning about a missing prototype when building with
+'make W=1'.
+
+Fixes: 6acc9b432e67 ("bpf: Add helper to retrieve socket in BPF")
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Joe Stringer <joe@wand.net.nz>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit df3f94a0bbeb6cb6a02eb16b8e76f16b33cb2f8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/filter.c
+diff --cc net/core/filter.c
+index ed8de8b22015,4bbc6567fcb8..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -4757,6 -4817,143 +4757,146 @@@ static const struct bpf_func_proto bpf_
+  };
+  #endif /* CONFIG_IPV6_SEG6_BPF */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_INET
++ static struct sock *sk_lookup(struct net *net, struct bpf_sock_tuple *tuple,
++ 			      struct sk_buff *skb, u8 family, u8 proto)
++ {
++ 	int dif = skb->dev->ifindex;
++ 	bool refcounted = false;
++ 	struct sock *sk = NULL;
++ 
++ 	if (family == AF_INET) {
++ 		__be32 src4 = tuple->ipv4.saddr;
++ 		__be32 dst4 = tuple->ipv4.daddr;
++ 		int sdif = inet_sdif(skb);
++ 
++ 		if (proto == IPPROTO_TCP)
++ 			sk = __inet_lookup(net, &tcp_hashinfo, skb, 0,
++ 					   src4, tuple->ipv4.sport,
++ 					   dst4, tuple->ipv4.dport,
++ 					   dif, sdif, &refcounted);
++ 		else
++ 			sk = __udp4_lib_lookup(net, src4, tuple->ipv4.sport,
++ 					       dst4, tuple->ipv4.dport,
++ 					       dif, sdif, &udp_table, skb);
++ #if IS_REACHABLE(CONFIG_IPV6)
++ 	} else {
++ 		struct in6_addr *src6 = (struct in6_addr *)&tuple->ipv6.saddr;
++ 		struct in6_addr *dst6 = (struct in6_addr *)&tuple->ipv6.daddr;
++ 		int sdif = inet6_sdif(skb);
++ 
++ 		if (proto == IPPROTO_TCP)
++ 			sk = __inet6_lookup(net, &tcp_hashinfo, skb, 0,
++ 					    src6, tuple->ipv6.sport,
++ 					    dst6, tuple->ipv6.dport,
++ 					    dif, sdif, &refcounted);
++ 		else
++ 			sk = __udp6_lib_lookup(net, src6, tuple->ipv6.sport,
++ 					       dst6, tuple->ipv6.dport,
++ 					       dif, sdif, &udp_table, skb);
++ #endif
++ 	}
++ 
++ 	if (unlikely(sk && !refcounted && !sock_flag(sk, SOCK_RCU_FREE))) {
++ 		WARN_ONCE(1, "Found non-RCU, unreferenced socket!");
++ 		sk = NULL;
++ 	}
++ 	return sk;
++ }
++ 
++ /* bpf_sk_lookup performs the core lookup for different types of sockets,
++  * taking a reference on the socket if it doesn't have the flag SOCK_RCU_FREE.
++  * Returns the socket as an 'unsigned long' to simplify the casting in the
++  * callers to satisfy BPF_CALL declarations.
++  */
++ static unsigned long
++ bpf_sk_lookup(struct sk_buff *skb, struct bpf_sock_tuple *tuple, u32 len,
++ 	      u8 proto, u64 netns_id, u64 flags)
++ {
++ 	struct net *caller_net;
++ 	struct sock *sk = NULL;
++ 	u8 family = AF_UNSPEC;
++ 	struct net *net;
++ 
++ 	family = len == sizeof(tuple->ipv4) ? AF_INET : AF_INET6;
++ 	if (unlikely(family == AF_UNSPEC || netns_id > U32_MAX || flags))
++ 		goto out;
++ 
++ 	if (skb->dev)
++ 		caller_net = dev_net(skb->dev);
++ 	else
++ 		caller_net = sock_net(skb->sk);
++ 	if (netns_id) {
++ 		net = get_net_ns_by_id(caller_net, netns_id);
++ 		if (unlikely(!net))
++ 			goto out;
++ 		sk = sk_lookup(net, tuple, skb, family, proto);
++ 		put_net(net);
++ 	} else {
++ 		net = caller_net;
++ 		sk = sk_lookup(net, tuple, skb, family, proto);
++ 	}
++ 
++ 	if (sk)
++ 		sk = sk_to_full_sk(sk);
++ out:
++ 	return (unsigned long) sk;
++ }
++ 
++ BPF_CALL_5(bpf_sk_lookup_tcp, struct sk_buff *, skb,
++ 	   struct bpf_sock_tuple *, tuple, u32, len, u64, netns_id, u64, flags)
++ {
++ 	return bpf_sk_lookup(skb, tuple, len, IPPROTO_TCP, netns_id, flags);
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_lookup_tcp_proto = {
++ 	.func		= bpf_sk_lookup_tcp,
++ 	.gpl_only	= false,
++ 	.pkt_access	= true,
++ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_5(bpf_sk_lookup_udp, struct sk_buff *, skb,
++ 	   struct bpf_sock_tuple *, tuple, u32, len, u64, netns_id, u64, flags)
++ {
++ 	return bpf_sk_lookup(skb, tuple, len, IPPROTO_UDP, netns_id, flags);
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_lookup_udp_proto = {
++ 	.func		= bpf_sk_lookup_udp,
++ 	.gpl_only	= false,
++ 	.pkt_access	= true,
++ 	.ret_type	= RET_PTR_TO_SOCKET_OR_NULL,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ BPF_CALL_1(bpf_sk_release, struct sock *, sk)
++ {
++ 	if (!sock_flag(sk, SOCK_RCU_FREE))
++ 		sock_gen_put(sk);
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_release_proto = {
++ 	.func		= bpf_sk_release,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_SOCKET,
++ };
++ #endif /* CONFIG_INET */
++ 
+++>>>>>>> df3f94a0bbeb (bpf: fix building without CONFIG_INET)
+  bool bpf_helper_changes_pkt_data(void *func)
+  {
+  	if (func == bpf_skb_vlan_push ||
+@@@ -4959,7 -5157,17 +5099,18 @@@ tc_cls_act_func_proto(enum bpf_func_id 
+  #ifdef CONFIG_SOCK_CGROUP_DATA
+  	case BPF_FUNC_skb_cgroup_id:
+  		return &bpf_skb_cgroup_id_proto;
+ -	case BPF_FUNC_skb_ancestor_cgroup_id:
+ -		return &bpf_skb_ancestor_cgroup_id_proto;
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_INET
++ 	case BPF_FUNC_sk_lookup_tcp:
++ 		return &bpf_sk_lookup_tcp_proto;
++ 	case BPF_FUNC_sk_lookup_udp:
++ 		return &bpf_sk_lookup_udp_proto;
++ 	case BPF_FUNC_sk_release:
++ 		return &bpf_sk_release_proto;
++ #endif
+++>>>>>>> df3f94a0bbeb (bpf: fix building without CONFIG_INET)
+  	default:
+  		return bpf_base_func_proto(func_id);
+  	}
+@@@ -5062,6 -5268,25 +5213,28 @@@ sk_skb_func_proto(enum bpf_func_id func
+  		return &bpf_sk_redirect_hash_proto;
+  	case BPF_FUNC_get_local_storage:
+  		return &bpf_get_local_storage_proto;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_INET
++ 	case BPF_FUNC_sk_lookup_tcp:
++ 		return &bpf_sk_lookup_tcp_proto;
++ 	case BPF_FUNC_sk_lookup_udp:
++ 		return &bpf_sk_lookup_udp_proto;
++ 	case BPF_FUNC_sk_release:
++ 		return &bpf_sk_release_proto;
++ #endif
++ 	default:
++ 		return bpf_base_func_proto(func_id);
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ flow_dissector_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_load_bytes:
++ 		return &bpf_skb_load_bytes_proto;
+++>>>>>>> df3f94a0bbeb (bpf: fix building without CONFIG_INET)
+  	default:
+  		return bpf_base_func_proto(func_id);
+  	}
+* Unmerged path net/core/filter.c
