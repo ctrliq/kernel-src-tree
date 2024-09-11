@@ -1074,7 +1074,8 @@ struct devlink_ops {
 	 */
 	int (*trap_action_set)(struct devlink *devlink,
 			       const struct devlink_trap *trap,
-			       enum devlink_trap_action action);
+			       enum devlink_trap_action action,
+			       struct netlink_ext_ack *extack);
 	/**
 	 * @trap_group_init: Trap group initialization function.
 	 *
@@ -1091,7 +1092,8 @@ struct devlink_ops {
 	 */
 	int (*trap_group_set)(struct devlink *devlink,
 			      const struct devlink_trap_group *group,
-			      const struct devlink_trap_policer *policer);
+			      const struct devlink_trap_policer *policer,
+			      struct netlink_ext_ack *extack);
 	/**
 	 * @trap_policer_init: Trap policer initialization function.
 	 *
