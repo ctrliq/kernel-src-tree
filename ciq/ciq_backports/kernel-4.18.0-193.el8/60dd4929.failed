@@ -1,0 +1,493 @@
+ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Takashi Sakamoto <o-takashi@sakamocchi.jp>
+commit 60dd49298ec5803ca423836d5a724c3fe402cc3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/60dd4929.failed
+
+This commit changes AMDTP domain to run on an IT context of 1394 OHCI as
+IRQ target. No hardware interrupt is scheduled for the other isoc
+contexts. All of the isoc context are processed in a callback for an isoc
+context of IRQ target.
+
+The IRQ target is automatically selected from a list of AMDTP streams,
+thus users of AMDTP domain should add an AMDTP stream for IT context
+at least.
+
+The reason to select IT context as IRQ target is that the IT context
+runs on local 1394 OHCI controller and it can be used as reliable,
+constant IRQ generator. On the other hand, IR context can include skip
+cycle according to isoc packet transferred by device.
+
+	Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Link: https://lore.kernel.org/r/20191018061911.24909-6-o-takashi@sakamocchi.jp
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 60dd49298ec5803ca423836d5a724c3fe402cc3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/firewire/amdtp-stream.c
+#	sound/firewire/amdtp-stream.h
+diff --cc sound/firewire/amdtp-stream.c
+index 6e1b83a082a2,48be31eae9a5..000000000000
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@@ -488,7 -488,7 +488,11 @@@ static inline int queue_in_packet(struc
+  	params->header_length = s->ctx_data.tx.ctx_header_size;
+  	params->payload_length = s->ctx_data.tx.max_ctx_payload_length;
+  	params->skip = false;
+++<<<<<<< HEAD
+ +	return queue_packet(s, params);
+++=======
++ 	return queue_packet(s, params, false);
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  }
+  
+  static void generate_cip_header(struct amdtp_stream *s, __be32 cip_header[2],
+@@@ -713,53 -777,86 +717,114 @@@ static inline void cancel_stream(struc
+  	WRITE_ONCE(s->pcm_buffer_pointer, SNDRV_PCM_POS_XRUN);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void process_ctx_payloads(struct amdtp_stream *s,
++ 				 const struct pkt_desc *descs,
++ 				 unsigned int packets)
++ {
++ 	struct snd_pcm_substream *pcm;
++ 	unsigned int pcm_frames;
++ 
++ 	pcm = READ_ONCE(s->pcm);
++ 	pcm_frames = s->process_ctx_payloads(s, descs, packets, pcm);
++ 	if (pcm)
++ 		update_pcm_pointers(s, pcm, pcm_frames);
++ }
++ 
++ static void amdtp_stream_master_callback(struct fw_iso_context *context,
++ 					 u32 tstamp, size_t header_length,
++ 					 void *header, void *private_data);
++ 
++ static void amdtp_stream_master_first_callback(struct fw_iso_context *context,
++ 					u32 tstamp, size_t header_length,
++ 					void *header, void *private_data);
++ 
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  static void out_stream_callback(struct fw_iso_context *context, u32 tstamp,
+  				size_t header_length, void *header,
+  				void *private_data)
+  {
+  	struct amdtp_stream *s = private_data;
+  	const __be32 *ctx_header = header;
+++<<<<<<< HEAD
+ +	unsigned int packets = header_length / sizeof(*ctx_header);
+++=======
++ 	unsigned int events_per_period = s->ctx_data.rx.events_per_period;
++ 	unsigned int event_count = s->ctx_data.rx.event_count;
++ 	unsigned int packets;
++ 	bool is_irq_target;
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  	int i;
+  
+  	if (s->packet_index < 0)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	// Calculate the number of packets in buffer and check XRUN.
++ 	packets = header_length / sizeof(*ctx_header);
++ 
++ 	generate_ideal_pkt_descs(s, s->pkt_descs, ctx_header, packets);
++ 
++ 	process_ctx_payloads(s, s->pkt_descs, packets);
++ 
++ 	is_irq_target =
++ 		!!(context->callback.sc == amdtp_stream_master_callback ||
++ 		   context->callback.sc == amdtp_stream_master_first_callback);
++ 
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  	for (i = 0; i < packets; ++i) {
+ -		const struct pkt_desc *desc = s->pkt_descs + i;
+ +		u32 cycle;
+  		unsigned int syt;
+ +		unsigned int data_blocks;
+ +		__be32 *buffer;
+ +		unsigned int pcm_frames;
+  		struct {
+  			struct fw_iso_packet params;
+  			__be32 header[IT_PKT_HEADER_SIZE_CIP / sizeof(__be32)];
+  		} template = { {0}, {0} };
+ -		bool sched_irq = false;
+ +		struct snd_pcm_substream *pcm;
+  
+ -		if (s->ctx_data.rx.syt_override < 0)
+ -			syt = desc->syt;
+ -		else
+ -			syt = s->ctx_data.rx.syt_override;
+ +		cycle = compute_it_cycle(*ctx_header);
+ +		syt = calculate_syt(s, cycle);
+ +		data_blocks = calculate_data_blocks(s, syt);
+ +		buffer = s->buffer.packets[s->packet_index].buffer;
+ +		pcm_frames = s->process_data_blocks(s, buffer, data_blocks,
+ +						    &syt);
+  
+ -		build_it_pkt_header(s, desc->cycle, &template.params,
+ -				    desc->data_blocks, desc->data_block_counter,
+ +		build_it_pkt_header(s, cycle, &template.params, data_blocks,
+  				    syt, i);
+  
+++<<<<<<< HEAD
+ +		if (queue_out_packet(s, &template.params) < 0) {
+++=======
++ 		if (is_irq_target) {
++ 			event_count += desc->data_blocks;
++ 			if (event_count >= events_per_period) {
++ 				event_count -= events_per_period;
++ 				sched_irq = true;
++ 			}
++ 		}
++ 
++ 		if (queue_out_packet(s, &template.params, sched_irq) < 0) {
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  			cancel_stream(s);
+  			return;
+  		}
+ +
+ +		pcm = READ_ONCE(s->pcm);
+ +		if (pcm && pcm_frames > 0)
+ +			update_pcm_pointers(s, pcm, pcm_frames);
+ +
+ +		++ctx_header;
+  	}
+  
+++<<<<<<< HEAD
+ +	fw_iso_context_queue_flush(s->context);
+++=======
++ 	s->ctx_data.rx.event_count = event_count;
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  }
+  
+  static void in_stream_callback(struct fw_iso_context *context, u32 tstamp,
+@@@ -767,63 -864,69 +832,121 @@@
+  			       void *private_data)
+  {
+  	struct amdtp_stream *s = private_data;
+ +	unsigned int i, packets;
+  	__be32 *ctx_header = header;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int packets;
++ 	int i;
++ 	int err;
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  
+  	if (s->packet_index < 0)
+  		return;
+  
+ -	// Calculate the number of packets in buffer and check XRUN.
+ +	// The number of packets in buffer.
+  	packets = header_length / s->ctx_data.tx.ctx_header_size;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < packets; i++) {
+ +		u32 cycle;
+ +		unsigned int payload_length;
+ +		unsigned int data_blocks;
+ +		unsigned int syt;
+ +		__be32 *buffer;
+ +		unsigned int pcm_frames = 0;
+ +		struct fw_iso_packet params = {0};
+ +		struct snd_pcm_substream *pcm;
+ +		int err;
+ +
+ +		cycle = compute_cycle_count(ctx_header[1]);
+ +		err = parse_ir_ctx_header(s, cycle, ctx_header, &payload_length,
+ +					  &data_blocks, &syt, i);
+ +		if (err < 0 && err != -EAGAIN)
+ +			break;
+ +
+ +		if (err >= 0) {
+ +			buffer = s->buffer.packets[s->packet_index].buffer;
+ +			pcm_frames = s->process_data_blocks(s, buffer,
+ +							    data_blocks, &syt);
+ +
+ +			if (!(s->flags & CIP_DBC_IS_END_EVENT)) {
+ +				s->data_block_counter += data_blocks;
+ +				s->data_block_counter &= 0xff;
+ +			}
+ +		}
+ +
+ +		if (queue_in_packet(s, &params) < 0)
+ +			break;
+ +
+ +		pcm = READ_ONCE(s->pcm);
+ +		if (pcm && pcm_frames > 0)
+ +			update_pcm_pointers(s, pcm, pcm_frames);
+ +
+ +		ctx_header += s->ctx_data.tx.ctx_header_size / sizeof(*ctx_header);
+ +	}
+ +
+ +	/* Queueing error or detecting invalid payload. */
+ +	if (i < packets) {
+ +		cancel_stream(s);
+ +		return;
+ +	}
+ +
+ +	fw_iso_context_queue_flush(s->context);
+++=======
++ 	err = generate_device_pkt_descs(s, s->pkt_descs, ctx_header, packets);
++ 	if (err < 0) {
++ 		if (err != -EAGAIN) {
++ 			cancel_stream(s);
++ 			return;
++ 		}
++ 	} else {
++ 		process_ctx_payloads(s, s->pkt_descs, packets);
++ 	}
++ 
++ 	for (i = 0; i < packets; ++i) {
++ 		struct fw_iso_packet params = {0};
++ 
++ 		if (queue_in_packet(s, &params) < 0) {
++ 			cancel_stream(s);
++ 			return;
++ 		}
++ 	}
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  }
+  
+- /* this is executed one time */
++ static void amdtp_stream_master_callback(struct fw_iso_context *context,
++ 					 u32 tstamp, size_t header_length,
++ 					 void *header, void *private_data)
++ {
++ 	struct amdtp_domain *d = private_data;
++ 	struct amdtp_stream *irq_target = d->irq_target;
++ 	struct amdtp_stream *s;
++ 
++ 	out_stream_callback(context, tstamp, header_length, header, irq_target);
++ 	if (amdtp_streaming_error(irq_target))
++ 		goto error;
++ 
++ 	list_for_each_entry(s, &d->streams, list) {
++ 		if (s != irq_target && amdtp_stream_running(s)) {
++ 			fw_iso_context_flush_completions(s->context);
++ 			if (amdtp_streaming_error(s))
++ 				goto error;
++ 		}
++ 	}
++ 
++ 	return;
++ error:
++ 	if (amdtp_stream_running(irq_target))
++ 		cancel_stream(irq_target);
++ 
++ 	list_for_each_entry(s, &d->streams, list) {
++ 		if (amdtp_stream_running(s))
++ 			cancel_stream(s);
++ 	}
++ }
++ 
++ // this is executed one time.
+  static void amdtp_stream_first_callback(struct fw_iso_context *context,
+  					u32 tstamp, size_t header_length,
+  					void *header, void *private_data)
+@@@ -864,7 -988,8 +1008,12 @@@ static void amdtp_stream_master_first_c
+   * amdtp_stream_set_parameters() and it must be started before any PCM or MIDI
+   * device can be started.
+   */
+++<<<<<<< HEAD
+ +static int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed)
+++=======
++ static int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed,
++ 			      struct amdtp_domain *d, bool is_irq_target)
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  {
+  	static const struct {
+  		unsigned int data_block;
+@@@ -878,6 -1003,9 +1027,12 @@@
+  		[CIP_SFC_88200]  = {  0,   67 },
+  		[CIP_SFC_176400] = {  0,   67 },
+  	};
+++<<<<<<< HEAD
+++=======
++ 	unsigned int events_per_buffer = d->events_per_buffer;
++ 	unsigned int events_per_period = d->events_per_period;
++ 	unsigned int idle_irq_interval;
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  	unsigned int ctx_header_size;
+  	unsigned int max_ctx_payload_size;
+  	enum dma_data_direction dir;
+@@@ -923,7 -1059,20 +1086,24 @@@
+  			max_ctx_payload_size -= IT_PKT_HEADER_SIZE_CIP;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = iso_packets_buffer_init(&s->buffer, s->unit, QUEUE_LENGTH,
+++=======
++ 	// This is a case that AMDTP streams in domain run just for MIDI
++ 	// substream. Use the number of events equivalent to 10 msec as
++ 	// interval of hardware IRQ.
++ 	if (events_per_period == 0)
++ 		events_per_period = amdtp_rate_table[s->sfc] / 100;
++ 	if (events_per_buffer == 0)
++ 		events_per_buffer = events_per_period * 3;
++ 
++ 	idle_irq_interval = DIV_ROUND_UP(CYCLES_PER_SECOND * events_per_period,
++ 					 amdtp_rate_table[s->sfc]);
++ 	s->queue_size = DIV_ROUND_UP(CYCLES_PER_SECOND * events_per_buffer,
++ 				     amdtp_rate_table[s->sfc]);
++ 
++ 	err = iso_packets_buffer_init(&s->buffer, s->unit, s->queue_size,
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  				      max_ctx_payload_size, dir);
+  	if (err < 0)
+  		goto err_unlock;
+@@@ -961,12 -1120,21 +1151,28 @@@
+  	s->packet_index = 0;
+  	do {
+  		struct fw_iso_packet params;
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  		if (s->direction == AMDTP_IN_STREAM) {
+  			err = queue_in_packet(s, &params);
+  		} else {
++ 			bool sched_irq = false;
++ 
+  			params.header_length = 0;
+  			params.payload_length = 0;
+++<<<<<<< HEAD
+ +			err = queue_out_packet(s, &params);
+++=======
++ 
++ 			if (is_irq_target) {
++ 				sched_irq = !((s->packet_index + 1) %
++ 					      idle_irq_interval);
++ 			}
++ 
++ 			err = queue_out_packet(s, &params, sched_irq);
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  		}
+  		if (err < 0)
+  			goto err_pkt_descs;
+@@@ -1127,3 -1312,92 +1333,95 @@@ void amdtp_domain_destroy(struct amdtp_
+  	return;
+  }
+  EXPORT_SYMBOL_GPL(amdtp_domain_destroy);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * amdtp_domain_add_stream - register isoc context into the domain.
++  * @d: the AMDTP domain.
++  * @s: the AMDTP stream.
++  * @channel: the isochronous channel on the bus.
++  * @speed: firewire speed code.
++  */
++ int amdtp_domain_add_stream(struct amdtp_domain *d, struct amdtp_stream *s,
++ 			    int channel, int speed)
++ {
++ 	struct amdtp_stream *tmp;
++ 
++ 	list_for_each_entry(tmp, &d->streams, list) {
++ 		if (s == tmp)
++ 			return -EBUSY;
++ 	}
++ 
++ 	list_add(&s->list, &d->streams);
++ 
++ 	s->channel = channel;
++ 	s->speed = speed;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_add_stream);
++ 
++ /**
++  * amdtp_domain_start - start sending packets for isoc context in the domain.
++  * @d: the AMDTP domain.
++  */
++ int amdtp_domain_start(struct amdtp_domain *d)
++ {
++ 	struct amdtp_stream *s;
++ 	int err = 0;
++ 
++ 	// Select an IT context as IRQ target.
++ 	list_for_each_entry(s, &d->streams, list) {
++ 		if (s->direction == AMDTP_OUT_STREAM)
++ 			break;
++ 	}
++ 	if (!s)
++ 		return -ENXIO;
++ 	d->irq_target = s;
++ 
++ 	list_for_each_entry(s, &d->streams, list) {
++ 		if (s != d->irq_target) {
++ 			err = amdtp_stream_start(s, s->channel, s->speed, d,
++ 						 false);
++ 			if (err < 0)
++ 				goto error;
++ 		}
++ 	}
++ 
++ 	s = d->irq_target;
++ 	err = amdtp_stream_start(s, s->channel, s->speed, d, true);
++ 	if (err < 0)
++ 		goto error;
++ 
++ 	return 0;
++ error:
++ 	list_for_each_entry(s, &d->streams, list)
++ 		amdtp_stream_stop(s);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_start);
++ 
++ /**
++  * amdtp_domain_stop - stop sending packets for isoc context in the same domain.
++  * @d: the AMDTP domain to which the isoc contexts belong.
++  */
++ void amdtp_domain_stop(struct amdtp_domain *d)
++ {
++ 	struct amdtp_stream *s, *next;
++ 
++ 	if (d->irq_target)
++ 		amdtp_stream_stop(d->irq_target);
++ 
++ 	list_for_each_entry_safe(s, next, &d->streams, list) {
++ 		list_del(&s->list);
++ 
++ 		if (s != d->irq_target)
++ 			amdtp_stream_stop(s);
++ 	}
++ 
++ 	d->events_per_period = 0;
++ 	d->irq_target = NULL;
++ }
++ EXPORT_SYMBOL_GPL(amdtp_domain_stop);
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+diff --cc sound/firewire/amdtp-stream.h
+index 7032772c4f90,c4bde69c2d4f..000000000000
+--- a/sound/firewire/amdtp-stream.h
++++ b/sound/firewire/amdtp-stream.h
+@@@ -140,6 -142,11 +140,14 @@@ struct amdtp_stream 
+  
+  			// To generate CIP header.
+  			unsigned int fdf;
+++<<<<<<< HEAD
+++=======
++ 			int syt_override;
++ 
++ 			// To generate constant hardware IRQ.
++ 			unsigned int event_count;
++ 			unsigned int events_per_period;
+++>>>>>>> 60dd49298ec5 (ALSA: firewire-lib: handle several AMDTP streams in callback handler of IRQ target)
+  		} rx;
+  	} ctx_data;
+  
+* Unmerged path sound/firewire/amdtp-stream.c
+* Unmerged path sound/firewire/amdtp-stream.h
