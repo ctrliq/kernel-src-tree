@@ -1,0 +1,189 @@
+cfg80211: util: fix bit count off by one
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Mordechay Goodstein <mordechay.goodstein@intel.com>
+commit 1a473d6092d5d182914bea854ce0b21e6d12519d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/1a473d60.failed
+
+The bits of Rx MCS Map in VHT capability were enumerated
+with index transform - index i -> (i + 1) bit => nss i. BUG!
+while it should be -   index i -> (i + 1) bit => (i + 1) nss.
+
+The bug was exposed in commit a53b2a0b1245 ("iwlwifi: mvm: implement VHT
+extended NSS support in rs.c"), where iwlwifi started using the
+function.
+
+	Signed-off-by: Mordechay Goodstein <mordechay.goodstein@intel.com>
+Fixes: b0aa75f0b1b2 ("ieee80211: add new VHT capability fields/parsing")
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 1a473d6092d5d182914bea854ce0b21e6d12519d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/wireless/util.c
+diff --cc net/wireless/util.c
+index 3c654cd7ba56,1c39d6a2e850..000000000000
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@@ -1810,3 -1922,153 +1810,156 @@@ EXPORT_SYMBOL(rfc1042_header)
+  const unsigned char bridge_tunnel_header[] __aligned(2) =
+  	{ 0xaa, 0xaa, 0x03, 0x00, 0x00, 0xf8 };
+  EXPORT_SYMBOL(bridge_tunnel_header);
+++<<<<<<< HEAD
+++=======
++ 
++ /* Layer 2 Update frame (802.2 Type 1 LLC XID Update response) */
++ struct iapp_layer2_update {
++ 	u8 da[ETH_ALEN];	/* broadcast */
++ 	u8 sa[ETH_ALEN];	/* STA addr */
++ 	__be16 len;		/* 6 */
++ 	u8 dsap;		/* 0 */
++ 	u8 ssap;		/* 0 */
++ 	u8 control;
++ 	u8 xid_info[3];
++ } __packed;
++ 
++ void cfg80211_send_layer2_update(struct net_device *dev, const u8 *addr)
++ {
++ 	struct iapp_layer2_update *msg;
++ 	struct sk_buff *skb;
++ 
++ 	/* Send Level 2 Update Frame to update forwarding tables in layer 2
++ 	 * bridge devices */
++ 
++ 	skb = dev_alloc_skb(sizeof(*msg));
++ 	if (!skb)
++ 		return;
++ 	msg = skb_put(skb, sizeof(*msg));
++ 
++ 	/* 802.2 Type 1 Logical Link Control (LLC) Exchange Identifier (XID)
++ 	 * Update response frame; IEEE Std 802.2-1998, 5.4.1.2.1 */
++ 
++ 	eth_broadcast_addr(msg->da);
++ 	ether_addr_copy(msg->sa, addr);
++ 	msg->len = htons(6);
++ 	msg->dsap = 0;
++ 	msg->ssap = 0x01;	/* NULL LSAP, CR Bit: Response */
++ 	msg->control = 0xaf;	/* XID response lsb.1111F101.
++ 				 * F=0 (no poll command; unsolicited frame) */
++ 	msg->xid_info[0] = 0x81;	/* XID format identifier */
++ 	msg->xid_info[1] = 1;	/* LLC types/classes: Type 1 LLC */
++ 	msg->xid_info[2] = 0;	/* XID sender's receive window size (RW) */
++ 
++ 	skb->dev = dev;
++ 	skb->protocol = eth_type_trans(skb, dev);
++ 	memset(skb->cb, 0, sizeof(skb->cb));
++ 	netif_rx_ni(skb);
++ }
++ EXPORT_SYMBOL(cfg80211_send_layer2_update);
++ 
++ int ieee80211_get_vht_max_nss(struct ieee80211_vht_cap *cap,
++ 			      enum ieee80211_vht_chanwidth bw,
++ 			      int mcs, bool ext_nss_bw_capable)
++ {
++ 	u16 map = le16_to_cpu(cap->supp_mcs.rx_mcs_map);
++ 	int max_vht_nss = 0;
++ 	int ext_nss_bw;
++ 	int supp_width;
++ 	int i, mcs_encoding;
++ 
++ 	if (map == 0xffff)
++ 		return 0;
++ 
++ 	if (WARN_ON(mcs > 9))
++ 		return 0;
++ 	if (mcs <= 7)
++ 		mcs_encoding = 0;
++ 	else if (mcs == 8)
++ 		mcs_encoding = 1;
++ 	else
++ 		mcs_encoding = 2;
++ 
++ 	/* find max_vht_nss for the given MCS */
++ 	for (i = 7; i >= 0; i--) {
++ 		int supp = (map >> (2 * i)) & 3;
++ 
++ 		if (supp == 3)
++ 			continue;
++ 
++ 		if (supp >= mcs_encoding) {
++ 			max_vht_nss = i + 1;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!(cap->supp_mcs.tx_mcs_map &
++ 			cpu_to_le16(IEEE80211_VHT_EXT_NSS_BW_CAPABLE)))
++ 		return max_vht_nss;
++ 
++ 	ext_nss_bw = le32_get_bits(cap->vht_cap_info,
++ 				   IEEE80211_VHT_CAP_EXT_NSS_BW_MASK);
++ 	supp_width = le32_get_bits(cap->vht_cap_info,
++ 				   IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK);
++ 
++ 	/* if not capable, treat ext_nss_bw as 0 */
++ 	if (!ext_nss_bw_capable)
++ 		ext_nss_bw = 0;
++ 
++ 	/* This is invalid */
++ 	if (supp_width == 3)
++ 		return 0;
++ 
++ 	/* This is an invalid combination so pretend nothing is supported */
++ 	if (supp_width == 2 && (ext_nss_bw == 1 || ext_nss_bw == 2))
++ 		return 0;
++ 
++ 	/*
++ 	 * Cover all the special cases according to IEEE 802.11-2016
++ 	 * Table 9-250. All other cases are either factor of 1 or not
++ 	 * valid/supported.
++ 	 */
++ 	switch (bw) {
++ 	case IEEE80211_VHT_CHANWIDTH_USE_HT:
++ 	case IEEE80211_VHT_CHANWIDTH_80MHZ:
++ 		if ((supp_width == 1 || supp_width == 2) &&
++ 		    ext_nss_bw == 3)
++ 			return 2 * max_vht_nss;
++ 		break;
++ 	case IEEE80211_VHT_CHANWIDTH_160MHZ:
++ 		if (supp_width == 0 &&
++ 		    (ext_nss_bw == 1 || ext_nss_bw == 2))
++ 			return max_vht_nss / 2;
++ 		if (supp_width == 0 &&
++ 		    ext_nss_bw == 3)
++ 			return (3 * max_vht_nss) / 4;
++ 		if (supp_width == 1 &&
++ 		    ext_nss_bw == 3)
++ 			return 2 * max_vht_nss;
++ 		break;
++ 	case IEEE80211_VHT_CHANWIDTH_80P80MHZ:
++ 		if (supp_width == 0 && ext_nss_bw == 1)
++ 			return 0; /* not possible */
++ 		if (supp_width == 0 &&
++ 		    ext_nss_bw == 2)
++ 			return max_vht_nss / 2;
++ 		if (supp_width == 0 &&
++ 		    ext_nss_bw == 3)
++ 			return (3 * max_vht_nss) / 4;
++ 		if (supp_width == 1 &&
++ 		    ext_nss_bw == 0)
++ 			return 0; /* not possible */
++ 		if (supp_width == 1 &&
++ 		    ext_nss_bw == 1)
++ 			return max_vht_nss / 2;
++ 		if (supp_width == 1 &&
++ 		    ext_nss_bw == 2)
++ 			return (3 * max_vht_nss) / 4;
++ 		break;
++ 	}
++ 
++ 	/* not covered or invalid combination received */
++ 	return max_vht_nss;
++ }
++ EXPORT_SYMBOL(ieee80211_get_vht_max_nss);
+++>>>>>>> 1a473d6092d5 (cfg80211: util: fix bit count off by one)
+* Unmerged path net/wireless/util.c
