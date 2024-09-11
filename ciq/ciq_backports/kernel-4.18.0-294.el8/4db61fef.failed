@@ -1,0 +1,138 @@
+arm64: kvm: Modernize __smccc_workaround_1_smc_start annotations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [arm64] kvm: Modernize __smccc_workaround_1_smc_start annotations (Auger Eric) [1882794]
+Rebuild_FUZZ: 94.21%
+commit-author Mark Brown <broonie@kernel.org>
+commit 4db61fef16a104f94bde24fe163064b98cee6b7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4db61fef.failed
+
+In an effort to clarify and simplify the annotation of assembly functions
+in the kernel new macros have been introduced. These replace ENTRY and
+ENDPROC with separate annotations for standard C callable functions,
+data and code with different calling conventions.
+
+Using these for __smccc_workaround_1_smc is more involved than for most
+symbols as this symbol is annotated quite unusually, rather than just have
+the explicit symbol we define _start and _end symbols which we then use to
+compute the length. This does not play at all nicely with the new style
+macros. Instead define a constant for the size of the function and use that
+in both the C code and for .org based size checks in the assembly code.
+
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 4db61fef16a104f94bde24fe163064b98cee6b7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_asm.h
+diff --cc arch/arm64/include/asm/kvm_asm.h
+index a4d0cba43b8c,7c7eeeaab9fa..000000000000
+--- a/arch/arm64/include/asm/kvm_asm.h
++++ b/arch/arm64/include/asm/kvm_asm.h
+@@@ -88,25 -77,7 +90,29 @@@ extern void __vgic_v3_init_lrs(void)
+  
+  extern u32 __kvm_get_mdcr_el2(void);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Obtain the PC-relative address of a kernel symbol
+ + * s: symbol
+ + *
+ + * The goal of this macro is to return a symbol's address based on a
+ + * PC-relative computation, as opposed to a loading the VA from a
+ + * constant pool or something similar. This works well for HYP, as an
+ + * absolute VA is guaranteed to be wrong. Only use this if trying to
+ + * obtain the address of a symbol (i.e. not something you obtained by
+ + * following a pointer).
+ + */
+ +#define hyp_symbol_addr(s)						\
+ +	({								\
+ +		typeof(s) *addr;					\
+ +		asm("adrp	%0, %1\n"				\
+ +		    "add	%0, %0, :lo12:%1\n"			\
+ +		    : "=r" (addr) : "S" (&s));				\
+ +		addr;							\
+ +	})
+++=======
++ extern char __smccc_workaround_1_smc[__SMCCC_WORKAROUND_1_SMC_SZ];
+++>>>>>>> 4db61fef16a1 (arm64: kvm: Modernize __smccc_workaround_1_smc_start annotations)
+  
+  /* Home-grown __this_cpu_{ptr,read} variants that always work at HYP */
+  #define __hyp_this_cpu_ptr(sym)						\
+* Unmerged path arch/arm64/include/asm/kvm_asm.h
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 24102ebdf637..47b633d88291 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -22,6 +22,7 @@
+ #include <asm/cpu.h>
+ #include <asm/cputype.h>
+ #include <asm/cpufeature.h>
++#include <asm/kvm_asm.h>
+ #include <asm/smp_plat.h>
+ 
+ static bool __maybe_unused
+@@ -124,9 +125,6 @@ atomic_t arm64_el2_vector_last_slot = ATOMIC_INIT(-1);
+ DEFINE_PER_CPU_READ_MOSTLY(struct bp_hardening_data, bp_hardening_data);
+ 
+ #ifdef CONFIG_KVM_INDIRECT_VECTORS
+-extern char __smccc_workaround_1_smc_start[];
+-extern char __smccc_workaround_1_smc_end[];
+-
+ static void __copy_hyp_vect_bpi(int slot, const char *hyp_vecs_start,
+ 				const char *hyp_vecs_end)
+ {
+@@ -174,9 +172,6 @@ static void install_bp_hardening_cb(bp_hardening_cb_t fn,
+ 	raw_spin_unlock(&bp_lock);
+ }
+ #else
+-#define __smccc_workaround_1_smc_start		NULL
+-#define __smccc_workaround_1_smc_end		NULL
+-
+ static void install_bp_hardening_cb(bp_hardening_cb_t fn,
+ 				      const char *hyp_vecs_start,
+ 				      const char *hyp_vecs_end)
+@@ -250,11 +245,14 @@ static int detect_harden_bp_fw(void)
+ 		smccc_end = NULL;
+ 		break;
+ 
++#if IS_ENABLED(CONFIG_KVM_ARM_HOST)
+ 	case SMCCC_CONDUIT_SMC:
+ 		cb = call_smc_arch_workaround_1;
+-		smccc_start = __smccc_workaround_1_smc_start;
+-		smccc_end = __smccc_workaround_1_smc_end;
++		smccc_start = __smccc_workaround_1_smc;
++		smccc_end = __smccc_workaround_1_smc +
++			__SMCCC_WORKAROUND_1_SMC_SZ;
+ 		break;
++#endif
+ 
+ 	default:
+ 		return -1;
+diff --git a/arch/arm64/kvm/hyp/hyp-entry.S b/arch/arm64/kvm/hyp/hyp-entry.S
+index cc210d405c4a..655b7613e016 100644
+--- a/arch/arm64/kvm/hyp/hyp-entry.S
++++ b/arch/arm64/kvm/hyp/hyp-entry.S
+@@ -333,7 +333,7 @@ SYM_CODE_END(__bp_harden_hyp_vecs)
+ 
+ 	.popsection
+ 
+-ENTRY(__smccc_workaround_1_smc_start)
++SYM_CODE_START(__smccc_workaround_1_smc)
+ 	esb
+ 	sub	sp, sp, #(8 * 4)
+ 	stp	x2, x3, [sp, #(8 * 0)]
+@@ -343,5 +343,7 @@ ENTRY(__smccc_workaround_1_smc_start)
+ 	ldp	x2, x3, [sp, #(8 * 0)]
+ 	ldp	x0, x1, [sp, #(8 * 2)]
+ 	add	sp, sp, #(8 * 4)
+-ENTRY(__smccc_workaround_1_smc_end)
++1:	.org __smccc_workaround_1_smc + __SMCCC_WORKAROUND_1_SMC_SZ
++	.org 1b
++SYM_CODE_END(__smccc_workaround_1_smc)
+ #endif
