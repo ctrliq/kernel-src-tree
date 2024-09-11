@@ -1,0 +1,136 @@
+net/mlx5e: Support offloading double vlan push/pop tc actions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jianbo Liu <jianbol@mellanox.com>
+commit cc495188a8ff0d169ad7c0182acd9c08b90e29ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/cc495188.failed
+
+As we can configure two push/pop actions in one flow table entry,
+add support to offload those double vlan actions in a rule to HW.
+
+	Signed-off-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit cc495188a8ff0d169ad7c0182acd9c08b90e29ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 1a38c9a292e1,e9888d6c1f7c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2568,6 -2578,56 +2568,59 @@@ out_err
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int parse_tc_vlan_action(struct mlx5e_priv *priv,
++ 				const struct tc_action *a,
++ 				struct mlx5_esw_flow_attr *attr,
++ 				u32 *action)
++ {
++ 	u8 vlan_idx = attr->total_vlan;
++ 
++ 	if (vlan_idx >= MLX5_FS_VLAN_DEPTH)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (tcf_vlan_action(a) == TCA_VLAN_ACT_POP) {
++ 		if (vlan_idx) {
++ 			if (!mlx5_eswitch_vlan_actions_supported(priv->mdev,
++ 								 MLX5_FS_VLAN_DEPTH))
++ 				return -EOPNOTSUPP;
++ 
++ 			*action |= MLX5_FLOW_CONTEXT_ACTION_VLAN_POP_2;
++ 		} else {
++ 			*action |= MLX5_FLOW_CONTEXT_ACTION_VLAN_POP;
++ 		}
++ 	} else if (tcf_vlan_action(a) == TCA_VLAN_ACT_PUSH) {
++ 		attr->vlan_vid[vlan_idx] = tcf_vlan_push_vid(a);
++ 		attr->vlan_prio[vlan_idx] = tcf_vlan_push_prio(a);
++ 		attr->vlan_proto[vlan_idx] = tcf_vlan_push_proto(a);
++ 		if (!attr->vlan_proto[vlan_idx])
++ 			attr->vlan_proto[vlan_idx] = htons(ETH_P_8021Q);
++ 
++ 		if (vlan_idx) {
++ 			if (!mlx5_eswitch_vlan_actions_supported(priv->mdev,
++ 								 MLX5_FS_VLAN_DEPTH))
++ 				return -EOPNOTSUPP;
++ 
++ 			*action |= MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH_2;
++ 		} else {
++ 			if (!mlx5_eswitch_vlan_actions_supported(priv->mdev, 1) &&
++ 			    (tcf_vlan_push_proto(a) != htons(ETH_P_8021Q) ||
++ 			     tcf_vlan_push_prio(a)))
++ 				return -EOPNOTSUPP;
++ 
++ 			*action |= MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH;
++ 		}
++ 	} else { /* action is TCA_VLAN_ACT_MODIFY */
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	attr->total_vlan = vlan_idx + 1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> cc495188a8ff (net/mlx5e: Support offloading double vlan push/pop tc actions)
+  static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
+  				struct mlx5e_tc_flow_parse_attr *parse_attr,
+  				struct mlx5e_tc_flow *flow)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 6e515e30b0a9,c17bfcab517c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -256,9 -257,10 +257,16 @@@ struct mlx5_esw_flow_attr 
+  	int out_count;
+  
+  	int	action;
+++<<<<<<< HEAD
+ +	__be16	vlan_proto;
+ +	u16	vlan_vid;
+ +	u8	vlan_prio;
+++=======
++ 	__be16	vlan_proto[MLX5_FS_VLAN_DEPTH];
++ 	u16	vlan_vid[MLX5_FS_VLAN_DEPTH];
++ 	u8	vlan_prio[MLX5_FS_VLAN_DEPTH];
++ 	u8	total_vlan;
+++>>>>>>> cc495188a8ff (net/mlx5e: Support offloading double vlan push/pop tc actions)
+  	bool	vlan_handled;
+  	u32	encap_id;
+  	u32	mod_hdr_id;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 69ba11a2c222,f72b5c9dcfe9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -70,9 -70,14 +70,20 @@@ mlx5_eswitch_add_offloaded_rule(struct 
+  		flow_act.action &= ~(MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH |
+  				     MLX5_FLOW_CONTEXT_ACTION_VLAN_POP);
+  	else if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH) {
+++<<<<<<< HEAD
+ +		flow_act.vlan[0].ethtype = ntohs(attr->vlan_proto);
+ +		flow_act.vlan[0].vid = attr->vlan_vid;
+ +		flow_act.vlan[0].prio = attr->vlan_prio;
+++=======
++ 		flow_act.vlan[0].ethtype = ntohs(attr->vlan_proto[0]);
++ 		flow_act.vlan[0].vid = attr->vlan_vid[0];
++ 		flow_act.vlan[0].prio = attr->vlan_prio[0];
++ 		if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH_2) {
++ 			flow_act.vlan[1].ethtype = ntohs(attr->vlan_proto[1]);
++ 			flow_act.vlan[1].vid = attr->vlan_vid[1];
++ 			flow_act.vlan[1].prio = attr->vlan_prio[1];
++ 		}
+++>>>>>>> cc495188a8ff (net/mlx5e: Support offloading double vlan push/pop tc actions)
+  	}
+  
+  	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
