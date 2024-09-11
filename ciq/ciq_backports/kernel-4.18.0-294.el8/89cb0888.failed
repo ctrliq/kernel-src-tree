@@ -1,0 +1,204 @@
+mm: migrate: provide buffer_migrate_page_norefs()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jan Kara <jack@suse.cz>
+commit 89cb0888ca1483ad72648844ddd1b801863a8949
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/89cb0888.failed
+
+Provide a variant of buffer_migrate_page() that also checks whether there
+are no unexpected references to buffer heads.  This function will then be
+safe to use for block device pages.
+
+[akpm@linux-foundation.org: remove EXPORT_SYMBOL(buffer_migrate_page_norefs)]
+Link: http://lkml.kernel.org/r/20181211172143.7358-5-jack@suse.cz
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 89cb0888ca1483ad72648844ddd1b801863a8949)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index 60059875287d,8dd57601714f..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -775,13 -701,51 +775,61 @@@ int migrate_page(struct address_space *
+  EXPORT_SYMBOL(migrate_page);
+  
+  #ifdef CONFIG_BLOCK
+++<<<<<<< HEAD
+ +/*
+ + * Migration function for pages with buffers. This function can only be used
+ + * if the underlying filesystem guarantees that no other references to "page"
+ + * exist.
+ + */
+ +int buffer_migrate_page(struct address_space *mapping,
+ +		struct page *newpage, struct page *page, enum migrate_mode mode)
+++=======
++ /* Returns true if all buffers are successfully locked */
++ static bool buffer_migrate_lock_buffers(struct buffer_head *head,
++ 							enum migrate_mode mode)
++ {
++ 	struct buffer_head *bh = head;
++ 
++ 	/* Simple case, sync compaction */
++ 	if (mode != MIGRATE_ASYNC) {
++ 		do {
++ 			get_bh(bh);
++ 			lock_buffer(bh);
++ 			bh = bh->b_this_page;
++ 
++ 		} while (bh != head);
++ 
++ 		return true;
++ 	}
++ 
++ 	/* async case, we cannot block on lock_buffer so use trylock_buffer */
++ 	do {
++ 		get_bh(bh);
++ 		if (!trylock_buffer(bh)) {
++ 			/*
++ 			 * We failed to lock the buffer and cannot stall in
++ 			 * async migration. Release the taken locks
++ 			 */
++ 			struct buffer_head *failed_bh = bh;
++ 			put_bh(failed_bh);
++ 			bh = head;
++ 			while (bh != failed_bh) {
++ 				unlock_buffer(bh);
++ 				put_bh(bh);
++ 				bh = bh->b_this_page;
++ 			}
++ 			return false;
++ 		}
++ 
++ 		bh = bh->b_this_page;
++ 	} while (bh != head);
++ 	return true;
++ }
++ 
++ static int __buffer_migrate_page(struct address_space *mapping,
++ 		struct page *newpage, struct page *page, enum migrate_mode mode,
++ 		bool check_refs)
+++>>>>>>> 89cb0888ca14 (mm: migrate: provide buffer_migrate_page_norefs())
+  {
+  	struct buffer_head *bh, *head;
+  	int rc;
+@@@ -789,20 -754,45 +837,51 @@@
+  	if (!page_has_buffers(page))
+  		return migrate_page(mapping, newpage, page, mode);
+  
+ -	/* Check whether page does not have extra refs before we do more work */
+ -	expected_count = expected_page_refs(page);
+ -	if (page_count(page) != expected_count)
+ -		return -EAGAIN;
+ -
+  	head = page_buffers(page);
+ -	if (!buffer_migrate_lock_buffers(head, mode))
+ -		return -EAGAIN;
+  
+++<<<<<<< HEAD
+ +	rc = migrate_page_move_mapping(mapping, newpage, page, head, mode, 0);
+ +
+++=======
++ 	if (check_refs) {
++ 		bool busy;
++ 		bool invalidated = false;
++ 
++ recheck_buffers:
++ 		busy = false;
++ 		spin_lock(&mapping->private_lock);
++ 		bh = head;
++ 		do {
++ 			if (atomic_read(&bh->b_count)) {
++ 				busy = true;
++ 				break;
++ 			}
++ 			bh = bh->b_this_page;
++ 		} while (bh != head);
++ 		spin_unlock(&mapping->private_lock);
++ 		if (busy) {
++ 			if (invalidated) {
++ 				rc = -EAGAIN;
++ 				goto unlock_buffers;
++ 			}
++ 			invalidate_bh_lrus();
++ 			invalidated = true;
++ 			goto recheck_buffers;
++ 		}
++ 	}
++ 
++ 	rc = migrate_page_move_mapping(mapping, newpage, page, NULL, mode, 0);
+++>>>>>>> 89cb0888ca14 (mm: migrate: provide buffer_migrate_page_norefs())
+  	if (rc != MIGRATEPAGE_SUCCESS)
+ -		goto unlock_buffers;
+ +		return rc;
+ +
+ +	/*
+ +	 * In the async case, migrate_page_move_mapping locked the buffers
+ +	 * with an IRQ-safe spinlock held. In the sync case, the buffers
+ +	 * need to be locked now
+ +	 */
+ +	if (mode != MIGRATE_ASYNC)
+ +		BUG_ON(!buffer_migrate_lock_buffers(head, mode));
+  
+  	ClearPagePrivate(page);
+  	set_page_private(newpage, page_private(page));
+@@@ -832,9 -824,32 +911,32 @@@
+  
+  	} while (bh != head);
+  
+ -	return rc;
+ +	return MIGRATEPAGE_SUCCESS;
+  }
++ 
++ /*
++  * Migration function for pages with buffers. This function can only be used
++  * if the underlying filesystem guarantees that no other references to "page"
++  * exist. For example attached buffer heads are accessed only under page lock.
++  */
++ int buffer_migrate_page(struct address_space *mapping,
++ 		struct page *newpage, struct page *page, enum migrate_mode mode)
++ {
++ 	return __buffer_migrate_page(mapping, newpage, page, mode, false);
++ }
+  EXPORT_SYMBOL(buffer_migrate_page);
++ 
++ /*
++  * Same as above except that this variant is more careful and checks that there
++  * are also no buffer head references. This function is the right one for
++  * mappings where buffer heads are directly looked up and referenced (such as
++  * block device mappings).
++  */
++ int buffer_migrate_page_norefs(struct address_space *mapping,
++ 		struct page *newpage, struct page *page, enum migrate_mode mode)
++ {
++ 	return __buffer_migrate_page(mapping, newpage, page, mode, true);
++ }
+  #endif
+  
+  /*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index f65e87eb75f7..77d29c2c8856 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -3326,8 +3326,12 @@ extern int generic_check_addressable(unsigned, u64);
+ extern int buffer_migrate_page(struct address_space *,
+ 				struct page *, struct page *,
+ 				enum migrate_mode);
++extern int buffer_migrate_page_norefs(struct address_space *,
++				struct page *, struct page *,
++				enum migrate_mode);
+ #else
+ #define buffer_migrate_page NULL
++#define buffer_migrate_page_norefs NULL
+ #endif
+ 
+ extern int setattr_prepare(struct dentry *, struct iattr *);
+* Unmerged path mm/migrate.c
