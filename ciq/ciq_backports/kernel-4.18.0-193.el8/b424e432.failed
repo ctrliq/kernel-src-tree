@@ -1,0 +1,141 @@
+netlink: add validation of NLA_F_NESTED flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Michal Kubecek <mkubecek@suse.cz>
+commit b424e432e770d6dd572765459d5b6a96a19c5286
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b424e432.failed
+
+Add new validation flag NL_VALIDATE_NESTED which adds three consistency
+checks of NLA_F_NESTED_FLAG:
+
+  - the flag is set on attributes with NLA_NESTED{,_ARRAY} policy
+  - the flag is not set on attributes with other policies except NLA_UNSPEC
+  - the flag is set on attribute passed to nla_parse_nested()
+
+	Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+
+v2: change error messages to mention NLA_F_NESTED explicitly
+	Reviewed-by: Johannes Berg <johannes@sipsolutions.net>
+	Reviewed-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b424e432e770d6dd572765459d5b6a96a19c5286)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netlink.h
+diff --cc include/net/netlink.h
+index 01d3e027e7e1,395b4406f4b0..000000000000
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@@ -282,6 -387,40 +282,43 @@@ struct nl_info 
+  	bool			skip_notify;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * enum netlink_validation - netlink message/attribute validation levels
++  * @NL_VALIDATE_LIBERAL: Old-style "be liberal" validation, not caring about
++  *	extra data at the end of the message, attributes being longer than
++  *	they should be, or unknown attributes being present.
++  * @NL_VALIDATE_TRAILING: Reject junk data encountered after attribute parsing.
++  * @NL_VALIDATE_MAXTYPE: Reject attributes > max type; Together with _TRAILING
++  *	this is equivalent to the old nla_parse_strict()/nlmsg_parse_strict().
++  * @NL_VALIDATE_UNSPEC: Reject attributes with NLA_UNSPEC in the policy.
++  *	This can safely be set by the kernel when the given policy has no
++  *	NLA_UNSPEC anymore, and can thus be used to ensure policy entries
++  *	are enforced going forward.
++  * @NL_VALIDATE_STRICT_ATTRS: strict attribute policy parsing (e.g.
++  *	U8, U16, U32 must have exact size, etc.)
++  * @NL_VALIDATE_NESTED: Check that NLA_F_NESTED is set for NLA_NESTED(_ARRAY)
++  *	and unset for other policies.
++  */
++ enum netlink_validation {
++ 	NL_VALIDATE_LIBERAL = 0,
++ 	NL_VALIDATE_TRAILING = BIT(0),
++ 	NL_VALIDATE_MAXTYPE = BIT(1),
++ 	NL_VALIDATE_UNSPEC = BIT(2),
++ 	NL_VALIDATE_STRICT_ATTRS = BIT(3),
++ 	NL_VALIDATE_NESTED = BIT(4),
++ };
++ 
++ #define NL_VALIDATE_DEPRECATED_STRICT (NL_VALIDATE_TRAILING |\
++ 				       NL_VALIDATE_MAXTYPE)
++ #define NL_VALIDATE_STRICT (NL_VALIDATE_TRAILING |\
++ 			    NL_VALIDATE_MAXTYPE |\
++ 			    NL_VALIDATE_UNSPEC |\
++ 			    NL_VALIDATE_STRICT_ATTRS |\
++ 			    NL_VALIDATE_NESTED)
++ 
+++>>>>>>> b424e432e770 (netlink: add validation of NLA_F_NESTED flag)
+  int netlink_rcv_skb(struct sk_buff *skb,
+  		    int (*cb)(struct sk_buff *, struct nlmsghdr *,
+  			      struct netlink_ext_ack *));
+@@@ -826,8 -1136,32 +863,37 @@@ static inline int nla_parse_nested(stru
+  				   const struct nla_policy *policy,
+  				   struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	return nla_parse(tb, maxtype, nla_data(nla), nla_len(nla), policy,
+ +			 extack);
+++=======
++ 	if (!(nla->nla_type & NLA_F_NESTED)) {
++ 		NL_SET_ERR_MSG_ATTR(extack, nla, "NLA_F_NESTED is missing");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return __nla_parse(tb, maxtype, nla_data(nla), nla_len(nla), policy,
++ 			   NL_VALIDATE_STRICT, extack);
++ }
++ 
++ /**
++  * nla_parse_nested_deprecated - parse nested attributes
++  * @tb: destination array with maxtype+1 elements
++  * @maxtype: maximum attribute type to be expected
++  * @nla: attribute containing the nested attributes
++  * @policy: validation policy
++  * @extack: extended ACK report struct
++  *
++  * See nla_parse_deprecated()
++  */
++ static inline int nla_parse_nested_deprecated(struct nlattr *tb[], int maxtype,
++ 					      const struct nlattr *nla,
++ 					      const struct nla_policy *policy,
++ 					      struct netlink_ext_ack *extack)
++ {
++ 	return __nla_parse(tb, maxtype, nla_data(nla), nla_len(nla), policy,
++ 			   NL_VALIDATE_LIBERAL, extack);
+++>>>>>>> b424e432e770 (netlink: add validation of NLA_F_NESTED flag)
+  }
+  
+  /**
+* Unmerged path include/net/netlink.h
+diff --git a/lib/nlattr.c b/lib/nlattr.c
+index 17d86e6fbd3b..f1b9c4750791 100644
+--- a/lib/nlattr.c
++++ b/lib/nlattr.c
+@@ -116,6 +116,21 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 				    current->comm, type);
+ 	}
+ 
++	if (validate & NL_VALIDATE_NESTED) {
++		if ((pt->type == NLA_NESTED || pt->type == NLA_NESTED_ARRAY) &&
++		    !(nla->nla_type & NLA_F_NESTED)) {
++			NL_SET_ERR_MSG_ATTR(extack, nla,
++					    "NLA_F_NESTED is missing");
++			return -EINVAL;
++		}
++		if (pt->type != NLA_NESTED && pt->type != NLA_NESTED_ARRAY &&
++		    pt->type != NLA_UNSPEC && (nla->nla_type & NLA_F_NESTED)) {
++			NL_SET_ERR_MSG_ATTR(extack, nla,
++					    "NLA_F_NESTED not expected");
++			return -EINVAL;
++		}
++	}
++
+ 	switch (pt->type) {
+ 	case NLA_EXACT_LEN:
+ 		if (attrlen != pt->len)
