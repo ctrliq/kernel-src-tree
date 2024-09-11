@@ -126,6 +126,8 @@ enum {
 enum mlx5_ib_mmap_type {
 	MLX5_IB_MMAP_TYPE_MEMIC = 1,
 	MLX5_IB_MMAP_TYPE_VAR = 2,
+	MLX5_IB_MMAP_TYPE_UAR_WC = 3,
+	MLX5_IB_MMAP_TYPE_UAR_NC = 4,
 };
 
 #define MLX5_LOG_SW_ICM_BLOCK_SIZE(dev)                                        \
