@@ -959,7 +959,6 @@ static blk_status_t sd_setup_write_same_cmnd(struct scsi_cmnd *cmd)
 	struct bio *bio = rq->bio;
 	sector_t sector = blk_rq_pos(rq);
 	unsigned int nr_sectors = blk_rq_sectors(rq);
-	unsigned int nr_bytes = blk_rq_bytes(rq);
 	blk_status_t ret;
 
 	if (sdkp->device->no_write_same)
@@ -999,7 +998,7 @@ static blk_status_t sd_setup_write_same_cmnd(struct scsi_cmnd *cmd)
 	 */
 	rq->__data_len = sdp->sector_size;
 	ret = scsi_init_io(cmd);
-	rq->__data_len = nr_bytes;
+	rq->__data_len = blk_rq_bytes(rq);
 
 	return ret;
 }
