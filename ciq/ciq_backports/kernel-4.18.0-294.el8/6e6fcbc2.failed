@@ -1,0 +1,148 @@
+blk-mq: support batching dispatch in case of io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 6e6fcbc27e7788af54139c53537395d95560f2ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6e6fcbc2.failed
+
+More and more drivers want to get batching requests queued from
+block layer, such as mmc, and tcp based storage drivers. Also
+current in-tree users have virtio-scsi, virtio-blk and nvme.
+
+For none, we already support batching dispatch.
+
+But for io scheduler, every time we just take one request from scheduler
+and pass the single request to blk_mq_dispatch_rq_list(). This way makes
+batching dispatch not possible when io scheduler is applied. One reason
+is that we don't want to hurt sequential IO performance, becasue IO
+merge chance is reduced if more requests are dequeued from scheduler
+queue.
+
+Try to support batching dispatch for io scheduler by starting with the
+following simple approach:
+
+1) still make sure we can get budget before dequeueing request
+
+2) use hctx->dispatch_busy to evaluate if queue is busy, if it is busy
+we fackback to non-batching dispatch, otherwise dequeue as many as
+possible requests from scheduler, and pass them to blk_mq_dispatch_rq_list().
+
+Wrt. 2), we use similar policy for none, and turns out that SCSI SSD
+performance got improved much.
+
+In future, maybe we can develop more intelligent algorithem for batching
+dispatch.
+
+Baolin has tested this patch and found that MMC performance is improved[3].
+
+[1] https://lore.kernel.org/linux-block/20200512075501.GF1531898@T590/#r
+[2] https://lore.kernel.org/linux-block/fe6bd8b9-6ed9-b225-f80c-314746133722@grimberg.me/
+[3] https://lore.kernel.org/linux-block/CADBw62o9eTQDJ9RvNgEqSpXmg6Xcq=2TxH0Hfxhp29uF2W=TXA@mail.gmail.com/
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Tested-by: Baolin Wang <baolin.wang7@gmail.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Cc: Baolin Wang <baolin.wang7@gmail.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 6e6fcbc27e7788af54139c53537395d95560f2ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+diff --cc block/blk-mq-sched.c
+index 5b47c24f496b,1c52e56a19b1..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -102,8 -126,16 +134,20 @@@ static int __blk_mq_do_dispatch_sched(s
+  {
+  	struct request_queue *q = hctx->queue;
+  	struct elevator_queue *e = q->elevator;
++ 	bool multi_hctxs = false, run_queue = false;
++ 	bool dispatched = false, busy = false;
++ 	unsigned int max_dispatch;
+  	LIST_HEAD(rq_list);
+++<<<<<<< HEAD
+ +	int ret = 0;
+++=======
++ 	int count = 0;
++ 
++ 	if (hctx->dispatch_busy)
++ 		max_dispatch = 1;
++ 	else
++ 		max_dispatch = hctx->queue->nr_requests;
+++>>>>>>> 6e6fcbc27e77 (blk-mq: support batching dispatch in case of io)
+  
+  	do {
+  		struct request *rq;
+@@@ -138,8 -170,42 +182,47 @@@
+  		 * if this rq won't be queued to driver via .queue_rq()
+  		 * in blk_mq_dispatch_rq_list().
+  		 */
+++<<<<<<< HEAD
+ +		list_add(&rq->queuelist, &rq_list);
+ +	} while (blk_mq_dispatch_rq_list(q, &rq_list, true));
+++=======
++ 		list_add_tail(&rq->queuelist, &rq_list);
++ 		if (rq->mq_hctx != hctx)
++ 			multi_hctxs = true;
++ 	} while (++count < max_dispatch);
++ 
++ 	if (!count) {
++ 		if (run_queue)
++ 			blk_mq_delay_run_hw_queues(q, BLK_MQ_BUDGET_DELAY);
++ 	} else if (multi_hctxs) {
++ 		/*
++ 		 * Requests from different hctx may be dequeued from some
++ 		 * schedulers, such as bfq and deadline.
++ 		 *
++ 		 * Sort the requests in the list according to their hctx,
++ 		 * dispatch batching requests from same hctx at a time.
++ 		 */
++ 		list_sort(NULL, &rq_list, sched_rq_cmp);
++ 		do {
++ 			dispatched |= blk_mq_dispatch_hctx_list(&rq_list);
++ 		} while (!list_empty(&rq_list));
++ 	} else {
++ 		dispatched = blk_mq_dispatch_rq_list(hctx, &rq_list, count);
++ 	}
++ 
++ 	if (busy)
++ 		return -EAGAIN;
++ 	return !!dispatched;
++ }
++ 
++ static int blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
++ {
++ 	int ret;
++ 
++ 	do {
++ 		ret = __blk_mq_do_dispatch_sched(hctx);
++ 	} while (ret == 1);
+++>>>>>>> 6e6fcbc27e77 (blk-mq: support batching dispatch in case of io)
+  
+  	return ret;
+  }
+diff --cc block/blk-mq.c
+index 51b640f2232f,a8fac4ff6fef..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1224,8 -1319,6 +1224,11 @@@ bool blk_mq_dispatch_rq_list(struct req
+  	if (list_empty(list))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	WARN_ON(!list_is_singular(list) && got_budget);
+ +
+++=======
+++>>>>>>> 6e6fcbc27e77 (blk-mq: support batching dispatch in case of io)
+  	/*
+  	 * Now process all the entries, sending them to the driver.
+  	 */
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
