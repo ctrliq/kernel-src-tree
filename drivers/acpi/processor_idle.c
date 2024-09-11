@@ -174,18 +174,10 @@ static void lapic_timer_propagate_broadcast(struct acpi_processor *pr)
 }
 
 /* Power(C) State timer broadcast control */
-static void lapic_timer_state_broadcast(struct acpi_processor *pr,
-				       struct acpi_processor_cx *cx,
-				       int broadcast)
+static bool lapic_timer_needs_broadcast(struct acpi_processor *pr,
+					struct acpi_processor_cx *cx)
 {
-	int state = cx - pr->power.states;
-
-	if (state >= pr->power.timer_broadcast_on_state) {
-		if (broadcast)
-			tick_broadcast_enter();
-		else
-			tick_broadcast_exit();
-	}
+	return cx - pr->power.states >= pr->power.timer_broadcast_on_state;
 }
 
 #else
@@ -193,9 +185,9 @@ static void lapic_timer_state_broadcast(struct acpi_processor *pr,
 static void lapic_timer_check_state(int state, struct acpi_processor *pr,
 				   struct acpi_processor_cx *cstate) { }
 static void lapic_timer_propagate_broadcast(struct acpi_processor *pr) { }
-static void lapic_timer_state_broadcast(struct acpi_processor *pr,
-				       struct acpi_processor_cx *cx,
-				       int broadcast)
+
+static bool lapic_timer_needs_broadcast(struct acpi_processor *pr,
+					struct acpi_processor_cx *cx)
 {
 }
 
@@ -579,19 +571,11 @@ static DEFINE_RAW_SPINLOCK(c3_lock);
  * acpi_idle_enter_bm - enters C3 with proper BM handling
  * @pr: Target processor
  * @cx: Target state context
- * @timer_bc: Whether or not to change timer mode to broadcast
  */
 static void acpi_idle_enter_bm(struct acpi_processor *pr,
-			       struct acpi_processor_cx *cx, bool timer_bc)
+			       struct acpi_processor_cx *cx)
 {
 	acpi_unlazy_tlb(smp_processor_id());
-
-	/*
-	 * Must be done before busmaster disable as we might need to
-	 * access HPET !
-	 */
-	if (timer_bc)
-		lapic_timer_state_broadcast(pr, cx, 1);
 
 	/*
 	 * disable bus master
@@ -620,9 +604,6 @@ static void acpi_idle_enter_bm(struct acpi_processor *pr,
 		c3_cpu_count--;
 		raw_spin_unlock(&c3_lock);
 	}
-
-	if (timer_bc)
-		lapic_timer_state_broadcast(pr, cx, 0);
 }
 
 static int acpi_idle_enter(struct cpuidle_device *dev,
@@ -641,7 +622,7 @@ static int acpi_idle_enter(struct cpuidle_device *dev,
 			cx = per_cpu(acpi_cstate[index], dev->cpu);
 		} else if (cx->type == ACPI_STATE_C3 && pr->flags.bm_check) {
 			if (cx->bm_sts_skip || !acpi_idle_bm_check()) {
-				acpi_idle_enter_bm(pr, cx, true);
+				acpi_idle_enter_bm(pr, cx);
 				return index;
 			} else if (drv->safe_state_index >= 0) {
 				index = drv->safe_state_index;
@@ -653,14 +634,10 @@ static int acpi_idle_enter(struct cpuidle_device *dev,
 		}
 	}
 
-	lapic_timer_state_broadcast(pr, cx, 1);
-
 	if (cx->type == ACPI_STATE_C3)
 		ACPI_FLUSH_CPU_CACHE();
 
 	acpi_idle_do_entry(cx);
-
-	lapic_timer_state_broadcast(pr, cx, 0);
 
 	return index;
 }
@@ -677,7 +654,7 @@ static void acpi_idle_enter_s2idle(struct cpuidle_device *dev,
 			return 0;
 
 		if (pr->flags.bm_check) {
-			acpi_idle_enter_bm(pr, cx, false);
+			acpi_idle_enter_bm(pr, cx);
 			return 0;
 		} else {
 			ACPI_FLUSH_CPU_CACHE();
@@ -691,6 +668,7 @@ static int acpi_processor_setup_cpuidle_cx(struct acpi_processor *pr,
 {
 	int i, count = ACPI_IDLE_STATE_START;
 	struct acpi_processor_cx *cx;
+	struct cpuidle_state *state;
 
 	if (max_cstate == 0)
 		max_cstate = 1;
@@ -702,6 +680,11 @@ static int acpi_processor_setup_cpuidle_cx(struct acpi_processor *pr,
 			continue;
 
 		per_cpu(acpi_cstate[count], dev->cpu) = cx;
+
+		if (lapic_timer_needs_broadcast(pr, cx)) {
+			state = &acpi_idle_driver.states[count];
+			state->flags |= CPUIDLE_FLAG_TIMER_STOP;
+		}
 
 		count++;
 		if (count == CPUIDLE_STATE_MAX)
