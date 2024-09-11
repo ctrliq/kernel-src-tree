@@ -1,0 +1,330 @@
+x86/alternative: Relax text_poke_bp() constraint
+
+jira LE-1907
+cve CVE-2021-26341
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 26c44b776dba4ac692a0bf5a3836feb8a63fea6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/26c44b77.failed
+
+Currently, text_poke_bp() is very strict to only allow patching a
+single instruction; however with straight-line-speculation it will be
+required to patch: ret; int3, which is two instructions.
+
+As such, relax the constraints a little to allow int3 padding for all
+instructions that do not imply the execution of the next instruction,
+ie: RET, JMP.d8 and JMP.d32.
+
+While there, rename the text_poke_loc::rel32 field to ::disp.
+
+Note: this fills up the text_poke_loc structure which is now a round
+  16 bytes big.
+
+  [ bp: Put comments ontop instead of on the side. ]
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20211204134908.082342723@infradead.org
+(cherry picked from commit 26c44b776dba4ac692a0bf5a3836feb8a63fea6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/alternative.c
+diff --cc arch/x86/kernel/alternative.c
+index 0b65a0cb501d,5007c3ffe96f..000000000000
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@@ -777,19 -1107,54 +777,59 @@@ static void do_sync_core(void *info
+  	sync_core();
+  }
+  
+ -void text_poke_sync(void)
+ -{
+ -	on_each_cpu(do_sync_core, NULL, 1);
+ -}
+ -
+  struct text_poke_loc {
+++<<<<<<< HEAD
+ +	void *addr;
+ +	s32 rel32;
+ +	u8 opcode;
+ +	const u8 text[POKE_MAX_OPCODE_SIZE];
+++=======
++ 	/* addr := _stext + rel_addr */
++ 	s32 rel_addr;
++ 	s32 disp;
++ 	u8 len;
++ 	u8 opcode;
++ 	const u8 text[POKE_MAX_OPCODE_SIZE];
++ 	/* see text_poke_bp_batch() */
++ 	u8 old;
+++>>>>>>> 26c44b776dba (x86/alternative: Relax text_poke_bp() constraint)
+  };
+  
+ -struct bp_patching_desc {
+ +static struct bp_patching_desc {
+  	struct text_poke_loc *vec;
+  	int nr_entries;
+ -	atomic_t refs;
+ -};
+ +} bp_patching;
+  
+++<<<<<<< HEAD
+ +static int patch_cmp(const void *key, const void *elt)
+++=======
++ static struct bp_patching_desc *bp_desc;
++ 
++ static __always_inline
++ struct bp_patching_desc *try_get_desc(struct bp_patching_desc **descp)
++ {
++ 	/* rcu_dereference */
++ 	struct bp_patching_desc *desc = __READ_ONCE(*descp);
++ 
++ 	if (!desc || !arch_atomic_inc_not_zero(&desc->refs))
++ 		return NULL;
++ 
++ 	return desc;
++ }
++ 
++ static __always_inline void put_desc(struct bp_patching_desc *desc)
++ {
++ 	smp_mb__before_atomic();
++ 	arch_atomic_dec(&desc->refs);
++ }
++ 
++ static __always_inline void *text_poke_addr(struct text_poke_loc *tp)
++ {
++ 	return _stext + tp->rel_addr;
++ }
++ 
++ static __always_inline int patch_cmp(const void *key, const void *elt)
+++>>>>>>> 26c44b776dba (x86/alternative: Relax text_poke_bp() constraint)
+  {
+  	struct text_poke_loc *tp = (struct text_poke_loc *) elt;
+  
+@@@ -799,13 -1164,16 +839,17 @@@
+  		return 1;
+  	return 0;
+  }
+ +NOKPROBE_SYMBOL(patch_cmp);
+  
+ -noinstr int poke_int3_handler(struct pt_regs *regs)
+ +int poke_int3_handler(struct pt_regs *regs)
+  {
+ -	struct bp_patching_desc *desc;
+  	struct text_poke_loc *tp;
+++<<<<<<< HEAD
+++=======
++ 	int ret = 0;
+++>>>>>>> 26c44b776dba (x86/alternative: Relax text_poke_bp() constraint)
+  	void *ip;
+ -
+ -	if (user_mode(regs))
+ -		return 0;
+ +	int len;
+  
+  	/*
+  	 * Having observed our INT3 instruction, we now must observe
+@@@ -833,20 -1197,19 +877,19 @@@
+  	/*
+  	 * Skip the binary search if there is a single member in the vector.
+  	 */
+ -	if (unlikely(desc->nr_entries > 1)) {
+ -		tp = __inline_bsearch(ip, desc->vec, desc->nr_entries,
+ -				      sizeof(struct text_poke_loc),
+ -				      patch_cmp);
+ +	if (unlikely(bp_patching.nr_entries > 1)) {
+ +		tp = bsearch(ip, bp_patching.vec, bp_patching.nr_entries,
+ +			     sizeof(struct text_poke_loc),
+ +			     patch_cmp);
+  		if (!tp)
+ -			goto out_put;
+ +			return 0;
+  	} else {
+ -		tp = desc->vec;
+ -		if (text_poke_addr(tp) != ip)
+ -			goto out_put;
+ +		tp = bp_patching.vec;
+ +		if (tp->addr != ip)
+ +			return 0;
+  	}
+  
+- 	len = text_opcode_size(tp->opcode);
+- 	ip += len;
++ 	ip += tp->len;
+  
+  	switch (tp->opcode) {
+  	case INT3_INSN_OPCODE:
+@@@ -854,10 -1217,14 +897,10 @@@
+  		 * Someone poked an explicit INT3, they'll want to handle it,
+  		 * do not consume.
+  		 */
+ -		goto out_put;
+ -
+ -	case RET_INSN_OPCODE:
+ -		int3_emulate_ret(regs);
+ -		break;
+ +		return 0;
+  
+  	case CALL_INSN_OPCODE:
+- 		int3_emulate_call(regs, (long)ip + tp->rel32);
++ 		int3_emulate_call(regs, (long)ip + tp->disp);
+  		break;
+  
+  	case JMP32_INSN_OPCODE:
+@@@ -927,14 -1303,45 +970,19 @@@ static void text_poke_bp_batch(struct t
+  	 * Second step: update all but the first byte of the patched range.
+  	 */
+  	for (do_sync = 0, i = 0; i < nr_entries; i++) {
+++<<<<<<< HEAD
+ +		int len = text_opcode_size(tp[i].opcode);
+++=======
++ 		u8 old[POKE_MAX_OPCODE_SIZE] = { tp[i].old, };
++ 		int len = tp[i].len;
+++>>>>>>> 26c44b776dba (x86/alternative: Relax text_poke_bp() constraint)
+  
+ -		if (len - INT3_INSN_SIZE > 0) {
+ -			memcpy(old + INT3_INSN_SIZE,
+ -			       text_poke_addr(&tp[i]) + INT3_INSN_SIZE,
+ -			       len - INT3_INSN_SIZE);
+ -			text_poke(text_poke_addr(&tp[i]) + INT3_INSN_SIZE,
+ -				  (const char *)tp[i].text + INT3_INSN_SIZE,
+ -				  len - INT3_INSN_SIZE);
+ +		if (len - sizeof(int3) > 0) {
+ +			text_poke((char *)tp[i].addr + sizeof(int3),
+ +				  (const char *)tp[i].text + sizeof(int3),
+ +				  len - sizeof(int3));
+  			do_sync++;
+  		}
+ -
+ -		/*
+ -		 * Emit a perf event to record the text poke, primarily to
+ -		 * support Intel PT decoding which must walk the executable code
+ -		 * to reconstruct the trace. The flow up to here is:
+ -		 *   - write INT3 byte
+ -		 *   - IPI-SYNC
+ -		 *   - write instruction tail
+ -		 * At this point the actual control flow will be through the
+ -		 * INT3 and handler and not hit the old or new instruction.
+ -		 * Intel PT outputs FUP/TIP packets for the INT3, so the flow
+ -		 * can still be decoded. Subsequently:
+ -		 *   - emit RECORD_TEXT_POKE with the new instruction
+ -		 *   - IPI-SYNC
+ -		 *   - write first byte
+ -		 *   - IPI-SYNC
+ -		 * So before the text poke event timestamp, the decoder will see
+ -		 * either the old instruction flow or FUP/TIP of INT3. After the
+ -		 * text poke event timestamp, the decoder will see either the
+ -		 * new instruction flow or FUP/TIP of INT3. Thus decoders can
+ -		 * use the timestamp as the point at which to modify the
+ -		 * executable code.
+ -		 * The old instruction is recorded so that the event can be
+ -		 * processed forwards or backwards.
+ -		 */
+ -		perf_event_text_poke(text_poke_addr(&tp[i]), old, len,
+ -				     tp[i].text, len);
+  	}
+  
+  	if (do_sync) {
+@@@ -959,42 -1366,54 +1007,67 @@@
+  	}
+  
+  	if (do_sync)
+ -		text_poke_sync();
+ +		on_each_cpu(do_sync_core, NULL, 1);
+  
+  	/*
+ -	 * Remove and synchronize_rcu(), except we have a very primitive
+ -	 * refcount based completion.
+ +	 * sync_core() implies an smp_mb() and orders this store against
+ +	 * the writing of the new instruction.
+ +	 */
+ +	bp_patching.nr_entries = 0;
+ +	/*
+ +	 * This sync_core () call ensures that all INT3 handlers in progress
+ +	 * have finished. This allows poke_int3_handler() after this to
+ +	 * avoid touching bp_paching.vec by checking nr_entries == 0.
+  	 */
+ -	WRITE_ONCE(bp_desc, NULL); /* RCU_INIT_POINTER */
+ -	if (!atomic_dec_and_test(&desc.refs))
+ -		atomic_cond_read_acquire(&desc.refs, !VAL);
+ +	on_each_cpu(do_sync_core, NULL, 1);
+ +	bp_patching.vec = NULL;
+  }
+  
+ -static void text_poke_loc_init(struct text_poke_loc *tp, void *addr,
+ -			       const void *opcode, size_t len, const void *emulate)
+ +void text_poke_loc_init(struct text_poke_loc *tp, void *addr,
+ +			const void *opcode, size_t len, const void *emulate)
+  {
+  	struct insn insn;
+- 	int ret;
++ 	int ret, i;
+  
+  	memcpy((void *)tp->text, opcode, len);
+  	if (!emulate)
+  		emulate = opcode;
+  
+++<<<<<<< HEAD
+ +	ret = insn_decode(&insn, emulate, MAX_INSN_SIZE, INSN_MODE_KERN);
+ +
+++=======
++ 	ret = insn_decode_kernel(&insn, emulate);
+++>>>>>>> 26c44b776dba (x86/alternative: Relax text_poke_bp() constraint)
+  	BUG_ON(ret < 0);
+- 	BUG_ON(len != insn.length);
+  
+++<<<<<<< HEAD
+ +	tp->addr = addr;
+++=======
++ 	tp->rel_addr = addr - (void *)_stext;
++ 	tp->len = len;
+++>>>>>>> 26c44b776dba (x86/alternative: Relax text_poke_bp() constraint)
+  	tp->opcode = insn.opcode.bytes[0];
+  
++ 	switch (tp->opcode) {
++ 	case RET_INSN_OPCODE:
++ 	case JMP32_INSN_OPCODE:
++ 	case JMP8_INSN_OPCODE:
++ 		/*
++ 		 * Control flow instructions without implied execution of the
++ 		 * next instruction can be padded with INT3.
++ 		 */
++ 		for (i = insn.length; i < len; i++)
++ 			BUG_ON(tp->text[i] != INT3_INSN_OPCODE);
++ 		break;
++ 
++ 	default:
++ 		BUG_ON(len != insn.length);
++ 	};
++ 
++ 
+  	switch (tp->opcode) {
+  	case INT3_INSN_OPCODE:
+ -	case RET_INSN_OPCODE:
+  		break;
+  
+  	case CALL_INSN_OPCODE:
+@@@ -1006,15 -1425,15 +1079,15 @@@
+  	default: /* assume NOP */
+  		switch (len) {
+  		case 2: /* NOP2 -- emulate as JMP8+0 */
+ -			BUG_ON(memcmp(emulate, x86_nops[len], len));
+ +			BUG_ON(memcmp(emulate, ideal_nops[len], len));
+  			tp->opcode = JMP8_INSN_OPCODE;
+- 			tp->rel32 = 0;
++ 			tp->disp = 0;
+  			break;
+  
+  		case 5: /* NOP5 -- emulate as JMP32+0 */
+ -			BUG_ON(memcmp(emulate, x86_nops[len], len));
+ +			BUG_ON(memcmp(emulate, ideal_nops[NOP_ATOMIC5], len));
+  			tp->opcode = JMP32_INSN_OPCODE;
+- 			tp->rel32 = 0;
++ 			tp->disp = 0;
+  			break;
+  
+  		default: /* unknown instruction */
+* Unmerged path arch/x86/kernel/alternative.c
