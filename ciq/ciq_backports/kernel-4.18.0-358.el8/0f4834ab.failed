@@ -1,0 +1,115 @@
+iommu/vt-d: Add PRQ handling latency sampling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 0f4834ab255bf488f20544e120713decfa77843e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/0f4834ab.failed
+
+The execution time for page fault request handling is performance critical
+and needs to be monitored. This adds code to sample the execution time of
+page fault request handling.
+
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20210520031531.712333-1-baolu.lu@linux.intel.com
+Link: https://lore.kernel.org/r/20210610020115.1637656-17-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 0f4834ab255bf488f20544e120713decfa77843e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/svm.c
+diff --cc drivers/iommu/intel/svm.c
+index f4c78a5e53a1,6bff9a7f9133..000000000000
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@@ -29,8 -21,10 +29,9 @@@
+  #include <linux/ioasid.h>
+  #include <asm/page.h>
+  #include <asm/fpu/api.h>
+ -#include <trace/events/intel_iommu.h>
+  
+  #include "pasid.h"
++ #include "perf.h"
+  #include "../iommu-sva-lib.h"
+  
+  static irqreturn_t prq_event_thread(int irq, void *d);
+@@@ -972,67 -990,12 +979,72 @@@ static irqreturn_t prq_event_thread(in
+  		 * If prq is to be handled outside iommu driver via receiver of
+  		 * the fault notifiers, we skip the page response here.
+  		 */
+++<<<<<<< HEAD
+ +		if (svm->flags & SVM_FLAG_GUEST_MODE) {
+ +			if (sdev && !intel_svm_prq_report(sdev->dev, req))
+ +				goto prq_advance;
+ +			else
+ +				goto bad_req;
+ +		}
+++=======
++ 		if (intel_svm_prq_report(iommu, sdev->dev, req))
++ 			handle_bad_prq_event(iommu, req, QI_RESP_INVALID);
+++>>>>>>> 0f4834ab255b (iommu/vt-d: Add PRQ handling latency sampling)
+ +
+ +		/* If the mm is already defunct, don't handle faults. */
+ +		if (!mmget_not_zero(svm->mm))
+ +			goto bad_req;
+ +
+ +		mmap_read_lock(svm->mm);
+ +		vma = find_extend_vma(svm->mm, address);
+ +		if (!vma || address < vma->vm_start)
+ +			goto invalid;
+ +
+ +		if (access_error(vma, req))
+ +			goto invalid;
+  
+ -		trace_prq_report(iommu, sdev->dev, req->qw_0, req->qw_1,
+ -				 req->priv_data[0], req->priv_data[1],
+ -				 sdev->prq_seq_number);
+ +		flags = FAULT_FLAG_USER | FAULT_FLAG_REMOTE;
+ +		if (req->wr_req)
+ +			flags |= FAULT_FLAG_WRITE;
+ +
+ +		ret = handle_mm_fault(vma, address, flags);
+ +		if (ret & VM_FAULT_ERROR)
+ +			goto invalid;
+ +
+ +		result = QI_RESP_SUCCESS;
+ +invalid:
+ +		mmap_read_unlock(svm->mm);
+ +		mmput(svm->mm);
+ +bad_req:
+ +		/* We get here in the error case where the PASID lookup failed,
+ +		   and these can be NULL. Do not use them below this point! */
+ +		sdev = NULL;
+ +		svm = NULL;
+ +no_pasid:
+ +		if (req->lpig || req->priv_data_present) {
+ +			/*
+ +			 * Per VT-d spec. v3.0 ch7.7, system software must
+ +			 * respond with page group response if private data
+ +			 * is present (PDP) or last page in group (LPIG) bit
+ +			 * is set. This is an additional VT-d feature beyond
+ +			 * PCI ATS spec.
+ +			 */
+ +			resp.qw0 = QI_PGRP_PASID(req->pasid) |
+ +				QI_PGRP_DID(req->rid) |
+ +				QI_PGRP_PASID_P(req->pasid_present) |
+ +				QI_PGRP_PDP(req->priv_data_present) |
+ +				QI_PGRP_RESP_CODE(result) |
+ +				QI_PGRP_RESP_TYPE;
+ +			resp.qw1 = QI_PGRP_IDX(req->prg_index) |
+ +				QI_PGRP_LPIG(req->lpig);
+ +			resp.qw2 = 0;
+ +			resp.qw3 = 0;
+ +
+ +			if (req->priv_data_present)
+ +				memcpy(&resp.qw2, req->priv_data,
+ +				       sizeof(req->priv_data));
+ +			qi_submit_sync(iommu, &resp, 1, 0);
+ +		}
+  prq_advance:
+  		head = (head + sizeof(*req)) & PRQ_RING_MASK;
+  	}
+* Unmerged path drivers/iommu/intel/svm.c
