@@ -1,0 +1,235 @@
+nvme: move nvme_validate_ns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit b2dc748a70c65a1b4eb1b9fceab57662cfd83e41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b2dc748a.failed
+
+Move nvme_validate_ns just above its only remaining caller.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Damien Le Moal <damien.lemoal@wdc.com>
+(cherry picked from commit b2dc748a70c65a1b4eb1b9fceab57662cfd83e41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 61e952b9cd65,07309f6c14fa..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2076,111 -2110,49 +2076,157 @@@ static void nvme_set_chunk_sectors(stru
+  	blk_queue_chunk_sectors(ns->queue, iob);
+  }
+  
+++<<<<<<< HEAD
+ +static int __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
+ +{
+ +	struct nvme_ns *ns = disk->private_data;
+ +	struct nvme_ctrl *ctrl = ns->ctrl;
+ +
+ +	/*
+ +	 * If identify namespace failed, use default 512 byte block size so
+ +	 * block layer can use before failing read/write for 0 capacity.
+ +	 */
+ +	ns->lba_shift = id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ds;
+ +	if (ns->lba_shift == 0)
+ +		ns->lba_shift = 9;
+ +
+ +	switch (ns->head->ids.csi) {
+ +	case NVME_CSI_NVM:
+ +		break;
+ +	default:
+ +		dev_warn(ctrl->device, "unknown csi:%d ns:%d\n",
+ +			ns->head->ids.csi, ns->head->ns_id);
+ +		return -ENODEV;
+ +	}
+ +
+ +	ns->features = 0;
+ +	ns->ms = le16_to_cpu(id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ms);
+ +	/* the PI implementation requires metadata equal t10 pi tuple size */
+ +	if (ns->ms == sizeof(struct t10_pi_tuple))
+ +		ns->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
+ +	else
+ +		ns->pi_type = 0;
+ +
+ +	if (ns->ms) {
+ +		/*
+ +		 * For PCIe only the separate metadata pointer is supported,
+ +		 * as the block layer supplies metadata in a separate bio_vec
+ +		 * chain. For Fabrics, only metadata as part of extended data
+ +		 * LBA is supported on the wire per the Fabrics specification,
+ +		 * but the HBA/HCA will do the remapping from the separate
+ +		 * metadata buffers for us.
+ +		 */
+ +		if (id->flbas & NVME_NS_FLBAS_META_EXT) {
+ +			ns->features |= NVME_NS_EXT_LBAS;
+ +			if ((ctrl->ops->flags & NVME_F_FABRICS) &&
+ +			    (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED) &&
+ +			    ctrl->max_integrity_segments)
+ +				ns->features |= NVME_NS_METADATA_SUPPORTED;
+ +		} else {
+ +			if (WARN_ON_ONCE(ctrl->ops->flags & NVME_F_FABRICS))
+ +				return -EINVAL;
+ +			if (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED)
+ +				ns->features |= NVME_NS_METADATA_SUPPORTED;
+ +		}
+ +	}
+ +
+ +	nvme_set_chunk_sectors(ns, id);
+ +	nvme_update_disk_info(disk, ns, id);
+ +#ifdef CONFIG_NVME_MULTIPATH
+ +	if (ns->head->disk) {
+ +		nvme_update_disk_info(ns->head->disk, ns, id);
+ +		blk_queue_stack_limits(ns->head->disk->queue, ns->queue);
+ +		nvme_mpath_update_disk_size(ns->head->disk);
+ +	}
+ +#endif
+ +	return 0;
+ +}
+ +
+ +static int nvme_revalidate_disk(struct gendisk *disk)
+ +{
+ +	struct nvme_ns *ns = disk->private_data;
+ +	struct nvme_ctrl *ctrl = ns->ctrl;
+ +	struct nvme_id_ns *id;
+ +	struct nvme_ns_ids ids;
+ +	int ret = 0;
+ +
+ +	if (test_bit(NVME_NS_DEAD, &ns->flags)) {
+ +		set_capacity(disk, 0);
+ +		return -ENODEV;
+ +	}
+ +
+ +	ret = nvme_identify_ns(ctrl, ns->head->ns_id, &id);
+ +	if (ret)
+ +		goto out;
+ +
+ +	ret = nvme_report_ns_ids(ctrl, ns->head->ns_id, id, &ids);
+ +	if (ret)
+ +		goto free_id;
+ +
+ +	if (!nvme_ns_ids_equal(&ns->head->ids, &ids)) {
+ +		dev_err(ctrl->device,
+ +			"identifiers changed for nsid %d\n", ns->head->ns_id);
+ +		ret = -ENODEV;
+ +		goto free_id;
+ +	}
+ +
+ +	ret = __nvme_revalidate_disk(disk, id);
+ +free_id:
+ +	kfree(id);
+ +out:
+ +	/*
+ +	 * Only fail the function if we got a fatal error back from the
+ +	 * device, otherwise ignore the error and just move on.
+ +	 */
+ +	if (ret == -ENOMEM || (ret > 0 && !(ret & NVME_SC_DNR)))
+ +		ret = 0;
+ +	else if (ret > 0)
+ +		ret = blk_status_to_errno(nvme_error_status(ret));
+++=======
++ static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
++ {
++ 	unsigned lbaf = id->flbas & NVME_NS_FLBAS_LBA_MASK;
++ 	int ret;
++ 
++ 	blk_mq_freeze_queue(ns->disk->queue);
++ 	ns->lba_shift = id->lbaf[lbaf].ds;
++ 	nvme_set_queue_limits(ns->ctrl, ns->queue);
++ 
++ 	if (ns->head->ids.csi == NVME_CSI_ZNS) {
++ 		ret = nvme_update_zone_info(ns, lbaf);
++ 		if (ret)
++ 			goto out_unfreeze;
++ 	}
++ 
++ 	ret = nvme_configure_metadata(ns, id);
++ 	if (ret)
++ 		goto out_unfreeze;
++ 	nvme_set_chunk_sectors(ns, id);
++ 	nvme_update_disk_info(ns->disk, ns, id);
++ 	blk_mq_unfreeze_queue(ns->disk->queue);
++ 
++ 	if (blk_queue_is_zoned(ns->queue)) {
++ 		ret = nvme_revalidate_zones(ns);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ #ifdef CONFIG_NVME_MULTIPATH
++ 	if (ns->head->disk) {
++ 		blk_mq_freeze_queue(ns->head->disk->queue);
++ 		nvme_update_disk_info(ns->head->disk, ns, id);
++ 		blk_stack_limits(&ns->head->disk->queue->limits,
++ 				 &ns->queue->limits, 0);
++ 		blk_queue_update_readahead(ns->head->disk->queue);
++ 		nvme_update_bdev_size(ns->head->disk);
++ 		blk_mq_unfreeze_queue(ns->head->disk->queue);
++ 	}
++ #endif
++ 	return 0;
++ 
++ out_unfreeze:
++ 	blk_mq_unfreeze_queue(ns->disk->queue);
+++>>>>>>> b2dc748a70c6 (nvme: move nvme_validate_ns)
+  	return ret;
+  }
+  
+@@@ -4022,9 -3936,51 +4068,46 @@@ static void nvme_ns_remove_by_nsid(stru
+  	}
+  }
+  
++ static int nvme_validate_ns(struct nvme_ns *ns, struct nvme_ns_ids *ids)
++ {
++ 	struct nvme_ctrl *ctrl = ns->ctrl;
++ 	struct nvme_id_ns *id;
++ 	int ret = 0;
++ 
++ 	if (test_bit(NVME_NS_DEAD, &ns->flags)) {
++ 		set_capacity(ns->disk, 0);
++ 		return -ENODEV;
++ 	}
++ 
++ 	ret = nvme_identify_ns(ctrl, ns->head->ns_id, ids, &id);
++ 	if (ret)
++ 		goto out;
++ 
++ 	if (!nvme_ns_ids_equal(&ns->head->ids, ids)) {
++ 		dev_err(ctrl->device,
++ 			"identifiers changed for nsid %d\n", ns->head->ns_id);
++ 		ret = -ENODEV;
++ 		goto free_id;
++ 	}
++ 
++ 	ret = nvme_update_ns_info(ns, id);
++ free_id:
++ 	kfree(id);
++ out:
++ 	/*
++ 	 * Only fail the function if we got a fatal error back from the
++ 	 * device, otherwise ignore the error and just move on.
++ 	 */
++ 	if (ret == -ENOMEM || (ret > 0 && !(ret & NVME_SC_DNR)))
++ 		ret = 0;
++ 	else if (ret > 0)
++ 		ret = blk_status_to_errno(nvme_error_status(ret));
++ 	return ret;
++ }
++ 
+  static void nvme_validate_or_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+  {
+ -	struct nvme_ns_ids ids = { };
+  	struct nvme_ns *ns;
+ -	int ret;
+ -
+ -	if (nvme_identify_ns_descs(ctrl, nsid, &ids))
+ -		return;
+  
+  	ns = nvme_find_get_ns(ctrl, nsid);
+  	if (ns) {
+* Unmerged path drivers/nvme/host/core.c
