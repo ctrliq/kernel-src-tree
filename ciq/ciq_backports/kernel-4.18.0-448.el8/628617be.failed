@@ -1,0 +1,253 @@
+scsi: sd: sd_zbc: Introduce struct zoned_disk_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit 628617be8968e575ca0a0637fb227f8a990cb2f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/628617be.failed
+
+Deriving the meaning of the nr_zones, rev_nr_zones, zone_blocks and
+rev_zone_blocks member variables requires careful analysis of the source
+code. Make the meaning of these member variables easier to understand by
+introducing struct zoned_disk_info.
+
+Link: https://lore.kernel.org/r/20220421183023.3462291-5-bvanassche@acm.org
+	Reviewed-by: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+	Acked-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 628617be8968e575ca0a0637fb227f8a990cb2f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd.h
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd.h
+index 8ad0c79ed938,47434f905b0a..000000000000
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@@ -69,7 -67,38 +69,42 @@@ enum 
+  	SD_ZERO_WS10_UNMAP,	/* Use WRITE SAME(10) with UNMAP */
+  };
+  
+++<<<<<<< HEAD
+ +struct scsi_disk_aux {
+++=======
++ /**
++  * struct zoned_disk_info - Specific properties of a ZBC SCSI device.
++  * @nr_zones: number of zones.
++  * @zone_blocks: number of logical blocks per zone.
++  *
++  * This data structure holds the ZBC SCSI device properties that are retrieved
++  * twice: a first time before the gendisk capacity is known and a second time
++  * after the gendisk capacity is known.
++  */
++ struct zoned_disk_info {
++ 	u32		nr_zones;
++ 	u32		zone_blocks;
++ };
++ 
++ struct scsi_disk {
++ 	struct scsi_device *device;
++ 
++ 	/*
++ 	 * disk_dev is used to show attributes in /sys/class/scsi_disk/,
++ 	 * but otherwise not really needed.  Do not use for refcounting.
++ 	 */
++ 	struct device	disk_dev;
++ 	struct gendisk	*disk;
++ 	struct opal_dev *opal_dev;
++ #ifdef CONFIG_BLK_DEV_ZONED
++ 	/* Updated during revalidation before the gendisk capacity is known. */
++ 	struct zoned_disk_info	early_zone_info;
++ 	/* Updated during revalidation after the gendisk capacity is known. */
++ 	struct zoned_disk_info	zone_info;
++ 	u32		zones_optimal_open;
++ 	u32		zones_optimal_nonseq;
++ 	u32		zones_max_open;
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  	u32		*zones_wp_offset;
+  	spinlock_t	zones_wp_offset_lock;
+  	u32		*rev_wp_offset;
+diff --cc drivers/scsi/sd_zbc.c
+index 4e86ebbf66b1,ac557a5a65c8..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -320,21 -317,20 +320,32 @@@ static void sd_zbc_update_wp_offset_wor
+  	sector_t zno;
+  	int ret;
+  
+ -	sdkp = container_of(work, struct scsi_disk, zone_wp_offset_work);
+ +	aux = container_of(work, struct scsi_disk_aux, zone_wp_offset_work);
+ +	sdkp = aux->sdkp;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&sdkp->aux->zones_wp_offset_lock, flags);
+ +	for (zno = 0; zno < sdkp->nr_zones; zno++) {
+ +		if (sdkp->aux->zones_wp_offset[zno] != SD_ZBC_UPDATING_WP_OFST)
+++=======
++ 	spin_lock_irqsave(&sdkp->zones_wp_offset_lock, flags);
++ 	for (zno = 0; zno < sdkp->zone_info.nr_zones; zno++) {
++ 		if (sdkp->zones_wp_offset[zno] != SD_ZBC_UPDATING_WP_OFST)
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  			continue;
+  
+ -		spin_unlock_irqrestore(&sdkp->zones_wp_offset_lock, flags);
+ -		ret = sd_zbc_do_report_zones(sdkp, sdkp->zone_wp_update_buf,
+ +		spin_unlock_irqrestore(&sdkp->aux->zones_wp_offset_lock, flags);
+ +		ret = sd_zbc_do_report_zones(sdkp, sdkp->aux->zone_wp_update_buf,
+  					     SD_BUF_SIZE,
+++<<<<<<< HEAD
+ +					     zno * sdkp->zone_blocks, true);
+ +		spin_lock_irqsave(&sdkp->aux->zones_wp_offset_lock, flags);
+++=======
++ 					     zno * sdkp->zone_info.zone_blocks, true);
++ 		spin_lock_irqsave(&sdkp->zones_wp_offset_lock, flags);
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  		if (!ret)
+ -			sd_zbc_parse_report(sdkp, sdkp->zone_wp_update_buf + 64,
+ +			sd_zbc_parse_report(sdkp, sdkp->aux->zone_wp_update_buf + 64,
+  					    zno, sd_zbc_update_wp_offset_cb,
+  					    sdkp);
+  	}
+@@@ -522,14 -516,14 +533,19 @@@ static unsigned int sd_zbc_zone_wp_upda
+  						good_bytes >> SECTOR_SHIFT;
+  		break;
+  	case REQ_OP_ZONE_RESET:
+ -		sdkp->zones_wp_offset[zno] = 0;
+ +		sdkp->aux->zones_wp_offset[zno] = 0;
+  		break;
+  	case REQ_OP_ZONE_FINISH:
+ -		sdkp->zones_wp_offset[zno] = sd_zbc_zone_sectors(sdkp);
+ +		sdkp->aux->zones_wp_offset[zno] = sd_zbc_zone_sectors(sdkp);
+  		break;
+  	case REQ_OP_ZONE_RESET_ALL:
+++<<<<<<< HEAD
+ +		memset(sdkp->aux->zones_wp_offset, 0,
+ +		       sdkp->nr_zones * sizeof(unsigned int));
+++=======
++ 		memset(sdkp->zones_wp_offset, 0,
++ 		       sdkp->zone_info.nr_zones * sizeof(unsigned int));
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  		break;
+  	default:
+  		break;
+@@@ -717,15 -711,13 +733,20 @@@ static void sd_zbc_clear_zone_info(stru
+  	/* Serialize against revalidate zones */
+  	mutex_lock(&sdkp->rev_mutex);
+  
+ -	kvfree(sdkp->zones_wp_offset);
+ -	sdkp->zones_wp_offset = NULL;
+ -	kfree(sdkp->zone_wp_update_buf);
+ -	sdkp->zone_wp_update_buf = NULL;
+ -
+ +	kvfree(sdkp->aux->zones_wp_offset);
+ +	sdkp->aux->zones_wp_offset = NULL;
+ +	kfree(sdkp->aux->zone_wp_update_buf);
+ +	sdkp->aux->zone_wp_update_buf = NULL;
+ +
+++<<<<<<< HEAD
+ +	sdkp->nr_zones = 0;
+ +	sdkp->aux->rev_nr_zones = 0;
+ +	sdkp->zone_blocks = 0;
+ +	sdkp->aux->rev_zone_blocks = 0;
+++=======
++ 	sdkp->early_zone_info = (struct zoned_disk_info){ };
++ 	sdkp->zone_info = (struct zoned_disk_info){ };
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  
+  	mutex_unlock(&sdkp->rev_mutex);
+  }
+@@@ -752,8 -744,8 +773,13 @@@ int sd_zbc_revalidate_zones(struct scsi
+  {
+  	struct gendisk *disk = sdkp->disk;
+  	struct request_queue *q = disk->queue;
+++<<<<<<< HEAD
+ +	u32 zone_blocks = sdkp->aux->rev_zone_blocks;
+ +	unsigned int nr_zones = sdkp->aux->rev_nr_zones;
+++=======
++ 	u32 zone_blocks = sdkp->early_zone_info.zone_blocks;
++ 	unsigned int nr_zones = sdkp->early_zone_info.nr_zones;
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  	u32 max_append;
+  	int ret = 0;
+  	unsigned int flags;
+@@@ -782,18 -774,18 +808,25 @@@
+  	 * Make sure revalidate zones are serialized to ensure exclusive
+  	 * updates of the scsi disk data.
+  	 */
+ -	mutex_lock(&sdkp->rev_mutex);
+ +	mutex_lock(&sdkp->aux->rev_mutex);
+  
+- 	if (sdkp->zone_blocks == zone_blocks &&
+- 	    sdkp->nr_zones == nr_zones &&
++ 	if (sdkp->zone_info.zone_blocks == zone_blocks &&
++ 	    sdkp->zone_info.nr_zones == nr_zones &&
+  	    disk->queue->nr_zones == nr_zones)
+  		goto unlock;
+  
+  	flags = memalloc_noio_save();
+++<<<<<<< HEAD
+ +	sdkp->zone_blocks = zone_blocks;
+ +	sdkp->nr_zones = nr_zones;
+ +	sdkp->aux->rev_wp_offset = kvcalloc(nr_zones, sizeof(u32), GFP_KERNEL);
+ +	if (!sdkp->aux->rev_wp_offset) {
+++=======
++ 	sdkp->zone_info.zone_blocks = zone_blocks;
++ 	sdkp->zone_info.nr_zones = nr_zones;
++ 	sdkp->rev_wp_offset = kvcalloc(nr_zones, sizeof(u32), GFP_KERNEL);
++ 	if (!sdkp->rev_wp_offset) {
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  		ret = -ENOMEM;
+  		memalloc_noio_restore(flags);
+  		goto unlock;
+@@@ -802,12 -794,11 +835,11 @@@
+  	ret = blk_revalidate_disk_zones(disk, sd_zbc_revalidate_zones_cb);
+  
+  	memalloc_noio_restore(flags);
+ -	kvfree(sdkp->rev_wp_offset);
+ -	sdkp->rev_wp_offset = NULL;
+ +	kvfree(sdkp->aux->rev_wp_offset);
+ +	sdkp->aux->rev_wp_offset = NULL;
+  
+  	if (ret) {
+- 		sdkp->zone_blocks = 0;
+- 		sdkp->nr_zones = 0;
++ 		sdkp->zone_info = (struct zoned_disk_info){ };
+  		sdkp->capacity = 0;
+  		goto unlock;
+  	}
+@@@ -878,10 -869,23 +910,23 @@@ int sd_zbc_read_zones(struct scsi_disk 
+  	/* The drive satisfies the kernel restrictions: set it up */
+  	blk_queue_flag_set(QUEUE_FLAG_ZONE_RESETALL, q);
+  	blk_queue_required_elevator_features(q, ELEVATOR_F_ZBD_SEQ_WRITE);
+ -	if (sdkp->zones_max_open == U32_MAX)
+ -		blk_queue_max_open_zones(q, 0);
+ -	else
+ -		blk_queue_max_open_zones(q, sdkp->zones_max_open);
+ -	blk_queue_max_active_zones(q, 0);
+  	nr_zones = round_up(sdkp->capacity, zone_blocks) >> ilog2(zone_blocks);
+  
+++<<<<<<< HEAD
+ +	sdkp->aux->rev_nr_zones = nr_zones;
+ +	sdkp->aux->rev_zone_blocks = zone_blocks;
+++=======
++ 	/*
++ 	 * Per ZBC and ZAC specifications, writes in sequential write required
++ 	 * zones of host-managed devices must be aligned to the device physical
++ 	 * block size.
++ 	 */
++ 	if (blk_queue_zoned_model(q) == BLK_ZONED_HM)
++ 		blk_queue_zone_write_granularity(q, sdkp->physical_block_size);
++ 
++ 	sdkp->early_zone_info.nr_zones = nr_zones;
++ 	sdkp->early_zone_info.zone_blocks = zone_blocks;
+++>>>>>>> 628617be8968 (scsi: sd: sd_zbc: Introduce struct zoned_disk_info)
+  
+  	return 0;
+  
+* Unmerged path drivers/scsi/sd.h
+* Unmerged path drivers/scsi/sd_zbc.c
