@@ -1,0 +1,407 @@
+SUNRPC: Clean up rpc_verify_header()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 7f5667a5f8c4ff85b14ccce9d41f9244bd30ab68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7f5667a5.failed
+
+- Recover some instruction count because I'm about to introduce a
+  few xdr_inline_decode call sites
+- Replace dprintk() call sites with trace points
+- Reduce the hot path so it fits in fewer cachelines
+
+I've also renamed it rpc_decode_header() to match everything else
+in the RPC client.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 7f5667a5f8c4ff85b14ccce9d41f9244bd30ab68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/xdr.h
+#	include/trace/events/sunrpc.h
+#	net/sunrpc/clnt.c
+diff --cc include/linux/sunrpc/xdr.h
+index 2d104fd9d602,c54041950cc0..000000000000
+--- a/include/linux/sunrpc/xdr.h
++++ b/include/linux/sunrpc/xdr.h
+@@@ -84,6 -87,15 +84,18 @@@ xdr_buf_init(struct xdr_buf *buf, void 
+  #define	xdr_one		cpu_to_be32(1)
+  #define	xdr_two		cpu_to_be32(2)
+  
+++<<<<<<< HEAD
+++=======
++ #define	rpc_auth_null	cpu_to_be32(RPC_AUTH_NULL)
++ #define	rpc_auth_unix	cpu_to_be32(RPC_AUTH_UNIX)
++ #define	rpc_auth_gss	cpu_to_be32(RPC_AUTH_GSS)
++ 
++ #define	rpc_call	cpu_to_be32(RPC_CALL)
++ #define	rpc_reply	cpu_to_be32(RPC_REPLY)
++ 
++ #define	rpc_msg_accepted	cpu_to_be32(RPC_MSG_ACCEPTED)
++ 
+++>>>>>>> 7f5667a5f8c4 (SUNRPC: Clean up rpc_verify_header())
+  #define	rpc_success		cpu_to_be32(RPC_SUCCESS)
+  #define	rpc_prog_unavail	cpu_to_be32(RPC_PROG_UNAVAIL)
+  #define	rpc_prog_mismatch	cpu_to_be32(RPC_PROG_MISMATCH)
+diff --cc include/trace/events/sunrpc.h
+index 42376a2afcb8,0654e9c50371..000000000000
+--- a/include/trace/events/sunrpc.h
++++ b/include/trace/events/sunrpc.h
+@@@ -213,6 -213,87 +213,90 @@@ DECLARE_EVENT_CLASS(rpc_task_queued
+  DEFINE_RPC_QUEUED_EVENT(sleep);
+  DEFINE_RPC_QUEUED_EVENT(wakeup);
+  
+++<<<<<<< HEAD
+++=======
++ DECLARE_EVENT_CLASS(rpc_failure,
++ 
++ 	TP_PROTO(const struct rpc_task *task),
++ 
++ 	TP_ARGS(task),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(unsigned int, task_id)
++ 		__field(unsigned int, client_id)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->task_id = task->tk_pid;
++ 		__entry->client_id = task->tk_client->cl_clid;
++ 	),
++ 
++ 	TP_printk("task:%u@%u",
++ 		__entry->task_id, __entry->client_id)
++ );
++ 
++ #define DEFINE_RPC_FAILURE(name)					\
++ 	DEFINE_EVENT(rpc_failure, rpc_bad_##name,			\
++ 			TP_PROTO(					\
++ 				const struct rpc_task *task		\
++ 			),						\
++ 			TP_ARGS(task))
++ 
++ DEFINE_RPC_FAILURE(callhdr);
++ DEFINE_RPC_FAILURE(verifier);
++ 
++ DECLARE_EVENT_CLASS(rpc_reply_event,
++ 
++ 	TP_PROTO(
++ 		const struct rpc_task *task
++ 	),
++ 
++ 	TP_ARGS(task),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(unsigned int, task_id)
++ 		__field(unsigned int, client_id)
++ 		__field(u32, xid)
++ 		__string(progname, task->tk_client->cl_program->name)
++ 		__field(u32, version)
++ 		__string(procname, rpc_proc_name(task))
++ 		__string(servername, task->tk_xprt->servername)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->task_id = task->tk_pid;
++ 		__entry->client_id = task->tk_client->cl_clid;
++ 		__entry->xid = be32_to_cpu(task->tk_rqstp->rq_xid);
++ 		__assign_str(progname, task->tk_client->cl_program->name)
++ 		__entry->version = task->tk_client->cl_vers;
++ 		__assign_str(procname, rpc_proc_name(task))
++ 		__assign_str(servername, task->tk_xprt->servername)
++ 	),
++ 
++ 	TP_printk("task:%u@%d server=%s xid=0x%08x %sv%d %s",
++ 		__entry->task_id, __entry->client_id, __get_str(servername),
++ 		__entry->xid, __get_str(progname), __entry->version,
++ 		__get_str(procname))
++ )
++ 
++ #define DEFINE_RPC_REPLY_EVENT(name)					\
++ 	DEFINE_EVENT(rpc_reply_event, rpc__##name,			\
++ 			TP_PROTO(					\
++ 				const struct rpc_task *task		\
++ 			),						\
++ 			TP_ARGS(task))
++ 
++ DEFINE_RPC_REPLY_EVENT(prog_unavail);
++ DEFINE_RPC_REPLY_EVENT(prog_mismatch);
++ DEFINE_RPC_REPLY_EVENT(proc_unavail);
++ DEFINE_RPC_REPLY_EVENT(garbage_args);
++ DEFINE_RPC_REPLY_EVENT(unparsable);
++ DEFINE_RPC_REPLY_EVENT(mismatch);
++ DEFINE_RPC_REPLY_EVENT(stale_creds);
++ DEFINE_RPC_REPLY_EVENT(bad_creds);
++ DEFINE_RPC_REPLY_EVENT(auth_tooweak);
++ 
+++>>>>>>> 7f5667a5f8c4 (SUNRPC: Clean up rpc_verify_header())
+  TRACE_EVENT(rpc_stats_latency,
+  
+  	TP_PROTO(
+diff --cc net/sunrpc/clnt.c
+index 415348b16ff1,e9735089bd66..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -76,8 -77,9 +76,14 @@@ static void	call_timeout(struct rpc_tas
+  static void	call_connect(struct rpc_task *task);
+  static void	call_connect_status(struct rpc_task *task);
+  
+++<<<<<<< HEAD
+ +static __be32	*rpc_encode_header(struct rpc_task *task);
+ +static __be32	*rpc_verify_header(struct rpc_task *task);
+++=======
++ static int	rpc_encode_header(struct rpc_task *task,
++ 				  struct xdr_stream *xdr);
++ static __be32	*rpc_decode_header(struct rpc_task *task);
+++>>>>>>> 7f5667a5f8c4 (SUNRPC: Clean up rpc_verify_header())
+  static int	rpc_ping(struct rpc_clnt *clnt);
+  
+  static void rpc_register_client(struct rpc_clnt *clnt)
+@@@ -2316,8 -2308,9 +2322,8 @@@ call_decode(struct rpc_task *task
+  	return;
+  out_retry:
+  	task->tk_status = 0;
+- 	/* Note: rpc_verify_header() may have freed the RPC slot */
++ 	/* Note: rpc_decode_header() may have freed the RPC slot */
+  	if (task->tk_rqstp == req) {
+ -		xdr_free_bvec(&req->rq_rcv_buf);
+  		req->rq_reply_bytes_recvd = req->rq_rcv_buf.len = 0;
+  		if (task->tk_client->cl_discrtry)
+  			xprt_conditional_disconnect(req->rq_xprt,
+@@@ -2330,168 -2323,89 +2336,149 @@@ rpc_encode_header(struct rpc_task *task
+  {
+  	struct rpc_clnt *clnt = task->tk_client;
+  	struct rpc_rqst	*req = task->tk_rqstp;
+ -	__be32 *p;
+ -	int error;
+ -
+ -	error = -EMSGSIZE;
+ -	p = xdr_reserve_space(xdr, RPC_CALLHDRSIZE << 2);
+ -	if (!p)
+ -		goto out_fail;
+ -	*p++ = req->rq_xid;
+ -	*p++ = rpc_call;
+ -	*p++ = cpu_to_be32(RPC_VERSION);
+ -	*p++ = cpu_to_be32(clnt->cl_prog);
+ -	*p++ = cpu_to_be32(clnt->cl_vers);
+ -	*p   = cpu_to_be32(task->tk_msg.rpc_proc->p_proc);
+ -
+ -	error = rpcauth_marshcred(task, xdr);
+ -	if (error < 0)
+ -		goto out_fail;
+ -	return 0;
+ -out_fail:
+ -	trace_rpc_bad_callhdr(task);
+ -	rpc_exit(task, error);
+ -	return error;
+ +	__be32		*p = req->rq_svec[0].iov_base;
+ +
+ +	/* FIXME: check buffer size? */
+ +
+ +	*p++ = req->rq_xid;		/* XID */
+ +	*p++ = htonl(RPC_CALL);		/* CALL */
+ +	*p++ = htonl(RPC_VERSION);	/* RPC version */
+ +	*p++ = htonl(clnt->cl_prog);	/* program number */
+ +	*p++ = htonl(clnt->cl_vers);	/* program version */
+ +	*p++ = htonl(task->tk_msg.rpc_proc->p_proc);	/* procedure */
+ +	p = rpcauth_marshcred(task, p);
+ +	req->rq_slen = xdr_adjust_iovec(&req->rq_svec[0], p);
+ +	return p;
+  }
+  
+- static __be32 *
+- rpc_verify_header(struct rpc_task *task)
++ static noinline __be32 *
++ rpc_decode_header(struct rpc_task *task)
+  {
+  	struct rpc_clnt *clnt = task->tk_client;
+  	struct kvec *iov = &task->tk_rqstp->rq_rcv_buf.head[0];
+  	int len = task->tk_rqstp->rq_rcv_buf.len >> 2;
+  	__be32	*p = iov->iov_base;
+- 	u32 n;
+  	int error = -EACCES;
+  
+- 	if ((task->tk_rqstp->rq_rcv_buf.len & 3) != 0) {
+- 		/* RFC-1014 says that the representation of XDR data must be a
+- 		 * multiple of four bytes
+- 		 * - if it isn't pointer subtraction in the NFS client may give
+- 		 *   undefined results
+- 		 */
+- 		dprintk("RPC: %5u %s: XDR representation not a multiple of"
+- 		       " 4 bytes: 0x%x\n", task->tk_pid, __func__,
+- 		       task->tk_rqstp->rq_rcv_buf.len);
+- 		error = -EIO;
+- 		goto out_err;
+- 	}
++ 	/* RFC-1014 says that the representation of XDR data must be a
++ 	 * multiple of four bytes
++ 	 * - if it isn't pointer subtraction in the NFS client may give
++ 	 *   undefined results
++ 	 */
++ 	if (task->tk_rqstp->rq_rcv_buf.len & 3)
++ 		goto out_badlen;
+  	if ((len -= 3) < 0)
+- 		goto out_overflow;
++ 		goto out_unparsable;
+  
+- 	p += 1; /* skip XID */
+- 	if ((n = ntohl(*p++)) != RPC_REPLY) {
+- 		dprintk("RPC: %5u %s: not an RPC reply: %x\n",
+- 			task->tk_pid, __func__, n);
+- 		error = -EIO;
+- 		goto out_garbage;
+- 	}
++ 	p++;	/* skip XID */
++ 	if (*p++ != rpc_reply)
++ 		goto out_unparsable;
++ 	if (*p++ != rpc_msg_accepted)
++ 		goto out_msg_denied;
+  
+++<<<<<<< HEAD
+ +	if ((n = ntohl(*p++)) != RPC_MSG_ACCEPTED) {
+ +		if (--len < 0)
+ +			goto out_overflow;
+ +		switch ((n = ntohl(*p++))) {
+ +		case RPC_AUTH_ERROR:
+ +			break;
+ +		case RPC_MISMATCH:
+ +			dprintk("RPC: %5u %s: RPC call version mismatch!\n",
+ +				task->tk_pid, __func__);
+ +			error = -EPROTONOSUPPORT;
+ +			goto out_err;
+ +		default:
+ +			dprintk("RPC: %5u %s: RPC call rejected, "
+ +				"unknown error: %x\n",
+ +				task->tk_pid, __func__, n);
+ +			error = -EIO;
+ +			goto out_err;
+ +		}
+ +		if (--len < 0)
+ +			goto out_overflow;
+ +		switch ((n = ntohl(*p++))) {
+ +		case RPC_AUTH_REJECTEDCRED:
+ +		case RPC_AUTH_REJECTEDVERF:
+ +		case RPCSEC_GSS_CREDPROBLEM:
+ +		case RPCSEC_GSS_CTXPROBLEM:
+ +			if (!task->tk_cred_retry)
+ +				break;
+ +			task->tk_cred_retry--;
+ +			dprintk("RPC: %5u %s: retry stale creds\n",
+ +					task->tk_pid, __func__);
+ +			rpcauth_invalcred(task);
+ +			/* Ensure we obtain a new XID! */
+ +			xprt_release(task);
+ +			task->tk_action = call_reserve;
+ +			goto out_retry;
+ +		case RPC_AUTH_BADCRED:
+ +		case RPC_AUTH_BADVERF:
+ +			/* possibly garbled cred/verf? */
+ +			if (!task->tk_garb_retry)
+ +				break;
+ +			task->tk_garb_retry--;
+ +			dprintk("RPC: %5u %s: retry garbled creds\n",
+ +					task->tk_pid, __func__);
+ +			task->tk_action = call_bind;
+ +			goto out_retry;
+ +		case RPC_AUTH_TOOWEAK:
+ +			printk(KERN_NOTICE "RPC: server %s requires stronger "
+ +			       "authentication.\n",
+ +			       task->tk_xprt->servername);
+ +			break;
+ +		default:
+ +			dprintk("RPC: %5u %s: unknown auth error: %x\n",
+ +					task->tk_pid, __func__, n);
+ +			error = -EIO;
+ +		}
+ +		dprintk("RPC: %5u %s: call rejected %d\n",
+ +				task->tk_pid, __func__, n);
+ +		goto out_err;
+ +	}
+++=======
+++>>>>>>> 7f5667a5f8c4 (SUNRPC: Clean up rpc_verify_header())
+  	p = rpcauth_checkverf(task, p);
+- 	if (IS_ERR(p)) {
+- 		error = PTR_ERR(p);
+- 		dprintk("RPC: %5u %s: auth check failed with %d\n",
+- 				task->tk_pid, __func__, error);
+- 		goto out_garbage;		/* bad verifier, retry */
+- 	}
++ 	if (IS_ERR(p))
++ 		goto out_verifier;
++ 
+  	len = p - (__be32 *)iov->iov_base - 1;
+  	if (len < 0)
+- 		goto out_overflow;
+- 	switch ((n = ntohl(*p++))) {
+- 	case RPC_SUCCESS:
++ 		goto out_unparsable;
++ 	switch (*p++) {
++ 	case rpc_success:
+  		return p;
+- 	case RPC_PROG_UNAVAIL:
+- 		dprintk("RPC: %5u %s: program %u is unsupported "
+- 				"by server %s\n", task->tk_pid, __func__,
+- 				(unsigned int)clnt->cl_prog,
+- 				task->tk_xprt->servername);
++ 	case rpc_prog_unavail:
++ 		trace_rpc__prog_unavail(task);
+  		error = -EPFNOSUPPORT;
+  		goto out_err;
+- 	case RPC_PROG_MISMATCH:
+- 		dprintk("RPC: %5u %s: program %u, version %u unsupported "
+- 				"by server %s\n", task->tk_pid, __func__,
+- 				(unsigned int)clnt->cl_prog,
+- 				(unsigned int)clnt->cl_vers,
+- 				task->tk_xprt->servername);
++ 	case rpc_prog_mismatch:
++ 		trace_rpc__prog_mismatch(task);
+  		error = -EPROTONOSUPPORT;
+  		goto out_err;
+- 	case RPC_PROC_UNAVAIL:
+- 		dprintk("RPC: %5u %s: proc %s unsupported by program %u, "
+- 				"version %u on server %s\n",
+- 				task->tk_pid, __func__,
+- 				rpc_proc_name(task),
+- 				clnt->cl_prog, clnt->cl_vers,
+- 				task->tk_xprt->servername);
++ 	case rpc_proc_unavail:
++ 		trace_rpc__proc_unavail(task);
+  		error = -EOPNOTSUPP;
+  		goto out_err;
+- 	case RPC_GARBAGE_ARGS:
+- 		dprintk("RPC: %5u %s: server saw garbage\n",
+- 				task->tk_pid, __func__);
+- 		break;			/* retry */
++ 	case rpc_garbage_args:
++ 		trace_rpc__garbage_args(task);
++ 		break;
+  	default:
+- 		dprintk("RPC: %5u %s: server accept status: %x\n",
+- 				task->tk_pid, __func__, n);
+- 		/* Also retry */
++ 		trace_rpc__unparsable(task);
+  	}
+  
+  out_garbage:
+  	clnt->cl_stats->rpcgarbage++;
+  	if (task->tk_garb_retry) {
+  		task->tk_garb_retry--;
+++<<<<<<< HEAD
+ +		dprintk("RPC: %5u %s: retrying\n",
+ +				task->tk_pid, __func__);
+ +		task->tk_action = call_bind;
+ +out_retry:
+++=======
++ 		task->tk_action = call_encode;
+++>>>>>>> 7f5667a5f8c4 (SUNRPC: Clean up rpc_verify_header())
+  		return ERR_PTR(-EAGAIN);
+  	}
+  out_err:
+* Unmerged path include/linux/sunrpc/xdr.h
+* Unmerged path include/trace/events/sunrpc.h
+* Unmerged path net/sunrpc/clnt.c
