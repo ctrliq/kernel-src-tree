@@ -1,0 +1,354 @@
+gfs2: Turn gl_delete into a delayed work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit a0e3cc65fa29f497cc97a069c318532c2a48d148
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a0e3cc65.failed
+
+This requires flushing delayed work items in gfs2_make_fs_ro (which is called
+before unmounting a filesystem).
+
+When inodes are deleted and then recreated, pending gl_delete work items would
+have no effect because the inode generations will have changed, so we can
+cancel any pending gl_delete works before reusing iopen glocks.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit a0e3cc65fa29f497cc97a069c318532c2a48d148)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+#	fs/gfs2/incore.h
+#	fs/gfs2/super.c
+diff --cc fs/gfs2/glops.c
+index c63bee9adb6a,909cd722e46a..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -572,8 -614,81 +573,83 @@@ static void iopen_go_callback(struct gf
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int iopen_go_demote_ok(const struct gfs2_glock *gl)
++ {
++        return !gfs2_delete_work_queued(gl);
++ }
++ 
++ /**
++  * inode_go_free - wake up anyone waiting for dlm's unlock ast to free it
++  * @gl: glock being freed
++  *
++  * For now, this is only used for the journal inode glock. In withdraw
++  * situations, we need to wait for the glock to be freed so that we know
++  * other nodes may proceed with recovery / journal replay.
++  */
++ static void inode_go_free(struct gfs2_glock *gl)
++ {
++ 	/* Note that we cannot reference gl_object because it's already set
++ 	 * to NULL by this point in its lifecycle. */
++ 	if (!test_bit(GLF_FREEING, &gl->gl_flags))
++ 		return;
++ 	clear_bit_unlock(GLF_FREEING, &gl->gl_flags);
++ 	wake_up_bit(&gl->gl_flags, GLF_FREEING);
++ }
++ 
++ /**
++  * nondisk_go_callback - used to signal when a node did a withdraw
++  * @gl: the nondisk glock
++  * @remote: true if this came from a different cluster node
++  *
++  */
++ static void nondisk_go_callback(struct gfs2_glock *gl, bool remote)
++ {
++ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
++ 
++ 	/* Ignore the callback unless it's from another node, and it's the
++ 	   live lock. */
++ 	if (!remote || gl->gl_name.ln_number != GFS2_LIVE_LOCK)
++ 		return;
++ 
++ 	/* First order of business is to cancel the demote request. We don't
++ 	 * really want to demote a nondisk glock. At best it's just to inform
++ 	 * us of another node's withdraw. We'll keep it in SH mode. */
++ 	clear_bit(GLF_DEMOTE, &gl->gl_flags);
++ 	clear_bit(GLF_PENDING_DEMOTE, &gl->gl_flags);
++ 
++ 	/* Ignore the unlock if we're withdrawn, unmounting, or in recovery. */
++ 	if (test_bit(SDF_NORECOVERY, &sdp->sd_flags) ||
++ 	    test_bit(SDF_WITHDRAWN, &sdp->sd_flags) ||
++ 	    test_bit(SDF_REMOTE_WITHDRAW, &sdp->sd_flags))
++ 		return;
++ 
++ 	/* We only care when a node wants us to unlock, because that means
++ 	 * they want a journal recovered. */
++ 	if (gl->gl_demote_state != LM_ST_UNLOCKED)
++ 		return;
++ 
++ 	if (sdp->sd_args.ar_spectator) {
++ 		fs_warn(sdp, "Spectator node cannot recover journals.\n");
++ 		return;
++ 	}
++ 
++ 	fs_warn(sdp, "Some node has withdrawn; checking for recovery.\n");
++ 	set_bit(SDF_REMOTE_WITHDRAW, &sdp->sd_flags);
++ 	/*
++ 	 * We can't call remote_withdraw directly here or gfs2_recover_journal
++ 	 * because this is called from the glock unlock function and the
++ 	 * remote_withdraw needs to enqueue and dequeue the same "live" glock
++ 	 * we were called from. So we queue it to the control work queue in
++ 	 * lock_dlm.
++ 	 */
++ 	queue_delayed_work(gfs2_control_wq, &sdp->sd_control_work, 0);
++ }
++ 
+++>>>>>>> a0e3cc65fa29 (gfs2: Turn gl_delete into a delayed work)
+  const struct gfs2_glock_operations gfs2_meta_glops = {
+  	.go_type = LM_TYPE_META,
+ -	.go_flags = GLOF_NONDISK,
+  };
+  
+  const struct gfs2_glock_operations gfs2_inode_glops = {
+@@@ -606,7 -722,8 +682,12 @@@ const struct gfs2_glock_operations gfs2
+  const struct gfs2_glock_operations gfs2_iopen_glops = {
+  	.go_type = LM_TYPE_IOPEN,
+  	.go_callback = iopen_go_callback,
+++<<<<<<< HEAD
+ +	.go_flags = GLOF_LRU,
+++=======
++ 	.go_demote_ok = iopen_go_demote_ok,
++ 	.go_flags = GLOF_LRU | GLOF_NONDISK,
+++>>>>>>> a0e3cc65fa29 (gfs2: Turn gl_delete into a delayed work)
+  };
+  
+  const struct gfs2_glock_operations gfs2_flock_glops = {
+diff --cc fs/gfs2/incore.h
+index bfd74134b369,fdcf7a2f06c5..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -350,6 -345,8 +350,11 @@@ enum 
+  	GLF_OBJECT			= 14, /* Used only for tracing */
+  	GLF_BLOCKING			= 15,
+  	GLF_INODE_CREATING		= 16, /* Inode creation occurring */
+++<<<<<<< HEAD
+++=======
++ 	GLF_PENDING_DELETE		= 17,
++ 	GLF_FREEING			= 18, /* Wait for glock to be freed */
+++>>>>>>> a0e3cc65fa29 (gfs2: Turn gl_delete into a delayed work)
+  };
+  
+  struct gfs2_glock {
+diff --cc fs/gfs2/super.c
+index 54e9fed68925,71218a6fd9b4..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -844,28 -602,58 +844,37 @@@ out
+   * Returns: errno
+   */
+  
+ -int gfs2_make_fs_ro(struct gfs2_sbd *sdp)
+ +static int gfs2_make_fs_ro(struct gfs2_sbd *sdp)
+  {
+  	struct gfs2_holder freeze_gh;
+ -	int error = 0;
+ -	int log_write_allowed = test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags);
+ -
+ -	gfs2_holder_mark_uninitialized(&freeze_gh);
+ -	if (sdp->sd_freeze_gl &&
+ -	    !gfs2_glock_is_locked_by_me(sdp->sd_freeze_gl)) {
+ -		if (!log_write_allowed) {
+ -			error = gfs2_glock_nq_init(sdp->sd_freeze_gl,
+ -						   LM_ST_SHARED, GL_NOCACHE |
+ -						   LM_FLAG_TRY, &freeze_gh);
+ -			if (error == GLR_TRYFAILED)
+ -				error = 0;
+ -		} else {
+ -			error = gfs2_glock_nq_init(sdp->sd_freeze_gl,
+ -						   LM_ST_SHARED, GL_NOCACHE,
+ -						   &freeze_gh);
+ -			if (error && !gfs2_withdrawn(sdp))
+ -				return error;
+ -		}
+ -	}
+ +	int error;
+ +
+ +	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_SHARED, GL_NOCACHE,
+ +				   &freeze_gh);
+ +	if (error && !test_bit(SDF_SHUTDOWN, &sdp->sd_flags))
+ +		return error;
+  
+++<<<<<<< HEAD
+ +	flush_workqueue(gfs2_delete_workqueue);
+ +	kthread_stop(sdp->sd_quotad_process);
+ +	kthread_stop(sdp->sd_logd_process);
+++=======
++ 	gfs2_flush_delete_work(sdp);
++ 	if (!log_write_allowed && current == sdp->sd_quotad_process)
++ 		fs_warn(sdp, "The quotad daemon is withdrawing.\n");
++ 	else if (sdp->sd_quotad_process)
++ 		kthread_stop(sdp->sd_quotad_process);
++ 	sdp->sd_quotad_process = NULL;
+++>>>>>>> a0e3cc65fa29 (gfs2: Turn gl_delete into a delayed work)
+ +
+ +	gfs2_quota_sync(sdp->sd_vfs, 0);
+ +	gfs2_statfs_sync(sdp->sd_vfs, 0);
+ +
+ +	gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_SHUTDOWN |
+ +		       GFS2_LFC_MAKE_FS_RO);
+ +	wait_event(sdp->sd_reserving_log_wait, atomic_read(&sdp->sd_reserving_log) == 0);
+ +	gfs2_assert_warn(sdp, atomic_read(&sdp->sd_log_blks_free) == sdp->sd_jdesc->jd_blocks);
+  
+ -	if (!log_write_allowed && current == sdp->sd_logd_process)
+ -		fs_warn(sdp, "The logd daemon is withdrawing.\n");
+ -	else if (sdp->sd_logd_process)
+ -		kthread_stop(sdp->sd_logd_process);
+ -	sdp->sd_logd_process = NULL;
+ -
+ -	if (log_write_allowed) {
+ -		gfs2_quota_sync(sdp->sd_vfs, 0);
+ -		gfs2_statfs_sync(sdp->sd_vfs, 0);
+ -
+ -		gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_SHUTDOWN |
+ -			       GFS2_LFC_MAKE_FS_RO);
+ -		wait_event(sdp->sd_reserving_log_wait,
+ -			   atomic_read(&sdp->sd_reserving_log) == 0);
+ -		gfs2_assert_warn(sdp, atomic_read(&sdp->sd_log_blks_free) ==
+ -				 sdp->sd_jdesc->jd_blocks);
+ -	} else {
+ -		wait_event_timeout(sdp->sd_reserving_log_wait,
+ -				   atomic_read(&sdp->sd_reserving_log) == 0,
+ -				   HZ * 5);
+ -	}
+  	if (gfs2_holder_initialized(&freeze_gh))
+  		gfs2_glock_dq_uninit(&freeze_gh);
+  
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 76c32d90eaaf..c362198a5519 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -671,11 +671,16 @@ __acquires(&gl->gl_lockref.lock)
+ 
+ static void delete_work_func(struct work_struct *work)
+ {
+-	struct gfs2_glock *gl = container_of(work, struct gfs2_glock, gl_delete);
++	struct delayed_work *dwork = to_delayed_work(work);
++	struct gfs2_glock *gl = container_of(dwork, struct gfs2_glock, gl_delete);
+ 	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+ 	struct inode *inode;
+ 	u64 no_addr = gl->gl_name.ln_number;
+ 
++	spin_lock(&gl->gl_lockref.lock);
++	clear_bit(GLF_PENDING_DELETE, &gl->gl_flags);
++	spin_unlock(&gl->gl_lockref.lock);
++
+ 	/* If someone's using this glock to create a new dinode, the block must
+ 	   have been freed by another node, then re-used, in which case our
+ 	   iopen callback is too late after the fact. Ignore it. */
+@@ -844,7 +849,7 @@ int gfs2_glock_get(struct gfs2_sbd *sdp, u64 number,
+ 	gl->gl_object = NULL;
+ 	gl->gl_hold_time = GL_GLOCK_DFT_HOLD;
+ 	INIT_DELAYED_WORK(&gl->gl_work, glock_work_func);
+-	INIT_WORK(&gl->gl_delete, delete_work_func);
++	INIT_DELAYED_WORK(&gl->gl_delete, delete_work_func);
+ 
+ 	mapping = gfs2_glock2aspace(gl);
+ 	if (mapping) {
+@@ -1660,6 +1665,44 @@ static void glock_hash_walk(glock_examiner examiner, const struct gfs2_sbd *sdp)
+ 	rhashtable_walk_exit(&iter);
+ }
+ 
++bool gfs2_queue_delete_work(struct gfs2_glock *gl, unsigned long delay)
++{
++	bool queued;
++
++	spin_lock(&gl->gl_lockref.lock);
++	queued = queue_delayed_work(gfs2_delete_workqueue,
++				    &gl->gl_delete, delay);
++	if (queued)
++		set_bit(GLF_PENDING_DELETE, &gl->gl_flags);
++	spin_unlock(&gl->gl_lockref.lock);
++	return queued;
++}
++
++void gfs2_cancel_delete_work(struct gfs2_glock *gl)
++{
++	if (cancel_delayed_work_sync(&gl->gl_delete)) {
++		clear_bit(GLF_PENDING_DELETE, &gl->gl_flags);
++		gfs2_glock_put(gl);
++	}
++}
++
++bool gfs2_delete_work_queued(const struct gfs2_glock *gl)
++{
++	return test_bit(GLF_PENDING_DELETE, &gl->gl_flags);
++}
++
++static void flush_delete_work(struct gfs2_glock *gl)
++{
++	flush_delayed_work(&gl->gl_delete);
++	gfs2_glock_queue_work(gl, 0);
++}
++
++void gfs2_flush_delete_work(struct gfs2_sbd *sdp)
++{
++	glock_hash_walk(flush_delete_work, sdp);
++	flush_workqueue(gfs2_delete_workqueue);
++}
++
+ /**
+  * thaw_glock - thaw out a glock which has an unprocessed reply waiting
+  * @gl: The glock to thaw
+diff --git a/fs/gfs2/glock.h b/fs/gfs2/glock.h
+index cff3f67734d7..4036242cb274 100644
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@ -235,6 +235,10 @@ static inline int gfs2_glock_nq_init(struct gfs2_glock *gl,
+ 
+ extern void gfs2_glock_cb(struct gfs2_glock *gl, unsigned int state);
+ extern void gfs2_glock_complete(struct gfs2_glock *gl, int ret);
++extern bool gfs2_queue_delete_work(struct gfs2_glock *gl, unsigned long delay);
++extern void gfs2_cancel_delete_work(struct gfs2_glock *gl);
++extern bool gfs2_delete_work_queued(const struct gfs2_glock *gl);
++extern void gfs2_flush_delete_work(struct gfs2_sbd *sdp);
+ extern void gfs2_gl_hash_clear(struct gfs2_sbd *sdp);
+ extern void gfs2_glock_finish_truncate(struct gfs2_inode *ip);
+ extern void gfs2_glock_thaw(struct gfs2_sbd *sdp);
+* Unmerged path fs/gfs2/glops.c
+* Unmerged path fs/gfs2/incore.h
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index b0d12e170499..251c4ca8843e 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -173,6 +173,7 @@ struct inode *gfs2_inode_lookup(struct super_block *sb, unsigned int type,
+ 		error = gfs2_glock_nq_init(io_gl, LM_ST_SHARED, GL_EXACT, &ip->i_iopen_gh);
+ 		if (unlikely(error))
+ 			goto fail;
++		gfs2_cancel_delete_work(ip->i_iopen_gh.gh_gl);
+ 		glock_set_object(ip->i_iopen_gh.gh_gl, ip);
+ 		gfs2_glock_put(io_gl);
+ 		io_gl = NULL;
+@@ -728,6 +729,7 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+ 	if (error)
+ 		goto fail_gunlock2;
+ 
++	gfs2_cancel_delete_work(ip->i_iopen_gh.gh_gl);
+ 	glock_set_object(ip->i_iopen_gh.gh_gl, ip);
+ 	gfs2_glock_put(io_gl);
+ 	gfs2_set_iop(inode);
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index 211781482cc9..a84aaa618044 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -1879,7 +1879,7 @@ static void try_rgrp_unlink(struct gfs2_rgrpd *rgd, u64 *last_unlinked, u64 skip
+ 		 */
+ 		ip = gl->gl_object;
+ 
+-		if (ip || queue_work(gfs2_delete_workqueue, &gl->gl_delete) == 0)
++		if (ip || !gfs2_queue_delete_work(gl, 0))
+ 			gfs2_glock_put(gl);
+ 		else
+ 			found++;
+* Unmerged path fs/gfs2/super.c
