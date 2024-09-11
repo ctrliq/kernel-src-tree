@@ -1,0 +1,140 @@
+selftests: bpf: fix compilation with out-of-tree $(OUTPUT)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit e78e00bd478a43ee01db726ce488424a371e8684
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e78e00bd.failed
+
+A bunch of related changes lumped together:
+* Create prog_tests and verifier output directories; these don't exist with
+  out-of-tree $(OUTPUT)
+* Add missing -I (via separate TEST_{PROGS,VERIFIER}_CFLAGS) for the main tree
+  ($(PWD) != $(OUTPUT) for out-of-tree)
+* Add libbpf.a dependency for test_progs_32 (parallel make fails otherwise)
+* Add missing "; \" after "cd" when generating test.h headers
+
+Tested by:
+$ alias m="make -s -j$(nproc)"
+$ m -C tools/testing/selftests/bpf/ clean
+$ m -C tools/lib/bpf/ clean
+$ rm -rf xxx; mkdir xxx; m -C tools/testing/selftests/bpf/ OUTPUT=$PWD/xxx
+$ m -C tools/testing/selftests/bpf/
+
+Fixes: 3f30658830f3 ("selftests: bpf: break up test_progs - preparations")
+Fixes: 2dfb40121ee8 ("selftests: bpf: prepare for break up of verifier tests")
+Fixes: 3ef84346c561 ("selftests: bpf: makefile support sub-register code-gen test mode")
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Acked-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit e78e00bd478a43ee01db726ce488424a371e8684)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/Makefile
+diff --cc tools/testing/selftests/bpf/Makefile
+index 37b01554670e,2aed37ea61a4..000000000000
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@@ -153,9 -153,43 +153,46 @@@ endi
+  endif
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ TEST_PROGS_CFLAGS := -I. -I$(OUTPUT)
++ TEST_VERIFIER_CFLAGS := -I. -I$(OUTPUT) -Iverifier
++ 
++ ifneq ($(SUBREG_CODEGEN),)
++ ALU32_BUILD_DIR = $(OUTPUT)/alu32
++ TEST_CUSTOM_PROGS += $(ALU32_BUILD_DIR)/test_progs_32
++ $(ALU32_BUILD_DIR):
++ 	mkdir -p $@
++ 
++ $(ALU32_BUILD_DIR)/urandom_read: $(OUTPUT)/urandom_read
++ 	cp $< $@
++ 
++ $(ALU32_BUILD_DIR)/test_progs_32: test_progs.c $(OUTPUT)/libbpf.a\
++ 						$(ALU32_BUILD_DIR) \
++ 						$(ALU32_BUILD_DIR)/urandom_read
++ 	$(CC) $(TEST_PROGS_CFLAGS) $(CFLAGS) \
++ 		-o $(ALU32_BUILD_DIR)/test_progs_32 \
++ 		test_progs.c trace_helpers.c prog_tests/*.c \
++ 		$(OUTPUT)/libbpf.a $(LDLIBS)
++ 
++ $(ALU32_BUILD_DIR)/test_progs_32: $(PROG_TESTS_H)
++ $(ALU32_BUILD_DIR)/test_progs_32: prog_tests/*.c
++ 
++ $(ALU32_BUILD_DIR)/%.o: progs/%.c $(ALU32_BUILD_DIR) \
++ 					$(ALU32_BUILD_DIR)/test_progs_32
++ 	$(CLANG) $(CLANG_FLAGS) \
++ 		 -O2 -target bpf -emit-llvm -c $< -o - |      \
++ 	$(LLC) -march=bpf -mattr=+alu32 -mcpu=$(CPU) $(LLC_FLAGS) \
++ 		-filetype=obj -o $@
++ ifeq ($(DWARF2BTF),y)
++ 	$(BTF_PAHOLE) -J $@
++ endif
++ endif
++ 
+++>>>>>>> e78e00bd478a (selftests: bpf: fix compilation with out-of-tree $(OUTPUT))
+  # Have one program compiled without "-target bpf" to test whether libbpf loads
+  # it successfully
+ -$(OUTPUT)/test_xdp.o: progs/test_xdp.c
+ +$(OUTPUT)/test_xdp.o: test_xdp.c
+  	$(CLANG) $(CLANG_FLAGS) \
+  		-O2 -emit-llvm -c $< -o - | \
+  	$(LLC) -march=bpf -mcpu=$(CPU) $(LLC_FLAGS) -filetype=obj -o $@
+@@@ -171,4 -205,46 +208,50 @@@ ifeq ($(DWARF2BTF),y
+  	$(BTF_PAHOLE) -J $@
+  endif
+  
+++<<<<<<< HEAD
+ +EXTRA_CLEAN := $(TEST_CUSTOM_PROGS)
+++=======
++ PROG_TESTS_H := $(OUTPUT)/prog_tests/tests.h
++ $(OUTPUT)/test_progs: $(PROG_TESTS_H)
++ $(OUTPUT)/test_progs: CFLAGS += $(TEST_PROGS_CFLAGS)
++ $(OUTPUT)/test_progs: prog_tests/*.c
++ 
++ PROG_TESTS_DIR = $(OUTPUT)/prog_tests
++ $(PROG_TESTS_DIR):
++ 	mkdir -p $@
++ 
++ PROG_TESTS_FILES := $(wildcard prog_tests/*.c)
++ $(PROG_TESTS_H): $(PROG_TESTS_DIR) $(PROG_TESTS_FILES)
++ 	$(shell ( cd prog_tests/; \
++ 		  echo '/* Generated header, do not edit */'; \
++ 		  echo '#ifdef DECLARE'; \
++ 		  ls *.c 2> /dev/null | \
++ 			sed -e 's@\([^\.]*\)\.c@extern void test_\1(void);@'; \
++ 		  echo '#endif'; \
++ 		  echo '#ifdef CALL'; \
++ 		  ls *.c 2> /dev/null | \
++ 			sed -e 's@\([^\.]*\)\.c@test_\1();@'; \
++ 		  echo '#endif' \
++ 		 ) > $(PROG_TESTS_H))
++ 
++ VERIFIER_TESTS_H := $(OUTPUT)/verifier/tests.h
++ $(OUTPUT)/test_verifier: $(VERIFIER_TESTS_H)
++ $(OUTPUT)/test_verifier: CFLAGS += $(TEST_VERIFIER_CFLAGS)
++ 
++ VERIFIER_TESTS_DIR = $(OUTPUT)/verifier
++ $(VERIFIER_TESTS_DIR):
++ 	mkdir -p $@
++ 
++ VERIFIER_TEST_FILES := $(wildcard verifier/*.c)
++ $(OUTPUT)/verifier/tests.h: $(VERIFIER_TESTS_DIR) $(VERIFIER_TEST_FILES)
++ 	$(shell ( cd verifier/; \
++ 		  echo '/* Generated header, do not edit */'; \
++ 		  echo '#ifdef FILL_ARRAY'; \
++ 		  ls *.c 2> /dev/null | \
++ 			sed -e 's@\(.*\)@#include \"\1\"@'; \
++ 		  echo '#endif' \
++ 		 ) > $(VERIFIER_TESTS_H))
++ 
++ EXTRA_CLEAN := $(TEST_CUSTOM_PROGS) $(ALU32_BUILD_DIR) \
++ 	$(VERIFIER_TESTS_H) $(PROG_TESTS_H)
+++>>>>>>> e78e00bd478a (selftests: bpf: fix compilation with out-of-tree $(OUTPUT))
+* Unmerged path tools/testing/selftests/bpf/Makefile
