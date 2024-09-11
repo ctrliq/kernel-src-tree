@@ -1,0 +1,527 @@
+scsi: smartpqi: Fix blocks_per_row static checker issue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Don Brace <don.brace@microchip.com>
+commit 667298ceaf042e28b856478e02cfa2cbe8ed83c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/667298ce.failed
+
+Dan Carpenter found a possible divide by 0 issue in the smartpqi driver in
+functions pci_get_aio_common_raid_map_values() and pqi_calc_aio_r5_or_r6().
+The variable rmd->blocks_per_row is used as a divisor and could be 0.
+
+       Using rmd->blocks_per_row as a divisor without checking
+       it for 0 first.
+
+Correct these possible divide by 0 conditions by insuring that
+rmd->blocks_per_row is not zero before usage.  The check for non-0 was too
+late to prevent a divide by 0 condition.  Add in a comment to explain why
+the check for non-zero is necessary. If the member is 0, return
+PQI_RAID_BYPASS_INELIGIBLE before any division is performed.
+
+Link: https://lore.kernel.org/linux-scsi/YG%2F5kWHHAr7w5dU5@mwanda/
+Link: https://lore.kernel.org/r/161850492435.7302.392780350442938047.stgit@brunhilda
+Fixes: 6702d2c40f31 ("scsi: smartpqi: Add support for RAID5 and RAID6 writes")
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reported-by: kernel test robot <lkp@intel.com>
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Reviewed-by: Mike McGowen <mike.mcgowen@microchip.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 667298ceaf042e28b856478e02cfa2cbe8ed83c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index c515caae5588,797ac699b7ff..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -2388,49 -2483,59 +2388,55 @@@ static int pqi_raid_bypass_submit_scsi_
+  		return PQI_RAID_BYPASS_INELIGIBLE;
+  	}
+  
+ -	put_unaligned_le32(scsi_bufflen(scmd), &rmd->data_length);
+ -
+ -	return 0;
+ -}
+ +	/* Check for write to non-RAID-0. */
+ +	if (is_write && device->raid_level != SA_RAID_0)
+ +		return PQI_RAID_BYPASS_INELIGIBLE;
+  
+ -static int pci_get_aio_common_raid_map_values(struct pqi_ctrl_info *ctrl_info,
+ -	struct pqi_scsi_dev_raid_map_data *rmd, struct raid_map *raid_map)
+ -{
+ -#if BITS_PER_LONG == 32
+ -	u64 tmpdiv;
+ -#endif
+ +	if (unlikely(block_cnt == 0))
+ +		return PQI_RAID_BYPASS_INELIGIBLE;
+  
+ -	rmd->last_block = rmd->first_block + rmd->block_cnt - 1;
+ +	last_block = first_block + block_cnt - 1;
+ +	raid_map = device->raid_map;
+  
+  	/* Check for invalid block or wraparound. */
+ -	if (rmd->last_block >=
+ -		get_unaligned_le64(&raid_map->volume_blk_cnt) ||
+ -		rmd->last_block < rmd->first_block)
+ +	if (last_block >= get_unaligned_le64(&raid_map->volume_blk_cnt) ||
+ +		last_block < first_block)
+  		return PQI_RAID_BYPASS_INELIGIBLE;
+  
+ -	rmd->data_disks_per_row =
+ -		get_unaligned_le16(&raid_map->data_disks_per_row);
+ -	rmd->strip_size = get_unaligned_le16(&raid_map->strip_size);
+ -	rmd->layout_map_count = get_unaligned_le16(&raid_map->layout_map_count);
+ +	data_disks_per_row = get_unaligned_le16(&raid_map->data_disks_per_row);
+ +	strip_size = get_unaligned_le16(&raid_map->strip_size);
+ +	layout_map_count = get_unaligned_le16(&raid_map->layout_map_count);
+  
+  	/* Calculate stripe information for the request. */
+++<<<<<<< HEAD
+ +	blocks_per_row = data_disks_per_row * strip_size;
+++=======
++ 	rmd->blocks_per_row = rmd->data_disks_per_row * rmd->strip_size;
++ 	if (rmd->blocks_per_row == 0) /* Used as a divisor in many calculations */
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
+++>>>>>>> 667298ceaf04 (scsi: smartpqi: Fix blocks_per_row static checker issue)
+  #if BITS_PER_LONG == 32
+ -	tmpdiv = rmd->first_block;
+ -	do_div(tmpdiv, rmd->blocks_per_row);
+ -	rmd->first_row = tmpdiv;
+ -	tmpdiv = rmd->last_block;
+ -	do_div(tmpdiv, rmd->blocks_per_row);
+ -	rmd->last_row = tmpdiv;
+ -	rmd->first_row_offset = (u32)(rmd->first_block - (rmd->first_row * rmd->blocks_per_row));
+ -	rmd->last_row_offset = (u32)(rmd->last_block - (rmd->last_row * rmd->blocks_per_row));
+ -	tmpdiv = rmd->first_row_offset;
+ -	do_div(tmpdiv, rmd->strip_size);
+ -	rmd->first_column = tmpdiv;
+ -	tmpdiv = rmd->last_row_offset;
+ -	do_div(tmpdiv, rmd->strip_size);
+ -	rmd->last_column = tmpdiv;
+ +	tmpdiv = first_block;
+ +	do_div(tmpdiv, blocks_per_row);
+ +	first_row = tmpdiv;
+ +	tmpdiv = last_block;
+ +	do_div(tmpdiv, blocks_per_row);
+ +	last_row = tmpdiv;
+ +	first_row_offset = (u32)(first_block - (first_row * blocks_per_row));
+ +	last_row_offset = (u32)(last_block - (last_row * blocks_per_row));
+ +	tmpdiv = first_row_offset;
+ +	do_div(tmpdiv, strip_size);
+ +	first_column = tmpdiv;
+ +	tmpdiv = last_row_offset;
+ +	do_div(tmpdiv, strip_size);
+ +	last_column = tmpdiv;
+  #else
+ -	rmd->first_row = rmd->first_block / rmd->blocks_per_row;
+ -	rmd->last_row = rmd->last_block / rmd->blocks_per_row;
+ -	rmd->first_row_offset = (u32)(rmd->first_block -
+ -		(rmd->first_row * rmd->blocks_per_row));
+ -	rmd->last_row_offset = (u32)(rmd->last_block - (rmd->last_row *
+ -		rmd->blocks_per_row));
+ -	rmd->first_column = rmd->first_row_offset / rmd->strip_size;
+ -	rmd->last_column = rmd->last_row_offset / rmd->strip_size;
+ +	first_row = first_block / blocks_per_row;
+ +	last_row = last_block / blocks_per_row;
+ +	first_row_offset = (u32)(first_block - (first_row * blocks_per_row));
+ +	last_row_offset = (u32)(last_block - (last_row * blocks_per_row));
+ +	first_column = first_row_offset / strip_size;
+ +	last_column = last_row_offset / strip_size;
+  #endif
+  
+  	/* If this isn't a single row/column then give to the controller. */
+@@@ -2438,155 -2544,242 +2444,358 @@@
+  		return PQI_RAID_BYPASS_INELIGIBLE;
+  
+  	/* Proceeding with driver mapping. */
+ -	rmd->total_disks_per_row = rmd->data_disks_per_row +
+ +	total_disks_per_row = data_disks_per_row +
+  		get_unaligned_le16(&raid_map->metadata_disks_per_row);
+ -	rmd->map_row = ((u32)(rmd->first_row >>
+ -		raid_map->parity_rotation_shift)) %
+ +	map_row = ((u32)(first_row >> raid_map->parity_rotation_shift)) %
+  		get_unaligned_le16(&raid_map->row_cnt);
+++<<<<<<< HEAD
+ +	map_index = (map_row * total_disks_per_row) + first_column;
+++=======
++ 	rmd->map_index = (rmd->map_row * rmd->total_disks_per_row) +
++ 		rmd->first_column;
++ 
++ 	return 0;
++ }
++ 
++ static int pqi_calc_aio_r5_or_r6(struct pqi_scsi_dev_raid_map_data *rmd,
++ 	struct raid_map *raid_map)
++ {
++ #if BITS_PER_LONG == 32
++ 	u64 tmpdiv;
++ #endif
++ 
++ 	if (rmd->blocks_per_row == 0) /* Used as a divisor in many calculations */
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	/* RAID 50/60 */
++ 	/* Verify first and last block are in same RAID group. */
++ 	rmd->stripesize = rmd->blocks_per_row * rmd->layout_map_count;
++ #if BITS_PER_LONG == 32
++ 	tmpdiv = rmd->first_block;
++ 	rmd->first_group = do_div(tmpdiv, rmd->stripesize);
++ 	tmpdiv = rmd->first_group;
++ 	do_div(tmpdiv, rmd->blocks_per_row);
++ 	rmd->first_group = tmpdiv;
++ 	tmpdiv = rmd->last_block;
++ 	rmd->last_group = do_div(tmpdiv, rmd->stripesize);
++ 	tmpdiv = rmd->last_group;
++ 	do_div(tmpdiv, rmd->blocks_per_row);
++ 	rmd->last_group = tmpdiv;
++ #else
++ 	rmd->first_group = (rmd->first_block % rmd->stripesize) / rmd->blocks_per_row;
++ 	rmd->last_group = (rmd->last_block % rmd->stripesize) / rmd->blocks_per_row;
++ #endif
++ 	if (rmd->first_group != rmd->last_group)
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	/* Verify request is in a single row of RAID 5/6. */
++ #if BITS_PER_LONG == 32
++ 	tmpdiv = rmd->first_block;
++ 	do_div(tmpdiv, rmd->stripesize);
++ 	rmd->first_row = tmpdiv;
++ 	rmd->r5or6_first_row = tmpdiv;
++ 	tmpdiv = rmd->last_block;
++ 	do_div(tmpdiv, rmd->stripesize);
++ 	rmd->r5or6_last_row = tmpdiv;
++ #else
++ 	rmd->first_row = rmd->r5or6_first_row =
++ 		rmd->first_block / rmd->stripesize;
++ 	rmd->r5or6_last_row = rmd->last_block / rmd->stripesize;
++ #endif
++ 	if (rmd->r5or6_first_row != rmd->r5or6_last_row)
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	/* Verify request is in a single column. */
++ #if BITS_PER_LONG == 32
++ 	tmpdiv = rmd->first_block;
++ 	rmd->first_row_offset = do_div(tmpdiv, rmd->stripesize);
++ 	tmpdiv = rmd->first_row_offset;
++ 	rmd->first_row_offset = (u32)do_div(tmpdiv, rmd->blocks_per_row);
++ 	rmd->r5or6_first_row_offset = rmd->first_row_offset;
++ 	tmpdiv = rmd->last_block;
++ 	rmd->r5or6_last_row_offset = do_div(tmpdiv, rmd->stripesize);
++ 	tmpdiv = rmd->r5or6_last_row_offset;
++ 	rmd->r5or6_last_row_offset = do_div(tmpdiv, rmd->blocks_per_row);
++ 	tmpdiv = rmd->r5or6_first_row_offset;
++ 	do_div(tmpdiv, rmd->strip_size);
++ 	rmd->first_column = rmd->r5or6_first_column = tmpdiv;
++ 	tmpdiv = rmd->r5or6_last_row_offset;
++ 	do_div(tmpdiv, rmd->strip_size);
++ 	rmd->r5or6_last_column = tmpdiv;
++ #else
++ 	rmd->first_row_offset = rmd->r5or6_first_row_offset =
++ 		(u32)((rmd->first_block % rmd->stripesize) %
++ 		rmd->blocks_per_row);
++ 
++ 	rmd->r5or6_last_row_offset =
++ 		(u32)((rmd->last_block % rmd->stripesize) %
++ 		rmd->blocks_per_row);
++ 
++ 	rmd->first_column =
++ 		rmd->r5or6_first_row_offset / rmd->strip_size;
++ 	rmd->r5or6_first_column = rmd->first_column;
++ 	rmd->r5or6_last_column = rmd->r5or6_last_row_offset / rmd->strip_size;
++ #endif
++ 	if (rmd->r5or6_first_column != rmd->r5or6_last_column)
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	/* Request is eligible. */
++ 	rmd->map_row =
++ 		((u32)(rmd->first_row >> raid_map->parity_rotation_shift)) %
++ 		get_unaligned_le16(&raid_map->row_cnt);
++ 
++ 	rmd->map_index = (rmd->first_group *
++ 		(get_unaligned_le16(&raid_map->row_cnt) *
++ 		rmd->total_disks_per_row)) +
++ 		(rmd->map_row * rmd->total_disks_per_row) + rmd->first_column;
++ 
++ 	if (rmd->is_write) {
++ 		u32 index;
+++>>>>>>> 667298ceaf04 (scsi: smartpqi: Fix blocks_per_row static checker issue)
+  
+ +	/* RAID 1 */
+ +	if (device->raid_level == SA_RAID_1) {
+ +		if (device->offload_to_mirror)
+ +			map_index += data_disks_per_row;
+ +		device->offload_to_mirror = !device->offload_to_mirror;
+ +	} else if (device->raid_level == SA_RAID_ADM) {
+ +		/* RAID ADM */
+  		/*
+ -		 * p_parity_it_nexus and q_parity_it_nexus are pointers to the
+ -		 * parity entries inside the device's raid_map.
+ -		 *
+ -		 * A device's RAID map is bounded by: number of RAID disks squared.
+ -		 *
+ -		 * The devices RAID map size is checked during device
+ -		 * initialization.
+ +		 * Handles N-way mirrors  (R1-ADM) and R10 with # of drives
+ +		 * divisible by 3.
+  		 */
+++<<<<<<< HEAD
+ +		offload_to_mirror = device->offload_to_mirror;
+ +		if (offload_to_mirror == 0)  {
+ +			/* use physical disk in the first mirrored group. */
+ +			map_index %= data_disks_per_row;
+++=======
++ 		index = DIV_ROUND_UP(rmd->map_index + 1, rmd->total_disks_per_row);
++ 		index *= rmd->total_disks_per_row;
++ 		index -= get_unaligned_le16(&raid_map->metadata_disks_per_row);
++ 
++ 		rmd->p_parity_it_nexus = raid_map->disk_data[index].aio_handle;
++ 		if (rmd->raid_level == SA_RAID_6) {
++ 			rmd->q_parity_it_nexus = raid_map->disk_data[index + 1].aio_handle;
++ 			rmd->xor_mult = raid_map->disk_data[rmd->map_index].xor_mult[1];
++ 		}
++ #if BITS_PER_LONG == 32
++ 		tmpdiv = rmd->first_block;
++ 		do_div(tmpdiv, rmd->blocks_per_row);
++ 		rmd->row = tmpdiv;
++ #else
++ 		rmd->row = rmd->first_block / rmd->blocks_per_row;
++ #endif
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void pqi_set_aio_cdb(struct pqi_scsi_dev_raid_map_data *rmd)
++ {
++ 	/* Build the new CDB for the physical disk I/O. */
++ 	if (rmd->disk_block > 0xffffffff) {
++ 		rmd->cdb[0] = rmd->is_write ? WRITE_16 : READ_16;
++ 		rmd->cdb[1] = 0;
++ 		put_unaligned_be64(rmd->disk_block, &rmd->cdb[2]);
++ 		put_unaligned_be32(rmd->disk_block_cnt, &rmd->cdb[10]);
++ 		rmd->cdb[14] = 0;
++ 		rmd->cdb[15] = 0;
++ 		rmd->cdb_length = 16;
++ 	} else {
++ 		rmd->cdb[0] = rmd->is_write ? WRITE_10 : READ_10;
++ 		rmd->cdb[1] = 0;
++ 		put_unaligned_be32((u32)rmd->disk_block, &rmd->cdb[2]);
++ 		rmd->cdb[6] = 0;
++ 		put_unaligned_be16((u16)rmd->disk_block_cnt, &rmd->cdb[7]);
++ 		rmd->cdb[9] = 0;
++ 		rmd->cdb_length = 10;
++ 	}
++ }
++ 
++ static void pqi_calc_aio_r1_nexus(struct raid_map *raid_map,
++ 	struct pqi_scsi_dev_raid_map_data *rmd)
++ {
++ 	u32 index;
++ 	u32 group;
++ 
++ 	group = rmd->map_index / rmd->data_disks_per_row;
++ 
++ 	index = rmd->map_index - (group * rmd->data_disks_per_row);
++ 	rmd->it_nexus[0] = raid_map->disk_data[index].aio_handle;
++ 	index += rmd->data_disks_per_row;
++ 	rmd->it_nexus[1] = raid_map->disk_data[index].aio_handle;
++ 	if (rmd->layout_map_count > 2) {
++ 		index += rmd->data_disks_per_row;
++ 		rmd->it_nexus[2] = raid_map->disk_data[index].aio_handle;
++ 	}
++ 
++ 	rmd->num_it_nexus_entries = rmd->layout_map_count;
++ }
++ 
++ static int pqi_raid_bypass_submit_scsi_cmd(struct pqi_ctrl_info *ctrl_info,
++ 	struct pqi_scsi_dev *device, struct scsi_cmnd *scmd,
++ 	struct pqi_queue_group *queue_group)
++ {
++ 	int rc;
++ 	struct raid_map *raid_map;
++ 	u32 group;
++ 	u32 next_bypass_group;
++ 	struct pqi_encryption_info *encryption_info_ptr;
++ 	struct pqi_encryption_info encryption_info;
++ 	struct pqi_scsi_dev_raid_map_data rmd = { 0 };
++ 
++ 	rc = pqi_get_aio_lba_and_block_count(scmd, &rmd);
++ 	if (rc)
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	rmd.raid_level = device->raid_level;
++ 
++ 	if (!pqi_aio_raid_level_supported(ctrl_info, &rmd))
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	if (unlikely(rmd.block_cnt == 0))
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	raid_map = device->raid_map;
++ 
++ 	rc = pci_get_aio_common_raid_map_values(ctrl_info, &rmd, raid_map);
++ 	if (rc)
++ 		return PQI_RAID_BYPASS_INELIGIBLE;
++ 
++ 	if (device->raid_level == SA_RAID_1 ||
++ 		device->raid_level == SA_RAID_TRIPLE) {
++ 		if (rmd.is_write) {
++ 			pqi_calc_aio_r1_nexus(raid_map, &rmd);
+++>>>>>>> 667298ceaf04 (scsi: smartpqi: Fix blocks_per_row static checker issue)
+  		} else {
+ -			group = device->next_bypass_group;
+ -			next_bypass_group = group + 1;
+ -			if (next_bypass_group >= rmd.layout_map_count)
+ -				next_bypass_group = 0;
+ -			device->next_bypass_group = next_bypass_group;
+ -			rmd.map_index += group * rmd.data_disks_per_row;
+ +			do {
+ +				/*
+ +				 * Determine mirror group that map_index
+ +				 * indicates.
+ +				 */
+ +				current_group = map_index / data_disks_per_row;
+ +
+ +				if (offload_to_mirror != current_group) {
+ +					if (current_group <
+ +						layout_map_count - 1) {
+ +						/*
+ +						 * Select raid index from
+ +						 * next group.
+ +						 */
+ +						map_index += data_disks_per_row;
+ +						current_group++;
+ +					} else {
+ +						/*
+ +						 * Select raid index from first
+ +						 * group.
+ +						 */
+ +						map_index %= data_disks_per_row;
+ +						current_group = 0;
+ +					}
+ +				}
+ +			} while (offload_to_mirror != current_group);
+  		}
+ +
+ +		/* Set mirror group to use next time. */
+ +		offload_to_mirror =
+ +			(offload_to_mirror >= layout_map_count - 1) ?
+ +				0 : offload_to_mirror + 1;
+ +		device->offload_to_mirror = offload_to_mirror;
+ +		/*
+ +		 * Avoid direct use of device->offload_to_mirror within this
+ +		 * function since multiple threads might simultaneously
+ +		 * increment it beyond the range of device->layout_map_count -1.
+ +		 */
+  	} else if ((device->raid_level == SA_RAID_5 ||
+ -		device->raid_level == SA_RAID_6) &&
+ -		(rmd.layout_map_count > 1 || rmd.is_write)) {
+ -		rc = pqi_calc_aio_r5_or_r6(&rmd, raid_map);
+ -		if (rc)
+ +		device->raid_level == SA_RAID_6) && layout_map_count > 1) {
+ +		/* RAID 50/60 */
+ +		/* Verify first and last block are in same RAID group */
+ +		r5or6_blocks_per_row = strip_size * data_disks_per_row;
+ +		stripesize = r5or6_blocks_per_row * layout_map_count;
+ +#if BITS_PER_LONG == 32
+ +		tmpdiv = first_block;
+ +		first_group = do_div(tmpdiv, stripesize);
+ +		tmpdiv = first_group;
+ +		do_div(tmpdiv, r5or6_blocks_per_row);
+ +		first_group = tmpdiv;
+ +		tmpdiv = last_block;
+ +		last_group = do_div(tmpdiv, stripesize);
+ +		tmpdiv = last_group;
+ +		do_div(tmpdiv, r5or6_blocks_per_row);
+ +		last_group = tmpdiv;
+ +#else
+ +		first_group = (first_block % stripesize) / r5or6_blocks_per_row;
+ +		last_group = (last_block % stripesize) / r5or6_blocks_per_row;
+ +#endif
+ +		if (first_group != last_group)
+  			return PQI_RAID_BYPASS_INELIGIBLE;
+ -	}
+  
+ -	if (unlikely(rmd.map_index >= RAID_MAP_MAX_ENTRIES))
+ -		return PQI_RAID_BYPASS_INELIGIBLE;
+ +		/* Verify request is in a single row of RAID 5/6 */
+ +#if BITS_PER_LONG == 32
+ +		tmpdiv = first_block;
+ +		do_div(tmpdiv, stripesize);
+ +		first_row = r5or6_first_row = r0_first_row = tmpdiv;
+ +		tmpdiv = last_block;
+ +		do_div(tmpdiv, stripesize);
+ +		r5or6_last_row = r0_last_row = tmpdiv;
+ +#else
+ +		first_row = r5or6_first_row = r0_first_row =
+ +			first_block / stripesize;
+ +		r5or6_last_row = r0_last_row = last_block / stripesize;
+ +#endif
+ +		if (r5or6_first_row != r5or6_last_row)
+ +			return PQI_RAID_BYPASS_INELIGIBLE;
+ +
+ +		/* Verify request is in a single column */
+ +#if BITS_PER_LONG == 32
+ +		tmpdiv = first_block;
+ +		first_row_offset = do_div(tmpdiv, stripesize);
+ +		tmpdiv = first_row_offset;
+ +		first_row_offset = (u32)do_div(tmpdiv, r5or6_blocks_per_row);
+ +		r5or6_first_row_offset = first_row_offset;
+ +		tmpdiv = last_block;
+ +		r5or6_last_row_offset = do_div(tmpdiv, stripesize);
+ +		tmpdiv = r5or6_last_row_offset;
+ +		r5or6_last_row_offset = do_div(tmpdiv, r5or6_blocks_per_row);
+ +		tmpdiv = r5or6_first_row_offset;
+ +		do_div(tmpdiv, strip_size);
+ +		first_column = r5or6_first_column = tmpdiv;
+ +		tmpdiv = r5or6_last_row_offset;
+ +		do_div(tmpdiv, strip_size);
+ +		r5or6_last_column = tmpdiv;
+ +#else
+ +		first_row_offset = r5or6_first_row_offset =
+ +			(u32)((first_block % stripesize) %
+ +			r5or6_blocks_per_row);
+ +
+ +		r5or6_last_row_offset =
+ +			(u32)((last_block % stripesize) %
+ +			r5or6_blocks_per_row);
+ +
+ +		first_column = r5or6_first_row_offset / strip_size;
+ +		r5or6_first_column = first_column;
+ +		r5or6_last_column = r5or6_last_row_offset / strip_size;
+ +#endif
+ +		if (r5or6_first_column != r5or6_last_column)
+ +			return PQI_RAID_BYPASS_INELIGIBLE;
+ +
+ +		/* Request is eligible */
+ +		map_row =
+ +			((u32)(first_row >> raid_map->parity_rotation_shift)) %
+ +			get_unaligned_le16(&raid_map->row_cnt);
+ +
+ +		map_index = (first_group *
+ +			(get_unaligned_le16(&raid_map->row_cnt) *
+ +			total_disks_per_row)) +
+ +			(map_row * total_disks_per_row) + first_column;
+ +	}
+  
+ -	rmd.aio_handle = raid_map->disk_data[rmd.map_index].aio_handle;
+ -	rmd.disk_block = get_unaligned_le64(&raid_map->disk_starting_blk) +
+ -		rmd.first_row * rmd.strip_size +
+ -		(rmd.first_row_offset - rmd.first_column * rmd.strip_size);
+ -	rmd.disk_block_cnt = rmd.block_cnt;
+ +	aio_handle = raid_map->disk_data[map_index].aio_handle;
+ +	disk_block = get_unaligned_le64(&raid_map->disk_starting_blk) +
+ +		first_row * strip_size +
+ +		(first_row_offset - first_column * strip_size);
+ +	disk_block_cnt = block_cnt;
+  
+  	/* Handle differing logical/physical block sizes. */
+  	if (raid_map->phys_blk_shift) {
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
