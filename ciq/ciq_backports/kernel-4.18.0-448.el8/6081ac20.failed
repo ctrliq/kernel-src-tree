@@ -1,0 +1,178 @@
+gve: Add tx|rx-coalesce-usec for DQO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tao Liu <xliutaox@google.com>
+commit 6081ac2013ab9f1a8743f90ef13d973888359cda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/6081ac20.failed
+
+Adding ethtool support for changing rx-coalesce-usec and tx-coalesce-usec
+when using the DQO queue format.
+
+	Signed-off-by: Tao Liu <xliutaox@google.com>
+	Signed-off-by: Jeroen de Borst <jeroendb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6081ac2013ab9f1a8743f90ef13d973888359cda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_dqo.h
+#	drivers/net/ethernet/google/gve/gve_main.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index 4775214c4d98,5f5d4f7aa813..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -505,6 -575,19 +505,22 @@@ struct gve_priv 
+  
+  	/* Gvnic device link speed from hypervisor. */
+  	u64 link_speed;
+++<<<<<<< HEAD
+++=======
++ 	bool up_before_suspend; /* True if dev was up before suspend */
++ 
++ 	struct gve_options_dqo_rda options_dqo_rda;
++ 	struct gve_ptype_lut *ptype_lut_dqo;
++ 
++ 	/* Must be a power of two. */
++ 	int data_buffer_size_dqo;
++ 
++ 	enum gve_queue_format queue_format;
++ 
++ 	/* Interrupt coalescing settings */
++ 	u32 tx_coalesce_usecs;
++ 	u32 rx_coalesce_usecs;
+++>>>>>>> 6081ac2013ab (gve: Add tx|rx-coalesce-usec for DQO)
+  };
+  
+  enum gve_service_task_flags_bit {
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index 5da121364d11,f7f65c4bf993..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -938,14 -1110,24 +938,32 @@@ static void gve_turnup(struct gve_priv 
+  		struct gve_notify_block *block = &priv->ntfy_blocks[ntfy_idx];
+  
+  		napi_enable(&block->napi);
+++<<<<<<< HEAD
+ +		iowrite32be(0, gve_irq_doorbell(priv, block));
+++=======
++ 		if (gve_is_gqi(priv)) {
++ 			iowrite32be(0, gve_irq_doorbell(priv, block));
++ 		} else {
++ 			gve_set_itr_coalesce_usecs_dqo(priv, block,
++ 						       priv->tx_coalesce_usecs);
++ 		}
+++>>>>>>> 6081ac2013ab (gve: Add tx|rx-coalesce-usec for DQO)
+  	}
+  	for (idx = 0; idx < priv->rx_cfg.num_queues; idx++) {
+  		int ntfy_idx = gve_rx_idx_to_ntfy(priv, idx);
+  		struct gve_notify_block *block = &priv->ntfy_blocks[ntfy_idx];
+  
+  		napi_enable(&block->napi);
+++<<<<<<< HEAD
+ +		iowrite32be(0, gve_irq_doorbell(priv, block));
+++=======
++ 		if (gve_is_gqi(priv)) {
++ 			iowrite32be(0, gve_irq_doorbell(priv, block));
++ 		} else {
++ 			gve_set_itr_coalesce_usecs_dqo(priv, block,
++ 						       priv->rx_coalesce_usecs);
++ 		}
+++>>>>>>> 6081ac2013ab (gve: Add tx|rx-coalesce-usec for DQO)
+  	}
+  
+  	gve_set_napi_enabled(priv);
+* Unmerged path drivers/net/ethernet/google/gve/gve_dqo.h
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_dqo.h
+diff --git a/drivers/net/ethernet/google/gve/gve_ethtool.c b/drivers/net/ethernet/google/gve/gve_ethtool.c
+index e8a09d3163e6..49f78a3cb8c5 100644
+--- a/drivers/net/ethernet/google/gve/gve_ethtool.c
++++ b/drivers/net/ethernet/google/gve/gve_ethtool.c
+@@ -7,6 +7,7 @@
+ #include <linux/rtnetlink.h>
+ #include "gve.h"
+ #include "gve_adminq.h"
++#include "gve_dqo.h"
+ 
+ static void gve_get_drvinfo(struct net_device *netdev,
+ 			    struct ethtool_drvinfo *info)
+@@ -518,7 +519,65 @@ static int gve_get_link_ksettings(struct net_device *netdev,
+ 	return err;
+ }
+ 
++static int gve_get_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_ec,
++			    struct netlink_ext_ack *extack)
++{
++	struct gve_priv *priv = netdev_priv(netdev);
++
++	if (gve_is_gqi(priv))
++		return -EOPNOTSUPP;
++	ec->tx_coalesce_usecs = priv->tx_coalesce_usecs;
++	ec->rx_coalesce_usecs = priv->rx_coalesce_usecs;
++
++	return 0;
++}
++
++static int gve_set_coalesce(struct net_device *netdev,
++			    struct ethtool_coalesce *ec,
++			    struct kernel_ethtool_coalesce *kernel_ec,
++			    struct netlink_ext_ack *extack)
++{
++	struct gve_priv *priv = netdev_priv(netdev);
++	u32 tx_usecs_orig = priv->tx_coalesce_usecs;
++	u32 rx_usecs_orig = priv->rx_coalesce_usecs;
++	int idx;
++
++	if (gve_is_gqi(priv))
++		return -EOPNOTSUPP;
++
++	if (ec->tx_coalesce_usecs > GVE_MAX_ITR_INTERVAL_DQO ||
++	    ec->rx_coalesce_usecs > GVE_MAX_ITR_INTERVAL_DQO)
++		return -EINVAL;
++	priv->tx_coalesce_usecs = ec->tx_coalesce_usecs;
++	priv->rx_coalesce_usecs = ec->rx_coalesce_usecs;
++
++	if (tx_usecs_orig != priv->tx_coalesce_usecs) {
++		for (idx = 0; idx < priv->tx_cfg.num_queues; idx++) {
++			int ntfy_idx = gve_tx_idx_to_ntfy(priv, idx);
++			struct gve_notify_block *block = &priv->ntfy_blocks[ntfy_idx];
++
++			gve_set_itr_coalesce_usecs_dqo(priv, block,
++						       priv->tx_coalesce_usecs);
++		}
++	}
++
++	if (rx_usecs_orig != priv->rx_coalesce_usecs) {
++		for (idx = 0; idx < priv->rx_cfg.num_queues; idx++) {
++			int ntfy_idx = gve_rx_idx_to_ntfy(priv, idx);
++			struct gve_notify_block *block = &priv->ntfy_blocks[ntfy_idx];
++
++			gve_set_itr_coalesce_usecs_dqo(priv, block,
++						       priv->rx_coalesce_usecs);
++		}
++	}
++
++	return 0;
++}
++
+ const struct ethtool_ops gve_ethtool_ops = {
++	.supported_coalesce_params = ETHTOOL_COALESCE_USECS,
+ 	.get_drvinfo = gve_get_drvinfo,
+ 	.get_strings = gve_get_strings,
+ 	.get_sset_count = gve_get_sset_count,
+@@ -528,6 +587,8 @@ const struct ethtool_ops gve_ethtool_ops = {
+ 	.set_channels = gve_set_channels,
+ 	.get_channels = gve_get_channels,
+ 	.get_link = ethtool_op_get_link,
++	.get_coalesce = gve_get_coalesce,
++	.set_coalesce = gve_set_coalesce,
+ 	.get_ringparam = gve_get_ringparam,
+ 	.reset = gve_user_reset,
+ 	.get_tunable = gve_get_tunable,
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
