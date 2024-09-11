@@ -1,0 +1,113 @@
+padata: add separate cpuhp node for CPUHP_PADATA_DEAD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Jordan <daniel.m.jordan@oracle.com>
+commit 3c2214b6027ff37945799de717c417212e1a8c54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3c2214b6.failed
+
+Removing the pcrypt module triggers this:
+
+  general protection fault, probably for non-canonical
+    address 0xdead000000000122
+  CPU: 5 PID: 264 Comm: modprobe Not tainted 5.6.0+ #2
+  Hardware name: QEMU Standard PC
+  RIP: 0010:__cpuhp_state_remove_instance+0xcc/0x120
+  Call Trace:
+   padata_sysfs_release+0x74/0xce
+   kobject_put+0x81/0xd0
+   padata_free+0x12/0x20
+   pcrypt_exit+0x43/0x8ee [pcrypt]
+
+padata instances wrongly use the same hlist node for the online and dead
+states, so __padata_free()'s second cpuhp remove call chokes on the node
+that the first poisoned.
+
+cpuhp multi-instance callbacks only walk forward in cpuhp_step->list and
+the same node is linked in both the online and dead lists, so the list
+corruption that results from padata_alloc() adding the node to a second
+list without removing it from the first doesn't cause problems as long
+as no instances are freed.
+
+Avoid the issue by giving each state its own node.
+
+Fixes: 894c9ef9780c ("padata: validate cpumask without removed CPU during offline")
+	Signed-off-by: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: Herbert Xu <herbert@gondor.apana.org.au>
+	Cc: Steffen Klassert <steffen.klassert@secunet.com>
+	Cc: linux-crypto@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+	Cc: stable@vger.kernel.org # v5.4+
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 3c2214b6027ff37945799de717c417212e1a8c54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/padata.h
+diff --cc include/linux/padata.h
+index 53c514db2642,693cae9bfe66..000000000000
+--- a/include/linux/padata.h
++++ b/include/linux/padata.h
+@@@ -154,7 -139,8 +154,12 @@@ struct padata_shell 
+  /**
+   * struct padata_instance - The overall control structure.
+   *
+++<<<<<<< HEAD
+ + * @cpu_notifier: cpu hotplug notifier.
+++=======
++  * @cpu_online_node: Linkage for CPU online callback.
++  * @cpu_dead_node: Linkage for CPU offline callback.
+++>>>>>>> 3c2214b6027f (padata: add separate cpuhp node for CPUHP_PADATA_DEAD)
+   * @parallel_wq: The workqueue used for parallel work.
+   * @serial_wq: The workqueue used for serial work.
+   * @pslist: List of padata_shell objects attached to this instance.
+* Unmerged path include/linux/padata.h
+diff --git a/kernel/padata.c b/kernel/padata.c
+index 1bef72cf00f2..b90665aaf6e1 100644
+--- a/kernel/padata.c
++++ b/kernel/padata.c
+@@ -700,7 +700,7 @@ static int padata_cpu_online(unsigned int cpu, struct hlist_node *node)
+ 	struct padata_instance *pinst;
+ 	int ret;
+ 
+-	pinst = hlist_entry_safe(node, struct padata_instance, node);
++	pinst = hlist_entry_safe(node, struct padata_instance, cpu_online_node);
+ 	if (!pinst_has_cpu(pinst, cpu))
+ 		return 0;
+ 
+@@ -715,7 +715,7 @@ static int padata_cpu_dead(unsigned int cpu, struct hlist_node *node)
+ 	struct padata_instance *pinst;
+ 	int ret;
+ 
+-	pinst = hlist_entry_safe(node, struct padata_instance, node);
++	pinst = hlist_entry_safe(node, struct padata_instance, cpu_dead_node);
+ 	if (!pinst_has_cpu(pinst, cpu))
+ 		return 0;
+ 
+@@ -731,8 +731,9 @@ static enum cpuhp_state hp_online;
+ static void __padata_free(struct padata_instance *pinst)
+ {
+ #ifdef CONFIG_HOTPLUG_CPU
+-	cpuhp_state_remove_instance_nocalls(CPUHP_PADATA_DEAD, &pinst->node);
+-	cpuhp_state_remove_instance_nocalls(hp_online, &pinst->node);
++	cpuhp_state_remove_instance_nocalls(CPUHP_PADATA_DEAD,
++					    &pinst->cpu_dead_node);
++	cpuhp_state_remove_instance_nocalls(hp_online, &pinst->cpu_online_node);
+ #endif
+ 
+ 	WARN_ON(!list_empty(&pinst->pslist));
+@@ -933,9 +934,10 @@ static struct padata_instance *padata_alloc(const char *name,
+ 	mutex_init(&pinst->lock);
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+-	cpuhp_state_add_instance_nocalls_cpuslocked(hp_online, &pinst->node);
++	cpuhp_state_add_instance_nocalls_cpuslocked(hp_online,
++						    &pinst->cpu_online_node);
+ 	cpuhp_state_add_instance_nocalls_cpuslocked(CPUHP_PADATA_DEAD,
+-						    &pinst->node);
++						    &pinst->cpu_dead_node);
+ #endif
+ 
+ 	put_online_cpus();
