@@ -1,0 +1,161 @@
+scsi: blk-mq: Add callbacks for storing & retrieving budget token
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit d022d18c045fc2ccf92d0f14cf80f98eb0a8e119
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/d022d18c.failed
+
+Since SCSI is the only driver which requires dispatch budget move the token
+from struct request to struct scsi_cmnd.
+
+Link: https://lore.kernel.org/r/20210122023317.687987-8-ming.lei@redhat.com
+	Cc: Omar Sandoval <osandov@fb.com>
+	Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+	Cc: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+	Cc: Ewan D. Milne <emilne@redhat.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Tested-by: Sumanesh Samanta <sumanesh.samanta@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d022d18c045fc2ccf92d0f14cf80f98eb0a8e119)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blk-mq.h
+diff --cc include/linux/blk-mq.h
+index f9f05156519e,5fae401f083d..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -228,32 -306,51 +228,45 @@@ struct blk_mq_ops 
+  	 * reserved budget. Also we have to handle failure case
+  	 * of .get_budget for avoiding I/O deadlock.
+  	 */
+ -	bool (*get_budget)(struct request_queue *);
+ +	get_budget_fn		*get_budget;
+ +	put_budget_fn		*put_budget;
+  
+ -	/**
+ -	 * @put_budget: Release the reserved budget.
+ +	/*
+ +	 * Called on request timeout
+  	 */
+ -	void (*put_budget)(struct request_queue *);
+ +	timeout_fn		*timeout;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Called to poll for completion of a specific tag.
+++=======
++ 	 * @set_rq_budget_toekn: store rq's budget token
++ 	 */
++ 	void (*set_rq_budget_token)(struct request *, int);
++ 	/*
++ 	 * @get_rq_budget_toekn: retrieve rq's budget token
++ 	 */
++ 	int (*get_rq_budget_token)(struct request *);
++ 
++ 	/**
++ 	 * @timeout: Called on request timeout.
+++>>>>>>> d022d18c045f (scsi: blk-mq: Add callbacks for storing & retrieving budget token)
+  	 */
+ -	enum blk_eh_timer_return (*timeout)(struct request *, bool);
+ +	poll_fn			*poll;
+  
+ -	/**
+ -	 * @poll: Called to poll for completion of a specific tag.
+ -	 */
+ -	int (*poll)(struct blk_mq_hw_ctx *);
+ +	complete_fn		*complete;
+  
+ -	/**
+ -	 * @complete: Mark the request as complete.
+ -	 */
+ -	void (*complete)(struct request *);
+ -
+ -	/**
+ -	 * @init_hctx: Called when the block layer side of a hardware queue has
+ -	 * been set up, allowing the driver to allocate/init matching
+ -	 * structures.
+ -	 */
+ -	int (*init_hctx)(struct blk_mq_hw_ctx *, void *, unsigned int);
+ -	/**
+ -	 * @exit_hctx: Ditto for exit/teardown.
+ +	/*
+ +	 * Called when the block layer side of a hardware queue has been
+ +	 * set up, allowing the driver to allocate/init matching structures.
+ +	 * Ditto for exit/teardown.
+  	 */
+ -	void (*exit_hctx)(struct blk_mq_hw_ctx *, unsigned int);
+ +	init_hctx_fn		*init_hctx;
+ +	exit_hctx_fn		*exit_hctx;
+  
+ -	/**
+ -	 * @init_request: Called for every command allocated by the block layer
+ -	 * to allow the driver to set up driver specific data.
+ +	/*
+ +	 * Called for every command allocated by the block layer to allow
+ +	 * the driver to set up driver specific data.
+  	 *
+  	 * Tag greater than or equal to queue_depth is for setting up
+  	 * flush request.
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 31348ae4746b..a2ebca265ffa 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1621,6 +1621,20 @@ static bool scsi_mq_get_budget(struct blk_mq_hw_ctx *hctx)
+ 	return false;
+ }
+ 
++static void scsi_mq_set_rq_budget_token(struct request *req, int token)
++{
++	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++
++	cmd->budget_token = token;
++}
++
++static int scsi_mq_get_rq_budget_token(struct request *req)
++{
++	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
++
++	return cmd->budget_token;
++}
++
+ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 			 const struct blk_mq_queue_data *bd)
+ {
+@@ -1824,6 +1838,8 @@ static const struct blk_mq_ops scsi_mq_ops_no_commit = {
+ 	.cleanup_rq	= scsi_cleanup_rq,
+ 	.busy		= scsi_mq_lld_busy,
+ 	.map_queues	= scsi_map_queues,
++	.set_rq_budget_token = scsi_mq_set_rq_budget_token,
++	.get_rq_budget_token = scsi_mq_get_rq_budget_token,
+ };
+ 
+ 
+@@ -1852,6 +1868,8 @@ static const struct blk_mq_ops scsi_mq_ops = {
+ 	.cleanup_rq	= scsi_cleanup_rq,
+ 	.busy		= scsi_mq_lld_busy,
+ 	.map_queues	= scsi_map_queues,
++	.set_rq_budget_token = scsi_mq_set_rq_budget_token,
++	.get_rq_budget_token = scsi_mq_get_rq_budget_token,
+ };
+ 
+ struct request_queue *scsi_mq_alloc_queue(struct scsi_device *sdev)
+* Unmerged path include/linux/blk-mq.h
+diff --git a/include/scsi/scsi_cmnd.h b/include/scsi/scsi_cmnd.h
+index be6e07f1f2a8..d4af6872b21f 100644
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@ -79,6 +79,8 @@ struct scsi_cmnd {
+ 
+ 	int eh_eflags;		/* Used by error handlr */
+ 
++	int budget_token;
++
+ 	/*
+ 	 * A SCSI Command is assigned a nonzero serial_number before passed
+ 	 * to the driver's queue command function.  The serial_number is
