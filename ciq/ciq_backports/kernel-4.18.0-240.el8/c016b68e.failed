@@ -1,0 +1,477 @@
+libbpf: Add bpf_link pinning/unpinning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit c016b68edc7a2adf3db0f11fb649797c1f9216ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c016b68e.failed
+
+With bpf_link abstraction supported by kernel explicitly, add
+pinning/unpinning API for links. Also allow to create (open) bpf_link from BPF
+FS file.
+
+This API allows to have an "ephemeral" FD-based BPF links (like raw tracepoint
+or fexit/freplace attachments) surviving user process exit, by pinning them in
+a BPF FS, which is an important use case for long-running BPF programs.
+
+As part of this, expose underlying FD for bpf_link. While legacy bpf_link's
+might not have a FD associated with them (which will be expressed as
+a bpf_link with fd=-1), kernel's abstraction is based around FD-based usage,
+so match it closely. This, subsequently, allows to have a generic
+pinning/unpinning API for generalized bpf_link. For some types of bpf_links
+kernel might not support pinning, in which case bpf_link__pin() will return
+error.
+
+With FD being part of generic bpf_link, also get rid of bpf_link_fd in favor
+of using vanialla bpf_link.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200303043159.323675-3-andriin@fb.com
+(cherry picked from commit c016b68edc7a2adf3db0f11fb649797c1f9216ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.h
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.c
+index 6ed9ef84b398,f8c4042e5855..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -5463,33 -6929,138 +5463,129 @@@ int bpf_prog_load_xattr(const struct bp
+  }
+  
+  struct bpf_link {
+ -	int (*detach)(struct bpf_link *link);
+  	int (*destroy)(struct bpf_link *link);
+++<<<<<<< HEAD
+++=======
++ 	char *pin_path;		/* NULL, if not pinned */
++ 	int fd;			/* hook FD, -1 if not applicable */
++ 	bool disconnected;
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+  };
+  
+ -/* Release "ownership" of underlying BPF resource (typically, BPF program
+ - * attached to some BPF hook, e.g., tracepoint, kprobe, etc). Disconnected
+ - * link, when destructed through bpf_link__destroy() call won't attempt to
+ - * detach/unregisted that BPF resource. This is useful in situations where,
+ - * say, attached BPF program has to outlive userspace program that attached it
+ - * in the system. Depending on type of BPF program, though, there might be
+ - * additional steps (like pinning BPF program in BPF FS) necessary to ensure
+ - * exit of userspace program doesn't trigger automatic detachment and clean up
+ - * inside the kernel.
+ - */
+ -void bpf_link__disconnect(struct bpf_link *link)
+ -{
+ -	link->disconnected = true;
+ -}
+ -
+  int bpf_link__destroy(struct bpf_link *link)
+  {
+ -	int err = 0;
+ +	int err;
+  
+  	if (!link)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	err = link->destroy(link);
+++=======
++ 	if (!link->disconnected && link->detach)
++ 		err = link->detach(link);
++ 	if (link->destroy)
++ 		link->destroy(link);
++ 	if (link->pin_path)
++ 		free(link->pin_path);
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+  	free(link);
+  
+  	return err;
+  }
+  
+- struct bpf_link_fd {
+- 	struct bpf_link link; /* has to be at the top of struct */
+- 	int fd; /* hook FD */
+- };
++ int bpf_link__fd(const struct bpf_link *link)
++ {
++ 	return link->fd;
++ }
++ 
++ const char *bpf_link__pin_path(const struct bpf_link *link)
++ {
++ 	return link->pin_path;
++ }
++ 
++ static int bpf_link__detach_fd(struct bpf_link *link)
++ {
++ 	return close(link->fd);
++ }
++ 
++ struct bpf_link *bpf_link__open(const char *path)
++ {
++ 	struct bpf_link *link;
++ 	int fd;
++ 
++ 	fd = bpf_obj_get(path);
++ 	if (fd < 0) {
++ 		fd = -errno;
++ 		pr_warn("failed to open link at %s: %d\n", path, fd);
++ 		return ERR_PTR(fd);
++ 	}
++ 
++ 	link = calloc(1, sizeof(*link));
++ 	if (!link) {
++ 		close(fd);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 	link->detach = &bpf_link__detach_fd;
++ 	link->fd = fd;
++ 
++ 	link->pin_path = strdup(path);
++ 	if (!link->pin_path) {
++ 		bpf_link__destroy(link);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	return link;
++ }
++ 
++ int bpf_link__pin(struct bpf_link *link, const char *path)
++ {
++ 	int err;
++ 
++ 	if (link->pin_path)
++ 		return -EBUSY;
++ 	err = make_parent_dir(path);
++ 	if (err)
++ 		return err;
++ 	err = check_path(path);
++ 	if (err)
++ 		return err;
++ 
++ 	link->pin_path = strdup(path);
++ 	if (!link->pin_path)
++ 		return -ENOMEM;
++ 
++ 	if (bpf_obj_pin(link->fd, link->pin_path)) {
++ 		err = -errno;
++ 		zfree(&link->pin_path);
++ 		return err;
++ 	}
++ 
++ 	pr_debug("link fd=%d: pinned at %s\n", link->fd, link->pin_path);
++ 	return 0;
++ }
++ 
++ int bpf_link__unpin(struct bpf_link *link)
++ {
++ 	int err;
++ 
++ 	if (!link->pin_path)
++ 		return -EINVAL;
++ 
++ 	err = unlink(link->pin_path);
++ 	if (err != 0)
++ 		return -errno;
++ 
++ 	pr_debug("link fd=%d: unpinned from %s\n", link->fd, link->pin_path);
++ 	zfree(&link->pin_path);
++ 	return 0;
++ }
+  
+ -static int bpf_link__detach_perf_event(struct bpf_link *link)
+ +static int bpf_link__destroy_perf_event(struct bpf_link *link)
+  {
+- 	struct bpf_link_fd *l = (void *)link;
+  	int err;
+  
+- 	err = ioctl(l->fd, PERF_EVENT_IOC_DISABLE, 0);
++ 	err = ioctl(link->fd, PERF_EVENT_IOC_DISABLE, 0);
+  	if (err)
+  		err = -errno;
+  
+@@@ -5516,10 -7087,10 +5612,14 @@@ struct bpf_link *bpf_program__attach_pe
+  		return ERR_PTR(-EINVAL);
+  	}
+  
+ -	link = calloc(1, sizeof(*link));
+ +	link = malloc(sizeof(*link));
+  	if (!link)
+  		return ERR_PTR(-ENOMEM);
+++<<<<<<< HEAD
+ +	link->link.destroy = &bpf_link__destroy_perf_event;
+++=======
++ 	link->detach = &bpf_link__detach_perf_event;
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+  	link->fd = pfd;
+  
+  	if (ioctl(pfd, PERF_EVENT_IOC_SET_BPF, prog_fd) < 0) {
+@@@ -5788,11 -7371,30 +5888,38 @@@ struct bpf_link *bpf_program__attach_tr
+  	return link;
+  }
+  
+++<<<<<<< HEAD
+ +static int bpf_link__destroy_fd(struct bpf_link *link)
+ +{
+ +	struct bpf_link_fd *l = (void *)link;
+ +
+ +	return close(l->fd);
+++=======
++ static struct bpf_link *attach_tp(const struct bpf_sec_def *sec,
++ 				  struct bpf_program *prog)
++ {
++ 	char *sec_name, *tp_cat, *tp_name;
++ 	struct bpf_link *link;
++ 
++ 	sec_name = strdup(bpf_program__title(prog, false));
++ 	if (!sec_name)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	/* extract "tp/<category>/<name>" */
++ 	tp_cat = sec_name + sec->len;
++ 	tp_name = strchr(tp_cat, '/');
++ 	if (!tp_name) {
++ 		link = ERR_PTR(-EINVAL);
++ 		goto out;
++ 	}
++ 	*tp_name = '\0';
++ 	tp_name++;
++ 
++ 	link = bpf_program__attach_tracepoint(prog, tp_cat, tp_name);
++ out:
++ 	free(sec_name);
++ 	return link;
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+  }
+  
+  struct bpf_link *bpf_program__attach_raw_tracepoint(struct bpf_program *prog,
+@@@ -5809,10 -7411,10 +5936,14 @@@
+  		return ERR_PTR(-EINVAL);
+  	}
+  
+ -	link = calloc(1, sizeof(*link));
+ +	link = malloc(sizeof(*link));
+  	if (!link)
+  		return ERR_PTR(-ENOMEM);
+++<<<<<<< HEAD
+ +	link->link.destroy = &bpf_link__destroy_fd;
+++=======
++ 	link->detach = &bpf_link__detach_fd;
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+  
+  	pfd = bpf_raw_tracepoint_open(tp_name, prog_fd);
+  	if (pfd < 0) {
+@@@ -5824,9 -7426,116 +5955,119 @@@
+  		return ERR_PTR(pfd);
+  	}
+  	link->fd = pfd;
++ 	return link;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static struct bpf_link *attach_raw_tp(const struct bpf_sec_def *sec,
++ 				      struct bpf_program *prog)
++ {
++ 	const char *tp_name = bpf_program__title(prog, false) + sec->len;
++ 
++ 	return bpf_program__attach_raw_tracepoint(prog, tp_name);
++ }
++ 
++ struct bpf_link *bpf_program__attach_trace(struct bpf_program *prog)
++ {
++ 	char errmsg[STRERR_BUFSIZE];
++ 	struct bpf_link *link;
++ 	int prog_fd, pfd;
++ 
++ 	prog_fd = bpf_program__fd(prog);
++ 	if (prog_fd < 0) {
++ 		pr_warn("program '%s': can't attach before loaded\n",
++ 			bpf_program__title(prog, false));
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	link = calloc(1, sizeof(*link));
++ 	if (!link)
++ 		return ERR_PTR(-ENOMEM);
++ 	link->detach = &bpf_link__detach_fd;
++ 
++ 	pfd = bpf_raw_tracepoint_open(NULL, prog_fd);
++ 	if (pfd < 0) {
++ 		pfd = -errno;
++ 		free(link);
++ 		pr_warn("program '%s': failed to attach to trace: %s\n",
++ 			bpf_program__title(prog, false),
++ 			libbpf_strerror_r(pfd, errmsg, sizeof(errmsg)));
++ 		return ERR_PTR(pfd);
++ 	}
++ 	link->fd = pfd;
+  	return (struct bpf_link *)link;
+  }
+  
++ static struct bpf_link *attach_trace(const struct bpf_sec_def *sec,
++ 				     struct bpf_program *prog)
++ {
++ 	return bpf_program__attach_trace(prog);
++ }
++ 
++ struct bpf_link *bpf_program__attach(struct bpf_program *prog)
++ {
++ 	const struct bpf_sec_def *sec_def;
++ 
++ 	sec_def = find_sec_def(bpf_program__title(prog, false));
++ 	if (!sec_def || !sec_def->attach_fn)
++ 		return ERR_PTR(-ESRCH);
++ 
++ 	return sec_def->attach_fn(sec_def, prog);
++ }
++ 
++ static int bpf_link__detach_struct_ops(struct bpf_link *link)
++ {
++ 	__u32 zero = 0;
++ 
++ 	if (bpf_map_delete_elem(link->fd, &zero))
++ 		return -errno;
++ 
++ 	return 0;
++ }
++ 
++ struct bpf_link *bpf_map__attach_struct_ops(struct bpf_map *map)
++ {
++ 	struct bpf_struct_ops *st_ops;
++ 	struct bpf_link *link;
++ 	__u32 i, zero = 0;
++ 	int err;
++ 
++ 	if (!bpf_map__is_struct_ops(map) || map->fd == -1)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	link = calloc(1, sizeof(*link));
++ 	if (!link)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	st_ops = map->st_ops;
++ 	for (i = 0; i < btf_vlen(st_ops->type); i++) {
++ 		struct bpf_program *prog = st_ops->progs[i];
++ 		void *kern_data;
++ 		int prog_fd;
++ 
++ 		if (!prog)
++ 			continue;
++ 
++ 		prog_fd = bpf_program__fd(prog);
++ 		kern_data = st_ops->kern_vdata + st_ops->kern_func_off[i];
++ 		*(unsigned long *)kern_data = prog_fd;
++ 	}
++ 
++ 	err = bpf_map_update_elem(map->fd, &zero, st_ops->kern_vdata, 0);
++ 	if (err) {
++ 		err = -errno;
++ 		free(link);
++ 		return ERR_PTR(err);
++ 	}
++ 
++ 	link->detach = bpf_link__detach_struct_ops;
++ 	link->fd = map->fd;
++ 
++ 	return link;
++ }
++ 
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+  enum bpf_perf_event_ret
+  bpf_perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
+  			   void **copy_mem, size_t *copy_size,
+diff --cc tools/lib/bpf/libbpf.h
+index e454ceec9fa2,d38d7a629417..000000000000
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@@ -203,8 -219,16 +203,17 @@@ LIBBPF_API void bpf_program__unload(str
+  
+  struct bpf_link;
+  
+++<<<<<<< HEAD
+++=======
++ LIBBPF_API struct bpf_link *bpf_link__open(const char *path);
++ LIBBPF_API int bpf_link__fd(const struct bpf_link *link);
++ LIBBPF_API const char *bpf_link__pin_path(const struct bpf_link *link);
++ LIBBPF_API int bpf_link__pin(struct bpf_link *link, const char *path);
++ LIBBPF_API int bpf_link__unpin(struct bpf_link *link);
++ LIBBPF_API void bpf_link__disconnect(struct bpf_link *link);
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+  LIBBPF_API int bpf_link__destroy(struct bpf_link *link);
+  
+ -LIBBPF_API struct bpf_link *
+ -bpf_program__attach(struct bpf_program *prog);
+  LIBBPF_API struct bpf_link *
+  bpf_program__attach_perf_event(struct bpf_program *prog, int pfd);
+  LIBBPF_API struct bpf_link *
+diff --cc tools/lib/bpf/libbpf.map
+index 3ca7228af37e,5129283c0284..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -188,9 -197,51 +188,52 @@@ LIBBPF_0.0.4 
+  		bpf_map__get_pin_path;
+  		bpf_map__is_pinned;
+  		bpf_map__set_pin_path;
+ -		bpf_object__open_file;
+ -		bpf_object__open_mem;
+ -		bpf_program__attach_trace;
+  		bpf_program__get_expected_attach_type;
+  		bpf_program__get_type;
+ -		bpf_program__is_tracing;
+ -		bpf_program__set_tracing;
+ +		bpf_get_link_xdp_info;
+  		bpf_program__size;
+++<<<<<<< HEAD
+ +		bpf_btf_get_next_id;
+ +} LIBBPF_0.0.3;
+++=======
++ 		btf__find_by_name_kind;
++ 		libbpf_find_vmlinux_btf_id;
++ } LIBBPF_0.0.5;
++ 
++ LIBBPF_0.0.7 {
++ 	global:
++ 		btf_dump__emit_type_decl;
++ 		bpf_link__disconnect;
++ 		bpf_map__attach_struct_ops;
++ 		bpf_map_delete_batch;
++ 		bpf_map_lookup_and_delete_batch;
++ 		bpf_map_lookup_batch;
++ 		bpf_map_update_batch;
++ 		bpf_object__find_program_by_name;
++ 		bpf_object__attach_skeleton;
++ 		bpf_object__destroy_skeleton;
++ 		bpf_object__detach_skeleton;
++ 		bpf_object__load_skeleton;
++ 		bpf_object__open_skeleton;
++ 		bpf_probe_large_insn_limit;
++ 		bpf_prog_attach_xattr;
++ 		bpf_program__attach;
++ 		bpf_program__name;
++ 		bpf_program__is_extension;
++ 		bpf_program__is_struct_ops;
++ 		bpf_program__set_extension;
++ 		bpf_program__set_struct_ops;
++ 		btf__align_of;
++ 		libbpf_find_kernel_btf;
++ } LIBBPF_0.0.6;
++ 
++ LIBBPF_0.0.8 {
++ 	global:
++ 		bpf_link__fd;
++ 		bpf_link__open;
++ 		bpf_link__pin;
++ 		bpf_link__pin_path;
++ 		bpf_link__unpin;
++ 		bpf_program__set_attach_target;
++ } LIBBPF_0.0.7;
+++>>>>>>> c016b68edc7a (libbpf: Add bpf_link pinning/unpinning)
+* Unmerged path tools/lib/bpf/libbpf.c
+* Unmerged path tools/lib/bpf/libbpf.h
+* Unmerged path tools/lib/bpf/libbpf.map
