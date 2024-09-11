@@ -1,0 +1,140 @@
+KVM: nVMX: Rename exit_reason to vm_exit_reason for nested VM-Exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 4dcefa312a6c1cc2aa2dd8a9ba76d97d63b3bd17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4dcefa31.failed
+
+Use "vm_exit_reason" for code related to injecting a nested VM-Exit to
+VM-Exits to make it clear that nested_vmx_vmexit() expects the full exit
+eason, not just the basic exit reason.  The basic exit reason (bits 15:0
+of vmcs.VM_EXIT_REASON) is colloquially referred to as simply "exit
+reason".
+
+Note, other flows, e.g. vmx_handle_exit(), are intentionally left as is.
+A future patch will convert vmx->exit_reason to a union + bit-field, and
+the exempted flows will interact with the unionized of "exit_reason".
+
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200415175519.14230-10-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4dcefa312a6c1cc2aa2dd8a9ba76d97d63b3bd17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.h
+diff --cc arch/x86/kvm/vmx/nested.h
+index 22c93a1e37fb,1514ff4db77f..000000000000
+--- a/arch/x86/kvm/vmx/nested.h
++++ b/arch/x86/kvm/vmx/nested.h
+@@@ -25,8 -25,8 +25,13 @@@ void nested_vmx_set_vmcs_shadowing_bitm
+  void nested_vmx_free_vcpu(struct kvm_vcpu *vcpu);
+  enum nvmx_vmentry_status nested_vmx_enter_non_root_mode(struct kvm_vcpu *vcpu,
+  						     bool from_vmentry);
+++<<<<<<< HEAD
+ +bool nested_vmx_exit_reflected(struct kvm_vcpu *vcpu, u32 exit_reason);
+ +void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+++=======
++ bool nested_vmx_reflect_vmexit(struct kvm_vcpu *vcpu);
++ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+++>>>>>>> 4dcefa312a6c (KVM: nVMX: Rename exit_reason to vm_exit_reason for nested VM-Exit)
+  		       u32 exit_intr_info, unsigned long exit_qualification);
+  void nested_sync_vmcs12_to_shadow(struct kvm_vcpu *vcpu);
+  int vmx_set_vmx_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 data);
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 4dc9860672d5..8fadcd9b3791 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -328,19 +328,19 @@ static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,
+ {
+ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+-	u32 exit_reason;
++	u32 vm_exit_reason;
+ 	unsigned long exit_qualification = vcpu->arch.exit_qualification;
+ 
+ 	if (vmx->nested.pml_full) {
+-		exit_reason = EXIT_REASON_PML_FULL;
++		vm_exit_reason = EXIT_REASON_PML_FULL;
+ 		vmx->nested.pml_full = false;
+ 		exit_qualification &= INTR_INFO_UNBLOCK_NMI;
+ 	} else if (fault->error_code & PFERR_RSVD_MASK)
+-		exit_reason = EXIT_REASON_EPT_MISCONFIG;
++		vm_exit_reason = EXIT_REASON_EPT_MISCONFIG;
+ 	else
+-		exit_reason = EXIT_REASON_EPT_VIOLATION;
++		vm_exit_reason = EXIT_REASON_EPT_VIOLATION;
+ 
+-	nested_vmx_vmexit(vcpu, exit_reason, 0, exit_qualification);
++	nested_vmx_vmexit(vcpu, vm_exit_reason, 0, exit_qualification);
+ 	vmcs12->guest_physical_address = fault->address;
+ }
+ 
+@@ -3933,11 +3933,11 @@ static void sync_vmcs02_to_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+  * which already writes to vmcs12 directly.
+  */
+ static void prepare_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
+-			   u32 exit_reason, u32 exit_intr_info,
++			   u32 vm_exit_reason, u32 exit_intr_info,
+ 			   unsigned long exit_qualification)
+ {
+ 	/* update exit information fields: */
+-	vmcs12->vm_exit_reason = exit_reason;
++	vmcs12->vm_exit_reason = vm_exit_reason;
+ 	vmcs12->exit_qualification = exit_qualification;
+ 	vmcs12->vm_exit_intr_info = exit_intr_info;
+ 
+@@ -4266,7 +4266,7 @@ static void nested_vmx_restore_host_state(struct kvm_vcpu *vcpu)
+  * and modify vmcs12 to make it see what it would expect to see there if
+  * L2 was its real guest. Must only be called when in L2 (is_guest_mode())
+  */
+-void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
++void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+ 		       u32 exit_intr_info, unsigned long exit_qualification)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+@@ -4286,9 +4286,9 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+ 	if (likely(!vmx->fail)) {
+ 		sync_vmcs02_to_vmcs12(vcpu, vmcs12);
+ 
+-		if (exit_reason != -1)
+-			prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
+-				       exit_qualification);
++		if (vm_exit_reason != -1)
++			prepare_vmcs12(vcpu, vmcs12, vm_exit_reason,
++				       exit_intr_info, exit_qualification);
+ 
+ 		/*
+ 		 * Must happen outside of sync_vmcs02_to_vmcs12() as it will
+@@ -4344,14 +4344,15 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+ 	 */
+ 	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
+ 
+-	if ((exit_reason != -1) && (enable_shadow_vmcs || vmx->nested.hv_evmcs))
++	if ((vm_exit_reason != -1) &&
++	    (enable_shadow_vmcs || vmx->nested.hv_evmcs))
+ 		vmx->nested.need_vmcs12_to_shadow_sync = true;
+ 
+ 	/* in case we halted in L2 */
+ 	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+ 
+ 	if (likely(!vmx->fail)) {
+-		if ((u16)exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
++		if ((u16)vm_exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
+ 		    nested_exit_intr_ack_set(vcpu)) {
+ 			int irq = kvm_cpu_get_interrupt(vcpu);
+ 			WARN_ON(irq < 0);
+@@ -4359,7 +4360,7 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+ 				INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
+ 		}
+ 
+-		if (exit_reason != -1)
++		if (vm_exit_reason != -1)
+ 			trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
+ 						       vmcs12->exit_qualification,
+ 						       vmcs12->idt_vectoring_info_field,
+* Unmerged path arch/x86/kvm/vmx/nested.h
