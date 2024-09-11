@@ -1,0 +1,289 @@
+driver core: Move the "removable" attribute from USB to core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Rajat Jain <rajatja@google.com>
+commit 70f400d4d957c2453c8689552ff212bc59f88938
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/70f400d4.failed
+
+Move the "removable" attribute from USB to core in order to allow it to be
+supported by other subsystem / buses. Individual buses that want to support
+this attribute can populate the removable property of the device while
+enumerating it with the 3 possible values -
+ - "unknown"
+ - "fixed"
+ - "removable"
+Leaving the field unchanged (i.e. "not supported") would mean that the
+attribute would not show up in sysfs for that device. The UAPI (location,
+symantics etc) for the attribute remains unchanged.
+
+Move the "removable" attribute from USB to the device core so it can be
+used by other subsystems / buses.
+
+By default, devices do not have a "removable" attribute in sysfs.
+
+If a subsystem or bus driver wants to support a "removable" attribute, it
+should call device_set_removable() before calling device_register() or
+device_add(), e.g.:
+
+    device_set_removable(dev, DEVICE_REMOVABLE);
+    device_register(dev);
+
+The possible values and the resulting sysfs attribute contents are:
+
+    DEVICE_REMOVABLE_UNKNOWN  ->  "unknown"
+    DEVICE_REMOVABLE          ->  "removable"
+    DEVICE_FIXED              ->  "fixed"
+
+Convert the USB "removable" attribute to use this new device core
+functionality.  There should be no user-visible change in the location or
+semantics of attribute for USB devices.
+
+	Reviewed-by: Bjorn Helgaas <bhelgaas@google.com>
+	Signed-off-by: Rajat Jain <rajatja@google.com>
+Link: https://lore.kernel.org/r/20210524171812.18095-1-rajatja@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 70f400d4d957c2453c8689552ff212bc59f88938)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/device.h
+diff --cc include/linux/device.h
+index 08956d517202,8566fa98b239..000000000000
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@@ -1276,9 -561,10 +1295,14 @@@ struct device 
+  
+  	void	(*release)(struct device *dev);
+  	struct iommu_group	*iommu_group;
+ -	struct dev_iommu	*iommu;
+ +	RH_KABI_DEPRECATE(struct iommu_fwspec *, iommu_fwspec)
+  
+++<<<<<<< HEAD
+ +	/* RHEL8 kabi note: Total of 64-bits of bool can be defined. */
+++=======
++ 	enum device_removable	removable;
++ 
+++>>>>>>> 70f400d4d957 (driver core: Move the "removable" attribute from USB to core)
+  	bool			offline_disabled:1;
+  	bool			offline:1;
+  	bool			of_node_reused:1;
+diff --git a/Documentation/ABI/testing/sysfs-bus-usb b/Documentation/ABI/testing/sysfs-bus-usb
+index 559baa5c418c..59986ff0678f 100644
+--- a/Documentation/ABI/testing/sysfs-bus-usb
++++ b/Documentation/ABI/testing/sysfs-bus-usb
+@@ -150,17 +150,6 @@ Description:
+ 		files hold a string value (enable or disable) indicating whether
+ 		or not USB3 hardware LPM U1 or U2 is enabled for the device.
+ 
+-What:		/sys/bus/usb/devices/.../removable
+-Date:		February 2012
+-Contact:	Matthew Garrett <mjg@redhat.com>
+-Description:
+-		Some information about whether a given USB device is
+-		physically fixed to the platform can be inferred from a
+-		combination of hub descriptor bits and platform-specific data
+-		such as ACPI. This file will read either "removable" or
+-		"fixed" if the information is available, and "unknown"
+-		otherwise.
+-
+ What:		/sys/bus/usb/devices/.../ltm_capable
+ Date:		July 2012
+ Contact:	Sarah Sharp <sarah.a.sharp@linux.intel.com>
+diff --git a/Documentation/ABI/testing/sysfs-devices-removable b/Documentation/ABI/testing/sysfs-devices-removable
+new file mode 100644
+index 000000000000..acf7766e800b
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-devices-removable
+@@ -0,0 +1,17 @@
++What:		/sys/devices/.../removable
++Date:		May 2021
++Contact:	Rajat Jain <rajatxjain@gmail.com>
++Description:
++		Information about whether a given device can be removed from the
++		platform by the	user. This is determined by its subsystem in a
++		bus / platform-specific way. This attribute is only present for
++		devices that can support determining such information:
++
++		"removable": device can be removed from the platform by the user
++		"fixed":     device is fixed to the platform / cannot be removed
++			     by the user.
++		"unknown":   The information is unavailable / cannot be deduced.
++
++		Currently this is only supported by USB (which infers the
++		information from a combination of hub descriptor bits and
++		platform-specific data such as ACPI).
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 44a47f2cd9c4..bc805e5d559a 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -2206,6 +2206,25 @@ static ssize_t online_store(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RW(online);
+ 
++static ssize_t removable_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	const char *loc;
++
++	switch (dev->removable) {
++	case DEVICE_REMOVABLE:
++		loc = "removable";
++		break;
++	case DEVICE_FIXED:
++		loc = "fixed";
++		break;
++	default:
++		loc = "unknown";
++	}
++	return sysfs_emit(buf, "%s\n", loc);
++}
++static DEVICE_ATTR_RO(removable);
++
+ int device_add_groups(struct device *dev, const struct attribute_group **groups)
+ {
+ 	return sysfs_create_groups(&dev->kobj, groups);
+@@ -2383,8 +2402,16 @@ static int device_add_attrs(struct device *dev)
+ 			goto err_remove_dev_online;
+ 	}
+ 
++	if (dev_removable_is_valid(dev)) {
++		error = device_create_file(dev, &dev_attr_removable);
++		if (error)
++			goto err_remove_dev_waiting_for_supplier;
++	}
++
+ 	return 0;
+ 
++ err_remove_dev_waiting_for_supplier:
++	device_remove_file(dev, &dev_attr_waiting_for_supplier);
+  err_remove_dev_online:
+ 	device_remove_file(dev, &dev_attr_online);
+  err_remove_dev_groups:
+@@ -2404,6 +2431,7 @@ static void device_remove_attrs(struct device *dev)
+ 	struct class *class = dev->class;
+ 	const struct device_type *type = dev->type;
+ 
++	device_remove_file(dev, &dev_attr_removable);
+ 	device_remove_file(dev, &dev_attr_waiting_for_supplier);
+ 	device_remove_file(dev, &dev_attr_online);
+ 	device_remove_groups(dev, dev->groups);
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index bec86d901942..0159fff0f27e 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2432,6 +2432,8 @@ static void set_usb_port_removable(struct usb_device *udev)
+ 	u16 wHubCharacteristics;
+ 	bool removable = true;
+ 
++	dev_set_removable(&udev->dev, DEVICE_REMOVABLE_UNKNOWN);
++
+ 	if (!hdev)
+ 		return;
+ 
+@@ -2443,11 +2445,11 @@ static void set_usb_port_removable(struct usb_device *udev)
+ 	 */
+ 	switch (hub->ports[udev->portnum - 1]->connect_type) {
+ 	case USB_PORT_CONNECT_TYPE_HOT_PLUG:
+-		udev->removable = USB_DEVICE_REMOVABLE;
++		dev_set_removable(&udev->dev, DEVICE_REMOVABLE);
+ 		return;
+ 	case USB_PORT_CONNECT_TYPE_HARD_WIRED:
+ 	case USB_PORT_NOT_USED:
+-		udev->removable = USB_DEVICE_FIXED;
++		dev_set_removable(&udev->dev, DEVICE_FIXED);
+ 		return;
+ 	default:
+ 		break;
+@@ -2472,9 +2474,9 @@ static void set_usb_port_removable(struct usb_device *udev)
+ 	}
+ 
+ 	if (removable)
+-		udev->removable = USB_DEVICE_REMOVABLE;
++		dev_set_removable(&udev->dev, DEVICE_REMOVABLE);
+ 	else
+-		udev->removable = USB_DEVICE_FIXED;
++		dev_set_removable(&udev->dev, DEVICE_FIXED);
+ 
+ }
+ 
+@@ -2546,8 +2548,7 @@ int usb_new_device(struct usb_device *udev)
+ 	device_enable_async_suspend(&udev->dev);
+ 
+ 	/* check whether the hub or firmware marks this port as non-removable */
+-	if (udev->parent)
+-		set_usb_port_removable(udev);
++	set_usb_port_removable(udev);
+ 
+ 	/* Register the device.  The device driver is responsible
+ 	 * for configuring the device and invoking the add-device
+diff --git a/drivers/usb/core/sysfs.c b/drivers/usb/core/sysfs.c
+index 5a168ba9fc51..fa2e49d432ff 100644
+--- a/drivers/usb/core/sysfs.c
++++ b/drivers/usb/core/sysfs.c
+@@ -301,29 +301,6 @@ static ssize_t urbnum_show(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RO(urbnum);
+ 
+-static ssize_t removable_show(struct device *dev, struct device_attribute *attr,
+-			      char *buf)
+-{
+-	struct usb_device *udev;
+-	char *state;
+-
+-	udev = to_usb_device(dev);
+-
+-	switch (udev->removable) {
+-	case USB_DEVICE_REMOVABLE:
+-		state = "removable";
+-		break;
+-	case USB_DEVICE_FIXED:
+-		state = "fixed";
+-		break;
+-	default:
+-		state = "unknown";
+-	}
+-
+-	return sprintf(buf, "%s\n", state);
+-}
+-static DEVICE_ATTR_RO(removable);
+-
+ static ssize_t ltm_capable_show(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+ {
+@@ -828,7 +805,6 @@ static struct attribute *dev_attrs[] = {
+ 	&dev_attr_avoid_reset_quirk.attr,
+ 	&dev_attr_authorized.attr,
+ 	&dev_attr_remove.attr,
+-	&dev_attr_removable.attr,
+ 	&dev_attr_ltm_capable.attr,
+ #ifdef CONFIG_OF
+ 	&dev_attr_devspec.attr,
+* Unmerged path include/linux/device.h
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 8f3bd169f1e5..86a73d834e38 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -473,12 +473,6 @@ struct usb_dev_state;
+ 
+ struct usb_tt;
+ 
+-enum usb_device_removable {
+-	USB_DEVICE_REMOVABLE_UNKNOWN = 0,
+-	USB_DEVICE_REMOVABLE,
+-	USB_DEVICE_FIXED,
+-};
+-
+ enum usb_port_connect_type {
+ 	USB_PORT_CONNECT_TYPE_UNKNOWN = 0,
+ 	USB_PORT_CONNECT_TYPE_HOT_PLUG,
+@@ -703,7 +697,6 @@ struct usb_device {
+ #endif
+ 	struct wusb_dev *wusb_dev;
+ 	int slot_id;
+-	enum usb_device_removable removable;
+ 	struct usb2_lpm_parameters l1_params;
+ 	struct usb3_lpm_parameters u1_params;
+ 	struct usb3_lpm_parameters u2_params;
