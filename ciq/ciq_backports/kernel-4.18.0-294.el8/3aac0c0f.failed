@@ -1,0 +1,126 @@
+scsi: qla2xxx: Honor status qualifier in FCP_RSP per spec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Arun Easi <aeasi@marvell.com>
+commit 3aac0c0fde17d2fdb65c7840bdf057a681f1e035
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3aac0c0f.failed
+
+FCP-4 (referred FCP-4 rev-2b) identifies the earlier known "retry delay
+timer" field as "status qualifier", which is described in SAM-5 and later
+specs. This fix makes appropriate driver side modifications to honor the
+new definition. The SAM document referred was SAM-6 rev-5.
+
+Link: https://lore.kernel.org/r/20200904045128.23631-5-njavali@marvell.com
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+	Signed-off-by: Arun Easi <aeasi@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Nilesh Javali <njavali@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3aac0c0fde17d2fdb65c7840bdf057a681f1e035)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_fw.h
+#	drivers/scsi/qla2xxx/qla_isr.c
+diff --cc drivers/scsi/qla2xxx/qla_fw.h
+index 34bbd2edc2fc,f0052d75849c..000000000000
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@@ -619,13 -619,13 +619,18 @@@ struct sts_entry_24xx 
+  #define SF_NVME_ERSP            BIT_6
+  #define SF_FCP_RSP_DMA		BIT_0
+  
+++<<<<<<< HEAD
+ +	uint16_t retry_delay;
+ +	uint16_t scsi_status;		/* SCSI status. */
+++=======
++ 	__le16	status_qualifier;
++ 	__le16	scsi_status;		/* SCSI status. */
+++>>>>>>> 3aac0c0fde17 (scsi: qla2xxx: Honor status qualifier in FCP_RSP per spec)
+  #define SS_CONFIRMATION_REQ		BIT_12
+  
+ -	__le32	rsp_residual_count;	/* FCP RSP residual count. */
+ +	uint32_t rsp_residual_count;	/* FCP RSP residual count. */
+  
+ -	__le32	sense_len;		/* FCP SENSE length. */
+ +	uint32_t sense_len;		/* FCP SENSE length. */
+  
+  	union {
+  		struct {
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index 228708669e93,36c980f1268e..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -2646,13 -2966,7 +2646,17 @@@ qla2x00_status_entry(scsi_qla_host_t *v
+  		host_to_fcp_swap(sts24->data, sizeof(sts24->data));
+  		ox_id = le16_to_cpu(sts24->ox_id);
+  		par_sense_len = sizeof(sts24->data);
+++<<<<<<< HEAD
+ +		/* Valid values of the retry delay timer are 0x1-0xffef */
+ +		if (sts24->retry_delay > 0 && sts24->retry_delay < 0xfff1) {
+ +			retry_delay = sts24->retry_delay & 0x3fff;
+ +			ql_dbg(ql_dbg_io, sp->vha, 0x3033,
+ +			    "%s: scope=%#x retry_delay=%#x\n", __func__,
+ +			    sts24->retry_delay >> 14, retry_delay);
+ +		}
+++=======
++ 		sts_qual = le16_to_cpu(sts24->status_qualifier);
+++>>>>>>> 3aac0c0fde17 (scsi: qla2xxx: Honor status qualifier in FCP_RSP per spec)
+  	} else {
+  		if (scsi_status & SS_SENSE_LEN_VALID)
+  			sense_len = le16_to_cpu(sts->req_sense_length);
+* Unmerged path drivers/scsi/qla2xxx/qla_fw.h
+diff --git a/drivers/scsi/qla2xxx/qla_inline.h b/drivers/scsi/qla2xxx/qla_inline.h
+index dff7bb34d5dc..564b6b8eb7be 100644
+--- a/drivers/scsi/qla2xxx/qla_inline.h
++++ b/drivers/scsi/qla2xxx/qla_inline.h
+@@ -271,11 +271,41 @@ qla2x00_handle_mbx_completion(struct qla_hw_data *ha, int status)
+ }
+ 
+ static inline void
+-qla2x00_set_retry_delay_timestamp(fc_port_t *fcport, uint16_t retry_delay)
++qla2x00_set_retry_delay_timestamp(fc_port_t *fcport, uint16_t sts_qual)
+ {
+-	if (retry_delay)
+-		fcport->retry_delay_timestamp = jiffies +
+-		    (retry_delay * HZ / 10);
++	u8 scope;
++	u16 qual;
++#define SQ_SCOPE_MASK		0xc000 /* SAM-6 rev5 5.3.2 */
++#define SQ_SCOPE_SHIFT		14
++#define SQ_QUAL_MASK		0x3fff
++
++#define SQ_MAX_WAIT_SEC		60 /* Max I/O hold off time in seconds. */
++#define SQ_MAX_WAIT_TIME	(SQ_MAX_WAIT_SEC * 10) /* in 100ms. */
++
++	if (!sts_qual) /* Common case. */
++		return;
++
++	scope = (sts_qual & SQ_SCOPE_MASK) >> SQ_SCOPE_SHIFT;
++	/* Handle only scope 1 or 2, which is for I-T nexus. */
++	if (scope != 1 && scope != 2)
++		return;
++
++	/* Skip processing, if retry delay timer is already in effect. */
++	if (fcport->retry_delay_timestamp &&
++	    time_before(jiffies, fcport->retry_delay_timestamp))
++		return;
++
++	qual = sts_qual & SQ_QUAL_MASK;
++	if (qual < 1 || qual > 0x3fef)
++		return;
++	qual = min(qual, (u16)SQ_MAX_WAIT_TIME);
++
++	/* qual is expressed in 100ms increments. */
++	fcport->retry_delay_timestamp = jiffies + (qual * HZ / 10);
++
++	ql_log(ql_log_warn, fcport->vha, 0x5101,
++	       "%8phC: I/O throttling requested (status qualifier = %04xh), holding off I/Os for %ums.\n",
++	       fcport->port_name, sts_qual, qual * 100);
+ }
+ 
+ static inline bool
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
