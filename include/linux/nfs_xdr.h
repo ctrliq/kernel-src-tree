@@ -1093,7 +1093,6 @@ struct nfs4_lookup_res {
 	const struct nfs_server *	server;
 	struct nfs_fattr *		fattr;
 	struct nfs_fh *			fh;
-	struct nfs4_label		*label;
 };
 
 struct nfs4_lookupp_arg {
@@ -1721,8 +1720,7 @@ struct nfs_rpc_ops {
 	int	(*setattr) (struct dentry *, struct nfs_fattr *,
 			    struct iattr *);
 	int	(*lookup)  (struct inode *, struct dentry *,
-			    struct nfs_fh *, struct nfs_fattr *,
-			    struct nfs4_label *);
+			    struct nfs_fh *, struct nfs_fattr *);
 	int	(*lookupp) (struct inode *, struct nfs_fh *,
 			    struct nfs_fattr *, struct nfs4_label *);
 	int	(*access)  (struct inode *, struct nfs_access_entry *);
