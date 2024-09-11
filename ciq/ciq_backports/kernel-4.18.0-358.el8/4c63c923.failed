@@ -1,0 +1,309 @@
+KVM: selftests: Hoist APIC functions out of individual tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jim Mattson <jmattson@google.com>
+commit 4c63c923408595eede59ce9fef6f4ab868928549
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4c63c923.failed
+
+Move the APIC functions into the library to encourage code reuse and
+to avoid unintended deviations.
+
+	Signed-off-by: Jim Mattson <jmattson@google.com>
+	Reviewed-by: Oliver Upton <oupton@google.com>
+Message-Id: <20210604172611.281819-10-jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4c63c923408595eede59ce9fef6f4ab868928549)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/Makefile
+diff --cc tools/testing/selftests/kvm/Makefile
+index 60c2b820c101,1c750910c27b..000000000000
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@@ -34,8 -34,8 +34,13 @@@ ifeq ($(ARCH),s390
+  endif
+  
+  LIBKVM = lib/assert.c lib/elf.c lib/io.c lib/kvm_util.c lib/rbtree.c lib/sparsebit.c lib/test_util.c lib/guest_modes.c lib/perf_test_util.c
+++<<<<<<< HEAD
+ +LIBKVM_x86_64 = lib/x86_64/processor.c lib/x86_64/vmx.c lib/x86_64/svm.c lib/x86_64/ucall.c lib/x86_64/handlers.S
+ +LIBKVM_aarch64 = lib/aarch64/processor.c lib/aarch64/ucall.c lib/aarch64/handlers.S
+++=======
++ LIBKVM_x86_64 = lib/x86_64/apic.c lib/x86_64/processor.c lib/x86_64/vmx.c lib/x86_64/svm.c lib/x86_64/ucall.c lib/x86_64/handlers.S
++ LIBKVM_aarch64 = lib/aarch64/processor.c lib/aarch64/ucall.c
+++>>>>>>> 4c63c9234085 (KVM: selftests: Hoist APIC functions out of individual tests)
+  LIBKVM_s390x = lib/s390x/processor.c lib/s390x/ucall.c lib/s390x/diag318_test_handler.c
+  
+  TEST_GEN_PROGS_x86_64 = x86_64/cr4_cpuid_sync_test
+* Unmerged path tools/testing/selftests/kvm/Makefile
+diff --git a/tools/testing/selftests/kvm/include/x86_64/apic.h b/tools/testing/selftests/kvm/include/x86_64/apic.h
+index 0d0e35c8866b..e5a9fe040a6c 100644
+--- a/tools/testing/selftests/kvm/include/x86_64/apic.h
++++ b/tools/testing/selftests/kvm/include/x86_64/apic.h
+@@ -8,6 +8,10 @@
+ #ifndef SELFTEST_KVM_APIC_H
+ #define SELFTEST_KVM_APIC_H
+ 
++#include <stdint.h>
++
++#include "processor.h"
++
+ #define APIC_DEFAULT_GPA		0xfee00000ULL
+ 
+ /* APIC base address MSR and fields */
+@@ -55,4 +59,23 @@
+ #define	APIC_ICR2	0x310
+ #define		SET_APIC_DEST_FIELD(x)	((x) << 24)
+ 
++void apic_disable(void);
++void xapic_enable(void);
++void x2apic_enable(void);
++
++static inline uint32_t get_bsp_flag(void)
++{
++	return rdmsr(MSR_IA32_APICBASE) & MSR_IA32_APICBASE_BSP;
++}
++
++static inline uint32_t xapic_read_reg(unsigned int reg)
++{
++	return ((volatile uint32_t *)APIC_DEFAULT_GPA)[reg >> 2];
++}
++
++static inline void xapic_write_reg(unsigned int reg, uint32_t val)
++{
++	((volatile uint32_t *)APIC_DEFAULT_GPA)[reg >> 2] = val;
++}
++
+ #endif /* SELFTEST_KVM_APIC_H */
+diff --git a/tools/testing/selftests/kvm/include/x86_64/processor.h b/tools/testing/selftests/kvm/include/x86_64/processor.h
+index 09cbccd1b785..479b057d6067 100644
+--- a/tools/testing/selftests/kvm/include/x86_64/processor.h
++++ b/tools/testing/selftests/kvm/include/x86_64/processor.h
+@@ -13,6 +13,8 @@
+ 
+ #include <asm/msr-index.h>
+ 
++#include "../kvm_util.h"
++
+ #define X86_EFLAGS_FIXED	 (1u << 1)
+ 
+ #define X86_CR4_VME		(1ul << 0)
+diff --git a/tools/testing/selftests/kvm/lib/x86_64/apic.c b/tools/testing/selftests/kvm/lib/x86_64/apic.c
+new file mode 100644
+index 000000000000..31f318ac67ba
+--- /dev/null
++++ b/tools/testing/selftests/kvm/lib/x86_64/apic.c
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * tools/testing/selftests/kvm/lib/x86_64/processor.c
++ *
++ * Copyright (C) 2021, Google LLC.
++ */
++
++#include "apic.h"
++
++void apic_disable(void)
++{
++	wrmsr(MSR_IA32_APICBASE,
++	      rdmsr(MSR_IA32_APICBASE) &
++		~(MSR_IA32_APICBASE_ENABLE | MSR_IA32_APICBASE_EXTD));
++}
++
++void xapic_enable(void)
++{
++	uint64_t val = rdmsr(MSR_IA32_APICBASE);
++
++	/* Per SDM: to enable xAPIC when in x2APIC must first disable APIC */
++	if (val & MSR_IA32_APICBASE_EXTD) {
++		apic_disable();
++		wrmsr(MSR_IA32_APICBASE,
++		      rdmsr(MSR_IA32_APICBASE) | MSR_IA32_APICBASE_ENABLE);
++	} else if (!(val & MSR_IA32_APICBASE_ENABLE)) {
++		wrmsr(MSR_IA32_APICBASE, val | MSR_IA32_APICBASE_ENABLE);
++	}
++
++	/*
++	 * Per SDM: reset value of spurious interrupt vector register has the
++	 * APIC software enabled bit=0. It must be enabled in addition to the
++	 * enable bit in the MSR.
++	 */
++	val = xapic_read_reg(APIC_SPIV) | APIC_SPIV_APIC_ENABLED;
++	xapic_write_reg(APIC_SPIV, val);
++}
++
++void x2apic_enable(void)
++{
++	uint32_t spiv_reg = APIC_BASE_MSR + (APIC_SPIV >> 4);
++
++	wrmsr(MSR_IA32_APICBASE, rdmsr(MSR_IA32_APICBASE) |
++	      MSR_IA32_APICBASE_ENABLE | MSR_IA32_APICBASE_EXTD);
++	wrmsr(spiv_reg, rdmsr(spiv_reg) | APIC_SPIV_APIC_ENABLED);
++}
+diff --git a/tools/testing/selftests/kvm/x86_64/evmcs_test.c b/tools/testing/selftests/kvm/x86_64/evmcs_test.c
+index 843ae36f7caa..2b46dcca86a8 100644
+--- a/tools/testing/selftests/kvm/x86_64/evmcs_test.c
++++ b/tools/testing/selftests/kvm/x86_64/evmcs_test.c
+@@ -22,15 +22,6 @@
+ 
+ static int ud_count;
+ 
+-void enable_x2apic(void)
+-{
+-	uint32_t spiv_reg = APIC_BASE_MSR + (APIC_SPIV >> 4);
+-
+-	wrmsr(MSR_IA32_APICBASE, rdmsr(MSR_IA32_APICBASE) |
+-	      MSR_IA32_APICBASE_ENABLE | MSR_IA32_APICBASE_EXTD);
+-	wrmsr(spiv_reg, rdmsr(spiv_reg) | APIC_SPIV_APIC_ENABLED);
+-}
+-
+ static void guest_ud_handler(struct ex_regs *regs)
+ {
+ 	ud_count++;
+@@ -59,7 +50,7 @@ void guest_code(struct vmx_pages *vmx_pages)
+ #define L2_GUEST_STACK_SIZE 64
+ 	unsigned long l2_guest_stack[L2_GUEST_STACK_SIZE];
+ 
+-	enable_x2apic();
++	x2apic_enable();
+ 
+ 	GUEST_SYNC(1);
+ 	GUEST_SYNC(2);
+diff --git a/tools/testing/selftests/kvm/x86_64/set_boot_cpu_id.c b/tools/testing/selftests/kvm/x86_64/set_boot_cpu_id.c
+index 12c558fc8074..5f8dd74d415f 100644
+--- a/tools/testing/selftests/kvm/x86_64/set_boot_cpu_id.c
++++ b/tools/testing/selftests/kvm/x86_64/set_boot_cpu_id.c
+@@ -14,16 +14,12 @@
+ #include "test_util.h"
+ #include "kvm_util.h"
+ #include "processor.h"
++#include "apic.h"
+ 
+ #define N_VCPU 2
+ #define VCPU_ID0 0
+ #define VCPU_ID1 1
+ 
+-static uint32_t get_bsp_flag(void)
+-{
+-	return rdmsr(MSR_IA32_APICBASE) & MSR_IA32_APICBASE_BSP;
+-}
+-
+ static void guest_bsp_vcpu(void *arg)
+ {
+ 	GUEST_SYNC(1);
+diff --git a/tools/testing/selftests/kvm/x86_64/xapic_ipi_test.c b/tools/testing/selftests/kvm/x86_64/xapic_ipi_test.c
+index ed27269a01bb..5db474e46804 100644
+--- a/tools/testing/selftests/kvm/x86_64/xapic_ipi_test.c
++++ b/tools/testing/selftests/kvm/x86_64/xapic_ipi_test.c
+@@ -42,8 +42,6 @@
+ #define HALTER_VCPU_ID 0
+ #define SENDER_VCPU_ID 1
+ 
+-volatile uint32_t *apic_base = (volatile uint32_t *)APIC_DEFAULT_GPA;
+-
+ /*
+  * Vector for IPI from sender vCPU to halting vCPU.
+  * Value is arbitrary and was chosen for the alternating bit pattern. Any
+@@ -86,45 +84,6 @@ struct thread_params {
+ 	uint64_t *pipis_rcvd; /* host address of ipis_rcvd global */
+ };
+ 
+-uint32_t read_apic_reg(uint reg)
+-{
+-	return apic_base[reg >> 2];
+-}
+-
+-void write_apic_reg(uint reg, uint32_t val)
+-{
+-	apic_base[reg >> 2] = val;
+-}
+-
+-void disable_apic(void)
+-{
+-	wrmsr(MSR_IA32_APICBASE,
+-	      rdmsr(MSR_IA32_APICBASE) &
+-		~(MSR_IA32_APICBASE_ENABLE | MSR_IA32_APICBASE_EXTD));
+-}
+-
+-void enable_xapic(void)
+-{
+-	uint64_t val = rdmsr(MSR_IA32_APICBASE);
+-
+-	/* Per SDM: to enable xAPIC when in x2APIC must first disable APIC */
+-	if (val & MSR_IA32_APICBASE_EXTD) {
+-		disable_apic();
+-		wrmsr(MSR_IA32_APICBASE,
+-		      rdmsr(MSR_IA32_APICBASE) | MSR_IA32_APICBASE_ENABLE);
+-	} else if (!(val & MSR_IA32_APICBASE_ENABLE)) {
+-		wrmsr(MSR_IA32_APICBASE, val | MSR_IA32_APICBASE_ENABLE);
+-	}
+-
+-	/*
+-	 * Per SDM: reset value of spurious interrupt vector register has the
+-	 * APIC software enabled bit=0. It must be enabled in addition to the
+-	 * enable bit in the MSR.
+-	 */
+-	val = read_apic_reg(APIC_SPIV) | APIC_SPIV_APIC_ENABLED;
+-	write_apic_reg(APIC_SPIV, val);
+-}
+-
+ void verify_apic_base_addr(void)
+ {
+ 	uint64_t msr = rdmsr(MSR_IA32_APICBASE);
+@@ -136,10 +95,10 @@ void verify_apic_base_addr(void)
+ static void halter_guest_code(struct test_data_page *data)
+ {
+ 	verify_apic_base_addr();
+-	enable_xapic();
++	xapic_enable();
+ 
+-	data->halter_apic_id = GET_APIC_ID_FIELD(read_apic_reg(APIC_ID));
+-	data->halter_lvr = read_apic_reg(APIC_LVR);
++	data->halter_apic_id = GET_APIC_ID_FIELD(xapic_read_reg(APIC_ID));
++	data->halter_lvr = xapic_read_reg(APIC_LVR);
+ 
+ 	/*
+ 	 * Loop forever HLTing and recording halts & wakes. Disable interrupts
+@@ -150,8 +109,8 @@ static void halter_guest_code(struct test_data_page *data)
+ 	 * TPR and PPR for diagnostic purposes in case the test fails.
+ 	 */
+ 	for (;;) {
+-		data->halter_tpr = read_apic_reg(APIC_TASKPRI);
+-		data->halter_ppr = read_apic_reg(APIC_PROCPRI);
++		data->halter_tpr = xapic_read_reg(APIC_TASKPRI);
++		data->halter_ppr = xapic_read_reg(APIC_PROCPRI);
+ 		data->hlt_count++;
+ 		asm volatile("sti; hlt; cli");
+ 		data->wake_count++;
+@@ -166,7 +125,7 @@ static void halter_guest_code(struct test_data_page *data)
+ static void guest_ipi_handler(struct ex_regs *regs)
+ {
+ 	ipis_rcvd++;
+-	write_apic_reg(APIC_EOI, 77);
++	xapic_write_reg(APIC_EOI, 77);
+ }
+ 
+ static void sender_guest_code(struct test_data_page *data)
+@@ -179,7 +138,7 @@ static void sender_guest_code(struct test_data_page *data)
+ 	uint64_t tsc_start;
+ 
+ 	verify_apic_base_addr();
+-	enable_xapic();
++	xapic_enable();
+ 
+ 	/*
+ 	 * Init interrupt command register for sending IPIs
+@@ -206,8 +165,8 @@ static void sender_guest_code(struct test_data_page *data)
+ 		 * First IPI can be sent unconditionally because halter vCPU
+ 		 * starts earlier.
+ 		 */
+-		write_apic_reg(APIC_ICR2, icr2_val);
+-		write_apic_reg(APIC_ICR, icr_val);
++		xapic_write_reg(APIC_ICR2, icr2_val);
++		xapic_write_reg(APIC_ICR, icr_val);
+ 		data->ipis_sent++;
+ 
+ 		/*
