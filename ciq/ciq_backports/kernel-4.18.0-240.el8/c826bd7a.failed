@@ -1,0 +1,512 @@
+io_uring: add set of tracing events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Dmitrii Dolgov <9erthalion6@gmail.com>
+commit c826bd7a743f275e2b68c16d595534063b400deb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c826bd7a.failed
+
+To trace io_uring activity one can get an information from workqueue and
+io trace events, but looks like some parts could be hard to identify via
+this approach. Making what happens inside io_uring more transparent is
+important to be able to reason about many aspects of it, hence introduce
+the set of tracing events.
+
+All such events could be roughly divided into two categories:
+
+* those, that are helping to understand correctness (from both kernel
+  and an application point of view). E.g. a ring creation, file
+  registration, or waiting for available CQE. Proposed approach is to
+  get a pointer to an original structure of interest (ring context, or
+  request), and then find relevant events. io_uring_queue_async_work
+  also exposes a pointer to work_struct, to be able to track down
+  corresponding workqueue events.
+
+* those, that provide performance related information. Mostly it's about
+  events that change the flow of requests, e.g. whether an async work
+  was queued, or delayed due to some dependencies. Another important
+  case is how io_uring optimizations (e.g. registered files) are
+  utilized.
+
+	Signed-off-by: Dmitrii Dolgov <9erthalion6@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c826bd7a743f275e2b68c16d595534063b400deb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+#	include/Kbuild
+diff --cc fs/io_uring.c
+index 8b8da0089cd2,f83465fc1ed1..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2451,13 -2774,14 +2462,21 @@@ static int io_submit_sqes(struct io_rin
+  
+  out:
+  		if (unlikely(mm_fault)) {
+ -			io_cqring_add_event(ctx, s.sqe->user_data,
+ +			io_cqring_add_event(ctx, sqes[i].sqe->user_data,
+  						-EFAULT);
+  		} else {
+++<<<<<<< HEAD
+ +			sqes[i].has_user = has_user;
+ +			sqes[i].needs_lock = true;
+ +			sqes[i].needs_fixed_file = true;
+ +			io_submit_sqe(ctx, &sqes[i], statep, &link, true);
+++=======
++ 			s.has_user = has_user;
++ 			s.in_async = true;
++ 			s.needs_fixed_file = true;
++ 			trace_io_uring_submit_sqe(ctx, true, true);
++ 			io_submit_sqe(ctx, &s, statep, &link);
+++>>>>>>> c826bd7a743f (io_uring: add set of tracing events)
+  			submitted++;
+  		}
+  	}
+@@@ -2654,21 -2966,11 +2673,26 @@@ static int io_ring_submit(struct io_rin
+  
+  out:
+  		s.has_user = true;
+ -		s.in_async = false;
+ +		s.needs_lock = false;
+  		s.needs_fixed_file = false;
+  		submit++;
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * The caller will block for events after submit, submit the
+ +		 * last IO non-blocking. This is either the only IO it's
+ +		 * submitting, or it already submitted the previous ones. This
+ +		 * improves performance by avoiding an async punt that we don't
+ +		 * need to do.
+ +		 */
+ +		if (block_for_last && submit == to_submit)
+ +			force_nonblock = false;
+ +
+ +		io_submit_sqe(ctx, &s, statep, &link, force_nonblock);
+++=======
++ 		trace_io_uring_submit_sqe(ctx, true, false);
++ 		io_submit_sqe(ctx, &s, statep, &link);
+++>>>>>>> c826bd7a743f (io_uring: add set of tracing events)
+  	}
+  
+  	if (link)
+@@@ -2710,11 -3050,23 +2734,29 @@@ static int io_cqring_wait(struct io_rin
+  			return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = wait_event_interruptible(ctx->wait, io_cqring_events(ring) >= min_events);
+ +
+ +	if (sig)
+ +		restore_user_sigmask(sig, &sigsaved, ret == -ERESTARTSYS);
+++=======
++ 	ret = 0;
++ 	iowq.nr_timeouts = atomic_read(&ctx->cq_timeouts);
++ 	trace_io_uring_cqring_wait(ctx, min_events);
++ 	do {
++ 		prepare_to_wait_exclusive(&ctx->wait, &iowq.wq,
++ 						TASK_INTERRUPTIBLE);
++ 		if (io_should_wake(&iowq))
++ 			break;
++ 		schedule();
++ 		if (signal_pending(current)) {
++ 			ret = -ERESTARTSYS;
++ 			break;
++ 		}
++ 	} while (1);
++ 	finish_wait(&ctx->wait, &iowq.wq);
+++>>>>>>> c826bd7a743f (io_uring: add set of tracing events)
+  
+ -	restore_saved_sigmask_unless(ret == -ERESTARTSYS);
+  	if (ret == -ERESTARTSYS)
+  		ret = -EINTR;
+  
+@@@ -3825,22 -4210,8 +3867,27 @@@ static int io_uring_create(unsigned ent
+  	if (ret < 0)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	memset(&p->sq_off, 0, sizeof(p->sq_off));
+ +	p->sq_off.head = offsetof(struct io_sq_ring, r.head);
+ +	p->sq_off.tail = offsetof(struct io_sq_ring, r.tail);
+ +	p->sq_off.ring_mask = offsetof(struct io_sq_ring, ring_mask);
+ +	p->sq_off.ring_entries = offsetof(struct io_sq_ring, ring_entries);
+ +	p->sq_off.flags = offsetof(struct io_sq_ring, flags);
+ +	p->sq_off.dropped = offsetof(struct io_sq_ring, dropped);
+ +	p->sq_off.array = offsetof(struct io_sq_ring, array);
+ +
+ +	memset(&p->cq_off, 0, sizeof(p->cq_off));
+ +	p->cq_off.head = offsetof(struct io_cq_ring, r.head);
+ +	p->cq_off.tail = offsetof(struct io_cq_ring, r.tail);
+ +	p->cq_off.ring_mask = offsetof(struct io_cq_ring, ring_mask);
+ +	p->cq_off.ring_entries = offsetof(struct io_cq_ring, ring_entries);
+ +	p->cq_off.overflow = offsetof(struct io_cq_ring, overflow);
+ +	p->cq_off.cqes = offsetof(struct io_cq_ring, cqes);
+++=======
++ 	p->features = IORING_FEAT_SINGLE_MMAP;
++ 	trace_io_uring_create(ret, ctx, p->sq_entries, p->cq_entries, p->flags);
+++>>>>>>> c826bd7a743f (io_uring: add set of tracing events)
+  	return ret;
+  err:
+  	io_ring_ctx_wait_and_kill(ctx);
+* Unmerged path include/Kbuild
+* Unmerged path fs/io_uring.c
+* Unmerged path include/Kbuild
+diff --git a/include/trace/events/io_uring.h b/include/trace/events/io_uring.h
+new file mode 100644
+index 000000000000..c5a905fbf1da
+--- /dev/null
++++ b/include/trace/events/io_uring.h
+@@ -0,0 +1,349 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM io_uring
++
++#if !defined(_TRACE_IO_URING_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_IO_URING_H
++
++#include <linux/tracepoint.h>
++
++/**
++ * io_uring_create - called after a new io_uring context was prepared
++ *
++ * @fd:			corresponding file descriptor
++ * @ctx:		pointer to a ring context structure
++ * @sq_entries:	actual SQ size
++ * @cq_entries:	actual CQ size
++ * @flags:		SQ ring flags, provided to io_uring_setup(2)
++ *
++ * Allows to trace io_uring creation and provide pointer to a context, that can
++ * be used later to find correlated events.
++ */
++TRACE_EVENT(io_uring_create,
++
++	TP_PROTO(int fd, void *ctx, u32 sq_entries, u32 cq_entries, u32 flags),
++
++	TP_ARGS(fd, ctx, sq_entries, cq_entries, flags),
++
++	TP_STRUCT__entry (
++		__field(  int,		fd			)
++		__field(  void *,	ctx			)
++		__field(  u32,		sq_entries	)
++		__field(  u32,		cq_entries	)
++		__field(  u32,		flags		)
++	),
++
++	TP_fast_assign(
++		__entry->fd			= fd;
++		__entry->ctx		= ctx;
++		__entry->sq_entries	= sq_entries;
++		__entry->cq_entries	= cq_entries;
++		__entry->flags		= flags;
++	),
++
++	TP_printk("ring %p, fd %d sq size %d, cq size %d, flags %d",
++			  __entry->ctx, __entry->fd, __entry->sq_entries,
++			  __entry->cq_entries, __entry->flags)
++);
++
++/**
++ * io_uring_register - called after a buffer/file/eventfd was succesfully
++ * 					   registered for a ring
++ *
++ * @ctx:			pointer to a ring context structure
++ * @opcode:			describes which operation to perform
++ * @nr_user_files:	number of registered files
++ * @nr_user_bufs:	number of registered buffers
++ * @cq_ev_fd:		whether eventfs registered or not
++ * @ret:			return code
++ *
++ * Allows to trace fixed files/buffers/eventfds, that could be registered to
++ * avoid an overhead of getting references to them for every operation. This
++ * event, together with io_uring_file_get, can provide a full picture of how
++ * much overhead one can reduce via fixing.
++ */
++TRACE_EVENT(io_uring_register,
++
++	TP_PROTO(void *ctx, unsigned opcode, unsigned nr_files,
++			 unsigned nr_bufs, bool eventfd, long ret),
++
++	TP_ARGS(ctx, opcode, nr_files, nr_bufs, eventfd, ret),
++
++	TP_STRUCT__entry (
++		__field(  void *,	ctx			)
++		__field(  unsigned,	opcode		)
++		__field(  unsigned,	nr_files	)
++		__field(  unsigned,	nr_bufs		)
++		__field(  bool,		eventfd		)
++		__field(  long,		ret			)
++	),
++
++	TP_fast_assign(
++		__entry->ctx		= ctx;
++		__entry->opcode		= opcode;
++		__entry->nr_files	= nr_files;
++		__entry->nr_bufs	= nr_bufs;
++		__entry->eventfd	= eventfd;
++		__entry->ret		= ret;
++	),
++
++	TP_printk("ring %p, opcode %d, nr_user_files %d, nr_user_bufs %d, "
++			  "eventfd %d, ret %ld",
++			  __entry->ctx, __entry->opcode, __entry->nr_files,
++			  __entry->nr_bufs, __entry->eventfd, __entry->ret)
++);
++
++/**
++ * io_uring_file_get - called before getting references to an SQE file
++ *
++ * @ctx:	pointer to a ring context structure
++ * @fd:		SQE file descriptor
++ *
++ * Allows to trace out how often an SQE file reference is obtained, which can
++ * help figuring out if it makes sense to use fixed files, or check that fixed
++ * files are used correctly.
++ */
++TRACE_EVENT(io_uring_file_get,
++
++	TP_PROTO(void *ctx, int fd),
++
++	TP_ARGS(ctx, fd),
++
++	TP_STRUCT__entry (
++		__field(  void *,	ctx	)
++		__field(  int,		fd	)
++	),
++
++	TP_fast_assign(
++		__entry->ctx	= ctx;
++		__entry->fd		= fd;
++	),
++
++	TP_printk("ring %p, fd %d", __entry->ctx, __entry->fd)
++);
++
++/**
++ * io_uring_queue_async_work - called before submitting a new async work
++ *
++ * @ctx:	pointer to a ring context structure
++ * @rw:		type of workqueue, normal or buffered writes
++ * @req:	pointer to a submitted request
++ * @work:	pointer to a submitted work_struct
++ *
++ * Allows to trace asynchronous work submission.
++ */
++TRACE_EVENT(io_uring_queue_async_work,
++
++	TP_PROTO(void *ctx, int rw, void * req, struct work_struct *work,
++			 unsigned int flags),
++
++	TP_ARGS(ctx, rw, req, work, flags),
++
++	TP_STRUCT__entry (
++		__field(  void *,				ctx		)
++		__field(  int,					rw		)
++		__field(  void *,				req		)
++		__field(  struct work_struct *,	work	)
++		__field(  unsigned int,			flags	)
++	),
++
++	TP_fast_assign(
++		__entry->ctx	= ctx;
++		__entry->rw		= rw;
++		__entry->req	= req;
++		__entry->work	= work;
++		__entry->flags	= flags;
++	),
++
++	TP_printk("ring %p, request %p, flags %d, %s queue, work %p",
++			  __entry->ctx, __entry->req, __entry->flags,
++			  __entry->rw ? "buffered" : "normal", __entry->work)
++);
++
++/**
++ * io_uring_defer_list - called before the io_uring work added into defer_list
++ *
++ * @ctx:	pointer to a ring context structure
++ * @req:	pointer to a deferred request
++ * @shadow: whether request is shadow or not
++ *
++ * Allows to track deferred requests, to get an insight about what requests are
++ * not started immediately.
++ */
++TRACE_EVENT(io_uring_defer,
++
++	TP_PROTO(void *ctx, void *req, bool shadow),
++
++	TP_ARGS(ctx, req, shadow),
++
++	TP_STRUCT__entry (
++		__field(  void *,	ctx		)
++		__field(  void *,	req		)
++		__field(  bool,		shadow	)
++	),
++
++	TP_fast_assign(
++		__entry->ctx	= ctx;
++		__entry->req	= req;
++		__entry->shadow	= shadow;
++	),
++
++	TP_printk("ring %p, request %p%s", __entry->ctx, __entry->req,
++			  __entry->shadow ? ", shadow": "")
++);
++
++/**
++ * io_uring_link - called before the io_uring request added into link_list of
++ * 				   another request
++ *
++ * @ctx:			pointer to a ring context structure
++ * @req:			pointer to a linked request
++ * @target_req:		pointer to a previous request, that would contain @req
++ *
++ * Allows to track linked requests, to understand dependencies between requests
++ * and how does it influence their execution flow.
++ */
++TRACE_EVENT(io_uring_link,
++
++	TP_PROTO(void *ctx, void *req, void *target_req),
++
++	TP_ARGS(ctx, req, target_req),
++
++	TP_STRUCT__entry (
++		__field(  void *,	ctx			)
++		__field(  void *,	req			)
++		__field(  void *,	target_req	)
++	),
++
++	TP_fast_assign(
++		__entry->ctx		= ctx;
++		__entry->req		= req;
++		__entry->target_req	= target_req;
++	),
++
++	TP_printk("ring %p, request %p linked after %p",
++			  __entry->ctx, __entry->req, __entry->target_req)
++);
++
++/**
++ * io_uring_add_to_prev - called after a request was added into a previously
++ * 						  submitted work
++ *
++ * @req:	pointer to a request, added to a previous
++ * @ret:	whether or not it was completed successfully
++ *
++ * Allows to track merged work, to figure out how often requests are piggy
++ * backed into other ones, changing the execution flow.
++ */
++TRACE_EVENT(io_uring_add_to_prev,
++
++	TP_PROTO(void *req, bool ret),
++
++	TP_ARGS(req, ret),
++
++	TP_STRUCT__entry (
++		__field(  void *,	req	)
++		__field(  bool,		ret	)
++	),
++
++	TP_fast_assign(
++		__entry->req	= req;
++		__entry->ret	= ret;
++	),
++
++	TP_printk("request %p, ret %d", __entry->req, __entry->ret)
++);
++
++/**
++ * io_uring_cqring_wait - called before start waiting for an available CQE
++ *
++ * @ctx:		pointer to a ring context structure
++ * @min_events:	minimal number of events to wait for
++ *
++ * Allows to track waiting for CQE, so that we can e.g. troubleshoot
++ * situations, when an application wants to wait for an event, that never
++ * comes.
++ */
++TRACE_EVENT(io_uring_cqring_wait,
++
++	TP_PROTO(void *ctx, int min_events),
++
++	TP_ARGS(ctx, min_events),
++
++	TP_STRUCT__entry (
++		__field(  void *,	ctx			)
++		__field(  int,		min_events	)
++	),
++
++	TP_fast_assign(
++		__entry->ctx	= ctx;
++		__entry->min_events	= min_events;
++	),
++
++	TP_printk("ring %p, min_events %d", __entry->ctx, __entry->min_events)
++);
++
++/**
++ * io_uring_fail_link - called before failing a linked request
++ *
++ * @req:	request, which links were cancelled
++ * @link:	cancelled link
++ *
++ * Allows to track linked requests cancellation, to see not only that some work
++ * was cancelled, but also which request was the reason.
++ */
++TRACE_EVENT(io_uring_fail_link,
++
++	TP_PROTO(void *req, void *link),
++
++	TP_ARGS(req, link),
++
++	TP_STRUCT__entry (
++		__field(  void *,	req		)
++		__field(  void *,	link	)
++	),
++
++	TP_fast_assign(
++		__entry->req	= req;
++		__entry->link	= link;
++	),
++
++	TP_printk("request %p, link %p", __entry->req, __entry->link)
++);
++
++/**
++ * io_uring_submit_sqe - called before submitting one SQE
++ *
++ * @ctx:			pointer to a ring context structure
++ * @force_nonblock:	whether a context blocking or not
++ * @sq_thread:		true if sq_thread has submitted this SQE
++ *
++ * Allows to track SQE submitting, to understand what was the source of it, SQ
++ * thread or io_uring_enter call.
++ */
++TRACE_EVENT(io_uring_submit_sqe,
++
++	TP_PROTO(void *ctx, bool force_nonblock, bool sq_thread),
++
++	TP_ARGS(ctx, force_nonblock, sq_thread),
++
++	TP_STRUCT__entry (
++		__field(  void *,	ctx				)
++		__field(  bool,		force_nonblock	)
++		__field(  bool,		sq_thread		)
++	),
++
++	TP_fast_assign(
++		__entry->ctx			= ctx;
++		__entry->force_nonblock	= force_nonblock;
++		__entry->sq_thread		= sq_thread;
++	),
++
++	TP_printk("ring %p, non block %d, sq_thread %d",
++			  __entry->ctx, __entry->force_nonblock, __entry->sq_thread)
++);
++
++#endif /* _TRACE_IO_URING_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
