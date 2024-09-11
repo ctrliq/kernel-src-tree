@@ -425,6 +425,7 @@ static int vp_vdpa_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		vp_vdpa->vring[i].irq = VIRTIO_MSI_NO_VECTOR;
 		vp_vdpa->vring[i].notify = vp_modern_map_vq_notify(mdev, i);
 		if (!vp_vdpa->vring[i].notify) {
+			ret = -EINVAL;
 			dev_warn(&pdev->dev, "Fail to map vq notify %d\n", i);
 			goto err;
 		}
