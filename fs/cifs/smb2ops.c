@@ -804,7 +804,8 @@ int open_shroot(unsigned int xid, struct cifs_tcon *tcon,
 		tcon->crfid.has_lease = true;
 		smb2_parse_contexts(server, o_rsp,
 				&oparms.fid->epoch,
-				oparms.fid->lease_key, &oplock, NULL);
+				    oparms.fid->lease_key, &oplock,
+				    NULL, NULL);
 	} else
 		goto oshr_exit;
 
@@ -848,7 +849,7 @@ smb3_qfs_tcon(const unsigned int xid, struct cifs_tcon *tcon,
 
 	if (no_cached_open)
 		rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL,
-			       NULL);
+			       NULL, NULL);
 	else
 		rc = open_shroot(xid, tcon, cifs_sb, &fid);
 
@@ -888,7 +889,8 @@ smb2_qfs_tcon(const unsigned int xid, struct cifs_tcon *tcon,
 	oparms.fid = &fid;
 	oparms.reconnect = false;
 
-	rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL, NULL);
+	rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL,
+		       NULL, NULL);
 	if (rc)
 		return;
 
@@ -923,7 +925,8 @@ smb2_is_path_accessible(const unsigned int xid, struct cifs_tcon *tcon,
 	oparms.fid = &fid;
 	oparms.reconnect = false;
 
-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL);
+	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL,
+		       NULL);
 	if (rc) {
 		kfree(utf16_path);
 		return rc;
@@ -2156,7 +2159,8 @@ smb3_notify(const unsigned int xid, struct file *pfile,
 	oparms.fid = &fid;
 	oparms.reconnect = false;
 
-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL);
+	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL,
+		       NULL);
 	if (rc)
 		goto notify_exit;
 
@@ -2586,7 +2590,8 @@ smb311_queryfs(const unsigned int xid, struct cifs_tcon *tcon,
 	oparms.fid = &fid;
 	oparms.reconnect = false;
 
-	rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL, NULL);
+	rc = SMB2_open(xid, &oparms, &srch_path, &oplock, NULL, NULL,
+		       NULL, NULL);
 	if (rc)
 		return rc;
 
@@ -3076,7 +3081,8 @@ get_smb2_acl_by_path(struct cifs_sb_info *cifs_sb,
 	oparms.fid = &fid;
 	oparms.reconnect = false;
 
-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL);
+	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL,
+		       NULL);
 	kfree(utf16_path);
 	if (!rc) {
 		rc = SMB2_query_acl(xid, tlink_tcon(tlink), fid.persistent_fid,
@@ -3134,7 +3140,8 @@ set_smb2_acl(struct cifs_ntsd *pnntsd, __u32 acllen,
 	oparms.fid = &fid;
 	oparms.reconnect = false;
 
-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL, NULL);
+	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL,
+		       NULL, NULL);
 	kfree(utf16_path);
 	if (!rc) {
 		rc = SMB2_set_acl(xid, tlink_tcon(tlink), fid.persistent_fid,
