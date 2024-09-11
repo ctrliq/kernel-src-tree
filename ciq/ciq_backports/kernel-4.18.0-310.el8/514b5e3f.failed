@@ -1,0 +1,248 @@
+fuse: get rid of fuse_mount refcount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 514b5e3ff45e6cfc39cfa7c094727d8e6d885986
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/514b5e3f.failed
+
+Fuse mount now only ever has a refcount of one (before being freed) so the
+count field is unnecessary.
+
+Remove the refcounting and fold fuse_mount_put() into callers.  The only
+caller of fuse_mount_put() where fm->fc was NULL is fuse_dentry_automount()
+and here the fuse_conn_put() can simply be omitted.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 514b5e3ff45e6cfc39cfa7c094727d8e6d885986)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dir.c
+#	fs/fuse/fuse_i.h
+#	fs/fuse/inode.c
+#	fs/fuse/virtio_fs.c
+diff --cc fs/fuse/dir.c
+index 4026eb58cd91,e9c244524985..000000000000
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@@ -298,6 -301,78 +298,81 @@@ static int fuse_dentry_delete(const str
+  	return time_before64(fuse_dentry_time(dentry), get_jiffies_64());
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Create a fuse_mount object with a new superblock (with path->dentry
++  * as the root), and return that mount so it can be auto-mounted on
++  * @path.
++  */
++ static struct vfsmount *fuse_dentry_automount(struct path *path)
++ {
++ 	struct fs_context *fsc;
++ 	struct fuse_mount *parent_fm = get_fuse_mount_super(path->mnt->mnt_sb);
++ 	struct fuse_conn *fc = parent_fm->fc;
++ 	struct fuse_mount *fm;
++ 	struct vfsmount *mnt;
++ 	struct fuse_inode *mp_fi = get_fuse_inode(d_inode(path->dentry));
++ 	struct super_block *sb;
++ 	int err;
++ 
++ 	fsc = fs_context_for_submount(path->mnt->mnt_sb->s_type, path->dentry);
++ 	if (IS_ERR(fsc)) {
++ 		err = PTR_ERR(fsc);
++ 		goto out;
++ 	}
++ 
++ 	err = -ENOMEM;
++ 	fm = kzalloc(sizeof(struct fuse_mount), GFP_KERNEL);
++ 	if (!fm)
++ 		goto out_put_fsc;
++ 
++ 	fsc->s_fs_info = fm;
++ 	sb = sget_fc(fsc, NULL, set_anon_super_fc);
++ 	if (IS_ERR(sb)) {
++ 		err = PTR_ERR(sb);
++ 		kfree(fm);
++ 		goto out_put_fsc;
++ 	}
++ 	fm->fc = fuse_conn_get(fc);
++ 
++ 	/* Initialize superblock, making @mp_fi its root */
++ 	err = fuse_fill_super_submount(sb, mp_fi);
++ 	if (err)
++ 		goto out_put_sb;
++ 
++ 	sb->s_flags |= SB_ACTIVE;
++ 	fsc->root = dget(sb->s_root);
++ 	/* We are done configuring the superblock, so unlock it */
++ 	up_write(&sb->s_umount);
++ 
++ 	down_write(&fc->killsb);
++ 	list_add_tail(&fm->fc_entry, &fc->mounts);
++ 	up_write(&fc->killsb);
++ 
++ 	/* Create the submount */
++ 	mnt = vfs_create_mount(fsc);
++ 	if (IS_ERR(mnt)) {
++ 		err = PTR_ERR(mnt);
++ 		goto out_put_fsc;
++ 	}
++ 	mntget(mnt);
++ 	put_fs_context(fsc);
++ 	return mnt;
++ 
++ out_put_sb:
++ 	/*
++ 	 * Only jump here when fsc->root is NULL and sb is still locked
++ 	 * (otherwise put_fs_context() will put the superblock)
++ 	 */
++ 	deactivate_locked_super(sb);
++ out_put_fsc:
++ 	put_fs_context(fsc);
++ out:
++ 	return ERR_PTR(err);
++ }
++ 
+++>>>>>>> 514b5e3ff45e (fuse: get rid of fuse_mount refcount)
+  const struct dentry_operations fuse_dentry_operations = {
+  	.d_revalidate	= fuse_dentry_revalidate,
+  	.d_delete	= fuse_dentry_delete,
+diff --cc fs/fuse/fuse_i.h
+index 1e2f0f27c1cd,919aaf184676..000000000000
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@@ -783,9 -785,33 +783,34 @@@ struct fuse_conn 
+  	/* Dax specific conn data, non-NULL if DAX is enabled */
+  	struct fuse_conn_dax *dax;
+  #endif
+ -
+ -	/** List of filesystems using this connection */
+ -	struct list_head mounts;
+  };
+  
+++<<<<<<< HEAD
+ +static inline struct fuse_conn *get_fuse_conn_super(struct super_block *sb)
+++=======
++ /*
++  * Represents a mounted filesystem, potentially a submount.
++  *
++  * This object allows sharing a fuse_conn between separate mounts to
++  * allow submounts with dedicated superblocks and thus separate device
++  * IDs.
++  */
++ struct fuse_mount {
++ 	/* Underlying (potentially shared) connection to the FUSE server */
++ 	struct fuse_conn *fc;
++ 
++ 	/*
++ 	 * Super block for this connection (fc->killsb must be held when
++ 	 * accessing this).
++ 	 */
++ 	struct super_block *sb;
++ 
++ 	/* Entry on fc->mounts */
++ 	struct list_head fc_entry;
++ };
++ 
++ static inline struct fuse_mount *get_fuse_mount_super(struct super_block *sb)
+++>>>>>>> 514b5e3ff45e (fuse: get rid of fuse_mount refcount)
+  {
+  	return sb->s_fs_info;
+  }
+diff --cc fs/fuse/inode.c
+index ad83ccd9accc,dd45dec4dc39..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -411,14 -450,10 +411,19 @@@ static void fuse_send_destroy(struct fu
+  
+  static void fuse_put_super(struct super_block *sb)
+  {
+ -	struct fuse_mount *fm = get_fuse_mount_super(sb);
+ +	struct fuse_conn *fc = get_fuse_conn_super(sb);
+ +
+++<<<<<<< HEAD
+ +	mutex_lock(&fuse_mutex);
+ +	list_del(&fc->entry);
+ +	fuse_ctl_remove_conn(fc);
+ +	mutex_unlock(&fuse_mutex);
+  
+ +	fuse_conn_put(fc);
+++=======
++ 	fuse_conn_put(fm->fc);
++ 	kfree(fm);
+++>>>>>>> 514b5e3ff45e (fuse: get rid of fuse_mount refcount)
+  }
+  
+  static void convert_fuse_statfs(struct kstatfs *stbuf, struct fuse_kstatfs *attr)
+@@@ -666,6 -702,10 +671,13 @@@ void fuse_conn_init(struct fuse_conn *f
+  	fc->pid_ns = get_pid_ns(task_active_pid_ns(current));
+  	fc->user_ns = get_user_ns(user_ns);
+  	fc->max_pages = FUSE_DEFAULT_MAX_PAGES_PER_REQ;
+++<<<<<<< HEAD
+++=======
++ 
++ 	INIT_LIST_HEAD(&fc->mounts);
++ 	list_add(&fm->fc_entry, &fc->mounts);
++ 	fm->fc = fc;
+++>>>>>>> 514b5e3ff45e (fuse: get rid of fuse_mount refcount)
+  }
+  EXPORT_SYMBOL_GPL(fuse_conn_init);
+  
+@@@ -1332,6 -1449,7 +1344,10 @@@ static int fuse_fill_super(struct super
+  
+   err_put_conn:
+  	fuse_conn_put(fc);
+++<<<<<<< HEAD
+++=======
++ 	kfree(fm);
+++>>>>>>> 514b5e3ff45e (fuse: get rid of fuse_mount refcount)
+  	sb->s_fs_info = NULL;
+   err_fput:
+  	fput(file);
+diff --cc fs/fuse/virtio_fs.c
+index 342f1a411d7e,62d89b9c30db..000000000000
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@@ -1430,14 -1428,27 +1430,23 @@@ static int virtio_fs_get_tree(struct fs
+  		return -ENOMEM;
+  	}
+  
+ -	fm = kzalloc(sizeof(struct fuse_mount), GFP_KERNEL);
+ -	if (!fm) {
+ -		mutex_lock(&virtio_fs_mutex);
+ -		virtio_fs_put(fs);
+ -		mutex_unlock(&virtio_fs_mutex);
+ -		kfree(fc);
+ -		return -ENOMEM;
+ -	}
+ -
+ -	fuse_conn_init(fc, fm, get_user_ns(current_user_ns()),
+ -		       &virtio_fs_fiq_ops, fs);
+ +	fuse_conn_init(fc, get_user_ns(current_user_ns()), &virtio_fs_fiq_ops,
+ +		       fs);
+  	fc->release = fuse_free_conn;
+  	fc->delete_stale = true;
+ -	fc->auto_submounts = true;
+  
+++<<<<<<< HEAD
+ +	fsc->s_fs_info = fc;
+ +	sb = sget_fc(fsc, virtio_fs_test_super, virtio_fs_set_super);
+ +	fuse_conn_put(fc);
+++=======
++ 	fsc->s_fs_info = fm;
++ 	sb = sget_fc(fsc, virtio_fs_test_super, set_anon_super_fc);
++ 	if (fsc->s_fs_info) {
++ 		fuse_conn_put(fc);
++ 		kfree(fm);
++ 	}
+++>>>>>>> 514b5e3ff45e (fuse: get rid of fuse_mount refcount)
+  	if (IS_ERR(sb))
+  		return PTR_ERR(sb);
+  
+* Unmerged path fs/fuse/dir.c
+* Unmerged path fs/fuse/fuse_i.h
+* Unmerged path fs/fuse/inode.c
+* Unmerged path fs/fuse/virtio_fs.c
