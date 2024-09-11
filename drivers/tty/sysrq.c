@@ -395,7 +395,6 @@ static struct sysrq_key_op sysrq_moom_op = {
 	.enable_mask	= SYSRQ_ENABLE_SIGNAL,
 };
 
-#ifdef CONFIG_BLOCK
 static void sysrq_handle_thaw(int key)
 {
 	emergency_thaw_all();
@@ -406,7 +405,6 @@ static struct sysrq_key_op sysrq_thaw_op = {
 	.action_msg	= "Emergency Thaw of all frozen filesystems",
 	.enable_mask	= SYSRQ_ENABLE_SIGNAL,
 };
-#endif
 
 static void sysrq_handle_kill(int key)
 {
