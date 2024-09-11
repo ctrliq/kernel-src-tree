@@ -1,0 +1,251 @@
+powerpc/pci: Move PHB discovery for PCI_DN using platforms
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Oliver O'Halloran <oohall@gmail.com>
+commit fbbefb320214db14c3e740fce98e2c95c9d0669b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/fbbefb32.failed
+
+Make powernv, pseries, powermac and maple use ppc_mc.discover_phbs.
+These platforms need to be done together because they all depend on
+pci_dn's being created from the DT. The pci_dn contains a pointer to
+the relevant pci_controller so they need to be created after the
+pci_controller structures are available, but before PCI devices are
+scanned. Currently this ordering is provided by initcalls and the
+sequence is:
+
+  1. PHBs are discovered (setup_arch) (early boot, pre-initcalls)
+  2. pci_dn are created from the unflattended DT (core initcall)
+  3. PHBs are scanned pcibios_init() (subsys initcall)
+
+The new ppc_md.discover_phbs() function is also a core_initcall so we
+can't guarantee ordering between the creation of pci_controllers and
+the creation of pci_dn's which require a pci_controller. We could use
+the postcore, or core_sync initcall levels, but it's cleaner to just
+move the pci_dn setup into the per-PHB inits which occur inside of
+.discover_phb() for these platforms. This brings the boot-time path in
+line with the PHB hotplug path that is used for pseries DLPAR
+operations too.
+
+	Signed-off-by: Oliver O'Halloran <oohall@gmail.com>
+[mpe: Squash powermac & maple in to avoid breakage those platforms,
+      convert memblock allocs to use kmalloc to avoid warnings]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20201103043523.916109-2-oohall@gmail.com
+(cherry picked from commit fbbefb320214db14c3e740fce98e2c95c9d0669b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/maple/setup.c
+diff --cc arch/powerpc/platforms/maple/setup.c
+index d1fee2d35b49,4e9ad5bf3efb..000000000000
+--- a/arch/powerpc/platforms/maple/setup.c
++++ b/arch/powerpc/platforms/maple/setup.c
+@@@ -185,12 -179,6 +185,15 @@@ static void __init maple_setup_arch(voi
+  #ifdef CONFIG_SMP
+  	smp_ops = &maple_smp_ops;
+  #endif
+++<<<<<<< HEAD
+ +	/* Lookup PCI hosts */
+ +       	maple_pci_init();
+ +
+ +#ifdef CONFIG_DUMMY_CONSOLE
+ +	conswitchp = &dummy_con;
+ +#endif
+++=======
+++>>>>>>> fbbefb320214 (powerpc/pci: Move PHB discovery for PCI_DN using platforms)
+  	maple_use_rtas_reboot_and_halt_if_present();
+  
+  	printk(KERN_DEBUG "Using native/NAP idle loop\n");
+diff --git a/arch/powerpc/kernel/pci_dn.c b/arch/powerpc/kernel/pci_dn.c
+index c9fc89d22d6d..4d152129f6cc 100644
+--- a/arch/powerpc/kernel/pci_dn.c
++++ b/arch/powerpc/kernel/pci_dn.c
+@@ -473,28 +473,6 @@ void pci_devs_phb_init_dynamic(struct pci_controller *phb)
+ 	pci_traverse_device_nodes(dn, add_pdn, phb);
+ }
+ 
+-/** 
+- * pci_devs_phb_init - Initialize phbs and pci devs under them.
+- * 
+- * This routine walks over all phb's (pci-host bridges) on the
+- * system, and sets up assorted pci-related structures 
+- * (including pci info in the device node structs) for each
+- * pci device found underneath.  This routine runs once,
+- * early in the boot sequence.
+- */
+-static int __init pci_devs_phb_init(void)
+-{
+-	struct pci_controller *phb, *tmp;
+-
+-	/* This must be done first so the device nodes have valid pci info! */
+-	list_for_each_entry_safe(phb, tmp, &hose_list, list_node)
+-		pci_devs_phb_init_dynamic(phb);
+-
+-	return 0;
+-}
+-
+-core_initcall(pci_devs_phb_init);
+-
+ static void pci_dev_pdn_setup(struct pci_dev *pdev)
+ {
+ 	struct pci_dn *pdn;
+diff --git a/arch/powerpc/platforms/maple/pci.c b/arch/powerpc/platforms/maple/pci.c
+index e3821379e86f..b6c6217b8757 100644
+--- a/arch/powerpc/platforms/maple/pci.c
++++ b/arch/powerpc/platforms/maple/pci.c
+@@ -540,6 +540,9 @@ static int __init maple_add_bridge(struct device_node *dev)
+ 	/* Check for legacy IOs */
+ 	isa_bridge_find_early(hose);
+ 
++	/* create pci_dn's for DT nodes under this PHB */
++	pci_devs_phb_init_dynamic(hose);
++
+ 	return 0;
+ }
+ 
+* Unmerged path arch/powerpc/platforms/maple/setup.c
+diff --git a/arch/powerpc/platforms/powermac/pci.c b/arch/powerpc/platforms/powermac/pci.c
+index df762bb3c735..1c00db903ad7 100644
+--- a/arch/powerpc/platforms/powermac/pci.c
++++ b/arch/powerpc/platforms/powermac/pci.c
+@@ -856,6 +856,10 @@ static int __init pmac_add_bridge(struct device_node *dev)
+ 	/* Fixup "bus-range" OF property */
+ 	fixup_bus_range(dev);
+ 
++	/* create pci_dn's for DT nodes under this PHB */
++	if (IS_ENABLED(CONFIG_PPC64))
++		pci_devs_phb_init_dynamic(hose);
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/powerpc/platforms/powermac/setup.c b/arch/powerpc/platforms/powermac/setup.c
+index 3a529fcdae97..d561c5867b28 100644
+--- a/arch/powerpc/platforms/powermac/setup.c
++++ b/arch/powerpc/platforms/powermac/setup.c
+@@ -303,9 +303,6 @@ static void __init pmac_setup_arch(void)
+ 		of_node_put(ic);
+ 	}
+ 
+-	/* Lookup PCI hosts */
+-	pmac_pci_init();
+-
+ #ifdef CONFIG_PPC32
+ 	ohare_init();
+ 	l2cr_init();
+@@ -613,6 +610,7 @@ define_machine(powermac) {
+ 	.name			= "PowerMac",
+ 	.probe			= pmac_probe,
+ 	.setup_arch		= pmac_setup_arch,
++	.discover_phbs		= pmac_pci_init,
+ 	.show_cpuinfo		= pmac_show_cpuinfo,
+ 	.init_IRQ		= pmac_pic_init,
+ 	.get_irq		= NULL,	/* changed later */
+diff --git a/arch/powerpc/platforms/powernv/pci-ioda.c b/arch/powerpc/platforms/powernv/pci-ioda.c
+index b383349b6306..7cd4821dceab 100644
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@ -3772,7 +3772,7 @@ static void __init pnv_pci_init_ioda_phb(struct device_node *np,
+ 	phb_id = be64_to_cpup(prop64);
+ 	pr_debug("  PHB-ID  : 0x%016llx\n", phb_id);
+ 
+-	phb = memblock_alloc(sizeof(*phb), SMP_CACHE_BYTES);
++	phb = kmalloc(sizeof(*phb), GFP_KERNEL);
+ 	if (!phb)
+ 		panic("%s: Failed to allocate %zu bytes\n", __func__,
+ 		      sizeof(*phb));
+@@ -3821,7 +3821,7 @@ static void __init pnv_pci_init_ioda_phb(struct device_node *np,
+ 	else
+ 		phb->diag_data_size = PNV_PCI_DIAG_BUF_SIZE;
+ 
+-	phb->diag_data = memblock_alloc(phb->diag_data_size, SMP_CACHE_BYTES);
++	phb->diag_data = kmalloc(phb->diag_data_size, GFP_KERNEL);
+ 	if (!phb->diag_data)
+ 		panic("%s: Failed to allocate %u bytes\n", __func__,
+ 		      phb->diag_data_size);
+@@ -3883,9 +3883,10 @@ static void __init pnv_pci_init_ioda_phb(struct device_node *np,
+ 	}
+ 	pemap_off = size;
+ 	size += phb->ioda.total_pe_num * sizeof(struct pnv_ioda_pe);
+-	aux = memblock_alloc(size, SMP_CACHE_BYTES);
++	aux = kmalloc(size, GFP_KERNEL);
+ 	if (!aux)
+ 		panic("%s: Failed to allocate %lu bytes\n", __func__, size);
++
+ 	phb->ioda.pe_alloc = aux;
+ 	phb->ioda.m64_segmap = aux + m64map_off;
+ 	phb->ioda.m32_segmap = aux + m32map_off;
+@@ -4011,6 +4012,9 @@ static void __init pnv_pci_init_ioda_phb(struct device_node *np,
+ 	/* Remove M64 resource if we can't configure it successfully */
+ 	if (!phb->init_m64 || phb->init_m64(phb))
+ 		hose->mem_resources[1].flags = 0;
++
++	/* create pci_dn's for DT nodes under this PHB */
++	pci_devs_phb_init_dynamic(hose);
+ }
+ 
+ void __init pnv_pci_init_ioda2_phb(struct device_node *np)
+diff --git a/arch/powerpc/platforms/powernv/setup.c b/arch/powerpc/platforms/powernv/setup.c
+index 75fe7e14ca2a..47612cd8d1e5 100644
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -143,9 +143,6 @@ static void __init pnv_setup_arch(void)
+ 	/* Initialize SMP */
+ 	pnv_smp_init();
+ 
+-	/* Setup PCI */
+-	pnv_pci_init();
+-
+ 	/* Setup RTC and NVRAM callbacks */
+ 	if (firmware_has_feature(FW_FEATURE_OPAL))
+ 		opal_nvram_init();
+@@ -486,6 +483,7 @@ define_machine(powernv) {
+ 	.init_IRQ		= pnv_init_IRQ,
+ 	.show_cpuinfo		= pnv_show_cpuinfo,
+ 	.get_proc_freq          = pnv_get_proc_freq,
++	.discover_phbs		= pnv_pci_init,
+ 	.progress		= pnv_progress,
+ 	.machine_shutdown	= pnv_shutdown,
+ 	.power_save             = NULL,
+diff --git a/arch/powerpc/platforms/pseries/setup.c b/arch/powerpc/platforms/pseries/setup.c
+index 1404d1db3571..f51396e41801 100644
+--- a/arch/powerpc/platforms/pseries/setup.c
++++ b/arch/powerpc/platforms/pseries/setup.c
+@@ -448,7 +448,7 @@ void pseries_little_endian_exceptions(void)
+ }
+ #endif
+ 
+-static void __init find_and_init_phbs(void)
++static void __init pSeries_discover_phbs(void)
+ {
+ 	struct device_node *node;
+ 	struct pci_controller *phb;
+@@ -466,6 +466,9 @@ static void __init find_and_init_phbs(void)
+ 		pci_process_bridge_OF_ranges(phb, node, 0);
+ 		isa_bridge_find_early(phb);
+ 		phb->controller_ops = pseries_pci_controller_ops;
++
++		/* create pci_dn's for DT nodes under this PHB */
++		pci_devs_phb_init_dynamic(phb);
+ 	}
+ 
+ 	of_node_put(root);
+@@ -767,7 +770,6 @@ static void __init pSeries_setup_arch(void)
+ 
+ 	/* Find and initialize PCI host bridges */
+ 	init_pci_config_tokens();
+-	find_and_init_phbs();
+ 	of_reconfig_notifier_register(&pci_dn_reconfig_nb);
+ 
+ 	pSeries_nvram_init();
+@@ -1033,6 +1035,7 @@ define_machine(pseries) {
+ 	.init_IRQ		= pseries_init_irq,
+ 	.show_cpuinfo		= pSeries_show_cpuinfo,
+ 	.log_error		= pSeries_log_error,
++	.discover_phbs		= pSeries_discover_phbs,
+ 	.pcibios_fixup		= pSeries_final_fixup,
+ 	.restart		= rtas_restart,
+ 	.halt			= rtas_halt,
