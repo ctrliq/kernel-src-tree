@@ -1,0 +1,84 @@
+virtio_net: Don't process redirected XDP frames when XDP is disabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+commit 03aa6d34868c07b2b1b8b2db080602d7ec528173
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/03aa6d34.failed
+
+Commit 8dcc5b0ab0ec ("virtio_net: fix ndo_xdp_xmit crash towards dev not
+ready for XDP") tried to avoid access to unexpected sq while XDP is
+disabled, but was not complete.
+
+There was a small window which causes out of bounds sq access in
+virtnet_xdp_xmit() while disabling XDP.
+
+An example case of
+ - curr_queue_pairs = 6 (2 for SKB and 4 for XDP)
+ - online_cpu_num = xdp_queue_paris = 4
+when XDP is enabled:
+
+CPU 0                         CPU 1
+(Disabling XDP)               (Processing redirected XDP frames)
+
+                              virtnet_xdp_xmit()
+virtnet_xdp_set()
+ _virtnet_set_queues()
+  set curr_queue_pairs (2)
+                               check if rq->xdp_prog is not NULL
+                               virtnet_xdp_sq(vi)
+                                qp = curr_queue_pairs -
+                                     xdp_queue_pairs +
+                                     smp_processor_id()
+                                   = 2 - 4 + 1 = -1
+                                sq = &vi->sq[qp] // out of bounds access
+  set xdp_queue_pairs (0)
+  rq->xdp_prog = NULL
+
+Basically we should not change curr_queue_pairs and xdp_queue_pairs
+while someone can read the values. Thus, when disabling XDP, assign NULL
+to rq->xdp_prog first, and wait for RCU grace period, then change
+xxx_queue_pairs.
+Note that we need to keep the current order when enabling XDP though.
+
+- v2: Make rcu_assign_pointer/synchronize_net conditional instead of
+      _virtnet_set_queues.
+
+Fixes: 186b3c998c50 ("virtio-net: support XDP_REDIRECT")
+	Signed-off-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 03aa6d34868c07b2b1b8b2db080602d7ec528173)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index 8f71eb2ce0d1,cea52e47dc65..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -2498,8 -2410,15 +2498,20 @@@ static int virtnet_xdp_set(struct net_d
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (prog)
+ +		bpf_prog_add(prog, vi->max_queue_pairs - 1);
+++=======
++ 	old_prog = rtnl_dereference(vi->rq[0].xdp_prog);
++ 	if (!prog && !old_prog)
++ 		return 0;
++ 
++ 	if (prog) {
++ 		prog = bpf_prog_add(prog, vi->max_queue_pairs - 1);
++ 		if (IS_ERR(prog))
++ 			return PTR_ERR(prog);
++ 	}
+++>>>>>>> 03aa6d34868c (virtio_net: Don't process redirected XDP frames when XDP is disabled)
+  
+  	/* Make sure NAPI is not using any XDP TX queues for RX. */
+  	if (netif_running(dev)) {
+* Unmerged path drivers/net/virtio_net.c
