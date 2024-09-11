@@ -1,0 +1,1343 @@
+scsi: qla2xxx: Cleanups for NVRAM/Flash read/write path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Joe Carnuccio <joe.carnuccio@cavium.com>
+commit f8f97b0c5b7f7c801d80ac78165edf25fff1f5e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f8f97b0c.failed
+
+This patch does following:
+
+ - Clean up NVRAM code.
+ - Optimizes reading of primary/secondary flash image validation.
+ - Remove 0xff mask and make correct width in FLT structure.
+ - Use endian macros to assign static fields in fwdump header.
+ - Correct fdwt checksum calculation.
+ - Simplify ql_dump_buffer() interface usage.
+ - Add endianizers to 27xx firmware image validator.
+ - fixes compiler warnings for big endian architecture.
+
+	Signed-off-by: Joe Carnuccio <joe.carnuccio@cavium.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f8f97b0c5b7f7c801d80ac78165edf25fff1f5e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 046c47b82245,17509ab553f0..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -6936,28 -7205,29 +6935,26 @@@ qla24xx_nvram_config(scsi_qla_host_t *v
+  uint8_t qla27xx_find_valid_image(struct scsi_qla_host *vha)
+  {
+  	struct qla27xx_image_status pri_image_status, sec_image_status;
+- 	uint8_t valid_pri_image, valid_sec_image;
++ 	bool valid_pri_image = true, valid_sec_image = true;
+  	uint32_t *wptr;
+- 	uint32_t cnt, chksum, size;
++ 	uint chksum, cnt, size = sizeof(pri_image_status) / sizeof(*wptr);
+  	struct qla_hw_data *ha = vha->hw;
+ -	uint32_t signature;
+  
+- 	valid_pri_image = valid_sec_image = 1;
+  	ha->active_image = 0;
+- 	size = sizeof(struct qla27xx_image_status) / sizeof(uint32_t);
+  
+  	if (!ha->flt_region_img_status_pri) {
+- 		valid_pri_image = 0;
++ 		valid_pri_image = false;
+  		goto check_sec_image;
+  	}
+  
+  	qla24xx_read_flash_data(vha, (uint32_t *)(&pri_image_status),
+  	    ha->flt_region_img_status_pri, size);
+  
+ -	signature = le32_to_cpu(pri_image_status.signature);
+ -	if (signature != QLA27XX_IMG_STATUS_SIGN &&
+ -	    signature != QLA28XX_IMG_STATUS_SIGN) {
+ +	if (pri_image_status.signature != QLA27XX_IMG_STATUS_SIGN) {
+  		ql_dbg(ql_dbg_init, vha, 0x018b,
+- 		    "Primary image signature (0x%x) not valid\n",
+- 		    pri_image_status.signature);
+- 		valid_pri_image = 0;
++ 		    "Primary image signature (%#x) not valid\n",
++ 		    le32_to_cpu(pri_image_status.signature));
++ 		valid_pri_image = false;
+  		goto check_sec_image;
+  	}
+  
+@@@ -6983,11 -7252,13 +6979,11 @@@ check_sec_image
+  	qla24xx_read_flash_data(vha, (uint32_t *)(&sec_image_status),
+  	    ha->flt_region_img_status_sec, size);
+  
+ -	signature = le32_to_cpu(sec_image_status.signature);
+ -	if (signature != QLA27XX_IMG_STATUS_SIGN &&
+ -	    signature != QLA28XX_IMG_STATUS_SIGN) {
+ +	if (sec_image_status.signature != QLA27XX_IMG_STATUS_SIGN) {
+  		ql_dbg(ql_dbg_init, vha, 0x018d,
+- 		    "Secondary image signature(0x%x) not valid\n",
+- 		    sec_image_status.signature);
+- 		valid_sec_image = 0;
++ 		    "Secondary image signature (%#x) not valid\n",
++ 		    le32_to_cpu(sec_image_status.signature));
++ 		valid_sec_image = false;
+  		goto check_valid_image;
+  	}
+  
+@@@ -7003,16 -7273,18 +6998,18 @@@
+  	}
+  
+  check_valid_image:
+- 	if (valid_pri_image && (pri_image_status.image_status_mask & 0x1))
++ 	if (valid_pri_image && (pri_image_status.image_status_mask & 1))
+  		ha->active_image = QLA27XX_PRIMARY_IMAGE;
+- 	if (valid_sec_image && (sec_image_status.image_status_mask & 0x1)) {
++ 
++ 	if (valid_sec_image && (sec_image_status.image_status_mask & 1)) {
+  		if (!ha->active_image ||
+- 		    pri_image_status.generation_number <
+- 		    sec_image_status.generation_number)
++ 		    le16_to_cpu(pri_image_status.generation) <
++ 		    le16_to_cpu(sec_image_status.generation)) {
+  			ha->active_image = QLA27XX_SECONDARY_IMAGE;
++ 		}
+  	}
+  
+ -	ql_dbg(ql_dbg_init + ql_dbg_verbose, vha, 0x018f, "%s image\n",
+ +	ql_dbg(ql_dbg_init, vha, 0x018f, "%s image\n",
+  	    ha->active_image == 0 ? "default bootld and fw" :
+  	    ha->active_image == 1 ? "primary" :
+  	    ha->active_image == 2 ? "secondary" :
+@@@ -7037,24 -7316,9 +7041,30 @@@ qla24xx_load_risc_flash(scsi_qla_host_
+  	ql_dbg(ql_dbg_init, vha, 0x008b,
+  	    "FW: Loading firmware from flash (%x).\n", faddr);
+  
+++<<<<<<< HEAD
+ +	rval = QLA_SUCCESS;
+ +
+ +	segments = FA_RISC_CODE_SEGMENTS;
+ +	dcode = (uint32_t *)req->ring;
+ +	*srisc_addr = 0;
+ +
+ +	if (IS_QLA27XX(ha) &&
+ +	    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
+ +		faddr = ha->flt_region_fw_sec;
+ +
+ +	/* Validate firmware image by checking version. */
+ +	qla24xx_read_flash_data(vha, dcode, faddr + 4, 4);
+ +	for (i = 0; i < 4; i++)
+ +		dcode[i] = be32_to_cpu(dcode[i]);
+ +	if ((dcode[0] == 0xffffffff && dcode[1] == 0xffffffff &&
+ +	    dcode[2] == 0xffffffff && dcode[3] == 0xffffffff) ||
+ +	    (dcode[0] == 0 && dcode[1] == 0 && dcode[2] == 0 &&
+ +		dcode[3] == 0)) {
+++=======
++ 	dcode = (void *)req->ring;
++ 	qla24xx_read_flash_data(vha, dcode, faddr, 8);
++ 	if (qla24xx_risc_firmware_invalid(dcode)) {
+++>>>>>>> f8f97b0c5b7f (scsi: qla2xxx: Cleanups for NVRAM/Flash read/write path)
+  		ql_log(ql_log_fatal, vha, 0x008c,
+  		    "Unable to verify the integrity of flash firmware "
+  		    "image.\n");
+@@@ -7908,14 -8179,10 +7924,19 @@@ qla81xx_nvram_config(scsi_qla_host_t *v
+  	}
+  
+  	 /* enable RIDA Format2 */
+ -	icb->firmware_options_3 |= BIT_0;
+ +	if (qla_tgt_mode_enabled(vha) || qla_dual_mode_enabled(vha))
+ +		icb->firmware_options_3 |= BIT_0;
+  
+++<<<<<<< HEAD
+ +	if (IS_QLA27XX(ha)) {
+ +		icb->firmware_options_3 |= BIT_8;
+ +		ql_dbg(ql_log_info, vha, 0x0075,
+ +		    "Enabling direct connection.\n");
+ +	}
+++=======
++ 	/* N2N: driver will initiate Login instead of FW */
++ 	icb->firmware_options_3 |= BIT_8;
+++>>>>>>> f8f97b0c5b7f (scsi: qla2xxx: Cleanups for NVRAM/Flash read/write path)
+  
+  	if (rval) {
+  		ql_log(ql_log_warn, vha, 0x0076,
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.c b/drivers/scsi/qla2xxx/qla_bsg.c
+index 4a9fd8d944d6..94c14cb749a7 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.c
++++ b/drivers/scsi/qla2xxx/qla_bsg.c
+@@ -1961,7 +1961,7 @@ qlafx00_mgmt_cmd(struct bsg_job *bsg_job)
+ 
+ 	/* Dump the vendor information */
+ 	ql_dump_buffer(ql_dbg_user + ql_dbg_verbose , vha, 0x70cf,
+-	    (uint8_t *)piocb_rqst, sizeof(struct qla_mt_iocb_rqst_fx00));
++	    piocb_rqst, sizeof(*piocb_rqst));
+ 
+ 	if (!vha->flags.online) {
+ 		ql_log(ql_log_warn, vha, 0x70d0,
+@@ -2323,8 +2323,8 @@ qla2x00_get_priv_stats(struct bsg_job *bsg_job)
+ 	rval = qla24xx_get_isp_stats(base_vha, stats, stats_dma, options);
+ 
+ 	if (rval == QLA_SUCCESS) {
+-		ql_dump_buffer(ql_dbg_user + ql_dbg_verbose, vha, 0x70e3,
+-		    (uint8_t *)stats, sizeof(*stats));
++		ql_dump_buffer(ql_dbg_user + ql_dbg_verbose, vha, 0x70e5,
++			stats, sizeof(*stats));
+ 		sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
+ 			bsg_job->reply_payload.sg_cnt, stats, sizeof(*stats));
+ 	}
+diff --git a/drivers/scsi/qla2xxx/qla_dbg.c b/drivers/scsi/qla2xxx/qla_dbg.c
+index ec5bad0b0607..955a8aba70eb 100644
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@ -2517,7 +2517,7 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
+ /****************************************************************************/
+ 
+ static inline int
+-ql_mask_match(uint32_t level)
++ql_mask_match(uint level)
+ {
+ 	return (level & ql2xextended_error_logging) == level;
+ }
+@@ -2536,7 +2536,7 @@ ql_mask_match(uint32_t level)
+  * msg:   The message to be displayed.
+  */
+ void
+-ql_dbg(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
++ql_dbg(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
+ {
+ 	va_list va;
+ 	struct va_format vaf;
+@@ -2579,8 +2579,7 @@ ql_dbg(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
+  * msg:   The message to be displayed.
+  */
+ void
+-ql_dbg_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
+-	   const char *fmt, ...)
++ql_dbg_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
+ {
+ 	va_list va;
+ 	struct va_format vaf;
+@@ -2616,7 +2615,7 @@ ql_dbg_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
+  * msg:   The message to be displayed.
+  */
+ void
+-ql_log(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
++ql_log(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
+ {
+ 	va_list va;
+ 	struct va_format vaf;
+@@ -2674,8 +2673,7 @@ ql_log(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
+  * msg:   The message to be displayed.
+  */
+ void
+-ql_log_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
+-	   const char *fmt, ...)
++ql_log_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
+ {
+ 	va_list va;
+ 	struct va_format vaf;
+@@ -2715,7 +2713,7 @@ ql_log_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
+ }
+ 
+ void
+-ql_dump_regs(uint32_t level, scsi_qla_host_t *vha, int32_t id)
++ql_dump_regs(uint level, scsi_qla_host_t *vha, uint id)
+ {
+ 	int i;
+ 	struct qla_hw_data *ha = vha->hw;
+@@ -2737,13 +2735,12 @@ ql_dump_regs(uint32_t level, scsi_qla_host_t *vha, int32_t id)
+ 	ql_dbg(level, vha, id, "Mailbox registers:\n");
+ 	for (i = 0; i < 6; i++, mbx_reg++)
+ 		ql_dbg(level, vha, id,
+-		    "mbox[%d] 0x%04x\n", i, RD_REG_WORD(mbx_reg));
++		    "mbox[%d] %#04x\n", i, RD_REG_WORD(mbx_reg));
+ }
+ 
+ 
+ void
+-ql_dump_buffer(uint32_t level, scsi_qla_host_t *vha, int32_t id,
+-	uint8_t *buf, uint size)
++ql_dump_buffer(uint level, scsi_qla_host_t *vha, uint id, void *buf, uint size)
+ {
+ 	uint cnt;
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_dbg.h b/drivers/scsi/qla2xxx/qla_dbg.h
+index 8877aa97d829..bb01b680ce9f 100644
+--- a/drivers/scsi/qla2xxx/qla_dbg.h
++++ b/drivers/scsi/qla2xxx/qla_dbg.h
+@@ -318,20 +318,20 @@ struct qla2xxx_fw_dump {
+ 				   * as compared to other log levels.
+ 				   */
+ 
+-extern int ql_errlev;
++extern uint ql_errlev;
+ 
+ void __attribute__((format (printf, 4, 5)))
+-ql_dbg(uint32_t, scsi_qla_host_t *vha, int32_t, const char *fmt, ...);
++ql_dbg(uint, scsi_qla_host_t *vha, uint, const char *fmt, ...);
+ void __attribute__((format (printf, 4, 5)))
+-ql_dbg_pci(uint32_t, struct pci_dev *pdev, int32_t, const char *fmt, ...);
++ql_dbg_pci(uint, struct pci_dev *pdev, uint, const char *fmt, ...);
+ void __attribute__((format (printf, 4, 5)))
+ ql_dbg_qp(uint32_t, struct qla_qpair *, int32_t, const char *fmt, ...);
+ 
+ 
+ void __attribute__((format (printf, 4, 5)))
+-ql_log(uint32_t, scsi_qla_host_t *vha, int32_t, const char *fmt, ...);
++ql_log(uint, scsi_qla_host_t *vha, uint, const char *fmt, ...);
+ void __attribute__((format (printf, 4, 5)))
+-ql_log_pci(uint32_t, struct pci_dev *pdev, int32_t, const char *fmt, ...);
++ql_log_pci(uint, struct pci_dev *pdev, uint, const char *fmt, ...);
+ 
+ void __attribute__((format (printf, 4, 5)))
+ ql_log_qp(uint32_t, struct qla_qpair *, int32_t, const char *fmt, ...);
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 824b13554ed2..231a5cee85b1 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -4384,7 +4384,7 @@ typedef struct scsi_qla_host {
+ 
+ struct qla27xx_image_status {
+ 	uint8_t image_status_mask;
+-	uint16_t generation_number;
++	uint16_t generation;
+ 	uint8_t reserved[3];
+ 	uint8_t ver_minor;
+ 	uint8_t ver_major;
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index 5d8688e5bc7c..f2dc470fc1cc 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -1511,7 +1511,9 @@ struct qla_flt_header {
+ #define FLT_REG_VPD_SEC_27XX_3	0xDA
+ 
+ struct qla_flt_region {
+-	uint32_t code;
++	uint16_t code;
++	uint8_t attribute;
++	uint8_t reserved;
+ 	uint32_t size;
+ 	uint32_t start;
+ 	uint32_t end;
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index ca3f732c0824..47e816ec7c13 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -118,6 +118,7 @@ int qla_post_iidma_work(struct scsi_qla_host *vha, fc_port_t *fcport);
+ void qla_do_iidma_work(struct scsi_qla_host *vha, fc_port_t *fcport);
+ int qla2x00_reserve_mgmt_server_loop_id(scsi_qla_host_t *);
+ void qla_rscn_replay(fc_port_t *fcport);
++extern bool qla24xx_risc_firmware_invalid(uint32_t *);
+ 
+ /*
+  * Global Data in qla_os.c source file.
+@@ -612,14 +613,9 @@ extern ulong qla27xx_fwdt_calculate_dump_size(struct scsi_qla_host *);
+ extern int qla27xx_fwdt_template_valid(void *);
+ extern ulong qla27xx_fwdt_template_size(void *);
+ 
+-extern void qla2x00_dump_regs(scsi_qla_host_t *);
+-extern void qla2x00_dump_buffer(uint8_t *, uint32_t);
+-extern void qla2x00_dump_buffer_zipped(uint8_t *, uint32_t);
+-extern void ql_dump_regs(uint32_t, scsi_qla_host_t *, int32_t);
+-extern void ql_dump_buffer(uint32_t, scsi_qla_host_t *, int32_t,
+-			   uint8_t *, uint32_t);
+ extern void qla2xxx_dump_post_process(scsi_qla_host_t *, int);
+-
++extern void ql_dump_regs(uint, scsi_qla_host_t *, uint);
++extern void ql_dump_buffer(uint, scsi_qla_host_t *, uint, void *, uint);
+ /*
+  * Global Function Prototypes in qla_gs.c source file.
+  */
+diff --git a/drivers/scsi/qla2xxx/qla_gs.c b/drivers/scsi/qla2xxx/qla_gs.c
+index c63c6062b326..e0efde38f8d8 100644
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@ -152,8 +152,8 @@ qla2x00_chk_ms_status(scsi_qla_host_t *vha, ms_iocb_entry_t *ms_pkt,
+ 				    vha->d_id.b.area, vha->d_id.b.al_pa,
+ 				    comp_status, ct_rsp->header.response);
+ 				ql_dump_buffer(ql_dbg_disc + ql_dbg_buffer, vha,
+-				    0x2078, (uint8_t *)&ct_rsp->header,
+-				    sizeof(struct ct_rsp_hdr));
++				    0x2078, ct_rsp,
++				    offsetof(typeof(*ct_rsp), rsp));
+ 				rval = QLA_INVALID_COMMAND;
+ 			} else
+ 				rval = QLA_SUCCESS;
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index ae69f3c45259..a9ccd2f42b0e 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -1371,7 +1371,7 @@ qla2x00_mbx_iocb_entry(scsi_qla_host_t *vha, struct req_que *req,
+ 		    le16_to_cpu(mbx->status_flags));
+ 
+ 		ql_dump_buffer(ql_dbg_async + ql_dbg_buffer, vha, 0x5029,
+-		    (uint8_t *)mbx, sizeof(*mbx));
++		    mbx, sizeof(*mbx));
+ 
+ 		goto logio_done;
+ 	}
+@@ -1515,7 +1515,7 @@ qla2x00_ct_entry(scsi_qla_host_t *vha, struct req_que *req,
+ 			    bsg_reply->reply_payload_rcv_len = 0;
+ 		    }
+ 		    ql_dump_buffer(ql_dbg_async + ql_dbg_buffer, vha, 0x5035,
+-			(uint8_t *)pkt, sizeof(*pkt));
++			pkt, sizeof(*pkt));
+ 	    } else {
+ 		    res = DID_OK << 16;
+ 		    bsg_reply->reply_payload_rcv_len =
+@@ -1655,7 +1655,7 @@ qla24xx_els_ct_entry(scsi_qla_host_t *vha, struct req_que *req,
+ 		memcpy(bsg_job->reply + sizeof(struct fc_bsg_reply),
+ 		       fw_status, sizeof(fw_status));
+ 		ql_dump_buffer(ql_dbg_user + ql_dbg_buffer, vha, 0x5056,
+-				(uint8_t *)pkt, sizeof(*pkt));
++		    pkt, sizeof(*pkt));
+ 	}
+ 	else {
+ 		res =  DID_OK << 16;
+@@ -1699,7 +1699,7 @@ qla24xx_logio_entry(scsi_qla_host_t *vha, struct req_que *req,
+ 		    fcport->d_id.b.area, fcport->d_id.b.al_pa,
+ 		    logio->entry_status);
+ 		ql_dump_buffer(ql_dbg_async + ql_dbg_buffer, vha, 0x504d,
+-		    (uint8_t *)logio, sizeof(*logio));
++		    logio, sizeof(*logio));
+ 
+ 		goto logio_done;
+ 	}
+@@ -1845,8 +1845,8 @@ qla24xx_tm_iocb_entry(scsi_qla_host_t *vha, struct req_que *req, void *tsk)
+ 	}
+ 
+ 	if (iocb->u.tmf.data != QLA_SUCCESS)
+-		ql_dump_buffer(ql_dbg_async + ql_dbg_buffer, vha, 0x5055,
+-		    (uint8_t *)sts, sizeof(*sts));
++		ql_dump_buffer(ql_dbg_async + ql_dbg_buffer, sp->vha, 0x5055,
++		    sts, sizeof(*sts));
+ 
+ 	sp->done(sp, 0);
+ }
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 65b8016b6102..8b74eb0038cb 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -1793,8 +1793,18 @@ qla2x00_init_firmware(scsi_qla_host_t *vha, uint16_t size)
+ 	if (rval != QLA_SUCCESS) {
+ 		/*EMPTY*/
+ 		ql_dbg(ql_dbg_mbx, vha, 0x104d,
+-		    "Failed=%x mb[0]=%x, mb[1]=%x, mb[2]=%x, mb[3]=%x,.\n",
++		    "Failed=%x mb[0]=%x, mb[1]=%x, mb[2]=%x, mb[3]=%x.\n",
+ 		    rval, mcp->mb[0], mcp->mb[1], mcp->mb[2], mcp->mb[3]);
++		if (ha->init_cb) {
++			ql_dbg(ql_dbg_mbx, vha, 0x104d, "init_cb:\n");
++			ql_dump_buffer(ql_dbg_init + ql_dbg_verbose, vha,
++			    0x0104d, ha->init_cb, sizeof(*ha->init_cb));
++		}
++		if (ha->ex_init_cb && ha->ex_init_cb->ex_version) {
++			ql_dbg(ql_dbg_mbx, vha, 0x104d, "ex_init_cb:\n");
++			ql_dump_buffer(ql_dbg_init + ql_dbg_verbose, vha,
++			    0x0104d, ha->ex_init_cb, sizeof(*ha->ex_init_cb));
++		}
+ 	} else {
+ 		if (IS_QLA27XX(ha)) {
+ 			if (mcp->mb[2] == 6 || mcp->mb[3] == 2)
+@@ -4184,7 +4194,7 @@ qla84xx_verify_chip(struct scsi_qla_host *vha, uint16_t *status)
+ 		ql_dbg(ql_dbg_mbx + ql_dbg_buffer, vha, 0x111c,
+ 		    "Dump of Verify Request.\n");
+ 		ql_dump_buffer(ql_dbg_mbx + ql_dbg_buffer, vha, 0x111e,
+-		    (uint8_t *)mn, sizeof(*mn));
++		    mn, sizeof(*mn));
+ 
+ 		rval = qla2x00_issue_iocb_timeout(vha, mn, mn_dma, 0, 120);
+ 		if (rval != QLA_SUCCESS) {
+@@ -4196,7 +4206,7 @@ qla84xx_verify_chip(struct scsi_qla_host *vha, uint16_t *status)
+ 		ql_dbg(ql_dbg_mbx + ql_dbg_buffer, vha, 0x1110,
+ 		    "Dump of Verify Response.\n");
+ 		ql_dump_buffer(ql_dbg_mbx + ql_dbg_buffer, vha, 0x1118,
+-		    (uint8_t *)mn, sizeof(*mn));
++		    mn, sizeof(*mn));
+ 
+ 		status[0] = le16_to_cpu(mn->p.rsp.comp_status);
+ 		status[1] = status[0] == CS_VCS_CHIP_FAILURE ?
+diff --git a/drivers/scsi/qla2xxx/qla_mr.c b/drivers/scsi/qla2xxx/qla_mr.c
+index 60f964c53c01..b628dcc2cc4a 100644
+--- a/drivers/scsi/qla2xxx/qla_mr.c
++++ b/drivers/scsi/qla2xxx/qla_mr.c
+@@ -1138,8 +1138,8 @@ qlafx00_find_all_targets(scsi_qla_host_t *vha,
+ 
+ 	ql_dbg(ql_dbg_disc + ql_dbg_init, vha, 0x2088,
+ 	    "Listing Target bit map...\n");
+-	ql_dump_buffer(ql_dbg_disc + ql_dbg_init, vha,
+-	    0x2089, (uint8_t *)ha->gid_list, 32);
++	ql_dump_buffer(ql_dbg_disc + ql_dbg_init, vha, 0x2089,
++	    ha->gid_list, 32);
+ 
+ 	/* Allocate temporary rmtport for any new rmtports discovered. */
+ 	new_fcport = qla2x00_alloc_fcport(vha, GFP_KERNEL);
+@@ -1913,8 +1913,7 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
+ 			    phost_info->domainname,
+ 			    phost_info->hostdriver);
+ 			ql_dump_buffer(ql_dbg_init + ql_dbg_disc, vha, 0x014d,
+-			    (uint8_t *)phost_info,
+-			    sizeof(struct host_system_info));
++			    phost_info, sizeof(*phost_info));
+ 		}
+ 	}
+ 
+@@ -1968,7 +1967,7 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
+ 		vha->d_id.b.al_pa = pinfo->port_id[2];
+ 		qlafx00_update_host_attr(vha, pinfo);
+ 		ql_dump_buffer(ql_dbg_init + ql_dbg_buffer, vha, 0x0141,
+-		    (uint8_t *)pinfo, 16);
++		    pinfo, 16);
+ 	} else if (fx_type == FXDISC_GET_TGT_NODE_INFO) {
+ 		struct qlafx00_tgt_node_info *pinfo =
+ 		    (struct qlafx00_tgt_node_info *) fdisc->u.fxiocb.rsp_addr;
+@@ -1976,12 +1975,12 @@ qlafx00_fx_disc(scsi_qla_host_t *vha, fc_port_t *fcport, uint16_t fx_type)
+ 		memcpy(fcport->port_name, pinfo->tgt_node_wwpn, WWN_SIZE);
+ 		fcport->port_type = FCT_TARGET;
+ 		ql_dump_buffer(ql_dbg_init + ql_dbg_buffer, vha, 0x0144,
+-		    (uint8_t *)pinfo, 16);
++		    pinfo, 16);
+ 	} else if (fx_type == FXDISC_GET_TGT_NODE_LIST) {
+ 		struct qlafx00_tgt_node_info *pinfo =
+ 		    (struct qlafx00_tgt_node_info *) fdisc->u.fxiocb.rsp_addr;
+ 		ql_dump_buffer(ql_dbg_init + ql_dbg_buffer, vha, 0x0146,
+-		    (uint8_t *)pinfo, 16);
++		    pinfo, 16);
+ 		memcpy(vha->hw->gid_list, pinfo, QLAFX00_TGT_NODE_LIST_SIZE);
+ 	} else if (fx_type == FXDISC_ABORT_IOCTL)
+ 		fdisc->u.fxiocb.result =
+@@ -2248,18 +2247,16 @@ qlafx00_ioctl_iosb_entry(scsi_qla_host_t *vha, struct req_que *req,
+ 
+ 		fw_sts_ptr = bsg_job->reply + sizeof(struct fc_bsg_reply);
+ 
+-		memcpy(fw_sts_ptr, (uint8_t *)&fstatus,
+-		    sizeof(struct qla_mt_iocb_rsp_fx00));
++		memcpy(fw_sts_ptr, &fstatus, sizeof(fstatus));
+ 		bsg_job->reply_len = sizeof(struct fc_bsg_reply) +
+ 			sizeof(struct qla_mt_iocb_rsp_fx00) + sizeof(uint8_t);
+ 
+ 		ql_dump_buffer(ql_dbg_user + ql_dbg_verbose,
+-		    sp->fcport->vha, 0x5080,
+-		    (uint8_t *)pkt, sizeof(struct ioctl_iocb_entry_fx00));
++		    sp->vha, 0x5080, pkt, sizeof(*pkt));
+ 
+ 		ql_dump_buffer(ql_dbg_user + ql_dbg_verbose,
+-		    sp->fcport->vha, 0x5074,
+-		    (uint8_t *)fw_sts_ptr, sizeof(struct qla_mt_iocb_rsp_fx00));
++		    sp->vha, 0x5074,
++		    fw_sts_ptr, sizeof(fstatus));
+ 
+ 		res = bsg_reply->result = DID_OK << 16;
+ 		bsg_reply->reply_payload_rcv_len =
+@@ -2597,7 +2594,7 @@ qlafx00_status_cont_entry(struct rsp_que *rsp, sts_cont_entry_t *pkt)
+ 
+ 		/* Move sense data. */
+ 		ql_dump_buffer(ql_dbg_io + ql_dbg_buffer, vha, 0x304e,
+-		    (uint8_t *)pkt, sizeof(sts_cont_entry_t));
++		    pkt, sizeof(*pkt));
+ 		memcpy(sense_ptr, pkt->data, sense_sz);
+ 		ql_dump_buffer(ql_dbg_io + ql_dbg_buffer, vha, 0x304a,
+ 		    sense_ptr, sense_sz);
+@@ -3056,13 +3053,13 @@ qlafx00_build_scsi_iocbs(srb_t *sp, struct cmd_type_7_fx00 *cmd_pkt,
+ 		if (avail_dsds == 0 && cont == 1) {
+ 			cont = 0;
+ 			memcpy_toio((void __iomem *)cont_pkt, &lcont_pkt,
+-			    REQUEST_ENTRY_SIZE);
++			    sizeof(lcont_pkt));
+ 		}
+ 
+ 	}
+ 	if (avail_dsds != 0 && cont == 1) {
+ 		memcpy_toio((void __iomem *)cont_pkt, &lcont_pkt,
+-		    REQUEST_ENTRY_SIZE);
++		    sizeof(lcont_pkt));
+ 	}
+ }
+ 
+@@ -3172,9 +3169,9 @@ qlafx00_start_scsi(srb_t *sp)
+ 	lcmd_pkt.entry_status = (uint8_t) rsp->id;
+ 
+ 	ql_dump_buffer(ql_dbg_io + ql_dbg_buffer, vha, 0x302e,
+-	    (uint8_t *)cmd->cmnd, cmd->cmd_len);
++	    cmd->cmnd, cmd->cmd_len);
+ 	ql_dump_buffer(ql_dbg_io + ql_dbg_buffer, vha, 0x3032,
+-	    (uint8_t *)&lcmd_pkt, REQUEST_ENTRY_SIZE);
++	    &lcmd_pkt, sizeof(lcmd_pkt));
+ 
+ 	memcpy_toio((void __iomem *)cmd_pkt, &lcmd_pkt, REQUEST_ENTRY_SIZE);
+ 	wmb();
+@@ -3454,10 +3451,8 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
+ 	}
+ 
+ 	ql_dump_buffer(ql_dbg_user + ql_dbg_verbose,
+-	    sp->vha, 0x3047,
+-	    (uint8_t *)&fx_iocb, sizeof(struct fxdisc_entry_fx00));
++	    sp->vha, 0x3047, &fx_iocb, sizeof(fx_iocb));
+ 
+-	memcpy_toio((void __iomem *)pfxiocb, &fx_iocb,
+-	    sizeof(struct fxdisc_entry_fx00));
++	memcpy_toio((void __iomem *)pfxiocb, &fx_iocb, sizeof(fx_iocb));
+ 	wmb();
+ }
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 9af7817f8d01..f9333d7837a2 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -40,7 +40,7 @@ static struct kmem_cache *ctx_cachep;
+ /*
+  * error level for logging
+  */
+-int ql_errlev = ql_log_all;
++uint ql_errlev = ql_log_all;
+ 
+ static int ql2xenableclass2;
+ module_param(ql2xenableclass2, int, S_IRUGO|S_IRUSR);
+diff --git a/drivers/scsi/qla2xxx/qla_sup.c b/drivers/scsi/qla2xxx/qla_sup.c
+index 2a3055c799fb..6f29f8254bd9 100644
+--- a/drivers/scsi/qla2xxx/qla_sup.c
++++ b/drivers/scsi/qla2xxx/qla_sup.c
+@@ -616,7 +616,7 @@ qla2xxx_find_flt_start(scsi_qla_host_t *vha, uint32_t *start)
+ 		ql_log(ql_log_fatal, vha, 0x0045,
+ 		    "Inconsistent FLTL detected: checksum=0x%x.\n", chksum);
+ 		ql_dump_buffer(ql_dbg_init + ql_dbg_buffer, vha, 0x010e,
+-		    buf, sizeof(struct qla_flt_location));
++		    fltl, sizeof(*fltl));
+ 		return QLA_FUNCTION_FAILED;
+ 	}
+ 
+@@ -718,12 +718,12 @@ qla2xxx_get_flt_info(scsi_qla_host_t *vha, uint32_t flt_addr)
+ 		/* Store addresses as DWORD offsets. */
+ 		start = le32_to_cpu(region->start) >> 2;
+ 		ql_dbg(ql_dbg_init, vha, 0x0049,
+-		    "FLT[%02x]: start=0x%x "
+-		    "end=0x%x size=0x%x.\n", le32_to_cpu(region->code) & 0xff,
++		    "FLT[%#x]: start=%#x end=%#x size=%#x.\n",
++		    le16_to_cpu(region->code),
+ 		    start, le32_to_cpu(region->end) >> 2,
+ 		    le32_to_cpu(region->size));
+ 
+-		switch (le32_to_cpu(region->code) & 0xff) {
++		switch (le16_to_cpu(region->code)) {
+ 		case FLT_REG_FCOE_FW:
+ 			if (!IS_QLA8031(ha))
+ 				break;
+@@ -938,7 +938,7 @@ qla2xxx_get_fdt_info(scsi_qla_host_t *vha)
+ 		    " checksum=0x%x id=%c version0x%x.\n", chksum,
+ 		    fdt->sig[0], le16_to_cpu(fdt->version));
+ 		ql_dump_buffer(ql_dbg_init + ql_dbg_buffer, vha, 0x0113,
+-		    (uint8_t *)fdt, sizeof(*fdt));
++		    fdt, sizeof(*fdt));
+ 		goto no_flash_data;
+ 	}
+ 
+@@ -2874,7 +2874,7 @@ qla2x00_get_flash_version(scsi_qla_host_t *vha, void *mbuf)
+ 		    "Dumping fw "
+ 		    "ver from flash:.\n");
+ 		ql_dump_buffer(ql_dbg_init + ql_dbg_buffer, vha, 0x010b,
+-		    (uint8_t *)dbyte, 8);
++		    dbyte, 8);
+ 
+ 		if ((dcode[0] == 0xffff && dcode[1] == 0xffff &&
+ 		    dcode[2] == 0xffff && dcode[3] == 0xffff) ||
+@@ -3123,24 +3123,16 @@ qla24xx_get_flash_version(scsi_qla_host_t *vha, void *mbuf)
+ 	    qla27xx_find_valid_image(vha) == QLA27XX_SECONDARY_IMAGE)
+ 		faddr = ha->flt_region_fw_sec;
+ 
+-	qla24xx_read_flash_data(vha, dcode, faddr + 4, 4);
+-	for (i = 0; i < 4; i++)
+-		dcode[i] = be32_to_cpu(dcode[i]);
+-
+-	if ((dcode[0] == 0xffffffff && dcode[1] == 0xffffffff &&
+-	    dcode[2] == 0xffffffff && dcode[3] == 0xffffffff) ||
+-	    (dcode[0] == 0 && dcode[1] == 0 && dcode[2] == 0 &&
+-	    dcode[3] == 0)) {
++	qla24xx_read_flash_data(vha, dcode, faddr, 8);
++	if (qla24xx_risc_firmware_invalid(dcode)) {
+ 		ql_log(ql_log_warn, vha, 0x005f,
+ 		    "Unrecognized fw revision at %x.\n",
+ 		    ha->flt_region_fw * 4);
+ 	} else {
+-		ha->fw_revision[0] = dcode[0];
+-		ha->fw_revision[1] = dcode[1];
+-		ha->fw_revision[2] = dcode[2];
+-		ha->fw_revision[3] = dcode[3];
++		for (i = 0; i < 4; i++)
++			ha->fw_revision[i] = be32_to_cpu(dcode[4+i]);
+ 		ql_dbg(ql_dbg_init, vha, 0x0060,
+-		    "Firmware revision %d.%d.%d (%x).\n",
++		    "Firmware revision (flash) %d.%d.%d (%x).\n",
+ 		    ha->fw_revision[0], ha->fw_revision[1],
+ 		    ha->fw_revision[2], ha->fw_revision[3]);
+ 	}
+@@ -3153,19 +3145,16 @@ qla24xx_get_flash_version(scsi_qla_host_t *vha, void *mbuf)
+ 
+ 	memset(ha->gold_fw_version, 0, sizeof(ha->gold_fw_version));
+ 	dcode = mbuf;
+-	ha->isp_ops->read_optrom(vha, (uint8_t *)dcode,
+-	    ha->flt_region_gold_fw << 2, 32);
+-
+-	if (dcode[4] == 0xFFFFFFFF && dcode[5] == 0xFFFFFFFF &&
+-	    dcode[6] == 0xFFFFFFFF && dcode[7] == 0xFFFFFFFF) {
++	qla24xx_read_flash_data(vha, dcode, ha->flt_region_gold_fw, 8);
++	if (qla24xx_risc_firmware_invalid(dcode)) {
+ 		ql_log(ql_log_warn, vha, 0x0056,
+ 		    "Unrecognized golden fw at 0x%x.\n",
+ 		    ha->flt_region_gold_fw * 4);
+ 		return ret;
+ 	}
+ 
+-	for (i = 4; i < 8; i++)
+-		ha->gold_fw_version[i-4] = be32_to_cpu(dcode[i]);
++	for (i = 0; i < 4; i++)
++		ha->gold_fw_version[i] = be32_to_cpu(dcode[4+i]);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/scsi/qla2xxx/qla_tmpl.c b/drivers/scsi/qla2xxx/qla_tmpl.c
+index 70f227f59050..c6a09d368733 100644
+--- a/drivers/scsi/qla2xxx/qla_tmpl.c
++++ b/drivers/scsi/qla2xxx/qla_tmpl.c
+@@ -134,7 +134,7 @@ qla27xx_skip_entry(struct qla27xx_fwdt_entry *ent, void *buf)
+ static inline struct qla27xx_fwdt_entry *
+ qla27xx_next_entry(struct qla27xx_fwdt_entry *ent)
+ {
+-	return (void *)ent + ent->hdr.size;
++	return (void *)ent + le32_to_cpu(ent->hdr.size);
+ }
+ 
+ static struct qla27xx_fwdt_entry *
+@@ -165,11 +165,14 @@ qla27xx_fwdt_entry_t256(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	ulong addr = le32_to_cpu(ent->t256.base_addr);
++	uint offset = ent->t256.pci_offset;
++	ulong count = le16_to_cpu(ent->t256.reg_count);
++	uint width = ent->t256.reg_width;
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd200,
+ 	    "%s: rdio t1 [%lx]\n", __func__, *len);
+-	qla27xx_read_window(reg, ent->t256.base_addr, ent->t256.pci_offset,
+-	    ent->t256.reg_count, ent->t256.reg_width, buf, len);
++	qla27xx_read_window(reg, addr, offset, count, width, buf, len);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -179,11 +182,14 @@ qla27xx_fwdt_entry_t257(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	ulong addr = le32_to_cpu(ent->t257.base_addr);
++	uint offset = ent->t257.pci_offset;
++	ulong data = le32_to_cpu(ent->t257.write_data);
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd201,
+ 	    "%s: wrio t1 [%lx]\n", __func__, *len);
+-	qla27xx_write_reg(reg, IOBASE_ADDR, ent->t257.base_addr, buf);
+-	qla27xx_write_reg(reg, ent->t257.pci_offset, ent->t257.write_data, buf);
++	qla27xx_write_reg(reg, IOBASE(reg), addr, buf);
++	qla27xx_write_reg(reg, offset, data, buf);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -193,12 +199,17 @@ qla27xx_fwdt_entry_t258(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	uint banksel = ent->t258.banksel_offset;
++	ulong bank = le32_to_cpu(ent->t258.bank);
++	ulong addr = le32_to_cpu(ent->t258.base_addr);
++	uint offset = ent->t258.pci_offset;
++	uint count = le16_to_cpu(ent->t258.reg_count);
++	uint width = ent->t258.reg_width;
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd202,
+ 	    "%s: rdio t2 [%lx]\n", __func__, *len);
+-	qla27xx_write_reg(reg, ent->t258.banksel_offset, ent->t258.bank, buf);
+-	qla27xx_read_window(reg, ent->t258.base_addr, ent->t258.pci_offset,
+-	    ent->t258.reg_count, ent->t258.reg_width, buf, len);
++	qla27xx_write_reg(reg, banksel, bank, buf);
++	qla27xx_read_window(reg, addr, offset, count, width, buf, len);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -208,12 +219,17 @@ qla27xx_fwdt_entry_t259(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	ulong addr = le32_to_cpu(ent->t259.base_addr);
++	uint banksel = ent->t259.banksel_offset;
++	ulong bank = le32_to_cpu(ent->t259.bank);
++	uint offset = ent->t259.pci_offset;
++	ulong data = le32_to_cpu(ent->t259.write_data);
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd203,
+ 	    "%s: wrio t2 [%lx]\n", __func__, *len);
+-	qla27xx_write_reg(reg, IOBASE_ADDR, ent->t259.base_addr, buf);
+-	qla27xx_write_reg(reg, ent->t259.banksel_offset, ent->t259.bank, buf);
+-	qla27xx_write_reg(reg, ent->t259.pci_offset, ent->t259.write_data, buf);
++	qla27xx_write_reg(reg, IOBASE(reg), addr, buf);
++	qla27xx_write_reg(reg, banksel, bank, buf);
++	qla27xx_write_reg(reg, offset, data, buf);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -223,11 +239,12 @@ qla27xx_fwdt_entry_t260(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	uint offset = ent->t260.pci_offset;
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd204,
+ 	    "%s: rdpci [%lx]\n", __func__, *len);
+-	qla27xx_insert32(ent->t260.pci_offset, buf, len);
+-	qla27xx_read_reg(reg, ent->t260.pci_offset, buf, len);
++	qla27xx_insert32(offset, buf, len);
++	qla27xx_read_reg(reg, offset, buf, len);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -237,10 +254,12 @@ qla27xx_fwdt_entry_t261(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	uint offset = ent->t261.pci_offset;
++	ulong data = le32_to_cpu(ent->t261.write_data);
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd205,
+ 	    "%s: wrpci [%lx]\n", __func__, *len);
+-	qla27xx_write_reg(reg, ent->t261.pci_offset, ent->t261.write_data, buf);
++	qla27xx_write_reg(reg, offset, data, buf);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -249,51 +268,50 @@ static struct qla27xx_fwdt_entry *
+ qla27xx_fwdt_entry_t262(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
++	uint area = ent->t262.ram_area;
++	ulong start = le32_to_cpu(ent->t262.start_addr);
++	ulong end = le32_to_cpu(ent->t262.end_addr);
+ 	ulong dwords;
+-	ulong start;
+-	ulong end;
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd206,
+ 	    "%s: rdram(%x) [%lx]\n", __func__, ent->t262.ram_area, *len);
+-	start = ent->t262.start_addr;
+-	end = ent->t262.end_addr;
+ 
+-	if (ent->t262.ram_area == T262_RAM_AREA_CRITICAL_RAM) {
++	if (area == T262_RAM_AREA_CRITICAL_RAM) {
+ 		;
+-	} else if (ent->t262.ram_area == T262_RAM_AREA_EXTERNAL_RAM) {
++	} else if (area == T262_RAM_AREA_EXTERNAL_RAM) {
+ 		end = vha->hw->fw_memory_size;
+ 		if (buf)
+-			ent->t262.end_addr = end;
+-	} else if (ent->t262.ram_area == T262_RAM_AREA_SHARED_RAM) {
++			ent->t262.end_addr = cpu_to_le32(end);
++	} else if (area == T262_RAM_AREA_SHARED_RAM) {
+ 		start = vha->hw->fw_shared_ram_start;
+ 		end = vha->hw->fw_shared_ram_end;
+ 		if (buf) {
+-			ent->t262.start_addr = start;
+-			ent->t262.end_addr = end;
++			ent->t262.start_addr = cpu_to_le32(start);
++			ent->t262.end_addr = cpu_to_le32(end);
+ 		}
+-	} else if (ent->t262.ram_area == T262_RAM_AREA_DDR_RAM) {
++	} else if (area == T262_RAM_AREA_DDR_RAM) {
+ 		start = vha->hw->fw_ddr_ram_start;
+ 		end = vha->hw->fw_ddr_ram_end;
+ 		if (buf) {
+-			ent->t262.start_addr = start;
+-			ent->t262.end_addr = end;
++			ent->t262.start_addr = cpu_to_le32(start);
++			ent->t262.end_addr = cpu_to_le32(end);
+ 		}
+-	} else if (ent->t262.ram_area == T262_RAM_AREA_MISC) {
++	} else if (area == T262_RAM_AREA_MISC) {
+ 		if (buf) {
+-			ent->t262.start_addr = start;
+-			ent->t262.end_addr = end;
++			ent->t262.start_addr = cpu_to_le32(start);
++			ent->t262.end_addr = cpu_to_le32(end);
+ 		}
+ 	} else {
+ 		ql_dbg(ql_dbg_misc, vha, 0xd022,
+-		    "%s: unknown area %x\n", __func__, ent->t262.ram_area);
++		    "%s: unknown area %x\n", __func__, area);
+ 		qla27xx_skip_entry(ent, buf);
+ 		goto done;
+ 	}
+ 
+ 	if (end < start || start == 0 || end == 0) {
+ 		ql_dbg(ql_dbg_misc, vha, 0xd023,
+-		    "%s: unusable range (start=%x end=%x)\n", __func__,
+-		    ent->t262.end_addr, ent->t262.start_addr);
++		    "%s: unusable range (start=%lx end=%lx)\n",
++		    __func__, start, end);
+ 		qla27xx_skip_entry(ent, buf);
+ 		goto done;
+ 	}
+@@ -312,13 +330,14 @@ static struct qla27xx_fwdt_entry *
+ qla27xx_fwdt_entry_t263(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
++	uint type = ent->t263.queue_type;
+ 	uint count = 0;
+ 	uint i;
+ 	uint length;
+ 
+-	ql_dbg(ql_dbg_misc, vha, 0xd207,
+-	    "%s: getq(%x) [%lx]\n", __func__, ent->t263.queue_type, *len);
+-	if (ent->t263.queue_type == T263_QUEUE_TYPE_REQ) {
++	ql_dbg(ql_dbg_misc + ql_dbg_verbose, vha, 0xd207,
++	    "%s: getq(%x) [%lx]\n", __func__, type, *len);
++	if (type == T263_QUEUE_TYPE_REQ) {
+ 		for (i = 0; i < vha->hw->max_req_queues; i++) {
+ 			struct req_que *req = vha->hw->req_q_map[i];
+ 
+@@ -332,7 +351,7 @@ qla27xx_fwdt_entry_t263(struct scsi_qla_host *vha,
+ 				count++;
+ 			}
+ 		}
+-	} else if (ent->t263.queue_type == T263_QUEUE_TYPE_RSP) {
++	} else if (type == T263_QUEUE_TYPE_RSP) {
+ 		for (i = 0; i < vha->hw->max_rsp_queues; i++) {
+ 			struct rsp_que *rsp = vha->hw->rsp_q_map[i];
+ 
+@@ -360,7 +379,7 @@ qla27xx_fwdt_entry_t263(struct scsi_qla_host *vha,
+ 		}
+ 	} else {
+ 		ql_dbg(ql_dbg_misc, vha, 0xd026,
+-		    "%s: unknown queue %x\n", __func__, ent->t263.queue_type);
++		    "%s: unknown queue %x\n", __func__, type);
+ 		qla27xx_skip_entry(ent, buf);
+ 	}
+ 
+@@ -433,10 +452,12 @@ qla27xx_fwdt_entry_t267(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	uint offset = ent->t267.pci_offset;
++	ulong data = le32_to_cpu(ent->t267.data);
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd20b,
+ 	    "%s: dis intr [%lx]\n", __func__, *len);
+-	qla27xx_write_reg(reg, ent->t267.pci_offset, ent->t267.data, buf);
++	qla27xx_write_reg(reg, offset, data, buf);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -533,8 +554,8 @@ qla27xx_fwdt_entry_t270(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
+-	ulong dwords = ent->t270.count;
+-	ulong addr = ent->t270.addr;
++	ulong addr = le32_to_cpu(ent->t270.addr);
++	ulong dwords = le32_to_cpu(ent->t270.count);
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd20e,
+ 	    "%s: rdremreg [%lx]\n", __func__, *len);
+@@ -554,8 +575,8 @@ qla27xx_fwdt_entry_t271(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
+-	ulong addr = ent->t271.addr;
+-	ulong data = ent->t271.data;
++	ulong addr = le32_to_cpu(ent->t271.addr);
++	ulong data = le32_to_cpu(ent->t271.data);
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd20f,
+ 	    "%s: wrremreg [%lx]\n", __func__, *len);
+@@ -570,8 +591,8 @@ static struct qla27xx_fwdt_entry *
+ qla27xx_fwdt_entry_t272(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+-	ulong dwords = ent->t272.count;
+-	ulong start = ent->t272.addr;
++	ulong dwords = le32_to_cpu(ent->t272.count);
++	ulong start = le32_to_cpu(ent->t272.addr);
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd210,
+ 	    "%s: rdremram [%lx]\n", __func__, *len);
+@@ -590,8 +611,8 @@ static struct qla27xx_fwdt_entry *
+ qla27xx_fwdt_entry_t273(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+-	ulong dwords = ent->t273.count;
+-	ulong addr = ent->t273.addr;
++	ulong dwords = le32_to_cpu(ent->t273.count);
++	ulong addr = le32_to_cpu(ent->t273.addr);
+ 	uint32_t value;
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd211,
+@@ -613,12 +634,13 @@ static struct qla27xx_fwdt_entry *
+ qla27xx_fwdt_entry_t274(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
++	ulong type = ent->t274.queue_type;
+ 	uint count = 0;
+ 	uint i;
+ 
+-	ql_dbg(ql_dbg_misc, vha, 0xd212,
+-	    "%s: getqsh(%x) [%lx]\n", __func__, ent->t274.queue_type, *len);
+-	if (ent->t274.queue_type == T274_QUEUE_TYPE_REQ_SHAD) {
++	ql_dbg(ql_dbg_misc + ql_dbg_verbose, vha, 0xd212,
++	    "%s: getqsh(%lx) [%lx]\n", __func__, type, *len);
++	if (type == T274_QUEUE_TYPE_REQ_SHAD) {
+ 		for (i = 0; i < vha->hw->max_req_queues; i++) {
+ 			struct req_que *req = vha->hw->req_q_map[i];
+ 
+@@ -630,7 +652,7 @@ qla27xx_fwdt_entry_t274(struct scsi_qla_host *vha,
+ 				count++;
+ 			}
+ 		}
+-	} else if (ent->t274.queue_type == T274_QUEUE_TYPE_RSP_SHAD) {
++	} else if (type == T274_QUEUE_TYPE_RSP_SHAD) {
+ 		for (i = 0; i < vha->hw->max_rsp_queues; i++) {
+ 			struct rsp_que *rsp = vha->hw->rsp_q_map[i];
+ 
+@@ -656,7 +678,7 @@ qla27xx_fwdt_entry_t274(struct scsi_qla_host *vha,
+ 		}
+ 	} else {
+ 		ql_dbg(ql_dbg_misc, vha, 0xd02f,
+-		    "%s: unknown queue %x\n", __func__, ent->t274.queue_type);
++		    "%s: unknown queue %lx\n", __func__, type);
+ 		qla27xx_skip_entry(ent, buf);
+ 	}
+ 
+@@ -675,23 +697,26 @@ qla27xx_fwdt_entry_t275(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	ulong offset = offsetof(typeof(*ent), t275.buffer);
++	ulong length = le32_to_cpu(ent->t275.length);
++	ulong size = le32_to_cpu(ent->hdr.size);
++	void *buffer = ent->t275.buffer;
+ 
+-	ql_dbg(ql_dbg_misc, vha, 0xd213,
+-	    "%s: buffer(%x) [%lx]\n", __func__, ent->t275.length, *len);
+-	if (!ent->t275.length) {
++	ql_dbg(ql_dbg_misc + ql_dbg_verbose, vha, 0xd213,
++	    "%s: buffer(%lx) [%lx]\n", __func__, length, *len);
++	if (!length) {
+ 		ql_dbg(ql_dbg_misc, vha, 0xd020,
+ 		    "%s: buffer zero length\n", __func__);
+ 		qla27xx_skip_entry(ent, buf);
+ 		goto done;
+ 	}
+-	if (offset + ent->t275.length > ent->hdr.size) {
++	if (offset + length > size) {
+ 		ql_dbg(ql_dbg_misc, vha, 0xd030,
+ 		    "%s: buffer overflow\n", __func__);
+ 		qla27xx_skip_entry(ent, buf);
+ 		goto done;
+ 	}
+ 
+-	qla27xx_insertbuf(ent->t275.buffer, ent->t275.length, buf, len);
++	qla27xx_insertbuf(buffer, length, buf, len);
+ done:
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -700,13 +725,15 @@ static struct qla27xx_fwdt_entry *
+ qla27xx_fwdt_entry_t276(struct scsi_qla_host *vha,
+     struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
++	ulong cond1 = le32_to_cpu(ent->t276.cond1);
++	ulong cond2 = le32_to_cpu(ent->t276.cond2);
+ 	uint type = vha->hw->pdev->device >> 4 & 0xf;
+ 	uint func = vha->hw->port_no & 0x3;
+ 
+ 	ql_dbg(ql_dbg_misc + ql_dbg_verbose, vha, 0xd214,
+ 	    "%s: cond [%lx]\n", __func__, *len);
+ 
+-	if (type != ent->t276.cond1 || func != ent->t276.cond2) {
++	if (type != cond1 || func != cond2) {
+ 		ent = qla27xx_next_entry(ent);
+ 		qla27xx_skip_entry(ent, buf);
+ 	}
+@@ -719,12 +746,15 @@ qla27xx_fwdt_entry_t277(struct scsi_qla_host *vha,
+     struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	ulong cmd_addr = le32_to_cpu(ent->t277.cmd_addr);
++	ulong wr_cmd_data = le32_to_cpu(ent->t277.wr_cmd_data);
++	ulong data_addr = le32_to_cpu(ent->t277.data_addr);
+ 
+ 	ql_dbg(ql_dbg_misc + ql_dbg_verbose, vha, 0xd215,
+ 	    "%s: rdpep [%lx]\n", __func__, *len);
+-	qla27xx_insert32(ent->t277.wr_cmd_data, buf, len);
+-	qla27xx_write_reg(reg, ent->t277.cmd_addr, ent->t277.wr_cmd_data, buf);
+-	qla27xx_read_reg(reg, ent->t277.data_addr, buf, len);
++	qla27xx_insert32(wr_cmd_data, buf, len);
++	qla27xx_write_reg(reg, cmd_addr, wr_cmd_data, buf);
++	qla27xx_read_reg(reg, data_addr, buf, len);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -734,11 +764,15 @@ qla27xx_fwdt_entry_t278(struct scsi_qla_host *vha,
+     struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
+ 	struct device_reg_24xx __iomem *reg = qla27xx_isp_reg(vha);
++	ulong cmd_addr = le32_to_cpu(ent->t278.cmd_addr);
++	ulong wr_cmd_data = le32_to_cpu(ent->t278.wr_cmd_data);
++	ulong data_addr = le32_to_cpu(ent->t278.data_addr);
++	ulong wr_data = le32_to_cpu(ent->t278.wr_data);
+ 
+ 	ql_dbg(ql_dbg_misc + ql_dbg_verbose, vha, 0xd216,
+ 	    "%s: wrpep [%lx]\n", __func__, *len);
+-	qla27xx_write_reg(reg, ent->t278.data_addr, ent->t278.wr_data, buf);
+-	qla27xx_write_reg(reg, ent->t278.cmd_addr, ent->t278.wr_cmd_data, buf);
++	qla27xx_write_reg(reg, data_addr, wr_data, buf);
++	qla27xx_write_reg(reg, cmd_addr, wr_cmd_data, buf);
+ 
+ 	return qla27xx_next_entry(ent);
+ }
+@@ -747,8 +781,10 @@ static struct qla27xx_fwdt_entry *
+ qla27xx_fwdt_entry_other(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_entry *ent, void *buf, ulong *len)
+ {
++	ulong type = le32_to_cpu(ent->hdr.type);
++
+ 	ql_dbg(ql_dbg_misc, vha, 0xd2ff,
+-	    "%s: type %x [%lx]\n", __func__, ent->hdr.type, *len);
++	    "%s: other %lx [%lx]\n", __func__, type, *len);
+ 	qla27xx_skip_entry(ent, buf);
+ 
+ 	return qla27xx_next_entry(ent);
+@@ -803,13 +839,16 @@ static void
+ qla27xx_walk_template(struct scsi_qla_host *vha,
+ 	struct qla27xx_fwdt_template *tmp, void *buf, ulong *len)
+ {
+-	struct qla27xx_fwdt_entry *ent = (void *)tmp + tmp->entry_offset;
+-	ulong count = tmp->entry_count;
++	struct qla27xx_fwdt_entry *ent = (void *)tmp +
++	    le32_to_cpu(tmp->entry_offset);
++	ulong count = le32_to_cpu(tmp->entry_count);
++	ulong type = 0;
+ 
+ 	ql_dbg(ql_dbg_misc, vha, 0xd01a,
+ 	    "%s: entry count %lx\n", __func__, count);
+ 	while (count--) {
+-		ent = qla27xx_find_entry(ent->hdr.type)(vha, ent, buf, len);
++		type = le32_to_cpu(ent->hdr.type);
++		ent = qla27xx_find_entry(type)(vha, ent, buf, len);
+ 		if (!ent)
+ 			break;
+ 	}
+@@ -879,13 +918,13 @@ ql27xx_edit_template(struct scsi_qla_host *vha,
+ static inline uint32_t
+ qla27xx_template_checksum(void *p, ulong size)
+ {
+-	uint32_t *buf = p;
++	__le32 *buf = p;
+ 	uint64_t sum = 0;
+ 
+ 	size /= sizeof(*buf);
+ 
+-	while (size--)
+-		sum += *buf++;
++	for ( ; size--; buf++)
++		sum += le32_to_cpu(*buf);
+ 
+ 	sum = (sum & 0xffffffff) + (sum >> 32);
+ 
+@@ -901,7 +940,7 @@ qla27xx_verify_template_checksum(struct qla27xx_fwdt_template *tmp)
+ static inline int
+ qla27xx_verify_template_header(struct qla27xx_fwdt_template *tmp)
+ {
+-	return tmp->template_type == TEMPLATE_TYPE_FWDUMP;
++	return le32_to_cpu(tmp->template_type) == TEMPLATE_TYPE_FWDUMP;
+ }
+ 
+ static void
+@@ -949,7 +988,8 @@ qla27xx_fwdt_template_valid(void *p)
+ 
+ 	if (!qla27xx_verify_template_header(tmp)) {
+ 		ql_log(ql_log_warn, NULL, 0xd01c,
+-		    "%s: template type %x\n", __func__, tmp->template_type);
++		    "%s: template type %x\n", __func__,
++		    le32_to_cpu(tmp->template_type));
+ 		return false;
+ 	}
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_tmpl.h b/drivers/scsi/qla2xxx/qla_tmpl.h
+index 5c2c2a8a19c4..6ce7fff014ee 100644
+--- a/drivers/scsi/qla2xxx/qla_tmpl.h
++++ b/drivers/scsi/qla2xxx/qla_tmpl.h
+@@ -11,12 +11,12 @@
+ #define IOBASE_ADDR	offsetof(struct device_reg_24xx, iobase_addr)
+ 
+ struct __packed qla27xx_fwdt_template {
+-	uint32_t template_type;
+-	uint32_t entry_offset;
++	__le32 template_type;
++	__le32 entry_offset;
+ 	uint32_t template_size;
+ 	uint32_t reserved_1;
+ 
+-	uint32_t entry_count;
++	__le32 entry_count;
+ 	uint32_t template_version;
+ 	uint32_t capture_timestamp;
+ 	uint32_t template_checksum;
+@@ -65,8 +65,8 @@ struct __packed qla27xx_fwdt_template {
+ 
+ struct __packed qla27xx_fwdt_entry {
+ 	struct __packed {
+-		uint32_t type;
+-		uint32_t size;
++		__le32 type;
++		__le32 size;
+ 		uint32_t reserved_1;
+ 
+ 		uint8_t  capture_flags;
+@@ -81,36 +81,36 @@ struct __packed qla27xx_fwdt_entry {
+ 		} t255;
+ 
+ 		struct __packed {
+-			uint32_t base_addr;
++			__le32 base_addr;
+ 			uint8_t  reg_width;
+-			uint16_t reg_count;
++			__le16 reg_count;
+ 			uint8_t  pci_offset;
+ 		} t256;
+ 
+ 		struct __packed {
+-			uint32_t base_addr;
+-			uint32_t write_data;
++			__le32 base_addr;
++			__le32 write_data;
+ 			uint8_t  pci_offset;
+ 			uint8_t  reserved[3];
+ 		} t257;
+ 
+ 		struct __packed {
+-			uint32_t base_addr;
++			__le32 base_addr;
+ 			uint8_t  reg_width;
+-			uint16_t reg_count;
++			__le16 reg_count;
+ 			uint8_t  pci_offset;
+ 			uint8_t  banksel_offset;
+ 			uint8_t  reserved[3];
+-			uint32_t bank;
++			__le32 bank;
+ 		} t258;
+ 
+ 		struct __packed {
+-			uint32_t base_addr;
+-			uint32_t write_data;
++			__le32 base_addr;
++			__le32 write_data;
+ 			uint8_t  reserved[2];
+ 			uint8_t  pci_offset;
+ 			uint8_t  banksel_offset;
+-			uint32_t bank;
++			__le32 bank;
+ 		} t259;
+ 
+ 		struct __packed {
+@@ -121,14 +121,14 @@ struct __packed qla27xx_fwdt_entry {
+ 		struct __packed {
+ 			uint8_t pci_offset;
+ 			uint8_t reserved[3];
+-			uint32_t write_data;
++			__le32 write_data;
+ 		} t261;
+ 
+ 		struct __packed {
+ 			uint8_t  ram_area;
+ 			uint8_t  reserved[3];
+-			uint32_t start_addr;
+-			uint32_t end_addr;
++			__le32 start_addr;
++			__le32 end_addr;
+ 		} t262;
+ 
+ 		struct __packed {
+@@ -158,7 +158,7 @@ struct __packed qla27xx_fwdt_entry {
+ 		struct __packed {
+ 			uint8_t  pci_offset;
+ 			uint8_t  reserved[3];
+-			uint32_t data;
++			__le32 data;
+ 		} t267;
+ 
+ 		struct __packed {
+@@ -173,23 +173,23 @@ struct __packed qla27xx_fwdt_entry {
+ 		} t269;
+ 
+ 		struct __packed {
+-			uint32_t addr;
+-			uint32_t count;
++			__le32 addr;
++			__le32 count;
+ 		} t270;
+ 
+ 		struct __packed {
+-			uint32_t addr;
+-			uint32_t data;
++			__le32 addr;
++			__le32 data;
+ 		} t271;
+ 
+ 		struct __packed {
+-			uint32_t addr;
+-			uint32_t count;
++			__le32 addr;
++			__le32 count;
+ 		} t272;
+ 
+ 		struct __packed {
+-			uint32_t addr;
+-			uint32_t count;
++			__le32 addr;
++			__le32 count;
+ 		} t273;
+ 
+ 		struct __packed {
+@@ -199,26 +199,26 @@ struct __packed qla27xx_fwdt_entry {
+ 		} t274;
+ 
+ 		struct __packed {
+-			uint32_t length;
++			__le32 length;
+ 			uint8_t  buffer[];
+ 		} t275;
+ 
+ 		struct __packed {
+-			uint32_t cond1;
+-			uint32_t cond2;
++			__le32 cond1;
++			__le32 cond2;
+ 		} t276;
+ 
+ 		struct __packed {
+-			uint32_t cmd_addr;
+-			uint32_t wr_cmd_data;
+-			uint32_t data_addr;
++			__le32 cmd_addr;
++			__le32 wr_cmd_data;
++			__le32 data_addr;
+ 		} t277;
+ 
+ 		struct __packed {
+-			uint32_t cmd_addr;
+-			uint32_t wr_cmd_data;
+-			uint32_t data_addr;
+-			uint32_t wr_data;
++			__le32 cmd_addr;
++			__le32 wr_cmd_data;
++			__le32 data_addr;
++			__le32 wr_data;
+ 		} t278;
+ 	};
+ };
