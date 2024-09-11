@@ -1,0 +1,174 @@
+Bluetooth: Add helper to set adv data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Daniel Winkler <danielwinkler@google.com>
+commit 31aab5c22e14c1c10110281d7f74b5e554f731b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/31aab5c2.failed
+
+We wish to handle advertising data separately from advertising
+parameters in our new MGMT requests. This change adds a helper that
+allows the advertising data and scan response to be updated for an
+existing advertising instance.
+
+	Reviewed-by: Sonny Sasaka <sonnysasaka@chromium.org>
+	Signed-off-by: Daniel Winkler <danielwinkler@google.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+	Signed-off-by: Johan Hedberg <johan.hedberg@intel.com>
+(cherry picked from commit 31aab5c22e14c1c10110281d7f74b5e554f731b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_core.c
+diff --cc net/bluetooth/hci_core.c
+index 0693dacbf6e3,46ec523d96a7..000000000000
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@@ -2995,6 -3005,127 +2995,130 @@@ int hci_add_adv_instance(struct hci_de
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This function requires the caller holds hdev->lock */
++ int hci_set_adv_instance_data(struct hci_dev *hdev, u8 instance,
++ 			      u16 adv_data_len, u8 *adv_data,
++ 			      u16 scan_rsp_len, u8 *scan_rsp_data)
++ {
++ 	struct adv_info *adv_instance;
++ 
++ 	adv_instance = hci_find_adv_instance(hdev, instance);
++ 
++ 	/* If advertisement doesn't exist, we can't modify its data */
++ 	if (!adv_instance)
++ 		return -ENOENT;
++ 
++ 	if (adv_data_len) {
++ 		memset(adv_instance->adv_data, 0,
++ 		       sizeof(adv_instance->adv_data));
++ 		memcpy(adv_instance->adv_data, adv_data, adv_data_len);
++ 		adv_instance->adv_data_len = adv_data_len;
++ 	}
++ 
++ 	if (scan_rsp_len) {
++ 		memset(adv_instance->scan_rsp_data, 0,
++ 		       sizeof(adv_instance->scan_rsp_data));
++ 		memcpy(adv_instance->scan_rsp_data,
++ 		       scan_rsp_data, scan_rsp_len);
++ 		adv_instance->scan_rsp_len = scan_rsp_len;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /* This function requires the caller holds hdev->lock */
++ void hci_adv_monitors_clear(struct hci_dev *hdev)
++ {
++ 	struct adv_monitor *monitor;
++ 	int handle;
++ 
++ 	idr_for_each_entry(&hdev->adv_monitors_idr, monitor, handle)
++ 		hci_free_adv_monitor(monitor);
++ 
++ 	idr_destroy(&hdev->adv_monitors_idr);
++ }
++ 
++ void hci_free_adv_monitor(struct adv_monitor *monitor)
++ {
++ 	struct adv_pattern *pattern;
++ 	struct adv_pattern *tmp;
++ 
++ 	if (!monitor)
++ 		return;
++ 
++ 	list_for_each_entry_safe(pattern, tmp, &monitor->patterns, list)
++ 		kfree(pattern);
++ 
++ 	kfree(monitor);
++ }
++ 
++ /* This function requires the caller holds hdev->lock */
++ int hci_add_adv_monitor(struct hci_dev *hdev, struct adv_monitor *monitor)
++ {
++ 	int min, max, handle;
++ 
++ 	if (!monitor)
++ 		return -EINVAL;
++ 
++ 	min = HCI_MIN_ADV_MONITOR_HANDLE;
++ 	max = HCI_MIN_ADV_MONITOR_HANDLE + HCI_MAX_ADV_MONITOR_NUM_HANDLES;
++ 	handle = idr_alloc(&hdev->adv_monitors_idr, monitor, min, max,
++ 			   GFP_KERNEL);
++ 	if (handle < 0)
++ 		return handle;
++ 
++ 	hdev->adv_monitors_cnt++;
++ 	monitor->handle = handle;
++ 
++ 	hci_update_background_scan(hdev);
++ 
++ 	return 0;
++ }
++ 
++ static int free_adv_monitor(int id, void *ptr, void *data)
++ {
++ 	struct hci_dev *hdev = data;
++ 	struct adv_monitor *monitor = ptr;
++ 
++ 	idr_remove(&hdev->adv_monitors_idr, monitor->handle);
++ 	hci_free_adv_monitor(monitor);
++ 	hdev->adv_monitors_cnt--;
++ 
++ 	return 0;
++ }
++ 
++ /* This function requires the caller holds hdev->lock */
++ int hci_remove_adv_monitor(struct hci_dev *hdev, u16 handle)
++ {
++ 	struct adv_monitor *monitor;
++ 
++ 	if (handle) {
++ 		monitor = idr_find(&hdev->adv_monitors_idr, handle);
++ 		if (!monitor)
++ 			return -ENOENT;
++ 
++ 		idr_remove(&hdev->adv_monitors_idr, monitor->handle);
++ 		hci_free_adv_monitor(monitor);
++ 		hdev->adv_monitors_cnt--;
++ 	} else {
++ 		/* Remove all monitors if handle is 0. */
++ 		idr_for_each(&hdev->adv_monitors_idr, &free_adv_monitor, hdev);
++ 	}
++ 
++ 	hci_update_background_scan(hdev);
++ 
++ 	return 0;
++ }
++ 
++ /* This function requires the caller holds hdev->lock */
++ bool hci_is_adv_monitoring(struct hci_dev *hdev)
++ {
++ 	return !idr_is_empty(&hdev->adv_monitors_idr);
++ }
++ 
+++>>>>>>> 31aab5c22e14 (Bluetooth: Add helper to set adv data)
+  struct bdaddr_list *hci_bdaddr_list_lookup(struct list_head *bdaddr_list,
+  					 bdaddr_t *bdaddr, u8 type)
+  {
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 87a79e4f1ac5..c8758779c051 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1268,6 +1268,9 @@ int hci_add_adv_instance(struct hci_dev *hdev, u8 instance, u32 flags,
+ 			 u16 adv_data_len, u8 *adv_data,
+ 			 u16 scan_rsp_len, u8 *scan_rsp_data,
+ 			 u16 timeout, u16 duration);
++int hci_set_adv_instance_data(struct hci_dev *hdev, u8 instance,
++			 u16 adv_data_len, u8 *adv_data,
++			 u16 scan_rsp_len, u8 *scan_rsp_data);
+ int hci_remove_adv_instance(struct hci_dev *hdev, u8 instance);
+ void hci_adv_instances_set_rpa_expired(struct hci_dev *hdev, bool rpa_expired);
+ 
+* Unmerged path net/bluetooth/hci_core.c
