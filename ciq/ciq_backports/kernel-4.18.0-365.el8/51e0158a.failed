@@ -1,0 +1,253 @@
+skmsg: Pass psock pointer to ->psock_update_sk_prot()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit 51e0158a54321a48d260e95998393934bb0de52c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/51e0158a.failed
+
+Using sk_psock() to retrieve psock pointer from sock requires
+RCU read lock, but we already get psock pointer before calling
+->psock_update_sk_prot() in both cases, so we can just pass it
+without bothering sk_psock().
+
+Fixes: 8a59f9d1e3d4 ("sock: Introduce sk->sk_prot->psock_update_sk_prot()")
+	Reported-by: syzbot+320a3bc8d80f478c37e4@syzkaller.appspotmail.com
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Tested-by: syzbot+320a3bc8d80f478c37e4@syzkaller.appspotmail.com
+	Reviewed-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20210407032111.33398-1-xiyou.wangcong@gmail.com
+(cherry picked from commit 51e0158a54321a48d260e95998393934bb0de52c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	include/net/sock.h
+#	include/net/tcp.h
+#	include/net/udp.h
+#	net/core/sock_map.c
+#	net/ipv4/tcp_bpf.c
+#	net/ipv4/udp_bpf.c
+diff --cc include/linux/skmsg.h
+index a85cacd89635,e2fb0a5a101e..000000000000
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@@ -100,13 -98,14 +100,19 @@@ struct sk_psock 
+  	void (*saved_unhash)(struct sock *sk);
+  	void (*saved_close)(struct sock *sk, long timeout);
+  	void (*saved_write_space)(struct sock *sk);
+++<<<<<<< HEAD
+++=======
++ 	void (*saved_data_ready)(struct sock *sk);
++ 	int  (*psock_update_sk_prot)(struct sock *sk, struct sk_psock *psock,
++ 				     bool restore);
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  	struct proto			*sk_proto;
+ -	struct mutex			work_mutex;
+  	struct sk_psock_work_state	work_state;
+  	struct work_struct		work;
+ -	struct rcu_work			rwork;
+ +	union {
+ +		struct rcu_head		rcu;
+ +		struct work_struct	gc;
+ +	};
+  };
+  
+  int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
+@@@ -347,19 -404,9 +353,25 @@@ static inline void sk_psock_update_prot
+  static inline void sk_psock_restore_proto(struct sock *sk,
+  					  struct sk_psock *psock)
+  {
+++<<<<<<< HEAD
+ +	if (inet_csk_has_ulp(sk)) {
+ +		/* TLS does not have an unhash proto in SW cases, but we need
+ +		 * to ensure we stop using the sock_map unhash routine because
+ +		 * the associated psock is being removed. So use the original
+ +		 * unhash handler.
+ +		 */
+ +		WRITE_ONCE(sk->sk_prot->unhash, psock->saved_unhash);
+ +		tcp_update_ulp(sk, psock->sk_proto, psock->saved_write_space);
+ +	} else {
+ +		sk->sk_write_space = psock->saved_write_space;
+ +		/* Pairs with lockless read in sk_clone_lock() */
+ +		WRITE_ONCE(sk->sk_prot, psock->sk_proto);
+ +	}
+++=======
++ 	sk->sk_prot->unhash = psock->saved_unhash;
++ 	if (psock->psock_update_sk_prot)
++ 		psock->psock_update_sk_prot(sk, psock, true);
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  }
+  
+  static inline void sk_psock_set_state(struct sk_psock *psock,
+diff --cc include/net/sock.h
+index efde7a4e6cf7,c4bbdcd83f4d..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -1186,6 -1185,11 +1187,14 @@@ struct proto 
+  	void			(*unhash)(struct sock *sk);
+  	void			(*rehash)(struct sock *sk);
+  	int			(*get_port)(struct sock *sk, unsigned short snum);
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ 	int			(*psock_update_sk_prot)(struct sock *sk,
++ 							struct sk_psock *psock,
++ 							bool restore);
++ #endif
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  
+  	/* Keeping track of sockets in use */
+  #ifdef CONFIG_PROC_FS
+diff --cc include/net/tcp.h
+index 94a5d2fb0393,d05193cb0d99..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -2193,22 -2212,23 +2193,26 @@@ void tcp_update_ulp(struct sock *sk, st
+  struct sk_msg;
+  struct sk_psock;
+  
+ -#ifdef CONFIG_BPF_SYSCALL
+ +#ifdef CONFIG_BPF_STREAM_PARSER
+  struct proto *tcp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
+++<<<<<<< HEAD
+++=======
++ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore);
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  void tcp_bpf_clone(const struct sock *sk, struct sock *newsk);
+ -#endif /* CONFIG_BPF_SYSCALL */
+ +#else
+ +static inline void tcp_bpf_clone(const struct sock *sk, struct sock *newsk)
+ +{
+ +}
+ +#endif /* CONFIG_BPF_STREAM_PARSER */
+  
+ +#ifdef CONFIG_NET_SOCK_MSG
+  int tcp_bpf_sendmsg_redir(struct sock *sk, struct sk_msg *msg, u32 bytes,
+  			  int flags);
+ +int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+ +		      struct msghdr *msg, int len, int flags);
+  #endif /* CONFIG_NET_SOCK_MSG */
+  
+ -#if !defined(CONFIG_BPF_SYSCALL) || !defined(CONFIG_NET_SOCK_MSG)
+ -static inline void tcp_bpf_clone(const struct sock *sk, struct sock *newsk)
+ -{
+ -}
+ -#endif
+ -
+  #ifdef CONFIG_CGROUP_BPF
+  static inline void bpf_skops_init_skb(struct bpf_sock_ops_kern *skops,
+  				      struct sk_buff *skb,
+diff --cc include/net/udp.h
+index b2d67e484800,360df454356c..000000000000
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@@ -534,9 -540,10 +534,14 @@@ static inline void udp_post_segment_fix
+  		skb->csum_valid = 1;
+  }
+  
+ -#ifdef CONFIG_BPF_SYSCALL
+ +#ifdef CONFIG_BPF_STREAM_PARSER
+  struct sk_psock;
+  struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
+++<<<<<<< HEAD
+ +#endif /* BPF_STREAM_PARSER */
+++=======
++ int udp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore);
++ #endif
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  
+  #endif	/* _UDP_H */
+diff --cc net/core/sock_map.c
+index c0612744b44c,f473c51cbc4b..000000000000
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@@ -183,26 -185,10 +183,31 @@@ static void sock_map_unref(struct sock 
+  
+  static int sock_map_init_proto(struct sock *sk, struct sk_psock *psock)
+  {
+ -	if (!sk->sk_prot->psock_update_sk_prot)
+ +	struct proto *prot;
+ +
+ +	switch (sk->sk_type) {
+ +	case SOCK_STREAM:
+ +		prot = tcp_bpf_get_proto(sk, psock);
+ +		break;
+ +
+ +	case SOCK_DGRAM:
+ +		prot = udp_bpf_get_proto(sk, psock);
+ +		break;
+ +
+ +	default:
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	}
+ +
+ +	if (IS_ERR(prot))
+ +		return PTR_ERR(prot);
+ +
+ +	sk_psock_update_proto(sk, psock, prot);
+ +	return 0;
+++=======
++ 	psock->psock_update_sk_prot = sk->sk_prot->psock_update_sk_prot;
++ 	return sk->sk_prot->psock_update_sk_prot(sk, psock, false);
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  }
+  
+  static struct sk_psock *sock_map_psock_get_checked(struct sock *sk)
+diff --cc net/ipv4/tcp_bpf.c
+index bc7d2a586e18,4930bc8ab47e..000000000000
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@@ -601,7 -499,7 +601,11 @@@ static int tcp_bpf_assert_proto_ops(str
+  	       ops->sendpage == tcp_sendpage ? 0 : -ENOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+ +struct proto *tcp_bpf_get_proto(struct sock *sk, struct sk_psock *psock)
+++=======
++ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  {
+  	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
+  	int config = psock->progs.msg_parser   ? TCP_BPF_TX   : TCP_BPF_BASE;
+diff --cc net/ipv4/udp_bpf.c
+index 51c5328e9dc1,954c4591a6fd..000000000000
+--- a/net/ipv4/udp_bpf.c
++++ b/net/ipv4/udp_bpf.c
+@@@ -101,11 -101,17 +101,23 @@@ static int __init udp_bpf_v4_build_prot
+  	udp_bpf_rebuild_protos(&udp_bpf_prots[UDP_BPF_IPV4], &udp_prot);
+  	return 0;
+  }
+ -core_initcall(udp_bpf_v4_build_proto);
+ +late_initcall(udp_bpf_v4_build_proto);
+  
+++<<<<<<< HEAD
+ +struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock)
+ +{
+ +	int family = sk->sk_family == AF_INET ? UDP_BPF_IPV4 : UDP_BPF_IPV6;
+++=======
++ int udp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
++ {
++ 	int family = sk->sk_family == AF_INET ? UDP_BPF_IPV4 : UDP_BPF_IPV6;
++ 
++ 	if (restore) {
++ 		sk->sk_write_space = psock->saved_write_space;
++ 		WRITE_ONCE(sk->sk_prot, psock->sk_proto);
++ 		return 0;
++ 	}
+++>>>>>>> 51e0158a5432 (skmsg: Pass psock pointer to ->psock_update_sk_prot())
+  
+  	if (sk->sk_family == AF_INET6)
+  		udp_bpf_check_v6_needs_rebuild(psock->sk_proto);
+* Unmerged path include/linux/skmsg.h
+* Unmerged path include/net/sock.h
+* Unmerged path include/net/tcp.h
+* Unmerged path include/net/udp.h
+* Unmerged path net/core/sock_map.c
+* Unmerged path net/ipv4/tcp_bpf.c
+* Unmerged path net/ipv4/udp_bpf.c
