@@ -1,0 +1,369 @@
+lockdep: Change hardirq{s_enabled,_context} to per-cpu variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [kernel] lockdep: Change hardirq{s_enabled, _context} to per-cpu variables (Waiman Long) [1885084]
+Rebuild_FUZZ: 99.22%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a21ee6055c30ce68c4e201c6496f0ed2a1936230
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a21ee605.failed
+
+Currently all IRQ-tracking state is in task_struct, this means that
+task_struct needs to be defined before we use it.
+
+Especially for lockdep_assert_irq*() this can lead to header-hell.
+
+Move the hardirq state into per-cpu variables to avoid the task_struct
+dependency.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lkml.kernel.org/r/20200623083721.512673481@infradead.org
+(cherry picked from commit a21ee6055c30ce68c4e201c6496f0ed2a1936230)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irqflags.h
+#	include/linux/sched.h
+#	kernel/locking/lockdep.c
+diff --cc include/linux/irqflags.h
+index b53a9f136087,255444fe4609..000000000000
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@@ -14,28 -14,48 +14,48 @@@
+  
+  #include <linux/typecheck.h>
+  #include <asm/irqflags.h>
++ #include <asm/percpu.h>
+  
+ -/* Currently lockdep_softirqs_on/off is used only by lockdep */
+ -#ifdef CONFIG_PROVE_LOCKING
+ -  extern void lockdep_softirqs_on(unsigned long ip);
+ -  extern void lockdep_softirqs_off(unsigned long ip);
+ -  extern void lockdep_hardirqs_on_prepare(unsigned long ip);
+ -  extern void lockdep_hardirqs_on(unsigned long ip);
+ -  extern void lockdep_hardirqs_off(unsigned long ip);
+ -#else
+ -  static inline void lockdep_softirqs_on(unsigned long ip) { }
+ -  static inline void lockdep_softirqs_off(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_on_prepare(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_on(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_off(unsigned long ip) { }
+ -#endif
+ -
+  #ifdef CONFIG_TRACE_IRQFLAGS
+++<<<<<<< HEAD
+ +  extern void trace_softirqs_on(unsigned long ip);
+ +  extern void trace_softirqs_off(unsigned long ip);
+ +  extern void trace_hardirqs_on(void);
+ +  extern void trace_hardirqs_off(void);
+ +# define trace_hardirq_context(p)	((p)->hardirq_context)
+ +# define trace_softirq_context(p)	((p)->softirq_context)
+ +# define trace_hardirqs_enabled(p)	((p)->hardirqs_enabled)
+ +# define trace_softirqs_enabled(p)	((p)->softirqs_enabled)
+ +# define trace_hardirq_enter()			\
+ +do {						\
+ +	if (!current->hardirq_context++)	\
+ +		current->hardirq_threaded = 0;	\
+++=======
++ 
++ DECLARE_PER_CPU(int, hardirqs_enabled);
++ DECLARE_PER_CPU(int, hardirq_context);
++ 
++   extern void trace_hardirqs_on_prepare(void);
++   extern void trace_hardirqs_off_finish(void);
++   extern void trace_hardirqs_on(void);
++   extern void trace_hardirqs_off(void);
++ # define lockdep_hardirq_context(p)	(this_cpu_read(hardirq_context))
++ # define lockdep_softirq_context(p)	((p)->softirq_context)
++ # define lockdep_hardirqs_enabled(p)	(this_cpu_read(hardirqs_enabled))
++ # define lockdep_softirqs_enabled(p)	((p)->softirqs_enabled)
++ # define lockdep_hardirq_enter()			\
++ do {							\
++ 	if (this_cpu_inc_return(hardirq_context) == 1)	\
++ 		current->hardirq_threaded = 0;		\
+++>>>>>>> a21ee6055c30 (lockdep: Change hardirq{s_enabled,_context} to per-cpu variables)
+  } while (0)
+ -# define lockdep_hardirq_threaded()		\
+ +# define trace_hardirq_threaded()		\
+  do {						\
+  	current->hardirq_threaded = 1;		\
+  } while (0)
+ -# define lockdep_hardirq_exit()			\
+ +# define trace_hardirq_exit()			\
+  do {						\
+- 	current->hardirq_context--;		\
++ 	this_cpu_dec(hardirq_context);		\
+  } while (0)
+  # define lockdep_softirq_enter()		\
+  do {						\
+diff --cc include/linux/sched.h
+index 6a1641d92452,3903a9500926..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -943,8 -990,7 +943,12 @@@ struct task_struct 
+  	unsigned long			hardirq_disable_ip;
+  	unsigned int			hardirq_enable_event;
+  	unsigned int			hardirq_disable_event;
+++<<<<<<< HEAD
+ +	int				hardirqs_enabled;
+ +	int				hardirq_context;
+++=======
++ 	u64				hardirq_chain_key;
+++>>>>>>> a21ee6055c30 (lockdep: Change hardirq{s_enabled,_context} to per-cpu variables)
+  	unsigned long			softirq_disable_ip;
+  	unsigned long			softirq_enable_ip;
+  	unsigned int			softirq_disable_event;
+diff --cc kernel/locking/lockdep.c
+index d02c793ed862,ab4ffbe0e9e9..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -3639,22 -3632,33 +3639,22 @@@ static void __trace_hardirqs_on_caller(
+  	 * this bit from being set before)
+  	 */
+  	if (curr->softirqs_enabled)
+ -		mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ);
+ +		if (!mark_held_locks(curr, LOCK_ENABLED_SOFTIRQ))
+ +			return;
+ +
+ +	curr->hardirq_enable_ip = ip;
+ +	curr->hardirq_enable_event = ++curr->irq_events;
+ +	debug_atomic_inc(hardirqs_on_events);
+  }
+  
+ -/**
+ - * lockdep_hardirqs_on_prepare - Prepare for enabling interrupts
+ - * @ip:		Caller address
+ - *
+ - * Invoked before a possible transition to RCU idle from exit to user or
+ - * guest mode. This ensures that all RCU operations are done before RCU
+ - * stops watching. After the RCU transition lockdep_hardirqs_on() has to be
+ - * invoked to set the final state.
+ - */
+ -void lockdep_hardirqs_on_prepare(unsigned long ip)
+ +__visible void trace_hardirqs_on_caller(unsigned long ip)
+  {
+ -	if (unlikely(!debug_locks))
+ -		return;
+ +	time_hardirqs_on(CALLER_ADDR0, ip);
+  
+ -	/*
+ -	 * NMIs do not (and cannot) track lock dependencies, nothing to do.
+ -	 */
+ -	if (unlikely(in_nmi()))
+ -		return;
+ -
+ -	if (unlikely(current->lockdep_recursion & LOCKDEP_RECURSION_MASK))
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+  		return;
+  
+- 	if (unlikely(current->hardirqs_enabled)) {
++ 	if (unlikely(lockdep_hardirqs_enabled(current))) {
+  		/*
+  		 * Neither irq nor preemption are disabled here
+  		 * so this is racy by nature but losing one hit
+@@@ -3682,20 -3686,77 +3682,79 @@@
+  	 * Can't allow enabling interrupts while in an interrupt handler,
+  	 * that's general bad form and such. Recursion, limited stack etc..
+  	 */
+- 	if (DEBUG_LOCKS_WARN_ON(current->hardirq_context))
++ 	if (DEBUG_LOCKS_WARN_ON(lockdep_hardirq_context(current)))
+  		return;
+  
+ -	current->hardirq_chain_key = current->curr_chain_key;
+ -
+  	current->lockdep_recursion++;
+ -	__trace_hardirqs_on_caller();
+ +	__trace_hardirqs_on_caller(ip);
+  	lockdep_recursion_finish();
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on_prepare);
+ +EXPORT_SYMBOL(trace_hardirqs_on_caller);
+  
+ -void noinstr lockdep_hardirqs_on(unsigned long ip)
+ +void trace_hardirqs_on(void)
+  {
+++<<<<<<< HEAD
+ +	trace_hardirqs_on_caller(CALLER_ADDR0);
+++=======
++ 	struct task_struct *curr = current;
++ 
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * NMIs can happen in the middle of local_irq_{en,dis}able() where the
++ 	 * tracking state and hardware state are out of sync.
++ 	 *
++ 	 * NMIs must save lockdep_hardirqs_enabled() to restore IRQ state from,
++ 	 * and not rely on hardware state like normal interrupts.
++ 	 */
++ 	if (unlikely(in_nmi())) {
++ 		/*
++ 		 * Skip:
++ 		 *  - recursion check, because NMI can hit lockdep;
++ 		 *  - hardware state check, because above;
++ 		 *  - chain_key check, see lockdep_hardirqs_on_prepare().
++ 		 */
++ 		goto skip_checks;
++ 	}
++ 
++ 	if (unlikely(current->lockdep_recursion & LOCKDEP_RECURSION_MASK))
++ 		return;
++ 
++ 	if (lockdep_hardirqs_enabled(curr)) {
++ 		/*
++ 		 * Neither irq nor preemption are disabled here
++ 		 * so this is racy by nature but losing one hit
++ 		 * in a stat is not a big deal.
++ 		 */
++ 		__debug_atomic_inc(redundant_hardirqs_on);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We're enabling irqs and according to our state above irqs weren't
++ 	 * already enabled, yet we find the hardware thinks they are in fact
++ 	 * enabled.. someone messed up their IRQ state tracing.
++ 	 */
++ 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++ 		return;
++ 
++ 	/*
++ 	 * Ensure the lock stack remained unchanged between
++ 	 * lockdep_hardirqs_on_prepare() and lockdep_hardirqs_on().
++ 	 */
++ 	DEBUG_LOCKS_WARN_ON(current->hardirq_chain_key !=
++ 			    current->curr_chain_key);
++ 
++ skip_checks:
++ 	/* we'll do an OFF -> ON transition: */
++ 	this_cpu_write(hardirqs_enabled, 1);
++ 	curr->hardirq_enable_ip = ip;
++ 	curr->hardirq_enable_event = ++curr->irq_events;
++ 	debug_atomic_inc(hardirqs_on_events);
+++>>>>>>> a21ee6055c30 (lockdep: Change hardirq{s_enabled,_context} to per-cpu variables)
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on);
+ +EXPORT_SYMBOL(trace_hardirqs_on);
+  
+  /*
+   * Hardirqs were disabled:
+* Unmerged path include/linux/irqflags.h
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index beeeef48a9a6..73dfe5ff3e6e 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -11,6 +11,7 @@
+ #define __LINUX_LOCKDEP_H
+ 
+ #include <linux/lockdep_types.h>
++#include <asm/percpu.h>
+ 
+ struct task_struct;
+ 
+@@ -532,28 +533,29 @@ do {									\
+ 	lock_release(&(lock)->dep_map, _THIS_IP_);			\
+ } while (0)
+ 
+-#define lockdep_assert_irqs_enabled()	do {				\
+-		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+-			  !current->hardirqs_enabled,			\
+-			  "IRQs not enabled as expected\n");		\
+-	} while (0)
++DECLARE_PER_CPU(int, hardirqs_enabled);
++DECLARE_PER_CPU(int, hardirq_context);
+ 
+-#define lockdep_assert_irqs_disabled()	do {				\
+-		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+-			  current->hardirqs_enabled,			\
+-			  "IRQs not disabled as expected\n");		\
+-	} while (0)
++#define lockdep_assert_irqs_enabled()					\
++do {									\
++	WARN_ON_ONCE(debug_locks && !this_cpu_read(hardirqs_enabled));	\
++} while (0)
+ 
+-#define lockdep_assert_in_irq() do {					\
+-		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+-			  !current->hardirq_context,			\
+-			  "Not in hardirq as expected\n");		\
+-	} while (0)
++#define lockdep_assert_irqs_disabled()					\
++do {									\
++	WARN_ON_ONCE(debug_locks && this_cpu_read(hardirqs_enabled));	\
++} while (0)
++
++#define lockdep_assert_in_irq()						\
++do {									\
++	WARN_ON_ONCE(debug_locks && !this_cpu_read(hardirq_context));	\
++} while (0)
+ 
+ #else
+ # define might_lock(lock) do { } while (0)
+ # define might_lock_read(lock) do { } while (0)
+ # define might_lock_nested(lock, subclass) do { } while (0)
++
+ # define lockdep_assert_irqs_enabled() do { } while (0)
+ # define lockdep_assert_irqs_disabled() do { } while (0)
+ # define lockdep_assert_in_irq() do { } while (0)
+@@ -563,7 +565,7 @@ do {									\
+ 
+ # define lockdep_assert_RT_in_threaded_ctx() do {			\
+ 		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+-			  current->hardirq_context &&			\
++			  lockdep_hardirq_context(current) &&		\
+ 			  !(current->hardirq_threaded || current->irq_config),	\
+ 			  "Not in threaded context on PREEMPT_RT as expected\n");	\
+ } while (0)
+* Unmerged path include/linux/sched.h
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 15627b0e0e5d..88c8ccc0fb52 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1796,8 +1796,8 @@ static __latent_entropy struct task_struct *copy_process(
+ 
+ 	rt_mutex_init_task(p);
+ 
++	lockdep_assert_irqs_enabled();
+ #ifdef CONFIG_PROVE_LOCKING
+-	DEBUG_LOCKS_WARN_ON(!p->hardirqs_enabled);
+ 	DEBUG_LOCKS_WARN_ON(!p->softirqs_enabled);
+ #endif
+ 	retval = -EAGAIN;
+@@ -1880,7 +1880,6 @@ static __latent_entropy struct task_struct *copy_process(
+ #endif
+ #ifdef CONFIG_TRACE_IRQFLAGS
+ 	p->irq_events = 0;
+-	p->hardirqs_enabled = 0;
+ 	p->hardirq_enable_ip = 0;
+ 	p->hardirq_enable_event = 0;
+ 	p->hardirq_disable_ip = _THIS_IP_;
+@@ -1890,7 +1889,6 @@ static __latent_entropy struct task_struct *copy_process(
+ 	p->softirq_enable_event = 0;
+ 	p->softirq_disable_ip = 0;
+ 	p->softirq_disable_event = 0;
+-	p->hardirq_context = 0;
+ 	p->softirq_context = 0;
+ #endif
+ 
+* Unmerged path kernel/locking/lockdep.c
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index cd64f829bfac..9f1d5e537495 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -107,6 +107,12 @@ static bool ksoftirqd_running(unsigned long pending)
+  * where hardirqs are disabled legitimately:
+  */
+ #ifdef CONFIG_TRACE_IRQFLAGS
++
++DEFINE_PER_CPU(int, hardirqs_enabled);
++DEFINE_PER_CPU(int, hardirq_context);
++EXPORT_PER_CPU_SYMBOL_GPL(hardirqs_enabled);
++EXPORT_PER_CPU_SYMBOL_GPL(hardirq_context);
++
+ void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+ {
+ 	unsigned long flags;
