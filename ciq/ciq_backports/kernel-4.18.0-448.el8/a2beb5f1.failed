@@ -1,0 +1,235 @@
+mm: clean up the last pieces of page fault accountings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Peter Xu <peterx@redhat.com>
+commit a2beb5f1efede6924a4258462a5660572e6ca864
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/a2beb5f1.failed
+
+Here're the last pieces of page fault accounting that were still done
+outside handle_mm_fault() where we still have regs==NULL when calling
+handle_mm_fault():
+
+arch/powerpc/mm/copro_fault.c:   copro_handle_mm_fault
+arch/sparc/mm/fault_32.c:        force_user_fault
+arch/um/kernel/trap.c:           handle_page_fault
+mm/gup.c:                        faultin_page
+                                 fixup_user_fault
+mm/hmm.c:                        hmm_vma_fault
+mm/ksm.c:                        break_ksm
+
+Some of them has the issue of duplicated accounting for page fault
+retries.  Some of them didn't do the accounting at all.
+
+This patch cleans all these up by letting handle_mm_fault() to do per-task
+page fault accounting even if regs==NULL (though we'll still skip the perf
+event accountings).  With that, we can safely remove all the outliers now.
+
+There's another functional change in that now we account the page faults
+to the caller of gup, rather than the task_struct that passed into the gup
+code.  More information of this can be found at [1].
+
+After this patch, below things should never be touched again outside
+handle_mm_fault():
+
+  - task_struct.[maj|min]_flt
+  - PERF_COUNT_SW_PAGE_FAULTS_[MAJ|MIN]
+
+[1] https://lore.kernel.org/lkml/CAHk-=wj_V2Tps2QrMn20_W0OJF9xqNh52XSGA42s-ZJ8Y+GyKw@mail.gmail.com/
+
+	Signed-off-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Albert Ou <aou@eecs.berkeley.edu>
+	Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Cain <bcain@codeaurora.org>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Chris Zankel <chris@zankel.net>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: David S. Miller <davem@davemloft.net>
+	Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+	Cc: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Cc: Greentime Hu <green.hu@gmail.com>
+	Cc: Guo Ren <guoren@kernel.org>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Helge Deller <deller@gmx.de>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+	Cc: James E.J. Bottomley <James.Bottomley@HansenPartnership.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Jonas Bonn <jonas@southpole.se>
+	Cc: Ley Foon Tan <ley.foon.tan@intel.com>
+	Cc: "Luck, Tony" <tony.luck@intel.com>
+	Cc: Matt Turner <mattst88@gmail.com>
+	Cc: Max Filippov <jcmvbkbc@gmail.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Michal Simek <monstr@monstr.eu>
+	Cc: Nick Hu <nickhu@andestech.com>
+	Cc: Palmer Dabbelt <palmer@dabbelt.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Paul Walmsley <paul.walmsley@sifive.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Richard Henderson <rth@twiddle.net>
+	Cc: Rich Felker <dalias@libc.org>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Stafford Horne <shorne@gmail.com>
+	Cc: Stefan Kristiansson <stefan.kristiansson@saunalahti.fi>
+	Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Vincent Chen <deanbo422@gmail.com>
+	Cc: Vineet Gupta <vgupta@synopsys.com>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+Link: http://lkml.kernel.org/r/20200707225021.200906-25-peterx@redhat.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a2beb5f1efede6924a4258462a5660572e6ca864)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+diff --cc mm/memory.c
+index 68de93d31a4b,2b7f0e00f312..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -4399,6 -4358,67 +4399,70 @@@ retry_pud
+  	return handle_pte_fault(&vmf);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * mm_account_fault - Do page fault accountings
++  *
++  * @regs: the pt_regs struct pointer.  When set to NULL, will skip accounting
++  *        of perf event counters, but we'll still do the per-task accounting to
++  *        the task who triggered this page fault.
++  * @address: the faulted address.
++  * @flags: the fault flags.
++  * @ret: the fault retcode.
++  *
++  * This will take care of most of the page fault accountings.  Meanwhile, it
++  * will also include the PERF_COUNT_SW_PAGE_FAULTS_[MAJ|MIN] perf counter
++  * updates.  However note that the handling of PERF_COUNT_SW_PAGE_FAULTS should
++  * still be in per-arch page fault handlers at the entry of page fault.
++  */
++ static inline void mm_account_fault(struct pt_regs *regs,
++ 				    unsigned long address, unsigned int flags,
++ 				    vm_fault_t ret)
++ {
++ 	bool major;
++ 
++ 	/*
++ 	 * We don't do accounting for some specific faults:
++ 	 *
++ 	 * - Unsuccessful faults (e.g. when the address wasn't valid).  That
++ 	 *   includes arch_vma_access_permitted() failing before reaching here.
++ 	 *   So this is not a "this many hardware page faults" counter.  We
++ 	 *   should use the hw profiling for that.
++ 	 *
++ 	 * - Incomplete faults (VM_FAULT_RETRY).  They will only be counted
++ 	 *   once they're completed.
++ 	 */
++ 	if (ret & (VM_FAULT_ERROR | VM_FAULT_RETRY))
++ 		return;
++ 
++ 	/*
++ 	 * We define the fault as a major fault when the final successful fault
++ 	 * is VM_FAULT_MAJOR, or if it retried (which implies that we couldn't
++ 	 * handle it immediately previously).
++ 	 */
++ 	major = (ret & VM_FAULT_MAJOR) || (flags & FAULT_FLAG_TRIED);
++ 
++ 	if (major)
++ 		current->maj_flt++;
++ 	else
++ 		current->min_flt++;
++ 
++ 	/*
++ 	 * If the fault is done for GUP, regs will be NULL.  We only do the
++ 	 * accounting for the per thread fault counters who triggered the
++ 	 * fault, and we skip the perf event updates.
++ 	 */
++ 	if (!regs)
++ 		return;
++ 
++ 	if (major)
++ 		perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MAJ, 1, regs, address);
++ 	else
++ 		perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MIN, 1, regs, address);
++ }
++ 
+++>>>>>>> a2beb5f1efed (mm: clean up the last pieces of page fault accountings)
+  /*
+   * By the time we get here, we already hold the mm semaphore
+   *
+diff --git a/arch/powerpc/mm/copro_fault.c b/arch/powerpc/mm/copro_fault.c
+index 87edde9d31ab..360ae91dc9cf 100644
+--- a/arch/powerpc/mm/copro_fault.c
++++ b/arch/powerpc/mm/copro_fault.c
+@@ -89,11 +89,6 @@ int copro_handle_mm_fault(struct mm_struct *mm, unsigned long ea,
+ 		BUG();
+ 	}
+ 
+-	if (*flt & VM_FAULT_MAJOR)
+-		current->maj_flt++;
+-	else
+-		current->min_flt++;
+-
+ out_unlock:
+ 	mmap_read_unlock(mm);
+ 	return ret;
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index cced82946042..eb03c74541ae 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -91,10 +91,6 @@ int handle_page_fault(unsigned long address, unsigned long ip,
+ 			BUG();
+ 		}
+ 		if (flags & FAULT_FLAG_ALLOW_RETRY) {
+-			if (fault & VM_FAULT_MAJOR)
+-				current->maj_flt++;
+-			else
+-				current->min_flt++;
+ 			if (fault & VM_FAULT_RETRY) {
+ 				flags &= ~FAULT_FLAG_ALLOW_RETRY;
+ 				flags |= FAULT_FLAG_TRIED;
+diff --git a/mm/gup.c b/mm/gup.c
+index b6ca92e3db6b..884bd57479fd 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -1110,13 +1110,6 @@ static int faultin_page(struct task_struct *tsk, struct vm_area_struct *vma,
+ 		BUG();
+ 	}
+ 
+-	if (tsk) {
+-		if (ret & VM_FAULT_MAJOR)
+-			tsk->maj_flt++;
+-		else
+-			tsk->min_flt++;
+-	}
+-
+ 	if (ret & VM_FAULT_RETRY) {
+ 		if (locked && !(fault_flags & FAULT_FLAG_RETRY_NOWAIT))
+ 			*locked = 0;
+@@ -1473,12 +1466,6 @@ int fixup_user_fault(struct task_struct *tsk, struct mm_struct *mm,
+ 		goto retry;
+ 	}
+ 
+-	if (tsk) {
+-		if (major)
+-			tsk->maj_flt++;
+-		else
+-			tsk->min_flt++;
+-	}
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(fixup_user_fault);
+* Unmerged path mm/memory.c
