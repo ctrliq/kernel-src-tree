@@ -645,11 +645,10 @@ xfs_vn_change_ok(
  * Caution: The caller of this function is responsible for calling
  * setattr_prepare() or otherwise verifying the change is fine.
  */
-int
+static int
 xfs_setattr_nonsize(
 	struct xfs_inode	*ip,
-	struct iattr		*iattr,
-	int			flags)
+	struct iattr		*iattr)
 {
 	xfs_mount_t		*mp = ip->i_mount;
 	struct inode		*inode = VFS_I(ip);
@@ -806,7 +805,7 @@ xfs_setattr_nonsize(
 	 *	     to attr_set.  No previous user of the generic
 	 * 	     Posix ACL code seems to care about this issue either.
 	 */
-	if ((mask & ATTR_MODE) && !(flags & XFS_ATTR_NOACL)) {
+	if (mask & ATTR_MODE) {
 		error = posix_acl_chmod(inode, inode->i_mode);
 		if (error)
 			return error;
@@ -862,7 +861,7 @@ xfs_setattr_size(
 		 * Use the regular setattr path to update the timestamps.
 		 */
 		iattr->ia_valid &= ~ATTR_SIZE;
-		return xfs_setattr_nonsize(ip, iattr, 0);
+		return xfs_setattr_nonsize(ip, iattr);
 	}
 
 	/*
@@ -1073,7 +1072,7 @@ xfs_vn_setattr(
 
 		error = xfs_vn_change_ok(dentry, iattr);
 		if (!error)
-			error = xfs_setattr_nonsize(ip, iattr, 0);
+			error = xfs_setattr_nonsize(ip, iattr);
 	}
 
 	return error;
