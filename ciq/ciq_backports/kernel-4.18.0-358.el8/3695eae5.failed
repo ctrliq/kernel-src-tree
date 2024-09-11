@@ -1,0 +1,353 @@
+pidfd: add P_PIDFD to waitid()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christian Brauner <christian.brauner@ubuntu.com>
+commit 3695eae5fee0605f316fbaad0b9e3de791d7dfaf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/3695eae5.failed
+
+This adds the P_PIDFD type to waitid().
+One of the last remaining bits for the pidfd api is to make it possible
+to wait on pidfds. With P_PIDFD added to waitid() the parts of userspace
+that want to use the pidfd api to exclusively manage processes can do so
+now.
+
+One of the things this will unblock in the future is the ability to make
+it possible to retrieve the exit status via waitid(P_PIDFD) for
+non-parent processes if handed a _suitable_ pidfd that has this feature
+set. This is similar to what you can do on FreeBSD with kqueue(). It
+might even end up being possible to wait on a process as a non-parent if
+an appropriate property is enabled on the pidfd.
+
+With P_PIDFD no scoping of the process identified by the pidfd is
+possible, i.e. it explicitly blocks things such as wait4(-1), wait4(0),
+waitid(P_ALL), waitid(P_PGID) etc. It only allows for semantics
+equivalent to wait4(pid), waitid(P_PID). Users that need scoping should
+rely on pid-based wait*() syscalls for now.
+
+	Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Andy Lutomirsky <luto@kernel.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Aleksa Sarai <cyphar@cyphar.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+Link: https://lore.kernel.org/r/20190727222229.6516-2-christian@brauner.io
+(cherry picked from commit 3695eae5fee0605f316fbaad0b9e3de791d7dfaf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+#	kernel/signal.c
+diff --cc kernel/fork.c
+index 886c2f479b06,b169e2ca2d84..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -1675,13 -1688,69 +1675,77 @@@ static inline void rcu_copy_process(str
+  	INIT_LIST_HEAD(&p->rcu_tasks_holdout_list);
+  	p->rcu_tasks_idle_cpu = -1;
+  #endif /* #ifdef CONFIG_TASKS_RCU */
+ +#ifdef CONFIG_TASKS_TRACE_RCU
+ +	p->task_struct_rh->trc_reader_nesting = 0;
+ +	p->task_struct_rh->trc_reader_special.s = 0;
+ +	INIT_LIST_HEAD(&p->task_struct_rh->trc_holdout_list);
+ +#endif /* #ifdef CONFIG_TASKS_TRACE_RCU */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct pid *pidfd_pid(const struct file *file)
++ {
++ 	if (file->f_op == &pidfd_fops)
++ 		return file->private_data;
++ 
++ 	return ERR_PTR(-EBADF);
++ }
++ 
++ static int pidfd_release(struct inode *inode, struct file *file)
++ {
++ 	struct pid *pid = file->private_data;
++ 
++ 	file->private_data = NULL;
++ 	put_pid(pid);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_PROC_FS
++ static void pidfd_show_fdinfo(struct seq_file *m, struct file *f)
++ {
++ 	struct pid_namespace *ns = proc_pid_ns(file_inode(m->file));
++ 	struct pid *pid = f->private_data;
++ 
++ 	seq_put_decimal_ull(m, "Pid:\t", pid_nr_ns(pid, ns));
++ 	seq_putc(m, '\n');
++ }
++ #endif
++ 
++ /*
++  * Poll support for process exit notification.
++  */
++ static unsigned int pidfd_poll(struct file *file, struct poll_table_struct *pts)
++ {
++ 	struct task_struct *task;
++ 	struct pid *pid = file->private_data;
++ 	int poll_flags = 0;
++ 
++ 	poll_wait(file, &pid->wait_pidfd, pts);
++ 
++ 	rcu_read_lock();
++ 	task = pid_task(pid, PIDTYPE_PID);
++ 	/*
++ 	 * Inform pollers only when the whole thread group exits.
++ 	 * If the thread group leader exits before all other threads in the
++ 	 * group, then poll(2) should block, similar to the wait(2) family.
++ 	 */
++ 	if (!task || (task->exit_state && thread_group_empty(task)))
++ 		poll_flags = POLLIN | POLLRDNORM;
++ 	rcu_read_unlock();
++ 
++ 	return poll_flags;
++ }
++ 
++ const struct file_operations pidfd_fops = {
++ 	.release = pidfd_release,
++ 	.poll = pidfd_poll,
++ #ifdef CONFIG_PROC_FS
++ 	.show_fdinfo = pidfd_show_fdinfo,
++ #endif
++ };
++ 
+++>>>>>>> 3695eae5fee0 (pidfd: add P_PIDFD to waitid())
+  static void __delayed_free_task(struct rcu_head *rhp)
+  {
+  	struct task_struct *tsk = container_of(rhp, struct task_struct, rcu);
+diff --cc kernel/signal.c
+index 0770041a0f5a,2e567f64812f..000000000000
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@@ -3543,6 -3634,123 +3543,126 @@@ SYSCALL_DEFINE2(kill, pid_t, pid, int, 
+  	return kill_something_info(sig, &info, pid);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Verify that the signaler and signalee either are in the same pid namespace
++  * or that the signaler's pid namespace is an ancestor of the signalee's pid
++  * namespace.
++  */
++ static bool access_pidfd_pidns(struct pid *pid)
++ {
++ 	struct pid_namespace *active = task_active_pid_ns(current);
++ 	struct pid_namespace *p = ns_of_pid(pid);
++ 
++ 	for (;;) {
++ 		if (!p)
++ 			return false;
++ 		if (p == active)
++ 			break;
++ 		p = p->parent;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static int copy_siginfo_from_user_any(kernel_siginfo_t *kinfo, siginfo_t *info)
++ {
++ #ifdef CONFIG_COMPAT
++ 	/*
++ 	 * Avoid hooking up compat syscalls and instead handle necessary
++ 	 * conversions here. Note, this is a stop-gap measure and should not be
++ 	 * considered a generic solution.
++ 	 */
++ 	if (in_compat_syscall())
++ 		return copy_siginfo_from_user32(
++ 			kinfo, (struct compat_siginfo __user *)info);
++ #endif
++ 	return copy_siginfo_from_user(kinfo, info);
++ }
++ 
++ static struct pid *pidfd_to_pid(const struct file *file)
++ {
++ 	struct pid *pid;
++ 
++ 	pid = pidfd_pid(file);
++ 	if (!IS_ERR(pid))
++ 		return pid;
++ 
++ 	return tgid_pidfd_to_pid(file);
++ }
++ 
++ /**
++  * sys_pidfd_send_signal - Signal a process through a pidfd
++  * @pidfd:  file descriptor of the process
++  * @sig:    signal to send
++  * @info:   signal info
++  * @flags:  future flags
++  *
++  * The syscall currently only signals via PIDTYPE_PID which covers
++  * kill(<positive-pid>, <signal>. It does not signal threads or process
++  * groups.
++  * In order to extend the syscall to threads and process groups the @flags
++  * argument should be used. In essence, the @flags argument will determine
++  * what is signaled and not the file descriptor itself. Put in other words,
++  * grouping is a property of the flags argument not a property of the file
++  * descriptor.
++  *
++  * Return: 0 on success, negative errno on failure
++  */
++ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
++ 		siginfo_t __user *, info, unsigned int, flags)
++ {
++ 	int ret;
++ 	struct fd f;
++ 	struct pid *pid;
++ 	kernel_siginfo_t kinfo;
++ 
++ 	/* Enforce flags be set to 0 until we add an extension. */
++ 	if (flags)
++ 		return -EINVAL;
++ 
++ 	f = fdget(pidfd);
++ 	if (!f.file)
++ 		return -EBADF;
++ 
++ 	/* Is this a pidfd? */
++ 	pid = pidfd_to_pid(f.file);
++ 	if (IS_ERR(pid)) {
++ 		ret = PTR_ERR(pid);
++ 		goto err;
++ 	}
++ 
++ 	ret = -EINVAL;
++ 	if (!access_pidfd_pidns(pid))
++ 		goto err;
++ 
++ 	if (info) {
++ 		ret = copy_siginfo_from_user_any(&kinfo, info);
++ 		if (unlikely(ret))
++ 			goto err;
++ 
++ 		ret = -EINVAL;
++ 		if (unlikely(sig != kinfo.si_signo))
++ 			goto err;
++ 
++ 		/* Only allow sending arbitrary signals to yourself. */
++ 		ret = -EPERM;
++ 		if ((task_pid(current) != pid) &&
++ 		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
++ 			goto err;
++ 	} else {
++ 		prepare_kill_siginfo(sig, &kinfo);
++ 	}
++ 
++ 	ret = kill_pid_info(sig, &kinfo, pid);
++ 
++ err:
++ 	fdput(f);
++ 	return ret;
++ }
++ 
+++>>>>>>> 3695eae5fee0 (pidfd: add P_PIDFD to waitid())
+  static int
+  do_send_specific(pid_t tgid, pid_t pid, int sig, struct kernel_siginfo *info)
+  {
+diff --git a/include/linux/pid.h b/include/linux/pid.h
+index d2050f8fbe59..ca3703b011f5 100644
+--- a/include/linux/pid.h
++++ b/include/linux/pid.h
+@@ -77,6 +77,10 @@ struct pid_link
+ 	struct pid *pid;
+ };
+ 
++struct file;
++
++extern struct pid *pidfd_pid(const struct file *file);
++
+ static inline struct pid *get_pid(struct pid *pid)
+ {
+ 	if (pid)
+diff --git a/include/uapi/linux/wait.h b/include/uapi/linux/wait.h
+index ac49a220cf2a..85b809fc9f11 100644
+--- a/include/uapi/linux/wait.h
++++ b/include/uapi/linux/wait.h
+@@ -17,6 +17,7 @@
+ #define P_ALL		0
+ #define P_PID		1
+ #define P_PGID		2
++#define P_PIDFD		3
+ 
+ 
+ #endif /* _UAPI_LINUX_WAIT_H */
+diff --git a/kernel/exit.c b/kernel/exit.c
+index af23ac64a619..164d076bc3b9 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -1469,6 +1469,23 @@ static long do_wait(struct wait_opts *wo)
+ 	return retval;
+ }
+ 
++static struct pid *pidfd_get_pid(unsigned int fd)
++{
++	struct fd f;
++	struct pid *pid;
++
++	f = fdget(fd);
++	if (!f.file)
++		return ERR_PTR(-EBADF);
++
++	pid = pidfd_pid(f.file);
++	if (!IS_ERR(pid))
++		get_pid(pid);
++
++	fdput(f);
++	return pid;
++}
++
+ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
+ 			  int options, struct rusage *ru)
+ {
+@@ -1491,19 +1508,29 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
+ 		type = PIDTYPE_PID;
+ 		if (upid <= 0)
+ 			return -EINVAL;
++
++		pid = find_get_pid(upid);
+ 		break;
+ 	case P_PGID:
+ 		type = PIDTYPE_PGID;
+ 		if (upid <= 0)
+ 			return -EINVAL;
++
++		pid = find_get_pid(upid);
++		break;
++	case P_PIDFD:
++		type = PIDTYPE_PID;
++		if (upid < 0)
++			return -EINVAL;
++
++		pid = pidfd_get_pid(upid);
++		if (IS_ERR(pid))
++			return PTR_ERR(pid);
+ 		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
+-	if (type < PIDTYPE_MAX)
+-		pid = find_get_pid(upid);
+-
+ 	wo.wo_type	= type;
+ 	wo.wo_pid	= pid;
+ 	wo.wo_flags	= options;
+* Unmerged path kernel/fork.c
+* Unmerged path kernel/signal.c
