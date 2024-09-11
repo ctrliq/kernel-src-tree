@@ -1,0 +1,424 @@
+Bluetooth: Handle BR/EDR devices during suspend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+commit 4f40afc6c76451daff7d0dcfc8a3d113ccf65bfc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4f40afc6.failed
+
+To handle BR/EDR devices, we first disable page scan and disconnect all
+connected devices. Once that is complete, we add event filters (for
+devices that can wake the system) and re-enable page scan.
+
+	Signed-off-by: Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 4f40afc6c76451daff7d0dcfc8a3d113ccf65bfc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/bluetooth/hci.h
+#	include/net/bluetooth/hci_core.h
+#	net/bluetooth/hci_core.c
+#	net/bluetooth/hci_request.c
+diff --cc include/net/bluetooth/hci.h
+index 1668211297a9,5f60e135aeb6..000000000000
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@@ -878,10 -942,14 +878,21 @@@ struct hci_cp_sniff_subrate 
+  #define HCI_OP_RESET			0x0c03
+  
+  #define HCI_OP_SET_EVENT_FLT		0x0c05
+++<<<<<<< HEAD
+ +struct hci_cp_set_event_flt {
+ +	__u8     flt_type;
+ +	__u8     cond_type;
+ +	__u8     condition[0];
+++=======
++ #define HCI_SET_EVENT_FLT_SIZE		9
++ struct hci_cp_set_event_filter {
++ 	__u8		flt_type;
++ 	__u8		cond_type;
++ 	struct {
++ 		bdaddr_t bdaddr;
++ 		__u8 auto_accept;
++ 	} __packed	addr_conn_flt;
+++>>>>>>> 4f40afc6c764 (Bluetooth: Handle BR/EDR devices during suspend)
+  } __packed;
+  
+  /* Filter types */
+diff --cc include/net/bluetooth/hci_core.h
+index b46e3ee436f3,1a4d732bdce6..000000000000
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@@ -88,6 -88,25 +88,28 @@@ struct discovery_state 
+  	unsigned long		scan_duration;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define SUSPEND_NOTIFIER_TIMEOUT	msecs_to_jiffies(2000) /* 2 seconds */
++ 
++ enum suspend_tasks {
++ 	SUSPEND_SCAN_DISABLE,
++ 	SUSPEND_SCAN_ENABLE,
++ 	SUSPEND_DISCONNECTING,
++ 
++ 	SUSPEND_POWERING_DOWN,
++ 
++ 	SUSPEND_PREPARE_NOTIFIER,
++ 	__SUSPEND_NUM_TASKS
++ };
++ 
++ enum suspended_state {
++ 	BT_RUNNING = 0,
++ 	BT_SUSPEND_DISCONNECT,
++ 	BT_SUSPEND_COMPLETE,
++ };
++ 
+++>>>>>>> 4f40afc6c764 (Bluetooth: Handle BR/EDR devices during suspend)
+  struct hci_conn_hash {
+  	struct list_head list;
+  	unsigned int     acl_num;
+@@@ -359,6 -409,17 +381,20 @@@ struct hci_dev 
+  	void			*smp_bredr_data;
+  
+  	struct discovery_state	discovery;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct notifier_block	suspend_notifier;
++ 	struct work_struct	suspend_prepare;
++ 	enum suspended_state	suspend_state_next;
++ 	enum suspended_state	suspend_state;
++ 	bool			scanning_paused;
++ 	bool			suspended;
++ 
++ 	wait_queue_head_t	suspend_wait_q;
++ 	DECLARE_BITMAP(suspend_tasks, __SUSPEND_NUM_TASKS);
++ 
+++>>>>>>> 4f40afc6c764 (Bluetooth: Handle BR/EDR devices during suspend)
+  	struct hci_conn_hash	conn_hash;
+  
+  	struct list_head	mgmt_pending;
+diff --cc net/bluetooth/hci_core.c
+index 2d71e1f91ae8,dbd2ad3a26ed..000000000000
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@@ -2960,6 -3269,93 +2960,96 @@@ void hci_copy_identity_address(struct h
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int hci_suspend_wait_event(struct hci_dev *hdev)
++ {
++ #define WAKE_COND                                                              \
++ 	(find_first_bit(hdev->suspend_tasks, __SUSPEND_NUM_TASKS) ==           \
++ 	 __SUSPEND_NUM_TASKS)
++ 
++ 	int i;
++ 	int ret = wait_event_timeout(hdev->suspend_wait_q,
++ 				     WAKE_COND, SUSPEND_NOTIFIER_TIMEOUT);
++ 
++ 	if (ret == 0) {
++ 		bt_dev_dbg(hdev, "Timed out waiting for suspend");
++ 		for (i = 0; i < __SUSPEND_NUM_TASKS; ++i) {
++ 			if (test_bit(i, hdev->suspend_tasks))
++ 				bt_dev_dbg(hdev, "Bit %d is set", i);
++ 			clear_bit(i, hdev->suspend_tasks);
++ 		}
++ 
++ 		ret = -ETIMEDOUT;
++ 	} else {
++ 		ret = 0;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void hci_prepare_suspend(struct work_struct *work)
++ {
++ 	struct hci_dev *hdev =
++ 		container_of(work, struct hci_dev, suspend_prepare);
++ 
++ 	hci_dev_lock(hdev);
++ 	hci_req_prepare_suspend(hdev, hdev->suspend_state_next);
++ 	hci_dev_unlock(hdev);
++ }
++ 
++ static int hci_suspend_notifier(struct notifier_block *nb, unsigned long action,
++ 				void *data)
++ {
++ 	struct hci_dev *hdev =
++ 		container_of(nb, struct hci_dev, suspend_notifier);
++ 	int ret = 0;
++ 
++ 	/* If powering down, wait for completion. */
++ 	if (mgmt_powering_down(hdev)) {
++ 		set_bit(SUSPEND_POWERING_DOWN, hdev->suspend_tasks);
++ 		ret = hci_suspend_wait_event(hdev);
++ 		if (ret)
++ 			goto done;
++ 	}
++ 
++ 	/* Suspend notifier should only act on events when powered. */
++ 	if (!hdev_is_powered(hdev))
++ 		goto done;
++ 
++ 	if (action == PM_SUSPEND_PREPARE) {
++ 		/* Suspend consists of two actions:
++ 		 *  - First, disconnect everything and make the controller not
++ 		 *    connectable (disabling scanning)
++ 		 *  - Second, program event filter/whitelist and enable scan
++ 		 */
++ 		hdev->suspend_state_next = BT_SUSPEND_DISCONNECT;
++ 		set_bit(SUSPEND_PREPARE_NOTIFIER, hdev->suspend_tasks);
++ 		queue_work(hdev->req_workqueue, &hdev->suspend_prepare);
++ 		ret = hci_suspend_wait_event(hdev);
++ 
++ 		/* If the disconnect portion failed, don't attempt to complete
++ 		 * by configuring the whitelist. The suspend notifier will
++ 		 * follow a cancelled suspend with a PM_POST_SUSPEND
++ 		 * notification.
++ 		 */
++ 		if (!ret) {
++ 			hdev->suspend_state_next = BT_SUSPEND_COMPLETE;
++ 			set_bit(SUSPEND_PREPARE_NOTIFIER, hdev->suspend_tasks);
++ 			queue_work(hdev->req_workqueue, &hdev->suspend_prepare);
++ 			ret = hci_suspend_wait_event(hdev);
++ 		}
++ 	} else if (action == PM_POST_SUSPEND) {
++ 		hdev->suspend_state_next = BT_RUNNING;
++ 		set_bit(SUSPEND_PREPARE_NOTIFIER, hdev->suspend_tasks);
++ 		queue_work(hdev->req_workqueue, &hdev->suspend_prepare);
++ 		ret = hci_suspend_wait_event(hdev);
++ 	}
++ 
++ done:
++ 	return ret ? notifier_from_errno(-EBUSY) : NOTIFY_STOP;
++ }
+++>>>>>>> 4f40afc6c764 (Bluetooth: Handle BR/EDR devices during suspend)
+  /* Alloc HCI device */
+  struct hci_dev *hci_alloc_dev(void)
+  {
+diff --cc net/bluetooth/hci_request.c
+index ef1f5ba85455,051e1b16c988..000000000000
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@@ -804,20 -896,144 +804,157 @@@ void hci_req_add_le_passive_scan(struc
+  	    (hdev->le_features[0] & HCI_LE_EXT_SCAN_POLICY))
+  		filter_policy |= 0x02;
+  
+ -	hci_req_start_scan(req, LE_SCAN_PASSIVE, hdev->le_scan_interval,
+ -			   hdev->le_scan_window, own_addr_type, filter_policy);
+ -}
+ -
+ +	memset(&param_cp, 0, sizeof(param_cp));
+ +	param_cp.type = LE_SCAN_PASSIVE;
+ +	param_cp.interval = cpu_to_le16(hdev->le_scan_interval);
+ +	param_cp.window = cpu_to_le16(hdev->le_scan_window);
+ +	param_cp.own_address_type = own_addr_type;
+ +	param_cp.filter_policy = filter_policy;
+ +	hci_req_add(req, HCI_OP_LE_SET_SCAN_PARAM, sizeof(param_cp),
+ +		    &param_cp);
+ +
+++<<<<<<< HEAD
+ +	memset(&enable_cp, 0, sizeof(enable_cp));
+ +	enable_cp.enable = LE_SCAN_ENABLE;
+ +	enable_cp.filter_dup = LE_SCAN_FILTER_DUP_ENABLE;
+ +	hci_req_add(req, HCI_OP_LE_SET_SCAN_ENABLE, sizeof(enable_cp),
+ +		    &enable_cp);
+++=======
++ static u8 get_adv_instance_scan_rsp_len(struct hci_dev *hdev, u8 instance)
++ {
++ 	struct adv_info *adv_instance;
++ 
++ 	/* Instance 0x00 always set local name */
++ 	if (instance == 0x00)
++ 		return 1;
++ 
++ 	adv_instance = hci_find_adv_instance(hdev, instance);
++ 	if (!adv_instance)
++ 		return 0;
++ 
++ 	/* TODO: Take into account the "appearance" and "local-name" flags here.
++ 	 * These are currently being ignored as they are not supported.
++ 	 */
++ 	return adv_instance->scan_rsp_len;
++ }
++ 
++ static void hci_req_clear_event_filter(struct hci_request *req)
++ {
++ 	struct hci_cp_set_event_filter f;
++ 
++ 	memset(&f, 0, sizeof(f));
++ 	f.flt_type = HCI_FLT_CLEAR_ALL;
++ 	hci_req_add(req, HCI_OP_SET_EVENT_FLT, 1, &f);
++ 
++ 	/* Update page scan state (since we may have modified it when setting
++ 	 * the event filter).
++ 	 */
++ 	__hci_req_update_scan(req);
++ }
++ 
++ static void hci_req_set_event_filter(struct hci_request *req)
++ {
++ 	struct bdaddr_list *b;
++ 	struct hci_cp_set_event_filter f;
++ 	struct hci_dev *hdev = req->hdev;
++ 	u8 scan;
++ 
++ 	/* Always clear event filter when starting */
++ 	hci_req_clear_event_filter(req);
++ 
++ 	list_for_each_entry(b, &hdev->wakeable, list) {
++ 		memset(&f, 0, sizeof(f));
++ 		bacpy(&f.addr_conn_flt.bdaddr, &b->bdaddr);
++ 		f.flt_type = HCI_FLT_CONN_SETUP;
++ 		f.cond_type = HCI_CONN_SETUP_ALLOW_BDADDR;
++ 		f.addr_conn_flt.auto_accept = HCI_CONN_SETUP_AUTO_ON;
++ 
++ 		bt_dev_dbg(hdev, "Adding event filters for %pMR", &b->bdaddr);
++ 		hci_req_add(req, HCI_OP_SET_EVENT_FLT, sizeof(f), &f);
++ 	}
++ 
++ 	scan = !list_empty(&hdev->wakeable) ? SCAN_PAGE : SCAN_DISABLED;
++ 	hci_req_add(req, HCI_OP_WRITE_SCAN_ENABLE, 1, &scan);
++ }
++ 
++ static void suspend_req_complete(struct hci_dev *hdev, u8 status, u16 opcode)
++ {
++ 	bt_dev_dbg(hdev, "Request complete opcode=0x%x, status=0x%x", opcode,
++ 		   status);
++ 	if (test_and_clear_bit(SUSPEND_SCAN_ENABLE, hdev->suspend_tasks) ||
++ 	    test_and_clear_bit(SUSPEND_SCAN_DISABLE, hdev->suspend_tasks)) {
++ 		wake_up(&hdev->suspend_wait_q);
++ 	}
++ }
++ 
++ /* Call with hci_dev_lock */
++ void hci_req_prepare_suspend(struct hci_dev *hdev, enum suspended_state next)
++ {
++ 	struct hci_conn *conn;
++ 	struct hci_request req;
++ 	u8 page_scan;
++ 	int disconnect_counter;
++ 
++ 	if (next == hdev->suspend_state) {
++ 		bt_dev_dbg(hdev, "Same state before and after: %d", next);
++ 		goto done;
++ 	}
++ 
++ 	hdev->suspend_state = next;
++ 	hci_req_init(&req, hdev);
++ 
++ 	if (next == BT_SUSPEND_DISCONNECT) {
++ 		/* Mark device as suspended */
++ 		hdev->suspended = true;
++ 
++ 		/* Disable page scan */
++ 		page_scan = SCAN_DISABLED;
++ 		hci_req_add(&req, HCI_OP_WRITE_SCAN_ENABLE, 1, &page_scan);
++ 
++ 		/* Mark task needing completion */
++ 		set_bit(SUSPEND_SCAN_DISABLE, hdev->suspend_tasks);
++ 
++ 		/* Prevent disconnects from causing scanning to be re-enabled */
++ 		hdev->scanning_paused = true;
++ 
++ 		/* Run commands before disconnecting */
++ 		hci_req_run(&req, suspend_req_complete);
++ 
++ 		disconnect_counter = 0;
++ 		/* Soft disconnect everything (power off) */
++ 		list_for_each_entry(conn, &hdev->conn_hash.list, list) {
++ 			hci_disconnect(conn, HCI_ERROR_REMOTE_POWER_OFF);
++ 			disconnect_counter++;
++ 		}
++ 
++ 		if (disconnect_counter > 0) {
++ 			bt_dev_dbg(hdev,
++ 				   "Had %d disconnects. Will wait on them",
++ 				   disconnect_counter);
++ 			set_bit(SUSPEND_DISCONNECTING, hdev->suspend_tasks);
++ 		}
++ 	} else if (next == BT_SUSPEND_COMPLETE) {
++ 		/* Unpause to take care of updating scanning params */
++ 		hdev->scanning_paused = false;
++ 		/* Enable event filter for paired devices */
++ 		hci_req_set_event_filter(&req);
++ 		/* Pause scan changes again. */
++ 		hdev->scanning_paused = true;
++ 		hci_req_run(&req, suspend_req_complete);
++ 	} else {
++ 		hdev->suspended = false;
++ 		hdev->scanning_paused = false;
++ 
++ 		hci_req_clear_event_filter(&req);
++ 		hci_req_run(&req, suspend_req_complete);
++ 	}
++ 
++ 	hdev->suspend_state = next;
++ 
++ done:
++ 	clear_bit(SUSPEND_PREPARE_NOTIFIER, hdev->suspend_tasks);
++ 	wake_up(&hdev->suspend_wait_q);
+++>>>>>>> 4f40afc6c764 (Bluetooth: Handle BR/EDR devices during suspend)
+  }
+  
+  static u8 get_cur_adv_instance_scan_rsp_len(struct hci_dev *hdev)
+* Unmerged path include/net/bluetooth/hci.h
+* Unmerged path include/net/bluetooth/hci_core.h
+* Unmerged path net/bluetooth/hci_core.c
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index b3d7da371310..9aff89fa9464 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -2128,6 +2128,7 @@ static void hci_inquiry_result_evt(struct hci_dev *hdev, struct sk_buff *skb)
+ static void hci_conn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
+ {
+ 	struct hci_ev_conn_complete *ev = (void *) skb->data;
++	struct inquiry_entry *ie;
+ 	struct hci_conn *conn;
+ 
+ 	BT_DBG("%s", hdev->name);
+@@ -2136,6 +2137,21 @@ static void hci_conn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
+ 
+ 	conn = hci_conn_hash_lookup_ba(hdev, ev->link_type, &ev->bdaddr);
+ 	if (!conn) {
++		/* Connection may not exist if auto-connected. Check the inquiry
++		 * cache to see if we've already discovered this bdaddr before.
++		 * If found and link is an ACL type, create a connection class
++		 * automatically.
++		 */
++		ie = hci_inquiry_cache_lookup(hdev, &ev->bdaddr);
++		if (ie && ev->link_type == ACL_LINK) {
++			conn = hci_conn_add(hdev, ev->link_type, &ev->bdaddr,
++					    HCI_ROLE_SLAVE);
++			if (!conn) {
++				bt_dev_err(hdev, "no memory for new conn");
++				goto unlock;
++			}
++		}
++
+ 		if (ev->link_type != SCO_LINK)
+ 			goto unlock;
+ 
+@@ -2397,6 +2413,14 @@ static void hci_disconn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
+ 	hci_disconn_cfm(conn, ev->reason);
+ 	hci_conn_del(conn);
+ 
++	/* The suspend notifier is waiting for all devices to disconnect so
++	 * clear the bit from pending tasks and inform the wait queue.
++	 */
++	if (list_empty(&hdev->conn_hash.list) &&
++	    test_and_clear_bit(SUSPEND_DISCONNECTING, hdev->suspend_tasks)) {
++		wake_up(&hdev->suspend_wait_q);
++	}
++
+ 	/* Re-enable advertising if necessary, since it might
+ 	 * have been disabled by the connection. From the
+ 	 * HCI_LE_Set_Advertise_Enable command description in
+* Unmerged path net/bluetooth/hci_request.c
