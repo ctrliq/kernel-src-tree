@@ -1,0 +1,250 @@
+RDMA/cm: Move debug counters to be under relevant IB device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit c87e65cfb97c7f325132a68288ed76ba7bdcd2c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c87e65cf.failed
+
+The sysfs layout is created by CM incorrectly presented RDMA devices with
+InfiniBand link layer. Layout of such devices represents device tree of
+connections. By moving CM statistics to be under relevant port of IB
+device, we will fix the following issues:
+
+ * Symlink name - It used device name instead of specific identifier.
+ * Target location - It was supposed to point to PCI-ID/infiniband_cm/
+   instead of PCI-ID/infiniband/
+ * Target name - It created extra device file under already existing
+   device folder, e.g. mlx5_0/mlx5_0
+ * Crash during boot with RDMA persistent naming patches.
+
+ sysfs: cannot create duplicate filename '/class/infiniband_cm/mlx5_0'
+ CPU: 29 PID: 433 Comm: modprobe Not tainted 5.0.0-rc5+ #178
+ Call Trace:
+  dump_stack+0xcc/0x180
+  sysfs_warn_dup.cold.3+0x17/0x2d
+  sysfs_do_create_link_sd.isra.2+0xd0/0xf0
+  device_add+0x7cb/0x1450
+  device_create_groups_vargs+0x1ae/0x220
+  device_create+0x93/0xc0
+  cm_add_one+0x38f/0xf60 [ib_cm]
+  add_client_context+0x167/0x210 [ib_core]
+  enable_device_and_get+0x230/0x3f0 [ib_core]
+  ib_register_device+0x823/0xbf0 [ib_core]
+  __mlx5_ib_add+0x45/0x150 [mlx5_ib]
+  mlx5_ib_add+0x1b3/0x5e0 [mlx5_ib]
+  mlx5_add_device+0x130/0x3a0 [mlx5_core]
+  mlx5_register_interface+0x1a9/0x270 [mlx5_core]
+  do_one_initcall+0x14f/0x5de
+  do_init_module+0x247/0x7c0
+  load_module+0x4c2f/0x60d0
+  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+After this change:
+[leonro@server ~]$ ls -al /sys/class/infiniband/ibp0s12f0/ports/1/
+drwxr-xr-x  2 root root    0 Mar 11 11:17 cm_rx_duplicates
+drwxr-xr-x  2 root root    0 Mar 11 11:17 cm_rx_msgs
+drwxr-xr-x  2 root root    0 Mar 11 11:17 cm_tx_msgs
+drwxr-xr-x  2 root root    0 Mar 11 11:17 cm_tx_retries
+
+Fixes: 110cf374a809 ("infiniband: make cm_device use a struct device and not a kobject.")
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c87e65cfb97c7f325132a68288ed76ba7bdcd2c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/core_priv.h
+diff --cc drivers/infiniband/core/core_priv.h
+index 9d1d4bce8f87,5b0ffbb6b3c9..000000000000
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@@ -326,4 -338,16 +326,19 @@@ int roce_resolve_route_from_path(struc
+  				 const struct ib_gid_attr *attr);
+  
+  struct net_device *rdma_read_gid_attr_ndev_rcu(const struct ib_gid_attr *attr);
+++<<<<<<< HEAD
+++=======
++ 
++ void ib_free_port_attrs(struct ib_core_device *coredev);
++ int ib_setup_port_attrs(struct ib_core_device *coredev,
++ 			bool alloc_hw_stats);
++ 
++ int rdma_compatdev_set(u8 enable);
++ 
++ int ib_port_register_module_stat(struct ib_device *device, u8 port_num,
++ 				 struct kobject *kobj, struct kobj_type *ktype,
++ 				 const char *name);
++ void ib_port_unregister_module_stat(struct kobject *kobj);
++ 
+++>>>>>>> c87e65cfb97c (RDMA/cm: Move debug counters to be under relevant IB device)
+  #endif /* _CORE_PRIV_H */
+diff --git a/drivers/infiniband/core/cm.c b/drivers/infiniband/core/cm.c
+index 1dd2b572f59f..4df59f2b0f04 100644
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -52,6 +52,7 @@
+ #include <rdma/ib_cache.h>
+ #include <rdma/ib_cm.h>
+ #include "cm_msgs.h"
++#include "core_priv.h"
+ 
+ MODULE_AUTHOR("Sean Hefty");
+ MODULE_DESCRIPTION("InfiniBand CM");
+@@ -220,7 +221,6 @@ struct cm_port {
+ struct cm_device {
+ 	struct list_head list;
+ 	struct ib_device *ib_device;
+-	struct device *device;
+ 	u8 ack_delay;
+ 	int going_down;
+ 	struct cm_port *port[0];
+@@ -4272,18 +4272,6 @@ static struct kobj_type cm_counter_obj_type = {
+ 	.default_attrs = cm_counter_default_attrs
+ };
+ 
+-static void cm_release_port_obj(struct kobject *obj)
+-{
+-	struct cm_port *cm_port;
+-
+-	cm_port = container_of(obj, struct cm_port, port_obj);
+-	kfree(cm_port);
+-}
+-
+-static struct kobj_type cm_port_obj_type = {
+-	.release = cm_release_port_obj
+-};
+-
+ static char *cm_devnode(struct device *dev, umode_t *mode)
+ {
+ 	if (mode)
+@@ -4302,19 +4290,12 @@ static int cm_create_port_fs(struct cm_port *port)
+ {
+ 	int i, ret;
+ 
+-	ret = kobject_init_and_add(&port->port_obj, &cm_port_obj_type,
+-				   &port->cm_dev->device->kobj,
+-				   "%d", port->port_num);
+-	if (ret) {
+-		kfree(port);
+-		return ret;
+-	}
+-
+ 	for (i = 0; i < CM_COUNTER_GROUPS; i++) {
+-		ret = kobject_init_and_add(&port->counter_group[i].obj,
+-					   &cm_counter_obj_type,
+-					   &port->port_obj,
+-					   "%s", counter_group_names[i]);
++		ret = ib_port_register_module_stat(port->cm_dev->ib_device,
++						   port->port_num,
++						   &port->counter_group[i].obj,
++						   &cm_counter_obj_type,
++						   counter_group_names[i]);
+ 		if (ret)
+ 			goto error;
+ 	}
+@@ -4323,8 +4304,7 @@ static int cm_create_port_fs(struct cm_port *port)
+ 
+ error:
+ 	while (i--)
+-		kobject_put(&port->counter_group[i].obj);
+-	kobject_put(&port->port_obj);
++		ib_port_unregister_module_stat(&port->counter_group[i].obj);
+ 	return ret;
+ 
+ }
+@@ -4334,9 +4314,8 @@ static void cm_remove_port_fs(struct cm_port *port)
+ 	int i;
+ 
+ 	for (i = 0; i < CM_COUNTER_GROUPS; i++)
+-		kobject_put(&port->counter_group[i].obj);
++		ib_port_unregister_module_stat(&port->counter_group[i].obj);
+ 
+-	kobject_put(&port->port_obj);
+ }
+ 
+ static void cm_add_one(struct ib_device *ib_device)
+@@ -4363,13 +4342,6 @@ static void cm_add_one(struct ib_device *ib_device)
+ 	cm_dev->ib_device = ib_device;
+ 	cm_dev->ack_delay = ib_device->attrs.local_ca_ack_delay;
+ 	cm_dev->going_down = 0;
+-	cm_dev->device = device_create(&cm_class, &ib_device->dev,
+-				       MKDEV(0, 0), NULL,
+-				       "%s", dev_name(&ib_device->dev));
+-	if (IS_ERR(cm_dev->device)) {
+-		kfree(cm_dev);
+-		return;
+-	}
+ 
+ 	set_bit(IB_MGMT_METHOD_SEND, reg_req.method_mask);
+ 	for (i = 1; i <= ib_device->phys_port_cnt; i++) {
+@@ -4436,7 +4408,6 @@ static void cm_add_one(struct ib_device *ib_device)
+ 		cm_remove_port_fs(port);
+ 	}
+ free:
+-	device_unregister(cm_dev->device);
+ 	kfree(cm_dev);
+ }
+ 
+@@ -4490,7 +4461,6 @@ static void cm_remove_one(struct ib_device *ib_device, void *client_data)
+ 		cm_remove_port_fs(port);
+ 	}
+ 
+-	device_unregister(cm_dev->device);
+ 	kfree(cm_dev);
+ }
+ 
+* Unmerged path drivers/infiniband/core/core_priv.h
+diff --git a/drivers/infiniband/core/sysfs.c b/drivers/infiniband/core/sysfs.c
+index 7e51b406e89a..41689a1627e7 100644
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@ -1366,3 +1366,46 @@ void ib_device_unregister_sysfs(struct ib_device *device)
+ 	/* Balances with device_add */
+ 	device_del(&device->dev);
+ }
++
++/**
++ * ib_port_register_module_stat - add module counters under relevant port
++ *  of IB device.
++ *
++ * @device: IB device to add counters
++ * @port_num: valid port number
++ * @kobj: pointer to the kobject to initialize
++ * @ktype: pointer to the ktype for this kobject.
++ * @name: the name of the kobject
++ */
++int ib_port_register_module_stat(struct ib_device *device, u8 port_num,
++				 struct kobject *kobj, struct kobj_type *ktype,
++				 const char *name)
++{
++	struct kobject *p, *t;
++	int ret;
++
++	list_for_each_entry_safe(p, t, &device->coredev.port_list, entry) {
++		struct ib_port *port = container_of(p, struct ib_port, kobj);
++
++		if (port->port_num != port_num)
++			continue;
++
++		ret = kobject_init_and_add(kobj, ktype, &port->kobj, "%s",
++					   name);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(ib_port_register_module_stat);
++
++/**
++ * ib_port_unregister_module_stat - release module counters
++ * @kobj: pointer to the kobject to release
++ */
++void ib_port_unregister_module_stat(struct kobject *kobj)
++{
++	kobject_put(kobj);
++}
++EXPORT_SYMBOL(ib_port_unregister_module_stat);
