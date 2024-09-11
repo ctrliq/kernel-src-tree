@@ -1,0 +1,258 @@
+udp: Update reuse->has_conns under reuseport_lock.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Kuniyuki Iwashima <kuniyu@amazon.com>
+commit 69421bf98482d089e50799f45e48b25ce4a8d154
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/69421bf9.failed
+
+When we call connect() for a UDP socket in a reuseport group, we have
+to update sk->sk_reuseport_cb->has_conns to 1.  Otherwise, the kernel
+could select a unconnected socket wrongly for packets sent to the
+connected socket.
+
+However, the current way to set has_conns is illegal and possible to
+trigger that problem.  reuseport_has_conns() changes has_conns under
+rcu_read_lock(), which upgrades the RCU reader to the updater.  Then,
+it must do the update under the updater's lock, reuseport_lock, but
+it doesn't for now.
+
+For this reason, there is a race below where we fail to set has_conns
+resulting in the wrong socket selection.  To avoid the race, let's split
+the reader and updater with proper locking.
+
+ cpu1                               cpu2
++----+                             +----+
+
+__ip[46]_datagram_connect()        reuseport_grow()
+.                                  .
+|- reuseport_has_conns(sk, true)   |- more_reuse = __reuseport_alloc(more_socks_size)
+|  .                               |
+|  |- rcu_read_lock()
+|  |- reuse = rcu_dereference(sk->sk_reuseport_cb)
+|  |
+|  |                               |  /* reuse->has_conns == 0 here */
+|  |                               |- more_reuse->has_conns = reuse->has_conns
+|  |- reuse->has_conns = 1         |  /* more_reuse->has_conns SHOULD BE 1 HERE */
+|  |                               |
+|  |                               |- rcu_assign_pointer(reuse->socks[i]->sk_reuseport_cb,
+|  |                               |                     more_reuse)
+|  `- rcu_read_unlock()            `- kfree_rcu(reuse, rcu)
+|
+|- sk->sk_state = TCP_ESTABLISHED
+
+Note the likely(reuse) in reuseport_has_conns_set() is always true,
+but we put the test there for ease of review.  [0]
+
+For the record, usually, sk_reuseport_cb is changed under lock_sock().
+The only exception is reuseport_grow() & TCP reqsk migration case.
+
+  1) shutdown() TCP listener, which is moved into the latter part of
+     reuse->socks[] to migrate reqsk.
+
+  2) New listen() overflows reuse->socks[] and call reuseport_grow().
+
+  3) reuse->max_socks overflows u16 with the new listener.
+
+  4) reuseport_grow() pops the old shutdown()ed listener from the array
+     and update its sk->sk_reuseport_cb as NULL without lock_sock().
+
+shutdown()ed TCP sk->sk_reuseport_cb can be changed without lock_sock(),
+but, reuseport_has_conns_set() is called only for UDP under lock_sock(),
+so likely(reuse) never be false in reuseport_has_conns_set().
+
+[0]: https://lore.kernel.org/netdev/CANn89iLja=eQHbsM_Ta2sQF0tOGU8vAGrh_izRuuHjuO1ouUag@mail.gmail.com/
+
+Fixes: acdcecc61285 ("udp: correct reuseport selection with connected sockets")
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Link: https://lore.kernel.org/r/20221014182625.89913-1-kuniyu@amazon.com
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+(cherry picked from commit 69421bf98482d089e50799f45e48b25ce4a8d154)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sock_reuseport.c
+diff --cc net/core/sock_reuseport.c
+index 7227c7a35314,fb90e1e00773..000000000000
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@@ -17,6 -18,90 +17,93 @@@
+  DEFINE_SPINLOCK(reuseport_lock);
+  
+  static DEFINE_IDA(reuseport_ida);
+++<<<<<<< HEAD
+++=======
++ static int reuseport_resurrect(struct sock *sk, struct sock_reuseport *old_reuse,
++ 			       struct sock_reuseport *reuse, bool bind_inany);
++ 
++ void reuseport_has_conns_set(struct sock *sk)
++ {
++ 	struct sock_reuseport *reuse;
++ 
++ 	if (!rcu_access_pointer(sk->sk_reuseport_cb))
++ 		return;
++ 
++ 	spin_lock_bh(&reuseport_lock);
++ 	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
++ 					  lockdep_is_held(&reuseport_lock));
++ 	if (likely(reuse))
++ 		reuse->has_conns = 1;
++ 	spin_unlock_bh(&reuseport_lock);
++ }
++ EXPORT_SYMBOL(reuseport_has_conns_set);
++ 
++ static int reuseport_sock_index(struct sock *sk,
++ 				const struct sock_reuseport *reuse,
++ 				bool closed)
++ {
++ 	int left, right;
++ 
++ 	if (!closed) {
++ 		left = 0;
++ 		right = reuse->num_socks;
++ 	} else {
++ 		left = reuse->max_socks - reuse->num_closed_socks;
++ 		right = reuse->max_socks;
++ 	}
++ 
++ 	for (; left < right; left++)
++ 		if (reuse->socks[left] == sk)
++ 			return left;
++ 	return -1;
++ }
++ 
++ static void __reuseport_add_sock(struct sock *sk,
++ 				 struct sock_reuseport *reuse)
++ {
++ 	reuse->socks[reuse->num_socks] = sk;
++ 	/* paired with smp_rmb() in reuseport_(select|migrate)_sock() */
++ 	smp_wmb();
++ 	reuse->num_socks++;
++ }
++ 
++ static bool __reuseport_detach_sock(struct sock *sk,
++ 				    struct sock_reuseport *reuse)
++ {
++ 	int i = reuseport_sock_index(sk, reuse, false);
++ 
++ 	if (i == -1)
++ 		return false;
++ 
++ 	reuse->socks[i] = reuse->socks[reuse->num_socks - 1];
++ 	reuse->num_socks--;
++ 
++ 	return true;
++ }
++ 
++ static void __reuseport_add_closed_sock(struct sock *sk,
++ 					struct sock_reuseport *reuse)
++ {
++ 	reuse->socks[reuse->max_socks - reuse->num_closed_socks - 1] = sk;
++ 	/* paired with READ_ONCE() in inet_csk_bind_conflict() */
++ 	WRITE_ONCE(reuse->num_closed_socks, reuse->num_closed_socks + 1);
++ }
++ 
++ static bool __reuseport_detach_closed_sock(struct sock *sk,
++ 					   struct sock_reuseport *reuse)
++ {
++ 	int i = reuseport_sock_index(sk, reuse, true);
++ 
++ 	if (i == -1)
++ 		return false;
++ 
++ 	reuse->socks[i] = reuse->socks[reuse->max_socks - reuse->num_closed_socks];
++ 	/* paired with READ_ONCE() in inet_csk_bind_conflict() */
++ 	WRITE_ONCE(reuse->num_closed_socks, reuse->num_closed_socks - 1);
++ 
++ 	return true;
++ }
+++>>>>>>> 69421bf98482 (udp: Update reuse->has_conns under reuseport_lock.)
+  
+  static struct sock_reuseport *__reuseport_alloc(unsigned int max_socks)
+  {
+diff --git a/include/net/sock_reuseport.h b/include/net/sock_reuseport.h
+index 3ecaa15d1850..8ec293d63729 100644
+--- a/include/net/sock_reuseport.h
++++ b/include/net/sock_reuseport.h
+@@ -38,21 +38,20 @@ extern struct sock *reuseport_select_sock(struct sock *sk,
+ extern int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog);
+ extern int reuseport_detach_prog(struct sock *sk);
+ 
+-static inline bool reuseport_has_conns(struct sock *sk, bool set)
++static inline bool reuseport_has_conns(struct sock *sk)
+ {
+ 	struct sock_reuseport *reuse;
+ 	bool ret = false;
+ 
+ 	rcu_read_lock();
+ 	reuse = rcu_dereference(sk->sk_reuseport_cb);
+-	if (reuse) {
+-		if (set)
+-			reuse->has_conns = 1;
+-		ret = reuse->has_conns;
+-	}
++	if (reuse && reuse->has_conns)
++		ret = true;
+ 	rcu_read_unlock();
+ 
+ 	return ret;
+ }
+ 
++void reuseport_has_conns_set(struct sock *sk);
++
+ #endif  /* _SOCK_REUSEPORT_H */
+* Unmerged path net/core/sock_reuseport.c
+diff --git a/net/ipv4/datagram.c b/net/ipv4/datagram.c
+index 69924d9cea0c..9ae3d327e2c6 100644
+--- a/net/ipv4/datagram.c
++++ b/net/ipv4/datagram.c
+@@ -74,7 +74,7 @@ int __ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len
+ 	}
+ 	inet->inet_daddr = fl4->daddr;
+ 	inet->inet_dport = usin->sin_port;
+-	reuseport_has_conns(sk, true);
++	reuseport_has_conns_set(sk);
+ 	sk->sk_state = TCP_ESTABLISHED;
+ 	sk_set_txhash(sk);
+ 	inet->inet_id = prandom_u32();
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 4a432858266c..91d01d31e431 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -450,7 +450,7 @@ static struct sock *udp4_lib_lookup2(struct net *net,
+ 			result = lookup_reuseport(net, sk, skb,
+ 						  saddr, sport, daddr, hnum);
+ 			/* Fall back to scoring if group has connections */
+-			if (result && !reuseport_has_conns(sk, false))
++			if (result && !reuseport_has_conns(sk))
+ 				return result;
+ 
+ 			result = result ? : sk;
+diff --git a/net/ipv6/datagram.c b/net/ipv6/datagram.c
+index f9523502a5da..8536fc74ff1b 100644
+--- a/net/ipv6/datagram.c
++++ b/net/ipv6/datagram.c
+@@ -259,7 +259,7 @@ int __ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr,
+ 		goto out;
+ 	}
+ 
+-	reuseport_has_conns(sk, true);
++	reuseport_has_conns_set(sk);
+ 	sk->sk_state = TCP_ESTABLISHED;
+ 	sk_set_txhash(sk);
+ out:
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index 8083aac3d992..bd41281f7765 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -195,7 +195,7 @@ static struct sock *udp6_lib_lookup2(struct net *net,
+ 			result = lookup_reuseport(net, sk, skb,
+ 						  saddr, sport, daddr, hnum);
+ 			/* Fall back to scoring if group has connections */
+-			if (result && !reuseport_has_conns(sk, false))
++			if (result && !reuseport_has_conns(sk))
+ 				return result;
+ 
+ 			result = result ? : sk;
