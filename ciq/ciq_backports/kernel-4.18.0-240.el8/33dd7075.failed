@@ -1,0 +1,198 @@
+lib: Uplevel the pmem "region" ida to a global allocator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 33dd70752cd76f4d883a165a674f13121a4155ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/33dd7075.failed
+
+In preparation for handling platform differentiated memory types beyond
+persistent memory, uplevel the "region" identifier to a global number
+space. This enables a device-dax instance to be registered to any memory
+type with guaranteed unique names.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 33dd70752cd76f4d883a165a674f13121a4155ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/Kconfig
+diff --cc lib/Kconfig
+index f36dc6e52088,0dc043ac271d..000000000000
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@@ -603,6 -606,13 +603,16 @@@ config ARCH_HAS_SG_CHAI
+  config ARCH_HAS_PMEM_API
+  	bool
+  
+++<<<<<<< HEAD
+++=======
++ config MEMREGION
++ 	bool
++ 
++ # use memcpy to implement user copies for nommu architectures
++ config UACCESS_MEMCPY
++ 	bool
++ 
+++>>>>>>> 33dd70752cd7 (lib: Uplevel the pmem "region" ida to a global allocator)
+  config ARCH_HAS_UACCESS_FLUSHCACHE
+  	bool
+  
+diff --git a/drivers/nvdimm/Kconfig b/drivers/nvdimm/Kconfig
+index 1e169bfd2f96..de6674576857 100644
+--- a/drivers/nvdimm/Kconfig
++++ b/drivers/nvdimm/Kconfig
+@@ -3,6 +3,7 @@ menuconfig LIBNVDIMM
+ 	depends on PHYS_ADDR_T_64BIT
+ 	depends on HAS_IOMEM
+ 	depends on BLK_DEV
++	select MEMREGION
+ 	help
+ 	  Generic support for non-volatile memory devices including
+ 	  ACPI-6-NFIT defined resources.  On platforms that define an
+diff --git a/drivers/nvdimm/core.c b/drivers/nvdimm/core.c
+index acce050856a8..75fe651d327d 100644
+--- a/drivers/nvdimm/core.c
++++ b/drivers/nvdimm/core.c
+@@ -463,7 +463,6 @@ static __exit void libnvdimm_exit(void)
+ 	nd_region_exit();
+ 	nvdimm_exit();
+ 	nvdimm_bus_exit();
+-	nd_region_devs_exit();
+ 	nvdimm_devs_exit();
+ }
+ 
+diff --git a/drivers/nvdimm/nd-core.h b/drivers/nvdimm/nd-core.h
+index d5c4d962b5ed..ba6815195352 100644
+--- a/drivers/nvdimm/nd-core.h
++++ b/drivers/nvdimm/nd-core.h
+@@ -121,7 +121,6 @@ struct nvdimm_bus *walk_to_nvdimm_bus(struct device *nd_dev);
+ int __init nvdimm_bus_init(void);
+ void nvdimm_bus_exit(void);
+ void nvdimm_devs_exit(void);
+-void nd_region_devs_exit(void);
+ struct nd_region;
+ void nd_region_advance_seeds(struct nd_region *nd_region, struct device *dev);
+ void nd_region_create_ns_seed(struct nd_region *nd_region);
+diff --git a/drivers/nvdimm/region_devs.c b/drivers/nvdimm/region_devs.c
+index f4c680fc5e01..7ce588e498fb 100644
+--- a/drivers/nvdimm/region_devs.c
++++ b/drivers/nvdimm/region_devs.c
+@@ -11,6 +11,7 @@
+  * General Public License for more details.
+  */
+ #include <linux/scatterlist.h>
++#include <linux/memregion.h>
+ #include <linux/highmem.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+@@ -27,7 +28,6 @@
+  */
+ #include <linux/io-64-nonatomic-hi-lo.h>
+ 
+-static DEFINE_IDA(region_ida);
+ static DEFINE_PER_CPU(int, flush_idx);
+ 
+ static int nvdimm_map_flush(struct device *dev, struct nvdimm *nvdimm, int dimm,
+@@ -141,7 +141,7 @@ static void nd_region_release(struct device *dev)
+ 		put_device(&nvdimm->dev);
+ 	}
+ 	free_percpu(nd_region->lane);
+-	ida_simple_remove(&region_ida, nd_region->id);
++	memregion_free(nd_region->id);
+ 	if (is_nd_blk(dev))
+ 		kfree(to_nd_blk_region(dev));
+ 	else
+@@ -991,7 +991,7 @@ static struct nd_region *nd_region_create(struct nvdimm_bus *nvdimm_bus,
+ 
+ 	if (!region_buf)
+ 		return NULL;
+-	nd_region->id = ida_simple_get(&region_ida, 0, 0, GFP_KERNEL);
++	nd_region->id = memregion_alloc(GFP_KERNEL);
+ 	if (nd_region->id < 0)
+ 		goto err_id;
+ 
+@@ -1045,7 +1045,7 @@ static struct nd_region *nd_region_create(struct nvdimm_bus *nvdimm_bus,
+ 	return nd_region;
+ 
+  err_percpu:
+-	ida_simple_remove(&region_ida, nd_region->id);
++	memregion_free(nd_region->id);
+  err_id:
+ 	kfree(region_buf);
+ 	return NULL;
+@@ -1192,8 +1192,3 @@ int nd_region_conflict(struct nd_region *nd_region, resource_size_t start,
+ 
+ 	return device_for_each_child(&nvdimm_bus->dev, &ctx, region_conflict);
+ }
+-
+-void __exit nd_region_devs_exit(void)
+-{
+-	ida_destroy(&region_ida);
+-}
+diff --git a/include/linux/memregion.h b/include/linux/memregion.h
+new file mode 100644
+index 000000000000..7de7c0a1444e
+--- /dev/null
++++ b/include/linux/memregion.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _MEMREGION_H_
++#define _MEMREGION_H_
++#include <linux/types.h>
++#include <linux/errno.h>
++
++#ifdef CONFIG_MEMREGION
++int memregion_alloc(gfp_t gfp);
++void memregion_free(int id);
++#else
++static inline int memregion_alloc(gfp_t gfp)
++{
++	return -ENOMEM;
++}
++void memregion_free(int id)
++{
++}
++#endif
++#endif /* _MEMREGION_H_ */
+* Unmerged path lib/Kconfig
+diff --git a/lib/Makefile b/lib/Makefile
+index 8eadf85ad2ad..acb63b2a7bef 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -212,6 +212,7 @@ obj-$(CONFIG_GENERIC_NET_UTILS) += net_utils.o
+ 
+ obj-$(CONFIG_SG_SPLIT) += sg_split.o
+ obj-$(CONFIG_SG_POOL) += sg_pool.o
++obj-$(CONFIG_MEMREGION) += memregion.o
+ obj-$(CONFIG_STMP_DEVICE) += stmp_device.o
+ obj-$(CONFIG_IRQ_POLL) += irq_poll.o
+ 
+diff --git a/lib/memregion.c b/lib/memregion.c
+new file mode 100644
+index 000000000000..77c85b5251da
+--- /dev/null
++++ b/lib/memregion.c
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* identifiers for device / performance-differentiated memory regions */
++#include <linux/idr.h>
++#include <linux/types.h>
++
++static DEFINE_IDA(memregion_ids);
++
++int memregion_alloc(gfp_t gfp)
++{
++	return ida_alloc(&memregion_ids, gfp);
++}
++EXPORT_SYMBOL(memregion_alloc);
++
++void memregion_free(int id)
++{
++	ida_free(&memregion_ids, id);
++}
++EXPORT_SYMBOL(memregion_free);
