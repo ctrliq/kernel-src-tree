@@ -1,0 +1,133 @@
+mm: allow swappiness that prefers reclaiming anon over the file workingset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit c843966c556d7370bb32e7319a6d164cb8c70ae2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c843966c.failed
+
+With the advent of fast random IO devices (SSDs, PMEM) and in-memory swap
+devices such as zswap, it's possible for swap to be much faster than
+filesystems, and for swapping to be preferable over thrashing filesystem
+caches.
+
+Allow setting swappiness - which defines the rough relative IO cost of
+cache misses between page cache and swap-backed pages - to reflect such
+situations by making the swap-preferred range configurable.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+Link: http://lkml.kernel.org/r/20200520232525.798933-4-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c843966c556d7370bb32e7319a6d164cb8c70ae2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sysctl/vm.txt
+diff --cc Documentation/sysctl/vm.txt
+index 5e866027a092,d46d5b7013c6..000000000000
+--- a/Documentation/sysctl/vm.txt
++++ b/Documentation/sysctl/vm.txt
+@@@ -791,24 -823,49 +791,40 @@@ do
+  	echo 0 > /proc/sys/vm/numa_stat
+  
+  When page allocation performance is not a bottleneck and you want all
+ -tooling to work, you can do::
+ -
+ +tooling to work, you can do:
+  	echo 1 > /proc/sys/vm/numa_stat
+  
+ +==============================================================
+  
+  swappiness
+ -==========
+  
+- This control is used to define how aggressive the kernel will swap
+- memory pages.  Higher values will increase aggressiveness, lower values
+- decrease the amount of swap.  A value of 0 instructs the kernel not to
+- initiate swap until the amount of free and file-backed pages is less
+- than the high water mark in a zone.
++ This control is used to define the rough relative IO cost of swapping
++ and filesystem paging, as a value between 0 and 200. At 100, the VM
++ assumes equal IO cost and will thus apply memory pressure to the page
++ cache and swap-backed pages equally; lower values signify more
++ expensive swap IO, higher values indicates cheaper.
++ 
++ Keep in mind that filesystem IO patterns under memory pressure tend to
++ be more efficient than swap's random IO. An optimal value will require
++ experimentation and will also be workload-dependent.
+  
+  The default value is 60.
+  
+++<<<<<<< HEAD:Documentation/sysctl/vm.txt
+ +==============================================================
+++=======
++ For in-memory swap, like zram or zswap, as well as hybrid setups that
++ have swap on faster devices than the filesystem, values beyond 100 can
++ be considered. For example, if the random IO against the swap device
++ is on average 2x faster than IO from the filesystem, swappiness should
++ be 133 (x + 2x = 200, 2x = 133.33).
++ 
++ At 0, the kernel will not initiate swap until the amount of free and
++ file-backed pages is less than the high watermark in a zone.
++ 
+++>>>>>>> c843966c556d (mm: allow swappiness that prefers reclaiming anon over the file workingset):Documentation/admin-guide/sysctl/vm.rst
+  
+ -unprivileged_userfaultfd
+ -========================
+ -
+ -This flag controls whether unprivileged users can use the userfaultfd
+ -system calls.  Set this to 1 to allow unprivileged users to use the
+ -userfaultfd system calls, or set this to 0 to restrict userfaultfd to only
+ -privileged users (with SYS_CAP_PTRACE capability).
+ -
+ -The default value is 1.
+ -
+ -
+ -user_reserve_kbytes
+ -===================
+ +- user_reserve_kbytes
+  
+  When overcommit_memory is set to 2, "never overcommit" mode, reserve
+  min(3% of current process size, user_reserve_kbytes) of free memory.
+* Unmerged path Documentation/sysctl/vm.txt
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index d9e0aff1f72d..a02f1b51480c 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -129,6 +129,7 @@ static unsigned long zero_ul;
+ static unsigned long one_ul = 1;
+ static unsigned long long_max = LONG_MAX;
+ static int one_hundred = 100;
++static int two_hundred = 200;
+ static int one_thousand = 1000;
+ #ifdef CONFIG_PRINTK
+ static int ten_thousand = 10000;
+@@ -1376,7 +1377,7 @@ static struct ctl_table vm_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+ 		.extra1		= SYSCTL_ZERO,
+-		.extra2		= &one_hundred,
++		.extra2		= &two_hundred,
+ 	},
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	{
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index deba1ddc925b..1b22870c238b 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -148,7 +148,7 @@ struct scan_control {
+ #endif
+ 
+ /*
+- * From 0 .. 100.  Higher means more swappy.
++ * From 0 .. 200.  Higher means more swappy.
+  */
+ int vm_swappiness = 60;
+ /*
