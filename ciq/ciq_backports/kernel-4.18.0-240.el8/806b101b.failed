@@ -1,0 +1,532 @@
+RDMA/mlx5: Use a dedicated mkey xarray for ODP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 806b101b2bfa800a9c779336b750bee39c7fb3b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/806b101b.failed
+
+There is a per device xarray storing mkeys that is used to store every
+mkey in the system. However, this xarray is now only read by ODP for
+certain ODP designated MRs (ODP, implicit ODP, MW, DEVX_INDIRECT).
+
+Create an xarray only for use by ODP, that only contains ODP related
+MKeys. This xarray is protected by SRCU and all erases are protected by a
+synchronize.
+
+This improves performance:
+
+ - All MRs in the odp_mkeys xarray are ODP MRs, so some tests for is_odp()
+   can be deleted. The xarray will also consume fewer nodes.
+
+ - normal MR's are never mixed with ODP MRs in a SRCU data structure so
+   performance sucking synchronize_srcu() on every MR destruction is not
+   needed.
+
+ - No smp_load_acquire(live) and xa_load() double barrier on read
+
+Due to the SRCU locking scheme care must be taken with the placement of
+the xa_store(). Once it completes the MR is immediately visible to other
+threads and only through a xa_erase() & synchronize_srcu() cycle could it
+be destroyed.
+
+Link: https://lore.kernel.org/r/20191009160934.3143-4-jgg@ziepe.ca
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 806b101b2bfa800a9c779336b750bee39c7fb3b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index e2bebcd6069c,2cf91db6a36f..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -604,7 -606,6 +604,10 @@@ struct mlx5_ib_mr 
+  	struct mlx5_ib_dev     *dev;
+  	u32 out[MLX5_ST_SZ_DW(create_mkey_out)];
+  	struct mlx5_core_sig_ctx    *sig;
+++<<<<<<< HEAD
+ +	int			live;
+++=======
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  	void			*descs_alloc;
+  	int			access_flags; /* Needed for rereg MR */
+  
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index e1a55424baa3,60b12dc53004..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1343,9 -1324,16 +1332,16 @@@ struct ib_mr *mlx5_ib_reg_user_mr(struc
+  		}
+  	}
+  
+ -	if (is_odp_mr(mr)) {
+ -		to_ib_umem_odp(mr->umem)->private = mr;
+ +	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+ +		mr->live = 1;
+  		atomic_set(&mr->num_pending_prefetch, 0);
++ 		err = xa_err(xa_store(&dev->odp_mkeys,
++ 				      mlx5_base_mkey(mr->mmkey.key), &mr->mmkey,
++ 				      GFP_KERNEL));
++ 		if (err) {
++ 			dereg_mr(dev, mr);
++ 			return ERR_PTR(err);
++ 		}
+  	}
+  
+  	return &mr->ibmr;
+@@@ -1588,10 -1576,10 +1584,14 @@@ static void dereg_mr(struct mlx5_ib_de
+  		/* Prevent new page faults and
+  		 * prefetch requests from succeeding
+  		 */
+++<<<<<<< HEAD
+ +		mr->live = 0;
+++=======
++ 		xa_erase(&dev->odp_mkeys, mlx5_base_mkey(mr->mmkey.key));
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  
+  		/* Wait for all running page-fault handlers to finish. */
+- 		synchronize_srcu(&dev->mr_srcu);
++ 		synchronize_srcu(&dev->odp_srcu);
+  
+  		/* dequeue pending prefetch requests for the mr */
+  		if (atomic_read(&mr->num_pending_prefetch))
+@@@ -1981,8 -1979,7 +1991,12 @@@ int mlx5_ib_dealloc_mw(struct ib_mw *mw
+  	int err;
+  
+  	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+++<<<<<<< HEAD
+ +		xa_erase_irq(&dev->mdev->priv.mkey_table,
+ +			     mlx5_base_mkey(mmw->mmkey.key));
+++=======
++ 		xa_erase(&dev->odp_mkeys, mlx5_base_mkey(mmw->mmkey.key));
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  		/*
+  		 * pagefault_single_data_segment() may be accessing mmw under
+  		 * SRCU if the user bound an ODP MR to this MW.
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index df3038ca913b,1f06433bcfc8..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -229,18 -229,18 +229,23 @@@ static void mr_leaf_free_action(struct 
+  	int srcu_key;
+  
+  	mr->parent = NULL;
+- 	synchronize_srcu(&mr->dev->mr_srcu);
++ 	synchronize_srcu(&mr->dev->odp_srcu);
+  
+++<<<<<<< HEAD
+ +	if (imr->live) {
+ +		srcu_key = srcu_read_lock(&mr->dev->mr_srcu);
+++=======
++ 	if (xa_load(&mr->dev->odp_mkeys, mlx5_base_mkey(imr->mmkey.key))) {
++ 		srcu_key = srcu_read_lock(&mr->dev->odp_srcu);
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  		mutex_lock(&odp_imr->umem_mutex);
+  		mlx5_ib_update_xlt(imr, idx, 1, 0,
+  				   MLX5_IB_UPD_XLT_INDIRECT |
+  				   MLX5_IB_UPD_XLT_ATOMIC);
+  		mutex_unlock(&odp_imr->umem_mutex);
+- 		srcu_read_unlock(&mr->dev->mr_srcu, srcu_key);
++ 		srcu_read_unlock(&mr->dev->odp_srcu, srcu_key);
+  	}
+ -	ib_umem_odp_release(odp);
+ +	ib_umem_release(&odp->umem);
+  	mlx5_mr_cache_free(mr->dev, mr);
+  
+  	if (atomic_dec_and_test(&imr->num_leaf_free))
+@@@ -324,10 -316,10 +329,15 @@@ void mlx5_ib_invalidate_range(struct ib
+  
+  	ib_umem_odp_unmap_dma_pages(umem_odp, start, end);
+  
+ +
+  	if (unlikely(!umem_odp->npages && mr->parent &&
+  		     !umem_odp->dying)) {
+++<<<<<<< HEAD
+ +		WRITE_ONCE(umem_odp->dying, 1);
+++=======
++ 		xa_erase(&mr->dev->odp_mkeys, mlx5_base_mkey(mr->mmkey.key));
++ 		umem_odp->dying = 1;
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  		atomic_inc(&mr->parent->num_leaf_free);
+  		schedule_work(&umem_odp->work);
+  	}
+@@@ -521,6 -520,9 +538,12 @@@ next_mr
+  		mtt->parent = mr;
+  		INIT_WORK(&odp->work, mr_leaf_free_action);
+  
+++<<<<<<< HEAD
+++=======
++ 		xa_store(&dev->odp_mkeys, mlx5_base_mkey(mtt->mmkey.key),
++ 			 &mtt->mmkey, GFP_ATOMIC);
++ 
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  		if (!nentries)
+  			start_idx = addr >> MLX5_IMR_MTT_SHIFT;
+  		nentries++;
+@@@ -573,8 -575,8 +596,13 @@@ struct mlx5_ib_mr *mlx5_ib_alloc_implic
+  	init_waitqueue_head(&imr->q_leaf_free);
+  	atomic_set(&imr->num_leaf_free, 0);
+  	atomic_set(&imr->num_pending_prefetch, 0);
+++<<<<<<< HEAD
+ +
+ +	imr->is_odp_implicit = true;
+++=======
++ 	xa_store(&imr->dev->odp_mkeys, mlx5_base_mkey(imr->mmkey.key),
++ 		 &imr->mmkey, GFP_ATOMIC);
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  
+  	return imr;
+  }
+@@@ -815,33 -818,8 +858,36 @@@ next_mr
+  	switch (mmkey->type) {
+  	case MLX5_MKEY_MR:
+  		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
+++<<<<<<< HEAD
+ +		if (!mr->live || !mr->ibmr.pd) {
+ +			mlx5_ib_dbg(dev, "got dead MR\n");
+ +			ret = -EFAULT;
+ +			goto srcu_unlock;
+ +		}
+ +
+ +		if (prefetch) {
+ +			if (!is_odp_mr(mr) ||
+ +			    mr->ibmr.pd != pd) {
+ +				mlx5_ib_dbg(dev, "Invalid prefetch request: %s\n",
+ +					    is_odp_mr(mr) ?  "MR is not ODP" :
+ +					    "PD is not of the MR");
+ +				ret = -EINVAL;
+ +				goto srcu_unlock;
+ +			}
+ +		}
+  
+ -		ret = pagefault_mr(mr, io_virt, bcnt, bytes_mapped, 0);
+ +		if (!is_odp_mr(mr)) {
+ +			mlx5_ib_dbg(dev, "skipping non ODP MR (lkey=0x%06x) in page fault handler.\n",
+ +				    key);
+ +			if (bytes_mapped)
+ +				*bytes_mapped += bcnt;
+ +			ret = 0;
+ +			goto srcu_unlock;
+ +		}
+++=======
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+ +
+ +		ret = pagefault_mr(dev, mr, io_virt, bcnt, bytes_mapped, flags);
+  		if (ret < 0)
+  			goto srcu_unlock;
+  
+@@@ -1636,75 -1606,134 +1682,182 @@@ int mlx5_ib_odp_init(void
+  
+  struct prefetch_mr_work {
+  	struct work_struct work;
+ +	struct ib_pd *pd;
+  	u32 pf_flags;
+  	u32 num_sge;
+ -	struct {
+ -		u64 io_virt;
+ -		struct mlx5_ib_mr *mr;
+ -		size_t length;
+ -	} frags[];
+ +	struct ib_sge sg_list[0];
+  };
+  
+ -static void destroy_prefetch_work(struct prefetch_mr_work *work)
+ +static void num_pending_prefetch_dec(struct mlx5_ib_dev *dev,
+ +				     struct ib_sge *sg_list, u32 num_sge,
+ +				     u32 from)
+  {
+  	u32 i;
+++<<<<<<< HEAD
+++=======
++ 
++ 	for (i = 0; i < work->num_sge; ++i)
++ 		atomic_dec(&work->frags[i].mr->num_pending_prefetch);
++ 	kvfree(work);
++ }
++ 
++ static struct mlx5_ib_mr *
++ get_prefetchable_mr(struct ib_pd *pd, enum ib_uverbs_advise_mr_advice advice,
++ 		    u32 lkey)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	struct mlx5_core_mkey *mmkey;
++ 	struct ib_umem_odp *odp;
++ 	struct mlx5_ib_mr *mr;
++ 
++ 	lockdep_assert_held(&dev->odp_srcu);
++ 
++ 	mmkey = xa_load(&dev->odp_mkeys, mlx5_base_mkey(lkey));
++ 	if (!mmkey || mmkey->key != lkey || mmkey->type != MLX5_MKEY_MR)
++ 		return NULL;
++ 
++ 	mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
++ 
++ 	if (mr->ibmr.pd != pd)
++ 		return NULL;
++ 
++ 	/*
++ 	 * Implicit child MRs are internal and userspace should not refer to
++ 	 * them.
++ 	 */
++ 	if (mr->parent)
++ 		return NULL;
++ 
++ 	odp = to_ib_umem_odp(mr->umem);
++ 
++ 	/* prefetch with write-access must be supported by the MR */
++ 	if (advice == IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE &&
++ 	    !odp->umem.writable)
++ 		return NULL;
++ 
++ 	return mr;
++ }
++ 
++ static void mlx5_ib_prefetch_mr_work(struct work_struct *w)
++ {
++ 	struct prefetch_mr_work *work =
++ 		container_of(w, struct prefetch_mr_work, work);
++ 	u32 bytes_mapped = 0;
++ 	u32 i;
++ 
++ 	for (i = 0; i < work->num_sge; ++i)
++ 		pagefault_mr(work->frags[i].mr, work->frags[i].io_virt,
++ 			     work->frags[i].length, &bytes_mapped,
++ 			     work->pf_flags);
++ 
++ 	destroy_prefetch_work(work);
++ }
++ 
++ static bool init_prefetch_work(struct ib_pd *pd,
++ 			       enum ib_uverbs_advise_mr_advice advice,
++ 			       u32 pf_flags, struct prefetch_mr_work *work,
++ 			       struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	u32 i;
++ 
++ 	INIT_WORK(&work->work, mlx5_ib_prefetch_mr_work);
++ 	work->pf_flags = pf_flags;
++ 
++ 	for (i = 0; i < num_sge; ++i) {
++ 		work->frags[i].io_virt = sg_list[i].addr;
++ 		work->frags[i].length = sg_list[i].length;
++ 		work->frags[i].mr =
++ 			get_prefetchable_mr(pd, advice, sg_list[i].lkey);
++ 		if (!work->frags[i].mr) {
++ 			work->num_sge = i - 1;
++ 			if (i)
++ 				destroy_prefetch_work(work);
++ 			return false;
++ 		}
++ 
++ 		/* Keep the MR pointer will valid outside the SRCU */
++ 		atomic_inc(&work->frags[i].mr->num_pending_prefetch);
++ 	}
++ 	work->num_sge = num_sge;
++ 	return true;
++ }
++ 
++ static int mlx5_ib_prefetch_sg_list(struct ib_pd *pd,
++ 				    enum ib_uverbs_advise_mr_advice advice,
++ 				    u32 pf_flags, struct ib_sge *sg_list,
++ 				    u32 num_sge)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	u32 bytes_mapped = 0;
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  	int srcu_key;
+ -	int ret = 0;
+ -	u32 i;
+  
+++<<<<<<< HEAD
+ +	srcu_key = srcu_read_lock(&dev->mr_srcu);
+ +
+ +	for (i = from; i < num_sge; ++i) {
+ +		struct mlx5_core_mkey *mmkey;
+++=======
++ 	srcu_key = srcu_read_lock(&dev->odp_srcu);
++ 	for (i = 0; i < num_sge; ++i) {
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+ +		struct mlx5_ib_mr *mr;
+ +
+ +		mmkey = xa_load(&dev->mdev->priv.mkey_table,
+ +				mlx5_base_mkey(sg_list[i].lkey));
+ +		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
+ +		atomic_dec(&mr->num_pending_prefetch);
+ +	}
+ +
+++<<<<<<< HEAD
+ +	srcu_read_unlock(&dev->mr_srcu, srcu_key);
+ +}
+ +
+ +static bool num_pending_prefetch_inc(struct ib_pd *pd,
+ +				     struct ib_sge *sg_list, u32 num_sge)
+ +{
+ +	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ +	bool ret = true;
+ +	u32 i;
+ +
+ +	for (i = 0; i < num_sge; ++i) {
+ +		struct mlx5_core_mkey *mmkey;
+  		struct mlx5_ib_mr *mr;
+  
+ -		mr = get_prefetchable_mr(pd, advice, sg_list[i].lkey);
+ -		if (!mr) {
+ -			ret = -ENOENT;
+ -			goto out;
+ +		mmkey = xa_load(&dev->mdev->priv.mkey_table,
+ +				mlx5_base_mkey(sg_list[i].lkey));
+ +		if (!mmkey || mmkey->key != sg_list[i].lkey) {
+ +			ret = false;
+ +			break;
+  		}
+ -		ret = pagefault_mr(mr, sg_list[i].addr, sg_list[i].length,
+ -				   &bytes_mapped, pf_flags);
+ -		if (ret < 0)
+ -			goto out;
+ +
+ +		if (mmkey->type != MLX5_MKEY_MR) {
+ +			ret = false;
+ +			break;
+ +		}
+ +
+ +		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
+ +
+ +		if (mr->ibmr.pd != pd) {
+ +			ret = false;
+ +			break;
+ +		}
+ +
+ +		if (!mr->live) {
+ +			ret = false;
+ +			break;
+ +		}
+ +
+ +		atomic_inc(&mr->num_pending_prefetch);
+  	}
+ -	ret = 0;
+  
+ +	if (!ret)
+ +		num_pending_prefetch_dec(dev, sg_list, i, 0);
+ +
+++=======
++ out:
++ 	srcu_read_unlock(&dev->odp_srcu, srcu_key);
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  	return ret;
+  }
+  
+@@@ -1767,27 -1757,12 +1920,38 @@@ int mlx5_ib_advise_mr_prefetch(struct i
+  	if (!work)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	memcpy(work->sg_list, sg_list, num_sge * sizeof(struct ib_sge));
+ +
+ +	/* It is guaranteed that the pd when work is executed is the pd when
+ +	 * work was queued since pd can't be destroyed while it holds MRs and
+ +	 * destroying a MR leads to flushing the workquque
+ +	 */
+ +	work->pd = pd;
+ +	work->pf_flags = pf_flags;
+ +	work->num_sge = num_sge;
+ +
+ +	INIT_WORK(&work->work, mlx5_ib_prefetch_mr_work);
+ +
+ +	srcu_key = srcu_read_lock(&dev->mr_srcu);
+ +
+ +	valid_req = num_pending_prefetch_inc(pd, sg_list, num_sge);
+ +	if (valid_req)
+ +		queue_work(system_unbound_wq, &work->work);
+ +	else
+ +		kvfree(work);
+ +
+ +	srcu_read_unlock(&dev->mr_srcu, srcu_key);
+ +
+ +	return valid_req ? 0 : -EINVAL;
+++=======
++ 	srcu_key = srcu_read_lock(&dev->odp_srcu);
++ 	if (!init_prefetch_work(pd, advice, pf_flags, work, sg_list, num_sge)) {
++ 		srcu_read_unlock(&dev->odp_srcu, srcu_key);
++ 		return -EINVAL;
++ 	}
++ 	queue_work(system_unbound_wq, &work->work);
++ 	srcu_read_unlock(&dev->odp_srcu, srcu_key);
++ 	return 0;
+++>>>>>>> 806b101b2bfa (RDMA/mlx5: Use a dedicated mkey xarray for ODP)
+  }
+diff --git a/drivers/infiniband/hw/mlx5/devx.c b/drivers/infiniband/hw/mlx5/devx.c
+index c6b831600d44..65a1a961b88d 100644
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@ -1264,8 +1264,8 @@ static int devx_handle_mkey_indirect(struct devx_obj *obj,
+ 	mkey->pd = MLX5_GET(mkc, mkc, pd);
+ 	devx_mr->ndescs = MLX5_GET(mkc, mkc, translations_octword_size);
+ 
+-	return xa_err(xa_store(&dev->mdev->priv.mkey_table,
+-			       mlx5_base_mkey(mkey->key), mkey, GFP_KERNEL));
++	return xa_err(xa_store(&dev->odp_mkeys, mlx5_base_mkey(mkey->key), mkey,
++			       GFP_KERNEL));
+ }
+ 
+ static int devx_handle_mkey_create(struct mlx5_ib_dev *dev,
+@@ -1344,9 +1344,9 @@ static int devx_obj_cleanup(struct ib_uobject *uobject,
+ 		 * the mmkey, we must wait for that to stop before freeing the
+ 		 * mkey, as another allocation could get the same mkey #.
+ 		 */
+-		xa_erase(&obj->ib_dev->mdev->priv.mkey_table,
++		xa_erase(&obj->ib_dev->odp_mkeys,
+ 			 mlx5_base_mkey(obj->devx_mr.mmkey.key));
+-		synchronize_srcu(&dev->mr_srcu);
++		synchronize_srcu(&dev->odp_srcu);
+ 	}
+ 
+ 	if (obj->flags & DEVX_OBJ_FLAGS_DCT)
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index ca3faf45438a..9fba913fcbb4 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -6141,10 +6141,10 @@ static struct ib_counters *mlx5_ib_create_counters(struct ib_device *device,
+ static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+ {
+ 	mlx5_ib_cleanup_multiport_master(dev);
+-	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+-		srcu_barrier(&dev->mr_srcu);
+-		cleanup_srcu_struct(&dev->mr_srcu);
+-	}
++	WARN_ON(!xa_empty(&dev->odp_mkeys));
++	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING))
++		srcu_barrier(&dev->odp_srcu);
++	cleanup_srcu_struct(&dev->odp_srcu);
+ 
+ 	WARN_ON(!xa_empty(&dev->sig_mrs));
+ 	WARN_ON(!bitmap_empty(dev->dm.memic_alloc_pages, MLX5_MAX_MEMIC_PAGES));
+@@ -6198,16 +6198,15 @@ static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
+ 	mutex_init(&dev->cap_mask_mutex);
+ 	INIT_LIST_HEAD(&dev->qp_list);
+ 	spin_lock_init(&dev->reset_flow_resource_lock);
++	xa_init(&dev->odp_mkeys);
+ 	xa_init(&dev->sig_mrs);
+ 
+ 	spin_lock_init(&dev->dm.lock);
+ 	dev->dm.dev = mdev;
+ 
+-	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
+-		err = init_srcu_struct(&dev->mr_srcu);
+-		if (err)
+-			goto err_mp;
+-	}
++	err = init_srcu_struct(&dev->odp_srcu);
++	if (err)
++		goto err_mp;
+ 
+ 	return 0;
+ 
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
