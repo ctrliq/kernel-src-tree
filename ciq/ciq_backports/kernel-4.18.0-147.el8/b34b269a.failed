@@ -1,0 +1,188 @@
+RDMA/device: Ensure that security memory is always freed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit b34b269ad85d7dd4a512487f2395c3be3e40f76a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b34b269a.failed
+
+Since this only frees memory it should be done during the release
+callback. Otherwise there are possible error flows where it might not get
+called if registration aborts.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b34b269ad85d7dd4a512487f2395c3be3e40f76a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index 47f3eaabe6fa,b997feac2c63..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -509,25 -518,37 +511,34 @@@ int ib_register_device(struct ib_devic
+  		WARN_ON_ONCE(!parent);
+  		device->dma_device = parent;
+  	}
+ -}
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&device_mutex);
+++=======
++ static void cleanup_device(struct ib_device *device)
++ {
++ 	ib_cache_cleanup_one(device);
++ 	ib_cache_release_one(device);
++ 	kfree(device->port_immutable);
++ }
+++>>>>>>> b34b269ad85d (RDMA/device: Ensure that security memory is always freed)
+  
+ -static int setup_device(struct ib_device *device)
+ -{
+ -	struct ib_udata uhw = {.outlen = 0, .inlen = 0};
+ -	int ret;
+ -
+ -	ret = ib_device_check_mandatory(device);
+ -	if (ret)
+ -		return ret;
+ +	if (strchr(device->name, '%')) {
+ +		ret = alloc_name(device->name);
+ +		if (ret)
+ +			goto out;
+ +	}
+  
+ -	ret = read_port_immutable(device);
+ -	if (ret) {
+ -		dev_warn(&device->dev,
+ -			 "Couldn't create per port immutable data\n");
+ -		return ret;
+ +	if (ib_device_check_mandatory(device)) {
+ +		ret = -EINVAL;
+ +		goto out;
+  	}
+  
+ -	memset(&device->attrs, 0, sizeof(device->attrs));
+ -	ret = device->ops.query_device(device, &device->attrs, &uhw);
+ +	ret = read_port_immutable(device);
+  	if (ret) {
+ -		dev_warn(&device->dev,
+ -			 "Couldn't query the device attributes\n");
+ -		goto port_cleanup;
+ +		pr_warn("Couldn't create per port immutable data %s\n",
+ +			device->name);
+ +		goto out;
+  	}
+  
+  	ret = setup_port_pkey_list(device);
+@@@ -538,9 -559,53 +549,59 @@@
+  
+  	ret = ib_cache_setup_one(device);
+  	if (ret) {
+++<<<<<<< HEAD
+ +		pr_warn("Couldn't set up InfiniBand P_Key/GID cache\n");
+ +		goto pkey_cleanup;
+ +	}
+++=======
++ 		dev_warn(&device->dev,
++ 			 "Couldn't set up InfiniBand P_Key/GID cache\n");
++ 		return ret;
++ 	}
++ 	return 0;
++ 
++ port_cleanup:
++ 	kfree(device->port_immutable);
++ 	return ret;
++ }
++ 
++ /**
++  * ib_register_device - Register an IB device with IB core
++  * @device:Device to register
++  *
++  * Low-level drivers use ib_register_device() to register their
++  * devices with the IB core.  All registered clients will receive a
++  * callback for each device that is added. @device must be allocated
++  * with ib_alloc_device().
++  */
++ int ib_register_device(struct ib_device *device, const char *name)
++ {
++ 	int ret;
++ 	struct ib_client *client;
++ 
++ 	setup_dma_device(device);
++ 
++ 	mutex_lock(&device_mutex);
++ 
++ 	if (strchr(name, '%')) {
++ 		ret = alloc_name(device, name);
++ 		if (ret)
++ 			goto out;
++ 	} else {
++ 		ret = dev_set_name(&device->dev, name);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 	if (__ib_device_get_by_name(dev_name(&device->dev))) {
++ 		ret = -ENFILE;
++ 		goto out;
++ 	}
++ 	strlcpy(device->name, dev_name(&device->dev), IB_DEVICE_NAME_MAX);
++ 
++ 	ret = setup_device(device);
++ 	if (ret)
++ 		goto out;
+++>>>>>>> b34b269ad85d (RDMA/device: Ensure that security memory is always freed)
+  
+  	device->index = __dev_new_index();
+  
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index f8e9b76f1ef7..73d3756bc8fa 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -177,7 +177,7 @@ int ib_get_cached_subnet_prefix(struct ib_device *device,
+ 				u64              *sn_pfx);
+ 
+ #ifdef CONFIG_SECURITY_INFINIBAND
+-void ib_security_destroy_port_pkey_list(struct ib_device *device);
++void ib_security_release_port_pkey_list(struct ib_device *device);
+ 
+ void ib_security_cache_change(struct ib_device *device,
+ 			      u8 port_num,
+@@ -199,7 +199,7 @@ int ib_mad_agent_security_setup(struct ib_mad_agent *agent,
+ void ib_mad_agent_security_cleanup(struct ib_mad_agent *agent);
+ int ib_mad_enforce_security(struct ib_mad_agent_private *map, u16 pkey_index);
+ #else
+-static inline void ib_security_destroy_port_pkey_list(struct ib_device *device)
++static inline void ib_security_release_port_pkey_list(struct ib_device *device)
+ {
+ }
+ 
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/core/security.c b/drivers/infiniband/core/security.c
+index b79b61bd6ee4..6f1285c00a54 100644
+--- a/drivers/infiniband/core/security.c
++++ b/drivers/infiniband/core/security.c
+@@ -554,13 +554,12 @@ void ib_security_cache_change(struct ib_device *device,
+ 	}
+ }
+ 
+-void ib_security_destroy_port_pkey_list(struct ib_device *device)
++void ib_security_release_port_pkey_list(struct ib_device *device)
+ {
+ 	struct pkey_index_qp_list *pkey, *tmp_pkey;
+ 	int i;
+ 
+ 	for (i = rdma_start_port(device); i <= rdma_end_port(device); i++) {
+-		spin_lock(&device->port_pkey_list[i].list_lock);
+ 		list_for_each_entry_safe(pkey,
+ 					 tmp_pkey,
+ 					 &device->port_pkey_list[i].pkey_list,
+@@ -568,7 +567,6 @@ void ib_security_destroy_port_pkey_list(struct ib_device *device)
+ 			list_del(&pkey->pkey_index_list);
+ 			kfree(pkey);
+ 		}
+-		spin_unlock(&device->port_pkey_list[i].list_lock);
+ 	}
+ }
+ 
