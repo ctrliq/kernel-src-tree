@@ -1,0 +1,154 @@
+netfilter: nf_tables: nft_exthdr: the presence return value should be little-endian
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Stephen Suryaputra <ssuryaextr@gmail.com>
+commit b428336676dbca363262cc134b6218205df4f530
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b4283366.failed
+
+On big-endian machine, the returned register data when the exthdr is
+present is not being compared correctly because little-endian is
+assumed. The function nft_cmp_fast_mask(), called by nft_cmp_fast_eval()
+and nft_cmp_fast_init(), calls cpu_to_le32().
+
+The following dump also shows that little endian is assumed:
+
+$ nft --debug=netlink add rule ip recordroute forward ip option rr exists counter
+ip
+  [ exthdr load ipv4 1b @ 7 + 0 present => reg 1 ]
+  [ cmp eq reg 1 0x01000000 ]
+  [ counter pkts 0 bytes 0 ]
+
+Lastly, debug print in nft_cmp_fast_init() and nft_cmp_fast_eval() when
+RR option exists in the packet shows that the comparison fails because
+the assumption:
+
+nft_cmp_fast_init:189 priv->sreg=4 desc.len=8 mask=0xff000000 data.data[0]=0x10003e0
+nft_cmp_fast_eval:57 regs->data[priv->sreg=4]=0x1 mask=0xff000000 priv->data=0x1000000
+
+v2: use nft_reg_store8() instead (Florian Westphal). Also to avoid the
+    warnings reported by kernel test robot.
+
+Fixes: dbb5281a1f84 ("netfilter: nf_tables: add support for matching IPv4 options")
+Fixes: c078ca3b0c5b ("netfilter: nft_exthdr: Add support for existence check")
+	Signed-off-by: Stephen Suryaputra <ssuryaextr@gmail.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit b428336676dbca363262cc134b6218205df4f530)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_exthdr.c
+diff --cc net/netfilter/nft_exthdr.c
+index a940c9fd9045,3c48cdc8935d..000000000000
+--- a/net/netfilter/nft_exthdr.c
++++ b/net/netfilter/nft_exthdr.c
+@@@ -62,6 -59,103 +62,106 @@@ err
+  	regs->verdict.code = NFT_BREAK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* find the offset to specified option.
++  *
++  * If target header is found, its offset is set in *offset and return option
++  * number. Otherwise, return negative error.
++  *
++  * If the first fragment doesn't contain the End of Options it is considered
++  * invalid.
++  */
++ static int ipv4_find_option(struct net *net, struct sk_buff *skb,
++ 			    unsigned int *offset, int target)
++ {
++ 	unsigned char optbuf[sizeof(struct ip_options) + 40];
++ 	struct ip_options *opt = (struct ip_options *)optbuf;
++ 	struct iphdr *iph, _iph;
++ 	unsigned int start;
++ 	bool found = false;
++ 	__be32 info;
++ 	int optlen;
++ 
++ 	iph = skb_header_pointer(skb, 0, sizeof(_iph), &_iph);
++ 	if (!iph)
++ 		return -EBADMSG;
++ 	start = sizeof(struct iphdr);
++ 
++ 	optlen = iph->ihl * 4 - (int)sizeof(struct iphdr);
++ 	if (optlen <= 0)
++ 		return -ENOENT;
++ 
++ 	memset(opt, 0, sizeof(struct ip_options));
++ 	/* Copy the options since __ip_options_compile() modifies
++ 	 * the options.
++ 	 */
++ 	if (skb_copy_bits(skb, start, opt->__data, optlen))
++ 		return -EBADMSG;
++ 	opt->optlen = optlen;
++ 
++ 	if (__ip_options_compile(net, opt, NULL, &info))
++ 		return -EBADMSG;
++ 
++ 	switch (target) {
++ 	case IPOPT_SSRR:
++ 	case IPOPT_LSRR:
++ 		if (!opt->srr)
++ 			break;
++ 		found = target == IPOPT_SSRR ? opt->is_strictroute :
++ 					       !opt->is_strictroute;
++ 		if (found)
++ 			*offset = opt->srr + start;
++ 		break;
++ 	case IPOPT_RR:
++ 		if (!opt->rr)
++ 			break;
++ 		*offset = opt->rr + start;
++ 		found = true;
++ 		break;
++ 	case IPOPT_RA:
++ 		if (!opt->router_alert)
++ 			break;
++ 		*offset = opt->router_alert + start;
++ 		found = true;
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 	return found ? target : -ENOENT;
++ }
++ 
++ static void nft_exthdr_ipv4_eval(const struct nft_expr *expr,
++ 				 struct nft_regs *regs,
++ 				 const struct nft_pktinfo *pkt)
++ {
++ 	struct nft_exthdr *priv = nft_expr_priv(expr);
++ 	u32 *dest = &regs->data[priv->dreg];
++ 	struct sk_buff *skb = pkt->skb;
++ 	unsigned int offset;
++ 	int err;
++ 
++ 	if (skb->protocol != htons(ETH_P_IP))
++ 		goto err;
++ 
++ 	err = ipv4_find_option(nft_net(pkt), skb, &offset, priv->type);
++ 	if (priv->flags & NFT_EXTHDR_F_PRESENT) {
++ 		nft_reg_store8(dest, err >= 0);
++ 		return;
++ 	} else if (err < 0) {
++ 		goto err;
++ 	}
++ 	offset += priv->offset;
++ 
++ 	dest[priv->len / NFT_REG32_SIZE] = 0;
++ 	if (skb_copy_bits(pkt->skb, offset, dest, priv->len) < 0)
++ 		goto err;
++ 	return;
++ err:
++ 	regs->verdict.code = NFT_BREAK;
++ }
++ 
+++>>>>>>> b428336676db (netfilter: nf_tables: nft_exthdr: the presence return value should be little-endian)
+  static void *
+  nft_tcp_header_pointer(const struct nft_pktinfo *pkt,
+  		       unsigned int len, void *buffer, unsigned int *tcphdr_len)
+* Unmerged path net/netfilter/nft_exthdr.c
