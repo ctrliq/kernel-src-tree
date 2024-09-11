@@ -14,18 +14,18 @@
  * more details.
  */
 
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/types.h>
-#include <linux/bitops.h>
-#include <linux/interrupt.h>
-#include <linux/gpio/driver.h>
 #include <linux/acpi.h>
-#include <linux/platform_device.h>
-#include <linux/seq_file.h>
+#include <linux/bitops.h>
+#include <linux/gpio/driver.h>
+#include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
+#include <linux/seq_file.h>
 
 #include <linux/pinctrl/pinctrl.h>
 #include <linux/pinctrl/pinmux.h>
