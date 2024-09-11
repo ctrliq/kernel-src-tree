@@ -1,0 +1,710 @@
+dma-mapping: add a new dma_alloc_pages API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit efa70f2fdc842e63a0a13223e0e83cedcc2117f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/efa70f2f.failed
+
+This API is the equivalent of alloc_pages, except that the returned memory
+is guaranteed to be DMA addressable by the passed in device.  The
+implementation will also be used to provide a more sensible replacement
+for DMA_ATTR_NON_CONSISTENT flag.
+
+Additionally dma_alloc_noncoherent is switched over to use dma_alloc_pages
+as its backend.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Thomas Bogendoerfer <tsbogend@alpha.franken.de> (MIPS part)
+(cherry picked from commit efa70f2fdc842e63a0a13223e0e83cedcc2117f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/alpha/kernel/pci_iommu.c
+#	arch/ia64/hp/common/sba_iommu.c
+#	arch/mips/jazz/jazzdma.c
+#	drivers/parisc/ccio-dma.c
+#	drivers/parisc/sba_iommu.c
+#	drivers/xen/swiotlb-xen.c
+#	kernel/dma/ops_helpers.c
+diff --cc arch/alpha/kernel/pci_iommu.c
+index 80c69ddba9b9,447e0fd0ed38..000000000000
+--- a/arch/alpha/kernel/pci_iommu.c
++++ b/arch/alpha/kernel/pci_iommu.c
+@@@ -942,7 -949,10 +942,14 @@@ const struct dma_map_ops alpha_pci_ops 
+  	.unmap_page		= alpha_pci_unmap_page,
+  	.map_sg			= alpha_pci_map_sg,
+  	.unmap_sg		= alpha_pci_unmap_sg,
+ +	.mapping_error		= alpha_pci_mapping_error,
+  	.dma_supported		= alpha_pci_supported,
+++<<<<<<< HEAD
+++=======
++ 	.mmap			= dma_common_mmap,
++ 	.get_sgtable		= dma_common_get_sgtable,
++ 	.alloc_pages		= dma_common_alloc_pages,
++ 	.free_pages		= dma_common_free_pages,
+++>>>>>>> efa70f2fdc84 (dma-mapping: add a new dma_alloc_pages API)
+  };
+  EXPORT_SYMBOL(alpha_pci_ops);
+diff --cc arch/ia64/hp/common/sba_iommu.c
+index 356e261983b6,cafbb848a34e..000000000000
+--- a/arch/ia64/hp/common/sba_iommu.c
++++ b/arch/ia64/hp/common/sba_iommu.c
+@@@ -2079,7 -2054,25 +2079,29 @@@ static int __init acpi_sba_ioc_init_acp
+  /* This has to run before acpi_scan_init(). */
+  arch_initcall(acpi_sba_ioc_init_acpi);
+  
+++<<<<<<< HEAD
+ +extern const struct dma_map_ops swiotlb_dma_ops;
+++=======
++ static int sba_dma_supported (struct device *dev, u64 mask)
++ {
++ 	/* make sure it's at least 32bit capable */
++ 	return ((mask & 0xFFFFFFFFUL) == 0xFFFFFFFFUL);
++ }
++ 
++ static const struct dma_map_ops sba_dma_ops = {
++ 	.alloc			= sba_alloc_coherent,
++ 	.free			= sba_free_coherent,
++ 	.map_page		= sba_map_page,
++ 	.unmap_page		= sba_unmap_page,
++ 	.map_sg			= sba_map_sg_attrs,
++ 	.unmap_sg		= sba_unmap_sg_attrs,
++ 	.dma_supported		= sba_dma_supported,
++ 	.mmap			= dma_common_mmap,
++ 	.get_sgtable		= dma_common_get_sgtable,
++ 	.alloc_pages		= dma_common_alloc_pages,
++ 	.free_pages		= dma_common_free_pages,
++ };
+++>>>>>>> efa70f2fdc84 (dma-mapping: add a new dma_alloc_pages API)
+  
+  static int __init
+  sba_init(void)
+diff --cc arch/mips/jazz/jazzdma.c
+index e792328651d1,f53bc043334c..000000000000
+--- a/arch/mips/jazz/jazzdma.c
++++ b/arch/mips/jazz/jazzdma.c
+@@@ -556,4 -488,136 +556,140 @@@ int vdma_get_enable(int channel
+  	return enable;
+  }
+  
+++<<<<<<< HEAD
+ +arch_initcall(vdma_init);
+++=======
++ static void *jazz_dma_alloc(struct device *dev, size_t size,
++ 		dma_addr_t *dma_handle, gfp_t gfp, unsigned long attrs)
++ {
++ 	struct page *page;
++ 	void *ret;
++ 
++ 	if (attrs & DMA_ATTR_NO_WARN)
++ 		gfp |= __GFP_NOWARN;
++ 
++ 	size = PAGE_ALIGN(size);
++ 	page = alloc_pages(gfp, get_order(size));
++ 	if (!page)
++ 		return NULL;
++ 	ret = page_address(page);
++ 	memset(ret, 0, size);
++ 	*dma_handle = vdma_alloc(virt_to_phys(ret), size);
++ 	if (*dma_handle == DMA_MAPPING_ERROR)
++ 		goto out_free_pages;
++ 	arch_dma_prep_coherent(page, size);
++ 	return (void *)(UNCAC_BASE + __pa(ret));
++ 
++ out_free_pages:
++ 	__free_pages(page, get_order(size));
++ 	return NULL;
++ }
++ 
++ static void jazz_dma_free(struct device *dev, size_t size, void *vaddr,
++ 		dma_addr_t dma_handle, unsigned long attrs)
++ {
++ 	vdma_free(dma_handle);
++ 	__free_pages(virt_to_page(vaddr), get_order(size));
++ }
++ 
++ static dma_addr_t jazz_dma_map_page(struct device *dev, struct page *page,
++ 		unsigned long offset, size_t size, enum dma_data_direction dir,
++ 		unsigned long attrs)
++ {
++ 	phys_addr_t phys = page_to_phys(page) + offset;
++ 
++ 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		arch_sync_dma_for_device(phys, size, dir);
++ 	return vdma_alloc(phys, size);
++ }
++ 
++ static void jazz_dma_unmap_page(struct device *dev, dma_addr_t dma_addr,
++ 		size_t size, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		arch_sync_dma_for_cpu(vdma_log2phys(dma_addr), size, dir);
++ 	vdma_free(dma_addr);
++ }
++ 
++ static int jazz_dma_map_sg(struct device *dev, struct scatterlist *sglist,
++ 		int nents, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	int i;
++ 	struct scatterlist *sg;
++ 
++ 	for_each_sg(sglist, sg, nents, i) {
++ 		if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 			arch_sync_dma_for_device(sg_phys(sg), sg->length,
++ 				dir);
++ 		sg->dma_address = vdma_alloc(sg_phys(sg), sg->length);
++ 		if (sg->dma_address == DMA_MAPPING_ERROR)
++ 			return 0;
++ 		sg_dma_len(sg) = sg->length;
++ 	}
++ 
++ 	return nents;
++ }
++ 
++ static void jazz_dma_unmap_sg(struct device *dev, struct scatterlist *sglist,
++ 		int nents, enum dma_data_direction dir, unsigned long attrs)
++ {
++ 	int i;
++ 	struct scatterlist *sg;
++ 
++ 	for_each_sg(sglist, sg, nents, i) {
++ 		if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 			arch_sync_dma_for_cpu(sg_phys(sg), sg->length, dir);
++ 		vdma_free(sg->dma_address);
++ 	}
++ }
++ 
++ static void jazz_dma_sync_single_for_device(struct device *dev,
++ 		dma_addr_t addr, size_t size, enum dma_data_direction dir)
++ {
++ 	arch_sync_dma_for_device(vdma_log2phys(addr), size, dir);
++ }
++ 
++ static void jazz_dma_sync_single_for_cpu(struct device *dev,
++ 		dma_addr_t addr, size_t size, enum dma_data_direction dir)
++ {
++ 	arch_sync_dma_for_cpu(vdma_log2phys(addr), size, dir);
++ }
++ 
++ static void jazz_dma_sync_sg_for_device(struct device *dev,
++ 		struct scatterlist *sgl, int nents, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	for_each_sg(sgl, sg, nents, i)
++ 		arch_sync_dma_for_device(sg_phys(sg), sg->length, dir);
++ }
++ 
++ static void jazz_dma_sync_sg_for_cpu(struct device *dev,
++ 		struct scatterlist *sgl, int nents, enum dma_data_direction dir)
++ {
++ 	struct scatterlist *sg;
++ 	int i;
++ 
++ 	for_each_sg(sgl, sg, nents, i)
++ 		arch_sync_dma_for_cpu(sg_phys(sg), sg->length, dir);
++ }
++ 
++ const struct dma_map_ops jazz_dma_ops = {
++ 	.alloc			= jazz_dma_alloc,
++ 	.free			= jazz_dma_free,
++ 	.map_page		= jazz_dma_map_page,
++ 	.unmap_page		= jazz_dma_unmap_page,
++ 	.map_sg			= jazz_dma_map_sg,
++ 	.unmap_sg		= jazz_dma_unmap_sg,
++ 	.sync_single_for_cpu	= jazz_dma_sync_single_for_cpu,
++ 	.sync_single_for_device	= jazz_dma_sync_single_for_device,
++ 	.sync_sg_for_cpu	= jazz_dma_sync_sg_for_cpu,
++ 	.sync_sg_for_device	= jazz_dma_sync_sg_for_device,
++ 	.mmap			= dma_common_mmap,
++ 	.get_sgtable		= dma_common_get_sgtable,
++ 	.alloc_pages		= dma_common_alloc_pages,
++ 	.free_pages		= dma_common_free_pages,
++ };
++ EXPORT_SYMBOL(jazz_dma_ops);
+++>>>>>>> efa70f2fdc84 (dma-mapping: add a new dma_alloc_pages API)
+diff --cc drivers/parisc/ccio-dma.c
+index e76f96739840,8cf0b9c8bdf7..000000000000
+--- a/drivers/parisc/ccio-dma.c
++++ b/drivers/parisc/ccio-dma.c
+@@@ -1037,7 -1023,9 +1037,13 @@@ static const struct dma_map_ops ccio_op
+  	.unmap_page =		ccio_unmap_page,
+  	.map_sg = 		ccio_map_sg,
+  	.unmap_sg = 		ccio_unmap_sg,
+++<<<<<<< HEAD
+ +	.mapping_error =	ccio_mapping_error,
+++=======
++ 	.get_sgtable =		dma_common_get_sgtable,
++ 	.alloc_pages =		dma_common_alloc_pages,
++ 	.free_pages =		dma_common_free_pages,
+++>>>>>>> efa70f2fdc84 (dma-mapping: add a new dma_alloc_pages API)
+  };
+  
+  #ifdef CONFIG_PROC_FS
+diff --cc drivers/parisc/sba_iommu.c
+index 7d078bff88a9,6fcde7980358..000000000000
+--- a/drivers/parisc/sba_iommu.c
++++ b/drivers/parisc/sba_iommu.c
+@@@ -1097,7 -1075,9 +1097,13 @@@ static const struct dma_map_ops sba_op
+  	.unmap_page =		sba_unmap_page,
+  	.map_sg =		sba_map_sg,
+  	.unmap_sg =		sba_unmap_sg,
+++<<<<<<< HEAD
+ +	.mapping_error =	sba_mapping_error,
+++=======
++ 	.get_sgtable =		dma_common_get_sgtable,
++ 	.alloc_pages =		dma_common_alloc_pages,
++ 	.free_pages =		dma_common_free_pages,
+++>>>>>>> efa70f2fdc84 (dma-mapping: add a new dma_alloc_pages API)
+  };
+  
+  
+diff --cc drivers/xen/swiotlb-xen.c
+index 7dd030dd3b2a,030a225624b0..000000000000
+--- a/drivers/xen/swiotlb-xen.c
++++ b/drivers/xen/swiotlb-xen.c
+@@@ -611,6 -576,8 +611,13 @@@ const struct dma_map_ops xen_swiotlb_dm
+  	.map_page = xen_swiotlb_map_page,
+  	.unmap_page = xen_swiotlb_unmap_page,
+  	.dma_supported = xen_swiotlb_dma_supported,
+++<<<<<<< HEAD
+ +	.mmap = xen_swiotlb_dma_mmap,
+ +	.get_sgtable = xen_swiotlb_get_sgtable,
+++=======
++ 	.mmap = dma_common_mmap,
++ 	.get_sgtable = dma_common_get_sgtable,
++ 	.alloc_pages = dma_common_alloc_pages,
++ 	.free_pages = dma_common_free_pages,
+++>>>>>>> efa70f2fdc84 (dma-mapping: add a new dma_alloc_pages API)
+  };
+* Unmerged path kernel/dma/ops_helpers.c
+diff --git a/Documentation/core-api/dma-attributes.rst b/Documentation/core-api/dma-attributes.rst
+index 29dcbe8826e8..1887d92e8e92 100644
+--- a/Documentation/core-api/dma-attributes.rst
++++ b/Documentation/core-api/dma-attributes.rst
+@@ -25,14 +25,6 @@ Since it is optional for platforms to implement DMA_ATTR_WRITE_COMBINE,
+ those that do not will simply ignore the attribute and exhibit default
+ behavior.
+ 
+-DMA_ATTR_NON_CONSISTENT
+------------------------
+-
+-DMA_ATTR_NON_CONSISTENT lets the platform to choose to return either
+-consistent or non-consistent memory as it sees fit.  By using this API,
+-you are guaranteeing to the platform that you have all the correct and
+-necessary sync points for this memory in the driver.
+-
+ DMA_ATTR_NO_KERNEL_MAPPING
+ --------------------------
+ 
+* Unmerged path arch/alpha/kernel/pci_iommu.c
+diff --git a/arch/arm/mm/dma-mapping-nommu.c b/arch/arm/mm/dma-mapping-nommu.c
+index f448a0663b10..b7084a2d048b 100644
+--- a/arch/arm/mm/dma-mapping-nommu.c
++++ b/arch/arm/mm/dma-mapping-nommu.c
+@@ -196,6 +196,8 @@ static void arm_nommu_dma_sync_sg_for_cpu(struct device *dev, struct scatterlist
+ const struct dma_map_ops arm_nommu_dma_ops = {
+ 	.alloc			= arm_nommu_dma_alloc,
+ 	.free			= arm_nommu_dma_free,
++	.alloc_pages		= dma_direct_alloc_pages,
++	.free_pages		= dma_direct_free_pages,
+ 	.mmap			= arm_nommu_dma_mmap,
+ 	.map_page		= arm_nommu_dma_map_page,
+ 	.unmap_page		= arm_nommu_dma_unmap_page,
+diff --git a/arch/arm/mm/dma-mapping.c b/arch/arm/mm/dma-mapping.c
+index ad8956969bed..e5a585d6d58c 100644
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@ -188,6 +188,8 @@ static int arm_dma_mapping_error(struct device *dev, dma_addr_t dma_addr)
+ const struct dma_map_ops arm_dma_ops = {
+ 	.alloc			= arm_dma_alloc,
+ 	.free			= arm_dma_free,
++	.alloc_pages		= dma_direct_alloc_pages,
++	.free_pages		= dma_direct_free_pages,
+ 	.mmap			= arm_dma_mmap,
+ 	.get_sgtable		= arm_dma_get_sgtable,
+ 	.map_page		= arm_dma_map_page,
+@@ -216,6 +218,8 @@ static int arm_coherent_dma_mmap(struct device *dev, struct vm_area_struct *vma,
+ const struct dma_map_ops arm_coherent_dma_ops = {
+ 	.alloc			= arm_coherent_dma_alloc,
+ 	.free			= arm_coherent_dma_free,
++	.alloc_pages		= dma_direct_alloc_pages,
++	.free_pages		= dma_direct_free_pages,
+ 	.mmap			= arm_coherent_dma_mmap,
+ 	.get_sgtable		= arm_dma_get_sgtable,
+ 	.map_page		= arm_coherent_dma_map_page,
+* Unmerged path arch/ia64/hp/common/sba_iommu.c
+* Unmerged path arch/mips/jazz/jazzdma.c
+diff --git a/arch/powerpc/kernel/dma-iommu.c b/arch/powerpc/kernel/dma-iommu.c
+index 68f5075b9c08..7723d745b5fa 100644
+--- a/arch/powerpc/kernel/dma-iommu.c
++++ b/arch/powerpc/kernel/dma-iommu.c
+@@ -138,4 +138,6 @@ const struct dma_map_ops dma_iommu_ops = {
+ 	.get_required_mask	= dma_iommu_get_required_mask,
+ 	.mmap			= dma_common_mmap,
+ 	.get_sgtable		= dma_common_get_sgtable,
++	.alloc_pages		= dma_common_alloc_pages,
++	.free_pages		= dma_common_free_pages,
+ };
+diff --git a/arch/powerpc/platforms/ps3/system-bus.c b/arch/powerpc/platforms/ps3/system-bus.c
+index dee7efb2022f..a8f688f57c33 100644
+--- a/arch/powerpc/platforms/ps3/system-bus.c
++++ b/arch/powerpc/platforms/ps3/system-bus.c
+@@ -708,6 +708,8 @@ static const struct dma_map_ops ps3_sb_dma_ops = {
+ 	.unmap_page = ps3_unmap_page,
+ 	.mmap = dma_common_mmap,
+ 	.get_sgtable = dma_common_get_sgtable,
++	.alloc_pages = dma_common_alloc_pages,
++	.free_pages = dma_common_free_pages,
+ };
+ 
+ static const struct dma_map_ops ps3_ioc0_dma_ops = {
+@@ -720,6 +722,8 @@ static const struct dma_map_ops ps3_ioc0_dma_ops = {
+ 	.unmap_page = ps3_unmap_page,
+ 	.mmap = dma_common_mmap,
+ 	.get_sgtable = dma_common_get_sgtable,
++	.alloc_pages = dma_common_alloc_pages,
++	.free_pages = dma_common_free_pages,
+ };
+ 
+ /**
+diff --git a/arch/powerpc/platforms/pseries/vio.c b/arch/powerpc/platforms/pseries/vio.c
+index fa552eeeb8c0..4f70b4fc7e22 100644
+--- a/arch/powerpc/platforms/pseries/vio.c
++++ b/arch/powerpc/platforms/pseries/vio.c
+@@ -612,6 +612,8 @@ static const struct dma_map_ops vio_dma_mapping_ops = {
+ 	.get_required_mask = dma_iommu_get_required_mask,
+ 	.mmap		   = dma_common_mmap,
+ 	.get_sgtable	   = dma_common_get_sgtable,
++	.alloc_pages	   = dma_common_alloc_pages,
++	.free_pages	   = dma_common_free_pages,
+ };
+ 
+ /**
+diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
+index a1919b510c0b..55a5248b87dc 100644
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@ -668,6 +668,8 @@ const struct dma_map_ops s390_pci_dma_ops = {
+ 	.unmap_page	= s390_dma_unmap_pages,
+ 	.mmap		= dma_common_mmap,
+ 	.get_sgtable	= dma_common_get_sgtable,
++	.alloc_pages	= dma_common_alloc_pages,
++	.free_pages	= dma_common_free_pages,
+ 	/* dma_supported is unconditionally true without a callback */
+ };
+ EXPORT_SYMBOL_GPL(s390_pci_dma_ops);
+diff --git a/arch/x86/kernel/amd_gart_64.c b/arch/x86/kernel/amd_gart_64.c
+index cf5e1dac96bf..be895b948273 100644
+--- a/arch/x86/kernel/amd_gart_64.c
++++ b/arch/x86/kernel/amd_gart_64.c
+@@ -683,6 +683,8 @@ static const struct dma_map_ops gart_dma_ops = {
+ 	.get_sgtable			= dma_common_get_sgtable,
+ 	.dma_supported			= dma_direct_supported,
+ 	.get_required_mask		= dma_direct_get_required_mask,
++	.alloc_pages			= dma_direct_alloc_pages,
++	.free_pages			= dma_direct_free_pages,
+ };
+ 
+ static void gart_iommu_shutdown(void)
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index ebea1484c24c..122357e6d516 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -1114,6 +1114,8 @@ static int iommu_dma_get_sgtable(struct device *dev, struct sg_table *sgt,
+ static const struct dma_map_ops iommu_dma_ops = {
+ 	.alloc			= iommu_dma_alloc,
+ 	.free			= iommu_dma_free,
++	.alloc_pages		= dma_common_alloc_pages,
++	.free_pages		= dma_common_free_pages,
+ 	.mmap			= iommu_dma_mmap,
+ 	.get_sgtable		= iommu_dma_get_sgtable,
+ 	.map_page		= iommu_dma_map_page,
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 57eb505e357a..314fad5fdae8 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -3759,6 +3759,8 @@ static const struct dma_map_ops intel_dma_ops = {
+ 	.dma_supported = dma_direct_supported,
+ 	.mmap = dma_common_mmap,
+ 	.get_sgtable = dma_common_get_sgtable,
++	.alloc_pages = dma_common_alloc_pages,
++	.free_pages = dma_common_free_pages,
+ 	.get_required_mask = intel_get_required_mask,
+ };
+ 
+@@ -4012,6 +4014,8 @@ static const struct dma_map_ops bounce_dma_ops = {
+ 	.sync_sg_for_device	= bounce_sync_sg_for_device,
+ 	.map_resource		= bounce_map_resource,
+ 	.unmap_resource		= bounce_unmap_resource,
++	.alloc_pages		= dma_common_alloc_pages,
++	.free_pages		= dma_common_free_pages,
+ 	.dma_supported		= dma_direct_supported,
+ };
+ 
+* Unmerged path drivers/parisc/ccio-dma.c
+* Unmerged path drivers/parisc/sba_iommu.c
+* Unmerged path drivers/xen/swiotlb-xen.c
+diff --git a/include/linux/dma-direct.h b/include/linux/dma-direct.h
+index d6de879cb334..067658135d94 100644
+--- a/include/linux/dma-direct.h
++++ b/include/linux/dma-direct.h
+@@ -74,6 +74,11 @@ void *dma_direct_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 		gfp_t gfp, unsigned long attrs);
+ void dma_direct_free(struct device *dev, size_t size, void *cpu_addr,
+ 		dma_addr_t dma_addr, unsigned long attrs);
++struct page *dma_direct_alloc_pages(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp);
++void dma_direct_free_pages(struct device *dev, size_t size,
++		struct page *page, dma_addr_t dma_addr,
++		enum dma_data_direction dir);
+ int dma_direct_get_sgtable(struct device *dev, struct sg_table *sgt,
+ 		void *cpu_addr, dma_addr_t dma_addr, size_t size,
+ 		unsigned long attrs);
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index ba0c1c793dd8..3dede5472cb0 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -27,11 +27,6 @@
+  * buffered to improve performance.
+  */
+ #define DMA_ATTR_WRITE_COMBINE		(1UL << 2)
+-/*
+- * DMA_ATTR_NON_CONSISTENT: Lets the platform to choose to return either
+- * consistent or non-consistent memory as it sees fit.
+- */
+-#define DMA_ATTR_NON_CONSISTENT		(1UL << 3)
+ /*
+  * DMA_ATTR_NO_KERNEL_MAPPING: Lets the platform to avoid creating a kernel
+  * virtual mapping for the allocated buffer.
+@@ -83,6 +78,11 @@ struct dma_map_ops {
+ 	void (*free)(struct device *dev, size_t size,
+ 			      void *vaddr, dma_addr_t dma_handle,
+ 			      unsigned long attrs);
++	struct page *(*alloc_pages)(struct device *dev, size_t size,
++			dma_addr_t *dma_handle, enum dma_data_direction dir,
++			gfp_t gfp);
++	void (*free_pages)(struct device *dev, size_t size, struct page *vaddr,
++			dma_addr_t dma_handle, enum dma_data_direction dir);
+ 	int (*mmap)(struct device *, struct vm_area_struct *,
+ 			  void *, dma_addr_t, size_t,
+ 			  unsigned long attrs);
+@@ -392,17 +392,14 @@ static inline unsigned long dma_get_merge_boundary(struct device *dev)
+ }
+ #endif /* CONFIG_HAS_DMA */
+ 
+-static inline void *dma_alloc_noncoherent(struct device *dev, size_t size,
+-		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp)
+-{
+-	return dma_alloc_attrs(dev, size, dma_handle, gfp,
+-			DMA_ATTR_NON_CONSISTENT);
+-}
+-static inline void dma_free_noncoherent(struct device *dev, size_t size,
+-		void *vaddr, dma_addr_t dma_handle, enum dma_data_direction dir)
+-{
+-	dma_free_attrs(dev, size, vaddr, dma_handle, DMA_ATTR_NON_CONSISTENT);
+-}
++struct page *dma_alloc_pages(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp);
++void dma_free_pages(struct device *dev, size_t size, struct page *page,
++		dma_addr_t dma_handle, enum dma_data_direction dir);
++void *dma_alloc_noncoherent(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp);
++void dma_free_noncoherent(struct device *dev, size_t size, void *vaddr,
++		dma_addr_t dma_handle, enum dma_data_direction dir);
+ 
+ static inline dma_addr_t dma_map_single_attrs(struct device *dev, void *ptr,
+ 		size_t size, enum dma_data_direction dir, unsigned long attrs)
+@@ -528,7 +525,10 @@ static inline void dma_sync_sgtable_for_device(struct device *dev,
+ extern int dma_common_mmap(struct device *dev, struct vm_area_struct *vma,
+ 		void *cpu_addr, dma_addr_t dma_addr, size_t size,
+ 		unsigned long attrs);
+-
++struct page *dma_common_alloc_pages(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp);
++void dma_common_free_pages(struct device *dev, size_t size, struct page *vaddr,
++		dma_addr_t dma_handle, enum dma_data_direction dir);
+ struct page **dma_common_find_pages(void *cpu_addr);
+ void *dma_common_contiguous_remap(struct page *page, size_t size,
+ 			pgprot_t prot, const void *caller);
+diff --git a/include/linux/dma-noncoherent.h b/include/linux/dma-noncoherent.h
+index 6b9a424beb5f..905ea0f68af8 100644
+--- a/include/linux/dma-noncoherent.h
++++ b/include/linux/dma-noncoherent.h
+@@ -31,9 +31,6 @@ static inline bool dma_alloc_need_uncached(struct device *dev,
+ 		return false;
+ 	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING)
+ 		return false;
+-	if (IS_ENABLED(CONFIG_DMA_NONCOHERENT_CACHE_SYNC) &&
+-	    (attrs & DMA_ATTR_NON_CONSISTENT))
+-		return false;
+ 	return true;
+ }
+ 
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index b992d9926af3..bf8a079e7aaf 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Copyright (C) 2018 Christoph Hellwig.
++ * Copyright (C) 2018-2020 Christoph Hellwig.
+  *
+  * DMA operations that map physical memory directly without using an IOMMU.
+  */
+@@ -291,6 +291,56 @@ void dma_direct_free(struct device *dev, size_t size,
+ 	dma_free_contiguous(dev, dma_direct_to_page(dev, dma_addr), size);
+ }
+ 
++struct page *dma_direct_alloc_pages(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp)
++{
++	struct page *page;
++	void *ret;
++
++	if (dma_should_alloc_from_pool(dev, gfp, 0)) {
++		page = dma_alloc_from_pool(dev, size, &ret, gfp,
++				dma_coherent_ok);
++		if (!page)
++			return NULL;
++		goto done;
++	}
++
++	page = __dma_direct_alloc_pages(dev, size, gfp);
++	if (!page)
++		return NULL;
++	ret = page_address(page);
++	if (force_dma_unencrypted(dev)) {
++		if (set_memory_decrypted((unsigned long)ret,
++				1 << get_order(size)))
++			goto out_free_pages;
++	}
++	memset(ret, 0, size);
++done:
++	*dma_handle = phys_to_dma_direct(dev, page_to_phys(page));
++	return page;
++out_free_pages:
++	dma_free_contiguous(dev, page, size);
++	return NULL;
++}
++
++void dma_direct_free_pages(struct device *dev, size_t size,
++		struct page *page, dma_addr_t dma_addr,
++		enum dma_data_direction dir)
++{
++	unsigned int page_order = get_order(size);
++	void *vaddr = page_address(page);
++
++	/* If cpu_addr is not from an atomic pool, dma_free_from_pool() fails */
++	if (dma_should_free_from_pool(dev, 0) &&
++	    dma_free_from_pool(dev, vaddr, size))
++		return;
++
++	if (force_dma_unencrypted(dev))
++		set_memory_encrypted((unsigned long)vaddr, 1 << page_order);
++
++	dma_free_contiguous(dev, page, size);
++}
++
+ #if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || \
+     defined(CONFIG_SWIOTLB)
+ void dma_direct_sync_sg_for_device(struct device *dev,
+diff --git a/kernel/dma/mapping.c b/kernel/dma/mapping.c
+index 0597cdaee492..1abf3813ed47 100644
+--- a/kernel/dma/mapping.c
++++ b/kernel/dma/mapping.c
+@@ -368,9 +368,7 @@ pgprot_t dma_pgprot(struct device *dev, pgprot_t prot, unsigned long attrs)
+ {
+ 	if (force_dma_unencrypted(dev))
+ 		prot = pgprot_decrypted(prot);
+-	if (dev_is_dma_coherent(dev) ||
+-	    (IS_ENABLED(CONFIG_DMA_NONCOHERENT_CACHE_SYNC) &&
+-             (attrs & DMA_ATTR_NON_CONSISTENT)))
++	if (dev_is_dma_coherent(dev))
+ 		return prot;
+ #ifdef CONFIG_ARCH_HAS_DMA_WRITE_COMBINE
+ 	if (attrs & DMA_ATTR_WRITE_COMBINE)
+@@ -528,6 +526,65 @@ void dma_free_attrs(struct device *dev, size_t size, void *cpu_addr,
+ }
+ EXPORT_SYMBOL(dma_free_attrs);
+ 
++struct page *dma_alloc_pages(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp)
++{
++	const struct dma_map_ops *ops = get_dma_ops(dev);
++	struct page *page;
++
++	if (WARN_ON_ONCE(!dev->coherent_dma_mask))
++		return NULL;
++	if (WARN_ON_ONCE(gfp & (__GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM)))
++		return NULL;
++
++	size = PAGE_ALIGN(size);
++	if (dma_alloc_direct(dev, ops))
++		page = dma_direct_alloc_pages(dev, size, dma_handle, dir, gfp);
++	else if (ops->alloc_pages)
++		page = ops->alloc_pages(dev, size, dma_handle, dir, gfp);
++	else
++		return NULL;
++
++	debug_dma_map_page(dev, page, 0, size, dir, *dma_handle);
++
++	return page;
++}
++EXPORT_SYMBOL_GPL(dma_alloc_pages);
++
++void dma_free_pages(struct device *dev, size_t size, struct page *page,
++		dma_addr_t dma_handle, enum dma_data_direction dir)
++{
++	const struct dma_map_ops *ops = get_dma_ops(dev);
++
++	size = PAGE_ALIGN(size);
++	debug_dma_unmap_page(dev, dma_handle, size, dir);
++
++	if (dma_alloc_direct(dev, ops))
++		dma_direct_free_pages(dev, size, page, dma_handle, dir);
++	else if (ops->free_pages)
++		ops->free_pages(dev, size, page, dma_handle, dir);
++}
++EXPORT_SYMBOL_GPL(dma_free_pages);
++
++void *dma_alloc_noncoherent(struct device *dev, size_t size,
++		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp)
++{
++	struct page *page;
++
++	page = dma_alloc_pages(dev, size, dma_handle, dir, gfp);
++	if (!page)
++		return NULL;
++	return page_address(page);
++}
++EXPORT_SYMBOL_GPL(dma_alloc_noncoherent);
++
++void dma_free_noncoherent(struct device *dev, size_t size, void *vaddr,
++		dma_addr_t dma_handle, enum dma_data_direction dir)
++{
++	dma_free_pages(dev, size, virt_to_page(vaddr), dma_handle, dir);
++}
++EXPORT_SYMBOL_GPL(dma_free_noncoherent);
++
+ int dma_supported(struct device *dev, u64 mask)
+ {
+ 	const struct dma_map_ops *ops = get_dma_ops(dev);
+* Unmerged path kernel/dma/ops_helpers.c
+diff --git a/kernel/dma/virt.c b/kernel/dma/virt.c
+index ebe128833af7..6986bf1fd668 100644
+--- a/kernel/dma/virt.c
++++ b/kernel/dma/virt.c
+@@ -55,5 +55,7 @@ const struct dma_map_ops dma_virt_ops = {
+ 	.free			= dma_virt_free,
+ 	.map_page		= dma_virt_map_page,
+ 	.map_sg			= dma_virt_map_sg,
++	.alloc_pages		= dma_common_alloc_pages,
++	.free_pages		= dma_common_free_pages,
+ };
+ EXPORT_SYMBOL(dma_virt_ops);
