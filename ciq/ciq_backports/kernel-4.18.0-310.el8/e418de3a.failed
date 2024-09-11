@@ -1,0 +1,235 @@
+block: switch gendisk lookup to a simple xarray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit e418de3abcda8b102f737919e830024d1455938f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/e418de3a.failed
+
+Now that bdev_map is only used for finding gendisks, we can use
+a simple xarray instead of the regions tracking structure for it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e418de3abcda8b102f737919e830024d1455938f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+diff --cc block/genhd.c
+index 4b77c8df084c,01d146598fe7..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -687,49 -652,30 +652,17 @@@ static void blk_register_region(struct 
+  	}
+  	mutex_unlock(&bdev_map_lock);
+  }
+- EXPORT_SYMBOL(blk_register_region);
+  
+- void blk_unregister_region(dev_t devt, unsigned long range)
++ static void blk_unregister_region(struct gendisk *disk)
+  {
+- 	unsigned n = MAJOR(devt + range - 1) - MAJOR(devt) + 1;
+- 	unsigned index = MAJOR(devt);
+- 	unsigned i;
+- 	struct bdev_map *found = NULL;
++ 	int i;
+  
+  	mutex_lock(&bdev_map_lock);
+- 	for (i = 0; i < min(n, 255u); i++, index++) {
+- 		struct bdev_map **s;
+- 		for (s = &bdev_map[index % 255]; *s; s = &(*s)->next) {
+- 			struct bdev_map *p = *s;
+- 			if (p->dev == devt && p->range == range) {
+- 				*s = p->next;
+- 				if (!found)
+- 					found = p;
+- 				break;
+- 			}
+- 		}
+- 	}
++ 	for (i = 0; i < disk->minors; i++)
++ 		xa_erase(&bdev_map, disk_devt(disk) + i);
+  	mutex_unlock(&bdev_map_lock);
+- 	kfree(found);
+- }
+- EXPORT_SYMBOL(blk_unregister_region);
+- 
+- static struct kobject *exact_match(dev_t devt, int *partno, void *data)
+- {
+- 	struct gendisk *p = data;
+- 
+- 	return &disk_to_dev(p)->kobj;
+- }
+- 
+- static int exact_lock(dev_t devt, void *data)
+- {
+- 	struct gendisk *p = data;
+- 
+- 	if (!get_disk_and_module(p))
+- 		return -1;
+- 	return 0;
+  }
+  
+ -static void disk_scan_partitions(struct gendisk *disk)
+ -{
+ -	struct block_device *bdev;
+ -
+ -	if (!get_capacity(disk) || !disk_part_scan_enabled(disk))
+ -		return;
+ -
+ -	set_bit(GD_NEED_PART_SCAN, &disk->state);
+ -	bdev = blkdev_get_by_dev(disk_devt(disk), FMODE_READ, NULL);
+ -	if (!IS_ERR(bdev))
+ -		blkdev_put(bdev, FMODE_READ);
+ -}
+ -
+  static void register_disk(struct device *parent, struct gendisk *disk,
+  			  const struct attribute_group **groups)
+  {
+@@@ -1814,79 -1746,54 +1710,82 @@@ struct gendisk *__alloc_disk_node(int m
+  	}
+  
+  	disk = kzalloc_node(sizeof(struct gendisk), GFP_KERNEL, node_id);
+ -	if (!disk)
+ -		return NULL;
+ +	if (disk) {
+ +		if (!init_part_stats(&disk->part0)) {
+ +			kfree(disk);
+ +			return NULL;
+ +		}
+ +		init_rwsem(&disk->lookup_sem);
+ +		disk->node_id = node_id;
+ +		if (disk_expand_part_tbl(disk, 0)) {
+ +			free_part_stats(&disk->part0);
+ +			kfree(disk);
+ +			return NULL;
+ +		}
+ +		ptbl = rcu_dereference_protected(disk->part_tbl, 1);
+ +		rcu_assign_pointer(ptbl->part[0], &disk->part0);
+  
+ -	disk->part0.dkstats = alloc_percpu(struct disk_stats);
+ -	if (!disk->part0.dkstats)
+ -		goto out_free_disk;
+ +		/*
+ +		 * set_capacity() and get_capacity() currently don't use
+ +		 * seqcounter to read/update the part0->nr_sects. Still init
+ +		 * the counter as we can read the sectors in IO submission
+ +		 * patch using seqence counters.
+ +		 *
+ +		 * TODO: Ideally set_capacity() and get_capacity() should be
+ +		 * converted to make use of bd_mutex and sequence counters.
+ +		 */
+ +		hd_sects_seq_init(&disk->part0);
+ +		if (hd_ref_init(&disk->part0)) {
+ +			hd_free_part(&disk->part0);
+ +			kfree(disk);
+ +			return NULL;
+ +		}
+  
+ -	init_rwsem(&disk->lookup_sem);
+ -	disk->node_id = node_id;
+ -	if (disk_expand_part_tbl(disk, 0)) {
+ -		free_percpu(disk->part0.dkstats);
+ -		goto out_free_disk;
+ +		disk->minors = minors;
+ +		rand_initialize_disk(disk);
+ +		disk_to_dev(disk)->class = &block_class;
+ +		disk_to_dev(disk)->type = &disk_type;
+ +		device_initialize(disk_to_dev(disk));
+  	}
+ +	return disk;
+ +}
+ +EXPORT_SYMBOL(__alloc_disk_node);
+  
+ -	ptbl = rcu_dereference_protected(disk->part_tbl, 1);
+ -	rcu_assign_pointer(ptbl->part[0], &disk->part0);
+ +/**
+++<<<<<<< HEAD
+ + * get_disk_and_module - increments the gendisk and gendisk fops module refcount
+ + * @disk: the struct gendisk to to increment the refcount for
+ + *
+ + * This increments the refcount for the struct gendisk, and the gendisk's
+ + * fops module owner.
+ + *
+ + * Context: Any context.
+ + */
+ +struct kobject *get_disk_and_module(struct gendisk *disk)
+ +{
+ +	struct module *owner;
+ +	struct kobject *kobj;
+  
+ -	/*
+ -	 * set_capacity() and get_capacity() currently don't use
+ -	 * seqcounter to read/update the part0->nr_sects. Still init
+ -	 * the counter as we can read the sectors in IO submission
+ -	 * patch using seqence counters.
+ -	 *
+ -	 * TODO: Ideally set_capacity() and get_capacity() should be
+ -	 * converted to make use of bd_mutex and sequence counters.
+ -	 */
+ -	hd_sects_seq_init(&disk->part0);
+ -	if (hd_ref_init(&disk->part0))
+ -		goto out_free_part0;
+ -
+ -	disk->minors = minors;
+ -	rand_initialize_disk(disk);
+ -	disk_to_dev(disk)->class = &block_class;
+ -	disk_to_dev(disk)->type = &disk_type;
+ -	device_initialize(disk_to_dev(disk));
+ -	return disk;
+ +	if (!disk->fops)
+ +		return NULL;
+ +	owner = disk->fops->owner;
+ +	if (owner && !try_module_get(owner))
+ +		return NULL;
+ +	kobj = kobject_get_unless_zero(&disk_to_dev(disk)->kobj);
+ +	if (kobj == NULL) {
+ +		module_put(owner);
+ +		return NULL;
+ +	}
+ +	return kobj;
+  
+ -out_free_part0:
+ -	hd_free_part(&disk->part0);
+ -out_free_disk:
+ -	kfree(disk);
+ -	return NULL;
+  }
+ -EXPORT_SYMBOL(__alloc_disk_node);
+ +EXPORT_SYMBOL(get_disk_and_module);
+  
+  /**
+++=======
+++>>>>>>> e418de3abcda (block: switch gendisk lookup to a simple xarray)
+   * put_disk - decrements the gendisk refcount
+ - * @disk: the struct gendisk to decrement the refcount for
+ + * @disk: the struct gendisk to to decrement the refcount for
+   *
+   * This decrements the refcount for the struct gendisk. When this reaches 0
+   * we'll have disk_release() called.
+* Unmerged path block/genhd.c
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 0fcca343e13b..5d787800a71d 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -470,15 +470,8 @@ int blk_drop_partitions(struct block_device *bdev);
+ extern void printk_all_partitions(void);
+ 
+ extern struct gendisk *__alloc_disk_node(int minors, int node_id);
+-extern struct kobject *get_disk_and_module(struct gendisk *disk);
+ extern void put_disk(struct gendisk *disk);
+ extern void put_disk_and_module(struct gendisk *disk);
+-extern void blk_register_region(dev_t devt, unsigned long range,
+-			struct module *module,
+-			struct kobject *(*probe)(dev_t, int *, void *),
+-			int (*lock)(dev_t, void *),
+-			void *data);
+-extern void blk_unregister_region(dev_t devt, unsigned long range);
+ 
+ #define alloc_disk_node(minors, node_id)				\
+ ({									\
