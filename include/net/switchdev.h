@@ -22,6 +22,7 @@ enum switchdev_attr_id {
 	SWITCHDEV_ATTR_ID_UNDEFINED,
 	RH_KABI_BROKEN_REMOVE_ENUM(SWITCHDEV_ATTR_ID_PORT_PARENT_ID)
 	SWITCHDEV_ATTR_ID_PORT_STP_STATE,
+	SWITCHDEV_ATTR_ID_PORT_MST_STATE,
 	SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS,
 	RH_KABI_BROKEN_INSERT_ENUM(SWITCHDEV_ATTR_ID_PORT_PRE_BRIDGE_FLAGS)
 	RH_KABI_BROKEN_REMOVE_ENUM(SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS_SUPPORT)
@@ -32,6 +33,11 @@ enum switchdev_attr_id {
 	SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
 	SWITCHDEV_ATTR_ID_BRIDGE_MROUTER,
 	RH_KABI_BROKEN_INSERT_ENUM(SWITCHDEV_ATTR_ID_MRP_PORT_ROLE)
+};
+
+struct switchdev_mst_state {
+	u16 msti;
+	u8 state;
 };
 
 struct switchdev_brport_flags {
@@ -64,6 +70,7 @@ struct switchdev_attr {
 		RH_KABI_BROKEN_INSERT_BLOCK(
 		struct netdev_phys_item_id ppid;	/* PORT_PARENT_ID */
 		u8 stp_state;				/* PORT_STP_STATE */
+		struct switchdev_mst_state mst_state;	/* PORT_MST_STATE */
 		struct switchdev_brport_flags brport_flags; /* PORT_BRIDGE_FLAGS */
 		bool mrouter;				/* PORT_MROUTER */
 		clock_t ageing_time;			/* BRIDGE_AGEING_TIME */
