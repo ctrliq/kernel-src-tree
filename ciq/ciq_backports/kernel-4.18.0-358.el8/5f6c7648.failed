@@ -1,0 +1,163 @@
+printk: kmsg_dumper: remove @active field
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 5f6c7648e556f41a3064bb6dceb9e102c50b618d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5f6c7648.failed
+
+All 6 kmsg_dumpers do not benefit from the @active flag:
+
+  (provide their own synchronization)
+  - arch/powerpc/kernel/nvram_64.c
+  - arch/um/kernel/kmsg_dump.c
+  - drivers/mtd/mtdoops.c
+  - fs/pstore/platform.c
+
+  (only dump on KMSG_DUMP_PANIC, which does not require
+  synchronization)
+  - arch/powerpc/platforms/powernv/opal-kmsg.c
+  - drivers/hv/vmbus_drv.c
+
+The other 2 kmsg_dump users also do not rely on @active:
+
+  (hard-code @active to always be true)
+  - arch/powerpc/xmon/xmon.c
+  - kernel/debug/kdb/kdb_main.c
+
+Therefore, @active can be removed.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-12-john.ogness@linutronix.de
+(cherry picked from commit 5f6c7648e556f41a3064bb6dceb9e102c50b618d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,ce4cc64ba7c9..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -3191,13 -3408,9 +3191,11 @@@ void kmsg_dump(enum kmsg_dump_reason re
+  			continue;
+  
+  		/* initialize iterator with data about the stored records */
+- 		dumper->active = true;
+- 
+  		logbuf_lock_irqsave(flags);
+ -		dumper->cur_seq = latched_seq_read_nolock(&clear_seq);
+ -		dumper->next_seq = prb_next_seq(prb);
+ +		dumper->cur_seq = clear_seq;
+ +		dumper->cur_idx = clear_idx;
+ +		dumper->next_seq = log_next_seq;
+ +		dumper->next_idx = log_next_idx;
+  		logbuf_unlock_irqrestore(flags);
+  
+  		/* invoke dumper which will iterate over records */
+@@@ -3235,24 -3447,24 +3230,42 @@@ bool kmsg_dump_get_line_nolock(struct k
+  	size_t l = 0;
+  	bool ret = false;
+  
+++<<<<<<< HEAD
+ +	if (!dumper->active)
+ +		goto out;
+ +
+ +	if (dumper->cur_seq < log_first_seq) {
+ +		/* messages are gone, move to first available one */
+ +		dumper->cur_seq = log_first_seq;
+ +		dumper->cur_idx = log_first_idx;
+++=======
++ 	prb_rec_init_rd(&r, &info, line, size);
++ 
++ 	/* Read text or count text lines? */
++ 	if (line) {
++ 		if (!prb_read_valid(prb, dumper->cur_seq, &r))
++ 			goto out;
++ 		l = record_print_text(&r, syslog, printk_time);
++ 	} else {
++ 		if (!prb_read_valid_info(prb, dumper->cur_seq,
++ 					 &info, &line_count)) {
++ 			goto out;
++ 		}
++ 		l = get_record_print_text_size(&info, line_count, syslog,
++ 					       printk_time);
++ 
+++>>>>>>> 5f6c7648e556 (printk: kmsg_dumper: remove @active field)
+  	}
+  
+ -	dumper->cur_seq = r.info->seq + 1;
+ +	/* last entry */
+ +	if (dumper->cur_seq >= log_next_seq)
+ +		goto out;
+ +
+ +	msg = log_from_idx(dumper->cur_idx);
+ +	l = msg_print_text(msg, syslog, printk_time, line, size);
+ +
+ +	dumper->cur_idx = log_next(dumper->cur_idx);
+ +	dumper->cur_seq++;
+  	ret = true;
+  out:
+  	if (len)
+@@@ -3322,7 -3534,7 +3335,11 @@@ bool kmsg_dump_get_buffer(struct kmsg_d
+  	bool ret = false;
+  	bool time = printk_time;
+  
+++<<<<<<< HEAD
+ +	if (!dumper->active)
+++=======
++ 	if (!buf || !size)
+++>>>>>>> 5f6c7648e556 (printk: kmsg_dumper: remove @active field)
+  		goto out;
+  
+  	logbuf_lock_irqsave(flags);
+diff --git a/arch/powerpc/xmon/xmon.c b/arch/powerpc/xmon/xmon.c
+index feb327dbc17f..5a192b3931a5 100644
+--- a/arch/powerpc/xmon/xmon.c
++++ b/arch/powerpc/xmon/xmon.c
+@@ -2950,7 +2950,7 @@ print_address(unsigned long addr)
+ void
+ dump_log_buf(void)
+ {
+-	struct kmsg_dumper dumper = { .active = 1 };
++	struct kmsg_dumper dumper;
+ 	unsigned char buf[128];
+ 	size_t len;
+ 
+diff --git a/include/linux/kmsg_dump.h b/include/linux/kmsg_dump.h
+index b833daa05587..bc751aeba5a7 100644
+--- a/include/linux/kmsg_dump.h
++++ b/include/linux/kmsg_dump.h
+@@ -37,7 +37,6 @@ enum kmsg_dump_reason {
+  * 		through the record iterator
+  * @max_reason:	filter for highest reason number that should be dumped
+  * @registered:	Flag that specifies if this is already registered
+- * @active:	Flag that specifies if this is currently dumping
+  * @cur_seq:	Points to the oldest message to dump
+  * @next_seq:	Points after the newest message to dump
+  */
+@@ -45,7 +44,6 @@ struct kmsg_dumper {
+ 	struct list_head list;
+ 	void (*dump)(struct kmsg_dumper *dumper, enum kmsg_dump_reason reason);
+ 	enum kmsg_dump_reason max_reason;
+-	bool active;
+ 	bool registered;
+ 
+ 	/* private state of the kmsg iterator */
+diff --git a/kernel/debug/kdb/kdb_main.c b/kernel/debug/kdb/kdb_main.c
+index f3aee10cce6f..c8a7ba82c728 100644
+--- a/kernel/debug/kdb/kdb_main.c
++++ b/kernel/debug/kdb/kdb_main.c
+@@ -2088,7 +2088,7 @@ static int kdb_dmesg(int argc, const char **argv)
+ 	int adjust = 0;
+ 	int n = 0;
+ 	int skip = 0;
+-	struct kmsg_dumper dumper = { .active = 1 };
++	struct kmsg_dumper dumper;
+ 	size_t len;
+ 	char buf[201];
+ 
+* Unmerged path kernel/printk/printk.c
