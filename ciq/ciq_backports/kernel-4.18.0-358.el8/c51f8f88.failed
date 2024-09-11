@@ -1,0 +1,117 @@
+random32: make prandom_u32() output unpredictable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author George Spelvin <lkml@sdf.org>
+commit c51f8f88d705e06bd696d7510aff22b33eb8e638
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c51f8f88.failed
+
+Non-cryptographic PRNGs may have great statistical properties, but
+are usually trivially predictable to someone who knows the algorithm,
+given a small sample of their output.  An LFSR like prandom_u32() is
+particularly simple, even if the sample is widely scattered bits.
+
+It turns out the network stack uses prandom_u32() for some things like
+random port numbers which it would prefer are *not* trivially predictable.
+Predictability led to a practical DNS spoofing attack.  Oops.
+
+This patch replaces the LFSR with a homebrew cryptographic PRNG based
+on the SipHash round function, which is in turn seeded with 128 bits
+of strong random key.  (The authors of SipHash have *not* been consulted
+about this abuse of their algorithm.)  Speed is prioritized over security;
+attacks are rare, while performance is always wanted.
+
+Replacing all callers of prandom_u32() is the quick fix.
+Whether to reinstate a weaker PRNG for uses which can tolerate it
+is an open question.
+
+Commit f227e3ec3b5c ("random32: update the net random state on interrupt
+and activity") was an earlier attempt at a solution.  This patch replaces
+it.
+
+	Reported-by: Amit Klein <aksecurity@gmail.com>
+	Cc: Willy Tarreau <w@1wt.eu>
+	Cc: Eric Dumazet <edumazet@google.com>
+	Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: tytso@mit.edu
+	Cc: Florian Westphal <fw@strlen.de>
+	Cc: Marc Plumb <lkml.mplumb@gmail.com>
+Fixes: f227e3ec3b5c ("random32: update the net random state on interrupt and activity")
+	Signed-off-by: George Spelvin <lkml@sdf.org>
+Link: https://lore.kernel.org/netdev/20200808152628.GA27941@SDF.ORG/
+[ willy: partial reversal of f227e3ec3b5c; moved SIPROUND definitions
+  to prandom.h for later use; merged George's prandom_seed() proposal;
+  inlined siprand_u32(); replaced the net_rand_state[] array with 4
+  members to fix a build issue; cosmetic cleanups to make checkpatch
+  happy; fixed RANDOM32_SELFTEST build ]
+	Signed-off-by: Willy Tarreau <w@1wt.eu>
+(cherry picked from commit c51f8f88d705e06bd696d7510aff22b33eb8e638)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/prandom.h
+#	lib/random32.c
+diff --cc lib/random32.c
+index 53acf5adef8f,be9f242a4207..000000000000
+--- a/lib/random32.c
++++ b/lib/random32.c
+@@@ -41,16 -41,6 +41,19 @@@
+  #include <asm/unaligned.h>
+  #include <trace/events/random.h>
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_RANDOM32_SELFTEST
+ +static void __init prandom_state_selftest(void);
+ +#else
+ +static inline void prandom_state_selftest(void)
+ +{
+ +}
+ +#endif
+ +
+ +DEFINE_PER_CPU(struct rnd_state, net_rand_state) __latent_entropy;
+ +
+++=======
+++>>>>>>> c51f8f88d705 (random32: make prandom_u32() output unpredictable)
+  /**
+   *	prandom_u32_state - seeded pseudo-random number generator.
+   *	@state: pointer to state structure holding seeded state.
+* Unmerged path include/linux/prandom.h
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index d4d97eaf79ef..0c956cd6e5a0 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -1266,7 +1266,6 @@ void add_interrupt_randomness(int irq, int irq_flags)
+ 
+ 	fast_mix(fast_pool);
+ 	add_interrupt_bench(cycles);
+-	this_cpu_add(net_rand_state.s1, fast_pool->pool[cycles & 3]);
+ 
+ 	if (unlikely(crng_init == 0)) {
+ 		if ((fast_pool->count >= 64) &&
+* Unmerged path include/linux/prandom.h
+diff --git a/kernel/time/timer.c b/kernel/time/timer.c
+index 8f5bf3f0c8ce..d841c5ec68cf 100644
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -1708,13 +1708,6 @@ void update_process_times(int user_tick)
+ 	scheduler_tick();
+ 	if (IS_ENABLED(CONFIG_POSIX_TIMERS))
+ 		run_posix_cpu_timers();
+-
+-	/* The current CPU might make use of net randoms without receiving IRQs
+-	 * to renew them often enough. Let's update the net_rand_state from a
+-	 * non-constant value that's not affine to the number of calls to make
+-	 * sure it's updated when there's some activity (we don't care in idle).
+-	 */
+-	this_cpu_add(net_rand_state.s1, rol32(jiffies, 24) + user_tick);
+ }
+ 
+ /**
+* Unmerged path lib/random32.c
