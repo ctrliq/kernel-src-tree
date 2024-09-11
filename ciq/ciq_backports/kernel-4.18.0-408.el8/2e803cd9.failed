@@ -1,0 +1,255 @@
+dm: don't grab target io reference in dm_zone_map_bio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 2e803cd99ba8b7a84be155c1d5ee28d363fdbe44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/2e803cd9.failed
+
+dm_zone_map_bio() is only called from __map_bio in which the io's
+reference is grabbed already, and the reference won't be released
+until the bio is submitted, so not necessary to do it dm_zone_map_bio
+any more.
+
+	Reviewed-by: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+	Tested-by: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 2e803cd99ba8b7a84be155c1d5ee28d363fdbe44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-core.h
+#	drivers/md/dm-zone.c
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-core.h
+index a9c78c74b3c7,d2d188c9b632..000000000000
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@@ -224,12 -277,24 +224,33 @@@ struct dm_io 
+  	struct dm_target_io tio;
+  };
+  
+++<<<<<<< HEAD
+ +static inline void dm_io_inc_pending(struct dm_io *io)
+ +{
+ +	atomic_inc(&io->io_count);
+ +}
+ +
+ +void dm_io_dec_pending(struct dm_io *io, blk_status_t error);
+++=======
++ /*
++  * dm_io flags
++  */
++ enum {
++ 	DM_IO_START_ACCT,
++ 	DM_IO_ACCOUNTED,
++ 	DM_IO_WAS_SPLIT
++ };
++ 
++ static inline bool dm_io_flagged(struct dm_io *io, unsigned int bit)
++ {
++ 	return (io->flags & (1U << bit)) != 0;
++ }
++ 
++ static inline void dm_io_set_flag(struct dm_io *io, unsigned int bit)
++ {
++ 	io->flags |= (1U << bit);
++ }
+++>>>>>>> 2e803cd99ba8 (dm: don't grab target io reference in dm_zone_map_bio)
+  
+  static inline struct completion *dm_get_completion_from_kobject(struct kobject *kobj)
+  {
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,7cae8235fbe1..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -866,72 -879,116 +866,179 @@@ static int __noflush_suspending(struct 
+  	return test_bit(DMF_NOFLUSH_SUSPENDING, &md->flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dm_io_complete(struct dm_io *io)
++ {
++ 	blk_status_t io_error;
++ 	struct mapped_device *md = io->md;
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	if (io->status == BLK_STS_DM_REQUEUE) {
++ 		unsigned long flags;
++ 		/*
++ 		 * Target requested pushing back the I/O.
++ 		 */
++ 		spin_lock_irqsave(&md->deferred_lock, flags);
++ 		if (__noflush_suspending(md) &&
++ 		    !WARN_ON_ONCE(dm_is_zone_write(md, bio))) {
++ 			/* NOTE early return due to BLK_STS_DM_REQUEUE below */
++ 			bio_list_add_head(&md->deferred, bio);
++ 		} else {
++ 			/*
++ 			 * noflush suspend was interrupted or this is
++ 			 * a write to a zoned target.
++ 			 */
++ 			io->status = BLK_STS_IOERR;
++ 		}
++ 		spin_unlock_irqrestore(&md->deferred_lock, flags);
++ 	}
++ 
++ 	io_error = io->status;
++ 	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 		dm_end_io_acct(io);
++ 	else if (!io_error) {
++ 		/*
++ 		 * Must handle target that DM_MAPIO_SUBMITTED only to
++ 		 * then bio_endio() rather than dm_submit_bio_remap()
++ 		 */
++ 		__dm_start_io_acct(io);
++ 		dm_end_io_acct(io);
++ 	}
++ 	free_io(io);
++ 	smp_wmb();
++ 	this_cpu_dec(*md->pending_io);
++ 
++ 	/* nudge anyone waiting on suspend queue */
++ 	if (unlikely(wq_has_sleeper(&md->wait)))
++ 		wake_up(&md->wait);
++ 
++ 	if (io_error == BLK_STS_DM_REQUEUE || io_error == BLK_STS_AGAIN) {
++ 		if (bio->bi_opf & REQ_POLLED) {
++ 			/*
++ 			 * Upper layer won't help us poll split bio (io->orig_bio
++ 			 * may only reflect a subset of the pre-split original)
++ 			 * so clear REQ_POLLED in case of requeue.
++ 			 */
++ 			bio_clear_polled(bio);
++ 			if (io_error == BLK_STS_AGAIN) {
++ 				/* io_uring doesn't handle BLK_STS_AGAIN (yet) */
++ 				queue_io(md, bio);
++ 			}
++ 		}
++ 		return;
++ 	}
++ 
++ 	if (bio_is_flush_with_data(bio)) {
++ 		/*
++ 		 * Preflush done for flush with data, reissue
++ 		 * without REQ_PREFLUSH.
++ 		 */
++ 		bio->bi_opf &= ~REQ_PREFLUSH;
++ 		queue_io(md, bio);
++ 	} else {
++ 		/* done with normal IO or empty flush */
++ 		if (io_error)
++ 			bio->bi_status = io_error;
++ 		bio_endio(bio);
++ 	}
++ }
++ 
++ static void dm_io_inc_pending(struct dm_io *io)
++ {
++ 	atomic_inc(&io->io_count);
++ }
++ 
+++>>>>>>> 2e803cd99ba8 (dm: don't grab target io reference in dm_zone_map_bio)
+  /*
+   * Decrements the number of outstanding ios that a bio has been
+   * cloned into, completing the original io if necc.
+   */
+++<<<<<<< HEAD
+ +void dm_io_dec_pending(struct dm_io *io, blk_status_t error)
+++=======
++ static inline void __dm_io_dec_pending(struct dm_io *io)
++ {
++ 	if (atomic_dec_and_test(&io->io_count))
++ 		dm_io_complete(io);
++ }
++ 
++ static void dm_io_set_error(struct dm_io *io, blk_status_t error)
++ {
++ 	unsigned long flags;
++ 
++ 	/* Push-back supersedes any I/O errors */
++ 	spin_lock_irqsave(&io->lock, flags);
++ 	if (!(io->status == BLK_STS_DM_REQUEUE &&
++ 	      __noflush_suspending(io->md))) {
++ 		io->status = error;
++ 	}
++ 	spin_unlock_irqrestore(&io->lock, flags);
++ }
++ 
++ static void dm_io_dec_pending(struct dm_io *io, blk_status_t error)
+++>>>>>>> 2e803cd99ba8 (dm: don't grab target io reference in dm_zone_map_bio)
+  {
+ -	if (unlikely(error))
+ -		dm_io_set_error(io, error);
+ +	unsigned long flags;
+ +	blk_status_t io_error;
+ +	struct bio *bio;
+ +	struct mapped_device *md = io->md;
+ +	unsigned long start_time = 0;
+ +	struct dm_stats_aux stats_aux;
+  
+ -	__dm_io_dec_pending(io);
+ +	/* Push-back supersedes any I/O errors */
+ +	if (unlikely(error)) {
+ +		spin_lock_irqsave(&io->endio_lock, flags);
+ +		if (!(io->status == BLK_STS_DM_REQUEUE && __noflush_suspending(md)))
+ +			io->status = error;
+ +		spin_unlock_irqrestore(&io->endio_lock, flags);
+ +	}
+ +
+ +	if (atomic_dec_and_test(&io->io_count)) {
+ +		if (io->status == BLK_STS_DM_REQUEUE) {
+ +			/*
+ +			 * Target requested pushing back the I/O.
+ +			 */
+ +			spin_lock_irqsave(&md->deferred_lock, flags);
+ +			if (__noflush_suspending(md))
+ +				/* NOTE early return due to BLK_STS_DM_REQUEUE below */
+ +				bio_list_add_head(&md->deferred, io->orig_bio);
+ +			else
+ +				/* noflush suspend was interrupted. */
+ +				io->status = BLK_STS_IOERR;
+ +			spin_unlock_irqrestore(&md->deferred_lock, flags);
+ +		}
+ +
+ +		io_error = io->status;
+ +		bio = io->orig_bio;
+ +		start_time = io->start_time;
+ +		stats_aux = io->stats_aux;
+ +		free_io(md, io);
+ +		end_io_acct(md, bio, start_time, &stats_aux);
+ +		smp_wmb();
+ +		this_cpu_dec(*md->pending_io);
+ +
+ +		/* nudge anyone waiting on suspend queue */
+ +		if (unlikely(wq_has_sleeper(&md->wait)))
+ +			wake_up(&md->wait);
+ +
+ +		if (io_error == BLK_STS_DM_REQUEUE)
+ +			return;
+ +
+ +		if (bio_is_flush_with_data(bio)) {
+ +			/*
+ +			 * Preflush done for flush with data, reissue
+ +			 * without REQ_PREFLUSH.
+ +			 */
+ +			bio->bi_opf &= ~REQ_PREFLUSH;
+ +			queue_io(md, bio);
+ +		} else {
+ +			/* done with normal IO or empty flush */
+ +			if (io_error)
+ +				bio->bi_status = io_error;
+ +			bio_endio(bio);
+ +		}
+ +	}
+  }
+  
+  void disable_discard(struct mapped_device *md)
+* Unmerged path drivers/md/dm-zone.c
+* Unmerged path drivers/md/dm-core.h
+* Unmerged path drivers/md/dm-zone.c
+* Unmerged path drivers/md/dm.c
