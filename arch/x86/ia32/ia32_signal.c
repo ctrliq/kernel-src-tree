@@ -93,7 +93,7 @@ static bool ia32_restore_sigcontext(struct pt_regs *regs,
 	 * normal case.
 	 */
 	reload_segments(&sc);
-	return !fpu__restore_sig(compat_ptr(sc.fpstate), 1);
+	return fpu__restore_sig(compat_ptr(sc.fpstate), 1);
 }
 
 asmlinkage long sys32_sigreturn(void)
