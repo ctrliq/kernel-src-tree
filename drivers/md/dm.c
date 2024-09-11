@@ -1594,7 +1594,7 @@ static blk_qc_t __split_and_process_bio(struct mapped_device *md,
 		ci.sector_count = bio_sectors(bio);
 		while (ci.sector_count && !error) {
 			error = __split_and_process_non_flush(&ci);
-			if (current->bio_list && ci.sector_count && !error) {
+			if (ci.sector_count && !error) {
 				/*
 				 * Remainder must be passed to generic_make_request()
 				 * so that it gets handled *after* bios already submitted
