@@ -1,0 +1,217 @@
+xhci: store TD status in the td struct instead of passing it along
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Mathias Nyman <mathias.nyman@linux.intel.com>
+commit a6ccd1fd4bd4fca37eaa3d76bef940d6332919bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/a6ccd1fd.failed
+
+In cases where the TD can't be given back in current handler we want
+to be able to store it until its time to return the TD.
+
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20210129130044.206855-19-mathias.nyman@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a6ccd1fd4bd4fca37eaa3d76bef940d6332919bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/xhci-ring.c
+diff --cc drivers/usb/host/xhci-ring.c
+index fdb8f13b8e27,26b2d1e9b55a..000000000000
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@@ -749,6 -749,74 +749,77 @@@ static void xhci_unmap_td_bounce_buffer
+  	seg->bounce_offs = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int xhci_td_cleanup(struct xhci_hcd *xhci, struct xhci_td *td,
++ 			   struct xhci_ring *ep_ring, int status)
++ {
++ 	struct urb *urb = NULL;
++ 
++ 	/* Clean up the endpoint's TD list */
++ 	urb = td->urb;
++ 
++ 	/* if a bounce buffer was used to align this td then unmap it */
++ 	xhci_unmap_td_bounce_buffer(xhci, ep_ring, td);
++ 
++ 	/* Do one last check of the actual transfer length.
++ 	 * If the host controller said we transferred more data than the buffer
++ 	 * length, urb->actual_length will be a very big number (since it's
++ 	 * unsigned).  Play it safe and say we didn't transfer anything.
++ 	 */
++ 	if (urb->actual_length > urb->transfer_buffer_length) {
++ 		xhci_warn(xhci, "URB req %u and actual %u transfer length mismatch\n",
++ 			  urb->transfer_buffer_length, urb->actual_length);
++ 		urb->actual_length = 0;
++ 		status = 0;
++ 	}
++ 	/* TD might be removed from td_list if we are giving back a cancelled URB */
++ 	if (!list_empty(&td->td_list))
++ 		list_del_init(&td->td_list);
++ 	/* Giving back a cancelled URB, or if a slated TD completed anyway */
++ 	if (!list_empty(&td->cancelled_td_list))
++ 		list_del_init(&td->cancelled_td_list);
++ 
++ 	inc_td_cnt(urb);
++ 	/* Giveback the urb when all the tds are completed */
++ 	if (last_td_in_urb(td)) {
++ 		if ((urb->actual_length != urb->transfer_buffer_length &&
++ 		     (urb->transfer_flags & URB_SHORT_NOT_OK)) ||
++ 		    (status != 0 && !usb_endpoint_xfer_isoc(&urb->ep->desc)))
++ 			xhci_dbg(xhci, "Giveback URB %p, len = %d, expected = %d, status = %d\n",
++ 				 urb, urb->actual_length,
++ 				 urb->transfer_buffer_length, status);
++ 
++ 		/* set isoc urb status to 0 just as EHCI, UHCI, and OHCI */
++ 		if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS)
++ 			status = 0;
++ 		xhci_giveback_urb_in_irq(xhci, td, status);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int xhci_reset_halted_ep(struct xhci_hcd *xhci, unsigned int slot_id,
++ 				unsigned int ep_index, enum xhci_ep_reset_type reset_type)
++ {
++ 	struct xhci_command *command;
++ 	int ret = 0;
++ 
++ 	command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
++ 	if (!command) {
++ 		ret = -ENOMEM;
++ 		goto done;
++ 	}
++ 
++ 	ret = xhci_queue_reset_ep(xhci, command, slot_id, ep_index, reset_type);
++ done:
++ 	if (ret)
++ 		xhci_err(xhci, "ERROR queuing reset endpoint for slot %d ep_index %d, %d\n",
++ 			 slot_id, ep_index, ret);
++ 	return ret;
++ }
++ 
+++>>>>>>> a6ccd1fd4bd4 (xhci: store TD status in the td struct instead of passing it along)
+  /*
+   * When we get a command completion for a Stop Endpoint Command, we need to
+   * unlink any cancelled TDs from the ring.  There are two ways to do that:
+@@@ -1973,68 -2035,15 +2044,67 @@@ int xhci_is_vendor_info_code(struct xhc
+  	return 0;
+  }
+  
+ +static int xhci_td_cleanup(struct xhci_hcd *xhci, struct xhci_td *td,
+ +		struct xhci_ring *ep_ring, int *status)
+ +{
+ +	struct urb *urb = NULL;
+ +
+ +	/* Clean up the endpoint's TD list */
+ +	urb = td->urb;
+ +
+ +	/* if a bounce buffer was used to align this td then unmap it */
+ +	xhci_unmap_td_bounce_buffer(xhci, ep_ring, td);
+ +
+ +	/* Do one last check of the actual transfer length.
+ +	 * If the host controller said we transferred more data than the buffer
+ +	 * length, urb->actual_length will be a very big number (since it's
+ +	 * unsigned).  Play it safe and say we didn't transfer anything.
+ +	 */
+ +	if (urb->actual_length > urb->transfer_buffer_length) {
+ +		xhci_warn(xhci, "URB req %u and actual %u transfer length mismatch\n",
+ +			  urb->transfer_buffer_length, urb->actual_length);
+ +		urb->actual_length = 0;
+ +		*status = 0;
+ +	}
+ +	list_del_init(&td->td_list);
+ +	/* Was this TD slated to be cancelled but completed anyway? */
+ +	if (!list_empty(&td->cancelled_td_list))
+ +		list_del_init(&td->cancelled_td_list);
+ +
+ +	inc_td_cnt(urb);
+ +	/* Giveback the urb when all the tds are completed */
+ +	if (last_td_in_urb(td)) {
+ +		if ((urb->actual_length != urb->transfer_buffer_length &&
+ +		     (urb->transfer_flags & URB_SHORT_NOT_OK)) ||
+ +		    (*status != 0 && !usb_endpoint_xfer_isoc(&urb->ep->desc)))
+ +			xhci_dbg(xhci, "Giveback URB %p, len = %d, expected = %d, status = %d\n",
+ +				 urb, urb->actual_length,
+ +				 urb->transfer_buffer_length, *status);
+ +
+ +		/* set isoc urb status to 0 just as EHCI, UHCI, and OHCI */
+ +		if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS)
+ +			*status = 0;
+ +		xhci_giveback_urb_in_irq(xhci, td, *status);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+  static int finish_td(struct xhci_hcd *xhci, struct xhci_td *td,
+- 	struct xhci_transfer_event *event,
+- 	struct xhci_virt_ep *ep, int *status)
++ 	struct xhci_transfer_event *event, struct xhci_virt_ep *ep)
+  {
+ +	struct xhci_virt_device *xdev;
+  	struct xhci_ep_ctx *ep_ctx;
+  	struct xhci_ring *ep_ring;
+ +	unsigned int slot_id;
+  	u32 trb_comp_code;
+ +	int ep_index;
+  
+ +	slot_id = TRB_TO_SLOT_ID(le32_to_cpu(event->flags));
+ +	xdev = xhci->devs[slot_id];
+ +	ep_index = TRB_TO_EP_ID(le32_to_cpu(event->flags)) - 1;
+  	ep_ring = xhci_dma_to_transfer_ring(ep, le64_to_cpu(event->buffer));
+ -	ep_ctx = xhci_get_ep_ctx(xhci, ep->vdev->out_ctx, ep->ep_index);
+ +	ep_ctx = xhci_get_ep_ctx(xhci, xdev->out_ctx, ep_index);
+  	trb_comp_code = GET_COMP_CODE(le32_to_cpu(event->transfer_len));
+  
+  	if (trb_comp_code == COMP_STOPPED_LENGTH_INVALID ||
+@@@ -2094,11 -2103,8 +2164,11 @@@ static int sum_trb_lengths(struct xhci_
+   */
+  static int process_ctrl_td(struct xhci_hcd *xhci, struct xhci_td *td,
+  	union xhci_trb *ep_trb, struct xhci_transfer_event *event,
+- 	struct xhci_virt_ep *ep, int *status)
++ 	struct xhci_virt_ep *ep)
+  {
+ +	struct xhci_virt_device *xdev;
+ +	unsigned int slot_id;
+ +	int ep_index;
+  	struct xhci_ep_ctx *ep_ctx;
+  	u32 trb_comp_code;
+  	u32 remaining, requested;
+@@@ -2355,9 -2354,10 +2425,16 @@@ static int process_bulk_intr_td(struct 
+  		if ((ep_ring->err_count++ > MAX_SOFT_RETRY) ||
+  		    le32_to_cpu(slot_ctx->tt_info) & TT_SLOT)
+  			break;
+++<<<<<<< HEAD
+ +		*status = 0;
+ +		xhci_cleanup_halted_endpoint(xhci, slot_id, ep_index,
+ +					ep_ring->stream_id, td, EP_SOFT_RESET);
+++=======
++ 
++ 		td->status = 0;
++ 		xhci_cleanup_halted_endpoint(xhci, ep, ep_ring->stream_id, td,
++ 					     EP_SOFT_RESET);
+++>>>>>>> a6ccd1fd4bd4 (xhci: store TD status in the td struct instead of passing it along)
+  		return 0;
+  	default:
+  		/* do nothing */
+* Unmerged path drivers/usb/host/xhci-ring.c
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index db601e9a0692..9a0841a8d194 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1539,6 +1539,7 @@ struct xhci_segment {
+ struct xhci_td {
+ 	struct list_head	td_list;
+ 	struct list_head	cancelled_td_list;
++	int			status;
+ 	struct urb		*urb;
+ 	struct xhci_segment	*start_seg;
+ 	union xhci_trb		*first_trb;
