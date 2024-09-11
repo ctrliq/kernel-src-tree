@@ -1,0 +1,605 @@
+kernfs: convert kernfs_node->id from union kernfs_node_id to u64
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Tejun Heo <tj@kernel.org>
+commit 67c0496e87d193b8356d2af49ab95e8a1b954b3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/67c0496e.failed
+
+kernfs_node->id is currently a union kernfs_node_id which represents
+either a 32bit (ino, gen) pair or u64 value.  I can't see much value
+in the usage of the union - all that's needed is a 64bit ID which the
+current code is already limited to.  Using a union makes the code
+unnecessarily complicated and prevents using 64bit ino without adding
+practical benefits.
+
+This patch drops union kernfs_node_id and makes kernfs_node->id a u64.
+ino is stored in the lower 32bits and gen upper.  Accessors -
+kernfs[_id]_ino() and kernfs[_id]_gen() - are added to retrieve the
+ino and gen.  This simplifies ID handling less cumbersome and will
+allow using 64bit inos on supported archs.
+
+This patch doesn't make any functional changes.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 67c0496e87d193b8356d2af49ab95e8a1b954b3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/writeback.h
+#	kernel/trace/blktrace.c
+diff --cc include/trace/events/writeback.h
+index 300afa559f46,b4f0ffe1817e..000000000000
+--- a/include/trace/events/writeback.h
++++ b/include/trace/events/writeback.h
+@@@ -134,12 -150,12 +134,12 @@@ DEFINE_EVENT(writeback_dirty_inode_temp
+  #ifdef CREATE_TRACE_POINTS
+  #ifdef CONFIG_CGROUP_WRITEBACK
+  
+ -static inline ino_t __trace_wb_assign_cgroup(struct bdi_writeback *wb)
+ +static inline unsigned int __trace_wb_assign_cgroup(struct bdi_writeback *wb)
+  {
+- 	return wb->memcg_css->cgroup->kn->id.ino;
++ 	return cgroup_ino(wb->memcg_css->cgroup);
+  }
+  
+ -static inline ino_t __trace_wbc_assign_cgroup(struct writeback_control *wbc)
+ +static inline unsigned int __trace_wbc_assign_cgroup(struct writeback_control *wbc)
+  {
+  	if (wbc->wb)
+  		return __trace_wb_assign_cgroup(wbc->wb);
+@@@ -161,6 -177,132 +161,135 @@@ static inline unsigned int __trace_wbc_
+  #endif	/* CONFIG_CGROUP_WRITEBACK */
+  #endif	/* CREATE_TRACE_POINTS */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CGROUP_WRITEBACK
++ TRACE_EVENT(inode_foreign_history,
++ 
++ 	TP_PROTO(struct inode *inode, struct writeback_control *wbc,
++ 		 unsigned int history),
++ 
++ 	TP_ARGS(inode, wbc, history),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(ino_t,		ino)
++ 		__field(ino_t,		cgroup_ino)
++ 		__field(unsigned int,	history)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		strncpy(__entry->name, dev_name(inode_to_bdi(inode)->dev), 32);
++ 		__entry->ino		= inode->i_ino;
++ 		__entry->cgroup_ino	= __trace_wbc_assign_cgroup(wbc);
++ 		__entry->history	= history;
++ 	),
++ 
++ 	TP_printk("bdi %s: ino=%lu cgroup_ino=%lu history=0x%x",
++ 		__entry->name,
++ 		__entry->ino,
++ 		__entry->cgroup_ino,
++ 		__entry->history
++ 	)
++ );
++ 
++ TRACE_EVENT(inode_switch_wbs,
++ 
++ 	TP_PROTO(struct inode *inode, struct bdi_writeback *old_wb,
++ 		 struct bdi_writeback *new_wb),
++ 
++ 	TP_ARGS(inode, old_wb, new_wb),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(ino_t,		ino)
++ 		__field(ino_t,		old_cgroup_ino)
++ 		__field(ino_t,		new_cgroup_ino)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		strncpy(__entry->name,	dev_name(old_wb->bdi->dev), 32);
++ 		__entry->ino		= inode->i_ino;
++ 		__entry->old_cgroup_ino	= __trace_wb_assign_cgroup(old_wb);
++ 		__entry->new_cgroup_ino	= __trace_wb_assign_cgroup(new_wb);
++ 	),
++ 
++ 	TP_printk("bdi %s: ino=%lu old_cgroup_ino=%lu new_cgroup_ino=%lu",
++ 		__entry->name,
++ 		__entry->ino,
++ 		__entry->old_cgroup_ino,
++ 		__entry->new_cgroup_ino
++ 	)
++ );
++ 
++ TRACE_EVENT(track_foreign_dirty,
++ 
++ 	TP_PROTO(struct page *page, struct bdi_writeback *wb),
++ 
++ 	TP_ARGS(page, wb),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(u64,		bdi_id)
++ 		__field(ino_t,		ino)
++ 		__field(unsigned int,	memcg_id)
++ 		__field(ino_t,		cgroup_ino)
++ 		__field(ino_t,		page_cgroup_ino)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		struct address_space *mapping = page_mapping(page);
++ 		struct inode *inode = mapping ? mapping->host : NULL;
++ 
++ 		strncpy(__entry->name,	dev_name(wb->bdi->dev), 32);
++ 		__entry->bdi_id		= wb->bdi->id;
++ 		__entry->ino		= inode ? inode->i_ino : 0;
++ 		__entry->memcg_id	= wb->memcg_css->id;
++ 		__entry->cgroup_ino	= __trace_wb_assign_cgroup(wb);
++ 		__entry->page_cgroup_ino = cgroup_ino(page->mem_cgroup->css.cgroup);
++ 	),
++ 
++ 	TP_printk("bdi %s[%llu]: ino=%lu memcg_id=%u cgroup_ino=%lu page_cgroup_ino=%lu",
++ 		__entry->name,
++ 		__entry->bdi_id,
++ 		__entry->ino,
++ 		__entry->memcg_id,
++ 		__entry->cgroup_ino,
++ 		__entry->page_cgroup_ino
++ 	)
++ );
++ 
++ TRACE_EVENT(flush_foreign,
++ 
++ 	TP_PROTO(struct bdi_writeback *wb, unsigned int frn_bdi_id,
++ 		 unsigned int frn_memcg_id),
++ 
++ 	TP_ARGS(wb, frn_bdi_id, frn_memcg_id),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(ino_t,		cgroup_ino)
++ 		__field(unsigned int,	frn_bdi_id)
++ 		__field(unsigned int,	frn_memcg_id)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		strncpy(__entry->name,	dev_name(wb->bdi->dev), 32);
++ 		__entry->cgroup_ino	= __trace_wb_assign_cgroup(wb);
++ 		__entry->frn_bdi_id	= frn_bdi_id;
++ 		__entry->frn_memcg_id	= frn_memcg_id;
++ 	),
++ 
++ 	TP_printk("bdi %s: cgroup_ino=%lu frn_bdi_id=%u frn_memcg_id=%u",
++ 		__entry->name,
++ 		__entry->cgroup_ino,
++ 		__entry->frn_bdi_id,
++ 		__entry->frn_memcg_id
++ 	)
++ );
++ #endif
++ 
+++>>>>>>> 67c0496e87d1 (kernfs: convert kernfs_node->id from union kernfs_node_id to u64)
+  DECLARE_EVENT_CLASS(writeback_write_inode_template,
+  
+  	TP_PROTO(struct inode *inode, struct writeback_control *wbc),
+diff --cc kernel/trace/blktrace.c
+index c53b2838dac9,a986d2e74ca2..000000000000
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@@ -798,18 -750,15 +797,17 @@@ void blk_trace_shutdown(struct request_
+  }
+  
+  #ifdef CONFIG_BLK_CGROUP
+- static union kernfs_node_id *
+- blk_trace_bio_get_cgid(struct request_queue *q, struct bio *bio)
++ static u64 blk_trace_bio_get_cgid(struct request_queue *q, struct bio *bio)
+  {
+ -	struct blk_trace *bt = q->blk_trace;
+ +	struct blk_trace *bt;
+  
+ +	/* We don't use the 'bt' value here except as an optimization... */
+ +	bt = rcu_dereference_protected(q->blk_trace, 1);
+  	if (!bt || !(blk_tracer_flags.val & TRACE_BLK_OPT_CGROUP))
+- 		return NULL;
++ 		return 0;
+  
+  	if (!bio->bi_blkg)
+- 		return NULL;
++ 		return 0;
+  	return cgroup_get_kernfs_id(bio_blkcg(bio)->css.cgroup);
+  }
+  #else
+@@@ -846,17 -794,12 +843,16 @@@ blk_trace_request_get_cgid(struct reque
+   *
+   **/
+  static void blk_add_trace_rq(struct request *rq, int error,
+- 			     unsigned int nr_bytes, u32 what,
+- 			     union kernfs_node_id *cgid)
++ 			     unsigned int nr_bytes, u32 what, u64 cgid)
+  {
+ -	struct blk_trace *bt = rq->q->blk_trace;
+ +	struct blk_trace *bt;
+  
+ -	if (likely(!bt))
+ +	rcu_read_lock();
+ +	bt = rcu_dereference(rq->q->blk_trace);
+ +	if (likely(!bt)) {
+ +		rcu_read_unlock();
+  		return;
+ +	}
+  
+  	if (blk_rq_is_passthrough(rq))
+  		what |= BLK_TC_ACT(BLK_TC_PC);
+@@@ -982,8 -909,7 +978,12 @@@ static void blk_add_trace_getrq(void *i
+  
+  		if (bt)
+  			__blk_add_trace(bt, 0, 0, rw, 0, BLK_TA_GETRQ, 0, 0,
+++<<<<<<< HEAD
+ +					NULL, NULL);
+ +		rcu_read_unlock();
+++=======
++ 					NULL, 0);
+++>>>>>>> 67c0496e87d1 (kernfs: convert kernfs_node->id from union kernfs_node_id to u64)
+  	}
+  }
+  
+@@@ -995,27 -921,20 +995,35 @@@ static void blk_add_trace_sleeprq(void 
+  	if (bio)
+  		blk_add_trace_bio(q, bio, BLK_TA_SLEEPRQ, 0);
+  	else {
+ -		struct blk_trace *bt = q->blk_trace;
+ +		struct blk_trace *bt;
+  
+ +		rcu_read_lock();
+ +		bt = rcu_dereference(q->blk_trace);
+  		if (bt)
+  			__blk_add_trace(bt, 0, 0, rw, 0, BLK_TA_SLEEPRQ,
+++<<<<<<< HEAD
+ +					0, 0, NULL, NULL);
+ +		rcu_read_unlock();
+++=======
++ 					0, 0, NULL, 0);
+++>>>>>>> 67c0496e87d1 (kernfs: convert kernfs_node->id from union kernfs_node_id to u64)
+  	}
+  }
+  
+  static void blk_add_trace_plug(void *ignore, struct request_queue *q)
+  {
+ -	struct blk_trace *bt = q->blk_trace;
+ +	struct blk_trace *bt;
+ +
+ +	rcu_read_lock();
+ +	bt = rcu_dereference(q->blk_trace);
+  
+  	if (bt)
+++<<<<<<< HEAD
+ +		__blk_add_trace(bt, 0, 0, 0, 0, BLK_TA_PLUG, 0, 0, NULL, NULL);
+ +	rcu_read_unlock();
+++=======
++ 		__blk_add_trace(bt, 0, 0, 0, 0, BLK_TA_PLUG, 0, 0, NULL, 0);
+++>>>>>>> 67c0496e87d1 (kernfs: convert kernfs_node->id from union kernfs_node_id to u64)
+  }
+  
+  static void blk_add_trace_unplug(void *ignore, struct request_queue *q,
+@@@ -1034,9 -951,8 +1042,9 @@@
+  		else
+  			what = BLK_TA_UNPLUG_TIMER;
+  
+- 		__blk_add_trace(bt, 0, 0, 0, 0, what, 0, sizeof(rpdu), &rpdu, NULL);
++ 		__blk_add_trace(bt, 0, 0, 0, 0, what, 0, sizeof(rpdu), &rpdu, 0);
+  	}
+ +	rcu_read_unlock();
+  }
+  
+  static void blk_add_trace_split(void *ignore,
+diff --git a/fs/kernfs/dir.c b/fs/kernfs/dir.c
+index 238fc3d98198..3bbefca7face 100644
+--- a/fs/kernfs/dir.c
++++ b/fs/kernfs/dir.c
+@@ -535,7 +535,7 @@ void kernfs_put(struct kernfs_node *kn)
+ 	}
+ 	kfree(kn->iattr);
+ 	spin_lock(&kernfs_idr_lock);
+-	idr_remove(&root->ino_idr, kn->id.ino);
++	idr_remove(&root->ino_idr, kernfs_ino(kn));
+ 	spin_unlock(&kernfs_idr_lock);
+ 	kmem_cache_free(kernfs_node_cache, kn);
+ 
+@@ -643,8 +643,8 @@ static struct kernfs_node *__kernfs_new_node(struct kernfs_root *root,
+ 	idr_preload_end();
+ 	if (ret < 0)
+ 		goto err_out2;
+-	kn->id.ino = ret;
+-	kn->id.generation = gen;
++
++	kn->id = (u64)gen << 32 | ret;
+ 
+ 	/*
+ 	 * set ino first. This barrier is paired with atomic_inc_not_zero in
+@@ -680,7 +680,7 @@ static struct kernfs_node *__kernfs_new_node(struct kernfs_root *root,
+ 	return kn;
+ 
+  err_out3:
+-	idr_remove(&root->ino_idr, kn->id.ino);
++	idr_remove(&root->ino_idr, kernfs_ino(kn));
+  err_out2:
+ 	kmem_cache_free(kernfs_node_cache, kn);
+  err_out1:
+@@ -1678,7 +1678,7 @@ static int kernfs_fop_readdir(struct file *file, struct dir_context *ctx)
+ 		const char *name = pos->name;
+ 		unsigned int type = dt_type(pos);
+ 		int len = strlen(name);
+-		ino_t ino = pos->id.ino;
++		ino_t ino = kernfs_ino(pos);
+ 
+ 		ctx->pos = pos->hash;
+ 		file->private_data = pos;
+diff --git a/fs/kernfs/file.c b/fs/kernfs/file.c
+index 5a5c2eb884f0..b76750a5c69a 100644
+--- a/fs/kernfs/file.c
++++ b/fs/kernfs/file.c
+@@ -905,7 +905,7 @@ static void kernfs_notify_workfn(struct work_struct *work)
+ 		 * have the matching @file available.  Look up the inodes
+ 		 * and generate the events manually.
+ 		 */
+-		inode = ilookup(info->sb, kn->id.ino);
++		inode = ilookup(info->sb, kernfs_ino(kn));
+ 		if (!inode)
+ 			continue;
+ 
+@@ -914,7 +914,7 @@ static void kernfs_notify_workfn(struct work_struct *work)
+ 		if (parent) {
+ 			struct inode *p_inode;
+ 
+-			p_inode = ilookup(info->sb, parent->id.ino);
++			p_inode = ilookup(info->sb, kernfs_ino(parent));
+ 			if (p_inode) {
+ 				fsnotify(p_inode, FS_MODIFY | FS_EVENT_ON_CHILD,
+ 					 inode, FSNOTIFY_EVENT_INODE, &name, 0);
+diff --git a/fs/kernfs/inode.c b/fs/kernfs/inode.c
+index fba5d7a5e97d..af5b293c0f57 100644
+--- a/fs/kernfs/inode.c
++++ b/fs/kernfs/inode.c
+@@ -202,7 +202,7 @@ static void kernfs_init_inode(struct kernfs_node *kn, struct inode *inode)
+ 	inode->i_private = kn;
+ 	inode->i_mapping->a_ops = &kernfs_aops;
+ 	inode->i_op = &kernfs_iops;
+-	inode->i_generation = kn->id.generation;
++	inode->i_generation = kernfs_gen(kn);
+ 
+ 	set_default_inode_attr(inode, kn->mode);
+ 	kernfs_refresh_inode(kn, inode);
+@@ -248,7 +248,7 @@ struct inode *kernfs_get_inode(struct super_block *sb, struct kernfs_node *kn)
+ {
+ 	struct inode *inode;
+ 
+-	inode = iget_locked(sb, kn->id.ino);
++	inode = iget_locked(sb, kernfs_ino(kn));
+ 	if (inode && (inode->i_state & I_NEW))
+ 		kernfs_init_inode(kn, inode);
+ 
+diff --git a/fs/kernfs/mount.c b/fs/kernfs/mount.c
+index 55db762d2e34..712a48323695 100644
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@ -69,15 +69,14 @@ const struct super_operations kernfs_sops = {
+  * Similar to kernfs_fh_get_inode, this one gets kernfs node from inode
+  * number and generation
+  */
+-struct kernfs_node *kernfs_get_node_by_id(struct kernfs_root *root,
+-	const union kernfs_node_id *id)
++struct kernfs_node *kernfs_get_node_by_id(struct kernfs_root *root, u64 id)
+ {
+ 	struct kernfs_node *kn;
+ 
+-	kn = kernfs_find_and_get_node_by_ino(root, id->ino);
++	kn = kernfs_find_and_get_node_by_ino(root, kernfs_id_ino(id));
+ 	if (!kn)
+ 		return NULL;
+-	if (kn->id.generation != id->generation) {
++	if (kernfs_gen(kn) != kernfs_id_gen(id)) {
+ 		kernfs_put(kn);
+ 		return NULL;
+ 	}
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 2664f061391e..45dabd0a1b63 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -611,7 +611,7 @@ static inline bool cgroup_is_populated(struct cgroup *cgrp)
+ /* returns ino associated with a cgroup */
+ static inline ino_t cgroup_ino(struct cgroup *cgrp)
+ {
+-	return cgrp->kn->id.ino;
++	return kernfs_ino(cgrp->kn);
+ }
+ 
+ /* cft/css accessors for cftype->write() operation */
+@@ -682,13 +682,12 @@ static inline void cgroup_kthread_ready(void)
+ 	current->no_cgroup_migration = 0;
+ }
+ 
+-static inline union kernfs_node_id *cgroup_get_kernfs_id(struct cgroup *cgrp)
++static inline u64 cgroup_get_kernfs_id(struct cgroup *cgrp)
+ {
+-	return &cgrp->kn->id;
++	return cgrp->kn->id;
+ }
+ 
+-void cgroup_path_from_kernfs_id(const union kernfs_node_id *id,
+-					char *buf, size_t buflen);
++void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen);
+ #else /* !CONFIG_CGROUPS */
+ 
+ struct cgroup_subsys_state;
+@@ -713,9 +712,9 @@ static inline int cgroup_init_early(void) { return 0; }
+ static inline int cgroup_init(void) { return 0; }
+ static inline void cgroup_init_kthreadd(void) {}
+ static inline void cgroup_kthread_ready(void) {}
+-static inline union kernfs_node_id *cgroup_get_kernfs_id(struct cgroup *cgrp)
++static inline union u64 cgroup_get_kernfs_id(struct cgroup *cgrp)
+ {
+-	return NULL;
++	return 0;
+ }
+ 
+ static inline struct cgroup *cgroup_parent(struct cgroup *cgrp)
+@@ -734,8 +733,8 @@ static inline bool task_under_cgroup_hierarchy(struct task_struct *task,
+ 	return true;
+ }
+ 
+-static inline void cgroup_path_from_kernfs_id(const union kernfs_node_id *id,
+-	char *buf, size_t buflen) {}
++static inline void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen)
++{}
+ #endif /* !CONFIG_CGROUPS */
+ 
+ #ifdef CONFIG_CGROUPS
+diff --git a/include/linux/kernfs.h b/include/linux/kernfs.h
+index 4e42898496aa..4d8d5a7c40bf 100644
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@ -105,21 +105,6 @@ struct kernfs_elem_attr {
+ 	struct kernfs_node	*notify_next;	/* for kernfs_notify() */
+ };
+ 
+-/* represent a kernfs node */
+-union kernfs_node_id {
+-	struct {
+-		/*
+-		 * blktrace will export this struct as a simplified 'struct
+-		 * fid' (which is a big data struction), so userspace can use
+-		 * it to find kernfs node. The layout must match the first two
+-		 * fields of 'struct fid' exactly.
+-		 */
+-		u32		ino;
+-		u32		generation;
+-	};
+-	u64			id;
+-};
+-
+ /*
+  * kernfs_node - the building block of kernfs hierarchy.  Each and every
+  * kernfs node is represented by single kernfs_node.  Most fields are
+@@ -156,7 +141,12 @@ struct kernfs_node {
+ 
+ 	void			*priv;
+ 
+-	union kernfs_node_id	id;
++	/*
++	 * 64bit unique ID.  Lower 32bits carry the inode number and lower
++	 * generation.
++	 */
++	u64			id;
++
+ 	unsigned short		flags;
+ 	umode_t			mode;
+ 	struct kernfs_iattrs	*iattr;
+@@ -285,6 +275,26 @@ static inline enum kernfs_node_type kernfs_type(struct kernfs_node *kn)
+ 	return kn->flags & KERNFS_TYPE_MASK;
+ }
+ 
++static inline ino_t kernfs_id_ino(u64 id)
++{
++	return (u32)id;
++}
++
++static inline u32 kernfs_id_gen(u64 id)
++{
++	return id >> 32;
++}
++
++static inline ino_t kernfs_ino(struct kernfs_node *kn)
++{
++	return kernfs_id_ino(kn->id);
++}
++
++static inline ino_t kernfs_gen(struct kernfs_node *kn)
++{
++	return kernfs_id_gen(kn->id);
++}
++
+ /**
+  * kernfs_enable_ns - enable namespace under a directory
+  * @kn: directory of interest, should be empty
+@@ -377,8 +387,7 @@ void kernfs_kill_sb(struct super_block *sb);
+ 
+ void kernfs_init(void);
+ 
+-struct kernfs_node *kernfs_get_node_by_id(struct kernfs_root *root,
+-	const union kernfs_node_id *id);
++struct kernfs_node *kernfs_get_node_by_id(struct kernfs_root *root, u64 id);
+ #else	/* CONFIG_KERNFS */
+ 
+ static inline enum kernfs_node_type kernfs_type(struct kernfs_node *kn)
+* Unmerged path include/trace/events/writeback.h
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 358df56a9561..27c84fd55d1b 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -351,7 +351,7 @@ BPF_CALL_0(bpf_get_current_cgroup_id)
+ {
+ 	struct cgroup *cgrp = task_dfl_cgroup(current);
+ 
+-	return cgrp->kn->id.id;
++	return cgrp->kn->id;
+ }
+ 
+ const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
+diff --git a/kernel/bpf/local_storage.c b/kernel/bpf/local_storage.c
+index 25fda792fa51..8157bddc2013 100644
+--- a/kernel/bpf/local_storage.c
++++ b/kernel/bpf/local_storage.c
+@@ -569,7 +569,7 @@ void bpf_cgroup_storage_link(struct bpf_cgroup_storage *storage,
+ 		return;
+ 
+ 	storage->key.attach_type = type;
+-	storage->key.cgroup_inode_id = cgroup->kn->id.id;
++	storage->key.cgroup_inode_id = cgroup->kn->id;
+ 
+ 	map = storage->map;
+ 
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 9e08519ae6db..d5c34dcd4f31 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -5693,8 +5693,7 @@ static int __init cgroup_wq_init(void)
+ }
+ core_initcall(cgroup_wq_init);
+ 
+-void cgroup_path_from_kernfs_id(const union kernfs_node_id *id,
+-					char *buf, size_t buflen)
++void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen)
+ {
+ 	struct kernfs_node *kn;
+ 
+* Unmerged path kernel/trace/blktrace.c
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 76aa4a2037db..e4f36d7c35ae 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -4041,7 +4041,7 @@ BPF_CALL_1(bpf_skb_cgroup_id, const struct sk_buff *, skb)
+ 		return 0;
+ 
+ 	cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
+-	return cgrp->kn->id.id;
++	return cgrp->kn->id;
+ }
+ 
+ static const struct bpf_func_proto bpf_skb_cgroup_id_proto = {
+@@ -4066,7 +4066,7 @@ BPF_CALL_2(bpf_skb_ancestor_cgroup_id, const struct sk_buff *, skb, int,
+ 	if (!ancestor)
+ 		return 0;
+ 
+-	return ancestor->kn->id.id;
++	return ancestor->kn->id;
+ }
+ 
+ static const struct bpf_func_proto bpf_skb_ancestor_cgroup_id_proto = {
