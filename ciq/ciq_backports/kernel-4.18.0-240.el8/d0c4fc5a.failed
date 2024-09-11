@@ -1,0 +1,329 @@
+drm/udl: Replace fbdev code with generic emulation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Zimmermann <tzimmermann@suse.de>
+commit d0c4fc5a4814e431c15272935c8dc973c18073aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d0c4fc5a.failed
+
+The udl driver can use the generic fbdev implementation. Convert it.
+
+v5:
+	* initialize console after registering device
+v4:
+	* hardcode console bpp to 16
+v3:
+	* remove module parameter fb_bpp in favor of fbdev's video
+	* call drm_fbdev_generic_setup() directly; remove udl_fbdev_init()
+	* use default for struct drm_mode_config_funcs.output_poll_changed
+	* use default for struct drm_driver.lastclose
+
+	Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+	Reviewed-by: Noralf Trønnes <noralf@tronnes.org>
+Link: https://patchwork.freedesktop.org/patch/msgid/20191114125106.28347-2-tzimmermann@suse.de
+(cherry picked from commit d0c4fc5a4814e431c15272935c8dc973c18073aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/udl/udl_drv.c
+#	drivers/gpu/drm/udl/udl_fb.c
+diff --cc drivers/gpu/drm/udl/udl_drv.c
+index 4a49facb608d,d5783fa32c5b..000000000000
+--- a/drivers/gpu/drm/udl/udl_drv.c
++++ b/drivers/gpu/drm/udl/udl_drv.c
+@@@ -4,9 -4,16 +4,17 @@@
+   */
+  
+  #include <linux/module.h>
+ -
+ +#include <drm/drmP.h>
+  #include <drm/drm_crtc_helper.h>
+++<<<<<<< HEAD
+++=======
++ #include <drm/drm_drv.h>
++ #include <drm/drm_fb_helper.h>
++ #include <drm/drm_file.h>
++ #include <drm/drm_gem_shmem_helper.h>
++ #include <drm/drm_ioctl.h>
+++>>>>>>> d0c4fc5a4814 (drm/udl: Replace fbdev code with generic emulation)
+  #include <drm/drm_probe_helper.h>
+ -#include <drm/drm_print.h>
+ -
+  #include "udl_drv.h"
+  
+  static int udl_usb_suspend(struct usb_interface *interface,
+diff --cc drivers/gpu/drm/udl/udl_fb.c
+index e1116bf7b9d7,8fe4d8cf3212..000000000000
+--- a/drivers/gpu/drm/udl/udl_fb.c
++++ b/drivers/gpu/drm/udl/udl_fb.c
+@@@ -7,33 -7,18 +7,43 @@@
+   * Copyright (C) 2009 Jaya Kumar <jayakumar.lkml@gmail.com>
+   * Copyright (C) 2009 Bernie Thompson <bernie@plugable.com>
+   */
+ -
+ -#include <linux/moduleparam.h>
+ +#include <linux/module.h>
+ +#include <linux/slab.h>
+ +#include <linux/fb.h>
+  #include <linux/dma-buf.h>
+ +#include <linux/mem_encrypt.h>
+  
+ +#include <drm/drmP.h>
+ +#include <drm/drm_crtc.h>
+  #include <drm/drm_crtc_helper.h>
+++<<<<<<< HEAD
+ +#include "udl_drv.h"
+ +
+ +#include <drm/drm_fb_helper.h>
+ +
+ +#define DL_DEFIO_WRITE_DELAY    (HZ/20) /* fb_deferred_io.delay in jiffies */
+ +
+ +static int fb_defio = 0;  /* Optionally enable experimental fb_defio mmap support */
+ +static int fb_bpp = 16;
+ +
+ +module_param(fb_bpp, int, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
+ +module_param(fb_defio, int, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
+ +
+ +struct udl_fbdev {
+ +	struct drm_fb_helper helper; /* must be first */
+ +	struct udl_framebuffer ufb;
+ +	int fb_count;
+ +};
+ +
+++=======
++ #include <drm/drm_drv.h>
++ #include <drm/drm_fourcc.h>
++ #include <drm/drm_gem_shmem_helper.h>
++ #include <drm/drm_modeset_helper.h>
++ 
++ #include "udl_drv.h"
++ 
+++>>>>>>> d0c4fc5a4814 (drm/udl: Replace fbdev code with generic emulation)
+  #define DL_ALIGN_UP(x, a) ALIGN(x, a)
+  #define DL_ALIGN_DOWN(x, a) ALIGN_DOWN(x, a)
+  
+@@@ -347,152 -215,6 +240,155 @@@ udl_framebuffer_init(struct drm_device 
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +static int udlfb_create(struct drm_fb_helper *helper,
+ +			struct drm_fb_helper_surface_size *sizes)
+ +{
+ +	struct udl_fbdev *ufbdev =
+ +		container_of(helper, struct udl_fbdev, helper);
+ +	struct drm_device *dev = ufbdev->helper.dev;
+ +	struct fb_info *info;
+ +	struct drm_framebuffer *fb;
+ +	struct drm_mode_fb_cmd2 mode_cmd;
+ +	struct udl_gem_object *obj;
+ +	uint32_t size;
+ +	int ret = 0;
+ +
+ +	if (sizes->surface_bpp == 24)
+ +		sizes->surface_bpp = 32;
+ +
+ +	mode_cmd.width = sizes->surface_width;
+ +	mode_cmd.height = sizes->surface_height;
+ +	mode_cmd.pitches[0] = mode_cmd.width * ((sizes->surface_bpp + 7) / 8);
+ +
+ +	mode_cmd.pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp,
+ +							  sizes->surface_depth);
+ +
+ +	size = mode_cmd.pitches[0] * mode_cmd.height;
+ +	size = ALIGN(size, PAGE_SIZE);
+ +
+ +	obj = udl_gem_alloc_object(dev, size);
+ +	if (!obj)
+ +		goto out;
+ +
+ +	ret = udl_gem_vmap(obj);
+ +	if (ret) {
+ +		DRM_ERROR("failed to vmap fb\n");
+ +		goto out_gfree;
+ +	}
+ +
+ +	info = drm_fb_helper_alloc_fbi(helper);
+ +	if (IS_ERR(info)) {
+ +		ret = PTR_ERR(info);
+ +		goto out_gfree;
+ +	}
+ +
+ +	ret = udl_framebuffer_init(dev, &ufbdev->ufb, &mode_cmd, obj);
+ +	if (ret)
+ +		goto out_gfree;
+ +
+ +	fb = &ufbdev->ufb.base;
+ +
+ +	ufbdev->helper.fb = fb;
+ +
+ +	info->screen_base = ufbdev->ufb.obj->vmapping;
+ +	info->fix.smem_len = size;
+ +	info->fix.smem_start = (unsigned long)ufbdev->ufb.obj->vmapping;
+ +
+ +	info->fbops = &udlfb_ops;
+ +	drm_fb_helper_fill_info(info, &ufbdev->helper, sizes);
+ +
+ +	DRM_DEBUG_KMS("allocated %dx%d vmal %p\n",
+ +		      fb->width, fb->height,
+ +		      ufbdev->ufb.obj->vmapping);
+ +
+ +	return ret;
+ +out_gfree:
+ +	drm_gem_object_put_unlocked(&ufbdev->ufb.obj->base);
+ +out:
+ +	return ret;
+ +}
+ +
+ +static const struct drm_fb_helper_funcs udl_fb_helper_funcs = {
+ +	.fb_probe = udlfb_create,
+ +};
+ +
+ +static void udl_fbdev_destroy(struct drm_device *dev,
+ +			      struct udl_fbdev *ufbdev)
+ +{
+ +	drm_fb_helper_unregister_fbi(&ufbdev->helper);
+ +	drm_fb_helper_fini(&ufbdev->helper);
+ +	if (ufbdev->ufb.obj) {
+ +		drm_framebuffer_unregister_private(&ufbdev->ufb.base);
+ +		drm_framebuffer_cleanup(&ufbdev->ufb.base);
+ +		drm_gem_object_put_unlocked(&ufbdev->ufb.obj->base);
+ +	}
+ +}
+ +
+ +int udl_fbdev_init(struct drm_device *dev)
+ +{
+ +	struct udl_device *udl = to_udl(dev);
+ +	int bpp_sel = fb_bpp;
+ +	struct udl_fbdev *ufbdev;
+ +	int ret;
+ +
+ +	ufbdev = kzalloc(sizeof(struct udl_fbdev), GFP_KERNEL);
+ +	if (!ufbdev)
+ +		return -ENOMEM;
+ +
+ +	udl->fbdev = ufbdev;
+ +
+ +	drm_fb_helper_prepare(dev, &ufbdev->helper, &udl_fb_helper_funcs);
+ +
+ +	ret = drm_fb_helper_init(dev, &ufbdev->helper, 1);
+ +	if (ret)
+ +		goto free;
+ +
+ +	ret = drm_fb_helper_single_add_all_connectors(&ufbdev->helper);
+ +	if (ret)
+ +		goto fini;
+ +
+ +	/* disable all the possible outputs/crtcs before entering KMS mode */
+ +	drm_helper_disable_unused_functions(dev);
+ +
+ +	ret = drm_fb_helper_initial_config(&ufbdev->helper, bpp_sel);
+ +	if (ret)
+ +		goto fini;
+ +
+ +	return 0;
+ +
+ +fini:
+ +	drm_fb_helper_fini(&ufbdev->helper);
+ +free:
+ +	kfree(ufbdev);
+ +	return ret;
+ +}
+ +
+ +void udl_fbdev_cleanup(struct drm_device *dev)
+ +{
+ +	struct udl_device *udl = to_udl(dev);
+ +	if (!udl->fbdev)
+ +		return;
+ +
+ +	udl_fbdev_destroy(dev, udl->fbdev);
+ +	kfree(udl->fbdev);
+ +	udl->fbdev = NULL;
+ +}
+ +
+ +void udl_fbdev_unplug(struct drm_device *dev)
+ +{
+ +	struct udl_device *udl = to_udl(dev);
+ +	struct udl_fbdev *ufbdev;
+ +	if (!udl->fbdev)
+ +		return;
+ +
+ +	ufbdev = udl->fbdev;
+ +	drm_fb_helper_unlink_fbi(&ufbdev->helper);
+ +}
+ +
+++=======
+++>>>>>>> d0c4fc5a4814 (drm/udl: Replace fbdev code with generic emulation)
+  struct drm_framebuffer *
+  udl_fb_user_fb_create(struct drm_device *dev,
+  		   struct drm_file *file,
+* Unmerged path drivers/gpu/drm/udl/udl_drv.c
+diff --git a/drivers/gpu/drm/udl/udl_drv.h b/drivers/gpu/drm/udl/udl_drv.h
+index 0fa4d8595d1a..77dbf604585c 100644
+--- a/drivers/gpu/drm/udl/udl_drv.h
++++ b/drivers/gpu/drm/udl/udl_drv.h
+@@ -41,8 +41,6 @@ struct urb_list {
+ 	size_t size;
+ };
+ 
+-struct udl_fbdev;
+-
+ struct udl_device {
+ 	struct drm_device drm;
+ 	struct device *dev;
+@@ -56,7 +54,6 @@ struct udl_device {
+ 	struct urb_list urbs;
+ 	atomic_t lost_pixels; /* 1 = a render op failed. Need screen refresh */
+ 
+-	struct udl_fbdev *fbdev;
+ 	char mode_buf[1024];
+ 	uint32_t mode_buf_len;
+ 	atomic_t bytes_rendered; /* raw pixel-bytes driver asked to render */
+@@ -100,9 +97,6 @@ void udl_urb_completion(struct urb *urb);
+ int udl_init(struct udl_device *udl);
+ void udl_fini(struct drm_device *dev);
+ 
+-int udl_fbdev_init(struct drm_device *dev);
+-void udl_fbdev_cleanup(struct drm_device *dev);
+-void udl_fbdev_unplug(struct drm_device *dev);
+ struct drm_framebuffer *
+ udl_fb_user_fb_create(struct drm_device *dev,
+ 		      struct drm_file *file,
+* Unmerged path drivers/gpu/drm/udl/udl_fb.c
+diff --git a/drivers/gpu/drm/udl/udl_main.c b/drivers/gpu/drm/udl/udl_main.c
+index 1a99c7647444..da7063cb4eb6 100644
+--- a/drivers/gpu/drm/udl/udl_main.c
++++ b/drivers/gpu/drm/udl/udl_main.c
+@@ -336,10 +336,6 @@ int udl_init(struct udl_device *udl)
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = udl_fbdev_init(dev);
+-	if (ret)
+-		goto err;
+-
+ 	drm_kms_helper_poll_init(dev);
+ 
+ 	return 0;
+@@ -365,6 +361,4 @@ void udl_fini(struct drm_device *dev)
+ 
+ 	if (udl->urbs.count)
+ 		udl_free_urb_list(dev);
+-
+-	udl_fbdev_cleanup(dev);
+ }
+diff --git a/drivers/gpu/drm/udl/udl_modeset.c b/drivers/gpu/drm/udl/udl_modeset.c
+index 793722d0c8cd..0042d0527e89 100644
+--- a/drivers/gpu/drm/udl/udl_modeset.c
++++ b/drivers/gpu/drm/udl/udl_modeset.c
+@@ -422,7 +422,6 @@ static int udl_crtc_init(struct drm_device *dev)
+ 
+ static const struct drm_mode_config_funcs udl_mode_funcs = {
+ 	.fb_create = udl_fb_user_fb_create,
+-	.output_poll_changed = NULL,
+ };
+ 
+ int udl_modeset_init(struct drm_device *dev)
