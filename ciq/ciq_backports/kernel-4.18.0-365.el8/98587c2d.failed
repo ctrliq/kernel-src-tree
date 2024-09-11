@@ -1,0 +1,191 @@
+s390: simplify disabled_wait
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 98587c2d894c34c9af5cd84ca169e1cd493aa692
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/98587c2d.failed
+
+The disabled_wait() function uses its argument as the PSW address when
+it stops the CPU with a wait PSW that is disabled for interrupts.
+The different callers sometimes use a specific number like 0xdeadbeef
+to indicate a specific failure, the early boot code uses 0 and some
+other calls sites use __builtin_return_address(0).
+
+At the time a dump is created the current PSW and the registers of a
+CPU are written to lowcore to make them avaiable to the dump analysis
+tool. For a CPU stopped with disabled_wait the PSW and the registers
+do not really make sense together, the PSW address does not point to
+the function the registers belong to.
+
+Simplify disabled_wait() by using _THIS_IP_ for the PSW address and
+drop the argument to the function.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 98587c2d894c34c9af5cd84ca169e1cd493aa692)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/boot/als.c
+diff --cc arch/s390/boot/als.c
+index 322e386bd9d0,ff6801d401c4..000000000000
+--- a/arch/s390/boot/als.c
++++ b/arch/s390/boot/als.c
+@@@ -98,7 -98,8 +98,12 @@@ static void facility_mismatch(void
+  	sclp_early_printk("The Linux kernel requires more recent processor hardware\n");
+  	print_machine_type();
+  	print_missing_facilities();
+++<<<<<<< HEAD
+ +	disabled_wait(0x8badcccc);
+++=======
++ 	sclp_early_printk("See Principles of Operations for facility bits\n");
++ 	disabled_wait();
+++>>>>>>> 98587c2d894c (s390: simplify disabled_wait)
+  }
+  
+  void verify_facilities(void)
+* Unmerged path arch/s390/boot/als.c
+diff --git a/arch/s390/boot/startup.c b/arch/s390/boot/startup.c
+index 9f7e7e2cac9e..6f5e5b4c649f 100644
+--- a/arch/s390/boot/startup.c
++++ b/arch/s390/boot/startup.c
+@@ -57,7 +57,7 @@ void error(char *x)
+ 	sclp_early_printk(x);
+ 	sclp_early_printk("\n\n -- System halted");
+ 
+-	disabled_wait(0xdeadbeef);
++	disabled_wait();
+ }
+ 
+ #ifdef CONFIG_KERNEL_UNCOMPRESSED
+diff --git a/arch/s390/include/asm/processor.h b/arch/s390/include/asm/processor.h
+index 344a2e86bbe1..900ff0d10726 100644
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -348,12 +348,12 @@ void enabled_wait(void);
+ /*
+  * Function to drop a processor into disabled wait state
+  */
+-static inline void __noreturn disabled_wait(unsigned long code)
++static inline void __noreturn disabled_wait(void)
+ {
+ 	psw_t psw;
+ 
+ 	psw.mask = PSW_MASK_BASE | PSW_MASK_WAIT | PSW_MASK_BA | PSW_MASK_EA;
+-	psw.addr = code;
++	psw.addr = _THIS_IP_;
+ 	__load_psw(psw);
+ 	while (1);
+ }
+diff --git a/arch/s390/kernel/early.c b/arch/s390/kernel/early.c
+index 0916e0e78677..6312fed48530 100644
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -140,7 +140,7 @@ static void early_pgm_check_handler(void)
+ 	addr = S390_lowcore.program_old_psw.addr;
+ 	fixup = s390_search_extables(addr);
+ 	if (!fixup)
+-		disabled_wait(0);
++		disabled_wait();
+ 	/* Disable low address protection before storing into lowcore. */
+ 	__ctl_store(cr0, 0, 0);
+ 	cr0_new = cr0 & ~(1UL << 28);
+@@ -296,7 +296,7 @@ static void __init check_image_bootable(void)
+ 	sclp_early_printk("Linux kernel boot failure: An attempt to boot a vmlinux ELF image failed.\n");
+ 	sclp_early_printk("This image does not contain all parts necessary for starting up. Use\n");
+ 	sclp_early_printk("bzImage or arch/s390/boot/compressed/vmlinux instead.\n");
+-	disabled_wait(0xbadb007);
++	disabled_wait();
+ }
+ 
+ void __init startup_init(void)
+diff --git a/arch/s390/kernel/early_nobss.c b/arch/s390/kernel/early_nobss.c
+index 8d73f7fae16e..52a3ef959341 100644
+--- a/arch/s390/kernel/early_nobss.c
++++ b/arch/s390/kernel/early_nobss.c
+@@ -25,7 +25,7 @@ static void __init reset_tod_clock(void)
+ 		return;
+ 	/* TOD clock not running. Set the clock to Unix Epoch. */
+ 	if (set_tod_clock(TOD_UNIX_EPOCH) != 0 || store_tod_clock(&time) != 0)
+-		disabled_wait(0);
++		disabled_wait();
+ 
+ 	memset(tod_clock_base, 0, 16);
+ 	*(__u64 *) &tod_clock_base[1] = TOD_UNIX_EPOCH;
+diff --git a/arch/s390/kernel/ipl.c b/arch/s390/kernel/ipl.c
+index 29f5bdcbea16..9f91e99af2f7 100644
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -1147,7 +1147,7 @@ static void __reipl_run(void *unused)
+ 	case IPL_TYPE_NVME_DUMP:
+ 		break;
+ 	}
+-	disabled_wait((unsigned long) __builtin_return_address(0));
++	disabled_wait();
+ }
+ 
+ static void reipl_run(struct shutdown_trigger *trigger)
+@@ -1729,7 +1729,7 @@ static void stop_run(struct shutdown_trigger *trigger)
+ {
+ 	if (strcmp(trigger->name, ON_PANIC_STR) == 0 ||
+ 	    strcmp(trigger->name, ON_RESTART_STR) == 0)
+-		disabled_wait((unsigned long) __builtin_return_address(0));
++		disabled_wait();
+ 	smp_stop_cpu();
+ }
+ 
+diff --git a/arch/s390/kernel/machine_kexec.c b/arch/s390/kernel/machine_kexec.c
+index 905df75e514a..428ca3671725 100644
+--- a/arch/s390/kernel/machine_kexec.c
++++ b/arch/s390/kernel/machine_kexec.c
+@@ -95,7 +95,7 @@ static void __do_machine_kdump(void *image)
+ 	start_kdump(1);
+ 
+ 	/* Die if start_kdump returns */
+-	disabled_wait((unsigned long) __builtin_return_address(0));
++	disabled_wait();
+ }
+ 
+ /*
+@@ -274,7 +274,7 @@ static void __do_machine_kexec(void *data)
+ 	(*data_mover)(&image->head, image->start);
+ 
+ 	/* Die if kexec returns */
+-	disabled_wait((unsigned long) __builtin_return_address(0));
++	disabled_wait();
+ }
+ 
+ /*
+diff --git a/arch/s390/kernel/nmi.c b/arch/s390/kernel/nmi.c
+index 8c867b43c8eb..0a487fae763e 100644
+--- a/arch/s390/kernel/nmi.c
++++ b/arch/s390/kernel/nmi.c
+@@ -125,7 +125,7 @@ void nmi_free_per_cpu(struct lowcore *lc)
+ static notrace void s390_handle_damage(void)
+ {
+ 	smp_emergency_stop();
+-	disabled_wait((unsigned long) __builtin_return_address(0));
++	disabled_wait();
+ 	while (1);
+ }
+ NOKPROBE_SYMBOL(s390_handle_damage);
+diff --git a/kernel/panic.c b/kernel/panic.c
+index c20038ae8a76..6e306a2427cc 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -321,12 +321,7 @@ void panic(const char *fmt, ...)
+ 	}
+ #endif
+ #if defined(CONFIG_S390)
+-	{
+-		unsigned long caller;
+-
+-		caller = (unsigned long)__builtin_return_address(0);
+-		disabled_wait(caller);
+-	}
++	disabled_wait();
+ #endif
+ 	pr_emerg("---[ end Kernel panic - not syncing: %s ]---\n", buf);
+ 
