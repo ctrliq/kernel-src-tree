@@ -1,0 +1,268 @@
+powerpc: Use mm_context vas_windows counter to issue CP_ABORT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Haren Myneni <haren@linux.ibm.com>
+commit c420644c0a8f8839ca7269acbb8a3fc7fe1ec97d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c420644c.failed
+
+set_thread_uses_vas() sets used_vas flag for a process that opened VAS
+window and issue CP_ABORT during context switch for only that process.
+In multi-thread application, windows can be shared. For example Thread
+A can open a window and Thread B can run COPY/PASTE instructions to
+send NX request which may cause corruption or snooping or a covert
+channel Also once this flag is set, continue to run CP_ABORT even the
+VAS window is closed.
+
+So define vas-windows counter in process mm_context, increment this
+counter for each window open and decrement it for window close. If
+vas-windows is set, issue CP_ABORT during context switch. It means
+clear the foreign real address mapping only if the process / thread
+uses COPY/PASTE. Then disable it for that process if windows are not
+open.
+
+Moved set_thread_uses_vas() code to vas_tx_win_open() as this
+functionality is needed only for userspace open windows. We are adding
+VAS userspace support along with this fix. So no need to include this
+fix in stable releases.
+
+Fixes: 9d2a4d71332c ("powerpc: Define set_thread_uses_vas()")
+	Signed-off-by: Haren Myneni <haren@linux.ibm.com>
+	Reported-by: Nicholas Piggin <npiggin@gmail.com>
+	Suggested-by: Milton Miller <miltonm@us.ibm.com>
+	Suggested-by: Nicholas Piggin <npiggin@gmail.com>
+	Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/1587017291.2275.1077.camel@hbabu-laptop
+(cherry picked from commit c420644c0a8f8839ca7269acbb8a3fc7fe1ec97d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/book3s/64/mmu.h
+#	arch/powerpc/kernel/process.c
+diff --cc arch/powerpc/include/asm/book3s/64/mmu.h
+index 9c8c669a6b6a,f0a9ff690881..000000000000
+--- a/arch/powerpc/include/asm/book3s/64/mmu.h
++++ b/arch/powerpc/include/asm/book3s/64/mmu.h
+@@@ -111,29 -116,12 +111,36 @@@ typedef struct 
+  	/* Number of users of the external (Nest) MMU */
+  	atomic_t copros;
+  
+++<<<<<<< HEAD
+ +	/* NPU NMMU context */
+ +	struct npu_context *npu_context;
+++=======
++ 	/* Number of user space windows opened in process mm_context */
++ 	atomic_t vas_windows;
++ 
++ 	struct hash_mm_context *hash_context;
+ -
+++>>>>>>> c420644c0a8f (powerpc: Use mm_context vas_windows counter to issue CP_ABORT)
+ +
+ +#ifdef CONFIG_PPC_MM_SLICES
+ +	 /* SLB page size encodings*/
+ +	unsigned char low_slices_psize[BITS_PER_LONG / BITS_PER_BYTE];
+ +	unsigned char high_slices_psize[SLICE_ARRAY_SIZE];
+ +	unsigned long slb_addr_limit;
+ +# ifdef CONFIG_PPC_64K_PAGES
+ +	struct slice_mask mask_64k;
+ +# endif
+ +	struct slice_mask mask_4k;
+ +# ifdef CONFIG_HUGETLB_PAGE
+ +	struct slice_mask mask_16m;
+ +	struct slice_mask mask_16g;
+ +# endif
+ +#else
+ +	u16 sllp;		/* SLB page size encoding */
+ +#endif
+  	unsigned long vdso_base;
+ +#ifdef CONFIG_PPC_SUBPAGE_PROT
+ +	struct subpage_prot_table spt;
+ +#endif /* CONFIG_PPC_SUBPAGE_PROT */
+  	/*
+  	 * pagetable fragment support
+  	 */
+diff --cc arch/powerpc/kernel/process.c
+index 5521e4136f28,8479c762aef2..000000000000
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@@ -1232,7 -1228,8 +1232,12 @@@ struct task_struct *__switch_to(struct 
+  		 * mappings, we must issue a cp_abort to clear any state and
+  		 * prevent snooping, corruption or a covert channel.
+  		 */
+++<<<<<<< HEAD
+ +		if (current_thread_info()->task->thread.used_vas)
+++=======
++ 		if (current->mm &&
++ 			atomic_read(&current->mm->context.vas_windows))
+++>>>>>>> c420644c0a8f (powerpc: Use mm_context vas_windows counter to issue CP_ABORT)
+  			asm volatile(PPC_CP_ABORT);
+  	}
+  #endif /* CONFIG_PPC_BOOK3S_64 */
+@@@ -1431,26 -1459,14 +1436,37 @@@ void flush_thread(void
+  #endif /* CONFIG_HAVE_HW_BREAKPOINT */
+  }
+  
+++<<<<<<< HEAD
+ +int set_thread_uses_vas(void)
+ +{
+ +#ifdef CONFIG_PPC_BOOK3S_64
+ +	if (!cpu_has_feature(CPU_FTR_ARCH_300))
+ +		return -EINVAL;
+ +
+ +	current->thread.used_vas = 1;
+ +
+ +	/*
+ +	 * Even a process that has no foreign real address mapping can use
+ +	 * an unpaired COPY instruction (to no real effect). Issue CP_ABORT
+ +	 * to clear any pending COPY and prevent a covert channel.
+ +	 *
+ +	 * __switch_to() will issue CP_ABORT on future context switches.
+ +	 */
+ +	asm volatile(PPC_CP_ABORT);
+ +
+ +#endif /* CONFIG_PPC_BOOK3S_64 */
+ +	return 0;
+ +}
+++=======
++ #ifdef CONFIG_PPC_BOOK3S_64
++ void arch_setup_new_exec(void)
++ {
++ 	if (radix_enabled())
++ 		return;
++ 	hash__setup_new_exec();
++ }
++ #endif
+++>>>>>>> c420644c0a8f (powerpc: Use mm_context vas_windows counter to issue CP_ABORT)
+  
+  #ifdef CONFIG_PPC64
+  /**
+* Unmerged path arch/powerpc/include/asm/book3s/64/mmu.h
+diff --git a/arch/powerpc/include/asm/mmu_context.h b/arch/powerpc/include/asm/mmu_context.h
+index f5585d947f20..6095f2798953 100644
+--- a/arch/powerpc/include/asm/mmu_context.h
++++ b/arch/powerpc/include/asm/mmu_context.h
+@@ -184,11 +184,41 @@ static inline void mm_context_remove_copro(struct mm_struct *mm)
+ 			dec_mm_active_cpus(mm);
+ 	}
+ }
++
++/*
++ * vas_windows counter shows number of open windows in the mm
++ * context. During context switch, use this counter to clear the
++ * foreign real address mapping (CP_ABORT) for the thread / process
++ * that intend to use COPY/PASTE. When a process closes all windows,
++ * disable CP_ABORT which is expensive to run.
++ *
++ * For user context, register a copro so that TLBIs are seen by the
++ * nest MMU. mm_context_add/remove_vas_window() are used only for user
++ * space windows.
++ */
++static inline void mm_context_add_vas_window(struct mm_struct *mm)
++{
++	atomic_inc(&mm->context.vas_windows);
++	mm_context_add_copro(mm);
++}
++
++static inline void mm_context_remove_vas_window(struct mm_struct *mm)
++{
++	int v;
++
++	mm_context_remove_copro(mm);
++	v = atomic_dec_if_positive(&mm->context.vas_windows);
++
++	/* Detect imbalance between add and remove */
++	WARN_ON(v < 0);
++}
+ #else
+ static inline void inc_mm_active_cpus(struct mm_struct *mm) { }
+ static inline void dec_mm_active_cpus(struct mm_struct *mm) { }
+ static inline void mm_context_add_copro(struct mm_struct *mm) { }
+ static inline void mm_context_remove_copro(struct mm_struct *mm) { }
++static inline void mm_context_add_vas_windows(struct mm_struct *mm) { }
++static inline void mm_context_remove_vas_windows(struct mm_struct *mm) { }
+ #endif
+ 
+ 
+diff --git a/arch/powerpc/include/asm/processor.h b/arch/powerpc/include/asm/processor.h
+index 3c59b9df5234..e78bbc247089 100644
+--- a/arch/powerpc/include/asm/processor.h
++++ b/arch/powerpc/include/asm/processor.h
+@@ -267,7 +267,6 @@ struct thread_struct {
+ 	unsigned 	mmcr0;
+ 
+ 	unsigned 	used_ebb;
+-	unsigned int	used_vas;
+ #endif
+ };
+ 
+diff --git a/arch/powerpc/include/asm/switch_to.h b/arch/powerpc/include/asm/switch_to.h
+index 5b03d8a82409..012db9aa198a 100644
+--- a/arch/powerpc/include/asm/switch_to.h
++++ b/arch/powerpc/include/asm/switch_to.h
+@@ -91,8 +91,6 @@ static inline void clear_task_ebb(struct task_struct *t)
+ #endif
+ }
+ 
+-extern int set_thread_uses_vas(void);
+-
+ extern int set_thread_tidr(struct task_struct *t);
+ 
+ #endif /* _ASM_POWERPC_SWITCH_TO_H */
+* Unmerged path arch/powerpc/kernel/process.c
+diff --git a/arch/powerpc/platforms/powernv/vas-window.c b/arch/powerpc/platforms/powernv/vas-window.c
+index 0bb867d7cc8a..3d7295d9c351 100644
+--- a/arch/powerpc/platforms/powernv/vas-window.c
++++ b/arch/powerpc/platforms/powernv/vas-window.c
+@@ -1062,13 +1062,6 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
+ 			rc = -ENODEV;
+ 			goto free_window;
+ 		}
+-		/*
+-		 * A user mapping must ensure that context switch issues
+-		 * CP_ABORT for this thread.
+-		 */
+-		rc = set_thread_uses_vas();
+-		if (rc)
+-			goto free_window;
+ 
+ 		/*
+ 		 * Window opened by a child thread may not be closed when
+@@ -1094,7 +1087,7 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
+ 
+ 		mmgrab(txwin->mm);
+ 		mmput(txwin->mm);
+-		mm_context_add_copro(txwin->mm);
++		mm_context_add_vas_window(txwin->mm);
+ 		/*
+ 		 * Process closes window during exit. In the case of
+ 		 * multithread application, the child thread can open
+@@ -1103,6 +1096,17 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
+ 		 * to take pid reference for parent thread.
+ 		 */
+ 		txwin->tgid = find_get_pid(task_tgid_vnr(current));
++		/*
++		 * Even a process that has no foreign real address mapping can
++		 * use an unpaired COPY instruction (to no real effect). Issue
++		 * CP_ABORT to clear any pending COPY and prevent a covert
++		 * channel.
++		 *
++		 * __switch_to() will issue CP_ABORT on future context switches
++		 * if process / thread has any open VAS window (Use
++		 * current->mm->context.vas_windows).
++		 */
++		asm volatile(PPC_CP_ABORT);
+ 	}
+ 
+ 	set_vinst_win(vinst, txwin);
+@@ -1336,7 +1340,7 @@ int vas_win_close(struct vas_window *window)
+ 			/* Drop references to pid and mm */
+ 			put_pid(window->pid);
+ 			if (window->mm) {
+-				mm_context_remove_copro(window->mm);
++				mm_context_remove_vas_window(window->mm);
+ 				mmdrop(window->mm);
+ 			}
+ 		}
