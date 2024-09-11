@@ -25,7 +25,7 @@
  */
 static inline bool sbitmap_deferred_clear(struct sbitmap_word *map)
 {
-	unsigned long mask, val;
+	unsigned long mask;
 
 	if (!READ_ONCE(map->cleared))
 		return false;
@@ -38,10 +38,8 @@ static inline bool sbitmap_deferred_clear(struct sbitmap_word *map)
 	/*
 	 * Now clear the masked bits in our free word
 	 */
-	do {
-		val = map->word;
-	} while (cmpxchg(&map->word, val, val & ~mask) != val);
-
+	atomic_long_andnot(mask, (atomic_long_t *)&map->word);
+	BUILD_BUG_ON(sizeof(atomic_long_t) != sizeof(map->word));
 	return true;
 }
 
