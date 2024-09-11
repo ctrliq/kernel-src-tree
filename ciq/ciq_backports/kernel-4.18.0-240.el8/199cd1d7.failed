@@ -1,0 +1,344 @@
+KVM: SVM: Split svm_vcpu_run inline assembly to separate file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Uros Bizjak <ubizjak@gmail.com>
+commit 199cd1d7b5348de4b58208420687676c658efed3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/199cd1d7.failed
+
+The compiler (GCC) does not like the situation, where there is inline
+assembly block that clobbers all available machine registers in the
+middle of the function. This situation can be found in function
+svm_vcpu_run in file kvm/svm.c and results in many register spills and
+fills to/from stack frame.
+
+This patch fixes the issue with the same approach as was done for
+VMX some time ago. The big inline assembly is moved to a separate
+assembly .S file, taking into account all ABI requirements.
+
+There are two main benefits of the above approach:
+
+* elimination of several register spills and fills to/from stack
+frame, and consequently smaller function .text size. The binary size
+of svm_vcpu_run is lowered from 2019 to 1626 bytes.
+
+* more efficient access to a register save array. Currently, register
+save array is accessed as:
+
+    7b00:    48 8b 98 28 02 00 00     mov    0x228(%rax),%rbx
+    7b07:    48 8b 88 18 02 00 00     mov    0x218(%rax),%rcx
+    7b0e:    48 8b 90 20 02 00 00     mov    0x220(%rax),%rdx
+
+and passing ia pointer to a register array as an argument to a function one gets:
+
+  12:    48 8b 48 08              mov    0x8(%rax),%rcx
+  16:    48 8b 50 10              mov    0x10(%rax),%rdx
+  1a:    48 8b 58 18              mov    0x18(%rax),%rbx
+
+As a result, the total size, considering that the new function size is 229
+bytes, gets lowered by 164 bytes.
+
+	Signed-off-by: Uros Bizjak <ubizjak@gmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 199cd1d7b5348de4b58208420687676c658efed3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/Makefile
+diff --cc arch/x86/kvm/Makefile
+index 0ef050982c37,a789759b7261..000000000000
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@@ -14,7 -14,7 +14,11 @@@ kvm-y			+= x86.o emulate.o i8259.o irq.
+  			   hyperv.o debugfs.o mmu/mmu.o mmu/page_track.o
+  
+  kvm-intel-y		+= vmx/vmx.o vmx/vmenter.o vmx/pmu_intel.o vmx/vmcs12.o vmx/evmcs.o vmx/nested.o
+++<<<<<<< HEAD
+ +kvm-amd-y		+= svm/svm.o svm/pmu.o
+++=======
++ kvm-amd-y		+= svm/svm.o svm/vmenter.o svm/pmu.o svm/nested.o svm/avic.o svm/sev.o
+++>>>>>>> 199cd1d7b534 (KVM: SVM: Split svm_vcpu_run inline assembly to separate file)
+  
+  obj-$(CONFIG_KVM)	+= kvm.o
+  obj-$(CONFIG_KVM_INTEL)	+= kvm-intel.o
+* Unmerged path arch/x86/kvm/Makefile
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index dd22d2cd361d..9dca91b556d2 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -5770,6 +5770,8 @@ static void svm_cancel_injection(struct kvm_vcpu *vcpu)
+ 	svm_complete_interrupts(svm);
+ }
+ 
++bool __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
++
+ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -5824,95 +5826,7 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	local_irq_enable();
+ 
+-	asm volatile (
+-		"push %%" _ASM_BP "; \n\t"
+-		"mov %c[rbx](%[svm]), %%" _ASM_BX " \n\t"
+-		"mov %c[rcx](%[svm]), %%" _ASM_CX " \n\t"
+-		"mov %c[rdx](%[svm]), %%" _ASM_DX " \n\t"
+-		"mov %c[rsi](%[svm]), %%" _ASM_SI " \n\t"
+-		"mov %c[rdi](%[svm]), %%" _ASM_DI " \n\t"
+-		"mov %c[rbp](%[svm]), %%" _ASM_BP " \n\t"
+-#ifdef CONFIG_X86_64
+-		"mov %c[r8](%[svm]),  %%r8  \n\t"
+-		"mov %c[r9](%[svm]),  %%r9  \n\t"
+-		"mov %c[r10](%[svm]), %%r10 \n\t"
+-		"mov %c[r11](%[svm]), %%r11 \n\t"
+-		"mov %c[r12](%[svm]), %%r12 \n\t"
+-		"mov %c[r13](%[svm]), %%r13 \n\t"
+-		"mov %c[r14](%[svm]), %%r14 \n\t"
+-		"mov %c[r15](%[svm]), %%r15 \n\t"
+-#endif
+-
+-		/* Enter guest mode */
+-		"push %%" _ASM_AX " \n\t"
+-		"mov %c[vmcb](%[svm]), %%" _ASM_AX " \n\t"
+-		__ex("vmload %%" _ASM_AX) "\n\t"
+-		__ex("vmrun %%" _ASM_AX) "\n\t"
+-		__ex("vmsave %%" _ASM_AX) "\n\t"
+-		"pop %%" _ASM_AX " \n\t"
+-
+-		/* Save guest registers, load host registers */
+-		"mov %%" _ASM_BX ", %c[rbx](%[svm]) \n\t"
+-		"mov %%" _ASM_CX ", %c[rcx](%[svm]) \n\t"
+-		"mov %%" _ASM_DX ", %c[rdx](%[svm]) \n\t"
+-		"mov %%" _ASM_SI ", %c[rsi](%[svm]) \n\t"
+-		"mov %%" _ASM_DI ", %c[rdi](%[svm]) \n\t"
+-		"mov %%" _ASM_BP ", %c[rbp](%[svm]) \n\t"
+-#ifdef CONFIG_X86_64
+-		"mov %%r8,  %c[r8](%[svm]) \n\t"
+-		"mov %%r9,  %c[r9](%[svm]) \n\t"
+-		"mov %%r10, %c[r10](%[svm]) \n\t"
+-		"mov %%r11, %c[r11](%[svm]) \n\t"
+-		"mov %%r12, %c[r12](%[svm]) \n\t"
+-		"mov %%r13, %c[r13](%[svm]) \n\t"
+-		"mov %%r14, %c[r14](%[svm]) \n\t"
+-		"mov %%r15, %c[r15](%[svm]) \n\t"
+-		/*
+-		* Clear host registers marked as clobbered to prevent
+-		* speculative use.
+-		*/
+-		"xor %%r8d, %%r8d \n\t"
+-		"xor %%r9d, %%r9d \n\t"
+-		"xor %%r10d, %%r10d \n\t"
+-		"xor %%r11d, %%r11d \n\t"
+-		"xor %%r12d, %%r12d \n\t"
+-		"xor %%r13d, %%r13d \n\t"
+-		"xor %%r14d, %%r14d \n\t"
+-		"xor %%r15d, %%r15d \n\t"
+-#endif
+-		"xor %%ebx, %%ebx \n\t"
+-		"xor %%ecx, %%ecx \n\t"
+-		"xor %%edx, %%edx \n\t"
+-		"xor %%esi, %%esi \n\t"
+-		"xor %%edi, %%edi \n\t"
+-		"pop %%" _ASM_BP
+-		:
+-		: [svm]"a"(svm),
+-		  [vmcb]"i"(offsetof(struct vcpu_svm, vmcb_pa)),
+-		  [rbx]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RBX])),
+-		  [rcx]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RCX])),
+-		  [rdx]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RDX])),
+-		  [rsi]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RSI])),
+-		  [rdi]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RDI])),
+-		  [rbp]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_RBP]))
+-#ifdef CONFIG_X86_64
+-		  , [r8]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R8])),
+-		  [r9]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R9])),
+-		  [r10]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R10])),
+-		  [r11]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R11])),
+-		  [r12]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R12])),
+-		  [r13]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R13])),
+-		  [r14]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R14])),
+-		  [r15]"i"(offsetof(struct vcpu_svm, vcpu.arch.regs[VCPU_REGS_R15]))
+-#endif
+-		: "cc", "memory"
+-#ifdef CONFIG_X86_64
+-		, "rbx", "rcx", "rdx", "rsi", "rdi"
+-		, "r8", "r9", "r10", "r11" , "r12", "r13", "r14", "r15"
+-#else
+-		, "ebx", "ecx", "edx", "esi", "edi"
+-#endif
+-		);
++	__svm_vcpu_run(svm->vmcb_pa, (unsigned long *)&svm->vcpu.arch.regs);
+ 
+ 	/* Eliminate branch target predictions from guest mode */
+ 	vmexit_fill_RSB();
+diff --git a/arch/x86/kvm/svm/vmenter.S b/arch/x86/kvm/svm/vmenter.S
+new file mode 100644
+index 000000000000..fa1af90067e9
+--- /dev/null
++++ b/arch/x86/kvm/svm/vmenter.S
+@@ -0,0 +1,162 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <linux/linkage.h>
++#include <asm/asm.h>
++#include <asm/bitsperlong.h>
++#include <asm/kvm_vcpu_regs.h>
++
++#define WORD_SIZE (BITS_PER_LONG / 8)
++
++/* Intentionally omit RAX as it's context switched by hardware */
++#define VCPU_RCX	__VCPU_REGS_RCX * WORD_SIZE
++#define VCPU_RDX	__VCPU_REGS_RDX * WORD_SIZE
++#define VCPU_RBX	__VCPU_REGS_RBX * WORD_SIZE
++/* Intentionally omit RSP as it's context switched by hardware */
++#define VCPU_RBP	__VCPU_REGS_RBP * WORD_SIZE
++#define VCPU_RSI	__VCPU_REGS_RSI * WORD_SIZE
++#define VCPU_RDI	__VCPU_REGS_RDI * WORD_SIZE
++
++#ifdef CONFIG_X86_64
++#define VCPU_R8		__VCPU_REGS_R8  * WORD_SIZE
++#define VCPU_R9		__VCPU_REGS_R9  * WORD_SIZE
++#define VCPU_R10	__VCPU_REGS_R10 * WORD_SIZE
++#define VCPU_R11	__VCPU_REGS_R11 * WORD_SIZE
++#define VCPU_R12	__VCPU_REGS_R12 * WORD_SIZE
++#define VCPU_R13	__VCPU_REGS_R13 * WORD_SIZE
++#define VCPU_R14	__VCPU_REGS_R14 * WORD_SIZE
++#define VCPU_R15	__VCPU_REGS_R15 * WORD_SIZE
++#endif
++
++	.text
++
++/**
++ * __svm_vcpu_run - Run a vCPU via a transition to SVM guest mode
++ * @vmcb_pa:	unsigned long
++ * @regs:	unsigned long * (to guest registers)
++ */
++SYM_FUNC_START(__svm_vcpu_run)
++	push %_ASM_BP
++	mov  %_ASM_SP, %_ASM_BP
++#ifdef CONFIG_X86_64
++	push %r15
++	push %r14
++	push %r13
++	push %r12
++#else
++	push %edi
++	push %esi
++#endif
++	push %_ASM_BX
++
++	/* Save @regs. */
++	push %_ASM_ARG2
++
++	/* Save @vmcb. */
++	push %_ASM_ARG1
++
++	/* Move @regs to RAX. */
++	mov %_ASM_ARG2, %_ASM_AX
++
++	/* Load guest registers. */
++	mov VCPU_RCX(%_ASM_AX), %_ASM_CX
++	mov VCPU_RDX(%_ASM_AX), %_ASM_DX
++	mov VCPU_RBX(%_ASM_AX), %_ASM_BX
++	mov VCPU_RBP(%_ASM_AX), %_ASM_BP
++	mov VCPU_RSI(%_ASM_AX), %_ASM_SI
++	mov VCPU_RDI(%_ASM_AX), %_ASM_DI
++#ifdef CONFIG_X86_64
++	mov VCPU_R8 (%_ASM_AX),  %r8
++	mov VCPU_R9 (%_ASM_AX),  %r9
++	mov VCPU_R10(%_ASM_AX), %r10
++	mov VCPU_R11(%_ASM_AX), %r11
++	mov VCPU_R12(%_ASM_AX), %r12
++	mov VCPU_R13(%_ASM_AX), %r13
++	mov VCPU_R14(%_ASM_AX), %r14
++	mov VCPU_R15(%_ASM_AX), %r15
++#endif
++
++	/* "POP" @vmcb to RAX. */
++	pop %_ASM_AX
++
++	/* Enter guest mode */
++1:	vmload %_ASM_AX
++	jmp 3f
++2:	cmpb $0, kvm_rebooting
++	jne 3f
++	ud2
++	_ASM_EXTABLE(1b, 2b)
++
++3:	vmrun %_ASM_AX
++	jmp 5f
++4:	cmpb $0, kvm_rebooting
++	jne 5f
++	ud2
++	_ASM_EXTABLE(3b, 4b)
++
++5:	vmsave %_ASM_AX
++	jmp 7f
++6:	cmpb $0, kvm_rebooting
++	jne 7f
++	ud2
++	_ASM_EXTABLE(5b, 6b)
++7:
++	/* "POP" @regs to RAX. */
++	pop %_ASM_AX
++
++	/* Save all guest registers.  */
++	mov %_ASM_CX,   VCPU_RCX(%_ASM_AX)
++	mov %_ASM_DX,   VCPU_RDX(%_ASM_AX)
++	mov %_ASM_BX,   VCPU_RBX(%_ASM_AX)
++	mov %_ASM_BP,   VCPU_RBP(%_ASM_AX)
++	mov %_ASM_SI,   VCPU_RSI(%_ASM_AX)
++	mov %_ASM_DI,   VCPU_RDI(%_ASM_AX)
++#ifdef CONFIG_X86_64
++	mov %r8,  VCPU_R8 (%_ASM_AX)
++	mov %r9,  VCPU_R9 (%_ASM_AX)
++	mov %r10, VCPU_R10(%_ASM_AX)
++	mov %r11, VCPU_R11(%_ASM_AX)
++	mov %r12, VCPU_R12(%_ASM_AX)
++	mov %r13, VCPU_R13(%_ASM_AX)
++	mov %r14, VCPU_R14(%_ASM_AX)
++	mov %r15, VCPU_R15(%_ASM_AX)
++#endif
++
++	/*
++	 * Clear all general purpose registers except RSP and RAX to prevent
++	 * speculative use of the guest's values, even those that are reloaded
++	 * via the stack.  In theory, an L1 cache miss when restoring registers
++	 * could lead to speculative execution with the guest's values.
++	 * Zeroing XORs are dirt cheap, i.e. the extra paranoia is essentially
++	 * free.  RSP and RAX are exempt as they are restored by hardware
++	 * during VM-Exit.
++	 */
++	xor %ecx, %ecx
++	xor %edx, %edx
++	xor %ebx, %ebx
++	xor %ebp, %ebp
++	xor %esi, %esi
++	xor %edi, %edi
++#ifdef CONFIG_X86_64
++	xor %r8d,  %r8d
++	xor %r9d,  %r9d
++	xor %r10d, %r10d
++	xor %r11d, %r11d
++	xor %r12d, %r12d
++	xor %r13d, %r13d
++	xor %r14d, %r14d
++	xor %r15d, %r15d
++#endif
++
++	pop %_ASM_BX
++
++#ifdef CONFIG_X86_64
++	pop %r12
++	pop %r13
++	pop %r14
++	pop %r15
++#else
++	pop %esi
++	pop %edi
++#endif
++	pop %_ASM_BP
++	ret
++SYM_FUNC_END(__svm_vcpu_run)
