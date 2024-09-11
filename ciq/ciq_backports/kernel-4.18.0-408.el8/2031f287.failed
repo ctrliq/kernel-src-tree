@@ -1,0 +1,414 @@
+KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 2031f2876896d82aca7e82f84accd9181b9587fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/2031f287.failed
+
+Add wrappers to acquire/release KVM's SRCU lock when stashing the index
+in vcpu->src_idx, along with rudimentary detection of illegal usage,
+e.g. re-acquiring SRCU and thus overwriting vcpu->src_idx.  Because the
+SRCU index is (currently) either 0 or 1, illegal nesting bugs can go
+unnoticed for quite some time and only cause problems when the nested
+lock happens to get a different index.
+
+Wrap the WARNs in PROVE_RCU=y, and make them ONCE, otherwise KVM will
+likely yell so loudly that it will bring the kernel to its knees.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Tested-by: Fabiano Rosas <farosas@linux.ibm.com>
+Message-Id: <20220415004343.2203171-4-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2031f2876896d82aca7e82f84accd9181b9587fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/riscv/kvm/vcpu.c
+#	arch/riscv/kvm/vcpu_exit.c
+#	arch/s390/kvm/interrupt.c
+#	arch/s390/kvm/vsie.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/s390/kvm/interrupt.c
+index fad1be82e605,af96dc0549a4..000000000000
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@@ -1334,11 -1334,11 +1334,16 @@@ int kvm_s390_handle_wait(struct kvm_vcp
+  	hrtimer_start(&vcpu->arch.ckc_timer, sltime, HRTIMER_MODE_REL);
+  	VCPU_EVENT(vcpu, 4, "enabled wait: %llu ns", sltime);
+  no_timer:
+++<<<<<<< HEAD
+ +	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+ +	kvm_vcpu_block(vcpu);
+++=======
++ 	kvm_vcpu_srcu_read_unlock(vcpu);
++ 	kvm_vcpu_halt(vcpu);
+++>>>>>>> 2031f2876896 (KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused)
+  	vcpu->valid_wakeup = false;
+  	__unset_cpu_idle(vcpu);
+- 	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++ 	kvm_vcpu_srcu_read_lock(vcpu);
+  
+  	hrtimer_cancel(&vcpu->arch.ckc_timer);
+  	return 0;
+diff --cc arch/s390/kvm/vsie.c
+index 2d8b8bbd3c3b,dada78b92691..000000000000
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@@ -1090,10 -1091,7 +1090,14 @@@ static int do_vsie_run(struct kvm_vcpu 
+  
+  	handle_last_fault(vcpu, vsie_page);
+  
+++<<<<<<< HEAD
+ +	if (test_cpu_flag(CIF_MCCK_PENDING))
+ +		s390_handle_mcck();
+ +
+ +	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+++=======
++ 	kvm_vcpu_srcu_read_unlock(vcpu);
+++>>>>>>> 2031f2876896 (KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused)
+  
+  	/* save current guest state of bp isolation override */
+  	guest_bp_isolation = test_thread_flag(TIF_ISOLATE_BP_GUEST);
+diff --cc arch/x86/kvm/x86.c
+index 4ef27c337e31,51eb27824452..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -10036,9 -10093,11 +10036,9 @@@ static int vcpu_enter_guest(struct kvm_
+  	 * result in virtual interrupt delivery.
+  	 */
+  	local_irq_disable();
+ -
+ -	/* Store vcpu->apicv_active before vcpu->mode.  */
+ -	smp_store_release(&vcpu->mode, IN_GUEST_MODE);
+ +	vcpu->mode = IN_GUEST_MODE;
+  
+- 	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++ 	kvm_vcpu_srcu_read_unlock(vcpu);
+  
+  	/*
+  	 * 1) We should set ->mode before checking ->requests.  Please see
+@@@ -10221,16 -10283,32 +10221,42 @@@ out
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
+ +{
+ +	if (!kvm_arch_vcpu_runnable(vcpu) &&
+ +	    (!kvm_x86_ops.pre_block || static_call(kvm_x86_pre_block)(vcpu) == 0)) {
+ +		srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
+ +		kvm_vcpu_block(vcpu);
+ +		vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
+++=======
++ /* Called within kvm->srcu read side.  */
++ static inline int vcpu_block(struct kvm_vcpu *vcpu)
++ {
++ 	bool hv_timer;
++ 
++ 	if (!kvm_arch_vcpu_runnable(vcpu)) {
++ 		/*
++ 		 * Switch to the software timer before halt-polling/blocking as
++ 		 * the guest's timer may be a break event for the vCPU, and the
++ 		 * hypervisor timer runs only when the CPU is in guest mode.
++ 		 * Switch before halt-polling so that KVM recognizes an expired
++ 		 * timer before blocking.
++ 		 */
++ 		hv_timer = kvm_lapic_hv_timer_in_use(vcpu);
++ 		if (hv_timer)
++ 			kvm_lapic_switch_to_sw_timer(vcpu);
++ 
++ 		kvm_vcpu_srcu_read_unlock(vcpu);
++ 		if (vcpu->arch.mp_state == KVM_MP_STATE_HALTED)
++ 			kvm_vcpu_halt(vcpu);
++ 		else
++ 			kvm_vcpu_block(vcpu);
++ 		kvm_vcpu_srcu_read_lock(vcpu);
+++>>>>>>> 2031f2876896 (KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused)
+  
+ -		if (hv_timer)
+ -			kvm_lapic_switch_to_hv_timer(vcpu);
+ +		if (kvm_x86_ops.post_block)
+ +			static_call(kvm_x86_post_block)(vcpu);
+  
+  		if (!kvm_check_request(KVM_REQ_UNHALT, vcpu))
+  			return 1;
+@@@ -10268,9 -10346,8 +10294,8 @@@ static inline bool kvm_vcpu_running(str
+  static int vcpu_run(struct kvm_vcpu *vcpu)
+  {
+  	int r;
+- 	struct kvm *kvm = vcpu->kvm;
+  
+ +	vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
+  	vcpu->arch.l1tf_flush_l1d = true;
+  
+  	for (;;) {
+@@@ -10295,16 -10372,12 +10320,25 @@@
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (signal_pending(current)) {
+ +			r = -EINTR;
+ +			vcpu->run->exit_reason = KVM_EXIT_INTR;
+ +			++vcpu->stat.signal_exits;
+ +			break;
+ +		}
+ +		if (need_resched()) {
+ +			srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
+ +			cond_resched();
+ +			vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
+++=======
++ 		if (__xfer_to_guest_mode_work_pending()) {
++ 			kvm_vcpu_srcu_read_unlock(vcpu);
++ 			r = xfer_to_guest_mode_handle_work(vcpu);
++ 			kvm_vcpu_srcu_read_lock(vcpu);
++ 			if (r)
++ 				return r;
+++>>>>>>> 2031f2876896 (KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused)
+  		}
+  	}
+  
+@@@ -10414,12 -10485,22 +10448,29 @@@ int kvm_arch_vcpu_ioctl_run(struct kvm_
+  	kvm_run->flags = 0;
+  	kvm_load_guest_fpu(vcpu);
+  
+++<<<<<<< HEAD
+++=======
++ 	kvm_vcpu_srcu_read_lock(vcpu);
+++>>>>>>> 2031f2876896 (KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused)
+  	if (unlikely(vcpu->arch.mp_state == KVM_MP_STATE_UNINITIALIZED)) {
+  		if (kvm_run->immediate_exit) {
+  			r = -EINTR;
+  			goto out;
+  		}
+++<<<<<<< HEAD
+ +		kvm_vcpu_block(vcpu);
+++=======
++ 		/*
++ 		 * It should be impossible for the hypervisor timer to be in
++ 		 * use before KVM has ever run the vCPU.
++ 		 */
++ 		WARN_ON_ONCE(kvm_lapic_hv_timer_in_use(vcpu));
++ 
++ 		kvm_vcpu_srcu_read_unlock(vcpu);
++ 		kvm_vcpu_block(vcpu);
++ 		kvm_vcpu_srcu_read_lock(vcpu);
++ 
+++>>>>>>> 2031f2876896 (KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused)
+  		if (kvm_apic_accept_events(vcpu) < 0) {
+  			r = 0;
+  			goto out;
+@@@ -10479,8 -10560,9 +10530,13 @@@ out
+  	if (kvm_run->kvm_valid_regs)
+  		store_regs(vcpu);
+  	post_kvm_run_save(vcpu);
+++<<<<<<< HEAD
+++=======
++ 	kvm_vcpu_srcu_read_unlock(vcpu);
++ 
+++>>>>>>> 2031f2876896 (KVM: Add helpers to wrap vcpu->srcu_idx and yell if it's abused)
+  	kvm_sigset_deactivate(vcpu);
+ +
+  	vcpu_put(vcpu);
+  	return r;
+  }
+* Unmerged path arch/riscv/kvm/vcpu.c
+* Unmerged path arch/riscv/kvm/vcpu_exit.c
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_radix.c b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+index 9f9be731abc8..3335c8b8d564 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@ -163,9 +163,10 @@ int kvmppc_mmu_walk_radix_tree(struct kvm_vcpu *vcpu, gva_t eaddr,
+ 			return -EINVAL;
+ 		/* Read the entry from guest memory */
+ 		addr = base + (index * sizeof(rpte));
+-		vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
++
++		kvm_vcpu_srcu_read_lock(vcpu);
+ 		ret = kvm_read_guest(kvm, addr, &rpte, sizeof(rpte));
+-		srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
++		kvm_vcpu_srcu_read_unlock(vcpu);
+ 		if (ret) {
+ 			if (pte_ret_p)
+ 				*pte_ret_p = addr;
+@@ -241,9 +242,9 @@ int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
+ 
+ 	/* Read the table to find the root of the radix tree */
+ 	ptbl = (table & PRTB_MASK) + (table_index * sizeof(entry));
+-	vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
++	kvm_vcpu_srcu_read_lock(vcpu);
+ 	ret = kvm_read_guest(kvm, ptbl, &entry, sizeof(entry));
+-	srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
++	kvm_vcpu_srcu_read_unlock(vcpu);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv_nested.c b/arch/powerpc/kvm/book3s_hv_nested.c
+index efe1fb3eae8a..7eb4cf5e21fe 100644
+--- a/arch/powerpc/kvm/book3s_hv_nested.c
++++ b/arch/powerpc/kvm/book3s_hv_nested.c
+@@ -303,10 +303,10 @@ long kvmhv_enter_nested_guest(struct kvm_vcpu *vcpu)
+ 	/* copy parameters in */
+ 	hv_ptr = kvmppc_get_gpr(vcpu, 4);
+ 	regs_ptr = kvmppc_get_gpr(vcpu, 5);
+-	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++	kvm_vcpu_srcu_read_lock(vcpu);
+ 	err = kvmhv_read_guest_state_and_regs(vcpu, &l2_hv, &l2_regs,
+ 					      hv_ptr, regs_ptr);
+-	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++	kvm_vcpu_srcu_read_unlock(vcpu);
+ 	if (err)
+ 		return H_PARAMETER;
+ 
+@@ -391,10 +391,10 @@ long kvmhv_enter_nested_guest(struct kvm_vcpu *vcpu)
+ 		byteswap_hv_regs(&l2_hv);
+ 		byteswap_pt_regs(&l2_regs);
+ 	}
+-	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++	kvm_vcpu_srcu_read_lock(vcpu);
+ 	err = kvmhv_write_guest_state_and_regs(vcpu, &l2_hv, &l2_regs,
+ 					       hv_ptr, regs_ptr);
+-	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++	kvm_vcpu_srcu_read_unlock(vcpu);
+ 	if (err)
+ 		return H_AUTHORITY;
+ 
+@@ -574,16 +574,16 @@ long kvmhv_copy_tofrom_guest_nested(struct kvm_vcpu *vcpu)
+ 			goto not_found;
+ 
+ 		/* Write what was loaded into our buffer back to the L1 guest */
+-		vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++		kvm_vcpu_srcu_read_lock(vcpu);
+ 		rc = kvm_vcpu_write_guest(vcpu, gp_to, buf, n);
+-		srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++		kvm_vcpu_srcu_read_unlock(vcpu);
+ 		if (rc)
+ 			goto not_found;
+ 	} else {
+ 		/* Load the data to be stored from the L1 guest into our buf */
+-		vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++		kvm_vcpu_srcu_read_lock(vcpu);
+ 		rc = kvm_vcpu_read_guest(vcpu, gp_from, buf, n);
+-		srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++		kvm_vcpu_srcu_read_unlock(vcpu);
+ 		if (rc)
+ 			goto not_found;
+ 
+diff --git a/arch/powerpc/kvm/book3s_rtas.c b/arch/powerpc/kvm/book3s_rtas.c
+index 52095f765e32..1df440297505 100644
+--- a/arch/powerpc/kvm/book3s_rtas.c
++++ b/arch/powerpc/kvm/book3s_rtas.c
+@@ -232,9 +232,9 @@ int kvmppc_rtas_hcall(struct kvm_vcpu *vcpu)
+ 	 */
+ 	args_phys = kvmppc_get_gpr(vcpu, 4) & KVM_PAM;
+ 
+-	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++	kvm_vcpu_srcu_read_lock(vcpu);
+ 	rc = kvm_read_guest(vcpu->kvm, args_phys, &args, sizeof(args));
+-	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++	kvm_vcpu_srcu_read_unlock(vcpu);
+ 	if (rc)
+ 		goto fail;
+ 
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index a43fec035ad4..5d071d5afc32 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -416,9 +416,9 @@ int kvmppc_ld(struct kvm_vcpu *vcpu, ulong *eaddr, int size, void *ptr,
+ 		return EMULATE_DONE;
+ 	}
+ 
+-	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++	kvm_vcpu_srcu_read_lock(vcpu);
+ 	rc = kvm_read_guest(vcpu->kvm, pte.raddr, ptr, size);
+-	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++	kvm_vcpu_srcu_read_unlock(vcpu);
+ 	if (rc)
+ 		return EMULATE_DO_MMIO;
+ 
+* Unmerged path arch/riscv/kvm/vcpu.c
+* Unmerged path arch/riscv/kvm/vcpu_exit.c
+* Unmerged path arch/s390/kvm/interrupt.c
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 537e809fbaae..cd248516e989 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -4140,14 +4140,14 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ 	 * We try to hold kvm->srcu during most of vcpu_run (except when run-
+ 	 * ning the guest), so that memslots (and other stuff) are protected
+ 	 */
+-	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++	kvm_vcpu_srcu_read_lock(vcpu);
+ 
+ 	do {
+ 		rc = vcpu_pre_run(vcpu);
+ 		if (rc)
+ 			break;
+ 
+-		srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++		kvm_vcpu_srcu_read_unlock(vcpu);
+ 		/*
+ 		 * As PF_VCPU will be used in fault handler, between
+ 		 * guest_enter and guest_exit should be no uaccess.
+@@ -4182,12 +4182,12 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
+ 		__enable_cpu_timer_accounting(vcpu);
+ 		guest_exit_irqoff();
+ 		local_irq_enable();
+-		vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++		kvm_vcpu_srcu_read_lock(vcpu);
+ 
+ 		rc = vcpu_post_run(vcpu, exit_reason);
+ 	} while (!signal_pending(current) && !guestdbg_exit_pending(vcpu) && !rc);
+ 
+-	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
++	kvm_vcpu_srcu_read_unlock(vcpu);
+ 	return rc;
+ }
+ 
+* Unmerged path arch/s390/kvm/vsie.c
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 905b4457d163..221556ad72e3 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -296,7 +296,10 @@ struct kvm_vcpu {
+ 	int cpu;
+ 	int vcpu_id; /* id given by userspace at creation */
+ 	int vcpu_idx; /* index in kvm->vcpus array */
+-	int srcu_idx;
++	int ____srcu_idx; /* Don't use this directly.  You've been warned. */
++#ifdef CONFIG_PROVE_RCU
++	int srcu_depth;
++#endif
+ 	int mode;
+ 	u64 requests;
+ 	unsigned long guest_debug;
+@@ -632,6 +635,25 @@ static inline void kvm_vm_bugged(struct kvm *kvm)
+ 	unlikely(__ret);					\
+ })
+ 
++static inline void kvm_vcpu_srcu_read_lock(struct kvm_vcpu *vcpu)
++{
++#ifdef CONFIG_PROVE_RCU
++	WARN_ONCE(vcpu->srcu_depth++,
++		  "KVM: Illegal vCPU srcu_idx LOCK, depth=%d", vcpu->srcu_depth - 1);
++#endif
++	vcpu->____srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
++}
++
++static inline void kvm_vcpu_srcu_read_unlock(struct kvm_vcpu *vcpu)
++{
++	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->____srcu_idx);
++
++#ifdef CONFIG_PROVE_RCU
++	WARN_ONCE(--vcpu->srcu_depth,
++		  "KVM: Illegal vCPU srcu_idx UNLOCK, depth=%d", vcpu->srcu_depth);
++#endif
++}
++
+ static inline bool kvm_dirty_log_manual_protect_and_init_set(struct kvm *kvm)
+ {
+ 	return !!(kvm->manual_dirty_log_protect & KVM_DIRTY_LOG_INITIALLY_SET);
