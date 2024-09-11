@@ -1,0 +1,97 @@
+mm: shmem: remove rare optimization when swapin races with hole punching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 14235ab36019d169f5eb5bf0c064c5b12ca1bf46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/14235ab3.failed
+
+Commit 215c02bc33bb ("tmpfs: fix shmem_getpage_gfp() VM_BUG_ON")
+recognized that hole punching can race with swapin and removed the
+BUG_ON() for a truncated entry from the swapin path.
+
+The patch also added a swapcache deletion to optimize this rare case:
+Since swapin has the page locked, and free_swap_and_cache() merely
+trylocks, this situation can leave the page stranded in swapcache.
+Usually, page reclaim picks up stale swapcache pages, and the race can
+happen at any other time when the page is locked.  (The same happens for
+non-shmem swapin racing with page table zapping.) The thinking here was:
+we already observed the race and we have the page locked, we may as well
+do the cleanup instead of waiting for reclaim.
+
+However, this optimization complicates the next patch which moves the
+cgroup charging code around.  As this is just a minor speedup for a race
+condition that is so rare that it required a fuzzer to trigger the
+original BUG_ON(), it's no longer worth the complications.
+
+	Suggested-by: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Cc: Alex Shi <alex.shi@linux.alibaba.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+Link: http://lkml.kernel.org/r/20200511181056.GA339505@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 14235ab36019d169f5eb5bf0c064c5b12ca1bf46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/shmem.c
+diff --cc mm/shmem.c
+index 10f03436a6bf,729bbb3513cd..000000000000
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@@ -1659,30 -1664,18 +1659,45 @@@ static int shmem_swapin_page(struct ino
+  			goto failed;
+  	}
+  
+++<<<<<<< HEAD
+ +	error = mem_cgroup_try_charge_delay(page, charge_mm, gfp, &memcg,
+ +					    false);
+ +	if (!error) {
+ +		error = shmem_add_to_page_cache(page, mapping, index,
+ +						swp_to_radix_entry(swap), gfp);
+ +		/*
+ +		 * We already confirmed swap under page lock, and make
+ +		 * no memory allocation here, so usually no possibility
+ +		 * of error; but free_swap_and_cache() only trylocks a
+ +		 * page, so it is just possible that the entry has been
+ +		 * truncated or holepunched since swap was confirmed.
+ +		 * shmem_undo_range() will have done some of the
+ +		 * unaccounting, now delete_from_swap_cache() will do
+ +		 * the rest.
+ +		 */
+ +		if (error) {
+ +			mem_cgroup_cancel_charge(page, memcg, false);
+ +			delete_from_swap_cache(page);
+ +		}
+ +	}
+ +	if (error)
+ +		goto failed;
+ +
+ +	mem_cgroup_commit_charge(page, memcg, true, false);
+++=======
++ 	error = mem_cgroup_try_charge_delay(page, charge_mm, gfp, &memcg);
++ 	if (error)
++ 		goto failed;
++ 
++ 	error = shmem_add_to_page_cache(page, mapping, index,
++ 					swp_to_radix_entry(swap), gfp);
++ 	if (error) {
++ 		mem_cgroup_cancel_charge(page, memcg);
++ 		goto failed;
++ 	}
++ 
++ 	mem_cgroup_commit_charge(page, memcg, true);
+++>>>>>>> 14235ab36019 (mm: shmem: remove rare optimization when swapin races with hole punching)
+  
+  	spin_lock_irq(&info->lock);
+  	info->swapped--;
+* Unmerged path mm/shmem.c
