@@ -1,0 +1,88 @@
+dax: Fix huge page faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 0e40de0338d005f73d46898a21544cd26f01b4ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0e40de03.failed
+
+Using xas_load() with a PMD-sized xa_state would work if either a
+PMD-sized entry was present or a PTE sized entry was present in the
+first 64 entries (of the 512 PTEs in a PMD on x86).  If there was no
+PTE in the first 64 entries, grab_mapping_entry() would believe there
+were no entries present, allocate a PMD-sized entry and overwrite the
+PTE in the page cache.
+
+Use xas_find_conflict() instead which turns out to simplify
+both get_unlocked_entry() and grab_mapping_entry().  Also remove a
+WARN_ON_ONCE from grab_mapping_entry() as it will have already triggered
+in get_unlocked_entry().
+
+Fixes: cfc93c6c6c96 ("dax: Convert dax_insert_pfn_mkwrite to XArray")
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit 0e40de0338d005f73d46898a21544cd26f01b4ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index b89ab8b5e700,cf2394e2bf4b..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -592,29 -442,32 +591,42 @@@ void dax_unlock_mapping_entry(struct pa
+   * Note: Unlike filemap_fault() we don't honor FAULT_FLAG_RETRY flags. For
+   * persistent memory the benefit is doubtful. We can add that later if we can
+   * show it helps.
+ - *
+ - * On error, this function does not return an ERR_PTR.  Instead it returns
+ - * a VM_FAULT code, encoded as an xarray internal entry.  The ERR_PTR values
+ - * overlap with xarray value entries.
+   */
+ -static void *grab_mapping_entry(struct xa_state *xas,
+ -		struct address_space *mapping, unsigned long size_flag)
+ +static void *grab_mapping_entry(struct address_space *mapping, pgoff_t index,
+ +		unsigned long size_flag)
+  {
+ -	unsigned long index = xas->xa_index;
+ -	bool pmd_downgrade = false; /* splitting PMD entry into PTE entries? */
+ -	void *entry;
+ +	bool pmd_downgrade = false; /* splitting 2MiB entry into 4k entries? */
+ +	void *entry, **slot;
+  
+++<<<<<<< HEAD
+ +restart:
+ +	xa_lock_irq(&mapping->i_pages);
+ +	entry = get_unlocked_mapping_entry(mapping, index, &slot);
+ +
+ +	if (WARN_ON_ONCE(entry && !xa_is_value(entry))) {
+ +		entry = ERR_PTR(-EIO);
+ +		goto out_unlock;
+ +	}
+ +
+ +	if (entry) {
+++=======
++ retry:
++ 	xas_lock_irq(xas);
++ 	entry = get_unlocked_entry(xas);
++ 
++ 	if (entry) {
++ 		if (!xa_is_value(entry)) {
++ 			xas_set_err(xas, EIO);
++ 			goto out_unlock;
++ 		}
++ 
+++>>>>>>> 0e40de0338d0 (dax: Fix huge page faults)
+  		if (size_flag & DAX_PMD) {
+  			if (dax_is_pte_entry(entry)) {
+ -				put_unlocked_entry(xas, entry);
+ -				goto fallback;
+ +				put_unlocked_mapping_entry(mapping, index,
+ +						entry);
+ +				entry = ERR_PTR(-EEXIST);
+ +				goto out_unlock;
+  			}
+  		} else { /* trying to grab a PTE entry */
+  			if (dax_is_pmd_entry(entry) &&
+* Unmerged path fs/dax.c
