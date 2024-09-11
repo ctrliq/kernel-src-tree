@@ -1,0 +1,283 @@
+printk: avoid and/or handle record truncation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 59f8bcca1ef6a5326f7c127e11b949e745bfa230
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/59f8bcca.failed
+
+If a reader provides a buffer that is smaller than the message text,
+the @text_len field of @info will have a value larger than the buffer
+size. If readers blindly read @text_len bytes of data without
+checking the size, they will read beyond their buffer.
+
+Add this check to record_print_text() to properly recognize when such
+truncation has occurred.
+
+Add a maximum size argument to the ringbuffer function to extend
+records so that records can not be created that are larger than the
+buffer size of readers.
+
+When extending records (LOG_CONT), do not extend records beyond
+LOG_LINE_MAX since that is the maximum size available in the buffers
+used by consoles and syslog.
+
+Fixes: f5f022e53b87 ("printk: reimplement log_cont using record extension")
+	Reported-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20200930090134.8723-2-john.ogness@linutronix.de
+(cherry picked from commit 59f8bcca1ef6a5326f7c127e11b949e745bfa230)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index c1fedccb5ed4,15cd73da0528..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1341,43 -1324,102 +1341,54 @@@ static size_t print_prefix(const struc
+  	return len;
+  }
+  
+ -/*
+ - * Prepare the record for printing. The text is shifted within the given
+ - * buffer to avoid a need for another one. The following operations are
+ - * done:
+ - *
+ - *   - Add prefix for each line.
+ - *   - Add the trailing newline that has been removed in vprintk_store().
+ - *   - Drop truncated lines that do not longer fit into the buffer.
+ - *
+ - * Return: The length of the updated/prepared text, including the added
+ - * prefixes and the newline. The dropped line(s) are not counted.
+ - */
+ -static size_t record_print_text(struct printk_record *r, bool syslog,
+ -				bool time)
+ +static size_t msg_print_text(const struct printk_log *msg, bool syslog,
+ +			     bool time, char *buf, size_t size)
+  {
+ -	size_t text_len = r->info->text_len;
+ -	size_t buf_size = r->text_buf_size;
+ -	char *text = r->text_buf;
+ -	char prefix[PREFIX_MAX];
+ -	bool truncated = false;
+ -	size_t prefix_len;
+ -	size_t line_len;
+ +	const char *text = log_text(msg);
+ +	size_t text_size = msg->text_len;
+  	size_t len = 0;
+ -	char *next;
+ +	char prefix[PREFIX_MAX];
+ +	const size_t prefix_len = print_prefix(msg, syslog, time, prefix);
+  
+++<<<<<<< HEAD
+ +	do {
+ +		const char *next = memchr(text, '\n', text_size);
+ +		size_t text_len;
+++=======
++ 	/*
++ 	 * If the message was truncated because the buffer was not large
++ 	 * enough, treat the available text as if it were the full text.
++ 	 */
++ 	if (text_len > buf_size)
++ 		text_len = buf_size;
++ 
++ 	prefix_len = info_print_prefix(r->info, syslog, time, prefix);
+++>>>>>>> 59f8bcca1ef6 (printk: avoid and/or handle record truncation)
+  
+ -	/*
+ -	 * @text_len: bytes of unprocessed text
+ -	 * @line_len: bytes of current line _without_ newline
+ -	 * @text:     pointer to beginning of current line
+ -	 * @len:      number of bytes prepared in r->text_buf
+ -	 */
+ -	for (;;) {
+ -		next = memchr(text, '\n', text_len);
+  		if (next) {
+ -			line_len = next - text;
+ +			text_len = next - text;
+ +			next++;
+ +			text_size -= next - text;
+  		} else {
+ -			/* Drop truncated line(s). */
+ -			if (truncated)
+ -				break;
+ -			line_len = text_len;
+ +			text_len = text_size;
+  		}
+  
+ -		/*
+ -		 * Truncate the text if there is not enough space to add the
+ -		 * prefix and a trailing newline.
+ -		 */
+ -		if (len + prefix_len + text_len + 1 > buf_size) {
+ -			/* Drop even the current line if no space. */
+ -			if (len + prefix_len + line_len + 1 > buf_size)
+ +		if (buf) {
+ +			if (prefix_len + text_len + 1 >= size - len)
+  				break;
+  
+ -			text_len = buf_size - len - prefix_len - 1;
+ -			truncated = true;
+ -		}
+ -
+ -		memmove(text + prefix_len, text, text_len);
+ -		memcpy(text, prefix, prefix_len);
+ -
+ -		len += prefix_len + line_len + 1;
+ -
+ -		if (text_len == line_len) {
+ -			/*
+ -			 * Add the trailing newline removed in
+ -			 * vprintk_store().
+ -			 */
+ -			text[prefix_len + line_len] = '\n';
+ -			break;
+ +			memcpy(buf + len, prefix, prefix_len);
+ +			len += prefix_len;
+ +			memcpy(buf + len, text, text_len);
+ +			len += text_len;
+ +			buf[len++] = '\n';
+ +		} else {
+ +			/* SYSLOG_ACTION_* buffer size only calculation */
+ +			len += prefix_len + text_len + 1;
+  		}
+  
+ -		/*
+ -		 * Advance beyond the added prefix and the related line with
+ -		 * its newline.
+ -		 */
+ -		text += prefix_len + line_len + 1;
+ -
+ -		/*
+ -		 * The remaining text has only decreased by the line with its
+ -		 * newline.
+ -		 *
+ -		 * Note that @text_len can become zero. It happens when @text
+ -		 * ended with a newline (either due to truncation or the
+ -		 * original string ending with "\n\n"). The loop is correctly
+ -		 * repeated and (if not truncated) an empty line with a prefix
+ -		 * will be prepared.
+ -		 */
+ -		text_len -= line_len + 1;
+ -	}
+ +		text = next;
+ +	} while (text);
+  
+  	return len;
+  }
+@@@ -1907,27 -1905,22 +1918,45 @@@ static size_t log_output(int facility, 
+  {
+  	const u32 caller_id = printk_caller_id();
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If an earlier line was buffered, and we're a continuation
+ +	 * write from the same context, try to add it to the buffer.
+ +	 */
+ +	if (cont.len) {
+ +		if (cont.caller_id == caller_id && (lflags & LOG_CONT)) {
+ +			if (cont_add(caller_id, facility, level, lflags, text, text_len))
+ +				return text_len;
+++=======
++ 	if (lflags & LOG_CONT) {
++ 		struct prb_reserved_entry e;
++ 		struct printk_record r;
++ 
++ 		prb_rec_init_wr(&r, text_len);
++ 		if (prb_reserve_in_last(&e, prb, &r, caller_id, LOG_LINE_MAX)) {
++ 			memcpy(&r.text_buf[r.info->text_len], text, text_len);
++ 			r.info->text_len += text_len;
++ 			if (lflags & LOG_NEWLINE) {
++ 				r.info->flags |= LOG_NEWLINE;
++ 				prb_final_commit(&e);
++ 			} else {
++ 				prb_commit(&e);
++ 			}
++ 			return text_len;
+++>>>>>>> 59f8bcca1ef6 (printk: avoid and/or handle record truncation)
+  		}
+ +		/* Otherwise, make sure it's flushed */
+ +		cont_flush();
+ +	}
+ +
+ +	/* Skip empty continuation lines that couldn't be added - they just flush */
+ +	if (!text_len && (lflags & LOG_CONT))
+ +		return 0;
+ +
+ +	/* If it doesn't end in a newline, try to buffer the current line */
+ +	if (!(lflags & LOG_NEWLINE)) {
+ +		if (cont_add(caller_id, facility, level, lflags, text, text_len))
+ +			return text_len;
+  	}
+  
+  	/* Store it in the record log */
+* Unmerged path kernel/printk/printk.c
+diff --git a/kernel/printk/printk_ringbuffer.c b/kernel/printk/printk_ringbuffer.c
+index 25548d2880ae..e9b7d219776b 100644
+--- a/kernel/printk/printk_ringbuffer.c
++++ b/kernel/printk/printk_ringbuffer.c
+@@ -204,7 +204,8 @@
+  *	// specify additional 5 bytes text space to extend
+  *	prb_rec_init_wr(&r, 5, 0);
+  *
+- *	if (prb_reserve_in_last(&e, &test_rb, &r, printk_caller_id())) {
++ *	// try to extend, but only if it does not exceed 32 bytes
++ *	if (prb_reserve_in_last(&e, &test_rb, &r, printk_caller_id()), 32) {
+  *		snprintf(&r.text_buf[r.info->text_len],
+  *			 r.text_buf_size - r.info->text_len, "hello");
+  *
+@@ -1309,6 +1310,7 @@ static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
+  * @rb:        The ringbuffer to re-reserve and extend data in.
+  * @r:         The record structure to allocate buffers for.
+  * @caller_id: The caller ID of the caller (reserving writer).
++ * @max_size:  Fail if the extended size would be greater than this.
+  *
+  * This is the public function available to writers to re-reserve and extend
+  * data.
+@@ -1348,7 +1350,7 @@ static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
+  *            @r->info->text_len after concatenating.
+  */
+ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+-			 struct printk_record *r, u32 caller_id)
++			 struct printk_record *r, u32 caller_id, unsigned int max_size)
+ {
+ 	unsigned int data_size;
+ 	struct prb_desc *d;
+@@ -1390,6 +1392,9 @@ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer
+ 		if (!data_check_size(&rb->text_data_ring, r->text_buf_size))
+ 			goto fail;
+ 
++		if (r->text_buf_size > max_size)
++			goto fail;
++
+ 		r->text_buf = data_alloc(rb, &rb->text_data_ring, r->text_buf_size,
+ 					 &d->text_blk_lpos, id);
+ 	} else {
+@@ -1411,6 +1416,9 @@ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer
+ 		if (!data_check_size(&rb->text_data_ring, r->text_buf_size))
+ 			goto fail;
+ 
++		if (r->text_buf_size > max_size)
++			goto fail;
++
+ 		r->text_buf = data_realloc(rb, &rb->text_data_ring, r->text_buf_size,
+ 					   &d->text_blk_lpos, id);
+ 	}
+diff --git a/kernel/printk/printk_ringbuffer.h b/kernel/printk/printk_ringbuffer.h
+index 853ea62dc5f2..b0003de62436 100644
+--- a/kernel/printk/printk_ringbuffer.h
++++ b/kernel/printk/printk_ringbuffer.h
+@@ -329,7 +329,7 @@ static inline void prb_rec_init_wr(struct printk_record *r,
+ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+ 		 struct printk_record *r);
+ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
+-			 struct printk_record *r, u32 caller_id);
++			 struct printk_record *r, u32 caller_id, unsigned int max_size);
+ void prb_commit(struct prb_reserved_entry *e);
+ void prb_final_commit(struct prb_reserved_entry *e);
+ 
