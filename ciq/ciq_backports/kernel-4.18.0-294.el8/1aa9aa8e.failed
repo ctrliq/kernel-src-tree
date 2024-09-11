@@ -1,0 +1,293 @@
+x86/sev-es: Setup GHCB-based boot #VC handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] sev-es: Setup GHCB-based boot #VC handler (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 95.35%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 1aa9aa8ee517e0443b06e816a4fd2d15f2113615
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1aa9aa8e.failed
+
+Add the infrastructure to handle #VC exceptions when the kernel runs on
+virtual addresses and has mapped a GHCB. This handler will be used until
+the runtime #VC handler takes over.
+
+Since the handler runs very early, disable instrumentation for sev-es.c.
+
+ [ bp: Make vc_ghcb_invalidate() __always_inline so that it can be
+   inlined in noinstr functions like __sev_es_nmi_complete(). ]
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200908123816.GB3764@8bytes.org
+(cherry picked from commit 1aa9aa8ee517e0443b06e816a4fd2d15f2113615)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/sev-es.h
+#	arch/x86/kernel/head64.c
+#	arch/x86/kernel/head_64.S
+#	arch/x86/kernel/sev-es-shared.c
+#	arch/x86/kernel/sev-es.c
+diff --cc arch/x86/kernel/head64.c
+index d68a9e3968b3,4199f25c0063..000000000000
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@@ -375,6 -400,19 +375,22 @@@ int __init early_make_pgtable(unsigned 
+  	return __early_make_pgtable(address, pmd);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void __init do_early_exception(struct pt_regs *regs, int trapnr)
++ {
++ 	if (trapnr == X86_TRAP_PF &&
++ 	    early_make_pgtable(native_read_cr2()))
++ 		return;
++ 
++ 	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT) &&
++ 	    trapnr == X86_TRAP_VC && handle_vc_boot_ghcb(regs))
++ 		return;
++ 
++ 	early_fixup_exception(regs, trapnr);
++ }
++ 
+++>>>>>>> 1aa9aa8ee517 (x86/sev-es: Setup GHCB-based boot #VC handler)
+  /* Don't add a printk in there. printk relies on the PDA which is not initialized 
+     yet. */
+  static void __init clear_bss(void)
+@@@ -487,3 -525,81 +503,84 @@@ void __init x86_64_start_reservations(c
+  
+  	start_kernel();
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Data structures and code used for IDT setup in head_64.S. The bringup-IDT is
++  * used until the idt_table takes over. On the boot CPU this happens in
++  * x86_64_start_kernel(), on secondary CPUs in start_secondary(). In both cases
++  * this happens in the functions called from head_64.S.
++  *
++  * The idt_table can't be used that early because all the code modifying it is
++  * in idt.c and can be instrumented by tracing or KASAN, which both don't work
++  * during early CPU bringup. Also the idt_table has the runtime vectors
++  * configured which require certain CPU state to be setup already (like TSS),
++  * which also hasn't happened yet in early CPU bringup.
++  */
++ static gate_desc bringup_idt_table[NUM_EXCEPTION_VECTORS] __page_aligned_data;
++ 
++ static struct desc_ptr bringup_idt_descr = {
++ 	.size		= (NUM_EXCEPTION_VECTORS * sizeof(gate_desc)) - 1,
++ 	.address	= 0, /* Set at runtime */
++ };
++ 
++ static void set_bringup_idt_handler(gate_desc *idt, int n, void *handler)
++ {
++ #ifdef CONFIG_AMD_MEM_ENCRYPT
++ 	struct idt_data data;
++ 	gate_desc desc;
++ 
++ 	init_idt_data(&data, n, handler);
++ 	idt_init_desc(&desc, &data);
++ 	native_write_idt_entry(idt, n, &desc);
++ #endif
++ }
++ 
++ /* This runs while still in the direct mapping */
++ static void startup_64_load_idt(unsigned long physbase)
++ {
++ 	struct desc_ptr *desc = fixup_pointer(&bringup_idt_descr, physbase);
++ 	gate_desc *idt = fixup_pointer(bringup_idt_table, physbase);
++ 
++ 
++ 	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT)) {
++ 		void *handler;
++ 
++ 		/* VMM Communication Exception */
++ 		handler = fixup_pointer(vc_no_ghcb, physbase);
++ 		set_bringup_idt_handler(idt, X86_TRAP_VC, handler);
++ 	}
++ 
++ 	desc->address = (unsigned long)idt;
++ 	native_load_idt(desc);
++ }
++ 
++ /* This is used when running on kernel addresses */
++ void early_setup_idt(void)
++ {
++ 	/* VMM Communication Exception */
++ 	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT))
++ 		set_bringup_idt_handler(bringup_idt_table, X86_TRAP_VC, vc_boot_ghcb);
++ 
++ 	bringup_idt_descr.address = (unsigned long)bringup_idt_table;
++ 	native_load_idt(&bringup_idt_descr);
++ }
++ 
++ /*
++  * Setup boot CPU state needed before kernel switches to virtual addresses.
++  */
++ void __head startup_64_setup_env(unsigned long physbase)
++ {
++ 	/* Load GDT */
++ 	startup_gdt_descr.address = (unsigned long)fixup_pointer(startup_gdt, physbase);
++ 	native_load_gdt(&startup_gdt_descr);
++ 
++ 	/* New GDT is live - reload data segment registers */
++ 	asm volatile("movl %%eax, %%ds\n"
++ 		     "movl %%eax, %%ss\n"
++ 		     "movl %%eax, %%es\n" : : "a"(__KERNEL_DS) : "memory");
++ 
++ 	startup_64_load_idt(physbase);
++ }
+++>>>>>>> 1aa9aa8ee517 (x86/sev-es: Setup GHCB-based boot #VC handler)
+diff --cc arch/x86/kernel/head_64.S
+index f62d1d12a0aa,1a71d0d4d575..000000000000
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@@ -255,26 -274,60 +255,73 @@@ END(secondary_startup_64
+   * up already except stack. We just set up stack here. Then call
+   * start_secondary() via .Ljump_to_C_code.
+   */
+ -SYM_CODE_START(start_cpu0)
+ -	UNWIND_HINT_EMPTY
+ +ENTRY(start_cpu0)
+  	movq	initial_stack(%rip), %rsp
+ +	UNWIND_HINT_EMPTY
+  	jmp	.Ljump_to_C_code
+ -SYM_CODE_END(start_cpu0)
+ +ENDPROC(start_cpu0)
++ #endif
++ 
++ #ifdef CONFIG_AMD_MEM_ENCRYPT
++ /*
++  * VC Exception handler used during early boot when running on kernel
++  * addresses, but before the switch to the idt_table can be made.
++  * The early_idt_handler_array can't be used here because it calls into a lot
++  * of __init code and this handler is also used during CPU offlining/onlining.
++  * Therefore this handler ends up in the .text section so that it stays around
++  * when .init.text is freed.
++  */
++ SYM_CODE_START_NOALIGN(vc_boot_ghcb)
++ 	UNWIND_HINT_IRET_REGS offset=8
++ 
++ 	/* Build pt_regs */
++ 	PUSH_AND_CLEAR_REGS
++ 
++ 	/* Call C handler */
++ 	movq    %rsp, %rdi
++ 	movq	ORIG_RAX(%rsp), %rsi
++ 	movq	initial_vc_handler(%rip), %rax
++ 	ANNOTATE_RETPOLINE_SAFE
++ 	call	*%rax
++ 
++ 	/* Unwind pt_regs */
++ 	POP_REGS
++ 
++ 	/* Remove Error Code */
++ 	addq    $8, %rsp
++ 
++ 	/* Pure iret required here - don't use INTERRUPT_RETURN */
++ 	iretq
++ SYM_CODE_END(vc_boot_ghcb)
+  #endif
+  
+  	/* Both SMP bootup and ACPI suspend change these variables */
+  	__REFDATA
+  	.balign	8
+++<<<<<<< HEAD
+ +	GLOBAL(initial_code)
+ +	.quad	x86_64_start_kernel
+ +	GLOBAL(initial_gs)
+ +	.quad	INIT_PER_CPU_VAR(fixed_percpu_data)
+ +	GLOBAL(initial_stack)
+ +	/*
+ +	 * The SIZEOF_PTREGS gap is a convention which helps the in-kernel
+ +	 * unwinder reliably detect the end of the stack.
+ +	 */
+ +	.quad  init_thread_union + THREAD_SIZE - SIZEOF_PTREGS
+++=======
++ SYM_DATA(initial_code,	.quad x86_64_start_kernel)
++ SYM_DATA(initial_gs,	.quad INIT_PER_CPU_VAR(fixed_percpu_data))
++ #ifdef CONFIG_AMD_MEM_ENCRYPT
++ SYM_DATA(initial_vc_handler,	.quad handle_vc_boot_ghcb)
++ #endif
++ 
++ /*
++  * The SIZEOF_PTREGS gap is a convention which helps the in-kernel unwinder
++  * reliably detect the end of the stack.
++  */
++ SYM_DATA(initial_stack, .quad init_thread_union + THREAD_SIZE - SIZEOF_PTREGS)
+++>>>>>>> 1aa9aa8ee517 (x86/sev-es: Setup GHCB-based boot #VC handler)
+  	__FINITDATA
+  
+  	__INIT
+* Unmerged path arch/x86/include/asm/sev-es.h
+* Unmerged path arch/x86/kernel/sev-es-shared.c
+* Unmerged path arch/x86/kernel/sev-es.c
+diff --git a/arch/x86/include/asm/realmode.h b/arch/x86/include/asm/realmode.h
+index c53682303c9c..e1185cecf09b 100644
+--- a/arch/x86/include/asm/realmode.h
++++ b/arch/x86/include/asm/realmode.h
+@@ -58,6 +58,9 @@ extern unsigned char real_mode_blob_end[];
+ extern unsigned long initial_code;
+ extern unsigned long initial_gs;
+ extern unsigned long initial_stack;
++#ifdef CONFIG_AMD_MEM_ENCRYPT
++extern unsigned long initial_vc_handler;
++#endif
+ 
+ extern unsigned char real_mode_blob[];
+ extern unsigned char real_mode_relocs[];
+diff --git a/arch/x86/include/asm/segment.h b/arch/x86/include/asm/segment.h
+index 381cd4ff5b6e..a7e3ec3929c4 100644
+--- a/arch/x86/include/asm/segment.h
++++ b/arch/x86/include/asm/segment.h
+@@ -230,7 +230,7 @@
+ #define NUM_EXCEPTION_VECTORS		32
+ 
+ /* Bitmask of exception vectors which push an error code on the stack: */
+-#define EXCEPTION_ERRCODE_MASK		0x00027d00
++#define EXCEPTION_ERRCODE_MASK		0x20027d00
+ 
+ #define GDT_SIZE			(GDT_ENTRIES*8)
+ #define GDT_ENTRY_TLS_ENTRIES		3
+* Unmerged path arch/x86/include/asm/sev-es.h
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index bddda128283a..4a1c217e837b 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -20,6 +20,7 @@ CFLAGS_REMOVE_kvmclock.o = -pg
+ CFLAGS_REMOVE_ftrace.o = -pg
+ CFLAGS_REMOVE_early_printk.o = -pg
+ CFLAGS_REMOVE_head64.o = -pg
++CFLAGS_REMOVE_sev-es.o = -pg
+ endif
+ 
+ KASAN_SANITIZE_head$(BITS).o				:= n
+@@ -27,6 +28,7 @@ KASAN_SANITIZE_dumpstack.o				:= n
+ KASAN_SANITIZE_dumpstack_$(BITS).o			:= n
+ KASAN_SANITIZE_stacktrace.o				:= n
+ KASAN_SANITIZE_paravirt.o				:= n
++KASAN_SANITIZE_sev-es.o					:= n
+ 
+ OBJECT_FILES_NON_STANDARD_relocate_kernel_$(BITS).o	:= y
+ OBJECT_FILES_NON_STANDARD_test_nx.o			:= y
+* Unmerged path arch/x86/kernel/head64.c
+* Unmerged path arch/x86/kernel/head_64.S
+* Unmerged path arch/x86/kernel/sev-es-shared.c
+* Unmerged path arch/x86/kernel/sev-es.c
+diff --git a/arch/x86/mm/extable.c b/arch/x86/mm/extable.c
+index 0b8b5d889eec..034f9e2c889e 100644
+--- a/arch/x86/mm/extable.c
++++ b/arch/x86/mm/extable.c
+@@ -4,6 +4,7 @@
+ #include <xen/xen.h>
+ 
+ #include <asm/fpu/internal.h>
++#include <asm/sev-es.h>
+ #include <asm/traps.h>
+ #include <asm/kdebug.h>
+ 
