@@ -1,0 +1,116 @@
+KVM: x86/mmu: Zap defunct roots via asynchronous worker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit efd995dae5eba57c5d28d6886a85298b390a4f07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/efd995da.failed
+
+Zap defunct roots, a.k.a. roots that have been invalidated after their
+last reference was initially dropped, asynchronously via the existing work
+queue instead of forcing the work upon the unfortunate task that happened
+to drop the last reference.
+
+If a vCPU task drops the last reference, the vCPU is effectively blocked
+by the host for the entire duration of the zap.  If the root being zapped
+happens be fully populated with 4kb leaf SPTEs, e.g. due to dirty logging
+being active, the zap can take several hundred seconds.  Unsurprisingly,
+most guests are unhappy if a vCPU disappears for hundreds of seconds.
+
+E.g. running a synthetic selftest that triggers a vCPU root zap with
+~64tb of guest memory and 4kb SPTEs blocks the vCPU for 900+ seconds.
+Offloading the zap to a worker drops the block time to <100ms.
+
+There is an important nuance to this change.  If the same work item
+was queued twice before the work function has run, it would only
+execute once and one reference would be leaked.  Therefore, now that
+queueing and flushing items is not anymore protected by kvm->slots_lock,
+kvm_tdp_mmu_invalidate_all_roots() has to check root->role.invalid and
+skip already invalid roots.  On the other hand, kvm_mmu_zap_all_fast()
+must return only after those skipped roots have been zapped as well.
+These two requirements can be satisfied only if _all_ places that
+change invalid to true now schedule the worker before releasing the
+mmu_lock.  There are just two, kvm_tdp_mmu_put_root() and
+kvm_tdp_mmu_invalidate_all_roots().
+
+Co-developed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20220226001546.360188-23-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit efd995dae5eba57c5d28d6886a85298b390a4f07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 97bb57fe39ca,3751a33ee258..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -77,6 -144,44 +77,47 @@@ void kvm_tdp_mmu_put_root(struct kvm *k
+  
+  	WARN_ON(!root->tdp_mmu_page);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * The root now has refcount=0.  It is valid, but readers already
++ 	 * cannot acquire a reference to it because kvm_tdp_mmu_get_root()
++ 	 * rejects it.  This remains true for the rest of the execution
++ 	 * of this function, because readers visit valid roots only
++ 	 * (except for tdp_mmu_zap_root_work(), which however
++ 	 * does not acquire any reference itself).
++ 	 *
++ 	 * Even though there are flows that need to visit all roots for
++ 	 * correctness, they all take mmu_lock for write, so they cannot yet
++ 	 * run concurrently. The same is true after kvm_tdp_root_mark_invalid,
++ 	 * since the root still has refcount=0.
++ 	 *
++ 	 * However, tdp_mmu_zap_root can yield, and writers do not expect to
++ 	 * see refcount=0 (see for example kvm_tdp_mmu_invalidate_all_roots()).
++ 	 * So the root temporarily gets an extra reference, going to refcount=1
++ 	 * while staying invalid.  Readers still cannot acquire any reference;
++ 	 * but writers are now allowed to run if tdp_mmu_zap_root yields and
++ 	 * they might take an extra reference if they themselves yield.
++ 	 * Therefore, when the reference is given back by the worker,
++ 	 * there is no guarantee that the refcount is still 1.  If not, whoever
++ 	 * puts the last reference will free the page, but they will not have to
++ 	 * zap the root because a root cannot go from invalid to valid.
++ 	 */
++ 	if (!kvm_tdp_root_mark_invalid(root)) {
++ 		refcount_set(&root->tdp_mmu_root_count, 1);
++ 
++ 		/*
++ 		 * Zapping the root in a worker is not just "nice to have";
++ 		 * it is required because kvm_tdp_mmu_invalidate_all_roots()
++ 		 * skips already-invalid roots.  If kvm_tdp_mmu_put_root() did
++ 		 * not add the root to the workqueue, kvm_tdp_mmu_zap_all_fast()
++ 		 * might return with some roots not zapped yet.
++ 		 */
++ 		tdp_mmu_schedule_zap_root(kvm, root);
++ 		return;
++ 	}
++ 
+++>>>>>>> efd995dae5eb (KVM: x86/mmu: Zap defunct roots via asynchronous worker)
+  	spin_lock(&kvm->arch.tdp_mmu_pages_lock);
+  	list_del_rcu(&root->link);
+  	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
+@@@ -875,8 -1023,11 +916,13 @@@ void kvm_tdp_mmu_invalidate_all_roots(s
+  
+  	lockdep_assert_held_write(&kvm->mmu_lock);
+  	list_for_each_entry(root, &kvm->arch.tdp_mmu_roots, link) {
+++<<<<<<< HEAD
+ +		if (!WARN_ON_ONCE(!kvm_tdp_mmu_get_root(root)))
+++=======
++ 		if (!root->role.invalid &&
++ 		    !WARN_ON_ONCE(!kvm_tdp_mmu_get_root(root))) {
+++>>>>>>> efd995dae5eb (KVM: x86/mmu: Zap defunct roots via asynchronous worker)
+  			root->role.invalid = true;
+ -			tdp_mmu_schedule_zap_root(kvm, root);
+ -		}
+  	}
+  }
+  
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
