@@ -1,0 +1,136 @@
+xfrm: add prep for esp beet mode offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 308491755f36c461ee67290af159fdba6be0169d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/30849175.failed
+
+Like __xfrm_transport/mode_tunnel_prep(), this patch is to add
+__xfrm_mode_beet_prep() to fix the transport_header for gso
+segments, and reset skb mac_len, and pull skb data to the
+proto inside esp.
+
+This patch also fixes a panic, reported by ltp:
+
+  # modprobe esp4_offload
+  # runltp -f net_stress.ipsec_tcp
+
+  [ 2452.780511] kernel BUG at net/core/skbuff.c:109!
+  [ 2452.799851] Call Trace:
+  [ 2452.800298]  <IRQ>
+  [ 2452.800705]  skb_push.cold.98+0x14/0x20
+  [ 2452.801396]  esp_xmit+0x17b/0x270 [esp4_offload]
+  [ 2452.802799]  validate_xmit_xfrm+0x22f/0x2e0
+  [ 2452.804285]  __dev_queue_xmit+0x589/0x910
+  [ 2452.806264]  __neigh_update+0x3d7/0xa50
+  [ 2452.806958]  arp_process+0x259/0x810
+  [ 2452.807589]  arp_rcv+0x18a/0x1c
+
+It was caused by the skb going to esp_xmit with a wrong transport
+header.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 308491755f36c461ee67290af159fdba6be0169d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_device.c
+diff --cc net/xfrm/xfrm_device.c
+index 456be7c7cd0f,fa2a506c8163..000000000000
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@@ -23,6 -19,86 +23,89 @@@
+  #include <linux/notifier.h>
+  
+  #ifdef CONFIG_XFRM_OFFLOAD
+++<<<<<<< HEAD
+++=======
++ static void __xfrm_transport_prep(struct xfrm_state *x, struct sk_buff *skb,
++ 				  unsigned int hsize)
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 
++ 	skb_reset_mac_len(skb);
++ 	pskb_pull(skb, skb->mac_len + hsize + x->props.header_len);
++ 
++ 	if (xo->flags & XFRM_GSO_SEGMENT) {
++ 		skb_reset_transport_header(skb);
++ 		skb->transport_header -= x->props.header_len;
++ 	}
++ }
++ 
++ static void __xfrm_mode_tunnel_prep(struct xfrm_state *x, struct sk_buff *skb,
++ 				    unsigned int hsize)
++ 
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 
++ 	if (xo->flags & XFRM_GSO_SEGMENT)
++ 		skb->transport_header = skb->network_header + hsize;
++ 
++ 	skb_reset_mac_len(skb);
++ 	pskb_pull(skb, skb->mac_len + x->props.header_len);
++ }
++ 
++ static void __xfrm_mode_beet_prep(struct xfrm_state *x, struct sk_buff *skb,
++ 				  unsigned int hsize)
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 	int phlen = 0;
++ 
++ 	if (xo->flags & XFRM_GSO_SEGMENT)
++ 		skb->transport_header = skb->network_header + hsize;
++ 
++ 	skb_reset_mac_len(skb);
++ 	if (x->sel.family != AF_INET6) {
++ 		phlen = IPV4_BEET_PHMAXLEN;
++ 		if (x->outer_mode.family == AF_INET6)
++ 			phlen += sizeof(struct ipv6hdr) - sizeof(struct iphdr);
++ 	}
++ 
++ 	pskb_pull(skb, skb->mac_len + hsize + (x->props.header_len - phlen));
++ }
++ 
++ /* Adjust pointers into the packet when IPsec is done at layer2 */
++ static void xfrm_outer_mode_prep(struct xfrm_state *x, struct sk_buff *skb)
++ {
++ 	switch (x->outer_mode.encap) {
++ 	case XFRM_MODE_TUNNEL:
++ 		if (x->outer_mode.family == AF_INET)
++ 			return __xfrm_mode_tunnel_prep(x, skb,
++ 						       sizeof(struct iphdr));
++ 		if (x->outer_mode.family == AF_INET6)
++ 			return __xfrm_mode_tunnel_prep(x, skb,
++ 						       sizeof(struct ipv6hdr));
++ 		break;
++ 	case XFRM_MODE_TRANSPORT:
++ 		if (x->outer_mode.family == AF_INET)
++ 			return __xfrm_transport_prep(x, skb,
++ 						     sizeof(struct iphdr));
++ 		if (x->outer_mode.family == AF_INET6)
++ 			return __xfrm_transport_prep(x, skb,
++ 						     sizeof(struct ipv6hdr));
++ 		break;
++ 	case XFRM_MODE_BEET:
++ 		if (x->outer_mode.family == AF_INET)
++ 			return __xfrm_mode_beet_prep(x, skb,
++ 						     sizeof(struct iphdr));
++ 		if (x->outer_mode.family == AF_INET6)
++ 			return __xfrm_mode_beet_prep(x, skb,
++ 						     sizeof(struct ipv6hdr));
++ 		break;
++ 	case XFRM_MODE_ROUTEOPTIMIZATION:
++ 	case XFRM_MODE_IN_TRIGGER:
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> 308491755f36 (xfrm: add prep for esp beet mode offload)
+  struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again)
+  {
+  	int err;
+* Unmerged path net/xfrm/xfrm_device.c
