@@ -554,7 +554,6 @@ static inline bool blkcg_bio_issue_check(struct request_queue *q,
 	struct blkcg_gq *blkg = bio->bi_blkg;
 	bool throtl = false;
 
-	rcu_read_lock();
 	throtl = blk_throtl_bio(q, blkg, bio);
 	if (!throtl) {
 		struct blkg_iostat_set *bis;
@@ -588,7 +587,6 @@ static inline bool blkcg_bio_issue_check(struct request_queue *q,
 
 	blkcg_bio_issue_init(bio);
 
-	rcu_read_unlock();
 	return !throtl;
 }
 
