@@ -1,0 +1,114 @@
+clocksource/drivers/hyper-v: Handle sched_clock differences inline
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Michael Kelley <mikelley@microsoft.com>
+commit eb3e1d370b4c57be1acbb9de51a7deaa036eff4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/eb3e1d37.failed
+
+While the Hyper-V Reference TSC code is architecture neutral, the
+pv_ops.time.sched_clock() function is implemented for x86/x64, but not
+for ARM64. Current code calls a utility function under arch/x86 (and
+coming, under arch/arm64) to handle the difference.
+
+Change this approach to handle the difference inline based on whether
+GENERIC_SCHED_CLOCK is present.  The new approach removes code under
+arch/* since the difference is tied more to the specifics of the Linux
+implementation than to the architecture.
+
+No functional change.
+
+	Signed-off-by: Michael Kelley <mikelley@microsoft.com>
+	Reviewed-by: Boqun Feng <boqun.feng@gmail.com>
+	Acked-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+Link: https://lore.kernel.org/r/1614721102-2241-9-git-send-email-mikelley@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit eb3e1d370b4c57be1acbb9de51a7deaa036eff4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mshyperv.h
+diff --cc arch/x86/include/asm/mshyperv.h
+index 2830e3653bc9,5433312c9041..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -27,38 -27,10 +27,41 @@@ static inline u64 hv_get_register(unsig
+  	return value;
+  }
+  
+ +#define hv_set_clocksource_vdso(val) \
+ +	((val).vdso_clock_mode = VDSO_CLOCKMODE_HVCLOCK)
+ +#define hv_enable_vdso_clocksource() \
+ +	vclocks_set_used(VDSO_CLOCKMODE_HVCLOCK);
+  #define hv_get_raw_timer() rdtsc_ordered()
+  
+++<<<<<<< HEAD
+ +void hyperv_callback_vector(void);
+ +void hyperv_reenlightenment_vector(void);
+ +#ifdef CONFIG_TRACING
+ +#define trace_hyperv_callback_vector hyperv_callback_vector
+ +#endif
+ +
+ +/*
+ + * Reference to pv_ops must be inline so objtool
+ + * detection of noinstr violations can work correctly.
+ + */
+ +static __always_inline void hv_setup_sched_clock(void *sched_clock)
+ +{
+ +#ifdef CONFIG_PARAVIRT
+ +	pv_time_ops.sched_clock = sched_clock;
+ +#endif
+ +}
+ +
+++=======
+++>>>>>>> eb3e1d370b4c (clocksource/drivers/hyper-v: Handle sched_clock differences inline)
+  void hyperv_vector_handler(struct pt_regs *regs);
+  
+ +/*
+ + * Routines for stimer0 Direct Mode handling.
+ + * On x86/x64, there are no percpu actions to take.
+ + */
+ +void hv_stimer0_vector_handler(struct pt_regs *regs);
+ +void hv_stimer0_callback_vector(void);
+ +
+  static inline void hv_enable_stimer0_percpu_irq(int irq) {}
+  static inline void hv_disable_stimer0_percpu_irq(int irq) {}
+  
+* Unmerged path arch/x86/include/asm/mshyperv.h
+diff --git a/drivers/clocksource/hyperv_timer.c b/drivers/clocksource/hyperv_timer.c
+index c73c1271e8b8..e15f94167b94 100644
+--- a/drivers/clocksource/hyperv_timer.c
++++ b/drivers/clocksource/hyperv_timer.c
+@@ -416,6 +416,30 @@ static struct clocksource hyperv_cs_msr = {
+ 	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
+ };
+ 
++/*
++ * Reference to pv_ops must be inline so objtool
++ * detection of noinstr violations can work correctly.
++ */
++#ifdef CONFIG_GENERIC_SCHED_CLOCK
++static __always_inline void hv_setup_sched_clock(void *sched_clock)
++{
++	/*
++	 * We're on an architecture with generic sched clock (not x86/x64).
++	 * The Hyper-V sched clock read function returns nanoseconds, not
++	 * the normal 100ns units of the Hyper-V synthetic clock.
++	 */
++	sched_clock_register(sched_clock, 64, NSEC_PER_SEC);
++}
++#elif defined CONFIG_PARAVIRT
++static __always_inline void hv_setup_sched_clock(void *sched_clock)
++{
++	/* We're on x86/x64 *and* using PV ops */
++	pv_ops.time.sched_clock = sched_clock;
++}
++#else /* !CONFIG_GENERIC_SCHED_CLOCK && !CONFIG_PARAVIRT */
++static __always_inline void hv_setup_sched_clock(void *sched_clock) {}
++#endif /* CONFIG_GENERIC_SCHED_CLOCK */
++
+ static bool __init hv_init_tsc_clocksource(void)
+ {
+ 	u64		tsc_msr;
