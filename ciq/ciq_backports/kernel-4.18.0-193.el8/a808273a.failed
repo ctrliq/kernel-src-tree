@@ -1,0 +1,126 @@
+RDMA/verbs: Add a DMA iterator to return aligned contiguous memory blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Shiraz Saleem <shiraz.saleem@intel.com>
+commit a808273a495c657e33281b181fd7fcc2bb28f662
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a808273a.failed
+
+This helper iterates over a DMA-mapped SGL and returns contiguous memory
+blocks aligned to a HW supported page size.
+
+	Suggested-by: Jason Gunthorpe <jgg@ziepe.ca>
+	Signed-off-by: Shiraz Saleem <shiraz.saleem@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit a808273a495c657e33281b181fd7fcc2bb28f662)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/rdma/ib_verbs.h
+diff --cc include/rdma/ib_verbs.h
+index 4fdff229596d,deb67b21ccb9..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2659,7 -2761,53 +2674,57 @@@ void ib_unregister_device(struct ib_dev
+  int ib_register_client   (struct ib_client *client);
+  void ib_unregister_client(struct ib_client *client);
+  
+++<<<<<<< HEAD
+ +void *ib_get_client_data(struct ib_device *device, struct ib_client *client);
+++=======
++ void __rdma_block_iter_start(struct ib_block_iter *biter,
++ 			     struct scatterlist *sglist,
++ 			     unsigned int nents,
++ 			     unsigned long pgsz);
++ bool __rdma_block_iter_next(struct ib_block_iter *biter);
++ 
++ /**
++  * rdma_block_iter_dma_address - get the aligned dma address of the current
++  * block held by the block iterator.
++  * @biter: block iterator holding the memory block
++  */
++ static inline dma_addr_t
++ rdma_block_iter_dma_address(struct ib_block_iter *biter)
++ {
++ 	return biter->__dma_addr & ~(BIT_ULL(biter->__pg_bit) - 1);
++ }
++ 
++ /**
++  * rdma_for_each_block - iterate over contiguous memory blocks of the sg list
++  * @sglist: sglist to iterate over
++  * @biter: block iterator holding the memory block
++  * @nents: maximum number of sg entries to iterate over
++  * @pgsz: best HW supported page size to use
++  *
++  * Callers may use rdma_block_iter_dma_address() to get each
++  * blocks aligned DMA address.
++  */
++ #define rdma_for_each_block(sglist, biter, nents, pgsz)		\
++ 	for (__rdma_block_iter_start(biter, sglist, nents,	\
++ 				     pgsz);			\
++ 	     __rdma_block_iter_next(biter);)
++ 
++ /**
++  * ib_get_client_data - Get IB client context
++  * @device:Device to get context for
++  * @client:Client to get context for
++  *
++  * ib_get_client_data() returns the client context data set with
++  * ib_set_client_data(). This can only be called while the client is
++  * registered to the device, once the ib_client remove() callback returns this
++  * cannot be called.
++  */
++ static inline void *ib_get_client_data(struct ib_device *device,
++ 				       struct ib_client *client)
++ {
++ 	return xa_load(&device->client_data, client->client_id);
++ }
+++>>>>>>> a808273a495c (RDMA/verbs: Add a DMA iterator to return aligned contiguous memory blocks)
+  void  ib_set_client_data(struct ib_device *device, struct ib_client *client,
+  			 void *data);
+  void ib_set_device_ops(struct ib_device *device,
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 7900f9febb28..250bc94cd4b6 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -2698,3 +2698,37 @@ int rdma_init_netdev(struct ib_device *device, u8 port_num,
+ 					     netdev, params.param);
+ }
+ EXPORT_SYMBOL(rdma_init_netdev);
++
++void __rdma_block_iter_start(struct ib_block_iter *biter,
++			     struct scatterlist *sglist, unsigned int nents,
++			     unsigned long pgsz)
++{
++	memset(biter, 0, sizeof(struct ib_block_iter));
++	biter->__sg = sglist;
++	biter->__sg_nents = nents;
++
++	/* Driver provides best block size to use */
++	biter->__pg_bit = __fls(pgsz);
++}
++EXPORT_SYMBOL(__rdma_block_iter_start);
++
++bool __rdma_block_iter_next(struct ib_block_iter *biter)
++{
++	unsigned int block_offset;
++
++	if (!biter->__sg_nents || !biter->__sg)
++		return false;
++
++	biter->__dma_addr = sg_dma_address(biter->__sg) + biter->__sg_advance;
++	block_offset = biter->__dma_addr & (BIT_ULL(biter->__pg_bit) - 1);
++	biter->__sg_advance += BIT_ULL(biter->__pg_bit) - block_offset;
++
++	if (biter->__sg_advance >= sg_dma_len(biter->__sg)) {
++		biter->__sg_advance = 0;
++		biter->__sg = sg_next(biter->__sg);
++		biter->__sg_nents--;
++	}
++
++	return true;
++}
++EXPORT_SYMBOL(__rdma_block_iter_next);
+* Unmerged path include/rdma/ib_verbs.h
