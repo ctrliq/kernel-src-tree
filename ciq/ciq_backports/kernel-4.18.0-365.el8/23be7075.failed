@@ -1,0 +1,96 @@
+ice: fix software generating extra interrupts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jesse Brandeburg <jesse.brandeburg@intel.com>
+commit 23be7075b31863da9cf3983aebcc8ff7537c06ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/23be7075.failed
+
+The driver tried to work around missing completion events that occurred
+while interrupts are disabled, by triggering a software interrupt
+whenever we exit polling (but we had to have polled at least once).
+
+This was causing a *lot* of extra interrupts for some workloads like
+NVMe over TCP, which resulted in regressions in performance. It was also
+visible when polling didn't prevent interrupts when busy_poll was
+enabled.
+
+Fix the extra interrupts by utilizing our previously unused 3rd ITR
+(interrupt throttle) index and set it to 20K interrupts per second, and
+then trigger a software interrupt within that rate limit.
+
+While here, slightly refactor the code to avoid an overwrite of a local
+variable in the case of wb_en = true.
+
+Fixes: b7306b42beaf ("ice: manage interrupts during poll exit")
+	Signed-off-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+	Tested-by: Gurucharan G <gurucharanx.g@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 23be7075b31863da9cf3983aebcc8ff7537c06ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_txrx.c
+diff --cc drivers/net/ethernet/intel/ice/ice_txrx.c
+index 41b26ede6d8d,8f908af9bdd5..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@@ -1322,25 -1361,25 +1322,39 @@@ static void ice_update_ena_itr(struct i
+  	if (test_bit(ICE_DOWN, vsi->state))
+  		return;
+  
+- 	/* When exiting WB_ON_ITR, let ITR resume its normal
+- 	 * interrupts-enabled path.
++ 	/* trigger an ITR delayed software interrupt when exiting busy poll, to
++ 	 * make sure to catch any pending cleanups that might have been missed
++ 	 * due to interrupt state transition. If busy poll or poll isn't
++ 	 * enabled, then don't update ITR, and just enable the interrupt.
+  	 */
+- 	if (wb_en)
++ 	if (!wb_en) {
++ 		itr_val = ice_buildreg_itr(ICE_ITR_NONE, 0);
++ 	} else {
+  		q_vector->wb_on_itr = false;
+  
+++<<<<<<< HEAD
+ +	/* This will do nothing if dynamic updates are not enabled. */
+ +	ice_net_dim(q_vector);
+ +
+ +	/* net_dim() updates ITR out-of-band using a work item */
+ +	itr_val = ice_buildreg_itr(ICE_ITR_NONE, 0);
+ +	/* trigger an immediate software interrupt when exiting
+ +	 * busy poll, to make sure to catch any pending cleanups
+ +	 * that might have been missed due to interrupt state
+ +	 * transition.
+ +	 */
+ +	if (wb_en) {
+++=======
++ 		/* do two things here with a single write. Set up the third ITR
++ 		 * index to be used for software interrupt moderation, and then
++ 		 * trigger a software interrupt with a rate limit of 20K on
++ 		 * software interrupts, this will help avoid high interrupt
++ 		 * loads due to frequently polling and exiting polling.
++ 		 */
++ 		itr_val = ice_buildreg_itr(ICE_IDX_ITR2, ICE_ITR_20K);
+++>>>>>>> 23be7075b318 (ice: fix software generating extra interrupts)
+  		itr_val |= GLINT_DYN_CTL_SWINT_TRIG_M |
+- 			   GLINT_DYN_CTL_SW_ITR_INDX_M |
++ 			   ICE_IDX_ITR2 << GLINT_DYN_CTL_SW_ITR_INDX_S |
+  			   GLINT_DYN_CTL_SW_ITR_INDX_ENA_M;
+  	}
+  	wr32(&vsi->back->hw, GLINT_DYN_CTL(q_vector->reg_idx), itr_val);
+diff --git a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+index 76021d977b60..a49082485642 100644
+--- a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
++++ b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+@@ -182,6 +182,7 @@
+ #define GLINT_DYN_CTL_INTERVAL_S		5
+ #define GLINT_DYN_CTL_INTERVAL_M		ICE_M(0xFFF, 5)
+ #define GLINT_DYN_CTL_SW_ITR_INDX_ENA_M		BIT(24)
++#define GLINT_DYN_CTL_SW_ITR_INDX_S		25
+ #define GLINT_DYN_CTL_SW_ITR_INDX_M		ICE_M(0x3, 25)
+ #define GLINT_DYN_CTL_WB_ON_ITR_M		BIT(30)
+ #define GLINT_DYN_CTL_INTENA_MSK_M		BIT(31)
+* Unmerged path drivers/net/ethernet/intel/ice/ice_txrx.c
