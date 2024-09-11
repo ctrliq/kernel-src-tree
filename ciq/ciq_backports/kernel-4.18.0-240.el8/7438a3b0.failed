@@ -1,0 +1,178 @@
+ice: print Rx MDD auto reset message before VF reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paul Greenwalt <paul.greenwalt@intel.com>
+commit 7438a3b0947a2ef43c16bfb7b5b19048d6d92b14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7438a3b0.failed
+
+Rx MDD auto reset message was not being logged because logging occurred
+after the VF reset and the VF MDD data was reinitialized.
+
+Log the Rx MDD auto reset message before triggering the VF reset.
+
+	Signed-off-by: Paul Greenwalt <paul.greenwalt@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 7438a3b0947a2ef43c16bfb7b5b19048d6d92b14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_main.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+diff --cc drivers/net/ethernet/intel/ice/ice_main.c
+index 40fd98d4ad25,bac5a0857c8c..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@@ -1316,19 -1312,27 +1316,33 @@@ static void ice_handle_mdd_event(struc
+  		reg = rd32(hw, VP_MDET_RX(i));
+  		if (reg & VP_MDET_RX_VALID_M) {
+  			wr32(hw, VP_MDET_RX(i), 0xFFFF);
+ -			vf->mdd_rx_events.count++;
+ -			set_bit(__ICE_MDD_VF_PRINT_PENDING, pf->state);
+ -			if (netif_msg_rx_err(pf))
+ -				dev_info(dev, "Malicious Driver Detection event RX detected on VF %d\n",
+ -					 i);
+ +			vf_mdd_detected = true;
+ +			dev_info(dev, "RX driver issue detected on VF %d\n",
+ +				 i);
+ +		}
+  
+++<<<<<<< HEAD
+ +		if (vf_mdd_detected) {
+ +			vf->num_mdd_events++;
+ +			if (vf->num_mdd_events &&
+ +			    vf->num_mdd_events <= ICE_MDD_EVENTS_THRESHOLD)
+ +				dev_info(dev, "VF %d has had %llu MDD events since last boot, Admin might need to reload AVF driver with this number of events\n",
+ +					 i, vf->num_mdd_events);
+++=======
++ 			/* Since the queue is disabled on VF Rx MDD events, the
++ 			 * PF can be configured to reset the VF through ethtool
++ 			 * private flag mdd-auto-reset-vf.
++ 			 */
++ 			if (test_bit(ICE_FLAG_MDD_AUTO_RESET_VF, pf->flags)) {
++ 				/* VF MDD event counters will be cleared by
++ 				 * reset, so print the event prior to reset.
++ 				 */
++ 				ice_print_vf_rx_mdd_event(vf);
++ 				ice_reset_vf(&pf->vf[i], false);
++ 			}
+++>>>>>>> 7438a3b0947a (ice: print Rx MDD auto reset message before VF reset)
+  		}
+  	}
+ -
+ -	ice_print_vfs_mdd_events(pf);
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index 4c35e5f2a915,e9c14d460731..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@@ -3512,3 -3755,65 +3512,68 @@@ int ice_get_vf_stats(struct net_device 
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * ice_print_vf_rx_mdd_event - print VF Rx malicious driver detect event
++  * @vf: pointer to the VF structure
++  */
++ void ice_print_vf_rx_mdd_event(struct ice_vf *vf)
++ {
++ 	struct ice_pf *pf = vf->pf;
++ 	struct device *dev;
++ 
++ 	dev = ice_pf_to_dev(pf);
++ 
++ 	dev_info(dev, "%d Rx Malicious Driver Detection events detected on PF %d VF %d MAC %pM. mdd-auto-reset-vfs=%s\n",
++ 		 vf->mdd_rx_events.count, pf->hw.pf_id, vf->vf_id,
++ 		 vf->dflt_lan_addr.addr,
++ 		 test_bit(ICE_FLAG_MDD_AUTO_RESET_VF, pf->flags)
++ 			  ? "on" : "off");
++ }
++ 
++ /**
++  * ice_print_vfs_mdd_event - print VFs malicious driver detect event
++  * @pf: pointer to the PF structure
++  *
++  * Called from ice_handle_mdd_event to rate limit and print VFs MDD events.
++  */
++ void ice_print_vfs_mdd_events(struct ice_pf *pf)
++ {
++ 	struct device *dev = ice_pf_to_dev(pf);
++ 	struct ice_hw *hw = &pf->hw;
++ 	int i;
++ 
++ 	/* check that there are pending MDD events to print */
++ 	if (!test_and_clear_bit(__ICE_MDD_VF_PRINT_PENDING, pf->state))
++ 		return;
++ 
++ 	/* VF MDD event logs are rate limited to one second intervals */
++ 	if (time_is_after_jiffies(pf->last_printed_mdd_jiffies + HZ * 1))
++ 		return;
++ 
++ 	pf->last_printed_mdd_jiffies = jiffies;
++ 
++ 	ice_for_each_vf(pf, i) {
++ 		struct ice_vf *vf = &pf->vf[i];
++ 
++ 		/* only print Rx MDD event message if there are new events */
++ 		if (vf->mdd_rx_events.count != vf->mdd_rx_events.last_printed) {
++ 			vf->mdd_rx_events.last_printed =
++ 							vf->mdd_rx_events.count;
++ 			ice_print_vf_rx_mdd_event(vf);
++ 		}
++ 
++ 		/* only print Tx MDD event message if there are new events */
++ 		if (vf->mdd_tx_events.count != vf->mdd_tx_events.last_printed) {
++ 			vf->mdd_tx_events.last_printed =
++ 							vf->mdd_tx_events.count;
++ 
++ 			dev_info(dev, "%d Tx Malicious Driver Detection events detected on PF %d VF %d MAC %pM.\n",
++ 				 vf->mdd_tx_events.count, hw->pf_id, i,
++ 				 vf->dflt_lan_addr.addr);
++ 		}
++ 	}
++ }
+++>>>>>>> 7438a3b0947a (ice: print Rx MDD auto reset message before VF reset)
+diff --cc drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+index 807fb154e59b,0adff89a6749..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+@@@ -121,6 -128,11 +121,14 @@@ void ice_set_vf_state_qs_dis(struct ice
+  int
+  ice_get_vf_stats(struct net_device *netdev, int vf_id,
+  		 struct ifla_vf_stats *vf_stats);
+++<<<<<<< HEAD
+++=======
++ bool ice_is_any_vf_in_promisc(struct ice_pf *pf);
++ void
++ ice_vf_lan_overflow_event(struct ice_pf *pf, struct ice_rq_event_info *event);
++ void ice_print_vfs_mdd_events(struct ice_pf *pf);
++ void ice_print_vf_rx_mdd_event(struct ice_vf *vf);
+++>>>>>>> 7438a3b0947a (ice: print Rx MDD auto reset message before VF reset)
+  #else /* CONFIG_PCI_IOV */
+  #define ice_process_vflr_event(pf) do {} while (0)
+  #define ice_free_vfs(pf) do {} while (0)
+@@@ -128,6 -140,9 +136,12 @@@
+  #define ice_vc_notify_link_state(pf) do {} while (0)
+  #define ice_vc_notify_reset(pf) do {} while (0)
+  #define ice_set_vf_state_qs_dis(vf) do {} while (0)
+++<<<<<<< HEAD
+++=======
++ #define ice_vf_lan_overflow_event(pf, event) do {} while (0)
++ #define ice_print_vfs_mdd_events(pf) do {} while (0)
++ #define ice_print_vf_rx_mdd_event(vf) do {} while (0)
+++>>>>>>> 7438a3b0947a (ice: print Rx MDD auto reset message before VF reset)
+  
+  static inline bool
+  ice_reset_all_vfs(struct ice_pf __always_unused *pf,
+* Unmerged path drivers/net/ethernet/intel/ice/ice_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
