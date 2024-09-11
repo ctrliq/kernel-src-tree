@@ -1,0 +1,215 @@
+RDMA/core: Use the ops infrastructure to keep all callbacks in one place
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 02da37509705d3ba6a58fe4799a0caf6b4baecb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/02da3750.failed
+
+As preparation to hide rdma_restrack_root, refactor the code to use the
+ops structure instead of a special callback which is hidden in
+rdma_restrack_root.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 02da37509705d3ba6a58fe4799a0caf6b4baecb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/provider.c
+diff --cc drivers/infiniband/hw/cxgb4/provider.c
+index adda8df00ce5,cb5b713bbf39..000000000000
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@@ -539,6 -548,8 +539,11 @@@ static const struct ib_device_ops c4iw_
+  	.dereg_mr = c4iw_dereg_mr,
+  	.destroy_cq = c4iw_destroy_cq,
+  	.destroy_qp = c4iw_destroy_qp,
+++<<<<<<< HEAD
+++=======
++ 	.destroy_srq = c4iw_destroy_srq,
++ 	.fill_res_entry = fill_res_entry,
+++>>>>>>> 02da37509705 (RDMA/core: Use the ops infrastructure to keep all callbacks in one place)
+  	.get_dev_fw_str = get_dev_fw_str,
+  	.get_dma_mr = c4iw_get_dma_mr,
+  	.get_hw_stats = c4iw_get_mib,
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index d93007189e25..08f960ce13d5 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -1256,6 +1256,7 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
+ 	SET_DEVICE_OP(dev_ops, disassociate_ucontext);
+ 	SET_DEVICE_OP(dev_ops, drain_rq);
+ 	SET_DEVICE_OP(dev_ops, drain_sq);
++	SET_DEVICE_OP(dev_ops, fill_res_entry);
+ 	SET_DEVICE_OP(dev_ops, get_dev_fw_str);
+ 	SET_DEVICE_OP(dev_ops, get_dma_mr);
+ 	SET_DEVICE_OP(dev_ops, get_hw_stats);
+diff --git a/drivers/infiniband/core/nldev.c b/drivers/infiniband/core/nldev.c
+index efccd8e0fb77..5601fa968244 100644
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -361,11 +361,19 @@ static int fill_res_name_pid(struct sk_buff *msg,
+ 	return 0;
+ }
+ 
++static bool fill_res_entry(struct ib_device *dev, struct sk_buff *msg,
++			   struct rdma_restrack_entry *res)
++{
++	if (!dev->ops.fill_res_entry)
++		return false;
++	return dev->ops.fill_res_entry(msg, res);
++}
++
+ static int fill_res_qp_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 			     struct rdma_restrack_entry *res, uint32_t port)
+ {
+ 	struct ib_qp *qp = container_of(res, struct ib_qp, res);
+-	struct rdma_restrack_root *resroot = &qp->device->res;
++	struct ib_device *dev = qp->device;
+ 	struct ib_qp_init_attr qp_init_attr;
+ 	struct nlattr *entry_attr;
+ 	struct ib_qp_attr qp_attr;
+@@ -415,7 +423,7 @@ static int fill_res_qp_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 	if (fill_res_name_pid(msg, res))
+ 		goto err;
+ 
+-	if (resroot->fill_res_entry(msg, res))
++	if (fill_res_entry(dev, msg, res))
+ 		goto err;
+ 
+ 	nla_nest_end(msg, entry_attr);
+@@ -432,7 +440,7 @@ static int fill_res_cm_id_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ {
+ 	struct rdma_id_private *id_priv =
+ 				container_of(res, struct rdma_id_private, res);
+-	struct rdma_restrack_root *resroot = &id_priv->id.device->res;
++	struct ib_device *dev = id_priv->id.device;
+ 	struct rdma_cm_id *cm_id = &id_priv->id;
+ 	struct nlattr *entry_attr;
+ 
+@@ -474,7 +482,7 @@ static int fill_res_cm_id_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 	if (fill_res_name_pid(msg, res))
+ 		goto err;
+ 
+-	if (resroot->fill_res_entry(msg, res))
++	if (fill_res_entry(dev, msg, res))
+ 		goto err;
+ 
+ 	nla_nest_end(msg, entry_attr);
+@@ -490,7 +498,7 @@ static int fill_res_cq_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 			     struct rdma_restrack_entry *res, uint32_t port)
+ {
+ 	struct ib_cq *cq = container_of(res, struct ib_cq, res);
+-	struct rdma_restrack_root *resroot = &cq->device->res;
++	struct ib_device *dev = cq->device;
+ 	struct nlattr *entry_attr;
+ 
+ 	entry_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_RES_CQ_ENTRY);
+@@ -511,7 +519,7 @@ static int fill_res_cq_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 	if (fill_res_name_pid(msg, res))
+ 		goto err;
+ 
+-	if (resroot->fill_res_entry(msg, res))
++	if (fill_res_entry(dev, msg, res))
+ 		goto err;
+ 
+ 	nla_nest_end(msg, entry_attr);
+@@ -527,7 +535,7 @@ static int fill_res_mr_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 			     struct rdma_restrack_entry *res, uint32_t port)
+ {
+ 	struct ib_mr *mr = container_of(res, struct ib_mr, res);
+-	struct rdma_restrack_root *resroot = &mr->pd->device->res;
++	struct ib_device *dev = mr->pd->device;
+ 	struct nlattr *entry_attr;
+ 
+ 	entry_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_RES_MR_ENTRY);
+@@ -548,7 +556,7 @@ static int fill_res_mr_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 	if (fill_res_name_pid(msg, res))
+ 		goto err;
+ 
+-	if (resroot->fill_res_entry(msg, res))
++	if (fill_res_entry(dev, msg, res))
+ 		goto err;
+ 
+ 	nla_nest_end(msg, entry_attr);
+@@ -564,7 +572,7 @@ static int fill_res_pd_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 			     struct rdma_restrack_entry *res, uint32_t port)
+ {
+ 	struct ib_pd *pd = container_of(res, struct ib_pd, res);
+-	struct rdma_restrack_root *resroot = &pd->device->res;
++	struct ib_device *dev = pd->device;
+ 	struct nlattr *entry_attr;
+ 
+ 	entry_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_RES_PD_ENTRY);
+@@ -587,7 +595,7 @@ static int fill_res_pd_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 	if (fill_res_name_pid(msg, res))
+ 		goto err;
+ 
+-	if (resroot->fill_res_entry(msg, res))
++	if (fill_res_entry(dev, msg, res))
+ 		goto err;
+ 
+ 	nla_nest_end(msg, entry_attr);
+diff --git a/drivers/infiniband/core/restrack.c b/drivers/infiniband/core/restrack.c
+index bd7770ed4174..f80b37d437ac 100644
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@ -12,12 +12,6 @@
+ 
+ #include "cma_priv.h"
+ 
+-static int fill_res_noop(struct sk_buff *msg,
+-			 struct rdma_restrack_entry *entry)
+-{
+-	return 0;
+-}
+-
+ /**
+  * rdma_restrack_init() - initialize resource tracking
+  * @dev:  IB device
+@@ -27,7 +21,6 @@ void rdma_restrack_init(struct ib_device *dev)
+ 	struct rdma_restrack_root *res = &dev->res;
+ 
+ 	init_rwsem(&res->rwsem);
+-	res->fill_res_entry = fill_res_noop;
+ }
+ 
+ static const char *type2str(enum rdma_restrack_type type)
+* Unmerged path drivers/infiniband/hw/cxgb4/provider.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 7832ce5f4a18..bf1cdc7dbc1f 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2510,6 +2510,11 @@ struct ib_device_ops {
+ 	 */
+ 	int (*init_port)(struct ib_device *device, u8 port_num,
+ 			 struct kobject *port_sysfs);
++	/**
++	 * Allows rdma drivers to add their own restrack attributes.
++	 */
++	int (*fill_res_entry)(struct sk_buff *msg,
++			      struct rdma_restrack_entry *entry);
+ };
+ 
+ struct ib_device {
+diff --git a/include/rdma/restrack.h b/include/rdma/restrack.h
+index f756fc48eee5..cc66cc7a11d3 100644
+--- a/include/rdma/restrack.h
++++ b/include/rdma/restrack.h
+@@ -65,13 +65,6 @@ struct rdma_restrack_root {
+ 	 * @hash: global database for all resources per-device
+ 	 */
+ 	DECLARE_HASHTABLE(hash, RDMA_RESTRACK_HASH_BITS);
+-	/**
+-	 * @fill_res_entry: driver-specific fill function
+-	 *
+-	 * Allows rdma drivers to add their own restrack attributes.
+-	 */
+-	int (*fill_res_entry)(struct sk_buff *msg,
+-			      struct rdma_restrack_entry *entry);
+ };
+ 
+ /**
