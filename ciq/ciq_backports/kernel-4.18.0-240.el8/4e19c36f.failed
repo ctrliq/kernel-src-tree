@@ -1,0 +1,225 @@
+kvm: x86: Introduce APICv inhibit reason bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit 4e19c36f2df8f84da22c7287de86729aaf3e352b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4e19c36f.failed
+
+There are several reasons in which a VM needs to deactivate APICv
+e.g. disable APICv via parameter during module loading, or when
+enable Hyper-V SynIC support. Additional inhibit reasons will be
+introduced later on when dynamic APICv is supported,
+
+Introduce KVM APICv inhibit reason bits along with a new variable,
+apicv_inhibit_reasons, to help keep track of APICv state for each VM,
+
+Initially, the APICV_INHIBIT_REASON_DISABLE bit is used to indicate
+the case where APICv is disabled during KVM module load.
+(e.g. insmod kvm_amd avic=0 or insmod kvm_intel enable_apicv=0).
+
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+[Do not use get_enable_apicv; consider irqchip_split in svm.c. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4e19c36f2df8f84da22c7287de86729aaf3e352b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index caae36aa2ba4,98209b8c18c1..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -9170,36 -9209,91 +9187,101 @@@ static void fx_init(struct kvm_vcpu *vc
+  	vcpu->arch.cr0 |= X86_CR0_ET;
+  }
+  
+ -int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
+ +void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
+  {
+ -	if (kvm_check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
+ -		pr_warn_once("kvm: SMP vm created on host with unstable TSC; "
+ -			     "guest TSC will not be reliable\n");
+ +	void *wbinvd_dirty_mask = vcpu->arch.wbinvd_dirty_mask;
+ +	struct gfn_to_pfn_cache *cache = &vcpu->arch.st.cache;
+  
+ -	return 0;
+ +	kvm_release_pfn(cache->pfn, cache->dirty, cache);
+ +
+ +	kvmclock_reset(vcpu);
+ +
+ +	kvm_x86_ops->vcpu_free(vcpu);
+ +	free_cpumask_var(wbinvd_dirty_mask);
+  }
+  
+ -int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ +struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
+ +						unsigned int id)
+  {
+ -	struct page *page;
+ -	int r;
+ +	struct kvm_vcpu *vcpu;
+  
+ -	vcpu->arch.emulate_ctxt.ops = &emulate_ops;
+ -	if (!irqchip_in_kernel(vcpu->kvm) || kvm_vcpu_is_reset_bsp(vcpu))
+ -		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+ -	else
+ -		vcpu->arch.mp_state = KVM_MP_STATE_UNINITIALIZED;
+ +	if (kvm_check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
+ +		printk_once(KERN_WARNING
+ +		"kvm: SMP vm created on host with unstable TSC; "
+ +		"guest TSC will not be reliable\n");
+  
+ -	kvm_set_tsc_khz(vcpu, max_tsc_khz);
+ +	vcpu = kvm_x86_ops->vcpu_create(kvm, id);
+  
+++<<<<<<< HEAD
+ +	return vcpu;
+ +}
+++=======
++ 	r = kvm_mmu_create(vcpu);
++ 	if (r < 0)
++ 		return r;
++ 
++ 	if (irqchip_in_kernel(vcpu->kvm)) {
++ 		r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
++ 		if (r < 0)
++ 			goto fail_mmu_destroy;
++ 		if (kvm_apicv_activated(vcpu->kvm))
++ 			vcpu->arch.apicv_active = true;
++ 	} else
++ 		static_key_slow_inc(&kvm_no_apic_vcpu);
++ 
++ 	r = -ENOMEM;
++ 
++ 	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++ 	if (!page)
++ 		goto fail_free_lapic;
++ 	vcpu->arch.pio_data = page_address(page);
++ 
++ 	vcpu->arch.mce_banks = kzalloc(KVM_MAX_MCE_BANKS * sizeof(u64) * 4,
++ 				       GFP_KERNEL_ACCOUNT);
++ 	if (!vcpu->arch.mce_banks)
++ 		goto fail_free_pio_data;
++ 	vcpu->arch.mcg_cap = KVM_MAX_MCE_BANKS;
++ 
++ 	if (!zalloc_cpumask_var(&vcpu->arch.wbinvd_dirty_mask,
++ 				GFP_KERNEL_ACCOUNT))
++ 		goto fail_free_mce_banks;
++ 
++ 	vcpu->arch.user_fpu = kmem_cache_zalloc(x86_fpu_cache,
++ 						GFP_KERNEL_ACCOUNT);
++ 	if (!vcpu->arch.user_fpu) {
++ 		pr_err("kvm: failed to allocate userspace's fpu\n");
++ 		goto free_wbinvd_dirty_mask;
++ 	}
++ 
++ 	vcpu->arch.guest_fpu = kmem_cache_zalloc(x86_fpu_cache,
++ 						 GFP_KERNEL_ACCOUNT);
++ 	if (!vcpu->arch.guest_fpu) {
++ 		pr_err("kvm: failed to allocate vcpu's fpu\n");
++ 		goto free_user_fpu;
++ 	}
++ 	fx_init(vcpu);
++ 
++ 	vcpu->arch.guest_xstate_size = XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET;
++ 
++ 	vcpu->arch.maxphyaddr = cpuid_query_maxphyaddr(vcpu);
++ 
++ 	vcpu->arch.pat = MSR_IA32_CR_PAT_DEFAULT;
++ 
++ 	kvm_async_pf_hash_reset(vcpu);
++ 	kvm_pmu_init(vcpu);
++ 
++ 	vcpu->arch.pending_external_vector = -1;
++ 	vcpu->arch.preempted_in_kernel = false;
++ 
++ 	kvm_hv_vcpu_init(vcpu);
++ 
++ 	r = kvm_x86_ops->vcpu_create(vcpu);
++ 	if (r)
++ 		goto free_guest_fpu;
+++>>>>>>> 4e19c36f2df8 (kvm: x86: Introduce APICv inhibit reason bits)
+  
+ +int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
+ +{
+  	vcpu->arch.arch_capabilities = kvm_get_arch_capabilities();
+  	vcpu->arch.msr_platform_info = MSR_PLATFORM_INFO_CPUID_FAULT;
+  	kvm_vcpu_mtrr_init(vcpu);
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 9e0b1cca8738..f34a8dfb4ce1 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -876,6 +876,8 @@ enum kvm_irqchip_mode {
+ 	KVM_IRQCHIP_SPLIT,        /* created with KVM_CAP_SPLIT_IRQCHIP */
+ };
+ 
++#define APICV_INHIBIT_REASON_DISABLE    0
++
+ struct kvm_arch {
+ 	unsigned long n_used_mmu_pages;
+ 	unsigned long n_requested_mmu_pages;
+@@ -907,6 +909,7 @@ struct kvm_arch {
+ 	struct kvm_apic_map *apic_map;
+ 
+ 	bool apic_access_page_done;
++	unsigned long apicv_inhibit_reasons;
+ 
+ 	gpa_t wall_clock;
+ 
+@@ -1481,6 +1484,8 @@ gpa_t kvm_mmu_gva_to_gpa_system(struct kvm_vcpu *vcpu, gva_t gva,
+ 				struct x86_exception *exception);
+ 
+ void kvm_vcpu_deactivate_apicv(struct kvm_vcpu *vcpu);
++bool kvm_apicv_activated(struct kvm *kvm);
++void kvm_apicv_init(struct kvm *kvm, bool enable);
+ 
+ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
+ 
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 4b247e55061a..70066cdb5831 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -2067,6 +2067,18 @@ static int avic_vm_init(struct kvm *kvm)
+ 	return err;
+ }
+ 
++static int svm_vm_init(struct kvm *kvm)
++{
++	if (avic) {
++		int ret = avic_vm_init(kvm);
++		if (ret)
++			return ret;
++	}
++
++	kvm_apicv_init(kvm, avic && irqchip_split(kvm));
++	return 0;
++}
++
+ static inline int
+ avic_update_iommu_vcpu_affinity(struct kvm_vcpu *vcpu, int cpu, bool r)
+ {
+@@ -7331,7 +7343,7 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 
+ 	.vm_alloc = svm_vm_alloc,
+ 	.vm_free = svm_vm_free,
+-	.vm_init = avic_vm_init,
++	.vm_init = svm_vm_init,
+ 	.vm_destroy = svm_vm_destroy,
+ 
+ 	.prepare_guest_switch = svm_prepare_guest_switch,
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 4b89bb52f520..7771a4df9787 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6919,6 +6919,7 @@ static int vmx_vm_init(struct kvm *kvm)
+ 			break;
+ 		}
+ 	}
++	kvm_apicv_init(kvm, enable_apicv);
+ 	return 0;
+ }
+ 
+* Unmerged path arch/x86/kvm/x86.c
