@@ -1,0 +1,98 @@
+nvmet-rdma: use SRQ per completion vector
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit b0012dd397155438c61b0c1b52ceec1f1366b3cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b0012dd3.failed
+
+In order to save resource allocation and utilize the completion
+locality in a better way (compared to SRQ per device that exist today),
+allocate Shared Receive Queues (SRQs) per completion vector. Associate
+each created QP/CQ with an appropriate SRQ according to the queue index.
+This association will reduce the lock contention in the fast path
+(compared to SRQ per device solution) and increase the locality in
+memory buffers. Add new module parameter for SRQ size to adjust it
+according to the expected load. User should make sure the size is >= 256
+to avoid lack of resources. Also reduce the debug level of "last WQE
+reached" event that is raised when a QP is using SRQ during destruction
+process to relief the log.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b0012dd397155438c61b0c1b52ceec1f1366b3cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/rdma.c
+diff --cc drivers/nvme/target/rdma.c
+index 4fd6850b0cb0,7a90b10359bb..000000000000
+--- a/drivers/nvme/target/rdma.c
++++ b/drivers/nvme/target/rdma.c
+@@@ -885,22 -962,29 +970,39 @@@ static int nvmet_rdma_init_srqs(struct 
+  		return 0;
+  	}
+  
+- 	ndev->srq_cmds = nvmet_rdma_alloc_cmds(ndev, srq_size, false);
+- 	if (IS_ERR(ndev->srq_cmds)) {
+- 		ret = PTR_ERR(ndev->srq_cmds);
+- 		goto out_destroy_srq;
+- 	}
++ 	ndev->srq_size = min(ndev->device->attrs.max_srq_wr,
++ 			     nvmet_rdma_srq_size);
++ 	ndev->srq_count = min(ndev->device->num_comp_vectors,
++ 			      ndev->device->attrs.max_srq);
+  
+- 	ndev->srq = srq;
+- 	ndev->srq_size = srq_size;
++ 	ndev->srqs = kcalloc(ndev->srq_count, sizeof(*ndev->srqs), GFP_KERNEL);
++ 	if (!ndev->srqs)
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < srq_size; i++)
+ +		nvmet_rdma_post_recv(ndev, &ndev->srq_cmds[i]);
+ +
+ +	return 0;
+ +
+ +out_destroy_srq:
+ +	ib_destroy_srq(srq);
+++=======
++ 	for (i = 0; i < ndev->srq_count; i++) {
++ 		ndev->srqs[i] = nvmet_rdma_init_srq(ndev);
++ 		if (IS_ERR(ndev->srqs[i])) {
++ 			ret = PTR_ERR(ndev->srqs[i]);
++ 			goto err_srq;
++ 		}
++ 	}
++ 
++ 	return 0;
++ 
++ err_srq:
++ 	while (--i >= 0)
++ 		nvmet_rdma_destroy_srq(ndev->srqs[i]);
++ 	kfree(ndev->srqs);
+++>>>>>>> b0012dd39715 (nvmet-rdma: use SRQ per completion vector)
+  	return ret;
+  }
+  
+@@@ -1044,10 -1121,12 +1139,10 @@@ static int nvmet_rdma_create_queue_ib(s
+  		 __func__, queue->cq->cqe, qp_attr.cap.max_send_sge,
+  		 qp_attr.cap.max_send_wr, queue->cm_id);
+  
+- 	if (!ndev->srq) {
++ 	if (!queue->nsrq) {
+  		for (i = 0; i < queue->recv_queue_size; i++) {
+  			queue->cmds[i].queue = queue;
+ -			ret = nvmet_rdma_post_recv(ndev, &queue->cmds[i]);
+ -			if (ret)
+ -				goto err_destroy_qp;
+ +			nvmet_rdma_post_recv(ndev, &queue->cmds[i]);
+  		}
+  	}
+  
+* Unmerged path drivers/nvme/target/rdma.c
