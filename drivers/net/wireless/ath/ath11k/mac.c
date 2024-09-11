@@ -4076,6 +4076,7 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
 	bool is_prb_rsp;
 	int ret;
 
+	memset(skb_cb, 0, sizeof(*skb_cb));
 	skb_cb->vif = vif;
 
 	if (key) {
