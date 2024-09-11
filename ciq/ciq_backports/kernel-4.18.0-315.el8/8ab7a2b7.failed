@@ -1,0 +1,353 @@
+tracing: Add trace_export support for event trace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Tingwei Zhang <tingwei@codeaurora.org>
+commit 8ab7a2b7055c88c3da5e4684dfa015c6a8987c28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/8ab7a2b7.failed
+
+Only function traces can be exported to other destinations currently.
+This patch exports event trace as well. Move trace export related
+function to the beginning of file so other trace can call
+trace_process_export() to export.
+
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Reviewed-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Tingwei Zhang <tingwei@codeaurora.org>
+	Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Link: https://lore.kernel.org/r/20201005071319.78508-4-alexander.shishkin@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 8ab7a2b7055c88c3da5e4684dfa015c6a8987c28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/trace.h
+#	kernel/trace/trace.c
+diff --cc include/linux/trace.h
+index b95ffb2188ab,86033d214972..000000000000
+--- a/include/linux/trace.h
++++ b/include/linux/trace.h
+@@@ -3,6 -3,10 +3,13 @@@
+  #define _LINUX_TRACE_H
+  
+  #ifdef CONFIG_TRACING
+++<<<<<<< HEAD
+++=======
++ 
++ #define TRACE_EXPORT_FUNCTION	BIT(0)
++ #define TRACE_EXPORT_EVENT	BIT(1)
++ 
+++>>>>>>> 8ab7a2b7055c (tracing: Add trace_export support for event trace)
+  /*
+   * The trace export - an export of Ftrace output. The trace_export
+   * can process traces and export them to a registered destination as
+diff --cc kernel/trace/trace.c
+index 3871b23923fc,a40ee413123c..000000000000
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@@ -2382,9 -2831,11 +2514,15 @@@ void trace_event_buffer_commit(struct t
+  	if (static_key_false(&tracepoint_printk_key.key))
+  		output_printk(fbuffer);
+  
+++<<<<<<< HEAD
+ +	event_trigger_unlock_commit(fbuffer->trace_file, fbuffer->buffer,
+++=======
++ 	if (static_branch_unlikely(&trace_event_exports_enabled))
++ 		ftrace_exports(fbuffer->event, TRACE_EXPORT_EVENT);
++ 	event_trigger_unlock_commit_regs(fbuffer->trace_file, fbuffer->buffer,
+++>>>>>>> 8ab7a2b7055c (tracing: Add trace_export support for event trace)
+  				    fbuffer->event, fbuffer->entry,
+ -				    fbuffer->flags, fbuffer->pc, fbuffer->regs);
+ +				    fbuffer->flags, fbuffer->pc);
+  }
+  EXPORT_SYMBOL_GPL(trace_event_buffer_commit);
+  
+@@@ -2425,216 -2876,87 +2563,219 @@@ trace_buffer_unlock_commit_nostack(stru
+  	__buffer_unlock_commit(buffer, event);
+  }
+  
+ -void
+ -trace_function(struct trace_array *tr,
+ -	       unsigned long ip, unsigned long parent_ip, unsigned long flags,
+ -	       int pc)
+++<<<<<<< HEAD
+ +static void
+ +trace_process_export(struct trace_export *export,
+ +	       struct ring_buffer_event *event)
+  {
+ -	struct trace_event_call *call = &event_function;
+ -	struct trace_buffer *buffer = tr->array_buffer.buffer;
+ -	struct ring_buffer_event *event;
+ -	struct ftrace_entry *entry;
+ -
+ -	event = __trace_buffer_lock_reserve(buffer, TRACE_FN, sizeof(*entry),
+ -					    flags, pc);
+ -	if (!event)
+ -		return;
+ -	entry	= ring_buffer_event_data(event);
+ -	entry->ip			= ip;
+ -	entry->parent_ip		= parent_ip;
+ +	struct trace_entry *entry;
+ +	unsigned int size = 0;
+  
+ -	if (!call_filter_check_discard(call, entry, buffer, event)) {
+ -		if (static_branch_unlikely(&trace_function_exports_enabled))
+ -			ftrace_exports(event, TRACE_EXPORT_FUNCTION);
+ -		__buffer_unlock_commit(buffer, event);
+ -	}
+ +	entry = ring_buffer_event_data(event);
+ +	size = ring_buffer_event_length(event);
+ +	export->write(export, entry, size);
+  }
+  
+ -#ifdef CONFIG_STACKTRACE
+ -
+ -/* Allow 4 levels of nesting: normal, softirq, irq, NMI */
+ -#define FTRACE_KSTACK_NESTING	4
+ -
+ -#define FTRACE_KSTACK_ENTRIES	(PAGE_SIZE / FTRACE_KSTACK_NESTING)
+ -
+ -struct ftrace_stack {
+ -	unsigned long		calls[FTRACE_KSTACK_ENTRIES];
+ -};
+ +static DEFINE_MUTEX(ftrace_export_lock);
+  
+ +static struct trace_export __rcu *ftrace_exports_list __read_mostly;
+  
+ -struct ftrace_stacks {
+ -	struct ftrace_stack	stacks[FTRACE_KSTACK_NESTING];
+ -};
+ +static DEFINE_STATIC_KEY_FALSE(ftrace_exports_enabled);
+  
+ -static DEFINE_PER_CPU(struct ftrace_stacks, ftrace_stacks);
+ -static DEFINE_PER_CPU(int, ftrace_stack_reserve);
+ +static inline void ftrace_exports_enable(void)
+ +{
+ +	static_branch_enable(&ftrace_exports_enabled);
+ +}
+  
+ -static void __ftrace_trace_stack(struct trace_buffer *buffer,
+ -				 unsigned long flags,
+ -				 int skip, int pc, struct pt_regs *regs)
+ +static inline void ftrace_exports_disable(void)
+  {
+ -	struct trace_event_call *call = &event_kernel_stack;
+ -	struct ring_buffer_event *event;
+ -	unsigned int size, nr_entries;
+ -	struct ftrace_stack *fstack;
+ -	struct stack_entry *entry;
+ -	int stackidx;
+ +	static_branch_disable(&ftrace_exports_enabled);
+ +}
+  
+ -	/*
+ -	 * Add one, for this function and the call to save_stack_trace()
+ -	 * If regs is set, then these functions will not be in the way.
+ -	 */
+ -#ifndef CONFIG_UNWINDER_ORC
+ -	if (!regs)
+ -		skip++;
+ -#endif
+ +static void ftrace_exports(struct ring_buffer_event *event)
+ +{
+ +	struct trace_export *export;
+  
+  	preempt_disable_notrace();
+  
+ -	stackidx = __this_cpu_inc_return(ftrace_stack_reserve) - 1;
+ +	export = rcu_dereference_raw_notrace(ftrace_exports_list);
+ +	while (export) {
+ +		trace_process_export(export, event);
+ +		export = rcu_dereference_raw_notrace(export->next);
+ +	}
+  
+ -	/* This should never happen. If it does, yell once and skip */
+ -	if (WARN_ON_ONCE(stackidx > FTRACE_KSTACK_NESTING))
+ -		goto out;
+ +	preempt_enable_notrace();
+ +}
+  
+ +static inline void
+ +add_trace_export(struct trace_export **list, struct trace_export *export)
+ +{
+ +	rcu_assign_pointer(export->next, *list);
+  	/*
+ -	 * The above __this_cpu_inc_return() is 'atomic' cpu local. An
+ -	 * interrupt will either see the value pre increment or post
+ -	 * increment. If the interrupt happens pre increment it will have
+ -	 * restored the counter when it returns.  We just need a barrier to
+ -	 * keep gcc from moving things around.
+ -	 */
+ -	barrier();
+ -
+ +	 * We are entering export into the list but another
+ +	 * CPU might be walking that list. We need to make sure
+ +	 * the export->next pointer is valid before another CPU sees
+ +	 * the export pointer included into the list.
+ +	 */
+ +	rcu_assign_pointer(*list, export);
+ +}
+ +
+ +static inline int
+ +rm_trace_export(struct trace_export **list, struct trace_export *export)
+ +{
+ +	struct trace_export **p;
+ +
+ +	for (p = list; *p != NULL; p = &(*p)->next)
+ +		if (*p == export)
+ +			break;
+ +
+ +	if (*p != export)
+ +		return -1;
+ +
+ +	rcu_assign_pointer(*p, (*p)->next);
+ +
+ +	return 0;
+ +}
+ +
+ +static inline void
+ +add_ftrace_export(struct trace_export **list, struct trace_export *export)
+ +{
+ +	if (*list == NULL)
+ +		ftrace_exports_enable();
+ +
+ +	add_trace_export(list, export);
+ +}
+ +
+ +static inline int
+ +rm_ftrace_export(struct trace_export **list, struct trace_export *export)
+ +{
+ +	int ret;
+ +
+ +	ret = rm_trace_export(list, export);
+ +	if (*list == NULL)
+ +		ftrace_exports_disable();
+ +
+ +	return ret;
+ +}
+ +
+ +int register_ftrace_export(struct trace_export *export)
+ +{
+ +	if (WARN_ON_ONCE(!export->write))
+ +		return -1;
+ +
+ +	mutex_lock(&ftrace_export_lock);
+ +
+ +	add_ftrace_export(&ftrace_exports_list, export);
+ +
+ +	mutex_unlock(&ftrace_export_lock);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(register_ftrace_export);
+ +
+ +int unregister_ftrace_export(struct trace_export *export)
+ +{
+ +	int ret;
+ +
+ +	mutex_lock(&ftrace_export_lock);
+ +
+ +	ret = rm_ftrace_export(&ftrace_exports_list, export);
+ +
+ +	mutex_unlock(&ftrace_export_lock);
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(unregister_ftrace_export);
+ +
+++=======
+++>>>>>>> 8ab7a2b7055c (tracing: Add trace_export support for event trace)
+ +void
+ +trace_function(struct trace_array *tr,
+ +	       unsigned long ip, unsigned long parent_ip, unsigned long flags,
+ +	       int pc)
+ +{
+ +	struct trace_event_call *call = &event_function;
+ +	struct trace_buffer *buffer = tr->array_buffer.buffer;
+ +	struct ring_buffer_event *event;
+ +	struct ftrace_entry *entry;
+ +
+ +	event = __trace_buffer_lock_reserve(buffer, TRACE_FN, sizeof(*entry),
+ +					    flags, pc);
+ +	if (!event)
+ +		return;
+ +	entry	= ring_buffer_event_data(event);
+ +	entry->ip			= ip;
+ +	entry->parent_ip		= parent_ip;
+ +
+ +	if (!call_filter_check_discard(call, entry, buffer, event)) {
+ +		if (static_branch_unlikely(&ftrace_exports_enabled))
+ +			ftrace_exports(event);
+ +		__buffer_unlock_commit(buffer, event);
+ +	}
+ +}
+ +
+ +#ifdef CONFIG_STACKTRACE
+ +
+ +/* Allow 4 levels of nesting: normal, softirq, irq, NMI */
+ +#define FTRACE_KSTACK_NESTING	4
+ +
+ +#define FTRACE_KSTACK_ENTRIES	(PAGE_SIZE / FTRACE_KSTACK_NESTING)
+ +
+ +struct ftrace_stack {
+ +	unsigned long		calls[FTRACE_KSTACK_ENTRIES];
+ +};
+ +
+ +
+ +struct ftrace_stacks {
+ +	struct ftrace_stack	stacks[FTRACE_KSTACK_NESTING];
+ +};
+ +
+ +static DEFINE_PER_CPU(struct ftrace_stacks, ftrace_stacks);
+ +static DEFINE_PER_CPU(int, ftrace_stack_reserve);
+ +
+ +static void __ftrace_trace_stack(struct trace_buffer *buffer,
+ +				 unsigned long flags,
+ +				 int skip, int pc, struct pt_regs *regs)
+ +{
+ +	struct trace_event_call *call = &event_kernel_stack;
+ +	struct ring_buffer_event *event;
+ +	unsigned int size, nr_entries;
+ +	struct ftrace_stack *fstack;
+ +	struct stack_entry *entry;
+ +	int stackidx;
+ +
+ +	/*
+ +	 * Add one, for this function and the call to save_stack_trace()
+ +	 * If regs is set, then these functions will not be in the way.
+ +	 */
+ +#ifndef CONFIG_UNWINDER_ORC
+ +	if (!regs)
+ +		skip++;
+ +#endif
+ +
+ +	/*
+ +	 * Since events can happen in NMIs there's no safe way to
+ +	 * use the per cpu ftrace_stacks. We reserve it and if an interrupt
+ +	 * or NMI comes in, it will just have to use the default
+ +	 * FTRACE_STACK_SIZE.
+ +	 */
+ +	preempt_disable_notrace();
+ +
+ +	stackidx = __this_cpu_inc_return(ftrace_stack_reserve) - 1;
+ +
+ +	/* This should never happen. If it does, yell once and skip */
+ +	if (WARN_ON_ONCE(stackidx > FTRACE_KSTACK_NESTING))
+ +		goto out;
+ +
+ +	/*
+ +	 * The above __this_cpu_inc_return() is 'atomic' cpu local. An
+ +	 * interrupt will either see the value pre increment or post
+ +	 * increment. If the interrupt happens pre increment it will have
+ +	 * restored the counter when it returns.  We just need a barrier to
+ +	 * keep gcc from moving things around.
+ +	 */
+ +	barrier();
+ +
+  	fstack = this_cpu_ptr(ftrace_stacks.stacks) + stackidx;
+  	size = ARRAY_SIZE(fstack->calls);
+  
+* Unmerged path include/linux/trace.h
+* Unmerged path kernel/trace/trace.c
