@@ -1,0 +1,358 @@
+drm/i915: Use bw state for per crtc SAGV evaluation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+commit 9728889f42b9ba078f86cd11535a89df29e93b33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9728889f.failed
+
+Future platforms require per-crtc SAGV evaluation
+and serializing global state when those are changed
+from different commits.
+
+v2: - Add has_sagv check to intel_crtc_can_enable_sagv
+      so that it sets bit in reject mask.
+    - Use bw_state in intel_pre/post_plane_enable_sagv
+      instead of atomic state
+
+v3: - Fixed rebase conflict, now using
+      intel_atomic_crtc_state_for_each_plane_state in
+      order to call it from atomic check
+v4: - Use fb modifier from plane state
+
+v5: - Make intel_has_sagv static again(Ville)
+    - Removed unnecessary NULL assignments(Ville)
+    - Removed unnecessary SAGV debug(Ville)
+    - Call intel_compute_sagv_mask only for modesets(Ville)
+    - Serialize global state only if sagv results change, but
+      not mask itself(Ville)
+
+v6: - use lock global state instead of serialize(Ville)
+v7: - use both global state lock and serialize depending on
+      if we need to change only global state or access hw
+      (Ville)
+
+	Signed-off-by: Stanislav Lisovskiy <stanislav.lisovskiy@intel.com>
+	Cc: Ville Syrjälä <ville.syrjala@intel.com>
+	Cc: James Ausmus <james.ausmus@intel.com>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200430191757.18206-1-stanislav.lisovskiy@intel.com
+(cherry picked from commit 9728889f42b9ba078f86cd11535a89df29e93b33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_pm.c
+#	drivers/gpu/drm/i915/intel_pm.h
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 8862271193ca,29c37e4a666c..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -37,9 -36,14 +37,14 @@@
+  #include "display/intel_fbc.h"
+  #include "display/intel_sprite.h"
+  
+ -#include "gt/intel_llc.h"
+ -
+  #include "i915_drv.h"
+ -#include "i915_fixed.h"
+  #include "i915_irq.h"
+++<<<<<<< HEAD
+ +#include "intel_drv.h"
+++=======
++ #include "i915_trace.h"
++ #include "display/intel_bw.h"
+++>>>>>>> 9728889f42b9 (drm/i915: Use bw state for per crtc SAGV evaluation)
+  #include "intel_pm.h"
+  #include "intel_sideband.h"
+  #include "../../../platform/x86/intel_ips.h"
+@@@ -3744,52 -3758,80 +3749,122 @@@ intel_disable_sagv(struct drm_i915_priv
+  	return 0;
+  }
+  
+ -void intel_sagv_pre_plane_update(struct intel_atomic_state *state)
+ +bool intel_can_enable_sagv(struct drm_atomic_state *state)
+  {
+++<<<<<<< HEAD
+ +	struct drm_device *dev = state->dev;
+ +	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+ +	struct intel_crtc *crtc;
+ +	struct intel_plane *plane;
+ +	struct intel_crtc_state *cstate;
+ +	enum pipe pipe;
+++=======
++ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++ 	const struct intel_bw_state *new_bw_state;
++ 
++ 	/*
++ 	 * Just return if we can't control SAGV or don't have it.
++ 	 * This is different from situation when we have SAGV but just can't
++ 	 * afford it due to DBuf limitation - in case if SAGV is completely
++ 	 * disabled in a BIOS, we are not even allowed to send a PCode request,
++ 	 * as it will throw an error. So have to check it here.
++ 	 */
++ 	if (!intel_has_sagv(dev_priv))
++ 		return;
++ 
++ 	new_bw_state = intel_atomic_get_new_bw_state(state);
++ 	if (!new_bw_state)
++ 		return;
++ 
++ 	if (!intel_can_enable_sagv(new_bw_state))
++ 		intel_disable_sagv(dev_priv);
++ }
++ 
++ void intel_sagv_post_plane_update(struct intel_atomic_state *state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++ 	const struct intel_bw_state *new_bw_state;
++ 
++ 	/*
++ 	 * Just return if we can't control SAGV or don't have it.
++ 	 * This is different from situation when we have SAGV but just can't
++ 	 * afford it due to DBuf limitation - in case if SAGV is completely
++ 	 * disabled in a BIOS, we are not even allowed to send a PCode request,
++ 	 * as it will throw an error. So have to check it here.
++ 	 */
++ 	if (!intel_has_sagv(dev_priv))
++ 		return;
++ 
++ 	new_bw_state = intel_atomic_get_new_bw_state(state);
++ 	if (!new_bw_state)
++ 		return;
++ 
++ 	if (intel_can_enable_sagv(new_bw_state))
++ 		intel_enable_sagv(dev_priv);
++ }
++ 
++ static bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
++ {
++ 	struct intel_atomic_state *state = to_intel_atomic_state(crtc_state->uapi.state);
++ 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
++ 	struct intel_plane *plane;
++ 	const struct intel_plane_state *plane_state;
+++>>>>>>> 9728889f42b9 (drm/i915: Use bw state for per crtc SAGV evaluation)
+  	int level, latency;
+ +	int sagv_block_time_us;
+  
+  	if (!intel_has_sagv(dev_priv))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	if (IS_GEN(dev_priv, 9))
+ +		sagv_block_time_us = 30;
+ +	else if (IS_GEN(dev_priv, 10))
+ +		sagv_block_time_us = 20;
+ +	else
+ +		sagv_block_time_us = 10;
+ +
+ +	/*
+ +	 * If there are no active CRTCs, no additional checks need be performed
+ +	 */
+ +	if (hweight32(intel_state->active_crtcs) == 0)
+++=======
++ 	if (!crtc_state->hw.active)
+++>>>>>>> 9728889f42b9 (drm/i915: Use bw state for per crtc SAGV evaluation)
+  		return true;
+  
+  	/*
+  	 * SKL+ workaround: bspec recommends we disable SAGV when we have
+  	 * more then one pipe enabled
+  	 */
+++<<<<<<< HEAD
+ +	if (hweight32(intel_state->active_crtcs) > 1)
+ +		return false;
+ +
+ +	/* Since we're now guaranteed to only have one active CRTC... */
+ +	pipe = ffs(intel_state->active_crtcs) - 1;
+ +	crtc = intel_get_crtc_for_pipe(dev_priv, pipe);
+ +	cstate = to_intel_crtc_state(crtc->base.state);
+ +
+ +	if (crtc->base.state->adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE)
+ +		return false;
+ +
+ +	for_each_intel_plane_on_crtc(dev, crtc, plane) {
+ +		struct skl_plane_wm *wm =
+ +			&cstate->wm.skl.optimal.planes[plane->id];
+++=======
++ 	if (hweight8(state->active_pipes) > 1)
++ 		return false;
++ 
++ 	if (crtc_state->hw.adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE)
++ 		return false;
++ 
++ 	intel_atomic_crtc_state_for_each_plane_state(plane, plane_state, crtc_state) {
++ 		const struct skl_plane_wm *wm =
++ 			&crtc_state->wm.skl.optimal.planes[plane->id];
+++>>>>>>> 9728889f42b9 (drm/i915: Use bw state for per crtc SAGV evaluation)
+  
+  		/* Skip this plane if it's not enabled */
+  		if (!wm->wm[0].plane_en)
+@@@ -3819,17 -3861,76 +3894,86 @@@
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static u16 intel_get_ddb_size(struct drm_i915_private *dev_priv,
+ +			      const struct intel_crtc_state *cstate,
+ +			      const u64 total_data_rate,
+ +			      const int num_active,
+ +			      struct skl_ddb_allocation *ddb)
+++=======
++ bool intel_can_enable_sagv(const struct intel_bw_state *bw_state)
++ {
++ 	return bw_state->pipe_sagv_reject == 0;
++ }
++ 
++ static int intel_compute_sagv_mask(struct intel_atomic_state *state)
++ {
++ 	int ret;
++ 	struct intel_crtc *crtc;
++ 	struct intel_crtc_state *new_crtc_state;
++ 	struct intel_bw_state *new_bw_state = NULL;
++ 	const struct intel_bw_state *old_bw_state = NULL;
++ 	int i;
++ 
++ 	for_each_new_intel_crtc_in_state(state, crtc,
++ 					 new_crtc_state, i) {
++ 		new_bw_state = intel_atomic_get_bw_state(state);
++ 		if (IS_ERR(new_bw_state))
++ 			return PTR_ERR(new_bw_state);
++ 
++ 		old_bw_state = intel_atomic_get_old_bw_state(state);
++ 
++ 		if (intel_crtc_can_enable_sagv(new_crtc_state))
++ 			new_bw_state->pipe_sagv_reject &= ~BIT(crtc->pipe);
++ 		else
++ 			new_bw_state->pipe_sagv_reject |= BIT(crtc->pipe);
++ 	}
++ 
++ 	if (!new_bw_state)
++ 		return 0;
++ 
++ 	if (intel_can_enable_sagv(new_bw_state) != intel_can_enable_sagv(old_bw_state)) {
++ 		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
++ 		if (ret)
++ 			return ret;
++ 	} else if (new_bw_state->pipe_sagv_reject != old_bw_state->pipe_sagv_reject) {
++ 		ret = intel_atomic_lock_global_state(&new_bw_state->base);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Calculate initial DBuf slice offset, based on slice size
++  * and mask(i.e if slice size is 1024 and second slice is enabled
++  * offset would be 1024)
++  */
++ static unsigned int
++ icl_get_first_dbuf_slice_offset(u32 dbuf_slice_mask,
++ 				u32 slice_size,
++ 				u32 ddb_size)
++ {
++ 	unsigned int offset = 0;
++ 
++ 	if (!dbuf_slice_mask)
++ 		return 0;
++ 
++ 	offset = (ffs(dbuf_slice_mask) - 1) * slice_size;
++ 
++ 	WARN_ON(offset >= ddb_size);
++ 	return offset;
++ }
++ 
++ static u16 intel_get_ddb_size(struct drm_i915_private *dev_priv)
+++>>>>>>> 9728889f42b9 (drm/i915: Use bw state for per crtc SAGV evaluation)
+  {
+ +	const struct drm_display_mode *adjusted_mode;
+ +	u64 total_data_bw;
+  	u16 ddb_size = INTEL_INFO(dev_priv)->ddb_size;
+  
+ -	drm_WARN_ON(&dev_priv->drm, ddb_size == 0);
+ +	WARN_ON(ddb_size == 0);
+  
+  	if (INTEL_GEN(dev_priv) < 11)
+  		return ddb_size - 4; /* 4 blocks for bypass path allocation */
+@@@ -5673,6 -5866,24 +5817,27 @@@ skl_compute_wm(struct intel_atomic_stat
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (state->modeset) {
++ 		ret = intel_compute_sagv_mask(state);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/*
++ 	 * skl_compute_ddb() will have adjusted the final watermarks
++ 	 * based on how much ddb is available. Now we can actually
++ 	 * check if the final watermarks changed.
++ 	 */
++ 	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
++ 					    new_crtc_state, i) {
++ 		ret = skl_wm_add_affected_planes(state, crtc);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
+++>>>>>>> 9728889f42b9 (drm/i915: Use bw state for per crtc SAGV evaluation)
+  	skl_print_wm_changes(state);
+  
+  	return 0;
+diff --cc drivers/gpu/drm/i915/intel_pm.h
+index 4ccb5a53b61c,fd1dc422e6c5..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.h
++++ b/drivers/gpu/drm/i915/intel_pm.h
+@@@ -9,8 -9,8 +9,9 @@@
+  #include <linux/types.h>
+  
+  #include "i915_reg.h"
++ #include "display/intel_bw.h"
+  
+ +struct drm_atomic_state;
+  struct drm_device;
+  struct drm_i915_private;
+  struct i915_request;
+@@@ -55,9 -42,11 +56,13 @@@ void skl_pipe_wm_get_hw_state(struct in
+  			      struct skl_pipe_wm *out);
+  void g4x_wm_sanitize(struct drm_i915_private *dev_priv);
+  void vlv_wm_sanitize(struct drm_i915_private *dev_priv);
+++<<<<<<< HEAD
+ +bool intel_can_enable_sagv(struct drm_atomic_state *state);
+++=======
++ bool intel_can_enable_sagv(const struct intel_bw_state *bw_state);
+++>>>>>>> 9728889f42b9 (drm/i915: Use bw state for per crtc SAGV evaluation)
+  int intel_enable_sagv(struct drm_i915_private *dev_priv);
+  int intel_disable_sagv(struct drm_i915_private *dev_priv);
+ -void intel_sagv_pre_plane_update(struct intel_atomic_state *state);
+ -void intel_sagv_post_plane_update(struct intel_atomic_state *state);
+  bool skl_wm_level_equals(const struct skl_wm_level *l1,
+  			 const struct skl_wm_level *l2);
+  bool skl_ddb_allocation_overlaps(const struct skl_ddb_entry *ddb,
+diff --git a/drivers/gpu/drm/i915/display/intel_bw.h b/drivers/gpu/drm/i915/display/intel_bw.h
+index e9d9c6d63bc3..552eaee030c4 100644
+--- a/drivers/gpu/drm/i915/display/intel_bw.h
++++ b/drivers/gpu/drm/i915/display/intel_bw.h
+@@ -18,6 +18,12 @@ struct intel_crtc_state;
+ struct intel_bw_state {
+ 	struct drm_private_state base;
+ 
++	/*
++	 * Contains a bit mask, used to determine, whether correspondent
++	 * pipe allows SAGV or not.
++	 */
++	u8 pipe_sagv_reject;
++
+ 	unsigned int data_rate[I915_MAX_PIPES];
+ 	u8 num_active_planes[I915_MAX_PIPES];
+ };
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
+* Unmerged path drivers/gpu/drm/i915/intel_pm.h
