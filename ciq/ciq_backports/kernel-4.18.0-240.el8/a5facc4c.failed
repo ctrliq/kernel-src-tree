@@ -1,0 +1,308 @@
+netdevsim: change fib accounting and limitations to be per-device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit a5facc4cac4dc504397428c936ef1492ce4edd19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a5facc4c.failed
+
+Currently, the accounting is done per-namespace. However, devlink
+instance is always in init_net namespace for now, so only the accounting
+related to init_net is used. Limitations set using devlink resources
+are only considered for init_net. nsim_devlink_net() always
+returns init_net always.
+
+Make the accounting per-device. This brings no functional change.
+Per-device accounting has the same values as per-net.
+For a single netdevsim instance, the behaviour is exactly the same
+as before. When multiple netdevsim instances are created, each
+can have different limits.
+
+This is in prepare to implement proper devlink netns support. After
+that, the devlink instance which would exist in particular netns would
+account and limit that netns.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a5facc4cac4dc504397428c936ef1492ce4edd19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/netdevsim/fib.c
+diff --cc drivers/net/netdevsim/fib.c
+index 1a251f76d09b,7de17e42d77a..000000000000
+--- a/drivers/net/netdevsim/fib.c
++++ b/drivers/net/netdevsim/fib.c
+@@@ -230,35 -257,10 +257,41 @@@ struct nsim_fib_data *nsim_fib_create(s
+  	data->ipv6.fib.max = (u64)-1;
+  	data->ipv6.rules.max = (u64)-1;
+  
+++<<<<<<< HEAD
+ +	return 0;
+ +}
+ +
+ +static struct pernet_operations nsim_fib_net_ops = {
+ +	.init = nsim_fib_netns_init,
+ +	.id   = &nsim_fib_net_id,
+ +	.size = sizeof(struct nsim_fib_data),
+ +};
+ +
+ +void nsim_fib_exit(void)
+ +{
+ +	unregister_fib_notifier(&nsim_fib_nb);
+ +	unregister_pernet_subsys(&nsim_fib_net_ops);
+ +}
+ +
+ +int nsim_fib_init(void)
+ +{
+ +	int err;
+ +
+ +	err = register_pernet_subsys(&nsim_fib_net_ops);
+ +	if (err < 0) {
+ +		pr_err("Failed to register pernet subsystem\n");
+ +		goto err_out;
+ +	}
+ +
+ +	err = register_fib_notifier(&nsim_fib_nb, nsim_fib_dump_inconsistent);
+ +	if (err < 0) {
+++=======
++ 	data->fib_nb.notifier_call = nsim_fib_event_nb;
++ 	err = register_fib_notifier(&data->fib_nb, nsim_fib_dump_inconsistent);
++ 	if (err) {
+++>>>>>>> a5facc4cac4d (netdevsim: change fib accounting and limitations to be per-device)
+  		pr_err("Failed to register fib notifier\n");
+ +		unregister_pernet_subsys(&nsim_fib_net_ops);
+  		goto err_out;
+  	}
+  
+diff --git a/drivers/net/netdevsim/dev.c b/drivers/net/netdevsim/dev.c
+index 863a10803cdb..6161426e6fd5 100644
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@ -123,39 +123,6 @@ static void nsim_dev_port_debugfs_exit(struct nsim_dev_port *nsim_dev_port)
+ 	debugfs_remove_recursive(nsim_dev_port->ddir);
+ }
+ 
+-static struct net *nsim_devlink_net(struct devlink *devlink)
+-{
+-	return &init_net;
+-}
+-
+-static u64 nsim_dev_ipv4_fib_resource_occ_get(void *priv)
+-{
+-	struct net *net = priv;
+-
+-	return nsim_fib_get_val(net, NSIM_RESOURCE_IPV4_FIB, false);
+-}
+-
+-static u64 nsim_dev_ipv4_fib_rules_res_occ_get(void *priv)
+-{
+-	struct net *net = priv;
+-
+-	return nsim_fib_get_val(net, NSIM_RESOURCE_IPV4_FIB_RULES, false);
+-}
+-
+-static u64 nsim_dev_ipv6_fib_resource_occ_get(void *priv)
+-{
+-	struct net *net = priv;
+-
+-	return nsim_fib_get_val(net, NSIM_RESOURCE_IPV6_FIB, false);
+-}
+-
+-static u64 nsim_dev_ipv6_fib_rules_res_occ_get(void *priv)
+-{
+-	struct net *net = priv;
+-
+-	return nsim_fib_get_val(net, NSIM_RESOURCE_IPV6_FIB_RULES, false);
+-}
+-
+ static int nsim_dev_resources_register(struct devlink *devlink)
+ {
+ 	struct devlink_resource_size_params params = {
+@@ -163,9 +130,7 @@ static int nsim_dev_resources_register(struct devlink *devlink)
+ 		.size_granularity = 1,
+ 		.unit = DEVLINK_RESOURCE_UNIT_ENTRY
+ 	};
+-	struct net *net = nsim_devlink_net(devlink);
+ 	int err;
+-	u64 n;
+ 
+ 	/* Resources for IPv4 */
+ 	err = devlink_resource_register(devlink, "IPv4", (u64)-1,
+@@ -177,8 +142,7 @@ static int nsim_dev_resources_register(struct devlink *devlink)
+ 		goto out;
+ 	}
+ 
+-	n = nsim_fib_get_val(net, NSIM_RESOURCE_IPV4_FIB, true);
+-	err = devlink_resource_register(devlink, "fib", n,
++	err = devlink_resource_register(devlink, "fib", (u64)-1,
+ 					NSIM_RESOURCE_IPV4_FIB,
+ 					NSIM_RESOURCE_IPV4, &params);
+ 	if (err) {
+@@ -186,8 +150,7 @@ static int nsim_dev_resources_register(struct devlink *devlink)
+ 		return err;
+ 	}
+ 
+-	n = nsim_fib_get_val(net, NSIM_RESOURCE_IPV4_FIB_RULES, true);
+-	err = devlink_resource_register(devlink, "fib-rules", n,
++	err = devlink_resource_register(devlink, "fib-rules", (u64)-1,
+ 					NSIM_RESOURCE_IPV4_FIB_RULES,
+ 					NSIM_RESOURCE_IPV4, &params);
+ 	if (err) {
+@@ -205,8 +168,7 @@ static int nsim_dev_resources_register(struct devlink *devlink)
+ 		goto out;
+ 	}
+ 
+-	n = nsim_fib_get_val(net, NSIM_RESOURCE_IPV6_FIB, true);
+-	err = devlink_resource_register(devlink, "fib", n,
++	err = devlink_resource_register(devlink, "fib", (u64)-1,
+ 					NSIM_RESOURCE_IPV6_FIB,
+ 					NSIM_RESOURCE_IPV6, &params);
+ 	if (err) {
+@@ -214,8 +176,7 @@ static int nsim_dev_resources_register(struct devlink *devlink)
+ 		return err;
+ 	}
+ 
+-	n = nsim_fib_get_val(net, NSIM_RESOURCE_IPV6_FIB_RULES, true);
+-	err = devlink_resource_register(devlink, "fib-rules", n,
++	err = devlink_resource_register(devlink, "fib-rules", (u64)-1,
+ 					NSIM_RESOURCE_IPV6_FIB_RULES,
+ 					NSIM_RESOURCE_IPV6, &params);
+ 	if (err) {
+@@ -223,22 +184,6 @@ static int nsim_dev_resources_register(struct devlink *devlink)
+ 		return err;
+ 	}
+ 
+-	devlink_resource_occ_get_register(devlink,
+-					  NSIM_RESOURCE_IPV4_FIB,
+-					  nsim_dev_ipv4_fib_resource_occ_get,
+-					  net);
+-	devlink_resource_occ_get_register(devlink,
+-					  NSIM_RESOURCE_IPV4_FIB_RULES,
+-					  nsim_dev_ipv4_fib_rules_res_occ_get,
+-					  net);
+-	devlink_resource_occ_get_register(devlink,
+-					  NSIM_RESOURCE_IPV6_FIB,
+-					  nsim_dev_ipv6_fib_resource_occ_get,
+-					  net);
+-	devlink_resource_occ_get_register(devlink,
+-					  NSIM_RESOURCE_IPV6_FIB_RULES,
+-					  nsim_dev_ipv6_fib_rules_res_occ_get,
+-					  net);
+ out:
+ 	return err;
+ }
+@@ -530,11 +475,11 @@ static int nsim_dev_reload_down(struct devlink *devlink,
+ static int nsim_dev_reload_up(struct devlink *devlink,
+ 			      struct netlink_ext_ack *extack)
+ {
++	struct nsim_dev *nsim_dev = devlink_priv(devlink);
+ 	enum nsim_resource_id res_ids[] = {
+ 		NSIM_RESOURCE_IPV4_FIB, NSIM_RESOURCE_IPV4_FIB_RULES,
+ 		NSIM_RESOURCE_IPV6_FIB, NSIM_RESOURCE_IPV6_FIB_RULES
+ 	};
+-	struct net *net = nsim_devlink_net(devlink);
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(res_ids); ++i) {
+@@ -543,7 +488,8 @@ static int nsim_dev_reload_up(struct devlink *devlink,
+ 
+ 		err = devlink_resource_size_get(devlink, res_ids[i], &val);
+ 		if (!err) {
+-			err = nsim_fib_set_max(net, res_ids[i], val, extack);
++			err = nsim_fib_set_max(nsim_dev->fib_data,
++					       res_ids[i], val, extack);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -678,9 +624,15 @@ nsim_dev_create(struct nsim_bus_dev *nsim_bus_dev, unsigned int port_count)
+ 	if (err)
+ 		goto err_devlink_free;
+ 
++	nsim_dev->fib_data = nsim_fib_create(devlink);
++	if (IS_ERR(nsim_dev->fib_data)) {
++		err = PTR_ERR(nsim_dev->fib_data);
++		goto err_resources_unregister;
++	}
++
+ 	err = devlink_register(devlink, &nsim_bus_dev->dev);
+ 	if (err)
+-		goto err_resources_unregister;
++		goto err_fib_destroy;
+ 
+ 	err = devlink_params_register(devlink, nsim_devlink_params,
+ 				      ARRAY_SIZE(nsim_devlink_params));
+@@ -718,6 +670,8 @@ nsim_dev_create(struct nsim_bus_dev *nsim_bus_dev, unsigned int port_count)
+ 				  ARRAY_SIZE(nsim_devlink_params));
+ err_dl_unregister:
+ 	devlink_unregister(devlink);
++err_fib_destroy:
++	nsim_fib_destroy(devlink, nsim_dev->fib_data);
+ err_resources_unregister:
+ 	devlink_resources_unregister(devlink, NULL);
+ err_devlink_free:
+@@ -736,6 +690,7 @@ static void nsim_dev_destroy(struct nsim_dev *nsim_dev)
+ 	devlink_params_unregister(devlink, nsim_devlink_params,
+ 				  ARRAY_SIZE(nsim_devlink_params));
+ 	devlink_unregister(devlink);
++	nsim_fib_destroy(devlink, nsim_dev->fib_data);
+ 	devlink_resources_unregister(devlink, NULL);
+ 	mutex_destroy(&nsim_dev->port_list_lock);
+ 	devlink_free(devlink);
+* Unmerged path drivers/net/netdevsim/fib.c
+diff --git a/drivers/net/netdevsim/netdev.c b/drivers/net/netdevsim/netdev.c
+index 55f57f76d01b..0740940f41b1 100644
+--- a/drivers/net/netdevsim/netdev.c
++++ b/drivers/net/netdevsim/netdev.c
+@@ -357,18 +357,12 @@ static int __init nsim_module_init(void)
+ 	if (err)
+ 		goto err_dev_exit;
+ 
+-	err = nsim_fib_init();
+-	if (err)
+-		goto err_bus_exit;
+-
+ 	err = rtnl_link_register(&nsim_link_ops);
+ 	if (err)
+-		goto err_fib_exit;
++		goto err_bus_exit;
+ 
+ 	return 0;
+ 
+-err_fib_exit:
+-	nsim_fib_exit();
+ err_bus_exit:
+ 	nsim_bus_exit();
+ err_dev_exit:
+@@ -379,7 +373,6 @@ static int __init nsim_module_init(void)
+ static void __exit nsim_module_exit(void)
+ {
+ 	rtnl_link_unregister(&nsim_link_ops);
+-	nsim_fib_exit();
+ 	nsim_bus_exit();
+ 	nsim_dev_exit();
+ }
+diff --git a/drivers/net/netdevsim/netdevsim.h b/drivers/net/netdevsim/netdevsim.h
+index 66bf13765ad0..ac506cf253b6 100644
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -173,10 +173,12 @@ int nsim_dev_port_add(struct nsim_bus_dev *nsim_bus_dev,
+ int nsim_dev_port_del(struct nsim_bus_dev *nsim_bus_dev,
+ 		      unsigned int port_index);
+ 
+-int nsim_fib_init(void);
+-void nsim_fib_exit(void);
+-u64 nsim_fib_get_val(struct net *net, enum nsim_resource_id res_id, bool max);
+-int nsim_fib_set_max(struct net *net, enum nsim_resource_id res_id, u64 val,
++struct nsim_fib_data *nsim_fib_create(struct devlink *devlink);
++void nsim_fib_destroy(struct devlink *devlink, struct nsim_fib_data *data);
++u64 nsim_fib_get_val(struct nsim_fib_data *fib_data,
++		     enum nsim_resource_id res_id, bool max);
++int nsim_fib_set_max(struct nsim_fib_data *fib_data,
++		     enum nsim_resource_id res_id, u64 val,
+ 		     struct netlink_ext_ack *extack);
+ 
+ #if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
