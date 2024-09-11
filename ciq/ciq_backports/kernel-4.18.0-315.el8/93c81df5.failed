@@ -1,0 +1,163 @@
+mt76: mt7921: properly configure rcpi adding a sta to the fw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit 93c81df520a1ba506757a47c6e4a148f4372a282
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/93c81df5.failed
+
+Properly configure rcpi based on association process rssi. rcpi is used
+by rate controller embedded into the fw to initialize amsdu size.
+
+	Tested-by: Jayden.Kuo <jayden.kuo@mediatek.com>
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 93c81df520a1ba506757a47c6e4a148f4372a282)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7921/main.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/main.c
+index b822180a14a3,7b4f6a70f87a..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/main.c
+@@@ -568,6 -626,15 +570,18 @@@ int mt7921_mac_sta_add(struct mt76_dev 
+  	struct mt7921_dev *dev = container_of(mdev, struct mt7921_dev, mt76);
+  	struct mt7921_sta *msta = (struct mt7921_sta *)sta->drv_priv;
+  	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
+++<<<<<<< HEAD
+++=======
++ 	int rssi = -ewma_rssi_read(&mvif->rssi);
++ 	struct mt76_sta_cmd_info info = {
++ 		.sta = sta,
++ 		.vif = vif,
++ 		.enable = true,
++ 		.cmd = MCU_UNI_CMD_STA_REC_UPDATE,
++ 		.wcid = &msta->wcid,
++ 		.rcpi = to_rcpi(rssi),
++ 	};
+++>>>>>>> 93c81df520a1 (mt76: mt7921: properly configure rcpi adding a sta to the fw)
+  	int ret, idx;
+  
+  	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7921_WTBL_STA - 1);
+@@@ -600,12 -675,29 +614,24 @@@ void mt7921_mac_sta_remove(struct mt76_
+  {
+  	struct mt7921_dev *dev = container_of(mdev, struct mt7921_dev, mt76);
+  	struct mt7921_sta *msta = (struct mt7921_sta *)sta->drv_priv;
+ -	struct mt76_sta_cmd_info info = {
+ -		.sta = sta,
+ -		.vif = vif,
+ -		.cmd = MCU_UNI_CMD_STA_REC_UPDATE,
+ -		.wcid = &msta->wcid,
+ -	};
+ -
+ -	mt76_connac_free_pending_tx_skbs(&dev->pm, &msta->wcid);
+ -	mt76_connac_pm_wake(&dev->mphy, &dev->pm);
+ -
+ -	mt76_connac_mcu_add_sta_cmd(&dev->mphy, &info);
+  
+ +	mt7921_mcu_uni_add_sta(dev, vif, sta, false);
+  	mt7921_mac_wtbl_update(dev, msta->wcid.idx,
+  			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+++<<<<<<< HEAD
+ +	if (vif->type == NL80211_IFTYPE_STATION && !sta->tdls)
+ +		mt7921_mcu_uni_add_bss(&dev->phy, vif, false);
+++=======
++ 
++ 	if (vif->type == NL80211_IFTYPE_STATION) {
++ 		struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
++ 
++ 		ewma_rssi_init(&mvif->rssi);
++ 		if (!sta->tdls)
++ 			mt76_connac_mcu_uni_add_bss(&dev->mphy, vif,
++ 						    &mvif->sta.wcid, false);
++ 	}
+++>>>>>>> 93c81df520a1 (mt76: mt7921: properly configure rcpi adding a sta to the fw)
+  
+  	spin_lock_bh(&dev->sta_poll_lock);
+  	if (!list_empty(&msta->poll_list))
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+index 2a7af97420c3,5cedefc41416..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+@@@ -43,10 -46,8 +43,15 @@@
+  #define MT7921_SKU_MAX_DELTA_IDX	MT7921_SKU_RATE_NUM
+  #define MT7921_SKU_TABLE_SIZE		(MT7921_SKU_RATE_NUM + 1)
+  
+++<<<<<<< HEAD
+ +#define MT7921_SCAN_IE_LEN		600
+ +#define MT7921_MAX_SCHED_SCAN_INTERVAL	10
+ +#define MT7921_MAX_SCHED_SCAN_SSID	10
+ +#define MT7921_MAX_SCAN_MATCH		16
+++=======
++ #define to_rssi(field, rxv)		((FIELD_GET(field, rxv) - 220) / 2)
++ #define to_rcpi(rssi)			(2 * (rssi) + 220)
+++>>>>>>> 93c81df520a1 (mt76: mt7921: properly configure rcpi adding a sta to the fw)
+  
+  struct mt7921_vif;
+  struct mt7921_sta;
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/mac.c b/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+index bcbd59a23f9b..a120588d6692 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+@@ -7,8 +7,6 @@
+ #include "../dma.h"
+ #include "mac.h"
+ 
+-#define to_rssi(field, rxv)	((FIELD_GET(field, rxv) - 220) / 2)
+-
+ #define HE_BITS(f)		cpu_to_le16(IEEE80211_RADIOTAP_HE_##f)
+ #define HE_PREP(f, m, v)	le16_encode_bits(le32_get_bits(v, MT_CRXV_HE_##m),\
+ 						 IEEE80211_RADIOTAP_HE_##f)
+@@ -275,6 +273,37 @@ mt7921_get_status_freq_info(struct mt7921_dev *dev, struct mt76_phy *mphy,
+ 	status->freq = ieee80211_channel_to_frequency(chfreq, status->band);
+ }
+ 
++static void
++mt7921_mac_rssi_iter(void *priv, u8 *mac, struct ieee80211_vif *vif)
++{
++	struct sk_buff *skb = priv;
++	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
++	struct ieee80211_hdr *hdr = mt76_skb_get_hdr(skb);
++
++	if (status->signal > 0)
++		return;
++
++	if (!ether_addr_equal(vif->addr, hdr->addr1))
++		return;
++
++	ewma_rssi_add(&mvif->rssi, -status->signal);
++}
++
++static void
++mt7921_mac_assoc_rssi(struct mt7921_dev *dev, struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = mt76_skb_get_hdr(skb);
++
++	if (!ieee80211_is_assoc_resp(hdr->frame_control) &&
++	    !ieee80211_is_auth(hdr->frame_control))
++		return;
++
++	ieee80211_iterate_active_interfaces_atomic(mt76_hw(dev),
++		IEEE80211_IFACE_ITER_RESUME_ALL,
++		mt7921_mac_rssi_iter, skb);
++}
++
+ int mt7921_mac_fill_rx(struct mt7921_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+@@ -512,6 +541,8 @@ int mt7921_mac_fill_rx(struct mt7921_dev *dev, struct sk_buff *skb)
+ 		mt76_insert_ccmp_hdr(skb, key_id);
+ 	}
+ 
++	mt7921_mac_assoc_rssi(dev, skb);
++
+ 	if (rxv && status->flag & RX_FLAG_RADIOTAP_HE)
+ 		mt7921_mac_decode_he_radiotap(skb, status, rxv, mode);
+ 
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/main.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
