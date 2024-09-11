@@ -104,9 +104,6 @@ __cvdso_clock_gettime32(clockid_t clock, struct old_timespec32 *res)
 	struct __kernel_timespec ts;
 	int ret;
 
-	if (res == NULL)
-		goto fallback;
-
 	ret = __cvdso_clock_gettime(clock, &ts);
 
 	if (ret == 0) {
@@ -115,9 +112,6 @@ __cvdso_clock_gettime32(clockid_t clock, struct old_timespec32 *res)
 	}
 
 	return ret;
-
-fallback:
-	return clock_gettime_fallback(clock, (struct __kernel_timespec *)res);
 }
 
 static __maybe_unused int
@@ -193,10 +187,8 @@ int __cvdso_clock_getres(clockid_t clock, struct __kernel_timespec *res)
 		goto fallback;
 	}
 
-	if (res) {
-		res->tv_sec = 0;
-		res->tv_nsec = ns;
-	}
+	res->tv_sec = 0;
+	res->tv_nsec = ns;
 
 	return 0;
 
@@ -210,9 +202,6 @@ __cvdso_clock_getres_time32(clockid_t clock, struct old_timespec32 *res)
 	struct __kernel_timespec ts;
 	int ret;
 
-	if (res == NULL)
-		goto fallback;
-
 	ret = __cvdso_clock_getres(clock, &ts);
 
 	if (ret == 0) {
@@ -221,8 +210,5 @@ __cvdso_clock_getres_time32(clockid_t clock, struct old_timespec32 *res)
 	}
 
 	return ret;
-
-fallback:
-	return clock_getres_fallback(clock, (struct __kernel_timespec *)res);
 }
 #endif /* VDSO_HAS_CLOCK_GETRES */
