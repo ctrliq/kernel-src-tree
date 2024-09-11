@@ -1,0 +1,173 @@
+RDMA/mlx5: Change mlx5_ib_populate_pas() to use rdma_for_each_block()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit aab8d3966d2c2aa6c59fbacdb17d82156653754f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/aab8d396.failed
+
+This routine converts the umem SGL into a list of fixed pages for DMA,
+which is exactly what rdma_umem_for_each_dma_block() is for, use the
+common code directly.
+
+Link: https://lore.kernel.org/r/20201026132314.1336717-2-leon@kernel.org
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit aab8d3966d2c2aa6c59fbacdb17d82156653754f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 52d81032598e,1cf57a921dac..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1186,7 -1167,10 +1186,14 @@@ static struct mlx5_ib_mr *reg_create(st
+  
+  	inlen = MLX5_ST_SZ_BYTES(create_mkey_in);
+  	if (populate)
+++<<<<<<< HEAD
+ +		inlen += sizeof(*pas) * roundup(npages, 2);
+++=======
++ 		inlen +=
++ 			sizeof(*pas) *
++ 			roundup(ib_umem_num_dma_blocks(umem, 1UL << page_shift),
++ 				2);
+++>>>>>>> aab8d3966d2c (RDMA/mlx5: Change mlx5_ib_populate_pas() to use rdma_for_each_block())
+  	in = kvzalloc(inlen, GFP_KERNEL);
+  	if (!in) {
+  		err = -ENOMEM;
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index 97c9edcdf214..aeb712ccc40e 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -760,7 +760,7 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 	}
+ 
+ 	pas = (__be64 *)MLX5_ADDR_OF(create_cq_in, *cqb, pas);
+-	mlx5_ib_populate_pas(dev, cq->buf.umem, page_shift, pas, 0);
++	mlx5_ib_populate_pas(cq->buf.umem, 1UL << page_shift, pas, 0);
+ 
+ 	cqc = MLX5_ADDR_OF(create_cq_in, *cqb, cq_context);
+ 	MLX5_SET(cqc, cqc, log_page_size,
+@@ -1304,8 +1304,8 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata)
+ 
+ 	pas = (__be64 *)MLX5_ADDR_OF(modify_cq_in, in, pas);
+ 	if (udata)
+-		mlx5_ib_populate_pas(dev, cq->resize_umem, page_shift,
+-				     pas, 0);
++		mlx5_ib_populate_pas(cq->resize_umem, 1UL << page_shift, pas,
++				     0);
+ 	else
+ 		mlx5_fill_page_frag_array(&cq->resize_buf->frag_buf, pas);
+ 
+diff --git a/drivers/infiniband/hw/mlx5/devx.c b/drivers/infiniband/hw/mlx5/devx.c
+index ed09a0921724..ddad198524f1 100644
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@ -2216,9 +2216,9 @@ static void devx_umem_reg_cmd_build(struct mlx5_ib_dev *dev,
+ 	MLX5_SET(umem, umem, log_page_size, obj->page_shift -
+ 					    MLX5_ADAPTER_PAGE_SHIFT);
+ 	MLX5_SET(umem, umem, page_offset, obj->page_offset);
+-	mlx5_ib_populate_pas(dev, obj->umem, obj->page_shift, mtt,
++	mlx5_ib_populate_pas(obj->umem, 1UL << obj->page_shift, mtt,
+ 			     (obj->umem->writable ? MLX5_IB_MTT_WRITE : 0) |
+-			     MLX5_IB_MTT_READ);
++				     MLX5_IB_MTT_READ);
+ }
+ 
+ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_UMEM_REG)(
+diff --git a/drivers/infiniband/hw/mlx5/mem.c b/drivers/infiniband/hw/mlx5/mem.c
+index 13de3d2edd34..576c4b550de1 100644
+--- a/drivers/infiniband/hw/mlx5/mem.c
++++ b/drivers/infiniband/hw/mlx5/mem.c
+@@ -165,13 +165,22 @@ void __mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+ 	}
+ }
+ 
+-void mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+-			  int page_shift, __be64 *pas, int access_flags)
++/*
++ * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
++ * filled in the pas array.
++ */
++void mlx5_ib_populate_pas(struct ib_umem *umem, size_t page_size, __be64 *pas,
++			  u64 access_flags)
+ {
+-	return __mlx5_ib_populate_pas(dev, umem, page_shift, 0,
+-				      ib_umem_num_dma_blocks(umem, PAGE_SIZE),
+-				      pas, access_flags);
++	struct ib_block_iter biter;
++
++	rdma_umem_for_each_dma_block (umem, &biter, page_size) {
++		*pas = cpu_to_be64(rdma_block_iter_dma_address(&biter) |
++				   access_flags);
++		pas++;
++	}
+ }
++
+ int mlx5_ib_get_buf_offset(u64 addr, int page_shift, u32 *offset)
+ {
+ 	u64 page_size;
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 5e47304abc75..6d7b17ab61a7 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -1239,8 +1239,8 @@ void mlx5_ib_cont_pages(struct ib_umem *umem, u64 addr,
+ void __mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+ 			    int page_shift, size_t offset, size_t num_pages,
+ 			    __be64 *pas, int access_flags);
+-void mlx5_ib_populate_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+-			  int page_shift, __be64 *pas, int access_flags);
++void mlx5_ib_populate_pas(struct ib_umem *umem, size_t page_size, __be64 *pas,
++			  u64 access_flags);
+ void mlx5_ib_copy_pas(u64 *old, u64 *new, int step, int num);
+ int mlx5_ib_get_cqe_size(struct ib_cq *ibcq);
+ int mlx5_mr_cache_init(struct mlx5_ib_dev *dev);
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 981aaf96640e..87d881652668 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -971,7 +971,7 @@ static int _create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 	MLX5_SET(create_qp_in, *in, uid, uid);
+ 	pas = (__be64 *)MLX5_ADDR_OF(create_qp_in, *in, pas);
+ 	if (ubuffer->umem)
+-		mlx5_ib_populate_pas(dev, ubuffer->umem, page_shift, pas, 0);
++		mlx5_ib_populate_pas(ubuffer->umem, 1UL << page_shift, pas, 0);
+ 
+ 	qpc = MLX5_ADDR_OF(create_qp_in, *in, qpc);
+ 
+@@ -1252,7 +1252,7 @@ static int create_raw_packet_qp_sq(struct mlx5_ib_dev *dev,
+ 	MLX5_SET(wq, wq, page_offset, offset);
+ 
+ 	pas = (__be64 *)MLX5_ADDR_OF(wq, wq, pas);
+-	mlx5_ib_populate_pas(dev, sq->ubuffer.umem, page_shift, pas, 0);
++	mlx5_ib_populate_pas(sq->ubuffer.umem, 1UL << page_shift, pas, 0);
+ 
+ 	err = mlx5_core_create_sq_tracked(dev, in, inlen, &sq->base.mqp);
+ 
+@@ -4900,7 +4900,7 @@ static int  create_rq(struct mlx5_ib_rwq *rwq, struct ib_pd *pd,
+ 		MLX5_SET(rqc, rqc, delay_drop_en, 1);
+ 	}
+ 	rq_pas0 = (__be64 *)MLX5_ADDR_OF(wq, wq, pas);
+-	mlx5_ib_populate_pas(dev, rwq->umem, rwq->page_shift, rq_pas0, 0);
++	mlx5_ib_populate_pas(rwq->umem, 1UL << rwq->page_shift, rq_pas0, 0);
+ 	err = mlx5_core_create_rq_tracked(dev, in, inlen, &rwq->core_qp);
+ 	if (!err && init_attr->create_flags & IB_WQ_FLAGS_DELAY_DROP) {
+ 		err = set_delay_drop(dev);
+diff --git a/drivers/infiniband/hw/mlx5/srq.c b/drivers/infiniband/hw/mlx5/srq.c
+index 39086f3cf4b4..88f1756c5607 100644
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@ -102,7 +102,7 @@ static int create_srq_user(struct ib_pd *pd, struct mlx5_ib_srq *srq,
+ 		goto err_umem;
+ 	}
+ 
+-	mlx5_ib_populate_pas(dev, srq->umem, page_shift, in->pas, 0);
++	mlx5_ib_populate_pas(srq->umem, 1UL << page_shift, in->pas, 0);
+ 
+ 	err = mlx5_ib_db_map_user(ucontext, udata, ucmd.db_addr, &srq->db);
+ 	if (err) {
