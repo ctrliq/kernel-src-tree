@@ -369,10 +369,6 @@ static struct rpc_clnt * rpc_new_client(const struct rpc_create_args *args,
 	const char *nodename = args->nodename;
 	int err;
 
-	/* sanity check the name before trying to print it */
-	dprintk("RPC:       creating %s client for %s (xprt %p)\n",
-			program->name, args->servername, xprt);
-
 	err = rpciod_up();
 	if (err)
 		goto out_no_rpciod;
@@ -435,6 +431,8 @@ static struct rpc_clnt * rpc_new_client(const struct rpc_create_args *args,
 		goto out_no_path;
 	if (parent)
 		atomic_inc(&parent->cl_count);
+
+	trace_rpc_clnt_new(clnt, xprt, program->name, args->servername);
 	return clnt;
 
 out_no_path:
@@ -449,6 +447,7 @@ out_err:
 out_no_rpciod:
 	xprt_switch_put(xps);
 	xprt_put(xprt);
+	trace_rpc_clnt_new_err(program->name, args->servername, err);
 	return ERR_PTR(err);
 }
 
@@ -633,10 +632,8 @@ static struct rpc_clnt *__rpc_clone_client(struct rpc_create_args *args,
 	args->nodename = clnt->cl_nodename;
 
 	new = rpc_new_client(args, xps, xprt, clnt);
-	if (IS_ERR(new)) {
-		err = PTR_ERR(new);
-		goto out_err;
-	}
+	if (IS_ERR(new))
+		return new;
 
 	/* Turn off autobind on clones */
 	new->cl_autobind = 0;
@@ -649,7 +646,7 @@ static struct rpc_clnt *__rpc_clone_client(struct rpc_create_args *args,
 	return new;
 
 out_err:
-	dprintk("RPC:       %s: returned error %d\n", __func__, err);
+	trace_rpc_clnt_clone_err(clnt, err);
 	return ERR_PTR(err);
 }
 
@@ -722,11 +719,8 @@ int rpc_switch_client_transport(struct rpc_clnt *clnt,
 	int err;
 
 	xprt = xprt_create_transport(args);
-	if (IS_ERR(xprt)) {
-		dprintk("RPC:       failed to create new xprt for clnt %p\n",
-			clnt);
+	if (IS_ERR(xprt))
 		return PTR_ERR(xprt);
-	}
 
 	xps = xprt_switch_alloc(xprt, GFP_KERNEL);
 	if (xps == NULL) {
@@ -766,7 +760,7 @@ int rpc_switch_client_transport(struct rpc_clnt *clnt,
 		rpc_release_client(parent);
 	xprt_switch_put(oldxps);
 	xprt_put(old);
-	dprintk("RPC:       replaced xprt for clnt %p\n", clnt);
+	trace_rpc_clnt_replace_xprt(clnt);
 	return 0;
 
 out_revert:
@@ -776,7 +770,7 @@ out_revert:
 	rpc_client_register(clnt, pseudoflavor, NULL);
 	xprt_switch_put(xps);
 	xprt_put(xprt);
-	dprintk("RPC:       failed to switch xprt for clnt %p\n", clnt);
+	trace_rpc_clnt_replace_xprt_err(clnt);
 	return err;
 }
 EXPORT_SYMBOL_GPL(rpc_switch_client_transport);
@@ -843,10 +837,11 @@ void rpc_killall_tasks(struct rpc_clnt *clnt)
 
 	if (list_empty(&clnt->cl_tasks))
 		return;
-	dprintk("RPC:       killing all tasks for client %p\n", clnt);
+
 	/*
 	 * Spin lock all_tasks to prevent changes...
 	 */
+	trace_rpc_clnt_killall(clnt);
 	spin_lock(&clnt->cl_lock);
 	list_for_each_entry(rovr, &clnt->cl_tasks, tk_task)
 		rpc_signal_task(rovr);
@@ -862,9 +857,7 @@ void rpc_shutdown_client(struct rpc_clnt *clnt)
 {
 	might_sleep();
 
-	dprintk_rcu("RPC:       shutting down %s client for %s\n",
-			clnt->cl_program->name,
-			rcu_dereference(clnt->cl_xprt)->servername);
+	trace_rpc_clnt_shutdown(clnt);
 
 	while (!list_empty(&clnt->cl_tasks)) {
 		rpc_killall_tasks(clnt);
@@ -883,6 +876,8 @@ static void rpc_free_client_work(struct work_struct *work)
 {
 	struct rpc_clnt *clnt = container_of(work, struct rpc_clnt, cl_work);
 
+	trace_rpc_clnt_free(clnt);
+
 	/* These might block on processes that might allocate memory,
 	 * so they cannot be called in rpciod, so they are handled separately
 	 * here.
@@ -900,9 +895,7 @@ rpc_free_client(struct rpc_clnt *clnt)
 {
 	struct rpc_clnt *parent = NULL;
 
-	dprintk_rcu("RPC:       destroying %s client for %s\n",
-			clnt->cl_program->name,
-			rcu_dereference(clnt->cl_xprt)->servername);
+	trace_rpc_clnt_release(clnt);
 	if (clnt->cl_parent != clnt)
 		parent = clnt->cl_parent;
 	rpc_unregister_client(clnt);
@@ -944,8 +937,6 @@ rpc_free_auth(struct rpc_clnt *clnt)
 void
 rpc_release_client(struct rpc_clnt *clnt)
 {
-	dprintk("RPC:       rpc_release_client(%p)\n", clnt);
-
 	do {
 		if (list_empty(&clnt->cl_tasks))
 			wake_up(&destroy_wait);
