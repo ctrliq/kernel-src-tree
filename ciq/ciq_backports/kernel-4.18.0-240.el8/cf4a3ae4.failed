@@ -1,0 +1,184 @@
+fbdev: lock_fb_info cannot fail
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit cf4a3ae4ef3399179166a464af1d6b172225bef4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cf4a3ae4.failed
+
+Ever since
+
+commit c47747fde931c02455683bd00ea43eaa62f35b0e
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Wed May 11 14:58:34 2011 -0700
+
+    fbmem: make read/write/ioctl use the frame buffer at open time
+
+fbdev has gained proper refcounting for the fbinfo attached to any
+open files, which means that the backing driver (stored in
+fb_info->fbops) cannot untimely disappear anymore.
+
+The only thing that can happen is that the entire device just outright
+disappears and gets unregistered, but file_fb_info does check for
+that. Except that it's racy - it only checks once at the start of a
+file_ops, there's no guarantee that the underlying fbdev won't
+untimely disappear. Aside: A proper way to fix that race is probably
+to replicate the srcu trickery we've rolled out in drm.
+
+But given that this race has existed since forever it's probably not
+one we need to fix right away. do_unregister_framebuffer also nowhere
+clears fb_info->fbops, hence the check in lock_fb_info can't possible
+catch a disappearing fbdev later on.
+
+Long story short: Ever since the above commit the fb_info->fbops
+checks have essentially become dead code. Remove this all.
+
+Aside from the file_ops callbacks, and stuff called from there
+there's only register/unregister code left. If that goes wrong a driver
+managed to register/unregister a device instance twice or in the wrong
+order.  That's just a driver bug.
+
+v2:
+- fb_mmap had an open-coded version of the fbinfo->fops check, because
+  it doesn't need the fbinfo->lock. Delete that too.
+- Use the wrapper function in fb_open/release now, since no difference
+  anymore.
+
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Reviewed-by: Sam Ravnborg <sam@ravnborg.org>
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Cc: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Hans de Goede <hdegoede@redhat.com>
+	Cc: Yisheng Xie <ysxie@foxmail.com>
+	Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Cc: "Noralf Trønnes" <noralf@tronnes.org>
+	Cc: Peter Rosin <peda@axentia.se>
+	Cc: "Michał Mirosław" <mirq-linux@rere.qmqm.pl>
+	Cc: Mikulas Patocka <mpatocka@redhat.com>
+	Cc: "Gustavo A. R. Silva" <gustavo@embeddedor.com>
+	Cc: linux-fbdev@vger.kernel.org
+Link: https://patchwork.freedesktop.org/patch/msgid/20190528090304.9388-17-daniel.vetter@ffwll.ch
+(cherry picked from commit cf4a3ae4ef3399179166a464af1d6b172225bef4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbmem.c
+#	include/linux/fb.h
+diff --cc drivers/video/fbdev/core/fbmem.c
+index 6ab151c45d19,d73762324ca2..000000000000
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@@ -1693,28 -1691,35 +1662,37 @@@ static int do_register_framebuffer(stru
+  	fb_add_videomode(&mode, &fb_info->modelist);
+  	registered_fb[i] = fb_info;
+  
+ -#ifdef CONFIG_GUMSTIX_AM200EPD
+ -	{
+ -		struct fb_event event;
+ -		event.info = fb_info;
+ -		fb_notifier_call_chain(FB_EVENT_FB_REGISTERED, &event);
+ -	}
+ -#endif
+ -
+ +	event.info = fb_info;
+  	if (!lockless_register_fb)
+  		console_lock();
+++<<<<<<< HEAD
+ +	if (!lock_fb_info(fb_info)) {
+ +		if (!lockless_register_fb)
+ +			console_unlock();
+ +		return -ENODEV;
+ +	}
+ +
+ +	fb_notifier_call_chain(FB_EVENT_FB_REGISTERED, &event);
+ +	unlock_fb_info(fb_info);
+++=======
++ 	else
++ 		atomic_inc(&ignore_console_lock_warning);
++ 	lock_fb_info(fb_info);
++ 	ret = fbcon_fb_registered(fb_info);
++ 	unlock_fb_info(fb_info);
++ 
+++>>>>>>> cf4a3ae4ef33 (fbdev: lock_fb_info cannot fail)
+  	if (!lockless_register_fb)
+  		console_unlock();
+ -	else
+ -		atomic_dec(&ignore_console_lock_warning);
+ -	return ret;
+ +	return 0;
+  }
+  
+ -static int unbind_console(struct fb_info *fb_info)
+ +static int do_unregister_framebuffer(struct fb_info *fb_info)
+  {
+  	struct fb_event event;
+ -	int ret;
+ -	int i = fb_info->node;
+ +	int i, ret = 0;
+  
+ +	i = fb_info->node;
+  	if (i < 0 || i >= FB_MAX || registered_fb[i] != fb_info)
+  		return -EINVAL;
+  
+diff --cc include/linux/fb.h
+index 04cb0fcc9db4,aa8f18163151..000000000000
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@@ -653,9 -656,17 +653,20 @@@ extern int fb_new_modelist(struct fb_in
+  
+  extern struct fb_info *registered_fb[FB_MAX];
+  extern int num_registered_fb;
+ -extern bool fb_center_logo;
+  extern struct class *fb_class;
+  
+++<<<<<<< HEAD
+ +extern int lock_fb_info(struct fb_info *info);
+++=======
++ #define for_each_registered_fb(i)		\
++ 	for (i = 0; i < FB_MAX; i++)		\
++ 		if (!registered_fb[i]) {} else
++ 
++ static inline void lock_fb_info(struct fb_info *info)
++ {
++ 	mutex_lock(&info->lock);
++ }
+++>>>>>>> cf4a3ae4ef33 (fbdev: lock_fb_info cannot fail)
+  
+  static inline void unlock_fb_info(struct fb_info *info)
+  {
+diff --git a/drivers/video/fbdev/core/fbcmap.c b/drivers/video/fbdev/core/fbcmap.c
+index 2811c4afde01..e5ae33c1a8e8 100644
+--- a/drivers/video/fbdev/core/fbcmap.c
++++ b/drivers/video/fbdev/core/fbcmap.c
+@@ -285,11 +285,7 @@ int fb_set_user_cmap(struct fb_cmap_user *cmap, struct fb_info *info)
+ 		goto out;
+ 	}
+ 	umap.start = cmap->start;
+-	if (!lock_fb_info(info)) {
+-		rc = -ENODEV;
+-		goto out;
+-	}
+-
++	lock_fb_info(info);
+ 	rc = fb_set_cmap(&umap, info);
+ 	unlock_fb_info(info);
+ out:
+diff --git a/drivers/video/fbdev/core/fbcon.c b/drivers/video/fbdev/core/fbcon.c
+index 6235851b0dfc..3b26536bb712 100644
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@ -2341,8 +2341,7 @@ static void fbcon_generic_blank(struct vc_data *vc, struct fb_info *info,
+ 	}
+ 
+ 
+-	if (!lock_fb_info(info))
+-		return;
++	lock_fb_info(info);
+ 	event.info = info;
+ 	event.data = &blank;
+ 	fb_notifier_call_chain(FB_EVENT_CONBLANK, &event);
+* Unmerged path drivers/video/fbdev/core/fbmem.c
+* Unmerged path include/linux/fb.h
