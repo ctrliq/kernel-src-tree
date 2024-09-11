@@ -1,0 +1,192 @@
+s390/zcrypt: Support CPRB minor version T7
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 383366b58016361cc8a2e4c585b7d581eb76263a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/383366b5.failed
+
+There is a new CPRB minor version T7 to be supported with
+this patch. Together with this the functions which extract
+the CPRB data from userspace and prepare the AP message do
+now check the CPRB minor version and provide some info in
+the flag field of the ap message struct for further processing.
+
+The 3 functions doing this job have been renamed to
+prep_cca_ap_msg, prep_ep11_ap_msg and prep_rng_ap_msg to
+reflect their job better (old was get..fc).
+
+This patch also introduces two new flags to be used internal
+with the flag field of the struct ap_message:
+
+AP_MSG_FLAG_USAGE is set when prep_cca_ap_msg or prep_ep11_ap_msg
+come to the conclusion that this is a ordinary crypto load CPRB
+(which means T2 for CCA CPRBs and no admin bit for EP11 CPRBs).
+
+AP_MSG_FLAG_ADMIN is set when prep_cca_ap_msg or prep_ep11_ap_msg
+think, this is an administrative (control) crypto load CPRB
+(which means T3, T5, T6 or T7 for CCA CPRBs and admin bit set
+for EP11 CPRBs).
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Reviewed-by: Jürgen Christ <jchrist@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 383366b58016361cc8a2e4c585b7d581eb76263a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/zcrypt_msgtype6.c
+diff --cc drivers/s390/crypto/zcrypt_msgtype6.c
+index ac841d50e557,98755b57104f..000000000000
+--- a/drivers/s390/crypto/zcrypt_msgtype6.c
++++ b/drivers/s390/crypto/zcrypt_msgtype6.c
+@@@ -1130,10 -1154,12 +1154,19 @@@ out_free
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * Fetch function code from cprb.
+ + * Extracting the fc requires to copy the cprb from userspace.
+ + * So this function allocates memory and needs an ap_msg prepared
+++=======
++ /*
++  * Prepare a CCA AP msg request.
++  * Prepare a CCA AP msg: fetch the required data from userspace,
++  * prepare the AP msg, fill some info into the ap_message struct,
++  * extract some data from the CPRB and give back to the caller.
++  * This function allocates memory and needs an ap_msg prepared
+++>>>>>>> 383366b58016 (s390/zcrypt: Support CPRB minor version T7)
+   * by the caller with ap_init_message(). Also the caller has to
+   * make sure ap_release_message() is always called even on failure.
+   */
+@@@ -1192,10 -1218,12 +1225,19 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * Fetch function code from ep11 cprb.
+ + * Extracting the fc requires to copy the ep11 cprb from userspace.
+ + * So this function allocates memory and needs an ap_msg prepared
+++=======
++ /*
++  * Prepare an EP11 AP msg request.
++  * Prepare an EP11 AP msg: fetch the required data from userspace,
++  * prepare the AP msg, fill some info into the ap_message struct,
++  * extract some data from the CPRB and give back to the caller.
++  * This function allocates memory and needs an ap_msg prepared
+++>>>>>>> 383366b58016 (s390/zcrypt: Support CPRB minor version T7)
+   * by the caller with ap_init_message(). Also the caller has to
+   * make sure ap_release_message() is always called even on failure.
+   */
+diff --git a/drivers/s390/crypto/ap_bus.h b/drivers/s390/crypto/ap_bus.h
+index 5ee06be1d3b0..5554fee187a0 100644
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -246,7 +246,9 @@ struct ap_message {
+ 			struct ap_message *);
+ };
+ 
+-#define AP_MSG_FLAG_SPECIAL  1		/* flag msg as 'special' with NQAP */
++#define AP_MSG_FLAG_SPECIAL  0x0001	/* flag msg as 'special' with NQAP */
++#define AP_MSG_FLAG_USAGE    0x0002	/* CCA, EP11: usage (no admin) msg */
++#define AP_MSG_FLAG_ADMIN    0x0004	/* CCA, EP11: admin (=control) msg */
+ 
+ /**
+  * ap_init_message() - Initialize ap_message.
+diff --git a/drivers/s390/crypto/zcrypt_api.c b/drivers/s390/crypto/zcrypt_api.c
+index 41beb6a25160..7de0085f14b1 100644
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@ -879,7 +879,7 @@ static long _zcrypt_send_cprb(bool userspace, struct ap_perms *perms,
+ 	}
+ #endif
+ 
+-	rc = get_cprb_fc(userspace, xcRB, &ap_msg, &func_code, &domain);
++	rc = prep_cca_ap_msg(userspace, xcRB, &ap_msg, &func_code, &domain);
+ 	if (rc)
+ 		goto out;
+ 
+@@ -1063,7 +1063,7 @@ static long _zcrypt_send_ep11_cprb(bool userspace, struct ap_perms *perms,
+ 		}
+ 	}
+ 
+-	rc = get_ep11cprb_fc(userspace, xcrb, &ap_msg, &func_code);
++	rc = prep_ep11_ap_msg(userspace, xcrb, &ap_msg, &func_code);
+ 	if (rc)
+ 		goto out_free;
+ 
+@@ -1177,7 +1177,7 @@ static long zcrypt_rng(char *buffer)
+ 	trace_s390_zcrypt_req(buffer, TP_HWRNGCPRB);
+ 
+ 	ap_init_message(&ap_msg);
+-	rc = get_rng_fc(&ap_msg, &func_code, &domain);
++	rc = prep_rng_ap_msg(&ap_msg, &func_code, &domain);
+ 	if (rc)
+ 		goto out;
+ 
+diff --git a/drivers/s390/crypto/zcrypt_msgtype50.c b/drivers/s390/crypto/zcrypt_msgtype50.c
+index 19c3b84c49dd..1ab6fc4be8cc 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype50.c
++++ b/drivers/s390/crypto/zcrypt_msgtype50.c
+@@ -156,7 +156,7 @@ struct type80_hdr {
+ 	unsigned char	reserved3[8];
+ } __packed;
+ 
+-unsigned int get_rsa_modex_fc(struct ica_rsa_modexpo *mex, int *fcode)
++int get_rsa_modex_fc(struct ica_rsa_modexpo *mex, int *fcode)
+ {
+ 
+ 	if (!mex->inputdatalength)
+@@ -172,7 +172,7 @@ unsigned int get_rsa_modex_fc(struct ica_rsa_modexpo *mex, int *fcode)
+ 	return 0;
+ }
+ 
+-unsigned int get_rsa_crt_fc(struct ica_rsa_modexpo_crt *crt, int *fcode)
++int get_rsa_crt_fc(struct ica_rsa_modexpo_crt *crt, int *fcode)
+ {
+ 
+ 	if (!crt->inputdatalength)
+diff --git a/drivers/s390/crypto/zcrypt_msgtype50.h b/drivers/s390/crypto/zcrypt_msgtype50.h
+index 66bec4f45c56..eb49f06bed29 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype50.h
++++ b/drivers/s390/crypto/zcrypt_msgtype50.h
+@@ -20,8 +20,8 @@
+ 
+ #define MSGTYPE_ADJUSTMENT 0x08  /* type04 extension (not needed in type50) */
+ 
+-unsigned int get_rsa_modex_fc(struct ica_rsa_modexpo *, int *);
+-unsigned int get_rsa_crt_fc(struct ica_rsa_modexpo_crt *, int *);
++int get_rsa_modex_fc(struct ica_rsa_modexpo *mex, int *fc);
++int get_rsa_crt_fc(struct ica_rsa_modexpo_crt *crt, int *fc);
+ 
+ void zcrypt_msgtype50_init(void);
+ void zcrypt_msgtype50_exit(void);
+* Unmerged path drivers/s390/crypto/zcrypt_msgtype6.c
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.h b/drivers/s390/crypto/zcrypt_msgtype6.h
+index 155c73514bac..ec960d01cca0 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.h
++++ b/drivers/s390/crypto/zcrypt_msgtype6.h
+@@ -94,11 +94,14 @@ struct type86_fmt2_ext {
+ 	unsigned int	  offset4;	/* 0x00000000			*/
+ } __packed;
+ 
+-unsigned int get_cprb_fc(bool userspace, struct ica_xcRB *, struct ap_message *,
+-			 unsigned int *, unsigned short **);
+-unsigned int get_ep11cprb_fc(bool userspace, struct ep11_urb *, struct ap_message *,
+-			     unsigned int *);
+-unsigned int get_rng_fc(struct ap_message *, int *, unsigned int *);
++int prep_cca_ap_msg(bool userspace, struct ica_xcRB *xcrb,
++		    struct ap_message *ap_msg,
++		    unsigned int *fc, unsigned short **dom);
++int prep_ep11_ap_msg(bool userspace, struct ep11_urb *xcrb,
++		     struct ap_message *ap_msg,
++		     unsigned int *fc);
++int prep_rng_ap_msg(struct ap_message *ap_msg,
++		    int *fc, unsigned int *dom);
+ 
+ #define LOW	10
+ #define MEDIUM	100
