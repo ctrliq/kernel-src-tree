@@ -1,0 +1,453 @@
+powerpc/smp: Implement cpu_to_coregroup_id
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+commit fa35e868f9ddcbb7984fd5ab7f91aef924fa8543
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fa35e868.failed
+
+Lookup the coregroup id from the associativity array.
+
+If unable to detect the coregroup id, fallback on the core id.
+This way, ensure sched_domain degenerates and an extra sched domain is
+not created.
+
+Ideally this function should have been implemented in
+arch/powerpc/kernel/smp.c. However if its implemented in mm/numa.c, we
+don't need to find the primary domain again.
+
+If the device-tree mentions more than one coregroup, then kernel
+implements only the last or the smallest coregroup, which currently
+corresponds to the penultimate domain in the device-tree.
+
+	Signed-off-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Reviewed-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200810071834.92514-11-srikar@linux.vnet.ibm.com
+(cherry picked from commit fa35e868f9ddcbb7984fd5ab7f91aef924fa8543)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/numa.c
+diff --cc arch/powerpc/mm/numa.c
+index 521195e99be3,b725fb66e913..000000000000
+--- a/arch/powerpc/mm/numa.c
++++ b/arch/powerpc/mm/numa.c
+@@@ -1271,389 -1245,33 +1271,413 @@@ int find_and_online_cpu_nid(int cpu
+  	return new_nid;
+  }
+  
+ -int cpu_to_coregroup_id(int cpu)
+ +/*
+ + * Update the CPU maps and sysfs entries for a single CPU when its NUMA
+ + * characteristics change. This function doesn't perform any locking and is
+ + * only safe to call from stop_machine().
+ + */
+ +static int update_cpu_topology(void *data)
+  {
+++<<<<<<< HEAD
+ +	struct topology_update_data *update;
+ +	unsigned long cpu;
+ +
+ +	if (!data)
+ +		return -EINVAL;
+ +
+ +	cpu = smp_processor_id();
+ +
+ +	for (update = data; update; update = update->next) {
+ +		int new_nid = update->new_nid;
+ +		if (cpu != update->cpu)
+ +			continue;
+ +
+ +		unmap_cpu_from_node(cpu);
+ +		map_cpu_to_node(cpu, new_nid);
+ +		set_cpu_numa_node(cpu, new_nid);
+ +		set_cpu_numa_mem(cpu, local_memory_node(new_nid));
+ +		vdso_getcpu_init();
+ +	}
+ +
+ +	return 0;
+++=======
++ 	__be32 associativity[VPHN_ASSOC_BUFSIZE] = {0};
++ 	int index;
++ 
++ 	if (cpu < 0 || cpu > nr_cpu_ids)
++ 		return -1;
++ 
++ 	if (!coregroup_enabled)
++ 		goto out;
++ 
++ 	if (!firmware_has_feature(FW_FEATURE_VPHN))
++ 		goto out;
++ 
++ 	if (vphn_get_associativity(cpu, associativity))
++ 		goto out;
++ 
++ 	index = of_read_number(associativity, 1);
++ 	if (index > min_common_depth + 1)
++ 		return of_read_number(&associativity[index - 1], 1);
++ 
++ out:
++ 	return cpu_to_core_id(cpu);
+++>>>>>>> fa35e868f9dd (powerpc/smp: Implement cpu_to_coregroup_id)
+ +}
+ +
+ +static int update_lookup_table(void *data)
+ +{
+ +	struct topology_update_data *update;
+ +
+ +	if (!data)
+ +		return -EINVAL;
+ +
+ +	/*
+ +	 * Upon topology update, the numa-cpu lookup table needs to be updated
+ +	 * for all threads in the core, including offline CPUs, to ensure that
+ +	 * future hotplug operations respect the cpu-to-node associativity
+ +	 * properly.
+ +	 */
+ +	for (update = data; update; update = update->next) {
+ +		int nid, base, j;
+ +
+ +		nid = update->new_nid;
+ +		base = cpu_first_thread_sibling(update->cpu);
+ +
+ +		for (j = 0; j < threads_per_core; j++) {
+ +			update_numa_cpu_lookup_table(base + j, nid);
+ +		}
+ +	}
+ +
+ +	return 0;
+  }
+  
+ +/*
+ + * Update the node maps and sysfs entries for each cpu whose home node
+ + * has changed. Returns 1 when the topology has changed, and 0 otherwise.
+ + *
+ + * cpus_locked says whether we already hold cpu_hotplug_lock.
+ + */
+ +int numa_update_cpu_topology(bool cpus_locked)
+ +{
+ +	unsigned int cpu, sibling, changed = 0;
+ +	struct topology_update_data *updates, *ud;
+ +	cpumask_t updated_cpus;
+ +	struct device *dev;
+ +	int weight, new_nid, i = 0;
+ +
+ +	if (!prrn_enabled && !vphn_enabled && topology_inited)
+ +		return 0;
+ +
+ +	weight = cpumask_weight(&cpu_associativity_changes_mask);
+ +	if (!weight)
+ +		return 0;
+ +
+ +	updates = kcalloc(weight, sizeof(*updates), GFP_KERNEL);
+ +	if (!updates)
+ +		return 0;
+ +
+ +	cpumask_clear(&updated_cpus);
+ +
+ +	for_each_cpu(cpu, &cpu_associativity_changes_mask) {
+ +		/*
+ +		 * If siblings aren't flagged for changes, updates list
+ +		 * will be too short. Skip on this update and set for next
+ +		 * update.
+ +		 */
+ +		if (!cpumask_subset(cpu_sibling_mask(cpu),
+ +					&cpu_associativity_changes_mask)) {
+ +			pr_info("Sibling bits not set for associativity "
+ +					"change, cpu%d\n", cpu);
+ +			cpumask_or(&cpu_associativity_changes_mask,
+ +					&cpu_associativity_changes_mask,
+ +					cpu_sibling_mask(cpu));
+ +			cpu = cpu_last_thread_sibling(cpu);
+ +			continue;
+ +		}
+ +
+ +		new_nid = find_and_online_cpu_nid(cpu);
+ +
+ +		if (new_nid == numa_cpu_lookup_table[cpu]) {
+ +			cpumask_andnot(&cpu_associativity_changes_mask,
+ +					&cpu_associativity_changes_mask,
+ +					cpu_sibling_mask(cpu));
+ +			dbg("Assoc chg gives same node %d for cpu%d\n",
+ +					new_nid, cpu);
+ +			cpu = cpu_last_thread_sibling(cpu);
+ +			continue;
+ +		}
+ +
+ +		for_each_cpu(sibling, cpu_sibling_mask(cpu)) {
+ +			ud = &updates[i++];
+ +			ud->next = &updates[i];
+ +			ud->cpu = sibling;
+ +			ud->new_nid = new_nid;
+ +			ud->old_nid = numa_cpu_lookup_table[sibling];
+ +			cpumask_set_cpu(sibling, &updated_cpus);
+ +		}
+ +		cpu = cpu_last_thread_sibling(cpu);
+ +	}
+ +
+ +	/*
+ +	 * Prevent processing of 'updates' from overflowing array
+ +	 * where last entry filled in a 'next' pointer.
+ +	 */
+ +	if (i)
+ +		updates[i-1].next = NULL;
+ +
+ +	pr_debug("Topology update for the following CPUs:\n");
+ +	if (cpumask_weight(&updated_cpus)) {
+ +		for (ud = &updates[0]; ud; ud = ud->next) {
+ +			pr_debug("cpu %d moving from node %d "
+ +					  "to %d\n", ud->cpu,
+ +					  ud->old_nid, ud->new_nid);
+ +		}
+ +	}
+ +
+ +	/*
+ +	 * In cases where we have nothing to update (because the updates list
+ +	 * is too short or because the new topology is same as the old one),
+ +	 * skip invoking update_cpu_topology() via stop-machine(). This is
+ +	 * necessary (and not just a fast-path optimization) since stop-machine
+ +	 * can end up electing a random CPU to run update_cpu_topology(), and
+ +	 * thus trick us into setting up incorrect cpu-node mappings (since
+ +	 * 'updates' is kzalloc()'ed).
+ +	 *
+ +	 * And for the similar reason, we will skip all the following updating.
+ +	 */
+ +	if (!cpumask_weight(&updated_cpus))
+ +		goto out;
+ +
+ +	if (cpus_locked)
+ +		stop_machine_cpuslocked(update_cpu_topology, &updates[0],
+ +					&updated_cpus);
+ +	else
+ +		stop_machine(update_cpu_topology, &updates[0], &updated_cpus);
+ +
+ +	/*
+ +	 * Update the numa-cpu lookup table with the new mappings, even for
+ +	 * offline CPUs. It is best to perform this update from the stop-
+ +	 * machine context.
+ +	 */
+ +	if (cpus_locked)
+ +		stop_machine_cpuslocked(update_lookup_table, &updates[0],
+ +					cpumask_of(raw_smp_processor_id()));
+ +	else
+ +		stop_machine(update_lookup_table, &updates[0],
+ +			     cpumask_of(raw_smp_processor_id()));
+ +
+ +	for (ud = &updates[0]; ud; ud = ud->next) {
+ +		unregister_cpu_under_node(ud->cpu, ud->old_nid);
+ +		register_cpu_under_node(ud->cpu, ud->new_nid);
+ +
+ +		dev = get_cpu_device(ud->cpu);
+ +		if (dev)
+ +			kobject_uevent(&dev->kobj, KOBJ_CHANGE);
+ +		cpumask_clear_cpu(ud->cpu, &cpu_associativity_changes_mask);
+ +		changed = 1;
+ +	}
+ +
+ +out:
+ +	kfree(updates);
+ +	return changed;
+ +}
+ +
+ +int arch_update_cpu_topology(void)
+ +{
+ +	return numa_update_cpu_topology(true);
+ +}
+ +
+ +static void topology_work_fn(struct work_struct *work)
+ +{
+ +	rebuild_sched_domains();
+ +}
+ +static DECLARE_WORK(topology_work, topology_work_fn);
+ +
+ +static void topology_schedule_update(void)
+ +{
+ +	schedule_work(&topology_work);
+ +}
+ +
+ +static void topology_timer_fn(struct timer_list *unused)
+ +{
+ +	if (prrn_enabled && cpumask_weight(&cpu_associativity_changes_mask))
+ +		topology_schedule_update();
+ +	else if (vphn_enabled) {
+ +		if (update_cpu_associativity_changes_mask() > 0)
+ +			topology_schedule_update();
+ +		reset_topology_timer();
+ +	}
+ +}
+ +static struct timer_list topology_timer;
+ +
+ +static void reset_topology_timer(void)
+ +{
+ +	if (vphn_enabled)
+ +		mod_timer(&topology_timer, jiffies + topology_timer_secs * HZ);
+ +}
+ +
+ +#ifdef CONFIG_SMP
+ +
+ +static int dt_update_callback(struct notifier_block *nb,
+ +				unsigned long action, void *data)
+ +{
+ +	struct of_reconfig_data *update = data;
+ +	int rc = NOTIFY_DONE;
+ +
+ +	switch (action) {
+ +	case OF_RECONFIG_UPDATE_PROPERTY:
+ +		if (!of_prop_cmp(update->dn->type, "cpu") &&
+ +		    !of_prop_cmp(update->prop->name, "ibm,associativity")) {
+ +			u32 core_id;
+ +			of_property_read_u32(update->dn, "reg", &core_id);
+ +			rc = dlpar_cpu_readd(core_id);
+ +			rc = NOTIFY_OK;
+ +		}
+ +		break;
+ +	}
+ +
+ +	return rc;
+ +}
+ +
+ +static struct notifier_block dt_update_nb = {
+ +	.notifier_call = dt_update_callback,
+ +};
+ +
+ +#endif
+ +
+ +/*
+ + * Start polling for associativity changes.
+ + */
+ +int start_topology_update(void)
+ +{
+ +	int rc = 0;
+ +
+ +	if (!topology_updates_enabled)
+ +		return 0;
+ +
+ +	if (firmware_has_feature(FW_FEATURE_PRRN)) {
+ +		if (!prrn_enabled) {
+ +			prrn_enabled = 1;
+ +#ifdef CONFIG_SMP
+ +			rc = of_reconfig_notifier_register(&dt_update_nb);
+ +#endif
+ +		}
+ +	}
+ +	if (firmware_has_feature(FW_FEATURE_VPHN) &&
+ +		   lppaca_shared_proc(get_lppaca())) {
+ +		if (!vphn_enabled) {
+ +			vphn_enabled = 1;
+ +			setup_cpu_associativity_change_counters();
+ +			timer_setup(&topology_timer, topology_timer_fn,
+ +				    TIMER_DEFERRABLE);
+ +			reset_topology_timer();
+ +		}
+ +	}
+ +
+ +	pr_info("Starting topology update%s%s\n",
+ +		(prrn_enabled ? " prrn_enabled" : ""),
+ +		(vphn_enabled ? " vphn_enabled" : ""));
+ +
+ +	return rc;
+ +}
+ +
+ +/*
+ + * Disable polling for VPHN associativity changes.
+ + */
+ +int stop_topology_update(void)
+ +{
+ +	int rc = 0;
+ +
+ +	if (!topology_updates_enabled)
+ +		return 0;
+ +
+ +	if (prrn_enabled) {
+ +		prrn_enabled = 0;
+ +#ifdef CONFIG_SMP
+ +		rc = of_reconfig_notifier_unregister(&dt_update_nb);
+ +#endif
+ +	}
+ +	if (vphn_enabled) {
+ +		vphn_enabled = 0;
+ +		rc = del_timer_sync(&topology_timer);
+ +	}
+ +
+ +	pr_info("Stopping topology update\n");
+ +
+ +	return rc;
+ +}
+ +
+ +int prrn_is_enabled(void)
+ +{
+ +	return prrn_enabled;
+ +}
+ +
+ +void __init shared_proc_topology_init(void)
+ +{
+ +	if (lppaca_shared_proc(get_lppaca())) {
+ +		bitmap_fill(cpumask_bits(&cpu_associativity_changes_mask),
+ +			    nr_cpumask_bits);
+ +		numa_update_cpu_topology(false);
+ +	}
+ +}
+ +
+ +static int topology_read(struct seq_file *file, void *v)
+ +{
+ +	if (vphn_enabled || prrn_enabled)
+ +		seq_puts(file, "on\n");
+ +	else
+ +		seq_puts(file, "off\n");
+ +
+ +	return 0;
+ +}
+ +
+ +static int topology_open(struct inode *inode, struct file *file)
+ +{
+ +	return single_open(file, topology_read, NULL);
+ +}
+ +
+ +static ssize_t topology_write(struct file *file, const char __user *buf,
+ +			      size_t count, loff_t *off)
+ +{
+ +	char kbuf[4]; /* "on" or "off" plus null. */
+ +	int read_len;
+ +
+ +	read_len = count < 3 ? count : 3;
+ +	if (copy_from_user(kbuf, buf, read_len))
+ +		return -EINVAL;
+ +
+ +	kbuf[read_len] = '\0';
+ +
+ +	if (!strncmp(kbuf, "on", 2)) {
+ +		topology_updates_enabled = true;
+ +		start_topology_update();
+ +	} else if (!strncmp(kbuf, "off", 3)) {
+ +		stop_topology_update();
+ +		topology_updates_enabled = false;
+ +	} else
+ +		return -EINVAL;
+ +
+ +	return count;
+ +}
+ +
+ +static const struct file_operations topology_ops = {
+ +	.read = seq_read,
+ +	.write = topology_write,
+ +	.open = topology_open,
+ +	.release = single_release
+ +};
+ +
+  static int topology_update_init(void)
+  {
+ +	start_topology_update();
+ +
+ +	if (vphn_enabled)
+ +		topology_schedule_update();
+ +
+ +	if (!proc_create("powerpc/topology_updates", 0644, NULL, &topology_ops))
+ +		return -ENOMEM;
+ +
+  	topology_inited = 1;
+  	return 0;
+  }
+* Unmerged path arch/powerpc/mm/numa.c
