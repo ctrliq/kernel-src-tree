@@ -1,0 +1,213 @@
+udp_tunnel: add the ability to hard-code IANA VXLAN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 966e50597666d530b69de2abb9c83ff0a9bd3ee6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/966e5059.failed
+
+mlx5 has the IANA VXLAN port (4789) hard coded by the device,
+instead of being added dynamically when tunnels are created.
+
+To support this add a workaround flag to struct udp_tunnel_nic_info.
+Skipping updates for the port is fairly trivial, dumping the hard
+coded port via ethtool requires some code duplication. The port
+is not a part of any real table, we dump it in a special table
+which has no tunnel types supported and only one entry.
+
+This is the last known workaround / hack needed to convert
+all drivers to the new infra.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 966e50597666d530b69de2abb9c83ff0a9bd3ee6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ethtool-netlink.rst
+#	include/net/udp_tunnel.h
+#	net/ethtool/tunnels.c
+#	net/ipv4/udp_tunnel_nic.c
+diff --cc include/net/udp_tunnel.h
+index 6337b9f08993,94bb7a882250..000000000000
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@@ -182,4 -182,166 +182,169 @@@ static inline void udp_tunnel_encap_ena
+  		udp_encap_enable();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define UDP_TUNNEL_NIC_MAX_TABLES	4
++ 
++ enum udp_tunnel_nic_info_flags {
++ 	/* Device callbacks may sleep */
++ 	UDP_TUNNEL_NIC_INFO_MAY_SLEEP	= BIT(0),
++ 	/* Device only supports offloads when it's open, all ports
++ 	 * will be removed before close and re-added after open.
++ 	 */
++ 	UDP_TUNNEL_NIC_INFO_OPEN_ONLY	= BIT(1),
++ 	/* Device supports only IPv4 tunnels */
++ 	UDP_TUNNEL_NIC_INFO_IPV4_ONLY	= BIT(2),
++ 	/* Device has hard-coded the IANA VXLAN port (4789) as VXLAN.
++ 	 * This port must not be counted towards n_entries of any table.
++ 	 * Driver will not receive any callback associated with port 4789.
++ 	 */
++ 	UDP_TUNNEL_NIC_INFO_STATIC_IANA_VXLAN	= BIT(3),
++ };
++ 
++ /**
++  * struct udp_tunnel_nic_info - driver UDP tunnel offload information
++  * @set_port:	callback for adding a new port
++  * @unset_port:	callback for removing a port
++  * @sync_table:	callback for syncing the entire port table at once
++  * @flags:	device flags from enum udp_tunnel_nic_info_flags
++  * @tables:	UDP port tables this device has
++  * @tables.n_entries:		number of entries in this table
++  * @tables.tunnel_types:	types of tunnels this table accepts
++  *
++  * Drivers are expected to provide either @set_port and @unset_port callbacks
++  * or the @sync_table callback. Callbacks are invoked with rtnl lock held.
++  *
++  * Known limitations:
++  *  - UDP tunnel port notifications are fundamentally best-effort -
++  *    it is likely the driver will both see skbs which use a UDP tunnel port,
++  *    while not being a tunneled skb, and tunnel skbs from other ports -
++  *    drivers should only use these ports for non-critical RX-side offloads,
++  *    e.g. the checksum offload;
++  *  - none of the devices care about the socket family at present, so we don't
++  *    track it. Please extend this code if you care.
++  */
++ struct udp_tunnel_nic_info {
++ 	/* one-by-one */
++ 	int (*set_port)(struct net_device *dev,
++ 			unsigned int table, unsigned int entry,
++ 			struct udp_tunnel_info *ti);
++ 	int (*unset_port)(struct net_device *dev,
++ 			  unsigned int table, unsigned int entry,
++ 			  struct udp_tunnel_info *ti);
++ 
++ 	/* all at once */
++ 	int (*sync_table)(struct net_device *dev, unsigned int table);
++ 
++ 	unsigned int flags;
++ 
++ 	struct udp_tunnel_nic_table_info {
++ 		unsigned int n_entries;
++ 		unsigned int tunnel_types;
++ 	} tables[UDP_TUNNEL_NIC_MAX_TABLES];
++ };
++ 
++ /* UDP tunnel module dependencies
++  *
++  * Tunnel drivers are expected to have a hard dependency on the udp_tunnel
++  * module. NIC drivers are not, they just attach their
++  * struct udp_tunnel_nic_info to the netdev and wait for callbacks to come.
++  * Loading a tunnel driver will cause the udp_tunnel module to be loaded
++  * and only then will all the required state structures be allocated.
++  * Since we want a weak dependency from the drivers and the core to udp_tunnel
++  * we call things through the following stubs.
++  */
++ struct udp_tunnel_nic_ops {
++ 	void (*get_port)(struct net_device *dev, unsigned int table,
++ 			 unsigned int idx, struct udp_tunnel_info *ti);
++ 	void (*set_port_priv)(struct net_device *dev, unsigned int table,
++ 			      unsigned int idx, u8 priv);
++ 	void (*add_port)(struct net_device *dev, struct udp_tunnel_info *ti);
++ 	void (*del_port)(struct net_device *dev, struct udp_tunnel_info *ti);
++ 	void (*reset_ntf)(struct net_device *dev);
++ 
++ 	size_t (*dump_size)(struct net_device *dev, unsigned int table);
++ 	int (*dump_write)(struct net_device *dev, unsigned int table,
++ 			  struct sk_buff *skb);
++ };
++ 
++ #ifdef CONFIG_INET
++ extern const struct udp_tunnel_nic_ops *udp_tunnel_nic_ops;
++ #else
++ #define udp_tunnel_nic_ops	((struct udp_tunnel_nic_ops *)NULL)
++ #endif
++ 
++ static inline void
++ udp_tunnel_nic_get_port(struct net_device *dev, unsigned int table,
++ 			unsigned int idx, struct udp_tunnel_info *ti)
++ {
++ 	/* This helper is used from .sync_table, we indicate empty entries
++ 	 * by zero'ed @ti. Drivers which need to know the details of a port
++ 	 * when it gets deleted should use the .set_port / .unset_port
++ 	 * callbacks.
++ 	 * Zero out here, otherwise !CONFIG_INET causes uninitilized warnings.
++ 	 */
++ 	memset(ti, 0, sizeof(*ti));
++ 
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->get_port(dev, table, idx, ti);
++ }
++ 
++ static inline void
++ udp_tunnel_nic_set_port_priv(struct net_device *dev, unsigned int table,
++ 			     unsigned int idx, u8 priv)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->set_port_priv(dev, table, idx, priv);
++ }
++ 
++ static inline void
++ udp_tunnel_nic_add_port(struct net_device *dev, struct udp_tunnel_info *ti)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->add_port(dev, ti);
++ }
++ 
++ static inline void
++ udp_tunnel_nic_del_port(struct net_device *dev, struct udp_tunnel_info *ti)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->del_port(dev, ti);
++ }
++ 
++ /**
++  * udp_tunnel_nic_reset_ntf() - device-originating reset notification
++  * @dev: network interface device structure
++  *
++  * Called by the driver to inform the core that the entire UDP tunnel port
++  * state has been lost, usually due to device reset. Core will assume device
++  * forgot all the ports and issue .set_port and .sync_table callbacks as
++  * necessary.
++  *
++  * This function must be called with rtnl lock held, and will issue all
++  * the callbacks before returning.
++  */
++ static inline void udp_tunnel_nic_reset_ntf(struct net_device *dev)
++ {
++ 	if (udp_tunnel_nic_ops)
++ 		udp_tunnel_nic_ops->reset_ntf(dev);
++ }
++ 
++ static inline size_t
++ udp_tunnel_nic_dump_size(struct net_device *dev, unsigned int table)
++ {
++ 	if (!udp_tunnel_nic_ops)
++ 		return 0;
++ 	return udp_tunnel_nic_ops->dump_size(dev, table);
++ }
++ 
++ static inline int
++ udp_tunnel_nic_dump_write(struct net_device *dev, unsigned int table,
++ 			  struct sk_buff *skb)
++ {
++ 	if (!udp_tunnel_nic_ops)
++ 		return 0;
++ 	return udp_tunnel_nic_ops->dump_write(dev, table, skb);
++ }
+++>>>>>>> 966e50597666 (udp_tunnel: add the ability to hard-code IANA VXLAN)
+  #endif
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path net/ethtool/tunnels.c
+* Unmerged path net/ipv4/udp_tunnel_nic.c
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/net/udp_tunnel.h
+* Unmerged path net/ethtool/tunnels.c
+* Unmerged path net/ipv4/udp_tunnel_nic.c
