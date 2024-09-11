@@ -1,0 +1,390 @@
+vdpa: split vdpasim to core and net modules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Max Gurtovoy <mgurtovoy@nvidia.com>
+commit db1e8bb6c63a77b74b0c6b49662fc50d49d5f90b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/db1e8bb6.failed
+
+Introduce new vdpa_sim_net and vdpa_sim (core) drivers. This is a
+preparation for adding a vdpa simulator module for block devices.
+
+	Signed-off-by: Max Gurtovoy <mgurtovoy@nvidia.com>
+[sgarzare: various cleanups/fixes]
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: Stefano Garzarella <sgarzare@redhat.com>
+Link: https://lore.kernel.org/r/20201215144256.155342-19-sgarzare@redhat.com
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit db1e8bb6c63a77b74b0c6b49662fc50d49d5f90b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vdpa/vdpa_sim/vdpa_sim.c
+diff --cc drivers/vdpa/vdpa_sim/vdpa_sim.c
+index 6cce5bf0b8f7,b3fcc67bfdf0..000000000000
+--- a/drivers/vdpa/vdpa_sim/vdpa_sim.c
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+@@@ -11,23 -11,14 +11,26 @@@
+  #include <linux/module.h>
+  #include <linux/device.h>
+  #include <linux/kernel.h>
+ +#include <linux/fs.h>
+ +#include <linux/poll.h>
+  #include <linux/slab.h>
+  #include <linux/sched.h>
+++<<<<<<< HEAD
+ +#include <linux/wait.h>
+ +#include <linux/uuid.h>
+ +#include <linux/iommu.h>
+ +#include <linux/dma-mapping.h>
+ +#include <linux/sysfs.h>
+ +#include <linux/file.h>
+ +#include <linux/etherdevice.h>
+++=======
++ #include <linux/dma-map-ops.h>
+++>>>>>>> db1e8bb6c63a (vdpa: split vdpasim to core and net modules)
+  #include <linux/vringh.h>
+  #include <linux/vdpa.h>
+- #include <linux/virtio_byteorder.h>
+  #include <linux/vhost_iotlb.h>
+- #include <uapi/linux/virtio_config.h>
+- #include <uapi/linux/virtio_net.h>
++ 
++ #include "vdpa_sim.h"
+  
+  #define DRV_VERSION  "0.1"
+  #define DRV_AUTHOR   "Jason Wang <jasowang@redhat.com>"
+diff --git a/drivers/vdpa/Kconfig b/drivers/vdpa/Kconfig
+index 2c892e890b9e..92a6396f8a73 100644
+--- a/drivers/vdpa/Kconfig
++++ b/drivers/vdpa/Kconfig
+@@ -9,15 +9,20 @@ menuconfig VDPA
+ if VDPA
+ 
+ config VDPA_SIM
+-	tristate "vDPA device simulator"
++	tristate "vDPA device simulator core"
+ 	depends on RUNTIME_TESTING_MENU && HAS_DMA
+ 	select DMA_OPS
+ 	select VHOST_RING
++	help
++	  Enable this module to support vDPA device simulators. These devices
++	  are used for testing, prototyping and development of vDPA.
++
++config VDPA_SIM_NET
++	tristate "vDPA simulator for networking device"
++	depends on VDPA_SIM
+ 	select GENERIC_NET_UTILS
+ 	help
+-	  vDPA networking device simulator which loop TX traffic back
+-	  to RX. This device is used for testing, prototyping and
+-	  development of vDPA.
++	  vDPA networking device simulator which loops TX traffic back to RX.
+ 
+ config IFCVF
+ 	tristate "Intel IFC VF vDPA driver"
+diff --git a/drivers/vdpa/vdpa_sim/Makefile b/drivers/vdpa/vdpa_sim/Makefile
+index b40278f65e04..79d4536d347e 100644
+--- a/drivers/vdpa/vdpa_sim/Makefile
++++ b/drivers/vdpa/vdpa_sim/Makefile
+@@ -1,2 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_VDPA_SIM) += vdpa_sim.o
++obj-$(CONFIG_VDPA_SIM_NET) += vdpa_sim_net.o
+* Unmerged path drivers/vdpa/vdpa_sim/vdpa_sim.c
+diff --git a/drivers/vdpa/vdpa_sim/vdpa_sim.h b/drivers/vdpa/vdpa_sim/vdpa_sim.h
+new file mode 100644
+index 000000000000..b02142293d5b
+--- /dev/null
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim.h
+@@ -0,0 +1,105 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2020, Red Hat Inc. All rights reserved.
++ */
++
++#ifndef _VDPA_SIM_H
++#define _VDPA_SIM_H
++
++#include <linux/vringh.h>
++#include <linux/vdpa.h>
++#include <linux/virtio_byteorder.h>
++#include <linux/vhost_iotlb.h>
++#include <uapi/linux/virtio_config.h>
++
++#define VDPASIM_FEATURES	((1ULL << VIRTIO_F_ANY_LAYOUT) | \
++				 (1ULL << VIRTIO_F_VERSION_1)  | \
++				 (1ULL << VIRTIO_F_ACCESS_PLATFORM))
++
++struct vdpasim;
++
++struct vdpasim_virtqueue {
++	struct vringh vring;
++	struct vringh_kiov in_iov;
++	struct vringh_kiov out_iov;
++	unsigned short head;
++	bool ready;
++	u64 desc_addr;
++	u64 device_addr;
++	u64 driver_addr;
++	u32 num;
++	void *private;
++	irqreturn_t (*cb)(void *data);
++};
++
++struct vdpasim_dev_attr {
++	u64 supported_features;
++	size_t config_size;
++	size_t buffer_size;
++	int nvqs;
++	u32 id;
++
++	work_func_t work_fn;
++	void (*get_config)(struct vdpasim *vdpasim, void *config);
++	void (*set_config)(struct vdpasim *vdpasim, const void *config);
++};
++
++/* State of each vdpasim device */
++struct vdpasim {
++	struct vdpa_device vdpa;
++	struct vdpasim_virtqueue *vqs;
++	struct work_struct work;
++	struct vdpasim_dev_attr dev_attr;
++	/* spinlock to synchronize virtqueue state */
++	spinlock_t lock;
++	/* virtio config according to device type */
++	void *config;
++	struct vhost_iotlb *iommu;
++	void *buffer;
++	u32 status;
++	u32 generation;
++	u64 features;
++	/* spinlock to synchronize iommu table */
++	spinlock_t iommu_lock;
++};
++
++struct vdpasim *vdpasim_create(struct vdpasim_dev_attr *attr);
++
++/* TODO: cross-endian support */
++static inline bool vdpasim_is_little_endian(struct vdpasim *vdpasim)
++{
++	return virtio_legacy_is_little_endian() ||
++		(vdpasim->features & (1ULL << VIRTIO_F_VERSION_1));
++}
++
++static inline u16 vdpasim16_to_cpu(struct vdpasim *vdpasim, __virtio16 val)
++{
++	return __virtio16_to_cpu(vdpasim_is_little_endian(vdpasim), val);
++}
++
++static inline __virtio16 cpu_to_vdpasim16(struct vdpasim *vdpasim, u16 val)
++{
++	return __cpu_to_virtio16(vdpasim_is_little_endian(vdpasim), val);
++}
++
++static inline u32 vdpasim32_to_cpu(struct vdpasim *vdpasim, __virtio32 val)
++{
++	return __virtio32_to_cpu(vdpasim_is_little_endian(vdpasim), val);
++}
++
++static inline __virtio32 cpu_to_vdpasim32(struct vdpasim *vdpasim, u32 val)
++{
++	return __cpu_to_virtio32(vdpasim_is_little_endian(vdpasim), val);
++}
++
++static inline u64 vdpasim64_to_cpu(struct vdpasim *vdpasim, __virtio64 val)
++{
++	return __virtio64_to_cpu(vdpasim_is_little_endian(vdpasim), val);
++}
++
++static inline __virtio64 cpu_to_vdpasim64(struct vdpasim *vdpasim, u64 val)
++{
++	return __cpu_to_virtio64(vdpasim_is_little_endian(vdpasim), val);
++}
++
++#endif
+diff --git a/drivers/vdpa/vdpa_sim/vdpa_sim_net.c b/drivers/vdpa/vdpa_sim/vdpa_sim_net.c
+new file mode 100644
+index 000000000000..c10b6981fdab
+--- /dev/null
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim_net.c
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * VDPA simulator for networking device.
++ *
++ * Copyright (c) 2020, Red Hat Inc. All rights reserved.
++ *     Author: Jason Wang <jasowang@redhat.com>
++ *
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/etherdevice.h>
++#include <linux/vringh.h>
++#include <linux/vdpa.h>
++#include <uapi/linux/virtio_net.h>
++
++#include "vdpa_sim.h"
++
++#define DRV_VERSION  "0.1"
++#define DRV_AUTHOR   "Jason Wang <jasowang@redhat.com>"
++#define DRV_DESC     "vDPA Device Simulator for networking device"
++#define DRV_LICENSE  "GPL v2"
++
++#define VDPASIM_NET_FEATURES	(VDPASIM_FEATURES | \
++				 (1ULL << VIRTIO_NET_F_MAC))
++
++#define VDPASIM_NET_VQ_NUM	2
++
++static char *macaddr;
++module_param(macaddr, charp, 0);
++MODULE_PARM_DESC(macaddr, "Ethernet MAC address");
++
++u8 macaddr_buf[ETH_ALEN];
++
++static struct vdpasim *vdpasim_net_dev;
++
++static void vdpasim_net_work(struct work_struct *work)
++{
++	struct vdpasim *vdpasim = container_of(work, struct vdpasim, work);
++	struct vdpasim_virtqueue *txq = &vdpasim->vqs[1];
++	struct vdpasim_virtqueue *rxq = &vdpasim->vqs[0];
++	ssize_t read, write;
++	size_t total_write;
++	int pkts = 0;
++	int err;
++
++	spin_lock(&vdpasim->lock);
++
++	if (!(vdpasim->status & VIRTIO_CONFIG_S_DRIVER_OK))
++		goto out;
++
++	if (!txq->ready || !rxq->ready)
++		goto out;
++
++	while (true) {
++		total_write = 0;
++		err = vringh_getdesc_iotlb(&txq->vring, &txq->out_iov, NULL,
++					   &txq->head, GFP_ATOMIC);
++		if (err <= 0)
++			break;
++
++		err = vringh_getdesc_iotlb(&rxq->vring, NULL, &rxq->in_iov,
++					   &rxq->head, GFP_ATOMIC);
++		if (err <= 0) {
++			vringh_complete_iotlb(&txq->vring, txq->head, 0);
++			break;
++		}
++
++		while (true) {
++			read = vringh_iov_pull_iotlb(&txq->vring, &txq->out_iov,
++						     vdpasim->buffer,
++						     PAGE_SIZE);
++			if (read <= 0)
++				break;
++
++			write = vringh_iov_push_iotlb(&rxq->vring, &rxq->in_iov,
++						      vdpasim->buffer, read);
++			if (write <= 0)
++				break;
++
++			total_write += write;
++		}
++
++		/* Make sure data is wrote before advancing index */
++		smp_wmb();
++
++		vringh_complete_iotlb(&txq->vring, txq->head, 0);
++		vringh_complete_iotlb(&rxq->vring, rxq->head, total_write);
++
++		/* Make sure used is visible before rasing the interrupt. */
++		smp_wmb();
++
++		local_bh_disable();
++		if (vringh_need_notify_iotlb(&txq->vring) > 0)
++			vringh_notify(&txq->vring);
++		if (vringh_need_notify_iotlb(&rxq->vring) > 0)
++			vringh_notify(&rxq->vring);
++		local_bh_enable();
++
++		if (++pkts > 4) {
++			schedule_work(&vdpasim->work);
++			goto out;
++		}
++	}
++
++out:
++	spin_unlock(&vdpasim->lock);
++}
++
++static void vdpasim_net_get_config(struct vdpasim *vdpasim, void *config)
++{
++	struct virtio_net_config *net_config =
++		(struct virtio_net_config *)config;
++
++	net_config->mtu = cpu_to_vdpasim16(vdpasim, 1500);
++	net_config->status = cpu_to_vdpasim16(vdpasim, VIRTIO_NET_S_LINK_UP);
++	memcpy(net_config->mac, macaddr_buf, ETH_ALEN);
++}
++
++static int __init vdpasim_net_init(void)
++{
++	struct vdpasim_dev_attr dev_attr = {};
++	int ret;
++
++	if (macaddr) {
++		mac_pton(macaddr, macaddr_buf);
++		if (!is_valid_ether_addr(macaddr_buf)) {
++			ret = -EADDRNOTAVAIL;
++			goto out;
++		}
++	} else {
++		eth_random_addr(macaddr_buf);
++	}
++
++	dev_attr.id = VIRTIO_ID_NET;
++	dev_attr.supported_features = VDPASIM_NET_FEATURES;
++	dev_attr.nvqs = VDPASIM_NET_VQ_NUM;
++	dev_attr.config_size = sizeof(struct virtio_net_config);
++	dev_attr.get_config = vdpasim_net_get_config;
++	dev_attr.work_fn = vdpasim_net_work;
++	dev_attr.buffer_size = PAGE_SIZE;
++
++	vdpasim_net_dev = vdpasim_create(&dev_attr);
++	if (IS_ERR(vdpasim_net_dev)) {
++		ret = PTR_ERR(vdpasim_net_dev);
++		goto out;
++	}
++
++	ret = vdpa_register_device(&vdpasim_net_dev->vdpa);
++	if (ret)
++		goto put_dev;
++
++	return 0;
++
++put_dev:
++	put_device(&vdpasim_net_dev->vdpa.dev);
++out:
++	return ret;
++}
++
++static void __exit vdpasim_net_exit(void)
++{
++	struct vdpa_device *vdpa = &vdpasim_net_dev->vdpa;
++
++	vdpa_unregister_device(vdpa);
++}
++
++module_init(vdpasim_net_init);
++module_exit(vdpasim_net_exit);
++
++MODULE_VERSION(DRV_VERSION);
++MODULE_LICENSE(DRV_LICENSE);
++MODULE_AUTHOR(DRV_AUTHOR);
++MODULE_DESCRIPTION(DRV_DESC);
