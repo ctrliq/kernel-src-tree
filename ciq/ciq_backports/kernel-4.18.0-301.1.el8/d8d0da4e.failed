@@ -1,0 +1,308 @@
+locking/arch: Move qrwlock.h include after qspinlock.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Waiman Long <longman@redhat.com>
+commit d8d0da4eee5c4e86ea08abde6975848376b4ac13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/d8d0da4e.failed
+
+include/asm-generic/qrwlock.h was trying to get arch_spin_is_locked via
+asm-generic/qspinlock.h.  However, this does not work because architectures
+might be using queued rwlocks but not queued spinlocks (csky), or because they
+might be defining their own queued_* macros before including asm/qspinlock.h.
+
+To fix this, ensure that asm/spinlock.h always includes qrwlock.h after
+defining arch_spin_is_locked (either directly for csky, or via
+asm/qspinlock.h for other architectures).  The only inclusion elsewhere
+is in kernel/locking/qrwlock.c.  That one is really unnecessary because
+the file is only compiled in SMP configurations (config QUEUED_RWLOCKS
+depends on SMP) and in that case linux/spinlock.h already includes
+asm/qrwlock.h if needed, via asm/spinlock.h.
+
+	Reported-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Waiman Long <longman@redhat.com>
+Fixes: 26128cb6c7e6 ("locking/rwlocks: Add contention detection for rwlocks")
+	Tested-by: Guenter Roeck <linux@roeck-us.net>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+[Add arch/sparc and kernel/locking parts per discussion with Waiman. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d8d0da4eee5c4e86ea08abde6975848376b4ac13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/xtensa/include/asm/spinlock.h
+diff --cc arch/xtensa/include/asm/spinlock.h
+index c6e1290dcbb7,41c449ece2d8..000000000000
+--- a/arch/xtensa/include/asm/spinlock.h
++++ b/arch/xtensa/include/asm/spinlock.h
+@@@ -12,188 -12,9 +12,193 @@@
+  #define _XTENSA_SPINLOCK_H
+  
+  #include <asm/barrier.h>
+++<<<<<<< HEAD
+ +#include <asm/processor.h>
+++=======
++ #include <asm/qspinlock.h>
++ #include <asm/qrwlock.h>
+++>>>>>>> d8d0da4eee5c (locking/arch: Move qrwlock.h include after qspinlock.h)
+  
+ -#define smp_mb__after_spinlock()	smp_mb()
+ +/*
+ + * spinlock
+ + *
+ + * There is at most one owner of a spinlock.  There are not different
+ + * types of spinlock owners like there are for rwlocks (see below).
+ + *
+ + * When trying to obtain a spinlock, the function "spins" forever, or busy-
+ + * waits, until the lock is obtained.  When spinning, presumably some other
+ + * owner will soon give up the spinlock making it available to others.  Use
+ + * the trylock functions to avoid spinning forever.
+ + *
+ + * possible values:
+ + *
+ + *    0         nobody owns the spinlock
+ + *    1         somebody owns the spinlock
+ + */
+ +
+ +#define arch_spin_is_locked(x) ((x)->slock != 0)
+ +
+ +static inline void arch_spin_lock(arch_spinlock_t *lock)
+ +{
+ +	unsigned long tmp;
+ +
+ +	__asm__ __volatile__(
+ +			"       movi    %0, 0\n"
+ +			"       wsr     %0, scompare1\n"
+ +			"1:     movi    %0, 1\n"
+ +			"       s32c1i  %0, %1, 0\n"
+ +			"       bnez    %0, 1b\n"
+ +			: "=&a" (tmp)
+ +			: "a" (&lock->slock)
+ +			: "memory");
+ +}
+ +
+ +/* Returns 1 if the lock is obtained, 0 otherwise. */
+ +
+ +static inline int arch_spin_trylock(arch_spinlock_t *lock)
+ +{
+ +	unsigned long tmp;
+ +
+ +	__asm__ __volatile__(
+ +			"       movi    %0, 0\n"
+ +			"       wsr     %0, scompare1\n"
+ +			"       movi    %0, 1\n"
+ +			"       s32c1i  %0, %1, 0\n"
+ +			: "=&a" (tmp)
+ +			: "a" (&lock->slock)
+ +			: "memory");
+ +
+ +	return tmp == 0 ? 1 : 0;
+ +}
+ +
+ +static inline void arch_spin_unlock(arch_spinlock_t *lock)
+ +{
+ +	unsigned long tmp;
+ +
+ +	__asm__ __volatile__(
+ +			"       movi    %0, 0\n"
+ +			"       s32ri   %0, %1, 0\n"
+ +			: "=&a" (tmp)
+ +			: "a" (&lock->slock)
+ +			: "memory");
+ +}
+ +
+ +/*
+ + * rwlock
+ + *
+ + * Read-write locks are really a more flexible spinlock.  They allow
+ + * multiple readers but only one writer.  Write ownership is exclusive
+ + * (i.e., all other readers and writers are blocked from ownership while
+ + * there is a write owner).  These rwlocks are unfair to writers.  Writers
+ + * can be starved for an indefinite time by readers.
+ + *
+ + * possible values:
+ + *
+ + *   0          nobody owns the rwlock
+ + *  >0          one or more readers own the rwlock
+ + *                (the positive value is the actual number of readers)
+ + *  0x80000000  one writer owns the rwlock, no other writers, no readers
+ + */
+ +
+ +static inline void arch_write_lock(arch_rwlock_t *rw)
+ +{
+ +	unsigned long tmp;
+ +
+ +	__asm__ __volatile__(
+ +			"       movi    %0, 0\n"
+ +			"       wsr     %0, scompare1\n"
+ +			"1:     movi    %0, 1\n"
+ +			"       slli    %0, %0, 31\n"
+ +			"       s32c1i  %0, %1, 0\n"
+ +			"       bnez    %0, 1b\n"
+ +			: "=&a" (tmp)
+ +			: "a" (&rw->lock)
+ +			: "memory");
+ +}
+ +
+ +/* Returns 1 if the lock is obtained, 0 otherwise. */
+ +
+ +static inline int arch_write_trylock(arch_rwlock_t *rw)
+ +{
+ +	unsigned long tmp;
+ +
+ +	__asm__ __volatile__(
+ +			"       movi    %0, 0\n"
+ +			"       wsr     %0, scompare1\n"
+ +			"       movi    %0, 1\n"
+ +			"       slli    %0, %0, 31\n"
+ +			"       s32c1i  %0, %1, 0\n"
+ +			: "=&a" (tmp)
+ +			: "a" (&rw->lock)
+ +			: "memory");
+ +
+ +	return tmp == 0 ? 1 : 0;
+ +}
+ +
+ +static inline void arch_write_unlock(arch_rwlock_t *rw)
+ +{
+ +	unsigned long tmp;
+ +
+ +	__asm__ __volatile__(
+ +			"       movi    %0, 0\n"
+ +			"       s32ri   %0, %1, 0\n"
+ +			: "=&a" (tmp)
+ +			: "a" (&rw->lock)
+ +			: "memory");
+ +}
+ +
+ +static inline void arch_read_lock(arch_rwlock_t *rw)
+ +{
+ +	unsigned long tmp;
+ +	unsigned long result;
+ +
+ +	__asm__ __volatile__(
+ +			"1:     l32i    %1, %2, 0\n"
+ +			"       bltz    %1, 1b\n"
+ +			"       wsr     %1, scompare1\n"
+ +			"       addi    %0, %1, 1\n"
+ +			"       s32c1i  %0, %2, 0\n"
+ +			"       bne     %0, %1, 1b\n"
+ +			: "=&a" (result), "=&a" (tmp)
+ +			: "a" (&rw->lock)
+ +			: "memory");
+ +}
+ +
+ +/* Returns 1 if the lock is obtained, 0 otherwise. */
+ +
+ +static inline int arch_read_trylock(arch_rwlock_t *rw)
+ +{
+ +	unsigned long result;
+ +	unsigned long tmp;
+ +
+ +	__asm__ __volatile__(
+ +			"       l32i    %1, %2, 0\n"
+ +			"       addi    %0, %1, 1\n"
+ +			"       bltz    %0, 1f\n"
+ +			"       wsr     %1, scompare1\n"
+ +			"       s32c1i  %0, %2, 0\n"
+ +			"       sub     %0, %0, %1\n"
+ +			"1:\n"
+ +			: "=&a" (result), "=&a" (tmp)
+ +			: "a" (&rw->lock)
+ +			: "memory");
+ +
+ +	return result == 0;
+ +}
+ +
+ +static inline void arch_read_unlock(arch_rwlock_t *rw)
+ +{
+ +	unsigned long tmp1, tmp2;
+ +
+ +	__asm__ __volatile__(
+ +			"1:     l32i    %1, %2, 0\n"
+ +			"       addi    %0, %1, -1\n"
+ +			"       wsr     %1, scompare1\n"
+ +			"       s32c1i  %0, %2, 0\n"
+ +			"       bne     %0, %1, 1b\n"
+ +			: "=&a" (tmp1), "=&a" (tmp2)
+ +			: "a" (&rw->lock)
+ +			: "memory");
+ +}
+  
+  #endif	/* _XTENSA_SPINLOCK_H */
+diff --git a/arch/arm64/include/asm/spinlock.h b/arch/arm64/include/asm/spinlock.h
+index a9dec081beca..efcef6470481 100644
+--- a/arch/arm64/include/asm/spinlock.h
++++ b/arch/arm64/include/asm/spinlock.h
+@@ -16,8 +16,8 @@
+ #ifndef __ASM_SPINLOCK_H
+ #define __ASM_SPINLOCK_H
+ 
+-#include <asm/qrwlock.h>
+ #include <asm/qspinlock.h>
++#include <asm/qrwlock.h>
+ 
+ /* See include/linux/spinlock.h */
+ #define smp_mb__after_spinlock()	smp_mb()
+diff --git a/arch/mips/include/asm/spinlock.h b/arch/mips/include/asm/spinlock.h
+index 8a88eb265516..6ce2117e49f6 100644
+--- a/arch/mips/include/asm/spinlock.h
++++ b/arch/mips/include/asm/spinlock.h
+@@ -10,7 +10,6 @@
+ #define _ASM_SPINLOCK_H
+ 
+ #include <asm/processor.h>
+-#include <asm/qrwlock.h>
+ 
+ #include <asm-generic/qspinlock_types.h>
+ 
+@@ -27,5 +26,6 @@ static inline void queued_spin_unlock(struct qspinlock *lock)
+ }
+ 
+ #include <asm/qspinlock.h>
++#include <asm/qrwlock.h>
+ 
+ #endif /* _ASM_SPINLOCK_H */
+diff --git a/arch/sparc/include/asm/spinlock_64.h b/arch/sparc/include/asm/spinlock_64.h
+index 7fc82a233f49..3a9a0b0c7465 100644
+--- a/arch/sparc/include/asm/spinlock_64.h
++++ b/arch/sparc/include/asm/spinlock_64.h
+@@ -11,8 +11,8 @@
+ 
+ #include <asm/processor.h>
+ #include <asm/barrier.h>
+-#include <asm/qrwlock.h>
+ #include <asm/qspinlock.h>
++#include <asm/qrwlock.h>
+ 
+ #endif /* !(__ASSEMBLY__) */
+ 
+* Unmerged path arch/xtensa/include/asm/spinlock.h
+diff --git a/include/asm-generic/qrwlock.h b/include/asm-generic/qrwlock.h
+index acbf0b4eef1c..ed9ed646b153 100644
+--- a/include/asm-generic/qrwlock.h
++++ b/include/asm-generic/qrwlock.h
+@@ -23,7 +23,8 @@
+ #include <asm/processor.h>
+ 
+ #include <asm-generic/qrwlock_types.h>
+-#include <asm-generic/qspinlock.h>
++
++/* Must be included from asm/spinlock.h after defining arch_spin_is_locked.  */
+ 
+ /*
+  * Writer states & reader shift and bias.
+diff --git a/kernel/locking/qrwlock.c b/kernel/locking/qrwlock.c
+index c7471c3fb798..55b0fa296b3b 100644
+--- a/kernel/locking/qrwlock.c
++++ b/kernel/locking/qrwlock.c
+@@ -21,7 +21,6 @@
+ #include <linux/percpu.h>
+ #include <linux/hardirq.h>
+ #include <linux/spinlock.h>
+-#include <asm/qrwlock.h>
+ 
+ /**
+  * queued_read_lock_slowpath - acquire read lock of a queue rwlock
