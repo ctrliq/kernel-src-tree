@@ -1,0 +1,218 @@
+xfrm: policy: fix bydst hlist corruption on hash rebuild
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit fd709721352dd5239056eacaded00f2244e6ef58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/fd709721.failed
+
+syzbot reported following spat:
+
+BUG: KASAN: use-after-free in __write_once_size include/linux/compiler.h:221
+BUG: KASAN: use-after-free in hlist_del_rcu include/linux/rculist.h:455
+BUG: KASAN: use-after-free in xfrm_hash_rebuild+0xa0d/0x1000 net/xfrm/xfrm_policy.c:1318
+Write of size 8 at addr ffff888095e79c00 by task kworker/1:3/8066
+Workqueue: events xfrm_hash_rebuild
+Call Trace:
+ __write_once_size include/linux/compiler.h:221 [inline]
+ hlist_del_rcu include/linux/rculist.h:455 [inline]
+ xfrm_hash_rebuild+0xa0d/0x1000 net/xfrm/xfrm_policy.c:1318
+ process_one_work+0x814/0x1130 kernel/workqueue.c:2269
+Allocated by task 8064:
+ __kmalloc+0x23c/0x310 mm/slab.c:3669
+ kzalloc include/linux/slab.h:742 [inline]
+ xfrm_hash_alloc+0x38/0xe0 net/xfrm/xfrm_hash.c:21
+ xfrm_policy_init net/xfrm/xfrm_policy.c:4036 [inline]
+ xfrm_net_init+0x269/0xd60 net/xfrm/xfrm_policy.c:4120
+ ops_init+0x336/0x420 net/core/net_namespace.c:130
+ setup_net+0x212/0x690 net/core/net_namespace.c:316
+
+The faulting address is the address of the old chain head,
+free'd by xfrm_hash_resize().
+
+In xfrm_hash_rehash(), chain heads get re-initialized without
+any hlist_del_rcu:
+
+ for (i = hmask; i >= 0; i--)
+    INIT_HLIST_HEAD(odst + i);
+
+Then, hlist_del_rcu() gets called on the about to-be-reinserted policy
+when iterating the per-net list of policies.
+
+hlist_del_rcu() will then make chain->first be nonzero again:
+
+static inline void __hlist_del(struct hlist_node *n)
+{
+   struct hlist_node *next = n->next;   // address of next element in list
+   struct hlist_node **pprev = n->pprev;// location of previous elem, this
+                                        // can point at chain->first
+        WRITE_ONCE(*pprev, next);       // chain->first points to next elem
+        if (next)
+                next->pprev = pprev;
+
+Then, when we walk chainlist to find insertion point, we may find a
+non-empty list even though we're supposedly reinserting the first
+policy to an empty chain.
+
+To fix this first unlink all exact and inexact policies instead of
+zeroing the list heads.
+
+Add the commands equivalent to the syzbot reproducer to xfrm_policy.sh,
+without fix KASAN catches the corruption as it happens, SLUB poisoning
+detects it a bit later.
+
+	Reported-by: syzbot+0165480d4ef07360eeda@syzkaller.appspotmail.com
+Fixes: 1548bc4e0512 ("xfrm: policy: delete inexact policies from inexact list on hash rebuild")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit fd709721352dd5239056eacaded00f2244e6ef58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/xfrm_policy.c
+diff --cc net/xfrm/xfrm_policy.c
+index 6b43f9247a17,c411662141ae..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -590,13 -1229,64 +590,27 @@@ static void xfrm_hash_rebuild(struct wo
+  	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
+  	write_seqcount_begin(&xfrm_policy_hash_generation);
+  
+ -	/* make sure that we can insert the indirect policies again before
+ -	 * we start with destructive action.
+ -	 */
+ -	list_for_each_entry(policy, &net->xfrm.policy_all, walk.all) {
+ -		struct xfrm_pol_inexact_bin *bin;
+ -		u8 dbits, sbits;
+ -
+ -		dir = xfrm_policy_id2dir(policy->index);
+ -		if (policy->walk.dead || dir >= XFRM_POLICY_MAX)
+ -			continue;
+ -
+ -		if ((dir & XFRM_POLICY_MASK) == XFRM_POLICY_OUT) {
+ -			if (policy->family == AF_INET) {
+ -				dbits = rbits4;
+ -				sbits = lbits4;
+ -			} else {
+ -				dbits = rbits6;
+ -				sbits = lbits6;
+ -			}
+ -		} else {
+ -			if (policy->family == AF_INET) {
+ -				dbits = lbits4;
+ -				sbits = rbits4;
+ -			} else {
+ -				dbits = lbits6;
+ -				sbits = rbits6;
+ -			}
+ -		}
+ -
+ -		if (policy->selector.prefixlen_d < dbits ||
+ -		    policy->selector.prefixlen_s < sbits)
+ -			continue;
+ -
+ -		bin = xfrm_policy_inexact_alloc_bin(policy, dir);
+ -		if (!bin)
+ -			goto out_unlock;
+ -
+ -		if (!xfrm_policy_inexact_alloc_chain(bin, policy, dir))
+ -			goto out_unlock;
+ -	}
+ -
+  	/* reset the bydst and inexact table in all directions */
+  	for (dir = 0; dir < XFRM_POLICY_MAX; dir++) {
+++<<<<<<< HEAD
+ +		INIT_HLIST_HEAD(&net->xfrm.policy_inexact[dir]);
+++=======
++ 		struct hlist_node *n;
++ 
++ 		hlist_for_each_entry_safe(policy, n,
++ 					  &net->xfrm.policy_inexact[dir],
++ 					  bydst_inexact_list) {
++ 			hlist_del_rcu(&policy->bydst);
++ 			hlist_del_init(&policy->bydst_inexact_list);
++ 		}
++ 
+++>>>>>>> fd709721352d (xfrm: policy: fix bydst hlist corruption on hash rebuild)
+  		hmask = net->xfrm.policy_bydst[dir].hmask;
+  		odst = net->xfrm.policy_bydst[dir].table;
+- 		for (i = hmask; i >= 0; i--)
+- 			INIT_HLIST_HEAD(odst + i);
++ 		for (i = hmask; i >= 0; i--) {
++ 			hlist_for_each_entry_safe(policy, n, odst + i, bydst)
++ 				hlist_del_rcu(&policy->bydst);
++ 		}
+  		if ((dir & XFRM_POLICY_MASK) == XFRM_POLICY_OUT) {
+  			/* dir out => dst = remote, src = local */
+  			net->xfrm.policy_bydst[dir].dbits4 = rbits4;
+@@@ -621,10 -1313,15 +635,22 @@@
+  		}
+  		newpos = NULL;
+  		chain = policy_hash_bysel(net, &policy->selector,
+++<<<<<<< HEAD
+ +					  policy->family,
+ +					  xfrm_policy_id2dir(policy->index));
+ +		if (!chain)
+ +			chain = &net->xfrm.policy_inexact[dir];
+++=======
++ 					  policy->family, dir);
++ 
++ 		if (!chain) {
++ 			void *p = xfrm_policy_inexact_insert(policy, dir, 0);
++ 
++ 			WARN_ONCE(IS_ERR(p), "reinsert: %ld\n", PTR_ERR(p));
++ 			continue;
++ 		}
++ 
+++>>>>>>> fd709721352d (xfrm: policy: fix bydst hlist corruption on hash rebuild)
+  		hlist_for_each_entry(pol, chain, bydst) {
+  			if (policy->priority >= pol->priority)
+  				newpos = &pol->bydst;
+* Unmerged path net/xfrm/xfrm_policy.c
+diff --git a/tools/testing/selftests/net/xfrm_policy.sh b/tools/testing/selftests/net/xfrm_policy.sh
+index 22f2483ac0e9..6c793c1e3abf 100755
+--- a/tools/testing/selftests/net/xfrm_policy.sh
++++ b/tools/testing/selftests/net/xfrm_policy.sh
+@@ -149,6 +149,29 @@ check_xfrm() {
+ 	return $ret
+ }
+ 
++check_hthresh_repeat()
++{
++	local log=$1
++	i=0
++
++	for i in $(seq 1 10);do
++		ip -net ns1 xfrm policy update src e000:0001::0000 dst ff01::0014:0000:0001 dir in tmpl src :: dst :: proto esp mode tunnel priority 100 action allow || break
++		ip -net ns1 xfrm policy set hthresh6 0 28 || break
++
++		ip -net ns1 xfrm policy update src e000:0001::0000 dst ff01::01 dir in tmpl src :: dst :: proto esp mode tunnel priority 100 action allow || break
++		ip -net ns1 xfrm policy set hthresh6 0 28 || break
++	done
++
++	if [ $i -ne 10 ] ;then
++		echo "FAIL: $log" 1>&2
++		ret=1
++		return 1
++	fi
++
++	echo "PASS: $log"
++	return 0
++}
++
+ #check for needed privileges
+ if [ "$(id -u)" -ne 0 ];then
+ 	echo "SKIP: Need root privileges"
+@@ -305,7 +328,9 @@ for n in ns3 ns4;do
+ 	ip -net $n xfrm policy set hthresh4 32 32 hthresh6 128 128
+ 	sleep $((RANDOM%5))
+ done
+-check_exceptions "exceptions and block policies after hresh change to normal"
++check_exceptions "exceptions and block policies after htresh change to normal"
++
++check_hthresh_repeat "policies with repeated htresh change"
+ 
+ for i in 1 2 3 4;do ip netns del ns$i;done
+ 
