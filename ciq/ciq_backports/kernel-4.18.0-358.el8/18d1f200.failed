@@ -1,0 +1,184 @@
+loop: move loop_ctl_mutex locking into loop_add
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 18d1f200b3807c383d80cc00d6bbdee288e63b1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/18d1f200.failed
+
+Move acquiring and releasing loop_ctl_mutex from the callers into
+loop_add.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Link: https://lore.kernel.org/r/20210623145908.92973-7-hch@lst.de
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 18d1f200b3807c383d80cc00d6bbdee288e63b1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/loop.c
+diff --cc drivers/block/loop.c
+index c2f478450eaa,c18e2930ca11..000000000000
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@@ -2175,11 -2329,9 +2178,16 @@@ static int loop_add(struct loop_device 
+  	disk->queue		= lo->lo_queue;
+  	sprintf(disk->disk_name, "loop%d", i);
+  	add_disk(disk);
+++<<<<<<< HEAD
+ +	*l = lo;
+ +	return lo->lo_number;
+++=======
++ 	mutex_unlock(&loop_ctl_mutex);
++ 	return i;
+++>>>>>>> 18d1f200b380 (loop: move loop_ctl_mutex locking into loop_add)
+  
+ +out_free_queue:
+ +	blk_cleanup_queue(lo->lo_queue);
+  out_cleanup_tags:
+  	blk_mq_free_tag_set(&lo->tag_set);
+  out_free_idr:
+@@@ -2245,64 -2397,70 +2255,120 @@@ static void loop_probe(dev_t dev
+  
+  	if (max_loop && idx >= max_loop)
+  		return;
+++<<<<<<< HEAD
+ +
+ +	mutex_lock(&loop_ctl_mutex);
+ +	if (loop_lookup(&lo, idx) < 0)
+ +		loop_add(&lo, idx);
+ +	mutex_unlock(&loop_ctl_mutex);
+++=======
++ 	loop_add(idx);
++ }
++ 
++ static int loop_control_remove(int idx)
++ {
++ 	struct loop_device *lo;
++ 	int ret;
++ 		
++ 	ret = mutex_lock_killable(&loop_ctl_mutex);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = loop_lookup(&lo, idx);
++ 	if (ret < 0)
++ 		goto out_unlock_ctrl;
++ 
++ 	ret = mutex_lock_killable(&lo->lo_mutex);
++ 	if (ret)
++ 		goto out_unlock_ctrl;
++ 	if (lo->lo_state != Lo_unbound ||
++ 	    atomic_read(&lo->lo_refcnt) > 0) {
++ 		mutex_unlock(&lo->lo_mutex);
++ 		ret = -EBUSY;
++ 		goto out_unlock_ctrl;
++ 	}
++ 	lo->lo_state = Lo_deleting;
++ 	mutex_unlock(&lo->lo_mutex);
++ 
++ 	idr_remove(&loop_index_idr, lo->lo_number);
++ 	loop_remove(lo);
++ out_unlock_ctrl:
++ 	mutex_unlock(&loop_ctl_mutex);
++ 	return ret;
++ }
++ 
++ static int loop_control_get_free(int idx)
++ {
++ 	struct loop_device *lo;
++ 	int ret;
++ 
++ 	ret = mutex_lock_killable(&loop_ctl_mutex);
++ 	if (ret)
++ 		return ret;
++ 	ret = loop_lookup(&lo, -1);
++ 	mutex_unlock(&loop_ctl_mutex);
++ 
++ 	if (ret >= 0)
++ 		return ret;
++ 	return loop_add(-1);
+++>>>>>>> 18d1f200b380 (loop: move loop_ctl_mutex locking into loop_add)
+  }
+  
+  static long loop_control_ioctl(struct file *file, unsigned int cmd,
+  			       unsigned long parm)
+  {
+ +	struct loop_device *lo;
+ +	int ret;
+ +
+ +	ret = mutex_lock_killable(&loop_ctl_mutex);
+ +	if (ret)
+ +		return ret;
+ +
+ +	ret = -ENOSYS;
+  	switch (cmd) {
+  	case LOOP_CTL_ADD:
+++<<<<<<< HEAD
+ +		ret = loop_lookup(&lo, parm);
+ +		if (ret >= 0) {
+ +			ret = -EEXIST;
+ +			break;
+ +		}
+ +		ret = loop_add(&lo, parm);
+ +		break;
+++=======
++ 		return loop_add(parm);
+++>>>>>>> 18d1f200b380 (loop: move loop_ctl_mutex locking into loop_add)
+  	case LOOP_CTL_REMOVE:
+ -		return loop_control_remove(parm);
+ +		ret = loop_lookup(&lo, parm);
+ +		if (ret < 0)
+ +			break;
+ +		ret = mutex_lock_killable(&lo->lo_mutex);
+ +		if (ret)
+ +			break;
+ +		if (lo->lo_state != Lo_unbound) {
+ +			ret = -EBUSY;
+ +			mutex_unlock(&lo->lo_mutex);
+ +			break;
+ +		}
+ +		if (atomic_read(&lo->lo_refcnt) > 0) {
+ +			ret = -EBUSY;
+ +			mutex_unlock(&lo->lo_mutex);
+ +			break;
+ +		}
+ +		lo->lo_state = Lo_deleting;
+ +		mutex_unlock(&lo->lo_mutex);
+ +		idr_remove(&loop_index_idr, lo->lo_number);
+ +		loop_remove(lo);
+ +		break;
+  	case LOOP_CTL_GET_FREE:
+ -		return loop_control_get_free(parm);
+ -	default:
+ -		return -ENOSYS;
+ +		ret = loop_lookup(&lo, -1);
+ +		if (ret >= 0)
+ +			break;
+ +		ret = loop_add(&lo, -1);
+  	}
+ +	mutex_unlock(&loop_ctl_mutex);
+ +
+ +	return ret;
+  }
+  
+  static const struct file_operations loop_ctl_fops = {
+@@@ -2381,10 -2534,8 +2447,13 @@@ static int __init loop_init(void
+  	}
+  
+  	/* pre-create number of devices given by config or max_loop */
+- 	mutex_lock(&loop_ctl_mutex);
+  	for (i = 0; i < nr; i++)
+++<<<<<<< HEAD
+ +		loop_add(&lo, i);
+ +	mutex_unlock(&loop_ctl_mutex);
+++=======
++ 		loop_add(i);
+++>>>>>>> 18d1f200b380 (loop: move loop_ctl_mutex locking into loop_add)
+  
+  	printk(KERN_INFO "loop: module loaded\n");
+  	return 0;
+* Unmerged path drivers/block/loop.c
