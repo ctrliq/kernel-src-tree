@@ -1,0 +1,287 @@
+net/mlx5e: Use synchronize_rcu to sync with NAPI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Maxim Mikityanskiy <maximmi@mellanox.com>
+commit 9c25a22dfb00270372224721fed646965420323a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9c25a22d.failed
+
+As described in the previous commit, napi_synchronize doesn't quite fit
+the purpose when we just need to wait until the currently running NAPI
+quits. Its implementation waits until NAPI is not running by polling and
+waiting for 1ms in between. In cases where we need to deactivate one
+queue (e.g., recovery flows) or where we deactivate them one-by-one
+(deactivate channel flow), we may get stuck in napi_synchronize forever
+if other queues keep NAPI active, causing a soft lockup. Depending on
+kernel configuration (CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC), it may result
+in a kernel panic.
+
+To fix the issue, use synchronize_rcu to wait for NAPI to quit, and wrap
+the whole NAPI in rcu_read_lock.
+
+Fixes: acc6c5953af1 ("net/mlx5e: Split open/close channels to stages")
+	Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 9c25a22dfb00270372224721fed646965420323a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
+index 62fc8a128a8d,40db27bf790b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
+@@@ -90,12 -29,8 +90,15 @@@ struct sk_buff *mlx5e_xsk_skb_from_cqe_
+  						    u32 head_offset,
+  						    u32 page_idx)
+  {
+ -	struct xdp_buff *xdp = wi->umr.dma_info[page_idx].xsk;
+ +	struct mlx5e_dma_info *di = &wi->umr.dma_info[page_idx];
+ +	u16 rx_headroom = rq->buff.headroom - rq->buff.umem_headroom;
+  	u32 cqe_bcnt32 = cqe_bcnt;
+++<<<<<<< HEAD
+ +	void *va, *data;
+ +	u32 frag_size;
+ +	bool consumed;
+++=======
+++>>>>>>> 9c25a22dfb00 (net/mlx5e: Use synchronize_rcu to sync with NAPI)
+  
+  	/* Check packet size. Note LRO doesn't use linear SKB */
+  	if (unlikely(cqe_bcnt > rq->hw_mtu)) {
+@@@ -110,17 -45,11 +113,20 @@@
+  	 */
+  	WARN_ON_ONCE(head_offset);
+  
+ -	xdp->data_end = xdp->data + cqe_bcnt32;
+ -	xdp_set_data_meta_invalid(xdp);
+ -	xsk_buff_dma_sync_for_cpu(xdp);
+ -	prefetch(xdp->data);
+ +	va             = di->xsk.data;
+ +	data           = va + rx_headroom;
+ +	frag_size      = rq->buff.headroom + cqe_bcnt32;
+ +
+ +	dma_sync_single_for_cpu(rq->pdev, di->addr, frag_size, DMA_BIDIRECTIONAL);
+ +	prefetch(data);
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	consumed = mlx5e_xdp_handle(rq, di, va, &rx_headroom, &cqe_bcnt32, true);
+ +	rcu_read_unlock();
+ +
+++=======
+++>>>>>>> 9c25a22dfb00 (net/mlx5e: Use synchronize_rcu to sync with NAPI)
+  	/* Possible flows:
+  	 * - XDP_REDIRECT to XSKMAP:
+  	 *   The page is owned by the userspace from now.
+@@@ -153,15 -82,11 +159,19 @@@ struct sk_buff *mlx5e_xsk_skb_from_cqe_
+  					      struct mlx5e_wqe_frag_info *wi,
+  					      u32 cqe_bcnt)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5e_dma_info *di = wi->di;
+ +	u16 rx_headroom = rq->buff.headroom - rq->buff.umem_headroom;
+ +	void *va, *data;
+ +	bool consumed;
+ +	u32 frag_size;
+++=======
++ 	struct xdp_buff *xdp = wi->di->xsk;
+++>>>>>>> 9c25a22dfb00 (net/mlx5e: Use synchronize_rcu to sync with NAPI)
+  
+ -	/* wi->offset is not used in this function, because xdp->data and the
+ -	 * DMA address point directly to the necessary place. Furthermore, the
+ -	 * XSK allocator allocates frames per packet, instead of pages, so
+ +	/* wi->offset is not used in this function, because di->xsk.data and
+ +	 * di->addr point directly to the necessary place. Furthermore, in the
+ +	 * current implementation, one page = one packet = one frame, so
+  	 * wi->offset should always be 0.
+  	 */
+  	WARN_ON_ONCE(wi->offset);
+@@@ -178,11 -101,7 +188,15 @@@
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	consumed = mlx5e_xdp_handle(rq, di, va, &rx_headroom, &cqe_bcnt, true);
+ +	rcu_read_unlock();
+ +
+ +	if (likely(consumed))
+++=======
++ 	if (likely(mlx5e_xdp_handle(rq, NULL, &cqe_bcnt, xdp)))
+++>>>>>>> 9c25a22dfb00 (net/mlx5e: Use synchronize_rcu to sync with NAPI)
+  		return NULL; /* page/packet was consumed by XDP */
+  
+  	/* XDP_PASS: copy the data from the UMEM to a new SKB. The frame reuse
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index fb2ab3692827,99d102c035b0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -1057,9 -1129,9 +1057,8 @@@ mlx5e_skb_from_cqe_linear(struct mlx5e_
+  {
+  	struct mlx5e_dma_info *di = wi->di;
+  	u16 rx_headroom = rq->buff.headroom;
+ -	struct xdp_buff xdp;
+  	struct sk_buff *skb;
+  	void *va, *data;
+- 	bool consumed;
+  	u32 frag_size;
+  
+  	va             = page_address(di->page) + wi->offset;
+@@@ -1071,12 -1143,11 +1070,17 @@@
+  	prefetchw(va); /* xdp_frame data area */
+  	prefetch(data);
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	consumed = mlx5e_xdp_handle(rq, di, va, &rx_headroom, &cqe_bcnt, false);
+ +	rcu_read_unlock();
+ +	if (consumed)
+++=======
++ 	mlx5e_fill_xdp_buff(rq, va, rx_headroom, cqe_bcnt, &xdp);
++ 	if (mlx5e_xdp_handle(rq, di, &cqe_bcnt, &xdp))
+++>>>>>>> 9c25a22dfb00 (net/mlx5e: Use synchronize_rcu to sync with NAPI)
+  		return NULL; /* page/packet was consumed by XDP */
+  
+ -	rx_headroom = xdp.data - xdp.data_hard_start;
+  	frag_size = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt);
+  	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt);
+  	if (unlikely(!skb))
+@@@ -1375,10 -1450,8 +1378,15 @@@ mlx5e_skb_from_cqe_mpwrq_linear(struct 
+  	prefetchw(va); /* xdp_frame data area */
+  	prefetch(data);
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	consumed = mlx5e_xdp_handle(rq, di, va, &rx_headroom, &cqe_bcnt32, false);
+ +	rcu_read_unlock();
+ +	if (consumed) {
+++=======
++ 	mlx5e_fill_xdp_buff(rq, va, rx_headroom, cqe_bcnt32, &xdp);
++ 	if (mlx5e_xdp_handle(rq, di, &cqe_bcnt32, &xdp)) {
+++>>>>>>> 9c25a22dfb00 (net/mlx5e: Use synchronize_rcu to sync with NAPI)
+  		if (__test_and_clear_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags))
+  			__set_bit(page_idx, wi->xdp_xmit_bitmap); /* non-atomic */
+  		return NULL; /* page/packet was consumed by XDP */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xsk/rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+index cc46414773b5..d81a7de73b9f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+@@ -105,8 +105,7 @@ int mlx5e_open_xsk(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ void mlx5e_close_xsk(struct mlx5e_channel *c)
+ {
+ 	clear_bit(MLX5E_CHANNEL_STATE_XSK, c->state);
+-	napi_synchronize(&c->napi);
+-	synchronize_rcu(); /* Sync with the XSK wakeup. */
++	synchronize_rcu(); /* Sync with the XSK wakeup and with NAPI. */
+ 
+ 	mlx5e_close_rq(&c->xskrq);
+ 	mlx5e_close_cq(&c->xskrq.cq);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 0b699d106e2d..96a6e159e657 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -925,7 +925,7 @@ void mlx5e_activate_rq(struct mlx5e_rq *rq)
+ void mlx5e_deactivate_rq(struct mlx5e_rq *rq)
+ {
+ 	clear_bit(MLX5E_RQ_STATE_ENABLED, &rq->state);
+-	napi_synchronize(&rq->channel->napi); /* prevent mlx5e_post_rx_wqes */
++	synchronize_rcu(); /* Sync with NAPI to prevent mlx5e_post_rx_wqes. */
+ }
+ 
+ void mlx5e_close_rq(struct mlx5e_rq *rq)
+@@ -1370,12 +1370,10 @@ void mlx5e_tx_disable_queue(struct netdev_queue *txq)
+ 
+ static void mlx5e_deactivate_txqsq(struct mlx5e_txqsq *sq)
+ {
+-	struct mlx5e_channel *c = sq->channel;
+ 	struct mlx5_wq_cyc *wq = &sq->wq;
+ 
+ 	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+-	/* prevent netif_tx_wake_queue */
+-	napi_synchronize(&c->napi);
++	synchronize_rcu(); /* Sync with NAPI to prevent netif_tx_wake_queue. */
+ 
+ 	mlx5e_tx_disable_queue(sq->txq);
+ 
+@@ -1450,10 +1448,8 @@ void mlx5e_activate_icosq(struct mlx5e_icosq *icosq)
+ 
+ void mlx5e_deactivate_icosq(struct mlx5e_icosq *icosq)
+ {
+-	struct mlx5e_channel *c = icosq->channel;
+-
+ 	clear_bit(MLX5E_SQ_STATE_ENABLED, &icosq->state);
+-	napi_synchronize(&c->napi);
++	synchronize_rcu(); /* Sync with NAPI. */
+ }
+ 
+ void mlx5e_close_icosq(struct mlx5e_icosq *sq)
+@@ -1531,7 +1527,7 @@ void mlx5e_close_xdpsq(struct mlx5e_xdpsq *sq)
+ 	struct mlx5e_channel *c = sq->channel;
+ 
+ 	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+-	napi_synchronize(&c->napi);
++	synchronize_rcu(); /* Sync with NAPI. */
+ 
+ 	mlx5e_destroy_sq(c->mdev, sq->sqn);
+ 	mlx5e_free_xdpsq_descs(sq);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index c45a2529e19a..4bb7de79b69e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -121,13 +121,17 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 	struct mlx5e_xdpsq *xsksq = &c->xsksq;
+ 	struct mlx5e_rq *xskrq = &c->xskrq;
+ 	struct mlx5e_rq *rq = &c->rq;
+-	bool xsk_open = test_bit(MLX5E_CHANNEL_STATE_XSK, c->state);
+ 	bool aff_change = false;
+ 	bool busy_xsk = false;
+ 	bool busy = false;
+ 	int work_done = 0;
++	bool xsk_open;
+ 	int i;
+ 
++	rcu_read_lock();
++
++	xsk_open = test_bit(MLX5E_CHANNEL_STATE_XSK, c->state);
++
+ 	ch_stats->poll++;
+ 
+ 	for (i = 0; i < c->num_tc; i++)
+@@ -167,8 +171,10 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 	busy |= busy_xsk;
+ 
+ 	if (busy) {
+-		if (likely(mlx5e_channel_no_affinity_change(c)))
+-			return budget;
++		if (likely(mlx5e_channel_no_affinity_change(c))) {
++			work_done = budget;
++			goto out;
++		}
+ 		ch_stats->aff_change++;
+ 		aff_change = true;
+ 		if (budget && work_done == budget)
+@@ -176,7 +182,7 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 	}
+ 
+ 	if (unlikely(!napi_complete_done(napi, work_done)))
+-		return work_done;
++		goto out;
+ 
+ 	ch_stats->arm++;
+ 
+@@ -203,6 +209,9 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 		ch_stats->force_irq++;
+ 	}
+ 
++out:
++	rcu_read_unlock();
++
+ 	return work_done;
+ }
+ 
