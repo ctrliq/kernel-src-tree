@@ -6052,7 +6052,7 @@ static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
 		return mlx5_ib_add_slave_port(mdev, port_num);
 	}
 
-	dev = (struct mlx5_ib_dev *)ib_alloc_device(sizeof(*dev));
+	dev = ib_alloc_device(mlx5_ib_dev, ib_dev);
 	if (!dev)
 		return NULL;
 
