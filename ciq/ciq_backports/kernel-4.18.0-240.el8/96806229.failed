@@ -1,0 +1,124 @@
+irqchip/gic-v4.1: Add support for VPENDBASER's Dirty+Valid signaling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [irqchip] gic-v4.1: Add support for VPENDBASER's Dirty+Valid signaling (Gavin Shan) [1833572]
+Rebuild_FUZZ: 93.75%
+commit-author Marc Zyngier <maz@kernel.org>
+commit 96806229ca033f85310bc5c203410189f8a1d2ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/96806229.failed
+
+When a vPE is made resident, the GIC starts parsing the virtual pending
+table to deliver pending interrupts. This takes place asynchronously,
+and can at times take a long while. Long enough that the vcpu enters
+the guest and hits WFI before any interrupt has been signaled yet.
+The vcpu then exits, blocks, and now gets a doorbell. Rince, repeat.
+
+In order to avoid the above, a (optional on GICv4, mandatory on v4.1)
+feature allows the GIC to feedback to the hypervisor whether it is
+done parsing the VPT by clearing the GICR_VPENDBASER.Dirty bit.
+The hypervisor can then wait until the GIC is ready before actually
+running the vPE.
+
+Plug the detection code as well as polling on vPE schedule. While
+at it, tidy-up the kernel message that displays the GICv4 optional
+features.
+
+	Reviewed-by: Zenghui Yu <yuzenghui@huawei.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 96806229ca033f85310bc5c203410189f8a1d2ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/irqchip/irq-gic-v3-its.c
+diff --cc drivers/irqchip/irq-gic-v3-its.c
+index 8119dc3b7953,affd325cc3d4..000000000000
+--- a/drivers/irqchip/irq-gic-v3-its.c
++++ b/drivers/irqchip/irq-gic-v3-its.c
+@@@ -3680,7 -3716,9 +3695,13 @@@ static void its_vpe_schedule(struct its
+  	val |= GICR_VPENDBASER_PendingLast;
+  	val |= vpe->idai ? GICR_VPENDBASER_IDAI : 0;
+  	val |= GICR_VPENDBASER_Valid;
+++<<<<<<< HEAD
+ +	gits_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
+++=======
++ 	gicr_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
++ 
++ 	its_wait_vpt_parse_complete();
+++>>>>>>> 96806229ca03 (irqchip/gic-v4.1: Add support for VPENDBASER's Dirty+Valid signaling)
+  }
+  
+  static void its_vpe_deschedule(struct its_vpe *vpe)
+@@@ -3888,7 -3926,9 +3909,13 @@@ static void its_vpe_4_1_schedule(struc
+  	val |= info->g1en ? GICR_VPENDBASER_4_1_VGRP1EN : 0;
+  	val |= FIELD_PREP(GICR_VPENDBASER_4_1_VPEID, vpe->vpe_id);
+  
+++<<<<<<< HEAD
+ +	gits_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
+++=======
++ 	gicr_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
++ 
++ 	its_wait_vpt_parse_complete();
+++>>>>>>> 96806229ca03 (irqchip/gic-v4.1: Add support for VPENDBASER's Dirty+Valid signaling)
+  }
+  
+  static void its_vpe_4_1_deschedule(struct its_vpe *vpe,
+* Unmerged path drivers/irqchip/irq-gic-v3-its.c
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index aaa5599d2d57..577223bd17e8 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -874,6 +874,7 @@ static int __gic_update_rdist_properties(struct redist_region *region,
+ 	gic_data.rdists.has_rvpeid &= !!(typer & GICR_TYPER_RVPEID);
+ 	gic_data.rdists.has_direct_lpi &= (!!(typer & GICR_TYPER_DirectLPIS) |
+ 					   gic_data.rdists.has_rvpeid);
++	gic_data.rdists.has_vpend_valid_dirty &= !!(typer & GICR_TYPER_DIRTY);
+ 
+ 	/* Detect non-sensical configurations */
+ 	if (WARN_ON_ONCE(gic_data.rdists.has_rvpeid && !gic_data.rdists.has_vlpis)) {
+@@ -894,10 +895,11 @@ static void gic_update_rdist_properties(void)
+ 	if (WARN_ON(gic_data.ppi_nr == UINT_MAX))
+ 		gic_data.ppi_nr = 0;
+ 	pr_info("%d PPIs implemented\n", gic_data.ppi_nr);
+-	pr_info("%sVLPI support, %sdirect LPI support, %sRVPEID support\n",
+-		!gic_data.rdists.has_vlpis ? "no " : "",
+-		!gic_data.rdists.has_direct_lpi ? "no " : "",
+-		!gic_data.rdists.has_rvpeid ? "no " : "");
++	if (gic_data.rdists.has_vlpis)
++		pr_info("GICv4 features: %s%s%s\n",
++			gic_data.rdists.has_direct_lpi ? "DirectLPI " : "",
++			gic_data.rdists.has_rvpeid ? "RVPEID " : "",
++			gic_data.rdists.has_vpend_valid_dirty ? "Valid+Dirty " : "");
+ }
+ 
+ /* Check whether it's single security state view */
+@@ -1537,6 +1539,7 @@ static int __init gic_init_bases(void __iomem *dist_base,
+ 	gic_data.rdists.has_rvpeid = true;
+ 	gic_data.rdists.has_vlpis = true;
+ 	gic_data.rdists.has_direct_lpi = true;
++	gic_data.rdists.has_vpend_valid_dirty = true;
+ 
+ 	if (WARN_ON(!gic_data.domain) || WARN_ON(!gic_data.rdists.rdist)) {
+ 		err = -ENOMEM;
+diff --git a/include/linux/irqchip/arm-gic-v3.h b/include/linux/irqchip/arm-gic-v3.h
+index 4ac9c104fb50..7a6d7d95bb48 100644
+--- a/include/linux/irqchip/arm-gic-v3.h
++++ b/include/linux/irqchip/arm-gic-v3.h
+@@ -255,6 +255,7 @@
+ 
+ #define GICR_TYPER_PLPIS		(1U << 0)
+ #define GICR_TYPER_VLPIS		(1U << 1)
++#define GICR_TYPER_DIRTY		(1U << 2)
+ #define GICR_TYPER_DirectLPIS		(1U << 3)
+ #define GICR_TYPER_LAST			(1U << 4)
+ #define GICR_TYPER_RVPEID		(1U << 7)
+@@ -696,6 +697,7 @@ struct rdists {
+ 	bool			has_vlpis;
+ 	bool			has_rvpeid;
+ 	bool			has_direct_lpi;
++	bool			has_vpend_valid_dirty;
+ };
+ 
+ struct irq_domain;
