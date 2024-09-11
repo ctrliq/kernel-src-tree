@@ -832,6 +832,9 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 	struct mlx5e_priv *out_priv;
 	int err;
 
+	/* keep the old behaviour, use same prio for all offloaded rules */
+	attr->prio = 1;
+
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT) {
 		out_dev = __dev_get_by_index(dev_net(priv->netdev),
 					     attr->parse_attr->mirred_ifindex);
