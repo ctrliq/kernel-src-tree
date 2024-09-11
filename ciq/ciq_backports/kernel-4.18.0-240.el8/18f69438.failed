@@ -1,0 +1,194 @@
+futex: Mark the begin of futex exit explicitly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 18f694385c4fd77a09851fd301236746ca83f3cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/18f69438.failed
+
+Instead of relying on PF_EXITING use an explicit state for the futex exit
+and set it in the futex exit function. This moves the smp barrier and the
+lock/unlock serialization into the futex code.
+
+As with the DEAD state this is restricted to the exit path as exec
+continues to use the same task struct.
+
+This allows to simplify that logic in a next step.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20191106224556.539409004@linutronix.de
+
+
+(cherry picked from commit 18f694385c4fd77a09851fd301236746ca83f3cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/futex.h
+#	kernel/exit.c
+#	kernel/futex.c
+diff --cc include/linux/futex.h
+index 821ae502d3d8,9f2792427d64..000000000000
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@@ -51,20 -50,34 +51,50 @@@ union futex_key 
+  #define FUTEX_KEY_INIT (union futex_key) { .both = { .ptr = NULL } }
+  
+  #ifdef CONFIG_FUTEX
+++<<<<<<< HEAD
+ +extern void exit_robust_list(struct task_struct *curr);
+++=======
++ enum {
++ 	FUTEX_STATE_OK,
++ 	FUTEX_STATE_EXITING,
++ 	FUTEX_STATE_DEAD,
++ };
++ 
++ static inline void futex_init_task(struct task_struct *tsk)
++ {
++ 	tsk->robust_list = NULL;
++ #ifdef CONFIG_COMPAT
++ 	tsk->compat_robust_list = NULL;
++ #endif
++ 	INIT_LIST_HEAD(&tsk->pi_state_list);
++ 	tsk->pi_state_cache = NULL;
++ 	tsk->futex_state = FUTEX_STATE_OK;
++ }
++ 
++ void futex_exit_recursive(struct task_struct *tsk);
++ void futex_exit_release(struct task_struct *tsk);
++ void futex_exec_release(struct task_struct *tsk);
+++>>>>>>> 18f694385c4f (futex: Mark the begin of futex exit explicitly)
+  
+  long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+  	      u32 __user *uaddr2, u32 val2, u32 val3);
+ +#ifdef CONFIG_HAVE_FUTEX_CMPXCHG
+ +#define futex_cmpxchg_enabled 1
+ +#else
+++<<<<<<< HEAD
+ +extern int futex_cmpxchg_enabled;
+ +#endif
+  #else
+ +static inline void exit_robust_list(struct task_struct *curr)
+ +{
+ +}
+ +
+++=======
++ static inline void futex_init_task(struct task_struct *tsk) { }
++ static inline void futex_exit_recursive(struct task_struct *tsk) { }
++ static inline void futex_exit_release(struct task_struct *tsk) { }
++ static inline void futex_exec_release(struct task_struct *tsk) { }
+++>>>>>>> 18f694385c4f (futex: Mark the begin of futex exit explicitly)
+  static inline long do_futex(u32 __user *uaddr, int op, u32 val,
+  			    ktime_t *timeout, u32 __user *uaddr2,
+  			    u32 val2, u32 val3)
+diff --cc kernel/exit.c
+index 7d2d5ee2a742,d351fd09e739..000000000000
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@@ -734,16 -746,7 +734,20 @@@ void __noreturn do_exit(long code
+  	 */
+  	if (unlikely(tsk->flags & PF_EXITING)) {
+  		pr_alert("Fixing recursive fault but reboot is needed!\n");
+++<<<<<<< HEAD
+ +		/*
+ +		 * We can do this unlocked here. The futex code uses
+ +		 * this flag just to verify whether the pi state
+ +		 * cleanup has been done or not. In the worst case it
+ +		 * loops once more. We pretend that the cleanup was
+ +		 * done as there is no way to return. Either the
+ +		 * OWNER_DIED bit is set by now or we push the blocked
+ +		 * task into the wait for ever nirwana as well.
+ +		 */
+ +		tsk->flags |= PF_EXITPIDONE;
+++=======
++ 		futex_exit_recursive(tsk);
+++>>>>>>> 18f694385c4f (futex: Mark the begin of futex exit explicitly)
+  		set_current_state(TASK_UNINTERRUPTIBLE);
+  		schedule();
+  	}
+diff --cc kernel/futex.c
+index ec3cc9521f31,3488fb024a20..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -3608,9 -3655,69 +3608,73 @@@ void exit_robust_list(struct task_struc
+  		cond_resched();
+  	}
+  
+ -	if (pending) {
+ +	if (pending)
+  		handle_futex_death((void __user *)pending + futex_offset,
+++<<<<<<< HEAD
+ +				   curr, pip);
+++=======
++ 				   curr, pip, HANDLE_DEATH_PENDING);
++ 	}
++ }
++ 
++ void futex_exec_release(struct task_struct *tsk)
++ {
++ 	if (unlikely(tsk->robust_list)) {
++ 		exit_robust_list(tsk);
++ 		tsk->robust_list = NULL;
++ 	}
++ 
++ #ifdef CONFIG_COMPAT
++ 	if (unlikely(tsk->compat_robust_list)) {
++ 		compat_exit_robust_list(tsk);
++ 		tsk->compat_robust_list = NULL;
++ 	}
++ #endif
++ 
++ 	if (unlikely(!list_empty(&tsk->pi_state_list)))
++ 		exit_pi_state_list(tsk);
++ }
++ 
++ /**
++  * futex_exit_recursive - Set the tasks futex state to FUTEX_STATE_DEAD
++  * @tsk:	task to set the state on
++  *
++  * Set the futex exit state of the task lockless. The futex waiter code
++  * observes that state when a task is exiting and loops until the task has
++  * actually finished the futex cleanup. The worst case for this is that the
++  * waiter runs through the wait loop until the state becomes visible.
++  *
++  * This is called from the recursive fault handling path in do_exit().
++  *
++  * This is best effort. Either the futex exit code has run already or
++  * not. If the OWNER_DIED bit has been set on the futex then the waiter can
++  * take it over. If not, the problem is pushed back to user space. If the
++  * futex exit code did not run yet, then an already queued waiter might
++  * block forever, but there is nothing which can be done about that.
++  */
++ void futex_exit_recursive(struct task_struct *tsk)
++ {
++ 	tsk->futex_state = FUTEX_STATE_DEAD;
++ }
++ 
++ void futex_exit_release(struct task_struct *tsk)
++ {
++ 	tsk->futex_state = FUTEX_STATE_EXITING;
++ 	/*
++ 	 * Ensure that all new tsk->pi_lock acquisitions must observe
++ 	 * FUTEX_STATE_EXITING. Serializes against attach_to_pi_owner().
++ 	 */
++ 	smp_mb();
++ 	/*
++ 	 * Ensure that we must observe the pi_state in exit_pi_state_list().
++ 	 */
++ 	raw_spin_lock_irq(&tsk->pi_lock);
++ 	raw_spin_unlock_irq(&tsk->pi_lock);
++ 
++ 	futex_exec_release(tsk);
++ 
++ 	tsk->futex_state = FUTEX_STATE_DEAD;
+++>>>>>>> 18f694385c4f (futex: Mark the begin of futex exit explicitly)
+  }
+  
+  long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+* Unmerged path include/linux/futex.h
+* Unmerged path kernel/exit.c
+* Unmerged path kernel/futex.c
