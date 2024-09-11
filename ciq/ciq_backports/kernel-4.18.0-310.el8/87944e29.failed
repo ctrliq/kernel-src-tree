@@ -1,0 +1,192 @@
+mm: Introduce page memcg flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 87944e2992bd28098c6806086a1e96bb4d0e502b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/87944e29.failed
+
+The lowest bit in page->memcg_data is used to distinguish between struct
+memory_cgroup pointer and a pointer to a objcgs array.  All checks and
+modifications of this bit are open-coded.
+
+Let's formalize it using page memcg flags, defined in enum
+page_memcg_data_flags.
+
+Additional flags might be added later.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+Link: https://lkml.kernel.org/r/20201027001657.3398190-4-guro@fb.com
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-4-guro@fb.com
+(cherry picked from commit 87944e2992bd28098c6806086a1e96bb4d0e502b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+diff --cc include/linux/memcontrol.h
+index 748026eb20df,99a4841d658b..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -408,6 -343,151 +408,154 @@@ struct mem_cgroup 
+  
+  extern struct mem_cgroup *root_mem_cgroup;
+  
+++<<<<<<< HEAD
+++=======
++ enum page_memcg_data_flags {
++ 	/* page->memcg_data is a pointer to an objcgs vector */
++ 	MEMCG_DATA_OBJCGS = (1UL << 0),
++ 	/* the next bit after the last actual flag */
++ 	__NR_MEMCG_DATA_FLAGS  = (1UL << 1),
++ };
++ 
++ #define MEMCG_DATA_FLAGS_MASK (__NR_MEMCG_DATA_FLAGS - 1)
++ 
++ /*
++  * page_memcg - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	return (struct mem_cgroup *)page->memcg_data;
++ }
++ 
++ /*
++  * page_memcg_rcu - locklessly get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  */
++ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	WARN_ON_ONCE(!rcu_read_lock_held());
++ 
++ 	return (struct mem_cgroup *)READ_ONCE(page->memcg_data);
++ }
++ 
++ /*
++  * page_memcg_check - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function unlike page_memcg() can take any  page
++  * as an argument. It has to be used in cases when it's not known if a page
++  * has an associated memory cgroup pointer or an object cgroups vector.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg_check(struct page *page)
++ {
++ 	/*
++ 	 * Because page->memcg_data might be changed asynchronously
++ 	 * for slab pages, READ_ONCE() should be used here.
++ 	 */
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	if (memcg_data & MEMCG_DATA_OBJCGS)
++ 		return NULL;
++ 
++ 	return (struct mem_cgroup *)memcg_data;
++ }
++ 
++ #ifdef CONFIG_MEMCG_KMEM
++ /*
++  * page_objcgs - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function assumes that the page is known to have an
++  * associated object cgroups vector. It's not safe to call this function
++  * against pages, which might have an associated memory cgroup: e.g.
++  * kernel stack pages.
++  */
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	VM_BUG_ON_PAGE(memcg_data && !(memcg_data & MEMCG_DATA_OBJCGS), page);
++ 
++ 	return (struct obj_cgroup **)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * page_objcgs_check - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function is safe to use if the page can be directly associated
++  * with a memory cgroup.
++  */
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	if (!memcg_data || !(memcg_data & MEMCG_DATA_OBJCGS))
++ 		return NULL;
++ 
++ 	return (struct obj_cgroup **)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * set_page_objcgs - associate a page with a object cgroups vector
++  * @page: a pointer to the page struct
++  * @objcgs: a pointer to the object cgroups vector
++  *
++  * Atomically associates a page with a vector of object cgroups.
++  */
++ static inline bool set_page_objcgs(struct page *page,
++ 					struct obj_cgroup **objcgs)
++ {
++ 	return !cmpxchg(&page->memcg_data, 0, (unsigned long)objcgs |
++ 			MEMCG_DATA_OBJCGS);
++ }
++ #else
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline bool set_page_objcgs(struct page *page,
++ 					struct obj_cgroup **objcgs)
++ {
++ 	return true;
++ }
++ #endif
++ 
+++>>>>>>> 87944e2992bd (mm: Introduce page memcg flags)
+  static __always_inline bool memcg_stat_item_in_bytes(int idx)
+  {
+  	if (idx == MEMCG_PERCPU_B)
+* Unmerged path include/linux/memcontrol.h
