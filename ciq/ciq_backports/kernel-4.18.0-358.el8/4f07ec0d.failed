@@ -1,0 +1,200 @@
+futex: Prevent inconsistent state and exit race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 4f07ec0d76f242d4ca0f0c0c6f7293c28254a554
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4f07ec0d.failed
+
+The recent rework of the requeue PI code introduced a possibility for
+going back to user space in inconsistent state:
+
+CPU 0				CPU 1
+
+requeue_futex()
+  if (lock_pifutex_user()) {
+      dequeue_waiter();
+      wake_waiter(task);
+				sched_in(task);
+     				return_from_futex_syscall();
+
+  ---> Inconsistent state because PI state is not established
+
+It becomes worse if the woken up task immediately exits:
+
+				sys_exit();
+				
+      attach_pistate(vpid);	<--- FAIL
+
+
+Attach the pi state before dequeuing and waking the waiter. If the waiter
+gets a spurious wakeup before the dequeue operation it will wait in
+futex_requeue_pi_wakeup_sync() and therefore cannot return and exit.
+
+Fixes: 07d91ef510fb ("futex: Prevent requeue_pi() lock nesting issue on RT")
+	Reported-by: syzbot+4d1bd0725ef09168e1a0@syzkaller.appspotmail.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20210902094414.558914045@linutronix.de
+
+
+(cherry picked from commit 4f07ec0d76f242d4ca0f0c0c6f7293c28254a554)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index 08f2ba214d67,04164d440d98..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -1885,17 -2046,42 +1900,43 @@@ futex_proxy_trylock_atomic(u32 __user *
+  	if (!match_futex(top_waiter->requeue_pi_key, key2))
+  		return -EINVAL;
+  
+ -	/* Ensure that this does not race against an early wakeup */
+ -	if (!futex_requeue_pi_prepare(top_waiter, NULL))
+ -		return -EAGAIN;
+ -
+  	/*
+- 	 * Try to take the lock for top_waiter.  Set the FUTEX_WAITERS bit in
+- 	 * the contended case or if set_waiters is 1.  The pi_state is returned
+- 	 * in ps in contended cases.
++ 	 * Try to take the lock for top_waiter and set the FUTEX_WAITERS bit
++ 	 * in the contended case or if @set_waiters is true.
++ 	 *
++ 	 * In the contended case PI state is attached to the lock owner. If
++ 	 * the user space lock can be acquired then PI state is attached to
++ 	 * the new owner (@top_waiter->task) when @set_waiters is true.
+  	 */
+  	vpid = task_pid_vnr(top_waiter->task);
+  	ret = futex_lock_pi_atomic(pifutex, hb2, key2, ps, top_waiter->task,
+  				   exiting, set_waiters);
+  	if (ret == 1) {
+++<<<<<<< HEAD
+ +		requeue_pi_wake_futex(top_waiter, key2, hb2);
+ +		return vpid;
+++=======
++ 		/*
++ 		 * Lock was acquired in user space and PI state was
++ 		 * attached to @top_waiter->task. That means state is fully
++ 		 * consistent and the waiter can return to user space
++ 		 * immediately after the wakeup.
++ 		 */
++ 		requeue_pi_wake_futex(top_waiter, key2, hb2);
++ 	} else if (ret < 0) {
++ 		/* Rewind top_waiter::requeue_state */
++ 		futex_requeue_pi_complete(top_waiter, ret);
++ 	} else {
++ 		/*
++ 		 * futex_lock_pi_atomic() did not acquire the user space
++ 		 * futex, but managed to establish the proxy lock and pi
++ 		 * state. top_waiter::requeue_state cannot be fixed up here
++ 		 * because the waiter is not enqueued on the rtmutex
++ 		 * yet. This is handled at the callsite depending on the
++ 		 * result of rt_mutex_start_proxy_lock() which is
++ 		 * guaranteed to be reached with this function returning 0.
++ 		 */
+++>>>>>>> 4f07ec0d76f2 (futex: Prevent inconsistent state and exit race)
+  	}
+  	return ret;
+  }
+@@@ -2042,45 -2230,57 +2083,71 @@@ retry_private
+  						 &exiting, nr_requeue);
+  
+  		/*
+++<<<<<<< HEAD
+ +		 * At this point the top_waiter has either taken uaddr2 or is
+ +		 * waiting on it.  If the former, then the pi_state will not
+ +		 * exist yet, look it up one more time to ensure we have a
+ +		 * reference to it. If the lock was taken, @ret contains the
+ +		 * VPID of the top waiter task.
+ +		 * If the lock was not taken, we have pi_state and an initial
+ +		 * refcount on it. In case of an error we have nothing.
+++=======
++ 		 * At this point the top_waiter has either taken uaddr2 or
++ 		 * is waiting on it. In both cases pi_state has been
++ 		 * established and an initial refcount on it. In case of an
++ 		 * error there's nothing.
++ 		 *
++ 		 * The top waiter's requeue_state is up to date:
++ 		 *
++ 		 *  - If the lock was acquired atomically (ret == 1), then
++ 		 *    the state is Q_REQUEUE_PI_LOCKED.
++ 		 *
++ 		 *    The top waiter has been dequeued and woken up and can
++ 		 *    return to user space immediately. The kernel/user
++ 		 *    space state is consistent. In case that there must be
++ 		 *    more waiters requeued the WAITERS bit in the user
++ 		 *    space futex is set so the top waiter task has to go
++ 		 *    into the syscall slowpath to unlock the futex. This
++ 		 *    will block until this requeue operation has been
++ 		 *    completed and the hash bucket locks have been
++ 		 *    dropped.
++ 		 *
++ 		 *  - If the trylock failed with an error (ret < 0) then
++ 		 *    the state is either Q_REQUEUE_PI_NONE, i.e. "nothing
++ 		 *    happened", or Q_REQUEUE_PI_IGNORE when there was an
++ 		 *    interleaved early wakeup.
++ 		 *
++ 		 *  - If the trylock did not succeed (ret == 0) then the
++ 		 *    state is either Q_REQUEUE_PI_IN_PROGRESS or
++ 		 *    Q_REQUEUE_PI_WAIT if an early wakeup interleaved.
++ 		 *    This will be cleaned up in the loop below, which
++ 		 *    cannot fail because futex_proxy_trylock_atomic() did
++ 		 *    the same sanity checks for requeue_pi as the loop
++ 		 *    below does.
+++>>>>>>> 4f07ec0d76f2 (futex: Prevent inconsistent state and exit race)
+  		 */
+- 		if (ret > 0) {
+- 			WARN_ON(pi_state);
+- 			task_count++;
+- 			/*
+- 			 * If futex_proxy_trylock_atomic() acquired the
+- 			 * user space futex, then the user space value
+- 			 * @uaddr2 has been set to the @hb1's top waiter
+- 			 * task VPID. This task is guaranteed to be alive
+- 			 * and cannot be exiting because it is either
+- 			 * sleeping or blocked on @hb2 lock.
+- 			 *
+- 			 * The @uaddr2 futex cannot have waiters either as
+- 			 * otherwise futex_proxy_trylock_atomic() would not
+- 			 * have succeeded.
+- 			 *
+- 			 * In order to requeue waiters to @hb2, pi state is
+- 			 * required. Hand in the VPID value (@ret) and
+- 			 * allocate PI state with an initial refcount on
+- 			 * it.
+- 			 */
+- 			ret = attach_to_pi_owner(uaddr2, ret, &key2, &pi_state,
+- 						 &exiting);
+- 			WARN_ON(ret);
+- 		}
+- 
+  		switch (ret) {
+  		case 0:
+  			/* We hold a reference on the pi state. */
+  			break;
+  
+++<<<<<<< HEAD
+ +			/* If the above failed, then pi_state is NULL */
+++=======
++ 		case 1:
++ 			/*
++ 			 * futex_proxy_trylock_atomic() acquired the user space
++ 			 * futex. Adjust task_count.
++ 			 */
++ 			task_count++;
++ 			ret = 0;
++ 			break;
++ 
++ 		/*
++ 		 * If the above failed, then pi_state is NULL and
++ 		 * waiter::requeue_state is correct.
++ 		 */
+++>>>>>>> 4f07ec0d76f2 (futex: Prevent inconsistent state and exit race)
+  		case -EFAULT:
+  			double_unlock_hb(hb1, hb2);
+  			hb_waiters_dec(hb2);
+* Unmerged path kernel/futex.c
