@@ -1,0 +1,127 @@
+net/tls: fix page double free on TX cleanup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: fix page double free on TX cleanup (Sabrina Dubroca) [1739260]
+Rebuild_FUZZ: 95.12%
+commit-author Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+commit 9354544cbccf68da1b047f8fb7b47630e3c8a59d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/9354544c.failed
+
+With commit 94850257cf0f ("tls: Fix tls_device handling of partial records")
+a new path was introduced to cleanup partial records during sk_proto_close.
+This path does not handle the SW KTLS tx_list cleanup.
+
+This is unnecessary though since the free_resources calls for both
+SW and offload paths will cleanup a partial record.
+
+The visible effect is the following warning, but this bug also causes
+a page double free.
+
+    WARNING: CPU: 7 PID: 4000 at net/core/stream.c:206 sk_stream_kill_queues+0x103/0x110
+    RIP: 0010:sk_stream_kill_queues+0x103/0x110
+    RSP: 0018:ffffb6df87e07bd0 EFLAGS: 00010206
+    RAX: 0000000000000000 RBX: ffff8c21db4971c0 RCX: 0000000000000007
+    RDX: ffffffffffffffa0 RSI: 000000000000001d RDI: ffff8c21db497270
+    RBP: ffff8c21db497270 R08: ffff8c29f4748600 R09: 000000010020001a
+    R10: ffffb6df87e07aa0 R11: ffffffff9a445600 R12: 0000000000000007
+    R13: 0000000000000000 R14: ffff8c21f03f2900 R15: ffff8c21f03b8df0
+    Call Trace:
+     inet_csk_destroy_sock+0x55/0x100
+     tcp_close+0x25d/0x400
+     ? tcp_check_oom+0x120/0x120
+     tls_sk_proto_close+0x127/0x1c0
+     inet_release+0x3c/0x60
+     __sock_release+0x3d/0xb0
+     sock_close+0x11/0x20
+     __fput+0xd8/0x210
+     task_work_run+0x84/0xa0
+     do_exit+0x2dc/0xb90
+     ? release_sock+0x43/0x90
+     do_group_exit+0x3a/0xa0
+     get_signal+0x295/0x720
+     do_signal+0x36/0x610
+     ? SYSC_recvfrom+0x11d/0x130
+     exit_to_usermode_loop+0x69/0xb0
+     do_syscall_64+0x173/0x180
+     entry_SYSCALL_64_after_hwframe+0x3d/0xa2
+    RIP: 0033:0x7fe9b9abc10d
+    RSP: 002b:00007fe9b19a1d48 EFLAGS: 00000246 ORIG_RAX: 00000000000000ca
+    RAX: fffffffffffffe00 RBX: 0000000000000006 RCX: 00007fe9b9abc10d
+    RDX: 0000000000000002 RSI: 0000000000000080 RDI: 00007fe948003430
+    RBP: 00007fe948003410 R08: 00007fe948003430 R09: 0000000000000000
+    R10: 0000000000000000 R11: 0000000000000246 R12: 00005603739d9080
+    R13: 00007fe9b9ab9f90 R14: 00007fe948003430 R15: 0000000000000000
+
+Fixes: 94850257cf0f ("tls: Fix tls_device handling of partial records")
+	Signed-off-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9354544cbccf68da1b047f8fb7b47630e3c8a59d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls.h
+diff --cc include/net/tls.h
+index 2eb5d4a087d6,53d96bca220d..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -320,28 -361,11 +320,29 @@@ int tls_push_sg(struct sock *sk, struc
+  		int flags);
+  int tls_push_partial_record(struct sock *sk, struct tls_context *ctx,
+  			    int flags);
+ -bool tls_free_partial_record(struct sock *sk, struct tls_context *ctx);
+  
+ -static inline struct tls_msg *tls_msg(struct sk_buff *skb)
+ +int tls_push_pending_closed_record(struct sock *sk, struct tls_context *ctx,
+ +				   int flags, long *timeo);
+ +
+ +static inline bool tls_is_pending_closed_record(struct tls_context *ctx)
+ +{
+ +	return test_bit(TLS_PENDING_CLOSED_RECORD, &ctx->flags);
+ +}
+ +
+++<<<<<<< HEAD
+ +static inline int tls_complete_pending_work(struct sock *sk,
+ +					    struct tls_context *ctx,
+ +					    int flags, long *timeo)
+  {
+ -	return (struct tls_msg *)strp_msg(skb);
+ +	int rc = 0;
+ +
+ +	if (unlikely(sk->sk_write_pending))
+ +		rc = wait_on_pending_writer(sk, timeo);
+ +
+ +	if (!rc && tls_is_pending_closed_record(ctx))
+ +		rc = tls_push_pending_closed_record(sk, ctx, flags, timeo);
+ +
+ +	return rc;
+  }
+  
+  static inline bool tls_is_partially_sent_record(struct tls_context *ctx)
+@@@ -349,6 -373,6 +350,8 @@@
+  	return !!ctx->partially_sent_record;
+  }
+  
+++=======
+++>>>>>>> 9354544cbccf (net/tls: fix page double free on TX cleanup)
+  static inline bool tls_is_pending_open_record(struct tls_context *tls_ctx)
+  {
+  	return tls_ctx->pending_open_record_frags;
+* Unmerged path include/net/tls.h
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index a3694e64e12d..85811c066fcb 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -268,7 +268,8 @@ static void tls_sk_proto_close(struct sock *sk, long timeout)
+ 		goto skip_tx_cleanup;
+ 	}
+ 
+-	if (!tls_complete_pending_work(sk, ctx, 0, &timeo))
++	if (unlikely(sk->sk_write_pending) &&
++	    !wait_on_pending_writer(sk, &timeo))
+ 		tls_handle_open_record(sk, 0);
+ 
+ 	/* We need these for tls_sw_fallback handling of other packets */
