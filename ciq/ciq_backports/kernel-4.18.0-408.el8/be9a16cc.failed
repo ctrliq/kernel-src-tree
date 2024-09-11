@@ -1,0 +1,93 @@
+net/smc: Cork when sendpage with MSG_SENDPAGE_NOTLAST flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Tony Lu <tonylu@linux.alibaba.com>
+commit be9a16cccaefac23cb16909e04bb65e62e09d515
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/be9a16cc.failed
+
+This introduces a new corked flag, MSG_SENDPAGE_NOTLAST, which is
+involved in syscall sendfile() [1], it indicates this is not the last
+page. So we can cork the data until the page is not specify this flag.
+It has the same effect as MSG_MORE, but existed in sendfile() only.
+
+This patch adds a option MSG_SENDPAGE_NOTLAST for corking data, try to
+cork more data before sending when using sendfile(), which acts like
+TCP's behaviour. Also, this reimplements the default sendpage to inform
+that it is supported to some extent.
+
+[1] https://man7.org/linux/man-pages/man2/sendfile.2.html
+
+	Signed-off-by: Tony Lu <tonylu@linux.alibaba.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit be9a16cccaefac23cb16909e04bb65e62e09d515)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_tx.c
+diff --cc net/smc/smc_tx.c
+index 31ee76131a79,a96ce162825e..000000000000
+--- a/net/smc/smc_tx.c
++++ b/net/smc/smc_tx.c
+@@@ -235,16 -235,17 +235,25 @@@ int smc_tx_sendmsg(struct smc_sock *smc
+  		 */
+  		if ((msg->msg_flags & MSG_OOB) && !send_remaining)
+  			conn->urg_tx_pend = true;
+++<<<<<<< HEAD
+ +		if ((msg->msg_flags & MSG_MORE || smc_tx_is_corked(smc)) &&
+ +		    (atomic_read(&conn->sndbuf_space) >
+ +						(conn->sndbuf_desc->len >> 1)))
+ +			/* for a corked socket defer the RDMA writes if there
+ +			 * is still sufficient sndbuf_space available
+++=======
++ 		if ((msg->msg_flags & MSG_MORE || smc_tx_is_corked(smc) ||
++ 		     msg->msg_flags & MSG_SENDPAGE_NOTLAST) &&
++ 		    (atomic_read(&conn->sndbuf_space)))
++ 			/* for a corked socket defer the RDMA writes if
++ 			 * sndbuf_space is still available. The applications
++ 			 * should known how/when to uncork it.
+++>>>>>>> be9a16cccaef (net/smc: Cork when sendpage with MSG_SENDPAGE_NOTLAST flag)
+  			 */
+ -			continue;
+ -		smc_tx_sndbuf_nonempty(conn);
+ -
+ -		trace_smc_tx_sendmsg(smc, copylen);
+ +			queue_delayed_work(conn->lgr->tx_wq, &conn->tx_work,
+ +					   SMC_TX_CORK_DELAY);
+ +		else
+ +			smc_tx_sndbuf_nonempty(conn);
+  	} /* while (msg_data_left(msg)) */
+  
+  	return send_done;
+diff --git a/net/smc/af_smc.c b/net/smc/af_smc.c
+index feb957973c38..a47142174424 100644
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -2599,8 +2599,10 @@ static ssize_t smc_sendpage(struct socket *sock, struct page *page,
+ 		rc = kernel_sendpage(smc->clcsock, page, offset,
+ 				     size, flags);
+ 	} else {
++		lock_sock(sk);
++		rc = smc_tx_sendpage(smc, page, offset, size, flags);
++		release_sock(sk);
+ 		SMC_STAT_INC(smc, sendpage_cnt);
+-		rc = sock_no_sendpage(sock, page, offset, size, flags);
+ 	}
+ 
+ out:
+* Unmerged path net/smc/smc_tx.c
+diff --git a/net/smc/smc_tx.h b/net/smc/smc_tx.h
+index a59f370b8b43..34b578498b1f 100644
+--- a/net/smc/smc_tx.h
++++ b/net/smc/smc_tx.h
+@@ -31,6 +31,8 @@ void smc_tx_pending(struct smc_connection *conn);
+ void smc_tx_work(struct work_struct *work);
+ void smc_tx_init(struct smc_sock *smc);
+ int smc_tx_sendmsg(struct smc_sock *smc, struct msghdr *msg, size_t len);
++int smc_tx_sendpage(struct smc_sock *smc, struct page *page, int offset,
++		    size_t size, int flags);
+ int smc_tx_sndbuf_nonempty(struct smc_connection *conn);
+ void smc_tx_sndbuf_nonfull(struct smc_sock *smc);
+ void smc_tx_consumer_update(struct smc_connection *conn, bool force);
