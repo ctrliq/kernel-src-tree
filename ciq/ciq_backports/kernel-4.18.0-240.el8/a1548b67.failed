@@ -1,0 +1,260 @@
+block: move rescan_partitions to fs/block_dev.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit a1548b674403c0de70cc29a1575689917ba60157
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a1548b67.failed
+
+Large parts of rescan_partitions aren't about partitions, and
+moving it to block_dev.c will allow for some further cleanups by
+merging it into its only caller.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a1548b674403c0de70cc29a1575689917ba60157)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/partition-generic.c
+#	include/linux/genhd.h
+diff --cc block/partition-generic.c
+index aee643ce13d1,2cbc23f6032c..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -509,26 -505,17 +509,30 @@@ static bool part_zone_aligned(struct ge
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
+++=======
++ int blk_add_partitions(struct gendisk *disk, struct block_device *bdev)
+++>>>>>>> a1548b674403 (block: move rescan_partitions to fs/block_dev.c)
+  {
+ -	struct parsed_partitions *state;
+ -	int ret = -EAGAIN, p, highest;
+ +	struct parsed_partitions *state = NULL;
+ +	struct hd_struct *part;
+ +	int p, highest, res;
+ +rescan:
+ +	if (state && !IS_ERR(state)) {
+ +		free_partitions(state);
+ +		state = NULL;
+ +	}
+  
+ -	state = check_partition(disk, bdev);
+ -	if (!state)
+ +	res = drop_partitions(disk, bdev);
+ +	if (res)
+ +		return res;
+ +
+ +	if (disk->fops->revalidate_disk)
+ +		disk->fops->revalidate_disk(disk);
+ +	check_disk_size_change(disk, bdev, true);
+ +	bdev->bd_invalidated = 0;
+ +	if (!get_capacity(disk) || !(state = check_partition(disk, bdev)))
+  		return 0;
+  	if (IS_ERR(state)) {
+  		/*
+@@@ -567,98 -564,18 +571,101 @@@
+  	for (p = 1, highest = 0; p < state->limit; p++)
+  		if (state->parts[p].size)
+  			highest = p;
+ +
+  	disk_expand_part_tbl(disk, highest);
+  
+ -	for (p = 1; p < state->limit; p++)
+ -		if (!blk_add_partition(disk, bdev, state, p))
+ -			goto out_free_state;
+ +	/* add partitions */
+ +	for (p = 1; p < state->limit; p++) {
+ +		sector_t size, from;
+ +
+ +		size = state->parts[p].size;
+ +		if (!size)
+ +			continue;
+ +
+ +		from = state->parts[p].from;
+ +		if (from >= get_capacity(disk)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d start %llu is beyond EOD, ",
+ +			       disk->disk_name, p, (unsigned long long) from);
+ +			if (disk_unlock_native_capacity(disk))
+ +				goto rescan;
+ +			continue;
+ +		}
+ +
+ +		if (from + size > get_capacity(disk)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d size %llu extends beyond EOD, ",
+ +			       disk->disk_name, p, (unsigned long long) size);
+ +
+ +			if (disk_unlock_native_capacity(disk)) {
+ +				/* free state and restart */
+ +				goto rescan;
+ +			} else {
+ +				/*
+ +				 * we can not ignore partitions of broken tables
+ +				 * created by for example camera firmware, but
+ +				 * we limit them to the end of the disk to avoid
+ +				 * creating invalid block devices
+ +				 */
+ +				size = get_capacity(disk) - from;
+ +			}
+ +		}
+ +
+ +		/*
+ +		 * On a zoned block device, partitions should be aligned on the
+ +		 * device zone size (i.e. zone boundary crossing not allowed).
+ +		 * Otherwise, resetting the write pointer of the last zone of
+ +		 * one partition may impact the following partition.
+ +		 */
+ +		if (bdev_is_zoned(bdev) &&
+ +		    !part_zone_aligned(disk, bdev, from, size)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d start %llu+%llu is not zone aligned\n",
+ +			       disk->disk_name, p, (unsigned long long) from,
+ +			       (unsigned long long) size);
+ +			continue;
+ +		}
+  
+ -	ret = 0;
+ -out_free_state:
+ +		part = add_partition(disk, p, from, size,
+ +				     state->parts[p].flags,
+ +				     &state->parts[p].info);
+ +		if (IS_ERR(part)) {
+ +			printk(KERN_ERR " %s: p%d could not be added: %ld\n",
+ +			       disk->disk_name, p, -PTR_ERR(part));
+ +			continue;
+ +		}
+ +#ifdef CONFIG_BLK_DEV_MD
+ +		if (state->parts[p].flags & ADDPART_FLAG_RAID)
+ +			md_autodetect_dev(part_to_dev(part)->devt);
+ +#endif
+ +	}
+  	free_partitions(state);
+ -	return ret;
+ +	return 0;
+ +}
+ +
+++<<<<<<< HEAD
+ +int invalidate_partitions(struct gendisk *disk, struct block_device *bdev)
+ +{
+ +	int res;
+ +
+ +	if (!bdev->bd_invalidated)
+ +		return 0;
+ +
+ +	res = drop_partitions(disk, bdev);
+ +	if (res)
+ +		return res;
+ +
+ +	set_capacity(disk, 0);
+ +	check_disk_size_change(disk, bdev, false);
+ +	bdev->bd_invalidated = 0;
+ +	/* tell userspace that the media / partition table may have changed */
+ +	kobject_uevent(&disk_to_dev(disk)->kobj, KOBJ_CHANGE);
+ +
+ +	return 0;
+  }
+  
+++=======
+++>>>>>>> a1548b674403 (block: move rescan_partitions to fs/block_dev.c)
+  unsigned char *read_dev_sector(struct block_device *bdev, sector_t n, Sector *p)
+  {
+  	struct address_space *mapping = bdev->bd_inode->i_mapping;
+diff --cc include/linux/genhd.h
+index fe1fb3b4d909,f5cffbf63abf..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -627,9 -621,9 +627,14 @@@ extern void blk_invalidate_devt(dev_t d
+  extern dev_t blk_lookup_devt(const char *name, int partno);
+  extern char *disk_name (struct gendisk *hd, int partno, char *buf);
+  
++ int blk_add_partitions(struct gendisk *disk, struct block_device *bdev);
++ int blk_drop_partitions(struct gendisk *disk, struct block_device *bdev);
+  extern int disk_expand_part_tbl(struct gendisk *disk, int target);
+++<<<<<<< HEAD
+ +extern int rescan_partitions(struct gendisk *disk, struct block_device *bdev);
+ +extern int invalidate_partitions(struct gendisk *disk, struct block_device *bdev);
+++=======
+++>>>>>>> a1548b674403 (block: move rescan_partitions to fs/block_dev.c)
+  extern struct hd_struct * __must_check add_partition(struct gendisk *disk,
+  						     int partno, sector_t start,
+  						     sector_t len, int flags,
+* Unmerged path block/partition-generic.c
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 445bfb04306f..a21a673c6d4b 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1437,8 +1437,8 @@ static void flush_disk(struct block_device *bdev, bool kill_dirty)
+  * and adjusts it if it differs. When shrinking the bdev size, its all caches
+  * are freed.
+  */
+-void check_disk_size_change(struct gendisk *disk, struct block_device *bdev,
+-		bool verbose)
++static void check_disk_size_change(struct gendisk *disk,
++		struct block_device *bdev, bool verbose)
+ {
+ 	loff_t disk_size, bdev_size;
+ 
+@@ -1529,6 +1529,40 @@ EXPORT_SYMBOL(bd_set_size);
+ 
+ static void __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part);
+ 
++static int rescan_partitions(struct gendisk *disk, struct block_device *bdev,
++		bool invalidate)
++{
++	int ret;
++
++rescan:
++	ret = blk_drop_partitions(disk, bdev);
++	if (ret)
++		return ret;
++
++	if (invalidate)
++		set_capacity(disk, 0);
++	else if (disk->fops->revalidate_disk)
++		disk->fops->revalidate_disk(disk);
++
++	check_disk_size_change(disk, bdev, !invalidate);
++	bdev->bd_invalidated = 0;
++
++	if (!get_capacity(disk)) {
++		/*
++		 * Tell userspace that the media / partition table may have
++		 * changed.
++		 */
++		kobject_uevent(&disk_to_dev(disk)->kobj, KOBJ_CHANGE);
++		return 0;
++	}
++
++	ret = blk_add_partitions(disk, bdev);
++	if (ret == -EAGAIN)
++		goto rescan;
++	return ret;
++}
++
++
+ static void bdev_disk_changed(struct block_device *bdev, bool invalidate)
+ {
+ 	if (disk_part_scan_enabled(bdev->bd_disk)) {
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 652bd41d3698..79fb3386f2fc 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2688,8 +2688,6 @@ extern void make_bad_inode(struct inode *);
+ extern bool is_bad_inode(struct inode *);
+ 
+ #ifdef CONFIG_BLOCK
+-extern void check_disk_size_change(struct gendisk *disk,
+-		struct block_device *bdev, bool verbose);
+ extern int revalidate_disk(struct gendisk *);
+ extern int check_disk_change(struct block_device *);
+ extern int __invalidate_device(struct block_device *, bool);
+* Unmerged path include/linux/genhd.h
