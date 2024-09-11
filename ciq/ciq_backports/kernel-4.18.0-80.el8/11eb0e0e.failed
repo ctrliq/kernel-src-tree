@@ -1,0 +1,239 @@
+PCI: Make early dump functionality generic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Sinan Kaya <okaya@codeaurora.org>
+commit 11eb0e0e8dea8b97cff972b09cf6fb033b729dff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/11eb0e0e.failed
+
+Move early dump functionality into common code so that it is available for
+all architectures.  No need to carry arch-specific reads around as the read
+hooks are already initialized by the time pci_setup_device() is getting
+called during scan.
+
+	Tested-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+	Signed-off-by: Sinan Kaya <okaya@codeaurora.org>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+(cherry picked from commit 11eb0e0e8dea8b97cff972b09cf6fb033b729dff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index e757de3c62e8,f11b9485ed7f..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -3023,31 -2994,8 +3023,36 @@@
+  			See header of drivers/block/paride/pcd.c.
+  			See also Documentation/blockdev/paride.txt.
+  
+++<<<<<<< HEAD
+ +	pci=option[,option...]	[PCI] various PCI subsystem options.
+ +
+ +				Some options herein operate on a specific device
+ +				or a set of devices (<pci_dev>). These are
+ +				specified in one of the following formats:
+ +
+ +				[<domain>:]<bus>:<dev>.<func>[/<dev>.<func>]*
+ +				pci:<vendor>:<device>[:<subvendor>:<subdevice>]
+ +
+ +				Note: the first format specifies a PCI
+ +				bus/device/function address which may change
+ +				if new hardware is inserted, if motherboard
+ +				firmware changes, or due to changes caused
+ +				by other kernel parameters. If the
+ +				domain is left unspecified, it is
+ +				taken to be zero. Optionally, a path
+ +				to a device through multiple device/function
+ +				addresses can be specified after the base
+ +				address (this is more robust against
+ +				renumbering issues).  The second format
+ +				selects devices using IDs from the
+ +				configuration space which may match multiple
+ +				devices in the system.
+ +
+ +		earlydump	[X86] dump PCI config space before the kernel
+++=======
++ 	pci=option[,option...]	[PCI] various PCI subsystem options:
++ 		earlydump	dump PCI config space before the kernel
+++>>>>>>> 11eb0e0e8dea (PCI: Make early dump functionality generic)
+  				changes anything
+  		off		[X86] don't probe for the PCI bus
+  		bios		[X86-32] force use of PCI BIOS, don't access
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+diff --git a/arch/x86/include/asm/pci-direct.h b/arch/x86/include/asm/pci-direct.h
+index e1084f71a295..94597a3cf3d0 100644
+--- a/arch/x86/include/asm/pci-direct.h
++++ b/arch/x86/include/asm/pci-direct.h
+@@ -15,8 +15,4 @@ extern void write_pci_config_byte(u8 bus, u8 slot, u8 func, u8 offset, u8 val);
+ extern void write_pci_config_16(u8 bus, u8 slot, u8 func, u8 offset, u16 val);
+ 
+ extern int early_pci_allowed(void);
+-
+-extern unsigned int pci_early_dump_regs;
+-extern void early_dump_pci_device(u8 bus, u8 slot, u8 func);
+-extern void early_dump_pci_devices(void);
+ #endif /* _ASM_X86_PCI_DIRECT_H */
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 74b4472ba0a6..8f26247b59f8 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -997,11 +997,6 @@ void __init setup_arch(char **cmdline_p)
+ 		setup_clear_cpu_cap(X86_FEATURE_APIC);
+ 	}
+ 
+-#ifdef CONFIG_PCI
+-	if (pci_early_dump_regs)
+-		early_dump_pci_devices();
+-#endif
+-
+ 	e820__reserve_setup_data();
+ 	e820__finish_early_params();
+ 
+diff --git a/arch/x86/pci/common.c b/arch/x86/pci/common.c
+index 563049c483a1..d4ec117c1142 100644
+--- a/arch/x86/pci/common.c
++++ b/arch/x86/pci/common.c
+@@ -22,7 +22,6 @@
+ unsigned int pci_probe = PCI_PROBE_BIOS | PCI_PROBE_CONF1 | PCI_PROBE_CONF2 |
+ 				PCI_PROBE_MMCONF;
+ 
+-unsigned int pci_early_dump_regs;
+ static int pci_bf_sort;
+ int pci_routeirq;
+ int noioapicquirk;
+@@ -599,9 +598,6 @@ char *__init pcibios_setup(char *str)
+ 		pci_probe |= PCI_BIG_ROOT_WINDOW;
+ 		return NULL;
+ #endif
+-	} else if (!strcmp(str, "earlydump")) {
+-		pci_early_dump_regs = 1;
+-		return NULL;
+ 	} else if (!strcmp(str, "routeirq")) {
+ 		pci_routeirq = 1;
+ 		return NULL;
+diff --git a/arch/x86/pci/early.c b/arch/x86/pci/early.c
+index e5f753cbb1c3..f5fc953e5848 100644
+--- a/arch/x86/pci/early.c
++++ b/arch/x86/pci/early.c
+@@ -57,47 +57,3 @@ int early_pci_allowed(void)
+ 			PCI_PROBE_CONF1;
+ }
+ 
+-void early_dump_pci_device(u8 bus, u8 slot, u8 func)
+-{
+-	u32 value[256 / 4];
+-	int i;
+-
+-	pr_info("pci 0000:%02x:%02x.%d config space:\n", bus, slot, func);
+-
+-	for (i = 0; i < 256; i += 4)
+-		value[i / 4] = read_pci_config(bus, slot, func, i);
+-
+-	print_hex_dump(KERN_INFO, "", DUMP_PREFIX_OFFSET, 16, 1, value, 256, false);
+-}
+-
+-void early_dump_pci_devices(void)
+-{
+-	unsigned bus, slot, func;
+-
+-	if (!early_pci_allowed())
+-		return;
+-
+-	for (bus = 0; bus < 256; bus++) {
+-		for (slot = 0; slot < 32; slot++) {
+-			for (func = 0; func < 8; func++) {
+-				u32 class;
+-				u8 type;
+-
+-				class = read_pci_config(bus, slot, func,
+-							PCI_CLASS_REVISION);
+-				if (class == 0xffffffff)
+-					continue;
+-
+-				early_dump_pci_device(bus, slot, func);
+-
+-				if (func == 0) {
+-					type = read_pci_config_byte(bus, slot,
+-								    func,
+-							       PCI_HEADER_TYPE);
+-					if (!(type & 0x80))
+-						break;
+-				}
+-			}
+-		}
+-	}
+-}
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 7061667b7c84..47b504a7da47 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -114,6 +114,9 @@ static bool pcie_ari_disabled;
+ /* If set, the PCIe ATS capability will not be used. */
+ static bool pcie_ats_disabled;
+ 
++/* If set, the PCI config space of each device is printed during boot. */
++bool pci_early_dump;
++
+ bool pci_ats_disabled(void)
+ {
+ 	return pcie_ats_disabled;
+@@ -6087,6 +6090,8 @@ static int __init pci_setup(char *str)
+ 				pcie_ats_disabled = true;
+ 			} else if (!strcmp(str, "noaer")) {
+ 				pci_no_aer();
++			} else if (!strcmp(str, "earlydump")) {
++				pci_early_dump = true;
+ 			} else if (!strncmp(str, "realloc=", 8)) {
+ 				pci_realloc_get_opt(str + 8);
+ 			} else if (!strncmp(str, "realloc", 7)) {
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index d8291f0ea7a2..803737815b03 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -7,6 +7,7 @@
+ #define PCI_VSEC_ID_INTEL_TBT	0x1234	/* Thunderbolt */
+ 
+ extern const unsigned char pcie_link_speed[];
++extern bool pci_early_dump;
+ 
+ bool pcie_cap_has_lnkctl(const struct pci_dev *dev);
+ 
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index f3d2fcc05cda..8fa78f0ae4d9 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -1548,6 +1548,20 @@ static int pci_intx_mask_broken(struct pci_dev *dev)
+ 	return 0;
+ }
+ 
++static void early_dump_pci_device(struct pci_dev *pdev)
++{
++	u32 value[256 / 4];
++	int i;
++
++	pci_info(pdev, "config space:\n");
++
++	for (i = 0; i < 256; i += 4)
++		pci_read_config_dword(pdev, i, &value[i / 4]);
++
++	print_hex_dump(KERN_INFO, "", DUMP_PREFIX_OFFSET, 16, 1,
++		       value, 256, false);
++}
++
+ /**
+  * pci_setup_device - Fill in class and map information of a device
+  * @dev: the device structure to fill
+@@ -1597,6 +1611,9 @@ int pci_setup_device(struct pci_dev *dev)
+ 	pci_printk(KERN_DEBUG, dev, "[%04x:%04x] type %02x class %#08x\n",
+ 		   dev->vendor, dev->device, dev->hdr_type, dev->class);
+ 
++	if (pci_early_dump)
++		early_dump_pci_device(dev);
++
+ 	/* Need to have dev->class ready */
+ 	dev->cfg_size = pci_cfg_space_size(dev);
+ 
