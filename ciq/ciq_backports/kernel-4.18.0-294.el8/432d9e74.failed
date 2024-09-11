@@ -1,0 +1,282 @@
+mptcp: use the variable sk instead of open-coding
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Geliang Tang <geliangtang@gmail.com>
+commit 432d9e74d8a303fc0e897392e7b8334ba222c5f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/432d9e74.failed
+
+Since the local variable sk has been defined, use it instead of
+open-coding.
+
+	Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 432d9e74d8a303fc0e897392e7b8334ba222c5f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/pm_netlink.c
+diff --cc net/mptcp/pm_netlink.c
+index 6f3bf9fdbbbc,5151cfcd6962..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -179,14 -187,133 +179,14 @@@ static void check_work_pending(struct m
+  		WRITE_ONCE(msk->pm.work_pending, false);
+  }
+  
+ -static struct mptcp_pm_add_entry *
+ -lookup_anno_list_by_saddr(struct mptcp_sock *msk,
+ -			  struct mptcp_addr_info *addr)
+ -{
+ -	struct mptcp_pm_add_entry *entry;
+ -
+ -	list_for_each_entry(entry, &msk->pm.anno_list, list) {
+ -		if (addresses_equal(&entry->addr, addr, false))
+ -			return entry;
+ -	}
+ -
+ -	return NULL;
+ -}
+ -
+ -static void mptcp_pm_add_timer(struct timer_list *timer)
+ -{
+ -	struct mptcp_pm_add_entry *entry = from_timer(entry, timer, add_timer);
+ -	struct mptcp_sock *msk = entry->sock;
+ -	struct sock *sk = (struct sock *)msk;
+ -
+ -	pr_debug("msk=%p", msk);
+ -
+ -	if (!msk)
+ -		return;
+ -
+ -	if (inet_sk_state_load(sk) == TCP_CLOSE)
+ -		return;
+ -
+ -	if (!entry->addr.id)
+ -		return;
+ -
+ -	if (mptcp_pm_should_add_signal(msk)) {
+ -		sk_reset_timer(sk, timer, jiffies + TCP_RTO_MAX / 8);
+ -		goto out;
+ -	}
+ -
+ -	spin_lock_bh(&msk->pm.lock);
+ -
+ -	if (!mptcp_pm_should_add_signal(msk)) {
+ -		pr_debug("retransmit ADD_ADDR id=%d", entry->addr.id);
+ -		mptcp_pm_announce_addr(msk, &entry->addr, false, entry->addr.port);
+ -		mptcp_pm_add_addr_send_ack(msk);
+ -		entry->retrans_times++;
+ -	}
+ -
+ -	if (entry->retrans_times < ADD_ADDR_RETRANS_MAX)
+ -		sk_reset_timer(sk, timer,
+ -			       jiffies + mptcp_get_add_addr_timeout(sock_net(sk)));
+ -
+ -	spin_unlock_bh(&msk->pm.lock);
+ -
+ -out:
+ -	__sock_put(sk);
+ -}
+ -
+ -struct mptcp_pm_add_entry *
+ -mptcp_pm_del_add_timer(struct mptcp_sock *msk,
+ -		       struct mptcp_addr_info *addr)
+ -{
+ -	struct mptcp_pm_add_entry *entry;
+ -	struct sock *sk = (struct sock *)msk;
+ -
+ -	spin_lock_bh(&msk->pm.lock);
+ -	entry = lookup_anno_list_by_saddr(msk, addr);
+ -	if (entry)
+ -		entry->retrans_times = ADD_ADDR_RETRANS_MAX;
+ -	spin_unlock_bh(&msk->pm.lock);
+ -
+ -	if (entry)
+ -		sk_stop_timer_sync(sk, &entry->add_timer);
+ -
+ -	return entry;
+ -}
+ -
+ -static bool mptcp_pm_alloc_anno_list(struct mptcp_sock *msk,
+ -				     struct mptcp_pm_addr_entry *entry)
+ -{
+ -	struct mptcp_pm_add_entry *add_entry = NULL;
+ -	struct sock *sk = (struct sock *)msk;
+ -	struct net *net = sock_net(sk);
+ -
+ -	if (lookup_anno_list_by_saddr(msk, &entry->addr))
+ -		return false;
+ -
+ -	add_entry = kmalloc(sizeof(*add_entry), GFP_ATOMIC);
+ -	if (!add_entry)
+ -		return false;
+ -
+ -	list_add(&add_entry->list, &msk->pm.anno_list);
+ -
+ -	add_entry->addr = entry->addr;
+ -	add_entry->sock = msk;
+ -	add_entry->retrans_times = 0;
+ -
+ -	timer_setup(&add_entry->add_timer, mptcp_pm_add_timer, 0);
+ -	sk_reset_timer(sk, &add_entry->add_timer,
+ -		       jiffies + mptcp_get_add_addr_timeout(net));
+ -
+ -	return true;
+ -}
+ -
+ -void mptcp_pm_free_anno_list(struct mptcp_sock *msk)
+ -{
+ -	struct mptcp_pm_add_entry *entry, *tmp;
+ -	struct sock *sk = (struct sock *)msk;
+ -	LIST_HEAD(free_list);
+ -
+ -	pr_debug("msk=%p", msk);
+ -
+ -	spin_lock_bh(&msk->pm.lock);
+ -	list_splice_init(&msk->pm.anno_list, &free_list);
+ -	spin_unlock_bh(&msk->pm.lock);
+ -
+ -	list_for_each_entry_safe(entry, tmp, &free_list, list) {
+ -		sk_stop_timer_sync(sk, &entry->add_timer);
+ -		kfree(entry);
+ -	}
+ -}
+ -
+  static void mptcp_pm_create_subflow_or_signal_addr(struct mptcp_sock *msk)
+  {
+ -	struct mptcp_addr_info remote = { 0 };
+  	struct sock *sk = (struct sock *)msk;
+  	struct mptcp_pm_addr_entry *local;
+ +	struct mptcp_addr_info remote;
+  	struct pm_nl_pernet *pernet;
+  
+- 	pernet = net_generic(sock_net((struct sock *)msk), pm_nl_pernet_id);
++ 	pernet = net_generic(sock_net(sk), pm_nl_pernet_id);
+  
+  	pr_debug("local %d:%d signal %d:%d subflows %d:%d\n",
+  		 msk->pm.local_addr_used, msk->pm.local_addr_max,
+@@@ -267,8 -399,114 +267,12 @@@ void mptcp_pm_nl_add_addr_received(stru
+  	local.family = remote.family;
+  
+  	spin_unlock_bh(&msk->pm.lock);
+++<<<<<<< HEAD
+ +	__mptcp_subflow_connect((struct sock *)msk, 0, &local, &remote);
+++=======
++ 	__mptcp_subflow_connect(sk, &local, &remote);
+++>>>>>>> 432d9e74d8a3 (mptcp: use the variable sk instead of open-coding)
+  	spin_lock_bh(&msk->pm.lock);
+ -
+ -	mptcp_pm_announce_addr(msk, &remote, true, use_port);
+ -	mptcp_pm_nl_add_addr_send_ack(msk);
+ -}
+ -
+ -void mptcp_pm_nl_add_addr_send_ack(struct mptcp_sock *msk)
+ -{
+ -	struct mptcp_subflow_context *subflow;
+ -
+ -	if (!mptcp_pm_should_add_signal_ipv6(msk) &&
+ -	    !mptcp_pm_should_add_signal_port(msk))
+ -		return;
+ -
+ -	__mptcp_flush_join_list(msk);
+ -	subflow = list_first_entry_or_null(&msk->conn_list, typeof(*subflow), node);
+ -	if (subflow) {
+ -		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ -		u8 add_addr;
+ -
+ -		spin_unlock_bh(&msk->pm.lock);
+ -		if (mptcp_pm_should_add_signal_ipv6(msk))
+ -			pr_debug("send ack for add_addr6");
+ -		if (mptcp_pm_should_add_signal_port(msk))
+ -			pr_debug("send ack for add_addr_port");
+ -
+ -		lock_sock(ssk);
+ -		tcp_send_ack(ssk);
+ -		release_sock(ssk);
+ -		spin_lock_bh(&msk->pm.lock);
+ -
+ -		add_addr = READ_ONCE(msk->pm.addr_signal);
+ -		if (mptcp_pm_should_add_signal_ipv6(msk))
+ -			add_addr &= ~BIT(MPTCP_ADD_ADDR_IPV6);
+ -		if (mptcp_pm_should_add_signal_port(msk))
+ -			add_addr &= ~BIT(MPTCP_ADD_ADDR_PORT);
+ -		WRITE_ONCE(msk->pm.addr_signal, add_addr);
+ -	}
+ -}
+ -
+ -void mptcp_pm_nl_rm_addr_received(struct mptcp_sock *msk)
+ -{
+ -	struct mptcp_subflow_context *subflow, *tmp;
+ -	struct sock *sk = (struct sock *)msk;
+ -
+ -	pr_debug("address rm_id %d", msk->pm.rm_id);
+ -
+ -	if (!msk->pm.rm_id)
+ -		return;
+ -
+ -	if (list_empty(&msk->conn_list))
+ -		return;
+ -
+ -	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
+ -		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ -		int how = RCV_SHUTDOWN | SEND_SHUTDOWN;
+ -
+ -		if (msk->pm.rm_id != subflow->remote_id)
+ -			continue;
+ -
+ -		spin_unlock_bh(&msk->pm.lock);
+ -		mptcp_subflow_shutdown(sk, ssk, how);
+ -		__mptcp_close_ssk(sk, ssk, subflow);
+ -		spin_lock_bh(&msk->pm.lock);
+ -
+ -		msk->pm.add_addr_accepted--;
+ -		msk->pm.subflows--;
+ -		WRITE_ONCE(msk->pm.accept_addr, true);
+ -
+ -		__MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_RMADDR);
+ -
+ -		break;
+ -	}
+ -}
+ -
+ -void mptcp_pm_nl_rm_subflow_received(struct mptcp_sock *msk, u8 rm_id)
+ -{
+ -	struct mptcp_subflow_context *subflow, *tmp;
+ -	struct sock *sk = (struct sock *)msk;
+ -
+ -	pr_debug("subflow rm_id %d", rm_id);
+ -
+ -	if (!rm_id)
+ -		return;
+ -
+ -	if (list_empty(&msk->conn_list))
+ -		return;
+ -
+ -	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
+ -		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ -		int how = RCV_SHUTDOWN | SEND_SHUTDOWN;
+ -
+ -		if (rm_id != subflow->local_id)
+ -			continue;
+ -
+ -		spin_unlock_bh(&msk->pm.lock);
+ -		mptcp_subflow_shutdown(sk, ssk, how);
+ -		__mptcp_close_ssk(sk, ssk, subflow);
+ -		spin_lock_bh(&msk->pm.lock);
+ -
+ -		msk->pm.local_addr_used--;
+ -		msk->pm.subflows--;
+ -
+ -		__MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_RMSUBFLOW);
+ -
+ -		break;
+ -	}
+  }
+  
+  static bool address_use_port(struct mptcp_pm_addr_entry *entry)
+* Unmerged path net/mptcp/pm_netlink.c
