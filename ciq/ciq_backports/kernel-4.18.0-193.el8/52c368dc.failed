@@ -1,0 +1,236 @@
+net/mlx5: Move health and page alloc init to mdev_init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Move health and page alloc init to mdev_init (Alaa Hleihel) [1724335]
+Rebuild_FUZZ: 96.15%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 52c368dc3da7beb7b283133024af1b6d07bf93b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/52c368dc.failed
+
+Software structure initialization should be in mdev_init stage.
+
+This provides a better logical separation of mlx5 core device
+initialization flow and will help to seamlessly support creating different
+mlx5 device types such as PF, VF and SF mlx5 sub-function virtual device.
+
+This patch does not change any functionality.
+
+	Signed-off-by: Vu Pham <vuhuong@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 52c368dc3da7beb7b283133024af1b6d07bf93b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 10376022a40f,4bdcbfcc5476..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -1249,29 -1217,15 +1249,33 @@@ static const struct devlink_ops mlx5_de
+  #endif
+  };
+  
+ -static int mlx5_mdev_init(struct mlx5_core_dev *dev, int profile_idx, const char *name)
+ +#define MLX5_IB_MOD "mlx5_ib"
+ +static int init_one(struct pci_dev *pdev,
+ +		    const struct pci_device_id *id)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5_core_dev *dev;
+ +	struct devlink *devlink;
+ +	struct mlx5_priv *priv;
+++=======
++ 	struct mlx5_priv *priv = &dev->priv;
+++>>>>>>> 52c368dc3da7 (net/mlx5: Move health and page alloc init to mdev_init)
+  	int err;
+  
+ -	strncpy(priv->name, name, MLX5_MAX_NAME_LEN);
+ -	priv->name[MLX5_MAX_NAME_LEN - 1] = 0;
+ +	devlink = devlink_alloc(&mlx5_devlink_ops, sizeof(*dev));
+ +	if (!devlink) {
+ +		dev_err(&pdev->dev, "kzalloc failed\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	dev = devlink_priv(devlink);
+ +	priv = &dev->priv;
+ +	priv->pci_dev_data = id->driver_data;
+ +
+ +	pci_set_drvdata(pdev, dev);
+  
+ -	dev->profile = &profile[profile_idx];
+ +	dev->pdev = pdev;
+ +	dev->profile = &profile[prof_sel];
+  
+  	INIT_LIST_HEAD(&priv->ctx_list);
+  	spin_lock_init(&priv->ctx_lock);
+@@@ -1283,23 -1237,68 +1287,86 @@@
+  	INIT_LIST_HEAD(&priv->bfregs.reg_head.list);
+  	INIT_LIST_HEAD(&priv->bfregs.wc_head.list);
+  
+++<<<<<<< HEAD
+ +	err = mlx5_pci_init(dev, priv);
+++=======
++ 	mutex_init(&priv->alloc_mutex);
++ 	mutex_init(&priv->pgdir_mutex);
++ 	INIT_LIST_HEAD(&priv->pgdir_list);
++ 	spin_lock_init(&priv->mkey_lock);
++ 
++ 	priv->dbg_root = debugfs_create_dir(name, mlx5_debugfs_root);
++ 	if (!priv->dbg_root) {
++ 		pr_err("mlx5_core: %s error, Cannot create debugfs dir, aborting\n", name);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	err = mlx5_health_init(dev);
++ 	if (err)
++ 		goto err_health_init;
++ 
++ 	err = mlx5_pagealloc_init(dev);
++ 	if (err)
++ 		goto err_pagealloc_init;
++ 
++ 	return 0;
++ 
++ err_pagealloc_init:
++ 	mlx5_health_cleanup(dev);
++ err_health_init:
++ 	debugfs_remove(dev->priv.dbg_root);
++ 
++ 	return err;
++ }
++ 
++ static void mlx5_mdev_uninit(struct mlx5_core_dev *dev)
++ {
++ 	mlx5_pagealloc_cleanup(dev);
++ 	mlx5_health_cleanup(dev);
++ 	debugfs_remove_recursive(dev->priv.dbg_root);
++ }
++ 
++ #define MLX5_IB_MOD "mlx5_ib"
++ static int init_one(struct pci_dev *pdev, const struct pci_device_id *id)
++ {
++ 	struct mlx5_core_dev *dev;
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	devlink = devlink_alloc(&mlx5_devlink_ops, sizeof(*dev));
++ 	if (!devlink) {
++ 		dev_err(&pdev->dev, "kzalloc failed\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	dev = devlink_priv(devlink);
++ 
++ 	err = mlx5_mdev_init(dev, prof_sel, dev_name(&pdev->dev));
++ 	if (err)
++ 		goto mdev_init_err;
++ 
++ 	err = mlx5_pci_init(dev, pdev, id);
+++>>>>>>> 52c368dc3da7 (net/mlx5: Move health and page alloc init to mdev_init)
+  	if (err) {
+  		dev_err(&pdev->dev, "mlx5_pci_init failed with error code %d\n", err);
+ -		goto pci_init_err;
+ +		goto clean_dev;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	err = mlx5_health_init(dev);
+ +	if (err) {
+ +		dev_err(&pdev->dev, "mlx5_health_init failed with error code %d\n", err);
+ +		goto close_pci;
+  	}
+  
+ +	err = mlx5_pagealloc_init(dev);
+ +	if (err)
+ +		goto err_pagealloc_init;
+ +
+ +	err = mlx5_load_one(dev, priv, true);
+++=======
++ 	err = mlx5_load_one(dev, true);
+++>>>>>>> 52c368dc3da7 (net/mlx5: Move health and page alloc init to mdev_init)
+  	if (err) {
+  		dev_err(&pdev->dev, "mlx5_load_one failed with error code %d\n", err);
+  		goto err_load_one;
+@@@ -1315,14 -1314,13 +1382,24 @@@
+  	return 0;
+  
+  clean_load:
+++<<<<<<< HEAD
+ +	mlx5_unload_one(dev, priv, true);
+ +err_load_one:
+ +	mlx5_pagealloc_cleanup(dev);
+ +err_pagealloc_init:
+ +	mlx5_health_cleanup(dev);
+ +close_pci:
+ +	mlx5_pci_close(dev, priv);
+ +clean_dev:
+++=======
++ 	mlx5_unload_one(dev, true);
++ 
++ err_load_one:
++ 	mlx5_pci_close(dev);
++ pci_init_err:
++ 	mlx5_mdev_uninit(dev);
++ mdev_init_err:
+++>>>>>>> 52c368dc3da7 (net/mlx5: Move health and page alloc init to mdev_init)
+  	devlink_free(devlink);
+  
+  	return err;
+@@@ -1337,15 -1334,14 +1414,20 @@@ static void remove_one(struct pci_dev *
+  	devlink_unregister(devlink);
+  	mlx5_unregister_device(dev);
+  
+ -	if (mlx5_unload_one(dev, true)) {
+ +	if (mlx5_unload_one(dev, priv, true)) {
+  		dev_err(&dev->pdev->dev, "mlx5_unload_one failed\n");
+- 		mlx5_health_cleanup(dev);
++ 		mlx5_health_flush(dev);
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	mlx5_pagealloc_cleanup(dev);
+ +	mlx5_health_cleanup(dev);
+ +	mlx5_pci_close(dev, priv);
+++=======
++ 	mlx5_pci_close(dev);
++ 	mlx5_mdev_uninit(dev);
+++>>>>>>> 52c368dc3da7 (net/mlx5: Move health and page alloc init to mdev_init)
+  	devlink_free(devlink);
+  }
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/health.c b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+index cb9fa3430c53..b0e3f809e886 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@ -352,6 +352,13 @@ void mlx5_drain_health_recovery(struct mlx5_core_dev *dev)
+ 	cancel_delayed_work_sync(&dev->priv.health.recover_work);
+ }
+ 
++void mlx5_health_flush(struct mlx5_core_dev *dev)
++{
++	struct mlx5_core_health *health = &dev->priv.health;
++
++	flush_workqueue(health->wq);
++}
++
+ void mlx5_health_cleanup(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_core_health *health = &dev->priv.health;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 6e446cd593cf..ccb9db7d1278 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -887,6 +887,7 @@ void mlx5_cmd_mbox_status(void *out, u8 *status, u32 *syndrome);
+ int mlx5_core_get_caps(struct mlx5_core_dev *dev, enum mlx5_cap_type cap_type);
+ int mlx5_cmd_alloc_uar(struct mlx5_core_dev *dev, u32 *uarn);
+ int mlx5_cmd_free_uar(struct mlx5_core_dev *dev, u32 uarn);
++void mlx5_health_flush(struct mlx5_core_dev *dev);
+ void mlx5_health_cleanup(struct mlx5_core_dev *dev);
+ int mlx5_health_init(struct mlx5_core_dev *dev);
+ void mlx5_start_health_poll(struct mlx5_core_dev *dev);
