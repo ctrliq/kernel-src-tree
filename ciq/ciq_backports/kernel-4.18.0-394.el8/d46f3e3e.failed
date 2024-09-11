@@ -1,0 +1,175 @@
+driver core: Improve fw_devlink & deferred_probe_timeout interaction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Saravana Kannan <saravanak@google.com>
+commit d46f3e3ed5276e756caf40f760d4902d15c12dcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/d46f3e3e.failed
+
+deferred_probe_timeout kernel commandline parameter allows probing of
+consumer devices if the supplier devices don't have any drivers.
+
+fw_devlink=on will indefintely block probe() calls on a device if all
+its suppliers haven't probed successfully. This completely skips calls
+to driver_deferred_probe_check_state() since that's only called when a
+.probe() function calls framework APIs. So fw_devlink=on breaks
+deferred_probe_timeout.
+
+deferred_probe_timeout in its current state also ignores a lot of
+information that's now available to the kernel. It assumes all suppliers
+that haven't probed when the timer expires (or when initcalls are done
+on a static kernel) will never probe and fails any calls to acquire
+resources from these unprobed suppliers.
+
+However, this assumption by deferred_probe_timeout isn't true under many
+conditions. For example:
+- If the consumer happens to be before the supplier in the deferred
+  probe list.
+- If the supplier itself is waiting on its supplier to probe.
+
+This patch fixes both these issues by relaxing device links between
+devices only if the supplier doesn't have any driver that could match
+with (NOT bound to) the supplier device. This way, we only fail attempts
+to acquire resources from suppliers that truly don't have any driver vs
+suppliers that just happen to not have probed yet.
+
+	Signed-off-by: Saravana Kannan <saravanak@google.com>
+Link: https://lore.kernel.org/r/20210402040342.2944858-3-saravanak@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d46f3e3ed5276e756caf40f760d4902d15c12dcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/dd.c
+diff --cc drivers/base/dd.c
+index fbde0bb9032b,59113543a154..000000000000
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@@ -341,9 -294,11 +341,15 @@@ int driver_deferred_probe_check_state_c
+  
+  static void deferred_probe_timeout_work_func(struct work_struct *work)
+  {
+ -	struct device_private *private, *p;
+ +	struct device_private *p;
+  
+++<<<<<<< HEAD
+ +	deferred_probe_timeout = 0;
+++=======
++ 	fw_devlink_drivers_done();
++ 
++ 	driver_deferred_probe_timeout = 0;
+++>>>>>>> d46f3e3ed527 (driver core: Improve fw_devlink & deferred_probe_timeout interaction)
+  	driver_deferred_probe_trigger();
+  	flush_work(&deferred_probe_work);
+  
+diff --git a/drivers/base/base.h b/drivers/base/base.h
+index a0d7b1c3b6a4..35ad697077fb 100644
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -178,6 +178,7 @@ extern void device_links_driver_cleanup(struct device *dev);
+ extern void device_links_no_driver(struct device *dev);
+ extern bool device_links_busy(struct device *dev);
+ extern void device_links_unbind_consumers(struct device *dev);
++extern void fw_devlink_drivers_done(void);
+ 
+ /* device pm support */
+ void device_pm_move_to_tail(struct device *dev);
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 692983f660a3..d197195cc4d8 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -51,6 +51,7 @@ static LIST_HEAD(deferred_sync);
+ static unsigned int defer_sync_state_count = 1;
+ static DEFINE_MUTEX(fwnode_link_lock);
+ static bool fw_devlink_is_permissive(void);
++static bool fw_devlink_drv_reg_done;
+ 
+ /**
+  * fwnode_link_add - Create a link between two fwnode_handles.
+@@ -1587,6 +1588,52 @@ static void fw_devlink_parse_fwtree(struct fwnode_handle *fwnode)
+ 		fw_devlink_parse_fwtree(child);
+ }
+ 
++static void fw_devlink_relax_link(struct device_link *link)
++{
++	if (!(link->flags & DL_FLAG_INFERRED))
++		return;
++
++	if (link->flags == (DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE))
++		return;
++
++	pm_runtime_drop_link(link);
++	link->flags = DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE;
++	dev_dbg(link->consumer, "Relaxing link with %s\n",
++		dev_name(link->supplier));
++}
++
++static int fw_devlink_no_driver(struct device *dev, void *data)
++{
++	struct device_link *link = to_devlink(dev);
++
++	if (!link->supplier->can_match)
++		fw_devlink_relax_link(link);
++
++	return 0;
++}
++
++void fw_devlink_drivers_done(void)
++{
++	fw_devlink_drv_reg_done = true;
++	device_links_write_lock();
++	class_for_each_device(&devlink_class, NULL, NULL,
++			      fw_devlink_no_driver);
++	device_links_write_unlock();
++}
++
++static void fw_devlink_unblock_consumers(struct device *dev)
++{
++	struct device_link *link;
++
++	if (!fw_devlink_flags || fw_devlink_is_permissive())
++		return;
++
++	device_links_write_lock();
++	list_for_each_entry(link, &dev->links.consumers, s_node)
++		fw_devlink_relax_link(link);
++	device_links_write_unlock();
++}
++
+ /**
+  * fw_devlink_relax_cycle - Convert cyclic links to SYNC_STATE_ONLY links
+  * @con: Device to check dependencies for.
+@@ -1623,13 +1670,7 @@ static int fw_devlink_relax_cycle(struct device *con, void *sup)
+ 
+ 		ret = 1;
+ 
+-		if (!(link->flags & DL_FLAG_INFERRED))
+-			continue;
+-
+-		pm_runtime_drop_link(link);
+-		link->flags = DL_FLAG_MANAGED | FW_DEVLINK_FLAGS_PERMISSIVE;
+-		dev_dbg(link->consumer, "Relaxing link with %s\n",
+-			dev_name(link->supplier));
++		fw_devlink_relax_link(link);
+ 	}
+ 	return ret;
+ }
+@@ -3282,6 +3323,15 @@ int device_add(struct device *dev)
+ 	}
+ 
+ 	bus_probe_device(dev);
++
++	/*
++	 * If all driver registration is done and a newly added device doesn't
++	 * match with any driver, don't block its consumers from probing in
++	 * case the consumer device is able to operate without this supplier.
++	 */
++	if (dev->fwnode && fw_devlink_drv_reg_done && !dev->can_match)
++		fw_devlink_unblock_consumers(dev);
++
+ 	if (parent)
+ 		klist_add_tail(&dev->p->knode_parent,
+ 			       &parent->p->klist_children);
+* Unmerged path drivers/base/dd.c
