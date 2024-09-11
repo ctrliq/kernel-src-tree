@@ -1,0 +1,139 @@
+net/mlx5e: Move netif_carrier_off() out of mlx5e_priv_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Roi Dayan <roid@nvidia.com>
+commit 1227bbc5d09e73d4ff952d833b20be8855840401
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/1227bbc5.failed
+
+It's not part of priv initialization.
+
+	Signed-off-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 1227bbc5d09e73d4ff952d833b20be8855840401)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 4b7d83e6ef25,e468d8329c2a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -5345,11 -5515,14 +5342,17 @@@ struct net_device *mlx5e_create_netdev(
+  		return NULL;
+  	}
+  
+ -	err = mlx5e_priv_init(netdev_priv(netdev), netdev, mdev);
+ +	err = profile->init(mdev, netdev, profile, ppriv);
+  	if (err) {
+ -		mlx5_core_err(mdev, "mlx5e_priv_init failed, err=%d\n", err);
+ +		mlx5_core_err(mdev, "failed to init mlx5e profile %d\n", err);
+  		goto err_free_netdev;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	netif_carrier_off(netdev);
++ 	dev_net_set(netdev, mlx5_core_net(mdev));
+++>>>>>>> 1227bbc5d09e (net/mlx5e: Move netif_carrier_off() out of mlx5e_priv_init())
+  
+  	return netdev;
+  
+@@@ -5432,13 -5616,76 +5435,81 @@@ void mlx5e_detach_netdev(struct mlx5e_p
+  	cancel_work_sync(&priv->update_stats_work);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ mlx5e_netdev_attach_profile(struct mlx5e_priv *priv,
++ 			    const struct mlx5e_profile *new_profile, void *new_ppriv)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	int err;
++ 
++ 	err = mlx5e_priv_init(priv, netdev, mdev);
++ 	if (err) {
++ 		mlx5_core_err(mdev, "mlx5e_priv_init failed, err=%d\n", err);
++ 		return err;
++ 	}
++ 	netif_carrier_off(netdev);
++ 	priv->profile = new_profile;
++ 	priv->ppriv = new_ppriv;
++ 	err = new_profile->init(priv->mdev, priv->netdev);
++ 	if (err)
++ 		return err;
++ 	err = mlx5e_attach_netdev(priv);
++ 	if (err)
++ 		new_profile->cleanup(priv);
++ 	return err;
++ }
++ 
++ int mlx5e_netdev_change_profile(struct mlx5e_priv *priv,
++ 				const struct mlx5e_profile *new_profile, void *new_ppriv)
++ {
++ 	unsigned int new_max_nch = mlx5e_calc_max_nch(priv, new_profile);
++ 	const struct mlx5e_profile *orig_profile = priv->profile;
++ 	void *orig_ppriv = priv->ppriv;
++ 	int err, rollback_err;
++ 
++ 	/* sanity */
++ 	if (new_max_nch != priv->max_nch) {
++ 		netdev_warn(priv->netdev,
++ 			    "%s: Replacing profile with different max channles\n",
++ 			    __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* cleanup old profile */
++ 	mlx5e_detach_netdev(priv);
++ 	priv->profile->cleanup(priv);
++ 	mlx5e_priv_cleanup(priv);
++ 
++ 	err = mlx5e_netdev_attach_profile(priv, new_profile, new_ppriv);
++ 	if (err) { /* roll back to original profile */
++ 		netdev_warn(priv->netdev, "%s: new profile init failed, %d\n",
++ 			    __func__, err);
++ 		goto rollback;
++ 	}
++ 
++ 	return 0;
++ 
++ rollback:
++ 	rollback_err = mlx5e_netdev_attach_profile(priv, orig_profile, orig_ppriv);
++ 	if (rollback_err) {
++ 		netdev_err(priv->netdev,
++ 			   "%s: failed to rollback to orig profile, %d\n",
++ 			   __func__, rollback_err);
++ 	}
++ 	return err;
++ }
++ 
+++>>>>>>> 1227bbc5d09e (net/mlx5e: Move netif_carrier_off() out of mlx5e_priv_init())
+  void mlx5e_destroy_netdev(struct mlx5e_priv *priv)
+  {
+ +	const struct mlx5e_profile *profile = priv->profile;
+  	struct net_device *netdev = priv->netdev;
+  
+ -	mlx5e_priv_cleanup(priv);
+ +	if (profile->cleanup)
+ +		profile->cleanup(priv);
+  	free_netdev(netdev);
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 97b5fcb1f406..1346c73d8b28 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -84,6 +84,7 @@ int mlx5i_init(struct mlx5_core_dev *mdev,
+ 	if (err)
+ 		return err;
+ 
++	netif_carrier_off(netdev);
+ 	mlx5e_set_netdev_mtu_boundaries(priv);
+ 	netdev->mtu = netdev->max_mtu;
+ 
