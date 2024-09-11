@@ -956,9 +956,14 @@ static int blkcg_print_stat(struct seq_file *sf, void *v)
 		int i;
 		bool has_stats = false;
 
+		spin_lock_irq(&blkg->q->queue_lock);
+
+		if (!blkg->online)
+			goto skip;
+
 		dname = blkg_dev_name(blkg);
 		if (!dname)
-			continue;
+			goto skip;
 
 		/*
 		 * Hooray string manipulation, count is the size written NOT
@@ -967,8 +972,6 @@ static int blkcg_print_stat(struct seq_file *sf, void *v)
 		 * the \0 so we only add count to buf.
 		 */
 		off += scnprintf(buf+off, size-off, "%s ", dname);
-
-		spin_lock_irq(&blkg->q->queue_lock);
 
 		blkg_rwstat_recursive_sum(blkg, NULL,
 				offsetof(struct blkcg_gq, stat_bytes), &rwstat);
@@ -981,8 +984,6 @@ static int blkcg_print_stat(struct seq_file *sf, void *v)
 		rios = rwstat.cnt[BLKG_RWSTAT_READ];
 		wios = rwstat.cnt[BLKG_RWSTAT_WRITE];
 		dios = rwstat.cnt[BLKG_RWSTAT_DISCARD];
-
-		spin_unlock_irq(&blkg->q->queue_lock);
 
 		if (rbytes || wbytes || rios || wios) {
 			has_stats = true;
@@ -1024,6 +1025,8 @@ next:
 				seq_commit(sf, -1);
 			}
 		}
+	skip:
+		spin_unlock_irq(&blkg->q->queue_lock);
 	}
 
 	rcu_read_unlock();
