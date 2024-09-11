@@ -1,0 +1,86 @@
+KVM: s390/mm: Make pages accessible before destroying the guest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christian Borntraeger <borntraeger@de.ibm.com>
+commit 1274800792dced8e5b6d54c71ec049c4d1e34189
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/12748007.failed
+
+Before we destroy the secure configuration, we better make all
+pages accessible again. This also happens during reboot, where we reboot
+into a non-secure guest that then can go again into secure mode. As
+this "new" secure guest will have a new ID we cannot reuse the old page
+state.
+
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Reviewed-by: Thomas Huth <thuth@redhat.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+(cherry picked from commit 1274800792dced8e5b6d54c71ec049c4d1e34189)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/gmap.h
+#	arch/s390/kvm/pv.c
+diff --cc arch/s390/include/asm/gmap.h
+index fcbd638fb9f4,a816fb4734b8..000000000000
+--- a/arch/s390/include/asm/gmap.h
++++ b/arch/s390/include/asm/gmap.h
+@@@ -142,4 -148,6 +142,9 @@@ int gmap_mprotect_notify(struct gmap *
+  
+  void gmap_sync_dirty_log_pmd(struct gmap *gmap, unsigned long dirty_bitmap[4],
+  			     unsigned long gaddr, unsigned long vmaddr);
+++<<<<<<< HEAD
+++=======
++ int gmap_mark_unmergeable(void);
++ void s390_reset_acc(struct mm_struct *mm);
+++>>>>>>> 1274800792dc (KVM: s390/mm: Make pages accessible before destroying the guest)
+  #endif /* _ASM_S390_GMAP_H */
+* Unmerged path arch/s390/kvm/pv.c
+* Unmerged path arch/s390/include/asm/gmap.h
+* Unmerged path arch/s390/kvm/pv.c
+diff --git a/arch/s390/mm/gmap.c b/arch/s390/mm/gmap.c
+index 911c7ded35f1..53286ebacc18 100644
+--- a/arch/s390/mm/gmap.c
++++ b/arch/s390/mm/gmap.c
+@@ -2637,3 +2637,38 @@ void s390_reset_cmma(struct mm_struct *mm)
+ 	up_write(&mm->mmap_sem);
+ }
+ EXPORT_SYMBOL_GPL(s390_reset_cmma);
++
++/*
++ * make inaccessible pages accessible again
++ */
++static int __s390_reset_acc(pte_t *ptep, unsigned long addr,
++			    unsigned long next, struct mm_walk *walk)
++{
++	pte_t pte = READ_ONCE(*ptep);
++
++	if (pte_present(pte))
++		WARN_ON_ONCE(uv_convert_from_secure(pte_val(pte) & PAGE_MASK));
++	return 0;
++}
++
++static const struct mm_walk_ops reset_acc_walk_ops = {
++	.pte_entry		= __s390_reset_acc,
++};
++
++#include <linux/sched/mm.h>
++void s390_reset_acc(struct mm_struct *mm)
++{
++	/*
++	 * we might be called during
++	 * reset:                             we walk the pages and clear
++	 * close of all kvm file descriptors: we walk the pages and clear
++	 * exit of process on fd closure:     vma already gone, do nothing
++	 */
++	if (!mmget_not_zero(mm))
++		return;
++	down_read(&mm->mmap_sem);
++	walk_page_range(mm, 0, TASK_SIZE, &reset_acc_walk_ops, NULL);
++	up_read(&mm->mmap_sem);
++	mmput(mm);
++}
++EXPORT_SYMBOL_GPL(s390_reset_acc);
