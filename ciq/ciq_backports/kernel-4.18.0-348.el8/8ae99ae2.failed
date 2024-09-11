@@ -1,0 +1,570 @@
+ceph: rename the metric helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Xiubo Li <xiubli@redhat.com>
+commit 8ae99ae2b40766a73026d5793942b4fea6d9ed31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/8ae99ae2.failed
+
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 8ae99ae2b40766a73026d5793942b4fea6d9ed31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+diff --cc fs/ceph/addr.c
+index d9c178f2c6ed,bc9864524fde..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -182,163 -185,180 +182,230 @@@ static int ceph_releasepage(struct pag
+  	return !PagePrivate(page);
+  }
+  
+ -static void ceph_netfs_expand_readahead(struct netfs_read_request *rreq)
+ +/* read a single page, without unlocking it. */
+ +static int ceph_do_readpage(struct file *filp, struct page *page)
+  {
+++<<<<<<< HEAD
+ +	struct inode *inode = file_inode(filp);
+++=======
++ 	struct inode *inode = rreq->mapping->host;
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_file_layout *lo = &ci->i_layout;
++ 	u32 blockoff;
++ 	u64 blockno;
++ 
++ 	/* Expand the start downward */
++ 	blockno = div_u64_rem(rreq->start, lo->stripe_unit, &blockoff);
++ 	rreq->start = blockno * lo->stripe_unit;
++ 	rreq->len += blockoff;
++ 
++ 	/* Now, round up the length to the next block */
++ 	rreq->len = roundup(rreq->len, lo->stripe_unit);
++ }
++ 
++ static bool ceph_netfs_clamp_length(struct netfs_read_subrequest *subreq)
++ {
++ 	struct inode *inode = subreq->rreq->mapping->host;
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	u64 objno, objoff;
++ 	u32 xlen;
++ 
++ 	/* Truncate the extent at the end of the current block */
++ 	ceph_calc_file_object_mapping(&ci->i_layout, subreq->start, subreq->len,
++ 				      &objno, &objoff, &xlen);
++ 	subreq->len = min(xlen, fsc->mount_options->rsize);
++ 	return true;
++ }
++ 
++ static void finish_netfs_read(struct ceph_osd_request *req)
++ {
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(req->r_inode);
++ 	struct ceph_osd_data *osd_data = osd_req_op_extent_osd_data(req, 0);
++ 	struct netfs_read_subrequest *subreq = req->r_priv;
++ 	int num_pages;
++ 	int err = req->r_result;
++ 
++ 	ceph_update_read_metrics(&fsc->mdsc->metric, req->r_start_latency,
++ 				 req->r_end_latency, err);
++ 
++ 	dout("%s: result %d subreq->len=%zu i_size=%lld\n", __func__, req->r_result,
++ 	     subreq->len, i_size_read(req->r_inode));
++ 
++ 	/* no object means success but no data */
++ 	if (err == -ENOENT)
++ 		err = 0;
++ 	else if (err == -EBLOCKLISTED)
++ 		fsc->blocklisted = true;
++ 
++ 	if (err >= 0 && err < subreq->len)
++ 		__set_bit(NETFS_SREQ_CLEAR_TAIL, &subreq->flags);
++ 
++ 	netfs_subreq_terminated(subreq, err, true);
++ 
++ 	num_pages = calc_pages_for(osd_data->alignment, osd_data->length);
++ 	ceph_put_page_vector(osd_data->pages, num_pages, false);
++ 	iput(req->r_inode);
++ }
++ 
++ static void ceph_netfs_issue_op(struct netfs_read_subrequest *subreq)
++ {
++ 	struct netfs_read_request *rreq = subreq->rreq;
++ 	struct inode *inode = rreq->mapping->host;
+++>>>>>>> 8ae99ae2b407 (ceph: rename the metric helpers)
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ +	struct ceph_osd_client *osdc = &fsc->client->osdc;
+  	struct ceph_osd_request *req;
+  	struct ceph_vino vino = ceph_vino(inode);
+ -	struct iov_iter iter;
+ -	struct page **pages;
+ -	size_t page_off;
+  	int err = 0;
+ -	u64 len = subreq->len;
+ +	u64 off = page_offset(page);
+ +	u64 len = PAGE_SIZE;
+  
+ -	req = ceph_osdc_new_request(&fsc->client->osdc, &ci->i_layout, vino, subreq->start, &len,
+ -			0, 1, CEPH_OSD_OP_READ,
+ -			CEPH_OSD_FLAG_READ | fsc->client->osdc.client->options->read_from_replica,
+ -			NULL, ci->i_truncate_seq, ci->i_truncate_size, false);
+ -	if (IS_ERR(req)) {
+ -		err = PTR_ERR(req);
+ -		req = NULL;
+ -		goto out;
+ +	if (off >= i_size_read(inode)) {
+ +		zero_user_segment(page, 0, PAGE_SIZE);
+ +		SetPageUptodate(page);
+ +		return 0;
+ +	}
+ +
+ +	if (ci->i_inline_version != CEPH_INLINE_NONE) {
+ +		/*
+ +		 * Uptodate inline data should have been added
+ +		 * into page cache while getting Fcr caps.
+ +		 */
+ +		if (off == 0)
+ +			return -EINVAL;
+ +		zero_user_segment(page, 0, PAGE_SIZE);
+ +		SetPageUptodate(page);
+ +		return 0;
+  	}
+  
+ -	dout("%s: pos=%llu orig_len=%zu len=%llu\n", __func__, subreq->start, subreq->len, len);
+ -	iov_iter_xarray(&iter, READ, &rreq->mapping->i_pages, subreq->start, len);
+ -	err = iov_iter_get_pages_alloc(&iter, &pages, len, &page_off);
+ +	err = ceph_readpage_from_fscache(inode, page);
+ +	if (err == 0)
+ +		return -EINPROGRESS;
+ +
+ +	dout("readpage ino %llx.%llx file %p off %llu len %llu page %p index %lu\n",
+ +	     vino.ino, vino.snap, filp, off, len, page, page->index);
+ +	req = ceph_osdc_new_request(osdc, &ci->i_layout, vino, off, &len, 0, 1,
+ +				    CEPH_OSD_OP_READ, CEPH_OSD_FLAG_READ, NULL,
+ +				    ci->i_truncate_seq, ci->i_truncate_size,
+ +				    false);
+ +	if (IS_ERR(req))
+ +		return PTR_ERR(req);
+ +
+ +	osd_req_op_extent_osd_data_pages(req, 0, &page, len, 0, false, false);
+ +
+ +	err = ceph_osdc_start_request(osdc, req, false);
+ +	if (!err)
+ +		err = ceph_osdc_wait_request(osdc, req);
+ +
+ +	ceph_update_read_latency(&fsc->mdsc->metric, req->r_start_latency,
+ +				 req->r_end_latency, err);
+ +
+ +	ceph_osdc_put_request(req);
+ +	dout("readpage result %d\n", err);
+ +
+ +	if (err == -ENOENT)
+ +		err = 0;
+  	if (err < 0) {
+ -		dout("%s: iov_ter_get_pages_alloc returned %d\n", __func__, err);
+ +		ceph_fscache_readpage_cancel(inode, page);
+ +		if (err == -EBLOCKLISTED)
+ +			fsc->blocklisted = true;
+  		goto out;
+  	}
+ +	if (err < PAGE_SIZE)
+ +		/* zero fill remainder of page */
+ +		zero_user_segment(page, err, PAGE_SIZE);
+ +	else
+ +		flush_dcache_page(page);
+  
+ -	/* should always give us a page-aligned read */
+ -	WARN_ON_ONCE(page_off);
+ -	len = err;
+ -
+ -	osd_req_op_extent_osd_data_pages(req, 0, pages, len, 0, false, false);
+ -	req->r_callback = finish_netfs_read;
+ -	req->r_priv = subreq;
+ -	req->r_inode = inode;
+ -	ihold(inode);
+ +	SetPageUptodate(page);
+ +	ceph_readpage_to_fscache(inode, page);
+  
+ -	err = ceph_osdc_start_request(req->r_osdc, req, false);
+ -	if (err)
+ -		iput(inode);
+  out:
+ -	ceph_osdc_put_request(req);
+ -	if (err)
+ -		netfs_subreq_terminated(subreq, err, false);
+ -	dout("%s: result %d\n", __func__, err);
+ +	return err < 0 ? err : 0;
+  }
+  
+ -static void ceph_init_rreq(struct netfs_read_request *rreq, struct file *file)
+ +static int ceph_readpage(struct file *filp, struct page *page)
+  {
+ +	int r = ceph_do_readpage(filp, page);
+ +	if (r != -EINPROGRESS)
+ +		unlock_page(page);
+ +	else
+ +		r = 0;
+ +	return r;
+  }
+  
+ -static void ceph_readahead_cleanup(struct address_space *mapping, void *priv)
+ +/*
+ + * Finish an async read(ahead) op.
+ + */
+ +static void finish_read(struct ceph_osd_request *req)
+  {
+ -	struct inode *inode = mapping->host;
+ -	struct ceph_inode_info *ci = ceph_inode(inode);
+ -	int got = (uintptr_t)priv;
+ -
+ -	if (got)
+ -		ceph_put_cap_refs(ci, got);
+ -}
+ -
+ -const struct netfs_read_request_ops ceph_netfs_read_ops = {
+ -	.init_rreq		= ceph_init_rreq,
+ -	.is_cache_enabled	= ceph_is_cache_enabled,
+ -	.begin_cache_operation	= ceph_begin_cache_operation,
+ -	.issue_op		= ceph_netfs_issue_op,
+ -	.expand_readahead	= ceph_netfs_expand_readahead,
+ -	.clamp_length		= ceph_netfs_clamp_length,
+ -	.check_write_begin	= ceph_netfs_check_write_begin,
+ -	.cleanup		= ceph_readahead_cleanup,
+ -};
+ +	struct inode *inode = req->r_inode;
+ +	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ +	struct ceph_osd_data *osd_data;
+ +	int rc = req->r_result <= 0 ? req->r_result : 0;
+ +	int bytes = req->r_result >= 0 ? req->r_result : 0;
+ +	int num_pages;
+ +	int i;
+  
+ -/* read a single page, without unlocking it. */
+ -static int ceph_readpage(struct file *file, struct page *page)
+ -{
+ -	struct inode *inode = file_inode(file);
+ -	struct ceph_inode_info *ci = ceph_inode(inode);
+ -	struct ceph_vino vino = ceph_vino(inode);
+ -	u64 off = page_offset(page);
+ -	u64 len = PAGE_SIZE;
+ +	dout("finish_read %p req %p rc %d bytes %d\n", inode, req, rc, bytes);
+ +	if (rc == -EBLOCKLISTED)
+ +		ceph_inode_to_client(inode)->blocklisted = true;
+  
+ -	if (ci->i_inline_version != CEPH_INLINE_NONE) {
+ -		/*
+ -		 * Uptodate inline data should have been added
+ -		 * into page cache while getting Fcr caps.
+ -		 */
+ -		if (off == 0) {
+ -			unlock_page(page);
+ -			return -EINVAL;
+ +	/* unlock all pages, zeroing any data we didn't read */
+ +	osd_data = osd_req_op_extent_osd_data(req, 0);
+ +	BUG_ON(osd_data->type != CEPH_OSD_DATA_TYPE_PAGES);
+ +	num_pages = calc_pages_for((u64)osd_data->alignment,
+ +					(u64)osd_data->length);
+ +	for (i = 0; i < num_pages; i++) {
+ +		struct page *page = osd_data->pages[i];
+ +
+ +		if (rc < 0 && rc != -ENOENT) {
+ +			ceph_fscache_readpage_cancel(inode, page);
+ +			goto unlock;
+  		}
+ -		zero_user_segment(page, 0, PAGE_SIZE);
+ +		if (bytes < (int)PAGE_SIZE) {
+ +			/* zero (remainder of) page */
+ +			int s = bytes < 0 ? 0 : bytes;
+ +			zero_user_segment(page, s, PAGE_SIZE);
+ +		}
+ + 		dout("finish_read %p uptodate %p idx %lu\n", inode, page,
+ +		     page->index);
+ +		flush_dcache_page(page);
+  		SetPageUptodate(page);
+ +		ceph_readpage_to_fscache(inode, page);
+ +unlock:
+  		unlock_page(page);
+ -		return 0;
+ +		put_page(page);
+ +		bytes -= PAGE_SIZE;
+  	}
+  
+ -	dout("readpage ino %llx.%llx file %p off %llu len %llu page %p index %lu\n",
+ -	     vino.ino, vino.snap, file, off, len, page, page->index);
+ +	ceph_update_read_latency(&fsc->mdsc->metric, req->r_start_latency,
+ +				 req->r_end_latency, rc);
+  
+ -	return netfs_readpage(file, page, &ceph_netfs_read_ops, NULL);
+ +	kfree(osd_data->pages);
+  }
+  
+ -static void ceph_readahead(struct readahead_control *ractl)
+ +/*
+ + * start an async read(ahead) operation.  return nr_pages we submitted
+ + * a read for on success, or negative error code.
+ + */
+ +static int start_read(struct inode *inode, struct ceph_rw_context *rw_ctx,
+ +		      struct list_head *page_list, int max)
+  {
+ -	struct inode *inode = file_inode(ractl->file);
+ -	struct ceph_file_info *fi = ractl->file->private_data;
+ -	struct ceph_rw_context *rw_ctx;
+ +	struct ceph_osd_client *osdc =
+ +		&ceph_inode_to_client(inode)->client->osdc;
+ +	struct ceph_inode_info *ci = ceph_inode(inode);
+ +	struct page *page = list_entry(page_list->prev, struct page, lru);
+ +	struct ceph_vino vino;
+ +	struct ceph_osd_request *req;
+ +	u64 off;
+ +	u64 len;
+ +	int i;
+ +	struct page **pages;
+ +	pgoff_t next_index;
+ +	int nr_pages = 0;
+  	int got = 0;
+  	int ret = 0;
+  
+* Unmerged path fs/ceph/addr.c
+diff --git a/fs/ceph/debugfs.c b/fs/ceph/debugfs.c
+index e7c5152d25a6..b5b4b7334817 100644
+--- a/fs/ceph/debugfs.c
++++ b/fs/ceph/debugfs.c
+@@ -162,34 +162,34 @@ static int metric_show(struct seq_file *s, void *p)
+ 	seq_printf(s, "item          total       avg_lat(us)     min_lat(us)     max_lat(us)     stdev(us)\n");
+ 	seq_printf(s, "-----------------------------------------------------------------------------------\n");
+ 
+-	spin_lock(&m->read_latency_lock);
++	spin_lock(&m->read_metric_lock);
+ 	total = m->total_reads;
+ 	sum = m->read_latency_sum;
+ 	avg = total > 0 ? DIV64_U64_ROUND_CLOSEST(sum, total) : 0;
+ 	min = m->read_latency_min;
+ 	max = m->read_latency_max;
+ 	sq = m->read_latency_sq_sum;
+-	spin_unlock(&m->read_latency_lock);
++	spin_unlock(&m->read_metric_lock);
+ 	CEPH_METRIC_SHOW("read", total, avg, min, max, sq);
+ 
+-	spin_lock(&m->write_latency_lock);
++	spin_lock(&m->write_metric_lock);
+ 	total = m->total_writes;
+ 	sum = m->write_latency_sum;
+ 	avg = total > 0 ? DIV64_U64_ROUND_CLOSEST(sum, total) : 0;
+ 	min = m->write_latency_min;
+ 	max = m->write_latency_max;
+ 	sq = m->write_latency_sq_sum;
+-	spin_unlock(&m->write_latency_lock);
++	spin_unlock(&m->write_metric_lock);
+ 	CEPH_METRIC_SHOW("write", total, avg, min, max, sq);
+ 
+-	spin_lock(&m->metadata_latency_lock);
++	spin_lock(&m->metadata_metric_lock);
+ 	total = m->total_metadatas;
+ 	sum = m->metadata_latency_sum;
+ 	avg = total > 0 ? DIV64_U64_ROUND_CLOSEST(sum, total) : 0;
+ 	min = m->metadata_latency_min;
+ 	max = m->metadata_latency_max;
+ 	sq = m->metadata_latency_sq_sum;
+-	spin_unlock(&m->metadata_latency_lock);
++	spin_unlock(&m->metadata_metric_lock);
+ 	CEPH_METRIC_SHOW("metadata", total, avg, min, max, sq);
+ 
+ 	seq_printf(s, "\n");
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index cf129fd96e84..6e09ee9fa6c1 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -897,7 +897,7 @@ static ssize_t ceph_sync_read(struct kiocb *iocb, struct iov_iter *to,
+ 		if (!ret)
+ 			ret = ceph_osdc_wait_request(osdc, req);
+ 
+-		ceph_update_read_latency(&fsc->mdsc->metric,
++		ceph_update_read_metrics(&fsc->mdsc->metric,
+ 					 req->r_start_latency,
+ 					 req->r_end_latency,
+ 					 ret);
+@@ -1042,10 +1042,10 @@ static void ceph_aio_complete_req(struct ceph_osd_request *req)
+ 	/* r_start_latency == 0 means the request was not submitted */
+ 	if (req->r_start_latency) {
+ 		if (aio_req->write)
+-			ceph_update_write_latency(metric, req->r_start_latency,
++			ceph_update_write_metrics(metric, req->r_start_latency,
+ 						  req->r_end_latency, rc);
+ 		else
+-			ceph_update_read_latency(metric, req->r_start_latency,
++			ceph_update_read_metrics(metric, req->r_start_latency,
+ 						 req->r_end_latency, rc);
+ 	}
+ 
+@@ -1295,10 +1295,10 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
+ 			ret = ceph_osdc_wait_request(&fsc->client->osdc, req);
+ 
+ 		if (write)
+-			ceph_update_write_latency(metric, req->r_start_latency,
++			ceph_update_write_metrics(metric, req->r_start_latency,
+ 						  req->r_end_latency, ret);
+ 		else
+-			ceph_update_read_latency(metric, req->r_start_latency,
++			ceph_update_read_metrics(metric, req->r_start_latency,
+ 						 req->r_end_latency, ret);
+ 
+ 		size = i_size_read(inode);
+@@ -1472,7 +1472,7 @@ ceph_sync_write(struct kiocb *iocb, struct iov_iter *from, loff_t pos,
+ 		if (!ret)
+ 			ret = ceph_osdc_wait_request(&fsc->client->osdc, req);
+ 
+-		ceph_update_write_latency(&fsc->mdsc->metric, req->r_start_latency,
++		ceph_update_write_metrics(&fsc->mdsc->metric, req->r_start_latency,
+ 					  req->r_end_latency, ret);
+ out:
+ 		ceph_osdc_put_request(req);
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 2165ca36790e..50e5ebecaf78 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -3305,7 +3305,7 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 	/* kick calling process */
+ 	complete_request(mdsc, req);
+ 
+-	ceph_update_metadata_latency(&mdsc->metric, req->r_start_latency,
++	ceph_update_metadata_metrics(&mdsc->metric, req->r_start_latency,
+ 				     req->r_end_latency, err);
+ out:
+ 	ceph_mdsc_put_request(req);
+diff --git a/fs/ceph/metric.c b/fs/ceph/metric.c
+index 5ec94bd4c1de..75d309f2fb0c 100644
+--- a/fs/ceph/metric.c
++++ b/fs/ceph/metric.c
+@@ -183,21 +183,21 @@ int ceph_metric_init(struct ceph_client_metric *m)
+ 	if (ret)
+ 		goto err_i_caps_mis;
+ 
+-	spin_lock_init(&m->read_latency_lock);
++	spin_lock_init(&m->read_metric_lock);
+ 	m->read_latency_sq_sum = 0;
+ 	m->read_latency_min = KTIME_MAX;
+ 	m->read_latency_max = 0;
+ 	m->total_reads = 0;
+ 	m->read_latency_sum = 0;
+ 
+-	spin_lock_init(&m->write_latency_lock);
++	spin_lock_init(&m->write_metric_lock);
+ 	m->write_latency_sq_sum = 0;
+ 	m->write_latency_min = KTIME_MAX;
+ 	m->write_latency_max = 0;
+ 	m->total_writes = 0;
+ 	m->write_latency_sum = 0;
+ 
+-	spin_lock_init(&m->metadata_latency_lock);
++	spin_lock_init(&m->metadata_metric_lock);
+ 	m->metadata_latency_sq_sum = 0;
+ 	m->metadata_latency_min = KTIME_MAX;
+ 	m->metadata_latency_max = 0;
+@@ -274,7 +274,7 @@ static inline void __update_latency(ktime_t *totalp, ktime_t *lsump,
+ 	*sq_sump += sq;
+ }
+ 
+-void ceph_update_read_latency(struct ceph_client_metric *m,
++void ceph_update_read_metrics(struct ceph_client_metric *m,
+ 			      ktime_t r_start, ktime_t r_end,
+ 			      int rc)
+ {
+@@ -283,14 +283,14 @@ void ceph_update_read_latency(struct ceph_client_metric *m,
+ 	if (unlikely(rc < 0 && rc != -ENOENT && rc != -ETIMEDOUT))
+ 		return;
+ 
+-	spin_lock(&m->read_latency_lock);
++	spin_lock(&m->read_metric_lock);
+ 	__update_latency(&m->total_reads, &m->read_latency_sum,
+ 			 &m->read_latency_min, &m->read_latency_max,
+ 			 &m->read_latency_sq_sum, lat);
+-	spin_unlock(&m->read_latency_lock);
++	spin_unlock(&m->read_metric_lock);
+ }
+ 
+-void ceph_update_write_latency(struct ceph_client_metric *m,
++void ceph_update_write_metrics(struct ceph_client_metric *m,
+ 			       ktime_t r_start, ktime_t r_end,
+ 			       int rc)
+ {
+@@ -299,14 +299,14 @@ void ceph_update_write_latency(struct ceph_client_metric *m,
+ 	if (unlikely(rc && rc != -ETIMEDOUT))
+ 		return;
+ 
+-	spin_lock(&m->write_latency_lock);
++	spin_lock(&m->write_metric_lock);
+ 	__update_latency(&m->total_writes, &m->write_latency_sum,
+ 			 &m->write_latency_min, &m->write_latency_max,
+ 			 &m->write_latency_sq_sum, lat);
+-	spin_unlock(&m->write_latency_lock);
++	spin_unlock(&m->write_metric_lock);
+ }
+ 
+-void ceph_update_metadata_latency(struct ceph_client_metric *m,
++void ceph_update_metadata_metrics(struct ceph_client_metric *m,
+ 				  ktime_t r_start, ktime_t r_end,
+ 				  int rc)
+ {
+@@ -315,9 +315,9 @@ void ceph_update_metadata_latency(struct ceph_client_metric *m,
+ 	if (unlikely(rc && rc != -ENOENT))
+ 		return;
+ 
+-	spin_lock(&m->metadata_latency_lock);
++	spin_lock(&m->metadata_metric_lock);
+ 	__update_latency(&m->total_metadatas, &m->metadata_latency_sum,
+ 			 &m->metadata_latency_min, &m->metadata_latency_max,
+ 			 &m->metadata_latency_sq_sum, lat);
+-	spin_unlock(&m->metadata_latency_lock);
++	spin_unlock(&m->metadata_metric_lock);
+ }
+diff --git a/fs/ceph/metric.h b/fs/ceph/metric.h
+index af6038ff39d4..57b5f0ec38be 100644
+--- a/fs/ceph/metric.h
++++ b/fs/ceph/metric.h
+@@ -108,21 +108,21 @@ struct ceph_client_metric {
+ 	struct percpu_counter i_caps_hit;
+ 	struct percpu_counter i_caps_mis;
+ 
+-	spinlock_t read_latency_lock;
++	spinlock_t read_metric_lock;
+ 	u64 total_reads;
+ 	ktime_t read_latency_sum;
+ 	ktime_t read_latency_sq_sum;
+ 	ktime_t read_latency_min;
+ 	ktime_t read_latency_max;
+ 
+-	spinlock_t write_latency_lock;
++	spinlock_t write_metric_lock;
+ 	u64 total_writes;
+ 	ktime_t write_latency_sum;
+ 	ktime_t write_latency_sq_sum;
+ 	ktime_t write_latency_min;
+ 	ktime_t write_latency_max;
+ 
+-	spinlock_t metadata_latency_lock;
++	spinlock_t metadata_metric_lock;
+ 	u64 total_metadatas;
+ 	ktime_t metadata_latency_sum;
+ 	ktime_t metadata_latency_sq_sum;
+@@ -162,13 +162,13 @@ static inline void ceph_update_cap_mis(struct ceph_client_metric *m)
+ 	percpu_counter_inc(&m->i_caps_mis);
+ }
+ 
+-extern void ceph_update_read_latency(struct ceph_client_metric *m,
++extern void ceph_update_read_metrics(struct ceph_client_metric *m,
+ 				     ktime_t r_start, ktime_t r_end,
+ 				     int rc);
+-extern void ceph_update_write_latency(struct ceph_client_metric *m,
++extern void ceph_update_write_metrics(struct ceph_client_metric *m,
+ 				      ktime_t r_start, ktime_t r_end,
+ 				      int rc);
+-extern void ceph_update_metadata_latency(struct ceph_client_metric *m,
++extern void ceph_update_metadata_metrics(struct ceph_client_metric *m,
+ 				         ktime_t r_start, ktime_t r_end,
+ 					 int rc);
+ #endif /* _FS_CEPH_MDS_METRIC_H */
