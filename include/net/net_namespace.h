@@ -33,6 +33,7 @@
 #include <net/netns/mpls.h>
 #include <net/netns/can.h>
 #include RH_KABI_HIDE_INCLUDE(<net/netns/xdp.h>)
+#include <net/netns/smc.h>
 #include <net/netns/bpf.h>
 #include <linux/ns_common.h>
 #include <linux/idr.h>
@@ -200,6 +201,10 @@ struct net {
 	RH_KABI_EXTEND(seqcount_spinlock_t	xfrm_state_hash_generation)
 	RH_KABI_EXTEND(unsigned int nf_tcp_net_offload_timeout)
 	RH_KABI_EXTEND(unsigned int nf_udp_net_offload_timeout)
+#if IS_ENABLED(CONFIG_SMC)
+	RH_KABI_EXTEND(struct netns_smc		smc)
+#endif
+	RH_KABI_EXTEND(seqcount_spinlock_t	xfrm_policy_hash_generation)
 } __randomize_layout;
 
 #include <linux/seq_file_net.h>

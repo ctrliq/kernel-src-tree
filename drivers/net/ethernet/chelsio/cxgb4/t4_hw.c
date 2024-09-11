@@ -3157,7 +3157,7 @@ int t4_get_tp_version(struct adapter *adapter, u32 *vers)
 
 /**
  *	t4_get_exprom_version - return the Expansion ROM version (if any)
- *	@adapter: the adapter
+ *	@adap: the adapter
  *	@vers: where to place the version
  *
  *	Reads the Expansion ROM header from FLASH and returns the version
@@ -5298,7 +5298,7 @@ static unsigned int t4_use_ldst(struct adapter *adap)
  * @cmd: TP fw ldst address space type
  * @vals: where the indirect register values are stored/written
  * @nregs: how many indirect registers to read/write
- * @start_idx: index of first indirect register to read/write
+ * @start_index: index of first indirect register to read/write
  * @rw: Read (1) or Write (0)
  * @sleep_ok: if true we may sleep while awaiting command completion
  *
@@ -6103,7 +6103,7 @@ void t4_pmrx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[])
 
 /**
  *	compute_mps_bg_map - compute the MPS Buffer Group Map for a Port
- *	@adap: the adapter
+ *	@adapter: the adapter
  *	@pidx: the port index
  *
  *	Computes and returns a bitmap indicating which MPS buffer groups are
@@ -6240,7 +6240,7 @@ static unsigned int t4_get_tp_e2c_map(struct adapter *adapter, int pidx)
 
 /**
  *	t4_get_tp_ch_map - return TP ingress channels associated with a port
- *	@adapter: the adapter
+ *	@adap: the adapter
  *	@pidx: the port index
  *
  *	Returns a bitmap indicating which TP Ingress Channels are associated
@@ -6577,7 +6577,7 @@ int t4_mdio_rd(struct adapter *adap, unsigned int mbox, unsigned int phy_addr,
  *	@phy_addr: the PHY address
  *	@mmd: the PHY MMD to access (0 for clause 22 PHYs)
  *	@reg: the register to write
- *	@valp: value to write
+ *	@val: value to write
  *
  *	Issues a FW command through the given mailbox to write a PHY register.
  */
@@ -6603,7 +6603,7 @@ int t4_mdio_wr(struct adapter *adap, unsigned int mbox, unsigned int phy_addr,
 
 /**
  *	t4_sge_decode_idma_state - decode the idma state
- *	@adap: the adapter
+ *	@adapter: the adapter
  *	@state: the state idma is stuck in
  */
 void t4_sge_decode_idma_state(struct adapter *adapter, int state)
@@ -6770,7 +6770,7 @@ void t4_sge_decode_idma_state(struct adapter *adapter, int state)
  *      t4_sge_ctxt_flush - flush the SGE context cache
  *      @adap: the adapter
  *      @mbox: mailbox to use for the FW command
- *      @ctx_type: Egress or Ingress
+ *      @ctxt_type: Egress or Ingress
  *
  *      Issues a FW command through the given mailbox to flush the
  *      SGE context cache.
@@ -6796,8 +6796,8 @@ int t4_sge_ctxt_flush(struct adapter *adap, unsigned int mbox, int ctxt_type)
 }
 
 /**
- *	t4_read_sge_dbqtimers - reag SGE Doorbell Queue Timer values
- *	@adap - the adapter
+ *	t4_read_sge_dbqtimers - read SGE Doorbell Queue Timer values
+ *	@adap: the adapter
  *	@ndbqtimers: size of the provided SGE Doorbell Queue Timer table
  *	@dbqtimers: SGE Doorbell Queue Timer table
  *
@@ -7080,6 +7080,7 @@ static int t4_fw_halt(struct adapter *adap, unsigned int mbox, int force)
 /**
  *	t4_fw_restart - restart the firmware by taking the uP out of RESET
  *	@adap: the adapter
+ *	@mbox: mailbox to use for the FW command
  *	@reset: if we want to do a RESET to restart things
  *
  *	Restart firmware previously halted by t4_fw_halt().  On successful
@@ -7618,6 +7619,8 @@ int t4_cfg_pfvf(struct adapter *adap, unsigned int mbox, unsigned int pf,
  *	@nmac: number of MAC addresses needed (1 to 5)
  *	@mac: the MAC addresses of the VI
  *	@rss_size: size of RSS table slice associated with this VI
+ *	@vivld: the destination to store the VI Valid value.
+ *	@vin: the destination to store the VIN value.
  *
  *	Allocates a virtual interface for the given physical port.  If @mac is
  *	not %NULL it contains the MAC addresses of the VI as assigned by FW.
@@ -7704,6 +7707,7 @@ int t4_free_vi(struct adapter *adap, unsigned int mbox, unsigned int pf,
  *	@adap: the adapter
  *	@mbox: mailbox to use for the FW command
  *	@viid: the VI id
+ *	@viid_mirror: the mirror VI id
  *	@mtu: the new MTU or -1
  *	@promisc: 1 to enable promiscuous mode, 0 to disable it, -1 no change
  *	@all_multi: 1 to enable all-multi mode, 0 to disable it, -1 no change
@@ -7714,10 +7718,11 @@ int t4_free_vi(struct adapter *adap, unsigned int mbox, unsigned int pf,
  *	Sets Rx properties of a virtual interface.
  */
 int t4_set_rxmode(struct adapter *adap, unsigned int mbox, unsigned int viid,
-		  int mtu, int promisc, int all_multi, int bcast, int vlanex,
-		  bool sleep_ok)
+		  unsigned int viid_mirror, int mtu, int promisc, int all_multi,
+		  int bcast, int vlanex, bool sleep_ok)
 {
-	struct fw_vi_rxmode_cmd c;
+	struct fw_vi_rxmode_cmd c, c_mirror;
+	int ret;
 
 	/* convert to FW values */
 	if (mtu < 0)
@@ -7742,7 +7747,24 @@ int t4_set_rxmode(struct adapter *adap, unsigned int mbox, unsigned int viid,
 			    FW_VI_RXMODE_CMD_ALLMULTIEN_V(all_multi) |
 			    FW_VI_RXMODE_CMD_BROADCASTEN_V(bcast) |
 			    FW_VI_RXMODE_CMD_VLANEXEN_V(vlanex));
-	return t4_wr_mbox_meat(adap, mbox, &c, sizeof(c), NULL, sleep_ok);
+
+	if (viid_mirror) {
+		memcpy(&c_mirror, &c, sizeof(c_mirror));
+		c_mirror.op_to_viid =
+			cpu_to_be32(FW_CMD_OP_V(FW_VI_RXMODE_CMD) |
+				    FW_CMD_REQUEST_F | FW_CMD_WRITE_F |
+				    FW_VI_RXMODE_CMD_VIID_V(viid_mirror));
+	}
+
+	ret = t4_wr_mbox_meat(adap, mbox, &c, sizeof(c), NULL, sleep_ok);
+	if (ret)
+		return ret;
+
+	if (viid_mirror)
+		ret = t4_wr_mbox_meat(adap, mbox, &c_mirror, sizeof(c_mirror),
+				      NULL, sleep_ok);
+
+	return ret;
 }
 
 /**
@@ -7836,7 +7858,7 @@ int t4_free_raw_mac_filt(struct adapter *adap, unsigned int viid,
  *      t4_alloc_encap_mac_filt - Adds a mac entry in mps tcam with VNI support
  *      @adap: the adapter
  *      @viid: the VI id
- *      @mac: the MAC address
+ *      @addr: the MAC address
  *      @mask: the mask
  *      @vni: the VNI id for the tunnel protocol
  *      @vni_mask: mask for the VNI id
@@ -7885,11 +7907,11 @@ int t4_alloc_encap_mac_filt(struct adapter *adap, unsigned int viid,
  *	t4_alloc_raw_mac_filt - Adds a mac entry in mps tcam
  *	@adap: the adapter
  *	@viid: the VI id
- *	@mac: the MAC address
+ *	@addr: the MAC address
  *	@mask: the mask
  *	@idx: index at which to add this entry
- *	@port_id: the port index
  *	@lookup_type: MAC address for inner (1) or outer (0) header
+ *	@port_id: the port index
  *	@sleep_ok: call is allowed to sleep
  *
  *	Adds the mac entry at the specified index using raw mac interface.
@@ -8114,7 +8136,7 @@ int t4_free_mac_filt(struct adapter *adap, unsigned int mbox,
  *	@idx: index of existing filter for old value of MAC address, or -1
  *	@addr: the new MAC address value
  *	@persist: whether a new MAC allocation should be persistent
- *	@add_smt: if true also add the address to the HW SMT
+ *	@smt_idx: the destination to store the new SMT index.
  *
  *	Modifies an exact-match filter and sets it to the new MAC address.
  *	Note that in general it is not possible to modify the value of a given
@@ -8436,7 +8458,6 @@ int t4_ofld_eq_free(struct adapter *adap, unsigned int mbox, unsigned int pf,
 
 /**
  *	t4_link_down_rc_str - return a string for a Link Down Reason Code
- *	@adap: the adapter
  *	@link_down_rc: Link Down Reason Code
  *
  *	Returns a string representation of the Link Down Reason Code.
@@ -8460,9 +8481,7 @@ static const char *t4_link_down_rc_str(unsigned char link_down_rc)
 	return reason[link_down_rc];
 }
 
-/**
- * Return the highest speed set in the port capabilities, in Mb/s.
- */
+/* Return the highest speed set in the port capabilities, in Mb/s. */
 static unsigned int fwcap_to_speed(fw_port_cap32_t caps)
 {
 	#define TEST_SPEED_RETURN(__caps_speed, __speed) \
@@ -9098,7 +9117,6 @@ found:
 /**
  *	t4_prep_adapter - prepare SW and HW for operation
  *	@adapter: the adapter
- *	@reset: if true perform a HW reset
  *
  *	Initialize adapter SW state for the various HW modules, set initial
  *	values for some adapter tunables, take PHYs out of reset, and
@@ -9705,6 +9723,22 @@ int t4_port_init(struct adapter *adap, int mbox, int pf, int vf)
 		memcpy(adap->port[i]->dev_addr, addr, ETH_ALEN);
 		j++;
 	}
+	return 0;
+}
+
+int t4_init_port_mirror(struct port_info *pi, u8 mbox, u8 port, u8 pf, u8 vf,
+			u16 *mirror_viid)
+{
+	int ret;
+
+	ret = t4_alloc_vi(pi->adapter, mbox, port, pf, vf, 1, NULL, NULL,
+			  NULL, NULL);
+	if (ret < 0)
+		return ret;
+
+	if (mirror_viid)
+		*mirror_viid = ret;
+
 	return 0;
 }
 
@@ -10383,6 +10417,7 @@ int t4_sched_params(struct adapter *adapter, u8 type, u8 level, u8 mode,
 /**
  *	t4_i2c_rd - read I2C data from adapter
  *	@adap: the adapter
+ *	@mbox: mailbox to use for the FW command
  *	@port: Port number if per-port device; <0 if not
  *	@devid: per-port device ID or absolute device ID
  *	@offset: byte offset into device I2C space
@@ -10438,7 +10473,7 @@ int t4_i2c_rd(struct adapter *adap, unsigned int mbox, int port,
 
 /**
  *      t4_set_vlan_acl - Set a VLAN id for the specified VF
- *      @adapter: the adapter
+ *      @adap: the adapter
  *      @mbox: mailbox to use for the FW command
  *      @vf: one of the VFs instantiated by the specified PF
  *      @vlan: The vlanid to be set

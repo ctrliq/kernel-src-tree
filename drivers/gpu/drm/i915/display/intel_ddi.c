@@ -824,6 +824,48 @@ static const struct cnl_ddi_buf_trans rkl_combo_phy_ddi_translations_dp_hbr2_hbr
 	{ 0x6, 0x7F, 0x3F, 0x00, 0x00 },	/* 900   900      0.0   */
 };
 
+static const struct cnl_ddi_buf_trans adls_combo_phy_ddi_translations_dp_hbr2_hbr3[] = {
+						/* NT mV Trans mV db    */
+	{ 0xA, 0x35, 0x3F, 0x00, 0x00 },	/* 350   350      0.0   */
+	{ 0xA, 0x4F, 0x37, 0x00, 0x08 },	/* 350   500      3.1   */
+	{ 0xC, 0x63, 0x31, 0x00, 0x0E },	/* 350   700      6.0   */
+	{ 0x6, 0x7F, 0x2C, 0x00, 0x13 },	/* 350   900      8.2   */
+	{ 0xA, 0x47, 0x3F, 0x00, 0x00 },	/* 500   500      0.0   */
+	{ 0xC, 0x63, 0x37, 0x00, 0x08 },	/* 500   700      2.9   */
+	{ 0x6, 0x73, 0x32, 0x00, 0x0D },	/* 500   900      5.1   */
+	{ 0xC, 0x58, 0x3F, 0x00, 0x00 },	/* 650   700      0.6   */
+	{ 0x6, 0x7F, 0x35, 0x00, 0x0A },	/* 600   900      3.5   */
+	{ 0x6, 0x7F, 0x3F, 0x00, 0x00 },	/* 900   900      0.0   */
+};
+
+static const struct cnl_ddi_buf_trans adls_combo_phy_ddi_translations_edp_hbr2[] = {
+						/* NT mV Trans mV db    */
+	{ 0x9, 0x73, 0x3D, 0x00, 0x02 },	/* 200   200      0.0   */
+	{ 0x9, 0x7A, 0x3C, 0x00, 0x03 },	/* 200   250      1.9   */
+	{ 0x9, 0x7F, 0x3B, 0x00, 0x04 },	/* 200   300      3.5   */
+	{ 0x4, 0x6C, 0x33, 0x00, 0x0C },	/* 200   350      4.9   */
+	{ 0x2, 0x73, 0x3A, 0x00, 0x05 },	/* 250   250      0.0   */
+	{ 0x2, 0x7C, 0x38, 0x00, 0x07 },	/* 250   300      1.6   */
+	{ 0x4, 0x5A, 0x36, 0x00, 0x09 },	/* 250   350      2.9   */
+	{ 0x4, 0x57, 0x3D, 0x00, 0x02 },	/* 300   300      0.0   */
+	{ 0x4, 0x65, 0x38, 0x00, 0x07 },	/* 300   350      1.3   */
+	{ 0x4, 0x6C, 0x3A, 0x00, 0x05 },	/* 350   350      0.0   */
+};
+
+static const struct cnl_ddi_buf_trans adls_combo_phy_ddi_translations_edp_hbr3[] = {
+						/* NT mV Trans mV db    */
+	{ 0xA, 0x35, 0x3F, 0x00, 0x00 },	/* 350   350      0.0   */
+	{ 0xA, 0x4F, 0x37, 0x00, 0x08 },	/* 350   500      3.1   */
+	{ 0xC, 0x63, 0x31, 0x00, 0x0E },	/* 350   700      6.0   */
+	{ 0x6, 0x7F, 0x2C, 0x00, 0x13 },	/* 350   900      8.2   */
+	{ 0xA, 0x47, 0x3F, 0x00, 0x00 },	/* 500   500      0.0   */
+	{ 0xC, 0x63, 0x37, 0x00, 0x08 },	/* 500   700      2.9   */
+	{ 0x6, 0x73, 0x32, 0x00, 0x0D },	/* 500   900      5.1   */
+	{ 0xC, 0x58, 0x3F, 0x00, 0x00 },	/* 650   700      0.6   */
+	{ 0x6, 0x7F, 0x35, 0x00, 0x0A },	/* 600   900      3.5   */
+	{ 0x6, 0x7F, 0x3F, 0x00, 0x00 },	/* 900   900      0.0   */
+};
+
 static bool is_hobl_buf_trans(const struct cnl_ddi_buf_trans *table)
 {
 	return table == tgl_combo_phy_ddi_translations_edp_hbr2_hobl;
@@ -1413,6 +1455,55 @@ tgl_get_dkl_buf_trans(struct intel_encoder *encoder,
 		return tgl_get_dkl_buf_trans_dp(encoder, crtc_state, n_entries);
 }
 
+static const struct cnl_ddi_buf_trans *
+adls_get_combo_buf_trans_dp(struct intel_encoder *encoder,
+			    const struct intel_crtc_state *crtc_state,
+			    int *n_entries)
+{
+	if (crtc_state->port_clock > 270000) {
+		*n_entries = ARRAY_SIZE(adls_combo_phy_ddi_translations_dp_hbr2_hbr3);
+		return adls_combo_phy_ddi_translations_dp_hbr2_hbr3;
+	} else {
+		*n_entries = ARRAY_SIZE(tgl_combo_phy_ddi_translations_dp_hbr);
+		return tgl_combo_phy_ddi_translations_dp_hbr;
+	}
+}
+
+static const struct cnl_ddi_buf_trans *
+adls_get_combo_buf_trans_edp(struct intel_encoder *encoder,
+			     const struct intel_crtc_state *crtc_state,
+			     int *n_entries)
+{
+	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
+	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+
+	if (crtc_state->port_clock > 540000) {
+		*n_entries = ARRAY_SIZE(adls_combo_phy_ddi_translations_edp_hbr3);
+		return adls_combo_phy_ddi_translations_edp_hbr3;
+	} else if (i915->vbt.edp.hobl && !intel_dp->hobl_failed) {
+		*n_entries = ARRAY_SIZE(tgl_combo_phy_ddi_translations_edp_hbr2_hobl);
+		return tgl_combo_phy_ddi_translations_edp_hbr2_hobl;
+	} else if (i915->vbt.edp.low_vswing) {
+		*n_entries = ARRAY_SIZE(adls_combo_phy_ddi_translations_edp_hbr2);
+		return adls_combo_phy_ddi_translations_edp_hbr2;
+	} else {
+		return adls_get_combo_buf_trans_dp(encoder, crtc_state, n_entries);
+	}
+}
+
+static const struct cnl_ddi_buf_trans *
+adls_get_combo_buf_trans(struct intel_encoder *encoder,
+			 const struct intel_crtc_state *crtc_state,
+			 int *n_entries)
+{
+	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_HDMI))
+		return icl_get_combo_buf_trans_hdmi(encoder, crtc_state, n_entries);
+	else if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_EDP))
+		return adls_get_combo_buf_trans_edp(encoder, crtc_state, n_entries);
+	else
+		return adls_get_combo_buf_trans_dp(encoder, crtc_state, n_entries);
+}
+
 static int intel_ddi_hdmi_level(struct intel_encoder *encoder,
 				const struct intel_crtc_state *crtc_state)
 {
@@ -1420,7 +1511,10 @@ static int intel_ddi_hdmi_level(struct intel_encoder *encoder,
 	int n_entries, level, default_entry;
 	enum phy phy = intel_port_to_phy(dev_priv, encoder->port);
 
-	if (INTEL_GEN(dev_priv) >= 12) {
+	if (IS_ALDERLAKE_S(dev_priv)) {
+		adls_get_combo_buf_trans(encoder, crtc_state, &n_entries);
+		default_entry = n_entries - 1;
+	} else if (INTEL_GEN(dev_priv) >= 12) {
 		if (intel_phy_is_combo(dev_priv, phy))
 			tgl_get_combo_buf_trans_hdmi(encoder, crtc_state, &n_entries);
 		else
@@ -2507,7 +2601,9 @@ static u8 intel_ddi_dp_voltage_max(struct intel_dp *intel_dp,
 	enum phy phy = intel_port_to_phy(dev_priv, port);
 	int n_entries;
 
-	if (INTEL_GEN(dev_priv) >= 12) {
+	if (IS_ALDERLAKE_S(dev_priv)) {
+		adls_get_combo_buf_trans(encoder, crtc_state, &n_entries);
+	} else if (INTEL_GEN(dev_priv) >= 12) {
 		if (intel_phy_is_combo(dev_priv, phy))
 			tgl_get_combo_buf_trans(encoder, crtc_state, &n_entries);
 		else
@@ -2694,7 +2790,9 @@ static void icl_ddi_combo_vswing_program(struct intel_encoder *encoder,
 	int n_entries, ln;
 	u32 val;
 
-	if (INTEL_GEN(dev_priv) >= 12)
+	if (IS_ALDERLAKE_S(dev_priv))
+		ddi_translations = adls_get_combo_buf_trans(encoder, crtc_state, &n_entries);
+	else if (INTEL_GEN(dev_priv) >= 12)
 		ddi_translations = tgl_get_combo_buf_trans(encoder, crtc_state, &n_entries);
 	else if (IS_PLATFORM(dev_priv, INTEL_JASPERLAKE))
 		ddi_translations = jsl_get_combo_buf_trans(encoder, crtc_state, &n_entries);

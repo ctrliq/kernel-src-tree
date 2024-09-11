@@ -1002,9 +1002,13 @@ struct devlink;
 
 struct netdev_name_node {
 	struct hlist_node hlist;
+	struct list_head list;
 	struct net_device *dev;
 	const char *name;
 };
+
+int netdev_name_node_alt_create(struct net_device *dev, const char *name);
+int netdev_name_node_alt_destroy(struct net_device *dev, const char *name);
 
 /*
  * This structure defines the management hooks for network devices.
@@ -1943,7 +1947,8 @@ struct net_device_extended_rh {
 
 struct net_device {
 	char			name[IFNAMSIZ];
-	struct netdev_name_node	*name_node;
+	RH_KABI_REPLACE(struct hlist_node name_hlist,
+			struct netdev_name_node *name_node)
 	struct dev_ifalias	__rcu *ifalias;
 	/*
 	 *	I/O specific fields

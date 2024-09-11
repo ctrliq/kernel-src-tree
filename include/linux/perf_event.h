@@ -1054,6 +1054,8 @@ struct perf_sample_data {
 
 	u64				phys_addr;
 	RH_KABI_BROKEN_INSERT(u64				cgroup)
+	RH_KABI_BROKEN_INSERT(u64				data_page_size)
+	RH_KABI_BROKEN_INSERT(u64				code_page_size)
 } ____cacheline_aligned;
 
 /* default value for data source */

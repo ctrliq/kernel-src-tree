@@ -4,11 +4,6 @@
 #include <linux/ethtool_netlink.h>
 #include "netlink.h"
 
-#ifdef ALTIFNAMSIZ
-#error Please remove RHEL specific definition of ALTIFNAMSIZ in net/ethtool/netlink.c
-#endif
-#define ALTIFNAMSIZ IFNAMSIZ
-
 static struct genl_family ethtool_genl_family;
 
 static bool ethnl_ok __read_mostly;

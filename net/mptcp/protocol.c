@@ -2466,7 +2466,6 @@ static int mptcp_init_sock(struct sock *sk)
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct net *net = sock_net(sk);
 	int ret;
-	static bool warned;
 
 	ret = __mptcp_init_sock(sk);
 	if (ret)
@@ -2474,11 +2473,6 @@ static int mptcp_init_sock(struct sock *sk)
 
 	if (!mptcp_is_enabled(net))
 		return -ENOPROTOOPT;
-
-	if (!warned) {
-		warned = true;
-		mark_tech_preview("Multipath TCP", NULL);
-	}
 
 	if (unlikely(!net->mptcp_mib.mptcp_statistics) && !mptcp_mib_alloc(net))
 		return -ENOMEM;

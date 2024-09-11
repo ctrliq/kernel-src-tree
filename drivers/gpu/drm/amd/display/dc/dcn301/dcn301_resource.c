@@ -847,7 +847,7 @@ static const struct dc_plane_cap plane_cap = {
 	.max_downscale_factor = {
 			.argb8888 = 167,
 			.nv12 = 167,
-			.fp16 = 167 
+			.fp16 = 167
 	},
 	64,
 	64

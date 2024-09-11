@@ -37,6 +37,15 @@ static void set_msglevel(struct net_device *dev, u32 val)
 	netdev2adap(dev)->msg_enable = val;
 }
 
+enum cxgb4_ethtool_tests {
+	CXGB4_ETHTOOL_LB_TEST,
+	CXGB4_ETHTOOL_MAX_TEST,
+};
+
+static const char cxgb4_selftest_strings[CXGB4_ETHTOOL_MAX_TEST][ETH_GSTRING_LEN] = {
+	"Loop back test (offline)",
+};
+
 static const char * const flash_region_strings[] = {
 	"All",
 	"Firmware",
@@ -120,15 +129,7 @@ static const char stats_strings[][ETH_GSTRING_LEN] = {
 	"vlan_insertions        ",
 	"gro_packets            ",
 	"gro_merged             ",
-};
-
-static char adapter_stats_strings[][ETH_GSTRING_LEN] = {
-	"db_drop                ",
-	"db_full                ",
-	"db_empty               ",
-	"write_coal_success     ",
-	"write_coal_fail        ",
-#ifdef CONFIG_CHELSIO_TLS_DEVICE
+#if  IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
 	"tx_tls_encrypted_packets",
 	"tx_tls_encrypted_bytes  ",
 	"tx_tls_ctx              ",
@@ -137,6 +138,14 @@ static char adapter_stats_strings[][ETH_GSTRING_LEN] = {
 	"tx_tls_drop_no_sync_data",
 	"tx_tls_drop_bypass_req  ",
 #endif
+};
+
+static char adapter_stats_strings[][ETH_GSTRING_LEN] = {
+	"db_drop                ",
+	"db_full                ",
+	"db_empty               ",
+	"write_coal_success     ",
+	"write_coal_fail        ",
 };
 
 static char loopback_stats_strings[][ETH_GSTRING_LEN] = {
@@ -178,6 +187,8 @@ static int get_sset_count(struct net_device *dev, int sset)
 		       ARRAY_SIZE(loopback_stats_strings);
 	case ETH_SS_PRIV_FLAGS:
 		return ARRAY_SIZE(cxgb4_priv_flags_strings);
+	case ETH_SS_TEST:
+		return ARRAY_SIZE(cxgb4_selftest_strings);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -242,6 +253,9 @@ static void get_strings(struct net_device *dev, u32 stringset, u8 *data)
 	} else if (stringset == ETH_SS_PRIV_FLAGS) {
 		memcpy(data, cxgb4_priv_flags_strings,
 		       sizeof(cxgb4_priv_flags_strings));
+	} else if (stringset == ETH_SS_TEST) {
+		memcpy(data, cxgb4_selftest_strings,
+		       sizeof(cxgb4_selftest_strings));
 	}
 }
 
@@ -257,15 +271,7 @@ struct queue_port_stats {
 	u64 vlan_ins;
 	u64 gro_pkts;
 	u64 gro_merged;
-};
-
-struct adapter_stats {
-	u64 db_drop;
-	u64 db_full;
-	u64 db_empty;
-	u64 wc_success;
-	u64 wc_fail;
-#ifdef CONFIG_CHELSIO_TLS_DEVICE
+#if IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
 	u64 tx_tls_encrypted_packets;
 	u64 tx_tls_encrypted_bytes;
 	u64 tx_tls_ctx;
@@ -276,12 +282,23 @@ struct adapter_stats {
 #endif
 };
 
+struct adapter_stats {
+	u64 db_drop;
+	u64 db_full;
+	u64 db_empty;
+	u64 wc_success;
+	u64 wc_fail;
+};
+
 static void collect_sge_port_stats(const struct adapter *adap,
 				   const struct port_info *p,
 				   struct queue_port_stats *s)
 {
 	const struct sge_eth_txq *tx = &adap->sge.ethtxq[p->first_qset];
 	const struct sge_eth_rxq *rx = &adap->sge.ethrxq[p->first_qset];
+#if IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
+	const struct ch_ktls_port_stats_debug *ktls_stats;
+#endif
 	struct sge_eohw_txq *eohw_tx;
 	unsigned int i;
 
@@ -306,6 +323,21 @@ static void collect_sge_port_stats(const struct adapter *adap,
 			s->vlan_ins += eohw_tx->vlan_ins;
 		}
 	}
+#if IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
+	ktls_stats = &adap->ch_ktls_stats.ktls_port[p->port_id];
+	s->tx_tls_encrypted_packets =
+		atomic64_read(&ktls_stats->ktls_tx_encrypted_packets);
+	s->tx_tls_encrypted_bytes =
+		atomic64_read(&ktls_stats->ktls_tx_encrypted_bytes);
+	s->tx_tls_ctx = atomic64_read(&ktls_stats->ktls_tx_ctx);
+	s->tx_tls_ooo = atomic64_read(&ktls_stats->ktls_tx_ooo);
+	s->tx_tls_skip_no_sync_data =
+		atomic64_read(&ktls_stats->ktls_tx_skip_no_sync_data);
+	s->tx_tls_drop_no_sync_data =
+		atomic64_read(&ktls_stats->ktls_tx_drop_no_sync_data);
+	s->tx_tls_drop_bypass_req =
+		atomic64_read(&ktls_stats->ktls_tx_drop_bypass_req);
+#endif
 }
 
 static void collect_adapter_stats(struct adapter *adap, struct adapter_stats *s)
@@ -612,7 +644,7 @@ static void fw_caps_to_lmm(enum fw_port_type port_type,
 /**
  *	lmm_to_fw_caps - translate ethtool Link Mode Mask to Firmware
  *	capabilities
- *	@et_lmm: ethtool Link Mode Mask
+ *	@link_mode_mask: ethtool Link Mode Mask
  *
  *	Translate ethtool Link Mode Mask into a Firmware Port capabilities
  *	value.
@@ -2070,6 +2102,44 @@ static int cxgb4_set_priv_flags(struct net_device *netdev, u32 flags)
 	return 0;
 }
 
+static void cxgb4_lb_test(struct net_device *netdev, u64 *lb_status)
+{
+	int dev_state = netif_running(netdev);
+
+	if (dev_state) {
+		netif_tx_stop_all_queues(netdev);
+		netif_carrier_off(netdev);
+	}
+
+	*lb_status = cxgb4_selftest_lb_pkt(netdev);
+
+	if (dev_state) {
+		netif_tx_start_all_queues(netdev);
+		netif_carrier_on(netdev);
+	}
+}
+
+static void cxgb4_self_test(struct net_device *netdev,
+			    struct ethtool_test *eth_test, u64 *data)
+{
+	struct port_info *pi = netdev_priv(netdev);
+	struct adapter *adap = pi->adapter;
+
+	memset(data, 0, sizeof(u64) * CXGB4_ETHTOOL_MAX_TEST);
+
+	if (!(adap->flags & CXGB4_FULL_INIT_DONE) ||
+	    !(adap->flags & CXGB4_FW_OK)) {
+		eth_test->flags |= ETH_TEST_FL_FAILED;
+		return;
+	}
+
+	if (eth_test->flags & ETH_TEST_FL_OFFLINE)
+		cxgb4_lb_test(netdev, &data[CXGB4_ETHTOOL_LB_TEST]);
+
+	if (data[CXGB4_ETHTOOL_LB_TEST])
+		eth_test->flags |= ETH_TEST_FL_FAILED;
+}
+
 static const struct ethtool_ops cxgb_ethtool_ops = {
 	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
 				     ETHTOOL_COALESCE_RX_MAX_FRAMES |
@@ -2104,6 +2174,7 @@ static const struct ethtool_ops cxgb_ethtool_ops = {
 	.get_rxfh_indir_size = get_rss_table_size,
 	.get_rxfh	   = get_rss_table,
 	.set_rxfh	   = set_rss_table,
+	.self_test	   = cxgb4_self_test,
 	.flash_device      = set_flash,
 	.get_ts_info       = get_ts_info,
 	.set_dump          = set_dump,

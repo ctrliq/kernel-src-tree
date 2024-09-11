@@ -652,12 +652,17 @@ static void tgl_ctx_workarounds_init(struct intel_engine_cs *engine,
 	       FF_MODE2_GS_TIMER_224  | FF_MODE2_TDS_TIMER_128,
 	       0);
 
-	/*
-	 * Wa_14012131227:dg1
-	 * Wa_1508744258:tgl,rkl,dg1,adl-s,adl-p
+	/* RH note: Limit this workaround to ADL-S as this came too late in the release cycle to
+	 * justify retesting other gens
 	 */
-	wa_masked_en(wal, GEN7_COMMON_SLICE_CHICKEN1,
-		     GEN9_RHWO_OPTIMIZATION_DISABLE);
+	if (IS_ALDERLAKE_S(engine->i915)) {
+		/*
+		 * Wa_14012131227:dg1
+		 * Wa_1508744258:tgl,rkl,dg1,adl-s,adl-p
+		 */
+		wa_masked_en(wal, GEN7_COMMON_SLICE_CHICKEN1,
+			     GEN9_RHWO_OPTIMIZATION_DISABLE);
+	}
 }
 
 static void dg1_ctx_workarounds_init(struct intel_engine_cs *engine,
@@ -1116,8 +1121,13 @@ gen12_gt_workarounds_init(struct drm_i915_private *i915,
 {
 	wa_init_mcr(i915, wal);
 
-	/* Wa_14011060649:tgl,rkl,dg1,adls */
-	wa_14011060649(i915, wal);
+	/* RH note: this workaround came in quite late, so limit it to ADL-S to avoid potential
+	 * regressions
+	 */
+	if (IS_ALDERLAKE_S(i915)) {
+		/* Wa_14011060649:tgl,rkl,dg1,adls */
+		wa_14011060649(i915, wal);
+	}
 }
 
 static void
