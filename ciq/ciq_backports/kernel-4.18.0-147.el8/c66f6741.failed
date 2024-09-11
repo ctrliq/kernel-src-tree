@@ -1,0 +1,140 @@
+IB/core: Don't register each MAD agent for LSM notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Daniel Jurgens <danielj@mellanox.com>
+commit c66f67414c1f88554485bb2a0abf8b5c0d741de7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c66f6741.failed
+
+When creating many MAD agents in a short period of time, receive packet
+processing can be delayed long enough to cause timeouts while new agents
+are being added to the atomic notifier chain with IRQs disabled.  Notifier
+chain registration and unregstration is an O(n) operation. With large
+numbers of MAD agents being created and destroyed simultaneously the CPUs
+spend too much time with interrupts disabled.
+
+Instead of each MAD agent registering for it's own LSM notification,
+maintain a list of agents internally and register once, this registration
+already existed for handling the PKeys. This list is write mostly, so a
+normal spin lock is used vs a read/write lock. All MAD agents must be
+checked, so a single list is used instead of breaking them down per
+device.
+
+Notifier calls are done under rcu_read_lock, so there isn't a risk of
+similar packet timeouts while checking the MAD agents security settings
+when notified.
+
+	Signed-off-by: Daniel Jurgens <danielj@mellanox.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Acked-by: Paul Moore <paul@paul-moore.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c66f67414c1f88554485bb2a0abf8b5c0d741de7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/security.c
+diff --cc drivers/infiniband/core/security.c
+index b79b61bd6ee4,a70d2ba312ed..000000000000
+--- a/drivers/infiniband/core/security.c
++++ b/drivers/infiniband/core/security.c
+@@@ -676,20 -680,18 +680,29 @@@ static int ib_security_pkey_access(stru
+  	return security_ib_pkey_access(sec, subnet_prefix, pkey);
+  }
+  
+- static int ib_mad_agent_security_change(struct notifier_block *nb,
+- 					unsigned long event,
+- 					void *data)
++ void ib_mad_agent_security_change(void)
+  {
+- 	struct ib_mad_agent *ag = container_of(nb, struct ib_mad_agent, lsm_nb);
++ 	struct ib_mad_agent *ag;
+  
+++<<<<<<< HEAD
+ +	if (event != LSM_POLICY_CHANGE)
+ +		return NOTIFY_DONE;
+ +
+ +	ag->smp_allowed = !security_ib_endport_manage_subnet(ag->security,
+ +							     ag->device->name,
+ +							     ag->port_num);
+ +
+ +	return NOTIFY_OK;
+++=======
++ 	spin_lock(&mad_agent_list_lock);
++ 	list_for_each_entry(ag,
++ 			    &mad_agent_list,
++ 			    mad_agent_sec_list)
++ 		WRITE_ONCE(ag->smp_allowed,
++ 			   !security_ib_endport_manage_subnet(ag->security,
++ 				dev_name(&ag->device->dev), ag->port_num));
++ 	spin_unlock(&mad_agent_list_lock);
+++>>>>>>> c66f67414c1f (IB/core: Don't register each MAD agent for LSM notifier)
+  }
+  
+  int ib_mad_agent_security_setup(struct ib_mad_agent *agent,
+@@@ -707,8 -711,9 +722,9 @@@
+  	if (qp_type != IB_QPT_SMI)
+  		return 0;
+  
++ 	spin_lock(&mad_agent_list_lock);
+  	ret = security_ib_endport_manage_subnet(agent->security,
+ -						dev_name(&agent->device->dev),
+ +						agent->device->name,
+  						agent->port_num);
+  	if (ret)
+  		goto free_security;
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index f8e9b76f1ef7..e464ca5cbc92 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -198,6 +198,7 @@ int ib_mad_agent_security_setup(struct ib_mad_agent *agent,
+ 				enum ib_qp_type qp_type);
+ void ib_mad_agent_security_cleanup(struct ib_mad_agent *agent);
+ int ib_mad_enforce_security(struct ib_mad_agent_private *map, u16 pkey_index);
++void ib_mad_agent_security_change(void);
+ #else
+ static inline void ib_security_destroy_port_pkey_list(struct ib_device *device)
+ {
+@@ -263,6 +264,10 @@ static inline int ib_mad_enforce_security(struct ib_mad_agent_private *map,
+ {
+ 	return 0;
+ }
++
++static inline void ib_mad_agent_security_change(void)
++{
++}
+ #endif
+ 
+ struct ib_device *ib_device_get_by_index(u32 ifindex);
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index bd5ecd56018d..fe3d2d376441 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -434,6 +434,7 @@ static int ib_security_change(struct notifier_block *nb, unsigned long event,
+ 		return NOTIFY_DONE;
+ 
+ 	schedule_work(&ib_policy_change_work);
++	ib_mad_agent_security_change();
+ 
+ 	return NOTIFY_OK;
+ }
+* Unmerged path drivers/infiniband/core/security.c
+diff --git a/include/rdma/ib_mad.h b/include/rdma/ib_mad.h
+index 1c0b914f199d..79ba8219e7dc 100644
+--- a/include/rdma/ib_mad.h
++++ b/include/rdma/ib_mad.h
+@@ -617,11 +617,10 @@ struct ib_mad_agent {
+ 	u32			hi_tid;
+ 	u32			flags;
+ 	void			*security;
+-	struct notifier_block   lsm_nb;
++	struct list_head	mad_agent_sec_list;
+ 	u8			port_num;
+ 	u8			rmpp_version;
+ 	bool			smp_allowed;
+-	bool			lsm_nb_reg;
+ };
+ 
+ /**
