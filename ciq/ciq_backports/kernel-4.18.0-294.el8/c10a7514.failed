@@ -1,0 +1,313 @@
+NFSv4.2: add the extended attribute proc functions.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [fs] NFSv4.2: add the extended attribute proc functions (Scott Mayhew) [1888214]
+Rebuild_FUZZ: 99.01%
+commit-author Frank van der Linden <fllinden@amazon.com>
+commit c10a75145febb588d96c6adda6eb5ae2338e4e32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c10a7514.failed
+
+Implement the extended attribute procedures for NFSv4.2 extended
+attribute support (RFC 8276).
+
+	Signed-off-by: Frank van der Linden <fllinden@amazon.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit c10a75145febb588d96c6adda6eb5ae2338e4e32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs42.h
+diff --cc fs/nfs/nfs42.h
+index 901cca7542f9,0fe5aacbcfdf..000000000000
+--- a/fs/nfs/nfs42.h
++++ b/fs/nfs/nfs42.h
+@@@ -23,5 -27,38 +23,34 @@@ int nfs42_proc_clone(struct file *, str
+  int nfs42_proc_layouterror(struct pnfs_layout_segment *lseg,
+  			   const struct nfs42_layout_error *errors,
+  			   size_t n);
+ -int nfs42_proc_copy_notify(struct file *, struct file *,
+ -			   struct nfs42_copy_notify_res *);
+ -static inline bool nfs42_files_from_same_server(struct file *in,
+ -						struct file *out)
+ -{
+ -	struct nfs_client *c_in = (NFS_SERVER(file_inode(in)))->nfs_client;
+ -	struct nfs_client *c_out = (NFS_SERVER(file_inode(out)))->nfs_client;
+  
+++<<<<<<< HEAD
+++=======
++ 	return nfs4_check_serverowner_major_id(c_in->cl_serverowner,
++ 					       c_out->cl_serverowner);
++ }
++ 
++ ssize_t nfs42_proc_getxattr(struct inode *inode, const char *name,
++ 			    void *buf, size_t buflen);
++ int nfs42_proc_setxattr(struct inode *inode, const char *name,
++ 			const void *buf, size_t buflen, int flags);
++ ssize_t nfs42_proc_listxattrs(struct inode *inode, void *buf,
++ 			       size_t buflen, u64 *cookiep, bool *eofp);
++ int nfs42_proc_removexattr(struct inode *inode, const char *name);
++ 
++ /*
++  * Maximum XDR buffer size needed for a listxattr buffer of buflen size.
++  *
++  * The upper boundary is a buffer with all 1-byte sized attribute names.
++  * They would be 7 bytes long in the eventual buffer ("user.x\0"), and
++  * 8 bytes long XDR-encoded.
++  *
++  * Include the trailing eof word as well.
++  */
++ static inline u32 nfs42_listxattr_xdrsize(u32 buflen)
++ {
++ 	return ((buflen / (XATTR_USER_PREFIX_LEN + 2)) * 8) + 4;
++ }
++ #endif /* CONFIG_NFS_V4_2 */
+++>>>>>>> c10a75145feb (NFSv4.2: add the extended attribute proc functions.)
+  #endif /* __LINUX_FS_NFS_NFS4_2_H */
+* Unmerged path fs/nfs/nfs42.h
+diff --git a/fs/nfs/nfs42proc.c b/fs/nfs/nfs42proc.c
+index cc44135fbc5b..ab131e0e7da5 100644
+--- a/fs/nfs/nfs42proc.c
++++ b/fs/nfs/nfs42proc.c
+@@ -933,3 +933,239 @@ int nfs42_proc_clone(struct file *src_f, struct file *dst_f,
+ 	nfs_put_lock_context(src_lock);
+ 	return err;
+ }
++
++#define NFS4XATTR_MAXPAGES DIV_ROUND_UP(XATTR_SIZE_MAX, PAGE_SIZE)
++
++static int _nfs42_proc_removexattr(struct inode *inode, const char *name)
++{
++	struct nfs_server *server = NFS_SERVER(inode);
++	struct nfs42_removexattrargs args = {
++		.fh = NFS_FH(inode),
++		.xattr_name = name,
++	};
++	struct nfs42_removexattrres res;
++	struct rpc_message msg = {
++		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_REMOVEXATTR],
++		.rpc_argp = &args,
++		.rpc_resp = &res,
++	};
++	int ret;
++	unsigned long timestamp = jiffies;
++
++	ret = nfs4_call_sync(server->client, server, &msg, &args.seq_args,
++	    &res.seq_res, 1);
++	if (!ret)
++		nfs4_update_changeattr(inode, &res.cinfo, timestamp, 0);
++
++	return ret;
++}
++
++static int _nfs42_proc_setxattr(struct inode *inode, const char *name,
++				const void *buf, size_t buflen, int flags)
++{
++	struct nfs_server *server = NFS_SERVER(inode);
++	struct page *pages[NFS4XATTR_MAXPAGES];
++	struct nfs42_setxattrargs arg = {
++		.fh		= NFS_FH(inode),
++		.xattr_pages	= pages,
++		.xattr_len	= buflen,
++		.xattr_name	= name,
++		.xattr_flags	= flags,
++	};
++	struct nfs42_setxattrres res;
++	struct rpc_message msg = {
++		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_SETXATTR],
++		.rpc_argp	= &arg,
++		.rpc_resp	= &res,
++	};
++	int ret, np;
++	unsigned long timestamp = jiffies;
++
++	if (buflen > server->sxasize)
++		return -ERANGE;
++
++	if (buflen > 0) {
++		np = nfs4_buf_to_pages_noslab(buf, buflen, arg.xattr_pages);
++		if (np < 0)
++			return np;
++	} else
++		np = 0;
++
++	ret = nfs4_call_sync(server->client, server, &msg, &arg.seq_args,
++	    &res.seq_res, 1);
++
++	for (; np > 0; np--)
++		put_page(pages[np - 1]);
++
++	if (!ret)
++		nfs4_update_changeattr(inode, &res.cinfo, timestamp, 0);
++
++	return ret;
++}
++
++static ssize_t _nfs42_proc_getxattr(struct inode *inode, const char *name,
++				void *buf, size_t buflen)
++{
++	struct nfs_server *server = NFS_SERVER(inode);
++	struct page *pages[NFS4XATTR_MAXPAGES] = {};
++	struct nfs42_getxattrargs arg = {
++		.fh		= NFS_FH(inode),
++		.xattr_pages	= pages,
++		.xattr_len	= buflen,
++		.xattr_name	= name,
++	};
++	struct nfs42_getxattrres res;
++	struct rpc_message msg = {
++		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_GETXATTR],
++		.rpc_argp	= &arg,
++		.rpc_resp	= &res,
++	};
++	int ret, np;
++
++	ret = nfs4_call_sync(server->client, server, &msg, &arg.seq_args,
++	    &res.seq_res, 0);
++	if (ret < 0)
++		return ret;
++
++	if (buflen) {
++		if (res.xattr_len > buflen)
++			return -ERANGE;
++		_copy_from_pages(buf, pages, 0, res.xattr_len);
++	}
++
++	np = DIV_ROUND_UP(res.xattr_len, PAGE_SIZE);
++	while (--np >= 0)
++		__free_page(pages[np]);
++
++	return res.xattr_len;
++}
++
++static ssize_t _nfs42_proc_listxattrs(struct inode *inode, void *buf,
++				 size_t buflen, u64 *cookiep, bool *eofp)
++{
++	struct nfs_server *server = NFS_SERVER(inode);
++	struct page **pages;
++	struct nfs42_listxattrsargs arg = {
++		.fh		= NFS_FH(inode),
++		.cookie		= *cookiep,
++	};
++	struct nfs42_listxattrsres res = {
++		.eof = false,
++		.xattr_buf = buf,
++		.xattr_len = buflen,
++	};
++	struct rpc_message msg = {
++		.rpc_proc	= &nfs4_procedures[NFSPROC4_CLNT_LISTXATTRS],
++		.rpc_argp	= &arg,
++		.rpc_resp	= &res,
++	};
++	u32 xdrlen;
++	int ret, np;
++
++
++	res.scratch = alloc_page(GFP_KERNEL);
++	if (!res.scratch)
++		return -ENOMEM;
++
++	xdrlen = nfs42_listxattr_xdrsize(buflen);
++	if (xdrlen > server->lxasize)
++		xdrlen = server->lxasize;
++	np = xdrlen / PAGE_SIZE + 1;
++
++	pages = kcalloc(np, sizeof(struct page *), GFP_KERNEL);
++	if (pages == NULL) {
++		__free_page(res.scratch);
++		return -ENOMEM;
++	}
++
++	arg.xattr_pages = pages;
++	arg.count = xdrlen;
++
++	ret = nfs4_call_sync(server->client, server, &msg, &arg.seq_args,
++	    &res.seq_res, 0);
++
++	if (ret >= 0) {
++		ret = res.copied;
++		*cookiep = res.cookie;
++		*eofp = res.eof;
++	}
++
++	while (--np >= 0) {
++		if (pages[np])
++			__free_page(pages[np]);
++	}
++
++	__free_page(res.scratch);
++	kfree(pages);
++
++	return ret;
++
++}
++
++ssize_t nfs42_proc_getxattr(struct inode *inode, const char *name,
++			      void *buf, size_t buflen)
++{
++	struct nfs4_exception exception = { };
++	ssize_t err;
++
++	do {
++		err = _nfs42_proc_getxattr(inode, name, buf, buflen);
++		if (err >= 0)
++			break;
++		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++				&exception);
++	} while (exception.retry);
++
++	return err;
++}
++
++int nfs42_proc_setxattr(struct inode *inode, const char *name,
++			      const void *buf, size_t buflen, int flags)
++{
++	struct nfs4_exception exception = { };
++	int err;
++
++	do {
++		err = _nfs42_proc_setxattr(inode, name, buf, buflen, flags);
++		if (!err)
++			break;
++		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++				&exception);
++	} while (exception.retry);
++
++	return err;
++}
++
++ssize_t nfs42_proc_listxattrs(struct inode *inode, void *buf,
++			      size_t buflen, u64 *cookiep, bool *eofp)
++{
++	struct nfs4_exception exception = { };
++	ssize_t err;
++
++	do {
++		err = _nfs42_proc_listxattrs(inode, buf, buflen,
++		    cookiep, eofp);
++		if (err >= 0)
++			break;
++		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++				&exception);
++	} while (exception.retry);
++
++	return err;
++}
++
++int nfs42_proc_removexattr(struct inode *inode, const char *name)
++{
++	struct nfs4_exception exception = { };
++	int err;
++
++	do {
++		err = _nfs42_proc_removexattr(inode, name);
++		if (!err)
++			break;
++		err = nfs4_handle_exception(NFS_SERVER(inode), err,
++				&exception);
++	} while (exception.retry);
++
++	return err;
++}
