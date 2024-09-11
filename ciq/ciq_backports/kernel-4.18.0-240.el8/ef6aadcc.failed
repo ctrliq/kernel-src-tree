@@ -1,0 +1,203 @@
+net: sched: Make TBF Qdisc offloadable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] sched: Make TBF Qdisc offloadable (Ivan Vecera) [1824071]
+Rebuild_FUZZ: 92.96%
+commit-author Petr Machata <petrm@mellanox.com>
+commit ef6aadcc76c97e25f62adc4e9d19684d3e5d0b87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ef6aadcc.failed
+
+Invoke ndo_setup_tc as appropriate to signal init / replacement, destroying
+and dumping of TBF Qdisc.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ef6aadcc76c97e25f62adc4e9d19684d3e5d0b87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/net/pkt_cls.h
+diff --cc include/linux/netdevice.h
+index 4bd94d67974c,11bdf6cb30bd..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -869,6 -848,9 +869,12 @@@ enum tc_setup_type 
+  	TC_SETUP_ROOT_QDISC,
+  	TC_SETUP_QDISC_GRED,
+  	TC_SETUP_QDISC_TAPRIO,
+++<<<<<<< HEAD
+++=======
++ 	TC_SETUP_FT,
++ 	TC_SETUP_QDISC_ETS,
++ 	TC_SETUP_QDISC_TBF,
+++>>>>>>> ef6aadcc76c9 (net: sched: Make TBF Qdisc offloadable)
+  };
+  
+  /* These structures hold the attributes of bpf state that are being passed
+diff --cc include/net/pkt_cls.h
+index fd260438d558,ce036492986a..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -828,4 -823,57 +828,60 @@@ struct tc_root_qopt_offload 
+  	bool ingress;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum tc_ets_command {
++ 	TC_ETS_REPLACE,
++ 	TC_ETS_DESTROY,
++ 	TC_ETS_STATS,
++ 	TC_ETS_GRAFT,
++ };
++ 
++ struct tc_ets_qopt_offload_replace_params {
++ 	unsigned int bands;
++ 	u8 priomap[TC_PRIO_MAX + 1];
++ 	unsigned int quanta[TCQ_ETS_MAX_BANDS];	/* 0 for strict bands. */
++ 	unsigned int weights[TCQ_ETS_MAX_BANDS];
++ 	struct gnet_stats_queue *qstats;
++ };
++ 
++ struct tc_ets_qopt_offload_graft_params {
++ 	u8 band;
++ 	u32 child_handle;
++ };
++ 
++ struct tc_ets_qopt_offload {
++ 	enum tc_ets_command command;
++ 	u32 handle;
++ 	u32 parent;
++ 	union {
++ 		struct tc_ets_qopt_offload_replace_params replace_params;
++ 		struct tc_qopt_offload_stats stats;
++ 		struct tc_ets_qopt_offload_graft_params graft_params;
++ 	};
++ };
++ 
++ enum tc_tbf_command {
++ 	TC_TBF_REPLACE,
++ 	TC_TBF_DESTROY,
++ 	TC_TBF_STATS,
++ };
++ 
++ struct tc_tbf_qopt_offload_replace_params {
++ 	struct psched_ratecfg rate;
++ 	u32 max_size;
++ 	struct gnet_stats_queue *qstats;
++ };
++ 
++ struct tc_tbf_qopt_offload {
++ 	enum tc_tbf_command command;
++ 	u32 handle;
++ 	u32 parent;
++ 	union {
++ 		struct tc_tbf_qopt_offload_replace_params replace_params;
++ 		struct tc_qopt_offload_stats stats;
++ 	};
++ };
++ 
+++>>>>>>> ef6aadcc76c9 (net: sched: Make TBF Qdisc offloadable)
+  #endif
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/net/pkt_cls.h
+diff --git a/net/sched/sch_tbf.c b/net/sched/sch_tbf.c
+index b94a15a76939..678862a91a8f 100644
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@ -20,6 +20,7 @@
+ #include <linux/skbuff.h>
+ #include <net/netlink.h>
+ #include <net/sch_generic.h>
++#include <net/pkt_cls.h>
+ #include <net/pkt_sched.h>
+ 
+ 
+@@ -142,6 +143,52 @@ static u64 psched_ns_t2l(const struct psched_ratecfg *r,
+ 	return len;
+ }
+ 
++static void tbf_offload_change(struct Qdisc *sch)
++{
++	struct tbf_sched_data *q = qdisc_priv(sch);
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_tbf_qopt_offload qopt;
++
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return;
++
++	qopt.command = TC_TBF_REPLACE;
++	qopt.handle = sch->handle;
++	qopt.parent = sch->parent;
++	qopt.replace_params.rate = q->rate;
++	qopt.replace_params.max_size = q->max_size;
++	qopt.replace_params.qstats = &sch->qstats;
++
++	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_TBF, &qopt);
++}
++
++static void tbf_offload_destroy(struct Qdisc *sch)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_tbf_qopt_offload qopt;
++
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return;
++
++	qopt.command = TC_TBF_DESTROY;
++	qopt.handle = sch->handle;
++	qopt.parent = sch->parent;
++	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_TBF, &qopt);
++}
++
++static int tbf_offload_dump(struct Qdisc *sch)
++{
++	struct tc_tbf_qopt_offload qopt;
++
++	qopt.command = TC_TBF_STATS;
++	qopt.handle = sch->handle;
++	qopt.parent = sch->parent;
++	qopt.stats.bstats = &sch->bstats;
++	qopt.stats.qstats = &sch->qstats;
++
++	return qdisc_offload_dump_helper(sch, TC_SETUP_QDISC_TBF, &qopt);
++}
++
+ /* GSO packet is too big, segment it so that tbf can transmit
+  * each segment in time
+  */
+@@ -412,6 +459,8 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt,
+ 
+ 	sch_tree_unlock(sch);
+ 	err = 0;
++
++	tbf_offload_change(sch);
+ done:
+ 	return err;
+ }
+@@ -437,6 +486,7 @@ static void tbf_destroy(struct Qdisc *sch)
+ 	struct tbf_sched_data *q = qdisc_priv(sch);
+ 
+ 	qdisc_watchdog_cancel(&q->watchdog);
++	tbf_offload_destroy(sch);
+ 	qdisc_put(q->qdisc);
+ }
+ 
+@@ -445,6 +495,11 @@ static int tbf_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct tbf_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *nest;
+ 	struct tc_tbf_qopt opt;
++	int err;
++
++	err = tbf_offload_dump(sch);
++	if (err)
++		return err;
+ 
+ 	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
