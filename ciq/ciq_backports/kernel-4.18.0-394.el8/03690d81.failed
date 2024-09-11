@@ -1,0 +1,135 @@
+scsi: iscsi: Fix unbound endpoint error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mike Christie <michael.christie@oracle.com>
+commit 03690d81974535f228e892a14f0d2d44404fe555
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/03690d81.failed
+
+If a driver raises a connection error before the connection is bound, we
+can leave a cleanup_work queued that can later run and disconnect/stop a
+connection that is logged in. The problem is that drivers can call
+iscsi_conn_error_event for endpoints that are connected but not yet bound
+when something like the network port they are using is brought down.
+iscsi_cleanup_conn_work_fn will check for this and exit early, but if the
+cleanup_work is stuck behind other works, it might not get run until after
+userspace has done ep_disconnect. Because the endpoint is not yet bound
+there was no way for ep_disconnect to flush the work.
+
+The bug of leaving stop_conns queued was added in:
+
+Commit 23d6fefbb3f6 ("scsi: iscsi: Fix in-kernel conn failure handling")
+
+and:
+
+Commit 0ab710458da1 ("scsi: iscsi: Perform connection failure entirely in
+kernel space")
+
+was supposed to fix it, but left this case.
+
+This patch moves the conn state check to before we even queue the work so
+we can avoid queueing.
+
+Link: https://lore.kernel.org/r/20220408001314.5014-7-michael.christie@oracle.com
+Fixes: 0ab710458da1 ("scsi: iscsi: Perform connection failure entirely in kernel space")
+	Tested-by: Manish Rangankar <mrangankar@marvell.com>
+	Reviewed-by: Lee Duncan <lduncan@@suse.com>
+	Reviewed-by: Chris Leech <cleech@redhat.com>
+	Signed-off-by: Mike Christie <michael.christie@oracle.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 03690d81974535f228e892a14f0d2d44404fe555)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_transport_iscsi.c
+diff --cc drivers/scsi/scsi_transport_iscsi.c
+index 46e03f51496a,2c0dd64159b0..000000000000
+--- a/drivers/scsi/scsi_transport_iscsi.c
++++ b/drivers/scsi/scsi_transport_iscsi.c
+@@@ -2310,18 -2322,11 +2310,26 @@@ static void iscsi_cleanup_conn_work_fn(
+  
+  	mutex_lock(&conn->ep_mutex);
+  	/*
+++<<<<<<< HEAD
+ +	 * If we are not at least bound there is nothing for us to do. Userspace
+ +	 * will do a ep_disconnect call if offload is used, but will not be
+ +	 * doing a stop since there is nothing to clean up, so we have to clear
+ +	 * the cleanup bit here.
+ +	 */
+ +	if (conn->state != ISCSI_CONN_BOUND && conn->state != ISCSI_CONN_UP) {
+ +		ISCSI_DBG_TRANS_CONN(conn, "Got error while conn is already failed. Ignoring.\n");
+ +		clear_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags);
+ +		mutex_unlock(&conn->ep_mutex);
+ +		return;
+ +	}
+ +
+++=======
++ 	 * Get a ref to the ep, so we don't release its ID until after
++ 	 * userspace is done referencing it in iscsi_if_disconnect_bound_ep.
++ 	 */
++ 	if (conn->ep)
++ 		get_device(&conn->ep->dev);
+++>>>>>>> 03690d819745 (scsi: iscsi: Fix unbound endpoint error handling)
+  	iscsi_ep_disconnect(conn, false);
+  
+  	if (system_state != SYSTEM_RUNNING) {
+@@@ -2568,9 -2574,32 +2576,38 @@@ void iscsi_conn_error_event(struct iscs
+  	struct iscsi_uevent *ev;
+  	struct iscsi_internal *priv;
+  	int len = nlmsg_total_size(sizeof(*ev));
+++<<<<<<< HEAD
+ +
+ +	if (!test_and_set_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags))
+ +		queue_work(iscsi_conn_cleanup_workq, &conn->cleanup_work);
+++=======
++ 	unsigned long flags;
++ 	int state;
++ 
++ 	spin_lock_irqsave(&conn->lock, flags);
++ 	/*
++ 	 * Userspace will only do a stop call if we are at least bound. And, we
++ 	 * only need to do the in kernel cleanup if in the UP state so cmds can
++ 	 * be released to upper layers. If in other states just wait for
++ 	 * userspace to avoid races that can leave the cleanup_work queued.
++ 	 */
++ 	state = READ_ONCE(conn->state);
++ 	switch (state) {
++ 	case ISCSI_CONN_BOUND:
++ 	case ISCSI_CONN_UP:
++ 		if (!test_and_set_bit(ISCSI_CLS_CONN_BIT_CLEANUP,
++ 				      &conn->flags)) {
++ 			queue_work(iscsi_conn_cleanup_workq,
++ 				   &conn->cleanup_work);
++ 		}
++ 		break;
++ 	default:
++ 		ISCSI_DBG_TRANS_CONN(conn, "Got conn error in state %d\n",
++ 				     state);
++ 		break;
++ 	}
++ 	spin_unlock_irqrestore(&conn->lock, flags);
+++>>>>>>> 03690d819745 (scsi: iscsi: Fix unbound endpoint error handling)
+  
+  	priv = iscsi_if_transport_lookup(conn->transport);
+  	if (!priv)
+@@@ -4067,12 -4090,13 +4105,13 @@@ static ssize_t show_conn_state(struct d
+  {
+  	struct iscsi_cls_conn *conn = iscsi_dev_to_conn(dev->parent);
+  	const char *state = "unknown";
++ 	int conn_state = READ_ONCE(conn->state);
+  
+- 	if (conn->state >= 0 &&
+- 	    conn->state < ARRAY_SIZE(connection_state_names))
+- 		state = connection_state_names[conn->state];
++ 	if (conn_state >= 0 &&
++ 	    conn_state < ARRAY_SIZE(connection_state_names))
++ 		state = connection_state_names[conn_state];
+  
+ -	return sysfs_emit(buf, "%s\n", state);
+ +	return scnprintf(buf, PAGE_SIZE, "%s\n", state);
+  }
+  static ISCSI_CLASS_ATTR(conn, state, S_IRUGO, show_conn_state,
+  			NULL);
+* Unmerged path drivers/scsi/scsi_transport_iscsi.c
