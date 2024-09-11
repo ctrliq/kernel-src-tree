@@ -1,0 +1,121 @@
+nvme: fix refcounting imbalance when all paths are down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Hannes Reinecke <hare@suse.de>
+commit 5396fdac56d87d04e75e5068c0c92d33625f51e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5396fdac.failed
+
+When the last path to a ns_head drops the current code
+removes the ns_head from the subsystem list, but will only
+delete the disk itself if the last reference to the ns_head
+drops. This is causing an refcounting imbalance eg when
+applications have a reference to the disk, as then they'll
+never get notified that the disk is in fact dead.
+This patch moves the call 'del_gendisk' into nvme_mpath_check_last_path(),
+ensuring that the disk can be properly removed and applications get the
+appropriate notifications.
+
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 5396fdac56d87d04e75e5068c0c92d33625f51e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/multipath.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/multipath.c
+index fd91627e7b46,3f32c5e86bfc..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -711,8 -764,17 +711,22 @@@ void nvme_mpath_shutdown_disk(struct nv
+  {
+  	if (!head->disk)
+  		return;
+++<<<<<<< HEAD
+ +	if (head->disk->flags & GENHD_FL_UP)
+ +		del_gendisk(head->disk);
+++=======
++ 	kblockd_schedule_work(&head->requeue_work);
++ 	if (head->disk->flags & GENHD_FL_UP) {
++ 		nvme_cdev_del(&head->cdev, &head->cdev_device);
++ 		del_gendisk(head->disk);
++ 	}
++ }
++ 
++ void nvme_mpath_remove_disk(struct nvme_ns_head *head)
++ {
++ 	if (!head->disk)
++ 		return;
+++>>>>>>> 5396fdac56d8 (nvme: fix refcounting imbalance when all paths are down)
+  	blk_set_queue_dying(head->disk->queue);
+  	/* make sure all pending bios are cleaned up */
+  	kblockd_schedule_work(&head->requeue_work);
+diff --cc drivers/nvme/host/nvme.h
+index 71a90ae628be,5cd1fa3b8464..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -675,15 -716,7 +675,19 @@@ void nvme_mpath_uninit(struct nvme_ctr
+  void nvme_mpath_stop(struct nvme_ctrl *ctrl);
+  bool nvme_mpath_clear_current_path(struct nvme_ns *ns);
+  void nvme_mpath_clear_ctrl_paths(struct nvme_ctrl *ctrl);
+++<<<<<<< HEAD
+ +struct nvme_ns *nvme_find_path(struct nvme_ns_head *head);
+ +
+ +static inline void nvme_mpath_check_last_path(struct nvme_ns *ns)
+ +{
+ +	struct nvme_ns_head *head = ns->head;
+ +
+ +	if (head->disk && list_empty(&head->list))
+ +		kblockd_schedule_work(&head->requeue_work);
+ +}
+++=======
++ void nvme_mpath_shutdown_disk(struct nvme_ns_head *head);
+++>>>>>>> 5396fdac56d8 (nvme: fix refcounting imbalance when all paths are down)
+  
+  static inline void nvme_trace_bio_complete(struct request *req)
+  {
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 228052b88c83..2d17f4c054e2 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -4186,6 +4186,8 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid,
+ 
+ static void nvme_ns_remove(struct nvme_ns *ns)
+ {
++	bool last_path = false;
++
+ 	if (test_and_set_bit(NVME_NS_REMOVING, &ns->flags))
+ 		return;
+ 
+@@ -4194,8 +4196,6 @@ static void nvme_ns_remove(struct nvme_ns *ns)
+ 
+ 	mutex_lock(&ns->ctrl->subsys->lock);
+ 	list_del_rcu(&ns->siblings);
+-	if (list_empty(&ns->head->list))
+-		list_del_init(&ns->head->entry);
+ 	mutex_unlock(&ns->ctrl->subsys->lock);
+ 
+ 	synchronize_rcu(); /* guarantee not available in head->list */
+@@ -4213,7 +4213,15 @@ static void nvme_ns_remove(struct nvme_ns *ns)
+ 	list_del_init(&ns->list);
+ 	up_write(&ns->ctrl->namespaces_rwsem);
+ 
+-	nvme_mpath_check_last_path(ns);
++	/* Synchronize with nvme_init_ns_head() */
++	mutex_lock(&ns->head->subsys->lock);
++	if (list_empty(&ns->head->list)) {
++		list_del_init(&ns->head->entry);
++		last_path = true;
++	}
++	mutex_unlock(&ns->head->subsys->lock);
++	if (last_path)
++		nvme_mpath_shutdown_disk(ns->head);
+ 	nvme_put_ns(ns);
+ }
+ 
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path drivers/nvme/host/nvme.h
