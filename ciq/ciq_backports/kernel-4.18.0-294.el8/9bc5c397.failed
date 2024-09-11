@@ -1,0 +1,126 @@
+block: fold bdev_unhash_inode into invalidate_partition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 9bc5c397d8384b50c8202f4400bf2f87fe8291d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9bc5c397.failed
+
+invalidate_partition and bdev_unhash_inode are always paired, and
+invalidate_partition already does an icache lookup for the block device
+inode.  Piggy back on that to remove the inode from the hash.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9bc5c397d8384b50c8202f4400bf2f87fe8291d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+diff --cc block/genhd.c
+index 4c34a620cd26,c05d509877fa..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -837,25 -878,25 +837,47 @@@ void device_add_disk_no_queue_reg(struc
+  }
+  EXPORT_SYMBOL(device_add_disk_no_queue_reg);
+  
+++<<<<<<< HEAD
+ +/**
+ + * del_gendisk - remove the gendisk
+ + * @disk: the struct gendisk to remove
+ + *
+ + * Removes the gendisk and all its associated resources. This deletes the
+ + * partitions associated with the gendisk, and unregisters the associated
+ + * request_queue.
+ + *
+ + * This is the counter to the respective __device_add_disk() call.
+ + *
+ + * The final removal of the struct gendisk happens when its refcount reaches 0
+ + * with put_disk(), which should be called after del_gendisk(), if
+ + * __device_add_disk() was used.
+ + *
+ + * Drivers exist which depend on the release of the gendisk to be synchronous,
+ + * it should not be deferred.
+ + *
+ + * Context: can sleep
+ + */
+++=======
++ static void invalidate_partition(struct gendisk *disk, int partno)
++ {
++ 	struct block_device *bdev;
++ 
++ 	bdev = bdget_disk(disk, partno);
++ 	if (!bdev)
++ 		return;
++ 
++ 	fsync_bdev(bdev);
++ 	__invalidate_device(bdev, true);
++ 
++ 	/*
++ 	 * Unhash the bdev inode for this device so that it gets evicted as soon
++ 	 * as last inode reference is dropped.
++ 	 */
++ 	remove_inode_hash(bdev->bd_inode);
++ 	bdput(bdev);
++ }
++ 
+++>>>>>>> 9bc5c397d838 (block: fold bdev_unhash_inode into invalidate_partition)
+  void del_gendisk(struct gendisk *disk)
+  {
+  	struct disk_part_iter piter;
+@@@ -876,8 -915,7 +898,12 @@@
+  			     DISK_PITER_INCL_EMPTY | DISK_PITER_REVERSE);
+  	while ((part = disk_part_iter_next(&piter))) {
+  		invalidate_partition(disk, part->partno);
+++<<<<<<< HEAD
+ +		bdev_unhash_inode(part_devt(part));
+ +		delete_partition(disk, part->partno);
+++=======
++ 		delete_partition(disk, part);
+++>>>>>>> 9bc5c397d838 (block: fold bdev_unhash_inode into invalidate_partition)
+  	}
+  	disk_part_iter_exit(&piter);
+  
+* Unmerged path block/genhd.c
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index ff580a010566..ff8f709ed669 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -902,21 +902,6 @@ static int bdev_set(struct inode *inode, void *data)
+ 
+ static LIST_HEAD(all_bdevs);
+ 
+-/*
+- * If there is a bdev inode for this device, unhash it so that it gets evicted
+- * as soon as last inode reference is dropped.
+- */
+-void bdev_unhash_inode(dev_t dev)
+-{
+-	struct inode *inode;
+-
+-	inode = ilookup5(blockdev_superblock, hash(dev), bdev_test, &dev);
+-	if (inode) {
+-		remove_inode_hash(inode);
+-		iput(inode);
+-	}
+-}
+-
+ struct block_device *bdget(dev_t dev)
+ {
+ 	struct block_device *bdev;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 60661a0850f1..06a2f34eb19c 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2577,7 +2577,6 @@ extern struct kmem_cache *names_cachep;
+ #ifdef CONFIG_BLOCK
+ extern int register_blkdev(unsigned int, const char *);
+ extern void unregister_blkdev(unsigned int, const char *);
+-extern void bdev_unhash_inode(dev_t dev);
+ extern struct block_device *bdget(dev_t);
+ extern struct block_device *bdgrab(struct block_device *bdev);
+ extern void bd_set_size(struct block_device *, loff_t size);
