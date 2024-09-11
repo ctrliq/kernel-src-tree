@@ -1,0 +1,194 @@
+selftests/vm: gup_test: fix test flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Pavel Tatashin <pasha.tatashin@soleen.com>
+commit 79dbf135e2481eaa77b172d88c343bf85e021545
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/79dbf135.failed
+
+In gup_test both gup_flags and test_flags use the same flags field.
+This is broken.
+
+Farther, in the actual gup_test.c all the passed gup_flags are erased
+and unconditionally replaced with FOLL_WRITE.
+
+Which means that test_flags are ignored, and code like this always
+performs pin dump test:
+
+155  			if (gup->flags & GUP_TEST_FLAG_DUMP_PAGES_USE_PIN)
+156  				nr = pin_user_pages(addr, nr, gup->flags,
+157  						    pages + i, NULL);
+158  			else
+159  				nr = get_user_pages(addr, nr, gup->flags,
+160  						    pages + i, NULL);
+161  			break;
+
+Add a new test_flags field, to allow raw gup_flags to work.  Add a new
+subcommand for DUMP_USER_PAGES_TEST to specify that pin test should be
+performed.
+
+Remove unconditional overwriting of gup_flags via FOLL_WRITE.  But,
+preserve the previous behaviour where FOLL_WRITE was the default flag,
+and add a new option "-W" to unset FOLL_WRITE.
+
+Rename flags with gup_flags.
+
+With the fix, dump works like this:
+
+  root@virtme:/# gup_test  -c
+  ---- page #0, starting from user virt addr: 0x7f8acb9e4000
+  page:00000000d3d2ee27 refcount:2 mapcount:1 mapping:0000000000000000
+  index:0x0 pfn:0x100bcf
+  anon flags: 0x300000000080016(referenced|uptodate|lru|swapbacked)
+  raw: 0300000000080016 ffffd0e204021608 ffffd0e208df2e88 ffff8ea04243ec61
+  raw: 0000000000000000 0000000000000000 0000000200000000 0000000000000000
+  page dumped because: gup_test: dump_pages() test
+  DUMP_USER_PAGES_TEST: done
+
+  root@virtme:/# gup_test  -c -p
+  ---- page #0, starting from user virt addr: 0x7fd19701b000
+  page:00000000baed3c7d refcount:1025 mapcount:1 mapping:0000000000000000
+  index:0x0 pfn:0x108008
+  anon flags: 0x300000000080014(uptodate|lru|swapbacked)
+  raw: 0300000000080014 ffffd0e204200188 ffffd0e205e09088 ffff8ea04243ee71
+  raw: 0000000000000000 0000000000000000 0000040100000000 0000000000000000
+  page dumped because: gup_test: dump_pages() test
+  DUMP_USER_PAGES_TEST: done
+
+Refcount shows the difference between pin vs no-pin case.
+Also change type of nr from int to long, as it counts number of pages.
+
+Link: https://lkml.kernel.org/r/20210215161349.246722-14-pasha.tatashin@soleen.com
+	Signed-off-by: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: James Morris <jmorris@namei.org>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sasha Levin <sashal@kernel.org>
+	Cc: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Cc: Tyler Hicks <tyhicks@linux.microsoft.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 79dbf135e2481eaa77b172d88c343bf85e021545)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup_benchmark.c
+#	mm/gup_test.h
+#	tools/testing/selftests/vm/gup_test.c
+diff --cc mm/gup_benchmark.c
+index 464cae1fa3ea,a6ed1c877679..000000000000
+--- a/mm/gup_benchmark.c
++++ b/mm/gup_benchmark.c
+@@@ -69,9 -94,11 +69,9 @@@ static int __gup_benchmark_ioctl(unsign
+  {
+  	ktime_t start_time, end_time;
+  	unsigned long i, nr_pages, addr, next;
+- 	int nr;
++ 	long nr;
+  	struct page **pages;
+  	int ret = 0;
+ -	bool needs_mmap_lock =
+ -		cmd != GUP_FAST_BENCHMARK && cmd != PIN_FAST_BENCHMARK;
+  
+  	if (gup->size > ULONG_MAX)
+  		return -EINVAL;
+@@@ -94,35 -126,39 +94,53 @@@
+  			nr = (next - addr) / PAGE_SIZE;
+  		}
+  
+- 		/* Filter out most gup flags: only allow a tiny subset here: */
+- 		gup->flags &= FOLL_WRITE;
+- 
+  		switch (cmd) {
+  		case GUP_FAST_BENCHMARK:
+- 			nr = get_user_pages_fast(addr, nr, gup->flags,
++ 			nr = get_user_pages_fast(addr, nr, gup->gup_flags,
+  						 pages + i);
+  			break;
+++<<<<<<< HEAD:mm/gup_benchmark.c
+ +		case GUP_BENCHMARK:
+ +			nr = get_user_pages(addr, nr, gup->flags, pages + i,
+++=======
++ 		case GUP_BASIC_TEST:
++ 			nr = get_user_pages(addr, nr, gup->gup_flags, pages + i,
+++>>>>>>> 79dbf135e248 (selftests/vm: gup_test: fix test flag):mm/gup_test.c
+  					    NULL);
+  			break;
+  		case PIN_FAST_BENCHMARK:
+- 			nr = pin_user_pages_fast(addr, nr, gup->flags,
++ 			nr = pin_user_pages_fast(addr, nr, gup->gup_flags,
+  						 pages + i);
+  			break;
+++<<<<<<< HEAD:mm/gup_benchmark.c
+ +		case PIN_BENCHMARK:
+ +			nr = pin_user_pages(addr, nr, gup->flags, pages + i,
+++=======
++ 		case PIN_BASIC_TEST:
++ 			nr = pin_user_pages(addr, nr, gup->gup_flags, pages + i,
+++>>>>>>> 79dbf135e248 (selftests/vm: gup_test: fix test flag):mm/gup_test.c
+  					    NULL);
+  			break;
+  		case PIN_LONGTERM_BENCHMARK:
+  			nr = pin_user_pages(addr, nr,
+- 					    gup->flags | FOLL_LONGTERM,
++ 					    gup->gup_flags | FOLL_LONGTERM,
+  					    pages + i, NULL);
+  			break;
+++<<<<<<< HEAD:mm/gup_benchmark.c
+++=======
++ 		case DUMP_USER_PAGES_TEST:
++ 			if (gup->test_flags & GUP_TEST_FLAG_DUMP_PAGES_USE_PIN)
++ 				nr = pin_user_pages(addr, nr, gup->gup_flags,
++ 						    pages + i, NULL);
++ 			else
++ 				nr = get_user_pages(addr, nr, gup->gup_flags,
++ 						    pages + i, NULL);
++ 			break;
+++>>>>>>> 79dbf135e248 (selftests/vm: gup_test: fix test flag):mm/gup_test.c
+  		default:
+ +			kvfree(pages);
+  			ret = -EINVAL;
+ -			goto unlock;
+ +			goto out;
+  		}
+  
+  		if (nr <= 0)
+@@@ -143,9 -179,12 +161,13 @@@
+  	 */
+  	verify_dma_pinned(cmd, pages, nr_pages);
+  
+ -	if (cmd == DUMP_USER_PAGES_TEST)
+ -		dump_pages_test(gup, pages, nr_pages);
+ -
+  	start_time = ktime_get();
+  
+++<<<<<<< HEAD:mm/gup_benchmark.c
+ +	put_back_pages(cmd, pages, nr_pages);
+++=======
++ 	put_back_pages(cmd, pages, nr_pages, gup->test_flags);
+++>>>>>>> 79dbf135e248 (selftests/vm: gup_test: fix test flag):mm/gup_test.c
+  
+  	end_time = ktime_get();
+  	gup->put_delta_usec = ktime_us_delta(end_time, start_time);
+* Unmerged path mm/gup_test.h
+* Unmerged path tools/testing/selftests/vm/gup_test.c
+* Unmerged path mm/gup_benchmark.c
+* Unmerged path mm/gup_test.h
+* Unmerged path tools/testing/selftests/vm/gup_test.c
