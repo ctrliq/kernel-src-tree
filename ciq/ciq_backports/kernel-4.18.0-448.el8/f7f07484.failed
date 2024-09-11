@@ -1,0 +1,378 @@
+iommu/iova: Move flush queue code to iommu-dma
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit f7f07484542fae833025da86eb4bd068f5253fe0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/f7f07484.failed
+
+Flush queues are specific to DMA ops, which are now handled exclusively
+by iommu-dma. As such, now that the historical artefacts from being
+shared directly with drivers have been cleaned up, move the flush queue
+code into iommu-dma itself to get it out of the way of other IOVA users.
+
+This is pure code movement with no functional change; refactoring to
+clean up the headers and definitions will follow.
+
+	Reviewed-by: John Garry <john.garry@huawei.com>
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Link: https://lore.kernel.org/r/1d9a1ee1392e96eaae5e6467181b3e83edfdfbad.1639753638.git.robin.murphy@arm.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit f7f07484542fae833025da86eb4bd068f5253fe0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+#	drivers/iommu/iova.c
+diff --cc drivers/iommu/dma-iommu.c
+index 223a46c79116,96057bec4164..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -76,18 -64,179 +76,194 @@@ static int __init iommu_dma_forcedac_se
+  }
+  early_param("iommu.forcedac", iommu_dma_forcedac_setup);
+  
+++<<<<<<< HEAD
+ +static void iommu_dma_entry_dtor(unsigned long data)
+ +{
+ +	struct page *freelist = (struct page *)data;
+ +
+ +	while (freelist) {
+ +		unsigned long p = (unsigned long)page_address(freelist);
+ +
+ +		freelist = freelist->freelist;
+ +		free_page(p);
+ +	}
+ +}
+ +
+++=======
++ #define fq_ring_for_each(i, fq) \
++ 	for ((i) = (fq)->head; (i) != (fq)->tail; (i) = ((i) + 1) % IOVA_FQ_SIZE)
++ 
++ static inline bool fq_full(struct iova_fq *fq)
++ {
++ 	assert_spin_locked(&fq->lock);
++ 	return (((fq->tail + 1) % IOVA_FQ_SIZE) == fq->head);
++ }
++ 
++ static inline unsigned fq_ring_add(struct iova_fq *fq)
++ {
++ 	unsigned idx = fq->tail;
++ 
++ 	assert_spin_locked(&fq->lock);
++ 
++ 	fq->tail = (idx + 1) % IOVA_FQ_SIZE;
++ 
++ 	return idx;
++ }
++ 
++ static void fq_ring_free(struct iova_domain *iovad, struct iova_fq *fq)
++ {
++ 	u64 counter = atomic64_read(&iovad->fq_flush_finish_cnt);
++ 	unsigned idx;
++ 
++ 	assert_spin_locked(&fq->lock);
++ 
++ 	fq_ring_for_each(idx, fq) {
++ 
++ 		if (fq->entries[idx].counter >= counter)
++ 			break;
++ 
++ 		put_pages_list(&fq->entries[idx].freelist);
++ 		free_iova_fast(iovad,
++ 			       fq->entries[idx].iova_pfn,
++ 			       fq->entries[idx].pages);
++ 
++ 		fq->head = (fq->head + 1) % IOVA_FQ_SIZE;
++ 	}
++ }
++ 
++ static void iova_domain_flush(struct iova_domain *iovad)
++ {
++ 	atomic64_inc(&iovad->fq_flush_start_cnt);
++ 	iovad->fq_domain->ops->flush_iotlb_all(iovad->fq_domain);
++ 	atomic64_inc(&iovad->fq_flush_finish_cnt);
++ }
++ 
++ static void fq_flush_timeout(struct timer_list *t)
++ {
++ 	struct iova_domain *iovad = from_timer(iovad, t, fq_timer);
++ 	int cpu;
++ 
++ 	atomic_set(&iovad->fq_timer_on, 0);
++ 	iova_domain_flush(iovad);
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		unsigned long flags;
++ 		struct iova_fq *fq;
++ 
++ 		fq = per_cpu_ptr(iovad->fq, cpu);
++ 		spin_lock_irqsave(&fq->lock, flags);
++ 		fq_ring_free(iovad, fq);
++ 		spin_unlock_irqrestore(&fq->lock, flags);
++ 	}
++ }
++ 
++ void queue_iova(struct iova_domain *iovad,
++ 		unsigned long pfn, unsigned long pages,
++ 		struct list_head *freelist)
++ {
++ 	struct iova_fq *fq;
++ 	unsigned long flags;
++ 	unsigned idx;
++ 
++ 	/*
++ 	 * Order against the IOMMU driver's pagetable update from unmapping
++ 	 * @pte, to guarantee that iova_domain_flush() observes that if called
++ 	 * from a different CPU before we release the lock below. Full barrier
++ 	 * so it also pairs with iommu_dma_init_fq() to avoid seeing partially
++ 	 * written fq state here.
++ 	 */
++ 	smp_mb();
++ 
++ 	fq = raw_cpu_ptr(iovad->fq);
++ 	spin_lock_irqsave(&fq->lock, flags);
++ 
++ 	/*
++ 	 * First remove all entries from the flush queue that have already been
++ 	 * flushed out on another CPU. This makes the fq_full() check below less
++ 	 * likely to be true.
++ 	 */
++ 	fq_ring_free(iovad, fq);
++ 
++ 	if (fq_full(fq)) {
++ 		iova_domain_flush(iovad);
++ 		fq_ring_free(iovad, fq);
++ 	}
++ 
++ 	idx = fq_ring_add(fq);
++ 
++ 	fq->entries[idx].iova_pfn = pfn;
++ 	fq->entries[idx].pages    = pages;
++ 	fq->entries[idx].counter  = atomic64_read(&iovad->fq_flush_start_cnt);
++ 	list_splice(freelist, &fq->entries[idx].freelist);
++ 
++ 	spin_unlock_irqrestore(&fq->lock, flags);
++ 
++ 	/* Avoid false sharing as much as possible. */
++ 	if (!atomic_read(&iovad->fq_timer_on) &&
++ 	    !atomic_xchg(&iovad->fq_timer_on, 1))
++ 		mod_timer(&iovad->fq_timer,
++ 			  jiffies + msecs_to_jiffies(IOVA_FQ_TIMEOUT));
++ }
++ 
++ static void free_iova_flush_queue(struct iova_domain *iovad)
++ {
++ 	int cpu, idx;
++ 
++ 	if (!iovad->fq)
++ 		return;
++ 
++ 	del_timer_sync(&iovad->fq_timer);
++ 	/*
++ 	 * This code runs when the iova_domain is being detroyed, so don't
++ 	 * bother to free iovas, just free any remaining pagetable pages.
++ 	 */
++ 	for_each_possible_cpu(cpu) {
++ 		struct iova_fq *fq = per_cpu_ptr(iovad->fq, cpu);
++ 
++ 		fq_ring_for_each(idx, fq)
++ 			put_pages_list(&fq->entries[idx].freelist);
++ 	}
++ 
++ 	free_percpu(iovad->fq);
++ 
++ 	iovad->fq = NULL;
++ 	iovad->fq_domain = NULL;
++ }
++ 
++ int init_iova_flush_queue(struct iova_domain *iovad, struct iommu_domain *fq_domain)
++ {
++ 	struct iova_fq __percpu *queue;
++ 	int i, cpu;
++ 
++ 	atomic64_set(&iovad->fq_flush_start_cnt,  0);
++ 	atomic64_set(&iovad->fq_flush_finish_cnt, 0);
++ 
++ 	queue = alloc_percpu(struct iova_fq);
++ 	if (!queue)
++ 		return -ENOMEM;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct iova_fq *fq = per_cpu_ptr(queue, cpu);
++ 
++ 		fq->head = 0;
++ 		fq->tail = 0;
++ 
++ 		spin_lock_init(&fq->lock);
++ 
++ 		for (i = 0; i < IOVA_FQ_SIZE; i++)
++ 			INIT_LIST_HEAD(&fq->entries[i].freelist);
++ 	}
++ 
++ 	iovad->fq_domain = fq_domain;
++ 	iovad->fq = queue;
++ 
++ 	timer_setup(&iovad->fq_timer, fq_flush_timeout, 0);
++ 	atomic_set(&iovad->fq_timer_on, 0);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f7f07484542f (iommu/iova: Move flush queue code to iommu-dma)
+  static inline size_t cookie_msi_granule(struct iommu_dma_cookie *cookie)
+  {
+  	if (cookie->type == IOMMU_DMA_IOVA_COOKIE)
+diff --cc drivers/iommu/iova.c
+index 1c18cdc4d102,081e5c0cf940..000000000000
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@@ -552,141 -490,6 +552,144 @@@ free_iova_fast(struct iova_domain *iova
+  }
+  EXPORT_SYMBOL_GPL(free_iova_fast);
+  
+++<<<<<<< HEAD
+ +#define fq_ring_for_each(i, fq) \
+ +	for ((i) = (fq)->head; (i) != (fq)->tail; (i) = ((i) + 1) % IOVA_FQ_SIZE)
+ +
+ +static inline bool fq_full(struct iova_fq *fq)
+ +{
+ +	assert_spin_locked(&fq->lock);
+ +	return (((fq->tail + 1) % IOVA_FQ_SIZE) == fq->head);
+ +}
+ +
+ +static inline unsigned fq_ring_add(struct iova_fq *fq)
+ +{
+ +	unsigned idx = fq->tail;
+ +
+ +	assert_spin_locked(&fq->lock);
+ +
+ +	fq->tail = (idx + 1) % IOVA_FQ_SIZE;
+ +
+ +	return idx;
+ +}
+ +
+ +static void fq_ring_free(struct iova_domain *iovad, struct iova_fq *fq)
+ +{
+ +	u64 counter = atomic64_read(&iovad->fq_flush_finish_cnt);
+ +	unsigned idx;
+ +
+ +	assert_spin_locked(&fq->lock);
+ +
+ +	fq_ring_for_each(idx, fq) {
+ +
+ +		if (fq->entries[idx].counter >= counter)
+ +			break;
+ +
+ +		if (iovad->entry_dtor)
+ +			iovad->entry_dtor(fq->entries[idx].data);
+ +
+ +		free_iova_fast(iovad,
+ +			       fq->entries[idx].iova_pfn,
+ +			       fq->entries[idx].pages);
+ +
+ +		fq->head = (fq->head + 1) % IOVA_FQ_SIZE;
+ +	}
+ +}
+ +
+ +static void iova_domain_flush(struct iova_domain *iovad)
+ +{
+ +	atomic64_inc(&iovad->fq_flush_start_cnt);
+ +	iovad->flush_cb(iovad);
+ +	atomic64_inc(&iovad->fq_flush_finish_cnt);
+ +}
+ +
+ +static void fq_destroy_all_entries(struct iova_domain *iovad)
+ +{
+ +	int cpu;
+ +
+ +	/*
+ +	 * This code runs when the iova_domain is being detroyed, so don't
+ +	 * bother to free iovas, just call the entry_dtor on all remaining
+ +	 * entries.
+ +	 */
+ +	if (!iovad->entry_dtor)
+ +		return;
+ +
+ +	for_each_possible_cpu(cpu) {
+ +		struct iova_fq *fq = per_cpu_ptr(iovad->fq, cpu);
+ +		int idx;
+ +
+ +		fq_ring_for_each(idx, fq)
+ +			iovad->entry_dtor(fq->entries[idx].data);
+ +	}
+ +}
+ +
+ +static void fq_flush_timeout(struct timer_list *t)
+ +{
+ +	struct iova_domain *iovad = from_timer(iovad, t, fq_timer);
+ +	int cpu;
+ +
+ +	atomic_set(&iovad->fq_timer_on, 0);
+ +	iova_domain_flush(iovad);
+ +
+ +	for_each_possible_cpu(cpu) {
+ +		unsigned long flags;
+ +		struct iova_fq *fq;
+ +
+ +		fq = per_cpu_ptr(iovad->fq, cpu);
+ +		spin_lock_irqsave(&fq->lock, flags);
+ +		fq_ring_free(iovad, fq);
+ +		spin_unlock_irqrestore(&fq->lock, flags);
+ +	}
+ +}
+ +
+ +void queue_iova(struct iova_domain *iovad,
+ +		unsigned long pfn, unsigned long pages,
+ +		unsigned long data)
+ +{
+ +	struct iova_fq *fq = raw_cpu_ptr(iovad->fq);
+ +	unsigned long flags;
+ +	unsigned idx;
+ +
+ +	/*
+ +	 * Order against the IOMMU driver's pagetable update from unmapping
+ +	 * @pte, to guarantee that iova_domain_flush() observes that if called
+ +	 * from a different CPU before we release the lock below.
+ +	 */
+ +	smp_wmb();
+ +
+ +	spin_lock_irqsave(&fq->lock, flags);
+ +
+ +	/*
+ +	 * First remove all entries from the flush queue that have already been
+ +	 * flushed out on another CPU. This makes the fq_full() check below less
+ +	 * likely to be true.
+ +	 */
+ +	fq_ring_free(iovad, fq);
+ +
+ +	if (fq_full(fq)) {
+ +		iova_domain_flush(iovad);
+ +		fq_ring_free(iovad, fq);
+ +	}
+ +
+ +	idx = fq_ring_add(fq);
+ +
+ +	fq->entries[idx].iova_pfn = pfn;
+ +	fq->entries[idx].pages    = pages;
+ +	fq->entries[idx].data     = data;
+ +	fq->entries[idx].counter  = atomic64_read(&iovad->fq_flush_start_cnt);
+ +
+ +	spin_unlock_irqrestore(&fq->lock, flags);
+ +
+ +	/* Avoid false sharing as much as possible. */
+ +	if (!atomic_read(&iovad->fq_timer_on) &&
+ +	    !atomic_xchg(&iovad->fq_timer_on, 1))
+ +		mod_timer(&iovad->fq_timer,
+ +			  jiffies + msecs_to_jiffies(IOVA_FQ_TIMEOUT));
+ +}
+ +
+++=======
+++>>>>>>> f7f07484542f (iommu/iova: Move flush queue code to iommu-dma)
+  /**
+   * put_iova_domain - destroys the iova domain
+   * @iovad: - iova domain in question.
+* Unmerged path drivers/iommu/dma-iommu.c
+* Unmerged path drivers/iommu/iova.c
