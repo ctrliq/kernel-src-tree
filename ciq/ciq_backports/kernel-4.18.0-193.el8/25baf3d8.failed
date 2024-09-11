@@ -1,0 +1,206 @@
+powerpc/eeh: Defer printing stack trace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [powerpc] eeh: Defer printing stack trace (Gustavo Duarte) [1524642]
+Rebuild_FUZZ: 88.57%
+commit-author Oliver O'Halloran <oohall@gmail.com>
+commit 25baf3d81614b0b8ca8958f4d6f111ccaaaad578
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/25baf3d8.failed
+
+Currently we print a stack trace in the event handler to help with
+debugging EEH issues. In the case of suprise hot-unplug this is unneeded,
+so we want to prevent printing the stack trace unless we know it's due to
+an actual device error. To accomplish this, we can save a stack trace at
+the point of detection and only print it once the EEH recovery handler has
+determined the freeze was due to an actual error.
+
+Since the whole point of this is to prevent spurious EEH output we also
+move a few prints out of the detection thread, or mark them as pr_debug
+so anyone interested can get output from the eeh_check_dev_failure()
+if they want.
+
+	Signed-off-by: Oliver O'Halloran <oohall@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20190903101605.2890-6-oohall@gmail.com
+(cherry picked from commit 25baf3d81614b0b8ca8958f4d6f111ccaaaad578)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/eeh.h
+diff --cc arch/powerpc/include/asm/eeh.h
+index 68163ac6f924,9d0e1694a94d..000000000000
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@@ -99,8 -86,19 +99,22 @@@ struct eeh_pe 
+  	struct eeh_pe *parent;		/* Parent PE			*/
+  	void *data;			/* PE auxillary data		*/
+  	struct list_head child_list;	/* List of PEs below this PE	*/
+ -	struct list_head child;		/* Memb. child_list/eeh_phb_pe	*/
+  	struct list_head edevs;		/* List of eeh_dev in this PE	*/
+++<<<<<<< HEAD
+ +	struct list_head child;		/* Memb. child_list/eeh_phb_pe	*/
+++=======
++ 
++ 	/*
++ 	 * Saved stack trace. When we find a PE freeze in eeh_dev_check_failure
++ 	 * the stack trace is saved here so we can print it in the recovery
++ 	 * thread if it turns out to due to a real problem rather than
++ 	 * a hot-remove.
++ 	 *
++ 	 * A max of 64 entries might be overkill, but it also might not be.
++ 	 */
++ 	unsigned long stack_trace[64];
++ 	int trace_entries;
+++>>>>>>> 25baf3d81614 (powerpc/eeh: Defer printing stack trace)
+  };
+  
+  #define eeh_pe_for_each_dev(pe, edev, tmp) \
+* Unmerged path arch/powerpc/include/asm/eeh.h
+diff --git a/arch/powerpc/kernel/eeh.c b/arch/powerpc/kernel/eeh.c
+index 528caf857428..1714fc27e9d4 100644
+--- a/arch/powerpc/kernel/eeh.c
++++ b/arch/powerpc/kernel/eeh.c
+@@ -407,11 +407,9 @@ static int eeh_phb_check_failure(struct eeh_pe *pe)
+ 	eeh_pe_mark_isolated(phb_pe);
+ 	eeh_serialize_unlock(flags);
+ 
+-	pr_err("EEH: PHB#%x failure detected, location: %s\n",
++	pr_debug("EEH: PHB#%x failure detected, location: %s\n",
+ 		phb_pe->phb->global_number, eeh_pe_loc_get(phb_pe));
+-	dump_stack();
+ 	eeh_send_failure_event(phb_pe);
+-
+ 	return 1;
+ out:
+ 	eeh_serialize_unlock(flags);
+@@ -438,7 +436,7 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
+ 	unsigned long flags;
+ 	struct device_node *dn;
+ 	struct pci_dev *dev;
+-	struct eeh_pe *pe, *parent_pe, *phb_pe;
++	struct eeh_pe *pe, *parent_pe;
+ 	int rc = 0;
+ 	const char *location = NULL;
+ 
+@@ -570,13 +568,8 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
+ 	 * a stack trace will help the device-driver authors figure
+ 	 * out what happened.  So print that out.
+ 	 */
+-	phb_pe = eeh_phb_pe_get(pe->phb);
+-	pr_err("EEH: Frozen PHB#%x-PE#%x detected\n",
+-	       pe->phb->global_number, pe->addr);
+-	pr_err("EEH: PE location: %s, PHB location: %s\n",
+-	       eeh_pe_loc_get(pe), eeh_pe_loc_get(phb_pe));
+-	dump_stack();
+-
++	pr_debug("EEH: %s: Frozen PHB#%x-PE#%x detected\n",
++		__func__, pe->phb->global_number, pe->addr);
+ 	eeh_send_failure_event(pe);
+ 
+ 	return 1;
+diff --git a/arch/powerpc/kernel/eeh_driver.c b/arch/powerpc/kernel/eeh_driver.c
+index 3d8d31c7da90..99be08f9e733 100644
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@ -873,8 +873,44 @@ void eeh_handle_normal_event(struct eeh_pe *pe)
+ 			if (eeh_slot_presence_check(edev->pdev))
+ 				devices++;
+ 
+-	if (!devices)
++	if (!devices) {
++		pr_debug("EEH: Frozen PHB#%x-PE#%x is empty!\n",
++			pe->phb->global_number, pe->addr);
+ 		goto out; /* nothing to recover */
++	}
++
++	/* Log the event */
++	if (pe->type & EEH_PE_PHB) {
++		pr_err("EEH: PHB#%x failure detected, location: %s\n",
++			pe->phb->global_number, eeh_pe_loc_get(pe));
++	} else {
++		struct eeh_pe *phb_pe = eeh_phb_pe_get(pe->phb);
++
++		pr_err("EEH: Frozen PHB#%x-PE#%x detected\n",
++		       pe->phb->global_number, pe->addr);
++		pr_err("EEH: PE location: %s, PHB location: %s\n",
++		       eeh_pe_loc_get(pe), eeh_pe_loc_get(phb_pe));
++	}
++
++	/*
++	 * Print the saved stack trace now that we've verified there's
++	 * something to recover.
++	 */
++	if (pe->trace_entries) {
++		void **ptrs = (void **) pe->stack_trace;
++		int i;
++
++		pr_err("EEH: Frozen PHB#%x-PE#%x detected\n",
++		       pe->phb->global_number, pe->addr);
++
++		/* FIXME: Use the same format as dump_stack() */
++		pr_err("EEH: Call Trace:\n");
++		for (i = 0; i < pe->trace_entries; i++)
++			pr_err("EEH: [%pK] %pS\n", ptrs[i], ptrs[i]);
++
++		pe->trace_entries = 0;
++	}
++
+ 
+ 	eeh_pe_update_time_stamp(pe);
+ 	pe->freeze_count++;
+diff --git a/arch/powerpc/kernel/eeh_event.c b/arch/powerpc/kernel/eeh_event.c
+index 80d1ea541fef..f51ef063847e 100644
+--- a/arch/powerpc/kernel/eeh_event.c
++++ b/arch/powerpc/kernel/eeh_event.c
+@@ -52,7 +52,6 @@ static int eeh_event_handler(void * dummy)
+ {
+ 	unsigned long flags;
+ 	struct eeh_event *event;
+-	struct eeh_pe *pe;
+ 
+ 	while (!kthread_should_stop()) {
+ 		if (down_interruptible(&eeh_eventlist_sem))
+@@ -71,19 +70,10 @@ static int eeh_event_handler(void * dummy)
+ 			continue;
+ 
+ 		/* We might have event without binding PE */
+-		pe = event->pe;
+-		if (pe) {
+-			if (pe->type & EEH_PE_PHB)
+-				pr_info("EEH: Detected error on PHB#%x\n",
+-					 pe->phb->global_number);
+-			else
+-				pr_info("EEH: Detected PCI bus error on "
+-					"PHB#%x-PE#%x\n",
+-					pe->phb->global_number, pe->addr);
+-			eeh_handle_normal_event(pe);
+-		} else {
++		if (event->pe)
++			eeh_handle_normal_event(event->pe);
++		else
+ 			eeh_handle_special_event();
+-		}
+ 
+ 		kfree(event);
+ 	}
+@@ -141,8 +131,16 @@ int eeh_send_failure_event(struct eeh_pe *pe)
+ 	 * This prevents the PE from being free()ed by a hotplug driver
+ 	 * while the PE is sitting in the event queue.
+ 	 */
+-	if (pe)
++	if (pe) {
++		/*
++		 * Save the current stack trace so we can dump it from the
++		 * event handler thread.
++		 */
++		pe->trace_entries = stack_trace_save(pe->stack_trace,
++					 ARRAY_SIZE(pe->stack_trace), 0);
++
+ 		eeh_pe_state_mark(pe, EEH_PE_RECOVERING);
++	}
+ 
+ 	/* We may or may not be called in an interrupt context */
+ 	spin_lock_irqsave(&eeh_eventlist_lock, flags);
