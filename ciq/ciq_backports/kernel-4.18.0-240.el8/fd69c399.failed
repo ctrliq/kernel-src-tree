@@ -1,0 +1,313 @@
+datagram: remove rendundant 'peeked' argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit fd69c399c7d6262086b6b820757c6aeaa71feeba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/fd69c399.failed
+
+After commit a297569fe00a ("net/udp: do not touch skb->peeked unless
+really needed") the 'peeked' argument of __skb_try_recv_datagram()
+and friends is always equal to !!'flags & MSG_PEEK'.
+
+Since such argument is really a boolean info, and the callers have
+already 'flags & MSG_PEEK' handy, we can remove it and clean-up the
+code a bit.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Acked-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fd69c399c7d6262086b6b820757c6aeaa71feeba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/udp.c
+diff --cc net/ipv6/udp.c
+index b54ba1e8f480,d538fafaf4a9..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -290,9 -285,9 +290,8 @@@ int udpv6_recvmsg(struct sock *sk, stru
+  	struct inet_sock *inet = inet_sk(sk);
+  	struct sk_buff *skb;
+  	unsigned int ulen, copied;
+- 	int peeked, peeking, off;
+- 	int err;
++ 	int off, err, peeking = flags & MSG_PEEK;
+  	int is_udplite = IS_UDPLITE(sk);
+ -	struct udp_mib __percpu *mib;
+  	bool checksum_valid = false;
+  	int is_udp4;
+  
+@@@ -343,26 -338,15 +341,31 @@@ try_again
+  			goto csum_copy_err;
+  	}
+  	if (unlikely(err)) {
+- 		if (!peeked) {
++ 		if (!peeking) {
+  			atomic_inc(&sk->sk_drops);
+ -			SNMP_INC_STATS(mib, UDP_MIB_INERRORS);
+ +			if (is_udp4)
+ +				UDP_INC_STATS(sock_net(sk), UDP_MIB_INERRORS,
+ +					      is_udplite);
+ +			else
+ +				UDP6_INC_STATS(sock_net(sk), UDP_MIB_INERRORS,
+ +					       is_udplite);
+  		}
+  		kfree_skb(skb);
+  		return err;
+  	}
+++<<<<<<< HEAD
+ +	if (!peeked) {
+ +		if (is_udp4)
+ +			UDP_INC_STATS(sock_net(sk), UDP_MIB_INDATAGRAMS,
+ +				      is_udplite);
+ +		else
+ +			UDP6_INC_STATS(sock_net(sk), UDP_MIB_INDATAGRAMS,
+ +				       is_udplite);
+ +	}
+++=======
++ 	if (!peeking)
++ 		SNMP_INC_STATS(mib, UDP_MIB_INDATAGRAMS);
+++>>>>>>> fd69c399c7d6 (datagram: remove rendundant 'peeked' argument)
+  
+  	sock_recv_ts_and_drops(msg, sk, skb);
+  
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index ed7aa7b1857e..b2c807eddfc0 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -3506,17 +3506,17 @@ struct sk_buff *__skb_try_recv_from_queue(struct sock *sk,
+ 					  unsigned int flags,
+ 					  void (*destructor)(struct sock *sk,
+ 							   struct sk_buff *skb),
+-					  int *peeked, int *off, int *err,
++					  int *off, int *err,
+ 					  struct sk_buff **last);
+ struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned flags,
+ 					void (*destructor)(struct sock *sk,
+ 							   struct sk_buff *skb),
+-					int *peeked, int *off, int *err,
++					int *off, int *err,
+ 					struct sk_buff **last);
+ struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned flags,
+ 				    void (*destructor)(struct sock *sk,
+ 						       struct sk_buff *skb),
+-				    int *peeked, int *off, int *err);
++				    int *off, int *err);
+ struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned flags, int noblock,
+ 				  int *err);
+ __poll_t datagram_poll(struct file *file, struct socket *sock,
+diff --git a/include/net/udp.h b/include/net/udp.h
+index b2402c6e63b9..157dff45695b 100644
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -258,13 +258,13 @@ void skb_consume_udp(struct sock *sk, struct sk_buff *skb, int len);
+ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb);
+ void udp_skb_destructor(struct sock *sk, struct sk_buff *skb);
+ struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
+-			       int noblock, int *peeked, int *off, int *err);
++			       int noblock, int *off, int *err);
+ static inline struct sk_buff *skb_recv_udp(struct sock *sk, unsigned int flags,
+ 					   int noblock, int *err)
+ {
+-	int peeked, off = 0;
++	int off = 0;
+ 
+-	return __skb_recv_udp(sk, flags, noblock, &peeked, &off, err);
++	return __skb_recv_udp(sk, flags, noblock, &off, err);
+ }
+ 
+ int udp_v4_early_demux(struct sk_buff *skb);
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index df1d96d17c98..4043d635c0bf 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -165,7 +165,7 @@ struct sk_buff *__skb_try_recv_from_queue(struct sock *sk,
+ 					  unsigned int flags,
+ 					  void (*destructor)(struct sock *sk,
+ 							   struct sk_buff *skb),
+-					  int *peeked, int *off, int *err,
++					  int *off, int *err,
+ 					  struct sk_buff **last)
+ {
+ 	bool peek_at_off = false;
+@@ -192,7 +192,6 @@ struct sk_buff *__skb_try_recv_from_queue(struct sock *sk,
+ 					return NULL;
+ 				}
+ 			}
+-			*peeked = 1;
+ 			refcount_inc(&skb->users);
+ 		} else {
+ 			__skb_unlink(skb, queue);
+@@ -210,7 +209,6 @@ struct sk_buff *__skb_try_recv_from_queue(struct sock *sk,
+  *	@sk: socket
+  *	@flags: MSG\_ flags
+  *	@destructor: invoked under the receive lock on successful dequeue
+- *	@peeked: returns non-zero if this packet has been seen before
+  *	@off: an offset in bytes to peek skb from. Returns an offset
+  *	      within an skb where data actually starts
+  *	@err: error code returned
+@@ -244,7 +242,7 @@ struct sk_buff *__skb_try_recv_from_queue(struct sock *sk,
+ struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned int flags,
+ 					void (*destructor)(struct sock *sk,
+ 							   struct sk_buff *skb),
+-					int *peeked, int *off, int *err,
++					int *off, int *err,
+ 					struct sk_buff **last)
+ {
+ 	struct sk_buff_head *queue = &sk->sk_receive_queue;
+@@ -258,7 +256,6 @@ struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned int flags,
+ 	if (error)
+ 		goto no_packet;
+ 
+-	*peeked = 0;
+ 	do {
+ 		/* Again only user level code calls this function, so nothing
+ 		 * interrupt level will suddenly eat the receive_queue.
+@@ -268,7 +265,7 @@ struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned int flags,
+ 		 */
+ 		spin_lock_irqsave(&queue->lock, cpu_flags);
+ 		skb = __skb_try_recv_from_queue(sk, queue, flags, destructor,
+-						peeked, off, &error, last);
++						off, &error, last);
+ 		spin_unlock_irqrestore(&queue->lock, cpu_flags);
+ 		if (error)
+ 			goto no_packet;
+@@ -292,7 +289,7 @@ EXPORT_SYMBOL(__skb_try_recv_datagram);
+ struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned int flags,
+ 				    void (*destructor)(struct sock *sk,
+ 						       struct sk_buff *skb),
+-				    int *peeked, int *off, int *err)
++				    int *off, int *err)
+ {
+ 	struct sk_buff *skb, *last;
+ 	long timeo;
+@@ -300,8 +297,8 @@ struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned int flags,
+ 	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+ 
+ 	do {
+-		skb = __skb_try_recv_datagram(sk, flags, destructor, peeked,
+-					      off, err, &last);
++		skb = __skb_try_recv_datagram(sk, flags, destructor, off, err,
++					      &last);
+ 		if (skb)
+ 			return skb;
+ 
+@@ -317,10 +314,10 @@ EXPORT_SYMBOL(__skb_recv_datagram);
+ struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned int flags,
+ 				  int noblock, int *err)
+ {
+-	int peeked, off = 0;
++	int off = 0;
+ 
+ 	return __skb_recv_datagram(sk, flags | (noblock ? MSG_DONTWAIT : 0),
+-				   NULL, &peeked, &off, err);
++				   NULL, &off, err);
+ }
+ EXPORT_SYMBOL(skb_recv_datagram);
+ 
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 50f5c7dfecad..700e5861ac34 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1627,7 +1627,7 @@ int udp_ioctl(struct sock *sk, int cmd, unsigned long arg)
+ EXPORT_SYMBOL(udp_ioctl);
+ 
+ struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
+-			       int noblock, int *peeked, int *off, int *err)
++			       int noblock, int *off, int *err)
+ {
+ 	struct sk_buff_head *sk_queue = &sk->sk_receive_queue;
+ 	struct sk_buff_head *queue;
+@@ -1646,13 +1646,11 @@ struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
+ 			break;
+ 
+ 		error = -EAGAIN;
+-		*peeked = 0;
+ 		do {
+ 			spin_lock_bh(&queue->lock);
+ 			skb = __skb_try_recv_from_queue(sk, queue, flags,
+ 							udp_skb_destructor,
+-							peeked, off, err,
+-							&last);
++							off, err, &last);
+ 			if (skb) {
+ 				spin_unlock_bh(&queue->lock);
+ 				return skb;
+@@ -1673,8 +1671,7 @@ struct sk_buff *__skb_recv_udp(struct sock *sk, unsigned int flags,
+ 
+ 			skb = __skb_try_recv_from_queue(sk, queue, flags,
+ 							udp_skb_dtor_locked,
+-							peeked, off, err,
+-							&last);
++							off, err, &last);
+ 			spin_unlock(&sk_queue->lock);
+ 			spin_unlock_bh(&queue->lock);
+ 			if (skb)
+@@ -1709,8 +1706,7 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock,
+ 	DECLARE_SOCKADDR(struct sockaddr_in *, sin, msg->msg_name);
+ 	struct sk_buff *skb;
+ 	unsigned int ulen, copied;
+-	int peeked, peeking, off;
+-	int err;
++	int off, err, peeking = flags & MSG_PEEK;
+ 	int is_udplite = IS_UDPLITE(sk);
+ 	bool checksum_valid = false;
+ 
+@@ -1718,9 +1714,8 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock,
+ 		return ip_recv_error(sk, msg, len, addr_len);
+ 
+ try_again:
+-	peeking = flags & MSG_PEEK;
+ 	off = sk_peek_offset(sk, flags);
+-	skb = __skb_recv_udp(sk, flags, noblock, &peeked, &off, &err);
++	skb = __skb_recv_udp(sk, flags, noblock, &off, &err);
+ 	if (!skb)
+ 		return err;
+ 
+@@ -1758,7 +1753,7 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock,
+ 	}
+ 
+ 	if (unlikely(err)) {
+-		if (!peeked) {
++		if (!peeking) {
+ 			atomic_inc(&sk->sk_drops);
+ 			UDP_INC_STATS(sock_net(sk),
+ 				      UDP_MIB_INERRORS, is_udplite);
+@@ -1767,7 +1762,7 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock,
+ 		return err;
+ 	}
+ 
+-	if (!peeked)
++	if (!peeking)
+ 		UDP_INC_STATS(sock_net(sk),
+ 			      UDP_MIB_INDATAGRAMS, is_udplite);
+ 
+* Unmerged path net/ipv6/udp.c
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index 2a031922ce3c..8c22d4f07a2e 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -2023,8 +2023,8 @@ static int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+ 	struct unix_sock *u = unix_sk(sk);
+ 	struct sk_buff *skb, *last;
+ 	long timeo;
++	int skip;
+ 	int err;
+-	int peeked, skip;
+ 
+ 	err = -EOPNOTSUPP;
+ 	if (flags&MSG_OOB)
+@@ -2036,8 +2036,8 @@ static int unix_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+ 		mutex_lock(&u->iolock);
+ 
+ 		skip = sk_peek_offset(sk, flags);
+-		skb = __skb_try_recv_datagram(sk, flags, NULL, &peeked, &skip,
+-					      &err, &last);
++		skb = __skb_try_recv_datagram(sk, flags, NULL, &skip, &err,
++					      &last);
+ 		if (skb)
+ 			break;
+ 
