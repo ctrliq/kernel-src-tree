@@ -1,0 +1,130 @@
+iommu/vt-d: Fix out-bounds-warning in intel/svm.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Gustavo A. R. Silva <gustavoars@kernel.org>
+commit 606636dcbdbb73b1a4ed61be77c76ea1087f042d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/606636dc.failed
+
+Replace a couple of calls to memcpy() with simple assignments in order
+to fix the following out-of-bounds warning:
+
+drivers/iommu/intel/svm.c:1198:4: warning: 'memcpy' offset [25, 32] from
+    the object at 'desc' is out of the bounds of referenced subobject
+    'qw2' with type 'long long unsigned int' at offset 16 [-Warray-bounds]
+
+The problem is that the original code is trying to copy data into a
+couple of struct members adjacent to each other in a single call to
+memcpy(). This causes a legitimate compiler warning because memcpy()
+overruns the length of &desc.qw2 and &resp.qw2, respectively.
+
+This helps with the ongoing efforts to globally enable -Warray-bounds
+and get us closer to being able to tighten the FORTIFY_SOURCE routines
+on memcpy().
+
+Link: https://github.com/KSPP/linux/issues/109
+	Signed-off-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20210414201403.GA392764@embeddedor
+Link: https://lore.kernel.org/r/20210610020115.1637656-18-baolu.lu@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 606636dcbdbb73b1a4ed61be77c76ea1087f042d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/svm.c
+diff --cc drivers/iommu/intel/svm.c
+index f4c78a5e53a1,9b0f22bc0514..000000000000
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@@ -891,13 -870,58 +891,66 @@@ intel_svm_prq_report(struct device *dev
+  		 */
+  		event.fault.prm.flags |= IOMMU_FAULT_PAGE_REQUEST_LAST_PAGE;
+  		event.fault.prm.flags |= IOMMU_FAULT_PAGE_REQUEST_PRIV_DATA;
+++<<<<<<< HEAD
+ +		memcpy(event.fault.prm.private_data, desc->priv_data,
+ +		       sizeof(desc->priv_data));
+++=======
++ 		event.fault.prm.private_data[0] = desc->priv_data[0];
++ 		event.fault.prm.private_data[1] = desc->priv_data[1];
++ 	} else if (dmar_latency_enabled(iommu, DMAR_LATENCY_PRQ)) {
++ 		/*
++ 		 * If the private data fields are not used by hardware, use it
++ 		 * to monitor the prq handle latency.
++ 		 */
++ 		event.fault.prm.private_data[0] = ktime_to_ns(ktime_get());
+++>>>>>>> 606636dcbdbb (iommu/vt-d: Fix out-bounds-warning in intel/svm.c)
+  	}
+  
+  	return iommu_report_device_fault(dev, &event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void handle_bad_prq_event(struct intel_iommu *iommu,
++ 				 struct page_req_dsc *req, int result)
++ {
++ 	struct qi_desc desc;
++ 
++ 	pr_err("%s: Invalid page request: %08llx %08llx\n",
++ 	       iommu->name, ((unsigned long long *)req)[0],
++ 	       ((unsigned long long *)req)[1]);
++ 
++ 	/*
++ 	 * Per VT-d spec. v3.0 ch7.7, system software must
++ 	 * respond with page group response if private data
++ 	 * is present (PDP) or last page in group (LPIG) bit
++ 	 * is set. This is an additional VT-d feature beyond
++ 	 * PCI ATS spec.
++ 	 */
++ 	if (!req->lpig && !req->priv_data_present)
++ 		return;
++ 
++ 	desc.qw0 = QI_PGRP_PASID(req->pasid) |
++ 			QI_PGRP_DID(req->rid) |
++ 			QI_PGRP_PASID_P(req->pasid_present) |
++ 			QI_PGRP_PDP(req->priv_data_present) |
++ 			QI_PGRP_RESP_CODE(result) |
++ 			QI_PGRP_RESP_TYPE;
++ 	desc.qw1 = QI_PGRP_IDX(req->prg_index) |
++ 			QI_PGRP_LPIG(req->lpig);
++ 
++ 	if (req->priv_data_present) {
++ 		desc.qw2 = req->priv_data[0];
++ 		desc.qw3 = req->priv_data[1];
++ 	} else {
++ 		desc.qw2 = 0;
++ 		desc.qw3 = 0;
++ 	}
++ 
++ 	qi_submit_sync(iommu, &desc, 1, 0);
++ }
++ 
+++>>>>>>> 606636dcbdbb (iommu/vt-d: Fix out-bounds-warning in intel/svm.c)
+  static irqreturn_t prq_event_thread(int irq, void *d)
+  {
+  	struct intel_svm_dev *sdev = NULL;
+@@@ -1212,9 -1180,14 +1265,20 @@@ int intel_svm_page_response(struct devi
+  		desc.qw1 = QI_PGRP_IDX(prm->grpid) | QI_PGRP_LPIG(last_page);
+  		desc.qw2 = 0;
+  		desc.qw3 = 0;
+++<<<<<<< HEAD
+ +		if (private_present)
+ +			memcpy(&desc.qw2, prm->private_data,
+ +			       sizeof(prm->private_data));
+++=======
++ 
++ 		if (private_present) {
++ 			desc.qw2 = prm->private_data[0];
++ 			desc.qw3 = prm->private_data[1];
++ 		} else if (prm->private_data[0]) {
++ 			dmar_latency_update(iommu, DMAR_LATENCY_PRQ,
++ 				ktime_to_ns(ktime_get()) - prm->private_data[0]);
++ 		}
+++>>>>>>> 606636dcbdbb (iommu/vt-d: Fix out-bounds-warning in intel/svm.c)
+  
+  		qi_submit_sync(iommu, &desc, 1, 0);
+  	}
+* Unmerged path drivers/iommu/intel/svm.c
