@@ -1,0 +1,289 @@
+xdp: add tracepoints for XDP mem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit f033b688c1ede5ec78c9a718fa9f0b374049bc31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f033b688.failed
+
+These tracepoints make it easier to troubleshoot XDP mem id disconnect.
+
+The xdp:mem_disconnect tracepoint cannot be replaced via kprobe. It is
+placed at the last stable place for the pointer to struct xdp_mem_allocator,
+just before it's scheduled for RCU removal. It also extract info on
+'safe_to_remove' and 'force'.
+
+Detailed info about in-flight pages is not available at this layer. The next
+patch will added tracepoints needed at the page_pool layer for this.
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f033b688c1ede5ec78c9a718fa9f0b374049bc31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/xdp.c
+diff --cc net/core/xdp.c
+index 762abeb89847,b29d7b513a18..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -29,17 -31,6 +31,20 @@@ static int mem_id_next = MEM_ID_MIN
+  static bool mem_id_init; /* false */
+  static struct rhashtable *mem_id_ht;
+  
+++<<<<<<< HEAD
+ +struct xdp_mem_allocator {
+ +	struct xdp_mem_info mem;
+ +	union {
+ +		void *allocator;
+ +		struct page_pool *page_pool;
+ +		struct zero_copy_allocator *zc_alloc;
+ +	};
+ +	struct rhash_head node;
+ +	struct rcu_head rcu;
+ +};
+ +
+++=======
+++>>>>>>> f033b688c1ed (xdp: add tracepoints for XDP mem)
+  static u32 xdp_mem_id_hashfn(const void *data, u32 len, u32 seed)
+  {
+  	const u32 *k = data;
+@@@ -94,6 -85,64 +99,67 @@@ static void __xdp_mem_allocator_rcu_fre
+  	kfree(xa);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool __mem_id_disconnect(int id, bool force)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 	bool safe_to_remove = true;
++ 
++ 	mutex_lock(&mem_id_lock);
++ 
++ 	xa = rhashtable_lookup_fast(mem_id_ht, &id, mem_id_rht_params);
++ 	if (!xa) {
++ 		mutex_unlock(&mem_id_lock);
++ 		WARN(1, "Request remove non-existing id(%d), driver bug?", id);
++ 		return true;
++ 	}
++ 	xa->disconnect_cnt++;
++ 
++ 	/* Detects in-flight packet-pages for page_pool */
++ 	if (xa->mem.type == MEM_TYPE_PAGE_POOL)
++ 		safe_to_remove = page_pool_request_shutdown(xa->page_pool);
++ 
++ 	trace_mem_disconnect(xa, safe_to_remove, force);
++ 
++ 	if ((safe_to_remove || force) &&
++ 	    !rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params))
++ 		call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
++ 
++ 	mutex_unlock(&mem_id_lock);
++ 	return (safe_to_remove|force);
++ }
++ 
++ #define DEFER_TIME (msecs_to_jiffies(1000))
++ #define DEFER_WARN_INTERVAL (30 * HZ)
++ #define DEFER_MAX_RETRIES 120
++ 
++ static void mem_id_disconnect_defer_retry(struct work_struct *wq)
++ {
++ 	struct delayed_work *dwq = to_delayed_work(wq);
++ 	struct xdp_mem_allocator *xa = container_of(dwq, typeof(*xa), defer_wq);
++ 	bool force = false;
++ 
++ 	if (xa->disconnect_cnt > DEFER_MAX_RETRIES)
++ 		force = true;
++ 
++ 	if (__mem_id_disconnect(xa->mem.id, force))
++ 		return;
++ 
++ 	/* Periodic warning */
++ 	if (time_after_eq(jiffies, xa->defer_warn)) {
++ 		int sec = (s32)((u32)jiffies - (u32)xa->defer_start) / HZ;
++ 
++ 		pr_warn("%s() stalled mem.id=%u shutdown %d attempts %d sec\n",
++ 			__func__, xa->mem.id, xa->disconnect_cnt, sec);
++ 		xa->defer_warn = jiffies + DEFER_WARN_INTERVAL;
++ 	}
++ 
++ 	/* Still not ready to be disconnected, retry later */
++ 	schedule_delayed_work(&xa->defer_wq, DEFER_TIME);
++ }
++ 
+++>>>>>>> f033b688c1ed (xdp: add tracepoints for XDP mem)
+  void xdp_rxq_info_unreg_mem_model(struct xdp_rxq_info *xdp_rxq)
+  {
+  	struct xdp_mem_allocator *xa;
+@@@ -339,6 -403,9 +406,12 @@@ static void __xdp_return(void *data, st
+  			napi_direct &= !xdp_return_frame_no_direct();
+  			page_pool_put_page(xa->page_pool, page, napi_direct);
+  		} else {
+++<<<<<<< HEAD
+++=======
++ 			/* Hopefully stack show who to blame for late return */
++ 			WARN_ONCE(1, "page_pool gone mem.id=%d", mem->id);
++ 			trace_mem_return_failed(mem, page);
+++>>>>>>> f033b688c1ed (xdp: add tracepoints for XDP mem)
+  			put_page(page);
+  		}
+  		rcu_read_unlock();
+diff --git a/include/net/xdp_priv.h b/include/net/xdp_priv.h
+new file mode 100644
+index 000000000000..6a8cba6ea79a
+--- /dev/null
++++ b/include/net/xdp_priv.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __LINUX_NET_XDP_PRIV_H__
++#define __LINUX_NET_XDP_PRIV_H__
++
++#include <linux/rhashtable.h>
++
++/* Private to net/core/xdp.c, but used by trace/events/xdp.h */
++struct xdp_mem_allocator {
++	struct xdp_mem_info mem;
++	union {
++		void *allocator;
++		struct page_pool *page_pool;
++		struct zero_copy_allocator *zc_alloc;
++	};
++	int disconnect_cnt;
++	unsigned long defer_start;
++	struct rhash_head node;
++	struct rcu_head rcu;
++	struct delayed_work defer_wq;
++	unsigned long defer_warn;
++};
++
++#endif /* __LINUX_NET_XDP_PRIV_H__ */
+diff --git a/include/trace/events/xdp.h b/include/trace/events/xdp.h
+index b28f6a2958d5..68899fdc985b 100644
+--- a/include/trace/events/xdp.h
++++ b/include/trace/events/xdp.h
+@@ -297,6 +297,121 @@ TRACE_EVENT(xdp_devmap_xmit,
+ 		  __entry->from_ifindex, __entry->to_ifindex, __entry->err)
+ );
+ 
++/* Expect users already include <net/xdp.h>, but not xdp_priv.h */
++#include <net/xdp_priv.h>
++
++#define __MEM_TYPE_MAP(FN)	\
++	FN(PAGE_SHARED)		\
++	FN(PAGE_ORDER0)		\
++	FN(PAGE_POOL)		\
++	FN(ZERO_COPY)
++
++#define __MEM_TYPE_TP_FN(x)	\
++	TRACE_DEFINE_ENUM(MEM_TYPE_##x);
++#define __MEM_TYPE_SYM_FN(x)	\
++	{ MEM_TYPE_##x, #x },
++#define __MEM_TYPE_SYM_TAB	\
++	__MEM_TYPE_MAP(__MEM_TYPE_SYM_FN) { -1, 0 }
++__MEM_TYPE_MAP(__MEM_TYPE_TP_FN)
++
++TRACE_EVENT(mem_disconnect,
++
++	TP_PROTO(const struct xdp_mem_allocator *xa,
++		 bool safe_to_remove, bool force),
++
++	TP_ARGS(xa, safe_to_remove, force),
++
++	TP_STRUCT__entry(
++		__field(const struct xdp_mem_allocator *,	xa)
++		__field(u32,		mem_id)
++		__field(u32,		mem_type)
++		__field(const void *,	allocator)
++		__field(bool,		safe_to_remove)
++		__field(bool,		force)
++		__field(int,		disconnect_cnt)
++	),
++
++	TP_fast_assign(
++		__entry->xa		= xa;
++		__entry->mem_id		= xa->mem.id;
++		__entry->mem_type	= xa->mem.type;
++		__entry->allocator	= xa->allocator;
++		__entry->safe_to_remove	= safe_to_remove;
++		__entry->force		= force;
++		__entry->disconnect_cnt	= xa->disconnect_cnt;
++	),
++
++	TP_printk("mem_id=%d mem_type=%s allocator=%p"
++		  " safe_to_remove=%s force=%s disconnect_cnt=%d",
++		  __entry->mem_id,
++		  __print_symbolic(__entry->mem_type, __MEM_TYPE_SYM_TAB),
++		  __entry->allocator,
++		  __entry->safe_to_remove ? "true" : "false",
++		  __entry->force ? "true" : "false",
++		  __entry->disconnect_cnt
++	)
++);
++
++TRACE_EVENT(mem_connect,
++
++	TP_PROTO(const struct xdp_mem_allocator *xa,
++		 const struct xdp_rxq_info *rxq),
++
++	TP_ARGS(xa, rxq),
++
++	TP_STRUCT__entry(
++		__field(const struct xdp_mem_allocator *,	xa)
++		__field(u32,		mem_id)
++		__field(u32,		mem_type)
++		__field(const void *,	allocator)
++		__field(const struct xdp_rxq_info *,		rxq)
++		__field(int,		ifindex)
++	),
++
++	TP_fast_assign(
++		__entry->xa		= xa;
++		__entry->mem_id		= xa->mem.id;
++		__entry->mem_type	= xa->mem.type;
++		__entry->allocator	= xa->allocator;
++		__entry->rxq		= rxq;
++		__entry->ifindex	= rxq->dev->ifindex;
++	),
++
++	TP_printk("mem_id=%d mem_type=%s allocator=%p"
++		  " ifindex=%d",
++		  __entry->mem_id,
++		  __print_symbolic(__entry->mem_type, __MEM_TYPE_SYM_TAB),
++		  __entry->allocator,
++		  __entry->ifindex
++	)
++);
++
++TRACE_EVENT(mem_return_failed,
++
++	TP_PROTO(const struct xdp_mem_info *mem,
++		 const struct page *page),
++
++	TP_ARGS(mem, page),
++
++	TP_STRUCT__entry(
++		__field(const struct page *,	page)
++		__field(u32,		mem_id)
++		__field(u32,		mem_type)
++	),
++
++	TP_fast_assign(
++		__entry->page		= page;
++		__entry->mem_id		= mem->id;
++		__entry->mem_type	= mem->type;
++	),
++
++	TP_printk("mem_id=%d mem_type=%s page=%p",
++		  __entry->mem_id,
++		  __print_symbolic(__entry->mem_type, __MEM_TYPE_SYM_TAB),
++		  __entry->page
++	)
++);
++
+ #endif /* _TRACE_XDP_H */
+ 
+ #include <trace/define_trace.h>
+* Unmerged path net/core/xdp.c
