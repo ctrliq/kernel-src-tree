@@ -1,0 +1,416 @@
+tcp: bpf: Optionally store mac header in TCP_SAVE_SYN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 267cf9fa43d1c9d525d5d818a8651f2900e3aa9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/267cf9fa.failed
+
+This patch is adapted from Eric's patch in an earlier discussion [1].
+
+The TCP_SAVE_SYN currently only stores the network header and
+tcp header.  This patch allows it to optionally store
+the mac header also if the setsockopt's optval is 2.
+
+It requires one more bit for the "save_syn" bit field in tcp_sock.
+This patch achieves this by moving the syn_smc bit next to the is_mptcp.
+The syn_smc is currently used with the TCP experimental option.  Since
+syn_smc is only used when CONFIG_SMC is enabled, this patch also puts
+the "IS_ENABLED(CONFIG_SMC)" around it like the is_mptcp did
+with "IS_ENABLED(CONFIG_MPTCP)".
+
+The mac_hdrlen is also stored in the "struct saved_syn"
+to allow a quick offset from the bpf prog if it chooses to start
+getting from the network header or the tcp header.
+
+[1]: https://lore.kernel.org/netdev/CANn89iLJNWh6bkH7DNhy_kmcAexuUCccqERqe7z2QsvPhGrYPQ@mail.gmail.com/
+
+	Suggested-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/bpf/20200820190123.2886935-1-kafai@fb.com
+(cherry picked from commit 267cf9fa43d1c9d525d5d818a8651f2900e3aa9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/tcp.h
+#	include/net/request_sock.h
+#	include/uapi/linux/bpf.h
+#	net/core/filter.c
+#	net/ipv4/tcp_input.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/linux/tcp.h
+index 800e60a38c07,56ff2952edaf..000000000000
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@@ -250,11 -245,10 +251,16 @@@ struct tcp_sock 
+  		syn_fastopen_exp:1,/* SYN includes Fast Open exp. option */
+  		syn_fastopen_ch:1, /* Active TFO re-enabling probe */
+  		syn_data_acked:1,/* data in SYN is acked by SYN-ACK */
+++<<<<<<< HEAD
+ +		save_syn:1,	/* Save headers of SYN packet */
+ +		is_cwnd_limited:1,/* forward progress limited by snd_cwnd? */
+ +		syn_smc:1;	/* SYN includes SMC */
+ +	u32	tlp_high_seq;	/* snd_nxt at the time of TLP retransmit. */
+++=======
++ 		is_cwnd_limited:1;/* forward progress limited by snd_cwnd? */
++ 	u32	tlp_high_seq;	/* snd_nxt at the time of TLP */
+++>>>>>>> 267cf9fa43d1 (tcp: bpf: Optionally store mac header in TCP_SAVE_SYN)
+  
+ -	u32	tcp_tx_delay;	/* delay (in usec) added to TX packets */
+  	u64	tcp_wstamp_ns;	/* departure time for next sent data packet */
+  	u64	tcp_clock_cache; /* cache last tcp_clock_ns() (see tcp_mstamp_refresh()) */
+  
+@@@ -485,7 -488,14 +494,18 @@@ static inline void tcp_saved_syn_free(s
+  	tp->saved_syn = NULL;
+  }
+  
+++<<<<<<< HEAD
+ +struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk);
+++=======
++ static inline u32 tcp_saved_syn_len(const struct saved_syn *saved_syn)
++ {
++ 	return saved_syn->mac_hdrlen + saved_syn->network_hdrlen +
++ 		saved_syn->tcp_hdrlen;
++ }
++ 
++ struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk,
++ 					       const struct sk_buff *orig_skb);
+++>>>>>>> 267cf9fa43d1 (tcp: bpf: Optionally store mac header in TCP_SAVE_SYN)
+  
+  static inline u16 tcp_mss_clamp(const struct tcp_sock *tp, u16 mss)
+  {
+diff --cc include/net/request_sock.h
+index 17b56556eb43,29e41ff3ec93..000000000000
+--- a/include/net/request_sock.h
++++ b/include/net/request_sock.h
+@@@ -45,6 -41,13 +45,16 @@@ struct request_sock_ops 
+  
+  int inet_rtx_syn_ack(const struct sock *parent, struct request_sock *req);
+  
+++<<<<<<< HEAD
+++=======
++ struct saved_syn {
++ 	u32 mac_hdrlen;
++ 	u32 network_hdrlen;
++ 	u32 tcp_hdrlen;
++ 	u8 data[];
++ };
++ 
+++>>>>>>> 267cf9fa43d1 (tcp: bpf: Optionally store mac header in TCP_SAVE_SYN)
+  /* struct request_sock - mini sock to represent a connection request
+   */
+  struct request_sock {
+diff --cc include/uapi/linux/bpf.h
+index 0a8b1917a074,544b89a64918..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -4310,6 -4506,61 +4310,64 @@@ enum 
+  	TCP_BPF_SNDCWND_CLAMP	= 1002,	/* Set sndcwnd_clamp */
+  	TCP_BPF_DELACK_MAX	= 1003, /* Max delay ack in usecs */
+  	TCP_BPF_RTO_MIN		= 1004, /* Min delay ack in usecs */
+++<<<<<<< HEAD
+++=======
++ 	/* Copy the SYN pkt to optval
++ 	 *
++ 	 * BPF_PROG_TYPE_SOCK_OPS only.  It is similar to the
++ 	 * bpf_getsockopt(TCP_SAVED_SYN) but it does not limit
++ 	 * to only getting from the saved_syn.  It can either get the
++ 	 * syn packet from:
++ 	 *
++ 	 * 1. the just-received SYN packet (only available when writing the
++ 	 *    SYNACK).  It will be useful when it is not necessary to
++ 	 *    save the SYN packet for latter use.  It is also the only way
++ 	 *    to get the SYN during syncookie mode because the syn
++ 	 *    packet cannot be saved during syncookie.
++ 	 *
++ 	 * OR
++ 	 *
++ 	 * 2. the earlier saved syn which was done by
++ 	 *    bpf_setsockopt(TCP_SAVE_SYN).
++ 	 *
++ 	 * The bpf_getsockopt(TCP_BPF_SYN*) option will hide where the
++ 	 * SYN packet is obtained.
++ 	 *
++ 	 * If the bpf-prog does not need the IP[46] header,  the
++ 	 * bpf-prog can avoid parsing the IP header by using
++ 	 * TCP_BPF_SYN.  Otherwise, the bpf-prog can get both
++ 	 * IP[46] and TCP header by using TCP_BPF_SYN_IP.
++ 	 *
++ 	 *      >0: Total number of bytes copied
++ 	 * -ENOSPC: Not enough space in optval. Only optlen number of
++ 	 *          bytes is copied.
++ 	 * -ENOENT: The SYN skb is not available now and the earlier SYN pkt
++ 	 *	    is not saved by setsockopt(TCP_SAVE_SYN).
++ 	 */
++ 	TCP_BPF_SYN		= 1005, /* Copy the TCP header */
++ 	TCP_BPF_SYN_IP		= 1006, /* Copy the IP[46] and TCP header */
++ 	TCP_BPF_SYN_MAC         = 1007, /* Copy the MAC, IP[46], and TCP header */
++ };
++ 
++ enum {
++ 	BPF_LOAD_HDR_OPT_TCP_SYN = (1ULL << 0),
++ };
++ 
++ /* args[0] value during BPF_SOCK_OPS_HDR_OPT_LEN_CB and
++  * BPF_SOCK_OPS_WRITE_HDR_OPT_CB.
++  */
++ enum {
++ 	BPF_WRITE_HDR_TCP_CURRENT_MSS = 1,	/* Kernel is finding the
++ 						 * total option spaces
++ 						 * required for an established
++ 						 * sk in order to calculate the
++ 						 * MSS.  No skb is actually
++ 						 * sent.
++ 						 */
++ 	BPF_WRITE_HDR_TCP_SYNACK_COOKIE = 2,	/* Kernel is in syncookie mode
++ 						 * when sending a SYN.
++ 						 */
+++>>>>>>> 267cf9fa43d1 (tcp: bpf: Optionally store mac header in TCP_SAVE_SYN)
+  };
+  
+  struct bpf_perf_event_value {
+diff --cc net/core/filter.c
+index a22f97d754fb,47eef9a0be6a..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -4714,9 -4669,99 +4714,105 @@@ static const struct bpf_func_proto bpf_
+  	.arg5_type	= ARG_CONST_SIZE,
+  };
+  
+++<<<<<<< HEAD
+ +BPF_CALL_5(bpf_sock_ops_getsockopt, struct bpf_sock_ops_kern *, bpf_sock,
+ +	   int, level, int, optname, char *, optval, int, optlen)
+ +{
+++=======
++ static int bpf_sock_ops_get_syn(struct bpf_sock_ops_kern *bpf_sock,
++ 				int optname, const u8 **start)
++ {
++ 	struct sk_buff *syn_skb = bpf_sock->syn_skb;
++ 	const u8 *hdr_start;
++ 	int ret;
++ 
++ 	if (syn_skb) {
++ 		/* sk is a request_sock here */
++ 
++ 		if (optname == TCP_BPF_SYN) {
++ 			hdr_start = syn_skb->data;
++ 			ret = tcp_hdrlen(syn_skb);
++ 		} else if (optname == TCP_BPF_SYN_IP) {
++ 			hdr_start = skb_network_header(syn_skb);
++ 			ret = skb_network_header_len(syn_skb) +
++ 				tcp_hdrlen(syn_skb);
++ 		} else {
++ 			/* optname == TCP_BPF_SYN_MAC */
++ 			hdr_start = skb_mac_header(syn_skb);
++ 			ret = skb_mac_header_len(syn_skb) +
++ 				skb_network_header_len(syn_skb) +
++ 				tcp_hdrlen(syn_skb);
++ 		}
++ 	} else {
++ 		struct sock *sk = bpf_sock->sk;
++ 		struct saved_syn *saved_syn;
++ 
++ 		if (sk->sk_state == TCP_NEW_SYN_RECV)
++ 			/* synack retransmit. bpf_sock->syn_skb will
++ 			 * not be available.  It has to resort to
++ 			 * saved_syn (if it is saved).
++ 			 */
++ 			saved_syn = inet_reqsk(sk)->saved_syn;
++ 		else
++ 			saved_syn = tcp_sk(sk)->saved_syn;
++ 
++ 		if (!saved_syn)
++ 			return -ENOENT;
++ 
++ 		if (optname == TCP_BPF_SYN) {
++ 			hdr_start = saved_syn->data +
++ 				saved_syn->mac_hdrlen +
++ 				saved_syn->network_hdrlen;
++ 			ret = saved_syn->tcp_hdrlen;
++ 		} else if (optname == TCP_BPF_SYN_IP) {
++ 			hdr_start = saved_syn->data +
++ 				saved_syn->mac_hdrlen;
++ 			ret = saved_syn->network_hdrlen +
++ 				saved_syn->tcp_hdrlen;
++ 		} else {
++ 			/* optname == TCP_BPF_SYN_MAC */
++ 
++ 			/* TCP_SAVE_SYN may not have saved the mac hdr */
++ 			if (!saved_syn->mac_hdrlen)
++ 				return -ENOENT;
++ 
++ 			hdr_start = saved_syn->data;
++ 			ret = saved_syn->mac_hdrlen +
++ 				saved_syn->network_hdrlen +
++ 				saved_syn->tcp_hdrlen;
++ 		}
++ 	}
++ 
++ 	*start = hdr_start;
++ 	return ret;
++ }
++ 
++ BPF_CALL_5(bpf_sock_ops_getsockopt, struct bpf_sock_ops_kern *, bpf_sock,
++ 	   int, level, int, optname, char *, optval, int, optlen)
++ {
++ 	if (IS_ENABLED(CONFIG_INET) && level == SOL_TCP &&
++ 	    optname >= TCP_BPF_SYN && optname <= TCP_BPF_SYN_MAC) {
++ 		int ret, copy_len = 0;
++ 		const u8 *start;
++ 
++ 		ret = bpf_sock_ops_get_syn(bpf_sock, optname, &start);
++ 		if (ret > 0) {
++ 			copy_len = ret;
++ 			if (optlen < copy_len) {
++ 				copy_len = optlen;
++ 				ret = -ENOSPC;
++ 			}
++ 
++ 			memcpy(optval, start, copy_len);
++ 		}
++ 
++ 		/* Zero out unused buffer at the end */
++ 		memset(optval + copy_len, 0, optlen - copy_len);
++ 
++ 		return ret;
++ 	}
++ 
+++>>>>>>> 267cf9fa43d1 (tcp: bpf: Optionally store mac header in TCP_SAVE_SYN)
+  	return _bpf_getsockopt(bpf_sock->sk, level, optname, optval, optlen);
+  }
+  
+diff --cc net/ipv4/tcp_input.c
+index 0a07f42fdf6f,4337841faeff..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -6481,13 -6675,27 +6481,37 @@@ static void tcp_reqsk_record_syn(const 
+  {
+  	if (tcp_sk(sk)->save_syn) {
+  		u32 len = skb_network_header_len(skb) + tcp_hdrlen(skb);
+++<<<<<<< HEAD
+ +		u32 *copy;
+ +
+ +		copy = kmalloc(len + sizeof(u32), GFP_ATOMIC);
+ +		if (copy) {
+ +			copy[0] = len;
+ +			memcpy(&copy[1], skb_network_header(skb), len);
+ +			req->saved_syn = copy;
+++=======
++ 		struct saved_syn *saved_syn;
++ 		u32 mac_hdrlen;
++ 		void *base;
++ 
++ 		if (tcp_sk(sk)->save_syn == 2) {  /* Save full header. */
++ 			base = skb_mac_header(skb);
++ 			mac_hdrlen = skb_mac_header_len(skb);
++ 			len += mac_hdrlen;
++ 		} else {
++ 			base = skb_network_header(skb);
++ 			mac_hdrlen = 0;
++ 		}
++ 
++ 		saved_syn = kmalloc(struct_size(saved_syn, data, len),
++ 				    GFP_ATOMIC);
++ 		if (saved_syn) {
++ 			saved_syn->mac_hdrlen = mac_hdrlen;
++ 			saved_syn->network_hdrlen = skb_network_header_len(skb);
++ 			saved_syn->tcp_hdrlen = tcp_hdrlen(skb);
++ 			memcpy(saved_syn->data, base, len);
++ 			req->saved_syn = saved_syn;
+++>>>>>>> 267cf9fa43d1 (tcp: bpf: Optionally store mac header in TCP_SAVE_SYN)
+  		}
+  	}
+  }
+diff --cc tools/include/uapi/linux/bpf.h
+index 0dc0309df9c7,544b89a64918..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -4290,6 -4506,61 +4290,64 @@@ enum 
+  	TCP_BPF_SNDCWND_CLAMP	= 1002,	/* Set sndcwnd_clamp */
+  	TCP_BPF_DELACK_MAX	= 1003, /* Max delay ack in usecs */
+  	TCP_BPF_RTO_MIN		= 1004, /* Min delay ack in usecs */
+++<<<<<<< HEAD
+++=======
++ 	/* Copy the SYN pkt to optval
++ 	 *
++ 	 * BPF_PROG_TYPE_SOCK_OPS only.  It is similar to the
++ 	 * bpf_getsockopt(TCP_SAVED_SYN) but it does not limit
++ 	 * to only getting from the saved_syn.  It can either get the
++ 	 * syn packet from:
++ 	 *
++ 	 * 1. the just-received SYN packet (only available when writing the
++ 	 *    SYNACK).  It will be useful when it is not necessary to
++ 	 *    save the SYN packet for latter use.  It is also the only way
++ 	 *    to get the SYN during syncookie mode because the syn
++ 	 *    packet cannot be saved during syncookie.
++ 	 *
++ 	 * OR
++ 	 *
++ 	 * 2. the earlier saved syn which was done by
++ 	 *    bpf_setsockopt(TCP_SAVE_SYN).
++ 	 *
++ 	 * The bpf_getsockopt(TCP_BPF_SYN*) option will hide where the
++ 	 * SYN packet is obtained.
++ 	 *
++ 	 * If the bpf-prog does not need the IP[46] header,  the
++ 	 * bpf-prog can avoid parsing the IP header by using
++ 	 * TCP_BPF_SYN.  Otherwise, the bpf-prog can get both
++ 	 * IP[46] and TCP header by using TCP_BPF_SYN_IP.
++ 	 *
++ 	 *      >0: Total number of bytes copied
++ 	 * -ENOSPC: Not enough space in optval. Only optlen number of
++ 	 *          bytes is copied.
++ 	 * -ENOENT: The SYN skb is not available now and the earlier SYN pkt
++ 	 *	    is not saved by setsockopt(TCP_SAVE_SYN).
++ 	 */
++ 	TCP_BPF_SYN		= 1005, /* Copy the TCP header */
++ 	TCP_BPF_SYN_IP		= 1006, /* Copy the IP[46] and TCP header */
++ 	TCP_BPF_SYN_MAC         = 1007, /* Copy the MAC, IP[46], and TCP header */
++ };
++ 
++ enum {
++ 	BPF_LOAD_HDR_OPT_TCP_SYN = (1ULL << 0),
++ };
++ 
++ /* args[0] value during BPF_SOCK_OPS_HDR_OPT_LEN_CB and
++  * BPF_SOCK_OPS_WRITE_HDR_OPT_CB.
++  */
++ enum {
++ 	BPF_WRITE_HDR_TCP_CURRENT_MSS = 1,	/* Kernel is finding the
++ 						 * total option spaces
++ 						 * required for an established
++ 						 * sk in order to calculate the
++ 						 * MSS.  No skb is actually
++ 						 * sent.
++ 						 */
++ 	BPF_WRITE_HDR_TCP_SYNACK_COOKIE = 2,	/* Kernel is in syncookie mode
++ 						 * when sending a SYN.
++ 						 */
+++>>>>>>> 267cf9fa43d1 (tcp: bpf: Optionally store mac header in TCP_SAVE_SYN)
+  };
+  
+  struct bpf_perf_event_value {
+* Unmerged path include/linux/tcp.h
+* Unmerged path include/net/request_sock.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path net/core/filter.c
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index c801d90c5543..e45c6712c8d2 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -3049,7 +3049,8 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
+ 		break;
+ 
+ 	case TCP_SAVE_SYN:
+-		if (val < 0 || val > 1)
++		/* 0: disable, 1: enable, 2: start from ether_header */
++		if (val < 0 || val > 2)
+ 			err = -EINVAL;
+ 		else
+ 			tp->save_syn = val;
+* Unmerged path net/ipv4/tcp_input.c
+* Unmerged path tools/include/uapi/linux/bpf.h
