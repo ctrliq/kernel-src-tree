@@ -1,0 +1,217 @@
+net/sched: act_police: don't use spinlock in the data path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: act_police: don't use spinlock in the data path (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 96.43%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit 2d550dbad83c88fc7cb594a1803e77457fe625f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/2d550dba.failed
+
+use RCU instead of spinlocks, to protect concurrent read/write on
+act_police configuration. This reduces the effects of contention in the
+data path, in case multiple readers are present.
+
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2d550dbad83c88fc7cb594a1803e77457fe625f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_police.c
+diff --cc net/sched/act_police.c
+index 0b82775575a6,92649d2667ed..000000000000
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@@ -204,64 -224,69 +220,116 @@@ static int tcf_police_act(struct sk_buf
+  			  struct tcf_result *res)
+  {
+  	struct tcf_police *police = to_police(a);
+++<<<<<<< HEAD
+ +	s64 now;
+ +	s64 toks;
+ +	s64 ptoks = 0;
+ +
+ +	spin_lock(&police->tcf_lock);
+ +
+ +	bstats_update(&police->tcf_bstats, skb);
+ +	tcf_lastuse_update(&police->tcf_tm);
+ +
+ +	if (police->tcfp_ewma_rate) {
+ +		struct gnet_stats_rate_est64 sample;
+ +
+ +		if (!gen_estimator_read(&police->tcf_rate_est, &sample) ||
+ +		    sample.bps >= police->tcfp_ewma_rate) {
+ +			police->tcf_qstats.overlimits++;
+ +			if (police->tcf_action == TC_ACT_SHOT)
+ +				police->tcf_qstats.drops++;
+ +			spin_unlock(&police->tcf_lock);
+ +			return police->tcf_action;
+ +		}
+ +	}
+ +
+ +	if (qdisc_pkt_len(skb) <= police->tcfp_mtu) {
+ +		if (!police->rate_present) {
+ +			spin_unlock(&police->tcf_lock);
+ +			return police->tcfp_result;
+++=======
++ 	struct tcf_police_params *p;
++ 	s64 now, toks, ptoks = 0;
++ 	int ret;
++ 
++ 	tcf_lastuse_update(&police->tcf_tm);
++ 	bstats_cpu_update(this_cpu_ptr(police->common.cpu_bstats), skb);
++ 
++ 	ret = READ_ONCE(police->tcf_action);
++ 	p = rcu_dereference_bh(police->params);
++ 
++ 	if (p->tcfp_ewma_rate) {
++ 		struct gnet_stats_rate_est64 sample;
++ 
++ 		if (!gen_estimator_read(&police->tcf_rate_est, &sample) ||
++ 		    sample.bps >= p->tcfp_ewma_rate)
++ 			goto inc_overlimits;
++ 	}
++ 
++ 	if (qdisc_pkt_len(skb) <= p->tcfp_mtu) {
++ 		if (!p->rate_present) {
++ 			ret = p->tcfp_result;
++ 			goto end;
+++>>>>>>> 2d550dbad83c (net/sched: act_police: don't use spinlock in the data path)
+  		}
+  
+  		now = ktime_get_ns();
+- 		toks = min_t(s64, now - police->tcfp_t_c,
+- 			     police->tcfp_burst);
+- 		if (police->peak_present) {
+- 			ptoks = toks + police->tcfp_ptoks;
+- 			if (ptoks > police->tcfp_mtu_ptoks)
+- 				ptoks = police->tcfp_mtu_ptoks;
+- 			ptoks -= (s64) psched_l2t_ns(&police->peak,
+- 						     qdisc_pkt_len(skb));
++ 		toks = min_t(s64, now - p->tcfp_t_c, p->tcfp_burst);
++ 		if (p->peak_present) {
++ 			ptoks = toks + p->tcfp_ptoks;
++ 			if (ptoks > p->tcfp_mtu_ptoks)
++ 				ptoks = p->tcfp_mtu_ptoks;
++ 			ptoks -= (s64)psched_l2t_ns(&p->peak,
++ 						    qdisc_pkt_len(skb));
+  		}
+- 		toks += police->tcfp_toks;
+- 		if (toks > police->tcfp_burst)
+- 			toks = police->tcfp_burst;
+- 		toks -= (s64) psched_l2t_ns(&police->rate, qdisc_pkt_len(skb));
++ 		toks += p->tcfp_toks;
++ 		if (toks > p->tcfp_burst)
++ 			toks = p->tcfp_burst;
++ 		toks -= (s64)psched_l2t_ns(&p->rate, qdisc_pkt_len(skb));
+  		if ((toks|ptoks) >= 0) {
+++<<<<<<< HEAD
+ +			police->tcfp_t_c = now;
+ +			police->tcfp_toks = toks;
+ +			police->tcfp_ptoks = ptoks;
+ +			if (police->tcfp_result == TC_ACT_SHOT)
+ +				police->tcf_qstats.drops++;
+ +			spin_unlock(&police->tcf_lock);
+ +			return police->tcfp_result;
+ +		}
+ +	}
+ +
+ +	police->tcf_qstats.overlimits++;
+ +	if (police->tcf_action == TC_ACT_SHOT)
+ +		police->tcf_qstats.drops++;
+ +	spin_unlock(&police->tcf_lock);
+ +	return police->tcf_action;
+++=======
++ 			p->tcfp_t_c = now;
++ 			p->tcfp_toks = toks;
++ 			p->tcfp_ptoks = ptoks;
++ 			ret = p->tcfp_result;
++ 			goto inc_drops;
++ 		}
++ 	}
++ 
++ inc_overlimits:
++ 	qstats_overlimit_inc(this_cpu_ptr(police->common.cpu_qstats));
++ inc_drops:
++ 	if (ret == TC_ACT_SHOT)
++ 		qstats_drop_inc(this_cpu_ptr(police->common.cpu_qstats));
++ end:
++ 	return ret;
+++>>>>>>> 2d550dbad83c (net/sched: act_police: don't use spinlock in the data path)
++ }
++ 
++ static void tcf_police_cleanup(struct tc_action *a)
++ {
++ 	struct tcf_police *police = to_police(a);
++ 	struct tcf_police_params *p;
++ 
++ 	p = rcu_dereference_protected(police->params, 1);
++ 	if (p)
++ 		kfree_rcu(p, rcu);
+  }
+  
+  static int tcf_police_dump(struct sk_buff *skb, struct tc_action *a,
+@@@ -269,27 -294,31 +337,41 @@@
+  {
+  	unsigned char *b = skb_tail_pointer(skb);
+  	struct tcf_police *police = to_police(a);
++ 	struct tcf_police_params *p;
+  	struct tc_police opt = {
+  		.index = police->tcf_index,
+ -		.refcnt = refcount_read(&police->tcf_refcnt) - ref,
+ -		.bindcnt = atomic_read(&police->tcf_bindcnt) - bind,
+ +		.action = police->tcf_action,
+ +		.mtu = police->tcfp_mtu,
+ +		.burst = PSCHED_NS2TICKS(police->tcfp_burst),
+ +		.refcnt = police->tcf_refcnt - ref,
+ +		.bindcnt = police->tcf_bindcnt - bind,
+  	};
+  	struct tcf_t t;
+  
+++<<<<<<< HEAD
+ +	if (police->rate_present)
+ +		psched_ratecfg_getrate(&opt.rate, &police->rate);
+ +	if (police->peak_present)
+ +		psched_ratecfg_getrate(&opt.peakrate, &police->peak);
+++=======
++ 	spin_lock_bh(&police->tcf_lock);
++ 	opt.action = police->tcf_action;
++ 	p = rcu_dereference_protected(police->params,
++ 				      lockdep_is_held(&police->tcf_lock));
++ 	opt.mtu = p->tcfp_mtu;
++ 	opt.burst = PSCHED_NS2TICKS(p->tcfp_burst);
++ 	if (p->rate_present)
++ 		psched_ratecfg_getrate(&opt.rate, &p->rate);
++ 	if (p->peak_present)
++ 		psched_ratecfg_getrate(&opt.peakrate, &p->peak);
+++>>>>>>> 2d550dbad83c (net/sched: act_police: don't use spinlock in the data path)
+  	if (nla_put(skb, TCA_POLICE_TBF, sizeof(opt), &opt))
+  		goto nla_put_failure;
+- 	if (police->tcfp_result &&
+- 	    nla_put_u32(skb, TCA_POLICE_RESULT, police->tcfp_result))
++ 	if (p->tcfp_result &&
++ 	    nla_put_u32(skb, TCA_POLICE_RESULT, p->tcfp_result))
+  		goto nla_put_failure;
+- 	if (police->tcfp_ewma_rate &&
+- 	    nla_put_u32(skb, TCA_POLICE_AVRATE, police->tcfp_ewma_rate))
++ 	if (p->tcfp_ewma_rate &&
++ 	    nla_put_u32(skb, TCA_POLICE_AVRATE, p->tcfp_ewma_rate))
+  		goto nla_put_failure;
+  
+  	t.install = jiffies_to_clock_t(jiffies - police->tcf_tm.install);
+@@@ -333,7 -357,7 +415,11 @@@ static struct tc_action_ops act_police_
+  	.init		=	tcf_police_init,
+  	.walk		=	tcf_police_walker,
+  	.lookup		=	tcf_police_search,
+++<<<<<<< HEAD
+ +	.delete		=	tcf_police_delete,
+++=======
++ 	.cleanup	=	tcf_police_cleanup,
+++>>>>>>> 2d550dbad83c (net/sched: act_police: don't use spinlock in the data path)
+  	.size		=	sizeof(struct tcf_police),
+  };
+  
+* Unmerged path net/sched/act_police.c
