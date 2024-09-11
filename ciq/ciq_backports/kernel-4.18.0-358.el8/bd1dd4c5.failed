@@ -1,0 +1,148 @@
+powerpc/pseries: Prevent free CPU ids being reused on another node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Laurent Dufour <ldufour@linux.ibm.com>
+commit bd1dd4c5f5286df0148b5b316f37c583b8f55fa1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/bd1dd4c5.failed
+
+When a CPU is hot added, the CPU ids are taken from the available mask
+from the lower possible set. If that set of values was previously used
+for a CPU attached to a different node, it appears to an application as
+if these CPUs have migrated from one node to another node which is not
+expected.
+
+To prevent this, it is needed to record the CPU ids used for each node
+and to not reuse them on another node. However, to prevent CPU hot plug
+to fail, in the case the CPU ids is starved on a node, the capability to
+reuse other nodes’ free CPU ids is kept. A warning is displayed in such
+a case to warn the user.
+
+A new CPU bit mask (node_recorded_ids_map) is introduced for each
+possible node. It is populated with the CPU onlined at boot time, and
+then when a CPU is hot plugged to a node. The bits in that mask remain
+when the CPU is hot unplugged, to remind this CPU ids have been used for
+this node.
+
+If no id set was found, a retry is made without removing the ids used on
+the other nodes to try reusing them. This is the way ids have been
+allocated prior to this patch.
+
+The effect of this patch can be seen by removing and adding CPUs using
+the Qemu monitor. In the following case, the first CPU from the node 2
+is removed, then the first one from the node 1 is removed too. Later,
+the first CPU of the node 2 is added back. Without that patch, the
+kernel will number these CPUs using the first CPU ids available which
+are the ones freed when removing the second CPU of the node 0. This
+leads to the CPU ids 16-23 to move from the node 1 to the node 2. With
+the patch applied, the CPU ids 32-39 are used since they are the lowest
+free ones which have not been used on another node.
+
+At boot time:
+  [root@vm40 ~]# numactl -H | grep cpus
+  node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+  node 1 cpus: 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+  node 2 cpus: 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+
+Vanilla kernel, after the CPU hot unplug/plug operations:
+  [root@vm40 ~]# numactl -H | grep cpus
+  node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+  node 1 cpus: 24 25 26 27 28 29 30 31
+  node 2 cpus: 16 17 18 19 20 21 22 23 40 41 42 43 44 45 46 47
+
+Patched kernel, after the CPU hot unplug/plug operations:
+  [root@vm40 ~]# numactl -H | grep cpus
+  node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+  node 1 cpus: 24 25 26 27 28 29 30 31
+  node 2 cpus: 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+
+	Signed-off-by: Laurent Dufour <ldufour@linux.ibm.com>
+	Reviewed-by: Nathan Lynch <nathanl@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20210429174908.16613-1-ldufour@linux.ibm.com
+
+(cherry picked from commit bd1dd4c5f5286df0148b5b316f37c583b8f55fa1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/hotplug-cpu.c
+diff --cc arch/powerpc/platforms/pseries/hotplug-cpu.c
+index 50086ca013aa,e1f224320102..000000000000
+--- a/arch/powerpc/platforms/pseries/hotplug-cpu.c
++++ b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+@@@ -164,44 -223,40 +230,55 @@@ static int pseries_add_processor(struc
+  	if (!intserv)
+  		return 0;
+  
+- 	zalloc_cpumask_var(&candidate_mask, GFP_KERNEL);
+- 	zalloc_cpumask_var(&tmp, GFP_KERNEL);
+- 
+  	nthreads = len / sizeof(u32);
+- 	for (i = 0; i < nthreads; i++)
+- 		cpumask_set_cpu(i, tmp);
+  
+- 	cpu_maps_update_begin();
++ 	if (!alloc_cpumask_var(&cpu_mask, GFP_KERNEL))
++ 		return -ENOMEM;
+  
+- 	BUG_ON(!cpumask_subset(cpu_present_mask, cpu_possible_mask));
++ 	/*
++ 	 * Fetch from the DT nodes read by dlpar_configure_connector() the NUMA
++ 	 * node id the added CPU belongs to.
++ 	 */
++ 	node = of_node_to_nid(np);
++ 	if (node < 0 || !node_possible(node))
++ 		node = first_online_node;
+  
+- 	/* Get a bitmap of unoccupied slots. */
+- 	cpumask_xor(candidate_mask, cpu_possible_mask, cpu_present_mask);
+- 	if (cpumask_empty(candidate_mask)) {
+- 		/* If we get here, it most likely means that NR_CPUS is
+- 		 * less than the partition's max processors setting.
++ 	BUG_ON(node == NUMA_NO_NODE);
++ 	assigned_node = node;
++ 
++ 	cpu_maps_update_begin();
++ 
++ 	rc = find_cpu_id_range(nthreads, node, &cpu_mask);
++ 	if (rc && nr_node_ids > 1) {
++ 		/*
++ 		 * Try again, considering the free CPU ids from the other node.
+  		 */
+- 		printk(KERN_ERR "Cannot add cpu %pOF; this system configuration"
+- 		       " supports %d logical cpus.\n", np,
+- 		       num_possible_cpus());
+- 		goto out_unlock;
++ 		node = NUMA_NO_NODE;
++ 		rc = find_cpu_id_range(nthreads, NUMA_NO_NODE, &cpu_mask);
+  	}
+  
+++<<<<<<< HEAD
+ +	while (!cpumask_empty(tmp))
+ +		if (cpumask_subset(tmp, candidate_mask))
+ +			/* Found a range where we can insert the new cpu(s) */
+ +			break;
+ +		else
+ +			cpumask_shift_left(tmp, tmp, nthreads);
+ +
+ +	if (cpumask_empty(tmp)) {
+ +		printk(KERN_ERR "Unable to find space in cpu_present_mask for"
+ +		       " processor %s with %d thread(s)\n", np->name,
+ +		       nthreads);
+ +		goto out_unlock;
+++=======
++ 	if (rc) {
++ 		pr_err("Cannot add cpu %pOF; this system configuration"
++ 		       " supports %d logical cpus.\n", np, num_possible_cpus());
++ 		goto out;
+++>>>>>>> bd1dd4c5f528 (powerpc/pseries: Prevent free CPU ids being reused on another node)
+  	}
+  
+- 	for_each_cpu(cpu, tmp) {
++ 	for_each_cpu(cpu, cpu_mask) {
+  		BUG_ON(cpu_present(cpu));
+  		set_cpu_present(cpu, true);
+  		set_hard_smp_processor_id(cpu, be32_to_cpu(*intserv++));
+* Unmerged path arch/powerpc/platforms/pseries/hotplug-cpu.c
