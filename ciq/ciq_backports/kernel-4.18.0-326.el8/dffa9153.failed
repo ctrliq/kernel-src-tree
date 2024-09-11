@@ -1,0 +1,132 @@
+powerpc/eeh: Move vf_index out of pci_dn and into eeh_dev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Oliver O'Halloran <oohall@gmail.com>
+commit dffa91539e80355402c0716a91af17fc8ddd1abf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/dffa9153.failed
+
+Drivers that do not support the PCI error handling callbacks are handled by
+tearing down the device and re-probing them. If the device being removed is
+a virtual function then we need to know the VF index so it can be removed
+using the pci_iov_{add|remove}_virtfn() API.
+
+Currently this is handled by looking up the pci_dn, and using the vf_index
+that was stashed there when the pci_dn for the VF was created in
+pcibios_sriov_enable(). We would like to eliminate the use of pci_dn
+outside of pseries though so we need to provide the generic EEH code with
+some other way to find the vf_index.
+
+The easiest thing to do here is move the vf_index field out of pci_dn and
+into eeh_dev.  Currently pci_dn and eeh_dev are allocated and initialized
+together so this is a fairly minimal change in preparation for splitting
+pci_dn and eeh_dev in the future.
+
+	Signed-off-by: Oliver O'Halloran <oohall@gmail.com>
+	Reviewed-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200725081231.39076-3-oohall@gmail.com
+(cherry picked from commit dffa91539e80355402c0716a91af17fc8ddd1abf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/eeh.h
+diff --cc arch/powerpc/include/asm/eeh.h
+index 3bf94ba598ab,2a935db72198..000000000000
+--- a/arch/powerpc/include/asm/eeh.h
++++ b/arch/powerpc/include/asm/eeh.h
+@@@ -159,9 -148,10 +159,15 @@@ struct eeh_dev 
+  	struct pci_dn *pdn;		/* Associated PCI device node	*/
+  	struct pci_dev *pdev;		/* Associated PCI device	*/
+  	bool in_error;			/* Error flag for edev		*/
++ 
++ 	/* VF specific properties */
+  	struct pci_dev *physfn;		/* Associated SRIOV PF		*/
+++<<<<<<< HEAD
+ +	RH_KABI_REPLACE(struct pci_bus * bus, struct pci_controller *controller)
+ +	RH_KABI_EXTEND(int bdfn)	/* bdfn of device (for cfg ops) */
+++=======
++ 	int vf_index;			/* Index of this VF 		*/
+++>>>>>>> dffa91539e80 (powerpc/eeh: Move vf_index out of pci_dn and into eeh_dev)
+  };
+  
+  /* "fmt" must be a simple literal string */
+* Unmerged path arch/powerpc/include/asm/eeh.h
+diff --git a/arch/powerpc/include/asm/pci-bridge.h b/arch/powerpc/include/asm/pci-bridge.h
+index a31dda027bf2..deddd8aeedeb 100644
+--- a/arch/powerpc/include/asm/pci-bridge.h
++++ b/arch/powerpc/include/asm/pci-bridge.h
+@@ -209,7 +209,6 @@ struct pci_dn {
+ #define IODA_INVALID_PE		0xFFFFFFFF
+ 	unsigned int pe_number;
+ #ifdef CONFIG_PCI_IOV
+-	int     vf_index;		/* VF index in the PF */
+ 	u16     vfs_expanded;		/* number of VFs IOV BAR expanded */
+ 	u16     num_vfs;		/* number of VFs enabled*/
+ 	unsigned int *pe_num_map;	/* PE# for the first VF PE or array */
+diff --git a/arch/powerpc/kernel/eeh_driver.c b/arch/powerpc/kernel/eeh_driver.c
+index c7286584fc55..3b82886384c8 100644
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@ -493,7 +493,7 @@ static void *eeh_add_virt_device(struct eeh_dev *edev)
+ 	}
+ 
+ #ifdef CONFIG_PCI_IOV
+-	pci_iov_add_virtfn(edev->physfn, eeh_dev_to_pdn(edev)->vf_index);
++	pci_iov_add_virtfn(edev->physfn, edev->vf_index);
+ #endif
+ 	return NULL;
+ }
+@@ -537,9 +537,7 @@ static void eeh_rmv_device(struct eeh_dev *edev, void *userdata)
+ 
+ 	if (edev->physfn) {
+ #ifdef CONFIG_PCI_IOV
+-		struct pci_dn *pdn = eeh_dev_to_pdn(edev);
+-
+-		pci_iov_remove_virtfn(edev->physfn, pdn->vf_index);
++		pci_iov_remove_virtfn(edev->physfn, edev->vf_index);
+ 		edev->pdev = NULL;
+ #endif
+ 		if (rmv_data)
+diff --git a/arch/powerpc/kernel/pci_dn.c b/arch/powerpc/kernel/pci_dn.c
+index 59bcb556ad74..3146841e8168 100644
+--- a/arch/powerpc/kernel/pci_dn.c
++++ b/arch/powerpc/kernel/pci_dn.c
+@@ -139,7 +139,6 @@ struct pci_dn *pci_get_pdn(struct pci_dev *pdev)
+ 
+ #ifdef CONFIG_PCI_IOV
+ static struct pci_dn *add_one_sriov_vf_pdn(struct pci_dn *parent,
+-					   int vf_index,
+ 					   int busno, int devfn)
+ {
+ 	struct pci_dn *pdn;
+@@ -156,7 +155,6 @@ static struct pci_dn *add_one_sriov_vf_pdn(struct pci_dn *parent,
+ 	pdn->parent = parent;
+ 	pdn->busno = busno;
+ 	pdn->devfn = devfn;
+-	pdn->vf_index = vf_index;
+ 	pdn->pe_number = IODA_INVALID_PE;
+ 	INIT_LIST_HEAD(&pdn->child_list);
+ 	INIT_LIST_HEAD(&pdn->list);
+@@ -187,7 +185,7 @@ struct pci_dn *add_sriov_vf_pdns(struct pci_dev *pdev)
+ 	for (i = 0; i < pci_sriov_get_totalvfs(pdev); i++) {
+ 		struct eeh_dev *edev __maybe_unused;
+ 
+-		pdn = add_one_sriov_vf_pdn(parent, i,
++		pdn = add_one_sriov_vf_pdn(parent,
+ 					   pci_iov_virtfn_bus(pdev, i),
+ 					   pci_iov_virtfn_devfn(pdev, i));
+ 		if (!pdn) {
+@@ -200,7 +198,10 @@ struct pci_dn *add_sriov_vf_pdns(struct pci_dev *pdev)
+ 		/* Create the EEH device for the VF */
+ 		edev = eeh_dev_init(pdn);
+ 		BUG_ON(!edev);
++
++		/* FIXME: these should probably be populated by the EEH probe */
+ 		edev->physfn = pdev;
++		edev->vf_index = i;
+ #endif /* CONFIG_EEH */
+ 	}
+ 	return pci_get_pdn(pdev);
