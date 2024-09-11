@@ -1,0 +1,360 @@
+KVM: s390: Add vm IOCTL for key checked guest absolute memory access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+commit ef11c9463ae006302ce170a401854a48ea0532ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/ef11c946.failed
+
+Channel I/O honors storage keys and is performed on absolute memory.
+For I/O emulation user space therefore needs to be able to do key
+checked accesses.
+The vm IOCTL supports read/write accesses, as well as checking
+if an access would succeed.
+Unlike relying on KVM_S390_GET_SKEYS for key checking would,
+the vm IOCTL performs the check in lockstep with the read or write,
+by, ultimately, mapping the access to move instructions that
+support key protection checking with a supplied key.
+Fetch and storage protection override are not applicable to absolute
+accesses and so are not applied as they are when using the vcpu memop.
+
+	Signed-off-by: Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+	Reviewed-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220211182215.2730017-7-scgl@linux.ibm.com
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+(cherry picked from commit ef11c9463ae006302ce170a401854a48ea0532ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/gaccess.c
+#	arch/s390/kvm/gaccess.h
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/s390/kvm/gaccess.c
+index 3d68154dd4eb,d53a183c2005..000000000000
+--- a/arch/s390/kvm/gaccess.c
++++ b/arch/s390/kvm/gaccess.c
+@@@ -794,6 -795,108 +794,111 @@@ static int low_address_protection_enabl
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vm_check_access_key(struct kvm *kvm, u8 access_key,
++ 			       enum gacc_mode mode, gpa_t gpa)
++ {
++ 	u8 storage_key, access_control;
++ 	bool fetch_protected;
++ 	unsigned long hva;
++ 	int r;
++ 
++ 	if (access_key == 0)
++ 		return 0;
++ 
++ 	hva = gfn_to_hva(kvm, gpa_to_gfn(gpa));
++ 	if (kvm_is_error_hva(hva))
++ 		return PGM_ADDRESSING;
++ 
++ 	mmap_read_lock(current->mm);
++ 	r = get_guest_storage_key(current->mm, hva, &storage_key);
++ 	mmap_read_unlock(current->mm);
++ 	if (r)
++ 		return r;
++ 	access_control = FIELD_GET(_PAGE_ACC_BITS, storage_key);
++ 	if (access_control == access_key)
++ 		return 0;
++ 	fetch_protected = storage_key & _PAGE_FP_BIT;
++ 	if ((mode == GACC_FETCH || mode == GACC_IFETCH) && !fetch_protected)
++ 		return 0;
++ 	return PGM_PROTECTION;
++ }
++ 
++ static bool fetch_prot_override_applicable(struct kvm_vcpu *vcpu, enum gacc_mode mode,
++ 					   union asce asce)
++ {
++ 	psw_t *psw = &vcpu->arch.sie_block->gpsw;
++ 	unsigned long override;
++ 
++ 	if (mode == GACC_FETCH || mode == GACC_IFETCH) {
++ 		/* check if fetch protection override enabled */
++ 		override = vcpu->arch.sie_block->gcr[0];
++ 		override &= CR0_FETCH_PROTECTION_OVERRIDE;
++ 		/* not applicable if subject to DAT && private space */
++ 		override = override && !(psw_bits(*psw).dat && asce.p);
++ 		return override;
++ 	}
++ 	return false;
++ }
++ 
++ static bool fetch_prot_override_applies(unsigned long ga, unsigned int len)
++ {
++ 	return ga < 2048 && ga + len <= 2048;
++ }
++ 
++ static bool storage_prot_override_applicable(struct kvm_vcpu *vcpu)
++ {
++ 	/* check if storage protection override enabled */
++ 	return vcpu->arch.sie_block->gcr[0] & CR0_STORAGE_PROTECTION_OVERRIDE;
++ }
++ 
++ static bool storage_prot_override_applies(u8 access_control)
++ {
++ 	/* matches special storage protection override key (9) -> allow */
++ 	return access_control == PAGE_SPO_ACC;
++ }
++ 
++ static int vcpu_check_access_key(struct kvm_vcpu *vcpu, u8 access_key,
++ 				 enum gacc_mode mode, union asce asce, gpa_t gpa,
++ 				 unsigned long ga, unsigned int len)
++ {
++ 	u8 storage_key, access_control;
++ 	unsigned long hva;
++ 	int r;
++ 
++ 	/* access key 0 matches any storage key -> allow */
++ 	if (access_key == 0)
++ 		return 0;
++ 	/*
++ 	 * caller needs to ensure that gfn is accessible, so we can
++ 	 * assume that this cannot fail
++ 	 */
++ 	hva = gfn_to_hva(vcpu->kvm, gpa_to_gfn(gpa));
++ 	mmap_read_lock(current->mm);
++ 	r = get_guest_storage_key(current->mm, hva, &storage_key);
++ 	mmap_read_unlock(current->mm);
++ 	if (r)
++ 		return r;
++ 	access_control = FIELD_GET(_PAGE_ACC_BITS, storage_key);
++ 	/* access key matches storage key -> allow */
++ 	if (access_control == access_key)
++ 		return 0;
++ 	if (mode == GACC_FETCH || mode == GACC_IFETCH) {
++ 		/* it is a fetch and fetch protection is off -> allow */
++ 		if (!(storage_key & _PAGE_FP_BIT))
++ 			return 0;
++ 		if (fetch_prot_override_applicable(vcpu, mode, asce) &&
++ 		    fetch_prot_override_applies(ga, len))
++ 			return 0;
++ 	}
++ 	if (storage_prot_override_applicable(vcpu) &&
++ 	    storage_prot_override_applies(access_control))
++ 		return 0;
++ 	return PGM_PROTECTION;
++ }
++ 
+++>>>>>>> ef11c9463ae0 (KVM: s390: Add vm IOCTL for key checked guest absolute memory access)
+  /**
+   * guest_range_to_gpas() - Calculate guest physical addresses of page fragments
+   * covering a logical range
+@@@ -880,8 -989,63 +985,68 @@@ static int access_guest_page(struct kv
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +int access_guest(struct kvm_vcpu *vcpu, unsigned long ga, u8 ar, void *data,
+ +		 unsigned long len, enum gacc_mode mode)
+++=======
++ static int
++ access_guest_page_with_key(struct kvm *kvm, enum gacc_mode mode, gpa_t gpa,
++ 			   void *data, unsigned int len, u8 access_key)
++ {
++ 	struct kvm_memory_slot *slot;
++ 	bool writable;
++ 	gfn_t gfn;
++ 	hva_t hva;
++ 	int rc;
++ 
++ 	gfn = gpa >> PAGE_SHIFT;
++ 	slot = gfn_to_memslot(kvm, gfn);
++ 	hva = gfn_to_hva_memslot_prot(slot, gfn, &writable);
++ 
++ 	if (kvm_is_error_hva(hva))
++ 		return PGM_ADDRESSING;
++ 	/*
++ 	 * Check if it's a ro memslot, even tho that can't occur (they're unsupported).
++ 	 * Don't try to actually handle that case.
++ 	 */
++ 	if (!writable && mode == GACC_STORE)
++ 		return -EOPNOTSUPP;
++ 	hva += offset_in_page(gpa);
++ 	if (mode == GACC_STORE)
++ 		rc = copy_to_user_key((void __user *)hva, data, len, access_key);
++ 	else
++ 		rc = copy_from_user_key(data, (void __user *)hva, len, access_key);
++ 	if (rc)
++ 		return PGM_PROTECTION;
++ 	if (mode == GACC_STORE)
++ 		mark_page_dirty_in_slot(kvm, slot, gfn);
++ 	return 0;
++ }
++ 
++ int access_guest_abs_with_key(struct kvm *kvm, gpa_t gpa, void *data,
++ 			      unsigned long len, enum gacc_mode mode, u8 access_key)
++ {
++ 	int offset = offset_in_page(gpa);
++ 	int fragment_len;
++ 	int rc;
++ 
++ 	while (min(PAGE_SIZE - offset, len) > 0) {
++ 		fragment_len = min(PAGE_SIZE - offset, len);
++ 		rc = access_guest_page_with_key(kvm, mode, gpa, data, fragment_len, access_key);
++ 		if (rc)
++ 			return rc;
++ 		offset = 0;
++ 		len -= fragment_len;
++ 		data += fragment_len;
++ 		gpa += fragment_len;
++ 	}
++ 	return 0;
++ }
++ 
++ int access_guest_with_key(struct kvm_vcpu *vcpu, unsigned long ga, u8 ar,
++ 			  void *data, unsigned long len, enum gacc_mode mode,
++ 			  u8 access_key)
+++>>>>>>> ef11c9463ae0 (KVM: s390: Add vm IOCTL for key checked guest absolute memory access)
+  {
+  	psw_t *psw = &vcpu->arch.sie_block->gpsw;
+  	unsigned long nr_pages, idx;
+diff --cc arch/s390/kvm/gaccess.h
+index 7c72a5e3449f,1124ff282012..000000000000
+--- a/arch/s390/kvm/gaccess.h
++++ b/arch/s390/kvm/gaccess.h
+@@@ -186,13 -186,22 +186,25 @@@ enum gacc_mode 
+  	GACC_IFETCH,
+  };
+  
+ -int guest_translate_address_with_key(struct kvm_vcpu *vcpu, unsigned long gva, u8 ar,
+ -				     unsigned long *gpa, enum gacc_mode mode,
+ -				     u8 access_key);
+ -
+ +int guest_translate_address(struct kvm_vcpu *vcpu, unsigned long gva,
+ +			    u8 ar, unsigned long *gpa, enum gacc_mode mode);
+  int check_gva_range(struct kvm_vcpu *vcpu, unsigned long gva, u8 ar,
+ -		    unsigned long length, enum gacc_mode mode, u8 access_key);
+ +		    unsigned long length, enum gacc_mode mode);
+  
+++<<<<<<< HEAD
+ +int access_guest(struct kvm_vcpu *vcpu, unsigned long ga, u8 ar, void *data,
+ +		 unsigned long len, enum gacc_mode mode);
+++=======
++ int check_gpa_range(struct kvm *kvm, unsigned long gpa, unsigned long length,
++ 		    enum gacc_mode mode, u8 access_key);
++ 
++ int access_guest_abs_with_key(struct kvm *kvm, gpa_t gpa, void *data,
++ 			      unsigned long len, enum gacc_mode mode, u8 access_key);
++ 
++ int access_guest_with_key(struct kvm_vcpu *vcpu, unsigned long ga, u8 ar,
++ 			  void *data, unsigned long len, enum gacc_mode mode,
++ 			  u8 access_key);
+++>>>>>>> ef11c9463ae0 (KVM: s390: Add vm IOCTL for key checked guest absolute memory access)
+  
+  int access_guest_real(struct kvm_vcpu *vcpu, unsigned long gra,
+  		      void *data, unsigned long len, enum gacc_mode mode);
+diff --cc arch/s390/kvm/kvm-s390.c
+index 3586a7dbed80,36bc73b5f5de..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -2357,6 -2359,83 +2357,86 @@@ static int kvm_s390_handle_pv(struct kv
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool access_key_invalid(u8 access_key)
++ {
++ 	return access_key > 0xf;
++ }
++ 
++ static int kvm_s390_vm_mem_op(struct kvm *kvm, struct kvm_s390_mem_op *mop)
++ {
++ 	void __user *uaddr = (void __user *)mop->buf;
++ 	u64 supported_flags;
++ 	void *tmpbuf = NULL;
++ 	int r, srcu_idx;
++ 
++ 	supported_flags = KVM_S390_MEMOP_F_SKEY_PROTECTION
++ 			  | KVM_S390_MEMOP_F_CHECK_ONLY;
++ 	if (mop->flags & ~supported_flags)
++ 		return -EINVAL;
++ 	if (mop->size > MEM_OP_MAX_SIZE)
++ 		return -E2BIG;
++ 	if (kvm_s390_pv_is_protected(kvm))
++ 		return -EINVAL;
++ 	if (mop->flags & KVM_S390_MEMOP_F_SKEY_PROTECTION) {
++ 		if (access_key_invalid(mop->key))
++ 			return -EINVAL;
++ 	} else {
++ 		mop->key = 0;
++ 	}
++ 	if (!(mop->flags & KVM_S390_MEMOP_F_CHECK_ONLY)) {
++ 		tmpbuf = vmalloc(mop->size);
++ 		if (!tmpbuf)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	srcu_idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	if (kvm_is_error_gpa(kvm, mop->gaddr)) {
++ 		r = PGM_ADDRESSING;
++ 		goto out_unlock;
++ 	}
++ 
++ 	switch (mop->op) {
++ 	case KVM_S390_MEMOP_ABSOLUTE_READ: {
++ 		if (mop->flags & KVM_S390_MEMOP_F_CHECK_ONLY) {
++ 			r = check_gpa_range(kvm, mop->gaddr, mop->size, GACC_FETCH, mop->key);
++ 		} else {
++ 			r = access_guest_abs_with_key(kvm, mop->gaddr, tmpbuf,
++ 						      mop->size, GACC_FETCH, mop->key);
++ 			if (r == 0) {
++ 				if (copy_to_user(uaddr, tmpbuf, mop->size))
++ 					r = -EFAULT;
++ 			}
++ 		}
++ 		break;
++ 	}
++ 	case KVM_S390_MEMOP_ABSOLUTE_WRITE: {
++ 		if (mop->flags & KVM_S390_MEMOP_F_CHECK_ONLY) {
++ 			r = check_gpa_range(kvm, mop->gaddr, mop->size, GACC_STORE, mop->key);
++ 		} else {
++ 			if (copy_from_user(tmpbuf, uaddr, mop->size)) {
++ 				r = -EFAULT;
++ 				break;
++ 			}
++ 			r = access_guest_abs_with_key(kvm, mop->gaddr, tmpbuf,
++ 						      mop->size, GACC_STORE, mop->key);
++ 		}
++ 		break;
++ 	}
++ 	default:
++ 		r = -EINVAL;
++ 	}
++ 
++ out_unlock:
++ 	srcu_read_unlock(&kvm->srcu, srcu_idx);
++ 
++ 	vfree(tmpbuf);
++ 	return r;
++ }
++ 
+++>>>>>>> ef11c9463ae0 (KVM: s390: Add vm IOCTL for key checked guest absolute memory access)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+* Unmerged path arch/s390/kvm/gaccess.c
+* Unmerged path arch/s390/kvm/gaccess.h
+* Unmerged path arch/s390/kvm/kvm-s390.c
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 610460f79466..57b0ad568cf9 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -554,6 +554,8 @@ struct kvm_s390_mem_op {
+ #define KVM_S390_MEMOP_LOGICAL_WRITE	1
+ #define KVM_S390_MEMOP_SIDA_READ	2
+ #define KVM_S390_MEMOP_SIDA_WRITE	3
++#define KVM_S390_MEMOP_ABSOLUTE_READ	4
++#define KVM_S390_MEMOP_ABSOLUTE_WRITE	5
+ /* flags for kvm_s390_mem_op->flags */
+ #define KVM_S390_MEMOP_F_CHECK_ONLY		(1ULL << 0)
+ #define KVM_S390_MEMOP_F_INJECT_EXCEPTION	(1ULL << 1)
