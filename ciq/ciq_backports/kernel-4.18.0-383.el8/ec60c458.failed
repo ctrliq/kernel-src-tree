@@ -1,0 +1,216 @@
+net/mlx5e: Support MQPRIO channel mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Tariq Toukan <tariqt@nvidia.com>
+commit ec60c4581bd952296c1f81115eabd0a570042458
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/ec60c458.failed
+
+Add support for MQPRIO channel mode, in which a partition to TCs
+is defined over the channels. We allow partitions with contiguous
+queue indices, with no holes within. We do not allow modification
+to the num of channels while this MQPRIO mode is active.
+
+	Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+	Reviewed-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit ec60c4581bd952296c1f81115eabd0a570042458)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 3a54bd65c2b7,5696d3f1baaf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -455,6 -456,27 +455,30 @@@ int mlx5e_ethtool_set_channels(struct m
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Don't allow changing the number of channels if non-default RSS contexts exist,
++ 	 * the kernel doesn't protect against set_channels operations that break them.
++ 	 */
++ 	rss_cnt = mlx5e_rx_res_rss_cnt(priv->rx_res) - 1;
++ 	if (rss_cnt) {
++ 		err = -EINVAL;
++ 		netdev_err(priv->netdev, "%s: Non-default RSS contexts exist (%d), cannot change the number of channels\n",
++ 			   __func__, rss_cnt);
++ 		goto out;
++ 	}
++ 
++ 	/* Don't allow changing the number of channels if MQPRIO mode channel offload is active,
++ 	 * because it defines a partition over the channels queues.
++ 	 */
++ 	if (cur_params->mqprio.mode == TC_MQPRIO_MODE_CHANNEL) {
++ 		err = -EINVAL;
++ 		netdev_err(priv->netdev, "%s: MQPRIO mode channel offload is active, cannot change the number of channels\n",
++ 			   __func__);
++ 		goto out;
++ 	}
++ 
+++>>>>>>> ec60c4581bd9 (net/mlx5e: Support MQPRIO channel mode)
+  	new_params = *cur_params;
+  	new_params.num_channels = count;
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 759fe81f5e1a..e9182cb4ce86 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -74,6 +74,7 @@ struct page_pool;
+ #define MLX5E_SW2HW_MTU(params, swmtu) ((swmtu) + ((params)->hard_mtu))
+ 
+ #define MLX5E_MAX_NUM_TC	8
++#define MLX5E_MAX_NUM_MQPRIO_CH_TC TC_QOPT_MAX_QUEUE
+ 
+ #define MLX5_RX_HEADROOM NET_SKB_PAD
+ #define MLX5_SKB_FRAG_SZ(len)	(SKB_DATA_ALIGN(len) +	\
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d829ad30e5f6..98d5929db910 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2280,7 +2280,8 @@ void mlx5e_set_netdev_mtu_boundaries(struct mlx5e_priv *priv)
+ 				ETH_MAX_MTU);
+ }
+ 
+-static int mlx5e_netdev_set_tcs(struct net_device *netdev, u16 nch, u8 ntc)
++static int mlx5e_netdev_set_tcs(struct net_device *netdev, u16 nch, u8 ntc,
++				struct tc_mqprio_qopt_offload *mqprio)
+ {
+ 	int tc, err;
+ 
+@@ -2295,11 +2296,16 @@ static int mlx5e_netdev_set_tcs(struct net_device *netdev, u16 nch, u8 ntc)
+ 		return err;
+ 	}
+ 
+-	/* Map netdev TCs to offset 0
+-	 * We have our own UP to TXQ mapping for QoS
+-	 */
+-	for (tc = 0; tc < ntc; tc++)
+-		netdev_set_tc_queue(netdev, tc, nch, 0);
++	for (tc = 0; tc < ntc; tc++) {
++		u16 count, offset;
++
++		/* For DCB mode, map netdev TCs to offset 0
++		 * We have our own UP to TXQ mapping for QoS
++		 */
++		count = mqprio ? mqprio->qopt.count[tc] : nch;
++		offset = mqprio ? mqprio->qopt.offset[tc] : 0;
++		netdev_set_tc_queue(netdev, tc, count, offset);
++	}
+ 
+ 	return 0;
+ }
+@@ -2338,7 +2344,7 @@ static int mlx5e_update_netdev_queues(struct mlx5e_priv *priv)
+ 	ntc = mlx5e_get_dcb_num_tc(&priv->channels.params);
+ 	num_rxqs = nch * priv->profile->rq_groups;
+ 
+-	err = mlx5e_netdev_set_tcs(netdev, nch, ntc);
++	err = mlx5e_netdev_set_tcs(netdev, nch, ntc, NULL);
+ 	if (err)
+ 		goto err_out;
+ 	err = mlx5e_update_tx_netdev_queues(priv);
+@@ -2361,7 +2367,7 @@ static int mlx5e_update_netdev_queues(struct mlx5e_priv *priv)
+ 	WARN_ON_ONCE(netif_set_real_num_tx_queues(netdev, old_num_txqs));
+ 
+ err_tcs:
+-	mlx5e_netdev_set_tcs(netdev, old_num_txqs / old_ntc, old_ntc);
++	mlx5e_netdev_set_tcs(netdev, old_num_txqs / old_ntc, old_ntc, NULL);
+ err_out:
+ 	return err;
+ }
+@@ -2897,6 +2903,81 @@ static int mlx5e_setup_tc_mqprio_dcb(struct mlx5e_priv *priv,
+ 	return err;
+ }
+ 
++static int mlx5e_mqprio_channel_validate(struct mlx5e_priv *priv,
++					 struct tc_mqprio_qopt_offload *mqprio)
++{
++	struct net_device *netdev = priv->netdev;
++	int agg_count = 0;
++	int i;
++
++	if (mqprio->qopt.offset[0] != 0 || mqprio->qopt.num_tc < 1 ||
++	    mqprio->qopt.num_tc > MLX5E_MAX_NUM_MQPRIO_CH_TC)
++		return -EINVAL;
++
++	for (i = 0; i < mqprio->qopt.num_tc; i++) {
++		if (!mqprio->qopt.count[i]) {
++			netdev_err(netdev, "Zero size for queue-group (%d) is not supported\n", i);
++			return -EINVAL;
++		}
++		if (mqprio->min_rate[i]) {
++			netdev_err(netdev, "Min tx rate is not supported\n");
++			return -EINVAL;
++		}
++		if (mqprio->max_rate[i]) {
++			netdev_err(netdev, "Max tx rate is not supported\n");
++			return -EINVAL;
++		}
++
++		if (mqprio->qopt.offset[i] != agg_count) {
++			netdev_err(netdev, "Discontinuous queues config is not supported\n");
++			return -EINVAL;
++		}
++		agg_count += mqprio->qopt.count[i];
++	}
++
++	if (priv->channels.params.num_channels < agg_count) {
++		netdev_err(netdev, "Num of queues (%d) exceeds available (%d)\n",
++			   agg_count, priv->channels.params.num_channels);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int mlx5e_mqprio_channel_set_tcs_ctx(struct mlx5e_priv *priv, void *ctx)
++{
++	struct tc_mqprio_qopt_offload *mqprio = (struct tc_mqprio_qopt_offload *)ctx;
++	struct net_device *netdev = priv->netdev;
++	u8 num_tc;
++
++	if (priv->channels.params.mqprio.mode != TC_MQPRIO_MODE_CHANNEL)
++		return -EINVAL;
++
++	num_tc = priv->channels.params.mqprio.num_tc;
++	mlx5e_netdev_set_tcs(netdev, 0, num_tc, mqprio);
++
++	return 0;
++}
++
++static int mlx5e_setup_tc_mqprio_channel(struct mlx5e_priv *priv,
++					 struct tc_mqprio_qopt_offload *mqprio)
++{
++	struct mlx5e_params new_params;
++	int err;
++
++	err = mlx5e_mqprio_channel_validate(priv, mqprio);
++	if (err)
++		return err;
++
++	new_params = priv->channels.params;
++	new_params.mqprio.mode = TC_MQPRIO_MODE_CHANNEL;
++	new_params.mqprio.num_tc = mqprio->qopt.num_tc;
++	err = mlx5e_safe_switch_params(priv, &new_params,
++				       mlx5e_mqprio_channel_set_tcs_ctx, mqprio, true);
++
++	return err;
++}
++
+ static int mlx5e_setup_tc_mqprio(struct mlx5e_priv *priv,
+ 				 struct tc_mqprio_qopt_offload *mqprio)
+ {
+@@ -2909,6 +2990,8 @@ static int mlx5e_setup_tc_mqprio(struct mlx5e_priv *priv,
+ 	switch (mqprio->mode) {
+ 	case TC_MQPRIO_MODE_DCB:
+ 		return mlx5e_setup_tc_mqprio_dcb(priv, &mqprio->qopt);
++	case TC_MQPRIO_MODE_CHANNEL:
++		return mlx5e_setup_tc_mqprio_channel(priv, mqprio);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
