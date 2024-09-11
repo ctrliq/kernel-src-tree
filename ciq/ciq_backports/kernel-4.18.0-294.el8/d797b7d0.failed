@@ -1,0 +1,473 @@
+mm: memcg/slab: simplify memcg cache creation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit d797b7d05405c519f7b62ea69a75cea1883863b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d797b7d0.failed
+
+Because the number of non-root kmem_caches doesn't depend on the number of
+memory cgroups anymore and is generally not very big, there is no more
+need for a dedicated workqueue.
+
+Also, as there is no more need to pass any arguments to the
+memcg_create_kmem_cache() except the root kmem_cache, it's possible to
+just embed the work structure into the kmem_cache and avoid the dynamic
+allocation of the work structure.
+
+This will also simplify the synchronization: for each root kmem_cache
+there is only one work.  So there will be no more concurrent attempts to
+create a non-root kmem_cache for a root kmem_cache: the second and all
+following attempts to queue the work will fail.
+
+On the kmem_cache destruction path there is no more need to call the
+expensive flush_workqueue() and wait for all pending works to be finished.
+Instead, cancel_work_sync() can be used to cancel/wait for only one work.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/r/20200623174037.3951353-14-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d797b7d05405c519f7b62ea69a75cea1883863b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+#	mm/slab.h
+#	mm/slab_common.c
+diff --cc mm/memcontrol.c
+index 13b0a0f8cd33,c713867e496d..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -312,8 -399,7 +312,12 @@@ void memcg_put_cache_ids(void
+   */
+  DEFINE_STATIC_KEY_FALSE(memcg_kmem_enabled_key);
+  EXPORT_SYMBOL(memcg_kmem_enabled_key);
+++<<<<<<< HEAD
+ +
+ +struct workqueue_struct *memcg_kmem_cache_wq;
+++=======
++ #endif
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  
+  static int memcg_shrinker_map_size;
+  static DEFINE_MUTEX(memcg_shrinker_map_mutex);
+@@@ -2828,51 -2900,8 +2832,54 @@@ static void memcg_free_cache_id(int id
+  	ida_simple_remove(&memcg_cache_ida, id);
+  }
+  
+++<<<<<<< HEAD
+ +struct memcg_kmem_cache_create_work {
+ +	struct mem_cgroup *memcg;
+ +	struct kmem_cache *cachep;
+ +	struct work_struct work;
+ +};
+ +
+ +static void memcg_kmem_cache_create_func(struct work_struct *w)
+ +{
+ +	struct memcg_kmem_cache_create_work *cw =
+ +		container_of(w, struct memcg_kmem_cache_create_work, work);
+ +	struct mem_cgroup *memcg = cw->memcg;
+ +	struct kmem_cache *cachep = cw->cachep;
+ +
+ +	memcg_create_kmem_cache(memcg, cachep);
+ +
+ +	css_put(&memcg->css);
+ +	kfree(cw);
+ +}
+ +
+ +/*
+ + * Enqueue the creation of a per-memcg kmem_cache.
+ + */
+ +static void memcg_schedule_kmem_cache_create(struct mem_cgroup *memcg,
+ +					       struct kmem_cache *cachep)
+ +{
+ +	struct memcg_kmem_cache_create_work *cw;
+ +
+ +	if (!css_tryget_online(&memcg->css))
+ +		return;
+ +
+ +	cw = kmalloc(sizeof(*cw), GFP_NOWAIT | __GFP_NOWARN);
+ +	if (!cw) {
+ +		css_put(&memcg->css);
+ +		return;
+ +	}
+ +
+ +	cw->memcg = memcg;
+ +	cw->cachep = cachep;
+ +	INIT_WORK(&cw->work, memcg_kmem_cache_create_func);
+ +
+ +	queue_work(memcg_kmem_cache_wq, &cw->work);
+ +}
+ +
+++=======
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  /**
+ - * memcg_kmem_get_cache: select memcg or root cache for allocation
+ + * memcg_kmem_get_cache: select the correct per-memcg cache for allocation
+   * @cachep: the original global kmem cache
+   *
+   * Return the kmem_cache we're supposed to use for a slab allocation.
+@@@ -2889,75 -2912,15 +2896,81 @@@
+   */
+  struct kmem_cache *memcg_kmem_get_cache(struct kmem_cache *cachep)
+  {
+ +	struct mem_cgroup *memcg;
+  	struct kmem_cache *memcg_cachep;
+ +	struct memcg_cache_array *arr;
+ +	int kmemcg_id;
+ +
+++<<<<<<< HEAD
+ +	VM_BUG_ON(!is_root_cache(cachep));
+  
+ +	if (memcg_kmem_bypass())
+++=======
++ 	memcg_cachep = READ_ONCE(cachep->memcg_params.memcg_cache);
++ 	if (unlikely(!memcg_cachep)) {
++ 		queue_work(system_wq, &cachep->memcg_params.work);
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  		return cachep;
+ -	}
+  
+ -	return memcg_cachep;
+ +	rcu_read_lock();
+ +
+ +	if (unlikely(current->active_memcg))
+ +		memcg = current->active_memcg;
+ +	else
+ +		memcg = mem_cgroup_from_task(current);
+ +
+ +	if (!memcg || memcg == root_mem_cgroup)
+ +		goto out_unlock;
+ +
+ +	kmemcg_id = READ_ONCE(memcg->kmemcg_id);
+ +	if (kmemcg_id < 0)
+ +		goto out_unlock;
+ +
+ +	arr = rcu_dereference(cachep->memcg_params.memcg_caches);
+ +
+ +	/*
+ +	 * Make sure we will access the up-to-date value. The code updating
+ +	 * memcg_caches issues a write barrier to match the data dependency
+ +	 * barrier inside READ_ONCE() (see memcg_create_kmem_cache()).
+ +	 */
+ +	memcg_cachep = READ_ONCE(arr->entries[kmemcg_id]);
+ +
+ +	/*
+ +	 * If we are in a safe context (can wait, and not in interrupt
+ +	 * context), we could be be predictable and return right away.
+ +	 * This would guarantee that the allocation being performed
+ +	 * already belongs in the new cache.
+ +	 *
+ +	 * However, there are some clashes that can arrive from locking.
+ +	 * For instance, because we acquire the slab_mutex while doing
+ +	 * memcg_create_kmem_cache, this means no further allocation
+ +	 * could happen with the slab_mutex held. So it's better to
+ +	 * defer everything.
+ +	 *
+ +	 * If the memcg is dying or memcg_cache is about to be released,
+ +	 * don't bother creating new kmem_caches. Because memcg_cachep
+ +	 * is ZEROed as the fist step of kmem offlining, we don't need
+ +	 * percpu_ref_tryget_live() here. css_tryget_online() check in
+ +	 * memcg_schedule_kmem_cache_create() will prevent us from
+ +	 * creation of a new kmem_cache.
+ +	 */
+ +	if (unlikely(!memcg_cachep))
+ +		memcg_schedule_kmem_cache_create(memcg, cachep);
+ +	else if (percpu_ref_tryget(&memcg_cachep->memcg_params.refcnt))
+ +		cachep = memcg_cachep;
+ +out_unlock:
+ +	rcu_read_unlock();
+ +	return cachep;
+ +}
+ +
+ +/**
+ + * memcg_kmem_put_cache: drop reference taken by memcg_kmem_get_cache
+ + * @cachep: the cache returned by memcg_kmem_get_cache
+ + */
+ +void memcg_kmem_put_cache(struct kmem_cache *cachep)
+ +{
+ +	if (!is_root_cache(cachep))
+ +		percpu_ref_put(&cachep->memcg_params.refcnt);
+  }
+  
+  /**
+diff --cc mm/slab.h
+index 45ad57de9d88,fd9fcdfb3789..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -30,6 -30,30 +30,33 @@@ struct kmem_cache 
+  	struct list_head list;	/* List of all slab caches on the system */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #else /* !CONFIG_SLOB */
++ 
++ /*
++  * This is the main placeholder for memcg-related information in kmem caches.
++  * Both the root cache and the child cache will have it. Some fields are used
++  * in both cases, other are specific to root caches.
++  *
++  * @root_cache:	Common to root and child caches.  NULL for root, pointer to
++  *		the root cache for children.
++  *
++  * The following fields are specific to root caches.
++  *
++  * @memcg_cache: pointer to memcg kmem cache, used by all non-root memory
++  *		cgroups.
++  * @root_caches_node: list node for slab_root_caches list.
++  * @work: work struct used to create the non-root cache.
++  */
++ struct memcg_cache_params {
++ 	struct kmem_cache *root_cache;
++ 
++ 	struct kmem_cache *memcg_cache;
++ 	struct list_head __root_caches_node;
++ 	struct work_struct work;
++ };
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  #endif /* CONFIG_SLOB */
+  
+  #ifdef CONFIG_SLAB
+diff --cc mm/slab_common.c
+index dd4f84ee402c,b898698f6c8a..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -133,122 -133,34 +133,134 @@@ int __kmem_cache_alloc_bulk(struct kmem
+  #ifdef CONFIG_MEMCG_KMEM
+  
+  LIST_HEAD(slab_root_caches);
+ +static DEFINE_SPINLOCK(memcg_kmem_wq_lock);
+ +
+ +static void kmemcg_cache_shutdown(struct percpu_ref *percpu_ref);
+  
++ static void memcg_kmem_cache_create_func(struct work_struct *work)
++ {
++ 	struct kmem_cache *cachep = container_of(work, struct kmem_cache,
++ 						 memcg_params.work);
++ 	memcg_create_kmem_cache(cachep);
++ }
++ 
+  void slab_init_memcg_params(struct kmem_cache *s)
+  {
+  	s->memcg_params.root_cache = NULL;
+++<<<<<<< HEAD
+ +	RCU_INIT_POINTER(s->memcg_params.memcg_caches, NULL);
+ +	INIT_LIST_HEAD(&s->memcg_params.children);
+ +	s->memcg_params.dying = false;
+++=======
++ 	s->memcg_params.memcg_cache = NULL;
++ 	INIT_WORK(&s->memcg_params.work, memcg_kmem_cache_create_func);
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  }
+  
+ -static void init_memcg_params(struct kmem_cache *s,
+ -			      struct kmem_cache *root_cache)
+ +static int init_memcg_params(struct kmem_cache *s,
+ +			     struct kmem_cache *root_cache)
+  {
+ -	if (root_cache)
+ +	struct memcg_cache_array *arr;
+ +
+ +	if (root_cache) {
+ +		int ret = percpu_ref_init(&s->memcg_params.refcnt,
+ +					  kmemcg_cache_shutdown,
+ +					  0, GFP_KERNEL);
+ +		if (ret)
+ +			return ret;
+ +
+  		s->memcg_params.root_cache = root_cache;
+ -	else
+ -		slab_init_memcg_params(s);
+ +		INIT_LIST_HEAD(&s->memcg_params.children_node);
+ +		INIT_LIST_HEAD(&s->memcg_params.kmem_caches_node);
+ +		return 0;
+ +	}
+ +
+ +	slab_init_memcg_params(s);
+ +
+ +	if (!memcg_nr_cache_ids)
+ +		return 0;
+ +
+ +	arr = kvzalloc(sizeof(struct memcg_cache_array) +
+ +		       memcg_nr_cache_ids * sizeof(void *),
+ +		       GFP_KERNEL);
+ +	if (!arr)
+ +		return -ENOMEM;
+ +
+ +	RCU_INIT_POINTER(s->memcg_params.memcg_caches, arr);
+ +	return 0;
+ +}
+ +
+ +static void destroy_memcg_params(struct kmem_cache *s)
+ +{
+ +	if (is_root_cache(s)) {
+ +		kvfree(rcu_access_pointer(s->memcg_params.memcg_caches));
+ +	} else {
+ +		mem_cgroup_put(s->memcg_params.memcg);
+ +		WRITE_ONCE(s->memcg_params.memcg, NULL);
+ +		percpu_ref_exit(&s->memcg_params.refcnt);
+ +	}
+ +}
+ +
+ +static void free_memcg_params(struct rcu_head *rcu)
+ +{
+ +	struct memcg_cache_array *old;
+ +
+ +	old = container_of(rcu, struct memcg_cache_array, rcu);
+ +	kvfree(old);
+ +}
+ +
+ +static int update_memcg_params(struct kmem_cache *s, int new_array_size)
+ +{
+ +	struct memcg_cache_array *old, *new;
+ +
+ +	new = kvzalloc(sizeof(struct memcg_cache_array) +
+ +		       new_array_size * sizeof(void *), GFP_KERNEL);
+ +	if (!new)
+ +		return -ENOMEM;
+ +
+ +	old = rcu_dereference_protected(s->memcg_params.memcg_caches,
+ +					lockdep_is_held(&slab_mutex));
+ +	if (old)
+ +		memcpy(new->entries, old->entries,
+ +		       memcg_nr_cache_ids * sizeof(void *));
+ +
+ +	rcu_assign_pointer(s->memcg_params.memcg_caches, new);
+ +	if (old)
+ +		call_rcu(&old->rcu, free_memcg_params);
+ +	return 0;
+  }
+  
+ -void memcg_link_cache(struct kmem_cache *s)
+ +int memcg_update_all_caches(int num_memcgs)
+  {
+ -	if (is_root_cache(s))
+ +	struct kmem_cache *s;
+ +	int ret = 0;
+ +
+ +	mutex_lock(&slab_mutex);
+ +	list_for_each_entry(s, &slab_root_caches, root_caches_node) {
+ +		ret = update_memcg_params(s, num_memcgs);
+ +		/*
+ +		 * Instead of freeing the memory, we'll just leave the caches
+ +		 * up to this point in an updated state.
+ +		 */
+ +		if (ret)
+ +			break;
+ +	}
+ +	mutex_unlock(&slab_mutex);
+ +	return ret;
+ +}
+ +
+ +void memcg_link_cache(struct kmem_cache *s, struct mem_cgroup *memcg)
+ +{
+ +	if (is_root_cache(s)) {
+  		list_add(&s->root_caches_node, &slab_root_caches);
+ +	} else {
+ +		css_get(&memcg->css);
+ +		s->memcg_params.memcg = memcg;
+ +		list_add(&s->memcg_params.children_node,
+ +			 &s->memcg_params.root_cache->memcg_params.children);
+ +		list_add(&s->memcg_params.kmem_caches_node,
+ +			 &s->memcg_params.memcg->kmem_caches);
+ +	}
+  }
+  
+  static void memcg_unlink_cache(struct kmem_cache *s)
+@@@ -896,46 -594,19 +908,59 @@@ static int shutdown_memcg_caches(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void memcg_set_kmem_cache_dying(struct kmem_cache *s)
+ +{
+ +	spin_lock_irq(&memcg_kmem_wq_lock);
+ +	s->memcg_params.dying = true;
+ +	spin_unlock_irq(&memcg_kmem_wq_lock);
+ +}
+ +
+ +static void flush_memcg_workqueue(struct kmem_cache *s)
+ +{
+ +	/*
+ +	 * SLAB and SLUB deactivate the kmem_caches through call_rcu. Make
+ +	 * sure all registered rcu callbacks have been invoked.
+ +	 */
+ +	rcu_barrier();
+ +
+ +	/*
+ +	 * SLAB and SLUB create memcg kmem_caches through workqueue and SLUB
+ +	 * deactivates the memcg kmem_caches through workqueue. Make sure all
+ +	 * previous workitems on workqueue are processed.
+ +	 */
+ +	if (likely(memcg_kmem_cache_wq))
+ +		flush_workqueue(memcg_kmem_cache_wq);
+ +
+ +	/*
+ +	 * If we're racing with children kmem_cache deactivation, it might
+ +	 * take another rcu grace period to complete their destruction.
+ +	 * At this moment the corresponding percpu_ref_kill() call should be
+ +	 * done, but it might take another rcu grace period to complete
+ +	 * switching to the atomic mode.
+ +	 * Please, note that we check without grabbing the slab_mutex. It's safe
+ +	 * because at this moment the children list can't grow.
+ +	 */
+ +	if (!list_empty(&s->memcg_params.children))
+ +		rcu_barrier();
+++=======
++ static void cancel_memcg_cache_creation(struct kmem_cache *s)
++ {
++ 	cancel_work_sync(&s->memcg_params.work);
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  }
+  #else
+  static inline int shutdown_memcg_caches(struct kmem_cache *s)
+  {
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void cancel_memcg_cache_creation(struct kmem_cache *s)
++ {
++ }
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  #endif /* CONFIG_MEMCG_KMEM */
+  
+  void slab_kmem_cache_release(struct kmem_cache *s)
+@@@ -953,6 -623,8 +978,11 @@@ void kmem_cache_destroy(struct kmem_cac
+  	if (unlikely(!s))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	cancel_memcg_cache_creation(s);
++ 
+++>>>>>>> d797b7d05405 (mm: memcg/slab: simplify memcg cache creation)
+  	get_online_cpus();
+  	get_online_mems();
+  
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 72fba94a643f..000260cdeeb3 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1358,7 +1358,6 @@ int __memcg_kmem_charge_page(struct page *page, gfp_t gfp, int order);
+ void __memcg_kmem_uncharge_page(struct page *page, int order);
+ 
+ extern struct static_key_false memcg_kmem_enabled_key;
+-extern struct workqueue_struct *memcg_kmem_cache_wq;
+ 
+ extern int memcg_nr_cache_ids;
+ void memcg_get_cache_ids(void);
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/slab.h
+* Unmerged path mm/slab_common.c
