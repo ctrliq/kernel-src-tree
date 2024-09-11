@@ -23,6 +23,7 @@
 #include "cache.h"
 #include "map.h"
 #include "symbol.h"
+#include "srcline.h"
 #include "units.h"
 #include "debug.h"
 #include "annotate.h"
@@ -38,6 +39,7 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <bpf/libbpf.h>
+#include <subcmd/parse-options.h>
 
 /* FIXME: For the HE_COLORSET */
 #include "ui/browser.h"

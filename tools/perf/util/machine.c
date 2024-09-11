@@ -10,10 +10,12 @@
 #include "hist.h"
 #include "machine.h"
 #include "map.h"
+#include "srcline.h"
 #include "symbol.h"
 #include "sort.h"
 #include "strlist.h"
 #include "thread.h"
+#include "util.h"
 #include "vdso.h"
 #include <stdbool.h>
 #include <sys/types.h>
