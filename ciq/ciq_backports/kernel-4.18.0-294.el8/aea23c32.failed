@@ -1,0 +1,223 @@
+ipv6: Fix use of anycast address with loopback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Ahern <dsahern@kernel.org>
+commit aea23c323d89836bcdcee67e49def997ffca043b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/aea23c32.failed
+
+Thomas reported a regression with IPv6 and anycast using the following
+reproducer:
+
+    echo 1 >  /proc/sys/net/ipv6/conf/all/forwarding
+    ip -6 a add fc12::1/16 dev lo
+    sleep 2
+    echo "pinging lo"
+    ping6 -c 2 fc12::
+
+The conversion of addrconf_f6i_alloc to use ip6_route_info_create missed
+the use of fib6_is_reject which checks addresses added to the loopback
+interface and sets the REJECT flag as needed. Update fib6_is_reject for
+loopback checks to handle RTF_ANYCAST addresses.
+
+Fixes: c7a1ce397ada ("ipv6: Change addrconf_f6i_alloc to use ip6_route_info_create")
+	Reported-by: thomas.gambier@nexedi.com
+	Signed-off-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit aea23c323d89836bcdcee67e49def997ffca043b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/route.c
+diff --cc net/ipv6/route.c
+index 8d3f84864403,f3279810d765..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -2955,6 -3400,181 +2955,184 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool fib6_is_reject(u32 flags, struct net_device *dev, int addr_type)
++ {
++ 	if ((flags & RTF_REJECT) ||
++ 	    (dev && (dev->flags & IFF_LOOPBACK) &&
++ 	     !(addr_type & IPV6_ADDR_LOOPBACK) &&
++ 	     !(flags & (RTF_ANYCAST | RTF_LOCAL))))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ int fib6_nh_init(struct net *net, struct fib6_nh *fib6_nh,
++ 		 struct fib6_config *cfg, gfp_t gfp_flags,
++ 		 struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *dev = NULL;
++ 	struct inet6_dev *idev = NULL;
++ 	int addr_type;
++ 	int err;
++ 
++ 	fib6_nh->fib_nh_family = AF_INET6;
++ #ifdef CONFIG_IPV6_ROUTER_PREF
++ 	fib6_nh->last_probe = jiffies;
++ #endif
++ 	if (cfg->fc_is_fdb) {
++ 		fib6_nh->fib_nh_gw6 = cfg->fc_gateway;
++ 		fib6_nh->fib_nh_gw_family = AF_INET6;
++ 		return 0;
++ 	}
++ 
++ 	err = -ENODEV;
++ 	if (cfg->fc_ifindex) {
++ 		dev = dev_get_by_index(net, cfg->fc_ifindex);
++ 		if (!dev)
++ 			goto out;
++ 		idev = in6_dev_get(dev);
++ 		if (!idev)
++ 			goto out;
++ 	}
++ 
++ 	if (cfg->fc_flags & RTNH_F_ONLINK) {
++ 		if (!dev) {
++ 			NL_SET_ERR_MSG(extack,
++ 				       "Nexthop device required for onlink");
++ 			goto out;
++ 		}
++ 
++ 		if (!(dev->flags & IFF_UP)) {
++ 			NL_SET_ERR_MSG(extack, "Nexthop device is not up");
++ 			err = -ENETDOWN;
++ 			goto out;
++ 		}
++ 
++ 		fib6_nh->fib_nh_flags |= RTNH_F_ONLINK;
++ 	}
++ 
++ 	fib6_nh->fib_nh_weight = 1;
++ 
++ 	/* We cannot add true routes via loopback here,
++ 	 * they would result in kernel looping; promote them to reject routes
++ 	 */
++ 	addr_type = ipv6_addr_type(&cfg->fc_dst);
++ 	if (fib6_is_reject(cfg->fc_flags, dev, addr_type)) {
++ 		/* hold loopback dev/idev if we haven't done so. */
++ 		if (dev != net->loopback_dev) {
++ 			if (dev) {
++ 				dev_put(dev);
++ 				in6_dev_put(idev);
++ 			}
++ 			dev = net->loopback_dev;
++ 			dev_hold(dev);
++ 			idev = in6_dev_get(dev);
++ 			if (!idev) {
++ 				err = -ENODEV;
++ 				goto out;
++ 			}
++ 		}
++ 		goto pcpu_alloc;
++ 	}
++ 
++ 	if (cfg->fc_flags & RTF_GATEWAY) {
++ 		err = ip6_validate_gw(net, cfg, &dev, &idev, extack);
++ 		if (err)
++ 			goto out;
++ 
++ 		fib6_nh->fib_nh_gw6 = cfg->fc_gateway;
++ 		fib6_nh->fib_nh_gw_family = AF_INET6;
++ 	}
++ 
++ 	err = -ENODEV;
++ 	if (!dev)
++ 		goto out;
++ 
++ 	if (idev->cnf.disable_ipv6) {
++ 		NL_SET_ERR_MSG(extack, "IPv6 is disabled on nexthop device");
++ 		err = -EACCES;
++ 		goto out;
++ 	}
++ 
++ 	if (!(dev->flags & IFF_UP) && !cfg->fc_ignore_dev_down) {
++ 		NL_SET_ERR_MSG(extack, "Nexthop device is not up");
++ 		err = -ENETDOWN;
++ 		goto out;
++ 	}
++ 
++ 	if (!(cfg->fc_flags & (RTF_LOCAL | RTF_ANYCAST)) &&
++ 	    !netif_carrier_ok(dev))
++ 		fib6_nh->fib_nh_flags |= RTNH_F_LINKDOWN;
++ 
++ 	err = fib_nh_common_init(net, &fib6_nh->nh_common, cfg->fc_encap,
++ 				 cfg->fc_encap_type, cfg, gfp_flags, extack);
++ 	if (err)
++ 		goto out;
++ 
++ pcpu_alloc:
++ 	fib6_nh->rt6i_pcpu = alloc_percpu_gfp(struct rt6_info *, gfp_flags);
++ 	if (!fib6_nh->rt6i_pcpu) {
++ 		err = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	fib6_nh->fib_nh_dev = dev;
++ 	fib6_nh->fib_nh_oif = dev->ifindex;
++ 	err = 0;
++ out:
++ 	if (idev)
++ 		in6_dev_put(idev);
++ 
++ 	if (err) {
++ 		lwtstate_put(fib6_nh->fib_nh_lws);
++ 		fib6_nh->fib_nh_lws = NULL;
++ 		if (dev)
++ 			dev_put(dev);
++ 	}
++ 
++ 	return err;
++ }
++ 
++ void fib6_nh_release(struct fib6_nh *fib6_nh)
++ {
++ 	struct rt6_exception_bucket *bucket;
++ 
++ 	rcu_read_lock();
++ 
++ 	fib6_nh_flush_exceptions(fib6_nh, NULL);
++ 	bucket = fib6_nh_get_excptn_bucket(fib6_nh, NULL);
++ 	if (bucket) {
++ 		rcu_assign_pointer(fib6_nh->rt6i_exception_bucket, NULL);
++ 		kfree(bucket);
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	if (fib6_nh->rt6i_pcpu) {
++ 		int cpu;
++ 
++ 		for_each_possible_cpu(cpu) {
++ 			struct rt6_info **ppcpu_rt;
++ 			struct rt6_info *pcpu_rt;
++ 
++ 			ppcpu_rt = per_cpu_ptr(fib6_nh->rt6i_pcpu, cpu);
++ 			pcpu_rt = *ppcpu_rt;
++ 			if (pcpu_rt) {
++ 				dst_dev_put(&pcpu_rt->dst);
++ 				dst_release(&pcpu_rt->dst);
++ 				*ppcpu_rt = NULL;
++ 			}
++ 		}
++ 
++ 		free_percpu(fib6_nh->rt6i_pcpu);
++ 	}
++ 
++ 	fib_nh_common_release(&fib6_nh->nh_common);
++ }
++ 
+++>>>>>>> aea23c323d89 (ipv6: Fix use of anycast address with loopback)
+  static struct fib6_info *ip6_route_info_create(struct fib6_config *cfg,
+  					      gfp_t gfp_flags,
+  					      struct netlink_ext_ack *extack)
+* Unmerged path net/ipv6/route.c
