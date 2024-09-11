@@ -1,0 +1,318 @@
+bpf: Replace prog_raw_tp+btf_id with prog_tracing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit f1b9509c2fb0ef4db8d22dac9aef8e856a5d81f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f1b9509c.failed
+
+The bpf program type raw_tp together with 'expected_attach_type'
+was the most appropriate api to indicate BTF-enabled raw_tp programs.
+But during development it became apparent that 'expected_attach_type'
+cannot be used and new 'attach_btf_id' field had to be introduced.
+Which means that the information is duplicated in two fields where
+one of them is ignored.
+Clean it up by introducing new program type where both
+'expected_attach_type' and 'attach_btf_id' fields have
+specific meaning.
+In the future 'expected_attach_type' will be extended
+with other attach points that have similar semantics to raw_tp.
+This patch is replacing BTF-enabled BPF_PROG_TYPE_RAW_TRACEPOINT with
+prog_type = BPF_RPOG_TYPE_TRACING
+expected_attach_type = BPF_TRACE_RAW_TP
+attach_btf_id = btf_id of raw tracepoint inside the kernel
+Future patches will add
+expected_attach_type = BPF_TRACE_FENTRY or BPF_TRACE_FEXIT
+where programs have the same input context and the same helpers,
+but different attach points.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20191030223212.953010-2-ast@kernel.org
+(cherry picked from commit f1b9509c2fb0ef4db8d22dac9aef8e856a5d81f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+diff --cc include/uapi/linux/bpf.h
+index f26f93a554f1,a6bf19dabaab..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -175,7 -173,7 +175,11 @@@ enum bpf_prog_type 
+  	BPF_PROG_TYPE_CGROUP_SYSCTL,
+  	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
+  	BPF_PROG_TYPE_CGROUP_SOCKOPT,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_PROG_TYPE_TRACING,
+++>>>>>>> f1b9509c2fb0 (bpf: Replace prog_raw_tp+btf_id with prog_tracing)
+  };
+  
+  enum bpf_attach_type {
+@@@ -203,7 -200,7 +207,11 @@@
+  	BPF_CGROUP_UDP6_RECVMSG,
+  	BPF_CGROUP_GETSOCKOPT,
+  	BPF_CGROUP_SETSOCKOPT,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_TRACE_RAW_TP,
+++>>>>>>> f1b9509c2fb0 (bpf: Replace prog_raw_tp+btf_id with prog_tracing)
+  	__MAX_BPF_ATTACH_TYPE
+  };
+  
+diff --cc kernel/bpf/syscall.c
+index dd68cbc967e7,985d01ced196..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1636,11 -1566,12 +1636,11 @@@ static void bpf_prog_load_fixup_attach_
+  }
+  
+  static int
+ -bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ -			   enum bpf_attach_type expected_attach_type,
+ -			   u32 btf_id)
+ +bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
+ +				enum bpf_attach_type expected_attach_type)
+  {
+  	switch (prog_type) {
+- 	case BPF_PROG_TYPE_RAW_TRACEPOINT:
++ 	case BPF_PROG_TYPE_TRACING:
+  		if (btf_id > BTF_MAX_TYPE)
+  			return -EINVAL;
+  		break;
+@@@ -1890,19 -1821,50 +1890,53 @@@ static int bpf_raw_tracepoint_open(cons
+  	struct bpf_raw_tracepoint *raw_tp;
+  	struct bpf_raw_event_map *btp;
+  	struct bpf_prog *prog;
+ -	const char *tp_name;
+ -	char buf[128];
+ +	char tp_name[128];
+  	int tp_fd, err;
+  
+ -	if (CHECK_ATTR(BPF_RAW_TRACEPOINT_OPEN))
+ -		return -EINVAL;
+ +	rh_mark_used_feature("eBPF/rawtrace");
+  
+++<<<<<<< HEAD
+ +	if (strncpy_from_user(tp_name, u64_to_user_ptr(attr->raw_tracepoint.name),
+ +			      sizeof(tp_name) - 1) < 0)
+ +		return -EFAULT;
+ +	tp_name[sizeof(tp_name) - 1] = 0;
+++=======
++ 	prog = bpf_prog_get(attr->raw_tracepoint.prog_fd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT &&
++ 	    prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE) {
++ 		err = -EINVAL;
++ 		goto out_put_prog;
++ 	}
++ 
++ 	if (prog->type == BPF_PROG_TYPE_TRACING) {
++ 		if (attr->raw_tracepoint.name) {
++ 			/* raw_tp name should not be specified in raw_tp
++ 			 * programs that were verified via in-kernel BTF info
++ 			 */
++ 			err = -EINVAL;
++ 			goto out_put_prog;
++ 		}
++ 		/* raw_tp name is taken from type name instead */
++ 		tp_name = prog->aux->attach_func_name;
++ 	} else {
++ 		if (strncpy_from_user(buf,
++ 				      u64_to_user_ptr(attr->raw_tracepoint.name),
++ 				      sizeof(buf) - 1) < 0) {
++ 			err = -EFAULT;
++ 			goto out_put_prog;
++ 		}
++ 		buf[sizeof(buf) - 1] = 0;
++ 		tp_name = buf;
++ 	}
+++>>>>>>> f1b9509c2fb0 (bpf: Replace prog_raw_tp+btf_id with prog_tracing)
+  
+  	btp = bpf_get_raw_tracepoint(tp_name);
+ -	if (!btp) {
+ -		err = -ENOENT;
+ -		goto out_put_prog;
+ -	}
+ +	if (!btp)
+ +		return -ENOENT;
+  
+  	raw_tp = kzalloc(sizeof(*raw_tp), GFP_USER);
+  	if (!raw_tp) {
+diff --cc kernel/bpf/verifier.c
+index ba15160eab20,2f2374967b36..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -9382,6 -9377,66 +9382,69 @@@ static void print_verification_stats(st
+  		env->peak_states, env->longest_mark_read_walk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	u32 btf_id = prog->aux->attach_btf_id;
++ 	const char prefix[] = "btf_trace_";
++ 	const struct btf_type *t;
++ 	const char *tname;
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING)
++ 		return 0;
++ 
++ 	if (!btf_id) {
++ 		verbose(env, "Tracing programs must provide btf_id\n");
++ 		return -EINVAL;
++ 	}
++ 	t = btf_type_by_id(btf_vmlinux, btf_id);
++ 	if (!t) {
++ 		verbose(env, "attach_btf_id %u is invalid\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	tname = btf_name_by_offset(btf_vmlinux, t->name_off);
++ 	if (!tname) {
++ 		verbose(env, "attach_btf_id %u doesn't have a name\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 
++ 	switch (prog->expected_attach_type) {
++ 	case BPF_TRACE_RAW_TP:
++ 		if (!btf_type_is_typedef(t)) {
++ 			verbose(env, "attach_btf_id %u is not a typedef\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (strncmp(prefix, tname, sizeof(prefix) - 1)) {
++ 			verbose(env, "attach_btf_id %u points to wrong type name %s\n",
++ 				btf_id, tname);
++ 			return -EINVAL;
++ 		}
++ 		tname += sizeof(prefix) - 1;
++ 		t = btf_type_by_id(btf_vmlinux, t->type);
++ 		if (!btf_type_is_ptr(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf_vmlinux, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 
++ 		/* remember two read only pointers that are valid for
++ 		 * the life time of the kernel
++ 		 */
++ 		prog->aux->attach_func_name = tname;
++ 		prog->aux->attach_func_proto = t;
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> f1b9509c2fb0 (bpf: Replace prog_raw_tp+btf_id with prog_tracing)
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+  	      union bpf_attr __user *uattr)
+  {
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index d5d1b8d6bb62..37bc53329222 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -383,6 +383,11 @@ enum bpf_cgroup_storage_type {
+ 
+ #define MAX_BPF_CGROUP_STORAGE_TYPE __BPF_CGROUP_STORAGE_MAX
+ 
++/* The longest tracepoint has 12 args.
++ * See include/trace/bpf_probe.h
++ */
++#define MAX_BPF_FUNC_ARGS 12
++
+ struct bpf_prog_stats {
+ 	u64 cnt;
+ 	u64 nsecs;
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index eec5aeeeaf92..af1d1c516d19 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -26,6 +26,7 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_TRACEPOINT, tracepoint)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_PERF_EVENT, perf_event)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPOINT, raw_tracepoint)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE, raw_tracepoint_writable)
++BPF_PROG_TYPE(BPF_PROG_TYPE_TRACING, tracing)
+ #endif
+ #ifdef CONFIG_CGROUP_BPF
+ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_DEVICE, cg_dev)
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 5d5f0d4ffd27..890c042c7c69 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1055,13 +1055,39 @@ raw_tp_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 	}
+ }
+ 
++static const struct bpf_func_proto *
++tracing_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	switch (func_id) {
++#ifdef CONFIG_NET
++	case BPF_FUNC_skb_output:
++		return &bpf_skb_output_proto;
++#endif
++	default:
++		return raw_tp_prog_func_proto(func_id, prog);
++	}
++}
++
+ static bool raw_tp_prog_is_valid_access(int off, int size,
+ 					enum bpf_access_type type,
+ 					const struct bpf_prog *prog,
+ 					struct bpf_insn_access_aux *info)
+ {
+-	/* largest tracepoint in the kernel has 12 args */
+-	if (off < 0 || off >= sizeof(__u64) * 12)
++	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
++		return false;
++	if (type != BPF_READ)
++		return false;
++	if (off % size != 0)
++		return false;
++	return true;
++}
++
++static bool tracing_prog_is_valid_access(int off, int size,
++					 enum bpf_access_type type,
++					 const struct bpf_prog *prog,
++					 struct bpf_insn_access_aux *info)
++{
++	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
+ 		return false;
+ 	if (type != BPF_READ)
+ 		return false;
+@@ -1078,6 +1104,14 @@ const struct bpf_verifier_ops raw_tracepoint_verifier_ops = {
+ const struct bpf_prog_ops raw_tracepoint_prog_ops = {
+ };
+ 
++const struct bpf_verifier_ops tracing_verifier_ops = {
++	.get_func_proto  = tracing_prog_func_proto,
++	.is_valid_access = tracing_prog_is_valid_access,
++};
++
++const struct bpf_prog_ops tracing_prog_ops = {
++};
++
+ static bool raw_tp_writable_prog_is_valid_access(int off, int size,
+ 						 enum bpf_access_type type,
+ 						 const struct bpf_prog *prog,
