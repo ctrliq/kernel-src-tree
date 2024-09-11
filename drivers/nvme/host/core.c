@@ -4404,6 +4404,19 @@ void nvme_uninit_ctrl(struct nvme_ctrl *ctrl)
 }
 EXPORT_SYMBOL_GPL(nvme_uninit_ctrl);
 
+static void nvme_free_cels(struct nvme_ctrl *ctrl)
+{
+	struct nvme_effects_log	*cel;
+	unsigned long i;
+
+	xa_for_each (&ctrl->cels, i, cel) {
+		xa_erase(&ctrl->cels, i);
+		kfree(cel);
+	}
+
+	xa_destroy(&ctrl->cels);
+}
+
 static void nvme_free_ctrl(struct device *dev)
 {
 	struct nvme_ctrl *ctrl =
@@ -4413,8 +4426,7 @@ static void nvme_free_ctrl(struct device *dev)
 	if (!subsys || ctrl->instance != subsys->instance)
 		ida_simple_remove(&nvme_instance_ida, ctrl->instance);
 
-	xa_destroy(&ctrl->cels);
-
+	nvme_free_cels(ctrl);
 	nvme_mpath_uninit(ctrl);
 	__free_page(ctrl->discard_page);
 
