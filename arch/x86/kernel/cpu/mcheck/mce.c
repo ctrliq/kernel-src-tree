@@ -1177,9 +1177,6 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 
 	this_cpu_inc(mce_exception_count);
 
-	if (!cfg->banks)
-		goto out;
-
 	mce_gather_info(&m, regs);
 	m.tsc = rdtsc();
 
@@ -1319,7 +1316,7 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	if (worst > 0)
 		mce_report_event(regs);
 	mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
-out:
+
 	sync_core();
 
 	if (worst != MCE_AR_SEVERITY && !kill_it)
