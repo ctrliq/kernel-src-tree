@@ -1,0 +1,167 @@
+bpf, netns: Keep attached programs in bpf_prog_array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit 695c12147a40181fe9221d321c3f2de33c9574ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/695c1214.failed
+
+Prepare for having multi-prog attachments for new netns attach types by
+storing programs to run in a bpf_prog_array, which is well suited for
+iterating over programs and running them in sequence.
+
+After this change bpf(PROG_QUERY) may block to allocate memory in
+bpf_prog_array_copy_to_user() for collected program IDs. This forces a
+change in how we protect access to the attached program in the query
+callback. Because bpf_prog_array_copy_to_user() can sleep, we switch from
+an RCU read lock to holding a mutex that serializes updaters.
+
+Because we allow only one BPF flow_dissector program to be attached to
+netns at all times, the bpf_prog_array pointed by net->bpf.run_array is
+always either detached (null) or one element long.
+
+No functional changes intended.
+
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200625141357.910330-3-jakub@cloudflare.com
+(cherry picked from commit 695c12147a40181fe9221d321c3f2de33c9574ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/bpf.h
+#	kernel/bpf/net_namespace.c
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index 4f65dd7a24e0,142a8824f0a8..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -133,70 -86,20 +133,80 @@@ int skb_flow_dissector_bpf_prog_attach(
+  		for_each_net(ns) {
+  			if (ns == &init_net)
+  				continue;
+++<<<<<<< HEAD
+ +			if (rcu_access_pointer(ns->flow_dissector_prog)) {
+ +				ret = -EEXIST;
+ +				goto out;
+ +			}
+++=======
++ 			if (rcu_access_pointer(ns->bpf.run_array[type]))
++ 				return -EEXIST;
+++>>>>>>> 695c12147a40 (bpf, netns: Keep attached programs in bpf_prog_array)
+  		}
+  	} else {
+  		/* Make sure root flow dissector is not attached
+  		 * when attaching to the non-root namespace.
+  		 */
+++<<<<<<< HEAD
+ +		if (rcu_access_pointer(init_net.flow_dissector_prog)) {
+ +			ret = -EEXIST;
+ +			goto out;
+ +		}
+++=======
++ 		if (rcu_access_pointer(init_net.bpf.run_array[type]))
++ 			return -EEXIST;
+++>>>>>>> 695c12147a40 (bpf, netns: Keep attached programs in bpf_prog_array)
+ +	}
+ +
+ +	attached = rcu_dereference_protected(net->flow_dissector_prog,
+ +					     lockdep_is_held(&flow_dissector_mutex));
+ +	if (attached == prog) {
+ +		/* The same program cannot be attached twice */
+ +		ret = -EINVAL;
+ +		goto out;
+  	}
+ +	rcu_assign_pointer(net->flow_dissector_prog, prog);
+ +	if (attached)
+ +		bpf_prog_put(attached);
+ +out:
+ +	mutex_unlock(&flow_dissector_mutex);
+ +	return ret;
+ +}
+  
+ +static int flow_dissector_bpf_prog_detach(struct net *net)
+ +{
+ +	struct bpf_prog *attached;
+ +
+ +	mutex_lock(&flow_dissector_mutex);
+ +	attached = rcu_dereference_protected(net->flow_dissector_prog,
+ +					     lockdep_is_held(&flow_dissector_mutex));
+ +	if (!attached) {
+ +		mutex_unlock(&flow_dissector_mutex);
+ +		return -ENOENT;
+ +	}
+ +	RCU_INIT_POINTER(net->flow_dissector_prog, NULL);
+ +	bpf_prog_put(attached);
+ +	mutex_unlock(&flow_dissector_mutex);
+  	return 0;
+  }
+ -#endif /* CONFIG_BPF_SYSCALL */
+ +
+ +int skb_flow_dissector_bpf_prog_detach(const union bpf_attr *attr)
+ +{
+ +	return flow_dissector_bpf_prog_detach(current->nsproxy->net_ns);
+ +}
+ +
+ +static void __net_exit flow_dissector_pernet_pre_exit(struct net *net)
+ +{
+ +	/* We're not racing with attach/detach because there are no
+ +	 * references to netns left when pre_exit gets called.
+ +	 */
+ +	if (rcu_access_pointer(net->flow_dissector_prog))
+ +		flow_dissector_bpf_prog_detach(net);
+ +}
+ +
+ +static struct pernet_operations flow_dissector_pernet_ops __net_initdata = {
+ +	.pre_exit = flow_dissector_pernet_pre_exit,
+ +};
+  
+  /**
+   * __skb_flow_get_ports - extract the upper layer ports and return them
+@@@ -996,9 -894,10 +1006,8 @@@ bool __skb_flow_dissect(const struct ne
+  	struct flow_dissector_key_addrs *key_addrs;
+  	struct flow_dissector_key_tags *key_tags;
+  	struct flow_dissector_key_vlan *key_vlan;
+- 	struct bpf_prog *attached = NULL;
+  	enum flow_dissect_ret fdret;
+  	enum flow_dissector_key_id dissector_vlan = FLOW_DISSECTOR_KEY_MAX;
+ -	bool mpls_el = false;
+ -	int mpls_lse = 0;
+  	int num_hdrs = 0;
+  	u8 ip_proto = 0;
+  	bool ret;
+@@@ -1050,13 -949,15 +1059,25 @@@
+  
+  	WARN_ON_ONCE(!net);
+  	if (net) {
+++<<<<<<< HEAD
+ +		rcu_read_lock();
+ +		attached = rcu_dereference(init_net.flow_dissector_prog);
+ +
+ +		if (!attached)
+ +			attached = rcu_dereference(net->flow_dissector_prog);
+ +
+ +		if (attached) {
+++=======
++ 		enum netns_bpf_attach_type type = NETNS_BPF_FLOW_DISSECTOR;
++ 		struct bpf_prog_array *run_array;
++ 
++ 		rcu_read_lock();
++ 		run_array = rcu_dereference(init_net.bpf.run_array[type]);
++ 		if (!run_array)
++ 			run_array = rcu_dereference(net->bpf.run_array[type]);
++ 
++ 		if (run_array) {
+++>>>>>>> 695c12147a40 (bpf, netns: Keep attached programs in bpf_prog_array)
+  			struct bpf_flow_keys flow_keys;
+  			struct bpf_flow_dissector ctx = {
+  				.flow_keys = &flow_keys,
+* Unmerged path include/net/netns/bpf.h
+* Unmerged path kernel/bpf/net_namespace.c
+* Unmerged path include/net/netns/bpf.h
+* Unmerged path kernel/bpf/net_namespace.c
+* Unmerged path net/core/flow_dissector.c
