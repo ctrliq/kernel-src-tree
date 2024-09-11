@@ -1,0 +1,370 @@
+xsk: Move fill and completion rings to buffer pool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Magnus Karlsson <magnus.karlsson@intel.com>
+commit 7361f9c3d71955c624fdad5676c99fc88a8249e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/7361f9c3.failed
+
+Move the fill and completion rings from the umem to the buffer
+pool. This so that we in a later commit can share the umem
+between multiple HW queue ids. In this case, we need one fill and
+completion ring per queue id. As the buffer pool is per queue id
+and napi id this is a natural place for it and one umem
+struture can be shared between these buffer pools.
+
+	Signed-off-by: Magnus Karlsson <magnus.karlsson@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Björn Töpel <bjorn.topel@intel.com>
+Link: https://lore.kernel.org/bpf/1598603189-32145-5-git-send-email-magnus.karlsson@intel.com
+(cherry picked from commit 7361f9c3d71955c624fdad5676c99fc88a8249e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xdp_sock.h
+#	include/net/xsk_buff_pool.h
+#	net/xdp/xdp_umem.c
+#	net/xdp/xsk.c
+#	net/xdp/xsk_buff_pool.c
+diff --cc include/net/xdp_sock.h
+index c9d87cc40c11,2a284e137e9a..000000000000
+--- a/include/net/xdp_sock.h
++++ b/include/net/xdp_sock.h
+@@@ -18,9 -18,6 +18,12 @@@ struct xsk_queue
+  struct xdp_buff;
+  
+  struct xdp_umem {
+++<<<<<<< HEAD
+ +	struct xsk_queue *fq;
+ +	struct xsk_queue *cq;
+ +	struct xsk_buff_pool *pool;
+++=======
+++>>>>>>> 7361f9c3d719 (xsk: Move fill and completion rings to buffer pool)
+  	u64 size;
+  	u32 headroom;
+  	u32 chunk_size;
+diff --cc include/net/xsk_buff_pool.h
+index 6842990e2712,380d9aeedbea..000000000000
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@@ -48,12 -54,15 +49,19 @@@ struct xsk_buff_pool 
+  };
+  
+  /* AF_XDP core. */
+++<<<<<<< HEAD
+ +struct xsk_buff_pool *xp_create(struct page **pages, u32 nr_pages, u32 chunks,
+ +				u32 chunk_size, u32 headroom, u64 size,
+ +				bool unaligned);
+ +void xp_set_fq(struct xsk_buff_pool *pool, struct xsk_queue *fq);
+++=======
++ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
++ 						struct xdp_umem *umem);
++ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
++ 		  u16 queue_id, u16 flags);
+++>>>>>>> 7361f9c3d719 (xsk: Move fill and completion rings to buffer pool)
+  void xp_destroy(struct xsk_buff_pool *pool);
+  void xp_release(struct xdp_buff_xsk *xskb);
+ -void xp_get_pool(struct xsk_buff_pool *pool);
+ -void xp_put_pool(struct xsk_buff_pool *pool);
+ -void xp_clear_dev(struct xsk_buff_pool *pool);
+  
+  /* AF_XDP, and XDP core. */
+  void xp_free(struct xdp_buff_xsk *xskb);
+diff --cc net/xdp/xdp_umem.c
+index fb8d9af5bc04,7d86a637367f..000000000000
+--- a/net/xdp/xdp_umem.c
++++ b/net/xdp/xdp_umem.c
+@@@ -203,17 -85,6 +203,20 @@@ static void xdp_umem_release(struct xdp
+  
+  	ida_simple_remove(&umem_ida, umem->id);
+  
+++<<<<<<< HEAD
+ +	if (umem->fq) {
+ +		xskq_destroy(umem->fq);
+ +		umem->fq = NULL;
+ +	}
+ +
+ +	if (umem->cq) {
+ +		xskq_destroy(umem->cq);
+ +		umem->cq = NULL;
+ +	}
+ +
+ +	xp_destroy(umem->pool);
+++=======
+++>>>>>>> 7361f9c3d719 (xsk: Move fill and completion rings to buffer pool)
+  	xdp_umem_unpin_pages(umem);
+  
+  	xdp_umem_unaccount_pages(umem);
+diff --cc net/xdp/xsk.c
+index 10c97cce9e3d,dacd34034973..000000000000
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@@ -38,11 -36,13 +38,11 @@@ static DEFINE_PER_CPU(struct list_head
+  bool xsk_is_setup_for_bpf_map(struct xdp_sock *xs)
+  {
+  	return READ_ONCE(xs->rx) &&  READ_ONCE(xs->umem) &&
+- 		READ_ONCE(xs->umem->fq);
++ 		(xs->pool->fq || READ_ONCE(xs->fq_tmp));
+  }
+  
+ -void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
+ +void xsk_set_rx_need_wakeup(struct xdp_umem *umem)
+  {
+ -	struct xdp_umem *umem = pool->umem;
+ -
+  	if (umem->need_wakeup & XDP_WAKEUP_RX)
+  		return;
+  
+@@@ -251,13 -295,13 +251,17 @@@ void __xsk_map_flush(void
+  	}
+  }
+  
+ -void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
+ +void xsk_umem_complete_tx(struct xdp_umem *umem, u32 nb_entries)
+  {
+++<<<<<<< HEAD
+ +	xskq_prod_submit_n(umem->cq, nb_entries);
+++=======
++ 	xskq_prod_submit_n(pool->cq, nb_entries);
+++>>>>>>> 7361f9c3d719 (xsk: Move fill and completion rings to buffer pool)
+  }
+ -EXPORT_SYMBOL(xsk_tx_completed);
+ +EXPORT_SYMBOL(xsk_umem_complete_tx);
+  
+ -void xsk_tx_release(struct xsk_buff_pool *pool)
+ +void xsk_umem_consume_tx_done(struct xdp_umem *umem)
+  {
+  	struct xdp_sock *xs;
+  
+@@@ -798,11 -862,9 +815,14 @@@ static int xsk_setsockopt(struct socke
+  			return -EINVAL;
+  		}
+  
+- 		q = (optname == XDP_UMEM_FILL_RING) ? &xs->umem->fq :
+- 			&xs->umem->cq;
++ 		q = (optname == XDP_UMEM_FILL_RING) ? &xs->fq_tmp :
++ 			&xs->cq_tmp;
+  		err = xsk_init_queue(entries, q, true);
+++<<<<<<< HEAD
+ +		if (optname == XDP_UMEM_FILL_RING)
+ +			xp_set_fq(xs->umem->pool, *q);
+++=======
+++>>>>>>> 7361f9c3d719 (xsk: Move fill and completion rings to buffer pool)
+  		mutex_unlock(&xs->mutex);
+  		return err;
+  	}
+diff --cc net/xdp/xsk_buff_pool.c
+index a2044c245215,36287d2c5095..000000000000
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@@ -46,16 -52,24 +46,21 @@@ struct xsk_buff_pool *xp_create(struct 
+  	if (!pool->heads)
+  		goto out;
+  
+ -	pool->chunk_mask = ~((u64)umem->chunk_size - 1);
+ -	pool->addrs_cnt = umem->size;
+ -	pool->heads_cnt = umem->chunks;
+ -	pool->free_heads_cnt = umem->chunks;
+ -	pool->headroom = umem->headroom;
+ -	pool->chunk_size = umem->chunk_size;
+ -	pool->unaligned = umem->flags & XDP_UMEM_UNALIGNED_CHUNK_FLAG;
+ -	pool->frame_len = umem->chunk_size - umem->headroom -
+ -		XDP_PACKET_HEADROOM;
+ -	pool->umem = umem;
+ +	pool->chunk_mask = ~((u64)chunk_size - 1);
+ +	pool->addrs_cnt = size;
+ +	pool->heads_cnt = chunks;
+ +	pool->free_heads_cnt = chunks;
+ +	pool->headroom = headroom;
+ +	pool->chunk_size = chunk_size;
+ +	pool->unaligned = unaligned;
+ +	pool->frame_len = chunk_size - headroom - XDP_PACKET_HEADROOM;
+  	INIT_LIST_HEAD(&pool->free_list);
+ -	refcount_set(&pool->users, 1);
+  
++ 	pool->fq = xs->fq_tmp;
++ 	pool->cq = xs->cq_tmp;
++ 	xs->fq_tmp = NULL;
++ 	xs->cq_tmp = NULL;
++ 
+  	for (i = 0; i < pool->free_heads_cnt; i++) {
+  		xskb = &pool->heads[i];
+  		xskb->pool = pool;
+@@@ -86,6 -95,130 +86,133 @@@ void xp_set_rxq_info(struct xsk_buff_po
+  }
+  EXPORT_SYMBOL(xp_set_rxq_info);
+  
+++<<<<<<< HEAD
+++=======
++ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
++ 		  u16 queue_id, u16 flags)
++ {
++ 	struct xdp_umem *umem = pool->umem;
++ 	bool force_zc, force_copy;
++ 	struct netdev_bpf bpf;
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	force_zc = flags & XDP_ZEROCOPY;
++ 	force_copy = flags & XDP_COPY;
++ 
++ 	if (force_zc && force_copy)
++ 		return -EINVAL;
++ 
++ 	if (xsk_get_pool_from_qid(dev, queue_id))
++ 		return -EBUSY;
++ 
++ 	err = xsk_reg_pool_at_qid(dev, pool, queue_id);
++ 	if (err)
++ 		return err;
++ 
++ 	if (flags & XDP_USE_NEED_WAKEUP) {
++ 		umem->flags |= XDP_UMEM_USES_NEED_WAKEUP;
++ 		/* Tx needs to be explicitly woken up the first time.
++ 		 * Also for supporting drivers that do not implement this
++ 		 * feature. They will always have to call sendto().
++ 		 */
++ 		umem->need_wakeup = XDP_WAKEUP_TX;
++ 	}
++ 
++ 	if (force_copy)
++ 		/* For copy-mode, we are done. */
++ 		return 0;
++ 
++ 	if (!dev->netdev_ops->ndo_bpf || !dev->netdev_ops->ndo_xsk_wakeup) {
++ 		err = -EOPNOTSUPP;
++ 		goto err_unreg_pool;
++ 	}
++ 
++ 	bpf.command = XDP_SETUP_XSK_POOL;
++ 	bpf.xsk.pool = pool;
++ 	bpf.xsk.queue_id = queue_id;
++ 
++ 	err = dev->netdev_ops->ndo_bpf(dev, &bpf);
++ 	if (err)
++ 		goto err_unreg_pool;
++ 
++ 	umem->zc = true;
++ 	return 0;
++ 
++ err_unreg_pool:
++ 	if (!force_zc)
++ 		err = 0; /* fallback to copy mode */
++ 	if (err)
++ 		xsk_clear_pool_at_qid(dev, queue_id);
++ 	return err;
++ }
++ 
++ void xp_clear_dev(struct xsk_buff_pool *pool)
++ {
++ 	struct xdp_umem *umem = pool->umem;
++ 	struct netdev_bpf bpf;
++ 	int err;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (!umem->dev)
++ 		return;
++ 
++ 	if (umem->zc) {
++ 		bpf.command = XDP_SETUP_XSK_POOL;
++ 		bpf.xsk.pool = NULL;
++ 		bpf.xsk.queue_id = umem->queue_id;
++ 
++ 		err = umem->dev->netdev_ops->ndo_bpf(umem->dev, &bpf);
++ 
++ 		if (err)
++ 			WARN(1, "failed to disable umem!\n");
++ 	}
++ 
++ 	xsk_clear_pool_at_qid(umem->dev, umem->queue_id);
++ }
++ 
++ static void xp_release_deferred(struct work_struct *work)
++ {
++ 	struct xsk_buff_pool *pool = container_of(work, struct xsk_buff_pool,
++ 						  work);
++ 
++ 	rtnl_lock();
++ 	xp_clear_dev(pool);
++ 	rtnl_unlock();
++ 
++ 	if (pool->fq) {
++ 		xskq_destroy(pool->fq);
++ 		pool->fq = NULL;
++ 	}
++ 
++ 	if (pool->cq) {
++ 		xskq_destroy(pool->cq);
++ 		pool->cq = NULL;
++ 	}
++ 
++ 	xdp_put_umem(pool->umem);
++ 	xp_destroy(pool);
++ }
++ 
++ void xp_get_pool(struct xsk_buff_pool *pool)
++ {
++ 	refcount_inc(&pool->users);
++ }
++ 
++ void xp_put_pool(struct xsk_buff_pool *pool)
++ {
++ 	if (!pool)
++ 		return;
++ 
++ 	if (refcount_dec_and_test(&pool->users)) {
++ 		INIT_WORK(&pool->work, xp_release_deferred);
++ 		schedule_work(&pool->work);
++ 	}
++ }
++ 
+++>>>>>>> 7361f9c3d719 (xsk: Move fill and completion rings to buffer pool)
+  void xp_dma_unmap(struct xsk_buff_pool *pool, unsigned long attrs)
+  {
+  	dma_addr_t *dma;
+* Unmerged path include/net/xdp_sock.h
+* Unmerged path include/net/xsk_buff_pool.h
+* Unmerged path net/xdp/xdp_umem.c
+* Unmerged path net/xdp/xsk.c
+* Unmerged path net/xdp/xsk_buff_pool.c
+diff --git a/net/xdp/xsk_diag.c b/net/xdp/xsk_diag.c
+index 21e9c2d123ee..52675ea067bf 100644
+--- a/net/xdp/xsk_diag.c
++++ b/net/xdp/xsk_diag.c
+@@ -46,6 +46,7 @@ static int xsk_diag_put_rings_cfg(const struct xdp_sock *xs,
+ 
+ static int xsk_diag_put_umem(const struct xdp_sock *xs, struct sk_buff *nlskb)
+ {
++	struct xsk_buff_pool *pool = xs->pool;
+ 	struct xdp_umem *umem = xs->umem;
+ 	struct xdp_diag_umem du = {};
+ 	int err;
+@@ -67,10 +68,11 @@ static int xsk_diag_put_umem(const struct xdp_sock *xs, struct sk_buff *nlskb)
+ 
+ 	err = nla_put(nlskb, XDP_DIAG_UMEM, sizeof(du), &du);
+ 
+-	if (!err && umem->fq)
+-		err = xsk_diag_put_ring(umem->fq, XDP_DIAG_UMEM_FILL_RING, nlskb);
+-	if (!err && umem->cq) {
+-		err = xsk_diag_put_ring(umem->cq, XDP_DIAG_UMEM_COMPLETION_RING,
++	if (!err && pool->fq)
++		err = xsk_diag_put_ring(pool->fq,
++					XDP_DIAG_UMEM_FILL_RING, nlskb);
++	if (!err && pool->cq) {
++		err = xsk_diag_put_ring(pool->cq, XDP_DIAG_UMEM_COMPLETION_RING,
+ 					nlskb);
+ 	}
+ 	return err;
+@@ -83,7 +85,7 @@ static int xsk_diag_put_stats(const struct xdp_sock *xs, struct sk_buff *nlskb)
+ 	du.n_rx_dropped = xs->rx_dropped;
+ 	du.n_rx_invalid = xskq_nb_invalid_descs(xs->rx);
+ 	du.n_rx_full = xs->rx_queue_full;
+-	du.n_fill_ring_empty = xs->umem ? xskq_nb_queue_empty_descs(xs->umem->fq) : 0;
++	du.n_fill_ring_empty = xs->pool ? xskq_nb_queue_empty_descs(xs->pool->fq) : 0;
+ 	du.n_tx_invalid = xskq_nb_invalid_descs(xs->tx);
+ 	du.n_tx_ring_empty = xskq_nb_queue_empty_descs(xs->tx);
+ 	return nla_put(nlskb, XDP_DIAG_STATS, sizeof(du), &du);
