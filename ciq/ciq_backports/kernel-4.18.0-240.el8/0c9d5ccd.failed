@@ -1,0 +1,257 @@
+io-wq: add support for uncancellable work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 0c9d5ccd26a004f59333c06fbbb98f9cb1eed93d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0c9d5ccd.failed
+
+Not all work can be cancelled, some of it we may need to guarantee
+that it runs to completion. Allow the caller to set IO_WQ_WORK_NO_CANCEL
+on work that must not be cancelled. Note that the caller work function
+must also check for IO_WQ_WORK_NO_CANCEL on work that is marked
+IO_WQ_WORK_CANCEL.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 0c9d5ccd26a004f59333c06fbbb98f9cb1eed93d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io-wq.c
+#	fs/io-wq.h
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index eb3b77d5111e,fe227650efd6..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1950,184 -3453,57 +1950,192 @@@ static int __io_submit_sqe(struct io_ri
+  	return 0;
+  }
+  
+ -static void io_wq_submit_work(struct io_wq_work **workptr)
+ +static struct async_list *io_async_list_from_sqe(struct io_ring_ctx *ctx,
+ +						 const struct io_uring_sqe *sqe)
+ +{
+ +	switch (sqe->opcode) {
+ +	case IORING_OP_READV:
+ +	case IORING_OP_READ_FIXED:
+ +		return &ctx->pending_async[READ];
+ +	case IORING_OP_WRITEV:
+ +	case IORING_OP_WRITE_FIXED:
+ +		return &ctx->pending_async[WRITE];
+ +	default:
+ +		return NULL;
+ +	}
+ +}
+ +
+ +static inline bool io_sqe_needs_user(const struct io_uring_sqe *sqe)
+ +{
+ +	u8 opcode = READ_ONCE(sqe->opcode);
+ +
+ +	return !(opcode == IORING_OP_READ_FIXED ||
+ +		 opcode == IORING_OP_WRITE_FIXED);
+ +}
+ +
+ +static void io_sq_wq_submit_work(struct work_struct *work)
+  {
+ -	struct io_wq_work *work = *workptr;
+  	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
+ -	struct io_kiocb *nxt = NULL;
+ -	int ret = 0;
+ +	struct io_ring_ctx *ctx = req->ctx;
+ +	struct mm_struct *cur_mm = NULL;
+ +	struct async_list *async_list;
+ +	LIST_HEAD(req_list);
+ +	mm_segment_t old_fs;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	async_list = io_async_list_from_sqe(ctx, req->submit.sqe);
+ +restart:
+ +	do {
+ +		struct sqe_submit *s = &req->submit;
+ +		const struct io_uring_sqe *sqe = s->sqe;
+ +		unsigned int flags = req->flags;
+++=======
++ 	/* if NO_CANCEL is set, we must still run the work */
++ 	if ((work->flags & (IO_WQ_WORK_CANCEL|IO_WQ_WORK_NO_CANCEL)) ==
++ 				IO_WQ_WORK_CANCEL) {
++ 		ret = -ECANCELED;
++ 	}
+++>>>>>>> 0c9d5ccd26a0 (io-wq: add support for uncancellable work)
+  
+ -	if (!ret) {
+ -		req->has_user = (work->flags & IO_WQ_WORK_HAS_MM) != 0;
+ -		req->in_async = true;
+ -		do {
+ -			ret = io_issue_sqe(req, NULL, &nxt, false);
+ -			/*
+ -			 * We can get EAGAIN for polled IO even though we're
+ -			 * forcing a sync submission from here, since we can't
+ -			 * wait for request slots on the block side.
+ -			 */
+ -			if (ret != -EAGAIN)
+ -				break;
+ -			cond_resched();
+ -		} while (1);
+ -	}
+ +		/* Ensure we clear previously set non-block flag */
+ +		req->rw.ki_flags &= ~IOCB_NOWAIT;
+  
+ -	/* drop submission reference */
+ -	io_put_req(req);
+ +		ret = 0;
+ +		if (io_sqe_needs_user(sqe) && !cur_mm) {
+ +			if (!mmget_not_zero(ctx->sqo_mm)) {
+ +				ret = -EFAULT;
+ +			} else {
+ +				cur_mm = ctx->sqo_mm;
+ +				use_mm(cur_mm);
+ +				old_fs = get_fs();
+ +				set_fs(USER_DS);
+ +			}
+ +		}
+  
+ -	if (ret) {
+ -		req_set_fail_links(req);
+ -		io_cqring_add_event(req, ret);
+ +		if (!ret) {
+ +			s->has_user = cur_mm != NULL;
+ +			s->needs_lock = true;
+ +			do {
+ +				ret = __io_submit_sqe(ctx, req, s, false);
+ +				/*
+ +				 * We can get EAGAIN for polled IO even though
+ +				 * we're forcing a sync submission from here,
+ +				 * since we can't wait for request slots on the
+ +				 * block side.
+ +				 */
+ +				if (ret != -EAGAIN)
+ +					break;
+ +				cond_resched();
+ +			} while (1);
+ +		}
+ +
+ +		/* drop submission reference */
+  		io_put_req(req);
+ +
+ +		if (ret) {
+ +			io_cqring_add_event(ctx, sqe->user_data, ret);
+ +			io_put_req(req);
+ +		}
+ +
+ +		/* async context always use a copy of the sqe */
+ +		kfree(sqe);
+ +
+ +		/* req from defer and link list needn't decrease async cnt */
+ +		if (flags & (REQ_F_IO_DRAINED | REQ_F_LINK_DONE))
+ +			goto out;
+ +
+ +		if (!async_list)
+ +			break;
+ +		if (!list_empty(&req_list)) {
+ +			req = list_first_entry(&req_list, struct io_kiocb,
+ +						list);
+ +			list_del(&req->list);
+ +			continue;
+ +		}
+ +		if (list_empty(&async_list->list))
+ +			break;
+ +
+ +		req = NULL;
+ +		spin_lock(&async_list->lock);
+ +		if (list_empty(&async_list->list)) {
+ +			spin_unlock(&async_list->lock);
+ +			break;
+ +		}
+ +		list_splice_init(&async_list->list, &req_list);
+ +		spin_unlock(&async_list->lock);
+ +
+ +		req = list_first_entry(&req_list, struct io_kiocb, list);
+ +		list_del(&req->list);
+ +	} while (req);
+ +
+ +	/*
+ +	 * Rare case of racing with a submitter. If we find the count has
+ +	 * dropped to zero AND we have pending work items, then restart
+ +	 * the processing. This is a tiny race window.
+ +	 */
+ +	if (async_list) {
+ +		ret = atomic_dec_return(&async_list->cnt);
+ +		while (!ret && !list_empty(&async_list->list)) {
+ +			spin_lock(&async_list->lock);
+ +			atomic_inc(&async_list->cnt);
+ +			list_splice_init(&async_list->list, &req_list);
+ +			spin_unlock(&async_list->lock);
+ +
+ +			if (!list_empty(&req_list)) {
+ +				req = list_first_entry(&req_list,
+ +							struct io_kiocb, list);
+ +				list_del(&req->list);
+ +				goto restart;
+ +			}
+ +			ret = atomic_dec_return(&async_list->cnt);
+ +		}
+  	}
+  
+ -	/* if a dependent link is ready, pass it back */
+ -	if (!ret && nxt)
+ -		io_wq_assign_next(workptr, nxt);
+ +out:
+ +	if (cur_mm) {
+ +		set_fs(old_fs);
+ +		unuse_mm(cur_mm);
+ +		mmput(cur_mm);
+ +	}
+  }
+  
+ -static bool io_req_op_valid(int op)
+ +/*
+ + * See if we can piggy back onto previously submitted work, that is still
+ + * running. We currently only allow this if the new request is sequential
+ + * to the previous one we punted.
+ + */
+ +static bool io_add_to_prev_work(struct async_list *list, struct io_kiocb *req)
+  {
+ -	return op >= IORING_OP_NOP && op < IORING_OP_LAST;
+ +	bool ret;
+ +
+ +	if (!list)
+ +		return false;
+ +	if (!(req->flags & REQ_F_SEQ_PREV))
+ +		return false;
+ +	if (!atomic_read(&list->cnt))
+ +		return false;
+ +
+ +	ret = true;
+ +	spin_lock(&list->lock);
+ +	list_add_tail(&req->list, &list->list);
+ +	/*
+ +	 * Ensure we see a simultaneous modification from io_sq_wq_submit_work()
+ +	 */
+ +	smp_mb();
+ +	if (!atomic_read(&list->cnt)) {
+ +		list_del_init(&req->list);
+ +		ret = false;
+ +	}
+ +	spin_unlock(&list->lock);
+ +	return ret;
+  }
+  
+ -static int io_req_needs_file(struct io_kiocb *req, int fd)
+ +static bool io_op_needs_file(const struct io_uring_sqe *sqe)
+  {
+ -	switch (req->opcode) {
+ +	int op = READ_ONCE(sqe->opcode);
+ +
+ +	switch (op) {
+  	case IORING_OP_NOP:
+  	case IORING_OP_POLL_REMOVE:
+  	case IORING_OP_TIMEOUT:
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io_uring.c
