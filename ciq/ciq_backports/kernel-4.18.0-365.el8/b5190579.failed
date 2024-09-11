@@ -1,0 +1,69 @@
+fanotify: Make waits for fanotify events only killable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jan Kara <jack@suse.cz>
+commit b51905798195eeb427c873643b3ada0d7bd991a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/b5190579.failed
+
+Making waits for response to fanotify permission events interruptible
+can result in EINTR returns from open(2) or other syscalls when there's
+e.g. AV software that's monitoring the file. Orion reports that e.g.
+bash is complaining like:
+
+bash: /etc/bash_completion.d/itweb-settings.bash: Interrupted system call
+
+So for now convert the wait from interruptible to only killable one.
+That is mostly invisible to userspace. Sadly this breaks hibernation
+with fanotify permission events pending again but we have to put more
+thought into how to fix this without regressing userspace visible
+behavior.
+
+	Reported-by: Orion Poplawski <orion@nwra.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit b51905798195eeb427c873643b3ada0d7bd991a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+diff --cc fs/notify/fanotify/fanotify.c
+index 2a603513f12e,6b9c27548997..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -65,7 -92,29 +65,33 @@@ static int fanotify_get_response(struc
+  
+  	pr_debug("%s: group=%p event=%p\n", __func__, group, event);
+  
+++<<<<<<< HEAD
+ +	wait_event(group->fanotify_data.access_waitq, event->response);
+++=======
++ 	ret = wait_event_killable(group->fanotify_data.access_waitq,
++ 				  event->state == FAN_EVENT_ANSWERED);
++ 	/* Signal pending? */
++ 	if (ret < 0) {
++ 		spin_lock(&group->notification_lock);
++ 		/* Event reported to userspace and no answer yet? */
++ 		if (event->state == FAN_EVENT_REPORTED) {
++ 			/* Event will get freed once userspace answers to it */
++ 			event->state = FAN_EVENT_CANCELED;
++ 			spin_unlock(&group->notification_lock);
++ 			return ret;
++ 		}
++ 		/* Event not yet reported? Just remove it. */
++ 		if (event->state == FAN_EVENT_INIT)
++ 			fsnotify_remove_queued_event(group, &event->fae.fse);
++ 		/*
++ 		 * Event may be also answered in case signal delivery raced
++ 		 * with wakeup. In that case we have nothing to do besides
++ 		 * freeing the event and reporting error.
++ 		 */
++ 		spin_unlock(&group->notification_lock);
++ 		goto out;
++ 	}
+++>>>>>>> b51905798195 (fanotify: Make waits for fanotify events only killable)
+  
+  	/* userspace responded, convert to something usable */
+  	switch (event->response & ~FAN_AUDIT) {
+* Unmerged path fs/notify/fanotify/fanotify.c
