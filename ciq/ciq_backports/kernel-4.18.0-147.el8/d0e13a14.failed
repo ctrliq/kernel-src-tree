@@ -1,0 +1,100 @@
+flow_dissector: lookup netns by skb->sk if skb->dev is NULL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Willem de Bruijn <willemb@google.com>
+commit d0e13a1488ad30dc3c2c9347b931cb10f892e3a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d0e13a14.failed
+
+BPF flow dissectors are configured per network namespace.
+__skb_flow_dissect looks up the netns through dev_net(skb->dev).
+
+In some dissector paths skb->dev is NULL, such as for Unix sockets.
+In these cases fall back to looking up the netns by socket.
+
+Analyzing the codepaths leading to __skb_flow_dissect I did not find
+a case where both skb->dev and skb->sk are NULL. Warn and fall back to
+standard flow dissector if one is found.
+
+Fixes: d58e468b1112 ("flow_dissector: implements flow dissector BPF hook")
+	Reported-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit d0e13a1488ad30dc3c2c9347b931cb10f892e3a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index 9dda92c23ba9,738c7562e1e0..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -619,6 -714,7 +619,10 @@@ bool __skb_flow_dissect(const struct sk
+  	struct flow_dissector_key_vlan *key_vlan;
+  	enum flow_dissect_ret fdret;
+  	enum flow_dissector_key_id dissector_vlan = FLOW_DISSECTOR_KEY_MAX;
+++<<<<<<< HEAD
+++=======
++ 	struct bpf_prog *attached = NULL;
+++>>>>>>> d0e13a1488ad (flow_dissector: lookup netns by skb->sk if skb->dev is NULL)
+  	int num_hdrs = 0;
+  	u8 ip_proto = 0;
+  	bool ret;
+@@@ -658,6 -754,50 +662,53 @@@
+  					      FLOW_DISSECTOR_KEY_BASIC,
+  					      target_container);
+  
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_lock();
++ 	if (skb) {
++ 		if (skb->dev)
++ 			attached = rcu_dereference(dev_net(skb->dev)->flow_dissector_prog);
++ 		else if (skb->sk)
++ 			attached = rcu_dereference(sock_net(skb->sk)->flow_dissector_prog);
++ 		else
++ 			WARN_ON_ONCE(1);
++ 	}
++ 	if (attached) {
++ 		/* Note that even though the const qualifier is discarded
++ 		 * throughout the execution of the BPF program, all changes(the
++ 		 * control block) are reverted after the BPF program returns.
++ 		 * Therefore, __skb_flow_dissect does not alter the skb.
++ 		 */
++ 		struct bpf_flow_keys flow_keys = {};
++ 		struct bpf_skb_data_end cb_saved;
++ 		struct bpf_skb_data_end *cb;
++ 		u32 result;
++ 
++ 		cb = (struct bpf_skb_data_end *)skb->cb;
++ 
++ 		/* Save Control Block */
++ 		memcpy(&cb_saved, cb, sizeof(cb_saved));
++ 		memset(cb, 0, sizeof(cb_saved));
++ 
++ 		/* Pass parameters to the BPF program */
++ 		cb->qdisc_cb.flow_keys = &flow_keys;
++ 		flow_keys.nhoff = nhoff;
++ 
++ 		bpf_compute_data_pointers((struct sk_buff *)skb);
++ 		result = BPF_PROG_RUN(attached, skb);
++ 
++ 		/* Restore state */
++ 		memcpy(cb, &cb_saved, sizeof(cb_saved));
++ 
++ 		__skb_flow_bpf_to_target(&flow_keys, flow_dissector,
++ 					 target_container);
++ 		key_control->thoff = min_t(u16, key_control->thoff, skb->len);
++ 		rcu_read_unlock();
++ 		return result == BPF_OK;
++ 	}
++ 	rcu_read_unlock();
++ 
+++>>>>>>> d0e13a1488ad (flow_dissector: lookup netns by skb->sk if skb->dev is NULL)
+  	if (dissector_uses_key(flow_dissector,
+  			       FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+  		struct ethhdr *eth = eth_hdr(skb);
+* Unmerged path net/core/flow_dissector.c
