@@ -1,0 +1,107 @@
+IB/mlx5: Add support for drain SQ & RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit d0e84c0ad39826c38a9d6881fd8f9af476a5d9a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d0e84c0a.failed
+
+This patch follows the logic from ib_core but considers the internal
+device state upon executing the involved commands.
+
+Specifically,
+Upon internal error state modify QP to an error state can be assumed to
+be success as each in-progress WR going to be flushed in error in any
+case as expected by that modify command.
+
+In addition,
+As the drain should never fail the driver makes sure that post_send/recv
+will succeed even if the device is already in an internal error state.
+As such once the driver will supply the simulated/SW CQEs the CQE for
+the drain WR will be handled as well.
+
+In case of an internal error state the CQE for the drain WR may be
+completed as part of the main task that handled the error state or by
+the task that issued the drain WR.
+
+As the above depends on scheduling the code takes the relevant locks and
+actions to make sure that the completion handler for that WR will always
+be called after that the post_send/recv were issued but not in parallel
+to the other task that handles the error flow.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit d0e84c0ad39826c38a9d6881fd8f9af476a5d9a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index d5e714bb62f2,6034a670859f..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -4407,6 -4393,13 +4406,16 @@@ static int _mlx5_ib_post_send(struct ib
+  
+  	spin_lock_irqsave(&qp->sq.lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR && !drain) {
++ 		err = -EIO;
++ 		*bad_wr = wr;
++ 		nreq = 0;
++ 		goto out;
++ 	}
++ 
+++>>>>>>> d0e84c0ad398 (IB/mlx5: Add support for drain SQ & RQ)
+  	for (nreq = 0; wr; nreq++, wr = wr->next) {
+  		if (unlikely(wr->opcode >= ARRAY_SIZE(mlx5_ib_opcode))) {
+  			mlx5_ib_warn(dev, "\n");
+@@@ -4725,6 -4720,13 +4740,16 @@@ static int _mlx5_ib_post_recv(struct ib
+  
+  	spin_lock_irqsave(&qp->rq.lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (mdev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR && !drain) {
++ 		err = -EIO;
++ 		*bad_wr = wr;
++ 		nreq = 0;
++ 		goto out;
++ 	}
++ 
+++>>>>>>> d0e84c0ad398 (IB/mlx5: Add support for drain SQ & RQ)
+  	ind = qp->rq.head & (qp->rq.wqe_cnt - 1);
+  
+  	for (nreq = 0; wr; nreq++, wr = wr->next) {
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 2776fc59ca1f..912355eec4cc 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -5578,6 +5578,8 @@ int mlx5_ib_stage_caps_init(struct mlx5_ib_dev *dev)
+ 	dev->ib_dev.modify_qp		= mlx5_ib_modify_qp;
+ 	dev->ib_dev.query_qp		= mlx5_ib_query_qp;
+ 	dev->ib_dev.destroy_qp		= mlx5_ib_destroy_qp;
++	dev->ib_dev.drain_sq		= mlx5_ib_drain_sq;
++	dev->ib_dev.drain_rq		= mlx5_ib_drain_rq;
+ 	dev->ib_dev.post_send		= mlx5_ib_post_send;
+ 	dev->ib_dev.post_recv		= mlx5_ib_post_recv;
+ 	dev->ib_dev.create_cq		= mlx5_ib_create_cq;
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index c1425d80700e..17612fc35c94 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -1016,6 +1016,8 @@ int mlx5_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ int mlx5_ib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr, int qp_attr_mask,
+ 		     struct ib_qp_init_attr *qp_init_attr);
+ int mlx5_ib_destroy_qp(struct ib_qp *qp);
++void mlx5_ib_drain_sq(struct ib_qp *qp);
++void mlx5_ib_drain_rq(struct ib_qp *qp);
+ int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 		      struct ib_send_wr **bad_wr);
+ int mlx5_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
