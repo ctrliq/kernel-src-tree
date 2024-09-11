@@ -1,0 +1,285 @@
+mm/devm_memremap_pages: enable sub-section remap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 7cc7867fb06166ac113eda9cf20d3c15d95ff6f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7cc7867f.failed
+
+Teach devm_memremap_pages() about the new sub-section capabilities of
+arch_{add,remove}_memory().  Effectively, just replace all usage of
+align_start, align_end, and align_size with res->start, res->end, and
+resource_size(res).  The existing sanity check will still make sure that
+the two separate remap attempts do not collide within a sub-section (2MB
+on x86).
+
+Link: http://lkml.kernel.org/r/156092355542.979959.10060071713397030576.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Tested-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>	[ppc64]
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Toshi Kani <toshi.kani@hpe.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Logan Gunthorpe <logang@deltatee.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Jane Chu <jane.chu@oracle.com>
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Wei Yang <richardw.yang@linux.intel.com>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7cc7867fb06166ac113eda9cf20d3c15d95ff6f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/memremap.c
+diff --cc kernel/memremap.c
+index 0da1ed9ab5e5,6ee03a816d67..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -87,14 -54,8 +87,19 @@@ static void pgmap_radix_release(struct 
+  
+  static unsigned long pfn_first(struct dev_pagemap *pgmap)
+  {
+++<<<<<<< HEAD
+ +	const struct resource *res = &pgmap->res;
+ +	struct vmem_altmap *altmap = &pgmap->altmap;
+ +	unsigned long pfn;
+ +
+ +	pfn = res->start >> PAGE_SHIFT;
+ +	if (pgmap->altmap_valid)
+ +		pfn += vmem_altmap_offset(altmap);
+ +	return pfn;
+++=======
++ 	return PHYS_PFN(pgmap->res.start) +
++ 		vmem_altmap_offset(pgmap_altmap(pgmap));
+++>>>>>>> 7cc7867fb061 (mm/devm_memremap_pages: enable sub-section remap)
+  }
+  
+  static unsigned long pfn_end(struct dev_pagemap *pgmap)
+@@@ -122,32 -101,28 +127,38 @@@ static void devm_memremap_pages_release
+  	unsigned long pfn;
+  	int nid;
+  
+ -	dev_pagemap_kill(pgmap);
+ +	pgmap->kill(pgmap->ref);
+  	for_each_device_pfn(pfn, pgmap)
+  		put_page(pfn_to_page(pfn));
+ -	dev_pagemap_cleanup(pgmap);
+  
+  	/* pages are dead and unused, undo the arch mapping */
+- 	align_start = res->start & ~(SECTION_SIZE - 1);
+- 	align_size = ALIGN(res->start + resource_size(res), SECTION_SIZE)
+- 		- align_start;
+- 
+- 	nid = page_to_nid(pfn_to_page(align_start >> PAGE_SHIFT));
++ 	nid = page_to_nid(pfn_to_page(PHYS_PFN(res->start)));
+  
+  	mem_hotplug_begin();
+  	if (pgmap->type == MEMORY_DEVICE_PRIVATE) {
+- 		pfn = align_start >> PAGE_SHIFT;
++ 		pfn = PHYS_PFN(res->start);
+  		__remove_pages(page_zone(pfn_to_page(pfn)), pfn,
+- 				align_size >> PAGE_SHIFT, NULL);
++ 				 PHYS_PFN(resource_size(res)), NULL);
+  	} else {
+++<<<<<<< HEAD
+ +		arch_remove_memory(nid, align_start, align_size,
+ +				pgmap->altmap_valid ? &pgmap->altmap : NULL);
+ +		kasan_remove_zero_shadow(__va(align_start), align_size);
+ +	}
+ +	mem_hotplug_done();
+ +
+ +	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
+ +	pgmap_radix_release(res, -1);
+++=======
++ 		arch_remove_memory(nid, res->start, resource_size(res),
++ 				pgmap_altmap(pgmap));
++ 		kasan_remove_zero_shadow(__va(res->start), resource_size(res));
++ 	}
++ 	mem_hotplug_done();
++ 
++ 	untrack_pfn(NULL, PHYS_PFN(res->start), resource_size(res));
++ 	pgmap_array_delete(res);
+++>>>>>>> 7cc7867fb061 (mm/devm_memremap_pages: enable sub-section remap)
+  	dev_WARN_ONCE(dev, pgmap->altmap.alloc,
+  		      "%s: failed to free all reserved pages\n", __func__);
+  }
+@@@ -173,38 -157,85 +184,44 @@@
+   */
+  void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap)
+  {
+++<<<<<<< HEAD
+ +	resource_size_t align_start, align_size, align_end;
+ +	struct vmem_altmap *altmap = pgmap->altmap_valid ?
+ +			&pgmap->altmap : NULL;
+ +	struct resource *res = &pgmap->res;
+ +	struct dev_pagemap *conflict_pgmap;
+++=======
++ 	struct resource *res = &pgmap->res;
++ 	struct dev_pagemap *conflict_pgmap;
++ 	struct mhp_restrictions restrictions = {
++ 		/*
++ 		 * We do not want any optional features only our own memmap
++ 		 */
++ 		.altmap = pgmap_altmap(pgmap),
++ 	};
+++>>>>>>> 7cc7867fb061 (mm/devm_memremap_pages: enable sub-section remap)
+  	pgprot_t pgprot = PAGE_KERNEL;
+ +	unsigned long pgoff, order;
+  	int error, nid, is_ram;
+ -	bool need_devmap_managed = true;
+ -
+ -	switch (pgmap->type) {
+ -	case MEMORY_DEVICE_PRIVATE:
+ -		if (!IS_ENABLED(CONFIG_DEVICE_PRIVATE)) {
+ -			WARN(1, "Device private memory not supported\n");
+ -			return ERR_PTR(-EINVAL);
+ -		}
+ -		if (!pgmap->ops || !pgmap->ops->migrate_to_ram) {
+ -			WARN(1, "Missing migrate_to_ram method\n");
+ -			return ERR_PTR(-EINVAL);
+ -		}
+ -		break;
+ -	case MEMORY_DEVICE_FS_DAX:
+ -		if (!IS_ENABLED(CONFIG_ZONE_DEVICE) ||
+ -		    IS_ENABLED(CONFIG_FS_DAX_LIMITED)) {
+ -			WARN(1, "File system DAX not supported\n");
+ -			return ERR_PTR(-EINVAL);
+ -		}
+ -		break;
+ -	case MEMORY_DEVICE_DEVDAX:
+ -	case MEMORY_DEVICE_PCI_P2PDMA:
+ -		need_devmap_managed = false;
+ -		break;
+ -	default:
+ -		WARN(1, "Invalid pgmap type %d\n", pgmap->type);
+ -		break;
+ -	}
+ -
+ -	if (!pgmap->ref) {
+ -		if (pgmap->ops && (pgmap->ops->kill || pgmap->ops->cleanup))
+ -			return ERR_PTR(-EINVAL);
+  
+ -		init_completion(&pgmap->done);
+ -		error = percpu_ref_init(&pgmap->internal_ref,
+ -				dev_pagemap_percpu_release, 0, GFP_KERNEL);
+ -		if (error)
+ -			return ERR_PTR(error);
+ -		pgmap->ref = &pgmap->internal_ref;
+ -	} else {
+ -		if (!pgmap->ops || !pgmap->ops->kill || !pgmap->ops->cleanup) {
+ -			WARN(1, "Missing reference count teardown definition\n");
+ -			return ERR_PTR(-EINVAL);
+ -		}
+ -	}
+ -
+ -	if (need_devmap_managed) {
+ -		error = devmap_managed_enable_get(dev, pgmap);
+ -		if (error)
+ -			return ERR_PTR(error);
+ -	}
+ +	if (!pgmap->ref || !pgmap->kill)
+ +		return ERR_PTR(-EINVAL);
+  
+- 	align_start = res->start & ~(SECTION_SIZE - 1);
+- 	align_size = ALIGN(res->start + resource_size(res), SECTION_SIZE)
+- 		- align_start;
+- 	align_end = align_start + align_size - 1;
+- 
+- 	conflict_pgmap = get_dev_pagemap(PHYS_PFN(align_start), NULL);
++ 	conflict_pgmap = get_dev_pagemap(PHYS_PFN(res->start), NULL);
+  	if (conflict_pgmap) {
+  		dev_WARN(dev, "Conflicting mapping in same section\n");
+  		put_dev_pagemap(conflict_pgmap);
+ -		error = -ENOMEM;
+ -		goto err_array;
+ +		return ERR_PTR(-ENOMEM);
+  	}
+  
+- 	conflict_pgmap = get_dev_pagemap(PHYS_PFN(align_end), NULL);
++ 	conflict_pgmap = get_dev_pagemap(PHYS_PFN(res->end), NULL);
+  	if (conflict_pgmap) {
+  		dev_WARN(dev, "Conflicting mapping in same section\n");
+  		put_dev_pagemap(conflict_pgmap);
+ -		error = -ENOMEM;
+ -		goto err_array;
+ +		return ERR_PTR(-ENOMEM);
+  	}
+  
+- 	is_ram = region_intersects(align_start, align_size,
++ 	is_ram = region_intersects(res->start, resource_size(res),
+  		IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE);
+  
+  	if (is_ram != REGION_DISJOINT) {
+@@@ -254,25 -275,25 +271,40 @@@
+  	 * arch_add_memory().
+  	 */
+  	if (pgmap->type == MEMORY_DEVICE_PRIVATE) {
+++<<<<<<< HEAD
+ +		error = add_pages(nid, align_start >> PAGE_SHIFT,
+ +				align_size >> PAGE_SHIFT, NULL, false);
+++=======
++ 		error = add_pages(nid, PHYS_PFN(res->start),
++ 				PHYS_PFN(resource_size(res)), &restrictions);
+++>>>>>>> 7cc7867fb061 (mm/devm_memremap_pages: enable sub-section remap)
+  	} else {
+- 		error = kasan_add_zero_shadow(__va(align_start), align_size);
++ 		error = kasan_add_zero_shadow(__va(res->start), resource_size(res));
+  		if (error) {
+  			mem_hotplug_done();
+  			goto err_kasan;
+  		}
+  
+++<<<<<<< HEAD
+ +		error = arch_add_memory(nid, align_start, align_size, altmap,
+ +				false);
+++=======
++ 		error = arch_add_memory(nid, res->start, resource_size(res),
++ 					&restrictions);
+++>>>>>>> 7cc7867fb061 (mm/devm_memremap_pages: enable sub-section remap)
+  	}
+  
+  	if (!error) {
+  		struct zone *zone;
+  
+  		zone = &NODE_DATA(nid)->node_zones[ZONE_DEVICE];
+++<<<<<<< HEAD
+ +		move_pfn_range_to_zone(zone, align_start >> PAGE_SHIFT,
+ +				align_size >> PAGE_SHIFT, altmap);
+++=======
++ 		move_pfn_range_to_zone(zone, PHYS_PFN(res->start),
++ 				PHYS_PFN(resource_size(res)), restrictions.altmap);
+++>>>>>>> 7cc7867fb061 (mm/devm_memremap_pages: enable sub-section remap)
+  	}
+  
+  	mem_hotplug_done();
+@@@ -296,14 -317,14 +328,14 @@@
+  	return __va(res->start);
+  
+   err_add_memory:
+- 	kasan_remove_zero_shadow(__va(align_start), align_size);
++ 	kasan_remove_zero_shadow(__va(res->start), resource_size(res));
+   err_kasan:
+- 	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
++ 	untrack_pfn(NULL, PHYS_PFN(res->start), resource_size(res));
+   err_pfn_remap:
+ -	pgmap_array_delete(res);
+ - err_array:
+ -	dev_pagemap_kill(pgmap);
+ -	dev_pagemap_cleanup(pgmap);
+ + err_radix:
+ +	pgmap_radix_release(res, pgoff);
+ + err_pgmap:
+ +	pgmap->kill(pgmap->ref);
+  	return ERR_PTR(error);
+  }
+  EXPORT_SYMBOL_GPL(devm_memremap_pages);
+* Unmerged path kernel/memremap.c
