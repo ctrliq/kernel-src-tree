@@ -1,0 +1,344 @@
+ACPI: HMAT: refactor hmat_register_target_device to hmem_register_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit c01044cc819160323f3ca4acd44fca487c4432e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c01044cc.failed
+
+In preparation for exposing "Soft Reserved" memory ranges without an HMAT,
+move the hmem device registration to its own compilation unit and make the
+implementation generic.
+
+The generic implementation drops usage acpi_map_pxm_to_online_node() that
+was translating ACPI proximity domain values and instead relies on
+numa_map_to_online_node() to determine the numa node for the device.
+
+[joao.m.martins@oracle.com: CONFIG_DEV_DAX_HMEM_DEVICES should depend on CONFIG_DAX=y]
+  Link: https://lkml.kernel.org/r/8f34727f-ec2d-9395-cb18-969ec8a5d0d4@oracle.com
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Joao Martins <joao.m.martins@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Ben Skeggs <bskeggs@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brice Goglin <Brice.Goglin@inria.fr>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Daniel Vetter <daniel@ffwll.ch>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Dave Jiang <dave.jiang@intel.com>
+	Cc: David Airlie <airlied@linux.ie>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Jia He <justin.he@arm.com>
+	Cc: Joao Martins <joao.m.martins@oracle.com>
+	Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Paul Mackerras <paulus@ozlabs.org>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: Vishal Verma <vishal.l.verma@intel.com>
+	Cc: Wei Yang <richard.weiyang@linux.alibaba.com>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Ard Biesheuvel <ardb@kernel.org>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Hulk Robot <hulkci@huawei.com>
+	Cc: Jason Yan <yanaijie@huawei.com>
+	Cc: "Jérôme Glisse" <jglisse@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: kernel test robot <lkp@intel.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Stefano Stabellini <sstabellini@kernel.org>
+	Cc: Vivek Goyal <vgoyal@redhat.com>
+Link: https://lkml.kernel.org/r/159643096584.4062302.5035370788475153738.stgit@dwillia2-desk3.amr.corp.intel.com
+Link: https://lore.kernel.org/r/158318761484.2216124.2049322072599482736.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c01044cc819160323f3ca4acd44fca487c4432e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/numa/hmat.c
+#	drivers/dax/Kconfig
+#	drivers/dax/Makefile
+diff --cc drivers/acpi/numa/hmat.c
+index 6ea95b367a31,134bcb40b2af..000000000000
+--- a/drivers/acpi/numa/hmat.c
++++ b/drivers/acpi/numa/hmat.c
+@@@ -24,8 -24,15 +24,9 @@@
+  #include <linux/mutex.h>
+  #include <linux/node.h>
+  #include <linux/sysfs.h>
++ #include <linux/dax.h>
+  
+  static u8 hmat_revision;
+ -static int hmat_disable __initdata;
+ -
+ -void __init disable_hmat(void)
+ -{
+ -	hmat_disable = 1;
+ -}
+  
+  static LIST_HEAD(targets);
+  static LIST_HEAD(initiators);
+@@@ -678,72 -635,12 +679,75 @@@ static void hmat_register_target_cache(
+  		node_add_cache(mem_nid, &tcache->cache_attrs);
+  }
+  
+ -static void hmat_register_target_perf(struct memory_target *target)
+ +static void hmat_register_target_perf(struct memory_target *target, int access)
+  {
+  	unsigned mem_nid = pxm_to_node(target->memory_pxm);
+ -	node_set_perf_attrs(mem_nid, &target->hmem_attrs, 0);
+ +	node_set_perf_attrs(mem_nid, &target->hmem_attrs[access], access);
+ +}
+ +
+++<<<<<<< HEAD
+ +static void hmat_register_target_device(struct memory_target *target,
+ +		struct resource *r)
+ +{
+ +	/* define a clean / non-busy resource for the platform device */
+ +	struct resource res = {
+ +		.start = r->start,
+ +		.end = r->end,
+ +		.flags = IORESOURCE_MEM,
+ +	};
+ +	struct platform_device *pdev;
+ +	struct memregion_info info;
+ +	int rc, id;
+ +
+ +	rc = region_intersects(res.start, resource_size(&res), IORESOURCE_MEM,
+ +			IORES_DESC_SOFT_RESERVED);
+ +	if (rc != REGION_INTERSECTS)
+ +		return;
+ +
+ +	id = memregion_alloc(GFP_KERNEL);
+ +	if (id < 0) {
+ +		pr_err("memregion allocation failure for %pr\n", &res);
+ +		return;
+ +	}
+ +
+ +	pdev = platform_device_alloc("hmem", id);
+ +	if (!pdev) {
+ +		pr_err("hmem device allocation failure for %pr\n", &res);
+ +		goto out_pdev;
+ +	}
+ +
+ +	pdev->dev.numa_node = pxm_to_online_node(target->memory_pxm);
+ +	info = (struct memregion_info) {
+ +		.target_node = pxm_to_node(target->memory_pxm),
+ +	};
+ +	rc = platform_device_add_data(pdev, &info, sizeof(info));
+ +	if (rc < 0) {
+ +		pr_err("hmem memregion_info allocation failure for %pr\n", &res);
+ +		goto out_pdev;
+ +	}
+ +
+ +	rc = platform_device_add_resources(pdev, &res, 1);
+ +	if (rc < 0) {
+ +		pr_err("hmem resource allocation failure for %pr\n", &res);
+ +		goto out_resource;
+ +	}
+ +
+ +	rc = platform_device_add(pdev);
+ +	if (rc < 0) {
+ +		dev_err(&pdev->dev, "device add failed for %pr\n", &res);
+ +		goto out_resource;
+ +	}
+ +
+ +	return;
+ +
+ +out_resource:
+ +	put_device(&pdev->dev);
+ +out_pdev:
+ +	memregion_free(id);
+  }
+  
+++=======
+++>>>>>>> c01044cc8191 (ACPI: HMAT: refactor hmat_register_target_device to hmem_register_device)
+  static void hmat_register_target_devices(struct memory_target *target)
+  {
+  	struct resource *res;
+diff --cc drivers/dax/Kconfig
+index 7e75ad43a14a,a66dff78f298..000000000000
+--- a/drivers/dax/Kconfig
++++ b/drivers/dax/Kconfig
+@@@ -47,6 -48,27 +47,30 @@@ config DEV_DAX_HME
+  
+  	  Say M if unsure.
+  
+++<<<<<<< HEAD
+++=======
++ config DEV_DAX_HMEM_DEVICES
++ 	depends on DEV_DAX_HMEM && DAX=y
++ 	def_bool y
++ 
++ config DEV_DAX_KMEM
++ 	tristate "KMEM DAX: volatile-use of persistent memory"
++ 	default DEV_DAX
++ 	depends on DEV_DAX
++ 	depends on MEMORY_HOTPLUG # for add_memory() and friends
++ 	help
++ 	  Support access to persistent, or other performance
++ 	  differentiated memory as if it were System RAM. This allows
++ 	  easier use of persistent memory by unmodified applications, or
++ 	  adds core kernel memory services to heterogeneous memory types
++ 	  (HMEM) marked "reserved" by platform firmware.
++ 
++ 	  To use this feature, a DAX device must be unbound from the
++ 	  device_dax driver and bound to this kmem driver on each boot.
++ 
++ 	  Say N if unsure.
++ 
+++>>>>>>> c01044cc8191 (ACPI: HMAT: refactor hmat_register_target_device to hmem_register_device)
+  config DEV_DAX_PMEM_COMPAT
+  	tristate "PMEM DAX: support the deprecated /sys/class/dax interface"
+  	depends on m && DEV_DAX_PMEM=m
+diff --cc drivers/dax/Makefile
+index 8e7f0aafd289,9d4ba672d305..000000000000
+--- a/drivers/dax/Makefile
++++ b/drivers/dax/Makefile
+@@@ -1,7 -1,7 +1,11 @@@
+  # SPDX-License-Identifier: GPL-2.0
+  obj-$(CONFIG_DAX) += dax.o
+  obj-$(CONFIG_DEV_DAX) += device_dax.o
+++<<<<<<< HEAD
+ +obj-$(CONFIG_DEV_DAX_HMEM) += dax_hmem.o
+++=======
++ obj-$(CONFIG_DEV_DAX_KMEM) += kmem.o
+++>>>>>>> c01044cc8191 (ACPI: HMAT: refactor hmat_register_target_device to hmem_register_device)
+  
+  dax-y := super.o
+  dax-y += bus.o
+* Unmerged path drivers/acpi/numa/hmat.c
+* Unmerged path drivers/dax/Kconfig
+* Unmerged path drivers/dax/Makefile
+diff --git a/drivers/dax/hmem/Makefile b/drivers/dax/hmem/Makefile
+new file mode 100644
+index 000000000000..a9d353d0c9ed
+--- /dev/null
++++ b/drivers/dax/hmem/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_DEV_DAX_HMEM) += dax_hmem.o
++obj-$(CONFIG_DEV_DAX_HMEM_DEVICES) += device.o
++
++dax_hmem-y := hmem.o
+diff --git a/drivers/dax/hmem/device.c b/drivers/dax/hmem/device.c
+new file mode 100644
+index 000000000000..b9dd6b27745c
+--- /dev/null
++++ b/drivers/dax/hmem/device.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/platform_device.h>
++#include <linux/memregion.h>
++#include <linux/module.h>
++#include <linux/dax.h>
++#include <linux/mm.h>
++
++void hmem_register_device(int target_nid, struct resource *r)
++{
++	/* define a clean / non-busy resource for the platform device */
++	struct resource res = {
++		.start = r->start,
++		.end = r->end,
++		.flags = IORESOURCE_MEM,
++	};
++	struct platform_device *pdev;
++	struct memregion_info info;
++	int rc, id;
++
++	rc = region_intersects(res.start, resource_size(&res), IORESOURCE_MEM,
++			IORES_DESC_SOFT_RESERVED);
++	if (rc != REGION_INTERSECTS)
++		return;
++
++	id = memregion_alloc(GFP_KERNEL);
++	if (id < 0) {
++		pr_err("memregion allocation failure for %pr\n", &res);
++		return;
++	}
++
++	pdev = platform_device_alloc("hmem", id);
++	if (!pdev) {
++		pr_err("hmem device allocation failure for %pr\n", &res);
++		goto out_pdev;
++	}
++
++	pdev->dev.numa_node = numa_map_to_online_node(target_nid);
++	info = (struct memregion_info) {
++		.target_node = target_nid,
++	};
++	rc = platform_device_add_data(pdev, &info, sizeof(info));
++	if (rc < 0) {
++		pr_err("hmem memregion_info allocation failure for %pr\n", &res);
++		goto out_pdev;
++	}
++
++	rc = platform_device_add_resources(pdev, &res, 1);
++	if (rc < 0) {
++		pr_err("hmem resource allocation failure for %pr\n", &res);
++		goto out_resource;
++	}
++
++	rc = platform_device_add(pdev);
++	if (rc < 0) {
++		dev_err(&pdev->dev, "device add failed for %pr\n", &res);
++		goto out_resource;
++	}
++
++	return;
++
++out_resource:
++	put_device(&pdev->dev);
++out_pdev:
++	memregion_free(id);
++}
+diff --git a/drivers/dax/hmem.c b/drivers/dax/hmem/hmem.c
+similarity index 98%
+rename from drivers/dax/hmem.c
+rename to drivers/dax/hmem/hmem.c
+index fe7214daf62e..29ceb5795297 100644
+--- a/drivers/dax/hmem.c
++++ b/drivers/dax/hmem/hmem.c
+@@ -3,7 +3,7 @@
+ #include <linux/memregion.h>
+ #include <linux/module.h>
+ #include <linux/pfn_t.h>
+-#include "bus.h"
++#include "../bus.h"
+ 
+ static int dax_hmem_probe(struct platform_device *pdev)
+ {
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index 147cf220e0e6..dd978ab5e4e1 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -230,4 +230,12 @@ static inline bool dax_mapping(struct address_space *mapping)
+ 	return mapping->host && IS_DAX(mapping->host);
+ }
+ 
++#ifdef CONFIG_DEV_DAX_HMEM_DEVICES
++void hmem_register_device(int target_nid, struct resource *r);
++#else
++static inline void hmem_register_device(int target_nid, struct resource *r)
++{
++}
++#endif
++
+ #endif
