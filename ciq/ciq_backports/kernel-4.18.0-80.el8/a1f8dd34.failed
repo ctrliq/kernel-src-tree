@@ -1,0 +1,130 @@
+tipc: eliminate possible recursive locking detected by LOCKDEP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Ying Xue <ying.xue@windriver.com>
+commit a1f8dd34e64af689e95122921fb2ca83dedd4c4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/a1f8dd34.failed
+
+When booting kernel with LOCKDEP option, below warning info was found:
+
+WARNING: possible recursive locking detected
+4.19.0-rc7+ #14 Not tainted
+--------------------------------------------
+swapper/0/1 is trying to acquire lock:
+00000000dcfc0fc8 (&(&list->lock)->rlock#4){+...}, at: spin_lock_bh
+include/linux/spinlock.h:334 [inline]
+00000000dcfc0fc8 (&(&list->lock)->rlock#4){+...}, at:
+tipc_link_reset+0x125/0xdf0 net/tipc/link.c:850
+
+but task is already holding lock:
+00000000cbb9b036 (&(&list->lock)->rlock#4){+...}, at: spin_lock_bh
+include/linux/spinlock.h:334 [inline]
+00000000cbb9b036 (&(&list->lock)->rlock#4){+...}, at:
+tipc_link_reset+0xfa/0xdf0 net/tipc/link.c:849
+
+other info that might help us debug this:
+ Possible unsafe locking scenario:
+
+       CPU0
+       ----
+  lock(&(&list->lock)->rlock#4);
+  lock(&(&list->lock)->rlock#4);
+
+ *** DEADLOCK ***
+
+ May be due to missing lock nesting notation
+
+2 locks held by swapper/0/1:
+ #0: 00000000f7539d34 (pernet_ops_rwsem){+.+.}, at:
+register_pernet_subsys+0x19/0x40 net/core/net_namespace.c:1051
+ #1: 00000000cbb9b036 (&(&list->lock)->rlock#4){+...}, at:
+spin_lock_bh include/linux/spinlock.h:334 [inline]
+ #1: 00000000cbb9b036 (&(&list->lock)->rlock#4){+...}, at:
+tipc_link_reset+0xfa/0xdf0 net/tipc/link.c:849
+
+stack backtrace:
+CPU: 0 PID: 1 Comm: swapper/0 Not tainted 4.19.0-rc7+ #14
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1 04/01/2014
+Call Trace:
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0x1af/0x295 lib/dump_stack.c:113
+ print_deadlock_bug kernel/locking/lockdep.c:1759 [inline]
+ check_deadlock kernel/locking/lockdep.c:1803 [inline]
+ validate_chain kernel/locking/lockdep.c:2399 [inline]
+ __lock_acquire+0xf1e/0x3c60 kernel/locking/lockdep.c:3411
+ lock_acquire+0x1db/0x520 kernel/locking/lockdep.c:3900
+ __raw_spin_lock_bh include/linux/spinlock_api_smp.h:135 [inline]
+ _raw_spin_lock_bh+0x31/0x40 kernel/locking/spinlock.c:168
+ spin_lock_bh include/linux/spinlock.h:334 [inline]
+ tipc_link_reset+0x125/0xdf0 net/tipc/link.c:850
+ tipc_link_bc_create+0xb5/0x1f0 net/tipc/link.c:526
+ tipc_bcast_init+0x59b/0xab0 net/tipc/bcast.c:521
+ tipc_init_net+0x472/0x610 net/tipc/core.c:82
+ ops_init+0xf7/0x520 net/core/net_namespace.c:129
+ __register_pernet_operations net/core/net_namespace.c:940 [inline]
+ register_pernet_operations+0x453/0xac0 net/core/net_namespace.c:1011
+ register_pernet_subsys+0x28/0x40 net/core/net_namespace.c:1052
+ tipc_init+0x83/0x104 net/tipc/core.c:140
+ do_one_initcall+0x109/0x70a init/main.c:885
+ do_initcall_level init/main.c:953 [inline]
+ do_initcalls init/main.c:961 [inline]
+ do_basic_setup init/main.c:979 [inline]
+ kernel_init_freeable+0x4bd/0x57f init/main.c:1144
+ kernel_init+0x13/0x180 init/main.c:1063
+ ret_from_fork+0x3a/0x50 arch/x86/entry/entry_64.S:413
+
+The reason why the noise above was complained by LOCKDEP is because we
+nested to hold l->wakeupq.lock and l->inputq->lock in tipc_link_reset
+function. In fact it's unnecessary to move skb buffer from l->wakeupq
+queue to l->inputq queue while holding the two locks at the same time.
+Instead, we can move skb buffers in l->wakeupq queue to a temporary
+list first and then move the buffers of the temporary list to l->inputq
+queue, which is also safe for us.
+
+Fixes: 3f32d0be6c16 ("tipc: lock wakeup & inputq at tipc_link_reset()")
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: Ying Xue <ying.xue@windriver.com>
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a1f8dd34e64af689e95122921fb2ca83dedd4c4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+diff --cc net/tipc/link.c
+index cf4381b0ae2f,f6552e4f4b43..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -842,14 -845,21 +842,25 @@@ void link_prepare_wakeup(struct tipc_li
+  
+  void tipc_link_reset(struct tipc_link *l)
+  {
+++<<<<<<< HEAD
+ +	l->peer_session = ANY_SESSION;
+++=======
++ 	struct sk_buff_head list;
++ 
++ 	__skb_queue_head_init(&list);
++ 
++ 	l->in_session = false;
+++>>>>>>> a1f8dd34e64a (tipc: eliminate possible recursive locking detected by LOCKDEP)
+  	l->session++;
+  	l->mtu = l->advertised_mtu;
++ 
+  	spin_lock_bh(&l->wakeupq.lock);
++ 	skb_queue_splice_init(&l->wakeupq, &list);
++ 	spin_unlock_bh(&l->wakeupq.lock);
++ 
+  	spin_lock_bh(&l->inputq->lock);
+- 	skb_queue_splice_init(&l->wakeupq, l->inputq);
++ 	skb_queue_splice_init(&list, l->inputq);
+  	spin_unlock_bh(&l->inputq->lock);
+- 	spin_unlock_bh(&l->wakeupq.lock);
+  
+  	__skb_queue_purge(&l->transmq);
+  	__skb_queue_purge(&l->deferdq);
+* Unmerged path net/tipc/link.c
