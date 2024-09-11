@@ -1,0 +1,113 @@
+KVM: s390/mm: handle guest unpin events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Claudio Imbrenda <imbrenda@linux.ibm.com>
+commit 5322781008a9dce894146ef71a09f1770062389a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/53227810.failed
+
+The current code tries to first pin shared pages, if that fails (e.g.
+because the page is not shared) it will export them. For shared pages
+this means that we get a new intercept telling us that the guest is
+unsharing that page. We will unpin the page at that point in time,
+following the same rules as for making a page secure (i.e. waiting for
+writeback, no elevated page references, etc.)
+
+	Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+[borntraeger@de.ibm.com: patch merging, splitting, fixing]
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit 5322781008a9dce894146ef71a09f1770062389a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/intercept.c
+diff --cc arch/s390/kvm/intercept.c
+index 59d88312ecd0,f907715d9479..000000000000
+--- a/arch/s390/kvm/intercept.c
++++ b/arch/s390/kvm/intercept.c
+@@@ -451,8 -452,74 +452,79 @@@ static int handle_operexc(struct kvm_vc
+  	return kvm_s390_inject_program_int(vcpu, PGM_OPERATION);
+  }
+  
+++<<<<<<< HEAD
+ +static int handle_pv_notification(struct kvm_vcpu *vcpu)
+ +{
+++=======
++ static int handle_pv_spx(struct kvm_vcpu *vcpu)
++ {
++ 	u32 pref = *(u32 *)vcpu->arch.sie_block->sidad;
++ 
++ 	kvm_s390_set_prefix(vcpu, pref);
++ 	trace_kvm_s390_handle_prefix(vcpu, 1, pref);
++ 	return 0;
++ }
++ 
++ static int handle_pv_sclp(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
++ 
++ 	spin_lock(&fi->lock);
++ 	/*
++ 	 * 2 cases:
++ 	 * a: an sccb answering interrupt was already pending or in flight.
++ 	 *    As the sccb value is not known we can simply set some value to
++ 	 *    trigger delivery of a saved SCCB. UV will then use its saved
++ 	 *    copy of the SCCB value.
++ 	 * b: an error SCCB interrupt needs to be injected so we also inject
++ 	 *    a fake SCCB address. Firmware will use the proper one.
++ 	 * This makes sure, that both errors and real sccb returns will only
++ 	 * be delivered after a notification intercept (instruction has
++ 	 * finished) but not after others.
++ 	 */
++ 	fi->srv_signal.ext_params |= 0x43000;
++ 	set_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs);
++ 	clear_bit(IRQ_PEND_EXT_SERVICE, &fi->masked_irqs);
++ 	spin_unlock(&fi->lock);
++ 	return 0;
++ }
++ 
++ static int handle_pv_uvc(struct kvm_vcpu *vcpu)
++ {
++ 	struct uv_cb_share *guest_uvcb = (void *)vcpu->arch.sie_block->sidad;
++ 	struct uv_cb_cts uvcb = {
++ 		.header.cmd	= UVC_CMD_UNPIN_PAGE_SHARED,
++ 		.header.len	= sizeof(uvcb),
++ 		.guest_handle	= kvm_s390_pv_get_handle(vcpu->kvm),
++ 		.gaddr		= guest_uvcb->paddr,
++ 	};
++ 	int rc;
++ 
++ 	if (guest_uvcb->header.cmd != UVC_CMD_REMOVE_SHARED_ACCESS) {
++ 		WARN_ONCE(1, "Unexpected notification intercept for UVC 0x%x\n",
++ 			  guest_uvcb->header.cmd);
++ 		return 0;
++ 	}
++ 	rc = gmap_make_secure(vcpu->arch.gmap, uvcb.gaddr, &uvcb);
++ 	/*
++ 	 * If the unpin did not succeed, the guest will exit again for the UVC
++ 	 * and we will retry the unpin.
++ 	 */
++ 	if (rc == -EINVAL)
++ 		return 0;
++ 	return rc;
++ }
++ 
++ static int handle_pv_notification(struct kvm_vcpu *vcpu)
++ {
++ 	if (vcpu->arch.sie_block->ipa == 0xb210)
++ 		return handle_pv_spx(vcpu);
++ 	if (vcpu->arch.sie_block->ipa == 0xb220)
++ 		return handle_pv_sclp(vcpu);
++ 	if (vcpu->arch.sie_block->ipa == 0xb9a4)
++ 		return handle_pv_uvc(vcpu);
++ 
+++>>>>>>> 5322781008a9 (KVM: s390/mm: handle guest unpin events)
+  	return handle_instruction(vcpu);
+  }
+  
+* Unmerged path arch/s390/kvm/intercept.c
