@@ -1,0 +1,218 @@
+psi: introduce psi monitor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Suren Baghdasaryan <surenb@google.com>
+commit 0e94682b73bfa6c44c98af7a26771c9c08c055d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/0e94682b.failed
+
+Psi monitor aims to provide a low-latency short-term pressure detection
+mechanism configurable by users.  It allows users to monitor psi metrics
+growth and trigger events whenever a metric raises above user-defined
+threshold within user-defined time window.
+
+Time window and threshold are both expressed in usecs.  Multiple psi
+resources with different thresholds and window sizes can be monitored
+concurrently.
+
+Psi monitors activate when system enters stall state for the monitored
+psi metric and deactivate upon exit from the stall state.  While system
+is in the stall state psi signal growth is monitored at a rate of 10
+times per tracking window.  Min window size is 500ms, therefore the min
+monitoring interval is 50ms.  Max window size is 10s with monitoring
+interval of 1s.
+
+When activated psi monitor stays active for at least the duration of one
+tracking window to avoid repeated activations/deactivations when psi
+signal is bouncing.
+
+Notifications to the users are rate-limited to one per tracking window.
+
+Link: http://lkml.kernel.org/r/20190319235619.260832-8-surenb@google.com
+	Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Dennis Zhou <dennis@kernel.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0e94682b73bfa6c44c98af7a26771c9c08c055d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/accounting/psi.txt
+#	include/linux/psi.h
+#	include/linux/psi_types.h
+#	kernel/cgroup/cgroup.c
+#	kernel/sched/psi.c
+diff --cc kernel/cgroup/cgroup.c
+index 0344a4e6701f,1140357d46f4..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -3481,6 -3537,113 +3481,116 @@@ static int cpu_stat_show(struct seq_fil
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PSI
++ static int cgroup_io_pressure_show(struct seq_file *seq, void *v)
++ {
++ 	return psi_show(seq, &seq_css(seq)->cgroup->psi, PSI_IO);
++ }
++ static int cgroup_memory_pressure_show(struct seq_file *seq, void *v)
++ {
++ 	return psi_show(seq, &seq_css(seq)->cgroup->psi, PSI_MEM);
++ }
++ static int cgroup_cpu_pressure_show(struct seq_file *seq, void *v)
++ {
++ 	return psi_show(seq, &seq_css(seq)->cgroup->psi, PSI_CPU);
++ }
++ 
++ static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
++ 					  size_t nbytes, enum psi_res res)
++ {
++ 	struct psi_trigger *new;
++ 	struct cgroup *cgrp;
++ 
++ 	cgrp = cgroup_kn_lock_live(of->kn, false);
++ 	if (!cgrp)
++ 		return -ENODEV;
++ 
++ 	cgroup_get(cgrp);
++ 	cgroup_kn_unlock(of->kn);
++ 
++ 	new = psi_trigger_create(&cgrp->psi, buf, nbytes, res);
++ 	if (IS_ERR(new)) {
++ 		cgroup_put(cgrp);
++ 		return PTR_ERR(new);
++ 	}
++ 
++ 	psi_trigger_replace(&of->priv, new);
++ 
++ 	cgroup_put(cgrp);
++ 
++ 	return nbytes;
++ }
++ 
++ static ssize_t cgroup_io_pressure_write(struct kernfs_open_file *of,
++ 					  char *buf, size_t nbytes,
++ 					  loff_t off)
++ {
++ 	return cgroup_pressure_write(of, buf, nbytes, PSI_IO);
++ }
++ 
++ static ssize_t cgroup_memory_pressure_write(struct kernfs_open_file *of,
++ 					  char *buf, size_t nbytes,
++ 					  loff_t off)
++ {
++ 	return cgroup_pressure_write(of, buf, nbytes, PSI_MEM);
++ }
++ 
++ static ssize_t cgroup_cpu_pressure_write(struct kernfs_open_file *of,
++ 					  char *buf, size_t nbytes,
++ 					  loff_t off)
++ {
++ 	return cgroup_pressure_write(of, buf, nbytes, PSI_CPU);
++ }
++ 
++ static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,
++ 					  poll_table *pt)
++ {
++ 	return psi_trigger_poll(&of->priv, of->file, pt);
++ }
++ 
++ static void cgroup_pressure_release(struct kernfs_open_file *of)
++ {
++ 	psi_trigger_replace(&of->priv, NULL);
++ }
++ #endif /* CONFIG_PSI */
++ 
++ static int cgroup_freeze_show(struct seq_file *seq, void *v)
++ {
++ 	struct cgroup *cgrp = seq_css(seq)->cgroup;
++ 
++ 	seq_printf(seq, "%d\n", cgrp->freezer.freeze);
++ 
++ 	return 0;
++ }
++ 
++ static ssize_t cgroup_freeze_write(struct kernfs_open_file *of,
++ 				   char *buf, size_t nbytes, loff_t off)
++ {
++ 	struct cgroup *cgrp;
++ 	ssize_t ret;
++ 	int freeze;
++ 
++ 	ret = kstrtoint(strstrip(buf), 0, &freeze);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (freeze < 0 || freeze > 1)
++ 		return -ERANGE;
++ 
++ 	cgrp = cgroup_kn_lock_live(of->kn, false);
++ 	if (!cgrp)
++ 		return -ENOENT;
++ 
++ 	cgroup_freeze(cgrp, freeze);
++ 
++ 	cgroup_kn_unlock(of->kn);
++ 
++ 	return nbytes;
++ }
++ 
+++>>>>>>> 0e94682b73bf (psi: introduce psi monitor)
+  static int cgroup_file_open(struct kernfs_open_file *of)
+  {
+  	struct cftype *cft = of->kn->priv;
+@@@ -4629,6 -4798,32 +4739,35 @@@ static struct cftype cgroup_base_files[
+  		.flags = CFTYPE_NOT_ON_ROOT,
+  		.seq_show = cpu_stat_show,
+  	},
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PSI
++ 	{
++ 		.name = "io.pressure",
++ 		.flags = CFTYPE_NOT_ON_ROOT,
++ 		.seq_show = cgroup_io_pressure_show,
++ 		.write = cgroup_io_pressure_write,
++ 		.poll = cgroup_pressure_poll,
++ 		.release = cgroup_pressure_release,
++ 	},
++ 	{
++ 		.name = "memory.pressure",
++ 		.flags = CFTYPE_NOT_ON_ROOT,
++ 		.seq_show = cgroup_memory_pressure_show,
++ 		.write = cgroup_memory_pressure_write,
++ 		.poll = cgroup_pressure_poll,
++ 		.release = cgroup_pressure_release,
++ 	},
++ 	{
++ 		.name = "cpu.pressure",
++ 		.flags = CFTYPE_NOT_ON_ROOT,
++ 		.seq_show = cgroup_cpu_pressure_show,
++ 		.write = cgroup_cpu_pressure_write,
++ 		.poll = cgroup_pressure_poll,
++ 		.release = cgroup_pressure_release,
++ 	},
++ #endif /* CONFIG_PSI */
+++>>>>>>> 0e94682b73bf (psi: introduce psi monitor)
+  	{ }	/* terminate */
+  };
+  
+* Unmerged path Documentation/accounting/psi.txt
+* Unmerged path include/linux/psi.h
+* Unmerged path include/linux/psi_types.h
+* Unmerged path kernel/sched/psi.c
+* Unmerged path Documentation/accounting/psi.txt
+* Unmerged path include/linux/psi.h
+* Unmerged path include/linux/psi_types.h
+* Unmerged path kernel/cgroup/cgroup.c
+* Unmerged path kernel/sched/psi.c
