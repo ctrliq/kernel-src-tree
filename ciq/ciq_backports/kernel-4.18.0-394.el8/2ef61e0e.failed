@@ -1,0 +1,432 @@
+NFS: Remove the nfs4_label from the nfs4_getattr_res
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Anna Schumaker <Anna.Schumaker@Netapp.com>
+commit 2ef61e0eaa333e4e9c348c41a4b7abfb34b8736d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/2ef61e0e.failed
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 2ef61e0eaa333e4e9c348c41a4b7abfb34b8736d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4_fs.h
+#	fs/nfs/nfs4file.c
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4_fs.h
+index 18ae861a2567,ed5eaca6801e..000000000000
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@@ -315,7 -315,14 +315,18 @@@ extern int nfs4_set_rw_stateid(nfs4_sta
+  		const struct nfs_open_context *ctx,
+  		const struct nfs_lock_context *l_ctx,
+  		fmode_t fmode);
+- 
+++<<<<<<< HEAD
+++
+++=======
++ extern int nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
++ 			     struct nfs_fattr *fattr, struct inode *inode);
++ extern int update_open_stateid(struct nfs4_state *state,
++ 				const nfs4_stateid *open_stateid,
++ 				const nfs4_stateid *deleg_stateid,
++ 				fmode_t fmode);
++ extern int nfs4_proc_setlease(struct file *file, long arg,
++ 			      struct file_lock **lease, void **priv);
+++>>>>>>> 2ef61e0eaa33 (NFS: Remove the nfs4_label from the nfs4_getattr_res)
+  extern int nfs4_proc_get_lease_time(struct nfs_client *clp,
+  		struct nfs_fsinfo *fsinfo);
+  extern void nfs4_update_changeattr(struct inode *dir,
+diff --cc fs/nfs/nfs4file.c
+index 0438c84fad10,e2451f66024c..000000000000
+--- a/fs/nfs/nfs4file.c
++++ b/fs/nfs/nfs4file.c
+@@@ -270,8 -310,136 +270,133 @@@ out_unlock
+  out:
+  	return ret < 0 ? ret : count;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int read_name_gen = 1;
++ #define SSC_READ_NAME_BODY "ssc_read_%d"
++ 
++ static struct file *__nfs42_ssc_open(struct vfsmount *ss_mnt,
++ 		struct nfs_fh *src_fh, nfs4_stateid *stateid)
++ {
++ 	struct nfs_fattr *fattr = nfs_alloc_fattr();
++ 	struct file *filep, *res;
++ 	struct nfs_server *server;
++ 	struct inode *r_ino = NULL;
++ 	struct nfs_open_context *ctx;
++ 	struct nfs4_state_owner *sp;
++ 	char *read_name = NULL;
++ 	int len, status = 0;
++ 
++ 	server = NFS_SERVER(ss_mnt->mnt_root->d_inode);
++ 
++ 	if (!fattr)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	status = nfs4_proc_getattr(server, src_fh, fattr, NULL);
++ 	if (status < 0) {
++ 		res = ERR_PTR(status);
++ 		goto out;
++ 	}
++ 
++ 	res = ERR_PTR(-ENOMEM);
++ 	len = strlen(SSC_READ_NAME_BODY) + 16;
++ 	read_name = kzalloc(len, GFP_NOFS);
++ 	if (read_name == NULL)
++ 		goto out;
++ 	snprintf(read_name, len, SSC_READ_NAME_BODY, read_name_gen++);
++ 
++ 	r_ino = nfs_fhget(ss_mnt->mnt_root->d_inode->i_sb, src_fh, fattr,
++ 			NULL);
++ 	if (IS_ERR(r_ino)) {
++ 		res = ERR_CAST(r_ino);
++ 		goto out_free_name;
++ 	}
++ 
++ 	filep = alloc_file_pseudo(r_ino, ss_mnt, read_name, O_RDONLY,
++ 				     r_ino->i_fop);
++ 	if (IS_ERR(filep)) {
++ 		res = ERR_CAST(filep);
++ 		goto out_free_name;
++ 	}
++ 
++ 	ctx = alloc_nfs_open_context(filep->f_path.dentry, filep->f_mode,
++ 					filep);
++ 	if (IS_ERR(ctx)) {
++ 		res = ERR_CAST(ctx);
++ 		goto out_filep;
++ 	}
++ 
++ 	res = ERR_PTR(-EINVAL);
++ 	sp = nfs4_get_state_owner(server, ctx->cred, GFP_KERNEL);
++ 	if (sp == NULL)
++ 		goto out_ctx;
++ 
++ 	ctx->state = nfs4_get_open_state(r_ino, sp);
++ 	if (ctx->state == NULL)
++ 		goto out_stateowner;
++ 
++ 	set_bit(NFS_SRV_SSC_COPY_STATE, &ctx->state->flags);
++ 	memcpy(&ctx->state->open_stateid.other, &stateid->other,
++ 	       NFS4_STATEID_OTHER_SIZE);
++ 	update_open_stateid(ctx->state, stateid, NULL, filep->f_mode);
++ 	set_bit(NFS_OPEN_STATE, &ctx->state->flags);
++ 
++ 	nfs_file_set_open_context(filep, ctx);
++ 	put_nfs_open_context(ctx);
++ 
++ 	file_ra_state_init(&filep->f_ra, filep->f_mapping->host->i_mapping);
++ 	res = filep;
++ out_free_name:
++ 	kfree(read_name);
++ out:
++ 	nfs_free_fattr(fattr);
++ 	return res;
++ out_stateowner:
++ 	nfs4_put_state_owner(sp);
++ out_ctx:
++ 	put_nfs_open_context(ctx);
++ out_filep:
++ 	fput(filep);
++ 	goto out_free_name;
++ }
++ 
++ static void __nfs42_ssc_close(struct file *filep)
++ {
++ 	struct nfs_open_context *ctx = nfs_file_open_context(filep);
++ 
++ 	ctx->state->flags = 0;
++ }
++ 
++ static const struct nfs4_ssc_client_ops nfs4_ssc_clnt_ops_tbl = {
++ 	.sco_open = __nfs42_ssc_open,
++ 	.sco_close = __nfs42_ssc_close,
++ };
++ 
++ /**
++  * nfs42_ssc_register_ops - Wrapper to register NFS_V4 ops in nfs_common
++  *
++  * Return values:
++  *   None
++  */
++ void nfs42_ssc_register_ops(void)
++ {
++ 	nfs42_ssc_register(&nfs4_ssc_clnt_ops_tbl);
++ }
++ 
++ /**
++  * nfs42_ssc_unregister_ops - wrapper to un-register NFS_V4 ops in nfs_common
++  *
++  * Return values:
++  *   None.
++  */
++ void nfs42_ssc_unregister_ops(void)
++ {
++ 	nfs42_ssc_unregister(&nfs4_ssc_clnt_ops_tbl);
++ }
+++>>>>>>> 2ef61e0eaa33 (NFS: Remove the nfs4_label from the nfs4_getattr_res)
+  #endif /* CONFIG_NFS_V4_2 */
+  
+ -static int nfs4_setlease(struct file *file, long arg, struct file_lock **lease,
+ -			 void **priv)
+ -{
+ -	return nfs4_proc_setlease(file, arg, lease, priv);
+ -}
+ -
+  const struct file_operations nfs4_file_operations = {
+  	.read_iter	= nfs_file_read,
+  	.write_iter	= nfs_file_write,
+diff --cc fs/nfs/nfs4proc.c
+index 3178b26fbb36,f0262397faec..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -93,8 -93,8 +93,13 @@@ struct nfs4_opendata
+  static int _nfs4_recover_proc_open(struct nfs4_opendata *data);
+  static int nfs4_do_fsinfo(struct nfs_server *, struct nfs_fh *, struct nfs_fsinfo *);
+  static void nfs_fixup_referral_attributes(struct nfs_fattr *fattr);
+++<<<<<<< HEAD
+ +static int nfs4_proc_getattr(struct nfs_server *, struct nfs_fh *, struct nfs_fattr *, struct nfs4_label *label, struct inode *inode);
+ +static int _nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle, struct nfs_fattr *fattr, struct nfs4_label *label, struct inode *inode);
+++=======
++ static int _nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
++ 			      struct nfs_fattr *fattr, struct inode *inode);
+++>>>>>>> 2ef61e0eaa33 (NFS: Remove the nfs4_label from the nfs4_getattr_res)
+  static int nfs4_do_setattr(struct inode *inode, const struct cred *cred,
+  			    struct nfs_fattr *fattr, struct iattr *sattr,
+  			    struct nfs_open_context *ctx, struct nfs4_label *ilabel,
+@@@ -4166,9 -4192,8 +4167,14 @@@ static int _nfs4_proc_getattr(struct nf
+  			&args.seq_args, &res.seq_res, task_flags);
+  }
+  
+++<<<<<<< HEAD
+ +static int nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+ +				struct nfs_fattr *fattr, struct nfs4_label *label,
+ +				struct inode *inode)
+++=======
++ int nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
++ 				struct nfs_fattr *fattr, struct inode *inode)
+++>>>>>>> 2ef61e0eaa33 (NFS: Remove the nfs4_label from the nfs4_getattr_res)
+  {
+  	struct nfs4_exception exception = {
+  		.interruptible = true,
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 6d66be970483..f6a7a41a74db 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -1036,7 +1036,7 @@ struct nfs_server *nfs_create_server(struct fs_context *fc)
+ 
+ 	if (!(fattr->valid & NFS_ATTR_FATTR)) {
+ 		error = ctx->nfs_mod->rpc_ops->getattr(server, ctx->mntfh,
+-						       fattr, NULL, NULL);
++						       fattr, NULL);
+ 		if (error < 0) {
+ 			dprintk("nfs_create_server: getattr error = %d\n", -error);
+ 			goto error;
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 28a069166836..272eae82c6c4 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -2057,7 +2057,7 @@ nfs_add_or_obtain(struct dentry *dentry, struct nfs_fh *fhandle,
+ 	if (!(fattr->valid & NFS_ATTR_FATTR)) {
+ 		struct nfs_server *server = NFS_SB(dentry->d_sb);
+ 		error = server->nfs_client->rpc_ops->getattr(server, fhandle,
+-				fattr, NULL, NULL);
++				fattr, NULL);
+ 		if (error < 0)
+ 			goto out_error;
+ 	}
+diff --git a/fs/nfs/export.c b/fs/nfs/export.c
+index dd80488b5a89..706a49bd8807 100644
+--- a/fs/nfs/export.c
++++ b/fs/nfs/export.c
+@@ -64,7 +64,6 @@ static struct dentry *
+ nfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
+ 		 int fh_len, int fh_type)
+ {
+-	struct nfs4_label *label = NULL;
+ 	struct nfs_fattr *fattr = NULL;
+ 	struct nfs_fh *server_fh = nfs_exp_embedfh(fid->raw);
+ 	size_t fh_size = offsetof(struct nfs_fh, data) + server_fh->size;
+@@ -79,7 +78,7 @@ nfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
+ 	if (fh_len < len || fh_type != len)
+ 		return NULL;
+ 
+-	fattr = nfs_alloc_fattr();
++	fattr = nfs_alloc_fattr_with_label(NFS_SB(sb));
+ 	if (fattr == NULL) {
+ 		dentry = ERR_PTR(-ENOMEM);
+ 		goto out;
+@@ -95,28 +94,19 @@ nfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
+ 	if (inode)
+ 		goto out_found;
+ 
+-	label = nfs4_label_alloc(NFS_SB(sb), GFP_KERNEL);
+-	if (IS_ERR(label)) {
+-		dentry = ERR_CAST(label);
+-		goto out_free_fattr;
+-	}
+-
+ 	rpc_ops = NFS_SB(sb)->nfs_client->rpc_ops;
+-	ret = rpc_ops->getattr(NFS_SB(sb), server_fh, fattr, label, NULL);
++	ret = rpc_ops->getattr(NFS_SB(sb), server_fh, fattr, NULL);
+ 	if (ret) {
+ 		dprintk("%s: getattr failed %d\n", __func__, ret);
+ 		trace_nfs_fh_to_dentry(sb, server_fh, fattr->fileid, ret);
+ 		dentry = ERR_PTR(ret);
+-		goto out_free_label;
++		goto out_free_fattr;
+ 	}
+ 
+-	inode = nfs_fhget(sb, server_fh, fattr, label);
++	inode = nfs_fhget(sb, server_fh, fattr, fattr->label);
+ 
+ out_found:
+ 	dentry = d_obtain_alias(inode);
+-
+-out_free_label:
+-	nfs4_label_free(label);
+ out_free_fattr:
+ 	nfs_free_fattr(fattr);
+ out:
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index e0f6ec45b039..8bc029525974 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -1182,7 +1182,6 @@ int
+ __nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ {
+ 	int		 status = -ESTALE;
+-	struct nfs4_label *label = NULL;
+ 	struct nfs_fattr *fattr = NULL;
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+ 
+@@ -1204,20 +1203,13 @@ __nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ 	}
+ 
+ 	status = -ENOMEM;
+-	fattr = nfs_alloc_fattr();
++	fattr = nfs_alloc_fattr_with_label(NFS_SERVER(inode));
+ 	if (fattr == NULL)
+ 		goto out;
+ 
+ 	nfs_inc_stats(inode, NFSIOS_INODEREVALIDATE);
+ 
+-	label = nfs4_label_alloc(NFS_SERVER(inode), GFP_KERNEL);
+-	if (IS_ERR(label)) {
+-		status = PTR_ERR(label);
+-		goto out;
+-	}
+-
+-	status = NFS_PROTO(inode)->getattr(server, NFS_FH(inode), fattr,
+-			label, inode);
++	status = NFS_PROTO(inode)->getattr(server, NFS_FH(inode), fattr, inode);
+ 	if (status != 0) {
+ 		dfprintk(PAGECACHE, "nfs_revalidate_inode: (%s/%Lu) getattr failed, error=%d\n",
+ 			 inode->i_sb->s_id,
+@@ -1234,7 +1226,7 @@ __nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ 			else
+ 				nfs_zap_caches(inode);
+ 		}
+-		goto err_out;
++		goto out;
+ 	}
+ 
+ 	status = nfs_refresh_inode(inode, fattr);
+@@ -1242,20 +1234,18 @@ __nfs_revalidate_inode(struct nfs_server *server, struct inode *inode)
+ 		dfprintk(PAGECACHE, "nfs_revalidate_inode: (%s/%Lu) refresh failed, error=%d\n",
+ 			 inode->i_sb->s_id,
+ 			 (unsigned long long)NFS_FILEID(inode), status);
+-		goto err_out;
++		goto out;
+ 	}
+ 
+ 	if (nfsi->cache_validity & NFS_INO_INVALID_ACL)
+ 		nfs_zap_acl_cache(inode);
+ 
+-	nfs_setsecurity(inode, fattr, label);
++	nfs_setsecurity(inode, fattr, fattr->label);
+ 
+ 	dfprintk(PAGECACHE, "NFS: (%s/%Lu) revalidation complete\n",
+ 		inode->i_sb->s_id,
+ 		(unsigned long long)NFS_FILEID(inode));
+ 
+-err_out:
+-	nfs4_label_free(label);
+ out:
+ 	nfs_free_fattr(fattr);
+ 	trace_nfs_revalidate_inode_exit(inode, status);
+diff --git a/fs/nfs/nfs3proc.c b/fs/nfs/nfs3proc.c
+index 516f3340b226..7bae21a2ba05 100644
+--- a/fs/nfs/nfs3proc.c
++++ b/fs/nfs/nfs3proc.c
+@@ -100,8 +100,7 @@ nfs3_proc_get_root(struct nfs_server *server, struct nfs_fh *fhandle,
+  */
+ static int
+ nfs3_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+-		struct nfs_fattr *fattr, struct nfs4_label *label,
+-		struct inode *inode)
++		struct nfs_fattr *fattr, struct inode *inode)
+ {
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs3_procedures[NFS3PROC_GETATTR],
+* Unmerged path fs/nfs/nfs4_fs.h
+* Unmerged path fs/nfs/nfs4file.c
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4xdr.c b/fs/nfs/nfs4xdr.c
+index 6c96cadde747..7e28ab7f16e7 100644
+--- a/fs/nfs/nfs4xdr.c
++++ b/fs/nfs/nfs4xdr.c
+@@ -6354,7 +6354,7 @@ static int nfs4_xdr_dec_getattr(struct rpc_rqst *rqstp, struct xdr_stream *xdr,
+ 	status = decode_putfh(xdr);
+ 	if (status)
+ 		goto out;
+-	status = decode_getfattr_label(xdr, res->fattr, res->label, res->server);
++	status = decode_getfattr_label(xdr, res->fattr, res->fattr->label, res->server);
+ out:
+ 	return status;
+ }
+diff --git a/fs/nfs/proc.c b/fs/nfs/proc.c
+index c1fd30d51b09..564a7d826bc4 100644
+--- a/fs/nfs/proc.c
++++ b/fs/nfs/proc.c
+@@ -99,8 +99,7 @@ nfs_proc_get_root(struct nfs_server *server, struct nfs_fh *fhandle,
+  */
+ static int
+ nfs_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+-		struct nfs_fattr *fattr, struct nfs4_label *label,
+-		struct inode *inode)
++		struct nfs_fattr *fattr, struct inode *inode)
+ {
+ 	struct rpc_message msg = {
+ 		.rpc_proc	= &nfs_procedures[NFSPROC_GETATTR],
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index d0e444b594dc..ca4ccde19a1f 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1061,7 +1061,6 @@ struct nfs4_getattr_res {
+ 	struct nfs4_sequence_res	seq_res;
+ 	const struct nfs_server *	server;
+ 	struct nfs_fattr *		fattr;
+-	struct nfs4_label		*label;
+ };
+ 
+ struct nfs4_link_arg {
+@@ -1713,8 +1712,7 @@ struct nfs_rpc_ops {
+ 	int	(*submount) (struct fs_context *, struct nfs_server *);
+ 	int	(*try_get_tree) (struct fs_context *);
+ 	int	(*getattr) (struct nfs_server *, struct nfs_fh *,
+-			    struct nfs_fattr *, struct nfs4_label *,
+-			    struct inode *);
++			    struct nfs_fattr *, struct inode *);
+ 	int	(*setattr) (struct dentry *, struct nfs_fattr *,
+ 			    struct iattr *);
+ 	int	(*lookup)  (struct inode *, struct dentry *,
