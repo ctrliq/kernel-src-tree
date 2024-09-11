@@ -1,0 +1,149 @@
+bpf, arm64: Optimize AND,OR,XOR,JSET BPF_K using arm64 logical immediates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [arm64] bpf, arm64: Optimize AND, OR, XOR, JSET BPF_K using arm64 logical immediates (Yauheni Kaliuta) [1874003]
+Rebuild_FUZZ: 97.99%
+commit-author Luke Nelson <lukenels@cs.washington.edu>
+commit fd49591cb49b72abd1b665222a635ccb17df7923
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fd49591c.failed
+
+The current code for BPF_{AND,OR,XOR,JSET} BPF_K loads the immediate to
+a temporary register before use.
+
+This patch changes the code to avoid using a temporary register
+when the BPF immediate is encodable using an arm64 logical immediate
+instruction. If the encoding fails (due to the immediate not being
+encodable), it falls back to using a temporary register.
+
+Example of generated code for BPF_ALU32_IMM(BPF_AND, R0, 0x80000001):
+
+without optimization:
+
+  24: mov  w10, #0x8000ffff
+  28: movk w10, #0x1
+  2c: and  w7, w7, w10
+
+with optimization:
+
+  24: and  w7, w7, #0x80000001
+
+Since the encoding process is quite complex, the JIT reuses existing
+functionality in arch/arm64/kernel/insn.c for encoding logical immediates
+rather than duplicate it in the JIT.
+
+Co-developed-by: Xi Wang <xi.wang@gmail.com>
+	Signed-off-by: Xi Wang <xi.wang@gmail.com>
+	Signed-off-by: Luke Nelson <luke.r.nels@gmail.com>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/r/20200508181547.24783-3-luke.r.nels@gmail.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit fd49591cb49b72abd1b665222a635ccb17df7923)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/net/bpf_jit.h
+diff --cc arch/arm64/net/bpf_jit.h
+index 1964cfb0552f,f36a779949e6..000000000000
+--- a/arch/arm64/net/bpf_jit.h
++++ b/arch/arm64/net/bpf_jit.h
+@@@ -200,12 -189,18 +200,28 @@@
+  /* Rn & Rm; set condition flags */
+  #define A64_TST(sf, Rn, Rm) A64_ANDS(sf, A64_ZR, Rn, Rm)
+  
+++<<<<<<< HEAD
+ +/* HINTs */
+ +#define A64_HINT(x) aarch64_insn_gen_hint(x)
+ +
+ +/* BTI */
+ +#define A64_BTI_C  A64_HINT(AARCH64_INSN_HINT_BTIC)
+ +#define A64_BTI_J  A64_HINT(AARCH64_INSN_HINT_BTIJ)
+ +#define A64_BTI_JC A64_HINT(AARCH64_INSN_HINT_BTIJC)
+++=======
++ /* Logical (immediate) */
++ #define A64_LOGIC_IMM(sf, Rd, Rn, imm, type) ({ \
++ 	u64 imm64 = (sf) ? (u64)imm : (u64)(u32)imm; \
++ 	aarch64_insn_gen_logical_immediate(AARCH64_INSN_LOGIC_##type, \
++ 		A64_VARIANT(sf), Rn, Rd, imm64); \
++ })
++ /* Rd = Rn OP imm */
++ #define A64_AND_I(sf, Rd, Rn, imm) A64_LOGIC_IMM(sf, Rd, Rn, imm, AND)
++ #define A64_ORR_I(sf, Rd, Rn, imm) A64_LOGIC_IMM(sf, Rd, Rn, imm, ORR)
++ #define A64_EOR_I(sf, Rd, Rn, imm) A64_LOGIC_IMM(sf, Rd, Rn, imm, EOR)
++ #define A64_ANDS_I(sf, Rd, Rn, imm) A64_LOGIC_IMM(sf, Rd, Rn, imm, AND_SETFLAGS)
++ /* Rn & imm; set condition flags */
++ #define A64_TST_I(sf, Rn, imm) A64_ANDS_I(sf, A64_ZR, Rn, imm)
+++>>>>>>> fd49591cb49b (bpf, arm64: Optimize AND,OR,XOR,JSET BPF_K using arm64 logical immediates)
+  
+  #endif /* _BPF_JIT_H */
+* Unmerged path arch/arm64/net/bpf_jit.h
+diff --git a/arch/arm64/net/bpf_jit_comp.c b/arch/arm64/net/bpf_jit_comp.c
+index 1b523c3298c6..1f001c33ca96 100644
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@ -379,6 +379,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 	const bool isdw = BPF_SIZE(code) == BPF_DW;
+ 	u8 jmp_cond, reg;
+ 	s32 jmp_offset;
++	u32 a64_insn;
+ 
+ #define check_imm(bits, imm) do {				\
+ 	if ((((imm) > 0) && ((imm) >> (bits))) ||		\
+@@ -511,18 +512,33 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 		break;
+ 	case BPF_ALU | BPF_AND | BPF_K:
+ 	case BPF_ALU64 | BPF_AND | BPF_K:
+-		emit_a64_mov_i(is64, tmp, imm, ctx);
+-		emit(A64_AND(is64, dst, dst, tmp), ctx);
++		a64_insn = A64_AND_I(is64, dst, dst, imm);
++		if (a64_insn != AARCH64_BREAK_FAULT) {
++			emit(a64_insn, ctx);
++		} else {
++			emit_a64_mov_i(is64, tmp, imm, ctx);
++			emit(A64_AND(is64, dst, dst, tmp), ctx);
++		}
+ 		break;
+ 	case BPF_ALU | BPF_OR | BPF_K:
+ 	case BPF_ALU64 | BPF_OR | BPF_K:
+-		emit_a64_mov_i(is64, tmp, imm, ctx);
+-		emit(A64_ORR(is64, dst, dst, tmp), ctx);
++		a64_insn = A64_ORR_I(is64, dst, dst, imm);
++		if (a64_insn != AARCH64_BREAK_FAULT) {
++			emit(a64_insn, ctx);
++		} else {
++			emit_a64_mov_i(is64, tmp, imm, ctx);
++			emit(A64_ORR(is64, dst, dst, tmp), ctx);
++		}
+ 		break;
+ 	case BPF_ALU | BPF_XOR | BPF_K:
+ 	case BPF_ALU64 | BPF_XOR | BPF_K:
+-		emit_a64_mov_i(is64, tmp, imm, ctx);
+-		emit(A64_EOR(is64, dst, dst, tmp), ctx);
++		a64_insn = A64_EOR_I(is64, dst, dst, imm);
++		if (a64_insn != AARCH64_BREAK_FAULT) {
++			emit(a64_insn, ctx);
++		} else {
++			emit_a64_mov_i(is64, tmp, imm, ctx);
++			emit(A64_EOR(is64, dst, dst, tmp), ctx);
++		}
+ 		break;
+ 	case BPF_ALU | BPF_MUL | BPF_K:
+ 	case BPF_ALU64 | BPF_MUL | BPF_K:
+@@ -651,8 +667,13 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
+ 		goto emit_cond_jmp;
+ 	case BPF_JMP | BPF_JSET | BPF_K:
+ 	case BPF_JMP32 | BPF_JSET | BPF_K:
+-		emit_a64_mov_i(is64, tmp, imm, ctx);
+-		emit(A64_TST(is64, dst, tmp), ctx);
++		a64_insn = A64_TST_I(is64, dst, imm);
++		if (a64_insn != AARCH64_BREAK_FAULT) {
++			emit(a64_insn, ctx);
++		} else {
++			emit_a64_mov_i(is64, tmp, imm, ctx);
++			emit(A64_TST(is64, dst, tmp), ctx);
++		}
+ 		goto emit_cond_jmp;
+ 	/* function call */
+ 	case BPF_JMP | BPF_CALL:
