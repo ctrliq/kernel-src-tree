@@ -1,0 +1,331 @@
+IB/mlx5: Protect against prefetch of invalid MR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Moni Shoua <monis@mellanox.com>
+commit a6bc3875f176f52c4a247c341e80d52dd4f5e356
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a6bc3875.failed
+
+When deferring a prefetch request we need to protect against MR or PD
+being destroyed while the request is still enqueued.
+
+The first step is to validate that PD owns the lkey that describes the MR
+and that the MR that the lkey refers to is owned by that PD.
+
+The second step is to dequeue all requests when MR is destroyed.
+
+Since PD can't be destroyed while it owns MRs it is guaranteed that when a
+worker wakes up the request it refers to is still valid.
+
+Now, it is possible to refrain from taking a reference on the device since
+it is assured to be present as pd.
+
+While that, replace the dedicated ordered workqueue with the system
+unbound workqueue to reuse an existing resource and improve
+performance. This will also fix a bug of queueing to the wrong workqueue.
+
+Fixes: 813e90b1aeaa ("IB/mlx5: Add advise_mr() support")
+	Reported-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit a6bc3875f176f52c4a247c341e80d52dd4f5e356)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 9f7060c02bfd,614b2acbc621..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -5459,9 -5826,10 +5459,16 @@@ static struct ib_counters *mlx5_ib_crea
+  void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+  {
+  	mlx5_ib_cleanup_multiport_master(dev);
+++<<<<<<< HEAD
+ +#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ +	cleanup_srcu_struct(&dev->mr_srcu);
+ +#endif
+++=======
++ 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
++ 		srcu_barrier(&dev->mr_srcu);
++ 		cleanup_srcu_struct(&dev->mr_srcu);
++ 	}
+++>>>>>>> a6bc3875f176 (IB/mlx5: Protect against prefetch of invalid MR)
+  	kfree(dev->port);
+  }
+  
+@@@ -5522,11 -5882,11 +5529,19 @@@ int mlx5_ib_stage_init_init(struct mlx5
+  	spin_lock_init(&dev->memic.memic_lock);
+  	dev->memic.dev = mdev;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ +	err = init_srcu_struct(&dev->mr_srcu);
+ +	if (err)
+ +		goto err_free_port;
+ +#endif
+++=======
++ 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
++ 		err = init_srcu_struct(&dev->mr_srcu);
++ 		if (err)
++ 			goto err_mp;
++ 	}
+++>>>>>>> a6bc3875f176 (IB/mlx5: Protect against prefetch of invalid MR)
+  
+  	return 0;
+  err_mp:
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 2c8fea140d3d,4a617d78eae1..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -566,8 -588,16 +566,13 @@@ struct mlx5_ib_mr 
+  	struct mlx5_ib_mr      *parent;
+  	atomic_t		num_leaf_free;
+  	wait_queue_head_t       q_leaf_free;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_async_work  cb_work;
++ 	atomic_t		num_pending_prefetch;
+++>>>>>>> a6bc3875f176 (IB/mlx5: Protect against prefetch of invalid MR)
+  };
+  
+ -static inline bool is_odp_mr(struct mlx5_ib_mr *mr)
+ -{
+ -	return IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING) && mr->umem &&
+ -	       mr->umem->is_odp;
+ -}
+ -
+  struct mlx5_ib_mw {
+  	struct ib_mw		ibmw;
+  	struct mlx5_core_mkey	mmkey;
+@@@ -874,7 -930,6 +879,10 @@@ struct mlx5_ib_dev 
+  	 */
+  	struct srcu_struct      mr_srcu;
+  	u32			null_mkey;
+++<<<<<<< HEAD
+ +#endif
+++=======
+++>>>>>>> a6bc3875f176 (IB/mlx5: Protect against prefetch of invalid MR)
+  	struct mlx5_ib_flow_db	*flow_db;
+  	/* protect resources needed as part of reset flow */
+  	spinlock_t		reset_flow_resource_lock;
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 7aa0bfa996ba,c85f00255884..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1390,9 -1339,11 +1390,17 @@@ struct ib_mr *mlx5_ib_reg_user_mr(struc
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ +	mr->live = 1;
+ +#endif
+++=======
++ 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
++ 		mr->live = 1;
++ 		atomic_set(&mr->num_pending_prefetch, 0);
++ 	}
++ 
+++>>>>>>> a6bc3875f176 (IB/mlx5: Protect against prefetch of invalid MR)
+  	return &mr->ibmr;
+  error:
+  	ib_umem_release(umem);
+@@@ -1626,10 -1575,19 +1634,25 @@@ static void dereg_mr(struct mlx5_ib_de
+  	int npages = mr->npages;
+  	struct ib_umem *umem = mr->umem;
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ +	if (umem && umem->odp_data) {
+ +		/* Prevent new page faults from succeeding */
+++=======
++ 	if (is_odp_mr(mr)) {
++ 		struct ib_umem_odp *umem_odp = to_ib_umem_odp(umem);
++ 
++ 		/* Prevent new page faults and
++ 		 * prefetch requests from succeeding
++ 		 */
+++>>>>>>> a6bc3875f176 (IB/mlx5: Protect against prefetch of invalid MR)
+  		mr->live = 0;
++ 
++ 		/* dequeue pending prefetch requests for the mr */
++ 		if (atomic_read(&mr->num_pending_prefetch))
++ 			flush_workqueue(system_unbound_wq);
++ 		WARN_ON(atomic_read(&mr->num_pending_prefetch));
++ 
+  		/* Wait for all running page-fault handlers to finish. */
+  		synchronize_srcu(&dev->mr_srcu);
+  		/* Destroy all page mappings */
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index 4e6f586dbb7c,a1346978702f..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -1265,3 -1653,154 +1266,157 @@@ int mlx5_ib_odp_init(void
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct prefetch_mr_work {
++ 	struct work_struct work;
++ 	struct mlx5_ib_dev *dev;
++ 	u32 pf_flags;
++ 	u32 num_sge;
++ 	struct ib_sge sg_list[0];
++ };
++ 
++ static void num_pending_prefetch_dec(struct mlx5_ib_dev *dev,
++ 				     struct ib_sge *sg_list, u32 num_sge,
++ 				     u32 from)
++ {
++ 	u32 i;
++ 	int srcu_key;
++ 
++ 	srcu_key = srcu_read_lock(&dev->mr_srcu);
++ 
++ 	for (i = from; i < num_sge; ++i) {
++ 		struct mlx5_core_mkey *mmkey;
++ 		struct mlx5_ib_mr *mr;
++ 
++ 		mmkey = __mlx5_mr_lookup(dev->mdev,
++ 					 mlx5_base_mkey(sg_list[i].lkey));
++ 		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
++ 		atomic_dec(&mr->num_pending_prefetch);
++ 	}
++ 
++ 	srcu_read_unlock(&dev->mr_srcu, srcu_key);
++ }
++ 
++ static bool num_pending_prefetch_inc(struct ib_pd *pd,
++ 				     struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	bool ret = true;
++ 	u32 i;
++ 
++ 	for (i = 0; i < num_sge; ++i) {
++ 		struct mlx5_core_mkey *mmkey;
++ 		struct mlx5_ib_mr *mr;
++ 
++ 		mmkey = __mlx5_mr_lookup(dev->mdev,
++ 					 mlx5_base_mkey(sg_list[i].lkey));
++ 		if (!mmkey || mmkey->key != sg_list[i].lkey) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		if (mmkey->type != MLX5_MKEY_MR) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		mr = container_of(mmkey, struct mlx5_ib_mr, mmkey);
++ 
++ 		if (mr->ibmr.pd != pd) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		if (!mr->live) {
++ 			ret = false;
++ 			break;
++ 		}
++ 
++ 		atomic_inc(&mr->num_pending_prefetch);
++ 	}
++ 
++ 	if (!ret)
++ 		num_pending_prefetch_dec(dev, sg_list, i, 0);
++ 
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_prefetch_sg_list(struct mlx5_ib_dev *dev, u32 pf_flags,
++ 				    struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	u32 i;
++ 	int ret = 0;
++ 
++ 	for (i = 0; i < num_sge; ++i) {
++ 		struct ib_sge *sg = &sg_list[i];
++ 		int bytes_committed = 0;
++ 
++ 		ret = pagefault_single_data_segment(dev, sg->lkey, sg->addr,
++ 						    sg->length,
++ 						    &bytes_committed, NULL,
++ 						    pf_flags);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 
++ 	return ret < 0 ? ret : 0;
++ }
++ 
++ static void mlx5_ib_prefetch_mr_work(struct work_struct *work)
++ {
++ 	struct prefetch_mr_work *w =
++ 		container_of(work, struct prefetch_mr_work, work);
++ 
++ 	if (ib_device_try_get(&w->dev->ib_dev)) {
++ 		mlx5_ib_prefetch_sg_list(w->dev, w->pf_flags, w->sg_list,
++ 					 w->num_sge);
++ 		ib_device_put(&w->dev->ib_dev);
++ 	}
++ 
++ 	num_pending_prefetch_dec(w->dev, w->sg_list, w->num_sge, 0);
++ 	kfree(w);
++ }
++ 
++ int mlx5_ib_advise_mr_prefetch(struct ib_pd *pd,
++ 			       enum ib_uverbs_advise_mr_advice advice,
++ 			       u32 flags, struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	u32 pf_flags = MLX5_PF_FLAGS_PREFETCH;
++ 	struct prefetch_mr_work *work;
++ 	bool valid_req;
++ 	int srcu_key;
++ 
++ 	if (advice == IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH)
++ 		pf_flags |= MLX5_PF_FLAGS_DOWNGRADE;
++ 
++ 	if (flags & IB_UVERBS_ADVISE_MR_FLAG_FLUSH)
++ 		return mlx5_ib_prefetch_sg_list(dev, pf_flags, sg_list,
++ 						num_sge);
++ 
++ 	work = kvzalloc(struct_size(work, sg_list, num_sge), GFP_KERNEL);
++ 	if (!work)
++ 		return -ENOMEM;
++ 
++ 	memcpy(work->sg_list, sg_list, num_sge * sizeof(struct ib_sge));
++ 
++ 	work->dev = dev;
++ 	work->pf_flags = pf_flags;
++ 	work->num_sge = num_sge;
++ 
++ 	INIT_WORK(&work->work, mlx5_ib_prefetch_mr_work);
++ 
++ 	srcu_key = srcu_read_lock(&dev->mr_srcu);
++ 
++ 	valid_req = num_pending_prefetch_inc(pd, sg_list, num_sge);
++ 	if (valid_req)
++ 		queue_work(system_unbound_wq, &work->work);
++ 	else
++ 		kfree(work);
++ 
++ 	srcu_read_unlock(&dev->mr_srcu, srcu_key);
++ 
++ 	return valid_req ? 0 : -EINVAL;
++ }
+++>>>>>>> a6bc3875f176 (IB/mlx5: Protect against prefetch of invalid MR)
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
