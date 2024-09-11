@@ -1,0 +1,403 @@
+memremap: replace the altmap_valid field with a PGMAP_ALTMAP_VALID flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 514caf23a70fd697fa2ece238b2cd8dcc73fb16f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/514caf23.failed
+
+Add a flags field to struct dev_pagemap to replace the altmap_valid
+boolean to be a little more extensible.  Also add a pgmap_altmap() helper
+to find the optional altmap and clean up the code using the altmap using
+it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Tested-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 514caf23a70fd697fa2ece238b2cd8dcc73fb16f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/mem.c
+#	arch/x86/mm/init_64.c
+#	drivers/nvdimm/pmem.c
+#	include/linux/memremap.h
+#	kernel/memremap.c
+#	mm/hmm.c
+diff --cc arch/powerpc/mm/mem.c
+index 7150ace1f956,a2923c5c1982..000000000000
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@@ -145,20 -131,10 +145,24 @@@ int __meminit arch_remove_memory(int ni
+  {
+  	unsigned long start_pfn = start >> PAGE_SHIFT;
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+- 	struct page *page;
++ 	struct page *page = pfn_to_page(start_pfn) + vmem_altmap_offset(altmap);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If we have an altmap then we need to skip over any reserved PFNs
+ +	 * when querying the zone.
+ +	 */
+ +	page = pfn_to_page(start_pfn);
+ +	if (altmap)
+ +		page += vmem_altmap_offset(altmap);
+ +
+ +	ret = __remove_pages(page_zone(page), start_pfn, nr_pages, altmap);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	__remove_pages(page_zone(page), start_pfn, nr_pages, altmap);
+++>>>>>>> 514caf23a70f (memremap: replace the altmap_valid field with a PGMAP_ALTMAP_VALID flag)
+  
+  	/* Remove htab bolted mappings for this section of memory */
+  	start = (unsigned long)__va(start);
+diff --cc arch/x86/mm/init_64.c
+index 823e60f719f3,08bbf648827b..000000000000
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@@ -1213,19 -1213,11 +1213,26 @@@ int __ref arch_remove_memory(int nid, u
+  {
+  	unsigned long start_pfn = start >> PAGE_SHIFT;
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +	struct page *page = pfn_to_page(start_pfn);
+ +	struct zone *zone;
+ +	int ret;
+ +
+ +	/* With altmap the first mapped page is offset from @start */
+ +	if (altmap)
+ +		page += vmem_altmap_offset(altmap);
+ +	zone = page_zone(page);
+ +	ret = __remove_pages(zone, start_pfn, nr_pages, altmap);
+ +	WARN_ON_ONCE(ret);
+++=======
++ 	struct page *page = pfn_to_page(start_pfn) + vmem_altmap_offset(altmap);
++ 	struct zone *zone = page_zone(page);
++ 
++ 	__remove_pages(zone, start_pfn, nr_pages, altmap);
+++>>>>>>> 514caf23a70f (memremap: replace the altmap_valid field with a PGMAP_ALTMAP_VALID flag)
+  	kernel_physical_mapping_remove(start, start + size);
+ +
+ +	return ret;
+  }
+  #endif
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+diff --cc drivers/nvdimm/pmem.c
+index d9d845077b8b,e7d8cc9f41e8..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -426,9 -412,8 +426,14 @@@ static int pmem_attach_disk(struct devi
+  		bb_res.start += pmem->data_offset;
+  	} else if (pmem_should_map_pages(dev)) {
+  		memcpy(&pmem->pgmap.res, &nsio->res, sizeof(pmem->pgmap.res));
+++<<<<<<< HEAD
+ +		pmem->pgmap.altmap_valid = false;
+ +		if (setup_pagemap_fsdax(dev, &pmem->pgmap))
+ +			return -ENOMEM;
+++=======
++ 		pmem->pgmap.type = MEMORY_DEVICE_FS_DAX;
++ 		pmem->pgmap.ops = &fsdax_pagemap_ops;
+++>>>>>>> 514caf23a70f (memremap: replace the altmap_valid field with a PGMAP_ALTMAP_VALID flag)
+  		addr = devm_memremap_pages(dev, &pmem->pgmap);
+  		pmem->pfn_flags |= PFN_MAP;
+  		memcpy(&bb_res, &pmem->pgmap.res, sizeof(bb_res));
+diff --cc include/linux/memremap.h
+index ae6713454b27,e25685b878e9..000000000000
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@@ -66,49 -62,36 +66,51 @@@ enum memory_type 
+  	MEMORY_DEVICE_PCI_P2PDMA,
+  };
+  
+ -struct dev_pagemap_ops {
+ -	/*
+ -	 * Called once the page refcount reaches 1.  (ZONE_DEVICE pages never
+ -	 * reach 0 refcount unless there is a refcount bug. This allows the
+ -	 * device driver to implement its own memory management.)
+ -	 */
+ -	void (*page_free)(struct page *page);
+ -
+ -	/*
+ -	 * Transition the refcount in struct dev_pagemap to the dead state.
+ -	 */
+ -	void (*kill)(struct dev_pagemap *pgmap);
+ -
+ -	/*
+ -	 * Wait for refcount in struct dev_pagemap to be idle and reap it.
+ -	 */
+ -	void (*cleanup)(struct dev_pagemap *pgmap);
+ -
+ -	/*
+ -	 * Used for private (un-addressable) device memory only.  Must migrate
+ -	 * the page back to a CPU accessible page.
+ -	 */
+ -	vm_fault_t (*migrate_to_ram)(struct vm_fault *vmf);
+ -};
+ +/*
+ + * For MEMORY_DEVICE_PRIVATE we use ZONE_DEVICE and extend it with two
+ + * callbacks:
+ + *   page_fault()
+ + *   page_free()
+ + *
+ + * Additional notes about MEMORY_DEVICE_PRIVATE may be found in
+ + * include/linux/hmm.h and Documentation/vm/hmm.rst. There is also a brief
+ + * explanation in include/linux/memory_hotplug.h.
+ + *
+ + * The page_fault() callback must migrate page back, from device memory to
+ + * system memory, so that the CPU can access it. This might fail for various
+ + * reasons (device issues,  device have been unplugged, ...). When such error
+ + * conditions happen, the page_fault() callback must return VM_FAULT_SIGBUS and
+ + * set the CPU page table entry to "poisoned".
+ + *
+ + * Note that because memory cgroup charges are transferred to the device memory,
+ + * this should never fail due to memory restrictions. However, allocation
+ + * of a regular system page might still fail because we are out of memory. If
+ + * that happens, the page_fault() callback must return VM_FAULT_OOM.
+ + *
+ + * The page_fault() callback can also try to migrate back multiple pages in one
+ + * chunk, as an optimization. It must, however, prioritize the faulting address
+ + * over all the others.
+ + *
+ + *
+ + * The page_free() callback is called once the page refcount reaches 1
+ + * (ZONE_DEVICE pages never reach 0 refcount unless there is a refcount bug.
+ + * This allows the device driver to implement its own memory management.)
+ + *
+ + * For MEMORY_DEVICE_PUBLIC only the page_free() callback matter.
+ + */
+ +typedef int (*dev_page_fault_t)(struct vm_area_struct *vma,
+ +				unsigned long addr,
+ +				const struct page *page,
+ +				unsigned int flags,
+ +				pmd_t *pmdp);
+ +typedef void (*dev_page_free_t)(struct page *page, void *data);
+  
++ #define PGMAP_ALTMAP_VALID	(1 << 0)
++ 
+  /**
+   * struct dev_pagemap - metadata for ZONE_DEVICE mappings
+ + * @page_fault: callback when CPU fault on an unaddressable device page
+ + * @page_free: free page callback when page refcount reaches 1
+   * @altmap: pre-allocated/reserved memory for vmemmap allocations
+   * @res: physical address range covered by @ref
+   * @ref: reference count that pins the devm_memremap_pages() mapping
+@@@ -116,21 -98,27 +118,33 @@@
+   * @dev: host device of the mapping for debug
+   * @data: private data pointer for page_free()
+   * @type: memory type: see MEMORY_* in memory_hotplug.h
+++<<<<<<< HEAD
+++=======
++  * @flags: PGMAP_* flags to specify defailed behavior
++  * @ops: method table
+++>>>>>>> 514caf23a70f (memremap: replace the altmap_valid field with a PGMAP_ALTMAP_VALID flag)
+   */
+  struct dev_pagemap {
+ +	dev_page_fault_t page_fault;
+ +	dev_page_free_t page_free;
+  	struct vmem_altmap altmap;
+- 	bool altmap_valid;
+  	struct resource res;
+  	struct percpu_ref *ref;
+  	struct device *dev;
+ +	void *data;
+  	enum memory_type type;
++ 	unsigned int flags;
+  	u64 pci_p2pdma_bus_offset;
+ -	const struct dev_pagemap_ops *ops;
+ +	RH_KABI_EXTEND(void (*kill)(struct percpu_ref *ref))
+  };
+  
++ static inline struct vmem_altmap *pgmap_altmap(struct dev_pagemap *pgmap)
++ {
++ 	if (pgmap->flags & PGMAP_ALTMAP_VALID)
++ 		return &pgmap->altmap;
++ 	return NULL;
++ }
++ 
+  #ifdef CONFIG_ZONE_DEVICE
+  void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap);
+  void devm_memunmap_pages(struct device *dev, struct dev_pagemap *pgmap);
+diff --cc kernel/memremap.c
+index 794888559eb7,eee490e7d7e1..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -157,14 -120,14 +151,14 @@@ static void devm_memremap_pages_release
+   * @pgmap: pointer to a struct dev_pagemap
+   *
+   * Notes:
+ - * 1/ At a minimum the res, ref and type and ops members of @pgmap must be
+ - *    initialized by the caller before passing it to this function
+ + * 1/ At a minimum the res, ref and type members of @pgmap must be initialized
+ + *    by the caller before passing it to this function
+   *
+-  * 2/ The altmap field may optionally be initialized, in which case altmap_valid
+-  *    must be set to true
++  * 2/ The altmap field may optionally be initialized, in which case
++  *    PGMAP_ALTMAP_VALID must be set in pgmap->flags.
+   *
+ - * 3/ pgmap->ref must be 'live' on entry and will be killed and reaped
+ - *    at devm_memremap_pages_release() time, or if this routine fails.
+ + * 3/ pgmap->ref must be 'live' on entry and will be killed at
+ + *    devm_memremap_pages_release() time, or if this routine fails.
+   *
+   * 4/ res is expected to be a host memory range that could feasibly be
+   *    treated as a "System RAM" range, i.e. not a device mmio range, but
+@@@ -173,16 -136,56 +167,23 @@@
+  void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap)
+  {
+  	resource_size_t align_start, align_size, align_end;
+- 	struct vmem_altmap *altmap = pgmap->altmap_valid ?
+- 			&pgmap->altmap : NULL;
+  	struct resource *res = &pgmap->res;
+  	struct dev_pagemap *conflict_pgmap;
+++<<<<<<< HEAD
+++=======
++ 	struct mhp_restrictions restrictions = {
++ 		/*
++ 		 * We do not want any optional features only our own memmap
++ 		*/
++ 		.altmap = pgmap_altmap(pgmap),
++ 	};
+++>>>>>>> 514caf23a70f (memremap: replace the altmap_valid field with a PGMAP_ALTMAP_VALID flag)
+  	pgprot_t pgprot = PAGE_KERNEL;
+ +	unsigned long pgoff, order;
+  	int error, nid, is_ram;
+ -	bool need_devmap_managed = true;
+ -
+ -	switch (pgmap->type) {
+ -	case MEMORY_DEVICE_PRIVATE:
+ -		if (!IS_ENABLED(CONFIG_DEVICE_PRIVATE)) {
+ -			WARN(1, "Device private memory not supported\n");
+ -			return ERR_PTR(-EINVAL);
+ -		}
+ -		if (!pgmap->ops || !pgmap->ops->migrate_to_ram) {
+ -			WARN(1, "Missing migrate_to_ram method\n");
+ -			return ERR_PTR(-EINVAL);
+ -		}
+ -		break;
+ -	case MEMORY_DEVICE_FS_DAX:
+ -		if (!IS_ENABLED(CONFIG_ZONE_DEVICE) ||
+ -		    IS_ENABLED(CONFIG_FS_DAX_LIMITED)) {
+ -			WARN(1, "File system DAX not supported\n");
+ -			return ERR_PTR(-EINVAL);
+ -		}
+ -		break;
+ -	case MEMORY_DEVICE_DEVDAX:
+ -	case MEMORY_DEVICE_PCI_P2PDMA:
+ -		need_devmap_managed = false;
+ -		break;
+ -	default:
+ -		WARN(1, "Invalid pgmap type %d\n", pgmap->type);
+ -		break;
+ -	}
+  
+ -	if (!pgmap->ref || !pgmap->ops || !pgmap->ops->kill ||
+ -	    !pgmap->ops->cleanup) {
+ -		WARN(1, "Missing reference count teardown definition\n");
+ +	if (!pgmap->ref || !pgmap->kill)
+  		return ERR_PTR(-EINVAL);
+ -	}
+ -
+ -	if (need_devmap_managed) {
+ -		error = devmap_managed_enable_get(dev, pgmap);
+ -		if (error)
+ -			return ERR_PTR(error);
+ -	}
+  
+  	align_start = res->start & ~(SECTION_SIZE - 1);
+  	align_size = ALIGN(res->start + resource_size(res), SECTION_SIZE)
+diff --cc mm/hmm.c
+index 91b885757871,e4470462298f..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -1081,12 -1441,8 +1081,16 @@@ struct hmm_devmem *hmm_devmem_add(cons
+  
+  	devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
+  	devmem->pagemap.res = *devmem->resource;
+++<<<<<<< HEAD
+ +	devmem->pagemap.page_fault = hmm_devmem_fault;
+ +	devmem->pagemap.page_free = hmm_devmem_free;
+ +	devmem->pagemap.altmap_valid = false;
+++=======
++ 	devmem->pagemap.ops = &hmm_pagemap_ops;
+++>>>>>>> 514caf23a70f (memremap: replace the altmap_valid field with a PGMAP_ALTMAP_VALID flag)
+  	devmem->pagemap.ref = &devmem->ref;
+ +	devmem->pagemap.data = devmem;
+ +	devmem->pagemap.kill = hmm_devmem_ref_kill;
+  
+  	result = devm_memremap_pages(devmem->device, &devmem->pagemap);
+  	if (IS_ERR(result))
+* Unmerged path arch/powerpc/mm/mem.c
+* Unmerged path arch/x86/mm/init_64.c
+diff --git a/drivers/nvdimm/pfn_devs.c b/drivers/nvdimm/pfn_devs.c
+index 8762ec764857..b49227f8b59b 100644
+--- a/drivers/nvdimm/pfn_devs.c
++++ b/drivers/nvdimm/pfn_devs.c
+@@ -633,7 +633,6 @@ static int __nvdimm_setup_pfn(struct nd_pfn *nd_pfn, struct dev_pagemap *pgmap)
+ 		if (offset < reserve)
+ 			return -EINVAL;
+ 		nd_pfn->npfns = le64_to_cpu(pfn_sb->npfns);
+-		pgmap->altmap_valid = false;
+ 	} else if (nd_pfn->mode == PFN_MODE_PMEM) {
+ 		nd_pfn->npfns = PFN_SECTION_ALIGN_UP((resource_size(res)
+ 					- offset) / PAGE_SIZE);
+@@ -645,7 +644,7 @@ static int __nvdimm_setup_pfn(struct nd_pfn *nd_pfn, struct dev_pagemap *pgmap)
+ 		memcpy(altmap, &__altmap, sizeof(*altmap));
+ 		altmap->free = PHYS_PFN(offset - reserve);
+ 		altmap->alloc = 0;
+-		pgmap->altmap_valid = true;
++		pgmap->flags |= PGMAP_ALTMAP_VALID;
+ 	} else
+ 		return -ENXIO;
+ 
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path include/linux/memremap.h
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/hmm.c
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index e466254573a3..633dfaaae9f2 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -547,10 +547,8 @@ int __remove_pages(struct zone *zone, unsigned long phys_start_pfn,
+ 	int sections_to_remove;
+ 
+ 	/* In the ZONE_DEVICE case device driver owns the memory region */
+-	if (is_dev_zone(zone)) {
+-		if (altmap)
+-			map_offset = vmem_altmap_offset(altmap);
+-	}
++	if (is_dev_zone(zone))
++		map_offset = vmem_altmap_offset(altmap);
+ 
+ 	clear_zone_contiguous(zone);
+ 
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 85ae7c324dfb..b62dbdbbcd0f 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -5597,6 +5597,7 @@ void __ref memmap_init_zone_device(struct zone *zone,
+ {
+ 	unsigned long pfn, end_pfn = start_pfn + size;
+ 	struct pglist_data *pgdat = zone->zone_pgdat;
++	struct vmem_altmap *altmap = pgmap_altmap(pgmap);
+ 	unsigned long zone_idx = zone_idx(zone);
+ 	unsigned long start = jiffies;
+ 	int nid = pgdat->node_id;
+@@ -5609,9 +5610,7 @@ void __ref memmap_init_zone_device(struct zone *zone,
+ 	 * of the pages reserved for the memmap, so we can just jump to
+ 	 * the end of that region and start processing the device pages.
+ 	 */
+-	if (pgmap->altmap_valid) {
+-		struct vmem_altmap *altmap = &pgmap->altmap;
+-
++	if (altmap) {
+ 		start_pfn = altmap->base_pfn + vmem_altmap_offset(altmap);
+ 		size = end_pfn - start_pfn;
+ 	}
