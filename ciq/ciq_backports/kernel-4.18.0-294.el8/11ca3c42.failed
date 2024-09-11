@@ -1,0 +1,155 @@
+net: ethtool: netlink: Add support for triggering a cable test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrew Lunn <andrew@lunn.ch>
+commit 11ca3c4261cdb4e2f33e32daf6447f8185843317
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/11ca3c42.failed
+
+Add new ethtool netlink calls to trigger the starting of a PHY cable
+test.
+
+Add Kconfig'ury to ETHTOOL_NETLINK so that PHYLIB is not a module when
+ETHTOOL_NETLINK is builtin, which would result in kernel linking errors.
+
+v2:
+Remove unwanted white space change
+Remove ethnl_cable_test_act_ops and use doit handler
+Rename cable_test_set_policy cable_test_act_policy
+Remove ETHTOOL_MSG_CABLE_TEST_ACT_REPLY
+
+v3:
+Remove ETHTOOL_MSG_CABLE_TEST_ACT_REPLY from documentation
+Remove unused cable_test_get_policy
+Add Reviewed-by tags
+
+v4:
+Remove unwanted blank line
+
+	Signed-off-by: Andrew Lunn <andrew@lunn.ch>
+	Reviewed-by: Michal Kubecek <mkubecek@suse.cz>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 11ca3c4261cdb4e2f33e32daf6447f8185843317)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ethtool-netlink.rst
+#	include/uapi/linux/ethtool_netlink.h
+#	net/Kconfig
+#	net/ethtool/Makefile
+#	net/ethtool/netlink.c
+#	net/ethtool/netlink.h
+diff --cc net/Kconfig
+index 548395aa1e2e,5c524c6ee75d..000000000000
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@@ -453,6 -452,15 +453,18 @@@ config FAILOVE
+  	  migration of VMs with direct attached VFs by failing over to the
+  	  paravirtual datapath when the VF is unplugged.
+  
+++<<<<<<< HEAD
+++=======
++ config ETHTOOL_NETLINK
++ 	bool "Netlink interface for ethtool"
++ 	default y
++ 	depends on PHYLIB=y || PHYLIB=n
++ 	help
++ 	  An alternative userspace interface for ethtool based on generic
++ 	  netlink. It provides better extensibility and some new features,
++ 	  e.g. notification messages.
++ 
+++>>>>>>> 11ca3c4261cd (net: ethtool: netlink: Add support for triggering a cable test)
+  endif   # if NET
+  
+  # Used by archs to tell that they support BPF JIT compiler plus which flavour.
+diff --cc net/ethtool/Makefile
+index f68387618973,0c2b94f20499..000000000000
+--- a/net/ethtool/Makefile
++++ b/net/ethtool/Makefile
+@@@ -1,3 -1,9 +1,13 @@@
+  # SPDX-License-Identifier: GPL-2.0-only
+  
+++<<<<<<< HEAD
+ +obj-y		+= ioctl.o common.o
+++=======
++ obj-y				+= ioctl.o common.o
++ 
++ obj-$(CONFIG_ETHTOOL_NETLINK)	+= ethtool_nl.o
++ 
++ ethtool_nl-y	:= netlink.o bitset.o strset.o linkinfo.o linkmodes.o \
++ 		   linkstate.o debug.o wol.o features.o privflags.o rings.o \
++ 		   channels.o coalesce.o pause.o eee.o tsinfo.o cabletest.o
+++>>>>>>> 11ca3c4261cd (net: ethtool: netlink: Add support for triggering a cable test)
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
+* Unmerged path Documentation/networking/ethtool-netlink.rst
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/Kconfig
+* Unmerged path net/ethtool/Makefile
+diff --git a/net/ethtool/cabletest.c b/net/ethtool/cabletest.c
+new file mode 100644
+index 000000000000..aeb6672a46d0
+--- /dev/null
++++ b/net/ethtool/cabletest.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/phy.h>
++#include "netlink.h"
++#include "common.h"
++
++/* CABLE_TEST_ACT */
++
++static const struct nla_policy
++cable_test_act_policy[ETHTOOL_A_CABLE_TEST_MAX + 1] = {
++	[ETHTOOL_A_CABLE_TEST_UNSPEC]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_CABLE_TEST_HEADER]		= { .type = NLA_NESTED },
++};
++
++int ethnl_act_cable_test(struct sk_buff *skb, struct genl_info *info)
++{
++	struct nlattr *tb[ETHTOOL_A_CABLE_TEST_MAX + 1];
++	struct ethnl_req_info req_info = {};
++	struct net_device *dev;
++	int ret;
++
++	ret = nlmsg_parse(info->nlhdr, GENL_HDRLEN, tb,
++			  ETHTOOL_A_CABLE_TEST_MAX,
++			  cable_test_act_policy, info->extack);
++	if (ret < 0)
++		return ret;
++
++	ret = ethnl_parse_header_dev_get(&req_info,
++					 tb[ETHTOOL_A_CABLE_TEST_HEADER],
++					 genl_info_net(info), info->extack,
++					 true);
++	if (ret < 0)
++		return ret;
++
++	dev = req_info.dev;
++	if (!dev->phydev) {
++		ret = -EOPNOTSUPP;
++		goto out_dev_put;
++	}
++
++	rtnl_lock();
++	ret = ethnl_ops_begin(dev);
++	if (ret < 0)
++		goto out_rtnl;
++
++	ret = phy_start_cable_test(dev->phydev, info->extack);
++
++	ethnl_ops_complete(dev);
++out_rtnl:
++	rtnl_unlock();
++out_dev_put:
++	dev_put(dev);
++	return ret;
++}
+* Unmerged path net/ethtool/netlink.c
+* Unmerged path net/ethtool/netlink.h
