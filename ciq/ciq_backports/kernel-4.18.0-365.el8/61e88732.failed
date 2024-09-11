@@ -1,0 +1,266 @@
+drm/i915/xelpd: Handle PSR2 SDP indication in the prior scanline
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author José Roberto de Souza <jose.souza@intel.com>
+commit 61e887329e337694f3c8ac726c9e9c08e5569e5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/61e88732.failed
+
+In some modes there is not enough time during hblank to transmit PSR2
+SDP plus the pixels CRC SDP, if such case happens PSR2 needs to be
+disabled.
+But eDP spec 1.4b allows to transmit PSR2 SDP in a prior scanline
+alone and than later the CRC SDP, allowing PSR2 to be enabled in
+those hblank constrained modes.
+
+BSpec: 49274
+	Cc: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+	Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+	Reviewed-by: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210616203158.118111-4-jose.souza@intel.com
+(cherry picked from commit 61e887329e337694f3c8ac726c9e9c08e5569e5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display_types.h
+#	drivers/gpu/drm/i915/display/intel_psr.c
+#	drivers/gpu/drm/i915/i915_reg.h
+diff --cc drivers/gpu/drm/i915/display/intel_display_types.h
+index cc8308e725ba,d7b5e26e1394..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@@ -1001,7 -1044,9 +1001,8 @@@ struct intel_crtc_state 
+  	bool has_psr;
+  	bool has_psr2;
+  	bool enable_psr2_sel_fetch;
++ 	bool req_psr2_sdp_prior_scanline;
+  	u32 dc3co_exitline;
+ -	u16 su_y_granularity;
+  
+  	/*
+  	 * Frequence the dpll for the port should run at. Differs from the
+@@@ -1420,6 -1472,47 +1421,50 @@@ struct intel_pps 
+  	struct edp_power_seq pps_delays;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct intel_psr {
++ 	/* Mutex for PSR state of the transcoder */
++ 	struct mutex lock;
++ 
++ #define I915_PSR_DEBUG_MODE_MASK	0x0f
++ #define I915_PSR_DEBUG_DEFAULT		0x00
++ #define I915_PSR_DEBUG_DISABLE		0x01
++ #define I915_PSR_DEBUG_ENABLE		0x02
++ #define I915_PSR_DEBUG_FORCE_PSR1	0x03
++ #define I915_PSR_DEBUG_ENABLE_SEL_FETCH	0x4
++ #define I915_PSR_DEBUG_IRQ		0x10
++ 
++ 	u32 debug;
++ 	bool sink_support;
++ 	bool source_support;
++ 	bool enabled;
++ 	bool paused;
++ 	enum pipe pipe;
++ 	enum transcoder transcoder;
++ 	bool active;
++ 	struct work_struct work;
++ 	unsigned int busy_frontbuffer_bits;
++ 	bool sink_psr2_support;
++ 	bool link_standby;
++ 	bool colorimetry_support;
++ 	bool psr2_enabled;
++ 	bool psr2_sel_fetch_enabled;
++ 	bool req_psr2_sdp_prior_scanline;
++ 	u8 sink_sync_latency;
++ 	ktime_t last_entry_attempt;
++ 	ktime_t last_exit;
++ 	bool sink_not_reliable;
++ 	bool irq_aux_error;
++ 	u16 su_w_granularity;
++ 	u16 su_y_granularity;
++ 	u32 dc3co_exitline;
++ 	u32 dc3co_exit_delay;
++ 	struct delayed_work dc3co_work;
++ 	struct drm_dp_vsc_sdp vsc;
++ };
++ 
+++>>>>>>> 61e887329e33 (drm/i915/xelpd: Handle PSR2 SDP indication in the prior scanline)
+  struct intel_dp {
+  	i915_reg_t output_reg;
+  	u32 DP;
+diff --cc drivers/gpu/drm/i915/display/intel_psr.c
+index 2c6c4a4f9477,3cb8758be404..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_psr.c
++++ b/drivers/gpu/drm/i915/display/intel_psr.c
+@@@ -549,7 -588,10 +552,14 @@@ static void hsw_activate_psr2(struct in
+  		val |= EDP_PSR2_FAST_WAKE(7);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (dev_priv->psr.psr2_sel_fetch_enabled) {
+++=======
++ 	if (intel_dp->psr.req_psr2_sdp_prior_scanline)
++ 		val |= EDP_PSR2_SU_SDP_SCANLINE;
++ 
++ 	if (intel_dp->psr.psr2_sel_fetch_enabled) {
+++>>>>>>> 61e887329e33 (drm/i915/xelpd: Handle PSR2 SDP indication in the prior scanline)
+  		/* WA 1408330847 */
+  		if (IS_TGL_DISPLAY_STEP(dev_priv, STEP_A0, STEP_A0) ||
+  		    IS_RKL_REVID(dev_priv, RKL_REVID_A0, RKL_REVID_A0))
+@@@ -714,6 -779,70 +724,66 @@@ static bool intel_psr2_sel_fetch_config
+  	return crtc_state->enable_psr2_sel_fetch = true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool psr2_granularity_check(struct intel_dp *intel_dp,
++ 				   struct intel_crtc_state *crtc_state)
++ {
++ 	const int crtc_hdisplay = crtc_state->hw.adjusted_mode.crtc_hdisplay;
++ 	const int crtc_vdisplay = crtc_state->hw.adjusted_mode.crtc_vdisplay;
++ 	u16 y_granularity = 0;
++ 
++ 	/* PSR2 HW only send full lines so we only need to validate the width */
++ 	if (crtc_hdisplay % intel_dp->psr.su_w_granularity)
++ 		return false;
++ 
++ 	if (crtc_vdisplay % intel_dp->psr.su_y_granularity)
++ 		return false;
++ 
++ 	/* HW tracking is only aligned to 4 lines */
++ 	if (!crtc_state->enable_psr2_sel_fetch)
++ 		return intel_dp->psr.su_y_granularity == 4;
++ 
++ 	/*
++ 	 * For SW tracking we can adjust the y to match sink requirement if
++ 	 * multiple of 4
++ 	 */
++ 	if (intel_dp->psr.su_y_granularity <= 2)
++ 		y_granularity = 4;
++ 	else if ((intel_dp->psr.su_y_granularity % 4) == 0)
++ 		y_granularity = intel_dp->psr.su_y_granularity;
++ 
++ 	if (y_granularity == 0 || crtc_vdisplay % y_granularity)
++ 		return false;
++ 
++ 	crtc_state->su_y_granularity = y_granularity;
++ 	return true;
++ }
++ 
++ static bool _compute_psr2_sdp_prior_scanline_indication(struct intel_dp *intel_dp,
++ 							struct intel_crtc_state *crtc_state)
++ {
++ 	const struct drm_display_mode *adjusted_mode = &crtc_state->uapi.adjusted_mode;
++ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
++ 	u32 hblank_total, hblank_ns, req_ns;
++ 
++ 	hblank_total = adjusted_mode->crtc_hblank_end - adjusted_mode->crtc_hblank_start;
++ 	hblank_ns = div_u64(1000000ULL * hblank_total, adjusted_mode->crtc_clock);
++ 
++ 	/* From spec: (72 / number of lanes) * 1000 / symbol clock frequency MHz */
++ 	req_ns = (72 / crtc_state->lane_count) * 1000 / (crtc_state->port_clock / 1000);
++ 
++ 	if ((hblank_ns - req_ns) > 100)
++ 		return true;
++ 
++ 	if (DISPLAY_VER(dev_priv) < 13 || intel_dp->edp_dpcd[0] < DP_EDP_14b)
++ 		return false;
++ 
++ 	crtc_state->req_psr2_sdp_prior_scanline = true;
++ 	return true;
++ }
++ 
+++>>>>>>> 61e887329e33 (drm/i915/xelpd: Handle PSR2 SDP indication in the prior scanline)
+  static bool intel_psr2_config_valid(struct intel_dp *intel_dp,
+  				    struct intel_crtc_state *crtc_state)
+  {
+@@@ -1015,23 -1176,53 +1091,55 @@@ static void intel_psr_enable_locked(str
+  		val &= EDP_PSR_ERROR(0);
+  	} else {
+  		val = intel_de_read(dev_priv, EDP_PSR_IIR);
+ -		val &= EDP_PSR_ERROR(intel_dp->psr.transcoder);
+ +		val &= EDP_PSR_ERROR(dev_priv->psr.transcoder);
+  	}
+  	if (val) {
+ -		intel_dp->psr.sink_not_reliable = true;
+ +		dev_priv->psr.sink_not_reliable = true;
+  		drm_dbg_kms(&dev_priv->drm,
+  			    "PSR interruption error set, not enabling PSR\n");
+ -		return false;
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return true;
++ }
++ 
++ static void intel_psr_enable_locked(struct intel_dp *intel_dp,
++ 				    const struct intel_crtc_state *crtc_state,
++ 				    const struct drm_connector_state *conn_state)
++ {
++ 	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
++ 	struct drm_i915_private *dev_priv = dp_to_i915(intel_dp);
++ 	struct intel_encoder *encoder = &dig_port->base;
++ 	u32 val;
++ 
++ 	drm_WARN_ON(&dev_priv->drm, intel_dp->psr.enabled);
++ 
++ 	intel_dp->psr.psr2_enabled = crtc_state->has_psr2;
++ 	intel_dp->psr.busy_frontbuffer_bits = 0;
++ 	intel_dp->psr.pipe = to_intel_crtc(crtc_state->uapi.crtc)->pipe;
++ 	intel_dp->psr.transcoder = crtc_state->cpu_transcoder;
++ 	/* DC5/DC6 requires at least 6 idle frames */
++ 	val = usecs_to_jiffies(intel_get_frame_time_us(crtc_state) * 6);
++ 	intel_dp->psr.dc3co_exit_delay = val;
++ 	intel_dp->psr.dc3co_exitline = crtc_state->dc3co_exitline;
++ 	intel_dp->psr.psr2_sel_fetch_enabled = crtc_state->enable_psr2_sel_fetch;
++ 	intel_dp->psr.req_psr2_sdp_prior_scanline =
++ 		crtc_state->req_psr2_sdp_prior_scanline;
++ 
++ 	if (!psr_interrupt_error_check(intel_dp))
++ 		return;
++ 
+++>>>>>>> 61e887329e33 (drm/i915/xelpd: Handle PSR2 SDP indication in the prior scanline)
+  	drm_dbg_kms(&dev_priv->drm, "Enabling PSR%s\n",
+ -		    intel_dp->psr.psr2_enabled ? "2" : "1");
+ +		    dev_priv->psr.psr2_enabled ? "2" : "1");
+  	intel_dp_compute_psr_vsc_sdp(intel_dp, crtc_state, conn_state,
+ -				     &intel_dp->psr.vsc);
+ -	intel_write_dp_vsc_sdp(encoder, crtc_state, &intel_dp->psr.vsc);
+ +				     &dev_priv->psr.vsc);
+ +	intel_write_dp_vsc_sdp(encoder, crtc_state, &dev_priv->psr.vsc);
+  	intel_psr_enable_sink(intel_dp);
+ -	intel_psr_enable_source(intel_dp);
+ -	intel_dp->psr.enabled = true;
+ -	intel_dp->psr.paused = false;
+ +	intel_psr_enable_source(intel_dp, crtc_state);
+ +	dev_priv->psr.enabled = true;
+  
+  	intel_psr_activate(intel_dp);
+  }
+diff --cc drivers/gpu/drm/i915/i915_reg.h
+index f515475c1335,10856e356be0..000000000000
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@@ -4566,8 -4577,8 +4566,13 @@@ enum 
+  #define   EDP_SU_TRACK_ENABLE			(1 << 30)
+  #define   TGL_EDP_PSR2_BLOCK_COUNT_NUM_2	(0 << 28)
+  #define   TGL_EDP_PSR2_BLOCK_COUNT_NUM_3	(1 << 28)
+++<<<<<<< HEAD
+ +#define   EDP_Y_COORDINATE_VALID		(1 << 26) /* GLK and CNL+ */
+ +#define   EDP_Y_COORDINATE_ENABLE		(1 << 25) /* GLK and CNL+ */
+++=======
++ #define   EDP_Y_COORDINATE_ENABLE		REG_BIT(25) /* display 10, 11 and 12 */
++ #define   EDP_PSR2_SU_SDP_SCANLINE		REG_BIT(25) /* display 13+ */
+++>>>>>>> 61e887329e33 (drm/i915/xelpd: Handle PSR2 SDP indication in the prior scanline)
+  #define   EDP_MAX_SU_DISABLE_TIME(t)		((t) << 20)
+  #define   EDP_MAX_SU_DISABLE_TIME_MASK		(0x1f << 20)
+  #define   EDP_PSR2_IO_BUFFER_WAKE_MAX_LINES	8
+* Unmerged path drivers/gpu/drm/i915/display/intel_display_types.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_psr.c
+* Unmerged path drivers/gpu/drm/i915/i915_reg.h
