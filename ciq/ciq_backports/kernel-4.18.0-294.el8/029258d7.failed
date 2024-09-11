@@ -1,0 +1,200 @@
+libbpf: Remove any use of reallocarray() in libbpf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 029258d7b22894fabcecb1626e1b87d18a6823f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/029258d7.failed
+
+Re-implement glibc's reallocarray() for libbpf internal-only use.
+reallocarray(), unfortunately, is not available in all versions of glibc, so
+requires extra feature detection and using reallocarray() stub from
+<tools/libc_compat.h> and COMPAT_NEED_REALLOCARRAY. All this complicates build
+of libbpf unnecessarily and is just a maintenance burden. Instead, it's
+trivial to implement libbpf-specific internal version and use it throughout
+libbpf.
+
+Which is what this patch does, along with converting some realloc() uses that
+should really have been reallocarray() in the first place.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200819013607.3607269-2-andriin@fb.com
+(cherry picked from commit 029258d7b22894fabcecb1626e1b87d18a6823f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/ringbuf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 3a6c874656cb,2653bcee73b7..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -5323,12 -5464,15 +5322,16 @@@ static int bpf_object__collect_map_relo
+  			return -EINVAL;
+  
+  		moff = rel.r_offset - vi->offset - moff;
+ -		/* here we use BPF pointer size, which is always 64 bit, as we
+ -		 * are parsing ELF that was built for BPF target
+ -		 */
+ -		if (moff % bpf_ptr_sz)
+ +		if (moff % ptr_sz)
+  			return -EINVAL;
+ -		moff /= bpf_ptr_sz;
+ +		moff /= ptr_sz;
+  		if (moff >= map->init_slots_sz) {
+  			new_sz = moff + 1;
+++<<<<<<< HEAD
+ +			tmp = realloc(map->init_slots, new_sz * ptr_sz);
+++=======
++ 			tmp = libbpf_reallocarray(map->init_slots, new_sz, host_ptr_sz);
+++>>>>>>> 029258d7b228 (libbpf: Remove any use of reallocarray() in libbpf)
+  			if (!tmp)
+  				return -ENOMEM;
+  			map->init_slots = tmp;
+* Unmerged path tools/lib/bpf/ringbuf.c
+diff --git a/tools/lib/bpf/Makefile b/tools/lib/bpf/Makefile
+index 8bf2c406b0e0..8dafc461f4af 100644
+--- a/tools/lib/bpf/Makefile
++++ b/tools/lib/bpf/Makefile
+@@ -56,7 +56,7 @@ ifndef VERBOSE
+ endif
+ 
+ FEATURE_USER = .libbpf
+-FEATURE_TESTS = libelf libelf-mmap zlib bpf reallocarray
++FEATURE_TESTS = libelf libelf-mmap zlib bpf
+ FEATURE_DISPLAY = libelf zlib bpf
+ 
+ INCLUDES = -I. -I$(srctree)/tools/include -I$(srctree)/tools/include/uapi
+@@ -102,10 +102,6 @@ ifeq ($(feature-libelf-mmap), 1)
+   override CFLAGS += -DHAVE_LIBELF_MMAP_SUPPORT
+ endif
+ 
+-ifeq ($(feature-reallocarray), 0)
+-  override CFLAGS += -DCOMPAT_NEED_REALLOCARRAY
+-endif
+-
+ # Append required CFLAGS
+ override CFLAGS += $(EXTRA_WARNINGS)
+ override CFLAGS += -Werror -Wall
+diff --git a/tools/lib/bpf/btf.c b/tools/lib/bpf/btf.c
+index 9ca048005e04..1e50be17b0f2 100644
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@ -60,7 +60,7 @@ static int btf_add_type(struct btf *btf, struct btf_type *t)
+ 		expand_by = max(btf->types_size >> 2, 16U);
+ 		new_size = min(BTF_MAX_NR_TYPES, btf->types_size + expand_by);
+ 
+-		new_types = realloc(btf->types, sizeof(*new_types) * new_size);
++		new_types = libbpf_reallocarray(btf->types, new_size, sizeof(*new_types));
+ 		if (!new_types)
+ 			return -ENOMEM;
+ 
+@@ -1415,7 +1415,7 @@ static int btf_dedup_hypot_map_add(struct btf_dedup *d,
+ 		__u32 *new_list;
+ 
+ 		d->hypot_cap += max((size_t)16, d->hypot_cap / 2);
+-		new_list = realloc(d->hypot_list, sizeof(__u32) * d->hypot_cap);
++		new_list = libbpf_reallocarray(d->hypot_list, d->hypot_cap, sizeof(__u32));
+ 		if (!new_list)
+ 			return -ENOMEM;
+ 		d->hypot_list = new_list;
+@@ -1711,8 +1711,7 @@ static int btf_dedup_strings(struct btf_dedup *d)
+ 			struct btf_str_ptr *new_ptrs;
+ 
+ 			strs.cap += max(strs.cnt / 2, 16U);
+-			new_ptrs = realloc(strs.ptrs,
+-					   sizeof(strs.ptrs[0]) * strs.cap);
++			new_ptrs = libbpf_reallocarray(strs.ptrs, strs.cap, sizeof(strs.ptrs[0]));
+ 			if (!new_ptrs) {
+ 				err = -ENOMEM;
+ 				goto done;
+@@ -2797,8 +2796,8 @@ static int btf_dedup_compact_types(struct btf_dedup *d)
+ 	d->btf->nr_types = next_type_id - 1;
+ 	d->btf->types_size = d->btf->nr_types;
+ 	d->btf->hdr->type_len = p - types_start;
+-	new_types = realloc(d->btf->types,
+-			    (1 + d->btf->nr_types) * sizeof(struct btf_type *));
++	new_types = libbpf_reallocarray(d->btf->types, (1 + d->btf->nr_types),
++					sizeof(struct btf_type *));
+ 	if (!new_types)
+ 		return -ENOMEM;
+ 	d->btf->types = new_types;
+diff --git a/tools/lib/bpf/btf_dump.c b/tools/lib/bpf/btf_dump.c
+index d4d7a964c0ee..e4fd378700ac 100644
+--- a/tools/lib/bpf/btf_dump.c
++++ b/tools/lib/bpf/btf_dump.c
+@@ -321,8 +321,7 @@ static int btf_dump_add_emit_queue_id(struct btf_dump *d, __u32 id)
+ 
+ 	if (d->emit_queue_cnt >= d->emit_queue_cap) {
+ 		new_cap = max(16, d->emit_queue_cap * 3 / 2);
+-		new_queue = realloc(d->emit_queue,
+-				    new_cap * sizeof(new_queue[0]));
++		new_queue = libbpf_reallocarray(d->emit_queue, new_cap, sizeof(new_queue[0]));
+ 		if (!new_queue)
+ 			return -ENOMEM;
+ 		d->emit_queue = new_queue;
+@@ -1001,8 +1000,7 @@ static int btf_dump_push_decl_stack_id(struct btf_dump *d, __u32 id)
+ 
+ 	if (d->decl_stack_cnt >= d->decl_stack_cap) {
+ 		new_cap = max(16, d->decl_stack_cap * 3 / 2);
+-		new_stack = realloc(d->decl_stack,
+-				    new_cap * sizeof(new_stack[0]));
++		new_stack = libbpf_reallocarray(d->decl_stack, new_cap, sizeof(new_stack[0]));
+ 		if (!new_stack)
+ 			return -ENOMEM;
+ 		d->decl_stack = new_stack;
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index b776a7125c92..954bc2bd040c 100644
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -9,6 +9,7 @@
+ #ifndef __LIBBPF_LIBBPF_INTERNAL_H
+ #define __LIBBPF_LIBBPF_INTERNAL_H
+ 
++#include <stdlib.h>
+ #include "libbpf.h"
+ 
+ #define BTF_INFO_ENC(kind, kind_flag, vlen) \
+@@ -23,6 +24,12 @@
+ #define BTF_PARAM_ENC(name, type) (name), (type)
+ #define BTF_VAR_SECINFO_ENC(type, offset, size) (type), (offset), (size)
+ 
++#ifndef likely
++#define likely(x) __builtin_expect(!!(x), 1)
++#endif
++#ifndef unlikely
++#define unlikely(x) __builtin_expect(!!(x), 0)
++#endif
+ #ifndef min
+ # define min(x, y) ((x) < (y) ? (x) : (y))
+ #endif
+@@ -63,6 +70,24 @@ do {				\
+ #define pr_info(fmt, ...)	__pr(LIBBPF_INFO, fmt, ##__VA_ARGS__)
+ #define pr_debug(fmt, ...)	__pr(LIBBPF_DEBUG, fmt, ##__VA_ARGS__)
+ 
++/*
++ * Re-implement glibc's reallocarray() for libbpf internal-only use.
++ * reallocarray(), unfortunately, is not available in all versions of glibc,
++ * so requires extra feature detection and using reallocarray() stub from
++ * <tools/libc_compat.h> and COMPAT_NEED_REALLOCARRAY. All this complicates
++ * build of libbpf unnecessarily and is just a maintenance burden. Instead,
++ * it's trivial to implement libbpf-specific internal version and use it
++ * throughout libbpf.
++ */
++static inline void *libbpf_reallocarray(void *ptr, size_t nmemb, size_t size)
++{
++	size_t total;
++
++	if (unlikely(__builtin_mul_overflow(nmemb, size, &total)))
++		return NULL;
++	return realloc(ptr, total);
++}
++
+ static inline bool libbpf_validate_opts(const char *opts,
+ 					size_t opts_sz, size_t user_sz,
+ 					const char *type_name)
+* Unmerged path tools/lib/bpf/ringbuf.c
