@@ -1,0 +1,252 @@
+KVM: VMX: Dynamically enable/disable PML based on memslot dirty logging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Makarand Sonare <makarandsonare@google.com>
+commit a85863c2ec55edcfd11853014b143fc02b8840a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/a85863c2.failed
+
+Currently, if enable_pml=1 PML remains enabled for the entire lifetime
+of the VM irrespective of whether dirty logging is enable or disabled.
+When dirty logging is disabled, all the pages of the VM are manually
+marked dirty, so that PML is effectively non-operational.  Setting
+the dirty bits is an expensive operation which can cause severe MMU
+lock contention in a performance sensitive path when dirty logging is
+disabled after a failed or canceled live migration.
+
+Manually setting dirty bits also fails to prevent PML activity if some
+code path clears dirty bits, which can incur unnecessary VM-Exits.
+
+In order to avoid this extra overhead, dynamically enable/disable PML
+when dirty logging gets turned on/off for the first/last memslot.
+
+	Signed-off-by: Makarand Sonare <makarandsonare@google.com>
+Co-developed-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210213005015.1651772-12-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a85863c2ec55edcfd11853014b143fc02b8840a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm-x86-ops.h
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/vmx/vmx.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm-x86-ops.h
+index 355a2ab8fc09,323641097f63..000000000000
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@@ -93,11 -93,7 +93,15 @@@ KVM_X86_OP(check_intercept
+  KVM_X86_OP(handle_exit_irqoff)
+  KVM_X86_OP_NULL(request_immediate_exit)
+  KVM_X86_OP(sched_in)
+++<<<<<<< HEAD
+ +KVM_X86_OP_NULL(slot_enable_log_dirty)
+ +KVM_X86_OP_NULL(slot_disable_log_dirty)
+ +KVM_X86_OP_NULL(flush_log_dirty)
+ +KVM_X86_OP_NULL(enable_log_dirty_pt_masked)
+ +KVM_X86_OP_NULL(cpu_dirty_log_size)
+++=======
++ KVM_X86_OP_NULL(update_cpu_dirty_logging)
+++>>>>>>> a85863c2ec55 (KVM: VMX: Dynamically enable/disable PML based on memslot dirty logging)
+  KVM_X86_OP_NULL(pre_block)
+  KVM_X86_OP_NULL(post_block)
+  KVM_X86_OP_NULL(vcpu_blocking)
+diff --cc arch/x86/include/asm/kvm_host.h
+index 35dd7577a5ae,ffcfa84c969d..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1263,29 -1274,11 +1266,34 @@@ struct kvm_x86_ops 
+  	void (*sched_in)(struct kvm_vcpu *kvm, int cpu);
+  
+  	/*
+ -	 * Size of the CPU's dirty log buffer, i.e. VMX's PML buffer.  A zero
+ -	 * value indicates CPU dirty logging is unsupported or disabled.
+ +	 * Arch-specific dirty logging hooks. These hooks are only supposed to
+ +	 * be valid if the specific arch has hardware-accelerated dirty logging
+ +	 * mechanism. Currently only for PML on VMX.
+ +	 *
+ +	 *  - slot_enable_log_dirty:
+ +	 *	called when enabling log dirty mode for the slot.
+ +	 *  - slot_disable_log_dirty:
+ +	 *	called when disabling log dirty mode for the slot.
+ +	 *	also called when slot is created with log dirty disabled.
+ +	 *  - flush_log_dirty:
+ +	 *	called before reporting dirty_bitmap to userspace.
+ +	 *  - enable_log_dirty_pt_masked:
+ +	 *	called when reenabling log dirty for the GFNs in the mask after
+ +	 *	corresponding bits are cleared in slot->dirty_bitmap.
+  	 */
+++<<<<<<< HEAD
+ +	void (*slot_enable_log_dirty)(struct kvm *kvm,
+ +				      struct kvm_memory_slot *slot);
+ +	void (*slot_disable_log_dirty)(struct kvm *kvm,
+ +				       struct kvm_memory_slot *slot);
+ +	void (*flush_log_dirty)(struct kvm *kvm);
+ +	void (*enable_log_dirty_pt_masked)(struct kvm *kvm,
+ +					   struct kvm_memory_slot *slot,
+ +					   gfn_t offset, unsigned long mask);
+++=======
++ 	int cpu_dirty_log_size;
++ 	void (*update_cpu_dirty_logging)(struct kvm_vcpu *vcpu);
+++>>>>>>> a85863c2ec55 (KVM: VMX: Dynamically enable/disable PML based on memslot dirty logging)
+  
+  	/* pmu operations of sub-arch */
+  	const struct kvm_pmu_ops *pmu_ops;
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 9c626d532031,50810d471462..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -7453,30 -7496,24 +7458,51 @@@ static void vmx_sched_in(struct kvm_vcp
+  		shrink_ple_window(vcpu);
+  }
+  
+++<<<<<<< HEAD
+ +static void vmx_slot_enable_log_dirty(struct kvm *kvm,
+ +				     struct kvm_memory_slot *slot)
+ +{
+ +	if (!kvm_dirty_log_manual_protect_and_init_set(kvm))
+ +		kvm_mmu_slot_leaf_clear_dirty(kvm, slot);
+ +	kvm_mmu_slot_largepage_remove_write_access(kvm, slot);
+ +}
+ +
+ +static void vmx_slot_disable_log_dirty(struct kvm *kvm,
+ +				       struct kvm_memory_slot *slot)
+ +{
+ +	kvm_mmu_slot_set_dirty(kvm, slot);
+ +}
+ +
+ +static void vmx_flush_log_dirty(struct kvm *kvm)
+ +{
+ +	kvm_flush_pml_buffers(kvm);
+ +}
+ +
+ +static void vmx_enable_log_dirty_pt_masked(struct kvm *kvm,
+ +					   struct kvm_memory_slot *memslot,
+ +					   gfn_t offset, unsigned long mask)
+ +{
+ +	kvm_mmu_clear_dirty_pt_masked(kvm, memslot, offset, mask);
+++=======
++ void vmx_update_cpu_dirty_logging(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (is_guest_mode(vcpu)) {
++ 		vmx->nested.update_vmcs01_cpu_dirty_logging = true;
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Note, cpu_dirty_logging_count can be changed concurrent with this
++ 	 * code, but in that case another update request will be made and so
++ 	 * the guest will never run with a stale PML value.
++ 	 */
++ 	if (vcpu->kvm->arch.cpu_dirty_logging_count)
++ 		secondary_exec_controls_setbit(vmx, SECONDARY_EXEC_ENABLE_PML);
++ 	else
++ 		secondary_exec_controls_clearbit(vmx, SECONDARY_EXEC_ENABLE_PML);
+++>>>>>>> a85863c2ec55 (KVM: VMX: Dynamically enable/disable PML based on memslot dirty logging)
+  }
+  
+  static int vmx_pre_block(struct kvm_vcpu *vcpu)
+@@@ -7685,10 -7722,8 +7711,15 @@@ static struct kvm_x86_ops vmx_x86_ops _
+  
+  	.sched_in = vmx_sched_in,
+  
+++<<<<<<< HEAD
+ +	.slot_enable_log_dirty = vmx_slot_enable_log_dirty,
+ +	.slot_disable_log_dirty = vmx_slot_disable_log_dirty,
+ +	.flush_log_dirty = vmx_flush_log_dirty,
+ +	.enable_log_dirty_pt_masked = vmx_enable_log_dirty_pt_masked,
+++=======
++ 	.cpu_dirty_log_size = PML_ENTITY_NUM,
++ 	.update_cpu_dirty_logging = vmx_update_cpu_dirty_logging,
+++>>>>>>> a85863c2ec55 (KVM: VMX: Dynamically enable/disable PML based on memslot dirty logging)
+  
+  	.pre_block = vmx_pre_block,
+  	.post_block = vmx_post_block,
+diff --cc arch/x86/kvm/x86.c
+index 7d556c7e50f6,b9a8c8af9713..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8894,10 -8986,14 +8894,17 @@@ static int vcpu_enter_guest(struct kvm_
+  		if (kvm_check_request(KVM_REQ_APF_READY, vcpu))
+  			kvm_check_async_pf_completion(vcpu);
+  		if (kvm_check_request(KVM_REQ_MSR_FILTER_CHANGED, vcpu))
+++<<<<<<< HEAD
+ +			kvm_x86_ops.msr_filter_changed(vcpu);
+++=======
++ 			static_call(kvm_x86_msr_filter_changed)(vcpu);
++ 
++ 		if (kvm_check_request(KVM_REQ_UPDATE_CPU_DIRTY_LOGGING, vcpu))
++ 			static_call(kvm_x86_update_cpu_dirty_logging)(vcpu);
+++>>>>>>> a85863c2ec55 (KVM: VMX: Dynamically enable/disable PML based on memslot dirty logging)
+  	}
+  
+ -	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win ||
+ -	    kvm_xen_has_interrupt(vcpu)) {
+ +	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
+  		++vcpu->stat.req_event;
+  		kvm_apic_accept_events(vcpu);
+  		if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED) {
+@@@ -10696,9 -10850,11 +10727,17 @@@ static void kvm_mmu_slot_apply_flags(st
+  	 * initial-all-set state.  Otherwise, depending on whether pml
+  	 * is enabled the D-bit or the W-bit will be cleared.
+  	 */
+++<<<<<<< HEAD
+ +	if (new->flags & KVM_MEM_LOG_DIRTY_PAGES) {
+ +		if (kvm_x86_ops.slot_enable_log_dirty) {
+ +			kvm_x86_ops.slot_enable_log_dirty(kvm, new);
+++=======
++ 	if (log_dirty_pages) {
++ 		if (kvm_x86_ops.cpu_dirty_log_size) {
++ 			if (!kvm_dirty_log_manual_protect_and_init_set(kvm))
++ 				kvm_mmu_slot_leaf_clear_dirty(kvm, new);
++ 			kvm_mmu_slot_largepage_remove_write_access(kvm, new);
+++>>>>>>> a85863c2ec55 (KVM: VMX: Dynamically enable/disable PML based on memslot dirty logging)
+  		} else {
+  			int level =
+  				kvm_dirty_log_manual_protect_and_init_set(kvm) ?
+* Unmerged path arch/x86/include/asm/kvm-x86-ops.h
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 9cd81a604f96..84d11815235f 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -4516,6 +4516,11 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+ 		vmx_set_virtual_apic_mode(vcpu);
+ 	}
+ 
++	if (vmx->nested.update_vmcs01_cpu_dirty_logging) {
++		vmx->nested.update_vmcs01_cpu_dirty_logging = false;
++		vmx_update_cpu_dirty_logging(vcpu);
++	}
++
+ 	/* Unpin physical memory we referred to in vmcs02 */
+ 	if (vmx->nested.apic_access_page) {
+ 		kvm_release_page_clean(vmx->nested.apic_access_page);
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 0f20df4e397f..9b396e0d8561 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -160,6 +160,7 @@ struct nested_vmx {
+ 
+ 	bool change_vmcs01_virtual_apic_mode;
+ 	bool reload_vmcs01_apic_access_page;
++	bool update_vmcs01_cpu_dirty_logging;
+ 
+ 	/*
+ 	 * Enlightened VMCS has been enabled. It does not mean that L1 has to
+@@ -387,6 +388,7 @@ int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr);
+ void vmx_ept_load_pdptrs(struct kvm_vcpu *vcpu);
+ void vmx_set_intercept_for_msr(struct kvm_vcpu *vcpu,
+ 	u32 msr, int type, bool value);
++void vmx_update_cpu_dirty_logging(struct kvm_vcpu *vcpu);
+ 
+ static inline u8 vmx_get_rvi(void)
+ {
+* Unmerged path arch/x86/kvm/x86.c
