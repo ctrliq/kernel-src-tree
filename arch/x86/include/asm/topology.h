@@ -112,6 +112,8 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
 	(cpu_data(cpu)._rh.cpu_die_id)
 #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
 
+extern unsigned int __max_die_per_package;
+
 #ifdef CONFIG_SMP
 #define topology_die_cpumask(cpu)		(per_cpu(cpu_die_map, cpu))
 #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
@@ -119,8 +121,6 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
 
 extern unsigned int __max_logical_packages;
 #define topology_max_packages()			(__max_logical_packages)
-
-extern unsigned int __max_die_per_package;
 
 static inline int topology_max_die_per_package(void)
 {
