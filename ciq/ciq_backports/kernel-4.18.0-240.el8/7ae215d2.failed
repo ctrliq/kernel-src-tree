@@ -1,0 +1,170 @@
+bpf: Don't refcount LISTEN sockets in sk_assign()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joe Stringer <joe@wand.net.nz>
+commit 7ae215d23c12a939005f35d1848ca55b6109b9c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7ae215d2.failed
+
+Avoid taking a reference on listen sockets by checking the socket type
+in the sk_assign and in the corresponding skb_steal_sock() code in the
+the transport layer, and by ensuring that the prefetch free (sock_pfree)
+function uses the same logic to check whether the socket is refcounted.
+
+	Suggested-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Joe Stringer <joe@wand.net.nz>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20200329225342.16317-4-joe@wand.net.nz
+(cherry picked from commit 7ae215d23c12a939005f35d1848ca55b6109b9c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+#	net/core/filter.c
+#	net/core/sock.c
+diff --cc include/net/sock.h
+index a36bd86aaa91,6d84784d33fa..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -2448,16 -2527,14 +2448,17 @@@ void sock_net_set(struct sock *sk, stru
+  	write_pnet(&sk->sk_net, net);
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct sock *skb_steal_sock(struct sk_buff *skb)
+++=======
++ static inline bool
++ skb_sk_is_prefetched(struct sk_buff *skb)
+  {
+- 	if (skb->sk) {
+- 		struct sock *sk = skb->sk;
+- 
+- 		skb->destructor = NULL;
+- 		skb->sk = NULL;
+- 		return sk;
+- 	}
+- 	return NULL;
++ #ifdef CONFIG_INET
++ 	return skb->destructor == sock_pfree;
++ #else
++ 	return false;
++ #endif /* CONFIG_INET */
+  }
+  
+  /* This helper checks if a socket is a full socket,
+@@@ -2468,6 -2545,35 +2469,38 @@@ static inline bool sk_fullsock(const st
+  	return (1 << sk->sk_state) & ~(TCPF_TIME_WAIT | TCPF_NEW_SYN_RECV);
+  }
+  
++ static inline bool
++ sk_is_refcounted(struct sock *sk)
++ {
++ 	/* Only full sockets have sk->sk_flags. */
++ 	return !sk_fullsock(sk) || !sock_flag(sk, SOCK_RCU_FREE);
++ }
++ 
++ /**
++  * skb_steal_sock
++  * @skb to steal the socket from
++  * @refcounted is set to true if the socket is reference-counted
++  */
++ static inline struct sock *
++ skb_steal_sock(struct sk_buff *skb, bool *refcounted)
+++>>>>>>> 7ae215d23c12 (bpf: Don't refcount LISTEN sockets in sk_assign())
++ {
++ 	if (skb->sk) {
++ 		struct sock *sk = skb->sk;
++ 
+++<<<<<<< HEAD
+++=======
++ 		*refcounted = true;
++ 		if (skb_sk_is_prefetched(skb))
++ 			*refcounted = sk_is_refcounted(sk);
+++>>>>>>> 7ae215d23c12 (bpf: Don't refcount LISTEN sockets in sk_assign())
++ 		skb->destructor = NULL;
++ 		skb->sk = NULL;
++ 		return sk;
++ 	}
+ -	*refcounted = false;
++ 	return NULL;
++ }
++ 
+  /* Checks if this SKB belongs to an HW offloaded socket
+   * and whether any SW fallbacks are required based on dev.
+   * Check decrypted mark in case skb_orphan() cleared socket.
+diff --cc net/core/filter.c
+index f77b9440c7a9,7628b947dbc3..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -5946,6 -5917,36 +5945,39 @@@ static const struct bpf_func_proto bpf_
+  	.arg5_type	= ARG_CONST_SIZE,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ BPF_CALL_3(bpf_sk_assign, struct sk_buff *, skb, struct sock *, sk, u64, flags)
++ {
++ 	if (flags != 0)
++ 		return -EINVAL;
++ 	if (!skb_at_tc_ingress(skb))
++ 		return -EOPNOTSUPP;
++ 	if (unlikely(dev_net(skb->dev) != sock_net(sk)))
++ 		return -ENETUNREACH;
++ 	if (unlikely(sk->sk_reuseport))
++ 		return -ESOCKTNOSUPPORT;
++ 	if (sk_is_refcounted(sk) &&
++ 	    unlikely(!refcount_inc_not_zero(&sk->sk_refcnt)))
++ 		return -ENOENT;
++ 
++ 	skb_orphan(skb);
++ 	skb->sk = sk;
++ 	skb->destructor = sock_pfree;
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_sk_assign_proto = {
++ 	.func		= bpf_sk_assign,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type      = ARG_PTR_TO_CTX,
++ 	.arg2_type      = ARG_PTR_TO_SOCK_COMMON,
++ 	.arg3_type	= ARG_ANYTHING,
++ };
++ 
+++>>>>>>> 7ae215d23c12 (bpf: Don't refcount LISTEN sockets in sk_assign())
+  #endif /* CONFIG_INET */
+  
+  bool bpf_helper_changes_pkt_data(void *func)
+diff --cc net/core/sock.c
+index 35fa08a8af6b,da32d9b6d09f..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -2005,6 -2071,18 +2005,21 @@@ void sock_efree(struct sk_buff *skb
+  }
+  EXPORT_SYMBOL(sock_efree);
+  
+++<<<<<<< HEAD
+++=======
++ /* Buffer destructor for prefetch/receive path where reference count may
++  * not be held, e.g. for listen sockets.
++  */
++ #ifdef CONFIG_INET
++ void sock_pfree(struct sk_buff *skb)
++ {
++ 	if (sk_is_refcounted(skb->sk))
++ 		sock_gen_put(skb->sk);
++ }
++ EXPORT_SYMBOL(sock_pfree);
++ #endif /* CONFIG_INET */
++ 
+++>>>>>>> 7ae215d23c12 (bpf: Don't refcount LISTEN sockets in sk_assign())
+  kuid_t sock_i_uid(struct sock *sk)
+  {
+  	kuid_t uid;
+* Unmerged path include/net/sock.h
+* Unmerged path net/core/filter.c
+* Unmerged path net/core/sock.c
