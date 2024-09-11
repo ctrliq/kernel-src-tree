@@ -489,6 +489,7 @@ enum rtl_register_content {
 	PCIDAC		= (1 << 4),
 	PCIMulRW	= (1 << 3),
 #define INTT_MASK	GENMASK(1, 0)
+#define CPCMD_MASK	(Normal_mode | RxVlan | RxChkSum | INTT_MASK)
 
 	/* rtl8169_PHYstatus */
 	TBI_Enable	= 0x80,
@@ -572,7 +573,6 @@ enum rtl_rx_desc_bit {
 };
 
 #define RsvdMask	0x3fffc000
-#define CPCMD_QUIRK_MASK	(Normal_mode | RxVlan | RxChkSum | INTT_MASK)
 
 struct TxDesc {
 	__le32 opts1;
@@ -4209,6 +4209,9 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
 {
 	rtl_unlock_config_regs(tp);
 
+	tp->cp_cmd &= CPCMD_MASK;
+	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
+
 	tp->hw_start(tp);
 
 	rtl_set_rx_max_size(tp);
@@ -4376,9 +4379,6 @@ static void rtl_hw_start_8168bb(struct rtl8169_private *tp)
 {
 	RTL_W8(tp, Config3, RTL_R8(tp, Config3) & ~Beacon_en);
 
-	tp->cp_cmd &= CPCMD_QUIRK_MASK;
-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
-
 	if (tp->dev->mtu <= ETH_DATA_LEN) {
 		rtl_tx_performance_tweak(tp, PCI_EXP_DEVCTL_READRQ_4096B |
 					 PCI_EXP_DEVCTL_NOSNOOP_EN);
@@ -4404,9 +4404,6 @@ static void __rtl_hw_start_8168cp(struct rtl8169_private *tp)
 		rtl_tx_performance_tweak(tp, PCI_EXP_DEVCTL_READRQ_4096B);
 
 	rtl_disable_clock_request(tp);
-
-	tp->cp_cmd &= CPCMD_QUIRK_MASK;
-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
 }
 
 static void rtl_hw_start_8168cp_1(struct rtl8169_private *tp)
@@ -4434,9 +4431,6 @@ static void rtl_hw_start_8168cp_2(struct rtl8169_private *tp)
 
 	if (tp->dev->mtu <= ETH_DATA_LEN)
 		rtl_tx_performance_tweak(tp, PCI_EXP_DEVCTL_READRQ_4096B);
-
-	tp->cp_cmd &= CPCMD_QUIRK_MASK;
-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
 }
 
 static void rtl_hw_start_8168cp_3(struct rtl8169_private *tp)
@@ -4452,9 +4446,6 @@ static void rtl_hw_start_8168cp_3(struct rtl8169_private *tp)
 
 	if (tp->dev->mtu <= ETH_DATA_LEN)
 		rtl_tx_performance_tweak(tp, PCI_EXP_DEVCTL_READRQ_4096B);
-
-	tp->cp_cmd &= CPCMD_QUIRK_MASK;
-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
 }
 
 static void rtl_hw_start_8168c_1(struct rtl8169_private *tp)
@@ -4510,9 +4501,6 @@ static void rtl_hw_start_8168d(struct rtl8169_private *tp)
 
 	if (tp->dev->mtu <= ETH_DATA_LEN)
 		rtl_tx_performance_tweak(tp, PCI_EXP_DEVCTL_READRQ_4096B);
-
-	tp->cp_cmd &= CPCMD_QUIRK_MASK;
-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
 }
 
 static void rtl_hw_start_8168dp(struct rtl8169_private *tp)
@@ -5146,9 +5134,6 @@ static void rtl_hw_start_8101(struct rtl8169_private *tp)
 					 PCI_EXP_DEVCTL_NOSNOOP_EN);
 
 	RTL_W8(tp, MaxTxPacketSize, TxPacketMax);
-
-	tp->cp_cmd &= CPCMD_QUIRK_MASK;
-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
 
 	rtl_hw_config(tp);
 }
