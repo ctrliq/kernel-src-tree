@@ -452,7 +452,7 @@ xfs_showargs(
 
 	if (mp->m_flags & XFS_MOUNT_DFLT_IOSIZE)
 		seq_printf(m, ",allocsize=%dk",
-				(int)(1 << mp->m_allocsize_log) >> 10);
+			   (1 << mp->m_allocsize_log) >> 10);
 
 	if (mp->m_logbufs > 0)
 		seq_printf(m, ",logbufs=%d", mp->m_logbufs);
