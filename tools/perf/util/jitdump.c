@@ -26,7 +26,6 @@
 #include "jit.h"
 #include "jitdump.h"
 #include "genelf.h"
-#include "../builtin.h"
 
 #include <linux/ctype.h>
 #include <linux/zalloc.h>
