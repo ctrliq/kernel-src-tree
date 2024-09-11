@@ -1,0 +1,837 @@
+scsi: qla2xxx: Introduce the dsd32 and dsd64 data structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit 15b7a68c1d030b2365c823730d0eb9257f2aa60e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/15b7a68c.failed
+
+Introduce two structures for the (DMA address, length) combination instead
+of using separate structure members for the DMA address and length. This
+patch fixes several Coverity complaints about 'cur_dsd' being used to write
+outside the bounds of structure members.
+
+	Cc: Himanshu Madhani <hmadhani@marvell.com>
+	Cc: Giridhar Malavali <gmalavali@marvell.com>
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Acked-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 15b7a68c1d030b2365c823730d0eb9257f2aa60e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_iocb.c
+diff --cc drivers/scsi/qla2xxx/qla_iocb.c
+index f311597650f9,ef895e1142c9..000000000000
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@@ -3058,11 -3033,7 +3024,15 @@@ qla2x00_ct_iocb(srb_t *sp, ms_iocb_entr
+  			entry_count++;
+  		}
+  
+++<<<<<<< HEAD
+ +		sle_dma = sg_dma_address(sg);
+ +		*cur_dsd++   = cpu_to_le32(LSD(sle_dma));
+ +		*cur_dsd++   = cpu_to_le32(MSD(sle_dma));
+ +		*cur_dsd++   = cpu_to_le32(sg_dma_len(sg));
+ +		loop_iterartion++;
+++=======
++ 		append_dsd64(&cur_dsd, sg);
+++>>>>>>> 15b7a68c1d03 (scsi: qla2xxx: Introduce the dsd32 and dsd64 data structures)
+  		avail_dsds--;
+  	}
+  	ct_iocb->entry_count = entry_count;
+diff --git a/drivers/scsi/qla2xxx/qla_bsg.c b/drivers/scsi/qla2xxx/qla_bsg.c
+index 489143b06be3..ddff604224cd 100644
+--- a/drivers/scsi/qla2xxx/qla_bsg.c
++++ b/drivers/scsi/qla2xxx/qla_bsg.c
+@@ -1056,9 +1056,8 @@ qla84xx_updatefw(struct bsg_job *bsg_job)
+ 	mn->fw_ver =  cpu_to_le32(fw_ver);
+ 	mn->fw_size =  cpu_to_le32(data_len);
+ 	mn->fw_seq_size =  cpu_to_le32(data_len);
+-	mn->dseg_address[0] = cpu_to_le32(LSD(fw_dma));
+-	mn->dseg_address[1] = cpu_to_le32(MSD(fw_dma));
+-	mn->dseg_length = cpu_to_le32(data_len);
++	put_unaligned_le64(fw_dma, &mn->dsd.address);
++	mn->dsd.length = cpu_to_le32(data_len);
+ 	mn->data_seg_cnt = cpu_to_le16(1);
+ 
+ 	rval = qla2x00_issue_iocb_timeout(vha, mn, mn_dma, 0, 120);
+@@ -1237,9 +1236,8 @@ qla84xx_mgmt_cmd(struct bsg_job *bsg_job)
+ 	if (ql84_mgmt->mgmt.cmd != QLA84_MGMT_CHNG_CONFIG) {
+ 		mn->total_byte_cnt = cpu_to_le32(ql84_mgmt->mgmt.len);
+ 		mn->dseg_count = cpu_to_le16(1);
+-		mn->dseg_address[0] = cpu_to_le32(LSD(mgmt_dma));
+-		mn->dseg_address[1] = cpu_to_le32(MSD(mgmt_dma));
+-		mn->dseg_length = cpu_to_le32(ql84_mgmt->mgmt.len);
++		put_unaligned_le64(mgmt_dma, &mn->dsd.address);
++		mn->dsd.length = cpu_to_le32(ql84_mgmt->mgmt.len);
+ 	}
+ 
+ 	rval = qla2x00_issue_iocb(vha, mn, mn_dma, 0);
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 277544e692c0..6cc171036871 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -35,6 +35,7 @@
+ #include <scsi/scsi_bsg_fc.h>
+ 
+ #include "qla_bsg.h"
++#include "qla_dsd.h"
+ #include "qla_nx.h"
+ #include "qla_nx2.h"
+ #include "qla_nvme.h"
+@@ -1757,12 +1758,10 @@ typedef struct {
+ 	uint16_t dseg_count;		/* Data segment count. */
+ 	uint8_t scsi_cdb[MAX_CMDSZ]; 	/* SCSI command words. */
+ 	uint32_t byte_count;		/* Total byte count. */
+-	uint32_t dseg_0_address;	/* Data segment 0 address. */
+-	uint32_t dseg_0_length;		/* Data segment 0 length. */
+-	uint32_t dseg_1_address;	/* Data segment 1 address. */
+-	uint32_t dseg_1_length;		/* Data segment 1 length. */
+-	uint32_t dseg_2_address;	/* Data segment 2 address. */
+-	uint32_t dseg_2_length;		/* Data segment 2 length. */
++	union {
++		struct dsd32 dsd32[3];
++		struct dsd64 dsd64[2];
++	};
+ } cmd_entry_t;
+ 
+ /*
+@@ -1783,10 +1782,7 @@ typedef struct {
+ 	uint16_t dseg_count;		/* Data segment count. */
+ 	uint8_t scsi_cdb[MAX_CMDSZ];	/* SCSI command words. */
+ 	uint32_t byte_count;		/* Total byte count. */
+-	uint32_t dseg_0_address[2];	/* Data segment 0 address. */
+-	uint32_t dseg_0_length;		/* Data segment 0 length. */
+-	uint32_t dseg_1_address[2];	/* Data segment 1 address. */
+-	uint32_t dseg_1_length;		/* Data segment 1 length. */
++	struct dsd64 dsd[2];
+ } cmd_a64_entry_t, request_t;
+ 
+ /*
+@@ -1799,20 +1795,7 @@ typedef struct {
+ 	uint8_t sys_define;		/* System defined. */
+ 	uint8_t entry_status;		/* Entry Status. */
+ 	uint32_t reserved;
+-	uint32_t dseg_0_address;	/* Data segment 0 address. */
+-	uint32_t dseg_0_length;		/* Data segment 0 length. */
+-	uint32_t dseg_1_address;	/* Data segment 1 address. */
+-	uint32_t dseg_1_length;		/* Data segment 1 length. */
+-	uint32_t dseg_2_address;	/* Data segment 2 address. */
+-	uint32_t dseg_2_length;		/* Data segment 2 length. */
+-	uint32_t dseg_3_address;	/* Data segment 3 address. */
+-	uint32_t dseg_3_length;		/* Data segment 3 length. */
+-	uint32_t dseg_4_address;	/* Data segment 4 address. */
+-	uint32_t dseg_4_length;		/* Data segment 4 length. */
+-	uint32_t dseg_5_address;	/* Data segment 5 address. */
+-	uint32_t dseg_5_length;		/* Data segment 5 length. */
+-	uint32_t dseg_6_address;	/* Data segment 6 address. */
+-	uint32_t dseg_6_length;		/* Data segment 6 length. */
++	struct dsd32 dsd[7];
+ } cont_entry_t;
+ 
+ /*
+@@ -1824,16 +1807,7 @@ typedef struct {
+ 	uint8_t entry_count;		/* Entry count. */
+ 	uint8_t sys_define;		/* System defined. */
+ 	uint8_t entry_status;		/* Entry Status. */
+-	uint32_t dseg_0_address[2];	/* Data segment 0 address. */
+-	uint32_t dseg_0_length;		/* Data segment 0 length. */
+-	uint32_t dseg_1_address[2];	/* Data segment 1 address. */
+-	uint32_t dseg_1_length;		/* Data segment 1 length. */
+-	uint32_t dseg_2_address	[2];	/* Data segment 2 address. */
+-	uint32_t dseg_2_length;		/* Data segment 2 length. */
+-	uint32_t dseg_3_address[2];	/* Data segment 3 address. */
+-	uint32_t dseg_3_length;		/* Data segment 3 length. */
+-	uint32_t dseg_4_address[2];	/* Data segment 4 address. */
+-	uint32_t dseg_4_length;		/* Data segment 4 length. */
++	struct dsd64 dsd[5];
+ } cont_a64_entry_t;
+ 
+ #define PO_MODE_DIF_INSERT	0
+@@ -1877,8 +1851,7 @@ struct crc_context {
+ 			uint16_t	reserved_2;
+ 			uint16_t	reserved_3;
+ 			uint32_t	reserved_4;
+-			uint32_t	data_address[2];
+-			uint32_t	data_length;
++			struct dsd64	data_dsd;
+ 			uint32_t	reserved_5[2];
+ 			uint32_t	reserved_6;
+ 		} nobundling;
+@@ -1888,11 +1861,8 @@ struct crc_context {
+ 			uint16_t	reserved_1;
+ 			__le16	dseg_count;	/* Data segment count */
+ 			uint32_t	reserved_2;
+-			uint32_t	data_address[2];
+-			uint32_t	data_length;
+-			uint32_t	dif_address[2];
+-			uint32_t	dif_length;	/* Data segment 0
+-							 * length */
++			struct dsd64	data_dsd;
++			struct dsd64	dif_dsd;
+ 		} bundling;
+ 	} u;
+ 
+@@ -2091,10 +2061,8 @@ typedef struct {
+ 	uint32_t handle2;
+ 	uint32_t rsp_bytecount;
+ 	uint32_t req_bytecount;
+-	uint32_t dseg_req_address[2];	/* Data segment 0 address. */
+-	uint32_t dseg_req_length;	/* Data segment 0 length. */
+-	uint32_t dseg_rsp_address[2];	/* Data segment 1 address. */
+-	uint32_t dseg_rsp_length;	/* Data segment 1 length. */
++	struct dsd64 req_dsd;
++	struct dsd64 rsp_dsd;
+ } ms_iocb_entry_t;
+ 
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_dsd.h b/drivers/scsi/qla2xxx/qla_dsd.h
+new file mode 100644
+index 000000000000..7479924ba422
+--- /dev/null
++++ b/drivers/scsi/qla2xxx/qla_dsd.h
+@@ -0,0 +1,30 @@
++#ifndef _QLA_DSD_H_
++#define _QLA_DSD_H_
++
++/* 32-bit data segment descriptor (8 bytes) */
++struct dsd32 {
++	__le32 address;
++	__le32 length;
++};
++
++static inline void append_dsd32(struct dsd32 **dsd, struct scatterlist *sg)
++{
++	put_unaligned_le32(sg_dma_address(sg), &(*dsd)->address);
++	put_unaligned_le32(sg_dma_len(sg),     &(*dsd)->length);
++	(*dsd)++;
++}
++
++/* 64-bit data segment descriptor (12 bytes) */
++struct dsd64 {
++	__le64 address;
++	__le32 length;
++} __packed;
++
++static inline void append_dsd64(struct dsd64 **dsd, struct scatterlist *sg)
++{
++	put_unaligned_le64(sg_dma_address(sg), &(*dsd)->address);
++	put_unaligned_le32(sg_dma_len(sg),     &(*dsd)->length);
++	(*dsd)++;
++}
++
++#endif
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index d53cd7875a85..604eb4682ac0 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -10,6 +10,8 @@
+ #include <linux/nvme.h>
+ #include <linux/nvme-fc.h>
+ 
++#include "qla_dsd.h"
++
+ #define MBS_CHECKSUM_ERROR	0x4010
+ #define MBS_INVALID_PRODUCT_KEY	0x4020
+ 
+@@ -463,8 +465,7 @@ struct cmd_bidir {
+ 	uint8_t port_id[3];			/* PortID of destination port.*/
+ 	uint8_t vp_index;
+ 
+-	uint32_t fcp_data_dseg_address[2];	/* Data segment address. */
+-	uint16_t fcp_data_dseg_len;		/* Data segment length. */
++	struct dsd64 fcp_dsd;
+ };
+ 
+ #define COMMAND_TYPE_6	0x48		/* Command Type 6 entry */
+@@ -501,8 +502,7 @@ struct cmd_type_6 {
+ 	uint8_t port_id[3];		/* PortID of destination port. */
+ 	uint8_t vp_index;
+ 
+-	uint32_t fcp_data_dseg_address[2];	/* Data segment address. */
+-	uint32_t fcp_data_dseg_len;		/* Data segment length. */
++	struct dsd64 fcp_dsd;
+ };
+ 
+ #define COMMAND_TYPE_7	0x18		/* Command Type 7 entry */
+@@ -548,8 +548,7 @@ struct cmd_type_7 {
+ 	uint8_t port_id[3];		/* PortID of destination port. */
+ 	uint8_t vp_index;
+ 
+-	uint32_t dseg_0_address[2];	/* Data segment 0 address. */
+-	uint32_t dseg_0_len;		/* Data segment 0 length. */
++	struct dsd64 dsd;
+ };
+ 
+ #define COMMAND_TYPE_CRC_2	0x6A	/* Command Type CRC_2 (Type 6)
+@@ -717,10 +716,7 @@ struct ct_entry_24xx {
+ 	uint32_t rsp_byte_count;
+ 	uint32_t cmd_byte_count;
+ 
+-	uint32_t dseg_0_address[2];	/* Data segment 0 address. */
+-	uint32_t dseg_0_len;		/* Data segment 0 length. */
+-	uint32_t dseg_1_address[2];	/* Data segment 1 address. */
+-	uint32_t dseg_1_len;		/* Data segment 1 length. */
++	struct dsd64 dsd[2];
+ };
+ 
+ /*
+@@ -1606,8 +1602,7 @@ struct verify_chip_entry_84xx {
+ 	uint32_t fw_seq_size;
+ 	uint32_t relative_offset;
+ 
+-	uint32_t dseg_address[2];
+-	uint32_t dseg_length;
++	struct dsd64 dsd;
+ };
+ 
+ struct verify_chip_rsp_84xx {
+@@ -1664,8 +1659,7 @@ struct access_chip_84xx {
+ 	uint32_t total_byte_cnt;
+ 	uint32_t reserved4;
+ 
+-	uint32_t dseg_address[2];
+-	uint32_t dseg_length;
++	struct dsd64 dsd;
+ };
+ 
+ struct access_chip_rsp_84xx {
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index 41a3d2f55b14..932600e67993 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -286,11 +286,11 @@ extern void *qla2x00_alloc_iocbs(struct scsi_qla_host *, srb_t *);
+ extern void *__qla2x00_alloc_iocbs(struct qla_qpair *, srb_t *);
+ extern int qla2x00_issue_marker(scsi_qla_host_t *, int);
+ extern int qla24xx_walk_and_build_sglist_no_difb(struct qla_hw_data *, srb_t *,
+-	uint32_t *, uint16_t, struct qla_tc_param *);
++	struct dsd64 *, uint16_t, struct qla_tc_param *);
+ extern int qla24xx_walk_and_build_sglist(struct qla_hw_data *, srb_t *,
+-	uint32_t *, uint16_t, struct qla_tc_param *);
++	struct dsd64 *, uint16_t, struct qla_tc_param *);
+ extern int qla24xx_walk_and_build_prot_sglist(struct qla_hw_data *, srb_t *,
+-	uint32_t *, uint16_t, struct qla_tgt_cmd *);
++	struct dsd64 *, uint16_t, struct qla_tgt_cmd *);
+ extern int qla24xx_get_one_block_sg(uint32_t, struct qla2_sgx *, uint32_t *);
+ extern int qla24xx_configure_prot_mode(srb_t *, uint16_t *);
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_gs.c b/drivers/scsi/qla2xxx/qla_gs.c
+index 368eecc13c30..5fca12afca57 100644
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@ -45,13 +45,11 @@ qla2x00_prep_ms_iocb(scsi_qla_host_t *vha, struct ct_arg *arg)
+ 	ms_pkt->rsp_bytecount = cpu_to_le32(arg->rsp_size);
+ 	ms_pkt->req_bytecount = cpu_to_le32(arg->req_size);
+ 
+-	ms_pkt->dseg_req_address[0] = cpu_to_le32(LSD(arg->req_dma));
+-	ms_pkt->dseg_req_address[1] = cpu_to_le32(MSD(arg->req_dma));
+-	ms_pkt->dseg_req_length = ms_pkt->req_bytecount;
++	put_unaligned_le64(arg->req_dma, &ms_pkt->req_dsd.address);
++	ms_pkt->req_dsd.length = ms_pkt->req_bytecount;
+ 
+-	ms_pkt->dseg_rsp_address[0] = cpu_to_le32(LSD(arg->rsp_dma));
+-	ms_pkt->dseg_rsp_address[1] = cpu_to_le32(MSD(arg->rsp_dma));
+-	ms_pkt->dseg_rsp_length = ms_pkt->rsp_bytecount;
++	put_unaligned_le64(arg->rsp_dma, &ms_pkt->rsp_dsd.address);
++	ms_pkt->rsp_dsd.length = ms_pkt->rsp_bytecount;
+ 
+ 	vha->qla_stats.control_requests++;
+ 
+@@ -83,13 +81,11 @@ qla24xx_prep_ms_iocb(scsi_qla_host_t *vha, struct ct_arg *arg)
+ 	ct_pkt->rsp_byte_count = cpu_to_le32(arg->rsp_size);
+ 	ct_pkt->cmd_byte_count = cpu_to_le32(arg->req_size);
+ 
+-	ct_pkt->dseg_0_address[0] = cpu_to_le32(LSD(arg->req_dma));
+-	ct_pkt->dseg_0_address[1] = cpu_to_le32(MSD(arg->req_dma));
+-	ct_pkt->dseg_0_len = ct_pkt->cmd_byte_count;
++	put_unaligned_le64(arg->req_dma, &ct_pkt->dsd[0].address);
++	ct_pkt->dsd[0].length = ct_pkt->cmd_byte_count;
+ 
+-	ct_pkt->dseg_1_address[0] = cpu_to_le32(LSD(arg->rsp_dma));
+-	ct_pkt->dseg_1_address[1] = cpu_to_le32(MSD(arg->rsp_dma));
+-	ct_pkt->dseg_1_len = ct_pkt->rsp_byte_count;
++	put_unaligned_le64(arg->rsp_dma, &ct_pkt->dsd[1].address);
++	ct_pkt->dsd[1].length = ct_pkt->rsp_byte_count;
+ 	ct_pkt->vp_index = vha->vp_idx;
+ 
+ 	vha->qla_stats.control_requests++;
+@@ -1438,13 +1434,11 @@ qla2x00_prep_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size,
+ 	ms_pkt->rsp_bytecount = cpu_to_le32(rsp_size);
+ 	ms_pkt->req_bytecount = cpu_to_le32(req_size);
+ 
+-	ms_pkt->dseg_req_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
+-	ms_pkt->dseg_req_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
+-	ms_pkt->dseg_req_length = ms_pkt->req_bytecount;
++	put_unaligned_le64(ha->ct_sns_dma, &ms_pkt->req_dsd.address);
++	ms_pkt->req_dsd.length = ms_pkt->req_bytecount;
+ 
+-	ms_pkt->dseg_rsp_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
+-	ms_pkt->dseg_rsp_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
+-	ms_pkt->dseg_rsp_length = ms_pkt->rsp_bytecount;
++	put_unaligned_le64(ha->ct_sns_dma, &ms_pkt->rsp_dsd.address);
++	ms_pkt->rsp_dsd.length = ms_pkt->rsp_bytecount;
+ 
+ 	return ms_pkt;
+ }
+@@ -1476,13 +1470,11 @@ qla24xx_prep_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size,
+ 	ct_pkt->rsp_byte_count = cpu_to_le32(rsp_size);
+ 	ct_pkt->cmd_byte_count = cpu_to_le32(req_size);
+ 
+-	ct_pkt->dseg_0_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
+-	ct_pkt->dseg_0_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
+-	ct_pkt->dseg_0_len = ct_pkt->cmd_byte_count;
++	put_unaligned_le64(ha->ct_sns_dma, &ct_pkt->dsd[0].address);
++	ct_pkt->dsd[0].length = ct_pkt->cmd_byte_count;
+ 
+-	ct_pkt->dseg_1_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
+-	ct_pkt->dseg_1_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
+-	ct_pkt->dseg_1_len = ct_pkt->rsp_byte_count;
++	put_unaligned_le64(ha->ct_sns_dma, &ct_pkt->dsd[1].address);
++	ct_pkt->dsd[1].length = ct_pkt->rsp_byte_count;
+ 	ct_pkt->vp_index = vha->vp_idx;
+ 
+ 	return ct_pkt;
+@@ -1497,10 +1489,10 @@ qla2x00_update_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size)
+ 
+ 	if (IS_FWI2_CAPABLE(ha)) {
+ 		ct_pkt->cmd_byte_count = cpu_to_le32(req_size);
+-		ct_pkt->dseg_0_len = ct_pkt->cmd_byte_count;
++		ct_pkt->dsd[0].length = ct_pkt->cmd_byte_count;
+ 	} else {
+ 		ms_pkt->req_bytecount = cpu_to_le32(req_size);
+-		ms_pkt->dseg_req_length = ms_pkt->req_bytecount;
++		ms_pkt->req_dsd.length = ms_pkt->req_bytecount;
+ 	}
+ 
+ 	return ms_pkt;
+* Unmerged path drivers/scsi/qla2xxx/qla_iocb.c
+diff --git a/drivers/scsi/qla2xxx/qla_mr.c b/drivers/scsi/qla2xxx/qla_mr.c
+index 783f24db89f7..a08d83dbcece 100644
+--- a/drivers/scsi/qla2xxx/qla_mr.c
++++ b/drivers/scsi/qla2xxx/qla_mr.c
+@@ -2993,7 +2993,7 @@ qlafx00_build_scsi_iocbs(srb_t *sp, struct cmd_type_7_fx00 *cmd_pkt,
+ 			 uint16_t tot_dsds, struct cmd_type_7_fx00 *lcmd_pkt)
+ {
+ 	uint16_t	avail_dsds;
+-	__le32 *cur_dsd;
++	struct dsd64	*cur_dsd;
+ 	scsi_qla_host_t	*vha;
+ 	struct scsi_cmnd *cmd;
+ 	struct scatterlist *sg;
+@@ -3029,12 +3029,10 @@ qlafx00_build_scsi_iocbs(srb_t *sp, struct cmd_type_7_fx00 *cmd_pkt,
+ 
+ 	/* One DSD is available in the Command Type 3 IOCB */
+ 	avail_dsds = 1;
+-	cur_dsd = (__le32 *)&lcmd_pkt->dseg_0_address;
++	cur_dsd = &lcmd_pkt->dsd;
+ 
+ 	/* Load data segments */
+ 	scsi_for_each_sg(cmd, sg, tot_dsds, i) {
+-		dma_addr_t	sle_dma;
+-
+ 		/* Allocate additional continuation packets? */
+ 		if (avail_dsds == 0) {
+ 			/*
+@@ -3044,15 +3042,12 @@ qlafx00_build_scsi_iocbs(srb_t *sp, struct cmd_type_7_fx00 *cmd_pkt,
+ 			memset(&lcont_pkt, 0, REQUEST_ENTRY_SIZE);
+ 			cont_pkt =
+ 			    qlafx00_prep_cont_type1_iocb(req, &lcont_pkt);
+-			cur_dsd = (__le32 *)lcont_pkt.dseg_0_address;
++			cur_dsd = lcont_pkt.dsd;
+ 			avail_dsds = 5;
+ 			cont = 1;
+ 		}
+ 
+-		sle_dma = sg_dma_address(sg);
+-		*cur_dsd++ = cpu_to_le32(LSD(sle_dma));
+-		*cur_dsd++ = cpu_to_le32(MSD(sle_dma));
+-		*cur_dsd++ = cpu_to_le32(sg_dma_len(sg));
++		append_dsd64(&cur_dsd, sg);
+ 		avail_dsds--;
+ 		if (avail_dsds == 0 && cont == 1) {
+ 			cont = 0;
+@@ -3283,11 +3278,9 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
+ 			fx_iocb.req_dsdcnt = cpu_to_le16(1);
+ 			fx_iocb.req_xfrcnt =
+ 			    cpu_to_le16(fxio->u.fxiocb.req_len);
+-			fx_iocb.dseg_rq_address[0] =
+-			    cpu_to_le32(LSD(fxio->u.fxiocb.req_dma_handle));
+-			fx_iocb.dseg_rq_address[1] =
+-			    cpu_to_le32(MSD(fxio->u.fxiocb.req_dma_handle));
+-			fx_iocb.dseg_rq_len =
++			fx_iocb.dseg_rq.address =
++			    cpu_to_le64(fxio->u.fxiocb.req_dma_handle);
++			fx_iocb.dseg_rq.length =
+ 			    cpu_to_le32(fxio->u.fxiocb.req_len);
+ 		}
+ 
+@@ -3295,11 +3288,9 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
+ 			fx_iocb.rsp_dsdcnt = cpu_to_le16(1);
+ 			fx_iocb.rsp_xfrcnt =
+ 			    cpu_to_le16(fxio->u.fxiocb.rsp_len);
+-			fx_iocb.dseg_rsp_address[0] =
+-			    cpu_to_le32(LSD(fxio->u.fxiocb.rsp_dma_handle));
+-			fx_iocb.dseg_rsp_address[1] =
+-			    cpu_to_le32(MSD(fxio->u.fxiocb.rsp_dma_handle));
+-			fx_iocb.dseg_rsp_len =
++			fx_iocb.dseg_rsp.address =
++			    cpu_to_le64(fxio->u.fxiocb.rsp_dma_handle);
++			fx_iocb.dseg_rsp.length =
+ 			    cpu_to_le32(fxio->u.fxiocb.rsp_len);
+ 		}
+ 
+@@ -3329,19 +3320,17 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
+ 			int avail_dsds, tot_dsds;
+ 			cont_a64_entry_t lcont_pkt;
+ 			cont_a64_entry_t *cont_pkt = NULL;
+-			__le32 *cur_dsd;
++			struct dsd64 *cur_dsd;
+ 			int index = 0, cont = 0;
+ 
+ 			fx_iocb.req_dsdcnt =
+ 			    cpu_to_le16(bsg_job->request_payload.sg_cnt);
+ 			tot_dsds =
+ 			    bsg_job->request_payload.sg_cnt;
+-			cur_dsd = (__le32 *)&fx_iocb.dseg_rq_address[0];
++			cur_dsd = &fx_iocb.dseg_rq;
+ 			avail_dsds = 1;
+ 			for_each_sg(bsg_job->request_payload.sg_list, sg,
+ 			    tot_dsds, index) {
+-				dma_addr_t sle_dma;
+-
+ 				/* Allocate additional continuation packets? */
+ 				if (avail_dsds == 0) {
+ 					/*
+@@ -3353,17 +3342,13 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
+ 					cont_pkt =
+ 					    qlafx00_prep_cont_type1_iocb(
+ 						sp->vha->req, &lcont_pkt);
+-					cur_dsd = (__le32 *)
+-					    lcont_pkt.dseg_0_address;
++					cur_dsd = lcont_pkt.dsd;
+ 					avail_dsds = 5;
+ 					cont = 1;
+ 					entry_cnt++;
+ 				}
+ 
+-				sle_dma = sg_dma_address(sg);
+-				*cur_dsd++   = cpu_to_le32(LSD(sle_dma));
+-				*cur_dsd++   = cpu_to_le32(MSD(sle_dma));
+-				*cur_dsd++   = cpu_to_le32(sg_dma_len(sg));
++				append_dsd64(&cur_dsd, sg);
+ 				avail_dsds--;
+ 
+ 				if (avail_dsds == 0 && cont == 1) {
+@@ -3391,19 +3376,17 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
+ 			int avail_dsds, tot_dsds;
+ 			cont_a64_entry_t lcont_pkt;
+ 			cont_a64_entry_t *cont_pkt = NULL;
+-			__le32 *cur_dsd;
++			struct dsd64 *cur_dsd;
+ 			int index = 0, cont = 0;
+ 
+ 			fx_iocb.rsp_dsdcnt =
+ 			   cpu_to_le16(bsg_job->reply_payload.sg_cnt);
+ 			tot_dsds = bsg_job->reply_payload.sg_cnt;
+-			cur_dsd = (__le32 *)&fx_iocb.dseg_rsp_address[0];
++			cur_dsd = &fx_iocb.dseg_rsp;
+ 			avail_dsds = 1;
+ 
+ 			for_each_sg(bsg_job->reply_payload.sg_list, sg,
+ 			    tot_dsds, index) {
+-				dma_addr_t sle_dma;
+-
+ 				/* Allocate additional continuation packets? */
+ 				if (avail_dsds == 0) {
+ 					/*
+@@ -3415,17 +3398,13 @@ qlafx00_fxdisc_iocb(srb_t *sp, struct fxdisc_entry_fx00 *pfxiocb)
+ 					cont_pkt =
+ 					    qlafx00_prep_cont_type1_iocb(
+ 						sp->vha->req, &lcont_pkt);
+-					cur_dsd = (__le32 *)
+-					    lcont_pkt.dseg_0_address;
++					cur_dsd = lcont_pkt.dsd;
+ 					avail_dsds = 5;
+ 					cont = 1;
+ 					entry_cnt++;
+ 				}
+ 
+-				sle_dma = sg_dma_address(sg);
+-				*cur_dsd++   = cpu_to_le32(LSD(sle_dma));
+-				*cur_dsd++   = cpu_to_le32(MSD(sle_dma));
+-				*cur_dsd++   = cpu_to_le32(sg_dma_len(sg));
++				append_dsd64(&cur_dsd, sg);
+ 				avail_dsds--;
+ 
+ 				if (avail_dsds == 0 && cont == 1) {
+diff --git a/drivers/scsi/qla2xxx/qla_mr.h b/drivers/scsi/qla2xxx/qla_mr.h
+index aeaa1b40b1fc..4567f0c42486 100644
+--- a/drivers/scsi/qla2xxx/qla_mr.h
++++ b/drivers/scsi/qla2xxx/qla_mr.h
+@@ -7,6 +7,8 @@
+ #ifndef __QLA_MR_H
+ #define __QLA_MR_H
+ 
++#include "qla_dsd.h"
++
+ /*
+  * The PCI VendorID and DeviceID for our board.
+  */
+@@ -46,8 +48,7 @@ struct cmd_type_7_fx00 {
+ 	uint8_t fcp_cdb[MAX_CMDSZ];	/* SCSI command words. */
+ 	__le32 byte_count;		/* Total byte count. */
+ 
+-	uint32_t dseg_0_address[2];	/* Data segment 0 address. */
+-	uint32_t dseg_0_len;		/* Data segment 0 length. */
++	struct dsd64 dsd;
+ };
+ 
+ #define	STATUS_TYPE_FX00	0x01		/* Status entry. */
+@@ -176,10 +177,8 @@ struct fxdisc_entry_fx00 {
+ 	uint8_t flags;
+ 	uint8_t reserved_1;
+ 
+-	__le32 dseg_rq_address[2];	/* Data segment 0 address. */
+-	__le32 dseg_rq_len;		/* Data segment 0 length. */
+-	__le32 dseg_rsp_address[2];	/* Data segment 1 address. */
+-	__le32 dseg_rsp_len;		/* Data segment 1 length. */
++	struct dsd64 dseg_rq;
++	struct dsd64 dseg_rsp;
+ 
+ 	__le32 dataword;
+ 	__le32 adapid;
+diff --git a/drivers/scsi/qla2xxx/qla_nvme.c b/drivers/scsi/qla2xxx/qla_nvme.c
+index ab315eb33d61..192cfee8eabe 100644
+--- a/drivers/scsi/qla2xxx/qla_nvme.c
++++ b/drivers/scsi/qla2xxx/qla_nvme.c
+@@ -364,7 +364,7 @@ static inline int qla2x00_start_nvme_mq(srb_t *sp)
+ 	uint16_t        req_cnt;
+ 	uint16_t        tot_dsds;
+ 	uint16_t	avail_dsds;
+-	uint32_t	*cur_dsd;
++	struct dsd64	*cur_dsd;
+ 	struct req_que *req = NULL;
+ 	struct scsi_qla_host *vha = sp->fcport->vha;
+ 	struct qla_hw_data *ha = vha->hw;
+@@ -482,12 +482,11 @@ static inline int qla2x00_start_nvme_mq(srb_t *sp)
+ 
+ 	/* One DSD is available in the Command Type NVME IOCB */
+ 	avail_dsds = 1;
+-	cur_dsd = (uint32_t *)&cmd_pkt->nvme_data_dseg_address[0];
++	cur_dsd = &cmd_pkt->nvme_dsd;
+ 	sgl = fd->first_sgl;
+ 
+ 	/* Load data segments */
+ 	for_each_sg(sgl, sg, tot_dsds, i) {
+-		dma_addr_t      sle_dma;
+ 		cont_a64_entry_t *cont_pkt;
+ 
+ 		/* Allocate additional continuation packets? */
+@@ -509,14 +508,11 @@ static inline int qla2x00_start_nvme_mq(srb_t *sp)
+ 			put_unaligned_le32(CONTINUE_A64_TYPE,
+ 					   &cont_pkt->entry_type);
+ 
+-			cur_dsd = (uint32_t *)cont_pkt->dseg_0_address;
+-			avail_dsds = 5;
++			cur_dsd = cont_pkt->dsd;
++			avail_dsds = ARRAY_SIZE(cont_pkt->dsd);
+ 		}
+ 
+-		sle_dma = sg_dma_address(sg);
+-		*cur_dsd++ = cpu_to_le32(LSD(sle_dma));
+-		*cur_dsd++ = cpu_to_le32(MSD(sle_dma));
+-		*cur_dsd++ = cpu_to_le32(sg_dma_len(sg));
++		append_dsd64(&cur_dsd, sg);
+ 		avail_dsds--;
+ 	}
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_nvme.h b/drivers/scsi/qla2xxx/qla_nvme.h
+index 31ffa1e003f1..3a6457c50687 100644
+--- a/drivers/scsi/qla2xxx/qla_nvme.h
++++ b/drivers/scsi/qla2xxx/qla_nvme.h
+@@ -13,6 +13,7 @@
+ #include <linux/nvme-fc-driver.h>
+ 
+ #include "qla_def.h"
++#include "qla_dsd.h"
+ 
+ /* default dev loss time (seconds) before transport tears down ctrl */
+ #define NVME_FC_DEV_LOSS_TMO  30
+@@ -72,8 +73,7 @@ struct cmd_nvme {
+ 	uint8_t port_id[3];             /* PortID of destination port. */
+ 	uint8_t vp_index;
+ 
+-	uint32_t nvme_data_dseg_address[2];      /* Data segment address. */
+-	uint32_t nvme_data_dseg_len;             /* Data segment length. */
++	struct dsd64 nvme_dsd;
+ };
+ 
+ #define PT_LS4_REQUEST 0x89	/* Link Service pass-through IOCB (request) */
+@@ -101,10 +101,7 @@ struct pt_ls4_request {
+ 	uint32_t rsvd3;
+ 	uint32_t rx_byte_count;
+ 	uint32_t tx_byte_count;
+-	uint32_t dseg0_address[2];
+-	uint32_t dseg0_len;
+-	uint32_t dseg1_address[2];
+-	uint32_t dseg1_len;
++	struct dsd64 dsd[2];
+ };
+ 
+ #define PT_LS4_UNSOL 0x56	/* pass-up unsolicited rec FC-NVMe request */
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index a47903071416..227d48fd05ea 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -2625,7 +2625,7 @@ static int qlt_24xx_build_ctio_pkt(struct qla_qpair *qpair,
+ static void qlt_load_cont_data_segments(struct qla_tgt_prm *prm)
+ {
+ 	int cnt;
+-	uint32_t *dword_ptr;
++	struct dsd64 *cur_dsd;
+ 
+ 	/* Build continuation packets */
+ 	while (prm->seg_cnt > 0) {
+@@ -2646,19 +2646,13 @@ static void qlt_load_cont_data_segments(struct qla_tgt_prm *prm)
+ 		cont_pkt64->sys_define = 0;
+ 
+ 		cont_pkt64->entry_type = CONTINUE_A64_TYPE;
+-		dword_ptr = (uint32_t *)&cont_pkt64->dseg_0_address;
++		cur_dsd = cont_pkt64->dsd;
+ 
+ 		/* Load continuation entry data segments */
+ 		for (cnt = 0;
+ 		    cnt < QLA_TGT_DATASEGS_PER_CONT_24XX && prm->seg_cnt;
+ 		    cnt++, prm->seg_cnt--) {
+-			*dword_ptr++ =
+-			    cpu_to_le32(lower_32_bits
+-				(sg_dma_address(prm->sg)));
+-			*dword_ptr++ = cpu_to_le32(upper_32_bits
+-			    (sg_dma_address(prm->sg)));
+-			*dword_ptr++ = cpu_to_le32(sg_dma_len(prm->sg));
+-
++			append_dsd64(&cur_dsd, prm->sg);
+ 			prm->sg = sg_next(prm->sg);
+ 		}
+ 	}
+@@ -2671,13 +2665,13 @@ static void qlt_load_cont_data_segments(struct qla_tgt_prm *prm)
+ static void qlt_load_data_segments(struct qla_tgt_prm *prm)
+ {
+ 	int cnt;
+-	uint32_t *dword_ptr;
++	struct dsd64 *cur_dsd;
+ 	struct ctio7_to_24xx *pkt24 = (struct ctio7_to_24xx *)prm->pkt;
+ 
+ 	pkt24->u.status0.transfer_length = cpu_to_le32(prm->cmd->bufflen);
+ 
+ 	/* Setup packet address segment pointer */
+-	dword_ptr = pkt24->u.status0.dseg_0_address;
++	cur_dsd = &pkt24->u.status0.dsd;
+ 
+ 	/* Set total data segment count */
+ 	if (prm->seg_cnt)
+@@ -2685,8 +2679,8 @@ static void qlt_load_data_segments(struct qla_tgt_prm *prm)
+ 
+ 	if (prm->seg_cnt == 0) {
+ 		/* No data transfer */
+-		*dword_ptr++ = 0;
+-		*dword_ptr = 0;
++		cur_dsd->address = 0;
++		cur_dsd->length = 0;
+ 		return;
+ 	}
+ 
+@@ -2696,14 +2690,7 @@ static void qlt_load_data_segments(struct qla_tgt_prm *prm)
+ 	for (cnt = 0;
+ 	    (cnt < QLA_TGT_DATASEGS_PER_CMD_24XX) && prm->seg_cnt;
+ 	    cnt++, prm->seg_cnt--) {
+-		*dword_ptr++ =
+-		    cpu_to_le32(lower_32_bits(sg_dma_address(prm->sg)));
+-
+-		*dword_ptr++ = cpu_to_le32(upper_32_bits(
+-			sg_dma_address(prm->sg)));
+-
+-		*dword_ptr++ = cpu_to_le32(sg_dma_len(prm->sg));
+-
++		append_dsd64(&cur_dsd, prm->sg);
+ 		prm->sg = sg_next(prm->sg);
+ 	}
+ 
+@@ -3027,7 +3014,7 @@ qla_tgt_set_dif_tags(struct qla_tgt_cmd *cmd, struct crc_context *ctx,
+ static inline int
+ qlt_build_ctio_crc2_pkt(struct qla_qpair *qpair, struct qla_tgt_prm *prm)
+ {
+-	uint32_t		*cur_dsd;
++	struct dsd64		*cur_dsd;
+ 	uint32_t		transfer_length = 0;
+ 	uint32_t		data_bytes;
+ 	uint32_t		dif_bytes;
+@@ -3178,7 +3165,7 @@ qlt_build_ctio_crc2_pkt(struct qla_qpair *qpair, struct qla_tgt_prm *prm)
+ 	pkt->crc_context_len = CRC_CONTEXT_LEN_FW;
+ 
+ 	if (!bundling) {
+-		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.nobundling.data_address;
++		cur_dsd = &crc_ctx_pkt->u.nobundling.data_dsd;
+ 	} else {
+ 		/*
+ 		 * Configure Bundling if we need to fetch interlaving
+@@ -3188,7 +3175,7 @@ qlt_build_ctio_crc2_pkt(struct qla_qpair *qpair, struct qla_tgt_prm *prm)
+ 		crc_ctx_pkt->u.bundling.dif_byte_count = cpu_to_le32(dif_bytes);
+ 		crc_ctx_pkt->u.bundling.dseg_count =
+ 			cpu_to_le16(prm->tot_dsds - prm->prot_seg_cnt);
+-		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.bundling.data_address;
++		cur_dsd = &crc_ctx_pkt->u.bundling.data_dsd;
+ 	}
+ 
+ 	/* Finish the common fields of CRC pkt */
+@@ -3221,7 +3208,7 @@ qlt_build_ctio_crc2_pkt(struct qla_qpair *qpair, struct qla_tgt_prm *prm)
+ 		/* Walks dif segments */
+ 		pkt->add_flags |= CTIO_CRC2_AF_DIF_DSD_ENA;
+ 
+-		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.bundling.dif_address;
++		cur_dsd = &crc_ctx_pkt->u.bundling.dif_dsd;
+ 		if (qla24xx_walk_and_build_prot_sglist(ha, NULL, cur_dsd,
+ 			prm->prot_seg_cnt, cmd))
+ 			goto crc_queuing_error;
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index 262fc33fb473..b09a9232b817 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -29,6 +29,7 @@
+ #define __QLA_TARGET_H
+ 
+ #include "qla_def.h"
++#include "qla_dsd.h"
+ 
+ /*
+  * Must be changed on any change in any initiator visible interfaces or
+@@ -224,12 +225,7 @@ struct ctio_to_2xxx {
+ 	uint16_t reserved_1[3];
+ 	uint16_t scsi_status;
+ 	uint32_t transfer_length;
+-	uint32_t dseg_0_address;	/* Data segment 0 address. */
+-	uint32_t dseg_0_length;		/* Data segment 0 length. */
+-	uint32_t dseg_1_address;	/* Data segment 1 address. */
+-	uint32_t dseg_1_length;		/* Data segment 1 length. */
+-	uint32_t dseg_2_address;	/* Data segment 2 address. */
+-	uint32_t dseg_2_length;		/* Data segment 2 length. */
++	struct dsd32 dsd[3];
+ } __packed;
+ #define ATIO_PATH_INVALID       0x07
+ #define ATIO_CANT_PROV_CAP      0x16
+@@ -429,10 +425,7 @@ struct ctio7_to_24xx {
+ 			uint32_t reserved2;
+ 			uint32_t transfer_length;
+ 			uint32_t reserved3;
+-			/* Data segment 0 address. */
+-			uint32_t dseg_0_address[2];
+-			/* Data segment 0 length. */
+-			uint32_t dseg_0_length;
++			struct dsd64 dsd;
+ 		} status0;
+ 		struct {
+ 			uint16_t sense_length;
