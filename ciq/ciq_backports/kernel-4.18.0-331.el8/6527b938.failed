@@ -1,0 +1,175 @@
+net: phy: remove the .did_interrupt() and .ack_interrupt() callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Ioana Ciornei <ioana.ciornei@nxp.com>
+commit 6527b938426f7fa66051273568d234b1fe01a15b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/6527b938.failed
+
+Now that all the PHY drivers have been migrated to directly implement
+the generic .handle_interrupt() callback for a seamless support of
+shared IRQs and all the .config_inter() implementations clear any
+pending interrupts, we can safely remove the two callbacks.
+
+With this patch, phylib has a proper support for shared IRQs (and not
+just for multi-PHY devices. A PHY driver must implement both the
+.handle_interrupt() and .config_intr() callbacks for the IRQs to be
+actually used.
+
+	Signed-off-by: Ioana Ciornei <ioana.ciornei@nxp.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 6527b938426f7fa66051273568d234b1fe01a15b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/phy.h
+diff --cc include/linux/phy.h
+index d602a120b33c,381a95732b6a..000000000000
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@@ -696,31 -737,28 +696,37 @@@ struct phy_driver 
+  	 */
+  	int (*config_aneg)(struct phy_device *phydev);
+  
+ -	/** @aneg_done: Determines the auto negotiation result */
+ +	/* Determines the auto negotiation result */
+  	int (*aneg_done)(struct phy_device *phydev);
+  
+ -	/** @read_status: Determines the negotiated speed and duplex */
+ +	/* Determines the negotiated speed and duplex */
+  	int (*read_status)(struct phy_device *phydev);
+  
+++<<<<<<< HEAD
+ +	/* Clears any pending interrupts */
+ +	int (*ack_interrupt)(struct phy_device *phydev);
+ +
+ +	/* Enables or disables interrupts */
+ +	int (*config_intr)(struct phy_device *phydev);
+ +
+ +	/*
+ +	 * Checks if the PHY generated an interrupt.
+ +	 * For multi-PHY devices with shared PHY interrupt pin
+ +	 * Set interrupt bits have to be cleared.
+++=======
++ 	/** @config_intr: Enables or disables interrupts.
++ 	 * It should also clear any pending interrupts prior to enabling the
++ 	 * IRQs and after disabling them.
+++>>>>>>> 6527b938426f (net: phy: remove the .did_interrupt() and .ack_interrupt() callback)
+  	 */
+- 	int (*did_interrupt)(struct phy_device *phydev);
++ 	int (*config_intr)(struct phy_device *phydev);
+  
+ -	/** @handle_interrupt: Override default interrupt handling */
+ -	irqreturn_t (*handle_interrupt)(struct phy_device *phydev);
+ -
+ -	/** @remove: Clears up any memory if needed */
+ +	/* Clears up any memory if needed */
+  	void (*remove)(struct phy_device *phydev);
+  
+ -	/**
+ -	 * @match_phy_device: Returns true if this is a suitable
+ -	 * driver for the given phydev.	 If NULL, matching is based on
+ -	 * phy_id and phy_id_mask.
+ +	/* Returns true if this is a suitable driver for the given
+ +	 * phydev.  If NULL, matching is based on phy_id and
+ +	 * phy_id_mask.
+  	 */
+  	int (*match_phy_device)(struct phy_device *phydev);
+  
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index 8fe4dc634b0d..05992acc3837 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -113,23 +113,6 @@ void phy_print_status(struct phy_device *phydev)
+ }
+ EXPORT_SYMBOL(phy_print_status);
+ 
+-/**
+- * phy_clear_interrupt - Ack the phy device's interrupt
+- * @phydev: the phy_device struct
+- *
+- * If the @phydev driver has an ack_interrupt function, call it to
+- * ack and clear the phy device's interrupt.
+- *
+- * Returns 0 on success or < 0 on error.
+- */
+-static int phy_clear_interrupt(struct phy_device *phydev)
+-{
+-	if (phydev->drv->ack_interrupt)
+-		return phydev->drv->ack_interrupt(phydev);
+-
+-	return 0;
+-}
+-
+ /**
+  * phy_config_interrupt - configure the PHY device for the requested interrupts
+  * @phydev: the phy_device struct
+@@ -890,15 +873,8 @@ static void phy_error(struct phy_device *phydev)
+  */
+ int phy_disable_interrupts(struct phy_device *phydev)
+ {
+-	int err;
+-
+ 	/* Disable PHY interrupts */
+-	err = phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
+-	if (err)
+-		return err;
+-
+-	/* Clear the interrupt */
+-	return phy_clear_interrupt(phydev);
++	return phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
+ }
+ 
+ /**
+@@ -913,22 +889,7 @@ static irqreturn_t phy_interrupt(int irq, void *phy_dat)
+ 	struct phy_device *phydev = phy_dat;
+ 	struct phy_driver *drv = phydev->drv;
+ 
+-	if (drv->handle_interrupt)
+-		return drv->handle_interrupt(phydev);
+-
+-	if (drv->did_interrupt && !drv->did_interrupt(phydev))
+-		return IRQ_NONE;
+-
+-	/* reschedule state queue work to run as soon as possible */
+-	phy_trigger_machine(phydev);
+-
+-	/* did_interrupt() may have cleared the interrupt already */
+-	if (!drv->did_interrupt && phy_clear_interrupt(phydev)) {
+-		phy_error(phydev);
+-		return IRQ_NONE;
+-	}
+-
+-	return IRQ_HANDLED;
++	return drv->handle_interrupt(phydev);
+ }
+ 
+ /**
+@@ -937,11 +898,6 @@ static irqreturn_t phy_interrupt(int irq, void *phy_dat)
+  */
+ static int phy_enable_interrupts(struct phy_device *phydev)
+ {
+-	int err = phy_clear_interrupt(phydev);
+-
+-	if (err < 0)
+-		return err;
+-
+ 	return phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED);
+ }
+ 
+diff --git a/drivers/net/phy/phy_device.c b/drivers/net/phy/phy_device.c
+index 33d15055ca5f..a3673d38c826 100644
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -2728,7 +2728,7 @@ EXPORT_SYMBOL(phy_get_pause);
+ 
+ static bool phy_drv_supports_irq(struct phy_driver *phydrv)
+ {
+-	return phydrv->config_intr && (phydrv->ack_interrupt || phydrv->handle_interrupt);
++	return phydrv->config_intr && phydrv->handle_interrupt;
+ }
+ 
+ /**
+* Unmerged path include/linux/phy.h
