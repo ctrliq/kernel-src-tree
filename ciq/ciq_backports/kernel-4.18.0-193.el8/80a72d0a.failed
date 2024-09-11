@@ -1,0 +1,228 @@
+memremap: remove the data field in struct dev_pagemap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 80a72d0af05ae97a8b106c172e431072ba587492
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/80a72d0a.failed
+
+struct dev_pagemap is always embedded into a containing structure, so
+there is no need to an additional private data field.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Tested-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 80a72d0af05ae97a8b106c172e431072ba587492)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/pmem.c
+#	include/linux/memremap.h
+#	kernel/memremap.c
+#	mm/hmm.c
+diff --cc drivers/nvdimm/pmem.c
+index d9d845077b8b,093408ce40ad..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -334,12 -334,7 +334,16 @@@ static void pmem_release_disk(void *__p
+  	put_disk(pmem->disk);
+  }
+  
+++<<<<<<< HEAD
+ +static void pmem_release_pgmap_ops(void *__pgmap)
+ +{
+ +	dev_pagemap_put_ops();
+ +}
+ +
+ +static void fsdax_pagefree(struct page *page, void *data)
+++=======
++ static void pmem_pagemap_page_free(struct page *page)
+++>>>>>>> 80a72d0af05a (memremap: remove the data field in struct dev_pagemap)
+  {
+  	wake_up_var(&page->_refcount);
+  }
+diff --cc include/linux/memremap.h
+index ae6713454b27,336eca601dad..000000000000
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@@ -66,44 -62,31 +66,71 @@@ enum memory_type 
+  	MEMORY_DEVICE_PCI_P2PDMA,
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + * For MEMORY_DEVICE_PRIVATE we use ZONE_DEVICE and extend it with two
+ + * callbacks:
+ + *   page_fault()
+ + *   page_free()
+ + *
+ + * Additional notes about MEMORY_DEVICE_PRIVATE may be found in
+ + * include/linux/hmm.h and Documentation/vm/hmm.rst. There is also a brief
+ + * explanation in include/linux/memory_hotplug.h.
+ + *
+ + * The page_fault() callback must migrate page back, from device memory to
+ + * system memory, so that the CPU can access it. This might fail for various
+ + * reasons (device issues,  device have been unplugged, ...). When such error
+ + * conditions happen, the page_fault() callback must return VM_FAULT_SIGBUS and
+ + * set the CPU page table entry to "poisoned".
+ + *
+ + * Note that because memory cgroup charges are transferred to the device memory,
+ + * this should never fail due to memory restrictions. However, allocation
+ + * of a regular system page might still fail because we are out of memory. If
+ + * that happens, the page_fault() callback must return VM_FAULT_OOM.
+ + *
+ + * The page_fault() callback can also try to migrate back multiple pages in one
+ + * chunk, as an optimization. It must, however, prioritize the faulting address
+ + * over all the others.
+ + *
+ + *
+ + * The page_free() callback is called once the page refcount reaches 1
+ + * (ZONE_DEVICE pages never reach 0 refcount unless there is a refcount bug.
+ + * This allows the device driver to implement its own memory management.)
+ + *
+ + * For MEMORY_DEVICE_PUBLIC only the page_free() callback matter.
+ + */
+ +typedef int (*dev_page_fault_t)(struct vm_area_struct *vma,
+ +				unsigned long addr,
+ +				const struct page *page,
+ +				unsigned int flags,
+ +				pmd_t *pmdp);
+ +typedef void (*dev_page_free_t)(struct page *page, void *data);
+++=======
++ struct dev_pagemap_ops {
++ 	/*
++ 	 * Called once the page refcount reaches 1.  (ZONE_DEVICE pages never
++ 	 * reach 0 refcount unless there is a refcount bug. This allows the
++ 	 * device driver to implement its own memory management.)
++ 	 */
++ 	void (*page_free)(struct page *page);
++ 
++ 	/*
++ 	 * Transition the refcount in struct dev_pagemap to the dead state.
++ 	 */
++ 	void (*kill)(struct dev_pagemap *pgmap);
++ 
++ 	/*
++ 	 * Wait for refcount in struct dev_pagemap to be idle and reap it.
++ 	 */
++ 	void (*cleanup)(struct dev_pagemap *pgmap);
++ 
++ 	/*
++ 	 * Used for private (un-addressable) device memory only.  Must migrate
++ 	 * the page back to a CPU accessible page.
++ 	 */
++ 	vm_fault_t (*migrate_to_ram)(struct vm_fault *vmf);
++ };
+++>>>>>>> 80a72d0af05a (memremap: remove the data field in struct dev_pagemap)
+  
+  /**
+   * struct dev_pagemap - metadata for ZONE_DEVICE mappings
+@@@ -125,10 -104,9 +152,9 @@@ struct dev_pagemap 
+  	struct resource res;
+  	struct percpu_ref *ref;
+  	struct device *dev;
+- 	void *data;
+  	enum memory_type type;
+  	u64 pci_p2pdma_bus_offset;
+ -	const struct dev_pagemap_ops *ops;
+ +	RH_KABI_EXTEND(void (*kill)(struct percpu_ref *ref))
+  };
+  
+  #ifdef CONFIG_ZONE_DEVICE
+diff --cc kernel/memremap.c
+index 794888559eb7,6c3dbb692037..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -395,7 -376,7 +395,11 @@@ void __put_devmap_managed_page(struct p
+  
+  		mem_cgroup_uncharge(page);
+  
+++<<<<<<< HEAD
+ +		page->pgmap->page_free(page, page->pgmap->data);
+++=======
++ 		page->pgmap->ops->page_free(page);
+++>>>>>>> 80a72d0af05a (memremap: remove the data field in struct dev_pagemap)
+  	} else if (!count)
+  		__put_page(page);
+  }
+diff --cc mm/hmm.c
+index 91b885757871,36e25cdbdac1..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -968,35 -1352,33 +968,41 @@@ static void hmm_devmem_ref_release(stru
+  	complete(&devmem->completion);
+  }
+  
+ -static void hmm_devmem_ref_exit(struct dev_pagemap *pgmap)
+ +static void hmm_devmem_ref_exit(void *data)
+  {
+ +	struct percpu_ref *ref = data;
+  	struct hmm_devmem *devmem;
+  
+ -	devmem = container_of(pgmap, struct hmm_devmem, pagemap);
+ +	devmem = container_of(ref, struct hmm_devmem, ref);
+  	wait_for_completion(&devmem->completion);
+ -	percpu_ref_exit(pgmap->ref);
+ +	percpu_ref_exit(ref);
+  }
+  
+ -static void hmm_devmem_ref_kill(struct dev_pagemap *pgmap)
+ +static void hmm_devmem_ref_kill(struct percpu_ref *ref)
+  {
+ -	percpu_ref_kill(pgmap->ref);
+ +	percpu_ref_kill(ref);
+  }
+  
+ -static vm_fault_t hmm_devmem_migrate_to_ram(struct vm_fault *vmf)
+ +static int hmm_devmem_fault(struct vm_area_struct *vma,
+ +			    unsigned long addr,
+ +			    const struct page *page,
+ +			    unsigned int flags,
+ +			    pmd_t *pmdp)
+  {
+++<<<<<<< HEAD
+ +	struct hmm_devmem *devmem = page->pgmap->data;
+++=======
++ 	struct hmm_devmem *devmem =
++ 		container_of(vmf->page->pgmap, struct hmm_devmem, pagemap);
+++>>>>>>> 80a72d0af05a (memremap: remove the data field in struct dev_pagemap)
+  
+ -	return devmem->ops->fault(devmem, vmf->vma, vmf->address, vmf->page,
+ -			vmf->flags, vmf->pmd);
+ +	return devmem->ops->fault(devmem, vma, addr, page, flags, pmdp);
+  }
+  
+- static void hmm_devmem_free(struct page *page, void *data)
++ static void hmm_devmem_free(struct page *page)
+  {
+- 	struct hmm_devmem *devmem = data;
++ 	struct hmm_devmem *devmem =
++ 		container_of(page->pgmap, struct hmm_devmem, pagemap);
+  
+  	devmem->ops->free(devmem, page);
+  }
+@@@ -1081,12 -1441,9 +1087,15 @@@ struct hmm_devmem *hmm_devmem_add(cons
+  
+  	devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
+  	devmem->pagemap.res = *devmem->resource;
+ -	devmem->pagemap.ops = &hmm_pagemap_ops;
+ +	devmem->pagemap.page_fault = hmm_devmem_fault;
+ +	devmem->pagemap.page_free = hmm_devmem_free;
+  	devmem->pagemap.altmap_valid = false;
+  	devmem->pagemap.ref = &devmem->ref;
+++<<<<<<< HEAD
+ +	devmem->pagemap.data = devmem;
+ +	devmem->pagemap.kill = hmm_devmem_ref_kill;
+++=======
+++>>>>>>> 80a72d0af05a (memremap: remove the data field in struct dev_pagemap)
+  
+  	result = devm_memremap_pages(devmem->device, &devmem->pagemap);
+  	if (IS_ERR(result))
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path include/linux/memremap.h
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/hmm.c
