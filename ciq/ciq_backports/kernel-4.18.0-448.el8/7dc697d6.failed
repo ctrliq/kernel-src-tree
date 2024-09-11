@@ -1,0 +1,131 @@
+s390/pci: do more bus setup in zpci_bus_scan()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 7dc697d6b2b5299ab7e09c592d727671a3859be2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/7dc697d6.failed
+
+Pull setting the maximum bus speed and multifunction attribute into
+zpci_bus_scan() in preparation for handling bus creation separately
+from scanning the bus.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Acked-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 7dc697d6b2b5299ab7e09c592d727671a3859be2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_bus.c
+diff --cc arch/s390/pci/pci_bus.c
+index c93486a9989b,f2577fb35be2..000000000000
+--- a/arch/s390/pci/pci_bus.c
++++ b/arch/s390/pci/pci_bus.c
+@@@ -29,24 -30,89 +29,93 @@@ static LIST_HEAD(zbus_list)
+  static DEFINE_SPINLOCK(zbus_list_lock);
+  static int zpci_nb_devices;
+  
+++<<<<<<< HEAD
+ +/* zpci_bus_scan
+++=======
++ /* zpci_bus_scan_device - Scan a single device adding it to the PCI core
++  * @zdev: the zdev to be scanned
++  *
++  * Scans the PCI function making it available to the common PCI code.
++  *
++  * Return: 0 on success, an error value otherwise
++  */
++ int zpci_bus_scan_device(struct zpci_dev *zdev)
++ {
++ 	struct pci_dev *pdev;
++ 
++ 	pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
++ 	if (!pdev)
++ 		return -ENODEV;
++ 
++ 	pci_bus_add_device(pdev);
++ 	pci_lock_rescan_remove();
++ 	pci_bus_add_devices(zdev->zbus->bus);
++ 	pci_unlock_rescan_remove();
++ 
++ 	return 0;
++ }
++ 
++ /* zpci_bus_remove_device - Removes the given zdev from the PCI core
++  * @zdev: the zdev to be removed from the PCI core
++  * @set_error: if true the device's error state is set to permanent failure
++  *
++  * Sets a zPCI device to a configured but offline state; the zPCI
++  * device is still accessible through its hotplug slot and the zPCI
++  * API but is removed from the common code PCI bus, making it
++  * no longer available to drivers.
++  */
++ void zpci_bus_remove_device(struct zpci_dev *zdev, bool set_error)
++ {
++ 	struct zpci_bus *zbus = zdev->zbus;
++ 	struct pci_dev *pdev;
++ 
++ 	if (!zdev->zbus->bus)
++ 		return;
++ 
++ 	pdev = pci_get_slot(zbus->bus, zdev->devfn);
++ 	if (pdev) {
++ 		if (set_error)
++ 			pdev->error_state = pci_channel_io_perm_failure;
++ 		if (pdev->is_virtfn) {
++ 			zpci_iov_remove_virtfn(pdev, zdev->vfn);
++ 			/* balance pci_get_slot */
++ 			pci_dev_put(pdev);
++ 			return;
++ 		}
++ 		pci_stop_and_remove_bus_device_locked(pdev);
++ 		/* balance pci_get_slot */
++ 		pci_dev_put(pdev);
++ 	}
++ }
++ 
++ /* zpci_bus_scan - Scan the PCI bus associated with this zbus
+++>>>>>>> 7dc697d6b2b5 (s390/pci: do more bus setup in zpci_bus_scan())
+   * @zbus: the zbus holding the zdevices
++  * @f0: function 0 of the bus
+   * @ops: the pci operations
+   *
+-  * The domain number must be set before pci_scan_root_bus is called.
+-  * This function can be called once the domain is known, hence
+-  * when the function_0 is dicovered.
++  * Function zero is taken as a parameter as this is used to determine the
++  * domain, multifunction property and maximum bus speed of the entire bus.
++  *
++  * Return: 0 on success, an error code otherwise
+   */
+- static int zpci_bus_scan(struct zpci_bus *zbus, int domain, struct pci_ops *ops)
++ static int zpci_bus_scan(struct zpci_bus *zbus, struct zpci_dev *f0, struct pci_ops *ops)
+  {
+  	struct pci_bus *bus;
+- 	int rc;
++ 	int domain;
+  
+- 	rc = zpci_alloc_domain(domain);
+- 	if (rc < 0)
+- 		return rc;
+- 	zbus->domain_nr = rc;
++ 	domain = zpci_alloc_domain((u16)f0->uid);
++ 	if (domain < 0)
++ 		return domain;
++ 
++ 	zbus->domain_nr = domain;
++ 	zbus->multifunction = f0->rid_available;
++ 	zbus->max_bus_speed = f0->max_bus_speed;
+  
++ 	/*
++ 	 * Note that the zbus->resources are taken over and zbus->resources
++ 	 * is empty after a successful call
++ 	 */
+  	bus = pci_scan_root_bus(NULL, ZPCI_BUS_NR, ops, zbus, &zbus->resources);
+  	if (!bus) {
+  		zpci_free_domain(zbus->domain_nr);
+* Unmerged path arch/s390/pci/pci_bus.c
