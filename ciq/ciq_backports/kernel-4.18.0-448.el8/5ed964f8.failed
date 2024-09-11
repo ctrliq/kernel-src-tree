@@ -1,0 +1,102 @@
+mm: hide laptop_mode_wb_timer entirely behind the BDI API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5ed964f8e54eb3191b8b7b45aeb52672a0c995dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/5ed964f8.failed
+
+Don't leak the detaіls of the timer into the block layer, instead
+initialize the timer in bdi_alloc and delete it in bdi_unregister.
+Note that this means the timer is initialized (but not armed) for
+non-block queues as well now.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Link: https://lore.kernel.org/r/20210809141744.1203023-2-hch@lst.de
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5ed964f8e54eb3191b8b7b45aeb52672a0c995dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+diff --cc block/blk-core.c
+index 6d35e7fa1f40,5897bc37467d..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -390,14 -394,9 +390,16 @@@ void blk_cleanup_queue(struct request_q
+  	/* for synchronous bio-based driver finish in-flight integrity i/o */
+  	blk_flush_integrity();
+  
+- 	/* @q won't process any more request, flush async actions */
+- 	del_timer_sync(&q->backing_dev_info->laptop_mode_wb_timer);
+  	blk_sync_queue(q);
+++<<<<<<< HEAD
+ +
+ +	if (queue_is_mq(q)) {
+ +		blk_mq_cancel_work_sync(q);
+++=======
++ 	if (queue_is_mq(q))
+++>>>>>>> 5ed964f8e54e (mm: hide laptop_mode_wb_timer entirely behind the BDI API)
+  		blk_mq_exit_queue(q);
+ +	}
+  
+  	/*
+  	 * In theory, request pool of sched_tags belongs to request queue.
+@@@ -540,10 -543,8 +542,8 @@@ struct request_queue *__blk_alloc_queue
+  
+  	atomic_set(&q->nr_active_requests_shared_sbitmap, 0);
+  
+- 	timer_setup(&q->backing_dev_info->laptop_mode_wb_timer,
+- 		    laptop_mode_timer_fn, 0);
+  	timer_setup(&q->timeout, blk_rq_timed_out_timer, 0);
+ -	INIT_WORK(&q->timeout_work, blk_timeout_work);
+ +	INIT_WORK(&q->timeout_work, NULL);
+  	INIT_LIST_HEAD(&q->icq_list);
+  #ifdef CONFIG_BLK_CGROUP
+  	INIT_LIST_HEAD(&q->blkg_list);
+* Unmerged path block/blk-core.c
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index e679bdf20251..70f9d864d953 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -926,6 +926,7 @@ struct backing_dev_info *bdi_alloc(int node_id)
+ 	bdi->capabilities = BDI_CAP_WRITEBACK | BDI_CAP_WRITEBACK_ACCT;
+ 	bdi->ra_pages = VM_READAHEAD_PAGES;
+ 	bdi->io_pages = VM_READAHEAD_PAGES;
++	timer_setup(&bdi->laptop_mode_wb_timer, laptop_mode_timer_fn, 0);
+ 	return bdi;
+ }
+ EXPORT_SYMBOL(bdi_alloc);
+@@ -1058,6 +1059,8 @@ static void bdi_remove_from_list(struct backing_dev_info *bdi)
+ 
+ void bdi_unregister(struct backing_dev_info *bdi)
+ {
++	del_timer_sync(&bdi->laptop_mode_wb_timer);
++
+ 	/* make sure nobody finds us on the bdi_list anymore */
+ 	bdi_remove_from_list(bdi);
+ 	wb_shutdown(&bdi->wb);
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index a9a53d24dbe6..e31bf957bba7 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -2029,7 +2029,6 @@ int dirty_writeback_centisecs_handler(struct ctl_table *table, int write,
+ 	return ret;
+ }
+ 
+-#ifdef CONFIG_BLOCK
+ void laptop_mode_timer_fn(struct timer_list *t)
+ {
+ 	struct backing_dev_info *backing_dev_info =
+@@ -2064,7 +2063,6 @@ void laptop_sync_completion(void)
+ 
+ 	rcu_read_unlock();
+ }
+-#endif
+ 
+ /*
+  * If ratelimit_pages is too high then we can get into dirty-data overload
