@@ -1,0 +1,137 @@
+dma-pool: add additional coherent pools to map to gfp mask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Rientjes <rientjes@google.com>
+commit c84dc6e68a1d2464e050d9694be4e4ff49e32bfd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c84dc6e6.failed
+
+The single atomic pool is allocated from the lowest zone possible since
+it is guaranteed to be applicable for any DMA allocation.
+
+Devices may allocate through the DMA API but not have a strict reliance
+on GFP_DMA memory.  Since the atomic pool will be used for all
+non-blockable allocations, returning all memory from ZONE_DMA may
+unnecessarily deplete the zone.
+
+Provision for multiple atomic pools that will map to the optimal gfp
+mask of the device.
+
+When allocating non-blockable memory, determine the optimal gfp mask of
+the device and use the appropriate atomic pool.
+
+The coherent DMA mask will remain the same between allocation and free
+and, thus, memory will be freed to the same atomic pool it was allocated
+from.
+
+__dma_atomic_pool_init() will be changed to return struct gen_pool *
+later once dynamic expansion is added.
+
+	Signed-off-by: David Rientjes <rientjes@google.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit c84dc6e68a1d2464e050d9694be4e4ff49e32bfd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/pool.c
+* Unmerged path kernel/dma/pool.c
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index b4d011969bbf..c9f6628377ac 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -963,7 +963,7 @@ static void __iommu_dma_free(struct device *dev, size_t size, void *cpu_addr)
+ 
+ 	/* Non-coherent atomic allocation? Easy */
+ 	if (IS_ENABLED(CONFIG_DMA_DIRECT_REMAP) &&
+-	    dma_free_from_pool(cpu_addr, alloc_size))
++	    dma_free_from_pool(dev, cpu_addr, alloc_size))
+ 		return;
+ 
+ 	if (IS_ENABLED(CONFIG_DMA_REMAP) && is_vmalloc_addr(cpu_addr)) {
+@@ -1046,7 +1046,8 @@ static void *iommu_dma_alloc(struct device *dev, size_t size,
+ 
+ 	if (IS_ENABLED(CONFIG_DMA_DIRECT_REMAP) &&
+ 	    !gfpflags_allow_blocking(gfp) && !coherent)
+-		cpu_addr = dma_alloc_from_pool(PAGE_ALIGN(size), &page, gfp);
++		cpu_addr = dma_alloc_from_pool(dev, PAGE_ALIGN(size), &page,
++					       gfp);
+ 	else
+ 		cpu_addr = iommu_dma_alloc_pages(dev, size, &page, gfp, attrs);
+ 	if (!cpu_addr)
+diff --git a/include/linux/dma-direct.h b/include/linux/dma-direct.h
+index 1628fb6087ec..a89abb21906e 100644
+--- a/include/linux/dma-direct.h
++++ b/include/linux/dma-direct.h
+@@ -69,6 +69,8 @@ static inline phys_addr_t dma_to_phys(struct device *dev, dma_addr_t daddr)
+ }
+ 
+ u64 dma_direct_get_required_mask(struct device *dev);
++gfp_t dma_direct_optimal_gfp_mask(struct device *dev, u64 dma_mask,
++				  u64 *phys_mask);
+ void *dma_direct_alloc(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 		gfp_t gfp, unsigned long attrs);
+ void dma_direct_free(struct device *dev, size_t size, void *cpu_addr,
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index 06cb794fc6c7..dba2fb03a0fd 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -727,9 +727,9 @@ void *dma_common_pages_remap(struct page **pages, size_t size,
+ 			pgprot_t prot, const void *caller);
+ void dma_common_free_remap(void *cpu_addr, size_t size);
+ 
+-bool dma_in_atomic_pool(void *start, size_t size);
+-void *dma_alloc_from_pool(size_t size, struct page **ret_page, gfp_t flags);
+-bool dma_free_from_pool(void *start, size_t size);
++void *dma_alloc_from_pool(struct device *dev, size_t size,
++			  struct page **ret_page, gfp_t flags);
++bool dma_free_from_pool(struct device *dev, void *start, size_t size);
+ 
+ int
+ dma_common_get_sgtable(struct device *dev, struct sg_table *sgt, void *cpu_addr,
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index 6ff74c282557..3dc3105a8bbf 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -45,8 +45,8 @@ u64 dma_direct_get_required_mask(struct device *dev)
+ 	return (1ULL << (fls64(max_dma) - 1)) * 2 - 1;
+ }
+ 
+-static gfp_t __dma_direct_optimal_gfp_mask(struct device *dev, u64 dma_mask,
+-		u64 *phys_limit)
++gfp_t dma_direct_optimal_gfp_mask(struct device *dev, u64 dma_mask,
++				  u64 *phys_limit)
+ {
+ 	u64 dma_limit = min_not_zero(dma_mask, dev->bus_dma_limit);
+ 
+@@ -89,8 +89,8 @@ struct page *__dma_direct_alloc_pages(struct device *dev, size_t size,
+ 
+ 	/* we always manually zero the memory once we are done: */
+ 	gfp &= ~__GFP_ZERO;
+-	gfp |= __dma_direct_optimal_gfp_mask(dev, dev->coherent_dma_mask,
+-			&phys_limit);
++	gfp |= dma_direct_optimal_gfp_mask(dev, dev->coherent_dma_mask,
++					   &phys_limit);
+ 	page = dma_alloc_contiguous(dev, alloc_size, gfp);
+ 	if (page && !dma_coherent_ok(dev, page_to_phys(page), size)) {
+ 		dma_free_contiguous(dev, page, alloc_size);
+@@ -128,7 +128,7 @@ void *dma_direct_alloc_pages(struct device *dev, size_t size,
+ 	if (IS_ENABLED(CONFIG_DMA_DIRECT_REMAP) &&
+ 	    dma_alloc_need_uncached(dev, attrs) &&
+ 	    !gfpflags_allow_blocking(gfp)) {
+-		ret = dma_alloc_from_pool(PAGE_ALIGN(size), &page, gfp);
++		ret = dma_alloc_from_pool(dev, PAGE_ALIGN(size), &page, gfp);
+ 		if (!ret)
+ 			return NULL;
+ 		goto done;
+@@ -210,7 +210,7 @@ void dma_direct_free_pages(struct device *dev, size_t size, void *cpu_addr,
+ 	}
+ 
+ 	if (IS_ENABLED(CONFIG_DMA_DIRECT_REMAP) &&
+-	    dma_free_from_pool(cpu_addr, PAGE_ALIGN(size)))
++	    dma_free_from_pool(dev, cpu_addr, PAGE_ALIGN(size)))
+ 		return;
+ 
+ 	if (force_dma_unencrypted(dev))
+* Unmerged path kernel/dma/pool.c
