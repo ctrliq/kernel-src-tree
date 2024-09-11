@@ -1,0 +1,259 @@
+ASoC: Make soc_component_read() returning an error code again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: Make soc_component_read() returning an error code again (Jaroslav Kysela) [1869536]
+Rebuild_FUZZ: 95.31%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit efc913c8fb88728626759735e1b09370a6813180
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/efc913c8.failed
+
+Along with the recent unification of snd_soc_component_read*()
+functions, the behavior of snd_soc_component_read() was changed
+slightly; namely it returns the register read value directly, and even
+if an error happens, it returns zero (but it prints an error
+message).  That said, the caller side can't know whether it's an error
+or not any longer.
+
+Ideally this shouldn't matter much, but in practice this seems causing
+a regression, as John reported.  And, grepping the tree revealed that
+there are still plenty of callers that do check the error code, so
+we'll need to deal with them in anyway.
+
+As a quick band-aid over the regression, this patch changes the return
+value of snd_soc_component_read() again to the negative error code.
+It can't work, obviously, for 32bit register values, but it should be
+enough for the known regressions, so far.
+
+Fixes: cf6e26c71bfd ("ASoC: soc-component: merge snd_soc_component_read() and snd_soc_component_read32()")
+	Reported-by: John Stultz <john.stultz@linaro.org>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Link: https://lore.kernel.org/r/20200810134631.19742-1-tiwai@suse.de
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit efc913c8fb88728626759735e1b09370a6813180)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/soc-component.c
+diff --cc sound/soc/soc-component.c
+index 05dcb9c6e130,5504b92946e3..000000000000
+--- a/sound/soc/soc-component.c
++++ b/sound/soc/soc-component.c
+@@@ -386,9 -389,210 +386,213 @@@ EXPORT_SYMBOL_GPL(snd_soc_component_exi
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int soc_component_read_no_lock(
++ 	struct snd_soc_component *component,
++ 	unsigned int reg)
++ {
++ 	int ret;
++ 	unsigned int val = 0;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_read(component->regmap, reg, &val);
++ 	else if (component->driver->read) {
++ 		ret = 0;
++ 		val = component->driver->read(component, reg);
++ 	}
++ 	else
++ 		ret = -EIO;
++ 
++ 	if (ret < 0)
++ 		return soc_component_ret(component, ret);
++ 
++ 	return val;
++ }
++ 
++ /**
++  * snd_soc_component_read() - Read register value
++  * @component: Component to read from
++  * @reg: Register to read
++  *
++  * Return: read value
++  */
++ unsigned int snd_soc_component_read(struct snd_soc_component *component,
++ 				    unsigned int reg)
++ {
++ 	unsigned int val;
++ 
++ 	mutex_lock(&component->io_mutex);
++ 	val = soc_component_read_no_lock(component, reg);
++ 	mutex_unlock(&component->io_mutex);
++ 
++ 	return val;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_read);
++ 
++ static int soc_component_write_no_lock(
++ 	struct snd_soc_component *component,
++ 	unsigned int reg, unsigned int val)
++ {
++ 	int ret = -EIO;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_write(component->regmap, reg, val);
++ 	else if (component->driver->write)
++ 		ret = component->driver->write(component, reg, val);
++ 
++ 	return soc_component_ret(component, ret);
++ }
++ 
++ /**
++  * snd_soc_component_write() - Write register value
++  * @component: Component to write to
++  * @reg: Register to write
++  * @val: Value to write to the register
++  *
++  * Return: 0 on success, a negative error code otherwise.
++  */
++ int snd_soc_component_write(struct snd_soc_component *component,
++ 			    unsigned int reg, unsigned int val)
++ {
++ 	int ret;
++ 
++ 	mutex_lock(&component->io_mutex);
++ 	ret = soc_component_write_no_lock(component, reg, val);
++ 	mutex_unlock(&component->io_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_write);
++ 
++ static int snd_soc_component_update_bits_legacy(
++ 	struct snd_soc_component *component, unsigned int reg,
++ 	unsigned int mask, unsigned int val, bool *change)
++ {
++ 	unsigned int old, new;
++ 	int ret = 0;
++ 
++ 	mutex_lock(&component->io_mutex);
++ 
++ 	old = soc_component_read_no_lock(component, reg);
++ 
++ 	new = (old & ~mask) | (val & mask);
++ 	*change = old != new;
++ 	if (*change)
++ 		ret = soc_component_write_no_lock(component, reg, new);
++ 
++ 	mutex_unlock(&component->io_mutex);
++ 
++ 	return soc_component_ret(component, ret);
++ }
++ 
++ /**
++  * snd_soc_component_update_bits() - Perform read/modify/write cycle
++  * @component: Component to update
++  * @reg: Register to update
++  * @mask: Mask that specifies which bits to update
++  * @val: New value for the bits specified by mask
++  *
++  * Return: 1 if the operation was successful and the value of the register
++  * changed, 0 if the operation was successful, but the value did not change.
++  * Returns a negative error code otherwise.
++  */
++ int snd_soc_component_update_bits(struct snd_soc_component *component,
++ 				  unsigned int reg, unsigned int mask, unsigned int val)
++ {
++ 	bool change;
++ 	int ret;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_update_bits_check(component->regmap, reg, mask,
++ 					       val, &change);
++ 	else
++ 		ret = snd_soc_component_update_bits_legacy(component, reg,
++ 							   mask, val, &change);
++ 
++ 	if (ret < 0)
++ 		return soc_component_ret(component, ret);
++ 	return change;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_update_bits);
++ 
++ /**
++  * snd_soc_component_update_bits_async() - Perform asynchronous
++  *  read/modify/write cycle
++  * @component: Component to update
++  * @reg: Register to update
++  * @mask: Mask that specifies which bits to update
++  * @val: New value for the bits specified by mask
++  *
++  * This function is similar to snd_soc_component_update_bits(), but the update
++  * operation is scheduled asynchronously. This means it may not be completed
++  * when the function returns. To make sure that all scheduled updates have been
++  * completed snd_soc_component_async_complete() must be called.
++  *
++  * Return: 1 if the operation was successful and the value of the register
++  * changed, 0 if the operation was successful, but the value did not change.
++  * Returns a negative error code otherwise.
++  */
++ int snd_soc_component_update_bits_async(struct snd_soc_component *component,
++ 					unsigned int reg, unsigned int mask, unsigned int val)
++ {
++ 	bool change;
++ 	int ret;
++ 
++ 	if (component->regmap)
++ 		ret = regmap_update_bits_check_async(component->regmap, reg,
++ 						     mask, val, &change);
++ 	else
++ 		ret = snd_soc_component_update_bits_legacy(component, reg,
++ 							   mask, val, &change);
++ 
++ 	if (ret < 0)
++ 		return soc_component_ret(component, ret);
++ 	return change;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_update_bits_async);
++ 
++ /**
++  * snd_soc_component_async_complete() - Ensure asynchronous I/O has completed
++  * @component: Component for which to wait
++  *
++  * This function blocks until all asynchronous I/O which has previously been
++  * scheduled using snd_soc_component_update_bits_async() has completed.
++  */
++ void snd_soc_component_async_complete(struct snd_soc_component *component)
++ {
++ 	if (component->regmap)
++ 		regmap_async_complete(component->regmap);
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_async_complete);
++ 
++ /**
++  * snd_soc_component_test_bits - Test register for change
++  * @component: component
++  * @reg: Register to test
++  * @mask: Mask that specifies which bits to test
++  * @value: Value to test against
++  *
++  * Tests a register with a new value and checks if the new value is
++  * different from the old value.
++  *
++  * Return: 1 for change, otherwise 0.
++  */
++ int snd_soc_component_test_bits(struct snd_soc_component *component,
++ 				unsigned int reg, unsigned int mask, unsigned int value)
++ {
++ 	unsigned int old, new;
++ 
++ 	old = snd_soc_component_read(component, reg);
++ 	new = (old & ~mask) | value;
++ 	return old != new;
++ }
++ EXPORT_SYMBOL_GPL(snd_soc_component_test_bits);
++ 
+++>>>>>>> efc913c8fb88 (ASoC: Make soc_component_read() returning an error code again)
+  int snd_soc_pcm_component_pointer(struct snd_pcm_substream *substream)
+  {
+ -	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
+ +	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+  	struct snd_soc_component *component;
+  	int i;
+  
+* Unmerged path sound/soc/soc-component.c
