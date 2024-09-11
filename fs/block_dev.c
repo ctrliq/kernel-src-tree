@@ -140,7 +140,6 @@ invalidate:
 					     lstart >> PAGE_SHIFT,
 					     lend >> PAGE_SHIFT);
 }
-EXPORT_SYMBOL(truncate_bdev_range);
 
 static void set_init_blocksize(struct block_device *bdev)
 {
