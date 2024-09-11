@@ -1,0 +1,167 @@
+blkcg: associate blkg when associating a device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Dennis Zhou <dennis@kernel.org>
+commit 5cdf2e3fea5ee37b66842d76a9b06e6dac0b933d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/5cdf2e3f.failed
+
+Previously, blkg association was handled by controller specific code in
+blk-throttle and blk-iolatency. However, because a blkg represents a
+relationship between a blkcg and a request_queue, it makes sense to keep
+the blkg->q and bio->bi_disk->queue consistent.
+
+This patch moves association into the bio_set_dev macro(). This should
+cover the majority of cases where the device is set/changed keeping the
+two pointers consistent. Fallback code is added to
+blkcg_bio_issue_check() to catch any missing paths.
+
+	Signed-off-by: Dennis Zhou <dennis@kernel.org>
+	Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5cdf2e3fea5ee37b66842d76a9b06e6dac0b933d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-iolatency.c
+#	block/blk-throttle.c
+#	include/linux/blk-cgroup.h
+diff --cc block/blk-iolatency.c
+index 171f7ae1a396,e6b47c255521..000000000000
+--- a/block/blk-iolatency.c
++++ b/block/blk-iolatency.c
+@@@ -385,32 -472,14 +385,40 @@@ static void check_scale_change(struct i
+  static void blkcg_iolatency_throttle(struct rq_qos *rqos, struct bio *bio)
+  {
+  	struct blk_iolatency *blkiolat = BLKIOLATENCY(rqos);
+++<<<<<<< HEAD
+ +	struct blkcg *blkcg;
+ +	struct blkcg_gq *blkg;
+ +	struct request_queue *q = rqos->q;
+++=======
++ 	struct blkcg_gq *blkg = bio->bi_blkg;
+++>>>>>>> 5cdf2e3fea5e (blkcg: associate blkg when associating a device)
+  	bool issue_as_root = bio_issue_as_root_blkg(bio);
+  
+  	if (!blk_iolatency_enabled(blkiolat))
+  		return;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	bio_associate_blkcg(bio, NULL);
+ +	blkcg = bio_blkcg(bio);
+ +	blkg = blkg_lookup(blkcg, q);
+ +	if (unlikely(!blkg)) {
+ +		spin_lock_irq(q->queue_lock);
+ +		blkg = blkg_lookup_create(blkcg, q);
+ +		if (IS_ERR(blkg))
+ +			blkg = NULL;
+ +		spin_unlock_irq(q->queue_lock);
+ +	}
+ +	if (!blkg)
+ +		goto out;
+++=======
++ 	bio_issue_init(&bio->bi_issue, bio_sectors(bio));
+++>>>>>>> 5cdf2e3fea5e (blkcg: associate blkg when associating a device)
+  
+ +	bio_issue_init(&bio->bi_issue, bio_sectors(bio));
+ +	bio_associate_blkg(bio, blkg);
+ +out:
+ +	rcu_read_unlock();
+  	while (blkg && blkg->parent) {
+  		struct iolatency_grp *iolat = blkg_to_lat(blkg);
+  		if (!iolat) {
+diff --cc block/blk-throttle.c
+index 07f1b008e5ab,1c6529df2002..000000000000
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@@ -2113,12 -2115,9 +2113,15 @@@ static inline void throtl_update_latenc
+  }
+  #endif
+  
+ -static void blk_throtl_assoc_bio(struct bio *bio)
+ +static void blk_throtl_assoc_bio(struct throtl_grp *tg, struct bio *bio)
+  {
+  #ifdef CONFIG_BLK_DEV_THROTTLING_LOW
+++<<<<<<< HEAD
+ +	/* fallback to root_blkg if we fail to get a blkg ref */
+ +	if (bio->bi_css && (bio_associate_blkg(bio, tg_to_blkg(tg)) == -ENODEV))
+ +		bio_associate_blkg(bio, bio->bi_disk->queue->root_blkg);
+++=======
+++>>>>>>> 5cdf2e3fea5e (blkcg: associate blkg when associating a device)
+  	bio_issue_init(&bio->bi_issue, bio_sectors(bio));
+  #endif
+  }
+diff --cc include/linux/blk-cgroup.h
+index 8bf2308b920c,f09752968c2a..000000000000
+--- a/include/linux/blk-cgroup.h
++++ b/include/linux/blk-cgroup.h
+@@@ -843,21 -806,16 +844,31 @@@ static inline bool blkcg_bio_issue_chec
+  	struct blkcg_gq *blkg;
+  	bool throtl = false;
+  
+- 	rcu_read_lock();
++ 	if (!bio->bi_blkg) {
++ 		char b[BDEVNAME_SIZE];
+  
+++<<<<<<< HEAD
+ +	/* associate blkcg if bio hasn't attached one */
+ +	bio_associate_blkcg(bio, NULL);
+ +	blkcg = bio_blkcg(bio);
+ +
+ +	blkg = blkg_lookup(blkcg, q);
+ +	if (unlikely(!blkg)) {
+ +		spin_lock_irq(q->queue_lock);
+ +		blkg = blkg_lookup_create(blkcg, q);
+ +		if (IS_ERR(blkg))
+ +			blkg = NULL;
+ +		spin_unlock_irq(q->queue_lock);
+ +	}
+++=======
++ 		WARN_ONCE(1,
++ 			  "no blkg associated for bio on block-device: %s\n",
++ 			  bio_devname(bio, b));
++ 		bio_associate_blkg(bio);
++ 	}
++ 
++ 	blkg = bio->bi_blkg;
+++>>>>>>> 5cdf2e3fea5e (blkcg: associate blkg when associating a device)
+  
+  	throtl = blk_throtl_bio(q, blkg, bio);
+  
+diff --git a/block/bio.c b/block/bio.c
+index 8d70c85b6b8f..ac2956b5efde 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -2026,6 +2026,7 @@ int bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg)
+ 	bio->bi_blkg = blkg;
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(bio_associate_blkg);
+ 
+ /**
+  * bio_disassociate_task - undo bio_associate_current()
+* Unmerged path block/blk-iolatency.c
+* Unmerged path block/blk-throttle.c
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 056fb627edb3..0eec692c0aa4 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -491,12 +491,14 @@ do {						\
+ 		bio_clear_flag(bio, BIO_THROTTLED);\
+ 	(bio)->bi_disk = (bdev)->bd_disk;	\
+ 	(bio)->bi_partno = (bdev)->bd_partno;	\
++	bio_associate_blkg(bio);		\
+ } while (0)
+ 
+ #define bio_copy_dev(dst, src)			\
+ do {						\
+ 	(dst)->bi_disk = (src)->bi_disk;	\
+ 	(dst)->bi_partno = (src)->bi_partno;	\
++	bio_clone_blkcg_association(dst, src);	\
+ } while (0)
+ 
+ #define bio_dev(bio) \
+* Unmerged path include/linux/blk-cgroup.h
