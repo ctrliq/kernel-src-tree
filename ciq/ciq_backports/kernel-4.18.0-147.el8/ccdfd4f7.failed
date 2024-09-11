@@ -1,0 +1,161 @@
+vxlan: Have vxlan_fdb_replace() save original rdst value
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Petr Machata <petrm@mellanox.com>
+commit ccdfd4f71d10937504cac8663cb1782063319e39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ccdfd4f7.failed
+
+To enable rollbacks after vetoed FDB updates, extend vxlan_fdb_replace()
+to take an additional argument where it should store the original values
+of a modified rdst. Update the sole caller.
+
+The following patch will make use of the saved value.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ccdfd4f71d10937504cac8663cb1782063319e39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 4ecaa83ef765,1c8d8c8e0961..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -934,6 -856,129 +935,132 @@@ static void vxlan_fdb_destroy(struct vx
+  	call_rcu(&f->rcu, vxlan_fdb_free);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vxlan_fdb_update_existing(struct vxlan_dev *vxlan,
++ 				     union vxlan_addr *ip,
++ 				     __u16 state, __u16 flags,
++ 				     __be16 port, __be32 vni,
++ 				     __u32 ifindex, __u16 ndm_flags,
++ 				     struct vxlan_fdb *f,
++ 				     bool swdev_notify)
++ {
++ 	__u16 fdb_flags = (ndm_flags & ~NTF_USE);
++ 	struct vxlan_rdst *rd = NULL;
++ 	struct vxlan_rdst oldrd;
++ 	int notify = 0;
++ 	int rc;
++ 
++ 	/* Do not allow an externally learned entry to take over an entry added
++ 	 * by the user.
++ 	 */
++ 	if (!(fdb_flags & NTF_EXT_LEARNED) ||
++ 	    !(f->flags & NTF_VXLAN_ADDED_BY_USER)) {
++ 		if (f->state != state) {
++ 			f->state = state;
++ 			f->updated = jiffies;
++ 			notify = 1;
++ 		}
++ 		if (f->flags != fdb_flags) {
++ 			f->flags = fdb_flags;
++ 			f->updated = jiffies;
++ 			notify = 1;
++ 		}
++ 	}
++ 
++ 	if ((flags & NLM_F_REPLACE)) {
++ 		/* Only change unicasts */
++ 		if (!(is_multicast_ether_addr(f->eth_addr) ||
++ 		      is_zero_ether_addr(f->eth_addr))) {
++ 			rc = vxlan_fdb_replace(f, ip, port, vni,
++ 					       ifindex, &oldrd);
++ 			notify |= rc;
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 	if ((flags & NLM_F_APPEND) &&
++ 	    (is_multicast_ether_addr(f->eth_addr) ||
++ 	     is_zero_ether_addr(f->eth_addr))) {
++ 		rc = vxlan_fdb_append(f, ip, port, vni, ifindex, &rd);
++ 
++ 		if (rc < 0)
++ 			return rc;
++ 		notify |= rc;
++ 	}
++ 
++ 	if (ndm_flags & NTF_USE)
++ 		f->used = jiffies;
++ 
++ 	if (notify) {
++ 		if (rd == NULL)
++ 			rd = first_remote_rtnl(f);
++ 
++ 		vxlan_fdb_notify(vxlan, f, rd, RTM_NEWNEIGH, swdev_notify);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int vxlan_fdb_update_create(struct vxlan_dev *vxlan,
++ 				   const u8 *mac, union vxlan_addr *ip,
++ 				   __u16 state, __u16 flags,
++ 				   __be16 port, __be32 src_vni, __be32 vni,
++ 				   __u32 ifindex, __u16 ndm_flags,
++ 				   bool swdev_notify)
++ {
++ 	__u16 fdb_flags = (ndm_flags & ~NTF_USE);
++ 	struct vxlan_fdb *f;
++ 	int rc;
++ 
++ 	/* Disallow replace to add a multicast entry */
++ 	if ((flags & NLM_F_REPLACE) &&
++ 	    (is_multicast_ether_addr(mac) || is_zero_ether_addr(mac)))
++ 		return -EOPNOTSUPP;
++ 
++ 	netdev_dbg(vxlan->dev, "add %pM -> %pIS\n", mac, ip);
++ 	rc = vxlan_fdb_create(vxlan, mac, ip, state, port, src_vni,
++ 			      vni, ifindex, fdb_flags, &f);
++ 	if (rc < 0)
++ 		return rc;
++ 
++ 	vxlan_fdb_notify(vxlan, f, first_remote_rtnl(f), RTM_NEWNEIGH,
++ 			 swdev_notify);
++ 	return 0;
++ }
++ 
++ /* Add new entry to forwarding table -- assumes lock held */
++ static int vxlan_fdb_update(struct vxlan_dev *vxlan,
++ 			    const u8 *mac, union vxlan_addr *ip,
++ 			    __u16 state, __u16 flags,
++ 			    __be16 port, __be32 src_vni, __be32 vni,
++ 			    __u32 ifindex, __u16 ndm_flags,
++ 			    bool swdev_notify)
++ {
++ 	struct vxlan_fdb *f;
++ 
++ 	f = __vxlan_find_mac(vxlan, mac, src_vni);
++ 	if (f) {
++ 		if (flags & NLM_F_EXCL) {
++ 			netdev_dbg(vxlan->dev,
++ 				   "lost race to create %pM\n", mac);
++ 			return -EEXIST;
++ 		}
++ 
++ 		return vxlan_fdb_update_existing(vxlan, ip, state, flags, port,
++ 						 vni, ifindex, ndm_flags, f,
++ 						 swdev_notify);
++ 	} else {
++ 		if (!(flags & NLM_F_CREATE))
++ 			return -ENOENT;
++ 
++ 		return vxlan_fdb_update_create(vxlan, mac, ip, state, flags,
++ 					       port, src_vni, vni, ifindex,
++ 					       ndm_flags, swdev_notify);
++ 	}
++ }
++ 
+++>>>>>>> ccdfd4f71d10 (vxlan: Have vxlan_fdb_replace() save original rdst value)
+  static void vxlan_dst_free(struct rcu_head *head)
+  {
+  	struct vxlan_rdst *rd = container_of(head, struct vxlan_rdst, rcu);
+* Unmerged path drivers/net/vxlan.c
