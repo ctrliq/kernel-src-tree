@@ -1,0 +1,178 @@
+iommu/vt-d: Make intel_iommu_enable_pasid() more generic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] vt-d: Make intel_iommu_enable_pasid() more generic (Jerry Snitselaar) [1742234]
+Rebuild_FUZZ: 94.34%
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit d7cbc0f3220fabbdfa9b3aa79275baa5b16fef5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d7cbc0f3.failed
+
+This moves intel_iommu_enable_pasid() out of the scope of
+CONFIG_INTEL_IOMMU_SVM with more and more features requiring
+pasid function.
+
+	Cc: Ashok Raj <ashok.raj@intel.com>
+	Cc: Jacob Pan <jacob.jun.pan@linux.intel.com>
+	Cc: Kevin Tian <kevin.tian@intel.com>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit d7cbc0f3220fabbdfa9b3aa79275baa5b16fef5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 417055f53472,d2e613875b3a..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -5265,31 -5301,13 +5265,35 @@@ static void intel_iommu_put_resv_region
+  {
+  	struct iommu_resv_region *entry, *next;
+  
+ -	list_for_each_entry_safe(entry, next, head, list) {
+ -		if (entry->type == IOMMU_RESV_MSI)
+ -			kfree(entry);
+ -	}
+ +	list_for_each_entry_safe(entry, next, head, list)
+ +		kfree(entry);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_INTEL_IOMMU_SVM
+ +#define MAX_NR_PASID_BITS (20)
+ +static inline unsigned long intel_iommu_get_pts(struct intel_iommu *iommu)
+ +{
+ +	/*
+ +	 * Convert ecap_pss to extend context entry pts encoding, also
+ +	 * respect the soft pasid_max value set by the iommu.
+ +	 * - number of PASID bits = ecap_pss + 1
+ +	 * - number of PASID table entries = 2^(pts + 5)
+ +	 * Therefore, pts = ecap_pss - 4
+ +	 * e.g. KBL ecap_pss = 0x13, PASID has 20 bits, pts = 15
+ +	 */
+ +	if (ecap_pss(iommu->ecap) < 5)
+ +		return 0;
+ +
+ +	/* pasid_max is encoded as actual number of entries not the bits */
+ +	return find_first_bit((unsigned long *)&iommu->pasid_max,
+ +			MAX_NR_PASID_BITS) - 5;
+ +}
+ +
+ +int intel_iommu_enable_pasid(struct intel_iommu *iommu, struct intel_svm_dev *sdev)
+++=======
++ int intel_iommu_enable_pasid(struct intel_iommu *iommu, struct device *dev)
+++>>>>>>> d7cbc0f3220f (iommu/vt-d: Make intel_iommu_enable_pasid() more generic)
+  {
+  	struct device_domain_info *info;
+  	struct context_entry *context;
+@@@ -5316,40 -5334,13 +5320,39 @@@
+  
+  	ctx_lo = context[0].lo;
+  
+- 	sdev->did = FLPT_DEFAULT_DID;
+- 	sdev->sid = PCI_DEVID(info->bus, info->devfn);
+- 
+  	if (!(ctx_lo & CONTEXT_PASIDE)) {
+ +		if (iommu->pasid_state_table)
+ +			context[1].hi = (u64)virt_to_phys(iommu->pasid_state_table);
+ +		context[1].lo = (u64)virt_to_phys(iommu->pasid_table) |
+ +			intel_iommu_get_pts(iommu);
+ +
+ +		wmb();
+ +		/* CONTEXT_TT_MULTI_LEVEL and CONTEXT_TT_DEV_IOTLB are both
+ +		 * extended to permit requests-with-PASID if the PASIDE bit
+ +		 * is set. which makes sense. For CONTEXT_TT_PASS_THROUGH,
+ +		 * however, the PASIDE bit is ignored and requests-with-PASID
+ +		 * are unconditionally blocked. Which makes less sense.
+ +		 * So convert from CONTEXT_TT_PASS_THROUGH to one of the new
+ +		 * "guest mode" translation types depending on whether ATS
+ +		 * is available or not. Annoyingly, we can't use the new
+ +		 * modes *unless* PASIDE is set. */
+ +		if ((ctx_lo & CONTEXT_TT_MASK) == (CONTEXT_TT_PASS_THROUGH << 2)) {
+ +			ctx_lo &= ~CONTEXT_TT_MASK;
+ +			if (info->ats_supported)
+ +				ctx_lo |= CONTEXT_TT_PT_PASID_DEV_IOTLB << 2;
+ +			else
+ +				ctx_lo |= CONTEXT_TT_PT_PASID << 2;
+ +		}
+  		ctx_lo |= CONTEXT_PASIDE;
+ +		if (iommu->pasid_state_table)
+ +			ctx_lo |= CONTEXT_DINVE;
+ +		if (info->pri_supported)
+ +			ctx_lo |= CONTEXT_PRS;
+  		context[0].lo = ctx_lo;
+  		wmb();
+- 		iommu->flush.flush_context(iommu, sdev->did, sdev->sid,
++ 		iommu->flush.flush_context(iommu,
++ 					   domain->iommu_did[iommu->seq_id],
++ 					   PCI_DEVID(info->bus, info->devfn),
+  					   DMA_CCMD_MASK_NOBIT,
+  					   DMA_CCMD_DEVICE_INVL);
+  	}
+* Unmerged path drivers/iommu/intel-iommu.c
+diff --git a/drivers/iommu/intel-svm.c b/drivers/iommu/intel-svm.c
+index 22119ff81137..d73fb12024b5 100644
+--- a/drivers/iommu/intel-svm.c
++++ b/drivers/iommu/intel-svm.c
+@@ -297,6 +297,7 @@ static LIST_HEAD(global_svm_list);
+ int intel_svm_bind_mm(struct device *dev, int *pasid, int flags, struct svm_dev_ops *ops)
+ {
+ 	struct intel_iommu *iommu = intel_svm_device_to_iommu(dev);
++	struct device_domain_info *info;
+ 	struct intel_svm_dev *sdev;
+ 	struct intel_svm *svm = NULL;
+ 	struct mm_struct *mm = NULL;
+@@ -361,13 +362,29 @@ int intel_svm_bind_mm(struct device *dev, int *pasid, int flags, struct svm_dev_
+ 	}
+ 	sdev->dev = dev;
+ 
+-	ret = intel_iommu_enable_pasid(iommu, sdev);
++	ret = intel_iommu_enable_pasid(iommu, dev);
+ 	if (ret || !pasid) {
+ 		/* If they don't actually want to assign a PASID, this is
+ 		 * just an enabling check/preparation. */
+ 		kfree(sdev);
+ 		goto out;
+ 	}
++
++	info = dev->archdata.iommu;
++	if (!info || !info->pasid_supported) {
++		kfree(sdev);
++		goto out;
++	}
++
++	sdev->did = FLPT_DEFAULT_DID;
++	sdev->sid = PCI_DEVID(info->bus, info->devfn);
++	if (info->ats_enabled) {
++		sdev->dev_iotlb = 1;
++		sdev->qdep = info->ats_qdep;
++		if (sdev->qdep >= QI_DEV_EIOTLB_MAX_INVS)
++			sdev->qdep = 0;
++	}
++
+ 	/* Finish the setup now we know we're keeping it */
+ 	sdev->users = 1;
+ 	sdev->ops = ops;
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index 0298b95e5d3a..56815d7f42dc 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -636,6 +636,7 @@ struct intel_iommu *domain_get_iommu(struct dmar_domain *domain);
+ int for_each_device_domain(int (*fn)(struct device_domain_info *info,
+ 				     void *data), void *data);
+ void iommu_flush_write_buffer(struct intel_iommu *iommu);
++int intel_iommu_enable_pasid(struct intel_iommu *iommu, struct device *dev);
+ 
+ #ifdef CONFIG_INTEL_IOMMU_SVM
+ int intel_svm_init(struct intel_iommu *iommu);
+@@ -666,7 +667,6 @@ struct intel_svm {
+ 	struct list_head list;
+ };
+ 
+-extern int intel_iommu_enable_pasid(struct intel_iommu *iommu, struct intel_svm_dev *sdev);
+ extern struct intel_iommu *intel_svm_device_to_iommu(struct device *dev);
+ #endif
+ 
