@@ -1,0 +1,143 @@
+KVM: nSVM: always use vmcb01 to for vmsave/vmload of guest state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit cc3ed80ae69f454c3d904af9f65394a540099723
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/cc3ed80a.failed
+
+This allows to avoid copying of these fields between vmcb01
+and vmcb02 on nested guest entry/exit.
+
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cc3ed80ae69f454c3d904af9f65394a540099723)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/nested.c
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/nested.c
+index e8796fbe795c,35947464ee2a..000000000000
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@@ -484,9 -533,14 +484,20 @@@ int enter_svm_guest_mode(struct vcpu_sv
+  
+  
+  	svm->nested.vmcb12_gpa = vmcb12_gpa;
+++<<<<<<< HEAD
+ +	load_nested_vmcb_control(svm, &vmcb12->control);
+ +	nested_prepare_vmcb_save(svm, vmcb12);
+ +	nested_prepare_vmcb_control(svm);
+++=======
++ 
++ 	WARN_ON(svm->vmcb == svm->nested.vmcb02.ptr);
++ 
++ 	nested_load_control_from_vmcb12(svm, &vmcb12->control);
++ 
++ 	svm_switch_vmcb(svm, &svm->nested.vmcb02);
++ 	nested_vmcb02_prepare_control(svm);
++ 	nested_vmcb02_prepare_save(svm, vmcb12);
+++>>>>>>> cc3ed80ae69f (KVM: nSVM: always use vmcb01 to for vmsave/vmload of guest state)
+  
+  	ret = nested_svm_load_cr3(&svm->vcpu, vmcb12->save.cr3,
+  				  nested_npt_enabled(svm));
+@@@ -677,11 -725,14 +688,20 @@@ int nested_svm_vmexit(struct vcpu_svm *
+  	vmcb12->control.pause_filter_thresh =
+  		svm->vmcb->control.pause_filter_thresh;
+  
+++<<<<<<< HEAD
+ +	/* Restore the original control entries */
+ +	copy_vmcb_control_area(&vmcb->control, &hsave->control);
+ +
+ +	/* On vmexit the  GIF is set to false */
+++=======
++ 	svm_switch_vmcb(svm, &svm->vmcb01);
++ 
++ 	/*
++ 	 * On vmexit the  GIF is set to false and
++ 	 * no event can be injected in L1.
++ 	 */
+++>>>>>>> cc3ed80ae69f (KVM: nSVM: always use vmcb01 to for vmsave/vmload of guest state)
+  	svm_set_gif(svm, false);
+ -	svm->vmcb->control.exit_int_info = 0;
+  
+  	svm->vcpu.arch.tsc_offset = svm->vcpu.arch.l1_tsc_offset;
+  	if (svm->vmcb->control.tsc_offset != svm->vcpu.arch.tsc_offset) {
+diff --cc arch/x86/kvm/svm/svm.c
+index dd9e65c2714d,d1316710a5e7..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -3668,9 -3690,63 +3670,65 @@@ static fastpath_t svm_exit_handlers_fas
+  	return EXIT_FASTPATH_NONE;
+  }
+  
+ -static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu)
+ -{
+ -	struct vcpu_svm *svm = to_svm(vcpu);
+ +void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
+  
+++<<<<<<< HEAD
+ +static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++=======
++ 	/*
++ 	 * VMENTER enables interrupts (host state), but the kernel state is
++ 	 * interrupts disabled when this is invoked. Also tell RCU about
++ 	 * it. This is the same logic as for exit_to_user_mode().
++ 	 *
++ 	 * This ensures that e.g. latency analysis on the host observes
++ 	 * guest mode as interrupt enabled.
++ 	 *
++ 	 * guest_enter_irqoff() informs context tracking about the
++ 	 * transition to guest mode and if enabled adjusts RCU state
++ 	 * accordingly.
++ 	 */
++ 	instrumentation_begin();
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	instrumentation_end();
++ 
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ 
++ 	if (sev_es_guest(vcpu->kvm)) {
++ 		__svm_sev_es_vcpu_run(svm->vmcb_pa);
++ 	} else {
++ 		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
++ 
++ 		vmload(svm->vmcb01.pa);
++ 		__svm_vcpu_run(svm->vmcb_pa, (unsigned long *)&vcpu->arch.regs);
++ 		vmsave(svm->vmcb01.pa);
++ 
++ 		vmload(__sme_page_pa(sd->save_area));
++ 	}
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ 
++ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++>>>>>>> cc3ed80ae69f (KVM: nSVM: always use vmcb01 to for vmsave/vmload of guest state)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+* Unmerged path arch/x86/kvm/svm/nested.c
+* Unmerged path arch/x86/kvm/svm/svm.c
