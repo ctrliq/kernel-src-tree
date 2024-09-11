@@ -1,0 +1,78 @@
+block: throttle split bio in case of iops limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 9f5ede3c01f9951b0ae7d68b28762ad51d9bacc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/9f5ede3c.failed
+
+Commit 111be8839817 ("block-throttle: avoid double charge") marks bio as
+BIO_THROTTLED unconditionally if __blk_throtl_bio() is called on this bio,
+then this bio won't be called into __blk_throtl_bio() any more. This way
+is to avoid double charge in case of bio splitting. It is reasonable for
+read/write throughput limit, but not reasonable for IOPS limit because
+block layer provides io accounting against split bio.
+
+Chunguang Xu has already observed this issue and fixed it in commit
+4f1e9630afe6 ("blk-throtl: optimize IOPS throttle for large IO scenarios").
+However, that patch only covers bio splitting in __blk_queue_split(), and
+we have other kind of bio splitting, such as bio_split() &
+submit_bio_noacct() and other ways.
+
+This patch tries to fix the issue in one generic way by always charging
+the bio for iops limit in blk_throtl_bio(). This way is reasonable:
+re-submission & fast-cloned bio is charged if it is submitted to same
+disk/queue, and BIO_THROTTLED will be cleared if bio->bi_bdev is changed.
+
+This new approach can get much more smooth/stable iops limit compared with
+commit 4f1e9630afe6 ("blk-throtl: optimize IOPS throttle for large IO
+scenarios") since that commit can't throttle current split bios actually.
+
+Also this way won't cause new double bio iops charge in
+blk_throtl_dispatch_work_fn() in which blk_throtl_bio() won't be called
+any more.
+
+	Reported-by: Ning Li <lining2020x@163.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Cc: Chunguang Xu <brookxu@tencent.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+Link: https://lore.kernel.org/r/20220216044514.2903784-7-ming.lei@redhat.com
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9f5ede3c01f9951b0ae7d68b28762ad51d9bacc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-throttle.h
+* Unmerged path block/blk-throttle.h
+diff --git a/block/blk-throttle.c b/block/blk-throttle.c
+index 977cb2fbd03d..bf947f21ccff 100644
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@ -946,7 +946,8 @@ static bool tg_with_in_bps_limit(struct throtl_grp *tg, struct bio *bio,
+ 	unsigned long jiffy_elapsed, jiffy_wait, jiffy_elapsed_rnd;
+ 	unsigned int bio_size = throtl_bio_data_size(bio);
+ 
+-	if (bps_limit == U64_MAX) {
++	/* no need to throttle if this bio's bytes have been accounted */
++	if (bps_limit == U64_MAX || bio_flagged(bio, BIO_THROTTLED)) {
+ 		if (wait)
+ 			*wait = 0;
+ 		return true;
+@@ -1055,9 +1056,12 @@ static void throtl_charge_bio(struct throtl_grp *tg, struct bio *bio)
+ 	unsigned int bio_size = throtl_bio_data_size(bio);
+ 
+ 	/* Charge the bio to the group */
+-	tg->bytes_disp[rw] += bio_size;
++	if (!bio_flagged(bio, BIO_THROTTLED)) {
++		tg->bytes_disp[rw] += bio_size;
++		tg->last_bytes_disp[rw] += bio_size;
++	}
++
+ 	tg->io_disp[rw]++;
+-	tg->last_bytes_disp[rw] += bio_size;
+ 	tg->last_io_disp[rw]++;
+ 
+ 	/*
+* Unmerged path block/blk-throttle.h
