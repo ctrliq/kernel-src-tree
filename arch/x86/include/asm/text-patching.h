@@ -57,6 +57,8 @@ extern void text_poke_bp_batch(struct text_poke_loc *tp, unsigned int nr_entries
 extern void text_poke_loc_init(struct text_poke_loc *tp, void *addr,
 			       const void *opcode, size_t len, const void *emulate);
 extern int after_bootmem;
+extern __ro_after_init struct mm_struct *poking_mm;
+extern __ro_after_init unsigned long poking_addr;
 
 static inline void int3_emulate_jmp(struct pt_regs *regs, unsigned long ip)
 {
