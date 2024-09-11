@@ -559,6 +559,8 @@ int cmd_annotate(int argc, const char **argv)
 	if (ret < 0)
 		return ret;
 
+	annotation_config__init(&annotate.opts);
+
 	argc = parse_options(argc, argv, options, annotate_usage, 0);
 	if (argc) {
 		/*
@@ -594,8 +596,6 @@ int cmd_annotate(int argc, const char **argv)
 	ret = symbol__annotation_init();
 	if (ret < 0)
 		goto out_delete;
-
-	annotation_config__init(&annotate.opts);
 
 	symbol_conf.try_vmlinux_path = true;
 
