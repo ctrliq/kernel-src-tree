@@ -3334,7 +3334,6 @@ xfs_rename(
 			goto out_trans_cancel;
 
 		xfs_bumplink(tp, wip);
-		xfs_trans_log_inode(tp, wip, XFS_ILOG_CORE);
 		VFS_I(wip)->i_state &= ~I_LINKABLE;
 	}
 
