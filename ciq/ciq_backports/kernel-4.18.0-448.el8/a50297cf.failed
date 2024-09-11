@@ -1,0 +1,613 @@
+s390/pci: separate zbus creation from scanning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit a50297cf8235b062bcdeaa8b1dad58e69d3e1b43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/a50297cf.failed
+
+In the existing code the creation of the PCI bus and the scanning of
+function zero all happens in zpci_scan_bus(). This in turn requires
+functions to be enabled and their resources to be available before the
+PCI bus is even created.
+
+This not only means that functions are enabled long before they are
+actually made available to the common PCI subsystem. In case of
+functions with non-zero devfn which appeared before the function with
+devfn zero they can wait arbitrarily long in this enabled but not
+scanned state.
+
+Fix this by separating the creation of the PCI bus from scanning it and
+only prepare, that is enable and setup MMIO bus resources, functions
+just before they are scanned. As they may be scanned multiple times
+track if we already created resources in the zdev.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Acked-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit a50297cf8235b062bcdeaa8b1dad58e69d3e1b43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_bus.c
+#	arch/s390/pci/pci_bus.h
+diff --cc arch/s390/pci/pci.c
+index 6af47e2fa8a9,023c3c2ab7f1..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -721,58 -680,101 +723,121 @@@ int zpci_disable_device(struct zpci_de
+  	 */
+  	return clp_disable_fh(zdev);
+  }
+ +EXPORT_SYMBOL_GPL(zpci_disable_device);
+  
+ -/**
+ - * zpci_create_device() - Create a new zpci_dev and add it to the zbus
+ - * @fid: Function ID of the device to be created
+ - * @fh: Current Function Handle of the device to be created
+ - * @state: Initial state after creation either Standby or Configured
+ - *
+ - * Creates a new zpci device and adds it to its, possibly newly created, zbus
+ - * as well as zpci_list.
+ - *
+ - * Returns: 0 on success, an error value otherwise
+ - */
+ -int zpci_create_device(u32 fid, u32 fh, enum zpci_state state)
+ +void zpci_remove_device(struct zpci_dev *zdev)
+  {
+ -	struct zpci_dev *zdev;
+ -	int rc;
+ -
+ -	zpci_dbg(3, "add fid:%x, fh:%x, c:%d\n", fid, fh, state);
+ -	zdev = kzalloc(sizeof(*zdev), GFP_KERNEL);
+ -	if (!zdev)
+ -		return -ENOMEM;
+ -
+ -	/* FID and Function Handle are the static/dynamic identifiers */
+ -	zdev->fid = fid;
+ -	zdev->fh = fh;
+ +	struct zpci_bus *zbus = zdev->zbus;
+ +	struct pci_dev *pdev;
+ +
+ +	pdev = pci_get_slot(zbus->bus, zdev->devfn);
+ +	if (pdev) {
+ +		if (pdev->is_virtfn)
+ +			return zpci_remove_virtfn(pdev, zdev->vfn);
+ +		pci_stop_and_remove_bus_device_locked(pdev);
+ +	}
+ +}
+  
+ -	/* Query function properties and update zdev */
+ -	rc = clp_query_pci_fn(zdev);
+ -	if (rc)
+ -		goto error;
+ -	zdev->state =  state;
+ +int zpci_create_device(struct zpci_dev *zdev)
+ +{
+ +	int rc;
+  
+  	kref_init(&zdev->kref);
+++<<<<<<< HEAD
+++=======
++ 	mutex_init(&zdev->lock);
++ 
++ 	rc = zpci_init_iommu(zdev);
++ 	if (rc)
++ 		goto error;
++ 
++ 	rc = zpci_bus_device_register(zdev, &pci_root_ops);
++ 	if (rc)
++ 		goto error_destroy_iommu;
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  
+  	spin_lock(&zpci_list_lock);
+  	list_add_tail(&zdev->entry, &zpci_list);
+  	spin_unlock(&zpci_list_lock);
+  
+++<<<<<<< HEAD
+ +	rc = zpci_init_iommu(zdev);
+ +	if (rc)
+ +		goto out;
+ +
+ +	mutex_init(&zdev->lock);
+ +	if (zdev->state == ZPCI_FN_STATE_CONFIGURED) {
+ +		rc = zpci_enable_device(zdev);
+ +		if (rc)
+ +			goto out_destroy_iommu;
+ +	}
+ +
+ +	rc = zpci_bus_device_register(zdev, &pci_root_ops);
+ +	if (rc)
+ +		goto out_disable;
+ +
+ +	return 0;
+ +
+ +out_disable:
+ +	if (zdev->state == ZPCI_FN_STATE_ONLINE)
+ +		zpci_disable_device(zdev);
+ +
+ +out_destroy_iommu:
+ +	zpci_destroy_iommu(zdev);
+ +out:
+ +	spin_lock(&zpci_list_lock);
+ +	list_del(&zdev->entry);
+ +	spin_unlock(&zpci_list_lock);
+++=======
++ 	return 0;
++ 
++ error_destroy_iommu:
++ 	zpci_destroy_iommu(zdev);
++ error:
++ 	zpci_dbg(0, "add fid:%x, rc:%d\n", fid, rc);
++ 	kfree(zdev);
++ 	return rc;
++ }
++ 
++ /**
++  * zpci_configure_device() - Configure a zpci_dev
++  * @zdev: The zpci_dev to be configured
++  * @fh: The general function handle supplied by the platform
++  *
++  * Configuring a device includes the configuration itself, if not done by the
++  * platform, enabling, scanning and adding it to the common code PCI subsystem.
++  * If any failure occurs, the zpci_dev is left disabled either in Standby if
++  * the configuration failed or Configured if enabling or scanning failed.
++  *
++  * Return: 0 on success, or an error code otherwise
++  */
++ int zpci_configure_device(struct zpci_dev *zdev, u32 fh)
++ {
++ 	int rc;
++ 
++ 	zdev->fh = fh;
++ 	if (zdev->state != ZPCI_FN_STATE_CONFIGURED) {
++ 		rc = sclp_pci_configure(zdev->fid);
++ 		zpci_dbg(3, "conf fid:%x, rc:%d\n", zdev->fid, rc);
++ 		if (rc)
++ 			return rc;
++ 		zdev->state = ZPCI_FN_STATE_CONFIGURED;
++ 	}
++ 
++ 	/* the PCI function will be scanned once function 0 appears */
++ 	if (!zdev->zbus->bus)
++ 		return 0;
++ 
++ 	/* For function 0 on a multi-function bus scan whole bus as we might
++ 	 * have to pick up existing functions waiting for it to allow creating
++ 	 * the PCI bus
++ 	 */
++ 	if (zdev->devfn == 0 && zdev->zbus->multifunction)
++ 		rc = zpci_bus_scan_bus(zdev->zbus);
++ 	else
++ 		rc = zpci_bus_scan_device(zdev);
++ 
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  	return rc;
+  }
+  
+diff --cc arch/s390/pci/pci_bus.c
+index c93486a9989b,d200e7559725..000000000000
+--- a/arch/s390/pci/pci_bus.c
++++ b/arch/s390/pci/pci_bus.c
+@@@ -29,25 -30,164 +29,175 @@@ static LIST_HEAD(zbus_list)
+  static DEFINE_SPINLOCK(zbus_list_lock);
+  static int zpci_nb_devices;
+  
+++<<<<<<< HEAD
+ +/* zpci_bus_scan
+++=======
++ /* zpci_bus_prepare_device - Prepare a zPCI function for scanning
++  * @zdev: the zPCI function to be prepared
++  *
++  * The PCI resources for the function are set up and added to its zbus and the
++  * function is enabled. The function must be added to a zbus which must have
++  * a PCI bus created. If an error occurs the zPCI function is not enabled.
++  *
++  * Return: 0 on success, an error code otherwise
++  */
++ static int zpci_bus_prepare_device(struct zpci_dev *zdev)
++ {
++ 	struct resource_entry *window, *n;
++ 	struct resource *res;
++ 	int rc;
++ 
++ 	if (!zdev_enabled(zdev)) {
++ 		rc = zpci_enable_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	if (!zdev->has_resources) {
++ 		zpci_setup_bus_resources(zdev, &zdev->zbus->resources);
++ 		resource_list_for_each_entry_safe(window, n, &zdev->zbus->resources) {
++ 			res = window->res;
++ 			pci_bus_add_resource(zdev->zbus->bus, res, 0);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /* zpci_bus_scan_device - Scan a single device adding it to the PCI core
++  * @zdev: the zdev to be scanned
++  *
++  * Scans the PCI function making it available to the common PCI code.
++  *
++  * Return: 0 on success, an error value otherwise
++  */
++ int zpci_bus_scan_device(struct zpci_dev *zdev)
++ {
++ 	struct pci_dev *pdev;
++ 	int rc;
++ 
++ 	rc = zpci_bus_prepare_device(zdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
++ 	if (!pdev)
++ 		return -ENODEV;
++ 
++ 	pci_bus_add_device(pdev);
++ 	pci_lock_rescan_remove();
++ 	pci_bus_add_devices(zdev->zbus->bus);
++ 	pci_unlock_rescan_remove();
++ 
++ 	return 0;
++ }
++ 
++ /* zpci_bus_remove_device - Removes the given zdev from the PCI core
++  * @zdev: the zdev to be removed from the PCI core
++  * @set_error: if true the device's error state is set to permanent failure
++  *
++  * Sets a zPCI device to a configured but offline state; the zPCI
++  * device is still accessible through its hotplug slot and the zPCI
++  * API but is removed from the common code PCI bus, making it
++  * no longer available to drivers.
++  */
++ void zpci_bus_remove_device(struct zpci_dev *zdev, bool set_error)
++ {
++ 	struct zpci_bus *zbus = zdev->zbus;
++ 	struct pci_dev *pdev;
++ 
++ 	if (!zdev->zbus->bus)
++ 		return;
++ 
++ 	pdev = pci_get_slot(zbus->bus, zdev->devfn);
++ 	if (pdev) {
++ 		if (set_error)
++ 			pdev->error_state = pci_channel_io_perm_failure;
++ 		if (pdev->is_virtfn) {
++ 			zpci_iov_remove_virtfn(pdev, zdev->vfn);
++ 			/* balance pci_get_slot */
++ 			pci_dev_put(pdev);
++ 			return;
++ 		}
++ 		pci_stop_and_remove_bus_device_locked(pdev);
++ 		/* balance pci_get_slot */
++ 		pci_dev_put(pdev);
++ 	}
++ }
++ 
++ /* zpci_bus_scan_bus - Scan all configured zPCI functions on the bus
++  * @zbus: the zbus to be scanned
++  *
++  * Enables and scans all PCI functions on the bus making them available to the
++  * common PCI code. If there is no function 0 on the zbus nothing is scanned. If
++  * a function does not have a slot yet because it was added to the zbus before
++  * function 0 the slot is created. If a PCI function fails to be initialized
++  * an error will be returned but attempts will still be made for all other
++  * functions on the bus.
++  *
++  * Return: 0 on success, an error value otherwise
++  */
++ int zpci_bus_scan_bus(struct zpci_bus *zbus)
++ {
++ 	struct zpci_dev *zdev;
++ 	int devfn, rc, ret = 0;
++ 
++ 	if (!zbus->function[0])
++ 		return 0;
++ 
++ 	for (devfn = 0; devfn < ZPCI_FUNCTIONS_PER_BUS; devfn++) {
++ 		zdev = zbus->function[devfn];
++ 		if (zdev && zdev->state == ZPCI_FN_STATE_CONFIGURED) {
++ 			rc = zpci_bus_prepare_device(zdev);
++ 			if (rc)
++ 				ret = -EIO;
++ 		}
++ 	}
++ 
++ 	pci_lock_rescan_remove();
++ 	pci_scan_child_bus(zbus->bus);
++ 	pci_bus_add_devices(zbus->bus);
++ 	pci_unlock_rescan_remove();
++ 
++ 	return ret;
++ }
++ 
++ /* zpci_bus_create_pci_bus - Create the PCI bus associated with this zbus
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+   * @zbus: the zbus holding the zdevices
+ - * @f0: function 0 of the bus
+   * @ops: the pci operations
+   *
+ - * Function zero is taken as a parameter as this is used to determine the
+ - * domain, multifunction property and maximum bus speed of the entire bus.
+ - *
+ - * Return: 0 on success, an error code otherwise
+ + * The domain number must be set before pci_scan_root_bus is called.
+ + * This function can be called once the domain is known, hence
+ + * when the function_0 is dicovered.
+   */
+++<<<<<<< HEAD
+ +static int zpci_bus_scan(struct zpci_bus *zbus, int domain, struct pci_ops *ops)
+++=======
++ static int zpci_bus_create_pci_bus(struct zpci_bus *zbus, struct zpci_dev *f0, struct pci_ops *ops)
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  {
+  	struct pci_bus *bus;
+ -	int domain;
+ +	int rc;
+  
+ -	domain = zpci_alloc_domain((u16)f0->uid);
+ -	if (domain < 0)
+ -		return domain;
+ +	rc = zpci_alloc_domain(domain);
+ +	if (rc < 0)
+ +		return rc;
+ +	zbus->domain_nr = rc;
+  
+++<<<<<<< HEAD
+ +	bus = pci_scan_root_bus(NULL, ZPCI_BUS_NR, ops, zbus, &zbus->resources);
+++=======
++ 	zbus->domain_nr = domain;
++ 	zbus->multifunction = f0->rid_available;
++ 	zbus->max_bus_speed = f0->max_bus_speed;
++ 
++ 	/*
++ 	 * Note that the zbus->resources are taken over and zbus->resources
++ 	 * is empty after a successful call
++ 	 */
++ 	bus = pci_create_root_bus(NULL, ZPCI_BUS_NR, ops, zbus, &zbus->resources);
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  	if (!bus) {
+  		zpci_free_domain(zbus->domain_nr);
+  		return -EFAULT;
+@@@ -203,53 -281,77 +354,114 @@@ void pcibios_bus_add_device(struct pci_
+  	}
+  }
+  
+- static int zpci_bus_add_device(struct zpci_bus *zbus, struct zpci_dev *zdev)
++ /* zpci_bus_create_hotplug_slots - Add hotplug slot(s) for device added to bus
++  * @zdev: the zPCI device that was newly added
++  *
++  * Add the hotplug slot(s) for the newly added PCI function. Normally this is
++  * simply the slot for the function itself. If however we are adding the
++  * function 0 on a zbus, it might be that we already registered functions on
++  * that zbus but could not create their hotplug slots yet so add those now too.
++  *
++  * Return: 0 on success, an error code otherwise
++  */
++ static int zpci_bus_create_hotplug_slots(struct zpci_dev *zdev)
+  {
+++<<<<<<< HEAD
+ +	struct pci_bus *bus;
+ +	struct resource_entry *window, *n;
+ +	struct resource *res;
+ +	struct pci_dev *pdev;
+ +	int rc;
+ +
+ +	bus = zbus->bus;
+ +	if (!bus)
+ +		return -EINVAL;
+ +
+ +	pdev = pci_get_slot(bus, zdev->devfn);
+ +	if (pdev) {
+ +		/* Device is already known. */
+ +		pci_dev_put(pdev);
+ +		return 0;
+ +	}
+++=======
++ 	struct zpci_bus *zbus = zdev->zbus;
++ 	int devfn, rc = 0;
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  
+  	rc = zpci_init_slot(zdev);
+  	if (rc)
+  		return rc;
+  	zdev->has_hp_slot = 1;
+  
+- 	resource_list_for_each_entry_safe(window, n, &zbus->resources) {
+- 		res = window->res;
+- 		pci_bus_add_resource(bus, res, 0);
++ 	if (zdev->devfn == 0 && zbus->multifunction) {
++ 		/* Now that function 0 is there we can finally create the
++ 		 * hotplug slots for those functions with devfn != 0 that have
++ 		 * been parked in zbus->function[] waiting for us to be able to
++ 		 * create the PCI bus.
++ 		 */
++ 		for  (devfn = 1; devfn < ZPCI_FUNCTIONS_PER_BUS; devfn++) {
++ 			zdev = zbus->function[devfn];
++ 			if (zdev && !zdev->has_hp_slot) {
++ 				rc = zpci_init_slot(zdev);
++ 				if (rc)
++ 					return rc;
++ 				zdev->has_hp_slot = 1;
++ 			}
++ 		}
++ 
+  	}
+  
+++<<<<<<< HEAD
+ +	pdev = pci_scan_single_device(bus, zdev->devfn);
+ +	if (pdev)
+ +		pci_bus_add_device(pdev);
+ +
+ +	return 0;
+++=======
++ 	return rc;
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  }
+  
+- static void zpci_bus_add_devices(struct zpci_bus *zbus)
++ static int zpci_bus_add_device(struct zpci_bus *zbus, struct zpci_dev *zdev)
+  {
+- 	int i;
++ 	int rc = -EINVAL;
+  
+++<<<<<<< HEAD
+ +	for (i = 1; i < ZPCI_FUNCTIONS_PER_BUS; i++)
+ +		if (zbus->function[i])
+ +			zpci_bus_add_device(zbus, zbus->function[i]);
+ +
+ +	pci_lock_rescan_remove();
+ +	pci_bus_add_devices(zbus->bus);
+ +	pci_unlock_rescan_remove();
+++=======
++ 	zdev->zbus = zbus;
++ 	if (zbus->function[zdev->devfn]) {
++ 		pr_err("devfn %04x is already assigned\n", zdev->devfn);
++ 		return rc;
++ 	}
++ 	zbus->function[zdev->devfn] = zdev;
++ 	zpci_nb_devices++;
++ 
++ 	if (zbus->bus) {
++ 		if (zbus->multifunction && !zdev->rid_available) {
++ 			WARN_ONCE(1, "rid_available not set for multifunction\n");
++ 			goto error;
++ 		}
++ 
++ 		zpci_bus_create_hotplug_slots(zdev);
++ 	} else {
++ 		/* Hotplug slot will be created once function 0 appears */
++ 		zbus->multifunction = 1;
++ 	}
++ 
++ 	return 0;
++ 
++ error:
++ 	zbus->function[zdev->devfn] = NULL;
++ 	zpci_nb_devices--;
++ 	return rc;
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  }
+  
+  int zpci_bus_device_register(struct zpci_dev *zdev, struct pci_ops *ops)
+@@@ -276,45 -377,33 +487,66 @@@
+  			return -ENOMEM;
+  	}
+  
+- 	zdev->zbus = zbus;
+- 	if (zbus->function[zdev->devfn]) {
+- 		pr_err("devfn %04x is already assigned\n", zdev->devfn);
+- 		goto error; /* rc already set */
++ 	if (zdev->devfn == 0) {
++ 		rc = zpci_bus_create_pci_bus(zbus, zdev, ops);
++ 		if (rc)
++ 			goto error;
+  	}
+- 	zbus->function[zdev->devfn] = zdev;
+  
+- 	zpci_setup_bus_resources(zdev, &zbus->resources);
++ 	rc = zpci_bus_add_device(zbus, zdev);
++ 	if (rc)
++ 		goto error;
+  
+++<<<<<<< HEAD
+ +	if (zbus->bus) {
+ +		if (!zbus->multifunction) {
+ +			WARN_ONCE(1, "zbus is not multifunction\n");
+ +			goto error_bus;
+ +		}
+ +		if (!zdev->rid_available) {
+ +			WARN_ONCE(1, "rid_available not set for multifunction\n");
+ +			goto error_bus;
+ +		}
+ +		rc = zpci_bus_add_device(zbus, zdev);
+ +		if (rc)
+ +			goto error_bus;
+ +	} else if (zdev->devfn == 0) {
+ +		if (zbus->multifunction && !zdev->rid_available) {
+ +			WARN_ONCE(1, "rid_available not set on function 0 for multifunction\n");
+ +			goto error_bus;
+ +		}
+ +		rc = zpci_bus_scan(zbus, (u16)zdev->uid, ops);
+ +		if (rc)
+ +			goto error_bus;
+ +		zpci_bus_add_devices(zbus);
+ +		rc = zpci_init_slot(zdev);
+ +		if (rc)
+ +			goto error_bus;
+ +		zdev->has_hp_slot = 1;
+ +		zbus->multifunction = zdev->rid_available;
+ +		zbus->max_bus_speed = zdev->max_bus_speed;
+ +	} else {
+ +		zbus->multifunction = 1;
+ +	}
+++=======
++ 	if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
++ 		return 0;
++ 
++ 	/* the PCI function will be scanned once function 0 appears */
++ 	if (!zdev->zbus->bus)
++ 		return 0;
++ 
++ 	/* For function 0 scan whole bus as we might have to pick up existing
++ 	 * functions waiting for it to allow creating the PCI bus
++ 	 */
++ 	if (zdev->devfn == 0 && zdev->zbus->multifunction)
++ 		rc = zpci_bus_scan_bus(zdev->zbus);
++ 	else
++ 		rc = zpci_bus_scan_device(zdev);
++ 
++ 	if (rc)
++ 		goto error;
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  
+  	return 0;
+  
+diff --cc arch/s390/pci/pci_bus.h
+index 8808ff0835b8,981876ae3bd7..000000000000
+--- a/arch/s390/pci/pci_bus.h
++++ b/arch/s390/pci/pci_bus.h
+@@@ -9,7 -9,11 +9,15 @@@
+  
+  int zpci_bus_device_register(struct zpci_dev *zdev, struct pci_ops *ops);
+  void zpci_bus_device_unregister(struct zpci_dev *zdev);
+++<<<<<<< HEAD
+ +int zpci_bus_init(void);
+++=======
++ 
++ int zpci_bus_scan_bus(struct zpci_bus *zbus);
++ 
++ int zpci_bus_scan_device(struct zpci_dev *zdev);
++ void zpci_bus_remove_device(struct zpci_dev *zdev, bool set_error);
+++>>>>>>> a50297cf8235 (s390/pci: separate zbus creation from scanning)
+  
+  void zpci_release_device(struct kref *kref);
+  static inline void zpci_zdev_put(struct zpci_dev *zdev)
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 37481081a26c..c88e5b09c739 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -131,9 +131,10 @@ struct zpci_dev {
+ 	u8		port;
+ 	u8		rid_available	: 1;
+ 	u8		has_hp_slot	: 1;
++	u8		has_resources	: 1;
+ 	u8		is_physfn	: 1;
+ 	u8		util_str_avail	: 1;
+-	u8		reserved	: 4;
++	u8		reserved	: 3;
+ 	unsigned int	devfn;		/* DEVFN part of the RID*/
+ 
+ 	struct mutex lock;
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path arch/s390/pci/pci_bus.c
+* Unmerged path arch/s390/pci/pci_bus.h
