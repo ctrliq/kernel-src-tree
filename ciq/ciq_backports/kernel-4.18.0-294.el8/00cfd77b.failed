@@ -1,0 +1,304 @@
+mptcp: retransmit ADD_ADDR when timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Geliang Tang <geliangtang@gmail.com>
+commit 00cfd77b9063dcdf3628a7087faba60de85a9cc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/00cfd77b.failed
+
+This patch implemented the retransmition of ADD_ADDR when no ADD_ADDR echo
+is received. It added a timer with the announced address. When timeout
+occurs, ADD_ADDR will be retransmitted.
+
+	Suggested-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Suggested-by: Paolo Abeni <pabeni@redhat.com>
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 00cfd77b9063dcdf3628a7087faba60de85a9cc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/options.c
+#	net/mptcp/pm_netlink.c
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/options.c
+index 13ea424aa84f,14a290fae767..000000000000
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@@ -855,8 -889,13 +855,16 @@@ void mptcp_incoming_options(struct soc
+  			addr.addr6 = mp_opt.addr6;
+  		}
+  #endif
+ -		if (!mp_opt.echo) {
+ +		if (!mp_opt.echo)
+  			mptcp_pm_add_addr_received(msk, &addr);
+++<<<<<<< HEAD
+++=======
++ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_ADDADDR);
++ 		} else {
++ 			mptcp_pm_del_add_timer(msk, &addr);
++ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_ECHOADD);
++ 		}
+++>>>>>>> 00cfd77b9063 (mptcp: retransmit ADD_ADDR when timeout)
+  		mp_opt.add_addr = 0;
+  	}
+  
+diff --cc net/mptcp/pm_netlink.c
+index 6f3bf9fdbbbc,5a0e4d11bcc3..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -29,6 -28,14 +29,17 @@@ struct mptcp_pm_addr_entry 
+  	struct rcu_head		rcu;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mptcp_pm_add_entry {
++ 	struct list_head	list;
++ 	struct mptcp_addr_info	addr;
++ 	struct timer_list	add_timer;
++ 	struct mptcp_sock	*sock;
++ 	u8			retrans_times;
++ };
++ 
+++>>>>>>> 00cfd77b9063 (mptcp: retransmit ADD_ADDR when timeout)
+  struct pm_nl_pernet {
+  	/* protects pernet updates */
+  	spinlock_t		lock;
+@@@ -179,11 -187,126 +191,129 @@@ static void check_work_pending(struct m
+  		WRITE_ONCE(msk->pm.work_pending, false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mptcp_pm_add_entry *
++ lookup_anno_list_by_saddr(struct mptcp_sock *msk,
++ 			  struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_add_entry *entry;
++ 
++ 	list_for_each_entry(entry, &msk->pm.anno_list, list) {
++ 		if (addresses_equal(&entry->addr, addr, false))
++ 			return entry;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static void mptcp_pm_add_timer(struct timer_list *timer)
++ {
++ 	struct mptcp_pm_add_entry *entry = from_timer(entry, timer, add_timer);
++ 	struct mptcp_sock *msk = entry->sock;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	pr_debug("msk=%p", msk);
++ 
++ 	if (!msk)
++ 		return;
++ 
++ 	if (inet_sk_state_load(sk) == TCP_CLOSE)
++ 		return;
++ 
++ 	if (!entry->addr.id)
++ 		return;
++ 
++ 	if (mptcp_pm_should_add_signal(msk)) {
++ 		sk_reset_timer(sk, timer, jiffies + TCP_RTO_MAX / 8);
++ 		goto out;
++ 	}
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 
++ 	if (!mptcp_pm_should_add_signal(msk)) {
++ 		pr_debug("retransmit ADD_ADDR id=%d", entry->addr.id);
++ 		mptcp_pm_announce_addr(msk, &entry->addr, false);
++ 		entry->retrans_times++;
++ 	}
++ 
++ 	if (entry->retrans_times < ADD_ADDR_RETRANS_MAX)
++ 		sk_reset_timer(sk, timer, jiffies + TCP_RTO_MAX);
++ 
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ out:
++ 	__sock_put(sk);
++ }
++ 
++ struct mptcp_pm_add_entry *
++ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
++ 		       struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_add_entry *entry;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 	entry = lookup_anno_list_by_saddr(msk, addr);
++ 	if (entry)
++ 		entry->retrans_times = ADD_ADDR_RETRANS_MAX;
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ 	if (entry)
++ 		sk_stop_timer_sync(sk, &entry->add_timer);
++ 
++ 	return entry;
++ }
++ 
++ static bool mptcp_pm_alloc_anno_list(struct mptcp_sock *msk,
++ 				     struct mptcp_pm_addr_entry *entry)
++ {
++ 	struct mptcp_pm_add_entry *add_entry = NULL;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	if (lookup_anno_list_by_saddr(msk, &entry->addr))
++ 		return false;
++ 
++ 	add_entry = kmalloc(sizeof(*add_entry), GFP_ATOMIC);
++ 	if (!add_entry)
++ 		return false;
++ 
++ 	list_add(&add_entry->list, &msk->pm.anno_list);
++ 
++ 	add_entry->addr = entry->addr;
++ 	add_entry->sock = msk;
++ 	add_entry->retrans_times = 0;
++ 
++ 	timer_setup(&add_entry->add_timer, mptcp_pm_add_timer, 0);
++ 	sk_reset_timer(sk, &add_entry->add_timer, jiffies + TCP_RTO_MAX);
++ 
++ 	return true;
++ }
++ 
++ void mptcp_pm_free_anno_list(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_pm_add_entry *entry, *tmp;
++ 	struct sock *sk = (struct sock *)msk;
++ 	LIST_HEAD(free_list);
++ 
++ 	pr_debug("msk=%p", msk);
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 	list_splice_init(&msk->pm.anno_list, &free_list);
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ 	list_for_each_entry_safe(entry, tmp, &free_list, list) {
++ 		sk_stop_timer_sync(sk, &entry->add_timer);
++ 		kfree(entry);
++ 	}
++ }
++ 
+++>>>>>>> 00cfd77b9063 (mptcp: retransmit ADD_ADDR when timeout)
+  static void mptcp_pm_create_subflow_or_signal_addr(struct mptcp_sock *msk)
+  {
+ -	struct mptcp_addr_info remote = { 0 };
+  	struct sock *sk = (struct sock *)msk;
+  	struct mptcp_pm_addr_entry *local;
+ +	struct mptcp_addr_info remote;
+  	struct pm_nl_pernet *pernet;
+  
+  	pernet = net_generic(sock_net((struct sock *)msk), pm_nl_pernet_id);
+@@@ -530,6 -731,68 +660,71 @@@ __lookup_addr_by_id(struct pm_nl_perne
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool remove_anno_list_by_saddr(struct mptcp_sock *msk,
++ 				      struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_add_entry *entry;
++ 
++ 	entry = mptcp_pm_del_add_timer(msk, addr);
++ 	if (entry) {
++ 		list_del(&entry->list);
++ 		kfree(entry);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool mptcp_pm_remove_anno_addr(struct mptcp_sock *msk,
++ 				      struct mptcp_addr_info *addr,
++ 				      bool force)
++ {
++ 	bool ret;
++ 
++ 	ret = remove_anno_list_by_saddr(msk, addr);
++ 	if (ret || force) {
++ 		spin_lock_bh(&msk->pm.lock);
++ 		mptcp_pm_remove_addr(msk, addr->id);
++ 		spin_unlock_bh(&msk->pm.lock);
++ 	}
++ 	return ret;
++ }
++ 
++ static int mptcp_nl_remove_subflow_and_signal_addr(struct net *net,
++ 						   struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_sock *msk;
++ 	long s_slot = 0, s_num = 0;
++ 
++ 	pr_debug("remove_id=%d", addr->id);
++ 
++ 	while ((msk = mptcp_token_iter_next(net, &s_slot, &s_num)) != NULL) {
++ 		struct sock *sk = (struct sock *)msk;
++ 		bool remove_subflow;
++ 
++ 		if (list_empty(&msk->conn_list)) {
++ 			mptcp_pm_remove_anno_addr(msk, addr, false);
++ 			goto next;
++ 		}
++ 
++ 		lock_sock(sk);
++ 		remove_subflow = lookup_subflow_by_saddr(&msk->conn_list, addr);
++ 		mptcp_pm_remove_anno_addr(msk, addr, remove_subflow);
++ 		if (remove_subflow)
++ 			mptcp_pm_remove_subflow(msk, addr->id);
++ 		release_sock(sk);
++ 
++ next:
++ 		sock_put(sk);
++ 		cond_resched();
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 00cfd77b9063 (mptcp: retransmit ADD_ADDR when timeout)
+  static int mptcp_nl_cmd_del_addr(struct sk_buff *skb, struct genl_info *info)
+  {
+  	struct nlattr *attr = info->attrs[MPTCP_PM_ATTR_ADDR];
+diff --cc net/mptcp/protocol.h
+index 68e02bf1a169,7cfe52aeb2b8..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -418,11 -442,17 +418,19 @@@ void mptcp_pm_subflow_established(struc
+  void mptcp_pm_subflow_closed(struct mptcp_sock *msk, u8 id);
+  void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+  				const struct mptcp_addr_info *addr);
+++<<<<<<< HEAD
+++=======
++ void mptcp_pm_rm_addr_received(struct mptcp_sock *msk, u8 rm_id);
++ void mptcp_pm_free_anno_list(struct mptcp_sock *msk);
++ struct mptcp_pm_add_entry *
++ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
++ 		       struct mptcp_addr_info *addr);
+++>>>>>>> 00cfd77b9063 (mptcp: retransmit ADD_ADDR when timeout)
+  
+  int mptcp_pm_announce_addr(struct mptcp_sock *msk,
+ -			   const struct mptcp_addr_info *addr,
+ -			   bool echo);
+ +			   const struct mptcp_addr_info *addr);
+  int mptcp_pm_remove_addr(struct mptcp_sock *msk, u8 local_id);
+ -int mptcp_pm_remove_subflow(struct mptcp_sock *msk, u8 local_id);
+ +int mptcp_pm_remove_subflow(struct mptcp_sock *msk, u8 remote_id);
+  
+  static inline bool mptcp_pm_should_add_signal(struct mptcp_sock *msk)
+  {
+* Unmerged path net/mptcp/options.c
+* Unmerged path net/mptcp/pm_netlink.c
+* Unmerged path net/mptcp/protocol.h
