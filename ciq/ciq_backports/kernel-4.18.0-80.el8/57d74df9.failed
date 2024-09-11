@@ -1,0 +1,294 @@
+block: use atomic bitops for ->queue_flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 57d74df90783f6a6b3e79dfdd2a567ce5db3b790
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/57d74df9.failed
+
+->queue_flags is generally not set or cleared in the fast path, and also
+generally set or cleared one flag at a time.  Make use of the normal
+atomic bitops for it so that we don't need to take the queue_lock,
+which is otherwise mostly unused in the core block layer now.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 57d74df90783f6a6b3e79dfdd2a567ce5db3b790)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk.h
+diff --cc block/blk-core.c
+index bb7fa612c2e2,5c8e66a09d82..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -118,67 -103,6 +103,70 @@@ bool blk_queue_flag_test_and_set(unsign
+  }
+  EXPORT_SYMBOL_GPL(blk_queue_flag_test_and_set);
+  
+++<<<<<<< HEAD
+ +/**
+ + * blk_queue_flag_test_and_clear - atomically test and clear a queue flag
+ + * @flag: flag to be cleared
+ + * @q: request queue
+ + *
+ + * Returns the previous value of @flag - 0 if the flag was not set and 1 if
+ + * the flag was set.
+ + */
+ +bool blk_queue_flag_test_and_clear(unsigned int flag, struct request_queue *q)
+ +{
+ +	unsigned long flags;
+ +	bool res;
+ +
+ +	spin_lock_irqsave(q->queue_lock, flags);
+ +	res = queue_flag_test_and_clear(flag, q);
+ +	spin_unlock_irqrestore(q->queue_lock, flags);
+ +
+ +	return res;
+ +}
+ +EXPORT_SYMBOL_GPL(blk_queue_flag_test_and_clear);
+ +
+ +static void blk_clear_congested(struct request_list *rl, int sync)
+ +{
+ +#ifdef CONFIG_CGROUP_WRITEBACK
+ +	clear_wb_congested(rl->blkg->wb_congested, sync);
+ +#else
+ +	/*
+ +	 * If !CGROUP_WRITEBACK, all blkg's map to bdi->wb and we shouldn't
+ +	 * flip its congestion state for events on other blkcgs.
+ +	 */
+ +	if (rl == &rl->q->root_rl)
+ +		clear_wb_congested(rl->q->backing_dev_info->wb.congested, sync);
+ +#endif
+ +}
+ +
+ +static void blk_set_congested(struct request_list *rl, int sync)
+ +{
+ +#ifdef CONFIG_CGROUP_WRITEBACK
+ +	set_wb_congested(rl->blkg->wb_congested, sync);
+ +#else
+ +	/* see blk_clear_congested() */
+ +	if (rl == &rl->q->root_rl)
+ +		set_wb_congested(rl->q->backing_dev_info->wb.congested, sync);
+ +#endif
+ +}
+ +
+ +void blk_queue_congestion_threshold(struct request_queue *q)
+ +{
+ +	int nr;
+ +
+ +	nr = q->nr_requests - (q->nr_requests / 8) + 1;
+ +	if (nr > q->nr_requests)
+ +		nr = q->nr_requests;
+ +	q->nr_congestion_on = nr;
+ +
+ +	nr = q->nr_requests - (q->nr_requests / 8) - (q->nr_requests / 16) - 1;
+ +	if (nr < 1)
+ +		nr = 1;
+ +	q->nr_congestion_off = nr;
+ +}
+ +
+++=======
+++>>>>>>> 57d74df90783 (block: use atomic bitops for ->queue_flags)
+  void blk_rq_init(struct request_queue *q, struct request *rq)
+  {
+  	memset(rq, 0, sizeof(*rq));
+diff --cc block/blk.h
+index fc4461de2d5b,f2ddc71e93da..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -54,66 -48,10 +54,71 @@@ static inline void queue_lockdep_assert
+  		lockdep_assert_held(q->queue_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void queue_flag_set_unlocked(unsigned int flag,
+ +					   struct request_queue *q)
+ +{
+ +	if (test_bit(QUEUE_FLAG_INIT_DONE, &q->queue_flags) &&
+ +	    kref_read(&q->kobj.kref))
+ +		lockdep_assert_held(q->queue_lock);
+ +	__set_bit(flag, &q->queue_flags);
+ +}
+ +
+ +static inline void queue_flag_clear_unlocked(unsigned int flag,
+ +					     struct request_queue *q)
+ +{
+ +	if (test_bit(QUEUE_FLAG_INIT_DONE, &q->queue_flags) &&
+ +	    kref_read(&q->kobj.kref))
+ +		lockdep_assert_held(q->queue_lock);
+ +	__clear_bit(flag, &q->queue_flags);
+ +}
+ +
+ +static inline int queue_flag_test_and_clear(unsigned int flag,
+ +					    struct request_queue *q)
+ +{
+ +	queue_lockdep_assert_held(q);
+ +
+ +	if (test_bit(flag, &q->queue_flags)) {
+ +		__clear_bit(flag, &q->queue_flags);
+ +		return 1;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static inline int queue_flag_test_and_set(unsigned int flag,
+ +					  struct request_queue *q)
+ +{
+ +	queue_lockdep_assert_held(q);
+ +
+ +	if (!test_bit(flag, &q->queue_flags)) {
+ +		__set_bit(flag, &q->queue_flags);
+ +		return 0;
+ +	}
+ +
+ +	return 1;
+ +}
+ +
+ +static inline void queue_flag_set(unsigned int flag, struct request_queue *q)
+ +{
+ +	queue_lockdep_assert_held(q);
+ +	__set_bit(flag, &q->queue_flags);
+ +}
+ +
+ +static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
+ +{
+ +	queue_lockdep_assert_held(q);
+ +	__clear_bit(flag, &q->queue_flags);
+ +}
+ +
+ +static inline struct blk_flush_queue *blk_get_flush_queue(
+ +		struct request_queue *q, struct blk_mq_ctx *ctx)
+++=======
++ static inline struct blk_flush_queue *
++ blk_get_flush_queue(struct request_queue *q, struct blk_mq_ctx *ctx)
+++>>>>>>> 57d74df90783 (block: use atomic bitops for ->queue_flags)
+  {
+ -	return blk_mq_map_queue(q, REQ_OP_FLUSH, ctx->cpu)->fq;
+ +	return blk_mq_map_queue(q, ctx->cpu)->fq;
+  }
+  
+  static inline void __blk_get_queue(struct request_queue *q)
+* Unmerged path block/blk-core.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2538b6d2cf10..8ed600c6015d 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2761,7 +2761,7 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ 	q->queue_flags |= QUEUE_FLAG_MQ_DEFAULT;
+ 
+ 	if (!(set->flags & BLK_MQ_F_SG_MERGE))
+-		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
++		blk_queue_flag_set(QUEUE_FLAG_NO_SG_MERGE, q);
+ 
+ 	q->sg_reserved_size = INT_MAX;
+ 
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 82b31fb2888c..4c243653162a 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -883,16 +883,14 @@ EXPORT_SYMBOL(blk_set_queue_depth);
+  */
+ void blk_queue_write_cache(struct request_queue *q, bool wc, bool fua)
+ {
+-	spin_lock_irq(q->queue_lock);
+ 	if (wc)
+-		queue_flag_set(QUEUE_FLAG_WC, q);
++		blk_queue_flag_set(QUEUE_FLAG_WC, q);
+ 	else
+-		queue_flag_clear(QUEUE_FLAG_WC, q);
++		blk_queue_flag_clear(QUEUE_FLAG_WC, q);
+ 	if (fua)
+-		queue_flag_set(QUEUE_FLAG_FUA, q);
++		blk_queue_flag_set(QUEUE_FLAG_FUA, q);
+ 	else
+-		queue_flag_clear(QUEUE_FLAG_FUA, q);
+-	spin_unlock_irq(q->queue_lock);
++		blk_queue_flag_clear(QUEUE_FLAG_FUA, q);
+ 
+ 	wbt_set_write_cache(q, test_bit(QUEUE_FLAG_WC, &q->queue_flags));
+ }
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 369b4855dcaf..ae3efd0de234 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -315,14 +315,12 @@ static ssize_t queue_nomerges_store(struct request_queue *q, const char *page,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	spin_lock_irq(q->queue_lock);
+-	queue_flag_clear(QUEUE_FLAG_NOMERGES, q);
+-	queue_flag_clear(QUEUE_FLAG_NOXMERGES, q);
++	blk_queue_flag_clear(QUEUE_FLAG_NOMERGES, q);
++	blk_queue_flag_clear(QUEUE_FLAG_NOXMERGES, q);
+ 	if (nm == 2)
+-		queue_flag_set(QUEUE_FLAG_NOMERGES, q);
++		blk_queue_flag_set(QUEUE_FLAG_NOMERGES, q);
+ 	else if (nm)
+-		queue_flag_set(QUEUE_FLAG_NOXMERGES, q);
+-	spin_unlock_irq(q->queue_lock);
++		blk_queue_flag_set(QUEUE_FLAG_NOXMERGES, q);
+ 
+ 	return ret;
+ }
+@@ -346,18 +344,16 @@ queue_rq_affinity_store(struct request_queue *q, const char *page, size_t count)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	spin_lock_irq(q->queue_lock);
+ 	if (val == 2) {
+-		queue_flag_set(QUEUE_FLAG_SAME_COMP, q);
+-		queue_flag_set(QUEUE_FLAG_SAME_FORCE, q);
++		blk_queue_flag_set(QUEUE_FLAG_SAME_COMP, q);
++		blk_queue_flag_set(QUEUE_FLAG_SAME_FORCE, q);
+ 	} else if (val == 1) {
+-		queue_flag_set(QUEUE_FLAG_SAME_COMP, q);
+-		queue_flag_clear(QUEUE_FLAG_SAME_FORCE, q);
++		blk_queue_flag_set(QUEUE_FLAG_SAME_COMP, q);
++		blk_queue_flag_clear(QUEUE_FLAG_SAME_FORCE, q);
+ 	} else if (val == 0) {
+-		queue_flag_clear(QUEUE_FLAG_SAME_COMP, q);
+-		queue_flag_clear(QUEUE_FLAG_SAME_FORCE, q);
++		blk_queue_flag_clear(QUEUE_FLAG_SAME_COMP, q);
++		blk_queue_flag_clear(QUEUE_FLAG_SAME_FORCE, q);
+ 	}
+-	spin_unlock_irq(q->queue_lock);
+ #endif
+ 	return ret;
+ }
+@@ -880,7 +876,7 @@ int blk_register_queue(struct gendisk *disk)
+ 	WARN_ONCE(test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags),
+ 		  "%s is registering an already registered queue\n",
+ 		  kobject_name(&dev->kobj));
+-	queue_flag_set_unlocked(QUEUE_FLAG_REGISTERED, q);
++	blk_queue_flag_set(QUEUE_FLAG_REGISTERED, q);
+ 
+ 	/*
+ 	 * SCSI probing may synchronously create and destroy a lot of
+@@ -892,7 +888,7 @@ int blk_register_queue(struct gendisk *disk)
+ 	 * request_queues for non-existent devices never get registered.
+ 	 */
+ 	if (!blk_queue_init_done(q)) {
+-		queue_flag_set_unlocked(QUEUE_FLAG_INIT_DONE, q);
++		blk_queue_flag_set(QUEUE_FLAG_INIT_DONE, q);
+ 		percpu_ref_switch_to_percpu(&q->q_usage_counter);
+ 		blk_queue_bypass_end(q);
+ 	}
+* Unmerged path block/blk.h
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 674c5ca2bded..d7f23a2808a5 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -702,7 +702,6 @@ struct request_queue {
+ void blk_queue_flag_set(unsigned int flag, struct request_queue *q);
+ void blk_queue_flag_clear(unsigned int flag, struct request_queue *q);
+ bool blk_queue_flag_test_and_set(unsigned int flag, struct request_queue *q);
+-bool blk_queue_flag_test_and_clear(unsigned int flag, struct request_queue *q);
+ 
+ #define blk_queue_stopped(q)	test_bit(QUEUE_FLAG_STOPPED, &(q)->queue_flags)
+ #define blk_queue_dying(q)	test_bit(QUEUE_FLAG_DYING, &(q)->queue_flags)
