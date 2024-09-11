@@ -1,0 +1,139 @@
+netfilter: nf_tables: handle nft_object lookups via rhltable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 4d44175aa5bb5f68772b1eb0306554812294ca52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/4d44175a.failed
+
+Instead of linear search, use rhlist interface to look up the objects.
+This fixes rulesets with thousands of named objects (quota, counters and
+the like).
+
+We only use a single table for this and consider the address of the
+table we're doing the lookup in as a part of the key.
+
+This reduces restore time of a sample ruleset with ~20k named counters
+from 37 seconds to 0.8 seconds.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 4d44175aa5bb5f68772b1eb0306554812294ca52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index 4e3aae10a16e,621ff834d3a4..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -1013,7 -1113,17 +1056,21 @@@ nft_chain_lookup_byhandle(const struct 
+  	return ERR_PTR(-ENOENT);
+  }
+  
+++<<<<<<< HEAD
+ +static struct nft_chain *nft_chain_lookup(struct nft_table *table,
+++=======
++ static bool lockdep_commit_lock_is_held(const struct net *net)
++ {
++ #ifdef CONFIG_PROVE_LOCKING
++ 	return lockdep_is_held(&net->nft.commit_mutex);
++ #else
++ 	return true;
++ #endif
++ }
++ 
++ static struct nft_chain *nft_chain_lookup(struct net *net,
++ 					  struct nft_table *table,
+++>>>>>>> 4d44175aa5bb (netfilter: nf_tables: handle nft_object lookups via rhltable)
+  					  const struct nlattr *nla, u8 genmask)
+  {
+  	char search[NFT_CHAIN_MAXNAMELEN + 1];
+@@@ -7248,9 -7469,20 +7334,26 @@@ static int __init nf_tables_module_init
+  	if (err < 0)
+  		goto err3;
+  
+++<<<<<<< HEAD
+ +	register_netdevice_notifier(&nf_tables_flowtable_notifier);
+ +
+ +	return register_pernet_subsys(&nf_tables_net_ops);
+++=======
++ 	err = rhltable_init(&nft_objname_ht, &nft_objname_ht_params);
++ 	if (err < 0)
++ 		goto err4;
++ 
++ 	/* must be last */
++ 	err = nfnetlink_subsys_register(&nf_tables_subsys);
++ 	if (err < 0)
++ 		goto err5;
++ 
++ 	return err;
++ err5:
++ 	rhltable_destroy(&nft_objname_ht);
++ err4:
++ 	unregister_netdevice_notifier(&nf_tables_flowtable_notifier);
+++>>>>>>> 4d44175aa5bb (netfilter: nf_tables: handle nft_object lookups via rhltable)
+  err3:
+  	nf_tables_core_module_exit();
+  err2:
+@@@ -7265,9 -7498,10 +7368,10 @@@ static void __exit nf_tables_module_exi
+  	unregister_netdevice_notifier(&nf_tables_flowtable_notifier);
+  	nft_chain_filter_fini();
+  	unregister_pernet_subsys(&nf_tables_net_ops);
+ -	cancel_work_sync(&trans_destroy_work);
+  	rcu_barrier();
++ 	rhltable_destroy(&nft_objname_ht);
+  	nf_tables_core_module_exit();
+ +	kfree(info);
+  }
+  
+  module_init(nf_tables_module_init);
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 9c9ba3f1052a..238c6aa0f934 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -1022,14 +1022,16 @@ struct nft_object_hash_key {
+  *
+  *	@list: table stateful object list node
+  *	@key:  keys that identify this object
++ *	@rhlhead: nft_objname_ht node
+  *	@genmask: generation mask
+  *	@use: number of references to this stateful object
+  *	@handle: unique object handle
+  *	@ops: object operations
+- * 	@data: object data, layout depends on type
++ *	@data: object data, layout depends on type
+  */
+ struct nft_object {
+ 	struct list_head		list;
++	struct rhlist_head		rhlhead;
+ 	struct nft_object_hash_key	key;
+ 	u32				genmask:2,
+ 					use:30;
+@@ -1047,7 +1049,8 @@ static inline void *nft_obj_data(const struct nft_object *obj)
+ 
+ #define nft_expr_obj(expr)	*((struct nft_object **)nft_expr_priv(expr))
+ 
+-struct nft_object *nft_obj_lookup(const struct nft_table *table,
++struct nft_object *nft_obj_lookup(const struct net *net,
++				  const struct nft_table *table,
+ 				  const struct nlattr *nla, u32 objtype,
+ 				  u8 genmask);
+ 
+* Unmerged path net/netfilter/nf_tables_api.c
+diff --git a/net/netfilter/nft_objref.c b/net/netfilter/nft_objref.c
+index c8ad18ed9104..febe5ccaff51 100644
+--- a/net/netfilter/nft_objref.c
++++ b/net/netfilter/nft_objref.c
+@@ -38,7 +38,8 @@ static int nft_objref_init(const struct nft_ctx *ctx,
+ 		return -EINVAL;
+ 
+ 	objtype = ntohl(nla_get_be32(tb[NFTA_OBJREF_IMM_TYPE]));
+-	obj = nft_obj_lookup(ctx->table, tb[NFTA_OBJREF_IMM_NAME], objtype,
++	obj = nft_obj_lookup(ctx->net, ctx->table,
++			     tb[NFTA_OBJREF_IMM_NAME], objtype,
+ 			     genmask);
+ 	if (IS_ERR(obj))
+ 		return -ENOENT;
