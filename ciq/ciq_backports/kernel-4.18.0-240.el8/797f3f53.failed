@@ -1,0 +1,116 @@
+io_uring: clear req->result always before issuing a read/write request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+commit 797f3f535d59f05ad12c629338beef6cb801d19e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/797f3f53.failed
+
+req->result is cleared when io_issue_sqe() calls io_read/write_pre()
+routines.  Those routines however are not called when the sqe
+argument is NULL, which is the case when io_issue_sqe() is called from
+io_wq_submit_work().  io_issue_sqe() may then examine a stale result if
+a polled request had previously failed with -EAGAIN:
+
+        if (ctx->flags & IORING_SETUP_IOPOLL) {
+                if (req->result == -EAGAIN)
+                        return -EAGAIN;
+
+                io_iopoll_req_issued(req);
+        }
+
+and in turn cause a subsequently completed request to be re-issued in
+io_wq_submit_work().
+
+	Signed-off-by: Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 797f3f535d59f05ad12c629338beef6cb801d19e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index ab99aea677bc,3130ed16456e..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1352,12 -1839,26 +1352,21 @@@ static int io_read(struct io_kiocb *req
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	read_size = ret;
+++=======
++ 	/* Ensure we clear previously set non-block flag */
++ 	if (!force_nonblock)
++ 		req->rw.kiocb.ki_flags &= ~IOCB_NOWAIT;
++ 
++ 	req->result = 0;
++ 	io_size = ret;
+++>>>>>>> 797f3f535d59 (io_uring: clear req->result always before issuing a read/write request)
+  	if (req->flags & REQ_F_LINK)
+ -		req->result = io_size;
+ -
+ -	/*
+ -	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
+ -	 * we know to async punt it even if it was opened O_NONBLOCK
+ -	 */
+ -	if (force_nonblock && !io_file_supports_async(req->file)) {
+ -		req->flags |= REQ_F_MUST_PUNT;
+ -		goto copy_iov;
+ -	}
+ +		req->result = read_size;
+  
+  	iov_count = iov_iter_count(&iter);
+ -	ret = rw_verify_area(READ, req->file, &kiocb->ki_pos, iov_count);
+ +	ret = rw_verify_area(READ, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+  
+@@@ -1415,20 -1927,31 +1424,29 @@@ static int io_write(struct io_kiocb *re
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Ensure we clear previously set non-block flag */
++ 	if (!force_nonblock)
++ 		req->rw.kiocb.ki_flags &= ~IOCB_NOWAIT;
++ 
++ 	req->result = 0;
++ 	io_size = ret;
+++>>>>>>> 797f3f535d59 (io_uring: clear req->result always before issuing a read/write request)
+  	if (req->flags & REQ_F_LINK)
+ -		req->result = io_size;
+ +		req->result = ret;
+  
+ -	/*
+ -	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
+ -	 * we know to async punt it even if it was opened O_NONBLOCK
+ -	 */
+ -	if (force_nonblock && !io_file_supports_async(req->file)) {
+ -		req->flags |= REQ_F_MUST_PUNT;
+ -		goto copy_iov;
+ -	}
+ +	iov_count = iov_iter_count(&iter);
+  
+ -	/* file path doesn't support NOWAIT for non-direct_IO */
+ -	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT) &&
+ -	    (req->flags & REQ_F_ISREG))
+ -		goto copy_iov;
+ +	ret = -EAGAIN;
+ +	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT)) {
+ +		/* If ->needs_lock is true, we're already in async context. */
+ +		if (!s->needs_lock)
+ +			io_async_list_note(WRITE, req, iov_count);
+ +		goto out_free;
+ +	}
+  
+ -	iov_count = iov_iter_count(&iter);
+ -	ret = rw_verify_area(WRITE, req->file, &kiocb->ki_pos, iov_count);
+ +	ret = rw_verify_area(WRITE, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+  
+* Unmerged path fs/io_uring.c
