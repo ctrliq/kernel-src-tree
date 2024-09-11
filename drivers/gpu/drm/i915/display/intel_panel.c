@@ -532,21 +532,21 @@ static u32 intel_panel_compute_brightness(struct intel_connector *connector,
 	return val;
 }
 
-static u32 lpt_get_backlight(struct intel_connector *connector)
+static u32 lpt_get_backlight(struct intel_connector *connector, enum pipe unused)
 {
 	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
 
 	return intel_de_read(dev_priv, BLC_PWM_PCH_CTL2) & BACKLIGHT_DUTY_CYCLE_MASK;
 }
 
-static u32 pch_get_backlight(struct intel_connector *connector)
+static u32 pch_get_backlight(struct intel_connector *connector, enum pipe unused)
 {
 	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
 
 	return intel_de_read(dev_priv, BLC_PWM_CPU_CTL) & BACKLIGHT_DUTY_CYCLE_MASK;
 }
 
-static u32 i9xx_get_backlight(struct intel_connector *connector)
+static u32 i9xx_get_backlight(struct intel_connector *connector, enum pipe unused)
 {
 	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
 	struct intel_panel *panel = &connector->panel;
@@ -566,23 +566,17 @@ static u32 i9xx_get_backlight(struct intel_connector *connector)
 	return val;
 }
 
-static u32 _vlv_get_backlight(struct drm_i915_private *dev_priv, enum pipe pipe)
+static u32 vlv_get_backlight(struct intel_connector *connector, enum pipe pipe)
 {
+	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
+
 	if (drm_WARN_ON(&dev_priv->drm, pipe != PIPE_A && pipe != PIPE_B))
 		return 0;
 
 	return intel_de_read(dev_priv, VLV_BLC_PWM_CTL(pipe)) & BACKLIGHT_DUTY_CYCLE_MASK;
 }
 
-static u32 vlv_get_backlight(struct intel_connector *connector)
-{
-	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
-	enum pipe pipe = intel_connector_get_pipe(connector);
-
-	return _vlv_get_backlight(dev_priv, pipe);
-}
-
-static u32 bxt_get_backlight(struct intel_connector *connector)
+static u32 bxt_get_backlight(struct intel_connector *connector, enum pipe unused)
 {
 	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
 	struct intel_panel *panel = &connector->panel;
@@ -591,7 +585,7 @@ static u32 bxt_get_backlight(struct intel_connector *connector)
 			     BXT_BLC_PWM_DUTY(panel->backlight.controller));
 }
 
-static u32 ext_pwm_get_backlight(struct intel_connector *connector)
+static u32 ext_pwm_get_backlight(struct intel_connector *connector, enum pipe unused)
 {
 	struct intel_panel *panel = &connector->panel;
 	int duty_ns;
@@ -1235,7 +1229,7 @@ static u32 intel_panel_get_backlight(struct intel_connector *connector)
 	mutex_lock(&dev_priv->backlight_lock);
 
 	if (panel->backlight.enabled) {
-		val = panel->backlight.funcs->get(connector);
+		val = panel->backlight.funcs->get(connector, intel_connector_get_pipe(connector));
 		val = intel_panel_compute_brightness(connector, val);
 	}
 
@@ -1648,9 +1642,9 @@ static int lpt_setup_backlight(struct intel_connector *connector, enum pipe unus
 		   !(pch_ctl1 & BLM_PCH_OVERRIDE_ENABLE) &&
 		   (cpu_ctl2 & BLM_PWM_ENABLE);
 	if (cpu_mode)
-		val = pch_get_backlight(connector);
+		val = pch_get_backlight(connector, unused);
 	else
-		val = lpt_get_backlight(connector);
+		val = lpt_get_backlight(connector, unused);
 
 	if (cpu_mode) {
 		drm_dbg_kms(&dev_priv->drm,
@@ -1692,7 +1686,7 @@ static int pch_setup_backlight(struct intel_connector *connector, enum pipe unus
 
 	panel->backlight.min = get_backlight_min_vbt(connector);
 
-	val = pch_get_backlight(connector);
+	val = pch_get_backlight(connector, unused);
 	val = intel_panel_compute_brightness(connector, val);
 	panel->backlight.level = clamp(val, panel->backlight.min,
 				       panel->backlight.max);
@@ -1733,7 +1727,7 @@ static int i9xx_setup_backlight(struct intel_connector *connector, enum pipe unu
 
 	panel->backlight.min = get_backlight_min_vbt(connector);
 
-	val = i9xx_get_backlight(connector);
+	val = i9xx_get_backlight(connector, unused);
 	val = intel_panel_compute_brightness(connector, val);
 	panel->backlight.level = clamp(val, panel->backlight.min,
 				       panel->backlight.max);
@@ -1767,7 +1761,7 @@ static int i965_setup_backlight(struct intel_connector *connector, enum pipe unu
 
 	panel->backlight.min = get_backlight_min_vbt(connector);
 
-	val = i9xx_get_backlight(connector);
+	val = i9xx_get_backlight(connector, unused);
 	val = intel_panel_compute_brightness(connector, val);
 	panel->backlight.level = clamp(val, panel->backlight.min,
 				       panel->backlight.max);
@@ -1800,7 +1794,7 @@ static int vlv_setup_backlight(struct intel_connector *connector, enum pipe pipe
 
 	panel->backlight.min = get_backlight_min_vbt(connector);
 
-	val = _vlv_get_backlight(dev_priv, pipe);
+	val = vlv_get_backlight(connector, pipe);
 	val = intel_panel_compute_brightness(connector, val);
 	panel->backlight.level = clamp(val, panel->backlight.min,
 				       panel->backlight.max);
@@ -1842,7 +1836,7 @@ bxt_setup_backlight(struct intel_connector *connector, enum pipe unused)
 
 	panel->backlight.min = get_backlight_min_vbt(connector);
 
-	val = bxt_get_backlight(connector);
+	val = bxt_get_backlight(connector, unused);
 	val = intel_panel_compute_brightness(connector, val);
 	panel->backlight.level = clamp(val, panel->backlight.min,
 				       panel->backlight.max);
@@ -1882,7 +1876,7 @@ cnp_setup_backlight(struct intel_connector *connector, enum pipe unused)
 
 	panel->backlight.min = get_backlight_min_vbt(connector);
 
-	val = bxt_get_backlight(connector);
+	val = bxt_get_backlight(connector, unused);
 	val = intel_panel_compute_brightness(connector, val);
 	panel->backlight.level = clamp(val, panel->backlight.min,
 				       panel->backlight.max);
