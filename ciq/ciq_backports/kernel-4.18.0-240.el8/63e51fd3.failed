@@ -1,0 +1,337 @@
+ASoC: SOF: Intel: cnl: Implement feature to support DSP D0i3 in S0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: SOF: Intel: cnl: Implement feature to support DSP D0i3 in S0 (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 95.65%
+commit-author Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+commit 63e51fd33fef04b634a0c32ae491ab16a19cb17c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/63e51fd3.failed
+
+This patch implements support for DSP D0i3 when the system
+is in S0. The basic idea is to schedule a delayed work after
+every successful IPC TX that checks if there are only
+D0I3-compatible streams active and if so transition
+the DSP to D0I3.
+
+With the introduction of DSP D0I3 in S0, we need to
+ensure that the DSP is in D0I0 before sending any new
+IPCs. The exception for this would be the
+compact IPCs that are used to set the DSP in
+D0I3/D0I0 states.
+
+	Signed-off-by: Keyon Jie <yang.jie@linux.intel.com>
+	Signed-off-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Link: https://lore.kernel.org/r/20200129220726.31792-9-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 63e51fd33fef04b634a0c32ae491ab16a19cb17c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda-dsp.c
+#	sound/soc/sof/intel/hda.h
+#	sound/soc/sof/sof-priv.h
+diff --cc sound/soc/sof/intel/hda-dsp.c
+index fddf2c48904f,ee604be715b9..000000000000
+--- a/sound/soc/sof/intel/hda-dsp.c
++++ b/sound/soc/sof/intel/hda-dsp.c
+@@@ -334,17 -335,15 +335,18 @@@ static int hda_dsp_send_pm_gate_ipc(str
+  	pm_gate.flags = flags;
+  
+  	/* send pm_gate ipc to dsp */
+- 	return sof_ipc_tx_message(sdev->ipc, pm_gate.hdr.cmd, &pm_gate,
+- 				  sizeof(pm_gate), &reply, sizeof(reply));
++ 	return sof_ipc_tx_message_no_pm(sdev->ipc, pm_gate.hdr.cmd,
++ 					&pm_gate, sizeof(pm_gate), &reply,
++ 					sizeof(reply));
+  }
+  
+ -static int hda_dsp_update_d0i3c_register(struct snd_sof_dev *sdev, u8 value)
+ +int hda_dsp_set_power_state(struct snd_sof_dev *sdev,
+ +			    enum sof_d0_substate d0_substate)
+  {
+  	struct hdac_bus *bus = sof_to_bus(sdev);
+ +	u32 flags;
+  	int ret;
+ +	u8 value;
+  
+  	/* Write to D0I3C after Command-In-Progress bit is cleared */
+  	ret = hda_dsp_wait_d0i3c_done(sdev);
+@@@ -528,9 -701,26 +530,25 @@@ int hda_dsp_suspend(struct snd_sof_dev 
+  	struct sof_intel_hda_dev *hda = sdev->pdata->hw_pdata;
+  	struct hdac_bus *bus = sof_to_bus(sdev);
+  	struct pci_dev *pci = to_pci_dev(sdev->dev);
+ -	const struct sof_dsp_power_state target_dsp_state = {
+ -		.state = target_state,
+ -		.substate = target_state == SOF_DSP_PM_D0 ?
+ -				SOF_HDA_DSP_PM_D0I3 : 0,
+ -	};
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (sdev->system_suspend_target == SOF_SUSPEND_S0IX) {
+++=======
++ 	/* cancel any attempt for DSP D0I3 */
++ 	cancel_delayed_work_sync(&hda->d0i3_work);
++ 
++ 	if (target_state == SOF_DSP_PM_D0) {
++ 		/* Set DSP power state */
++ 		ret = hda_dsp_set_power_state(sdev, &target_dsp_state);
++ 		if (ret < 0) {
++ 			dev_err(sdev->dev, "error: setting dsp state %d substate %d\n",
++ 				target_dsp_state.state,
++ 				target_dsp_state.substate);
++ 			return ret;
++ 		}
++ 
+++>>>>>>> 63e51fd33fef (ASoC: SOF: Intel: cnl: Implement feature to support DSP D0i3 in S0)
+  		/* enable L1SEN to make sure the system can enter S0Ix */
+  		hda->l1_support_changed =
+  			snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
+diff --cc sound/soc/sof/intel/hda.h
+index 8b0e8dd9071a,a46b66437a3d..000000000000
+--- a/sound/soc/sof/intel/hda.h
++++ b/sound/soc/sof/intel/hda.h
+@@@ -393,6 -392,19 +393,22 @@@ struct sof_intel_dsp_bdl 
+  #define SOF_HDA_PLAYBACK		0
+  #define SOF_HDA_CAPTURE			1
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Time in ms for opportunistic D0I3 entry delay.
++  * This has been deliberately chosen to be long to avoid race conditions.
++  * Could be optimized in future.
++  */
++ #define SOF_HDA_D0I3_WORK_DELAY_MS	5000
++ 
++ /* HDA DSP D0 substate */
++ enum sof_hda_D0_substate {
++ 	SOF_HDA_DSP_PM_D0I0,	/* default D0 substate */
++ 	SOF_HDA_DSP_PM_D0I3,	/* low power D0 substate */
++ };
++ 
+++>>>>>>> 63e51fd33fef (ASoC: SOF: Intel: cnl: Implement feature to support DSP D0i3 in S0)
+  /* represents DSP HDA controller frontend - i.e. host facing control */
+  struct sof_intel_hda_dev {
+  
+diff --cc sound/soc/sof/sof-priv.h
+index b6c2f9374075,00084471d0de..000000000000
+--- a/sound/soc/sof/sof-priv.h
++++ b/sound/soc/sof/sof-priv.h
+@@@ -543,67 -470,9 +543,73 @@@ int snd_sof_ipc_valid(struct snd_sof_de
+  int sof_ipc_tx_message(struct snd_sof_ipc *ipc, u32 header,
+  		       void *msg_data, size_t msg_bytes, void *reply_data,
+  		       size_t reply_bytes);
+++<<<<<<< HEAD
+ +struct snd_sof_widget *snd_sof_find_swidget(struct snd_sof_dev *sdev,
+ +					    const char *name);
+ +struct snd_sof_widget *snd_sof_find_swidget_sname(struct snd_sof_dev *sdev,
+ +						  const char *pcm_name,
+ +						  int dir);
+ +struct snd_sof_dai *snd_sof_find_dai(struct snd_sof_dev *sdev,
+ +				     const char *name);
+ +
+ +static inline
+ +struct snd_sof_pcm *snd_sof_find_spcm_dai(struct snd_sof_dev *sdev,
+ +					  struct snd_soc_pcm_runtime *rtd)
+ +{
+ +	struct snd_sof_pcm *spcm = NULL;
+ +
+ +	list_for_each_entry(spcm, &sdev->pcm_list, list) {
+ +		if (le32_to_cpu(spcm->pcm.dai_id) == rtd->dai_link->id)
+ +			return spcm;
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+ +bool snd_sof_dsp_d0i3_on_suspend(struct snd_sof_dev *sdev);
+ +
+ +struct snd_sof_pcm *snd_sof_find_spcm_name(struct snd_sof_dev *sdev,
+ +					   const char *name);
+ +struct snd_sof_pcm *snd_sof_find_spcm_comp(struct snd_sof_dev *sdev,
+ +					   unsigned int comp_id,
+ +					   int *direction);
+ +struct snd_sof_pcm *snd_sof_find_spcm_pcm_id(struct snd_sof_dev *sdev,
+ +					     unsigned int pcm_id);
+ +void snd_sof_pcm_period_elapsed(struct snd_pcm_substream *substream);
+ +
+ +/*
+ + * Stream IPC
+ + */
+ +int snd_sof_ipc_stream_posn(struct snd_sof_dev *sdev,
+ +			    struct snd_sof_pcm *spcm, int direction,
+ +			    struct sof_ipc_stream_posn *posn);
+ +
+ +/*
+ + * Mixer IPC
+ + */
+ +int snd_sof_ipc_set_get_comp_data(struct snd_sof_ipc *ipc,
+ +				  struct snd_sof_control *scontrol, u32 ipc_cmd,
+ +				  enum sof_ipc_ctrl_type ctrl_type,
+ +				  enum sof_ipc_ctrl_cmd ctrl_cmd,
+ +				  bool send);
+ +
+ +/*
+ + * Topology.
+ + * There is no snd_sof_free_topology since topology components will
+ + * be freed by snd_soc_unregister_component,
+ + */
+ +int snd_sof_load_topology(struct snd_sof_dev *sdev, const char *file);
+ +int snd_sof_complete_pipeline(struct snd_sof_dev *sdev,
+ +			      struct snd_sof_widget *swidget);
+ +
+ +int sof_load_pipeline_ipc(struct snd_sof_dev *sdev,
+ +			  struct sof_ipc_pipe_new *pipeline,
+ +			  struct sof_ipc_comp_reply *r);
+++=======
++ int sof_ipc_tx_message_no_pm(struct snd_sof_ipc *ipc, u32 header,
++ 			     void *msg_data, size_t msg_bytes,
++ 			     void *reply_data, size_t reply_bytes);
+++>>>>>>> 63e51fd33fef (ASoC: SOF: Intel: cnl: Implement feature to support DSP D0i3 in S0)
+  
+  /*
+   * Trace/debug
+diff --git a/sound/soc/sof/intel/cnl.c b/sound/soc/sof/intel/cnl.c
+index aaa3f3a74f98..dfb4dff207d2 100644
+--- a/sound/soc/sof/intel/cnl.c
++++ b/sound/soc/sof/intel/cnl.c
+@@ -170,23 +170,48 @@ static bool cnl_compact_ipc_compress(struct snd_sof_ipc_msg *msg,
+ static int cnl_ipc_send_msg(struct snd_sof_dev *sdev,
+ 			    struct snd_sof_ipc_msg *msg)
+ {
++	struct sof_intel_hda_dev *hdev = sdev->pdata->hw_pdata;
++	struct sof_ipc_cmd_hdr *hdr;
+ 	u32 dr = 0;
+ 	u32 dd = 0;
+ 
++	/*
++	 * Currently the only compact IPC supported is the PM_GATE
++	 * IPC which is used for transitioning the DSP between the
++	 * D0I0 and D0I3 states. And these are sent only during the
++	 * set_power_state() op. Therefore, there will never be a case
++	 * that a compact IPC results in the DSP exiting D0I3 without
++	 * the host and FW being in sync.
++	 */
+ 	if (cnl_compact_ipc_compress(msg, &dr, &dd)) {
+ 		/* send the message via IPC registers */
+ 		snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDD,
+ 				  dd);
+ 		snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDR,
+ 				  CNL_DSP_REG_HIPCIDR_BUSY | dr);
+-	} else {
+-		/* send the message via mailbox */
+-		sof_mailbox_write(sdev, sdev->host_box.offset, msg->msg_data,
+-				  msg->msg_size);
+-		snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDR,
+-				  CNL_DSP_REG_HIPCIDR_BUSY);
++		return 0;
+ 	}
+ 
++	/* send the message via mailbox */
++	sof_mailbox_write(sdev, sdev->host_box.offset, msg->msg_data,
++			  msg->msg_size);
++	snd_sof_dsp_write(sdev, HDA_DSP_BAR, CNL_DSP_REG_HIPCIDR,
++			  CNL_DSP_REG_HIPCIDR_BUSY);
++
++	hdr = msg->msg_data;
++
++	/*
++	 * Use mod_delayed_work() to schedule the delayed work
++	 * to avoid scheduling multiple workqueue items when
++	 * IPCs are sent at a high-rate. mod_delayed_work()
++	 * modifies the timer if the work is pending.
++	 * Also, a new delayed work should not be queued after the
++	 * the CTX_SAVE IPC, which is sent before the DSP enters D3.
++	 */
++	if (hdr->cmd != (SOF_IPC_GLB_PM_MSG | SOF_IPC_PM_CTX_SAVE))
++		mod_delayed_work(system_wq, &hdev->d0i3_work,
++				 msecs_to_jiffies(SOF_HDA_D0I3_WORK_DELAY_MS));
++
+ 	return 0;
+ }
+ 
+* Unmerged path sound/soc/sof/intel/hda-dsp.c
+diff --git a/sound/soc/sof/intel/hda.c b/sound/soc/sof/intel/hda.c
+index e20431686d1c..38cc29a0accc 100644
+--- a/sound/soc/sof/intel/hda.c
++++ b/sound/soc/sof/intel/hda.c
+@@ -692,6 +692,8 @@ int hda_dsp_probe(struct snd_sof_dev *sdev)
+ 	/* set default mailbox offset for FW ready message */
+ 	sdev->dsp_box.offset = HDA_DSP_MBOX_UPLINK_OFFSET;
+ 
++	INIT_DELAYED_WORK(&hdev->d0i3_work, hda_dsp_d0i3_work);
++
+ 	return 0;
+ 
+ free_ipc_irq:
+@@ -717,6 +719,9 @@ int hda_dsp_remove(struct snd_sof_dev *sdev)
+ 	struct pci_dev *pci = to_pci_dev(sdev->dev);
+ 	const struct sof_intel_dsp_desc *chip = hda->desc;
+ 
++	/* cancel any attempt for DSP D0I3 */
++	cancel_delayed_work_sync(&hda->d0i3_work);
++
+ #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+ 	/* codec removal, invoke bus_device_remove */
+ 	snd_hdac_ext_bus_device_remove(bus);
+* Unmerged path sound/soc/sof/intel/hda.h
+diff --git a/sound/soc/sof/ipc.c b/sound/soc/sof/ipc.c
+index 103309c0e8df..9d9e41225d0b 100644
+--- a/sound/soc/sof/ipc.c
++++ b/sound/soc/sof/ipc.c
+@@ -267,7 +267,6 @@ static int sof_ipc_tx_message_unlocked(struct snd_sof_ipc *ipc, u32 header,
+ 	spin_unlock_irq(&sdev->ipc_lock);
+ 
+ 	if (ret < 0) {
+-		/* So far IPC TX never fails, consider making the above void */
+ 		dev_err_ratelimited(sdev->dev,
+ 				    "error: ipc tx failed with error %d\n",
+ 				    ret);
+@@ -287,6 +286,32 @@ static int sof_ipc_tx_message_unlocked(struct snd_sof_ipc *ipc, u32 header,
+ int sof_ipc_tx_message(struct snd_sof_ipc *ipc, u32 header,
+ 		       void *msg_data, size_t msg_bytes, void *reply_data,
+ 		       size_t reply_bytes)
++{
++	const struct sof_dsp_power_state target_state = {
++		.state = SOF_DSP_PM_D0,
++	};
++	int ret;
++
++	/* ensure the DSP is in D0 before sending a new IPC */
++	ret = snd_sof_dsp_set_power_state(ipc->sdev, &target_state);
++	if (ret < 0) {
++		dev_err(ipc->sdev->dev, "error: resuming DSP %d\n", ret);
++		return ret;
++	}
++
++	return sof_ipc_tx_message_no_pm(ipc, header, msg_data, msg_bytes,
++					reply_data, reply_bytes);
++}
++EXPORT_SYMBOL(sof_ipc_tx_message);
++
++/*
++ * send IPC message from host to DSP without modifying the DSP state.
++ * This will be used for IPC's that can be handled by the DSP
++ * even in a low-power D0 substate.
++ */
++int sof_ipc_tx_message_no_pm(struct snd_sof_ipc *ipc, u32 header,
++			     void *msg_data, size_t msg_bytes,
++			     void *reply_data, size_t reply_bytes)
+ {
+ 	int ret;
+ 
+@@ -304,7 +329,7 @@ int sof_ipc_tx_message(struct snd_sof_ipc *ipc, u32 header,
+ 
+ 	return ret;
+ }
+-EXPORT_SYMBOL(sof_ipc_tx_message);
++EXPORT_SYMBOL(sof_ipc_tx_message_no_pm);
+ 
+ /* handle reply message from DSP */
+ int snd_sof_ipc_reply(struct snd_sof_dev *sdev, u32 msg_id)
+* Unmerged path sound/soc/sof/sof-priv.h
