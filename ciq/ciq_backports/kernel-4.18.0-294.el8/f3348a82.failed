@@ -1,0 +1,352 @@
+selftests: net: Add port split test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Danielle Ratson <danieller@mellanox.com>
+commit f3348a82e72795ce218264fd00ef5cf5137836a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f3348a82.failed
+
+Test port split configuration using previously added number of port lanes
+attribute.
+
+Check that all the splittable ports are successfully split to their maximum
+number of lanes and below, and that those which are not splittable fail to
+be split.
+
+Test output example:
+
+TEST: swp4 is unsplittable                                         [ OK ]
+TEST: split port swp53 into 4                                      [ OK ]
+TEST: Unsplit port pci/0000:03:00.0/25                             [ OK ]
+TEST: split port swp53 into 2                                      [ OK ]
+TEST: Unsplit port pci/0000:03:00.0/25                             [ OK ]
+
+	Signed-off-by: Danielle Ratson <danieller@mellanox.com>
+	Reviewed-by: Petr Machata <petrm@mellanox.com>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f3348a82e72795ce218264fd00ef5cf5137836a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/net/Makefile
+diff --cc tools/testing/selftests/net/Makefile
+index c47204c6dada,9491bbaa0831..000000000000
+--- a/tools/testing/selftests/net/Makefile
++++ b/tools/testing/selftests/net/Makefile
+@@@ -5,15 -5,23 +5,20 @@@ CFLAGS =  -Wall -Wl,--no-as-needed -O2 
+  CFLAGS += -I../../../../usr/include/
+  
+  TEST_PROGS := run_netsocktests run_afpackettests test_bpf.sh netdevice.sh \
+ -	      rtnetlink.sh xfrm_policy.sh test_blackhole_dev.sh
+ +	      rtnetlink.sh xfrm_policy.sh
+  TEST_PROGS += fib_tests.sh fib-onlink-tests.sh pmtu.sh udpgso.sh ip_defrag.sh
+  TEST_PROGS += udpgso_bench.sh fib_rule_tests.sh msg_zerocopy.sh psock_snd.sh
+ -TEST_PROGS += udpgro_bench.sh udpgro.sh test_vxlan_under_vrf.sh reuseport_addr_any.sh
+  TEST_PROGS += test_vxlan_fdb_changelink.sh so_txtime.sh ipv6_flowlabel.sh
+ -TEST_PROGS += tcp_fastopen_backup_key.sh fcnal-test.sh l2tp.sh traceroute.sh
+ -TEST_PROGS += fin_ack_lat.sh fib_nexthop_multiprefix.sh fib_nexthops.sh
+ -TEST_PROGS += altnames.sh icmp_redirect.sh ip6_gre_headroom.sh
+ -TEST_PROGS += route_localnet.sh
+ -TEST_PROGS += reuseaddr_ports_exhausted.sh
+ -TEST_PROGS += txtimestamp.sh
+ +TEST_PROGS += fcnal-test.sh l2tp.sh traceroute.sh
+  TEST_PROGS += vrf-xfrm-tests.sh
+++<<<<<<< HEAD
+++=======
++ TEST_PROGS += rxtimestamp.sh
++ TEST_PROGS += devlink_port_split.py
+++>>>>>>> f3348a82e727 (selftests: net: Add port split test)
+  TEST_PROGS_EXTENDED := in_netns.sh
+  TEST_GEN_FILES =  socket nettest
+ -TEST_GEN_FILES += psock_fanout psock_tpacket msg_zerocopy reuseport_addr_any
+ +TEST_GEN_FILES += psock_fanout psock_tpacket msg_zerocopy
+  TEST_GEN_FILES += tcp_mmap tcp_inq psock_snd txring_overwrite
+  TEST_GEN_FILES += udpgso udpgso_bench_tx udpgso_bench_rx ip_defrag
+  TEST_GEN_FILES += so_txtime ipv6_flowlabel ipv6_flowlabel_mgr
+* Unmerged path tools/testing/selftests/net/Makefile
+diff --git a/tools/testing/selftests/net/devlink_port_split.py b/tools/testing/selftests/net/devlink_port_split.py
+new file mode 100755
+index 000000000000..58bb7e9b88ce
+--- /dev/null
++++ b/tools/testing/selftests/net/devlink_port_split.py
+@@ -0,0 +1,277 @@
++#!/usr/bin/python3
++# SPDX-License-Identifier: GPL-2.0
++
++from subprocess import PIPE, Popen
++import json
++import time
++import argparse
++import collections
++import sys
++
++#
++# Test port split configuration using devlink-port lanes attribute.
++# The test is skipped in case the attribute is not available.
++#
++# First, check that all the ports with 1 lane fail to split.
++# Second, check that all the ports with more than 1 lane can be split
++# to all valid configurations (e.g., split to 2, split to 4 etc.)
++#
++
++
++Port = collections.namedtuple('Port', 'bus_info name')
++
++
++def run_command(cmd, should_fail=False):
++    """
++    Run a command in subprocess.
++    Return: Tuple of (stdout, stderr).
++    """
++
++    p = Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
++    stdout, stderr = p.communicate()
++    stdout, stderr = stdout.decode(), stderr.decode()
++
++    if stderr != "" and not should_fail:
++        print("Error sending command: %s" % cmd)
++        print(stdout)
++        print(stderr)
++    return stdout, stderr
++
++
++class devlink_ports(object):
++    """
++    Class that holds information on the devlink ports, required to the tests;
++    if_names: A list of interfaces in the devlink ports.
++    """
++
++    def get_if_names(dev):
++        """
++        Get a list of physical devlink ports.
++        Return: Array of tuples (bus_info/port, if_name).
++        """
++
++        arr = []
++
++        cmd = "devlink -j port show"
++        stdout, stderr = run_command(cmd)
++        assert stderr == ""
++        ports = json.loads(stdout)['port']
++
++        for port in ports:
++            if dev in port:
++                if ports[port]['flavour'] == 'physical':
++                    arr.append(Port(bus_info=port, name=ports[port]['netdev']))
++
++        return arr
++
++    def __init__(self, dev):
++        self.if_names = devlink_ports.get_if_names(dev)
++
++
++def get_max_lanes(port):
++    """
++    Get the $port's maximum number of lanes.
++    Return: number of lanes, e.g. 1, 2, 4 and 8.
++    """
++
++    cmd = "devlink -j port show %s" % port
++    stdout, stderr = run_command(cmd)
++    assert stderr == ""
++    values = list(json.loads(stdout)['port'].values())[0]
++
++    if 'lanes' in values:
++        lanes = values['lanes']
++    else:
++        lanes = 0
++    return lanes
++
++
++def get_split_ability(port):
++    """
++    Get the $port split ability.
++    Return: split ability, true or false.
++    """
++
++    cmd = "devlink -j port show %s" % port.name
++    stdout, stderr = run_command(cmd)
++    assert stderr == ""
++    values = list(json.loads(stdout)['port'].values())[0]
++
++    return values['splittable']
++
++
++def split(k, port, should_fail=False):
++    """
++    Split $port into $k ports.
++    If should_fail == True, the split should fail. Otherwise, should pass.
++    Return: Array of sub ports after splitting.
++            If the $port wasn't split, the array will be empty.
++    """
++
++    cmd = "devlink port split %s count %s" % (port.bus_info, k)
++    stdout, stderr = run_command(cmd, should_fail=should_fail)
++
++    if should_fail:
++        if not test(stderr != "", "%s is unsplittable" % port.name):
++            print("split an unsplittable port %s" % port.name)
++            return create_split_group(port, k)
++    else:
++        if stderr == "":
++            return create_split_group(port, k)
++        print("didn't split a splittable port %s" % port.name)
++
++    return []
++
++
++def unsplit(port):
++    """
++    Unsplit $port.
++    """
++
++    cmd = "devlink port unsplit %s" % port
++    stdout, stderr = run_command(cmd)
++    test(stderr == "", "Unsplit port %s" % port)
++
++
++def exists(port, dev):
++    """
++    Check if $port exists in the devlink ports.
++    Return: True is so, False otherwise.
++    """
++
++    return any(dev_port.name == port
++               for dev_port in devlink_ports.get_if_names(dev))
++
++
++def exists_and_lanes(ports, lanes, dev):
++    """
++    Check if every port in the list $ports exists in the devlink ports and has
++    $lanes number of lanes after splitting.
++    Return: True if both are True, False otherwise.
++    """
++
++    for port in ports:
++        max_lanes = get_max_lanes(port)
++        if not exists(port, dev):
++            print("port %s doesn't exist in devlink ports" % port)
++            return False
++        if max_lanes != lanes:
++            print("port %s has %d lanes, but %s were expected"
++                  % (port, lanes, max_lanes))
++            return False
++    return True
++
++
++def test(cond, msg):
++    """
++    Check $cond and print a message accordingly.
++    Return: True is pass, False otherwise.
++    """
++
++    if cond:
++        print("TEST: %-60s [ OK ]" % msg)
++    else:
++        print("TEST: %-60s [FAIL]" % msg)
++
++    return cond
++
++
++def create_split_group(port, k):
++    """
++    Create the split group for $port.
++    Return: Array with $k elements, which are the split port group.
++    """
++
++    return list(port.name + "s" + str(i) for i in range(k))
++
++
++def split_unsplittable_port(port, k):
++    """
++    Test that splitting of unsplittable port fails.
++    """
++
++    # split to max
++    new_split_group = split(k, port, should_fail=True)
++
++    if new_split_group != []:
++        unsplit(port.bus_info)
++
++
++def split_splittable_port(port, k, lanes, dev):
++    """
++    Test that splitting of splittable port passes correctly.
++    """
++
++    new_split_group = split(k, port)
++
++    # Once the split command ends, it takes some time to the sub ifaces'
++    # to get their names. Use udevadm to continue only when all current udev
++    # events are handled.
++    cmd = "udevadm settle"
++    stdout, stderr = run_command(cmd)
++    assert stderr == ""
++
++    if new_split_group != []:
++        test(exists_and_lanes(new_split_group, lanes/k, dev),
++             "split port %s into %s" % (port.name, k))
++
++    unsplit(port.bus_info)
++
++
++def make_parser():
++    parser = argparse.ArgumentParser(description='A test for port splitting.')
++    parser.add_argument('--dev',
++                        help='The devlink handle of the device under test. ' +
++                             'The default is the first registered devlink ' +
++                             'handle.')
++
++    return parser
++
++
++def main(cmdline=None):
++    parser = make_parser()
++    args = parser.parse_args(cmdline)
++
++    dev = args.dev
++    if not dev:
++        cmd = "devlink -j dev show"
++        stdout, stderr = run_command(cmd)
++        assert stderr == ""
++
++        devs = json.loads(stdout)['dev']
++        dev = list(devs.keys())[0]
++
++    cmd = "devlink dev show %s" % dev
++    stdout, stderr = run_command(cmd)
++    if stderr != "":
++        print("devlink device %s can not be found" % dev)
++        sys.exit(1)
++
++    ports = devlink_ports(dev)
++
++    for port in ports.if_names:
++        max_lanes = get_max_lanes(port.name)
++
++        # If max lanes is 0, do not test port splitting at all
++        if max_lanes == 0:
++            continue
++
++        # If 1 lane, shouldn't be able to split
++        elif max_lanes == 1:
++            test(not get_split_ability(port),
++                 "%s should not be able to split" % port.name)
++            split_unsplittable_port(port, max_lanes)
++
++        # Else, splitting should pass and all the split ports should exist.
++        else:
++            lane = max_lanes
++            test(get_split_ability(port),
++                 "%s should be able to split" % port.name)
++            while lane > 1:
++                split_splittable_port(port, lane, max_lanes, dev)
++
++                lane //= 2
++
++
++if __name__ == "__main__":
++    main()
