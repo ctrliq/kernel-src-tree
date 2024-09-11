@@ -1,0 +1,416 @@
+LSM: Infrastructure management of the task security
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Casey Schaufler <casey@schaufler-ca.com>
+commit f4ad8f2c40769b3cc9497ba0883bbaf823f7752f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/f4ad8f2c.failed
+
+Move management of the task_struct->security blob out
+of the individual security modules and into the security
+infrastructure. Instead of allocating the blobs from within
+the modules the modules tell the infrastructure how much
+space is required, and the space is allocated there.
+The only user of this blob is AppArmor. The AppArmor use
+is abstracted to avoid future conflict.
+
+	Signed-off-by: Casey Schaufler <casey@schaufler-ca.com>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+[kees: adjusted for ordered init series]
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit f4ad8f2c40769b3cc9497ba0883bbaf823f7752f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/lsm_hooks.h
+#	security/apparmor/lsm.c
+#	security/security.c
+diff --cc include/linux/lsm_hooks.h
+index 84380f3a8dab,9b39fefa88c4..000000000000
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@@ -1479,10 -2028,14 +1479,19 @@@ struct security_hook_list 
+  } __randomize_layout;
+  
+  /*
+ - * Security blob size or offset data.
+ + * LSM_RET_VOID is used as the default value in LSM_HOOK definitions for void
+ + * LSM hooks (in include/linux/lsm_hook_defs.h).
+   */
+++<<<<<<< HEAD
+ +#define LSM_RET_VOID ((void) 0)
+++=======
++ struct lsm_blob_sizes {
++ 	int	lbs_cred;
++ 	int	lbs_file;
++ 	int	lbs_inode;
++ 	int	lbs_task;
++ };
+++>>>>>>> f4ad8f2c4076 (LSM: Infrastructure management of the task security)
+  
+  /*
+   * Initializing a security_hook_list structure takes
+@@@ -1552,4 -2106,11 +1561,14 @@@ static inline void security_delete_hook
+  #define __lsm_ro_after_init	__ro_after_init
+  #endif /* CONFIG_SECURITY_WRITABLE_HOOKS */
+  
+++<<<<<<< HEAD
+++=======
++ extern int lsm_inode_alloc(struct inode *inode);
++ 
++ #ifdef CONFIG_SECURITY
++ void __init lsm_early_cred(struct cred *cred);
++ void __init lsm_early_task(struct task_struct *task);
++ #endif
++ 
+++>>>>>>> f4ad8f2c4076 (LSM: Infrastructure management of the task security)
+  #endif /* ! __LINUX_LSM_HOOKS_H */
+diff --cc security/apparmor/lsm.c
+index 85c05989635b,60ef71268ccf..000000000000
+--- a/security/apparmor/lsm.c
++++ b/security/apparmor/lsm.c
+@@@ -1126,6 -1132,29 +1121,32 @@@ static void apparmor_sock_graft(struct 
+  		ctx->label = aa_get_current_label();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NETWORK_SECMARK
++ static int apparmor_inet_conn_request(struct sock *sk, struct sk_buff *skb,
++ 				      struct request_sock *req)
++ {
++ 	struct aa_sk_ctx *ctx = SK_CTX(sk);
++ 
++ 	if (!skb->secmark)
++ 		return 0;
++ 
++ 	return apparmor_secmark_check(ctx->label, OP_CONNECT, AA_MAY_CONNECT,
++ 				      skb->secmark, sk);
++ }
++ #endif
++ 
++ /*
++  * The cred blob is a pointer to, not an instance of, an aa_task_ctx.
++  */
++ struct lsm_blob_sizes apparmor_blob_sizes __lsm_ro_after_init = {
++ 	.lbs_cred = sizeof(struct aa_task_ctx *),
++ 	.lbs_file = sizeof(struct aa_file_ctx),
++ 	.lbs_task = sizeof(struct aa_task_ctx),
++ };
++ 
+++>>>>>>> f4ad8f2c4076 (LSM: Infrastructure management of the task security)
+  static struct security_hook_list apparmor_hooks[] __lsm_ro_after_init = {
+  	LSM_HOOK_INIT(ptrace_access_check, apparmor_ptrace_access_check),
+  	LSM_HOOK_INIT(ptrace_traceme, apparmor_ptrace_traceme),
+@@@ -1449,14 -1483,10 +1470,15 @@@ static int param_set_mode(const char *v
+  static int __init set_init_ctx(void)
+  {
+  	struct cred *cred = (struct cred *)current->real_cred;
+- 	struct aa_task_ctx *ctx;
+- 
+- 	ctx = aa_alloc_task_ctx(GFP_KERNEL);
+- 	if (!ctx)
+- 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	cred_label(cred) = aa_get_label(ns_unconfined(root_ns));
+ +	task_ctx(current) = ctx;
+++=======
++ 	lsm_early_cred(cred);
++ 	lsm_early_task(current);
++ 	set_cred_label(cred, aa_get_label(ns_unconfined(root_ns)));
+++>>>>>>> f4ad8f2c4076 (LSM: Infrastructure management of the task security)
+  
+  	return 0;
+  }
+diff --cc security/security.c
+index 8555aece1bce,e59a1e1514ee..000000000000
+--- a/security/security.c
++++ b/security/security.c
+@@@ -142,6 -144,34 +142,37 @@@ static bool __init lsm_allowed(struct l
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __init lsm_set_blob_size(int *need, int *lbs)
++ {
++ 	int offset;
++ 
++ 	if (*need > 0) {
++ 		offset = *lbs;
++ 		*lbs += *need;
++ 		*need = offset;
++ 	}
++ }
++ 
++ static void __init lsm_set_blob_sizes(struct lsm_blob_sizes *needed)
++ {
++ 	if (!needed)
++ 		return;
++ 
++ 	lsm_set_blob_size(&needed->lbs_cred, &blob_sizes.lbs_cred);
++ 	lsm_set_blob_size(&needed->lbs_file, &blob_sizes.lbs_file);
++ 	/*
++ 	 * The inode blob gets an rcu_head in addition to
++ 	 * what the modules might need.
++ 	 */
++ 	if (needed->lbs_inode && blob_sizes.lbs_inode == 0)
++ 		blob_sizes.lbs_inode = sizeof(struct rcu_head);
++ 	lsm_set_blob_size(&needed->lbs_inode, &blob_sizes.lbs_inode);
++ 	lsm_set_blob_size(&needed->lbs_task, &blob_sizes.lbs_task);
++ }
++ 
+++>>>>>>> f4ad8f2c4076 (LSM: Infrastructure management of the task security)
+  /* Prepare LSM for initialization. */
+  static void __init prepare_lsm(struct lsm_info *lsm)
+  {
+@@@ -262,6 -290,23 +293,26 @@@ static void __init ordered_lsm_init(voi
+  	for (lsm = ordered_lsms; *lsm; lsm++)
+  		prepare_lsm(*lsm);
+  
+++<<<<<<< HEAD
+++=======
++ 	init_debug("cred blob size     = %d\n", blob_sizes.lbs_cred);
++ 	init_debug("file blob size     = %d\n", blob_sizes.lbs_file);
++ 	init_debug("inode blob size    = %d\n", blob_sizes.lbs_inode);
++ 	init_debug("task blob size     = %d\n", blob_sizes.lbs_task);
++ 
++ 	/*
++ 	 * Create any kmem_caches needed for blobs
++ 	 */
++ 	if (blob_sizes.lbs_file)
++ 		lsm_file_cache = kmem_cache_create("lsm_file_cache",
++ 						   blob_sizes.lbs_file, 0,
++ 						   SLAB_PANIC, NULL);
++ 	if (blob_sizes.lbs_inode)
++ 		lsm_inode_cache = kmem_cache_create("lsm_inode_cache",
++ 						    blob_sizes.lbs_inode, 0,
++ 						    SLAB_PANIC, NULL);
++ 
+++>>>>>>> f4ad8f2c4076 (LSM: Infrastructure management of the task security)
+  	for (lsm = ordered_lsms; *lsm; lsm++)
+  		initialize_lsm(*lsm);
+  
+@@@ -371,46 -416,147 +422,86 @@@ void __init security_add_hooks(struct s
+  		panic("%s - Cannot get early memory.\n", __func__);
+  }
+  
+ -int call_lsm_notifier(enum lsm_event event, void *data)
+ -{
+ -	return atomic_notifier_call_chain(&lsm_notifier_chain, event, data);
+ -}
+ -EXPORT_SYMBOL(call_lsm_notifier);
+ -
+ -int register_lsm_notifier(struct notifier_block *nb)
+ -{
+ -	return atomic_notifier_chain_register(&lsm_notifier_chain, nb);
+ -}
+ -EXPORT_SYMBOL(register_lsm_notifier);
+ -
+ -int unregister_lsm_notifier(struct notifier_block *nb)
+ -{
+ -	return atomic_notifier_chain_unregister(&lsm_notifier_chain, nb);
+ -}
+ -EXPORT_SYMBOL(unregister_lsm_notifier);
+ -
+ -/**
+ - * lsm_cred_alloc - allocate a composite cred blob
+ - * @cred: the cred that needs a blob
+ - * @gfp: allocation type
+ - *
+ - * Allocate the cred blob for all the modules
+ - *
+ - * Returns 0, or -ENOMEM if memory can't be allocated.
+ - */
+ -static int lsm_cred_alloc(struct cred *cred, gfp_t gfp)
+ +int call_blocking_lsm_notifier(enum lsm_event event, void *data)
+  {
+ -	if (blob_sizes.lbs_cred == 0) {
+ -		cred->security = NULL;
+ -		return 0;
+ -	}
+ -
+ -	cred->security = kzalloc(blob_sizes.lbs_cred, gfp);
+ -	if (cred->security == NULL)
+ -		return -ENOMEM;
+ -	return 0;
+ +	return blocking_notifier_call_chain(&blocking_lsm_notifier_chain,
+ +					    event, data);
+  }
+ +EXPORT_SYMBOL(call_blocking_lsm_notifier);
+  
+ -/**
+ - * lsm_early_cred - during initialization allocate a composite cred blob
+ - * @cred: the cred that needs a blob
+ - *
+ - * Allocate the cred blob for all the modules if it's not already there
+ - */
+ -void __init lsm_early_cred(struct cred *cred)
+ +int register_blocking_lsm_notifier(struct notifier_block *nb)
+  {
+ -	int rc;
+ -
+ -	if (cred == NULL)
+ -		panic("%s: NULL cred.\n", __func__);
+ -	if (cred->security != NULL)
+ -		return;
+ -	rc = lsm_cred_alloc(cred, GFP_KERNEL);
+ -	if (rc)
+ -		panic("%s: Early cred alloc failed.\n", __func__);
+ +	return blocking_notifier_chain_register(&blocking_lsm_notifier_chain,
+ +						nb);
+  }
+ +EXPORT_SYMBOL(register_blocking_lsm_notifier);
+  
+ -/**
+ - * lsm_file_alloc - allocate a composite file blob
+ - * @file: the file that needs a blob
+ - *
+ - * Allocate the file blob for all the modules
+ - *
+ - * Returns 0, or -ENOMEM if memory can't be allocated.
+ - */
+ -static int lsm_file_alloc(struct file *file)
+ +int unregister_blocking_lsm_notifier(struct notifier_block *nb)
+  {
+ -	if (!lsm_file_cache) {
+ -		file->f_security = NULL;
+ -		return 0;
+ -	}
+ -
+ -	file->f_security = kmem_cache_zalloc(lsm_file_cache, GFP_KERNEL);
+ -	if (file->f_security == NULL)
+ -		return -ENOMEM;
+ -	return 0;
+ +	return blocking_notifier_chain_unregister(&blocking_lsm_notifier_chain,
+ +						  nb);
+  }
+ +EXPORT_SYMBOL(unregister_blocking_lsm_notifier);
+  
+ -/**
+ - * lsm_inode_alloc - allocate a composite inode blob
+ - * @inode: the inode that needs a blob
+ +/*
+ + * The default value of the LSM hook is defined in linux/lsm_hook_defs.h and
+ + * can be accessed with:
+   *
+ - * Allocate the inode blob for all the modules
+ + *	LSM_RET_DEFAULT(<hook_name>)
+   *
+ - * Returns 0, or -ENOMEM if memory can't be allocated.
+ + * The macros below define static constants for the default value of each
+ + * LSM hook.
+   */
+ -int lsm_inode_alloc(struct inode *inode)
+ -{
+ -	if (!lsm_inode_cache) {
+ -		inode->i_security = NULL;
+ -		return 0;
+ -	}
+ +#define LSM_RET_DEFAULT(NAME) (NAME##_default)
+ +#define DECLARE_LSM_RET_DEFAULT_void(DEFAULT, NAME)
+ +#define DECLARE_LSM_RET_DEFAULT_int(DEFAULT, NAME) \
+ +	static const int LSM_RET_DEFAULT(NAME) = (DEFAULT);
+ +#define LSM_HOOK(RET, DEFAULT, NAME, ...) \
+ +	DECLARE_LSM_RET_DEFAULT_##RET(DEFAULT, NAME)
+  
+ -	inode->i_security = kmem_cache_zalloc(lsm_inode_cache, GFP_NOFS);
+ -	if (inode->i_security == NULL)
+ -		return -ENOMEM;
+ -	return 0;
+ -}
+ +#include <linux/lsm_hook_defs.h>
+ +#undef LSM_HOOK
+  
++ /**
++  * lsm_task_alloc - allocate a composite task blob
++  * @task: the task that needs a blob
++  *
++  * Allocate the task blob for all the modules
++  *
++  * Returns 0, or -ENOMEM if memory can't be allocated.
++  */
++ int lsm_task_alloc(struct task_struct *task)
++ {
++ 	if (blob_sizes.lbs_task == 0) {
++ 		task->security = NULL;
++ 		return 0;
++ 	}
++ 
++ 	task->security = kzalloc(blob_sizes.lbs_task, GFP_KERNEL);
++ 	if (task->security == NULL)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ /**
++  * lsm_early_task - during initialization allocate a composite task blob
++  * @task: the task that needs a blob
++  *
++  * Allocate the task blob for all the modules if it's not already there
++  */
++ void __init lsm_early_task(struct task_struct *task)
++ {
++ 	int rc;
++ 
++ 	if (task == NULL)
++ 		panic("%s: task cred.\n", __func__);
++ 	if (task->security != NULL)
++ 		return;
++ 	rc = lsm_task_alloc(task);
++ 	if (rc)
++ 		panic("%s: Early task alloc failed.\n", __func__);
++ }
++ 
+  /*
+   * Hook list operation macros.
+   *
+* Unmerged path include/linux/lsm_hooks.h
+diff --git a/security/apparmor/include/task.h b/security/apparmor/include/task.h
+index 55edaa1d83f8..039c1e60887a 100644
+--- a/security/apparmor/include/task.h
++++ b/security/apparmor/include/task.h
+@@ -14,7 +14,10 @@
+ #ifndef __AA_TASK_H
+ #define __AA_TASK_H
+ 
+-#define task_ctx(X) ((X)->security)
++static inline struct aa_task_ctx *task_ctx(struct task_struct *task)
++{
++	return task->security;
++}
+ 
+ /*
+  * struct aa_task_ctx - information for current task label change
+@@ -36,17 +39,6 @@ int aa_set_current_hat(struct aa_label *label, u64 token);
+ int aa_restore_previous_label(u64 cookie);
+ struct aa_label *aa_get_task_label(struct task_struct *task);
+ 
+-/**
+- * aa_alloc_task_ctx - allocate a new task_ctx
+- * @flags: gfp flags for allocation
+- *
+- * Returns: allocated buffer or NULL on failure
+- */
+-static inline struct aa_task_ctx *aa_alloc_task_ctx(gfp_t flags)
+-{
+-	return kzalloc(sizeof(struct aa_task_ctx), flags);
+-}
+-
+ /**
+  * aa_free_task_ctx - free a task_ctx
+  * @ctx: task_ctx to free (MAYBE NULL)
+@@ -57,8 +49,6 @@ static inline void aa_free_task_ctx(struct aa_task_ctx *ctx)
+ 		aa_put_label(ctx->nnp);
+ 		aa_put_label(ctx->previous);
+ 		aa_put_label(ctx->onexec);
+-
+-		kzfree(ctx);
+ 	}
+ }
+ 
+* Unmerged path security/apparmor/lsm.c
+* Unmerged path security/security.c
