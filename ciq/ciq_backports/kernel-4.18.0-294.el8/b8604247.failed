@@ -1,0 +1,200 @@
+libbpf: Remove assumption of single contiguous memory for BTF data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit b86042478fa083d87f1b67047e788d70b8c81eef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b8604247.failed
+
+Refactor internals of struct btf to remove assumptions that BTF header, type
+data, and string data are layed out contiguously in a memory in a single
+memory allocation. Now we have three separate pointers pointing to the start
+of each respective are: header, types, strings. In the next patches, these
+pointers will be re-assigned to point to independently allocated memory areas,
+if BTF needs to be modified.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200926011357.2366158-3-andriin@fb.com
+(cherry picked from commit b86042478fa083d87f1b67047e788d70b8c81eef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+diff --cc tools/lib/bpf/btf.c
+index 9ca048005e04,d180a677a3fb..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -30,17 -27,38 +30,52 @@@
+  static struct btf_type btf_void;
+  
+  struct btf {
+++<<<<<<< HEAD
+ +	union {
+ +		struct btf_header *hdr;
+ +		void *data;
+ +	};
+ +	struct btf_type **types;
+ +	const char *strings;
+ +	void *nohdr_data;
+ +	__u32 nr_types;
+ +	__u32 types_size;
+ +	__u32 data_size;
+ +	int fd;
+++=======
++ 	void *raw_data;
++ 	__u32 raw_size;
++ 
++ 	/*
++ 	 * When BTF is loaded from ELF or raw memory it is stored
++ 	 * in contiguous memory block, pointed to by raw_data pointer, and
++ 	 * hdr, types_data, and strs_data point inside that memory region to
++ 	 * respective parts of BTF representation:
++ 	 *
++ 	 * +--------------------------------+
++ 	 * |  Header  |  Types  |  Strings  |
++ 	 * +--------------------------------+
++ 	 * ^          ^         ^
++ 	 * |          |         |
++ 	 * hdr        |         |
++ 	 * types_data-+         |
++ 	 * strs_data------------+
++ 	 */
++ 	struct btf_header *hdr;
++ 	void *types_data;
++ 	void *strs_data;
++ 
++ 	/* type ID to `struct btf_type *` lookup index */
++ 	__u32 *type_offs;
++ 	__u32 type_offs_cap;
++ 	__u32 nr_types;
++ 
++ 	/* BTF object FD, if loaded into kernel */
++ 	int fd;
++ 
++ 	/* Pointer size (in bytes) for a target architecture of this BTF */
++ 	int ptr_sz;
+++>>>>>>> b86042478fa0 (libbpf: Remove assumption of single contiguous memory for BTF data)
+  };
+  
+  static inline __u64 ptr_to_u64(const void *ptr)
+@@@ -187,12 -201,10 +218,17 @@@ static int btf_type_size(struct btf_typ
+  static int btf_parse_type_sec(struct btf *btf)
+  {
+  	struct btf_header *hdr = btf->hdr;
+++<<<<<<< HEAD
+ +	void *nohdr_data = btf->nohdr_data;
+ +	void *next_type = nohdr_data + hdr->type_off;
+ +	void *end_type = nohdr_data + hdr->str_off;
+++=======
++ 	void *next_type = btf->types_data;
++ 	void *end_type = next_type + hdr->type_len;
+++>>>>>>> b86042478fa0 (libbpf: Remove assumption of single contiguous memory for BTF data)
+  
+  	while (next_type < end_type) {
+ +		struct btf_type *t = next_type;
+  		int type_size;
+  		int err;
+  
+@@@ -389,11 -476,11 +425,16 @@@ void btf__free(struct btf *btf
+  	if (IS_ERR_OR_NULL(btf))
+  		return;
+  
+ -	if (btf->fd >= 0)
+ +	if (btf->fd != -1)
+  		close(btf->fd);
+  
+++<<<<<<< HEAD
+ +	free(btf->data);
+ +	free(btf->types);
+++=======
++ 	free(btf->raw_data);
++ 	free(btf->type_offs);
+++>>>>>>> b86042478fa0 (libbpf: Remove assumption of single contiguous memory for BTF data)
+  	free(btf);
+  }
+  
+@@@ -700,10 -882,15 +747,10 @@@ int btf__fd(const struct btf *btf
+  	return btf->fd;
+  }
+  
+ -void btf__set_fd(struct btf *btf, int fd)
+ -{
+ -	btf->fd = fd;
+ -}
+ -
+  const void *btf__get_raw_data(const struct btf *btf, __u32 *size)
+  {
+- 	*size = btf->data_size;
+- 	return btf->data;
++ 	*size = btf->raw_size;
++ 	return btf->raw_data;
+  }
+  
+  const char *btf__name_by_offset(const struct btf *btf, __u32 offset)
+@@@ -2795,21 -2979,20 +2841,29 @@@ static int btf_dedup_compact_types(stru
+  
+  	/* shrink struct btf's internal types index and update btf_header */
+  	d->btf->nr_types = next_type_id - 1;
+ -	d->btf->type_offs_cap = d->btf->nr_types + 1;
+ -	d->btf->hdr->type_len = p - d->btf->types_data;
+ -	new_offs = libbpf_reallocarray(d->btf->type_offs, d->btf->type_offs_cap,
+ -				       sizeof(*new_offs));
+ -	if (!new_offs)
+ +	d->btf->types_size = d->btf->nr_types;
+ +	d->btf->hdr->type_len = p - types_start;
+ +	new_types = realloc(d->btf->types,
+ +			    (1 + d->btf->nr_types) * sizeof(struct btf_type *));
+ +	if (!new_types)
+  		return -ENOMEM;
+ -	d->btf->type_offs = new_offs;
+ +	d->btf->types = new_types;
+  
+  	/* make sure string section follows type information without gaps */
+++<<<<<<< HEAD
+ +	d->btf->hdr->str_off = p - (char *)d->btf->nohdr_data;
+ +	memmove(p, d->btf->strings, d->btf->hdr->str_len);
+ +	d->btf->strings = p;
+ +	p += d->btf->hdr->str_len;
+ +
+ +	d->btf->data_size = p - (char *)d->btf->data;
+++=======
++ 	d->btf->hdr->str_off = p - d->btf->types_data;
++ 	memmove(p, d->btf->strs_data, d->btf->hdr->str_len);
++ 	d->btf->strs_data = p;
++ 
++ 	d->btf->raw_size = d->btf->hdr->hdr_len + d->btf->hdr->type_len + d->btf->hdr->str_len;
+++>>>>>>> b86042478fa0 (libbpf: Remove assumption of single contiguous memory for BTF data)
+  	return 0;
+  }
+  
+diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
+index da45889fc732..14cf982258c5 100644
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -779,7 +779,7 @@ int bpf_raw_tracepoint_open(const char *name, int prog_fd)
+ 	return sys_bpf(BPF_RAW_TRACEPOINT_OPEN, &attr, sizeof(attr));
+ }
+ 
+-int bpf_load_btf(void *btf, __u32 btf_size, char *log_buf, __u32 log_buf_size,
++int bpf_load_btf(const void *btf, __u32 btf_size, char *log_buf, __u32 log_buf_size,
+ 		 bool do_log)
+ {
+ 	union bpf_attr attr = {};
+diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
+index f8c9bd418cb7..2775189aa792 100644
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -226,7 +226,7 @@ LIBBPF_API int bpf_prog_query(int target_fd, enum bpf_attach_type type,
+ 			      __u32 query_flags, __u32 *attach_flags,
+ 			      __u32 *prog_ids, __u32 *prog_cnt);
+ LIBBPF_API int bpf_raw_tracepoint_open(const char *name, int prog_fd);
+-LIBBPF_API int bpf_load_btf(void *btf, __u32 btf_size, char *log_buf,
++LIBBPF_API int bpf_load_btf(const void *btf, __u32 btf_size, char *log_buf,
+ 			    __u32 log_buf_size, bool do_log);
+ LIBBPF_API int bpf_task_fd_query(int pid, int fd, __u32 flags, char *buf,
+ 				 __u32 *buf_len, __u32 *prog_id, __u32 *fd_type,
+* Unmerged path tools/lib/bpf/btf.c
