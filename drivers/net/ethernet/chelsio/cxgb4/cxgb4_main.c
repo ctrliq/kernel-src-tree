@@ -6025,6 +6025,11 @@ static void remove_one(struct pci_dev *pdev)
 		return;
 	}
 
+	/* If we allocated filters, free up state associated with any
+	 * valid filters ...
+	 */
+	clear_all_filters(adapter);
+
 	adapter->flags |= CXGB4_SHUTTING_DOWN;
 
 	if (adapter->pf == 4) {
@@ -6054,11 +6059,6 @@ static void remove_one(struct pci_dev *pdev)
 			cxgb4_ptp_stop(adapter);
 		if (IS_REACHABLE(CONFIG_THERMAL))
 			cxgb4_thermal_remove(adapter);
-
-		/* If we allocated filters, free up state associated with any
-		 * valid filters ...
-		 */
-		clear_all_filters(adapter);
 
 		if (adapter->flags & CXGB4_FULL_INIT_DONE)
 			cxgb_down(adapter);
