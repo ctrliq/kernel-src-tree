@@ -1,0 +1,166 @@
+perf maps: Move kmap::kmaps setup to maps__insert()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 484214f49bd0948d716832a94e4737ca4dd02c16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/484214f4.failed
+
+So the kmaps pointer setup is centralized and we do not need to update
+it in all those places (2 current places and few more missing) after
+calling maps__insert().
+
+	Reported-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Tested-by: Kim Phillips <kim.phillips@amd.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Michael Petlan <mpetlan@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/20200210143218.24948-5-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 484214f49bd0948d716832a94e4737ca4dd02c16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/machine.c
+#	tools/perf/util/map.c
+diff --cc tools/perf/util/machine.c
+index 40cbcc9a1474,fb5c2cd44d30..000000000000
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@@ -966,10 -981,9 +966,9 @@@ int machine__create_extra_kernel_map(st
+  
+  	kmap = map__kmap(map);
+  
+- 	kmap->kmaps = &machine->kmaps;
+  	strlcpy(kmap->name, xm->name, KMAP_NAME_LEN);
+  
+ -	maps__insert(&machine->kmaps, map);
+ +	map_groups__insert(&machine->kmaps, map);
+  
+  	pr_debug2("Added extra kernel map %s %" PRIx64 "-%" PRIx64 "\n",
+  		  kmap->name, map->start, map->end);
+@@@ -1088,14 -1098,7 +1084,18 @@@ __machine__create_kernel_maps(struct ma
+  		return -1;
+  
+  	machine->vmlinux_map->map_ip = machine->vmlinux_map->unmap_ip = identity__map_ip;
+++<<<<<<< HEAD
+ +	map = machine__kernel_map(machine);
+ +	kmap = map__kmap(map);
+ +	if (!kmap)
+ +		return -1;
+ +
+ +	kmap->kmaps = &machine->kmaps;
+ +	map_groups__insert(&machine->kmaps, map);
+ +
+++=======
++ 	maps__insert(&machine->kmaps, machine->vmlinux_map);
+++>>>>>>> 484214f49bd0 (perf maps: Move kmap::kmaps setup to maps__insert())
+  	return 0;
+  }
+  
+diff --cc tools/perf/util/map.c
+index acbc65347d14,a08ca276098e..000000000000
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@@ -521,23 -517,83 +521,81 @@@ u64 map__objdump_2mem(struct map *map, 
+  	return ip + map->reloc;
+  }
+  
+ -void maps__init(struct maps *maps, struct machine *machine)
+ +static void maps__init(struct maps *maps)
+  {
+  	maps->entries = RB_ROOT;
+ +	maps->names = RB_ROOT;
+  	init_rwsem(&maps->lock);
+ -	maps->machine = machine;
+ -	maps->last_search_by_name = NULL;
+ -	maps->nr_maps = 0;
+ -	maps->maps_by_name = NULL;
+ -	refcount_set(&maps->refcnt, 1);
+  }
+  
+ -static void __maps__free_maps_by_name(struct maps *maps)
+ +void map_groups__init(struct map_groups *mg, struct machine *machine)
+  {
+ -	/*
+ -	 * Free everything to try to do it from the rbtree in the next search
+ -	 */
+ -	zfree(&maps->maps_by_name);
+ -	maps->nr_maps_allocated = 0;
+ +	maps__init(&mg->maps);
+ +	mg->machine = machine;
+ +	refcount_set(&mg->refcnt, 1);
+  }
+  
+ -void maps__insert(struct maps *maps, struct map *map)
+ +void map_groups__insert(struct map_groups *mg, struct map *map)
+  {
+++<<<<<<< HEAD
+ +	maps__insert(&mg->maps, map);
+++=======
++ 	down_write(&maps->lock);
++ 	__maps__insert(maps, map);
++ 	++maps->nr_maps;
++ 
++ 	if (map->dso && map->dso->kernel) {
++ 		struct kmap *kmap = map__kmap(map);
++ 
++ 		if (kmap)
++ 			kmap->kmaps = maps;
++ 		else
++ 			pr_err("Internal error: kernel dso with non kernel map\n");
++ 	}
++ 
++ 
++ 	/*
++ 	 * If we already performed some search by name, then we need to add the just
++ 	 * inserted map and resort.
++ 	 */
++ 	if (maps->maps_by_name) {
++ 		if (maps->nr_maps > maps->nr_maps_allocated) {
++ 			int nr_allocate = maps->nr_maps * 2;
++ 			struct map **maps_by_name = realloc(maps->maps_by_name, nr_allocate * sizeof(map));
++ 
++ 			if (maps_by_name == NULL) {
++ 				__maps__free_maps_by_name(maps);
++ 				up_write(&maps->lock);
++ 				return;
++ 			}
++ 
++ 			maps->maps_by_name = maps_by_name;
++ 			maps->nr_maps_allocated = nr_allocate;
++ 		}
++ 		maps->maps_by_name[maps->nr_maps - 1] = map;
++ 		__maps__sort_by_name(maps);
++ 	}
++ 	up_write(&maps->lock);
++ }
++ 
++ static void __maps__remove(struct maps *maps, struct map *map)
++ {
++ 	rb_erase_init(&map->rb_node, &maps->entries);
++ 	map__put(map);
++ }
++ 
++ void maps__remove(struct maps *maps, struct map *map)
++ {
++ 	down_write(&maps->lock);
++ 	if (maps->last_search_by_name == map)
++ 		maps->last_search_by_name = NULL;
++ 
++ 	__maps__remove(maps, map);
++ 	--maps->nr_maps;
++ 	if (maps->maps_by_name)
++ 		__maps__free_maps_by_name(maps);
++ 	up_write(&maps->lock);
+++>>>>>>> 484214f49bd0 (perf maps: Move kmap::kmaps setup to maps__insert())
+  }
+  
+  static void __maps__purge(struct maps *maps)
+* Unmerged path tools/perf/util/machine.c
+* Unmerged path tools/perf/util/map.c
