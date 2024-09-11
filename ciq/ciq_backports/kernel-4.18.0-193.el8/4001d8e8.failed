@@ -1,0 +1,180 @@
+genirq: Delay deactivation in free_irq()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 4001d8e8762f57d418b66e4e668601791900a1dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/4001d8e8.failed
+
+When interrupts are shutdown, they are immediately deactivated in the
+irqdomain hierarchy. While this looks obviously correct there is a subtle
+issue:
+
+There might be an interrupt in flight when free_irq() is invoking the
+shutdown. This is properly handled at the irq descriptor / primary handler
+level, but the deactivation might completely disable resources which are
+required to acknowledge the interrupt.
+
+Split the shutdown code and deactivate the interrupt after synchronization
+in free_irq(). Fixup all other usage sites where this is not an issue to
+invoke the combined shutdown_and_deactivate() function instead.
+
+This still might be an issue if the interrupt in flight servicing is
+delayed on a remote CPU beyond the invocation of synchronize_irq(), but
+that cannot be handled at that level and needs to be handled in the
+synchronize_irq() context.
+
+Fixes: f8264e34965a ("irqdomain: Introduce new interfaces to support hierarchy irqdomains")
+	Reported-by: Robert Hodaszi <Robert.Hodaszi@digi.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+Link: https://lkml.kernel.org/r/20190628111440.098196390@linutronix.de
+
+(cherry picked from commit 4001d8e8762f57d418b66e4e668601791900a1dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/irq/manage.c
+diff --cc kernel/irq/manage.c
+index bba358c977e0,dc8b35f2d545..000000000000
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@@ -1753,6 -1848,59 +1763,62 @@@ const void *free_irq(unsigned int irq, 
+  }
+  EXPORT_SYMBOL(free_irq);
+  
+++<<<<<<< HEAD
+++=======
++ /* This function must be called with desc->lock held */
++ static const void *__cleanup_nmi(unsigned int irq, struct irq_desc *desc)
++ {
++ 	const char *devname = NULL;
++ 
++ 	desc->istate &= ~IRQS_NMI;
++ 
++ 	if (!WARN_ON(desc->action == NULL)) {
++ 		irq_pm_remove_action(desc, desc->action);
++ 		devname = desc->action->name;
++ 		unregister_handler_proc(irq, desc->action);
++ 
++ 		kfree(desc->action);
++ 		desc->action = NULL;
++ 	}
++ 
++ 	irq_settings_clr_disable_unlazy(desc);
++ 	irq_shutdown_and_deactivate(desc);
++ 
++ 	irq_release_resources(desc);
++ 
++ 	irq_chip_pm_put(&desc->irq_data);
++ 	module_put(desc->owner);
++ 
++ 	return devname;
++ }
++ 
++ const void *free_nmi(unsigned int irq, void *dev_id)
++ {
++ 	struct irq_desc *desc = irq_to_desc(irq);
++ 	unsigned long flags;
++ 	const void *devname;
++ 
++ 	if (!desc || WARN_ON(!(desc->istate & IRQS_NMI)))
++ 		return NULL;
++ 
++ 	if (WARN_ON(irq_settings_is_per_cpu_devid(desc)))
++ 		return NULL;
++ 
++ 	/* NMI still enabled */
++ 	if (WARN_ON(desc->depth == 0))
++ 		disable_nmi_nosync(irq);
++ 
++ 	raw_spin_lock_irqsave(&desc->lock, flags);
++ 
++ 	irq_nmi_teardown(desc);
++ 	devname = __cleanup_nmi(irq, desc);
++ 
++ 	raw_spin_unlock_irqrestore(&desc->lock, flags);
++ 
++ 	return devname;
++ }
++ 
+++>>>>>>> 4001d8e8762f (genirq: Delay deactivation in free_irq())
+  /**
+   *	request_threaded_irq - allocate an interrupt line
+   *	@irq: Interrupt line to allocate
+diff --git a/kernel/irq/autoprobe.c b/kernel/irq/autoprobe.c
+index 16cbf6beb276..ae60cae24e9a 100644
+--- a/kernel/irq/autoprobe.c
++++ b/kernel/irq/autoprobe.c
+@@ -90,7 +90,7 @@ unsigned long probe_irq_on(void)
+ 			/* It triggered already - consider it spurious. */
+ 			if (!(desc->istate & IRQS_WAITING)) {
+ 				desc->istate &= ~IRQS_AUTODETECT;
+-				irq_shutdown(desc);
++				irq_shutdown_and_deactivate(desc);
+ 			} else
+ 				if (i < 32)
+ 					mask |= 1 << i;
+@@ -127,7 +127,7 @@ unsigned int probe_irq_mask(unsigned long val)
+ 				mask |= 1 << i;
+ 
+ 			desc->istate &= ~IRQS_AUTODETECT;
+-			irq_shutdown(desc);
++			irq_shutdown_and_deactivate(desc);
+ 		}
+ 		raw_spin_unlock_irq(&desc->lock);
+ 	}
+@@ -169,7 +169,7 @@ int probe_irq_off(unsigned long val)
+ 				nr_of_irqs++;
+ 			}
+ 			desc->istate &= ~IRQS_AUTODETECT;
+-			irq_shutdown(desc);
++			irq_shutdown_and_deactivate(desc);
+ 		}
+ 		raw_spin_unlock_irq(&desc->lock);
+ 	}
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index 811009ebacd4..0b70a5c8cfd4 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -314,6 +314,12 @@ void irq_shutdown(struct irq_desc *desc)
+ 		}
+ 		irq_state_clr_started(desc);
+ 	}
++}
++
++
++void irq_shutdown_and_deactivate(struct irq_desc *desc)
++{
++	irq_shutdown(desc);
+ 	/*
+ 	 * This must be called even if the interrupt was never started up,
+ 	 * because the activation can happen before the interrupt is
+diff --git a/kernel/irq/cpuhotplug.c b/kernel/irq/cpuhotplug.c
+index 5b1072e394b2..6c7ca2e983a5 100644
+--- a/kernel/irq/cpuhotplug.c
++++ b/kernel/irq/cpuhotplug.c
+@@ -116,7 +116,7 @@ static bool migrate_one_irq(struct irq_desc *desc)
+ 		 */
+ 		if (irqd_affinity_is_managed(d)) {
+ 			irqd_set_managed_shutdown(d);
+-			irq_shutdown(desc);
++			irq_shutdown_and_deactivate(desc);
+ 			return false;
+ 		}
+ 		affinity = cpu_online_mask;
+diff --git a/kernel/irq/internals.h b/kernel/irq/internals.h
+index e74e7eea76cf..c119aa1ffc40 100644
+--- a/kernel/irq/internals.h
++++ b/kernel/irq/internals.h
+@@ -80,6 +80,7 @@ extern int irq_activate_and_startup(struct irq_desc *desc, bool resend);
+ extern int irq_startup(struct irq_desc *desc, bool resend, bool force);
+ 
+ extern void irq_shutdown(struct irq_desc *desc);
++extern void irq_shutdown_and_deactivate(struct irq_desc *desc);
+ extern void irq_enable(struct irq_desc *desc);
+ extern void irq_disable(struct irq_desc *desc);
+ extern void irq_percpu_enable(struct irq_desc *desc, unsigned int cpu);
+* Unmerged path kernel/irq/manage.c
