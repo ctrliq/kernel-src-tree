@@ -29,7 +29,6 @@
 #define __ex(x) __kvm_handle_fault_on_reboot(x)
 
 static u8 sev_enc_bit;
-static int sev_flush_asids(void);
 static DECLARE_RWSEM(sev_deactivate_lock);
 static DEFINE_MUTEX(sev_bitmap_lock);
 unsigned int max_sev_asid;
