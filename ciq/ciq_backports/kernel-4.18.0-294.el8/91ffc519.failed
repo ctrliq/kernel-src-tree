@@ -1,0 +1,432 @@
+s390/zcrypt: introduce msg tracking in zcrypt functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 91ffc519c1997520ff3435ee227d86cfaa30d037
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/91ffc519.failed
+
+Introduce a new internal struct zcrypt_track with an retry counter
+field and a last return code field. Fill and update these fields at
+certain points during processing of an request/reply. This tracking
+info is then used to
+- avoid trying to resend the message forever. Now each message is
+  tried to be send TRACK_AGAIN_MAX (currently 10) times and then the
+  ioctl returns to userspace with errno EAGAIN.
+- avoid trying to resend the message on the very same card/domain. If
+  possible (more than one APQN with same quality) don't use the very
+  same qid as the previous attempt when again scheduling the request.
+  This is done by adding penalty weight values when the dispatching
+  takes place. There is a penalty TRACK_AGAIN_CARD_WEIGHT_PENALTY for
+  using the same card as previously and another penalty define
+  TRACK_AGAIN_QUEUE_WEIGHT_PENALTY to be considered when the same qid
+  as the previous sent attempt is calculated. Both values make it
+  harder to choose the very same card/domain but not impossible. For
+  example when only one APQN is available a resend can only address the
+  very same APQN.
+
+There are some more ideas for the future to extend the use of this
+tracking information. For example the last response code at NQAP and
+DQAP could be stored there, giving the possibility to extended tracing
+and debugging about requests failing to get processed properly.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 91ffc519c1997520ff3435ee227d86cfaa30d037)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/zcrypt_api.c
+diff --cc drivers/s390/crypto/zcrypt_api.c
+index 1d27c6c62e02,223e1c233278..000000000000
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@@ -807,7 -823,8 +833,12 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static long _zcrypt_send_cprb(struct ap_perms *perms,
+++=======
++ static long _zcrypt_send_cprb(bool userspace, struct ap_perms *perms,
++ 			      struct zcrypt_track *tr,
+++>>>>>>> 91ffc519c199 (s390/zcrypt: introduce msg tracking in zcrypt functions)
+  			      struct ica_xcRB *xcRB)
+  {
+  	struct zcrypt_card *zc, *pref_zc;
+@@@ -888,10 -913,10 +927,10 @@@
+  	if (*domain == AUTOSEL_DOM)
+  		*domain = AP_QID_QUEUE(qid);
+  
+ -	rc = pref_zq->ops->send_cprb(userspace, pref_zq, xcRB, &ap_msg);
+ +	rc = pref_zq->ops->send_cprb(pref_zq, xcRB, &ap_msg);
+  
+  	spin_lock(&zcrypt_list_lock);
+- 	zcrypt_drop_queue(pref_zc, pref_zq, mod, weight);
++ 	zcrypt_drop_queue(pref_zc, pref_zq, mod, wgt);
+  	spin_unlock(&zcrypt_list_lock);
+  
+  out:
+@@@ -903,7 -932,7 +946,11 @@@
+  
+  long zcrypt_send_cprb(struct ica_xcRB *xcRB)
+  {
+++<<<<<<< HEAD
+ +	return _zcrypt_send_cprb(&ap_perms, xcRB);
+++=======
++ 	return _zcrypt_send_cprb(false, &ap_perms, NULL, xcRB);
+++>>>>>>> 91ffc519c199 (s390/zcrypt: introduce msg tracking in zcrypt functions)
+  }
+  EXPORT_SYMBOL(zcrypt_send_cprb);
+  
+@@@ -934,7 -963,8 +981,12 @@@ static bool is_desired_ep11_queue(unsig
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static long _zcrypt_send_ep11_cprb(struct ap_perms *perms,
+++=======
++ static long _zcrypt_send_ep11_cprb(bool userspace, struct ap_perms *perms,
++ 				   struct zcrypt_track *tr,
+++>>>>>>> 91ffc519c199 (s390/zcrypt: introduce msg tracking in zcrypt functions)
+  				   struct ep11_urb *xcrb)
+  {
+  	struct zcrypt_card *zc, *pref_zc;
+@@@ -1025,10 -1063,10 +1085,10 @@@
+  	}
+  
+  	qid = pref_zq->queue->qid;
+ -	rc = pref_zq->ops->send_ep11_cprb(userspace, pref_zq, xcrb, &ap_msg);
+ +	rc = pref_zq->ops->send_ep11_cprb(pref_zq, xcrb, &ap_msg);
+  
+  	spin_lock(&zcrypt_list_lock);
+- 	zcrypt_drop_queue(pref_zc, pref_zq, mod, weight);
++ 	zcrypt_drop_queue(pref_zc, pref_zq, mod, wgt);
+  	spin_unlock(&zcrypt_list_lock);
+  
+  out_free:
+@@@ -1042,7 -1084,7 +1106,11 @@@ out
+  
+  long zcrypt_send_ep11_cprb(struct ep11_urb *xcrb)
+  {
+++<<<<<<< HEAD
+ +	return _zcrypt_send_ep11_cprb(&ap_perms, xcrb);
+++=======
++ 	return _zcrypt_send_ep11_cprb(false, &ap_perms, NULL, xcrb);
+++>>>>>>> 91ffc519c199 (s390/zcrypt: introduce msg tracking in zcrypt functions)
+  }
+  EXPORT_SYMBOL(zcrypt_send_ep11_cprb);
+  
+@@@ -1363,13 -1418,17 +1444,27 @@@ static int zsecsendcprb_ioctl(struct ap
+  	if (copy_from_user(&xcRB, uxcRB, sizeof(xcRB)))
+  		return -EFAULT;
+  	do {
+++<<<<<<< HEAD
+ +		rc = _zcrypt_send_cprb(perms, &xcRB);
+ +	} while (rc == -EAGAIN);
+ +	/* on failure: retry once again after a requested rescan */
+ +	if ((rc == -ENODEV) && (zcrypt_process_rescan()))
+ +		do {
+ +			rc = _zcrypt_send_cprb(perms, &xcRB);
+ +		} while (rc == -EAGAIN);
+++=======
++ 		rc = _zcrypt_send_cprb(true, perms, &tr, &xcRB);
++ 		if (rc == -EAGAIN)
++ 			tr.again_counter++;
++ 	} while (rc == -EAGAIN && tr.again_counter < TRACK_AGAIN_MAX);
++ 	/* on failure: retry once again after a requested rescan */
++ 	if ((rc == -ENODEV) && (zcrypt_process_rescan()))
++ 		do {
++ 			rc = _zcrypt_send_cprb(true, perms, &tr, &xcRB);
++ 			if (rc == -EAGAIN)
++ 				tr.again_counter++;
++ 		} while (rc == -EAGAIN && tr.again_counter < TRACK_AGAIN_MAX);
+++>>>>>>> 91ffc519c199 (s390/zcrypt: introduce msg tracking in zcrypt functions)
+  	if (rc)
+  		ZCRYPT_DBF(DBF_DEBUG, "ioctl ZSENDCPRB rc=%d status=0x%x\n",
+  			   rc, xcRB.status);
+@@@ -1387,13 -1448,17 +1484,27 @@@ static int zsendep11cprb_ioctl(struct a
+  	if (copy_from_user(&xcrb, uxcrb, sizeof(xcrb)))
+  		return -EFAULT;
+  	do {
+++<<<<<<< HEAD
+ +		rc = _zcrypt_send_ep11_cprb(perms, &xcrb);
+ +	} while (rc == -EAGAIN);
+ +	/* on failure: retry once again after a requested rescan */
+ +	if ((rc == -ENODEV) && (zcrypt_process_rescan()))
+ +		do {
+ +			rc = _zcrypt_send_ep11_cprb(perms, &xcrb);
+ +		} while (rc == -EAGAIN);
+++=======
++ 		rc = _zcrypt_send_ep11_cprb(true, perms, &tr, &xcrb);
++ 		if (rc == -EAGAIN)
++ 			tr.again_counter++;
++ 	} while (rc == -EAGAIN && tr.again_counter < TRACK_AGAIN_MAX);
++ 	/* on failure: retry once again after a requested rescan */
++ 	if ((rc == -ENODEV) && (zcrypt_process_rescan()))
++ 		do {
++ 			rc = _zcrypt_send_ep11_cprb(true, perms, &tr, &xcrb);
++ 			if (rc == -EAGAIN)
++ 				tr.again_counter++;
++ 		} while (rc == -EAGAIN && tr.again_counter < TRACK_AGAIN_MAX);
+++>>>>>>> 91ffc519c199 (s390/zcrypt: introduce msg tracking in zcrypt functions)
+  	if (rc)
+  		ZCRYPT_DBF(DBF_DEBUG, "ioctl ZSENDEP11CPRB rc=%d\n", rc);
+  	if (copy_to_user(uxcrb, &xcrb, sizeof(xcrb)))
+@@@ -1666,13 -1744,17 +1791,27 @@@ static long trans_xcRB32(struct ap_perm
+  	xcRB64.priority_window = xcRB32.priority_window;
+  	xcRB64.status = xcRB32.status;
+  	do {
+++<<<<<<< HEAD
+ +		rc = _zcrypt_send_cprb(perms, &xcRB64);
+ +	} while (rc == -EAGAIN);
+ +	/* on failure: retry once again after a requested rescan */
+ +	if ((rc == -ENODEV) && (zcrypt_process_rescan()))
+ +		do {
+ +			rc = _zcrypt_send_cprb(perms, &xcRB64);
+ +		} while (rc == -EAGAIN);
+++=======
++ 		rc = _zcrypt_send_cprb(true, perms, &tr, &xcRB64);
++ 		if (rc == -EAGAIN)
++ 			tr.again_counter++;
++ 	} while (rc == -EAGAIN && tr.again_counter < TRACK_AGAIN_MAX);
++ 	/* on failure: retry once again after a requested rescan */
++ 	if ((rc == -ENODEV) && (zcrypt_process_rescan()))
++ 		do {
++ 			rc = _zcrypt_send_cprb(true, perms, &tr, &xcRB64);
++ 			if (rc == -EAGAIN)
++ 				tr.again_counter++;
++ 		} while (rc == -EAGAIN && tr.again_counter < TRACK_AGAIN_MAX);
+++>>>>>>> 91ffc519c199 (s390/zcrypt: introduce msg tracking in zcrypt functions)
+  	xcRB32.reply_control_blk_length = xcRB64.reply_control_blk_length;
+  	xcRB32.reply_data_length = xcRB64.reply_data_length;
+  	xcRB32.status = xcRB64.status;
+* Unmerged path drivers/s390/crypto/zcrypt_api.c
+diff --git a/drivers/s390/crypto/zcrypt_api.h b/drivers/s390/crypto/zcrypt_api.h
+index 599e68bf53f7..306ed3b13d5e 100644
+--- a/drivers/s390/crypto/zcrypt_api.h
++++ b/drivers/s390/crypto/zcrypt_api.h
+@@ -55,6 +55,18 @@ enum crypto_ops {
+ 
+ struct zcrypt_queue;
+ 
++/* struct to hold tracking information for a userspace request/response */
++struct zcrypt_track {
++	int again_counter;		/* retry attempts counter */
++	int last_qid;			/* last qid used */
++	int last_rc;			/* last return code */
++};
++
++/* defines related to message tracking */
++#define TRACK_AGAIN_MAX 10
++#define TRACK_AGAIN_CARD_WEIGHT_PENALTY  1000
++#define TRACK_AGAIN_QUEUE_WEIGHT_PENALTY 10000
++
+ struct zcrypt_ops {
+ 	long (*rsa_modexpo)(struct zcrypt_queue *, struct ica_rsa_modexpo *);
+ 	long (*rsa_modexpo_crt)(struct zcrypt_queue *,
+@@ -82,7 +94,7 @@ struct zcrypt_card {
+ 	int min_mod_size;		/* Min number of bits. */
+ 	int max_mod_size;		/* Max number of bits. */
+ 	int max_exp_bit_length;
+-	int speed_rating[NUM_OPS];	/* Speed idx of crypto ops. */
++	const int *speed_rating;	/* Speed idx of crypto ops. */
+ 	atomic_t load;			/* Utilization of the crypto device */
+ 
+ 	int request_count;		/* # current requests. */
+diff --git a/drivers/s390/crypto/zcrypt_cex2a.c b/drivers/s390/crypto/zcrypt_cex2a.c
+index 7cbb384ec535..e6642bbdaaaa 100644
+--- a/drivers/s390/crypto/zcrypt_cex2a.c
++++ b/drivers/s390/crypto/zcrypt_cex2a.c
+@@ -94,8 +94,7 @@ static int zcrypt_cex2a_card_probe(struct ap_device *ap_dev)
+ 	if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX2A) {
+ 		zc->min_mod_size = CEX2A_MIN_MOD_SIZE;
+ 		zc->max_mod_size = CEX2A_MAX_MOD_SIZE;
+-		memcpy(zc->speed_rating, CEX2A_SPEED_IDX,
+-		       sizeof(CEX2A_SPEED_IDX));
++		zc->speed_rating = CEX2A_SPEED_IDX;
+ 		zc->max_exp_bit_length = CEX2A_MAX_MOD_SIZE;
+ 		zc->type_string = "CEX2A";
+ 		zc->user_space_type = ZCRYPT_CEX2A;
+@@ -108,8 +107,7 @@ static int zcrypt_cex2a_card_probe(struct ap_device *ap_dev)
+ 			zc->max_mod_size = CEX3A_MAX_MOD_SIZE;
+ 			zc->max_exp_bit_length = CEX3A_MAX_MOD_SIZE;
+ 		}
+-		memcpy(zc->speed_rating, CEX3A_SPEED_IDX,
+-		       sizeof(CEX3A_SPEED_IDX));
++		zc->speed_rating = CEX3A_SPEED_IDX;
+ 		zc->type_string = "CEX3A";
+ 		zc->user_space_type = ZCRYPT_CEX3A;
+ 	} else {
+diff --git a/drivers/s390/crypto/zcrypt_cex2c.c b/drivers/s390/crypto/zcrypt_cex2c.c
+index 704bdbfe1463..0614919bfc1d 100644
+--- a/drivers/s390/crypto/zcrypt_cex2c.c
++++ b/drivers/s390/crypto/zcrypt_cex2c.c
+@@ -239,8 +239,7 @@ static int zcrypt_cex2c_card_probe(struct ap_device *ap_dev)
+ 	case AP_DEVICE_TYPE_CEX2C:
+ 		zc->user_space_type = ZCRYPT_CEX2C;
+ 		zc->type_string = "CEX2C";
+-		memcpy(zc->speed_rating, CEX2C_SPEED_IDX,
+-		       sizeof(CEX2C_SPEED_IDX));
++		zc->speed_rating = CEX2C_SPEED_IDX;
+ 		zc->min_mod_size = CEX2C_MIN_MOD_SIZE;
+ 		zc->max_mod_size = CEX2C_MAX_MOD_SIZE;
+ 		zc->max_exp_bit_length = CEX2C_MAX_MOD_SIZE;
+@@ -248,8 +247,7 @@ static int zcrypt_cex2c_card_probe(struct ap_device *ap_dev)
+ 	case AP_DEVICE_TYPE_CEX3C:
+ 		zc->user_space_type = ZCRYPT_CEX3C;
+ 		zc->type_string = "CEX3C";
+-		memcpy(zc->speed_rating, CEX3C_SPEED_IDX,
+-		       sizeof(CEX3C_SPEED_IDX));
++		zc->speed_rating = CEX3C_SPEED_IDX;
+ 		zc->min_mod_size = CEX3C_MIN_MOD_SIZE;
+ 		zc->max_mod_size = CEX3C_MAX_MOD_SIZE;
+ 		zc->max_exp_bit_length = CEX3C_MAX_MOD_SIZE;
+diff --git a/drivers/s390/crypto/zcrypt_cex4.c b/drivers/s390/crypto/zcrypt_cex4.c
+index c1d79b30c5ee..424afe5537e9 100644
+--- a/drivers/s390/crypto/zcrypt_cex4.c
++++ b/drivers/s390/crypto/zcrypt_cex4.c
+@@ -382,31 +382,31 @@ static int zcrypt_cex4_card_probe(struct ap_device *ap_dev)
+ 	 * Normalized speed ratings per crypto adapter
+ 	 * MEX_1k, MEX_2k, MEX_4k, CRT_1k, CRT_2k, CRT_4k, RNG, SECKEY
+ 	 */
+-	static const int CEX4A_SPEED_IDX[] = {
++	static const int CEX4A_SPEED_IDX[NUM_OPS] = {
+ 		 14,  19, 249, 42, 228, 1458, 0, 0};
+-	static const int CEX5A_SPEED_IDX[] = {
++	static const int CEX5A_SPEED_IDX[NUM_OPS] = {
+ 		  8,   9,  20, 18,  66,	 458, 0, 0};
+-	static const int CEX6A_SPEED_IDX[] = {
++	static const int CEX6A_SPEED_IDX[NUM_OPS] = {
+ 		  6,   9,  20, 17,  65,	 438, 0, 0};
+-	static const int CEX7A_SPEED_IDX[] = {
++	static const int CEX7A_SPEED_IDX[NUM_OPS] = {
+ 		  6,   8,  17, 15,  54,	 362, 0, 0};
+ 
+-	static const int CEX4C_SPEED_IDX[] = {
++	static const int CEX4C_SPEED_IDX[NUM_OPS] = {
+ 		 59,  69, 308, 83, 278, 2204, 209, 40};
+ 	static const int CEX5C_SPEED_IDX[] = {
+ 		 24,  31,  50, 37,  90,	 479,  27, 10};
+-	static const int CEX6C_SPEED_IDX[] = {
++	static const int CEX6C_SPEED_IDX[NUM_OPS] = {
+ 		 16,  20,  32, 27,  77,	 455,  24,  9};
+-	static const int CEX7C_SPEED_IDX[] = {
++	static const int CEX7C_SPEED_IDX[NUM_OPS] = {
+ 		 14,  16,  26, 23,  64,	 376,  23,  8};
+ 
+-	static const int CEX4P_SPEED_IDX[] = {
++	static const int CEX4P_SPEED_IDX[NUM_OPS] = {
+ 		  0,   0,   0,	 0,   0,   0,	0,  50};
+-	static const int CEX5P_SPEED_IDX[] = {
++	static const int CEX5P_SPEED_IDX[NUM_OPS] = {
+ 		  0,   0,   0,	 0,   0,   0,	0,  10};
+-	static const int CEX6P_SPEED_IDX[] = {
++	static const int CEX6P_SPEED_IDX[NUM_OPS] = {
+ 		  0,   0,   0,	 0,   0,   0,	0,   9};
+-	static const int CEX7P_SPEED_IDX[] = {
++	static const int CEX7P_SPEED_IDX[NUM_OPS] = {
+ 		  0,   0,   0,	 0,   0,   0,	0,   8};
+ 
+ 	struct ap_card *ac = to_ap_card(&ap_dev->device);
+@@ -422,26 +422,22 @@ static int zcrypt_cex4_card_probe(struct ap_device *ap_dev)
+ 		if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX4) {
+ 			zc->type_string = "CEX4A";
+ 			zc->user_space_type = ZCRYPT_CEX4;
+-			memcpy(zc->speed_rating, CEX4A_SPEED_IDX,
+-			       sizeof(CEX4A_SPEED_IDX));
++			zc->speed_rating = CEX4A_SPEED_IDX;
+ 		} else if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX5) {
+ 			zc->type_string = "CEX5A";
+ 			zc->user_space_type = ZCRYPT_CEX5;
+-			memcpy(zc->speed_rating, CEX5A_SPEED_IDX,
+-			       sizeof(CEX5A_SPEED_IDX));
++			zc->speed_rating = CEX5A_SPEED_IDX;
+ 		} else if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX6) {
+ 			zc->type_string = "CEX6A";
+ 			zc->user_space_type = ZCRYPT_CEX6;
+-			memcpy(zc->speed_rating, CEX6A_SPEED_IDX,
+-			       sizeof(CEX6A_SPEED_IDX));
++			zc->speed_rating = CEX6A_SPEED_IDX;
+ 		} else {
+ 			zc->type_string = "CEX7A";
+ 			/* wrong user space type, just for compatibility
+ 			 * with the ZCRYPT_STATUS_MASK ioctl.
+ 			 */
+ 			zc->user_space_type = ZCRYPT_CEX6;
+-			memcpy(zc->speed_rating, CEX7A_SPEED_IDX,
+-			       sizeof(CEX7A_SPEED_IDX));
++			zc->speed_rating = CEX7A_SPEED_IDX;
+ 		}
+ 		zc->min_mod_size = CEX4A_MIN_MOD_SIZE;
+ 		if (ap_test_bit(&ac->functions, AP_FUNC_MEX4K) &&
+@@ -461,32 +457,28 @@ static int zcrypt_cex4_card_probe(struct ap_device *ap_dev)
+ 			 * just keep it for cca compatibility
+ 			 */
+ 			zc->user_space_type = ZCRYPT_CEX3C;
+-			memcpy(zc->speed_rating, CEX4C_SPEED_IDX,
+-			       sizeof(CEX4C_SPEED_IDX));
++			zc->speed_rating = CEX4C_SPEED_IDX;
+ 		} else if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX5) {
+ 			zc->type_string = "CEX5C";
+ 			/* wrong user space type, must be CEX5
+ 			 * just keep it for cca compatibility
+ 			 */
+ 			zc->user_space_type = ZCRYPT_CEX3C;
+-			memcpy(zc->speed_rating, CEX5C_SPEED_IDX,
+-			       sizeof(CEX5C_SPEED_IDX));
++			zc->speed_rating = CEX5C_SPEED_IDX;
+ 		} else if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX6) {
+ 			zc->type_string = "CEX6C";
+ 			/* wrong user space type, must be CEX6
+ 			 * just keep it for cca compatibility
+ 			 */
+ 			zc->user_space_type = ZCRYPT_CEX3C;
+-			memcpy(zc->speed_rating, CEX6C_SPEED_IDX,
+-			       sizeof(CEX6C_SPEED_IDX));
++			zc->speed_rating = CEX6C_SPEED_IDX;
+ 		} else {
+ 			zc->type_string = "CEX7C";
+ 			/* wrong user space type, must be CEX7
+ 			 * just keep it for cca compatibility
+ 			 */
+ 			zc->user_space_type = ZCRYPT_CEX3C;
+-			memcpy(zc->speed_rating, CEX7C_SPEED_IDX,
+-			       sizeof(CEX7C_SPEED_IDX));
++			zc->speed_rating = CEX7C_SPEED_IDX;
+ 		}
+ 		zc->min_mod_size = CEX4C_MIN_MOD_SIZE;
+ 		zc->max_mod_size = CEX4C_MAX_MOD_SIZE;
+@@ -495,26 +487,22 @@ static int zcrypt_cex4_card_probe(struct ap_device *ap_dev)
+ 		if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX4) {
+ 			zc->type_string = "CEX4P";
+ 			zc->user_space_type = ZCRYPT_CEX4;
+-			memcpy(zc->speed_rating, CEX4P_SPEED_IDX,
+-			       sizeof(CEX4P_SPEED_IDX));
++			zc->speed_rating = CEX4P_SPEED_IDX;
+ 		} else if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX5) {
+ 			zc->type_string = "CEX5P";
+ 			zc->user_space_type = ZCRYPT_CEX5;
+-			memcpy(zc->speed_rating, CEX5P_SPEED_IDX,
+-			       sizeof(CEX5P_SPEED_IDX));
++			zc->speed_rating = CEX5P_SPEED_IDX;
+ 		} else if (ac->ap_dev.device_type == AP_DEVICE_TYPE_CEX6) {
+ 			zc->type_string = "CEX6P";
+ 			zc->user_space_type = ZCRYPT_CEX6;
+-			memcpy(zc->speed_rating, CEX6P_SPEED_IDX,
+-			       sizeof(CEX6P_SPEED_IDX));
++			zc->speed_rating = CEX6P_SPEED_IDX;
+ 		} else {
+ 			zc->type_string = "CEX7P";
+ 			/* wrong user space type, just for compatibility
+ 			 * with the ZCRYPT_STATUS_MASK ioctl.
+ 			 */
+ 			zc->user_space_type = ZCRYPT_CEX6;
+-			memcpy(zc->speed_rating, CEX7P_SPEED_IDX,
+-			       sizeof(CEX7P_SPEED_IDX));
++			zc->speed_rating = CEX7P_SPEED_IDX;
+ 		}
+ 		zc->min_mod_size = CEX4C_MIN_MOD_SIZE;
+ 		zc->max_mod_size = CEX4C_MAX_MOD_SIZE;
