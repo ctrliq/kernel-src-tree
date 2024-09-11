@@ -1,0 +1,120 @@
+perf/x86: Implement immediate enforcement of /sys/devices/cpu/rdpmc value of 0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Anthony Steinhauser <asteinhauser@google.com>
+commit 405b45376de90b3027aaf8c4de035c6bb721fa7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/405b4537.failed
+
+When you successfully write 0 to /sys/devices/cpu/rdpmc, the RDPMC
+instruction should be disabled unconditionally and immediately (after you
+close the SYSFS file) by the documentation.
+
+Instead, in the current implementation the PMU must be reloaded which
+happens only eventually some time in the future. Only after that the RDPMC
+instruction becomes disabled (on ring 3) on the respective core.
+
+This change makes the treatment of the 0 value as blocking and as
+unconditional as the current treatment of the 2 value, only the CR4.PCE
+bit is naturally set to false instead of true.
+
+	Signed-off-by: Anthony Steinhauser <asteinhauser@google.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: acme@kernel.org
+Link: https://lkml.kernel.org/r/20191125054838.137615-1-asteinhauser@google.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 405b45376de90b3027aaf8c4de035c6bb721fa7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mmu_context.h
+diff --cc arch/x86/include/asm/mmu_context.h
+index 6659ebf49b5b,5f33924e200f..000000000000
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@@ -25,18 -26,20 +25,25 @@@ static inline void paravirt_activate_mm
+  
+  #ifdef CONFIG_PERF_EVENTS
+  
++ DECLARE_STATIC_KEY_FALSE(rdpmc_never_available_key);
+  DECLARE_STATIC_KEY_FALSE(rdpmc_always_available_key);
+  
+ -static inline void load_mm_cr4_irqsoff(struct mm_struct *mm)
+ +static inline void load_mm_cr4(struct mm_struct *mm)
+  {
+  	if (static_branch_unlikely(&rdpmc_always_available_key) ||
+++<<<<<<< HEAD
+ +	    atomic_read(&mm->context.perf_rdpmc_allowed))
+ +		cr4_set_bits(X86_CR4_PCE);
+++=======
++ 	    (!static_branch_unlikely(&rdpmc_never_available_key) &&
++ 	     atomic_read(&mm->context.perf_rdpmc_allowed)))
++ 		cr4_set_bits_irqsoff(X86_CR4_PCE);
+++>>>>>>> 405b45376de9 (perf/x86: Implement immediate enforcement of /sys/devices/cpu/rdpmc value of 0)
+  	else
+ -		cr4_clear_bits_irqsoff(X86_CR4_PCE);
+ +		cr4_clear_bits(X86_CR4_PCE);
+  }
+  #else
+ -static inline void load_mm_cr4_irqsoff(struct mm_struct *mm) {}
+ +static inline void load_mm_cr4(struct mm_struct *mm) {}
+  #endif
+  
+  #ifdef CONFIG_MODIFY_LDT_SYSCALL
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index d30ab079ecb7..a09f20cb600a 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -49,6 +49,7 @@ DEFINE_PER_CPU(struct cpu_hw_events, cpu_hw_events) = {
+ 	.enabled = 1,
+ };
+ 
++DEFINE_STATIC_KEY_FALSE(rdpmc_never_available_key);
+ DEFINE_STATIC_KEY_FALSE(rdpmc_always_available_key);
+ 
+ u64 __read_mostly hw_cache_event_ids
+@@ -2177,21 +2178,26 @@ static ssize_t set_attr_rdpmc(struct device *cdev,
+ 	if (x86_pmu.attr_rdpmc_broken)
+ 		return -ENOTSUPP;
+ 
+-	if ((val == 2) != (x86_pmu.attr_rdpmc == 2)) {
++	if (val != x86_pmu.attr_rdpmc) {
+ 		/*
+-		 * Changing into or out of always available, aka
+-		 * perf-event-bypassing mode.  This path is extremely slow,
++		 * Changing into or out of never available or always available,
++		 * aka perf-event-bypassing mode. This path is extremely slow,
+ 		 * but only root can trigger it, so it's okay.
+ 		 */
++		if (val == 0)
++			static_branch_inc(&rdpmc_never_available_key);
++		else if (x86_pmu.attr_rdpmc == 0)
++			static_branch_dec(&rdpmc_never_available_key);
++
+ 		if (val == 2)
+ 			static_branch_inc(&rdpmc_always_available_key);
+-		else
++		else if (x86_pmu.attr_rdpmc == 2)
+ 			static_branch_dec(&rdpmc_always_available_key);
++
+ 		on_each_cpu(refresh_pce, NULL, 1);
++		x86_pmu.attr_rdpmc = val;
+ 	}
+ 
+-	x86_pmu.attr_rdpmc = val;
+-
+ 	return count;
+ }
+ 
+* Unmerged path arch/x86/include/asm/mmu_context.h
