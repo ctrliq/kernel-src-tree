@@ -1,0 +1,145 @@
+bpf: sockmap: Only check ULP for TCP sockets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Lorenz Bauer <lmb@cloudflare.com>
+commit 7b70973d7edb2f005511102d5a2e0116464a46a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7b70973d.failed
+
+The sock map code checks that a socket does not have an active upper
+layer protocol before inserting it into the map. This requires casting
+via inet_csk, which isn't valid for UDP sockets.
+
+Guard checks for ULP by checking inet_sk(sk)->is_icsk first.
+
+	Signed-off-by: Lorenz Bauer <lmb@cloudflare.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200309111243.6982-2-lmb@cloudflare.com
+(cherry picked from commit 7b70973d7edb2f005511102d5a2e0116464a46a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/inet_connection_sock.h
+diff --cc include/net/inet_connection_sock.h
+index b1309c09372e,a3f076befa4f..000000000000
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@@ -321,4 -310,35 +321,38 @@@ int inet_csk_compat_setsockopt(struct s
+  			       char __user *optval, unsigned int optlen);
+  
+  struct dst_entry *inet_csk_update_pmtu(struct sock *sk, u32 mtu);
+++<<<<<<< HEAD
+++=======
++ 
++ #define TCP_PINGPONG_THRESH	3
++ 
++ static inline void inet_csk_enter_pingpong_mode(struct sock *sk)
++ {
++ 	inet_csk(sk)->icsk_ack.pingpong = TCP_PINGPONG_THRESH;
++ }
++ 
++ static inline void inet_csk_exit_pingpong_mode(struct sock *sk)
++ {
++ 	inet_csk(sk)->icsk_ack.pingpong = 0;
++ }
++ 
++ static inline bool inet_csk_in_pingpong_mode(struct sock *sk)
++ {
++ 	return inet_csk(sk)->icsk_ack.pingpong >= TCP_PINGPONG_THRESH;
++ }
++ 
++ static inline void inet_csk_inc_pingpong_cnt(struct sock *sk)
++ {
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 
++ 	if (icsk->icsk_ack.pingpong < U8_MAX)
++ 		icsk->icsk_ack.pingpong++;
++ }
++ 
++ static inline bool inet_csk_has_ulp(struct sock *sk)
++ {
++ 	return inet_sk(sk)->is_icsk && !!inet_csk(sk)->icsk_ulp_ops;
++ }
++ 
+++>>>>>>> 7b70973d7edb (bpf: sockmap: Only check ULP for TCP sockets)
+  #endif /* _INET_CONNECTION_SOCK_H */
+diff --git a/include/linux/skmsg.h b/include/linux/skmsg.h
+index 5ba036ddfb94..cfdbd1248344 100644
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -358,7 +358,13 @@ static inline void sk_psock_restore_proto(struct sock *sk,
+ 					  struct sk_psock *psock)
+ {
+ 	sk->sk_prot->unhash = psock->saved_unhash;
+-	tcp_update_ulp(sk, psock->sk_proto, psock->saved_write_space);
++	if (inet_csk_has_ulp(sk)) {
++		tcp_update_ulp(sk, psock->sk_proto, psock->saved_write_space);
++	} else {
++		sk->sk_write_space = psock->saved_write_space;
++		/* Pairs with lockless read in sk_clone_lock() */
++		WRITE_ONCE(sk->sk_prot, psock->sk_proto);
++	}
+ }
+ 
+ static inline void sk_psock_set_state(struct sk_psock *psock,
+* Unmerged path include/net/inet_connection_sock.h
+diff --git a/net/core/sock_map.c b/net/core/sock_map.c
+index 870536602474..5585c9acb307 100644
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -390,7 +390,6 @@ static int sock_map_update_common(struct bpf_map *map, u32 idx,
+ 				  struct sock *sk, u64 flags)
+ {
+ 	struct bpf_stab *stab = container_of(map, struct bpf_stab, map);
+-	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	struct sk_psock_link *link;
+ 	struct sk_psock *psock;
+ 	struct sock *osk;
+@@ -401,7 +400,7 @@ static int sock_map_update_common(struct bpf_map *map, u32 idx,
+ 		return -EINVAL;
+ 	if (unlikely(idx >= map->max_entries))
+ 		return -E2BIG;
+-	if (unlikely(rcu_access_pointer(icsk->icsk_ulp_data)))
++	if (inet_csk_has_ulp(sk))
+ 		return -EINVAL;
+ 
+ 	link = sk_psock_init_link();
+@@ -744,7 +743,6 @@ static int sock_hash_update_common(struct bpf_map *map, void *key,
+ 				   struct sock *sk, u64 flags)
+ {
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+-	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	u32 key_size = map->key_size, hash;
+ 	struct bpf_htab_elem *elem, *elem_new;
+ 	struct bpf_htab_bucket *bucket;
+@@ -755,7 +753,7 @@ static int sock_hash_update_common(struct bpf_map *map, void *key,
+ 	WARN_ON_ONCE(!rcu_read_lock_held());
+ 	if (unlikely(flags > BPF_EXIST))
+ 		return -EINVAL;
+-	if (unlikely(icsk->icsk_ulp_data))
++	if (inet_csk_has_ulp(sk))
+ 		return -EINVAL;
+ 
+ 	link = sk_psock_init_link();
+diff --git a/net/ipv4/tcp_ulp.c b/net/ipv4/tcp_ulp.c
+index ba7754e19c30..6cae9e21420b 100644
+--- a/net/ipv4/tcp_ulp.c
++++ b/net/ipv4/tcp_ulp.c
+@@ -100,13 +100,6 @@ void tcp_update_ulp(struct sock *sk, struct proto *proto,
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 
+-	if (!icsk->icsk_ulp_ops) {
+-		sk->sk_write_space = write_space;
+-		/* Pairs with lockless read in sk_clone_lock() */
+-		WRITE_ONCE(sk->sk_prot, proto);
+-		return;
+-	}
+-
+ 	if (icsk->icsk_ulp_ops->update)
+ 		icsk->icsk_ulp_ops->update(sk, proto, write_space);
+ }
