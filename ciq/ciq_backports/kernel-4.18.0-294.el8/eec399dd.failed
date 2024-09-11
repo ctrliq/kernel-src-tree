@@ -1,0 +1,324 @@
+x86/vdso: Move VDSO clocksource state tracking to callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit eec399dd862762b9594df3659f15839a4e12f17a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/eec399dd.failed
+
+All architectures which use the generic VDSO code have their own storage
+for the VDSO clock mode. That's pointless and just requires duplicate code.
+
+X86 abuses the function which retrieves the architecture specific clock
+mode storage to mark the clocksource as used in the VDSO. That's silly
+because this is invoked on every tick when the VDSO data is updated.
+
+Move this functionality to the clocksource::enable() callback so it gets
+invoked once when the clocksource is installed. This allows to make the
+clock mode storage generic.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>  (Hyper-V parts)
+	Reviewed-by: Vincenzo Frascino <vincenzo.frascino@arm.com> (VDSO parts)
+	Acked-by: Juergen Gross <jgross@suse.com> (Xen parts)
+Link: https://lkml.kernel.org/r/20200207124402.934519777@linutronix.de
+
+
+(cherry picked from commit eec399dd862762b9594df3659f15839a4e12f17a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/vdso/vma.c
+#	arch/x86/include/asm/vdso/vsyscall.h
+#	arch/x86/include/asm/vgtod.h
+diff --cc arch/x86/entry/vdso/vma.c
+index 6a5ebfebd133,cce3e809f17e..000000000000
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@@ -27,6 -27,19 +27,22 @@@
+  #include <asm/cpufeature.h>
+  #include <clocksource/hyperv_timer.h>
+  
+++<<<<<<< HEAD
+++=======
++ #undef _ASM_X86_VVAR_H
++ #define EMIT_VVAR(name, offset)	\
++ 	const size_t name ## _offset = offset;
++ #include <asm/vvar.h>
++ 
++ struct vdso_data *arch_get_vdso_data(void *vvar_page)
++ {
++ 	return (struct vdso_data *)(vvar_page + _vdso_data_offset);
++ }
++ #undef EMIT_VVAR
++ 
++ unsigned int vclocks_used __read_mostly;
++ 
+++>>>>>>> eec399dd8627 (x86/vdso: Move VDSO clocksource state tracking to callback)
+  #if defined(CONFIG_X86_64)
+  unsigned int __read_mostly vdso64_enabled = 1;
+  #endif
+diff --cc arch/x86/include/asm/vgtod.h
+index 913a133f8e6f,fc8e4cd342cc..000000000000
+--- a/arch/x86/include/asm/vgtod.h
++++ b/arch/x86/include/asm/vgtod.h
+@@@ -13,81 -15,4 +13,84 @@@ typedef u64 gtod_long_t
+  typedef unsigned long gtod_long_t;
+  #endif
+  
+++<<<<<<< HEAD
+ +/*
+ + * There is one of these objects in the vvar page for each
+ + * vDSO-accelerated clockid.  For high-resolution clocks, this encodes
+ + * the time corresponding to vsyscall_gtod_data.cycle_last.  For coarse
+ + * clocks, this encodes the actual time.
+ + *
+ + * To confuse the reader, for high-resolution clocks, nsec is left-shifted
+ + * by vsyscall_gtod_data.shift.
+ + */
+ +struct vgtod_ts {
+ +	u64		sec;
+ +	u64		nsec;
+ +};
+ +
+ +#define VGTOD_BASES	(CLOCK_TAI + 1)
+ +#define VGTOD_HRES	(BIT(CLOCK_REALTIME) | BIT(CLOCK_MONOTONIC) | BIT(CLOCK_TAI))
+ +#define VGTOD_COARSE	(BIT(CLOCK_REALTIME_COARSE) | BIT(CLOCK_MONOTONIC_COARSE))
+ +
+ +/*
+ + * vsyscall_gtod_data will be accessed by 32 and 64 bit code at the same time
+ + * so be carefull by modifying this structure.
+ + */
+ +struct vsyscall_gtod_data {
+ +	unsigned int	seq;
+ +
+ +	int		vclock_mode;
+ +	u64		cycle_last;
+ +	u64		mask;
+ +	u32		mult;
+ +	u32		shift;
+ +
+ +	struct vgtod_ts	basetime[VGTOD_BASES];
+ +
+ +	int		tz_minuteswest;
+ +	int		tz_dsttime;
+ +};
+ +extern struct vsyscall_gtod_data vsyscall_gtod_data;
+ +
+ +extern int vclocks_used;
+ +static inline bool vclock_was_used(int vclock)
+ +{
+ +	return READ_ONCE(vclocks_used) & (1 << vclock);
+ +}
+ +
+ +static inline unsigned int gtod_read_begin(const struct vsyscall_gtod_data *s)
+ +{
+ +	unsigned int ret;
+ +
+ +repeat:
+ +	ret = READ_ONCE(s->seq);
+ +	if (unlikely(ret & 1)) {
+ +		cpu_relax();
+ +		goto repeat;
+ +	}
+ +	smp_rmb();
+ +	return ret;
+ +}
+ +
+ +static inline int gtod_read_retry(const struct vsyscall_gtod_data *s,
+ +				  unsigned int start)
+ +{
+ +	smp_rmb();
+ +	return unlikely(s->seq != start);
+ +}
+ +
+ +static inline void gtod_write_begin(struct vsyscall_gtod_data *s)
+ +{
+ +	++s->seq;
+ +	smp_wmb();
+ +}
+ +
+ +static inline void gtod_write_end(struct vsyscall_gtod_data *s)
+ +{
+ +	smp_wmb();
+ +	++s->seq;
+ +}
+ +
+++=======
+++>>>>>>> eec399dd8627 (x86/vdso: Move VDSO clocksource state tracking to callback)
+  #endif /* _ASM_X86_VGTOD_H */
+* Unmerged path arch/x86/include/asm/vdso/vsyscall.h
+* Unmerged path arch/x86/entry/vdso/vma.c
+diff --git a/arch/x86/include/asm/clocksource.h b/arch/x86/include/asm/clocksource.h
+index dc4cfc888d6d..2450d6e02a5d 100644
+--- a/arch/x86/include/asm/clocksource.h
++++ b/arch/x86/include/asm/clocksource.h
+@@ -14,4 +14,16 @@ struct arch_clocksource_data {
+ 	int vclock_mode;
+ };
+ 
++extern unsigned int vclocks_used;
++
++static inline bool vclock_was_used(int vclock)
++{
++	return READ_ONCE(vclocks_used) & (1U << vclock);
++}
++
++static inline void vclocks_set_used(unsigned int which)
++{
++	WRITE_ONCE(vclocks_used, READ_ONCE(vclocks_used) | (1 << which));
++}
++
+ #endif /* _ASM_X86_CLOCKSOURCE_H */
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+index d893b0b8985e..9e7e391aee18 100644
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -50,6 +50,8 @@ typedef int (*hyperv_fill_flush_list_func)(
+ 	wrmsrl(HV_X64_MSR_REFERENCE_TSC, val)
+ #define hv_set_clocksource_vdso(val) \
+ 	((val).archdata.vclock_mode = VCLOCK_HVCLOCK)
++#define hv_enable_vdso_clocksource() \
++	vclocks_set_used(VCLOCK_HVCLOCK);
+ #define hv_get_raw_timer() rdtsc_ordered()
+ 
+ void hyperv_callback_vector(void);
+* Unmerged path arch/x86/include/asm/vdso/vsyscall.h
+* Unmerged path arch/x86/include/asm/vgtod.h
+diff --git a/arch/x86/kernel/kvmclock.c b/arch/x86/kernel/kvmclock.c
+index 04021fb87d29..491caa51f96c 100644
+--- a/arch/x86/kernel/kvmclock.c
++++ b/arch/x86/kernel/kvmclock.c
+@@ -159,12 +159,19 @@ bool kvm_check_and_clear_guest_paused(void)
+ 	return ret;
+ }
+ 
++static int kvm_cs_enable(struct clocksource *cs)
++{
++	vclocks_set_used(VCLOCK_PVCLOCK);
++	return 0;
++}
++
+ struct clocksource kvm_clock = {
+ 	.name	= "kvm-clock",
+ 	.read	= kvm_clock_get_cycles,
+ 	.rating	= 400,
+ 	.mask	= CLOCKSOURCE_MASK(64),
+ 	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
++	.enable	= kvm_cs_enable,
+ };
+ EXPORT_SYMBOL_GPL(kvm_clock);
+ 
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index 0c4803b7fa8d..c47766781e11 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -1090,17 +1090,24 @@ static void tsc_cs_tick_stable(struct clocksource *cs)
+ 		sched_clock_tick_stable();
+ }
+ 
++static int tsc_cs_enable(struct clocksource *cs)
++{
++	vclocks_set_used(VCLOCK_TSC);
++	return 0;
++}
++
+ /*
+  * .mask MUST be CLOCKSOURCE_MASK(64). See comment above read_tsc()
+  */
+ static struct clocksource clocksource_tsc_early = {
+-	.name                   = "tsc-early",
+-	.rating                 = 299,
+-	.read                   = read_tsc,
+-	.mask                   = CLOCKSOURCE_MASK(64),
+-	.flags                  = CLOCK_SOURCE_IS_CONTINUOUS |
++	.name			= "tsc-early",
++	.rating			= 299,
++	.read			= read_tsc,
++	.mask			= CLOCKSOURCE_MASK(64),
++	.flags			= CLOCK_SOURCE_IS_CONTINUOUS |
+ 				  CLOCK_SOURCE_MUST_VERIFY,
+-	.archdata               = { .vclock_mode = VCLOCK_TSC },
++	.archdata		= { .vclock_mode = VCLOCK_TSC },
++	.enable			= tsc_cs_enable,
+ 	.resume			= tsc_resume,
+ 	.mark_unstable		= tsc_cs_mark_unstable,
+ 	.tick_stable		= tsc_cs_tick_stable,
+@@ -1113,14 +1120,15 @@ static struct clocksource clocksource_tsc_early = {
+  * been found good.
+  */
+ static struct clocksource clocksource_tsc = {
+-	.name                   = "tsc",
+-	.rating                 = 300,
+-	.read                   = read_tsc,
+-	.mask                   = CLOCKSOURCE_MASK(64),
+-	.flags                  = CLOCK_SOURCE_IS_CONTINUOUS |
++	.name			= "tsc",
++	.rating			= 300,
++	.read			= read_tsc,
++	.mask			= CLOCKSOURCE_MASK(64),
++	.flags			= CLOCK_SOURCE_IS_CONTINUOUS |
+ 				  CLOCK_SOURCE_VALID_FOR_HRES |
+ 				  CLOCK_SOURCE_MUST_VERIFY,
+-	.archdata               = { .vclock_mode = VCLOCK_TSC },
++	.archdata		= { .vclock_mode = VCLOCK_TSC },
++	.enable			= tsc_cs_enable,
+ 	.resume			= tsc_resume,
+ 	.mark_unstable		= tsc_cs_mark_unstable,
+ 	.tick_stable		= tsc_cs_tick_stable,
+diff --git a/arch/x86/xen/time.c b/arch/x86/xen/time.c
+index e0f1bcf01d63..33cea1f81031 100644
+--- a/arch/x86/xen/time.c
++++ b/arch/x86/xen/time.c
+@@ -138,12 +138,19 @@ static struct notifier_block xen_pvclock_gtod_notifier = {
+ 	.notifier_call = xen_pvclock_gtod_notify,
+ };
+ 
++static int xen_cs_enable(struct clocksource *cs)
++{
++	vclocks_set_used(VCLOCK_PVCLOCK);
++	return 0;
++}
++
+ static struct clocksource xen_clocksource __read_mostly = {
+-	.name = "xen",
+-	.rating = 400,
+-	.read = xen_clocksource_get_cycles,
+-	.mask = ~0,
+-	.flags = CLOCK_SOURCE_IS_CONTINUOUS,
++	.name	= "xen",
++	.rating	= 400,
++	.read	= xen_clocksource_get_cycles,
++	.mask	= CLOCKSOURCE_MASK(64),
++	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
++	.enable = xen_cs_enable,
+ };
+ 
+ /*
+diff --git a/drivers/clocksource/hyperv_timer.c b/drivers/clocksource/hyperv_timer.c
+index 001edab26c77..ba04cb381cd3 100644
+--- a/drivers/clocksource/hyperv_timer.c
++++ b/drivers/clocksource/hyperv_timer.c
+@@ -370,6 +370,12 @@ static void resume_hv_clock_tsc(struct clocksource *arg)
+ 	hv_set_reference_tsc(tsc_msr);
+ }
+ 
++static int hv_cs_enable(struct clocksource *cs)
++{
++	hv_enable_vdso_clocksource();
++	return 0;
++}
++
+ static struct clocksource hyperv_cs_tsc = {
+ 	.name	= "hyperv_clocksource_tsc_page",
+ 	.rating	= 250,
+@@ -378,6 +384,7 @@ static struct clocksource hyperv_cs_tsc = {
+ 	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
+ 	.suspend= suspend_hv_clock_tsc,
+ 	.resume	= resume_hv_clock_tsc,
++	.enable = hv_cs_enable,
+ };
+ 
+ static u64 notrace read_hv_clock_msr(void)
