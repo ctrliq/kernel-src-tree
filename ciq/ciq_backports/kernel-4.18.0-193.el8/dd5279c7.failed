@@ -1,0 +1,357 @@
+drm/i915: Fix PCH reference clock for FDI on HSW/BDW
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit dd5279c71405533d4ddbb9453effc60f0f5bf211
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/dd5279c7.failed
+
+The change to skip the PCH reference initialization during fastboot
+did end up breaking FDI. To fix that let's try to do the PCH reference
+init whenever we're disabling a DPLL that was using said reference
+previously.
+
+	Cc: stable@vger.kernel.org
+	Tested-by: Andrija <akijo97@gmail.com>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=112084
+Fixes: b16c7ed95caf ("drm/i915: Do not touch the PCH SSC reference if a PLL is using it")
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20191022185643.1483-1-ville.syrjala@linux.intel.com
+	Reviewed-by: Imre Deak <imre.deak@intel.com>
+(cherry picked from commit dd5279c71405533d4ddbb9453effc60f0f5bf211)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_drv.h
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/i915_drv.h
+index 2a3ce817328c,8622b4567aa5..000000000000
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@@ -1857,204 -1334,29 +1857,211 @@@ struct drm_i915_private 
+  
+  	struct drm_private_obj bw_obj;
+  
+ -	struct intel_runtime_pm runtime_pm;
+ +	struct i915_runtime_pm runtime_pm;
+  
+ -	struct i915_perf perf;
+ +	struct {
+ +		bool initialized;
+  
+ -	/* Abstract the submission mechanism (legacy ringbuffer or execlists) away */
+ -	struct intel_gt gt;
+ +		struct kobject *metrics_kobj;
+ +		struct ctl_table_header *sysctl_header;
+ +
+ +		/*
+ +		 * Lock associated with adding/modifying/removing OA configs
+ +		 * in dev_priv->perf.metrics_idr.
+ +		 */
+ +		struct mutex metrics_lock;
+ +
+++<<<<<<< HEAD
+ +		/*
+ +		 * List of dynamic configurations, you need to hold
+ +		 * dev_priv->perf.metrics_lock to access it.
+ +		 */
+ +		struct idr metrics_idr;
+ +
+ +		/*
+ +		 * Lock associated with anything below within this structure
+ +		 * except exclusive_stream.
+ +		 */
+ +		struct mutex lock;
+ +		struct list_head streams;
+ +
+ +		struct {
+ +			/*
+ +			 * The stream currently using the OA unit. If accessed
+ +			 * outside a syscall associated to its file
+ +			 * descriptor, you need to hold
+ +			 * dev_priv->drm.struct_mutex.
+ +			 */
+ +			struct i915_perf_stream *exclusive_stream;
+ +
+ +			struct intel_context *pinned_ctx;
+ +			u32 specific_ctx_id;
+ +			u32 specific_ctx_id_mask;
+ +
+ +			struct hrtimer poll_check_timer;
+ +			wait_queue_head_t poll_wq;
+ +			bool pollin;
+ +
+ +			/**
+ +			 * For rate limiting any notifications of spurious
+ +			 * invalid OA reports
+ +			 */
+ +			struct ratelimit_state spurious_report_rs;
+ +
+ +			bool periodic;
+ +			int period_exponent;
+ +
+ +			struct i915_oa_config test_config;
+ +
+ +			struct {
+ +				struct i915_vma *vma;
+ +				u8 *vaddr;
+ +				u32 last_ctx_id;
+ +				int format;
+ +				int format_size;
+ +
+ +				/**
+ +				 * Locks reads and writes to all head/tail state
+ +				 *
+ +				 * Consider: the head and tail pointer state
+ +				 * needs to be read consistently from a hrtimer
+ +				 * callback (atomic context) and read() fop
+ +				 * (user context) with tail pointer updates
+ +				 * happening in atomic context and head updates
+ +				 * in user context and the (unlikely)
+ +				 * possibility of read() errors needing to
+ +				 * reset all head/tail state.
+ +				 *
+ +				 * Note: Contention or performance aren't
+ +				 * currently a significant concern here
+ +				 * considering the relatively low frequency of
+ +				 * hrtimer callbacks (5ms period) and that
+ +				 * reads typically only happen in response to a
+ +				 * hrtimer event and likely complete before the
+ +				 * next callback.
+ +				 *
+ +				 * Note: This lock is not held *while* reading
+ +				 * and copying data to userspace so the value
+ +				 * of head observed in htrimer callbacks won't
+ +				 * represent any partial consumption of data.
+ +				 */
+ +				spinlock_t ptr_lock;
+ +
+ +				/**
+ +				 * One 'aging' tail pointer and one 'aged'
+ +				 * tail pointer ready to used for reading.
+ +				 *
+ +				 * Initial values of 0xffffffff are invalid
+ +				 * and imply that an update is required
+ +				 * (and should be ignored by an attempted
+ +				 * read)
+ +				 */
+ +				struct {
+ +					u32 offset;
+ +				} tails[2];
+ +
+ +				/**
+ +				 * Index for the aged tail ready to read()
+ +				 * data up to.
+ +				 */
+ +				unsigned int aged_tail_idx;
+ +
+ +				/**
+ +				 * A monotonic timestamp for when the current
+ +				 * aging tail pointer was read; used to
+ +				 * determine when it is old enough to trust.
+ +				 */
+ +				u64 aging_timestamp;
+ +
+ +				/**
+ +				 * Although we can always read back the head
+ +				 * pointer register, we prefer to avoid
+ +				 * trusting the HW state, just to avoid any
+ +				 * risk that some hardware condition could
+ +				 * somehow bump the head pointer unpredictably
+ +				 * and cause us to forward the wrong OA buffer
+ +				 * data to userspace.
+ +				 */
+ +				u32 head;
+ +			} oa_buffer;
+ +
+ +			u32 gen7_latched_oastatus1;
+ +			u32 ctx_oactxctrl_offset;
+ +			u32 ctx_flexeu0_offset;
+ +
+ +			/**
+ +			 * The RPT_ID/reason field for Gen8+ includes a bit
+ +			 * to determine if the CTX ID in the report is valid
+ +			 * but the specific bit differs between Gen 8 and 9
+ +			 */
+ +			u32 gen8_valid_ctx_bit;
+ +
+ +			struct i915_oa_ops ops;
+ +			const struct i915_oa_format *oa_formats;
+ +		} oa;
+ +	} perf;
+  
+ +	/* Abstract the submission mechanism (legacy ringbuffer or execlists) away */
+  	struct {
+ -		struct notifier_block pm_notifier;
+ +		void (*resume)(struct drm_i915_private *);
+ +		void (*cleanup_engine)(struct intel_engine_cs *engine);
+ +
+ +		struct i915_gt_timelines {
+ +			struct mutex mutex; /* protects list, tainted by GPU */
+ +			struct list_head active_list;
+ +
+ +			/* Pack multiple timelines' seqnos into the same page */
+ +			spinlock_t hwsp_lock;
+ +			struct list_head hwsp_free_list;
+ +		} timelines;
+ +
+ +		struct list_head active_rings;
+ +		struct list_head closed_vma;
+ +		u32 active_requests;
+ +
+ +		/**
+ +		 * Is the GPU currently considered idle, or busy executing
+ +		 * userspace requests? Whilst idle, we allow runtime power
+ +		 * management to power down the hardware and display clocks.
+ +		 * In order to reduce the effect on performance, there
+ +		 * is a slight delay before we do so.
+ +		 */
+ +		intel_wakeref_t awake;
+  
+ -		struct i915_gem_contexts {
+ -			spinlock_t lock; /* locks list */
+ -			struct list_head list;
+ +		/**
+ +		 * The number of times we have woken up.
+ +		 */
+ +		unsigned int epoch;
+ +#define I915_EPOCH_INVALID 0
+ +
+ +		/**
+ +		 * We leave the user IRQ off as much as possible,
+ +		 * but this means that requests will finish and never
+ +		 * be retired once the system goes idle. Set a timer to
+ +		 * fire periodically while the ring is running. When it
+ +		 * fires, go retire requests.
+ +		 */
+ +		struct delayed_work retire_work;
+ +
+ +		/**
+ +		 * When we detect an idle GPU, we want to turn on
+ +		 * powersaving features. So once we see that there
+ +		 * are no more requests outstanding and no more
+ +		 * arrive within a small period of time, we fire
+ +		 * off the idle_work.
+ +		 */
+ +		struct delayed_work idle_work;
+  
+ -			struct llist_head free_list;
+ -			struct work_struct free_work;
+ -		} contexts;
+ -	} gem;
+ +		ktime_t last_init_time;
+  
+ +		struct i915_vma *scratch;
+ +	} gt;
+++=======
++ 	u8 pch_ssc_use;
++ 
++ 	/* For i915gm/i945gm vblank irq workaround */
++ 	u8 vblank_enabled;
+++>>>>>>> dd5279c71405 (drm/i915: Fix PCH reference clock for FDI on HSW/BDW)
+  
+  	/* perform PHY state sanity checks? */
+  	bool chv_phy_assert[2];
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 9a6ac3d8208b,cbf9cf30050c..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -9008,7 -9393,46 +9008,11 @@@ static void lpt_bend_clkout_dp(struct d
+  static void lpt_init_pch_refclk(struct drm_i915_private *dev_priv)
+  {
+  	struct intel_encoder *encoder;
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_display.c
+ +	bool has_vga = false;
+++=======
++ 	bool has_fdi = false;
+++>>>>>>> dd5279c71405 (drm/i915: Fix PCH reference clock for FDI on HSW/BDW):drivers/gpu/drm/i915/display/intel_display.c
+  
+  	for_each_intel_encoder(&dev_priv->drm, encoder) {
+  		switch (encoder->type) {
+@@@ -9020,7 -9444,42 +9024,46 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_display.c
+ +	if (has_vga) {
+++=======
++ 	/*
++ 	 * The BIOS may have decided to use the PCH SSC
++ 	 * reference so we must not disable it until the
++ 	 * relevant PLLs have stopped relying on it. We'll
++ 	 * just leave the PCH SSC reference enabled in case
++ 	 * any active PLL is using it. It will get disabled
++ 	 * after runtime suspend if we don't have FDI.
++ 	 *
++ 	 * TODO: Move the whole reference clock handling
++ 	 * to the modeset sequence proper so that we can
++ 	 * actually enable/disable/reconfigure these things
++ 	 * safely. To do that we need to introduce a real
++ 	 * clock hierarchy. That would also allow us to do
++ 	 * clock bending finally.
++ 	 */
++ 	dev_priv->pch_ssc_use = 0;
++ 
++ 	if (spll_uses_pch_ssc(dev_priv)) {
++ 		DRM_DEBUG_KMS("SPLL using PCH SSC\n");
++ 		dev_priv->pch_ssc_use |= BIT(DPLL_ID_SPLL);
++ 	}
++ 
++ 	if (wrpll_uses_pch_ssc(dev_priv, DPLL_ID_WRPLL1)) {
++ 		DRM_DEBUG_KMS("WRPLL1 using PCH SSC\n");
++ 		dev_priv->pch_ssc_use |= BIT(DPLL_ID_WRPLL1);
++ 	}
++ 
++ 	if (wrpll_uses_pch_ssc(dev_priv, DPLL_ID_WRPLL2)) {
++ 		DRM_DEBUG_KMS("WRPLL2 using PCH SSC\n");
++ 		dev_priv->pch_ssc_use |= BIT(DPLL_ID_WRPLL2);
++ 	}
++ 
++ 	if (dev_priv->pch_ssc_use)
++ 		return;
++ 
++ 	if (has_fdi) {
+++>>>>>>> dd5279c71405 (drm/i915: Fix PCH reference clock for FDI on HSW/BDW):drivers/gpu/drm/i915/display/intel_display.c
+  		lpt_bend_clkout_dp(dev_priv, 0);
+  		lpt_enable_clkout_dp(dev_priv, true, true);
+  	} else {
+* Unmerged path drivers/gpu/drm/i915/i915_drv.h
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
+diff --git a/drivers/gpu/drm/i915/intel_dpll_mgr.c b/drivers/gpu/drm/i915/intel_dpll_mgr.c
+index e4ec73d415d9..166825077f6a 100644
+--- a/drivers/gpu/drm/i915/intel_dpll_mgr.c
++++ b/drivers/gpu/drm/i915/intel_dpll_mgr.c
+@@ -495,16 +495,31 @@ static void hsw_ddi_wrpll_disable(struct drm_i915_private *dev_priv,
+ 	val = I915_READ(WRPLL_CTL(id));
+ 	I915_WRITE(WRPLL_CTL(id), val & ~WRPLL_PLL_ENABLE);
+ 	POSTING_READ(WRPLL_CTL(id));
++
++	/*
++	 * Try to set up the PCH reference clock once all DPLLs
++	 * that depend on it have been shut down.
++	 */
++	if (dev_priv->pch_ssc_use & BIT(id))
++		intel_init_pch_refclk(dev_priv);
+ }
+ 
+ static void hsw_ddi_spll_disable(struct drm_i915_private *dev_priv,
+ 				 struct intel_shared_dpll *pll)
+ {
++	enum intel_dpll_id id = pll->info->id;
+ 	u32 val;
+ 
+ 	val = I915_READ(SPLL_CTL);
+ 	I915_WRITE(SPLL_CTL, val & ~SPLL_PLL_ENABLE);
+ 	POSTING_READ(SPLL_CTL);
++
++	/*
++	 * Try to set up the PCH reference clock once all DPLLs
++	 * that depend on it have been shut down.
++	 */
++	if (dev_priv->pch_ssc_use & BIT(id))
++		intel_init_pch_refclk(dev_priv);
+ }
+ 
+ static bool hsw_ddi_wrpll_get_hw_state(struct drm_i915_private *dev_priv,
