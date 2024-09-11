@@ -54,6 +54,9 @@ static DEFINE_MUTEX(smc_client_lgr_pending);	/* serialize link group
 						 * creation on client
 						 */
 
+struct workqueue_struct	*smc_hs_wq;	/* wq for handshake work */
+struct workqueue_struct	*smc_close_wq;	/* wq for close work */
+
 static void smc_tcp_listen_work(struct work_struct *);
 static void smc_connect_work(struct work_struct *);
 
@@ -903,7 +906,7 @@ static int smc_connect(struct socket *sock, struct sockaddr *addr,
 	if (smc->use_fallback)
 		goto out;
 	if (flags & O_NONBLOCK) {
-		if (schedule_work(&smc->connect_work))
+		if (queue_work(smc_hs_wq, &smc->connect_work))
 			smc->connect_nonblock = 1;
 		rc = -EINPROGRESS;
 	} else {
@@ -1410,7 +1413,7 @@ static void smc_tcp_listen_work(struct work_struct *work)
 		new_smc->sk.sk_sndbuf = lsmc->sk.sk_sndbuf;
 		new_smc->sk.sk_rcvbuf = lsmc->sk.sk_rcvbuf;
 		sock_hold(&new_smc->sk); /* sock_put in passive closing */
-		if (!schedule_work(&new_smc->smc_listen_work))
+		if (!queue_work(smc_hs_wq, &new_smc->smc_listen_work))
 			sock_put(&new_smc->sk);
 	}
 
@@ -1430,7 +1433,7 @@ static void smc_clcsock_data_ready(struct sock *listen_clcsock)
 	lsmc->clcsk_data_ready(listen_clcsock);
 	if (lsmc->sk.sk_state == SMC_LISTEN) {
 		sock_hold(&lsmc->sk); /* sock_put in smc_tcp_listen_work() */
-		if (!schedule_work(&lsmc->tcp_listen_work))
+		if (!queue_work(smc_hs_wq, &lsmc->tcp_listen_work))
 			sock_put(&lsmc->sk);
 	}
 }
@@ -1795,8 +1798,8 @@ static int smc_setsockopt(struct socket *sock, int level, int optname,
 		    sk->sk_state != SMC_LISTEN &&
 		    sk->sk_state != SMC_CLOSED) {
 			if (val)
-				mod_delayed_work(system_wq, &smc->conn.tx_work,
-						 0);
+				mod_delayed_work(smc->conn.lgr->tx_wq,
+						 &smc->conn.tx_work, 0);
 		}
 		break;
 	case TCP_CORK:
@@ -1804,8 +1807,8 @@ static int smc_setsockopt(struct socket *sock, int level, int optname,
 		    sk->sk_state != SMC_LISTEN &&
 		    sk->sk_state != SMC_CLOSED) {
 			if (!val)
-				mod_delayed_work(system_wq, &smc->conn.tx_work,
-						 0);
+				mod_delayed_work(smc->conn.lgr->tx_wq,
+						 &smc->conn.tx_work, 0);
 		}
 		break;
 	case TCP_DEFER_ACCEPT:
@@ -2086,10 +2089,19 @@ static int __init smc_init(void)
 	if (rc)
 		goto out_pernet_subsys;
 
+	rc = -ENOMEM;
+	smc_hs_wq = alloc_workqueue("smc_hs_wq", 0, 0);
+	if (!smc_hs_wq)
+		goto out_pnet;
+
+	smc_close_wq = alloc_workqueue("smc_close_wq", 0, 0);
+	if (!smc_close_wq)
+		goto out_alloc_hs_wq;
+
 	rc = smc_core_init();
 	if (rc) {
 		pr_err("%s: smc_core_init fails with %d\n", __func__, rc);
-		goto out_pnet;
+		goto out_alloc_wqs;
 	}
 
 	rc = smc_llc_init();
@@ -2141,6 +2153,10 @@ out_proto:
 	proto_unregister(&smc_proto);
 out_core:
 	smc_core_exit();
+out_alloc_wqs:
+	destroy_workqueue(smc_close_wq);
+out_alloc_hs_wq:
+	destroy_workqueue(smc_hs_wq);
 out_pnet:
 	smc_pnet_exit();
 out_pernet_subsys:
@@ -2155,6 +2171,8 @@ static void __exit smc_exit(void)
 	sock_unregister(PF_SMC);
 	smc_core_exit();
 	smc_ib_unregister_client();
+	destroy_workqueue(smc_close_wq);
+	destroy_workqueue(smc_hs_wq);
 	proto_unregister(&smc_proto6);
 	proto_unregister(&smc_proto);
 	smc_pnet_exit();
