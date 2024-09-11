@@ -1,0 +1,149 @@
+mptcp: better msk-level shutdown.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 76e2a55d16259b51116767b28b19d759bff43f72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/76e2a55d.failed
+
+Instead of re-implementing most of inet_shutdown, re-use
+such helper, and implement the MPTCP-specific bits at the
+'proto' level.
+
+The msk-level disconnect() can now be invoked, lets provide a
+suitable implementation.
+
+As a side effect, this fixes bad state management for listener
+sockets. The latter could lead to division by 0 oops since
+commit ea4ca586b16f ("mptcp: refine MPTCP-level ack scheduling").
+
+Fixes: 43b54c6ee382 ("mptcp: Use full MPTCP-level disconnect state machine")
+Fixes: ea4ca586b16f ("mptcp: refine MPTCP-level ack scheduling")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 76e2a55d16259b51116767b28b19d759bff43f72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 509aa48ee70d,81faeff8f3bb..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -2123,11 -3090,12 +2124,20 @@@ bool mptcp_finish_join(struct sock *sk
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static bool mptcp_memory_free(const struct sock *sk)
+ +{
+ +	struct mptcp_sock *msk = mptcp_sk(sk);
+ +
+ +	return test_bit(MPTCP_SEND_SPACE, &msk->flags);
+++=======
++ static void mptcp_shutdown(struct sock *sk, int how)
++ {
++ 	pr_debug("sk=%p, how=%d", sk, how);
++ 
++ 	if ((how & SEND_SHUTDOWN) && mptcp_close_state(sk))
++ 		__mptcp_wr_shutdown(sk);
+++>>>>>>> 76e2a55d1625 (mptcp: better msk-level shutdown.)
+  }
+  
+  static struct proto mptcp_prot = {
+@@@ -2334,66 -3353,6 +2344,69 @@@ static __poll_t mptcp_poll(struct file 
+  	return mask;
+  }
+  
+++<<<<<<< HEAD
+ +static int mptcp_shutdown(struct socket *sock, int how)
+ +{
+ +	struct mptcp_sock *msk = mptcp_sk(sock->sk);
+ +	struct mptcp_subflow_context *subflow;
+ +	int ret = 0;
+ +
+ +	pr_debug("sk=%p, how=%d", msk, how);
+ +
+ +	lock_sock(sock->sk);
+ +
+ +	how++;
+ +	if ((how & ~SHUTDOWN_MASK) || !how) {
+ +		ret = -EINVAL;
+ +		goto out_unlock;
+ +	}
+ +
+ +	if (sock->state == SS_CONNECTING) {
+ +		if ((1 << sock->sk->sk_state) &
+ +		    (TCPF_SYN_SENT | TCPF_SYN_RECV | TCPF_CLOSE))
+ +			sock->state = SS_DISCONNECTING;
+ +		else
+ +			sock->state = SS_CONNECTED;
+ +	}
+ +
+ +	/* If we've already sent a FIN, or it's a closed state, skip this. */
+ +	if (__mptcp_check_fallback(msk)) {
+ +		if (how == SHUT_WR || how == SHUT_RDWR)
+ +			inet_sk_state_store(sock->sk, TCP_FIN_WAIT1);
+ +
+ +		mptcp_for_each_subflow(msk, subflow) {
+ +			struct sock *tcp_sk = mptcp_subflow_tcp_sock(subflow);
+ +
+ +			mptcp_subflow_shutdown(sock->sk, tcp_sk, how);
+ +		}
+ +	} else if ((how & SEND_SHUTDOWN) &&
+ +		   ((1 << sock->sk->sk_state) &
+ +		    (TCPF_ESTABLISHED | TCPF_SYN_SENT |
+ +		     TCPF_SYN_RECV | TCPF_CLOSE_WAIT)) &&
+ +		   mptcp_close_state(sock->sk)) {
+ +		__mptcp_flush_join_list(msk);
+ +
+ +		WRITE_ONCE(msk->write_seq, msk->write_seq + 1);
+ +		WRITE_ONCE(msk->snd_data_fin_enable, 1);
+ +
+ +		mptcp_for_each_subflow(msk, subflow) {
+ +			struct sock *tcp_sk = mptcp_subflow_tcp_sock(subflow);
+ +
+ +			mptcp_subflow_shutdown(sock->sk, tcp_sk, how);
+ +		}
+ +	}
+ +
+ +	/* Wake up anyone sleeping in poll. */
+ +	sock->sk->sk_state_change(sock->sk);
+ +
+ +out_unlock:
+ +	release_sock(sock->sk);
+ +
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 76e2a55d1625 (mptcp: better msk-level shutdown.)
+  static const struct proto_ops mptcp_stream_ops = {
+  	.family		   = PF_INET,
+  	.owner		   = THIS_MODULE,
+@@@ -2405,8 -3364,9 +2418,8 @@@
+  	.getname	   = inet_getname,
+  	.poll		   = mptcp_poll,
+  	.ioctl		   = inet_ioctl,
+ -	.gettstamp	   = sock_gettstamp,
+  	.listen		   = mptcp_listen,
+- 	.shutdown	   = mptcp_shutdown,
++ 	.shutdown	   = inet_shutdown,
+  	.setsockopt	   = sock_common_setsockopt,
+  	.getsockopt	   = sock_common_getsockopt,
+  	.sendmsg	   = inet_sendmsg,
+@@@ -2457,8 -3414,9 +2470,8 @@@ static const struct proto_ops mptcp_v6_
+  	.getname	   = inet6_getname,
+  	.poll		   = mptcp_poll,
+  	.ioctl		   = inet6_ioctl,
+ -	.gettstamp	   = sock_gettstamp,
+  	.listen		   = mptcp_listen,
+- 	.shutdown	   = mptcp_shutdown,
++ 	.shutdown	   = inet_shutdown,
+  	.setsockopt	   = sock_common_setsockopt,
+  	.getsockopt	   = sock_common_getsockopt,
+  	.sendmsg	   = inet6_sendmsg,
+* Unmerged path net/mptcp/protocol.c
