@@ -1,0 +1,143 @@
+block: Disable write plugging for zoned block devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit b49773e7bcf316f238f6709ad9e1999dcc3ed433
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b49773e7.failed
+
+Simultaneously writing to a sequential zone of a zoned block device
+from multiple contexts requires mutual exclusion for BIO issuing to
+ensure that writes happen sequentially. However, even for a well
+behaved user correctly implementing such synchronization, BIO plugging
+may interfere and result in BIOs from the different contextx to be
+reordered if plugging is done outside of the mutual exclusion section,
+e.g. the plug was started by a function higher in the call chain than
+the function issuing BIOs.
+
+         Context A                     Context B
+
+   | blk_start_plug()
+   | ...
+   | seq_write_zone()
+     | mutex_lock(zone)
+     | bio-0->bi_iter.bi_sector = zone->wp
+     | zone->wp += bio_sectors(bio-0)
+     | submit_bio(bio-0)
+     | bio-1->bi_iter.bi_sector = zone->wp
+     | zone->wp += bio_sectors(bio-1)
+     | submit_bio(bio-1)
+     | mutex_unlock(zone)
+     | return
+   | -----------------------> | seq_write_zone()
+  				| mutex_lock(zone)
+     				| bio-2->bi_iter.bi_sector = zone->wp
+     				| zone->wp += bio_sectors(bio-2)
+				| submit_bio(bio-2)
+				| mutex_unlock(zone)
+   | <------------------------- |
+   | blk_finish_plug()
+
+In the above example, despite the mutex synchronization ensuring the
+correct BIO issuing order 0, 1, 2, context A BIOs 0 and 1 end up being
+issued after BIO 2 of context B, when the plug is released with
+blk_finish_plug().
+
+While this problem can be addressed using the blk_flush_plug_list()
+function (in the above example, the call must be inserted before the
+zone mutex lock is released), a simple generic solution in the block
+layer avoid this additional code in all zoned block device user code.
+The simple generic solution implemented with this patch is to introduce
+the internal helper function blk_mq_plug() to access the current
+context plug on BIO submission. This helper returns the current plug
+only if the target device is not a zoned block device or if the BIO to
+be plugged is not a write operation. Otherwise, the caller context plug
+is ignored and NULL returned, resulting is all writes to zoned block
+device to never be plugged.
+
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b49773e7bcf316f238f6709ad9e1999dcc3ed433)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 49d6c08f6c9f,b038ec680e84..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1972,11 -1971,10 +1972,17 @@@ static blk_qc_t blk_mq_make_request(str
+  
+  	cookie = request_to_qc_t(data.hctx, rq);
+  
+++<<<<<<< HEAD
+ +	plug = current->plug;
+++=======
++ 	blk_mq_bio_to_request(rq, bio, nr_segs);
++ 
++ 	plug = blk_mq_plug(q, bio);
+++>>>>>>> b49773e7bcf3 (block: Disable write plugging for zoned block devices)
+  	if (unlikely(is_flush_fua)) {
+ +		blk_mq_put_ctx(data.ctx);
+ +		blk_mq_bio_to_request(rq, bio);
+ +
+  		/* bypass scheduler for flush rq */
+  		blk_insert_flush(rq);
+  		blk_mq_run_hw_queue(data.hctx, true);
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 28e65041f407..f1a828c1c136 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -684,7 +684,7 @@ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+ 	struct request *rq;
+ 	struct list_head *plug_list;
+ 
+-	plug = current->plug;
++	plug = blk_mq_plug(q, bio);
+ 	if (!plug)
+ 		return false;
+ 
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index ea15f6e6fc87..26c26aa0fdc8 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -241,4 +241,36 @@ static inline void blk_mq_clear_mq_map(struct blk_mq_queue_map *qmap)
+ 		qmap->mq_map[cpu] = 0;
+ }
+ 
++/*
++ * blk_mq_plug() - Get caller context plug
++ * @q: request queue
++ * @bio : the bio being submitted by the caller context
++ *
++ * Plugging, by design, may delay the insertion of BIOs into the elevator in
++ * order to increase BIO merging opportunities. This however can cause BIO
++ * insertion order to change from the order in which submit_bio() is being
++ * executed in the case of multiple contexts concurrently issuing BIOs to a
++ * device, even if these context are synchronized to tightly control BIO issuing
++ * order. While this is not a problem with regular block devices, this ordering
++ * change can cause write BIO failures with zoned block devices as these
++ * require sequential write patterns to zones. Prevent this from happening by
++ * ignoring the plug state of a BIO issuing context if the target request queue
++ * is for a zoned block device and the BIO to plug is a write operation.
++ *
++ * Return current->plug if the bio can be plugged and NULL otherwise
++ */
++static inline struct blk_plug *blk_mq_plug(struct request_queue *q,
++					   struct bio *bio)
++{
++	/*
++	 * For regular block devices or read operations, use the context plug
++	 * which may be NULL if blk_start_plug() was not executed.
++	 */
++	if (!blk_queue_is_zoned(q) || !op_is_write(bio_op(bio)))
++		return current->plug;
++
++	/* Zoned block device write operation case: do not plug the BIO */
++	return NULL;
++}
++
+ #endif
