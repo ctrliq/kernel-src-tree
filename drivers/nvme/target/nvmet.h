@@ -173,8 +173,8 @@ struct nvmet_ctrl {
 	char			subsysnqn[NVMF_NQN_FIELD_LEN];
 	char			hostnqn[NVMF_NQN_FIELD_LEN];
 
-	struct device *p2p_client;
-	struct radix_tree_root p2p_ns_map;
+	struct device		*p2p_client;
+	struct radix_tree_root	p2p_ns_map;
 };
 
 struct nvmet_subsys {
@@ -286,8 +286,8 @@ struct nvmet_req {
 	void (*execute)(struct nvmet_req *req);
 	const struct nvmet_fabrics_ops *ops;
 
-	struct pci_dev *p2p_dev;
-	struct device *p2p_client;
+	struct pci_dev		*p2p_dev;
+	struct device		*p2p_client;
 };
 
 static inline void nvmet_set_status(struct nvmet_req *req, u16 status)
