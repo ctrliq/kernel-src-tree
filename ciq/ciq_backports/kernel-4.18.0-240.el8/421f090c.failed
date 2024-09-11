@@ -1,0 +1,112 @@
+x86/hyperv: Suspend/resume the VP assist page for hibernation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [x86] hyperv: Suspend/resume the VP assist page for hibernation (Mohammed Gamal) [1815475]
+Rebuild_FUZZ: 96.61%
+commit-author Dexuan Cui <decui@microsoft.com>
+commit 421f090c819d695942a470051cd624dc43deaf95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/421f090c.failed
+
+Unlike the other CPUs, CPU0 is never offlined during hibernation, so in the
+resume path, the "new" kernel's VP assist page is not suspended (i.e. not
+disabled), and later when we jump to the "old" kernel, the page is not
+properly re-enabled for CPU0 with the allocated page from the old kernel.
+
+So far, the VP assist page is used by hv_apic_eoi_write(), and is also
+used in the case of nested virtualization (running KVM atop Hyper-V).
+
+For hv_apic_eoi_write(), when the page is not properly re-enabled,
+hvp->apic_assist is always 0, so the HV_X64_MSR_EOI MSR is always written.
+This is not ideal with respect to performance, but Hyper-V can still
+correctly handle this according to the Hyper-V spec; nevertheless, Linux
+still must update the Hyper-V hypervisor with the correct VP assist page
+to prevent Hyper-V from writing to the stale page, which causes guest
+memory corruption and consequently may have caused the hangs and triple
+faults seen during non-boot CPUs resume.
+
+Fix the issue by calling hv_cpu_die()/hv_cpu_init() in the syscore ops.
+Without the fix, hibernation can fail at a rate of 1/300 ~ 1/500.
+With the fix, hibernation can pass a long-haul test of 2000 runs.
+
+In the case of nested virtualization, disabling/reenabling the assist
+page upon hibernation may be unsafe if there are active L2 guests.
+It looks KVM should be enhanced to abort the hibernation request if
+there is any active L2 guest.
+
+Fixes: 05bd330a7fd8 ("x86/hyperv: Suspend/resume the hypercall page for hibernation")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+Link: https://lore.kernel.org/r/1587437171-2472-1-git-send-email-decui@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 421f090c819d695942a470051cd624dc43deaf95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+diff --cc arch/x86/hyperv/hv_init.c
+index 346ed6001be8,fd51bac11b46..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -307,6 -252,55 +308,58 @@@ static int __init hv_pci_init(void
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int hv_suspend(void)
++ {
++ 	union hv_x64_msr_hypercall_contents hypercall_msr;
++ 	int ret;
++ 
++ 	/*
++ 	 * Reset the hypercall page as it is going to be invalidated
++ 	 * accross hibernation. Setting hv_hypercall_pg to NULL ensures
++ 	 * that any subsequent hypercall operation fails safely instead of
++ 	 * crashing due to an access of an invalid page. The hypercall page
++ 	 * pointer is restored on resume.
++ 	 */
++ 	hv_hypercall_pg_saved = hv_hypercall_pg;
++ 	hv_hypercall_pg = NULL;
++ 
++ 	/* Disable the hypercall page in the hypervisor */
++ 	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 	hypercall_msr.enable = 0;
++ 	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 
++ 	ret = hv_cpu_die(0);
++ 	return ret;
++ }
++ 
++ static void hv_resume(void)
++ {
++ 	union hv_x64_msr_hypercall_contents hypercall_msr;
++ 	int ret;
++ 
++ 	ret = hv_cpu_init(0);
++ 	WARN_ON(ret);
++ 
++ 	/* Re-enable the hypercall page */
++ 	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 	hypercall_msr.enable = 1;
++ 	hypercall_msr.guest_physical_address =
++ 		vmalloc_to_pfn(hv_hypercall_pg_saved);
++ 	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
++ 
++ 	hv_hypercall_pg = hv_hypercall_pg_saved;
++ 	hv_hypercall_pg_saved = NULL;
++ }
++ 
++ /* Note: when the ops are called, only CPU0 is online and IRQs are disabled. */
++ static struct syscore_ops hv_syscore_ops = {
++ 	.suspend	= hv_suspend,
++ 	.resume		= hv_resume,
++ };
++ 
+++>>>>>>> 421f090c819d (x86/hyperv: Suspend/resume the VP assist page for hibernation)
+  /*
+   * This function is to be invoked early in the boot sequence after the
+   * hypervisor has been detected.
+* Unmerged path arch/x86/hyperv/hv_init.c
