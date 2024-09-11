@@ -1,0 +1,304 @@
+xprtrdma: Allocate and map transport header buffers at connect time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit b78de1dca00376aaba7a58bb5fe21c1606524abe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b78de1dc.failed
+
+Currently the underlying RDMA device is chosen at transport set-up
+time. But it will soon be at connect time instead.
+
+The maximum size of a transport header is based on device
+capabilities. Thus transport header buffers have to be allocated
+_after_ the underlying device has been chosen (via address and route
+resolution); ie, in the connect worker.
+
+Thus, move the allocation of transport header buffers to the connect
+worker, after the point at which the underlying RDMA device has been
+chosen.
+
+This also means the RDMA device is available to do a DMA mapping of
+these buffers at connect time, instead of in the hot I/O path. Make
+that optimization as well.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b78de1dca00376aaba7a58bb5fe21c1606524abe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 522f58cb1aab,28020ec104d4..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -562,21 -585,74 +562,83 @@@ static void rpcrdma_prepare_hdr_sge(str
+  {
+  	struct rpcrdma_sendctx *sc = req->rl_sendctx;
+  	struct rpcrdma_regbuf *rb = req->rl_rdmabuf;
+ -	struct ib_sge *sge = &sc->sc_sges[req->rl_wr.num_sge++];
+ +	struct ib_sge *sge = sc->sc_sges;
+  
+++<<<<<<< HEAD
+ +	if (!rpcrdma_regbuf_dma_map(r_xprt, rb))
+ +		goto out_regbuf;
+++=======
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  	sge->addr = rdmab_addr(rb);
+  	sge->length = len;
+  	sge->lkey = rdmab_lkey(rb);
+  
+  	ib_dma_sync_single_for_device(rdmab_device(rb), sge->addr, sge->length,
+  				      DMA_TO_DEVICE);
+++<<<<<<< HEAD
+ +	req->rl_wr.num_sge++;
+++=======
++ }
++ 
++ /* The head iovec is straightforward, as it is usually already
++  * DMA-mapped. Sync the content that has changed.
++  */
++ static bool rpcrdma_prepare_head_iov(struct rpcrdma_xprt *r_xprt,
++ 				     struct rpcrdma_req *req, unsigned int len)
++ {
++ 	struct rpcrdma_sendctx *sc = req->rl_sendctx;
++ 	struct ib_sge *sge = &sc->sc_sges[req->rl_wr.num_sge++];
++ 	struct rpcrdma_regbuf *rb = req->rl_sendbuf;
++ 
++ 	if (!rpcrdma_regbuf_dma_map(r_xprt, rb))
++ 		return false;
++ 
++ 	sge->addr = rdmab_addr(rb);
++ 	sge->length = len;
++ 	sge->lkey = rdmab_lkey(rb);
++ 
++ 	ib_dma_sync_single_for_device(rdmab_device(rb), sge->addr, sge->length,
++ 				      DMA_TO_DEVICE);
++ 	return true;
++ }
++ 
++ /* If there is a page list present, DMA map and prepare an
++  * SGE for each page to be sent.
++  */
++ static bool rpcrdma_prepare_pagelist(struct rpcrdma_req *req,
++ 				     struct xdr_buf *xdr)
++ {
++ 	struct rpcrdma_sendctx *sc = req->rl_sendctx;
++ 	struct rpcrdma_regbuf *rb = req->rl_sendbuf;
++ 	unsigned int page_base, len, remaining;
++ 	struct page **ppages;
++ 	struct ib_sge *sge;
++ 
++ 	ppages = xdr->pages + (xdr->page_base >> PAGE_SHIFT);
++ 	page_base = offset_in_page(xdr->page_base);
++ 	remaining = xdr->page_len;
++ 	while (remaining) {
++ 		sge = &sc->sc_sges[req->rl_wr.num_sge++];
++ 		len = min_t(unsigned int, PAGE_SIZE - page_base, remaining);
++ 		sge->addr = ib_dma_map_page(rdmab_device(rb), *ppages,
++ 					    page_base, len, DMA_TO_DEVICE);
++ 		if (ib_dma_mapping_error(rdmab_device(rb), sge->addr))
++ 			goto out_mapping_err;
++ 
++ 		sge->length = len;
++ 		sge->lkey = rdmab_lkey(rb);
++ 
++ 		sc->sc_unmap_count++;
++ 		ppages++;
++ 		remaining -= len;
++ 		page_base = 0;
++ 	}
++ 
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  	return true;
+  
+ -out_mapping_err:
+ -	trace_xprtrdma_dma_maperr(sge->addr);
+ +out_regbuf:
+ +	pr_err("rpcrdma: failed to DMA map a Send buffer\n");
+  	return false;
+  }
+  
+@@@ -734,15 -833,33 +796,40 @@@ rpcrdma_prepare_send_sges(struct rpcrdm
+  	req->rl_wr.num_sge = 0;
+  	req->rl_wr.opcode = IB_WR_SEND;
+  
+++<<<<<<< HEAD
+ +	ret = -EIO;
+ +	if (!rpcrdma_prepare_hdr_sge(r_xprt, req, hdrlen))
+ +		goto err;
+ +	if (rtype != rpcrdma_areadch)
+ +		if (!rpcrdma_prepare_msg_sges(r_xprt, req, xdr, rtype))
+ +			goto err;
+++=======
++ 	rpcrdma_prepare_hdr_sge(r_xprt, req, hdrlen);
++ 
++ 	ret = -EIO;
++ 	switch (rtype) {
++ 	case rpcrdma_noch_pullup:
++ 		if (!rpcrdma_prepare_noch_pullup(r_xprt, req, xdr))
++ 			goto out_unmap;
++ 		break;
++ 	case rpcrdma_noch_mapped:
++ 		if (!rpcrdma_prepare_noch_mapped(r_xprt, req, xdr))
++ 			goto out_unmap;
++ 		break;
++ 	case rpcrdma_readch:
++ 		if (!rpcrdma_prepare_readch(r_xprt, req, xdr))
++ 			goto out_unmap;
++ 		break;
++ 	case rpcrdma_areadch:
++ 		break;
++ 	default:
++ 		goto out_unmap;
++ 	}
++ 
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  	return 0;
+  
+ -out_unmap:
+ -	rpcrdma_sendctx_unmap(req->rl_sendctx);
+ -out_nosc:
+ +err:
+  	trace_xprtrdma_prepsend_failed(&req->rl_slot, ret);
+  	return ret;
+  }
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index e03a8d720a48,90c215beef06..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -73,10 -74,15 +73,18 @@@
+  /*
+   * internal functions
+   */
+++<<<<<<< HEAD
+ +static void rpcrdma_sendctx_put_locked(struct rpcrdma_sendctx *sc);
+++=======
++ static int rpcrdma_sendctxs_create(struct rpcrdma_xprt *r_xprt);
++ static void rpcrdma_sendctxs_destroy(struct rpcrdma_xprt *r_xprt);
++ static void rpcrdma_sendctx_put_locked(struct rpcrdma_xprt *r_xprt,
++ 				       struct rpcrdma_sendctx *sc);
++ static int rpcrdma_reqs_setup(struct rpcrdma_xprt *r_xprt);
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  static void rpcrdma_reqs_reset(struct rpcrdma_xprt *r_xprt);
+ -static void rpcrdma_reps_unmap(struct rpcrdma_xprt *r_xprt);
+  static void rpcrdma_mrs_create(struct rpcrdma_xprt *r_xprt);
+ -static void rpcrdma_mrs_destroy(struct rpcrdma_xprt *r_xprt);
+ +static void rpcrdma_mrs_destroy(struct rpcrdma_buffer *buf);
+  static struct rpcrdma_regbuf *
+  rpcrdma_regbuf_alloc(size_t size, enum dma_data_direction direction,
+  		     gfp_t flags);
+@@@ -390,11 -391,6 +400,14 @@@ rpcrdma_ia_remove(struct rpcrdma_ia *ia
+  	struct rpcrdma_xprt *r_xprt = container_of(ia, struct rpcrdma_xprt,
+  						   rx_ia);
+  	struct rpcrdma_ep *ep = &r_xprt->rx_ep;
+++<<<<<<< HEAD
+ +	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+ +	struct rpcrdma_req *req;
+ +	struct rpcrdma_rep *rep;
+ +
+ +	cancel_delayed_work_sync(&buf->rb_refresh_worker);
+++=======
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  
+  	/* This is similar to rpcrdma_ep_destroy, but:
+  	 * - Don't cancel the connect worker.
+@@@ -416,14 -412,10 +429,21 @@@
+  	/* The ULP is responsible for ensuring all DMA
+  	 * mappings and MRs are gone.
+  	 */
+++<<<<<<< HEAD
+ +	list_for_each_entry(rep, &buf->rb_recv_bufs, rr_list)
+ +		rpcrdma_regbuf_dma_unmap(rep->rr_rdmabuf);
+ +	list_for_each_entry(req, &buf->rb_allreqs, rl_all) {
+ +		rpcrdma_regbuf_dma_unmap(req->rl_rdmabuf);
+ +		rpcrdma_regbuf_dma_unmap(req->rl_sendbuf);
+ +		rpcrdma_regbuf_dma_unmap(req->rl_recvbuf);
+ +	}
+ +	rpcrdma_mrs_destroy(buf);
+++=======
++ 	rpcrdma_reps_unmap(r_xprt);
++ 	rpcrdma_reqs_reset(r_xprt);
++ 	rpcrdma_mrs_destroy(r_xprt);
++ 	rpcrdma_sendctxs_destroy(r_xprt);
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  	ib_dealloc_pd(ia->ri_pd);
+  	ia->ri_pd = NULL;
+  
+@@@ -714,7 -712,12 +734,16 @@@ retry
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC:       %s: connected\n", __func__);
+++=======
++ 	rc = rpcrdma_reqs_setup(r_xprt);
++ 	if (rc) {
++ 		rpcrdma_ep_disconnect(ep, ia);
++ 		goto out;
++ 	}
++ 	rpcrdma_mrs_create(r_xprt);
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  
+  out:
+  	if (rc)
+@@@ -979,20 -1004,15 +1007,23 @@@ struct rpcrdma_req *rpcrdma_req_create(
+  	if (req == NULL)
+  		goto out1;
+  
+++<<<<<<< HEAD
+ +	rb = rpcrdma_regbuf_alloc(RPCRDMA_HDRBUF_SIZE, DMA_TO_DEVICE, flags);
+ +	if (!rb)
+ +		goto out2;
+ +	req->rl_rdmabuf = rb;
+ +	xdr_buf_init(&req->rl_hdrbuf, rdmab_data(rb), rdmab_length(rb));
+ +
+++=======
+++>>>>>>> b78de1dca003 (xprtrdma: Allocate and map transport header buffers at connect time)
+  	req->rl_sendbuf = rpcrdma_regbuf_alloc(size, DMA_TO_DEVICE, flags);
+  	if (!req->rl_sendbuf)
+- 		goto out3;
++ 		goto out2;
+  
+  	req->rl_recvbuf = rpcrdma_regbuf_alloc(size, DMA_NONE, flags);
+  	if (!req->rl_recvbuf)
+- 		goto out4;
++ 		goto out3;
+  
+ -	INIT_LIST_HEAD(&req->rl_free_mrs);
+  	INIT_LIST_HEAD(&req->rl_registered);
+  	spin_lock(&buffer->rb_lock);
+  	list_add(&req->rl_all, &buffer->rb_allreqs);
+diff --git a/net/sunrpc/xprtrdma/backchannel.c b/net/sunrpc/xprtrdma/backchannel.c
+index a580572e3aff..58a373dd7502 100644
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@ -189,6 +189,10 @@ static struct rpc_rqst *rpcrdma_bc_rqst_get(struct rpcrdma_xprt *r_xprt)
+ 	req = rpcrdma_req_create(r_xprt, size, GFP_KERNEL);
+ 	if (!req)
+ 		return NULL;
++	if (rpcrdma_req_setup(r_xprt, req)) {
++		rpcrdma_req_destroy(req);
++		return NULL;
++	}
+ 
+ 	xprt->bc_alloc_count++;
+ 	rqst = &req->rl_slot;
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 56e2b0c73124..036cabe8c729 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -483,6 +483,7 @@ void rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, bool temp);
+  */
+ struct rpcrdma_req *rpcrdma_req_create(struct rpcrdma_xprt *r_xprt, size_t size,
+ 				       gfp_t flags);
++int rpcrdma_req_setup(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req);
+ void rpcrdma_req_destroy(struct rpcrdma_req *req);
+ int rpcrdma_buffer_create(struct rpcrdma_xprt *);
+ void rpcrdma_buffer_destroy(struct rpcrdma_buffer *);
