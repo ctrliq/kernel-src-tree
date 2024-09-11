@@ -1,0 +1,145 @@
+x86/cpu: Use SERIALIZE in sync_core() when available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+commit bf9c912f9a649776c2d741310486a6984edaac72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bf9c912f.failed
+
+The SERIALIZE instruction gives software a way to force the processor to
+complete all modifications to flags, registers and memory from previous
+instructions and drain all buffered writes to memory before the next
+instruction is fetched and executed. Thus, it serves the purpose of
+sync_core(). Use it when available.
+
+	Suggested-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Ricardo Neri <ricardo.neri-calderon@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+Link: https://lkml.kernel.org/r/20200807032833.17484-1-ricardo.neri-calderon@linux.intel.com
+(cherry picked from commit bf9c912f9a649776c2d741310486a6984edaac72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/special_insns.h
+#	arch/x86/include/asm/sync_core.h
+diff --cc arch/x86/include/asm/special_insns.h
+index b684dfdaaec1,5999b0b3dd4a..000000000000
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@@ -252,6 -234,11 +252,14 @@@ static inline void clwb(volatile void *
+  
+  #define nop() asm volatile ("nop")
+  
+++<<<<<<< HEAD
+++=======
++ static inline void serialize(void)
++ {
++ 	/* Instruction opcode for SERIALIZE; supported in binutils >= 2.35. */
++ 	asm volatile(".byte 0xf, 0x1, 0xe8" ::: "memory");
++ }
+++>>>>>>> bf9c912f9a64 (x86/cpu: Use SERIALIZE in sync_core() when available)
+  
+  #endif /* __KERNEL__ */
+  
+diff --cc arch/x86/include/asm/sync_core.h
+index c67caafd3381,4631c0f969d4..000000000000
+--- a/arch/x86/include/asm/sync_core.h
++++ b/arch/x86/include/asm/sync_core.h
+@@@ -5,7 -5,89 +5,92 @@@
+  #include <linux/preempt.h>
+  #include <asm/processor.h>
+  #include <asm/cpufeature.h>
++ #include <asm/special_insns.h>
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_32
++ static inline void iret_to_self(void)
++ {
++ 	asm volatile (
++ 		"pushfl\n\t"
++ 		"pushl %%cs\n\t"
++ 		"pushl $1f\n\t"
++ 		"iret\n\t"
++ 		"1:"
++ 		: ASM_CALL_CONSTRAINT : : "memory");
++ }
++ #else
++ static inline void iret_to_self(void)
++ {
++ 	unsigned int tmp;
++ 
++ 	asm volatile (
++ 		"mov %%ss, %0\n\t"
++ 		"pushq %q0\n\t"
++ 		"pushq %%rsp\n\t"
++ 		"addq $8, (%%rsp)\n\t"
++ 		"pushfq\n\t"
++ 		"mov %%cs, %0\n\t"
++ 		"pushq %q0\n\t"
++ 		"pushq $1f\n\t"
++ 		"iretq\n\t"
++ 		"1:"
++ 		: "=&r" (tmp), ASM_CALL_CONSTRAINT : : "cc", "memory");
++ }
++ #endif /* CONFIG_X86_32 */
++ 
++ /*
++  * This function forces the icache and prefetched instruction stream to
++  * catch up with reality in two very specific cases:
++  *
++  *  a) Text was modified using one virtual address and is about to be executed
++  *     from the same physical page at a different virtual address.
++  *
++  *  b) Text was modified on a different CPU, may subsequently be
++  *     executed on this CPU, and you want to make sure the new version
++  *     gets executed.  This generally means you're calling this in a IPI.
++  *
++  * If you're calling this for a different reason, you're probably doing
++  * it wrong.
++  */
++ static inline void sync_core(void)
++ {
++ 	/*
++ 	 * The SERIALIZE instruction is the most straightforward way to
++ 	 * do this but it not universally available.
++ 	 */
++ 	if (static_cpu_has(X86_FEATURE_SERIALIZE)) {
++ 		serialize();
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * For all other processors, there are quite a few ways to do this.
++ 	 * IRET-to-self is nice because it works on every CPU, at any CPL
++ 	 * (so it's compatible with paravirtualization), and it never exits
++ 	 * to a hypervisor. The only down sides are that it's a bit slow
++ 	 * (it seems to be a bit more than 2x slower than the fastest
++ 	 * options) and that it unmasks NMIs.  The "push %cs" is needed
++ 	 * because, in paravirtual environments, __KERNEL_CS may not be a
++ 	 * valid CS value when we do IRET directly.
++ 	 *
++ 	 * In case NMI unmasking or performance ever becomes a problem,
++ 	 * the next best option appears to be MOV-to-CR2 and an
++ 	 * unconditional jump.  That sequence also works on all CPUs,
++ 	 * but it will fault at CPL3 (i.e. Xen PV).
++ 	 *
++ 	 * CPUID is the conventional way, but it's nasty: it doesn't
++ 	 * exist on some 486-like CPUs, and it usually exits to a
++ 	 * hypervisor.
++ 	 *
++ 	 * Like all of Linux's memory ordering operations, this is a
++ 	 * compiler barrier as well.
++ 	 */
++ 	iret_to_self();
++ }
++ 
+++>>>>>>> bf9c912f9a64 (x86/cpu: Use SERIALIZE in sync_core() when available)
+  /*
+   * Ensure that a core serializing instruction is issued before returning
+   * to user-mode. x86 implements return to user-space through sysexit,
+* Unmerged path arch/x86/include/asm/special_insns.h
+* Unmerged path arch/x86/include/asm/sync_core.h
