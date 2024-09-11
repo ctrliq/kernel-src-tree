@@ -182,6 +182,8 @@ nv50_wndw_atomic_check_release(struct nv50_wndw *wndw,
 	wndw->func->release(wndw, asyw, asyh);
 	asyw->ntfy.handle = 0;
 	asyw->sema.handle = 0;
+	asyw->xlut.handle = 0;
+	memset(asyw->image.handle, 0x00, sizeof(asyw->image.handle));
 }
 
 static int
@@ -458,7 +460,8 @@ nv50_wndw_prepare_fb(struct drm_plane *plane, struct drm_plane_state *state)
 			return PTR_ERR(ctxdma);
 		}
 
-		asyw->image.handle[0] = ctxdma->object.handle;
+		if (asyw->visible)
+			asyw->image.handle[0] = ctxdma->object.handle;
 	}
 
 	asyw->state.fence = reservation_object_get_excl_rcu(fb->nvbo->bo.resv);
