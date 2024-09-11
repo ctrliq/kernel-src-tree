@@ -536,7 +536,6 @@ enum qeth_card_states {
 	CARD_STATE_HARDSETUP,
 	CARD_STATE_SOFTSETUP,
 	CARD_STATE_UP,
-	CARD_STATE_RECOVER,
 };
 
 /**
@@ -648,6 +647,7 @@ struct qeth_card_info {
 	unsigned short chpid;
 	__u16 func_level;
 	char mcl_level[QETH_MCL_LENGTH + 1];
+	u8 open_when_online:1;
 	int guestlan;
 	int mac_bits;
 	enum qeth_card_types type;
