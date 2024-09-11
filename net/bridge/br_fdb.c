@@ -403,8 +403,8 @@ static struct net_bridge_fdb_entry *fdb_create(struct net_bridge *br,
 	return fdb;
 }
 
-static int fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
-		      const unsigned char *addr, u16 vid)
+static int fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
+			 const unsigned char *addr, u16 vid)
 {
 	struct net_bridge_fdb_entry *fdb;
 
@@ -459,7 +459,7 @@ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr)
 
 insert:
 	/* insert new address,  may fail if invalid address or dup. */
-	fdb_insert(br, p, newaddr, 0);
+	fdb_add_local(br, p, newaddr, 0);
 
 	if (!vg || !vg->num_vlans)
 		goto done;
@@ -469,7 +469,7 @@ insert:
 	 * from under us.
 	 */
 	list_for_each_entry(v, &vg->vlan_list, vlist)
-		fdb_insert(br, p, newaddr, v->vid);
+		fdb_add_local(br, p, newaddr, v->vid);
 
 done:
 	spin_unlock_bh(&br->hash_lock);
@@ -489,7 +489,7 @@ void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr)
 	    !f->dst && !test_bit(BR_FDB_ADDED_BY_USER, &f->flags))
 		fdb_delete_local(br, NULL, f);
 
-	fdb_insert(br, NULL, newaddr, 0);
+	fdb_add_local(br, NULL, newaddr, 0);
 	vg = br_vlan_group(br);
 	if (!vg || !vg->num_vlans)
 		goto out;
@@ -504,7 +504,7 @@ void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr)
 		if (f && test_bit(BR_FDB_LOCAL, &f->flags) &&
 		    !f->dst && !test_bit(BR_FDB_ADDED_BY_USER, &f->flags))
 			fdb_delete_local(br, NULL, f);
-		fdb_insert(br, NULL, newaddr, v->vid);
+		fdb_add_local(br, NULL, newaddr, v->vid);
 	}
 out:
 	spin_unlock_bh(&br->hash_lock);
@@ -686,7 +686,7 @@ int br_fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
 	int ret;
 
 	spin_lock_bh(&br->hash_lock);
-	ret = fdb_insert(br, source, addr, vid);
+	ret = fdb_add_local(br, source, addr, vid);
 	spin_unlock_bh(&br->hash_lock);
 	return ret;
 }
