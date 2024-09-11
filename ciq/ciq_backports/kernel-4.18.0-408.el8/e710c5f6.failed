@@ -1,0 +1,254 @@
+KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit e710c5f6be0eb36f8f2e98efbc02f1b31021c29d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/e710c5f6.failed
+
+The memslot for the faulting gfn is used throughout the page fault
+handling code, so capture it in kvm_page_fault as soon as we know the
+gfn and use it in the page fault handling code that has direct access
+to the kvm_page_fault struct.  Replace various tests using is_noslot_pfn
+with more direct tests on fault->slot being NULL.
+
+This, in combination with the subsequent patch, improves "Populate
+memory time" in dirty_log_perf_test by 5% when using the legacy MMU.
+There is no discerable improvement to the performance of the TDP MMU.
+
+No functional change intended.
+
+	Suggested-by: Ben Gardon <bgardon@google.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20210813203504.2742757-4-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e710c5f6be0eb36f8f2e98efbc02f1b31021c29d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.h
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/paging_tmpl.h
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu.h
+index 58b438826461,75367af1a6d3..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -126,14 -127,44 +126,25 @@@ struct kvm_page_fault 
+  	const bool rsvd;
+  	const bool user;
+  
+ -	/* Derived from mmu and global state.  */
+ +	/* Derived from mmu.  */
+  	const bool is_tdp;
+ -	const bool nx_huge_page_workaround_enabled;
+  
+ -	/*
+ -	 * Whether a >4KB mapping can be created or is forbidden due to NX
+ -	 * hugepages.
+ -	 */
+ -	bool huge_page_disallowed;
+ -
+ -	/*
+ -	 * Maximum page size that can be created for this fault; input to
+ -	 * FNAME(fetch), __direct_map and kvm_tdp_mmu_map.
+ -	 */
+ +	/* Input to FNAME(fetch), __direct_map and kvm_tdp_mmu_map.  */
+  	u8 max_level;
+  
+ -	/*
+ -	 * Page size that can be created based on the max_level and the
+ -	 * page size used by the host mapping.
+ -	 */
+ -	u8 req_level;
+ -
+ -	/*
+ -	 * Page size that will be created based on the req_level and
+ -	 * huge_page_disallowed.
+ -	 */
+ -	u8 goal_level;
+ -
+  	/* Shifted addr, or result of guest page table walk if addr is a gva.  */
+  	gfn_t gfn;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* The memslot containing gfn. May be NULL. */
++ 	struct kvm_memory_slot *slot;
++ 
++ 	/* Outputs of kvm_faultin_pfn.  */
++ 	kvm_pfn_t pfn;
++ 	hva_t hva;
++ 	bool map_writable;
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  };
+  
+  int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 4d7446c022d2,754578458cb7..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2890,26 -2905,21 +2890,35 @@@ int kvm_mmu_max_mapping_level(struct kv
+  	return min(host_level, max_level);
+  }
+  
+ -void kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ +int kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, gfn_t gfn,
+ +			    int max_level, kvm_pfn_t *pfnp,
+ +			    bool huge_page_disallowed, int *req_level)
+  {
+++<<<<<<< HEAD
+ +	struct kvm_memory_slot *slot;
+ +	kvm_pfn_t pfn = *pfnp;
+++=======
++ 	struct kvm_memory_slot *slot = fault->slot;
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  	kvm_pfn_t mask;
+ +	int level;
+  
+ -	fault->huge_page_disallowed = fault->exec && fault->nx_huge_page_workaround_enabled;
+ +	*req_level = PG_LEVEL_4K;
+  
+ -	if (unlikely(fault->max_level == PG_LEVEL_4K))
+ -		return;
+ +	if (unlikely(max_level == PG_LEVEL_4K))
+ +		return PG_LEVEL_4K;
+  
+ -	if (is_error_noslot_pfn(fault->pfn) || kvm_is_reserved_pfn(fault->pfn))
+ -		return;
+ +	if (is_error_noslot_pfn(pfn) || kvm_is_reserved_pfn(pfn))
+ +		return PG_LEVEL_4K;
+  
+++<<<<<<< HEAD
+ +	slot = gfn_to_memslot_dirty_bitmap(vcpu, gfn, true);
+ +	if (!slot)
+ +		return PG_LEVEL_4K;
+++=======
++ 	if (kvm_slot_dirty_track_enabled(slot))
++ 		return;
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  
+  	/*
+  	 * Enforce the iTLB multihit workaround after capturing the requested
+@@@ -3040,8 -3042,10 +3049,15 @@@ static bool handle_abnormal_pfn(struct 
+  		return true;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(is_noslot_pfn(pfn))) {
+ +		vcpu_cache_mmio_info(vcpu, gva, gfn,
+++=======
++ 	if (unlikely(!fault->slot)) {
++ 		gva_t gva = fault->is_tdp ? 0 : fault->addr;
++ 
++ 		vcpu_cache_mmio_info(vcpu, gva, fault->gfn,
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  				     access & shadow_mmio_access_mask);
+  		/*
+  		 * If MMIO caching is disabled, emulate immediately without
+@@@ -3852,11 -3850,9 +3858,15 @@@ static bool kvm_arch_setup_async_pf(str
+  				  kvm_vcpu_gfn_to_hva(vcpu, gfn), &arch);
+  }
+  
+ -static bool kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault, int *r)
+ +static bool kvm_faultin_pfn(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
+ +			 gpa_t cr2_or_gpa, kvm_pfn_t *pfn, hva_t *hva,
+ +			 bool write, bool *writable, int *r)
+  {
+++<<<<<<< HEAD
+ +	struct kvm_memory_slot *slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+++=======
++ 	struct kvm_memory_slot *slot = fault->slot;
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  	bool async;
+  
+  	/*
+@@@ -3870,8 -3866,9 +3880,14 @@@
+  	if (!kvm_is_visible_memslot(slot)) {
+  		/* Don't expose private memslots to L2. */
+  		if (is_guest_mode(vcpu)) {
+++<<<<<<< HEAD
+ +			*pfn = KVM_PFN_NOSLOT;
+ +			*writable = false;
+++=======
++ 			fault->slot = NULL;
++ 			fault->pfn = KVM_PFN_NOSLOT;
++ 			fault->map_writable = false;
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  			return false;
+  		}
+  		/*
+@@@ -3952,7 -3947,7 +3970,11 @@@ static int direct_page_fault(struct kvm
+  	else
+  		write_lock(&vcpu->kvm->mmu_lock);
+  
+++<<<<<<< HEAD
+ +	if (!is_noslot_pfn(pfn) && mmu_notifier_retry_hva(vcpu->kvm, mmu_seq, hva))
+++=======
++ 	if (fault->slot && mmu_notifier_retry_hva(vcpu->kvm, mmu_seq, fault->hva))
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  		goto out_unlock;
+  	r = make_mmu_pages_available(vcpu);
+  	if (r)
+diff --cc arch/x86/kvm/mmu/paging_tmpl.h
+index de3ee26beb48,e4c7bf3deac8..000000000000
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@@ -870,8 -861,10 +870,10 @@@ static int FNAME(page_fault)(struct kvm
+  	}
+  
+  	fault->gfn = walker.gfn;
++ 	fault->slot = kvm_vcpu_gfn_to_memslot(vcpu, fault->gfn);
++ 
+  	if (page_fault_handle_page_track(vcpu, fault)) {
+ -		shadow_page_table_clear_flood(vcpu, fault->addr);
+ +		shadow_page_table_clear_flood(vcpu, addr);
+  		return RET_PF_EMULATE;
+  	}
+  
+@@@ -904,7 -896,7 +906,11 @@@
+  	 * we will cache the incorrect access into mmio spte.
+  	 */
+  	if (fault->write && !(walker.pte_access & ACC_WRITE_MASK) &&
+++<<<<<<< HEAD
+ +	    !is_cr0_wp(vcpu->arch.mmu) && !fault->user && !is_noslot_pfn(pfn)) {
+++=======
++ 	    !is_cr0_wp(vcpu->arch.mmu) && !fault->user && fault->slot) {
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  		walker.pte_access |= ACC_WRITE_MASK;
+  		walker.pte_access &= ~ACC_USER_MASK;
+  
+@@@ -920,7 -912,7 +926,11 @@@
+  
+  	r = RET_PF_RETRY;
+  	write_lock(&vcpu->kvm->mmu_lock);
+++<<<<<<< HEAD
+ +	if (!is_noslot_pfn(pfn) && mmu_notifier_retry_hva(vcpu->kvm, mmu_seq, hva))
+++=======
++ 	if (fault->slot && mmu_notifier_retry_hva(vcpu->kvm, mmu_seq, fault->hva))
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  		goto out_unlock;
+  
+  	kvm_mmu_audit(vcpu, AUDIT_PRE_PAGE_FAULT);
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index bc5924587138,3e10658cf0d7..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -871,7 -900,7 +871,11 @@@ static int tdp_mmu_map_handle_target_le
+  	int ret = RET_PF_FIXED;
+  	int make_spte_ret = 0;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(is_noslot_pfn(pfn)))
+++=======
++ 	if (unlikely(!fault->slot))
+++>>>>>>> e710c5f6be0e (KVM: x86/mmu: Pass the memslot around via struct kvm_page_fault)
+  		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
+  	else
+  		make_spte_ret = make_spte(vcpu, ACC_ALL, iter->level, iter->gfn,
+* Unmerged path arch/x86/kvm/mmu.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/paging_tmpl.h
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
