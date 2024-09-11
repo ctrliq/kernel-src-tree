@@ -1,0 +1,269 @@
+nfsd: use boottime for lease expiry calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit 20b7d86f29d39e8ae19bb29c24ffee70dc385ddf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/20b7d86f.failed
+
+A couple of time_t variables are only used to track the state of the
+lease time and its expiration. The code correctly uses the 'time_after()'
+macro to make this work on 32-bit architectures even beyond year 2038,
+but the get_seconds() function and the time_t type itself are deprecated
+as they behave inconsistently between 32-bit and 64-bit architectures
+and often lead to code that is not y2038 safe.
+
+As a minor issue, using get_seconds() leads to problems with concurrent
+settimeofday() or clock_settime() calls, in the worst case timeout never
+triggering after the time has been set backwards.
+
+Change nfsd to use time64_t and ktime_get_boottime_seconds() here. This
+is clearly excessive, as boottime by itself means we never go beyond 32
+bits, but it does mean we handle this correctly and consistently without
+having to worry about corner cases and should be no more expensive than
+the previous implementation on 64-bit architectures.
+
+The max_cb_time() function gets changed in order to avoid an expensive
+64-bit division operation, but as the lease time is at most one hour,
+there is no change in behavior.
+
+Also do the same for server-to-server copy expiration time.
+
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+[bfields@redhat.com: fix up copy expiration]
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 20b7d86f29d39e8ae19bb29c24ffee70dc385ddf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4state.c
+#	fs/nfsd/state.h
+diff --cc fs/nfsd/nfs4state.c
+index 20dc2d0f707b,1ad68b49a101..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -747,7 -763,33 +747,37 @@@ int nfs4_init_cp_state(struct nfsd_net 
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+ +void nfs4_free_cp_state(struct nfsd4_copy *copy)
+++=======
++ int nfs4_init_copy_state(struct nfsd_net *nn, struct nfsd4_copy *copy)
++ {
++ 	return nfs4_init_cp_state(nn, &copy->cp_stateid, NFS4_COPY_STID);
++ }
++ 
++ struct nfs4_cpntf_state *nfs4_alloc_init_cpntf_state(struct nfsd_net *nn,
++ 						     struct nfs4_stid *p_stid)
++ {
++ 	struct nfs4_cpntf_state *cps;
++ 
++ 	cps = kzalloc(sizeof(struct nfs4_cpntf_state), GFP_KERNEL);
++ 	if (!cps)
++ 		return NULL;
++ 	cps->cpntf_time = ktime_get_boottime_seconds();
++ 	refcount_set(&cps->cp_stateid.sc_count, 1);
++ 	if (!nfs4_init_cp_state(nn, &cps->cp_stateid, NFS4_COPYNOTIFY_STID))
++ 		goto out_free;
++ 	spin_lock(&nn->s2s_cp_lock);
++ 	list_add(&cps->cp_list, &p_stid->sc_cp_list);
++ 	spin_unlock(&nn->s2s_cp_lock);
++ 	return cps;
++ out_free:
++ 	kfree(cps);
++ 	return NULL;
++ }
++ 
++ void nfs4_free_copy_state(struct nfsd4_copy *copy)
+++>>>>>>> 20b7d86f29d3 (nfsd: use boottime for lease expiry calculation)
+  {
+  	struct nfsd_net *nn;
+  
+@@@ -5183,9 -5233,8 +5213,14 @@@ nfsd4_end_grace(struct nfsd_net *nn
+   */
+  static bool clients_still_reclaiming(struct nfsd_net *nn)
+  {
+++<<<<<<< HEAD
+ +	unsigned long now = get_seconds();
+ +	unsigned long double_grace_period_end = nn->boot_time +
+ +						2 * nn->nfsd4_lease;
+++=======
++ 	time64_t double_grace_period_end = nn->boot_time +
++ 					   2 * nn->nfsd4_lease;
+++>>>>>>> 20b7d86f29d3 (nfsd: use boottime for lease expiry calculation)
+  
+  	if (nn->track_reclaim_completes &&
+  			atomic_read(&nn->nr_reclaim_complete) ==
+@@@ -5212,8 -5261,11 +5247,16 @@@ nfs4_laundromat(struct nfsd_net *nn
+  	struct nfs4_ol_stateid *stp;
+  	struct nfsd4_blocked_lock *nbl;
+  	struct list_head *pos, *next, reaplist;
+++<<<<<<< HEAD
+ +	time_t cutoff = get_seconds() - nn->nfsd4_lease;
+ +	time_t t, new_timeo = nn->nfsd4_lease;
+++=======
++ 	time64_t cutoff = ktime_get_boottime_seconds() - nn->nfsd4_lease;
++ 	time64_t t, new_timeo = nn->nfsd4_lease;
++ 	struct nfs4_cpntf_state *cps;
++ 	copy_stateid_t *cps_t;
++ 	int i;
+++>>>>>>> 20b7d86f29d3 (nfsd: use boottime for lease expiry calculation)
+  
+  	dprintk("NFSD: laundromat service - starting\n");
+  
+@@@ -5224,6 -5276,16 +5267,19 @@@
+  	dprintk("NFSD: end of grace period\n");
+  	nfsd4_end_grace(nn);
+  	INIT_LIST_HEAD(&reaplist);
+++<<<<<<< HEAD
+++=======
++ 
++ 	spin_lock(&nn->s2s_cp_lock);
++ 	idr_for_each_entry(&nn->s2s_cp_stateids, cps_t, i) {
++ 		cps = container_of(cps_t, struct nfs4_cpntf_state, cp_stateid);
++ 		if (cps->cp_stateid.sc_type == NFS4_COPYNOTIFY_STID &&
++ 				cps->cpntf_time > cutoff)
++ 			_free_cpntf_state_locked(nn, cps);
++ 	}
++ 	spin_unlock(&nn->s2s_cp_lock);
++ 
+++>>>>>>> 20b7d86f29d3 (nfsd: use boottime for lease expiry calculation)
+  	spin_lock(&nn->client_lock);
+  	list_for_each_safe(pos, next, &nn->client_lru) {
+  		clp = list_entry(pos, struct nfs4_client, cl_lru);
+@@@ -5605,6 -5708,38 +5659,41 @@@ nfs4_check_file(struct svc_rqst *rqstp
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __be32 find_cpntf_state(struct nfsd_net *nn, stateid_t *st,
++ 			       struct nfs4_stid **stid)
++ {
++ 	__be32 status;
++ 	struct nfs4_cpntf_state *cps = NULL;
++ 	struct nfsd4_compound_state cstate;
++ 
++ 	status = manage_cpntf_state(nn, st, NULL, &cps);
++ 	if (status)
++ 		return status;
++ 
++ 	cps->cpntf_time = ktime_get_boottime_seconds();
++ 	memset(&cstate, 0, sizeof(cstate));
++ 	status = lookup_clientid(&cps->cp_p_clid, &cstate, nn, true);
++ 	if (status)
++ 		goto out;
++ 	status = nfsd4_lookup_stateid(&cstate, &cps->cp_p_stateid,
++ 				NFS4_DELEG_STID|NFS4_OPEN_STID|NFS4_LOCK_STID,
++ 				stid, nn);
++ 	put_client_renew(cstate.clp);
++ out:
++ 	nfs4_put_cpntf_state(nn, cps);
++ 	return status;
++ }
++ 
++ void nfs4_put_cpntf_state(struct nfsd_net *nn, struct nfs4_cpntf_state *cps)
++ {
++ 	spin_lock(&nn->s2s_cp_lock);
++ 	_free_cpntf_state_locked(nn, cps);
++ 	spin_unlock(&nn->s2s_cp_lock);
++ }
++ 
+++>>>>>>> 20b7d86f29d3 (nfsd: use boottime for lease expiry calculation)
+  /*
+   * Checks for stateid operations
+   */
+diff --cc fs/nfsd/state.h
+index c1f3f6e65999,68d3f30ee760..000000000000
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@@ -104,6 -113,17 +104,20 @@@ struct nfs4_stid 
+  	void			(*sc_free)(struct nfs4_stid *);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Keep a list of stateids issued by the COPY_NOTIFY, associate it with the
++  * parent OPEN/LOCK/DELEG stateid.
++  */
++ struct nfs4_cpntf_state {
++ 	copy_stateid_t		cp_stateid;
++ 	struct list_head	cp_list;	/* per parent nfs4_stid */
++ 	stateid_t		cp_p_stateid;	/* copy of parent's stateid */
++ 	clientid_t		cp_p_clid;	/* copy of parent's clid */
++ 	time64_t		cpntf_time;	/* last time stateid used */
++ };
++ 
+++>>>>>>> 20b7d86f29d3 (nfsd: use boottime for lease expiry calculation)
+  /*
+   * Represents a delegation stateid. The nfs4_client holds references to these
+   * and they are put when it is being destroyed or when the delegation is
+diff --git a/fs/nfsd/netns.h b/fs/nfsd/netns.h
+index d647fa17a5fd..735f80f90b87 100644
+--- a/fs/nfsd/netns.h
++++ b/fs/nfsd/netns.h
+@@ -105,8 +105,8 @@ struct nfsd_net {
+ 	bool in_grace;
+ 	const struct nfsd4_client_tracking_ops *client_tracking_ops;
+ 
+-	time_t nfsd4_lease;
+-	time_t nfsd4_grace;
++	time64_t nfsd4_lease;
++	time64_t nfsd4_grace;
+ 	bool somebody_reclaimed;
+ 
+ 	bool track_reclaim_completes;
+diff --git a/fs/nfsd/nfs4callback.c b/fs/nfsd/nfs4callback.c
+index 9c45c3260aa1..f41065e8400f 100644
+--- a/fs/nfsd/nfs4callback.c
++++ b/fs/nfsd/nfs4callback.c
+@@ -823,7 +823,16 @@ static const struct rpc_program cb_program = {
+ static int max_cb_time(struct net *net)
+ {
+ 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+-	return max(nn->nfsd4_lease/10, (time_t)1) * HZ;
++
++	/*
++	 * nfsd4_lease is set to at most one hour in __nfsd4_write_time,
++	 * so we can use 32-bit math on it. Warn if that assumption
++	 * ever stops being true.
++	 */
++	if (WARN_ON_ONCE(nn->nfsd4_lease > 3600))
++		return 360 * HZ;
++
++	return max(((u32)nn->nfsd4_lease)/10, 1u) * HZ;
+ }
+ 
+ static struct workqueue_struct *callback_wq;
+* Unmerged path fs/nfsd/nfs4state.c
+diff --git a/fs/nfsd/nfsctl.c b/fs/nfsd/nfsctl.c
+index 84a10209c454..40ef361f30d8 100644
+--- a/fs/nfsd/nfsctl.c
++++ b/fs/nfsd/nfsctl.c
+@@ -954,7 +954,7 @@ static ssize_t write_maxconn(struct file *file, char *buf, size_t size)
+ 
+ #ifdef CONFIG_NFSD_V4
+ static ssize_t __nfsd4_write_time(struct file *file, char *buf, size_t size,
+-				  time_t *time, struct nfsd_net *nn)
++				  time64_t *time, struct nfsd_net *nn)
+ {
+ 	char *mesg = buf;
+ 	int rv, i;
+@@ -982,11 +982,11 @@ static ssize_t __nfsd4_write_time(struct file *file, char *buf, size_t size,
+ 		*time = i;
+ 	}
+ 
+-	return scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%ld\n", *time);
++	return scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%lld\n", *time);
+ }
+ 
+ static ssize_t nfsd4_write_time(struct file *file, char *buf, size_t size,
+-				time_t *time, struct nfsd_net *nn)
++				time64_t *time, struct nfsd_net *nn)
+ {
+ 	ssize_t rv;
+ 
+* Unmerged path fs/nfsd/state.h
