@@ -1,0 +1,265 @@
+dma-direct: Force unencrypted DMA under SME for certain DMA masks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 9087c37584fb7d8315877bb55f85e4268cc0b4f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/9087c375.failed
+
+If a device doesn't support DMA to a physical address that includes the
+encryption bit (currently bit 47, so 48-bit DMA), then the DMA must
+occur to unencrypted memory. SWIOTLB is used to satisfy that requirement
+if an IOMMU is not active (enabled or configured in passthrough mode).
+
+However, commit fafadcd16595 ("swiotlb: don't dip into swiotlb pool for
+coherent allocations") modified the coherent allocation support in
+SWIOTLB to use the DMA direct coherent allocation support. When an IOMMU
+is not active, this resulted in dma_alloc_coherent() failing for devices
+that didn't support DMA addresses that included the encryption bit.
+
+Addressing this requires changes to the force_dma_unencrypted() function
+in kernel/dma/direct.c. Since the function is now non-trivial and
+SME/SEV specific, update the DMA direct support to add an arch override
+for the force_dma_unencrypted() function. The arch override is selected
+when CONFIG_AMD_MEM_ENCRYPT is set. The arch override function resides in
+the arch/x86/mm/mem_encrypt.c file and forces unencrypted DMA when either
+SEV is active or SME is active and the device does not support DMA to
+physical addresses that include the encryption bit.
+
+Fixes: fafadcd16595 ("swiotlb: don't dip into swiotlb pool for coherent allocations")
+	Suggested-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+[hch: moved the force_dma_unencrypted declaration to dma-mapping.h,
+      fold the s390 fix from Halil Pasic]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 9087c37584fb7d8315877bb55f85e4268cc0b4f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/Kconfig
+#	arch/s390/mm/init.c
+#	arch/x86/Kconfig
+#	kernel/dma/direct.c
+diff --cc arch/s390/Kconfig
+index 04005b10ee5b,a4ad2733eedf..000000000000
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@@ -179,8 -188,10 +179,14 @@@ config S39
+  	select TTY
+  	select VIRT_CPU_ACCOUNTING
+  	select ARCH_HAS_SCALED_CPUTIME
+ +	select VIRT_TO_BUS
+  	select HAVE_NMI
+++<<<<<<< HEAD
+++=======
++ 	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
++ 	select SWIOTLB
++ 	select GENERIC_ALLOCATOR
+++>>>>>>> 9087c37584fb (dma-direct: Force unencrypted DMA under SME for certain DMA masks)
+  
+  
+  config SCHED_OMIT_FRAME_POINTER
+diff --cc arch/s390/mm/init.c
+index 92d7a153e72a,78c319c5ce48..000000000000
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@@ -29,7 -30,7 +29,11 @@@
+  #include <linux/export.h>
+  #include <linux/cma.h>
+  #include <linux/gfp.h>
+++<<<<<<< HEAD
+ +#include <linux/memblock.h>
+++=======
++ #include <linux/dma-direct.h>
+++>>>>>>> 9087c37584fb (dma-direct: Force unencrypted DMA under SME for certain DMA masks)
+  #include <asm/processor.h>
+  #include <linux/uaccess.h>
+  #include <asm/pgtable.h>
+@@@ -127,6 -132,52 +131,55 @@@ void mark_rodata_ro(void
+  	pr_info("Write protected read-only-after-init data: %luk\n", size >> 10);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int set_memory_encrypted(unsigned long addr, int numpages)
++ {
++ 	int i;
++ 
++ 	/* make specified pages unshared, (swiotlb, dma_free) */
++ 	for (i = 0; i < numpages; ++i) {
++ 		uv_remove_shared(addr);
++ 		addr += PAGE_SIZE;
++ 	}
++ 	return 0;
++ }
++ 
++ int set_memory_decrypted(unsigned long addr, int numpages)
++ {
++ 	int i;
++ 	/* make specified pages shared (swiotlb, dma_alloca) */
++ 	for (i = 0; i < numpages; ++i) {
++ 		uv_set_shared(addr);
++ 		addr += PAGE_SIZE;
++ 	}
++ 	return 0;
++ }
++ 
++ /* are we a protected virtualization guest? */
++ bool sev_active(void)
++ {
++ 	return is_prot_virt_guest();
++ }
++ 
++ bool force_dma_unencrypted(struct device *dev)
++ {
++ 	return sev_active();
++ }
++ 
++ /* protected virtualization */
++ static void pv_init(void)
++ {
++ 	if (!is_prot_virt_guest())
++ 		return;
++ 
++ 	/* make sure bounce buffers are shared */
++ 	swiotlb_init(1);
++ 	swiotlb_update_mem_attributes();
++ 	swiotlb_force = SWIOTLB_FORCE;
++ }
++ 
+++>>>>>>> 9087c37584fb (dma-direct: Force unencrypted DMA under SME for certain DMA masks)
+  void __init mem_init(void)
+  {
+  	cpumask_set_cpu(0, &init_mm.context.cpu_attach_mask);
+diff --cc arch/x86/Kconfig
+index 9e4d0be6f50c,d1afe92bf994..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -1492,6 -1527,8 +1492,11 @@@ config AMD_MEM_ENCRYP
+  	bool "AMD Secure Memory Encryption (SME) support"
+  	depends on X86_64 && CPU_SUP_AMD
+  	select DYNAMIC_PHYSICAL_MASK
+++<<<<<<< HEAD
+++=======
++ 	select ARCH_USE_MEMREMAP_PROT
++ 	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
+++>>>>>>> 9087c37584fb (dma-direct: Force unencrypted DMA under SME for certain DMA masks)
+  	---help---
+  	  Say yes to enable support for the encryption of system memory.
+  	  This requires an AMD processor that supports Secure Memory
+diff --cc kernel/dma/direct.c
+index 26bb7b9a7670,d7cec866d16b..000000000000
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@@ -172,8 -178,18 +164,18 @@@ void dma_direct_free_pages(struct devic
+  {
+  	unsigned int page_order = get_order(size);
+  
+++<<<<<<< HEAD
+ +	if (force_dma_unencrypted())
+++=======
++ 	if (attrs & DMA_ATTR_NO_KERNEL_MAPPING) {
++ 		/* cpu_addr is a struct page cookie, not a kernel address */
++ 		__dma_direct_free_pages(dev, size, cpu_addr);
++ 		return;
++ 	}
++ 
++ 	if (force_dma_unencrypted(dev))
+++>>>>>>> 9087c37584fb (dma-direct: Force unencrypted DMA under SME for certain DMA masks)
+  		set_memory_encrypted((unsigned long)cpu_addr, 1 << page_order);
+ -
+ -	if (IS_ENABLED(CONFIG_ARCH_HAS_UNCACHED_SEGMENT) &&
+ -	    dma_alloc_need_uncached(dev, attrs))
+ -		cpu_addr = cached_kernel_address(cpu_addr);
+  	__dma_direct_free_pages(dev, size, virt_to_page(cpu_addr));
+  }
+  
+* Unmerged path arch/s390/Kconfig
+* Unmerged path arch/s390/mm/init.c
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/mm/mem_encrypt.c b/arch/x86/mm/mem_encrypt.c
+index fa8a4b7f91f2..ff38163d5adb 100644
+--- a/arch/x86/mm/mem_encrypt.c
++++ b/arch/x86/mm/mem_encrypt.c
+@@ -18,6 +18,10 @@
+ #include <linux/dma-direct.h>
+ #include <linux/swiotlb.h>
+ #include <linux/mem_encrypt.h>
++#include <linux/device.h>
++#include <linux/kernel.h>
++#include <linux/bitops.h>
++#include <linux/dma-mapping.h>
+ 
+ #include <asm/tlbflush.h>
+ #include <asm/fixmap.h>
+@@ -351,6 +355,32 @@ bool sev_active(void)
+ }
+ EXPORT_SYMBOL(sev_active);
+ 
++/* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
++bool force_dma_unencrypted(struct device *dev)
++{
++	/*
++	 * For SEV, all DMA must be to unencrypted addresses.
++	 */
++	if (sev_active())
++		return true;
++
++	/*
++	 * For SME, all DMA must be to unencrypted addresses if the
++	 * device does not support DMA to addresses that include the
++	 * encryption mask.
++	 */
++	if (sme_active()) {
++		u64 dma_enc_mask = DMA_BIT_MASK(__ffs64(sme_me_mask));
++		u64 dma_dev_mask = min_not_zero(dev->coherent_dma_mask,
++						dev->bus_dma_mask);
++
++		if (dma_dev_mask <= dma_enc_mask)
++			return true;
++	}
++
++	return false;
++}
++
+ /* Architecture __weak replacement functions */
+ void __init mem_encrypt_init(void)
+ {
+diff --git a/include/linux/dma-direct.h b/include/linux/dma-direct.h
+index b7338702592a..adf993a3bd58 100644
+--- a/include/linux/dma-direct.h
++++ b/include/linux/dma-direct.h
+@@ -32,6 +32,15 @@ static inline bool dma_capable(struct device *dev, dma_addr_t addr, size_t size)
+ }
+ #endif /* !CONFIG_ARCH_HAS_PHYS_TO_DMA */
+ 
++#ifdef CONFIG_ARCH_HAS_FORCE_DMA_UNENCRYPTED
++bool force_dma_unencrypted(struct device *dev);
++#else
++static inline bool force_dma_unencrypted(struct device *dev)
++{
++	return false;
++}
++#endif /* CONFIG_ARCH_HAS_FORCE_DMA_UNENCRYPTED */
++
+ /*
+  * If memory encryption is supported, phys_to_dma will set the memory encryption
+  * bit in the DMA address, and dma_to_phys will clear it.  The raw __phys_to_dma
+diff --git a/kernel/dma/Kconfig b/kernel/dma/Kconfig
+index 7154428a9ca5..db9dcea76e93 100644
+--- a/kernel/dma/Kconfig
++++ b/kernel/dma/Kconfig
+@@ -35,6 +35,9 @@ config ARCH_HAS_DMA_COHERENT_TO_PFN
+ config ARCH_HAS_DMA_MMAP_PGPROT
+ 	bool
+ 
++config ARCH_HAS_FORCE_DMA_UNENCRYPTED
++	bool
++
+ config DMA_NONCOHERENT_CACHE_SYNC
+ 	bool
+ 
+* Unmerged path kernel/dma/direct.c
