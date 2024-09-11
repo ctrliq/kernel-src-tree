@@ -1,0 +1,263 @@
+iommu/io-pgtable-arm: Rationalise TTBRn handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit d1e5f26f14272b5039cc198569ec4fabed14e6db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d1e5f26f.failed
+
+TTBR1 values have so far been redundant since no users implement any
+support for split address spaces. Crucially, though, one of the main
+reasons for wanting to do so is to be able to manage each half entirely
+independently, e.g. context-switching one set of mappings without
+disturbing the other. Thus it seems unlikely that tying two tables
+together in a single io_pgtable_cfg would ever be particularly desirable
+or useful.
+
+Streamline the configs to just a single conceptual TTBR value
+representing the allocated table. This paves the way for future users to
+support split address spaces by simply allocating a table and dealing
+with the detailed TTBRn logistics themselves.
+
+	Tested-by: Jordan Crouse <jcrouse@codeaurora.org>
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+[will: Drop change to ttbr value]
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit d1e5f26f14272b5039cc198569ec4fabed14e6db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/ipmmu-vmsa.c
+#	drivers/iommu/mtk_iommu.c
+diff --cc drivers/iommu/ipmmu-vmsa.c
+index 8ccab8ec763c,ecb3f9464dd5..000000000000
+--- a/drivers/iommu/ipmmu-vmsa.c
++++ b/drivers/iommu/ipmmu-vmsa.c
+@@@ -402,6 -372,57 +402,60 @@@ static int ipmmu_domain_init_context(st
+  {
+  	u64 ttbr;
+  	u32 tmp;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* TTBR0 */
++ 	ttbr = domain->cfg.arm_lpae_s1_cfg.ttbr;
++ 	ipmmu_ctx_write_root(domain, IMTTLBR0, ttbr);
++ 	ipmmu_ctx_write_root(domain, IMTTUBR0, ttbr >> 32);
++ 
++ 	/*
++ 	 * TTBCR
++ 	 * We use long descriptors and allocate the whole 32-bit VA space to
++ 	 * TTBR0.
++ 	 */
++ 	if (domain->mmu->features->twobit_imttbcr_sl0)
++ 		tmp = IMTTBCR_SL0_TWOBIT_LVL_1;
++ 	else
++ 		tmp = IMTTBCR_SL0_LVL_1;
++ 
++ 	if (domain->mmu->features->cache_snoop)
++ 		tmp |= IMTTBCR_SH0_INNER_SHAREABLE | IMTTBCR_ORGN0_WB_WA |
++ 		       IMTTBCR_IRGN0_WB_WA;
++ 
++ 	ipmmu_ctx_write_root(domain, IMTTBCR, IMTTBCR_EAE | tmp);
++ 
++ 	/* MAIR0 */
++ 	ipmmu_ctx_write_root(domain, IMMAIR0,
++ 			     domain->cfg.arm_lpae_s1_cfg.mair);
++ 
++ 	/* IMBUSCR */
++ 	if (domain->mmu->features->setup_imbuscr)
++ 		ipmmu_ctx_write_root(domain, IMBUSCR,
++ 				     ipmmu_ctx_read_root(domain, IMBUSCR) &
++ 				     ~(IMBUSCR_DVM | IMBUSCR_BUSSEL_MASK));
++ 
++ 	/*
++ 	 * IMSTR
++ 	 * Clear all interrupt flags.
++ 	 */
++ 	ipmmu_ctx_write_root(domain, IMSTR, ipmmu_ctx_read_root(domain, IMSTR));
++ 
++ 	/*
++ 	 * IMCTR
++ 	 * Enable the MMU and interrupt generation. The long-descriptor
++ 	 * translation table format doesn't use TEX remapping. Don't enable AF
++ 	 * software management as we have no use for it. Flush the TLB as
++ 	 * required when modifying the context registers.
++ 	 */
++ 	ipmmu_ctx_write_all(domain, IMCTR,
++ 			    IMCTR_INTEN | IMCTR_FLUSH | IMCTR_MMUEN);
++ }
++ 
++ static int ipmmu_domain_init_context(struct ipmmu_vmsa_domain *domain)
++ {
+++>>>>>>> d1e5f26f1427 (iommu/io-pgtable-arm: Rationalise TTBRn handling)
+  	int ret;
+  
+  	/*
+diff --cc drivers/iommu/mtk_iommu.c
+index 38aceac865e2,95945f467c03..000000000000
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@@ -366,7 -367,7 +366,11 @@@ static int mtk_iommu_attach_device(stru
+  	/* Update the pgtable base address register of the M4U HW */
+  	if (!data->m4u_dom) {
+  		data->m4u_dom = dom;
+++<<<<<<< HEAD
+ +		writel(dom->cfg.arm_v7s_cfg.ttbr[0],
+++=======
++ 		writel(dom->cfg.arm_v7s_cfg.ttbr & MMU_PT_ADDR_MASK,
+++>>>>>>> d1e5f26f1427 (iommu/io-pgtable-arm: Rationalise TTBRn handling)
+  		       data->base + REG_MMU_PT_BASE_ADDR);
+  	}
+  
+@@@ -752,8 -763,9 +756,14 @@@ static int __maybe_unused mtk_iommu_res
+  	writel_relaxed(reg->int_control0, base + REG_MMU_INT_CONTROL0);
+  	writel_relaxed(reg->int_main_control, base + REG_MMU_INT_MAIN_CONTROL);
+  	writel_relaxed(reg->ivrp_paddr, base + REG_MMU_IVRP_PADDR);
+++<<<<<<< HEAD
+ +	if (data->m4u_dom)
+ +		writel(data->m4u_dom->cfg.arm_v7s_cfg.ttbr[0],
+++=======
++ 	writel_relaxed(reg->vld_pa_rng, base + REG_MMU_VLD_PA_RNG);
++ 	if (m4u_dom)
++ 		writel(m4u_dom->cfg.arm_v7s_cfg.ttbr & MMU_PT_ADDR_MASK,
+++>>>>>>> d1e5f26f1427 (iommu/io-pgtable-arm: Rationalise TTBRn handling)
+  		       base + REG_MMU_PT_BASE_ADDR);
+  	return 0;
+  }
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index d076622e2dd4..a829fec17cf9 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -2177,7 +2177,7 @@ static int arm_smmu_domain_finalise_s1(struct arm_smmu_domain *smmu_domain,
+ 	}
+ 
+ 	cfg->cd.asid	= (u16)asid;
+-	cfg->cd.ttbr	= pgtbl_cfg->arm_lpae_s1_cfg.ttbr[0];
++	cfg->cd.ttbr	= pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
+ 	cfg->cd.tcr	= pgtbl_cfg->arm_lpae_s1_cfg.tcr;
+ 	cfg->cd.mair	= pgtbl_cfg->arm_lpae_s1_cfg.mair[0];
+ 	return 0;
+diff --git a/drivers/iommu/arm-smmu.c b/drivers/iommu/arm-smmu.c
+index ab9a0239376c..809ec4710295 100644
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@ -726,13 +726,12 @@ static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain,
+ 	/* TTBRs */
+ 	if (stage1) {
+ 		if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH32_S) {
+-			cb->ttbr[0] = pgtbl_cfg->arm_v7s_cfg.ttbr[0];
+-			cb->ttbr[1] = pgtbl_cfg->arm_v7s_cfg.ttbr[1];
++			cb->ttbr[0] = pgtbl_cfg->arm_v7s_cfg.ttbr;
++			cb->ttbr[1] = 0;
+ 		} else {
+-			cb->ttbr[0] = pgtbl_cfg->arm_lpae_s1_cfg.ttbr[0];
++			cb->ttbr[0] = pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
+ 			cb->ttbr[0] |= FIELD_PREP(TTBRn_ASID, cfg->asid);
+-			cb->ttbr[1] = pgtbl_cfg->arm_lpae_s1_cfg.ttbr[1];
+-			cb->ttbr[1] |= FIELD_PREP(TTBRn_ASID, cfg->asid);
++			cb->ttbr[1] = FIELD_PREP(TTBRn_ASID, cfg->asid);
+ 		}
+ 	} else {
+ 		cb->ttbr[0] = pgtbl_cfg->arm_lpae_s2_cfg.vttbr;
+diff --git a/drivers/iommu/io-pgtable-arm-v7s.c b/drivers/iommu/io-pgtable-arm-v7s.c
+index c4cce9fb7cff..8cfa768f9116 100644
+--- a/drivers/iommu/io-pgtable-arm-v7s.c
++++ b/drivers/iommu/io-pgtable-arm-v7s.c
+@@ -786,15 +786,14 @@ static struct io_pgtable *arm_v7s_alloc_pgtable(struct io_pgtable_cfg *cfg,
+ 	/* Ensure the empty pgd is visible before any actual TTBR write */
+ 	wmb();
+ 
+-	/* TTBRs */
+-	cfg->arm_v7s_cfg.ttbr[0] = virt_to_phys(data->pgd) |
+-				   ARM_V7S_TTBR_S | ARM_V7S_TTBR_NOS |
+-				   (cfg->coherent_walk ?
+-				   (ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_WBWA) |
+-				    ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_WBWA)) :
+-				   (ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_NC) |
+-				    ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_NC)));
+-	cfg->arm_v7s_cfg.ttbr[1] = 0;
++	/* TTBR */
++	cfg->arm_v7s_cfg.ttbr = virt_to_phys(data->pgd) |
++				ARM_V7S_TTBR_S | ARM_V7S_TTBR_NOS |
++				(cfg->coherent_walk ?
++				(ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_WBWA) |
++				 ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_WBWA)) :
++				(ARM_V7S_TTBR_IRGN_ATTR(ARM_V7S_RGN_NC) |
++				 ARM_V7S_TTBR_ORGN_ATTR(ARM_V7S_RGN_NC)));
+ 	return &data->iop;
+ 
+ out_free_data:
+diff --git a/drivers/iommu/io-pgtable-arm.c b/drivers/iommu/io-pgtable-arm.c
+index 4e5d466384a5..69a4dc5bffd6 100644
+--- a/drivers/iommu/io-pgtable-arm.c
++++ b/drivers/iommu/io-pgtable-arm.c
+@@ -884,9 +884,8 @@ arm_64_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
+ 	/* Ensure the empty pgd is visible before any actual TTBR write */
+ 	wmb();
+ 
+-	/* TTBRs */
+-	cfg->arm_lpae_s1_cfg.ttbr[0] = virt_to_phys(data->pgd);
+-	cfg->arm_lpae_s1_cfg.ttbr[1] = 0;
++	/* TTBR */
++	cfg->arm_lpae_s1_cfg.ttbr = virt_to_phys(data->pgd);
+ 	return &data->iop;
+ 
+ out_free_data:
+* Unmerged path drivers/iommu/ipmmu-vmsa.c
+diff --git a/drivers/iommu/msm_iommu.c b/drivers/iommu/msm_iommu.c
+index 306a90d2f5e4..8164a0221425 100644
+--- a/drivers/iommu/msm_iommu.c
++++ b/drivers/iommu/msm_iommu.c
+@@ -290,8 +290,8 @@ static void __program_context(void __iomem *base, int ctx,
+ 	SET_V2PCFG(base, ctx, 0x3);
+ 
+ 	SET_TTBCR(base, ctx, priv->cfg.arm_v7s_cfg.tcr);
+-	SET_TTBR0(base, ctx, priv->cfg.arm_v7s_cfg.ttbr[0]);
+-	SET_TTBR1(base, ctx, priv->cfg.arm_v7s_cfg.ttbr[1]);
++	SET_TTBR0(base, ctx, priv->cfg.arm_v7s_cfg.ttbr);
++	SET_TTBR1(base, ctx, 0);
+ 
+ 	/* Set prrr and nmrr */
+ 	SET_PRRR(base, ctx, priv->cfg.arm_v7s_cfg.prrr);
+* Unmerged path drivers/iommu/mtk_iommu.c
+diff --git a/drivers/iommu/qcom_iommu.c b/drivers/iommu/qcom_iommu.c
+index 763f16e52d2a..d24b4d1577b0 100644
+--- a/drivers/iommu/qcom_iommu.c
++++ b/drivers/iommu/qcom_iommu.c
+@@ -280,10 +280,9 @@ static int qcom_iommu_init_domain(struct iommu_domain *domain,
+ 
+ 		/* TTBRs */
+ 		iommu_writeq(ctx, ARM_SMMU_CB_TTBR0,
+-				pgtbl_cfg.arm_lpae_s1_cfg.ttbr[0] |
++				pgtbl_cfg.arm_lpae_s1_cfg.ttbr |
+ 				FIELD_PREP(TTBRn_ASID, ctx->asid));
+ 		iommu_writeq(ctx, ARM_SMMU_CB_TTBR1,
+-				pgtbl_cfg.arm_lpae_s1_cfg.ttbr[1] |
+ 				FIELD_PREP(TTBRn_ASID, ctx->asid));
+ 
+ 		/* TCR */
+diff --git a/include/linux/io-pgtable.h b/include/linux/io-pgtable.h
+index 6b1b8be3ebec..236c7c0b7866 100644
+--- a/include/linux/io-pgtable.h
++++ b/include/linux/io-pgtable.h
+@@ -101,7 +101,7 @@ struct io_pgtable_cfg {
+ 	/* Low-level data specific to the table format */
+ 	union {
+ 		struct {
+-			u64	ttbr[2];
++			u64	ttbr;
+ 			u64	tcr;
+ 			u64	mair[2];
+ 		} arm_lpae_s1_cfg;
+@@ -112,7 +112,7 @@ struct io_pgtable_cfg {
+ 		} arm_lpae_s2_cfg;
+ 
+ 		struct {
+-			u32	ttbr[2];
++			u32	ttbr;
+ 			u32	tcr;
+ 			u32	nmrr;
+ 			u32	prrr;
