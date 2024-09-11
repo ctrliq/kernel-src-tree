@@ -1,0 +1,201 @@
+blk-mq: allow blk_mq_make_request to consume the q_usage_counter reference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit ac7c5675fa45a372fab27d78a72d2e10e4734959
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ac7c5675.failed
+
+blk_mq_make_request currently needs to grab an q_usage_counter
+reference when allocating a request.  This is because the block layer
+grabs one before calling blk_mq_make_request, but also releases it as
+soon as blk_mq_make_request returns.  Remove the blk_queue_exit call
+after blk_mq_make_request returns, and instead let it consume the
+reference.  This works perfectly fine for the block layer caller, just
+device mapper needs an extra reference as the old problem still
+persists there.  Open code blk_queue_enter_live in device mapper,
+as there should be no other callers and this allows better documenting
+why we do a non-try get.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit ac7c5675fa45a372fab27d78a72d2e10e4734959)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq.c
+#	drivers/md/dm.c
+diff --cc block/blk-core.c
+index ca0690d00a60,78683ea61c93..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -1064,9 -1145,7 +1078,13 @@@ blk_qc_t generic_make_request(struct bi
+  			/* Create a fresh bio_list for all subordinate requests */
+  			bio_list_on_stack[1] = bio_list_on_stack[0];
+  			bio_list_init(&bio_list_on_stack[0]);
+++<<<<<<< HEAD
+ +			ret = q->make_request_fn(q, bio);
+ +
+ +			blk_queue_exit(q);
+++=======
++ 			ret = do_make_request(bio);
+++>>>>>>> ac7c5675fa45 (blk-mq: allow blk_mq_make_request to consume the q_usage_counter reference)
+  
+  			/* sort new bios into those for a lower level
+  			 * and those for the same level
+@@@ -1111,23 -1182,20 +1129,34 @@@ EXPORT_SYMBOL(generic_make_request)
+  blk_qc_t direct_make_request(struct bio *bio)
+  {
+  	struct request_queue *q = bio->bi_disk->queue;
+++<<<<<<< HEAD
+ +	bool nowait = bio->bi_opf & REQ_NOWAIT;
+ +	blk_qc_t ret;
+++=======
+++>>>>>>> ac7c5675fa45 (blk-mq: allow blk_mq_make_request to consume the q_usage_counter reference)
+  
+ -	if (WARN_ON_ONCE(q->make_request_fn)) {
+ -		bio_io_error(bio);
+ -		return BLK_QC_T_NONE;
+ -	}
+  	if (!generic_make_request_checks(bio))
+  		return BLK_QC_T_NONE;
+ -	if (unlikely(bio_queue_enter(bio)))
+ +
+ +	if (unlikely(blk_queue_enter(q, nowait ? BLK_MQ_REQ_NOWAIT : 0))) {
+ +		if (nowait && !blk_queue_dying(q))
+ +			bio_wouldblock_error(bio);
+ +		else
+ +			bio_io_error(bio);
+  		return BLK_QC_T_NONE;
+++<<<<<<< HEAD
+ +	}
+ +
+ +	ret = q->make_request_fn(q, bio);
+ +	blk_queue_exit(q);
+ +	return ret;
+++=======
++ 	if (!blk_crypto_bio_prep(&bio)) {
++ 		blk_queue_exit(q);
++ 		return BLK_QC_T_NONE;
++ 	}
++ 	return blk_mq_make_request(q, bio);
+++>>>>>>> ac7c5675fa45 (blk-mq: allow blk_mq_make_request to consume the q_usage_counter reference)
+  }
+  EXPORT_SYMBOL_GPL(direct_make_request);
+  
+diff --cc block/blk-mq.c
+index 9ae50b6aa4f6,cac11945f602..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -2023,29 -2020,28 +2023,40 @@@ static blk_qc_t blk_mq_make_request(str
+  	struct request *rq;
+  	struct blk_plug *plug;
+  	struct request *same_queue_rq = NULL;
+ -	unsigned int nr_segs;
+  	blk_qc_t cookie;
+ -	blk_status_t ret;
+  
+  	blk_queue_bounce(q, &bio);
+ -	__blk_queue_split(q, &bio, &nr_segs);
+ +
+ +	blk_queue_split(q, &bio);
+  
+  	if (!bio_integrity_prep(bio))
+- 		return BLK_QC_T_NONE;
++ 		goto queue_exit;
+  
+  	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+++<<<<<<< HEAD
+ +	    blk_attempt_plug_merge(q, bio, &same_queue_rq))
+ +		return BLK_QC_T_NONE;
+ +
+ +	if (blk_mq_sched_bio_merge(q, bio))
+ +		return BLK_QC_T_NONE;
+++=======
++ 	    blk_attempt_plug_merge(q, bio, nr_segs, &same_queue_rq))
++ 		goto queue_exit;
++ 
++ 	if (blk_mq_sched_bio_merge(q, bio, nr_segs))
++ 		goto queue_exit;
+++>>>>>>> ac7c5675fa45 (blk-mq: allow blk_mq_make_request to consume the q_usage_counter reference)
+  
+  	rq_qos_throttle(q, bio);
+  
+  	data.cmd_flags = bio->bi_opf;
+++<<<<<<< HEAD
+ +	blk_queue_enter_live(q);
+ +	rq = __blk_mq_alloc_request(&data);
+++=======
++ 	rq = blk_mq_get_request(q, bio, &data);
+++>>>>>>> ac7c5675fa45 (blk-mq: allow blk_mq_make_request to consume the q_usage_counter reference)
+  	if (unlikely(!rq)) {
+- 		blk_queue_exit(q);
+  		rq_qos_cleanup(q, bio);
+  		if (bio->bi_opf & REQ_NOWAIT)
+  			bio_wouldblock_error(bio);
+@@@ -2128,7 -2132,11 +2139,10 @@@
+  	}
+  
+  	return cookie;
++ queue_exit:
++ 	blk_queue_exit(q);
++ 	return BLK_QC_T_NONE;
+  }
+ -EXPORT_SYMBOL_GPL(blk_mq_make_request); /* only for request based dm */
+  
+  void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+  		     unsigned int hctx_idx)
+diff --cc drivers/md/dm.c
+index 4432fad8e41a,f215b8666448..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1744,6 -1791,18 +1744,21 @@@ static blk_qc_t dm_make_request(struct 
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) {
++ 		/*
++ 		 * We are called with a live reference on q_usage_counter, but
++ 		 * that one will be released as soon as we return.  Grab an
++ 		 * extra one as blk_mq_make_request expects to be able to
++ 		 * consume a reference (which lives until the request is freed
++ 		 * in case a request is allocated).
++ 		 */
++ 		percpu_ref_get(&q->q_usage_counter);
++ 		return blk_mq_make_request(q, bio);
++ 	}
++ 
+++>>>>>>> ac7c5675fa45 (blk-mq: allow blk_mq_make_request to consume the q_usage_counter reference)
+  	map = dm_get_live_table(md, &srcu_idx);
+  
+  	/* if we're suspended, we have to queue this io for later */
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk.h b/block/blk.h
+index 3849dabe650b..87ed152ee4a2 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -63,17 +63,6 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
+ 			struct bio *bio);
+ void blk_freeze_queue(struct request_queue *q);
+ 
+-static inline void blk_queue_enter_live(struct request_queue *q)
+-{
+-	/*
+-	 * Given that running in generic_make_request() context
+-	 * guarantees that a live reference against q_usage_counter has
+-	 * been established, further references under that same context
+-	 * need not check that the queue has been frozen (marked dead).
+-	 */
+-	percpu_ref_get(&q->q_usage_counter);
+-}
+-
+ static inline bool biovec_phys_mergeable(struct request_queue *q,
+ 		struct bio_vec *vec1, struct bio_vec *vec2)
+ {
+* Unmerged path drivers/md/dm.c
