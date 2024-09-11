@@ -1,0 +1,209 @@
+powerpc/xive: add OPAL extensions for the XIVE native exploitation support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [powerpc] xive: add OPAL extensions for the XIVE native exploitation support (David Gibson) [1524674]
+Rebuild_FUZZ: 94.29%
+commit-author Cédric Le Goater <clg@kaod.org>
+commit 88ec6b93c8e7d6d4ffaf6ad6395ceb3bf552de15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/88ec6b93.failed
+
+The support for XIVE native exploitation mode in Linux/KVM needs a
+couple more OPAL calls to get and set the state of the XIVE internal
+structures being used by a sPAPR guest.
+
+	Signed-off-by: Cédric Le Goater <clg@kaod.org>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 88ec6b93c8e7d6d4ffaf6ad6395ceb3bf552de15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/opal-api.h
+#	arch/powerpc/platforms/powernv/opal-call.c
+diff --cc arch/powerpc/include/asm/opal-api.h
+index 8c68c76b9e85,e1d118ac61dc..000000000000
+--- a/arch/powerpc/include/asm/opal-api.h
++++ b/arch/powerpc/include/asm/opal-api.h
+@@@ -209,7 -209,9 +209,13 @@@
+  #define OPAL_SENSOR_GROUP_ENABLE		163
+  #define OPAL_PCI_GET_PBCQ_TUNNEL_BAR		164
+  #define OPAL_PCI_SET_PBCQ_TUNNEL_BAR		165
+++<<<<<<< HEAD
+ +#define OPAL_LAST				165
+++=======
++ #define	OPAL_NX_COPROC_INIT			167
++ #define OPAL_XIVE_GET_VP_STATE			170
++ #define OPAL_LAST				170
+++>>>>>>> 88ec6b93c8e7 (powerpc/xive: add OPAL extensions for the XIVE native exploitation support)
+  
+  #define QUIESCE_HOLD			1 /* Spin all calls at entry */
+  #define QUIESCE_REJECT			2 /* Fail all calls with OPAL_BUSY */
+* Unmerged path arch/powerpc/platforms/powernv/opal-call.c
+* Unmerged path arch/powerpc/include/asm/opal-api.h
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index fc0550ea8dc6..9ce4274181ff 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -279,6 +279,13 @@ int64_t opal_xive_allocate_irq(uint32_t chip_id);
+ int64_t opal_xive_free_irq(uint32_t girq);
+ int64_t opal_xive_sync(uint32_t type, uint32_t id);
+ int64_t opal_xive_dump(uint32_t type, uint32_t id);
++int64_t opal_xive_get_queue_state(uint64_t vp, uint32_t prio,
++				  __be32 *out_qtoggle,
++				  __be32 *out_qindex);
++int64_t opal_xive_set_queue_state(uint64_t vp, uint32_t prio,
++				  uint32_t qtoggle,
++				  uint32_t qindex);
++int64_t opal_xive_get_vp_state(uint64_t vp, __be64 *out_w01);
+ int64_t opal_pci_set_p2p(uint64_t phb_init, uint64_t phb_target,
+ 			uint64_t desc, uint16_t pe_number);
+ 
+diff --git a/arch/powerpc/include/asm/xive.h b/arch/powerpc/include/asm/xive.h
+index 8d1a2792484f..7840ecbad34f 100644
+--- a/arch/powerpc/include/asm/xive.h
++++ b/arch/powerpc/include/asm/xive.h
+@@ -110,12 +110,26 @@ extern int xive_native_configure_queue(u32 vp_id, struct xive_q *q, u8 prio,
+ extern void xive_native_disable_queue(u32 vp_id, struct xive_q *q, u8 prio);
+ 
+ extern void xive_native_sync_source(u32 hw_irq);
++extern void xive_native_sync_queue(u32 hw_irq);
+ extern bool is_xive_irq(struct irq_chip *chip);
+ extern int xive_native_enable_vp(u32 vp_id, bool single_escalation);
+ extern int xive_native_disable_vp(u32 vp_id);
+ extern int xive_native_get_vp_info(u32 vp_id, u32 *out_cam_id, u32 *out_chip_id);
+ extern bool xive_native_has_single_escalation(void);
+ 
++extern int xive_native_get_queue_info(u32 vp_id, uint32_t prio,
++				      u64 *out_qpage,
++				      u64 *out_qsize,
++				      u64 *out_qeoi_page,
++				      u32 *out_escalate_irq,
++				      u64 *out_qflags);
++
++extern int xive_native_get_queue_state(u32 vp_id, uint32_t prio, u32 *qtoggle,
++				       u32 *qindex);
++extern int xive_native_set_queue_state(u32 vp_id, uint32_t prio, u32 qtoggle,
++				       u32 qindex);
++extern int xive_native_get_vp_state(u32 vp_id, u64 *out_state);
++
+ #else
+ 
+ static inline bool xive_enabled(void) { return false; }
+* Unmerged path arch/powerpc/platforms/powernv/opal-call.c
+diff --git a/arch/powerpc/sysdev/xive/native.c b/arch/powerpc/sysdev/xive/native.c
+index 311185b9960a..9681b0f26893 100644
+--- a/arch/powerpc/sysdev/xive/native.c
++++ b/arch/powerpc/sysdev/xive/native.c
+@@ -454,6 +454,12 @@ void xive_native_sync_source(u32 hw_irq)
+ }
+ EXPORT_SYMBOL_GPL(xive_native_sync_source);
+ 
++void xive_native_sync_queue(u32 hw_irq)
++{
++	opal_xive_sync(XIVE_SYNC_QUEUE, hw_irq);
++}
++EXPORT_SYMBOL_GPL(xive_native_sync_queue);
++
+ static const struct xive_ops xive_native_ops = {
+ 	.populate_irq_data	= xive_native_populate_irq_data,
+ 	.configure_irq		= xive_native_configure_irq,
+@@ -728,3 +734,96 @@ bool xive_native_has_single_escalation(void)
+ 	return xive_has_single_esc;
+ }
+ EXPORT_SYMBOL_GPL(xive_native_has_single_escalation);
++
++int xive_native_get_queue_info(u32 vp_id, u32 prio,
++			       u64 *out_qpage,
++			       u64 *out_qsize,
++			       u64 *out_qeoi_page,
++			       u32 *out_escalate_irq,
++			       u64 *out_qflags)
++{
++	__be64 qpage;
++	__be64 qsize;
++	__be64 qeoi_page;
++	__be32 escalate_irq;
++	__be64 qflags;
++	s64 rc;
++
++	rc = opal_xive_get_queue_info(vp_id, prio, &qpage, &qsize,
++				      &qeoi_page, &escalate_irq, &qflags);
++	if (rc) {
++		pr_err("OPAL failed to get queue info for VCPU %d/%d : %lld\n",
++		       vp_id, prio, rc);
++		return -EIO;
++	}
++
++	if (out_qpage)
++		*out_qpage = be64_to_cpu(qpage);
++	if (out_qsize)
++		*out_qsize = be32_to_cpu(qsize);
++	if (out_qeoi_page)
++		*out_qeoi_page = be64_to_cpu(qeoi_page);
++	if (out_escalate_irq)
++		*out_escalate_irq = be32_to_cpu(escalate_irq);
++	if (out_qflags)
++		*out_qflags = be64_to_cpu(qflags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xive_native_get_queue_info);
++
++int xive_native_get_queue_state(u32 vp_id, u32 prio, u32 *qtoggle, u32 *qindex)
++{
++	__be32 opal_qtoggle;
++	__be32 opal_qindex;
++	s64 rc;
++
++	rc = opal_xive_get_queue_state(vp_id, prio, &opal_qtoggle,
++				       &opal_qindex);
++	if (rc) {
++		pr_err("OPAL failed to get queue state for VCPU %d/%d : %lld\n",
++		       vp_id, prio, rc);
++		return -EIO;
++	}
++
++	if (qtoggle)
++		*qtoggle = be32_to_cpu(opal_qtoggle);
++	if (qindex)
++		*qindex = be32_to_cpu(opal_qindex);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xive_native_get_queue_state);
++
++int xive_native_set_queue_state(u32 vp_id, u32 prio, u32 qtoggle, u32 qindex)
++{
++	s64 rc;
++
++	rc = opal_xive_set_queue_state(vp_id, prio, qtoggle, qindex);
++	if (rc) {
++		pr_err("OPAL failed to set queue state for VCPU %d/%d : %lld\n",
++		       vp_id, prio, rc);
++		return -EIO;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xive_native_set_queue_state);
++
++int xive_native_get_vp_state(u32 vp_id, u64 *out_state)
++{
++	__be64 state;
++	s64 rc;
++
++	rc = opal_xive_get_vp_state(vp_id, &state);
++	if (rc) {
++		pr_err("OPAL failed to get vp state for VCPU %d : %lld\n",
++		       vp_id, rc);
++		return -EIO;
++	}
++
++	if (out_state)
++		*out_state = be64_to_cpu(state);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xive_native_get_vp_state);
