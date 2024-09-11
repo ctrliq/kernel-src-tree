@@ -1,0 +1,130 @@
+net/mlx5e: Protect unready flows with dedicated lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Protect unready flows with dedicated lock (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 96.00%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit ad86755b18d5edf1956f6d25c844f27289216877
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ad86755b.failed
+
+In order to remove dependency on rtnl lock for protecting unready_flows
+list when reoffloading unready flows on workqueue, extend representor
+uplink private structure with dedicated 'unready_flows_lock' mutex. Take
+the lock in all users of unready_flows list before accessing it. Implement
+helper functions to add and delete unready flow.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit ad86755b18d5edf1956f6d25c844f27289216877)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index f8b0a7e3a895,714aa9d7180b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -932,9 -993,28 +932,28 @@@ mlx5e_tc_unoffload_from_slow_path(struc
+  	slow_attr->split_count = 0;
+  	slow_attr->dest_chain = FDB_SLOW_PATH_CHAIN;
+  	mlx5e_tc_unoffload_fdb_rules(esw, flow, slow_attr);
+ -	flow_flag_clear(flow, SLOW);
+ +	flow->flags &= ~MLX5E_TC_FLOW_SLOW;
+  }
+  
++ /* Caller must obtain uplink_priv->unready_flows_lock mutex before calling this
++  * function.
++  */
++ static void unready_flow_add(struct mlx5e_tc_flow *flow,
++ 			     struct list_head *unready_flows)
++ {
++ 	flow_flag_set(flow, NOT_READY);
++ 	list_add_tail(&flow->unready, unready_flows);
++ }
++ 
++ /* Caller must obtain uplink_priv->unready_flows_lock mutex before calling this
++  * function.
++  */
++ static void unready_flow_del(struct mlx5e_tc_flow *flow)
++ {
++ 	list_del(&flow->unready);
++ 	flow_flag_clear(flow, NOT_READY);
++ }
++ 
+  static void add_unready_flow(struct mlx5e_tc_flow *flow)
+  {
+  	struct mlx5_rep_uplink_priv *uplink_priv;
+@@@ -945,14 -1025,24 +964,34 @@@
+  	rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+  	uplink_priv = &rpriv->uplink_priv;
+  
+++<<<<<<< HEAD
+ +	flow->flags |= MLX5E_TC_FLOW_NOT_READY;
+ +	list_add_tail(&flow->unready, &uplink_priv->unready_flows);
+++=======
++ 	mutex_lock(&uplink_priv->unready_flows_lock);
++ 	unready_flow_add(flow, &uplink_priv->unready_flows);
++ 	mutex_unlock(&uplink_priv->unready_flows_lock);
+++>>>>>>> ad86755b18d5 (net/mlx5e: Protect unready flows with dedicated lock)
+  }
+  
+  static void remove_unready_flow(struct mlx5e_tc_flow *flow)
+  {
+++<<<<<<< HEAD
+ +	list_del(&flow->unready);
+ +	flow->flags &= ~MLX5E_TC_FLOW_NOT_READY;
+++=======
++ 	struct mlx5_rep_uplink_priv *uplink_priv;
++ 	struct mlx5e_rep_priv *rpriv;
++ 	struct mlx5_eswitch *esw;
++ 
++ 	esw = flow->priv->mdev->priv.eswitch;
++ 	rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
++ 	uplink_priv = &rpriv->uplink_priv;
++ 
++ 	mutex_lock(&uplink_priv->unready_flows_lock);
++ 	unready_flow_del(flow);
++ 	mutex_unlock(&uplink_priv->unready_flows_lock);
+++>>>>>>> ad86755b18d5 (net/mlx5e: Protect unready flows with dedicated lock)
+  }
+  
+  static int
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 1ddcc10576ec..10800d222d94 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -1606,6 +1606,7 @@ static int mlx5e_init_rep_tx(struct mlx5e_priv *priv)
+ 	if (rpriv->rep->vport == FDB_UPLINK_VPORT) {
+ 		uplink_priv = &rpriv->uplink_priv;
+ 
++		mutex_init(&uplink_priv->unready_flows_lock);
+ 		INIT_LIST_HEAD(&uplink_priv->unready_flows);
+ 
+ 		/* init shared tc flow table */
+@@ -1650,6 +1651,7 @@ static void mlx5e_cleanup_rep_tx(struct mlx5e_priv *priv)
+ 
+ 		/* delete shared tc flow table */
+ 		mlx5e_tc_esw_cleanup(&rpriv->uplink_priv.tc_ht);
++		mutex_destroy(&rpriv->uplink_priv.unready_flows_lock);
+ 	}
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 98e5b7d6bb09..4701ef4f3706 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -75,6 +75,8 @@ struct mlx5_rep_uplink_priv {
+ 
+ 	struct mlx5_tun_entropy tun_entropy;
+ 
++	/* protects unready_flows */
++	struct mutex                unready_flows_lock;
+ 	struct list_head            unready_flows;
+ 	struct work_struct          reoffload_flows_work;
+ };
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
