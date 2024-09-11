@@ -1271,6 +1271,7 @@ struct pnfs_commit_array {
 };
 
 struct pnfs_ds_commit_info {
+	struct list_head commits;
 	unsigned int nwritten;
 	unsigned int ncommitting;
 	unsigned int nbuckets;
