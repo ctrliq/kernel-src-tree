@@ -1,0 +1,319 @@
+mlxsw: spectrum_router: Split nexthop group configuration to a different struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Ido Schimmel <idosch@nvidia.com>
+commit 7f7a417e6a11d7dc8528712b1a624381751f26cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/7f7a417e.failed
+
+Currently, the individual nexthops member in the group and attributes of
+the group (e.g., its type) are stored in the same struct (i.e., 'struct
+mlxsw_sp_nexthop_group'). This is fine since the individual nexthops
+cannot change during the lifetime of the group.
+
+With nexthop objects this is no longer the case. An existing nexthop
+group can be replaced to use a new set of nexthops. Creating a new
+struct whenever a group is replaced entails replacing the group pointer
+of all the routes (i.e., 'struct mlxsw_sp_fib_entry') using the group.
+
+Avoid this inefficient step by splitting the nexthop group configuration
+to a different struct (i.e., 'struct mlxsw_sp_nexthop_group_info').
+When a nexthop group is replaced a new group info struct is created and
+the individual rotues do not need to be touched.
+
+Illustration after the change:
+
+  mlxsw_sp_fib_entry    mlxsw_sp_nexthop_group    mlxsw_sp_nexthop_group_info
++-------------------+  +----------------------+  +---------------------------+
+| nh_group;         +--> nhgi;                +-->                           |
+|                   |  |                      |  |                           |
++-------------------+  +----------------------+  +---------------------------+
+
+No functional changes intended.
+
+	Signed-off-by: Ido Schimmel <idosch@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7f7a417e6a11d7dc8528712b1a624381751f26cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 336976120ae8,3079be4bc5ec..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -2830,10 -2832,11 +2831,10 @@@ struct mlxsw_sp_nexthop 
+  	struct list_head neigh_list_node; /* member of neigh entry list */
+  	struct list_head rif_list_node;
+  	struct list_head router_list_node;
+- 	struct mlxsw_sp_nexthop_group *nh_grp; /* pointer back to the group
+- 						* this belongs to
+- 						*/
++ 	struct mlxsw_sp_nexthop_group_info *nhgi; /* pointer back to the group
++ 						   * this nexthop belongs to
++ 						   */
+  	struct rhash_head ht_node;
+ -	struct neigh_table *neigh_tbl;
+  	struct mlxsw_sp_nexthop_key key;
+  	unsigned char gw_addr[sizeof(struct in6_addr)];
+  	int ifindex;
+@@@ -2880,6 -2879,18 +2877,25 @@@ struct mlxsw_sp_nexthop_group_info 
+  #define nh_rif	nexthops[0].rif
+  };
+  
++ struct mlxsw_sp_nexthop_group {
+++<<<<<<< HEAD
+++	void *priv;
+++	struct rhash_head ht_node;
+++	struct list_head fib_list; /* list of fib entries that use this group */
+++	struct neigh_table *neigh_tbl;
+++=======
++ 	struct rhash_head ht_node;
++ 	struct list_head fib_list; /* list of fib entries that use this group */
++ 	union {
++ 		struct {
++ 			struct fib_info *fi;
++ 		} ipv4;
++ 	};
++ 	struct mlxsw_sp_nexthop_group_info *nhgi;
+++>>>>>>> 7f7a417e6a11 (mlxsw: spectrum_router: Split nexthop group configuration to a different struct)
++ 	enum mlxsw_sp_nexthop_group_type type;
++ };
++ 
+  void mlxsw_sp_nexthop_counter_alloc(struct mlxsw_sp *mlxsw_sp,
+  				    struct mlxsw_sp_nexthop *nh)
+  {
+@@@ -3075,12 -3081,12 +3091,12 @@@ static u32 mlxsw_sp_nexthop_group_hash_
+  
+  	switch (nh_grp->type) {
+  	case MLXSW_SP_NEXTHOP_GROUP_TYPE_IPV4:
+ -		fi = nh_grp->ipv4.fi;
+ +		fi = mlxsw_sp_nexthop4_group_fi(nh_grp);
+  		return jhash(&fi, sizeof(fi), seed);
+  	case MLXSW_SP_NEXTHOP_GROUP_TYPE_IPV6:
+- 		val = nh_grp->count;
+- 		for (i = 0; i < nh_grp->count; i++) {
+- 			nh = &nh_grp->nexthops[i];
++ 		val = nh_grp->nhgi->count;
++ 		for (i = 0; i < nh_grp->nhgi->count; i++) {
++ 			nh = &nh_grp->nhgi->nexthops[i];
+  			val ^= jhash(&nh->ifindex, sizeof(nh->ifindex), seed);
+  			val ^= jhash(&nh->gw_addr, sizeof(nh->gw_addr), seed);
+  		}
+@@@ -3478,13 -3486,13 +3496,13 @@@ mlxsw_sp_nexthop4_group_offload_refresh
+  {
+  	int i;
+  
+- 	for (i = 0; i < nh_grp->count; i++) {
+- 		struct mlxsw_sp_nexthop *nh = &nh_grp->nexthops[i];
++ 	for (i = 0; i < nh_grp->nhgi->count; i++) {
++ 		struct mlxsw_sp_nexthop *nh = &nh_grp->nhgi->nexthops[i];
+  
+  		if (nh->offloaded)
+ -			nh->key.fib_nh->fib_nh_flags |= RTNH_F_OFFLOAD;
+ +			nh->key.fib_nh->nh_flags |= RTNH_F_OFFLOAD;
+  		else
+ -			nh->key.fib_nh->fib_nh_flags &= ~RTNH_F_OFFLOAD;
+ +			nh->key.fib_nh->nh_flags &= ~RTNH_F_OFFLOAD;
+  	}
+  }
+  
+@@@ -3958,10 -3965,10 +3977,10 @@@ static int mlxsw_sp_nexthop4_init(struc
+  	struct in_device *in_dev;
+  	int err;
+  
+- 	nh->nh_grp = nh_grp;
++ 	nh->nhgi = nh_grp->nhgi;
+  	nh->key.fib_nh = fib_nh;
+  #ifdef CONFIG_IP_ROUTE_MULTIPATH
+ -	nh->nh_weight = fib_nh->fib_nh_weight;
+ +	nh->nh_weight = fib_nh->nh_weight;
+  #else
+  	nh->nh_weight = 1;
+  #endif
+@@@ -4079,36 -4087,35 +4098,55 @@@ static void mlxsw_sp_nexthop_rif_gone_s
+  }
+  
+  static bool mlxsw_sp_fi_is_gateway(const struct mlxsw_sp *mlxsw_sp,
+ -				   struct fib_info *fi)
+ +				   const struct fib_info *fi)
+  {
+ -	const struct fib_nh *nh = fib_info_nh(fi, 0);
+ -
+ -	return nh->fib_nh_scope == RT_SCOPE_LINK ||
+ -	       mlxsw_sp_nexthop4_ipip_type(mlxsw_sp, nh, NULL);
+ +	return fi->fib_nh->nh_scope == RT_SCOPE_LINK ||
+ +	       mlxsw_sp_nexthop4_ipip_type(mlxsw_sp, fi->fib_nh, NULL);
+  }
+  
+- static struct mlxsw_sp_nexthop_group *
+- mlxsw_sp_nexthop4_group_create(struct mlxsw_sp *mlxsw_sp, struct fib_info *fi)
++ static int
++ mlxsw_sp_nexthop4_group_info_init(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_nexthop_group *nh_grp)
+  {
+++<<<<<<< HEAD
+ +	struct mlxsw_sp_nexthop_group *nh_grp;
+++=======
++ 	unsigned int nhs = fib_info_num_path(nh_grp->ipv4.fi);
++ 	struct mlxsw_sp_nexthop_group_info *nhgi;
+++>>>>>>> 7f7a417e6a11 (mlxsw: spectrum_router: Split nexthop group configuration to a different struct)
+  	struct mlxsw_sp_nexthop *nh;
+- 	struct fib_nh *fib_nh;
+- 	int i;
+- 	int err;
++ 	int err, i;
+  
+++<<<<<<< HEAD
+ +	nh_grp = kzalloc(struct_size(nh_grp, nexthops, fi->fib_nhs),
+ +			 GFP_KERNEL);
+ +	if (!nh_grp)
+ +		return ERR_PTR(-ENOMEM);
+ +	nh_grp->priv = fi;
+ +	INIT_LIST_HEAD(&nh_grp->fib_list);
+ +	nh_grp->neigh_tbl = &arp_tbl;
+ +	nh_grp->type = MLXSW_SP_NEXTHOP_GROUP_TYPE_IPV4;
+ +
+ +	nh_grp->gateway = mlxsw_sp_fi_is_gateway(mlxsw_sp, fi);
+ +	nh_grp->count = fi->fib_nhs;
+ +	fib_info_hold(fi);
+ +	for (i = 0; i < nh_grp->count; i++) {
+ +		nh = &nh_grp->nexthops[i];
+ +		fib_nh = &fi->fib_nh[i];
+++=======
++ 	nhgi = kzalloc(struct_size(nhgi, nexthops, nhs), GFP_KERNEL);
++ 	if (!nhgi)
++ 		return -ENOMEM;
++ 	nh_grp->nhgi = nhgi;
++ 	nhgi->nh_grp = nh_grp;
++ 	nhgi->gateway = mlxsw_sp_fi_is_gateway(mlxsw_sp, nh_grp->ipv4.fi);
++ 	nhgi->count = nhs;
++ 	for (i = 0; i < nhgi->count; i++) {
++ 		struct fib_nh *fib_nh;
++ 
++ 		nh = &nhgi->nexthops[i];
++ 		fib_nh = fib_info_nh(nh_grp->ipv4.fi, i);
+++>>>>>>> 7f7a417e6a11 (mlxsw: spectrum_router: Split nexthop group configuration to a different struct)
+  		err = mlxsw_sp_nexthop4_init(mlxsw_sp, nh_grp, nh, fib_nh);
+  		if (err)
+  			goto err_nexthop4_init;
+@@@ -4134,17 -4186,9 +4217,19 @@@ static voi
+  mlxsw_sp_nexthop4_group_destroy(struct mlxsw_sp *mlxsw_sp,
+  				struct mlxsw_sp_nexthop_group *nh_grp)
+  {
+- 	struct mlxsw_sp_nexthop *nh;
+- 	int i;
+- 
+  	mlxsw_sp_nexthop_group_remove(mlxsw_sp, nh_grp);
+++<<<<<<< HEAD
+ +	for (i = 0; i < nh_grp->count; i++) {
+ +		nh = &nh_grp->nexthops[i];
+ +		mlxsw_sp_nexthop4_fini(mlxsw_sp, nh);
+ +	}
+ +	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh_grp);
+ +	WARN_ON_ONCE(nh_grp->adj_index_valid);
+ +	fib_info_put(mlxsw_sp_nexthop4_group_fi(nh_grp));
+++=======
++ 	mlxsw_sp_nexthop4_group_info_fini(mlxsw_sp, nh_grp);
++ 	fib_info_put(nh_grp->ipv4.fi);
+++>>>>>>> 7f7a417e6a11 (mlxsw: spectrum_router: Split nexthop group configuration to a different struct)
+  	kfree(nh_grp);
+  }
+  
+@@@ -4220,13 -4264,13 +4305,13 @@@ mlxsw_sp_rt6_nexthop(struct mlxsw_sp_ne
+  {
+  	int i;
+  
+- 	for (i = 0; i < nh_grp->count; i++) {
+- 		struct mlxsw_sp_nexthop *nh = &nh_grp->nexthops[i];
++ 	for (i = 0; i < nh_grp->nhgi->count; i++) {
++ 		struct mlxsw_sp_nexthop *nh = &nh_grp->nhgi->nexthops[i];
+  		struct fib6_info *rt = mlxsw_sp_rt6->rt;
+  
+ -		if (nh->rif && nh->rif->dev == rt->fib6_nh->fib_nh_dev &&
+ +		if (nh->rif && nh->rif->dev == rt->fib6_nh.nh_dev &&
+  		    ipv6_addr_equal((const struct in6_addr *) &nh->gw_addr,
+ -				    &rt->fib6_nh->fib_nh_gw6))
+ +				    &rt->fib6_nh.nh_gw))
+  			return nh;
+  		continue;
+  	}
+@@@ -5363,11 -5407,14 +5448,20 @@@ static int mlxsw_sp_nexthop6_init(struc
+  				  struct mlxsw_sp_nexthop *nh,
+  				  const struct fib6_info *rt)
+  {
+ -	struct net_device *dev = rt->fib6_nh->fib_nh_dev;
+ +	struct net_device *dev = rt->fib6_nh.nh_dev;
+  
+++<<<<<<< HEAD
+ +	nh->nh_grp = nh_grp;
+ +	nh->nh_weight = rt->fib6_nh.nh_weight;
+ +	memcpy(&nh->gw_addr, &rt->fib6_nh.nh_gw, sizeof(nh->gw_addr));
+++=======
++ 	nh->nhgi = nh_grp->nhgi;
++ 	nh->nh_weight = rt->fib6_nh->fib_nh_weight;
++ 	memcpy(&nh->gw_addr, &rt->fib6_nh->fib_nh_gw6, sizeof(nh->gw_addr));
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	nh->neigh_tbl = &nd_tbl;
++ #endif
+++>>>>>>> 7f7a417e6a11 (mlxsw: spectrum_router: Split nexthop group configuration to a different struct)
+  	mlxsw_sp_nexthop_counter_alloc(mlxsw_sp, nh);
+  
+  	list_add_tail(&nh->router_list_node, &mlxsw_sp->router->nexthop_list);
+@@@ -5394,33 -5441,30 +5488,42 @@@ static bool mlxsw_sp_rt6_is_gateway(con
+  	       mlxsw_sp_nexthop6_ipip_type(mlxsw_sp, rt, NULL);
+  }
+  
+- static struct mlxsw_sp_nexthop_group *
+- mlxsw_sp_nexthop6_group_create(struct mlxsw_sp *mlxsw_sp,
+- 			       struct mlxsw_sp_fib6_entry *fib6_entry)
++ static int
++ mlxsw_sp_nexthop6_group_info_init(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_nexthop_group *nh_grp,
++ 				  struct mlxsw_sp_fib6_entry *fib6_entry)
+  {
+- 	struct mlxsw_sp_nexthop_group *nh_grp;
++ 	struct mlxsw_sp_nexthop_group_info *nhgi;
+  	struct mlxsw_sp_rt6 *mlxsw_sp_rt6;
+  	struct mlxsw_sp_nexthop *nh;
+- 	int i = 0;
+- 	int err;
++ 	int err, i;
+  
+++<<<<<<< HEAD
+ +	nh_grp = kzalloc(struct_size(nh_grp, nexthops, fib6_entry->nrt6),
+ +			 GFP_KERNEL);
+ +	if (!nh_grp)
+ +		return ERR_PTR(-ENOMEM);
+ +	INIT_LIST_HEAD(&nh_grp->fib_list);
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	nh_grp->neigh_tbl = &nd_tbl;
+ +#endif
+ +	nh_grp->type = MLXSW_SP_NEXTHOP_GROUP_TYPE_IPV6;
+++=======
++ 	nhgi = kzalloc(struct_size(nhgi, nexthops, fib6_entry->nrt6),
++ 		       GFP_KERNEL);
++ 	if (!nhgi)
++ 		return -ENOMEM;
++ 	nh_grp->nhgi = nhgi;
++ 	nhgi->nh_grp = nh_grp;
+++>>>>>>> 7f7a417e6a11 (mlxsw: spectrum_router: Split nexthop group configuration to a different struct)
+  	mlxsw_sp_rt6 = list_first_entry(&fib6_entry->rt6_list,
+  					struct mlxsw_sp_rt6, list);
+- 	nh_grp->gateway = mlxsw_sp_rt6_is_gateway(mlxsw_sp, mlxsw_sp_rt6->rt);
+- 	nh_grp->count = fib6_entry->nrt6;
+- 	for (i = 0; i < nh_grp->count; i++) {
++ 	nhgi->gateway = mlxsw_sp_rt6_is_gateway(mlxsw_sp, mlxsw_sp_rt6->rt);
++ 	nhgi->count = fib6_entry->nrt6;
++ 	for (i = 0; i < nhgi->count; i++) {
+  		struct fib6_info *rt = mlxsw_sp_rt6->rt;
+  
+- 		nh = &nh_grp->nexthops[i];
++ 		nh = &nhgi->nexthops[i];
+  		err = mlxsw_sp_nexthop6_init(mlxsw_sp, nh_grp, nh, rt);
+  		if (err)
+  			goto err_nexthop6_init;
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
