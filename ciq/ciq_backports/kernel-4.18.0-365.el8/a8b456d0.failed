@@ -1,0 +1,172 @@
+bdi: remove BDI_CAP_SYNCHRONOUS_IO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit a8b456d01cd6b37191f14248f3e2bdbe5ce3a89e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/a8b456d0.failed
+
+BDI_CAP_SYNCHRONOUS_IO is only checked in the swap code, and used to
+decided if ->rw_page can be used on a block device.  Just check up for
+the method instead.  The only complication is that zram needs a second
+set of block_device_operations as it can switch between modes that
+actually support ->rw_page and those who don't.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a8b456d01cd6b37191f14248f3e2bdbe5ce3a89e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/pmem.c
+diff --cc drivers/nvdimm/pmem.c
+index 30d89c62cbef,1711fdfd8d28..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -484,7 -474,7 +484,11 @@@ static int pmem_attach_disk(struct devi
+  	disk->fops		= &pmem_fops;
+  	disk->queue		= q;
+  	disk->flags		= GENHD_FL_EXT_DEVT;
+++<<<<<<< HEAD
+ +	disk->queue->backing_dev_info->capabilities |= BDI_CAP_SYNCHRONOUS_IO;
+++=======
++ 	disk->private_data	= pmem;
+++>>>>>>> a8b456d01cd6 (bdi: remove BDI_CAP_SYNCHRONOUS_IO)
+  	nvdimm_namespace_disk_name(ndns, disk->disk_name);
+  	set_capacity(disk, (pmem->size - pmem->pfn_pad - pmem->data_offset)
+  			/ 512);
+diff --git a/drivers/block/brd.c b/drivers/block/brd.c
+index 4efb40440ef8..68836ee9182d 100644
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@ -396,7 +396,6 @@ static struct brd_device *brd_alloc(int i)
+ 	disk->flags		= GENHD_FL_EXT_DEVT;
+ 	sprintf(disk->disk_name, "ram%d", i);
+ 	set_capacity(disk, rd_size * 2);
+-	brd->brd_queue->backing_dev_info->capabilities |= BDI_CAP_SYNCHRONOUS_IO;
+ 
+ 	/* Tell the block layer that this is not a rotational device */
+ 	blk_queue_flag_set(QUEUE_FLAG_NONROT, brd->brd_queue);
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 67307d00ac23..d9c4117f339d 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -51,6 +51,9 @@ static unsigned int num_devices = 1;
+  */
+ static size_t huge_class_size;
+ 
++static const struct block_device_operations zram_devops;
++static const struct block_device_operations zram_wb_devops;
++
+ static void zram_free_page(struct zram *zram, size_t index);
+ 
+ static void zram_slot_lock(struct zram *zram, u32 index)
+@@ -295,8 +298,7 @@ static void reset_bdev(struct zram *zram)
+ 	filp_close(zram->backing_dev, NULL);
+ 	zram->backing_dev = NULL;
+ 	zram->bdev = NULL;
+-	zram->disk->queue->backing_dev_info->capabilities |=
+-				BDI_CAP_SYNCHRONOUS_IO;
++	zram->disk->fops = &zram_devops;
+ 	kvfree(zram->bitmap);
+ 	zram->bitmap = NULL;
+ }
+@@ -405,8 +407,7 @@ static ssize_t backing_dev_store(struct device *dev,
+ 	 * freely but in fact, IO is going on so finally could cause
+ 	 * use-after-free when the IO is really done.
+ 	 */
+-	zram->disk->queue->backing_dev_info->capabilities &=
+-			~BDI_CAP_SYNCHRONOUS_IO;
++	zram->disk->fops = &zram_wb_devops;
+ 	up_write(&zram->init_lock);
+ 
+ 	pr_info("setup backing device %s\n", file_name);
+@@ -1590,6 +1591,13 @@ static const struct block_device_operations zram_devops = {
+ 	.owner = THIS_MODULE
+ };
+ 
++static const struct block_device_operations zram_wb_devops = {
++	.open = zram_open,
++	.submit_bio = zram_submit_bio,
++	.swap_slot_free_notify = zram_slot_free_notify,
++	.owner = THIS_MODULE
++};
++
+ static DEVICE_ATTR_WO(compact);
+ static DEVICE_ATTR_RW(disksize);
+ static DEVICE_ATTR_RO(initstate);
+@@ -1705,8 +1713,7 @@ static int zram_add(void)
+ 	if (ZRAM_LOGICAL_BLOCK_SIZE == PAGE_SIZE)
+ 		blk_queue_max_write_zeroes_sectors(zram->disk->queue, UINT_MAX);
+ 
+-	zram->disk->queue->backing_dev_info->capabilities |=
+-			(BDI_CAP_STABLE_WRITES | BDI_CAP_SYNCHRONOUS_IO);
++	zram->disk->queue->backing_dev_info->capabilities |= BDI_CAP_STABLE_WRITES;
+ 	device_add_disk(NULL, zram->disk, zram_disk_attr_groups);
+ 
+ 	strlcpy(zram->compressor, default_compressor, sizeof(zram->compressor));
+diff --git a/drivers/nvdimm/btt.c b/drivers/nvdimm/btt.c
+index 69d23bda759e..ee677aa334d1 100644
+--- a/drivers/nvdimm/btt.c
++++ b/drivers/nvdimm/btt.c
+@@ -1544,8 +1544,6 @@ static int btt_blk_init(struct btt *btt)
+ 	btt->btt_disk->private_data = btt;
+ 	btt->btt_disk->queue = btt->btt_queue;
+ 	btt->btt_disk->flags = GENHD_FL_EXT_DEVT;
+-	btt->btt_disk->queue->backing_dev_info->capabilities |=
+-			BDI_CAP_SYNCHRONOUS_IO;
+ 
+ 	blk_queue_logical_block_size(btt->btt_queue, btt->sector_size);
+ 	blk_queue_max_hw_sectors(btt->btt_queue, UINT_MAX);
+* Unmerged path drivers/nvdimm/pmem.c
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index d0dea95dff96..0c9549fd541c 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -122,9 +122,6 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
+  * BDI_CAP_NO_WRITEBACK:   Don't write pages back
+  * BDI_CAP_NO_ACCT_WB:     Don't automatically account writeback pages
+  * BDI_CAP_STRICTLIMIT:    Keep number of dirty pages below bdi threshold.
+- *
+- * BDI_CAP_SYNCHRONOUS_IO: Device is so fast that asynchronous IO would be
+- *			   inefficient.
+  */
+ #define BDI_CAP_NO_ACCT_DIRTY	0x00000001
+ #define BDI_CAP_NO_WRITEBACK	0x00000002
+@@ -132,7 +129,6 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
+ #define BDI_CAP_STABLE_WRITES	0x00000008
+ #define BDI_CAP_STRICTLIMIT	0x00000010
+ #define BDI_CAP_CGROUP_WRITEBACK 0x00000020
+-#define BDI_CAP_SYNCHRONOUS_IO	0x00000040
+ 
+ #define BDI_CAP_NO_ACCT_AND_WRITEBACK \
+ 	(BDI_CAP_NO_WRITEBACK | BDI_CAP_NO_ACCT_DIRTY | BDI_CAP_NO_ACCT_WB)
+@@ -178,11 +174,6 @@ static inline int wb_congested(struct bdi_writeback *wb, int cong_bits)
+ long congestion_wait(int sync, long timeout);
+ long wait_iff_congested(int sync, long timeout);
+ 
+-static inline bool bdi_cap_synchronous_io(struct backing_dev_info *bdi)
+-{
+-	return bdi->capabilities & BDI_CAP_SYNCHRONOUS_IO;
+-}
+-
+ static inline bool bdi_cap_stable_pages_required(struct backing_dev_info *bdi)
+ {
+ 	return bdi->capabilities & BDI_CAP_STABLE_WRITES;
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 85dbb252f95e..13243fbf3483 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -3252,7 +3252,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 	if (bdi_cap_stable_pages_required(inode_to_bdi(inode)))
+ 		p->flags |= SWP_STABLE_WRITES;
+ 
+-	if (bdi_cap_synchronous_io(inode_to_bdi(inode)))
++	if (p->bdev && p->bdev->bd_disk->fops->rw_page)
+ 		p->flags |= SWP_SYNCHRONOUS_IO;
+ 
+ 	if (p->bdev && blk_queue_nonrot(bdev_get_queue(p->bdev))) {
