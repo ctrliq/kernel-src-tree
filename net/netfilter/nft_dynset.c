@@ -191,21 +191,10 @@ static int nft_dynset_init(const struct nft_ctx *ctx,
 		if (!nft_set_is_anonymous(set))
 			return -EOPNOTSUPP;
 
-		priv->expr = nft_expr_init(ctx, tb[NFTA_DYNSET_EXPR]);
+		priv->expr = nft_set_elem_expr_alloc(ctx, set,
+						     tb[NFTA_DYNSET_EXPR]);
 		if (IS_ERR(priv->expr))
 			return PTR_ERR(priv->expr);
-
-		err = -EOPNOTSUPP;
-		if (!(priv->expr->ops->type->flags & NFT_EXPR_STATEFUL))
-			goto err1;
-
-		if (priv->expr->ops->type->flags & NFT_EXPR_GC) {
-			if (set->flags & NFT_SET_TIMEOUT)
-				goto err1;
-			if (!set->ops->gc_init)
-				goto err1;
-			set->ops->gc_init(set);
-		}
 	}
 
 	nft_set_ext_prepare(&priv->tmpl);
