@@ -1,0 +1,199 @@
+KVM: Use enum to track if cached PFN will be used in guest and/or host
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit d0d96121d03d6d9cf608d948247a9f24f5a02da9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/d0d96121.failed
+
+Replace the guest_uses_pa and kernel_map booleans in the PFN cache code
+with a unified enum/bitmask. Using explicit names makes it easier to
+review and audit call sites.
+
+Opportunistically add a WARN to prevent passing garbage; instantating a
+cache without declaring its usage is either buggy or pointless.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20220303154127.202856-2-dwmw2@infradead.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d0d96121d03d6d9cf608d948247a9f24f5a02da9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kvm_host.h
+#	include/linux/kvm_types.h
+#	virt/kvm/pfncache.c
+diff --cc include/linux/kvm_host.h
+index 905b4457d163,be9bbc0c6200..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -914,6 -1223,105 +914,108 @@@ int kvm_vcpu_write_guest(struct kvm_vcp
+  			 unsigned long len);
+  void kvm_vcpu_mark_page_dirty(struct kvm_vcpu *vcpu, gfn_t gfn);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * kvm_gfn_to_pfn_cache_init - prepare a cached kernel mapping and HPA for a
++  *                             given guest physical address.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @vcpu:	   vCPU to be used for marking pages dirty and to be woken on
++  *		   invalidation.
++  * @usage:	   indicates if the resulting host physical PFN is used while
++  *		   the @vcpu is IN_GUEST_MODE (in which case invalidation of 
++  *		   the cache from MMU notifiers---but not for KVM memslot
++  *		   changes!---will also force @vcpu to exit the guest and
++  *		   refresh the cache); and/or if the PFN used directly
++  *		   by KVM (and thus needs a kernel virtual mapping).
++  * @gpa:	   guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  * @dirty:         mark the cache dirty immediately.
++  *
++  * @return:	   0 for success.
++  *		   -EINVAL for a mapping which would cross a page boundary.
++  *                 -EFAULT for an untranslatable guest physical address.
++  *
++  * This primes a gfn_to_pfn_cache and links it into the @kvm's list for
++  * invalidations to be processed.  Callers are required to use
++  * kvm_gfn_to_pfn_cache_check() to ensure that the cache is valid before
++  * accessing the target page.
++  */
++ int kvm_gfn_to_pfn_cache_init(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 			      struct kvm_vcpu *vcpu, enum pfn_cache_usage usage,
++ 			      gpa_t gpa, unsigned long len, bool dirty);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_check - check validity of a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @gpa:	   current guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  * @dirty:         mark the cache dirty immediately.
++  *
++  * @return:	   %true if the cache is still valid and the address matches.
++  *		   %false if the cache is not valid.
++  *
++  * Callers outside IN_GUEST_MODE context should hold a read lock on @gpc->lock
++  * while calling this function, and then continue to hold the lock until the
++  * access is complete.
++  *
++  * Callers in IN_GUEST_MODE may do so without locking, although they should
++  * still hold a read lock on kvm->scru for the memslot checks.
++  */
++ bool kvm_gfn_to_pfn_cache_check(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 				gpa_t gpa, unsigned long len);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_refresh - update a previously initialized cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @gpa:	   updated guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  * @dirty:         mark the cache dirty immediately.
++  *
++  * @return:	   0 for success.
++  *		   -EINVAL for a mapping which would cross a page boundary.
++  *                 -EFAULT for an untranslatable guest physical address.
++  *
++  * This will attempt to refresh a gfn_to_pfn_cache. Note that a successful
++  * returm from this function does not mean the page can be immediately
++  * accessed because it may have raced with an invalidation. Callers must
++  * still lock and check the cache status, as this function does not return
++  * with the lock still held to permit access.
++  */
++ int kvm_gfn_to_pfn_cache_refresh(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 				 gpa_t gpa, unsigned long len, bool dirty);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_unmap - temporarily unmap a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  *
++  * This unmaps the referenced page and marks it dirty, if appropriate. The
++  * cache is left in the invalid state but at least the mapping from GPA to
++  * userspace HVA will remain cached and can be reused on a subsequent
++  * refresh.
++  */
++ void kvm_gfn_to_pfn_cache_unmap(struct kvm *kvm, struct gfn_to_pfn_cache *gpc);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_destroy - destroy and unlink a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  *
++  * This removes a cache from the @kvm's list to be processed on MMU notifier
++  * invocation.
++  */
++ void kvm_gfn_to_pfn_cache_destroy(struct kvm *kvm, struct gfn_to_pfn_cache *gpc);
++ 
+++>>>>>>> d0d96121d03d (KVM: Use enum to track if cached PFN will be used in guest and/or host)
+  void kvm_sigset_activate(struct kvm_vcpu *vcpu);
+  void kvm_sigset_deactivate(struct kvm_vcpu *vcpu);
+  
+diff --cc include/linux/kvm_types.h
+index e65323751d08,784f37cbf33e..000000000000
+--- a/include/linux/kvm_types.h
++++ b/include/linux/kvm_types.h
+@@@ -32,7 -18,9 +32,8 @@@ struct kvm_memslots
+  
+  enum kvm_mr_change;
+  
++ #include <linux/bits.h>
+  #include <linux/types.h>
+ -#include <linux/spinlock_types.h>
+  
+  #include <asm/kvm_types.h>
+  
+@@@ -67,6 -61,22 +74,25 @@@ struct gfn_to_hva_cache 
+  	struct kvm_memory_slot *memslot;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct gfn_to_pfn_cache {
++ 	u64 generation;
++ 	gpa_t gpa;
++ 	unsigned long uhva;
++ 	struct kvm_memory_slot *memslot;
++ 	struct kvm_vcpu *vcpu;
++ 	struct list_head list;
++ 	rwlock_t lock;
++ 	void *khva;
++ 	kvm_pfn_t pfn;
++ 	enum pfn_cache_usage usage;
++ 	bool active;
++ 	bool valid;
++ 	bool dirty;
++ };
++ 
+++>>>>>>> d0d96121d03d (KVM: Use enum to track if cached PFN will be used in guest and/or host)
+  #ifdef KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE
+  /*
+   * Memory caches are used to preallocate memory ahead of various MMU flows,
+* Unmerged path virt/kvm/pfncache.c
+diff --git a/arch/x86/kvm/xen.c b/arch/x86/kvm/xen.c
+index 302b37ed2e8d..ebbc279e7b0b 100644
+--- a/arch/x86/kvm/xen.c
++++ b/arch/x86/kvm/xen.c
+@@ -38,7 +38,7 @@ static int kvm_xen_shared_info_init(struct kvm *kvm, gfn_t gfn)
+ 	}
+ 
+ 	do {
+-		ret = kvm_gfn_to_pfn_cache_init(kvm, gpc, NULL, false, true,
++		ret = kvm_gfn_to_pfn_cache_init(kvm, gpc, NULL, KVM_HOST_USES_PFN,
+ 						gpa, PAGE_SIZE, false);
+ 		if (ret)
+ 			goto out;
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path include/linux/kvm_types.h
+* Unmerged path virt/kvm/pfncache.c
