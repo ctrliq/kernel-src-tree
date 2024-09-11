@@ -1,0 +1,156 @@
+bpf: Support bpf tracing/iter programs for BPF_LINK_UPDATE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit 2057c92bc927f09b22f5609425eb37d7e782f484
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2057c92b.failed
+
+Added BPF_LINK_UPDATE support for tracing/iter programs.
+This way, a file based bpf iterator, which holds a reference
+to the link, can have its bpf program updated without
+creating new files.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200509175902.2475262-1-yhs@fb.com
+(cherry picked from commit 2057c92bc927f09b22f5609425eb37d7e782f484)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/bpf_iter.c
+diff --cc kernel/bpf/bpf_iter.c
+index 5a8119d17d14,0542a243b78c..000000000000
+--- a/kernel/bpf/bpf_iter.c
++++ b/kernel/bpf/bpf_iter.c
+@@@ -57,3 -66,123 +60,126 @@@ void bpf_iter_unreg_target(const char *
+  
+  	WARN_ON(found == false);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void cache_btf_id(struct bpf_iter_target_info *tinfo,
++ 			 struct bpf_prog *prog)
++ {
++ 	tinfo->btf_id = prog->aux->attach_btf_id;
++ }
++ 
++ bool bpf_iter_prog_supported(struct bpf_prog *prog)
++ {
++ 	const char *attach_fname = prog->aux->attach_func_name;
++ 	u32 prog_btf_id = prog->aux->attach_btf_id;
++ 	const char *prefix = BPF_ITER_FUNC_PREFIX;
++ 	struct bpf_iter_target_info *tinfo;
++ 	int prefix_len = strlen(prefix);
++ 	bool supported = false;
++ 
++ 	if (strncmp(attach_fname, prefix, prefix_len))
++ 		return false;
++ 
++ 	mutex_lock(&targets_mutex);
++ 	list_for_each_entry(tinfo, &targets, list) {
++ 		if (tinfo->btf_id && tinfo->btf_id == prog_btf_id) {
++ 			supported = true;
++ 			break;
++ 		}
++ 		if (!strcmp(attach_fname + prefix_len, tinfo->target)) {
++ 			cache_btf_id(tinfo, prog);
++ 			supported = true;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&targets_mutex);
++ 
++ 	return supported;
++ }
++ 
++ static void bpf_iter_link_release(struct bpf_link *link)
++ {
++ }
++ 
++ static void bpf_iter_link_dealloc(struct bpf_link *link)
++ {
++ 	struct bpf_iter_link *iter_link =
++ 		container_of(link, struct bpf_iter_link, link);
++ 
++ 	kfree(iter_link);
++ }
++ 
++ static int bpf_iter_link_replace(struct bpf_link *link,
++ 				 struct bpf_prog *new_prog,
++ 				 struct bpf_prog *old_prog)
++ {
++ 	int ret = 0;
++ 
++ 	mutex_lock(&link_mutex);
++ 	if (old_prog && link->prog != old_prog) {
++ 		ret = -EPERM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	if (link->prog->type != new_prog->type ||
++ 	    link->prog->expected_attach_type != new_prog->expected_attach_type ||
++ 	    link->prog->aux->attach_btf_id != new_prog->aux->attach_btf_id) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	old_prog = xchg(&link->prog, new_prog);
++ 	bpf_prog_put(old_prog);
++ 
++ out_unlock:
++ 	mutex_unlock(&link_mutex);
++ 	return ret;
++ }
++ 
++ static const struct bpf_link_ops bpf_iter_link_lops = {
++ 	.release = bpf_iter_link_release,
++ 	.dealloc = bpf_iter_link_dealloc,
++ 	.update_prog = bpf_iter_link_replace,
++ };
++ 
++ int bpf_iter_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++ {
++ 	struct bpf_link_primer link_primer;
++ 	struct bpf_iter_target_info *tinfo;
++ 	struct bpf_iter_link *link;
++ 	bool existed = false;
++ 	u32 prog_btf_id;
++ 	int err;
++ 
++ 	if (attr->link_create.target_fd || attr->link_create.flags)
++ 		return -EINVAL;
++ 
++ 	prog_btf_id = prog->aux->attach_btf_id;
++ 	mutex_lock(&targets_mutex);
++ 	list_for_each_entry(tinfo, &targets, list) {
++ 		if (tinfo->btf_id == prog_btf_id) {
++ 			existed = true;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&targets_mutex);
++ 	if (!existed)
++ 		return -ENOENT;
++ 
++ 	link = kzalloc(sizeof(*link), GFP_USER | __GFP_NOWARN);
++ 	if (!link)
++ 		return -ENOMEM;
++ 
++ 	bpf_link_init(&link->link, BPF_LINK_TYPE_ITER, &bpf_iter_link_lops, prog);
++ 	link->tinfo = tinfo;
++ 
++ 	err  = bpf_link_prime(&link->link, &link_primer);
++ 	if (err) {
++ 		kfree(link);
++ 		return err;
++ 	}
++ 
++ 	return bpf_link_settle(&link_primer);
++ }
+++>>>>>>> 2057c92bc927 (bpf: Support bpf tracing/iter programs for BPF_LINK_UPDATE)
+* Unmerged path kernel/bpf/bpf_iter.c
