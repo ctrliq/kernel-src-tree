@@ -1212,9 +1212,6 @@ static int esw_offloads_stop(struct mlx5_eswitch *esw,
 		}
 	}
 
-	/* enable back PF RoCE */
-	mlx5_reload_interface(esw->dev, MLX5_INTERFACE_PROTOCOL_IB);
-
 	return err;
 }
 
