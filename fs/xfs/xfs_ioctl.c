@@ -1442,7 +1442,6 @@ xfs_ioctl_setattr(
 	struct fsxattr		old_fa;
 	struct xfs_mount	*mp = ip->i_mount;
 	struct xfs_trans	*tp;
-	struct xfs_dquot	*udqp = NULL;
 	struct xfs_dquot	*pdqp = NULL;
 	struct xfs_dquot	*olddquot = NULL;
 	int			code;
@@ -1464,7 +1463,7 @@ xfs_ioctl_setattr(
 	if (XFS_IS_QUOTA_ON(mp)) {
 		code = xfs_qm_vop_dqalloc(ip, VFS_I(ip)->i_uid,
 				VFS_I(ip)->i_gid, fa->fsx_projid,
-				XFS_QMOPT_PQUOTA, &udqp, NULL, &pdqp);
+				XFS_QMOPT_PQUOTA, NULL, NULL, &pdqp);
 		if (code)
 			return code;
 	}
@@ -1479,7 +1478,7 @@ xfs_ioctl_setattr(
 
 	if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_PQUOTA_ON(mp) &&
 	    ip->i_d.di_projid != fa->fsx_projid) {
-		code = xfs_qm_vop_chown_reserve(tp, ip, udqp, NULL, pdqp,
+		code = xfs_qm_vop_chown_reserve(tp, ip, NULL, NULL, pdqp,
 				capable(CAP_FOWNER) ?  XFS_QMOPT_FORCE_RES : 0);
 		if (code)	/* out of quota */
 			goto error_trans_cancel;
@@ -1545,7 +1544,6 @@ xfs_ioctl_setattr(
 	 * Release any dquot(s) the inode had kept before chown.
 	 */
 	xfs_qm_dqrele(olddquot);
-	xfs_qm_dqrele(udqp);
 	xfs_qm_dqrele(pdqp);
 
 	return code;
@@ -1553,7 +1551,6 @@ xfs_ioctl_setattr(
 error_trans_cancel:
 	xfs_trans_cancel(tp);
 error_free_dquots:
-	xfs_qm_dqrele(udqp);
 	xfs_qm_dqrele(pdqp);
 	return code;
 }
