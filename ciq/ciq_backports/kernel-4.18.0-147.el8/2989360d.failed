@@ -1,0 +1,138 @@
+x86/intel_rdt: Fix possible circular lock dependency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Reinette Chatre <reinette.chatre@intel.com>
+commit 2989360d9c6669d8ae64edc933088e640481b48b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2989360d.failed
+
+Lockdep is reporting a possible circular locking dependency:
+
+ ======================================================
+ WARNING: possible circular locking dependency detected
+ 4.18.0-rc1-test-test+ #4 Not tainted
+ ------------------------------------------------------
+ user_example/766 is trying to acquire lock:
+ 0000000073479a0f (rdtgroup_mutex){+.+.}, at: pseudo_lock_dev_mmap
+
+ but task is already holding lock:
+ 000000001ef7a35b (&mm->mmap_sem){++++}, at: vm_mmap_pgoff+0x9f/0x
+
+ which lock already depends on the new lock.
+
+ the existing dependency chain (in reverse order) is:
+
+ -> #2 (&mm->mmap_sem){++++}:
+        _copy_to_user+0x1e/0x70
+        filldir+0x91/0x100
+        dcache_readdir+0x54/0x160
+        iterate_dir+0x142/0x190
+        __x64_sys_getdents+0xb9/0x170
+        do_syscall_64+0x86/0x200
+        entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+ -> #1 (&sb->s_type->i_mutex_key#3){++++}:
+        start_creating+0x60/0x100
+        debugfs_create_dir+0xc/0xc0
+        rdtgroup_pseudo_lock_create+0x217/0x4d0
+        rdtgroup_schemata_write+0x313/0x3d0
+        kernfs_fop_write+0xf0/0x1a0
+        __vfs_write+0x36/0x190
+        vfs_write+0xb7/0x190
+        ksys_write+0x52/0xc0
+        do_syscall_64+0x86/0x200
+        entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+ -> #0 (rdtgroup_mutex){+.+.}:
+        __mutex_lock+0x80/0x9b0
+        pseudo_lock_dev_mmap+0x2f/0x170
+        mmap_region+0x3d6/0x610
+        do_mmap+0x387/0x580
+        vm_mmap_pgoff+0xcf/0x110
+        ksys_mmap_pgoff+0x170/0x1f0
+        do_syscall_64+0x86/0x200
+        entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+ other info that might help us debug this:
+
+ Chain exists of:
+   rdtgroup_mutex --> &sb->s_type->i_mutex_key#3 --> &mm->mmap_sem
+
+  Possible unsafe locking scenario:
+
+        CPU0                    CPU1
+        ----                    ----
+   lock(&mm->mmap_sem);
+                                lock(&sb->s_type->i_mutex_key#3);
+                                lock(&mm->mmap_sem);
+   lock(rdtgroup_mutex);
+
+  *** DEADLOCK ***
+
+ 1 lock held by user_example/766:
+  #0: 000000001ef7a35b (&mm->mmap_sem){++++}, at: vm_mmap_pgoff+0x9f/0x110
+
+rdtgroup_mutex is already being released temporarily during pseudo-lock
+region creation to prevent the potential deadlock between rdtgroup_mutex
+and mm->mmap_sem that is obtained during device_create(). Move the
+debugfs creation into this area to avoid the same circular dependency.
+
+	Signed-off-by: Reinette Chatre <reinette.chatre@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: fenghua.yu@intel.com
+	Cc: tony.luck@intel.com
+	Cc: vikas.shivappa@linux.intel.com
+	Cc: gavin.hindman@intel.com
+	Cc: jithu.joseph@intel.com
+	Cc: hpa@zytor.com
+Link: https://lkml.kernel.org/r/fffb57f9c6b8285904c9a60cc91ce21591af17fe.1531332480.git.reinette.chatre@intel.com
+
+(cherry picked from commit 2989360d9c6669d8ae64edc933088e640481b48b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt_pseudo_lock.c
+diff --cc arch/x86/kernel/cpu/intel_rdt_pseudo_lock.c
+index c09a994b47e8,f80c58f8adc3..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_pseudo_lock.c
++++ b/arch/x86/kernel/cpu/intel_rdt_pseudo_lock.c
+@@@ -1173,18 -1251,9 +1173,9 @@@ int rdtgroup_pseudo_lock_create(struct 
+  		 * empty pseudo-locking loop.
+  		 */
+  		rdt_last_cmd_puts("locking thread interrupted\n");
+ -		goto out_cstates;
+ +		goto out_region;
+  	}
+  
+- 	if (!IS_ERR_OR_NULL(debugfs_resctrl)) {
+- 		plr->debugfs_dir = debugfs_create_dir(rdtgrp->kn->name,
+- 						      debugfs_resctrl);
+- 		if (!IS_ERR_OR_NULL(plr->debugfs_dir))
+- 			debugfs_create_file("pseudo_lock_measure", 0200,
+- 					    plr->debugfs_dir, rdtgrp,
+- 					    &pseudo_measure_fops);
+- 	}
+- 
+  	ret = pseudo_lock_minor_get(&new_minor);
+  	if (ret < 0) {
+  		rdt_last_cmd_puts("unable to obtain a new minor number\n");
+@@@ -1233,10 -1311,11 +1233,14 @@@
+  
+  out_device:
+  	device_destroy(pseudo_lock_class, MKDEV(pseudo_lock_major, new_minor));
+- out_minor:
+- 	pseudo_lock_minor_release(new_minor);
+  out_debugfs:
+  	debugfs_remove_recursive(plr->debugfs_dir);
+++<<<<<<< HEAD
+++=======
++ 	pseudo_lock_minor_release(new_minor);
++ out_cstates:
++ 	pseudo_lock_cstates_relax(plr);
+++>>>>>>> 2989360d9c66 (x86/intel_rdt: Fix possible circular lock dependency)
+  out_region:
+  	pseudo_lock_region_clear(plr);
+  out:
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_pseudo_lock.c
