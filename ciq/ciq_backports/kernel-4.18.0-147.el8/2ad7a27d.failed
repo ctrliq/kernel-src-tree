@@ -1,0 +1,353 @@
+KVM: PPC: Book3S: Enable XIVE native capability only if OPAL has required functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [powerpc] kvm: ppc: book3s: Enable XIVE native capability only if OPAL has required functions [BZ1744884] (David Gibson) [1744884]
+Rebuild_FUZZ: 93.26%
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 2ad7a27deaf6d78545d97ab80874584f6990360e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2ad7a27d.failed
+
+There are some POWER9 machines where the OPAL firmware does not support
+the OPAL_XIVE_GET_QUEUE_STATE and OPAL_XIVE_SET_QUEUE_STATE calls.
+The impact of this is that a guest using XIVE natively will not be able
+to be migrated successfully.  On the source side, the get_attr operation
+on the KVM native device for the KVM_DEV_XIVE_GRP_EQ_CONFIG attribute
+will fail; on the destination side, the set_attr operation for the same
+attribute will fail.
+
+This adds tests for the existence of the OPAL get/set queue state
+functions, and if they are not supported, the XIVE-native KVM device
+is not created and the KVM_CAP_PPC_IRQ_XIVE capability returns false.
+Userspace can then either provide a software emulation of XIVE, or
+else tell the guest that it does not have a XIVE controller available
+to it.
+
+	Cc: stable@vger.kernel.org # v5.2+
+Fixes: 3fab2d10588e ("KVM: PPC: Book3S HV: XIVE: Activate XIVE exploitation mode")
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Reviewed-by: Cédric Le Goater <clg@kaod.org>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 2ad7a27deaf6d78545d97ab80874584f6990360e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_ppc.h
+#	arch/powerpc/include/asm/xive.h
+#	arch/powerpc/kvm/book3s_xive_native.c
+#	arch/powerpc/kvm/powerpc.c
+#	arch/powerpc/sysdev/xive/native.c
+diff --cc arch/powerpc/include/asm/kvm_ppc.h
+index f3383e76017a,8e8514efb124..000000000000
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@@ -595,8 -584,21 +595,16 @@@ extern int kvmppc_xive_set_irq(struct k
+  			       int level, bool line_status);
+  extern void kvmppc_xive_push_vcpu(struct kvm_vcpu *vcpu);
+  
+ -static inline int kvmppc_xive_enabled(struct kvm_vcpu *vcpu)
+ -{
+ -	return vcpu->arch.irq_type == KVMPPC_IRQ_XIVE;
+ -}
+ -
+ -extern int kvmppc_xive_native_connect_vcpu(struct kvm_device *dev,
+ -					   struct kvm_vcpu *vcpu, u32 cpu);
+ -extern void kvmppc_xive_native_cleanup_vcpu(struct kvm_vcpu *vcpu);
+  extern void kvmppc_xive_native_init_module(void);
+  extern void kvmppc_xive_native_exit_module(void);
+++<<<<<<< HEAD
+++=======
++ extern int kvmppc_xive_native_get_vp(struct kvm_vcpu *vcpu,
++ 				     union kvmppc_one_reg *val);
++ extern int kvmppc_xive_native_set_vp(struct kvm_vcpu *vcpu,
++ 				     union kvmppc_one_reg *val);
++ extern bool kvmppc_xive_native_supported(void);
+++>>>>>>> 2ad7a27deaf6 (KVM: PPC: Book3S: Enable XIVE native capability only if OPAL has required functions)
+  
+  #else
+  static inline int kvmppc_xive_set_xive(struct kvm *kvm, u32 irq, u32 server,
+diff --cc arch/powerpc/include/asm/xive.h
+index 8d1a2792484f,818989e11678..000000000000
+--- a/arch/powerpc/include/asm/xive.h
++++ b/arch/powerpc/include/asm/xive.h
+@@@ -116,6 -123,20 +116,23 @@@ extern int xive_native_disable_vp(u32 v
+  extern int xive_native_get_vp_info(u32 vp_id, u32 *out_cam_id, u32 *out_chip_id);
+  extern bool xive_native_has_single_escalation(void);
+  
+++<<<<<<< HEAD
+++=======
++ extern int xive_native_get_queue_info(u32 vp_id, uint32_t prio,
++ 				      u64 *out_qpage,
++ 				      u64 *out_qsize,
++ 				      u64 *out_qeoi_page,
++ 				      u32 *out_escalate_irq,
++ 				      u64 *out_qflags);
++ 
++ extern int xive_native_get_queue_state(u32 vp_id, uint32_t prio, u32 *qtoggle,
++ 				       u32 *qindex);
++ extern int xive_native_set_queue_state(u32 vp_id, uint32_t prio, u32 qtoggle,
++ 				       u32 qindex);
++ extern int xive_native_get_vp_state(u32 vp_id, u64 *out_state);
++ extern bool xive_native_has_queue_state_support(void);
++ 
+++>>>>>>> 2ad7a27deaf6 (KVM: PPC: Book3S: Enable XIVE native capability only if OPAL has required functions)
+  #else
+  
+  static inline bool xive_enabled(void) { return false; }
+diff --cc arch/powerpc/kvm/book3s_xive_native.c
+index fd27063de020,248c1ea9e788..000000000000
+--- a/arch/powerpc/kvm/book3s_xive_native.c
++++ b/arch/powerpc/kvm/book3s_xive_native.c
+@@@ -110,6 -1103,87 +110,90 @@@ static int kvmppc_xive_native_create(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Interrupt Pending Buffer (IPB) offset
++  */
++ #define TM_IPB_SHIFT 40
++ #define TM_IPB_MASK  (((u64) 0xFF) << TM_IPB_SHIFT)
++ 
++ int kvmppc_xive_native_get_vp(struct kvm_vcpu *vcpu, union kvmppc_one_reg *val)
++ {
++ 	struct kvmppc_xive_vcpu *xc = vcpu->arch.xive_vcpu;
++ 	u64 opal_state;
++ 	int rc;
++ 
++ 	if (!kvmppc_xive_enabled(vcpu))
++ 		return -EPERM;
++ 
++ 	if (!xc)
++ 		return -ENOENT;
++ 
++ 	/* Thread context registers. We only care about IPB and CPPR */
++ 	val->xive_timaval[0] = vcpu->arch.xive_saved_state.w01;
++ 
++ 	/* Get the VP state from OPAL */
++ 	rc = xive_native_get_vp_state(xc->vp_id, &opal_state);
++ 	if (rc)
++ 		return rc;
++ 
++ 	/*
++ 	 * Capture the backup of IPB register in the NVT structure and
++ 	 * merge it in our KVM VP state.
++ 	 */
++ 	val->xive_timaval[0] |= cpu_to_be64(opal_state & TM_IPB_MASK);
++ 
++ 	pr_devel("%s NSR=%02x CPPR=%02x IBP=%02x PIPR=%02x w01=%016llx w2=%08x opal=%016llx\n",
++ 		 __func__,
++ 		 vcpu->arch.xive_saved_state.nsr,
++ 		 vcpu->arch.xive_saved_state.cppr,
++ 		 vcpu->arch.xive_saved_state.ipb,
++ 		 vcpu->arch.xive_saved_state.pipr,
++ 		 vcpu->arch.xive_saved_state.w01,
++ 		 (u32) vcpu->arch.xive_cam_word, opal_state);
++ 
++ 	return 0;
++ }
++ 
++ int kvmppc_xive_native_set_vp(struct kvm_vcpu *vcpu, union kvmppc_one_reg *val)
++ {
++ 	struct kvmppc_xive_vcpu *xc = vcpu->arch.xive_vcpu;
++ 	struct kvmppc_xive *xive = vcpu->kvm->arch.xive;
++ 
++ 	pr_devel("%s w01=%016llx vp=%016llx\n", __func__,
++ 		 val->xive_timaval[0], val->xive_timaval[1]);
++ 
++ 	if (!kvmppc_xive_enabled(vcpu))
++ 		return -EPERM;
++ 
++ 	if (!xc || !xive)
++ 		return -ENOENT;
++ 
++ 	/* We can't update the state of a "pushed" VCPU	 */
++ 	if (WARN_ON(vcpu->arch.xive_pushed))
++ 		return -EBUSY;
++ 
++ 	/*
++ 	 * Restore the thread context registers. IPB and CPPR should
++ 	 * be the only ones that matter.
++ 	 */
++ 	vcpu->arch.xive_saved_state.w01 = val->xive_timaval[0];
++ 
++ 	/*
++ 	 * There is no need to restore the XIVE internal state (IPB
++ 	 * stored in the NVT) as the IPB register was merged in KVM VP
++ 	 * state when captured.
++ 	 */
++ 	return 0;
++ }
++ 
++ bool kvmppc_xive_native_supported(void)
++ {
++ 	return xive_native_has_queue_state_support();
++ }
++ 
+++>>>>>>> 2ad7a27deaf6 (KVM: PPC: Book3S: Enable XIVE native capability only if OPAL has required functions)
+  static int xive_native_debug_show(struct seq_file *m, void *private)
+  {
+  	struct kvmppc_xive *xive = m->private;
+diff --cc arch/powerpc/kvm/powerpc.c
+index 1a65db7bb1ae,7012dd709787..000000000000
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@@ -571,6 -559,17 +571,20 @@@ int kvm_vm_ioctl_check_extension(struc
+  	case KVM_CAP_PPC_GET_CPU_CHAR:
+  		r = 1;
+  		break;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_XIVE
++ 	case KVM_CAP_PPC_IRQ_XIVE:
++ 		/*
++ 		 * We need XIVE to be enabled on the platform (implies
++ 		 * a POWER9 processor) and the PowerNV platform, as
++ 		 * nested is not yet supported.
++ 		 */
++ 		r = xive_enabled() && !!cpu_has_feature(CPU_FTR_HVMODE) &&
++ 			kvmppc_xive_native_supported();
++ 		break;
++ #endif
+++>>>>>>> 2ad7a27deaf6 (KVM: PPC: Book3S: Enable XIVE native capability only if OPAL has required functions)
+  
+  	case KVM_CAP_PPC_ALLOC_HTAB:
+  		r = hv_enabled;
+diff --cc arch/powerpc/sysdev/xive/native.c
+index 311185b9960a,37987c815913..000000000000
+--- a/arch/powerpc/sysdev/xive/native.c
++++ b/arch/powerpc/sysdev/xive/native.c
+@@@ -728,3 -724,103 +728,106 @@@ bool xive_native_has_single_escalation(
+  	return xive_has_single_esc;
+  }
+  EXPORT_SYMBOL_GPL(xive_native_has_single_escalation);
+++<<<<<<< HEAD
+++=======
++ 
++ int xive_native_get_queue_info(u32 vp_id, u32 prio,
++ 			       u64 *out_qpage,
++ 			       u64 *out_qsize,
++ 			       u64 *out_qeoi_page,
++ 			       u32 *out_escalate_irq,
++ 			       u64 *out_qflags)
++ {
++ 	__be64 qpage;
++ 	__be64 qsize;
++ 	__be64 qeoi_page;
++ 	__be32 escalate_irq;
++ 	__be64 qflags;
++ 	s64 rc;
++ 
++ 	rc = opal_xive_get_queue_info(vp_id, prio, &qpage, &qsize,
++ 				      &qeoi_page, &escalate_irq, &qflags);
++ 	if (rc) {
++ 		pr_err("OPAL failed to get queue info for VCPU %d/%d : %lld\n",
++ 		       vp_id, prio, rc);
++ 		return -EIO;
++ 	}
++ 
++ 	if (out_qpage)
++ 		*out_qpage = be64_to_cpu(qpage);
++ 	if (out_qsize)
++ 		*out_qsize = be32_to_cpu(qsize);
++ 	if (out_qeoi_page)
++ 		*out_qeoi_page = be64_to_cpu(qeoi_page);
++ 	if (out_escalate_irq)
++ 		*out_escalate_irq = be32_to_cpu(escalate_irq);
++ 	if (out_qflags)
++ 		*out_qflags = be64_to_cpu(qflags);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(xive_native_get_queue_info);
++ 
++ int xive_native_get_queue_state(u32 vp_id, u32 prio, u32 *qtoggle, u32 *qindex)
++ {
++ 	__be32 opal_qtoggle;
++ 	__be32 opal_qindex;
++ 	s64 rc;
++ 
++ 	rc = opal_xive_get_queue_state(vp_id, prio, &opal_qtoggle,
++ 				       &opal_qindex);
++ 	if (rc) {
++ 		pr_err("OPAL failed to get queue state for VCPU %d/%d : %lld\n",
++ 		       vp_id, prio, rc);
++ 		return -EIO;
++ 	}
++ 
++ 	if (qtoggle)
++ 		*qtoggle = be32_to_cpu(opal_qtoggle);
++ 	if (qindex)
++ 		*qindex = be32_to_cpu(opal_qindex);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(xive_native_get_queue_state);
++ 
++ int xive_native_set_queue_state(u32 vp_id, u32 prio, u32 qtoggle, u32 qindex)
++ {
++ 	s64 rc;
++ 
++ 	rc = opal_xive_set_queue_state(vp_id, prio, qtoggle, qindex);
++ 	if (rc) {
++ 		pr_err("OPAL failed to set queue state for VCPU %d/%d : %lld\n",
++ 		       vp_id, prio, rc);
++ 		return -EIO;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(xive_native_set_queue_state);
++ 
++ bool xive_native_has_queue_state_support(void)
++ {
++ 	return opal_check_token(OPAL_XIVE_GET_QUEUE_STATE) &&
++ 		opal_check_token(OPAL_XIVE_SET_QUEUE_STATE);
++ }
++ EXPORT_SYMBOL_GPL(xive_native_has_queue_state_support);
++ 
++ int xive_native_get_vp_state(u32 vp_id, u64 *out_state)
++ {
++ 	__be64 state;
++ 	s64 rc;
++ 
++ 	rc = opal_xive_get_vp_state(vp_id, &state);
++ 	if (rc) {
++ 		pr_err("OPAL failed to get vp state for VCPU %d : %lld\n",
++ 		       vp_id, rc);
++ 		return -EIO;
++ 	}
++ 
++ 	if (out_state)
++ 		*out_state = be64_to_cpu(state);
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(xive_native_get_vp_state);
+++>>>>>>> 2ad7a27deaf6 (KVM: PPC: Book3S: Enable XIVE native capability only if OPAL has required functions)
+* Unmerged path arch/powerpc/include/asm/kvm_ppc.h
+* Unmerged path arch/powerpc/include/asm/xive.h
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index 2580b4ae18f7..cba755622014 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -1052,9 +1052,11 @@ static int kvmppc_book3s_init(void)
+ 	if (xics_on_xive()) {
+ 		kvmppc_xive_init_module();
+ 		kvm_register_device_ops(&kvm_xive_ops, KVM_DEV_TYPE_XICS);
+-		kvmppc_xive_native_init_module();
+-		kvm_register_device_ops(&kvm_xive_native_ops,
+-					KVM_DEV_TYPE_XIVE);
++		if (kvmppc_xive_native_supported()) {
++			kvmppc_xive_native_init_module();
++			kvm_register_device_ops(&kvm_xive_native_ops,
++						KVM_DEV_TYPE_XIVE);
++		}
+ 	} else
+ #endif
+ 		kvm_register_device_ops(&kvm_xics_ops, KVM_DEV_TYPE_XICS);
+* Unmerged path arch/powerpc/kvm/book3s_xive_native.c
+* Unmerged path arch/powerpc/kvm/powerpc.c
+* Unmerged path arch/powerpc/sysdev/xive/native.c
