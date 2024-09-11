@@ -1,0 +1,207 @@
+iomap: use a srcmap for a read-modify-write I/O
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Goldwyn Rodrigues <rgoldwyn@suse.com>
+commit c039b99792726346ad46ff17c5a5bcb77a5edac4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c039b997.failed
+
+The srcmap is used to identify where the read is to be performed from.
+It is passed to ->iomap_begin, which can fill it in if we need to read
+data for partially written blocks from a different location than the
+write target.  The srcmap is only supported for buffered writes so far.
+
+	Signed-off-by: Goldwyn Rodrigues <rgoldwyn@suse.com>
+[hch: merged two patches, removed the IOMAP_F_COW flag, use iomap as
+      srcmap if not set, adjust length down to srcmap end as well]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Acked-by: Goldwyn Rodrigues <rgoldwyn@suse.com>
+(cherry picked from commit c039b99792726346ad46ff17c5a5bcb77a5edac4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/iomap/apply.c
+#	fs/iomap/buffered-io.c
+#	fs/iomap/direct-io.c
+#	fs/iomap/fiemap.c
+#	fs/iomap/seek.c
+#	fs/iomap/swapfile.c
+#	include/linux/iomap.h
+diff --cc include/linux/iomap.h
+index 68b316a9b4a1,8b09463dae0d..000000000000
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@@ -139,21 -143,14 +140,26 @@@ struct iomap_ops 
+  };
+  
+  /*
+ - * Main iomap iterator function.
+ + * Structure allocate for each page when block size < PAGE_SIZE to track
+ + * sub-page uptodate status and I/O completions.
+   */
+++<<<<<<< HEAD
+ +struct iomap_page {
+ +	atomic_t		read_count;
+ +	atomic_t		write_count;
+ +	DECLARE_BITMAP(uptodate, PAGE_SIZE / 512);
+ +};
+++=======
++ typedef loff_t (*iomap_actor_t)(struct inode *inode, loff_t pos, loff_t len,
++ 		void *data, struct iomap *iomap, struct iomap *srcmap);
+++>>>>>>> c039b9979272 (iomap: use a srcmap for a read-modify-write I/O)
+  
+ -loff_t iomap_apply(struct inode *inode, loff_t pos, loff_t length,
+ -		unsigned flags, const struct iomap_ops *ops, void *data,
+ -		iomap_actor_t actor);
+ +static inline struct iomap_page *to_iomap_page(struct page *page)
+ +{
+ +	if (page_has_private(page))
+ +		return (struct iomap_page *)page_private(page);
+ +	return NULL;
+ +}
+  
+  ssize_t iomap_file_buffered_write(struct kiocb *iocb, struct iov_iter *from,
+  		const struct iomap_ops *ops);
+* Unmerged path fs/iomap/apply.c
+* Unmerged path fs/iomap/buffered-io.c
+* Unmerged path fs/iomap/direct-io.c
+* Unmerged path fs/iomap/fiemap.c
+* Unmerged path fs/iomap/seek.c
+* Unmerged path fs/iomap/swapfile.c
+diff --git a/fs/dax.c b/fs/dax.c
+index b0d01bff87fd..d3bdab13f4a3 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -1098,7 +1098,7 @@ EXPORT_SYMBOL_GPL(__dax_zero_page_range);
+ 
+ static loff_t
+ dax_iomap_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
+-		struct iomap *iomap)
++		struct iomap *iomap, struct iomap *srcmap)
+ {
+ 	struct block_device *bdev = iomap->bdev;
+ 	struct dax_device *dax_dev = iomap->dax_dev;
+@@ -1255,7 +1255,8 @@ static vm_fault_t dax_iomap_pte_fault(struct vm_fault *vmf, pfn_t *pfnp,
+ 	struct inode *inode = mapping->host;
+ 	unsigned long vaddr = vmf->address;
+ 	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
+-	struct iomap iomap = { 0 };
++	struct iomap iomap = { .type = IOMAP_HOLE };
++	struct iomap srcmap = { .type = IOMAP_HOLE };
+ 	unsigned flags = IOMAP_FAULT;
+ 	int error, major = 0;
+ 	bool write = vmf->flags & FAULT_FLAG_WRITE;
+@@ -1300,7 +1301,7 @@ static vm_fault_t dax_iomap_pte_fault(struct vm_fault *vmf, pfn_t *pfnp,
+ 	 * the file system block size to be equal the page size, which means
+ 	 * that we never have to deal with more than a single extent here.
+ 	 */
+-	error = ops->iomap_begin(inode, pos, PAGE_SIZE, flags, &iomap);
++	error = ops->iomap_begin(inode, pos, PAGE_SIZE, flags, &iomap, &srcmap);
+ 	if (iomap_errp)
+ 		*iomap_errp = error;
+ 	if (error) {
+@@ -1479,7 +1480,8 @@ static vm_fault_t dax_iomap_pmd_fault(struct vm_fault *vmf, pfn_t *pfnp,
+ 	unsigned int iomap_flags = (write ? IOMAP_WRITE : 0) | IOMAP_FAULT;
+ 	struct inode *inode = mapping->host;
+ 	vm_fault_t result = VM_FAULT_FALLBACK;
+-	struct iomap iomap = { 0 };
++	struct iomap iomap = { .type = IOMAP_HOLE };
++	struct iomap srcmap = { .type = IOMAP_HOLE };
+ 	pgoff_t max_pgoff;
+ 	void *entry;
+ 	loff_t pos;
+@@ -1554,7 +1556,8 @@ static vm_fault_t dax_iomap_pmd_fault(struct vm_fault *vmf, pfn_t *pfnp,
+ 	 * to look up our filesystem block.
+ 	 */
+ 	pos = (loff_t)xas.xa_index << PAGE_SHIFT;
+-	error = ops->iomap_begin(inode, pos, PMD_SIZE, iomap_flags, &iomap);
++	error = ops->iomap_begin(inode, pos, PMD_SIZE, iomap_flags, &iomap,
++			&srcmap);
+ 	if (error)
+ 		goto unlock_entry;
+ 
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index 71635909df3b..6189c2b96c04 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -799,7 +799,7 @@ int ext2_get_block(struct inode *inode, sector_t iblock,
+ 
+ #ifdef CONFIG_FS_DAX
+ static int ext2_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+-		unsigned flags, struct iomap *iomap)
++		unsigned flags, struct iomap *iomap, struct iomap *srcmap)
+ {
+ 	unsigned int blkbits = inode->i_blkbits;
+ 	unsigned long first_block = offset >> blkbits;
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 6c48a64d6051..9cd3201cc566 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -3439,7 +3439,7 @@ static bool ext4_inode_datasync_dirty(struct inode *inode)
+ }
+ 
+ static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+-			    unsigned flags, struct iomap *iomap)
++		unsigned flags, struct iomap *iomap, struct iomap *srcmap)
+ {
+ 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+ 	unsigned int blkbits = inode->i_blkbits;
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 8e472f6a6f67..056d66c8248f 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -1170,7 +1170,8 @@ static int gfs2_iomap_begin_write(struct inode *inode, loff_t pos,
+ }
+ 
+ static int gfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
+-			    unsigned flags, struct iomap *iomap)
++			    unsigned flags, struct iomap *iomap,
++			    struct iomap *srcmap)
+ {
+ 	struct gfs2_inode *ip = GFS2_I(inode);
+ 	struct metapath mp = { .mp_aheight = 1, };
+* Unmerged path fs/iomap/apply.c
+* Unmerged path fs/iomap/buffered-io.c
+* Unmerged path fs/iomap/direct-io.c
+* Unmerged path fs/iomap/fiemap.c
+* Unmerged path fs/iomap/seek.c
+* Unmerged path fs/iomap/swapfile.c
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 28991e288372..10eb5b5a9764 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -941,7 +941,8 @@ xfs_file_iomap_begin(
+ 	loff_t			offset,
+ 	loff_t			length,
+ 	unsigned		flags,
+-	struct iomap		*iomap)
++	struct iomap		*iomap,
++	struct iomap		*srcmap)
+ {
+ 	struct xfs_inode	*ip = XFS_I(inode);
+ 	struct xfs_mount	*mp = ip->i_mount;
+@@ -1174,7 +1175,8 @@ xfs_seek_iomap_begin(
+ 	loff_t			offset,
+ 	loff_t			length,
+ 	unsigned		flags,
+-	struct iomap		*iomap)
++	struct iomap		*iomap,
++	struct iomap		*srcmap)
+ {
+ 	struct xfs_inode	*ip = XFS_I(inode);
+ 	struct xfs_mount	*mp = ip->i_mount;
+@@ -1260,7 +1262,8 @@ xfs_xattr_iomap_begin(
+ 	loff_t			offset,
+ 	loff_t			length,
+ 	unsigned		flags,
+-	struct iomap		*iomap)
++	struct iomap		*iomap,
++	struct iomap		*srcmap)
+ {
+ 	struct xfs_inode	*ip = XFS_I(inode);
+ 	struct xfs_mount	*mp = ip->i_mount;
+* Unmerged path include/linux/iomap.h
