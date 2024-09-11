@@ -1,0 +1,135 @@
+powerpc/kvm/book3s: Add helper to walk partition scoped linux page table.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [powerpc] kvm/book3s: Add helper to walk partition scoped linux page table (Greg Kurz) [1748772]
+Rebuild_FUZZ: 93.43%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 4b99412ed6972cc77c1f16009e1d00323fcef9ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4b99412e.failed
+
+The locking rules for walking partition scoped table is different from process
+scoped table. Hence add a helper for secondary linux page table walk and also
+add check whether we are holding the right locks.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200505071729.54912-10-aneesh.kumar@linux.ibm.com
+(cherry picked from commit 4b99412ed6972cc77c1f16009e1d00323fcef9ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_mmu_radix.c
+diff --cc arch/powerpc/kvm/book3s_64_mmu_radix.c
+index d8281fb29d25,c92d413eeaaf..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@@ -984,7 -976,12 +984,16 @@@ int kvm_unmap_radix(struct kvm *kvm, st
+  	unsigned long gpa = gfn << PAGE_SHIFT;
+  	unsigned int shift;
+  
+++<<<<<<< HEAD
+ +	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+++=======
++ 	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE) {
++ 		uv_page_inval(kvm->arch.lpid, gpa, PAGE_SHIFT);
++ 		return 0;
++ 	}
++ 
++ 	ptep = find_kvm_secondary_pte(kvm, gpa, &shift);
+++>>>>>>> 4b99412ed697 (powerpc/kvm/book3s: Add helper to walk partition scoped linux page table.)
+  	if (ptep && pte_present(*ptep))
+  		kvmppc_unmap_pte(kvm, ptep, gpa, shift, memslot,
+  				 kvm->arch.lpid);
+@@@ -1001,7 -998,10 +1010,14 @@@ int kvm_age_radix(struct kvm *kvm, stru
+  	int ref = 0;
+  	unsigned long old, *rmapp;
+  
+++<<<<<<< HEAD
+ +	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+++=======
++ 	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++ 		return ref;
++ 
++ 	ptep = find_kvm_secondary_pte(kvm, gpa, &shift);
+++>>>>>>> 4b99412ed697 (powerpc/kvm/book3s: Add helper to walk partition scoped linux page table.)
+  	if (ptep && pte_present(*ptep) && pte_young(*ptep)) {
+  		old = kvmppc_radix_update_pte(kvm, ptep, _PAGE_ACCESSED, 0,
+  					      gpa, shift);
+@@@ -1025,7 -1025,10 +1041,14 @@@ int kvm_test_age_radix(struct kvm *kvm
+  	unsigned int shift;
+  	int ref = 0;
+  
+++<<<<<<< HEAD
+ +	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+++=======
++ 	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++ 		return ref;
++ 
++ 	ptep = find_kvm_secondary_pte(kvm, gpa, &shift);
+++>>>>>>> 4b99412ed697 (powerpc/kvm/book3s: Add helper to walk partition scoped linux page table.)
+  	if (ptep && pte_present(*ptep) && pte_young(*ptep))
+  		ref = 1;
+  	return ref;
+@@@ -1042,7 -1045,10 +1065,14 @@@ static int kvm_radix_test_clear_dirty(s
+  	int ret = 0;
+  	unsigned long old, *rmapp;
+  
+++<<<<<<< HEAD
+ +	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+++=======
++ 	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++ 		return ret;
++ 
++ 	ptep = find_kvm_secondary_pte(kvm, gpa, &shift);
+++>>>>>>> 4b99412ed697 (powerpc/kvm/book3s: Add helper to walk partition scoped linux page table.)
+  	if (ptep && pte_present(*ptep) && pte_dirty(*ptep)) {
+  		ret = 1;
+  		if (shift)
+diff --git a/arch/powerpc/include/asm/kvm_book3s_64.h b/arch/powerpc/include/asm/kvm_book3s_64.h
+index 21b1ed5df888..599b1560bbd1 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@ -25,6 +25,7 @@
+ #include <asm/book3s/64/mmu-hash.h>
+ #include <asm/cpu_has_feature.h>
+ #include <asm/ppc-opcode.h>
++#include <asm/pte-walk.h>
+ 
+ #ifdef CONFIG_PPC_PSERIES
+ static inline bool kvmhv_on_pseries(void)
+@@ -645,6 +646,18 @@ extern void kvmhv_remove_nest_rmap_range(struct kvm *kvm,
+ 				unsigned long gpa, unsigned long hpa,
+ 				unsigned long nbytes);
+ 
++static inline pte_t *find_kvm_secondary_pte(struct kvm *kvm, unsigned long ea,
++					    unsigned *hshift)
++{
++	pte_t *pte;
++
++	VM_WARN(!spin_is_locked(&kvm->mmu_lock),
++		"%s called with kvm mmu_lock not held \n", __func__);
++	pte = __find_linux_pte(kvm->arch.pgtable, ea, NULL, hshift);
++
++	return pte;
++}
++
+ #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+ 
+ #endif /* __ASM_KVM_BOOK3S_64_H__ */
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_radix.c
+diff --git a/arch/powerpc/kvm/book3s_hv_nested.c b/arch/powerpc/kvm/book3s_hv_nested.c
+index 8190cbbf4218..8212d0e1953b 100644
+--- a/arch/powerpc/kvm/book3s_hv_nested.c
++++ b/arch/powerpc/kvm/book3s_hv_nested.c
+@@ -1362,7 +1362,7 @@ static long int __kvmhv_nested_page_fault(struct kvm_run *run,
+ 	/* See if can find translation in our partition scoped tables for L1 */
+ 	pte = __pte(0);
+ 	spin_lock(&kvm->mmu_lock);
+-	pte_p = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
++	pte_p = find_kvm_secondary_pte(kvm, gpa, &shift);
+ 	if (!shift)
+ 		shift = PAGE_SHIFT;
+ 	if (pte_p)
