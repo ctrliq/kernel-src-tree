@@ -1,0 +1,242 @@
+nvme: use blk_execute_rq() for passthrough commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Keith Busch <kbusch@kernel.org>
+commit be42a33b9252f0b3857cadb896e430ee17cccad4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/be42a33b.failed
+
+The generic blk_execute_rq() knows how to handle polled completions. Use
+that instead of implementing an nvme specific handler.
+
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Link: https://lore.kernel.org/r/20210610214437.641245-3-kbusch@kernel.org
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit be42a33b9252f0b3857cadb896e430ee17cccad4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 228052b88c83,e0d3f0aa25da..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -669,9 -627,14 +669,11 @@@ static inline void nvme_init_request(st
+  	else /* no queuedata implies admin queue */
+  		req->timeout = NVME_ADMIN_TIMEOUT;
+  
+ -	/* passthru commands should let the driver set the SGL flags */
+ -	cmd->common.flags &= ~NVME_CMD_SGL_ALL;
+ -
+  	req->cmd_flags |= REQ_FAILFAST_DRIVER;
++ 	if (req->mq_hctx->type == HCTX_TYPE_POLL)
++ 		req->cmd_flags |= REQ_HIPRI;
+  	nvme_clear_nvme_request(req);
+ -	memcpy(nvme_req(req)->cmd, cmd, sizeof(*cmd));
+ +	nvme_req(req)->cmd = cmd;
+  }
+  
+  struct request *nvme_alloc_request(struct request_queue *q,
+@@@ -1019,31 -1031,6 +1021,34 @@@ blk_status_t nvme_setup_cmd(struct nvme
+  }
+  EXPORT_SYMBOL_GPL(nvme_setup_cmd);
+  
+++<<<<<<< HEAD
+ +static void nvme_end_sync_rq(struct request *rq, blk_status_t error)
+ +{
+ +	struct completion *waiting = rq->end_io_data;
+ +
+ +	rq->end_io_data = NULL;
+ +	complete(waiting);
+ +}
+ +
+ +static void nvme_execute_rq_polled(struct request_queue *q,
+ +		struct gendisk *bd_disk, struct request *rq, int at_head)
+ +{
+ +	DECLARE_COMPLETION_ONSTACK(wait);
+ +
+ +	WARN_ON_ONCE(!test_bit(QUEUE_FLAG_POLL, &q->queue_flags));
+ +
+ +	rq->cmd_flags |= REQ_HIPRI;
+ +	rq->end_io_data = &wait;
+ +	blk_execute_rq_nowait(q, bd_disk, rq, at_head, nvme_end_sync_rq);
+ +
+ +	while (!completion_done(&wait)) {
+ +		blk_poll(q, request_to_qc_t(rq->mq_hctx, rq), true);
+ +		cond_resched();
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> be42a33b9252 (nvme: use blk_execute_rq() for passthrough commands)
+  /*
+   * Returns 0 on success.  If the result is negative, it's a Linux error code;
+   * if the result is positive, it's an NVM Express status code
+@@@ -1072,10 -1059,7 +1077,14 @@@ int __nvme_submit_sync_cmd(struct reque
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (poll)
+ +		nvme_execute_rq_polled(req->q, NULL, req, at_head);
+ +	else
+ +		blk_execute_rq(req->q, NULL, req, at_head);
+++=======
++ 	blk_execute_rq(NULL, req, at_head);
+++>>>>>>> be42a33b9252 (nvme: use blk_execute_rq() for passthrough commands)
+  	if (result)
+  		*result = nvme_req(req)->result;
+  	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/fabrics.c b/drivers/nvme/host/fabrics.c
+index 605fbb6969b0..97b8a46a506a 100644
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@ -154,7 +154,7 @@ int nvmf_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
+ 	cmd.prop_get.offset = cpu_to_le32(off);
+ 
+ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, &res, NULL, 0, 0,
+-			NVME_QID_ANY, 0, 0, false);
++			NVME_QID_ANY, 0, 0);
+ 
+ 	if (ret >= 0)
+ 		*val = le64_to_cpu(res.u64);
+@@ -200,7 +200,7 @@ int nvmf_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
+ 	cmd.prop_get.offset = cpu_to_le32(off);
+ 
+ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, &res, NULL, 0, 0,
+-			NVME_QID_ANY, 0, 0, false);
++			NVME_QID_ANY, 0, 0);
+ 
+ 	if (ret >= 0)
+ 		*val = le64_to_cpu(res.u64);
+@@ -245,7 +245,7 @@ int nvmf_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
+ 	cmd.prop_set.value = cpu_to_le64(val);
+ 
+ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, NULL, NULL, 0, 0,
+-			NVME_QID_ANY, 0, 0, false);
++			NVME_QID_ANY, 0, 0);
+ 	if (unlikely(ret))
+ 		dev_err(ctrl->device,
+ 			"Property Set error: %d, offset %#x\n",
+@@ -397,7 +397,7 @@ int nvmf_connect_admin_queue(struct nvme_ctrl *ctrl)
+ 
+ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, &res,
+ 			data, sizeof(*data), 0, NVME_QID_ANY, 1,
+-			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT, false);
++			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT);
+ 	if (ret) {
+ 		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(res.u32),
+ 				       &cmd, data);
+@@ -421,7 +421,6 @@ EXPORT_SYMBOL_GPL(nvmf_connect_admin_queue);
+  * @qid:	NVMe I/O queue number for the new I/O connection between
+  *		host and target (note qid == 0 is illegal as this is
+  *		the Admin queue, per NVMe standard).
+- * @poll:	Whether or not to poll for the completion of the connect cmd.
+  *
+  * This function issues a fabrics-protocol connection
+  * of a NVMe I/O queue (via NVMe Fabrics "Connect" command)
+@@ -433,7 +432,7 @@ EXPORT_SYMBOL_GPL(nvmf_connect_admin_queue);
+  *	> 0: NVMe error status code
+  *	< 0: Linux errno error code
+  */
+-int nvmf_connect_io_queue(struct nvme_ctrl *ctrl, u16 qid, bool poll)
++int nvmf_connect_io_queue(struct nvme_ctrl *ctrl, u16 qid)
+ {
+ 	struct nvme_command cmd = { };
+ 	struct nvmf_connect_data *data;
+@@ -459,7 +458,7 @@ int nvmf_connect_io_queue(struct nvme_ctrl *ctrl, u16 qid, bool poll)
+ 
+ 	ret = __nvme_submit_sync_cmd(ctrl->connect_q, &cmd, &res,
+ 			data, sizeof(*data), 0, qid, 1,
+-			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT, poll);
++			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT);
+ 	if (ret) {
+ 		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(res.u32),
+ 				       &cmd, data);
+diff --git a/drivers/nvme/host/fabrics.h b/drivers/nvme/host/fabrics.h
+index b8900946749c..b9e391e10402 100644
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@ -182,7 +182,7 @@ int nvmf_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val);
+ int nvmf_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val);
+ int nvmf_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val);
+ int nvmf_connect_admin_queue(struct nvme_ctrl *ctrl);
+-int nvmf_connect_io_queue(struct nvme_ctrl *ctrl, u16 qid, bool poll);
++int nvmf_connect_io_queue(struct nvme_ctrl *ctrl, u16 qid);
+ int nvmf_register_transport(struct nvmf_transport_ops *ops);
+ void nvmf_unregister_transport(struct nvmf_transport_ops *ops);
+ void nvmf_free_options(struct nvmf_ctrl_options *opts);
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 6599a4d0590b..e527a8457c21 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2345,7 +2345,7 @@ nvme_fc_connect_io_queues(struct nvme_fc_ctrl *ctrl, u16 qsize)
+ 					(qsize / 5));
+ 		if (ret)
+ 			break;
+-		ret = nvmf_connect_io_queue(&ctrl->ctrl, i, false);
++		ret = nvmf_connect_io_queue(&ctrl->ctrl, i);
+ 		if (ret)
+ 			break;
+ 
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 71a90ae628be..d0ed09cab59a 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -631,7 +631,7 @@ int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		union nvme_result *result, void *buffer, unsigned bufflen,
+ 		unsigned timeout, int qid, int at_head,
+-		blk_mq_req_flags_t flags, bool poll);
++		blk_mq_req_flags_t flags);
+ int nvme_set_features(struct nvme_ctrl *dev, unsigned int fid,
+ 		      unsigned int dword11, void *buffer, size_t buflen,
+ 		      u32 *result);
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 1b8a4640d836..c40bbe6a49a9 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -695,11 +695,10 @@ static void nvme_rdma_stop_io_queues(struct nvme_rdma_ctrl *ctrl)
+ static int nvme_rdma_start_queue(struct nvme_rdma_ctrl *ctrl, int idx)
+ {
+ 	struct nvme_rdma_queue *queue = &ctrl->queues[idx];
+-	bool poll = nvme_rdma_poll_queue(queue);
+ 	int ret;
+ 
+ 	if (idx)
+-		ret = nvmf_connect_io_queue(&ctrl->ctrl, idx, poll);
++		ret = nvmf_connect_io_queue(&ctrl->ctrl, idx);
+ 	else
+ 		ret = nvmf_connect_admin_queue(&ctrl->ctrl);
+ 
+diff --git a/drivers/nvme/host/tcp.c b/drivers/nvme/host/tcp.c
+index 8d95492ec1f8..2716c22be0b4 100644
+--- a/drivers/nvme/host/tcp.c
++++ b/drivers/nvme/host/tcp.c
+@@ -1567,7 +1567,7 @@ static int nvme_tcp_start_queue(struct nvme_ctrl *nctrl, int idx)
+ 	int ret;
+ 
+ 	if (idx)
+-		ret = nvmf_connect_io_queue(nctrl, idx, false);
++		ret = nvmf_connect_io_queue(nctrl, idx);
+ 	else
+ 		ret = nvmf_connect_admin_queue(nctrl);
+ 
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index 0287c7a099d1..ef3c10b2e793 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -353,7 +353,7 @@ static int nvme_loop_connect_io_queues(struct nvme_loop_ctrl *ctrl)
+ 	int i, ret;
+ 
+ 	for (i = 1; i < ctrl->ctrl.queue_count; i++) {
+-		ret = nvmf_connect_io_queue(&ctrl->ctrl, i, false);
++		ret = nvmf_connect_io_queue(&ctrl->ctrl, i);
+ 		if (ret)
+ 			return ret;
+ 		set_bit(NVME_LOOP_Q_LIVE, &ctrl->queues[i].flags);
