@@ -1,0 +1,378 @@
+signal: remove the wrong signal_pending() check in restore_user_sigmask()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 97abc889ee296faf95ca0e978340fb7b942a3e32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/97abc889.failed
+
+This is the minimal fix for stable, I'll send cleanups later.
+
+Commit 854a6ed56839 ("signal: Add restore_user_sigmask()") introduced
+the visible change which breaks user-space: a signal temporary unblocked
+by set_user_sigmask() can be delivered even if the caller returns
+success or timeout.
+
+Change restore_user_sigmask() to accept the additional "interrupted"
+argument which should be used instead of signal_pending() check, and
+update the callers.
+
+Eric said:
+
+: For clarity.  I don't think this is required by posix, or fundamentally to
+: remove the races in select.  It is what linux has always done and we have
+: applications who care so I agree this fix is needed.
+:
+: Further in any case where the semantic change that this patch rolls back
+: (aka where allowing a signal to be delivered and the select like call to
+: complete) would be advantage we can do as well if not better by using
+: signalfd.
+:
+: Michael is there any chance we can get this guarantee of the linux
+: implementation of pselect and friends clearly documented.  The guarantee
+: that if the system call completes successfully we are guaranteed that no
+: signal that is unblocked by using sigmask will be delivered?
+
+Link: http://lkml.kernel.org/r/20190604134117.GA29963@redhat.com
+Fixes: 854a6ed56839a40f6b5d02a2962f48841482eec4 ("signal: Add restore_user_sigmask()")
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Reported-by: Eric Wong <e@80x24.org>
+	Tested-by: Eric Wong <e@80x24.org>
+	Acked-by: "Eric W. Biederman" <ebiederm@xmission.com>
+	Acked-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Deepa Dinamani <deepa.kernel@gmail.com>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Jason Baron <jbaron@akamai.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Cc: David Laight <David.Laight@ACULAB.COM>
+	Cc: <stable@vger.kernel.org>	[5.0+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 97abc889ee296faf95ca0e978340fb7b942a3e32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/aio.c
+#	fs/select.c
+diff --cc fs/aio.c
+index 38f8d514060c,c1e581dd32f5..000000000000
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@@ -1912,6 -2104,42 +1913,45 @@@ SYSCALL_DEFINE6(io_pgetevents
+  	if (usig && copy_from_user(&ksig, usig, sizeof(ksig)))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = set_user_sigmask(ksig.sigmask, &ksigmask, &sigsaved, ksig.sigsetsize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = do_io_getevents(ctx_id, min_nr, nr, events, timeout ? &ts : NULL);
++ 
++ 	interrupted = signal_pending(current);
++ 	restore_user_sigmask(ksig.sigmask, &sigsaved, interrupted);
++ 	if (interrupted && !ret)
++ 		ret = -ERESTARTNOHAND;
++ 
++ 	return ret;
++ }
++ 
++ #if defined(CONFIG_COMPAT_32BIT_TIME) && !defined(CONFIG_64BIT)
++ 
++ SYSCALL_DEFINE6(io_pgetevents_time32,
++ 		aio_context_t, ctx_id,
++ 		long, min_nr,
++ 		long, nr,
++ 		struct io_event __user *, events,
++ 		struct old_timespec32 __user *, timeout,
++ 		const struct __aio_sigset __user *, usig)
++ {
++ 	struct __aio_sigset	ksig = { NULL, };
++ 	sigset_t		ksigmask, sigsaved;
++ 	struct timespec64	ts;
++ 	bool interrupted;
++ 	int ret;
++ 
++ 	if (timeout && unlikely(get_old_timespec32(&ts, timeout)))
++ 		return -EFAULT;
++ 
++ 	if (usig && copy_from_user(&ksig, usig, sizeof(ksig)))
++ 		return -EFAULT;
++ 
+++>>>>>>> 97abc889ee29 (signal: remove the wrong signal_pending() check in restore_user_sigmask())
+  
+  	ret = set_user_sigmask(ksig.sigmask, &ksigmask, &sigsaved, ksig.sigsetsize);
+  	if (ret)
+@@@ -1961,9 -2199,10 +2003,13 @@@ COMPAT_SYSCALL_DEFINE6(io_pgetevents
+  	struct __compat_aio_sigset ksig = { NULL, };
+  	sigset_t ksigmask, sigsaved;
+  	struct timespec64 t;
++ 	bool interrupted;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (timeout && compat_get_timespec64(&t, timeout))
+++=======
++ 	if (timeout && get_old_timespec32(&t, timeout))
+  		return -EFAULT;
+  
+  	if (usig && copy_from_user(&ksig, usig, sizeof(ksig)))
+@@@ -1974,8 -2213,46 +2020,47 @@@
+  		return ret;
+  
+  	ret = do_io_getevents(ctx_id, min_nr, nr, events, timeout ? &t : NULL);
+- 	restore_user_sigmask(ksig.sigmask, &sigsaved);
+- 	if (signal_pending(current) && !ret)
++ 
++ 	interrupted = signal_pending(current);
++ 	restore_user_sigmask(ksig.sigmask, &sigsaved, interrupted);
++ 	if (interrupted && !ret)
++ 		ret = -ERESTARTNOHAND;
++ 
++ 	return ret;
++ }
++ 
++ #endif
++ 
++ COMPAT_SYSCALL_DEFINE6(io_pgetevents_time64,
++ 		compat_aio_context_t, ctx_id,
++ 		compat_long_t, min_nr,
++ 		compat_long_t, nr,
++ 		struct io_event __user *, events,
++ 		struct __kernel_timespec __user *, timeout,
++ 		const struct __compat_aio_sigset __user *, usig)
++ {
++ 	struct __compat_aio_sigset ksig = { NULL, };
++ 	sigset_t ksigmask, sigsaved;
++ 	struct timespec64 t;
++ 	bool interrupted;
++ 	int ret;
++ 
++ 	if (timeout && get_timespec64(&t, timeout))
+++>>>>>>> 97abc889ee29 (signal: remove the wrong signal_pending() check in restore_user_sigmask())
++ 		return -EFAULT;
++ 
++ 	if (usig && copy_from_user(&ksig, usig, sizeof(ksig)))
++ 		return -EFAULT;
++ 
++ 	ret = set_compat_user_sigmask(ksig.sigmask, &ksigmask, &sigsaved, ksig.sigsetsize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = do_io_getevents(ctx_id, min_nr, nr, events, timeout ? &t : NULL);
++ 
++ 	interrupted = signal_pending(current);
++ 	restore_user_sigmask(ksig.sigmask, &sigsaved, interrupted);
++ 	if (interrupted && !ret)
+  		ret = -ERESTARTNOHAND;
+  
+  	return ret;
+diff --cc fs/select.c
+index ac5218bcbf3b,a4d8f6e8b63c..000000000000
+--- a/fs/select.c
++++ b/fs/select.c
+@@@ -719,9 -758,8 +719,12 @@@ static long do_pselect(int n, fd_set __
+  		return ret;
+  
+  	ret = core_sys_select(n, inp, outp, exp, to);
+++<<<<<<< HEAD
+ +	ret = poll_select_copy_remaining(&end_time, tsp, 0, ret);
+- 
+- 	restore_user_sigmask(sigmask, &sigsaved);
+++=======
++ 	restore_user_sigmask(sigmask, &sigsaved, ret == -ERESTARTNOHAND);
++ 	ret = poll_select_copy_remaining(&end_time, tsp, type, ret);
+++>>>>>>> 97abc889ee29 (signal: remove the wrong signal_pending() check in restore_user_sigmask())
+  
+  	return ret;
+  }
+@@@ -1056,6 -1115,42 +1058,45 @@@ SYSCALL_DEFINE5(ppoll, struct pollfd __
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_COMPAT_32BIT_TIME) && !defined(CONFIG_64BIT)
++ 
++ SYSCALL_DEFINE5(ppoll_time32, struct pollfd __user *, ufds, unsigned int, nfds,
++ 		struct old_timespec32 __user *, tsp, const sigset_t __user *, sigmask,
++ 		size_t, sigsetsize)
++ {
++ 	sigset_t ksigmask, sigsaved;
++ 	struct timespec64 ts, end_time, *to = NULL;
++ 	int ret;
++ 
++ 	if (tsp) {
++ 		if (get_old_timespec32(&ts, tsp))
++ 			return -EFAULT;
++ 
++ 		to = &end_time;
++ 		if (poll_select_set_timeout(to, ts.tv_sec, ts.tv_nsec))
++ 			return -EINVAL;
++ 	}
++ 
++ 	ret = set_user_sigmask(sigmask, &ksigmask, &sigsaved, sigsetsize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = do_sys_poll(ufds, nfds, to);
++ 
++ 	restore_user_sigmask(sigmask, &sigsaved, ret == -EINTR);
++ 	/* We can restart this syscall, usually */
++ 	if (ret == -EINTR)
++ 		ret = -ERESTARTNOHAND;
++ 
++ 	ret = poll_select_copy_remaining(&end_time, tsp, PT_OLD_TIMESPEC, ret);
++ 
++ 	return ret;
++ }
++ #endif
++ 
+++>>>>>>> 97abc889ee29 (signal: remove the wrong signal_pending() check in restore_user_sigmask())
+  #ifdef CONFIG_COMPAT
+  #define __COMPAT_NFDBITS       (8 * sizeof(compat_ulong_t))
+  
+@@@ -1289,9 -1347,8 +1330,12 @@@ static long do_compat_pselect(int n, co
+  		return ret;
+  
+  	ret = compat_core_sys_select(n, inp, outp, exp, to);
+++<<<<<<< HEAD
+ +	ret = compat_poll_select_copy_remaining(&end_time, tsp, 0, ret);
+- 
+- 	restore_user_sigmask(sigmask, &sigsaved);
+++=======
++ 	restore_user_sigmask(sigmask, &sigsaved, ret == -ERESTARTNOHAND);
++ 	ret = poll_select_copy_remaining(&end_time, tsp, type, ret);
+++>>>>>>> 97abc889ee29 (signal: remove the wrong signal_pending() check in restore_user_sigmask())
+  
+  	return ret;
+  }
+@@@ -1349,3 -1431,39 +1392,42 @@@ COMPAT_SYSCALL_DEFINE5(ppoll, struct po
+  	return ret;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ /* New compat syscall for 64 bit time_t*/
++ COMPAT_SYSCALL_DEFINE5(ppoll_time64, struct pollfd __user *, ufds,
++ 	unsigned int,  nfds, struct __kernel_timespec __user *, tsp,
++ 	const compat_sigset_t __user *, sigmask, compat_size_t, sigsetsize)
++ {
++ 	sigset_t ksigmask, sigsaved;
++ 	struct timespec64 ts, end_time, *to = NULL;
++ 	int ret;
++ 
++ 	if (tsp) {
++ 		if (get_timespec64(&ts, tsp))
++ 			return -EFAULT;
++ 
++ 		to = &end_time;
++ 		if (poll_select_set_timeout(to, ts.tv_sec, ts.tv_nsec))
++ 			return -EINVAL;
++ 	}
++ 
++ 	ret = set_compat_user_sigmask(sigmask, &ksigmask, &sigsaved, sigsetsize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = do_sys_poll(ufds, nfds, to);
++ 
++ 	restore_user_sigmask(sigmask, &sigsaved, ret == -EINTR);
++ 	/* We can restart this syscall, usually */
++ 	if (ret == -EINTR)
++ 		ret = -ERESTARTNOHAND;
++ 
++ 	ret = poll_select_copy_remaining(&end_time, tsp, PT_TIMESPEC, ret);
++ 
++ 	return ret;
++ }
++ 
++ #endif
+++>>>>>>> 97abc889ee29 (signal: remove the wrong signal_pending() check in restore_user_sigmask())
+* Unmerged path fs/aio.c
+diff --git a/fs/eventpoll.c b/fs/eventpoll.c
+index d58736a470b2..3d0a42394f5d 100644
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -2221,7 +2221,7 @@ SYSCALL_DEFINE6(epoll_pwait, int, epfd, struct epoll_event __user *, events,
+ 
+ 	error = do_epoll_wait(epfd, events, maxevents, timeout);
+ 
+-	restore_user_sigmask(sigmask, &sigsaved);
++	restore_user_sigmask(sigmask, &sigsaved, error == -EINTR);
+ 
+ 	return error;
+ }
+@@ -2246,7 +2246,7 @@ COMPAT_SYSCALL_DEFINE6(epoll_pwait, int, epfd,
+ 
+ 	err = do_epoll_wait(epfd, events, maxevents, timeout);
+ 
+-	restore_user_sigmask(sigmask, &sigsaved);
++	restore_user_sigmask(sigmask, &sigsaved, err == -EINTR);
+ 
+ 	return err;
+ }
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 1f79dd22450a..13fa4ce0d0a1 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -2197,11 +2197,12 @@ static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
+ 	}
+ 
+ 	ret = wait_event_interruptible(ctx->wait, io_cqring_events(ring) >= min_events);
+-	if (ret == -ERESTARTSYS)
+-		ret = -EINTR;
+ 
+ 	if (sig)
+-		restore_user_sigmask(sig, &sigsaved);
++		restore_user_sigmask(sig, &sigsaved, ret == -ERESTARTSYS);
++
++	if (ret == -ERESTARTSYS)
++		ret = -EINTR;
+ 
+ 	return READ_ONCE(ring->r.head) == READ_ONCE(ring->r.tail) ? ret : 0;
+ }
+* Unmerged path fs/select.c
+diff --git a/include/linux/signal.h b/include/linux/signal.h
+index 258c594d6eee..1f1ea78f9e7c 100644
+--- a/include/linux/signal.h
++++ b/include/linux/signal.h
+@@ -270,7 +270,7 @@ extern int sigprocmask(int, sigset_t *, sigset_t *);
+ extern int set_user_sigmask(const sigset_t __user *usigmask, sigset_t *set,
+ 	sigset_t *oldset, size_t sigsetsize);
+ extern void restore_user_sigmask(const void __user *usigmask,
+-				 sigset_t *sigsaved);
++				 sigset_t *sigsaved, bool interrupted);
+ extern void set_current_blocked(sigset_t *);
+ extern void __set_current_blocked(const sigset_t *);
+ extern int show_unhandled_signals;
+diff --git a/kernel/signal.c b/kernel/signal.c
+index c020e161702c..eb2d3915cbc9 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2908,7 +2908,8 @@ EXPORT_SYMBOL(set_compat_user_sigmask);
+  * This is useful for syscalls such as ppoll, pselect, io_pgetevents and
+  * epoll_pwait where a new sigmask is passed in from userland for the syscalls.
+  */
+-void restore_user_sigmask(const void __user *usigmask, sigset_t *sigsaved)
++void restore_user_sigmask(const void __user *usigmask, sigset_t *sigsaved,
++				bool interrupted)
+ {
+ 
+ 	if (!usigmask)
+@@ -2918,7 +2919,7 @@ void restore_user_sigmask(const void __user *usigmask, sigset_t *sigsaved)
+ 	 * Restoring sigmask here can lead to delivering signals that the above
+ 	 * syscalls are intended to block because of the sigmask passed in.
+ 	 */
+-	if (signal_pending(current)) {
++	if (interrupted) {
+ 		current->saved_sigmask = *sigsaved;
+ 		set_restore_sigmask();
+ 		return;
