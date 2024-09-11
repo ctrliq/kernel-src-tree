@@ -1,0 +1,147 @@
+s390/qeth: add SW timestamping support for IQD devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 8d145da294a9371c050994bbe6fef98c91e3c072
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8d145da2.failed
+
+This adds support for SOF_TIMESTAMPING_TX_SOFTWARE.
+No support for non-IQD devices, since they orphan the skb in their xmit
+path.
+
+To play nice with TX bulking, set the timestamp when the buffer that
+contains the skb(s) is actually flushed out to HW.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d145da294a9371c050994bbe6fef98c91e3c072)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_ethtool.c
+diff --cc drivers/s390/net/qeth_ethtool.c
+index ab59bc975719,5cfa371b7426..000000000000
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@@ -175,6 -175,75 +175,78 @@@ static void qeth_get_channels(struct ne
+  	channels->combined_count = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qeth_set_channels(struct net_device *dev,
++ 			     struct ethtool_channels *channels)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	if (channels->rx_count == 0 || channels->tx_count == 0)
++ 		return -EINVAL;
++ 	if (channels->tx_count > card->qdio.no_out_queues)
++ 		return -EINVAL;
++ 
++ 	if (IS_IQD(card)) {
++ 		if (channels->tx_count < QETH_IQD_MIN_TXQ)
++ 			return -EINVAL;
++ 
++ 		/* Reject downgrade while running. It could push displaced
++ 		 * ucast flows onto txq0, which is reserved for mcast.
++ 		 */
++ 		if (netif_running(dev) &&
++ 		    channels->tx_count < dev->real_num_tx_queues)
++ 			return -EPERM;
++ 	} else {
++ 		/* OSA still uses the legacy prio-queue mechanism: */
++ 		if (!IS_VM_NIC(card))
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return qeth_set_real_num_tx_queues(card, channels->tx_count);
++ }
++ 
++ static int qeth_get_ts_info(struct net_device *dev,
++ 			    struct ethtool_ts_info *info)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	if (!IS_IQD(card))
++ 		return -EOPNOTSUPP;
++ 
++ 	return ethtool_op_get_ts_info(dev, info);
++ }
++ 
++ static int qeth_get_tunable(struct net_device *dev,
++ 			    const struct ethtool_tunable *tuna, void *data)
++ {
++ 	struct qeth_priv *priv = netdev_priv(dev);
++ 
++ 	switch (tuna->id) {
++ 	case ETHTOOL_RX_COPYBREAK:
++ 		*(u32 *)data = priv->rx_copybreak;
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int qeth_set_tunable(struct net_device *dev,
++ 			    const struct ethtool_tunable *tuna,
++ 			    const void *data)
++ {
++ 	struct qeth_priv *priv = netdev_priv(dev);
++ 
++ 	switch (tuna->id) {
++ 	case ETHTOOL_RX_COPYBREAK:
++ 		WRITE_ONCE(priv->rx_copybreak, *(u32 *)data);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
+++>>>>>>> 8d145da294a9 (s390/qeth: add SW timestamping support for IQD devices)
+  /* Helper function to fill 'advertising' and 'supported' which are the same. */
+  /* Autoneg and full-duplex are supported and advertised unconditionally.     */
+  /* Always advertise and support all speeds up to specified, and only one     */
+@@@ -381,6 -450,10 +453,13 @@@ const struct ethtool_ops qeth_ethtool_o
+  	.get_sset_count = qeth_get_sset_count,
+  	.get_drvinfo = qeth_get_drvinfo,
+  	.get_channels = qeth_get_channels,
+++<<<<<<< HEAD
+++=======
++ 	.set_channels = qeth_set_channels,
++ 	.get_ts_info = qeth_get_ts_info,
++ 	.get_tunable = qeth_get_tunable,
++ 	.set_tunable = qeth_set_tunable,
+++>>>>>>> 8d145da294a9 (s390/qeth: add SW timestamping support for IQD devices)
+  	.get_link_ksettings = qeth_get_link_ksettings,
+  };
+  
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index bc50c9fcba8c..7aa018507495 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -3365,6 +3365,7 @@ static void qeth_flush_buffers(struct qeth_qdio_out_q *queue, int index,
+ 
+ 	for (i = index; i < index + count; ++i) {
+ 		unsigned int bidx = QDIO_BUFNR(i);
++		struct sk_buff *skb;
+ 
+ 		buf = queue->bufs[bidx];
+ 		buf->buffer->element[buf->next_element_to_fill - 1].eflags |=
+@@ -3373,8 +3374,11 @@ static void qeth_flush_buffers(struct qeth_qdio_out_q *queue, int index,
+ 		if (queue->bufstates)
+ 			queue->bufstates[bidx].user = buf;
+ 
+-		if (IS_IQD(queue->card))
++		if (IS_IQD(card)) {
++			skb_queue_walk(&buf->skb_list, skb)
++				skb_tx_timestamp(skb);
+ 			continue;
++		}
+ 
+ 		if (!queue->do_pack) {
+ 			if ((atomic_read(&queue->used_buffers) >=
+* Unmerged path drivers/s390/net/qeth_ethtool.c
