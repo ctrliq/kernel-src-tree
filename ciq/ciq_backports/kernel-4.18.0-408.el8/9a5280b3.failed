@@ -1,0 +1,82 @@
+xfs: reorder iunlink remove operation in xfs_ifree
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 9a5280b312e2e7898b6397b2ca3cfd03f67d7be1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/9a5280b3.failed
+
+The O_TMPFILE creation implementation creates a specific order of
+operations for inode allocation/freeing and unlinked list
+modification. Currently both are serialised by the AGI, so the order
+doesn't strictly matter as long as the are both in the same
+transaction.
+
+However, if we want to move the unlinked list insertions largely out
+from under the AGI lock, then we have to be concerned about the
+order in which we do unlinked list modification operations.
+O_TMPFILE creation tells us this order is inode allocation/free,
+then unlinked list modification.
+
+Change xfs_ifree() to use this same ordering on unlinked list
+removal. This way we always guarantee that when we enter the
+iunlinked list removal code from this path, we already have the AGI
+locked and we don't have to worry about lock nesting AGI reads
+inside unlink list locks because it's already locked and attached to
+the transaction.
+
+We can do this safely as the inode freeing and unlinked list removal
+are done in the same transaction and hence are atomic operations
+with respect to log recovery.
+
+
+	Reported-by: Frank Hofmann <fhofmann@cloudflare.com>
+Fixes: 298f7bec503f ("xfs: pin inode backing buffer to the inode log item")
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit 9a5280b312e2e7898b6397b2ca3cfd03f67d7be1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/xfs_inode.c
+index a52a24b35c02,39ae53efb3ab..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -2594,16 -2619,21 +2593,29 @@@ xfs_ifree
+  	ASSERT(ip->i_disk_size == 0 || !S_ISREG(VFS_I(ip)->i_mode));
+  	ASSERT(ip->i_nblocks == 0);
+  
+ -	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
+ -
+  	/*
+- 	 * Pull the on-disk inode from the AGI unlinked list.
++ 	 * Free the inode first so that we guarantee that the AGI lock is going
++ 	 * to be taken before we remove the inode from the unlinked list. This
++ 	 * makes the AGI lock -> unlinked list modification order the same as
++ 	 * used in O_TMPFILE creation.
+  	 */
+++<<<<<<< HEAD
+ +	error = xfs_iunlink_remove(tp, ip);
+ +	if (error)
+ +		return error;
+ +
+ +	error = xfs_difree(tp, ip->i_ino, &xic);
+ +	if (error)
+ +		return error;
+++=======
++ 	error = xfs_difree(tp, pag, ip->i_ino, &xic);
++ 	if (error)
++ 		return error;
++ 
++ 	error = xfs_iunlink_remove(tp, pag, ip);
++ 	if (error)
++ 		goto out;
+++>>>>>>> 9a5280b312e2 (xfs: reorder iunlink remove operation in xfs_ifree)
+  
+  	/*
+  	 * Free any local-format data sitting around before we reset the
+* Unmerged path fs/xfs/xfs_inode.c
