@@ -988,13 +988,14 @@ int __init early_init_dt_scan_chosen_stdout(void)
 /**
  * early_init_dt_scan_root - fetch the top level address and size cells
  */
-int __init early_init_dt_scan_root(unsigned long node, const char *uname,
-				   int depth, void *data)
+int __init early_init_dt_scan_root(void)
 {
 	const __be32 *prop;
+	const void *fdt = initial_boot_params;
+	int node = fdt_path_offset(fdt, "/");
 
-	if (depth != 0)
-		return 0;
+	if (node < 0)
+		return -ENODEV;
 
 	dt_root_size_cells = OF_ROOT_NODE_SIZE_CELLS_DEFAULT;
 	dt_root_addr_cells = OF_ROOT_NODE_ADDR_CELLS_DEFAULT;
@@ -1009,8 +1010,7 @@ int __init early_init_dt_scan_root(unsigned long node, const char *uname,
 		dt_root_addr_cells = be32_to_cpup(prop);
 	pr_debug("dt_root_addr_cells = %x\n", dt_root_addr_cells);
 
-	/* break now */
-	return 1;
+	return 0;
 }
 
 u64 __init dt_mem_next_cell(int s, const __be32 **cellp)
@@ -1216,7 +1216,7 @@ void __init early_init_dt_scan_nodes(void)
 	of_scan_flat_dt(early_init_dt_scan_chosen, boot_command_line);
 
 	/* Initialize {size,address}-cells info */
-	of_scan_flat_dt(early_init_dt_scan_root, NULL);
+	early_init_dt_scan_root();
 
 	/* Setup memory, calling early_init_dt_add_memory_arch */
 	of_scan_flat_dt(early_init_dt_scan_memory, NULL);
