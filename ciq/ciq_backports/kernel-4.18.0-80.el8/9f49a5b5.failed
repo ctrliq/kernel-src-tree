@@ -1,0 +1,396 @@
+RDMA/netdev: Use priv_destructor for netdev cleanup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 9f49a5b5c21d58aa84e16cfdc5e99e49faefcb7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/9f49a5b5.failed
+
+Now that the unregister_netdev flow for IPoIB no longer relies on external
+code we can now introduce the use of priv_destructor and
+needs_free_netdev.
+
+The rdma_netdev flow is switched to use the netdev common priv_destructor
+instead of the special free_rdma_netdev and the IPOIB ULP adjusted:
+ - priv_destructor needs to switch to point to the ULP's destructor
+   which will then call the rdma_ndev's in the right order
+ - We need to be careful around the error unwind of register_netdev
+   as it sometimes calls priv_destructor on failure
+ - ULPs need to use ndo_init/uninit to ensure proper ordering
+   of failures around register_netdev
+
+Switching to priv_destructor is a necessary pre-requisite to using
+the rtnl new_link mechanism.
+
+The VNIC user for rdma_netdev should also be revised, but that is left for
+another patch.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Denis Drozdov <denisd@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 9f49a5b5c21d58aa84e16cfdc5e99e49faefcb7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 94512d9e8358,73d917d57f93..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -2251,69 -2376,15 +2286,75 @@@ static struct net_device *ipoib_add_por
+  					 struct ib_device *hca, u8 port)
+  {
+  	struct ipoib_dev_priv *priv;
+++<<<<<<< HEAD
+ +	struct ib_port_attr attr;
+ +	struct rdma_netdev *rn;
+ +	int result = -ENOMEM;
+++=======
++ 	struct net_device *ndev;
++ 	int result;
+++>>>>>>> 9f49a5b5c21d (RDMA/netdev: Use priv_destructor for netdev cleanup)
+  
+  	priv = ipoib_intf_alloc(hca, port, format);
+  	if (!priv) {
+  		pr_warn("%s, %d: ipoib_intf_alloc failed\n", hca->name, port);
+ -		return ERR_PTR(-ENOMEM);
+ +		goto alloc_mem_failed;
+ +	}
+ +
+ +	SET_NETDEV_DEV(priv->dev, hca->dev.parent);
+ +	priv->dev->dev_id = port - 1;
+ +
+ +	result = ib_query_port(hca, port, &attr);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_port %d failed\n", hca->name, port);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	priv->max_ib_mtu = ib_mtu_enum_to_int(attr.max_mtu);
+ +
+ +	/* MTU will be reset when mcast join happens */
+ +	priv->dev->mtu  = IPOIB_UD_MTU(priv->max_ib_mtu);
+ +	priv->mcast_mtu  = priv->admin_mtu = priv->dev->mtu;
+ +	priv->dev->max_mtu = IPOIB_CM_MTU;
+ +
+ +	priv->dev->neigh_priv_len = sizeof(struct ipoib_neigh);
+ +
+ +	result = ib_query_pkey(hca, port, 0, &priv->pkey);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_pkey port %d failed (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	ipoib_set_dev_features(priv, hca);
+ +
+ +	/*
+ +	 * Set the full membership bit, so that we join the right
+ +	 * broadcast group, etc.
+ +	 */
+ +	priv->pkey |= 0x8000;
+ +
+ +	priv->dev->broadcast[8] = priv->pkey >> 8;
+ +	priv->dev->broadcast[9] = priv->pkey & 0xff;
+ +
+ +	result = ib_query_gid(hca, port, 0, &priv->local_gid, NULL);
+ +	if (result) {
+ +		pr_warn("%s: ib_query_gid port %d failed (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+ +	}
+ +
+ +	memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw,
+ +	       sizeof(union ib_gid));
+ +	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ +
+ +	result = ipoib_dev_init(priv->dev, hca, port);
+ +	if (result) {
+ +		pr_warn("%s: failed to initialize port %d (ret = %d)\n",
+ +			hca->name, port, result);
+ +		goto device_init_failed;
+  	}
++ 	ndev = priv->dev;
+  
+  	INIT_IB_EVENT_HANDLER(&priv->event_handler,
+  			      priv->ca, ipoib_event);
+@@@ -2326,35 -2397,39 +2367,52 @@@
+  	if (result) {
+  		pr_warn("%s: couldn't register ipoib port %d; error %d\n",
+  			hca->name, port, result);
+- 		ipoib_parent_unregister_pre(priv->dev);
+- 		goto device_init_failed;
++ 
++ 		ipoib_parent_unregister_pre(ndev);
++ 		ipoib_intf_free(ndev);
++ 		free_netdev(ndev);
++ 
++ 		return ERR_PTR(result);
+  	}
+  
+- 	result = -ENOMEM;
+- 	if (ipoib_cm_add_mode_attr(priv->dev))
++ 	/*
++ 	 * We cannot set priv_destructor before register_netdev because we
++ 	 * need priv to be always valid during the error flow to execute
++ 	 * ipoib_parent_unregister_pre(). Instead handle it manually and only
++ 	 * enter priv_destructor mode once we are completely registered.
++ 	 */
++ 	ndev->priv_destructor = ipoib_intf_free;
++ 
++ 	if (ipoib_cm_add_mode_attr(ndev))
+  		goto sysfs_failed;
+- 	if (ipoib_add_pkey_attr(priv->dev))
++ 	if (ipoib_add_pkey_attr(ndev))
+  		goto sysfs_failed;
+- 	if (ipoib_add_umcast_attr(priv->dev))
++ 	if (ipoib_add_umcast_attr(ndev))
+  		goto sysfs_failed;
+- 	if (device_create_file(&priv->dev->dev, &dev_attr_create_child))
++ 	if (device_create_file(&ndev->dev, &dev_attr_create_child))
+  		goto sysfs_failed;
+- 	if (device_create_file(&priv->dev->dev, &dev_attr_delete_child))
++ 	if (device_create_file(&ndev->dev, &dev_attr_delete_child))
+  		goto sysfs_failed;
+  
+- 	return priv->dev;
++ 	return ndev;
+  
+  sysfs_failed:
+++<<<<<<< HEAD
+ +	ipoib_parent_unregister_pre(priv->dev);
+ +	unregister_netdev(priv->dev);
+ +
+ +device_init_failed:
+ +	rn = netdev_priv(priv->dev);
+ +	rn->free_rdma_netdev(priv->dev);
+ +	kfree(priv);
+ +
+ +alloc_mem_failed:
+ +	return ERR_PTR(result);
+++=======
++ 	ipoib_parent_unregister_pre(ndev);
++ 	unregister_netdev(ndev);
++ 	return ERR_PTR(-ENOMEM);
+++>>>>>>> 9f49a5b5c21d (RDMA/netdev: Use priv_destructor for netdev cleanup)
+  }
+  
+  static void ipoib_add_one(struct ib_device *device)
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index b62ab85c8ead,7776334cf8c5..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@@ -53,37 -62,29 +62,57 @@@ static DEVICE_ATTR(parent, S_IRUGO, sho
+  int __ipoib_vlan_add(struct ipoib_dev_priv *ppriv, struct ipoib_dev_priv *priv,
+  		     u16 pkey, int type)
+  {
++ 	struct net_device *ndev = priv->dev;
+  	int result;
+  
+++<<<<<<< HEAD
+ +	priv->max_ib_mtu = ppriv->max_ib_mtu;
+ +	/* MTU will be reset when mcast join happens */
+ +	priv->dev->mtu   = IPOIB_UD_MTU(priv->max_ib_mtu);
+ +	priv->mcast_mtu  = priv->admin_mtu = priv->dev->mtu;
+++=======
++ 	ASSERT_RTNL();
++ 
+++>>>>>>> 9f49a5b5c21d (RDMA/netdev: Use priv_destructor for netdev cleanup)
+  	priv->parent = ppriv->dev;
+ +	set_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags);
+ +
+ +	ipoib_set_dev_features(priv, ppriv->ca);
+ +
+  	priv->pkey = pkey;
+ -	priv->child_type = type;
+ +
+ +	memcpy(priv->dev->dev_addr, ppriv->dev->dev_addr, INFINIBAND_ALEN);
+ +	memcpy(&priv->local_gid, &ppriv->local_gid, sizeof(priv->local_gid));
+ +	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ +	priv->dev->broadcast[8] = pkey >> 8;
+ +	priv->dev->broadcast[9] = pkey & 0xff;
+ +
+ +	result = ipoib_dev_init(priv->dev, ppriv->ca, ppriv->port);
+ +	if (result < 0) {
+ +		ipoib_warn(ppriv, "failed to initialize subinterface: "
+ +			   "device %s, port %d",
+ +			   ppriv->ca->name, ppriv->port);
+ +		goto err;
+ +	}
+  
+- 	result = register_netdevice(priv->dev);
++ 	/* We do not need to touch priv if register_netdevice fails */
++ 	ndev->priv_destructor = ipoib_intf_free;
++ 
++ 	result = register_netdevice(ndev);
+  	if (result) {
+  		ipoib_warn(priv, "failed to initialize; error %i", result);
+++<<<<<<< HEAD
+ +		goto err;
+++=======
++ 
++ 		/*
++ 		 * register_netdevice sometimes calls priv_destructor,
++ 		 * sometimes not. Make sure it was done.
++ 		 */
++ 		if (ndev->priv_destructor)
++ 			ndev->priv_destructor(ndev);
++ 		return result;
+++>>>>>>> 9f49a5b5c21d (RDMA/netdev: Use priv_destructor for netdev cleanup)
+  	}
+  
+  	/* RTNL childs don't need proprietary sysfs entries */
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 04ebdfad018d..8ae8ce007549 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -4898,11 +4898,6 @@ static int mlx5_ib_get_hw_stats(struct ib_device *ibdev,
+ 	return num_counters;
+ }
+ 
+-static void mlx5_ib_free_rdma_netdev(struct net_device *netdev)
+-{
+-	return mlx5_rdma_netdev_free(netdev);
+-}
+-
+ static struct net_device*
+ mlx5_ib_alloc_rdma_netdev(struct ib_device *hca,
+ 			  u8 port_num,
+@@ -4912,17 +4907,12 @@ mlx5_ib_alloc_rdma_netdev(struct ib_device *hca,
+ 			  void (*setup)(struct net_device *))
+ {
+ 	struct net_device *netdev;
+-	struct rdma_netdev *rn;
+ 
+ 	if (type != RDMA_NETDEV_IPOIB)
+ 		return ERR_PTR(-EOPNOTSUPP);
+ 
+ 	netdev = mlx5_rdma_netdev_alloc(to_mdev(hca)->mdev, hca,
+ 					name, setup);
+-	if (likely(!IS_ERR_OR_NULL(netdev))) {
+-		rn = netdev_priv(netdev);
+-		rn->free_rdma_netdev = mlx5_ib_free_rdma_netdev;
+-	}
+ 	return netdev;
+ }
+ 
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 44bce3b18901..bc53304a4578 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -323,6 +323,7 @@ struct ipoib_dev_priv {
+ 	spinlock_t lock;
+ 
+ 	struct net_device *dev;
++	void (*next_priv_destructor)(struct net_device *dev);
+ 
+ 	struct napi_struct send_napi;
+ 	struct napi_struct recv_napi;
+@@ -481,6 +482,7 @@ static inline void ipoib_put_ah(struct ipoib_ah *ah)
+ 	kref_put(&ah->ref, ipoib_free_ah);
+ }
+ int ipoib_open(struct net_device *dev);
++void ipoib_intf_free(struct net_device *dev);
+ int ipoib_add_pkey_attr(struct net_device *dev);
+ int ipoib_add_umcast_attr(struct net_device *dev);
+ 
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 0e07e0bb17d3..3dd9f885ed8b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -627,6 +627,22 @@ static int mlx5i_check_required_hca_cap(struct mlx5_core_dev *mdev)
+ 	return 0;
+ }
+ 
++static void mlx5_rdma_netdev_free(struct net_device *netdev)
++{
++	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
++	struct mlx5i_priv *ipriv = priv->ppriv;
++	const struct mlx5e_profile *profile = priv->profile;
++
++	mlx5e_detach_netdev(priv);
++	profile->cleanup(priv);
++	destroy_workqueue(priv->wq);
++
++	if (!ipriv->sub_interface) {
++		mlx5i_pkey_qpn_ht_cleanup(netdev);
++		mlx5e_destroy_mdev_resources(priv->mdev);
++	}
++}
++
+ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+ 					  struct ib_device *ibdev,
+ 					  const char *name,
+@@ -700,6 +716,9 @@ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+ 	rn->detach_mcast = mlx5i_detach_mcast;
+ 	rn->set_id = mlx5i_set_pkey_index;
+ 
++	netdev->priv_destructor = mlx5_rdma_netdev_free;
++	netdev->needs_free_netdev = 1;
++
+ 	return netdev;
+ 
+ destroy_ht:
+@@ -712,21 +731,3 @@ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(mlx5_rdma_netdev_alloc);
+-
+-void mlx5_rdma_netdev_free(struct net_device *netdev)
+-{
+-	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
+-	struct mlx5i_priv *ipriv = priv->ppriv;
+-	const struct mlx5e_profile *profile = priv->profile;
+-
+-	mlx5e_detach_netdev(priv);
+-	profile->cleanup(priv);
+-	destroy_workqueue(priv->wq);
+-
+-	if (!ipriv->sub_interface) {
+-		mlx5i_pkey_qpn_ht_cleanup(netdev);
+-		mlx5e_destroy_mdev_resources(priv->mdev);
+-	}
+-	free_netdev(netdev);
+-}
+-EXPORT_SYMBOL(mlx5_rdma_netdev_free);
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 367b6f4dfc69..5aa8415a6540 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -1236,14 +1236,11 @@ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+ {
+ 	return ERR_PTR(-EOPNOTSUPP);
+ }
+-
+-static inline void mlx5_rdma_netdev_free(struct net_device *netdev) {}
+ #else
+ struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
+ 					  struct ib_device *ibdev,
+ 					  const char *name,
+ 					  void (*setup)(struct net_device *));
+-void mlx5_rdma_netdev_free(struct net_device *netdev);
+ #endif /* CONFIG_MLX5_CORE_IPOIB */
+ 
+ struct mlx5_profile {
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 1760f50c20d6..e1a47e3eb7c3 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2189,7 +2189,11 @@ struct rdma_netdev {
+ 	struct ib_device  *hca;
+ 	u8                 port_num;
+ 
+-	/* cleanup function must be specified */
++	/*
++	 * cleanup function must be specified.
++	 * FIXME: This is only used for OPA_VNIC and that usage should be
++	 * removed too.
++	 */
+ 	void (*free_rdma_netdev)(struct net_device *netdev);
+ 
+ 	/* control functions */
