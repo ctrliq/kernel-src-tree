@@ -1211,14 +1211,14 @@ void esw_offloads_cleanup_reps(struct mlx5_eswitch *esw)
 
 int esw_offloads_init_reps(struct mlx5_eswitch *esw)
 {
-	int total_vfs = MLX5_TOTAL_VPORTS(esw->dev);
+	int total_vports = MLX5_TOTAL_VPORTS(esw->dev);
 	struct mlx5_core_dev *dev = esw->dev;
 	struct mlx5_esw_offload *offloads;
 	struct mlx5_eswitch_rep *rep;
 	u8 hw_id[ETH_ALEN];
 	int vport;
 
-	esw->offloads.vport_reps = kcalloc(total_vfs,
+	esw->offloads.vport_reps = kcalloc(total_vports,
 					   sizeof(struct mlx5_eswitch_rep),
 					   GFP_KERNEL);
 	if (!esw->offloads.vport_reps)
