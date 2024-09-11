@@ -1,0 +1,167 @@
+arm64: add prctl control for resetting ptrauth keys
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [arm64] add prctl control for resetting ptrauth keys (Mark Salter) [1756103]
+Rebuild_FUZZ: 92.63%
+commit-author Kristina Martsenko <kristina.martsenko@arm.com>
+commit ba830885656414101b2f8ca88786524d4bb5e8c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ba830885.failed
+
+Add an arm64-specific prctl to allow a thread to reinitialize its
+pointer authentication keys to random values. This can be useful when
+exec() is not used for starting new processes, to ensure that different
+processes still have different keys.
+
+	Signed-off-by: Kristina Martsenko <kristina.martsenko@arm.com>
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit ba830885656414101b2f8ca88786524d4bb5e8c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/pointer_auth.h
+#	arch/arm64/include/asm/processor.h
+diff --cc arch/arm64/include/asm/processor.h
+index 80d0ee02d1f0,142c708cb429..000000000000
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@@ -294,5 -290,23 +295,26 @@@ extern void __init minsigstksz_setup(vo
+  #define SVE_SET_VL(arg)	sve_set_current_vl(arg)
+  #define SVE_GET_VL()	sve_get_current_vl()
+  
+++<<<<<<< HEAD
+++=======
++ /* PR_PAC_RESET_KEYS prctl */
++ #define PAC_RESET_KEYS(tsk, arg)	ptrauth_prctl_reset_keys(tsk, arg)
++ 
++ /*
++  * For CONFIG_GCC_PLUGIN_STACKLEAK
++  *
++  * These need to be macros because otherwise we get stuck in a nightmare
++  * of header definitions for the use of task_stack_page.
++  */
++ 
++ #define current_top_of_stack()							\
++ ({										\
++ 	struct stack_info _info;						\
++ 	BUG_ON(!on_accessible_stack(current, current_stack_pointer, &_info));	\
++ 	_info.high;								\
++ })
++ #define on_thread_stack()	(on_task_stack(current, current_stack_pointer, NULL))
++ 
+++>>>>>>> ba8308856564 (arm64: add prctl control for resetting ptrauth keys)
+  #endif /* __ASSEMBLY__ */
+  #endif /* __ASM_PROCESSOR_H */
+* Unmerged path arch/arm64/include/asm/pointer_auth.h
+* Unmerged path arch/arm64/include/asm/pointer_auth.h
+* Unmerged path arch/arm64/include/asm/processor.h
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 8cd514855eec..aa002ad6e084 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -57,6 +57,7 @@ arm64-reloc-test-y := reloc_test_core.o reloc_test_syms.o
+ arm64-obj-$(CONFIG_CRASH_DUMP)		+= crash_dump.o
+ arm64-obj-$(CONFIG_ARM_SDE_INTERFACE)	+= sdei.o
+ arm64-obj-$(CONFIG_ARM64_SSBD)		+= ssbd.o
++arm64-obj-$(CONFIG_ARM64_PTR_AUTH)	+= pointer_auth.o
+ 
+ obj-y					+= $(arm64-obj-y) vdso/ probes/
+ obj-m					+= $(arm64-obj-m)
+diff --git a/arch/arm64/kernel/pointer_auth.c b/arch/arm64/kernel/pointer_auth.c
+new file mode 100644
+index 000000000000..b9f6f5f3409a
+--- /dev/null
++++ b/arch/arm64/kernel/pointer_auth.c
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/errno.h>
++#include <linux/prctl.h>
++#include <linux/random.h>
++#include <linux/sched.h>
++#include <asm/cpufeature.h>
++#include <asm/pointer_auth.h>
++
++int ptrauth_prctl_reset_keys(struct task_struct *tsk, unsigned long arg)
++{
++	struct ptrauth_keys *keys = &tsk->thread_info.keys_user;
++	unsigned long addr_key_mask = PR_PAC_APIAKEY | PR_PAC_APIBKEY |
++				      PR_PAC_APDAKEY | PR_PAC_APDBKEY;
++	unsigned long key_mask = addr_key_mask | PR_PAC_APGAKEY;
++
++	if (!system_supports_address_auth() && !system_supports_generic_auth())
++		return -EINVAL;
++
++	if (!arg) {
++		ptrauth_keys_init(keys);
++		ptrauth_keys_switch(keys);
++		return 0;
++	}
++
++	if (arg & ~key_mask)
++		return -EINVAL;
++
++	if (((arg & addr_key_mask) && !system_supports_address_auth()) ||
++	    ((arg & PR_PAC_APGAKEY) && !system_supports_generic_auth()))
++		return -EINVAL;
++
++	if (arg & PR_PAC_APIAKEY)
++		get_random_bytes(&keys->apia, sizeof(keys->apia));
++	if (arg & PR_PAC_APIBKEY)
++		get_random_bytes(&keys->apib, sizeof(keys->apib));
++	if (arg & PR_PAC_APDAKEY)
++		get_random_bytes(&keys->apda, sizeof(keys->apda));
++	if (arg & PR_PAC_APDBKEY)
++		get_random_bytes(&keys->apdb, sizeof(keys->apdb));
++	if (arg & PR_PAC_APGAKEY)
++		get_random_bytes(&keys->apga, sizeof(keys->apga));
++
++	ptrauth_keys_switch(keys);
++
++	return 0;
++}
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index 327319b88051..094bb03b9cc2 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -221,4 +221,12 @@ struct prctl_mm_map {
+ # define PR_SPEC_FORCE_DISABLE		(1UL << 3)
+ # define PR_SPEC_DISABLE_NOEXEC		(1UL << 4)
+ 
++/* Reset arm64 pointer authentication keys */
++#define PR_PAC_RESET_KEYS		54
++# define PR_PAC_APIAKEY			(1UL << 0)
++# define PR_PAC_APIBKEY			(1UL << 1)
++# define PR_PAC_APDAKEY			(1UL << 2)
++# define PR_PAC_APDBKEY			(1UL << 3)
++# define PR_PAC_APGAKEY			(1UL << 4)
++
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index ab22efc6641c..1a0c7cadfb88 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -124,6 +124,9 @@
+ #ifndef SVE_GET_VL
+ # define SVE_GET_VL()		(-EINVAL)
+ #endif
++#ifndef PAC_RESET_KEYS
++# define PAC_RESET_KEYS(a, b)	(-EINVAL)
++#endif
+ 
+ /*
+  * this is where the system-wide overflow UID and GID are defined, for
+@@ -2491,6 +2494,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 			return -EINVAL;
+ 		error = arch_prctl_spec_ctrl_set(me, arg2, arg3);
+ 		break;
++	case PR_PAC_RESET_KEYS:
++		if (arg3 || arg4 || arg5)
++			return -EINVAL;
++		error = PAC_RESET_KEYS(me, arg2);
++		break;
+ 	default:
+ 		error = -EINVAL;
+ 		break;
