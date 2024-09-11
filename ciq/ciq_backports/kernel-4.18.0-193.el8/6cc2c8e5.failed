@@ -1,0 +1,179 @@
+RDMA/rxe: Add ib_device_get_by_name() and use it in rxe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 6cc2c8e535ec19153714cee62e11e4d9ac2ea953
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6cc2c8e5.failed
+
+rxe has an open coded version of this that is not as safe as the core
+version. This lets us eliminate the internal device list entirely from
+rxe.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 6cc2c8e535ec19153714cee62e11e4d9ac2ea953)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe.c
+#	drivers/infiniband/sw/rxe/rxe.h
+#	drivers/infiniband/sw/rxe/rxe_sysfs.c
+diff --cc drivers/infiniband/sw/rxe/rxe.c
+index ce90da888b4b,08a45ce9cab5..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@@ -65,16 -67,8 +65,21 @@@ static void rxe_cleanup(struct rxe_dev 
+  
+  	rxe_cleanup_ports(rxe);
+  
+++<<<<<<< HEAD
+ +	crypto_free_shash(rxe->tfm);
+ +}
+ +
+ +/* called when all references have been dropped */
+ +void rxe_release(struct kref *kref)
+ +{
+ +	struct rxe_dev *rxe = container_of(kref, struct rxe_dev, ref_cnt);
+ +
+ +	rxe_cleanup(rxe);
+ +	ib_dealloc_device(&rxe->ib_dev);
+++=======
++ 	if (rxe->tfm)
++ 		crypto_free_shash(rxe->tfm);
+++>>>>>>> 6cc2c8e535ec (RDMA/rxe: Add ib_device_get_by_name() and use it in rxe)
+  }
+  
+  /* initialize rxe device parameters */
+diff --cc drivers/infiniband/sw/rxe/rxe.h
+index 2b875875962f,63b3b89b894a..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe.h
++++ b/drivers/infiniband/sw/rxe/rxe.h
+@@@ -101,12 -99,6 +101,15 @@@ void rxe_remove_all(void)
+  
+  void rxe_rcv(struct sk_buff *skb);
+  
+++<<<<<<< HEAD
+ +static inline void rxe_dev_put(struct rxe_dev *rxe)
+ +{
+ +	kref_put(&rxe->ref_cnt, rxe_release);
+ +}
+ +struct rxe_dev *get_rxe_by_name(const char *name);
+ +
+++=======
+++>>>>>>> 6cc2c8e535ec (RDMA/rxe: Add ib_device_get_by_name() and use it in rxe)
+  /* The caller must do a matching ib_device_put(&dev->ib_dev) */
+  static inline struct rxe_dev *rxe_get_dev_from_net(struct net_device *ndev)
+  {
+diff --cc drivers/infiniband/sw/rxe/rxe_sysfs.c
+index 6802be71bf9b,d51b55b0a311..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_sysfs.c
++++ b/drivers/infiniband/sw/rxe/rxe_sysfs.c
+@@@ -122,8 -121,7 +121,12 @@@ static int rxe_param_set_remove(const c
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	list_del(&rxe->list);
+ +	rxe_remove(rxe);
+++=======
++ 	ib_unregister_device_and_put(ib_dev);
+++>>>>>>> 6cc2c8e535ec (RDMA/rxe: Add ib_device_get_by_name() and use it in rxe)
+  
+  	return 0;
+  }
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index 8641d8bca5aa..8e79747dcc21 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -189,6 +189,34 @@ static struct ib_device *__ib_device_get_by_name(const char *name)
+ 	return NULL;
+ }
+ 
++/**
++ * ib_device_get_by_name - Find an IB device by name
++ * @name: The name to look for
++ * @driver_id: The driver ID that must match (RDMA_DRIVER_UNKNOWN matches all)
++ *
++ * Find and hold an ib_device by its name. The caller must call
++ * ib_device_put() on the returned pointer.
++ */
++struct ib_device *ib_device_get_by_name(const char *name,
++					enum rdma_driver_id driver_id)
++{
++	struct ib_device *device;
++
++	down_read(&devices_rwsem);
++	device = __ib_device_get_by_name(name);
++	if (device && driver_id != RDMA_DRIVER_UNKNOWN &&
++	    device->driver_id != driver_id)
++		device = NULL;
++
++	if (device) {
++		if (!ib_device_try_get(device))
++			device = NULL;
++	}
++	up_read(&devices_rwsem);
++	return device;
++}
++EXPORT_SYMBOL(ib_device_get_by_name);
++
+ int ib_device_rename(struct ib_device *ibdev, const char *name)
+ {
+ 	int ret;
+* Unmerged path drivers/infiniband/sw/rxe/rxe.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe.h
+diff --git a/drivers/infiniband/sw/rxe/rxe_net.c b/drivers/infiniband/sw/rxe/rxe_net.c
+index 56878453f1ae..f0e7ac976093 100644
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@ -45,25 +45,6 @@
+ #include "rxe_net.h"
+ #include "rxe_loc.h"
+ 
+-static LIST_HEAD(rxe_dev_list);
+-static DEFINE_SPINLOCK(dev_list_lock); /* spinlock for device list */
+-
+-struct rxe_dev *get_rxe_by_name(const char *name)
+-{
+-	struct rxe_dev *rxe;
+-	struct rxe_dev *found = NULL;
+-
+-	spin_lock_bh(&dev_list_lock);
+-	list_for_each_entry(rxe, &rxe_dev_list, list) {
+-		if (!strcmp(name, dev_name(&rxe->ib_dev.dev))) {
+-			found = rxe;
+-			break;
+-		}
+-	}
+-	spin_unlock_bh(&dev_list_lock);
+-	return found;
+-}
+-
+ static struct rxe_recv_sockets recv_sockets;
+ 
+ struct device *rxe_dma_device(struct rxe_dev *rxe)
+@@ -553,9 +534,6 @@ struct rxe_dev *rxe_net_add(struct net_device *ndev)
+ 		return NULL;
+ 	}
+ 
+-	spin_lock_bh(&dev_list_lock);
+-	list_add_tail(&rxe->list, &rxe_dev_list);
+-	spin_unlock_bh(&dev_list_lock);
+ 	return rxe;
+ }
+ 
+* Unmerged path drivers/infiniband/sw/rxe/rxe_sysfs.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.h b/drivers/infiniband/sw/rxe/rxe_verbs.h
+index 74e04801d34d..f11bc8be4ee0 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@ -412,7 +412,6 @@ struct rxe_dev {
+ 	atomic64_t		stats_counters[RXE_NUM_OF_COUNTERS];
+ 
+ 	struct rxe_port		port;
+-	struct list_head	list;
+ 	struct crypto_shash	*tfm;
+ };
+ 
