@@ -1,0 +1,215 @@
+ASoC: soc-pcm: add soc_pcm_clean() and call it from soc_pcm_open/close()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: soc-pcm: add soc_pcm_clean() and call it from soc_pcm_open/close() (Jaroslav Kysela) [1783462]
+Rebuild_FUZZ: 96.00%
+commit-author Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+commit 140a4532cdb8c44a664e7e871ea5dbaa4c2829bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/140a4532.failed
+
+soc_pcm_open() does rollback when failed (A),
+but, it is almost same as soc_pcm_close().
+
+	static int soc_pcm_open(xxx)
+	{
+		...
+		if (ret < 0)
+			goto xxx_err;
+		...
+		return 0;
+
+ ^	config_err:
+ |		...
+ |	rtd_startup_err:
+(A)		...
+ |	component_err:
+ |		...
+ v		return ret;
+	}
+
+The difference is
+soc_pcm_close() is for all dai/component/substream,
+rollback        is for succeeded part only.
+
+This kind of duplicated code can be a hotbed of bugs,
+thus, we want to share soc_pcm_close() and rollback.
+
+Now, soc_pcm_open/close() are handling
+	1) snd_soc_dai_startup/shutdown()
+	2) snd_soc_link_startup/shutdown()
+	3) snd_soc_component_module_get/put()
+	4) snd_soc_component_open/close()
+	5) pm_runtime_put/get()
+
+Now, 1) to 5) are handled.
+This patch adds new soc_pcm_clean() and call it from
+soc_pcm_open() as rollback, and from soc_pcm_close() as
+normal close handler.
+
+One note here is that it don't need to call snd_soc_runtime_deactivate()
+when rollback case, because it will be called without
+snd_soc_runtime_activate().
+It also don't need to call snd_soc_dapm_stream_stop() when rollback case.
+
+	Signed-off-by: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+Link: https://lore.kernel.org/r/87ft72bwn4.wl-kuninori.morimoto.gx@renesas.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 140a4532cdb8c44a664e7e871ea5dbaa4c2829bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/soc-pcm.c
+diff --cc sound/soc/soc-pcm.c
+index 82d806ac486a,7f3e44918f19..000000000000
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@@ -544,40 -651,34 +544,47 @@@ static int soc_pcm_components_close(str
+  	return ret;
+  }
+  
+- /*
+-  * Called by ALSA when a PCM substream is closed. Private data can be
+-  * freed here. The cpu DAI, codec DAI, machine and components are also
+-  * shutdown.
+-  */
+- static int soc_pcm_close(struct snd_pcm_substream *substream)
++ static int soc_pcm_clean(struct snd_pcm_substream *substream, int rollback)
+  {
+ -	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
+ +	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+  	struct snd_soc_component *component;
+  	struct snd_soc_dai *dai;
+  	int i;
+  
+  	mutex_lock_nested(&rtd->card->pcm_mutex, rtd->card->pcm_subclass);
+  
+- 	snd_soc_runtime_deactivate(rtd, substream->stream);
++ 	if (!rollback)
++ 		snd_soc_runtime_deactivate(rtd, substream->stream);
+  
+  	for_each_rtd_dais(rtd, i, dai)
+- 		snd_soc_dai_shutdown(dai, substream, 0);
++ 		snd_soc_dai_shutdown(dai, substream, rollback);
+  
+++<<<<<<< HEAD
+ +	soc_rtd_shutdown(rtd, substream);
+ +
+ +	soc_pcm_components_close(substream);
+++=======
++ 	snd_soc_link_shutdown(substream, rollback);
+  
+- 	snd_soc_dapm_stream_stop(rtd, substream->stream);
++ 	soc_pcm_components_close(substream, rollback);
+++>>>>>>> 140a4532cdb8 (ASoC: soc-pcm: add soc_pcm_clean() and call it from soc_pcm_open/close())
++ 
++ 	if (!rollback)
++ 		snd_soc_dapm_stream_stop(rtd, substream->stream);
+  
+  	mutex_unlock(&rtd->card->pcm_mutex);
+  
+++<<<<<<< HEAD
+ +	for_each_rtd_components(rtd, i, component) {
+ +		pm_runtime_mark_last_busy(component->dev);
+ +		pm_runtime_put_autosuspend(component->dev);
+ +	}
+++=======
++ 	snd_soc_pcm_component_pm_runtime_put(rtd, substream, rollback);
+++>>>>>>> 140a4532cdb8 (ASoC: soc-pcm: add soc_pcm_clean() and call it from soc_pcm_open/close())
+  
+  	for_each_rtd_components(rtd, i, component)
+ -		if (!snd_soc_component_active(component))
+ +		if (!component->active)
+  			pinctrl_pm_select_sleep_state(component->dev);
+  
+  	return 0;
+@@@ -601,21 -712,19 +618,33 @@@ static int soc_pcm_open(struct snd_pcm_
+  	for_each_rtd_components(rtd, i, component)
+  		pinctrl_pm_select_default_state(component->dev);
+  
+++<<<<<<< HEAD
+ +	for_each_rtd_components(rtd, i, component)
+ +		pm_runtime_get_sync(component->dev);
+++=======
++ 	ret = snd_soc_pcm_component_pm_runtime_get(rtd, substream);
++ 	if (ret < 0)
++ 		goto err;
+++>>>>>>> 140a4532cdb8 (ASoC: soc-pcm: add soc_pcm_clean() and call it from soc_pcm_open/close())
+  
+  	mutex_lock_nested(&rtd->card->pcm_mutex, rtd->card->pcm_subclass);
+  
+  	ret = soc_pcm_components_open(substream);
+  	if (ret < 0)
+- 		goto component_err;
++ 		goto err;
+  
+++<<<<<<< HEAD
+ +	ret = soc_rtd_startup(rtd, substream);
+ +	if (ret < 0) {
+ +		pr_err("ASoC: %s startup failed: %d\n",
+ +		       rtd->dai_link->name, ret);
+ +		goto rtd_startup_err;
+ +	}
+++=======
++ 	ret = snd_soc_link_startup(substream);
++ 	if (ret < 0)
++ 		goto err;
+++>>>>>>> 140a4532cdb8 (ASoC: soc-pcm: add soc_pcm_clean() and call it from soc_pcm_open/close())
+  
+  	/* startup the audio subsystem */
+  	for_each_rtd_dais(rtd, i, dai) {
+@@@ -671,10 -780,10 +700,10 @@@
+  
+  	/* Symmetry only applies if we've already got an active stream. */
+  	for_each_rtd_dais(rtd, i, dai) {
+ -		if (snd_soc_dai_active(dai)) {
+ +		if (dai->active) {
+  			ret = soc_pcm_apply_symmetry(substream, dai);
+  			if (ret != 0)
+- 				goto config_err;
++ 				goto err;
+  		}
+  	}
+  
+@@@ -685,32 -794,13 +714,34 @@@
+  		 runtime->hw.channels_max);
+  	pr_debug("ASoC: min rate %d max rate %d\n", runtime->hw.rate_min,
+  		 runtime->hw.rate_max);
+- 
+  dynamic:
+- 
+  	snd_soc_runtime_activate(rtd, substream->stream);
+- 
++ err:
+  	mutex_unlock(&rtd->card->pcm_mutex);
+- 	return 0;
+  
+++<<<<<<< HEAD
+ +config_err:
+ +	for_each_rtd_dais_rollback(rtd, i, dai)
+ +		snd_soc_dai_shutdown(dai, substream, 1);
+ +
+ +	soc_rtd_shutdown(rtd, substream);
+ +rtd_startup_err:
+ +	soc_pcm_components_close(substream);
+ +component_err:
+ +	mutex_unlock(&rtd->card->pcm_mutex);
+ +
+ +	for_each_rtd_components(rtd, i, component) {
+ +		pm_runtime_mark_last_busy(component->dev);
+ +		pm_runtime_put_autosuspend(component->dev);
+ +	}
+ +
+ +	for_each_rtd_components(rtd, i, component)
+ +		if (!component->active)
+ +			pinctrl_pm_select_sleep_state(component->dev);
+++=======
++ 	if (ret < 0)
++ 		soc_pcm_clean(substream, 1);
+++>>>>>>> 140a4532cdb8 (ASoC: soc-pcm: add soc_pcm_clean() and call it from soc_pcm_open/close())
+  
+  	return ret;
+  }
+* Unmerged path sound/soc/soc-pcm.c
