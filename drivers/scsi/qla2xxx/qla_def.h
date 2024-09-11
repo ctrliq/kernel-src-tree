@@ -2277,7 +2277,6 @@ struct ct_sns_desc {
 enum discovery_state {
 	DSC_DELETED,
 	DSC_GNN_ID,
-	DSC_GID_PN,
 	DSC_GNL,
 	DSC_LOGIN_PEND,
 	DSC_LOGIN_FAILED,
@@ -2302,7 +2301,6 @@ enum login_state {	/* FW control Target side */
 enum fcport_mgt_event {
 	FCME_RELOGIN = 1,
 	FCME_RSCN,
-	FCME_GIDPN_DONE,
 	FCME_PLOGI_DONE,	/* Initiator side sent LLIOCB */
 	FCME_PRLI_DONE,
 	FCME_GNL_DONE,
@@ -3209,7 +3207,6 @@ enum qla_work_type {
 	QLA_EVT_ASYNC_ADISC_DONE,
 	QLA_EVT_UEVENT,
 	QLA_EVT_AENFX,
-	QLA_EVT_GIDPN,
 	QLA_EVT_GPNID,
 	QLA_EVT_UNMAP,
 	QLA_EVT_NEW_SESS,
