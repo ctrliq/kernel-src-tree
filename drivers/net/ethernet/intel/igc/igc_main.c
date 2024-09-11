@@ -2198,7 +2198,7 @@ static int igc_add_mac_filter(struct igc_adapter *adapter, const u8 *addr,
 		adapter->mac_table[i].state |= IGC_MAC_STATE_IN_USE | flags;
 
 		igc_rar_set_index(adapter, i);
-		return i;
+		return 0;
 	}
 
 	return -ENOSPC;
@@ -2257,11 +2257,8 @@ static int igc_del_mac_filter(struct igc_adapter *adapter, const u8 *addr,
 static int igc_uc_sync(struct net_device *netdev, const unsigned char *addr)
 {
 	struct igc_adapter *adapter = netdev_priv(netdev);
-	int ret;
 
-	ret = igc_add_mac_filter(adapter, addr, adapter->num_rx_queues, 0);
-
-	return min_t(int, ret, 0);
+	return igc_add_mac_filter(adapter, addr, adapter->num_rx_queues, 0);
 }
 
 static int igc_uc_unsync(struct net_device *netdev, const unsigned char *addr)
