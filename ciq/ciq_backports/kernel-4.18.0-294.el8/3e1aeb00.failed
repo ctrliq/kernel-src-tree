@@ -1,0 +1,225 @@
+vfs: Implement a filesystem superblock creation/configuration context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Howells <dhowells@redhat.com>
+commit 3e1aeb00e6d132efc151dacc062b38269bc9eccc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3e1aeb00.failed
+
+[AV - unfuck kern_mount_data(); we want non-NULL ->mnt_ns on long-living
+mounts]
+[AV - reordering fs/namespace.c is badly overdue, but let's keep it
+separate from that series]
+[AV - drop simple_pin_fs() change]
+[AV - clean vfs_kern_mount() failure exits up]
+
+Implement a filesystem context concept to be used during superblock
+creation for mount and superblock reconfiguration for remount.
+
+The mounting procedure then becomes:
+
+ (1) Allocate new fs_context context.
+
+ (2) Configure the context.
+
+ (3) Create superblock.
+
+ (4) Query the superblock.
+
+ (5) Create a mount for the superblock.
+
+ (6) Destroy the context.
+
+Rather than calling fs_type->mount(), an fs_context struct is created and
+fs_type->init_fs_context() is called to set it up.  Pointers exist for the
+filesystem and LSM to hang their private data off.
+
+A set of operations has to be set by ->init_fs_context() to provide
+freeing, duplication, option parsing, binary data parsing, validation,
+mounting and superblock filling.
+
+Legacy filesystems are supported by the provision of a set of legacy
+fs_context operations that build up a list of mount options and then invoke
+fs_type->mount() from within the fs_context ->get_tree() operation.  This
+allows all filesystems to be accessed using fs_context.
+
+It should be noted that, whilst this patch adds a lot of lines of code,
+there is quite a bit of duplication with existing code that can be
+eliminated should all filesystems be converted over.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 3e1aeb00e6d132efc151dacc062b38269bc9eccc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs_context.c
+#	fs/namespace.c
+#	include/linux/fs.h
+#	include/linux/fs_context.h
+diff --cc fs/namespace.c
+index d4be8b82f7bd,1a1ed2528f47..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -939,37 -941,80 +939,49 @@@ static struct mount *skip_mnt_tree(stru
+  	return p;
+  }
+  
+ -/**
+ - * vfs_create_mount - Create a mount for a configured superblock
+ - * @fc: The configuration context with the superblock attached
+ - *
+ - * Create a mount to an already configured superblock.  If necessary, the
+ - * caller should invoke vfs_get_tree() before calling this.
+ - *
+ - * Note that this does not attach the mount to anything.
+ - */
+ -struct vfsmount *vfs_create_mount(struct fs_context *fc)
+ +struct vfsmount *
+ +vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void *data)
+  {
+  	struct mount *mnt;
+ +	struct dentry *root;
+  
+ -	if (!fc->root)
+ +	if (!type)
+- 		return ERR_PTR(-ENODEV);
++ 		return ERR_PTR(-EINVAL);
+  
+ -	mnt = alloc_vfsmnt(fc->source ?: "none");
+ +	mnt = alloc_vfsmnt(name);
+  	if (!mnt)
+  		return ERR_PTR(-ENOMEM);
+  
+ -	if (fc->sb_flags & SB_KERNMOUNT)
+++<<<<<<< HEAD
+ +	if (flags & SB_KERNMOUNT)
+  		mnt->mnt.mnt_flags = MNT_INTERNAL;
+  
+ -	atomic_inc(&fc->root->d_sb->s_active);
+ -	mnt->mnt.mnt_sb		= fc->root->d_sb;
+ -	mnt->mnt.mnt_root	= dget(fc->root);
+ -	mnt->mnt_mountpoint	= mnt->mnt.mnt_root;
+ -	mnt->mnt_parent		= mnt;
+ -
+ -	lock_mount_hash();
+ -	list_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);
+ -	unlock_mount_hash();
+ -	return &mnt->mnt;
+ -}
+ -EXPORT_SYMBOL(vfs_create_mount);
+ -
+ -struct vfsmount *fc_mount(struct fs_context *fc)
+ -{
+ -	int err = vfs_get_tree(fc);
+ -	if (!err) {
+ -		up_write(&fc->root->d_sb->s_umount);
+ -		return vfs_create_mount(fc);
+ +	root = mount_fs(type, flags, name, data);
+ +	if (IS_ERR(root)) {
+ +		mnt_free_id(mnt);
+ +		free_vfsmnt(mnt);
+ +		return ERR_CAST(root);
+  	}
+ -	return ERR_PTR(err);
+ -}
+ -EXPORT_SYMBOL(fc_mount);
+ -
+ -struct vfsmount *vfs_kern_mount(struct file_system_type *type,
+ -				int flags, const char *name,
+ -				void *data)
+ -{
+ -	struct fs_context *fc;
+ -	struct vfsmount *mnt;
+ -	int ret = 0;
+ -
+ -	if (!type)
+ -		return ERR_PTR(-EINVAL);
+ -
+ -	fc = fs_context_for_mount(type, flags);
+ -	if (IS_ERR(fc))
+ -		return ERR_CAST(fc);
+ -
+++=======
++ 	if (name)
++ 		ret = vfs_parse_fs_string(fc, "source",
++ 					  name, strlen(name));
++ 	if (!ret)
++ 		ret = parse_monolithic_mount_data(fc, data);
++ 	if (!ret)
++ 		mnt = fc_mount(fc);
++ 	else
++ 		mnt = ERR_PTR(ret);
+++>>>>>>> 3e1aeb00e6d1 (vfs: Implement a filesystem superblock creation/configuration context)
+  
+ -	put_fs_context(fc);
+ -	return mnt;
+ +	mnt->mnt.mnt_root = root;
+ +	mnt->mnt.mnt_sb = root->d_sb;
+ +	mnt->mnt_mountpoint = mnt->mnt.mnt_root;
+ +	mnt->mnt_parent = mnt;
+ +	lock_mount_hash();
+ +	list_add_tail(&mnt->mnt_instance, &root->d_sb->s_mounts);
+ +	unlock_mount_hash();
+ +	return &mnt->mnt;
+  }
+  EXPORT_SYMBOL_GPL(vfs_kern_mount);
+  
+diff --cc include/linux/fs.h
+index cc0bba4da9f8,cf6e9ea161eb..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -65,6 -61,8 +65,11 @@@ struct workqueue_struct
+  struct iov_iter;
+  struct fscrypt_info;
+  struct fscrypt_operations;
+++<<<<<<< HEAD
+++=======
++ struct fs_context;
++ struct fs_parameter_description;
+++>>>>>>> 3e1aeb00e6d1 (vfs: Implement a filesystem superblock creation/configuration context)
+  
+  extern void __init inode_init(void);
+  extern void __init inode_init_early(void);
+@@@ -2209,6 -2175,8 +2214,11 @@@ struct file_system_type 
+  #define FS_HAS_SUBTYPE		4
+  #define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+  #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
+++<<<<<<< HEAD
+++=======
++ 	int (*init_fs_context)(struct fs_context *);
++ 	const struct fs_parameter_description *parameters;
+++>>>>>>> 3e1aeb00e6d1 (vfs: Implement a filesystem superblock creation/configuration context)
+  	struct dentry *(*mount) (struct file_system_type *, int,
+  		       const char *, void *);
+  	void (*kill_sb) (struct super_block *);
+* Unmerged path fs/fs_context.c
+* Unmerged path include/linux/fs_context.h
+diff --git a/fs/filesystems.c b/fs/filesystems.c
+index b03f57b1105b..9135646e41ac 100644
+--- a/fs/filesystems.c
++++ b/fs/filesystems.c
+@@ -16,6 +16,7 @@
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/fs_parser.h>
+ 
+ /*
+  * Handling of filesystem drivers list.
+@@ -73,6 +74,9 @@ int register_filesystem(struct file_system_type * fs)
+ 	int res = 0;
+ 	struct file_system_type ** p;
+ 
++	if (fs->parameters && !fs_validate_description(fs->parameters))
++		return -EINVAL;
++
+ 	BUG_ON(strchr(fs->name, '.'));
+ 	if (fs->next)
+ 		return -EBUSY;
+* Unmerged path fs/fs_context.c
+* Unmerged path fs/namespace.c
+* Unmerged path include/linux/fs.h
+* Unmerged path include/linux/fs_context.h
