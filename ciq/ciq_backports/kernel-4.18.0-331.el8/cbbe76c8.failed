@@ -1,0 +1,138 @@
+gfs2: Remove vestigial bd_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit cbbe76c8bb27c0bea4bfa6cac56b5d4073b90687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/cbbe76c8.failed
+
+Field bd_ops was set but never used, so I removed it, and all
+code supporting it.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit cbbe76c8bb27c0bea4bfa6cac56b5d4073b90687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 60c486e0225a,5bfaf381921a..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -654,37 -605,33 +654,42 @@@ void gfs2_add_revoke(struct gfs2_sbd *s
+  	bd->bd_blkno = bh->b_blocknr;
+  	gfs2_remove_from_ail(bd); /* drops ref on bh */
+  	bd->bd_bh = NULL;
+++<<<<<<< HEAD
+ +	bd->bd_ops = &gfs2_revoke_lops;
+++=======
++ 	sdp->sd_log_num_revoke++;
++ 	atomic_inc(&gl->gl_revokes);
+++>>>>>>> cbbe76c8bb27 (gfs2: Remove vestigial bd_ops)
+  	set_bit(GLF_LFLUSH, &gl->gl_flags);
+ -	list_add(&bd->bd_list, &sdp->sd_log_le_revoke);
+ +	list_add(&bd->bd_list, &sdp->sd_log_revokes);
+  }
+  
+ +void gfs2_glock_remove_revoke(struct gfs2_glock *gl)
+ +{
+ +	if (atomic_dec_return(&gl->gl_revokes) == 0) {
+ +		clear_bit(GLF_LFLUSH, &gl->gl_flags);
+ +		gfs2_glock_queue_put(gl);
+ +	}
+ +}
+ +
+ +/**
+ + * gfs2_write_revokes - Add as many revokes to the system transaction as we can
+ + * @sdp: The GFS2 superblock
+ + *
+ + * Our usual strategy is to defer writing revokes as much as we can in the hope
+ + * that we'll eventually overwrite the journal, which will make those revokes
+ + * go away.  This changes when we flush the log: at that point, there will
+ + * likely be some left-over space in the last revoke block of that transaction.
+ + * We can fill that space with additional revokes for blocks that have already
+ + * been written back.  This will basically come at no cost now, and will save
+ + * us from having to keep track of those blocks on the AIL2 list later.
+ + */
+  void gfs2_write_revokes(struct gfs2_sbd *sdp)
+  {
+ -	struct gfs2_trans *tr;
+ -	struct gfs2_bufdata *bd, *tmp;
+ -	int have_revokes = 0;
+ +	/* number of revokes we still have room for */
+  	int max_revokes = (sdp->sd_sb.sb_bsize - sizeof(struct gfs2_log_descriptor)) / sizeof(u64);
+  
+ -	gfs2_ail1_empty(sdp);
+ -	spin_lock(&sdp->sd_ail_lock);
+ -	list_for_each_entry_reverse(tr, &sdp->sd_ail1_list, tr_list) {
+ -		list_for_each_entry(bd, &tr->tr_ail2_list, bd_ail_st_list) {
+ -			if (list_empty(&bd->bd_list)) {
+ -				have_revokes = 1;
+ -				goto done;
+ -			}
+ -		}
+ -	}
+ -done:
+ -	spin_unlock(&sdp->sd_ail_lock);
+ -	if (have_revokes == 0)
+ -		return;
+ +	gfs2_log_lock(sdp);
+  	while (sdp->sd_log_num_revoke > max_revokes)
+  		max_revokes += (sdp->sd_sb.sb_bsize - sizeof(struct gfs2_meta_header)) / sizeof(u64);
+  	max_revokes -= sdp->sd_log_num_revoke;
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 87f2a7d5777d..8a3e90407a06 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -169,7 +169,6 @@ struct gfs2_bufdata {
+ 	u64 bd_blkno;
+ 
+ 	struct list_head bd_list;
+-	const struct gfs2_log_operations *bd_ops;
+ 
+ 	struct gfs2_trans *bd_tr;
+ 	struct list_head bd_ail_st_list;
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/trans.c b/fs/gfs2/trans.c
+index 1f8b229132e8..4cdec2c3f899 100644
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@ -125,15 +125,13 @@ void gfs2_trans_end(struct gfs2_sbd *sdp)
+ }
+ 
+ static struct gfs2_bufdata *gfs2_alloc_bufdata(struct gfs2_glock *gl,
+-					       struct buffer_head *bh,
+-					       const struct gfs2_log_operations *lops)
++					       struct buffer_head *bh)
+ {
+ 	struct gfs2_bufdata *bd;
+ 
+ 	bd = kmem_cache_zalloc(gfs2_bufdata_cachep, GFP_NOFS | __GFP_NOFAIL);
+ 	bd->bd_bh = bh;
+ 	bd->bd_gl = gl;
+-	bd->bd_ops = lops;
+ 	INIT_LIST_HEAD(&bd->bd_list);
+ 	bh->b_private = bd;
+ 	return bd;
+@@ -170,7 +168,7 @@ void gfs2_trans_add_data(struct gfs2_glock *gl, struct buffer_head *bh)
+ 		gfs2_log_unlock(sdp);
+ 		unlock_buffer(bh);
+ 		if (bh->b_private == NULL)
+-			bd = gfs2_alloc_bufdata(gl, bh, &gfs2_databuf_lops);
++			bd = gfs2_alloc_bufdata(gl, bh);
+ 		else
+ 			bd = bh->b_private;
+ 		lock_buffer(bh);
+@@ -211,7 +209,7 @@ void gfs2_trans_add_meta(struct gfs2_glock *gl, struct buffer_head *bh)
+ 		unlock_buffer(bh);
+ 		lock_page(bh->b_page);
+ 		if (bh->b_private == NULL)
+-			bd = gfs2_alloc_bufdata(gl, bh, &gfs2_buf_lops);
++			bd = gfs2_alloc_bufdata(gl, bh);
+ 		else
+ 			bd = bh->b_private;
+ 		unlock_page(bh->b_page);
