@@ -1,0 +1,91 @@
+nfp: tls: make use of kernel-driven TX resync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 9ed431c1d7cf8c394aa7562ca6b84f3eeb8c78a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9ed431c1.failed
+
+When TCP stream gets out of sync (driver stops receiving skbs
+with expected TCP sequence numbers) request a TX resync from
+the kernel.
+
+We try to distinguish retransmissions from missed transmissions
+by comparing the sequence number to expected - if it's further
+than the expected one - we probably missed packets.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9ed431c1d7cf8c394aa7562ca6b84f3eeb8c78a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/crypto/tls.c
+diff --cc drivers/net/ethernet/netronome/nfp/crypto/tls.c
+index eebaf5e1621d,3ee829d69c04..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/crypto/tls.c
++++ b/drivers/net/ethernet/netronome/nfp/crypto/tls.c
+@@@ -381,8 -390,10 +381,14 @@@ nfp_net_tls_resync_rx(struct net_devic
+  	struct nfp_net_tls_offload_ctx *ntls;
+  	struct nfp_crypto_req_update *req;
+  	struct sk_buff *skb;
++ 	gfp_t flags;
+  
+++<<<<<<< HEAD
+ +	skb = nfp_net_tls_alloc_simple(nn, sizeof(*req), GFP_ATOMIC);
+++=======
++ 	flags = direction == TLS_OFFLOAD_CTX_DIR_TX ? GFP_KERNEL : GFP_ATOMIC;
++ 	skb = nfp_net_tls_alloc_simple(nn, sizeof(*req), flags);
+++>>>>>>> 9ed431c1d7cf (nfp: tls: make use of kernel-driven TX resync)
+  	if (!skb)
+  		return;
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/crypto/crypto.h b/drivers/net/ethernet/netronome/nfp/crypto/crypto.h
+index 1f97fb443134..9e9cc12c528f 100644
+--- a/drivers/net/ethernet/netronome/nfp/crypto/crypto.h
++++ b/drivers/net/ethernet/netronome/nfp/crypto/crypto.h
+@@ -8,7 +8,6 @@ struct nfp_net_tls_offload_ctx {
+ 	__be32 fw_handle[2];
+ 
+ 	u32 next_seq;
+-	bool out_of_sync;
+ };
+ 
+ #ifdef CONFIG_TLS_DEVICE
+* Unmerged path drivers/net/ethernet/netronome/nfp/crypto/tls.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 6fd110786938..8e2cd27aa270 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -829,6 +829,7 @@ nfp_net_tls_tx(struct nfp_net_dp *dp, struct nfp_net_r_vector *r_vec,
+ {
+ 	struct nfp_net_tls_offload_ctx *ntls;
+ 	struct sk_buff *nskb;
++	bool resync_pending;
+ 	u32 datalen, seq;
+ 
+ 	if (likely(!dp->ktls_tx))
+@@ -839,7 +840,8 @@ nfp_net_tls_tx(struct nfp_net_dp *dp, struct nfp_net_r_vector *r_vec,
+ 	datalen = skb->len - (skb_transport_offset(skb) + tcp_hdrlen(skb));
+ 	seq = ntohl(tcp_hdr(skb)->seq);
+ 	ntls = tls_driver_ctx(skb->sk, TLS_OFFLOAD_CTX_DIR_TX);
+-	if (unlikely(ntls->next_seq != seq || ntls->out_of_sync)) {
++	resync_pending = tls_offload_tx_resync_pending(skb->sk);
++	if (unlikely(resync_pending || ntls->next_seq != seq)) {
+ 		/* Pure ACK out of order already */
+ 		if (!datalen)
+ 			return skb;
+@@ -869,8 +871,8 @@ nfp_net_tls_tx(struct nfp_net_dp *dp, struct nfp_net_r_vector *r_vec,
+ 		}
+ 
+ 		/* jump forward, a TX may have gotten lost, need to sync TX */
+-		if (!ntls->out_of_sync && seq - ntls->next_seq < U32_MAX / 4)
+-			ntls->out_of_sync = true;
++		if (!resync_pending && seq - ntls->next_seq < U32_MAX / 4)
++			tls_offload_tx_resync_request(nskb->sk);
+ 
+ 		*nr_frags = 0;
+ 		return nskb;
