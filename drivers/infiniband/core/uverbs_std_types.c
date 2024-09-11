@@ -222,6 +222,7 @@ uverbs_completion_event_file_destroy_uobj(struct ib_uobject *uobj,
 	list_for_each_entry_safe(entry, tmp, &event_queue->event_list, list) {
 		if (entry->counter)
 			list_del(&entry->obj_list);
+		list_del(&entry->list);
 		kfree(entry);
 	}
 	spin_unlock_irq(&event_queue->lock);
