@@ -7663,6 +7663,16 @@ bool bpf_map__is_pinned_v0_0_4(const struct bpf_map *map)
 	return map->pinned;
 }
 
+static void sanitize_pin_path(char *s)
+{
+	/* bpffs disallows periods in path names */
+	while (*s) {
+		if (*s == '.')
+			*s = '_';
+		s++;
+	}
+}
+
 int bpf_object__pin_maps(struct bpf_object *obj, const char *path)
 {
 	struct bpf_map *map;
@@ -7692,6 +7702,7 @@ int bpf_object__pin_maps(struct bpf_object *obj, const char *path)
 				err = -ENAMETOOLONG;
 				goto err_unpin_maps;
 			}
+			sanitize_pin_path(buf);
 			pin_path = buf;
 		} else if (!map->pin_path) {
 			continue;
@@ -7736,6 +7747,7 @@ int bpf_object__unpin_maps(struct bpf_object *obj, const char *path)
 				return -EINVAL;
 			else if (len >= PATH_MAX)
 				return -ENAMETOOLONG;
+			sanitize_pin_path(buf);
 			pin_path = buf;
 		} else if (!map->pin_path) {
 			continue;
