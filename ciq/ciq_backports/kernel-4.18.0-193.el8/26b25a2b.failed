@@ -1,0 +1,477 @@
+iommu: Bind process address spaces to devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] Bind process address spaces to devices (Jerry Snitselaar) [1742234]
+Rebuild_FUZZ: 91.57%
+commit-author Jean-Philippe Brucker <jean-philippe.brucker@arm.com>
+commit 26b25a2b98e45aeb40eedcedc586ad5034cbd984
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/26b25a2b.failed
+
+Add bind() and unbind() operations to the IOMMU API.
+iommu_sva_bind_device() binds a device to an mm, and returns a handle to
+the bond, which is released by calling iommu_sva_unbind_device().
+
+Each mm bound to devices gets a PASID (by convention, a 20-bit system-wide
+ID representing the address space), which can be retrieved with
+iommu_sva_get_pasid(). When programming DMA addresses, device drivers
+include this PASID in a device-specific manner, to let the device access
+the given address space. Since the process memory may be paged out, device
+and IOMMU must support I/O page faults (e.g. PCI PRI).
+
+Using iommu_sva_set_ops(), device drivers provide an mm_exit() callback
+that is called by the IOMMU driver if the process exits before the device
+driver called unbind(). In mm_exit(), device driver should disable DMA
+from the given context, so that the core IOMMU can reallocate the PASID.
+Whether the process exited or nor, the device driver should always release
+the handle with unbind().
+
+To use these functions, device driver must first enable the
+IOMMU_DEV_FEAT_SVA device feature with iommu_dev_enable_feature().
+
+	Signed-off-by: Jean-Philippe Brucker <jean-philippe.brucker@arm.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 26b25a2b98e45aeb40eedcedc586ad5034cbd984)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommu.c
+#	include/linux/iommu.h
+diff --cc drivers/iommu/iommu.c
+index 21d8b7dc0f3c,f8fe112e507a..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -2012,23 -2040,202 +2012,142 @@@ int iommu_fwspec_add_ids(struct device 
+  }
+  EXPORT_SYMBOL_GPL(iommu_fwspec_add_ids);
+  
+ -/*
+ - * Per device IOMMU features.
+ - */
+ -bool iommu_dev_has_feature(struct device *dev, enum iommu_dev_features feat)
+ +#ifdef CONFIG_ARM64
+ +static int __init iommu_quirks(void)
+  {
+ -	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -
+ -	if (ops && ops->dev_has_feat)
+ -		return ops->dev_has_feat(dev, feat);
+ +	const char *vendor, *name;
+  
+ -	return false;
+ -}
+ -EXPORT_SYMBOL_GPL(iommu_dev_has_feature);
+ +	vendor = dmi_get_system_info(DMI_SYS_VENDOR);
+ +	name = dmi_get_system_info(DMI_PRODUCT_NAME);
+  
+ -int iommu_dev_enable_feature(struct device *dev, enum iommu_dev_features feat)
+ -{
+ -	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -
+ -	if (ops && ops->dev_enable_feat)
+ -		return ops->dev_enable_feat(dev, feat);
+ -
+ -	return -ENODEV;
+ -}
+ -EXPORT_SYMBOL_GPL(iommu_dev_enable_feature);
+ -
+ -/*
+ - * The device drivers should do the necessary cleanups before calling this.
+ - * For example, before disabling the aux-domain feature, the device driver
+ - * should detach all aux-domains. Otherwise, this will return -EBUSY.
+ - */
+ -int iommu_dev_disable_feature(struct device *dev, enum iommu_dev_features feat)
+ -{
+ -	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -
+ -	if (ops && ops->dev_disable_feat)
+ -		return ops->dev_disable_feat(dev, feat);
+ -
+ -	return -EBUSY;
+ -}
+ -EXPORT_SYMBOL_GPL(iommu_dev_disable_feature);
+ -
+ -bool iommu_dev_feature_enabled(struct device *dev, enum iommu_dev_features feat)
+ -{
+ -	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -
+ -	if (ops && ops->dev_feat_enabled)
+ -		return ops->dev_feat_enabled(dev, feat);
+ -
+ -	return false;
+ -}
+ -EXPORT_SYMBOL_GPL(iommu_dev_feature_enabled);
+ -
+ -/*
+ - * Aux-domain specific attach/detach.
+ - *
+ - * Only works if iommu_dev_feature_enabled(dev, IOMMU_DEV_FEAT_AUX) returns
+ - * true. Also, as long as domains are attached to a device through this
+ - * interface, any tries to call iommu_attach_device() should fail
+ - * (iommu_detach_device() can't fail, so we fail when trying to re-attach).
+ - * This should make us safe against a device being attached to a guest as a
+ - * whole while there are still pasid users on it (aux and sva).
+ - */
+ -int iommu_aux_attach_device(struct iommu_domain *domain, struct device *dev)
+ -{
+ -	int ret = -ENODEV;
+ -
+ -	if (domain->ops->aux_attach_dev)
+ -		ret = domain->ops->aux_attach_dev(domain, dev);
+ -
+ -	if (!ret)
+ -		trace_attach_device_to_domain(dev);
+ -
+ -	return ret;
+ -}
+ -EXPORT_SYMBOL_GPL(iommu_aux_attach_device);
+ -
+ -void iommu_aux_detach_device(struct iommu_domain *domain, struct device *dev)
+ -{
+ -	if (domain->ops->aux_detach_dev) {
+ -		domain->ops->aux_detach_dev(domain, dev);
+ -		trace_detach_device_from_domain(dev);
+ +	if (vendor &&
+ +	    (strncmp(vendor, "GIGABYTE", 8) == 0 && name &&
+ +	     (strncmp(name, "R120", 4) == 0 ||
+ +	      strncmp(name, "R270", 4) == 0))) {
+ +		pr_warn("Gigabyte %s detected, force iommu passthrough mode", name);
+ +		iommu_def_domain_type = IOMMU_DOMAIN_IDENTITY;
+  	}
+ +
+ +	return 0;
+  }
+++<<<<<<< HEAD
+ +arch_initcall(iommu_quirks);
+ +#endif
+++=======
++ EXPORT_SYMBOL_GPL(iommu_aux_detach_device);
++ 
++ int iommu_aux_get_pasid(struct iommu_domain *domain, struct device *dev)
++ {
++ 	int ret = -ENODEV;
++ 
++ 	if (domain->ops->aux_get_pasid)
++ 		ret = domain->ops->aux_get_pasid(domain, dev);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(iommu_aux_get_pasid);
++ 
++ /**
++  * iommu_sva_bind_device() - Bind a process address space to a device
++  * @dev: the device
++  * @mm: the mm to bind, caller must hold a reference to it
++  *
++  * Create a bond between device and address space, allowing the device to access
++  * the mm using the returned PASID. If a bond already exists between @device and
++  * @mm, it is returned and an additional reference is taken. Caller must call
++  * iommu_sva_unbind_device() to release each reference.
++  *
++  * iommu_dev_enable_feature(dev, IOMMU_DEV_FEAT_SVA) must be called first, to
++  * initialize the required SVA features.
++  *
++  * On error, returns an ERR_PTR value.
++  */
++ struct iommu_sva *
++ iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, void *drvdata)
++ {
++ 	struct iommu_group *group;
++ 	struct iommu_sva *handle = ERR_PTR(-EINVAL);
++ 	const struct iommu_ops *ops = dev->bus->iommu_ops;
++ 
++ 	if (!ops || !ops->sva_bind)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	group = iommu_group_get(dev);
++ 	if (!group)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	/* Ensure device count and domain don't change while we're binding */
++ 	mutex_lock(&group->mutex);
++ 
++ 	/*
++ 	 * To keep things simple, SVA currently doesn't support IOMMU groups
++ 	 * with more than one device. Existing SVA-capable systems are not
++ 	 * affected by the problems that required IOMMU groups (lack of ACS
++ 	 * isolation, device ID aliasing and other hardware issues).
++ 	 */
++ 	if (iommu_group_device_count(group) != 1)
++ 		goto out_unlock;
++ 
++ 	handle = ops->sva_bind(dev, mm, drvdata);
++ 
++ out_unlock:
++ 	mutex_unlock(&group->mutex);
++ 	iommu_group_put(group);
++ 
++ 	return handle;
++ }
++ EXPORT_SYMBOL_GPL(iommu_sva_bind_device);
++ 
++ /**
++  * iommu_sva_unbind_device() - Remove a bond created with iommu_sva_bind_device
++  * @handle: the handle returned by iommu_sva_bind_device()
++  *
++  * Put reference to a bond between device and address space. The device should
++  * not be issuing any more transaction for this PASID. All outstanding page
++  * requests for this PASID must have been flushed to the IOMMU.
++  *
++  * Returns 0 on success, or an error value
++  */
++ void iommu_sva_unbind_device(struct iommu_sva *handle)
++ {
++ 	struct iommu_group *group;
++ 	struct device *dev = handle->dev;
++ 	const struct iommu_ops *ops = dev->bus->iommu_ops;
++ 
++ 	if (!ops || !ops->sva_unbind)
++ 		return;
++ 
++ 	group = iommu_group_get(dev);
++ 	if (!group)
++ 		return;
++ 
++ 	mutex_lock(&group->mutex);
++ 	ops->sva_unbind(handle);
++ 	mutex_unlock(&group->mutex);
++ 
++ 	iommu_group_put(group);
++ }
++ EXPORT_SYMBOL_GPL(iommu_sva_unbind_device);
++ 
++ int iommu_sva_set_ops(struct iommu_sva *handle,
++ 		      const struct iommu_sva_ops *sva_ops)
++ {
++ 	if (handle->ops && handle->ops != sva_ops)
++ 		return -EEXIST;
++ 
++ 	handle->ops = sva_ops;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(iommu_sva_set_ops);
++ 
++ int iommu_sva_get_pasid(struct iommu_sva *handle)
++ {
++ 	const struct iommu_ops *ops = handle->dev->bus->iommu_ops;
++ 
++ 	if (!ops || !ops->sva_get_pasid)
++ 		return IOMMU_PASID_INVALID;
++ 
++ 	return ops->sva_get_pasid(handle);
++ }
++ EXPORT_SYMBOL_GPL(iommu_sva_get_pasid);
+++>>>>>>> 26b25a2b98e4 (iommu: Bind process address spaces to devices)
+diff --cc include/linux/iommu.h
+index 19668cb5b1d5,480921dfbadf..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -150,6 -159,33 +153,36 @@@ struct iommu_resv_region 
+  	enum iommu_resv_type	type;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Per device IOMMU features */
++ enum iommu_dev_features {
++ 	IOMMU_DEV_FEAT_AUX,	/* Aux-domain feature */
++ 	IOMMU_DEV_FEAT_SVA,	/* Shared Virtual Addresses */
++ };
++ 
++ #define IOMMU_PASID_INVALID	(-1U)
++ 
++ /**
++  * struct iommu_sva_ops - device driver callbacks for an SVA context
++  *
++  * @mm_exit: called when the mm is about to be torn down by exit_mmap. After
++  *           @mm_exit returns, the device must not issue any more transaction
++  *           with the PASID given as argument.
++  *
++  *           The @mm_exit handler is allowed to sleep. Be careful about the
++  *           locks taken in @mm_exit, because they might lead to deadlocks if
++  *           they are also held when dropping references to the mm. Consider the
++  *           following call chain:
++  *           mutex_lock(A); mmput(mm) -> exit_mm() -> @mm_exit() -> mutex_lock(A)
++  *           Using mmput_async() prevents this scenario.
++  *
++  */
++ struct iommu_sva_ops {
++ 	iommu_mm_exit_handler_t mm_exit;
++ };
++ 
+++>>>>>>> 26b25a2b98e4 (iommu: Bind process address spaces to devices)
+  #ifdef CONFIG_IOMMU_API
+  
+  /**
+@@@ -182,6 -216,14 +215,17 @@@
+   * @of_xlate: add OF master IDs to iommu grouping
+   * @is_attach_deferred: Check if domain attach should be deferred from iommu
+   *                      driver init to device driver init (default no)
+++<<<<<<< HEAD
+++=======
++  * @dev_has/enable/disable_feat: per device entries to check/enable/disable
++  *                               iommu specific features.
++  * @dev_feat_enabled: check enabled feature
++  * @aux_attach/detach_dev: aux-domain specific attach/detach entries.
++  * @aux_get_pasid: get the pasid given an aux-domain
++  * @sva_bind: Bind process address space to device
++  * @sva_unbind: Unbind process address space from device
++  * @sva_get_pasid: Get PASID associated to a SVA handle
+++>>>>>>> 26b25a2b98e4 (iommu: Bind process address spaces to devices)
+   * @pgsize_bitmap: bitmap of all possible supported page sizes
+   */
+  struct iommu_ops {
+@@@ -229,6 -268,22 +273,25 @@@
+  	int (*of_xlate)(struct device *dev, struct of_phandle_args *args);
+  	bool (*is_attach_deferred)(struct iommu_domain *domain, struct device *dev);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Per device IOMMU features */
++ 	bool (*dev_has_feat)(struct device *dev, enum iommu_dev_features f);
++ 	bool (*dev_feat_enabled)(struct device *dev, enum iommu_dev_features f);
++ 	int (*dev_enable_feat)(struct device *dev, enum iommu_dev_features f);
++ 	int (*dev_disable_feat)(struct device *dev, enum iommu_dev_features f);
++ 
++ 	/* Aux-domain specific attach/detach entries */
++ 	int (*aux_attach_dev)(struct iommu_domain *domain, struct device *dev);
++ 	void (*aux_detach_dev)(struct iommu_domain *domain, struct device *dev);
++ 	int (*aux_get_pasid)(struct iommu_domain *domain, struct device *dev);
++ 
++ 	struct iommu_sva *(*sva_bind)(struct device *dev, struct mm_struct *mm,
++ 				      void *drvdata);
++ 	void (*sva_unbind)(struct iommu_sva *handle);
++ 	int (*sva_get_pasid)(struct iommu_sva *handle);
++ 
+++>>>>>>> 26b25a2b98e4 (iommu: Bind process address spaces to devices)
+  	unsigned long pgsize_bitmap;
+  };
+  
+@@@ -394,8 -450,13 +457,18 @@@ struct iommu_fwspec 
+  	u32			ids[1];
+  };
+  
+++<<<<<<< HEAD
+ +/* ATS is supported */
+ +#define IOMMU_FWSPEC_PCI_RC_ATS			(1 << 0)
+++=======
++ /**
++  * struct iommu_sva - handle to a device-mm bond
++  */
++ struct iommu_sva {
++ 	struct device			*dev;
++ 	const struct iommu_sva_ops	*ops;
++ };
+++>>>>>>> 26b25a2b98e4 (iommu: Bind process address spaces to devices)
+  
+  int iommu_fwspec_init(struct device *dev, struct fwnode_handle *iommu_fwnode,
+  		      const struct iommu_ops *ops);
+@@@ -417,6 -478,22 +490,25 @@@ static inline void dev_iommu_fwspec_set
+  int iommu_probe_device(struct device *dev);
+  void iommu_release_device(struct device *dev);
+  
+++<<<<<<< HEAD
+++=======
++ bool iommu_dev_has_feature(struct device *dev, enum iommu_dev_features f);
++ int iommu_dev_enable_feature(struct device *dev, enum iommu_dev_features f);
++ int iommu_dev_disable_feature(struct device *dev, enum iommu_dev_features f);
++ bool iommu_dev_feature_enabled(struct device *dev, enum iommu_dev_features f);
++ int iommu_aux_attach_device(struct iommu_domain *domain, struct device *dev);
++ void iommu_aux_detach_device(struct iommu_domain *domain, struct device *dev);
++ int iommu_aux_get_pasid(struct iommu_domain *domain, struct device *dev);
++ 
++ struct iommu_sva *iommu_sva_bind_device(struct device *dev,
++ 					struct mm_struct *mm,
++ 					void *drvdata);
++ void iommu_sva_unbind_device(struct iommu_sva *handle);
++ int iommu_sva_set_ops(struct iommu_sva *handle,
++ 		      const struct iommu_sva_ops *ops);
++ int iommu_sva_get_pasid(struct iommu_sva *handle);
++ 
+++>>>>>>> 26b25a2b98e4 (iommu: Bind process address spaces to devices)
+  #else /* CONFIG_IOMMU_API */
+  
+  struct iommu_ops {};
+@@@ -701,6 -778,75 +793,71 @@@ const struct iommu_ops *iommu_ops_from_
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool
++ iommu_dev_has_feature(struct device *dev, enum iommu_dev_features feat)
++ {
++ 	return false;
++ }
++ 
++ static inline bool
++ iommu_dev_feature_enabled(struct device *dev, enum iommu_dev_features feat)
++ {
++ 	return false;
++ }
++ 
++ static inline int
++ iommu_dev_enable_feature(struct device *dev, enum iommu_dev_features feat)
++ {
++ 	return -ENODEV;
++ }
++ 
++ static inline int
++ iommu_dev_disable_feature(struct device *dev, enum iommu_dev_features feat)
++ {
++ 	return -ENODEV;
++ }
++ 
++ static inline int
++ iommu_aux_attach_device(struct iommu_domain *domain, struct device *dev)
++ {
++ 	return -ENODEV;
++ }
++ 
++ static inline void
++ iommu_aux_detach_device(struct iommu_domain *domain, struct device *dev)
++ {
++ }
++ 
++ static inline int
++ iommu_aux_get_pasid(struct iommu_domain *domain, struct device *dev)
++ {
++ 	return -ENODEV;
++ }
++ 
++ static inline struct iommu_sva *
++ iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, void *drvdata)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void iommu_sva_unbind_device(struct iommu_sva *handle)
++ {
++ }
++ 
++ static inline int iommu_sva_set_ops(struct iommu_sva *handle,
++ 				    const struct iommu_sva_ops *ops)
++ {
++ 	return -EINVAL;
++ }
++ 
++ static inline int iommu_sva_get_pasid(struct iommu_sva *handle)
++ {
++ 	return IOMMU_PASID_INVALID;
++ }
++ 
+++>>>>>>> 26b25a2b98e4 (iommu: Bind process address spaces to devices)
+  #endif /* CONFIG_IOMMU_API */
+  
+ -#ifdef CONFIG_IOMMU_DEBUGFS
+ -extern	struct dentry *iommu_debugfs_dir;
+ -void iommu_debugfs_setup(void);
+ -#else
+ -static inline void iommu_debugfs_setup(void) {}
+ -#endif
+ -
+  #endif /* __LINUX_IOMMU_H */
+* Unmerged path drivers/iommu/iommu.c
+* Unmerged path include/linux/iommu.h
