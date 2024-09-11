@@ -1,0 +1,172 @@
+ASoC: SOF: Intel: hda: fix ordering bug in resume flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: SOF: Intel: hda: fix ordering bug in resume flow (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 94.74%
+commit-author Kai Vehmanen <kai.vehmanen@linux.intel.com>
+commit 816938b272b0ac0203e25ce50483bd284ea4a2db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/816938b2.failed
+
+When HDA controller is resumed from suspend, i915 HDMI/DP
+codec requires that following order of actions is kept:
+
+ - i915 display power up and configuration of link params
+ - hda link reset and setup
+
+Current SOF HDA code delegates display codec power control
+to the codec driver. This works most of the time, but in
+runtime PM sequences, the above constraint may be violated.
+On platforms where BIOS values for HDA link parameters do
+not match hardware reset defaults, this may lead to errors
+in HDA verb transactions after resume.
+
+Fix the issue by explicitly powering the display codec
+in the HDA controller resume/suspend calls, thus ensuring
+correct ordering. Special handling is needed for the D0i3
+flow, where display power must be turned off even though
+DSP is left powered.
+
+Now that we have more invocations of the display power helper
+functions, the conditional checks surrounding each call have
+been moved inside hda_codec_i915_display_power(). The two
+special cases of display powering at initial probe are handled
+separately. The intent is to avoid powering the display whenever
+no display codecs are used.
+
+Note that early powering of display was removed in
+commit 687ae9e287b3 ("ASoC: intel: skl: Fix display power regression").
+This change was also copied to the SOF driver. No failures
+have resulted as hardware default values for link parameters
+have worked out of the box. However with recent i915 driver
+changes like done in commit 87c1694533c9 ("drm/i915: save
+AUD_FREQ_CNTRL state at audio domain suspend"), this does not
+hold anymore and errors are hit.
+
+	Cc: Takashi Iwai <tiwai@suse.de>
+	Signed-off-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Takashi Iwai <tiwai@suse.de>
+Link: https://lore.kernel.org/r/20200206200223.7715-2-kai.vehmanen@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 816938b272b0ac0203e25ce50483bd284ea4a2db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda-codec.c
+#	sound/soc/sof/intel/hda-dsp.c
+#	sound/soc/sof/intel/hda.c
+diff --cc sound/soc/sof/intel/hda-codec.c
+index 9eae2be41b28,ff45075ef720..000000000000
+--- a/sound/soc/sof/intel/hda-codec.c
++++ b/sound/soc/sof/intel/hda-codec.c
+@@@ -174,19 -174,12 +174,26 @@@ void hda_codec_i915_get(struct snd_sof_
+  {
+  	struct hdac_bus *bus = sof_to_bus(sdev);
+  
+++<<<<<<< HEAD
+ +	dev_dbg(bus->dev, "Turning i915 HDAC power on\n");
+ +	snd_hdac_display_power(bus, HDA_CODEC_IDX_CONTROLLER, true);
+++=======
++ 	if (HDA_IDISP_CODEC(bus->codec_mask)) {
++ 		dev_dbg(bus->dev, "Turning i915 HDAC power %d\n", enable);
++ 		snd_hdac_display_power(bus, HDA_CODEC_IDX_CONTROLLER, enable);
++ 	}
+++>>>>>>> 816938b272b0 (ASoC: SOF: Intel: hda: fix ordering bug in resume flow)
+ +}
+ +EXPORT_SYMBOL(hda_codec_i915_get);
+ +
+ +void hda_codec_i915_put(struct snd_sof_dev *sdev)
+ +{
+ +	struct hdac_bus *bus = sof_to_bus(sdev);
+ +
+ +	dev_dbg(bus->dev, "Turning i915 HDAC power off\n");
+ +	snd_hdac_display_power(bus, HDA_CODEC_IDX_CONTROLLER, false);
+  }
+ -EXPORT_SYMBOL_NS(hda_codec_i915_display_power, SND_SOC_SOF_HDA_AUDIO_CODEC_I915);
+ +EXPORT_SYMBOL(hda_codec_i915_put);
+  
+  int hda_codec_i915_init(struct snd_sof_dev *sdev)
+  {
+@@@ -198,7 -191,8 +205,12 @@@
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	hda_codec_i915_get(sdev);
+++=======
++ 	/* codec_mask not yet known, power up for probe */
++ 	snd_hdac_display_power(bus, HDA_CODEC_IDX_CONTROLLER, true);
+++>>>>>>> 816938b272b0 (ASoC: SOF: Intel: hda: fix ordering bug in resume flow)
+  
+  	return 0;
+  }
+@@@ -209,7 -203,8 +221,12 @@@ int hda_codec_i915_exit(struct snd_sof_
+  	struct hdac_bus *bus = sof_to_bus(sdev);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	hda_codec_i915_put(sdev);
+++=======
++ 	/* power down unconditionally */
++ 	snd_hdac_display_power(bus, HDA_CODEC_IDX_CONTROLLER, false);
+++>>>>>>> 816938b272b0 (ASoC: SOF: Intel: hda: fix ordering bug in resume flow)
+  
+  	ret = snd_hdac_i915_exit(bus);
+  
+diff --cc sound/soc/sof/intel/hda-dsp.c
+index cbaa7fcc86d0,0848b79967a9..000000000000
+--- a/sound/soc/sof/intel/hda-dsp.c
++++ b/sound/soc/sof/intel/hda-dsp.c
+@@@ -483,7 -487,9 +489,13 @@@ int hda_dsp_resume(struct snd_sof_dev *
+  	struct sof_intel_hda_dev *hda = sdev->pdata->hw_pdata;
+  	struct pci_dev *pci = to_pci_dev(sdev->dev);
+  
+++<<<<<<< HEAD
+ +	if (sdev->system_suspend_target == SOF_SUSPEND_S0IX) {
+++=======
++ 	if (sdev->s0_suspend) {
++ 		hda_codec_i915_display_power(sdev, true);
++ 
+++>>>>>>> 816938b272b0 (ASoC: SOF: Intel: hda: fix ordering bug in resume flow)
+  		/* restore L1SEN bit */
+  		if (hda->l1_support_changed)
+  			snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
+@@@ -532,7 -538,10 +544,14 @@@ int hda_dsp_suspend(struct snd_sof_dev 
+  	struct pci_dev *pci = to_pci_dev(sdev->dev);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (sdev->system_suspend_target == SOF_SUSPEND_S0IX) {
+++=======
++ 	if (sdev->s0_suspend) {
++ 		/* we can't keep a wakeref to display driver at suspend */
++ 		hda_codec_i915_display_power(sdev, false);
++ 
+++>>>>>>> 816938b272b0 (ASoC: SOF: Intel: hda: fix ordering bug in resume flow)
+  		/* enable L1SEN to make sure the system can enter S0Ix */
+  		hda->l1_support_changed =
+  			snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
+diff --cc sound/soc/sof/intel/hda.c
+index e20431686d1c,8fddafb5c1d4..000000000000
+--- a/sound/soc/sof/intel/hda.c
++++ b/sound/soc/sof/intel/hda.c
+@@@ -475,7 -380,8 +475,12 @@@ static int hda_init_caps(struct snd_sof
+  	/* create codec instances */
+  	hda_codec_probe_bus(sdev, hda_codec_use_common_hdmi);
+  
+++<<<<<<< HEAD
+ +	hda_codec_i915_put(sdev);
+++=======
++ 	if (!HDA_IDISP_CODEC(bus->codec_mask))
++ 		hda_codec_i915_exit(sdev);
+++>>>>>>> 816938b272b0 (ASoC: SOF: Intel: hda: fix ordering bug in resume flow)
+  
+  	/*
+  	 * we are done probing so decrement link counts
+* Unmerged path sound/soc/sof/intel/hda-codec.c
+* Unmerged path sound/soc/sof/intel/hda-dsp.c
+* Unmerged path sound/soc/sof/intel/hda.c
