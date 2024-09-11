@@ -1,0 +1,161 @@
+scsi: qla2xxx: Setup debugfs entries for remote ports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Arun Easi <aeasi@marvell.com>
+commit 1e98fb0f9208da058e2b6627f9f19fa0a95d05cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1e98fb0f.failed
+
+Create a base for adding remote port related entries in debugfs.
+
+Link: https://lore.kernel.org/r/20200904045128.23631-3-njavali@marvell.com
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@oracle.com>
+	Signed-off-by: Arun Easi <aeasi@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Saurav Kashyap <skashyap@marvell.com>
+	Signed-off-by: Nilesh Javali <njavali@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 1e98fb0f9208da058e2b6627f9f19fa0a95d05cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_gbl.h
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index fbac8553d518,6d6d74e3546c..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -4580,6 -4782,14 +4582,17 @@@ typedef struct scsi_qla_host 
+  	uint16_t ql2xexchoffld;
+  	uint16_t ql2xiniexchg;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct dentry *dfs_rport_root;
++ 
++ 	struct purex_list {
++ 		struct list_head head;
++ 		spinlock_t lock;
++ 	} purex_list;
++ 	struct purex_item default_item;
++ 
+++>>>>>>> 1e98fb0f9208 (scsi: qla2xxx: Setup debugfs entries for remote ports)
+  	struct name_list_extended gnl;
+  	/* Count of active session/fcport */
+  	int fcport_count;
+diff --cc drivers/scsi/qla2xxx/qla_gbl.h
+index a6e3ebf4ee44,36c210c24f72..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@@ -928,6 -934,9 +928,12 @@@ void qlt_remove_target_resources(struc
+  void qlt_clr_qp_table(struct scsi_qla_host *vha);
+  void qlt_set_mode(struct scsi_qla_host *);
+  int qla2x00_set_data_rate(scsi_qla_host_t *vha, uint16_t mode);
+++<<<<<<< HEAD
+++=======
++ extern void qla24xx_process_purex_list(struct purex_list *);
++ extern void qla2x00_dfs_create_rport(scsi_qla_host_t *vha, struct fc_port *fp);
++ extern void qla2x00_dfs_remove_rport(scsi_qla_host_t *vha, struct fc_port *fp);
+++>>>>>>> 1e98fb0f9208 (scsi: qla2xxx: Setup debugfs entries for remote ports)
+  
+  /* nvme.c */
+  void qla_nvme_unregister_remote_port(struct fc_port *fcport);
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_dfs.c b/drivers/scsi/qla2xxx/qla_dfs.c
+index e62b2115235e..3c4b9b549b17 100644
+--- a/drivers/scsi/qla2xxx/qla_dfs.c
++++ b/drivers/scsi/qla2xxx/qla_dfs.c
+@@ -12,6 +12,29 @@
+ static struct dentry *qla2x00_dfs_root;
+ static atomic_t qla2x00_dfs_root_count;
+ 
++void
++qla2x00_dfs_create_rport(scsi_qla_host_t *vha, struct fc_port *fp)
++{
++	char wwn[32];
++
++	if (!vha->dfs_rport_root || fp->dfs_rport_dir)
++		return;
++
++	sprintf(wwn, "pn-%016llx", wwn_to_u64(fp->port_name));
++	fp->dfs_rport_dir = debugfs_create_dir(wwn, vha->dfs_rport_root);
++	if (!fp->dfs_rport_dir)
++		return;
++}
++
++void
++qla2x00_dfs_remove_rport(scsi_qla_host_t *vha, struct fc_port *fp)
++{
++	if (!vha->dfs_rport_root || !fp->dfs_rport_dir)
++		return;
++	debugfs_remove_recursive(fp->dfs_rport_dir);
++	fp->dfs_rport_dir = NULL;
++}
++
+ static int
+ qla2x00_dfs_tgt_sess_show(struct seq_file *s, void *unused)
+ {
+@@ -473,9 +496,21 @@ qla2x00_dfs_setup(scsi_qla_host_t *vha)
+ 	ha->tgt.dfs_tgt_sess = debugfs_create_file("tgt_sess",
+ 		S_IRUSR, ha->dfs_dir, vha, &dfs_tgt_sess_ops);
+ 
+-	if (IS_QLA27XX(ha) || IS_QLA83XX(ha) || IS_QLA28XX(ha))
++	if (IS_QLA27XX(ha) || IS_QLA83XX(ha) || IS_QLA28XX(ha)) {
+ 		ha->tgt.dfs_naqp = debugfs_create_file("naqp",
+ 		    0400, ha->dfs_dir, vha, &dfs_naqp_ops);
++		if (!ha->tgt.dfs_naqp) {
++			ql_log(ql_log_warn, vha, 0xd011,
++			       "Unable to create debugFS naqp node.\n");
++			goto out;
++		}
++	}
++	vha->dfs_rport_root = debugfs_create_dir("rports", ha->dfs_dir);
++	if (!vha->dfs_rport_root) {
++		ql_log(ql_log_warn, vha, 0xd012,
++		       "Unable to create debugFS rports node.\n");
++		goto out;
++	}
+ out:
+ 	return 0;
+ }
+@@ -515,6 +550,11 @@ qla2x00_dfs_remove(scsi_qla_host_t *vha)
+ 		ha->dfs_fce = NULL;
+ 	}
+ 
++	if (vha->dfs_rport_root) {
++		debugfs_remove_recursive(vha->dfs_rport_root);
++		vha->dfs_rport_root = NULL;
++	}
++
+ 	if (ha->dfs_dir) {
+ 		debugfs_remove(ha->dfs_dir);
+ 		ha->dfs_dir = NULL;
+* Unmerged path drivers/scsi/qla2xxx/qla_gbl.h
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index 9920f8721dbd..ad667021793d 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -5498,6 +5498,8 @@ qla2x00_update_fcport(scsi_qla_host_t *vha, fc_port_t *fcport)
+ 
+ 	qla2x00_iidma_fcport(vha, fcport);
+ 
++	qla2x00_dfs_create_rport(vha, fcport);
++
+ 	if (NVME_TARGET(vha->hw, fcport)) {
+ 		qla_nvme_register_remote(vha, fcport);
+ 		qla2x00_set_fcport_disc_state(fcport, DSC_LOGIN_COMPLETE);
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 8a87dbdc39aa..8e7aafa71bb4 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -1122,6 +1122,8 @@ void qlt_free_session_done(struct work_struct *work)
+ 	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+ 	sess->free_pending = 0;
+ 
++	qla2x00_dfs_remove_rport(vha, sess);
++
+ 	ql_dbg(ql_dbg_disc, vha, 0xf001,
+ 	    "Unregistration of sess %p %8phC finished fcp_cnt %d\n",
+ 		sess, sess->port_name, vha->fcport_count);
