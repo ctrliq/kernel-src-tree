@@ -1,0 +1,187 @@
+HID: logitech-hidpp: add support for HID++ 1.0 wheel reports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [hid] logitech-hidpp: add support for HID++ 1.0 wheel reports (Benjamin Tissoires) [1740778]
+Rebuild_FUZZ: 95.65%
+commit-author Hans de Goede <hdegoede@redhat.com>
+commit 4a79bcc64a0514d630783b8d19cf9a85e46fe988
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/4a79bcc6.failed
+
+Add a quirk for switching wheel event reporting to using the HID++
+report for this.
+
+This has 2 advantages:
+1) Without this tilting the scrollwheel left / right will send a
+   scroll-lock + cursor-left/-right + scroll-lock key-sequence instead of
+   hwheel events
+
+2) The HID++ reports contain the device index instead of using the generic
+   HID implementation, so this will make scroll-wheel events from the wheel
+   on some keyboards be emitted by the right event node.
+
+2. also fixes keyboard scroll-wheel events getting lost in the (mostly
+theoretical) case of there not being a mouse paired with the receiver.
+
+This commit enables this quirk for all 27Mhz mice, it cannot hurt to have
+it enabled and this avoids the need to keep adding more and more quirks for
+this. This has been tested in 5 different 27MHz mice, 3 of which have a
+wheel which can tilt.
+
+This commit also adds explicit quirks for 3 keyboards with a zoom-/scroll-
+wheel. The MX3000 keyboard scroll-wheel can also tilt. I've defined aliases
+to the new HIDPP_QUIRK_HIDPP_WHEELS for this, so that it is clear why the
+keyboard has the quirk and in case we want to handle the keyboard wheels
+and especially the keyboard zoom-wheels differently in the future.
+
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+(cherry picked from commit 4a79bcc64a0514d630783b8d19cf9a85e46fe988)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/hid-logitech-hidpp.c
+diff --cc drivers/hid/hid-logitech-hidpp.c
+index 844711d5f9a8,7f6bebae3a78..000000000000
+--- a/drivers/hid/hid-logitech-hidpp.c
++++ b/drivers/hid/hid-logitech-hidpp.c
+@@@ -50,8 -51,11 +50,11 @@@ MODULE_PARM_DESC(disable_tap_to_click
+  
+  #define HIDPP_REPORT_SHORT_LENGTH		7
+  #define HIDPP_REPORT_LONG_LENGTH		20
+ -#define HIDPP_REPORT_VERY_LONG_MAX_LENGTH	64
+ +#define HIDPP_REPORT_VERY_LONG_LENGTH		64
+  
++ #define HIDPP_SUB_ID_ROLLER			0x05
++ #define HIDPP_SUB_ID_MOUSE_EXTRA_BTNS		0x06
++ 
+  #define HIDPP_QUIRK_CLASS_WTP			BIT(0)
+  #define HIDPP_QUIRK_CLASS_M560			BIT(1)
+  #define HIDPP_QUIRK_CLASS_K400			BIT(2)
+@@@ -2782,17 -2868,17 +2836,24 @@@ static int hidpp_input_mapped(struct hi
+  
+  
+  static void hidpp_populate_input(struct hidpp_device *hidpp,
+ -				 struct input_dev *input)
+ +		struct input_dev *input, bool origin_is_hid_core)
+  {
+ -	hidpp->input = input;
+ -
+  	if (hidpp->quirks & HIDPP_QUIRK_CLASS_WTP)
+ -		wtp_populate_input(hidpp, input);
+ +		wtp_populate_input(hidpp, input, origin_is_hid_core);
+  	else if (hidpp->quirks & HIDPP_QUIRK_CLASS_M560)
+++<<<<<<< HEAD
+ +		m560_populate_input(hidpp, input, origin_is_hid_core);
+ +
+ +	if (hidpp->quirks & HIDPP_QUIRK_HI_RES_SCROLL) {
+ +		input_set_capability(input, EV_REL, REL_WHEEL_HI_RES);
+ +		hidpp->vertical_wheel_counter.dev = input;
+ +	}
+++=======
++ 		m560_populate_input(hidpp, input);
++ 
++ 	if (hidpp->quirks & HIDPP_QUIRK_HIDPP_WHEELS)
++ 		hidpp10_wheel_populate_input(hidpp, input);
+++>>>>>>> 4a79bcc64a05 (HID: logitech-hidpp: add support for HID++ 1.0 wheel reports)
+  }
+  
+  static int hidpp_input_configured(struct hid_device *hdev,
+@@@ -3171,6 -3280,60 +3244,63 @@@ static const struct attribute_group ps_
+  	.attrs = sysfs_attrs
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int hidpp_get_report_length(struct hid_device *hdev, int id)
++ {
++ 	struct hid_report_enum *re;
++ 	struct hid_report *report;
++ 
++ 	re = &(hdev->report_enum[HID_OUTPUT_REPORT]);
++ 	report = re->report_id_hash[id];
++ 	if (!report)
++ 		return 0;
++ 
++ 	return report->field[0]->report_count + 1;
++ }
++ 
++ static bool hidpp_validate_report(struct hid_device *hdev, int id,
++ 				  int expected_length, bool optional)
++ {
++ 	int report_length;
++ 
++ 	if (id >= HID_MAX_IDS || id < 0) {
++ 		hid_err(hdev, "invalid HID report id %u\n", id);
++ 		return false;
++ 	}
++ 
++ 	report_length = hidpp_get_report_length(hdev, id);
++ 	if (!report_length)
++ 		return optional;
++ 
++ 	if (report_length < expected_length) {
++ 		hid_warn(hdev, "not enough values in hidpp report %d\n", id);
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static bool hidpp_validate_device(struct hid_device *hdev)
++ {
++ 	return hidpp_validate_report(hdev, REPORT_ID_HIDPP_SHORT,
++ 				     HIDPP_REPORT_SHORT_LENGTH, false) &&
++ 	       hidpp_validate_report(hdev, REPORT_ID_HIDPP_LONG,
++ 				     HIDPP_REPORT_LONG_LENGTH, true);
++ }
++ 
++ static bool hidpp_application_equals(struct hid_device *hdev,
++ 				     unsigned int application)
++ {
++ 	struct list_head *report_list;
++ 	struct hid_report *report;
++ 
++ 	report_list = &hdev->report_enum[HID_INPUT_REPORT].report_list;
++ 	report = list_first_entry_or_null(report_list, struct hid_report, list);
++ 	return report && report->application == application;
++ }
++ 
+++>>>>>>> 4a79bcc64a05 (HID: logitech-hidpp: add support for HID++ 1.0 wheel reports)
+  static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
+  {
+  	struct hidpp_device *hidpp;
+@@@ -3379,7 -3556,26 +3513,30 @@@ static const struct hid_device_id hidpp
+  
+  	{ LDJ_DEVICE(HID_ANY_ID) },
+  
+++<<<<<<< HEAD
+ +	{ HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G920_WHEEL),
+++=======
++ 	{ /* Keyboard LX501 (Y-RR53) */
++ 	  L27MHZ_DEVICE(0x0049),
++ 	  .driver_data = HIDPP_QUIRK_KBD_ZOOM_WHEEL },
++ 	{ /* Keyboard MX3000 (Y-RAM74) */
++ 	  L27MHZ_DEVICE(0x0057),
++ 	  .driver_data = HIDPP_QUIRK_KBD_SCROLL_WHEEL },
++ 	{ /* Keyboard MX3200 (Y-RAV80) */
++ 	  L27MHZ_DEVICE(0x005c),
++ 	  .driver_data = HIDPP_QUIRK_KBD_ZOOM_WHEEL },
++ 
++ 	{ L27MHZ_DEVICE(HID_ANY_ID) },
++ 
++ 	{ /* Logitech G403 Gaming Mouse over USB */
++ 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC082) },
++ 	{ /* Logitech G700 Gaming Mouse over USB */
++ 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC06B) },
++ 	{ /* Logitech G900 Gaming Mouse over USB */
++ 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC081) },
++ 	{ /* Logitech G920 Wheel over USB */
++ 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G920_WHEEL),
+++>>>>>>> 4a79bcc64a05 (HID: logitech-hidpp: add support for HID++ 1.0 wheel reports)
+  		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS},
+  	{}
+  };
+* Unmerged path drivers/hid/hid-logitech-hidpp.c
