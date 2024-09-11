@@ -1,0 +1,112 @@
+mptcp: adjust mptcp receive buffer limit if subflow has larger one
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 13c7ba0c8494a4fcee9e8cc163ae332d0480bde5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/13c7ba0c.failed
+
+In addition to tcp autotuning during read, it may also increase the
+receive buffer in tcp_clamp_window().
+
+In this case, mptcp should adjust its receive buffer size as well so
+it can move all pending skbs from the subflow socket to the mptcp socket.
+
+At this time, TCP can have more skbs ready for processing than what the
+mptcp receive buffer size allows.
+
+In the mptcp case, the receive window announced is based on the free
+space of the mptcp parent socket instead of the individual subflows.
+
+Following the subflow allows mptcp to grow its receive buffer.
+
+This is especially noticeable for loopback traffic where two skbs are
+enough to fill the initial receive window.
+
+In mptcp_data_ready() we do not hold the mptcp socket lock, so modifying
+mptcp_sk->sk_rcvbuf is racy.  Do it when moving skbs from subflow to
+mptcp socket, both sockets are locked in this case.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 13c7ba0c8494a4fcee9e8cc163ae332d0480bde5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 2ecf7fd58ba2,e010ef7585bf..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -338,14 -464,24 +338,26 @@@ static bool __mptcp_move_skbs_from_subf
+  	unsigned int moved = 0;
+  	bool more_data_avail;
+  	struct tcp_sock *tp;
+ -	u32 old_copied_seq;
+  	bool done = false;
++ 	int sk_rbuf;
++ 
++ 	sk_rbuf = READ_ONCE(sk->sk_rcvbuf);
++ 
++ 	if (!(sk->sk_userlocks & SOCK_RCVBUF_LOCK)) {
++ 		int ssk_rbuf = READ_ONCE(ssk->sk_rcvbuf);
++ 
++ 		if (unlikely(ssk_rbuf > sk_rbuf)) {
++ 			WRITE_ONCE(sk->sk_rcvbuf, ssk_rbuf);
++ 			sk_rbuf = ssk_rbuf;
++ 		}
++ 	}
+  
+ -	pr_debug("msk=%p ssk=%p", msk, ssk);
+ +	if (!mptcp_subflow_dsn_valid(msk, ssk)) {
+ +		*bytes = 0;
+ +		return false;
+ +	}
+ +
+  	tp = tcp_sk(ssk);
+ -	old_copied_seq = tp->copied_seq;
+  	do {
+  		u32 map_remaining, offset;
+  		u32 seq = tp->copied_seq;
+@@@ -449,16 -632,29 +461,25 @@@ static bool move_skbs_to_msk(struct mpt
+  
+  void mptcp_data_ready(struct sock *sk, struct sock *ssk)
+  {
+ -	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+++<<<<<<< HEAD
+++=======
++ 	int sk_rbuf, ssk_rbuf;
++ 	bool wake;
+++>>>>>>> 13c7ba0c8494 (mptcp: adjust mptcp receive buffer limit if subflow has larger one)
+  
+ -	/* move_skbs_to_msk below can legitly clear the data_avail flag,
+ -	 * but we will need later to properly woke the reader, cache its
+ -	 * value
+ -	 */
+ -	wake = subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL;
+ -	if (wake)
+ -		set_bit(MPTCP_DATA_READY, &msk->flags);
+ +	set_bit(MPTCP_DATA_READY, &msk->flags);
+  
+- 	if (atomic_read(&sk->sk_rmem_alloc) < READ_ONCE(sk->sk_rcvbuf) &&
+- 	    move_skbs_to_msk(msk, ssk))
++ 	ssk_rbuf = READ_ONCE(ssk->sk_rcvbuf);
++ 	sk_rbuf = READ_ONCE(sk->sk_rcvbuf);
++ 	if (unlikely(ssk_rbuf > sk_rbuf))
++ 		sk_rbuf = ssk_rbuf;
++ 
++ 	/* over limit? can't append more skbs to msk */
++ 	if (atomic_read(&sk->sk_rmem_alloc) > sk_rbuf)
+  		goto wake;
+  
+- 	/* don't schedule if mptcp sk is (still) over limit */
+- 	if (atomic_read(&sk->sk_rmem_alloc) > READ_ONCE(sk->sk_rcvbuf))
++ 	if (move_skbs_to_msk(msk, ssk))
+  		goto wake;
+  
+  	/* mptcp socket is owned, release_cb should retry */
+* Unmerged path net/mptcp/protocol.c
