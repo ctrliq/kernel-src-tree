@@ -1197,7 +1197,7 @@ void ata_eh_freeze_port(struct ata_port *ap)
 }
 
 /**
- *	ata_port_thaw_port - EH helper to thaw port
+ *	ata_eh_thaw_port - EH helper to thaw port
  *	@ap: ATA port to thaw
  *
  *	Thaw frozen port @ap.
