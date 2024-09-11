@@ -1,0 +1,249 @@
+powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [powerpc] powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size (Desnes Augusto Nunes do Rosario) [1854528]
+Rebuild_FUZZ: 99.37%
+commit-author Christophe Leroy <christophe.leroy@c-s.fr>
+commit 39413ae009674c6ba745850515b551bbb9d6374b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/39413ae0.failed
+
+Unlike standard powerpc, Powerpc 8xx doesn't have SPRN_DABR, but
+it has a breakpoint support based on a set of comparators which
+allow more flexibility.
+
+Commit 4ad8622dc548 ("powerpc/8xx: Implement hw_breakpoint")
+implemented breakpoints by emulating the DABR behaviour. It did
+this by setting one comparator the match 4 bytes at breakpoint address
+and the other comparator to match 4 bytes at breakpoint address + 4.
+
+Rewrite 8xx hw_breakpoint to make breakpoints match all addresses
+defined by the breakpoint address and length by making full use of
+comparators.
+
+Now, comparator E is set to match any address greater than breakpoint
+address minus one. Comparator F is set to match any address lower than
+breakpoint address plus breakpoint length. Addresses are aligned
+to 32 bits.
+
+When the breakpoint range starts at address 0, the breakpoint is set
+to match comparator F only. When the breakpoint range end at address
+0xffffffff, the breakpoint is set to match comparator E only.
+Otherwise the breakpoint is set to match comparator E and F.
+
+At the same time, use registers bit names instead of hardcoded values.
+
+	Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/05105deeaf63bc02151aea2cdeaf525534e0e9d4.1574790198.git.christophe.leroy@c-s.fr
+(cherry picked from commit 39413ae009674c6ba745850515b551bbb9d6374b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/hw_breakpoint.h
+#	arch/powerpc/include/asm/reg_8xx.h
+#	arch/powerpc/kernel/hw_breakpoint.c
+#	arch/powerpc/kernel/process.c
+diff --cc arch/powerpc/include/asm/hw_breakpoint.h
+index 27d6e3c8fde9,f2f8d8aa8e3b..000000000000
+--- a/arch/powerpc/include/asm/hw_breakpoint.h
++++ b/arch/powerpc/include/asm/hw_breakpoint.h
+@@@ -47,6 -34,15 +47,18 @@@ struct arch_hw_breakpoint 
+  #define HW_BRK_TYPE_PRIV_ALL	(HW_BRK_TYPE_USER | HW_BRK_TYPE_KERNEL | \
+  				 HW_BRK_TYPE_HYP)
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PPC_8xx
++ #define HW_BREAKPOINT_ALIGN 0x3
++ #else
++ #define HW_BREAKPOINT_ALIGN 0x7
++ #endif
++ 
++ #define DABR_MAX_LEN	8
++ #define DAWR_MAX_LEN	512
++ 
+++>>>>>>> 39413ae00967 (powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size.)
+  #ifdef CONFIG_HAVE_HW_BREAKPOINT
+  #include <linux/kdebug.h>
+  #include <asm/reg.h>
+diff --cc arch/powerpc/include/asm/reg_8xx.h
+index 7192eece6c3e,299ee7be0f67..000000000000
+--- a/arch/powerpc/include/asm/reg_8xx.h
++++ b/arch/powerpc/include/asm/reg_8xx.h
+@@@ -37,8 -35,24 +37,26 @@@
+  #define SPRN_CMPE	152
+  #define SPRN_CMPF	153
+  #define SPRN_LCTRL1	156
++ #define   LCTRL1_CTE_GT		0xc0000000
++ #define   LCTRL1_CTF_LT		0x14000000
++ #define   LCTRL1_CRWE_RW	0x00000000
++ #define   LCTRL1_CRWE_RO	0x00040000
++ #define   LCTRL1_CRWE_WO	0x000c0000
++ #define   LCTRL1_CRWF_RW	0x00000000
++ #define   LCTRL1_CRWF_RO	0x00010000
++ #define   LCTRL1_CRWF_WO	0x00030000
+  #define SPRN_LCTRL2	157
+++<<<<<<< HEAD
+++=======
++ #define   LCTRL2_LW0EN		0x80000000
++ #define   LCTRL2_LW0LA_E	0x00000000
++ #define   LCTRL2_LW0LA_F	0x04000000
++ #define   LCTRL2_LW0LA_EandF	0x08000000
++ #define   LCTRL2_LW0LADC	0x02000000
++ #define   LCTRL2_SLW0EN		0x00000002
++ #ifdef CONFIG_PPC_8xx
+++>>>>>>> 39413ae00967 (powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size.)
+  #define SPRN_ICTRL	158
+ -#endif
+  #define SPRN_BAR	159
+  
+  /* Commands.  Only the first few are available to the instruction cache.
+diff --cc arch/powerpc/kernel/hw_breakpoint.c
+index cb5dfa15ad41,2462cd7c565c..000000000000
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@@ -137,6 -127,52 +137,55 @@@ int arch_bp_generic_fields(int type, in
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Watchpoint match range is always doubleword(8 bytes) aligned on
++  * powerpc. If the given range is crossing doubleword boundary, we
++  * need to increase the length such that next doubleword also get
++  * covered. Ex,
++  *
++  *          address   len = 6 bytes
++  *                |=========.
++  *   |------------v--|------v--------|
++  *   | | | | | | | | | | | | | | | | |
++  *   |---------------|---------------|
++  *    <---8 bytes--->
++  *
++  * In this case, we should configure hw as:
++  *   start_addr = address & ~HW_BREAKPOINT_ALIGN
++  *   len = 16 bytes
++  *
++  * @start_addr and @end_addr are inclusive.
++  */
++ static int hw_breakpoint_validate_len(struct arch_hw_breakpoint *hw)
++ {
++ 	u16 max_len = DABR_MAX_LEN;
++ 	u16 hw_len;
++ 	unsigned long start_addr, end_addr;
++ 
++ 	start_addr = hw->address & ~HW_BREAKPOINT_ALIGN;
++ 	end_addr = (hw->address + hw->len - 1) | HW_BREAKPOINT_ALIGN;
++ 	hw_len = end_addr - start_addr + 1;
++ 
++ 	if (dawr_enabled()) {
++ 		max_len = DAWR_MAX_LEN;
++ 		/* DAWR region can't cross 512 bytes boundary */
++ 		if ((start_addr >> 9) != (end_addr >> 9))
++ 			return -EINVAL;
++ 	} else if (IS_ENABLED(CONFIG_PPC_8xx)) {
++ 		/* 8xx can setup a range without limitation */
++ 		max_len = U16_MAX;
++ 	}
++ 
++ 	if (hw_len > max_len)
++ 		return -EINVAL;
++ 
++ 	hw->hw_len = hw_len;
++ 	return 0;
++ }
++ 
++ /*
+++>>>>>>> 39413ae00967 (powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size.)
+   * Validate the arch-specific HW Breakpoint register settings
+   */
+  int hw_breakpoint_arch_parse(struct perf_event *bp,
+diff --cc arch/powerpc/kernel/process.c
+index 6ca2453dede4,7fcf72e58826..000000000000
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@@ -775,31 -760,36 +753,64 @@@ static inline int set_dabr(struct arch_
+  	return __set_dabr(dabr, dabrx);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int set_dawr(struct arch_hw_breakpoint *brk)
+ +{
+ +	unsigned long dawr, dawrx, mrd;
+ +
+ +	dawr = brk->address;
+ +
+ +	dawrx  = (brk->type & (HW_BRK_TYPE_READ | HW_BRK_TYPE_WRITE)) \
+ +		                   << (63 - 58); //* read/write bits */
+ +	dawrx |= ((brk->type & (HW_BRK_TYPE_TRANSLATE)) >> 2) \
+ +		                   << (63 - 59); //* translate */
+ +	dawrx |= (brk->type & (HW_BRK_TYPE_PRIV_ALL)) \
+ +		                   >> 3; //* PRIM bits */
+ +	/* dawr length is stored in field MDR bits 48:53.  Matches range in
+ +	   doublewords (64 bits) baised by -1 eg. 0b000000=1DW and
+ +	   0b111111=64DW.
+ +	   brk->len is in bytes.
+ +	   This aligns up to double word size, shifts and does the bias.
+ +	*/
+ +	mrd = ((brk->len + 7) >> 3) - 1;
+ +	dawrx |= (mrd & 0x3f) << (63 - 53);
+ +
+ +	if (ppc_md.set_dawr)
+ +		return ppc_md.set_dawr(dawr, dawrx);
+ +	mtspr(SPRN_DAWR, dawr);
+ +	mtspr(SPRN_DAWRX, dawrx);
+++=======
++ static inline int set_breakpoint_8xx(struct arch_hw_breakpoint *brk)
++ {
++ 	unsigned long lctrl1 = LCTRL1_CTE_GT | LCTRL1_CTF_LT | LCTRL1_CRWE_RW |
++ 			       LCTRL1_CRWF_RW;
++ 	unsigned long lctrl2 = LCTRL2_LW0EN | LCTRL2_LW0LADC | LCTRL2_SLW0EN;
++ 	unsigned long start_addr = brk->address & ~HW_BREAKPOINT_ALIGN;
++ 	unsigned long end_addr = (brk->address + brk->len - 1) | HW_BREAKPOINT_ALIGN;
++ 
++ 	if (start_addr == 0)
++ 		lctrl2 |= LCTRL2_LW0LA_F;
++ 	else if (end_addr == ~0U)
++ 		lctrl2 |= LCTRL2_LW0LA_E;
++ 	else
++ 		lctrl2 |= LCTRL2_LW0LA_EandF;
++ 
++ 	mtspr(SPRN_LCTRL2, 0);
++ 
++ 	if ((brk->type & HW_BRK_TYPE_RDWR) == 0)
++ 		return 0;
++ 
++ 	if ((brk->type & HW_BRK_TYPE_RDWR) == HW_BRK_TYPE_READ)
++ 		lctrl1 |= LCTRL1_CRWE_RO | LCTRL1_CRWF_RO;
++ 	if ((brk->type & HW_BRK_TYPE_RDWR) == HW_BRK_TYPE_WRITE)
++ 		lctrl1 |= LCTRL1_CRWE_WO | LCTRL1_CRWF_WO;
++ 
++ 	mtspr(SPRN_CMPE, start_addr - 1);
++ 	mtspr(SPRN_CMPF, end_addr + 1);
++ 	mtspr(SPRN_LCTRL1, lctrl1);
++ 	mtspr(SPRN_LCTRL2, lctrl2);
++ 
+++>>>>>>> 39413ae00967 (powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size.)
+  	return 0;
+  }
+  
+@@@ -807,9 -797,11 +818,11 @@@ void __set_breakpoint(struct arch_hw_br
+  {
+  	memcpy(this_cpu_ptr(&current_brk), brk, sizeof(*brk));
+  
+ -	if (dawr_enabled())
+ +	if (cpu_has_feature(CPU_FTR_DAWR))
+  		// Power8 or later
+  		set_dawr(brk);
++ 	else if (IS_ENABLED(CONFIG_PPC_8xx))
++ 		set_breakpoint_8xx(brk);
+  	else if (!cpu_has_feature(CPU_FTR_ARCH_207S))
+  		// Power7 or earlier
+  		set_dabr(brk);
+* Unmerged path arch/powerpc/include/asm/hw_breakpoint.h
+* Unmerged path arch/powerpc/include/asm/reg_8xx.h
+* Unmerged path arch/powerpc/kernel/hw_breakpoint.c
+* Unmerged path arch/powerpc/kernel/process.c
