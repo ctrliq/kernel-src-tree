@@ -1,0 +1,155 @@
+x86/kvm/mmu: introduce guest_mmu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 14c07ad89f4d728a468caaea6a769c018c2b8dd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/14c07ad8.failed
+
+When EPT is used for nested guest we need to re-init MMU as shadow
+EPT MMU (nested_ept_init_mmu_context() does that). When we return back
+from L2 to L1 kvm_mmu_reset_context() in nested_vmx_load_cr3() resets
+MMU back to normal TDP mode. Add a special 'guest_mmu' so we can use
+separate root caches; the improved hit rate is not very important for
+single vCPU performance, but it avoids contention on the mmu_lock for
+many vCPUs.
+
+On the nested CPUID benchmark, with 16 vCPUs, an L2->L1->L2 vmexit
+goes from 42k to 26k cycles.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 14c07ad89f4d728a468caaea6a769c018c2b8dd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 860eb68a8d8a,02888031d038..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -8512,9 -8499,8 +8520,14 @@@ static int handle_vmoff(struct kvm_vcp
+  {
+  	if (!nested_vmx_check_permission(vcpu))
+  		return 1;
+++<<<<<<< HEAD
+ +	free_nested(to_vmx(vcpu));
+ +	nested_vmx_succeed(vcpu);
+ +	return kvm_skip_emulated_instruction(vcpu);
+++=======
++ 	free_nested(vcpu);
++ 	return nested_vmx_succeed(vcpu);
+++>>>>>>> 14c07ad89f4d (x86/kvm/mmu: introduce guest_mmu)
+  }
+  
+  /* Emulate the VMCLEAR instruction */
+@@@ -8530,18 -8516,16 +8543,18 @@@ static int handle_vmclear(struct kvm_vc
+  	if (nested_vmx_get_vmptr(vcpu, &vmptr))
+  		return 1;
+  
+ -	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu)))
+ -		return nested_vmx_failValid(vcpu,
+ -			VMXERR_VMCLEAR_INVALID_ADDRESS);
+ +	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu))) {
+ +		nested_vmx_failValid(vcpu, VMXERR_VMCLEAR_INVALID_ADDRESS);
+ +		return kvm_skip_emulated_instruction(vcpu);
+ +	}
+  
+ -	if (vmptr == vmx->nested.vmxon_ptr)
+ -		return nested_vmx_failValid(vcpu,
+ -			VMXERR_VMCLEAR_VMXON_POINTER);
+ +	if (vmptr == vmx->nested.vmxon_ptr) {
+ +		nested_vmx_failValid(vcpu, VMXERR_VMCLEAR_VMXON_POINTER);
+ +		return kvm_skip_emulated_instruction(vcpu);
+ +	}
+  
+  	if (vmptr == vmx->nested.current_vmptr)
+- 		nested_release_vmcs12(vmx);
++ 		nested_release_vmcs12(vcpu);
+  
+  	kvm_vcpu_write_guest(vcpu,
+  			vmptr + offsetof(struct vmcs12, launch_state),
+@@@ -8927,12 -8876,12 +8940,13 @@@ static int handle_vmptrld(struct kvm_vc
+  		     !nested_cpu_has_vmx_shadow_vmcs(vcpu))) {
+  			kunmap(page);
+  			kvm_release_page_clean(page);
+ -			return nested_vmx_failValid(vcpu,
+ +			nested_vmx_failValid(vcpu,
+  				VMXERR_VMPTRLD_INCORRECT_VMCS_REVISION_ID);
+ +			return kvm_skip_emulated_instruction(vcpu);
+  		}
+  
+- 		nested_release_vmcs12(vmx);
++ 		nested_release_vmcs12(vcpu);
++ 
+  		/*
+  		 * Load VMCS12 from guest memory since it is not already
+  		 * cached.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 2c8011c4e405..77b13683fde0 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -548,6 +548,9 @@ struct kvm_vcpu_arch {
+ 	/* Non-nested MMU for L1 */
+ 	struct kvm_mmu root_mmu;
+ 
++	/* L1 MMU when running nested */
++	struct kvm_mmu guest_mmu;
++
+ 	/*
+ 	 * Paging state of an L2 guest (used for nested npt)
+ 	 *
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index ad486956e256..8d1197564d8e 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -4823,7 +4823,10 @@ EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+ static union kvm_mmu_page_role
+ kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty)
+ {
+-	union kvm_mmu_page_role role = vcpu->arch.mmu->base_role;
++	union kvm_mmu_page_role role;
++
++	/* Role is inherited from root_mmu */
++	role.word = vcpu->arch.root_mmu.base_role.word;
+ 
+ 	role.level = PT64_ROOT_4LEVEL;
+ 	role.direct = false;
+@@ -4973,8 +4976,10 @@ EXPORT_SYMBOL_GPL(kvm_mmu_load);
+ 
+ void kvm_mmu_unload(struct kvm_vcpu *vcpu)
+ {
+-	kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, KVM_MMU_ROOTS_ALL);
+-	WARN_ON(VALID_PAGE(vcpu->arch.mmu->root_hpa));
++	kvm_mmu_free_roots(vcpu, &vcpu->arch.root_mmu, KVM_MMU_ROOTS_ALL);
++	WARN_ON(VALID_PAGE(vcpu->arch.root_mmu.root_hpa));
++	kvm_mmu_free_roots(vcpu, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
++	WARN_ON(VALID_PAGE(vcpu->arch.guest_mmu.root_hpa));
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_unload);
+ 
+@@ -5404,13 +5409,18 @@ int kvm_mmu_create(struct kvm_vcpu *vcpu)
+ 
+ 	vcpu->arch.mmu = &vcpu->arch.root_mmu;
+ 	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
++
+ 	vcpu->arch.root_mmu.root_hpa = INVALID_PAGE;
+ 	vcpu->arch.root_mmu.translate_gpa = translate_gpa;
+-	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
+-
+ 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+ 		vcpu->arch.root_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
+ 
++	vcpu->arch.guest_mmu.root_hpa = INVALID_PAGE;
++	vcpu->arch.guest_mmu.translate_gpa = translate_gpa;
++	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
++		vcpu->arch.guest_mmu.prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
++
++	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
+ 	return alloc_mmu_pages(vcpu);
+ }
+ 
+* Unmerged path arch/x86/kvm/vmx.c
