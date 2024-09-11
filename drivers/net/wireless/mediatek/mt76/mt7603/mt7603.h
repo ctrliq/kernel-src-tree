@@ -116,7 +116,6 @@ struct mt7603_dev {
 
 	s8 tx_power_limit;
 
-	ktime_t survey_time;
 	ktime_t ed_time;
 	int beacon_int;
 
