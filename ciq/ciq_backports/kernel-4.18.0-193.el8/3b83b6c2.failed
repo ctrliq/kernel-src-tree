@@ -1,0 +1,265 @@
+net/mlx5e: Clear VF config when switching modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Dmytro Linkin <dmitrolin@mellanox.com>
+commit 3b83b6c2e024d85b770ddb1e19a513b5d7587f6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3b83b6c2.failed
+
+Currently VF in LEGACY mode are not able to go up. Also in OFFLOADS
+mode, when switching to it first time, VF can go up independently to
+his representor, which is not expected.
+Perform clearing of VF config when switching modes and set link state
+to AUTO as default value. Also, when switching to OFFLOADS mode set
+link state to DOWN, which allow VF link state to be controlled by its
+REP.
+
+Fixes: 1ab2068a4c66 ("net/mlx5: Implement vports admin state backup/restore")
+Fixes: 556b9d16d3f5 ("net/mlx5: Clear VF's configuration on disabling SRIOV")
+	Signed-off-by: Dmytro Linkin <dmitrolin@mellanox.com>
+	Signed-off-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 3b83b6c2e024d85b770ddb1e19a513b5d7587f6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index fc18b33e9731,3df3604e8929..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1716,6 -1871,69 +1716,72 @@@ static int eswitch_vport_event(struct n
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * mlx5_esw_query_functions - Returns raw output about functions state
++  * @dev:	Pointer to device to query
++  *
++  * mlx5_esw_query_functions() allocates and returns functions changed
++  * raw output memory pointer from device on success. Otherwise returns ERR_PTR.
++  * Caller must free the memory using kvfree() when valid pointer is returned.
++  */
++ const u32 *mlx5_esw_query_functions(struct mlx5_core_dev *dev)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_esw_functions_out);
++ 	u32 in[MLX5_ST_SZ_DW(query_esw_functions_in)] = {};
++ 	u32 *out;
++ 	int err;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	MLX5_SET(query_esw_functions_in, in, opcode,
++ 		 MLX5_CMD_OP_QUERY_ESW_FUNCTIONS);
++ 
++ 	err = mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
++ 	if (!err)
++ 		return out;
++ 
++ 	kvfree(out);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void mlx5_eswitch_event_handlers_register(struct mlx5_eswitch *esw)
++ {
++ 	MLX5_NB_INIT(&esw->nb, eswitch_vport_event, NIC_VPORT_CHANGE);
++ 	mlx5_eq_notifier_register(esw->dev, &esw->nb);
++ 
++ 	if (esw->mode == MLX5_ESWITCH_OFFLOADS && mlx5_eswitch_is_funcs_handler(esw->dev)) {
++ 		MLX5_NB_INIT(&esw->esw_funcs.nb, mlx5_esw_funcs_changed_handler,
++ 			     ESW_FUNCTIONS_CHANGED);
++ 		mlx5_eq_notifier_register(esw->dev, &esw->esw_funcs.nb);
++ 	}
++ }
++ 
++ static void mlx5_eswitch_event_handlers_unregister(struct mlx5_eswitch *esw)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_OFFLOADS && mlx5_eswitch_is_funcs_handler(esw->dev))
++ 		mlx5_eq_notifier_unregister(esw->dev, &esw->esw_funcs.nb);
++ 
++ 	mlx5_eq_notifier_unregister(esw->dev, &esw->nb);
++ 
++ 	flush_workqueue(esw->work_queue);
++ }
++ 
++ static void mlx5_eswitch_clear_vf_vports_info(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_vport *vport;
++ 	int i;
++ 
++ 	mlx5_esw_for_each_vf_vport(esw, i, vport, esw->esw_funcs.num_vfs) {
++ 		memset(&vport->info, 0, sizeof(vport->info));
++ 		vport->info.link_state = MLX5_VPORT_ADMIN_STATE_AUTO;
++ 	}
++ }
++ 
+++>>>>>>> 3b83b6c2e024 (net/mlx5e: Clear VF config when switching modes)
+  /* Public E-Switch API */
+  #define ESW_ALLOWED(esw) ((esw) && MLX5_ESWITCH_MANAGER((esw)->dev))
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index cfa5607ee8ba,3e6412783078..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1176,8 -1377,9 +1176,14 @@@ static int esw_offloads_start(struct ml
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	mlx5_eswitch_disable_sriov(esw);
+ +	err = mlx5_eswitch_enable_sriov(esw, num_vfs, SRIOV_OFFLOADS);
+++=======
++ 	mlx5_eswitch_disable(esw, true);
++ 	mlx5_eswitch_update_num_of_vfs(esw, esw->dev->priv.sriov.num_vfs);
++ 	err = mlx5_eswitch_enable(esw, MLX5_ESWITCH_OFFLOADS);
+++>>>>>>> 3b83b6c2e024 (net/mlx5e: Clear VF config when switching modes)
+  	if (err) {
+  		NL_SET_ERR_MSG_MOD(extack,
+  				   "Failed setting eswitch to offloads");
+@@@ -1599,21 -2148,105 +1605,38 @@@ static void esw_offloads_steering_clean
+  	esw_destroy_vport_rx_group(esw);
+  	esw_destroy_offloads_table(esw);
+  	esw_destroy_offloads_fdb_tables(esw);
+ -	esw_destroy_uplink_offloads_acl_tables(esw);
+ -}
+ -
+ -static void
+ -esw_vfs_changed_event_handler(struct mlx5_eswitch *esw, const u32 *out)
+ -{
+ -	bool host_pf_disabled;
+ -	u16 new_num_vfs;
+ -
+ -	new_num_vfs = MLX5_GET(query_esw_functions_out, out,
+ -			       host_params_context.host_num_of_vfs);
+ -	host_pf_disabled = MLX5_GET(query_esw_functions_out, out,
+ -				    host_params_context.host_pf_disabled);
+ -
+ -	if (new_num_vfs == esw->esw_funcs.num_vfs || host_pf_disabled)
+ -		return;
+ -
+ -	/* Number of VFs can only change from "0 to x" or "x to 0". */
+ -	if (esw->esw_funcs.num_vfs > 0) {
+ -		esw_offloads_unload_vf_reps(esw, esw->esw_funcs.num_vfs);
+ -	} else {
+ -		int err;
+ -
+ -		err = esw_offloads_load_vf_reps(esw, new_num_vfs);
+ -		if (err)
+ -			return;
+ -	}
+ -	esw->esw_funcs.num_vfs = new_num_vfs;
+ +	if (MLX5_CAP_GEN(esw->dev, prio_tag_required))
+ +		esw_prio_tag_acls_cleanup(esw);
+  }
+  
+ -static void esw_functions_changed_event_handler(struct work_struct *work)
+ -{
+ -	struct mlx5_host_work *host_work;
+ -	struct mlx5_eswitch *esw;
+ -	const u32 *out;
+ -
+ -	host_work = container_of(work, struct mlx5_host_work, work);
+ -	esw = host_work->esw;
+ -
+ -	out = mlx5_esw_query_functions(esw->dev);
+ -	if (IS_ERR(out))
+ -		goto out;
+ -
+ -	esw_vfs_changed_event_handler(esw, out);
+ -	kvfree(out);
+ -out:
+ -	kfree(host_work);
+ -}
+ -
+ -int mlx5_esw_funcs_changed_handler(struct notifier_block *nb, unsigned long type, void *data)
+ -{
+ -	struct mlx5_esw_functions *esw_funcs;
+ -	struct mlx5_host_work *host_work;
+ -	struct mlx5_eswitch *esw;
+ -
+ -	host_work = kzalloc(sizeof(*host_work), GFP_ATOMIC);
+ -	if (!host_work)
+ -		return NOTIFY_DONE;
+ -
+ -	esw_funcs = mlx5_nb_cof(nb, struct mlx5_esw_functions, nb);
+ -	esw = container_of(esw_funcs, struct mlx5_eswitch, esw_funcs);
+ -
+ -	host_work->esw = esw;
+ -
+ -	INIT_WORK(&host_work->work, esw_functions_changed_event_handler);
+ -	queue_work(esw->work_queue, &host_work->work);
+ -
+ -	return NOTIFY_OK;
+ -}
+ -
+ -int esw_offloads_enable(struct mlx5_eswitch *esw)
+ +int esw_offloads_init(struct mlx5_eswitch *esw, int nvports)
+  {
+- 	int err;
++ 	struct mlx5_vport *vport;
++ 	int err, i;
+  
+ -	if (MLX5_CAP_ESW_FLOWTABLE_FDB(esw->dev, reformat) &&
+ -	    MLX5_CAP_ESW_FLOWTABLE_FDB(esw->dev, decap))
+ -		esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_BASIC;
+ -	else
+ -		esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_NONE;
+ +	mutex_init(&esw->fdb_table.offloads.fdb_prio_lock);
+  
+ -	mlx5_rdma_enable_roce(esw->dev);
+ -	err = esw_offloads_steering_init(esw);
+ +	err = esw_offloads_steering_init(esw, nvports);
+  	if (err)
+ -		goto err_steering_init;
+ +		return err;
+  
+++<<<<<<< HEAD
+ +	err = esw_offloads_load_reps(esw, nvports);
+++=======
++ 	err = esw_set_passing_vport_metadata(esw, true);
++ 	if (err)
++ 		goto err_vport_metadata;
++ 
++ 	/* Representor will control the vport link state */
++ 	mlx5_esw_for_each_vf_vport(esw, i, vport, esw->esw_funcs.num_vfs)
++ 		vport->info.link_state = MLX5_VPORT_ADMIN_STATE_DOWN;
++ 
++ 	err = mlx5_eswitch_enable_pf_vf_vports(esw, MLX5_VPORT_UC_ADDR_CHANGE);
++ 	if (err)
++ 		goto err_vports;
++ 
++ 	err = esw_offloads_load_all_reps(esw);
+++>>>>>>> 3b83b6c2e024 (net/mlx5e: Clear VF config when switching modes)
+  	if (err)
+  		goto err_reps;
+  
+@@@ -1628,13 -2269,13 +1651,18 @@@ err_reps
+  static int esw_offloads_stop(struct mlx5_eswitch *esw,
+  			     struct netlink_ext_ack *extack)
+  {
+ -	int err, err1;
+ +	int err, err1, num_vfs = esw->dev->priv.sriov.num_vfs;
+  
+++<<<<<<< HEAD
+ +	mlx5_eswitch_disable_sriov(esw);
+ +	err = mlx5_eswitch_enable_sriov(esw, num_vfs, SRIOV_LEGACY);
+++=======
++ 	mlx5_eswitch_disable(esw, true);
++ 	err = mlx5_eswitch_enable(esw, MLX5_ESWITCH_LEGACY);
+++>>>>>>> 3b83b6c2e024 (net/mlx5e: Clear VF config when switching modes)
+  	if (err) {
+  		NL_SET_ERR_MSG_MOD(extack, "Failed setting eswitch to legacy");
+ -		err1 = mlx5_eswitch_enable(esw, MLX5_ESWITCH_OFFLOADS);
+ +		err1 = mlx5_eswitch_enable_sriov(esw, num_vfs, SRIOV_OFFLOADS);
+  		if (err1) {
+  			NL_SET_ERR_MSG_MOD(extack,
+  					   "Failed setting eswitch back to offloads");
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
