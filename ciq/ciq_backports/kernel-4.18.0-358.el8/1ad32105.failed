@@ -1,0 +1,213 @@
+KVM: x86: selftests: test simultaneous uses of V_IRQ from L1 and L0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit 1ad32105d78e4b5da60688eca014bcd45271318f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/1ad32105.failed
+
+Test that if:
+
+* L1 disables virtual interrupt masking, and INTR intercept.
+
+* L1 setups a virtual interrupt to be injected to L2 and enters L2 with
+  interrupts disabled, thus the virtual interrupt is pending.
+
+* Now an external interrupt arrives in L1 and since
+  L1 doesn't intercept it, it should be delivered to L2 when
+  it enables interrupts.
+
+  to do this L0 (abuses) V_IRQ to setup an
+  interrupt window, and returns to L2.
+
+* L2 enables interrupts.
+  This should trigger the interrupt window,
+  injection of the external interrupt and delivery
+  of the virtual interrupt that can now be done.
+
+* Test that now L2 gets those interrupts.
+
+This is the test that demonstrates the issue that was
+fixed in the previous patch.
+
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20210914154825.104886-3-mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1ad32105d78e4b5da60688eca014bcd45271318f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/.gitignore
+diff --cc tools/testing/selftests/kvm/.gitignore
+index 875fd0bd2081,b8dbabe24ac2..000000000000
+--- a/tools/testing/selftests/kvm/.gitignore
++++ b/tools/testing/selftests/kvm/.gitignore
+@@@ -8,9 -23,16 +8,14 @@@
+  /x86_64/set_sregs_test
+  /x86_64/smm_test
+  /x86_64/state_test
+++<<<<<<< HEAD
+++=======
++ /x86_64/svm_vmcall_test
++ /x86_64/svm_int_ctl_test
+++>>>>>>> 1ad32105d78e (KVM: x86: selftests: test simultaneous uses of V_IRQ from L1 and L0)
+  /x86_64/sync_regs_test
+ -/x86_64/tsc_msrs_test
+ -/x86_64/userspace_msr_exit_test
+  /x86_64/vmx_apic_access_test
+  /x86_64/vmx_close_while_nested_test
+ -/x86_64/vmx_dirty_log_test
+ -/x86_64/vmx_preemption_timer_test
+ -/x86_64/vmx_set_nested_state_test
+  /x86_64/vmx_tsc_adjust_test
+  /x86_64/vmx_nested_tsc_scaling_test
+  /x86_64/xapic_ipi_test
+* Unmerged path tools/testing/selftests/kvm/.gitignore
+diff --git a/tools/testing/selftests/kvm/Makefile b/tools/testing/selftests/kvm/Makefile
+index 60c2b820c101..ad1b5e4565dc 100644
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@ -53,6 +53,7 @@ TEST_GEN_PROGS_x86_64 += x86_64/smm_test
+ TEST_GEN_PROGS_x86_64 += x86_64/state_test
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_preemption_timer_test
+ TEST_GEN_PROGS_x86_64 += x86_64/svm_vmcall_test
++TEST_GEN_PROGS_x86_64 += x86_64/svm_int_ctl_test
+ TEST_GEN_PROGS_x86_64 += x86_64/sync_regs_test
+ TEST_GEN_PROGS_x86_64 += x86_64/userspace_msr_exit_test
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_apic_access_test
+diff --git a/tools/testing/selftests/kvm/x86_64/svm_int_ctl_test.c b/tools/testing/selftests/kvm/x86_64/svm_int_ctl_test.c
+new file mode 100644
+index 000000000000..df04f56ce859
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/svm_int_ctl_test.c
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * svm_int_ctl_test
++ *
++ * Copyright (C) 2021, Red Hat, Inc.
++ *
++ * Nested SVM testing: test simultaneous use of V_IRQ from L1 and L0.
++ */
++
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++#include "svm_util.h"
++#include "apic.h"
++
++#define VCPU_ID		0
++
++static struct kvm_vm *vm;
++
++bool vintr_irq_called;
++bool intr_irq_called;
++
++#define VINTR_IRQ_NUMBER 0x20
++#define INTR_IRQ_NUMBER 0x30
++
++static void vintr_irq_handler(struct ex_regs *regs)
++{
++	vintr_irq_called = true;
++}
++
++static void intr_irq_handler(struct ex_regs *regs)
++{
++	x2apic_write_reg(APIC_EOI, 0x00);
++	intr_irq_called = true;
++}
++
++static void l2_guest_code(struct svm_test_data *svm)
++{
++	/* This code raises interrupt INTR_IRQ_NUMBER in the L1's LAPIC,
++	 * and since L1 didn't enable virtual interrupt masking,
++	 * L2 should receive it and not L1.
++	 *
++	 * L2 also has virtual interrupt 'VINTR_IRQ_NUMBER' pending in V_IRQ
++	 * so it should also receive it after the following 'sti'.
++	 */
++	x2apic_write_reg(APIC_ICR,
++		APIC_DEST_SELF | APIC_INT_ASSERT | INTR_IRQ_NUMBER);
++
++	__asm__ __volatile__(
++		"sti\n"
++		"nop\n"
++	);
++
++	GUEST_ASSERT(vintr_irq_called);
++	GUEST_ASSERT(intr_irq_called);
++
++	__asm__ __volatile__(
++		"vmcall\n"
++	);
++}
++
++static void l1_guest_code(struct svm_test_data *svm)
++{
++	#define L2_GUEST_STACK_SIZE 64
++	unsigned long l2_guest_stack[L2_GUEST_STACK_SIZE];
++	struct vmcb *vmcb = svm->vmcb;
++
++	x2apic_enable();
++
++	/* Prepare for L2 execution. */
++	generic_svm_setup(svm, l2_guest_code,
++			  &l2_guest_stack[L2_GUEST_STACK_SIZE]);
++
++	/* No virtual interrupt masking */
++	vmcb->control.int_ctl &= ~V_INTR_MASKING_MASK;
++
++	/* No intercepts for real and virtual interrupts */
++	vmcb->control.intercept &= ~(1ULL << INTERCEPT_INTR | INTERCEPT_VINTR);
++
++	/* Make a virtual interrupt VINTR_IRQ_NUMBER pending */
++	vmcb->control.int_ctl |= V_IRQ_MASK | (0x1 << V_INTR_PRIO_SHIFT);
++	vmcb->control.int_vector = VINTR_IRQ_NUMBER;
++
++	run_guest(vmcb, svm->vmcb_gpa);
++	GUEST_ASSERT(vmcb->control.exit_code == SVM_EXIT_VMMCALL);
++	GUEST_DONE();
++}
++
++int main(int argc, char *argv[])
++{
++	vm_vaddr_t svm_gva;
++
++	nested_svm_check_supported();
++
++	vm = vm_create_default(VCPU_ID, 0, (void *) l1_guest_code);
++
++	vm_init_descriptor_tables(vm);
++	vcpu_init_descriptor_tables(vm, VCPU_ID);
++
++	vm_install_exception_handler(vm, VINTR_IRQ_NUMBER, vintr_irq_handler);
++	vm_install_exception_handler(vm, INTR_IRQ_NUMBER, intr_irq_handler);
++
++	vcpu_alloc_svm(vm, &svm_gva);
++	vcpu_args_set(vm, VCPU_ID, 1, svm_gva);
++
++	struct kvm_run *run = vcpu_state(vm, VCPU_ID);
++	struct ucall uc;
++
++	vcpu_run(vm, VCPU_ID);
++	TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
++		    "Got exit_reason other than KVM_EXIT_IO: %u (%s)\n",
++		    run->exit_reason,
++		    exit_reason_str(run->exit_reason));
++
++	switch (get_ucall(vm, VCPU_ID, &uc)) {
++	case UCALL_ABORT:
++		TEST_FAIL("%s", (const char *)uc.args[0]);
++		break;
++		/* NOT REACHED */
++	case UCALL_DONE:
++		goto done;
++	default:
++		TEST_FAIL("Unknown ucall 0x%lx.", uc.cmd);
++	}
++done:
++	kvm_vm_free(vm);
++	return 0;
++}
