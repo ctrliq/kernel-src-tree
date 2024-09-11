@@ -1,0 +1,229 @@
+KVM: x86: hyper-v: allow KVM_GET_SUPPORTED_HV_CPUID as a system ioctl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit c21d54f0307ff42a346294899107b570b98c47b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c21d54f0.failed
+
+KVM_GET_SUPPORTED_HV_CPUID is a vCPU ioctl but its output is now
+independent from vCPU and in some cases VMMs may want to use it as a system
+ioctl instead. In particular, QEMU doesn CPU feature expansion before any
+vCPU gets created so KVM_GET_SUPPORTED_HV_CPUID can't be used.
+
+Convert KVM_GET_SUPPORTED_HV_CPUID to 'dual' system/vCPU ioctl with the
+same meaning.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20200929150944.1235688-2-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c21d54f0307ff42a346294899107b570b98c47b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index f2c3051a98e4,204afbe1240e..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1030,6 -1045,15 +1030,18 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_S390_PROTECTED 180
+  #define KVM_CAP_PPC_SECURE_GUEST 181
+  #define KVM_CAP_HALT_POLL 182
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ASYNC_PF_INT 183
++ #define KVM_CAP_LAST_CPU 184
++ #define KVM_CAP_SMALLER_MAXPHYADDR 185
++ #define KVM_CAP_S390_DIAG318 186
++ #define KVM_CAP_STEAL_TIME 187
++ #define KVM_CAP_X86_USER_SPACE_MSR 188
++ #define KVM_CAP_X86_MSR_FILTER 189
++ #define KVM_CAP_ENFORCE_PV_FEATURE_CPUID 190
++ #define KVM_CAP_SYS_HYPERV_CPUID 191
+++>>>>>>> c21d54f0307f (KVM: x86: hyper-v: allow KVM_GET_SUPPORTED_HV_CPUID as a system ioctl)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index 9f9939af8c4e..2bc6a6c037fb 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -4455,9 +4455,9 @@ that KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 is present.
+ 4.118 KVM_GET_SUPPORTED_HV_CPUID
+ --------------------------------
+ 
+-:Capability: KVM_CAP_HYPERV_CPUID
++:Capability: KVM_CAP_HYPERV_CPUID (vcpu), KVM_CAP_SYS_HYPERV_CPUID (system)
+ :Architectures: x86
+-:Type: vcpu ioctl
++:Type: system ioctl, vcpu ioctl
+ :Parameters: struct kvm_cpuid2 (in/out)
+ :Returns: 0 on success, -1 on error
+ 
+@@ -4502,9 +4502,6 @@ Currently, the following list of CPUID leaves are returned:
+  - HYPERV_CPUID_SYNDBG_INTERFACE
+  - HYPERV_CPUID_SYNDBG_PLATFORM_CAPABILITIES
+ 
+-HYPERV_CPUID_NESTED_FEATURES leaf is only exposed when Enlightened VMCS was
+-enabled on the corresponding vCPU (KVM_CAP_HYPERV_ENLIGHTENED_VMCS).
+-
+ Userspace invokes KVM_GET_SUPPORTED_HV_CPUID by passing a kvm_cpuid2 structure
+ with the 'nent' field indicating the number of entries in the variable-size
+ array 'entries'.  If the number of entries is too low to describe all Hyper-V
+@@ -4515,6 +4512,15 @@ number of valid entries in the 'entries' array, which is then filled.
+ 'index' and 'flags' fields in 'struct kvm_cpuid_entry2' are currently reserved,
+ userspace should not expect to get any particular value there.
+ 
++Note, vcpu version of KVM_GET_SUPPORTED_HV_CPUID is currently deprecated. Unlike
++system ioctl which exposes all supported feature bits unconditionally, vcpu
++version has the following quirks:
++- HYPERV_CPUID_NESTED_FEATURES leaf and HV_X64_ENLIGHTENED_VMCS_RECOMMENDED
++  feature bit are only exposed when Enlightened VMCS was previously enabled
++  on the corresponding vCPU (KVM_CAP_HYPERV_ENLIGHTENED_VMCS).
++- HV_STIMER_DIRECT_MODE_AVAILABLE bit is only exposed with in-kernel LAPIC.
++  (presumes KVM_CREATE_IRQCHIP has already been called).
++
+ 4.119 KVM_ARM_VCPU_FINALIZE
+ ---------------------------
+ 
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index 738d04ce345a..f82b4e153316 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -1951,8 +1951,8 @@ int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args)
+ 	return kvm_hv_eventfd_assign(kvm, args->conn_id, args->fd);
+ }
+ 
+-int kvm_vcpu_ioctl_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
+-				struct kvm_cpuid_entry2 __user *entries)
++int kvm_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
++		     struct kvm_cpuid_entry2 __user *entries)
+ {
+ 	uint16_t evmcs_ver = 0;
+ 	struct kvm_cpuid_entry2 cpuid_entries[] = {
+@@ -2037,7 +2037,7 @@ int kvm_vcpu_ioctl_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
+ 			 * Direct Synthetic timers only make sense with in-kernel
+ 			 * LAPIC
+ 			 */
+-			if (lapic_in_kernel(vcpu))
++			if (!vcpu || lapic_in_kernel(vcpu))
+ 				ent->edx |= HV_STIMER_DIRECT_MODE_AVAILABLE;
+ 
+ 			break;
+diff --git a/arch/x86/kvm/hyperv.h b/arch/x86/kvm/hyperv.h
+index e68c6c2e9649..6d7def2b0aad 100644
+--- a/arch/x86/kvm/hyperv.h
++++ b/arch/x86/kvm/hyperv.h
+@@ -126,7 +126,7 @@ void kvm_hv_setup_tsc_page(struct kvm *kvm,
+ void kvm_hv_init_vm(struct kvm *kvm);
+ void kvm_hv_destroy_vm(struct kvm *kvm);
+ int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args);
+-int kvm_vcpu_ioctl_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
+-				struct kvm_cpuid_entry2 __user *entries);
++int kvm_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
++		     struct kvm_cpuid_entry2 __user *entries);
+ 
+ #endif
+diff --git a/arch/x86/kvm/vmx/evmcs.c b/arch/x86/kvm/vmx/evmcs.c
+index f3199bb02f22..41f24661af04 100644
+--- a/arch/x86/kvm/vmx/evmcs.c
++++ b/arch/x86/kvm/vmx/evmcs.c
+@@ -326,7 +326,6 @@ bool nested_enlightened_vmentry(struct kvm_vcpu *vcpu, u64 *evmcs_gpa)
+ 
+ uint16_t nested_get_evmcs_version(struct kvm_vcpu *vcpu)
+ {
+-	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	/*
+ 	 * vmcs_version represents the range of supported Enlightened VMCS
+ 	 * versions: lower 8 bits is the minimal version, higher 8 bits is the
+@@ -334,7 +333,7 @@ uint16_t nested_get_evmcs_version(struct kvm_vcpu *vcpu)
+ 	 * KVM_EVMCS_VERSION.
+ 	 */
+ 	if (kvm_cpu_cap_get(X86_FEATURE_VMX) &&
+-	    vmx->nested.enlightened_vmcs_enabled)
++	    (!vcpu || to_vmx(vcpu)->nested.enlightened_vmcs_enabled))
+ 		return (KVM_EVMCS_VERSION << 8) | 1;
+ 
+ 	return 0;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 7e227ac0ce01..8e83cf73454a 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3428,6 +3428,27 @@ static inline bool kvm_can_mwait_in_guest(void)
+ 		boot_cpu_has(X86_FEATURE_ARAT);
+ }
+ 
++static int kvm_ioctl_get_supported_hv_cpuid(struct kvm_vcpu *vcpu,
++					    struct kvm_cpuid2 __user *cpuid_arg)
++{
++	struct kvm_cpuid2 cpuid;
++	int r;
++
++	r = -EFAULT;
++	if (copy_from_user(&cpuid, cpuid_arg, sizeof(cpuid)))
++		return r;
++
++	r = kvm_get_hv_cpuid(vcpu, &cpuid, cpuid_arg->entries);
++	if (r)
++		return r;
++
++	r = -EFAULT;
++	if (copy_to_user(cpuid_arg, &cpuid, sizeof(cpuid)))
++		return r;
++
++	return 0;
++}
++
+ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ {
+ 	int r = 0;
+@@ -3464,6 +3485,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_HYPERV_TLBFLUSH:
+ 	case KVM_CAP_HYPERV_SEND_IPI:
+ 	case KVM_CAP_HYPERV_CPUID:
++	case KVM_CAP_SYS_HYPERV_CPUID:
+ 	case KVM_CAP_PCI_SEGMENT:
+ 	case KVM_CAP_DEBUGREGS:
+ 	case KVM_CAP_X86_ROBUST_SINGLESTEP:
+@@ -3638,6 +3660,9 @@ long kvm_arch_dev_ioctl(struct file *filp,
+ 	case KVM_GET_MSRS:
+ 		r = msr_io(NULL, argp, do_get_msr_feature, 1);
+ 		break;
++	case KVM_GET_SUPPORTED_HV_CPUID:
++		r = kvm_ioctl_get_supported_hv_cpuid(NULL, argp);
++		break;
+ 	default:
+ 		r = -EINVAL;
+ 		break;
+@@ -4707,25 +4732,9 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 		srcu_read_unlock(&vcpu->kvm->srcu, idx);
+ 		break;
+ 	}
+-	case KVM_GET_SUPPORTED_HV_CPUID: {
+-		struct kvm_cpuid2 __user *cpuid_arg = argp;
+-		struct kvm_cpuid2 cpuid;
+-
+-		r = -EFAULT;
+-		if (copy_from_user(&cpuid, cpuid_arg, sizeof(cpuid)))
+-			goto out;
+-
+-		r = kvm_vcpu_ioctl_get_hv_cpuid(vcpu, &cpuid,
+-						cpuid_arg->entries);
+-		if (r)
+-			goto out;
+-
+-		r = -EFAULT;
+-		if (copy_to_user(cpuid_arg, &cpuid, sizeof(cpuid)))
+-			goto out;
+-		r = 0;
++	case KVM_GET_SUPPORTED_HV_CPUID:
++		r = kvm_ioctl_get_supported_hv_cpuid(vcpu, argp);
+ 		break;
+-	}
+ 	default:
+ 		r = -EINVAL;
+ 	}
+* Unmerged path include/uapi/linux/kvm.h
