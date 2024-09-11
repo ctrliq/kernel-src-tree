@@ -1,0 +1,87 @@
+virtio_net: bulk free tx skbs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit df133f3f96257ee29696c0ed8bd198ec801dc810
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/df133f3f.failed
+
+Use napi_consume_skb() to get bulk free.  Note that napi_consume_skb is
+safe to call in a non-napi context as long as the napi_budget flag is
+correct.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df133f3f96257ee29696c0ed8bd198ec801dc810)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index 20814dd573ad,8fadd8eaf601..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -1361,28 -1330,20 +1361,33 @@@ static int virtnet_receive(struct recei
+  	return stats.packets;
+  }
+  
+- static void free_old_xmit_skbs(struct send_queue *sq)
++ static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
+  {
+ -	struct sk_buff *skb;
+  	unsigned int len;
+  	unsigned int packets = 0;
+  	unsigned int bytes = 0;
+ +	void *ptr;
+ +
+ +	while ((ptr = virtqueue_get_buf(sq->vq, &len)) != NULL) {
+ +		if (likely(!is_xdp_frame(ptr))) {
+ +			struct sk_buff *skb = ptr;
+  
+ -	while ((skb = virtqueue_get_buf(sq->vq, &len)) != NULL) {
+ -		pr_debug("Sent skb %p\n", skb);
+ +			pr_debug("Sent skb %p\n", skb);
+  
+ -		bytes += skb->len;
+ +			bytes += skb->len;
+ +			dev_consume_skb_any(skb);
+ +		} else {
+ +			struct xdp_frame *frame = ptr_to_xdp(ptr);
+ +
+ +			bytes += frame->len;
+ +			xdp_return_frame(frame);
+ +		}
+  		packets++;
+++<<<<<<< HEAD
+++=======
++ 
++ 		napi_consume_skb(skb, in_napi);
+++>>>>>>> df133f3f9625 (virtio_net: bulk free tx skbs)
+  	}
+  
+  	/* Avoid overhead when no packets have been processed
+@@@ -1491,18 -1442,10 +1496,18 @@@ static int virtnet_poll_tx(struct napi_
+  {
+  	struct send_queue *sq = container_of(napi, struct send_queue, napi);
+  	struct virtnet_info *vi = sq->vq->vdev->priv;
+ -	struct netdev_queue *txq = netdev_get_tx_queue(vi->dev, vq2txq(sq->vq));
+ +	unsigned int index = vq2txq(sq->vq);
+ +	struct netdev_queue *txq;
+ +
+ +	if (unlikely(is_xdp_raw_buffer_queue(vi, index))) {
+ +		/* We don't need to enable cb for XDP */
+ +		napi_complete_done(napi, 0);
+ +		return 0;
+ +	}
+  
+ +	txq = netdev_get_tx_queue(vi->dev, index);
+  	__netif_tx_lock(txq, raw_smp_processor_id());
+- 	free_old_xmit_skbs(sq);
++ 	free_old_xmit_skbs(sq, true);
+  	__netif_tx_unlock(txq);
+  
+  	virtqueue_napi_complete(napi, sq->vq, 0);
+* Unmerged path drivers/net/virtio_net.c
