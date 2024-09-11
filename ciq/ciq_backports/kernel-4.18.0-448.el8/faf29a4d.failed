@@ -1,0 +1,221 @@
+s390/pci: introduce zpci_bus_scan_device()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit faf29a4d93a98b4ccd8a10297353a9d0779d231f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/faf29a4d.failed
+
+To match zpci_bus_scan_device() and the PCI common code terminology and
+to remove some code duplication, we pull the multiple uses of
+pci_scan_single_device() into a function. For now this has the side
+effect of adding each device to the PCI bus separately and locking and
+unlocking the rescan/remove lock for each instead of just once per bus.
+This is clearly less efficient but provides a correct intermediate
+behavior until a follow on change does both the adding and scanning only
+once per bus.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Acked-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit faf29a4d93a98b4ccd8a10297353a9d0779d231f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_bus.c
+#	arch/s390/pci/pci_bus.h
+diff --cc arch/s390/pci/pci.c
+index 6af47e2fa8a9,0bce6078bfd6..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -746,33 -731,66 +746,90 @@@ int zpci_create_device(struct zpci_dev 
+  	list_add_tail(&zdev->entry, &zpci_list);
+  	spin_unlock(&zpci_list_lock);
+  
+++<<<<<<< HEAD
+ +	rc = zpci_init_iommu(zdev);
+++=======
++ 	return 0;
++ 
++ error_disable:
++ 	if (zdev_enabled(zdev))
++ 		zpci_disable_device(zdev);
++ error_destroy_iommu:
++ 	zpci_destroy_iommu(zdev);
++ error:
++ 	zpci_dbg(0, "add fid:%x, rc:%d\n", fid, rc);
++ 	kfree(zdev);
++ 	return rc;
++ }
++ 
++ /**
++  * zpci_configure_device() - Configure a zpci_dev
++  * @zdev: The zpci_dev to be configured
++  * @fh: The general function handle supplied by the platform
++  *
++  * Configuring a device includes the configuration itself, if not done by the
++  * platform, enabling, scanning and adding it to the common code PCI subsystem.
++  * If any failure occurs, the zpci_dev is left in Standby.
++  *
++  * Return: 0 on success, or an error code otherwise
++  */
++ int zpci_configure_device(struct zpci_dev *zdev, u32 fh)
++ {
++ 	int rc;
++ 
++ 	zdev->fh = fh;
++ 	if (zdev->state != ZPCI_FN_STATE_CONFIGURED) {
++ 		rc = sclp_pci_configure(zdev->fid);
++ 		zpci_dbg(3, "conf fid:%x, rc:%d\n", zdev->fid, rc);
++ 		if (rc)
++ 			return rc;
++ 		zdev->state = ZPCI_FN_STATE_CONFIGURED;
++ 	}
++ 
++ 	rc = zpci_enable_device(zdev);
+++>>>>>>> faf29a4d93a9 (s390/pci: introduce zpci_bus_scan_device())
+  	if (rc)
+ -		goto error;
+ +		goto out;
+  
+++<<<<<<< HEAD
+ +	mutex_init(&zdev->lock);
+++=======
++ 	/* the PCI function will be scanned once function 0 appears */
++ 	if (!zdev->zbus->bus)
++ 		return 0;
++ 
++ 	rc = zpci_bus_scan_device(zdev);
++ 	if (rc)
++ 		goto error_disable;
++ 
++ 	return 0;
++ 
++ error_disable:
++ 	zpci_disable_device(zdev);
++ error:
+++>>>>>>> faf29a4d93a9 (s390/pci: introduce zpci_bus_scan_device())
+  	if (zdev->state == ZPCI_FN_STATE_CONFIGURED) {
+ -		rc = sclp_pci_deconfigure(zdev->fid);
+ -		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, rc);
+ -		if (!rc)
+ -			zdev->state = ZPCI_FN_STATE_STANDBY;
+ +		rc = zpci_enable_device(zdev);
+ +		if (rc)
+ +			goto out_destroy_iommu;
+  	}
+ +
+ +	rc = zpci_bus_device_register(zdev, &pci_root_ops);
+ +	if (rc)
+ +		goto out_disable;
+ +
+ +	return 0;
+ +
+ +out_disable:
+ +	if (zdev->state == ZPCI_FN_STATE_ONLINE)
+ +		zpci_disable_device(zdev);
+ +
+ +out_destroy_iommu:
+ +	zpci_destroy_iommu(zdev);
+ +out:
+ +	spin_lock(&zpci_list_lock);
+ +	list_del(&zdev->entry);
+ +	spin_unlock(&zpci_list_lock);
+  	return rc;
+  }
+  
+diff --cc arch/s390/pci/pci_bus.c
+index c93486a9989b,7b37c4316e35..000000000000
+--- a/arch/s390/pci/pci_bus.c
++++ b/arch/s390/pci/pci_bus.c
+@@@ -29,6 -30,62 +29,65 @@@ static LIST_HEAD(zbus_list)
+  static DEFINE_SPINLOCK(zbus_list_lock);
+  static int zpci_nb_devices;
+  
+++<<<<<<< HEAD
+++=======
++ /* zpci_bus_scan_device - Scan a single device adding it to the PCI core
++  * @zdev: the zdev to be scanned
++  *
++  * Scans the PCI function making it available to the common PCI code.
++  *
++  * Return: 0 on success, an error value otherwise
++  */
++ int zpci_bus_scan_device(struct zpci_dev *zdev)
++ {
++ 	struct pci_dev *pdev;
++ 
++ 	pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
++ 	if (!pdev)
++ 		return -ENODEV;
++ 
++ 	pci_bus_add_device(pdev);
++ 	pci_lock_rescan_remove();
++ 	pci_bus_add_devices(zdev->zbus->bus);
++ 	pci_unlock_rescan_remove();
++ 
++ 	return 0;
++ }
++ 
++ /* zpci_bus_remove_device - Removes the given zdev from the PCI core
++  * @zdev: the zdev to be removed from the PCI core
++  * @set_error: if true the device's error state is set to permanent failure
++  *
++  * Sets a zPCI device to a configured but offline state; the zPCI
++  * device is still accessible through its hotplug slot and the zPCI
++  * API but is removed from the common code PCI bus, making it
++  * no longer available to drivers.
++  */
++ void zpci_bus_remove_device(struct zpci_dev *zdev, bool set_error)
++ {
++ 	struct zpci_bus *zbus = zdev->zbus;
++ 	struct pci_dev *pdev;
++ 
++ 	if (!zdev->zbus->bus)
++ 		return;
++ 
++ 	pdev = pci_get_slot(zbus->bus, zdev->devfn);
++ 	if (pdev) {
++ 		if (set_error)
++ 			pdev->error_state = pci_channel_io_perm_failure;
++ 		if (pdev->is_virtfn) {
++ 			zpci_iov_remove_virtfn(pdev, zdev->vfn);
++ 			/* balance pci_get_slot */
++ 			pci_dev_put(pdev);
++ 			return;
++ 		}
++ 		pci_stop_and_remove_bus_device_locked(pdev);
++ 		/* balance pci_get_slot */
++ 		pci_dev_put(pdev);
++ 	}
++ }
++ 
+++>>>>>>> faf29a4d93a9 (s390/pci: introduce zpci_bus_scan_device())
+  /* zpci_bus_scan
+   * @zbus: the zbus holding the zdevices
+   * @ops: the pci operations
+diff --cc arch/s390/pci/pci_bus.h
+index 8808ff0835b8,2649238f6cde..000000000000
+--- a/arch/s390/pci/pci_bus.h
++++ b/arch/s390/pci/pci_bus.h
+@@@ -9,7 -9,9 +9,13 @@@
+  
+  int zpci_bus_device_register(struct zpci_dev *zdev, struct pci_ops *ops);
+  void zpci_bus_device_unregister(struct zpci_dev *zdev);
+++<<<<<<< HEAD
+ +int zpci_bus_init(void);
+++=======
++ 
++ int zpci_bus_scan_device(struct zpci_dev *zdev);
++ void zpci_bus_remove_device(struct zpci_dev *zdev, bool set_error);
+++>>>>>>> faf29a4d93a9 (s390/pci: introduce zpci_bus_scan_device())
+  
+  void zpci_release_device(struct kref *kref);
+  static inline void zpci_zdev_put(struct zpci_dev *zdev)
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path arch/s390/pci/pci_bus.c
+* Unmerged path arch/s390/pci/pci_bus.h
