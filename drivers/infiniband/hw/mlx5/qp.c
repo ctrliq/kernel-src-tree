@@ -3326,7 +3326,7 @@ static int modify_raw_packet_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 	switch (raw_qp_param->operation) {
 	case MLX5_CMD_OP_RST2INIT_QP:
 		rq_state = MLX5_RQC_STATE_RDY;
-		sq_state = MLX5_SQC_STATE_RDY;
+		sq_state = MLX5_SQC_STATE_RST;
 		break;
 	case MLX5_CMD_OP_2ERR_QP:
 		rq_state = MLX5_RQC_STATE_ERR;
@@ -3338,13 +3338,11 @@ static int modify_raw_packet_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 		break;
 	case MLX5_CMD_OP_RTR2RTS_QP:
 	case MLX5_CMD_OP_RTS2RTS_QP:
-		if (raw_qp_param->set_mask ==
-		    MLX5_RAW_QP_RATE_LIMIT) {
-			modify_rq = 0;
-			sq_state = sq->state;
-		} else {
-			return raw_qp_param->set_mask ? -EINVAL : 0;
-		}
+		if (raw_qp_param->set_mask & ~MLX5_RAW_QP_RATE_LIMIT)
+			return -EINVAL;
+
+		modify_rq = 0;
+		sq_state = MLX5_SQC_STATE_RDY;
 		break;
 	case MLX5_CMD_OP_INIT2INIT_QP:
 	case MLX5_CMD_OP_INIT2RTR_QP:
@@ -5657,7 +5655,7 @@ static int sqrq_state_to_qp_state(u8 sq_state, u8 rq_state,
 			[MLX5_SQ_STATE_NA]	= IB_QPS_RESET,
 		},
 		[MLX5_RQC_STATE_RDY] = {
-			[MLX5_SQC_STATE_RST]	= MLX5_QP_STATE_BAD,
+			[MLX5_SQC_STATE_RST]	= MLX5_QP_STATE,
 			[MLX5_SQC_STATE_RDY]	= MLX5_QP_STATE,
 			[MLX5_SQC_STATE_ERR]	= IB_QPS_SQE,
 			[MLX5_SQ_STATE_NA]	= MLX5_QP_STATE,
@@ -5669,7 +5667,7 @@ static int sqrq_state_to_qp_state(u8 sq_state, u8 rq_state,
 			[MLX5_SQ_STATE_NA]	= IB_QPS_ERR,
 		},
 		[MLX5_RQ_STATE_NA] = {
-			[MLX5_SQC_STATE_RST]    = IB_QPS_RESET,
+			[MLX5_SQC_STATE_RST]    = MLX5_QP_STATE,
 			[MLX5_SQC_STATE_RDY]	= MLX5_QP_STATE,
 			[MLX5_SQC_STATE_ERR]	= MLX5_QP_STATE,
 			[MLX5_SQ_STATE_NA]	= MLX5_QP_STATE_BAD,
