@@ -1,0 +1,215 @@
+bpf: x64: Do not emit sub/add 0, %rsp when !stack_depth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+Rebuild_CHGLOG: - bpf: x64: Do not emit sub/add 0, rsp when !stack_depth (Yauheni Kaliuta) [1874006]
+Rebuild_FUZZ: 99.08%
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 4d0b8c0b46a5e6f23ab8301780d689072c6c91fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/4d0b8c0b.failed
+
+There is no particular reason for keeping the "sub 0, %rsp" insn within
+the BPF's x64 JIT prologue.
+
+When tail call code was skipping the whole prologue section these 7
+bytes that represent the rsp subtraction could not be simply discarded
+as the jump target address would be broken. An option to address that
+would be to substitute it with nop7.
+
+Right now tail call is skipping only first 11 bytes of target program's
+prologue and "sub X, %rsp" is the first insn that is processed, so if
+stack depth is zero then this insn could be omitted without the need for
+nop7 swap.
+
+Therefore, do not emit the "sub 0, %rsp" in prologue when program is not
+making use of R10 register. Also, make the emission of "add X, %rsp"
+conditional in tail call code logic and take into account the presence
+of mentioned insn when calculating the jump offsets.
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200929204653.4325-3-maciej.fijalkowski@intel.com
+(cherry picked from commit 4d0b8c0b46a5e6f23ab8301780d689072c6c91fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/net/bpf_jit_comp.c
+diff --cc arch/x86/net/bpf_jit_comp.c
+index 5a752b07597f,796506dcfc42..000000000000
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@@ -245,16 -275,16 +245,23 @@@ static void emit_prologue(u8 **pprog, u
+  	EMIT1(0x55);             /* push rbp */
+  	EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
+  	/* sub rsp, rounded_stack_depth */
+++<<<<<<< HEAD
+ +	EMIT3_off32(0x48, 0x81, 0xEC, round_up(stack_depth, 8));
+ +	EMIT1(0x53);             /* push rbx */
+ +	EMIT2(0x41, 0x55);       /* push r13 */
+ +	EMIT2(0x41, 0x56);       /* push r14 */
+ +	EMIT2(0x41, 0x57);       /* push r15 */
+ +	if (!ebpf_from_cbpf) {
+ +		/* zero init tail_call_cnt */
+ +		EMIT2(0x6a, 0x00);
+ +		BUILD_BUG_ON(cnt != PROLOGUE_SIZE);
+ +	}
+++=======
++ 	if (stack_depth)
++ 		EMIT3_off32(0x48, 0x81, 0xEC, round_up(stack_depth, 8));
++ 	if (tail_call_reachable)
++ 		EMIT1(0x50);         /* push rax */
+++>>>>>>> 4d0b8c0b46a5 (bpf: x64: Do not emit sub/add 0, %rsp when !stack_depth)
+  	*pprog = prog;
+  }
+  
+@@@ -355,12 -402,32 +362,36 @@@ int bpf_arch_text_poke(void *ip, enum b
+   *   goto *(prog->bpf_func + prologue_size);
+   * out:
+   */
+ -static void emit_bpf_tail_call_indirect(u8 **pprog, bool *callee_regs_used,
+ -					u32 stack_depth)
+ +static void emit_bpf_tail_call_indirect(u8 **pprog)
+  {
+ -	int tcc_off = -4 - round_up(stack_depth, 8);
+  	u8 *prog = *pprog;
+++<<<<<<< HEAD
+ +	int label1, label2, label3;
+ +	int cnt = 0;
+ +
+++=======
++ 	int pop_bytes = 0;
++ 	int off1 = 42;
++ 	int off2 = 31;
++ 	int off3 = 9;
++ 	int cnt = 0;
++ 
++ 	/* count the additional bytes used for popping callee regs from stack
++ 	 * that need to be taken into account for each of the offsets that
++ 	 * are used for bailing out of the tail call
++ 	 */
++ 	pop_bytes = get_pop_bytes(callee_regs_used);
++ 	off1 += pop_bytes;
++ 	off2 += pop_bytes;
++ 	off3 += pop_bytes;
++ 
++ 	if (stack_depth) {
++ 		off1 += 7;
++ 		off2 += 7;
++ 		off3 += 7;
++ 	}
++ 
+++>>>>>>> 4d0b8c0b46a5 (bpf: x64: Do not emit sub/add 0, %rsp when !stack_depth)
+  	/*
+  	 * rdi - pointer to ctx
+  	 * rsi - pointer to bpf_array
+@@@ -398,16 -463,24 +429,29 @@@
+  	 * if (prog == NULL)
+  	 *	goto out;
+  	 */
+ -	EMIT3(0x48, 0x85, 0xC9);                  /* test rcx,rcx */
+ -#define OFFSET3 (off3 + RETPOLINE_RCX_BPF_JIT_SIZE)
+ +	EMIT3(0x48, 0x85, 0xC9);		  /* test rcx,rcx */
+ +#define OFFSET3 (8 + RETPOLINE_RCX_BPF_JIT_SIZE)
+  	EMIT2(X86_JE, OFFSET3);                   /* je out */
+ +	label3 = cnt;
+  
+++<<<<<<< HEAD
+ +	/* goto *(prog->bpf_func + prologue_size); */
+++=======
++ 	*pprog = prog;
++ 	pop_callee_regs(pprog, callee_regs_used);
++ 	prog = *pprog;
++ 
++ 	EMIT1(0x58);                              /* pop rax */
++ 	if (stack_depth)
++ 		EMIT3_off32(0x48, 0x81, 0xC4,     /* add rsp, sd */
++ 			    round_up(stack_depth, 8));
++ 
++ 	/* goto *(prog->bpf_func + X86_TAIL_CALL_OFFSET); */
+++>>>>>>> 4d0b8c0b46a5 (bpf: x64: Do not emit sub/add 0, %rsp when !stack_depth)
+  	EMIT4(0x48, 0x8B, 0x49,                   /* mov rcx, qword ptr [rcx + 32] */
+  	      offsetof(struct bpf_prog, bpf_func));
+ -	EMIT4(0x48, 0x83, 0xC1,                   /* add rcx, X86_TAIL_CALL_OFFSET */
+ -	      X86_TAIL_CALL_OFFSET);
+ +	EMIT4(0x48, 0x83, 0xC1, PROLOGUE_SIZE);   /* add rcx, prologue_size */
+ +
+  	/*
+  	 * Now we're ready to jump into next BPF program
+  	 * rdi == ctx (1st arg)
+@@@ -423,23 -493,60 +467,65 @@@
+  }
+  
+  static void emit_bpf_tail_call_direct(struct bpf_jit_poke_descriptor *poke,
+ -				      u8 **pprog, int addr, u8 *image,
+ -				      bool *callee_regs_used, u32 stack_depth)
+ +				      u8 **pprog, int addr, u8 *image)
+  {
+ -	int tcc_off = -4 - round_up(stack_depth, 8);
+  	u8 *prog = *pprog;
+++<<<<<<< HEAD
+++	int cnt = 0;
+++
+++=======
++ 	int pop_bytes = 0;
++ 	int off1 = 20;
++ 	int poke_off;
+  	int cnt = 0;
+  
++ 	/* count the additional bytes used for popping callee regs to stack
++ 	 * that need to be taken into account for jump offset that is used for
++ 	 * bailing out from of the tail call when limit is reached
++ 	 */
++ 	pop_bytes = get_pop_bytes(callee_regs_used);
++ 	off1 += pop_bytes;
++ 
++ 	/*
++ 	 * total bytes for:
++ 	 * - nop5/ jmpq $off
++ 	 * - pop callee regs
++ 	 * - sub rsp, $val if depth > 0
++ 	 * - pop rax
++ 	 */
++ 	poke_off = X86_PATCH_SIZE + pop_bytes + 1;
++ 	if (stack_depth) {
++ 		poke_off += 7;
++ 		off1 += 7;
++ 	}
++ 
+++>>>>>>> 4d0b8c0b46a5 (bpf: x64: Do not emit sub/add 0, %rsp when !stack_depth)
+  	/*
+  	 * if (tail_call_cnt > MAX_TAIL_CALL_CNT)
+  	 *	goto out;
+  	 */
+ -	EMIT2_off32(0x8B, 0x85, tcc_off);             /* mov eax, dword ptr [rbp - tcc_off] */
+ +	EMIT2_off32(0x8B, 0x85, -36 - MAX_BPF_STACK); /* mov eax, dword ptr [rbp - 548] */
+  	EMIT3(0x83, 0xF8, MAX_TAIL_CALL_CNT);         /* cmp eax, MAX_TAIL_CALL_CNT */
+ -	EMIT2(X86_JA, off1);                          /* ja out */
+ +	EMIT2(X86_JA, 14);                            /* ja out */
+  	EMIT3(0x83, 0xC0, 0x01);                      /* add eax, 1 */
+ -	EMIT2_off32(0x89, 0x85, tcc_off);             /* mov dword ptr [rbp - tcc_off], eax */
+ +	EMIT2_off32(0x89, 0x85, -36 - MAX_BPF_STACK); /* mov dword ptr [rbp -548], eax */
+  
+ -	poke->tailcall_bypass = image + (addr - poke_off - X86_PATCH_SIZE);
+ -	poke->adj_off = X86_TAIL_CALL_OFFSET;
+  	poke->tailcall_target = image + (addr - X86_PATCH_SIZE);
+++<<<<<<< HEAD
+ +	poke->adj_off = PROLOGUE_SIZE;
+++=======
++ 	poke->bypass_addr = (u8 *)poke->tailcall_target + X86_PATCH_SIZE;
++ 
++ 	emit_jump(&prog, (u8 *)poke->tailcall_target + X86_PATCH_SIZE,
++ 		  poke->tailcall_bypass);
++ 
++ 	*pprog = prog;
++ 	pop_callee_regs(pprog, callee_regs_used);
++ 	prog = *pprog;
++ 	EMIT1(0x58);                                  /* pop rax */
++ 	if (stack_depth)
++ 		EMIT3_off32(0x48, 0x81, 0xC4, round_up(stack_depth, 8));
+++>>>>>>> 4d0b8c0b46a5 (bpf: x64: Do not emit sub/add 0, %rsp when !stack_depth)
+  
+  	memcpy(prog, ideal_nops[NOP_ATOMIC5], X86_PATCH_SIZE);
+  	prog += X86_PATCH_SIZE;
+* Unmerged path arch/x86/net/bpf_jit_comp.c
