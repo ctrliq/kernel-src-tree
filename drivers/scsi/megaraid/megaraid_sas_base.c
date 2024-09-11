@@ -114,15 +114,6 @@ unsigned int enable_sdev_max_qd;
 module_param(enable_sdev_max_qd, int, 0444);
 MODULE_PARM_DESC(enable_sdev_max_qd, "Enable sdev max qd as can_queue. Default: 0");
 
-int poll_queues;
-module_param(poll_queues, int, 0444);
-MODULE_PARM_DESC(poll_queues, "Number of queues to be use for io_uring poll mode.\n\t\t"
-		"This parameter is effective only if host_tagset_enable=1 &\n\t\t"
-		"It is not applicable for MFI_SERIES. &\n\t\t"
-		"Driver will work in latency mode. &\n\t\t"
-		"High iops queues are not allocated &\n\t\t"
-		);
-
 int host_tagset_enable = 1;
 module_param(host_tagset_enable, int, 0444);
 MODULE_PARM_DESC(host_tagset_enable, "Shared host tagset enable/disable Default: enable(1)");
@@ -220,7 +211,6 @@ static bool support_pci_lane_margining;
 static DEFINE_SPINLOCK(poll_aen_lock);
 
 extern struct dentry *megasas_debugfs_root;
-extern int megasas_blk_mq_poll(struct Scsi_Host *shost, unsigned int queue_num);
 
 void
 megasas_complete_cmd(struct megasas_instance *instance, struct megasas_cmd *cmd,
@@ -3173,37 +3163,14 @@ megasas_bios_param(struct scsi_device *sdev, struct block_device *bdev,
 static int megasas_map_queues(struct Scsi_Host *shost)
 {
 	struct megasas_instance *instance;
-	int qoff = 0, offset;
-	struct blk_mq_queue_map *map;
 
 	instance = (struct megasas_instance *)shost->hostdata;
 
 	if (shost->nr_hw_queues == 1)
 		return 0;
 
-	offset = instance->low_latency_index_start;
-
-	/* Setup Default hctx */
-	map = &shost->tag_set.map[HCTX_TYPE_DEFAULT];
-	map->nr_queues = instance->msix_vectors - offset;
-	map->queue_offset = 0;
-	blk_mq_pci_map_queues(map, instance->pdev, offset);
-	qoff += map->nr_queues;
-	offset += map->nr_queues;
-
-	/* Setup Poll hctx */
-	map = &shost->tag_set.map[HCTX_TYPE_POLL];
-	map->nr_queues = instance->iopoll_q_count;
-	if (map->nr_queues) {
-		/*
-		 * The poll queue(s) doesn't have an IRQ (and hence IRQ
-		 * affinity), so use the regular blk-mq cpu mapping
-		 */
-		map->queue_offset = qoff;
-		blk_mq_map_queues(map);
-	}
-
-	return 0;
+	return blk_mq_pci_map_queues(&shost->tag_set.map[HCTX_TYPE_DEFAULT],
+			instance->pdev, instance->low_latency_index_start);
 }
 
 static void megasas_aen_polling(struct work_struct *work);
@@ -3516,7 +3483,6 @@ static struct scsi_host_template megasas_template = {
 	.bios_param = megasas_bios_param,
 	.use_clustering = ENABLE_CLUSTERING,
 	.map_queues = megasas_map_queues,
-	.mq_poll = megasas_blk_mq_poll,
 	.change_queue_depth = scsi_change_queue_depth,
 };
 
@@ -5925,16 +5891,13 @@ __megasas_alloc_irq_vectors(struct megasas_instance *instance)
 	irq_flags = PCI_IRQ_MSIX;
 
 	if (instance->smp_affinity_enable)
-		irq_flags |= PCI_IRQ_AFFINITY | PCI_IRQ_ALL_TYPES;
+		irq_flags |= PCI_IRQ_AFFINITY;
 	else
 		descp = NULL;
 
-	/* Do not allocate msix vectors for poll_queues.
-	 * msix_vectors is always within a range of FW supported reply queue.
-	 */
 	i = pci_alloc_irq_vectors_affinity(instance->pdev,
 		instance->low_latency_index_start,
-		instance->msix_vectors - instance->iopoll_q_count, irq_flags, descp);
+		instance->msix_vectors, irq_flags, descp);
 
 	return i;
 }
@@ -5950,30 +5913,10 @@ megasas_alloc_irq_vectors(struct megasas_instance *instance)
 	int i;
 	unsigned int num_msix_req;
 
-	instance->iopoll_q_count = 0;
-	if ((instance->adapter_type != MFI_SERIES) &&
-		poll_queues) {
-
-		instance->perf_mode = MR_LATENCY_PERF_MODE;
-		instance->low_latency_index_start = 1;
-
-		/* reserve for default and non-mananged pre-vector. */
-		if (instance->msix_vectors > (poll_queues + 2))
-			instance->iopoll_q_count = poll_queues;
-		else
-			instance->iopoll_q_count = 0;
-
-		num_msix_req = num_online_cpus() + instance->low_latency_index_start;
-		instance->msix_vectors = min(num_msix_req,
-				instance->msix_vectors);
-
-	}
-
 	i = __megasas_alloc_irq_vectors(instance);
 
-	if (((instance->perf_mode == MR_BALANCED_PERF_MODE)
-		|| instance->iopoll_q_count) &&
-	    (i != (instance->msix_vectors - instance->iopoll_q_count))) {
+	if ((instance->perf_mode == MR_BALANCED_PERF_MODE) &&
+	    (i != instance->msix_vectors)) {
 		if (instance->msix_vectors)
 			pci_free_irq_vectors(instance->pdev);
 		/* Disable Balanced IOPS mode and try realloc vectors */
@@ -5984,15 +5927,12 @@ megasas_alloc_irq_vectors(struct megasas_instance *instance)
 		instance->msix_vectors = min(num_msix_req,
 				instance->msix_vectors);
 
-		instance->iopoll_q_count = 0;
 		i = __megasas_alloc_irq_vectors(instance);
 
 	}
 
 	dev_info(&instance->pdev->dev,
-		"requested/available msix %d/%d poll_queue %d\n",
-			instance->msix_vectors - instance->iopoll_q_count,
-			i, instance->iopoll_q_count);
+		"requested/available msix %d/%d\n", instance->msix_vectors, i);
 
 	if (i > 0)
 		instance->msix_vectors = i;
@@ -6958,18 +6898,12 @@ static int megasas_io_attach(struct megasas_instance *instance)
 		instance->smp_affinity_enable) {
 		host->host_tagset = 1;
 		host->nr_hw_queues = instance->msix_vectors -
-			instance->low_latency_index_start + instance->iopoll_q_count;
-		if (instance->iopoll_q_count)
-			host->nr_maps = 3;
-	} else {
-		instance->iopoll_q_count = 0;
+			instance->low_latency_index_start;
 	}
 
 	dev_info(&instance->pdev->dev,
-		"Max firmware commands: %d shared with default "
-		"hw_queues = %d poll_queues %d\n", instance->max_fw_cmds,
-		host->nr_hw_queues - instance->iopoll_q_count,
-		instance->iopoll_q_count);
+		"Max firmware commands: %d shared with nr_hw_queues = %d\n",
+		instance->max_fw_cmds, host->nr_hw_queues);
 	/*
 	 * Notify the mid-layer about the new controller
 	 */
@@ -9036,7 +8970,6 @@ static int __init megasas_init(void)
 		msix_vectors = 1;
 		rdpq_enable = 0;
 		dual_qdepth_disable = 1;
-		poll_queues = 0;
 	}
 
 	/*

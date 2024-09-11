@@ -2461,7 +2461,6 @@ struct megasas_instance {
 	bool support_pci_lane_margining;
 	u8  low_latency_index_start;
 	int perf_mode;
-	int iopoll_q_count;
 };
 
 struct MR_LD_VF_MAP {
@@ -2744,6 +2743,5 @@ void megasas_init_debugfs(void);
 void megasas_exit_debugfs(void);
 void megasas_setup_debugfs(struct megasas_instance *instance);
 void megasas_destroy_debugfs(struct megasas_instance *instance);
-int megasas_blk_mq_poll(struct Scsi_Host *shost, unsigned int queue_num);
 
 #endif				/*LSI_MEGARAID_SAS_H */

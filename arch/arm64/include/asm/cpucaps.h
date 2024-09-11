@@ -69,7 +69,10 @@
 #define ARM64_WORKAROUND_NVIDIA_CARMEL_CNP	48
 #define ARM64_HAS_ARMv8_4_TTL			49
 #define ARM64_HAS_TLB_RANGE			50
+#define ARM64_HAS_DCPODP			51
+#define ARM64_HAS_E0PD				52
+#define ARM64_HAS_RNG				53
 
-#define ARM64_NCAPS				51
+#define ARM64_NCAPS				54
 
 #endif /* __ASM_CPUCAPS_H */

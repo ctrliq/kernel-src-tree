@@ -47,6 +47,7 @@ extern bool handle_user_split_lock(struct pt_regs *regs, long error_code);
 extern bool handle_guest_split_lock(unsigned long ip);
 extern void handle_kernel_split_lock(struct pt_regs *regs, long error_code);
 extern void handle_bus_lock(struct pt_regs *regs);
+u8 get_this_hybrid_cpu_type(void);
 #else
 static inline void __init sld_setup(struct cpuinfo_x86 *c) {}
 static inline void switch_to_sld(unsigned long tifn) {}
@@ -66,5 +67,10 @@ static inline void handle_kernel_split_lock(struct pt_regs *regs,
 }
 
 static inline void handle_bus_lock(struct pt_regs *regs) {}
+
+static inline u8 get_this_hybrid_cpu_type(void)
+{
+	return 0;
+}
 #endif
 #endif /* _ASM_X86_CPU_H */

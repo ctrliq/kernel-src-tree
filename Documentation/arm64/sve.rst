@@ -1,7 +1,9 @@
-            Scalable Vector Extension support for AArch64 Linux
-            ===================================================
+===================================================
+Scalable Vector Extension support for AArch64 Linux
+===================================================
 
 Author: Dave Martin <Dave.Martin@arm.com>
+
 Date:   4 August 2017
 
 This document outlines briefly the interface provided to userspace by Linux in
@@ -33,6 +35,23 @@ model features for SVE is included in Appendix A.
   It does not guarantee the presence of the system interfaces described in the
   following sections: software that needs to verify that those interfaces are
   present must check for HWCAP_SVE instead.
+
+* On hardware that supports the SVE2 extensions, HWCAP2_SVE2 will also
+  be reported in the AT_HWCAP2 aux vector entry.  In addition to this,
+  optional extensions to SVE2 may be reported by the presence of:
+
+	HWCAP2_SVE2
+	HWCAP2_SVEAES
+	HWCAP2_SVEPMULL
+	HWCAP2_SVEBITPERM
+	HWCAP2_SVESHA3
+	HWCAP2_SVESM4
+
+  This list may be extended over time as the SVE architecture evolves.
+
+  These extensions are also reported via the CPU ID register ID_AA64ZFR0_EL1,
+  which userspace can read using an MRS instruction.  See elf_hwcaps.txt and
+  cpu-feature-registers.txt for details.
 
 * Debuggers should restrict themselves to interacting with the target via the
   NT_ARM_SVE regset.  The recommended way of detecting support for this regset
@@ -425,7 +444,7 @@ In A64 state, SVE adds the following:
 
 * FPSR and FPCR are retained from ARMv8-A, and interact with SVE floating-point
   operations in a similar way to the way in which they interact with ARMv8
-  floating-point operations.
+  floating-point operations::
 
          8VL-1                       128               0  bit index
         +----          ////            -----------------+
@@ -482,6 +501,8 @@ ARMv8-A defines the following floating-point / SIMD register state:
 * 32 128-bit vector registers V0..V31
 * 2 32-bit status/control registers FPSR, FPCR
 
+::
+
          127           0  bit index
         +---------------+
      V0 |               |
@@ -516,7 +537,7 @@ References
 [2] arch/arm64/include/uapi/asm/ptrace.h
     AArch64 Linux ptrace ABI definitions
 
-[3] Documentation/arm64/cpu-feature-registers.txt
+[3] Documentation/arm64/cpu-feature-registers.rst
 
 [4] ARM IHI0055C
     http://infocenter.arm.com/help/topic/com.arm.doc.ihi0055c/IHI0055C_beta_aapcs64.pdf

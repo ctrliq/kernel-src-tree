@@ -163,7 +163,8 @@ $(OUTPUT)%.bpf.o: skeleton/%.bpf.c $(OUTPUT)vmlinux.h $(LIBBPF)
 		-I$(srctree)/tools/include/uapi/ \
 		-I$(LIBBPF_PATH) \
 		-I$(srctree)/tools/lib \
-		-g -O2 -target bpf -c $< -o $@ && $(LLVM_STRIP) -g $@
+		-g -O2 -target bpf -fno-asynchronous-unwind-tables \
+		-c $< -o $@ && $(LLVM_STRIP) -g $@
 
 $(OUTPUT)%.skel.h: $(OUTPUT)%.bpf.o $(BPFTOOL_BOOTSTRAP)
 	$(QUIET_GEN)$(BPFTOOL_BOOTSTRAP) gen skeleton $< > $@

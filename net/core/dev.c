@@ -5655,6 +5655,15 @@ static void gro_list_prepare(struct napi_struct *napi, struct sk_buff *skb)
 	u32 hash = skb_get_hash_raw(skb);
 	struct sk_buff *p;
 
+	/* RHEL-only: out-of-tree drivers build vs prior release don't set
+	 * correctly the slow_gro flag, re-initialize it here
+	 */
+	skb->slow_gro = !!(skb->sk || skb->_skb_refdst ||
+#ifdef CONFIG_SKB_EXTENSIONS
+			   skb->active_extensions ||
+#endif
+			   skb_get_nfct(skb));
+
 	list_for_each_entry(p, &napi->gro_list, list) {
 		unsigned long diffs;
 

@@ -52,11 +52,6 @@ static void ice_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type);
 
 static void ice_vsi_release_all(struct ice_pf *pf);
 
-bool netif_is_ice(struct net_device *dev)
-{
-	return dev && (dev->netdev_ops == &ice_netdev_ops);
-}
-
 /**
  * ice_get_tx_pending - returns number of Tx descriptors not processed
  * @ring: the ring of descriptors
@@ -4334,9 +4329,6 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 		ice_cfg_lldp_mib_change(&pf->hw, true);
 	}
 
-	if (ice_init_lag(pf))
-		dev_warn(dev, "Failed to init link aggregation support\n");
-
 	/* print PCI link speed and width */
 	pcie_print_link_status(pf->pdev);
 
@@ -4459,7 +4451,6 @@ static void ice_remove(struct pci_dev *pdev)
 	ice_aq_cancel_waiting_tasks(pf);
 
 	mutex_destroy(&(&pf->hw)->fdir_fltr_lock);
-	ice_deinit_lag(pf);
 	if (test_bit(ICE_FLAG_PTP_SUPPORTED, pf->flags))
 		ice_ptp_release(pf);
 	if (!ice_is_safe_mode(pf))

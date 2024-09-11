@@ -224,8 +224,8 @@ static int ceph_do_readpage(struct file *filp, struct page *page)
 	if (!err)
 		err = ceph_osdc_wait_request(osdc, req);
 
-	ceph_update_read_latency(&fsc->mdsc->metric, req->r_start_latency,
-				 req->r_end_latency, err);
+	ceph_update_read_metrics(&fsc->mdsc->metric, req->r_start_latency,
+				 req->r_end_latency, len, err);
 
 	ceph_osdc_put_request(req);
 	dout("readpage result %d\n", err);
@@ -271,6 +271,7 @@ static void finish_read(struct ceph_osd_request *req)
 	struct ceph_osd_data *osd_data;
 	int rc = req->r_result <= 0 ? req->r_result : 0;
 	int bytes = req->r_result >= 0 ? req->r_result : 0;
+	int len = bytes;
 	int num_pages;
 	int i;
 
@@ -306,8 +307,8 @@ unlock:
 		bytes -= PAGE_SIZE;
 	}
 
-	ceph_update_read_latency(&fsc->mdsc->metric, req->r_start_latency,
-				 req->r_end_latency, rc);
+	ceph_update_read_metrics(&fsc->mdsc->metric, req->r_start_latency,
+				 req->r_end_latency, len, rc);
 
 	kfree(osd_data->pages);
 }
@@ -660,8 +661,8 @@ static int writepage_nounlock(struct page *page, struct writeback_control *wbc)
 	if (!err)
 		err = ceph_osdc_wait_request(osdc, req);
 
-	ceph_update_write_latency(&fsc->mdsc->metric, req->r_start_latency,
-				  req->r_end_latency, err);
+	ceph_update_write_metrics(&fsc->mdsc->metric, req->r_start_latency,
+				  req->r_end_latency, len, err);
 
 	ceph_osdc_put_request(req);
 	if (err == 0)
@@ -736,6 +737,7 @@ static void writepages_finish(struct ceph_osd_request *req)
 	struct ceph_snap_context *snapc = req->r_snapc;
 	struct address_space *mapping = inode->i_mapping;
 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+	unsigned int len = 0;
 	bool remove_page;
 
 	dout("writepages_finish %p rc %d\n", inode, rc);
@@ -747,9 +749,6 @@ static void writepages_finish(struct ceph_osd_request *req)
 	} else {
 		ceph_clear_error_write(ci);
 	}
-
-	ceph_update_write_latency(&fsc->mdsc->metric, req->r_start_latency,
-				  req->r_end_latency, rc);
 
 	/*
 	 * We lost the cache cap, need to truncate the page before
@@ -767,6 +766,7 @@ static void writepages_finish(struct ceph_osd_request *req)
 
 		osd_data = osd_req_op_extent_osd_data(req, i);
 		BUG_ON(osd_data->type != CEPH_OSD_DATA_TYPE_PAGES);
+		len += osd_data->length;
 		num_pages = calc_pages_for((u64)osd_data->alignment,
 					   (u64)osd_data->length);
 		total_pages += num_pages;
@@ -798,6 +798,9 @@ static void writepages_finish(struct ceph_osd_request *req)
 
 		release_pages(osd_data->pages, num_pages);
 	}
+
+	ceph_update_write_metrics(&fsc->mdsc->metric, req->r_start_latency,
+				  req->r_end_latency, len, rc);
 
 	ceph_put_wrbuffer_cap_refs(ci, total_pages, snapc);
 
@@ -1848,8 +1851,8 @@ int ceph_uninline_data(struct file *filp, struct page *locked_page)
 	if (!err)
 		err = ceph_osdc_wait_request(&fsc->client->osdc, req);
 
-	ceph_update_write_latency(&fsc->mdsc->metric, req->r_start_latency,
-				  req->r_end_latency, err);
+	ceph_update_write_metrics(&fsc->mdsc->metric, req->r_start_latency,
+				  req->r_end_latency, len, err);
 
 out_put:
 	ceph_osdc_put_request(req);

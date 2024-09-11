@@ -713,8 +713,6 @@ megasas_alloc_reply_fusion(struct megasas_instance *instance)
 	fusion = instance->ctrl_context;
 
 	count = instance->msix_vectors > 0 ? instance->msix_vectors : 1;
-	count += instance->iopoll_q_count;
-
 	fusion->reply_frames_desc_pool =
 			dma_pool_create("mr_reply", &instance->pdev->dev,
 				fusion->reply_alloc_sz * count, 16, 0);
@@ -809,7 +807,6 @@ megasas_alloc_rdpq_fusion(struct megasas_instance *instance)
 	}
 
 	msix_count = instance->msix_vectors > 0 ? instance->msix_vectors : 1;
-	msix_count += instance->iopoll_q_count;
 
 	fusion->reply_frames_desc_pool = dma_pool_create("mr_rdpq",
 							 &instance->pdev->dev,
@@ -1160,7 +1157,7 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
 			MPI2_IOCINIT_MSGFLAG_RDPQ_ARRAY_MODE : 0;
 	IOCInitMessage->SystemRequestFrameBaseAddress = cpu_to_le64(fusion->io_request_frames_phys);
 	IOCInitMessage->SenseBufferAddressHigh = cpu_to_le32(upper_32_bits(fusion->sense_phys_addr));
-	IOCInitMessage->HostMSIxVectors = instance->msix_vectors + instance->iopoll_q_count;
+	IOCInitMessage->HostMSIxVectors = instance->msix_vectors;
 	IOCInitMessage->HostPageSize = MR_DEFAULT_NVME_PAGE_SHIFT;
 
 	time = ktime_get_real();
@@ -1854,8 +1851,6 @@ megasas_init_adapter_fusion(struct megasas_instance *instance)
 		 sizeof(union MPI2_SGE_IO_UNION))/16;
 
 	count = instance->msix_vectors > 0 ? instance->msix_vectors : 1;
-	count += instance->iopoll_q_count;
-
 	for (i = 0 ; i < count; i++)
 		fusion->last_reply_idx[i] = 0;
 
@@ -1867,9 +1862,6 @@ megasas_init_adapter_fusion(struct megasas_instance *instance)
 				(MEGASAS_FUSION_INTERNAL_CMDS +
 				MEGASAS_FUSION_IOCTL_CMDS);
 	sema_init(&instance->ioctl_sem, MEGASAS_FUSION_IOCTL_CMDS);
-
-	for (i = 0; i < MAX_MSIX_QUEUES_FUSION; i++)
-		atomic_set(&fusion->busy_mq_poll[i], 0);
 
 	if (megasas_alloc_ioc_init_frame(instance))
 		return 1;
@@ -3689,28 +3681,6 @@ complete_cmd_fusion(struct megasas_instance *instance, u32 MSIxIndex,
 	return num_completed;
 }
 
-int megasas_blk_mq_poll(struct Scsi_Host *shost, unsigned int queue_num)
-{
-
-	struct megasas_instance *instance;
-	int num_entries = 0;
-	struct fusion_context *fusion;
-
-	instance = (struct megasas_instance *)shost->hostdata;
-
-	fusion = instance->ctrl_context;
-
-	queue_num = queue_num + instance->low_latency_index_start;
-
-	if (!atomic_add_unless(&fusion->busy_mq_poll[queue_num], 1, 1))
-		return 0;
-
-	num_entries = complete_cmd_fusion(instance, queue_num, NULL);
-	atomic_dec(&fusion->busy_mq_poll[queue_num]);
-
-	return num_entries;
-}
-
 /**
  * megasas_enable_irq_poll() - enable irqpoll
  * @instance:			Adapter soft state
@@ -4246,8 +4216,6 @@ void  megasas_reset_reply_desc(struct megasas_instance *instance)
 
 	fusion = instance->ctrl_context;
 	count = instance->msix_vectors > 0 ? instance->msix_vectors : 1;
-	count += instance->iopoll_q_count;
-
 	for (i = 0 ; i < count ; i++) {
 		fusion->last_reply_idx[i] = 0;
 		reply_desc = fusion->reply_frames_desc[i];

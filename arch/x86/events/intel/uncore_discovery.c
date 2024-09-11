@@ -47,7 +47,7 @@ static int get_device_die_id(struct pci_dev *dev)
 		struct cpuinfo_x86 *c = &cpu_data(cpu);
 
 		if (c->initialized && cpu_to_node(cpu) == node)
-			return c->logical_die_id;
+			return c->_rh.logical_die_id;
 	}
 
 	/*
