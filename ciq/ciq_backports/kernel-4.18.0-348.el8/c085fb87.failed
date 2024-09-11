@@ -1,0 +1,115 @@
+perf/x86/intel/lbr: Support XSAVES for arch LBR read
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit c085fb8774671e83f6199a8e838fbc0e57094029
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/c085fb87.failed
+
+Reading LBR registers in a perf NMI handler for a non-PEBS event
+causes a high overhead because the number of LBR registers is huge.
+To reduce the overhead, the XSAVES instruction should be used to replace
+the LBR registers' reading method.
+
+The XSAVES buffer used for LBR read has to be per-CPU because the NMI
+handler invoked the lbr_read(). The existing task_ctx_data buffer
+cannot be used which is per-task and only be allocated for the LBR call
+stack mode. A new lbr_xsave pointer is introduced in the cpu_hw_events
+as an XSAVES buffer for LBR read.
+
+The XSAVES buffer should be allocated only when LBR is used by a
+non-PEBS event on the CPU because the total size of the lbr_xsave is
+not small (~1.4KB).
+
+The XSAVES buffer is allocated when a non-PEBS event is added, but it
+is lazily released in x86_release_hardware() when perf releases the
+entire PMU hardware resource, because perf may frequently schedule the
+event, e.g. high context switch. The lazy release method reduces the
+overhead of frequently allocate/free the buffer.
+
+If the lbr_xsave fails to be allocated, roll back to normal Arch LBR
+lbr_read().
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+Link: https://lkml.kernel.org/r/1593780569-62993-24-git-send-email-kan.liang@linux.intel.com
+(cherry picked from commit c085fb8774671e83f6199a8e838fbc0e57094029)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/lbr.c
+diff --cc arch/x86/events/intel/lbr.c
+index d05b80c1c2dd,63f58bdf556c..000000000000
+--- a/arch/x86/events/intel/lbr.c
++++ b/arch/x86/events/intel/lbr.c
+@@@ -1704,9 -1804,16 +1741,22 @@@ void __init intel_pmu_arch_lbr_init(voi
+  		x86_pmu.lbr_ctl_map = NULL;
+  
+  	x86_pmu.lbr_reset = intel_pmu_arch_lbr_reset;
+++<<<<<<< HEAD
+ +	x86_pmu.lbr_read = intel_pmu_arch_lbr_read;
+ +	x86_pmu.lbr_save = intel_pmu_arch_lbr_save;
+ +	x86_pmu.lbr_restore = intel_pmu_arch_lbr_restore;
+++=======
++ 	if (arch_lbr_xsave) {
++ 		x86_pmu.lbr_save = intel_pmu_arch_lbr_xsaves;
++ 		x86_pmu.lbr_restore = intel_pmu_arch_lbr_xrstors;
++ 		x86_pmu.lbr_read = intel_pmu_arch_lbr_read_xsave;
++ 		pr_cont("XSAVE ");
++ 	} else {
++ 		x86_pmu.lbr_save = intel_pmu_arch_lbr_save;
++ 		x86_pmu.lbr_restore = intel_pmu_arch_lbr_restore;
++ 		x86_pmu.lbr_read = intel_pmu_arch_lbr_read;
++ 	}
+++>>>>>>> c085fb877467 (perf/x86/intel/lbr: Support XSAVES for arch LBR read)
+  
+  	pr_cont("Architectural LBR, ");
+  
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 6386151f5053..c03144849339 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -363,6 +363,7 @@ void x86_release_hardware(void)
+ 	if (atomic_dec_and_mutex_lock(&pmc_refcount, &pmc_reserve_mutex)) {
+ 		release_pmc_hardware();
+ 		release_ds_buffers();
++		release_lbr_buffers();
+ 		mutex_unlock(&pmc_reserve_mutex);
+ 	}
+ }
+* Unmerged path arch/x86/events/intel/lbr.c
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 5b83205b6893..5d04bdc0d599 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -281,6 +281,7 @@ struct cpu_hw_events {
+ 	void				*last_task_ctx;
+ 	int				last_log_id;
+ 	int				lbr_select;
++	void				*lbr_xsave;
+ 
+ 	/*
+ 	 * Intel host/guest exclude bits
+@@ -1116,6 +1117,8 @@ void release_ds_buffers(void);
+ 
+ void reserve_ds_buffers(void);
+ 
++void release_lbr_buffers(void);
++
+ extern struct event_constraint bts_constraint;
+ extern struct event_constraint vlbr_constraint;
+ 
+@@ -1259,6 +1262,10 @@ static inline void release_ds_buffers(void)
+ {
+ }
+ 
++static inline void release_lbr_buffers(void)
++{
++}
++
+ static inline int intel_pmu_init(void)
+ {
+ 	return 0;
