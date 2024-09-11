@@ -1,0 +1,161 @@
+ipv4: ipcm_cookie initializers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Willem de Bruijn <willemb@google.com>
+commit 351782067b6be81879b0af0daf7bd3acbb32d986
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/35178206.failed
+
+Initialize the cookie in one location to reduce code duplication and
+avoid bugs from inconsistent initialization, such as that fixed in
+commit 9887cba19978 ("ip: limit use of gso_size to udp").
+
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 351782067b6be81879b0af0daf7bd3acbb32d986)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp.c
+diff --cc net/ipv4/udp.c
+index dd3faf1644ad,87f3a0b77864..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -1126,10 -972,8 +1120,15 @@@ int udp_sendmsg(struct sock *sk, struc
+  		connected = 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	ipc.sockc.tsflags = sk->sk_tsflags;
+ +	ipc.addr = inet->inet_saddr;
+ +	ipc.oif = sk->sk_bound_dev_if;
+ +	ipc.gso_size = READ_ONCE(up->gso_size);
+++=======
++ 	ipcm_init_sk(&ipc, inet);
++ 	ipc.gso_size = up->gso_size;
+++>>>>>>> 351782067b6b (ipv4: ipcm_cookie initializers)
+  
+  	if (msg->msg_controllen) {
+  		err = udp_cmsg_send(sk, msg, &ipc.gso_size);
+diff --git a/include/net/ip.h b/include/net/ip.h
+index f61e0dd9a8e3..6720ad2fc853 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -79,6 +79,21 @@ struct ipcm_cookie {
+ 	__u16			gso_size;
+ };
+ 
++static inline void ipcm_init(struct ipcm_cookie *ipcm)
++{
++	*ipcm = (struct ipcm_cookie) { .tos = -1 };
++}
++
++static inline void ipcm_init_sk(struct ipcm_cookie *ipcm,
++				const struct inet_sock *inet)
++{
++	ipcm_init(ipcm);
++
++	ipcm->sockc.tsflags = inet->sk.sk_tsflags;
++	ipcm->oif = inet->sk.sk_bound_dev_if;
++	ipcm->addr = inet->inet_saddr;
++}
++
+ #define IPCB(skb) ((struct inet_skb_parm*)((skb)->cb))
+ #define PKTINFO_SKB_CB(skb) ((struct in_pktinfo *)((skb)->cb))
+ 
+diff --git a/net/ipv4/icmp.c b/net/ipv4/icmp.c
+index cafe71040b9c..df7adcdf89d5 100644
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -433,15 +433,11 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
+ 
+ 	icmp_param->data.icmph.checksum = 0;
+ 
++	ipcm_init(&ipc);
+ 	inet->tos = ip_hdr(skb)->tos;
+ 	sk->sk_mark = mark;
+ 	daddr = ipc.addr = ip_hdr(skb)->saddr;
+ 	saddr = fib_compute_spec_dst(skb);
+-	ipc.opt = NULL;
+-	ipc.tx_flags = 0;
+-	ipc.ttl = 0;
+-	ipc.tos = -1;
+-	ipc.sockc.transmit_time = 0;
+ 
+ 	if (icmp_param->replyopts.opt.opt.optlen) {
+ 		ipc.opt = &icmp_param->replyopts.opt;
+@@ -722,12 +718,9 @@ void __icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info,
+ 	icmp_param.offset = skb_network_offset(skb_in);
+ 	inet_sk(sk)->tos = tos;
+ 	sk->sk_mark = mark;
++	ipcm_init(&ipc);
+ 	ipc.addr = iph->saddr;
+ 	ipc.opt = &icmp_param.replyopts.opt;
+-	ipc.tx_flags = 0;
+-	ipc.ttl = 0;
+-	ipc.tos = -1;
+-	ipc.sockc.transmit_time = 0;
+ 
+ 	rt = icmp_route_lookup(net, &fl4, skb_in, iph, saddr, tos, mark,
+ 			       type, code, &icmp_param);
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index e18239b9a992..ed57196e843f 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1576,12 +1576,8 @@ void ip_send_unicast_reply(struct sock *sk, struct sk_buff *skb,
+ 	if (__ip_options_echo(net, &replyopts.opt.opt, skb, sopt))
+ 		return;
+ 
++	ipcm_init(&ipc);
+ 	ipc.addr = daddr;
+-	ipc.opt = NULL;
+-	ipc.tx_flags = 0;
+-	ipc.ttl = 0;
+-	ipc.tos = -1;
+-	ipc.sockc.transmit_time = 0;
+ 
+ 	if (replyopts.opt.opt.optlen) {
+ 		ipc.opt = &replyopts.opt;
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index 9be046de601c..2a0d4247f286 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -739,14 +739,7 @@ static int ping_v4_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		/* no remote port */
+ 	}
+ 
+-	ipc.sockc.tsflags = sk->sk_tsflags;
+-	ipc.addr = inet->inet_saddr;
+-	ipc.opt = NULL;
+-	ipc.oif = sk->sk_bound_dev_if;
+-	ipc.tx_flags = 0;
+-	ipc.ttl = 0;
+-	ipc.tos = -1;
+-	ipc.sockc.transmit_time = 0;
++	ipcm_init_sk(&ipc, inet);
+ 
+ 	if (msg->msg_controllen) {
+ 		err = ip_cmsg_send(sk, msg, &ipc, false);
+diff --git a/net/ipv4/raw.c b/net/ipv4/raw.c
+index d6d68213fbd5..44c466c7cadd 100644
+--- a/net/ipv4/raw.c
++++ b/net/ipv4/raw.c
+@@ -562,14 +562,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		daddr = inet->inet_daddr;
+ 	}
+ 
+-	ipc.sockc.tsflags = sk->sk_tsflags;
+-	ipc.sockc.transmit_time = 0;
+-	ipc.addr = inet->inet_saddr;
+-	ipc.opt = NULL;
+-	ipc.tx_flags = 0;
+-	ipc.ttl = 0;
+-	ipc.tos = -1;
+-	ipc.oif = sk->sk_bound_dev_if;
++	ipcm_init_sk(&ipc, inet);
+ 
+ 	if (msg->msg_controllen) {
+ 		err = ip_cmsg_send(sk, msg, &ipc, false);
+* Unmerged path net/ipv4/udp.c
