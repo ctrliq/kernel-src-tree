@@ -1,0 +1,391 @@
+mt76: mt7921: fix a race between mt7921_mcu_drv_pmctrl and mt7921_mcu_fw_pmctrl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit fad90e43eac0434108af18e326e179d1b5153135
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/fad90e43.failed
+
+Introduce a mutex in order to avoid a race between mt7921_mcu_drv_pmctrl and
+mt7921_mcu_fw_pmctrl routines since they are run two independent works
+
+Fixes: 1d8efc741df8 ("mt76: mt7921: introduce Runtime PM support")
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit fad90e43eac0434108af18e326e179d1b5153135)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt76_connac.h
+#	drivers/net/wireless/mediatek/mt76/mt7921/init.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/init.c
+index a1cf9d52fcea,0b8a5a7f4362..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/init.c
+@@@ -212,6 -219,13 +212,16 @@@ int mt7921_register_device(struct mt792
+  	dev->phy.dev = dev;
+  	dev->phy.mt76 = &dev->mt76.phy;
+  	dev->mt76.phy.priv = &dev->phy;
+++<<<<<<< HEAD
+++=======
++ 
++ 	INIT_DELAYED_WORK(&dev->pm.ps_work, mt7921_pm_power_save_work);
++ 	INIT_WORK(&dev->pm.wake_work, mt7921_pm_wake_work);
++ 	mutex_init(&dev->pm.mutex);
++ 	init_completion(&dev->pm.wake_cmpl);
++ 	spin_lock_init(&dev->pm.txq_lock);
++ 	set_bit(MT76_STATE_PM, &dev->mphy.state);
+++>>>>>>> fad90e43eac0 (mt76: mt7921: fix a race between mt7921_mcu_drv_pmctrl and mt7921_mcu_fw_pmctrl)
+  	INIT_LIST_HEAD(&dev->phy.stats_list);
+  	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt7921_mac_work);
+  	INIT_DELAYED_WORK(&dev->phy.scan_work, mt7921_scan_work);
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+index 031cb2bd8cce,ea00f6b6af56..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+@@@ -2639,256 -1264,92 +2639,309 @@@ int mt7921_mcu_set_bss_pm(struct mt7921
+  				 sizeof(req), false);
+  }
+  
+ -int mt7921_mcu_drv_pmctrl(struct mt7921_dev *dev)
+ +#ifdef CONFIG_PM
+ +int mt7921_mcu_set_hif_suspend(struct mt7921_dev *dev, bool suspend)
+  {
+++<<<<<<< HEAD
+ +	struct {
+ +		struct {
+ +			u8 hif_type; /* 0x0: HIF_SDIO
+ +				      * 0x1: HIF_USB
+ +				      * 0x2: HIF_PCIE
+ +				      */
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct hif_suspend_tlv {
+ +			__le16 tag;
+ +			__le16 len;
+ +			u8 suspend;
+ +		} __packed hif_suspend;
+ +	} req = {
+ +		.hif_suspend = {
+ +			.tag = cpu_to_le16(0), /* 0: UNI_HIF_CTRL_BASIC */
+ +			.len = cpu_to_le16(sizeof(struct hif_suspend_tlv)),
+ +			.suspend = suspend,
+ +		},
+ +	};
+ +
+ +	if (mt76_is_mmio(&dev->mt76))
+ +		req.hdr.hif_type = 2;
+ +	else if (mt76_is_usb(&dev->mt76))
+ +		req.hdr.hif_type = 1;
+ +	else if (mt76_is_sdio(&dev->mt76))
+ +		req.hdr.hif_type = 0;
+++=======
++ 	struct mt76_phy *mphy = &dev->mt76.phy;
++ 	int i, err = 0;
++ 
++ 	mutex_lock(&dev->pm.mutex);
++ 
++ 	if (!test_bit(MT76_STATE_PM, &mphy->state))
++ 		goto out;
+++>>>>>>> fad90e43eac0 (mt76: mt7921: fix a race between mt7921_mcu_drv_pmctrl and mt7921_mcu_fw_pmctrl)
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_HIF_CTRL, &req,
+ +				 sizeof(req), true);
+ +}
+ +EXPORT_SYMBOL_GPL(mt7921_mcu_set_hif_suspend);
+ +
+ +static int
+ +mt7921_mcu_set_wow_ctrl(struct mt7921_phy *phy, struct ieee80211_vif *vif,
+ +			bool suspend, struct cfg80211_wowlan *wowlan)
+ +{
+ +	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
+ +	struct mt7921_dev *dev = phy->dev;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7921_wow_ctrl_tlv wow_ctrl_tlv;
+ +		struct mt7921_wow_gpio_param_tlv gpio_tlv;
+ +	} req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->mt76.idx,
+ +		},
+ +		.wow_ctrl_tlv = {
+ +			.tag = cpu_to_le16(UNI_SUSPEND_WOW_CTRL),
+ +			.len = cpu_to_le16(sizeof(struct mt7921_wow_ctrl_tlv)),
+ +			.cmd = suspend ? 1 : 2,
+ +		},
+ +		.gpio_tlv = {
+ +			.tag = cpu_to_le16(UNI_SUSPEND_WOW_GPIO_PARAM),
+ +			.len = cpu_to_le16(sizeof(struct mt7921_wow_gpio_param_tlv)),
+ +			.gpio_pin = 0xff, /* follow fw about GPIO pin */
+ +		},
+ +	};
+  
+ -	for (i = 0; i < MT7921_DRV_OWN_RETRY_COUNT; i++) {
+ -		mt76_wr(dev, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_CLR_OWN);
+ -		if (mt76_poll_msec(dev, MT_CONN_ON_LPCTL,
+ -				   PCIE_LPCR_HOST_OWN_SYNC, 0, 50))
+ -			break;
+ +	if (wowlan->magic_pkt)
+ +		req.wow_ctrl_tlv.trigger |= BIT(0);
+ +	if (wowlan->disconnect)
+ +		req.wow_ctrl_tlv.trigger |= BIT(2);
+ +	if (wowlan->nd_config) {
+ +		mt7921_mcu_sched_scan_req(phy, vif, wowlan->nd_config);
+ +		req.wow_ctrl_tlv.trigger |= BIT(5);
+ +		mt7921_mcu_sched_scan_enable(phy, vif, suspend);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (mt76_is_mmio(&dev->mt76))
+ +		req.wow_ctrl_tlv.wakeup_hif = WOW_PCIE;
+ +	else if (mt76_is_usb(&dev->mt76))
+ +		req.wow_ctrl_tlv.wakeup_hif = WOW_USB;
+ +	else if (mt76_is_sdio(&dev->mt76))
+ +		req.wow_ctrl_tlv.wakeup_hif = WOW_GPIO;
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_SUSPEND, &req,
+ +				 sizeof(req), true);
+++=======
++ 	if (i == MT7921_DRV_OWN_RETRY_COUNT) {
++ 		dev_err(dev->mt76.dev, "driver own failed\n");
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 	clear_bit(MT76_STATE_PM, &mphy->state);
++ 
++ out:
++ 	dev->pm.last_activity = jiffies;
++ 	mutex_unlock(&dev->pm.mutex);
++ 
++ 	if (err)
++ 		mt7921_reset(&dev->mt76);
++ 
++ 	return err;
+++>>>>>>> fad90e43eac0 (mt76: mt7921: fix a race between mt7921_mcu_drv_pmctrl and mt7921_mcu_fw_pmctrl)
+  }
+  
+ -int mt7921_mcu_fw_pmctrl(struct mt7921_dev *dev)
+ +static int
+ +mt7921_mcu_set_wow_pattern(struct mt7921_dev *dev,
+ +			   struct ieee80211_vif *vif,
+ +			   u8 index, bool enable,
+ +			   struct cfg80211_pkt_pattern *pattern)
+  {
+++<<<<<<< HEAD
+ +	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
+ +	struct mt7921_wow_pattern_tlv *ptlv;
+ +	struct sk_buff *skb;
+ +	struct req_hdr {
+ +		u8 bss_idx;
+ +		u8 pad[3];
+ +	} __packed hdr = {
+ +		.bss_idx = mvif->mt76.idx,
+ +	};
+ +
+ +	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
+ +				 sizeof(hdr) + sizeof(*ptlv));
+ +	if (!skb)
+ +		return -ENOMEM;
+++=======
++ 	struct mt76_phy *mphy = &dev->mt76.phy;
++ 	int i, err = 0;
++ 
++ 	mutex_lock(&dev->pm.mutex);
++ 
++ 	if (test_and_set_bit(MT76_STATE_PM, &mphy->state))
++ 		goto out;
+ -
+ -	for (i = 0; i < MT7921_DRV_OWN_RETRY_COUNT; i++) {
+ -		mt76_wr(dev, MT_CONN_ON_LPCTL, PCIE_LPCR_HOST_SET_OWN);
+ -		if (mt76_poll_msec(dev, MT_CONN_ON_LPCTL,
+ -				   PCIE_LPCR_HOST_OWN_SYNC, 4, 50))
+ -			break;
+ -	}
+ -
+++>>>>>>> fad90e43eac0 (mt76: mt7921: fix a race between mt7921_mcu_drv_pmctrl and mt7921_mcu_fw_pmctrl)
+ +
+ +	skb_put_data(skb, &hdr, sizeof(hdr));
+ +	ptlv = (struct mt7921_wow_pattern_tlv *)skb_put(skb, sizeof(*ptlv));
+ +	ptlv->tag = cpu_to_le16(UNI_SUSPEND_WOW_PATTERN);
+ +	ptlv->len = cpu_to_le16(sizeof(*ptlv));
+ +	ptlv->data_len = pattern->pattern_len;
+ +	ptlv->enable = enable;
+ +	ptlv->index = index;
+ +
+++<<<<<<< HEAD
+ +	memcpy(ptlv->pattern, pattern->pattern, pattern->pattern_len);
+ +	memcpy(ptlv->mask, pattern->mask, pattern->pattern_len / 8);
+ +
+ +	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_UNI_CMD_SUSPEND,
+ +				     true);
+++=======
++ 	if (i == MT7921_DRV_OWN_RETRY_COUNT) {
++ 		dev_err(dev->mt76.dev, "firmware own failed\n");
++ 		clear_bit(MT76_STATE_PM, &mphy->state);
++ 		err = -EIO;
++ 	}
++ out:
++ 	mutex_unlock(&dev->pm.mutex);
++ 
++ 	if (err)
++ 		mt7921_reset(&dev->mt76);
++ 
++ 	return err;
+++>>>>>>> fad90e43eac0 (mt76: mt7921: fix a race between mt7921_mcu_drv_pmctrl and mt7921_mcu_fw_pmctrl)
+ +}
+ +
+ +static int
+ +mt7921_mcu_set_suspend_mode(struct mt7921_dev *dev,
+ +			    struct ieee80211_vif *vif,
+ +			    bool enable, u8 mdtim, bool wow_suspend)
+ +{
+ +	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7921_suspend_tlv suspend_tlv;
+ +	} req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->mt76.idx,
+ +		},
+ +		.suspend_tlv = {
+ +			.tag = cpu_to_le16(UNI_SUSPEND_MODE_SETTING),
+ +			.len = cpu_to_le16(sizeof(struct mt7921_suspend_tlv)),
+ +			.enable = enable,
+ +			.mdtim = mdtim,
+ +			.wow_suspend = wow_suspend,
+ +		},
+ +	};
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_SUSPEND, &req,
+ +				 sizeof(req), true);
+ +}
+ +
+ +static int
+ +mt7921_mcu_set_gtk_rekey(struct mt7921_dev *dev,
+ +			 struct ieee80211_vif *vif,
+ +			 bool suspend)
+ +{
+ +	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7921_gtk_rekey_tlv gtk_tlv;
+ +	} __packed req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->mt76.idx,
+ +		},
+ +		.gtk_tlv = {
+ +			.tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_GTK_REKEY),
+ +			.len = cpu_to_le16(sizeof(struct mt7921_gtk_rekey_tlv)),
+ +			.rekey_mode = !suspend,
+ +		},
+ +	};
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_OFFLOAD, &req,
+ +				 sizeof(req), true);
+ +}
+ +
+ +static int
+ +mt7921_mcu_set_arp_filter(struct mt7921_dev *dev, struct ieee80211_vif *vif,
+ +			  bool suspend)
+ +{
+ +	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
+ +	struct {
+ +		struct {
+ +			u8 bss_idx;
+ +			u8 pad[3];
+ +		} __packed hdr;
+ +		struct mt7921_arpns_tlv arpns;
+ +	} req = {
+ +		.hdr = {
+ +			.bss_idx = mvif->mt76.idx,
+ +		},
+ +		.arpns = {
+ +			.tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_ARP),
+ +			.len = cpu_to_le16(sizeof(struct mt7921_arpns_tlv)),
+ +			.mode = suspend,
+ +		},
+ +	};
+ +
+ +	return mt76_mcu_send_msg(&dev->mt76, MCU_UNI_CMD_OFFLOAD, &req,
+ +				 sizeof(req), true);
+  }
+  
+ -void
+ -mt7921_pm_interface_iter(void *priv, u8 *mac, struct ieee80211_vif *vif)
+ +void mt7921_mcu_set_suspend_iter(void *priv, u8 *mac,
+ +				 struct ieee80211_vif *vif)
+  {
+  	struct mt7921_phy *phy = priv;
+ -	struct mt7921_dev *dev = phy->dev;
+ -	int ret;
+ +	bool suspend = test_bit(MT76_STATE_SUSPEND, &phy->mt76->state);
+ +	struct ieee80211_hw *hw = phy->mt76->hw;
+ +	struct cfg80211_wowlan *wowlan = hw->wiphy->wowlan_config;
+ +	int i;
+  
+ -	if (dev->pm.enable)
+ -		ret = mt7921_mcu_uni_bss_bcnft(dev, vif, true);
+ -	else
+ -		ret = mt7921_mcu_set_bss_pm(dev, vif, false);
+ +	mt7921_mcu_set_gtk_rekey(phy->dev, vif, suspend);
+ +	mt7921_mcu_set_arp_filter(phy->dev, vif, suspend);
+  
+ -	if (ret)
+ +	mt7921_mcu_set_suspend_mode(phy->dev, vif, suspend, 1, true);
+ +
+ +	for (i = 0; i < wowlan->n_patterns; i++)
+ +		mt7921_mcu_set_wow_pattern(phy->dev, vif, i, suspend,
+ +					   &wowlan->patterns[i]);
+ +	mt7921_mcu_set_wow_ctrl(phy, vif, suspend, wowlan);
+ +}
+ +
+ +static void
+ +mt7921_mcu_key_iter(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ +		    struct ieee80211_sta *sta, struct ieee80211_key_conf *key,
+ +		    void *data)
+ +{
+ +	struct mt7921_gtk_rekey_tlv *gtk_tlv = data;
+ +	u32 cipher;
+ +
+ +	if (key->cipher != WLAN_CIPHER_SUITE_AES_CMAC &&
+ +	    key->cipher != WLAN_CIPHER_SUITE_CCMP &&
+ +	    key->cipher != WLAN_CIPHER_SUITE_TKIP)
+  		return;
+  
+ -	if (dev->pm.enable) {
+ -		vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
+ -		mt76_set(dev, MT_WF_RFCR(0), MT_WF_RFCR_DROP_OTHER_BEACON);
+ +	if (key->cipher == WLAN_CIPHER_SUITE_TKIP) {
+ +		gtk_tlv->proto = cpu_to_le32(NL80211_WPA_VERSION_1);
+ +		cipher = BIT(3);
+  	} else {
+ -		vif->driver_flags &= ~IEEE80211_VIF_BEACON_FILTER;
+ -		mt76_clear(dev, MT_WF_RFCR(0), MT_WF_RFCR_DROP_OTHER_BEACON);
+ +		gtk_tlv->proto = cpu_to_le32(NL80211_WPA_VERSION_2);
+ +		cipher = BIT(4);
+ +	}
+ +
+ +	/* we are assuming here to have a single pairwise key */
+ +	if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
+ +		gtk_tlv->pairwise_cipher = cpu_to_le32(cipher);
+ +		gtk_tlv->group_cipher = cpu_to_le32(cipher);
+ +		gtk_tlv->keyid = key->keyidx;
+  	}
+  }
+  
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac.h
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76_connac.h
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/init.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
