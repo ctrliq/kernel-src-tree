@@ -1,0 +1,443 @@
+bnxt_en: Fix RDMA driver failure with SRIOV after firmware reset.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Fix RDMA driver failure with SRIOV after firmware reset (Jonathan Toppins) [1801868]
+Rebuild_FUZZ: 99.22%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 12de2eadf87825c3990c1aa68b5e93101ca2f043
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/12de2ead.failed
+
+bnxt_ulp_start() needs to be called before SRIOV is re-enabled after
+firmware reset.  Re-enabling SRIOV may consume all the resources and
+may cause the RDMA driver to fail to get MSIX and other resources.
+Fix it by calling bnxt_ulp_start() first before calling
+bnxt_reenable_sriov().
+
+We re-arrange the logic so that we call bnxt_ulp_start() and
+bnxt_reenable_sriov() in proper sequence in bnxt_fw_reset_task() and
+bnxt_open().  The former is the normal coordinated firmware reset sequence
+and the latter is firmware reset while the function is down.  This new
+logic is now more straight forward and will now fix both scenarios.
+
+Fixes: f3a6d206c25a ("bnxt_en: Call bnxt_ulp_stop()/bnxt_ulp_start() during error recovery.")
+	Reported-by: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 12de2eadf87825c3990c1aa68b5e93101ca2f043)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 3fd9beafbaf6,a69e46621a04..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -8790,12 -9257,26 +8790,24 @@@ static int bnxt_open(struct net_device 
+  	struct bnxt *bp = netdev_priv(dev);
+  	int rc;
+  
+ -	if (test_bit(BNXT_STATE_ABORT_ERR, &bp->state)) {
+ -		netdev_err(bp->dev, "A previous firmware reset did not complete, aborting\n");
+ -		return -ENODEV;
+ -	}
+ -
+ -	rc = bnxt_hwrm_if_change(bp, true);
+ -	if (rc)
+ -		return rc;
+ +	bnxt_hwrm_if_change(bp, true);
+  	rc = __bnxt_open_nic(bp, true, true);
+ -	if (rc) {
+ +	if (rc)
+  		bnxt_hwrm_if_change(bp, false);
+++<<<<<<< HEAD
+ +
+ +	bnxt_hwmon_open(bp);
+++=======
++ 	} else {
++ 		if (test_and_clear_bit(BNXT_STATE_FW_RESET_DET, &bp->state)) {
++ 			if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
++ 				bnxt_ulp_start(bp, 0);
++ 				bnxt_reenable_sriov(bp);
++ 			}
++ 		}
++ 		bnxt_hwmon_open(bp);
++ 	}
+++>>>>>>> 12de2eadf878 (bnxt_en: Fix RDMA driver failure with SRIOV after firmware reset.)
+  
+  	return rc;
+  }
+@@@ -9781,6 -10495,367 +9793,370 @@@ static void bnxt_init_dflt_coal(struct 
+  	bp->stats_coal_ticks = BNXT_DEF_STATS_COAL_TICKS;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void bnxt_alloc_fw_health(struct bnxt *bp)
++ {
++ 	if (bp->fw_health)
++ 		return;
++ 
++ 	if (!(bp->fw_cap & BNXT_FW_CAP_HOT_RESET) &&
++ 	    !(bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY))
++ 		return;
++ 
++ 	bp->fw_health = kzalloc(sizeof(*bp->fw_health), GFP_KERNEL);
++ 	if (!bp->fw_health) {
++ 		netdev_warn(bp->dev, "Failed to allocate fw_health\n");
++ 		bp->fw_cap &= ~BNXT_FW_CAP_HOT_RESET;
++ 		bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
++ 	}
++ }
++ 
++ static int bnxt_fw_init_one_p1(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	bp->fw_cap = 0;
++ 	rc = bnxt_hwrm_ver_get(bp);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL) {
++ 		rc = bnxt_alloc_kong_hwrm_resources(bp);
++ 		if (rc)
++ 			bp->fw_cap &= ~BNXT_FW_CAP_KONG_MB_CHNL;
++ 	}
++ 
++ 	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
++ 	    bp->hwrm_max_ext_req_len > BNXT_HWRM_MAX_REQ_LEN) {
++ 		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	rc = bnxt_hwrm_func_reset(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_fw_set_time(bp);
++ 	return 0;
++ }
++ 
++ static int bnxt_fw_init_one_p2(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	/* Get the MAX capabilities for this function */
++ 	rc = bnxt_hwrm_func_qcaps(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "hwrm query capability failure rc: %x\n",
++ 			   rc);
++ 		return -ENODEV;
++ 	}
++ 
++ 	rc = bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query adv flow mgnt failure rc: %d\n",
++ 			    rc);
++ 
++ 	bnxt_alloc_fw_health(bp);
++ 	rc = bnxt_hwrm_error_recovery_qcfg(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query error recovery failure rc: %d\n",
++ 			    rc);
++ 
++ 	rc = bnxt_hwrm_func_drv_rgtr(bp, NULL, 0, false);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_func_qcfg(bp);
++ 	bnxt_hwrm_vnic_qcaps(bp);
++ 	bnxt_hwrm_port_led_qcaps(bp);
++ 	bnxt_ethtool_init(bp);
++ 	bnxt_dcb_init(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_set_dflt_rss_hash_type(struct bnxt *bp)
++ {
++ 	bp->flags &= ~BNXT_FLAG_UDP_RSS_CAP;
++ 	bp->rss_hash_cfg = VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_IPV6 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV6;
++ 	if (BNXT_CHIP_P4_PLUS(bp) && bp->hwrm_spec_code >= 0x10501) {
++ 		bp->flags |= BNXT_FLAG_UDP_RSS_CAP;
++ 		bp->rss_hash_cfg |= VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV4 |
++ 				    VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV6;
++ 	}
++ }
++ 
++ static void bnxt_set_dflt_rfs(struct bnxt *bp)
++ {
++ 	struct net_device *dev = bp->dev;
++ 
++ 	dev->hw_features &= ~NETIF_F_NTUPLE;
++ 	dev->features &= ~NETIF_F_NTUPLE;
++ 	bp->flags &= ~BNXT_FLAG_RFS;
++ 	if (bnxt_rfs_supported(bp)) {
++ 		dev->hw_features |= NETIF_F_NTUPLE;
++ 		if (bnxt_rfs_capable(bp)) {
++ 			bp->flags |= BNXT_FLAG_RFS;
++ 			dev->features |= NETIF_F_NTUPLE;
++ 		}
++ 	}
++ }
++ 
++ static void bnxt_fw_init_one_p3(struct bnxt *bp)
++ {
++ 	struct pci_dev *pdev = bp->pdev;
++ 
++ 	bnxt_set_dflt_rss_hash_type(bp);
++ 	bnxt_set_dflt_rfs(bp);
++ 
++ 	bnxt_get_wol_settings(bp);
++ 	if (bp->flags & BNXT_FLAG_WOL_CAP)
++ 		device_set_wakeup_enable(&pdev->dev, bp->wol);
++ 	else
++ 		device_set_wakeup_capable(&pdev->dev, false);
++ 
++ 	bnxt_hwrm_set_cache_line_size(bp, cache_line_size());
++ 	bnxt_hwrm_coal_params_qcaps(bp);
++ }
++ 
++ static int bnxt_fw_init_one(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	rc = bnxt_fw_init_one_p1(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 1 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_fw_init_one_p2(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 2 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_approve_mac(bp, bp->dev->dev_addr, false);
++ 	if (rc)
++ 		return rc;
++ 
++ 	/* In case fw capabilities have changed, destroy the unneeded
++ 	 * reporters and create newly capable ones.
++ 	 */
++ 	bnxt_dl_fw_reporters_destroy(bp, false);
++ 	bnxt_dl_fw_reporters_create(bp);
++ 	bnxt_fw_init_one_p3(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_fw_reset_writel(struct bnxt *bp, int reg_idx)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	u32 reg = fw_health->fw_reset_seq_regs[reg_idx];
++ 	u32 val = fw_health->fw_reset_seq_vals[reg_idx];
++ 	u32 reg_type, reg_off, delay_msecs;
++ 
++ 	delay_msecs = fw_health->fw_reset_seq_delay_msec[reg_idx];
++ 	reg_type = BNXT_FW_HEALTH_REG_TYPE(reg);
++ 	reg_off = BNXT_FW_HEALTH_REG_OFF(reg);
++ 	switch (reg_type) {
++ 	case BNXT_FW_HEALTH_REG_TYPE_CFG:
++ 		pci_write_config_dword(bp->pdev, reg_off, val);
++ 		break;
++ 	case BNXT_FW_HEALTH_REG_TYPE_GRC:
++ 		writel(reg_off & BNXT_GRC_BASE_MASK,
++ 		       bp->bar0 + BNXT_GRCPF_REG_WINDOW_BASE_OUT + 4);
++ 		reg_off = (reg_off & BNXT_GRC_OFFSET_MASK) + 0x2000;
++ 		/* fall through */
++ 	case BNXT_FW_HEALTH_REG_TYPE_BAR0:
++ 		writel(val, bp->bar0 + reg_off);
++ 		break;
++ 	case BNXT_FW_HEALTH_REG_TYPE_BAR1:
++ 		writel(val, bp->bar1 + reg_off);
++ 		break;
++ 	}
++ 	if (delay_msecs) {
++ 		pci_read_config_dword(bp->pdev, 0, &val);
++ 		msleep(delay_msecs);
++ 	}
++ }
++ 
++ static void bnxt_reset_all(struct bnxt *bp)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	int i, rc;
++ 
++ 	if (bp->fw_cap & BNXT_FW_CAP_ERR_RECOVER_RELOAD) {
++ #ifdef CONFIG_TEE_BNXT_FW
++ 		rc = tee_bnxt_fw_load();
++ 		if (rc)
++ 			netdev_err(bp->dev, "Unable to reset FW rc=%d\n", rc);
++ 		bp->fw_reset_timestamp = jiffies;
++ #endif
++ 		return;
++ 	}
++ 
++ 	if (fw_health->flags & ERROR_RECOVERY_QCFG_RESP_FLAGS_HOST) {
++ 		for (i = 0; i < fw_health->fw_reset_seq_cnt; i++)
++ 			bnxt_fw_reset_writel(bp, i);
++ 	} else if (fw_health->flags & ERROR_RECOVERY_QCFG_RESP_FLAGS_CO_CPU) {
++ 		struct hwrm_fw_reset_input req = {0};
++ 
++ 		bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FW_RESET, -1, -1);
++ 		req.resp_addr = cpu_to_le64(bp->hwrm_cmd_kong_resp_dma_addr);
++ 		req.embedded_proc_type = FW_RESET_REQ_EMBEDDED_PROC_TYPE_CHIP;
++ 		req.selfrst_status = FW_RESET_REQ_SELFRST_STATUS_SELFRSTASAP;
++ 		req.flags = FW_RESET_REQ_FLAGS_RESET_GRACEFUL;
++ 		rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++ 		if (rc)
++ 			netdev_warn(bp->dev, "Unable to reset FW rc=%d\n", rc);
++ 	}
++ 	bp->fw_reset_timestamp = jiffies;
++ }
++ 
++ static void bnxt_fw_reset_task(struct work_struct *work)
++ {
++ 	struct bnxt *bp = container_of(work, struct bnxt, fw_reset_task.work);
++ 	int rc;
++ 
++ 	if (!test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
++ 		netdev_err(bp->dev, "bnxt_fw_reset_task() called when not in fw reset mode!\n");
++ 		return;
++ 	}
++ 
++ 	switch (bp->fw_reset_state) {
++ 	case BNXT_FW_RESET_STATE_POLL_VF: {
++ 		int n = bnxt_get_registered_vfs(bp);
++ 		int tmo;
++ 
++ 		if (n < 0) {
++ 			netdev_err(bp->dev, "Firmware reset aborted, subsequent func_qcfg cmd failed, rc = %d, %d msecs since reset timestamp\n",
++ 				   n, jiffies_to_msecs(jiffies -
++ 				   bp->fw_reset_timestamp));
++ 			goto fw_reset_abort;
++ 		} else if (n > 0) {
++ 			if (time_after(jiffies, bp->fw_reset_timestamp +
++ 				       (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 				clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 				bp->fw_reset_state = 0;
++ 				netdev_err(bp->dev, "Firmware reset aborted, bnxt_get_registered_vfs() returns %d\n",
++ 					   n);
++ 				return;
++ 			}
++ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 			return;
++ 		}
++ 		bp->fw_reset_timestamp = jiffies;
++ 		rtnl_lock();
++ 		bnxt_fw_reset_close(bp);
++ 		if (bp->fw_cap & BNXT_FW_CAP_ERR_RECOVER_RELOAD) {
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_POLL_FW_DOWN;
++ 			tmo = HZ / 10;
++ 		} else {
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 			tmo = bp->fw_reset_min_dsecs * HZ / 10;
++ 		}
++ 		rtnl_unlock();
++ 		bnxt_queue_fw_reset_work(bp, tmo);
++ 		return;
++ 	}
++ 	case BNXT_FW_RESET_STATE_POLL_FW_DOWN: {
++ 		u32 val;
++ 
++ 		val = bnxt_fw_health_readl(bp, BNXT_FW_HEALTH_REG);
++ 		if (!(val & BNXT_FW_STATUS_SHUTDOWN) &&
++ 		    !time_after(jiffies, bp->fw_reset_timestamp +
++ 		    (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 			bnxt_queue_fw_reset_work(bp, HZ / 5);
++ 			return;
++ 		}
++ 
++ 		if (!bp->fw_health->master) {
++ 			u32 wait_dsecs = bp->fw_health->normal_func_wait_dsecs;
++ 
++ 			bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 			bnxt_queue_fw_reset_work(bp, wait_dsecs * HZ / 10);
++ 			return;
++ 		}
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_RESET_FW;
++ 	}
++ 	/* fall through */
++ 	case BNXT_FW_RESET_STATE_RESET_FW:
++ 		bnxt_reset_all(bp);
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_ENABLE_DEV;
++ 		bnxt_queue_fw_reset_work(bp, bp->fw_reset_min_dsecs * HZ / 10);
++ 		return;
++ 	case BNXT_FW_RESET_STATE_ENABLE_DEV:
++ 		if (test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state)) {
++ 			u32 val;
++ 
++ 			val = bnxt_fw_health_readl(bp,
++ 						   BNXT_FW_RESET_INPROG_REG);
++ 			if (val)
++ 				netdev_warn(bp->dev, "FW reset inprog %x after min wait time.\n",
++ 					    val);
++ 		}
++ 		clear_bit(BNXT_STATE_FW_FATAL_COND, &bp->state);
++ 		if (pci_enable_device(bp->pdev)) {
++ 			netdev_err(bp->dev, "Cannot re-enable PCI device\n");
++ 			goto fw_reset_abort;
++ 		}
++ 		pci_set_master(bp->pdev);
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_POLL_FW;
++ 		/* fall through */
++ 	case BNXT_FW_RESET_STATE_POLL_FW:
++ 		bp->hwrm_cmd_timeout = SHORT_HWRM_CMD_TIMEOUT;
++ 		rc = __bnxt_hwrm_ver_get(bp, true);
++ 		if (rc) {
++ 			if (time_after(jiffies, bp->fw_reset_timestamp +
++ 				       (bp->fw_reset_max_dsecs * HZ / 10))) {
++ 				netdev_err(bp->dev, "Firmware reset aborted\n");
++ 				goto fw_reset_abort;
++ 			}
++ 			bnxt_queue_fw_reset_work(bp, HZ / 5);
++ 			return;
++ 		}
++ 		bp->hwrm_cmd_timeout = DFLT_HWRM_CMD_TIMEOUT;
++ 		bp->fw_reset_state = BNXT_FW_RESET_STATE_OPENING;
++ 		/* fall through */
++ 	case BNXT_FW_RESET_STATE_OPENING:
++ 		while (!rtnl_trylock()) {
++ 			bnxt_queue_fw_reset_work(bp, HZ / 10);
++ 			return;
++ 		}
++ 		rc = bnxt_open(bp->dev);
++ 		if (rc) {
++ 			netdev_err(bp->dev, "bnxt_open_nic() failed\n");
++ 			clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 			dev_close(bp->dev);
++ 		}
++ 
++ 		bp->fw_reset_state = 0;
++ 		/* Make sure fw_reset_state is 0 before clearing the flag */
++ 		smp_mb__before_atomic();
++ 		clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 		bnxt_ulp_start(bp, rc);
++ 		if (!rc)
++ 			bnxt_reenable_sriov(bp);
++ 		bnxt_dl_health_recovery_done(bp);
++ 		bnxt_dl_health_status_update(bp, true);
++ 		rtnl_unlock();
++ 		break;
++ 	}
++ 	return;
++ 
++ fw_reset_abort:
++ 	clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
++ 	if (bp->fw_reset_state != BNXT_FW_RESET_STATE_POLL_VF)
++ 		bnxt_dl_health_status_update(bp, false);
++ 	bp->fw_reset_state = 0;
++ 	rtnl_lock();
++ 	dev_close(bp->dev);
++ 	rtnl_unlock();
++ }
++ 
+++>>>>>>> 12de2eadf878 (bnxt_en: Fix RDMA driver failure with SRIOV after firmware reset.)
+  static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
+  {
+  	int rc;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
