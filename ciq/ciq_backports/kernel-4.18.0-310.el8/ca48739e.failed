@@ -1,0 +1,139 @@
+Drivers: hv: vmbus: Move Hyper-V page allocator to arch neutral code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Michael Kelley <mikelley@microsoft.com>
+commit ca48739e59df31d16c27dbcd9ea2ea61d7caa9fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/ca48739e.failed
+
+The Hyper-V page allocator functions are implemented in an architecture
+neutral way.  Move them into the architecture neutral VMbus module so
+a separate implementation for ARM64 is not needed.
+
+No functional change.
+
+	Signed-off-by: Michael Kelley <mikelley@microsoft.com>
+	Reviewed-by: Boqun Feng <boqun.feng@gmail.com>
+Link: https://lore.kernel.org/r/1614721102-2241-2-git-send-email-mikelley@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit ca48739e59df31d16c27dbcd9ea2ea61d7caa9fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mshyperv.h
+diff --cc arch/x86/include/asm/mshyperv.h
+index 1cf8cd215d06,ef6e968e2828..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -238,10 -233,6 +238,13 @@@ static inline struct hv_vp_assist_page 
+  
+  void __init hyperv_init(void);
+  void hyperv_setup_mmu_ops(void);
+++<<<<<<< HEAD
+ +void *hv_alloc_hyperv_page(void);
+ +void *hv_alloc_hyperv_zeroed_page(void);
+ +void hv_free_hyperv_page(unsigned long addr);
+ +void hyperv_reenlightenment_intr(struct pt_regs *regs);
+++=======
+++>>>>>>> ca48739e59df (Drivers: hv: vmbus: Move Hyper-V page allocator to arch neutral code)
+  void set_hv_tscchange_cb(void (*cb)(void));
+  void clear_hv_tscchange_cb(void);
+  void hyperv_stop_tsc_emulation(void);
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+index 42dff5ca4ffc..07f31ded1e40 100644
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -57,28 +57,6 @@ EXPORT_SYMBOL_GPL(hyperv_pcpu_output_arg);
+ u32 hv_max_vp_index;
+ EXPORT_SYMBOL_GPL(hv_max_vp_index);
+ 
+-void *hv_alloc_hyperv_page(void)
+-{
+-	BUILD_BUG_ON(PAGE_SIZE != HV_HYP_PAGE_SIZE);
+-
+-	return (void *)__get_free_page(GFP_KERNEL);
+-}
+-EXPORT_SYMBOL_GPL(hv_alloc_hyperv_page);
+-
+-void *hv_alloc_hyperv_zeroed_page(void)
+-{
+-        BUILD_BUG_ON(PAGE_SIZE != HV_HYP_PAGE_SIZE);
+-
+-        return (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+-}
+-EXPORT_SYMBOL_GPL(hv_alloc_hyperv_zeroed_page);
+-
+-void hv_free_hyperv_page(unsigned long addr)
+-{
+-	free_page(addr);
+-}
+-EXPORT_SYMBOL_GPL(hv_free_hyperv_page);
+-
+ static int hv_cpu_init(unsigned int cpu)
+ {
+ 	u64 msr_vp_index;
+* Unmerged path arch/x86/include/asm/mshyperv.h
+diff --git a/drivers/hv/hv.c b/drivers/hv/hv.c
+index 56ccf3499524..ea2a02f8aa47 100644
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@ -49,6 +49,42 @@ int hv_init(void)
+ 	return 0;
+ }
+ 
++/*
++ * Functions for allocating and freeing memory with size and
++ * alignment HV_HYP_PAGE_SIZE. These functions are needed because
++ * the guest page size may not be the same as the Hyper-V page
++ * size. We depend upon kmalloc() aligning power-of-two size
++ * allocations to the allocation size boundary, so that the
++ * allocated memory appears to Hyper-V as a page of the size
++ * it expects.
++ */
++
++void *hv_alloc_hyperv_page(void)
++{
++	BUILD_BUG_ON(PAGE_SIZE <  HV_HYP_PAGE_SIZE);
++
++	if (PAGE_SIZE == HV_HYP_PAGE_SIZE)
++		return (void *)__get_free_page(GFP_KERNEL);
++	else
++		return kmalloc(HV_HYP_PAGE_SIZE, GFP_KERNEL);
++}
++
++void *hv_alloc_hyperv_zeroed_page(void)
++{
++	if (PAGE_SIZE == HV_HYP_PAGE_SIZE)
++		return (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++	else
++		return kzalloc(HV_HYP_PAGE_SIZE, GFP_KERNEL);
++}
++
++void hv_free_hyperv_page(unsigned long addr)
++{
++	if (PAGE_SIZE == HV_HYP_PAGE_SIZE)
++		free_page(addr);
++	else
++		kfree((void *)addr);
++}
++
+ /*
+  * hv_post_message - Post a message using the hypervisor message IPC.
+  *
+diff --git a/include/asm-generic/mshyperv.h b/include/asm-generic/mshyperv.h
+index dff58a3db5d5..694b5bc3561c 100644
+--- a/include/asm-generic/mshyperv.h
++++ b/include/asm-generic/mshyperv.h
+@@ -117,6 +117,10 @@ extern u32 hv_max_vp_index;
+ /* Sentinel value for an uninitialized entry in hv_vp_index array */
+ #define VP_INVAL	U32_MAX
+ 
++void *hv_alloc_hyperv_page(void);
++void *hv_alloc_hyperv_zeroed_page(void);
++void hv_free_hyperv_page(unsigned long addr);
++
+ /**
+  * hv_cpu_number_to_vp_number() - Map CPU to VP.
+  * @cpu_number: CPU number in Linux terms
