@@ -1,0 +1,109 @@
+x86/purgatory: Do not use __builtin_memcpy and __builtin_memset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Nick Desaulniers <ndesaulniers@google.com>
+commit 4ce97317f41d38584fb93578e922fcd19e535f5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4ce97317.failed
+
+Implementing memcpy and memset in terms of __builtin_memcpy and
+__builtin_memset is problematic.
+
+GCC at -O2 will replace calls to the builtins with calls to memcpy and
+memset (but will generate an inline implementation at -Os).  Clang will
+replace the builtins with these calls regardless of optimization level.
+$ llvm-objdump -dr arch/x86/purgatory/string.o | tail
+
+0000000000000339 memcpy:
+     339: 48 b8 00 00 00 00 00 00 00 00 movabsq $0, %rax
+                000000000000033b:  R_X86_64_64  memcpy
+     343: ff e0                         jmpq    *%rax
+
+0000000000000345 memset:
+     345: 48 b8 00 00 00 00 00 00 00 00 movabsq $0, %rax
+                0000000000000347:  R_X86_64_64  memset
+     34f: ff e0
+
+Such code results in infinite recursion at runtime. This is observed
+when doing kexec.
+
+Instead, reuse an implementation from arch/x86/boot/compressed/string.c.
+This requires to implement a stub function for warn(). Also, Clang may
+lower memcmp's that compare against 0 to bcmp's, so add a small definition,
+too. See also: commit 5f074f3e192f ("lib/string.c: implement a basic bcmp")
+
+Fixes: 8fc5b4d4121c ("purgatory: core purgatory functionality")
+	Reported-by: Vaibhav Rustagi <vaibhavrustagi@google.com>
+	Debugged-by: Vaibhav Rustagi <vaibhavrustagi@google.com>
+	Debugged-by: Manoj Gupta <manojgupta@google.com>
+	Suggested-by: Alistair Delva <adelva@google.com>
+	Signed-off-by: Nick Desaulniers <ndesaulniers@google.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Vaibhav Rustagi <vaibhavrustagi@google.com>
+	Cc: stable@vger.kernel.org
+Link: https://bugs.chromium.org/p/chromium/issues/detail?id=984056
+Link: https://lkml.kernel.org/r/20190807221539.94583-1-ndesaulniers@google.com
+
+(cherry picked from commit 4ce97317f41d38584fb93578e922fcd19e535f5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/purgatory/Makefile
+#	arch/x86/purgatory/string.c
+diff --cc arch/x86/purgatory/Makefile
+index f40064fc27a6,91ef244026d2..000000000000
+--- a/arch/x86/purgatory/Makefile
++++ b/arch/x86/purgatory/Makefile
+@@@ -6,7 -6,10 +6,14 @@@ purgatory-y := purgatory.o stack.o setu
+  targets += $(purgatory-y)
+  PURGATORY_OBJS = $(addprefix $(obj)/,$(purgatory-y))
+  
+++<<<<<<< HEAD
+ +$(obj)/sha256.o: $(srctree)/lib/crypto/sha256.c FORCE
+++=======
++ $(obj)/string.o: $(srctree)/arch/x86/boot/compressed/string.c FORCE
++ 	$(call if_changed_rule,cc_o_c)
++ 
++ $(obj)/sha256.o: $(srctree)/lib/sha256.c FORCE
+++>>>>>>> 4ce97317f41d (x86/purgatory: Do not use __builtin_memcpy and __builtin_memset)
+  	$(call if_changed_rule,cc_o_c)
+  
+  LDFLAGS_purgatory.ro := -e purgatory_start -r --no-undefined -nostdlib -z nodefaultlib
+* Unmerged path arch/x86/purgatory/string.c
+diff --git a/arch/x86/boot/string.c b/arch/x86/boot/string.c
+index 90154df8f125..ea4626f12141 100644
+--- a/arch/x86/boot/string.c
++++ b/arch/x86/boot/string.c
+@@ -39,6 +39,14 @@ int memcmp(const void *s1, const void *s2, size_t len)
+ 	return diff;
+ }
+ 
++/*
++ * Clang may lower `memcmp == 0` to `bcmp == 0`.
++ */
++int bcmp(const void *s1, const void *s2, size_t len)
++{
++	return memcmp(s1, s2, len);
++}
++
+ int strcmp(const char *str1, const char *str2)
+ {
+ 	const unsigned char *s1 = (const unsigned char *)str1;
+* Unmerged path arch/x86/purgatory/Makefile
+diff --git a/arch/x86/purgatory/purgatory.c b/arch/x86/purgatory/purgatory.c
+index 437de0560b82..03a13e5a34ee 100644
+--- a/arch/x86/purgatory/purgatory.c
++++ b/arch/x86/purgatory/purgatory.c
+@@ -51,3 +51,9 @@ void purgatory(void)
+ 			;
+ 	}
+ }
++
++/*
++ * Defined in order to reuse memcpy() and memset() from
++ * arch/x86/boot/compressed/string.c
++ */
++void warn(const char *msg) {}
+* Unmerged path arch/x86/purgatory/string.c
