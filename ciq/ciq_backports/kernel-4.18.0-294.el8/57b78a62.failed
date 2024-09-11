@@ -1,0 +1,285 @@
+x86/uaccess, kasan: Fix KASAN vs SMAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 57b78a62e7f23c4686fe54091cdc3d12e60d6513
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/57b78a62.failed
+
+KASAN inserts extra code for every LOAD/STORE emitted by te compiler.
+Much of this code is simple and safe to run with AC=1, however the
+kasan_report() function, called on error, is most certainly not safe
+to call with AC=1.
+
+Therefore wrap kasan_report() in user_access_{save,restore}; which for
+x86 SMAP, saves/restores EFLAGS and clears AC before calling the real
+function.
+
+Also ensure all the functions are without __fentry__ hook. The
+function tracer is also not safe.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 57b78a62e7f23c4686fe54091cdc3d12e60d6513)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/Makefile
+#	mm/kasan/kasan.c
+#	mm/kasan/report.c
+diff --cc mm/kasan/Makefile
+index 3289db38bc87,613dfe681e9f..000000000000
+--- a/mm/kasan/Makefile
++++ b/mm/kasan/Makefile
+@@@ -1,11 -1,24 +1,36 @@@
+  # SPDX-License-Identifier: GPL-2.0
+  KASAN_SANITIZE := n
+++<<<<<<< HEAD
+ +UBSAN_SANITIZE_kasan.o := n
+ +KCOV_INSTRUMENT := n
+ +
+ +CFLAGS_REMOVE_kasan.o = -pg
+++=======
++ UBSAN_SANITIZE_common.o := n
++ UBSAN_SANITIZE_generic.o := n
++ UBSAN_SANITIZE_generic_report.o := n
++ UBSAN_SANITIZE_tags.o := n
++ KCOV_INSTRUMENT := n
++ 
++ CFLAGS_REMOVE_common.o = -pg
++ CFLAGS_REMOVE_generic.o = -pg
++ CFLAGS_REMOVE_generic_report.o = -pg
++ CFLAGS_REMOVE_tags.o = -pg
++ 
+++>>>>>>> 57b78a62e7f2 (x86/uaccess, kasan: Fix KASAN vs SMAP)
+  # Function splitter causes unnecessary splits in __asan_load1/__asan_store1
+  # see: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=63533
+ +CFLAGS_kasan.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
+  
+++<<<<<<< HEAD
+ +obj-y := kasan.o report.o kasan_init.o quarantine.o
+++=======
++ CFLAGS_common.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
++ CFLAGS_generic.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
++ CFLAGS_generic_report.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
++ CFLAGS_tags.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
++ 
++ obj-$(CONFIG_KASAN) := common.o init.o report.o
++ obj-$(CONFIG_KASAN_GENERIC) += generic.o generic_report.o quarantine.o
++ obj-$(CONFIG_KASAN_SW_TAGS) += tags.o tags_report.o
+++>>>>>>> 57b78a62e7f2 (x86/uaccess, kasan: Fix KASAN vs SMAP)
+diff --cc mm/kasan/kasan.c
+index d79269dd4b58,09c586474511..000000000000
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+@@@ -657,147 -615,15 +658,159 @@@ void kasan_free_shadow(const struct vm_
+  		vfree(kasan_mem_to_shadow(vm->addr));
+  }
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +static void register_global(struct kasan_global *global)
+ +{
+ +	size_t aligned_size = round_up(global->size, KASAN_SHADOW_SCALE_SIZE);
+ +
+ +	kasan_unpoison_shadow(global->beg, global->size);
+ +
+ +	kasan_poison_shadow(global->beg + aligned_size,
+ +		global->size_with_redzone - aligned_size,
+ +		KASAN_GLOBAL_REDZONE);
+ +}
+ +
+ +void __asan_register_globals(struct kasan_global *globals, size_t size)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < size; i++)
+ +		register_global(&globals[i]);
+ +}
+ +EXPORT_SYMBOL(__asan_register_globals);
+ +
+ +void __asan_unregister_globals(struct kasan_global *globals, size_t size)
+ +{
+ +}
+ +EXPORT_SYMBOL(__asan_unregister_globals);
+ +
+ +#define DEFINE_ASAN_LOAD_STORE(size)					\
+ +	void __asan_load##size(unsigned long addr)			\
+ +	{								\
+ +		check_memory_region_inline(addr, size, false, _RET_IP_);\
+ +	}								\
+ +	EXPORT_SYMBOL(__asan_load##size);				\
+ +	__alias(__asan_load##size)					\
+ +	void __asan_load##size##_noabort(unsigned long);		\
+ +	EXPORT_SYMBOL(__asan_load##size##_noabort);			\
+ +	void __asan_store##size(unsigned long addr)			\
+ +	{								\
+ +		check_memory_region_inline(addr, size, true, _RET_IP_);	\
+ +	}								\
+ +	EXPORT_SYMBOL(__asan_store##size);				\
+ +	__alias(__asan_store##size)					\
+ +	void __asan_store##size##_noabort(unsigned long);		\
+ +	EXPORT_SYMBOL(__asan_store##size##_noabort)
+ +
+ +DEFINE_ASAN_LOAD_STORE(1);
+ +DEFINE_ASAN_LOAD_STORE(2);
+ +DEFINE_ASAN_LOAD_STORE(4);
+ +DEFINE_ASAN_LOAD_STORE(8);
+ +DEFINE_ASAN_LOAD_STORE(16);
+ +
+ +void __asan_loadN(unsigned long addr, size_t size)
+ +{
+ +	check_memory_region(addr, size, false, _RET_IP_);
+ +}
+ +EXPORT_SYMBOL(__asan_loadN);
+ +
+ +__alias(__asan_loadN)
+ +void __asan_loadN_noabort(unsigned long, size_t);
+ +EXPORT_SYMBOL(__asan_loadN_noabort);
+ +
+ +void __asan_storeN(unsigned long addr, size_t size)
+ +{
+ +	check_memory_region(addr, size, true, _RET_IP_);
+ +}
+ +EXPORT_SYMBOL(__asan_storeN);
+ +
+ +__alias(__asan_storeN)
+ +void __asan_storeN_noabort(unsigned long, size_t);
+ +EXPORT_SYMBOL(__asan_storeN_noabort);
+ +
+ +/* to shut up compiler complaints */
+ +void __asan_handle_no_return(void) {}
+ +EXPORT_SYMBOL(__asan_handle_no_return);
+ +
+ +/* Emitted by compiler to poison large objects when they go out of scope. */
+ +void __asan_poison_stack_memory(const void *addr, size_t size)
+ +{
+ +	/*
+ +	 * Addr is KASAN_SHADOW_SCALE_SIZE-aligned and the object is surrounded
+ +	 * by redzones, so we simply round up size to simplify logic.
+ +	 */
+ +	kasan_poison_shadow(addr, round_up(size, KASAN_SHADOW_SCALE_SIZE),
+ +			    KASAN_USE_AFTER_SCOPE);
+ +}
+ +EXPORT_SYMBOL(__asan_poison_stack_memory);
+ +
+ +/* Emitted by compiler to unpoison large objects when they go into scope. */
+ +void __asan_unpoison_stack_memory(const void *addr, size_t size)
+ +{
+ +	kasan_unpoison_shadow(addr, size);
+ +}
+ +EXPORT_SYMBOL(__asan_unpoison_stack_memory);
+ +
+ +/* Emitted by compiler to poison alloca()ed objects. */
+ +void __asan_alloca_poison(unsigned long addr, size_t size)
+ +{
+ +	size_t rounded_up_size = round_up(size, KASAN_SHADOW_SCALE_SIZE);
+ +	size_t padding_size = round_up(size, KASAN_ALLOCA_REDZONE_SIZE) -
+ +			rounded_up_size;
+ +	size_t rounded_down_size = round_down(size, KASAN_SHADOW_SCALE_SIZE);
+ +
+ +	const void *left_redzone = (const void *)(addr -
+ +			KASAN_ALLOCA_REDZONE_SIZE);
+ +	const void *right_redzone = (const void *)(addr + rounded_up_size);
+ +
+ +	WARN_ON(!IS_ALIGNED(addr, KASAN_ALLOCA_REDZONE_SIZE));
+ +
+ +	kasan_unpoison_shadow((const void *)(addr + rounded_down_size),
+ +			      size - rounded_down_size);
+ +	kasan_poison_shadow(left_redzone, KASAN_ALLOCA_REDZONE_SIZE,
+ +			KASAN_ALLOCA_LEFT);
+ +	kasan_poison_shadow(right_redzone,
+ +			padding_size + KASAN_ALLOCA_REDZONE_SIZE,
+ +			KASAN_ALLOCA_RIGHT);
+ +}
+ +EXPORT_SYMBOL(__asan_alloca_poison);
+ +
+ +/* Emitted by compiler to unpoison alloca()ed areas when the stack unwinds. */
+ +void __asan_allocas_unpoison(const void *stack_top, const void *stack_bottom)
+ +{
+ +	if (unlikely(!stack_top || stack_top > stack_bottom))
+ +		return;
+ +
+ +	kasan_unpoison_shadow(stack_top, stack_bottom - stack_top);
+ +}
+ +EXPORT_SYMBOL(__asan_allocas_unpoison);
+ +
+ +/* Emitted by the compiler to [un]poison local variables. */
+ +#define DEFINE_ASAN_SET_SHADOW(byte) \
+ +	void __asan_set_shadow_##byte(const void *addr, size_t size)	\
+ +	{								\
+ +		__memset((void *)addr, 0x##byte, size);			\
+ +	}								\
+ +	EXPORT_SYMBOL(__asan_set_shadow_##byte)
+ +
+ +DEFINE_ASAN_SET_SHADOW(00);
+ +DEFINE_ASAN_SET_SHADOW(f1);
+ +DEFINE_ASAN_SET_SHADOW(f2);
+ +DEFINE_ASAN_SET_SHADOW(f3);
+ +DEFINE_ASAN_SET_SHADOW(f5);
+ +DEFINE_ASAN_SET_SHADOW(f8);
+ +
+++=======
++ extern void __kasan_report(unsigned long addr, size_t size, bool is_write, unsigned long ip);
++ 
++ void kasan_report(unsigned long addr, size_t size, bool is_write, unsigned long ip)
++ {
++ 	unsigned long flags = user_access_save();
++ 	__kasan_report(addr, size, is_write, ip);
++ 	user_access_restore(flags);
++ }
++ 
+++>>>>>>> 57b78a62e7f2 (x86/uaccess, kasan: Fix KASAN vs SMAP):mm/kasan/common.c
+  #ifdef CONFIG_MEMORY_HOTPLUG
+  static bool shadow_mapped(unsigned long addr)
+  {
+diff --cc mm/kasan/report.c
+index 5c169aa688fd,0772820ad098..000000000000
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@@ -393,12 -266,29 +393,31 @@@ static inline bool kasan_report_enabled
+  	return !test_and_set_bit(KASAN_BIT_REPORTED, &kasan_flags);
+  }
+  
+++<<<<<<< HEAD
+ +void kasan_report(unsigned long addr, size_t size,
+ +		bool is_write, unsigned long ip)
+++=======
++ void kasan_report_invalid_free(void *object, unsigned long ip)
++ {
++ 	unsigned long flags;
++ 
++ 	start_report(&flags);
++ 	pr_err("BUG: KASAN: double-free or invalid-free in %pS\n", (void *)ip);
++ 	print_tags(get_tag(object), reset_tag(object));
++ 	object = reset_tag(object);
++ 	pr_err("\n");
++ 	print_address_description(object);
++ 	pr_err("\n");
++ 	print_shadow_for_address(object);
++ 	end_report(&flags);
++ }
++ 
++ void __kasan_report(unsigned long addr, size_t size, bool is_write, unsigned long ip)
+++>>>>>>> 57b78a62e7f2 (x86/uaccess, kasan: Fix KASAN vs SMAP)
+  {
+  	struct kasan_access_info info;
+ -	void *tagged_addr;
+ -	void *untagged_addr;
+ -	unsigned long flags;
+  
+ -	if (likely(!report_enabled()))
+ +	if (likely(!kasan_report_enabled()))
+  		return;
+  
+  	disable_trace_on_warning();
+* Unmerged path mm/kasan/Makefile
+* Unmerged path mm/kasan/kasan.c
+* Unmerged path mm/kasan/report.c
