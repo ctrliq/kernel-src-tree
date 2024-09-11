@@ -1,0 +1,287 @@
+IB/hfi1: Move rvt_cq_wc struct into uapi directory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Kamenee Arumugam <kamenee.arumugam@intel.com>
+commit 239b0e52d8aa64d2559c672fd8c29cf1fffc3ec7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/239b0e52.failed
+
+The rvt_cq_wc struct elements are shared between rdmavt and the providers
+but not in uapi directory.  As per the comment in
+https://marc.info/?l=linux-rdma&m=152296522708522&w=2 The hfi1 driver and
+the rdma core driver are not using shared structures in the uapi
+directory.
+
+In that case, move rvt_cq_wc struct into the rvt-abi.h header file and
+create a rvt_k_cq_w for the kernel completion queue.
+
+	Signed-off-by: Kamenee Arumugam <kamenee.arumugam@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 239b0e52d8aa64d2559c672fd8c29cf1fffc3ec7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/cq.c
+diff --cc drivers/infiniband/sw/rdmavt/cq.c
+index 4f1544ad4aff,2602ad8b8cb0..000000000000
+--- a/drivers/infiniband/sw/rdmavt/cq.c
++++ b/drivers/infiniband/sw/rdmavt/cq.c
+@@@ -173,18 -186,16 +187,24 @@@ static void send_complete(struct work_s
+   *
+   * Called by ib_create_cq() in the generic verbs code.
+   *
+ - * Return: 0 on success
+ + * Return: pointer to the completion queue or negative errno values
+ + * for failure.
+   */
+ -int rvt_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
+ -		  struct ib_udata *udata)
+ +struct ib_cq *rvt_create_cq(struct ib_device *ibdev,
+ +			    const struct ib_cq_init_attr *attr,
+ +			    struct ib_ucontext *context,
+ +			    struct ib_udata *udata)
+  {
+ -	struct ib_device *ibdev = ibcq->device;
+  	struct rvt_dev_info *rdi = ib_to_rvt(ibdev);
+++<<<<<<< HEAD
+ +	struct rvt_cq *cq;
+ +	struct rvt_cq_wc *wc;
+ +	struct ib_cq *ret;
+++=======
++ 	struct rvt_cq *cq = ibcq_to_rvtcq(ibcq);
++ 	struct rvt_cq_wc *u_wc = NULL;
++ 	struct rvt_k_cq_wc *k_wc = NULL;
+++>>>>>>> 239b0e52d8aa (IB/hfi1: Move rvt_cq_wc struct into uapi directory)
+  	u32 sz;
+  	unsigned int entries = attr->cqe;
+  	int comp_vector = attr->comp_vector;
+@@@ -212,17 -219,18 +232,32 @@@
+  	 * We need to use vmalloc() in order to support mmap and large
+  	 * numbers of entries.
+  	 */
+++<<<<<<< HEAD
+ +	sz = sizeof(*wc);
+ +	if (udata && udata->outlen >= sizeof(__u64))
+ +		sz += sizeof(struct ib_uverbs_wc) * (entries + 1);
+ +	else
+ +		sz += sizeof(struct ib_wc) * (entries + 1);
+ +	wc = udata ?
+ +		vmalloc_user(sz) :
+ +		vzalloc_node(sz, rdi->dparms.node);
+ +	if (!wc) {
+ +		ret = ERR_PTR(-ENOMEM);
+ +		goto bail_cq;
+++=======
++ 	if (udata && udata->outlen >= sizeof(__u64)) {
++ 		sz = sizeof(struct ib_uverbs_wc) * (entries + 1);
++ 		sz += sizeof(*u_wc);
++ 		u_wc = vmalloc_user(sz);
++ 		if (!u_wc)
++ 			return -ENOMEM;
++ 	} else {
++ 		sz = sizeof(struct ib_wc) * (entries + 1);
++ 		sz += sizeof(*k_wc);
++ 		k_wc = vzalloc_node(sz, rdi->dparms.node);
++ 		if (!k_wc)
++ 			return -ENOMEM;
+++>>>>>>> 239b0e52d8aa (IB/hfi1: Move rvt_cq_wc struct into uapi directory)
+  	}
+  
+  	/*
+@@@ -232,9 -240,9 +267,13 @@@
+  	if (udata && udata->outlen >= sizeof(__u64)) {
+  		int err;
+  
+++<<<<<<< HEAD
+ +		cq->ip = rvt_create_mmap_info(rdi, sz, context, wc);
+++=======
++ 		cq->ip = rvt_create_mmap_info(rdi, sz, udata, u_wc);
+++>>>>>>> 239b0e52d8aa (IB/hfi1: Move rvt_cq_wc struct into uapi directory)
+  		if (!cq->ip) {
+ -			err = -ENOMEM;
+ +			ret = ERR_PTR(-ENOMEM);
+  			goto bail_wc;
+  		}
+  
+@@@ -279,21 -285,20 +318,30 @@@
+  	cq->notify = RVT_CQ_NONE;
+  	spin_lock_init(&cq->lock);
+  	INIT_WORK(&cq->comptask, send_complete);
+- 	cq->queue = wc;
++ 	if (u_wc)
++ 		cq->queue = u_wc;
++ 	else
++ 		cq->kqueue = k_wc;
+  
+ +	ret = &cq->ibcq;
+ +
+  	trace_rvt_create_cq(cq, attr);
+ -	return 0;
+ +	goto done;
+  
+  bail_ip:
+  	kfree(cq->ip);
+  bail_wc:
+++<<<<<<< HEAD
+ +	vfree(wc);
+ +bail_cq:
+ +	kfree(cq);
+ +done:
+ +	return ret;
+++=======
++ 	vfree(u_wc);
++ 	vfree(k_wc);
++ 	return err;
+++>>>>>>> 239b0e52d8aa (IB/hfi1: Move rvt_cq_wc struct into uapi directory)
+  }
+  
+  /**
+diff --git a/drivers/infiniband/hw/hfi1/qp.c b/drivers/infiniband/hw/hfi1/qp.c
+index 4e0e9fc0a777..41261e72c429 100644
+--- a/drivers/infiniband/hw/hfi1/qp.c
++++ b/drivers/infiniband/hw/hfi1/qp.c
+@@ -702,8 +702,8 @@ void qp_iter_print(struct seq_file *s, struct rvt_qp_iter *iter)
+ 		   sde ? sde->this_idx : 0,
+ 		   send_context,
+ 		   send_context ? send_context->sw_index : 0,
+-		   ibcq_to_rvtcq(qp->ibqp.send_cq)->queue->head,
+-		   ibcq_to_rvtcq(qp->ibqp.send_cq)->queue->tail,
++		   ib_cq_head(qp->ibqp.send_cq),
++		   ib_cq_tail(qp->ibqp.send_cq),
+ 		   qp->pid,
+ 		   qp->s_state,
+ 		   qp->s_ack_state,
+* Unmerged path drivers/infiniband/sw/rdmavt/cq.c
+diff --git a/include/rdma/rdmavt_cq.h b/include/rdma/rdmavt_cq.h
+index 75dc65c0bfb8..ab22860a63e2 100644
+--- a/include/rdma/rdmavt_cq.h
++++ b/include/rdma/rdmavt_cq.h
+@@ -60,19 +60,28 @@
+  */
+ #define RVT_CQ_NONE      (IB_CQ_NEXT_COMP + 1)
+ 
++/*
++ * Define read macro that apply smp_load_acquire memory barrier
++ * when reading indice of circular buffer that mmaped to user space.
++ */
++#define RDMA_READ_UAPI_ATOMIC(member) smp_load_acquire(&(member).val)
++
++/*
++ * Define write macro that uses smp_store_release memory barrier
++ * when writing indice of circular buffer that mmaped to user space.
++ */
++#define RDMA_WRITE_UAPI_ATOMIC(member, x) smp_store_release(&(member).val, x)
++#include <rdma/rvt-abi.h>
++
+ /*
+  * This structure is used to contain the head pointer, tail pointer,
+  * and completion queue entries as a single memory allocation so
+  * it can be mmap'ed into user space.
+  */
+-struct rvt_cq_wc {
++struct rvt_k_cq_wc {
+ 	u32 head;               /* index of next entry to fill */
+ 	u32 tail;               /* index of next ib_poll_cq() entry */
+-	union {
+-		/* these are actually size ibcq.cqe + 1 */
+-		struct ib_uverbs_wc uqueue[0];
+-		struct ib_wc kqueue[0];
+-	};
++	struct ib_wc kqueue[];
+ };
+ 
+ /*
+@@ -88,6 +97,7 @@ struct rvt_cq {
+ 	struct rvt_dev_info *rdi;
+ 	struct rvt_cq_wc *queue;
+ 	struct rvt_mmap_info *ip;
++	struct rvt_k_cq_wc *kqueue;
+ };
+ 
+ static inline struct rvt_cq *ibcq_to_rvtcq(struct ib_cq *ibcq)
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index 84d0f36afc2f..7fcd687af278 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -820,6 +820,38 @@ struct rvt_qp_iter {
+ 	int n;
+ };
+ 
++/**
++ * ib_cq_tail - Return tail index of cq buffer
++ * @send_cq - The cq for send
++ *
++ * This is called in qp_iter_print to get tail
++ * of cq buffer.
++ */
++static inline u32 ib_cq_tail(struct ib_cq *send_cq)
++{
++	struct rvt_cq *cq = ibcq_to_rvtcq(send_cq);
++
++	return ibcq_to_rvtcq(send_cq)->ip ?
++	       RDMA_READ_UAPI_ATOMIC(cq->queue->tail) :
++	       ibcq_to_rvtcq(send_cq)->kqueue->tail;
++}
++
++/**
++ * ib_cq_head - Return head index of cq buffer
++ * @send_cq - The cq for send
++ *
++ * This is called in qp_iter_print to get head
++ * of cq buffer.
++ */
++static inline u32 ib_cq_head(struct ib_cq *send_cq)
++{
++	struct rvt_cq *cq = ibcq_to_rvtcq(send_cq);
++
++	return ibcq_to_rvtcq(send_cq)->ip ?
++	       RDMA_READ_UAPI_ATOMIC(cq->queue->head) :
++	       ibcq_to_rvtcq(send_cq)->kqueue->head;
++}
++
+ struct rvt_qp_iter *rvt_qp_iter_init(struct rvt_dev_info *rdi,
+ 				     u64 v,
+ 				     void (*cb)(struct rvt_qp *qp, u64 v));
+diff --git a/include/uapi/rdma/rvt-abi.h b/include/uapi/rdma/rvt-abi.h
+new file mode 100644
+index 000000000000..8e5f7e0c15fe
+--- /dev/null
++++ b/include/uapi/rdma/rvt-abi.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
++
++/*
++ * This file contains defines, structures, etc. that are used
++ * to communicate between kernel and user code.
++ */
++
++#ifndef RVT_ABI_USER_H
++#define RVT_ABI_USER_H
++
++#include <linux/types.h>
++#include <rdma/ib_user_verbs.h>
++#ifndef RDMA_ATOMIC_UAPI
++#define RDMA_ATOMIC_UAPI(_type, _name) struct{ _type val; } _name
++#endif
++
++/*
++ * This structure is used to contain the head pointer, tail pointer,
++ * and completion queue entries as a single memory allocation so
++ * it can be mmap'ed into user space.
++ */
++struct rvt_cq_wc {
++	/* index of next entry to fill */
++	RDMA_ATOMIC_UAPI(__u32, head);
++	/* index of next ib_poll_cq() entry */
++	RDMA_ATOMIC_UAPI(__u32, tail);
++
++	/* these are actually size ibcq.cqe + 1 */
++	struct ib_uverbs_wc uqueue[];
++};
++
++#endif /* RVT_ABI_USER_H */
