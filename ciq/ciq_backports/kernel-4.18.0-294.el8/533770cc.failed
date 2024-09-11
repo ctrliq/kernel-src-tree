@@ -1,0 +1,182 @@
+new helper: get_tree_keyed()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 533770cc0ae84890624dc129609f3d75855c8982
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/533770cc.failed
+
+For vfs_get_keyed_super users.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 533770cc0ae84890624dc129609f3d75855c8982)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfsctl.c
+#	fs/proc/root.c
+#	include/linux/fs_context.h
+diff --cc fs/nfsd/nfsctl.c
+index f831a0a9bd66,695223394985..000000000000
+--- a/fs/nfsd/nfsctl.c
++++ b/fs/nfsd/nfsctl.c
+@@@ -1380,14 -1382,30 +1380,37 @@@ static int nfsd_fill_super(struct super
+  		return PTR_ERR(dentry);
+  	nn->nfsd_client_dir = dentry;
+  	return 0;
+ +
+  }
+  
+ -static int nfsd_fs_get_tree(struct fs_context *fc)
+ +static struct dentry *nfsd_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+  {
+++<<<<<<< HEAD
+ +	struct net *net = current->nsproxy->net_ns;
+ +	return mount_ns(fs_type, flags, data, net, net->user_ns, nfsd_fill_super);
+++=======
++ 	return get_tree_keyed(fc, nfsd_fill_super, get_net(fc->net_ns));
++ }
++ 
++ static void nfsd_fs_free_fc(struct fs_context *fc)
++ {
++ 	if (fc->s_fs_info)
++ 		put_net(fc->s_fs_info);
++ }
++ 
++ static const struct fs_context_operations nfsd_fs_context_ops = {
++ 	.free		= nfsd_fs_free_fc,
++ 	.get_tree	= nfsd_fs_get_tree,
++ };
++ 
++ static int nfsd_init_fs_context(struct fs_context *fc)
++ {
++ 	put_user_ns(fc->user_ns);
++ 	fc->user_ns = get_user_ns(fc->net_ns->user_ns);
++ 	fc->ops = &nfsd_fs_context_ops;
++ 	return 0;
+++>>>>>>> 533770cc0ae8 (new helper: get_tree_keyed())
+  }
+  
+  static void nfsd_umount(struct super_block *sb)
+diff --cc fs/proc/root.c
+index f4b1a9d2eca6,0b7c8dffc9ae..000000000000
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@@ -83,22 -90,105 +83,27 @@@ int proc_remount(struct super_block *sb
+  	struct pid_namespace *pid = sb->s_fs_info;
+  
+  	sync_filesystem(sb);
+ -
+ -	proc_apply_options(sb, fc, pid, current_user_ns());
+ -	return 0;
+ +	return !proc_parse_options(data, pid);
+  }
+  
+ -static int proc_get_tree(struct fs_context *fc)
+ +static struct dentry *proc_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+  {
+ -	struct proc_fs_context *ctx = fc->fs_private;
+ +	struct pid_namespace *ns;
+  
+++<<<<<<< HEAD
+ +	if (flags & SB_KERNMOUNT) {
+ +		ns = data;
+ +		data = NULL;
+ +	} else {
+ +		ns = task_active_pid_ns(current);
+ +	}
+++=======
++ 	return get_tree_keyed(fc, proc_fill_super, ctx->pid_ns);
++ }
+++>>>>>>> 533770cc0ae8 (new helper: get_tree_keyed())
+  
+ -static void proc_fs_context_free(struct fs_context *fc)
+ -{
+ -	struct proc_fs_context *ctx = fc->fs_private;
+ -
+ -	put_pid_ns(ctx->pid_ns);
+ -	kfree(ctx);
+ -}
+ -
+ -static const struct fs_context_operations proc_fs_context_ops = {
+ -	.free		= proc_fs_context_free,
+ -	.parse_param	= proc_parse_param,
+ -	.get_tree	= proc_get_tree,
+ -	.reconfigure	= proc_reconfigure,
+ -};
+ -
+ -static int proc_init_fs_context(struct fs_context *fc)
+ -{
+ -	struct proc_fs_context *ctx;
+ -
+ -	ctx = kzalloc(sizeof(struct proc_fs_context), GFP_KERNEL);
+ -	if (!ctx)
+ -		return -ENOMEM;
+ -
+ -	ctx->pid_ns = get_pid_ns(task_active_pid_ns(current));
+ -	put_user_ns(fc->user_ns);
+ -	fc->user_ns = get_user_ns(ctx->pid_ns->user_ns);
+ -	fc->fs_private = ctx;
+ -	fc->ops = &proc_fs_context_ops;
+ -	return 0;
+ +	return mount_ns(fs_type, flags, data, ns, ns->user_ns, proc_fill_super);
+  }
+  
+  static void proc_kill_sb(struct super_block *sb)
+* Unmerged path include/linux/fs_context.h
+* Unmerged path fs/nfsd/nfsctl.c
+* Unmerged path fs/proc/root.c
+diff --git a/fs/super.c b/fs/super.c
+index 72596c26684f..465ae8e78230 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -1084,6 +1084,16 @@ struct dentry *mount_ns(struct file_system_type *fs_type,
+ 
+ EXPORT_SYMBOL(mount_ns);
+ 
++int get_tree_keyed(struct fs_context *fc,
++		  int (*fill_super)(struct super_block *sb,
++				    struct fs_context *fc),
++		void *key)
++{
++	fc->s_fs_info = key;
++	return vfs_get_super(fc, vfs_get_keyed_super, fill_super);
++}
++EXPORT_SYMBOL(get_tree_keyed);
++
+ #ifdef CONFIG_BLOCK
+ static int set_bdev_super(struct super_block *s, void *data)
+ {
+* Unmerged path include/linux/fs_context.h
+diff --git a/ipc/mqueue.c b/ipc/mqueue.c
+index 6d789a0de7ed..aec32ce7d94a 100644
+--- a/ipc/mqueue.c
++++ b/ipc/mqueue.c
+@@ -365,8 +365,7 @@ static int mqueue_get_tree(struct fs_context *fc)
+ {
+ 	struct mqueue_fs_context *ctx = fc->fs_private;
+ 
+-	fc->s_fs_info = ctx->ipc_ns;
+-	return vfs_get_super(fc, vfs_get_keyed_super, mqueue_fill_super);
++	return get_tree_keyed(fc, mqueue_fill_super, ctx->ipc_ns);
+ }
+ 
+ static void mqueue_fs_context_free(struct fs_context *fc)
+diff --git a/net/sunrpc/rpc_pipe.c b/net/sunrpc/rpc_pipe.c
+index 2d697861d49a..daae9d6783f9 100644
+--- a/net/sunrpc/rpc_pipe.c
++++ b/net/sunrpc/rpc_pipe.c
+@@ -1418,8 +1418,7 @@ EXPORT_SYMBOL_GPL(gssd_running);
+ 
+ static int rpc_fs_get_tree(struct fs_context *fc)
+ {
+-	fc->s_fs_info = get_net(fc->net_ns);
+-	return vfs_get_super(fc, vfs_get_keyed_super, rpc_fill_super);
++	return get_tree_keyed(fc, rpc_fill_super, get_net(fc->net_ns));
+ }
+ 
+ static void rpc_fs_free_fc(struct fs_context *fc)
