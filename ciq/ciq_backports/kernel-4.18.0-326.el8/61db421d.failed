@@ -1,0 +1,189 @@
+ionic: link in the new hw timestamp code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Shannon Nelson <snelson@pensando.io>
+commit 61db421da31b6fb3767df46c9963e87f2a1d2418
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/61db421d.failed
+
+These are changes to compile and link the new code, but no
+new feature support is available or advertised yet.
+
+	Signed-off-by: Allen Hubbe <allenbh@pensando.io>
+	Signed-off-by: Shannon Nelson <snelson@pensando.io>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 61db421da31b6fb3767df46c9963e87f2a1d2418)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/pensando/ionic/ionic_lif.h
+diff --cc drivers/net/ethernet/pensando/ionic/ionic_lif.h
+index 516d9f1fa574,ea3b086af179..000000000000
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.h
+@@@ -158,10 -169,10 +169,12 @@@ struct ionic_qtype_info 
+  	u16 sg_desc_stride;
+  };
+  
++ struct ionic_phc;
++ 
+  #define IONIC_LIF_NAME_MAX_SZ		32
+  struct ionic_lif {
+ +	char name[IONIC_LIF_NAME_MAX_SZ];
+ +	struct list_head list;
+  	struct net_device *netdev;
+  	DECLARE_BITMAP(state, IONIC_LIF_F_STATE_SIZE);
+  	struct ionic *ionic;
+@@@ -175,10 -183,16 +188,12 @@@
+  	struct ionic_qcq *adminqcq;
+  	struct ionic_qcq *notifyqcq;
+  	struct ionic_qcq **txqcqs;
++ 	struct ionic_qcq *hwstamp_txq;
+  	struct ionic_tx_stats *txqstats;
+  	struct ionic_qcq **rxqcqs;
++ 	struct ionic_qcq *hwstamp_rxq;
+  	struct ionic_rx_stats *rxqstats;
+ -	struct ionic_deferred deferred;
+ -	struct work_struct tx_timeout_work;
+  	u64 last_eid;
+ -	unsigned int kern_pid;
+ -	u64 __iomem *kern_dbpage;
+  	unsigned int neqs;
+  	unsigned int nxqs;
+  	unsigned int ntxq_descs;
+@@@ -214,8 -226,30 +229,32 @@@
+  	u32 rx_coalesce_hw;		/* what the hw is using */
+  	u32 tx_coalesce_usecs;		/* what the user asked for */
+  	u32 tx_coalesce_hw;		/* what the hw is using */
+ -	unsigned long *dbid_inuse;
+ -	unsigned int dbid_count;
+  
+++<<<<<<< HEAD
+ +	struct work_struct tx_timeout_work;
+++=======
++ 	struct ionic_phc *phc;
++ 
++ 	struct dentry *dentry;
+++>>>>>>> 61db421da31b (ionic: link in the new hw timestamp code)
++ };
++ 
++ struct ionic_phc {
++ 	spinlock_t lock; /* lock for cc and tc */
++ 	struct cyclecounter cc;
++ 	struct timecounter tc;
++ 
++ 	struct mutex config_lock; /* lock for ts_config */
++ 	struct hwtstamp_config ts_config;
++ 	u64 ts_config_rx_filt;
++ 	u32 ts_config_tx_mode;
++ 
++ 	u32 init_cc_mult;
++ 	long aux_work_delay;
++ 
++ 	struct ptp_clock_info ptp_info;
++ 	struct ptp_clock *ptp;
++ 	struct ionic_lif *lif;
+  };
+  
+  struct ionic_queue_params {
+diff --git a/drivers/net/ethernet/pensando/ionic/Makefile b/drivers/net/ethernet/pensando/ionic/Makefile
+index 8d3c2d3cb10d..4e7642a2d25f 100644
+--- a/drivers/net/ethernet/pensando/ionic/Makefile
++++ b/drivers/net/ethernet/pensando/ionic/Makefile
+@@ -6,3 +6,4 @@ obj-$(CONFIG_IONIC) := ionic.o
+ ionic-y := ionic_main.o ionic_bus_pci.o ionic_devlink.o ionic_dev.o \
+ 	   ionic_debugfs.o ionic_lif.o ionic_rx_filter.o ionic_ethtool.o \
+ 	   ionic_txrx.o ionic_stats.o ionic_fw.o
++ionic-$(CONFIG_PTP_1588_CLOCK) += ionic_phc.o
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic.h b/drivers/net/ethernet/pensando/ionic/ionic.h
+index 18e92103c711..66204106f83e 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic.h
+@@ -20,6 +20,10 @@ struct ionic_lif;
+ 
+ #define DEVCMD_TIMEOUT  10
+ 
++#define IONIC_PHC_UPDATE_NS	10000000000	    /* 10s in nanoseconds */
++#define NORMAL_PPB		1000000000	    /* one billion parts per billion */
++#define SCALED_PPM		(1000000ull << 16)  /* 2^16 million parts per 2^16 million */
++
+ struct ionic_vf {
+ 	u16	 index;
+ 	u8	 macaddr[6];
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_dev.c b/drivers/net/ethernet/pensando/ionic/ionic_dev.c
+index ad447aa19416..21b9c21a867d 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_dev.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_dev.c
+@@ -79,6 +79,8 @@ int ionic_dev_setup(struct ionic *ionic)
+ 	idev->intr_status = bar->vaddr + IONIC_BAR0_INTR_STATUS_OFFSET;
+ 	idev->intr_ctrl = bar->vaddr + IONIC_BAR0_INTR_CTRL_OFFSET;
+ 
++	idev->hwstamp_regs = &idev->dev_info_regs->hwstamp;
++
+ 	sig = ioread32(&idev->dev_info_regs->signature);
+ 	if (sig != IONIC_DEV_INFO_SIGNATURE) {
+ 		dev_err(dev, "Incompatible firmware signature %x", sig);
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_dev.h b/drivers/net/ethernet/pensando/ionic/ionic_dev.h
+index 565a891e2691..013ea35de6a0 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_dev.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_dev.h
+@@ -136,6 +136,7 @@ struct ionic_devinfo {
+ struct ionic_dev {
+ 	union ionic_dev_info_regs __iomem *dev_info_regs;
+ 	union ionic_dev_cmd_regs __iomem *dev_cmd_regs;
++	struct ionic_hwstamp_regs __iomem *hwstamp_regs;
+ 
+ 	atomic_long_t last_check_time;
+ 	unsigned long last_hb_time;
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_lif.c b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+index ff3f4b510503..b673dea7693b 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+@@ -827,6 +827,31 @@ static int ionic_lif_rxq_init(struct ionic_lif *lif, struct ionic_qcq *qcq)
+ 	return 0;
+ }
+ 
++int ionic_lif_create_hwstamp_txq(struct ionic_lif *lif)
++{
++	return 0;
++}
++
++int ionic_lif_create_hwstamp_rxq(struct ionic_lif *lif)
++{
++	return 0;
++}
++
++int ionic_lif_config_hwstamp_rxq_all(struct ionic_lif *lif, bool rx_all)
++{
++	return 0;
++}
++
++int ionic_lif_set_hwstamp_txmode(struct ionic_lif *lif, u16 txstamp_mode)
++{
++	return 0;
++}
++
++int ionic_lif_set_hwstamp_rxfilt(struct ionic_lif *lif, u64 pkt_class)
++{
++	return 0;
++}
++
+ static bool ionic_notifyq_service(struct ionic_cq *cq,
+ 				  struct ionic_cq_info *cq_info)
+ {
+* Unmerged path drivers/net/ethernet/pensando/ionic/ionic_lif.h
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_main.c b/drivers/net/ethernet/pensando/ionic/ionic_main.c
+index 6788259df9fb..f808764d3823 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_main.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_main.c
+@@ -148,6 +148,8 @@ static const char *ionic_opcode_to_str(enum ionic_cmd_opcode opcode)
+ 		return "IONIC_CMD_LIF_SETATTR";
+ 	case IONIC_CMD_LIF_GETATTR:
+ 		return "IONIC_CMD_LIF_GETATTR";
++	case IONIC_CMD_LIF_SETPHC:
++		return "IONIC_CMD_LIF_SETPHC";
+ 	case IONIC_CMD_RX_MODE_SET:
+ 		return "IONIC_CMD_RX_MODE_SET";
+ 	case IONIC_CMD_RX_FILTER_ADD:
