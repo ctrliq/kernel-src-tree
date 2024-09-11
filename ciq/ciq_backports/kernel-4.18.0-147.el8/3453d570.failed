@@ -1,0 +1,117 @@
+NFSv4.1: Avoid false retries when RPC calls are interrupted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 3453d5708b33efe76f40eca1c0ed60923094b971
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/3453d570.failed
+
+A 'false retry' in NFSv4.1 occurs when the client attempts to transmit a
+new RPC call using a slot+sequence number combination that references an
+already cached one. Currently, the Linux NFS client will do this if a
+user process interrupts an RPC call that is in progress.
+The problem with doing so is that we defeat the main mechanism used by
+the server to differentiate between a new call and a replayed one. Even
+if the server is able to perfectly cache the arguments of the old call,
+it cannot know if the client intended to replay or send a new call.
+
+The obvious fix is to bump the sequence number pre-emptively if an
+RPC call is interrupted, but in order to deal with the corner cases
+where the interrupted call is not actually received and processed by
+the server, we need to interpret the error NFS4ERR_SEQ_MISORDERED
+as a sign that we need to either wait or locate a correct sequence
+number that lies between the value we sent, and the last value that
+was acked by a SEQUENCE call on that slot.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Tested-by: Jason Tibbitts <tibbs@math.uh.edu>
+(cherry picked from commit 3453d5708b33efe76f40eca1c0ed60923094b971)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 9406949a8f46,77c6e2d3f3fc..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -896,17 -923,6 +913,20 @@@ static const struct rpc_call_ops nfs41_
+  	.rpc_call_done = nfs41_call_sync_done,
+  };
+  
+++<<<<<<< HEAD
+ +static void
+ +nfs4_sequence_process_interrupted(struct nfs_client *client,
+ +		struct nfs4_slot *slot, struct rpc_cred *cred)
+ +{
+ +	struct rpc_task *task;
+ +
+ +	task = _nfs41_proc_sequence(client, cred, slot, true);
+ +	if (!IS_ERR(task))
+ +		rpc_put_task_async(task);
+ +}
+ +
+++=======
+++>>>>>>> 3453d5708b33 (NFSv4.1: Avoid false retries when RPC calls are interrupted)
+  #else	/* !CONFIG_NFS_V4_1 */
+  
+  static int nfs4_sequence_process(struct rpc_task *task, struct nfs4_sequence_res *res)
+@@@ -927,14 -943,6 +947,17 @@@ int nfs4_sequence_done(struct rpc_task 
+  }
+  EXPORT_SYMBOL_GPL(nfs4_sequence_done);
+  
+++<<<<<<< HEAD
+ +static void
+ +nfs4_sequence_process_interrupted(struct nfs_client *client,
+ +		struct nfs4_slot *slot, struct rpc_cred *cred)
+ +{
+ +	WARN_ON_ONCE(1);
+ +	slot->interrupted = 0;
+ +}
+ +
+++=======
+++>>>>>>> 3453d5708b33 (NFSv4.1: Avoid false retries when RPC calls are interrupted)
+  #endif	/* !CONFIG_NFS_V4_1 */
+  
+  static
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4session.c b/fs/nfs/nfs4session.c
+index 769b85655c4b..fdb75da5d349 100644
+--- a/fs/nfs/nfs4session.c
++++ b/fs/nfs/nfs4session.c
+@@ -110,6 +110,8 @@ static struct nfs4_slot *nfs4_new_slot(struct nfs4_slot_table  *tbl,
+ 		slot->table = tbl;
+ 		slot->slot_nr = slotid;
+ 		slot->seq_nr = seq_init;
++		slot->seq_nr_highest_sent = seq_init;
++		slot->seq_nr_last_acked = seq_init - 1;
+ 	}
+ 	return slot;
+ }
+@@ -276,7 +278,8 @@ static void nfs4_reset_slot_table(struct nfs4_slot_table *tbl,
+ 	p = &tbl->slots;
+ 	while (*p) {
+ 		(*p)->seq_nr = ivalue;
+-		(*p)->interrupted = 0;
++		(*p)->seq_nr_highest_sent = ivalue;
++		(*p)->seq_nr_last_acked = ivalue - 1;
+ 		p = &(*p)->next;
+ 	}
+ 	tbl->highest_used_slotid = NFS4_NO_SLOT;
+diff --git a/fs/nfs/nfs4session.h b/fs/nfs/nfs4session.h
+index 3c550f297561..230509b77121 100644
+--- a/fs/nfs/nfs4session.h
++++ b/fs/nfs/nfs4session.h
+@@ -23,8 +23,9 @@ struct nfs4_slot {
+ 	unsigned long		generation;
+ 	u32			slot_nr;
+ 	u32		 	seq_nr;
+-	unsigned int		interrupted : 1,
+-				privileged : 1,
++	u32		 	seq_nr_last_acked;
++	u32		 	seq_nr_highest_sent;
++	unsigned int		privileged : 1,
+ 				seq_done : 1;
+ };
+ 
