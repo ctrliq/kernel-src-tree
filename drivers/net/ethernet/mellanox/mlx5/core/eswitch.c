@@ -1744,8 +1744,6 @@ int mlx5_eswitch_enable_sriov(struct mlx5_eswitch *esw, int nvfs, int mode)
 
 	if (mode == SRIOV_LEGACY) {
 		err = esw_create_legacy_table(esw);
-		if (err)
-			goto abort;
 	} else {
 		mlx5_reload_interface(esw->dev, MLX5_INTERFACE_PROTOCOL_ETH);
 		mlx5_reload_interface(esw->dev, MLX5_INTERFACE_PROTOCOL_IB);
