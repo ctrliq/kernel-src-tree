@@ -6,8 +6,6 @@
  * This work is licensed under the terms of the GNU GPL, version 2.
  */
 
-#define _GNU_SOURCE /* for program_invocation_name */
-
 #include "test_util.h"
 #include "kvm_util.h"
 #include "processor.h"
