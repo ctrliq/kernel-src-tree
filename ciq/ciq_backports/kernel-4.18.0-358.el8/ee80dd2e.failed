@@ -1,0 +1,125 @@
+net: bridge: add a helper for retrieving port VLANs from the data path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit ee80dd2e89ecce9c5dd6f556b8f581c9e1cbb605
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ee80dd2e.failed
+
+Introduce a brother of br_vlan_get_info() which is protected by the RCU
+mechanism, as opposed to br_vlan_get_info() which relies on taking the
+write-side rtnl_mutex.
+
+This is needed for drivers which need to find out whether a bridge port
+has a VLAN configured or not. For example, certain DSA switches might
+not offer complete source port identification to the CPU on RX, just the
+VLAN in which the packet was received. Based on this VLAN, we cannot set
+an accurate skb->dev ingress port, but at least we can configure one
+that behaves the same as the correct one would (this is possible because
+DSA sets skb->offload_fwd_mark = 1).
+
+When we look at the bridge RX handler (br_handle_frame), we see that
+what matters regarding skb->dev is the VLAN ID and the port STP state.
+So we need to select an skb->dev that has the same bridge VLAN as the
+packet we're receiving, and is in the LEARNING or FORWARDING STP state.
+The latter is easy, but for the former, we should somehow keep a shadow
+list of the bridge VLANs on each port, and a lookup table between VLAN
+ID and the 'designated port for imprecise RX'. That is rather
+complicated to keep in sync properly (the designated port per VLAN needs
+to be updated on the addition and removal of a VLAN, as well as on the
+join/leave events of the bridge on that port).
+
+So, to avoid all that complexity, let's just iterate through our finite
+number of ports and ask the bridge, for each packet: "do you have this
+VLAN configured on this port?".
+
+	Cc: Roopa Prabhu <roopa@nvidia.com>
+	Cc: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Cc: Ido Schimmel <idosch@nvidia.com>
+	Cc: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee80dd2e89ecce9c5dd6f556b8f581c9e1cbb605)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/if_bridge.h
+diff --cc include/linux/if_bridge.h
+index f87c7c990fb6,b73b4ff749e1..000000000000
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@@ -115,8 -111,8 +115,13 @@@ int br_vlan_get_pvid_rcu(const struct n
+  int br_vlan_get_proto(const struct net_device *dev, u16 *p_proto);
+  int br_vlan_get_info(const struct net_device *dev, u16 vid,
+  		     struct bridge_vlan_info *p_vinfo);
+++<<<<<<< HEAD
+ +int br_vlan_replay(struct net_device *br_dev, struct net_device *dev,
+ +		   struct notifier_block *nb, struct netlink_ext_ack *extack);
+++=======
++ int br_vlan_get_info_rcu(const struct net_device *dev, u16 vid,
++ 			 struct bridge_vlan_info *p_vinfo);
+++>>>>>>> ee80dd2e89ec (net: bridge: add a helper for retrieving port VLANs from the data path)
+  #else
+  static inline bool br_vlan_enabled(const struct net_device *dev)
+  {
+@@@ -144,12 -140,10 +149,19 @@@ static inline int br_vlan_get_info(cons
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int br_vlan_replay(struct net_device *br_dev,
+ +				 struct net_device *dev,
+ +				 struct notifier_block *nb,
+ +				 struct netlink_ext_ack *extack)
+ +{
+ +	return -EOPNOTSUPP;
+++=======
++ static inline int br_vlan_get_info_rcu(const struct net_device *dev, u16 vid,
++ 				       struct bridge_vlan_info *p_vinfo)
++ {
++ 	return -EINVAL;
+++>>>>>>> ee80dd2e89ec (net: bridge: add a helper for retrieving port VLANs from the data path)
+  }
+  #endif
+  
+* Unmerged path include/linux/if_bridge.h
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index b985e572c168..7e7afacb190a 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -1324,6 +1324,33 @@ int br_vlan_get_info(const struct net_device *dev, u16 vid,
+ }
+ EXPORT_SYMBOL_GPL(br_vlan_get_info);
+ 
++int br_vlan_get_info_rcu(const struct net_device *dev, u16 vid,
++			 struct bridge_vlan_info *p_vinfo)
++{
++	struct net_bridge_vlan_group *vg;
++	struct net_bridge_vlan *v;
++	struct net_bridge_port *p;
++
++	p = br_port_get_check_rcu(dev);
++	if (p)
++		vg = nbp_vlan_group_rcu(p);
++	else if (netif_is_bridge_master(dev))
++		vg = br_vlan_group_rcu(netdev_priv(dev));
++	else
++		return -EINVAL;
++
++	v = br_vlan_find(vg, vid);
++	if (!v)
++		return -ENOENT;
++
++	p_vinfo->vid = vid;
++	p_vinfo->flags = v->flags;
++	if (vid == br_get_pvid(vg))
++		p_vinfo->flags |= BRIDGE_VLAN_INFO_PVID;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(br_vlan_get_info_rcu);
++
+ static int br_vlan_is_bind_vlan_dev(const struct net_device *dev)
+ {
+ 	return is_vlan_dev(dev) &&
