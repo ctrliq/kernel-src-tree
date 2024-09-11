@@ -145,10 +145,10 @@ struct tap_filter {
 #define TUN_FLOW_EXPIRE (3 * HZ)
 
 struct tun_pcpu_stats {
-	u64 rx_packets;
-	u64 rx_bytes;
-	u64 tx_packets;
-	u64 tx_bytes;
+	u64_stats_t rx_packets;
+	u64_stats_t rx_bytes;
+	u64_stats_t tx_packets;
+	u64_stats_t tx_bytes;
 	struct u64_stats_sync syncp;
 	u32 rx_dropped;
 	u32 tx_dropped;
@@ -1200,10 +1200,10 @@ tun_net_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 		p = per_cpu_ptr(tun->pcpu_stats, i);
 		do {
 			start = u64_stats_fetch_begin(&p->syncp);
-			rxpackets	= p->rx_packets;
-			rxbytes		= p->rx_bytes;
-			txpackets	= p->tx_packets;
-			txbytes		= p->tx_bytes;
+			rxpackets	= u64_stats_read(&p->rx_packets);
+			rxbytes		= u64_stats_read(&p->rx_bytes);
+			txpackets	= u64_stats_read(&p->tx_packets);
+			txbytes		= u64_stats_read(&p->tx_bytes);
 		} while (u64_stats_fetch_retry(&p->syncp, start));
 
 		stats->rx_packets	+= rxpackets;
@@ -2034,8 +2034,8 @@ drop:
 
 	stats = get_cpu_ptr(tun->pcpu_stats);
 	u64_stats_update_begin(&stats->syncp);
-	stats->rx_packets++;
-	stats->rx_bytes += len;
+	u64_stats_inc(&stats->rx_packets);
+	u64_stats_add(&stats->rx_bytes, len);
 	u64_stats_update_end(&stats->syncp);
 	put_cpu_ptr(stats);
 
@@ -2088,8 +2088,8 @@ static ssize_t tun_put_user_xdp(struct tun_struct *tun,
 
 	stats = get_cpu_ptr(tun->pcpu_stats);
 	u64_stats_update_begin(&stats->syncp);
-	stats->tx_packets++;
-	stats->tx_bytes += ret;
+	u64_stats_inc(&stats->tx_packets);
+	u64_stats_add(&stats->tx_bytes, ret);
 	u64_stats_update_end(&stats->syncp);
 	put_cpu_ptr(tun->pcpu_stats);
 
@@ -2183,8 +2183,8 @@ done:
 	/* caller is in process context, */
 	stats = get_cpu_ptr(tun->pcpu_stats);
 	u64_stats_update_begin(&stats->syncp);
-	stats->tx_packets++;
-	stats->tx_bytes += skb->len + vlan_hlen;
+	u64_stats_inc(&stats->tx_packets);
+	u64_stats_add(&stats->tx_bytes, skb->len + vlan_hlen);
 	u64_stats_update_end(&stats->syncp);
 	put_cpu_ptr(tun->pcpu_stats);
 
@@ -2547,8 +2547,8 @@ build:
 	 */
 	stats = this_cpu_ptr(tun->pcpu_stats);
 	u64_stats_update_begin(&stats->syncp);
-	stats->rx_packets++;
-	stats->rx_bytes += datasize;
+	u64_stats_inc(&stats->rx_packets);
+	u64_stats_add(&stats->rx_bytes, datasize);
 	u64_stats_update_end(&stats->syncp);
 
 	if (rxhash)
