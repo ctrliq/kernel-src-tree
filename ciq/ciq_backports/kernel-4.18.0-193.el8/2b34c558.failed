@@ -1,0 +1,617 @@
+RDMA/core: Add command to set ib_core device net namspace sharing mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit 2b34c558022673c0d6393dd7941d417f1b5a7236
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2b34c558.failed
+
+Add netlink command that enables/disables sharing rdma device among
+multiple net namespaces.
+
+Using rdma tool,
+$rdma sys set netns shared (default mode)
+
+When rdma subsystem netns mode is set to shared mode, rdma devices
+will be accessible in all net namespaces.
+
+Using rdma tool,
+$rdma sys set netns exclusive
+
+When rdma subsystem netns mode is set to exclusive mode, devices
+will be accessible in only one net namespace at any given
+point of time.
+
+If there are any net namespaces other than default init_net exists,
+while executing this command, it will fail and mode cannot be changed.
+
+To change this mode, netlink command is used instead of sysctl, because
+netlink command allows to auto load a module.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 2b34c558022673c0d6393dd7941d417f1b5a7236)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/core_priv.h
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/core/nldev.c
+#	include/uapi/rdma/rdma_netlink.h
+diff --cc drivers/infiniband/core/core_priv.h
+index 9d1d4bce8f87,0663fc64e950..000000000000
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@@ -326,4 -338,10 +326,13 @@@ int roce_resolve_route_from_path(struc
+  				 const struct ib_gid_attr *attr);
+  
+  struct net_device *rdma_read_gid_attr_ndev_rcu(const struct ib_gid_attr *attr);
+++<<<<<<< HEAD
+++=======
++ 
++ void ib_free_port_attrs(struct ib_core_device *coredev);
++ int ib_setup_port_attrs(struct ib_core_device *coredev,
++ 			bool alloc_hw_stats);
++ 
++ int rdma_compatdev_set(u8 enable);
+++>>>>>>> 2b34c5580226 (RDMA/core: Add command to set ib_core device net namspace sharing mode)
+  #endif /* _CORE_PRIV_H */
+diff --cc drivers/infiniband/core/device.c
+index 3aa933cc02d9,2dbd04739ac6..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -469,28 -752,308 +469,304 @@@ static int ib_security_change(struct no
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + *	__dev_new_index	-	allocate an device index
+ + *
+ + *	Returns a suitable unique value for a new device interface
+ + *	number.  It assumes that there are less than 2^32-1 ib devices
+ + *	will be present in the system.
+++=======
++ static void compatdev_release(struct device *dev)
++ {
++ 	struct ib_core_device *cdev =
++ 		container_of(dev, struct ib_core_device, dev);
++ 
++ 	kfree(cdev);
++ }
++ 
++ static int add_one_compat_dev(struct ib_device *device,
++ 			      struct rdma_dev_net *rnet)
++ {
++ 	struct ib_core_device *cdev;
++ 	int ret;
++ 
++ 	lockdep_assert_held(&rdma_nets_rwsem);
++ 	if (!ib_devices_shared_netns)
++ 		return 0;
++ 
++ 	/*
++ 	 * Create and add compat device in all namespaces other than where it
++ 	 * is currently bound to.
++ 	 */
++ 	if (net_eq(read_pnet(&rnet->net),
++ 		   read_pnet(&device->coredev.rdma_net)))
++ 		return 0;
++ 
++ 	/*
++ 	 * The first of init_net() or ib_register_device() to take the
++ 	 * compat_devs_mutex wins and gets to add the device. Others will wait
++ 	 * for completion here.
++ 	 */
++ 	mutex_lock(&device->compat_devs_mutex);
++ 	cdev = xa_load(&device->compat_devs, rnet->id);
++ 	if (cdev) {
++ 		ret = 0;
++ 		goto done;
++ 	}
++ 	ret = xa_reserve(&device->compat_devs, rnet->id, GFP_KERNEL);
++ 	if (ret)
++ 		goto done;
++ 
++ 	cdev = kzalloc(sizeof(*cdev), GFP_KERNEL);
++ 	if (!cdev) {
++ 		ret = -ENOMEM;
++ 		goto cdev_err;
++ 	}
++ 
++ 	cdev->dev.parent = device->dev.parent;
++ 	rdma_init_coredev(cdev, device, read_pnet(&rnet->net));
++ 	cdev->dev.release = compatdev_release;
++ 	dev_set_name(&cdev->dev, "%s", dev_name(&device->dev));
++ 
++ 	ret = device_add(&cdev->dev);
++ 	if (ret)
++ 		goto add_err;
++ 	ret = ib_setup_port_attrs(cdev, false);
++ 	if (ret)
++ 		goto port_err;
++ 
++ 	ret = xa_err(xa_store(&device->compat_devs, rnet->id,
++ 			      cdev, GFP_KERNEL));
++ 	if (ret)
++ 		goto insert_err;
++ 
++ 	mutex_unlock(&device->compat_devs_mutex);
++ 	return 0;
++ 
++ insert_err:
++ 	ib_free_port_attrs(cdev);
++ port_err:
++ 	device_del(&cdev->dev);
++ add_err:
++ 	put_device(&cdev->dev);
++ cdev_err:
++ 	xa_release(&device->compat_devs, rnet->id);
++ done:
++ 	mutex_unlock(&device->compat_devs_mutex);
++ 	return ret;
++ }
++ 
++ static void remove_one_compat_dev(struct ib_device *device, u32 id)
++ {
++ 	struct ib_core_device *cdev;
++ 
++ 	mutex_lock(&device->compat_devs_mutex);
++ 	cdev = xa_erase(&device->compat_devs, id);
++ 	mutex_unlock(&device->compat_devs_mutex);
++ 	if (cdev) {
++ 		ib_free_port_attrs(cdev);
++ 		device_del(&cdev->dev);
++ 		put_device(&cdev->dev);
++ 	}
++ }
++ 
++ static void remove_compat_devs(struct ib_device *device)
++ {
++ 	struct ib_core_device *cdev;
++ 	unsigned long index;
++ 
++ 	xa_for_each (&device->compat_devs, index, cdev)
++ 		remove_one_compat_dev(device, index);
++ }
++ 
++ static int add_compat_devs(struct ib_device *device)
++ {
++ 	struct rdma_dev_net *rnet;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	down_read(&rdma_nets_rwsem);
++ 	xa_for_each (&rdma_nets, index, rnet) {
++ 		ret = add_one_compat_dev(device, rnet);
++ 		if (ret)
++ 			break;
++ 	}
++ 	up_read(&rdma_nets_rwsem);
++ 	return ret;
++ }
++ 
++ static void remove_all_compat_devs(void)
++ {
++ 	struct ib_compat_device *cdev;
++ 	struct ib_device *dev;
++ 	unsigned long index;
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each (&devices, index, dev) {
++ 		unsigned long c_index = 0;
++ 
++ 		/* Hold nets_rwsem so that any other thread modifying this
++ 		 * system param can sync with this thread.
++ 		 */
++ 		down_read(&rdma_nets_rwsem);
++ 		xa_for_each (&dev->compat_devs, c_index, cdev)
++ 			remove_one_compat_dev(dev, c_index);
++ 		up_read(&rdma_nets_rwsem);
++ 	}
++ 	up_read(&devices_rwsem);
++ }
++ 
++ static int add_all_compat_devs(void)
++ {
++ 	struct rdma_dev_net *rnet;
++ 	struct ib_device *dev;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each_marked (&devices, index, dev, DEVICE_REGISTERED) {
++ 		unsigned long net_index = 0;
++ 
++ 		/* Hold nets_rwsem so that any other thread modifying this
++ 		 * system param can sync with this thread.
++ 		 */
++ 		down_read(&rdma_nets_rwsem);
++ 		xa_for_each (&rdma_nets, net_index, rnet) {
++ 			ret = add_one_compat_dev(dev, rnet);
++ 			if (ret)
++ 				break;
++ 		}
++ 		up_read(&rdma_nets_rwsem);
++ 	}
++ 	up_read(&devices_rwsem);
++ 	if (ret)
++ 		remove_all_compat_devs();
++ 	return ret;
++ }
++ 
++ int rdma_compatdev_set(u8 enable)
++ {
++ 	struct rdma_dev_net *rnet;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	down_write(&rdma_nets_rwsem);
++ 	if (ib_devices_shared_netns == enable) {
++ 		up_write(&rdma_nets_rwsem);
++ 		return 0;
++ 	}
++ 
++ 	/* enable/disable of compat devices is not supported
++ 	 * when more than default init_net exists.
++ 	 */
++ 	xa_for_each (&rdma_nets, index, rnet) {
++ 		ret++;
++ 		break;
++ 	}
++ 	if (!ret)
++ 		ib_devices_shared_netns = enable;
++ 	up_write(&rdma_nets_rwsem);
++ 	if (ret)
++ 		return -EBUSY;
++ 
++ 	if (enable)
++ 		ret = add_all_compat_devs();
++ 	else
++ 		remove_all_compat_devs();
++ 	return ret;
++ }
++ 
++ static void rdma_dev_exit_net(struct net *net)
++ {
++ 	struct rdma_dev_net *rnet = net_generic(net, rdma_dev_net_id);
++ 	struct ib_device *dev;
++ 	unsigned long index;
++ 	int ret;
++ 
++ 	down_write(&rdma_nets_rwsem);
++ 	/*
++ 	 * Prevent the ID from being re-used and hide the id from xa_for_each.
++ 	 */
++ 	ret = xa_err(xa_store(&rdma_nets, rnet->id, NULL, GFP_KERNEL));
++ 	WARN_ON(ret);
++ 	up_write(&rdma_nets_rwsem);
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each (&devices, index, dev) {
++ 		get_device(&dev->dev);
++ 		/*
++ 		 * Release the devices_rwsem so that pontentially blocking
++ 		 * device_del, doesn't hold the devices_rwsem for too long.
++ 		 */
++ 		up_read(&devices_rwsem);
++ 
++ 		remove_one_compat_dev(dev, rnet->id);
++ 
++ 		put_device(&dev->dev);
++ 		down_read(&devices_rwsem);
++ 	}
++ 	up_read(&devices_rwsem);
++ 
++ 	xa_erase(&rdma_nets, rnet->id);
++ }
++ 
++ static __net_init int rdma_dev_init_net(struct net *net)
++ {
++ 	struct rdma_dev_net *rnet = net_generic(net, rdma_dev_net_id);
++ 	unsigned long index;
++ 	struct ib_device *dev;
++ 	int ret;
++ 
++ 	/* No need to create any compat devices in default init_net. */
++ 	if (net_eq(net, &init_net))
++ 		return 0;
++ 
++ 	write_pnet(&rnet->net, net);
++ 
++ 	ret = xa_alloc(&rdma_nets, &rnet->id, rnet, xa_limit_32b, GFP_KERNEL);
++ 	if (ret)
++ 		return ret;
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each_marked (&devices, index, dev, DEVICE_REGISTERED) {
++ 		/* Hold nets_rwsem so that netlink command cannot change
++ 		 * system configuration for device sharing mode.
++ 		 */
++ 		down_read(&rdma_nets_rwsem);
++ 		ret = add_one_compat_dev(dev, rnet);
++ 		up_read(&rdma_nets_rwsem);
++ 		if (ret)
++ 			break;
++ 	}
++ 	up_read(&devices_rwsem);
++ 
++ 	if (ret)
++ 		rdma_dev_exit_net(net);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Assign the unique string device name and the unique device index. This is
++  * undone by ib_dealloc_device.
+++>>>>>>> 2b34c5580226 (RDMA/core: Add command to set ib_core device net namspace sharing mode)
+   */
+ -static int assign_name(struct ib_device *device, const char *name)
+ +static u32 __dev_new_index(void)
+  {
+ -	static u32 last_id;
+ -	int ret;
+ +	/*
+ +	 * The device index to allow stable naming.
+ +	 * Similar to struct net -> ifindex.
+ +	 */
+ +	static u32 index;
+  
+ -	down_write(&devices_rwsem);
+ -	/* Assign a unique name to the device */
+ -	if (strchr(name, '%'))
+ -		ret = alloc_name(device, name);
+ -	else
+ -		ret = dev_set_name(&device->dev, name);
+ -	if (ret)
+ -		goto out;
+ +	for (;;) {
+ +		if (!(++index))
+ +			index = 1;
+  
+ -	if (__ib_device_get_by_name(dev_name(&device->dev))) {
+ -		ret = -ENFILE;
+ -		goto out;
+ +		if (!__ib_device_get_by_index(index))
+ +			return index;
+  	}
+ -	strlcpy(device->name, dev_name(&device->dev), IB_DEVICE_NAME_MAX);
+ -
+ -	ret = xa_alloc_cyclic(&devices, &device->index, device, xa_limit_31b,
+ -			&last_id, GFP_KERNEL);
+ -	if (ret > 0)
+ -		ret = 0;
+ -
+ -out:
+ -	up_write(&devices_rwsem);
+ -	return ret;
+  }
+  
+  static void setup_dma_device(struct ib_device *device)
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,28b4ed8f9930..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -1090,6 -1204,164 +1090,167 @@@ RES_GET_FUNCS(cq, RDMA_RESTRACK_CQ)
+  RES_GET_FUNCS(pd, RDMA_RESTRACK_PD);
+  RES_GET_FUNCS(mr, RDMA_RESTRACK_MR);
+  
+++<<<<<<< HEAD
+++=======
++ static LIST_HEAD(link_ops);
++ static DECLARE_RWSEM(link_ops_rwsem);
++ 
++ static const struct rdma_link_ops *link_ops_get(const char *type)
++ {
++ 	const struct rdma_link_ops *ops;
++ 
++ 	list_for_each_entry(ops, &link_ops, list) {
++ 		if (!strcmp(ops->type, type))
++ 			goto out;
++ 	}
++ 	ops = NULL;
++ out:
++ 	return ops;
++ }
++ 
++ void rdma_link_register(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	if (WARN_ON_ONCE(link_ops_get(ops->type)))
++ 		goto out;
++ 	list_add(&ops->list, &link_ops);
++ out:
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_register);
++ 
++ void rdma_link_unregister(struct rdma_link_ops *ops)
++ {
++ 	down_write(&link_ops_rwsem);
++ 	list_del(&ops->list);
++ 	up_write(&link_ops_rwsem);
++ }
++ EXPORT_SYMBOL(rdma_link_unregister);
++ 
++ static int nldev_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	char ibdev_name[IB_DEVICE_NAME_MAX];
++ 	const struct rdma_link_ops *ops;
++ 	char ndev_name[IFNAMSIZ];
++ 	struct net_device *ndev;
++ 	char type[IFNAMSIZ];
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_NAME] ||
++ 	    !tb[RDMA_NLDEV_ATTR_LINK_TYPE] || !tb[RDMA_NLDEV_ATTR_NDEV_NAME])
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(ibdev_name, tb[RDMA_NLDEV_ATTR_DEV_NAME],
++ 		    sizeof(ibdev_name));
++ 	if (strchr(ibdev_name, '%'))
++ 		return -EINVAL;
++ 
++ 	nla_strlcpy(type, tb[RDMA_NLDEV_ATTR_LINK_TYPE], sizeof(type));
++ 	nla_strlcpy(ndev_name, tb[RDMA_NLDEV_ATTR_NDEV_NAME],
++ 		    sizeof(ndev_name));
++ 
++ 	ndev = dev_get_by_name(&init_net, ndev_name);
++ 	if (!ndev)
++ 		return -ENODEV;
++ 
++ 	down_read(&link_ops_rwsem);
++ 	ops = link_ops_get(type);
++ #ifdef CONFIG_MODULES
++ 	if (!ops) {
++ 		up_read(&link_ops_rwsem);
++ 		request_module("rdma-link-%s", type);
++ 		down_read(&link_ops_rwsem);
++ 		ops = link_ops_get(type);
++ 	}
++ #endif
++ 	err = ops ? ops->newlink(ibdev_name, ndev) : -EINVAL;
++ 	up_read(&link_ops_rwsem);
++ 	dev_put(ndev);
++ 
++ 	return err;
++ }
++ 
++ static int nldev_dellink(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct ib_device *device;
++ 	u32 index;
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_ATTR_DEV_INDEX])
++ 		return -EINVAL;
++ 
++ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
++ 	device = ib_device_get_by_index(sock_net(skb->sk), index);
++ 	if (!device)
++ 		return -EINVAL;
++ 
++ 	if (!(device->attrs.device_cap_flags & IB_DEVICE_ALLOW_USER_UNREG)) {
++ 		ib_device_put(device);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ib_unregister_device_and_put(device);
++ 	return 0;
++ }
++ 
++ static int nldev_get_sys_get_dumpit(struct sk_buff *skb,
++ 				    struct netlink_callback *cb)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	struct nlmsghdr *nlh;
++ 	int err;
++ 
++ 	err = nlmsg_parse(cb->nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	nlh = nlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
++ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV,
++ 					 RDMA_NLDEV_CMD_SYS_GET),
++ 			0, 0);
++ 
++ 	err = nla_put_u8(skb, RDMA_NLDEV_SYS_ATTR_NETNS_MODE,
++ 			 (u8)ib_devices_shared_netns);
++ 	if (err) {
++ 		nlmsg_cancel(skb, nlh);
++ 		return err;
++ 	}
++ 
++ 	nlmsg_end(skb, nlh);
++ 	return skb->len;
++ }
++ 
++ static int nldev_set_sys_set_doit(struct sk_buff *skb, struct nlmsghdr *nlh,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
++ 	u8 enable;
++ 	int err;
++ 
++ 	err = nlmsg_parse(nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
++ 			  nldev_policy, extack);
++ 	if (err || !tb[RDMA_NLDEV_SYS_ATTR_NETNS_MODE])
++ 		return -EINVAL;
++ 
++ 	enable = nla_get_u8(tb[RDMA_NLDEV_SYS_ATTR_NETNS_MODE]);
++ 	/* Only 0 and 1 are supported */
++ 	if (enable > 1)
++ 		return -EINVAL;
++ 
++ 	err = rdma_compatdev_set(enable);
++ 	return err;
++ }
++ 
+++>>>>>>> 2b34c5580226 (RDMA/core: Add command to set ib_core device net namspace sharing mode)
+  static const struct rdma_nl_cbs nldev_cb_table[RDMA_NLDEV_NUM_OPS] = {
+  	[RDMA_NLDEV_CMD_GET] = {
+  		.doit = nldev_get_doit,
+@@@ -1130,8 -1403,17 +1291,18 @@@
+  		.dump = nldev_res_get_mr_dumpit,
+  	},
+  	[RDMA_NLDEV_CMD_RES_PD_GET] = {
+ -		.doit = nldev_res_get_pd_doit,
+  		.dump = nldev_res_get_pd_dumpit,
+  	},
+++<<<<<<< HEAD
+++=======
++ 	[RDMA_NLDEV_CMD_SYS_GET] = {
++ 		.dump = nldev_get_sys_get_dumpit,
++ 	},
++ 	[RDMA_NLDEV_CMD_SYS_SET] = {
++ 		.doit = nldev_set_sys_set_doit,
++ 		.flags = RDMA_NL_ADMIN_PERM,
++ 	},
+++>>>>>>> 2b34c5580226 (RDMA/core: Add command to set ib_core device net namspace sharing mode)
+  };
+  
+  void __init nldev_init(void)
+diff --cc include/uapi/rdma/rdma_netlink.h
+index 3a9e681e4257,9bba001a7347..000000000000
+--- a/include/uapi/rdma/rdma_netlink.h
++++ b/include/uapi/rdma/rdma_netlink.h
+@@@ -255,11 -255,16 +255,20 @@@ enum rdma_nldev_command 
+  	RDMA_NLDEV_CMD_GET, /* can dump */
+  	RDMA_NLDEV_CMD_SET,
+  
+ -	RDMA_NLDEV_CMD_NEWLINK,
+ +	/* 3 - 4 are free to use */
+  
+ -	RDMA_NLDEV_CMD_DELLINK,
+ +	RDMA_NLDEV_CMD_PORT_GET = 5, /* can dump */
+  
+++<<<<<<< HEAD
+ +	/* 6 - 8 are free to use */
+++=======
++ 	RDMA_NLDEV_CMD_PORT_GET, /* can dump */
++ 
++ 	RDMA_NLDEV_CMD_SYS_GET, /* can dump */
++ 	RDMA_NLDEV_CMD_SYS_SET,
++ 
++ 	/* 8 is free to use */
+++>>>>>>> 2b34c5580226 (RDMA/core: Add command to set ib_core device net namspace sharing mode)
+  
+  	RDMA_NLDEV_CMD_RES_GET = 9, /* can dump */
+  
+* Unmerged path drivers/infiniband/core/core_priv.h
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path drivers/infiniband/core/nldev.c
+* Unmerged path include/uapi/rdma/rdma_netlink.h
