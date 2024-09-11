@@ -1,0 +1,363 @@
+kasan: ensure poisoning size alignment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit cde8a7eb778c7c71f70d636aa0bb1ec081b9167c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/cde8a7eb.failed
+
+A previous changes d99f6a10c161 ("kasan: don't round_up too much")
+attempted to simplify the code by adding a round_up(size) call into
+kasan_poison().  While this allows to have less round_up() calls around
+the code, this results in round_up() being called multiple times.
+
+This patch removes round_up() of size from kasan_poison() and ensures that
+all callers round_up() the size explicitly.  This patch also adds
+WARN_ON() alignment checks for address and size to kasan_poison() and
+kasan_unpoison().
+
+Link: https://lkml.kernel.org/r/3ffe8d4a246ae67a8b5e91f65bf98cd7cba9d7b9.1612546384.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cde8a7eb778c7c71f70d636aa0bb1ec081b9167c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+#	mm/kasan/kasan.h
+#	mm/kasan/shadow.c
+diff --cc mm/kasan/common.c
+index 0d0cb20ec1a4,dec7375fb884..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -306,21 -248,20 +306,25 @@@ void kasan_poison_slab(struct page *pag
+  {
+  	unsigned long i;
+  
+ -	for (i = 0; i < compound_nr(page); i++)
+ +	for (i = 0; i < (1 << compound_order(page)); i++)
+  		page_kasan_tag_reset(page + i);
+ -	kasan_poison(page_address(page), page_size(page),
+ -		     KASAN_KMALLOC_REDZONE);
+ +	kasan_poison_shadow(page_address(page), page_size(page),
+ +			KASAN_KMALLOC_REDZONE);
+  }
+  
+ -void __kasan_unpoison_object_data(struct kmem_cache *cache, void *object)
+ +void kasan_unpoison_object_data(struct kmem_cache *cache, void *object)
+  {
+ -	kasan_unpoison(object, cache->object_size);
+ +	kasan_unpoison_shadow(object, cache->object_size);
+  }
+  
+ -void __kasan_poison_object_data(struct kmem_cache *cache, void *object)
+ +void kasan_poison_object_data(struct kmem_cache *cache, void *object)
+  {
+++<<<<<<< HEAD
+ +	kasan_poison_shadow(object,
+ +			round_up(cache->object_size, KASAN_SHADOW_SCALE_SIZE),
+++=======
++ 	kasan_poison(object, round_up(cache->object_size, KASAN_GRANULE_SIZE),
+++>>>>>>> cde8a7eb778c (kasan: ensure poisoning size alignment)
+  			KASAN_KMALLOC_REDZONE);
+  }
+  
+@@@ -431,112 -349,49 +435,125 @@@ static bool __kasan_slab_free(struct km
+  		return true;
+  	}
+  
+++<<<<<<< HEAD
+ +	rounded_up_size = round_up(cache->object_size, KASAN_SHADOW_SCALE_SIZE);
+ +	kasan_poison_shadow(object, rounded_up_size, KASAN_KMALLOC_FREE);
+++=======
++ 	kasan_poison(object, round_up(cache->object_size, KASAN_GRANULE_SIZE),
++ 			KASAN_KMALLOC_FREE);
+++>>>>>>> cde8a7eb778c (kasan: ensure poisoning size alignment)
+  
+ -	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine))
+ +	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine) ||
+ +			unlikely(!(cache->flags & SLAB_KASAN)))
+  		return false;
+  
+ -	if (kasan_stack_collection_enabled())
+ -		kasan_set_free_info(cache, object, tag);
+ +	kasan_set_free_info(cache, object, tag);
+ +
+ +	quarantine_put(cache, object);
+  
+ -	return kasan_quarantine_put(cache, object);
+ +	return IS_ENABLED(CONFIG_KASAN_GENERIC);
+  }
+  
+ -bool __kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+ +bool kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+  {
+ -	return ____kasan_slab_free(cache, object, ip, true);
+ +	return __kasan_slab_free(cache, object, ip, true);
+  }
+  
+ -static bool ____kasan_kfree_large(void *ptr, unsigned long ip)
+ +static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +				size_t size, gfp_t flags, bool keep_tag)
+  {
+ -	if (ptr != page_address(virt_to_head_page(ptr))) {
+ -		kasan_report_invalid_free(ptr, ip);
+ -		return true;
+ -	}
+ +	unsigned long redzone_start;
+ +	unsigned long redzone_end;
+ +	u8 tag = 0xff;
+  
+ -	if (!kasan_byte_accessible(ptr)) {
+ -		kasan_report_invalid_free(ptr, ip);
+ -		return true;
+ -	}
+ +	if (gfpflags_allow_blocking(flags))
+ +		quarantine_reduce();
+  
+ -	/*
+ -	 * The object will be poisoned by kasan_free_pages() or
+ -	 * kasan_slab_free_mempool().
+ -	 */
+ +	if (unlikely(object == NULL))
+ +		return NULL;
+  
+ -	return false;
+ +	redzone_start = round_up((unsigned long)(object + size),
+++<<<<<<< HEAD
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +	redzone_end = round_up((unsigned long)object + cache->object_size,
+ +				KASAN_SHADOW_SCALE_SIZE);
+++=======
+++				KASAN_GRANULE_SIZE);
+++	redzone_end = round_up((unsigned long)(object + cache->object_size),
+++				KASAN_GRANULE_SIZE);
+++	kasan_poison((void *)redzone_start, redzone_end - redzone_start,
+++			   KASAN_KMALLOC_REDZONE);
+++>>>>>>> cde8a7eb778c (kasan: ensure poisoning size alignment)
+ +
+ +	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +		tag = assign_tag(cache, object, false, keep_tag);
+ +
+ +	/* Tag is ignored in set_tag without CONFIG_KASAN_SW_TAGS */
+ +	kasan_unpoison_shadow(set_tag(object, tag), size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_KMALLOC_REDZONE);
+ +
+ +	if (cache->flags & SLAB_KASAN)
+ +		kasan_set_track(&get_alloc_info(cache, object)->alloc_track, flags);
+ +
+ +	return set_tag(object, tag);
+ +}
+ +
+ +void * __must_check kasan_slab_alloc(struct kmem_cache *cache, void *object,
+ +					gfp_t flags)
+ +{
+ +	return __kasan_kmalloc(cache, object, cache->object_size, flags, false);
+ +}
+ +
+ +void * __must_check kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +				size_t size, gfp_t flags)
+ +{
+ +	return __kasan_kmalloc(cache, object, size, flags, true);
+ +}
+ +EXPORT_SYMBOL(kasan_kmalloc);
+ +
+ +void * __must_check kasan_kmalloc_large(const void *ptr, size_t size,
+ +						gfp_t flags)
+ +{
+ +	struct page *page;
+ +	unsigned long redzone_start;
+ +	unsigned long redzone_end;
+ +
+ +	if (gfpflags_allow_blocking(flags))
+ +		quarantine_reduce();
+ +
+ +	if (unlikely(ptr == NULL))
+ +		return NULL;
+ +
+ +	page = virt_to_page(ptr);
+ +	redzone_start = round_up((unsigned long)(ptr + size),
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +	redzone_end = (unsigned long)ptr + page_size(page);
+ +
+ +	kasan_unpoison_shadow(ptr, size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_PAGE_REDZONE);
+ +
+ +	return (void *)ptr;
+  }
+  
+ -void __kasan_kfree_large(void *ptr, unsigned long ip)
+ +void * __must_check kasan_krealloc(const void *object, size_t size, gfp_t flags)
+  {
+ -	____kasan_kfree_large(ptr, ip);
+ +	struct page *page;
+ +
+ +	if (unlikely(object == ZERO_SIZE_PTR))
+ +		return (void *)object;
+ +
+ +	page = virt_to_head_page(object);
+ +
+ +	if (unlikely(!PageSlab(page)))
+ +		return kasan_kmalloc_large(object, size, flags);
+ +	else
+ +		return __kasan_kmalloc(page->slab_cache, object, size,
+ +						flags, true);
+  }
+  
+ -void __kasan_slab_free_mempool(void *ptr, unsigned long ip)
+ +void kasan_poison_kfree(void *ptr, unsigned long ip)
+  {
+  	struct page *page;
+  
+diff --cc mm/kasan/kasan.h
+index 2db4c5c1b473,8c55634d6edd..000000000000
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@@ -247,8 -301,124 +247,122 @@@ static inline const void *arch_kasan_se
+  #define hw_get_mem_tag(addr)			arch_get_mem_tag(addr)
+  #define hw_set_mem_tag_range(addr, size, tag)	arch_set_mem_tag_range((addr), (size), (tag))
+  
+ -#else /* CONFIG_KASAN_HW_TAGS */
+ -
+ -#define hw_enable_tagging()
+ -#define hw_set_tagging_report_once(state)
+ -
+  #endif /* CONFIG_KASAN_HW_TAGS */
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_KASAN_HW_TAGS) && IS_ENABLED(CONFIG_KASAN_KUNIT_TEST)
++ 
++ void kasan_set_tagging_report_once(bool state);
++ void kasan_enable_tagging(void);
++ 
++ #else /* CONFIG_KASAN_HW_TAGS || CONFIG_KASAN_KUNIT_TEST */
++ 
++ static inline void kasan_set_tagging_report_once(bool state) { }
++ static inline void kasan_enable_tagging(void) { }
++ 
++ #endif /* CONFIG_KASAN_HW_TAGS || CONFIG_KASAN_KUNIT_TEST */
++ 
++ #ifdef CONFIG_KASAN_SW_TAGS
++ u8 kasan_random_tag(void);
++ #elif defined(CONFIG_KASAN_HW_TAGS)
++ static inline u8 kasan_random_tag(void) { return hw_get_random_tag(); }
++ #else
++ static inline u8 kasan_random_tag(void) { return 0; }
++ #endif
++ 
++ #ifdef CONFIG_KASAN_HW_TAGS
++ 
++ static inline void kasan_poison(const void *addr, size_t size, u8 value)
++ {
++ 	addr = kasan_reset_tag(addr);
++ 
++ 	/* Skip KFENCE memory if called explicitly outside of sl*b. */
++ 	if (is_kfence_address(addr))
++ 		return;
++ 
++ 	if (WARN_ON((unsigned long)addr & KASAN_GRANULE_MASK))
++ 		return;
++ 	if (WARN_ON(size & KASAN_GRANULE_MASK))
++ 		return;
++ 
++ 	hw_set_mem_tag_range((void *)addr, size, value);
++ }
++ 
++ static inline void kasan_unpoison(const void *addr, size_t size)
++ {
++ 	u8 tag = get_tag(addr);
++ 
++ 	addr = kasan_reset_tag(addr);
++ 
++ 	/* Skip KFENCE memory if called explicitly outside of sl*b. */
++ 	if (is_kfence_address(addr))
++ 		return;
++ 
++ 	if (WARN_ON((unsigned long)addr & KASAN_GRANULE_MASK))
++ 		return;
++ 	size = round_up(size, KASAN_GRANULE_SIZE);
++ 
++ 	hw_set_mem_tag_range((void *)addr, size, tag);
++ }
++ 
++ static inline bool kasan_byte_accessible(const void *addr)
++ {
++ 	u8 ptr_tag = get_tag(addr);
++ 	u8 mem_tag = hw_get_mem_tag((void *)addr);
++ 
++ 	return (mem_tag != KASAN_TAG_INVALID) &&
++ 		(ptr_tag == KASAN_TAG_KERNEL || ptr_tag == mem_tag);
++ }
++ 
++ #else /* CONFIG_KASAN_HW_TAGS */
++ 
++ /**
++  * kasan_poison - mark the memory range as unaccessible
++  * @addr - range start address, must be aligned to KASAN_GRANULE_SIZE
++  * @size - range size, must be aligned to KASAN_GRANULE_SIZE
++  * @value - value that's written to metadata for the range
++  *
++  * The size gets aligned to KASAN_GRANULE_SIZE before marking the range.
++  */
++ void kasan_poison(const void *addr, size_t size, u8 value);
++ 
++ /**
++  * kasan_unpoison - mark the memory range as accessible
++  * @addr - range start address, must be aligned to KASAN_GRANULE_SIZE
++  * @size - range size, can be unaligned
++  *
++  * For the tag-based modes, the @size gets aligned to KASAN_GRANULE_SIZE before
++  * marking the range.
++  * For the generic mode, the last granule of the memory range gets partially
++  * unpoisoned based on the @size.
++  */
++ void kasan_unpoison(const void *addr, size_t size);
++ 
++ bool kasan_byte_accessible(const void *addr);
++ 
++ #endif /* CONFIG_KASAN_HW_TAGS */
++ 
++ #ifdef CONFIG_KASAN_GENERIC
++ 
++ /**
++  * kasan_poison_last_granule - mark the last granule of the memory range as
++  * unaccessible
++  * @addr - range start address, must be aligned to KASAN_GRANULE_SIZE
++  * @size - range size
++  *
++  * This function is only available for the generic mode, as it's the only mode
++  * that has partially poisoned memory granules.
++  */
++ void kasan_poison_last_granule(const void *address, size_t size);
++ 
++ #else /* CONFIG_KASAN_GENERIC */
++ 
++ static inline void kasan_poison_last_granule(const void *address, size_t size) { }
++ 
++ #endif /* CONFIG_KASAN_GENERIC */
++ 
+++>>>>>>> cde8a7eb778c (kasan: ensure poisoning size alignment)
+  /*
+   * Exported functions for interfaces called from assembly or from generated
+   * code. Declarations here to avoid warning about missing declarations.
+* Unmerged path mm/kasan/shadow.c
+* Unmerged path mm/kasan/common.c
+* Unmerged path mm/kasan/kasan.h
+* Unmerged path mm/kasan/shadow.c
