@@ -1,0 +1,143 @@
+netfilter: ipv6: nf_defrag: accept duplicate fragments again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Guillaume Nault <gnault@redhat.com>
+commit 8a3dca632538c550930ce8bafa8c906b130d35cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8a3dca63.failed
+
+When fixing the skb leak introduced by the conversion to rbtree, I
+forgot about the special case of duplicate fragments. The condition
+under the 'insert_error' label isn't effective anymore as
+nf_ct_frg6_gather() doesn't override the returned value anymore. So
+duplicate fragments now get NF_DROP verdict.
+
+To accept duplicate fragments again, handle them specially as soon as
+inet_frag_queue_insert() reports them. Return -EINPROGRESS which will
+translate to NF_STOLEN verdict, like any accepted fragment. However,
+such packets don't carry any new information and aren't queued, so we
+just drop them immediately.
+
+Fixes: a0d56cb911ca ("netfilter: ipv6: nf_defrag: fix leakage of unqueued fragments")
+	Signed-off-by: Guillaume Nault <gnault@redhat.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 8a3dca632538c550930ce8bafa8c906b130d35cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/netfilter/nf_conntrack_reasm.c
+diff --cc net/ipv6/netfilter/nf_conntrack_reasm.c
+index 043ed8eb0ab9,8951de8b568f..000000000000
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@@ -254,55 -258,24 +254,71 @@@ static int nf_ct_frag6_queue(struct fra
+  		goto err;
+  	}
+  
+ -	/* Note : skb->rbnode and skb->dev share the same location. */
+ -	dev = skb->dev;
+ +	/* Find out which fragments are in front and at the back of us
+ +	 * in the chain of fragments so far.  We must know where to put
+ +	 * this fragment, right?
+ +	 */
+ +	prev = fq->q.fragments_tail;
+ +	if (!prev || prev->ip_defrag_offset < offset) {
+ +		next = NULL;
+ +		goto found;
+ +	}
+ +	prev = NULL;
+ +	for (next = fq->q.fragments; next != NULL; next = next->next) {
+ +		if (next->ip_defrag_offset >= offset)
+ +			break;	/* bingo! */
+ +		prev = next;
+ +	}
+ +
+ +found:
+ +	/* RFC5722, Section 4:
+ +	 *                                  When reassembling an IPv6 datagram, if
+ +	 *   one or more its constituent fragments is determined to be an
+ +	 *   overlapping fragment, the entire datagram (and any constituent
+ +	 *   fragments, including those not yet received) MUST be silently
+ +	 *   discarded.
+ +	 */
+ +
+ +	/* Check for overlap with preceding fragment. */
+ +	if (prev &&
+ +	    (prev->ip_defrag_offset + prev->len) > offset)
+ +		goto discard_fq;
+ +
+ +	/* Look for overlap with succeeding segment. */
+ +	if (next && next->ip_defrag_offset < end)
+ +		goto discard_fq;
+ +
+ +	/* Note : skb->ip_defrag_offset and skb->dev share the same location */
+ +	if (skb->dev)
+ +		fq->iif = skb->dev->ifindex;
+  	/* Makes sure compiler wont do silly aliasing games */
+  	barrier();
+ -
+ +	skb->ip_defrag_offset = offset;
+ +
+++<<<<<<< HEAD
+ +	/* Insert this fragment in the chain of fragments. */
+ +	skb->next = next;
+ +	if (!next)
+ +		fq->q.fragments_tail = skb;
+ +	if (prev)
+ +		prev->next = skb;
+ +	else
+ +		fq->q.fragments = skb;
+++=======
++ 	prev = fq->q.fragments_tail;
++ 	err = inet_frag_queue_insert(&fq->q, skb, offset, end);
++ 	if (err) {
++ 		if (err == IPFRAG_DUP) {
++ 			/* No error for duplicates, pretend they got queued. */
++ 			kfree_skb(skb);
++ 			return -EINPROGRESS;
++ 		}
++ 		goto insert_error;
++ 	}
++ 
++ 	if (dev)
++ 		fq->iif = dev->ifindex;
+++>>>>>>> 8a3dca632538 (netfilter: ipv6: nf_defrag: accept duplicate fragments again)
+  
+  	fq->q.stamp = skb->tstamp;
+  	fq->q.meat += skb->len;
+@@@ -319,11 -292,27 +335,28 @@@
+  		fq->q.flags |= INET_FRAG_FIRST_IN;
+  	}
+  
+ -	if (fq->q.flags == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+ -	    fq->q.meat == fq->q.len) {
+ -		unsigned long orefdst = skb->_skb_refdst;
+ +	return 0;
+  
+++<<<<<<< HEAD
+ +discard_fq:
+++=======
++ 		skb->_skb_refdst = 0UL;
++ 		err = nf_ct_frag6_reasm(fq, skb, prev, dev);
++ 		skb->_skb_refdst = orefdst;
++ 
++ 		/* After queue has assumed skb ownership, only 0 or
++ 		 * -EINPROGRESS must be returned.
++ 		 */
++ 		return err ? -EINPROGRESS : 0;
++ 	}
++ 
++ 	skb_dst_drop(skb);
++ 	return -EINPROGRESS;
++ 
++ insert_error:
+++>>>>>>> 8a3dca632538 (netfilter: ipv6: nf_defrag: accept duplicate fragments again)
+  	inet_frag_kill(&fq->q);
+  err:
+ -	skb_dst_drop(skb);
+  	return -EINVAL;
+  }
+  
+* Unmerged path net/ipv6/netfilter/nf_conntrack_reasm.c
