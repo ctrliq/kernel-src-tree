@@ -1,0 +1,104 @@
+iommu/arm-smmu: Report USF more clearly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 931a0ba638e09a707e9a905cb6bea1fb1c6d4183
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/931a0ba6.failed
+
+Although CONFIG_ARM_SMMU_DISABLE_BYPASS_BY_DEFAULT is a welcome tool
+for smoking out inadequate firmware, the failure mode is non-obvious
+and can be confusing for end users. Add some special-case reporting of
+Unidentified Stream Faults to help clarify this particular symptom.
+Since we're adding yet another print to the mix, also break out an
+explicit ratelimit state to make sure everything stays together (and
+reduce the static storage footprint a little).
+
+	Reviewed-by: Douglas Anderson <dianders@chromium.org>
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 931a0ba638e09a707e9a905cb6bea1fb1c6d4183)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu.c
+diff --cc drivers/iommu/arm-smmu.c
+index c913cdd695bd,bd6683c210da..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -51,10 -36,11 +51,11 @@@
+  #include <linux/pci.h>
+  #include <linux/platform_device.h>
+  #include <linux/pm_runtime.h>
++ #include <linux/ratelimit.h>
+  #include <linux/slab.h>
+ +#include <linux/spinlock.h>
+  
+  #include <linux/amba/bus.h>
+ -#include <linux/fsl/mc.h>
+  
+  #include "arm-smmu.h"
+  
+@@@ -679,23 -478,32 +680,36 @@@ static irqreturn_t arm_smmu_global_faul
+  {
+  	u32 gfsr, gfsynr0, gfsynr1, gfsynr2;
+  	struct arm_smmu_device *smmu = dev;
+++<<<<<<< HEAD
+ +	void __iomem *gr0_base = ARM_SMMU_GR0_NS(smmu);
+++=======
++ 	static DEFINE_RATELIMIT_STATE(rs, DEFAULT_RATELIMIT_INTERVAL,
++ 				      DEFAULT_RATELIMIT_BURST);
+++>>>>>>> 931a0ba638e0 (iommu/arm-smmu: Report USF more clearly)
+  
+ -	gfsr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSR);
+ -	gfsynr0 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSYNR0);
+ -	gfsynr1 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSYNR1);
+ -	gfsynr2 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sGFSYNR2);
+ +	gfsr = readl_relaxed(gr0_base + ARM_SMMU_GR0_sGFSR);
+ +	gfsynr0 = readl_relaxed(gr0_base + ARM_SMMU_GR0_sGFSYNR0);
+ +	gfsynr1 = readl_relaxed(gr0_base + ARM_SMMU_GR0_sGFSYNR1);
+ +	gfsynr2 = readl_relaxed(gr0_base + ARM_SMMU_GR0_sGFSYNR2);
+  
+  	if (!gfsr)
+  		return IRQ_NONE;
+  
+- 	dev_err_ratelimited(smmu->dev,
+- 		"Unexpected global fault, this could be serious\n");
+- 	dev_err_ratelimited(smmu->dev,
+- 		"\tGFSR 0x%08x, GFSYNR0 0x%08x, GFSYNR1 0x%08x, GFSYNR2 0x%08x\n",
+- 		gfsr, gfsynr0, gfsynr1, gfsynr2);
++ 	if (__ratelimit(&rs)) {
++ 		if (IS_ENABLED(CONFIG_ARM_SMMU_DISABLE_BYPASS_BY_DEFAULT) &&
++ 		    (gfsr & sGFSR_USF))
++ 			dev_err(smmu->dev,
++ 				"Blocked unknown Stream ID 0x%hx; boot with \"arm-smmu.disable_bypass=0\" to allow, but this may have security implications\n",
++ 				(u16)gfsynr1);
++ 		else
++ 			dev_err(smmu->dev,
++ 				"Unexpected global fault, this could be serious\n");
++ 		dev_err(smmu->dev,
++ 			"\tGFSR 0x%08x, GFSYNR0 0x%08x, GFSYNR1 0x%08x, GFSYNR2 0x%08x\n",
++ 			gfsr, gfsynr0, gfsynr1, gfsynr2);
++ 	}
+  
+ -	arm_smmu_gr0_write(smmu, ARM_SMMU_GR0_sGFSR, gfsr);
+ +	writel(gfsr, gr0_base + ARM_SMMU_GR0_sGFSR);
+  	return IRQ_HANDLED;
+  }
+  
+* Unmerged path drivers/iommu/arm-smmu.c
+diff --git a/drivers/iommu/arm-smmu.h b/drivers/iommu/arm-smmu.h
+index 671b3a337fea..bb6f4033e409 100644
+--- a/drivers/iommu/arm-smmu.h
++++ b/drivers/iommu/arm-smmu.h
+@@ -51,6 +51,8 @@
+ #define ARM_SMMU_GR0_ID6		0x38
+ #define ARM_SMMU_GR0_ID7		0x3c
+ #define ARM_SMMU_GR0_sGFSR		0x48
++#define sGFSR_USF			BIT(1)
++
+ #define ARM_SMMU_GR0_sGFSYNR0		0x50
+ #define ARM_SMMU_GR0_sGFSYNR1		0x54
+ #define ARM_SMMU_GR0_sGFSYNR2		0x58
