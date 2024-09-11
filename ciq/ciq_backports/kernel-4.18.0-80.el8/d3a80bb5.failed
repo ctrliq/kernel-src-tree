@@ -1,0 +1,124 @@
+net/mlx5e: Don't match on vlan non-existence if ethertype is wildcarded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit d3a80bb5a3eac311ddf28387402593977574460d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/d3a80bb5.failed
+
+For the "all" ethertype we should not care whether the packet has
+vlans. Besides being wrong, the way we did it caused FW error
+for rules such as:
+
+tc filter add dev eth0 protocol all parent ffff: \
+	prio 1 flower skip_sw action drop
+
+b/c the matching meta-data (outer headers bit in struct mlx5_flow_spec)
+wasn't set. Fix that by matching on vlan non-existence only if we were
+also told to match on the ethertype.
+
+Fixes: cee26487620b ('net/mlx5e: Set vlan masks for all offloaded TC rules')
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Reported-by: Slava Ovsiienko <viacheslavo@mellanox.com>
+	Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit d3a80bb5a3eac311ddf28387402593977574460d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 445be7b416af,84eb6939e69a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -1358,26 -1495,72 +1348,77 @@@ static int __parse_cls_flower(struct ml
+  
+  			*match_level = MLX5_MATCH_L2;
+  		}
+- 	} else {
++ 	} else if (*match_level != MLX5_MATCH_NONE) {
+  		MLX5_SET(fte_match_set_lyr_2_4, headers_c, svlan_tag, 1);
+  		MLX5_SET(fte_match_set_lyr_2_4, headers_c, cvlan_tag, 1);
++ 		*match_level = MLX5_MATCH_L2;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
+ +		struct flow_dissector_key_basic *key =
+++=======
++ 	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_CVLAN)) {
++ 		struct flow_dissector_key_vlan *key =
+  			skb_flow_dissector_target(f->dissector,
+- 						  FLOW_DISSECTOR_KEY_BASIC,
++ 						  FLOW_DISSECTOR_KEY_CVLAN,
+  						  f->key);
+- 		struct flow_dissector_key_basic *mask =
++ 		struct flow_dissector_key_vlan *mask =
+  			skb_flow_dissector_target(f->dissector,
+- 						  FLOW_DISSECTOR_KEY_BASIC,
++ 						  FLOW_DISSECTOR_KEY_CVLAN,
+  						  f->mask);
+- 		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ethertype,
+- 			 ntohs(mask->n_proto));
+- 		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ethertype,
+- 			 ntohs(key->n_proto));
++ 		if (mask->vlan_id || mask->vlan_priority || mask->vlan_tpid) {
++ 			if (key->vlan_tpid == htons(ETH_P_8021AD)) {
++ 				MLX5_SET(fte_match_set_misc, misc_c,
++ 					 outer_second_svlan_tag, 1);
++ 				MLX5_SET(fte_match_set_misc, misc_v,
++ 					 outer_second_svlan_tag, 1);
++ 			} else {
++ 				MLX5_SET(fte_match_set_misc, misc_c,
++ 					 outer_second_cvlan_tag, 1);
++ 				MLX5_SET(fte_match_set_misc, misc_v,
++ 					 outer_second_cvlan_tag, 1);
++ 			}
+  
+- 		if (mask->n_proto)
++ 			MLX5_SET(fte_match_set_misc, misc_c, outer_second_vid,
++ 				 mask->vlan_id);
++ 			MLX5_SET(fte_match_set_misc, misc_v, outer_second_vid,
++ 				 key->vlan_id);
++ 			MLX5_SET(fte_match_set_misc, misc_c, outer_second_prio,
++ 				 mask->vlan_priority);
++ 			MLX5_SET(fte_match_set_misc, misc_v, outer_second_prio,
++ 				 key->vlan_priority);
++ 
++ 			*match_level = MLX5_MATCH_L2;
++ 		}
++ 	}
++ 
++ 	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
++ 		struct flow_dissector_key_eth_addrs *key =
+++>>>>>>> d3a80bb5a3ea (net/mlx5e: Don't match on vlan non-existence if ethertype is wildcarded)
++ 			skb_flow_dissector_target(f->dissector,
++ 						  FLOW_DISSECTOR_KEY_ETH_ADDRS,
++ 						  f->key);
++ 		struct flow_dissector_key_eth_addrs *mask =
++ 			skb_flow_dissector_target(f->dissector,
++ 						  FLOW_DISSECTOR_KEY_ETH_ADDRS,
++ 						  f->mask);
++ 
++ 		ether_addr_copy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
++ 					     dmac_47_16),
++ 				mask->dst);
++ 		ether_addr_copy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
++ 					     dmac_47_16),
++ 				key->dst);
++ 
++ 		ether_addr_copy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
++ 					     smac_47_16),
++ 				mask->src);
++ 		ether_addr_copy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
++ 					     smac_47_16),
++ 				key->src);
++ 
++ 		if (!is_zero_ether_addr(mask->src) || !is_zero_ether_addr(mask->dst))
+  			*match_level = MLX5_MATCH_L2;
+  	}
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
