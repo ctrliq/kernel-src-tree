@@ -1,0 +1,111 @@
+perf/x86: Move cpuc->running into P4 specific code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 46ade4740bbf9bf4e804ddb2c85845cccd219f3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/46ade474.failed
+
+The 'running' variable is only used in the P4 PMU. Current perf sets the
+variable in the critical function x86_pmu_start(), which wastes cycles
+for everybody not running on P4.
+
+Move cpuc->running into the P4 specific p4_pmu_enable_event().
+
+Add a static per-CPU 'p4_running' variable to replace the 'running'
+variable in the struct cpu_hw_events. Saves space for the generic
+structure.
+
+The p4_pmu_enable_all() also invokes the p4_pmu_enable_event(), but it
+should not set cpuc->running. Factor out __p4_pmu_enable_event() for
+p4_pmu_enable_all().
+
+	Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/1618410990-21383-1-git-send-email-kan.liang@linux.intel.com
+(cherry picked from commit 46ade4740bbf9bf4e804ddb2c85845cccd219f3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/core.c
+diff --cc arch/x86/events/core.c
+index ac7b2222d576,dd9f3c2f7d05..000000000000
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@@ -1484,8 -1480,7 +1484,12 @@@ static void x86_pmu_start(struct perf_e
+  
+  	cpuc->events[idx] = event;
+  	__set_bit(idx, cpuc->active_mask);
+++<<<<<<< HEAD
+ +	__set_bit(idx, cpuc->running);
+ +	x86_pmu.enable(event);
+++=======
++ 	static_call(x86_pmu_enable)(event);
+++>>>>>>> 46ade4740bbf (perf/x86: Move cpuc->running into P4 specific code)
+  	perf_event_update_userpage(event);
+  }
+  
+* Unmerged path arch/x86/events/core.c
+diff --git a/arch/x86/events/intel/p4.c b/arch/x86/events/intel/p4.c
+index a4cc66005ce8..9c10cbb48f40 100644
+--- a/arch/x86/events/intel/p4.c
++++ b/arch/x86/events/intel/p4.c
+@@ -947,7 +947,7 @@ static void p4_pmu_enable_pebs(u64 config)
+ 	(void)wrmsrl_safe(MSR_P4_PEBS_MATRIX_VERT,	(u64)bind->metric_vert);
+ }
+ 
+-static void p4_pmu_enable_event(struct perf_event *event)
++static void __p4_pmu_enable_event(struct perf_event *event)
+ {
+ 	struct hw_perf_event *hwc = &event->hw;
+ 	int thread = p4_ht_config_thread(hwc->config);
+@@ -983,6 +983,16 @@ static void p4_pmu_enable_event(struct perf_event *event)
+ 				(cccr & ~P4_CCCR_RESERVED) | P4_CCCR_ENABLE);
+ }
+ 
++static DEFINE_PER_CPU(unsigned long [BITS_TO_LONGS(X86_PMC_IDX_MAX)], p4_running);
++
++static void p4_pmu_enable_event(struct perf_event *event)
++{
++	int idx = event->hw.idx;
++
++	__set_bit(idx, per_cpu(p4_running, smp_processor_id()));
++	__p4_pmu_enable_event(event);
++}
++
+ static void p4_pmu_enable_all(int added)
+ {
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+@@ -992,7 +1002,7 @@ static void p4_pmu_enable_all(int added)
+ 		struct perf_event *event = cpuc->events[idx];
+ 		if (!test_bit(idx, cpuc->active_mask))
+ 			continue;
+-		p4_pmu_enable_event(event);
++		__p4_pmu_enable_event(event);
+ 	}
+ }
+ 
+@@ -1012,7 +1022,7 @@ static int p4_pmu_handle_irq(struct pt_regs *regs)
+ 
+ 		if (!test_bit(idx, cpuc->active_mask)) {
+ 			/* catch in-flight IRQs */
+-			if (__test_and_clear_bit(idx, cpuc->running))
++			if (__test_and_clear_bit(idx, per_cpu(p4_running, smp_processor_id())))
+ 				handled++;
+ 			continue;
+ 		}
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 23e9b1e50646..69092488e1c3 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -229,7 +229,6 @@ struct cpu_hw_events {
+ 	 */
+ 	struct perf_event	*events[X86_PMC_IDX_MAX]; /* in counter order */
+ 	unsigned long		active_mask[BITS_TO_LONGS(X86_PMC_IDX_MAX)];
+-	unsigned long		running[BITS_TO_LONGS(X86_PMC_IDX_MAX)];
+ 	int			enabled;
+ 
+ 	int			n_events; /* the # of events in the below arrays */
