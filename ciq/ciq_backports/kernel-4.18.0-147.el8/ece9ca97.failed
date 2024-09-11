@@ -1,0 +1,293 @@
+RDMA/uverbs: Do not check the input length on create_cq/qp paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit ece9ca97ccdc845c0c48e204e5a6d9149b7a24b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ece9ca97.failed
+
+If the user did not provide a long enough command buffer then the missing
+bytes are forced to zero. There is no reason to check the length if a zero
+value is OK.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ece9ca97ccdc845c0c48e204e5a6d9149b7a24b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,11e2175e0362..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -948,30 -1005,20 +948,35 @@@ ssize_t ib_uverbs_create_comp_channel(s
+  	resp.fd = uobj->id;
+  
+  	ev_file = container_of(uobj, struct ib_uverbs_completion_event_file,
+ -			       uobj);
+ +			       uobj_file.uobj);
+  	ib_uverbs_init_event_queue(&ev_file->ev_queue);
+  
+ -	ret = uverbs_response(attrs, &resp, sizeof(resp));
+ -	if (ret) {
+ +	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof resp)) {
+  		uobj_alloc_abort(uobj);
+ -		return ret;
+ +		return -EFAULT;
+  	}
+  
+ -	return uobj_alloc_commit(uobj);
+ +	uobj_alloc_commit(uobj);
+ +	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +static struct ib_ucq_object *create_cq(struct ib_uverbs_file *file,
+ +					struct ib_device *ib_dev,
+ +				       struct ib_udata *ucore,
+ +				       struct ib_udata *uhw,
+ +				       struct ib_uverbs_ex_create_cq *cmd,
+ +				       size_t cmd_sz,
+ +				       int (*cb)(struct ib_uverbs_file *file,
+ +						 struct ib_ucq_object *obj,
+ +						 struct ib_uverbs_ex_create_cq_resp *resp,
+ +						 struct ib_udata *udata,
+ +						 void *context),
+ +				       void *context)
+++=======
++ static struct ib_ucq_object *create_cq(struct uverbs_attr_bundle *attrs,
++ 				       struct ib_uverbs_ex_create_cq *cmd)
+++>>>>>>> ece9ca97ccdc (RDMA/uverbs: Do not check the input length on create_cq/qp paths)
+  {
+  	struct ib_ucq_object           *obj;
+  	struct ib_uverbs_completion_event_file    *ev_file = NULL;
+@@@ -1008,11 -1052,10 +1013,9 @@@
+  
+  	attr.cqe = cmd->cqe;
+  	attr.comp_vector = cmd->comp_vector;
+- 
+- 	if (cmd_sz > offsetof(typeof(*cmd), flags) + sizeof(cmd->flags))
+- 		attr.flags = cmd->flags;
++ 	attr.flags = cmd->flags;
+  
+ -	cq = ib_dev->create_cq(ib_dev, &attr, obj->uobject.context,
+ -			       &attrs->driver_udata);
+ +	cq = ib_dev->create_cq(ib_dev, &attr, file->ucontext, uhw);
+  	if (IS_ERR(cq)) {
+  		ret = PTR_ERR(cq);
+  		goto err_file;
+@@@ -1099,44 -1117,20 +1102,49 @@@ ssize_t ib_uverbs_create_cq(struct ib_u
+  	cmd_ex.comp_vector = cmd.comp_vector;
+  	cmd_ex.comp_channel = cmd.comp_channel;
+  
+++<<<<<<< HEAD
+ +	obj = create_cq(file, ib_dev, &ucore, &uhw, &cmd_ex,
+ +			offsetof(typeof(cmd_ex), comp_channel) +
+ +			sizeof(cmd.comp_channel), ib_uverbs_create_cq_cb,
+ +			NULL);
+ +
+ +	if (IS_ERR(obj))
+ +		return PTR_ERR(obj);
+ +
+ +	return in_len;
+++=======
++ 	obj = create_cq(attrs, &cmd_ex);
++ 	return PTR_ERR_OR_ZERO(obj);
+++>>>>>>> ece9ca97ccdc (RDMA/uverbs: Do not check the input length on create_cq/qp paths)
+  }
+  
+ -static int ib_uverbs_ex_create_cq(struct uverbs_attr_bundle *attrs,
+ -				  struct ib_udata *ucore)
+ +static int ib_uverbs_ex_create_cq_cb(struct ib_uverbs_file *file,
+ +				     struct ib_ucq_object *obj,
+ +				     struct ib_uverbs_ex_create_cq_resp *resp,
+ +				     struct ib_udata *ucore, void *context)
+  {
+ +	if (ib_copy_to_udata(ucore, resp, resp->response_length))
+ +		return -EFAULT;
+ +
+ +	return 0;
+ +}
+ +
+ +int ib_uverbs_ex_create_cq(struct ib_uverbs_file *file,
+ +			 struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+ +{
+ +	struct ib_uverbs_ex_create_cq_resp resp;
+  	struct ib_uverbs_ex_create_cq  cmd;
+  	struct ib_ucq_object           *obj;
+ -	int ret;
+ +	int err;
+  
+ -	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ -	if (ret)
+ -		return ret;
+ +	if (ucore->inlen < sizeof(cmd))
+ +		return -EINVAL;
+ +
+ +	err = ib_copy_from_udata(&cmd, ucore, sizeof(cmd));
+ +	if (err)
+ +		return err;
+  
+  	if (cmd.comp_mask)
+  		return -EINVAL;
+@@@ -1144,14 -1138,7 +1152,18 @@@
+  	if (cmd.reserved)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (ucore->outlen < (offsetof(typeof(resp), response_length) +
+ +			     sizeof(resp.response_length)))
+ +		return -ENOSPC;
+ +
+ +	obj = create_cq(file, ib_dev, ucore, uhw, &cmd,
+ +			min(ucore->inlen, sizeof(cmd)),
+ +			ib_uverbs_ex_create_cq_cb, NULL);
+ +
+++=======
++ 	obj = create_cq(attrs, &cmd);
+++>>>>>>> ece9ca97ccdc (RDMA/uverbs: Do not check the input length on create_cq/qp paths)
+  	return PTR_ERR_OR_ZERO(obj);
+  }
+  
+@@@ -1337,22 -1298,13 +1349,27 @@@ ssize_t ib_uverbs_destroy_cq(struct ib_
+  	resp.comp_events_reported  = obj->comp_events_reported;
+  	resp.async_events_reported = obj->async_events_reported;
+  
+ -	uobj_put_destroy(uobj);
+ +	uverbs_uobject_put(uobj);
+ +	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof resp))
+ +		return -EFAULT;
+  
+ -	return uverbs_response(attrs, &resp, sizeof(resp));
+ +	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +static int create_qp(struct ib_uverbs_file *file,
+ +		     struct ib_udata *ucore,
+ +		     struct ib_udata *uhw,
+ +		     struct ib_uverbs_ex_create_qp *cmd,
+ +		     size_t cmd_sz,
+ +		     int (*cb)(struct ib_uverbs_file *file,
+ +			       struct ib_uverbs_ex_create_qp_resp *resp,
+ +			       struct ib_udata *udata),
+ +		     void *context)
+++=======
++ static int create_qp(struct uverbs_attr_bundle *attrs,
++ 		     struct ib_uverbs_ex_create_qp *cmd)
+++>>>>>>> ece9ca97ccdc (RDMA/uverbs: Do not check the input length on create_cq/qp paths)
+  {
+  	struct ib_uqp_object		*obj;
+  	struct ib_device		*device;
+@@@ -1380,12 -1332,10 +1396,19 @@@
+  	obj->uevent.uobject.user_handle = cmd->user_handle;
+  	mutex_init(&obj->mcast_lock);
+  
+++<<<<<<< HEAD
+ +	if (cmd_sz >= offsetof(typeof(*cmd), rwq_ind_tbl_handle) +
+ +		      sizeof(cmd->rwq_ind_tbl_handle) &&
+ +		      (cmd->comp_mask & IB_UVERBS_CREATE_QP_MASK_IND_TABLE)) {
+ +		ind_tbl = uobj_get_obj_read(rwq_ind_table, UVERBS_OBJECT_RWQ_IND_TBL,
+ +					    cmd->rwq_ind_tbl_handle,
+ +					    file->ucontext);
+++=======
++ 	if (cmd->comp_mask & IB_UVERBS_CREATE_QP_MASK_IND_TABLE) {
++ 		ind_tbl = uobj_get_obj_read(rwq_ind_table,
++ 					    UVERBS_OBJECT_RWQ_IND_TBL,
++ 					    cmd->rwq_ind_tbl_handle, attrs);
+++>>>>>>> ece9ca97ccdc (RDMA/uverbs: Do not check the input length on create_cq/qp paths)
+  		if (!ind_tbl) {
+  			ret = -EINVAL;
+  			goto err_put;
+@@@ -1669,43 -1575,18 +1681,47 @@@ ssize_t ib_uverbs_create_qp(struct ib_u
+  	cmd_ex.qp_type = cmd.qp_type;
+  	cmd_ex.is_srq = cmd.is_srq;
+  
+++<<<<<<< HEAD
+ +	err = create_qp(file, &ucore, &uhw, &cmd_ex,
+ +			offsetof(typeof(cmd_ex), is_srq) +
+ +			sizeof(cmd.is_srq), ib_uverbs_create_qp_cb,
+ +			NULL);
+ +
+ +	if (err)
+ +		return err;
+ +
+ +	return in_len;
+++=======
++ 	return create_qp(attrs, &cmd_ex);
+++>>>>>>> ece9ca97ccdc (RDMA/uverbs: Do not check the input length on create_cq/qp paths)
+  }
+  
+ -static int ib_uverbs_ex_create_qp(struct uverbs_attr_bundle *attrs,
+ -				  struct ib_udata *ucore)
+ +static int ib_uverbs_ex_create_qp_cb(struct ib_uverbs_file *file,
+ +				     struct ib_uverbs_ex_create_qp_resp *resp,
+ +				     struct ib_udata *ucore)
+  {
+ -	struct ib_uverbs_ex_create_qp cmd;
+ -	int ret;
+ +	if (ib_copy_to_udata(ucore, resp, resp->response_length))
+ +		return -EFAULT;
+  
+ -	ret = uverbs_request(attrs, &cmd, sizeof(cmd));
+ -	if (ret)
+ -		return ret;
+ +	return 0;
+ +}
+ +
+ +int ib_uverbs_ex_create_qp(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+ +{
+ +	struct ib_uverbs_ex_create_qp_resp resp;
+ +	struct ib_uverbs_ex_create_qp cmd = {0};
+ +	int err;
+ +
+ +	if (ucore->inlen < (offsetof(typeof(cmd), comp_mask) +
+ +			    sizeof(cmd.comp_mask)))
+ +		return -EINVAL;
+ +
+ +	err = ib_copy_from_udata(&cmd, ucore, min(sizeof(cmd), ucore->inlen));
+ +	if (err)
+ +		return err;
+  
+  	if (cmd.comp_mask & ~IB_UVERBS_CREATE_QP_SUP_COMP_MASK)
+  		return -EINVAL;
+@@@ -1713,23 -1594,11 +1729,27 @@@
+  	if (cmd.reserved)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (ucore->outlen < (offsetof(typeof(resp), response_length) +
+ +			     sizeof(resp.response_length)))
+ +		return -ENOSPC;
+ +
+ +	err = create_qp(file, ucore, uhw, &cmd,
+ +			min(ucore->inlen, sizeof(cmd)),
+ +			ib_uverbs_ex_create_qp_cb, NULL);
+ +
+ +	if (err)
+ +		return err;
+ +
+ +	return 0;
+++=======
++ 	return create_qp(attrs, &cmd);
+++>>>>>>> ece9ca97ccdc (RDMA/uverbs: Do not check the input length on create_cq/qp paths)
+  }
+  
+ -static int ib_uverbs_open_qp(struct uverbs_attr_bundle *attrs,
+ -			     const char __user *buf, int in_len, int out_len)
+ +ssize_t ib_uverbs_open_qp(struct ib_uverbs_file *file,
+ +			  struct ib_device *ib_dev,
+ +			  const char __user *buf, int in_len, int out_len)
+  {
+  	struct ib_uverbs_open_qp        cmd;
+  	struct ib_uverbs_create_qp_resp resp;
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
