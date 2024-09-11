@@ -1,0 +1,93 @@
+KVM: x86/mmu: Don't step down in the TDP iterator when zapping all SPTEs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 0103098fb4f13b447b26ed514bcd3140f6791047
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/0103098f.failed
+
+Set the min_level for the TDP iterator at the root level when zapping all
+SPTEs to optimize the iterator's try_step_down().  Zapping a non-leaf
+SPTE will recursively zap all its children, thus there is no need for the
+iterator to attempt to step down.  This avoids rereading the top-level
+SPTEs after they are zapped by causing try_step_down() to short-circuit.
+
+In most cases, optimizing try_step_down() will be in the noise as the cost
+of zapping SPTEs completely dominates the overall time.  The optimization
+is however helpful if the zap occurs with relatively few SPTEs, e.g. if KVM
+is zapping in response to multiple memslot updates when userspace is adding
+and removing read-only memslots for option ROMs.  In that case, the task
+doing the zapping likely isn't a vCPU thread, but it still holds mmu_lock
+for read and thus can be a noisy neighbor of sorts.
+
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210812181414.3376143-3-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0103098fb4f13b447b26ed514bcd3140f6791047)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 506d3bdb9486,d80cb122b5f3..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -691,20 -712,43 +691,43 @@@ static inline bool __must_check tdp_mmu
+   * scheduler needs the CPU or there is contention on the MMU lock. If this
+   * function cannot yield, it will not release the MMU lock or reschedule and
+   * the caller must ensure it does not supply too large a GFN range, or the
+ - * operation can cause a soft lockup.
+ - *
+ - * If shared is true, this thread holds the MMU lock in read mode and must
+ - * account for the possibility that other threads are modifying the paging
+ - * structures concurrently. If shared is false, this thread should hold the
+ - * MMU lock in write mode.
+ + * operation can cause a soft lockup.  Note, in some use cases a flush may be
+ + * required by prior actions.  Ensure the pending flush is performed prior to
+ + * yielding.
+   */
+  static bool zap_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
+ -			  gfn_t start, gfn_t end, bool can_yield, bool flush,
+ -			  bool shared)
+ +			  gfn_t start, gfn_t end, bool can_yield, bool flush)
+  {
+ -	gfn_t max_gfn_host = 1ULL << (shadow_phys_bits - PAGE_SHIFT);
+ -	bool zap_all = (start == 0 && end >= max_gfn_host);
+  	struct tdp_iter iter;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +
+ +	tdp_root_for_each_pte(iter, root, start, end) {
+++=======
++ 	/*
++ 	 * No need to try to step down in the iterator when zapping all SPTEs,
++ 	 * zapping the top-level non-leaf SPTEs will recurse on their children.
++ 	 */
++ 	int min_level = zap_all ? root->role.level : PG_LEVEL_4K;
++ 
++ 	/*
++ 	 * Bound the walk at host.MAXPHYADDR, guest accesses beyond that will
++ 	 * hit a #PF(RSVD) and never get to an EPT Violation/Misconfig / #NPF,
++ 	 * and so KVM will never install a SPTE for such addresses.
++ 	 */
++ 	end = min(end, max_gfn_host);
++ 
++ 	kvm_lockdep_assert_mmu_lock_held(kvm, shared);
++ 
++ 	rcu_read_lock();
++ 
++ 	for_each_tdp_pte_min_level(iter, root->spt, root->role.level,
++ 				   min_level, start, end) {
++ retry:
+++>>>>>>> 0103098fb4f1 (KVM: x86/mmu: Don't step down in the TDP iterator when zapping all SPTEs)
+  		if (can_yield &&
+ -		    tdp_mmu_iter_cond_resched(kvm, &iter, flush, shared)) {
+ +		    tdp_mmu_iter_cond_resched(kvm, &iter, flush)) {
+  			flush = false;
+  			continue;
+  		}
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
