@@ -1,0 +1,280 @@
+KVM: x86/mmu: Configure max page level during hardware setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 703c335d06934401763863cf24fee61a13de055b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/703c335d.failed
+
+Configure the max page level during hardware setup to avoid a retpoline
+in the page fault handler.  Drop ->get_lpage_level() as the page fault
+handler was the last user.
+
+No functional change intended.
+
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 703c335d06934401763863cf24fee61a13de055b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 57bbfbf61b11,c817987c599e..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1147,9 -1155,6 +1147,12 @@@ struct kvm_x86_ops 
+  	int (*set_identity_map_addr)(struct kvm *kvm, u64 ident_addr);
+  	int (*get_tdp_level)(struct kvm_vcpu *vcpu);
+  	u64 (*get_mt_mask)(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio);
+++<<<<<<< HEAD
+ +	int (*get_lpage_level)(void);
+ +	bool (*rdtscp_supported)(void);
+ +	bool (*invpcid_supported)(void);
+++=======
+++>>>>>>> 703c335d0693 (KVM: x86/mmu: Configure max page level during hardware setup)
+  
+  	void (*set_tdp_cr3)(struct kvm_vcpu *vcpu, unsigned long cr3);
+  
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 7b990f5b5c82,554546948e87..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -3334,33 -3234,81 +3336,64 @@@ static void direct_pte_prefetch(struct 
+  	__direct_pte_prefetch(vcpu, sp, sptep);
+  }
+  
+ -static int host_pfn_mapping_level(struct kvm_vcpu *vcpu, gfn_t gfn,
+ -				  kvm_pfn_t pfn, struct kvm_memory_slot *slot)
+ -{
+ -	unsigned long hva;
+ -	pte_t *pte;
+ -	int level;
+ -
+ -	BUILD_BUG_ON(PT_PAGE_TABLE_LEVEL != (int)PG_LEVEL_4K ||
+ -		     PT_DIRECTORY_LEVEL != (int)PG_LEVEL_2M ||
+ -		     PT_PDPE_LEVEL != (int)PG_LEVEL_1G);
+ -
+ -	if (!PageCompound(pfn_to_page(pfn)) && !kvm_is_zone_device_pfn(pfn))
+ -		return PT_PAGE_TABLE_LEVEL;
+ -
+ -	/*
+ -	 * Note, using the already-retrieved memslot and __gfn_to_hva_memslot()
+ -	 * is not solely for performance, it's also necessary to avoid the
+ -	 * "writable" check in __gfn_to_hva_many(), which will always fail on
+ -	 * read-only memslots due to gfn_to_hva() assuming writes.  Earlier
+ -	 * page fault steps have already verified the guest isn't writing a
+ -	 * read-only memslot.
+ -	 */
+ -	hva = __gfn_to_hva_memslot(slot, gfn);
+ -
+ -	pte = lookup_address_in_mm(vcpu->kvm->mm, hva, &level);
+ -	if (unlikely(!pte))
+ -		return PT_PAGE_TABLE_LEVEL;
+ -
+ -	return level;
+ -}
+ -
+ -static int kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, gfn_t gfn,
+ -				   int max_level, kvm_pfn_t *pfnp)
+ +static void transparent_hugepage_adjust(struct kvm_vcpu *vcpu,
+ +					gfn_t gfn, kvm_pfn_t *pfnp,
+ +					int *levelp)
+  {
+ -	struct kvm_memory_slot *slot;
+ -	struct kvm_lpage_info *linfo;
+  	kvm_pfn_t pfn = *pfnp;
+++<<<<<<< HEAD
+ +	int level = *levelp;
+++=======
++ 	kvm_pfn_t mask;
++ 	int level;
++ 
++ 	if (unlikely(max_level == PT_PAGE_TABLE_LEVEL))
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	if (is_error_noslot_pfn(pfn) || kvm_is_reserved_pfn(pfn))
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	slot = gfn_to_memslot_dirty_bitmap(vcpu, gfn, true);
++ 	if (!slot)
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	max_level = min(max_level, max_page_level);
++ 	for ( ; max_level > PT_PAGE_TABLE_LEVEL; max_level--) {
++ 		linfo = lpage_info_slot(gfn, slot, max_level);
++ 		if (!linfo->disallow_lpage)
++ 			break;
++ 	}
++ 
++ 	if (max_level == PT_PAGE_TABLE_LEVEL)
++ 		return PT_PAGE_TABLE_LEVEL;
++ 
++ 	level = host_pfn_mapping_level(vcpu, gfn, pfn, slot);
++ 	if (level == PT_PAGE_TABLE_LEVEL)
++ 		return level;
++ 
++ 	level = min(level, max_level);
+++>>>>>>> 703c335d0693 (KVM: x86/mmu: Configure max page level during hardware setup)
+  
+  	/*
+ -	 * mmu_notifier_retry() was successful and mmu_lock is held, so
+ -	 * the pmd can't be split from under us.
+ +	 * Check if it's a transparent hugepage. If this would be an
+ +	 * hugetlbfs page, level wouldn't be set to
+ +	 * PT_PAGE_TABLE_LEVEL and there would be no adjustment done
+ +	 * here.
+  	 */
+ -	mask = KVM_PAGES_PER_HPAGE(level) - 1;
+ -	VM_BUG_ON((gfn & mask) != (pfn & mask));
+ -	*pfnp = pfn & ~mask;
+ +	if (!is_error_noslot_pfn(pfn) && !kvm_is_reserved_pfn(pfn) &&
+ +	    !kvm_is_zone_device_pfn(pfn) && level == PT_PAGE_TABLE_LEVEL &&
+ +	    PageTransCompoundMap(pfn_to_page(pfn))) {
+ +		unsigned long mask;
+  
+ -	return level;
+ +		/*
+ +		 * mmu_notifier_retry() was successful and mmu_lock is held, so
+ +		 * the pmd can't be split from under us.
+ +		 */
+ +		*levelp = level = PT_DIRECTORY_LEVEL;
+ +		mask = KVM_PAGES_PER_HPAGE(level) - 1;
+ +		VM_BUG_ON((gfn & mask) != (pfn & mask));
+ +		*pfnp = pfn & ~mask;
+ +	}
+  }
+  
+  static void disallowed_hugepage_adjust(struct kvm_shadow_walk_iterator it,
+diff --cc arch/x86/kvm/svm.c
+index 720353d5a356,5e3261ec8c59..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -6076,41 -6064,6 +6076,44 @@@ static void svm_set_supported_cpuid(u3
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int svm_get_lpage_level(void)
+ +{
+ +	return PT_PDPE_LEVEL;
+ +}
+ +
+ +static bool svm_rdtscp_supported(void)
+ +{
+ +	return boot_cpu_has(X86_FEATURE_RDTSCP);
+ +}
+ +
+ +static bool svm_invpcid_supported(void)
+ +{
+ +	return false;
+ +}
+ +
+ +static bool svm_mpx_supported(void)
+ +{
+ +	return false;
+ +}
+ +
+ +static bool svm_xsaves_supported(void)
+ +{
+ +	return boot_cpu_has(X86_FEATURE_XSAVES);
+ +}
+ +
+ +static bool svm_umip_emulated(void)
+ +{
+ +	return false;
+ +}
+ +
+ +static bool svm_pt_supported(void)
+ +{
+ +	return false;
+ +}
+ +
+++=======
+++>>>>>>> 703c335d0693 (KVM: x86/mmu: Configure max page level during hardware setup)
+  static bool svm_has_wbinvd_exit(void)
+  {
+  	return true;
+@@@ -7455,18 -7421,8 +7458,16 @@@ static struct kvm_x86_ops svm_x86_ops _
+  
+  	.get_exit_info = svm_get_exit_info,
+  
+- 	.get_lpage_level = svm_get_lpage_level,
+- 
+  	.cpuid_update = svm_cpuid_update,
+  
+ +	.rdtscp_supported = svm_rdtscp_supported,
+ +	.invpcid_supported = svm_invpcid_supported,
+ +	.mpx_supported = svm_mpx_supported,
+ +	.xsaves_supported = svm_xsaves_supported,
+ +	.umip_emulated = svm_umip_emulated,
+ +	.pt_supported = svm_pt_supported,
+ +	.pku_supported = svm_pku_supported,
+ +
+  	.set_supported_cpuid = svm_set_supported_cpuid,
+  
+  	.has_wbinvd_exit = svm_has_wbinvd_exit,
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/svm.c
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 8256ce5407a6..3b3617962b33 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7051,15 +7051,6 @@ static u64 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
+ 	return (cache << VMX_EPT_MT_EPTE_SHIFT) | ipat;
+ }
+ 
+-static int vmx_get_lpage_level(void)
+-{
+-	if (enable_ept && !cpu_has_vmx_ept_1g_page())
+-		return PT_DIRECTORY_LEVEL;
+-	else
+-		/* For shadow and EPT supported 1GB page */
+-		return PT_PDPE_LEVEL;
+-}
+-
+ static void vmcs_set_secondary_exec_control(struct vcpu_vmx *vmx)
+ {
+ 	/*
+@@ -7716,7 +7707,7 @@ static __init int hardware_setup(void)
+ {
+ 	unsigned long host_bndcfgs;
+ 	struct desc_ptr dt;
+-	int r, i;
++	int r, i, ept_lpage_level;
+ 
+ 	rdmsrl_safe(MSR_EFER, &host_efer);
+ 
+@@ -7805,7 +7796,16 @@ static __init int hardware_setup(void)
+ 
+ 	if (enable_ept)
+ 		vmx_enable_tdp();
+-	kvm_configure_mmu(enable_ept);
++
++	if (!enable_ept)
++		ept_lpage_level = 0;
++	else if (cpu_has_vmx_ept_1g_page())
++		ept_lpage_level = PT_PDPE_LEVEL;
++	else if (cpu_has_vmx_ept_2m_page())
++		ept_lpage_level = PT_DIRECTORY_LEVEL;
++	else
++		ept_lpage_level = PT_PAGE_TABLE_LEVEL;
++	kvm_configure_mmu(enable_ept, ept_lpage_level);
+ 
+ 	/*
+ 	 * Only enable PML when hardware supports PML feature, and both EPT
+@@ -7970,8 +7970,6 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 
+ 	.get_exit_info = vmx_get_exit_info,
+ 
+-	.get_lpage_level = vmx_get_lpage_level,
+-
+ 	.cpuid_update = vmx_cpuid_update,
+ 
+ 	.rdtscp_supported = vmx_rdtscp_supported,
