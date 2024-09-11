@@ -1,0 +1,224 @@
+scsi: lpfc: Fix NMI crash during rmmod due to circular hbalock dependency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author James Smart <jsmart2021@gmail.com>
+commit a789241e49b6adce84cdba7a24c92ecc845aface
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/a789241e.failed
+
+Remove hbalock dependency for lpfc_abts_els_sgl_list and
+lpfc_abts_nvmet_ctx_list.  The lists are adaquately synchronized with the
+sgl_list_lock and abts_nvmet_buf_list_lock.
+
+Link: https://lore.kernel.org/r/20210412013127.2387-5-jsmart2021@gmail.com
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a789241e49b6adce84cdba7a24c92ecc845aface)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_nvmet.c
+diff --cc drivers/scsi/lpfc/lpfc_nvmet.c
+index 35d4b98c0dc2,f2d9a3580887..000000000000
+--- a/drivers/scsi/lpfc/lpfc_nvmet.c
++++ b/drivers/scsi/lpfc/lpfc_nvmet.c
+@@@ -1453,6 -1427,38 +1453,41 @@@ static struct nvmet_fc_target_template 
+  };
+  
+  static void
+++<<<<<<< HEAD
+++=======
++ __lpfc_nvmet_clean_io_for_cpu(struct lpfc_hba *phba,
++ 		struct lpfc_nvmet_ctx_info *infop)
++ {
++ 	struct lpfc_nvmet_ctxbuf *ctx_buf, *next_ctx_buf;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&infop->nvmet_ctx_list_lock, flags);
++ 	list_for_each_entry_safe(ctx_buf, next_ctx_buf,
++ 				&infop->nvmet_ctx_list, list) {
++ 		spin_lock(&phba->sli4_hba.abts_nvmet_buf_list_lock);
++ 		list_del_init(&ctx_buf->list);
++ 		spin_unlock(&phba->sli4_hba.abts_nvmet_buf_list_lock);
++ 
++ 		spin_lock(&phba->hbalock);
++ 		__lpfc_clear_active_sglq(phba, ctx_buf->sglq->sli4_lxritag);
++ 		spin_unlock(&phba->hbalock);
++ 
++ 		ctx_buf->sglq->state = SGL_FREED;
++ 		ctx_buf->sglq->ndlp = NULL;
++ 
++ 		spin_lock(&phba->sli4_hba.sgl_list_lock);
++ 		list_add_tail(&ctx_buf->sglq->list,
++ 				&phba->sli4_hba.lpfc_nvmet_sgl_list);
++ 		spin_unlock(&phba->sli4_hba.sgl_list_lock);
++ 
++ 		lpfc_sli_release_iocbq(phba, ctx_buf->iocbq);
++ 		kfree(ctx_buf->context);
++ 	}
++ 	spin_unlock_irqrestore(&infop->nvmet_ctx_list_lock, flags);
++ }
++ 
++ static void
+++>>>>>>> a789241e49b6 (scsi: lpfc: Fix NMI crash during rmmod due to circular hbalock dependency)
+  lpfc_nvmet_cleanup_io_context(struct lpfc_hba *phba)
+  {
+  	struct lpfc_nvmet_ctx_info *infop;
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index 89a368f136d0..c376279bb56c 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -10083,8 +10083,7 @@ lpfc_sli4_vport_delete_els_xri_aborted(struct lpfc_vport *vport)
+ 	struct lpfc_sglq *sglq_entry = NULL, *sglq_next = NULL;
+ 	unsigned long iflag = 0;
+ 
+-	spin_lock_irqsave(&phba->hbalock, iflag);
+-	spin_lock(&phba->sli4_hba.sgl_list_lock);
++	spin_lock_irqsave(&phba->sli4_hba.sgl_list_lock, iflag);
+ 	list_for_each_entry_safe(sglq_entry, sglq_next,
+ 			&phba->sli4_hba.lpfc_abts_els_sgl_list, list) {
+ 		if (sglq_entry->ndlp && sglq_entry->ndlp->vport == vport) {
+@@ -10092,8 +10091,7 @@ lpfc_sli4_vport_delete_els_xri_aborted(struct lpfc_vport *vport)
+ 			sglq_entry->ndlp = NULL;
+ 		}
+ 	}
+-	spin_unlock(&phba->sli4_hba.sgl_list_lock);
+-	spin_unlock_irqrestore(&phba->hbalock, iflag);
++	spin_unlock_irqrestore(&phba->sli4_hba.sgl_list_lock, iflag);
+ 	return;
+ }
+ 
+@@ -10120,8 +10118,7 @@ lpfc_sli4_els_xri_aborted(struct lpfc_hba *phba,
+ 
+ 	pring = lpfc_phba_elsring(phba);
+ 
+-	spin_lock_irqsave(&phba->hbalock, iflag);
+-	spin_lock(&phba->sli4_hba.sgl_list_lock);
++	spin_lock_irqsave(&phba->sli4_hba.sgl_list_lock, iflag);
+ 	list_for_each_entry_safe(sglq_entry, sglq_next,
+ 			&phba->sli4_hba.lpfc_abts_els_sgl_list, list) {
+ 		if (sglq_entry->sli4_xritag == xri) {
+@@ -10131,8 +10128,8 @@ lpfc_sli4_els_xri_aborted(struct lpfc_hba *phba,
+ 			list_add_tail(&sglq_entry->list,
+ 				&phba->sli4_hba.lpfc_els_sgl_list);
+ 			sglq_entry->state = SGL_FREED;
+-			spin_unlock(&phba->sli4_hba.sgl_list_lock);
+-			spin_unlock_irqrestore(&phba->hbalock, iflag);
++			spin_unlock_irqrestore(&phba->sli4_hba.sgl_list_lock,
++					       iflag);
+ 
+ 			if (ndlp) {
+ 				lpfc_set_rrq_active(phba, ndlp,
+@@ -10147,21 +10144,18 @@ lpfc_sli4_els_xri_aborted(struct lpfc_hba *phba,
+ 			return;
+ 		}
+ 	}
+-	spin_unlock(&phba->sli4_hba.sgl_list_lock);
++	spin_unlock_irqrestore(&phba->sli4_hba.sgl_list_lock, iflag);
+ 	lxri = lpfc_sli4_xri_inrange(phba, xri);
+-	if (lxri == NO_XRI) {
+-		spin_unlock_irqrestore(&phba->hbalock, iflag);
++	if (lxri == NO_XRI)
+ 		return;
+-	}
+-	spin_lock(&phba->sli4_hba.sgl_list_lock);
++
++	spin_lock_irqsave(&phba->hbalock, iflag);
+ 	sglq_entry = __lpfc_get_active_sglq(phba, lxri);
+ 	if (!sglq_entry || (sglq_entry->sli4_xritag != xri)) {
+-		spin_unlock(&phba->sli4_hba.sgl_list_lock);
+ 		spin_unlock_irqrestore(&phba->hbalock, iflag);
+ 		return;
+ 	}
+ 	sglq_entry->state = SGL_XRI_ABORTED;
+-	spin_unlock(&phba->sli4_hba.sgl_list_lock);
+ 	spin_unlock_irqrestore(&phba->hbalock, iflag);
+ 	return;
+ }
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index d652de94a580..5faf0f2824ce 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -1043,12 +1043,11 @@ lpfc_hba_down_post_s4(struct lpfc_hba *phba)
+ 	 * driver is unloading or reposted if the driver is restarting
+ 	 * the port.
+ 	 */
+-	spin_lock_irq(&phba->hbalock);  /* required for lpfc_els_sgl_list and */
+-					/* scsl_buf_list */
++
+ 	/* sgl_list_lock required because worker thread uses this
+ 	 * list.
+ 	 */
+-	spin_lock(&phba->sli4_hba.sgl_list_lock);
++	spin_lock_irq(&phba->sli4_hba.sgl_list_lock);
+ 	list_for_each_entry(sglq_entry,
+ 		&phba->sli4_hba.lpfc_abts_els_sgl_list, list)
+ 		sglq_entry->state = SGL_FREED;
+@@ -1057,11 +1056,12 @@ lpfc_hba_down_post_s4(struct lpfc_hba *phba)
+ 			&phba->sli4_hba.lpfc_els_sgl_list);
+ 
+ 
+-	spin_unlock(&phba->sli4_hba.sgl_list_lock);
++	spin_unlock_irq(&phba->sli4_hba.sgl_list_lock);
+ 
+ 	/* abts_xxxx_buf_list_lock required because worker thread uses this
+ 	 * list.
+ 	 */
++	spin_lock_irq(&phba->hbalock);
+ 	cnt = 0;
+ 	for (idx = 0; idx < phba->cfg_hdw_queue; idx++) {
+ 		qp = &phba->sli4_hba.hdwq[idx];
+@@ -3677,12 +3677,10 @@ lpfc_sli4_els_sgl_update(struct lpfc_hba *phba)
+ 			sglq_entry->state = SGL_FREED;
+ 			list_add_tail(&sglq_entry->list, &els_sgl_list);
+ 		}
+-		spin_lock_irq(&phba->hbalock);
+-		spin_lock(&phba->sli4_hba.sgl_list_lock);
++		spin_lock_irq(&phba->sli4_hba.sgl_list_lock);
+ 		list_splice_init(&els_sgl_list,
+ 				 &phba->sli4_hba.lpfc_els_sgl_list);
+-		spin_unlock(&phba->sli4_hba.sgl_list_lock);
+-		spin_unlock_irq(&phba->hbalock);
++		spin_unlock_irq(&phba->sli4_hba.sgl_list_lock);
+ 	} else if (els_xri_cnt < phba->sli4_hba.els_xri_cnt) {
+ 		/* els xri-sgl shrinked */
+ 		xri_cnt = phba->sli4_hba.els_xri_cnt - els_xri_cnt;
+@@ -3690,8 +3688,7 @@ lpfc_sli4_els_sgl_update(struct lpfc_hba *phba)
+ 				"3158 ELS xri-sgl count decreased from "
+ 				"%d to %d\n", phba->sli4_hba.els_xri_cnt,
+ 				els_xri_cnt);
+-		spin_lock_irq(&phba->hbalock);
+-		spin_lock(&phba->sli4_hba.sgl_list_lock);
++		spin_lock_irq(&phba->sli4_hba.sgl_list_lock);
+ 		list_splice_init(&phba->sli4_hba.lpfc_els_sgl_list,
+ 				 &els_sgl_list);
+ 		/* release extra els sgls from list */
+@@ -3706,8 +3703,7 @@ lpfc_sli4_els_sgl_update(struct lpfc_hba *phba)
+ 		}
+ 		list_splice_init(&els_sgl_list,
+ 				 &phba->sli4_hba.lpfc_els_sgl_list);
+-		spin_unlock(&phba->sli4_hba.sgl_list_lock);
+-		spin_unlock_irq(&phba->hbalock);
++		spin_unlock_irq(&phba->sli4_hba.sgl_list_lock);
+ 	} else
+ 		lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
+ 				"3163 ELS xri-sgl count unchanged: %d\n",
+@@ -7233,11 +7229,9 @@ lpfc_free_els_sgl_list(struct lpfc_hba *phba)
+ 	LIST_HEAD(sglq_list);
+ 
+ 	/* Retrieve all els sgls from driver list */
+-	spin_lock_irq(&phba->hbalock);
+-	spin_lock(&phba->sli4_hba.sgl_list_lock);
++	spin_lock_irq(&phba->sli4_hba.sgl_list_lock);
+ 	list_splice_init(&phba->sli4_hba.lpfc_els_sgl_list, &sglq_list);
+-	spin_unlock(&phba->sli4_hba.sgl_list_lock);
+-	spin_unlock_irq(&phba->hbalock);
++	spin_unlock_irq(&phba->sli4_hba.sgl_list_lock);
+ 
+ 	/* Now free the sgl list */
+ 	lpfc_free_sgl_list(phba, &sglq_list);
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.c
