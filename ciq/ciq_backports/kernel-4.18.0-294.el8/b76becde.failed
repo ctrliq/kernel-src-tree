@@ -1,0 +1,246 @@
+scsi: zfcp: fix request object use-after-free in send path causing seqno errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Benjamin Block <bblock@linux.ibm.com>
+commit b76becde2b84137faa29bbc9a3b20953b5980e48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b76becde.failed
+
+With a recent change to our send path for FSF commands we introduced a
+possible use-after-free of request-objects, that might further lead to
+zfcp crafting bad requests, which the FCP channel correctly complains
+about with an error (FSF_PROT_SEQ_NUMB_ERROR). This error is then handled
+by an adapter-wide recovery.
+
+The following sequence illustrates the possible use-after-free:
+
+    Send Path:
+
+        int zfcp_fsf_open_port(struct zfcp_erp_action *erp_action)
+        {
+                struct zfcp_fsf_req *req;
+                ...
+                spin_lock_irq(&qdio->req_q_lock);
+        //                     ^^^^^^^^^^^^^^^^
+        //                     protects QDIO queue during sending
+                ...
+                req = zfcp_fsf_req_create(qdio,
+                                          FSF_QTCB_OPEN_PORT_WITH_DID,
+                                          SBAL_SFLAGS0_TYPE_READ,
+                                          qdio->adapter->pool.erp_req);
+        //            ^^^^^^^^^^^^^^^^^^^
+        //            allocation of the request-object
+                ...
+                retval = zfcp_fsf_req_send(req);
+                ...
+                spin_unlock_irq(&qdio->req_q_lock);
+                return retval;
+        }
+
+        static int zfcp_fsf_req_send(struct zfcp_fsf_req *req)
+        {
+                struct zfcp_adapter *adapter = req->adapter;
+                struct zfcp_qdio *qdio = adapter->qdio;
+                ...
+                zfcp_reqlist_add(adapter->req_list, req);
+        //      ^^^^^^^^^^^^^^^^
+        //      add request to our driver-internal hash-table for tracking
+        //      (protected by separate lock req_list->lock)
+                ...
+                if (zfcp_qdio_send(qdio, &req->qdio_req)) {
+        //          ^^^^^^^^^^^^^^
+        //          hand-off the request to FCP channel;
+        //          the request can complete at any point now
+                        ...
+                }
+
+                /* Don't increase for unsolicited status */
+                if (!zfcp_fsf_req_is_status_read_buffer(req))
+        //           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        //           possible use-after-free
+                        adapter->fsf_req_seq_no++;
+        //                       ^^^^^^^^^^^^^^^^
+        //                       because of the use-after-free we might
+        //                       miss this accounting, and as follow-up
+        //                       this results in the FCP channel error
+        //                       FSF_PROT_SEQ_NUMB_ERROR
+                adapter->req_no++;
+
+                return 0;
+        }
+
+        static inline bool
+        zfcp_fsf_req_is_status_read_buffer(struct zfcp_fsf_req *req)
+        {
+                return req->qtcb == NULL;
+        //             ^^^^^^^^^
+        //             possible use-after-free
+        }
+
+    Response Path:
+
+        void zfcp_fsf_reqid_check(struct zfcp_qdio *qdio, int sbal_idx)
+        {
+                ...
+                struct zfcp_fsf_req *fsf_req;
+                ...
+                for (idx = 0; idx < QDIO_MAX_ELEMENTS_PER_BUFFER; idx++) {
+                        ...
+                        fsf_req = zfcp_reqlist_find_rm(adapter->req_list,
+                                                       req_id);
+        //                        ^^^^^^^^^^^^^^^^^^^^
+        //                        remove request from our driver-internal
+        //                        hash-table (lock req_list->lock)
+                        ...
+                        zfcp_fsf_req_complete(fsf_req);
+                }
+        }
+
+        static void zfcp_fsf_req_complete(struct zfcp_fsf_req *req)
+        {
+                ...
+                if (likely(req->status & ZFCP_STATUS_FSFREQ_CLEANUP))
+                        zfcp_fsf_req_free(req);
+        //              ^^^^^^^^^^^^^^^^^
+        //              free memory for request-object
+                else
+                        complete(&req->completion);
+        //              ^^^^^^^^
+        //              completion notification for code-paths that wait
+        //              synchronous for the completion of the request; in
+        //              those the memory is freed separately
+        }
+
+The result of the use-after-free only affects the send path, and can not
+lead to any data corruption. In case we miss the sequence-number
+accounting, because the memory was already re-purposed, the next FSF
+command will fail with said FCP channel error, and we will recover the
+whole adapter. This causes no additional errors, but it slows down
+traffic.  There is a slight chance of the same thing happen again
+recursively after the adapter recovery, but so far this has not been seen.
+
+This was seen under z/VM, where the send path might run on a virtual CPU
+that gets scheduled away by z/VM, while the return path might still run,
+and so create the necessary timing. Running with KASAN can also slow down
+the kernel sufficiently to run into this user-after-free, and then see the
+report by KASAN.
+
+To fix this, simply pull the test for the sequence-number accounting in
+front of the hand-off to the FCP channel (this information doesn't change
+during hand-off), but leave the sequence-number accounting itself where it
+is.
+
+To make future regressions of the same kind less likely, add comments to
+all closely related code-paths.
+
+	Signed-off-by: Benjamin Block <bblock@linux.ibm.com>
+Fixes: f9eca0227600 ("scsi: zfcp: drop duplicate fsf_command from zfcp_fsf_req which is also in QTCB header")
+	Cc: <stable@vger.kernel.org> #5.0+
+	Reviewed-by: Steffen Maier <maier@linux.ibm.com>
+	Reviewed-by: Jens Remus <jremus@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit b76becde2b84137faa29bbc9a3b20953b5980e48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/scsi/zfcp_fsf.c
+diff --cc drivers/s390/scsi/zfcp_fsf.c
+index 2b3e32ad4831,c5b2615b49ef..000000000000
+--- a/drivers/s390/scsi/zfcp_fsf.c
++++ b/drivers/s390/scsi/zfcp_fsf.c
+@@@ -11,7 -11,7 +11,11 @@@
+  #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+  
+  #include <linux/blktrace_api.h>
+++<<<<<<< HEAD
+ +#include <linux/jiffies.h>
+++=======
++ #include <linux/types.h>
+++>>>>>>> b76becde2b84 (scsi: zfcp: fix request object use-after-free in send path causing seqno errors)
+  #include <linux/slab.h>
+  #include <scsi/fc/fc_els.h>
+  #include "zfcp_ext.h"
+@@@ -1024,9 -928,11 +1042,16 @@@ struct zfcp_fsf_req *zfcp_fsf_abort_fcp
+  	req->qtcb->header.port_handle = zfcp_sdev->port->handle;
+  	req->qtcb->bottom.support.req_handle = (u64) old_req_id;
+  
+++<<<<<<< HEAD
+ +	zfcp_fsf_start_timer(req, ZFCP_SCSI_ER_TIMEOUT);
+ +	if (!zfcp_fsf_req_send(req))
+++=======
++ 	zfcp_fsf_start_timer(req, ZFCP_FSF_SCSI_ER_TIMEOUT);
++ 	if (!zfcp_fsf_req_send(req)) {
++ 		/* NOTE: DO NOT TOUCH req, UNTIL IT COMPLETES! */
+++>>>>>>> b76becde2b84 (scsi: zfcp: fix request object use-after-free in send path causing seqno errors)
+  		goto out;
++ 	}
+  
+  out_error_free:
+  	zfcp_fsf_req_free(req);
+@@@ -1400,17 -1299,11 +1428,23 @@@ int zfcp_fsf_exchange_config_data_sync(
+  	zfcp_fsf_start_timer(req, ZFCP_FSF_REQUEST_TIMEOUT);
+  	retval = zfcp_fsf_req_send(req);
+  	spin_unlock_irq(&qdio->req_q_lock);
+++<<<<<<< HEAD
+ +
+ +	if (!retval) {
+++=======
++ 	if (!retval) {
++ 		/* NOTE: ONLY TOUCH SYNC req AGAIN ON req->completion. */
+++>>>>>>> b76becde2b84 (scsi: zfcp: fix request object use-after-free in send path causing seqno errors)
+  		wait_for_completion(&req->completion);
++ 	}
+  
+ +		if (req->status &
+ +		    (ZFCP_STATUS_FSFREQ_ERROR | ZFCP_STATUS_FSFREQ_DISMISSED))
+ +			retval = -EIO;
+ +		else if (req->status & ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE)
+ +			retval = -EAGAIN;
+ +	}
+ +
+  	zfcp_fsf_req_free(req);
+  	return retval;
+  
+@@@ -1509,16 -1396,12 +1544,21 @@@ int zfcp_fsf_exchange_port_data_sync(st
+  	spin_unlock_irq(&qdio->req_q_lock);
+  
+  	if (!retval) {
+++<<<<<<< HEAD
+++=======
++ 		/* NOTE: ONLY TOUCH SYNC req AGAIN ON req->completion. */
+++>>>>>>> b76becde2b84 (scsi: zfcp: fix request object use-after-free in send path causing seqno errors)
+  		wait_for_completion(&req->completion);
++ 	}
+  
+ -	zfcp_fsf_req_free(req);
+ +		if (req->status &
+ +		    (ZFCP_STATUS_FSFREQ_ERROR | ZFCP_STATUS_FSFREQ_DISMISSED))
+ +			retval = -EIO;
+ +		else if (req->status & ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE)
+ +			retval = -EAGAIN;
+ +	}
+  
+ +	zfcp_fsf_req_free(req);
+  	return retval;
+  
+  out_unlock:
+@@@ -2644,9 -2405,11 +2692,16 @@@ struct zfcp_fsf_req *zfcp_fsf_fcp_task_
+  	fcp_cmnd = &req->qtcb->bottom.io.fcp_cmnd.iu;
+  	zfcp_fc_fcp_tm(fcp_cmnd, sdev, tm_flags);
+  
+++<<<<<<< HEAD
+ +	zfcp_fsf_start_timer(req, ZFCP_SCSI_ER_TIMEOUT);
+ +	if (!zfcp_fsf_req_send(req))
+++=======
++ 	zfcp_fsf_start_timer(req, ZFCP_FSF_SCSI_ER_TIMEOUT);
++ 	if (!zfcp_fsf_req_send(req)) {
++ 		/* NOTE: DO NOT TOUCH req, UNTIL IT COMPLETES! */
+++>>>>>>> b76becde2b84 (scsi: zfcp: fix request object use-after-free in send path causing seqno errors)
+  		goto out;
++ 	}
+  
+  	zfcp_fsf_req_free(req);
+  	req = NULL;
+* Unmerged path drivers/s390/scsi/zfcp_fsf.c
