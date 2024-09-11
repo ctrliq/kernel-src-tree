@@ -1,0 +1,271 @@
+x86/speculation/swapgs: Exclude ATOMs from speculation through SWAPGS
+
+jira LE-1907
+cve CVE-2019-1125
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit f36cf386e3fec258a341d446915862eded3e13d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/f36cf386.failed
+
+Intel provided the following information:
+
+ On all current Atom processors, instructions that use a segment register
+ value (e.g. a load or store) will not speculatively execute before the
+ last writer of that segment retires. Thus they will not use a
+ speculatively written segment value.
+
+That means on ATOMs there is no speculation through SWAPGS, so the SWAPGS
+entry paths can be excluded from the extra LFENCE if PTI is disabled.
+
+Create a separate bug flag for the through SWAPGS speculation and mark all
+out-of-order ATOMs and AMD/HYGON CPUs as not affected. The in-order ATOMs
+are excluded from the whole mitigation mess anyway.
+
+	Reported-by: Andrew Cooper <andrew.cooper3@citrix.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Tyler Hicks <tyhicks@canonical.com>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+(cherry picked from commit f36cf386e3fec258a341d446915862eded3e13d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kernel/cpu/common.c
+diff --cc arch/x86/include/asm/cpufeatures.h
+index 4f3178083106,e880f2408e29..000000000000
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@@ -390,5 -394,8 +390,11 @@@
+  #define X86_BUG_SPECTRE_V2		X86_BUG(16) /* CPU is affected by Spectre variant 2 attack with indirect branches */
+  #define X86_BUG_SPEC_STORE_BYPASS	X86_BUG(17) /* CPU is affected by speculative store bypass attack */
+  #define X86_BUG_L1TF			X86_BUG(18) /* CPU is affected by L1 Terminal Fault */
+++<<<<<<< HEAD
+++=======
++ #define X86_BUG_MDS			X86_BUG(19) /* CPU is affected by Microarchitectural data sampling */
++ #define X86_BUG_MSBDS_ONLY		X86_BUG(20) /* CPU is only affected by the  MSDBS variant of BUG_MDS */
++ #define X86_BUG_SWAPGS			X86_BUG(21) /* CPU is affected by speculation through SWAPGS */
+++>>>>>>> f36cf386e3fe (x86/speculation/swapgs: Exclude ATOMs from speculation through SWAPGS)
+  
+  #endif /* _ASM_X86_CPUFEATURES_H */
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 54b2ed151407,6383f0db098c..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -277,6 -269,98 +277,101 @@@ static int __init mds_cmdline(char *str
+  early_param("mds", mds_cmdline);
+  
+  #undef pr_fmt
+++<<<<<<< HEAD
+++=======
++ #define pr_fmt(fmt)     "Spectre V1 : " fmt
++ 
++ enum spectre_v1_mitigation {
++ 	SPECTRE_V1_MITIGATION_NONE,
++ 	SPECTRE_V1_MITIGATION_AUTO,
++ };
++ 
++ static enum spectre_v1_mitigation spectre_v1_mitigation __ro_after_init =
++ 	SPECTRE_V1_MITIGATION_AUTO;
++ 
++ static const char * const spectre_v1_strings[] = {
++ 	[SPECTRE_V1_MITIGATION_NONE] = "Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers",
++ 	[SPECTRE_V1_MITIGATION_AUTO] = "Mitigation: usercopy/swapgs barriers and __user pointer sanitization",
++ };
++ 
++ /*
++  * Does SMAP provide full mitigation against speculative kernel access to
++  * userspace?
++  */
++ static bool smap_works_speculatively(void)
++ {
++ 	if (!boot_cpu_has(X86_FEATURE_SMAP))
++ 		return false;
++ 
++ 	/*
++ 	 * On CPUs which are vulnerable to Meltdown, SMAP does not
++ 	 * prevent speculative access to user data in the L1 cache.
++ 	 * Consider SMAP to be non-functional as a mitigation on these
++ 	 * CPUs.
++ 	 */
++ 	if (boot_cpu_has(X86_BUG_CPU_MELTDOWN))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void __init spectre_v1_select_mitigation(void)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V1) || cpu_mitigations_off()) {
++ 		spectre_v1_mitigation = SPECTRE_V1_MITIGATION_NONE;
++ 		return;
++ 	}
++ 
++ 	if (spectre_v1_mitigation == SPECTRE_V1_MITIGATION_AUTO) {
++ 		/*
++ 		 * With Spectre v1, a user can speculatively control either
++ 		 * path of a conditional swapgs with a user-controlled GS
++ 		 * value.  The mitigation is to add lfences to both code paths.
++ 		 *
++ 		 * If FSGSBASE is enabled, the user can put a kernel address in
++ 		 * GS, in which case SMAP provides no protection.
++ 		 *
++ 		 * [ NOTE: Don't check for X86_FEATURE_FSGSBASE until the
++ 		 *	   FSGSBASE enablement patches have been merged. ]
++ 		 *
++ 		 * If FSGSBASE is disabled, the user can only put a user space
++ 		 * address in GS.  That makes an attack harder, but still
++ 		 * possible if there's no SMAP protection.
++ 		 */
++ 		if (!smap_works_speculatively()) {
++ 			/*
++ 			 * Mitigation can be provided from SWAPGS itself or
++ 			 * PTI as the CR3 write in the Meltdown mitigation
++ 			 * is serializing.
++ 			 *
++ 			 * If neither is there, mitigate with an LFENCE to
++ 			 * stop speculation through swapgs.
++ 			 */
++ 			if (boot_cpu_has_bug(X86_BUG_SWAPGS) &&
++ 			    !boot_cpu_has(X86_FEATURE_PTI))
++ 				setup_force_cpu_cap(X86_FEATURE_FENCE_SWAPGS_USER);
++ 
++ 			/*
++ 			 * Enable lfences in the kernel entry (non-swapgs)
++ 			 * paths, to prevent user entry from speculatively
++ 			 * skipping swapgs.
++ 			 */
++ 			setup_force_cpu_cap(X86_FEATURE_FENCE_SWAPGS_KERNEL);
++ 		}
++ 	}
++ 
++ 	pr_info("%s\n", spectre_v1_strings[spectre_v1_mitigation]);
++ }
++ 
++ static int __init nospectre_v1_cmdline(char *str)
++ {
++ 	spectre_v1_mitigation = SPECTRE_V1_MITIGATION_NONE;
++ 	return 0;
++ }
++ early_param("nospectre_v1", nospectre_v1_cmdline);
++ 
++ #undef pr_fmt
+++>>>>>>> f36cf386e3fe (x86/speculation/swapgs: Exclude ATOMs from speculation through SWAPGS)
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+  static enum spectre_v2_mitigation spectre_v2_enabled __ro_after_init =
+diff --cc arch/x86/kernel/cpu/common.c
+index 7b99e9d22f0c,300dcf00d287..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -947,16 -964,71 +947,84 @@@ static void identify_cpu_without_cpuid(
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +static const __initconst struct x86_cpu_id cpu_no_speculation[] = {
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CEDARVIEW,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CLOVERVIEW,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_LINCROFT,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PENWELL,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PINEVIEW,	X86_FEATURE_ANY },
+ +	{ X86_VENDOR_CENTAUR,	5 },
+ +	{ X86_VENDOR_INTEL,	5 },
+ +	{ X86_VENDOR_NSC,	5 },
+ +	{ X86_VENDOR_ANY,	4 },
+++=======
++ #define NO_SPECULATION	BIT(0)
++ #define NO_MELTDOWN	BIT(1)
++ #define NO_SSB		BIT(2)
++ #define NO_L1TF		BIT(3)
++ #define NO_MDS		BIT(4)
++ #define MSBDS_ONLY	BIT(5)
++ #define NO_SWAPGS	BIT(6)
++ 
++ #define VULNWL(_vendor, _family, _model, _whitelist)	\
++ 	{ X86_VENDOR_##_vendor, _family, _model, X86_FEATURE_ANY, _whitelist }
++ 
++ #define VULNWL_INTEL(model, whitelist)		\
++ 	VULNWL(INTEL, 6, INTEL_FAM6_##model, whitelist)
++ 
++ #define VULNWL_AMD(family, whitelist)		\
++ 	VULNWL(AMD, family, X86_MODEL_ANY, whitelist)
++ 
++ #define VULNWL_HYGON(family, whitelist)		\
++ 	VULNWL(HYGON, family, X86_MODEL_ANY, whitelist)
++ 
++ static const __initconst struct x86_cpu_id cpu_vuln_whitelist[] = {
++ 	VULNWL(ANY,	4, X86_MODEL_ANY,	NO_SPECULATION),
++ 	VULNWL(CENTAUR,	5, X86_MODEL_ANY,	NO_SPECULATION),
++ 	VULNWL(INTEL,	5, X86_MODEL_ANY,	NO_SPECULATION),
++ 	VULNWL(NSC,	5, X86_MODEL_ANY,	NO_SPECULATION),
++ 
++ 	/* Intel Family 6 */
++ 	VULNWL_INTEL(ATOM_SALTWELL,		NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_SALTWELL_TABLET,	NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_SALTWELL_MID,		NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_BONNELL,		NO_SPECULATION),
++ 	VULNWL_INTEL(ATOM_BONNELL_MID,		NO_SPECULATION),
++ 
++ 	VULNWL_INTEL(ATOM_SILVERMONT,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_SWAPGS),
++ 	VULNWL_INTEL(ATOM_SILVERMONT_X,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_SWAPGS),
++ 	VULNWL_INTEL(ATOM_SILVERMONT_MID,	NO_SSB | NO_L1TF | MSBDS_ONLY | NO_SWAPGS),
++ 	VULNWL_INTEL(ATOM_AIRMONT,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_SWAPGS),
++ 	VULNWL_INTEL(XEON_PHI_KNL,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_SWAPGS),
++ 	VULNWL_INTEL(XEON_PHI_KNM,		NO_SSB | NO_L1TF | MSBDS_ONLY | NO_SWAPGS),
++ 
++ 	VULNWL_INTEL(CORE_YONAH,		NO_SSB),
++ 
++ 	VULNWL_INTEL(ATOM_AIRMONT_MID,		NO_L1TF | MSBDS_ONLY | NO_SWAPGS),
++ 
++ 	VULNWL_INTEL(ATOM_GOLDMONT,		NO_MDS | NO_L1TF | NO_SWAPGS),
++ 	VULNWL_INTEL(ATOM_GOLDMONT_X,		NO_MDS | NO_L1TF | NO_SWAPGS),
++ 	VULNWL_INTEL(ATOM_GOLDMONT_PLUS,	NO_MDS | NO_L1TF | NO_SWAPGS),
++ 
++ 	/*
++ 	 * Technically, swapgs isn't serializing on AMD (despite it previously
++ 	 * being documented as such in the APM).  But according to AMD, %gs is
++ 	 * updated non-speculatively, and the issuing of %gs-relative memory
++ 	 * operands will be blocked until the %gs update completes, which is
++ 	 * good enough for our purposes.
++ 	 */
++ 
++ 	/* AMD Family 0xf - 0x12 */
++ 	VULNWL_AMD(0x0f,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS),
++ 	VULNWL_AMD(0x10,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS),
++ 	VULNWL_AMD(0x11,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS),
++ 	VULNWL_AMD(0x12,	NO_MELTDOWN | NO_SSB | NO_L1TF | NO_MDS | NO_SWAPGS),
++ 
++ 	/* FAMILY_ANY must be last, otherwise 0x0f - 0x12 matches won't work */
++ 	VULNWL_AMD(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS | NO_SWAPGS),
++ 	VULNWL_HYGON(X86_FAMILY_ANY,	NO_MELTDOWN | NO_L1TF | NO_MDS | NO_SWAPGS),
+++>>>>>>> f36cf386e3fe (x86/speculation/swapgs: Exclude ATOMs from speculation through SWAPGS)
+  	{}
+  };
+  
+@@@ -1017,7 -1059,16 +1085,20 @@@ static void __init cpu_set_bug_bits(str
+  	if (ia32_cap & ARCH_CAP_IBRS_ALL)
+  		setup_force_cpu_cap(X86_FEATURE_IBRS_ENHANCED);
+  
+++<<<<<<< HEAD
+ +	if (x86_match_cpu(cpu_no_meltdown))
+++=======
++ 	if (!cpu_matches(NO_MDS) && !(ia32_cap & ARCH_CAP_MDS_NO)) {
++ 		setup_force_cpu_bug(X86_BUG_MDS);
++ 		if (cpu_matches(MSBDS_ONLY))
++ 			setup_force_cpu_bug(X86_BUG_MSBDS_ONLY);
++ 	}
++ 
++ 	if (!cpu_matches(NO_SWAPGS))
++ 		setup_force_cpu_bug(X86_BUG_SWAPGS);
++ 
++ 	if (cpu_matches(NO_MELTDOWN))
+++>>>>>>> f36cf386e3fe (x86/speculation/swapgs: Exclude ATOMs from speculation through SWAPGS)
+  		return;
+  
+  	/* Rogue Data Cache Load? No! */
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kernel/cpu/common.c
