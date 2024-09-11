@@ -1,0 +1,160 @@
+mt76: remove mt76_queue dependency from tx_complete_skb function pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit e226ba2e356929c8d4aa9131acb795c302e5e821
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e226ba2e.failed
+
+Remove mt76_queue dependency from tx_complete_skb function pointer and
+rely on mt76_tx_qid instead. Remove flush from tx_complete_skb
+signature. This is a preliminary patch to introduce mt76_sw_queue
+support
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit e226ba2e356929c8d4aa9131acb795c302e5e821)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/dma.c
+#	drivers/net/wireless/mediatek/mt76/mt76x02_usb.h
+#	drivers/net/wireless/mediatek/mt76/usb.c
+diff --cc drivers/net/wireless/mediatek/mt76/dma.c
+index 4381155375e1,58c67df9f185..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/dma.c
+@@@ -161,22 -158,25 +161,30 @@@ mt76_dma_tx_cleanup(struct mt76_dev *de
+  	if (flush)
+  		last = -1;
+  	else
+ -		last = ioread32(&q->regs->dma_idx);
+ +		last = readl(&q->regs->dma_idx);
+  
+ -	while (q->queued && q->tail != last) {
+ +	while ((q->queued > n_queued) && q->tail != last) {
+  		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
+  		if (entry.schedule)
+ -			q->swq_queued--;
+ +			n_swq_queued[entry.qid]++;
+  
+  		q->tail = (q->tail + 1) % q->ndesc;
+ -		q->queued--;
+ +		n_queued++;
+  
+++<<<<<<< HEAD
+ +		if (entry.skb)
+ +			dev->drv->tx_complete_skb(dev, qid, &entry);
+++=======
++ 		if (entry.skb) {
++ 			spin_unlock_bh(&q->lock);
++ 			dev->drv->tx_complete_skb(dev, qid, &entry);
++ 			spin_lock_bh(&q->lock);
++ 		}
+++>>>>>>> e226ba2e3569 (mt76: remove mt76_queue dependency from tx_complete_skb function pointer)
+  
+  		if (entry.txwi) {
+ -			mt76_put_txwi(dev, entry.txwi);
+ +			if (!(dev->drv->txwi_flags & MT_TXWI_NO_FREE))
+ +				mt76_put_txwi(dev, entry.txwi);
+  			wake = !flush;
+  		}
+  
+diff --cc drivers/net/wireless/mediatek/mt76/mt76x02_usb.h
+index 7b53f9e57f29,98e647c8c7c7..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt76x02_usb.h
++++ b/drivers/net/wireless/mediatek/mt76/mt76x02_usb.h
+@@@ -26,11 -26,9 +26,19 @@@ int mt76x02u_mcu_fw_send_data(struct mt
+  
+  int mt76x02u_skb_dma_info(struct sk_buff *skb, int port, u32 flags);
+  int mt76x02u_tx_prepare_skb(struct mt76_dev *mdev, void *data,
+++<<<<<<< HEAD
+ +			    enum mt76_txq_id qid, struct mt76_wcid *wcid,
+ +			    struct ieee80211_sta *sta,
+ +			    struct mt76_tx_info *tx_info);
+ +void mt76x02u_tx_complete_skb(struct mt76_dev *mdev, enum mt76_txq_id qid,
+ +			      struct mt76_queue_entry *e);
+ +void mt76x02u_init_beacon_config(struct mt76x02_dev *dev);
+ +void mt76x02u_exit_beacon_config(struct mt76x02_dev *dev);
+++=======
++ 			    struct sk_buff *skb, enum mt76_txq_id qid,
++ 			    struct mt76_wcid *wcid, struct ieee80211_sta *sta,
++ 			    u32 *tx_info);
++ void mt76x02u_tx_complete_skb(struct mt76_dev *mdev, enum mt76_txq_id qid,
++ 			      struct mt76_queue_entry *e);
+++>>>>>>> e226ba2e3569 (mt76: remove mt76_queue dependency from tx_complete_skb function pointer)
+  #endif /* __MT76x02_USB_H */
+diff --cc drivers/net/wireless/mediatek/mt76/usb.c
+index fb87ce7fbdf6,71130f120936..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/usb.c
+@@@ -683,17 -647,14 +683,23 @@@ static void mt76u_tx_tasklet(unsigned l
+  			}
+  
+  			entry = q->entry[q->head];
+ +			q->entry[q->head].done = false;
+  			q->head = (q->head + 1) % q->ndesc;
+ -			q->queued--;
+ +			n_dequeued++;
+  
+++<<<<<<< HEAD
+ +			dev->drv->tx_complete_skb(dev, i, &entry);
+++=======
++ 			spin_unlock_bh(&q->lock);
++ 			dev->drv->tx_complete_skb(dev, i, &entry);
++ 			spin_lock_bh(&q->lock);
+++>>>>>>> e226ba2e3569 (mt76: remove mt76_queue dependency from tx_complete_skb function pointer)
+  		}
+ -		mt76_txq_schedule(dev, q);
+ +
+ +		spin_lock_bh(&q->lock);
+ +
+ +		sq->swq_queued -= n_sw_dequeued;
+ +		q->queued -= n_dequeued;
+  
+  		wake = q->stopped && q->queued < q->ndesc - 8;
+  		if (wake)
+* Unmerged path drivers/net/wireless/mediatek/mt76/dma.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7603/mac.c b/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+index 5abc02b57818..9bc21057906c 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/mac.c
+@@ -1142,8 +1142,8 @@ void mt7603_mac_add_txs(struct mt7603_dev *dev, void *data)
+ 	rcu_read_unlock();
+ }
+ 
+-void mt7603_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue *q,
+-			    struct mt76_queue_entry *e, bool flush)
++void mt7603_tx_complete_skb(struct mt76_dev *mdev, enum mt76_txq_id qid,
++			    struct mt76_queue_entry *e)
+ {
+ 	struct mt7603_dev *dev = container_of(mdev, struct mt7603_dev, mt76);
+ 	struct sk_buff *skb = e->skb;
+@@ -1153,7 +1153,7 @@ void mt7603_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue *q,
+ 		return;
+ 	}
+ 
+-	if (q - dev->mt76.q_tx < 4)
++	if (qid < 4)
+ 		dev->tx_hang_check = 0;
+ 
+ 	mt76_tx_complete_skb(mdev, skb);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7603/mt7603.h b/drivers/net/wireless/mediatek/mt76/mt7603/mt7603.h
+index 6049f3b7c8fe..5e13abb229fd 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7603/mt7603.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7603/mt7603.h
+@@ -229,8 +229,8 @@ int mt7603_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 			  struct mt76_wcid *wcid, struct ieee80211_sta *sta,
+ 			  u32 *tx_info);
+ 
+-void mt7603_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue *q,
+-			    struct mt76_queue_entry *e, bool flush);
++void mt7603_tx_complete_skb(struct mt76_dev *mdev, enum mt76_txq_id qid,
++			    struct mt76_queue_entry *e);
+ 
+ void mt7603_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 			 struct sk_buff *skb);
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76x02_usb.h
+* Unmerged path drivers/net/wireless/mediatek/mt76/usb.c
