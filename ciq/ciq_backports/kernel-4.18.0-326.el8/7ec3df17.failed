@@ -1,0 +1,116 @@
+RDMA/mlx5: Use PCI device for dma mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Parav Pandit <parav@nvidia.com>
+commit 7ec3df174f2b225267849d5e645d641d5f98dcd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/7ec3df17.failed
+
+DMA operation of the IB device is done using ib_device->dma_device.
+
+Instead of accessing parent of the IB device, use the PCI dma device which
+is setup to ib_device->dma_device during IB device registration.
+
+Link: https://lore.kernel.org/r/20201125064628.8431-1-leon@kernel.org
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 7ec3df174f2b225267849d5e645d641d5f98dcd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index d1c1a16be30f,b6116f6d065d..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1140,8 -1121,23 +1140,13 @@@ static void mlx5_ib_unmap_free_xlt(stru
+  int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
+  		       int page_shift, int flags)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5_ib_dev *dev = mr_to_mdev(mr);
+ +	struct device *ddev = dev->ib_dev.dev.parent;
+++=======
++ 	struct mlx5_ib_dev *dev = mr->dev;
++ 	struct device *ddev = &dev->mdev->pdev->dev;
+++>>>>>>> 7ec3df174f2b (RDMA/mlx5: Use PCI device for dma mappings)
+  	void *xlt;
+  	struct mlx5_umr_wr wr;
+  	struct ib_sge sg;
+@@@ -1236,6 -1211,69 +1241,72 @@@
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Send the DMA list to the HW for a normal MR using UMR.
++  */
++ static int mlx5_ib_update_mr_pas(struct mlx5_ib_mr *mr, unsigned int flags)
++ {
++ 	struct mlx5_ib_dev *dev = mr->dev;
++ 	struct device *ddev = &dev->mdev->pdev->dev;
++ 	struct ib_block_iter biter;
++ 	struct mlx5_mtt *cur_mtt;
++ 	struct mlx5_umr_wr wr;
++ 	size_t orig_sg_length;
++ 	struct mlx5_mtt *mtt;
++ 	size_t final_size;
++ 	struct ib_sge sg;
++ 	int err = 0;
++ 
++ 	if (WARN_ON(mr->umem->is_odp))
++ 		return -EINVAL;
++ 
++ 	mtt = mlx5_ib_create_xlt_wr(mr, &wr, &sg,
++ 				    ib_umem_num_dma_blocks(mr->umem,
++ 							   1 << mr->page_shift),
++ 				    sizeof(*mtt), flags);
++ 	if (!mtt)
++ 		return -ENOMEM;
++ 	orig_sg_length = sg.length;
++ 
++ 	cur_mtt = mtt;
++ 	rdma_for_each_block (mr->umem->sg_head.sgl, &biter, mr->umem->nmap,
++ 			     BIT(mr->page_shift)) {
++ 		if (cur_mtt == (void *)mtt + sg.length) {
++ 			dma_sync_single_for_device(ddev, sg.addr, sg.length,
++ 						   DMA_TO_DEVICE);
++ 			err = mlx5_ib_post_send_wait(dev, &wr);
++ 			if (err)
++ 				goto err;
++ 			dma_sync_single_for_cpu(ddev, sg.addr, sg.length,
++ 						DMA_TO_DEVICE);
++ 			wr.offset += sg.length;
++ 			cur_mtt = mtt;
++ 		}
++ 
++ 		cur_mtt->ptag =
++ 			cpu_to_be64(rdma_block_iter_dma_address(&biter) |
++ 				    MLX5_IB_MTT_PRESENT);
++ 		cur_mtt++;
++ 	}
++ 
++ 	final_size = (void *)cur_mtt - (void *)mtt;
++ 	sg.length = ALIGN(final_size, MLX5_UMR_MTT_ALIGNMENT);
++ 	memset(cur_mtt, 0, sg.length - final_size);
++ 	wr.wr.send_flags |= xlt_wr_final_send_flags(flags);
++ 	wr.xlt_size = sg.length;
++ 
++ 	dma_sync_single_for_device(ddev, sg.addr, sg.length, DMA_TO_DEVICE);
++ 	err = mlx5_ib_post_send_wait(dev, &wr);
++ 
++ err:
++ 	sg.length = orig_sg_length;
++ 	mlx5_ib_unmap_free_xlt(dev, mtt, &sg);
++ 	return err;
++ }
++ 
++ /*
+++>>>>>>> 7ec3df174f2b (RDMA/mlx5: Use PCI device for dma mappings)
+   * If ibmr is NULL it will be allocated by reg_create.
+   * Else, the given ibmr will be used.
+   */
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
