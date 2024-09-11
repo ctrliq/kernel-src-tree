@@ -1,0 +1,547 @@
+drm/i915: Report steering details in debugfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Matt Roper <matthew.d.roper@intel.com>
+commit b7563ec7d906ef87dcd15f39c66e0f35f58c2003
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b7563ec7.failed
+
+Add a new 'steering' node in each gt's debugfs directory that tells
+whether we're using explicit steering for various types of MCR ranges
+and, if so, what MMIO ranges it applies to.
+
+We're going to be transitioning away from implicit steering, even for
+slice/dss steering soon, so the information reported here will become
+increasingly valuable once that happens.
+
+v2:
+ - Adding missing 'static' on intel_steering_types[]  (Jose, sparse)
+v3:
+ - "static const char *" -> "static const char * const" (sparse)
+
+	Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+	Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+	Reviewed-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220315170250.954380-1-matthew.d.roper@intel.com
+(cherry picked from commit b7563ec7d906ef87dcd15f39c66e0f35f58c2003)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gt/intel_gt.c
+#	drivers/gpu/drm/i915/gt/intel_gt.h
+#	drivers/gpu/drm/i915/gt/intel_gt_debugfs.c
+#	drivers/gpu/drm/i915/gt/intel_gt_types.h
+#	drivers/gpu/drm/i915/gt/intel_workarounds.c
+diff --cc drivers/gpu/drm/i915/gt/intel_gt.c
+index 59d36fff08ab,ef6fef1bab20..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@@ -80,9 -89,49 +80,53 @@@ int intel_gt_probe_lmem(struct intel_g
+  	return 0;
+  }
+  
+ -int intel_gt_assign_ggtt(struct intel_gt *gt)
+ +void intel_gt_init_hw_early(struct intel_gt *gt, struct i915_ggtt *ggtt)
+  {
+++<<<<<<< HEAD
+ +	gt->ggtt = ggtt;
+++=======
++ 	gt->ggtt = drmm_kzalloc(&gt->i915->drm, sizeof(*gt->ggtt), GFP_KERNEL);
++ 
++ 	return gt->ggtt ? 0 : -ENOMEM;
++ }
++ 
++ static const char * const intel_steering_types[] = {
++ 	"L3BANK",
++ 	"MSLICE",
++ 	"LNCF",
++ };
++ 
++ static const struct intel_mmio_range icl_l3bank_steering_table[] = {
++ 	{ 0x00B100, 0x00B3FF },
++ 	{},
++ };
++ 
++ static const struct intel_mmio_range xehpsdv_mslice_steering_table[] = {
++ 	{ 0x004000, 0x004AFF },
++ 	{ 0x00C800, 0x00CFFF },
++ 	{ 0x00DD00, 0x00DDFF },
++ 	{ 0x00E900, 0x00FFFF }, /* 0xEA00 - OxEFFF is unused */
++ 	{},
++ };
++ 
++ static const struct intel_mmio_range xehpsdv_lncf_steering_table[] = {
++ 	{ 0x00B000, 0x00B0FF },
++ 	{ 0x00D800, 0x00D8FF },
++ 	{},
++ };
++ 
++ static const struct intel_mmio_range dg2_lncf_steering_table[] = {
++ 	{ 0x00B000, 0x00B0FF },
++ 	{ 0x00D880, 0x00D8FF },
++ 	{},
++ };
++ 
++ static u16 slicemask(struct intel_gt *gt, int count)
++ {
++ 	u64 dss_mask = intel_sseu_get_subslices(&gt->info.sseu, 0);
++ 
++ 	return intel_slicemask_from_dssmask(dss_mask, count);
+++>>>>>>> b7563ec7d906 (drm/i915: Report steering details in debugfs)
+  }
+  
+  int intel_gt_init_mmio(struct intel_gt *gt)
+@@@ -699,6 -813,171 +743,174 @@@ void intel_gt_driver_late_release(struc
+  	intel_engines_free(gt);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * intel_gt_reg_needs_read_steering - determine whether a register read
++  *     requires explicit steering
++  * @gt: GT structure
++  * @reg: the register to check steering requirements for
++  * @type: type of multicast steering to check
++  *
++  * Determines whether @reg needs explicit steering of a specific type for
++  * reads.
++  *
++  * Returns false if @reg does not belong to a register range of the given
++  * steering type, or if the default (subslice-based) steering IDs are suitable
++  * for @type steering too.
++  */
++ static bool intel_gt_reg_needs_read_steering(struct intel_gt *gt,
++ 					     i915_reg_t reg,
++ 					     enum intel_steering_type type)
++ {
++ 	const u32 offset = i915_mmio_reg_offset(reg);
++ 	const struct intel_mmio_range *entry;
++ 
++ 	if (likely(!intel_gt_needs_read_steering(gt, type)))
++ 		return false;
++ 
++ 	for (entry = gt->steering_table[type]; entry->end; entry++) {
++ 		if (offset >= entry->start && offset <= entry->end)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /**
++  * intel_gt_get_valid_steering - determines valid IDs for a class of MCR steering
++  * @gt: GT structure
++  * @type: multicast register type
++  * @sliceid: Slice ID returned
++  * @subsliceid: Subslice ID returned
++  *
++  * Determines sliceid and subsliceid values that will steer reads
++  * of a specific multicast register class to a valid value.
++  */
++ static void intel_gt_get_valid_steering(struct intel_gt *gt,
++ 					enum intel_steering_type type,
++ 					u8 *sliceid, u8 *subsliceid)
++ {
++ 	switch (type) {
++ 	case L3BANK:
++ 		GEM_DEBUG_WARN_ON(!gt->info.l3bank_mask); /* should be impossible! */
++ 
++ 		*sliceid = 0;		/* unused */
++ 		*subsliceid = __ffs(gt->info.l3bank_mask);
++ 		break;
++ 	case MSLICE:
++ 		GEM_DEBUG_WARN_ON(!gt->info.mslice_mask); /* should be impossible! */
++ 
++ 		*sliceid = __ffs(gt->info.mslice_mask);
++ 		*subsliceid = 0;	/* unused */
++ 		break;
++ 	case LNCF:
++ 		GEM_DEBUG_WARN_ON(!gt->info.mslice_mask); /* should be impossible! */
++ 
++ 		/*
++ 		 * An LNCF is always present if its mslice is present, so we
++ 		 * can safely just steer to LNCF 0 in all cases.
++ 		 */
++ 		*sliceid = __ffs(gt->info.mslice_mask) << 1;
++ 		*subsliceid = 0;	/* unused */
++ 		break;
++ 	default:
++ 		MISSING_CASE(type);
++ 		*sliceid = 0;
++ 		*subsliceid = 0;
++ 	}
++ }
++ 
++ /**
++  * intel_gt_read_register_fw - reads a GT register with support for multicast
++  * @gt: GT structure
++  * @reg: register to read
++  *
++  * This function will read a GT register.  If the register is a multicast
++  * register, the read will be steered to a valid instance (i.e., one that
++  * isn't fused off or powered down by power gating).
++  *
++  * Returns the value from a valid instance of @reg.
++  */
++ u32 intel_gt_read_register_fw(struct intel_gt *gt, i915_reg_t reg)
++ {
++ 	int type;
++ 	u8 sliceid, subsliceid;
++ 
++ 	for (type = 0; type < NUM_STEERING_TYPES; type++) {
++ 		if (intel_gt_reg_needs_read_steering(gt, reg, type)) {
++ 			intel_gt_get_valid_steering(gt, type, &sliceid,
++ 						    &subsliceid);
++ 			return intel_uncore_read_with_mcr_steering_fw(gt->uncore,
++ 								      reg,
++ 								      sliceid,
++ 								      subsliceid);
++ 		}
++ 	}
++ 
++ 	return intel_uncore_read_fw(gt->uncore, reg);
++ }
++ 
++ u32 intel_gt_read_register(struct intel_gt *gt, i915_reg_t reg)
++ {
++ 	int type;
++ 	u8 sliceid, subsliceid;
++ 
++ 	for (type = 0; type < NUM_STEERING_TYPES; type++) {
++ 		if (intel_gt_reg_needs_read_steering(gt, reg, type)) {
++ 			intel_gt_get_valid_steering(gt, type, &sliceid,
++ 						    &subsliceid);
++ 			return intel_uncore_read_with_mcr_steering(gt->uncore,
++ 								   reg,
++ 								   sliceid,
++ 								   subsliceid);
++ 		}
++ 	}
++ 
++ 	return intel_uncore_read(gt->uncore, reg);
++ }
++ 
++ static void report_steering_type(struct drm_printer *p,
++ 				 struct intel_gt *gt,
++ 				 enum intel_steering_type type,
++ 				 bool dump_table)
++ {
++ 	const struct intel_mmio_range *entry;
++ 	u8 slice, subslice;
++ 
++ 	BUILD_BUG_ON(ARRAY_SIZE(intel_steering_types) != NUM_STEERING_TYPES);
++ 
++ 	if (!gt->steering_table[type]) {
++ 		drm_printf(p, "%s steering: uses default steering\n",
++ 			   intel_steering_types[type]);
++ 		return;
++ 	}
++ 
++ 	intel_gt_get_valid_steering(gt, type, &slice, &subslice);
++ 	drm_printf(p, "%s steering: sliceid=0x%x, subsliceid=0x%x\n",
++ 		   intel_steering_types[type], slice, subslice);
++ 
++ 	if (!dump_table)
++ 		return;
++ 
++ 	for (entry = gt->steering_table[type]; entry->end; entry++)
++ 		drm_printf(p, "\t0x%06x - 0x%06x\n", entry->start, entry->end);
++ }
++ 
++ void intel_gt_report_steering(struct drm_printer *p, struct intel_gt *gt,
++ 			      bool dump_table)
++ {
++ 	drm_printf(p, "Default steering: sliceid=0x%x, subsliceid=0x%x\n",
++ 		   gt->default_steering.groupid,
++ 		   gt->default_steering.instanceid);
++ 
++ 	if (HAS_MSLICES(gt->i915)) {
++ 		report_steering_type(p, gt, MSLICE, dump_table);
++ 		report_steering_type(p, gt, LNCF, dump_table);
++ 	}
++ }
++ 
+++>>>>>>> b7563ec7d906 (drm/i915: Report steering details in debugfs)
+  void intel_gt_info_print(const struct intel_gt_info *info,
+  			 struct drm_printer *p)
+  {
+diff --cc drivers/gpu/drm/i915/gt/intel_gt.h
+index 5d090b338e77,3edece1865e4..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt.h
+@@@ -75,6 -78,17 +75,20 @@@ static inline bool intel_gt_is_wedged(c
+  	return unlikely(test_bit(I915_WEDGED, &gt->reset.flags));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool intel_gt_needs_read_steering(struct intel_gt *gt,
++ 						enum intel_steering_type type)
++ {
++ 	return gt->steering_table[type];
++ }
++ 
++ u32 intel_gt_read_register_fw(struct intel_gt *gt, i915_reg_t reg);
++ u32 intel_gt_read_register(struct intel_gt *gt, i915_reg_t reg);
++ 
++ void intel_gt_report_steering(struct drm_printer *p, struct intel_gt *gt,
++ 			      bool dump_table);
+++>>>>>>> b7563ec7d906 (drm/i915: Report steering details in debugfs)
+  void intel_gt_info_print(const struct intel_gt_info *info,
+  			 struct drm_printer *p);
+  
+diff --cc drivers/gpu/drm/i915/gt/intel_gt_types.h
+index afeb478ce0ca,7781ab84e7a3..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_gt_types.h
++++ b/drivers/gpu/drm/i915/gt/intel_gt_types.h
+@@@ -147,10 -178,25 +147,22 @@@ struct intel_gt 
+  
+  	struct i915_vma *scratch;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct intel_migrate migrate;
++ 
++ 	const struct intel_mmio_range *steering_table[NUM_STEERING_TYPES];
++ 
++ 	struct {
++ 		u8 groupid;
++ 		u8 instanceid;
++ 	} default_steering;
++ 
+++>>>>>>> b7563ec7d906 (drm/i915: Report steering details in debugfs)
+  	struct intel_gt_info {
+  		intel_engine_mask_t engine_mask;
+ -
+ -		u32 l3bank_mask;
+ -
+  		u8 num_engines;
+  
+ -		/* General presence of SFC units */
+ -		u8 sfc_mask;
+ -
+  		/* Media engine access to SFC per instance */
+  		u8 vdbox_sfc_access;
+  
+diff --cc drivers/gpu/drm/i915/gt/intel_workarounds.c
+index 9ea97c1fa521,c328d46f8095..000000000000
+--- a/drivers/gpu/drm/i915/gt/intel_workarounds.c
++++ b/drivers/gpu/drm/i915/gt/intel_workarounds.c
+@@@ -944,87 -1057,143 +944,116 @@@ cfl_gt_workarounds_init(struct drm_i915
+  		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __set_mcr_steering(struct i915_wa_list *wal,
++ 			       i915_reg_t steering_reg,
++ 			       unsigned int slice, unsigned int subslice)
++ {
++ 	u32 mcr, mcr_mask;
++ 
++ 	mcr = GEN11_MCR_SLICE(slice) | GEN11_MCR_SUBSLICE(subslice);
++ 	mcr_mask = GEN11_MCR_SLICE_MASK | GEN11_MCR_SUBSLICE_MASK;
++ 
++ 	wa_write_clr_set(wal, steering_reg, mcr_mask, mcr);
++ }
++ 
++ static void __add_mcr_wa(struct intel_gt *gt, struct i915_wa_list *wal,
++ 			 unsigned int slice, unsigned int subslice)
++ {
++ 	struct drm_printer p = drm_debug_printer("MCR Steering:");
++ 
++ 	__set_mcr_steering(wal, GEN8_MCR_SELECTOR, slice, subslice);
++ 
++ 	gt->default_steering.groupid = slice;
++ 	gt->default_steering.instanceid = subslice;
++ 
++ 	if (drm_debug_enabled(DRM_UT_DRIVER))
++ 		intel_gt_report_steering(&p, gt, false);
++ }
++ 
+++>>>>>>> b7563ec7d906 (drm/i915: Report steering details in debugfs)
+  static void
+ -icl_wa_init_mcr(struct intel_gt *gt, struct i915_wa_list *wal)
+ +wa_init_mcr(struct drm_i915_private *i915, struct i915_wa_list *wal)
+  {
+ -	const struct sseu_dev_info *sseu = &gt->info.sseu;
+ +	const struct sseu_dev_info *sseu = &i915->gt.info.sseu;
+  	unsigned int slice, subslice;
+ +	u32 l3_en, mcr, mcr_mask;
+  
+ -	GEM_BUG_ON(GRAPHICS_VER(gt->i915) < 11);
+ -	GEM_BUG_ON(hweight8(sseu->slice_mask) > 1);
+ -	slice = 0;
+ -
+ -	/*
+ -	 * Although a platform may have subslices, we need to always steer
+ -	 * reads to the lowest instance that isn't fused off.  When Render
+ -	 * Power Gating is enabled, grabbing forcewake will only power up a
+ -	 * single subslice (the "minconfig") if there isn't a real workload
+ -	 * that needs to be run; this means that if we steer register reads to
+ -	 * one of the higher subslices, we run the risk of reading back 0's or
+ -	 * random garbage.
+ -	 */
+ -	subslice = __ffs(intel_sseu_get_subslices(sseu, slice));
+ +	GEM_BUG_ON(GRAPHICS_VER(i915) < 10);
+  
+  	/*
+ -	 * If the subslice we picked above also steers us to a valid L3 bank,
+ -	 * then we can just rely on the default steering and won't need to
+ -	 * worry about explicitly re-steering L3BANK reads later.
+ -	 */
+ -	if (gt->info.l3bank_mask & BIT(subslice))
+ -		gt->steering_table[L3BANK] = NULL;
+ -
+ -	__add_mcr_wa(gt, wal, slice, subslice);
+ -}
+ -
+ -static void
+ -xehp_init_mcr(struct intel_gt *gt, struct i915_wa_list *wal)
+ -{
+ -	const struct sseu_dev_info *sseu = &gt->info.sseu;
+ -	unsigned long slice, subslice = 0, slice_mask = 0;
+ -	u64 dss_mask = 0;
+ -	u32 lncf_mask = 0;
+ -	int i;
+ -
+ -	/*
+ -	 * On Xe_HP the steering increases in complexity. There are now several
+ -	 * more units that require steering and we're not guaranteed to be able
+ -	 * to find a common setting for all of them. These are:
+ -	 * - GSLICE (fusable)
+ -	 * - DSS (sub-unit within gslice; fusable)
+ -	 * - L3 Bank (fusable)
+ -	 * - MSLICE (fusable)
+ -	 * - LNCF (sub-unit within mslice; always present if mslice is present)
+ +	 * WaProgramMgsrForL3BankSpecificMmioReads: cnl,icl
+ +	 * L3Banks could be fused off in single slice scenario. If that is
+ +	 * the case, we might need to program MCR select to a valid L3Bank
+ +	 * by default, to make sure we correctly read certain registers
+ +	 * later on (in the range 0xB100 - 0xB3FF).
+  	 *
+ -	 * We'll do our default/implicit steering based on GSLICE (in the
+ -	 * sliceid field) and DSS (in the subsliceid field).  If we can
+ -	 * find overlap between the valid MSLICE and/or LNCF values with
+ -	 * a suitable GSLICE, then we can just re-use the default value and
+ -	 * skip and explicit steering at runtime.
+ +	 * WaProgramMgsrForCorrectSliceSpecificMmioReads:cnl,icl
+ +	 * Before any MMIO read into slice/subslice specific registers, MCR
+ +	 * packet control register needs to be programmed to point to any
+ +	 * enabled s/ss pair. Otherwise, incorrect values will be returned.
+ +	 * This means each subsequent MMIO read will be forwarded to an
+ +	 * specific s/ss combination, but this is OK since these registers
+ +	 * are consistent across s/ss in almost all cases. In the rare
+ +	 * occasions, such as INSTDONE, where this value is dependent
+ +	 * on s/ss combo, the read should be done with read_subslice_reg.
+  	 *
+ -	 * We only need to look for overlap between GSLICE/MSLICE/LNCF to find
+ -	 * a valid sliceid value.  DSS steering is the only type of steering
+ -	 * that utilizes the 'subsliceid' bits.
+ +	 * Since GEN8_MCR_SELECTOR contains dual-purpose bits which select both
+ +	 * to which subslice, or to which L3 bank, the respective mmio reads
+ +	 * will go, we have to find a common index which works for both
+ +	 * accesses.
+  	 *
+ -	 * Also note that, even though the steering domain is called "GSlice"
+ -	 * and it is encoded in the register using the gslice format, the spec
+ -	 * says that the combined (geometry | compute) fuse should be used to
+ -	 * select the steering.
+ +	 * Case where we cannot find a common index fortunately should not
+ +	 * happen in production hardware, so we only emit a warning instead of
+ +	 * implementing something more complex that requires checking the range
+ +	 * of every MMIO read.
+  	 */
+  
+ -	/* Find the potential gslice candidates */
+ -	dss_mask = intel_sseu_get_subslices(sseu, 0);
+ -	slice_mask = intel_slicemask_from_dssmask(dss_mask, GEN_DSS_PER_GSLICE);
+ +	if (GRAPHICS_VER(i915) >= 10 && is_power_of_2(sseu->slice_mask)) {
+ +		u32 l3_fuse =
+ +			intel_uncore_read(&i915->uncore, GEN10_MIRROR_FUSE3) &
+ +			GEN10_L3BANK_MASK;
+  
+ -	/*
+ -	 * Find the potential LNCF candidates.  Either LNCF within a valid
+ -	 * mslice is fine.
+ -	 */
+ -	for_each_set_bit(i, &gt->info.mslice_mask, GEN12_MAX_MSLICES)
+ -		lncf_mask |= (0x3 << (i * 2));
+ +		drm_dbg(&i915->drm, "L3 fuse = %x\n", l3_fuse);
+ +		l3_en = ~(l3_fuse << GEN10_L3BANK_PAIR_COUNT | l3_fuse);
+ +	} else {
+ +		l3_en = ~0;
+ +	}
+  
+ -	/*
+ -	 * Are there any sliceid values that work for both GSLICE and LNCF
+ -	 * steering?
+ -	 */
+ -	if (slice_mask & lncf_mask) {
+ -		slice_mask &= lncf_mask;
+ -		gt->steering_table[LNCF] = NULL;
+ +	slice = fls(sseu->slice_mask) - 1;
+ +	subslice = fls(l3_en & intel_sseu_get_subslices(sseu, slice));
+ +	if (!subslice) {
+ +		drm_warn(&i915->drm,
+ +			 "No common index found between subslice mask %x and L3 bank mask %x!\n",
+ +			 intel_sseu_get_subslices(sseu, slice), l3_en);
+ +		subslice = fls(l3_en);
+ +		drm_WARN_ON(&i915->drm, !subslice);
+  	}
+ +	subslice--;
+  
+ -	/* How about sliceid values that also work for MSLICE steering? */
+ -	if (slice_mask & gt->info.mslice_mask) {
+ -		slice_mask &= gt->info.mslice_mask;
+ -		gt->steering_table[MSLICE] = NULL;
+ +	if (GRAPHICS_VER(i915) >= 11) {
+ +		mcr = GEN11_MCR_SLICE(slice) | GEN11_MCR_SUBSLICE(subslice);
+ +		mcr_mask = GEN11_MCR_SLICE_MASK | GEN11_MCR_SUBSLICE_MASK;
+ +	} else {
+ +		mcr = GEN8_MCR_SLICE(slice) | GEN8_MCR_SUBSLICE(subslice);
+ +		mcr_mask = GEN8_MCR_SLICE_MASK | GEN8_MCR_SUBSLICE_MASK;
+  	}
+  
+ -	slice = __ffs(slice_mask);
+ -	subslice = __ffs(dss_mask >> (slice * GEN_DSS_PER_GSLICE));
+ -	WARN_ON(subslice > GEN_DSS_PER_GSLICE);
+ -	WARN_ON(dss_mask >> (slice * GEN_DSS_PER_GSLICE) == 0);
+ +	drm_dbg(&i915->drm, "MCR slice/subslice = %x\n", mcr);
+  
+ -	__add_mcr_wa(gt, wal, slice, subslice);
+ +	wa_write_clr_set(wal, GEN8_MCR_SELECTOR, mcr_mask, mcr);
+ +}
+  
+ -	/*
+ -	 * SQIDI ranges are special because they use different steering
+ -	 * registers than everything else we work with.  On XeHP SDV and
+ -	 * DG2-G10, any value in the steering registers will work fine since
+ -	 * all instances are present, but DG2-G11 only has SQIDI instances at
+ -	 * ID's 2 and 3, so we need to steer to one of those.  For simplicity
+ -	 * we'll just steer to a hardcoded "2" since that value will work
+ -	 * everywhere.
+ -	 */
+ -	__set_mcr_steering(wal, MCFG_MCR_SELECTOR, 0, 2);
+ -	__set_mcr_steering(wal, SF_MCR_SELECTOR, 0, 2);
+ +static void
+ +cnl_gt_workarounds_init(struct drm_i915_private *i915, struct i915_wa_list *wal)
+ +{
+ +	wa_init_mcr(i915, wal);
+ +
+ +	/* WaInPlaceDecompressionHang:cnl */
+ +	wa_write_or(wal,
+ +		    GEN9_GAMT_ECO_REG_RW_IA,
+ +		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS);
+  }
+  
+  static void
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_debugfs.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.h
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_debugfs.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_types.h
+* Unmerged path drivers/gpu/drm/i915/gt/intel_workarounds.c
