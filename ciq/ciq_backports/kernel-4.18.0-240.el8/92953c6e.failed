@@ -1,0 +1,152 @@
+scsi: zfcp: signal incomplete or error for sync exchange config/port data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Benjamin Block <bblock@linux.ibm.com>
+commit 92953c6e0aa77d4febcca6dd691e8192910c8a28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/92953c6e.failed
+
+Adds a new FSF-Request status flag (ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE)
+that signal that the data received using Exchange Config Data or Exchange
+Port Data was incomplete. This new flags is set in the respective handlers
+during the response path.
+
+With this patch, only the synchronous FSF-functions for each command got
+support for the new flag, otherwise it is transparent.
+
+Together with this new flag and already existing status flags the
+synchronous FSF-functions are extended to now detect whether the received
+data is complete, incomplete or completely invalid (this includes cases
+where a command ran into a timeout). This is now signaled back to the
+caller, where previously only failures on the request path would result in
+a bad return-code.
+
+For complete data the return-code remains 0. For incomplete data a new
+return-code -EAGAIN is added to the function-interface. For completely
+invalid data the already existing return-code -EIO is reused - formerly
+this was used to signal failures on the request path.
+
+Existing callers of the FSF-functions are adjusted so that they behave as
+before for return-code 0 and -EAGAIN, to not change the user-interface. As
+-EIO existed all along, it was already exposed to the user - and needed
+handling - and will now also be exposed in this new special case.
+
+Link: https://lore.kernel.org/r/e14f0702fa2b00a4d1f37c7981a13f2dd1ea2c83.1572018130.git.bblock@linux.ibm.com
+	Reviewed-by: Steffen Maier <maier@linux.ibm.com>
+	Signed-off-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 92953c6e0aa77d4febcca6dd691e8192910c8a28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/scsi/zfcp_fsf.c
+diff --cc drivers/s390/scsi/zfcp_fsf.c
+index c106c96f2061,d8f0e446fe13..000000000000
+--- a/drivers/s390/scsi/zfcp_fsf.c
++++ b/drivers/s390/scsi/zfcp_fsf.c
+@@@ -1283,8 -1326,17 +1300,22 @@@ int zfcp_fsf_exchange_config_data_sync(
+  	zfcp_fsf_start_timer(req, ZFCP_FSF_REQUEST_TIMEOUT);
+  	retval = zfcp_fsf_req_send(req);
+  	spin_unlock_irq(&qdio->req_q_lock);
+++<<<<<<< HEAD
+ +	if (!retval)
+ +		wait_for_completion(&req->completion);
+++=======
++ 
++ 	if (!retval) {
++ 		/* NOTE: ONLY TOUCH SYNC req AGAIN ON req->completion. */
++ 		wait_for_completion(&req->completion);
++ 
++ 		if (req->status &
++ 		    (ZFCP_STATUS_FSFREQ_ERROR | ZFCP_STATUS_FSFREQ_DISMISSED))
++ 			retval = -EIO;
++ 		else if (req->status & ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE)
++ 			retval = -EAGAIN;
++ 	}
+++>>>>>>> 92953c6e0aa7 (scsi: zfcp: signal incomplete or error for sync exchange config/port data)
+  
+  	zfcp_fsf_req_free(req);
+  	return retval;
+@@@ -1376,11 -1436,18 +1414,20 @@@ int zfcp_fsf_exchange_port_data_sync(st
+  	retval = zfcp_fsf_req_send(req);
+  	spin_unlock_irq(&qdio->req_q_lock);
+  
+ -	if (!retval) {
+ -		/* NOTE: ONLY TOUCH SYNC req AGAIN ON req->completion. */
+ +	if (!retval)
+  		wait_for_completion(&req->completion);
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (req->status &
++ 		    (ZFCP_STATUS_FSFREQ_ERROR | ZFCP_STATUS_FSFREQ_DISMISSED))
++ 			retval = -EIO;
++ 		else if (req->status & ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE)
++ 			retval = -EAGAIN;
++ 	}
+++>>>>>>> 92953c6e0aa7 (scsi: zfcp: signal incomplete or error for sync exchange config/port data)
+  
+  	zfcp_fsf_req_free(req);
+- 
+  	return retval;
+  
+  out_unlock:
+diff --git a/drivers/s390/scsi/zfcp_def.h b/drivers/s390/scsi/zfcp_def.h
+index 3396a47721a7..303a6bab855c 100644
+--- a/drivers/s390/scsi/zfcp_def.h
++++ b/drivers/s390/scsi/zfcp_def.h
+@@ -94,6 +94,7 @@ struct zfcp_reqlist;
+ #define ZFCP_STATUS_FSFREQ_ABORTNOTNEEDED       0x00000080
+ #define ZFCP_STATUS_FSFREQ_TMFUNCFAILED         0x00000200
+ #define ZFCP_STATUS_FSFREQ_DISMISSED            0x00001000
++#define ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE	0x00020000
+ 
+ /************************* STRUCTURE DEFINITIONS *****************************/
+ 
+* Unmerged path drivers/s390/scsi/zfcp_fsf.c
+diff --git a/drivers/s390/scsi/zfcp_scsi.c b/drivers/s390/scsi/zfcp_scsi.c
+index 03b6abc213c9..4c6be2cec14e 100644
+--- a/drivers/s390/scsi/zfcp_scsi.c
++++ b/drivers/s390/scsi/zfcp_scsi.c
+@@ -602,7 +602,7 @@ zfcp_scsi_get_fc_host_stats(struct Scsi_Host *host)
+ 		return NULL;
+ 
+ 	ret = zfcp_fsf_exchange_port_data_sync(adapter->qdio, data);
+-	if (ret) {
++	if (ret != 0 && ret != -EAGAIN) {
+ 		kfree(data);
+ 		return NULL;
+ 	}
+@@ -631,7 +631,7 @@ static void zfcp_scsi_reset_fc_host_stats(struct Scsi_Host *shost)
+ 		return;
+ 
+ 	ret = zfcp_fsf_exchange_port_data_sync(adapter->qdio, data);
+-	if (ret)
++	if (ret != 0 && ret != -EAGAIN)
+ 		kfree(data);
+ 	else {
+ 		adapter->stats_reset = jiffies/HZ;
+diff --git a/drivers/s390/scsi/zfcp_sysfs.c b/drivers/s390/scsi/zfcp_sysfs.c
+index af197e2b3e69..90d851d49410 100644
+--- a/drivers/s390/scsi/zfcp_sysfs.c
++++ b/drivers/s390/scsi/zfcp_sysfs.c
+@@ -577,7 +577,7 @@ static ssize_t zfcp_sysfs_adapter_util_show(struct device *dev,
+ 		return -ENOMEM;
+ 
+ 	retval = zfcp_fsf_exchange_port_data_sync(adapter->qdio, qtcb_port);
+-	if (!retval)
++	if (retval == 0 || retval == -EAGAIN)
+ 		retval = sprintf(buf, "%u %u %u\n", qtcb_port->cp_util,
+ 				 qtcb_port->cb_util, qtcb_port->a_util);
+ 	kfree(qtcb_port);
+@@ -603,7 +603,7 @@ static int zfcp_sysfs_adapter_ex_config(struct device *dev,
+ 		return -ENOMEM;
+ 
+ 	retval = zfcp_fsf_exchange_config_data_sync(adapter->qdio, qtcb_config);
+-	if (!retval)
++	if (retval == 0 || retval == -EAGAIN)
+ 		*stat_inf = qtcb_config->stat_info;
+ 
+ 	kfree(qtcb_config);
