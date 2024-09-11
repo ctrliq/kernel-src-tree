@@ -1,0 +1,157 @@
+ipv6: Handle route deletion notification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit d2f0c9b11410f9c6a07c126f8a215b0b81cdcf6c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d2f0c9b1.failed
+
+For the purpose of route offload, when a single route is deleted, it is
+only of interest if it is the first route in the node or if it is
+sibling to such a route.
+
+In the first case, distinguish between several possibilities:
+
+1. Route is the last route in the node. Emit a delete notification
+
+2. Route is followed by a non-multipath route. Emit a replace
+notification for the non-multipath route.
+
+3. Route is followed by a multipath route. Emit a replace notification
+for the multipath route.
+
+In the second case, only emit a delete notification to ensure the route
+is no longer used as a valid nexthop.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d2f0c9b11410f9c6a07c126f8a215b0b81cdcf6c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_fib.h
+#	net/ipv6/ip6_fib.c
+diff --cc include/net/ip6_fib.h
+index 390067ba9e95,b579faea41e9..000000000000
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@@ -422,17 -454,42 +422,32 @@@ int fib6_add(struct fib6_node *root, st
+  	     struct nl_info *info, struct netlink_ext_ack *extack);
+  int fib6_del(struct fib6_info *rt, struct nl_info *info);
+  
+ -static inline
+ -void rt6_get_prefsrc(const struct rt6_info *rt, struct in6_addr *addr)
+ +static inline struct net_device *fib6_info_nh_dev(const struct fib6_info *f6i)
+  {
+ -	const struct fib6_info *from;
+ -
+ -	rcu_read_lock();
+ -
+ -	from = rcu_dereference(rt->from);
+ -	if (from) {
+ -		*addr = from->fib6_prefsrc.addr;
+ -	} else {
+ -		struct in6_addr in6_zero = {};
+ -
+ -		*addr = in6_zero;
+ -	}
+ -
+ -	rcu_read_unlock();
+ +	return f6i->fib6_nh.nh_dev;
+  }
+  
+ -int fib6_nh_init(struct net *net, struct fib6_nh *fib6_nh,
+ -		 struct fib6_config *cfg, gfp_t gfp_flags,
+ -		 struct netlink_ext_ack *extack);
+ -void fib6_nh_release(struct fib6_nh *fib6_nh);
+ +static inline
+ +struct lwtunnel_state *fib6_info_nh_lwt(const struct fib6_info *f6i)
+ +{
+ +	return f6i->fib6_nh.nh_lwtstate;
+ +}
+  
+++<<<<<<< HEAD
+++=======
++ int call_fib6_entry_notifiers(struct net *net,
++ 			      enum fib_event_type event_type,
++ 			      struct fib6_info *rt,
++ 			      struct netlink_ext_ack *extack);
++ int call_fib6_multipath_entry_notifiers(struct net *net,
++ 					enum fib_event_type event_type,
++ 					struct fib6_info *rt,
++ 					unsigned int nsiblings,
++ 					struct netlink_ext_ack *extack);
++ int call_fib6_entry_notifiers_replace(struct net *net, struct fib6_info *rt);
++ void fib6_rt_update(struct net *net, struct fib6_info *rt,
++ 		    struct nl_info *info);
+++>>>>>>> d2f0c9b11410 (ipv6: Handle route deletion notification)
+  void inet6_rt_notify(int event, struct fib6_info *rt, struct nl_info *info,
+  		     unsigned int flags);
+  
+diff --cc net/ipv6/ip6_fib.c
+index 246c67f714a3,67ddee539f77..000000000000
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@@ -415,6 -399,34 +415,18 @@@ static int call_fib6_entry_notifiers(st
+  	return call_fib6_notifiers(net, event_type, &info.info);
+  }
+  
+ -int call_fib6_multipath_entry_notifiers(struct net *net,
+ -					enum fib_event_type event_type,
+ -					struct fib6_info *rt,
+ -					unsigned int nsiblings,
+ -					struct netlink_ext_ack *extack)
+ -{
+ -	struct fib6_entry_notifier_info info = {
+ -		.info.extack = extack,
+ -		.rt = rt,
+ -		.nsiblings = nsiblings,
+ -	};
+ -
+ -	rt->fib6_table->fib_seq++;
+ -	return call_fib6_notifiers(net, event_type, &info.info);
+ -}
+ -
++ int call_fib6_entry_notifiers_replace(struct net *net, struct fib6_info *rt)
++ {
++ 	struct fib6_entry_notifier_info info = {
++ 		.rt = rt,
++ 		.nsiblings = rt->fib6_nsiblings,
++ 	};
++ 
++ 	rt->fib6_table->fib_seq++;
++ 	return call_fib6_notifiers(net, FIB_EVENT_ENTRY_REPLACE_TMP,
++ 				   &info.info);
++ }
++ 
+  struct fib6_dump_arg {
+  	struct net *net;
+  	struct notifier_block *nb;
+@@@ -1844,9 -2005,17 +1880,20 @@@ static void fib6_del_route(struct fib6_
+  
+  	fib6_purge_rt(rt, fn, net);
+  
+++<<<<<<< HEAD
+ +	call_fib6_entry_notifiers(net, FIB_EVENT_ENTRY_DEL, rt, NULL);
+++=======
++ 	if (!info->skip_notify_kernel) {
++ 		if (notify_del)
++ 			call_fib6_entry_notifiers(net, FIB_EVENT_ENTRY_DEL_TMP,
++ 						  rt, NULL);
++ 		else if (replace_rt)
++ 			call_fib6_entry_notifiers_replace(net, replace_rt);
++ 		call_fib6_entry_notifiers(net, FIB_EVENT_ENTRY_DEL, rt, NULL);
++ 	}
+++>>>>>>> d2f0c9b11410 (ipv6: Handle route deletion notification)
+  	if (!info->skip_notify)
+  		inet6_rt_notify(RTM_DELROUTE, rt, info, 0);
+ -
+  	fib6_info_release(rt);
+  }
+  
+* Unmerged path include/net/ip6_fib.h
+* Unmerged path net/ipv6/ip6_fib.c
