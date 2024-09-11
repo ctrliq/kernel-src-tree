@@ -1,0 +1,146 @@
+route: add support for directed broadcast forwarding
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 5cbf777cfdf6e5a7b7149006e4881a255da78fdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5cbf777c.failed
+
+This patch implements the feature described in rfc1812#section-5.3.5.2
+and rfc2644. It allows the router to forward directed broadcast when
+sysctl bc_forwarding is enabled.
+
+Note that this feature could be done by iptables -j TEE, but it would
+cause some problems:
+  - target TEE's gateway param has to be set with a specific address,
+    and it's not flexible especially when the route wants forward all
+    directed broadcasts.
+  - this duplicates the directed broadcasts so this may cause side
+    effects to applications.
+
+Besides, to keep consistent with other os router like BSD, it's also
+necessary to implement it in the route rx path.
+
+Note that route cache needs to be flushed when bc_forwarding is
+changed.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5cbf777cfdf6e5a7b7149006e4881a255da78fdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/ip.h
+diff --cc include/uapi/linux/ip.h
+index f4c4a76f1ef0,e42d13b55cf3..000000000000
+--- a/include/uapi/linux/ip.h
++++ b/include/uapi/linux/ip.h
+@@@ -168,9 -168,7 +168,13 @@@ enu
+  	IPV4_DEVCONF_IGNORE_ROUTES_WITH_LINKDOWN,
+  	IPV4_DEVCONF_DROP_UNICAST_IN_L2_MULTICAST,
+  	IPV4_DEVCONF_DROP_GRATUITOUS_ARP,
+++<<<<<<< HEAD
+ +#ifdef __KERNEL__
+ +	RH_IPV4_DEVCONF_BASE = IPV4_DEVCONF_DROP_GRATUITOUS_ARP,
+ +#endif
+++=======
++ 	IPV4_DEVCONF_BC_FORWARDING,
+++>>>>>>> 5cbf777cfdf6 (route: add support for directed broadcast forwarding)
+  	__IPV4_DEVCONF_MAX
+  };
+  
+diff --git a/include/linux/inetdevice.h b/include/linux/inetdevice.h
+index 2b5eb4d78e83..89b33e834e3e 100644
+--- a/include/linux/inetdevice.h
++++ b/include/linux/inetdevice.h
+@@ -97,6 +97,7 @@ static inline void ipv4_devconf_setall(struct in_device *in_dev)
+ 
+ #define IN_DEV_FORWARD(in_dev)		IN_DEV_CONF_GET((in_dev), FORWARDING)
+ #define IN_DEV_MFORWARD(in_dev)		IN_DEV_ANDCONF((in_dev), MC_FORWARDING)
++#define IN_DEV_BFORWARD(in_dev)		IN_DEV_ANDCONF((in_dev), BC_FORWARDING)
+ #define IN_DEV_RPFILTER(in_dev)		IN_DEV_MAXCONF((in_dev), RP_FILTER)
+ #define IN_DEV_SRC_VMARK(in_dev)    	IN_DEV_ORCONF((in_dev), SRC_VMARK)
+ #define IN_DEV_SOURCE_ROUTE(in_dev)	IN_DEV_ANDCONF((in_dev), \
+* Unmerged path include/uapi/linux/ip.h
+diff --git a/include/uapi/linux/netconf.h b/include/uapi/linux/netconf.h
+index c84fcdfca862..fac4edd55379 100644
+--- a/include/uapi/linux/netconf.h
++++ b/include/uapi/linux/netconf.h
+@@ -18,6 +18,7 @@ enum {
+ 	NETCONFA_PROXY_NEIGH,
+ 	NETCONFA_IGNORE_ROUTES_WITH_LINKDOWN,
+ 	NETCONFA_INPUT,
++	NETCONFA_BC_FORWARDING,
+ 	__NETCONFA_MAX
+ };
+ #define NETCONFA_MAX	(__NETCONFA_MAX - 1)
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index 6e4c250c669a..37adc3f1d5b3 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -1827,6 +1827,8 @@ static int inet_netconf_msgsize_devconf(int type)
+ 		size += nla_total_size(4);
+ 	if (all || type == NETCONFA_MC_FORWARDING)
+ 		size += nla_total_size(4);
++	if (all || type == NETCONFA_BC_FORWARDING)
++		size += nla_total_size(4);
+ 	if (all || type == NETCONFA_PROXY_NEIGH)
+ 		size += nla_total_size(4);
+ 	if (all || type == NETCONFA_IGNORE_ROUTES_WITH_LINKDOWN)
+@@ -1873,6 +1875,10 @@ static int inet_netconf_fill_devconf(struct sk_buff *skb, int ifindex,
+ 	    nla_put_s32(skb, NETCONFA_MC_FORWARDING,
+ 			IPV4_DEVCONF(*devconf, MC_FORWARDING)) < 0)
+ 		goto nla_put_failure;
++	if ((all || type == NETCONFA_BC_FORWARDING) &&
++	    nla_put_s32(skb, NETCONFA_BC_FORWARDING,
++			IPV4_DEVCONF(*devconf, BC_FORWARDING)) < 0)
++		goto nla_put_failure;
+ 	if ((all || type == NETCONFA_PROXY_NEIGH) &&
+ 	    nla_put_s32(skb, NETCONFA_PROXY_NEIGH,
+ 			IPV4_DEVCONF(*devconf, PROXY_ARP)) < 0)
+@@ -2143,6 +2149,10 @@ static int devinet_conf_proc(struct ctl_table *ctl, int write,
+ 			if ((new_value == 0) && (old_value != 0))
+ 				rt_cache_flush(net);
+ 
++		if (i == IPV4_DEVCONF_BC_FORWARDING - 1 &&
++		    new_value != old_value)
++			rt_cache_flush(net);
++
+ 		if (i == IPV4_DEVCONF_RP_FILTER - 1 &&
+ 		    new_value != old_value) {
+ 			ifindex = devinet_conf_ifindex(net, cnf);
+@@ -2259,6 +2269,7 @@ static struct devinet_sysctl_table {
+ 		DEVINET_SYSCTL_COMPLEX_ENTRY(FORWARDING, "forwarding",
+ 					     devinet_sysctl_forward),
+ 		DEVINET_SYSCTL_RO_ENTRY(MC_FORWARDING, "mc_forwarding"),
++		DEVINET_SYSCTL_RW_ENTRY(BC_FORWARDING, "bc_forwarding"),
+ 
+ 		DEVINET_SYSCTL_RW_ENTRY(ACCEPT_REDIRECTS, "accept_redirects"),
+ 		DEVINET_SYSCTL_RW_ENTRY(SECURE_REDIRECTS, "secure_redirects"),
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index f3ea5115d727..341b180bcc68 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2000,8 +2000,11 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 		goto no_route;
+ 	}
+ 
+-	if (res->type == RTN_BROADCAST)
++	if (res->type == RTN_BROADCAST) {
++		if (IN_DEV_BFORWARD(in_dev))
++			goto make_route;
+ 		goto brd_input;
++	}
+ 
+ 	if (res->type == RTN_LOCAL) {
+ 		err = fib_validate_source(skb, saddr, daddr, tos,
+@@ -2018,6 +2021,7 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ 	if (res->type != RTN_UNICAST)
+ 		goto martian_destination;
+ 
++make_route:
+ 	err = ip_mkroute_input(skb, res, in_dev, daddr, saddr, tos, flkeys);
+ out:	return err;
+ 
