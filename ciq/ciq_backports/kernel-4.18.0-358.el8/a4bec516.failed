@@ -1,0 +1,144 @@
+powerpc/cacheinfo: Lookup cache by dt node and thread-group id
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+commit a4bec516b9c0823d7e2bb8c8928c98b535cf9adf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a4bec516.failed
+
+Currently the cacheinfo code on powerpc indexes the "cache" objects
+(modelling the L1/L2/L3 caches) where the key is device-tree node
+corresponding to that cache. On some of the POWER server platforms
+thread-groups within the core share different sets of caches (Eg: On
+SMT8 POWER9 systems, threads 0,2,4,6 of a core share L1 cache and
+threads 1,3,5,7 of the same core share another L1 cache). On such
+platforms, there is a single device-tree node corresponding to that
+cache and the cache-configuration within the threads of the core is
+indicated via "ibm,thread-groups" device-tree property.
+
+Since the current code is not aware of the "ibm,thread-groups"
+property, on the aforementoined systems, cacheinfo code still treats
+all the threads in the core to be sharing the cache because of the
+single device-tree node (In the earlier example, the cacheinfo code
+would says CPUs 0-7 share L1 cache).
+
+In this patch, we make the powerpc cacheinfo code aware of the
+"ibm,thread-groups" property. We indexe the "cache" objects by the
+key-pair (device-tree node, thread-group id). For any CPUX, for a
+given level of cache, the thread-group id is defined to be the first
+CPU in the "ibm,thread-groups" cache-group containing CPUX. For levels
+of cache which are not represented in "ibm,thread-groups" property,
+the thread-group id is -1.
+
+[parth: Remove "static" keyword for the definition of "thread_group_l1_cache_map"
+and "thread_group_l2_cache_map" to get rid of the compile error.]
+
+	Signed-off-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+	Signed-off-by: Parth Shah <parth@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20210728175607.591679-2-parth@linux.ibm.com
+
+(cherry picked from commit a4bec516b9c0823d7e2bb8c8928c98b535cf9adf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/cacheinfo.c
+diff --cc arch/powerpc/kernel/cacheinfo.c
+index e8624e52e669,5a6925d87424..000000000000
+--- a/arch/powerpc/kernel/cacheinfo.c
++++ b/arch/powerpc/kernel/cacheinfo.c
+@@@ -353,25 -359,24 +360,30 @@@ static int cache_is_unified_d(const str
+  		CACHE_TYPE_UNIFIED_D : CACHE_TYPE_UNIFIED;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + */
+ +static struct cache *cache_do_one_devnode_unified(struct device_node *node, int level)
+++=======
++ static struct cache *cache_do_one_devnode_unified(struct device_node *node, int group_id,
++ 						  int level)
+++>>>>>>> a4bec516b9c0 (powerpc/cacheinfo: Lookup cache by dt node and thread-group id)
+  {
+ -	pr_debug("creating L%d ucache for %pOFP\n", level, node);
+ +	pr_debug("creating L%d ucache for %pOF\n", level, node);
+  
+- 	return new_cache(cache_is_unified_d(node), level, node);
++ 	return new_cache(cache_is_unified_d(node), level, node, group_id);
+  }
+  
+- static struct cache *cache_do_one_devnode_split(struct device_node *node,
++ static struct cache *cache_do_one_devnode_split(struct device_node *node, int group_id,
+  						int level)
+  {
+  	struct cache *dcache, *icache;
+  
+ -	pr_debug("creating L%d dcache and icache for %pOFP\n", level,
+ +	pr_debug("creating L%d dcache and icache for %pOF\n", level,
+  		 node);
+  
+- 	dcache = new_cache(CACHE_TYPE_DATA, level, node);
+- 	icache = new_cache(CACHE_TYPE_INSTRUCTION, level, node);
++ 	dcache = new_cache(CACHE_TYPE_DATA, level, node, group_id);
++ 	icache = new_cache(CACHE_TYPE_INSTRUCTION, level, node, group_id);
+  
+  	if (!dcache || !icache)
+  		goto err;
+@@@ -427,11 -442,37 +440,31 @@@ static void link_cache_lists(struct cac
+  
+  static void do_subsidiary_caches_debugcheck(struct cache *cache)
+  {
+ -	WARN_ONCE(cache->level != 1,
+ -		  "instantiating cache chain from L%d %s cache for "
+ -		  "%pOFP instead of an L1\n", cache->level,
+ -		  cache_type_string(cache), cache->ofnode);
+ -	WARN_ONCE(!of_node_is_type(cache->ofnode, "cpu"),
+ -		  "instantiating cache chain from node %pOFP of type '%s' "
+ -		  "instead of a cpu node\n", cache->ofnode,
+ -		  of_node_get_device_type(cache->ofnode));
+ +	WARN_ON_ONCE(cache->level != 1);
+ +	WARN_ON_ONCE(strcmp(cache->ofnode->type, "cpu"));
+  }
+  
+- static void do_subsidiary_caches(struct cache *cache)
++ /*
++  * If sub-groups of threads in a core containing @cpu_id share the
++  * L@level-cache (information obtained via "ibm,thread-groups"
++  * device-tree property), then we identify the group by the first
++  * thread-sibling in the group. We define this to be the group-id.
++  *
++  * In the absence of any thread-group information for L@level-cache,
++  * this function returns -1.
++  */
++ static int get_group_id(unsigned int cpu_id, int level)
++ {
++ 	if (has_big_cores && level == 1)
++ 		return cpumask_first(per_cpu(thread_group_l1_cache_map,
++ 					     cpu_id));
++ 	else if (thread_group_shares_l2 && level == 2)
++ 		return cpumask_first(per_cpu(thread_group_l2_cache_map,
++ 					     cpu_id));
++ 	return -1;
++ }
++ 
++ static void do_subsidiary_caches(struct cache *cache, unsigned int cpu_id)
+  {
+  	struct device_node *subcache_node;
+  	int level = cache->level;
+diff --git a/arch/powerpc/include/asm/smp.h b/arch/powerpc/include/asm/smp.h
+index 99568f469c8e..8f7bf510ae5c 100644
+--- a/arch/powerpc/include/asm/smp.h
++++ b/arch/powerpc/include/asm/smp.h
+@@ -38,6 +38,9 @@ extern void cpu_die(void);
+ extern int cpu_to_chip_id(int cpu);
+ extern int *chip_id_lookup_table;
+ 
++DECLARE_PER_CPU(cpumask_var_t, thread_group_l1_cache_map);
++DECLARE_PER_CPU(cpumask_var_t, thread_group_l2_cache_map);
++
+ #ifdef CONFIG_SMP
+ 
+ struct smp_ops_t {
+* Unmerged path arch/powerpc/kernel/cacheinfo.c
