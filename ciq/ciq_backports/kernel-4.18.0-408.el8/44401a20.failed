@@ -1,0 +1,174 @@
+KVM: Optimize overlapping memslots check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+commit 44401a204734ce837e0b36c8418af4fad6a21f95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/44401a20.failed
+
+Do a quick lookup for possibly overlapping gfns when creating or moving
+a memslot instead of performing a linear scan of the whole memslot set.
+
+	Signed-off-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+[sean: tweaked params to avoid churn in future cleanup]
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <a4795e5c2f624754e9c0aab023ebda1966feb3e1.1638817641.git.maciej.szmigiero@oracle.com>
+(cherry picked from commit 44401a204734ce837e0b36c8418af4fad6a21f95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index b1373f69ce5e,d27568b3b984..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1460,59 -1788,46 +1460,72 @@@ static int kvm_set_memslot(struct kvm *
+  	}
+  
+  	/*
+ -	 * For DELETE and MOVE, the working slot is now active as the INVALID
+ -	 * version of the old slot.  MOVE is particularly special as it reuses
+ -	 * the old slot and returns a copy of the old slot (in working_slot).
+ -	 * For CREATE, there is no old slot.  For DELETE and FLAGS_ONLY, the
+ -	 * old slot is detached but otherwise preserved.
+ +	 * Make a full copy of the old memslot, the pointer will become stale
+ +	 * when the memslots are re-sorted by update_memslots(), and the old
+ +	 * memslot needs to be referenced after calling update_memslots(), e.g.
+ +	 * to free its resources and for arch specific behavior.  This needs to
+ +	 * happen *after* (re)acquiring slots_arch_lock.
+  	 */
+ -	if (change == KVM_MR_CREATE)
+ -		kvm_create_memslot(kvm, new, working);
+ -	else if (change == KVM_MR_DELETE)
+ -		kvm_delete_memslot(kvm, old, working);
+ -	else if (change == KVM_MR_MOVE)
+ -		old = kvm_move_memslot(kvm, old, new, working);
+ -	else if (change == KVM_MR_FLAGS_ONLY)
+ -		kvm_update_flags_memslot(kvm, old, new, working);
+ -	else
+ -		BUG();
+ +	slot = id_to_memslot(slots, new->id);
+ +	if (slot) {
+ +		old = *slot;
+ +	} else {
+ +		WARN_ON_ONCE(change != KVM_MR_CREATE);
+ +		memset(&old, 0, sizeof(old));
+ +		old.id = new->id;
+ +		old.as_id = new->as_id;
+ +	}
+ +
+ +	/* Copy the arch-specific data, again after (re)acquiring slots_arch_lock. */
+ +	memcpy(&new->arch, &old.arch, sizeof(old.arch));
+ +
+ +	r = kvm_arch_prepare_memory_region(kvm, new, mem, change);
+ +	if (r)
+ +		goto out_slots;
+ +
+ +	update_memslots(slots, new, change);
+ +	slots = install_new_memslots(kvm, new->as_id, slots);
+  
+  	/*
+ -	 * No need to refresh new->arch, changes after dropping slots_arch_lock
+ -	 * will directly hit the final, active memsot.  Architectures are
+ -	 * responsible for knowing that new->arch may be stale.
+ +	 * Update the total number of memslot pages before calling the arch
+ +	 * hook so that architectures can consume the result directly.
+  	 */
+ -	kvm_commit_memory_region(kvm, old, new, change);
+ +	if (change == KVM_MR_DELETE)
+ +		kvm->nr_memslot_pages -= old.npages;
+ +	else if (change == KVM_MR_CREATE)
+ +		kvm->nr_memslot_pages += new->npages;
+ +
+ +	kvm_arch_commit_memory_region(kvm, mem, &old, new, change);
+ +
+ +	/* Free the old memslot's metadata.  Note, this is the full copy!!! */
+ +	if (change == KVM_MR_DELETE)
+ +		kvm_free_memslot(kvm, &old);
+  
+ +	kvfree(slots);
+  	return 0;
+ +
+ +out_slots:
+ +	if (change == KVM_MR_DELETE || change == KVM_MR_MOVE)
+ +		slots = install_new_memslots(kvm, new->as_id, slots);
+ +	else
+ +		mutex_unlock(&kvm->slots_arch_lock);
+ +	kvfree(slots);
+ +	return r;
+  }
+  
++ static bool kvm_check_memslot_overlap(struct kvm_memslots *slots, int id,
++ 				      gfn_t start, gfn_t end)
++ {
++ 	struct kvm_memslot_iter iter;
++ 
++ 	kvm_for_each_memslot_in_gfn_range(&iter, slots, start, end) {
++ 		if (iter.slot->id != id)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+  /*
+   * Allocate some memory and give it an address in the guest physical address
+   * space.
+@@@ -1606,46 -1923,14 +1622,53 @@@ int __kvm_set_memory_region(struct kvm 
+  			change = KVM_MR_FLAGS_ONLY;
+  		else /* Nothing to change. */
+  			return 0;
+ +
+ +		/* Copy dirty_bitmap from the current memslot. */
+ +		new.dirty_bitmap = old.dirty_bitmap;
+  	}
+  
+++<<<<<<< HEAD
+ +	if ((change == KVM_MR_CREATE) || (change == KVM_MR_MOVE)) {
+ +		/* Check for overlaps */
+ +		kvm_for_each_memslot(tmp, __kvm_memslots(kvm, as_id)) {
+ +			if (tmp->id == id)
+ +				continue;
+ +			if (!((new.base_gfn + new.npages <= tmp->base_gfn) ||
+ +			      (new.base_gfn >= tmp->base_gfn + tmp->npages)))
+ +				return -EEXIST;
+ +		}
+ +	}
+++=======
++ 	if ((change == KVM_MR_CREATE || change == KVM_MR_MOVE) &&
++ 	    kvm_check_memslot_overlap(slots, id, new.base_gfn,
++ 				      new.base_gfn + new.npages))
++ 		return -EEXIST;
+++>>>>>>> 44401a204734 (KVM: Optimize overlapping memslots check)
+ +
+ +	/* Allocate/free page dirty bitmap as needed */
+ +	if (!(new.flags & KVM_MEM_LOG_DIRTY_PAGES))
+ +		new.dirty_bitmap = NULL;
+ +	else if (!new.dirty_bitmap && !kvm->dirty_ring_size) {
+ +		r = kvm_alloc_dirty_bitmap(&new);
+ +		if (r)
+ +			return r;
+ +
+ +		if (kvm_dirty_log_manual_protect_and_init_set(kvm))
+ +			bitmap_set(new.dirty_bitmap, 0, new.npages);
+ +	}
+ +
+ +	r = kvm_set_memslot(kvm, mem, &new, change);
+ +	if (r)
+ +		goto out_bitmap;
+  
+ -	return kvm_set_memslot(kvm, old, &new, change);
+ +	if (old.dirty_bitmap && !new.dirty_bitmap)
+ +		kvm_destroy_dirty_bitmap(&old);
+ +	return 0;
+ +
+ +out_bitmap:
+ +	if (new.dirty_bitmap && !old.dirty_bitmap)
+ +		kvm_destroy_dirty_bitmap(&new);
+ +	return r;
+  }
+  EXPORT_SYMBOL_GPL(__kvm_set_memory_region);
+  
+* Unmerged path virt/kvm/kvm_main.c
