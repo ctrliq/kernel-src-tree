@@ -1,0 +1,249 @@
+mm: memcontrol/slab: Use helpers to access slab page's memcg_data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 270c6a71460e12b07b1dcadf7457ff95b6c6e8f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/270c6a71.failed
+
+To gather all direct accesses to struct page's memcg_data field in one
+place, let's introduce 3 new helpers to use in the slab accounting code:
+
+  struct obj_cgroup **page_objcgs(struct page *page);
+  struct obj_cgroup **page_objcgs_check(struct page *page);
+  bool set_page_objcgs(struct page *page, struct obj_cgroup **objcgs);
+
+They are similar to the corresponding API for generic pages, except that
+the setter can return false, indicating that the value has been already
+set from a different thread.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Link: https://lkml.kernel.org/r/20201027001657.3398190-3-guro@fb.com
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-3-guro@fb.com
+(cherry picked from commit 270c6a71460e12b07b1dcadf7457ff95b6c6e8f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+#	mm/slab.h
+diff --cc include/linux/memcontrol.h
+index 748026eb20df,c7ac0a5b8989..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -408,6 -343,143 +408,146 @@@ struct mem_cgroup 
+  
+  extern struct mem_cgroup *root_mem_cgroup;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * page_memcg - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	return (struct mem_cgroup *)page->memcg_data;
++ }
++ 
++ /*
++  * page_memcg_rcu - locklessly get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  */
++ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	WARN_ON_ONCE(!rcu_read_lock_held());
++ 
++ 	return (struct mem_cgroup *)READ_ONCE(page->memcg_data);
++ }
++ 
++ /*
++  * page_memcg_check - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function unlike page_memcg() can take any  page
++  * as an argument. It has to be used in cases when it's not known if a page
++  * has an associated memory cgroup pointer or an object cgroups vector.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg_check(struct page *page)
++ {
++ 	/*
++ 	 * Because page->memcg_data might be changed asynchronously
++ 	 * for slab pages, READ_ONCE() should be used here.
++ 	 */
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	/*
++ 	 * The lowest bit set means that memcg isn't a valid
++ 	 * memcg pointer, but a obj_cgroups pointer.
++ 	 * In this case the page is shared and doesn't belong
++ 	 * to any specific memory cgroup.
++ 	 */
++ 	if (memcg_data & 0x1UL)
++ 		return NULL;
++ 
++ 	return (struct mem_cgroup *)memcg_data;
++ }
++ 
++ #ifdef CONFIG_MEMCG_KMEM
++ /*
++  * page_objcgs - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function assumes that the page is known to have an
++  * associated object cgroups vector. It's not safe to call this function
++  * against pages, which might have an associated memory cgroup: e.g.
++  * kernel stack pages.
++  */
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	return (struct obj_cgroup **)(READ_ONCE(page->memcg_data) & ~0x1UL);
++ }
++ 
++ /*
++  * page_objcgs_check - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function is safe to use if the page can be directly associated
++  * with a memory cgroup.
++  */
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	if (memcg_data && (memcg_data & 0x1UL))
++ 		return (struct obj_cgroup **)(memcg_data & ~0x1UL);
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * set_page_objcgs - associate a page with a object cgroups vector
++  * @page: a pointer to the page struct
++  * @objcgs: a pointer to the object cgroups vector
++  *
++  * Atomically associates a page with a vector of object cgroups.
++  */
++ static inline bool set_page_objcgs(struct page *page,
++ 					struct obj_cgroup **objcgs)
++ {
++ 	return !cmpxchg(&page->memcg_data, 0, (unsigned long)objcgs | 0x1UL);
++ }
++ #else
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline bool set_page_objcgs(struct page *page,
++ 					struct obj_cgroup **objcgs)
++ {
++ 	return true;
++ }
++ #endif
++ 
+++>>>>>>> 270c6a71460e (mm: memcontrol/slab: Use helpers to access slab page's memcg_data)
+  static __always_inline bool memcg_stat_item_in_bytes(int idx)
+  {
+  	if (idx == MEMCG_PERCPU_B)
+diff --cc mm/memcontrol.c
+index e4ee0600b869,0054b4846770..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2871,8 -2899,7 +2871,12 @@@ int memcg_alloc_page_obj_cgroups(struc
+  	if (!vec)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (cmpxchg(&page->obj_cgroups, NULL,
+ +		    (struct obj_cgroup **) ((unsigned long)vec | 0x1UL)))
+++=======
++ 	if (!set_page_objcgs(page, vec))
+++>>>>>>> 270c6a71460e (mm: memcontrol/slab: Use helpers to access slab page's memcg_data)
+  		kfree(vec);
+  	else
+  		kmemleak_not_leak(vec);
+diff --cc mm/slab.h
+index 830ef5b0d4de,9a54a0cb5cca..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -269,30 -239,13 +269,38 @@@ static inline bool kmem_cache_debug_fla
+  }
+  
+  #ifdef CONFIG_MEMCG_KMEM
+++<<<<<<< HEAD
+ +static inline struct obj_cgroup **page_obj_cgroups(struct page *page)
+ +{
+ +	/*
+ +	 * page->mem_cgroup and page->obj_cgroups are sharing the same
+ +	 * space. To distinguish between them in case we don't know for sure
+ +	 * that the page is a slab page (e.g. page_cgroup_ino()), let's
+ +	 * always set the lowest bit of obj_cgroups.
+ +	 */
+ +	return (struct obj_cgroup **)
+ +		((unsigned long)page->obj_cgroups & ~0x1UL);
+ +}
+ +
+ +static inline bool page_has_obj_cgroups(struct page *page)
+ +{
+ +	return ((unsigned long)page->obj_cgroups & 0x1UL);
+ +}
+ +
+++=======
+++>>>>>>> 270c6a71460e (mm: memcontrol/slab: Use helpers to access slab page's memcg_data)
+  int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
+  				 gfp_t gfp);
+  
+  static inline void memcg_free_page_obj_cgroups(struct page *page)
+  {
+++<<<<<<< HEAD
+ +	kfree(page_obj_cgroups(page));
+ +	page->obj_cgroups = NULL;
+++=======
++ 	kfree(page_objcgs(page));
++ 	page->memcg_data = 0;
+++>>>>>>> 270c6a71460e (mm: memcontrol/slab: Use helpers to access slab page's memcg_data)
+  }
+  
+  static inline size_t obj_full_size(struct kmem_cache *s)
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/slab.h
