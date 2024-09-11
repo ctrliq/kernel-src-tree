@@ -1,0 +1,151 @@
+x86/fpu: Don't use current->mm to check for a kthread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8d3289f2fa1e0c7e2f72c7352f1efb75d2ad7c76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/8d3289f2.failed
+
+current->mm can be non-NULL if a kthread calls use_mm(). Check for
+PF_KTHREAD instead to decide when to store user mode FP state.
+
+Fixes: 2722146eb784 ("x86/fpu: Remove fpu->initialized")
+	Reported-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Aubrey Li <aubrey.li@intel.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Nicolai Stange <nstange@suse.de>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20190604175411.GA27477@lst.de
+(cherry picked from commit 8d3289f2fa1e0c7e2f72c7352f1efb75d2ad7c76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/internal.h
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/include/asm/fpu/internal.h
+index 8265ef2d693b,4c95c365058a..000000000000
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@@ -513,6 -529,25 +513,28 @@@ static inline void fpregs_activate(stru
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Internal helper, do not use directly. Use switch_fpu_return() instead.
++  */
++ static inline void __fpregs_load_activate(void)
++ {
++ 	struct fpu *fpu = &current->thread.fpu;
++ 	int cpu = smp_processor_id();
++ 
++ 	if (WARN_ON_ONCE(current->flags & PF_KTHREAD))
++ 		return;
++ 
++ 	if (!fpregs_state_valid(fpu, cpu)) {
++ 		copy_kernel_to_fpregs(&fpu->state);
++ 		fpregs_activate(fpu);
++ 		fpu->last_cpu = cpu;
++ 	}
++ 	clear_thread_flag(TIF_NEED_FPU_LOAD);
++ }
++ 
++ /*
+++>>>>>>> 8d3289f2fa1e (x86/fpu: Don't use current->mm to check for a kthread)
+   * FPU state switching for scheduling.
+   *
+   * This is a two-stage process:
+@@@ -520,13 -555,23 +542,33 @@@
+   *  - switch_fpu_prepare() saves the old state.
+   *    This is done within the context of the old process.
+   *
+++<<<<<<< HEAD
+ + *  - switch_fpu_finish() restores the new state as
+ + *    necessary.
+++=======
++  *  - switch_fpu_finish() sets TIF_NEED_FPU_LOAD; the floating point state
++  *    will get loaded on return to userspace, or when the kernel needs it.
++  *
++  * If TIF_NEED_FPU_LOAD is cleared then the CPU's FPU registers
++  * are saved in the current thread's FPU register state.
++  *
++  * If TIF_NEED_FPU_LOAD is set then CPU's FPU registers may not
++  * hold current()'s FPU registers. It is required to load the
++  * registers before returning to userland or using the content
++  * otherwise.
++  *
++  * The FPU context is only stored/restored for a user task and
++  * PF_KTHREAD is used to distinguish between kernel and user threads.
+++>>>>>>> 8d3289f2fa1e (x86/fpu: Don't use current->mm to check for a kthread)
+   */
+ -static inline void switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+ +static inline void
+ +switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+  {
+++<<<<<<< HEAD
+ +	if (static_cpu_has(X86_FEATURE_FPU) && old_fpu->initialized) {
+++=======
++ 	if (static_cpu_has(X86_FEATURE_FPU) && !(current->flags & PF_KTHREAD)) {
+++>>>>>>> 8d3289f2fa1e (x86/fpu: Don't use current->mm to check for a kthread)
+  		if (!copy_fpregs_to_fpstate(old_fpu))
+  			old_fpu->last_cpu = -1;
+  		else
+diff --cc arch/x86/kernel/fpu/core.c
+index eb3de7cdd906,649fbc3fcf9f..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -101,28 -102,23 +101,40 @@@ void __kernel_fpu_begin(void
+  
+  	kernel_fpu_disable();
+  
+++<<<<<<< HEAD
+ +	if (fpu->initialized) {
+ +		/*
+ +		 * Ignore return value -- we don't care if reg state
+ +		 * is clobbered.
+ +		 */
+ +		copy_fpregs_to_fpstate(fpu);
+ +	} else {
+ +		__cpu_invalidate_fpregs_state();
+++=======
++ 	if (!(current->flags & PF_KTHREAD)) {
++ 		if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
++ 			set_thread_flag(TIF_NEED_FPU_LOAD);
++ 			/*
++ 			 * Ignore return value -- we don't care if reg state
++ 			 * is clobbered.
++ 			 */
++ 			copy_fpregs_to_fpstate(fpu);
++ 		}
+++>>>>>>> 8d3289f2fa1e (x86/fpu: Don't use current->mm to check for a kthread)
+  	}
+ -	__cpu_invalidate_fpregs_state();
+  }
+ +EXPORT_SYMBOL(__kernel_fpu_begin);
+  
+ -static void __kernel_fpu_end(void)
+ +void __kernel_fpu_end(void)
+  {
+ +	struct fpu *fpu = &current->thread.fpu;
+ +
+ +	if (fpu->initialized)
+ +		copy_kernel_to_fpregs(&fpu->state);
+ +
+  	kernel_fpu_enable();
+  }
+ +EXPORT_SYMBOL(__kernel_fpu_end);
+  
+  void kernel_fpu_begin(void)
+  {
+* Unmerged path arch/x86/include/asm/fpu/internal.h
+* Unmerged path arch/x86/kernel/fpu/core.c
