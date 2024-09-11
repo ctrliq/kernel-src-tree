@@ -248,6 +248,11 @@ ifeq ($(RETPOLINE_CFLAGS),)
   $(error You are building kernel with non-retpoline compiler, please update your compiler.)
 endif
   KBUILD_CFLAGS += $(RETPOLINE_CFLAGS)
+  # Additionally, avoid generating expensive indirect jumps which
+  # are subject to retpolines for small number of switch cases.
+  # clang turns off jump table generation by default when under
+  # retpoline builds, however, gcc does not for x86.
+  KBUILD_CFLAGS += $(call cc-option,--param=case-values-threshold=20)
 endif
 
 archscripts: scripts_basic
