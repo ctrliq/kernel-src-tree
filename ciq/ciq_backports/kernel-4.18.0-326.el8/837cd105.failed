@@ -1,0 +1,298 @@
+s390/ap: ap bus userspace notifications for some bus conditions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 837cd1059a985ee610e4b72dcdddb287e7b97de0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/837cd105.failed
+
+This patch adds notifications to userspace for two important
+conditions of the ap bus:
+
+I) Initial ap bus scan done. This indicates that the initial
+   scan of all the ap devices (cards, queues) is complete and
+   ap devices have been build up for all the hardware found.
+   This condition is signaled with
+   1) An ap bus change uevent send to userspace with an environment
+      key/value pair "INITSCAN=done":
+	# udevadm monitor -k -p
+	...
+	KERNEL[97.830919] change   /devices/ap (ap)
+	ACTION=change
+	DEVPATH=/devices/ap
+	SUBSYSTEM=ap
+	INITSCAN=done
+	SEQNUM=10421
+   2) A sysfs attribute /sys/bus/ap/scans which shows the
+      number of completed ap bus scans done since bus init.
+      So a value of 1 or greater signals that the initial
+      ap bus scan is complete.
+   Note: The initial ap bus scan complete condition is fulfilled
+   and will be signaled even if there was no ap resource found.
+
+II) APQN driver bindings complete. This indicates that all
+    APQNs have been bound to an zcrypt or alternate device
+    driver. Only with the help of an device driver an APQN
+    can be used for crypto load. So the binding complete
+    condition is the starting point for user space to be
+    sure all crypto resources on the ap bus are available
+    for use.
+    This condition is signaled with
+    1) An ap bus change uevent send to userspace with an environment
+       key/value pair "BINDINGS=complete":
+	 # udevadm monitor -k -p
+	 ...
+	 KERNEL[97.830975] change   /devices/ap (ap)
+	 ACTION=change
+	 DEVPATH=/devices/ap
+	 SUBSYSTEM=ap
+	 BINDINGS=complete
+	 SEQNUM=10422
+    2) A sysfs attribute /sys/bus/ap/bindings showing
+	 "<nr of bound apqns>/<total nr of apqns> (complete)"
+       when all available apqns have been bound to device drivers, or
+	 "<nr of bound apqns>/<total nr of apqns>"
+       when there are some apqns not bound to an device driver.
+    Note: The binding complete condition is also fulfilled, when
+    there are no apqns available to bind any device driver. In
+    this case the binding complete will be signaled AFTER init
+    scan is done.
+    Note: This condition may arise multiple times when after
+    initial scan modifications on the bindings take place. For
+    example a manual unbind of an APQN switches the binding
+    complete condition off. When at a later time the unbound APQNs
+    are bound with an device driver the binding is (again) complete
+    resulting in another uevent and marking the bindings sysfs
+    attribute with '(complete)'.
+
+There is also a new function to be used within the kernel:
+
+  int ap_wait_init_apqn_bindings_complete(unsigned long timeout)
+
+Interface to wait for the AP bus to have done one initial ap bus
+scan and all detected APQNs have been bound to device drivers.
+If these both conditions are not fulfilled, this function blocks
+on a condition with wait_for_completion_interruptible_timeout().
+If these both conditions are fulfilled (before the timeout hits)
+the return value is 0. If the timeout (in jiffies) hits instead
+-ETIME is returned. On failures negative return values are
+returned to the caller. Please note that further unbind/bind
+actions after initial binding complete is through do not cause this
+function to block again.
+
+	Reviewed-by: Ingo Franzki <ifranzki@linux.ibm.com>
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 837cd1059a985ee610e4b72dcdddb287e7b97de0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index f7931881105c,13bd6b27f00e..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -588,67 -584,124 +595,171 @@@ static int ap_bus_match(struct device *
+   */
+  static int ap_uevent(struct device *dev, struct kobj_uevent_env *env)
+  {
++ 	int rc;
+  	struct ap_device *ap_dev = to_ap_dev(dev);
+- 	int retval = 0;
+  
+- 	if (!ap_dev)
+- 		return -ENODEV;
++ 	/* Uevents from ap bus core don't need extensions to the env */
++ 	if (dev == ap_root_device)
++ 		return 0;
+  
+  	/* Set up DEV_TYPE environment variable. */
+- 	retval = add_uevent_var(env, "DEV_TYPE=%04X", ap_dev->device_type);
+- 	if (retval)
+- 		return retval;
++ 	rc = add_uevent_var(env, "DEV_TYPE=%04X", ap_dev->device_type);
++ 	if (rc)
++ 		return rc;
+  
+  	/* Add MODALIAS= */
+- 	retval = add_uevent_var(env, "MODALIAS=ap:t%02X", ap_dev->device_type);
++ 	rc = add_uevent_var(env, "MODALIAS=ap:t%02X", ap_dev->device_type);
++ 	if (rc)
++ 		return rc;
+  
+- 	return retval;
++ 	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int ap_dev_suspend(struct device *dev)
+ +{
+ +	struct ap_device *ap_dev = to_ap_dev(dev);
+ +
+ +	if (ap_dev->drv && ap_dev->drv->suspend)
+ +		ap_dev->drv->suspend(ap_dev);
+ +	return 0;
+ +}
+ +
+ +static int ap_dev_resume(struct device *dev)
+ +{
+ +	struct ap_device *ap_dev = to_ap_dev(dev);
+ +
+ +	if (ap_dev->drv && ap_dev->drv->resume)
+ +		ap_dev->drv->resume(ap_dev);
+ +	return 0;
+ +}
+ +
+ +static void ap_bus_suspend(void)
+ +{
+ +	AP_DBF(DBF_DEBUG, "%s running\n", __func__);
+ +
+ +	ap_suspend_flag = 1;
+ +	/*
+ +	 * Disable scanning for devices, thus we do not want to scan
+ +	 * for them after removing.
+ +	 */
+ +	flush_work(&ap_scan_work);
+ +	tasklet_disable(&ap_tasklet);
+ +}
+ +
+ +static int __ap_card_devices_unregister(struct device *dev, void *dummy)
+ +{
+ +	if (is_card_dev(dev))
+ +		device_unregister(dev);
+ +	return 0;
+ +}
+ +
+ +static int __ap_queue_devices_unregister(struct device *dev, void *dummy)
+ +{
+ +	if (is_queue_dev(dev))
+ +		device_unregister(dev);
+ +	return 0;
+ +}
+++=======
++ static void ap_send_init_scan_done_uevent(void)
++ {
++ 	char *envp[] = { "INITSCAN=done", NULL };
++ 
++ 	kobject_uevent_env(&ap_root_device->kobj, KOBJ_CHANGE, envp);
++ }
++ 
++ static void ap_send_bindings_complete_uevent(void)
++ {
++ 	char *envp[] = { "BINDINGS=complete", NULL };
++ 
++ 	kobject_uevent_env(&ap_root_device->kobj, KOBJ_CHANGE, envp);
++ }
++ 
++ /*
++  * calc # of bound APQNs
++  */
++ 
++ struct __ap_calc_ctrs {
++ 	unsigned int apqns;
++ 	unsigned int bound;
++ };
++ 
++ static int __ap_calc_helper(struct device *dev, void *arg)
++ {
++ 	struct __ap_calc_ctrs *pctrs = (struct __ap_calc_ctrs *) arg;
++ 
++ 	if (is_queue_dev(dev)) {
++ 		pctrs->apqns++;
++ 		if ((to_ap_dev(dev))->drv)
++ 			pctrs->bound++;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void ap_calc_bound_apqns(unsigned int *apqns, unsigned int *bound)
++ {
++ 	struct __ap_calc_ctrs ctrs;
++ 
++ 	memset(&ctrs, 0, sizeof(ctrs));
++ 	bus_for_each_dev(&ap_bus_type, NULL, (void *) &ctrs, __ap_calc_helper);
++ 
++ 	*apqns = ctrs.apqns;
++ 	*bound = ctrs.bound;
++ }
++ 
++ /*
++  * After initial ap bus scan do check if all existing APQNs are
++  * bound to device drivers.
++  */
++ static void ap_check_bindings_complete(void)
++ {
++ 	unsigned int apqns, bound;
++ 
++ 	if (atomic64_read(&ap_scan_bus_count) >= 1) {
++ 		ap_calc_bound_apqns(&apqns, &bound);
++ 		if (bound == apqns) {
++ 			if (!completion_done(&ap_init_apqn_bindings_complete)) {
++ 				complete_all(&ap_init_apqn_bindings_complete);
++ 				AP_DBF(DBF_INFO, "%s complete\n", __func__);
++ 			}
++ 			ap_send_bindings_complete_uevent();
++ 		}
++ 	}
++ }
++ 
++ /*
++  * Interface to wait for the AP bus to have done one initial ap bus
++  * scan and all detected APQNs have been bound to device drivers.
++  * If these both conditions are not fulfilled, this function blocks
++  * on a condition with wait_for_completion_interruptible_timeout().
++  * If these both conditions are fulfilled (before the timeout hits)
++  * the return value is 0. If the timeout (in jiffies) hits instead
++  * -ETIME is returned. On failures negative return values are
++  * returned to the caller.
++  */
++ int ap_wait_init_apqn_bindings_complete(unsigned long timeout)
++ {
++ 	long l;
++ 
++ 	if (completion_done(&ap_init_apqn_bindings_complete))
++ 		return 0;
++ 
++ 	if (timeout)
++ 		l = wait_for_completion_interruptible_timeout(
++ 			&ap_init_apqn_bindings_complete, timeout);
++ 	else
++ 		l = wait_for_completion_interruptible(
++ 			&ap_init_apqn_bindings_complete);
++ 	if (l < 0)
++ 		return l == -ERESTARTSYS ? -EINTR : l;
++ 	else if (l == 0 && timeout)
++ 		return -ETIME;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(ap_wait_init_apqn_bindings_complete);
+++>>>>>>> 837cd1059a98 (s390/ap: ap bus userspace notifications for some bus conditions)
+  
+  static int __ap_queue_devices_with_id_unregister(struct device *dev, void *data)
+  {
+* Unmerged path drivers/s390/crypto/ap_bus.c
+diff --git a/drivers/s390/crypto/ap_bus.h b/drivers/s390/crypto/ap_bus.h
+index fa17a5ca4914..65b5bf4811f2 100644
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -355,4 +355,16 @@ int ap_parse_mask_str(const char *str,
+ 		      unsigned long *bitmap, int bits,
+ 		      struct mutex *lock);
+ 
++/*
++ * Interface to wait for the AP bus to have done one initial ap bus
++ * scan and all detected APQNs have been bound to device drivers.
++ * If these both conditions are not fulfilled, this function blocks
++ * on a condition with wait_for_completion_killable_timeout().
++ * If these both conditions are fulfilled (before the timeout hits)
++ * the return value is 0. If the timeout (in jiffies) hits instead
++ * -ETIME is returned. On failures negative return values are
++ * returned to the caller.
++ */
++int ap_wait_init_apqn_bindings_complete(unsigned long timeout);
++
+ #endif /* _AP_BUS_H_ */
