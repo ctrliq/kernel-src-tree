@@ -1,0 +1,258 @@
+bpf: Sockmap/tls, push write_space updates through ulp updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit 33bfe20dd7117dd81fd896a53f743a233e1ad64f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/33bfe20d.failed
+
+When sockmap sock with TLS enabled is removed we cleanup bpf/psock state
+and call tcp_update_ulp() to push updates to TLS ULP on top. However, we
+don't push the write_space callback up and instead simply overwrite the
+op with the psock stored previous op. This may or may not be correct so
+to ensure we don't overwrite the TLS write space hook pass this field to
+the ULP and have it fixup the ctx.
+
+This completes a previous fix that pushed the ops through to the ULP
+but at the time missed doing this for write_space, presumably because
+write_space TLS hook was added around the same time.
+
+Fixes: 95fa145479fbc ("bpf: sockmap/tls, close can race with map free")
+	Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Acked-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/bpf/20200111061206.8028-4-john.fastabend@gmail.com
+(cherry picked from commit 33bfe20dd7117dd81fd896a53f743a233e1ad64f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	include/net/tcp.h
+#	net/ipv4/tcp_ulp.c
+#	net/tls/tls_main.c
+diff --cc include/linux/skmsg.h
+index 2d292bb7d5db,14d61bba0b79..000000000000
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@@ -355,11 -359,21 +355,25 @@@ static inline void sk_psock_restore_pro
+  					  struct sk_psock *psock)
+  {
+  	sk->sk_prot->unhash = psock->saved_unhash;
+- 	sk->sk_write_space = psock->saved_write_space;
+  
+  	if (psock->sk_proto) {
+++<<<<<<< HEAD
+ +		sk->sk_prot = psock->sk_proto;
+++=======
++ 		struct inet_connection_sock *icsk = inet_csk(sk);
++ 		bool has_ulp = !!icsk->icsk_ulp_data;
++ 
++ 		if (has_ulp) {
++ 			tcp_update_ulp(sk, psock->sk_proto,
++ 				       psock->saved_write_space);
++ 		} else {
++ 			sk->sk_prot = psock->sk_proto;
++ 			sk->sk_write_space = psock->saved_write_space;
++ 		}
+++>>>>>>> 33bfe20dd711 (bpf: Sockmap/tls, push write_space updates through ulp updates)
+  		psock->sk_proto = NULL;
++ 	} else {
++ 		sk->sk_write_space = psock->saved_write_space;
+  	}
+  }
+  
+diff --cc include/net/tcp.h
+index 530bc36b1333,e6f48384dc71..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -2020,6 -2146,9 +2020,12 @@@ struct tcp_ulp_ops 
+  
+  	/* initialize ulp */
+  	int (*init)(struct sock *sk);
+++<<<<<<< HEAD
+++=======
++ 	/* update ulp */
++ 	void (*update)(struct sock *sk, struct proto *p,
++ 		       void (*write_space)(struct sock *sk));
+++>>>>>>> 33bfe20dd711 (bpf: Sockmap/tls, push write_space updates through ulp updates)
+  	/* cleanup ulp */
+  	void (*release)(struct sock *sk);
+  	/* diagnostic */
+@@@ -2034,6 -2163,8 +2040,11 @@@ void tcp_unregister_ulp(struct tcp_ulp_
+  int tcp_set_ulp(struct sock *sk, const char *name);
+  void tcp_get_available_ulp(char *buf, size_t len);
+  void tcp_cleanup_ulp(struct sock *sk);
+++<<<<<<< HEAD
+++=======
++ void tcp_update_ulp(struct sock *sk, struct proto *p,
++ 		    void (*write_space)(struct sock *sk));
+++>>>>>>> 33bfe20dd711 (bpf: Sockmap/tls, push write_space updates through ulp updates)
+  
+  #define MODULE_ALIAS_TCP_ULP(name)				\
+  	__MODULE_INFO(alias, alias_userspace, name);		\
+diff --cc net/ipv4/tcp_ulp.c
+index 95df7f7f6328,38d3ad141161..000000000000
+--- a/net/ipv4/tcp_ulp.c
++++ b/net/ipv4/tcp_ulp.c
+@@@ -95,6 -99,21 +95,24 @@@ void tcp_get_available_ulp(char *buf, s
+  	rcu_read_unlock();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void tcp_update_ulp(struct sock *sk, struct proto *proto,
++ 		    void (*write_space)(struct sock *sk))
++ {
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 
++ 	if (!icsk->icsk_ulp_ops) {
++ 		sk->sk_write_space = write_space;
++ 		sk->sk_prot = proto;
++ 		return;
++ 	}
++ 
++ 	if (icsk->icsk_ulp_ops->update)
++ 		icsk->icsk_ulp_ops->update(sk, proto, write_space);
++ }
++ 
+++>>>>>>> 33bfe20dd711 (bpf: Sockmap/tls, push write_space updates through ulp updates)
+  void tcp_cleanup_ulp(struct sock *sk)
+  {
+  	struct inet_connection_sock *icsk = inet_csk(sk);
+diff --cc net/tls/tls_main.c
+index fae5d01833f3,94774c0e5ff3..000000000000
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@@ -795,21 -731,111 +795,37 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +void tls_register_device(struct tls_device *device)
+ +{
+ +	mutex_lock(&device_mutex);
+ +	list_add_tail(&device->dev_list, &device_list);
+ +	mutex_unlock(&device_mutex);
+++=======
++ static void tls_update(struct sock *sk, struct proto *p,
++ 		       void (*write_space)(struct sock *sk))
++ {
++ 	struct tls_context *ctx;
++ 
++ 	ctx = tls_get_ctx(sk);
++ 	if (likely(ctx)) {
++ 		ctx->sk_write_space = write_space;
++ 		ctx->sk_proto = p;
++ 	} else {
++ 		sk->sk_prot = p;
++ 		sk->sk_write_space = write_space;
++ 	}
+++>>>>>>> 33bfe20dd711 (bpf: Sockmap/tls, push write_space updates through ulp updates)
+  }
+ +EXPORT_SYMBOL(tls_register_device);
+  
+ -static int tls_get_info(const struct sock *sk, struct sk_buff *skb)
+ -{
+ -	u16 version, cipher_type;
+ -	struct tls_context *ctx;
+ -	struct nlattr *start;
+ -	int err;
+ -
+ -	start = nla_nest_start_noflag(skb, INET_ULP_INFO_TLS);
+ -	if (!start)
+ -		return -EMSGSIZE;
+ -
+ -	rcu_read_lock();
+ -	ctx = rcu_dereference(inet_csk(sk)->icsk_ulp_data);
+ -	if (!ctx) {
+ -		err = 0;
+ -		goto nla_failure;
+ -	}
+ -	version = ctx->prot_info.version;
+ -	if (version) {
+ -		err = nla_put_u16(skb, TLS_INFO_VERSION, version);
+ -		if (err)
+ -			goto nla_failure;
+ -	}
+ -	cipher_type = ctx->prot_info.cipher_type;
+ -	if (cipher_type) {
+ -		err = nla_put_u16(skb, TLS_INFO_CIPHER, cipher_type);
+ -		if (err)
+ -			goto nla_failure;
+ -	}
+ -	err = nla_put_u16(skb, TLS_INFO_TXCONF, tls_user_config(ctx, true));
+ -	if (err)
+ -		goto nla_failure;
+ -
+ -	err = nla_put_u16(skb, TLS_INFO_RXCONF, tls_user_config(ctx, false));
+ -	if (err)
+ -		goto nla_failure;
+ -
+ -	rcu_read_unlock();
+ -	nla_nest_end(skb, start);
+ -	return 0;
+ -
+ -nla_failure:
+ -	rcu_read_unlock();
+ -	nla_nest_cancel(skb, start);
+ -	return err;
+ -}
+ -
+ -static size_t tls_get_info_size(const struct sock *sk)
+ -{
+ -	size_t size = 0;
+ -
+ -	size += nla_total_size(0) +		/* INET_ULP_INFO_TLS */
+ -		nla_total_size(sizeof(u16)) +	/* TLS_INFO_VERSION */
+ -		nla_total_size(sizeof(u16)) +	/* TLS_INFO_CIPHER */
+ -		nla_total_size(sizeof(u16)) +	/* TLS_INFO_RXCONF */
+ -		nla_total_size(sizeof(u16)) +	/* TLS_INFO_TXCONF */
+ -		0;
+ -
+ -	return size;
+ -}
+ -
+ -static int __net_init tls_init_net(struct net *net)
+ -{
+ -	int err;
+ -
+ -	net->mib.tls_statistics = alloc_percpu(struct linux_tls_mib);
+ -	if (!net->mib.tls_statistics)
+ -		return -ENOMEM;
+ -
+ -	err = tls_proc_init(net);
+ -	if (err)
+ -		goto err_free_stats;
+ -
+ -	return 0;
+ -err_free_stats:
+ -	free_percpu(net->mib.tls_statistics);
+ -	return err;
+ -}
+ -
+ -static void __net_exit tls_exit_net(struct net *net)
+ +void tls_unregister_device(struct tls_device *device)
+  {
+ -	tls_proc_fini(net);
+ -	free_percpu(net->mib.tls_statistics);
+ +	mutex_lock(&device_mutex);
+ +	list_del(&device->dev_list);
+ +	mutex_unlock(&device_mutex);
+  }
+ -
+ -static struct pernet_operations tls_proc_ops = {
+ -	.init = tls_init_net,
+ -	.exit = tls_exit_net,
+ -};
+ +EXPORT_SYMBOL(tls_unregister_device);
+  
+  static struct tcp_ulp_ops tcp_tls_ulp_ops __read_mostly = {
+  	.name			= "tls",
+* Unmerged path include/linux/skmsg.h
+* Unmerged path include/net/tcp.h
+* Unmerged path net/ipv4/tcp_ulp.c
+* Unmerged path net/tls/tls_main.c
