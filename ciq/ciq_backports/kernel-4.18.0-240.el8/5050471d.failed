@@ -1,0 +1,144 @@
+virtio_net: Differentiate sk_buff and xdp_frame on freeing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+commit 5050471d35d1316ba32dfcbb409978337eb9e75e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5050471d.failed
+
+We do not reset or free up unused buffers when enabling/disabling XDP,
+so it can happen that xdp_frames are freed after disabling XDP or
+sk_buffs are freed after enabling XDP on xdp tx queues.
+Thus we need to handle both forms (xdp_frames and sk_buffs) regardless
+of XDP setting.
+One way to trigger this problem is to disable XDP when napi_tx is
+enabled. In that case, virtnet_xdp_set() calls virtnet_napi_enable()
+which kicks NAPI. The NAPI handler will call virtnet_poll_cleantx()
+which invokes free_old_xmit_skbs() for queues which have been used by
+XDP.
+
+Note that even with this change we need to keep skipping
+free_old_xmit_skbs() from NAPI handlers when XDP is enabled, because XDP
+tx queues do not aquire queue locks.
+
+- v2: Use napi_consume_skb() instead of dev_consume_skb_any()
+
+Fixes: 4941d472bf95 ("virtio-net: do not reset during XDP set")
+	Signed-off-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5050471d35d1316ba32dfcbb409978337eb9e75e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index 7c401c3a65d4,259448182272..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -474,18 -503,12 +492,23 @@@ static int virtnet_xdp_xmit(struct net_
+  	struct bpf_prog *xdp_prog;
+  	struct send_queue *sq;
+  	unsigned int len;
+ +	unsigned int qp;
+  	int drops = 0;
+++<<<<<<< HEAD
+ +	int err;
+++=======
++ 	int kicks = 0;
++ 	int ret, err;
++ 	void *ptr;
+++>>>>>>> 5050471d35d1 (virtio_net: Differentiate sk_buff and xdp_frame on freeing)
+  	int i;
+  
+ +	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+ +		return -EINVAL;
+ +
+ +	qp = vi->curr_queue_pairs - vi->xdp_queue_pairs + smp_processor_id();
+ +	sq = &vi->sq[qp];
+ +
+  	/* Only allow ndo_xdp_xmit if XDP is loaded on dev, as this
+  	 * indicate XDP resources have been successfully allocated.
+  	 */
+@@@ -493,9 -516,21 +516,13 @@@
+  	if (!xdp_prog)
+  		return -ENXIO;
+  
+ -	sq = virtnet_xdp_sq(vi);
+ -
+ -	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK)) {
+ -		ret = -EINVAL;
+ -		drops = n;
+ -		goto out;
+ -	}
+ -
+  	/* Free up any pending old buffers before queueing new ones. */
+- 	while ((xdpf_sent = virtqueue_get_buf(sq->vq, &len)) != NULL)
+- 		xdp_return_frame(xdpf_sent);
++ 	while ((ptr = virtqueue_get_buf(sq->vq, &len)) != NULL) {
++ 		if (likely(is_xdp_frame(ptr)))
++ 			xdp_return_frame(ptr_to_xdp(ptr));
++ 		else
++ 			napi_consume_skb(ptr, false);
++ 	}
+  
+  	for (i = 0; i < n; i++) {
+  		struct xdp_frame *xdpf = frames[i];
+@@@ -1272,27 -1337,40 +1299,40 @@@ static int virtnet_receive(struct recei
+  	}
+  
+  	u64_stats_update_begin(&rq->stats.syncp);
+ -	for (i = 0; i < VIRTNET_RQ_STATS_LEN; i++) {
+ -		size_t offset = virtnet_rq_stats_desc[i].offset;
+ -		u64 *item;
+ -
+ -		item = (u64 *)((u8 *)&rq->stats + offset);
+ -		*item += *(u64 *)((u8 *)&stats + offset);
+ -	}
+ +	rq->stats.bytes += bytes;
+ +	rq->stats.packets += received;
+  	u64_stats_update_end(&rq->stats.syncp);
+  
+ -	return stats.packets;
+ +	return received;
+  }
+  
+ -static void free_old_xmit_skbs(struct send_queue *sq, bool in_napi)
+ +static void free_old_xmit_skbs(struct send_queue *sq)
+  {
+- 	struct sk_buff *skb;
+  	unsigned int len;
+  	unsigned int packets = 0;
+  	unsigned int bytes = 0;
++ 	void *ptr;
++ 
++ 	while ((ptr = virtqueue_get_buf(sq->vq, &len)) != NULL) {
++ 		if (likely(!is_xdp_frame(ptr))) {
++ 			struct sk_buff *skb = ptr;
+  
+- 	while ((skb = virtqueue_get_buf(sq->vq, &len)) != NULL) {
+- 		pr_debug("Sent skb %p\n", skb);
++ 			pr_debug("Sent skb %p\n", skb);
+  
+- 		bytes += skb->len;
++ 			bytes += skb->len;
++ 			napi_consume_skb(skb, in_napi);
++ 		} else {
++ 			struct xdp_frame *frame = ptr_to_xdp(ptr);
++ 
++ 			bytes += frame->len;
++ 			xdp_return_frame(frame);
++ 		}
+  		packets++;
+++<<<<<<< HEAD
+ +
+ +		dev_consume_skb_any(skb);
+++=======
+++>>>>>>> 5050471d35d1 (virtio_net: Differentiate sk_buff and xdp_frame on freeing)
+  	}
+  
+  	/* Avoid overhead when no packets have been processed
+* Unmerged path drivers/net/virtio_net.c
