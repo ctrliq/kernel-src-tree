@@ -1,0 +1,114 @@
+ceph: invalidate all write mode filp after reconnect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 81f148a910045cd0a139f589a0b42764b172f8f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/81f148a9.failed
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 81f148a910045cd0a139f589a0b42764b172f8f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/caps.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/caps.c
+index 25654e58a962,d17bde5d4f9a..000000000000
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@@ -2761,22 -2774,31 +2761,34 @@@ int ceph_try_get_caps(struct ceph_inode
+   * due to a small max_size, make sure we check_max_size (and possibly
+   * ask the mds) so we don't get hung up indefinitely.
+   */
+ -int ceph_get_caps(struct file *filp, int need, int want,
+ +int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
+  		  loff_t endoff, int *got, struct page **pinned_page)
+  {
+++<<<<<<< HEAD
+ +	int _got, ret;
+++=======
++ 	struct ceph_file_info *fi = filp->private_data;
++ 	struct inode *inode = file_inode(filp);
++ 	struct ceph_inode_info *ci = ceph_inode(inode);
++ 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
++ 	int ret, _got, flags;
+++>>>>>>> 81f148a91004 (ceph: invalidate all write mode filp after reconnect)
+  
+ -	ret = ceph_pool_perm_check(inode, need);
+ +	ret = ceph_pool_perm_check(ci, need);
+  	if (ret < 0)
+  		return ret;
+  
++ 	if ((fi->fmode & CEPH_FILE_MODE_WR) &&
++ 	    fi->filp_gen != READ_ONCE(fsc->filp_gen))
++ 		return -EBADF;
++ 
+  	while (true) {
+  		if (endoff > 0)
+ -			check_max_size(inode, endoff);
+ +			check_max_size(&ci->vfs_inode, endoff);
+  
+ -		flags = atomic_read(&fi->num_locks) ? CHECK_FILELOCK : 0;
+  		_got = 0;
+ -		ret = try_get_cap_refs(inode, need, want, endoff,
+ -				       flags, &_got);
+ +		ret = try_get_cap_refs(ci, need, want, endoff,
+ +				       false, &_got);
+  		if (ret == -EAGAIN)
+  			continue;
+  		if (!ret) {
+diff --cc fs/ceph/super.h
+index 146f2cee5024,f5e5f6a6bfb8..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -704,6 -709,8 +706,11 @@@ struct ceph_file_info 
+  	struct list_head rw_contexts;
+  
+  	errseq_t meta_err;
+++<<<<<<< HEAD
+++=======
++ 	u32 filp_gen;
++ 	atomic_t num_locks;
+++>>>>>>> 81f148a91004 (ceph: invalidate all write mode filp after reconnect)
+  };
+  
+  struct ceph_dir_file_info {
+* Unmerged path fs/ceph/caps.c
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 212dcf3021b3..81bbbac8fbe2 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -232,6 +232,7 @@ static int ceph_init_file_info(struct inode *inode, struct file *file,
+ 	spin_lock_init(&fi->rw_contexts_lock);
+ 	INIT_LIST_HEAD(&fi->rw_contexts);
+ 	fi->meta_err = errseq_sample(&ci->i_meta_err);
++	fi->filp_gen = READ_ONCE(ceph_inode_to_client(inode)->filp_gen);
+ 
+ 	return 0;
+ }
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index d2e58aa4efef..bdb2b71053e5 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -650,6 +650,7 @@ static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
+ 
+ 	fsc->sb = NULL;
+ 	fsc->mount_state = CEPH_MOUNT_MOUNTING;
++	fsc->filp_gen = 1;
+ 
+ 	atomic_long_set(&fsc->writeback_count, 0);
+ 
+@@ -815,6 +816,7 @@ static void ceph_umount_begin(struct super_block *sb)
+ 	fsc->mount_state = CEPH_MOUNT_SHUTDOWN;
+ 	ceph_osdc_abort_requests(&fsc->client->osdc, -EIO);
+ 	ceph_mdsc_force_umount(fsc->mdsc);
++	fsc->filp_gen++; // invalidate open files
+ }
+ 
+ static int ceph_remount(struct super_block *sb, int *flags, char *data)
+* Unmerged path fs/ceph/super.h
