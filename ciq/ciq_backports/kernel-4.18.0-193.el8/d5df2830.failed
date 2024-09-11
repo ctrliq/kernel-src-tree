@@ -1,0 +1,174 @@
+devmap/cpumap: Use flush list instead of bitmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit d5df2830ca9922d03a33940ea424c9a5f39f1162
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d5df2830.failed
+
+The socket map uses a linked list instead of a bitmap to keep track of
+which entries to flush. Do the same for devmap and cpumap, as this means we
+don't have to care about the map index when enqueueing things into the
+map (and so we can cache the map lookup).
+
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Acked-by: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit d5df2830ca9922d03a33940ea424c9a5f39f1162)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/cpumap.c
+#	kernel/bpf/devmap.c
+diff --cc kernel/bpf/cpumap.c
+index cf727d77c6c6,ef49e17ae47c..000000000000
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@@ -105,23 -106,21 +106,36 @@@ static struct bpf_map *cpu_map_alloc(un
+  
+  	/* make sure page count doesn't overflow */
+  	cost = (u64) cmap->map.max_entries * sizeof(struct bpf_cpu_map_entry *);
+++<<<<<<< HEAD
+ +	cost += cpu_map_bitmap_size(attr) * num_possible_cpus();
+ +	if (cost >= U32_MAX - PAGE_SIZE)
+ +		goto free_cmap;
+ +	cmap->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+++=======
++ 	cost += sizeof(struct list_head) * num_possible_cpus();
+++>>>>>>> d5df2830ca99 (devmap/cpumap: Use flush list instead of bitmap)
+  
+  	/* Notice returns -EPERM on if map size is larger than memlock limit */
+ -	ret = bpf_map_charge_init(&cmap->map.memory, cost);
+ +	ret = bpf_map_precharge_memlock(cmap->map.pages);
+  	if (ret) {
+  		err = ret;
+  		goto free_cmap;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* A per cpu bitfield with a bit per possible CPU in map  */
+ +	cmap->flush_needed = __alloc_percpu(cpu_map_bitmap_size(attr),
+ +					    __alignof__(unsigned long));
+ +	if (!cmap->flush_needed)
+ +		goto free_cmap;
+++=======
++ 	cmap->flush_list = alloc_percpu(struct list_head);
++ 	if (!cmap->flush_list)
++ 		goto free_charge;
+++>>>>>>> d5df2830ca99 (devmap/cpumap: Use flush list instead of bitmap)
++ 
++ 	for_each_possible_cpu(cpu)
++ 		INIT_LIST_HEAD(per_cpu_ptr(cmap->flush_list, cpu));
+  
+  	/* Alloc array for possible remote "destination" CPUs */
+  	cmap->cpu_map = bpf_map_area_alloc(cmap->map.max_entries *
+@@@ -132,7 -131,9 +146,13 @@@
+  
+  	return &cmap->map;
+  free_percpu:
+++<<<<<<< HEAD
+ +	free_percpu(cmap->flush_needed);
+++=======
++ 	free_percpu(cmap->flush_list);
++ free_charge:
++ 	bpf_map_charge_finish(&cmap->map.memory);
+++>>>>>>> d5df2830ca99 (devmap/cpumap: Use flush list instead of bitmap)
+  free_cmap:
+  	kfree(cmap);
+  	return ERR_PTR(err);
+diff --cc kernel/bpf/devmap.c
+index 05a8836729e5,a4dddc867cbf..000000000000
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@@ -99,39 -97,39 +97,63 @@@ static struct bpf_map *dev_map_alloc(un
+  
+  	/* make sure page count doesn't overflow */
+  	cost = (u64) dtab->map.max_entries * sizeof(struct bpf_dtab_netdev *);
+++<<<<<<< HEAD
+ +	cost += dev_map_bitmap_size(attr) * num_possible_cpus();
+ +	if (cost >= U32_MAX - PAGE_SIZE)
+ +		goto free_dtab;
+++=======
++ 	cost += sizeof(struct list_head) * num_possible_cpus();
+++>>>>>>> d5df2830ca99 (devmap/cpumap: Use flush list instead of bitmap)
+ +
+ +	dtab->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+  
+ -	/* if map size is larger than memlock limit, reject it */
+ -	err = bpf_map_charge_init(&dtab->map.memory, cost);
+ +	/* if map size is larger than memlock limit, reject it early */
+ +	err = bpf_map_precharge_memlock(dtab->map.pages);
+  	if (err)
+  		goto free_dtab;
+  
+  	err = -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	/* A per cpu bitfield with a bit per possible net device */
+ +	dtab->flush_needed = __alloc_percpu_gfp(dev_map_bitmap_size(attr),
+ +						__alignof__(unsigned long),
+ +						GFP_KERNEL | __GFP_NOWARN);
+ +	if (!dtab->flush_needed)
+ +		goto free_dtab;
+++=======
++ 	dtab->flush_list = alloc_percpu(struct list_head);
++ 	if (!dtab->flush_list)
++ 		goto free_charge;
+++>>>>>>> d5df2830ca99 (devmap/cpumap: Use flush list instead of bitmap)
++ 
++ 	for_each_possible_cpu(cpu)
++ 		INIT_LIST_HEAD(per_cpu_ptr(dtab->flush_list, cpu));
+  
+  	dtab->netdev_map = bpf_map_area_alloc(dtab->map.max_entries *
+  					      sizeof(struct bpf_dtab_netdev *),
+  					      dtab->map.numa_node);
+  	if (!dtab->netdev_map)
+++<<<<<<< HEAD
+ +		goto free_dtab;
+++=======
++ 		goto free_percpu;
+++>>>>>>> d5df2830ca99 (devmap/cpumap: Use flush list instead of bitmap)
+  
+  	spin_lock(&dev_map_lock);
+  	list_add_tail_rcu(&dtab->list, &dev_map_list);
+  	spin_unlock(&dev_map_lock);
+  
+  	return &dtab->map;
+++<<<<<<< HEAD
+++=======
++ 
++ free_percpu:
++ 	free_percpu(dtab->flush_list);
++ free_charge:
++ 	bpf_map_charge_finish(&dtab->map.memory);
+++>>>>>>> d5df2830ca99 (devmap/cpumap: Use flush list instead of bitmap)
+  free_dtab:
+- 	free_percpu(dtab->flush_needed);
+  	kfree(dtab);
+  	return ERR_PTR(err);
+  }
+* Unmerged path kernel/bpf/cpumap.c
+* Unmerged path kernel/bpf/devmap.c
+diff --git a/net/core/filter.c b/net/core/filter.c
+index f5f71f2e4cb7..4912b35fe335 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -3500,7 +3500,6 @@ static int __bpf_tx_xdp_map(struct net_device *dev_rx, void *fwd,
+ 		err = dev_map_enqueue(dst, xdp, dev_rx);
+ 		if (unlikely(err))
+ 			return err;
+-		__dev_map_insert_ctx(map, index);
+ 		break;
+ 	}
+ 	case BPF_MAP_TYPE_CPUMAP: {
+@@ -3509,7 +3508,6 @@ static int __bpf_tx_xdp_map(struct net_device *dev_rx, void *fwd,
+ 		err = cpu_map_enqueue(rcpu, xdp, dev_rx);
+ 		if (unlikely(err))
+ 			return err;
+-		__cpu_map_insert_ctx(map, index);
+ 		break;
+ 	}
+ 	case BPF_MAP_TYPE_XSKMAP: {
