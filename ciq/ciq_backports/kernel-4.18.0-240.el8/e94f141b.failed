@@ -1,0 +1,356 @@
+io_uring: improve poll completion performance
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit e94f141bd248ebdadcb7351f1e70b31cee5add53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e94f141b.failed
+
+For busy IORING_OP_POLL_ADD workloads, we can have enough contention
+on the completion lock that we fail the inline completion path quite
+often as we fail the trylock on that lock. Add a list for deferred
+completions that we can use in that case. This helps reduce the number
+of async offloads we have to do, as if we get multiple completions in
+a row, we'll piggy back on to the poll_llist instead of having to queue
+our own offload.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e94f141bd248ebdadcb7351f1e70b31cee5add53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index eb3b77d5111e,c54a8bd37b54..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -277,22 -295,13 +278,31 @@@ struct io_ring_ctx 
+  		 * manipulate the list, hence no extra locking is needed there.
+  		 */
+  		struct list_head	poll_list;
+++<<<<<<< HEAD
+ +		struct list_head	cancel_list;
+++=======
++ 		struct hlist_head	*cancel_hash;
++ 		unsigned		cancel_hash_bits;
++ 		bool			poll_multi_file;
++ 
++ 		spinlock_t		inflight_lock;
++ 		struct list_head	inflight_list;
+++>>>>>>> e94f141bd248 (io_uring: improve poll completion performance)
+  	} ____cacheline_aligned_in_smp;
+ +
+ +	struct async_list	pending_async[2];
+ +
+ +#if defined(CONFIG_UNIX)
+ +	struct socket		*ring_sock;
+ +#endif
+ +};
+ +
+ +struct sqe_submit {
+ +	const struct io_uring_sqe	*sqe;
+ +	u32				sequence;
+ +	bool				has_user;
+ +	bool				needs_lock;
+ +	bool				needs_fixed_file;
+  };
+  
+  /*
+@@@ -317,14 -441,39 +327,31 @@@ struct io_poll_iocb 
+  struct io_kiocb {
+  	union {
+  		struct file		*file;
+ -		struct io_rw		rw;
+ +		struct kiocb		rw;
+  		struct io_poll_iocb	poll;
+ -		struct io_accept	accept;
+ -		struct io_sync		sync;
+ -		struct io_cancel	cancel;
+ -		struct io_timeout	timeout;
+ -		struct io_connect	connect;
+ -		struct io_sr_msg	sr_msg;
+ -		struct io_open		open;
+ -		struct io_close		close;
+ -		struct io_files_update	files_update;
+  	};
+  
+++<<<<<<< HEAD
+ +	struct sqe_submit	submit;
+++=======
++ 	struct io_async_ctx		*io;
++ 	union {
++ 		/*
++ 		 * ring_file is only used in the submission path, and
++ 		 * llist_node is only used for poll deferred completions
++ 		 */
++ 		struct file		*ring_file;
++ 		struct llist_node	llist_node;
++ 	};
++ 	int				ring_fd;
++ 	bool				has_user;
++ 	bool				in_async;
++ 	bool				needs_fixed_file;
++ 	u8				opcode;
+++>>>>>>> e94f141bd248 (io_uring: improve poll completion performance)
+  
+  	struct io_ring_ctx	*ctx;
+ -	union {
+ -		struct list_head	list;
+ -		struct hlist_node	hash_node;
+ -	};
+ +	struct list_head	list;
+  	struct list_head	link_list;
+  	unsigned int		flags;
+  	refcount_t		refs;
+@@@ -411,29 -728,43 +438,30 @@@ static struct io_ring_ctx *io_ring_ctx_
+  
+  	ctx->flags = p->flags;
+  	init_waitqueue_head(&ctx->cq_wait);
+ -	INIT_LIST_HEAD(&ctx->cq_overflow_list);
+ -	init_completion(&ctx->completions[0]);
+ -	init_completion(&ctx->completions[1]);
+ +	init_completion(&ctx->ctx_done);
+ +	init_completion(&ctx->sqo_thread_started);
+  	mutex_init(&ctx->uring_lock);
+  	init_waitqueue_head(&ctx->wait);
+ +	for (i = 0; i < ARRAY_SIZE(ctx->pending_async); i++) {
+ +		spin_lock_init(&ctx->pending_async[i].lock);
+ +		INIT_LIST_HEAD(&ctx->pending_async[i].list);
+ +		atomic_set(&ctx->pending_async[i].cnt, 0);
+ +	}
+  	spin_lock_init(&ctx->completion_lock);
++ 	init_llist_head(&ctx->poll_llist);
+  	INIT_LIST_HEAD(&ctx->poll_list);
+ +	INIT_LIST_HEAD(&ctx->cancel_list);
+  	INIT_LIST_HEAD(&ctx->defer_list);
+ -	INIT_LIST_HEAD(&ctx->timeout_list);
+ -	init_waitqueue_head(&ctx->inflight_wait);
+ -	spin_lock_init(&ctx->inflight_lock);
+ -	INIT_LIST_HEAD(&ctx->inflight_list);
+  	return ctx;
+ -err:
+ -	if (ctx->fallback_req)
+ -		kmem_cache_free(req_cachep, ctx->fallback_req);
+ -	kfree(ctx->completions);
+ -	kfree(ctx->cancel_hash);
+ -	kfree(ctx);
+ -	return NULL;
+ -}
+ -
+ -static inline bool __req_need_defer(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -
+ -	return req->sequence != ctx->cached_cq_tail + ctx->cached_sq_dropped
+ -					+ atomic_read(&ctx->cached_cq_overflow);
+  }
+  
+ -static inline bool req_need_defer(struct io_kiocb *req)
+ +static inline bool io_sequence_defer(struct io_ring_ctx *ctx,
+ +				     struct io_kiocb *req)
+  {
+ -	if ((req->flags & (REQ_F_IO_DRAIN|REQ_F_IO_DRAINED)) == REQ_F_IO_DRAIN)
+ -		return __req_need_defer(req);
+ +	if ((req->flags & (REQ_F_IO_DRAIN|REQ_F_IO_DRAINED)) != REQ_F_IO_DRAIN)
+ +		return false;
+  
+ -	return false;
+ +	return req->sequence != ctx->cached_cq_tail + ctx->sq_ring->dropped;
+  }
+  
+  static struct io_kiocb *io_get_deferred_req(struct io_ring_ctx *ctx)
+@@@ -696,13 -1283,67 +724,27 @@@ static void io_put_req(struct io_kiocb 
+  		io_free_req(req);
+  }
+  
+ -/*
+ - * Must only be used if we don't need to care about links, usually from
+ - * within the completion handling itself.
+ - */
+ -static void __io_double_put_req(struct io_kiocb *req)
+ -{
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		__io_free_req(req);
+ -}
+ -
+ -static void io_double_put_req(struct io_kiocb *req)
+ -{
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		io_free_req(req);
+ -}
+ -
+ -static unsigned io_cqring_events(struct io_ring_ctx *ctx, bool noflush)
+ +static unsigned io_cqring_events(struct io_cq_ring *ring)
+  {
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	if (test_bit(0, &ctx->cq_check_overflow)) {
+ -		/*
+ -		 * noflush == true is from the waitqueue handler, just ensure
+ -		 * we wake up the task, and the next invocation will flush the
+ -		 * entries. We cannot safely to it from here.
+ -		 */
+ -		if (noflush && !list_empty(&ctx->cq_overflow_list))
+ -			return -1U;
+ -
+ -		io_cqring_overflow_flush(ctx, false);
+ -	}
+ -
+  	/* See comment at the top of this file */
+  	smp_rmb();
+ -	return ctx->cached_cq_tail - READ_ONCE(rings->cq.head);
+ -}
+ -
+ -static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	/* make sure SQ entry isn't read before tail */
+ -	return smp_load_acquire(&rings->sq.tail) - ctx->cached_sq_head;
+ +	return READ_ONCE(ring->r.tail) - READ_ONCE(ring->r.head);
+  }
+  
++ static inline bool io_req_multi_free(struct io_kiocb *req)
++ {
++ 	/*
++ 	 * If we're not using fixed files, we have to pair the completion part
++ 	 * with the file put. Use regular completions for those, only batch
++ 	 * free for fixed file and non-linked commands.
++ 	 */
++ 	if (((req->flags & (REQ_F_FIXED_FILE|REQ_F_LINK)) == REQ_F_FIXED_FILE)
++ 	    && !io_is_fallback_req(req) && !req->io)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
+  /*
+   * Find and free completed poll iocbs
+   */
+@@@ -722,13 -1363,7 +764,17 @@@ static void io_iopoll_complete(struct i
+  		(*nr_events)++;
+  
+  		if (refcount_dec_and_test(&req->refs)) {
+++<<<<<<< HEAD
+ +			/* If we're not using fixed files, we have to pair the
+ +			 * completion part with the file put. Use regular
+ +			 * completions for those, only batch free for fixed
+ +			 * file and non-linked commands.
+ +			 */
+ +			if ((req->flags & (REQ_F_FIXED_FILE|REQ_F_LINK)) ==
+ +			    REQ_F_FIXED_FILE) {
+++=======
++ 			if (io_req_multi_free(req)) {
+++>>>>>>> e94f141bd248 (io_uring: improve poll completion performance)
+  				reqs[to_free++] = req;
+  				if (to_free == ARRAY_SIZE(reqs))
+  					io_free_req_many(ctx, reqs, &to_free);
+@@@ -1731,9 -3090,52 +1777,47 @@@ static void io_poll_complete_work(struc
+  	spin_unlock_irq(&ctx->completion_lock);
+  
+  	io_cqring_ev_posted(ctx);
+ -
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_put_req_find_next(req, &nxt);
+ -	if (nxt)
+ -		io_wq_assign_next(workptr, nxt);
+ +	io_put_req(req);
+  }
+  
++ static void __io_poll_flush(struct io_ring_ctx *ctx, struct llist_node *nodes)
++ {
++ 	void *reqs[IO_IOPOLL_BATCH];
++ 	struct io_kiocb *req, *tmp;
++ 	int to_free = 0;
++ 
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	llist_for_each_entry_safe(req, tmp, nodes, llist_node) {
++ 		hash_del(&req->hash_node);
++ 		io_poll_complete(req, req->result, 0);
++ 
++ 		if (refcount_dec_and_test(&req->refs)) {
++ 			if (io_req_multi_free(req)) {
++ 				reqs[to_free++] = req;
++ 				if (to_free == ARRAY_SIZE(reqs))
++ 					io_free_req_many(ctx, reqs, &to_free);
++ 			} else {
++ 				req->flags |= REQ_F_COMP_LOCKED;
++ 				io_free_req(req);
++ 			}
++ 		}
++ 	}
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 
++ 	io_cqring_ev_posted(ctx);
++ 	io_free_req_many(ctx, reqs, &to_free);
++ }
++ 
++ static void io_poll_flush(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 	struct llist_node *nodes;
++ 
++ 	nodes = llist_del_all(&req->ctx->poll_llist);
++ 	if (nodes)
++ 		__io_poll_flush(req->ctx, nodes);
++ }
++ 
+  static int io_poll_wake(struct wait_queue_entry *wait, unsigned mode, int sync,
+  			void *key)
+  {
+@@@ -1750,16 -3150,37 +1833,49 @@@
+  
+  	list_del_init(&poll->wait.entry);
+  
+++<<<<<<< HEAD
+ +	if (mask && spin_trylock_irqsave(&ctx->completion_lock, flags)) {
+ +		list_del(&req->list);
+ +		io_poll_complete(ctx, req, mask);
+ +		spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ +
+ +		io_cqring_ev_posted(ctx);
+ +		io_put_req(req);
+ +	} else {
+ +		io_queue_async_work(ctx, req);
+++=======
++ 	/*
++ 	 * Run completion inline if we can. We're using trylock here because
++ 	 * we are violating the completion_lock -> poll wq lock ordering.
++ 	 * If we have a link timeout we're going to need the completion_lock
++ 	 * for finalizing the request, mark us as having grabbed that already.
++ 	 */
++ 	if (mask) {
++ 		unsigned long flags;
++ 
++ 		if (llist_empty(&ctx->poll_llist) &&
++ 		    spin_trylock_irqsave(&ctx->completion_lock, flags)) {
++ 			hash_del(&req->hash_node);
++ 			io_poll_complete(req, mask, 0);
++ 			req->flags |= REQ_F_COMP_LOCKED;
++ 			io_put_req(req);
++ 			spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 			io_cqring_ev_posted(ctx);
++ 			req = NULL;
++ 		} else {
++ 			req->result = mask;
++ 			req->llist_node.next = NULL;
++ 			/* if the list wasn't empty, we're done */
++ 			if (!llist_add(&req->llist_node, &ctx->poll_llist))
++ 				req = NULL;
++ 			else
++ 				req->work.func = io_poll_flush;
++ 		}
+++>>>>>>> e94f141bd248 (io_uring: improve poll completion performance)
+  	}
++ 	if (req)
++ 		io_queue_async_work(req);
+  
+  	return 1;
+  }
+* Unmerged path fs/io_uring.c
