@@ -1,0 +1,214 @@
+KVM: x86/mmu: Use atomic XCHG to write TDP MMU SPTEs with volatile bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit ba3a6120a4e7efc13d19fe43eb6c5caf1da05b72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/ba3a6120.failed
+
+Use an atomic XCHG to write TDP MMU SPTEs that have volatile bits, even
+if mmu_lock is held for write, as volatile SPTEs can be written by other
+tasks/vCPUs outside of mmu_lock.  If a vCPU uses the to-be-modified SPTE
+to write a page, the CPU can cache the translation as WRITABLE in the TLB
+despite it being seen by KVM as !WRITABLE, and/or KVM can clobber the
+Accessed/Dirty bits and not properly tag the backing page.
+
+Exempt non-leaf SPTEs from atomic updates as KVM itself doesn't modify
+non-leaf SPTEs without holding mmu_lock, they do not have Dirty bits, and
+KVM doesn't consume the Accessed bit of non-leaf SPTEs.
+
+Dropping the Dirty and/or Writable bits is most problematic for dirty
+logging, as doing so can result in a missed TLB flush and eventually a
+missed dirty page.  In the unlikely event that the only dirty page(s) is
+a clobbered SPTE, clear_dirty_gfn_range() will see the SPTE as not dirty
+(based on the Dirty or Writable bit depending on the method) and so not
+update the SPTE and ultimately not flush.  If the SPTE is cached in the
+TLB as writable before it is clobbered, the guest can continue writing
+the associated page without ever taking a write-protect fault.
+
+For most (all?) file back memory, dropping the Dirty bit is a non-issue.
+The primary MMU write-protects its PTEs on writeback, i.e. KVM's dirty
+bit is effectively ignored because the primary MMU will mark that page
+dirty when the write-protection is lifted, e.g. when KVM faults the page
+back in for write.
+
+The Accessed bit is a complete non-issue.  Aside from being unused for
+non-leaf SPTEs, KVM doesn't do a TLB flush when aging SPTEs, i.e. the
+Accessed bit may be dropped anyways.
+
+Lastly, the Writable bit is also problematic as an extension of the Dirty
+bit, as KVM (correctly) treats the Dirty bit as volatile iff the SPTE is
+!DIRTY && WRITABLE.  If KVM fixes an MMU-writable, but !WRITABLE, SPTE
+out of mmu_lock, then it can allow the CPU to set the Dirty bit despite
+the SPTE being !WRITABLE when it is checked by KVM.  But that all depends
+on the Dirty bit being problematic in the first place.
+
+Fixes: 2f2fad0897cb ("kvm: x86/mmu: Add functions to handle changed TDP SPTEs")
+	Cc: stable@vger.kernel.org
+	Cc: Ben Gardon <bgardon@google.com>
+	Cc: David Matlack <dmatlack@google.com>
+	Cc: Venkatesh Srinivas <venkateshs@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220423034752.1161007-4-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ba3a6120a4e7efc13d19fe43eb6c5caf1da05b72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 97bb57fe39ca,922b06bf4b94..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -318,12 -423,12 +318,12 @@@ static void handle_removed_pt(struct kv
+  
+  	trace_kvm_mmu_prepare_zap_page(sp);
+  
+ -	tdp_mmu_unlink_sp(kvm, sp, shared);
+ +	tdp_mmu_unlink_page(kvm, sp, shared);
+  
+  	for (i = 0; i < PT64_ENT_PER_PAGE; i++) {
+- 		u64 *sptep = rcu_dereference(pt) + i;
++ 		tdp_ptep_t sptep = pt + i;
+  		gfn_t gfn = base_gfn + i * KVM_PAGES_PER_HPAGE(level);
+- 		u64 old_child_spte;
++ 		u64 old_spte;
+  
+  		if (shared) {
+  			/*
+@@@ -355,23 -460,40 +355,43 @@@
+  				continue;
+  
+  			/*
+- 			 * Marking the SPTE as a removed SPTE is not
+- 			 * strictly necessary here as the MMU lock will
+- 			 * stop other threads from concurrently modifying
+- 			 * this SPTE. Using the removed SPTE value keeps
+- 			 * the two branches consistent and simplifies
+- 			 * the function.
++ 			 * Use the common helper instead of a raw WRITE_ONCE as
++ 			 * the SPTE needs to be updated atomically if it can be
++ 			 * modified by a different vCPU outside of mmu_lock.
++ 			 * Even though the parent SPTE is !PRESENT, the TLB
++ 			 * hasn't yet been flushed, and both Intel and AMD
++ 			 * document that A/D assists can use upper-level PxE
++ 			 * entries that are cached in the TLB, i.e. the CPU can
++ 			 * still access the page and mark it dirty.
++ 			 *
++ 			 * No retry is needed in the atomic update path as the
++ 			 * sole concern is dropping a Dirty bit, i.e. no other
++ 			 * task can zap/remove the SPTE as mmu_lock is held for
++ 			 * write.  Marking the SPTE as a removed SPTE is not
++ 			 * strictly necessary for the same reason, but using
++ 			 * the remove SPTE value keeps the shared/exclusive
++ 			 * paths consistent and allows the handle_changed_spte()
++ 			 * call below to hardcode the new value to REMOVED_SPTE.
++ 			 *
++ 			 * Note, even though dropping a Dirty bit is the only
++ 			 * scenario where a non-atomic update could result in a
++ 			 * functional bug, simply checking the Dirty bit isn't
++ 			 * sufficient as a fast page fault could read the upper
++ 			 * level SPTE before it is zapped, and then make this
++ 			 * target SPTE writable, resume the guest, and set the
++ 			 * Dirty bit between reading the SPTE above and writing
++ 			 * it here.
+  			 */
+- 			WRITE_ONCE(*sptep, REMOVED_SPTE);
++ 			old_spte = kvm_tdp_mmu_write_spte(sptep, old_spte,
++ 							  REMOVED_SPTE, level);
+  		}
+  		handle_changed_spte(kvm, kvm_mmu_page_as_id(sp), gfn,
+- 				    old_child_spte, REMOVED_SPTE, level,
+- 				    shared);
++ 				    old_spte, REMOVED_SPTE, level, shared);
+  	}
+  
+ +	kvm_flush_remote_tlbs_with_address(kvm, base_gfn,
+ +					   KVM_PAGES_PER_HPAGE(level + 1));
+ +
+  	call_rcu(&sp->rcu_head, tdp_mmu_free_sp_rcu_callback);
+  }
+  
+@@@ -555,16 -687,15 +575,24 @@@ static inline bool tdp_mmu_zap_spte_ato
+  					   KVM_PAGES_PER_HPAGE(iter->level));
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * No other thread can overwrite the removed SPTE as they
+ +	 * must either wait on the MMU lock or use
+ +	 * tdp_mmu_set_spte_atomic which will not overrite the
+ +	 * special removed SPTE value. No bookkeeping is needed
+ +	 * here since the SPTE is going from non-present
+ +	 * to non-present.
+++=======
++ 	 * No other thread can overwrite the removed SPTE as they must either
++ 	 * wait on the MMU lock or use tdp_mmu_set_spte_atomic() which will not
++ 	 * overwrite the special removed SPTE value. No bookkeeping is needed
++ 	 * here since the SPTE is going from non-present to non-present.  Use
++ 	 * the raw write helper to avoid an unnecessary check on volatile bits.
+++>>>>>>> ba3a6120a4e7 (KVM: x86/mmu: Use atomic XCHG to write TDP MMU SPTEs with volatile bits)
+  	 */
+- 	kvm_tdp_mmu_write_spte(iter->sptep, 0);
++ 	__kvm_tdp_mmu_write_spte(iter->sptep, 0);
+  
+ -	return 0;
+ +	return true;
+  }
+  
+  
+diff --git a/arch/x86/kvm/mmu/tdp_iter.h b/arch/x86/kvm/mmu/tdp_iter.h
+index a8673c625c04..a9f7a4cd2008 100644
+--- a/arch/x86/kvm/mmu/tdp_iter.h
++++ b/arch/x86/kvm/mmu/tdp_iter.h
+@@ -6,6 +6,7 @@
+ #include <linux/kvm_host.h>
+ 
+ #include "mmu.h"
++#include "spte.h"
+ 
+ typedef u64 __rcu *tdp_ptep_t;
+ 
+@@ -20,9 +21,38 @@ static inline u64 kvm_tdp_mmu_read_spte(tdp_ptep_t sptep)
+ {
+ 	return READ_ONCE(*rcu_dereference(sptep));
+ }
+-static inline void kvm_tdp_mmu_write_spte(tdp_ptep_t sptep, u64 val)
++
++static inline u64 kvm_tdp_mmu_write_spte_atomic(tdp_ptep_t sptep, u64 new_spte)
++{
++	return xchg(rcu_dereference(sptep), new_spte);
++}
++
++static inline void __kvm_tdp_mmu_write_spte(tdp_ptep_t sptep, u64 new_spte)
++{
++	WRITE_ONCE(*rcu_dereference(sptep), new_spte);
++}
++
++static inline u64 kvm_tdp_mmu_write_spte(tdp_ptep_t sptep, u64 old_spte,
++					 u64 new_spte, int level)
+ {
+-	WRITE_ONCE(*rcu_dereference(sptep), val);
++	/*
++	 * Atomically write the SPTE if it is a shadow-present, leaf SPTE with
++	 * volatile bits, i.e. has bits that can be set outside of mmu_lock.
++	 * The Writable bit can be set by KVM's fast page fault handler, and
++	 * Accessed and Dirty bits can be set by the CPU.
++	 *
++	 * Note, non-leaf SPTEs do have Accessed bits and those bits are
++	 * technically volatile, but KVM doesn't consume the Accessed bit of
++	 * non-leaf SPTEs, i.e. KVM doesn't care if it clobbers the bit.  This
++	 * logic needs to be reassessed if KVM were to use non-leaf Accessed
++	 * bits, e.g. to skip stepping down into child SPTEs when aging SPTEs.
++	 */
++	if (is_shadow_present_pte(old_spte) && is_last_spte(old_spte, level) &&
++	    spte_has_volatile_bits(old_spte))
++		return kvm_tdp_mmu_write_spte_atomic(sptep, new_spte);
++
++	__kvm_tdp_mmu_write_spte(sptep, new_spte);
++	return old_spte;
+ }
+ 
+ /*
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
