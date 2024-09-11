@@ -1,0 +1,250 @@
+selftests/bpf: fix clearing buffered output between tests/subtests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit bf8ff0f8cfd73e850c01b453ddb79609bd83279c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/bf8ff0f8.failed
+
+Clear buffered output once test or subtests finishes even if test was
+successful. Not doing this leads to accumulation of output from previous
+tests and on first failed tests lots of irrelevant output will be
+dumped, greatly confusing things.
+
+v1->v2: fix Fixes tag, add more context to patch
+
+Fixes: 3a516a0a3a7b ("selftests/bpf: add sub-tests support for test_progs")
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit bf8ff0f8cfd73e850c01b453ddb79609bd83279c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/test_progs.c
+diff --cc tools/testing/selftests/bpf/test_progs.c
+index da24416535c6,db00196c8315..000000000000
+--- a/tools/testing/selftests/bpf/test_progs.c
++++ b/tools/testing/selftests/bpf/test_progs.c
+@@@ -1,58 -1,164 +1,185 @@@
+ -// SPDX-License-Identifier: GPL-2.0-only
+  /* Copyright (c) 2017 Facebook
+ + *
+ + * This program is free software; you can redistribute it and/or
+ + * modify it under the terms of version 2 of the GNU General Public
+ + * License as published by the Free Software Foundation.
+   */
+ -#include "test_progs.h"
+ -#include "bpf_rlimit.h"
+ -#include <argp.h>
+ +#include <stdio.h>
+ +#include <unistd.h>
+ +#include <errno.h>
+  #include <string.h>
+ -
+ -/* defined in test_progs.h */
+ -struct test_env env;
+ -int error_cnt, pass_cnt;
+ -
+ -struct prog_test_def {
+ -	const char *test_name;
+ -	int test_num;
+ -	void (*run_test)(void);
+ -	bool force_log;
+ -	int pass_cnt;
+ -	int error_cnt;
+ -	bool tested;
+ -
+ -	const char *subtest_name;
+ -	int subtest_num;
+ -
+ -	/* store counts before subtest started */
+ -	int old_pass_cnt;
+ -	int old_error_cnt;
+ -};
+ -
+ -static bool should_run(struct test_selector *sel, int num, const char *name)
+ -{
+ -	if (sel->name && sel->name[0] && !strstr(name, sel->name))
+ -		return false;
+ -
+ -	if (!sel->num_set)
+ -		return true;
+ -
+ +#include <assert.h>
+ +#include <stdlib.h>
+ +#include <stdarg.h>
+ +#include <time.h>
+ +
+ +#include <linux/types.h>
+ +typedef __u16 __sum16;
+ +#include <arpa/inet.h>
+ +#include <linux/if_ether.h>
+ +#include <linux/if_packet.h>
+ +#include <linux/ip.h>
+ +#include <linux/ipv6.h>
+ +#include <linux/tcp.h>
+ +#include <linux/filter.h>
+ +#include <linux/perf_event.h>
+ +#include <linux/unistd.h>
+ +
+ +#include <sys/ioctl.h>
+ +#include <sys/wait.h>
+ +#include <sys/types.h>
+ +#include <fcntl.h>
+ +
+ +#include <linux/bpf.h>
+ +#include <linux/err.h>
+ +#include <bpf/bpf.h>
+ +#include <bpf/libbpf.h>
+ +
+ +#include "test_iptunnel_common.h"
+ +#include "bpf_util.h"
+ +#include "bpf_endian.h"
+ +#include "bpf_rlimit.h"
+ +#include "trace_helpers.h"
+ +#include "flow_dissector_load.h"
+ +
+ +static int error_cnt, pass_cnt;
+ +static bool jit_enabled;
+ +
+ +#define MAGIC_BYTES 123
+ +
+++<<<<<<< HEAD
+ +/* ipv4 test vector */
+ +static struct {
+ +	struct ethhdr eth;
+ +	struct iphdr iph;
+ +	struct tcphdr tcp;
+ +} __packed pkt_v4 = {
+++=======
++ 	return num < sel->num_set_len && sel->num_set[num];
++ }
++ 
++ static void dump_test_log(const struct prog_test_def *test, bool failed)
++ {
++ 	if (env.verbose || test->force_log || failed) {
++ 		if (env.log_cnt) {
++ 			fprintf(stdout, "%s", env.log_buf);
++ 			if (env.log_buf[env.log_cnt - 1] != '\n')
++ 				fprintf(stdout, "\n");
++ 		}
++ 	}
++ 	env.log_cnt = 0;
++ }
++ 
++ void test__end_subtest()
++ {
++ 	struct prog_test_def *test = env.test;
++ 	int sub_error_cnt = error_cnt - test->old_error_cnt;
++ 
++ 	if (sub_error_cnt)
++ 		env.fail_cnt++;
++ 	else
++ 		env.sub_succ_cnt++;
++ 
++ 	dump_test_log(test, sub_error_cnt);
++ 
++ 	printf("#%d/%d %s:%s\n",
++ 	       test->test_num, test->subtest_num,
++ 	       test->subtest_name, sub_error_cnt ? "FAIL" : "OK");
++ }
++ 
++ bool test__start_subtest(const char *name)
++ {
++ 	struct prog_test_def *test = env.test;
++ 
++ 	if (test->subtest_name) {
++ 		test__end_subtest();
++ 		test->subtest_name = NULL;
++ 	}
++ 
++ 	test->subtest_num++;
++ 
++ 	if (!name || !name[0]) {
++ 		fprintf(stderr, "Subtest #%d didn't provide sub-test name!\n",
++ 			test->subtest_num);
++ 		return false;
++ 	}
++ 
++ 	if (!should_run(&env.subtest_selector, test->subtest_num, name))
++ 		return false;
++ 
++ 	test->subtest_name = name;
++ 	env.test->old_pass_cnt = pass_cnt;
++ 	env.test->old_error_cnt = error_cnt;
++ 
++ 	return true;
++ }
++ 
++ void test__force_log() {
++ 	env.test->force_log = true;
++ }
++ 
++ void test__vprintf(const char *fmt, va_list args)
++ {
++ 	size_t rem_sz;
++ 	int ret = 0;
++ 
++ 	if (env.verbose || (env.test && env.test->force_log)) {
++ 		vfprintf(stderr, fmt, args);
++ 		return;
++ 	}
++ 
++ try_again:
++ 	rem_sz = env.log_cap - env.log_cnt;
++ 	if (rem_sz) {
++ 		va_list ap;
++ 
++ 		va_copy(ap, args);
++ 		/* we reserved extra byte for \0 at the end */
++ 		ret = vsnprintf(env.log_buf + env.log_cnt, rem_sz + 1, fmt, ap);
++ 		va_end(ap);
++ 
++ 		if (ret < 0) {
++ 			env.log_buf[env.log_cnt] = '\0';
++ 			fprintf(stderr, "failed to log w/ fmt '%s'\n", fmt);
++ 			return;
++ 		}
++ 	}
++ 
++ 	if (!rem_sz || ret > rem_sz) {
++ 		size_t new_sz = env.log_cap * 3 / 2;
++ 		char *new_buf;
++ 
++ 		if (new_sz < 4096)
++ 			new_sz = 4096;
++ 		if (new_sz < ret + env.log_cnt)
++ 			new_sz = ret + env.log_cnt;
++ 
++ 		/* +1 for guaranteed space for terminating \0 */
++ 		new_buf = realloc(env.log_buf, new_sz + 1);
++ 		if (!new_buf) {
++ 			fprintf(stderr, "failed to realloc log buffer: %d\n",
++ 				errno);
++ 			return;
++ 		}
++ 		env.log_buf = new_buf;
++ 		env.log_cap = new_sz;
++ 		goto try_again;
++ 	}
++ 
++ 	env.log_cnt += ret;
++ }
++ 
++ void test__printf(const char *fmt, ...)
++ {
++ 	va_list args;
++ 
++ 	va_start(args, fmt);
++ 	test__vprintf(fmt, args);
++ 	va_end(args);
++ }
++ 
++ struct ipv4_packet pkt_v4 = {
+++>>>>>>> bf8ff0f8cfd7 (selftests/bpf: fix clearing buffered output between tests/subtests)
+  	.eth.h_proto = __bpf_constant_htons(ETH_P_IP),
+  	.iph.ihl = 5,
+  	.iph.protocol = IPPROTO_TCP,
+* Unmerged path tools/testing/selftests/bpf/test_progs.c
