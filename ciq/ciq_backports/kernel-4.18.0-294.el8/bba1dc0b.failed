@@ -1,0 +1,139 @@
+bpf: Remove redundant synchronize_rcu.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] bpf: Remove redundant synchronize_rcu (Yauheni Kaliuta) [1874005]
+Rebuild_FUZZ: 98.67%
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit bba1dc0b55ac462d24ed1228ad49800c238cd6d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bba1dc0b.failed
+
+bpf_free_used_maps() or close(map_fd) will trigger map_free callback.
+bpf_free_used_maps() is called after bpf prog is no longer executing:
+bpf_prog_put->call_rcu->bpf_prog_free->bpf_free_used_maps.
+Hence there is no need to call synchronize_rcu() to protect map elements.
+
+Note that hash_of_maps and array_of_maps update/delete inner maps via
+sys_bpf() that calls maybe_wait_bpf_programs() and synchronize_rcu().
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Paul E. McKenney <paulmck@kernel.org>
+Link: https://lore.kernel.org/bpf/20200630043343.53195-2-alexei.starovoitov@gmail.com
+(cherry picked from commit bba1dc0b55ac462d24ed1228ad49800c238cd6d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/ringbuf.c
+* Unmerged path kernel/bpf/ringbuf.c
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index bf32bbe740a2..12c969a32088 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -394,13 +394,6 @@ static void array_map_free(struct bpf_map *map)
+ {
+ 	struct bpf_array *array = container_of(map, struct bpf_array, map);
+ 
+-	/* at this point bpf_prog->aux->refcnt == 0 and this map->refcnt == 0,
+-	 * so the programs (can be more than one that used this map) were
+-	 * disconnected from events. Wait for outstanding programs to complete
+-	 * and free the array
+-	 */
+-	synchronize_rcu();
+-
+ 	if (array->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+ 		bpf_array_free_percpu(array);
+ 
+@@ -548,8 +541,6 @@ static void fd_array_map_free(struct bpf_map *map)
+ 	struct bpf_array *array = container_of(map, struct bpf_array, map);
+ 	int i;
+ 
+-	synchronize_rcu();
+-
+ 	/* make sure it's empty */
+ 	for (i = 0; i < array->map.max_entries; i++)
+ 		BUG_ON(array->ptrs[i] != NULL);
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 496ea743bae8..6afabde24334 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -1304,12 +1304,10 @@ static void htab_map_free(struct bpf_map *map)
+ {
+ 	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+ 
+-	/* at this point bpf_prog->aux->refcnt == 0 and this map->refcnt == 0,
+-	 * so the programs (can be more than one that used this map) were
+-	 * disconnected from events. Wait for outstanding critical sections in
+-	 * these programs to complete
++	/* bpf_free_used_maps() or close(map_fd) will trigger this map_free callback.
++	 * bpf_free_used_maps() is called after bpf prog is no longer executing.
++	 * There is no need to synchronize_rcu() here to protect map elements.
+ 	 */
+-	synchronize_rcu();
+ 
+ 	/* some of free_htab_elem() callbacks for elements of this map may
+ 	 * not have executed. Wait for them.
+diff --git a/kernel/bpf/lpm_trie.c b/kernel/bpf/lpm_trie.c
+index 270fa84766a7..fff90343f917 100644
+--- a/kernel/bpf/lpm_trie.c
++++ b/kernel/bpf/lpm_trie.c
+@@ -592,11 +592,6 @@ static void trie_free(struct bpf_map *map)
+ 	struct lpm_trie_node __rcu **slot;
+ 	struct lpm_trie_node *node;
+ 
+-	/* Wait for outstanding programs to complete
+-	 * update/lookup/delete/get_next_key and free the trie.
+-	 */
+-	synchronize_rcu();
+-
+ 	/* Always start at the root and walk down to a node that has no
+ 	 * children. Then free that node, nullify its reference in the parent
+ 	 * and start over.
+diff --git a/kernel/bpf/queue_stack_maps.c b/kernel/bpf/queue_stack_maps.c
+index 30e1373fd437..8a551297058d 100644
+--- a/kernel/bpf/queue_stack_maps.c
++++ b/kernel/bpf/queue_stack_maps.c
+@@ -101,13 +101,6 @@ static void queue_stack_map_free(struct bpf_map *map)
+ {
+ 	struct bpf_queue_stack *qs = bpf_queue_stack(map);
+ 
+-	/* at this point bpf_prog->aux->refcnt == 0 and this map->refcnt == 0,
+-	 * so the programs (can be more than one that used this map) were
+-	 * disconnected from events. Wait for outstanding critical sections in
+-	 * these programs to complete
+-	 */
+-	synchronize_rcu();
+-
+ 	bpf_map_area_free(qs);
+ }
+ 
+diff --git a/kernel/bpf/reuseport_array.c b/kernel/bpf/reuseport_array.c
+index 2aaa88e47f9c..f0f3e33fa32e 100644
+--- a/kernel/bpf/reuseport_array.c
++++ b/kernel/bpf/reuseport_array.c
+@@ -99,8 +99,6 @@ static void reuseport_array_free(struct bpf_map *map)
+ 	struct sock *sk;
+ 	u32 i;
+ 
+-	synchronize_rcu();
+-
+ 	/*
+ 	 * ops->map_*_elem() will not be able to access this
+ 	 * array now. Hence, this function only races with
+* Unmerged path kernel/bpf/ringbuf.c
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index 4153fd4ee538..9b3b96919981 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -614,9 +614,6 @@ static void stack_map_free(struct bpf_map *map)
+ {
+ 	struct bpf_stack_map *smap = container_of(map, struct bpf_stack_map, map);
+ 
+-	/* wait for bpf programs to complete before freeing stack map */
+-	synchronize_rcu();
+-
+ 	bpf_map_area_free(smap->elems);
+ 	pcpu_freelist_destroy(&smap->freelist);
+ 	bpf_map_area_free(smap);
