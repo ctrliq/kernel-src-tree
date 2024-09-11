@@ -53,6 +53,8 @@
 #include <uapi/linux/pkt_cls.h>
 #include <linux/hashtable.h>
 
+#include <linux/rh_kabi.h>
+
 struct netpoll_info;
 struct device;
 struct phy_device;
@@ -274,6 +276,10 @@ struct header_ops {
 				const struct net_device *dev,
 				const unsigned char *haddr);
 	bool	(*validate)(const char *ll_header, unsigned int len);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
 };
 
 /* These flag bits are private to the generic network queueing
@@ -302,6 +308,9 @@ struct netdev_boot_setup {
 
 int __init netdev_boot_setup(char *str);
 
+struct napi_struct_extended_rh {
+};
+
 /*
  * Structure for NAPI scheduling similar to tasklet but with weighting
  */
@@ -328,6 +337,15 @@ struct napi_struct {
 	struct list_head	dev_list;
 	struct hlist_node	napi_hash_node;
 	unsigned int		napi_id;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_SIZE_AND_EXTEND(napi_struct_extended)
 };
 
 enum {
@@ -581,8 +599,8 @@ struct netdev_queue {
  * read-mostly part
  */
 	struct net_device	*dev;
-	struct Qdisc __rcu	*qdisc;
-	struct Qdisc		*qdisc_sleeping;
+	RH_KABI_EXCLUDE(struct Qdisc __rcu	*qdisc)
+	RH_KABI_EXCLUDE(struct Qdisc		*qdisc_sleeping)
 #ifdef CONFIG_SYSFS
 	struct kobject		kobj;
 #endif
@@ -613,6 +631,15 @@ struct netdev_queue {
 #ifdef CONFIG_BQL
 	struct dql		dql;
 #endif
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
 } ____cacheline_aligned_in_smp;
 
 extern int sysctl_fb_tunnels_only_for_init_net;
@@ -726,7 +753,16 @@ struct netdev_rx_queue {
 #endif
 	struct kobject			kobj;
 	struct net_device		*dev;
-	struct xdp_rxq_info		xdp_rxq;
+	RH_KABI_EXCLUDE(struct xdp_rxq_info	xdp_rxq)
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
 } ____cacheline_aligned_in_smp;
 
 /*
@@ -844,6 +880,7 @@ enum bpf_netdev_command {
 	XDP_SETUP_PROG,
 	XDP_SETUP_PROG_HW,
 	XDP_QUERY_PROG,
+	XDP_QUERY_PROG_HW,
 	/* BPF program for offload callbacks, invoked at program load time. */
 	BPF_OFFLOAD_VERIFIER_PREP,
 	BPF_OFFLOAD_TRANSLATE,
@@ -867,7 +904,7 @@ struct netdev_bpf {
 			struct bpf_prog *prog;
 			struct netlink_ext_ack *extack;
 		};
-		/* XDP_QUERY_PROG */
+		/* XDP_QUERY_PROG, XDP_QUERY_PROG_HW */
 		struct {
 			u32 prog_id;
 			/* flags with which program was installed */
@@ -895,6 +932,9 @@ struct netdev_bpf {
 };
 
 #ifdef CONFIG_XFRM_OFFLOAD
+struct xfrmdev_ops_extended_rh {
+};
+
 struct xfrmdev_ops {
 	int	(*xdo_dev_state_add) (struct xfrm_state *x);
 	void	(*xdo_dev_state_delete) (struct xfrm_state *x);
@@ -902,6 +942,15 @@ struct xfrmdev_ops {
 	bool	(*xdo_dev_offload_ok) (struct sk_buff *skb,
 				       struct xfrm_state *x);
 	void	(*xdo_dev_state_advance_esn) (struct xfrm_state *x);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_SIZE_AND_EXTEND(xfrmdev_ops_extended)
 };
 #endif
 
@@ -914,6 +963,9 @@ enum tls_offload_ctx_dir {
 struct tls_crypto_info;
 struct tls_context;
 
+struct tlsdev_ops_extended_rh {
+};
+
 struct tlsdev_ops {
 	int (*tls_dev_add)(struct net_device *netdev, struct sock *sk,
 			   enum tls_offload_ctx_dir direction,
@@ -922,12 +974,24 @@ struct tlsdev_ops {
 	void (*tls_dev_del)(struct net_device *netdev,
 			    struct tls_context *ctx,
 			    enum tls_offload_ctx_dir direction);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_SIZE_AND_EXTEND(tlsdev_ops_extended)
 };
 #endif
 
 struct dev_ifalias {
 	struct rcu_head rcuhead;
 	char ifalias[];
+};
+
+struct net_device_ops_extended_rh {
 };
 
 /*
@@ -1314,9 +1378,9 @@ struct net_device_ops {
 	int			(*ndo_set_vf_rss_query_en)(
 						   struct net_device *dev,
 						   int vf, bool setting);
-	int			(*ndo_setup_tc)(struct net_device *dev,
+	RH_KABI_EXCLUDE(int	(*ndo_setup_tc)(struct net_device *dev,
 						enum tc_setup_type type,
-						void *type_data);
+						void *type_data))
 #if IS_ENABLED(CONFIG_FCOE)
 	int			(*ndo_fcoe_enable)(struct net_device *dev);
 	int			(*ndo_fcoe_disable)(struct net_device *dev);
@@ -1415,13 +1479,62 @@ struct net_device_ops {
 						       struct sk_buff *skb);
 	void			(*ndo_set_rx_headroom)(struct net_device *dev,
 						       int needed_headroom);
-	int			(*ndo_bpf)(struct net_device *dev,
-					   struct netdev_bpf *bpf);
-	int			(*ndo_xdp_xmit)(struct net_device *dev, int n,
+	RH_KABI_EXCLUDE(int	(*ndo_bpf)(struct net_device *dev,
+					   struct netdev_bpf *bpf))
+	RH_KABI_EXCLUDE(int	(*ndo_xdp_xmit)(struct net_device *dev, int n,
 						struct xdp_frame **xdp,
-						u32 flags);
-	int			(*ndo_xsk_async_xmit)(struct net_device *dev,
-						      u32 queue_id);
+						u32 flags))
+	RH_KABI_EXCLUDE(int	(*ndo_xsk_async_xmit)(struct net_device *dev,
+						      u32 queue_id))
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+	RH_KABI_RESERVE(9)
+	RH_KABI_RESERVE(10)
+	RH_KABI_RESERVE(11)
+	RH_KABI_RESERVE(12)
+	RH_KABI_RESERVE(13)
+	RH_KABI_RESERVE(14)
+	RH_KABI_RESERVE(15)
+	RH_KABI_RESERVE(16)
+	RH_KABI_RESERVE(17)
+	RH_KABI_RESERVE(18)
+	RH_KABI_RESERVE(19)
+	RH_KABI_RESERVE(20)
+	RH_KABI_RESERVE(21)
+	RH_KABI_RESERVE(22)
+	RH_KABI_RESERVE(23)
+	RH_KABI_RESERVE(24)
+	RH_KABI_RESERVE(25)
+	RH_KABI_RESERVE(26)
+	RH_KABI_RESERVE(27)
+	RH_KABI_RESERVE(28)
+	RH_KABI_RESERVE(29)
+	RH_KABI_RESERVE(30)
+	RH_KABI_RESERVE(31)
+	RH_KABI_RESERVE(32)
+	RH_KABI_RESERVE(33)
+	RH_KABI_RESERVE(34)
+	RH_KABI_RESERVE(35)
+	RH_KABI_RESERVE(36)
+	RH_KABI_RESERVE(37)
+	RH_KABI_RESERVE(38)
+	RH_KABI_RESERVE(39)
+	RH_KABI_RESERVE(40)
+	RH_KABI_RESERVE(41)
+	RH_KABI_RESERVE(42)
+	RH_KABI_RESERVE(43)
+	RH_KABI_RESERVE(44)
+	RH_KABI_RESERVE(45)
+	RH_KABI_RESERVE(46)
+	RH_KABI_RESERVE(47)
+	RH_KABI_SIZE_AND_EXTEND(net_device_ops_extended)
 };
 
 /**
@@ -1528,6 +1641,9 @@ enum netdev_priv_flags {
 #define IFF_NO_RX_HANDLER		IFF_NO_RX_HANDLER
 #define IFF_FAILOVER			IFF_FAILOVER
 #define IFF_FAILOVER_SLAVE		IFF_FAILOVER_SLAVE
+
+struct net_device_extended_rh {
+};
 
 /**
  *	struct net_device - The DEVICE structure.
@@ -1813,7 +1929,10 @@ struct net_device {
 	const struct l3mdev_ops	*l3mdev_ops;
 #endif
 #if IS_ENABLED(CONFIG_IPV6)
-	const struct ndisc_ops *ndisc_ops;
+	/* RHEL: this structure is strictly internal to the kernel IPv6 stack
+	 * and is not intended for 3rd party consumption
+	 */
+	RH_KABI_EXCLUDE(const struct ndisc_ops *ndisc_ops)
 #endif
 
 #ifdef CONFIG_XFRM_OFFLOAD
@@ -1891,7 +2010,7 @@ struct net_device {
 #if IS_ENABLED(CONFIG_AX25)
 	void			*ax25_ptr;
 #endif
-	struct wireless_dev	*ieee80211_ptr;
+	RH_KABI_EXCLUDE(struct wireless_dev	*ieee80211_ptr)
 	struct wpan_dev		*ieee802154_ptr;
 #if IS_ENABLED(CONFIG_MPLS_ROUTING)
 	struct mpls_dev __rcu	*mpls_ptr;
@@ -1907,13 +2026,17 @@ struct net_device {
 	unsigned int		num_rx_queues;
 	unsigned int		real_num_rx_queues;
 
-	struct bpf_prog __rcu	*xdp_prog;
+	/* RHEL: while xdp_prog is explicitly removed from the kABI
+	 * whitelist, one semantics must be preserved: comparison of
+	 * xdp_prog to NULL denotes whether a XDP program is loaded or not.
+	 */
+	RH_KABI_EXCLUDE(struct bpf_prog __rcu	*xdp_prog)
 	unsigned long		gro_flush_timeout;
 	rx_handler_func_t __rcu	*rx_handler;
 	void __rcu		*rx_handler_data;
 
 #ifdef CONFIG_NET_CLS_ACT
-	struct mini_Qdisc __rcu	*miniq_ingress;
+	RH_KABI_EXCLUDE(struct mini_Qdisc __rcu	*miniq_ingress)
 #endif
 	struct netdev_queue __rcu *ingress_queue;
 #ifdef CONFIG_NETFILTER_INGRESS
@@ -1932,7 +2055,7 @@ struct net_device {
 	struct netdev_queue	*_tx ____cacheline_aligned_in_smp;
 	unsigned int		num_tx_queues;
 	unsigned int		real_num_tx_queues;
-	struct Qdisc		*qdisc;
+	RH_KABI_EXCLUDE(struct Qdisc		*qdisc)
 #ifdef CONFIG_NET_SCHED
 	DECLARE_HASHTABLE	(qdisc_hash, 4);
 #endif
@@ -1945,7 +2068,7 @@ struct net_device {
 	struct xps_dev_maps __rcu *xps_rxqs_map;
 #endif
 #ifdef CONFIG_NET_CLS_ACT
-	struct mini_Qdisc __rcu	*miniq_egress;
+	RH_KABI_EXCLUDE(struct mini_Qdisc __rcu	*miniq_egress)
 #endif
 
 	/* These may be needed for future network-power-down code. */
@@ -2026,6 +2149,38 @@ struct net_device {
 	struct lock_class_key	*qdisc_tx_busylock;
 	struct lock_class_key	*qdisc_running_key;
 	bool			proto_down;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+	RH_KABI_RESERVE(9)
+	RH_KABI_RESERVE(10)
+	RH_KABI_RESERVE(11)
+	RH_KABI_RESERVE(12)
+	RH_KABI_RESERVE(13)
+	RH_KABI_RESERVE(14)
+	RH_KABI_RESERVE(15)
+	RH_KABI_RESERVE(16)
+	RH_KABI_RESERVE(17)
+	RH_KABI_RESERVE(18)
+	RH_KABI_RESERVE(19)
+	RH_KABI_RESERVE(20)
+	RH_KABI_RESERVE(21)
+	RH_KABI_RESERVE(22)
+	RH_KABI_RESERVE(23)
+	RH_KABI_RESERVE(24)
+	RH_KABI_RESERVE(25)
+	RH_KABI_RESERVE(26)
+	RH_KABI_RESERVE(27)
+	RH_KABI_RESERVE(28)
+	RH_KABI_RESERVE(29)
+	RH_KABI_RESERVE(30)
+	RH_KABI_SIZE_AND_EXTEND_PTR(net_device_extended)
 };
 #define to_net_dev(d) container_of(d, struct net_device, dev)
 
@@ -2057,6 +2212,10 @@ int netdev_set_prio_tc_map(struct net_device *dev, u8 prio, u8 tc)
 int netdev_txq_to_tc(struct net_device *dev, unsigned int txq);
 void netdev_reset_tc(struct net_device *dev);
 int netdev_set_tc_queue(struct net_device *dev, u8 tc, u16 count, u16 offset);
+/* RHEL: Increase the version of netdev_set_num_tc() kABI when TC subsystem
+ * is changed in a kABI incompatible way. This includes changes to ndo_setup_tc,
+ * inline function changes and TC struct changes. */
+RH_KABI_FORCE_CHANGE(1)
 int netdev_set_num_tc(struct net_device *dev, u8 num_tc);
 
 static inline
@@ -2338,6 +2497,11 @@ struct packet_type {
 					    struct sock *sk);
 	void			*af_packet_priv;
 	struct list_head	list;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 struct offload_callbacks {
@@ -2952,8 +3116,8 @@ struct softnet_data {
 #ifdef CONFIG_NET_FLOW_LIMIT
 	struct sd_flow_limit __rcu *flow_limit;
 #endif
-	struct Qdisc		*output_queue;
-	struct Qdisc		**output_queue_tailp;
+	RH_KABI_EXCLUDE(struct Qdisc		*output_queue)
+	RH_KABI_EXCLUDE(struct Qdisc		**output_queue_tailp)
 	struct sk_buff		*completion_queue;
 #ifdef CONFIG_XFRM_OFFLOAD
 	struct sk_buff_head	xfrm_backlog;
@@ -3585,8 +3749,8 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 typedef int (*bpf_op_t)(struct net_device *dev, struct netdev_bpf *bpf);
 int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
 		      int fd, u32 flags);
-void __dev_xdp_query(struct net_device *dev, bpf_op_t xdp_op,
-		     struct netdev_bpf *xdp);
+u32 __dev_xdp_query(struct net_device *dev, bpf_op_t xdp_op,
+		    enum bpf_netdev_command cmd);
 
 int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
 int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);

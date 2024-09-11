@@ -184,7 +184,7 @@ struct target_type {
 	dm_status_fn status;
 	dm_message_fn message;
 	dm_prepare_ioctl_fn prepare_ioctl;
-#ifdef CONFIG_BLK_DEV_ZONED
+#if 1 /* CONFIG_BLK_DEV_ZONED */
 	dm_report_zones_fn report_zones;
 #endif
 	dm_busy_fn busy;

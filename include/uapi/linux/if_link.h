@@ -38,6 +38,20 @@ struct rtnl_link_stats {
 	__u32	tx_compressed;
 
 	__u32	rx_nohandler;		/* dropped, no handler found	*/
+
+#ifdef __KERNEL__
+#ifndef __GENKSYMS__
+	/*
+	 * RHEL: when used, reserved fields must be moved before __KERNEL__
+	 * and must be under a #ifndef __GENKSYMS__ conditional
+	 */
+	char __rh_tail[0];
+	__u32	__rh_reserved_1;
+	__u32	__rh_reserved_2;
+	__u32	__rh_reserved_3;
+	__u32	__rh_reserved_4;
+#endif
+#endif
 };
 
 /* The main device statistics structure */
@@ -73,7 +87,22 @@ struct rtnl_link_stats64 {
 	__u64	tx_compressed;
 
 	__u64	rx_nohandler;		/* dropped, no handler found	*/
+
+#ifdef __KERNEL__
+#ifndef __GENKSYMS__
+	char __rh_tail[0];
+	__u64	__rh_reserved_1;
+	__u64	__rh_reserved_2;
+	__u64	__rh_reserved_3;
+	__u64	__rh_reserved_4;
+#endif
+#endif
 };
+
+#ifdef __KERNEL__
+#define sizeof_rtnl_link_stats offsetof(struct rtnl_link_stats, __rh_tail)
+#define sizeof_rtnl_link_stats64 offsetof(struct rtnl_link_stats64, __rh_tail)
+#endif
 
 /* The struct should be in sync with struct ifmap */
 struct rtnl_link_ifmap {
@@ -920,6 +949,7 @@ enum {
 	XDP_ATTACHED_DRV,
 	XDP_ATTACHED_SKB,
 	XDP_ATTACHED_HW,
+	XDP_ATTACHED_MULTI,
 };
 
 enum {

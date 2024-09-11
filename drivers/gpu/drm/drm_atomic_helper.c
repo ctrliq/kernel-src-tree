@@ -320,7 +320,7 @@ update_connector_routing(struct drm_atomic_state *state,
 	 * display on a connector that was destroyed after its been notified,
 	 * not before.
 	 */
-	if (!READ_ONCE(connector->registered) && crtc_state->active) {
+	if (drm_connector_is_unregistered(connector) && crtc_state->active) {
 		DRM_DEBUG_ATOMIC("[CONNECTOR:%d:%s] is not registered\n",
 				 connector->base.id, connector->name);
 		return -EINVAL;

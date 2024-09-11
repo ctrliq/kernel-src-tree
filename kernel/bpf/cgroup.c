@@ -16,6 +16,8 @@
 #include <linux/bpf-cgroup.h>
 #include <net/sock.h>
 
+#include <linux/rh_features.h>
+
 DEFINE_STATIC_KEY_FALSE(cgroup_bpf_enabled_key);
 EXPORT_SYMBOL(cgroup_bpf_enabled_key);
 
@@ -437,6 +439,7 @@ int cgroup_bpf_prog_attach(const union bpf_attr *attr,
 	if (IS_ERR(cgrp))
 		return PTR_ERR(cgrp);
 
+	rh_mark_used_feature("eBPF/cgroup");
 	ret = cgroup_bpf_attach(cgrp, prog, attr->attach_type,
 				attr->attach_flags);
 	cgroup_put(cgrp);

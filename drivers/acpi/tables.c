@@ -35,7 +35,6 @@
 #include <linux/earlycpio.h>
 #include <linux/memblock.h>
 #include <linux/initrd.h>
-#include <linux/security.h>
 #include "internal.h"
 
 #ifdef CONFIG_ACPI_CUSTOM_DSDT
@@ -533,7 +532,7 @@ void __init acpi_table_upgrade(void)
 	if (table_nr == 0)
 		return;
 
-	if (security_locked_down(LOCKDOWN_ACPI_TABLES)) {
+	if (kernel_is_locked_down("ACPI table override")) {
 		pr_notice("kernel is locked down, ignoring table override\n");
 		return;
 	}

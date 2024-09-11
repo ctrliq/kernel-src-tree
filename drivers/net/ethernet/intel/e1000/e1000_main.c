@@ -195,7 +195,7 @@ static struct pci_driver e1000_driver = {
 
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION("Intel(R) PRO/1000 Network Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
 
 #define DEFAULT_MSG_ENABLE (NETIF_MSG_DRV|NETIF_MSG_PROBE|NETIF_MSG_LINK)
@@ -226,6 +226,9 @@ static int __init e1000_init_module(void)
 	pr_info("%s - version %s\n", e1000_driver_string, e1000_driver_version);
 
 	pr_info("%s\n", e1000_copyright);
+
+	add_taint(TAINT_SUPPORT_REMOVED, LOCKDEP_STILL_OK);
+	pr_warn("E1000 MODULE IS NOT SUPPORTED\n");
 
 	ret = pci_register_driver(&e1000_driver);
 	if (copybreak != COPYBREAK_DEFAULT) {

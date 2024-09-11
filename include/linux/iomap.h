@@ -7,6 +7,8 @@
 #include <linux/mm.h>
 #include <linux/types.h>
 
+#include <linux/rh_kabi.h>
+
 struct address_space;
 struct fiemap_extent_info;
 struct inode;
@@ -99,6 +101,10 @@ struct iomap_ops {
 	 */
 	int (*iomap_end)(struct inode *inode, loff_t pos, loff_t length,
 			ssize_t written, unsigned flags, struct iomap *iomap);
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 /*

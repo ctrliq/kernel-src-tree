@@ -75,7 +75,7 @@ union __packed ip_addr {
 	} v4;
 };
 
-struct __packed hw_aq_atl_utils_fw_rpc {
+struct __packed hw_atl_utils_fw_rpc {
 	u32 msg_id;
 
 	union {
@@ -165,15 +165,28 @@ struct __packed hw_aq_atl_utils_fw_rpc {
 	};
 };
 
-struct __packed hw_aq_atl_utils_mbox_header {
+struct __packed hw_atl_utils_mbox_header {
 	u32 version;
 	u32 transaction_id;
 	u32 error;
 };
 
-struct __packed hw_aq_atl_utils_mbox {
-	struct hw_aq_atl_utils_mbox_header header;
+struct __packed hw_aq_info {
+	u8 reserved[6];
+	u16 phy_fault_code;
+	u16 phy_temperature;
+	u8 cable_len;
+	u8 reserved1;
+	u32 cable_diag_data[4];
+	u8 reserved2[32];
+	u32 caps_lo;
+	u32 caps_hi;
+};
+
+struct __packed hw_atl_utils_mbox {
+	struct hw_atl_utils_mbox_header header;
 	struct hw_atl_stats_s stats;
+	struct hw_aq_info info;
 };
 
 /* fw2x */
@@ -257,6 +270,9 @@ enum hal_atl_utils_fw_state_e {
 #define HAL_ATLANTIC_UTILS_FW_MSG_ARP           0x2U
 #define HAL_ATLANTIC_UTILS_FW_MSG_INJECT        0x3U
 #define HAL_ATLANTIC_UTILS_FW_MSG_WOL_ADD       0x4U
+#define HAL_ATLANTIC_UTILS_FW_MSG_WOL_PRIOR     0x10000000U
+#define HAL_ATLANTIC_UTILS_FW_MSG_WOL_PATTERN   0x1U
+#define HAL_ATLANTIC_UTILS_FW_MSG_WOL_MAG_PKT   0x2U
 #define HAL_ATLANTIC_UTILS_FW_MSG_WOL_DEL       0x5U
 #define HAL_ATLANTIC_UTILS_FW_MSG_ENABLE_WAKEUP 0x6U
 #define HAL_ATLANTIC_UTILS_FW_MSG_MSM_PFC       0x7U
@@ -323,6 +339,41 @@ enum hw_atl_fw2x_caps_hi {
 	CAPS_HI_TRANSACTION_ID,
 };
 
+enum hw_atl_fw2x_ctrl {
+	CTRL_RESERVED1 = 0x00,
+	CTRL_RESERVED2,
+	CTRL_RESERVED3,
+	CTRL_PAUSE,
+	CTRL_ASYMMETRIC_PAUSE,
+	CTRL_RESERVED4,
+	CTRL_RESERVED5,
+	CTRL_RESERVED6,
+	CTRL_1GBASET_FD_EEE,
+	CTRL_2P5GBASET_FD_EEE,
+	CTRL_5GBASET_FD_EEE,
+	CTRL_10GBASET_FD_EEE,
+	CTRL_THERMAL_SHUTDOWN,
+	CTRL_PHY_LOGS,
+	CTRL_EEE_AUTO_DISABLE,
+	CTRL_PFC,
+	CTRL_WAKE_ON_LINK,
+	CTRL_CABLE_DIAG,
+	CTRL_TEMPERATURE,
+	CTRL_DOWNSHIFT,
+	CTRL_PTP_AVB,
+	CTRL_RESERVED7,
+	CTRL_LINK_DROP,
+	CTRL_SLEEP_PROXY,
+	CTRL_WOL,
+	CTRL_MAC_STOP,
+	CTRL_EXT_LOOPBACK,
+	CTRL_INT_LOOPBACK,
+	CTRL_RESERVED8,
+	CTRL_WOL_TIMER,
+	CTRL_STATISTICS,
+	CTRL_FORCE_RECONNECT,
+};
+
 struct aq_hw_s;
 struct aq_fw_ops;
 struct aq_hw_caps_s;
@@ -335,10 +386,10 @@ int hw_atl_utils_soft_reset(struct aq_hw_s *self);
 void hw_atl_utils_hw_chip_features_init(struct aq_hw_s *self, u32 *p);
 
 int hw_atl_utils_mpi_read_mbox(struct aq_hw_s *self,
-			       struct hw_aq_atl_utils_mbox_header *pmbox);
+			       struct hw_atl_utils_mbox_header *pmbox);
 
 void hw_atl_utils_mpi_read_stats(struct aq_hw_s *self,
-				 struct hw_aq_atl_utils_mbox *pmbox);
+				 struct hw_atl_utils_mbox *pmbox);
 
 void hw_atl_utils_mpi_set(struct aq_hw_s *self,
 			  enum hal_atl_utils_fw_state_e state,
@@ -365,13 +416,16 @@ int hw_atl_utils_get_fw_version(struct aq_hw_s *self, u32 *fw_version);
 int hw_atl_utils_update_stats(struct aq_hw_s *self);
 
 struct aq_stats_s *hw_atl_utils_get_hw_stats(struct aq_hw_s *self);
+
 int hw_atl_utils_fw_downld_dwords(struct aq_hw_s *self, u32 a,
 				  u32 *p, u32 cnt);
+
+int hw_atl_utils_fw_set_wol(struct aq_hw_s *self, bool wol_enabled, u8 *mac);
 
 int hw_atl_utils_fw_rpc_call(struct aq_hw_s *self, unsigned int rpc_size);
 
 int hw_atl_utils_fw_rpc_wait(struct aq_hw_s *self,
-			     struct hw_aq_atl_utils_fw_rpc **rpc);
+			     struct hw_atl_utils_fw_rpc **rpc);
 
 extern const struct aq_fw_ops aq_fw_1x_ops;
 extern const struct aq_fw_ops aq_fw_2x_ops;

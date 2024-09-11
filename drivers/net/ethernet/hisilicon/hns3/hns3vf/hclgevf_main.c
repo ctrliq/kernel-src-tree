@@ -31,16 +31,15 @@ static inline struct hclgevf_dev *hclgevf_ae_get_hdev(
 
 static int hclgevf_tqps_update_stats(struct hnae3_handle *handle)
 {
+	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
 	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
-	struct hnae3_queue *queue;
 	struct hclgevf_desc desc;
 	struct hclgevf_tqp *tqp;
 	int status;
 	int i;
 
-	for (i = 0; i < hdev->num_tqps; i++) {
-		queue = handle->kinfo.tqp[i];
-		tqp = container_of(queue, struct hclgevf_tqp, q);
+	for (i = 0; i < kinfo->num_tqps; i++) {
+		tqp = container_of(kinfo->tqp[i], struct hclgevf_tqp, q);
 		hclgevf_cmd_setup_basic_desc(&desc,
 					     HCLGEVF_OPC_QUERY_RX_STATUS,
 					     true);
@@ -77,17 +76,16 @@ static int hclgevf_tqps_update_stats(struct hnae3_handle *handle)
 static u64 *hclgevf_tqps_get_stats(struct hnae3_handle *handle, u64 *data)
 {
 	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
-	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
 	struct hclgevf_tqp *tqp;
 	u64 *buff = data;
 	int i;
 
-	for (i = 0; i < hdev->num_tqps; i++) {
-		tqp = container_of(handle->kinfo.tqp[i], struct hclgevf_tqp, q);
+	for (i = 0; i < kinfo->num_tqps; i++) {
+		tqp = container_of(kinfo->tqp[i], struct hclgevf_tqp, q);
 		*buff++ = tqp->tqp_stats.rcb_tx_ring_pktnum_rcd;
 	}
 	for (i = 0; i < kinfo->num_tqps; i++) {
-		tqp = container_of(handle->kinfo.tqp[i], struct hclgevf_tqp, q);
+		tqp = container_of(kinfo->tqp[i], struct hclgevf_tqp, q);
 		*buff++ = tqp->tqp_stats.rcb_rx_ring_pktnum_rcd;
 	}
 
@@ -96,28 +94,28 @@ static u64 *hclgevf_tqps_get_stats(struct hnae3_handle *handle, u64 *data)
 
 static int hclgevf_tqps_get_sset_count(struct hnae3_handle *handle, int strset)
 {
-	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
+	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
 
-	return hdev->num_tqps * 2;
+	return kinfo->num_tqps * 2;
 }
 
 static u8 *hclgevf_tqps_get_strings(struct hnae3_handle *handle, u8 *data)
 {
-	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
+	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
 	u8 *buff = data;
 	int i = 0;
 
-	for (i = 0; i < hdev->num_tqps; i++) {
-		struct hclgevf_tqp *tqp = container_of(handle->kinfo.tqp[i],
-			struct hclgevf_tqp, q);
+	for (i = 0; i < kinfo->num_tqps; i++) {
+		struct hclgevf_tqp *tqp = container_of(kinfo->tqp[i],
+						       struct hclgevf_tqp, q);
 		snprintf(buff, ETH_GSTRING_LEN, "txq#%d_pktnum_rcd",
 			 tqp->index);
 		buff += ETH_GSTRING_LEN;
 	}
 
-	for (i = 0; i < hdev->num_tqps; i++) {
-		struct hclgevf_tqp *tqp = container_of(handle->kinfo.tqp[i],
-			struct hclgevf_tqp, q);
+	for (i = 0; i < kinfo->num_tqps; i++) {
+		struct hclgevf_tqp *tqp = container_of(kinfo->tqp[i],
+						       struct hclgevf_tqp, q);
 		snprintf(buff, ETH_GSTRING_LEN, "rxq#%d_pktnum_rcd",
 			 tqp->index);
 		buff += ETH_GSTRING_LEN;
@@ -453,12 +451,12 @@ static int hclgevf_set_rss_tc_mode(struct hclgevf_dev *hdev,  u16 rss_size)
 
 	hclgevf_cmd_setup_basic_desc(&desc, HCLGEVF_OPC_RSS_TC_MODE, false);
 	for (i = 0; i < HCLGEVF_MAX_TC_NUM; i++) {
-		hnae_set_bit(req->rss_tc_mode[i], HCLGEVF_RSS_TC_VALID_B,
-			     (tc_valid[i] & 0x1));
-		hnae_set_field(req->rss_tc_mode[i], HCLGEVF_RSS_TC_SIZE_M,
-			       HCLGEVF_RSS_TC_SIZE_S, tc_size[i]);
-		hnae_set_field(req->rss_tc_mode[i], HCLGEVF_RSS_TC_OFFSET_M,
-			       HCLGEVF_RSS_TC_OFFSET_S, tc_offset[i]);
+		hnae3_set_bit(req->rss_tc_mode[i], HCLGEVF_RSS_TC_VALID_B,
+			      (tc_valid[i] & 0x1));
+		hnae3_set_field(req->rss_tc_mode[i], HCLGEVF_RSS_TC_SIZE_M,
+				HCLGEVF_RSS_TC_SIZE_S, tc_size[i]);
+		hnae3_set_field(req->rss_tc_mode[i], HCLGEVF_RSS_TC_OFFSET_M,
+				HCLGEVF_RSS_TC_OFFSET_S, tc_offset[i]);
 	}
 	status = hclgevf_cmd_send(&hdev->hw, &desc, 1);
 	if (status)
@@ -585,11 +583,11 @@ static int hclgevf_bind_ring_to_vector(struct hnae3_handle *handle, bool en,
 		}
 
 		req->msg[idx_offset] =
-				hnae_get_bit(node->flag, HNAE3_RING_TYPE_B);
+				hnae3_get_bit(node->flag, HNAE3_RING_TYPE_B);
 		req->msg[idx_offset + 1] = node->tqp_index;
-		req->msg[idx_offset + 2] = hnae_get_field(node->int_gl_idx,
-							  HNAE3_RING_GL_IDX_M,
-							  HNAE3_RING_GL_IDX_S);
+		req->msg[idx_offset + 2] = hnae3_get_field(node->int_gl_idx,
+							   HNAE3_RING_GL_IDX_M,
+							   HNAE3_RING_GL_IDX_S);
 
 		i++;
 		if ((i == (HCLGE_MBX_VF_MSG_DATA_NUM -
@@ -738,14 +736,12 @@ static int hclgevf_get_queue_id(struct hnae3_queue *queue)
 
 static void hclgevf_reset_tqp_stats(struct hnae3_handle *handle)
 {
-	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
-	struct hnae3_queue *queue;
+	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
 	struct hclgevf_tqp *tqp;
 	int i;
 
-	for (i = 0; i < hdev->num_tqps; i++) {
-		queue = handle->kinfo.tqp[i];
-		tqp = container_of(queue, struct hclgevf_tqp, q);
+	for (i = 0; i < kinfo->num_tqps; i++) {
+		tqp = container_of(kinfo->tqp[i], struct hclgevf_tqp, q);
 		memset(&tqp->tqp_stats, 0, sizeof(tqp->tqp_stats));
 	}
 }
@@ -1012,8 +1008,8 @@ static int hclgevf_reset_wait(struct hclgevf_dev *hdev)
 
 	/* wait to check the hardware reset completion status */
 	val = hclgevf_read_dev(&hdev->hw, HCLGEVF_FUN_RST_ING);
-	while (hnae_get_bit(val, HCLGEVF_FUN_RST_ING_B) &&
-			    (cnt < HCLGEVF_RESET_WAIT_CNT)) {
+	while (hnae3_get_bit(val, HCLGEVF_FUN_RST_ING_B) &&
+	       (cnt < HCLGEVF_RESET_WAIT_CNT)) {
 		msleep(HCLGEVF_RESET_WAIT_MS);
 		val = hclgevf_read_dev(&hdev->hw, HCLGEVF_FUN_RST_ING);
 		cnt++;
@@ -1422,12 +1418,13 @@ static int hclgevf_init_vlan_config(struct hclgevf_dev *hdev)
 
 static int hclgevf_ae_start(struct hnae3_handle *handle)
 {
+	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
 	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
 	int i, queue_id;
 
-	for (i = 0; i < handle->kinfo.num_tqps; i++) {
+	for (i = 0; i < kinfo->num_tqps; i++) {
 		/* ring enable */
-		queue_id = hclgevf_get_queue_id(handle->kinfo.tqp[i]);
+		queue_id = hclgevf_get_queue_id(kinfo->tqp[i]);
 		if (queue_id < 0) {
 			dev_warn(&hdev->pdev->dev,
 				 "Get invalid queue id, ignore it\n");
@@ -1450,14 +1447,15 @@ static int hclgevf_ae_start(struct hnae3_handle *handle)
 
 static void hclgevf_ae_stop(struct hnae3_handle *handle)
 {
+	struct hnae3_knic_private_info *kinfo = &handle->kinfo;
 	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
 	int i, queue_id;
 
 	set_bit(HCLGEVF_STATE_DOWN, &hdev->state);
 
-	for (i = 0; i < hdev->num_tqps; i++) {
+	for (i = 0; i < kinfo->num_tqps; i++) {
 		/* Ring disable */
-		queue_id = hclgevf_get_queue_id(handle->kinfo.tqp[i]);
+		queue_id = hclgevf_get_queue_id(kinfo->tqp[i]);
 		if (queue_id < 0) {
 			dev_warn(&hdev->pdev->dev,
 				 "Get invalid queue id, ignore it\n");
@@ -1628,6 +1626,8 @@ static int hclgevf_init_client_instance(struct hnae3_client *client,
 		if (ret)
 			goto clear_nic;
 
+		hnae3_set_client_init_flag(client, ae_dev, 1);
+
 		if (hdev->roce_client && hnae3_dev_roce_supported(hdev)) {
 			struct hnae3_client *rc = hdev->roce_client;
 
@@ -1637,6 +1637,9 @@ static int hclgevf_init_client_instance(struct hnae3_client *client,
 			ret = rc->ops->init_instance(&hdev->roce);
 			if (ret)
 				goto clear_roce;
+
+			hnae3_set_client_init_flag(hdev->roce_client, ae_dev,
+						   1);
 		}
 		break;
 	case HNAE3_CLIENT_UNIC:
@@ -1646,6 +1649,8 @@ static int hclgevf_init_client_instance(struct hnae3_client *client,
 		ret = client->ops->init_instance(&hdev->nic);
 		if (ret)
 			goto clear_nic;
+
+		hnae3_set_client_init_flag(client, ae_dev, 1);
 		break;
 	case HNAE3_CLIENT_ROCE:
 		if (hnae3_dev_roce_supported(hdev)) {
@@ -1662,6 +1667,11 @@ static int hclgevf_init_client_instance(struct hnae3_client *client,
 			if (ret)
 				goto clear_roce;
 		}
+
+		hnae3_set_client_init_flag(client, ae_dev, 1);
+		break;
+	default:
+		return -EINVAL;
 	}
 
 	return 0;

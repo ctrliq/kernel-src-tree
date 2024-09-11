@@ -69,6 +69,8 @@
 #include <net/seg6.h>
 #include <net/seg6_local.h>
 
+#include <linux/rh_features.h>
+
 /**
  *	sk_filter_trim_cap - run a packet through a socket filter
  *	@sk: sock associated with &sk_buff
@@ -1575,6 +1577,8 @@ int sk_attach_bpf(u32 ufd, struct sock *sk)
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
+	rh_mark_used_feature("eBPF/sock");
+
 	err = __sk_attach_prog(prog, sk);
 	if (err < 0) {
 		bpf_prog_put(prog);
@@ -1591,6 +1595,8 @@ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk)
 
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
+
+	rh_mark_used_feature("eBPF/reuseport");
 
 	err = __reuseport_attach_prog(prog, sk);
 	if (err < 0) {

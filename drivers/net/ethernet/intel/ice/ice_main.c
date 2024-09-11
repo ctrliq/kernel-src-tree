@@ -16,7 +16,7 @@ static const char ice_copyright[] = "Copyright (c) 2018, Intel Corporation.";
 
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION(DRV_SUMMARY);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
 
 static int debug = -1;
@@ -2254,6 +2254,7 @@ static int __init ice_module_init(void)
 
 	pr_info("%s - version %s\n", ice_driver_string, ice_drv_ver);
 	pr_info("%s\n", ice_copyright);
+	mark_tech_preview(DRV_SUMMARY, THIS_MODULE);
 
 	ice_wq = alloc_workqueue("%s", WQ_MEM_RECLAIM, 0, KBUILD_MODNAME);
 	if (!ice_wq) {

@@ -23,6 +23,8 @@
 #include <net/pkt_cls.h>
 #include <net/sock.h>
 
+#include <linux/rh_features.h>
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Daniel Borkmann <dborkman@redhat.com>");
 MODULE_DESCRIPTION("TC BPF based classifier");
@@ -392,6 +394,8 @@ static int cls_bpf_prog_from_efd(struct nlattr **tb, struct cls_bpf_prog *prog,
 			return -ENOMEM;
 		}
 	}
+
+	rh_mark_used_feature("eBPF/cls");
 
 	prog->bpf_ops = NULL;
 	prog->bpf_name = name;

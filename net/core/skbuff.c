@@ -837,6 +837,9 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	CHECK_SKB_FIELD(tc_index);
 #endif
 
+	BUILD_BUG_ON(offsetof(struct sk_buff, rh_reserved_end) -
+		     offsetof(struct sk_buff, rh_reserved_start) !=
+		     RH_KABI_SKBUFF_RESERVED);
 }
 
 /*

@@ -685,12 +685,10 @@ static void blk_account_io_merge(struct request *req)
 {
 	if (blk_do_io_stat(req)) {
 		struct hd_struct *part;
-		int cpu;
 
-		cpu = part_stat_lock();
+		part_stat_lock();
 		part = req->part;
 
-		part_round_stats(req->q, cpu, part);
 		part_dec_in_flight(req->q, part, rq_data_dir(req));
 
 		hd_struct_put(part);
@@ -841,16 +839,11 @@ struct request *attempt_front_merge(struct request_queue *q, struct request *rq)
 int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
 			  struct request *next)
 {
-	struct elevator_queue *e = q->elevator;
 	struct request *free;
-
-	if (!e->uses_mq && e->type->ops.sq.elevator_allow_rq_merge_fn)
-		if (!e->type->ops.sq.elevator_allow_rq_merge_fn(q, rq, next))
-			return 0;
 
 	free = attempt_merge(q, rq, next);
 	if (free) {
-		__blk_put_request(q, free);
+		blk_put_request(free);
 		return 1;
 	}
 

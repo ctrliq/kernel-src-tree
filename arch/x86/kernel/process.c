@@ -39,6 +39,7 @@
 #include <asm/desc.h>
 #include <asm/prctl.h>
 #include <asm/spec-ctrl.h>
+#include <asm/spec_ctrl.h>
 
 #include "process.h"
 
@@ -441,8 +442,11 @@ static __always_inline void __speculation_ctrl_update(unsigned long tifp,
 		msr |= stibp_tif_to_spec_ctrl(tifn);
 	}
 
-	if (updmsr)
+	if (updmsr) {
+		if (static_cpu_has(X86_FEATURE_SPEC_CTRL_ENTRY))
+			spec_ctrl_update(msr);
 		wrmsrl(MSR_IA32_SPEC_CTRL, msr);
+	}
 }
 
 static unsigned long speculation_ctrl_update_tif(struct task_struct *tsk)
@@ -452,6 +456,11 @@ static unsigned long speculation_ctrl_update_tif(struct task_struct *tsk)
 			set_tsk_thread_flag(tsk, TIF_SSBD);
 		else
 			clear_tsk_thread_flag(tsk, TIF_SSBD);
+
+		if (task_spec_ib_disable(tsk))
+			set_tsk_thread_flag(tsk, TIF_SPEC_IB);
+		else
+			clear_tsk_thread_flag(tsk, TIF_SPEC_IB);
 	}
 	/* Return the updated threadinfo flags*/
 	return task_thread_info(tsk)->flags;

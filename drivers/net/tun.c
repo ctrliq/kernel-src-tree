@@ -1176,13 +1176,11 @@ static void tun_poll_controller(struct net_device *dev)
 		struct tun_file *tfile;
 		int i;
 
-		if (tun_napi_frags_enabled(tun))
-			return;
-
 		rcu_read_lock();
 		for (i = 0; i < tun->numqueues; i++) {
 			tfile = rcu_dereference(tun->tfiles[i]);
-			if (tfile->napi_enabled)
+			if (!tun_napi_frags_enabled(tfile) &&
+			    tfile->napi_enabled)
 				napi_schedule(&tfile->napi);
 		}
 		rcu_read_unlock();

@@ -359,6 +359,10 @@ static inline int hyp_map_aux_data(void)
 #define kvm_phys_to_vttbr(addr)		(addr)
 
 static inline void kvm_set_ipa_limit(void) {}
+static inline bool kvm_cpu_has_cnp(void)
+{
+	return false;
+}
 
 #endif	/* !__ASSEMBLY__ */
 

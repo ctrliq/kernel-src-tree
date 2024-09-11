@@ -847,14 +847,21 @@ void link_prepare_wakeup(struct tipc_link *l)
 
 void tipc_link_reset(struct tipc_link *l)
 {
+	struct sk_buff_head list;
+
+	__skb_queue_head_init(&list);
+
 	l->peer_session = ANY_SESSION;
 	l->session++;
 	l->mtu = l->advertised_mtu;
+
 	spin_lock_bh(&l->wakeupq.lock);
-	spin_lock_bh(&l->inputq->lock);
-	skb_queue_splice_init(&l->wakeupq, l->inputq);
-	spin_unlock_bh(&l->inputq->lock);
+	skb_queue_splice_init(&l->wakeupq, &list);
 	spin_unlock_bh(&l->wakeupq.lock);
+
+	spin_lock_bh(&l->inputq->lock);
+	skb_queue_splice_init(&list, l->inputq);
+	spin_unlock_bh(&l->inputq->lock);
 
 	__skb_queue_purge(&l->transmq);
 	__skb_queue_purge(&l->deferdq);
@@ -1543,6 +1550,7 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
 			l->tolerance = peers_tol;
 			l->bc_rcvlink->tolerance = peers_tol;
 		}
+
 		/* Update own priority if peer's priority is higher */
 		if (in_range(peers_prio, l->priority + 1, TIPC_MAX_LINK_PRI))
 			l->priority = peers_prio;

@@ -30,39 +30,17 @@
 #define pt_levels_pgdir_shift(lvls)	ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - (lvls))
 
 /*
- * The hardware supports concatenation of up to 16 tables at stage2 entry level
- * and we use the feature whenever possible.
+ * The hardware supports concatenation of up to 16 tables at stage2 entry
+ * level and we use the feature whenever possible, which means we resolve 4
+ * additional bits of address at the entry level.
  *
- * Now, the minimum number of bits resolved at any level is (PAGE_SHIFT - 3).
- * On arm64, the smallest PAGE_SIZE supported is 4k, which means
- *             (PAGE_SHIFT - 3) > 4 holds for all page sizes.
- * This implies, the total number of page table levels at stage2 expected
- * by the hardware is actually the number of levels required for (IPA_SHIFT - 4)
- * in normal translations(e.g, stage1), since we cannot have another level in
- * the range (IPA_SHIFT, IPA_SHIFT - 4).
+ * This implies, the total number of page table levels required for
+ * IPA_SHIFT at stage2 expected by the hardware can be calculated using
+ * the same logic used for the (non-collapsable) stage1 page tables but for
+ * (IPA_SHIFT - 4).
  */
 #define stage2_pgtable_levels(ipa)	ARM64_HW_PGTABLE_LEVELS((ipa) - 4)
-#define STAGE2_PGTABLE_LEVELS		stage2_pgtable_levels(KVM_PHYS_SHIFT)
 #define kvm_stage2_levels(kvm)		VTCR_EL2_LVLS(kvm->arch.vtcr)
-
-/*
- * With all the supported VA_BITs and 40bit guest IPA, the following condition
- * is always true:
- *
- *       STAGE2_PGTABLE_LEVELS <= CONFIG_PGTABLE_LEVELS
- *
- * We base our stage-2 page table walker helpers on this assumption and
- * fall back to using the host version of the helper wherever possible.
- * i.e, if a particular level is not folded (e.g, PUD) at stage2, we fall back
- * to using the host version, since it is guaranteed it is not folded at host.
- *
- * If the condition breaks in the future, we can rearrange the host level
- * definitions and reuse them for stage2. Till then...
- */
-#if STAGE2_PGTABLE_LEVELS > CONFIG_PGTABLE_LEVELS
-#error "Unsupported combination of guest IPA and host VA_BITS."
-#endif
-
 
 /* stage2_pgdir_shift() is the size mapped by top-level stage2 entry for the VM */
 #define stage2_pgdir_shift(kvm)		pt_levels_pgdir_shift(kvm_stage2_levels(kvm))

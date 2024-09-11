@@ -4,6 +4,8 @@
 
 #include <linux/neighbour.h>
 
+#include <linux/rh_kabi.h>
+
 /*
  *	Generic neighbour manipulation
  *
@@ -156,6 +158,9 @@ struct neighbour {
 	const struct neigh_ops	*ops;
 	struct rcu_head		rcu;
 	struct net_device	*dev;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 	u8			primary_key[0];
 } __randomize_layout;
 

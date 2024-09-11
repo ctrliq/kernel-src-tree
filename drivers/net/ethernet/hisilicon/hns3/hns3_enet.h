@@ -44,6 +44,7 @@ enum hns3_nic_state {
 #define HNS3_RING_TX_RING_BASEADDR_H_REG	0x00044
 #define HNS3_RING_TX_RING_BD_NUM_REG		0x00048
 #define HNS3_RING_TX_RING_BD_LEN_REG		0x0004C
+#define HNS3_RING_TX_RING_TC_REG		0x00050
 #define HNS3_RING_TX_RING_TAIL_REG		0x00058
 #define HNS3_RING_TX_RING_HEAD_REG		0x0005C
 #define HNS3_RING_TX_RING_FBDNUM_REG		0x00060
@@ -547,6 +548,8 @@ struct hns3_nic_priv {
 	/* Vxlan/Geneve information */
 	struct hns3_udp_tunnel udp_tnl[HNS3_UDP_TNL_MAX];
 	unsigned long active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
+	struct hns3_enet_coalesce tx_coal;
+	struct hns3_enet_coalesce rx_coal;
 };
 
 union l3_hdr_info {
@@ -590,7 +593,7 @@ static inline void hns3_write_reg(void __iomem *base, u32 reg, u32 value)
 #define hns3_write_dev(a, reg, value) \
 	hns3_write_reg((a)->io_base, (reg), (value))
 
-#define hnae_queue_xmit(tqp, buf_num) writel_relaxed(buf_num, \
+#define hnae3_queue_xmit(tqp, buf_num) writel_relaxed(buf_num, \
 		(tqp)->io_base + HNS3_RING_TX_RING_TAIL_REG)
 
 #define ring_to_dev(ring) (&(ring)->tqp->handle->pdev->dev)
@@ -600,9 +603,9 @@ static inline void hns3_write_reg(void __iomem *base, u32 reg, u32 value)
 
 #define tx_ring_data(priv, idx) ((priv)->ring_data[idx])
 
-#define hnae_buf_size(_ring) ((_ring)->buf_size)
-#define hnae_page_order(_ring) (get_order(hnae_buf_size(_ring)))
-#define hnae_page_size(_ring) (PAGE_SIZE << hnae_page_order(_ring))
+#define hnae3_buf_size(_ring) ((_ring)->buf_size)
+#define hnae3_page_order(_ring) (get_order(hnae3_buf_size(_ring)))
+#define hnae3_page_size(_ring) (PAGE_SIZE << hnae3_page_order(_ring))
 
 /* iterator for handling rings in ring group */
 #define hns3_for_each_ring(pos, head) \
@@ -636,6 +639,9 @@ void hns3_set_vector_coalesce_tx_gl(struct hns3_enet_tqp_vector *tqp_vector,
 				    u32 gl_value);
 void hns3_set_vector_coalesce_rl(struct hns3_enet_tqp_vector *tqp_vector,
 				 u32 rl_value);
+
+void hns3_enable_vlan_filter(struct net_device *netdev, bool enable);
+void hns3_update_promisc_mode(struct net_device *netdev, u8 promisc_flags);
 
 #ifdef CONFIG_HNS3_DCB
 void hns3_dcbnl_setup(struct hnae3_handle *handle);

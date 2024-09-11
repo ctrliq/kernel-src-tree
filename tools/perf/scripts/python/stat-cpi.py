@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#! /usr/bin/python3
 # SPDX-License-Identifier: GPL-2.0
 
 from __future__ import print_function
@@ -22,8 +22,8 @@ def store_key(time, cpu, thread):
         threads.append(thread)
 
 def store(time, event, cpu, thread, val, ena, run):
-    #print("event %s cpu %d, thread %d, time %d, val %d, ena %d, run %d" %
-    #      (event, cpu, thread, time, val, ena, run))
+    #print "event %s cpu %d, thread %d, time %d, val %d, ena %d, run %d" % \
+    #      (event, cpu, thread, time, val, ena, run)
 
     store_key(time, cpu, thread)
     key = get_key(time, event, cpu, thread)
@@ -61,7 +61,8 @@ def stat__interval(time):
             if ins != 0:
                 cpi = cyc/float(ins)
 
-            print("%15f: cpu %d, thread %d -> cpi %f (%d/%d)" % (time/(float(1000000000)), cpu, thread, cpi, cyc, ins))
+            print("%15f: cpu %d, thread %d -> cpi %f (%d/%d)" %
+                  (time/(float(1000000000)), cpu, thread, cpi, cyc, ins))
 
 def trace_end():
     pass
@@ -77,4 +78,4 @@ def trace_end():
 #                if ins != 0:
 #                    cpi = cyc/float(ins)
 #
-#                print("time %.9f, cpu %d, thread %d -> cpi %f" % (time/(float(1000000000)), cpu, thread, cpi))
+#                print "time %.9f, cpu %d, thread %d -> cpi %f" % (time/(float(1000000000)), cpu, thread, cpi)

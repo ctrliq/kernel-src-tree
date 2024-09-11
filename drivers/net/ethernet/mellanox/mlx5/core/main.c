@@ -62,6 +62,7 @@
 #include "accel/ipsec.h"
 #include "accel/tls.h"
 #include "lib/clock.h"
+#include "lib/vxlan.h"
 
 MODULE_AUTHOR("Eli Cohen <eli@mellanox.com>");
 MODULE_DESCRIPTION("Mellanox 5th generation network adapters (ConnectX series) core driver");
@@ -321,7 +322,9 @@ static int mlx5_alloc_irq_vectors(struct mlx5_core_dev *dev)
 {
 	struct mlx5_priv *priv = &dev->priv;
 	struct mlx5_eq_table *table = &priv->eq_table;
-	int num_eqs = 1 << MLX5_CAP_GEN(dev, log_max_eq);
+	int num_eqs = MLX5_CAP_GEN(dev, max_num_eqs) ?
+		      MLX5_CAP_GEN(dev, max_num_eqs) :
+		      1 << MLX5_CAP_GEN(dev, log_max_eq);
 	int nvec;
 	int err;
 
@@ -962,6 +965,8 @@ static int mlx5_init_once(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 
 	mlx5_init_clock(dev);
 
+	dev->vxlan = mlx5_vxlan_create(dev);
+
 	err = mlx5_init_rl_table(dev);
 	if (err) {
 		dev_err(&pdev->dev, "Failed to init rate limiting\n");
@@ -1003,6 +1008,7 @@ err_mpfs_cleanup:
 err_rl_cleanup:
 	mlx5_cleanup_rl_table(dev);
 err_tables_cleanup:
+	mlx5_vxlan_destroy(dev->vxlan);
 	mlx5_cleanup_mkey_table(dev);
 	mlx5_cleanup_srq_table(dev);
 	mlx5_cleanup_qp_table(dev);
@@ -1022,6 +1028,7 @@ static void mlx5_cleanup_once(struct mlx5_core_dev *dev)
 	mlx5_eswitch_cleanup(dev->priv.eswitch);
 	mlx5_mpfs_cleanup(dev);
 	mlx5_cleanup_rl_table(dev);
+	mlx5_vxlan_destroy(dev->vxlan);
 	mlx5_cleanup_clock(dev);
 	mlx5_cleanup_reserved_gids(dev);
 	mlx5_cleanup_mkey_table(dev);
@@ -1573,12 +1580,17 @@ static const struct pci_error_handlers mlx5_err_handler = {
 
 static int mlx5_try_fast_unload(struct mlx5_core_dev *dev)
 {
-	int ret;
+	bool fast_teardown = false, force_teardown = false;
+	int ret = 1;
 
-	if (!MLX5_CAP_GEN(dev, force_teardown)) {
-		mlx5_core_dbg(dev, "force teardown is not supported in the firmware\n");
+	fast_teardown = MLX5_CAP_GEN(dev, fast_teardown);
+	force_teardown = MLX5_CAP_GEN(dev, force_teardown);
+
+	mlx5_core_dbg(dev, "force teardown firmware support=%d\n", force_teardown);
+	mlx5_core_dbg(dev, "fast teardown firmware support=%d\n", fast_teardown);
+
+	if (!fast_teardown && !force_teardown)
 		return -EOPNOTSUPP;
-	}
 
 	if (dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR) {
 		mlx5_core_dbg(dev, "Device in internal error state, giving up\n");
@@ -1591,13 +1603,19 @@ static int mlx5_try_fast_unload(struct mlx5_core_dev *dev)
 	mlx5_drain_health_wq(dev);
 	mlx5_stop_health_poll(dev, false);
 
-	ret = mlx5_cmd_force_teardown_hca(dev);
-	if (ret) {
-		mlx5_core_dbg(dev, "Firmware couldn't do fast unload error: %d\n", ret);
-		mlx5_start_health_poll(dev);
-		return ret;
-	}
+	ret = mlx5_cmd_fast_teardown_hca(dev);
+	if (!ret)
+		goto succeed;
 
+	ret = mlx5_cmd_force_teardown_hca(dev);
+	if (!ret)
+		goto succeed;
+
+	mlx5_core_dbg(dev, "Firmware couldn't do fast unload error: %d\n", ret);
+	mlx5_start_health_poll(dev);
+	return ret;
+
+succeed:
 	mlx5_enter_error_state(dev, true);
 
 	/* Some platforms requiring freeing the IRQ's in the shutdown

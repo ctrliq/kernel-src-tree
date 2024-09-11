@@ -395,7 +395,7 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
 
 	map = swiotlb_tbl_map_single(dev, start_dma_addr, phys, size, dir,
 				     attrs);
-	if (map == SWIOTLB_MAP_ERROR)
+	if (map == DMA_MAPPING_ERROR)
 		return DMA_MAPPING_ERROR;
 
 	dev_addr = xen_phys_to_bus(map);
@@ -433,21 +433,8 @@ static void xen_unmap_single(struct device *hwdev, dma_addr_t dev_addr,
 	xen_dma_unmap_page(hwdev, dev_addr, size, dir, attrs);
 
 	/* NOTE: We use dev_addr here, not paddr! */
-	if (is_xen_swiotlb_buffer(dev_addr)) {
+	if (is_xen_swiotlb_buffer(dev_addr))
 		swiotlb_tbl_unmap_single(hwdev, paddr, size, dir, attrs);
-		return;
-	}
-
-	if (dir != DMA_FROM_DEVICE)
-		return;
-
-	/*
-	 * phys_to_virt doesn't work with hihgmem page but we could
-	 * call dma_mark_clean() with hihgmem page here. However, we
-	 * are fine since dma_mark_clean() is null on POWERPC. We can
-	 * make dma_mark_clean() take a physical address if necessary.
-	 */
-	dma_mark_clean(phys_to_virt(paddr), size);
 }
 
 static void xen_swiotlb_unmap_page(struct device *hwdev, dma_addr_t dev_addr,
@@ -485,11 +472,6 @@ xen_swiotlb_sync_single(struct device *hwdev, dma_addr_t dev_addr,
 
 	if (target == SYNC_FOR_DEVICE)
 		xen_dma_sync_single_for_device(hwdev, dev_addr, size, dir);
-
-	if (dir != DMA_FROM_DEVICE)
-		return;
-
-	dma_mark_clean(phys_to_virt(paddr), size);
 }
 
 void
@@ -564,7 +546,7 @@ xen_swiotlb_map_sg_attrs(struct device *hwdev, struct scatterlist *sgl,
 								 sg_phys(sg),
 								 sg->length,
 								 dir, attrs);
-			if (map == SWIOTLB_MAP_ERROR) {
+			if (map == DMA_MAPPING_ERROR) {
 				dev_warn(hwdev, "swiotlb buffer is full\n");
 				/* Don't panic here, we expect map_sg users
 				   to do proper error handling. */
@@ -660,7 +642,7 @@ xen_swiotlb_dma_mmap(struct device *dev, struct vm_area_struct *vma,
 		return xen_get_dma_ops(dev)->mmap(dev, vma, cpu_addr,
 						    dma_addr, size, attrs);
 #endif
-	return dma_common_mmap(dev, vma, cpu_addr, dma_addr, size);
+	return dma_common_mmap(dev, vma, cpu_addr, dma_addr, size, attrs);
 }
 
 /*

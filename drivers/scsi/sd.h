@@ -2,6 +2,8 @@
 #ifndef _SCSI_DISK_H
 #define _SCSI_DISK_H
 
+#include <linux/rh_kabi.h>
+
 /*
  * More than enough for everybody ;)  The huge number of majors
  * is a leftover from 16bit dev_t days, we don't really need that
@@ -73,7 +75,7 @@ struct scsi_disk {
 	struct device	dev;
 	struct gendisk	*disk;
 	struct opal_dev *opal_dev;
-#ifdef CONFIG_BLK_DEV_ZONED
+#if 1 /* CONFIG_BLK_DEV_ZONED */
 	u32		nr_zones;
 	u32		zone_blocks;
 	u32		zones_optimal_open;
@@ -116,6 +118,14 @@ struct scsi_disk {
 	unsigned	urswrz : 1;
 	unsigned	security : 1;
 	unsigned	ignore_medium_access_errors : 1;
+
+	/* FOR RH USE ONLY
+	 *
+	 * The following padding has been inserted before ABI freeze to
+	 * allow extending the structure while preserving ABI.
+	 */
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
 };
 #define to_scsi_disk(obj) container_of(obj,struct scsi_disk,dev)
 

@@ -29,43 +29,16 @@
  */
 static int p9_supported_radix_bits[4] = { 5, 9, 9, 13 };
 
-/*
- * Used to walk a partition or process table radix tree in guest memory
- * Note: We exploit the fact that a partition table and a process
- * table have the same layout, a partition-scoped page table and a
- * process-scoped page table have the same layout, and the 2nd
- * doubleword of a partition table entry has the same layout as
- * the PTCR register.
- */
-int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
-				     struct kvmppc_pte *gpte, u64 table,
-				     int table_index, u64 *pte_ret_p)
+int kvmppc_mmu_walk_radix_tree(struct kvm_vcpu *vcpu, gva_t eaddr,
+			       struct kvmppc_pte *gpte, u64 root,
+			       u64 *pte_ret_p)
 {
 	struct kvm *kvm = vcpu->kvm;
 	int ret, level, ps;
-	unsigned long ptbl, root;
-	unsigned long rts, bits, offset;
-	unsigned long size, index;
-	struct prtb_entry entry;
+	unsigned long rts, bits, offset, index;
 	u64 pte, base, gpa;
 	__be64 rpte;
 
-	if ((table & PRTS_MASK) > 24)
-		return -EINVAL;
-	size = 1ul << ((table & PRTS_MASK) + 12);
-
-	/* Is the table big enough to contain this entry? */
-	if ((table_index * sizeof(entry)) >= size)
-		return -EINVAL;
-
-	/* Read the table to find the root of the radix tree */
-	ptbl = (table & PRTB_MASK) + (table_index * sizeof(entry));
-	ret = kvm_read_guest(kvm, ptbl, &entry, sizeof(entry));
-	if (ret)
-		return ret;
-
-	/* Root is stored in the first double word */
-	root = be64_to_cpu(entry.prtb0);
 	rts = ((root & RTS1_MASK) >> (RTS1_SHIFT - 3)) |
 		((root & RTS2_MASK) >> RTS2_SHIFT);
 	bits = root & RPDS_MASK;
@@ -79,6 +52,7 @@ int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
 
 	/* Walk each level of the radix tree */
 	for (level = 3; level >= 0; --level) {
+		u64 addr;
 		/* Check a valid size */
 		if (level && bits != p9_supported_radix_bits[level])
 			return -EINVAL;
@@ -90,10 +64,13 @@ int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
 		if (base & ((1UL << (bits + 3)) - 1))
 			return -EINVAL;
 		/* Read the entry from guest memory */
-		ret = kvm_read_guest(kvm, base + (index * sizeof(rpte)),
-				     &rpte, sizeof(rpte));
-		if (ret)
+		addr = base + (index * sizeof(rpte));
+		ret = kvm_read_guest(kvm, addr, &rpte, sizeof(rpte));
+		if (ret) {
+			if (pte_ret_p)
+				*pte_ret_p = addr;
 			return ret;
+		}
 		pte = __be64_to_cpu(rpte);
 		if (!(pte & _PAGE_PRESENT))
 			return -ENOENT;
@@ -119,6 +96,7 @@ int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
 		if (offset == mmu_psize_defs[ps].shift)
 			break;
 	gpte->page_size = ps;
+	gpte->page_shift = offset;
 
 	gpte->eaddr = eaddr;
 	gpte->raddr = gpa;
@@ -128,10 +106,49 @@ int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
 	gpte->may_write = !!(pte & _PAGE_WRITE);
 	gpte->may_execute = !!(pte & _PAGE_EXEC);
 
+	gpte->rc = pte & (_PAGE_ACCESSED | _PAGE_DIRTY);
+
 	if (pte_ret_p)
 		*pte_ret_p = pte;
 
 	return 0;
+}
+
+/*
+ * Used to walk a partition or process table radix tree in guest memory
+ * Note: We exploit the fact that a partition table and a process
+ * table have the same layout, a partition-scoped page table and a
+ * process-scoped page table have the same layout, and the 2nd
+ * doubleword of a partition table entry has the same layout as
+ * the PTCR register.
+ */
+int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
+				     struct kvmppc_pte *gpte, u64 table,
+				     int table_index, u64 *pte_ret_p)
+{
+	struct kvm *kvm = vcpu->kvm;
+	int ret;
+	unsigned long size, ptbl, root;
+	struct prtb_entry entry;
+
+	if ((table & PRTS_MASK) > 24)
+		return -EINVAL;
+	size = 1ul << ((table & PRTS_MASK) + 12);
+
+	/* Is the table big enough to contain this entry? */
+	if ((table_index * sizeof(entry)) >= size)
+		return -EINVAL;
+
+	/* Read the table to find the root of the radix tree */
+	ptbl = (table & PRTB_MASK) + (table_index * sizeof(entry));
+	ret = kvm_read_guest(kvm, ptbl, &entry, sizeof(entry));
+	if (ret)
+		return ret;
+
+	/* Root is stored in the first double word */
+	root = be64_to_cpu(entry.prtb0);
+
+	return kvmppc_mmu_walk_radix_tree(vcpu, eaddr, gpte, root, pte_ret_p);
 }
 
 int kvmppc_mmu_radix_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
@@ -180,21 +197,47 @@ int kvmppc_mmu_radix_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
 	return 0;
 }
 
-static void kvmppc_radix_tlbie_page(struct kvm *kvm, unsigned long addr,
-				    unsigned int pshift)
+void kvmppc_radix_tlbie_page(struct kvm *kvm, unsigned long addr,
+			     unsigned int pshift, unsigned int lpid)
 {
 	unsigned long psize = PAGE_SIZE;
+	int psi;
+	long rc;
+	unsigned long rb;
 
 	if (pshift)
 		psize = 1UL << pshift;
+	else
+		pshift = PAGE_SHIFT;
 
 	addr &= ~(psize - 1);
-	radix__flush_tlb_lpid_page(kvm->arch.lpid, addr, psize);
+
+	if (!kvmhv_on_pseries()) {
+		radix__flush_tlb_lpid_page(lpid, addr, psize);
+		return;
+	}
+
+	psi = shift_to_mmu_psize(pshift);
+	rb = addr | (mmu_get_ap(psi) << PPC_BITLSHIFT(58));
+	rc = plpar_hcall_norets(H_TLB_INVALIDATE, H_TLBIE_P1_ENC(0, 0, 1),
+				lpid, rb);
+	if (rc)
+		pr_err("KVM: TLB page invalidation hcall failed, rc=%ld\n", rc);
 }
 
-static void kvmppc_radix_flush_pwc(struct kvm *kvm)
+static void kvmppc_radix_flush_pwc(struct kvm *kvm, unsigned int lpid)
 {
-	radix__flush_pwc_lpid(kvm->arch.lpid);
+	long rc;
+
+	if (!kvmhv_on_pseries()) {
+		radix__flush_pwc_lpid(lpid);
+		return;
+	}
+
+	rc = plpar_hcall_norets(H_TLB_INVALIDATE, H_TLBIE_P1_ENC(1, 0, 1),
+				lpid, TLBIEL_INVAL_SET_LPID);
+	if (rc)
+		pr_err("KVM: TLB PWC invalidation hcall failed, rc=%ld\n", rc);
 }
 
 static unsigned long kvmppc_radix_update_pte(struct kvm *kvm, pte_t *ptep,
@@ -239,26 +282,39 @@ static void kvmppc_pmd_free(pmd_t *pmdp)
 	kmem_cache_free(kvm_pmd_cache, pmdp);
 }
 
-static void kvmppc_unmap_pte(struct kvm *kvm, pte_t *pte,
-			     unsigned long gpa, unsigned int shift,
-			     struct kvm_memory_slot *memslot)
+/* Called with kvm->mmu_lock held */
+void kvmppc_unmap_pte(struct kvm *kvm, pte_t *pte, unsigned long gpa,
+		      unsigned int shift,
+		      const struct kvm_memory_slot *memslot,
+		      unsigned int lpid)
 
 {
 	unsigned long old;
+	unsigned long gfn = gpa >> PAGE_SHIFT;
+	unsigned long page_size = PAGE_SIZE;
+	unsigned long hpa;
 
 	old = kvmppc_radix_update_pte(kvm, pte, ~0UL, 0, gpa, shift);
-	kvmppc_radix_tlbie_page(kvm, gpa, shift);
-	if (old & _PAGE_DIRTY) {
-		unsigned long gfn = gpa >> PAGE_SHIFT;
-		unsigned long page_size = PAGE_SIZE;
+	kvmppc_radix_tlbie_page(kvm, gpa, shift, lpid);
 
-		if (shift)
-			page_size = 1ul << shift;
+	/* The following only applies to L1 entries */
+	if (lpid != kvm->arch.lpid)
+		return;
+
+	if (!memslot) {
+		memslot = gfn_to_memslot(kvm, gfn);
 		if (!memslot)
-			memslot = gfn_to_memslot(kvm, gfn);
-		if (memslot && memslot->dirty_bitmap)
-			kvmppc_update_dirty_map(memslot, gfn, page_size);
+			return;
 	}
+	if (shift)
+		page_size = 1ul << shift;
+
+	gpa &= ~(page_size - 1);
+	hpa = old & PTE_RPN_MASK;
+	kvmhv_remove_nest_rmap_range(kvm, memslot, gpa, hpa, page_size);
+
+	if ((old & _PAGE_DIRTY) && memslot->dirty_bitmap)
+		kvmppc_update_dirty_map(memslot, gfn, page_size);
 }
 
 /*
@@ -271,7 +327,8 @@ static void kvmppc_unmap_pte(struct kvm *kvm, pte_t *pte,
  * and emit a warning if encountered, but there may already be data
  * corruption due to the unexpected mappings.
  */
-static void kvmppc_unmap_free_pte(struct kvm *kvm, pte_t *pte, bool full)
+static void kvmppc_unmap_free_pte(struct kvm *kvm, pte_t *pte, bool full,
+				  unsigned int lpid)
 {
 	if (full) {
 		memset(pte, 0, sizeof(long) << PTE_INDEX_SIZE);
@@ -285,14 +342,15 @@ static void kvmppc_unmap_free_pte(struct kvm *kvm, pte_t *pte, bool full)
 			WARN_ON_ONCE(1);
 			kvmppc_unmap_pte(kvm, p,
 					 pte_pfn(*p) << PAGE_SHIFT,
-					 PAGE_SHIFT, NULL);
+					 PAGE_SHIFT, NULL, lpid);
 		}
 	}
 
 	kvmppc_pte_free(pte);
 }
 
-static void kvmppc_unmap_free_pmd(struct kvm *kvm, pmd_t *pmd, bool full)
+static void kvmppc_unmap_free_pmd(struct kvm *kvm, pmd_t *pmd, bool full,
+				  unsigned int lpid)
 {
 	unsigned long im;
 	pmd_t *p = pmd;
@@ -307,20 +365,21 @@ static void kvmppc_unmap_free_pmd(struct kvm *kvm, pmd_t *pmd, bool full)
 				WARN_ON_ONCE(1);
 				kvmppc_unmap_pte(kvm, (pte_t *)p,
 					 pte_pfn(*(pte_t *)p) << PAGE_SHIFT,
-					 PMD_SHIFT, NULL);
+					 PMD_SHIFT, NULL, lpid);
 			}
 		} else {
 			pte_t *pte;
 
 			pte = pte_offset_map(p, 0);
-			kvmppc_unmap_free_pte(kvm, pte, full);
+			kvmppc_unmap_free_pte(kvm, pte, full, lpid);
 			pmd_clear(p);
 		}
 	}
 	kvmppc_pmd_free(pmd);
 }
 
-static void kvmppc_unmap_free_pud(struct kvm *kvm, pud_t *pud)
+static void kvmppc_unmap_free_pud(struct kvm *kvm, pud_t *pud,
+				  unsigned int lpid)
 {
 	unsigned long iu;
 	pud_t *p = pud;
@@ -334,36 +393,40 @@ static void kvmppc_unmap_free_pud(struct kvm *kvm, pud_t *pud)
 			pmd_t *pmd;
 
 			pmd = pmd_offset(p, 0);
-			kvmppc_unmap_free_pmd(kvm, pmd, true);
+			kvmppc_unmap_free_pmd(kvm, pmd, true, lpid);
 			pud_clear(p);
 		}
 	}
 	pud_free(kvm->mm, pud);
 }
 
-void kvmppc_free_radix(struct kvm *kvm)
+void kvmppc_free_pgtable_radix(struct kvm *kvm, pgd_t *pgd, unsigned int lpid)
 {
 	unsigned long ig;
-	pgd_t *pgd;
 
-	if (!kvm->arch.pgtable)
-		return;
-	pgd = kvm->arch.pgtable;
 	for (ig = 0; ig < PTRS_PER_PGD; ++ig, ++pgd) {
 		pud_t *pud;
 
 		if (!pgd_present(*pgd))
 			continue;
 		pud = pud_offset(pgd, 0);
-		kvmppc_unmap_free_pud(kvm, pud);
+		kvmppc_unmap_free_pud(kvm, pud, lpid);
 		pgd_clear(pgd);
 	}
-	pgd_free(kvm->mm, kvm->arch.pgtable);
-	kvm->arch.pgtable = NULL;
+}
+
+void kvmppc_free_radix(struct kvm *kvm)
+{
+	if (kvm->arch.pgtable) {
+		kvmppc_free_pgtable_radix(kvm, kvm->arch.pgtable,
+					  kvm->arch.lpid);
+		pgd_free(kvm->mm, kvm->arch.pgtable);
+		kvm->arch.pgtable = NULL;
+	}
 }
 
 static void kvmppc_unmap_free_pmd_entry_table(struct kvm *kvm, pmd_t *pmd,
-					      unsigned long gpa)
+					unsigned long gpa, unsigned int lpid)
 {
 	pte_t *pte = pte_offset_kernel(pmd, 0);
 
@@ -373,13 +436,13 @@ static void kvmppc_unmap_free_pmd_entry_table(struct kvm *kvm, pmd_t *pmd,
 	 * flushing the PWC again.
 	 */
 	pmd_clear(pmd);
-	kvmppc_radix_flush_pwc(kvm);
+	kvmppc_radix_flush_pwc(kvm, lpid);
 
-	kvmppc_unmap_free_pte(kvm, pte, false);
+	kvmppc_unmap_free_pte(kvm, pte, false, lpid);
 }
 
 static void kvmppc_unmap_free_pud_entry_table(struct kvm *kvm, pud_t *pud,
-					unsigned long gpa)
+					unsigned long gpa, unsigned int lpid)
 {
 	pmd_t *pmd = pmd_offset(pud, 0);
 
@@ -389,9 +452,9 @@ static void kvmppc_unmap_free_pud_entry_table(struct kvm *kvm, pud_t *pud,
 	 * so can be freed without flushing the PWC again.
 	 */
 	pud_clear(pud);
-	kvmppc_radix_flush_pwc(kvm);
+	kvmppc_radix_flush_pwc(kvm, lpid);
 
-	kvmppc_unmap_free_pmd(kvm, pmd, false);
+	kvmppc_unmap_free_pmd(kvm, pmd, false, lpid);
 }
 
 /*
@@ -403,9 +466,10 @@ static void kvmppc_unmap_free_pud_entry_table(struct kvm *kvm, pud_t *pud,
  */
 #define PTE_BITS_MUST_MATCH (~(_PAGE_WRITE | _PAGE_DIRTY | _PAGE_ACCESSED))
 
-static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
-			     unsigned long gpa, unsigned int level,
-			     unsigned long mmu_seq)
+int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
+		      unsigned long gpa, unsigned int level,
+		      unsigned long mmu_seq, unsigned int lpid,
+		      unsigned long *rmapp, struct rmap_nested **n_rmap)
 {
 	pgd_t *pgd;
 	pud_t *pud, *new_pud = NULL;
@@ -471,7 +535,8 @@ static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
 			goto out_unlock;
 		}
 		/* Valid 1GB page here already, remove it */
-		kvmppc_unmap_pte(kvm, (pte_t *)pud, hgpa, PUD_SHIFT, NULL);
+		kvmppc_unmap_pte(kvm, (pte_t *)pud, hgpa, PUD_SHIFT, NULL,
+				 lpid);
 	}
 	if (level == 2) {
 		if (!pud_none(*pud)) {
@@ -480,9 +545,11 @@ static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
 			 * install a large page, so remove and free the page
 			 * table page.
 			 */
-			kvmppc_unmap_free_pud_entry_table(kvm, pud, gpa);
+			kvmppc_unmap_free_pud_entry_table(kvm, pud, gpa, lpid);
 		}
 		kvmppc_radix_set_pte_at(kvm, gpa, (pte_t *)pud, pte);
+		if (rmapp && n_rmap)
+			kvmhv_insert_nest_rmap(kvm, rmapp, n_rmap);
 		ret = 0;
 		goto out_unlock;
 	}
@@ -506,7 +573,7 @@ static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
 			WARN_ON_ONCE((pmd_val(*pmd) ^ pte_val(pte)) &
 							PTE_BITS_MUST_MATCH);
 			kvmppc_radix_update_pte(kvm, pmdp_ptep(pmd),
-					      0, pte_val(pte), lgpa, PMD_SHIFT);
+					0, pte_val(pte), lgpa, PMD_SHIFT);
 			ret = 0;
 			goto out_unlock;
 		}
@@ -520,7 +587,8 @@ static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
 			goto out_unlock;
 		}
 		/* Valid 2MB page here already, remove it */
-		kvmppc_unmap_pte(kvm, pmdp_ptep(pmd), lgpa, PMD_SHIFT, NULL);
+		kvmppc_unmap_pte(kvm, pmdp_ptep(pmd), lgpa, PMD_SHIFT, NULL,
+				 lpid);
 	}
 	if (level == 1) {
 		if (!pmd_none(*pmd)) {
@@ -529,9 +597,11 @@ static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
 			 * install a large page, so remove and free the page
 			 * table page.
 			 */
-			kvmppc_unmap_free_pmd_entry_table(kvm, pmd, gpa);
+			kvmppc_unmap_free_pmd_entry_table(kvm, pmd, gpa, lpid);
 		}
 		kvmppc_radix_set_pte_at(kvm, gpa, pmdp_ptep(pmd), pte);
+		if (rmapp && n_rmap)
+			kvmhv_insert_nest_rmap(kvm, rmapp, n_rmap);
 		ret = 0;
 		goto out_unlock;
 	}
@@ -556,6 +626,8 @@ static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
 		goto out_unlock;
 	}
 	kvmppc_radix_set_pte_at(kvm, gpa, ptep, pte);
+	if (rmapp && n_rmap)
+		kvmhv_insert_nest_rmap(kvm, rmapp, n_rmap);
 	ret = 0;
 
  out_unlock:
@@ -569,8 +641,8 @@ static int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
 	return ret;
 }
 
-static bool kvmppc_hv_handle_set_rc(struct kvm *kvm, pgd_t *pgtable,
-				    bool writing, unsigned long gpa)
+bool kvmppc_hv_handle_set_rc(struct kvm *kvm, pgd_t *pgtable, bool writing,
+			     unsigned long gpa, unsigned int lpid)
 {
 	unsigned long pgflags;
 	unsigned int shift;
@@ -597,11 +669,11 @@ static bool kvmppc_hv_handle_set_rc(struct kvm *kvm, pgd_t *pgtable,
 	return false;
 }
 
-static int kvmppc_book3s_instantiate_page(struct kvm_vcpu *vcpu,
-				unsigned long gpa,
-				struct kvm_memory_slot *memslot,
-				bool writing, bool kvm_ro,
-				pte_t *inserted_pte, unsigned int *levelp)
+int kvmppc_book3s_instantiate_page(struct kvm_vcpu *vcpu,
+				   unsigned long gpa,
+				   struct kvm_memory_slot *memslot,
+				   bool writing, bool kvm_ro,
+				   pte_t *inserted_pte, unsigned int *levelp)
 {
 	struct kvm *kvm = vcpu->kvm;
 	struct page *page = NULL;
@@ -697,7 +769,7 @@ static int kvmppc_book3s_instantiate_page(struct kvm_vcpu *vcpu,
 
 	/* Allocate space in the tree and write the PTE */
 	ret = kvmppc_create_pte(kvm, kvm->arch.pgtable, pte, gpa, level,
-				mmu_seq);
+				mmu_seq, kvm->arch.lpid, NULL, NULL);
 	if (inserted_pte)
 		*inserted_pte = pte;
 	if (levelp)
@@ -772,7 +844,7 @@ int kvmppc_book3s_radix_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
 	if (dsisr & DSISR_SET_RC) {
 		spin_lock(&kvm->mmu_lock);
 		if (kvmppc_hv_handle_set_rc(kvm, kvm->arch.pgtable,
-					    writing, gpa))
+					    writing, gpa, kvm->arch.lpid))
 			dsisr &= ~DSISR_SET_RC;
 		spin_unlock(&kvm->mmu_lock);
 
@@ -790,7 +862,7 @@ int kvmppc_book3s_radix_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
 	return ret;
 }
 
-/* Called with kvm->lock held */
+/* Called with kvm->mmu_lock held */
 int kvm_unmap_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		    unsigned long gfn)
 {
@@ -800,11 +872,12 @@ int kvm_unmap_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
 
 	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
 	if (ptep && pte_present(*ptep))
-		kvmppc_unmap_pte(kvm, ptep, gpa, shift, memslot);
+		kvmppc_unmap_pte(kvm, ptep, gpa, shift, memslot,
+				 kvm->arch.lpid);
 	return 0;				
 }
 
-/* Called with kvm->lock held */
+/* Called with kvm->mmu_lock held */
 int kvm_age_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		  unsigned long gfn)
 {
@@ -812,18 +885,24 @@ int kvm_age_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	unsigned long gpa = gfn << PAGE_SHIFT;
 	unsigned int shift;
 	int ref = 0;
+	unsigned long old, *rmapp;
 
 	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
 	if (ptep && pte_present(*ptep) && pte_young(*ptep)) {
-		kvmppc_radix_update_pte(kvm, ptep, _PAGE_ACCESSED, 0,
-					gpa, shift);
+		old = kvmppc_radix_update_pte(kvm, ptep, _PAGE_ACCESSED, 0,
+					      gpa, shift);
 		/* XXX need to flush tlb here? */
+		/* Also clear bit in ptes in shadow pgtable for nested guests */
+		rmapp = &memslot->arch.rmap[gfn - memslot->base_gfn];
+		kvmhv_update_nest_rmap_rc_list(kvm, rmapp, _PAGE_ACCESSED, 0,
+					       old & PTE_RPN_MASK,
+					       1UL << shift);
 		ref = 1;
 	}
 	return ref;
 }
 
-/* Called with kvm->lock held */
+/* Called with kvm->mmu_lock held */
 int kvm_test_age_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		       unsigned long gfn)
 {
@@ -847,15 +926,23 @@ static int kvm_radix_test_clear_dirty(struct kvm *kvm,
 	pte_t *ptep;
 	unsigned int shift;
 	int ret = 0;
+	unsigned long old, *rmapp;
 
 	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
 	if (ptep && pte_present(*ptep) && pte_dirty(*ptep)) {
 		ret = 1;
 		if (shift)
 			ret = 1 << (shift - PAGE_SHIFT);
-		kvmppc_radix_update_pte(kvm, ptep, _PAGE_DIRTY, 0,
-					gpa, shift);
-		kvmppc_radix_tlbie_page(kvm, gpa, shift);
+		spin_lock(&kvm->mmu_lock);
+		old = kvmppc_radix_update_pte(kvm, ptep, _PAGE_DIRTY, 0,
+					      gpa, shift);
+		kvmppc_radix_tlbie_page(kvm, gpa, shift, kvm->arch.lpid);
+		/* Also clear bit in ptes in shadow pgtable for nested guests */
+		rmapp = &memslot->arch.rmap[gfn - memslot->base_gfn];
+		kvmhv_update_nest_rmap_rc_list(kvm, rmapp, _PAGE_DIRTY, 0,
+					       old & PTE_RPN_MASK,
+					       1UL << shift);
+		spin_unlock(&kvm->mmu_lock);
 	}
 	return ret;
 }
@@ -964,6 +1051,7 @@ struct debugfs_radix_state {
 	struct kvm	*kvm;
 	struct mutex	mutex;
 	unsigned long	gpa;
+	int		lpid;
 	int		chars_left;
 	int		buf_index;
 	char		buf[128];
@@ -1005,6 +1093,7 @@ static ssize_t debugfs_radix_read(struct file *file, char __user *buf,
 	struct kvm *kvm;
 	unsigned long gpa;
 	pgd_t *pgt;
+	struct kvm_nested_guest *nested;
 	pgd_t pgd, *pgdp;
 	pud_t pud, *pudp;
 	pmd_t pmd, *pmdp;
@@ -1039,10 +1128,39 @@ static ssize_t debugfs_radix_read(struct file *file, char __user *buf,
 	}
 
 	gpa = p->gpa;
-	pgt = kvm->arch.pgtable;
-	while (len != 0 && gpa < RADIX_PGTABLE_RANGE) {
+	nested = NULL;
+	pgt = NULL;
+	while (len != 0 && p->lpid >= 0) {
+		if (gpa >= RADIX_PGTABLE_RANGE) {
+			gpa = 0;
+			pgt = NULL;
+			if (nested) {
+				kvmhv_put_nested(nested);
+				nested = NULL;
+			}
+			p->lpid = kvmhv_nested_next_lpid(kvm, p->lpid);
+			p->hdr = 0;
+			if (p->lpid < 0)
+				break;
+		}
+		if (!pgt) {
+			if (p->lpid == 0) {
+				pgt = kvm->arch.pgtable;
+			} else {
+				nested = kvmhv_get_nested(kvm, p->lpid, false);
+				if (!nested) {
+					gpa = RADIX_PGTABLE_RANGE;
+					continue;
+				}
+				pgt = nested->shadow_pgtable;
+			}
+		}
+		n = 0;
 		if (!p->hdr) {
-			n = scnprintf(p->buf, sizeof(p->buf),
+			if (p->lpid > 0)
+				n = scnprintf(p->buf, sizeof(p->buf),
+					      "\nNested LPID %d: ", p->lpid);
+			n += scnprintf(p->buf + n, sizeof(p->buf) - n,
 				      "pgdir: %lx\n", (unsigned long)pgt);
 			p->hdr = 1;
 			goto copy;
@@ -1108,6 +1226,8 @@ static ssize_t debugfs_radix_read(struct file *file, char __user *buf,
 		}
 	}
 	p->gpa = gpa;
+	if (nested)
+		kvmhv_put_nested(nested);
 
  out:
 	mutex_unlock(&p->mutex);

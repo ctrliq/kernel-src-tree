@@ -188,13 +188,32 @@ extern int kvmppc_book3s_hcall_implemented(struct kvm *kvm, unsigned long hc);
 extern int kvmppc_book3s_radix_page_fault(struct kvm_run *run,
 			struct kvm_vcpu *vcpu,
 			unsigned long ea, unsigned long dsisr);
+extern int kvmppc_mmu_walk_radix_tree(struct kvm_vcpu *vcpu, gva_t eaddr,
+				      struct kvmppc_pte *gpte, u64 root,
+				      u64 *pte_ret_p);
 extern int kvmppc_mmu_radix_translate_table(struct kvm_vcpu *vcpu, gva_t eaddr,
 			struct kvmppc_pte *gpte, u64 table,
 			int table_index, u64 *pte_ret_p);
 extern int kvmppc_mmu_radix_xlate(struct kvm_vcpu *vcpu, gva_t eaddr,
 			struct kvmppc_pte *gpte, bool data, bool iswrite);
+extern void kvmppc_radix_tlbie_page(struct kvm *kvm, unsigned long addr,
+				    unsigned int pshift, unsigned int lpid);
+extern void kvmppc_unmap_pte(struct kvm *kvm, pte_t *pte, unsigned long gpa,
+			unsigned int shift,
+			const struct kvm_memory_slot *memslot,
+			unsigned int lpid);
+extern bool kvmppc_hv_handle_set_rc(struct kvm *kvm, pgd_t *pgtable,
+				    bool writing, unsigned long gpa,
+				    unsigned int lpid);
+extern int kvmppc_book3s_instantiate_page(struct kvm_vcpu *vcpu,
+				unsigned long gpa,
+				struct kvm_memory_slot *memslot,
+				bool writing, bool kvm_ro,
+				pte_t *inserted_pte, unsigned int *levelp);
 extern int kvmppc_init_vm_radix(struct kvm *kvm);
 extern void kvmppc_free_radix(struct kvm *kvm);
+extern void kvmppc_free_pgtable_radix(struct kvm *kvm, pgd_t *pgd,
+				      unsigned int lpid);
 extern int kvmppc_radix_init(void);
 extern void kvmppc_radix_exit(void);
 extern int kvm_unmap_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
@@ -224,7 +243,7 @@ extern kvm_pfn_t kvmppc_gpa_to_pfn(struct kvm_vcpu *vcpu, gpa_t gpa,
 			bool writing, bool *writable);
 extern void kvmppc_add_revmap_chain(struct kvm *kvm, struct revmap_entry *rev,
 			unsigned long *rmap, long pte_index, int realmode);
-extern void kvmppc_update_dirty_map(struct kvm_memory_slot *memslot,
+extern void kvmppc_update_dirty_map(const struct kvm_memory_slot *memslot,
 			unsigned long gfn, unsigned long psize);
 extern void kvmppc_invalidate_hpte(struct kvm *kvm, __be64 *hptep,
 			unsigned long pte_index);
@@ -282,6 +301,14 @@ void kvmhv_vm_nested_init(struct kvm *kvm);
 long kvmhv_set_partition_table(struct kvm_vcpu *vcpu);
 void kvmhv_set_ptbl_entry(unsigned int lpid, u64 dw0, u64 dw1);
 void kvmhv_release_all_nested(struct kvm *kvm);
+long kvmhv_enter_nested_guest(struct kvm_vcpu *vcpu);
+long kvmhv_do_nested_tlbie(struct kvm_vcpu *vcpu);
+int kvmhv_run_single_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu,
+			  u64 time_limit, unsigned long lpcr);
+void kvmhv_save_hv_regs(struct kvm_vcpu *vcpu, struct hv_guest_state *hr);
+void kvmhv_restore_hv_return_state(struct kvm_vcpu *vcpu,
+				   struct hv_guest_state *hr);
+long int kvmhv_nested_page_fault(struct kvm_vcpu *vcpu);
 
 void kvmppc_giveup_fac(struct kvm_vcpu *vcpu, ulong fac);
 

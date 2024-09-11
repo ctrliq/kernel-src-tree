@@ -35,8 +35,8 @@
 /*
  * MegaRAID SAS Driver meta data
  */
-#define MEGASAS_VERSION				"07.706.03.00-rc1"
-#define MEGASAS_RELDATE				"May 21, 2018"
+#define MEGASAS_VERSION				"07.707.50.00-rc1"
+#define MEGASAS_RELDATE				"December 18, 2018"
 
 /*
  * Device IDs
@@ -1553,6 +1553,7 @@ enum MR_ADAPTER_TYPE {
 	THUNDERBOLT_SERIES = 2,
 	INVADER_SERIES = 3,
 	VENTURA_SERIES = 4,
+	AERO_SERIES = 5,
 };
 
 /*

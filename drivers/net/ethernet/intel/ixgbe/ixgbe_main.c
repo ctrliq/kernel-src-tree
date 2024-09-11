@@ -159,7 +159,7 @@ MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
 
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION("Intel(R) 10 Gigabit PCI Express Network Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
 
 static struct workqueue_struct *ixgbe_wq;
@@ -9016,14 +9016,12 @@ static int parse_tc_actions(struct ixgbe_adapter *adapter,
 			    struct tcf_exts *exts, u64 *action, u8 *queue)
 {
 	const struct tc_action *a;
-	LIST_HEAD(actions);
+	int i;
 
 	if (!tcf_exts_has_actions(exts))
 		return -EINVAL;
 
-	tcf_exts_to_list(exts, &actions);
-	list_for_each_entry(a, &actions, list) {
-
+	tcf_exts_for_each_action(i, a, exts) {
 		/* Drop action */
 		if (is_tcf_gact_shot(a)) {
 			*action = IXGBE_FDIR_DROP_QUEUE;

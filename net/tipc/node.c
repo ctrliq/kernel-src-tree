@@ -848,6 +848,7 @@ void tipc_node_check_dest(struct net *net, u32 addr,
 	bool reset = true;
 	char *if_name;
 	unsigned long intv;
+	u16 session;
 
 	*dupl_addr = false;
 	*respond = false;
@@ -934,9 +935,10 @@ void tipc_node_check_dest(struct net *net, u32 addr,
 			goto exit;
 
 		if_name = strchr(b->name, ':') + 1;
+		get_random_bytes(&session, sizeof(u16));
 		if (!tipc_link_create(net, if_name, b->identity, b->tolerance,
 				      b->net_plane, b->mtu, b->priority,
-				      b->window, mod(tipc_net(net)->random),
+				      b->window, session,
 				      tipc_own_addr(net), addr, peer_id,
 				      n->capabilities,
 				      tipc_bc_sndlink(n->net), n->bc_entry.link,

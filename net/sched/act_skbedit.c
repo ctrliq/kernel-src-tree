@@ -37,14 +37,18 @@ static int tcf_skbedit_act(struct sk_buff *skb, const struct tc_action *a,
 			   struct tcf_result *res)
 {
 	struct tcf_skbedit *d = to_skbedit(a);
+	struct tcf_skbedit_params *params;
+	int action;
 
-	spin_lock(&d->tcf_lock);
 	tcf_lastuse_update(&d->tcf_tm);
-	bstats_update(&d->tcf_bstats, skb);
+	bstats_cpu_update(this_cpu_ptr(d->common.cpu_bstats), skb);
 
-	if (d->flags & SKBEDIT_F_PRIORITY)
-		skb->priority = d->priority;
-	if (d->flags & SKBEDIT_F_INHERITDSFIELD) {
+	params = rcu_dereference_bh(d->params);
+	action = READ_ONCE(d->tcf_action);
+
+	if (params->flags & SKBEDIT_F_PRIORITY)
+		skb->priority = params->priority;
+	if (params->flags & SKBEDIT_F_INHERITDSFIELD) {
 		int wlen = skb_network_offset(skb);
 
 		switch (tc_skb_protocol(skb)) {
@@ -63,22 +67,19 @@ static int tcf_skbedit_act(struct sk_buff *skb, const struct tc_action *a,
 			break;
 		}
 	}
-	if (d->flags & SKBEDIT_F_QUEUE_MAPPING &&
-	    skb->dev->real_num_tx_queues > d->queue_mapping)
-		skb_set_queue_mapping(skb, d->queue_mapping);
-	if (d->flags & SKBEDIT_F_MARK) {
-		skb->mark &= ~d->mask;
-		skb->mark |= d->mark & d->mask;
+	if (params->flags & SKBEDIT_F_QUEUE_MAPPING &&
+	    skb->dev->real_num_tx_queues > params->queue_mapping)
+		skb_set_queue_mapping(skb, params->queue_mapping);
+	if (params->flags & SKBEDIT_F_MARK) {
+		skb->mark &= ~params->mask;
+		skb->mark |= params->mark & params->mask;
 	}
-	if (d->flags & SKBEDIT_F_PTYPE)
-		skb->pkt_type = d->ptype;
-
-	spin_unlock(&d->tcf_lock);
-	return d->tcf_action;
+	if (params->flags & SKBEDIT_F_PTYPE)
+		skb->pkt_type = params->ptype;
+	return action;
 
 err:
-	d->tcf_qstats.drops++;
-	spin_unlock(&d->tcf_lock);
+	qstats_drop_inc(this_cpu_ptr(d->common.cpu_qstats));
 	return TC_ACT_SHOT;
 }
 
@@ -98,6 +99,7 @@ static int tcf_skbedit_init(struct net *net, struct nlattr *nla,
 			    struct netlink_ext_ack *extack)
 {
 	struct tc_action_net *tn = net_generic(net, skbedit_net_id);
+	struct tcf_skbedit_params *params_new;
 	struct nlattr *tb[TCA_SKBEDIT_MAX + 1];
 	struct tc_skbedit *parm;
 	struct tcf_skbedit *d;
@@ -152,50 +154,67 @@ static int tcf_skbedit_init(struct net *net, struct nlattr *nla,
 
 	parm = nla_data(tb[TCA_SKBEDIT_PARMS]);
 
-	exists = tcf_idr_check(tn, parm->index, a, bind);
+	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
+	if (err < 0)
+		return err;
+	exists = err;
 	if (exists && bind)
 		return 0;
 
 	if (!flags) {
 		if (exists)
 			tcf_idr_release(*a, bind);
+		else
+			tcf_idr_cleanup(tn, parm->index);
 		return -EINVAL;
 	}
 
 	if (!exists) {
 		ret = tcf_idr_create(tn, parm->index, est, a,
-				     &act_skbedit_ops, bind, false);
-		if (ret)
+				     &act_skbedit_ops, bind, true);
+		if (ret) {
+			tcf_idr_cleanup(tn, parm->index);
 			return ret;
+		}
 
 		d = to_skbedit(*a);
 		ret = ACT_P_CREATED;
 	} else {
 		d = to_skbedit(*a);
-		tcf_idr_release(*a, bind);
-		if (!ovr)
+		if (!ovr) {
+			tcf_idr_release(*a, bind);
 			return -EEXIST;
+		}
 	}
 
-	spin_lock_bh(&d->tcf_lock);
+	params_new = kzalloc(sizeof(*params_new), GFP_KERNEL);
+	if (unlikely(!params_new)) {
+		if (ret == ACT_P_CREATED)
+			tcf_idr_release(*a, bind);
+		return -ENOMEM;
+	}
 
-	d->flags = flags;
+	params_new->flags = flags;
 	if (flags & SKBEDIT_F_PRIORITY)
-		d->priority = *priority;
+		params_new->priority = *priority;
 	if (flags & SKBEDIT_F_QUEUE_MAPPING)
-		d->queue_mapping = *queue_mapping;
+		params_new->queue_mapping = *queue_mapping;
 	if (flags & SKBEDIT_F_MARK)
-		d->mark = *mark;
+		params_new->mark = *mark;
 	if (flags & SKBEDIT_F_PTYPE)
-		d->ptype = *ptype;
+		params_new->ptype = *ptype;
 	/* default behaviour is to use all the bits */
-	d->mask = 0xffffffff;
+	params_new->mask = 0xffffffff;
 	if (flags & SKBEDIT_F_MASK)
-		d->mask = *mask;
+		params_new->mask = *mask;
 
+	spin_lock_bh(&d->tcf_lock);
 	d->tcf_action = parm->action;
-
+	rcu_swap_protected(d->params, params_new,
+			   lockdep_is_held(&d->tcf_lock));
 	spin_unlock_bh(&d->tcf_lock);
+	if (params_new)
+		kfree_rcu(params_new, rcu);
 
 	if (ret == ACT_P_CREATED)
 		tcf_idr_insert(tn, *a);
@@ -207,33 +226,38 @@ static int tcf_skbedit_dump(struct sk_buff *skb, struct tc_action *a,
 {
 	unsigned char *b = skb_tail_pointer(skb);
 	struct tcf_skbedit *d = to_skbedit(a);
+	struct tcf_skbedit_params *params;
 	struct tc_skbedit opt = {
 		.index   = d->tcf_index,
-		.refcnt  = d->tcf_refcnt - ref,
-		.bindcnt = d->tcf_bindcnt - bind,
-		.action  = d->tcf_action,
+		.refcnt  = refcount_read(&d->tcf_refcnt) - ref,
+		.bindcnt = atomic_read(&d->tcf_bindcnt) - bind,
 	};
-	struct tcf_t t;
 	u64 pure_flags = 0;
+	struct tcf_t t;
+
+	spin_lock_bh(&d->tcf_lock);
+	params = rcu_dereference_protected(d->params,
+					   lockdep_is_held(&d->tcf_lock));
+	opt.action = d->tcf_action;
 
 	if (nla_put(skb, TCA_SKBEDIT_PARMS, sizeof(opt), &opt))
 		goto nla_put_failure;
-	if ((d->flags & SKBEDIT_F_PRIORITY) &&
-	    nla_put_u32(skb, TCA_SKBEDIT_PRIORITY, d->priority))
+	if ((params->flags & SKBEDIT_F_PRIORITY) &&
+	    nla_put_u32(skb, TCA_SKBEDIT_PRIORITY, params->priority))
 		goto nla_put_failure;
-	if ((d->flags & SKBEDIT_F_QUEUE_MAPPING) &&
-	    nla_put_u16(skb, TCA_SKBEDIT_QUEUE_MAPPING, d->queue_mapping))
+	if ((params->flags & SKBEDIT_F_QUEUE_MAPPING) &&
+	    nla_put_u16(skb, TCA_SKBEDIT_QUEUE_MAPPING, params->queue_mapping))
 		goto nla_put_failure;
-	if ((d->flags & SKBEDIT_F_MARK) &&
-	    nla_put_u32(skb, TCA_SKBEDIT_MARK, d->mark))
+	if ((params->flags & SKBEDIT_F_MARK) &&
+	    nla_put_u32(skb, TCA_SKBEDIT_MARK, params->mark))
 		goto nla_put_failure;
-	if ((d->flags & SKBEDIT_F_PTYPE) &&
-	    nla_put_u16(skb, TCA_SKBEDIT_PTYPE, d->ptype))
+	if ((params->flags & SKBEDIT_F_PTYPE) &&
+	    nla_put_u16(skb, TCA_SKBEDIT_PTYPE, params->ptype))
 		goto nla_put_failure;
-	if ((d->flags & SKBEDIT_F_MASK) &&
-	    nla_put_u32(skb, TCA_SKBEDIT_MASK, d->mask))
+	if ((params->flags & SKBEDIT_F_MASK) &&
+	    nla_put_u32(skb, TCA_SKBEDIT_MASK, params->mask))
 		goto nla_put_failure;
-	if (d->flags & SKBEDIT_F_INHERITDSFIELD)
+	if (params->flags & SKBEDIT_F_INHERITDSFIELD)
 		pure_flags |= SKBEDIT_F_INHERITDSFIELD;
 	if (pure_flags != 0 &&
 	    nla_put(skb, TCA_SKBEDIT_FLAGS, sizeof(pure_flags), &pure_flags))
@@ -242,11 +266,24 @@ static int tcf_skbedit_dump(struct sk_buff *skb, struct tc_action *a,
 	tcf_tm_dump(&t, &d->tcf_tm);
 	if (nla_put_64bit(skb, TCA_SKBEDIT_TM, sizeof(t), &t, TCA_SKBEDIT_PAD))
 		goto nla_put_failure;
+	spin_unlock_bh(&d->tcf_lock);
+
 	return skb->len;
 
 nla_put_failure:
+	spin_unlock_bh(&d->tcf_lock);
 	nlmsg_trim(skb, b);
 	return -1;
+}
+
+static void tcf_skbedit_cleanup(struct tc_action *a)
+{
+	struct tcf_skbedit *d = to_skbedit(a);
+	struct tcf_skbedit_params *params;
+
+	params = rcu_dereference_protected(d->params, 1);
+	if (params)
+		kfree_rcu(params, rcu);
 }
 
 static int tcf_skbedit_walker(struct net *net, struct sk_buff *skb,
@@ -266,13 +303,6 @@ static int tcf_skbedit_search(struct net *net, struct tc_action **a, u32 index)
 	return tcf_idr_search(tn, a, index);
 }
 
-static int tcf_skbedit_delete(struct net *net, u32 index)
-{
-	struct tc_action_net *tn = net_generic(net, skbedit_net_id);
-
-	return tcf_idr_delete_index(tn, index);
-}
-
 static struct tc_action_ops act_skbedit_ops = {
 	.kind		=	"skbedit",
 	.type		=	TCA_ACT_SKBEDIT,
@@ -280,9 +310,9 @@ static struct tc_action_ops act_skbedit_ops = {
 	.act		=	tcf_skbedit_act,
 	.dump		=	tcf_skbedit_dump,
 	.init		=	tcf_skbedit_init,
+	.cleanup	=	tcf_skbedit_cleanup,
 	.walk		=	tcf_skbedit_walker,
 	.lookup		=	tcf_skbedit_search,
-	.delete		=	tcf_skbedit_delete,
 	.size		=	sizeof(struct tcf_skbedit),
 };
 

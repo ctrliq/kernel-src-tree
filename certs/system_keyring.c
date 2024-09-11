@@ -279,11 +279,11 @@ error:
 }
 EXPORT_SYMBOL_GPL(verify_pkcs7_signature);
 
-#endif /* CONFIG_SYSTEM_DATA_VERIFICATION */
-
 #ifdef CONFIG_INTEGRITY_PLATFORM_KEYRING
 void __init set_platform_trusted_keys(struct key *keyring)
 {
 	platform_trusted_keys = keyring;
 }
 #endif
+
+#endif /* CONFIG_SYSTEM_DATA_VERIFICATION */

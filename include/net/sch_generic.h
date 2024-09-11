@@ -305,6 +305,8 @@ struct tcf_proto {
 	/* Fast access part */
 	struct tcf_proto __rcu	*next;
 	void __rcu		*root;
+
+	/* called under RCU BH lock*/
 	int			(*classify)(struct sk_buff *,
 					    const struct tcf_proto *,
 					    struct tcf_result *);
@@ -375,7 +377,7 @@ static inline void tcf_block_offload_dec(struct tcf_block *block, u32 *flags)
 }
 
 static inline void
-tc_cls_offload_cnt_update(struct tcf_block *block, unsigned int *cnt,
+tc_cls_offload_cnt_update(struct tcf_block *block, u32 *cnt,
 			  u32 *flags, bool add)
 {
 	if (add) {

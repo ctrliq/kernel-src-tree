@@ -176,8 +176,9 @@ static inline unsigned long rcu_seq_diff(unsigned long new, unsigned long old)
 
 /*
  * debug_rcu_head_queue()/debug_rcu_head_unqueue() are used internally
- * by call_rcu() and rcu callback execution, and are therefore not part of the
- * RCU API. Leaving in rcupdate.h because they are used by all RCU flavors.
+ * by call_rcu() and rcu callback execution, and are therefore not part
+ * of the RCU API. These are in rcupdate.h because they are used by all
+ * RCU implementations.
  */
 
 #ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
@@ -331,40 +332,35 @@ static inline void rcu_init_levelspread(int *levelspread, const int *levelcnt)
 	}
 }
 
-/* Returns first leaf rcu_node of the specified RCU flavor. */
-#define rcu_first_leaf_node(rsp) ((rsp)->level[rcu_num_lvls - 1])
+/* Returns a pointer to the first leaf rcu_node structure. */
+#define rcu_first_leaf_node() (rcu_state.level[rcu_num_lvls - 1])
 
 /* Is this rcu_node a leaf? */
 #define rcu_is_leaf_node(rnp) ((rnp)->level == rcu_num_lvls - 1)
 
 /* Is this rcu_node the last leaf? */
-#define rcu_is_last_leaf_node(rsp, rnp) ((rnp) == &(rsp)->node[rcu_num_nodes - 1])
+#define rcu_is_last_leaf_node(rnp) ((rnp) == &rcu_state.node[rcu_num_nodes - 1])
 
 /*
- * Do a full breadth-first scan of the rcu_node structures for the
- * specified rcu_state structure.
+ * Do a full breadth-first scan of the {s,}rcu_node structures for the
+ * specified state structure (for SRCU) or the only rcu_state structure
+ * (for RCU).
  */
-#define rcu_for_each_node_breadth_first(rsp, rnp) \
-	for ((rnp) = &(rsp)->node[0]; \
-	     (rnp) < &(rsp)->node[rcu_num_nodes]; (rnp)++)
+#define srcu_for_each_node_breadth_first(sp, rnp) \
+	for ((rnp) = &(sp)->node[0]; \
+	     (rnp) < &(sp)->node[rcu_num_nodes]; (rnp)++)
+#define rcu_for_each_node_breadth_first(rnp) \
+	srcu_for_each_node_breadth_first(&rcu_state, rnp)
 
 /*
- * Do a breadth-first scan of the non-leaf rcu_node structures for the
- * specified rcu_state structure.  Note that if there is a singleton
- * rcu_node tree with but one rcu_node structure, this loop is a no-op.
+ * Scan the leaves of the rcu_node hierarchy for the rcu_state structure.
+ * Note that if there is a singleton rcu_node tree with but one rcu_node
+ * structure, this loop -will- visit the rcu_node structure.  It is still
+ * a leaf node, even if it is also the root node.
  */
-#define rcu_for_each_nonleaf_node_breadth_first(rsp, rnp) \
-	for ((rnp) = &(rsp)->node[0]; !rcu_is_leaf_node(rsp, rnp); (rnp)++)
-
-/*
- * Scan the leaves of the rcu_node hierarchy for the specified rcu_state
- * structure.  Note that if there is a singleton rcu_node tree with but
- * one rcu_node structure, this loop -will- visit the rcu_node structure.
- * It is still a leaf node, even if it is also the root node.
- */
-#define rcu_for_each_leaf_node(rsp, rnp) \
-	for ((rnp) = rcu_first_leaf_node(rsp); \
-	     (rnp) < &(rsp)->node[rcu_num_nodes]; (rnp)++)
+#define rcu_for_each_leaf_node(rnp) \
+	for ((rnp) = rcu_first_leaf_node(); \
+	     (rnp) < &rcu_state.node[rcu_num_nodes]; (rnp)++)
 
 /*
  * Iterate over all possible CPUs in a leaf RCU node.

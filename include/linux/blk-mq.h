@@ -37,7 +37,8 @@ struct blk_mq_hw_ctx {
 	struct blk_mq_ctx	*dispatch_from;
 	unsigned int		dispatch_busy;
 
-	unsigned int		nr_ctx;
+	unsigned short		type;
+	unsigned short		nr_ctx;
 	struct blk_mq_ctx	**ctxs;
 
 	spinlock_t		dispatch_wait_lock;
@@ -70,6 +71,15 @@ struct blk_mq_hw_ctx {
 	struct dentry		*sched_debugfs_dir;
 #endif
 
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+
 	/* Must be the last member - see also blk_mq_hw_ctx_size(). */
 	struct srcu_struct	srcu[0];
 };
@@ -80,12 +90,24 @@ struct blk_mq_queue_map {
 	unsigned int queue_offset;
 };
 
-enum {
-	HCTX_MAX_TYPES = 3,
+enum hctx_type {
+	HCTX_TYPE_DEFAULT,	/* all I/O not otherwise accounted for */
+	HCTX_TYPE_READ,		/* just for READ I/O */
+	HCTX_TYPE_POLL,		/* polled I/O of any kind */
+
+	HCTX_MAX_TYPES,
+	RH_HCTX_MAX_TYPES = 6,	/* RH extend for reserving space*/
 };
 
 struct blk_mq_tag_set {
-	struct blk_mq_queue_map	map[HCTX_MAX_TYPES];
+	/*
+	 * map[] holds ctx -> hctx mappings, one map exists for each type
+	 * that the driver wishes to support. There are no restrictions
+	 * on maps being of the same size, and it's perfectly legal to
+	 * share maps between types.
+	 */
+	struct blk_mq_queue_map	map[RH_HCTX_MAX_TYPES];
+	unsigned int		nr_maps;	/* nr entries in map[] */
 	const struct blk_mq_ops	*ops;
 	unsigned int		nr_hw_queues;	/* nr hw queues across maps */
 	unsigned int		queue_depth;	/* max hw supported */
@@ -100,15 +122,27 @@ struct blk_mq_tag_set {
 
 	struct mutex		tag_list_lock;
 	struct list_head	tag_list;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
 };
 
 struct blk_mq_queue_data {
 	struct request *rq;
 	bool last;
+
+	RH_KABI_RESERVE(1)
 };
 
 typedef blk_status_t (queue_rq_fn)(struct blk_mq_hw_ctx *,
 		const struct blk_mq_queue_data *);
+typedef void (commit_rqs_fn)(struct blk_mq_hw_ctx *);
 typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
 typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
 typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
@@ -122,9 +156,10 @@ typedef void (exit_request_fn)(struct blk_mq_tag_set *set, struct request *,
 typedef bool (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
 		bool);
 typedef bool (busy_tag_iter_fn)(struct request *, void *, bool);
-typedef int (poll_fn)(struct blk_mq_hw_ctx *, unsigned int);
+typedef int (poll_fn)(struct blk_mq_hw_ctx *);
 typedef int (map_queues_fn)(struct blk_mq_tag_set *set);
 typedef bool (busy_fn)(struct request_queue *);
+typedef void (complete_fn)(struct request *);
 
 
 struct blk_mq_ops {
@@ -132,6 +167,15 @@ struct blk_mq_ops {
 	 * Queue request
 	 */
 	queue_rq_fn		*queue_rq;
+
+	/*
+	 * If a driver uses bd->last to judge when to submit requests to
+	 * hardware, it must define this function. In case of errors that
+	 * make us stop issuing further requests, this hook serves the
+	 * purpose of kicking the hardware (which the last request otherwise
+	 * would have done).
+	 */
+	commit_rqs_fn		*commit_rqs;
 
 	/*
 	 * Reserve budget before queue request, once .queue_rq is
@@ -152,7 +196,7 @@ struct blk_mq_ops {
 	 */
 	poll_fn			*poll;
 
-	softirq_done_fn		*complete;
+	complete_fn		*complete;
 
 	/*
 	 * Called when the block layer side of a hardware queue has been
@@ -190,6 +234,15 @@ struct blk_mq_ops {
 	 */
 	void (*show_rq)(struct seq_file *m, struct request *rq);
 #endif
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
 };
 
 enum {

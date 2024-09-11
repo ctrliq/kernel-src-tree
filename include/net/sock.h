@@ -74,6 +74,8 @@
 #include <net/smc.h>
 #include <net/l3mdev.h>
 
+#include <linux/rh_kabi.h>
+
 /*
  * This structure really needs to be cleaned up.
  * Most of it is for TCP, and not used by any of
@@ -503,8 +505,25 @@ struct sock {
 							struct sk_buff *skb);
 #endif
 	void                    (*sk_destruct)(struct sock *sk);
-	struct sock_reuseport __rcu	*sk_reuseport_cb;
+	RH_KABI_EXCLUDE(struct sock_reuseport __rcu	*sk_reuseport_cb)
 	struct rcu_head		sk_rcu;
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+	RH_KABI_RESERVE(9)
+	RH_KABI_RESERVE(10)
+	RH_KABI_RESERVE(11)
+	RH_KABI_RESERVE(12)
+	RH_KABI_RESERVE(13)
+	RH_KABI_RESERVE(14)
+	RH_KABI_RESERVE(15)
+	RH_KABI_RESERVE(16)
 };
 
 enum sk_pacing {
@@ -1160,6 +1179,23 @@ struct proto {
 	atomic_t		socks;
 #endif
 	int			(*diag_destroy)(struct sock *sk, int err);
+
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
+	RH_KABI_RESERVE(5)
+	RH_KABI_RESERVE(6)
+	RH_KABI_RESERVE(7)
+	RH_KABI_RESERVE(8)
+	RH_KABI_RESERVE(9)
+	RH_KABI_RESERVE(10)
+	RH_KABI_RESERVE(11)
+	RH_KABI_RESERVE(12)
+	RH_KABI_RESERVE(13)
+	RH_KABI_RESERVE(14)
+	RH_KABI_RESERVE(15)
+	RH_KABI_RESERVE(16)
 } __randomize_layout;
 
 int proto_register(struct proto *prot, int alloc_slab);
@@ -2051,13 +2087,20 @@ static inline bool skwq_has_sleeper(struct socket_wq *wq)
 /**
  * sock_poll_wait - place memory barrier behind the poll_wait call.
  * @filp:           file
+ * @sock:           socket to wait on
  * @p:              poll_table
  *
  * See the comments in the wq_has_sleeper function.
+ *
+ * Do not derive sock from filp->private_data here. An SMC socket establishes
+ * an internal TCP socket that is used in the fallback case. All socket
+ * operations on the SMC socket are then forwarded to the TCP socket. In case of
+ * poll, the filp->private_data pointer references the SMC socket because the
+ * TCP socket has no file assigned.
  */
-static inline void sock_poll_wait(struct file *filp, poll_table *p)
+static inline void sock_poll_wait(struct file *filp, struct socket *sock,
+				  poll_table *p)
 {
-	struct socket *sock = filp->private_data;
 	wait_queue_head_t *wq = sk_sleep(sock->sk);
 
 	if (!poll_does_not_wait(p) && wq) {

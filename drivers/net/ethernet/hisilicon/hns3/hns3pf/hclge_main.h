@@ -20,6 +20,8 @@
 #define HCLGE_MOD_VERSION "1.0"
 #define HCLGE_DRIVER_NAME "hclge"
 
+#define HCLGE_MAX_PF_NUM		8
+
 #define HCLGE_INVALID_VPORT 0xffff
 
 #define HCLGE_PF_CFG_BLOCK_SIZE		32
@@ -58,6 +60,10 @@
 #define HCLGE_RSS_TC_SIZE_5		32
 #define HCLGE_RSS_TC_SIZE_6		64
 #define HCLGE_RSS_TC_SIZE_7		128
+
+#define HCLGE_UMV_TBL_SIZE		3072
+#define HCLGE_DEFAULT_UMV_SPACE_PER_PF \
+	(HCLGE_UMV_TBL_SIZE / HCLGE_MAX_PF_NUM)
 
 #define HCLGE_MTA_TBL_SIZE		4096
 
@@ -248,6 +254,7 @@ struct hclge_cfg {
 	u8 default_speed;
 	u32 numa_node_map;
 	u8 speed_ability;
+	u16 umv_space;
 };
 
 struct hclge_tm_info {
@@ -463,6 +470,15 @@ struct hclge_dev {
 	struct hclge_vlan_type_cfg vlan_type_cfg;
 
 	unsigned long vlan_table[VLAN_N_VID][BITS_TO_LONGS(HCLGE_VPORT_NUM)];
+
+	u16 wanted_umv_size;
+	/* max available unicast mac vlan space */
+	u16 max_umv_size;
+	/* private unicast mac vlan space, it's same for PF and its VFs */
+	u16 priv_umv_size;
+	/* unicast mac vlan space shared by PF and its VFs */
+	u16 share_umv_size;
+	struct mutex umv_mutex; /* protect share_umv_size */
 };
 
 /* VPort level vlan tag configuration for TX direction */
@@ -514,6 +530,8 @@ struct hclge_vport {
 
 	struct hclge_tx_vtag_cfg  txvlan_cfg;
 	struct hclge_rx_vtag_cfg  rxvlan_cfg;
+
+	u16 used_umv_num;
 
 	int vport_id;
 	struct hclge_dev *back;  /* Back reference to associated dev */

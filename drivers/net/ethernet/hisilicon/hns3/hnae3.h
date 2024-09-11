@@ -62,10 +62,10 @@
 		BIT(HNAE3_DEV_SUPPORT_ROCE_B))
 
 #define hnae3_dev_roce_supported(hdev) \
-	hnae_get_bit(hdev->ae_dev->flag, HNAE3_DEV_SUPPORT_ROCE_B)
+	hnae3_get_bit(hdev->ae_dev->flag, HNAE3_DEV_SUPPORT_ROCE_B)
 
 #define hnae3_dev_dcb_supported(hdev) \
-	hnae_get_bit(hdev->ae_dev->flag, HNAE3_DEV_SUPPORT_DCB_B)
+	hnae3_get_bit(hdev->ae_dev->flag, HNAE3_DEV_SUPPORT_DCB_B)
 
 #define ring_ptr_move_fw(ring, p) \
 	((ring)->p = ((ring)->p + 1) % (ring)->desc_num)
@@ -490,6 +490,15 @@ struct hnae3_unic_private_info {
 #define HNAE3_SUPPORT_SERDES_LOOPBACK BIT(2)
 #define HNAE3_SUPPORT_VF	      BIT(3)
 
+#define HNAE3_USER_UPE		BIT(0)	/* unicast promisc enabled by user */
+#define HNAE3_USER_MPE		BIT(1)	/* mulitcast promisc enabled by user */
+#define HNAE3_BPE		BIT(2)	/* broadcast promisc enable */
+#define HNAE3_OVERFLOW_UPE	BIT(3)	/* unicast mac vlan overflow */
+#define HNAE3_OVERFLOW_MPE	BIT(4)	/* multicast mac vlan overflow */
+#define HNAE3_VLAN_FLTR		BIT(5)	/* enable vlan filter */
+#define HNAE3_UPE		(HNAE3_USER_UPE | HNAE3_OVERFLOW_UPE)
+#define HNAE3_MPE		(HNAE3_USER_MPE | HNAE3_OVERFLOW_MPE)
+
 struct hnae3_handle {
 	struct hnae3_client *client;
 	struct pci_dev *pdev;
@@ -508,19 +517,21 @@ struct hnae3_handle {
 	};
 
 	u32 numa_node_mask;	/* for multi-chip support */
+
+	u8 netdev_flags;
 };
 
-#define hnae_set_field(origin, mask, shift, val) \
+#define hnae3_set_field(origin, mask, shift, val) \
 	do { \
 		(origin) &= (~(mask)); \
 		(origin) |= ((val) << (shift)) & (mask); \
 	} while (0)
-#define hnae_get_field(origin, mask, shift) (((origin) & (mask)) >> (shift))
+#define hnae3_get_field(origin, mask, shift) (((origin) & (mask)) >> (shift))
 
-#define hnae_set_bit(origin, shift, val) \
-	hnae_set_field((origin), (0x1 << (shift)), (shift), (val))
-#define hnae_get_bit(origin, shift) \
-	hnae_get_field((origin), (0x1 << (shift)), (shift))
+#define hnae3_set_bit(origin, shift, val) \
+	hnae3_set_field((origin), (0x1 << (shift)), (shift), (val))
+#define hnae3_get_bit(origin, shift) \
+	hnae3_get_field((origin), (0x1 << (shift)), (shift))
 
 void hnae3_register_ae_dev(struct hnae3_ae_dev *ae_dev);
 void hnae3_unregister_ae_dev(struct hnae3_ae_dev *ae_dev);
@@ -530,4 +541,7 @@ void hnae3_register_ae_algo(struct hnae3_ae_algo *ae_algo);
 
 void hnae3_unregister_client(struct hnae3_client *client);
 int hnae3_register_client(struct hnae3_client *client);
+
+void hnae3_set_client_init_flag(struct hnae3_client *client,
+				struct hnae3_ae_dev *ae_dev, int inited);
 #endif

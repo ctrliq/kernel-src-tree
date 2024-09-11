@@ -340,7 +340,7 @@ static int smc_clnt_conf_first_link(struct smc_sock *smc)
 		struct smc_clc_msg_decline dclc;
 
 		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
-				      SMC_CLC_DECLINE);
+				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
 		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_CL : rc;
 	}
 
@@ -368,7 +368,7 @@ static int smc_clnt_conf_first_link(struct smc_sock *smc)
 		struct smc_clc_msg_decline dclc;
 
 		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
-				      SMC_CLC_DECLINE);
+				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
 		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_AL : rc;
 	}
 
@@ -538,7 +538,8 @@ static int smc_connect_clc(struct smc_sock *smc, int smc_type,
 	if (rc)
 		return rc;
 	/* receive SMC Accept CLC message */
-	return smc_clc_wait_msg(smc, aclc, sizeof(*aclc), SMC_CLC_ACCEPT);
+	return smc_clc_wait_msg(smc, aclc, sizeof(*aclc), SMC_CLC_ACCEPT,
+				CLC_WAIT_TIME);
 }
 
 /* setup for RDMA connection of client */
@@ -970,7 +971,7 @@ static int smc_serv_conf_first_link(struct smc_sock *smc)
 		struct smc_clc_msg_decline dclc;
 
 		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
-				      SMC_CLC_DECLINE);
+				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
 		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_CL : rc;
 	}
 
@@ -991,7 +992,7 @@ static int smc_serv_conf_first_link(struct smc_sock *smc)
 		struct smc_clc_msg_decline dclc;
 
 		rc = smc_clc_wait_msg(smc, &dclc, sizeof(dclc),
-				      SMC_CLC_DECLINE);
+				      SMC_CLC_DECLINE, CLC_WAIT_TIME_SHORT);
 		return rc == -EAGAIN ? SMC_CLC_DECL_TIMEOUT_AL : rc;
 	}
 
@@ -1224,7 +1225,7 @@ static void smc_listen_work(struct work_struct *work)
 	 */
 	pclc = (struct smc_clc_msg_proposal *)&buf;
 	reason_code = smc_clc_wait_msg(new_smc, pclc, SMC_CLC_MAX_LEN,
-				       SMC_CLC_PROPOSAL);
+				       SMC_CLC_PROPOSAL, CLC_WAIT_TIME);
 	if (reason_code) {
 		smc_listen_decline(new_smc, reason_code, 0);
 		return;
@@ -1274,7 +1275,7 @@ static void smc_listen_work(struct work_struct *work)
 
 	/* receive SMC Confirm CLC message */
 	reason_code = smc_clc_wait_msg(new_smc, &cclc, sizeof(cclc),
-				       SMC_CLC_CONFIRM);
+				       SMC_CLC_CONFIRM, CLC_WAIT_TIME);
 	if (reason_code) {
 		mutex_unlock(&smc_create_lgr_pending);
 		smc_listen_decline(new_smc, reason_code, local_contact);
@@ -1546,7 +1547,7 @@ static __poll_t smc_poll(struct file *file, struct socket *sock,
 			mask |= EPOLLERR;
 	} else {
 		if (sk->sk_state != SMC_CLOSED)
-			sock_poll_wait(file, wait);
+			sock_poll_wait(file, sock, wait);
 		if (sk->sk_err)
 			mask |= EPOLLERR;
 		if ((sk->sk_shutdown == SHUTDOWN_MASK) ||

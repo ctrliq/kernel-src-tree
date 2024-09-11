@@ -57,18 +57,24 @@ static int tcf_nat_init(struct net *net, struct nlattr *nla, struct nlattr *est,
 		return -EINVAL;
 	parm = nla_data(tb[TCA_NAT_PARMS]);
 
-	if (!tcf_idr_check(tn, parm->index, a, bind)) {
+	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
+	if (!err) {
 		ret = tcf_idr_create(tn, parm->index, est, a,
 				     &act_nat_ops, bind, false);
-		if (ret)
+		if (ret) {
+			tcf_idr_cleanup(tn, parm->index);
 			return ret;
+		}
 		ret = ACT_P_CREATED;
-	} else {
+	} else if (err > 0) {
 		if (bind)
 			return 0;
-		tcf_idr_release(*a, bind);
-		if (!ovr)
+		if (!ovr) {
+			tcf_idr_release(*a, bind);
 			return -EEXIST;
+		}
+	} else {
+		return err;
 	}
 	p = to_tcf_nat(*a);
 
@@ -250,17 +256,18 @@ static int tcf_nat_dump(struct sk_buff *skb, struct tc_action *a,
 	unsigned char *b = skb_tail_pointer(skb);
 	struct tcf_nat *p = to_tcf_nat(a);
 	struct tc_nat opt = {
-		.old_addr = p->old_addr,
-		.new_addr = p->new_addr,
-		.mask     = p->mask,
-		.flags    = p->flags,
-
 		.index    = p->tcf_index,
-		.action   = p->tcf_action,
-		.refcnt   = p->tcf_refcnt - ref,
-		.bindcnt  = p->tcf_bindcnt - bind,
+		.refcnt   = refcount_read(&p->tcf_refcnt) - ref,
+		.bindcnt  = atomic_read(&p->tcf_bindcnt) - bind,
 	};
 	struct tcf_t t;
+
+	spin_lock_bh(&p->tcf_lock);
+	opt.old_addr = p->old_addr;
+	opt.new_addr = p->new_addr;
+	opt.mask = p->mask;
+	opt.flags = p->flags;
+	opt.action = p->tcf_action;
 
 	if (nla_put(skb, TCA_NAT_PARMS, sizeof(opt), &opt))
 		goto nla_put_failure;
@@ -268,10 +275,12 @@ static int tcf_nat_dump(struct sk_buff *skb, struct tc_action *a,
 	tcf_tm_dump(&t, &p->tcf_tm);
 	if (nla_put_64bit(skb, TCA_NAT_TM, sizeof(t), &t, TCA_NAT_PAD))
 		goto nla_put_failure;
+	spin_unlock_bh(&p->tcf_lock);
 
 	return skb->len;
 
 nla_put_failure:
+	spin_unlock_bh(&p->tcf_lock);
 	nlmsg_trim(skb, b);
 	return -1;
 }
@@ -293,13 +302,6 @@ static int tcf_nat_search(struct net *net, struct tc_action **a, u32 index)
 	return tcf_idr_search(tn, a, index);
 }
 
-static int tcf_nat_delete(struct net *net, u32 index)
-{
-	struct tc_action_net *tn = net_generic(net, nat_net_id);
-
-	return tcf_idr_delete_index(tn, index);
-}
-
 static struct tc_action_ops act_nat_ops = {
 	.kind		=	"nat",
 	.type		=	TCA_ACT_NAT,
@@ -309,7 +311,6 @@ static struct tc_action_ops act_nat_ops = {
 	.init		=	tcf_nat_init,
 	.walk		=	tcf_nat_walker,
 	.lookup		=	tcf_nat_search,
-	.delete		=	tcf_nat_delete,
 	.size		=	sizeof(struct tcf_nat),
 };
 

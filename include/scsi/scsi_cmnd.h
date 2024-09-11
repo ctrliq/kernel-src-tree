@@ -12,6 +12,8 @@
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_request.h>
 
+#include <linux/rh_kabi.h>
+
 struct Scsi_Host;
 struct scsi_driver;
 
@@ -151,6 +153,16 @@ struct scsi_cmnd {
 	unsigned long state;	/* Command completion state */
 
 	unsigned char tag;	/* SCSI-II queued command tag */
+
+	/* FOR RH USE ONLY
+	 *
+	 * The following padding has been inserted before ABI freeze to
+	 * allow extending the structure while preserving ABI.
+	 */
+	RH_KABI_RESERVE(1)
+	RH_KABI_RESERVE(2)
+	RH_KABI_RESERVE(3)
+	RH_KABI_RESERVE(4)
 };
 
 /*

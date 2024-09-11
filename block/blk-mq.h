@@ -22,7 +22,7 @@ struct blk_mq_ctx {
 	} ____cacheline_aligned_in_smp;
 
 	unsigned int		cpu;
-	unsigned int		index_hw;
+	unsigned short		index_hw[HCTX_MAX_TYPES];
 
 	/* incremented at dispatch time */
 	unsigned long		rq_dispatched[2];
@@ -69,7 +69,7 @@ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
 				struct list_head *list);
 
 /* Used by blk_insert_cloned_request() to issue request directly */
-blk_status_t blk_mq_request_issue_directly(struct request *rq);
+blk_status_t blk_mq_request_issue_directly(struct request *rq, bool last);
 void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
 				    struct list_head *list);
 
@@ -78,19 +78,43 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
  */
 extern int blk_mq_hw_queue_to_node(struct blk_mq_queue_map *qmap, unsigned int);
 
-static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
-						     unsigned int cpu)
-{
-	struct blk_mq_tag_set *set = q->tag_set;
-
-	return q->queue_hw_ctx[set->map[0].mq_map[cpu]];
-}
-
+/*
+ * blk_mq_map_queue_type() - map (hctx_type,cpu) to hardware queue
+ * @q: request queue
+ * @type: the hctx type index
+ * @cpu: CPU
+ */
 static inline struct blk_mq_hw_ctx *blk_mq_map_queue_type(struct request_queue *q,
-							  unsigned int hctx_type,
+							  enum hctx_type type,
 							  unsigned int cpu)
 {
-	return blk_mq_map_queue(q, cpu);
+	return q->queue_hw_ctx[q->tag_set->map[type].mq_map[cpu]];
+}
+
+/*
+ * blk_mq_map_queue() - map (cmd_flags,type) to hardware queue
+ * @q: request queue
+ * @flags: request command flags
+ * @cpu: CPU
+ */
+static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
+						     unsigned int flags,
+						     unsigned int cpu)
+{
+	enum hctx_type type = HCTX_TYPE_DEFAULT;
+
+	if ((flags & REQ_HIPRI) &&
+	    q->tag_set->nr_maps > HCTX_TYPE_POLL && 
+	    q->tag_set->map[HCTX_TYPE_POLL].nr_queues &&
+	    test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+		type = HCTX_TYPE_POLL;
+
+	else if (((flags & REQ_OP_MASK) == REQ_OP_READ) &&
+	         q->tag_set->nr_maps > HCTX_TYPE_READ &&
+		 q->tag_set->map[HCTX_TYPE_READ].nr_queues)
+		type = HCTX_TYPE_READ;
+	
+	return blk_mq_map_queue_type(q, type, cpu);
 }
 
 /*
@@ -141,6 +165,7 @@ struct blk_mq_alloc_data {
 	struct request_queue *q;
 	blk_mq_req_flags_t flags;
 	unsigned int shallow_depth;
+	unsigned int cmd_flags;
 
 	/* input & output parameter */
 	struct blk_mq_ctx *ctx;
@@ -165,8 +190,7 @@ static inline bool blk_mq_hw_queue_mapped(struct blk_mq_hw_ctx *hctx)
 	return hctx->nr_ctx && hctx->tags;
 }
 
-void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
-		      unsigned int inflight[2]);
+unsigned int blk_mq_in_flight(struct request_queue *q, struct hd_struct *part);
 void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
 			 unsigned int inflight[2]);
 
@@ -210,13 +234,10 @@ static inline void blk_mq_put_driver_tag_hctx(struct blk_mq_hw_ctx *hctx,
 
 static inline void blk_mq_put_driver_tag(struct request *rq)
 {
-	struct blk_mq_hw_ctx *hctx;
-
 	if (rq->tag == -1 || rq->internal_tag == -1)
 		return;
 
-	hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu);
-	__blk_mq_put_driver_tag(hctx, rq);
+	__blk_mq_put_driver_tag(rq->mq_hctx, rq);
 }
 
 static inline void blk_mq_clear_mq_map(struct blk_mq_queue_map *qmap)

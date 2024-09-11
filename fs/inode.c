@@ -165,6 +165,9 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_wb_frn_history = 0;
 #endif
 
+	inode->rh_reserved1 = 0;
+	inode->rh_reserved2 = 0;
+
 	if (security_inode_alloc(inode))
 		goto out;
 	spin_lock_init(&inode->i_lock);

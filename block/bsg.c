@@ -83,7 +83,7 @@ static int bsg_scsi_fill_hdr(struct request *rq, struct sg_io_v4 *hdr,
 
 	if (copy_from_user(sreq->cmd, uptr64(hdr->request), sreq->cmd_len))
 		return -EFAULT;
-	if (blk_verify_command(sreq->cmd, mode))
+	if (blk_verify_command(rq->q, sreq->cmd, mode))
 		return -EPERM;
 	return 0;
 }
@@ -471,7 +471,7 @@ int bsg_register_queue(struct request_queue *q, struct device *parent,
 	/*
 	 * we need a proper transport to send commands, not a stacked device
 	 */
-	if (!queue_is_rq_based(q))
+	if (!queue_is_mq(q))
 		return 0;
 
 	bcd = &q->bsg_dev;

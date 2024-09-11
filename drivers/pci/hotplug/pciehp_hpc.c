@@ -745,6 +745,7 @@ int pciehp_reset_slot(struct hotplug_slot *hotplug_slot, int probe)
 	struct controller *ctrl = to_ctrl(hotplug_slot);
 	struct pci_dev *pdev = ctrl_dev(ctrl);
 	u16 stat_mask = 0, ctrl_mask = 0;
+	int rc;
 
 	if (probe)
 		return 0;
@@ -762,7 +763,7 @@ int pciehp_reset_slot(struct hotplug_slot *hotplug_slot, int probe)
 	ctrl_dbg(ctrl, "%s: SLOTCTRL %x write cmd %x\n", __func__,
 		 pci_pcie_cap(ctrl->pcie->port) + PCI_EXP_SLTCTL, 0);
 
-	pci_reset_bridge_secondary_bus(ctrl->pcie->port);
+	rc = pci_bridge_secondary_bus_reset(ctrl->pcie->port);
 
 	pcie_capability_write_word(pdev, PCI_EXP_SLTSTA, stat_mask);
 	pcie_write_cmd_nowait(ctrl, ctrl_mask, ctrl_mask);
@@ -770,7 +771,7 @@ int pciehp_reset_slot(struct hotplug_slot *hotplug_slot, int probe)
 		 pci_pcie_cap(ctrl->pcie->port) + PCI_EXP_SLTCTL, ctrl_mask);
 
 	up_write(&ctrl->reset_lock);
-	return 0;
+	return rc;
 }
 
 int pcie_init_notification(struct controller *ctrl)

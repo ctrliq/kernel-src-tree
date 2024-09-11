@@ -32,6 +32,7 @@
 
 #include "en.h"
 #include "en/port.h"
+#include "lib/clock.h"
 
 void mlx5e_ethtool_get_drvinfo(struct mlx5e_priv *priv,
 			       struct ethtool_drvinfo *drvinfo)
@@ -317,7 +318,7 @@ static int mlx5e_set_ringparam(struct net_device *dev,
 void mlx5e_ethtool_get_channels(struct mlx5e_priv *priv,
 				struct ethtool_channels *ch)
 {
-	ch->max_combined   = priv->profile->max_nch(priv->mdev);
+	ch->max_combined   = mlx5e_get_netdev_max_channels(priv->netdev);
 	ch->combined_count = priv->channels.params.num_channels;
 }
 
@@ -1113,10 +1114,10 @@ int mlx5e_ethtool_get_ts_info(struct mlx5e_priv *priv,
 	if (ret)
 		return ret;
 
-	info->phc_index = mdev->clock.ptp ?
-			  ptp_clock_index(mdev->clock.ptp) : -1;
+	info->phc_index = mlx5_clock_get_ptp_index(mdev);
 
-	if (!MLX5_CAP_GEN(priv->mdev, device_frequency_khz))
+	if (!MLX5_CAP_GEN(priv->mdev, device_frequency_khz) ||
+	    info->phc_index == -1)
 		return 0;
 
 	info->so_timestamping |= SOF_TIMESTAMPING_TX_HARDWARE |
@@ -1638,8 +1639,10 @@ const struct ethtool_ops mlx5e_ethtool_ops = {
 	.get_rxfh_indir_size = mlx5e_get_rxfh_indir_size,
 	.get_rxfh          = mlx5e_get_rxfh,
 	.set_rxfh          = mlx5e_set_rxfh,
+#ifdef CONFIG_MLX5_EN_RXNFC
 	.get_rxnfc         = mlx5e_get_rxnfc,
 	.set_rxnfc         = mlx5e_set_rxnfc,
+#endif
 	.flash_device      = mlx5e_flash_device,
 	.get_tunable       = mlx5e_get_tunable,
 	.set_tunable       = mlx5e_set_tunable,

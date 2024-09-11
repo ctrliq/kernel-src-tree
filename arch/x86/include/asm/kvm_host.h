@@ -37,8 +37,8 @@
 #include <asm/kvm_page_track.h>
 #include <asm/hyperv-tlfs.h>
 
-#define KVM_MAX_VCPUS 288
-#define KVM_SOFT_MAX_VCPUS 240
+#define KVM_MAX_VCPUS 384
+#define KVM_SOFT_MAX_VCPUS 384
 #define KVM_MAX_VCPU_ID 1023
 #define KVM_USER_MEM_SLOTS 509
 /* memory slots that are not exposed to userspace */
@@ -727,6 +727,9 @@ struct kvm_vcpu_arch {
 
 	/* be preempted when it's in kernel-mode(cpl=0) */
 	bool preempted_in_kernel;
+
+	/* Flush the L1 Data cache for L1TF mitigation on VMENTER */
+	bool l1tf_flush_l1d;
 };
 
 struct kvm_lpage_info {
@@ -867,6 +870,8 @@ struct kvm_arch {
 
 	bool x2apic_format;
 	bool x2apic_broadcast_quirk_disabled;
+
+	bool guest_can_read_msr_platform_info;
 };
 
 struct kvm_vm_stat {
@@ -895,6 +900,7 @@ struct kvm_vcpu_stat {
 	u64 signal_exits;
 	u64 irq_window_exits;
 	u64 nmi_window_exits;
+	u64 l1d_flush;
 	u64 halt_exits;
 	u64 halt_successful_poll;
 	u64 halt_attempted_poll;
@@ -1458,6 +1464,7 @@ int kvm_pv_send_ipi(struct kvm *kvm, unsigned long ipi_bitmap_low,
 		    unsigned long ipi_bitmap_high, u32 min,
 		    unsigned long icr, int op_64_bit);
 
+u64 kvm_get_arch_capabilities(void);
 void kvm_define_shared_msr(unsigned index, u32 msr);
 int kvm_set_shared_msr(unsigned index, u64 val, u64 mask);
 

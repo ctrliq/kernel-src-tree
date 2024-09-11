@@ -95,6 +95,7 @@ struct dtl_entry;
 
 struct kvmppc_vcpu_book3s;
 struct kvmppc_book3s_shadow_vcpu;
+struct kvm_nested_guest;
 
 struct kvm_vm_stat {
 	ulong remote_tlb_flush;
@@ -366,7 +367,9 @@ struct kvmppc_pte {
 	bool may_write		: 1;
 	bool may_execute	: 1;
 	unsigned long wimg;
+	unsigned long rc;
 	u8 page_size;		/* MMU_PAGE_xxx */
+	u8 page_shift;
 };
 
 struct kvmppc_mmu {
@@ -786,6 +789,10 @@ struct kvm_vcpu_arch {
 	u32 emul_inst;
 
 	u32 online;
+
+	/* For support of nested guests */
+	struct kvm_nested_guest *nested;
+	u32 nested_vcpu_id;
 #endif
 
 #ifdef CONFIG_KVM_BOOK3S_HV_EXIT_TIMING

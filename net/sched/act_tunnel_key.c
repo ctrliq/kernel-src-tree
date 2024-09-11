@@ -31,9 +31,7 @@ static int tunnel_key_act(struct sk_buff *skb, const struct tc_action *a,
 	struct tcf_tunnel_key_params *params;
 	int action;
 
-	rcu_read_lock();
-
-	params = rcu_dereference(t->params);
+	params = rcu_dereference_bh(t->params);
 
 	tcf_lastuse_update(&t->tcf_tm);
 	bstats_cpu_update(this_cpu_ptr(t->common.cpu_bstats), skb);
@@ -52,8 +50,6 @@ static int tunnel_key_act(struct sk_buff *skb, const struct tc_action *a,
 			  params->tcft_action);
 		break;
 	}
-
-	rcu_read_unlock();
 
 	return action;
 }
@@ -208,7 +204,6 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 {
 	struct tc_action_net *tn = net_generic(net, tunnel_key_net_id);
 	struct nlattr *tb[TCA_TUNNEL_KEY_MAX + 1];
-	struct tcf_tunnel_key_params *params_old;
 	struct tcf_tunnel_key_params *params_new;
 	struct metadata_dst *metadata = NULL;
 	struct tc_tunnel_key *parm;
@@ -240,7 +235,10 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 	}
 
 	parm = nla_data(tb[TCA_TUNNEL_KEY_PARMS]);
-	exists = tcf_idr_check(tn, parm->index, a, bind);
+	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
+	if (err < 0)
+		return err;
+	exists = err;
 	if (exists && bind)
 		return 0;
 
@@ -319,7 +317,7 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 						  &metadata->u.tun_info,
 						  opts_len, extack);
 			if (ret < 0)
-				goto err_out;
+				goto release_tun_meta;
 		}
 
 		metadata->u.tun_info.mode |= IP_TUNNEL_INFO_TX;
@@ -335,48 +333,49 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
 				     &act_tunnel_key_ops, bind, true);
 		if (ret) {
 			NL_SET_ERR_MSG(extack, "Cannot create TC IDR");
-			return ret;
+			goto release_tun_meta;
 		}
 
 		ret = ACT_P_CREATED;
-	} else {
-		tcf_idr_release(*a, bind);
-		if (!ovr) {
-			NL_SET_ERR_MSG(extack, "TC IDR already exists");
-			return -EEXIST;
-		}
+	} else if (!ovr) {
+		NL_SET_ERR_MSG(extack, "TC IDR already exists");
+		ret = -EEXIST;
+		goto release_tun_meta;
 	}
 
 	t = to_tunnel_key(*a);
 
-	ASSERT_RTNL();
 	params_new = kzalloc(sizeof(*params_new), GFP_KERNEL);
 	if (unlikely(!params_new)) {
-		if (ret == ACT_P_CREATED)
-			tcf_idr_release(*a, bind);
 		NL_SET_ERR_MSG(extack, "Cannot allocate tunnel key parameters");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		exists = true;
+		goto release_tun_meta;
 	}
-
-	params_old = rtnl_dereference(t->params);
-
-	t->tcf_action = parm->action;
 	params_new->tcft_action = parm->t_action;
 	params_new->tcft_enc_metadata = metadata;
 
-	rcu_assign_pointer(t->params, params_new);
-
-	if (params_old)
-		kfree_rcu(params_old, rcu);
+	spin_lock_bh(&t->tcf_lock);
+	t->tcf_action = parm->action;
+	rcu_swap_protected(t->params, params_new,
+			   lockdep_is_held(&t->tcf_lock));
+	spin_unlock_bh(&t->tcf_lock);
+	if (params_new)
+		kfree_rcu(params_new, rcu);
 
 	if (ret == ACT_P_CREATED)
 		tcf_idr_insert(tn, *a);
 
 	return ret;
 
+release_tun_meta:
+	dst_release(&metadata->dst);
+
 err_out:
 	if (exists)
 		tcf_idr_release(*a, bind);
+	else
+		tcf_idr_cleanup(tn, parm->index);
 	return ret;
 }
 
@@ -489,14 +488,15 @@ static int tunnel_key_dump(struct sk_buff *skb, struct tc_action *a,
 	struct tcf_tunnel_key_params *params;
 	struct tc_tunnel_key opt = {
 		.index    = t->tcf_index,
-		.refcnt   = t->tcf_refcnt - ref,
-		.bindcnt  = t->tcf_bindcnt - bind,
-		.action   = t->tcf_action,
+		.refcnt   = refcount_read(&t->tcf_refcnt) - ref,
+		.bindcnt  = atomic_read(&t->tcf_bindcnt) - bind,
 	};
 	struct tcf_t tm;
 
-	params = rtnl_dereference(t->params);
-
+	spin_lock_bh(&t->tcf_lock);
+	params = rcu_dereference_protected(t->params,
+					   lockdep_is_held(&t->tcf_lock));
+	opt.action   = t->tcf_action;
 	opt.t_action = params->tcft_action;
 
 	if (nla_put(skb, TCA_TUNNEL_KEY_PARMS, sizeof(opt), &opt))
@@ -528,10 +528,12 @@ static int tunnel_key_dump(struct sk_buff *skb, struct tc_action *a,
 	if (nla_put_64bit(skb, TCA_TUNNEL_KEY_TM, sizeof(tm),
 			  &tm, TCA_TUNNEL_KEY_PAD))
 		goto nla_put_failure;
+	spin_unlock_bh(&t->tcf_lock);
 
 	return skb->len;
 
 nla_put_failure:
+	spin_unlock_bh(&t->tcf_lock);
 	nlmsg_trim(skb, b);
 	return -1;
 }
@@ -553,13 +555,6 @@ static int tunnel_key_search(struct net *net, struct tc_action **a, u32 index)
 	return tcf_idr_search(tn, a, index);
 }
 
-static int tunnel_key_delete(struct net *net, u32 index)
-{
-	struct tc_action_net *tn = net_generic(net, tunnel_key_net_id);
-
-	return tcf_idr_delete_index(tn, index);
-}
-
 static struct tc_action_ops act_tunnel_key_ops = {
 	.kind		=	"tunnel_key",
 	.type		=	TCA_ACT_TUNNEL_KEY,
@@ -570,7 +565,6 @@ static struct tc_action_ops act_tunnel_key_ops = {
 	.cleanup	=	tunnel_key_release,
 	.walk		=	tunnel_key_walker,
 	.lookup		=	tunnel_key_search,
-	.delete		=	tunnel_key_delete,
 	.size		=	sizeof(struct tcf_tunnel_key),
 };
 

@@ -12174,6 +12174,10 @@ lpfc_pci_probe_one(struct pci_dev *pdev, const struct pci_device_id *pid)
 	int rc;
 	struct lpfc_sli_intf intf;
 
+	if (pci_device_support_removed(lpfc_id_table,
+				lpfc_pci_ids_removed, pdev))
+		return -ENODEV;
+
 	if (pci_read_config_dword(pdev, LPFC_SLI_INTF, &intf.word0))
 		return -ENODEV;
 

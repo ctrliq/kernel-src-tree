@@ -2004,7 +2004,7 @@ static int pnv_ioda1_tce_build(struct iommu_table *tbl, long index,
 static int pnv_ioda1_tce_xchg(struct iommu_table *tbl, long index,
 		unsigned long *hpa, enum dma_data_direction *direction)
 {
-	long ret = pnv_tce_xchg(tbl, index, hpa, direction);
+	long ret = pnv_tce_xchg(tbl, index, hpa, direction, true);
 
 	if (!ret)
 		pnv_pci_p7ioc_tce_invalidate(tbl, index, 1, false);
@@ -2015,7 +2015,7 @@ static int pnv_ioda1_tce_xchg(struct iommu_table *tbl, long index,
 static int pnv_ioda1_tce_xchg_rm(struct iommu_table *tbl, long index,
 		unsigned long *hpa, enum dma_data_direction *direction)
 {
-	long ret = pnv_tce_xchg(tbl, index, hpa, direction);
+	long ret = pnv_tce_xchg(tbl, index, hpa, direction, false);
 
 	if (!ret)
 		pnv_pci_p7ioc_tce_invalidate(tbl, index, 1, true);
@@ -2037,6 +2037,7 @@ static struct iommu_table_ops pnv_ioda1_iommu_ops = {
 #ifdef CONFIG_IOMMU_API
 	.exchange = pnv_ioda1_tce_xchg,
 	.exchange_rm = pnv_ioda1_tce_xchg_rm,
+	.useraddrptr = pnv_tce_useraddrptr,
 #endif
 	.clear = pnv_ioda1_tce_free,
 	.get = pnv_tce_get,
@@ -2168,7 +2169,7 @@ static int pnv_ioda2_tce_build(struct iommu_table *tbl, long index,
 static int pnv_ioda2_tce_xchg(struct iommu_table *tbl, long index,
 		unsigned long *hpa, enum dma_data_direction *direction)
 {
-	long ret = pnv_tce_xchg(tbl, index, hpa, direction);
+	long ret = pnv_tce_xchg(tbl, index, hpa, direction, true);
 
 	if (!ret)
 		pnv_pci_ioda2_tce_invalidate(tbl, index, 1, false);
@@ -2179,7 +2180,7 @@ static int pnv_ioda2_tce_xchg(struct iommu_table *tbl, long index,
 static int pnv_ioda2_tce_xchg_rm(struct iommu_table *tbl, long index,
 		unsigned long *hpa, enum dma_data_direction *direction)
 {
-	long ret = pnv_tce_xchg(tbl, index, hpa, direction);
+	long ret = pnv_tce_xchg(tbl, index, hpa, direction, false);
 
 	if (!ret)
 		pnv_pci_ioda2_tce_invalidate(tbl, index, 1, true);
@@ -2206,6 +2207,7 @@ static struct iommu_table_ops pnv_ioda2_iommu_ops = {
 #ifdef CONFIG_IOMMU_API
 	.exchange = pnv_ioda2_tce_xchg,
 	.exchange_rm = pnv_ioda2_tce_xchg_rm,
+	.useraddrptr = pnv_tce_useraddrptr,
 #endif
 	.clear = pnv_ioda2_tce_free,
 	.get = pnv_tce_get,
@@ -2461,7 +2463,7 @@ void pnv_pci_ioda2_set_bypass(struct pnv_ioda_pe *pe, bool enable)
 
 static long pnv_pci_ioda2_create_table(struct iommu_table_group *table_group,
 		int num, __u32 page_shift, __u64 window_size, __u32 levels,
-		struct iommu_table **ptbl)
+		bool alloc_userspace_copy, struct iommu_table **ptbl)
 {
 	struct pnv_ioda_pe *pe = container_of(table_group, struct pnv_ioda_pe,
 			table_group);
@@ -2478,7 +2480,7 @@ static long pnv_pci_ioda2_create_table(struct iommu_table_group *table_group,
 
 	ret = pnv_pci_ioda2_table_alloc_pages(nid,
 			bus_offset, page_shift, window_size,
-			levels, tbl);
+			levels, alloc_userspace_copy, tbl);
 	if (ret) {
 		iommu_tce_table_put(tbl);
 		return ret;
@@ -2511,7 +2513,7 @@ static long pnv_pci_ioda2_setup_default_config(struct pnv_ioda_pe *pe)
 	rc = pnv_pci_ioda2_create_table(&pe->table_group, 0,
 			IOMMU_PAGE_SHIFT_4K,
 			window_size,
-			POWERNV_IOMMU_DEFAULT_LEVELS, &tbl);
+			POWERNV_IOMMU_DEFAULT_LEVELS, false, &tbl);
 	if (rc) {
 		pe_err(pe, "Failed to create 32-bit TCE table, err %ld",
 				rc);
@@ -2598,7 +2600,16 @@ static unsigned long pnv_pci_ioda2_get_table_size(__u32 page_shift,
 				tce_table_size, direct_table_size);
 	}
 
-	return bytes;
+	return bytes + bytes; /* one for HW table, one for userspace copy */
+}
+
+static long pnv_pci_ioda2_create_table_userspace(
+		struct iommu_table_group *table_group,
+		int num, __u32 page_shift, __u64 window_size, __u32 levels,
+		struct iommu_table **ptbl)
+{
+	return pnv_pci_ioda2_create_table(table_group,
+			num, page_shift, window_size, levels, true, ptbl);
 }
 
 static void pnv_ioda2_take_ownership(struct iommu_table_group *table_group)
@@ -2627,7 +2638,7 @@ static void pnv_ioda2_release_ownership(struct iommu_table_group *table_group)
 
 static struct iommu_table_group_ops pnv_pci_ioda2_ops = {
 	.get_table_size = pnv_pci_ioda2_get_table_size,
-	.create_table = pnv_pci_ioda2_create_table,
+	.create_table = pnv_pci_ioda2_create_table_userspace,
 	.set_window = pnv_pci_ioda2_set_window,
 	.unset_window = pnv_pci_ioda2_unset_window,
 	.take_ownership = pnv_ioda2_take_ownership,
@@ -2732,7 +2743,7 @@ static void pnv_ioda2_npu_take_ownership(struct iommu_table_group *table_group)
 
 static struct iommu_table_group_ops pnv_pci_ioda2_npu_ops = {
 	.get_table_size = pnv_pci_ioda2_get_table_size,
-	.create_table = pnv_pci_ioda2_create_table,
+	.create_table = pnv_pci_ioda2_create_table_userspace,
 	.set_window = pnv_pci_ioda2_npu_set_window,
 	.unset_window = pnv_pci_ioda2_npu_unset_window,
 	.take_ownership = pnv_ioda2_npu_take_ownership,

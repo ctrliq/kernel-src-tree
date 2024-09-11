@@ -34,9 +34,15 @@ enum {
 	NFT_VALIDATE_DO,
 };
 
+static struct rhltable nft_objname_ht;
+
 static u32 nft_chain_hash(const void *data, u32 len, u32 seed);
 static u32 nft_chain_hash_obj(const void *data, u32 len, u32 seed);
 static int nft_chain_hash_cmp(struct rhashtable_compare_arg *, const void *);
+
+static u32 nft_objname_hash(const void *data, u32 len, u32 seed);
+static u32 nft_objname_hash_obj(const void *data, u32 len, u32 seed);
+static int nft_objname_hash_cmp(struct rhashtable_compare_arg *, const void *);
 
 static const struct rhashtable_params nft_chain_ht_params = {
 	.head_offset		= offsetof(struct nft_chain, rhlhead),
@@ -45,6 +51,15 @@ static const struct rhashtable_params nft_chain_ht_params = {
 	.obj_hashfn		= nft_chain_hash_obj,
 	.obj_cmpfn		= nft_chain_hash_cmp,
 	.locks_mul		= 1,
+	.automatic_shrinking	= true,
+};
+
+static const struct rhashtable_params nft_objname_ht_params = {
+	.head_offset		= offsetof(struct nft_object, rhlhead),
+	.key_offset		= offsetof(struct nft_object, key),
+	.hashfn			= nft_objname_hash,
+	.obj_hashfn		= nft_objname_hash_obj,
+	.obj_cmpfn		= nft_objname_hash_cmp,
 	.automatic_shrinking	= true,
 };
 
@@ -759,6 +774,34 @@ static int nft_chain_hash_cmp(struct rhashtable_compare_arg *arg,
 	const char *name = arg->key;
 
 	return strcmp(chain->name, name);
+}
+
+static u32 nft_objname_hash(const void *data, u32 len, u32 seed)
+{
+	const struct nft_object_hash_key *k = data;
+
+	seed ^= hash_ptr(k->table, 32);
+
+	return jhash(k->name, strlen(k->name), seed);
+}
+
+static u32 nft_objname_hash_obj(const void *data, u32 len, u32 seed)
+{
+	const struct nft_object *obj = data;
+
+	return nft_objname_hash(&obj->key, 0, seed);
+}
+
+static int nft_objname_hash_cmp(struct rhashtable_compare_arg *arg,
+				const void *ptr)
+{
+	const struct nft_object_hash_key *k = arg->key;
+	const struct nft_object *obj = ptr;
+
+	if (obj->key.table != k->table)
+		return -1;
+
+	return strcmp(obj->key.name, k->name);
 }
 
 static int nf_tables_newtable(struct net *net, struct sock *nlsk,
@@ -4302,7 +4345,8 @@ static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
 			err = -EINVAL;
 			goto err2;
 		}
-		obj = nft_obj_lookup(ctx->table, nla[NFTA_SET_ELEM_OBJREF],
+		obj = nft_obj_lookup(ctx->net, ctx->table,
+				     nla[NFTA_SET_ELEM_OBJREF],
 				     set->objtype, genmask);
 		if (IS_ERR(obj)) {
 			err = PTR_ERR(obj);
@@ -4735,18 +4779,36 @@ void nft_unregister_obj(struct nft_object_type *obj_type)
 }
 EXPORT_SYMBOL_GPL(nft_unregister_obj);
 
-struct nft_object *nft_obj_lookup(const struct nft_table *table,
+struct nft_object *nft_obj_lookup(const struct net *net,
+				  const struct nft_table *table,
 				  const struct nlattr *nla, u32 objtype,
 				  u8 genmask)
 {
+	struct nft_object_hash_key k = { .table = table };
+	char search[NFT_OBJ_MAXNAMELEN];
+	struct rhlist_head *tmp, *list;
 	struct nft_object *obj;
 
-	list_for_each_entry_rcu(obj, &table->objects, list) {
-		if (!nla_strcmp(nla, obj->key.name) &&
-		    objtype == obj->ops->type->type &&
-		    nft_active_genmask(obj, genmask))
+	nla_strlcpy(search, nla, sizeof(search));
+	k.name = search;
+
+	WARN_ON_ONCE(!rcu_read_lock_held() &&
+		     !lockdep_nfnl_is_held(NFNL_SUBSYS_NFTABLES));
+
+	rcu_read_lock();
+	list = rhltable_lookup(&nft_objname_ht, &k, nft_objname_ht_params);
+	if (!list)
+		goto out;
+
+	rhl_for_each_entry_rcu(obj, tmp, list, rhlhead) {
+		if (objtype == obj->ops->type->type &&
+		    nft_active_genmask(obj, genmask)) {
+			rcu_read_unlock();
 			return obj;
+		}
 	}
+out:
+	rcu_read_unlock();
 	return ERR_PTR(-ENOENT);
 }
 EXPORT_SYMBOL_GPL(nft_obj_lookup);
@@ -4904,7 +4966,7 @@ static int nf_tables_newobj(struct net *net, struct sock *nlsk,
 	}
 
 	objtype = ntohl(nla_get_be32(nla[NFTA_OBJ_TYPE]));
-	obj = nft_obj_lookup(table, nla[NFTA_OBJ_NAME], objtype, genmask);
+	obj = nft_obj_lookup(net, table, nla[NFTA_OBJ_NAME], objtype, genmask);
 	if (IS_ERR(obj)) {
 		err = PTR_ERR(obj);
 		if (err != -ENOENT) {
@@ -4943,9 +5005,18 @@ static int nf_tables_newobj(struct net *net, struct sock *nlsk,
 	if (err < 0)
 		goto err3;
 
+	err = rhltable_insert(&nft_objname_ht, &obj->rhlhead,
+			      nft_objname_ht_params);
+	if (err < 0)
+		goto err4;
+
 	list_add_tail_rcu(&obj->list, &table->objects);
 	table->use++;
 	return 0;
+err4:
+	/* queued in transaction log */
+	INIT_LIST_HEAD(&obj->list);
+	return err;
 err3:
 	kfree(obj->key.name);
 err2:
@@ -5131,7 +5202,7 @@ static int nf_tables_getobj(struct net *net, struct sock *nlsk,
 	}
 
 	objtype = ntohl(nla_get_be32(nla[NFTA_OBJ_TYPE]));
-	obj = nft_obj_lookup(table, nla[NFTA_OBJ_NAME], objtype, genmask);
+	obj = nft_obj_lookup(net, table, nla[NFTA_OBJ_NAME], objtype, genmask);
 	if (IS_ERR(obj)) {
 		NL_SET_BAD_ATTR(extack, nla[NFTA_OBJ_NAME]);
 		return PTR_ERR(obj);
@@ -5196,7 +5267,7 @@ static int nf_tables_delobj(struct net *net, struct sock *nlsk,
 		obj = nft_obj_lookup_byhandle(table, attr, objtype, genmask);
 	} else {
 		attr = nla[NFTA_OBJ_NAME];
-		obj = nft_obj_lookup(table, attr, objtype, genmask);
+		obj = nft_obj_lookup(net, table, attr, objtype, genmask);
 	}
 
 	if (IS_ERR(obj)) {
@@ -6313,6 +6384,7 @@ static void nf_tables_commit_chain(struct net *net, struct nft_chain *chain)
 
 static void nft_obj_del(struct nft_object *obj)
 {
+	rhltable_remove(&nft_objname_ht, &obj->rhlhead, nft_objname_ht_params);
 	list_del_rcu(&obj->list);
 }
 
@@ -6597,7 +6669,7 @@ static int __nf_tables_abort(struct net *net)
 			break;
 		case NFT_MSG_NEWOBJ:
 			trans->ctx.table->use--;
-			list_del_rcu(&nft_trans_obj(trans)->list);
+			nft_obj_del(nft_trans_obj(trans));
 			break;
 		case NFT_MSG_DELOBJ:
 			trans->ctx.table->use++;
@@ -7263,7 +7335,14 @@ static int __init nf_tables_module_init(void)
 
 	register_netdevice_notifier(&nf_tables_flowtable_notifier);
 
+	err = rhltable_init(&nft_objname_ht, &nft_objname_ht_params);
+	if (err < 0)
+		goto err4;
+
+
 	return register_pernet_subsys(&nf_tables_net_ops);
+err4:
+	unregister_netdevice_notifier(&nf_tables_flowtable_notifier);
 err3:
 	nf_tables_core_module_exit();
 err2:
@@ -7279,6 +7358,7 @@ static void __exit nf_tables_module_exit(void)
 	nft_chain_filter_fini();
 	unregister_pernet_subsys(&nf_tables_net_ops);
 	rcu_barrier();
+	rhltable_destroy(&nft_objname_ht);
 	nf_tables_core_module_exit();
 	kfree(info);
 }
