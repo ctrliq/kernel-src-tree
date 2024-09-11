@@ -1,0 +1,239 @@
+net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Oz Shlomo <ozsh@nvidia.com>
+commit eed38eeee734756596e2cc163bdc7dac3be501b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/eed38eee.failed
+
+Connection counters may be shared for both directions when the counter
+is used for connection aging purposes. However, if TC flow
+accounting is enabled then a unique counter is required per direction.
+
+Instantiate a unique counter per direction if the conntrack accounting
+extension is enabled. Use a shared counter when the connection accounting
+extension is disabled.
+
+Fixes: 1edae2335adf ("net/mlx5e: CT: Use the same counter for both directions")
+	Signed-off-by: Oz Shlomo <ozsh@nvidia.com>
+	Reported-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Reviewed-by: Paul Blakey <paulb@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit eed38eeee734756596e2cc163bdc7dac3be501b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+index 5ca0fb79498c,072363e73f1c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
+@@@ -114,11 -118,17 +114,24 @@@ struct mlx5_ct_tuple 
+  	u16 zone;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_ct_counter {
++ 	struct mlx5_fc *counter;
++ 	refcount_t refcount;
++ 	bool is_shared;
++ };
++ 
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  struct mlx5_ct_entry {
+  	struct rhash_head node;
+  	struct rhash_head tuple_node;
+  	struct rhash_head tuple_nat_node;
+++<<<<<<< HEAD
+ +	struct mlx5_fc *counter;
+++=======
++ 	struct mlx5_ct_counter *counter;
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  	unsigned long cookie;
+  	unsigned long restore_cookie;
+  	struct mlx5_ct_tuple tuple;
+@@@ -403,6 -395,17 +416,20 @@@ mlx5_tc_ct_set_tuple_match(struct mlx5e
+  }
+  
+  static void
+++<<<<<<< HEAD
+++=======
++ mlx5_tc_ct_counter_put(struct mlx5_tc_ct_priv *ct_priv, struct mlx5_ct_entry *entry)
++ {
++ 	if (entry->counter->is_shared &&
++ 	    !refcount_dec_and_test(&entry->counter->refcount))
++ 		return;
++ 
++ 	mlx5_fc_destroy(ct_priv->dev, entry->counter->counter);
++ 	kfree(entry->counter);
++ }
++ 
++ static void
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  mlx5_tc_ct_entry_del_rule(struct mlx5_tc_ct_priv *ct_priv,
+  			  struct mlx5_ct_entry *entry,
+  			  bool nat)
+@@@ -682,9 -699,9 +709,13 @@@ mlx5_tc_ct_entry_add_rule(struct mlx5_t
+  		       MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  	attr->dest_chain = 0;
+  	attr->dest_ft = ct_priv->post_ct;
+ -	attr->ft = nat ? ct_priv->ct_nat : ct_priv->ct;
+ +	attr->fdb = nat ? ct_priv->ct_nat : ct_priv->ct;
+  	attr->outer_match_level = MLX5_MATCH_L4;
+++<<<<<<< HEAD
+ +	attr->counter = entry->counter;
+++=======
++ 	attr->counter = entry->counter->counter;
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  	attr->flags |= MLX5_ESW_ATTR_FLAG_NO_IN_PORT;
+  
+  	mlx5_tc_ct_set_tuple_match(netdev_priv(ct_priv->netdev), spec, flow_rule);
+@@@ -713,19 -734,95 +744,106 @@@ err_mod_hdr
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mlx5_ct_counter *
++ mlx5_tc_ct_counter_create(struct mlx5_tc_ct_priv *ct_priv)
++ {
++ 	struct mlx5_ct_counter *counter;
++ 	int ret;
++ 
++ 	counter = kzalloc(sizeof(*counter), GFP_KERNEL);
++ 	if (!counter)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	counter->is_shared = false;
++ 	counter->counter = mlx5_fc_create(ct_priv->dev, true);
++ 	if (IS_ERR(counter->counter)) {
++ 		ct_dbg("Failed to create counter for ct entry");
++ 		ret = PTR_ERR(counter->counter);
++ 		kfree(counter);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	return counter;
++ }
++ 
++ static struct mlx5_ct_counter *
++ mlx5_tc_ct_shared_counter_get(struct mlx5_tc_ct_priv *ct_priv,
++ 			      struct mlx5_ct_entry *entry)
++ {
++ 	struct mlx5_ct_tuple rev_tuple = entry->tuple;
++ 	struct mlx5_ct_counter *shared_counter;
++ 	struct mlx5_ct_entry *rev_entry;
++ 	__be16 tmp_port;
++ 	int ret;
++ 
++ 	/* get the reversed tuple */
++ 	tmp_port = rev_tuple.port.src;
++ 	rev_tuple.port.src = rev_tuple.port.dst;
++ 	rev_tuple.port.dst = tmp_port;
++ 
++ 	if (rev_tuple.addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
++ 		__be32 tmp_addr = rev_tuple.ip.src_v4;
++ 
++ 		rev_tuple.ip.src_v4 = rev_tuple.ip.dst_v4;
++ 		rev_tuple.ip.dst_v4 = tmp_addr;
++ 	} else if (rev_tuple.addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
++ 		struct in6_addr tmp_addr = rev_tuple.ip.src_v6;
++ 
++ 		rev_tuple.ip.src_v6 = rev_tuple.ip.dst_v6;
++ 		rev_tuple.ip.dst_v6 = tmp_addr;
++ 	} else {
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	}
++ 
++ 	/* Use the same counter as the reverse direction */
++ 	mutex_lock(&ct_priv->shared_counter_lock);
++ 	rev_entry = rhashtable_lookup_fast(&ct_priv->ct_tuples_ht, &rev_tuple,
++ 					   tuples_ht_params);
++ 	if (rev_entry) {
++ 		if (refcount_inc_not_zero(&rev_entry->counter->refcount)) {
++ 			mutex_unlock(&ct_priv->shared_counter_lock);
++ 			return rev_entry->counter;
++ 		}
++ 	}
++ 	mutex_unlock(&ct_priv->shared_counter_lock);
++ 
++ 	shared_counter = mlx5_tc_ct_counter_create(ct_priv);
++ 	if (IS_ERR(shared_counter)) {
++ 		ret = PTR_ERR(shared_counter);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	shared_counter->is_shared = true;
++ 	refcount_set(&shared_counter->refcount, 1);
++ 	return shared_counter;
++ }
++ 
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  static int
+  mlx5_tc_ct_entry_add_rules(struct mlx5_tc_ct_priv *ct_priv,
+  			   struct flow_rule *flow_rule,
+  			   struct mlx5_ct_entry *entry,
+  			   u8 zone_restore_id)
+  {
+ +	struct mlx5_eswitch *esw = ct_priv->esw;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	entry->counter = mlx5_fc_create(esw->dev, true);
+ +	if (IS_ERR(entry->counter)) {
+ +		err = PTR_ERR(entry->counter);
+ +		ct_dbg("Failed to create counter for ct entry");
+++=======
++ 	if (nf_ct_acct_enabled(dev_net(ct_priv->netdev)))
++ 		entry->counter = mlx5_tc_ct_counter_create(ct_priv);
++ 	else
++ 		entry->counter = mlx5_tc_ct_shared_counter_get(ct_priv, entry);
++ 
++ 	if (IS_ERR(entry->counter)) {
++ 		err = PTR_ERR(entry->counter);
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  		return err;
+  	}
+  
+@@@ -744,7 -841,7 +862,11 @@@
+  err_nat:
+  	mlx5_tc_ct_entry_del_rule(ct_priv, entry, false);
+  err_orig:
+++<<<<<<< HEAD
+ +	mlx5_fc_destroy(esw->dev, entry->counter);
+++=======
++ 	mlx5_tc_ct_counter_put(ct_priv, entry);
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  	return err;
+  }
+  
+@@@ -840,6 -938,9 +962,12 @@@ mlx5_tc_ct_del_ft_entry(struct mlx5_tc_
+  				       tuples_nat_ht_params);
+  	rhashtable_remove_fast(&ct_priv->ct_tuples_ht, &entry->tuple_node,
+  			       tuples_ht_params);
+++<<<<<<< HEAD
+++=======
++ 	mutex_unlock(&ct_priv->shared_counter_lock);
++ 	mlx5_tc_ct_counter_put(ct_priv, entry);
++ 
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  }
+  
+  static int
+@@@ -876,7 -977,7 +1004,11 @@@ mlx5_tc_ct_block_flow_offload_stats(str
+  	if (!entry)
+  		return -ENOENT;
+  
+++<<<<<<< HEAD
+ +	mlx5_fc_query_cached(entry->counter, &bytes, &packets, &lastuse);
+++=======
++ 	mlx5_fc_query_cached(entry->counter->counter, &bytes, &packets, &lastuse);
+++>>>>>>> eed38eeee734 (net/mlx5e: CT: Use per flow counter when CT flow accounting is enabled)
+  	flow_stats_update(&f->stats, bytes, packets, 0, lastuse,
+  			  FLOW_ACTION_HW_STATS_DELAYED);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_ct.c
