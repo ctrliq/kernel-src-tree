@@ -1,0 +1,290 @@
+KVM: X86: Change the type of access u32 to u64
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Lai Jiangshan <jiangshan.ljs@antgroup.com>
+commit 5b22bbe717d9b96867783cde380c43f6cc28aafd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/5b22bbe7.failed
+
+Change the type of access u32 to u64 for FNAME(walk_addr) and
+->gva_to_gpa().
+
+The kinds of accesses are usually combinations of UWX, and VMX/SVM's
+nested paging adds a new factor of access: is it an access for a guest
+page table or for a final guest physical address.
+
+And SMAP relies a factor for supervisor access: explicit or implicit.
+
+So @access in FNAME(walk_addr) and ->gva_to_gpa() is better to include
+all these information to do the walk.
+
+Although @access(u32) has enough bits to encode all the kinds, this
+patch extends it to u64:
+	o Extra bits will be in the higher 32 bits, so that we can
+	  easily obtain the traditional access mode (UWX) by converting
+	  it to u32.
+	o Reuse the value for the access kind defined by SVM's nested
+	  paging (PFERR_GUEST_FINAL_MASK and PFERR_GUEST_PAGE_MASK) as
+	  @error_code in kvm_handle_page_fault().
+
+	Signed-off-by: Lai Jiangshan <jiangshan.ljs@antgroup.com>
+Message-Id: <20220311070346.45023-2-jiangshanlai@gmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 5b22bbe717d9b96867783cde380c43f6cc28aafd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.h
+diff --cc arch/x86/kvm/mmu.h
+index c605a3c2b84d,74efeaefa8f8..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -229,4 -271,64 +231,67 @@@ int kvm_arch_write_log_dirty(struct kvm
+  int kvm_mmu_post_init_vm(struct kvm *kvm);
+  void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool kvm_shadow_root_allocated(struct kvm *kvm)
++ {
++ 	/*
++ 	 * Read shadow_root_allocated before related pointers. Hence, threads
++ 	 * reading shadow_root_allocated in any lock context are guaranteed to
++ 	 * see the pointers. Pairs with smp_store_release in
++ 	 * mmu_first_shadow_root_alloc.
++ 	 */
++ 	return smp_load_acquire(&kvm->arch.shadow_root_allocated);
++ }
++ 
++ #ifdef CONFIG_X86_64
++ static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return kvm->arch.tdp_mmu_enabled; }
++ #else
++ static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return false; }
++ #endif
++ 
++ static inline bool kvm_memslots_have_rmaps(struct kvm *kvm)
++ {
++ 	return !is_tdp_mmu_enabled(kvm) || kvm_shadow_root_allocated(kvm);
++ }
++ 
++ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
++ {
++ 	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
++ 	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
++ 		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
++ }
++ 
++ static inline unsigned long
++ __kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, unsigned long npages,
++ 		      int level)
++ {
++ 	return gfn_to_index(slot->base_gfn + npages - 1,
++ 			    slot->base_gfn, level) + 1;
++ }
++ 
++ static inline unsigned long
++ kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, int level)
++ {
++ 	return __kvm_mmu_slot_lpages(slot, slot->npages, level);
++ }
++ 
++ static inline void kvm_update_page_stats(struct kvm *kvm, int level, int count)
++ {
++ 	atomic64_add(count, &kvm->stat.pages[level - 1]);
++ }
++ 
++ gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u64 access,
++ 			   struct x86_exception *exception);
++ 
++ static inline gpa_t kvm_translate_gpa(struct kvm_vcpu *vcpu,
++ 				      struct kvm_mmu *mmu,
++ 				      gpa_t gpa, u64 access,
++ 				      struct x86_exception *exception)
++ {
++ 	if (mmu != &vcpu->arch.nested_mmu)
++ 		return gpa;
++ 	return translate_nested_gpa(vcpu, gpa, access, exception);
++ }
+++>>>>>>> 5b22bbe717d9 (KVM: X86: Change the type of access u32 to u64)
+  #endif
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 24742b8ee038..443dc1c42791 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -427,7 +427,7 @@ struct kvm_mmu {
+ 	void (*inject_page_fault)(struct kvm_vcpu *vcpu,
+ 				  struct x86_exception *fault);
+ 	gpa_t (*gva_to_gpa)(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+-			    gpa_t gva_or_gpa, u32 access,
++			    gpa_t gva_or_gpa, u64 access,
+ 			    struct x86_exception *exception);
+ 	gpa_t (*translate_gpa)(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+ 			       struct x86_exception *exception);
+* Unmerged path arch/x86/kvm/mmu.h
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index ad983809b045..4fce19a702c7 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3692,7 +3692,7 @@ void kvm_mmu_sync_prev_roots(struct kvm_vcpu *vcpu)
+ }
+ 
+ static gpa_t nonpaging_gva_to_gpa(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+-				  gpa_t vaddr, u32 access,
++				  gpa_t vaddr, u64 access,
+ 				  struct x86_exception *exception)
+ {
+ 	if (exception)
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index 55af99407e31..e267c482215d 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -339,7 +339,7 @@ static inline bool FNAME(is_last_gpte)(struct kvm_mmu *mmu,
+  */
+ static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+ 				    struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+-				    gpa_t addr, u32 access)
++				    gpa_t addr, u64 access)
+ {
+ 	int ret;
+ 	pt_element_t pte;
+@@ -347,7 +347,7 @@ static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+ 	gfn_t table_gfn;
+ 	u64 pt_access, pte_access;
+ 	unsigned index, accessed_dirty, pte_pkey;
+-	unsigned nested_access;
++	u64 nested_access;
+ 	gpa_t pte_gpa;
+ 	bool have_ad;
+ 	int offset;
+@@ -541,7 +541,7 @@ static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+ }
+ 
+ static int FNAME(walk_addr)(struct guest_walker *walker,
+-			    struct kvm_vcpu *vcpu, gpa_t addr, u32 access)
++			    struct kvm_vcpu *vcpu, gpa_t addr, u64 access)
+ {
+ 	return FNAME(walk_addr_generic)(walker, vcpu, vcpu->arch.mmu, addr,
+ 					access);
+@@ -1000,7 +1000,7 @@ static void FNAME(invlpg)(struct kvm_vcpu *vcpu, gva_t gva, hpa_t root_hpa)
+ 
+ /* Note, @addr is a GPA when gva_to_gpa() translates an L2 GPA to an L1 GPA. */
+ static gpa_t FNAME(gva_to_gpa)(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+-			       gpa_t addr, u32 access,
++			       gpa_t addr, u64 access,
+ 			       struct x86_exception *exception)
+ {
+ 	struct guest_walker walker;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e014b7ea74df..28f196390535 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6635,7 +6635,7 @@ void kvm_get_segment(struct kvm_vcpu *vcpu,
+ 	static_call(kvm_x86_get_segment)(vcpu, var, seg);
+ }
+ 
+-gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
++gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u64 access,
+ 			   struct x86_exception *exception)
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.mmu;
+@@ -6655,7 +6655,7 @@ gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+ 
+-	u32 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
++	u64 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
+ 	return mmu->gva_to_gpa(vcpu, mmu, gva, access, exception);
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_gva_to_gpa_read);
+@@ -6665,7 +6665,7 @@ EXPORT_SYMBOL_GPL(kvm_mmu_gva_to_gpa_read);
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+ 
+-	u32 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
++	u64 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
+ 	access |= PFERR_FETCH_MASK;
+ 	return mmu->gva_to_gpa(vcpu, mmu, gva, access, exception);
+ }
+@@ -6675,7 +6675,7 @@ gpa_t kvm_mmu_gva_to_gpa_write(struct kvm_vcpu *vcpu, gva_t gva,
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+ 
+-	u32 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
++	u64 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
+ 	access |= PFERR_WRITE_MASK;
+ 	return mmu->gva_to_gpa(vcpu, mmu, gva, access, exception);
+ }
+@@ -6691,7 +6691,7 @@ gpa_t kvm_mmu_gva_to_gpa_system(struct kvm_vcpu *vcpu, gva_t gva,
+ }
+ 
+ static int kvm_read_guest_virt_helper(gva_t addr, void *val, unsigned int bytes,
+-				      struct kvm_vcpu *vcpu, u32 access,
++				      struct kvm_vcpu *vcpu, u64 access,
+ 				      struct x86_exception *exception)
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+@@ -6728,7 +6728,7 @@ static int kvm_fetch_guest_virt(struct x86_emulate_ctxt *ctxt,
+ {
+ 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+-	u32 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
++	u64 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
+ 	unsigned offset;
+ 	int ret;
+ 
+@@ -6753,7 +6753,7 @@ int kvm_read_guest_virt(struct kvm_vcpu *vcpu,
+ 			       gva_t addr, void *val, unsigned int bytes,
+ 			       struct x86_exception *exception)
+ {
+-	u32 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
++	u64 access = (static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
+ 
+ 	/*
+ 	 * FIXME: this should call handle_emulation_failure if X86EMUL_IO_NEEDED
+@@ -6772,7 +6772,7 @@ static int emulator_read_std(struct x86_emulate_ctxt *ctxt,
+ 			     struct x86_exception *exception, bool system)
+ {
+ 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+-	u32 access = 0;
++	u64 access = 0;
+ 
+ 	if (!system && static_call(kvm_x86_get_cpl)(vcpu) == 3)
+ 		access |= PFERR_USER_MASK;
+@@ -6790,7 +6790,7 @@ static int kvm_read_guest_phys_system(struct x86_emulate_ctxt *ctxt,
+ }
+ 
+ static int kvm_write_guest_virt_helper(gva_t addr, void *val, unsigned int bytes,
+-				      struct kvm_vcpu *vcpu, u32 access,
++				      struct kvm_vcpu *vcpu, u64 access,
+ 				      struct x86_exception *exception)
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+@@ -6824,7 +6824,7 @@ static int emulator_write_std(struct x86_emulate_ctxt *ctxt, gva_t addr, void *v
+ 			      bool system)
+ {
+ 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+-	u32 access = PFERR_WRITE_MASK;
++	u64 access = PFERR_WRITE_MASK;
+ 
+ 	if (!system && static_call(kvm_x86_get_cpl)(vcpu) == 3)
+ 		access |= PFERR_USER_MASK;
+@@ -6893,7 +6893,7 @@ static int vcpu_mmio_gva_to_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
+ 				bool write)
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+-	u32 access = ((static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0)
++	u64 access = ((static_call(kvm_x86_get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0)
+ 		| (write ? PFERR_WRITE_MASK : 0);
+ 
+ 	/*
+@@ -12529,7 +12529,7 @@ void kvm_fixup_and_inject_pf_error(struct kvm_vcpu *vcpu, gva_t gva, u16 error_c
+ {
+ 	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+ 	struct x86_exception fault;
+-	u32 access = error_code &
++	u64 access = error_code &
+ 		(PFERR_WRITE_MASK | PFERR_FETCH_MASK | PFERR_USER_MASK);
+ 
+ 	if (!(error_code & PFERR_PRESENT_MASK) ||
