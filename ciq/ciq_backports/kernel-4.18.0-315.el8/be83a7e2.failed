@@ -1,0 +1,128 @@
+mt76: mt76u: rely on woker APIs for rx work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit be83a7e20c5735d3a687db92e9fe9db944dead20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/be83a7e2.failed
+
+In order to improve parallelism, convert rx path in mt76-usb module to
+mt76 workers APIs
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit be83a7e20c5735d3a687db92e9fe9db944dead20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/usb.c
+diff --cc drivers/net/wireless/mediatek/mt76/usb.c
+index f1ae9ff835b2,63f55abede71..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/usb.c
+@@@ -665,13 -665,17 +665,23 @@@ mt76u_process_rx_queue(struct mt76_dev 
+  		}
+  		mt76u_submit_rx_buf(dev, qid, urb);
+  	}
+- 	if (qid == MT_RXQ_MAIN)
++ 	if (qid == MT_RXQ_MAIN) {
++ 		local_bh_disable();
+  		mt76_rx_poll_complete(dev, MT_RXQ_MAIN, NULL);
++ 		local_bh_enable();
++ 	}
+  }
+  
+++<<<<<<< HEAD
+ +static void mt76u_rx_tasklet(unsigned long data)
+ +{
+ +	struct mt76_dev *dev = (struct mt76_dev *)data;
+++=======
++ static void mt76u_rx_worker(struct mt76_worker *w)
++ {
++ 	struct mt76_usb *usb = container_of(w, struct mt76_usb, rx_worker);
++ 	struct mt76_dev *dev = container_of(usb, struct mt76_dev, usb);
+++>>>>>>> be83a7e20c57 (mt76: mt76u: rely on woker APIs for rx work)
+  	int i;
+  
+  	rcu_read_lock();
+@@@ -1111,7 -1125,6 +1132,10 @@@ int mt76u_init(struct mt76_dev *dev
+  	mt76u_ops.write_copy = ext ? mt76u_copy_ext : mt76u_copy;
+  
+  	dev->tx_worker.fn = mt76u_tx_worker;
+++<<<<<<< HEAD
+ +	tasklet_init(&usb->rx_tasklet, mt76u_rx_tasklet, (unsigned long)dev);
+++=======
+++>>>>>>> be83a7e20c57 (mt76: mt76u: rely on woker APIs for rx work)
+  	INIT_WORK(&usb->stat_work, mt76u_tx_status_data);
+  
+  	usb->data_len = usb_maxpacket(udev, usb_sndctrlpipe(udev, 0), 1);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76.h b/drivers/net/wireless/mediatek/mt76/mt76.h
+index 49d61ce83183..4046ac033847 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76.h
++++ b/drivers/net/wireless/mediatek/mt76/mt76.h
+@@ -430,7 +430,7 @@ struct mt76_usb {
+ 	u8 *data;
+ 	u16 data_len;
+ 
+-	struct tasklet_struct rx_tasklet;
++	struct mt76_worker rx_worker;
+ 	struct work_struct stat_work;
+ 
+ 	u8 out_ep[__MT_EP_OUT_MAX];
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/usb.c b/drivers/net/wireless/mediatek/mt76/mt7615/usb.c
+index f0ad83af9e00..a60cfa345521 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/usb.c
+@@ -126,21 +126,20 @@ static int mt7663u_probe(struct usb_interface *usb_intf,
+ alloc_queues:
+ 	ret = mt76u_alloc_mcu_queue(&dev->mt76);
+ 	if (ret)
+-		goto error_free_q;
++		goto error;
+ 
+ 	ret = mt76u_alloc_queues(&dev->mt76);
+ 	if (ret)
+-		goto error_free_q;
++		goto error;
+ 
+ 	ret = mt7663_usb_sdio_register_device(dev);
+ 	if (ret)
+-		goto error_free_q;
++		goto error;
+ 
+ 	return 0;
+ 
+-error_free_q:
+-	mt76u_queues_deinit(&dev->mt76);
+ error:
++	mt76u_queues_deinit(&dev->mt76);
+ 	usb_set_intfdata(usb_intf, NULL);
+ 	usb_put_dev(interface_to_usbdev(usb_intf));
+ 
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76x0/usb.c b/drivers/net/wireless/mediatek/mt76/mt76x0/usb.c
+index ce6b286a8152..b12cb17cb43d 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76x0/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/mt76x0/usb.c
+@@ -277,6 +277,7 @@ static int mt76x0u_probe(struct usb_interface *usb_intf,
+ err:
+ 	usb_set_intfdata(usb_intf, NULL);
+ 	usb_put_dev(interface_to_usbdev(usb_intf));
++	mt76u_queues_deinit(&dev->mt76);
+ 	mt76_free_device(&dev->mt76);
+ 
+ 	return ret;
+diff --git a/drivers/net/wireless/mediatek/mt76/mt76x2/usb.c b/drivers/net/wireless/mediatek/mt76/mt76x2/usb.c
+index 4e003c7b62cf..2575369e44e2 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt76x2/usb.c
++++ b/drivers/net/wireless/mediatek/mt76/mt76x2/usb.c
+@@ -75,6 +75,7 @@ static int mt76x2u_probe(struct usb_interface *intf,
+ 	return 0;
+ 
+ err:
++	mt76u_queues_deinit(&dev->mt76);
+ 	mt76_free_device(&dev->mt76);
+ 	usb_set_intfdata(intf, NULL);
+ 	usb_put_dev(udev);
+* Unmerged path drivers/net/wireless/mediatek/mt76/usb.c
