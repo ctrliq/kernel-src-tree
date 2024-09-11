@@ -1,0 +1,212 @@
+gve: Do lazy cleanup in TX path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tao Liu <xliutaox@google.com>
+commit 61d72c7e486b63340f1fadcf3bed4cae98f03d9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/61d72c7e.failed
+
+When TX queue is full, attemt to process enough TX completions
+to avoid stalling the queue.
+
+Fixes: f5cedc84a30d2 ("gve: Add transmit and receive support")
+	Signed-off-by: Tao Liu <xliutaox@google.com>
+	Signed-off-by: Catherine Sullivan <csully@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 61d72c7e486b63340f1fadcf3bed4cae98f03d9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_ethtool.c
+#	drivers/net/ethernet/google/gve/gve_main.c
+#	drivers/net/ethernet/google/gve/gve_tx.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index fc4326acb8d1,3de561e22659..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -753,16 -820,16 +753,23 @@@ void gve_free_page(struct device *dev, 
+  netdev_tx_t gve_tx(struct sk_buff *skb, struct net_device *dev);
+  bool gve_tx_poll(struct gve_notify_block *block, int budget);
+  int gve_tx_alloc_rings(struct gve_priv *priv);
+++<<<<<<< HEAD
+ +void gve_tx_free_rings(struct gve_priv *priv);
+ +__be32 gve_tx_load_event_counter(struct gve_priv *priv,
+ +				 struct gve_tx_ring *tx);
+++=======
++ void gve_tx_free_rings_gqi(struct gve_priv *priv);
++ u32 gve_tx_load_event_counter(struct gve_priv *priv,
++ 			      struct gve_tx_ring *tx);
++ bool gve_tx_clean_pending(struct gve_priv *priv, struct gve_tx_ring *tx);
+++>>>>>>> 61d72c7e486b (gve: Do lazy cleanup in TX path)
+  /* rx handling */
+  void gve_rx_write_doorbell(struct gve_priv *priv, struct gve_rx_ring *rx);
+ -int gve_rx_poll(struct gve_notify_block *block, int budget);
+ -bool gve_rx_work_pending(struct gve_rx_ring *rx);
+ +bool gve_rx_poll(struct gve_notify_block *block, int budget);
+  int gve_rx_alloc_rings(struct gve_priv *priv);
+ -void gve_rx_free_rings_gqi(struct gve_priv *priv);
+ +void gve_rx_free_rings(struct gve_priv *priv);
+ +bool gve_clean_rx_done(struct gve_rx_ring *rx, int budget,
+ +		       netdev_features_t feat);
+  /* Reset */
+  void gve_schedule_reset(struct gve_priv *priv);
+  int gve_reset(struct gve_priv *priv, bool attempt_teardown);
+diff --cc drivers/net/ethernet/google/gve/gve_ethtool.c
+index e8a09d3163e6,618a3e1d858e..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_ethtool.c
++++ b/drivers/net/ethernet/google/gve/gve_ethtool.c
+@@@ -320,8 -330,8 +320,13 @@@ gve_get_ethtool_stats(struct net_devic
+  			data[i++] = tmp_tx_bytes;
+  			data[i++] = tx->wake_queue;
+  			data[i++] = tx->stop_queue;
+++<<<<<<< HEAD
+ +			data[i++] = be32_to_cpu(gve_tx_load_event_counter(priv,
+ +									  tx));
+++=======
++ 			data[i++] = gve_tx_load_event_counter(priv, tx);
++ 			data[i++] = tx->dma_mapping_error;
+++>>>>>>> 61d72c7e486b (gve: Do lazy cleanup in TX path)
+  			/* stats from NIC */
+  			if (skip_nic_stats) {
+  				/* skip NIC tx stats */
+diff --cc drivers/net/ethernet/google/gve/gve_main.c
+index 3674fe63944d,b6805ad2011b..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@@ -185,22 -207,73 +185,58 @@@ static int gve_napi_poll(struct napi_st
+  	if (reschedule)
+  		return budget;
+  
+ -       /* Complete processing - don't unmask irq if busy polling is enabled */
+ -	if (likely(napi_complete_done(napi, work_done))) {
+ -		irq_doorbell = gve_irq_doorbell(priv, block);
+ -		iowrite32be(GVE_IRQ_ACK | GVE_IRQ_EVENT, irq_doorbell);
+ +	napi_complete(napi);
+ +	irq_doorbell = gve_irq_doorbell(priv, block);
+ +	iowrite32be(GVE_IRQ_ACK | GVE_IRQ_EVENT, irq_doorbell);
+  
+++<<<<<<< HEAD
+ +	/* Double check we have no extra work.
+ +	 * Ensure unmask synchronizes with checking for work.
+++=======
++ 		/* Ensure IRQ ACK is visible before we check pending work.
++ 		 * If queue had issued updates, it would be truly visible.
++ 		 */
++ 		mb();
++ 
++ 		if (block->tx)
++ 			reschedule |= gve_tx_clean_pending(priv, block->tx);
++ 		if (block->rx)
++ 			reschedule |= gve_rx_work_pending(block->rx);
++ 
++ 		if (reschedule && napi_reschedule(napi))
++ 			iowrite32be(GVE_IRQ_MASK, irq_doorbell);
++ 	}
++ 	return work_done;
++ }
++ 
++ static int gve_napi_poll_dqo(struct napi_struct *napi, int budget)
++ {
++ 	struct gve_notify_block *block =
++ 		container_of(napi, struct gve_notify_block, napi);
++ 	struct gve_priv *priv = block->priv;
++ 	bool reschedule = false;
++ 	int work_done = 0;
++ 
++ 	/* Clear PCI MSI-X Pending Bit Array (PBA)
++ 	 *
++ 	 * This bit is set if an interrupt event occurs while the vector is
++ 	 * masked. If this bit is set and we reenable the interrupt, it will
++ 	 * fire again. Since we're just about to poll the queue state, we don't
++ 	 * need it to fire again.
++ 	 *
++ 	 * Under high softirq load, it's possible that the interrupt condition
++ 	 * is triggered twice before we got the chance to process it.
+++>>>>>>> 61d72c7e486b (gve: Do lazy cleanup in TX path)
+  	 */
+ -	gve_write_irq_doorbell_dqo(priv, block,
+ -				   GVE_ITR_NO_UPDATE_DQO | GVE_ITR_CLEAR_PBA_BIT_DQO);
+ -
+ +	mb();
+  	if (block->tx)
+ -		reschedule |= gve_tx_poll_dqo(block, /*do_clean=*/true);
+ -
+ -	if (block->rx) {
+ -		work_done = gve_rx_poll_dqo(block, budget);
+ -		reschedule |= work_done == budget;
+ -	}
+ -
+ -	if (reschedule)
+ -		return budget;
+ -
+ -	if (likely(napi_complete_done(napi, work_done))) {
+ -		/* Enable interrupts again.
+ -		 *
+ -		 * We don't need to repoll afterwards because HW supports the
+ -		 * PCI MSI-X PBA feature.
+ -		 *
+ -		 * Another interrupt would be triggered if a new event came in
+ -		 * since the last one.
+ -		 */
+ -		gve_write_irq_doorbell_dqo(priv, block,
+ -					   GVE_ITR_NO_UPDATE_DQO | GVE_ITR_ENABLE_BIT_DQO);
+ -	}
+ +		reschedule |= gve_tx_poll(block, -1);
+ +	if (block->rx)
+ +		reschedule |= gve_rx_poll(block, -1);
+ +	if (reschedule && napi_reschedule(napi))
+ +		iowrite32be(GVE_IRQ_MASK, irq_doorbell);
+  
+ -	return work_done;
+ +	return 0;
+  }
+  
+  static int gve_alloc_notify_blocks(struct gve_priv *priv)
+diff --cc drivers/net/ethernet/google/gve/gve_tx.c
+index 6559c232a86a,a9cb241fedf4..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_tx.c
++++ b/drivers/net/ethernet/google/gve/gve_tx.c
+@@@ -295,16 -321,28 +296,29 @@@ static inline int gve_skb_fifo_bytes_re
+   */
+  static inline bool gve_can_tx(struct gve_tx_ring *tx, int bytes_required)
+  {
+ -	bool can_alloc = true;
+ -
+ -	if (!tx->raw_addressing)
+ -		can_alloc = gve_tx_fifo_can_alloc(&tx->tx_fifo, bytes_required);
+ -
+ -	return (gve_tx_avail(tx) >= MAX_TX_DESC_NEEDED && can_alloc);
+ +	return (gve_tx_avail(tx) >= MAX_TX_DESC_NEEDED &&
+ +		gve_tx_fifo_can_alloc(&tx->tx_fifo, bytes_required));
+  }
+  
++ static_assert(NAPI_POLL_WEIGHT >= MAX_TX_DESC_NEEDED);
++ 
+  /* Stops the queue if the skb cannot be transmitted. */
+- static int gve_maybe_stop_tx(struct gve_tx_ring *tx, struct sk_buff *skb)
++ static int gve_maybe_stop_tx(struct gve_priv *priv, struct gve_tx_ring *tx,
++ 			     struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	int bytes_required;
+++=======
++ 	int bytes_required = 0;
++ 	u32 nic_done;
++ 	u32 to_do;
++ 	int ret;
++ 
++ 	if (!tx->raw_addressing)
++ 		bytes_required = gve_skb_fifo_bytes_required(tx, skb);
+++>>>>>>> 61d72c7e486b (gve: Do lazy cleanup in TX path)
+  
+ +	bytes_required = gve_skb_fifo_bytes_required(tx, skb);
+  	if (likely(gve_can_tx(tx, bytes_required)))
+  		return 0;
+  
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_ethtool.c
+* Unmerged path drivers/net/ethernet/google/gve/gve_main.c
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx.c
