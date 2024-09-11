@@ -1,0 +1,736 @@
+tls: add bpf support to sk_msg handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit d3b18ad31f93d0b6bae105c679018a1ba7daa9ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d3b18ad3.failed
+
+This work adds BPF sk_msg verdict program support to kTLS
+allowing BPF and kTLS to be combined together. Previously kTLS
+and sk_msg verdict programs were mutually exclusive in the
+ULP layer which created challenges for the orchestrator when
+trying to apply TCP based policy, for example. To resolve this,
+leveraging the work from previous patches that consolidates
+the use of sk_msg, we can finally enable BPF sk_msg verdict
+programs so they continue to run after the kTLS socket is
+created. No change in behavior when kTLS is not used in
+combination with BPF, the kselftest suite for kTLS also runs
+successfully.
+
+Joint work with Daniel.
+
+	Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d3b18ad31f93d0b6bae105c679018a1ba7daa9ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 79112fc82343,a525fc4c2a4b..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -139,101 -241,74 +140,148 @@@ static int move_to_plaintext_sg(struct 
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_pl = &rec->msg_plaintext;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ +	struct scatterlist *plain_sg = &rec->sg_plaintext_data[1];
+ +	struct scatterlist *enc_sg = &rec->sg_encrypted_data[1];
+ +	int enc_sg_idx = 0;
+  	int skip, len;
+  
+ -	/* We add page references worth len bytes from encrypted sg
+ -	 * at the end of plaintext sg. It is guaranteed that msg_en
+ +	if (rec->sg_plaintext_num_elem == MAX_SKB_FRAGS)
+ +		return -ENOSPC;
+ +
+ +	/* We add page references worth len bytes from enc_sg at the
+ +	 * end of plain_sg. It is guaranteed that sg_encrypted_data
+  	 * has enough required room (ensured by caller).
+  	 */
+ -	len = required - msg_pl->sg.size;
+ +	len = required_size - rec->sg_plaintext_size;
+  
+ -	/* Skip initial bytes in msg_en's data to be able to use
+ -	 * same offset of both plain and encrypted data.
+ +	/* Skip initial bytes in sg_encrypted_data to be able
+ +	 * to use same offset of both plain and encrypted data.
+  	 */
+ -	skip = tls_ctx->tx.prepend_size + msg_pl->sg.size;
+ +	skip = tls_ctx->tx.prepend_size + rec->sg_plaintext_size;
+ +
+ +	while (enc_sg_idx < rec->sg_encrypted_num_elem) {
+ +		if (enc_sg[enc_sg_idx].length > skip)
+ +			break;
+ +
+ +		skip -= enc_sg[enc_sg_idx].length;
+ +		enc_sg_idx++;
+ +	}
+ +
+ +	/* unmark the end of plain_sg*/
+ +	sg_unmark_end(plain_sg + rec->sg_plaintext_num_elem - 1);
+ +
+ +	while (len) {
+ +		struct page *page = sg_page(&enc_sg[enc_sg_idx]);
+ +		int bytes = enc_sg[enc_sg_idx].length - skip;
+ +		int offset = enc_sg[enc_sg_idx].offset + skip;
+  
+ -	return sk_msg_clone(sk, msg_pl, msg_en, skip, len);
+ +		if (bytes > len)
+ +			bytes = len;
+ +		else
+ +			enc_sg_idx++;
+ +
+ +		/* Skipping is required only one time */
+ +		skip = 0;
+ +
+ +		/* Increment page reference */
+ +		get_page(page);
+ +
+ +		sg_set_page(&plain_sg[rec->sg_plaintext_num_elem], page,
+ +			    bytes, offset);
+ +
+ +		sk_mem_charge(sk, bytes);
+ +
+ +		len -= bytes;
+ +		rec->sg_plaintext_size += bytes;
+ +
+ +		rec->sg_plaintext_num_elem++;
+ +
+ +		if (rec->sg_plaintext_num_elem == MAX_SKB_FRAGS)
+ +			return -ENOSPC;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static void free_sg(struct sock *sk, struct scatterlist *sg,
+ +		    int *sg_num_elem, unsigned int *sg_size)
+ +{
+ +	int i, n = *sg_num_elem;
+ +
+ +	for (i = 0; i < n; ++i) {
+ +		sk_mem_uncharge(sk, sg[i].length);
+ +		put_page(sg_page(&sg[i]));
+ +	}
+ +	*sg_num_elem = 0;
+ +	*sg_size = 0;
+  }
+  
++ static struct tls_rec *tls_get_rec(struct sock *sk)
++ {
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
++ 	struct sk_msg *msg_pl, *msg_en;
++ 	struct tls_rec *rec;
++ 	int mem_size;
++ 
++ 	mem_size = sizeof(struct tls_rec) + crypto_aead_reqsize(ctx->aead_send);
++ 
++ 	rec = kzalloc(mem_size, sk->sk_allocation);
++ 	if (!rec)
++ 		return NULL;
++ 
++ 	msg_pl = &rec->msg_plaintext;
++ 	msg_en = &rec->msg_encrypted;
++ 
++ 	sk_msg_init(msg_pl);
++ 	sk_msg_init(msg_en);
++ 
++ 	sg_init_table(rec->sg_aead_in, 2);
++ 	sg_set_buf(&rec->sg_aead_in[0], rec->aad_space,
++ 		   sizeof(rec->aad_space));
++ 	sg_unmark_end(&rec->sg_aead_in[1]);
++ 
++ 	sg_init_table(rec->sg_aead_out, 2);
++ 	sg_set_buf(&rec->sg_aead_out[0], rec->aad_space,
++ 		   sizeof(rec->aad_space));
++ 	sg_unmark_end(&rec->sg_aead_out[1]);
++ 
++ 	return rec;
++ }
++ 
++ static void tls_free_rec(struct sock *sk, struct tls_rec *rec)
++ {
++ 	sk_msg_free(sk, &rec->msg_encrypted);
++ 	sk_msg_free(sk, &rec->msg_plaintext);
++ 	kfree(rec);
++ }
++ 
+  static void tls_free_open_rec(struct sock *sk)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	struct tls_rec *rec = ctx->open_rec;
+  
+++<<<<<<< HEAD
+ +	/* Return if there is no open record */
+ +	if (!rec)
+ +		return;
+ +
+ +	free_sg(sk, &rec->sg_encrypted_data[1],
+ +		&rec->sg_encrypted_num_elem,
+ +		&rec->sg_encrypted_size);
+ +
+ +	free_sg(sk, &rec->sg_plaintext_data[1],
+ +		&rec->sg_plaintext_num_elem,
+ +		&rec->sg_plaintext_size);
+ +
+ +	kfree(rec);
+++=======
++ 	if (rec) {
++ 		tls_free_rec(sk, rec);
++ 		ctx->open_rec = NULL;
++ 	}
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  }
+  
+  int tls_tx_records(struct sock *sk, int flags)
+@@@ -409,13 -600,31 +575,38 @@@ static int tls_push_record(struct sock 
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+++<<<<<<< HEAD
+ +	struct tls_rec *rec = ctx->open_rec;
+++=======
++ 	struct tls_rec *rec = ctx->open_rec, *tmp = NULL;
++ 	u32 i, split_point, uninitialized_var(orig_end);
++ 	struct sk_msg *msg_pl, *msg_en;
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  	struct aead_request *req;
++ 	bool split;
+  	int rc;
+  
+  	if (!rec)
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	msg_pl = &rec->msg_plaintext;
++ 	msg_en = &rec->msg_encrypted;
++ 
++ 	split_point = msg_pl->apply_bytes;
++ 	split = split_point && split_point < msg_pl->sg.size;
++ 	if (split) {
++ 		rc = tls_split_open_record(sk, rec, &tmp, msg_pl, msg_en,
++ 					   split_point, tls_ctx->tx.overhead_size,
++ 					   &orig_end);
++ 		if (rc < 0)
++ 			return rc;
++ 		sk_msg_trim(sk, msg_en, msg_pl->sg.size +
++ 			    tls_ctx->tx.overhead_size);
++ 	}
++ 
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  	rec->tx_flags = flags;
+  	req = &rec->aead_req;
+  
+@@@ -427,154 -648,147 +618,277 @@@
+  		     record_type);
+  
+  	tls_fill_prepend(tls_ctx,
+ -			 page_address(sg_page(&msg_en->sg.data[i])) +
+ -			 msg_en->sg.data[i].offset, msg_pl->sg.size,
+ -			 record_type);
+ +			 page_address(sg_page(&rec->sg_encrypted_data[1])) +
+ +			 rec->sg_encrypted_data[1].offset,
+ +			 rec->sg_plaintext_size, record_type);
+ +
+ +	tls_ctx->pending_open_record_frags = 0;
+  
+ -	tls_ctx->pending_open_record_frags = false;
+ +	rc = tls_do_encryption(sk, tls_ctx, ctx, req, rec->sg_plaintext_size);
+ +	if (rc == -EINPROGRESS)
+ +		return -EINPROGRESS;
+  
+ -	rc = tls_do_encryption(sk, tls_ctx, ctx, req, msg_pl->sg.size, i);
+  	if (rc < 0) {
+++<<<<<<< HEAD
+ +		tls_err_abort(sk, EBADMSG);
+++=======
++ 		if (rc != -EINPROGRESS) {
++ 			tls_err_abort(sk, EBADMSG);
++ 			if (split) {
++ 				tls_ctx->pending_open_record_frags = true;
++ 				tls_merge_open_record(sk, rec, tmp, orig_end);
++ 			}
++ 		}
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  		return rc;
++ 	} else if (split) {
++ 		msg_pl = &tmp->msg_plaintext;
++ 		msg_en = &tmp->msg_encrypted;
++ 		sk_msg_trim(sk, msg_en, msg_pl->sg.size +
++ 			    tls_ctx->tx.overhead_size);
++ 		tls_ctx->pending_open_record_frags = true;
++ 		ctx->open_rec = tmp;
+  	}
+  
+  	return tls_tx_records(sk, flags);
+  }
+  
+++<<<<<<< HEAD
+ +static int tls_sw_push_pending_record(struct sock *sk, int flags)
+ +{
+ +	return tls_push_record(sk, flags, TLS_RECORD_TYPE_DATA);
+ +}
+ +
+ +static int zerocopy_from_iter(struct sock *sk, struct iov_iter *from,
+ +			      int length, int *pages_used,
+ +			      unsigned int *size_used,
+ +			      struct scatterlist *to, int to_max_pages,
+ +			      bool charge)
+ +{
+ +	struct page *pages[MAX_SKB_FRAGS];
+ +
+ +	size_t offset;
+ +	ssize_t copied, use;
+ +	int i = 0;
+ +	unsigned int size = *size_used;
+ +	int num_elem = *pages_used;
+ +	int rc = 0;
+ +	int maxpages;
+ +
+ +	while (length > 0) {
+ +		i = 0;
+ +		maxpages = to_max_pages - num_elem;
+ +		if (maxpages == 0) {
+ +			rc = -EFAULT;
+ +			goto out;
+ +		}
+ +		copied = iov_iter_get_pages(from, pages,
+ +					    length,
+ +					    maxpages, &offset);
+ +		if (copied <= 0) {
+ +			rc = -EFAULT;
+ +			goto out;
+ +		}
+ +
+ +		iov_iter_advance(from, copied);
+ +
+ +		length -= copied;
+ +		size += copied;
+ +		while (copied) {
+ +			use = min_t(int, copied, PAGE_SIZE - offset);
+ +
+ +			sg_set_page(&to[num_elem],
+ +				    pages[i], use, offset);
+ +			sg_unmark_end(&to[num_elem]);
+ +			if (charge)
+ +				sk_mem_charge(sk, use);
+ +
+ +			offset = 0;
+ +			copied -= use;
+ +
+ +			++i;
+ +			++num_elem;
+ +		}
+ +	}
+ +
+ +	/* Mark the end in the last sg entry if newly added */
+ +	if (num_elem > *pages_used)
+ +		sg_mark_end(&to[num_elem - 1]);
+ +out:
+ +	if (rc)
+ +		iov_iter_revert(from, size - *size_used);
+ +	*size_used = size;
+ +	*pages_used = num_elem;
+ +
+ +	return rc;
+ +}
+ +
+ +static int memcopy_from_iter(struct sock *sk, struct iov_iter *from,
+ +			     int bytes)
+ +{
+ +	struct tls_context *tls_ctx = tls_get_ctx(sk);
+ +	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+ +	struct tls_rec *rec = ctx->open_rec;
+ +	struct scatterlist *sg = &rec->sg_plaintext_data[1];
+ +	int copy, i, rc = 0;
+ +
+ +	for (i = tls_ctx->pending_open_record_frags;
+ +	     i < rec->sg_plaintext_num_elem; ++i) {
+ +		copy = sg[i].length;
+ +		if (copy_from_iter(
+ +				page_address(sg_page(&sg[i])) + sg[i].offset,
+ +				copy, from) != copy) {
+ +			rc = -EFAULT;
+ +			goto out;
+ +		}
+ +		bytes -= copy;
+ +
+ +		++tls_ctx->pending_open_record_frags;
+ +
+ +		if (!bytes)
+ +			break;
+ +	}
+ +
+ +out:
+ +	return rc;
+ +}
+ +
+ +static struct tls_rec *get_rec(struct sock *sk)
+ +{
+ +	struct tls_context *tls_ctx = tls_get_ctx(sk);
+ +	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+++=======
++ static int bpf_exec_tx_verdict(struct sk_msg *msg, struct sock *sk,
++ 			       bool full_record, u8 record_type,
++ 			       size_t *copied, int flags)
++ {
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
++ 	struct sk_msg msg_redir = { };
++ 	struct sk_psock *psock;
++ 	struct sock *sk_redir;
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  	struct tls_rec *rec;
+- 	int mem_size;
++ 	int err = 0, send;
++ 	bool enospc;
++ 
++ 	psock = sk_psock_get(sk);
++ 	if (!psock)
++ 		return tls_push_record(sk, flags, record_type);
++ more_data:
++ 	enospc = sk_msg_full(msg);
++ 	if (psock->eval == __SK_NONE)
++ 		psock->eval = sk_psock_msg_verdict(sk, psock, msg);
++ 	if (msg->cork_bytes && msg->cork_bytes > msg->sg.size &&
++ 	    !enospc && !full_record) {
++ 		err = -ENOSPC;
++ 		goto out_err;
++ 	}
++ 	msg->cork_bytes = 0;
++ 	send = msg->sg.size;
++ 	if (msg->apply_bytes && msg->apply_bytes < send)
++ 		send = msg->apply_bytes;
++ 
++ 	switch (psock->eval) {
++ 	case __SK_PASS:
++ 		err = tls_push_record(sk, flags, record_type);
++ 		if (err < 0) {
++ 			*copied -= sk_msg_free(sk, msg);
++ 			tls_free_open_rec(sk);
++ 			goto out_err;
++ 		}
++ 		break;
++ 	case __SK_REDIRECT:
++ 		sk_redir = psock->sk_redir;
++ 		memcpy(&msg_redir, msg, sizeof(*msg));
++ 		if (msg->apply_bytes < send)
++ 			msg->apply_bytes = 0;
++ 		else
++ 			msg->apply_bytes -= send;
++ 		sk_msg_return_zero(sk, msg, send);
++ 		msg->sg.size -= send;
++ 		release_sock(sk);
++ 		err = tcp_bpf_sendmsg_redir(sk_redir, &msg_redir, send, flags);
++ 		lock_sock(sk);
++ 		if (err < 0) {
++ 			*copied -= sk_msg_free_nocharge(sk, &msg_redir);
++ 			msg->sg.size = 0;
++ 		}
++ 		if (msg->sg.size == 0)
++ 			tls_free_open_rec(sk);
++ 		break;
++ 	case __SK_DROP:
++ 	default:
++ 		sk_msg_free_partial(sk, msg, send);
++ 		if (msg->apply_bytes < send)
++ 			msg->apply_bytes = 0;
++ 		else
++ 			msg->apply_bytes -= send;
++ 		if (msg->sg.size == 0)
++ 			tls_free_open_rec(sk);
++ 		*copied -= send;
++ 		err = -EACCES;
++ 	}
+  
+- 	/* Return if we already have an open record */
+- 	if (ctx->open_rec)
+- 		return ctx->open_rec;
++ 	if (likely(!err)) {
++ 		bool reset_eval = !ctx->open_rec;
+  
+- 	mem_size = sizeof(struct tls_rec) + crypto_aead_reqsize(ctx->aead_send);
++ 		rec = ctx->open_rec;
++ 		if (rec) {
++ 			msg = &rec->msg_plaintext;
++ 			if (!msg->apply_bytes)
++ 				reset_eval = true;
++ 		}
++ 		if (reset_eval) {
++ 			psock->eval = __SK_NONE;
++ 			if (psock->sk_redir) {
++ 				sock_put(psock->sk_redir);
++ 				psock->sk_redir = NULL;
++ 			}
++ 		}
++ 		if (rec)
++ 			goto more_data;
++ 	}
++  out_err:
++ 	sk_psock_put(sk, psock);
++ 	return err;
++ }
++ 
++ static int tls_sw_push_pending_record(struct sock *sk, int flags)
++ {
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
++ 	struct tls_rec *rec = ctx->open_rec;
++ 	struct sk_msg *msg_pl;
++ 	size_t copied;
+  
+- 	rec = kzalloc(mem_size, sk->sk_allocation);
+  	if (!rec)
+- 		return NULL;
++ 		return 0;
+  
+++<<<<<<< HEAD
+ +	sg_init_table(&rec->sg_plaintext_data[0],
+ +		      ARRAY_SIZE(rec->sg_plaintext_data));
+ +	sg_init_table(&rec->sg_encrypted_data[0],
+ +		      ARRAY_SIZE(rec->sg_encrypted_data));
+ +
+ +	sg_set_buf(&rec->sg_plaintext_data[0], rec->aad_space,
+ +		   sizeof(rec->aad_space));
+ +	sg_set_buf(&rec->sg_encrypted_data[0], rec->aad_space,
+ +		   sizeof(rec->aad_space));
+ +
+ +	ctx->open_rec = rec;
+ +	rec->inplace_crypto = 1;
+ +
+ +	return rec;
+++=======
++ 	msg_pl = &rec->msg_plaintext;
++ 	copied = msg_pl->sg.size;
++ 	if (!copied)
++ 		return 0;
++ 
++ 	return bpf_exec_tx_verdict(msg_pl, sk, true, TLS_RECORD_TYPE_DATA,
++ 				   &copied, flags);
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  }
+  
+  int tls_sw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+@@@ -661,12 -882,10 +978,19 @@@ alloc_encrypted
+  		}
+  
+  		if (!is_kvec && (full_record || eor) && !async_capable) {
+++<<<<<<< HEAD
+ +			ret = zerocopy_from_iter(sk, &msg->msg_iter,
+ +				try_to_copy, &rec->sg_plaintext_num_elem,
+ +				&rec->sg_plaintext_size,
+ +				&rec->sg_plaintext_data[1],
+ +				ARRAY_SIZE(rec->sg_plaintext_data) - 1,
+ +				true);
+++=======
++ 			u32 first = msg_pl->sg.end;
++ 
++ 			ret = sk_msg_zerocopy_from_iter(sk, &msg->msg_iter,
++ 							msg_pl, try_to_copy);
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  			if (ret)
+  				goto fallback_to_reg_send;
+  
+@@@ -682,17 -909,18 +1014,21 @@@
+  					goto send_end;
+  			}
+  			continue;
+- 
++ rollback_iter:
++ 			copied -= try_to_copy;
++ 			sk_msg_sg_copy_clear(msg_pl, first);
++ 			iov_iter_revert(&msg->msg_iter,
++ 					msg_pl->sg.size - orig_size);
+  fallback_to_reg_send:
+ -			sk_msg_trim(sk, msg_pl, orig_size);
+ +			trim_sg(sk, &rec->sg_plaintext_data[1],
+ +				&rec->sg_plaintext_num_elem,
+ +				&rec->sg_plaintext_size,
+ +				orig_size);
+  		}
+  
+ -		required_size = msg_pl->sg.size + try_to_copy;
+ +		required_size = rec->sg_plaintext_size + try_to_copy;
+  
+ -		ret = tls_clone_plaintext_msg(sk, required_size);
+ +		ret = move_to_plaintext_sg(sk, required_size);
+  		if (ret) {
+  			if (ret != -ENOSPC)
+  				goto send_end;
+@@@ -701,23 -929,26 +1037,25 @@@
+  			 * actually allocated. The difference is due
+  			 * to max sg elements limit
+  			 */
+ -			try_to_copy -= required_size - msg_pl->sg.size;
+ +			try_to_copy -= required_size - rec->sg_plaintext_size;
+  			full_record = true;
+ -			sk_msg_trim(sk, msg_en, msg_pl->sg.size +
+ -				    tls_ctx->tx.overhead_size);
+ +
+ +			trim_sg(sk, &rec->sg_encrypted_data[1],
+ +				&rec->sg_encrypted_num_elem,
+ +				&rec->sg_encrypted_size,
+ +				rec->sg_plaintext_size +
+ +				tls_ctx->tx.overhead_size);
+  		}
+  
+ -		ret = sk_msg_memcopy_from_iter(sk, &msg->msg_iter, msg_pl,
+ -					       try_to_copy);
+ -		if (ret < 0)
+ +		ret = memcopy_from_iter(sk, &msg->msg_iter, try_to_copy);
+ +		if (ret)
+  			goto trim_sgl;
+  
+ -		/* Open records defined only if successfully copied, otherwise
+ -		 * we would trim the sg but not reset the open record frags.
+ -		 */
+ -		tls_ctx->pending_open_record_frags = true;
+  		copied += try_to_copy;
+  		if (full_record || eor) {
+- 			ret = tls_push_record(sk, msg->msg_flags, record_type);
++ 			ret = bpf_exec_tx_verdict(msg_pl, sk, full_record,
++ 						  record_type, &copied,
++ 						  msg->msg_flags);
+  			if (ret) {
+  				if (ret == -EINPROGRESS)
+  					num_async++;
+@@@ -781,14 -1017,14 +1124,19 @@@ int tls_sw_sendpage(struct sock *sk, st
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	unsigned char record_type = TLS_RECORD_TYPE_DATA;
+++<<<<<<< HEAD
+ +	size_t orig_size = size;
+ +	struct scatterlist *sg;
+++=======
++ 	struct sk_msg *msg_pl;
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  	struct tls_rec *rec;
+  	int num_async = 0;
++ 	size_t copied = 0;
+  	bool full_record;
+  	int record_room;
+ -	int ret = 0;
+  	bool eor;
+ +	int ret;
+  
+  	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
+  		      MSG_SENDPAGE_NOTLAST))
+@@@ -823,8 -1062,11 +1174,13 @@@
+  			goto sendpage_end;
+  		}
+  
+ -		msg_pl = &rec->msg_plaintext;
+ -
+  		full_record = false;
+++<<<<<<< HEAD
+ +		record_room = TLS_MAX_PAYLOAD_SIZE - rec->sg_plaintext_size;
+++=======
++ 		record_room = TLS_MAX_PAYLOAD_SIZE - msg_pl->sg.size;
++ 		copied = 0;
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  		copy = size;
+  		if (copy >= record_room) {
+  			copy = record_room;
+@@@ -849,24 -1092,18 +1205,29 @@@ alloc_payload
+  			full_record = true;
+  		}
+  
+ -		sk_msg_page_add(msg_pl, page, copy, offset);
+ -		sk_mem_charge(sk, copy);
+ +		get_page(page);
+ +		sg = &rec->sg_plaintext_data[1] + rec->sg_plaintext_num_elem;
+ +		sg_set_page(sg, page, copy, offset);
+ +		sg_unmark_end(sg);
+ +
+ +		rec->sg_plaintext_num_elem++;
+  
+ +		sk_mem_charge(sk, copy);
+  		offset += copy;
+  		size -= copy;
+++<<<<<<< HEAD
+ +		rec->sg_plaintext_size += copy;
+ +		tls_ctx->pending_open_record_frags = rec->sg_plaintext_num_elem;
+++=======
++ 		copied += copy;
+++>>>>>>> d3b18ad31f93 (tls: add bpf support to sk_msg handling)
+  
+ -		tls_ctx->pending_open_record_frags = true;
+ -		if (full_record || eor || sk_msg_full(msg_pl)) {
+ +		if (full_record || eor ||
+ +		    rec->sg_plaintext_num_elem ==
+ +		    ARRAY_SIZE(rec->sg_plaintext_data) - 1) {
+  			rec->inplace_crypto = 0;
+- 			ret = tls_push_record(sk, flags, record_type);
++ 			ret = bpf_exec_tx_verdict(msg_pl, sk, full_record,
++ 						  record_type, &copied, flags);
+  			if (ret) {
+  				if (ret == -EINPROGRESS)
+  					num_async++;
+@@@ -1159,13 -1472,25 +1526,23 @@@ int tls_sw_recvmsg(struct sock *sk
+  	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+  	do {
+  		bool zc = false;
+ -		bool async = false;
+  		int chunk = 0;
+  
+- 		skb = tls_wait_data(sk, flags, timeo, &err);
+- 		if (!skb)
++ 		skb = tls_wait_data(sk, psock, flags, timeo, &err);
++ 		if (!skb) {
++ 			if (psock) {
++ 				int ret = __tcp_bpf_recvmsg(sk, psock, msg, len);
++ 
++ 				if (ret > 0) {
++ 					copied += ret;
++ 					len -= ret;
++ 					continue;
++ 				}
++ 			}
+  			goto recv_end;
++ 		}
+  
+  		rxm = strp_msg(skb);
+ -
+  		if (!cmsg) {
+  			int cerr;
+  
+@@@ -1236,7 -1576,25 +1613,9 @@@
+  	} while (len);
+  
+  recv_end:
+ -	if (num_async) {
+ -		/* Wait for all previously submitted records to be decrypted */
+ -		smp_store_mb(ctx->async_notify, true);
+ -		if (atomic_read(&ctx->decrypt_pending)) {
+ -			err = crypto_wait_req(-EINPROGRESS, &ctx->async_wait);
+ -			if (err) {
+ -				/* one of async decrypt failed */
+ -				tls_err_abort(sk, err);
+ -				copied = 0;
+ -			}
+ -		} else {
+ -			reinit_completion(&ctx->async_wait.completion);
+ -		}
+ -		WRITE_ONCE(ctx->async_notify, false);
+ -	}
+ -
+  	release_sock(sk);
++ 	if (psock)
++ 		sk_psock_put(sk, psock);
+  	return copied ? : err;
+  }
+  
+* Unmerged path include/linux/skmsg.h
+* Unmerged path include/linux/skmsg.h
+* Unmerged path net/tls/tls_sw.c
