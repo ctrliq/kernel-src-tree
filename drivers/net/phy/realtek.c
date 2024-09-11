@@ -298,6 +298,13 @@ static struct phy_driver realtek_drvs[] = {
 		.features	= PHY_GBIT_FEATURES,
 		.flags		= PHY_HAS_INTERRUPT,
 		.config_init	= &rtl8366rb_config_init,
+		/* These interrupts are handled by the irq controller
+		 * embedded inside the RTL8366RB, they get unmasked when the
+		 * irq is requested and ACKed by reading the status register,
+		 * which is done by the irqchip code.
+		 */
+		.ack_interrupt	= genphy_no_ack_interrupt,
+		.config_intr	= genphy_no_config_intr,
 		.suspend	= genphy_suspend,
 		.resume		= genphy_resume,
 	},
