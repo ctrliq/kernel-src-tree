@@ -1,0 +1,164 @@
+udp: fix skb_copy_and_csum_datagram with odd segment sizes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Willem de Bruijn <willemb@google.com>
+commit 52cbd23a119c6ebf40a527e53f3402d2ea38eccb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/52cbd23a.failed
+
+When iteratively computing a checksum with csum_block_add, track the
+offset "pos" to correctly rotate in csum_block_add when offset is odd.
+
+The open coded implementation of skb_copy_and_csum_datagram did this.
+With the switch to __skb_datagram_iter calling csum_and_copy_to_iter,
+pos was reinitialized to 0 on each call.
+
+Bring back the pos by passing it along with the csum to the callback.
+
+Changes v1->v2
+  - pass csum value, instead of csump pointer (Alexander Duyck)
+
+Link: https://lore.kernel.org/netdev/20210128152353.GB27281@optiplex/
+Fixes: 950fcaecd5cc ("datagram: consolidate datagram copy to iter helpers")
+	Reported-by: Oliver Graute <oliver.graute@gmail.com>
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/r/20210203192952.1849843-1-willemdebruijn.kernel@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 52cbd23a119c6ebf40a527e53f3402d2ea38eccb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/iov_iter.c
+diff --cc lib/iov_iter.c
+index 2fca8d3dc4f1,f0b2ccb1bb01..000000000000
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@@ -561,6 -584,49 +561,52 @@@ static size_t copy_pipe_to_iter(const v
+  	return bytes;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __wsum csum_and_memcpy(void *to, const void *from, size_t len,
++ 			      __wsum sum, size_t off)
++ {
++ 	__wsum next = csum_partial_copy_nocheck(from, to, len);
++ 	return csum_block_add(sum, next, off);
++ }
++ 
++ static size_t csum_and_copy_to_pipe_iter(const void *addr, size_t bytes,
++ 					 struct csum_state *csstate,
++ 					 struct iov_iter *i)
++ {
++ 	struct pipe_inode_info *pipe = i->pipe;
++ 	unsigned int p_mask = pipe->ring_size - 1;
++ 	__wsum sum = csstate->csum;
++ 	size_t off = csstate->off;
++ 	unsigned int i_head;
++ 	size_t n, r;
++ 
++ 	if (!sanity(i))
++ 		return 0;
++ 
++ 	bytes = n = push_pipe(i, bytes, &i_head, &r);
++ 	if (unlikely(!n))
++ 		return 0;
++ 	do {
++ 		size_t chunk = min_t(size_t, n, PAGE_SIZE - r);
++ 		char *p = kmap_atomic(pipe->bufs[i_head & p_mask].page);
++ 		sum = csum_and_memcpy(p + r, addr, chunk, sum, off);
++ 		kunmap_atomic(p);
++ 		i->head = i_head;
++ 		i->iov_offset = r + chunk;
++ 		n -= chunk;
++ 		off += chunk;
++ 		addr += chunk;
++ 		r = 0;
++ 		i_head++;
++ 	} while (n);
++ 	i->count -= bytes;
++ 	csstate->csum = sum;
++ 	csstate->off = off;
++ 	return bytes;
++ }
++ 
+++>>>>>>> 52cbd23a119c (udp: fix skb_copy_and_csum_datagram with odd segment sizes)
+  size_t _copy_to_iter(const void *addr, size_t bytes, struct iov_iter *i)
+  {
+  	const char *from = addr;
+@@@ -1449,15 -1524,20 +1495,26 @@@ bool csum_and_copy_from_iter_full(void 
+  }
+  EXPORT_SYMBOL(csum_and_copy_from_iter_full);
+  
+- size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *csump,
++ size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *_csstate,
+  			     struct iov_iter *i)
+  {
++ 	struct csum_state *csstate = _csstate;
+  	const char *from = addr;
+- 	__wsum *csum = csump;
+  	__wsum sum, next;
+++<<<<<<< HEAD
+ +	size_t off = 0;
+ +	sum = *csum;
+ +	if (unlikely(iov_iter_is_pipe(i) || iov_iter_is_discard(i))) {
+++=======
++ 	size_t off;
++ 
++ 	if (unlikely(iov_iter_is_pipe(i)))
++ 		return csum_and_copy_to_pipe_iter(addr, bytes, _csstate, i);
++ 
++ 	sum = csstate->csum;
++ 	off = csstate->off;
++ 	if (unlikely(iov_iter_is_discard(i))) {
+++>>>>>>> 52cbd23a119c (udp: fix skb_copy_and_csum_datagram with odd segment sizes)
+  		WARN_ON(1);	/* for now */
+  		return 0;
+  	}
+diff --git a/include/linux/uio.h b/include/linux/uio.h
+index 6bacd2c7a111..95334d4d6fa7 100644
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@ -283,7 +283,13 @@ static inline void iov_iter_reexpand(struct iov_iter *i, size_t count)
+ {
+ 	i->count = count;
+ }
+-size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *csump, struct iov_iter *i);
++
++struct csum_state {
++	__wsum csum;
++	size_t off;
++};
++
++size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *csstate, struct iov_iter *i);
+ size_t csum_and_copy_from_iter(void *addr, size_t bytes, __wsum *csum, struct iov_iter *i);
+ bool csum_and_copy_from_iter_full(void *addr, size_t bytes, __wsum *csum, struct iov_iter *i);
+ size_t hash_and_copy_to_iter(const void *addr, size_t bytes, void *hashp,
+* Unmerged path lib/iov_iter.c
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index bcc8bcb4c408..00f961c57d69 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -705,8 +705,16 @@ static int skb_copy_and_csum_datagram(const struct sk_buff *skb, int offset,
+ 				      struct iov_iter *to, int len,
+ 				      __wsum *csump)
+ {
+-	return __skb_datagram_iter(skb, offset, to, len, true,
+-			csum_and_copy_to_iter, csump);
++	struct csum_state csdata = { .csum = *csump };
++	int ret;
++
++	ret = __skb_datagram_iter(skb, offset, to, len, true,
++				  csum_and_copy_to_iter, &csdata);
++	if (ret)
++		return ret;
++
++	*csump = csdata.csum;
++	return 0;
+ }
+ 
+ __sum16 __skb_checksum_complete_head(struct sk_buff *skb, int len)
