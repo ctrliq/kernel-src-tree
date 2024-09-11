@@ -1,0 +1,266 @@
+io_uring: fix current->mm NULL dereference on exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit d60b5fbc1ce8210759b568da49d149b868e7c6d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d60b5fbc.failed
+
+Don't reissue requests from io_iopoll_reap_events(), the task may not
+have mm, which ends up with NULL. It's better to kill everything off on
+exit anyway.
+
+[  677.734670] RIP: 0010:io_iopoll_complete+0x27e/0x630
+...
+[  677.734679] Call Trace:
+[  677.734695]  ? __send_signal+0x1f2/0x420
+[  677.734698]  ? _raw_spin_unlock_irqrestore+0x24/0x40
+[  677.734699]  ? send_signal+0xf5/0x140
+[  677.734700]  io_iopoll_getevents+0x12f/0x1a0
+[  677.734702]  io_iopoll_reap_events.part.0+0x5e/0xa0
+[  677.734703]  io_ring_ctx_wait_and_kill+0x132/0x1c0
+[  677.734704]  io_uring_release+0x20/0x30
+[  677.734706]  __fput+0xcd/0x230
+[  677.734707]  ____fput+0xe/0x10
+[  677.734709]  task_work_run+0x67/0xa0
+[  677.734710]  do_exit+0x35d/0xb70
+[  677.734712]  do_group_exit+0x43/0xa0
+[  677.734713]  get_signal+0x140/0x900
+[  677.734715]  do_signal+0x37/0x780
+[  677.734717]  ? enqueue_hrtimer+0x41/0xb0
+[  677.734718]  ? recalibrate_cpu_khz+0x10/0x10
+[  677.734720]  ? ktime_get+0x3e/0xa0
+[  677.734721]  ? lapic_next_deadline+0x26/0x30
+[  677.734723]  ? tick_program_event+0x4d/0x90
+[  677.734724]  ? __hrtimer_get_next_event+0x4d/0x80
+[  677.734726]  __prepare_exit_to_usermode+0x126/0x1c0
+[  677.734741]  prepare_exit_to_usermode+0x9/0x40
+[  677.734742]  idtentry_exit_cond_rcu+0x4c/0x60
+[  677.734743]  sysvec_reschedule_ipi+0x92/0x160
+[  677.734744]  ? asm_sysvec_reschedule_ipi+0xa/0x20
+[  677.734745]  asm_sysvec_reschedule_ipi+0x12/0x20
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d60b5fbc1ce8210759b568da49d149b868e7c6d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 0b681a205810,e507737f044e..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -366,8 -698,204 +366,209 @@@ struct io_submit_state 
+  	unsigned int		ios_left;
+  };
+  
+++<<<<<<< HEAD
+ +static void io_sq_wq_submit_work(struct work_struct *work);
+ +static void __io_free_req(struct io_kiocb *req);
+++=======
++ struct io_op_def {
++ 	/* needs req->io allocated for deferral/async */
++ 	unsigned		async_ctx : 1;
++ 	/* needs current->mm setup, does mm access */
++ 	unsigned		needs_mm : 1;
++ 	/* needs req->file assigned */
++ 	unsigned		needs_file : 1;
++ 	/* don't fail if file grab fails */
++ 	unsigned		needs_file_no_error : 1;
++ 	/* hash wq insertion if file is a regular file */
++ 	unsigned		hash_reg_file : 1;
++ 	/* unbound wq insertion if file is a non-regular file */
++ 	unsigned		unbound_nonreg_file : 1;
++ 	/* opcode is not supported by this kernel */
++ 	unsigned		not_supported : 1;
++ 	/* needs file table */
++ 	unsigned		file_table : 1;
++ 	/* needs ->fs */
++ 	unsigned		needs_fs : 1;
++ 	/* set if opcode supports polled "wait" */
++ 	unsigned		pollin : 1;
++ 	unsigned		pollout : 1;
++ 	/* op supports buffer selection */
++ 	unsigned		buffer_select : 1;
++ };
++ 
++ static const struct io_op_def io_op_defs[] = {
++ 	[IORING_OP_NOP] = {},
++ 	[IORING_OP_READV] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 		.buffer_select		= 1,
++ 	},
++ 	[IORING_OP_WRITEV] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.hash_reg_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_FSYNC] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_READ_FIXED] = {
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 	},
++ 	[IORING_OP_WRITE_FIXED] = {
++ 		.needs_file		= 1,
++ 		.hash_reg_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_POLL_ADD] = {
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 	},
++ 	[IORING_OP_POLL_REMOVE] = {},
++ 	[IORING_OP_SYNC_FILE_RANGE] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_SENDMSG] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.needs_fs		= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_RECVMSG] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.needs_fs		= 1,
++ 		.pollin			= 1,
++ 		.buffer_select		= 1,
++ 	},
++ 	[IORING_OP_TIMEOUT] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 	},
++ 	[IORING_OP_TIMEOUT_REMOVE] = {},
++ 	[IORING_OP_ACCEPT] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.file_table		= 1,
++ 		.pollin			= 1,
++ 	},
++ 	[IORING_OP_ASYNC_CANCEL] = {},
++ 	[IORING_OP_LINK_TIMEOUT] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 	},
++ 	[IORING_OP_CONNECT] = {
++ 		.async_ctx		= 1,
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_FALLOCATE] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_OPENAT] = {
++ 		.file_table		= 1,
++ 		.needs_fs		= 1,
++ 	},
++ 	[IORING_OP_CLOSE] = {
++ 		.needs_file		= 1,
++ 		.needs_file_no_error	= 1,
++ 		.file_table		= 1,
++ 	},
++ 	[IORING_OP_FILES_UPDATE] = {
++ 		.needs_mm		= 1,
++ 		.file_table		= 1,
++ 	},
++ 	[IORING_OP_STATX] = {
++ 		.needs_mm		= 1,
++ 		.needs_fs		= 1,
++ 		.file_table		= 1,
++ 	},
++ 	[IORING_OP_READ] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 		.buffer_select		= 1,
++ 	},
++ 	[IORING_OP_WRITE] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_FADVISE] = {
++ 		.needs_file		= 1,
++ 	},
++ 	[IORING_OP_MADVISE] = {
++ 		.needs_mm		= 1,
++ 	},
++ 	[IORING_OP_SEND] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollout		= 1,
++ 	},
++ 	[IORING_OP_RECV] = {
++ 		.needs_mm		= 1,
++ 		.needs_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 		.pollin			= 1,
++ 		.buffer_select		= 1,
++ 	},
++ 	[IORING_OP_OPENAT2] = {
++ 		.file_table		= 1,
++ 		.needs_fs		= 1,
++ 	},
++ 	[IORING_OP_EPOLL_CTL] = {
++ 		.unbound_nonreg_file	= 1,
++ 		.file_table		= 1,
++ 	},
++ 	[IORING_OP_SPLICE] = {
++ 		.needs_file		= 1,
++ 		.hash_reg_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 	},
++ 	[IORING_OP_PROVIDE_BUFFERS] = {},
++ 	[IORING_OP_REMOVE_BUFFERS] = {},
++ 	[IORING_OP_TEE] = {
++ 		.needs_file		= 1,
++ 		.hash_reg_file		= 1,
++ 		.unbound_nonreg_file	= 1,
++ 	},
++ };
++ 
++ static void io_wq_submit_work(struct io_wq_work **workptr);
++ static void io_cqring_fill_event(struct io_kiocb *req, long res);
++ static void io_put_req(struct io_kiocb *req);
++ static void __io_double_put_req(struct io_kiocb *req);
++ static struct io_kiocb *io_prep_linked_timeout(struct io_kiocb *req);
++ static void io_queue_linked_timeout(struct io_kiocb *req);
++ static int __io_sqe_files_update(struct io_ring_ctx *ctx,
++ 				 struct io_uring_files_update *ip,
++ 				 unsigned nr_args);
++ static int io_grab_files(struct io_kiocb *req);
++ static void io_complete_rw_common(struct kiocb *kiocb, long res);
++ static void io_cleanup_req(struct io_kiocb *req);
++ static int io_file_get(struct io_submit_state *state, struct io_kiocb *req,
++ 		       int fd, struct file **out_file, bool fixed);
++ static void __io_queue_sqe(struct io_kiocb *req,
++ 			   const struct io_uring_sqe *sqe);
+++>>>>>>> d60b5fbc1ce8 (io_uring: fix current->mm NULL dereference on exit)
+  
+  static struct kmem_cache *req_cachep;
+  
+* Unmerged path fs/io_uring.c
