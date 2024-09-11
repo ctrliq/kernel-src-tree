@@ -1,0 +1,818 @@
+bpf: Add bpf_line_info support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit c454a46b5efd8eff8880e88ece2976e60a26bf35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c454a46b.failed
+
+This patch adds bpf_line_info support.
+
+It accepts an array of bpf_line_info objects during BPF_PROG_LOAD.
+The "line_info", "line_info_cnt" and "line_info_rec_size" are added
+to the "union bpf_attr".  The "line_info_rec_size" makes
+bpf_line_info extensible in the future.
+
+The new "check_btf_line()" ensures the userspace line_info is valid
+for the kernel to use.
+
+When the verifier is translating/patching the bpf_prog (through
+"bpf_patch_insn_single()"), the line_infos' insn_off is also
+adjusted by the newly added "bpf_adj_linfo()".
+
+If the bpf_prog is jited, this patch also provides the jited addrs (in
+aux->jited_linfo) for the corresponding line_info.insn_off.
+"bpf_prog_fill_jited_linfo()" is added to fill the aux->jited_linfo.
+It is currently called by the x86 jit.  Other jits can also use
+"bpf_prog_fill_jited_linfo()" and it will be done in the followup patches.
+In the future, if it deemed necessary, a particular jit could also provide
+its own "bpf_prog_fill_jited_linfo()" implementation.
+
+A few "*line_info*" fields are added to the bpf_prog_info such
+that the user can get the xlated line_info back (i.e. the line_info
+with its insn_off reflecting the translated prog).  The jited_line_info
+is available if the prog is jited.  It is an array of __u64.
+If the prog is not jited, jited_line_info_cnt is 0.
+
+The verifier's verbose log with line_info will be done in
+a follow up patch.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit c454a46b5efd8eff8880e88ece2976e60a26bf35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index 61dff997a78e,0c992b86eb2c..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -305,6 -317,30 +305,33 @@@ struct bpf_prog_aux 
+  	void *security;
+  #endif
+  	struct bpf_prog_offload *offload;
+++<<<<<<< HEAD
+++=======
++ 	struct btf *btf;
++ 	struct bpf_func_info *func_info;
++ 	/* bpf_line_info loaded from userspace.  linfo->insn_off
++ 	 * has the xlated insn offset.
++ 	 * Both the main and sub prog share the same linfo.
++ 	 * The subprog can access its first linfo by
++ 	 * using the linfo_idx.
++ 	 */
++ 	struct bpf_line_info *linfo;
++ 	/* jited_linfo is the jited addr of the linfo.  It has a
++ 	 * one to one mapping to linfo:
++ 	 * jited_linfo[i] is the jited addr for the linfo[i]->insn_off.
++ 	 * Both the main and sub prog share the same jited_linfo.
++ 	 * The subprog can access its first jited_linfo by
++ 	 * using the linfo_idx.
++ 	 */
++ 	void **jited_linfo;
++ 	u32 func_info_cnt;
++ 	u32 nr_linfo;
++ 	/* subprog can use linfo_idx to access its first linfo and
++ 	 * jited_linfo.
++ 	 * main prog always has linfo_idx == 0
++ 	 */
++ 	u32 linfo_idx;
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  	union {
+  		struct work_struct work;
+  		struct rcu_head	rcu;
+diff --cc include/uapi/linux/bpf.h
+index b049f187b868,7a66db8d15d5..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -333,6 -352,13 +333,16 @@@ union bpf_attr 
+  		 * (context accesses, allowed helpers, etc).
+  		 */
+  		__u32		expected_attach_type;
+++<<<<<<< HEAD
+++=======
++ 		__u32		prog_btf_fd;	/* fd pointing to BTF type data */
++ 		__u32		func_info_rec_size;	/* userspace bpf_func_info size */
++ 		__aligned_u64	func_info;	/* func info */
++ 		__u32		func_info_cnt;	/* number of bpf_func_info records */
++ 		__u32		line_info_rec_size;	/* userspace bpf_line_info size */
++ 		__aligned_u64	line_info;	/* line info */
++ 		__u32		line_info_cnt;	/* number of bpf_line_info records */
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  	};
+  
+  	struct { /* anonymous struct used by BPF_OBJ_* commands */
+@@@ -2447,6 -2678,16 +2457,19 @@@ struct bpf_prog_info 
+  	__u32 nr_jited_func_lens;
+  	__aligned_u64 jited_ksyms;
+  	__aligned_u64 jited_func_lens;
+++<<<<<<< HEAD
+++=======
++ 	__u32 btf_id;
++ 	__u32 func_info_rec_size;
++ 	__aligned_u64 func_info;
++ 	__u32 func_info_cnt;
++ 	__u32 line_info_cnt;
++ 	__aligned_u64 line_info;
++ 	__aligned_u64 jited_line_info;
++ 	__u32 jited_line_info_cnt;
++ 	__u32 line_info_rec_size;
++ 	__u32 jited_line_info_rec_size;
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  } __attribute__((aligned(8)));
+  
+  struct bpf_map_info {
+@@@ -2735,4 -2976,42 +2758,45 @@@ enum bpf_task_fd_type 
+  	BPF_FD_TYPE_URETPROBE,		/* filename + offset */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_flow_keys {
++ 	__u16	nhoff;
++ 	__u16	thoff;
++ 	__u16	addr_proto;			/* ETH_P_* of valid addrs */
++ 	__u8	is_frag;
++ 	__u8	is_first_frag;
++ 	__u8	is_encap;
++ 	__u8	ip_proto;
++ 	__be16	n_proto;
++ 	__be16	sport;
++ 	__be16	dport;
++ 	union {
++ 		struct {
++ 			__be32	ipv4_src;
++ 			__be32	ipv4_dst;
++ 		};
++ 		struct {
++ 			__u32	ipv6_src[4];	/* in6_addr; network order */
++ 			__u32	ipv6_dst[4];	/* in6_addr; network order */
++ 		};
++ 	};
++ };
++ 
++ struct bpf_func_info {
++ 	__u32	insn_off;
++ 	__u32	type_id;
++ };
++ 
++ #define BPF_LINE_INFO_LINE_NUM(line_col)	((line_col) >> 10)
++ #define BPF_LINE_INFO_LINE_COL(line_col)	((line_col) & 0x3ff)
++ 
++ struct bpf_line_info {
++ 	__u32	insn_off;
++ 	__u32	file_name_off;
++ 	__u32	line_off;
++ 	__u32	line_col;
++ };
++ 
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  #endif /* _UAPI__LINUX_BPF_H__ */
+diff --cc kernel/bpf/syscall.c
+index 09834e3d61d8,19c88cff7880..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1228,6 -1213,9 +1228,12 @@@ static void __bpf_prog_put(struct bpf_p
+  		/* bpf_prog_free_id() must be called first */
+  		bpf_prog_free_id(prog, do_idr_lock);
+  		bpf_prog_kallsyms_del_all(prog);
+++<<<<<<< HEAD
+++=======
++ 		btf_put(prog->aux->btf);
++ 		kvfree(prog->aux->func_info);
++ 		bpf_prog_free_linfo(prog);
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  
+  		call_rcu(&prog->aux->rcu, __bpf_prog_put_rcu);
+  	}
+@@@ -1452,9 -1440,9 +1458,13 @@@ bpf_prog_load_check_attach_type(enum bp
+  }
+  
+  /* last field in 'union bpf_attr' used by this command */
+++<<<<<<< HEAD
+ +#define	BPF_PROG_LOAD_LAST_FIELD expected_attach_type
+++=======
++ #define	BPF_PROG_LOAD_LAST_FIELD line_info_cnt
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  
+ -static int bpf_prog_load(union bpf_attr *attr, union bpf_attr __user *uattr)
+ +static int bpf_prog_load(union bpf_attr *attr)
+  {
+  	enum bpf_prog_type type = attr->prog_type;
+  	struct bpf_prog *prog;
+@@@ -2087,11 -2116,18 +2129,24 @@@ static int bpf_prog_get_info_by_fd(stru
+  				return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	err = set_info_rec_size(&info);
++ 	if (err)
++ 		return err;
++ 
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  	if (!capable(CAP_SYS_ADMIN)) {
+  		info.jited_prog_len = 0;
+  		info.xlated_prog_len = 0;
+  		info.nr_jited_ksyms = 0;
+  		info.nr_jited_func_lens = 0;
+++<<<<<<< HEAD
+++=======
++ 		info.func_info_cnt = 0;
++ 		info.line_info_cnt = 0;
++ 		info.jited_line_info_cnt = 0;
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  		goto done;
+  	}
+  
+@@@ -2229,6 -2265,63 +2284,66 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (prog->aux->btf)
++ 		info.btf_id = btf_id(prog->aux->btf);
++ 
++ 	ulen = info.func_info_cnt;
++ 	info.func_info_cnt = prog->aux->func_info_cnt;
++ 	if (info.func_info_cnt && ulen) {
++ 		if (bpf_dump_raw_ok()) {
++ 			char __user *user_finfo;
++ 
++ 			user_finfo = u64_to_user_ptr(info.func_info);
++ 			ulen = min_t(u32, info.func_info_cnt, ulen);
++ 			if (copy_to_user(user_finfo, prog->aux->func_info,
++ 					 info.func_info_rec_size * ulen))
++ 				return -EFAULT;
++ 		} else {
++ 			info.func_info = 0;
++ 		}
++ 	}
++ 
++ 	ulen = info.line_info_cnt;
++ 	info.line_info_cnt = prog->aux->nr_linfo;
++ 	if (info.line_info_cnt && ulen) {
++ 		if (bpf_dump_raw_ok()) {
++ 			__u8 __user *user_linfo;
++ 
++ 			user_linfo = u64_to_user_ptr(info.line_info);
++ 			ulen = min_t(u32, info.line_info_cnt, ulen);
++ 			if (copy_to_user(user_linfo, prog->aux->linfo,
++ 					 info.line_info_rec_size * ulen))
++ 				return -EFAULT;
++ 		} else {
++ 			info.line_info = 0;
++ 		}
++ 	}
++ 
++ 	ulen = info.jited_line_info_cnt;
++ 	if (prog->aux->jited_linfo)
++ 		info.jited_line_info_cnt = prog->aux->nr_linfo;
++ 	else
++ 		info.jited_line_info_cnt = 0;
++ 	if (info.jited_line_info_cnt && ulen) {
++ 		if (bpf_dump_raw_ok()) {
++ 			__u64 __user *user_linfo;
++ 			u32 i;
++ 
++ 			user_linfo = u64_to_user_ptr(info.jited_line_info);
++ 			ulen = min_t(u32, info.jited_line_info_cnt, ulen);
++ 			for (i = 0; i < ulen; i++) {
++ 				if (put_user((__u64)(long)prog->aux->jited_linfo[i],
++ 					     &user_linfo[i]))
++ 					return -EFAULT;
++ 			}
++ 		} else {
++ 			info.jited_line_info = 0;
++ 		}
++ 	}
++ 
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  done:
+  	if (copy_to_user(uinfo, &info, info_len) ||
+  	    put_user(info_len, &uattr->info.info_len))
+diff --cc kernel/bpf/verifier.c
+index cf8599a3b656,9d25506bd55a..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -4489,6 -4636,269 +4489,272 @@@ err_free
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* The minimum supported BTF func info size */
++ #define MIN_BPF_FUNCINFO_SIZE	8
++ #define MAX_FUNCINFO_REC_SIZE	252
++ 
++ static int check_btf_func(struct bpf_verifier_env *env,
++ 			  const union bpf_attr *attr,
++ 			  union bpf_attr __user *uattr)
++ {
++ 	u32 i, nfuncs, urec_size, min_size, prev_offset;
++ 	u32 krec_size = sizeof(struct bpf_func_info);
++ 	struct bpf_func_info *krecord;
++ 	const struct btf_type *type;
++ 	struct bpf_prog *prog;
++ 	const struct btf *btf;
++ 	void __user *urecord;
++ 	int ret = 0;
++ 
++ 	nfuncs = attr->func_info_cnt;
++ 	if (!nfuncs)
++ 		return 0;
++ 
++ 	if (nfuncs != env->subprog_cnt) {
++ 		verbose(env, "number of funcs in func_info doesn't match number of subprogs\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	urec_size = attr->func_info_rec_size;
++ 	if (urec_size < MIN_BPF_FUNCINFO_SIZE ||
++ 	    urec_size > MAX_FUNCINFO_REC_SIZE ||
++ 	    urec_size % sizeof(u32)) {
++ 		verbose(env, "invalid func info rec size %u\n", urec_size);
++ 		return -EINVAL;
++ 	}
++ 
++ 	prog = env->prog;
++ 	btf = prog->aux->btf;
++ 
++ 	urecord = u64_to_user_ptr(attr->func_info);
++ 	min_size = min_t(u32, krec_size, urec_size);
++ 
++ 	krecord = kvcalloc(nfuncs, krec_size, GFP_KERNEL | __GFP_NOWARN);
++ 	if (!krecord)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < nfuncs; i++) {
++ 		ret = bpf_check_uarg_tail_zero(urecord, krec_size, urec_size);
++ 		if (ret) {
++ 			if (ret == -E2BIG) {
++ 				verbose(env, "nonzero tailing record in func info");
++ 				/* set the size kernel expects so loader can zero
++ 				 * out the rest of the record.
++ 				 */
++ 				if (put_user(min_size, &uattr->func_info_rec_size))
++ 					ret = -EFAULT;
++ 			}
++ 			goto err_free;
++ 		}
++ 
++ 		if (copy_from_user(&krecord[i], urecord, min_size)) {
++ 			ret = -EFAULT;
++ 			goto err_free;
++ 		}
++ 
++ 		/* check insn_off */
++ 		if (i == 0) {
++ 			if (krecord[i].insn_off) {
++ 				verbose(env,
++ 					"nonzero insn_off %u for the first func info record",
++ 					krecord[i].insn_off);
++ 				ret = -EINVAL;
++ 				goto err_free;
++ 			}
++ 		} else if (krecord[i].insn_off <= prev_offset) {
++ 			verbose(env,
++ 				"same or smaller insn offset (%u) than previous func info record (%u)",
++ 				krecord[i].insn_off, prev_offset);
++ 			ret = -EINVAL;
++ 			goto err_free;
++ 		}
++ 
++ 		if (env->subprog_info[i].start != krecord[i].insn_off) {
++ 			verbose(env, "func_info BTF section doesn't match subprog layout in BPF program\n");
++ 			ret = -EINVAL;
++ 			goto err_free;
++ 		}
++ 
++ 		/* check type_id */
++ 		type = btf_type_by_id(btf, krecord[i].type_id);
++ 		if (!type || BTF_INFO_KIND(type->info) != BTF_KIND_FUNC) {
++ 			verbose(env, "invalid type id %d in func info",
++ 				krecord[i].type_id);
++ 			ret = -EINVAL;
++ 			goto err_free;
++ 		}
++ 
++ 		prev_offset = krecord[i].insn_off;
++ 		urecord += urec_size;
++ 	}
++ 
++ 	prog->aux->func_info = krecord;
++ 	prog->aux->func_info_cnt = nfuncs;
++ 	return 0;
++ 
++ err_free:
++ 	kvfree(krecord);
++ 	return ret;
++ }
++ 
++ static void adjust_btf_func(struct bpf_verifier_env *env)
++ {
++ 	int i;
++ 
++ 	if (!env->prog->aux->func_info)
++ 		return;
++ 
++ 	for (i = 0; i < env->subprog_cnt; i++)
++ 		env->prog->aux->func_info[i].insn_off = env->subprog_info[i].start;
++ }
++ 
++ #define MIN_BPF_LINEINFO_SIZE	(offsetof(struct bpf_line_info, line_col) + \
++ 		sizeof(((struct bpf_line_info *)(0))->line_col))
++ #define MAX_LINEINFO_REC_SIZE	MAX_FUNCINFO_REC_SIZE
++ 
++ static int check_btf_line(struct bpf_verifier_env *env,
++ 			  const union bpf_attr *attr,
++ 			  union bpf_attr __user *uattr)
++ {
++ 	u32 i, s, nr_linfo, ncopy, expected_size, rec_size, prev_offset = 0;
++ 	struct bpf_subprog_info *sub;
++ 	struct bpf_line_info *linfo;
++ 	struct bpf_prog *prog;
++ 	const struct btf *btf;
++ 	void __user *ulinfo;
++ 	int err;
++ 
++ 	nr_linfo = attr->line_info_cnt;
++ 	if (!nr_linfo)
++ 		return 0;
++ 
++ 	rec_size = attr->line_info_rec_size;
++ 	if (rec_size < MIN_BPF_LINEINFO_SIZE ||
++ 	    rec_size > MAX_LINEINFO_REC_SIZE ||
++ 	    rec_size & (sizeof(u32) - 1))
++ 		return -EINVAL;
++ 
++ 	/* Need to zero it in case the userspace may
++ 	 * pass in a smaller bpf_line_info object.
++ 	 */
++ 	linfo = kvcalloc(nr_linfo, sizeof(struct bpf_line_info),
++ 			 GFP_KERNEL | __GFP_NOWARN);
++ 	if (!linfo)
++ 		return -ENOMEM;
++ 
++ 	prog = env->prog;
++ 	btf = prog->aux->btf;
++ 
++ 	s = 0;
++ 	sub = env->subprog_info;
++ 	ulinfo = u64_to_user_ptr(attr->line_info);
++ 	expected_size = sizeof(struct bpf_line_info);
++ 	ncopy = min_t(u32, expected_size, rec_size);
++ 	for (i = 0; i < nr_linfo; i++) {
++ 		err = bpf_check_uarg_tail_zero(ulinfo, expected_size, rec_size);
++ 		if (err) {
++ 			if (err == -E2BIG) {
++ 				verbose(env, "nonzero tailing record in line_info");
++ 				if (put_user(expected_size,
++ 					     &uattr->line_info_rec_size))
++ 					err = -EFAULT;
++ 			}
++ 			goto err_free;
++ 		}
++ 
++ 		if (copy_from_user(&linfo[i], ulinfo, ncopy)) {
++ 			err = -EFAULT;
++ 			goto err_free;
++ 		}
++ 
++ 		/*
++ 		 * Check insn_off to ensure
++ 		 * 1) strictly increasing AND
++ 		 * 2) bounded by prog->len
++ 		 *
++ 		 * The linfo[0].insn_off == 0 check logically falls into
++ 		 * the later "missing bpf_line_info for func..." case
++ 		 * because the first linfo[0].insn_off must be the
++ 		 * first sub also and the first sub must have
++ 		 * subprog_info[0].start == 0.
++ 		 */
++ 		if ((i && linfo[i].insn_off <= prev_offset) ||
++ 		    linfo[i].insn_off >= prog->len) {
++ 			verbose(env, "Invalid line_info[%u].insn_off:%u (prev_offset:%u prog->len:%u)\n",
++ 				i, linfo[i].insn_off, prev_offset,
++ 				prog->len);
++ 			err = -EINVAL;
++ 			goto err_free;
++ 		}
++ 
++ 		if (!btf_name_offset_valid(btf, linfo[i].line_off) ||
++ 		    !btf_name_offset_valid(btf, linfo[i].file_name_off)) {
++ 			verbose(env, "Invalid line_info[%u].line_off or .file_name_off\n", i);
++ 			err = -EINVAL;
++ 			goto err_free;
++ 		}
++ 
++ 		if (s != env->subprog_cnt) {
++ 			if (linfo[i].insn_off == sub[s].start) {
++ 				sub[s].linfo_idx = i;
++ 				s++;
++ 			} else if (sub[s].start < linfo[i].insn_off) {
++ 				verbose(env, "missing bpf_line_info for func#%u\n", s);
++ 				err = -EINVAL;
++ 				goto err_free;
++ 			}
++ 		}
++ 
++ 		prev_offset = linfo[i].insn_off;
++ 		ulinfo += rec_size;
++ 	}
++ 
++ 	if (s != env->subprog_cnt) {
++ 		verbose(env, "missing bpf_line_info for %u funcs starting from func#%u\n",
++ 			env->subprog_cnt - s, s);
++ 		err = -EINVAL;
++ 		goto err_free;
++ 	}
++ 
++ 	prog->aux->linfo = linfo;
++ 	prog->aux->nr_linfo = nr_linfo;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kvfree(linfo);
++ 	return err;
++ }
++ 
++ static int check_btf_info(struct bpf_verifier_env *env,
++ 			  const union bpf_attr *attr,
++ 			  union bpf_attr __user *uattr)
++ {
++ 	struct btf *btf;
++ 	int err;
++ 
++ 	if (!attr->func_info_cnt && !attr->line_info_cnt)
++ 		return 0;
++ 
++ 	btf = btf_get_by_fd(attr->prog_btf_fd);
++ 	if (IS_ERR(btf))
++ 		return PTR_ERR(btf);
++ 	env->prog->aux->btf = btf;
++ 
++ 	err = check_btf_func(env, attr, uattr);
++ 	if (err)
++ 		return err;
++ 
++ 	err = check_btf_line(env, attr, uattr);
++ 	if (err)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  /* check %cur's range satisfies %old's */
+  static bool range_within(struct bpf_reg_state *old,
+  			 struct bpf_reg_state *cur)
+@@@ -6257,6 -6676,10 +6534,13 @@@ int bpf_check(struct bpf_prog **prog, u
+  	if (ret < 0)
+  		goto skip_full_check;
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = check_btf_info(env, attr, uattr);
++ 	if (ret < 0)
++ 		goto skip_full_check;
++ 
+++>>>>>>> c454a46b5efd (bpf: Add bpf_line_info support)
+  	ret = do_check(env);
+  	if (env->cur_state) {
+  		free_verifier_state(env->cur_state, true);
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 2580cd2e98b1..5542303c43d9 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -1181,6 +1181,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 	}
+ 
+ 	if (!image || !prog->is_func || extra_pass) {
++		if (image)
++			bpf_prog_fill_jited_linfo(prog, addrs);
+ out_addrs:
+ 		kfree(addrs);
+ 		kfree(jit_data);
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 60fc755117b1..c356f7cb9479 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -199,6 +199,7 @@ static inline bool bpf_verifier_log_needed(const struct bpf_verifier_log *log)
+ 
+ struct bpf_subprog_info {
+ 	u32 start; /* insn idx of function entry point */
++	u32 linfo_idx; /* The idx to the main_prog->aux->linfo */
+ 	u16 stack_depth; /* max. stack depth used by this function */
+ };
+ 
+diff --git a/include/linux/btf.h b/include/linux/btf.h
+index e076c4697049..cbb7819a2c99 100644
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@ -46,5 +46,6 @@ void btf_type_seq_show(const struct btf *btf, u32 type_id, void *obj,
+ 		       struct seq_file *m);
+ int btf_get_fd_by_id(u32 id);
+ u32 btf_id(const struct btf *btf);
++bool btf_name_offset_valid(const struct btf *btf, u32 offset);
+ 
+ #endif
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 96a873a376e6..d1377d0a5ede 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -735,6 +735,13 @@ void bpf_prog_free(struct bpf_prog *fp);
+ 
+ bool bpf_opcode_in_insntable(u8 code);
+ 
++void bpf_prog_free_linfo(struct bpf_prog *prog);
++void bpf_prog_fill_jited_linfo(struct bpf_prog *prog,
++			       const u32 *insn_to_jit_off);
++int bpf_prog_alloc_jited_linfo(struct bpf_prog *prog);
++void bpf_prog_free_jited_linfo(struct bpf_prog *prog);
++void bpf_prog_free_unused_jited_linfo(struct bpf_prog *prog);
++
+ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags);
+ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
+ 				  gfp_t gfp_extra_flags);
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 15d36732d95a..2f6c42723bfb 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -444,7 +444,7 @@ static const struct btf_kind_operations *btf_type_ops(const struct btf_type *t)
+ 	return kind_ops[BTF_INFO_KIND(t->info)];
+ }
+ 
+-static bool btf_name_offset_valid(const struct btf *btf, u32 offset)
++bool btf_name_offset_valid(const struct btf *btf, u32 offset)
+ {
+ 	return BTF_STR_OFFSET_VALID(offset) &&
+ 		offset < btf->hdr.str_len;
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 7cdce00221d3..4c603df71622 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -103,6 +103,91 @@ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
+ }
+ EXPORT_SYMBOL_GPL(bpf_prog_alloc);
+ 
++int bpf_prog_alloc_jited_linfo(struct bpf_prog *prog)
++{
++	if (!prog->aux->nr_linfo || !prog->jit_requested)
++		return 0;
++
++	prog->aux->jited_linfo = kcalloc(prog->aux->nr_linfo,
++					 sizeof(*prog->aux->jited_linfo),
++					 GFP_KERNEL | __GFP_NOWARN);
++	if (!prog->aux->jited_linfo)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void bpf_prog_free_jited_linfo(struct bpf_prog *prog)
++{
++	kfree(prog->aux->jited_linfo);
++	prog->aux->jited_linfo = NULL;
++}
++
++void bpf_prog_free_unused_jited_linfo(struct bpf_prog *prog)
++{
++	if (prog->aux->jited_linfo && !prog->aux->jited_linfo[0])
++		bpf_prog_free_jited_linfo(prog);
++}
++
++/* The jit engine is responsible to provide an array
++ * for insn_off to the jited_off mapping (insn_to_jit_off).
++ *
++ * The idx to this array is the insn_off.  Hence, the insn_off
++ * here is relative to the prog itself instead of the main prog.
++ * This array has one entry for each xlated bpf insn.
++ *
++ * jited_off is the byte off to the last byte of the jited insn.
++ *
++ * Hence, with
++ * insn_start:
++ *      The first bpf insn off of the prog.  The insn off
++ *      here is relative to the main prog.
++ *      e.g. if prog is a subprog, insn_start > 0
++ * linfo_idx:
++ *      The prog's idx to prog->aux->linfo and jited_linfo
++ *
++ * jited_linfo[linfo_idx] = prog->bpf_func
++ *
++ * For i > linfo_idx,
++ *
++ * jited_linfo[i] = prog->bpf_func +
++ *	insn_to_jit_off[linfo[i].insn_off - insn_start - 1]
++ */
++void bpf_prog_fill_jited_linfo(struct bpf_prog *prog,
++			       const u32 *insn_to_jit_off)
++{
++	u32 linfo_idx, insn_start, insn_end, nr_linfo, i;
++	const struct bpf_line_info *linfo;
++	void **jited_linfo;
++
++	if (!prog->aux->jited_linfo)
++		/* Userspace did not provide linfo */
++		return;
++
++	linfo_idx = prog->aux->linfo_idx;
++	linfo = &prog->aux->linfo[linfo_idx];
++	insn_start = linfo[0].insn_off;
++	insn_end = insn_start + prog->len;
++
++	jited_linfo = &prog->aux->jited_linfo[linfo_idx];
++	jited_linfo[0] = prog->bpf_func;
++
++	nr_linfo = prog->aux->nr_linfo - linfo_idx;
++
++	for (i = 1; i < nr_linfo && linfo[i].insn_off < insn_end; i++)
++		/* The verifier ensures that linfo[i].insn_off is
++		 * strictly increasing
++		 */
++		jited_linfo[i] = prog->bpf_func +
++			insn_to_jit_off[linfo[i].insn_off - insn_start - 1];
++}
++
++void bpf_prog_free_linfo(struct bpf_prog *prog)
++{
++	bpf_prog_free_jited_linfo(prog);
++	kvfree(prog->aux->linfo);
++}
++
+ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
+ 				  gfp_t gfp_extra_flags)
+ {
+@@ -292,6 +377,26 @@ static int bpf_adj_branches(struct bpf_prog *prog, u32 pos, u32 delta,
+ 	return ret;
+ }
+ 
++static void bpf_adj_linfo(struct bpf_prog *prog, u32 off, u32 delta)
++{
++	struct bpf_line_info *linfo;
++	u32 i, nr_linfo;
++
++	nr_linfo = prog->aux->nr_linfo;
++	if (!nr_linfo || !delta)
++		return;
++
++	linfo = prog->aux->linfo;
++
++	for (i = 0; i < nr_linfo; i++)
++		if (off < linfo[i].insn_off)
++			break;
++
++	/* Push all off < linfo[i].insn_off by delta */
++	for (; i < nr_linfo; i++)
++		linfo[i].insn_off += delta;
++}
++
+ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
+ 				       const struct bpf_insn *patch, u32 len)
+ {
+@@ -347,6 +452,8 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
+ 	 */
+ 	BUG_ON(bpf_adj_branches(prog_adj, off, insn_delta, false));
+ 
++	bpf_adj_linfo(prog_adj, off, insn_delta);
++
+ 	return prog_adj;
+ }
+ 
+@@ -1526,13 +1633,20 @@ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
+ 	 * be JITed, but falls back to the interpreter.
+ 	 */
+ 	if (!bpf_prog_is_dev_bound(fp->aux)) {
++		*err = bpf_prog_alloc_jited_linfo(fp);
++		if (*err)
++			return fp;
++
+ 		fp = bpf_int_jit_compile(fp);
+-#ifdef CONFIG_BPF_JIT_ALWAYS_ON
+ 		if (!fp->jited) {
++			bpf_prog_free_jited_linfo(fp);
++#ifdef CONFIG_BPF_JIT_ALWAYS_ON
+ 			*err = -ENOTSUPP;
+ 			return fp;
+-		}
+ #endif
++		} else {
++			bpf_prog_free_unused_jited_linfo(fp);
++		}
+ 	} else {
+ 		*err = bpf_prog_offload_compile(fp);
+ 		if (*err)
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
