@@ -1,0 +1,301 @@
+i2c: designware: Adjust bus speed independently of ACPI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+commit 852f71942ce71fd9a2bb25667bda53afeb97dcb6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/852f7194.failed
+
+John Stultz reported that commit f9288fcc5c615 ("i2c: designware: Move
+ACPI parts into common module") caused a regression on the HiKey board
+where adv7511 HDMI bridge driver wasn't probing anymore due the I2C bus
+failed to start.
+
+It seems the change caused the bus speed being zero when CONFIG_ACPI
+not set and neither speed based on "clock-frequency" device property
+or default fast mode is set.
+
+Fix this by splitting i2c_dw_acpi_adjust_bus_speed() to
+i2c_dw_acpi_round_bus_speed() and i2c_dw_adjust_bus_speed(), where
+the latter one has the code that runs independently of ACPI.
+
+Fixes: f9288fcc5c615 ("i2c: designware: Move ACPI parts into common module")
+	Reported-by: John Stultz <john.stultz@linaro.org>
+	Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Acked-by: Jarkko Nikula <jarkko.nikula@linux.intel.com>
+	Tested-by: John Stultz <john.stultz@linaro.org>
+	Signed-off-by: Wolfram Sang <wsa@kernel.org>
+(cherry picked from commit 852f71942ce71fd9a2bb25667bda53afeb97dcb6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/i2c/busses/i2c-designware-common.c
+#	drivers/i2c/busses/i2c-designware-core.h
+#	drivers/i2c/busses/i2c-designware-platdrv.c
+diff --cc drivers/i2c/busses/i2c-designware-common.c
+index 37ca1ea69f2b,3c19aada4b30..000000000000
+--- a/drivers/i2c/busses/i2c-designware-common.c
++++ b/drivers/i2c/busses/i2c-designware-common.c
+@@@ -116,6 -165,169 +116,160 @@@ int i2c_dw_set_reg_access(struct dw_i2c
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const u32 supported_speeds[] = {
++ 	I2C_MAX_HIGH_SPEED_MODE_FREQ,
++ 	I2C_MAX_FAST_MODE_PLUS_FREQ,
++ 	I2C_MAX_FAST_MODE_FREQ,
++ 	I2C_MAX_STANDARD_MODE_FREQ,
++ };
++ 
++ int i2c_dw_validate_speed(struct dw_i2c_dev *dev)
++ {
++ 	struct i2c_timings *t = &dev->timings;
++ 	unsigned int i;
++ 
++ 	/*
++ 	 * Only standard mode at 100kHz, fast mode at 400kHz,
++ 	 * fast mode plus at 1MHz and high speed mode at 3.4MHz are supported.
++ 	 */
++ 	for (i = 0; i < ARRAY_SIZE(supported_speeds); i++) {
++ 		if (t->bus_freq_hz == supported_speeds[i])
++ 			return 0;
++ 	}
++ 
++ 	dev_err(dev->dev,
++ 		"%d Hz is unsupported, only 100kHz, 400kHz, 1MHz and 3.4MHz are supported\n",
++ 		t->bus_freq_hz);
++ 
++ 	return -EINVAL;
++ }
++ EXPORT_SYMBOL_GPL(i2c_dw_validate_speed);
++ 
++ #ifdef CONFIG_ACPI
++ 
++ #include <linux/dmi.h>
++ 
++ /*
++  * The HCNT/LCNT information coming from ACPI should be the most accurate
++  * for given platform. However, some systems get it wrong. On such systems
++  * we get better results by calculating those based on the input clock.
++  */
++ static const struct dmi_system_id i2c_dw_no_acpi_params[] = {
++ 	{
++ 		.ident = "Dell Inspiron 7348",
++ 		.matches = {
++ 			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++ 			DMI_MATCH(DMI_PRODUCT_NAME, "Inspiron 7348"),
++ 		},
++ 	},
++ 	{}
++ };
++ 
++ static void i2c_dw_acpi_params(struct device *device, char method[],
++ 			       u16 *hcnt, u16 *lcnt, u32 *sda_hold)
++ {
++ 	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER };
++ 	acpi_handle handle = ACPI_HANDLE(device);
++ 	union acpi_object *obj;
++ 
++ 	if (dmi_check_system(i2c_dw_no_acpi_params))
++ 		return;
++ 
++ 	if (ACPI_FAILURE(acpi_evaluate_object(handle, method, NULL, &buf)))
++ 		return;
++ 
++ 	obj = (union acpi_object *)buf.pointer;
++ 	if (obj->type == ACPI_TYPE_PACKAGE && obj->package.count == 3) {
++ 		const union acpi_object *objs = obj->package.elements;
++ 
++ 		*hcnt = (u16)objs[0].integer.value;
++ 		*lcnt = (u16)objs[1].integer.value;
++ 		*sda_hold = (u32)objs[2].integer.value;
++ 	}
++ 
++ 	kfree(buf.pointer);
++ }
++ 
++ int i2c_dw_acpi_configure(struct device *device)
++ {
++ 	struct dw_i2c_dev *dev = dev_get_drvdata(device);
++ 	struct i2c_timings *t = &dev->timings;
++ 	u32 ss_ht = 0, fp_ht = 0, hs_ht = 0, fs_ht = 0;
++ 
++ 	/*
++ 	 * Try to get SDA hold time and *CNT values from an ACPI method for
++ 	 * selected speed modes.
++ 	 */
++ 	i2c_dw_acpi_params(device, "SSCN", &dev->ss_hcnt, &dev->ss_lcnt, &ss_ht);
++ 	i2c_dw_acpi_params(device, "FPCN", &dev->fp_hcnt, &dev->fp_lcnt, &fp_ht);
++ 	i2c_dw_acpi_params(device, "HSCN", &dev->hs_hcnt, &dev->hs_lcnt, &hs_ht);
++ 	i2c_dw_acpi_params(device, "FMCN", &dev->fs_hcnt, &dev->fs_lcnt, &fs_ht);
++ 
++ 	switch (t->bus_freq_hz) {
++ 	case I2C_MAX_STANDARD_MODE_FREQ:
++ 		dev->sda_hold_time = ss_ht;
++ 		break;
++ 	case I2C_MAX_FAST_MODE_PLUS_FREQ:
++ 		dev->sda_hold_time = fp_ht;
++ 		break;
++ 	case I2C_MAX_HIGH_SPEED_MODE_FREQ:
++ 		dev->sda_hold_time = hs_ht;
++ 		break;
++ 	case I2C_MAX_FAST_MODE_FREQ:
++ 	default:
++ 		dev->sda_hold_time = fs_ht;
++ 		break;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(i2c_dw_acpi_configure);
++ 
++ static u32 i2c_dw_acpi_round_bus_speed(struct device *device)
++ {
++ 	u32 acpi_speed;
++ 	int i;
++ 
++ 	acpi_speed = i2c_acpi_find_bus_speed(device);
++ 	/*
++ 	 * Some DSTDs use a non standard speed, round down to the lowest
++ 	 * standard speed.
++ 	 */
++ 	for (i = 0; i < ARRAY_SIZE(supported_speeds); i++) {
++ 		if (acpi_speed >= supported_speeds[i])
++ 			return supported_speeds[i];
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ #else	/* CONFIG_ACPI */
++ 
++ static inline u32 i2c_dw_acpi_round_bus_speed(struct device *device) { return 0; }
++ 
++ #endif	/* CONFIG_ACPI */
++ 
++ void i2c_dw_adjust_bus_speed(struct dw_i2c_dev *dev)
++ {
++ 	u32 acpi_speed = i2c_dw_acpi_round_bus_speed(dev->dev);
++ 	struct i2c_timings *t = &dev->timings;
++ 
++ 	/*
++ 	 * Find bus speed from the "clock-frequency" device property, ACPI
++ 	 * or by using fast mode if neither is set.
++ 	 */
++ 	if (acpi_speed && t->bus_freq_hz)
++ 		t->bus_freq_hz = min(t->bus_freq_hz, acpi_speed);
++ 	else if (acpi_speed || t->bus_freq_hz)
++ 		t->bus_freq_hz = max(t->bus_freq_hz, acpi_speed);
++ 	else
++ 		t->bus_freq_hz = I2C_MAX_FAST_MODE_FREQ;
++ }
++ EXPORT_SYMBOL_GPL(i2c_dw_adjust_bus_speed);
++ 
+++>>>>>>> 852f71942ce7 (i2c: designware: Adjust bus speed independently of ACPI)
+  u32 i2c_dw_scl_hcnt(u32 ic_clk, u32 tSYMBOL, u32 tf, int cond, int offset)
+  {
+  	/*
+diff --cc drivers/i2c/busses/i2c-designware-core.h
+index a5f6db491e44,eb5ef4d0f463..000000000000
+--- a/drivers/i2c/busses/i2c-designware-core.h
++++ b/drivers/i2c/busses/i2c-designware-core.h
+@@@ -323,10 -332,39 +323,22 @@@ extern int i2c_dw_probe_slave(struct dw
+  static inline int i2c_dw_probe_slave(struct dw_i2c_dev *dev) { return -EINVAL; }
+  #endif
+  
+ -static inline int i2c_dw_probe(struct dw_i2c_dev *dev)
+ -{
+ -	switch (dev->mode) {
+ -	case DW_IC_SLAVE:
+ -		return i2c_dw_probe_slave(dev);
+ -	case DW_IC_MASTER:
+ -		return i2c_dw_probe_master(dev);
+ -	default:
+ -		dev_err(dev->dev, "Wrong operation mode: %d\n", dev->mode);
+ -		return -EINVAL;
+ -	}
+ -}
+ -
+ -static inline void i2c_dw_configure(struct dw_i2c_dev *dev)
+ -{
+ -	if (i2c_detect_slave_mode(dev->dev))
+ -		i2c_dw_configure_slave(dev);
+ -	else
+ -		i2c_dw_configure_master(dev);
+ -}
+ -
+  #if IS_ENABLED(CONFIG_I2C_DESIGNWARE_BAYTRAIL)
+  extern int i2c_dw_probe_lock_support(struct dw_i2c_dev *dev);
+ +extern void i2c_dw_remove_lock_support(struct dw_i2c_dev *dev);
+  #else
+  static inline int i2c_dw_probe_lock_support(struct dw_i2c_dev *dev) { return 0; }
+++<<<<<<< HEAD
+ +static inline void i2c_dw_remove_lock_support(struct dw_i2c_dev *dev) {}
+++=======
++ #endif
++ 
++ int i2c_dw_validate_speed(struct dw_i2c_dev *dev);
++ void i2c_dw_adjust_bus_speed(struct dw_i2c_dev *dev);
++ 
++ #if IS_ENABLED(CONFIG_ACPI)
++ int i2c_dw_acpi_configure(struct device *device);
++ #else
++ static inline int i2c_dw_acpi_configure(struct device *device) { return -ENODEV; }
+++>>>>>>> 852f71942ce7 (i2c: designware: Adjust bus speed independently of ACPI)
+  #endif
+diff --cc drivers/i2c/busses/i2c-designware-platdrv.c
+index 094d8604af68,c2efaaaac252..000000000000
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@@ -275,27 -228,7 +275,31 @@@ static int dw_i2c_plat_probe(struct pla
+  	else
+  		i2c_parse_fw_timings(&pdev->dev, t, false);
+  
+++<<<<<<< HEAD
+ +	acpi_speed = i2c_acpi_find_bus_speed(&pdev->dev);
+ +	/*
+ +	 * Some DSTDs use a non standard speed, round down to the lowest
+ +	 * standard speed.
+ +	 */
+ +	for (i = 1; i < ARRAY_SIZE(supported_speeds); i++) {
+ +		if (acpi_speed < supported_speeds[i])
+ +			break;
+ +	}
+ +	acpi_speed = supported_speeds[i - 1];
+ +
+ +	/*
+ +	 * Find bus speed from the "clock-frequency" device property, ACPI
+ +	 * or by using fast mode if neither is set.
+ +	 */
+ +	if (acpi_speed && t->bus_freq_hz)
+ +		t->bus_freq_hz = min(t->bus_freq_hz, acpi_speed);
+ +	else if (acpi_speed || t->bus_freq_hz)
+ +		t->bus_freq_hz = max(t->bus_freq_hz, acpi_speed);
+ +	else
+ +		t->bus_freq_hz = 400000;
+++=======
++ 	i2c_dw_adjust_bus_speed(dev);
+++>>>>>>> 852f71942ce7 (i2c: designware: Adjust bus speed independently of ACPI)
+  
+  	if (pdev->dev.of_node)
+  		dw_i2c_of_configure(pdev);
+* Unmerged path drivers/i2c/busses/i2c-designware-common.c
+* Unmerged path drivers/i2c/busses/i2c-designware-core.h
+diff --git a/drivers/i2c/busses/i2c-designware-pcidrv.c b/drivers/i2c/busses/i2c-designware-pcidrv.c
+index 3664d76bb976..1c1c7d5968e6 100644
+--- a/drivers/i2c/busses/i2c-designware-pcidrv.c
++++ b/drivers/i2c/busses/i2c-designware-pcidrv.c
+@@ -255,7 +255,7 @@ static int i2c_dw_pci_probe(struct pci_dev *pdev,
+ 		}
+ 	}
+ 
+-	i2c_dw_acpi_adjust_bus_speed(&pdev->dev);
++	i2c_dw_adjust_bus_speed(dev);
+ 
+ 	if (has_acpi_companion(&pdev->dev))
+ 		i2c_dw_acpi_configure(&pdev->dev);
+* Unmerged path drivers/i2c/busses/i2c-designware-platdrv.c
