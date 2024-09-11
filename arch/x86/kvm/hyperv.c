@@ -1158,7 +1158,7 @@ out_unlock:
 
 void kvm_hv_invalidate_tsc_page(struct kvm *kvm)
 {
-	struct kvm_hv *hv = to_kvm_hv(kvm);
+	struct kvm_hv *hv = &kvm->arch.hyperv;
 	u64 gfn;
 
 	if (hv->hv_tsc_page_status == HV_TSC_PAGE_BROKEN ||

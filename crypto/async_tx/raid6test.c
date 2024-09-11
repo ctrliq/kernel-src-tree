@@ -31,7 +31,6 @@
 #define NDISKS 64 /* Including P and Q */
 
 static struct page *dataptrs[NDISKS];
-unsigned int dataoffs[NDISKS];
 static addr_conv_t addr_conv[NDISKS];
 static struct page *data[NDISKS+3];
 static struct page *spare;
@@ -52,7 +51,6 @@ static void makedata(int disks)
 	for (i = 0; i < disks; i++) {
 		prandom_bytes(page_address(data[i]), PAGE_SIZE);
 		dataptrs[i] = data[i];
-		dataoffs[i] = 0;
 	}
 }
 
@@ -67,8 +65,7 @@ static char disk_type(int d, int disks)
 }
 
 /* Recover two failed blocks. */
-static void raid6_dual_recov(int disks, size_t bytes, int faila, int failb,
-		struct page **ptrs, unsigned int *offs)
+static void raid6_dual_recov(int disks, size_t bytes, int faila, int failb, struct page **ptrs)
 {
 	struct async_submit_ctl submit;
 	struct completion cmp;
@@ -82,8 +79,7 @@ static void raid6_dual_recov(int disks, size_t bytes, int faila, int failb,
 		if (faila == disks-2) {
 			/* P+Q failure.  Just rebuild the syndrome. */
 			init_async_submit(&submit, 0, NULL, NULL, NULL, addr_conv);
-			tx = async_gen_syndrome(ptrs, offs,
-					disks, bytes, &submit);
+			tx = async_gen_syndrome(ptrs, 0, disks, bytes, &submit);
 		} else {
 			struct page *blocks[disks];
 			struct page *dest;
@@ -104,26 +100,22 @@ static void raid6_dual_recov(int disks, size_t bytes, int faila, int failb,
 			tx = async_xor(dest, blocks, 0, count, bytes, &submit);
 
 			init_async_submit(&submit, 0, tx, NULL, NULL, addr_conv);
-			tx = async_gen_syndrome(ptrs, offs,
-					disks, bytes, &submit);
+			tx = async_gen_syndrome(ptrs, 0, disks, bytes, &submit);
 		}
 	} else {
 		if (failb == disks-2) {
 			/* data+P failure. */
 			init_async_submit(&submit, 0, NULL, NULL, NULL, addr_conv);
-			tx = async_raid6_datap_recov(disks, bytes,
-					faila, ptrs, offs, &submit);
+			tx = async_raid6_datap_recov(disks, bytes, faila, ptrs, &submit);
 		} else {
 			/* data+data failure. */
 			init_async_submit(&submit, 0, NULL, NULL, NULL, addr_conv);
-			tx = async_raid6_2data_recov(disks, bytes,
-					faila, failb, ptrs, offs, &submit);
+			tx = async_raid6_2data_recov(disks, bytes, faila, failb, ptrs, &submit);
 		}
 	}
 	init_completion(&cmp);
 	init_async_submit(&submit, ASYNC_TX_ACK, tx, callback, &cmp, addr_conv);
-	tx = async_syndrome_val(ptrs, offs,
-			disks, bytes, &result, spare, 0, &submit);
+	tx = async_syndrome_val(ptrs, 0, disks, bytes, &result, spare, &submit);
 	async_tx_issue_pending(tx);
 
 	if (wait_for_completion_timeout(&cmp, msecs_to_jiffies(3000)) == 0)
@@ -145,7 +137,7 @@ static int test_disks(int i, int j, int disks)
 	dataptrs[i] = recovi;
 	dataptrs[j] = recovj;
 
-	raid6_dual_recov(disks, PAGE_SIZE, i, j, dataptrs, dataoffs);
+	raid6_dual_recov(disks, PAGE_SIZE, i, j, dataptrs);
 
 	erra = memcmp(page_address(data[i]), page_address(recovi), PAGE_SIZE);
 	errb = memcmp(page_address(data[j]), page_address(recovj), PAGE_SIZE);
@@ -181,7 +173,7 @@ static int test(int disks, int *tests)
 	/* Generate assumed good syndrome */
 	init_completion(&cmp);
 	init_async_submit(&submit, ASYNC_TX_ACK, NULL, callback, &cmp, addr_conv);
-	tx = async_gen_syndrome(dataptrs, dataoffs, disks, PAGE_SIZE, &submit);
+	tx = async_gen_syndrome(dataptrs, 0, disks, PAGE_SIZE, &submit);
 	async_tx_issue_pending(tx);
 
 	if (wait_for_completion_timeout(&cmp, msecs_to_jiffies(3000)) == 0) {

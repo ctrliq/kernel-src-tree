@@ -147,7 +147,7 @@ void main(void)
 
 	/* Make sure we have all the proper CPU support */
 	if (validate_cpu()) {
-		puts("This processor is not supported in this version of RHEL.\n");
+		puts("This processor is not supported in this version of CentOS Linux.\n");
 		die();
 	}
 

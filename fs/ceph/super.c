@@ -413,6 +413,7 @@ static int parse_fsopt_token(char *c, void *private)
 		break;
 	case Opt_nowsync:
 		fsopt->flags |= CEPH_MOUNT_OPT_ASYNC_DIROPS;
+		break;
 	default:
 		BUG_ON(token);
 	}

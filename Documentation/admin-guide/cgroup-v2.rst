@@ -714,7 +714,9 @@ Conventions
 - Settings for a single feature should be contained in a single file.
 
 - The root cgroup should be exempt from resource control and thus
-  shouldn't have resource control interface files.
+  shouldn't have resource control interface files.  Also,
+  informational files on the root cgroup which end up showing global
+  information available elsewhere shouldn't exist.
 
 - The default time unit is microseconds.  If a different unit is ever
   used, an explicit unit suffix must be present.
@@ -976,7 +978,7 @@ CPU Interface Files
 All time durations are in microseconds.
 
   cpu.stat
-	A read-only flat-keyed file.
+	A read-only flat-keyed file which exists on non-root cgroups.
 	This file exists whether the controller is enabled or not.
 
 	It always reports the following three stats:
