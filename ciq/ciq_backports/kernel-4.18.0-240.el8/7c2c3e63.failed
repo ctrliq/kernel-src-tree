@@ -1,0 +1,706 @@
+Bluetooth: hci_qca: Bug fixes while collecting controller memory dump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Venkata Lakshmi Narayana Gubba <gubbaven@codeaurora.org>
+commit 7c2c3e63e1e97cf8547c5818544312fb916dd0b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7c2c3e63.failed
+
+This patch will fix the below issues
+ 1. Discarding memory dump events if memdump state is moved to
+    MEMDUMP_TIMEOUT.
+ 2. Fixed race conditions between qca_hw_error() and qca_controller_memdump
+    while free memory dump buffers using mutex lock
+ 3. Moved timeout timer to delayed work queue
+ 4. Injecting HW error event in a case when dumps failed to receive and HW
+    error event is not yet received.
+ 5. Clearing hw error and command timeout function callbacks before
+    sending pre shutdown command.
+
+ Collecting memory dump will follow any of the below sequence.
+
+ Sequence 1:
+   Receiving Memory dump events from the controller
+   Received entire dump in stipulated time
+   Received HW error event from the controller
+   Controller Reset from HOST
+
+ Sequence 2:
+   Receiving Memory dump events from the controller
+   Failed to Receive entire dump in stipulated time
+   A Timeout schedules and if no HW error event received a fake HW
+     error event will be injected.
+   Controller Reset from HOST.
+
+ Sequence 3:
+   Received HW error event
+   HOST trigger SSR by sending crash packet to controller.
+   Received entire dump in stipulated time
+   Controller Reset from HOST
+
+Fixes: d841502c79e3 ("Bluetooth: hci_qca: Collect controller memory dump during SSR")
+	Reported-by: Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+	Signed-off-by: Venkata Lakshmi Narayana Gubba <gubbaven@codeaurora.org>
+	Reviewed-by: Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 7c2c3e63e1e97cf8547c5818544312fb916dd0b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+diff --cc drivers/bluetooth/hci_qca.c
+index c7723b08787d,1e4d6118d9bf..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -34,7 -22,15 +34,12 @@@
+  #include <linux/gpio/consumer.h>
+  #include <linux/mod_devicetable.h>
+  #include <linux/module.h>
+ -#include <linux/of_device.h>
+ -#include <linux/platform_device.h>
+ -#include <linux/regulator/consumer.h>
+  #include <linux/serdev.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/mutex.h>
++ #include <asm/unaligned.h>
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  
+  #include <net/bluetooth/bluetooth.h>
+  #include <net/bluetooth/hci_core.h>
+@@@ -58,6 -53,28 +63,31 @@@
+  /* susclk rate */
+  #define SUSCLK_RATE_32KHZ	32768
+  
+++<<<<<<< HEAD
+++=======
++ /* Controller debug log header */
++ #define QCA_DEBUG_HANDLE	0x2EDC
++ 
++ /* max retry count when init fails */
++ #define MAX_INIT_RETRIES 3
++ 
++ /* Controller dump header */
++ #define QCA_SSR_DUMP_HANDLE		0x0108
++ #define QCA_DUMP_PACKET_SIZE		255
++ #define QCA_LAST_SEQUENCE_NUM		0xFFFF
++ #define QCA_CRASHBYTE_PACKET_LEN	1096
++ #define QCA_MEMDUMP_BYTE		0xFB
++ 
++ enum qca_flags {
++ 	QCA_IBS_ENABLED,
++ 	QCA_DROP_VENDOR_EVENT,
++ 	QCA_SUSPENDING,
++ 	QCA_MEMDUMP_COLLECTION,
++ 	QCA_HW_ERROR_EVENT
++ };
++ 
++ 
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  /* HCI_IBS transmit side sleep protocol states */
+  enum tx_ibs_states {
+  	HCI_IBS_TX_ASLEEP,
+@@@ -99,7 -145,14 +129,18 @@@ struct qca_data 
+  	struct work_struct ws_awake_device;
+  	struct work_struct ws_rx_vote_off;
+  	struct work_struct ws_tx_vote_off;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+++=======
++ 	struct work_struct ctrl_memdump_evt;
++ 	struct delayed_work ctrl_memdump_timeout;
++ 	struct qca_memdump_data *qca_memdump;
++ 	unsigned long flags;
++ 	struct completion drop_ev_comp;
++ 	wait_queue_head_t suspend_wait_q;
++ 	enum qca_memdump_states memdump_state;
++ 	struct mutex hci_memdump_lock;
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  
+  	/* For debugging purpose */
+  	u64 ibs_sent_wacks;
+@@@ -399,6 -525,28 +440,31 @@@ static void hci_ibs_wake_retrans_timeou
+  		hci_uart_tx_wakeup(hu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static void qca_controller_memdump_timeout(struct work_struct *work)
++ {
++ 	struct qca_data *qca = container_of(work, struct qca_data,
++ 					ctrl_memdump_timeout.work);
++ 	struct hci_uart *hu = qca->hu;
++ 
++ 	mutex_lock(&qca->hci_memdump_lock);
++ 	if (test_bit(QCA_MEMDUMP_COLLECTION, &qca->flags)) {
++ 		qca->memdump_state = QCA_MEMDUMP_TIMEOUT;
++ 		if (!test_bit(QCA_HW_ERROR_EVENT, &qca->flags)) {
++ 			/* Inject hw error event to reset the device
++ 			 * and driver.
++ 			 */
++ 			hci_reset_dev(hu->hdev);
++ 		}
++ 	}
++ 
++ 	mutex_unlock(&qca->hci_memdump_lock);
++ }
++ 
++ 
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  /* Initialize protocol */
+  static int qca_open(struct hci_uart *hu)
+  {
+@@@ -416,7 -564,9 +482,8 @@@
+  
+  	skb_queue_head_init(&qca->txq);
+  	skb_queue_head_init(&qca->tx_wait_q);
+ -	skb_queue_head_init(&qca->rx_memdump_q);
+  	spin_lock_init(&qca->hci_ibs_lock);
++ 	mutex_init(&qca->hci_memdump_lock);
+  	qca->workqueue = alloc_ordered_workqueue("qca_wq", 0);
+  	if (!qca->workqueue) {
+  		BT_ERR("QCA Workqueue not initialized properly");
+@@@ -428,8 -578,13 +495,15 @@@
+  	INIT_WORK(&qca->ws_awake_device, qca_wq_awake_device);
+  	INIT_WORK(&qca->ws_rx_vote_off, qca_wq_serial_rx_clock_vote_off);
+  	INIT_WORK(&qca->ws_tx_vote_off, qca_wq_serial_tx_clock_vote_off);
+++<<<<<<< HEAD
+++=======
++ 	INIT_WORK(&qca->ctrl_memdump_evt, qca_controller_memdump);
++ 	INIT_DELAYED_WORK(&qca->ctrl_memdump_timeout,
++ 			  qca_controller_memdump_timeout);
++ 	init_waitqueue_head(&qca->suspend_wait_q);
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  
+  	qca->hu = hu;
+ -	init_completion(&qca->drop_ev_comp);
+  
+  	/* Assume we start with both sides asleep -- extra wakes OK */
+  	qca->tx_ibs_state = HCI_IBS_TX_ASLEEP;
+@@@ -443,14 -606,7 +517,18 @@@
+  	qca->wake_retrans = IBS_WAKE_RETRANS_TIMEOUT_MS;
+  
+  	timer_setup(&qca->tx_idle_timer, hci_ibs_tx_idle_timeout, 0);
+++<<<<<<< HEAD
+ +	qca->tx_idle_delay = IBS_TX_IDLE_TIMEOUT_MS;
+ +
+ +	if (hu->serdev) {
+ +		serdev_device_open(hu->serdev);
+ +
+ +		qcadev = serdev_device_get_drvdata(hu->serdev);
+ +		gpiod_set_value_cansleep(qcadev->bt_en, 1);
+ +	}
+++=======
++ 	qca->tx_idle_delay = IBS_HOST_TX_IDLE_TIMEOUT_MS;
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  
+  	BT_DBG("HCI_UART_QCA open, tx_idle_delay=%u, wake_retrans=%u",
+  	       qca->tx_idle_delay, qca->wake_retrans);
+@@@ -775,6 -943,191 +853,194 @@@ static int qca_ibs_wake_ack(struct hci_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qca_recv_acl_data(struct hci_dev *hdev, struct sk_buff *skb)
++ {
++ 	/* We receive debug logs from chip as an ACL packets.
++ 	 * Instead of sending the data to ACL to decode the
++ 	 * received data, we are pushing them to the above layers
++ 	 * as a diagnostic packet.
++ 	 */
++ 	if (get_unaligned_le16(skb->data) == QCA_DEBUG_HANDLE)
++ 		return hci_recv_diag(hdev, skb);
++ 
++ 	return hci_recv_frame(hdev, skb);
++ }
++ 
++ static void qca_controller_memdump(struct work_struct *work)
++ {
++ 	struct qca_data *qca = container_of(work, struct qca_data,
++ 					    ctrl_memdump_evt);
++ 	struct hci_uart *hu = qca->hu;
++ 	struct sk_buff *skb;
++ 	struct qca_memdump_event_hdr *cmd_hdr;
++ 	struct qca_memdump_data *qca_memdump = qca->qca_memdump;
++ 	struct qca_dump_size *dump;
++ 	char *memdump_buf;
++ 	char nullBuff[QCA_DUMP_PACKET_SIZE] = { 0 };
++ 	u16 seq_no;
++ 	u32 dump_size;
++ 
++ 	while ((skb = skb_dequeue(&qca->rx_memdump_q))) {
++ 
++ 		mutex_lock(&qca->hci_memdump_lock);
++ 		/* Skip processing the received packets if timeout detected. */
++ 		if (qca->memdump_state == QCA_MEMDUMP_TIMEOUT) {
++ 			mutex_unlock(&qca->hci_memdump_lock);
++ 			return;
++ 		}
++ 
++ 		if (!qca_memdump) {
++ 			qca_memdump = kzalloc(sizeof(struct qca_memdump_data),
++ 					      GFP_ATOMIC);
++ 			if (!qca_memdump) {
++ 				mutex_unlock(&qca->hci_memdump_lock);
++ 				return;
++ 			}
++ 
++ 			qca->qca_memdump = qca_memdump;
++ 		}
++ 
++ 		qca->memdump_state = QCA_MEMDUMP_COLLECTING;
++ 		cmd_hdr = (void *) skb->data;
++ 		seq_no = __le16_to_cpu(cmd_hdr->seq_no);
++ 		skb_pull(skb, sizeof(struct qca_memdump_event_hdr));
++ 
++ 		if (!seq_no) {
++ 
++ 			/* This is the first frame of memdump packet from
++ 			 * the controller, Disable IBS to recevie dump
++ 			 * with out any interruption, ideally time required for
++ 			 * the controller to send the dump is 8 seconds. let us
++ 			 * start timer to handle this asynchronous activity.
++ 			 */
++ 			clear_bit(QCA_IBS_ENABLED, &qca->flags);
++ 			set_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ 			dump = (void *) skb->data;
++ 			dump_size = __le32_to_cpu(dump->dump_size);
++ 			if (!(dump_size)) {
++ 				bt_dev_err(hu->hdev, "Rx invalid memdump size");
++ 				kfree_skb(skb);
++ 				mutex_unlock(&qca->hci_memdump_lock);
++ 				return;
++ 			}
++ 
++ 			bt_dev_info(hu->hdev, "QCA collecting dump of size:%u",
++ 				    dump_size);
++ 			queue_delayed_work(qca->workqueue,
++ 					   &qca->ctrl_memdump_timeout,
++ 					msecs_to_jiffies(MEMDUMP_TIMEOUT_MS));
++ 
++ 			skb_pull(skb, sizeof(dump_size));
++ 			memdump_buf = vmalloc(dump_size);
++ 			qca_memdump->memdump_buf_head = memdump_buf;
++ 			qca_memdump->memdump_buf_tail = memdump_buf;
++ 		}
++ 
++ 		memdump_buf = qca_memdump->memdump_buf_tail;
++ 
++ 		/* If sequence no 0 is missed then there is no point in
++ 		 * accepting the other sequences.
++ 		 */
++ 		if (!memdump_buf) {
++ 			bt_dev_err(hu->hdev, "QCA: Discarding other packets");
++ 			kfree(qca_memdump);
++ 			kfree_skb(skb);
++ 			qca->qca_memdump = NULL;
++ 			mutex_unlock(&qca->hci_memdump_lock);
++ 			return;
++ 		}
++ 
++ 		/* There could be chance of missing some packets from
++ 		 * the controller. In such cases let us store the dummy
++ 		 * packets in the buffer.
++ 		 */
++ 		while ((seq_no > qca_memdump->current_seq_no + 1) &&
++ 			seq_no != QCA_LAST_SEQUENCE_NUM) {
++ 			bt_dev_err(hu->hdev, "QCA controller missed packet:%d",
++ 				   qca_memdump->current_seq_no);
++ 			memcpy(memdump_buf, nullBuff, QCA_DUMP_PACKET_SIZE);
++ 			memdump_buf = memdump_buf + QCA_DUMP_PACKET_SIZE;
++ 			qca_memdump->received_dump += QCA_DUMP_PACKET_SIZE;
++ 			qca_memdump->current_seq_no++;
++ 		}
++ 
++ 		memcpy(memdump_buf, (unsigned char *) skb->data, skb->len);
++ 		memdump_buf = memdump_buf + skb->len;
++ 		qca_memdump->memdump_buf_tail = memdump_buf;
++ 		qca_memdump->current_seq_no = seq_no + 1;
++ 		qca_memdump->received_dump += skb->len;
++ 		qca->qca_memdump = qca_memdump;
++ 		kfree_skb(skb);
++ 		if (seq_no == QCA_LAST_SEQUENCE_NUM) {
++ 			bt_dev_info(hu->hdev, "QCA writing crash dump of size %d bytes",
++ 				   qca_memdump->received_dump);
++ 			memdump_buf = qca_memdump->memdump_buf_head;
++ 			dev_coredumpv(&hu->serdev->dev, memdump_buf,
++ 				      qca_memdump->received_dump, GFP_KERNEL);
++ 			cancel_delayed_work(&qca->ctrl_memdump_timeout);
++ 			kfree(qca->qca_memdump);
++ 			qca->qca_memdump = NULL;
++ 			qca->memdump_state = QCA_MEMDUMP_COLLECTED;
++ 			clear_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ 		}
++ 
++ 		mutex_unlock(&qca->hci_memdump_lock);
++ 	}
++ 
++ }
++ 
++ static int qca_controller_memdump_event(struct hci_dev *hdev,
++ 					struct sk_buff *skb)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	skb_queue_tail(&qca->rx_memdump_q, skb);
++ 	queue_work(qca->workqueue, &qca->ctrl_memdump_evt);
++ 
++ 	return 0;
++ }
++ 
++ static int qca_recv_event(struct hci_dev *hdev, struct sk_buff *skb)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	if (test_bit(QCA_DROP_VENDOR_EVENT, &qca->flags)) {
++ 		struct hci_event_hdr *hdr = (void *)skb->data;
++ 
++ 		/* For the WCN3990 the vendor command for a baudrate change
++ 		 * isn't sent as synchronous HCI command, because the
++ 		 * controller sends the corresponding vendor event with the
++ 		 * new baudrate. The event is received and properly decoded
++ 		 * after changing the baudrate of the host port. It needs to
++ 		 * be dropped, otherwise it can be misinterpreted as
++ 		 * response to a later firmware download command (also a
++ 		 * vendor command).
++ 		 */
++ 
++ 		if (hdr->evt == HCI_EV_VENDOR)
++ 			complete(&qca->drop_ev_comp);
++ 
++ 		kfree_skb(skb);
++ 
++ 		return 0;
++ 	}
++ 	/* We receive chip memory dump as an event packet, With a dedicated
++ 	 * handler followed by a hardware error event. When this event is
++ 	 * received we store dump into a file before closing hci. This
++ 	 * dump will help in triaging the issues.
++ 	 */
++ 	if ((skb->data[0] == HCI_VENDOR_PKT) &&
++ 	    (get_unaligned_be16(skb->data + 2) == QCA_SSR_DUMP_HANDLE))
++ 		return qca_controller_memdump_event(hdev, skb);
++ 
++ 	return hci_recv_frame(hdev, skb);
++ }
++ 
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  #define QCA_IBS_SLEEP_IND_EVENT \
+  	.type = HCI_IBS_SLEEP_IND, \
+  	.hlen = 0, \
+@@@ -909,6 -1271,305 +1175,308 @@@ static inline void host_set_baudrate(st
+  		hci_uart_set_baudrate(hu, speed);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qca_send_power_pulse(struct hci_uart *hu, bool on)
++ {
++ 	int ret;
++ 	int timeout = msecs_to_jiffies(CMD_TRANS_TIMEOUT_MS);
++ 	u8 cmd = on ? QCA_WCN3990_POWERON_PULSE : QCA_WCN3990_POWEROFF_PULSE;
++ 
++ 	/* These power pulses are single byte command which are sent
++ 	 * at required baudrate to wcn3990. On wcn3990, we have an external
++ 	 * circuit at Tx pin which decodes the pulse sent at specific baudrate.
++ 	 * For example, wcn3990 supports RF COEX antenna for both Wi-Fi/BT
++ 	 * and also we use the same power inputs to turn on and off for
++ 	 * Wi-Fi/BT. Powering up the power sources will not enable BT, until
++ 	 * we send a power on pulse at 115200 bps. This algorithm will help to
++ 	 * save power. Disabling hardware flow control is mandatory while
++ 	 * sending power pulses to SoC.
++ 	 */
++ 	bt_dev_dbg(hu->hdev, "sending power pulse %02x to controller", cmd);
++ 
++ 	serdev_device_write_flush(hu->serdev);
++ 	hci_uart_set_flow_control(hu, true);
++ 	ret = serdev_device_write_buf(hu->serdev, &cmd, sizeof(cmd));
++ 	if (ret < 0) {
++ 		bt_dev_err(hu->hdev, "failed to send power pulse %02x", cmd);
++ 		return ret;
++ 	}
++ 
++ 	serdev_device_wait_until_sent(hu->serdev, timeout);
++ 	hci_uart_set_flow_control(hu, false);
++ 
++ 	/* Give to controller time to boot/shutdown */
++ 	if (on)
++ 		msleep(100);
++ 	else
++ 		msleep(10);
++ 
++ 	return 0;
++ }
++ 
++ static unsigned int qca_get_speed(struct hci_uart *hu,
++ 				  enum qca_speed_type speed_type)
++ {
++ 	unsigned int speed = 0;
++ 
++ 	if (speed_type == QCA_INIT_SPEED) {
++ 		if (hu->init_speed)
++ 			speed = hu->init_speed;
++ 		else if (hu->proto->init_speed)
++ 			speed = hu->proto->init_speed;
++ 	} else {
++ 		if (hu->oper_speed)
++ 			speed = hu->oper_speed;
++ 		else if (hu->proto->oper_speed)
++ 			speed = hu->proto->oper_speed;
++ 	}
++ 
++ 	return speed;
++ }
++ 
++ static int qca_check_speeds(struct hci_uart *hu)
++ {
++ 	if (qca_is_wcn399x(qca_soc_type(hu))) {
++ 		if (!qca_get_speed(hu, QCA_INIT_SPEED) &&
++ 		    !qca_get_speed(hu, QCA_OPER_SPEED))
++ 			return -EINVAL;
++ 	} else {
++ 		if (!qca_get_speed(hu, QCA_INIT_SPEED) ||
++ 		    !qca_get_speed(hu, QCA_OPER_SPEED))
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int qca_set_speed(struct hci_uart *hu, enum qca_speed_type speed_type)
++ {
++ 	unsigned int speed, qca_baudrate;
++ 	struct qca_data *qca = hu->priv;
++ 	int ret = 0;
++ 
++ 	if (speed_type == QCA_INIT_SPEED) {
++ 		speed = qca_get_speed(hu, QCA_INIT_SPEED);
++ 		if (speed)
++ 			host_set_baudrate(hu, speed);
++ 	} else {
++ 		enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 
++ 		speed = qca_get_speed(hu, QCA_OPER_SPEED);
++ 		if (!speed)
++ 			return 0;
++ 
++ 		/* Disable flow control for wcn3990 to deassert RTS while
++ 		 * changing the baudrate of chip and host.
++ 		 */
++ 		if (qca_is_wcn399x(soc_type))
++ 			hci_uart_set_flow_control(hu, true);
++ 
++ 		if (soc_type == QCA_WCN3990) {
++ 			reinit_completion(&qca->drop_ev_comp);
++ 			set_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++ 		}
++ 
++ 		qca_baudrate = qca_get_baudrate_value(speed);
++ 		bt_dev_dbg(hu->hdev, "Set UART speed to %d", speed);
++ 		ret = qca_set_baudrate(hu->hdev, qca_baudrate);
++ 		if (ret)
++ 			goto error;
++ 
++ 		host_set_baudrate(hu, speed);
++ 
++ error:
++ 		if (qca_is_wcn399x(soc_type))
++ 			hci_uart_set_flow_control(hu, false);
++ 
++ 		if (soc_type == QCA_WCN3990) {
++ 			/* Wait for the controller to send the vendor event
++ 			 * for the baudrate change command.
++ 			 */
++ 			if (!wait_for_completion_timeout(&qca->drop_ev_comp,
++ 						 msecs_to_jiffies(100))) {
++ 				bt_dev_err(hu->hdev,
++ 					   "Failed to change controller baudrate\n");
++ 				ret = -ETIMEDOUT;
++ 			}
++ 
++ 			clear_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int qca_send_crashbuffer(struct hci_uart *hu)
++ {
++ 	struct qca_data *qca = hu->priv;
++ 	struct sk_buff *skb;
++ 
++ 	skb = bt_skb_alloc(QCA_CRASHBYTE_PACKET_LEN, GFP_KERNEL);
++ 	if (!skb) {
++ 		bt_dev_err(hu->hdev, "Failed to allocate memory for skb packet");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* We forcefully crash the controller, by sending 0xfb byte for
++ 	 * 1024 times. We also might have chance of losing data, To be
++ 	 * on safer side we send 1096 bytes to the SoC.
++ 	 */
++ 	memset(skb_put(skb, QCA_CRASHBYTE_PACKET_LEN), QCA_MEMDUMP_BYTE,
++ 	       QCA_CRASHBYTE_PACKET_LEN);
++ 	hci_skb_pkt_type(skb) = HCI_COMMAND_PKT;
++ 	bt_dev_info(hu->hdev, "crash the soc to collect controller dump");
++ 	skb_queue_tail(&qca->txq, skb);
++ 	hci_uart_tx_wakeup(hu);
++ 
++ 	return 0;
++ }
++ 
++ static void qca_wait_for_dump_collection(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	wait_on_bit_timeout(&qca->flags, QCA_MEMDUMP_COLLECTION,
++ 			    TASK_UNINTERRUPTIBLE, MEMDUMP_TIMEOUT_MS);
++ 
++ 	clear_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ }
++ 
++ static void qca_hw_error(struct hci_dev *hdev, u8 code)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 	struct qca_memdump_data *qca_memdump = qca->qca_memdump;
++ 	char *memdump_buf = NULL;
++ 
++ 	set_bit(QCA_HW_ERROR_EVENT, &qca->flags);
++ 	bt_dev_info(hdev, "mem_dump_status: %d", qca->memdump_state);
++ 
++ 	if (qca->memdump_state == QCA_MEMDUMP_IDLE) {
++ 		/* If hardware error event received for other than QCA
++ 		 * soc memory dump event, then we need to crash the SOC
++ 		 * and wait here for 8 seconds to get the dump packets.
++ 		 * This will block main thread to be on hold until we
++ 		 * collect dump.
++ 		 */
++ 		set_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ 		qca_send_crashbuffer(hu);
++ 		qca_wait_for_dump_collection(hdev);
++ 	} else if (qca->memdump_state == QCA_MEMDUMP_COLLECTING) {
++ 		/* Let us wait here until memory dump collected or
++ 		 * memory dump timer expired.
++ 		 */
++ 		bt_dev_info(hdev, "waiting for dump to complete");
++ 		qca_wait_for_dump_collection(hdev);
++ 	}
++ 
++ 	if (qca->memdump_state != QCA_MEMDUMP_COLLECTED) {
++ 		bt_dev_err(hu->hdev, "clearing allocated memory due to memdump timeout");
++ 		mutex_lock(&qca->hci_memdump_lock);
++ 		if (qca_memdump)
++ 			memdump_buf = qca_memdump->memdump_buf_head;
++ 		vfree(memdump_buf);
++ 		kfree(qca_memdump);
++ 		qca->qca_memdump = NULL;
++ 		qca->memdump_state = QCA_MEMDUMP_TIMEOUT;
++ 		cancel_delayed_work(&qca->ctrl_memdump_timeout);
++ 		skb_queue_purge(&qca->rx_memdump_q);
++ 		mutex_unlock(&qca->hci_memdump_lock);
++ 		cancel_work_sync(&qca->ctrl_memdump_evt);
++ 	}
++ 
++ 	clear_bit(QCA_HW_ERROR_EVENT, &qca->flags);
++ }
++ 
++ static void qca_cmd_timeout(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	if (qca->memdump_state == QCA_MEMDUMP_IDLE)
++ 		qca_send_crashbuffer(hu);
++ 	else
++ 		bt_dev_info(hdev, "Dump collection is in process");
++ }
++ 
++ static int qca_wcn3990_init(struct hci_uart *hu)
++ {
++ 	struct qca_serdev *qcadev;
++ 	int ret;
++ 
++ 	/* Check for vregs status, may be hci down has turned
++ 	 * off the voltage regulator.
++ 	 */
++ 	qcadev = serdev_device_get_drvdata(hu->serdev);
++ 	if (!qcadev->bt_power->vregs_on) {
++ 		serdev_device_close(hu->serdev);
++ 		ret = qca_regulator_enable(qcadev);
++ 		if (ret)
++ 			return ret;
++ 
++ 		ret = serdev_device_open(hu->serdev);
++ 		if (ret) {
++ 			bt_dev_err(hu->hdev, "failed to open port");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	/* Forcefully enable wcn3990 to enter in to boot mode. */
++ 	host_set_baudrate(hu, 2400);
++ 	ret = qca_send_power_pulse(hu, false);
++ 	if (ret)
++ 		return ret;
++ 
++ 	qca_set_speed(hu, QCA_INIT_SPEED);
++ 	ret = qca_send_power_pulse(hu, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Now the device is in ready state to communicate with host.
++ 	 * To sync host with device we need to reopen port.
++ 	 * Without this, we will have RTS and CTS synchronization
++ 	 * issues.
++ 	 */
++ 	serdev_device_close(hu->serdev);
++ 	ret = serdev_device_open(hu->serdev);
++ 	if (ret) {
++ 		bt_dev_err(hu->hdev, "failed to open port");
++ 		return ret;
++ 	}
++ 
++ 	hci_uart_set_flow_control(hu, false);
++ 
++ 	return 0;
++ }
++ 
++ static int qca_power_on(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 	struct qca_serdev *qcadev;
++ 	int ret = 0;
++ 
++ 	/* Non-serdev device usually is powered by external power
++ 	 * and don't need additional action in driver for power on
++ 	 */
++ 	if (!hu->serdev)
++ 		return 0;
++ 
++ 	if (qca_is_wcn399x(soc_type)) {
++ 		ret = qca_wcn3990_init(hu);
++ 	} else {
++ 		qcadev = serdev_device_get_drvdata(hu->serdev);
++ 		gpiod_set_value_cansleep(qcadev->bt_en, 1);
++ 		/* Controller needs time to bootup. */
++ 		msleep(150);
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 7c2c3e63e1e9 (Bluetooth: hci_qca: Bug fixes while collecting controller memory dump)
+  static int qca_setup(struct hci_uart *hu)
+  {
+  	struct hci_dev *hdev = hu->hdev;
+* Unmerged path drivers/bluetooth/hci_qca.c
