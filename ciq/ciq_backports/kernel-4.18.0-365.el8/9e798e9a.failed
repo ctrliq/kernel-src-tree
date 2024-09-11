@@ -1,0 +1,137 @@
+x86/fpu: Prepare fpu_clone() for dynamically enabled features
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 9e798e9aa14c45fb94e47b30bf6347b369ce9df7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/9e798e9a.failed
+
+The default portion of the parent's FPU state is saved in a child task.
+With dynamic features enabled, the non-default portion is not saved in a
+child's fpstate because these register states are defined to be
+caller-saved. The new task's fpstate is therefore the default buffer.
+
+Fork inherits the permission of the parent.
+
+Also, do not use memcpy() when TIF_NEED_FPU_LOAD is set because it is
+invalid when the parent has dynamic features.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211021225527.10184-11-chang.seok.bae@intel.com
+(cherry picked from commit 9e798e9aa14c45fb94e47b30bf6347b369ce9df7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/kernel/fpu/core.c
+index 2859edb41245,1ff6b83094a1..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -320,24 -394,49 +320,36 @@@ void fpstate_init_user(union fpregs_sta
+  		return;
+  	}
+  
+ -	xstate_init_xcomp_bv(&fpstate->regs.xsave, fpstate->xfeatures);
+ +	xstate_init_xcomp_bv(&state->xsave, xfeatures_mask_uabi());
+  
+  	if (cpu_feature_enabled(X86_FEATURE_FXSR))
+ -		fpstate_init_fxstate(fpstate);
+ +		fpstate_init_fxstate(&state->fxsave);
+  	else
+ -		fpstate_init_fstate(fpstate);
+ -}
+ -
+ -static void __fpstate_reset(struct fpstate *fpstate)
+ -{
+ -	/* Initialize sizes and feature masks */
+ -	fpstate->size		= fpu_kernel_cfg.default_size;
+ -	fpstate->user_size	= fpu_user_cfg.default_size;
+ -	fpstate->xfeatures	= fpu_kernel_cfg.default_features;
+ -	fpstate->user_xfeatures	= fpu_user_cfg.default_features;
+ +		fpstate_init_fstate(&state->fsave);
+  }
+  
+ -void fpstate_reset(struct fpu *fpu)
+ +#if IS_ENABLED(CONFIG_KVM)
+ +void fpu_init_fpstate_user(struct fpu *fpu)
+  {
+ -	/* Set the fpstate pointer to the default fpstate */
+ -	fpu->fpstate = &fpu->__fpstate;
+ -	__fpstate_reset(fpu->fpstate);
+ -
+ -	/* Initialize the permission related info in fpu */
+ -	fpu->perm.__state_perm		= fpu_kernel_cfg.default_features;
+ -	fpu->perm.__state_size		= fpu_kernel_cfg.default_size;
+ -	fpu->perm.__user_state_size	= fpu_user_cfg.default_size;
+ +	fpstate_init_user(&fpu->state);
+  }
+ +EXPORT_SYMBOL_GPL(fpu_init_fpstate_user);
+ +#endif
+  
++ static inline void fpu_inherit_perms(struct fpu *dst_fpu)
++ {
++ 	if (fpu_state_size_dynamic()) {
++ 		struct fpu *src_fpu = &current->group_leader->thread.fpu;
++ 
++ 		spin_lock_irq(&current->sighand->siglock);
++ 		/* Fork also inherits the permissions of the parent */
++ 		dst_fpu->perm = src_fpu->perm;
++ 		spin_unlock_irq(&current->sighand->siglock);
++ 	}
++ }
++ 
+  /* Clone current's FPU state on fork */
+- int fpu_clone(struct task_struct *dst)
++ int fpu_clone(struct task_struct *dst, unsigned long clone_flags)
+  {
+  	struct fpu *src_fpu = &current->thread.fpu;
+  	struct fpu *dst_fpu = &dst->thread.fpu;
+@@@ -372,10 -477,10 +388,17 @@@
+  	 */
+  	fpregs_lock();
+  	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+++<<<<<<< HEAD
+ +		memcpy(&dst_fpu->state, &src_fpu->state, fpu_kernel_xstate_size);
+ +
+ +	else
+ +		save_fpregs_to_fpstate(dst_fpu);
+++=======
++ 		fpregs_restore_userregs();
++ 	save_fpregs_to_fpstate(dst_fpu);
++ 	if (!(clone_flags & CLONE_THREAD))
++ 		fpu_inherit_perms(dst_fpu);
+++>>>>>>> 9e798e9aa14c (x86/fpu: Prepare fpu_clone() for dynamically enabled features)
+  	fpregs_unlock();
+  
+  	trace_x86_fpu_copy_src(src_fpu);
+diff --git a/arch/x86/include/asm/fpu/sched.h b/arch/x86/include/asm/fpu/sched.h
+index cdb78d590c86..99a8820e8cc4 100644
+--- a/arch/x86/include/asm/fpu/sched.h
++++ b/arch/x86/include/asm/fpu/sched.h
+@@ -11,7 +11,7 @@
+ 
+ extern void save_fpregs_to_fpstate(struct fpu *fpu);
+ extern void fpu__drop(struct fpu *fpu);
+-extern int  fpu_clone(struct task_struct *dst);
++extern int  fpu_clone(struct task_struct *dst, unsigned long clone_flags);
+ extern void fpu_flush_thread(void);
+ 
+ /*
+* Unmerged path arch/x86/kernel/fpu/core.c
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index bb26f23ff9f8..5738d3825ab0 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -206,7 +206,7 @@ int copy_thread_tls(unsigned long clone_flags, unsigned long sp,
+ 	p->thread.sp0 = (unsigned long) (childregs + 1);
+ #endif
+ 
+-	fpu_clone(p);
++	fpu_clone(p, clone_flags);
+ 
+ 	/* Kernel thread ? */
+ 	if (unlikely(p->flags & PF_KTHREAD)) {
