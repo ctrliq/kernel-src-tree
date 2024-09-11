@@ -1,0 +1,144 @@
+arm64: arch_timer: Add workaround for ARM erratum 1188873
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Marc Zyngier <marc.zyngier@arm.com>
+commit 95b861a4a6d94f64d5242605569218160ebacdbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/95b861a4.failed
+
+When running on Cortex-A76, a timer access from an AArch32 EL0
+task may end up with a corrupted value or register. The workaround for
+this is to trap these accesses at EL1/EL2 and execute them there.
+
+This only affects versions r0p0, r1p0 and r2p0 of the CPU.
+
+	Acked-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 95b861a4a6d94f64d5242605569218160ebacdbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/cpucaps.h
+diff --cc arch/arm64/include/asm/cpucaps.h
+index c0f5aa4ec4c9,6e2d254c09eb..000000000000
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@@ -49,9 -49,12 +49,19 @@@
+  #define ARM64_HAS_CACHE_DIC			28
+  #define ARM64_HW_DBM				29
+  #define ARM64_SSBD				30
+++<<<<<<< HEAD
+ +#define ARM64_HAS_SB				31
+ +#define ARM64_HAS_CNP				32
+ +
+ +#define ARM64_NCAPS				33
+++=======
++ #define ARM64_MISMATCHED_CACHE_TYPE		31
++ #define ARM64_HAS_STAGE2_FWB			32
++ #define ARM64_HAS_CRC32				33
++ #define ARM64_SSBS				34
++ #define ARM64_WORKAROUND_1188873		35
++ 
++ #define ARM64_NCAPS				36
+++>>>>>>> 95b861a4a6d9 (arm64: arch_timer: Add workaround for ARM erratum 1188873)
+  
+  #endif /* __ASM_CPUCAPS_H */
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 3e25e4e00f46..689bc085a0b0 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -487,6 +487,18 @@ config ARM64_ERRATUM_1024718
+ 
+ 	  If unsure, say Y.
+ 
++config ARM64_ERRATUM_1188873
++	bool "Cortex-A76: MRC read following MRRC read of specific Generic Timer in AArch32 might give incorrect result"
++	default y
++	help
++	  This option adds work arounds for ARM Cortex-A76 erratum 1188873
++
++	  Affected Cortex-A76 cores (r0p0, r1p0, r2p0) could cause
++	  register corruption when accessing the timer registers from
++	  AArch32 userspace.
++
++	  If unsure, say Y.
++
+ config CAVIUM_ERRATUM_22375
+ 	bool "Cavium erratum 22375, 24313"
+ 	default y
+* Unmerged path arch/arm64/include/asm/cpucaps.h
+diff --git a/arch/arm64/include/asm/cputype.h b/arch/arm64/include/asm/cputype.h
+index ea690b3562af..12f93e4d2452 100644
+--- a/arch/arm64/include/asm/cputype.h
++++ b/arch/arm64/include/asm/cputype.h
+@@ -86,6 +86,7 @@
+ #define ARM_CPU_PART_CORTEX_A75		0xD0A
+ #define ARM_CPU_PART_CORTEX_A35		0xD04
+ #define ARM_CPU_PART_CORTEX_A55		0xD05
++#define ARM_CPU_PART_CORTEX_A76		0xD0B
+ 
+ #define APM_CPU_PART_POTENZA		0x000
+ 
+@@ -110,6 +111,7 @@
+ #define MIDR_CORTEX_A75 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A75)
+ #define MIDR_CORTEX_A35 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A35)
+ #define MIDR_CORTEX_A55 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A55)
++#define MIDR_CORTEX_A76	MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A76)
+ #define MIDR_THUNDERX	MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX)
+ #define MIDR_THUNDERX_81XX MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX_81XX)
+ #define MIDR_THUNDERX_83XX MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX_83XX)
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 5d1fa928ea4b..4f3627566e95 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -671,6 +671,14 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
+ 		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+ 		.matches = has_ssbd_mitigation,
+ 	},
++#endif
++#ifdef CONFIG_ARM64_ERRATUM_1188873
++	{
++		/* Cortex-A76 r0p0 to r2p0 */
++		.desc = "ARM erratum 1188873",
++		.capability = ARM64_WORKAROUND_1188873,
++		ERRATA_MIDR_RANGE(MIDR_CORTEX_A76, 0, 0, 2, 0),
++	},
+ #endif
+ 	{
+ 	}
+diff --git a/drivers/clocksource/arm_arch_timer.c b/drivers/clocksource/arm_arch_timer.c
+index d8c7f5750cdb..9a7d4dc00b6e 100644
+--- a/drivers/clocksource/arm_arch_timer.c
++++ b/drivers/clocksource/arm_arch_timer.c
+@@ -319,6 +319,13 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
+ }
+ #endif
+ 
++#ifdef CONFIG_ARM64_ERRATUM_1188873
++static u64 notrace arm64_1188873_read_cntvct_el0(void)
++{
++	return read_sysreg(cntvct_el0);
++}
++#endif
++
+ #ifdef CONFIG_ARM_ARCH_TIMER_OOL_WORKAROUND
+ DEFINE_PER_CPU(const struct arch_timer_erratum_workaround *, timer_unstable_counter_workaround);
+ EXPORT_SYMBOL_GPL(timer_unstable_counter_workaround);
+@@ -408,6 +415,14 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
+ 		.read_cntvct_el0 = arm64_858921_read_cntvct_el0,
+ 	},
+ #endif
++#ifdef CONFIG_ARM64_ERRATUM_1188873
++	{
++		.match_type = ate_match_local_cap_id,
++		.id = (void *)ARM64_WORKAROUND_1188873,
++		.desc = "ARM erratum 1188873",
++		.read_cntvct_el0 = arm64_1188873_read_cntvct_el0,
++	},
++#endif
+ };
+ 
+ typedef bool (*ate_match_fn_t)(const struct arch_timer_erratum_workaround *,
