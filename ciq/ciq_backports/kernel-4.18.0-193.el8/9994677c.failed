@@ -1,0 +1,208 @@
+net: sched: flower: fix filter net reference counting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: flower: fix filter net reference counting (Ivan Vecera) [1751856]
+Rebuild_FUZZ: 95.05%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 9994677c968eff50968b2611e61e3afa90b39966
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9994677c.failed
+
+Fix net reference counting in fl_change() and remove redundant call to
+tcf_exts_get_net() from __fl_delete(). __fl_put() already tries to get net
+before releasing exts and deallocating a filter, so this code caused flower
+classifier to obtain net twice per filter that is being deleted.
+
+Implementation of __fl_delete() called tcf_exts_get_net() to pass its
+result as 'async' flag to fl_mask_put(). However, 'async' flag is redundant
+and only complicates fl_mask_put() implementation. This functionality seems
+to be copied from filter cleanup code, where it was added by Cong with
+following explanation:
+
+    This patchset tries to fix the race between call_rcu() and
+    cleanup_net() again. Without holding the netns refcnt the
+    tc_action_net_exit() in netns workqueue could be called before
+    filter destroy works in tc filter workqueue. This patchset
+    moves the netns refcnt from tc actions to tcf_exts, without
+    breaking per-netns tc actions.
+
+This doesn't apply to flower mask, which doesn't call any tc action code
+during cleanup. Simplify fl_mask_put() by removing the flag parameter and
+always use tcf_queue_work() to free mask objects.
+
+Fixes: 061775583e35 ("net: sched: flower: introduce reference counting for filters")
+Fixes: 1f17f7742eeb ("net: sched: flower: insert filter to ht before offloading it to hw")
+Fixes: 05cd271fd61a ("cls_flower: Support multiple masks per priority")
+	Reported-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9994677c968eff50968b2611e61e3afa90b39966)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index bf30bf04d4ea,4b5585358699..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -453,25 -485,78 +449,34 @@@ static struct cls_fl_head *fl_head_dere
+  	return rcu_dereference_raw(tp->root);
+  }
+  
+ -static void __fl_put(struct cls_fl_filter *f)
+ -{
+ -	if (!refcount_dec_and_test(&f->refcnt))
+ -		return;
+ -
+ -	WARN_ON(!f->deleted);
+ -
+ -	if (tcf_exts_get_net(&f->exts))
+ -		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
+ -	else
+ -		__fl_destroy_filter(f);
+ -}
+ -
+ -static struct cls_fl_filter *__fl_get(struct cls_fl_head *head, u32 handle)
+ -{
+ -	struct cls_fl_filter *f;
+ -
+ -	rcu_read_lock();
+ -	f = idr_find(&head->handle_idr, handle);
+ -	if (f && !refcount_inc_not_zero(&f->refcnt))
+ -		f = NULL;
+ -	rcu_read_unlock();
+ -
+ -	return f;
+ -}
+ -
+ -static struct cls_fl_filter *fl_get_next_filter(struct tcf_proto *tp,
+ -						unsigned long *handle)
+ -{
+ -	struct cls_fl_head *head = fl_head_dereference(tp);
+ -	struct cls_fl_filter *f;
+ -
+ -	rcu_read_lock();
+ -	while ((f = idr_get_next_ul(&head->handle_idr, handle))) {
+ -		/* don't return filters that are being deleted */
+ -		if (refcount_inc_not_zero(&f->refcnt))
+ -			break;
+ -		++(*handle);
+ -	}
+ -	rcu_read_unlock();
+ -
+ -	return f;
+ -}
+ -
+ -static int __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
+ -		       bool *last, bool rtnl_held,
+ -		       struct netlink_ext_ack *extack)
+ +static bool __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
+ +			struct netlink_ext_ack *extack)
+  {
+  	struct cls_fl_head *head = fl_head_dereference(tp);
+++<<<<<<< HEAD
+ +	bool async = tcf_exts_get_net(&f->exts);
+ +	bool last;
+++=======
+++>>>>>>> 9994677c968e (net: sched: flower: fix filter net reference counting)
+  
+ -	*last = false;
+ -
+ -	spin_lock(&tp->lock);
+ -	if (f->deleted) {
+ -		spin_unlock(&tp->lock);
+ -		return -ENOENT;
+ -	}
+ -
+ -	f->deleted = true;
+ -	rhashtable_remove_fast(&f->mask->ht, &f->ht_node,
+ -			       f->mask->filter_ht_params);
+  	idr_remove(&head->handle_idr, f->handle);
+  	list_del_rcu(&f->list);
+++<<<<<<< HEAD
+ +	last = fl_mask_put(head, f->mask, async);
+++=======
++ 	spin_unlock(&tp->lock);
++ 
++ 	*last = fl_mask_put(head, f->mask);
+++>>>>>>> 9994677c968e (net: sched: flower: fix filter net reference counting)
+  	if (!tc_skip_hw(f->flags))
+ -		fl_hw_destroy_filter(tp, f, rtnl_held, extack);
+ +		fl_hw_destroy_filter(tp, f, extack);
+  	tcf_unbind_filter(tp, &f->res);
+ -	__fl_put(f);
+ +	if (async)
+ +		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
+ +	else
+ +		__fl_destroy_filter(f);
+  
+ -	return 0;
+ +	return last;
+  }
+  
+  static void fl_destroy_sleepable(struct work_struct *work)
+@@@ -1442,19 -1596,20 +1447,27 @@@ static int fl_change(struct net *net, s
+  				       fold->mask->filter_ht_params);
+  		idr_replace(&head->handle_idr, fnew, fnew->handle);
+  		list_replace_rcu(&fold->list, &fnew->list);
+ -		fold->deleted = true;
+ -
+ -		spin_unlock(&tp->lock);
+  
+- 		fl_mask_put(head, fold->mask, true);
++ 		fl_mask_put(head, fold->mask);
+  		if (!tc_skip_hw(fold->flags))
+ -			fl_hw_destroy_filter(tp, fold, rtnl_held, NULL);
+ +			fl_hw_destroy_filter(tp, fold, NULL);
+  		tcf_unbind_filter(tp, &fold->res);
+++<<<<<<< HEAD
+ +		tcf_exts_get_net(&fold->exts);
+ +		tcf_queue_work(&fold->rwork, fl_destroy_filter_work);
+++=======
++ 		/* Caller holds reference to fold, so refcnt is always > 0
++ 		 * after this.
++ 		 */
++ 		refcount_dec(&fold->refcnt);
++ 		__fl_put(fold);
+++>>>>>>> 9994677c968e (net: sched: flower: fix filter net reference counting)
+  	} else {
+ +		if (__fl_lookup(fnew->mask, &fnew->mkey)) {
+ +			err = -EEXIST;
+ +			goto errout_hw;
+ +		}
+ +
+  		if (handle) {
+  			/* user specifies a handle and it doesn't exist */
+  			err = idr_alloc_u32(&head->handle_idr, fnew, &handle,
+@@@ -1492,16 -1642,19 +1505,21 @@@
+  	kfree(mask);
+  	return 0;
+  
+ +errout_idr:
+ +	idr_remove(&head->handle_idr, fnew->handle);
+  errout_hw:
+ -	spin_unlock(&tp->lock);
+  	if (!tc_skip_hw(fnew->flags))
+ -		fl_hw_destroy_filter(tp, fnew, rtnl_held, NULL);
+ -errout_ht:
+ -	if (in_ht)
+ -		rhashtable_remove_fast(&fnew->mask->ht, &fnew->ht_node,
+ -				       fnew->mask->filter_ht_params);
+ +		fl_hw_destroy_filter(tp, fnew, NULL);
+  errout_mask:
+- 	fl_mask_put(head, fnew->mask, true);
++ 	fl_mask_put(head, fnew->mask);
+  errout:
+++<<<<<<< HEAD
+ +	tcf_exts_destroy(&fnew->exts);
+ +	kfree(fnew);
+++=======
++ 	tcf_exts_get_net(&fnew->exts);
++ 	tcf_queue_work(&fnew->rwork, fl_destroy_filter_work);
+++>>>>>>> 9994677c968e (net: sched: flower: fix filter net reference counting)
+  errout_tb:
+  	kfree(tb);
+  errout_mask_alloc:
+* Unmerged path net/sched/cls_flower.c
