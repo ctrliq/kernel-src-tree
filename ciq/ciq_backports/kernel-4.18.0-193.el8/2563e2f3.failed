@@ -1,0 +1,314 @@
+RDMA/mlx5: Use PA mapping for PI handover
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 2563e2f30acb4c914fc475331e476fa920eb4245
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2563e2f3.failed
+
+If possibe, avoid doing a UMR operation to register data and protection
+buffers (via MTT/KLM mkeys). Instead, use the local DMA key and map the
+SG lists using PA access. This is safe, since the internal key for data
+and protection never exposed to the remote server (only signature key
+might be exposed). If PA mappings are not possible, perform mapping
+using MTT/KLM descriptors.
+
+The setup of the tested benchmark (using iSER ULP):
+ - 2 servers with 24 cores (1 initiator and 1 target)
+ - ConnectX-4/ConnectX-5 adapters
+ - 24 target sessions with 1 LUN each
+ - ramdisk backstore
+ - PI active
+
+Performance results running fio (24 jobs, 128 iodepth) using
+write_generate=1 and read_verify=1 (w/w.o patch):
+
+bs      IOPS(read)        IOPS(write)
+----    ----------        ----------
+512   1266.4K/1262.4K    1720.1K/1732.1K
+4k    793139/570902      1129.6K/773982
+32k   72660/72086        97229/96164
+
+Using write_generate=0 and read_verify=0 (w/w.o patch):
+bs      IOPS(read)        IOPS(write)
+----    ----------        ----------
+512   1590.2K/1600.1K    1828.2K/1830.3K
+4k    1078.1K/937272     1142.1K/815304
+32k   77012/77369        98125/97435
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Israel Rukshin <israelr@mellanox.com>
+	Suggested-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 2563e2f30acb4c914fc475331e476fa920eb4245)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/mr.c
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 7e795d5a30d7,bdb83fc85f94..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -584,6 -605,13 +584,16 @@@ struct mlx5_ib_mr 
+  	int			access_flags; /* Needed for rereg MR */
+  
+  	struct mlx5_ib_mr      *parent;
+++<<<<<<< HEAD
+++=======
++ 	/* Needed for IB_MR_TYPE_INTEGRITY */
++ 	struct mlx5_ib_mr      *pi_mr;
++ 	struct mlx5_ib_mr      *klm_mr;
++ 	struct mlx5_ib_mr      *mtt_mr;
++ 	u64			data_iova;
++ 	u64			pi_iova;
++ 
+++>>>>>>> 2563e2f30acb (RDMA/mlx5: Use PA mapping for PI handover)
+  	atomic_t		num_leaf_free;
+  	wait_queue_head_t       q_leaf_free;
+  	struct mlx5_async_work  cb_work;
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 0a633d06794a,f2ef89e48afa..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -1952,6 -2109,181 +1986,184 @@@ static int mlx5_set_page(struct ib_mr *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5_set_page_pi(struct ib_mr *ibmr, u64 addr)
++ {
++ 	struct mlx5_ib_mr *mr = to_mmr(ibmr);
++ 	__be64 *descs;
++ 
++ 	if (unlikely(mr->ndescs + mr->meta_ndescs == mr->max_descs))
++ 		return -ENOMEM;
++ 
++ 	descs = mr->descs;
++ 	descs[mr->ndescs + mr->meta_ndescs++] =
++ 		cpu_to_be64(addr | MLX5_EN_RD | MLX5_EN_WR);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ mlx5_ib_map_mtt_mr_sg_pi(struct ib_mr *ibmr, struct scatterlist *data_sg,
++ 			 int data_sg_nents, unsigned int *data_sg_offset,
++ 			 struct scatterlist *meta_sg, int meta_sg_nents,
++ 			 unsigned int *meta_sg_offset)
++ {
++ 	struct mlx5_ib_mr *mr = to_mmr(ibmr);
++ 	struct mlx5_ib_mr *pi_mr = mr->mtt_mr;
++ 	int n;
++ 
++ 	pi_mr->ndescs = 0;
++ 	pi_mr->meta_ndescs = 0;
++ 	pi_mr->meta_length = 0;
++ 
++ 	ib_dma_sync_single_for_cpu(ibmr->device, pi_mr->desc_map,
++ 				   pi_mr->desc_size * pi_mr->max_descs,
++ 				   DMA_TO_DEVICE);
++ 
++ 	pi_mr->ibmr.page_size = ibmr->page_size;
++ 	n = ib_sg_to_pages(&pi_mr->ibmr, data_sg, data_sg_nents, data_sg_offset,
++ 			   mlx5_set_page);
++ 	if (n != data_sg_nents)
++ 		return n;
++ 
++ 	pi_mr->data_iova = pi_mr->ibmr.iova;
++ 	pi_mr->data_length = pi_mr->ibmr.length;
++ 	pi_mr->ibmr.length = pi_mr->data_length;
++ 	ibmr->length = pi_mr->data_length;
++ 
++ 	if (meta_sg_nents) {
++ 		u64 page_mask = ~((u64)ibmr->page_size - 1);
++ 		u64 iova = pi_mr->data_iova;
++ 
++ 		n += ib_sg_to_pages(&pi_mr->ibmr, meta_sg, meta_sg_nents,
++ 				    meta_sg_offset, mlx5_set_page_pi);
++ 
++ 		pi_mr->meta_length = pi_mr->ibmr.length;
++ 		/*
++ 		 * PI address for the HW is the offset of the metadata address
++ 		 * relative to the first data page address.
++ 		 * It equals to first data page address + size of data pages +
++ 		 * metadata offset at the first metadata page
++ 		 */
++ 		pi_mr->pi_iova = (iova & page_mask) +
++ 				 pi_mr->ndescs * ibmr->page_size +
++ 				 (pi_mr->ibmr.iova & ~page_mask);
++ 		/*
++ 		 * In order to use one MTT MR for data and metadata, we register
++ 		 * also the gaps between the end of the data and the start of
++ 		 * the metadata (the sig MR will verify that the HW will access
++ 		 * to right addresses). This mapping is safe because we use
++ 		 * internal mkey for the registration.
++ 		 */
++ 		pi_mr->ibmr.length = pi_mr->pi_iova + pi_mr->meta_length - iova;
++ 		pi_mr->ibmr.iova = iova;
++ 		ibmr->length += pi_mr->meta_length;
++ 	}
++ 
++ 	ib_dma_sync_single_for_device(ibmr->device, pi_mr->desc_map,
++ 				      pi_mr->desc_size * pi_mr->max_descs,
++ 				      DMA_TO_DEVICE);
++ 
++ 	return n;
++ }
++ 
++ static int
++ mlx5_ib_map_klm_mr_sg_pi(struct ib_mr *ibmr, struct scatterlist *data_sg,
++ 			 int data_sg_nents, unsigned int *data_sg_offset,
++ 			 struct scatterlist *meta_sg, int meta_sg_nents,
++ 			 unsigned int *meta_sg_offset)
++ {
++ 	struct mlx5_ib_mr *mr = to_mmr(ibmr);
++ 	struct mlx5_ib_mr *pi_mr = mr->klm_mr;
++ 	int n;
++ 
++ 	pi_mr->ndescs = 0;
++ 	pi_mr->meta_ndescs = 0;
++ 	pi_mr->meta_length = 0;
++ 
++ 	ib_dma_sync_single_for_cpu(ibmr->device, pi_mr->desc_map,
++ 				   pi_mr->desc_size * pi_mr->max_descs,
++ 				   DMA_TO_DEVICE);
++ 
++ 	n = mlx5_ib_sg_to_klms(pi_mr, data_sg, data_sg_nents, data_sg_offset,
++ 			       meta_sg, meta_sg_nents, meta_sg_offset);
++ 
++ 	ib_dma_sync_single_for_device(ibmr->device, pi_mr->desc_map,
++ 				      pi_mr->desc_size * pi_mr->max_descs,
++ 				      DMA_TO_DEVICE);
++ 
++ 	/* This is zero-based memory region */
++ 	pi_mr->data_iova = 0;
++ 	pi_mr->ibmr.iova = 0;
++ 	pi_mr->pi_iova = pi_mr->data_length;
++ 	ibmr->length = pi_mr->ibmr.length;
++ 
++ 	return n;
++ }
++ 
++ int mlx5_ib_map_mr_sg_pi(struct ib_mr *ibmr, struct scatterlist *data_sg,
++ 			 int data_sg_nents, unsigned int *data_sg_offset,
++ 			 struct scatterlist *meta_sg, int meta_sg_nents,
++ 			 unsigned int *meta_sg_offset)
++ {
++ 	struct mlx5_ib_mr *mr = to_mmr(ibmr);
++ 	struct mlx5_ib_mr *pi_mr = NULL;
++ 	int n;
++ 
++ 	WARN_ON(ibmr->type != IB_MR_TYPE_INTEGRITY);
++ 
++ 	mr->ndescs = 0;
++ 	mr->data_length = 0;
++ 	mr->data_iova = 0;
++ 	mr->meta_ndescs = 0;
++ 	mr->pi_iova = 0;
++ 	/*
++ 	 * As a performance optimization, if possible, there is no need to
++ 	 * perform UMR operation to register the data/metadata buffers.
++ 	 * First try to map the sg lists to PA descriptors with local_dma_lkey.
++ 	 * Fallback to UMR only in case of a failure.
++ 	 */
++ 	n = mlx5_ib_map_pa_mr_sg_pi(ibmr, data_sg, data_sg_nents,
++ 				    data_sg_offset, meta_sg, meta_sg_nents,
++ 				    meta_sg_offset);
++ 	if (n == data_sg_nents + meta_sg_nents)
++ 		goto out;
++ 	/*
++ 	 * As a performance optimization, if possible, there is no need to map
++ 	 * the sg lists to KLM descriptors. First try to map the sg lists to MTT
++ 	 * descriptors and fallback to KLM only in case of a failure.
++ 	 * It's more efficient for the HW to work with MTT descriptors
++ 	 * (especially in high load).
++ 	 * Use KLM (indirect access) only if it's mandatory.
++ 	 */
++ 	pi_mr = mr->mtt_mr;
++ 	n = mlx5_ib_map_mtt_mr_sg_pi(ibmr, data_sg, data_sg_nents,
++ 				     data_sg_offset, meta_sg, meta_sg_nents,
++ 				     meta_sg_offset);
++ 	if (n == data_sg_nents + meta_sg_nents)
++ 		goto out;
++ 
++ 	pi_mr = mr->klm_mr;
++ 	n = mlx5_ib_map_klm_mr_sg_pi(ibmr, data_sg, data_sg_nents,
++ 				     data_sg_offset, meta_sg, meta_sg_nents,
++ 				     meta_sg_offset);
++ 	if (unlikely(n != data_sg_nents + meta_sg_nents))
++ 		return -ENOMEM;
++ 
++ out:
++ 	/* This is zero-based memory region */
++ 	ibmr->iova = 0;
++ 	mr->pi_mr = pi_mr;
++ 	if (pi_mr)
++ 		ibmr->sig_attrs->meta_length = pi_mr->meta_length;
++ 	else
++ 		ibmr->sig_attrs->meta_length = mr->meta_length;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 2563e2f30acb (RDMA/mlx5: Use PA mapping for PI handover)
+  int mlx5_ib_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg, int sg_nents,
+  		      unsigned int *sg_offset)
+  {
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 7d1e0ba30dfa,4fbf60fed374..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -4534,32 -4557,17 +4534,43 @@@ static int set_sig_data_segment(const s
+  	bool prot = false;
+  	int ret;
+  	int wqe_size;
+ -	struct mlx5_ib_mr *mr = to_mmr(sig_mr);
+ -	struct mlx5_ib_mr *pi_mr = mr->pi_mr;
+  
+++<<<<<<< HEAD
+ +	if (send_wr->opcode == IB_WR_REG_SIG_MR) {
+ +		const struct ib_sig_handover_wr *wr = sig_handover_wr(send_wr);
+ +
+ +		data_len = wr->wr.sg_list->length;
+ +		data_key = wr->wr.sg_list->lkey;
+ +		data_va = wr->wr.sg_list->addr;
+ +		if (wr->prot) {
+ +			prot_len = wr->prot->length;
+ +			prot_key = wr->prot->lkey;
+ +			prot_va = wr->prot->addr;
+ +			prot = true;
+ +		}
+ +	} else {
+ +		struct mlx5_ib_mr *mr = to_mmr(sig_mr);
+ +		struct mlx5_ib_mr *pi_mr = mr->pi_mr;
+ +
+ +		data_len = pi_mr->data_length;
+ +		data_key = pi_mr->ibmr.lkey;
+ +		data_va = pi_mr->ibmr.iova;
+ +		if (pi_mr->meta_ndescs) {
+ +			prot_len = pi_mr->meta_length;
+ +			prot_key = pi_mr->ibmr.lkey;
+ +			prot_va = pi_mr->ibmr.iova + data_len;
+ +			prot = true;
+ +		}
+++=======
++ 	data_len = pi_mr->data_length;
++ 	data_key = pi_mr->ibmr.lkey;
++ 	data_va = pi_mr->data_iova;
++ 	if (pi_mr->meta_ndescs) {
++ 		prot_len = pi_mr->meta_length;
++ 		prot_key = pi_mr->ibmr.lkey;
++ 		prot_va = pi_mr->pi_iova;
++ 		prot = true;
+++>>>>>>> 2563e2f30acb (RDMA/mlx5: Use PA mapping for PI handover)
+  	}
+  
+  	if (!prot || (data_key == prot_key && data_va == prot_va &&
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
