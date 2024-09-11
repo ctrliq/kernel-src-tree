@@ -1,0 +1,201 @@
+netlink: add validation function to policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 33188bd6430ef06d206ae4fda2cc92f14f16fd20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/33188bd6.failed
+
+Add the ability to have an arbitrary validation function attached
+to a netlink policy that doesn't already use the validation_data
+pointer in another way.
+
+This can be useful to validate for example the content of a binary
+attribute, like in nl80211 the "(information) elements", which must
+be valid streams of "u8 type, u8 length, u8 value[length]".
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 33188bd6430ef06d206ae4fda2cc92f14f16fd20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netlink.h
+#	lib/nlattr.c
+diff --cc include/net/netlink.h
+index a3ea1d082b9d,6a106ef5ca56..000000000000
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@@ -188,9 -188,20 +188,26 @@@ enum 
+  
+  #define NLA_TYPE_MAX (__NLA_TYPE_MAX - 1)
+  
+++<<<<<<< HEAD
+ +/**
+ + * struct nla_policy - attribute validation policy
+ + * @type: Type of attribute or NLA_UNSPEC
+++=======
++ enum nla_policy_validation {
++ 	NLA_VALIDATE_NONE,
++ 	NLA_VALIDATE_RANGE,
++ 	NLA_VALIDATE_MIN,
++ 	NLA_VALIDATE_MAX,
++ 	NLA_VALIDATE_FUNCTION,
++ };
++ 
++ /**
++  * struct nla_policy - attribute validation policy
++  * @type: Type of attribute or NLA_UNSPEC
++  * @validation_type: type of attribute validation done in addition to
++  *	type-specific validation (e.g. range, function call), see
++  *	&enum nla_policy_validation
+++>>>>>>> 33188bd6430e (netlink: add validation function to policy)
+   * @len: Type specific length of payload
+   *
+   * Policies are defined as arrays of this struct, the array must be
+@@@ -238,8 -249,34 +255,15 @@@
+   *                         nested attributes directly inside, while an array has
+   *                         the nested attributes at another level down and the
+   *                         attributes directly in the nesting don't matter.
+ - *    All other            Unused - but note that it's a union
+ - *
+ - * Meaning of `min' and `max' fields, use via NLA_POLICY_MIN, NLA_POLICY_MAX
+ - * and NLA_POLICY_RANGE:
+ - *    NLA_U8,
+ - *    NLA_U16,
+ - *    NLA_U32,
+ - *    NLA_U64,
+ - *    NLA_S8,
+ - *    NLA_S16,
+ - *    NLA_S32,
+ - *    NLA_S64              These are used depending on the validation_type
+ - *                         field, if that is min/max/range then the minimum,
+ - *                         maximum and both are used (respectively) to check
+ - *                         the value of the integer attribute.
+ - *                         Note that in the interest of code simplicity and
+ - *                         struct size both limits are s16, so you cannot
+ - *                         enforce a range that doesn't fall within the range
+ - *                         of s16 - do that as usual in the code instead.
+ - *    All other            Unused - but note that it's a union
+ + *    All other            Unused
+   *
++  * Meaning of `validate' field, use via NLA_POLICY_VALIDATE_FN:
++  *    NLA_BINARY           Validation function called for the attribute,
++  *                         not compatible with use of the validation_data
++  *                         as in NLA_BITFIELD32, NLA_REJECT, NLA_NESTED and
++  *                         NLA_NESTED_ARRAY.
++  *    All other            Unused - but note that it's a union
++  *
+   * Example:
+   * static const struct nla_policy my_policy[ATTR_MAX+1] = {
+   * 	[ATTR_FOO] = { .type = NLA_U16 },
+@@@ -249,9 -286,17 +273,20 @@@
+   * };
+   */
+  struct nla_policy {
+ -	u8		type;
+ -	u8		validation_type;
+ +	u16		type;
+  	u16		len;
+++<<<<<<< HEAD
+ +	RH_KABI_CONST void     *validation_data;
+++=======
++ 	union {
++ 		const void *validation_data;
++ 		struct {
++ 			s16 min, max;
++ 		};
++ 		int (*validate)(const struct nlattr *attr,
++ 				struct netlink_ext_ack *extack);
++ 	};
+++>>>>>>> 33188bd6430e (netlink: add validation function to policy)
+  };
+  
+  #define NLA_POLICY_EXACT_LEN(_len)	{ .type = NLA_EXACT_LEN, .len = _len }
+@@@ -266,6 -311,44 +301,47 @@@
+  #define NLA_POLICY_NESTED_ARRAY(maxattr, policy) \
+  	{ .type = NLA_NESTED_ARRAY, .validation_data = policy, .len = maxattr }
+  
+++<<<<<<< HEAD
+++=======
++ #define __NLA_ENSURE(condition) (sizeof(char[1 - 2*!(condition)]) - 1)
++ #define NLA_ENSURE_INT_TYPE(tp)				\
++ 	(__NLA_ENSURE(tp == NLA_S8 || tp == NLA_U8 ||	\
++ 		      tp == NLA_S16 || tp == NLA_U16 ||	\
++ 		      tp == NLA_S32 || tp == NLA_U32 ||	\
++ 		      tp == NLA_S64 || tp == NLA_U64) + tp)
++ #define NLA_ENSURE_NO_VALIDATION_PTR(tp)		\
++ 	(__NLA_ENSURE(tp != NLA_BITFIELD32 &&		\
++ 		      tp != NLA_REJECT &&		\
++ 		      tp != NLA_NESTED &&		\
++ 		      tp != NLA_NESTED_ARRAY) + tp)
++ 
++ #define NLA_POLICY_RANGE(tp, _min, _max) {		\
++ 	.type = NLA_ENSURE_INT_TYPE(tp),		\
++ 	.validation_type = NLA_VALIDATE_RANGE,		\
++ 	.min = _min,					\
++ 	.max = _max					\
++ }
++ 
++ #define NLA_POLICY_MIN(tp, _min) {			\
++ 	.type = NLA_ENSURE_INT_TYPE(tp),		\
++ 	.validation_type = NLA_VALIDATE_MIN,		\
++ 	.min = _min,					\
++ }
++ 
++ #define NLA_POLICY_MAX(tp, _max) {			\
++ 	.type = NLA_ENSURE_INT_TYPE(tp),		\
++ 	.validation_type = NLA_VALIDATE_MAX,		\
++ 	.max = _max,					\
++ }
++ 
++ #define NLA_POLICY_VALIDATE_FN(tp, fn, ...) {		\
++ 	.type = NLA_ENSURE_NO_VALIDATION_PTR(tp),	\
++ 	.validation_type = NLA_VALIDATE_FUNCTION,	\
++ 	.validate = fn,					\
++ 	.len = __VA_ARGS__ + 0,				\
++ }
++ 
+++>>>>>>> 33188bd6430e (netlink: add validation function to policy)
+  /**
+   * struct nl_info - netlink source information
+   * @nlh: Netlink message header of original request
+diff --cc lib/nlattr.c
+index d34c7207de82,1e900bb414ef..000000000000
+--- a/lib/nlattr.c
++++ b/lib/nlattr.c
+@@@ -230,6 -288,27 +230,30 @@@ static int validate_nla(const struct nl
+  			goto out_err;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* further validation */
++ 	switch (pt->validation_type) {
++ 	case NLA_VALIDATE_NONE:
++ 		/* nothing to do */
++ 		break;
++ 	case NLA_VALIDATE_RANGE:
++ 	case NLA_VALIDATE_MIN:
++ 	case NLA_VALIDATE_MAX:
++ 		err = nla_validate_int_range(pt, nla, extack);
++ 		if (err)
++ 			return err;
++ 		break;
++ 	case NLA_VALIDATE_FUNCTION:
++ 		if (pt->validate) {
++ 			err = pt->validate(nla, extack);
++ 			if (err)
++ 				return err;
++ 		}
++ 		break;
++ 	}
++ 
+++>>>>>>> 33188bd6430e (netlink: add validation function to policy)
+  	return 0;
+  out_err:
+  	NL_SET_ERR_MSG_ATTR(extack, nla, "Attribute failed policy validation");
+* Unmerged path include/net/netlink.h
+* Unmerged path lib/nlattr.c
