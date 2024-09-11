@@ -98,6 +98,7 @@ struct zpci_bar_struct {
 };
 
 struct s390_domain;
+struct kvm_zdev;
 
 #define ZPCI_FUNCTIONS_PER_BUS 256
 struct zpci_bus {
@@ -187,7 +188,9 @@ struct zpci_dev {
 
 	struct dentry	*debugfs_dev;
 
+	/* IOMMU and passthrough */
 	struct s390_domain *s390_domain; /* s390 IOMMU domain data */
+	struct kvm_zdev *kzdev;
 };
 
 static inline bool zdev_enabled(struct zpci_dev *zdev)
