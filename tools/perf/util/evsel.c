@@ -1440,7 +1440,8 @@ perf_evsel__set_count(struct perf_evsel *counter, int cpu, int thread,
 	count->val    = val;
 	count->ena    = ena;
 	count->run    = run;
-	count->loaded = true;
+
+	perf_counts__set_loaded(counter->counts, cpu, thread, true);
 }
 
 static int
