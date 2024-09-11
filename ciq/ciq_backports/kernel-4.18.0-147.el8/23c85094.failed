@@ -1,0 +1,173 @@
+proc/kcore: add vmcoreinfo note to /proc/kcore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Omar Sandoval <osandov@fb.com>
+commit 23c85094fe1895caefdd19ef624ee687ec5f4507
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/23c85094.failed
+
+The vmcoreinfo information is useful for runtime debugging tools, not just
+for crash dumps.  A lot of this information can be determined by other
+means, but this is much more convenient, and it only adds a page at most
+to the file.
+
+Link: http://lkml.kernel.org/r/fddbcd08eed76344863303878b12de1c1e2a04b6.1531953780.git.osandov@fb.com
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Bhupesh Sharma <bhsharma@redhat.com>
+	Cc: Eric Biederman <ebiederm@xmission.com>
+	Cc: James Morse <james.morse@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 23c85094fe1895caefdd19ef624ee687ec5f4507)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/kcore.c
+diff --cc fs/proc/kcore.c
+index 00d616f7727a,80464432dfe6..000000000000
+--- a/fs/proc/kcore.c
++++ b/fs/proc/kcore.c
+@@@ -88,15 -80,18 +89,30 @@@ static size_t get_kcore_size(int *nphdr
+  			size = try;
+  		*nphdr = *nphdr + 1;
+  	}
+++<<<<<<< HEAD
+ +	*elf_buflen =	sizeof(struct elfhdr) + 
+ +			(*nphdr + 2)*sizeof(struct elf_phdr) + 
+ +			3 * ((sizeof(struct elf_note)) +
+ +			     roundup(sizeof(CORE_STR), 4)) +
+ +			roundup(sizeof(struct elf_prstatus), 4) +
+ +			roundup(sizeof(struct elf_prpsinfo), 4) +
+ +			roundup(arch_task_struct_size, 4);
+ +	*elf_buflen = PAGE_ALIGN(*elf_buflen);
+ +	return size + *elf_buflen;
+++=======
++ 
++ 	*phdrs_len = *nphdr * sizeof(struct elf_phdr);
++ 	*notes_len = (4 * sizeof(struct elf_note) +
++ 		      3 * ALIGN(sizeof(CORE_STR), 4) +
++ 		      VMCOREINFO_NOTE_NAME_BYTES +
++ 		      ALIGN(sizeof(struct elf_prstatus), 4) +
++ 		      ALIGN(sizeof(struct elf_prpsinfo), 4) +
++ 		      ALIGN(arch_task_struct_size, 4) +
++ 		      ALIGN(vmcoreinfo_size, 4));
++ 	*data_offset = PAGE_ALIGN(sizeof(struct elfhdr) + *phdrs_len +
++ 				  *notes_len);
++ 	return *data_offset + size;
+++>>>>>>> 23c85094fe18 (proc/kcore: add vmcoreinfo note to /proc/kcore)
+  }
+  
+  #ifdef CONFIG_HIGHMEM
+@@@ -477,14 -378,60 +493,63 @@@ read_kcore(struct file *file, char __us
+  			ret = -EFAULT;
+  			goto out;
+  		}
+ -		kfree(phdrs);
+ -
+ -		buffer += tsz;
+ +		kfree(elf_buf);
+  		buflen -= tsz;
+  		*fpos += tsz;
+++<<<<<<< HEAD
+++=======
++ 	}
++ 
++ 	/* ELF note segment. */
++ 	if (buflen && *fpos < notes_offset + notes_len) {
++ 		struct elf_prstatus prstatus = {};
++ 		struct elf_prpsinfo prpsinfo = {
++ 			.pr_sname = 'R',
++ 			.pr_fname = "vmlinux",
++ 		};
++ 		char *notes;
++ 		size_t i = 0;
++ 
++ 		strlcpy(prpsinfo.pr_psargs, saved_command_line,
++ 			sizeof(prpsinfo.pr_psargs));
++ 
++ 		notes = kzalloc(notes_len, GFP_KERNEL);
++ 		if (!notes) {
++ 			ret = -ENOMEM;
++ 			goto out;
++ 		}
++ 
++ 		append_kcore_note(notes, &i, CORE_STR, NT_PRSTATUS, &prstatus,
++ 				  sizeof(prstatus));
++ 		append_kcore_note(notes, &i, CORE_STR, NT_PRPSINFO, &prpsinfo,
++ 				  sizeof(prpsinfo));
++ 		append_kcore_note(notes, &i, CORE_STR, NT_TASKSTRUCT, current,
++ 				  arch_task_struct_size);
++ 		/*
++ 		 * vmcoreinfo_size is mostly constant after init time, but it
++ 		 * can be changed by crash_save_vmcoreinfo(). Racing here with a
++ 		 * panic on another CPU before the machine goes down is insanely
++ 		 * unlikely, but it's better to not leave potential buffer
++ 		 * overflows lying around, regardless.
++ 		 */
++ 		append_kcore_note(notes, &i, VMCOREINFO_NOTE_NAME, 0,
++ 				  vmcoreinfo_data,
++ 				  min(vmcoreinfo_size, notes_len - i));
++ 
++ 		tsz = min_t(size_t, buflen, notes_offset + notes_len - *fpos);
++ 		if (copy_to_user(buffer, notes + *fpos - notes_offset, tsz)) {
++ 			kfree(notes);
++ 			ret = -EFAULT;
++ 			goto out;
++ 		}
++ 		kfree(notes);
++ 
+++>>>>>>> 23c85094fe18 (proc/kcore: add vmcoreinfo note to /proc/kcore)
+  		buffer += tsz;
+ -		buflen -= tsz;
+ -		*fpos += tsz;
+ +
+ +		/* leave now if filled buffer already */
+ +		if (buflen == 0)
+ +			goto out;
+  	}
+  
+  	/*
+diff --git a/fs/proc/Kconfig b/fs/proc/Kconfig
+index 0eaeb41453f5..817c02b13b1d 100644
+--- a/fs/proc/Kconfig
++++ b/fs/proc/Kconfig
+@@ -31,6 +31,7 @@ config PROC_FS
+ config PROC_KCORE
+ 	bool "/proc/kcore support" if !ARM
+ 	depends on PROC_FS && MMU
++	select CRASH_CORE
+ 	help
+ 	  Provides a virtual ELF core file of the live kernel.  This can
+ 	  be read with gdb and other ELF tools.  No modifications can be
+* Unmerged path fs/proc/kcore.c
+diff --git a/include/linux/crash_core.h b/include/linux/crash_core.h
+index b511f6d24b42..525510a9f965 100644
+--- a/include/linux/crash_core.h
++++ b/include/linux/crash_core.h
+@@ -60,6 +60,8 @@ phys_addr_t paddr_vmcoreinfo_note(void);
+ #define VMCOREINFO_CONFIG(name) \
+ 	vmcoreinfo_append_str("CONFIG_%s=y\n", #name)
+ 
++extern unsigned char *vmcoreinfo_data;
++extern size_t vmcoreinfo_size;
+ extern u32 *vmcoreinfo_note;
+ 
+ Elf_Word *append_elf_note(Elf_Word *buf, char *name, unsigned int type,
+diff --git a/kernel/crash_core.c b/kernel/crash_core.c
+index 4c4acd9b80ad..6a14ee2da1f7 100644
+--- a/kernel/crash_core.c
++++ b/kernel/crash_core.c
+@@ -15,8 +15,8 @@
+ #include <asm/sections.h>
+ 
+ /* vmcoreinfo stuff */
+-static unsigned char *vmcoreinfo_data;
+-static size_t vmcoreinfo_size;
++unsigned char *vmcoreinfo_data;
++size_t vmcoreinfo_size;
+ u32 *vmcoreinfo_note;
+ 
+ /* trusted vmcoreinfo, e.g. we can make a copy in the crash memory */
