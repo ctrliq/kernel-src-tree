@@ -1,0 +1,204 @@
+block: merge invalidate_partitions into rescan_partitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6917d0689993f46d97d40dd66c601d0fd5b1dbdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6917d068.failed
+
+A lot of the logic in invalidate_partitions and rescan_partitions is
+shared.  Merge the two functions to simplify things.  There is a small
+behavior change in that we now send the kevent change notice also if we
+were not invalidating but no partitions were found, which seems like
+the right thing to do.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 6917d0689993f46d97d40dd66c601d0fd5b1dbdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/partition-generic.c
+diff --cc block/partition-generic.c
+index aee643ce13d1,6b9f4f5d993a..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -567,96 -564,49 +567,113 @@@ rescan
+  	for (p = 1, highest = 0; p < state->limit; p++)
+  		if (state->parts[p].size)
+  			highest = p;
+ +
+  	disk_expand_part_tbl(disk, highest);
+  
+ -	for (p = 1; p < state->limit; p++)
+ -		if (!blk_add_partition(disk, bdev, state, p))
+ -			goto out_free_state;
+ +	/* add partitions */
+ +	for (p = 1; p < state->limit; p++) {
+ +		sector_t size, from;
+ +
+ +		size = state->parts[p].size;
+ +		if (!size)
+ +			continue;
+ +
+ +		from = state->parts[p].from;
+ +		if (from >= get_capacity(disk)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d start %llu is beyond EOD, ",
+ +			       disk->disk_name, p, (unsigned long long) from);
+ +			if (disk_unlock_native_capacity(disk))
+ +				goto rescan;
+ +			continue;
+ +		}
+ +
+ +		if (from + size > get_capacity(disk)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d size %llu extends beyond EOD, ",
+ +			       disk->disk_name, p, (unsigned long long) size);
+ +
+ +			if (disk_unlock_native_capacity(disk)) {
+ +				/* free state and restart */
+ +				goto rescan;
+ +			} else {
+ +				/*
+ +				 * we can not ignore partitions of broken tables
+ +				 * created by for example camera firmware, but
+ +				 * we limit them to the end of the disk to avoid
+ +				 * creating invalid block devices
+ +				 */
+ +				size = get_capacity(disk) - from;
+ +			}
+ +		}
+  
+ -	ret = 0;
+ -out_free_state:
+ +		/*
+ +		 * On a zoned block device, partitions should be aligned on the
+ +		 * device zone size (i.e. zone boundary crossing not allowed).
+ +		 * Otherwise, resetting the write pointer of the last zone of
+ +		 * one partition may impact the following partition.
+ +		 */
+ +		if (bdev_is_zoned(bdev) &&
+ +		    !part_zone_aligned(disk, bdev, from, size)) {
+ +			printk(KERN_WARNING
+ +			       "%s: p%d start %llu+%llu is not zone aligned\n",
+ +			       disk->disk_name, p, (unsigned long long) from,
+ +			       (unsigned long long) size);
+ +			continue;
+ +		}
+ +
+ +		part = add_partition(disk, p, from, size,
+ +				     state->parts[p].flags,
+ +				     &state->parts[p].info);
+ +		if (IS_ERR(part)) {
+ +			printk(KERN_ERR " %s: p%d could not be added: %ld\n",
+ +			       disk->disk_name, p, -PTR_ERR(part));
+ +			continue;
+ +		}
+ +#ifdef CONFIG_BLK_DEV_MD
+ +		if (state->parts[p].flags & ADDPART_FLAG_RAID)
+ +			md_autodetect_dev(part_to_dev(part)->devt);
+ +#endif
+ +	}
+  	free_partitions(state);
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	return ret;
+  }
+  
+- int invalidate_partitions(struct gendisk *disk, struct block_device *bdev)
++ int rescan_partitions(struct gendisk *disk, struct block_device *bdev,
++ 		bool invalidate)
+  {
+- 	int res;
++ 	int ret;
+  
+- 	if (!bdev->bd_invalidated)
+- 		return 0;
++ rescan:
++ 	ret = drop_partitions(disk, bdev);
++ 	if (ret)
++ 		return ret;
+  
+- 	res = drop_partitions(disk, bdev);
+- 	if (res)
+- 		return res;
++ 	if (invalidate)
++ 		set_capacity(disk, 0);
++ 	else if (disk->fops->revalidate_disk)
++ 		disk->fops->revalidate_disk(disk);
+  
+- 	set_capacity(disk, 0);
+- 	check_disk_size_change(disk, bdev, false);
++ 	check_disk_size_change(disk, bdev, !invalidate);
+  	bdev->bd_invalidated = 0;
+- 	/* tell userspace that the media / partition table may have changed */
+- 	kobject_uevent(&disk_to_dev(disk)->kobj, KOBJ_CHANGE);
+  
+- 	return 0;
++ 	if (!get_capacity(disk)) {
++ 		/*
++ 		 * Tell userspace that the media / partition table may have
++ 		 * changed.
++ 		 */
++ 		kobject_uevent(&disk_to_dev(disk)->kobj, KOBJ_CHANGE);
++ 		return 0;
++ 	}
++ 
++ 	ret = blk_add_partitions(disk, bdev);
++ 	if (ret == -EAGAIN)
++ 		goto rescan;
++ 	return ret;
+++>>>>>>> 6917d0689993 (block: merge invalidate_partitions into rescan_partitions)
+  }
+  
+  unsigned char *read_dev_sector(struct block_device *bdev, sector_t n, Sector *p)
+diff --git a/block/ioctl.c b/block/ioctl.c
+index 4825c78a6baa..d9a274d6d7e2 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -170,7 +170,7 @@ int __blkdev_reread_part(struct block_device *bdev)
+ 
+ 	lockdep_assert_held(&bdev->bd_mutex);
+ 
+-	return rescan_partitions(disk, bdev);
++	return rescan_partitions(disk, bdev, false);
+ }
+ EXPORT_SYMBOL(__blkdev_reread_part);
+ 
+* Unmerged path block/partition-generic.c
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 445bfb04306f..c2318be3c69b 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1532,10 +1532,7 @@ static void __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part);
+ static void bdev_disk_changed(struct block_device *bdev, bool invalidate)
+ {
+ 	if (disk_part_scan_enabled(bdev->bd_disk)) {
+-		if (invalidate)
+-			invalidate_partitions(bdev->bd_disk, bdev);
+-		else
+-			rescan_partitions(bdev->bd_disk, bdev);
++		rescan_partitions(bdev->bd_disk, bdev, invalidate);
+ 	} else {
+ 		check_disk_size_change(bdev->bd_disk, bdev, !invalidate);
+ 		bdev->bd_invalidated = 0;
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index fe1fb3b4d909..1526df0c7e5e 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -628,8 +628,8 @@ extern dev_t blk_lookup_devt(const char *name, int partno);
+ extern char *disk_name (struct gendisk *hd, int partno, char *buf);
+ 
+ extern int disk_expand_part_tbl(struct gendisk *disk, int target);
+-extern int rescan_partitions(struct gendisk *disk, struct block_device *bdev);
+-extern int invalidate_partitions(struct gendisk *disk, struct block_device *bdev);
++int rescan_partitions(struct gendisk *disk, struct block_device *bdev,
++		bool invalidate);
+ extern struct hd_struct * __must_check add_partition(struct gendisk *disk,
+ 						     int partno, sector_t start,
+ 						     sector_t len, int flags,
