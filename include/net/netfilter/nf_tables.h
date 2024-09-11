@@ -889,6 +889,8 @@ enum nft_chain_flags {
 	NFT_BASE_CHAIN			= 0x1,
 };
 
+#define NFT_CHAIN_POLICY_UNSET		U8_MAX
+
 /**
  *	struct nft_chain - nf_tables chain
  *
