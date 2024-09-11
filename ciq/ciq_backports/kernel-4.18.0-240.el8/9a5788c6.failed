@@ -1,0 +1,293 @@
+KVM: PPC: Book3S HV: Add a capability for enabling secure guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 9a5788c615f52f6d7bf0b61986a632d4ec86791d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9a5788c6.failed
+
+At present, on Power systems with Protected Execution Facility
+hardware and an ultravisor, a KVM guest can transition to being a
+secure guest at will.  Userspace (QEMU) has no way of knowing
+whether a host system is capable of running secure guests.  This
+will present a problem in future when the ultravisor is capable of
+migrating secure guests from one host to another, because
+virtualization management software will have no way to ensure that
+secure guests only run in domains where all of the hosts can
+support secure guests.
+
+This adds a VM capability which has two functions: (a) userspace
+can query it to find out whether the host can support secure guests,
+and (b) userspace can enable it for a guest, which allows that
+guest to become a secure guest.  If userspace does not enable it,
+KVM will return an error when the ultravisor does the hypercall
+that indicates that the guest is starting to transition to a
+secure guest.  The ultravisor will then abort the transition and
+the guest will terminate.
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Reviewed-by: Ram Pai <linuxram@us.ibm.com>
+(cherry picked from commit 9a5788c615f52f6d7bf0b61986a632d4ec86791d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s_uvmem.h
+#	arch/powerpc/include/asm/kvm_host.h
+#	arch/powerpc/include/asm/kvm_ppc.h
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/powerpc/kvm/book3s_hv_uvmem.c
+#	include/uapi/linux/kvm.h
+diff --cc arch/powerpc/include/asm/kvm_host.h
+index e3c1a20f542d,f99b4333dfba..000000000000
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@@ -308,6 -302,8 +308,11 @@@ struct kvm_arch 
+  	cpumask_t cpu_in_guest;
+  	u8 radix;
+  	u8 fwnmi_enabled;
+++<<<<<<< HEAD
+++=======
++ 	u8 secure_guest;
++ 	u8 svm_enabled;
+++>>>>>>> 9a5788c615f5 (KVM: PPC: Book3S HV: Add a capability for enabling secure guests)
+  	bool threads_indep;
+  	bool nested_enable;
+  	pgd_t *pgtable;
+diff --cc arch/powerpc/include/asm/kvm_ppc.h
+index b46e2c5f3fd1,94f5a32acaf1..000000000000
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@@ -324,6 -313,8 +324,11 @@@ struct kvmppc_ops 
+  			       int size);
+  	int (*store_to_eaddr)(struct kvm_vcpu *vcpu, ulong *eaddr, void *ptr,
+  			      int size);
+++<<<<<<< HEAD
+++=======
++ 	int (*enable_svm)(struct kvm *kvm);
++ 	int (*svm_off)(struct kvm *kvm);
+++>>>>>>> 9a5788c615f5 (KVM: PPC: Book3S HV: Add a capability for enabling secure guests)
+  };
+  
+  extern struct kvmppc_ops *kvmppc_hv_ops;
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 8227db8cf4b7,fa6e4fc7d0e4..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -5357,6 -5419,109 +5357,112 @@@ static int kvmhv_store_to_eaddr(struct 
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void unpin_vpa_reset(struct kvm *kvm, struct kvmppc_vpa *vpa)
++ {
++ 	unpin_vpa(kvm, vpa);
++ 	vpa->gpa = 0;
++ 	vpa->pinned_addr = NULL;
++ 	vpa->dirty = false;
++ 	vpa->update_pending = 0;
++ }
++ 
++ /*
++  * Enable a guest to become a secure VM, or test whether
++  * that could be enabled.
++  * Called when the KVM_CAP_PPC_SECURE_GUEST capability is
++  * tested (kvm == NULL) or enabled (kvm != NULL).
++  */
++ static int kvmhv_enable_svm(struct kvm *kvm)
++ {
++ 	if (!kvmppc_uvmem_available())
++ 		return -EINVAL;
++ 	if (kvm)
++ 		kvm->arch.svm_enabled = 1;
++ 	return 0;
++ }
++ 
++ /*
++  *  IOCTL handler to turn off secure mode of guest
++  *
++  * - Release all device pages
++  * - Issue ucall to terminate the guest on the UV side
++  * - Unpin the VPA pages.
++  * - Reinit the partition scoped page tables
++  */
++ static int kvmhv_svm_off(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	int mmu_was_ready;
++ 	int srcu_idx;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	if (!(kvm->arch.secure_guest & KVMPPC_SECURE_INIT_START))
++ 		return ret;
++ 
++ 	mutex_lock(&kvm->arch.mmu_setup_lock);
++ 	mmu_was_ready = kvm->arch.mmu_ready;
++ 	if (kvm->arch.mmu_ready) {
++ 		kvm->arch.mmu_ready = 0;
++ 		/* order mmu_ready vs. vcpus_running */
++ 		smp_mb();
++ 		if (atomic_read(&kvm->arch.vcpus_running)) {
++ 			kvm->arch.mmu_ready = 1;
++ 			ret = -EBUSY;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	srcu_idx = srcu_read_lock(&kvm->srcu);
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		struct kvm_memory_slot *memslot;
++ 		struct kvm_memslots *slots = __kvm_memslots(kvm, i);
++ 
++ 		if (!slots)
++ 			continue;
++ 
++ 		kvm_for_each_memslot(memslot, slots) {
++ 			kvmppc_uvmem_drop_pages(memslot, kvm, true);
++ 			uv_unregister_mem_slot(kvm->arch.lpid, memslot->id);
++ 		}
++ 	}
++ 	srcu_read_unlock(&kvm->srcu, srcu_idx);
++ 
++ 	ret = uv_svm_terminate(kvm->arch.lpid);
++ 	if (ret != U_SUCCESS) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * When secure guest is reset, all the guest pages are sent
++ 	 * to UV via UV_PAGE_IN before the non-boot vcpus get a
++ 	 * chance to run and unpin their VPA pages. Unpinning of all
++ 	 * VPA pages is done here explicitly so that VPA pages
++ 	 * can be migrated to the secure side.
++ 	 *
++ 	 * This is required to for the secure SMP guest to reboot
++ 	 * correctly.
++ 	 */
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		spin_lock(&vcpu->arch.vpa_update_lock);
++ 		unpin_vpa_reset(kvm, &vcpu->arch.dtl);
++ 		unpin_vpa_reset(kvm, &vcpu->arch.slb_shadow);
++ 		unpin_vpa_reset(kvm, &vcpu->arch.vpa);
++ 		spin_unlock(&vcpu->arch.vpa_update_lock);
++ 	}
++ 
++ 	kvmppc_setup_partition_table(kvm);
++ 	kvm->arch.secure_guest = 0;
++ 	kvm->arch.mmu_ready = mmu_was_ready;
++ out:
++ 	mutex_unlock(&kvm->arch.mmu_setup_lock);
++ 	return ret;
++ }
++ 
+++>>>>>>> 9a5788c615f5 (KVM: PPC: Book3S HV: Add a capability for enabling secure guests)
+  static struct kvmppc_ops kvm_ops_hv = {
+  	.get_sregs = kvm_arch_vcpu_ioctl_get_sregs_hv,
+  	.set_sregs = kvm_arch_vcpu_ioctl_set_sregs_hv,
+@@@ -5398,6 -5563,8 +5504,11 @@@
+  	.enable_nested = kvmhv_enable_nested,
+  	.load_from_eaddr = kvmhv_load_from_eaddr,
+  	.store_to_eaddr = kvmhv_store_to_eaddr,
+++<<<<<<< HEAD
+++=======
++ 	.enable_svm = kvmhv_enable_svm,
++ 	.svm_off = kvmhv_svm_off,
+++>>>>>>> 9a5788c615f5 (KVM: PPC: Book3S HV: Add a capability for enabling secure guests)
+  };
+  
+  static int kvm_init_subcore_bitmap(void)
+diff --cc include/uapi/linux/kvm.h
+index 8e4c64ff9f98,428c7dde6b4b..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1004,8 -1009,14 +1004,17 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_PMU_EVENT_FILTER 173
+  #define KVM_CAP_ARM_IRQ_LINE_LAYOUT_2 174
+  #define KVM_CAP_HYPERV_DIRECT_TLBFLUSH 175
+++<<<<<<< HEAD
+ +#define KVM_CAP_ARM_NISV_TO_USER 176
+ +#define KVM_CAP_ARM_INJECT_EXT_DABT 177
+++=======
++ #define KVM_CAP_PPC_GUEST_DEBUG_SSTEP 176
++ #define KVM_CAP_ARM_NISV_TO_USER 177
++ #define KVM_CAP_ARM_INJECT_EXT_DABT 178
++ #define KVM_CAP_S390_VCPU_RESETS 179
++ #define KVM_CAP_S390_PROTECTED 180
++ #define KVM_CAP_PPC_SECURE_GUEST 181
+++>>>>>>> 9a5788c615f5 (KVM: PPC: Book3S HV: Add a capability for enabling secure guests)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+* Unmerged path arch/powerpc/include/asm/kvm_book3s_uvmem.h
+* Unmerged path arch/powerpc/kvm/book3s_hv_uvmem.c
+diff --git a/Documentation/virt/kvm/api.txt b/Documentation/virt/kvm/api.txt
+index 0fa33ec7673f..de0c518b6817 100644
+--- a/Documentation/virt/kvm/api.txt
++++ b/Documentation/virt/kvm/api.txt
+@@ -5127,6 +5127,23 @@ it hard or impossible to use it correctly.  The availability of
+ KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 signals that those bugs are fixed.
+ Userspace should not try to use KVM_CAP_MANUAL_DIRTY_LOG_PROTECT.
+ 
++7.19 KVM_CAP_PPC_SECURE_GUEST
++------------------------------
++
++:Architectures: ppc
++
++This capability indicates that KVM is running on a host that has
++ultravisor firmware and thus can support a secure guest.  On such a
++system, a guest can ask the ultravisor to make it a secure guest,
++one whose memory is inaccessible to the host except for pages which
++are explicitly requested to be shared with the host.  The ultravisor
++notifies KVM when a guest requests to become a secure guest, and KVM
++has the opportunity to veto the transition.
++
++If present, this capability can be enabled for a VM, meaning that KVM
++will allow the transition to secure guest mode.  Otherwise KVM will
++veto the transition.
++
+ 8. Other capabilities.
+ ----------------------
+ 
+* Unmerged path arch/powerpc/include/asm/kvm_book3s_uvmem.h
+* Unmerged path arch/powerpc/include/asm/kvm_host.h
+* Unmerged path arch/powerpc/include/asm/kvm_ppc.h
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path arch/powerpc/kvm/book3s_hv_uvmem.c
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index ad5a8fa98211..0bd262fdf986 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -678,6 +678,12 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 		r = !!(cur_cpu_spec->cpu_user_features2 & PPC_FEATURE2_HTM) ||
+ 		     (hv_enabled && cpu_has_feature(CPU_FTR_P9_TM_HV_ASSIST));
+ 		break;
++#endif
++#if defined(CONFIG_KVM_BOOK3S_HV_POSSIBLE)
++	case KVM_CAP_PPC_SECURE_GUEST:
++		r = hv_enabled && kvmppc_hv_ops->enable_svm &&
++			!kvmppc_hv_ops->enable_svm(NULL);
++		break;
+ #endif
+ 	default:
+ 		r = 0;
+@@ -2194,6 +2200,14 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 			break;
+ 		r = kvm->arch.kvm_ops->enable_nested(kvm);
+ 		break;
++#endif
++#if defined(CONFIG_KVM_BOOK3S_HV_POSSIBLE)
++	case KVM_CAP_PPC_SECURE_GUEST:
++		r = -EINVAL;
++		if (!is_kvmppc_hv_enabled(kvm) || !kvm->arch.kvm_ops->enable_svm)
++			break;
++		r = kvm->arch.kvm_ops->enable_svm(kvm);
++		break;
+ #endif
+ 	default:
+ 		r = -EINVAL;
+* Unmerged path include/uapi/linux/kvm.h
