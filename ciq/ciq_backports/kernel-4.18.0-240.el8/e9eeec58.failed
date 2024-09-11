@@ -1,0 +1,218 @@
+bpf: Fix a bug when getting subprog 0 jited image in check_attach_btf_id
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit e9eeec58c992c47b394e4f829e4f81b923b0a322
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e9eeec58.failed
+
+For jited bpf program, if the subprogram count is 1, i.e.,
+there is no callees in the program, prog->aux->func will be NULL
+and prog->bpf_func points to image address of the program.
+
+If there is more than one subprogram, prog->aux->func is populated,
+and subprogram 0 can be accessed through either prog->bpf_func or
+prog->aux->func[0]. Other subprograms should be accessed through
+prog->aux->func[subprog_id].
+
+This patch fixed a bug in check_attach_btf_id(), where
+prog->aux->func[subprog_id] is used to access any subprogram which
+caused a segfault like below:
+  [79162.619208] BUG: kernel NULL pointer dereference, address:
+  0000000000000000
+  ......
+  [79162.634255] Call Trace:
+  [79162.634974]  ? _cond_resched+0x15/0x30
+  [79162.635686]  ? kmem_cache_alloc_trace+0x162/0x220
+  [79162.636398]  ? selinux_bpf_prog_alloc+0x1f/0x60
+  [79162.637111]  bpf_prog_load+0x3de/0x690
+  [79162.637809]  __do_sys_bpf+0x105/0x1740
+  [79162.638488]  do_syscall_64+0x5b/0x180
+  [79162.639147]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+  ......
+
+Fixes: 5b92a28aae4d ("bpf: Support attaching tracing BPF program to other BPF programs")
+	Reported-by: Eelco Chaudron <echaudro@redhat.com>
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20191205010606.177774-1-yhs@fb.com
+(cherry picked from commit e9eeec58c992c47b394e4f829e4f81b923b0a322)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index 7e7ad8585479,034ef81f935b..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -9503,6 -9504,164 +9503,167 @@@ static void print_verification_stats(st
+  		env->peak_states, env->longest_mark_read_walk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
++ 	u32 btf_id = prog->aux->attach_btf_id;
++ 	const char prefix[] = "btf_trace_";
++ 	int ret = 0, subprog = -1, i;
++ 	struct bpf_trampoline *tr;
++ 	const struct btf_type *t;
++ 	bool conservative = true;
++ 	const char *tname;
++ 	struct btf *btf;
++ 	long addr;
++ 	u64 key;
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING)
++ 		return 0;
++ 
++ 	if (!btf_id) {
++ 		verbose(env, "Tracing programs must provide btf_id\n");
++ 		return -EINVAL;
++ 	}
++ 	btf = bpf_prog_get_target_btf(prog);
++ 	if (!btf) {
++ 		verbose(env,
++ 			"FENTRY/FEXIT program can only be attached to another program annotated with BTF\n");
++ 		return -EINVAL;
++ 	}
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t) {
++ 		verbose(env, "attach_btf_id %u is invalid\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 	if (!tname) {
++ 		verbose(env, "attach_btf_id %u doesn't have a name\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	if (tgt_prog) {
++ 		struct bpf_prog_aux *aux = tgt_prog->aux;
++ 
++ 		for (i = 0; i < aux->func_info_cnt; i++)
++ 			if (aux->func_info[i].type_id == btf_id) {
++ 				subprog = i;
++ 				break;
++ 			}
++ 		if (subprog == -1) {
++ 			verbose(env, "Subprog %s doesn't exist\n", tname);
++ 			return -EINVAL;
++ 		}
++ 		conservative = aux->func_info_aux[subprog].unreliable;
++ 		key = ((u64)aux->id) << 32 | btf_id;
++ 	} else {
++ 		key = btf_id;
++ 	}
++ 
++ 	switch (prog->expected_attach_type) {
++ 	case BPF_TRACE_RAW_TP:
++ 		if (tgt_prog) {
++ 			verbose(env,
++ 				"Only FENTRY/FEXIT progs are attachable to another BPF prog\n");
++ 			return -EINVAL;
++ 		}
++ 		if (!btf_type_is_typedef(t)) {
++ 			verbose(env, "attach_btf_id %u is not a typedef\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (strncmp(prefix, tname, sizeof(prefix) - 1)) {
++ 			verbose(env, "attach_btf_id %u points to wrong type name %s\n",
++ 				btf_id, tname);
++ 			return -EINVAL;
++ 		}
++ 		tname += sizeof(prefix) - 1;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_ptr(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 
++ 		/* remember two read only pointers that are valid for
++ 		 * the life time of the kernel
++ 		 */
++ 		prog->aux->attach_func_name = tname;
++ 		prog->aux->attach_func_proto = t;
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	case BPF_TRACE_FENTRY:
++ 	case BPF_TRACE_FEXIT:
++ 		if (!btf_type_is_func(t)) {
++ 			verbose(env, "attach_btf_id %u is not a function\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			return -EINVAL;
++ 		tr = bpf_trampoline_lookup(key);
++ 		if (!tr)
++ 			return -ENOMEM;
++ 		prog->aux->attach_func_name = tname;
++ 		/* t is either vmlinux type or another program's type */
++ 		prog->aux->attach_func_proto = t;
++ 		mutex_lock(&tr->mutex);
++ 		if (tr->func.addr) {
++ 			prog->aux->trampoline = tr;
++ 			goto out;
++ 		}
++ 		if (tgt_prog && conservative) {
++ 			prog->aux->attach_func_proto = NULL;
++ 			t = NULL;
++ 		}
++ 		ret = btf_distill_func_proto(&env->log, btf, t,
++ 					     tname, &tr->func.model);
++ 		if (ret < 0)
++ 			goto out;
++ 		if (tgt_prog) {
++ 			if (!tgt_prog->jited) {
++ 				/* for now */
++ 				verbose(env, "Can trace only JITed BPF progs\n");
++ 				ret = -EINVAL;
++ 				goto out;
++ 			}
++ 			if (tgt_prog->type == BPF_PROG_TYPE_TRACING) {
++ 				/* prevent cycles */
++ 				verbose(env, "Cannot recursively attach\n");
++ 				ret = -EINVAL;
++ 				goto out;
++ 			}
++ 			if (subprog == 0)
++ 				addr = (long) tgt_prog->bpf_func;
++ 			else
++ 				addr = (long) tgt_prog->aux->func[subprog]->bpf_func;
++ 		} else {
++ 			addr = kallsyms_lookup_name(tname);
++ 			if (!addr) {
++ 				verbose(env,
++ 					"The address of function %s cannot be found\n",
++ 					tname);
++ 				ret = -ENOENT;
++ 				goto out;
++ 			}
++ 		}
++ 		tr->func.addr = (void *)addr;
++ 		prog->aux->trampoline = tr;
++ out:
++ 		mutex_unlock(&tr->mutex);
++ 		if (ret)
++ 			bpf_trampoline_put(tr);
++ 		return ret;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> e9eeec58c992 (bpf: Fix a bug when getting subprog 0 jited image in check_attach_btf_id)
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+  	      union bpf_attr __user *uattr)
+  {
+* Unmerged path kernel/bpf/verifier.c
