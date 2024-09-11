@@ -1,0 +1,185 @@
+RDMA/mlx5: Fix -Wformat warning in check_ucmd_data()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Tom Seewald <tseewald@gmail.com>
+commit 4f5747cf8e5947479a27a3597829e45d6d8d73e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4f5747cf.failed
+
+Variables of type size_t should use %zu rather than %lu [1]. The variables
+"inlen", "ucmd", "last", and "size" are all size_t, so use the correct
+format specifiers.
+
+[1] https://www.kernel.org/doc/html/latest/core-api/printk-formats.html
+
+Fixes: e383085c2425 ("RDMA/mlx5: Set ECE options during QP create")
+Link: https://lore.kernel.org/r/20200605023012.9527-1-tseewald@gmail.com
+	Signed-off-by: Tom Seewald <tseewald@gmail.com>
+	Acked-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 4f5747cf8e5947479a27a3597829e45d6d8d73e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 68ab87769d36,dbe82cdb8d2c..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -2795,6 -2870,150 +2795,153 @@@ static int mlx5_ib_destroy_dct(struct m
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_ucmd_data(struct mlx5_ib_dev *dev,
++ 			   struct mlx5_create_qp_params *params)
++ {
++ 	struct ib_qp_init_attr *attr = params->attr;
++ 	struct ib_udata *udata = params->udata;
++ 	size_t size, last;
++ 	int ret;
++ 
++ 	if (params->is_rss_raw)
++ 		/*
++ 		 * These QPs don't have "reserved" field in their
++ 		 * create_qp input struct, so their data is always valid.
++ 		 */
++ 		last = sizeof(struct mlx5_ib_create_qp_rss);
++ 	else
++ 		/* IB_QPT_RAW_PACKET doesn't have ECE data */
++ 		switch (attr->qp_type) {
++ 		case IB_QPT_RAW_PACKET:
++ 			last = offsetof(struct mlx5_ib_create_qp, ece_options);
++ 			break;
++ 		default:
++ 			last = offsetof(struct mlx5_ib_create_qp, reserved);
++ 		}
++ 
++ 	if (udata->inlen <= last)
++ 		return 0;
++ 
++ 	/*
++ 	 * User provides different create_qp structures based on the
++ 	 * flow and we need to know if he cleared memory after our
++ 	 * struct create_qp ends.
++ 	 */
++ 	size = udata->inlen - last;
++ 	ret = ib_is_udata_cleared(params->udata, last, size);
++ 	if (!ret)
++ 		mlx5_ib_dbg(
++ 			dev,
++ 			"udata is not cleared, inlen = %zu, ucmd = %zu, last = %zu, size = %zu\n",
++ 			udata->inlen, params->ucmd_size, last, size);
++ 	return ret ? 0 : -EINVAL;
++ }
++ 
++ struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attr,
++ 				struct ib_udata *udata)
++ {
++ 	struct mlx5_create_qp_params params = {};
++ 	struct mlx5_ib_dev *dev;
++ 	struct mlx5_ib_qp *qp;
++ 	enum ib_qp_type type;
++ 	int err;
++ 
++ 	dev = pd ? to_mdev(pd->device) :
++ 		   to_mdev(to_mxrcd(attr->xrcd)->ibxrcd.device);
++ 
++ 	err = check_qp_type(dev, attr, &type);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	err = check_valid_flow(dev, pd, attr, udata);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	if (attr->qp_type == IB_QPT_GSI)
++ 		return mlx5_ib_gsi_create_qp(pd, attr);
++ 
++ 	params.udata = udata;
++ 	params.uidx = MLX5_IB_DEFAULT_UIDX;
++ 	params.attr = attr;
++ 	params.is_rss_raw = !!attr->rwq_ind_tbl;
++ 
++ 	if (udata) {
++ 		err = process_udata_size(dev, &params);
++ 		if (err)
++ 			return ERR_PTR(err);
++ 
++ 		err = check_ucmd_data(dev, &params);
++ 		if (err)
++ 			return ERR_PTR(err);
++ 
++ 		params.ucmd = kzalloc(params.ucmd_size, GFP_KERNEL);
++ 		if (!params.ucmd)
++ 			return ERR_PTR(-ENOMEM);
++ 
++ 		err = ib_copy_from_udata(params.ucmd, udata, params.inlen);
++ 		if (err)
++ 			goto free_ucmd;
++ 	}
++ 
++ 	qp = kzalloc(sizeof(*qp), GFP_KERNEL);
++ 	if (!qp) {
++ 		err = -ENOMEM;
++ 		goto free_ucmd;
++ 	}
++ 
++ 	qp->type = type;
++ 	if (udata) {
++ 		err = process_vendor_flags(dev, qp, params.ucmd, attr);
++ 		if (err)
++ 			goto free_qp;
++ 
++ 		err = get_qp_uidx(qp, &params);
++ 		if (err)
++ 			goto free_qp;
++ 	}
++ 	err = process_create_flags(dev, qp, attr);
++ 	if (err)
++ 		goto free_qp;
++ 
++ 	err = check_qp_attr(dev, qp, attr);
++ 	if (err)
++ 		goto free_qp;
++ 
++ 	err = create_qp(dev, pd, qp, &params);
++ 	if (err)
++ 		goto free_qp;
++ 
++ 	kfree(params.ucmd);
++ 	params.ucmd = NULL;
++ 
++ 	if (udata)
++ 		/*
++ 		 * It is safe to copy response for all user create QP flows,
++ 		 * including MLX5_IB_QPT_DCT, which doesn't need it.
++ 		 * In that case, resp will be filled with zeros.
++ 		 */
++ 		err = ib_copy_to_udata(udata, &params.resp, params.outlen);
++ 	if (err)
++ 		goto destroy_qp;
++ 
++ 	return &qp->ibqp;
++ 
++ destroy_qp:
++ 	if (qp->type == MLX5_IB_QPT_DCT)
++ 		mlx5_ib_destroy_dct(qp);
++ 	else
++ 		destroy_qp_common(dev, qp, udata);
++ 	qp = NULL;
++ free_qp:
++ 	kfree(qp);
++ free_ucmd:
++ 	kfree(params.ucmd);
++ 	return ERR_PTR(err);
++ }
++ 
+++>>>>>>> 4f5747cf8e59 (RDMA/mlx5: Fix -Wformat warning in check_ucmd_data())
+  int mlx5_ib_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
+  {
+  	struct mlx5_ib_dev *dev = to_mdev(qp->device);
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
