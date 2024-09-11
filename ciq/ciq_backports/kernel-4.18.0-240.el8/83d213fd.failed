@@ -1,0 +1,490 @@
+netfilter: conntrack: deconstify packet callback skb pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 83d213fd9d1a56108584cd812333462caa39a747
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/83d213fd.failed
+
+Only two protocols need the ->error() function: icmp and icmpv6.
+This is because icmp error mssages might be RELATED to an existing
+connection (e.g. PMTUD, port unreachable and the like), and their
+->error() handlers do this.
+
+The error callback is already optional, so remove it for
+udp and call them from ->packet() instead.
+
+As the error() callback can call checksum functions that write to
+skb->csum*, the const qualifier has to be removed as well.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 83d213fd9d1a56108584cd812333462caa39a747)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+#	net/netfilter/nf_conntrack_proto_dccp.c
+#	net/netfilter/nf_conntrack_proto_udp.c
+diff --cc net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+index c3ab22bf84b8,a1933566d53d..000000000000
+--- a/net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
++++ b/net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+@@@ -91,11 -92,32 +91,18 @@@ static unsigned int *icmpv6_get_timeout
+  
+  /* Returns verdict for packet, or -1 for invalid. */
+  static int icmpv6_packet(struct nf_conn *ct,
+++<<<<<<< HEAD:net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+ +		       const struct sk_buff *skb,
+ +		       unsigned int dataoff,
+ +		       enum ip_conntrack_info ctinfo,
+ +		       unsigned int *timeout)
+++=======
++ 		         struct sk_buff *skb,
++ 		         unsigned int dataoff,
++ 		         enum ip_conntrack_info ctinfo,
++ 		         const struct nf_hook_state *state)
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer):net/netfilter/nf_conntrack_proto_icmpv6.c
+  {
+ -	unsigned int *timeout = nf_ct_timeout_lookup(ct);
+ -	static const u8 valid_new[] = {
+ -		[ICMPV6_ECHO_REQUEST - 128] = 1,
+ -		[ICMPV6_NI_QUERY - 128] = 1
+ -	};
+ -
+ -	if (!nf_ct_is_confirmed(ct)) {
+ -		int type = ct->tuplehash[0].tuple.dst.u.icmp.type - 128;
+ -
+ -		if (type < 0 || type >= sizeof(valid_new) || !valid_new[type]) {
+ -			/* Can't create a new ICMPv6 `conn' with this. */
+ -			pr_debug("icmpv6: can't create new conn with type %u\n",
+ -				 type + 128);
+ -			nf_ct_dump_tuple_ipv6(&ct->tuplehash[0].tuple);
+ -			return -NF_ACCEPT;
+ -		}
+ -	}
+ -
+ -	if (!timeout)
+ -		timeout = icmpv6_get_timeouts(nf_ct_net(ct));
+ -
+  	/* Do not immediately delete the connection after the first
+  	   successful reply to avoid excessive conntrackd traffic
+  	   and also to handle correctly ICMP echo reply duplicates. */
+diff --cc net/netfilter/nf_conntrack_proto_dccp.c
+index 5773ad591022,fdea305c7aa5..000000000000
+--- a/net/netfilter/nf_conntrack_proto_dccp.c
++++ b/net/netfilter/nf_conntrack_proto_dccp.c
+@@@ -437,14 -435,9 +437,18 @@@ static u64 dccp_ack_seq(const struct dc
+  		     ntohl(dhack->dccph_ack_nr_low);
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int *dccp_get_timeouts(struct net *net)
+ +{
+ +	return dccp_pernet(net)->dccp_timeout;
+ +}
+ +
+ +static int dccp_packet(struct nf_conn *ct, const struct sk_buff *skb,
+++=======
++ static int dccp_packet(struct nf_conn *ct, struct sk_buff *skb,
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  		       unsigned int dataoff, enum ip_conntrack_info ctinfo,
+ -		       const struct nf_hook_state *state)
+ +		       unsigned int *timeouts)
+  {
+  	enum ip_conntrack_dir dir = CTINFO2DIR(ctinfo);
+  	struct dccp_hdr _dh, *dh;
+diff --cc net/netfilter/nf_conntrack_proto_udp.c
+index a89c059cbf40,da94c967c835..000000000000
+--- a/net/netfilter/nf_conntrack_proto_udp.c
++++ b/net/netfilter/nf_conntrack_proto_udp.c
+@@@ -41,13 -42,69 +41,72 @@@ static unsigned int *udp_get_timeouts(s
+  	return udp_pernet(net)->timeouts;
+  }
+  
++ static void udp_error_log(const struct sk_buff *skb,
++ 			  const struct nf_hook_state *state,
++ 			  const char *msg)
++ {
++ 	nf_l4proto_log_invalid(skb, state->net, state->pf,
++ 			       IPPROTO_UDP, "%s", msg);
++ }
++ 
++ static bool udp_error(struct sk_buff *skb,
++ 		      unsigned int dataoff,
++ 		      const struct nf_hook_state *state)
++ {
++ 	unsigned int udplen = skb->len - dataoff;
++ 	const struct udphdr *hdr;
++ 	struct udphdr _hdr;
++ 
++ 	/* Header is too small? */
++ 	hdr = skb_header_pointer(skb, dataoff, sizeof(_hdr), &_hdr);
++ 	if (!hdr) {
++ 		udp_error_log(skb, state, "short packet");
++ 		return true;
++ 	}
++ 
++ 	/* Truncated/malformed packets */
++ 	if (ntohs(hdr->len) > udplen || ntohs(hdr->len) < sizeof(*hdr)) {
++ 		udp_error_log(skb, state, "truncated/malformed packet");
++ 		return true;
++ 	}
++ 
++ 	/* Packet with no checksum */
++ 	if (!hdr->check)
++ 		return false;
++ 
++ 	/* Checksum invalid? Ignore.
++ 	 * We skip checking packets on the outgoing path
++ 	 * because the checksum is assumed to be correct.
++ 	 * FIXME: Source route IP option packets --RR */
++ 	if (state->hook == NF_INET_PRE_ROUTING &&
++ 	    state->net->ct.sysctl_checksum &&
++ 	    nf_checksum(skb, state->hook, dataoff, IPPROTO_UDP, state->pf)) {
++ 		udp_error_log(skb, state, "bad checksum");
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
+  /* Returns verdict for packet, and may modify conntracktype */
+  static int udp_packet(struct nf_conn *ct,
+- 		      const struct sk_buff *skb,
++ 		      struct sk_buff *skb,
+  		      unsigned int dataoff,
+  		      enum ip_conntrack_info ctinfo,
+ -		      const struct nf_hook_state *state)
+ +		      unsigned int *timeouts)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int *timeouts;
++ 
++ 	if (udp_error(skb, dataoff, state))
++ 		return -NF_ACCEPT;
++ 
++ 	timeouts = nf_ct_timeout_lookup(ct);
++ 	if (!timeouts)
++ 		timeouts = udp_get_timeouts(nf_ct_net(ct));
++ 
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  	/* If we've seen traffic both ways, this is some kind of UDP
+  	   stream.  Extend timeout. */
+  	if (test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) {
+@@@ -63,24 -120,18 +122,30 @@@
+  	return NF_ACCEPT;
+  }
+  
+ +/* Called when a new connection for this protocol found. */
+ +static bool udp_new(struct nf_conn *ct, const struct sk_buff *skb,
+ +		    unsigned int dataoff, unsigned int *timeouts)
+ +{
+ +	return true;
+ +}
+ +
+++<<<<<<< HEAD
+  #ifdef CONFIG_NF_CT_PROTO_UDPLITE
+ -static void udplite_error_log(const struct sk_buff *skb,
+ -			      const struct nf_hook_state *state,
+ -			      const char *msg)
+ +static void udplite_error_log(const struct sk_buff *skb, struct net *net,
+ +			      u8 pf, const char *msg)
+  {
+ -	nf_l4proto_log_invalid(skb, state->net, state->pf,
+ -			       IPPROTO_UDPLITE, "%s", msg);
+ +	nf_l4proto_log_invalid(skb, net, pf, IPPROTO_UDPLITE, "%s", msg);
+  }
+  
+ +static int udplite_error(struct net *net, struct nf_conn *tmpl,
+ +			 struct sk_buff *skb,
+ +			 unsigned int dataoff,
+ +			 u8 pf, unsigned int hooknum)
+++=======
++ static bool udplite_error(struct sk_buff *skb,
++ 			  unsigned int dataoff,
++ 			  const struct nf_hook_state *state)
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  {
+  	unsigned int udplen = skb->len - dataoff;
+  	const struct udphdr *hdr;
+@@@ -90,81 -141,68 +155,139 @@@
+  	/* Header is too small? */
+  	hdr = skb_header_pointer(skb, dataoff, sizeof(_hdr), &_hdr);
+  	if (!hdr) {
+++<<<<<<< HEAD
+ +		udplite_error_log(skb, net, pf, "short packet");
+ +		return -NF_ACCEPT;
+++=======
++ 		udplite_error_log(skb, state, "short packet");
++ 		return true;
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  	}
+  
+  	cscov = ntohs(hdr->len);
+  	if (cscov == 0) {
+  		cscov = udplen;
+  	} else if (cscov < sizeof(*hdr) || cscov > udplen) {
+++<<<<<<< HEAD
+ +		udplite_error_log(skb, net, pf, "invalid checksum coverage");
+ +		return -NF_ACCEPT;
+++=======
++ 		udplite_error_log(skb, state, "invalid checksum coverage");
++ 		return true;
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  	}
+  
+  	/* UDPLITE mandates checksums */
+  	if (!hdr->check) {
+++<<<<<<< HEAD
+ +		udplite_error_log(skb, net, pf, "checksum missing");
+ +		return -NF_ACCEPT;
+ +	}
+ +
+ +	/* Checksum invalid? Ignore. */
+ +	if (net->ct.sysctl_checksum && hooknum == NF_INET_PRE_ROUTING &&
+ +	    nf_checksum_partial(skb, hooknum, dataoff, cscov, IPPROTO_UDP,
+ +				pf)) {
+ +		udplite_error_log(skb, net, pf, "bad checksum");
+ +		return -NF_ACCEPT;
+++=======
++ 		udplite_error_log(skb, state, "checksum missing");
++ 		return true;
++ 	}
++ 
++ 	/* Checksum invalid? Ignore. */
++ 	if (state->hook == NF_INET_PRE_ROUTING &&
++ 	    state->net->ct.sysctl_checksum &&
++ 	    nf_checksum_partial(skb, state->hook, dataoff, cscov, IPPROTO_UDP,
++ 				state->pf)) {
++ 		udplite_error_log(skb, state, "bad checksum");
++ 		return true;
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  	}
+  
++ 	return false;
++ }
++ 
++ /* Returns verdict for packet, and may modify conntracktype */
++ static int udplite_packet(struct nf_conn *ct,
++ 			  struct sk_buff *skb,
++ 			  unsigned int dataoff,
++ 			  enum ip_conntrack_info ctinfo,
++ 			  const struct nf_hook_state *state)
++ {
++ 	unsigned int *timeouts;
++ 
++ 	if (udplite_error(skb, dataoff, state))
++ 		return -NF_ACCEPT;
++ 
++ 	timeouts = nf_ct_timeout_lookup(ct);
++ 	if (!timeouts)
++ 		timeouts = udp_get_timeouts(nf_ct_net(ct));
++ 
++ 	/* If we've seen traffic both ways, this is some kind of UDP
++ 	   stream.  Extend timeout. */
++ 	if (test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) {
++ 		nf_ct_refresh_acct(ct, ctinfo, skb,
++ 				   timeouts[UDP_CT_REPLIED]);
++ 		/* Also, more likely to be important, and not a probe */
++ 		if (!test_and_set_bit(IPS_ASSURED_BIT, &ct->status))
++ 			nf_conntrack_event_cache(IPCT_ASSURED, ct);
++ 	} else {
++ 		nf_ct_refresh_acct(ct, ctinfo, skb,
++ 				   timeouts[UDP_CT_UNREPLIED]);
++ 	}
+  	return NF_ACCEPT;
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static void udp_error_log(const struct sk_buff *skb, struct net *net,
+ +			  u8 pf, const char *msg)
+ +{
+ +	nf_l4proto_log_invalid(skb, net, pf, IPPROTO_UDP, "%s", msg);
+ +}
+ +
+ +static int udp_error(struct net *net, struct nf_conn *tmpl, struct sk_buff *skb,
+ +		     unsigned int dataoff,
+ +		     u_int8_t pf,
+ +		     unsigned int hooknum)
+ +{
+ +	unsigned int udplen = skb->len - dataoff;
+ +	const struct udphdr *hdr;
+ +	struct udphdr _hdr;
+ +
+ +	/* Header is too small? */
+ +	hdr = skb_header_pointer(skb, dataoff, sizeof(_hdr), &_hdr);
+ +	if (hdr == NULL) {
+ +		udp_error_log(skb, net, pf, "short packet");
+ +		return -NF_ACCEPT;
+ +	}
+ +
+ +	/* Truncated/malformed packets */
+ +	if (ntohs(hdr->len) > udplen || ntohs(hdr->len) < sizeof(*hdr)) {
+ +		udp_error_log(skb, net, pf, "truncated/malformed packet");
+ +		return -NF_ACCEPT;
+ +	}
+ +
+ +	/* Packet with no checksum */
+ +	if (!hdr->check)
+ +		return NF_ACCEPT;
+ +
+ +	/* Checksum invalid? Ignore.
+ +	 * We skip checking packets on the outgoing path
+ +	 * because the checksum is assumed to be correct.
+ +	 * FIXME: Source route IP option packets --RR */
+ +	if (net->ct.sysctl_checksum && hooknum == NF_INET_PRE_ROUTING &&
+ +	    nf_checksum(skb, hooknum, dataoff, IPPROTO_UDP, pf)) {
+ +		udp_error_log(skb, net, pf, "bad checksum");
+ +		return -NF_ACCEPT;
+ +	}
+ +
+ +	return NF_ACCEPT;
+ +}
+ +
+++=======
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
+  
+  #include <linux/netfilter/nfnetlink.h>
+@@@ -275,9 -316,6 +398,12 @@@ const struct nf_conntrack_l4proto nf_co
+  	.l4proto		= IPPROTO_UDP,
+  	.allow_clash		= true,
+  	.packet			= udp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= udp_get_timeouts,
+ +	.new			= udp_new,
+ +	.error			= udp_error,
+++=======
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+  	.tuple_to_nlattr	= nf_ct_port_tuple_to_nlattr,
+  	.nlattr_to_tuple	= nf_ct_port_nlattr_to_tuple,
+@@@ -304,10 -342,7 +430,14 @@@ const struct nf_conntrack_l4proto nf_co
+  	.l3proto		= PF_INET,
+  	.l4proto		= IPPROTO_UDPLITE,
+  	.allow_clash		= true,
+++<<<<<<< HEAD
+ +	.packet			= udp_packet,
+ +	.get_timeouts		= udp_get_timeouts,
+ +	.new			= udp_new,
+ +	.error			= udplite_error,
+++=======
++ 	.packet			= udplite_packet,
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+  	.tuple_to_nlattr	= nf_ct_port_tuple_to_nlattr,
+  	.nlattr_to_tuple	= nf_ct_port_nlattr_to_tuple,
+@@@ -335,9 -370,6 +465,12 @@@ const struct nf_conntrack_l4proto nf_co
+  	.l4proto		= IPPROTO_UDP,
+  	.allow_clash		= true,
+  	.packet			= udp_packet,
+++<<<<<<< HEAD
+ +	.get_timeouts		= udp_get_timeouts,
+ +	.new			= udp_new,
+ +	.error			= udp_error,
+++=======
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+  	.tuple_to_nlattr	= nf_ct_port_tuple_to_nlattr,
+  	.nlattr_to_tuple	= nf_ct_port_nlattr_to_tuple,
+@@@ -364,10 -396,7 +497,14 @@@ const struct nf_conntrack_l4proto nf_co
+  	.l3proto		= PF_INET6,
+  	.l4proto		= IPPROTO_UDPLITE,
+  	.allow_clash		= true,
+++<<<<<<< HEAD
+ +	.packet			= udp_packet,
+ +	.get_timeouts		= udp_get_timeouts,
+ +	.new			= udp_new,
+ +	.error			= udplite_error,
+++=======
++ 	.packet			= udplite_packet,
+++>>>>>>> 83d213fd9d1a (netfilter: conntrack: deconstify packet callback skb pointer)
+  #if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+  	.tuple_to_nlattr	= nf_ct_port_tuple_to_nlattr,
+  	.nlattr_to_tuple	= nf_ct_port_nlattr_to_tuple,
+diff --git a/include/net/netfilter/nf_conntrack_l4proto.h b/include/net/netfilter/nf_conntrack_l4proto.h
+index 771e9d473ecd..3df9f7a09846 100644
+--- a/include/net/netfilter/nf_conntrack_l4proto.h
++++ b/include/net/netfilter/nf_conntrack_l4proto.h
+@@ -43,7 +43,7 @@ struct nf_conntrack_l4proto {
+ 
+ 	/* Returns verdict for packet, or -1 for invalid. */
+ 	int (*packet)(struct nf_conn *ct,
+-		      const struct sk_buff *skb,
++		      struct sk_buff *skb,
+ 		      unsigned int dataoff,
+ 		      enum ip_conntrack_info ctinfo,
+ 		      unsigned int *timeouts);
+diff --git a/net/ipv4/netfilter/nf_conntrack_proto_icmp.c b/net/ipv4/netfilter/nf_conntrack_proto_icmp.c
+index f2bc6a47243a..89a27a9cee7f 100644
+--- a/net/ipv4/netfilter/nf_conntrack_proto_icmp.c
++++ b/net/ipv4/netfilter/nf_conntrack_proto_icmp.c
+@@ -78,7 +78,7 @@ static unsigned int *icmp_get_timeouts(struct net *net)
+ 
+ /* Returns verdict for packet, or -1 for invalid. */
+ static int icmp_packet(struct nf_conn *ct,
+-		       const struct sk_buff *skb,
++		       struct sk_buff *skb,
+ 		       unsigned int dataoff,
+ 		       enum ip_conntrack_info ctinfo,
+ 		       unsigned int *timeout)
+* Unmerged path net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+* Unmerged path net/netfilter/nf_conntrack_proto_dccp.c
+diff --git a/net/netfilter/nf_conntrack_proto_generic.c b/net/netfilter/nf_conntrack_proto_generic.c
+index 592164faa299..38b276d72db3 100644
+--- a/net/netfilter/nf_conntrack_proto_generic.c
++++ b/net/netfilter/nf_conntrack_proto_generic.c
+@@ -48,7 +48,7 @@ static unsigned int *generic_get_timeouts(struct net *net)
+ 
+ /* Returns verdict for packet, or -1 for invalid. */
+ static int generic_packet(struct nf_conn *ct,
+-			  const struct sk_buff *skb,
++			  struct sk_buff *skb,
+ 			  unsigned int dataoff,
+ 			  enum ip_conntrack_info ctinfo,
+ 			  unsigned int *timeout)
+diff --git a/net/netfilter/nf_conntrack_proto_gre.c b/net/netfilter/nf_conntrack_proto_gre.c
+index 1d1fc1718f60..7df4ad647e4c 100644
+--- a/net/netfilter/nf_conntrack_proto_gre.c
++++ b/net/netfilter/nf_conntrack_proto_gre.c
+@@ -232,7 +232,7 @@ static unsigned int *gre_get_timeouts(struct net *net)
+ 
+ /* Returns verdict for packet, and may modify conntrack */
+ static int gre_packet(struct nf_conn *ct,
+-		      const struct sk_buff *skb,
++		      struct sk_buff *skb,
+ 		      unsigned int dataoff,
+ 		      enum ip_conntrack_info ctinfo,
+ 		      unsigned int *timeouts)
+diff --git a/net/netfilter/nf_conntrack_proto_sctp.c b/net/netfilter/nf_conntrack_proto_sctp.c
+index 900b74fa0c53..83ed36f0e122 100644
+--- a/net/netfilter/nf_conntrack_proto_sctp.c
++++ b/net/netfilter/nf_conntrack_proto_sctp.c
+@@ -279,7 +279,7 @@ static unsigned int *sctp_get_timeouts(struct net *net)
+ 
+ /* Returns verdict for packet, or -NF_ACCEPT for invalid. */
+ static int sctp_packet(struct nf_conn *ct,
+-		       const struct sk_buff *skb,
++		       struct sk_buff *skb,
+ 		       unsigned int dataoff,
+ 		       enum ip_conntrack_info ctinfo,
+ 		       unsigned int *timeouts)
+diff --git a/net/netfilter/nf_conntrack_proto_tcp.c b/net/netfilter/nf_conntrack_proto_tcp.c
+index 4908e99488e6..7af90cd92a55 100644
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@ -777,7 +777,7 @@ static unsigned int *tcp_get_timeouts(struct net *net)
+ 
+ /* Returns verdict for packet, or -1 for invalid. */
+ static int tcp_packet(struct nf_conn *ct,
+-		      const struct sk_buff *skb,
++		      struct sk_buff *skb,
+ 		      unsigned int dataoff,
+ 		      enum ip_conntrack_info ctinfo,
+ 		      unsigned int *timeouts)
+* Unmerged path net/netfilter/nf_conntrack_proto_udp.c
