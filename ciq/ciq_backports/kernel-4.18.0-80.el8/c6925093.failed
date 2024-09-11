@@ -1,0 +1,189 @@
+nvmet: Optionally use PCI P2P memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit c6925093d0b28329ad3a486f5b0345c2c192ae9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/c6925093.failed
+
+Create a configfs attribute in each nvme-fabrics namespace to enable P2P
+memory use.  The attribute may be enabled (with a boolean) or a specific
+P2P device may be given (with the device's PCI name).
+
+When enabled, the namespace will ensure the underlying block device
+supports P2P and is compatible with any specified P2P device.  If no device
+was specified it will ensure there is compatible P2P memory somewhere in
+the system.  Enabling a namespace with P2P memory will fail with EINVAL
+(and an appropriate dmesg error) if any of these conditions are not met.
+
+Once a controller is set up on a specific port, the P2P device to use for
+each namespace will be found and stored in a radix tree by namespace ID.
+When memory is allocated for a request, the tree is used to look up the P2P
+device to allocate memory against.  If no device is in the tree (because no
+appropriate device was found), or if allocation of P2P memory fails, fall
+back to using regular memory.
+
+	Signed-off-by: Stephen Bates <sbates@raithlin.com>
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+[hch: partial rewrite of the initial code]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit c6925093d0b28329ad3a486f5b0345c2c192ae9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/configfs.c
+#	drivers/nvme/target/core.c
+diff --cc drivers/nvme/target/configfs.c
+index 027a4175caff,d895579b6c5d..000000000000
+--- a/drivers/nvme/target/configfs.c
++++ b/drivers/nvme/target/configfs.c
+@@@ -445,7 -550,12 +489,14 @@@ static struct configfs_attribute *nvmet
+  	&nvmet_ns_attr_device_path,
+  	&nvmet_ns_attr_device_nguid,
+  	&nvmet_ns_attr_device_uuid,
+ -	&nvmet_ns_attr_ana_grpid,
+  	&nvmet_ns_attr_enable,
+++<<<<<<< HEAD
+++=======
++ 	&nvmet_ns_attr_buffered_io,
++ #ifdef CONFIG_PCI_P2PDMA
++ 	&nvmet_ns_attr_p2pmem,
++ #endif
+++>>>>>>> c6925093d0b2 (nvmet: Optionally use PCI P2P memory)
+  	NULL,
+  };
+  
+diff --cc drivers/nvme/target/core.c
+index 380d69c52c74,9b4d84cfc224..000000000000
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@@ -336,9 -452,14 +420,14 @@@ static void nvmet_p2pmem_ns_add_p2p(str
+  int nvmet_ns_enable(struct nvmet_ns *ns)
+  {
+  	struct nvmet_subsys *subsys = ns->subsys;
+++<<<<<<< HEAD
+ +	int ret = 0;
+++=======
++ 	struct nvmet_ctrl *ctrl;
++ 	int ret;
+++>>>>>>> c6925093d0b2 (nvmet: Optionally use PCI P2P memory)
+  
+  	mutex_lock(&subsys->lock);
+ -	ret = -EMFILE;
+ -	if (subsys->nr_namespaces == NVMET_MAX_NAMESPACES)
+ -		goto out_unlock;
+ -	ret = 0;
+  	if (ns->enabled)
+  		goto out_unlock;
+  
+@@@ -413,6 -550,8 +517,11 @@@ void nvmet_ns_disable(struct nvmet_ns *
+  	percpu_ref_exit(&ns->ref);
+  
+  	mutex_lock(&subsys->lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	subsys->nr_namespaces--;
+++>>>>>>> c6925093d0b2 (nvmet: Optionally use PCI P2P memory)
+  	nvmet_ns_changed(subsys, ns->nsid);
+  	nvmet_ns_dev_disable(ns);
+  out_unlock:
+@@@ -892,8 -1135,11 +1059,9 @@@ u16 nvmet_alloc_ctrl(const char *subsys
+  
+  	nvmet_init_cap(ctrl);
+  
+ -	ctrl->port = req->port;
+ -
+  	INIT_WORK(&ctrl->async_event_work, nvmet_async_event_work);
+  	INIT_LIST_HEAD(&ctrl->async_events);
++ 	INIT_RADIX_TREE(&ctrl->p2p_ns_map, GFP_KERNEL);
+  
+  	memcpy(ctrl->subsysnqn, subsysnqn, NVMF_NQN_SIZE);
+  	memcpy(ctrl->hostnqn, hostnqn, NVMF_NQN_SIZE);
+* Unmerged path drivers/nvme/target/configfs.c
+* Unmerged path drivers/nvme/target/core.c
+diff --git a/drivers/nvme/target/io-cmd-bdev.c b/drivers/nvme/target/io-cmd-bdev.c
+index e0b0f7df70c2..e81763afbf80 100644
+--- a/drivers/nvme/target/io-cmd-bdev.c
++++ b/drivers/nvme/target/io-cmd-bdev.c
+@@ -78,6 +78,9 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
+ 		op = REQ_OP_READ;
+ 	}
+ 
++	if (is_pci_p2pdma_page(sg_page(req->sg)))
++		op_flags |= REQ_NOMERGE;
++
+ 	sector = le64_to_cpu(req->cmd->rw.slba);
+ 	sector <<= (req->ns->blksize_shift - 9);
+ 
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 6acfb8f520ec..ec9283b6fd89 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -26,6 +26,7 @@
+ #include <linux/configfs.h>
+ #include <linux/rcupdate.h>
+ #include <linux/blkdev.h>
++#include <linux/radix-tree.h>
+ 
+ #define NVMET_ASYNC_EVENTS		4
+ #define NVMET_ERROR_LOG_SLOTS		128
+@@ -75,6 +76,9 @@ struct nvmet_ns {
+ 	struct completion	disable_done;
+ 	mempool_t		*bvec_pool;
+ 	struct kmem_cache	*bvec_cache;
++
++	int			use_p2pmem;
++	struct pci_dev		*p2p_dev;
+ };
+ 
+ static inline struct nvmet_ns *to_nvmet_ns(struct config_item *item)
+@@ -82,6 +86,11 @@ static inline struct nvmet_ns *to_nvmet_ns(struct config_item *item)
+ 	return container_of(to_config_group(item), struct nvmet_ns, group);
+ }
+ 
++static inline struct device *nvmet_ns_dev(struct nvmet_ns *ns)
++{
++	return ns->bdev ? disk_to_dev(ns->bdev->bd_disk) : NULL;
++}
++
+ struct nvmet_cq {
+ 	u16			qid;
+ 	u16			size;
+@@ -158,6 +167,9 @@ struct nvmet_ctrl {
+ 
+ 	char			subsysnqn[NVMF_NQN_FIELD_LEN];
+ 	char			hostnqn[NVMF_NQN_FIELD_LEN];
++
++	struct device *p2p_client;
++	struct radix_tree_root p2p_ns_map;
+ };
+ 
+ struct nvmet_subsys {
+@@ -267,6 +279,9 @@ struct nvmet_req {
+ 
+ 	void (*execute)(struct nvmet_req *req);
+ 	const struct nvmet_fabrics_ops *ops;
++
++	struct pci_dev *p2p_dev;
++	struct device *p2p_client;
+ };
+ 
+ static inline void nvmet_set_status(struct nvmet_req *req, u16 status)
+diff --git a/drivers/nvme/target/rdma.c b/drivers/nvme/target/rdma.c
+index d64e7e056d63..f34891757c9d 100644
+--- a/drivers/nvme/target/rdma.c
++++ b/drivers/nvme/target/rdma.c
+@@ -729,6 +729,8 @@ static void nvmet_rdma_handle_command(struct nvmet_rdma_queue *queue,
+ 		cmd->send_sge.addr, cmd->send_sge.length,
+ 		DMA_TO_DEVICE);
+ 
++	cmd->req.p2p_client = &queue->dev->device->dev;
++
+ 	if (!nvmet_req_init(&cmd->req, &queue->nvme_cq,
+ 			&queue->nvme_sq, &nvmet_rdma_ops))
+ 		return;
