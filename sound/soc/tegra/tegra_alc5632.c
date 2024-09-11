@@ -126,7 +126,8 @@ static int tegra_alc5632_asoc_init(struct snd_soc_pcm_runtime *rtd)
 
 SND_SOC_DAILINK_DEFS(pcm,
 	DAILINK_COMP_ARRAY(COMP_EMPTY()),
-	DAILINK_COMP_ARRAY(COMP_CODEC(NULL, "alc5632-hifi")));
+	DAILINK_COMP_ARRAY(COMP_CODEC(NULL, "alc5632-hifi")),
+	DAILINK_COMP_ARRAY(COMP_EMPTY()));
 
 static struct snd_soc_dai_link tegra_alc5632_dai = {
 	.name = "ALC5632",
@@ -197,6 +198,8 @@ static int tegra_alc5632_probe(struct platform_device *pdev)
 		goto err_put_codec_of_node;
 	}
 
+	tegra_alc5632_dai.platforms->of_node = tegra_alc5632_dai.cpus->of_node;
+
 	ret = tegra_asoc_utils_init(&alc5632->util_data, &pdev->dev);
 	if (ret)
 		goto err_put_cpu_of_node;
@@ -215,6 +218,7 @@ err_fini_utils:
 err_put_cpu_of_node:
 	of_node_put(tegra_alc5632_dai.cpus->of_node);
 	tegra_alc5632_dai.cpus->of_node = NULL;
+	tegra_alc5632_dai.platforms->of_node = NULL;
 err_put_codec_of_node:
 	of_node_put(tegra_alc5632_dai.codecs->of_node);
 	tegra_alc5632_dai.codecs->of_node = NULL;
@@ -233,6 +237,7 @@ static int tegra_alc5632_remove(struct platform_device *pdev)
 
 	of_node_put(tegra_alc5632_dai.cpus->of_node);
 	tegra_alc5632_dai.cpus->of_node = NULL;
+	tegra_alc5632_dai.platforms->of_node = NULL;
 	of_node_put(tegra_alc5632_dai.codecs->of_node);
 	tegra_alc5632_dai.codecs->of_node = NULL;
 
