@@ -1,0 +1,279 @@
+mm: memcg/slab: reparent memcg kmem_caches on cgroup removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit fb2f2b0adb98bbbbbb51c5a5327f3f90f5dc417e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/fb2f2b0a.failed
+
+Let's reparent non-root kmem_caches on memcg offlining.  This allows us to
+release the memory cgroup without waiting for the last outstanding kernel
+object (e.g.  dentry used by another application).
+
+Since the parent cgroup is already charged, everything we need to do is to
+splice the list of kmem_caches to the parent's kmem_caches list, swap the
+memcg pointer, drop the css refcounter for each kmem_cache and adjust the
+parent's css refcounter.
+
+Please, note that kmem_cache->memcg_params.memcg isn't a stable pointer
+anymore.  It's safe to read it under rcu_read_lock(), cgroup_mutex held,
+or any other way that protects the memory cgroup from being released.
+
+We can race with the slab allocation and deallocation paths.  It's not a
+big problem: parent's charge and slab global stats are always correct, and
+we don't care anymore about the child usage and global stats.  The child
+cgroup is already offline, so we don't use or show it anywhere.
+
+Local slab stats (NR_SLAB_RECLAIMABLE and NR_SLAB_UNRECLAIMABLE) aren't
+used anywhere except count_shadow_nodes().  But even there it won't break
+anything: after reparenting "nodes" will be 0 on child level (because
+we're already reparenting shrinker lists), and on parent level page stats
+always were 0, and this patch won't change anything.
+
+[guro@fb.com: properly handle kmem_caches reparented to root_mem_cgroup]
+  Link: http://lkml.kernel.org/r/20190620213427.1691847-1-guro@fb.com
+Link: http://lkml.kernel.org/r/20190611231813.3148843-11-guro@fb.com
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Waiman Long <longman@redhat.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Andrei Vagin <avagin@gmail.com>
+	Cc: Qian Cai <cai@lca.pw>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fb2f2b0adb98bbbbbb51c5a5327f3f90f5dc417e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.h
+diff --cc mm/slab.h
+index fc50b234565a,a62372d0f271..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -248,30 -255,90 +248,101 @@@ static inline struct kmem_cache *memcg_
+  	return s->memcg_params.root_cache;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Expects a pointer to a slab page. Please note, that PageSlab() check
++  * isn't sufficient, as it returns true also for tail compound slab pages,
++  * which do not have slab_cache pointer set.
++  * So this function assumes that the page can pass PageHead() and PageSlab()
++  * checks.
++  *
++  * The kmem_cache can be reparented asynchronously. The caller must ensure
++  * the memcg lifetime, e.g. by taking rcu_read_lock() or cgroup_mutex.
++  */
++ static inline struct mem_cgroup *memcg_from_slab_page(struct page *page)
++ {
++ 	struct kmem_cache *s;
++ 
++ 	s = READ_ONCE(page->slab_cache);
++ 	if (s && !is_root_cache(s))
++ 		return READ_ONCE(s->memcg_params.memcg);
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * Charge the slab page belonging to the non-root kmem_cache.
++  * Can be called for non-root kmem_caches only.
++  */
+++>>>>>>> fb2f2b0adb98 (mm: memcg/slab: reparent memcg kmem_caches on cgroup removal)
+  static __always_inline int memcg_charge_slab(struct page *page,
+  					     gfp_t gfp, int order,
+  					     struct kmem_cache *s)
+  {
+ -	struct mem_cgroup *memcg;
+ -	struct lruvec *lruvec;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (is_root_cache(s))
+ +		return 0;
+ +
+ +	ret = memcg_kmem_charge_memcg(page, gfp, order, s->memcg_params.memcg);
+++=======
++ 	rcu_read_lock();
++ 	memcg = READ_ONCE(s->memcg_params.memcg);
++ 	while (memcg && !css_tryget_online(&memcg->css))
++ 		memcg = parent_mem_cgroup(memcg);
++ 	rcu_read_unlock();
++ 
++ 	if (unlikely(!memcg || mem_cgroup_is_root(memcg))) {
++ 		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
++ 				    (1 << order));
++ 		percpu_ref_get_many(&s->memcg_params.refcnt, 1 << order);
++ 		return 0;
++ 	}
++ 
++ 	ret = memcg_kmem_charge_memcg(page, gfp, order, memcg);
+++>>>>>>> fb2f2b0adb98 (mm: memcg/slab: reparent memcg kmem_caches on cgroup removal)
+  	if (ret)
+- 		return ret;
++ 		goto out;
+  
+ -	lruvec = mem_cgroup_lruvec(page_pgdat(page), memcg);
+ -	mod_lruvec_state(lruvec, cache_vmstat_idx(s), 1 << order);
+ -
+ -	/* transer try_charge() page references to kmem_cache */
+  	percpu_ref_get_many(&s->memcg_params.refcnt, 1 << order);
+++<<<<<<< HEAD
+ +
+ +	return 0;
+++=======
++ 	css_put_many(&memcg->css, 1 << order);
++ out:
++ 	css_put(&memcg->css);
++ 	return ret;
+++>>>>>>> fb2f2b0adb98 (mm: memcg/slab: reparent memcg kmem_caches on cgroup removal)
+  }
+  
+ -/*
+ - * Uncharge a slab page belonging to a non-root kmem_cache.
+ - * Can be called for non-root kmem_caches only.
+ - */
+  static __always_inline void memcg_uncharge_slab(struct page *page, int order,
+  						struct kmem_cache *s)
+  {
+++<<<<<<< HEAD
+ +	if (!is_root_cache(s))
+ +		percpu_ref_put_many(&s->memcg_params.refcnt, 1 << order);
+ +	memcg_kmem_uncharge(page, order);
+++=======
++ 	struct mem_cgroup *memcg;
++ 	struct lruvec *lruvec;
++ 
++ 	rcu_read_lock();
++ 	memcg = READ_ONCE(s->memcg_params.memcg);
++ 	if (likely(!mem_cgroup_is_root(memcg))) {
++ 		lruvec = mem_cgroup_lruvec(page_pgdat(page), memcg);
++ 		mod_lruvec_state(lruvec, cache_vmstat_idx(s), -(1 << order));
++ 		memcg_kmem_uncharge_memcg(page, order, memcg);
++ 	} else {
++ 		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
++ 				    -(1 << order));
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	percpu_ref_put_many(&s->memcg_params.refcnt, 1 << order);
+++>>>>>>> fb2f2b0adb98 (mm: memcg/slab: reparent memcg kmem_caches on cgroup removal)
+  }
+  
+  extern void slab_init_memcg_params(struct kmem_cache *);
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index f8d905ed061e..398d8dd8f452 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -150,7 +150,7 @@ void kmem_cache_destroy(struct kmem_cache *);
+ int kmem_cache_shrink(struct kmem_cache *);
+ 
+ void memcg_create_kmem_cache(struct mem_cgroup *, struct kmem_cache *);
+-void memcg_deactivate_kmem_caches(struct mem_cgroup *);
++void memcg_deactivate_kmem_caches(struct mem_cgroup *, struct mem_cgroup *);
+ 
+ /*
+  * Please use this macro to create slab caches. Simply specify the
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 4b3962b0a37e..b36884b768f5 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3131,15 +3131,15 @@ static void memcg_offline_kmem(struct mem_cgroup *memcg)
+ 	 */
+ 	memcg->kmem_state = KMEM_ALLOCATED;
+ 
+-	memcg_deactivate_kmem_caches(memcg);
+-
+-	kmemcg_id = memcg->kmemcg_id;
+-	BUG_ON(kmemcg_id < 0);
+-
+ 	parent = parent_mem_cgroup(memcg);
+ 	if (!parent)
+ 		parent = root_mem_cgroup;
+ 
++	memcg_deactivate_kmem_caches(memcg, parent);
++
++	kmemcg_id = memcg->kmemcg_id;
++	BUG_ON(kmemcg_id < 0);
++
+ 	/*
+ 	 * Change kmemcg_id of this cgroup and all its descendants to the
+ 	 * parent's id, and then move all entries from this cgroup's list_lrus
+@@ -3172,7 +3172,6 @@ static void memcg_free_kmem(struct mem_cgroup *memcg)
+ 	if (memcg->kmem_state == KMEM_ALLOCATED) {
+ 		WARN_ON(!list_empty(&memcg->kmem_caches));
+ 		static_branch_dec(&memcg_kmem_enabled_key);
+-		WARN_ON(page_counter_read(&memcg->kmem));
+ 	}
+ }
+ #else
+@@ -4539,6 +4538,9 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ 
+ 	/* The following stuff does not apply to the root */
+ 	if (!parent) {
++#ifdef CONFIG_MEMCG_KMEM
++		INIT_LIST_HEAD(&memcg->kmem_caches);
++#endif
+ 		root_mem_cgroup = memcg;
+ 		return &memcg->css;
+ 	}
+* Unmerged path mm/slab.h
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index 4ee168346cac..298ced933a7e 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -252,7 +252,8 @@ static void memcg_unlink_cache(struct kmem_cache *s)
+ 	} else {
+ 		list_del(&s->memcg_params.children_node);
+ 		list_del(&s->memcg_params.kmem_caches_node);
+-		css_put(&s->memcg_params.memcg->css);
++		mem_cgroup_put(s->memcg_params.memcg);
++		WRITE_ONCE(s->memcg_params.memcg, NULL);
+ 	}
+ }
+ #else
+@@ -758,11 +759,13 @@ static void kmemcg_cache_deactivate(struct kmem_cache *s)
+ 	spin_unlock_irq(&memcg_kmem_wq_lock);
+ }
+ 
+-void memcg_deactivate_kmem_caches(struct mem_cgroup *memcg)
++void memcg_deactivate_kmem_caches(struct mem_cgroup *memcg,
++				  struct mem_cgroup *parent)
+ {
+ 	int idx;
+ 	struct memcg_cache_array *arr;
+ 	struct kmem_cache *s, *c;
++	unsigned int nr_reparented;
+ 
+ 	idx = memcg_cache_id(memcg);
+ 
+@@ -780,6 +783,18 @@ void memcg_deactivate_kmem_caches(struct mem_cgroup *memcg)
+ 		kmemcg_cache_deactivate(c);
+ 		arr->entries[idx] = NULL;
+ 	}
++	nr_reparented = 0;
++	list_for_each_entry(s, &memcg->kmem_caches,
++			    memcg_params.kmem_caches_node) {
++		WRITE_ONCE(s->memcg_params.memcg, parent);
++		css_put(&memcg->css);
++		nr_reparented++;
++	}
++	if (nr_reparented) {
++		list_splice_init(&memcg->kmem_caches,
++				 &parent->kmem_caches);
++		css_get_many(&parent->css, nr_reparented);
++	}
+ 	mutex_unlock(&slab_mutex);
+ 
+ 	put_online_mems();
