@@ -1,0 +1,107 @@
+net/mlx5e: Protect tc flow table with mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5e: Protect tc flow table with mutex (Alaa Hleihel) [1663231 1724336]
+Rebuild_FUZZ: 95.12%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit b6fac0b46a1a76024698d240f0f9aac552f897b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b6fac0b4.failed
+
+TC flow table is created when first flow is added, and destroyed when last
+flow is removed. This assumes that all accesses to the table are externally
+synchronized with rtnl lock. To remove dependency on rtnl lock, add new
+mutex mlx5e_tc_table->t_lock and use it to protect the flow table.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Jianbo Liu <jianbol@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b6fac0b46a1a76024698d240f0f9aac552f897b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c033e0d4fc59,f3ed028d5017..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -769,9 -851,10 +769,10 @@@ mlx5e_tc_add_nic_flow(struct mlx5e_pri
+  		flow_act.modify_id = attr->mod_hdr_id;
+  		kfree(parse_attr->mod_hdr_actions);
+  		if (err)
+ -			return err;
+ +			goto err_create_mod_hdr_id;
+  	}
+  
++ 	mutex_lock(&priv->fs.tc.t_lock);
+  	if (IS_ERR_OR_NULL(priv->fs.tc.t)) {
+  		int tc_grp_size, tc_tbl_size;
+  		u32 max_flow_counter;
+@@@ -807,29 -888,12 +809,30 @@@
+  
+  	flow->rule[0] = mlx5_add_flow_rules(priv->fs.tc.t, &parse_attr->spec,
+  					    &flow_act, dest, dest_ix);
++ 	mutex_unlock(&priv->fs.tc.t_lock);
+  
+ -	if (IS_ERR(flow->rule[0]))
+ -		return PTR_ERR(flow->rule[0]);
+ +	if (IS_ERR(flow->rule[0])) {
+ +		err = PTR_ERR(flow->rule[0]);
+ +		goto err_add_rule;
+ +	}
+  
+  	return 0;
+ +
+ +err_add_rule:
+ +	if (table_created) {
+ +		mlx5_destroy_flow_table(priv->fs.tc.t);
+ +		priv->fs.tc.t = NULL;
+ +	}
+ +err_create_ft:
+ +	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
+ +		mlx5e_detach_mod_hdr(priv, flow);
+ +err_create_mod_hdr_id:
+ +	mlx5_fc_destroy(dev, counter);
+ +err_fc_create:
+ +	if (flow->flags & MLX5E_TC_FLOW_HAIRPIN)
+ +		mlx5e_hairpin_flow_del(priv, flow);
+ +err_add_hairpin_flow:
+ +	return err;
+  }
+  
+  static void mlx5e_tc_del_nic_flow(struct mlx5e_priv *priv,
+@@@ -839,10 -903,12 +842,15 @@@
+  	struct mlx5_fc *counter = NULL;
+  
+  	counter = attr->counter;
+ -	if (!IS_ERR_OR_NULL(flow->rule[0]))
+ -		mlx5_del_flow_rules(flow->rule[0]);
+ +	mlx5_del_flow_rules(flow->rule[0]);
+  	mlx5_fc_destroy(priv->mdev, counter);
+  
+++<<<<<<< HEAD
+ +	if (!mlx5e_tc_num_filters(priv, MLX5E_TC_NIC_OFFLOAD)  && priv->fs.tc.t) {
+++=======
++ 	mutex_lock(&priv->fs.tc.t_lock);
++ 	if (!mlx5e_tc_num_filters(priv, MLX5_TC_FLAG(NIC_OFFLOAD)) && priv->fs.tc.t) {
+++>>>>>>> b6fac0b46a1a (net/mlx5e: Protect tc flow table with mutex)
+  		mlx5_destroy_flow_table(priv->fs.tc.t);
+  		priv->fs.tc.t = NULL;
+  	}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h b/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+index eb70ada89b09..4518ce19112e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+@@ -10,6 +10,8 @@ enum {
+ };
+ 
+ struct mlx5e_tc_table {
++	/* protects flow table */
++	struct mutex			t_lock;
+ 	struct mlx5_flow_table		*t;
+ 
+ 	struct rhashtable               ht;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
