@@ -52,7 +52,7 @@ static ssize_t qeth_dev_if_name_show(struct device *dev,
 {
 	struct qeth_card *card = dev_get_drvdata(dev);
 
-	return sprintf(buf, "%s\n", QETH_CARD_IFNAME(card));
+	return sprintf(buf, "%s\n", netdev_name(card->dev));
 }
 
 static DEVICE_ATTR(if_name, 0444, qeth_dev_if_name_show, NULL);
@@ -164,9 +164,11 @@ static ssize_t qeth_dev_prioqing_show(struct device *dev,
 		return sprintf(buf, "%s\n", "by skb-priority");
 	case QETH_PRIO_Q_ING_VLAN:
 		return sprintf(buf, "%s\n", "by VLAN headers");
-	default:
+	case QETH_PRIO_Q_ING_FIXED:
 		return sprintf(buf, "always queue %i\n",
 			       card->qdio.default_out_queue);
+	default:
+		return sprintf(buf, "disabled\n");
 	}
 }
 
@@ -382,19 +384,13 @@ static ssize_t qeth_dev_layer2_store(struct device *dev,
 			goto out;
 		}
 
-		card->discipline->remove(card->gdev);
-		qeth_core_free_discipline(card);
+		qeth_remove_discipline(card);
 		free_netdev(card->dev);
 		card->dev = ndev;
 	}
 
-	rc = qeth_core_load_discipline(card, newdis);
-	if (rc)
-		goto out;
+	rc = qeth_setup_discipline(card, newdis);
 
-	rc = card->discipline->setup(card->gdev);
-	if (rc)
-		qeth_core_free_discipline(card);
 out:
 	mutex_unlock(&card->discipline_mutex);
 	return rc ? rc : count;
@@ -638,23 +634,17 @@ static struct attribute *qeth_blkt_device_attrs[] = {
 	&dev_attr_inter_jumbo.attr,
 	NULL,
 };
-const struct attribute_group qeth_device_blkt_group = {
+
+static const struct attribute_group qeth_dev_blkt_group = {
 	.name = "blkt",
 	.attrs = qeth_blkt_device_attrs,
 };
-EXPORT_SYMBOL_GPL(qeth_device_blkt_group);
 
-static struct attribute *qeth_device_attrs[] = {
-	&dev_attr_state.attr,
-	&dev_attr_chpid.attr,
-	&dev_attr_if_name.attr,
-	&dev_attr_card_type.attr,
+static struct attribute *qeth_dev_extended_attrs[] = {
 	&dev_attr_inbuf_size.attr,
 	&dev_attr_portno.attr,
 	&dev_attr_portname.attr,
 	&dev_attr_priority_queueing.attr,
-	&dev_attr_buffer_count.attr,
-	&dev_attr_recover.attr,
 	&dev_attr_performance_stats.attr,
 	&dev_attr_layer2.attr,
 	&dev_attr_isolation.attr,
@@ -662,18 +652,12 @@ static struct attribute *qeth_device_attrs[] = {
 	&dev_attr_switch_attrs.attr,
 	NULL,
 };
-const struct attribute_group qeth_device_attr_group = {
-	.attrs = qeth_device_attrs,
-};
-EXPORT_SYMBOL_GPL(qeth_device_attr_group);
 
-const struct attribute_group *qeth_generic_attr_groups[] = {
-	&qeth_device_attr_group,
-	&qeth_device_blkt_group,
-	NULL,
+static const struct attribute_group qeth_dev_extended_group = {
+	.attrs = qeth_dev_extended_attrs,
 };
 
-static struct attribute *qeth_osn_device_attrs[] = {
+static struct attribute *qeth_dev_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_chpid.attr,
 	&dev_attr_if_name.attr,
@@ -682,10 +666,19 @@ static struct attribute *qeth_osn_device_attrs[] = {
 	&dev_attr_recover.attr,
 	NULL,
 };
-static struct attribute_group qeth_osn_device_attr_group = {
-	.attrs = qeth_osn_device_attrs,
+
+static const struct attribute_group qeth_dev_group = {
+	.attrs = qeth_dev_attrs,
 };
-const struct attribute_group *qeth_osn_attr_groups[] = {
-	&qeth_osn_device_attr_group,
+
+const struct attribute_group *qeth_osn_dev_groups[] = {
+	&qeth_dev_group,
+	NULL,
+};
+
+const struct attribute_group *qeth_dev_groups[] = {
+	&qeth_dev_group,
+	&qeth_dev_extended_group,
+	&qeth_dev_blkt_group,
 	NULL,
 };

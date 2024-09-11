@@ -475,12 +475,13 @@ retry:
 	}
 	/*
 	 * We need to make the page accessible if and only if we are going
-	 * to access its content (the FOLL_GET case).
+	 * to access its content (the FOLL_PIN case).  Please see
+	 * Documentation/core-api/pin_user_pages.rst for details.
 	 */
-	if (flags & FOLL_GET) {
+	if (flags & FOLL_PIN) {
 		ret = arch_make_page_accessible(page);
 		if (ret) {
-			put_page(page);
+			unpin_user_page(page);
 			page = ERR_PTR(ret);
 			goto out;
 		}
@@ -2175,12 +2176,14 @@ static int gup_pte_range(pmd_t pmd, unsigned long addr, unsigned long end,
 
 		/*
 		 * We need to make the page accessible if and only if we are
-		 * going to access its content (the FOLL_GET case).
+		 * going to access its content (the FOLL_PIN case).  Please
+		 * see Documentation/core-api/pin_user_pages.rst for
+		 * details.
 		 */
-		if (flags & FOLL_GET) {
+		if (flags & FOLL_PIN) {
 			ret = arch_make_page_accessible(page);
 			if (ret) {
-				put_page(page);
+				unpin_user_page(page);
 				goto pte_unmap;
 			}
 		}

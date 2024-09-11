@@ -165,7 +165,7 @@ static int gfs2_dir_write_data(struct gfs2_inode *ip, const char *buf,
 	unsigned int o;
 	int copied = 0;
 	int error = 0;
-	int new = 0;
+	bool new = false;
 
 	if (!size)
 		return 0;
@@ -178,7 +178,7 @@ static int gfs2_dir_write_data(struct gfs2_inode *ip, const char *buf,
 		return -EINVAL;
 
 	if (gfs2_is_stuffed(ip)) {
-		error = gfs2_unstuff_dinode(ip, NULL);
+		error = gfs2_unstuff_dinode(ip);
 		if (error)
 			return error;
 	}
@@ -195,9 +195,9 @@ static int gfs2_dir_write_data(struct gfs2_inode *ip, const char *buf,
 			amount = sdp->sd_sb.sb_bsize - o;
 
 		if (!extlen) {
-			new = 1;
-			error = gfs2_extent_map(&ip->i_inode, lblock, &new,
-						&dblock, &extlen);
+			extlen = 1;
+			error = gfs2_alloc_extent(&ip->i_inode, lblock, &dblock,
+						  &extlen, &new);
 			if (error)
 				goto fail;
 			error = -EIO;
@@ -292,15 +292,14 @@ static int gfs2_dir_read_data(struct gfs2_inode *ip, __be64 *buf,
 	while (copied < size) {
 		unsigned int amount;
 		struct buffer_head *bh;
-		int new;
 
 		amount = size - copied;
 		if (amount > sdp->sd_sb.sb_bsize - o)
 			amount = sdp->sd_sb.sb_bsize - o;
 
 		if (!extlen) {
-			new = 0;
-			error = gfs2_extent_map(&ip->i_inode, lblock, &new,
+			extlen = 32;
+			error = gfs2_get_extent(&ip->i_inode, lblock,
 						&dblock, &extlen);
 			if (error || !dblock)
 				goto fail;
@@ -2047,6 +2046,8 @@ static int leaf_dealloc(struct gfs2_inode *dip, u32 index, u32 len,
 	bh = leaf_bh;
 
 	for (blk = leaf_no; blk; blk = nblk) {
+		struct gfs2_rgrpd *rgd;
+
 		if (blk != leaf_no) {
 			error = get_leaf(dip, blk, &bh);
 			if (error)
@@ -2057,7 +2058,8 @@ static int leaf_dealloc(struct gfs2_inode *dip, u32 index, u32 len,
 		if (blk != leaf_no)
 			brelse(bh);
 
-		gfs2_free_meta(dip, blk, 1);
+		rgd = gfs2_blk2rgrpd(sdp, blk, true);
+		gfs2_free_meta(dip, rgd, blk, 1);
 		gfs2_add_inode_blocks(&dip->i_inode, -1);
 	}
 

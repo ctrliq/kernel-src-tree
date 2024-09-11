@@ -215,7 +215,7 @@ cifs_read_super(struct super_block *sb)
 	if (rc)
 		goto out_no_root;
 	/* tune readahead according to rsize */
-	sb->s_bdi->ra_pages = cifs_sb->rsize / PAGE_SIZE;
+	sb->s_bdi->ra_pages = cifs_sb->ctx->rsize / PAGE_SIZE;
 
 	sb->s_blocksize = CIFS_MAX_MSGSIZE;
 	sb->s_blocksize_bits = 14;	/* default 2**14 = CIFS_MAX_MSGSIZE */
@@ -472,7 +472,7 @@ cifs_show_cache_flavor(struct seq_file *s, struct cifs_sb_info *cifs_sb)
 static int cifs_show_devname(struct seq_file *m, struct dentry *root)
 {
 	struct cifs_sb_info *cifs_sb = CIFS_SB(root->d_sb);
-	char *devname = kstrdup(cifs_sb->ctx->UNC, GFP_KERNEL);
+	char *devname = kstrdup(cifs_sb->ctx->source, GFP_KERNEL);
 
 	if (devname == NULL)
 		seq_puts(m, "none");
@@ -503,7 +503,7 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
 
 	if (tcon->no_lease)
 		seq_puts(s, ",nolease");
-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MULTIUSER)
+	if (cifs_sb->ctx->multiuser)
 		seq_puts(s, ",multiuser");
 	else if (tcon->ses->user_name)
 		seq_show_option(s, "username", tcon->ses->user_name);
@@ -624,9 +624,9 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
 			   from_kgid_munged(&init_user_ns,
 					    cifs_sb->ctx->backupgid));
 
-	seq_printf(s, ",rsize=%u", cifs_sb->rsize);
-	seq_printf(s, ",wsize=%u", cifs_sb->wsize);
-	seq_printf(s, ",bsize=%u", cifs_sb->bsize);
+	seq_printf(s, ",rsize=%u", cifs_sb->ctx->rsize);
+	seq_printf(s, ",wsize=%u", cifs_sb->ctx->wsize);
+	seq_printf(s, ",bsize=%u", cifs_sb->ctx->bsize);
 	if (tcon->ses->server->min_offload)
 		seq_printf(s, ",esize=%u", tcon->ses->server->min_offload);
 	seq_printf(s, ",echo_interval=%lu",
@@ -640,8 +640,18 @@ cifs_show_options(struct seq_file *s, struct dentry *root)
 		seq_printf(s, ",snapshot=%llu", tcon->snapshot_time);
 	if (tcon->handle_timeout)
 		seq_printf(s, ",handletimeout=%u", tcon->handle_timeout);
-	/* convert actimeo and display it in seconds */
-	seq_printf(s, ",actimeo=%lu", cifs_sb->ctx->actimeo / HZ);
+
+	/*
+	 * Display file and directory attribute timeout in seconds.
+	 * If file and directory attribute timeout the same then actimeo
+	 * was likely specified on mount
+	 */
+	if (cifs_sb->ctx->acdirmax == cifs_sb->ctx->acregmax)
+		seq_printf(s, ",actimeo=%lu", cifs_sb->ctx->acregmax / HZ);
+	else {
+		seq_printf(s, ",acdirmax=%lu", cifs_sb->ctx->acdirmax / HZ);
+		seq_printf(s, ",acregmax=%lu", cifs_sb->ctx->acregmax / HZ);
+	}
 
 	if (tcon->ses->chan_max > 1)
 		seq_printf(s, ",multichannel,max_channels=%zu",
@@ -694,13 +704,6 @@ static int cifs_show_stats(struct seq_file *s, struct dentry *root)
 }
 #endif
 
-static int cifs_remount(struct super_block *sb, int *flags, char *data)
-{
-	sync_filesystem(sb);
-	*flags |= SB_NODIRATIME;
-	return 0;
-}
-
 static int cifs_drop_inode(struct inode *inode)
 {
 	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
@@ -724,7 +727,6 @@ static const struct super_operations cifs_super_ops = {
 	as opens */
 	.show_options = cifs_show_options,
 	.umount_begin   = cifs_umount_begin,
-	.remount_fs = cifs_remount,
 #ifdef CONFIG_CIFS_STATS2
 	.show_stats = cifs_show_stats,
 #endif
@@ -792,14 +794,13 @@ static int cifs_set_super(struct super_block *sb, void *data)
 	return set_anon_super(sb, NULL);
 }
 
-static struct dentry *
+struct dentry *
 cifs_smb3_do_mount(struct file_system_type *fs_type,
-	      int flags, const char *dev_name, void *data, bool is_smb3)
+	      int flags, struct smb3_fs_context *old_ctx)
 {
 	int rc;
 	struct super_block *sb;
-	struct cifs_sb_info *cifs_sb;
-	struct smb3_fs_context *ctx;
+	struct cifs_sb_info *cifs_sb = NULL;
 	struct cifs_mnt_data mnt_data;
 	struct dentry *root;
 
@@ -808,42 +809,49 @@ cifs_smb3_do_mount(struct file_system_type *fs_type,
 	 *	If CIFS_DEBUG && cifs_FYI
 	 */
 	if (cifsFYI)
-		cifs_dbg(FYI, "Devname: %s flags: %d\n", dev_name, flags);
+		cifs_dbg(FYI, "Devname: %s flags: %d\n", old_ctx->UNC, flags);
 	else
-		cifs_info("Attempting to mount %s\n", dev_name);
-
-	ctx = cifs_get_volume_info((char *)data, dev_name, is_smb3);
-	if (IS_ERR(ctx))
-		return ERR_CAST(ctx);
+		cifs_info("Attempting to mount %s\n", old_ctx->UNC);
 
 	cifs_sb = kzalloc(sizeof(struct cifs_sb_info), GFP_KERNEL);
 	if (cifs_sb == NULL) {
 		root = ERR_PTR(-ENOMEM);
-		goto out_nls;
+		goto out;
 	}
 
-	cifs_sb->mountdata = kstrndup(data, PAGE_SIZE, GFP_KERNEL);
-	if (cifs_sb->mountdata == NULL) {
+	cifs_sb->ctx = kzalloc(sizeof(struct smb3_fs_context), GFP_KERNEL);
+	if (!cifs_sb->ctx) {
 		root = ERR_PTR(-ENOMEM);
-		goto out_free;
+		goto out;
 	}
-
-	rc = cifs_setup_cifs_sb(ctx, cifs_sb);
+	rc = smb3_fs_context_dup(cifs_sb->ctx, old_ctx);
 	if (rc) {
 		root = ERR_PTR(rc);
-		goto out_free;
+		goto out;
 	}
 
-	rc = cifs_mount(cifs_sb, ctx);
+	rc = cifs_setup_volume_info(cifs_sb->ctx, NULL, NULL);
+	if (rc) {
+		root = ERR_PTR(rc);
+		goto out;
+	}
+
+	rc = cifs_setup_cifs_sb(cifs_sb);
+	if (rc) {
+		root = ERR_PTR(rc);
+		goto out;
+	}
+
+	rc = cifs_mount(cifs_sb, cifs_sb->ctx);
 	if (rc) {
 		if (!(flags & SB_SILENT))
 			cifs_dbg(VFS, "cifs_mount failed w/return code = %d\n",
 				 rc);
 		root = ERR_PTR(rc);
-		goto out_free;
+		goto out;
 	}
 
-	mnt_data.ctx = ctx;
+	mnt_data.ctx = cifs_sb->ctx;
 	mnt_data.cifs_sb = cifs_sb;
 	mnt_data.flags = flags;
 
@@ -854,12 +862,14 @@ cifs_smb3_do_mount(struct file_system_type *fs_type,
 	if (IS_ERR(sb)) {
 		root = ERR_CAST(sb);
 		cifs_umount(cifs_sb);
+		cifs_sb = NULL;
 		goto out;
 	}
 
 	if (sb->s_root) {
 		cifs_dbg(FYI, "Use existing superblock\n");
 		cifs_umount(cifs_sb);
+		cifs_sb = NULL;
 	} else {
 		rc = cifs_read_super(sb);
 		if (rc) {
@@ -870,41 +880,24 @@ cifs_smb3_do_mount(struct file_system_type *fs_type,
 		sb->s_flags |= SB_ACTIVE;
 	}
 
-	root = cifs_get_root(ctx, sb);
+	root = cifs_get_root(cifs_sb ? cifs_sb->ctx : old_ctx, sb);
 	if (IS_ERR(root))
 		goto out_super;
 
 	cifs_dbg(FYI, "dentry root is: %p\n", root);
-	goto out;
+	return root;
 
 out_super:
 	deactivate_locked_super(sb);
 out:
-	cifs_cleanup_volume_info(ctx);
+	if (cifs_sb) {
+		kfree(cifs_sb->prepath);
+		smb3_cleanup_fs_context(cifs_sb->ctx);
+		kfree(cifs_sb);
+	}
 	return root;
-
-out_free:
-	kfree(cifs_sb->prepath);
-	kfree(cifs_sb->mountdata);
-	kfree(cifs_sb);
-out_nls:
-	unload_nls(ctx->local_nls);
-	goto out;
 }
 
-static struct dentry *
-smb3_do_mount(struct file_system_type *fs_type,
-	      int flags, const char *dev_name, void *data)
-{
-	return cifs_smb3_do_mount(fs_type, flags, dev_name, data, true);
-}
-
-static struct dentry *
-cifs_do_mount(struct file_system_type *fs_type,
-	      int flags, const char *dev_name, void *data)
-{
-	return cifs_smb3_do_mount(fs_type, flags, dev_name, data, false);
-}
 
 static ssize_t
 cifs_loose_read_iter(struct kiocb *iocb, struct iov_iter *iter)
@@ -1041,7 +1034,8 @@ cifs_setlease(struct file *file, long arg, struct file_lock **lease, void **priv
 struct file_system_type cifs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "cifs",
-	.mount = cifs_do_mount,
+	.init_fs_context = smb3_init_fs_context,
+	.parameters = smb3_fs_parameters,
 	.kill_sb = cifs_kill_sb,
 	.fs_flags = FS_RENAME_DOES_D_MOVE,
 };
@@ -1050,7 +1044,8 @@ MODULE_ALIAS_FS("cifs");
 static struct file_system_type smb3_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "smb3",
-	.mount = smb3_do_mount,
+	.init_fs_context = smb3_init_fs_context,
+	.parameters = smb3_fs_parameters,
 	.kill_sb = cifs_kill_sb,
 	.fs_flags = FS_RENAME_DOES_D_MOVE,
 };

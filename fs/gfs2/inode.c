@@ -611,7 +611,7 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	struct inode *inode = NULL;
 	struct gfs2_inode *dip = GFS2_I(dir), *ip;
 	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
-	struct gfs2_glock *io_gl = NULL;
+	struct gfs2_glock *io_gl;
 	int error, free_vfs_inode = 1;
 	u32 aflags = 0;
 	unsigned blocks = 1;
@@ -752,8 +752,6 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	init_dinode(dip, ip, symname);
 	gfs2_trans_end(sdp);
 
-	BUG_ON(test_and_set_bit(GLF_INODE_CREATING, &io_gl->gl_flags));
-
 	error = gfs2_glock_nq_init(io_gl, LM_ST_SHARED, GL_EXACT, &ip->i_iopen_gh);
 	if (error)
 		goto fail_gunlock2;
@@ -799,7 +797,6 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	gfs2_glock_dq_uninit(ghs);
 	gfs2_qa_put(ip);
 	gfs2_glock_dq_uninit(ghs + 1);
-	clear_bit(GLF_INODE_CREATING, &io_gl->gl_flags);
 	gfs2_glock_put(io_gl);
 	gfs2_qa_put(dip);
 	return error;
@@ -808,7 +805,6 @@ fail_gunlock3:
 	glock_clear_object(io_gl, ip);
 	gfs2_glock_dq_uninit(&ip->i_iopen_gh);
 fail_gunlock2:
-	clear_bit(GLF_INODE_CREATING, &io_gl->gl_flags);
 	glock_clear_object(io_gl, ip);
 	gfs2_glock_put(io_gl);
 fail_free_inode:
@@ -1153,7 +1149,7 @@ static int gfs2_unlink(struct inode *dir, struct dentry *dentry)
 	if (!rgd)
 		goto out_inodes;
 
-	gfs2_holder_init(rgd->rd_gl, LM_ST_EXCLUSIVE, 0, ghs + 2);
+	gfs2_holder_init(rgd->rd_gl, LM_ST_EXCLUSIVE, LM_FLAG_NODE_SCOPE, ghs + 2);
 
 
 	error = gfs2_glock_nq(ghs); /* parent */
@@ -1459,8 +1455,8 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 			error = -ENOENT;
 			goto out_gunlock;
 		}
-		error = gfs2_glock_nq_init(nrgd->rd_gl, LM_ST_EXCLUSIVE, 0,
-					   &rd_gh);
+		error = gfs2_glock_nq_init(nrgd->rd_gl, LM_ST_EXCLUSIVE,
+					   LM_FLAG_NODE_SCOPE, &rd_gh);
 		if (error)
 			goto out_gunlock;
 	}
@@ -1884,7 +1880,7 @@ static int __gfs2_setattr_simple(struct inode *inode, struct iattr *attr)
  * Returns: errno
  */
 
-int gfs2_setattr_simple(struct inode *inode, struct iattr *attr)
+static int gfs2_setattr_simple(struct inode *inode, struct iattr *attr)
 {
 	int error;
 

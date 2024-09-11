@@ -705,18 +705,15 @@ struct phy_driver {
 	/* Determines the negotiated speed and duplex */
 	int (*read_status)(struct phy_device *phydev);
 
-	/* Clears any pending interrupts */
-	int (*ack_interrupt)(struct phy_device *phydev);
+	RH_KABI_DEPRECATE_FN(int, ack_interrupt, struct phy_device *phydev)
 
-	/* Enables or disables interrupts */
+	/** @config_intr: Enables or disables interrupts.
+	 * It should also clear any pending interrupts prior to enabling the
+	 * IRQs and after disabling them.
+	 */
 	int (*config_intr)(struct phy_device *phydev);
 
-	/*
-	 * Checks if the PHY generated an interrupt.
-	 * For multi-PHY devices with shared PHY interrupt pin
-	 * Set interrupt bits have to be cleared.
-	 */
-	int (*did_interrupt)(struct phy_device *phydev);
+	RH_KABI_DEPRECATE_FN(int, did_interrupt, struct phy_device *phydev)
 
 	/* Clears up any memory if needed */
 	void (*remove)(struct phy_device *phydev);
@@ -1447,10 +1444,6 @@ static inline int genphy_config_aneg(struct phy_device *phydev)
 	return __genphy_config_aneg(phydev, false);
 }
 
-static inline int genphy_no_ack_interrupt(struct phy_device *phydev)
-{
-	return 0;
-}
 static inline int genphy_no_config_intr(struct phy_device *phydev)
 {
 	return 0;
@@ -1509,8 +1502,10 @@ int phy_driver_register(struct phy_driver *new_driver, struct module *owner);
 RH_KABI_FORCE_CHANGE(5)
 int phy_drivers_register(struct phy_driver *new_driver, int n,
 			 struct module *owner);
+void phy_error(struct phy_device *phydev);
 void phy_state_machine(struct work_struct *work);
 void phy_queue_state_machine(struct phy_device *phydev, unsigned long jiffies);
+void phy_trigger_machine(struct phy_device *phydev);
 void phy_mac_interrupt(struct phy_device *phydev);
 void phy_start_machine(struct phy_device *phydev);
 void phy_stop_machine(struct phy_device *phydev);
@@ -1536,6 +1531,10 @@ void phy_set_asym_pause(struct phy_device *phydev, bool rx, bool tx);
 bool phy_validate_pause(struct phy_device *phydev,
 			struct ethtool_pauseparam *pp);
 void phy_get_pause(struct phy_device *phydev, bool *tx_pause, bool *rx_pause);
+
+s32 phy_get_internal_delay(struct phy_device *phydev, struct device *dev,
+			   const int *delay_values, int size, bool is_rx);
+
 void phy_resolve_pause(unsigned long *local_adv, unsigned long *partner_adv,
 		       bool *tx_pause, bool *rx_pause);
 

@@ -376,7 +376,6 @@ extern int rtas_set_indicator_fast(int indicator, int index, int new_value);
 extern void rtas_progress(char *s, unsigned short hex);
 extern int rtas_suspend_cpu(struct rtas_suspend_me_data *data);
 extern int rtas_suspend_last_cpu(struct rtas_suspend_me_data *data);
-int rtas_ibm_suspend_me_unsafe(u64 handle);
 int rtas_ibm_suspend_me(int *fw_status);
 
 struct rtc_time;
@@ -397,8 +396,13 @@ extern time64_t last_rtas_event;
 extern int clobbering_unread_rtas_event(void);
 extern int pseries_devicetree_update(s32 scope);
 extern void post_mobility_fixup(void);
+int rtas_syscall_dispatch_ibm_suspend_me(u64 handle);
 #else
 static inline int clobbering_unread_rtas_event(void) { return 0; }
+static inline int rtas_syscall_dispatch_ibm_suspend_me(u64 handle)
+{
+	return -EINVAL;
+}
 #endif
 
 #ifdef CONFIG_PPC_RTAS_DAEMON

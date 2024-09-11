@@ -278,6 +278,26 @@ struct qeth_hdr {
 	} hdr;
 } __attribute__ ((packed));
 
+#define QETH_QIB_PQUE_ORDER_RR		0
+#define QETH_QIB_PQUE_UNITS_SBAL	2
+#define QETH_QIB_PQUE_PRIO_DEFAULT	4
+
+struct qeth_qib_parms {
+	char pcit_magic[4];
+	u32 pcit_a;
+	u32 pcit_b;
+	u32 pcit_c;
+	char blkt_magic[4];
+	u32 blkt_total;
+	u32 blkt_inter_packet;
+	u32 blkt_inter_packet_jumbo;
+	char pque_magic[4];
+	u8 pque_order;
+	u8 pque_units;
+	u16 reserved;
+	u32 pque_priority[4];
+};
+
 /*TCP Segmentation Offload header*/
 struct qeth_hdr_ext_tso {
 	__u16 hdr_tot_len;
@@ -417,6 +437,7 @@ struct qeth_qdio_out_buffer {
 
 	struct qeth_qdio_out_q *q;
 	struct list_head list_entry;
+	struct qaob *aob;
 };
 
 struct qeth_card;
@@ -479,10 +500,10 @@ struct qeth_out_q_stats {
 struct qeth_qdio_out_q {
 	struct qdio_buffer *qdio_bufs[QDIO_MAX_BUFFERS_PER_Q];
 	struct qeth_qdio_out_buffer *bufs[QDIO_MAX_BUFFERS_PER_Q];
-	struct qdio_outbuf_state *bufstates; /* convenience pointer */
 	struct list_head pending_bufs;
 	struct qeth_out_q_stats stats;
 	spinlock_t lock;
+	unsigned int priority;
 	u8 next_buf_to_fill;
 	u8 max_elements;
 	u8 queue_no;
@@ -540,9 +561,8 @@ struct qeth_qdio_info {
 	int in_buf_size;
 
 	/* output */
-	int no_out_queues;
+	unsigned int no_out_queues;
 	struct qeth_qdio_out_q *out_qs[QETH_MAX_OUT_QUEUES];
-	struct qdio_outbuf_state *out_bufstates;
 
 	/* priority queueing */
 	int do_prio_queueing;
@@ -682,10 +702,17 @@ enum qeth_pnso_mode {
 	QETH_PNSO_ADDR_INFO,
 };
 
+enum qeth_link_mode {
+	QETH_LINK_MODE_UNKNOWN,
+	QETH_LINK_MODE_FIBRE_SHORT,
+	QETH_LINK_MODE_FIBRE_LONG,
+};
+
 struct qeth_link_info {
 	u32 speed;
 	u8 duplex;
 	u8 port;
+	enum qeth_link_mode link_mode;
 };
 
 #define QETH_BROADCAST_WITH_ECHO    0x01
@@ -791,6 +818,7 @@ struct qeth_switch_info {
 
 struct qeth_priv {
 	unsigned int rx_copybreak;
+	unsigned int tx_wanted_queues;
 	u32 brport_hw_features;
 	u32 brport_features;
 };
@@ -839,7 +867,7 @@ struct qeth_card {
 	struct qeth_qdio_info qdio;
 	int read_or_write_problem;
 	struct qeth_osn_info osn_info;
-	struct qeth_discipline *discipline;
+	const struct qeth_discipline *discipline;
 	atomic_t force_alloc_skb;
 	struct service_level qeth_service_level;
 	struct qdio_ssqd_desc ssqd;
@@ -873,8 +901,20 @@ struct qeth_trap_id {
 	__u16 devno;
 } __packed;
 
-/*some helper functions*/
-#define QETH_CARD_IFNAME(card) (((card)->dev)? (card)->dev->name : "")
+static inline bool qeth_uses_tx_prio_queueing(struct qeth_card *card)
+{
+	return card->qdio.do_prio_queueing != QETH_NO_PRIO_QUEUEING;
+}
+
+static inline unsigned int qeth_tx_actual_queues(struct qeth_card *card)
+{
+	struct qeth_priv *priv = netdev_priv(card->dev);
+
+	if (qeth_uses_tx_prio_queueing(card))
+		return min(card->dev->num_tx_queues, card->qdio.no_out_queues);
+
+	return min(priv->tx_wanted_queues, card->qdio.no_out_queues);
+}
 
 static inline u16 qeth_iqd_translate_txq(struct net_device *dev, u16 txq)
 {
@@ -1005,20 +1045,18 @@ static inline int qeth_send_simple_setassparms_v6(struct qeth_card *card,
 
 int qeth_get_priority_queue(struct qeth_card *card, struct sk_buff *skb);
 
-extern struct qeth_discipline qeth_l2_discipline;
-extern struct qeth_discipline qeth_l3_discipline;
+extern const struct qeth_discipline qeth_l2_discipline;
+extern const struct qeth_discipline qeth_l3_discipline;
 extern const struct ethtool_ops qeth_ethtool_ops;
 extern const struct ethtool_ops qeth_osn_ethtool_ops;
-extern const struct attribute_group *qeth_generic_attr_groups[];
-extern const struct attribute_group *qeth_osn_attr_groups[];
-extern const struct attribute_group qeth_device_attr_group;
-extern const struct attribute_group qeth_device_blkt_group;
+extern const struct attribute_group *qeth_dev_groups[];
+extern const struct attribute_group *qeth_osn_dev_groups[];
 extern const struct device_type qeth_generic_devtype;
 
 const char *qeth_get_cardname_short(struct qeth_card *);
 int qeth_resize_buffer_pool(struct qeth_card *card, unsigned int count);
-int qeth_core_load_discipline(struct qeth_card *, enum qeth_discipline_id);
-void qeth_core_free_discipline(struct qeth_card *);
+int qeth_setup_discipline(struct qeth_card *card, enum qeth_discipline_id disc);
+void qeth_remove_discipline(struct qeth_card *card);
 
 /* exports for qeth discipline device drivers */
 extern struct kmem_cache *qeth_core_header_cache;
@@ -1029,7 +1067,8 @@ struct qeth_card *qeth_get_card_by_busid(char *bus_id);
 void qeth_set_allowed_threads(struct qeth_card *card, unsigned long threads,
 			      int clear_start_mask);
 int qeth_threads_running(struct qeth_card *, unsigned long);
-int qeth_set_offline(struct qeth_card *card, bool resetting);
+int qeth_set_offline(struct qeth_card *card, const struct qeth_discipline *disc,
+		     bool resetting);
 
 int qeth_send_ipa_cmd(struct qeth_card *, struct qeth_cmd_buffer *,
 		  int (*reply_cb)
@@ -1079,7 +1118,6 @@ void qeth_dbf_longtext(debug_info_t *id, int level, char *text, ...);
 int qeth_configure_cq(struct qeth_card *, enum qeth_cq);
 int qeth_hw_trap(struct qeth_card *, enum qeth_diags_trap_action);
 int qeth_setassparms_cb(struct qeth_card *, struct qeth_reply *, unsigned long);
-int qeth_setup_netdev(struct qeth_card *card);
 int qeth_set_features(struct net_device *, netdev_features_t);
 void qeth_enable_hw_features(struct net_device *dev);
 netdev_features_t qeth_fix_features(struct net_device *, netdev_features_t);

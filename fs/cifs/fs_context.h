@@ -9,8 +9,16 @@
 #ifndef _FS_CONTEXT_H
 #define _FS_CONTEXT_H
 
-#include <linux/parser.h>
 #include "cifsglob.h"
+#include <linux/parser.h>
+#include <linux/fs_parser.h>
+
+/* Log errors in fs_context (new mount api) but also in dmesg (old style) */
+#define cifs_errorf(fc, fmt, ...)			\
+	do {						\
+		errorf(fc, fmt, ## __VA_ARGS__);	\
+		cifs_dbg(VFS, fmt, ## __VA_ARGS__);	\
+	} while (0)
 
 enum smb_version {
 	Smb_1 = 1,
@@ -24,8 +32,6 @@ enum smb_version {
 	Smb_version_err
 };
 
-int cifs_parse_smb_version(char *value, struct smb3_fs_context *ctx, bool is_smb3);
-
 enum {
 	Opt_cache_loose,
 	Opt_cache_strict,
@@ -34,8 +40,6 @@ enum {
 	Opt_cache_rw,
 	Opt_cache_err
 };
-
-int cifs_parse_cache_flavor(char *value, struct smb3_fs_context *ctx);
 
 enum cifs_sec_param {
 	Opt_sec_krb5,
@@ -55,36 +59,36 @@ enum cifs_sec_param {
 
 enum cifs_param {
 	/* Mount options that take no arguments */
-	Opt_user_xattr, Opt_nouser_xattr,
-	Opt_forceuid, Opt_noforceuid,
-	Opt_forcegid, Opt_noforcegid,
+	Opt_user_xattr,
+	Opt_forceuid,
+	Opt_forcegid,
 	Opt_noblocksend,
 	Opt_noautotune,
 	Opt_nolease,
-	Opt_hard, Opt_nohard,
-	Opt_soft, Opt_nosoft,
-	Opt_perm, Opt_noperm,
+	Opt_hard,
+	Opt_soft,
+	Opt_perm,
 	Opt_nodelete,
-	Opt_mapposix, Opt_nomapposix,
+	Opt_mapposix,
 	Opt_mapchars,
 	Opt_nomapchars,
-	Opt_sfu, Opt_nosfu,
+	Opt_sfu,
 	Opt_nodfs,
-	Opt_posixpaths, Opt_noposixpaths,
-	Opt_unix, Opt_nounix,
+	Opt_posixpaths,
+	Opt_unix,
 	Opt_nocase,
-	Opt_brl, Opt_nobrl,
-	Opt_handlecache, Opt_nohandlecache,
+	Opt_brl,
+	Opt_handlecache,
 	Opt_forcemandatorylock,
 	Opt_setuidfromacl,
-	Opt_setuids, Opt_nosetuids,
-	Opt_dynperm, Opt_nodynperm,
-	Opt_intr, Opt_nointr,
-	Opt_strictsync, Opt_nostrictsync,
-	Opt_serverino, Opt_noserverino,
+	Opt_setuids,
+	Opt_dynperm,
+	Opt_intr,
+	Opt_strictsync,
+	Opt_serverino,
 	Opt_rwpidforward,
-	Opt_cifsacl, Opt_nocifsacl,
-	Opt_acl, Opt_noacl,
+	Opt_cifsacl,
+	Opt_acl,
 	Opt_locallease,
 	Opt_sign,
 	Opt_ignore_signature,
@@ -95,13 +99,13 @@ enum cifs_param {
 	Opt_multiuser,
 	Opt_sloppy,
 	Opt_nosharesock,
-	Opt_persistent, Opt_nopersistent,
-	Opt_resilient, Opt_noresilient,
+	Opt_persistent,
+	Opt_resilient,
 	Opt_domainauto,
 	Opt_rdma,
 	Opt_modesid,
 	Opt_rootfs,
-	Opt_multichannel, Opt_nomultichannel,
+	Opt_multichannel,
 	Opt_compress,
 
 	/* Mount options which take numeric value */
@@ -118,6 +122,8 @@ enum cifs_param {
 	Opt_rsize,
 	Opt_wsize,
 	Opt_actimeo,
+	Opt_acdirmax,
+	Opt_acregmax,
 	Opt_echo_interval,
 	Opt_max_credits,
 	Opt_snapshot,
@@ -142,11 +148,6 @@ enum cifs_param {
 	/* Mount options to be ignored */
 	Opt_ignore,
 
-	/* Options which could be blank */
-	Opt_blank_pass,
-	Opt_blank_user,
-	Opt_blank_ip,
-
 	Opt_err
 };
 
@@ -154,15 +155,19 @@ struct smb3_fs_context {
 	bool uid_specified;
 	bool gid_specified;
 	bool sloppy;
-	char *nodename;
 	bool got_ip;
 	bool got_version;
+	bool got_rsize;
+	bool got_wsize;
+	bool got_bsize;
 	unsigned short port;
 
 	char *username;
 	char *password;
 	char *domainname;
+	char *source;
 	char *UNC;
+	char *nodename;
 	char *iocharset;  /* local code page for mapping to and from Unicode */
 	char source_rfc1001_name[RFC1001_NAME_LEN_WITH_NULL]; /* clnt nb name */
 	char target_rfc1001_name[RFC1001_NAME_LEN_WITH_NULL]; /* srvr nb name */
@@ -233,13 +238,15 @@ struct smb3_fs_context {
 	unsigned int wsize;
 	unsigned int min_offload;
 	bool sockopt_tcp_nodelay:1;
-	unsigned long actimeo; /* attribute cache timeout (jiffies) */
+	/* attribute cache timemout for files and directories in jiffies */
+	unsigned long acregmax;
+	unsigned long acdirmax;
 	struct smb_version_operations *ops;
 	struct smb_version_values *vals;
 	char *prepath;
 	struct sockaddr_storage dstaddr; /* destination address */
 	struct sockaddr_storage srcaddr; /* allow binding to a local IP */
-	struct nls_table *local_nls;
+	struct nls_table *local_nls; /* This is a copy of the pointer in cifs_sb */
 	unsigned int echo_interval; /* echo interval in secs */
 	__u64 snapshot_time; /* needed for timewarp tokens */
 	__u32 handle_timeout; /* persistent and durable handle timeout in ms */
@@ -247,9 +254,22 @@ struct smb3_fs_context {
 	unsigned int max_channels;
 	__u16 compression; /* compression algorithm 0xFFFF default 0=disabled */
 	bool rootfs:1; /* if it's a SMB root file system */
+
+	char *mount_options;
 };
 
-extern int cifs_parse_security_flavors(char *value, struct smb3_fs_context *ctx);
+extern const struct fs_parameter_spec smb3_fs_parameters[];
+
+extern int smb3_init_fs_context(struct fs_context *fc);
+extern void smb3_cleanup_fs_context_contents(struct smb3_fs_context *ctx);
+extern void smb3_cleanup_fs_context(struct smb3_fs_context *ctx);
+
+static inline struct smb3_fs_context *smb3_fc2context(const struct fs_context *fc)
+{
+	return fc->fs_private;
+}
+
 extern int smb3_fs_context_dup(struct smb3_fs_context *new_ctx, struct smb3_fs_context *ctx);
+extern void smb3_update_mnt_flags(struct cifs_sb_info *cifs_sb);
 
 #endif

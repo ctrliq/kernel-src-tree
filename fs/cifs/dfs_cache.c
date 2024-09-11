@@ -17,9 +17,9 @@
 #include "cifs_debug.h"
 #include "cifs_unicode.h"
 #include "smb2glob.h"
+#include "fs_context.h"
 
 #include "dfs_cache.h"
-#include "fs_context.h"
 
 #define CACHE_HTABLE_SIZE 32
 #define CACHE_MAX_ENTRIES 64
@@ -586,7 +586,7 @@ static void __vol_release(struct vol_info *vi)
 {
 	kfree(vi->fullpath);
 	kfree(vi->mntdata);
-	cifs_cleanup_volume_info_contents(&vi->ctx);
+	smb3_cleanup_fs_context_contents(&vi->ctx);
 	kfree(vi);
 }
 
@@ -1141,14 +1141,14 @@ out_unlock:
 }
 
 /**
- * dfs_cache_add_vol - add a cifs volume during mount() that will be handled by
+ * dfs_cache_add_vol - add a cifs context during mount() that will be handled by
  * DFS cache refresh worker.
  *
  * @mntdata: mount data.
  * @ctx: cifs context.
  * @fullpath: origin full path.
  *
- * Return zero if volume was set up correctly, otherwise non-zero.
+ * Return zero if context was set up correctly, otherwise non-zero.
  */
 int dfs_cache_add_vol(char *mntdata, struct smb3_fs_context *ctx, const char *fullpath)
 {
@@ -1452,8 +1452,7 @@ static struct cifs_ses *find_root_ses(struct vol_info *vi,
 		goto out;
 	}
 
-	rc = cifs_setup_volume_info(&ctx, mdata, devname, false);
-	kfree(devname);
+	rc = cifs_setup_volume_info(&ctx, NULL, devname);
 
 	if (rc) {
 		ses = ERR_PTR(rc);
@@ -1469,9 +1468,10 @@ static struct cifs_ses *find_root_ses(struct vol_info *vi,
 	ses = cifs_get_smb_ses(server, &ctx);
 
 out:
-	cifs_cleanup_volume_info_contents(&ctx);
+	smb3_cleanup_fs_context_contents(&ctx);
 	kfree(mdata);
 	kfree(rpath);
+	kfree(devname);
 
 	return ses;
 }

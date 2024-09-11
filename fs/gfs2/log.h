@@ -16,6 +16,13 @@
 #include "incore.h"
 #include "inode.h"
 
+/*
+ * The minimum amount of log space required for a log flush is one block for
+ * revokes and one block for the log header.  Log flushes other than
+ * GFS2_LOG_HEAD_FLUSH_NORMAL may write one or two more log headers.
+ */
+#define GFS2_LOG_FLUSH_MIN_BLOCKS 4
+
 /**
  * gfs2_log_lock - acquire the right to mess with the log manager
  * @sdp: the filesystem
@@ -46,7 +53,9 @@ static inline void gfs2_log_pointers_init(struct gfs2_sbd *sdp,
 	if (++value == sdp->sd_jdesc->jd_blocks) {
 		value = 0;
 	}
-	sdp->sd_log_head = sdp->sd_log_tail = value;
+	sdp->sd_log_tail = value;
+	sdp->sd_log_flush_tail = value;
+	sdp->sd_log_head = value;
 }
 
 static inline void gfs2_ordered_add_inode(struct gfs2_inode *ip)
@@ -63,13 +72,17 @@ static inline void gfs2_ordered_add_inode(struct gfs2_inode *ip)
 		spin_unlock(&sdp->sd_ordered_lock);
 	}
 }
-extern void gfs2_ordered_del_inode(struct gfs2_inode *ip);
-extern unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct,
-			    unsigned int ssize);
 
+extern void gfs2_ordered_del_inode(struct gfs2_inode *ip);
+extern unsigned int gfs2_struct2blk(struct gfs2_sbd *sdp, unsigned int nstruct);
 extern void gfs2_remove_from_ail(struct gfs2_bufdata *bd);
+extern bool gfs2_log_is_empty(struct gfs2_sbd *sdp);
+extern void gfs2_log_release_revokes(struct gfs2_sbd *sdp, unsigned int revokes);
 extern void gfs2_log_release(struct gfs2_sbd *sdp, unsigned int blks);
-extern int gfs2_log_reserve(struct gfs2_sbd *sdp, unsigned int blks);
+extern bool gfs2_log_try_reserve(struct gfs2_sbd *sdp, struct gfs2_trans *tr,
+				 unsigned int *extra_revokes);
+extern void gfs2_log_reserve(struct gfs2_sbd *sdp, struct gfs2_trans *tr,
+			     unsigned int *extra_revokes);
 extern void gfs2_write_log_header(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd,
 				  u64 seq, u32 tail, u32 lblock, u32 flags,
 				  int op_flags);

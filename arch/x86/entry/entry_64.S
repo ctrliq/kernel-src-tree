@@ -1216,6 +1216,10 @@ idtentry xendebug		do_debug		has_error_code=0
 idtentry xenint3		do_int3			has_error_code=0
 #endif
 
+#if IS_ENABLED(CONFIG_KVM_INTEL)
+idtentry nmi_noist		do_nmi			has_error_code=0
+#endif
+
 idtentry general_protection	do_general_protection	has_error_code=1
 idtentry page_fault		do_page_fault		has_error_code=1
 

@@ -61,12 +61,9 @@ struct cifs_sb_info {
 	spinlock_t tlink_tree_lock;
 	struct tcon_link *master_tlink;
 	struct nls_table *local_nls;
-	unsigned int bsize;
-	unsigned int rsize;
-	unsigned int wsize;
+	struct smb3_fs_context *ctx;
 	atomic_t active;
 	unsigned int mnt_cifs_flags;
-	char   *mountdata; /* options received at mount time or via DFS refs */
 	struct delayed_work prune_tlinks;
 	struct rcu_head rcu;
 
