@@ -1,0 +1,257 @@
+mm/highmem: Provide CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 0e91a0c6984c837a7c6760e3f28e8e1c532abf87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/0e91a0c6.failed
+
+CONFIG_DEBUG_KMAP_LOCAL, which is selected by CONFIG_DEBUG_HIGHMEM is only
+providing guard pages, but does not provide a mechanism to enforce the
+usage of the kmap_local() infrastructure.
+
+Provide CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP which forces the temporary
+mapping even for lowmem pages. This needs to be a seperate config switch
+because this only works on architectures which do not have cache aliasing
+problems.
+
+	Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20201118204007.028261233@linutronix.de
+
+(cherry picked from commit 0e91a0c6984c837a7c6760e3f28e8e1c532abf87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/Kconfig.debug
+#	mm/highmem.c
+diff --cc lib/Kconfig.debug
+index a156b0b9204f,e952f892f047..000000000000
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@@ -744,9 -849,31 +744,37 @@@ config DEBUG_PER_CPU_MAP
+  
+  	  Say N if unsure.
+  
+++<<<<<<< HEAD
+ +config DEBUG_HIGHMEM
+ +	bool "Highmem debugging"
+ +	depends on DEBUG_KERNEL && HIGHMEM
+++=======
++ config DEBUG_KMAP_LOCAL
++ 	bool "Debug kmap_local temporary mappings"
++ 	depends on DEBUG_KERNEL && KMAP_LOCAL
++ 	help
++ 	  This option enables additional error checking for the kmap_local
++ 	  infrastructure.  Disable for production use.
++ 
++ config ARCH_SUPPORTS_KMAP_LOCAL_FORCE_MAP
++ 	bool
++ 
++ config DEBUG_KMAP_LOCAL_FORCE_MAP
++ 	bool "Enforce kmap_local temporary mappings"
++ 	depends on DEBUG_KERNEL && ARCH_SUPPORTS_KMAP_LOCAL_FORCE_MAP
++ 	select KMAP_LOCAL
++ 	select DEBUG_KMAP_LOCAL
++ 	help
++ 	  This option enforces temporary mappings through the kmap_local
++ 	  mechanism for non-highmem pages and on non-highmem systems.
++ 	  Disable this for production systems!
++ 
++ config DEBUG_HIGHMEM
++ 	bool "Highmem debugging"
++ 	depends on DEBUG_KERNEL && HIGHMEM
++ 	select DEBUG_KMAP_LOCAL_FORCE_MAP if ARCH_SUPPORTS_KMAP_LOCAL_FORCE_MAP
++ 	select DEBUG_KMAP_LOCAL
+++>>>>>>> 0e91a0c6984c (mm/highmem: Provide CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP)
+  	help
+  	  This option enables additional error checking for high memory
+  	  systems.  Disable for production systems.
+diff --cc mm/highmem.c
+index 51171d0f44c2,39aaca1a1ece..000000000000
+--- a/mm/highmem.c
++++ b/mm/highmem.c
+@@@ -365,8 -358,174 +365,178 @@@ void kunmap_high(struct page *page
+  	if (need_wakeup)
+  		wake_up(pkmap_map_wait);
+  }
+ +
+  EXPORT_SYMBOL(kunmap_high);
+++<<<<<<< HEAD
+++=======
++ #endif /* CONFIG_HIGHMEM */
++ 
++ #ifdef CONFIG_KMAP_LOCAL
++ 
++ #include <asm/kmap_size.h>
++ 
++ static DEFINE_PER_CPU(int, __kmap_local_idx);
++ 
++ /*
++  * With DEBUG_KMAP_LOCAL the stack depth is doubled and every second
++  * slot is unused which acts as a guard page
++  */
++ #ifdef CONFIG_DEBUG_KMAP_LOCAL
++ # define KM_INCR	2
++ #else
++ # define KM_INCR	1
++ #endif
++ 
++ static inline int kmap_local_idx_push(void)
++ {
++ 	int idx = __this_cpu_add_return(__kmap_local_idx, KM_INCR) - 1;
++ 
++ 	WARN_ON_ONCE(in_irq() && !irqs_disabled());
++ 	BUG_ON(idx >= KM_MAX_IDX);
++ 	return idx;
++ }
++ 
++ static inline int kmap_local_idx(void)
++ {
++ 	return __this_cpu_read(__kmap_local_idx) - 1;
++ }
++ 
++ static inline void kmap_local_idx_pop(void)
++ {
++ 	int idx = __this_cpu_sub_return(__kmap_local_idx, KM_INCR);
++ 
++ 	BUG_ON(idx < 0);
++ }
++ 
++ #ifndef arch_kmap_local_post_map
++ # define arch_kmap_local_post_map(vaddr, pteval)	do { } while (0)
++ #endif
++ 
++ #ifndef arch_kmap_local_pre_unmap
++ # define arch_kmap_local_pre_unmap(vaddr)		do { } while (0)
++ #endif
++ 
++ #ifndef arch_kmap_local_post_unmap
++ # define arch_kmap_local_post_unmap(vaddr)		do { } while (0)
++ #endif
++ 
++ #ifndef arch_kmap_local_map_idx
++ #define arch_kmap_local_map_idx(idx, pfn)	kmap_local_calc_idx(idx)
++ #endif
++ 
++ #ifndef arch_kmap_local_unmap_idx
++ #define arch_kmap_local_unmap_idx(idx, vaddr)	kmap_local_calc_idx(idx)
++ #endif
++ 
++ #ifndef arch_kmap_local_high_get
++ static inline void *arch_kmap_local_high_get(struct page *page)
++ {
++ 	return NULL;
++ }
++ #endif
++ 
++ /* Unmap a local mapping which was obtained by kmap_high_get() */
++ static inline bool kmap_high_unmap_local(unsigned long vaddr)
++ {
++ #ifdef ARCH_NEEDS_KMAP_HIGH_GET
++ 	if (vaddr >= PKMAP_ADDR(0) && vaddr < PKMAP_ADDR(LAST_PKMAP)) {
++ 		kunmap_high(pte_page(pkmap_page_table[PKMAP_NR(vaddr)]));
++ 		return true;
++ 	}
++ #endif
++ 	return false;
++ }
++ 
++ static inline int kmap_local_calc_idx(int idx)
++ {
++ 	return idx + KM_MAX_IDX * smp_processor_id();
++ }
++ 
++ static pte_t *__kmap_pte;
++ 
++ static pte_t *kmap_get_pte(void)
++ {
++ 	if (!__kmap_pte)
++ 		__kmap_pte = virt_to_kpte(__fix_to_virt(FIX_KMAP_BEGIN));
++ 	return __kmap_pte;
++ }
++ 
++ void *__kmap_local_pfn_prot(unsigned long pfn, pgprot_t prot)
++ {
++ 	pte_t pteval, *kmap_pte = kmap_get_pte();
++ 	unsigned long vaddr;
++ 	int idx;
++ 
++ 	preempt_disable();
++ 	idx = arch_kmap_local_map_idx(kmap_local_idx_push(), pfn);
++ 	vaddr = __fix_to_virt(FIX_KMAP_BEGIN + idx);
++ 	BUG_ON(!pte_none(*(kmap_pte - idx)));
++ 	pteval = pfn_pte(pfn, prot);
++ 	set_pte_at(&init_mm, vaddr, kmap_pte - idx, pteval);
++ 	arch_kmap_local_post_map(vaddr, pteval);
++ 	preempt_enable();
++ 
++ 	return (void *)vaddr;
++ }
++ EXPORT_SYMBOL_GPL(__kmap_local_pfn_prot);
++ 
++ void *__kmap_local_page_prot(struct page *page, pgprot_t prot)
++ {
++ 	void *kmap;
++ 
++ 	/*
++ 	 * To broaden the usage of the actual kmap_local() machinery always map
++ 	 * pages when debugging is enabled and the architecture has no problems
++ 	 * with alias mappings.
++ 	 */
++ 	if (!IS_ENABLED(CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP) && !PageHighMem(page))
++ 		return page_address(page);
++ 
++ 	/* Try kmap_high_get() if architecture has it enabled */
++ 	kmap = arch_kmap_local_high_get(page);
++ 	if (kmap)
++ 		return kmap;
++ 
++ 	return __kmap_local_pfn_prot(page_to_pfn(page), prot);
++ }
++ EXPORT_SYMBOL(__kmap_local_page_prot);
++ 
++ void kunmap_local_indexed(void *vaddr)
++ {
++ 	unsigned long addr = (unsigned long) vaddr & PAGE_MASK;
++ 	pte_t *kmap_pte = kmap_get_pte();
++ 	int idx;
++ 
++ 	if (addr < __fix_to_virt(FIX_KMAP_END) ||
++ 	    addr > __fix_to_virt(FIX_KMAP_BEGIN)) {
++ 		if (IS_ENABLED(CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP)) {
++ 			/* This _should_ never happen! See above. */
++ 			WARN_ON_ONCE(1);
++ 			return;
++ 		}
++ 		/*
++ 		 * Handle mappings which were obtained by kmap_high_get()
++ 		 * first as the virtual address of such mappings is below
++ 		 * PAGE_OFFSET. Warn for all other addresses which are in
++ 		 * the user space part of the virtual address space.
++ 		 */
++ 		if (!kmap_high_unmap_local(addr))
++ 			WARN_ON_ONCE(addr < PAGE_OFFSET);
++ 		return;
++ 	}
++ 
++ 	preempt_disable();
++ 	idx = arch_kmap_local_unmap_idx(kmap_local_idx(), addr);
++ 	WARN_ON_ONCE(addr != __fix_to_virt(FIX_KMAP_BEGIN + idx));
++ 
++ 	arch_kmap_local_pre_unmap(addr);
++ 	pte_clear(&init_mm, addr, kmap_pte - idx);
++ 	arch_kmap_local_post_unmap(addr);
++ 	kmap_local_idx_pop();
++ 	preempt_enable();
++ }
++ EXPORT_SYMBOL(kunmap_local_indexed);
+++>>>>>>> 0e91a0c6984c (mm/highmem: Provide CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP)
+  #endif
+  
+  #if defined(HASHED_PAGE_VIRTUAL)
+* Unmerged path lib/Kconfig.debug
+* Unmerged path mm/highmem.c
