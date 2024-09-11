@@ -1,0 +1,331 @@
+mm: memcg/slab: pre-allocate obj_cgroups for slab caches with SLAB_ACCOUNT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 2e9bd483159939ed2c0704b914294653c8341d25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/2e9bd483.failed
+
+In general it's unknown in advance if a slab page will contain accounted
+objects or not.  In order to avoid memory waste, an obj_cgroup vector is
+allocated dynamically when a need to account of a new object arises.  Such
+approach is memory efficient, but requires an expensive cmpxchg() to set
+up the memcg/objcgs pointer, because an allocation can race with a
+different allocation on another cpu.
+
+But in some common cases it's known for sure that a slab page will contain
+accounted objects: if the page belongs to a slab cache with a SLAB_ACCOUNT
+flag set.  It includes such popular objects like vm_area_struct, anon_vma,
+task_struct, etc.
+
+In such cases we can pre-allocate the objcgs vector and simple assign it
+to the page without any atomic operations, because at this early stage the
+page is not visible to anyone else.
+
+A very simplistic benchmark (allocating 10000000 64-bytes objects in a
+row) shows ~15% win.  In the real life it seems that most workloads are
+not very sensitive to the speed of (accounted) slab allocations.
+
+[guro@fb.com: open-code set_page_objcgs() and add some comments, by Johannes]
+  Link: https://lkml.kernel.org/r/20201113001926.GA2934489@carbon.dhcp.thefacebook.com
+[akpm@linux-foundation.org: fix it for mm-slub-call-account_slab_page-after-slab-page-initialization-fix.patch]
+
+Link: https://lkml.kernel.org/r/20201110195753.530157-2-guro@fb.com
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Christoph Lameter <cl@linux.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2e9bd483159939ed2c0704b914294653c8341d25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+#	mm/slab.h
+#	mm/slub.c
+diff --cc include/linux/memcontrol.h
+index da9b4f3ccbfd,7a4dd1cb19fe..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -407,6 -337,156 +407,159 @@@ struct mem_cgroup 
+  
+  extern struct mem_cgroup *root_mem_cgroup;
+  
+++<<<<<<< HEAD
+++=======
++ enum page_memcg_data_flags {
++ 	/* page->memcg_data is a pointer to an objcgs vector */
++ 	MEMCG_DATA_OBJCGS = (1UL << 0),
++ 	/* page has been accounted as a non-slab kernel page */
++ 	MEMCG_DATA_KMEM = (1UL << 1),
++ 	/* the next bit after the last actual flag */
++ 	__NR_MEMCG_DATA_FLAGS  = (1UL << 2),
++ };
++ 
++ #define MEMCG_DATA_FLAGS_MASK (__NR_MEMCG_DATA_FLAGS - 1)
++ 
++ /*
++  * page_memcg - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg(struct page *page)
++ {
++ 	unsigned long memcg_data = page->memcg_data;
++ 
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	VM_BUG_ON_PAGE(memcg_data & MEMCG_DATA_OBJCGS, page);
++ 
++ 	return (struct mem_cgroup *)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * page_memcg_rcu - locklessly get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function assumes that the page is known to have a
++  * proper memory cgroup pointer. It's not safe to call this function
++  * against some type of pages, e.g. slab pages or ex-slab pages.
++  */
++ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(PageSlab(page), page);
++ 	WARN_ON_ONCE(!rcu_read_lock_held());
++ 
++ 	return (struct mem_cgroup *)(READ_ONCE(page->memcg_data) &
++ 				     ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * page_memcg_check - get the memory cgroup associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the memory cgroup associated with the page,
++  * or NULL. This function unlike page_memcg() can take any  page
++  * as an argument. It has to be used in cases when it's not known if a page
++  * has an associated memory cgroup pointer or an object cgroups vector.
++  *
++  * Any of the following ensures page and memcg binding stability:
++  * - the page lock
++  * - LRU isolation
++  * - lock_page_memcg()
++  * - exclusive reference
++  */
++ static inline struct mem_cgroup *page_memcg_check(struct page *page)
++ {
++ 	/*
++ 	 * Because page->memcg_data might be changed asynchronously
++ 	 * for slab pages, READ_ONCE() should be used here.
++ 	 */
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	if (memcg_data & MEMCG_DATA_OBJCGS)
++ 		return NULL;
++ 
++ 	return (struct mem_cgroup *)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * PageMemcgKmem - check if the page has MemcgKmem flag set
++  * @page: a pointer to the page struct
++  *
++  * Checks if the page has MemcgKmem flag set. The caller must ensure that
++  * the page has an associated memory cgroup. It's not safe to call this function
++  * against some types of pages, e.g. slab pages.
++  */
++ static inline bool PageMemcgKmem(struct page *page)
++ {
++ 	VM_BUG_ON_PAGE(page->memcg_data & MEMCG_DATA_OBJCGS, page);
++ 	return page->memcg_data & MEMCG_DATA_KMEM;
++ }
++ 
++ #ifdef CONFIG_MEMCG_KMEM
++ /*
++  * page_objcgs - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function assumes that the page is known to have an
++  * associated object cgroups vector. It's not safe to call this function
++  * against pages, which might have an associated memory cgroup: e.g.
++  * kernel stack pages.
++  */
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	VM_BUG_ON_PAGE(memcg_data && !(memcg_data & MEMCG_DATA_OBJCGS), page);
++ 	VM_BUG_ON_PAGE(memcg_data & MEMCG_DATA_KMEM, page);
++ 
++ 	return (struct obj_cgroup **)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ /*
++  * page_objcgs_check - get the object cgroups vector associated with a page
++  * @page: a pointer to the page struct
++  *
++  * Returns a pointer to the object cgroups vector associated with the page,
++  * or NULL. This function is safe to use if the page can be directly associated
++  * with a memory cgroup.
++  */
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
++ 
++ 	if (!memcg_data || !(memcg_data & MEMCG_DATA_OBJCGS))
++ 		return NULL;
++ 
++ 	VM_BUG_ON_PAGE(memcg_data & MEMCG_DATA_KMEM, page);
++ 
++ 	return (struct obj_cgroup **)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
++ }
++ 
++ #else
++ static inline struct obj_cgroup **page_objcgs(struct page *page)
++ {
++ 	return NULL;
++ }
++ 
++ static inline struct obj_cgroup **page_objcgs_check(struct page *page)
++ {
++ 	return NULL;
++ }
++ #endif
++ 
+++>>>>>>> 2e9bd4831599 (mm: memcg/slab: pre-allocate obj_cgroups for slab caches with SLAB_ACCOUNT)
+  static __always_inline bool memcg_stat_item_in_bytes(int idx)
+  {
+  	if (idx == MEMCG_PERCPU_B)
+diff --cc mm/memcontrol.c
+index 4d65b541b4a3,60ce452e42e6..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2872,12 -2946,25 +2873,30 @@@ int memcg_alloc_page_obj_cgroups(struc
+  	if (!vec)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (cmpxchg(&page->obj_cgroups, NULL,
+ +		    (struct obj_cgroup **) ((unsigned long)vec | 0x1UL)))
+++=======
++ 	memcg_data = (unsigned long) vec | MEMCG_DATA_OBJCGS;
++ 	if (new_page) {
++ 		/*
++ 		 * If the slab page is brand new and nobody can yet access
++ 		 * it's memcg_data, no synchronization is required and
++ 		 * memcg_data can be simply assigned.
++ 		 */
++ 		page->memcg_data = memcg_data;
++ 	} else if (cmpxchg(&page->memcg_data, 0, memcg_data)) {
++ 		/*
++ 		 * If the slab page is already in use, somebody can allocate
++ 		 * and assign obj_cgroups in parallel. In this case the existing
++ 		 * objcg vector should be reused.
++ 		 */
+++>>>>>>> 2e9bd4831599 (mm: memcg/slab: pre-allocate obj_cgroups for slab caches with SLAB_ACCOUNT)
+  		kfree(vec);
+- 	else
+- 		kmemleak_not_leak(vec);
++ 		return 0;
++ 	}
+  
++ 	kmemleak_not_leak(vec);
+  	return 0;
+  }
+  
+diff --cc mm/slab.h
+index 16243c3c4c3c,076582f58f68..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -267,25 -237,8 +267,25 @@@ static inline bool kmem_cache_debug_fla
+  }
+  
+  #ifdef CONFIG_MEMCG_KMEM
+ +static inline struct obj_cgroup **page_obj_cgroups(struct page *page)
+ +{
+ +	/*
+ +	 * page->mem_cgroup and page->obj_cgroups are sharing the same
+ +	 * space. To distinguish between them in case we don't know for sure
+ +	 * that the page is a slab page (e.g. page_cgroup_ino()), let's
+ +	 * always set the lowest bit of obj_cgroups.
+ +	 */
+ +	return (struct obj_cgroup **)
+ +		((unsigned long)page->obj_cgroups & ~0x1UL);
+ +}
+ +
+ +static inline bool page_has_obj_cgroups(struct page *page)
+ +{
+ +	return ((unsigned long)page->obj_cgroups & 0x1UL);
+ +}
+ +
+  int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
+- 				 gfp_t gfp);
++ 				 gfp_t gfp, bool new_page);
+  
+  static inline void memcg_free_page_obj_cgroups(struct page *page)
+  {
+@@@ -361,8 -314,9 +361,14 @@@ static inline void memcg_slab_post_allo
+  		if (likely(p[i])) {
+  			page = virt_to_head_page(p[i]);
+  
+++<<<<<<< HEAD
+ +			if (!page_has_obj_cgroups(page) &&
+ +			    memcg_alloc_page_obj_cgroups(page, s, flags)) {
+++=======
++ 			if (!page_objcgs(page) &&
++ 			    memcg_alloc_page_obj_cgroups(page, s, flags,
++ 							 false)) {
+++>>>>>>> 2e9bd4831599 (mm: memcg/slab: pre-allocate obj_cgroups for slab caches with SLAB_ACCOUNT)
+  				obj_cgroup_uncharge(objcg, obj_full_size(s));
+  				continue;
+  			}
+diff --cc mm/slub.c
+index 307a6d26ac2d,ca566361561e..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -1780,7 -1785,8 +1780,12 @@@ static struct page *allocate_slab(struc
+  
+  	page->objects = oo_objects(oo);
+  
+++<<<<<<< HEAD
+ +	order = compound_order(page);
+++=======
++ 	account_slab_page(page, oo_order(oo), s, flags);
++ 
+++>>>>>>> 2e9bd4831599 (mm: memcg/slab: pre-allocate obj_cgroups for slab caches with SLAB_ACCOUNT)
+  	page->slab_cache = s;
+  	__SetPageSlab(page);
+  	if (page_is_pfmemalloc(page))
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/slab.c b/mm/slab.c
+index 63a44a9a85ed..6d3712a767c3 100644
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -1402,7 +1402,7 @@ static struct page *kmem_getpages(struct kmem_cache *cachep, gfp_t flags,
+ 		return NULL;
+ 	}
+ 
+-	account_slab_page(page, cachep->gfporder, cachep);
++	account_slab_page(page, cachep->gfporder, cachep, flags);
+ 	__SetPageSlab(page);
+ 	/* Record if ALLOC_NO_WATERMARKS was set when allocating the slab */
+ 	if (sk_memalloc_socks() && page_is_pfmemalloc(page))
+* Unmerged path mm/slab.h
+* Unmerged path mm/slub.c
