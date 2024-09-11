@@ -1,0 +1,108 @@
+io_uring: correct O_NONBLOCK check for splice punt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 88357580854aab29d27e1a443575caaedd081612
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/88357580.failed
+
+The splice file punt check uses file->f_mode to check for O_NONBLOCK,
+but it should be checking file->f_flags. This leads to punting even
+for files that have O_NONBLOCK set, which isn't necessary. This equates
+to checking for FMODE_PATH, which will never be set on the fd in
+question.
+
+Fixes: 7d67af2c0134 ("io_uring: add splice(2) support")
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 88357580854aab29d27e1a443575caaedd081612)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,0d1b5d5f1251..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1479,6 -2727,76 +1479,79 @@@ out_free
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int io_splice_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	struct io_splice* sp = &req->splice;
++ 	unsigned int valid_flags = SPLICE_F_FD_IN_FIXED | SPLICE_F_ALL;
++ 	int ret;
++ 
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	sp->file_in = NULL;
++ 	sp->off_in = READ_ONCE(sqe->splice_off_in);
++ 	sp->off_out = READ_ONCE(sqe->off);
++ 	sp->len = READ_ONCE(sqe->len);
++ 	sp->flags = READ_ONCE(sqe->splice_flags);
++ 
++ 	if (unlikely(sp->flags & ~valid_flags))
++ 		return -EINVAL;
++ 
++ 	ret = io_file_get(NULL, req, READ_ONCE(sqe->splice_fd_in), &sp->file_in,
++ 			  (sp->flags & SPLICE_F_FD_IN_FIXED));
++ 	if (ret)
++ 		return ret;
++ 	req->flags |= REQ_F_NEED_CLEANUP;
++ 
++ 	if (!S_ISREG(file_inode(sp->file_in)->i_mode))
++ 		req->work.flags |= IO_WQ_WORK_UNBOUND;
++ 
++ 	return 0;
++ }
++ 
++ static bool io_splice_punt(struct file *file)
++ {
++ 	if (get_pipe_info(file))
++ 		return false;
++ 	if (!io_file_supports_async(file))
++ 		return true;
++ 	return !(file->f_flags & O_NONBLOCK);
++ }
++ 
++ static int io_splice(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct io_splice *sp = &req->splice;
++ 	struct file *in = sp->file_in;
++ 	struct file *out = sp->file_out;
++ 	unsigned int flags = sp->flags & ~SPLICE_F_FD_IN_FIXED;
++ 	loff_t *poff_in, *poff_out;
++ 	long ret;
++ 
++ 	if (force_nonblock) {
++ 		if (io_splice_punt(in) || io_splice_punt(out))
++ 			return -EAGAIN;
++ 		flags |= SPLICE_F_NONBLOCK;
++ 	}
++ 
++ 	poff_in = (sp->off_in == -1) ? NULL : &sp->off_in;
++ 	poff_out = (sp->off_out == -1) ? NULL : &sp->off_out;
++ 	ret = do_splice(in, poff_in, out, poff_out, sp->len, flags);
++ 	if (force_nonblock && ret == -EAGAIN)
++ 		return -EAGAIN;
++ 
++ 	io_put_file(req, in, (sp->flags & SPLICE_F_FD_IN_FIXED));
++ 	req->flags &= ~REQ_F_NEED_CLEANUP;
++ 
++ 	io_cqring_add_event(req, ret);
++ 	if (ret != sp->len)
++ 		req_set_fail_links(req);
++ 	io_put_req(req);
++ 	return 0;
++ }
++ 
+++>>>>>>> 88357580854a (io_uring: correct O_NONBLOCK check for splice punt)
+  /*
+   * IORING_OP_NOP just posts a completion event, nothing else.
+   */
+* Unmerged path fs/io_uring.c
