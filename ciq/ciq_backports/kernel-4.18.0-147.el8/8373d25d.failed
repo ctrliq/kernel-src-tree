@@ -1,0 +1,1327 @@
+KVM: VMX: Add vmx.h to hold VMX definitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 8373d25d25d14fe644feae007c15a5a10cf8e888
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8373d25d.failed
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8373d25d25d14fe644feae007c15a5a10cf8e888)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 461e3698b5ee,6e3da6486471..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -16,49 -16,51 +16,56 @@@
+   *
+   */
+  
+ -#include <linux/frame.h>
+ -#include <linux/highmem.h>
+ -#include <linux/hrtimer.h>
+ -#include <linux/kernel.h>
+ +#include "irq.h"
+ +#include "mmu.h"
+ +#include "cpuid.h"
+ +#include "lapic.h"
+ +
+  #include <linux/kvm_host.h>
+  #include <linux/module.h>
+ -#include <linux/moduleparam.h>
+ -#include <linux/mod_devicetable.h>
+ +#include <linux/kernel.h>
+  #include <linux/mm.h>
+ +#include <linux/highmem.h>
+  #include <linux/sched.h>
+ +#include <linux/sched/smt.h>
+ +#include <linux/moduleparam.h>
+ +#include <linux/mod_devicetable.h>
+ +#include <linux/trace_events.h>
+  #include <linux/slab.h>
+  #include <linux/tboot.h>
+ -#include <linux/trace_events.h>
+ +#include <linux/hrtimer.h>
+ +#include <linux/frame.h>
+ +#include <linux/nospec.h>
+ +#include "kvm_cache_regs.h"
+ +#include "x86.h"
+  
+ -#include <asm/apic.h>
+  #include <asm/asm.h>
+  #include <asm/cpu.h>
+ -#include <asm/debugreg.h>
+ +#include <asm/io.h>
+  #include <asm/desc.h>
+ +#include <asm/vmx.h>
+ +#include <asm/virtext.h>
+ +#include <asm/mce.h>
+  #include <asm/fpu/internal.h>
+ -#include <asm/io.h>
+ -#include <asm/irq_remapping.h>
+ -#include <asm/kexec.h>
+  #include <asm/perf_event.h>
+ -#include <asm/mce.h>
+ +#include <asm/debugreg.h>
+ +#include <asm/kexec.h>
+ +#include <asm/apic.h>
+ +#include <asm/irq_remapping.h>
+  #include <asm/mmu_context.h>
+ -#include <asm/mshyperv.h>
+  #include <asm/spec-ctrl.h>
+ -#include <asm/virtext.h>
+ -#include <asm/vmx.h>
+ +#include <asm/mshyperv.h>
+  
+ -#include "capabilities.h"
+ -#include "cpuid.h"
+ -#include "evmcs.h"
+ -#include "hyperv.h"
+ -#include "irq.h"
+ -#include "kvm_cache_regs.h"
+ -#include "lapic.h"
+ -#include "mmu.h"
+ -#include "pmu.h"
+  #include "trace.h"
+++<<<<<<< HEAD
+ +#include "pmu.h"
+ +#include "vmx_evmcs.h"
+++=======
++ #include "vmcs.h"
++ #include "vmcs12.h"
++ #include "x86.h"
++ #include "vmx.h"
+++>>>>>>> 8373d25d25d1 (KVM: VMX: Add vmx.h to hold VMX definitions)
+  
+  #define __ex(x) __kvm_handle_fault_on_reboot(x)
+  #define __ex_clear(x, reg) \
+@@@ -116,13 -118,9 +123,9 @@@ module_param(nested_early_check, bool, 
+  
+  static u64 __read_mostly host_xss;
+  
+ -bool __read_mostly enable_pml = 1;
+ +static bool __read_mostly enable_pml = 1;
+  module_param_named(pml, enable_pml, bool, S_IRUGO);
+  
+- #define MSR_TYPE_R	1
+- #define MSR_TYPE_W	2
+- #define MSR_TYPE_RW	3
+- 
+  #define MSR_BITMAP_MODE_X2APIC		1
+  #define MSR_BITMAP_MODE_X2APIC_APICV	2
+  
+@@@ -350,749 -342,6 +353,752 @@@ static const struct kernel_param_ops vm
+  };
+  module_param_cb(vmentry_l1d_flush, &vmentry_l1d_flush_ops, NULL, 0644);
+  
+++<<<<<<< HEAD
+ +struct kvm_vmx {
+ +	struct kvm kvm;
+ +
+ +	unsigned int tss_addr;
+ +	bool ept_identity_pagetable_done;
+ +	gpa_t ept_identity_map_addr;
+ +
+ +	enum ept_pointers_status ept_pointers_match;
+ +	spinlock_t ept_pointer_lock;
+ +};
+ +
+ +#define NR_AUTOLOAD_MSRS 8
+ +
+ +struct vmcs_hdr {
+ +	u32 revision_id:31;
+ +	u32 shadow_vmcs:1;
+ +};
+ +
+ +struct vmcs {
+ +	struct vmcs_hdr hdr;
+ +	u32 abort;
+ +	char data[0];
+ +};
+ +
+ +/*
+ + * vmcs_host_state tracks registers that are loaded from the VMCS on VMEXIT
+ + * and whose values change infrequently, but are not constant.  I.e. this is
+ + * used as a write-through cache of the corresponding VMCS fields.
+ + */
+ +struct vmcs_host_state {
+ +	unsigned long cr3;	/* May not match real cr3 */
+ +	unsigned long cr4;	/* May not match real cr4 */
+ +	unsigned long gs_base;
+ +	unsigned long fs_base;
+ +
+ +	u16           fs_sel, gs_sel, ldt_sel;
+ +#ifdef CONFIG_X86_64
+ +	u16           ds_sel, es_sel;
+ +#endif
+ +};
+ +
+ +/*
+ + * Track a VMCS that may be loaded on a certain CPU. If it is (cpu!=-1), also
+ + * remember whether it was VMLAUNCHed, and maintain a linked list of all VMCSs
+ + * loaded on this CPU (so we can clear them if the CPU goes down).
+ + */
+ +struct loaded_vmcs {
+ +	struct vmcs *vmcs;
+ +	struct vmcs *shadow_vmcs;
+ +	int cpu;
+ +	bool launched;
+ +	bool nmi_known_unmasked;
+ +	bool hv_timer_armed;
+ +	/* Support for vnmi-less CPUs */
+ +	int soft_vnmi_blocked;
+ +	ktime_t entry_time;
+ +	s64 vnmi_blocked_time;
+ +	unsigned long *msr_bitmap;
+ +	struct list_head loaded_vmcss_on_cpu_link;
+ +	struct vmcs_host_state host_state;
+ +};
+ +
+ +struct shared_msr_entry {
+ +	unsigned index;
+ +	u64 data;
+ +	u64 mask;
+ +};
+ +
+ +/*
+ + * struct vmcs12 describes the state that our guest hypervisor (L1) keeps for a
+ + * single nested guest (L2), hence the name vmcs12. Any VMX implementation has
+ + * a VMCS structure, and vmcs12 is our emulated VMX's VMCS. This structure is
+ + * stored in guest memory specified by VMPTRLD, but is opaque to the guest,
+ + * which must access it using VMREAD/VMWRITE/VMCLEAR instructions.
+ + * More than one of these structures may exist, if L1 runs multiple L2 guests.
+ + * nested_vmx_run() will use the data here to build the vmcs02: a VMCS for the
+ + * underlying hardware which will be used to run L2.
+ + * This structure is packed to ensure that its layout is identical across
+ + * machines (necessary for live migration).
+ + *
+ + * IMPORTANT: Changing the layout of existing fields in this structure
+ + * will break save/restore compatibility with older kvm releases. When
+ + * adding new fields, either use space in the reserved padding* arrays
+ + * or add the new fields to the end of the structure.
+ + */
+ +typedef u64 natural_width;
+ +struct __packed vmcs12 {
+ +	/* According to the Intel spec, a VMCS region must start with the
+ +	 * following two fields. Then follow implementation-specific data.
+ +	 */
+ +	struct vmcs_hdr hdr;
+ +	u32 abort;
+ +
+ +	u32 launch_state; /* set to 0 by VMCLEAR, to 1 by VMLAUNCH */
+ +	u32 padding[7]; /* room for future expansion */
+ +
+ +	u64 io_bitmap_a;
+ +	u64 io_bitmap_b;
+ +	u64 msr_bitmap;
+ +	u64 vm_exit_msr_store_addr;
+ +	u64 vm_exit_msr_load_addr;
+ +	u64 vm_entry_msr_load_addr;
+ +	u64 tsc_offset;
+ +	u64 virtual_apic_page_addr;
+ +	u64 apic_access_addr;
+ +	u64 posted_intr_desc_addr;
+ +	u64 ept_pointer;
+ +	u64 eoi_exit_bitmap0;
+ +	u64 eoi_exit_bitmap1;
+ +	u64 eoi_exit_bitmap2;
+ +	u64 eoi_exit_bitmap3;
+ +	u64 xss_exit_bitmap;
+ +	u64 guest_physical_address;
+ +	u64 vmcs_link_pointer;
+ +	u64 guest_ia32_debugctl;
+ +	u64 guest_ia32_pat;
+ +	u64 guest_ia32_efer;
+ +	u64 guest_ia32_perf_global_ctrl;
+ +	u64 guest_pdptr0;
+ +	u64 guest_pdptr1;
+ +	u64 guest_pdptr2;
+ +	u64 guest_pdptr3;
+ +	u64 guest_bndcfgs;
+ +	u64 host_ia32_pat;
+ +	u64 host_ia32_efer;
+ +	u64 host_ia32_perf_global_ctrl;
+ +	u64 vmread_bitmap;
+ +	u64 vmwrite_bitmap;
+ +	u64 vm_function_control;
+ +	u64 eptp_list_address;
+ +	u64 pml_address;
+ +	u64 padding64[3]; /* room for future expansion */
+ +	/*
+ +	 * To allow migration of L1 (complete with its L2 guests) between
+ +	 * machines of different natural widths (32 or 64 bit), we cannot have
+ +	 * unsigned long fields with no explict size. We use u64 (aliased
+ +	 * natural_width) instead. Luckily, x86 is little-endian.
+ +	 */
+ +	natural_width cr0_guest_host_mask;
+ +	natural_width cr4_guest_host_mask;
+ +	natural_width cr0_read_shadow;
+ +	natural_width cr4_read_shadow;
+ +	natural_width cr3_target_value0;
+ +	natural_width cr3_target_value1;
+ +	natural_width cr3_target_value2;
+ +	natural_width cr3_target_value3;
+ +	natural_width exit_qualification;
+ +	natural_width guest_linear_address;
+ +	natural_width guest_cr0;
+ +	natural_width guest_cr3;
+ +	natural_width guest_cr4;
+ +	natural_width guest_es_base;
+ +	natural_width guest_cs_base;
+ +	natural_width guest_ss_base;
+ +	natural_width guest_ds_base;
+ +	natural_width guest_fs_base;
+ +	natural_width guest_gs_base;
+ +	natural_width guest_ldtr_base;
+ +	natural_width guest_tr_base;
+ +	natural_width guest_gdtr_base;
+ +	natural_width guest_idtr_base;
+ +	natural_width guest_dr7;
+ +	natural_width guest_rsp;
+ +	natural_width guest_rip;
+ +	natural_width guest_rflags;
+ +	natural_width guest_pending_dbg_exceptions;
+ +	natural_width guest_sysenter_esp;
+ +	natural_width guest_sysenter_eip;
+ +	natural_width host_cr0;
+ +	natural_width host_cr3;
+ +	natural_width host_cr4;
+ +	natural_width host_fs_base;
+ +	natural_width host_gs_base;
+ +	natural_width host_tr_base;
+ +	natural_width host_gdtr_base;
+ +	natural_width host_idtr_base;
+ +	natural_width host_ia32_sysenter_esp;
+ +	natural_width host_ia32_sysenter_eip;
+ +	natural_width host_rsp;
+ +	natural_width host_rip;
+ +	natural_width paddingl[8]; /* room for future expansion */
+ +	u32 pin_based_vm_exec_control;
+ +	u32 cpu_based_vm_exec_control;
+ +	u32 exception_bitmap;
+ +	u32 page_fault_error_code_mask;
+ +	u32 page_fault_error_code_match;
+ +	u32 cr3_target_count;
+ +	u32 vm_exit_controls;
+ +	u32 vm_exit_msr_store_count;
+ +	u32 vm_exit_msr_load_count;
+ +	u32 vm_entry_controls;
+ +	u32 vm_entry_msr_load_count;
+ +	u32 vm_entry_intr_info_field;
+ +	u32 vm_entry_exception_error_code;
+ +	u32 vm_entry_instruction_len;
+ +	u32 tpr_threshold;
+ +	u32 secondary_vm_exec_control;
+ +	u32 vm_instruction_error;
+ +	u32 vm_exit_reason;
+ +	u32 vm_exit_intr_info;
+ +	u32 vm_exit_intr_error_code;
+ +	u32 idt_vectoring_info_field;
+ +	u32 idt_vectoring_error_code;
+ +	u32 vm_exit_instruction_len;
+ +	u32 vmx_instruction_info;
+ +	u32 guest_es_limit;
+ +	u32 guest_cs_limit;
+ +	u32 guest_ss_limit;
+ +	u32 guest_ds_limit;
+ +	u32 guest_fs_limit;
+ +	u32 guest_gs_limit;
+ +	u32 guest_ldtr_limit;
+ +	u32 guest_tr_limit;
+ +	u32 guest_gdtr_limit;
+ +	u32 guest_idtr_limit;
+ +	u32 guest_es_ar_bytes;
+ +	u32 guest_cs_ar_bytes;
+ +	u32 guest_ss_ar_bytes;
+ +	u32 guest_ds_ar_bytes;
+ +	u32 guest_fs_ar_bytes;
+ +	u32 guest_gs_ar_bytes;
+ +	u32 guest_ldtr_ar_bytes;
+ +	u32 guest_tr_ar_bytes;
+ +	u32 guest_interruptibility_info;
+ +	u32 guest_activity_state;
+ +	u32 guest_sysenter_cs;
+ +	u32 host_ia32_sysenter_cs;
+ +	u32 vmx_preemption_timer_value;
+ +	u32 padding32[7]; /* room for future expansion */
+ +	u16 virtual_processor_id;
+ +	u16 posted_intr_nv;
+ +	u16 guest_es_selector;
+ +	u16 guest_cs_selector;
+ +	u16 guest_ss_selector;
+ +	u16 guest_ds_selector;
+ +	u16 guest_fs_selector;
+ +	u16 guest_gs_selector;
+ +	u16 guest_ldtr_selector;
+ +	u16 guest_tr_selector;
+ +	u16 guest_intr_status;
+ +	u16 host_es_selector;
+ +	u16 host_cs_selector;
+ +	u16 host_ss_selector;
+ +	u16 host_ds_selector;
+ +	u16 host_fs_selector;
+ +	u16 host_gs_selector;
+ +	u16 host_tr_selector;
+ +	u16 guest_pml_index;
+ +};
+ +
+ +/*
+ + * For save/restore compatibility, the vmcs12 field offsets must not change.
+ + */
+ +#define CHECK_OFFSET(field, loc)				\
+ +	BUILD_BUG_ON_MSG(offsetof(struct vmcs12, field) != (loc),	\
+ +		"Offset of " #field " in struct vmcs12 has changed.")
+ +
+ +static inline void vmx_check_vmcs12_offsets(void) {
+ +	CHECK_OFFSET(hdr, 0);
+ +	CHECK_OFFSET(abort, 4);
+ +	CHECK_OFFSET(launch_state, 8);
+ +	CHECK_OFFSET(io_bitmap_a, 40);
+ +	CHECK_OFFSET(io_bitmap_b, 48);
+ +	CHECK_OFFSET(msr_bitmap, 56);
+ +	CHECK_OFFSET(vm_exit_msr_store_addr, 64);
+ +	CHECK_OFFSET(vm_exit_msr_load_addr, 72);
+ +	CHECK_OFFSET(vm_entry_msr_load_addr, 80);
+ +	CHECK_OFFSET(tsc_offset, 88);
+ +	CHECK_OFFSET(virtual_apic_page_addr, 96);
+ +	CHECK_OFFSET(apic_access_addr, 104);
+ +	CHECK_OFFSET(posted_intr_desc_addr, 112);
+ +	CHECK_OFFSET(ept_pointer, 120);
+ +	CHECK_OFFSET(eoi_exit_bitmap0, 128);
+ +	CHECK_OFFSET(eoi_exit_bitmap1, 136);
+ +	CHECK_OFFSET(eoi_exit_bitmap2, 144);
+ +	CHECK_OFFSET(eoi_exit_bitmap3, 152);
+ +	CHECK_OFFSET(xss_exit_bitmap, 160);
+ +	CHECK_OFFSET(guest_physical_address, 168);
+ +	CHECK_OFFSET(vmcs_link_pointer, 176);
+ +	CHECK_OFFSET(guest_ia32_debugctl, 184);
+ +	CHECK_OFFSET(guest_ia32_pat, 192);
+ +	CHECK_OFFSET(guest_ia32_efer, 200);
+ +	CHECK_OFFSET(guest_ia32_perf_global_ctrl, 208);
+ +	CHECK_OFFSET(guest_pdptr0, 216);
+ +	CHECK_OFFSET(guest_pdptr1, 224);
+ +	CHECK_OFFSET(guest_pdptr2, 232);
+ +	CHECK_OFFSET(guest_pdptr3, 240);
+ +	CHECK_OFFSET(guest_bndcfgs, 248);
+ +	CHECK_OFFSET(host_ia32_pat, 256);
+ +	CHECK_OFFSET(host_ia32_efer, 264);
+ +	CHECK_OFFSET(host_ia32_perf_global_ctrl, 272);
+ +	CHECK_OFFSET(vmread_bitmap, 280);
+ +	CHECK_OFFSET(vmwrite_bitmap, 288);
+ +	CHECK_OFFSET(vm_function_control, 296);
+ +	CHECK_OFFSET(eptp_list_address, 304);
+ +	CHECK_OFFSET(pml_address, 312);
+ +	CHECK_OFFSET(cr0_guest_host_mask, 344);
+ +	CHECK_OFFSET(cr4_guest_host_mask, 352);
+ +	CHECK_OFFSET(cr0_read_shadow, 360);
+ +	CHECK_OFFSET(cr4_read_shadow, 368);
+ +	CHECK_OFFSET(cr3_target_value0, 376);
+ +	CHECK_OFFSET(cr3_target_value1, 384);
+ +	CHECK_OFFSET(cr3_target_value2, 392);
+ +	CHECK_OFFSET(cr3_target_value3, 400);
+ +	CHECK_OFFSET(exit_qualification, 408);
+ +	CHECK_OFFSET(guest_linear_address, 416);
+ +	CHECK_OFFSET(guest_cr0, 424);
+ +	CHECK_OFFSET(guest_cr3, 432);
+ +	CHECK_OFFSET(guest_cr4, 440);
+ +	CHECK_OFFSET(guest_es_base, 448);
+ +	CHECK_OFFSET(guest_cs_base, 456);
+ +	CHECK_OFFSET(guest_ss_base, 464);
+ +	CHECK_OFFSET(guest_ds_base, 472);
+ +	CHECK_OFFSET(guest_fs_base, 480);
+ +	CHECK_OFFSET(guest_gs_base, 488);
+ +	CHECK_OFFSET(guest_ldtr_base, 496);
+ +	CHECK_OFFSET(guest_tr_base, 504);
+ +	CHECK_OFFSET(guest_gdtr_base, 512);
+ +	CHECK_OFFSET(guest_idtr_base, 520);
+ +	CHECK_OFFSET(guest_dr7, 528);
+ +	CHECK_OFFSET(guest_rsp, 536);
+ +	CHECK_OFFSET(guest_rip, 544);
+ +	CHECK_OFFSET(guest_rflags, 552);
+ +	CHECK_OFFSET(guest_pending_dbg_exceptions, 560);
+ +	CHECK_OFFSET(guest_sysenter_esp, 568);
+ +	CHECK_OFFSET(guest_sysenter_eip, 576);
+ +	CHECK_OFFSET(host_cr0, 584);
+ +	CHECK_OFFSET(host_cr3, 592);
+ +	CHECK_OFFSET(host_cr4, 600);
+ +	CHECK_OFFSET(host_fs_base, 608);
+ +	CHECK_OFFSET(host_gs_base, 616);
+ +	CHECK_OFFSET(host_tr_base, 624);
+ +	CHECK_OFFSET(host_gdtr_base, 632);
+ +	CHECK_OFFSET(host_idtr_base, 640);
+ +	CHECK_OFFSET(host_ia32_sysenter_esp, 648);
+ +	CHECK_OFFSET(host_ia32_sysenter_eip, 656);
+ +	CHECK_OFFSET(host_rsp, 664);
+ +	CHECK_OFFSET(host_rip, 672);
+ +	CHECK_OFFSET(pin_based_vm_exec_control, 744);
+ +	CHECK_OFFSET(cpu_based_vm_exec_control, 748);
+ +	CHECK_OFFSET(exception_bitmap, 752);
+ +	CHECK_OFFSET(page_fault_error_code_mask, 756);
+ +	CHECK_OFFSET(page_fault_error_code_match, 760);
+ +	CHECK_OFFSET(cr3_target_count, 764);
+ +	CHECK_OFFSET(vm_exit_controls, 768);
+ +	CHECK_OFFSET(vm_exit_msr_store_count, 772);
+ +	CHECK_OFFSET(vm_exit_msr_load_count, 776);
+ +	CHECK_OFFSET(vm_entry_controls, 780);
+ +	CHECK_OFFSET(vm_entry_msr_load_count, 784);
+ +	CHECK_OFFSET(vm_entry_intr_info_field, 788);
+ +	CHECK_OFFSET(vm_entry_exception_error_code, 792);
+ +	CHECK_OFFSET(vm_entry_instruction_len, 796);
+ +	CHECK_OFFSET(tpr_threshold, 800);
+ +	CHECK_OFFSET(secondary_vm_exec_control, 804);
+ +	CHECK_OFFSET(vm_instruction_error, 808);
+ +	CHECK_OFFSET(vm_exit_reason, 812);
+ +	CHECK_OFFSET(vm_exit_intr_info, 816);
+ +	CHECK_OFFSET(vm_exit_intr_error_code, 820);
+ +	CHECK_OFFSET(idt_vectoring_info_field, 824);
+ +	CHECK_OFFSET(idt_vectoring_error_code, 828);
+ +	CHECK_OFFSET(vm_exit_instruction_len, 832);
+ +	CHECK_OFFSET(vmx_instruction_info, 836);
+ +	CHECK_OFFSET(guest_es_limit, 840);
+ +	CHECK_OFFSET(guest_cs_limit, 844);
+ +	CHECK_OFFSET(guest_ss_limit, 848);
+ +	CHECK_OFFSET(guest_ds_limit, 852);
+ +	CHECK_OFFSET(guest_fs_limit, 856);
+ +	CHECK_OFFSET(guest_gs_limit, 860);
+ +	CHECK_OFFSET(guest_ldtr_limit, 864);
+ +	CHECK_OFFSET(guest_tr_limit, 868);
+ +	CHECK_OFFSET(guest_gdtr_limit, 872);
+ +	CHECK_OFFSET(guest_idtr_limit, 876);
+ +	CHECK_OFFSET(guest_es_ar_bytes, 880);
+ +	CHECK_OFFSET(guest_cs_ar_bytes, 884);
+ +	CHECK_OFFSET(guest_ss_ar_bytes, 888);
+ +	CHECK_OFFSET(guest_ds_ar_bytes, 892);
+ +	CHECK_OFFSET(guest_fs_ar_bytes, 896);
+ +	CHECK_OFFSET(guest_gs_ar_bytes, 900);
+ +	CHECK_OFFSET(guest_ldtr_ar_bytes, 904);
+ +	CHECK_OFFSET(guest_tr_ar_bytes, 908);
+ +	CHECK_OFFSET(guest_interruptibility_info, 912);
+ +	CHECK_OFFSET(guest_activity_state, 916);
+ +	CHECK_OFFSET(guest_sysenter_cs, 920);
+ +	CHECK_OFFSET(host_ia32_sysenter_cs, 924);
+ +	CHECK_OFFSET(vmx_preemption_timer_value, 928);
+ +	CHECK_OFFSET(virtual_processor_id, 960);
+ +	CHECK_OFFSET(posted_intr_nv, 962);
+ +	CHECK_OFFSET(guest_es_selector, 964);
+ +	CHECK_OFFSET(guest_cs_selector, 966);
+ +	CHECK_OFFSET(guest_ss_selector, 968);
+ +	CHECK_OFFSET(guest_ds_selector, 970);
+ +	CHECK_OFFSET(guest_fs_selector, 972);
+ +	CHECK_OFFSET(guest_gs_selector, 974);
+ +	CHECK_OFFSET(guest_ldtr_selector, 976);
+ +	CHECK_OFFSET(guest_tr_selector, 978);
+ +	CHECK_OFFSET(guest_intr_status, 980);
+ +	CHECK_OFFSET(host_es_selector, 982);
+ +	CHECK_OFFSET(host_cs_selector, 984);
+ +	CHECK_OFFSET(host_ss_selector, 986);
+ +	CHECK_OFFSET(host_ds_selector, 988);
+ +	CHECK_OFFSET(host_fs_selector, 990);
+ +	CHECK_OFFSET(host_gs_selector, 992);
+ +	CHECK_OFFSET(host_tr_selector, 994);
+ +	CHECK_OFFSET(guest_pml_index, 996);
+ +}
+ +
+ +/*
+ + * VMCS12_REVISION is an arbitrary id that should be changed if the content or
+ + * layout of struct vmcs12 is changed. MSR_IA32_VMX_BASIC returns this id, and
+ + * VMPTRLD verifies that the VMCS region that L1 is loading contains this id.
+ + *
+ + * IMPORTANT: Changing this value will break save/restore compatibility with
+ + * older kvm releases.
+ + */
+ +#define VMCS12_REVISION 0x11e57ed0
+ +
+ +/*
+ + * VMCS12_SIZE is the number of bytes L1 should allocate for the VMXON region
+ + * and any VMCS region. Although only sizeof(struct vmcs12) are used by the
+ + * current implementation, 4K are reserved to avoid future complications.
+ + */
+ +#define VMCS12_SIZE 0x1000
+ +
+ +/*
+ + * VMCS12_MAX_FIELD_INDEX is the highest index value used in any
+ + * supported VMCS12 field encoding.
+ + */
+ +#define VMCS12_MAX_FIELD_INDEX 0x17
+ +
+ +struct nested_vmx_msrs {
+ +	/*
+ +	 * We only store the "true" versions of the VMX capability MSRs. We
+ +	 * generate the "non-true" versions by setting the must-be-1 bits
+ +	 * according to the SDM.
+ +	 */
+ +	u32 procbased_ctls_low;
+ +	u32 procbased_ctls_high;
+ +	u32 secondary_ctls_low;
+ +	u32 secondary_ctls_high;
+ +	u32 pinbased_ctls_low;
+ +	u32 pinbased_ctls_high;
+ +	u32 exit_ctls_low;
+ +	u32 exit_ctls_high;
+ +	u32 entry_ctls_low;
+ +	u32 entry_ctls_high;
+ +	u32 misc_low;
+ +	u32 misc_high;
+ +	u32 ept_caps;
+ +	u32 vpid_caps;
+ +	u64 basic;
+ +	u64 cr0_fixed0;
+ +	u64 cr0_fixed1;
+ +	u64 cr4_fixed0;
+ +	u64 cr4_fixed1;
+ +	u64 vmcs_enum;
+ +	u64 vmfunc_controls;
+ +};
+ +
+ +/*
+ + * The nested_vmx structure is part of vcpu_vmx, and holds information we need
+ + * for correct emulation of VMX (i.e., nested VMX) on this vcpu.
+ + */
+ +struct nested_vmx {
+ +	/* Has the level1 guest done vmxon? */
+ +	bool vmxon;
+ +	gpa_t vmxon_ptr;
+ +	bool pml_full;
+ +
+ +	/* The guest-physical address of the current VMCS L1 keeps for L2 */
+ +	gpa_t current_vmptr;
+ +	/*
+ +	 * Cache of the guest's VMCS, existing outside of guest memory.
+ +	 * Loaded from guest memory during VMPTRLD. Flushed to guest
+ +	 * memory during VMCLEAR and VMPTRLD.
+ +	 */
+ +	struct vmcs12 *cached_vmcs12;
+ +	/*
+ +	 * Cache of the guest's shadow VMCS, existing outside of guest
+ +	 * memory. Loaded from guest memory during VM entry. Flushed
+ +	 * to guest memory during VM exit.
+ +	 */
+ +	struct vmcs12 *cached_shadow_vmcs12;
+ +	/*
+ +	 * Indicates if the shadow vmcs or enlightened vmcs must be updated
+ +	 * with the data held by struct vmcs12.
+ +	 */
+ +	bool need_vmcs12_sync;
+ +	bool dirty_vmcs12;
+ +
+ +	/*
+ +	 * vmcs02 has been initialized, i.e. state that is constant for
+ +	 * vmcs02 has been written to the backing VMCS.  Initialization
+ +	 * is delayed until L1 actually attempts to run a nested VM.
+ +	 */
+ +	bool vmcs02_initialized;
+ +
+ +	bool change_vmcs01_virtual_apic_mode;
+ +
+ +	/* L2 must run next, and mustn't decide to exit to L1. */
+ +	bool nested_run_pending;
+ +
+ +	struct loaded_vmcs vmcs02;
+ +
+ +	/*
+ +	 * Guest pages referred to in the vmcs02 with host-physical
+ +	 * pointers, so we must keep them pinned while L2 runs.
+ +	 */
+ +	struct page *apic_access_page;
+ +	struct page *virtual_apic_page;
+ +	struct page *pi_desc_page;
+ +	struct pi_desc *pi_desc;
+ +	bool pi_pending;
+ +	u16 posted_intr_nv;
+ +
+ +	struct hrtimer preemption_timer;
+ +	bool preemption_timer_expired;
+ +
+ +	/* to migrate it to L2 if VM_ENTRY_LOAD_DEBUG_CONTROLS is off */
+ +	u64 vmcs01_debugctl;
+ +	u64 vmcs01_guest_bndcfgs;
+ +
+ +	u16 vpid02;
+ +	u16 last_vpid;
+ +
+ +	struct nested_vmx_msrs msrs;
+ +
+ +	/* SMM related state */
+ +	struct {
+ +		/* in VMX operation on SMM entry? */
+ +		bool vmxon;
+ +		/* in guest mode on SMM entry? */
+ +		bool guest_mode;
+ +	} smm;
+ +
+ +	struct hv_enlightened_vmcs *hv_evmcs;
+ +};
+ +
+ +#define POSTED_INTR_ON  0
+ +#define POSTED_INTR_SN  1
+ +
+ +/* Posted-Interrupt Descriptor */
+ +struct pi_desc {
+ +	u32 pir[8];     /* Posted interrupt requested */
+ +	union {
+ +		struct {
+ +				/* bit 256 - Outstanding Notification */
+ +			u16	on	: 1,
+ +				/* bit 257 - Suppress Notification */
+ +				sn	: 1,
+ +				/* bit 271:258 - Reserved */
+ +				rsvd_1	: 14;
+ +				/* bit 279:272 - Notification Vector */
+ +			u8	nv;
+ +				/* bit 287:280 - Reserved */
+ +			u8	rsvd_2;
+ +				/* bit 319:288 - Notification Destination */
+ +			u32	ndst;
+ +		};
+ +		u64 control;
+ +	};
+ +	u32 rsvd[6];
+ +} __aligned(64);
+ +
+ +static bool pi_test_and_set_on(struct pi_desc *pi_desc)
+ +{
+ +	return test_and_set_bit(POSTED_INTR_ON,
+ +			(unsigned long *)&pi_desc->control);
+ +}
+ +
+ +static bool pi_test_and_clear_on(struct pi_desc *pi_desc)
+ +{
+ +	return test_and_clear_bit(POSTED_INTR_ON,
+ +			(unsigned long *)&pi_desc->control);
+ +}
+ +
+ +static int pi_test_and_set_pir(int vector, struct pi_desc *pi_desc)
+ +{
+ +	return test_and_set_bit(vector, (unsigned long *)pi_desc->pir);
+ +}
+ +
+ +static inline void pi_clear_sn(struct pi_desc *pi_desc)
+ +{
+ +	return clear_bit(POSTED_INTR_SN,
+ +			(unsigned long *)&pi_desc->control);
+ +}
+ +
+ +static inline void pi_set_sn(struct pi_desc *pi_desc)
+ +{
+ +	return set_bit(POSTED_INTR_SN,
+ +			(unsigned long *)&pi_desc->control);
+ +}
+ +
+ +static inline void pi_clear_on(struct pi_desc *pi_desc)
+ +{
+ +	clear_bit(POSTED_INTR_ON,
+ +  		  (unsigned long *)&pi_desc->control);
+ +}
+ +
+ +static inline int pi_test_on(struct pi_desc *pi_desc)
+ +{
+ +	return test_bit(POSTED_INTR_ON,
+ +			(unsigned long *)&pi_desc->control);
+ +}
+ +
+ +static inline int pi_test_sn(struct pi_desc *pi_desc)
+ +{
+ +	return test_bit(POSTED_INTR_SN,
+ +			(unsigned long *)&pi_desc->control);
+ +}
+ +
+ +struct vmx_msrs {
+ +	unsigned int		nr;
+ +	struct vmx_msr_entry	val[NR_AUTOLOAD_MSRS];
+ +};
+ +
+ +struct vcpu_vmx {
+ +	struct kvm_vcpu       vcpu;
+ +	unsigned long         host_rsp;
+ +	u8                    fail;
+ +	u8		      msr_bitmap_mode;
+ +	u32                   exit_intr_info;
+ +	u32                   idt_vectoring_info;
+ +	ulong                 rflags;
+ +	struct shared_msr_entry *guest_msrs;
+ +	int                   nmsrs;
+ +	int                   save_nmsrs;
+ +	bool                  guest_msrs_dirty;
+ +	unsigned long	      host_idt_base;
+ +#ifdef CONFIG_X86_64
+ +	u64 		      msr_host_kernel_gs_base;
+ +	u64 		      msr_guest_kernel_gs_base;
+ +#endif
+ +
+ +	u64 		      arch_capabilities;
+ +	u64 		      spec_ctrl;
+ +
+ +	u32 vm_entry_controls_shadow;
+ +	u32 vm_exit_controls_shadow;
+ +	u32 secondary_exec_control;
+ +
+ +	/*
+ +	 * loaded_vmcs points to the VMCS currently used in this vcpu. For a
+ +	 * non-nested (L1) guest, it always points to vmcs01. For a nested
+ +	 * guest (L2), it points to a different VMCS.  loaded_cpu_state points
+ +	 * to the VMCS whose state is loaded into the CPU registers that only
+ +	 * need to be switched when transitioning to/from the kernel; a NULL
+ +	 * value indicates that host state is loaded.
+ +	 */
+ +	struct loaded_vmcs    vmcs01;
+ +	struct loaded_vmcs   *loaded_vmcs;
+ +	struct loaded_vmcs   *loaded_cpu_state;
+ +	bool                  __launched; /* temporary, used in vmx_vcpu_run */
+ +	struct msr_autoload {
+ +		struct vmx_msrs guest;
+ +		struct vmx_msrs host;
+ +	} msr_autoload;
+ +
+ +	struct {
+ +		int vm86_active;
+ +		ulong save_rflags;
+ +		struct kvm_segment segs[8];
+ +	} rmode;
+ +	struct {
+ +		u32 bitmask; /* 4 bits per segment (1 bit per field) */
+ +		struct kvm_save_segment {
+ +			u16 selector;
+ +			unsigned long base;
+ +			u32 limit;
+ +			u32 ar;
+ +		} seg[8];
+ +	} segment_cache;
+ +	int vpid;
+ +	bool emulation_required;
+ +
+ +	u32 exit_reason;
+ +
+ +	/* Posted interrupt descriptor */
+ +	struct pi_desc pi_desc;
+ +
+ +	/* Support for a guest hypervisor (nested VMX) */
+ +	struct nested_vmx nested;
+ +
+ +	/* Dynamic PLE window. */
+ +	int ple_window;
+ +	bool ple_window_dirty;
+ +
+ +	bool req_immediate_exit;
+ +
+ +	/* Support for PML */
+ +#define PML_ENTITY_NUM		512
+ +	struct page *pml_pg;
+ +
+ +	/* apic deadline value in host tsc */
+ +	u64 hv_deadline_tsc;
+ +
+ +	u64 current_tsc_ratio;
+ +
+ +	u32 host_pkru;
+ +
+ +	unsigned long host_debugctlmsr;
+ +
+ +	/*
+ +	 * Only bits masked by msr_ia32_feature_control_valid_bits can be set in
+ +	 * msr_ia32_feature_control. FEATURE_CONTROL_LOCKED is always included
+ +	 * in msr_ia32_feature_control_valid_bits.
+ +	 */
+ +	u64 msr_ia32_feature_control;
+ +	u64 msr_ia32_feature_control_valid_bits;
+ +	u64 ept_pointer;
+ +};
+ +
+ +enum segment_cache_field {
+ +	SEG_FIELD_SEL = 0,
+ +	SEG_FIELD_BASE = 1,
+ +	SEG_FIELD_LIMIT = 2,
+ +	SEG_FIELD_AR = 3,
+ +
+ +	SEG_FIELD_NR = 4
+ +};
+ +
+ +static inline struct kvm_vmx *to_kvm_vmx(struct kvm *kvm)
+ +{
+ +	return container_of(kvm, struct kvm_vmx, kvm);
+ +}
+ +
+ +static inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
+ +{
+ +	return container_of(vcpu, struct vcpu_vmx, vcpu);
+ +}
+ +
+ +static struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
+ +{
+ +	return &(to_vmx(vcpu)->pi_desc);
+ +}
+ +
+ +#define ROL16(val, n) ((u16)(((u16)(val) << (n)) | ((u16)(val) >> (16 - (n)))))
+ +#define VMCS12_OFFSET(x) offsetof(struct vmcs12, x)
+ +#define FIELD(number, name)	[ROL16(number, 6)] = VMCS12_OFFSET(name)
+ +#define FIELD64(number, name)						\
+ +	FIELD(number, name),						\
+ +	[ROL16(number##_HIGH, 6)] = VMCS12_OFFSET(name) + sizeof(u32)
+ +
+ +
+++=======
+++>>>>>>> 8373d25d25d1 (KVM: VMX: Add vmx.h to hold VMX definitions)
+  static u16 shadow_read_only_fields[] = {
+  #define SHADOW_FIELD_RO(x) x,
+  #include "vmcs_shadow_fields.h"
+@@@ -6358,78 -5137,26 +6357,81 @@@ static u32 vmx_pin_based_exec_ctrl(stru
+  	return pin_based_exec_ctrl;
+  }
+  
+ -static void vmx_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
+ +static void vmx_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
+ +{
+ +	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ +
+ +	vmcs_write32(PIN_BASED_VM_EXEC_CONTROL, vmx_pin_based_exec_ctrl(vmx));
+ +	if (cpu_has_secondary_exec_ctrls()) {
+ +		if (kvm_vcpu_apicv_active(vcpu))
+ +			vmcs_set_bits(SECONDARY_VM_EXEC_CONTROL,
+ +				      SECONDARY_EXEC_APIC_REGISTER_VIRT |
+ +				      SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
+ +		else
+ +			vmcs_clear_bits(SECONDARY_VM_EXEC_CONTROL,
+ +					SECONDARY_EXEC_APIC_REGISTER_VIRT |
+ +					SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
+ +	}
+ +
+ +	if (cpu_has_vmx_msr_bitmap())
+ +		vmx_update_msr_bitmap(vcpu);
+ +}
+ +
+++<<<<<<< HEAD
+ +static u32 vmx_vmentry_ctrl(void)
+ +{
+ +	/* Loading of EFER and PERF_GLOBAL_CTRL are toggled dynamically */
+ +	return vmcs_config.vmentry_ctrl &
+ +		~(VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL | VM_ENTRY_LOAD_IA32_EFER);
+ +}
+ +
+ +static u32 vmx_vmexit_ctrl(void)
+ +{
+ +	/* Loading of EFER and PERF_GLOBAL_CTRL are toggled dynamically */
+ +	return vmcs_config.vmexit_ctrl &
+ +		~(VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL | VM_EXIT_LOAD_IA32_EFER);
+ +}
+ +
+ +static u32 vmx_exec_control(struct vcpu_vmx *vmx)
+ +{
+ +	u32 exec_control = vmcs_config.cpu_based_exec_ctrl;
+ +
+ +	if (vmx->vcpu.arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT)
+ +		exec_control &= ~CPU_BASED_MOV_DR_EXITING;
+ +
+ +	if (!cpu_need_tpr_shadow(&vmx->vcpu)) {
+ +		exec_control &= ~CPU_BASED_TPR_SHADOW;
+ +#ifdef CONFIG_X86_64
+ +		exec_control |= CPU_BASED_CR8_STORE_EXITING |
+ +				CPU_BASED_CR8_LOAD_EXITING;
+ +#endif
+ +	}
+ +	if (!enable_ept)
+ +		exec_control |= CPU_BASED_CR3_STORE_EXITING |
+ +				CPU_BASED_CR3_LOAD_EXITING  |
+ +				CPU_BASED_INVLPG_EXITING;
+ +	if (kvm_mwait_in_guest(vmx->vcpu.kvm))
+ +		exec_control &= ~(CPU_BASED_MWAIT_EXITING |
+ +				CPU_BASED_MONITOR_EXITING);
+ +	if (kvm_hlt_in_guest(vmx->vcpu.kvm))
+ +		exec_control &= ~CPU_BASED_HLT_EXITING;
+ +	return exec_control;
+ +}
+ +
+ +static bool vmx_rdrand_supported(void)
+  {
+ -	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ -
+ -	vmcs_write32(PIN_BASED_VM_EXEC_CONTROL, vmx_pin_based_exec_ctrl(vmx));
+ -	if (cpu_has_secondary_exec_ctrls()) {
+ -		if (kvm_vcpu_apicv_active(vcpu))
+ -			vmcs_set_bits(SECONDARY_VM_EXEC_CONTROL,
+ -				      SECONDARY_EXEC_APIC_REGISTER_VIRT |
+ -				      SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
+ -		else
+ -			vmcs_clear_bits(SECONDARY_VM_EXEC_CONTROL,
+ -					SECONDARY_EXEC_APIC_REGISTER_VIRT |
+ -					SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
+ -	}
+ +	return vmcs_config.cpu_based_2nd_exec_ctrl &
+ +		SECONDARY_EXEC_RDRAND_EXITING;
+ +}
+  
+ -	if (cpu_has_vmx_msr_bitmap())
+ -		vmx_update_msr_bitmap(vcpu);
+ +static bool vmx_rdseed_supported(void)
+ +{
+ +	return vmcs_config.cpu_based_2nd_exec_ctrl &
+ +		SECONDARY_EXEC_RDSEED_EXITING;
+  }
+  
+++=======
+++>>>>>>> 8373d25d25d1 (KVM: VMX: Add vmx.h to hold VMX definitions)
+  static void vmx_compute_secondary_exec_control(struct vcpu_vmx *vmx)
+  {
+  	struct kvm_vcpu *vcpu = &vmx->vcpu;
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+new file mode 100644
+index 000000000000..c9aa150aa014
+--- /dev/null
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -0,0 +1,351 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __KVM_X86_VMX_H
++#define __KVM_X86_VMX_H
++
++#include <linux/kvm_host.h>
++
++#include <asm/kvm.h>
++
++#include "capabilities.h"
++#include "vmcs.h"
++
++#define MSR_TYPE_R	1
++#define MSR_TYPE_W	2
++#define MSR_TYPE_RW	3
++
++#define X2APIC_MSR(r) (APIC_BASE_MSR + ((r) >> 4))
++
++#define NR_AUTOLOAD_MSRS 8
++
++struct vmx_msrs {
++	unsigned int		nr;
++	struct vmx_msr_entry	val[NR_AUTOLOAD_MSRS];
++};
++
++struct shared_msr_entry {
++	unsigned index;
++	u64 data;
++	u64 mask;
++};
++
++enum segment_cache_field {
++	SEG_FIELD_SEL = 0,
++	SEG_FIELD_BASE = 1,
++	SEG_FIELD_LIMIT = 2,
++	SEG_FIELD_AR = 3,
++
++	SEG_FIELD_NR = 4
++};
++
++/* Posted-Interrupt Descriptor */
++struct pi_desc {
++	u32 pir[8];     /* Posted interrupt requested */
++	union {
++		struct {
++				/* bit 256 - Outstanding Notification */
++			u16	on	: 1,
++				/* bit 257 - Suppress Notification */
++				sn	: 1,
++				/* bit 271:258 - Reserved */
++				rsvd_1	: 14;
++				/* bit 279:272 - Notification Vector */
++			u8	nv;
++				/* bit 287:280 - Reserved */
++			u8	rsvd_2;
++				/* bit 319:288 - Notification Destination */
++			u32	ndst;
++		};
++		u64 control;
++	};
++	u32 rsvd[6];
++} __aligned(64);
++
++
++/*
++ * The nested_vmx structure is part of vcpu_vmx, and holds information we need
++ * for correct emulation of VMX (i.e., nested VMX) on this vcpu.
++ */
++struct nested_vmx {
++	/* Has the level1 guest done vmxon? */
++	bool vmxon;
++	gpa_t vmxon_ptr;
++	bool pml_full;
++
++	/* The guest-physical address of the current VMCS L1 keeps for L2 */
++	gpa_t current_vmptr;
++	/*
++	 * Cache of the guest's VMCS, existing outside of guest memory.
++	 * Loaded from guest memory during VMPTRLD. Flushed to guest
++	 * memory during VMCLEAR and VMPTRLD.
++	 */
++	struct vmcs12 *cached_vmcs12;
++	/*
++	 * Cache of the guest's shadow VMCS, existing outside of guest
++	 * memory. Loaded from guest memory during VM entry. Flushed
++	 * to guest memory during VM exit.
++	 */
++	struct vmcs12 *cached_shadow_vmcs12;
++	/*
++	 * Indicates if the shadow vmcs or enlightened vmcs must be updated
++	 * with the data held by struct vmcs12.
++	 */
++	bool need_vmcs12_sync;
++	bool dirty_vmcs12;
++
++	/*
++	 * vmcs02 has been initialized, i.e. state that is constant for
++	 * vmcs02 has been written to the backing VMCS.  Initialization
++	 * is delayed until L1 actually attempts to run a nested VM.
++	 */
++	bool vmcs02_initialized;
++
++	bool change_vmcs01_virtual_apic_mode;
++
++	/*
++	 * Enlightened VMCS has been enabled. It does not mean that L1 has to
++	 * use it. However, VMX features available to L1 will be limited based
++	 * on what the enlightened VMCS supports.
++	 */
++	bool enlightened_vmcs_enabled;
++
++	/* L2 must run next, and mustn't decide to exit to L1. */
++	bool nested_run_pending;
++
++	struct loaded_vmcs vmcs02;
++
++	/*
++	 * Guest pages referred to in the vmcs02 with host-physical
++	 * pointers, so we must keep them pinned while L2 runs.
++	 */
++	struct page *apic_access_page;
++	struct page *virtual_apic_page;
++	struct page *pi_desc_page;
++	struct pi_desc *pi_desc;
++	bool pi_pending;
++	u16 posted_intr_nv;
++
++	struct hrtimer preemption_timer;
++	bool preemption_timer_expired;
++
++	/* to migrate it to L2 if VM_ENTRY_LOAD_DEBUG_CONTROLS is off */
++	u64 vmcs01_debugctl;
++	u64 vmcs01_guest_bndcfgs;
++
++	u16 vpid02;
++	u16 last_vpid;
++
++	struct nested_vmx_msrs msrs;
++
++	/* SMM related state */
++	struct {
++		/* in VMX operation on SMM entry? */
++		bool vmxon;
++		/* in guest mode on SMM entry? */
++		bool guest_mode;
++	} smm;
++
++	gpa_t hv_evmcs_vmptr;
++	struct page *hv_evmcs_page;
++	struct hv_enlightened_vmcs *hv_evmcs;
++};
++
++struct vcpu_vmx {
++	struct kvm_vcpu       vcpu;
++	unsigned long         host_rsp;
++	u8                    fail;
++	u8		      msr_bitmap_mode;
++	u32                   exit_intr_info;
++	u32                   idt_vectoring_info;
++	ulong                 rflags;
++	struct shared_msr_entry *guest_msrs;
++	int                   nmsrs;
++	int                   save_nmsrs;
++	bool                  guest_msrs_dirty;
++	unsigned long	      host_idt_base;
++#ifdef CONFIG_X86_64
++	u64		      msr_host_kernel_gs_base;
++	u64		      msr_guest_kernel_gs_base;
++#endif
++
++	u64		      arch_capabilities;
++	u64		      spec_ctrl;
++
++	u32 vm_entry_controls_shadow;
++	u32 vm_exit_controls_shadow;
++	u32 secondary_exec_control;
++
++	/*
++	 * loaded_vmcs points to the VMCS currently used in this vcpu. For a
++	 * non-nested (L1) guest, it always points to vmcs01. For a nested
++	 * guest (L2), it points to a different VMCS.  loaded_cpu_state points
++	 * to the VMCS whose state is loaded into the CPU registers that only
++	 * need to be switched when transitioning to/from the kernel; a NULL
++	 * value indicates that host state is loaded.
++	 */
++	struct loaded_vmcs    vmcs01;
++	struct loaded_vmcs   *loaded_vmcs;
++	struct loaded_vmcs   *loaded_cpu_state;
++	bool                  __launched; /* temporary, used in vmx_vcpu_run */
++	struct msr_autoload {
++		struct vmx_msrs guest;
++		struct vmx_msrs host;
++	} msr_autoload;
++
++	struct {
++		int vm86_active;
++		ulong save_rflags;
++		struct kvm_segment segs[8];
++	} rmode;
++	struct {
++		u32 bitmask; /* 4 bits per segment (1 bit per field) */
++		struct kvm_save_segment {
++			u16 selector;
++			unsigned long base;
++			u32 limit;
++			u32 ar;
++		} seg[8];
++	} segment_cache;
++	int vpid;
++	bool emulation_required;
++
++	u32 exit_reason;
++
++	/* Posted interrupt descriptor */
++	struct pi_desc pi_desc;
++
++	/* Support for a guest hypervisor (nested VMX) */
++	struct nested_vmx nested;
++
++	/* Dynamic PLE window. */
++	int ple_window;
++	bool ple_window_dirty;
++
++	bool req_immediate_exit;
++
++	/* Support for PML */
++#define PML_ENTITY_NUM		512
++	struct page *pml_pg;
++
++	/* apic deadline value in host tsc */
++	u64 hv_deadline_tsc;
++
++	u64 current_tsc_ratio;
++
++	u32 host_pkru;
++
++	unsigned long host_debugctlmsr;
++
++	/*
++	 * Only bits masked by msr_ia32_feature_control_valid_bits can be set in
++	 * msr_ia32_feature_control. FEATURE_CONTROL_LOCKED is always included
++	 * in msr_ia32_feature_control_valid_bits.
++	 */
++	u64 msr_ia32_feature_control;
++	u64 msr_ia32_feature_control_valid_bits;
++	u64 ept_pointer;
++};
++
++enum ept_pointers_status {
++	EPT_POINTERS_CHECK = 0,
++	EPT_POINTERS_MATCH = 1,
++	EPT_POINTERS_MISMATCH = 2
++};
++
++struct kvm_vmx {
++	struct kvm kvm;
++
++	unsigned int tss_addr;
++	bool ept_identity_pagetable_done;
++	gpa_t ept_identity_map_addr;
++
++	enum ept_pointers_status ept_pointers_match;
++	spinlock_t ept_pointer_lock;
++};
++
++#define POSTED_INTR_ON  0
++#define POSTED_INTR_SN  1
++
++static inline bool pi_test_and_set_on(struct pi_desc *pi_desc)
++{
++	return test_and_set_bit(POSTED_INTR_ON,
++			(unsigned long *)&pi_desc->control);
++}
++
++static inline bool pi_test_and_clear_on(struct pi_desc *pi_desc)
++{
++	return test_and_clear_bit(POSTED_INTR_ON,
++			(unsigned long *)&pi_desc->control);
++}
++
++static inline int pi_test_and_set_pir(int vector, struct pi_desc *pi_desc)
++{
++	return test_and_set_bit(vector, (unsigned long *)pi_desc->pir);
++}
++
++static inline void pi_clear_sn(struct pi_desc *pi_desc)
++{
++	return clear_bit(POSTED_INTR_SN,
++			(unsigned long *)&pi_desc->control);
++}
++
++static inline void pi_set_sn(struct pi_desc *pi_desc)
++{
++	return set_bit(POSTED_INTR_SN,
++			(unsigned long *)&pi_desc->control);
++}
++
++static inline void pi_clear_on(struct pi_desc *pi_desc)
++{
++	clear_bit(POSTED_INTR_ON,
++		(unsigned long *)&pi_desc->control);
++}
++
++static inline int pi_test_on(struct pi_desc *pi_desc)
++{
++	return test_bit(POSTED_INTR_ON,
++			(unsigned long *)&pi_desc->control);
++}
++
++static inline int pi_test_sn(struct pi_desc *pi_desc)
++{
++	return test_bit(POSTED_INTR_SN,
++			(unsigned long *)&pi_desc->control);
++}
++
++static inline void vmx_segment_cache_clear(struct vcpu_vmx *vmx)
++{
++	vmx->segment_cache.bitmask = 0;
++}
++
++static inline u32 vmx_vmentry_ctrl(void)
++{
++	/* Loading of EFER and PERF_GLOBAL_CTRL are toggled dynamically */
++	return vmcs_config.vmentry_ctrl &
++		~(VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL | VM_ENTRY_LOAD_IA32_EFER);
++}
++
++static inline u32 vmx_vmexit_ctrl(void)
++{
++	/* Loading of EFER and PERF_GLOBAL_CTRL are toggled dynamically */
++	return vmcs_config.vmexit_ctrl &
++		~(VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL | VM_EXIT_LOAD_IA32_EFER);
++}
++
++u32 vmx_exec_control(struct vcpu_vmx *vmx);
++
++static inline struct kvm_vmx *to_kvm_vmx(struct kvm *kvm)
++{
++	return container_of(kvm, struct kvm_vmx, kvm);
++}
++
++static inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
++{
++	return container_of(vcpu, struct vcpu_vmx, vcpu);
++}
++
++static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
++{
++	return &(to_vmx(vcpu)->pi_desc);
++}
++
++#endif /* __KVM_X86_VMX_H */
