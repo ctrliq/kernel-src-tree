@@ -266,7 +266,7 @@ static gpa_t translate_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
                                   struct x86_exception *exception)
 {
 	/* Check if guest physical address doesn't exceed guest maximum */
-	if (kvm_mmu_is_illegal_gpa(vcpu, gpa)) {
+	if (kvm_vcpu_is_illegal_gpa(vcpu, gpa)) {
 		exception->error_code |= PFERR_RSVD_MASK;
 		return UNMAPPED_GVA;
 	}
@@ -388,7 +388,7 @@ static u64 __update_clear_spte_slow(u64 *sptep, u64 spte)
 
 /*
  * The idea using the light way get the spte on x86_32 guest is from
- * gup_get_pte(arch/x86/mm/gup.c).
+ * gup_get_pte (mm/gup.c).
  *
  * An spte tlb flush may be pending, because kvm_set_pte_rmapp
  * coalesces them and we are running out of the MMU lock.  Therefore
@@ -3118,7 +3118,7 @@ static int fast_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 		/*
 		 * Currently, fast page fault only works for direct mapping
 		 * since the gfn is not stable for indirect shadow page. See
-		 * Documentation/virt/kvm/locking.txt to get more detail.
+		 * Documentation/virt/kvm/locking.rst to get more detail.
 		 */
 		if (fast_pf_fix_direct_spte(vcpu, sp, iterator.sptep, spte,
 					    new_spte)) {
@@ -3749,6 +3749,7 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
 				u64 fault_address, char *insn, int insn_len)
 {
 	int r = 1;
+	u32 flags = vcpu->arch.apf.host_apf_flags;
 
 #ifndef CONFIG_X86_64
 	/* A 64-bit CR2 should be impossible on 32-bit KVM. */
@@ -3757,28 +3758,22 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
 #endif
 
 	vcpu->arch.l1tf_flush_l1d = true;
-	switch (vcpu->arch.apf.host_apf_reason) {
-	default:
+	if (!flags) {
 		trace_kvm_page_fault(fault_address, error_code);
 
 		if (kvm_event_needs_reinjection(vcpu))
 			kvm_mmu_unprotect_page_virt(vcpu, fault_address);
 		r = kvm_mmu_page_fault(vcpu, fault_address, error_code, insn,
 				insn_len);
-		break;
-	case KVM_PV_REASON_PAGE_NOT_PRESENT:
-		vcpu->arch.apf.host_apf_reason = 0;
+	} else if (flags & KVM_PV_REASON_PAGE_NOT_PRESENT) {
+		vcpu->arch.apf.host_apf_flags = 0;
 		local_irq_disable();
-		kvm_async_pf_task_wait(fault_address, 0);
+		kvm_async_pf_task_wait_schedule(fault_address);
 		local_irq_enable();
-		break;
-	case KVM_PV_REASON_PAGE_READY:
-		vcpu->arch.apf.host_apf_reason = 0;
-		local_irq_disable();
-		kvm_async_pf_task_wake(fault_address);
-		local_irq_enable();
-		break;
+	} else {
+		WARN_ONCE(1, "Unexpected host async PF flags: %x\n", flags);
 	}
+
 	return r;
 }
 EXPORT_SYMBOL_GPL(kvm_handle_page_fault);
@@ -5104,18 +5099,6 @@ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 error_code,
 	if (!mmio_info_in_cache(vcpu, cr2_or_gpa, direct) && !is_guest_mode(vcpu))
 		emulation_type |= EMULTYPE_ALLOW_RETRY_PF;
 emulate:
-	/*
-	 * On AMD platforms, under certain conditions insn_len may be zero on #NPF.
-	 * This can happen if a guest gets a page-fault on data access but the HW
-	 * table walker is not able to read the instruction page (e.g instruction
-	 * page is not present in memory). In those cases we simply restart the
-	 * guest, with the exception of AMD Erratum 1096 which is unrecoverable.
-	 */
-	if (unlikely(insn && !insn_len)) {
-		if (!kvm_x86_ops.need_emulation_on_page_fault(vcpu))
-			return 1;
-	}
-
 	return x86_emulate_instruction(vcpu, cr2_or_gpa, emulation_type, insn,
 				       insn_len);
 }

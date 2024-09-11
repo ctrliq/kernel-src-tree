@@ -345,7 +345,7 @@ pte_t *__find_linux_pte(pgd_t *pgdir, unsigned long ea,
 	 */
 	if (pgd_none(pgd))
 		return NULL;
-	else if (pgd_huge(pgd)) {
+	else if (pgd_is_leaf(pgd)) {
 		ret_pte = (pte_t *) pgdp;
 		goto out;
 	} else if (is_hugepd(__hugepd(pgd_val(pgd))))
@@ -362,7 +362,7 @@ pte_t *__find_linux_pte(pgd_t *pgdir, unsigned long ea,
 
 		if (pud_none(pud))
 			return NULL;
-		else if (pud_huge(pud)) {
+		else if (pud_is_leaf(pud)) {
 			ret_pte = (pte_t *) pudp;
 			goto out;
 		} else if (is_hugepd(__hugepd(pud_val(pud))))
@@ -389,7 +389,7 @@ pte_t *__find_linux_pte(pgd_t *pgdir, unsigned long ea,
 			 * we need to do both the check because they are config
 			 * dependent.
 			 */
-			if (pmd_huge(pmd) || pmd_large(pmd)) {
+			if (pmd_is_leaf(pmd) || pmd_large(pmd)) {
 				ret_pte = (pte_t *) pmdp;
 				goto out;
 			} else if (is_hugepd(__hugepd(pmd_val(pmd))))

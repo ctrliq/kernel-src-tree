@@ -116,8 +116,12 @@ xfs_qm_adjust_dqtimers(
 	struct xfs_mount	*mp,
 	struct xfs_dquot	*dq)
 {
+	struct xfs_quotainfo	*qi = mp->m_quotainfo;
 	struct xfs_disk_dquot	*d = &dq->q_core;
+	struct xfs_def_quota	*defq;
+
 	ASSERT(d->d_id);
+	defq = xfs_get_defquota(qi, xfs_dquot_type(dq));
 
 #ifdef DEBUG
 	if (d->d_blk_hardlimit)
@@ -139,7 +143,7 @@ xfs_qm_adjust_dqtimers(
 		     (be64_to_cpu(d->d_bcount) >
 		      be64_to_cpu(d->d_blk_hardlimit)))) {
 			d->d_btimer = cpu_to_be32(ktime_get_real_seconds() +
-					mp->m_quotainfo->qi_btimelimit);
+					defq->btimelimit);
 		} else {
 			d->d_bwarns = 0;
 		}
@@ -162,7 +166,7 @@ xfs_qm_adjust_dqtimers(
 		     (be64_to_cpu(d->d_icount) >
 		      be64_to_cpu(d->d_ino_hardlimit)))) {
 			d->d_itimer = cpu_to_be32(ktime_get_real_seconds() +
-					mp->m_quotainfo->qi_itimelimit);
+					defq->itimelimit);
 		} else {
 			d->d_iwarns = 0;
 		}
@@ -185,7 +189,7 @@ xfs_qm_adjust_dqtimers(
 		     (be64_to_cpu(d->d_rtbcount) >
 		      be64_to_cpu(d->d_rtb_hardlimit)))) {
 			d->d_rtbtimer = cpu_to_be32(ktime_get_real_seconds() +
-					mp->m_quotainfo->qi_rtbtimelimit);
+					defq->rtbtimelimit);
 		} else {
 			d->d_rtbwarns = 0;
 		}
@@ -321,10 +325,10 @@ xfs_dquot_disk_alloc(
 	dqp->q_blkno = XFS_FSB_TO_DADDR(mp, map.br_startblock);
 
 	/* now we can just get the buffer (there's nothing to read yet) */
-	bp = xfs_trans_get_buf(tp, mp->m_ddev_targp, dqp->q_blkno,
-			mp->m_quotainfo->qi_dqchunklen, 0);
-	if (!bp)
-		return -ENOMEM;
+	error = xfs_trans_get_buf(tp, mp->m_ddev_targp, dqp->q_blkno,
+			mp->m_quotainfo->qi_dqchunklen, 0, &bp);
+	if (error)
+		return error;
 	bp->b_ops = &xfs_dquot_buf_ops;
 
 	/*
@@ -834,7 +838,7 @@ xfs_qm_id_for_quotatype(
 	case XFS_DQ_GROUP:
 		return ip->i_d.di_gid;
 	case XFS_DQ_PROJ:
-		return xfs_get_projid(ip);
+		return ip->i_d.di_projid;
 	}
 	ASSERT(0);
 	return 0;
@@ -1126,7 +1130,7 @@ xfs_qm_dqflush(
 		xfs_buf_relse(bp);
 		xfs_dqfunlock(dqp);
 		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
-		return -EIO;
+		return -EFSCORRUPTED;
 	}
 
 	/* This is the only portion of data that needs to persist */

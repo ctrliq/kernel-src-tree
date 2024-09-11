@@ -301,11 +301,11 @@ static void gfs2_recovery_done(struct gfs2_sbd *sdp, unsigned int jid,
 
 /**
  * update_statfs_inode - Update the master statfs inode or zero out the local
- *			 statfs inode for a given journal.
+ *                       statfs inode for a given journal.
  * @jd: The journal
  * @head: If NULL, @inode is the local statfs inode and we need to zero it out.
- *	  Otherwise, it @head contains the statfs change info that needs to be
- *	  synced to the master statfs inode (pointed to by @inode).
+ *        Otherwise, it @head contains the statfs change info that needs to be
+ *        synced to the master statfs inode (pointed to by @inode).
  * @inode: statfs inode to update.
  */
 static int update_statfs_inode(struct gfs2_jdesc *jd,
@@ -339,7 +339,7 @@ static int update_statfs_inode(struct gfs2_jdesc *jd,
 			"[%+lld,%+lld,%+lld]\n", jd->jd_jid, sc.sc_total,
 			sc.sc_free, sc.sc_dinodes, head->lh_local_total,
 			head->lh_local_free, head->lh_local_dinodes);
-	} else { /* Zero out the local statfs inode */
+	} else { /* Zeroing out the local statfs inode */
 		memset(bh->b_data + sizeof(struct gfs2_dinode), 0,
 		       sizeof(struct gfs2_statfs_change));
 		/* If it's our own journal, reset any in-memory changes too */
@@ -360,7 +360,7 @@ out:
 
 /**
  * recover_local_statfs - Update the master and local statfs changes for this
- *			  journal.
+ *                        journal.
  *
  * Previously, statfs updates would be read in from the local statfs inode and
  * synced to the master statfs inode during recovery.
@@ -397,7 +397,7 @@ zero_local:
 	/* Zero out the local statfs inode so any changes in there
 	 * are not re-recovered. */
 	error = update_statfs_inode(jd, NULL,
-				    find_local_statfs_inode(sdp, jd->jd_jid));
+				    find_lcl_statfs_inode(sdp, jd->jd_jid));
 out:
 	return;
 }

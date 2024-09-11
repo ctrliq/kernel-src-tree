@@ -13,6 +13,7 @@
 #include "xfs_btree.h"
 #include "xfs_alloc_btree.h"
 #include "xfs_alloc.h"
+#include "xfs_discard.h"
 #include "xfs_error.h"
 #include "xfs_extent_busy.h"
 #include "xfs_trace.h"
@@ -44,7 +45,7 @@ xfs_trim_extents(
 	xfs_log_force(mp, XFS_LOG_SYNC);
 
 	error = xfs_alloc_read_agf(mp, NULL, agno, 0, &agbp);
-	if (error || !agbp)
+	if (error)
 		goto out_put_perag;
 
 	cur = xfs_allocbt_init_cursor(mp, NULL, agbp, agno, XFS_BTNUM_CNT);

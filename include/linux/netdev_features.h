@@ -67,14 +67,13 @@ enum {
 	 * The reserved space is limited: we need good reasons to use each
 	 * bit.
 	 */
-	__NETIF_F_RH_KABI_PLACEHOLDER_1,
 	__NETIF_F_RH_KABI_PLACEHOLDER_2,
 	__NETIF_F_RH_KABI_PLACEHOLDER_3,
 	__NETIF_F_RH_KABI_PLACEHOLDER_4,
 	__NETIF_F_RH_KABI_PLACEHOLDER_5,
 	__NETIF_F_RH_KABI_PLACEHOLDER_6,
 	__NETIF_F_RH_KABI_PLACEHOLDER_7,
-	__NETIF_F_RH_KABI_PLACEHOLDER_8,
+	NETIF_F_GRO_FRAGLIST_BIT,	/* Fraglist GRO */
 	NETIF_F_HW_TLS_RX_BIT,		/* Hardware TLS RX offload */
 
 	NETIF_F_FCOE_CRC_BIT,		/* FCoE CRC32 */
@@ -100,7 +99,6 @@ enum {
 
 	NETIF_F_GRO_HW_BIT,		/* Hardware Generic receive offload */
 	NETIF_F_HW_TLS_RECORD_BIT,	/* Offload TLS record */
-	NETIF_F_GRO_FRAGLIST_BIT,	/* Fraglist GRO */
 
 	/*
 	 * Add your fresh new feature above and remember to update

@@ -42,7 +42,9 @@ static int br_device_event(struct notifier_block *unused, unsigned long event, v
 
 	/* register of bridge completed, add sysfs entries */
 	if ((dev->priv_flags & IFF_EBRIDGE) && event == NETDEV_REGISTER) {
-		br_sysfs_addbr(dev);
+		err = br_sysfs_addbr(dev);
+		if (err)
+			return notifier_from_errno(err);
 		return NOTIFY_DONE;
 	}
 

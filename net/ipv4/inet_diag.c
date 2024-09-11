@@ -201,9 +201,13 @@ static int inet_diag_parse_attrs(const struct nlmsghdr *nlh, int hdrlen,
 static int inet_diag_get_protocol(const struct inet_diag_req_v2 *req,
 				  const struct inet_diag_dump_data *data)
 {
+	int retval;
+
 	if (data->req_nlas[INET_DIAG_REQ_PROTOCOL])
-		return nla_get_u32(data->req_nlas[INET_DIAG_REQ_PROTOCOL]);
-	return req->sdiag_protocol;
+		retval = nla_get_u32(data->req_nlas[INET_DIAG_REQ_PROTOCOL]);
+	else
+		retval = req->sdiag_protocol;
+	return retval == IPPROTO_MPTCP ? IPPROTO_MPTCP_KERN : retval;
 }
 
 #define MAX_DUMP_ALLOC_SIZE (KMALLOC_MAX_SIZE - SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))

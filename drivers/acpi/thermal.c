@@ -513,9 +513,6 @@ static void acpi_thermal_check(void *data)
 {
 	struct acpi_thermal *tz = data;
 
-	if (tz->thermal_zone->mode != THERMAL_DEVICE_ENABLED)
-		return;
-
 	thermal_zone_device_update(tz->thermal_zone,
 				   THERMAL_EVENT_UNSPECIFIED);
 }
@@ -536,34 +533,6 @@ static int thermal_get_temp(struct thermal_zone_device *thermal, int *temp)
 
 	*temp = deci_kelvin_to_millicelsius_with_offset(tz->temperature,
 							tz->kelvin_offset);
-	return 0;
-}
-
-static int thermal_set_mode(struct thermal_zone_device *thermal,
-				enum thermal_device_mode mode)
-{
-	struct acpi_thermal *tz = thermal->devdata;
-
-	if (!tz)
-		return -EINVAL;
-
-	if (mode != THERMAL_DEVICE_DISABLED &&
-	    mode != THERMAL_DEVICE_ENABLED)
-		return -EINVAL;
-	/*
-	 * enable/disable thermal management from ACPI thermal driver
-	 */
-	if (mode == THERMAL_DEVICE_DISABLED)
-		pr_warn("thermal zone will be disabled\n");
-
-	if (mode != tz->thermal_zone->mode) {
-		tz->thermal_zone->mode = mode;
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-			"%s kernel ACPI thermal control\n",
-			tz->thermal_zone->mode == THERMAL_DEVICE_ENABLED ?
-			"Enable" : "Disable"));
-		acpi_thermal_check(tz);
-	}
 	return 0;
 }
 
@@ -853,7 +822,6 @@ static struct thermal_zone_device_ops acpi_thermal_zone_ops = {
 	.bind = acpi_thermal_bind_cooling_device,
 	.unbind	= acpi_thermal_unbind_cooling_device,
 	.get_temp = thermal_get_temp,
-	.set_mode = thermal_set_mode,
 	.get_trip_type = thermal_get_trip_type,
 	.get_trip_temp = thermal_get_trip_temp,
 	.get_crit_temp = thermal_get_crit_temp,
@@ -911,13 +879,17 @@ static int acpi_thermal_register_thermal_zone(struct acpi_thermal *tz)
 		goto remove_dev_link;
 	}
 
-	tz->thermal_zone->mode = THERMAL_DEVICE_ENABLED;
+	result = thermal_zone_device_enable(tz->thermal_zone);
+	if (result)
+		goto acpi_bus_detach;
 
 	dev_info(&tz->device->dev, "registered as thermal_zone%d\n",
 		 tz->thermal_zone->id);
 
 	return 0;
 
+acpi_bus_detach:
+	acpi_bus_detach_private_data(tz->device->handle);
 remove_dev_link:
 	sysfs_remove_link(&tz->thermal_zone->device.kobj, "device");
 remove_tz_link:

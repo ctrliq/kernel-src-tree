@@ -17,18 +17,12 @@ int dump_ipv6_route(struct bpf_iter__ipv6_route *ctx)
 	const struct net_device *dev;
 	struct fib6_nh *fib6_nh;
 	unsigned int flags;
-	struct nexthop *nh;
 
 	if (rt == (void *)0)
 		return 0;
 
-	fib6_nh = &rt->fib6_nh[0];
+	fib6_nh = &rt->fib6_nh;
 	flags = rt->fib6_flags;
-
-	/* FIXME: nexthop_is_multipath is not handled here. */
-	nh = rt->nh;
-	if (rt->nh)
-		fib6_nh = &nh->nh_info->fib6_nh;
 
 	BPF_SEQ_PRINTF(seq, "%pi6 %02x ", &rt->fib6_dst.addr, rt->fib6_dst.plen);
 
@@ -38,20 +32,19 @@ int dump_ipv6_route(struct bpf_iter__ipv6_route *ctx)
 	else
 		BPF_SEQ_PRINTF(seq, "00000000000000000000000000000000 00 ");
 
-	if (fib6_nh->fib_nh_gw_family) {
-		flags |= RTF_GATEWAY;
-		BPF_SEQ_PRINTF(seq, "%pi6 ", &fib6_nh->fib_nh_gw6);
+	if (flags & RTF_GATEWAY) {
+		BPF_SEQ_PRINTF(seq, "%pi6 ", &fib6_nh->nh_gw);
 	} else {
 		BPF_SEQ_PRINTF(seq, "00000000000000000000000000000000 ");
 	}
 
-	dev = fib6_nh->fib_nh_dev;
+	dev = fib6_nh->nh_dev;
 	if (dev)
 		BPF_SEQ_PRINTF(seq, "%08x %08x %08x %08x %8s\n", rt->fib6_metric,
-			       rt->fib6_ref.refs.counter, 0, flags, dev->name);
+			       rt->fib6_ref.counter, 0, flags, dev->name);
 	else
 		BPF_SEQ_PRINTF(seq, "%08x %08x %08x %08x\n", rt->fib6_metric,
-			       rt->fib6_ref.refs.counter, 0, flags);
+			       rt->fib6_ref.counter, 0, flags);
 
 	return 0;
 }

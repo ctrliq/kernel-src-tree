@@ -5,6 +5,7 @@
 #include <linux/ipv6.h>
 #include <linux/skbuff.h>
 #include <linux/string.h>
+#include <net/inet6_hashtables.h>
 #include <net/tls.h>
 
 #include "../ccm.h"
@@ -391,8 +392,9 @@ nfp_net_tls_add(struct net_device *netdev, struct sock *sk,
 	if (direction == TLS_OFFLOAD_CTX_DIR_TX)
 		return 0;
 
-	tls_offload_rx_resync_set_type(sk,
-				       TLS_OFFLOAD_SYNC_TYPE_CORE_NEXT_HINT);
+	if (!nn->tlv_caps.tls_resync_ss)
+		tls_offload_rx_resync_set_type(sk, TLS_OFFLOAD_SYNC_TYPE_CORE_NEXT_HINT);
+
 	return 0;
 
 err_fw_remove:
@@ -417,37 +419,127 @@ nfp_net_tls_del(struct net_device *netdev, struct tls_context *tls_ctx,
 	nfp_net_tls_del_fw(nn, ntls->fw_handle);
 }
 
-static void
-nfp_net_tls_resync_rx(struct net_device *netdev, struct sock *sk, u32 seq,
-		      u8 *rcd_sn)
+static int
+nfp_net_tls_resync(struct net_device *netdev, struct sock *sk, u32 seq,
+		   u8 *rcd_sn, enum tls_offload_ctx_dir direction)
 {
 	struct nfp_net *nn = netdev_priv(netdev);
 	struct nfp_net_tls_offload_ctx *ntls;
 	struct nfp_crypto_req_update *req;
+	enum nfp_ccm_type type;
 	struct sk_buff *skb;
+	gfp_t flags;
+	int err;
 
-	skb = nfp_net_tls_alloc_simple(nn, sizeof(*req), GFP_ATOMIC);
+	flags = direction == TLS_OFFLOAD_CTX_DIR_TX ? GFP_KERNEL : GFP_ATOMIC;
+	skb = nfp_net_tls_alloc_simple(nn, sizeof(*req), flags);
 	if (!skb)
-		return;
+		return -ENOMEM;
 
-	ntls = tls_driver_ctx(sk, TLS_OFFLOAD_CTX_DIR_RX);
+	ntls = tls_driver_ctx(sk, direction);
 	req = (void *)skb->data;
 	req->ep_id = 0;
-	req->opcode = NFP_NET_CRYPTO_OP_TLS_1_2_AES_GCM_128_DEC;
+	req->opcode = nfp_tls_1_2_dir_to_opcode(direction);
 	memset(req->resv, 0, sizeof(req->resv));
 	memcpy(req->handle, ntls->fw_handle, sizeof(ntls->fw_handle));
 	req->tcp_seq = cpu_to_be32(seq);
 	memcpy(req->rec_no, rcd_sn, sizeof(req->rec_no));
 
-	nfp_ccm_mbox_post(nn, skb, NFP_CCM_TYPE_CRYPTO_UPDATE,
-			  sizeof(struct nfp_crypto_reply_simple));
+	type = NFP_CCM_TYPE_CRYPTO_UPDATE;
+	if (direction == TLS_OFFLOAD_CTX_DIR_TX) {
+		err = nfp_net_tls_communicate_simple(nn, skb, "sync", type);
+		if (err)
+			return err;
+		ntls->next_seq = seq;
+	} else {
+		if (nn->tlv_caps.tls_resync_ss)
+			type = NFP_CCM_TYPE_CRYPTO_RESYNC;
+		nfp_ccm_mbox_post(nn, skb, type,
+				  sizeof(struct nfp_crypto_reply_simple));
+		atomic_inc(&nn->ktls_rx_resync_sent);
+	}
+
+	return 0;
 }
 
 static const struct tlsdev_ops nfp_net_tls_ops = {
 	.tls_dev_add = nfp_net_tls_add,
 	.tls_dev_del = nfp_net_tls_del,
-	.tls_dev_resync_rx = nfp_net_tls_resync_rx,
+	.tls_dev_resync = nfp_net_tls_resync,
 };
+
+int nfp_net_tls_rx_resync_req(struct net_device *netdev,
+			      struct nfp_net_tls_resync_req *req,
+			      void *pkt, unsigned int pkt_len)
+{
+	struct nfp_net *nn = netdev_priv(netdev);
+	struct nfp_net_tls_offload_ctx *ntls;
+	struct ipv6hdr *ipv6h;
+	struct tcphdr *th;
+	struct iphdr *iph;
+	struct sock *sk;
+	__be32 tcp_seq;
+	int err;
+
+	iph = pkt + req->l3_offset;
+	ipv6h = pkt + req->l3_offset;
+	th = pkt + req->l4_offset;
+
+	if ((u8 *)&th[1] > (u8 *)pkt + pkt_len) {
+		netdev_warn_once(netdev, "invalid TLS RX resync request (l3_off: %hhu l4_off: %hhu pkt_len: %u)\n",
+				 req->l3_offset, req->l4_offset, pkt_len);
+		err = -EINVAL;
+		goto err_cnt_ign;
+	}
+
+	switch (iph->version) {
+	case 4:
+		sk = inet_lookup_established(dev_net(netdev), &tcp_hashinfo,
+					     iph->saddr, th->source, iph->daddr,
+					     th->dest, netdev->ifindex);
+		break;
+#if IS_ENABLED(CONFIG_IPV6)
+	case 6:
+		sk = __inet6_lookup_established(dev_net(netdev), &tcp_hashinfo,
+						&ipv6h->saddr, th->source,
+						&ipv6h->daddr, ntohs(th->dest),
+						netdev->ifindex, 0);
+		break;
+#endif
+	default:
+		netdev_warn_once(netdev, "invalid TLS RX resync request (l3_off: %hhu l4_off: %hhu ipver: %u)\n",
+				 req->l3_offset, req->l4_offset, iph->version);
+		err = -EINVAL;
+		goto err_cnt_ign;
+	}
+
+	err = 0;
+	if (!sk)
+		goto err_cnt_ign;
+	if (!tls_is_sk_rx_device_offloaded(sk) ||
+	    sk->sk_shutdown & RCV_SHUTDOWN)
+		goto err_put_sock;
+
+	ntls = tls_driver_ctx(sk, TLS_OFFLOAD_CTX_DIR_RX);
+	/* some FW versions can't report the handle and report 0s */
+	if (memchr_inv(&req->fw_handle, 0, sizeof(req->fw_handle)) &&
+	    memcmp(&req->fw_handle, &ntls->fw_handle, sizeof(ntls->fw_handle)))
+		goto err_put_sock;
+
+	/* copy to ensure alignment */
+	memcpy(&tcp_seq, &req->tcp_seq, sizeof(tcp_seq));
+	tls_offload_rx_resync_request(sk, tcp_seq);
+	atomic_inc(&nn->ktls_rx_resync_req);
+
+	sock_gen_put(sk);
+	return 0;
+
+err_put_sock:
+	sock_gen_put(sk);
+err_cnt_ign:
+	atomic_inc(&nn->ktls_rx_resync_ign);
+	return err;
+}
 
 static int nfp_net_tls_reset(struct nfp_net *nn)
 {

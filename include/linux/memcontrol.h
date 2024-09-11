@@ -32,19 +32,22 @@
 #include <linux/page-flags.h>
 
 struct mem_cgroup;
+struct obj_cgroup;
 struct page;
 struct mm_struct;
 struct kmem_cache;
 
 /* Cgroup-specific page state, on top of universal node page state */
 enum memcg_stat_item {
-	MEMCG_CACHE = NR_VM_NODE_STAT_ITEMS,
-	MEMCG_RSS,
-	MEMCG_RSS_HUGE,
-	MEMCG_SWAP,
+	MEMCG_SWAP = NR_VM_NODE_STAT_ITEMS,
 	MEMCG_SOCK,
+	MEMCG_PERCPU_B,
 	/* XXX: why are these zone and not node counters? */
 	MEMCG_KERNEL_STACK_KB,
+#ifdef __GENKSYMS__
+	_RH_KABI_MEMCG_STAT_RESERVED1,
+	_RH_KABI_MEMCG_STAT_RESERVED2,
+#endif
 	MEMCG_NR_STAT,
 };
 
@@ -54,7 +57,7 @@ enum memcg_memory_event {
 	MEMCG_MAX,
 	MEMCG_OOM,
 	MEMCG_OOM_KILL,
-	MEMCG_SWAP_HIGH,
+	RH_KABI_BROKEN_INSERT_ENUM(MEMCG_SWAP_HIGH)
 	MEMCG_SWAP_MAX,
 	MEMCG_SWAP_FAIL,
 	MEMCG_NR_MEMORY_EVENTS,
@@ -117,7 +120,7 @@ struct lruvec_stat {
  */
 struct memcg_shrinker_map {
 	struct rcu_head rcu;
-	unsigned long map[];
+	unsigned long RH_KABI_RENAME(map[0], map[]);
 };
 
 /*
@@ -141,8 +144,7 @@ struct mem_cgroup_per_node {
 	unsigned long		usage_in_excess;/* Set to the value by which */
 						/* the soft limit is exceeded*/
 	bool			on_tree;
-	bool			congested;	/* memcg has many dirty pages */
-						/* backed by a congested BDI */
+	RH_KABI_DEPRECATE(bool,	congested)
 
 	struct mem_cgroup	*memcg;		/* Back pointer, we cannot */
 						/* use container_of	   */
@@ -150,9 +152,7 @@ struct mem_cgroup_per_node {
 	 * RHEL8: The mem_cgroup_per_node is dynamically allocated at
 	 * boot time and so is perfectly fine to be extended in size.
 	 */
-#ifdef CONFIG_MEMCG_KMEM
 	RH_KABI_EXTEND(struct memcg_shrinker_map __rcu	*shrinker_map)
-#endif
 };
 
 struct mem_cgroup_threshold {
@@ -167,7 +167,7 @@ struct mem_cgroup_threshold_ary {
 	/* Size of entries[] */
 	unsigned int size;
 	/* Array of thresholds */
-	struct mem_cgroup_threshold entries[];
+	struct mem_cgroup_threshold RH_KABI_RENAME(entries[0], entries[]);
 };
 
 struct mem_cgroup_thresholds {
@@ -214,10 +214,49 @@ struct memcg_cgwb_frn {
 };
 
 /*
+ * Bucket for arbitrarily byte-sized objects charged to a memory
+ * cgroup. The bucket can be reparented in one piece when the cgroup
+ * is destroyed, without having to round up the individual references
+ * of all live memory objects in the wild.
+ */
+struct obj_cgroup {
+	struct percpu_ref refcnt;
+	struct mem_cgroup *memcg;
+	atomic_t nr_charged_bytes;
+	union {
+		struct list_head list;
+		struct rcu_head rcu;
+	};
+};
+
+/*
  * The memory controller data structure. The memory controller controls both
  * page cache and RSS per cgroup. We would eventually like to provide
  * statistics based on the statistics developed by Rik Van Riel for clock-pro,
  * to help the administrator determine what knobs to tune.
+ *
+ * RHEL8 Warning
+ * -------------
+ * The mem_cgroup structure is allocated dynamically and is not embedded in
+ * other data structures. To support new features, mem_cgroup structure can
+ * change quite a lot over time. The kABI signature of mem_cgroup structure
+ * will be maintained, but we will not guarantee field offsets will remain
+ * stable. Therefore, third-party kernel modules should not access mem_cgroup
+ * or mem_cgroup_per_node directly or use inlined functions that access them
+ * directly.
+ *
+ * In addition, the following enum types will have new upstream fields added
+ * in a way that may break kABI if they are used or referenced by 3rd party
+ * drivers.
+ *  - memcg_memory_event: affect MEMCG_NR_MEMORY_EVENTS
+ *  - node_stat_item: NR_VM_NODE_STAT_ITEMS does get used in lruvec_stat[] of
+ *    mem_cgroup_per_node (memcontrol.h) and lumped into MEMCG_NR_STAT.
+ *    The change in MEMCG_NR_STAT does increase the size of stat[] of
+ *    memcg_vmstats_percpu and vmstats[] of mem_cgroup structures.
+ *    These arrays are not at the end of the structure and so changing
+ *    the array size will break offsets of existing fields that
+ *    follows the arrays.
+ *  - vm_event_item: NR_VM_EVENT_ITEMS used in vmevents[] of memcg.
  */
 struct mem_cgroup {
 	struct cgroup_subsys_state css;
@@ -228,6 +267,13 @@ struct mem_cgroup {
 	/* Accounted resources */
 	struct page_counter memory;		/* Both v1 & v2 */
 
+#ifdef __GENKSYMS__
+	struct page_counter swap;
+	struct page_counter memsw;
+	struct page_counter kmem;
+	struct page_counter tcpmem;
+	RH_KABI_DEPRECATE(unsigned long, high)
+#else
 	union {
 		struct page_counter swap;	/* v2 only */
 		struct page_counter memsw;	/* v1 only */
@@ -236,6 +282,7 @@ struct mem_cgroup {
 	/* Legacy consumer-oriented counters */
 	struct page_counter kmem;		/* v1 only */
 	struct page_counter tcpmem;		/* v1 only */
+#endif
 
 	/* Range enforcement for interrupt charges */
 	struct work_struct high_work;
@@ -323,37 +370,29 @@ struct mem_cgroup {
         /* Index in the kmem_cache->memcg_params.memcg_caches array */
 	int kmemcg_id;
 	enum memcg_kmem_state kmem_state;
-	struct list_head kmem_caches;
+	RH_KABI_DEPRECATE(struct list_head, kmem_caches)
 #endif
+	RH_KABI_REPLACE_SPLIT(int		last_scanned_node;
+			      nodemask_t	scan_nodes;
+			      atomic_t		numainfo_events;
+			      atomic_t		numainfo_updating,
 
-	RH_KABI_DEPRECATE(int, last_scanned_node)
-#if MAX_NUMNODES > 1
-	RH_KABI_DEPRECATE(nodemask_t, scan_nodes)
-	RH_KABI_DEPRECATE(atomic_t, numainfo_events)
-	RH_KABI_DEPRECATE(atomic_t, numainfo_updating)
-#endif
-
+			      struct obj_cgroup __rcu *objcg,
+			      /* list of inherited objcgs */
+			      struct list_head	objcg_list)
 #ifdef CONFIG_CGROUP_WRITEBACK
 	struct list_head cgwb_list;
 	struct wb_domain cgwb_domain;
-	struct memcg_cgwb_frn cgwb_frn[MEMCG_CGWB_FRN_CNT];
+	RH_KABI_BROKEN_INSERT(struct memcg_cgwb_frn cgwb_frn[MEMCG_CGWB_FRN_CNT])
 #endif
 
 	/* List of events which userspace want to receive */
 	struct list_head event_list;
 	spinlock_t event_list_lock;
 
-	/*
-	 * RHEL8 Warning:
-	 * The offsets of the nodeinfo[] array entries are subject to change.
-	 * Third-party kernel modules should NOT try to access its content.
-	 * In addition, the following inline functions should not be used.
-	 *  - mem_cgroup_nodeinfo()
-	 *  - mem_cgroup_lruvec()
-	 *  - mod_lruvec_page_state(), __mod_lruvec_page_state()
-	 *  - inc_lruvec_page_state(), __inc_lruvec_page_state()
-	 *  - dec_lruvec_page_state(), __dec_lruvec_page_state()
-	 */
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	RH_KABI_BROKEN_INSERT(struct deferred_split deferred_split_queue)
+#endif
 	RH_KABI_BROKEN_INSERT(MEMCG_PADDING(_pad3_))
 	struct mem_cgroup_per_node *nodeinfo[0];
 	/* WARNING: nodeinfo must be the last member here */
@@ -366,6 +405,13 @@ struct mem_cgroup {
 #define MEMCG_CHARGE_BATCH 32U
 
 extern struct mem_cgroup *root_mem_cgroup;
+
+static __always_inline bool memcg_stat_item_in_bytes(int idx)
+{
+	if (idx == MEMCG_PERCPU_B)
+		return true;
+	return vmstat_item_in_bytes(idx);
+}
 
 static inline bool mem_cgroup_is_root(struct mem_cgroup *memcg)
 {
@@ -430,16 +476,8 @@ static inline unsigned long mem_cgroup_protection(struct mem_cgroup *root,
 enum mem_cgroup_protection mem_cgroup_protected(struct mem_cgroup *root,
 						struct mem_cgroup *memcg);
 
-int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,
-			  gfp_t gfp_mask, struct mem_cgroup **memcgp,
-			  bool compound);
-int mem_cgroup_try_charge_delay(struct page *page, struct mm_struct *mm,
-			  gfp_t gfp_mask, struct mem_cgroup **memcgp,
-			  bool compound);
-void mem_cgroup_commit_charge(struct page *page, struct mem_cgroup *memcg,
-			      bool lrucare, bool compound);
-void mem_cgroup_cancel_charge(struct page *page, struct mem_cgroup *memcg,
-		bool compound);
+int mem_cgroup_charge(struct page *page, struct mm_struct *mm, gfp_t gfp_mask);
+
 void mem_cgroup_uncharge(struct page *page);
 void mem_cgroup_uncharge_list(struct list_head *page_list);
 
@@ -470,6 +508,9 @@ static inline struct lruvec *mem_cgroup_lruvec(struct mem_cgroup *memcg,
 		goto out;
 	}
 
+	if (!memcg)
+		memcg = root_mem_cgroup;
+
 	mz = mem_cgroup_nodeinfo(memcg, pgdat->node_id);
 	lruvec = &mz->lruvec;
 out:
@@ -494,6 +535,33 @@ struct mem_cgroup *get_mem_cgroup_from_page(struct page *page);
 static inline
 struct mem_cgroup *mem_cgroup_from_css(struct cgroup_subsys_state *css){
 	return css ? container_of(css, struct mem_cgroup, css) : NULL;
+}
+
+static inline bool obj_cgroup_tryget(struct obj_cgroup *objcg)
+{
+	return percpu_ref_tryget(&objcg->refcnt);
+}
+
+static inline void obj_cgroup_get(struct obj_cgroup *objcg)
+{
+	percpu_ref_get(&objcg->refcnt);
+}
+
+static inline void obj_cgroup_put(struct obj_cgroup *objcg)
+{
+	percpu_ref_put(&objcg->refcnt);
+}
+
+/*
+ * After the initialization objcg->memcg is always pointing at
+ * a valid memcg, but can be atomically swapped to the parent memcg.
+ *
+ * The caller must ensure that the returned memcg won't be released:
+ * e.g. acquire the rcu_read_lock or css_set_lock.
+ */
+static inline struct mem_cgroup *obj_cgroup_memcg(struct obj_cgroup *objcg)
+{
+	return READ_ONCE(objcg->memcg);
 }
 
 static inline void mem_cgroup_put(struct mem_cgroup *memcg)
@@ -856,8 +924,16 @@ static inline void count_memcg_event_mm(struct mm_struct *mm,
 static inline void memcg_memory_event(struct mem_cgroup *memcg,
 				      enum memcg_memory_event event)
 {
-	atomic_long_inc(&memcg->memory_events[event]);
-	cgroup_file_notify(&memcg->events_file);
+	do {
+		atomic_long_inc(&memcg->memory_events[event]);
+		cgroup_file_notify(&memcg->events_file);
+
+		if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
+			break;
+		if (cgrp_dfl_root.flags & CGRP_ROOT_MEMORY_LOCAL_EVENTS)
+			break;
+	} while ((memcg = parent_mem_cgroup(memcg)) &&
+		 !mem_cgroup_is_root(memcg));
 }
 
 static inline void memcg_memory_event_mm(struct mm_struct *mm,
@@ -919,35 +995,10 @@ static inline enum mem_cgroup_protection mem_cgroup_protected(
 	return MEMCG_PROT_NONE;
 }
 
-static inline int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,
-					gfp_t gfp_mask,
-					struct mem_cgroup **memcgp,
-					bool compound)
+static inline int mem_cgroup_charge(struct page *page, struct mm_struct *mm,
+				    gfp_t gfp_mask)
 {
-	*memcgp = NULL;
 	return 0;
-}
-
-static inline int mem_cgroup_try_charge_delay(struct page *page,
-					      struct mm_struct *mm,
-					      gfp_t gfp_mask,
-					      struct mem_cgroup **memcgp,
-					      bool compound)
-{
-	*memcgp = NULL;
-	return 0;
-}
-
-static inline void mem_cgroup_commit_charge(struct page *page,
-					    struct mem_cgroup *memcg,
-					    bool lrucare, bool compound)
-{
-}
-
-static inline void mem_cgroup_cancel_charge(struct page *page,
-					    struct mem_cgroup *memcg,
-					    bool compound)
-{
 }
 
 static inline void mem_cgroup_uncharge(struct page *page)
@@ -1354,6 +1405,19 @@ static inline void dec_lruvec_page_state(struct page *page,
 	mod_lruvec_page_state(page, idx, -1);
 }
 
+static inline struct lruvec *parent_lruvec(struct lruvec *lruvec)
+{
+	struct mem_cgroup *memcg;
+
+	memcg = lruvec_memcg(lruvec);
+	if (!memcg)
+		return NULL;
+	memcg = parent_mem_cgroup(memcg);
+	if (!memcg)
+		return NULL;
+	return mem_cgroup_lruvec(memcg, lruvec_pgdat(lruvec));
+}
+
 #ifdef CONFIG_CGROUP_WRITEBACK
 
 struct wb_domain *mem_cgroup_wb_domain(struct bdi_writeback *wb);
@@ -1420,6 +1484,11 @@ static inline bool mem_cgroup_under_socket_pressure(struct mem_cgroup *memcg)
 	} while ((memcg = parent_mem_cgroup(memcg)));
 	return false;
 }
+
+extern int memcg_expand_shrinker_maps(int new_id);
+
+extern void memcg_set_shrinker_bit(struct mem_cgroup *memcg,
+				   int nid, int shrinker_id);
 #else
 #define mem_cgroup_sockets_enabled 0
 static inline void mem_cgroup_sk_alloc(struct sock *sk) { };
@@ -1428,10 +1497,12 @@ static inline bool mem_cgroup_under_socket_pressure(struct mem_cgroup *memcg)
 {
 	return false;
 }
-#endif
 
-struct kmem_cache *memcg_kmem_get_cache(struct kmem_cache *cachep);
-void memcg_kmem_put_cache(struct kmem_cache *cachep);
+static inline void memcg_set_shrinker_bit(struct mem_cgroup *memcg,
+					  int nid, int shrinker_id)
+{
+}
+#endif
 
 #ifdef CONFIG_MEMCG_KMEM
 int __memcg_kmem_charge(struct mem_cgroup *memcg, gfp_t gfp,
@@ -1440,8 +1511,12 @@ void __memcg_kmem_uncharge(struct mem_cgroup *memcg, unsigned int nr_pages);
 int __memcg_kmem_charge_page(struct page *page, gfp_t gfp, int order);
 void __memcg_kmem_uncharge_page(struct page *page, int order);
 
+struct obj_cgroup *get_obj_cgroup_from_current(void);
+
+int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size);
+void obj_cgroup_uncharge(struct obj_cgroup *objcg, size_t size);
+
 extern struct static_key_false memcg_kmem_enabled_key;
-extern struct workqueue_struct *memcg_kmem_cache_wq;
 
 extern int memcg_nr_cache_ids;
 void memcg_get_cache_ids(void);
@@ -1511,10 +1586,6 @@ static inline int memcg_cache_id(struct mem_cgroup *memcg)
 	return memcg ? memcg->kmemcg_id : -1;
 }
 
-extern int memcg_expand_shrinker_maps(int new_id);
-
-extern void memcg_set_shrinker_bit(struct mem_cgroup *memcg,
-				   int nid, int shrinker_id);
 struct mem_cgroup *mem_cgroup_from_obj(void *p);
 
 #else
@@ -1559,9 +1630,6 @@ static inline void memcg_get_cache_ids(void)
 static inline void memcg_put_cache_ids(void)
 {
 }
-
-static inline void memcg_set_shrinker_bit(struct mem_cgroup *memcg,
-					  int nid, int shrinker_id) { }
 
 static inline struct mem_cgroup *mem_cgroup_from_obj(void *p)
 {

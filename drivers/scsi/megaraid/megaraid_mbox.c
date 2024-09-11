@@ -3369,6 +3369,7 @@ blocked_mailbox:
  * megaraid_mbox_display_scb - display SCB information, mostly debug purposes
  * @adapter		: controller's soft state
  * @scb			: SCB to be displayed
+ * @level		: debug level for console print
  *
  * Diplay information about the given SCB iff the current debug level is
  * verbose.
@@ -4040,8 +4041,7 @@ megaraid_sysfs_get_ldmap(adapter_t *adapter)
 
 /**
  * megaraid_sysfs_show_app_hndl - display application handle for this adapter
- * @dev		: class device object representation for the host
- * @attr	: device attribute (unused)
+ * @cdev	: class device object representation for the host
  * @buf		: buffer to send data to
  *
  * Display the handle used by the applications while executing management

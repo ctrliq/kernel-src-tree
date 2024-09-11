@@ -308,7 +308,7 @@ struct apic {
 	u32	dest_logical;
 	u32	disable_esr;
 
-	enum apic_delivery_modes delivery_mode;
+	RH_KABI_REPLACE(u32 irq_delivery_mode, enum apic_delivery_modes delivery_mode)
 	u32	irq_dest_mode;
 
 	u32	(*calc_dest_apicid)(unsigned int cpu);
@@ -553,6 +553,12 @@ static inline void exiting_ack_irq(void)
 	ack_APIC_irq();
 	irq_exit();
 }
+
+struct msi_msg;
+struct irq_cfg;
+
+extern void __irq_msi_compose_msg(struct irq_cfg *cfg, struct msi_msg *msg,
+				  bool dmar);
 
 extern void ioapic_zap_locks(void);
 

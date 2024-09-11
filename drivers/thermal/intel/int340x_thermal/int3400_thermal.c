@@ -386,8 +386,8 @@ static int int3400_thermal_get_temp(struct thermal_zone_device *thermal,
 	return 0;
 }
 
-static int int3400_thermal_set_mode(struct thermal_zone_device *thermal,
-				enum thermal_device_mode mode)
+static int int3400_thermal_change_mode(struct thermal_zone_device *thermal,
+				       enum thermal_device_mode mode)
 {
 	struct int3400_thermal_priv *priv = thermal->devdata;
 	int result = 0;
@@ -395,16 +395,11 @@ static int int3400_thermal_set_mode(struct thermal_zone_device *thermal,
 	if (!priv)
 		return -EINVAL;
 
-	if (mode != THERMAL_DEVICE_ENABLED &&
-	    mode != THERMAL_DEVICE_DISABLED)
-		return -EINVAL;
-
-	if (mode != thermal->mode) {
-		thermal->mode = mode;
+	if (mode != thermal->mode)
 		result = int3400_thermal_run_osc(priv->adev->handle,
 						priv->current_uuid_index,
 						mode == THERMAL_DEVICE_ENABLED);
-	}
+
 
 	evaluate_odvp(priv);
 
@@ -413,7 +408,7 @@ static int int3400_thermal_set_mode(struct thermal_zone_device *thermal,
 
 static struct thermal_zone_device_ops int3400_thermal_ops = {
 	.get_temp = int3400_thermal_get_temp,
-	.set_mode = int3400_thermal_set_mode,
+	.change_mode = int3400_thermal_change_mode,
 };
 
 static struct thermal_zone_params int3400_thermal_params = {

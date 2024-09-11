@@ -47,14 +47,17 @@ TRACE_DEFINE_ENUM(AF_INET6);
 		{ AF_INET,		"AF_INET" },		\
 		{ AF_INET6,		"AF_INET6" })
 
-DECLARE_EVENT_CLASS(xdr_buf_class,
+DECLARE_EVENT_CLASS(rpc_xdr_buf_class,
 	TP_PROTO(
+		const struct rpc_task *task,
 		const struct xdr_buf *xdr
 	),
 
-	TP_ARGS(xdr),
+	TP_ARGS(task, xdr),
 
 	TP_STRUCT__entry(
+		__field(unsigned int, task_id)
+		__field(unsigned int, client_id)
 		__field(const void *, head_base)
 		__field(size_t, head_len)
 		__field(const void *, tail_base)
@@ -64,6 +67,9 @@ DECLARE_EVENT_CLASS(xdr_buf_class,
 	),
 
 	TP_fast_assign(
+		__entry->task_id = task->tk_pid;
+		__entry->client_id = task->tk_client ?
+				     task->tk_client->cl_clid : -1;
 		__entry->head_base = xdr->head[0].iov_base;
 		__entry->head_len = xdr->head[0].iov_len;
 		__entry->tail_base = xdr->tail[0].iov_base;
@@ -72,23 +78,26 @@ DECLARE_EVENT_CLASS(xdr_buf_class,
 		__entry->msg_len = xdr->len;
 	),
 
-	TP_printk("head=[%p,%zu] page=%u tail=[%p,%zu] len=%u",
+	TP_printk("task:%u@%u head=[%p,%zu] page=%u tail=[%p,%zu] len=%u",
+		__entry->task_id, __entry->client_id,
 		__entry->head_base, __entry->head_len, __entry->page_len,
 		__entry->tail_base, __entry->tail_len, __entry->msg_len
 	)
 );
 
-#define DEFINE_XDRBUF_EVENT(name)					\
-		DEFINE_EVENT(xdr_buf_class, name,			\
+#define DEFINE_RPCXDRBUF_EVENT(name)					\
+		DEFINE_EVENT(rpc_xdr_buf_class,				\
+				rpc_xdr_##name,				\
 				TP_PROTO(				\
+					const struct rpc_task *task,	\
 					const struct xdr_buf *xdr	\
 				),					\
-				TP_ARGS(xdr))
+				TP_ARGS(task, xdr))
 
-DEFINE_XDRBUF_EVENT(xprt_sendto);
-DEFINE_XDRBUF_EVENT(xprt_recvfrom);
-DEFINE_XDRBUF_EVENT(svc_recvfrom);
-DEFINE_XDRBUF_EVENT(svc_sendto);
+DEFINE_RPCXDRBUF_EVENT(sendto);
+DEFINE_RPCXDRBUF_EVENT(recvfrom);
+DEFINE_RPCXDRBUF_EVENT(reply_pages);
+
 
 DECLARE_EVENT_CLASS(rpc_clnt_class,
 	TP_PROTO(
@@ -704,43 +713,6 @@ TRACE_EVENT(rpc_xdr_alignment,
 	)
 );
 
-TRACE_EVENT(rpc_reply_pages,
-	TP_PROTO(
-		const struct rpc_rqst *req
-	),
-
-	TP_ARGS(req),
-
-	TP_STRUCT__entry(
-		__field(unsigned int, task_id)
-		__field(unsigned int, client_id)
-		__field(const void *, head_base)
-		__field(size_t, head_len)
-		__field(const void *, tail_base)
-		__field(size_t, tail_len)
-		__field(unsigned int, page_len)
-	),
-
-	TP_fast_assign(
-		__entry->task_id = req->rq_task->tk_pid;
-		__entry->client_id = req->rq_task->tk_client->cl_clid;
-
-		__entry->head_base = req->rq_rcv_buf.head[0].iov_base;
-		__entry->head_len = req->rq_rcv_buf.head[0].iov_len;
-		__entry->page_len = req->rq_rcv_buf.page_len;
-		__entry->tail_base = req->rq_rcv_buf.tail[0].iov_base;
-		__entry->tail_len = req->rq_rcv_buf.tail[0].iov_len;
-	),
-
-	TP_printk(
-		"task:%u@%u xdr=[%p,%zu]/%u/[%p,%zu]\n",
-		__entry->task_id, __entry->client_id,
-		__entry->head_base, __entry->head_len,
-		__entry->page_len,
-		__entry->tail_base, __entry->tail_len
-	)
-);
-
 /*
  * First define the enums in the below macros to be exported to userspace
  * via TRACE_DEFINE_ENUM().
@@ -1231,15 +1203,82 @@ TRACE_EVENT(xs_stream_read_request,
 			__entry->copied, __entry->reclen, __entry->offset)
 );
 
+
+DECLARE_EVENT_CLASS(svc_xdr_buf_class,
+	TP_PROTO(
+		const struct svc_rqst *rqst,
+		const struct xdr_buf *xdr
+	),
+
+	TP_ARGS(rqst, xdr),
+
+	TP_STRUCT__entry(
+		__field(u32, xid)
+		__field(const void *, head_base)
+		__field(size_t, head_len)
+		__field(const void *, tail_base)
+		__field(size_t, tail_len)
+		__field(unsigned int, page_len)
+		__field(unsigned int, msg_len)
+	),
+
+	TP_fast_assign(
+		__entry->xid = be32_to_cpu(rqst->rq_xid);
+		__entry->head_base = xdr->head[0].iov_base;
+		__entry->head_len = xdr->head[0].iov_len;
+		__entry->tail_base = xdr->tail[0].iov_base;
+		__entry->tail_len = xdr->tail[0].iov_len;
+		__entry->page_len = xdr->page_len;
+		__entry->msg_len = xdr->len;
+	),
+
+	TP_printk("xid=0x%08x head=[%p,%zu] page=%u tail=[%p,%zu] len=%u",
+		__entry->xid,
+		__entry->head_base, __entry->head_len, __entry->page_len,
+		__entry->tail_base, __entry->tail_len, __entry->msg_len
+	)
+);
+
+#define DEFINE_SVCXDRBUF_EVENT(name)					\
+		DEFINE_EVENT(svc_xdr_buf_class,				\
+				svc_xdr_##name,				\
+				TP_PROTO(				\
+					const struct svc_rqst *rqst,	\
+					const struct xdr_buf *xdr	\
+				),					\
+				TP_ARGS(rqst, xdr))
+
+DEFINE_SVCXDRBUF_EVENT(recvfrom);
+DEFINE_SVCXDRBUF_EVENT(sendto);
+
+/*
+ * from include/linux/sunrpc/svc.h
+ */
+#define SVC_RQST_FLAG_LIST						\
+	svc_rqst_flag(SECURE)						\
+	svc_rqst_flag(LOCAL)						\
+	svc_rqst_flag(USEDEFERRAL)					\
+	svc_rqst_flag(DROPME)						\
+	svc_rqst_flag(SPLICE_OK)					\
+	svc_rqst_flag(VICTIM)						\
+	svc_rqst_flag(BUSY)						\
+	svc_rqst_flag(DATA)						\
+	svc_rqst_flag_end(AUTHERR)
+
+#undef svc_rqst_flag
+#undef svc_rqst_flag_end
+#define svc_rqst_flag(x)	TRACE_DEFINE_ENUM(RQ_##x);
+#define svc_rqst_flag_end(x)	TRACE_DEFINE_ENUM(RQ_##x);
+
+SVC_RQST_FLAG_LIST
+
+#undef svc_rqst_flag
+#undef svc_rqst_flag_end
+#define svc_rqst_flag(x)	{ BIT(RQ_##x), #x },
+#define svc_rqst_flag_end(x)	{ BIT(RQ_##x), #x }
+
 #define show_rqstp_flags(flags)						\
-	__print_flags(flags, "|",					\
-		{ (1UL << RQ_SECURE),		"RQ_SECURE"},		\
-		{ (1UL << RQ_LOCAL),		"RQ_LOCAL"},		\
-		{ (1UL << RQ_USEDEFERRAL),	"RQ_USEDEFERRAL"},	\
-		{ (1UL << RQ_DROPME),		"RQ_DROPME"},		\
-		{ (1UL << RQ_SPLICE_OK),	"RQ_SPLICE_OK"},	\
-		{ (1UL << RQ_VICTIM),		"RQ_VICTIM"},		\
-		{ (1UL << RQ_BUSY),		"RQ_BUSY"})
+		__print_flags(flags, "|", SVC_RQST_FLAG_LIST)
 
 TRACE_EVENT(svc_recv,
 	TP_PROTO(struct svc_rqst *rqst, int len),

@@ -1209,6 +1209,18 @@ nfs_delegation_test_free_expired(struct inode *inode,
 		nfs_remove_bad_delegation(inode, stateid);
 }
 
+/**
+ * nfs_test_expired_all_delegations - test all delegations for a client
+ * @clp: nfs_client to process
+ *
+ * Helper for handling "recallable state revoked" status from server.
+ */
+void nfs_test_expired_all_delegations(struct nfs_client *clp)
+{
+	nfs_mark_test_expired_all_delegations(clp);
+	nfs4_schedule_state_manager(clp);
+}
+
 static int nfs_server_reap_expired_delegations(struct nfs_server *server,
 		void __always_unused *data)
 {
@@ -1249,18 +1261,6 @@ restart_locked:
 	}
 	rcu_read_unlock();
 	return 0;
-}
-
-/**
- * nfs_test_expired_all_delegations - test all delegations for a client
- * @clp: nfs_client to process
- *
- * Helper for handling "recallable state revoked" status from server.
- */
-void nfs_test_expired_all_delegations(struct nfs_client *clp)
-{
-	nfs_mark_test_expired_all_delegations(clp);
-	nfs4_schedule_state_manager(clp);
 }
 
 /**

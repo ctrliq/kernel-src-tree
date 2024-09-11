@@ -530,7 +530,7 @@ static int tipc_aead_init(struct tipc_aead **aead, struct tipc_aead_key *ukey,
 	/* Allocate per-cpu TFM entry pointer */
 	tmp->tfm_entry = alloc_percpu(struct tipc_tfm *);
 	if (!tmp->tfm_entry) {
-		kzfree(tmp);
+		kfree_sensitive(tmp);
 		return -ENOMEM;
 	}
 
@@ -580,7 +580,7 @@ static int tipc_aead_init(struct tipc_aead **aead, struct tipc_aead_key *ukey,
 	/* Not any TFM is allocated? */
 	if (!tfm_cnt) {
 		free_percpu(tmp->tfm_entry);
-		kzfree(tmp);
+		kfree_sensitive(tmp);
 		return err;
 	}
 
@@ -635,7 +635,7 @@ static int tipc_aead_clone(struct tipc_aead **dst, struct tipc_aead *src)
 
 	aead->tfm_entry = alloc_percpu_gfp(struct tipc_tfm *, GFP_ATOMIC);
 	if (unlikely(!aead->tfm_entry)) {
-		kzfree(aead);
+		kfree_sensitive(aead);
 		return -ENOMEM;
 	}
 
@@ -1488,7 +1488,7 @@ int tipc_crypto_start(struct tipc_crypto **crypto, struct net *net,
 	/* Allocate statistic structure */
 	c->stats = alloc_percpu_gfp(struct tipc_crypto_stats, GFP_ATOMIC);
 	if (!c->stats) {
-		kzfree(c);
+		kfree_sensitive(c);
 		return -ENOMEM;
 	}
 
@@ -1543,7 +1543,7 @@ void tipc_crypto_stop(struct tipc_crypto **crypto)
 	free_percpu(c->stats);
 
 	*crypto = NULL;
-	kzfree(c);
+	kfree_sensitive(c);
 }
 
 void tipc_crypto_timeout(struct tipc_crypto *rx)

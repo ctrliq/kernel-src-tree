@@ -1588,13 +1588,6 @@ static inline void drbd_tcp_uncork(struct socket *sock)
 			(char*)&val, sizeof(val));
 }
 
-static inline void drbd_tcp_nodelay(struct socket *sock)
-{
-	int val = 1;
-	(void) kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY,
-			(char*)&val, sizeof(val));
-}
-
 static inline void drbd_tcp_quickack(struct socket *sock)
 {
 	int val = 2;

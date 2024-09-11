@@ -1454,11 +1454,13 @@ int acpi_dma_get_range(struct device *dev, u64 *dma_addr, u64 *offset,
 }
 
 /**
- * acpi_dma_configure - Set-up DMA configuration for the device.
+ * acpi_dma_configure_id - Set-up DMA configuration for the device.
  * @dev: The pointer to the device
  * @attr: device dma attributes
+ * @input_id: input device id const value pointer
  */
-int acpi_dma_configure(struct device *dev, enum dev_dma_attr attr)
+int acpi_dma_configure_id(struct device *dev, enum dev_dma_attr attr,
+			  const u32 *input_id)
 {
 	const struct iommu_ops *iommu;
 	u64 dma_addr = 0, size = 0;
@@ -1470,14 +1472,33 @@ int acpi_dma_configure(struct device *dev, enum dev_dma_attr attr)
 
 	iort_dma_setup(dev, &dma_addr, &size);
 
-	iommu = iort_iommu_configure(dev);
-	if (IS_ERR(iommu) && PTR_ERR(iommu) == -EPROBE_DEFER)
+	iommu = iort_iommu_configure_id(dev, input_id);
+	if (PTR_ERR(iommu) == -EPROBE_DEFER)
 		return -EPROBE_DEFER;
 
 	arch_setup_dma_ops(dev, dma_addr, size,
 				iommu, attr == DEV_DMA_COHERENT);
 
 	return 0;
+}
+EXPORT_SYMBOL_GPL(acpi_dma_configure_id);
+
+/**
+ * RHEL-only:
+ * acpi_dma_configure - Set-up DMA configuration for the device.
+ * @dev: The pointer to the device
+ * @attr: device dma attributes
+ *
+ * This function is retained here in order to maintain the kABI.  In
+ * upstream commit b8e069a2a8da (ACPI/IORT: Add an input ID to
+ * acpi_dma_configure()) the declaration was replaced with a static inline
+ * defintion in acpi_bus.h.  However, doing so breaks the kABI.  Move the
+ * definition back here to the original location so the declaration can stay
+ * the same and satisfy kABI.
+ */
+int acpi_dma_configure(struct device *dev, enum dev_dma_attr attr)
+{
+	return acpi_dma_configure_id(dev, attr, NULL);
 }
 EXPORT_SYMBOL_GPL(acpi_dma_configure);
 

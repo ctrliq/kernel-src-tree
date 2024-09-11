@@ -1853,7 +1853,7 @@ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
 			ret = HV_STATUS_INVALID_PARAMETER;
 			break;
 		}
-		fallthrough;
+		/* fall through */
 	case HVCALL_RESET_DEBUG_SESSION: {
 		struct kvm_hv_syndbg *syndbg = vcpu_to_hv_syndbg(vcpu);
 
@@ -1951,8 +1951,8 @@ int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args)
 	return kvm_hv_eventfd_assign(kvm, args->conn_id, args->fd);
 }
 
-int kvm_vcpu_ioctl_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
-				struct kvm_cpuid_entry2 __user *entries)
+int kvm_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
+		     struct kvm_cpuid_entry2 __user *entries)
 {
 	uint16_t evmcs_ver = 0;
 	struct kvm_cpuid_entry2 cpuid_entries[] = {
@@ -2011,25 +2011,25 @@ int kvm_vcpu_ioctl_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
 			break;
 
 		case HYPERV_CPUID_FEATURES:
-			ent->eax |= HV_X64_MSR_VP_RUNTIME_AVAILABLE;
+			ent->eax |= HV_MSR_VP_RUNTIME_AVAILABLE;
 			ent->eax |= HV_MSR_TIME_REF_COUNT_AVAILABLE;
-			ent->eax |= HV_X64_MSR_SYNIC_AVAILABLE;
+			ent->eax |= HV_MSR_SYNIC_AVAILABLE;
 			ent->eax |= HV_MSR_SYNTIMER_AVAILABLE;
-			ent->eax |= HV_X64_MSR_APIC_ACCESS_AVAILABLE;
-			ent->eax |= HV_X64_MSR_HYPERCALL_AVAILABLE;
-			ent->eax |= HV_X64_MSR_VP_INDEX_AVAILABLE;
-			ent->eax |= HV_X64_MSR_RESET_AVAILABLE;
+			ent->eax |= HV_MSR_APIC_ACCESS_AVAILABLE;
+			ent->eax |= HV_MSR_HYPERCALL_AVAILABLE;
+			ent->eax |= HV_MSR_VP_INDEX_AVAILABLE;
+			ent->eax |= HV_MSR_RESET_AVAILABLE;
 			ent->eax |= HV_MSR_REFERENCE_TSC_AVAILABLE;
-			ent->eax |= HV_X64_ACCESS_FREQUENCY_MSRS;
-			ent->eax |= HV_X64_ACCESS_REENLIGHTENMENT;
+			ent->eax |= HV_ACCESS_FREQUENCY_MSRS;
+			ent->eax |= HV_ACCESS_REENLIGHTENMENT;
 
-			ent->ebx |= HV_X64_POST_MESSAGES;
-			ent->ebx |= HV_X64_SIGNAL_EVENTS;
+			ent->ebx |= HV_POST_MESSAGES;
+			ent->ebx |= HV_SIGNAL_EVENTS;
 
 			ent->edx |= HV_FEATURE_FREQUENCY_MSRS_AVAILABLE;
 			ent->edx |= HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE;
 
-			ent->ebx |= HV_X64_DEBUGGING;
+			ent->ebx |= HV_DEBUGGING;
 			ent->edx |= HV_X64_GUEST_DEBUGGING_AVAILABLE;
 			ent->edx |= HV_FEATURE_DEBUG_MSRS_AVAILABLE;
 
@@ -2037,7 +2037,7 @@ int kvm_vcpu_ioctl_get_hv_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid2 *cpuid,
 			 * Direct Synthetic timers only make sense with in-kernel
 			 * LAPIC
 			 */
-			if (lapic_in_kernel(vcpu))
+			if (!vcpu || lapic_in_kernel(vcpu))
 				ent->edx |= HV_STIMER_DIRECT_MODE_AVAILABLE;
 
 			break;

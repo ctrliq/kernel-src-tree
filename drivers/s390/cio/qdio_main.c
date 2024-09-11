@@ -510,14 +510,7 @@ static int get_inbound_buffer_frontier(struct qdio_q *q, unsigned int start)
 
 static int qdio_inbound_q_moved(struct qdio_q *q, unsigned int start)
 {
-	int count;
-
-	count = get_inbound_buffer_frontier(q, start);
-
-	if (count && !is_thinint_irq(q->irq_ptr) && MACHINE_IS_LPAR)
-		q->u.in.timestamp = get_tod_clock();
-
-	return count;
+	return get_inbound_buffer_frontier(q, start);
 }
 
 static inline int qdio_inbound_q_done(struct qdio_q *q, unsigned int start)
@@ -535,22 +528,7 @@ static inline int qdio_inbound_q_done(struct qdio_q *q, unsigned int start)
 		/* more work coming */
 		return 0;
 
-	if (is_thinint_irq(q->irq_ptr))
-		return 1;
-
-	/* don't poll under z/VM */
-	if (MACHINE_IS_VM)
-		return 1;
-
-	/*
-	 * At this point we know, that inbound first_to_check
-	 * has (probably) not moved (see qdio_inbound_processing).
-	 */
-	if (get_tod_clock_fast() > q->u.in.timestamp + QDIO_INPUT_THRESHOLD) {
-		DBF_DEV_EVENT(DBF_INFO, q->irq_ptr, "in done:%02x", start);
-		return 1;
-	} else
-		return 0;
+	return 1;
 }
 
 static inline void qdio_handle_aobs(struct qdio_q *q, int start, int count)
@@ -889,19 +867,14 @@ static void qdio_int_handler_pci(struct qdio_irq *irq_ptr)
 	if (unlikely(irq_ptr->state != QDIO_IRQ_STATE_ACTIVE))
 		return;
 
-	for_each_input_queue(irq_ptr, q, i) {
-		if (q->u.in.queue_start_poll) {
-			/* skip if polling is enabled or already in work */
-			if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
-				     &q->u.in.queue_irq_state)) {
-				QDIO_PERF_STAT_INC(irq_ptr, int_discarded);
-				continue;
-			}
-			q->u.in.queue_start_poll(q->irq_ptr->cdev, q->nr,
-						 q->irq_ptr->int_parm);
-		} else {
+	if (irq_ptr->irq_poll) {
+		if (!test_and_set_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state))
+			irq_ptr->irq_poll(irq_ptr->cdev, irq_ptr->int_parm);
+		else
+			QDIO_PERF_STAT_INC(irq_ptr, int_discarded);
+	} else {
+		for_each_input_queue(irq_ptr, q, i)
 			tasklet_schedule(&q->tasklet);
-		}
 	}
 
 	if (!pci_out_supported(irq_ptr) || !irq_ptr->scan_threshold)
@@ -1539,24 +1512,24 @@ EXPORT_SYMBOL_GPL(do_QDIO);
 /**
  * qdio_start_irq - enable interrupt processing for the device
  * @cdev: associated ccw_device for the qdio subchannel
- * @nr: input queue number
  *
  * Return codes
  *   0 - success
  *   1 - irqs not started since new data is available
  */
-int qdio_start_irq(struct ccw_device *cdev, int nr)
+int qdio_start_irq(struct ccw_device *cdev)
 {
 	struct qdio_q *q;
 	struct qdio_irq *irq_ptr = cdev->private->qdio_data;
+	unsigned int i;
 
 	if (!irq_ptr)
 		return -ENODEV;
-	q = irq_ptr->input_qs[nr];
 
-	clear_nonshared_ind(irq_ptr);
-	qdio_stop_polling(q);
-	clear_bit(QDIO_QUEUE_IRQS_DISABLED, &q->u.in.queue_irq_state);
+	for_each_input_queue(irq_ptr, q, i)
+		qdio_stop_polling(q);
+
+	clear_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state);
 
 	/*
 	 * We need to check again to not lose initiative after
@@ -1564,13 +1537,16 @@ int qdio_start_irq(struct ccw_device *cdev, int nr)
 	 */
 	if (test_nonshared_ind(irq_ptr))
 		goto rescan;
-	if (!qdio_inbound_q_done(q, q->first_to_check))
-		goto rescan;
+
+	for_each_input_queue(irq_ptr, q, i) {
+		if (!qdio_inbound_q_done(q, q->first_to_check))
+			goto rescan;
+	}
+
 	return 0;
 
 rescan:
-	if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
-			     &q->u.in.queue_irq_state))
+	if (test_and_set_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state))
 		return 0;
 	else
 		return 1;
@@ -1658,116 +1634,24 @@ EXPORT_SYMBOL(qdio_get_next_buffers);
 /**
  * qdio_stop_irq - disable interrupt processing for the device
  * @cdev: associated ccw_device for the qdio subchannel
- * @nr: input queue number
  *
  * Return codes
  *   0 - interrupts were already disabled
  *   1 - interrupts successfully disabled
  */
-int qdio_stop_irq(struct ccw_device *cdev, int nr)
+int qdio_stop_irq(struct ccw_device *cdev)
 {
-	struct qdio_q *q;
 	struct qdio_irq *irq_ptr = cdev->private->qdio_data;
 
 	if (!irq_ptr)
 		return -ENODEV;
-	q = irq_ptr->input_qs[nr];
 
-	if (test_and_set_bit(QDIO_QUEUE_IRQS_DISABLED,
-			     &q->u.in.queue_irq_state))
+	if (test_and_set_bit(QDIO_IRQ_DISABLED, &irq_ptr->poll_state))
 		return 0;
 	else
 		return 1;
 }
 EXPORT_SYMBOL(qdio_stop_irq);
-
-/**
- * qdio_pnso_brinfo() - perform network subchannel op #0 - bridge info.
- * @schid:		Subchannel ID.
- * @cnc:		Boolean Change-Notification Control
- * @response:		Response code will be stored at this address
- * @cb: 		Callback function will be executed for each element
- *			of the address list
- * @priv:		Pointer to pass to the callback function.
- *
- * Performs "Store-network-bridging-information list" operation and calls
- * the callback function for every entry in the list. If "change-
- * notification-control" is set, further changes in the address list
- * will be reported via the IPA command.
- */
-int qdio_pnso_brinfo(struct subchannel_id schid,
-		int cnc, u16 *response,
-		void (*cb)(void *priv, enum qdio_brinfo_entry_type type,
-				void *entry),
-		void *priv)
-{
-	struct chsc_pnso_area *rr;
-	int rc;
-	u32 prev_instance = 0;
-	int isfirstblock = 1;
-	int i, size, elems;
-
-	rr = (struct chsc_pnso_area *)get_zeroed_page(GFP_KERNEL);
-	if (rr == NULL)
-		return -ENOMEM;
-	do {
-		/* on the first iteration, naihdr.resume_token will be zero */
-		rc = chsc_pnso_brinfo(schid, rr, rr->naihdr.resume_token, cnc);
-		if (rc != 0 && rc != -EBUSY)
-			goto out;
-		if (rr->response.code != 1) {
-			rc = -EIO;
-			continue;
-		} else
-			rc = 0;
-
-		if (cb == NULL)
-			continue;
-
-		size = rr->naihdr.naids;
-		elems = (rr->response.length -
-				sizeof(struct chsc_header) -
-				sizeof(struct chsc_brinfo_naihdr)) /
-				size;
-
-		if (!isfirstblock && (rr->naihdr.instance != prev_instance)) {
-			/* Inform the caller that they need to scrap */
-			/* the data that was already reported via cb */
-				rc = -EAGAIN;
-				break;
-		}
-		isfirstblock = 0;
-		prev_instance = rr->naihdr.instance;
-		for (i = 0; i < elems; i++)
-			switch (size) {
-			case sizeof(struct qdio_brinfo_entry_l3_ipv6):
-				(*cb)(priv, l3_ipv6_addr,
-						&rr->entries.l3_ipv6[i]);
-				break;
-			case sizeof(struct qdio_brinfo_entry_l3_ipv4):
-				(*cb)(priv, l3_ipv4_addr,
-						&rr->entries.l3_ipv4[i]);
-				break;
-			case sizeof(struct qdio_brinfo_entry_l2):
-				(*cb)(priv, l2_addr_lnid,
-						&rr->entries.l2[i]);
-				break;
-			default:
-				WARN_ON_ONCE(1);
-				rc = -EIO;
-				goto out;
-			}
-	} while (rr->response.code == 0x0107 ||  /* channel busy */
-		  (rr->response.code == 1 && /* list stored */
-		   /* resume token is non-zero => list incomplete */
-		   (rr->naihdr.resume_token.t1 || rr->naihdr.resume_token.t2)));
-	(*response) = rr->response.code;
-
-out:
-	free_page((unsigned long)rr);
-	return rc;
-}
-EXPORT_SYMBOL_GPL(qdio_pnso_brinfo);
 
 static int __init init_QDIO(void)
 {
@@ -1779,16 +1663,11 @@ static int __init init_QDIO(void)
 	rc = qdio_setup_init();
 	if (rc)
 		goto out_debug;
-	rc = tiqdio_allocate_memory();
+	rc = qdio_thinint_init();
 	if (rc)
 		goto out_cache;
-	rc = tiqdio_register_thinints();
-	if (rc)
-		goto out_ti;
 	return 0;
 
-out_ti:
-	tiqdio_free_memory();
 out_cache:
 	qdio_setup_exit();
 out_debug:
@@ -1798,8 +1677,7 @@ out_debug:
 
 static void __exit exit_QDIO(void)
 {
-	tiqdio_unregister_thinints();
-	tiqdio_free_memory();
+	qdio_thinint_exit();
 	qdio_setup_exit();
 	qdio_debug_exit();
 }

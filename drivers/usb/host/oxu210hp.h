@@ -444,3 +444,5 @@ enum ehci_timer_action {
 	TIMER_ASYNC_SHRINK,
 	TIMER_ASYNC_OFF,
 };
+
+#include <linux/oxu210hp.h>

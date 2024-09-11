@@ -607,12 +607,12 @@ static int gfs2_jindex_hold(struct gfs2_sbd *sdp, struct gfs2_holder *ji_gh)
 }
 
 /**
- * init_statfs - look up and initialize master and local (per node) statfs inodes
+ * init_statfs - lookup and initialize master and local (per node)
+ *               statfs inodes. This should be called after the jindex
+ *               is initialized in init_journal() and before
+ *               gfs2_journal_recovery() is called because we need to
+ *               be able to write to these inodes during recovery.
  * @sdp: The GFS2 superblock
- *
- * This should be called after the jindex is initialized in init_journal() and
- * before gfs2_journal_recovery() is called because we need to be able to write
- * to these inodes during recovery.
  *
  * Returns: errno
  */
@@ -644,11 +644,11 @@ static int init_statfs(struct gfs2_sbd *sdp)
 	/* For each jid, lookup the corresponding local statfs inode in the
 	 * per_node metafs directory and save it in the sdp->sd_sc_inodes_list. */
 	list_for_each_entry(jd, &sdp->sd_jindex_list, jd_list) {
-		struct local_statfs_inode *lsi =
-			kmalloc(sizeof(struct local_statfs_inode), GFP_NOFS);
+		struct lcl_statfs_inode *lsi =
+			kmalloc(sizeof(struct lcl_statfs_inode), GFP_NOFS);
 		if (!lsi) {
 			error = -ENOMEM;
-			goto free_local;
+			goto free_lcl;
 		}
 		sprintf(buf, "statfs_change%u", jd->jd_jid);
 		lsi->si_sc_inode = gfs2_lookup_simple(pn, buf);
@@ -656,7 +656,7 @@ static int init_statfs(struct gfs2_sbd *sdp)
 			error = PTR_ERR(lsi->si_sc_inode);
 			fs_err(sdp, "can't find local \"sc\" file#%u: %d\n",
 			       jd->jd_jid, error);
-			goto free_local;
+			goto free_lcl;
 		}
 		lsi->si_jid = jd->jd_jid;
 		if (jd->jd_jid == sdp->sd_jdesc->jd_jid)
@@ -671,12 +671,12 @@ static int init_statfs(struct gfs2_sbd *sdp)
 				   &sdp->sd_sc_gh);
 	if (error) {
 		fs_err(sdp, "can't lock local \"sc\" file: %d\n", error);
-		goto free_local;
+		goto free_lcl;
 	}
 	return 0;
 
-free_local:
-	free_local_statfs_inodes(sdp);
+free_lcl:
+	free_lcl_statfs_inodes(sdp);
 	iput(pn);
 put_statfs:
 	iput(sdp->sd_statfs_inode);
@@ -689,7 +689,7 @@ static void uninit_statfs(struct gfs2_sbd *sdp)
 {
 	if (!sdp->sd_args.ar_spectator) {
 		gfs2_glock_dq_uninit(&sdp->sd_sc_gh);
-		free_local_statfs_inodes(sdp);
+		free_lcl_statfs_inodes(sdp);
 	}
 	iput(sdp->sd_statfs_inode);
 }
@@ -1286,6 +1286,7 @@ enum gfs2_param {
 	Opt_upgrade,
 	Opt_acl,
 	Opt_quota,
+	Opt_quota_flag,
 	Opt_suiddir,
 	Opt_data,
 	Opt_meta,
@@ -1300,17 +1301,11 @@ enum gfs2_param {
 	Opt_loccookie,
 };
 
-enum opt_quota {
-	Opt_quota_unset = 0,
-	Opt_quota_off,
-	Opt_quota_account,
-	Opt_quota_on,
-};
-
-static const unsigned int opt_quota_values[] = {
-	[Opt_quota_off]     = GFS2_QUOTA_OFF,
-	[Opt_quota_account] = GFS2_QUOTA_ACCOUNT,
-	[Opt_quota_on]      = GFS2_QUOTA_ON,
+static const struct constant_table gfs2_param_quota[] = {
+	{"off",        GFS2_QUOTA_OFF},
+	{"account",    GFS2_QUOTA_ACCOUNT},
+	{"on",         GFS2_QUOTA_ON},
+	{}
 };
 
 enum opt_data {
@@ -1318,12 +1313,24 @@ enum opt_data {
 	Opt_data_ordered   = GFS2_DATA_ORDERED,
 };
 
+static const struct constant_table gfs2_param_data[] = {
+	{"writeback",  Opt_data_writeback },
+	{"ordered",    Opt_data_ordered },
+	{}
+};
+
 enum opt_errors {
 	Opt_errors_withdraw = GFS2_ERRORS_WITHDRAW,
 	Opt_errors_panic    = GFS2_ERRORS_PANIC,
 };
 
-static const struct fs_parameter_spec gfs2_param_specs[] = {
+static const struct constant_table gfs2_param_errors[] = {
+	{"withdraw",   Opt_errors_withdraw },
+	{"panic",      Opt_errors_panic },
+	{}
+};
+
+static const struct fs_parameter_spec gfs2_fs_parameters[] = {
 	fsparam_string ("lockproto",          Opt_lockproto),
 	fsparam_string ("locktable",          Opt_locktable),
 	fsparam_string ("hostdata",           Opt_hostdata),
@@ -1336,11 +1343,11 @@ static const struct fs_parameter_spec gfs2_param_specs[] = {
 	fsparam_flag   ("upgrade",            Opt_upgrade),
 	fsparam_flag_no("acl",                Opt_acl),
 	fsparam_flag_no("suiddir",            Opt_suiddir),
-	fsparam_enum   ("data",               Opt_data),
+	fsparam_enum   ("data",               Opt_data, gfs2_param_data),
 	fsparam_flag   ("meta",               Opt_meta),
 	fsparam_flag_no("discard",            Opt_discard),
 	fsparam_s32    ("commit",             Opt_commit),
-	fsparam_enum   ("errors",             Opt_errors),
+	fsparam_enum   ("errors",             Opt_errors, gfs2_param_errors),
 	fsparam_s32    ("statfs_quantum",     Opt_statfs_quantum),
 	fsparam_s32    ("statfs_percent",     Opt_statfs_percent),
 	fsparam_s32    ("quota_quantum",      Opt_quota_quantum),
@@ -1348,25 +1355,9 @@ static const struct fs_parameter_spec gfs2_param_specs[] = {
 	fsparam_flag_no("rgrplvb",            Opt_rgrplvb),
 	fsparam_flag_no("loccookie",          Opt_loccookie),
 	/* quota can be a flag or an enum so it gets special treatment */
-	__fsparam(fs_param_is_enum, "quota", Opt_quota, fs_param_neg_with_no|fs_param_v_optional),
+	fsparam_flag_no("quota",	      Opt_quota_flag),
+	fsparam_enum("quota",		      Opt_quota, gfs2_param_quota),
 	{}
-};
-
-static const struct fs_parameter_enum gfs2_param_enums[] = {
-	{ Opt_quota,    "off",        Opt_quota_off },
-	{ Opt_quota,    "account",    Opt_quota_account },
-	{ Opt_quota,    "on",         Opt_quota_on },
-	{ Opt_data,     "writeback",  Opt_data_writeback },
-	{ Opt_data,     "ordered",    Opt_data_ordered },
-	{ Opt_errors,   "withdraw",   Opt_errors_withdraw },
-	{ Opt_errors,   "panic",      Opt_errors_panic },
-	{}
-};
-
-static const struct fs_parameter_description gfs2_fs_parameters = {
-	.name = "gfs2",
-	.specs = gfs2_param_specs,
-	.enums = gfs2_param_enums,
 };
 
 /* Parse a single mount parameter */
@@ -1376,7 +1367,7 @@ static int gfs2_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	struct fs_parse_result result;
 	int o;
 
-	o = fs_parse(fc, &gfs2_fs_parameters, param, &result);
+	o = fs_parse(fc, gfs2_fs_parameters, param, &result);
 	if (o < 0)
 		return o;
 
@@ -1413,17 +1404,11 @@ static int gfs2_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_acl:
 		args->ar_posix_acl = result.boolean;
 		break;
+	case Opt_quota_flag:
+		args->ar_quota = result.negated ? GFS2_QUOTA_OFF : GFS2_QUOTA_ON;
+		break;
 	case Opt_quota:
-		/* The quota option can be a flag or an enum. A non-zero int_32
-		   result means that we have an enum index. Otherwise we have
-		   to rely on the 'negated' flag to tell us whether 'quota' or
-		   'noquota' was specified. */
-		if (result.negated)
-			args->ar_quota = GFS2_QUOTA_OFF;
-		else if (result.int_32 > 0)
-			args->ar_quota = opt_quota_values[result.int_32];
-		else
-			args->ar_quota = GFS2_QUOTA_ON;
+		args->ar_quota = result.int_32;
 		break;
 	case Opt_suiddir:
 		args->ar_suiddir = result.boolean;
@@ -1678,7 +1663,7 @@ struct file_system_type gfs2_fs_type = {
 	.name = "gfs2",
 	.fs_flags = FS_REQUIRES_DEV,
 	.init_fs_context = gfs2_init_fs_context,
-	.parameters = &gfs2_fs_parameters,
+	.parameters = gfs2_fs_parameters,
 	.kill_sb = gfs2_kill_sb,
 	.owner = THIS_MODULE,
 };

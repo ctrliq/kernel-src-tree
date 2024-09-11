@@ -136,7 +136,7 @@ struct xfrm_state_offload {
 	unsigned int		num_exthdrs;
 	u8			flags;
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, struct net_device *real_dev)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)

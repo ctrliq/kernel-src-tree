@@ -9,9 +9,10 @@
 
 #include "capabilities.h"
 #include "kvm_cache_regs.h"
-#include "ops.h"
 #include "posted_intr.h"
 #include "vmcs.h"
+#include "vmx_ops.h"
+#include "cpuid.h"
 
 extern const u32 vmx_msr_index[];
 
@@ -22,9 +23,9 @@ extern const u32 vmx_msr_index[];
 #define X2APIC_MSR(r) (APIC_BASE_MSR + ((r) >> 4))
 
 #ifdef CONFIG_X86_64
-#define MAX_NR_SHARED_MSRS	7
+#define MAX_NR_USER_RETURN_MSRS	7
 #else
-#define MAX_NR_SHARED_MSRS	4
+#define MAX_NR_USER_RETURN_MSRS	4
 #endif
 
 #define MAX_NR_LOADSTORE_MSRS	8
@@ -34,8 +35,8 @@ struct vmx_msrs {
 	struct vmx_msr_entry	val[MAX_NR_LOADSTORE_MSRS];
 };
 
-struct shared_msr_entry {
-	unsigned index;
+struct vmx_uret_msr {
+	unsigned int slot; /* The MSR's slot in kvm_user_return_msrs. */
 	u64 data;
 	u64 mask;
 };
@@ -195,10 +196,10 @@ struct vcpu_vmx {
 	u32                   idt_vectoring_info;
 	ulong                 rflags;
 
-	struct shared_msr_entry guest_msrs[MAX_NR_SHARED_MSRS];
-	int                   nmsrs;
-	int                   save_nmsrs;
-	bool                  guest_msrs_ready;
+	struct vmx_uret_msr   guest_uret_msrs[MAX_NR_USER_RETURN_MSRS];
+	int                   nr_uret_msrs;
+	int                   nr_active_uret_msrs;
+	bool                  guest_uret_msrs_loaded;
 #ifdef CONFIG_X86_64
 	u64		      msr_host_kernel_gs_base;
 	u64		      msr_guest_kernel_gs_base;
@@ -279,8 +280,12 @@ struct vcpu_vmx {
 
 	struct pt_desc pt_desc;
 
-	/* which host CPU was used for running this vcpu */
-	unsigned int last_cpu;
+	/* Save desired MSR intercept (read: pass-through) state */
+#define MAX_POSSIBLE_PASSTHROUGH_MSRS	13
+	struct {
+		DECLARE_BITMAP(read, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+		DECLARE_BITMAP(write, MAX_POSSIBLE_PASSTHROUGH_MSRS);
+	} shadow_msr_intercept;
 };
 
 enum ept_pointers_status {
@@ -331,8 +336,8 @@ bool vmx_interrupt_blocked(struct kvm_vcpu *vcpu);
 bool vmx_get_nmi_mask(struct kvm_vcpu *vcpu);
 void vmx_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked);
 void vmx_set_virtual_apic_mode(struct kvm_vcpu *vcpu);
-struct shared_msr_entry *find_msr_entry(struct vcpu_vmx *vmx, u32 msr);
-void pt_update_intercept_for_msr(struct vcpu_vmx *vmx);
+struct vmx_uret_msr *vmx_find_uret_msr(struct vcpu_vmx *vmx, u32 msr);
+void pt_update_intercept_for_msr(struct kvm_vcpu *vcpu);
 void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp);
 int vmx_find_loadstore_msr_slot(struct vmx_msrs *m, u32 msr);
 void vmx_ept_load_pdptrs(struct kvm_vcpu *vcpu);
@@ -465,7 +470,10 @@ static inline bool vmx_has_waitpkg(struct vcpu_vmx *vmx)
 
 static inline bool vmx_need_pf_intercept(struct kvm_vcpu *vcpu)
 {
-	return !enable_ept;
+	if (!enable_ept)
+		return true;
+
+	return allow_smaller_maxphyaddr && cpuid_maxphyaddr(vcpu) < boot_cpu_data.x86_phys_bits;
 }
 
 static inline bool is_unrestricted_guest(struct kvm_vcpu *vcpu)

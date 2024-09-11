@@ -97,7 +97,6 @@ int rvt_driver_mr_init(struct rvt_dev_info *rdi)
 		RCU_INIT_POINTER(rdi->lkey_table.table[i], NULL);
 
 	rdi->dparms.props.max_mr = rdi->lkey_table.max;
-	rdi->dparms.props.max_fmr = rdi->lkey_table.max;
 	return 0;
 }
 
@@ -577,7 +576,7 @@ out:
  * Return: the memory region on success, otherwise return an errno.
  */
 struct ib_mr *rvt_alloc_mr(struct ib_pd *pd, enum ib_mr_type mr_type,
-			   u32 max_num_sg, struct ib_udata *udata)
+			   u32 max_num_sg)
 {
 	struct rvt_mr *mr;
 

@@ -58,7 +58,7 @@ struct devlink_port_phys_attrs {
 			  * A physical port which is visible to the user
 			  * for a given port flavour.
 			  */
-	u32 split_subport_number;
+	u32 split_subport_number; /* If the port is split, this is the number of subport. */
 };
 
 struct devlink_port_pci_pf_attrs {
@@ -70,8 +70,18 @@ struct devlink_port_pci_vf_attrs {
 	u16 vf;	/* Associated PCI VF for of the PCI PF for this port. */
 };
 
+/**
+ * struct devlink_port_attrs - devlink port object
+ * @flavour: flavour of the port
+ * @split: indicates if this is split port
+ * @splittable: indicates if the port can be split.
+ * @lanes: maximum number of lanes the port supports. 0 value is not passed to netlink.
+ * @switch_id: if the port is part of switch, this is buffer with ID, otherwise this is NULL
+ */
 struct devlink_port_attrs {
-	u8 split:1;
+	u8 split:1,
+	   splittable:1;
+	u32 lanes;
 	enum devlink_port_flavour flavour;
 	struct netdev_phys_item_id switch_id;
 	union {
@@ -363,6 +373,25 @@ union devlink_param_value {
 struct devlink_param_gset_ctx {
 	union devlink_param_value val;
 	enum devlink_param_cmode cmode;
+};
+
+/**
+ * struct devlink_flash_notify - devlink dev flash notify data
+ * @status_msg: current status string
+ * @component: firmware component being updated
+ * @done: amount of work completed of total amount
+ * @total: amount of work expected to be done
+ * @timeout: expected max timeout in seconds
+ *
+ * These are values to be given to userland to be displayed in order
+ * to show current activity in a firmware update process.
+ */
+struct devlink_flash_notify {
+	const char *status_msg;
+	const char *component;
+	unsigned long done;
+	unsigned long total;
+	unsigned long timeout;
 };
 
 /**
@@ -1199,17 +1228,9 @@ void devlink_port_type_ib_set(struct devlink_port *devlink_port,
 			      struct ib_device *ibdev);
 void devlink_port_type_clear(struct devlink_port *devlink_port);
 void devlink_port_attrs_set(struct devlink_port *devlink_port,
-			    enum devlink_port_flavour flavour,
-			    u32 port_number, bool split,
-			    u32 split_subport_number,
-			    const unsigned char *switch_id,
-			    unsigned char switch_id_len);
-void devlink_port_attrs_pci_pf_set(struct devlink_port *devlink_port,
-				   const unsigned char *switch_id,
-				   unsigned char switch_id_len, u16 pf);
+			    struct devlink_port_attrs *devlink_port_attrs);
+void devlink_port_attrs_pci_pf_set(struct devlink_port *devlink_port, u16 pf);
 void devlink_port_attrs_pci_vf_set(struct devlink_port *devlink_port,
-				   const unsigned char *switch_id,
-				   unsigned char switch_id_len,
 				   u16 pf, u16 vf);
 int devlink_sb_register(struct devlink *devlink, unsigned int sb_index,
 			u32 size, u16 ingress_pools_count,
@@ -1384,6 +1405,10 @@ void devlink_flash_update_status_notify(struct devlink *devlink,
 					const char *component,
 					unsigned long done,
 					unsigned long total);
+void devlink_flash_update_timeout_notify(struct devlink *devlink,
+					 const char *status_msg,
+					 const char *component,
+					 unsigned long timeout);
 
 int devlink_traps_register(struct devlink *devlink,
 			   const struct devlink_trap *traps,

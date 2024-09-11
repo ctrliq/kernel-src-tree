@@ -178,14 +178,14 @@ void mt7915_mac_sta_poll(struct mt7915_dev *dev)
 
 static void
 mt7915_mac_decode_he_radiotap_ru(struct mt76_rx_status *status,
-				 struct mt7915_rxv *rxv,
-				 struct ieee80211_radiotap_he *he)
+				 struct ieee80211_radiotap_he *he,
+				 __le32 *rxv)
 {
 	u32 ru_h, ru_l;
 	u8 ru, offs = 0;
 
-	ru_l = FIELD_GET(MT_PRXV_HE_RU_ALLOC_L, le32_to_cpu(rxv->v[0]));
-	ru_h = FIELD_GET(MT_PRXV_HE_RU_ALLOC_H, le32_to_cpu(rxv->v[1]));
+	ru_l = FIELD_GET(MT_PRXV_HE_RU_ALLOC_L, le32_to_cpu(rxv[0]));
+	ru_h = FIELD_GET(MT_PRXV_HE_RU_ALLOC_H, le32_to_cpu(rxv[1]));
 	ru = (u8)(ru_l | ru_h << 4);
 
 	status->bw = RATE_INFO_BW_HE_RU;
@@ -228,7 +228,7 @@ mt7915_mac_decode_he_radiotap_ru(struct mt76_rx_status *status,
 static void
 mt7915_mac_decode_he_radiotap(struct sk_buff *skb,
 			      struct mt76_rx_status *status,
-			      struct mt7915_rxv *rxv)
+			      __le32 *rxv, u32 phy)
 {
 	/* TODO: struct ieee80211_radiotap_he_mu */
 	static const struct ieee80211_radiotap_he known = {
@@ -245,48 +245,45 @@ mt7915_mac_decode_he_radiotap(struct sk_buff *skb,
 			 HE_BITS(DATA2_TXOP_KNOWN),
 	};
 	struct ieee80211_radiotap_he *he = NULL;
-	__le32 v2 = rxv->v[2];
-	__le32 v11 = rxv->v[11];
-	__le32 v14 = rxv->v[14];
-	u32 ltf_size = le32_get_bits(v2, MT_CRXV_HE_LTF_SIZE) + 1;
+	u32 ltf_size = le32_get_bits(rxv[2], MT_CRXV_HE_LTF_SIZE) + 1;
 
 	he = skb_push(skb, sizeof(known));
 	memcpy(he, &known, sizeof(known));
 
-	he->data3 = HE_PREP(DATA3_BSS_COLOR, BSS_COLOR, v14) |
-		    HE_PREP(DATA3_LDPC_XSYMSEG, LDPC_EXT_SYM, v2);
-	he->data5 = HE_PREP(DATA5_PE_DISAMBIG, PE_DISAMBIG, v2) |
+	he->data3 = HE_PREP(DATA3_BSS_COLOR, BSS_COLOR, rxv[14]) |
+		    HE_PREP(DATA3_LDPC_XSYMSEG, LDPC_EXT_SYM, rxv[2]);
+	he->data5 = HE_PREP(DATA5_PE_DISAMBIG, PE_DISAMBIG, rxv[2]) |
 		    le16_encode_bits(ltf_size,
 				     IEEE80211_RADIOTAP_HE_DATA5_LTF_SIZE);
-	he->data6 = HE_PREP(DATA6_TXOP, TXOP_DUR, v14) |
-		    HE_PREP(DATA6_DOPPLER, DOPPLER, v14);
+	he->data6 = HE_PREP(DATA6_TXOP, TXOP_DUR, rxv[14]) |
+		    HE_PREP(DATA6_DOPPLER, DOPPLER, rxv[14]);
 
-	switch (rxv->phy) {
+	switch (phy) {
 	case MT_PHY_TYPE_HE_SU:
 		he->data1 |= HE_BITS(DATA1_FORMAT_SU) |
 			     HE_BITS(DATA1_UL_DL_KNOWN) |
 			     HE_BITS(DATA1_BEAM_CHANGE_KNOWN) |
 			     HE_BITS(DATA1_SPTL_REUSE_KNOWN);
 
-		he->data3 |= HE_PREP(DATA3_BEAM_CHANGE, BEAM_CHNG, v14) |
-			     HE_PREP(DATA3_UL_DL, UPLINK, v2);
-		he->data4 |= HE_PREP(DATA4_SU_MU_SPTL_REUSE, SR_MASK, v11);
+		he->data3 |= HE_PREP(DATA3_BEAM_CHANGE, BEAM_CHNG, rxv[14]) |
+			     HE_PREP(DATA3_UL_DL, UPLINK, rxv[2]);
+		he->data4 |= HE_PREP(DATA4_SU_MU_SPTL_REUSE, SR_MASK, rxv[11]);
 		break;
 	case MT_PHY_TYPE_HE_EXT_SU:
 		he->data1 |= HE_BITS(DATA1_FORMAT_EXT_SU) |
 			     HE_BITS(DATA1_UL_DL_KNOWN);
 
-		he->data3 |= HE_PREP(DATA3_UL_DL, UPLINK, v2);
+		he->data3 |= HE_PREP(DATA3_UL_DL, UPLINK, rxv[2]);
 		break;
 	case MT_PHY_TYPE_HE_MU:
 		he->data1 |= HE_BITS(DATA1_FORMAT_MU) |
 			     HE_BITS(DATA1_UL_DL_KNOWN) |
 			     HE_BITS(DATA1_SPTL_REUSE_KNOWN);
 
-		he->data3 |= HE_PREP(DATA3_UL_DL, UPLINK, v2);
-		he->data4 |= HE_PREP(DATA4_SU_MU_SPTL_REUSE, SR_MASK, v11);
+		he->data3 |= HE_PREP(DATA3_UL_DL, UPLINK, rxv[2]);
+		he->data4 |= HE_PREP(DATA4_SU_MU_SPTL_REUSE, SR_MASK, rxv[11]);
 
-		mt7915_mac_decode_he_radiotap_ru(status, rxv, he);
+		mt7915_mac_decode_he_radiotap_ru(status, he, rxv);
 		break;
 	case MT_PHY_TYPE_HE_TB:
 		he->data1 |= HE_BITS(DATA1_FORMAT_TRIG) |
@@ -295,12 +292,12 @@ mt7915_mac_decode_he_radiotap(struct sk_buff *skb,
 			     HE_BITS(DATA1_SPTL_REUSE3_KNOWN) |
 			     HE_BITS(DATA1_SPTL_REUSE4_KNOWN);
 
-		he->data4 |= HE_PREP(DATA4_TB_SPTL_REUSE1, SR_MASK, v11) |
-			     HE_PREP(DATA4_TB_SPTL_REUSE2, SR1_MASK, v11) |
-			     HE_PREP(DATA4_TB_SPTL_REUSE3, SR2_MASK, v11) |
-			     HE_PREP(DATA4_TB_SPTL_REUSE4, SR3_MASK, v11);
+		he->data4 |= HE_PREP(DATA4_TB_SPTL_REUSE1, SR_MASK, rxv[11]) |
+			     HE_PREP(DATA4_TB_SPTL_REUSE2, SR1_MASK, rxv[11]) |
+			     HE_PREP(DATA4_TB_SPTL_REUSE3, SR2_MASK, rxv[11]) |
+			     HE_PREP(DATA4_TB_SPTL_REUSE4, SR3_MASK, rxv[11]);
 
-		mt7915_mac_decode_he_radiotap_ru(status, rxv, he);
+		mt7915_mac_decode_he_radiotap_ru(status, he, rxv);
 		break;
 	default:
 		break;
@@ -314,8 +311,9 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 	struct mt7915_phy *phy = &dev->phy;
 	struct ieee80211_supported_band *sband;
 	struct ieee80211_hdr *hdr;
-	struct mt7915_rxv rxv = {};
 	__le32 *rxd = (__le32 *)skb->data;
+	__le32 *rxv = NULL;
+	u32 mode = 0;
 	u32 rxd1 = le32_to_cpu(rxd[1]);
 	u32 rxd2 = le32_to_cpu(rxd[2]);
 	u32 rxd3 = le32_to_cpu(rxd[3]);
@@ -425,20 +423,25 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 
 	/* RXD Group 3 - P-RXV */
 	if (rxd1 & MT_RXD1_NORMAL_GROUP_3) {
-		memcpy(rxv.v, rxd, sizeof(rxv.v));
+		u32 v0, v1, v2;
 
+		rxv = rxd;
 		rxd += 2;
 		if ((u8 *)rxd - skb->data >= skb->len)
 			return -EINVAL;
 
-		if (rxv.v[0] & MT_PRXV_HT_AD_CODE)
+		v0 = le32_to_cpu(rxv[0]);
+		v1 = le32_to_cpu(rxv[1]);
+		v2 = le32_to_cpu(rxv[2]);
+
+		if (v0 & MT_PRXV_HT_AD_CODE)
 			status->enc_flags |= RX_ENC_FLAG_LDPC;
 
 		status->chains = mphy->antenna_mask;
-		status->chain_signal[0] = to_rssi(MT_PRXV_RCPI0, rxv.v[1]);
-		status->chain_signal[1] = to_rssi(MT_PRXV_RCPI1, rxv.v[1]);
-		status->chain_signal[2] = to_rssi(MT_PRXV_RCPI2, rxv.v[1]);
-		status->chain_signal[3] = to_rssi(MT_PRXV_RCPI3, rxv.v[1]);
+		status->chain_signal[0] = to_rssi(MT_PRXV_RCPI0, v1);
+		status->chain_signal[1] = to_rssi(MT_PRXV_RCPI1, v1);
+		status->chain_signal[2] = to_rssi(MT_PRXV_RCPI2, v1);
+		status->chain_signal[3] = to_rssi(MT_PRXV_RCPI3, v1);
 		status->signal = status->chain_signal[0];
 
 		for (i = 1; i < hweight8(mphy->antenna_mask); i++) {
@@ -451,18 +454,18 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 
 		/* RXD Group 5 - C-RXV */
 		if (rxd1 & MT_RXD1_NORMAL_GROUP_5) {
-			u8 stbc = FIELD_GET(MT_CRXV_HT_STBC, rxv.v[2]);
-			u8 gi = FIELD_GET(MT_CRXV_HT_SHORT_GI, rxv.v[2]);
+			u8 stbc = FIELD_GET(MT_CRXV_HT_STBC, v2);
+			u8 gi = FIELD_GET(MT_CRXV_HT_SHORT_GI, v2);
 			bool cck = false;
 
 			rxd += 18;
 			if ((u8 *)rxd - skb->data >= skb->len)
 				return -EINVAL;
 
-			idx = i = FIELD_GET(MT_PRXV_TX_RATE, rxv.v[0]);
-			rxv.phy = FIELD_GET(MT_CRXV_TX_MODE, rxv.v[2]);
+			idx = i = FIELD_GET(MT_PRXV_TX_RATE, v0);
+			mode = FIELD_GET(MT_CRXV_TX_MODE, v2);
 
-			switch (rxv.phy) {
+			switch (mode) {
 			case MT_PHY_TYPE_CCK:
 				cck = true;
 				/* fall through */
@@ -477,7 +480,7 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 				break;
 			case MT_PHY_TYPE_VHT:
 				status->nss =
-					FIELD_GET(MT_PRXV_NSTS, rxv.v[0]) + 1;
+					FIELD_GET(MT_PRXV_NSTS, v0) + 1;
 				status->encoding = RX_ENC_VHT;
 				if (i > 9)
 					return -EINVAL;
@@ -489,7 +492,7 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 			case MT_PHY_TYPE_HE_EXT_SU:
 			case MT_PHY_TYPE_HE_TB:
 				status->nss =
-					FIELD_GET(MT_PRXV_NSTS, rxv.v[0]) + 1;
+					FIELD_GET(MT_PRXV_NSTS, v0) + 1;
 				status->encoding = RX_ENC_HE;
 				status->flag |= RX_FLAG_RADIOTAP_HE;
 				i &= GENMASK(3, 0);
@@ -497,19 +500,18 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 				if (gi <= NL80211_RATE_INFO_HE_GI_3_2)
 					status->he_gi = gi;
 
-				if (idx & MT_PRXV_TX_DCM)
-					status->he_dcm = true;
+				status->he_dcm = !!(idx & MT_PRXV_TX_DCM);
 				break;
 			default:
 				return -EINVAL;
 			}
 			status->rate_idx = i;
 
-			switch (FIELD_GET(MT_CRXV_FRAME_MODE, rxv.v[2])) {
+			switch (FIELD_GET(MT_CRXV_FRAME_MODE, v2)) {
 			case IEEE80211_STA_RX_BW_20:
 				break;
 			case IEEE80211_STA_RX_BW_40:
-				if (rxv.phy & MT_PHY_TYPE_HE_EXT_SU &&
+				if (mode & MT_PHY_TYPE_HE_EXT_SU &&
 				    (idx & MT_PRXV_TX_ER_SU_106T)) {
 					status->bw = RATE_INFO_BW_HE_RU;
 					status->he_ru =
@@ -529,7 +531,7 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 			}
 
 			status->enc_flags |= RX_ENC_FLAG_STBC_MASK * stbc;
-			if (rxv.phy < MT_PHY_TYPE_HE_SU && gi)
+			if (mode < MT_PHY_TYPE_HE_SU && gi)
 				status->enc_flags |= RX_ENC_FLAG_SHORT_GI;
 		}
 	}
@@ -542,8 +544,8 @@ int mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb)
 		mt76_insert_ccmp_hdr(skb, key_id);
 	}
 
-	if (status->flag & RX_FLAG_RADIOTAP_HE)
-		mt7915_mac_decode_he_radiotap(skb, status, &rxv);
+	if (rxv && status->flag & RX_FLAG_RADIOTAP_HE)
+		mt7915_mac_decode_he_radiotap(skb, status, rxv, mode);
 
 	hdr = mt76_skb_get_hdr(skb);
 	if (!status->wcid || !ieee80211_is_data_qos(hdr->frame_control))
@@ -612,7 +614,7 @@ void mt7915_mac_write_txwi(struct mt7915_dev *dev, __le32 *txwi,
 	      FIELD_PREP(MT_TXD1_OWN_MAC, omac_idx);
 
 	if (ext_phy && q_idx >= MT_LMAC_ALTX0 && q_idx <= MT_LMAC_BCN0)
-		val |= cpu_to_le32(MT_TXD1_TGID);
+		val |= MT_TXD1_TGID;
 
 	txwi[1] = cpu_to_le32(val);
 

@@ -3,6 +3,7 @@
 
 #include "setup.h"
 #include "en/params.h"
+#include "en/txrx.h"
 
 /* It matches XDP_UMEM_MIN_CHUNK_SIZE, but as this constant is private and may
  * change unexpectedly, and mlx5e has a minimum valid stride size for striding
@@ -105,8 +106,7 @@ err_free_cparam:
 void mlx5e_close_xsk(struct mlx5e_channel *c)
 {
 	clear_bit(MLX5E_CHANNEL_STATE_XSK, c->state);
-	napi_synchronize(&c->napi);
-	synchronize_rcu(); /* Sync with the XSK wakeup. */
+	synchronize_rcu(); /* Sync with the XSK wakeup and with NAPI. */
 
 	mlx5e_close_rq(&c->xskrq);
 	mlx5e_close_cq(&c->xskrq.cq);

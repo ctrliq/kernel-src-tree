@@ -152,9 +152,9 @@ static int metric_show(struct seq_file *s, void *p)
 	seq_printf(s, "item                               total\n");
 	seq_printf(s, "------------------------------------------\n");
 	seq_printf(s, "%-35s%lld / %lld\n", "opened files  / total inodes",
-		   atomic64_read(&m->opened_files), sum);
+		   (long long)atomic64_read(&m->opened_files), sum);
 	seq_printf(s, "%-35s%lld / %lld\n", "pinned i_caps / total inodes",
-		   atomic64_read(&m->total_caps), sum);
+		   (long long)atomic64_read(&m->total_caps), sum);
 	seq_printf(s, "%-35s%lld / %lld\n", "opened inodes / total inodes",
 		   percpu_counter_sum(&m->opened_inodes), sum);
 
@@ -197,7 +197,7 @@ static int metric_show(struct seq_file *s, void *p)
 	seq_printf(s, "-------------------------------------------------\n");
 
 	seq_printf(s, "%-14s%-16lld%-16lld%lld\n", "d_lease",
-		   atomic64_read(&m->total_dentries),
+		   (long long)atomic64_read(&m->total_dentries),
 		   percpu_counter_sum(&m->d_lease_mis),
 		   percpu_counter_sum(&m->d_lease_hit));
 

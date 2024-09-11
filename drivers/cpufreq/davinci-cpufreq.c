@@ -1,7 +1,7 @@
 /*
  * CPU frequency scaling for DaVinci
  *
- * Copyright (C) 2009 Texas Instruments Incorporated - https://www.ti.com/
+ * Copyright (C) 2009 Texas Instruments Incorporated - http://www.ti.com/
  *
  * Based on linux/arch/arm/plat-omap/cpu-omap.c. Original Copyright follows:
  *

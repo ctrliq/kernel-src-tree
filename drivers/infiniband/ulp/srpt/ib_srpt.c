@@ -622,10 +622,11 @@ static int srpt_refresh_port(struct srpt_port *sport)
 /**
  * srpt_unregister_mad_agent - unregister MAD callback functions
  * @sdev: SRPT HCA pointer.
+ * #port_cnt: number of ports with registered MAD
  *
  * Note: It is safe to call this function more than once for the same device.
  */
-static void srpt_unregister_mad_agent(struct srpt_device *sdev)
+static void srpt_unregister_mad_agent(struct srpt_device *sdev, int port_cnt)
 {
 	struct ib_port_modify port_modify = {
 		.clr_port_cap_mask = IB_PORT_DEVICE_MGMT_SUP,
@@ -633,7 +634,7 @@ static void srpt_unregister_mad_agent(struct srpt_device *sdev)
 	struct srpt_port *sport;
 	int i;
 
-	for (i = 1; i <= sdev->device->phys_port_cnt; i++) {
+	for (i = 1; i <= port_cnt; i++) {
 		sport = &sdev->port[i - 1];
 		WARN_ON(sport->port != i);
 		if (sport->mad_agent) {
@@ -2491,7 +2492,8 @@ reject:
 				   SRP_BUF_FORMAT_INDIRECT);
 
 	if (rdma_cm_id)
-		rdma_reject(rdma_cm_id, rej, sizeof(*rej));
+		rdma_reject(rdma_cm_id, rej, sizeof(*rej),
+			    IB_CM_REJ_CONSUMER_DEFINED);
 	else
 		ib_send_cm_rej(ib_cm_id, IB_CM_REJ_CONSUMER_DEFINED, NULL, 0,
 			       rej, sizeof(*rej));
@@ -3099,7 +3101,7 @@ static int srpt_use_srq(struct srpt_device *sdev, bool use_srq)
  * srpt_add_one - InfiniBand device addition callback function
  * @device: Describes a HCA.
  */
-static void srpt_add_one(struct ib_device *device)
+static int srpt_add_one(struct ib_device *device)
 {
 	struct srpt_device *sdev;
 	struct srpt_port *sport;
@@ -3110,14 +3112,16 @@ static void srpt_add_one(struct ib_device *device)
 	sdev = kzalloc(struct_size(sdev, port, device->phys_port_cnt),
 		       GFP_KERNEL);
 	if (!sdev)
-		goto err;
+		return -ENOMEM;
 
 	sdev->device = device;
 	mutex_init(&sdev->sdev_mutex);
 
 	sdev->pd = ib_alloc_pd(device, 0);
-	if (IS_ERR(sdev->pd))
+	if (IS_ERR(sdev->pd)) {
+		ret = PTR_ERR(sdev->pd);
 		goto free_dev;
+	}
 
 	sdev->lkey = sdev->pd->local_dma_lkey;
 
@@ -3133,6 +3137,7 @@ static void srpt_add_one(struct ib_device *device)
 	if (IS_ERR(sdev->cm_id)) {
 		pr_info("ib_create_cm_id() failed: %ld\n",
 			PTR_ERR(sdev->cm_id));
+		ret = PTR_ERR(sdev->cm_id);
 		sdev->cm_id = NULL;
 		if (!rdma_cm_id)
 			goto err_ring;
@@ -3177,10 +3182,12 @@ static void srpt_add_one(struct ib_device *device)
 		mutex_init(&sport->port_gid_id.mutex);
 		INIT_LIST_HEAD(&sport->port_gid_id.tpg_list);
 
-		if (srpt_refresh_port(sport)) {
+		ret = srpt_refresh_port(sport);
+		if (ret) {
 			pr_err("MAD registration failed for %s-%d.\n",
 			       dev_name(&sdev->device->dev), i);
-			goto err_event;
+			i--;
+			goto err_port;
 		}
 	}
 
@@ -3188,12 +3195,12 @@ static void srpt_add_one(struct ib_device *device)
 	list_add_tail(&sdev->list, &srpt_dev_list);
 	spin_unlock(&srpt_dev_lock);
 
-out:
 	ib_set_client_data(device, &srpt_client, sdev);
 	pr_debug("added %s.\n", dev_name(&device->dev));
-	return;
+	return 0;
 
-err_event:
+err_port:
+	srpt_unregister_mad_agent(sdev, i);
 	ib_unregister_event_handler(&sdev->event_handler);
 err_cm:
 	if (sdev->cm_id)
@@ -3203,10 +3210,8 @@ err_ring:
 	ib_dealloc_pd(sdev->pd);
 free_dev:
 	kfree(sdev);
-err:
-	sdev = NULL;
 	pr_info("%s(%s) failed.\n", __func__, dev_name(&device->dev));
-	goto out;
+	return ret;
 }
 
 /**
@@ -3219,13 +3224,7 @@ static void srpt_remove_one(struct ib_device *device, void *client_data)
 	struct srpt_device *sdev = client_data;
 	int i;
 
-	if (!sdev) {
-		pr_info("%s(%s): nothing to do.\n", __func__,
-			dev_name(&device->dev));
-		return;
-	}
-
-	srpt_unregister_mad_agent(sdev);
+	srpt_unregister_mad_agent(sdev, sdev->device->phys_port_cnt);
 
 	ib_unregister_event_handler(&sdev->event_handler);
 

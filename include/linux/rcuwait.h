@@ -3,7 +3,7 @@
 #define _LINUX_RCUWAIT_H_
 
 #include <linux/rcupdate.h>
-#include <linux/sched/signal.h>
+#include RH_KABI_HIDE_INCLUDE(<linux/sched/signal.h>)
 
 /*
  * rcuwait provides a way of blocking and waking up a single

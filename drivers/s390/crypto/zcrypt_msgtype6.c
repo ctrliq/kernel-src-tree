@@ -482,6 +482,11 @@ static int XCRB_msg_to_type6CPRB_msgX(struct ap_message *ap_msg,
 	    || memcmp(function_code, "AU", 2) == 0)
 		ap_msg->flags |= AP_MSG_FLAG_SPECIAL;
 
+#ifdef CONFIG_ZCRYPT_DEBUG
+	if (ap_msg->fi.flags & AP_FI_FLAG_TOGGLE_SPECIAL)
+		ap_msg->flags ^= AP_MSG_FLAG_SPECIAL;
+#endif
+
 	/* copy data block */
 	if (xcRB->request_data_length &&
 	    copy_from_user(req_data, xcRB->request_data_address,
@@ -569,6 +574,11 @@ static int xcrb_msg_to_type6_ep11cprb_msgx(struct ap_message *ap_msg,
 	if (msg->cprbx.flags & 0x20)
 		ap_msg->flags |= AP_MSG_FLAG_SPECIAL;
 
+#ifdef CONFIG_ZCRYPT_DEBUG
+	if (ap_msg->fi.flags & AP_FI_FLAG_TOGGLE_SPECIAL)
+		ap_msg->flags ^= AP_MSG_FLAG_SPECIAL;
+#endif
+
 	return 0;
 }
 
@@ -650,23 +660,22 @@ static int convert_type86_ica(struct zcrypt_queue *zq,
 		    (service_rc == 8 && service_rs == 72) ||
 		    (service_rc == 8 && service_rs == 770) ||
 		    (service_rc == 12 && service_rs == 769)) {
-			ZCRYPT_DBF(DBF_DEBUG,
-				   "device=%02x.%04x rc/rs=%d/%d => rc=EINVAL\n",
-				   AP_QID_CARD(zq->queue->qid),
-				   AP_QID_QUEUE(zq->queue->qid),
-				   (int) service_rc, (int) service_rs);
+			ZCRYPT_DBF_WARN("dev=%02x.%04x rc/rs=%d/%d => rc=EINVAL\n",
+					AP_QID_CARD(zq->queue->qid),
+					AP_QID_QUEUE(zq->queue->qid),
+					(int) service_rc, (int) service_rs);
 			return -EINVAL;
 		}
 		zq->online = 0;
-		pr_err("Cryptographic device %02x.%04x failed and was set offline\n",
+		pr_err("Crypto dev=%02x.%04x rc/rs=%d/%d online=0 rc=EAGAIN\n",
 		       AP_QID_CARD(zq->queue->qid),
-		       AP_QID_QUEUE(zq->queue->qid));
-		ZCRYPT_DBF(DBF_ERR,
-			   "device=%02x.%04x rc/rs=%d/%d => online=0 rc=EAGAIN\n",
-			   AP_QID_CARD(zq->queue->qid),
-			   AP_QID_QUEUE(zq->queue->qid),
-			   (int) service_rc, (int) service_rs);
-		return -EAGAIN;	/* repeat the request on a different device. */
+		       AP_QID_QUEUE(zq->queue->qid),
+		       (int) service_rc, (int) service_rs);
+		ZCRYPT_DBF_ERR("dev=%02x.%04x rc/rs=%d/%d => online=0 rc=EAGAIN\n",
+			       AP_QID_CARD(zq->queue->qid),
+			       AP_QID_QUEUE(zq->queue->qid),
+			       (int) service_rc, (int) service_rs);
+		return -EAGAIN;
 	}
 	data = msg->text;
 	reply_len = msg->length - 2;
@@ -800,17 +809,18 @@ static int convert_response_ica(struct zcrypt_queue *zq,
 			return convert_type86_ica(zq, reply,
 						  outputdata, outputdatalength);
 		/* fall through - wrong cprb version is an unknown response */
-	default: /* Unknown response type, this should NEVER EVER happen */
+	default:
+		/* Unknown response type, this should NEVER EVER happen */
 		zq->online = 0;
-		pr_err("Cryptographic device %02x.%04x failed and was set offline\n",
+		pr_err("Crypto dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
 		       AP_QID_CARD(zq->queue->qid),
-		       AP_QID_QUEUE(zq->queue->qid));
-		ZCRYPT_DBF(DBF_ERR,
-			   "device=%02x.%04x rtype=0x%02x => online=0 rc=EAGAIN\n",
-			   AP_QID_CARD(zq->queue->qid),
-			   AP_QID_QUEUE(zq->queue->qid),
-			   (int) msg->hdr.type);
-		return -EAGAIN;	/* repeat the request on a different device. */
+		       AP_QID_QUEUE(zq->queue->qid),
+		       (int) msg->hdr.type);
+		ZCRYPT_DBF_ERR("dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
+			       AP_QID_CARD(zq->queue->qid),
+			       AP_QID_QUEUE(zq->queue->qid),
+			       (int) msg->hdr.type);
+		return -EAGAIN;
 	}
 }
 
@@ -836,15 +846,15 @@ static int convert_response_xcrb(struct zcrypt_queue *zq,
 	default: /* Unknown response type, this should NEVER EVER happen */
 		xcRB->status = 0x0008044DL; /* HDD_InvalidParm */
 		zq->online = 0;
-		pr_err("Cryptographic device %02x.%04x failed and was set offline\n",
+		pr_err("Crypto dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
 		       AP_QID_CARD(zq->queue->qid),
-		       AP_QID_QUEUE(zq->queue->qid));
-		ZCRYPT_DBF(DBF_ERR,
-			   "device=%02x.%04x rtype=0x%02x => online=0 rc=EAGAIN\n",
-			   AP_QID_CARD(zq->queue->qid),
-			   AP_QID_QUEUE(zq->queue->qid),
-			   (int) msg->hdr.type);
-		return -EAGAIN;	/* repeat the request on a different device. */
+		       AP_QID_QUEUE(zq->queue->qid),
+		       (int) msg->hdr.type);
+		ZCRYPT_DBF_ERR("dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
+			       AP_QID_CARD(zq->queue->qid),
+			       AP_QID_QUEUE(zq->queue->qid),
+			       (int) msg->hdr.type);
+		return -EAGAIN;
 	}
 }
 
@@ -865,15 +875,15 @@ static int convert_response_ep11_xcrb(struct zcrypt_queue *zq,
 		/* fall through - wrong cprb version is an unknown resp */
 	default: /* Unknown response type, this should NEVER EVER happen */
 		zq->online = 0;
-		pr_err("Cryptographic device %02x.%04x failed and was set offline\n",
+		pr_err("Crypto dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
 		       AP_QID_CARD(zq->queue->qid),
-		       AP_QID_QUEUE(zq->queue->qid));
-		ZCRYPT_DBF(DBF_ERR,
-			   "device=%02x.%04x rtype=0x%02x => online=0 rc=EAGAIN\n",
-			   AP_QID_CARD(zq->queue->qid),
-			   AP_QID_QUEUE(zq->queue->qid),
-			   (int) msg->hdr.type);
-		return -EAGAIN; /* repeat the request on a different device. */
+		       AP_QID_QUEUE(zq->queue->qid),
+		       (int) msg->hdr.type);
+		ZCRYPT_DBF_ERR("dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
+			       AP_QID_CARD(zq->queue->qid),
+			       AP_QID_QUEUE(zq->queue->qid),
+			       (int) msg->hdr.type);
+		return -EAGAIN;
 	}
 }
 
@@ -895,15 +905,15 @@ static int convert_response_rng(struct zcrypt_queue *zq,
 		/* fall through - wrong cprb version is an unknown response */
 	default: /* Unknown response type, this should NEVER EVER happen */
 		zq->online = 0;
-		pr_err("Cryptographic device %02x.%04x failed and was set offline\n",
+		pr_err("Crypto dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
 		       AP_QID_CARD(zq->queue->qid),
-		       AP_QID_QUEUE(zq->queue->qid));
-		ZCRYPT_DBF(DBF_ERR,
-			   "device=%02x.%04x rtype=0x%02x => online=0 rc=EAGAIN\n",
-			   AP_QID_CARD(zq->queue->qid),
-			   AP_QID_QUEUE(zq->queue->qid),
-			   (int) msg->hdr.type);
-		return -EAGAIN;	/* repeat the request on a different device. */
+		       AP_QID_QUEUE(zq->queue->qid),
+		       (int) msg->hdr.type);
+		ZCRYPT_DBF_ERR("dev=%02x.%04x unknown response type 0x%02x => online=0 rc=EAGAIN\n",
+			       AP_QID_CARD(zq->queue->qid),
+			       AP_QID_QUEUE(zq->queue->qid),
+			       (int) msg->hdr.type);
+		return -EAGAIN;
 	}
 }
 
@@ -1007,39 +1017,42 @@ static atomic_t zcrypt_step = ATOMIC_INIT(0);
  * @mex: pointer to the modexpo request buffer
  */
 static long zcrypt_msgtype6_modexpo(struct zcrypt_queue *zq,
-				  struct ica_rsa_modexpo *mex)
+				    struct ica_rsa_modexpo *mex,
+				    struct ap_message *ap_msg)
 {
-	struct ap_message ap_msg;
 	struct response_type resp_type = {
 		.type = CEXXC_RESPONSE_TYPE_ICA,
 	};
 	int rc;
 
-	ap_init_message(&ap_msg);
-	ap_msg.msg = (void *) get_zeroed_page(GFP_KERNEL);
-	if (!ap_msg.msg)
+	ap_msg->msg = (void *) get_zeroed_page(GFP_KERNEL);
+	if (!ap_msg->msg)
 		return -ENOMEM;
-	ap_msg.receive = zcrypt_msgtype6_receive;
-	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
-				atomic_inc_return(&zcrypt_step);
-	ap_msg.private = &resp_type;
-	rc = ICAMEX_msg_to_type6MEX_msgX(zq, &ap_msg, mex);
+	ap_msg->receive = zcrypt_msgtype6_receive;
+	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
+		atomic_inc_return(&zcrypt_step);
+	ap_msg->private = &resp_type;
+	rc = ICAMEX_msg_to_type6MEX_msgX(zq, ap_msg, mex);
 	if (rc)
 		goto out_free;
 	init_completion(&resp_type.work);
-	ap_queue_message(zq->queue, &ap_msg);
+	rc = ap_queue_message(zq->queue, ap_msg);
+	if (rc)
+		goto out_free;
 	rc = wait_for_completion_interruptible(&resp_type.work);
 	if (rc == 0) {
-		rc = ap_msg.rc;
+		rc = ap_msg->rc;
 		if (rc == 0)
-			rc = convert_response_ica(zq, &ap_msg,
+			rc = convert_response_ica(zq, ap_msg,
 						  mex->outputdata,
 						  mex->outputdatalength);
 	} else
 		/* Signal pending. */
-		ap_cancel_message(zq->queue, &ap_msg);
+		ap_cancel_message(zq->queue, ap_msg);
 out_free:
-	free_page((unsigned long) ap_msg.msg);
+	free_page((unsigned long) ap_msg->msg);
+	ap_msg->private = NULL;
+	ap_msg->msg = NULL;
 	return rc;
 }
 
@@ -1051,40 +1064,43 @@ out_free:
  * @crt: pointer to the modexpoc_crt request buffer
  */
 static long zcrypt_msgtype6_modexpo_crt(struct zcrypt_queue *zq,
-				      struct ica_rsa_modexpo_crt *crt)
+					struct ica_rsa_modexpo_crt *crt,
+					struct ap_message *ap_msg)
 {
-	struct ap_message ap_msg;
 	struct response_type resp_type = {
 		.type = CEXXC_RESPONSE_TYPE_ICA,
 	};
 	int rc;
 
-	ap_init_message(&ap_msg);
-	ap_msg.msg = (void *) get_zeroed_page(GFP_KERNEL);
-	if (!ap_msg.msg)
+	ap_msg->msg = (void *) get_zeroed_page(GFP_KERNEL);
+	if (!ap_msg->msg)
 		return -ENOMEM;
-	ap_msg.receive = zcrypt_msgtype6_receive;
-	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
-				atomic_inc_return(&zcrypt_step);
-	ap_msg.private = &resp_type;
-	rc = ICACRT_msg_to_type6CRT_msgX(zq, &ap_msg, crt);
+	ap_msg->receive = zcrypt_msgtype6_receive;
+	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
+		atomic_inc_return(&zcrypt_step);
+	ap_msg->private = &resp_type;
+	rc = ICACRT_msg_to_type6CRT_msgX(zq, ap_msg, crt);
 	if (rc)
 		goto out_free;
 	init_completion(&resp_type.work);
-	ap_queue_message(zq->queue, &ap_msg);
+	rc = ap_queue_message(zq->queue, ap_msg);
+	if (rc)
+		goto out_free;
 	rc = wait_for_completion_interruptible(&resp_type.work);
 	if (rc == 0) {
-		rc = ap_msg.rc;
+		rc = ap_msg->rc;
 		if (rc == 0)
-			rc = convert_response_ica(zq, &ap_msg,
+			rc = convert_response_ica(zq, ap_msg,
 						  crt->outputdata,
 						  crt->outputdatalength);
 	} else {
 		/* Signal pending. */
-		ap_cancel_message(zq->queue, &ap_msg);
+		ap_cancel_message(zq->queue, ap_msg);
 	}
 out_free:
-	free_page((unsigned long) ap_msg.msg);
+	free_page((unsigned long) ap_msg->msg);
+	ap_msg->private = NULL;
+	ap_msg->msg = NULL;
 	return rc;
 }
 
@@ -1130,7 +1146,9 @@ static long zcrypt_msgtype6_send_cprb(struct zcrypt_queue *zq,
 	struct response_type *rtype = (struct response_type *)(ap_msg->private);
 
 	init_completion(&rtype->work);
-	ap_queue_message(zq->queue, ap_msg);
+	rc = ap_queue_message(zq->queue, ap_msg);
+	if (rc)
+		goto out;
 	rc = wait_for_completion_interruptible(&rtype->work);
 	if (rc == 0) {
 		rc = ap_msg->rc;
@@ -1139,7 +1157,7 @@ static long zcrypt_msgtype6_send_cprb(struct zcrypt_queue *zq,
 	} else
 		/* Signal pending. */
 		ap_cancel_message(zq->queue, ap_msg);
-
+out:
 	return rc;
 }
 
@@ -1232,7 +1250,9 @@ static long zcrypt_msgtype6_send_ep11_cprb(struct zcrypt_queue *zq,
 	}
 
 	init_completion(&rtype->work);
-	ap_queue_message(zq->queue, ap_msg);
+	rc = ap_queue_message(zq->queue, ap_msg);
+	if (rc)
+		goto out;
 	rc = wait_for_completion_interruptible(&rtype->work);
 	if (rc == 0) {
 		rc = ap_msg->rc;
@@ -1241,7 +1261,7 @@ static long zcrypt_msgtype6_send_ep11_cprb(struct zcrypt_queue *zq,
 	} else
 		/* Signal pending. */
 		ap_cancel_message(zq->queue, ap_msg);
-
+out:
 	return rc;
 }
 
@@ -1293,7 +1313,9 @@ static long zcrypt_msgtype6_rng(struct zcrypt_queue *zq,
 	msg->cprbx.domain = AP_QID_QUEUE(zq->queue->qid);
 
 	init_completion(&rtype->work);
-	ap_queue_message(zq->queue, ap_msg);
+	rc = ap_queue_message(zq->queue, ap_msg);
+	if (rc)
+		goto out;
 	rc = wait_for_completion_interruptible(&rtype->work);
 	if (rc == 0) {
 		rc = ap_msg->rc;
@@ -1302,7 +1324,7 @@ static long zcrypt_msgtype6_rng(struct zcrypt_queue *zq,
 	} else
 		/* Signal pending. */
 		ap_cancel_message(zq->queue, ap_msg);
-
+out:
 	return rc;
 }
 

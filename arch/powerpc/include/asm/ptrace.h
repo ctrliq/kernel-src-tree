@@ -24,8 +24,9 @@
 #define _ASM_POWERPC_PTRACE_H
 
 #include <uapi/asm/ptrace.h>
+#include <linux/rh_kabi.h>
 
-#ifndef __ASSEMBLY__
+#if !defined(__ASSEMBLY__) && !defined(__GENKSYMS__)
 struct pt_regs
 {
 	union {
@@ -39,7 +40,7 @@ struct pt_regs
 			unsigned long link;
 			unsigned long xer;
 			unsigned long ccr;
-#ifdef CONFIG_PPC64
+#ifdef __powerpc64__
 			unsigned long softe;
 #else
 			unsigned long mq;
@@ -51,9 +52,9 @@ struct pt_regs
 		};
 	};
 
-#ifdef CONFIG_PPC64
-	unsigned long ppr;
-	unsigned long __pad;	/* Maintain 16 byte interrupt stack alignment */
+#ifdef __powerpc64__
+	RH_KABI_EXTEND(unsigned long ppr)
+	RH_KABI_EXTEND(unsigned long __pad)	/* Maintain 16 byte interrupt stack alignment */
 #endif
 };
 #endif

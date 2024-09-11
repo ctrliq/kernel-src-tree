@@ -33,6 +33,7 @@
 #include <net/netns/mpls.h>
 #include <net/netns/can.h>
 #include RH_KABI_HIDE_INCLUDE(<net/netns/xdp.h>)
+#include <net/netns/bpf.h>
 #include <linux/ns_common.h>
 #include <linux/idr.h>
 #include <linux/skbuff.h>
@@ -168,7 +169,7 @@ struct net {
 
 	RH_KABI_EXTEND(int	ipv4_sysctl_ip_fwd_update_priority)
 	RH_KABI_EXTEND(int	ipv4_sysctl_tcp_min_snd_mss)
-	RH_KABI_EXTEND(struct bpf_prog __rcu	*flow_dissector_prog)
+	RH_KABI_EXTEND(void *rh_unused)		/* available for reuse */
 	RH_KABI_EXTEND(siphash_key_t ipv4_ip_id_key)
 	RH_KABI_EXTEND(u32	hash_mix)
 	RH_KABI_EXTEND_WITH_SIZE(struct netns_xdp xdp, 21)
@@ -185,6 +186,9 @@ struct net {
 	RH_KABI_EXTEND(struct netns_mptcp_mib  mptcp_mib)
 #endif
 	RH_KABI_EXTEND(atomic64_t		net_cookie) /* written once */
+	RH_KABI_EXTEND(int	sctp_pf_expose)
+	RH_KABI_EXTEND(int	sctp_ps_retrans)
+	RH_KABI_EXTEND_WITH_SIZE(struct netns_bpf bpf, 128)
 } __randomize_layout;
 
 #include <linux/seq_file_net.h>

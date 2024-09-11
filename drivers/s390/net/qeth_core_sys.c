@@ -24,8 +24,6 @@ static ssize_t qeth_dev_state_show(struct device *dev,
 	switch (card->state) {
 	case CARD_STATE_DOWN:
 		return sprintf(buf, "DOWN\n");
-	case CARD_STATE_HARDSETUP:
-		return sprintf(buf, "HARDSETUP\n");
 	case CARD_STATE_SOFTSETUP:
 		if (card->dev->flags & IFF_UP)
 			return sprintf(buf, "UP (LAN %s)\n",
@@ -277,17 +275,20 @@ static ssize_t qeth_dev_recover_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct qeth_card *card = dev_get_drvdata(dev);
-	char *tmp;
-	int i;
+	bool reset;
+	int rc;
+
+	rc = kstrtobool(buf, &reset);
+	if (rc)
+		return rc;
 
 	if (!qeth_card_hw_is_reachable(card))
 		return -EPERM;
 
-	i = simple_strtoul(buf, &tmp, 16);
-	if (i == 1)
-		qeth_schedule_recovery(card);
+	if (reset)
+		rc = qeth_schedule_recovery(card);
 
-	return count;
+	return rc ? rc : count;
 }
 
 static DEVICE_ATTR(recover, 0200, NULL, qeth_dev_recover_store);
@@ -447,19 +448,17 @@ static ssize_t qeth_dev_isolation_store(struct device *dev,
 		rc = -EINVAL;
 		goto out;
 	}
-	rc = count;
 
-	/* defer IP assist if device is offline (until discipline->set_online)*/
-	card->options.prev_isolation = card->options.isolation;
-	card->options.isolation = isolation;
-	if (qeth_card_hw_is_reachable(card)) {
-		int ipa_rc = qeth_set_access_ctrl_online(card, 1);
-		if (ipa_rc != 0)
-			rc = ipa_rc;
-	}
+	if (qeth_card_hw_is_reachable(card))
+		rc = qeth_setadpparms_set_access_ctrl(card, isolation);
+
+	if (!rc)
+		WRITE_ONCE(card->options.isolation, isolation);
+
 out:
 	mutex_unlock(&card->conf_mutex);
-	return rc;
+
+	return rc ? rc : count;
 }
 
 static DEVICE_ATTR(isolation, 0644, qeth_dev_isolation_show,

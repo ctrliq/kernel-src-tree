@@ -4,12 +4,14 @@
 
 #include <uapi/linux/netfilter/nf_conntrack_common.h>
 
+#include <linux/rh_kabi.h>
+
 struct ip_conntrack_stat {
 	unsigned int found;
 	unsigned int invalid;
+	RH_KABI_REPLACE(unsigned int ignore, unsigned int clash_resolve)
 	unsigned int insert;
 	unsigned int insert_failed;
-	unsigned int clash_resolve;
 	unsigned int drop;
 	unsigned int early_drop;
 	unsigned int error;

@@ -318,6 +318,9 @@ void __init efi_reserve_boot_services(void)
 {
 	efi_memory_desc_t *md;
 
+	if (!efi_enabled(EFI_MEMMAP))
+		return;
+
 	for_each_efi_memory_desc(md) {
 		u64 start = md->phys_addr;
 		u64 size = md->num_pages << EFI_PAGE_SHIFT;
@@ -378,14 +381,6 @@ static void __init efi_unmap_pages(efi_memory_desc_t *md)
 	pgd_t *pgd = efi_mm.pgd;
 	u64 pa = md->phys_addr;
 	u64 va = md->virt_addr;
-
-	/*
-	 * To Do: Remove this check after adding functionality to unmap EFI boot
-	 * services code/data regions from direct mapping area because
-	 * "efi=old_map" maps EFI regions in swapper_pg_dir.
-	 */
-	if (efi_enabled(EFI_OLD_MEMMAP))
-		return;
 
 	/*
 	 * EFI mixed mode has all RAM mapped to access arguments while making
@@ -552,16 +547,6 @@ out:
 	return ret;
 }
 
-static const struct dmi_system_id sgi_uv1_dmi[] = {
-	{ NULL, "SGI UV1",
-		{	DMI_MATCH(DMI_PRODUCT_NAME,	"Stoutland Platform"),
-			DMI_MATCH(DMI_PRODUCT_VERSION,	"1.0"),
-			DMI_MATCH(DMI_BIOS_VENDOR,	"SGI.COM"),
-		}
-	},
-	{ } /* NULL entry stops DMI scanning */
-};
-
 void __init efi_apply_memmap_quirks(void)
 {
 	/*
@@ -573,10 +558,6 @@ void __init efi_apply_memmap_quirks(void)
 		pr_info("Setup done, disabling due to 32/64-bit mismatch\n");
 		efi_memmap_unmap();
 	}
-
-	/* UV2+ BIOS has a fix for this issue.  UV1 still needs the quirk. */
-	if (dmi_check_system(sgi_uv1_dmi))
-		set_bit(EFI_OLD_MEMMAP, &efi.flags);
 }
 
 /*
@@ -710,8 +691,6 @@ void efi_recover_from_page_fault(unsigned long phys_addr)
 
 	/*
 	 * Make sure that an efi runtime service caused the page fault.
-	 * "efi_mm" cannot be used to check if the page fault had occurred
-	 * in the firmware context because efi=old_map doesn't use efi_pgd.
 	 */
 	if (efi_rts_work.efi_rts_id == NONE)
 		return;

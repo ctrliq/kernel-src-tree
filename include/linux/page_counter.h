@@ -4,13 +4,14 @@
 
 #include <linux/atomic.h>
 #include <linux/kernel.h>
+#include <linux/rh_kabi.h>
 #include <asm/page.h>
 
 struct page_counter {
 	atomic_long_t usage;
 	unsigned long min;
 	unsigned long low;
-	unsigned long high;
+	RH_KABI_BROKEN_INSERT(unsigned long high)
 	unsigned long max;
 	struct page_counter *parent;
 

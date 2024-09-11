@@ -42,6 +42,7 @@
 
 extern const struct ethtool_ops mlx5i_ethtool_ops;
 extern const struct ethtool_ops mlx5i_pkey_ethtool_ops;
+extern const struct mlx5e_rx_handlers mlx5i_rx_handlers;
 
 #define MLX5_IB_GRH_BYTES       40
 #define MLX5_IPOIB_ENCAP_LEN    4
@@ -51,7 +52,7 @@ extern const struct ethtool_ops mlx5i_pkey_ethtool_ops;
 /* ipoib rdma netdev's private data structure */
 struct mlx5i_priv {
 	struct rdma_netdev rn; /* keep this first */
-	struct mlx5_core_qp qp;
+	u32 qpn;
 	bool   sub_interface;
 	u32    qkey;
 	u16    pkey_index;
@@ -62,8 +63,8 @@ struct mlx5i_priv {
 int mlx5i_create_tis(struct mlx5_core_dev *mdev, u32 underlay_qpn, u32 *tisn);
 
 /* Underlay QP create/destroy functions */
-int mlx5i_create_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp);
-void mlx5i_destroy_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp);
+int mlx5i_create_underlay_qp(struct mlx5e_priv *priv);
+void mlx5i_destroy_underlay_qp(struct mlx5_core_dev *mdev, u32 qpn);
 
 /* Underlay QP state modification init/uninit functions */
 int mlx5i_init_underlay_qp(struct mlx5e_priv *priv);
@@ -117,7 +118,6 @@ struct mlx5i_tx_wqe {
 
 void mlx5i_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
 		   struct mlx5_av *av, u32 dqpn, u32 dqkey, bool xmit_more);
-void mlx5i_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
 void mlx5i_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats);
 
 #endif /* CONFIG_MLX5_CORE_IPOIB */

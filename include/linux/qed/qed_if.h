@@ -594,6 +594,7 @@ enum qed_hw_err_type {
 enum qed_dev_type {
 	QED_DEV_TYPE_BB,
 	QED_DEV_TYPE_AH,
+	QED_DEV_TYPE_E5,
 };
 
 struct qed_dev_info {
@@ -662,6 +663,14 @@ enum qed_protocol {
 	QED_PROTOCOL_FCOE,
 };
 
+enum qed_fec_mode {
+	QED_FEC_MODE_NONE			= BIT(0),
+	QED_FEC_MODE_FIRECODE			= BIT(1),
+	QED_FEC_MODE_RS				= BIT(2),
+	QED_FEC_MODE_AUTO			= BIT(3),
+	QED_FEC_MODE_UNSUPPORTED		= BIT(4),
+};
+
 struct qed_link_params {
 	bool					link_up;
 
@@ -672,6 +681,7 @@ struct qed_link_params {
 #define QED_LINK_OVERRIDE_PAUSE_CONFIG		BIT(3)
 #define QED_LINK_OVERRIDE_LOOPBACK_MODE		BIT(4)
 #define QED_LINK_OVERRIDE_EEE_CONFIG		BIT(5)
+#define QED_LINK_OVERRIDE_FEC_CONFIG		BIT(6)
 
 	bool					autoneg;
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_speeds);
@@ -695,6 +705,7 @@ struct qed_link_params {
 #define QED_LINK_LOOPBACK_INT_PHY_FEA_AH_ONLY	BIT(9)
 
 	struct qed_link_eee_params		eee;
+	u32					fec;
 };
 
 struct qed_link_output {
@@ -715,6 +726,9 @@ struct qed_link_output {
 	bool					eee_active;
 	u8					sup_caps;
 	struct qed_link_eee_params		eee;
+
+	u32					sup_fec;
+	u32					active_fec;
 };
 
 struct qed_probe_params {

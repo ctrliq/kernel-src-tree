@@ -308,6 +308,26 @@ const struct pci_device_id *pci_hw_vendor_status(
 }
 EXPORT_SYMBOL(pci_hw_vendor_status);
 
+/*
+ * check_pci_unsupported_hardware() tests if certain pci-id is
+ * unsupported and if needed calls mark_hardware_unsupported
+ */
+void check_unsupported_pci_hardware(const struct pci_device_id *removed_ids,
+                                    struct pci_dev *dev)
+{
+	char devinfo[64];
+	const struct pci_device_id *ret = pci_match_id(removed_ids, dev);
+
+	if (!ret)
+		return;
+
+	snprintf(devinfo, sizeof(devinfo), "%s %s [%04x:%04x]",
+		dev_driver_string(&dev->dev), dev_name(&dev->dev),
+		dev->vendor, dev->device);
+	mark_hardware_unsupported(devinfo);
+}
+EXPORT_SYMBOL(check_unsupported_pci_hardware);
+
 struct drv_dev_and_id {
 	struct pci_driver *drv;
 	struct pci_dev *dev;

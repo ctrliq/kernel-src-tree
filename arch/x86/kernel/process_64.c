@@ -52,7 +52,7 @@
 #include <asm/switch_to.h>
 #include <asm/xen/hypervisor.h>
 #include <asm/vdso.h>
-#include <asm/resctrl_sched.h>
+#include <asm/resctrl.h>
 #include <asm/unistd.h>
 #include <asm/fsgsbase.h>
 #ifdef CONFIG_IA32_EMULATION
@@ -162,11 +162,14 @@ enum which_selector {
 };
 
 /*
- * Out of line to be protected from kprobes. It is not used on Xen
- * paravirt. When paravirt support is needed, it needs to be renamed
- * with native_ prefix.
+ * Out of line to be protected from kprobes and tracing. If this would be
+ * traced or probed than any access to a per CPU variable happens with
+ * the wrong GS.
+ *
+ * It is not used on Xen paravirt. When paravirt support is needed, it
+ * needs to be renamed with native_ prefix.
  */
-static noinline unsigned long __rdgsbase_inactive(void)
+static noinstr unsigned long __rdgsbase_inactive(void)
 {
 	unsigned long gsbase;
 
@@ -184,14 +187,16 @@ static noinline unsigned long __rdgsbase_inactive(void)
 
 	return gsbase;
 }
-NOKPROBE_SYMBOL(__rdgsbase_inactive);
 
 /*
- * Out of line to be protected from kprobes. It is not used on Xen
- * paravirt. When paravirt support is needed, it needs to be renamed
- * with native_ prefix.
+ * Out of line to be protected from kprobes and tracing. If this would be
+ * traced or probed than any access to a per CPU variable happens with
+ * the wrong GS.
+ *
+ * It is not used on Xen paravirt. When paravirt support is needed, it
+ * needs to be renamed with native_ prefix.
  */
-static noinline void __wrgsbase_inactive(unsigned long gsbase)
+static noinstr void __wrgsbase_inactive(unsigned long gsbase)
 {
 	lockdep_assert_irqs_disabled();
 
@@ -205,7 +210,6 @@ static noinline void __wrgsbase_inactive(unsigned long gsbase)
 		instrumentation_end();
 	}
 }
-NOKPROBE_SYMBOL(__wrgsbase_inactive);
 
 /*
  * Saves the FS or GS base for an outgoing thread if FSGSBASE extensions are
@@ -257,17 +261,13 @@ static __always_inline void save_fsgs(struct task_struct *task)
 	savesegment(fs, task->thread.fsindex);
 	savesegment(gs, task->thread.gsindex);
 	if (static_cpu_has(X86_FEATURE_FSGSBASE)) {
-		unsigned long flags;
-
 		/*
 		 * If FSGSBASE is enabled, we can't make any useful guesses
 		 * about the base, and user code expects us to save the current
 		 * value.  Fortunately, reading the base directly is efficient.
 		 */
 		task->thread.fsbase = rdfsbase();
-		local_irq_save(flags);
 		task->thread.gsbase = __rdgsbase_inactive();
-		local_irq_restore(flags);
 	} else {
 		save_base_legacy(task, task->thread.fsindex, FS);
 		save_base_legacy(task, task->thread.gsindex, GS);
@@ -371,8 +371,8 @@ static __always_inline void x86_fsgsbase_load(struct thread_struct *prev,
 	}
 }
 
-static unsigned long x86_fsgsbase_read_task(struct task_struct *task,
-					    unsigned short selector)
+unsigned long x86_fsgsbase_read_task(struct task_struct *task,
+				     unsigned short selector)
 {
 	unsigned short idx = selector >> 3;
 	unsigned long base;
@@ -421,7 +421,6 @@ unsigned long x86_gsbase_read_cpu_inactive(void)
 	if (boot_cpu_has(X86_FEATURE_FSGSBASE)) {
 		unsigned long flags;
 
-		/* Interrupts are disabled here. */
 		local_irq_save(flags);
 		gsbase = __rdgsbase_inactive();
 		local_irq_restore(flags);
@@ -437,7 +436,6 @@ void x86_gsbase_write_cpu_inactive(unsigned long gsbase)
 	if (boot_cpu_has(X86_FEATURE_FSGSBASE)) {
 		unsigned long flags;
 
-		/* Interrupts are disabled here. */
 		local_irq_save(flags);
 		__wrgsbase_inactive(gsbase);
 		local_irq_restore(flags);
@@ -488,89 +486,6 @@ void x86_gsbase_write_task(struct task_struct *task, unsigned long gsbase)
 	WARN_ON_ONCE(task == current);
 
 	task->thread.gsbase = gsbase;
-}
-
-int copy_thread_tls(unsigned long clone_flags, unsigned long sp,
-		unsigned long arg, struct task_struct *p, unsigned long tls)
-{
-	int err;
-	struct pt_regs *childregs;
-	struct fork_frame *fork_frame;
-	struct inactive_task_frame *frame;
-	struct task_struct *me = current;
-
-	childregs = task_pt_regs(p);
-	fork_frame = container_of(childregs, struct fork_frame, regs);
-	frame = &fork_frame->frame;
-
-	/*
-	 * For a new task use the RESET flags value since there is no before.
-	 * All the status flags are zero; DF and all the system flags must also
-	 * be 0, specifically IF must be 0 because we context switch to the new
-	 * task with interrupts disabled.
-	 */
-	frame->flags = X86_EFLAGS_FIXED;
-	frame->bp = 0;
-	frame->ret_addr = (unsigned long) ret_from_fork;
-	p->thread.sp = (unsigned long) fork_frame;
-	p->thread.io_bitmap_ptr = NULL;
-
-	save_fsgs(me);
-	p->thread.fsindex = me->thread.fsindex;
-	p->thread.fsbase = me->thread.fsbase;
-	p->thread.gsindex = me->thread.gsindex;
-	p->thread.gsbase = me->thread.gsbase;
-	savesegment(es, p->thread.es);
-	savesegment(ds, p->thread.ds);
-	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
-
-	if (unlikely(p->flags & PF_KTHREAD)) {
-		/* kernel thread */
-		memset(childregs, 0, sizeof(struct pt_regs));
-		frame->bx = sp;		/* function */
-		frame->r12 = arg;
-		return 0;
-	}
-	frame->bx = 0;
-	*childregs = *current_pt_regs();
-
-	childregs->ax = 0;
-	if (sp)
-		childregs->sp = sp;
-
-	err = -ENOMEM;
-	if (unlikely(test_tsk_thread_flag(me, TIF_IO_BITMAP))) {
-		p->thread.io_bitmap_ptr = kmemdup(me->thread.io_bitmap_ptr,
-						  IO_BITMAP_BYTES, GFP_KERNEL);
-		if (!p->thread.io_bitmap_ptr) {
-			p->thread.io_bitmap_max = 0;
-			return -ENOMEM;
-		}
-		set_tsk_thread_flag(p, TIF_IO_BITMAP);
-	}
-
-	/*
-	 * Set a new TLS for the child thread?
-	 */
-	if (clone_flags & CLONE_SETTLS) {
-#ifdef CONFIG_IA32_EMULATION
-		if (in_ia32_syscall())
-			err = do_set_thread_area(p, -1,
-				(struct user_desc __user *)tls, 0);
-		else
-#endif
-			err = do_arch_prctl_64(p, ARCH_SET_FS, tls);
-		if (err)
-			goto out;
-	}
-	err = 0;
-out:
-	if (err && p->thread.io_bitmap_ptr) {
-		kfree(p->thread.io_bitmap_ptr);
-		p->thread.io_bitmap_max = 0;
-	}
-
-	return err;
 }
 
 static void

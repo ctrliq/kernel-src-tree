@@ -1,17 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * net/core/ethtool.c - Ethtool ioctl handler
  * Copyright (c) 2003 Matthew Wilcox <matthew@wil.cx>
  *
  * This file is where we call all the ethtool_ops commands to get
  * the information ethtool needs.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
  */
 
 #include <linux/rh_kabi.h>
+#include "rhel.h"
 
 #include <linux/module.h>
 #include <linux/types.h>
@@ -23,7 +20,6 @@
 #include <linux/phy.h>
 #include <linux/bitops.h>
 #include <linux/uaccess.h>
-#include <linux/vermagic.h>
 #include <linux/vmalloc.h>
 #include <linux/sfp.h>
 #include <linux/slab.h>
@@ -31,9 +27,10 @@
 #include <linux/sched/signal.h>
 #include <linux/net.h>
 #include <net/devlink.h>
-#include RH_KABI_HIDE_INCLUDE(<net/xdp_sock.h>)
+#include RH_KABI_HIDE_INCLUDE(<net/xdp_sock_drv.h>)
 #include <net/flow_offload.h>
-
+#include <linux/ethtool_netlink.h>
+#include <generated/utsrelease.h>
 #include "common.h"
 
 /*
@@ -60,8 +57,6 @@ int ethtool_op_get_ts_info(struct net_device *dev, struct ethtool_ts_info *info)
 EXPORT_SYMBOL(ethtool_op_get_ts_info);
 
 /* Handlers for each ethtool command */
-
-#define ETHTOOL_DEV_FEATURE_WORDS	((NETDEV_FEATURE_COUNT + 31) / 32)
 
 static int ethtool_get_features(struct net_device *dev, void __user *useraddr)
 {
@@ -366,54 +361,6 @@ bool ethtool_convert_link_mode_to_legacy_u32(u32 *legacy_u32,
 }
 EXPORT_SYMBOL(ethtool_convert_link_mode_to_legacy_u32);
 
-/* return false if legacy contained non-0 deprecated fields
- * maxtxpkt/maxrxpkt. rest of ksettings always updated
- */
-static bool
-convert_legacy_settings_to_link_ksettings(
-	struct ethtool_link_ksettings *link_ksettings,
-	const struct ethtool_cmd *legacy_settings)
-{
-	bool retval = true;
-
-	memset(link_ksettings, 0, sizeof(*link_ksettings));
-
-	/* This is used to tell users that driver is still using these
-	 * deprecated legacy fields, and they should not use
-	 * %ETHTOOL_GLINKSETTINGS/%ETHTOOL_SLINKSETTINGS
-	 */
-	if (legacy_settings->maxtxpkt ||
-	    legacy_settings->maxrxpkt)
-		retval = false;
-
-	ethtool_convert_legacy_u32_to_link_mode(
-		link_ksettings->link_modes.supported,
-		legacy_settings->supported);
-	ethtool_convert_legacy_u32_to_link_mode(
-		link_ksettings->link_modes.advertising,
-		legacy_settings->advertising);
-	ethtool_convert_legacy_u32_to_link_mode(
-		link_ksettings->link_modes.lp_advertising,
-		legacy_settings->lp_advertising);
-	link_ksettings->base.speed
-		= ethtool_cmd_speed(legacy_settings);
-	link_ksettings->base.duplex
-		= legacy_settings->duplex;
-	link_ksettings->base.port
-		= legacy_settings->port;
-	link_ksettings->base.phy_address
-		= legacy_settings->phy_address;
-	link_ksettings->base.autoneg
-		= legacy_settings->autoneg;
-	link_ksettings->base.mdio_support
-		= legacy_settings->mdio_support;
-	link_ksettings->base.eth_tp_mdix
-		= legacy_settings->eth_tp_mdix;
-	link_ksettings->base.eth_tp_mdix_ctrl
-		= legacy_settings->eth_tp_mdix_ctrl;
-	return retval;
-}
-
 /* return false if ksettings link modes had higher bits
  * set. legacy_settings always updated (best effort)
  */
@@ -473,134 +420,6 @@ struct ethtool_link_usettings {
 		__u32 lp_advertising[__ETHTOOL_LINK_MODE_MASK_NU32];
 	} link_modes;
 };
-
-/* RHEL: RHEL-8.0 knows only 51 link modes so its bitmaps used
- * in ethtool_link_ksettings are array of longs with just 1 item.
- * The RHEL code uses more link modes so the size of fields
- * supported, advertising and lp_advertising are larger so
- * the current struct ethtool_link_ksettings cannot be used
- * for drivers compiled against RHEL-8.0.
- * We need to declare a compatibility structure that will
- * be used for these old drivers.
- */
-#define __ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(name)	\
-	DECLARE_BITMAP(name, __ETHTOOL_LINK_MODE_LAST_RH80 + 1)
-
-struct ethtool_link_ksettings_rh80 {
-	struct ethtool_link_settings base;
-	struct {
-		__ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(supported);
-		__ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(advertising);
-		__ETHTOOL_DECLARE_LINK_MODE_MASK_RH80(lp_advertising);
-	} link_modes;
-};
-
-/* RHEL: Helper function to check whether a driver implements
- * ethtool_ops->get_link_ksettings() callback or its older
- * variant used in RHEL-8.0.
- */
-static inline
-bool __rh_has_get_link_ksettings(struct net_device *dev)
-{
-	return (dev->ethtool_ops->get_link_ksettings ||
-		dev->ethtool_ops->get_link_ksettings_rh80);
-}
-
-/* RHEL: Helper function to check whether a driver implements
- * ethtool_ops->set_link_ksettings() callback or its older
- * variant used in RHEL-8.0.
- */
-static inline
-bool __rh_has_set_link_ksettings(struct net_device *dev)
-{
-	return (dev->ethtool_ops->set_link_ksettings ||
-		dev->ethtool_ops->set_link_ksettings_rh80);
-}
-
-/* RHEL: Helper function to call ethtool_ops->get_link_ksettings()
- * callback or its older variant used RHEL-8.0 depending on what
- * the driver implements.
- *
- * Newer callback is called directly and link_ksettings parameter
- * is passed through.
- * For older callback a temporary storage is used and its content
- * is then translated for caller.
- */
-static inline
-int __rh_call_get_link_ksettings(struct net_device *dev,
-				 struct ethtool_link_ksettings *link_ksettings)
-{
-	int err = -ENOTSUPP;
-
-	if (dev->ethtool_ops->get_link_ksettings) {
-		err = dev->ethtool_ops->get_link_ksettings(dev, link_ksettings);
-	} else if (dev->ethtool_ops->get_link_ksettings_rh80) {
-		struct ethtool_link_ksettings_rh80 tmp;
-
-		memset(&tmp, 0, sizeof(tmp));
-		err = dev->ethtool_ops->get_link_ksettings_rh80(dev, &tmp);
-		if (!err) {
-			link_ksettings->base = tmp.base;
-			bitmap_zero(link_ksettings->link_modes.supported,
-				    __ETHTOOL_LINK_MODE_MASK_NBITS - 1);
-			bitmap_copy(link_ksettings->link_modes.supported,
-				    tmp.link_modes.supported,
-				    __ETHTOOL_LINK_MODE_LAST_RH80);
-			bitmap_zero(link_ksettings->link_modes.advertising,
-				    __ETHTOOL_LINK_MODE_MASK_NBITS - 1);
-			bitmap_copy(link_ksettings->link_modes.advertising,
-				    tmp.link_modes.advertising,
-				    __ETHTOOL_LINK_MODE_LAST_RH80);
-			bitmap_zero(link_ksettings->link_modes.lp_advertising,
-				    __ETHTOOL_LINK_MODE_MASK_NBITS - 1);
-			bitmap_copy(link_ksettings->link_modes.lp_advertising,
-				    tmp.link_modes.lp_advertising,
-				    __ETHTOOL_LINK_MODE_LAST_RH80);
-		}
-	}
-
-	return err;
-}
-
-/* RHEL: Helper function to call ethtool_ops->set_link_ksettings()
- * callback or its older variant used RHEL-8.0 depending on what
- * the driver implements.
- *
- * Newer callback is called directly and link_ksettings parameter
- * is passed through.
- * For older callback a temporary storage is used and its content
- * is filled from input buffer (link modes bitmaps truncated).
- */
-static inline
-int __rh_call_set_link_ksettings(struct net_device *dev,
-				 const struct ethtool_link_ksettings *link_ksettings)
-{
-	int err = -ENOTSUPP;
-
-	if (dev->ethtool_ops->set_link_ksettings) {
-		err = dev->ethtool_ops->set_link_ksettings(dev, link_ksettings);
-	} else if (dev->ethtool_ops->set_link_ksettings_rh80) {
-		struct ethtool_link_ksettings_rh80 tmp;
-
-		/* Copy only link modes that are known for RHEL-8.0 based
-		 * drivers.
-		 */
-		tmp.base = link_ksettings->base;
-		bitmap_copy(tmp.link_modes.supported,
-			    link_ksettings->link_modes.supported,
-			    __ETHTOOL_LINK_MODE_LAST_RH80);
-		bitmap_copy(tmp.link_modes.advertising,
-			    link_ksettings->link_modes.advertising,
-			    __ETHTOOL_LINK_MODE_LAST_RH80);
-		bitmap_copy(tmp.link_modes.lp_advertising,
-			    link_ksettings->link_modes.lp_advertising,
-			    __ETHTOOL_LINK_MODE_LAST_RH80);
-
-		err = dev->ethtool_ops->set_link_ksettings_rh80(dev, &tmp);
-	}
-
-	return err;
-}
 
 /* Internal kernel helper to query a device ethtool_link_settings.
  *
@@ -775,6 +594,8 @@ static int ethtool_get_link_ksettings(struct net_device *dev,
 	link_ksettings.base.cmd = ETHTOOL_GLINKSETTINGS;
 	link_ksettings.base.link_mode_masks_nwords
 		= __ETHTOOL_LINK_MODE_MASK_NU32;
+	link_ksettings.base.master_slave_cfg = MASTER_SLAVE_CFG_UNSUPPORTED;
+	link_ksettings.base.master_slave_state = MASTER_SLAVE_STATE_UNSUPPORTED;
 
 	return store_link_ksettings_for_user(useraddr, &link_ksettings);
 }
@@ -821,7 +642,16 @@ static int ethtool_set_link_ksettings(struct net_device *dev,
 	    != link_ksettings.base.link_mode_masks_nwords)
 		return -EINVAL;
 
-	return __rh_call_set_link_ksettings(dev, &link_ksettings);
+	if (link_ksettings.base.master_slave_cfg ||
+	    link_ksettings.base.master_slave_state)
+		return -EINVAL;
+
+	err = __rh_call_set_link_ksettings(dev, &link_ksettings);
+	if (err >= 0) {
+		ethtool_notify(dev, ETHTOOL_MSG_LINKINFO_NTF, NULL);
+		ethtool_notify(dev, ETHTOOL_MSG_LINKMODES_NTF, NULL);
+	}
+	return err;
 }
 
 int ethtool_virtdev_set_link_ksettings(struct net_device *dev,
@@ -911,6 +741,7 @@ static int ethtool_get_settings(struct net_device *dev, void __user *useraddr)
 static int ethtool_set_settings(struct net_device *dev, void __user *useraddr)
 {
 	struct ethtool_cmd cmd;
+	int ret;
 
 	ASSERT_RTNL();
 
@@ -928,7 +759,12 @@ static int ethtool_set_settings(struct net_device *dev, void __user *useraddr)
 		link_ksettings.base.cmd = ETHTOOL_SLINKSETTINGS;
 		link_ksettings.base.link_mode_masks_nwords
 			= __ETHTOOL_LINK_MODE_MASK_NU32;
-		return __rh_call_set_link_ksettings(dev, &link_ksettings);
+		ret = __rh_call_set_link_ksettings(dev, &link_ksettings);
+		if (ret >= 0) {
+			ethtool_notify(dev, ETHTOOL_MSG_LINKINFO_NTF, NULL);
+			ethtool_notify(dev, ETHTOOL_MSG_LINKMODES_NTF, NULL);
+		}
+		return ret;
 	}
 
 	/* legacy %ethtool_cmd API */
@@ -940,7 +776,12 @@ static int ethtool_set_settings(struct net_device *dev, void __user *useraddr)
 	if (!dev->ethtool_ops->set_settings)
 		return -EOPNOTSUPP;
 
-	return dev->ethtool_ops->set_settings(dev, &cmd);
+	ret = dev->ethtool_ops->set_settings(dev, &cmd);
+	if (ret >= 0) {
+		ethtool_notify(dev, ETHTOOL_MSG_LINKINFO_NTF, NULL);
+		ethtool_notify(dev, ETHTOOL_MSG_LINKMODES_NTF, NULL);
+	}
+	return ret;
 }
 
 static noinline_for_stack int ethtool_get_drvinfo(struct net_device *dev,
@@ -1185,37 +1026,6 @@ void netdev_rss_key_fill(void *buffer, size_t len)
 	memcpy(buffer, netdev_rss_key, len);
 }
 EXPORT_SYMBOL(netdev_rss_key_fill);
-
-static int ethtool_get_max_rxfh_channel(struct net_device *dev, u32 *max)
-{
-	u32 dev_size, current_max = 0;
-	u32 *indir;
-	int ret;
-
-	if (!dev->ethtool_ops->get_rxfh_indir_size ||
-	    !dev->ethtool_ops->get_rxfh)
-		return -EOPNOTSUPP;
-	dev_size = dev->ethtool_ops->get_rxfh_indir_size(dev);
-	if (dev_size == 0)
-		return -EOPNOTSUPP;
-
-	indir = kcalloc(dev_size, sizeof(indir[0]), GFP_USER);
-	if (!indir)
-		return -ENOMEM;
-
-	ret = dev->ethtool_ops->get_rxfh(dev, indir, NULL, NULL);
-	if (ret)
-		goto out;
-
-	while (dev_size--)
-		current_max = max(current_max, indir[dev_size]);
-
-	*max = current_max;
-
-out:
-	kfree(indir);
-	return ret;
-}
 
 static noinline_for_stack int ethtool_get_rxfh_indir(struct net_device *dev,
 						     void __user *useraddr)
@@ -1613,6 +1423,7 @@ static int ethtool_set_wol(struct net_device *dev, char __user *useraddr)
 		return ret;
 
 	dev->wol_enabled = !!wol.wolopts;
+	ethtool_notify(dev, ETHTOOL_MSG_WOL_NTF, NULL);
 
 	return 0;
 }
@@ -1641,6 +1452,7 @@ static int ethtool_get_eee(struct net_device *dev, char __user *useraddr)
 static int ethtool_set_eee(struct net_device *dev, char __user *useraddr)
 {
 	struct ethtool_eee edata;
+	int ret;
 
 	if (!dev->ethtool_ops->set_eee)
 		return -EOPNOTSUPP;
@@ -1648,7 +1460,10 @@ static int ethtool_set_eee(struct net_device *dev, char __user *useraddr)
 	if (copy_from_user(&edata, useraddr, sizeof(edata)))
 		return -EFAULT;
 
-	return dev->ethtool_ops->set_eee(dev, &edata);
+	ret = dev->ethtool_ops->set_eee(dev, &edata);
+	if (!ret)
+		ethtool_notify(dev, ETHTOOL_MSG_EEE_NTF, NULL);
+	return ret;
 }
 
 static int ethtool_nway_reset(struct net_device *dev)
@@ -1662,12 +1477,12 @@ static int ethtool_nway_reset(struct net_device *dev)
 static int ethtool_get_link(struct net_device *dev, char __user *useraddr)
 {
 	struct ethtool_value edata = { .cmd = ETHTOOL_GLINK };
+	int link = __ethtool_get_link(dev);
 
-	if (!dev->ethtool_ops->get_link)
-		return -EOPNOTSUPP;
+	if (link < 0)
+		return link;
 
-	edata.data = netif_running(dev) && dev->ethtool_ops->get_link(dev);
-
+	edata.data = link;
 	if (copy_to_user(useraddr, &edata, sizeof(edata)))
 		return -EFAULT;
 	return 0;
@@ -1864,6 +1679,7 @@ static noinline_for_stack int ethtool_set_coalesce(struct net_device *dev,
 						   void __user *useraddr)
 {
 	struct ethtool_coalesce coalesce;
+	int ret;
 
 	if (!dev->ethtool_ops->set_coalesce)
 		return -EOPNOTSUPP;
@@ -1874,7 +1690,10 @@ static noinline_for_stack int ethtool_set_coalesce(struct net_device *dev,
 	if (!ethtool_set_coalesce_supported(dev, &coalesce))
 		return -EOPNOTSUPP;
 
-	return dev->ethtool_ops->set_coalesce(dev, &coalesce);
+	ret = dev->ethtool_ops->set_coalesce(dev, &coalesce);
+	if (!ret)
+		ethtool_notify(dev, ETHTOOL_MSG_COALESCE_NTF, NULL);
+	return ret;
 }
 
 static int ethtool_get_ringparam(struct net_device *dev, void __user *useraddr)
@@ -1894,6 +1713,7 @@ static int ethtool_get_ringparam(struct net_device *dev, void __user *useraddr)
 static int ethtool_set_ringparam(struct net_device *dev, void __user *useraddr)
 {
 	struct ethtool_ringparam ringparam, max = { .cmd = ETHTOOL_GRINGPARAM };
+	int ret;
 
 	if (!dev->ethtool_ops->set_ringparam || !dev->ethtool_ops->get_ringparam)
 		return -EOPNOTSUPP;
@@ -1910,7 +1730,10 @@ static int ethtool_set_ringparam(struct net_device *dev, void __user *useraddr)
 	    ringparam.tx_pending > max.tx_max_pending)
 		return -EINVAL;
 
-	return dev->ethtool_ops->set_ringparam(dev, &ringparam);
+	ret = dev->ethtool_ops->set_ringparam(dev, &ringparam);
+	if (!ret)
+		ethtool_notify(dev, ETHTOOL_MSG_RINGS_NTF, NULL);
+	return ret;
 }
 
 static noinline_for_stack int ethtool_get_channels(struct net_device *dev,
@@ -1935,6 +1758,7 @@ static noinline_for_stack int ethtool_set_channels(struct net_device *dev,
 	u16 from_channel, to_channel;
 	u32 max_rx_in_use = 0;
 	unsigned int i;
+	int ret;
 
 	if (!dev->ethtool_ops->set_channels || !dev->ethtool_ops->get_channels)
 		return -EOPNOTSUPP;
@@ -1957,6 +1781,11 @@ static noinline_for_stack int ethtool_set_channels(struct net_device *dev,
 	    channels.other_count > curr.max_other)
 		return -EINVAL;
 
+	/* ensure there is at least one RX and one TX channel */
+	if (!channels.combined_count &&
+	    (!channels.rx_count || !channels.tx_count))
+		return -EINVAL;
+
 	/* ensure the new Rx count fits within the configured Rx flow
 	 * indirection table settings */
 	if (netif_is_rxfh_configured(dev) &&
@@ -1972,7 +1801,10 @@ static noinline_for_stack int ethtool_set_channels(struct net_device *dev,
 		if (xdp_get_umem_from_qid(dev, i))
 			return -EINVAL;
 
-	return dev->ethtool_ops->set_channels(dev, &channels);
+	ret = dev->ethtool_ops->set_channels(dev, &channels);
+	if (!ret)
+		ethtool_notify(dev, ETHTOOL_MSG_CHANNELS_NTF, NULL);
+	return ret;
 }
 
 static int ethtool_get_pauseparam(struct net_device *dev, void __user *useraddr)
@@ -1992,6 +1824,7 @@ static int ethtool_get_pauseparam(struct net_device *dev, void __user *useraddr)
 static int ethtool_set_pauseparam(struct net_device *dev, void __user *useraddr)
 {
 	struct ethtool_pauseparam pauseparam;
+	int ret;
 
 	if (!dev->ethtool_ops->set_pauseparam)
 		return -EOPNOTSUPP;
@@ -1999,7 +1832,10 @@ static int ethtool_set_pauseparam(struct net_device *dev, void __user *useraddr)
 	if (copy_from_user(&pauseparam, useraddr, sizeof(pauseparam)))
 		return -EFAULT;
 
-	return dev->ethtool_ops->set_pauseparam(dev, &pauseparam);
+	ret = dev->ethtool_ops->set_pauseparam(dev, &pauseparam);
+	if (!ret)
+		ethtool_notify(dev, ETHTOOL_MSG_PAUSE_NTF, NULL);
+	return ret;
 }
 
 static int ethtool_self_test(struct net_device *dev, char __user *useraddr)
@@ -2421,32 +2257,17 @@ out:
 
 static int ethtool_get_ts_info(struct net_device *dev, void __user *useraddr)
 {
-	int err = 0;
 	struct ethtool_ts_info info;
-	const struct ethtool_ops *ops = dev->ethtool_ops;
-	struct phy_device *phydev = dev->phydev;
+	int err;
 
-	memset(&info, 0, sizeof(info));
-	info.cmd = ETHTOOL_GET_TS_INFO;
-
-	if (phy_has_tsinfo(phydev)) {
-		err = phy_ts_info(phydev, &info);
-	} else if (ops->get_ts_info) {
-		err = ops->get_ts_info(dev, &info);
-	} else {
-		info.so_timestamping =
-			SOF_TIMESTAMPING_RX_SOFTWARE |
-			SOF_TIMESTAMPING_SOFTWARE;
-		info.phc_index = -1;
-	}
-
+	err = __ethtool_get_ts_info(dev, &info);
 	if (err)
 		return err;
 
 	if (copy_to_user(useraddr, &info, sizeof(info)))
-		err = -EFAULT;
+		return -EFAULT;
 
-	return err;
+	return 0;
 }
 
 static int __ethtool_get_module_info(struct net_device *dev,
@@ -2919,6 +2740,8 @@ int dev_ethtool(struct net *net, struct ifreq *ifr)
 	case ETHTOOL_SMSGLVL:
 		rc = ethtool_set_value_void(dev, useraddr,
 				       dev->ethtool_ops->set_msglevel);
+		if (!rc)
+			ethtool_notify(dev, ETHTOOL_MSG_DEBUG_NTF, NULL);
 		break;
 	case ETHTOOL_GEEE:
 		rc = ethtool_get_eee(dev, useraddr);
@@ -2981,6 +2804,8 @@ int dev_ethtool(struct net *net, struct ifreq *ifr)
 	case ETHTOOL_GPFLAGS:
 		rc = ethtool_get_value(dev, useraddr, ethcmd,
 				       dev->ethtool_ops->get_priv_flags);
+		if (!rc)
+			ethtool_notify(dev, ETHTOOL_MSG_PRIVFLAGS_NTF, NULL);
 		break;
 	case ETHTOOL_SPFLAGS:
 		rc = ethtool_set_value(dev, useraddr,

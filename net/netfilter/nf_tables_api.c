@@ -1218,7 +1218,7 @@ nft_chain_lookup_byhandle(const struct nft_table *table, u64 handle, u8 genmask)
 	return ERR_PTR(-ENOENT);
 }
 
-static bool lockdep_commit_lock_is_held(struct net *net)
+static bool lockdep_commit_lock_is_held(const struct net *net)
 {
 #ifdef CONFIG_PROVE_LOCKING
 	return lockdep_is_held(&net->nft_commit_mutex);
@@ -5438,7 +5438,7 @@ struct nft_object *nft_obj_lookup(const struct net *net,
 	k.name = search;
 
 	WARN_ON_ONCE(!rcu_read_lock_held() &&
-		     !lockdep_nfnl_is_held(NFNL_SUBSYS_NFTABLES));
+		     !lockdep_commit_lock_is_held(net));
 
 	rcu_read_lock();
 	list = rhltable_lookup(&nft_objname_ht, &k, nft_objname_ht_params);

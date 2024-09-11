@@ -24,8 +24,6 @@ bool s390_arch_random_generate(u8 *buf, unsigned int nbytes);
 
 static inline bool arch_has_random(void)
 {
-	if (static_branch_likely(&s390_arch_random_available))
-		return s390_arch_get_random_long(v);
 	return false;
 }
 
@@ -38,6 +36,8 @@ static inline bool arch_has_random_seed(void)
 
 static inline bool arch_get_random_long(unsigned long *v)
 {
+	if (static_branch_likely(&s390_arch_random_available))
+		return s390_arch_get_random_long(v);
 	return false;
 }
 

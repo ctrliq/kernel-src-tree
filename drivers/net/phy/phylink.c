@@ -40,8 +40,10 @@ enum {
 struct phylink {
 	/* private: */
 	struct net_device *netdev;
-	const struct phylink_mac_ops *ops;
+	const struct phylink_mac_ops *mac_ops;
+	const struct phylink_pcs_ops *pcs_ops;
 	struct phylink_config *config;
+	struct phylink_pcs *pcs;
 	struct device *dev;
 	unsigned int old_link_state:1;
 
@@ -154,7 +156,7 @@ static const char *phylink_an_mode_str(unsigned int mode)
 static int phylink_validate(struct phylink *pl, unsigned long *supported,
 			    struct phylink_link_state *state)
 {
-	pl->ops->validate(pl->config, supported, state);
+	pl->mac_ops->validate(pl->config, supported, state);
 
 	return phylink_is_empty_linkmode(supported) ? -EINVAL : 0;
 }
@@ -416,26 +418,110 @@ static void phylink_mac_config(struct phylink *pl,
 		    __ETHTOOL_LINK_MODE_MASK_NBITS, state->advertising,
 		    state->pause, state->link, state->an_enabled);
 
-	pl->ops->mac_config(pl->config, pl->cur_link_an_mode, state);
+	pl->mac_ops->mac_config(pl->config, pl->cur_link_an_mode, state);
 }
 
-static void phylink_mac_config_up(struct phylink *pl,
-				  const struct phylink_link_state *state)
-{
-	if (state->link)
-		phylink_mac_config(pl, state);
-}
-
-static void phylink_mac_an_restart(struct phylink *pl)
+static void phylink_mac_pcs_an_restart(struct phylink *pl)
 {
 	if (pl->link_config.an_enabled &&
-	    phy_interface_mode_is_8023z(pl->link_config.interface))
-		pl->ops->mac_an_restart(pl->config);
+	    phy_interface_mode_is_8023z(pl->link_config.interface) &&
+	    phylink_autoneg_inband(pl->cur_link_an_mode)) {
+		if (pl->pcs_ops)
+			pl->pcs_ops->pcs_an_restart(pl->pcs);
+		else
+			pl->mac_ops->mac_an_restart(pl->config);
+	}
 }
 
-static int phylink_get_mac_state(struct phylink *pl, struct phylink_link_state *state)
+static void phylink_major_config(struct phylink *pl, bool restart,
+				  const struct phylink_link_state *state)
 {
+	int err;
 
+	phylink_dbg(pl, "major config %s\n", phy_modes(state->interface));
+
+	if (pl->mac_ops->mac_prepare) {
+		err = pl->mac_ops->mac_prepare(pl->config, pl->cur_link_an_mode,
+					       state->interface);
+		if (err < 0) {
+			phylink_err(pl, "mac_prepare failed: %pe\n",
+				    ERR_PTR(err));
+			return;
+		}
+	}
+
+	phylink_mac_config(pl, state);
+
+	if (pl->pcs_ops) {
+		err = pl->pcs_ops->pcs_config(pl->pcs, pl->cur_link_an_mode,
+					      state->interface,
+					      state->advertising,
+					      !!(pl->link_config.pause &
+						 MLO_PAUSE_AN));
+		if (err < 0)
+			phylink_err(pl, "pcs_config failed: %pe\n",
+				    ERR_PTR(err));
+		if (err > 0)
+			restart = true;
+	}
+	if (restart)
+		phylink_mac_pcs_an_restart(pl);
+
+	if (pl->mac_ops->mac_finish) {
+		err = pl->mac_ops->mac_finish(pl->config, pl->cur_link_an_mode,
+					      state->interface);
+		if (err < 0)
+			phylink_err(pl, "mac_prepare failed: %pe\n",
+				    ERR_PTR(err));
+	}
+}
+
+/*
+ * Reconfigure for a change of inband advertisement.
+ * If we have a separate PCS, we only need to call its pcs_config() method,
+ * and then restart AN if it indicates something changed. Otherwise, we do
+ * the full MAC reconfiguration.
+ */
+static int phylink_change_inband_advert(struct phylink *pl)
+{
+	int ret;
+
+	if (test_bit(PHYLINK_DISABLE_STOPPED, &pl->phylink_disable_state))
+		return 0;
+
+	if (!pl->pcs_ops) {
+		/* Legacy method */
+		phylink_mac_config(pl, &pl->link_config);
+		phylink_mac_pcs_an_restart(pl);
+		return 0;
+	}
+
+	phylink_dbg(pl, "%s: mode=%s/%s adv=%*pb pause=%02x\n", __func__,
+		    phylink_an_mode_str(pl->cur_link_an_mode),
+		    phy_modes(pl->link_config.interface),
+		    __ETHTOOL_LINK_MODE_MASK_NBITS, pl->link_config.advertising,
+		    pl->link_config.pause);
+
+	/* Modern PCS-based method; update the advert at the PCS, and
+	 * restart negotiation if the pcs_config() helper indicates that
+	 * the programmed advertisement has changed.
+	 */
+	ret = pl->pcs_ops->pcs_config(pl->pcs, pl->cur_link_an_mode,
+				      pl->link_config.interface,
+				      pl->link_config.advertising,
+				      !!(pl->link_config.pause & MLO_PAUSE_AN));
+	if (ret < 0)
+		return ret;
+
+	if (ret > 0)
+		phylink_mac_pcs_an_restart(pl);
+
+	return 0;
+}
+
+static void phylink_mac_pcs_get_state(struct phylink *pl,
+				      struct phylink_link_state *state)
+{
 	linkmode_copy(state->advertising, pl->link_config.advertising);
 	linkmode_zero(state->lp_advertising);
 	state->interface = pl->link_config.interface;
@@ -446,7 +532,12 @@ static int phylink_get_mac_state(struct phylink *pl, struct phylink_link_state *
 	state->an_complete = 0;
 	state->link = 1;
 
-	return pl->ops->mac_link_state(pl->config, state);
+	if (pl->pcs_ops)
+		pl->pcs_ops->pcs_get_state(pl->pcs, state);
+	else if (pl->mac_ops->mac_pcs_get_state)
+		pl->mac_ops->mac_pcs_get_state(pl->config, state);
+	else
+		state->link = 0;
 }
 
 /* The fixed state is... fixed except for the link state,
@@ -464,7 +555,7 @@ static void phylink_get_fixed_state(struct phylink *pl,
 	phylink_resolve_flow(state);
 }
 
-static void phylink_mac_initial_config(struct phylink *pl)
+static void phylink_mac_initial_config(struct phylink *pl, bool force_restart)
 {
 	struct phylink_link_state link_state;
 
@@ -490,7 +581,7 @@ static void phylink_mac_initial_config(struct phylink *pl)
 	link_state.link = false;
 
 	phylink_apply_manual_flow(pl, &link_state);
-	phylink_mac_config(pl, &link_state);
+	phylink_major_config(pl, force_restart, &link_state);
 }
 
 static const char *phylink_pause_to_str(int pause)
@@ -507,14 +598,23 @@ static const char *phylink_pause_to_str(int pause)
 	}
 }
 
-static void phylink_mac_link_up(struct phylink *pl,
-				struct phylink_link_state link_state)
+static void phylink_link_up(struct phylink *pl,
+			    struct phylink_link_state link_state)
 {
 	struct net_device *ndev = pl->netdev;
 
 	pl->cur_interface = link_state.interface;
-	pl->ops->mac_link_up(pl->config, pl->link_an_mode,
-			     pl->cur_interface, pl->phydev);
+
+	if (pl->pcs_ops && pl->pcs_ops->pcs_link_up)
+		pl->pcs_ops->pcs_link_up(pl->pcs, pl->cur_link_an_mode,
+					 pl->cur_interface,
+					 link_state.speed, link_state.duplex);
+
+	pl->mac_ops->mac_link_up(pl->config, pl->phydev,
+				 pl->cur_link_an_mode, pl->cur_interface,
+				 link_state.speed, link_state.duplex,
+				 !!(link_state.pause & MLO_PAUSE_TX),
+				 !!(link_state.pause & MLO_PAUSE_RX));
 
 	if (ndev)
 		netif_carrier_on(ndev);
@@ -526,14 +626,14 @@ static void phylink_mac_link_up(struct phylink *pl,
 		     phylink_pause_to_str(link_state.pause));
 }
 
-static void phylink_mac_link_down(struct phylink *pl)
+static void phylink_link_down(struct phylink *pl)
 {
 	struct net_device *ndev = pl->netdev;
 
 	if (ndev)
 		netif_carrier_off(ndev);
-	pl->ops->mac_link_down(pl->config, pl->cur_link_an_mode,
-			       pl->cur_interface);
+	pl->mac_ops->mac_link_down(pl->config, pl->cur_link_an_mode,
+				   pl->cur_interface);
 	phylink_info(pl, "Link is Down\n");
 }
 
@@ -542,6 +642,7 @@ static void phylink_resolve(struct work_struct *w)
 	struct phylink *pl = container_of(w, struct phylink, resolve);
 	struct phylink_link_state link_state;
 	struct net_device *ndev = pl->netdev;
+	bool mac_config = false;
 	bool cur_link_state;
 
 	mutex_lock(&pl->state_mutex);
@@ -560,16 +661,16 @@ static void phylink_resolve(struct work_struct *w)
 		case MLO_AN_PHY:
 			link_state = pl->phy_state;
 			phylink_apply_manual_flow(pl, &link_state);
-			phylink_mac_config_up(pl, &link_state);
+			mac_config = link_state.link;
 			break;
 
 		case MLO_AN_FIXED:
 			phylink_get_fixed_state(pl, &link_state);
-			phylink_mac_config_up(pl, &link_state);
+			mac_config = link_state.link;
 			break;
 
 		case MLO_AN_INBAND:
-			phylink_get_mac_state(pl, &link_state);
+			phylink_mac_pcs_get_state(pl, &link_state);
 
 			/* If we have a phy, the "up" state is the union of
 			 * both the PHY and the MAC */
@@ -583,19 +684,41 @@ static void phylink_resolve(struct work_struct *w)
 				/* If we have a PHY, we need to update with
 				 * the PHY flow control bits. */
 				link_state.pause = pl->phy_state.pause;
-				phylink_apply_manual_flow(pl, &link_state);
-				phylink_mac_config(pl, &link_state);
+				mac_config = true;
 			}
+			phylink_apply_manual_flow(pl, &link_state);
 			break;
+		}
+	}
+
+	if (mac_config) {
+		if (link_state.interface != pl->link_config.interface) {
+			/* The interface has changed, force the link down and
+			 * then reconfigure.
+			 */
+			if (cur_link_state) {
+				phylink_link_down(pl);
+				cur_link_state = false;
+			}
+			phylink_major_config(pl, false, &link_state);
+			pl->link_config.interface = link_state.interface;
+		} else if (!pl->pcs_ops) {
+			/* The interface remains unchanged, only the speed,
+			 * duplex or pause settings have changed. Call the
+			 * old mac_config() method to configure the MAC/PCS
+			 * only if we do not have a PCS installed (an
+			 * unconverted user.)
+			 */
+			phylink_mac_config(pl, &link_state);
 		}
 	}
 
 	if (link_state.link != cur_link_state) {
 		pl->old_link_state = link_state.link;
 		if (!link_state.link)
-			phylink_mac_link_down(pl);
+			phylink_link_down(pl);
 		else
-			phylink_mac_link_up(pl, link_state);
+			phylink_link_up(pl, link_state);
 	}
 	if (!link_state.link && pl->mac_link_dropped) {
 		pl->mac_link_dropped = false;
@@ -662,7 +785,7 @@ static int phylink_register_sfp(struct phylink *pl,
  * @fwnode: a pointer to a &struct fwnode_handle describing the network
  *	interface
  * @iface: the desired link mode defined by &typedef phy_interface_t
- * @ops: a pointer to a &struct phylink_mac_ops for the MAC.
+ * @mac_ops: a pointer to a &struct phylink_mac_ops for the MAC.
  *
  * Create a new phylink instance, and parse the link parameters found in @np.
  * This will parse in-band modes, fixed-link or SFP configuration.
@@ -675,7 +798,7 @@ static int phylink_register_sfp(struct phylink *pl,
 struct phylink *phylink_create(struct phylink_config *config,
 			       struct fwnode_handle *fwnode,
 			       phy_interface_t iface,
-			       const struct phylink_mac_ops *ops)
+			       const struct phylink_mac_ops *mac_ops)
 {
 	struct phylink *pl;
 	int ret;
@@ -708,7 +831,7 @@ struct phylink *phylink_create(struct phylink_config *config,
 	pl->link_config.speed = SPEED_UNKNOWN;
 	pl->link_config.duplex = DUPLEX_UNKNOWN;
 	pl->link_config.an_enabled = true;
-	pl->ops = ops;
+	pl->mac_ops = mac_ops;
 	__set_bit(PHYLINK_DISABLE_STOPPED, &pl->phylink_disable_state);
 	timer_setup(&pl->link_poll, phylink_fixed_poll, 0);
 
@@ -743,6 +866,27 @@ struct phylink *phylink_create(struct phylink_config *config,
 EXPORT_SYMBOL_GPL(phylink_create);
 
 /**
+ * phylink_set_pcs() - set the current PCS for phylink to use
+ * @pl: a pointer to a &struct phylink returned from phylink_create()
+ * @pcs: a pointer to the &struct phylink_pcs
+ *
+ * Bind the MAC PCS to phylink.  This may be called after phylink_create(),
+ * in mac_prepare() or mac_config() methods if it is desired to dynamically
+ * change the PCS.
+ *
+ * Please note that there are behavioural changes with the mac_config()
+ * callback if a PCS is present (denoting a newer setup) so removing a PCS
+ * is not supported, and if a PCS is going to be used, it must be registered
+ * by calling phylink_set_pcs() at the latest in the first mac_config() call.
+ */
+void phylink_set_pcs(struct phylink *pl, struct phylink_pcs *pcs)
+{
+	pl->pcs = pcs;
+	pl->pcs_ops = pcs->ops;
+}
+EXPORT_SYMBOL_GPL(phylink_set_pcs);
+
+/**
  * phylink_destroy() - cleanup and destroy the phylink instance
  * @pl: a pointer to a &struct phylink returned from phylink_create()
  *
@@ -762,8 +906,7 @@ void phylink_destroy(struct phylink *pl)
 }
 EXPORT_SYMBOL_GPL(phylink_destroy);
 
-static void phylink_phy_change(struct phy_device *phydev, bool up,
-			       bool do_carrier)
+static void phylink_phy_change(struct phy_device *phydev, bool up)
 {
 	struct phylink *pl = phydev->phylink;
 	bool tx_pause, rx_pause;
@@ -1054,14 +1197,12 @@ void phylink_start(struct phylink *pl)
 	/* Apply the link configuration to the MAC when starting. This allows
 	 * a fixed-link to start with the correct parameters, and also
 	 * ensures that we set the appropriate advertisement for Serdes links.
-	 */
-	phylink_mac_initial_config(pl);
-
-	/* Restart autonegotiation if using 802.3z to ensure that the link
+	 *
+	 * Restart autonegotiation if using 802.3z to ensure that the link
 	 * parameters are properly negotiated.  This is necessary for DSA
 	 * switches using 802.3z negotiation to ensure they see our modes.
 	 */
-	phylink_mac_an_restart(pl);
+	phylink_mac_initial_config(pl, true);
 
 	clear_bit(PHYLINK_DISABLE_STOPPED, &pl->phylink_disable_state);
 	phylink_run_resolve(pl);
@@ -1088,6 +1229,8 @@ void phylink_start(struct phylink *pl)
 		break;
 	case MLO_AN_INBAND:
 		poll |= pl->config->pcs_poll;
+		if (pl->pcs)
+			poll |= pl->pcs->poll;
 		break;
 	}
 	if (poll)
@@ -1234,7 +1377,7 @@ int phylink_ethtool_ksettings_get(struct phylink *pl,
 		if (pl->phydev)
 			break;
 
-		phylink_get_mac_state(pl, &link_state);
+		phylink_mac_pcs_get_state(pl, &link_state);
 
 		/* The MAC is reporting the link results from its own PCS
 		 * layer via in-band status. Report these as the current
@@ -1257,12 +1400,32 @@ int phylink_ethtool_ksettings_set(struct phylink *pl,
 				  const struct ethtool_link_ksettings *kset)
 {
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(support);
-	struct ethtool_link_ksettings our_kset;
 	struct phylink_link_state config;
 	const struct phy_setting *s;
-	int ret;
 
 	ASSERT_RTNL();
+
+	if (pl->phydev) {
+		/* We can rely on phylib for this update; we also do not need
+		 * to update the pl->link_config settings:
+		 * - the configuration returned via ksettings_get() will come
+		 *   from phylib whenever a PHY is present.
+		 * - link_config.interface will be updated by the PHY calling
+		 *   back via phylink_phy_change() and a subsequent resolve.
+		 * - initial link configuration for PHY mode comes from the
+		 *   last phy state updated via phylink_phy_change().
+		 * - other configuration changes (e.g. pause modes) are
+		 *   performed directly via phylib.
+		 * - if in in-band mode with a PHY, the link configuration
+		 *   is passed on the link from the PHY, and all of
+		 *   link_config.{speed,duplex,an_enabled,pause} are not used.
+		 * - the only possible use would be link_config.advertising
+		 *   pause modes when in 1000base-X mode with a PHY, but in
+		 *   the presence of a PHY, this should not be changed as that
+		 *   should be determined from the media side advertisement.
+		 */
+		return phy_ethtool_ksettings_set(pl->phydev, kset);
+	}
 
 	linkmode_copy(support, pl->supported);
 	config = pl->link_config;
@@ -1285,22 +1448,31 @@ int phylink_ethtool_ksettings_set(struct phylink *pl,
 		if (!s)
 			return -EINVAL;
 
-		/* If we have a fixed link (as specified by firmware), refuse
-		 * to change link parameters.
+		/* If we have a fixed link, refuse to change link parameters.
+		 * If the link parameters match, accept them but do nothing.
 		 */
-		if (pl->cur_link_an_mode == MLO_AN_FIXED &&
-		    (s->speed != pl->link_config.speed ||
-		     s->duplex != pl->link_config.duplex))
-			return -EINVAL;
+		if (pl->cur_link_an_mode == MLO_AN_FIXED) {
+			if (s->speed != pl->link_config.speed ||
+			    s->duplex != pl->link_config.duplex)
+				return -EINVAL;
+			return 0;
+		}
 
 		config.speed = s->speed;
 		config.duplex = s->duplex;
 		break;
 
 	case AUTONEG_ENABLE:
-		/* If we have a fixed link, refuse to enable autonegotiation */
-		if (pl->cur_link_an_mode == MLO_AN_FIXED)
-			return -EINVAL;
+		/* If we have a fixed link, allow autonegotiation (since that
+		 * is our default case) but do not allow the advertisement to
+		 * be changed. If the advertisement matches, simply return.
+		 */
+		if (pl->cur_link_an_mode == MLO_AN_FIXED) {
+			if (!linkmode_equal(config.advertising,
+					    pl->link_config.advertising))
+				return -EINVAL;
+			return 0;
+		}
 
 		config.speed = SPEED_UNKNOWN;
 		config.duplex = DUPLEX_UNKNOWN;
@@ -1310,66 +1482,39 @@ int phylink_ethtool_ksettings_set(struct phylink *pl,
 		return -EINVAL;
 	}
 
-	if (pl->phydev) {
-		/* If we have a PHY, we process the kset change via phylib.
-		 * phylib will call our link state function if the PHY
-		 * parameters have changed, which will trigger a resolve
-		 * and update the MAC configuration.
-		 */
-		our_kset = *kset;
-		linkmode_copy(our_kset.link_modes.advertising,
-			      config.advertising);
-		our_kset.base.speed = config.speed;
-		our_kset.base.duplex = config.duplex;
+	/* We have ruled out the case with a PHY attached, and the
+	 * fixed-link cases.  All that is left are in-band links.
+	 */
+	if (phylink_validate(pl, support, &config))
+		return -EINVAL;
 
-		ret = phy_ethtool_ksettings_set(pl->phydev, &our_kset);
-		if (ret)
-			return ret;
+	/* If autonegotiation is enabled, we must have an advertisement */
+	if (config.an_enabled && phylink_is_empty_linkmode(config.advertising))
+		return -EINVAL;
 
-		mutex_lock(&pl->state_mutex);
-		/* Save the new configuration */
-		linkmode_copy(pl->link_config.advertising,
-			      our_kset.link_modes.advertising);
-		pl->link_config.interface = config.interface;
-		pl->link_config.speed = our_kset.base.speed;
-		pl->link_config.duplex = our_kset.base.duplex;
-		pl->link_config.an_enabled = our_kset.base.autoneg !=
-					     AUTONEG_DISABLE;
-		mutex_unlock(&pl->state_mutex);
-	} else {
-		/* For a fixed link, this isn't able to change any parameters,
-		 * which just leaves inband mode.
-		 */
-		if (phylink_validate(pl, support, &config))
-			return -EINVAL;
+	mutex_lock(&pl->state_mutex);
+	pl->link_config.speed = config.speed;
+	pl->link_config.duplex = config.duplex;
+	pl->link_config.an_enabled = config.an_enabled;
 
-		/* If autonegotiation is enabled, we must have an advertisement */
-		if (config.an_enabled &&
-		    phylink_is_empty_linkmode(config.advertising))
-			return -EINVAL;
-
-		mutex_lock(&pl->state_mutex);
-		linkmode_copy(pl->link_config.advertising, config.advertising);
-		pl->link_config.interface = config.interface;
-		pl->link_config.speed = config.speed;
-		pl->link_config.duplex = config.duplex;
-		pl->link_config.an_enabled = kset->base.autoneg !=
-					     AUTONEG_DISABLE;
-
-		if (pl->cur_link_an_mode == MLO_AN_INBAND &&
-		    !test_bit(PHYLINK_DISABLE_STOPPED,
-			      &pl->phylink_disable_state)) {
-			/* If in 802.3z mode, this updates the advertisement.
-			 *
-			 * If we are in SGMII mode without a PHY, there is no
-			 * advertisement; the only thing we have is the pause
-			 * modes which can only come from a PHY.
-			 */
-			phylink_mac_config(pl, &pl->link_config);
-			phylink_mac_an_restart(pl);
+	if (pl->link_config.interface != config.interface) {
+		/* The interface changed, e.g. 1000base-X <-> 2500base-X */
+		/* We need to force the link down, then change the interface */
+		if (pl->old_link_state) {
+			phylink_link_down(pl);
+			pl->old_link_state = false;
 		}
-		mutex_unlock(&pl->state_mutex);
+		if (!test_bit(PHYLINK_DISABLE_STOPPED,
+			      &pl->phylink_disable_state))
+			phylink_major_config(pl, false, &config);
+		pl->link_config.interface = config.interface;
+		linkmode_copy(pl->link_config.advertising, config.advertising);
+	} else if (!linkmode_equal(pl->link_config.advertising,
+				   config.advertising)) {
+		linkmode_copy(pl->link_config.advertising, config.advertising);
+		phylink_change_inband_advert(pl);
 	}
+	mutex_unlock(&pl->state_mutex);
 
 	return 0;
 }
@@ -1394,7 +1539,7 @@ int phylink_ethtool_nway_reset(struct phylink *pl)
 
 	if (pl->phydev)
 		ret = phy_restart_aneg(pl->phydev);
-	phylink_mac_an_restart(pl);
+	phylink_mac_pcs_an_restart(pl);
 
 	return ret;
 }
@@ -1425,6 +1570,8 @@ int phylink_ethtool_set_pauseparam(struct phylink *pl,
 				   struct ethtool_pauseparam *pause)
 {
 	struct phylink_link_state *config = &pl->link_config;
+	bool manual_changed;
+	int pause_state;
 
 	ASSERT_RTNL();
 
@@ -1439,15 +1586,15 @@ int phylink_ethtool_set_pauseparam(struct phylink *pl,
 	    !pause->autoneg && pause->rx_pause != pause->tx_pause)
 		return -EINVAL;
 
-	mutex_lock(&pl->state_mutex);
-	config->pause = 0;
+	pause_state = 0;
 	if (pause->autoneg)
-		config->pause |= MLO_PAUSE_AN;
+		pause_state |= MLO_PAUSE_AN;
 	if (pause->rx_pause)
-		config->pause |= MLO_PAUSE_RX;
+		pause_state |= MLO_PAUSE_RX;
 	if (pause->tx_pause)
-		config->pause |= MLO_PAUSE_TX;
+		pause_state |= MLO_PAUSE_TX;
 
+	mutex_lock(&pl->state_mutex);
 	/*
 	 * See the comments for linkmode_set_pause(), wrt the deficiencies
 	 * with the current implementation.  A solution to this issue would
@@ -1464,19 +1611,37 @@ int phylink_ethtool_set_pauseparam(struct phylink *pl,
 	linkmode_set_pause(config->advertising, pause->tx_pause,
 			   pause->rx_pause);
 
-	/* If we have a PHY, phylib will call our link state function if the
-	 * mode has changed, which will trigger a resolve and update the MAC
-	 * configuration.
+	manual_changed = (config->pause ^ pause_state) & MLO_PAUSE_AN ||
+			 (!(pause_state & MLO_PAUSE_AN) &&
+			   (config->pause ^ pause_state) & MLO_PAUSE_TXRX_MASK);
+
+	config->pause = pause_state;
+
+	/* Update our in-band advertisement, triggering a renegotiation if
+	 * the advertisement changed.
 	 */
-	if (pl->phydev) {
+	if (!pl->phydev)
+		phylink_change_inband_advert(pl);
+
+	mutex_unlock(&pl->state_mutex);
+
+	/* If we have a PHY, a change of the pause frame advertisement will
+	 * cause phylib to renegotiate (if AN is enabled) which will in turn
+	 * call our phylink_phy_change() and trigger a resolve.  Note that
+	 * we can't hold our state mutex while calling phy_set_asym_pause().
+	 */
+	if (pl->phydev)
 		phy_set_asym_pause(pl->phydev, pause->rx_pause,
 				   pause->tx_pause);
-	} else if (!test_bit(PHYLINK_DISABLE_STOPPED,
-			     &pl->phylink_disable_state)) {
-		phylink_mac_config(pl, &pl->link_config);
-		phylink_mac_an_restart(pl);
+
+	/* If the manual pause settings changed, make sure we trigger a
+	 * resolve to update their state; we can not guarantee that the
+	 * link will cycle.
+	 */
+	if (manual_changed) {
+		pl->mac_link_dropped = true;
+		phylink_run_resolve(pl);
 	}
-	mutex_unlock(&pl->state_mutex);
 
 	return 0;
 }
@@ -1685,10 +1850,7 @@ static int phylink_mii_read(struct phylink *pl, unsigned int phy_id,
 
 	case MLO_AN_INBAND:
 		if (phy_id == 0) {
-			val = phylink_get_mac_state(pl, &state);
-			if (val < 0)
-				return val;
-
+			phylink_mac_pcs_get_state(pl, &state);
 			val = phylink_mii_emul_read(reg, &state);
 		}
 		break;
@@ -1931,7 +2093,7 @@ static int phylink_sfp_config(struct phylink *pl, u8 mode,
 
 	if (changed && !test_bit(PHYLINK_DISABLE_STOPPED,
 				 &pl->phylink_disable_state))
-		phylink_mac_initial_config(pl);
+		phylink_mac_initial_config(pl, false);
 
 	return ret;
 }

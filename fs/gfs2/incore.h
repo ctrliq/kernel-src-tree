@@ -715,7 +715,7 @@ struct gfs2_pcpu_lkstats {
 };
 
 /* List of local (per node) statfs inodes */
-struct local_statfs_inode {
+struct lcl_statfs_inode {
 	struct list_head si_list;
 	struct inode *si_sc_inode;
 	unsigned int si_jid; /* journal id this statfs inode corresponds to */

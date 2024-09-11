@@ -488,8 +488,8 @@ static int thermal_zone_device_set_mode(struct thermal_zone_device *tz,
 		return ret;
 	}
 
-	if (tz->ops->set_mode)
-		ret = tz->ops->set_mode(tz, mode);
+	if (tz->ops->change_mode)
+		ret = tz->ops->change_mode(tz, mode);
 
 	if (!ret)
 		tz->mode = mode;
@@ -1619,7 +1619,7 @@ static int thermal_pm_notify(struct notifier_block *nb,
 	case PM_POST_SUSPEND:
 		atomic_set(&in_suspend, 0);
 		list_for_each_entry(tz, &thermal_tz_list, node) {
-			if (tz->mode == THERMAL_DEVICE_DISABLED)
+			if (!thermal_zone_device_is_enabled(tz))
 				continue;
 
 			thermal_zone_device_init(tz);

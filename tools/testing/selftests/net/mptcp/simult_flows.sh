@@ -58,6 +58,7 @@ setup()
 
 	for i in "$ns1" "$ns2" "$ns3";do
 		ip netns add $i || exit $ksft_skip
+		ip netns exec ${i} sysctl -q net.mptcp.enabled=1
 		ip -net $i link set lo up
 	done
 
@@ -200,9 +201,9 @@ do_transfer()
 
 	echo " [ fail ]"
 	echo "client exit code $retc, server $rets" 1>&2
-	echo "\nnetns ${ns3} socket stat for $port:" 1>&2
+	echo -e "\nnetns ${ns3} socket stat for $port:" 1>&2
 	ip netns exec ${ns3} ss -nita 1>&2 -o "sport = :$port"
-	echo "\nnetns ${ns1} socket stat for $port:" 1>&2
+	echo -e "\nnetns ${ns1} socket stat for $port:" 1>&2
 	ip netns exec ${ns1} ss -nita 1>&2 -o "dport = :$port"
 	ls -l $sin $cout
 	ls -l $cin $sout
@@ -287,7 +288,7 @@ run_test 10 10 0 0 "balanced bwidth"
 run_test 10 10 1 50 "balanced bwidth with unbalanced delay"
 
 # we still need some additional infrastructure to pass the following test-cases
-# run_test 30 10 0 0 "unbalanced bwidth"
-# run_test 30 10 1 50 "unbalanced bwidth with unbalanced delay"
-# run_test 30 10 50 1 "unbalanced bwidth with opposed, unbalanced delay"
+run_test 30 10 0 0 "unbalanced bwidth"
+run_test 30 10 1 50 "unbalanced bwidth with unbalanced delay"
+run_test 30 10 50 1 "unbalanced bwidth with opposed, unbalanced delay"
 exit $ret

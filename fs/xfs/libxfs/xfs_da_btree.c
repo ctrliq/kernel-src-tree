@@ -369,7 +369,7 @@ xfs_da3_node_read(
 {
 	int			error;
 
-	error = xfs_da_read_buf(tp, dp, bno, -1, bpp, whichfork,
+	error = xfs_da_read_buf(tp, dp, bno, 0, bpp, whichfork,
 			&xfs_da3_node_buf_ops);
 	if (error || !*bpp || !tp)
 		return error;
@@ -384,12 +384,22 @@ xfs_da3_node_read_mapped(
 	struct xfs_buf		**bpp,
 	int			whichfork)
 {
+	struct xfs_mount	*mp = dp->i_mount;
 	int			error;
 
-	error = xfs_da_read_buf(tp, dp, 0, mappedbno, bpp, whichfork,
-			&xfs_da3_node_buf_ops);
-	if (error || !*bpp || !tp)
+	error = xfs_trans_read_buf(mp, tp, mp->m_ddev_targp, mappedbno,
+			XFS_FSB_TO_BB(mp, xfs_dabuf_nfsb(mp, whichfork)), 0,
+			bpp, &xfs_da3_node_buf_ops);
+	if (error || !*bpp)
 		return error;
+
+	if (whichfork == XFS_ATTR_FORK)
+		xfs_buf_set_ref(*bpp, XFS_ATTR_BTREE_REF);
+	else
+		xfs_buf_set_ref(*bpp, XFS_DIR_BTREE_REF);
+
+	if (!tp)
+		return 0;
 	return xfs_da3_node_set_type(tp, *bpp);
 }
 
@@ -419,7 +429,7 @@ xfs_da3_node_create(
 	trace_xfs_da_node_create(args);
 	ASSERT(level <= XFS_DA_NODE_MAXDEPTH);
 
-	error = xfs_da_get_buf(tp, dp, blkno, -1, &bp, whichfork);
+	error = xfs_da_get_buf(tp, dp, blkno, &bp, whichfork);
 	if (error)
 		return error;
 	bp->b_ops = &xfs_da3_node_buf_ops;
@@ -580,6 +590,7 @@ xfs_da3_split(
 	node = oldblk->bp->b_addr;
 	if (node->hdr.info.forw) {
 		if (be32_to_cpu(node->hdr.info.forw) != addblk->blkno) {
+			xfs_buf_corruption_error(oldblk->bp);
 			error = -EFSCORRUPTED;
 			goto out;
 		}
@@ -592,6 +603,7 @@ xfs_da3_split(
 	node = oldblk->bp->b_addr;
 	if (node->hdr.info.back) {
 		if (be32_to_cpu(node->hdr.info.back) != addblk->blkno) {
+			xfs_buf_corruption_error(oldblk->bp);
 			error = -EFSCORRUPTED;
 			goto out;
 		}
@@ -644,7 +656,7 @@ xfs_da3_root_split(
 
 	dp = args->dp;
 	tp = args->trans;
-	error = xfs_da_get_buf(tp, dp, blkno, -1, &bp, args->whichfork);
+	error = xfs_da_get_buf(tp, dp, blkno, &bp, args->whichfork);
 	if (error)
 		return error;
 	node = bp->b_addr;
@@ -1611,8 +1623,10 @@ xfs_da3_node_lookup_int(
 			break;
 		}
 
-		if (magic != XFS_DA_NODE_MAGIC && magic != XFS_DA3_NODE_MAGIC)
+		if (magic != XFS_DA_NODE_MAGIC && magic != XFS_DA3_NODE_MAGIC) {
+			xfs_buf_corruption_error(blk->bp);
 			return -EFSCORRUPTED;
+		}
 
 		blk->magic = XFS_DA_NODE_MAGIC;
 
@@ -1624,15 +1638,18 @@ xfs_da3_node_lookup_int(
 		btree = nodehdr.btree;
 
 		/* Tree taller than we can handle; bail out! */
-		if (nodehdr.level >= XFS_DA_NODE_MAXDEPTH)
+		if (nodehdr.level >= XFS_DA_NODE_MAXDEPTH) {
+			xfs_buf_corruption_error(blk->bp);
 			return -EFSCORRUPTED;
+		}
 
 		/* Check the level from the root. */
 		if (blkno == args->geo->leafblk)
 			expected_level = nodehdr.level - 1;
-		else if (expected_level != nodehdr.level)
+		else if (expected_level != nodehdr.level) {
+			xfs_buf_corruption_error(blk->bp);
 			return -EFSCORRUPTED;
-		else
+		} else
 			expected_level--;
 
 		max = nodehdr.count;
@@ -1682,11 +1699,11 @@ xfs_da3_node_lookup_int(
 		}
 
 		/* We can't point back to the root. */
-		if (blkno == args->geo->leafblk)
+		if (XFS_IS_CORRUPT(dp->i_mount, blkno == args->geo->leafblk))
 			return -EFSCORRUPTED;
 	}
 
-	if (expected_level != 0)
+	if (XFS_IS_CORRUPT(dp->i_mount, expected_level != 0))
 		return -EFSCORRUPTED;
 
 	/*
@@ -2269,11 +2286,8 @@ xfs_da3_swap_lastblock(
 	error = xfs_bmap_last_before(tp, dp, &lastoff, w);
 	if (error)
 		return error;
-	if (unlikely(lastoff == 0)) {
-		XFS_ERROR_REPORT("xfs_da_swap_lastblock(1)", XFS_ERRLEVEL_LOW,
-				 mp);
+	if (XFS_IS_CORRUPT(mp, lastoff == 0))
 		return -EFSCORRUPTED;
-	}
 	/*
 	 * Read the last block in the btree space.
 	 */
@@ -2319,11 +2333,9 @@ xfs_da3_swap_lastblock(
 		if (error)
 			goto done;
 		sib_info = sib_buf->b_addr;
-		if (unlikely(
-		    be32_to_cpu(sib_info->forw) != last_blkno ||
-		    sib_info->magic != dead_info->magic)) {
-			XFS_ERROR_REPORT("xfs_da_swap_lastblock(2)",
-					 XFS_ERRLEVEL_LOW, mp);
+		if (XFS_IS_CORRUPT(mp,
+				   be32_to_cpu(sib_info->forw) != last_blkno ||
+				   sib_info->magic != dead_info->magic)) {
 			error = -EFSCORRUPTED;
 			goto done;
 		}
@@ -2341,11 +2353,9 @@ xfs_da3_swap_lastblock(
 		if (error)
 			goto done;
 		sib_info = sib_buf->b_addr;
-		if (unlikely(
-		       be32_to_cpu(sib_info->back) != last_blkno ||
-		       sib_info->magic != dead_info->magic)) {
-			XFS_ERROR_REPORT("xfs_da_swap_lastblock(3)",
-					 XFS_ERRLEVEL_LOW, mp);
+		if (XFS_IS_CORRUPT(mp,
+				   be32_to_cpu(sib_info->back) != last_blkno ||
+				   sib_info->magic != dead_info->magic)) {
 			error = -EFSCORRUPTED;
 			goto done;
 		}
@@ -2366,9 +2376,8 @@ xfs_da3_swap_lastblock(
 			goto done;
 		par_node = par_buf->b_addr;
 		xfs_da3_node_hdr_from_disk(dp->i_mount, &par_hdr, par_node);
-		if (level >= 0 && level != par_hdr.level + 1) {
-			XFS_ERROR_REPORT("xfs_da_swap_lastblock(4)",
-					 XFS_ERRLEVEL_LOW, mp);
+		if (XFS_IS_CORRUPT(mp,
+				   level >= 0 && level != par_hdr.level + 1)) {
 			error = -EFSCORRUPTED;
 			goto done;
 		}
@@ -2379,9 +2388,7 @@ xfs_da3_swap_lastblock(
 		     be32_to_cpu(btree[entno].hashval) < dead_hash;
 		     entno++)
 			continue;
-		if (entno == par_hdr.count) {
-			XFS_ERROR_REPORT("xfs_da_swap_lastblock(5)",
-					 XFS_ERRLEVEL_LOW, mp);
+		if (XFS_IS_CORRUPT(mp, entno == par_hdr.count)) {
 			error = -EFSCORRUPTED;
 			goto done;
 		}
@@ -2406,9 +2413,7 @@ xfs_da3_swap_lastblock(
 		par_blkno = par_hdr.forw;
 		xfs_trans_brelse(tp, par_buf);
 		par_buf = NULL;
-		if (unlikely(par_blkno == 0)) {
-			XFS_ERROR_REPORT("xfs_da_swap_lastblock(6)",
-					 XFS_ERRLEVEL_LOW, mp);
+		if (XFS_IS_CORRUPT(mp, par_blkno == 0)) {
 			error = -EFSCORRUPTED;
 			goto done;
 		}
@@ -2417,9 +2422,7 @@ xfs_da3_swap_lastblock(
 			goto done;
 		par_node = par_buf->b_addr;
 		xfs_da3_node_hdr_from_disk(dp->i_mount, &par_hdr, par_node);
-		if (par_hdr.level != level) {
-			XFS_ERROR_REPORT("xfs_da_swap_lastblock(7)",
-					 XFS_ERRLEVEL_LOW, mp);
+		if (XFS_IS_CORRUPT(mp, par_hdr.level != level)) {
 			error = -EFSCORRUPTED;
 			goto done;
 		}
@@ -2486,141 +2489,86 @@ xfs_da_shrink_inode(
 	return error;
 }
 
-/*
- * See if the mapping(s) for this btree block are valid, i.e.
- * don't contain holes, are logically contiguous, and cover the whole range.
- */
-STATIC int
-xfs_da_map_covers_blocks(
-	int		nmap,
-	xfs_bmbt_irec_t	*mapp,
-	xfs_dablk_t	bno,
-	int		count)
-{
-	int		i;
-	xfs_fileoff_t	off;
-
-	for (i = 0, off = bno; i < nmap; i++) {
-		if (mapp[i].br_startblock == HOLESTARTBLOCK ||
-		    mapp[i].br_startblock == DELAYSTARTBLOCK) {
-			return 0;
-		}
-		if (off != mapp[i].br_startoff) {
-			return 0;
-		}
-		off += mapp[i].br_blockcount;
-	}
-	return off == bno + count;
-}
-
-/*
- * Convert a struct xfs_bmbt_irec to a struct xfs_buf_map.
- *
- * For the single map case, it is assumed that the caller has provided a pointer
- * to a valid xfs_buf_map.  For the multiple map case, this function will
- * allocate the xfs_buf_map to hold all the maps and replace the caller's single
- * map pointer with the allocated map.
- */
-static int
-xfs_buf_map_from_irec(
-	struct xfs_mount	*mp,
-	struct xfs_buf_map	**mapp,
-	int			*nmaps,
-	struct xfs_bmbt_irec	*irecs,
-	int			nirecs)
-{
-	struct xfs_buf_map	*map;
-	int			i;
-
-	ASSERT(*nmaps == 1);
-	ASSERT(nirecs >= 1);
-
-	if (nirecs > 1) {
-		map = kmem_zalloc(nirecs * sizeof(struct xfs_buf_map),
-				  KM_NOFS);
-		if (!map)
-			return -ENOMEM;
-		*mapp = map;
-	}
-
-	*nmaps = nirecs;
-	map = *mapp;
-	for (i = 0; i < *nmaps; i++) {
-		ASSERT(irecs[i].br_startblock != DELAYSTARTBLOCK &&
-		       irecs[i].br_startblock != HOLESTARTBLOCK);
-		map[i].bm_bn = XFS_FSB_TO_DADDR(mp, irecs[i].br_startblock);
-		map[i].bm_len = XFS_FSB_TO_BB(mp, irecs[i].br_blockcount);
-	}
-	return 0;
-}
-
-/*
- * Map the block we are given ready for reading. There are three possible return
- * values:
- *	-1 - will be returned if we land in a hole and mappedbno == -2 so the
- *	     caller knows not to execute a subsequent read.
- *	 0 - if we mapped the block successfully
- *	>0 - positive error number if there was an error.
- */
 static int
 xfs_dabuf_map(
 	struct xfs_inode	*dp,
 	xfs_dablk_t		bno,
-	xfs_daddr_t		mappedbno,
+	unsigned int		flags,
 	int			whichfork,
-	struct xfs_buf_map	**map,
+	struct xfs_buf_map	**mapp,
 	int			*nmaps)
 {
 	struct xfs_mount	*mp = dp->i_mount;
 	int			nfsb = xfs_dabuf_nfsb(mp, whichfork);
-	int			error = 0;
-	struct xfs_bmbt_irec	irec;
-	struct xfs_bmbt_irec	*irecs = &irec;
-	int			nirecs;
+	struct xfs_bmbt_irec	irec, *irecs = &irec;
+	struct xfs_buf_map	*map = *mapp;
+	xfs_fileoff_t		off = bno;
+	int			error = 0, nirecs, i;
 
-	ASSERT(map && *map);
-	ASSERT(*nmaps == 1);
-
-	if (nfsb != 1)
+	if (nfsb > 1)
 		irecs = kmem_zalloc(sizeof(irec) * nfsb, KM_NOFS);
+
 	nirecs = nfsb;
-	error = xfs_bmapi_read(dp, (xfs_fileoff_t)bno, nfsb, irecs,
-			       &nirecs, xfs_bmapi_aflag(whichfork));
+	error = xfs_bmapi_read(dp, bno, nfsb, irecs, &nirecs,
+			xfs_bmapi_aflag(whichfork));
 	if (error)
-		goto out;
+		goto out_free_irecs;
 
-	if (!xfs_da_map_covers_blocks(nirecs, irecs, bno, nfsb)) {
-		/* Caller ok with no mapping. */
-		if (mappedbno == -2) {
-			error = -1;
-			goto out;
+	/*
+	 * Use the caller provided map for the single map case, else allocate a
+	 * larger one that needs to be free by the caller.
+	 */
+	if (nirecs > 1) {
+		map = kmem_zalloc(nirecs * sizeof(struct xfs_buf_map), KM_NOFS);
+		if (!map) {
+			error = -ENOMEM;
+			goto out_free_irecs;
 		}
-
-		/* Caller expected a mapping, so abort. */
-		if (xfs_error_level >= XFS_ERRLEVEL_LOW) {
-			int i;
-
-			xfs_alert(mp, "%s: bno %lld dir: inode %lld", __func__,
-					(long long)bno, (long long)dp->i_ino);
-			for (i = 0; i < *nmaps; i++) {
-				xfs_alert(mp,
-"[%02d] br_startoff %lld br_startblock %lld br_blockcount %lld br_state %d",
-					i,
-					(long long)irecs[i].br_startoff,
-					(long long)irecs[i].br_startblock,
-					(long long)irecs[i].br_blockcount,
-					irecs[i].br_state);
-			}
-		}
-		XFS_ERROR_REPORT("xfs_da_do_buf(1)", XFS_ERRLEVEL_LOW, mp);
-		error = -EFSCORRUPTED;
-		goto out;
+		*mapp = map;
 	}
-	error = xfs_buf_map_from_irec(mp, map, nmaps, irecs, nirecs);
-out:
+
+	for (i = 0; i < nirecs; i++) {
+		if (irecs[i].br_startblock == HOLESTARTBLOCK ||
+		    irecs[i].br_startblock == DELAYSTARTBLOCK)
+			goto invalid_mapping;
+		if (off != irecs[i].br_startoff)
+			goto invalid_mapping;
+
+		map[i].bm_bn = XFS_FSB_TO_DADDR(mp, irecs[i].br_startblock);
+		map[i].bm_len = XFS_FSB_TO_BB(mp, irecs[i].br_blockcount);
+		off += irecs[i].br_blockcount;
+	}
+
+	if (off != bno + nfsb)
+		goto invalid_mapping;
+
+	*nmaps = nirecs;
+out_free_irecs:
 	if (irecs != &irec)
 		kmem_free(irecs);
 	return error;
+
+invalid_mapping:
+	/* Caller ok with no mapping. */
+	if (XFS_IS_CORRUPT(mp, !(flags & XFS_DABUF_MAP_HOLE_OK))) {
+		error = -EFSCORRUPTED;
+		if (xfs_error_level >= XFS_ERRLEVEL_LOW) {
+			xfs_alert(mp, "%s: bno %u inode %llu",
+					__func__, bno, dp->i_ino);
+
+			for (i = 0; i < nirecs; i++) {
+				xfs_alert(mp,
+"[%02d] br_startoff %lld br_startblock %lld br_blockcount %lld br_state %d",
+					i, irecs[i].br_startoff,
+					irecs[i].br_startblock,
+					irecs[i].br_blockcount,
+					irecs[i].br_state);
+			}
+		}
+	} else {
+		*nmaps = 0;
+	}
+	goto out_free_irecs;
 }
 
 /*
@@ -2631,7 +2579,6 @@ xfs_da_get_buf(
 	struct xfs_trans	*tp,
 	struct xfs_inode	*dp,
 	xfs_dablk_t		bno,
-	xfs_daddr_t		mappedbno,
 	struct xfs_buf		**bpp,
 	int			whichfork)
 {
@@ -2642,30 +2589,13 @@ xfs_da_get_buf(
 	int			error;
 
 	*bpp = NULL;
-
-	if (mappedbno >= 0) {
-		bp = xfs_trans_get_buf(tp, mp->m_ddev_targp, mappedbno,
-				XFS_FSB_TO_BB(mp,
-					xfs_dabuf_nfsb(mp, whichfork)), 0);
-		goto done;
-	}
-
-	error = xfs_dabuf_map(dp, bno, mappedbno, whichfork, &mapp, &nmap);
-	if (error) {
-		/* mapping a hole is not an error, but we don't continue */
-		if (error == -1)
-			error = 0;
+	error = xfs_dabuf_map(dp, bno, 0, whichfork, &mapp, &nmap);
+	if (error || nmap == 0)
 		goto out_free;
-	}
 
-	bp = xfs_trans_get_buf_map(tp, mp->m_ddev_targp, mapp, nmap, 0);
-done:
-	error = bp ? bp->b_error : -EIO;
-	if (error) {
-		if (bp)
-			xfs_trans_brelse(tp, bp);
+	error = xfs_trans_get_buf_map(tp, mp->m_ddev_targp, mapp, nmap, 0, &bp);
+	if (error)
 		goto out_free;
-	}
 
 	*bpp = bp;
 
@@ -2684,7 +2614,7 @@ xfs_da_read_buf(
 	struct xfs_trans	*tp,
 	struct xfs_inode	*dp,
 	xfs_dablk_t		bno,
-	xfs_daddr_t		mappedbno,
+	unsigned int		flags,
 	struct xfs_buf		**bpp,
 	int			whichfork,
 	const struct xfs_buf_ops *ops)
@@ -2696,26 +2626,12 @@ xfs_da_read_buf(
 	int			error;
 
 	*bpp = NULL;
-
-	if (mappedbno >= 0) {
-		error = xfs_trans_read_buf(mp, tp, mp->m_ddev_targp,
-				mappedbno, XFS_FSB_TO_BB(mp,
-					xfs_dabuf_nfsb(mp, whichfork)),
-				0, &bp, ops);
-		goto done;
-	}
-
-	error = xfs_dabuf_map(dp, bno, mappedbno, whichfork, &mapp, &nmap);
-	if (error) {
-		/* mapping a hole is not an error, but we don't continue */
-		if (error == -1)
-			error = 0;
+	error = xfs_dabuf_map(dp, bno, flags, whichfork, &mapp, &nmap);
+	if (error || !nmap)
 		goto out_free;
-	}
 
 	error = xfs_trans_read_buf_map(mp, tp, mp->m_ddev_targp, mapp, nmap, 0,
 			&bp, ops);
-done:
 	if (error)
 		goto out_free;
 
@@ -2738,7 +2654,7 @@ int
 xfs_da_reada_buf(
 	struct xfs_inode	*dp,
 	xfs_dablk_t		bno,
-	xfs_daddr_t		mappedbno,
+	unsigned int		flags,
 	int			whichfork,
 	const struct xfs_buf_ops *ops)
 {
@@ -2747,21 +2663,12 @@ xfs_da_reada_buf(
 	int			nmap;
 	int			error;
 
-	if (mappedbno >= 0)
-		return -EINVAL;
-
 	mapp = &map;
 	nmap = 1;
-	error = xfs_dabuf_map(dp, bno, mappedbno, whichfork,
-				&mapp, &nmap);
-	if (error) {
-		/* mapping a hole is not an error, but we don't continue */
-		if (error == -1)
-			error = 0;
+	error = xfs_dabuf_map(dp, bno, flags, whichfork, &mapp, &nmap);
+	if (error || !nmap)
 		goto out_free;
-	}
 
-	mappedbno = mapp[0].bm_bn;
 	xfs_buf_readahead_map(dp->i_mount->m_ddev_targp, mapp, nmap, ops);
 
 out_free:

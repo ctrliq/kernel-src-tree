@@ -150,7 +150,7 @@ DEFINE_EVENT(writeback_dirty_inode_template, writeback_dirty_inode,
 
 static inline unsigned int __trace_wb_assign_cgroup(struct bdi_writeback *wb)
 {
-	return wb->memcg_css->cgroup->kn->id.ino;
+	return cgroup_ino(wb->memcg_css->cgroup);
 }
 
 static inline unsigned int __trace_wbc_assign_cgroup(struct writeback_control *wbc)
@@ -258,7 +258,7 @@ TRACE_EVENT(track_foreign_dirty,
 		__entry->ino		= inode ? inode->i_ino : 0;
 		__entry->memcg_id	= wb->memcg_css->id;
 		__entry->cgroup_ino	= __trace_wb_assign_cgroup(wb);
-		__entry->page_cgroup_ino = page->mem_cgroup->css.cgroup->kn->id.ino;
+		__entry->page_cgroup_ino = cgroup_ino(page->mem_cgroup->css.cgroup);
 	),
 
 	TP_printk("bdi %s[%llu]: ino=%lu memcg_id=%u cgroup_ino=%u page_cgroup_ino=%u",
@@ -540,7 +540,6 @@ TRACE_EVENT(global_dirty_state,
 	TP_STRUCT__entry(
 		__field(unsigned long,	nr_dirty)
 		__field(unsigned long,	nr_writeback)
-		__field(unsigned long,	nr_unstable)
 		__field(unsigned long,	background_thresh)
 		__field(unsigned long,	dirty_thresh)
 		__field(unsigned long,	dirty_limit)
@@ -551,7 +550,6 @@ TRACE_EVENT(global_dirty_state,
 	TP_fast_assign(
 		__entry->nr_dirty	= global_node_page_state(NR_FILE_DIRTY);
 		__entry->nr_writeback	= global_node_page_state(NR_WRITEBACK);
-		__entry->nr_unstable	= global_node_page_state(NR_UNSTABLE_NFS);
 		__entry->nr_dirtied	= global_node_page_state(NR_DIRTIED);
 		__entry->nr_written	= global_node_page_state(NR_WRITTEN);
 		__entry->background_thresh = background_thresh;
@@ -559,12 +557,11 @@ TRACE_EVENT(global_dirty_state,
 		__entry->dirty_limit	= global_wb_domain.dirty_limit;
 	),
 
-	TP_printk("dirty=%lu writeback=%lu unstable=%lu "
+	TP_printk("dirty=%lu writeback=%lu "
 		  "bg_thresh=%lu thresh=%lu limit=%lu "
 		  "dirtied=%lu written=%lu",
 		  __entry->nr_dirty,
 		  __entry->nr_writeback,
-		  __entry->nr_unstable,
 		  __entry->background_thresh,
 		  __entry->dirty_thresh,
 		  __entry->dirty_limit,

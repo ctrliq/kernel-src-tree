@@ -64,7 +64,6 @@ int main(void)
 	BLANK();
 #undef ENTRY
 
-	OFFSET(TSS_ist, tss_struct, x86_tss.ist);
 	BLANK();
 
 #ifdef CONFIG_STACKPROTECTOR

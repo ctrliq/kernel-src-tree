@@ -11,14 +11,12 @@
  * ----------------------------------------------------------------------
  * |             Level            |   Last Value Used  |     Holes	|
  * ----------------------------------------------------------------------
- * | Module Init and Probe        |       0x0193       | 0x0146         |
- * |                              |                    | 0x015b-0x0160	|
- * |                              |                    | 0x016e		|
- * | Mailbox commands             |       0x1206       | 0x11a2-0x11ff	|
+ * | Module Init and Probe        |       0x0199       |                |
+ * | Mailbox commands             |       0x1206       | 0x11a5-0x11ff	|
  * | Device Discovery             |       0x2134       | 0x210e-0x2116  |
  * |				  | 		       | 0x211a         |
  * |                              |                    | 0x211c-0x2128  |
- * |                              |                    | 0x212a-0x2134  |
+ * |                              |                    | 0x212c-0x2134  |
  * | Queue Command and IO tracing |       0x3074       | 0x300b         |
  * |                              |                    | 0x3027-0x3028  |
  * |                              |                    | 0x303d-0x3041  |
@@ -26,11 +24,7 @@
  * |                              |                    | 0x3036,0x3038  |
  * |                              |                    | 0x303a		|
  * | DPC Thread                   |       0x4023       | 0x4002,0x4013  |
- * | Async Events                 |       0x5090       | 0x502b-0x502f  |
- * |				  | 		       | 0x5047         |
- * |                              |                    | 0x5084,0x5075	|
- * |                              |                    | 0x503d,0x5044  |
- * |                              |                    | 0x505f		|
+ * | Async Events                 |       0x509c       |                |
  * | Timer Routines               |       0x6012       |                |
  * | User Space Interactions      |       0x70e3       | 0x7018,0x702e  |
  * |				  |		       | 0x7020,0x7024  |
@@ -115,7 +109,7 @@ qla27xx_dump_mpi_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 {
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	dma_addr_t dump_dma = ha->gid_list_dma;
-	uint32_t *chunk = (void *)ha->gid_list;
+	uint32_t *chunk = (uint32_t *)ha->gid_list;
 	uint32_t dwords = qla2x00_gid_list_size(ha) / 4;
 	uint32_t stat;
 	ulong i, j, timer = 6000000;
@@ -189,13 +183,13 @@ qla27xx_dump_mpi_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 }
 
 int
-qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
-    uint32_t ram_dwords, void **nxt)
+qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, __be32 *ram,
+		 uint32_t ram_dwords, void **nxt)
 {
 	int rval = QLA_FUNCTION_FAILED;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	dma_addr_t dump_dma = ha->gid_list_dma;
-	uint32_t *chunk = (void *)ha->gid_list;
+	uint32_t *chunk = (uint32_t *)ha->gid_list;
 	uint32_t dwords = qla2x00_gid_list_size(ha) / 4;
 	uint32_t stat;
 	ulong i, j, timer = 6000000;
@@ -255,9 +249,9 @@ qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 			return rval;
 		}
 		for (j = 0; j < dwords; j++) {
-			ram[i + j] =
-			    (IS_QLA27XX(ha) || IS_QLA28XX(ha)) ?
-			    chunk[j] : swab32(chunk[j]);
+			ram[i + j] = (__force __be32)
+				((IS_QLA27XX(ha) || IS_QLA28XX(ha)) ?
+				 chunk[j] : swab32(chunk[j]));
 		}
 	}
 
@@ -266,8 +260,8 @@ qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 }
 
 static int
-qla24xx_dump_memory(struct qla_hw_data *ha, uint32_t *code_ram,
-    uint32_t cram_size, void **nxt)
+qla24xx_dump_memory(struct qla_hw_data *ha, __be32 *code_ram,
+		    uint32_t cram_size, void **nxt)
 {
 	int rval;
 
@@ -287,11 +281,11 @@ qla24xx_dump_memory(struct qla_hw_data *ha, uint32_t *code_ram,
 	return rval;
 }
 
-static uint32_t *
+static __be32 *
 qla24xx_read_window(struct device_reg_24xx __iomem *reg, uint32_t iobase,
-    uint32_t count, uint32_t *buf)
+		    uint32_t count, __be32 *buf)
 {
-	uint32_t __iomem *dmp_reg;
+	__le32 __iomem *dmp_reg;
 
 	wrt_reg_dword(&reg->iobase_addr, iobase);
 	dmp_reg = &reg->iobase_window;
@@ -369,7 +363,7 @@ qla24xx_soft_reset(struct qla_hw_data *ha)
 }
 
 static int
-qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint16_t *ram,
+qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, __be16 *ram,
     uint32_t ram_words, void **nxt)
 {
 	int rval;
@@ -377,7 +371,7 @@ qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint16_t *ram,
 	uint16_t mb0;
 	struct device_reg_2xxx __iomem *reg = &ha->iobase->isp;
 	dma_addr_t dump_dma = ha->gid_list_dma;
-	uint16_t *dump = (uint16_t *)ha->gid_list;
+	__le16 *dump = (__force __le16 *)ha->gid_list;
 
 	rval = QLA_SUCCESS;
 	mb0 = 0;
@@ -442,7 +436,8 @@ qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint16_t *ram,
 		if (test_and_clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags)) {
 			rval = mb0 & MBS_MASK;
 			for (idx = 0; idx < words; idx++)
-				ram[cnt + idx] = swab16(dump[idx]);
+				ram[cnt + idx] =
+					cpu_to_be16(le16_to_cpu(dump[idx]));
 		} else {
 			rval = QLA_FUNCTION_FAILED;
 		}
@@ -454,9 +449,9 @@ qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint16_t *ram,
 
 static inline void
 qla2xxx_read_window(struct device_reg_2xxx __iomem *reg, uint32_t count,
-    uint16_t *buf)
+		    __be16 *buf)
 {
-	uint16_t __iomem *dmp_reg = &reg->u.isp2300.fb_cmd;
+	__le16 __iomem *dmp_reg = &reg->u.isp2300.fb_cmd;
 
 	for ( ; count--; dmp_reg++)
 		*buf++ = htons(rd_reg_word(dmp_reg));
@@ -473,10 +468,10 @@ qla24xx_copy_eft(struct qla_hw_data *ha, void *ptr)
 }
 
 static inline void *
-qla25xx_copy_fce(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
+qla25xx_copy_fce(struct qla_hw_data *ha, void *ptr, __be32 **last_chain)
 {
 	uint32_t cnt;
-	uint32_t *iter_reg;
+	__be32 *iter_reg;
 	struct qla2xxx_fce_chain *fcec = ptr;
 
 	if (!ha->fce)
@@ -500,7 +495,7 @@ qla25xx_copy_fce(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 }
 
 static inline void *
-qla25xx_copy_exlogin(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
+qla25xx_copy_exlogin(struct qla_hw_data *ha, void *ptr, __be32 **last_chain)
 {
 	struct qla2xxx_offld_chain *c = ptr;
 
@@ -518,11 +513,11 @@ qla25xx_copy_exlogin(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 	ptr += sizeof(struct qla2xxx_offld_chain);
 	memcpy(ptr, ha->exlogin_buf, ha->exlogin_size);
 
-	return (char *)ptr + cpu_to_be32(c->size);
+	return (char *)ptr + be32_to_cpu(c->size);
 }
 
 static inline void *
-qla81xx_copy_exchoffld(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
+qla81xx_copy_exchoffld(struct qla_hw_data *ha, void *ptr, __be32 **last_chain)
 {
 	struct qla2xxx_offld_chain *c = ptr;
 
@@ -540,12 +535,12 @@ qla81xx_copy_exchoffld(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 	ptr += sizeof(struct qla2xxx_offld_chain);
 	memcpy(ptr, ha->exchoffld_buf, ha->exchoffld_size);
 
-	return (char *)ptr + cpu_to_be32(c->size);
+	return (char *)ptr + be32_to_cpu(c->size);
 }
 
 static inline void *
 qla2xxx_copy_atioqueues(struct qla_hw_data *ha, void *ptr,
-	uint32_t **last_chain)
+			__be32 **last_chain)
 {
 	struct qla2xxx_mqueue_chain *q;
 	struct qla2xxx_mqueue_header *qh;
@@ -592,7 +587,7 @@ qla2xxx_copy_atioqueues(struct qla_hw_data *ha, void *ptr,
 }
 
 static inline void *
-qla25xx_copy_mqueues(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
+qla25xx_copy_mqueues(struct qla_hw_data *ha, void *ptr, __be32 **last_chain)
 {
 	struct qla2xxx_mqueue_chain *q;
 	struct qla2xxx_mqueue_header *qh;
@@ -663,7 +658,7 @@ qla25xx_copy_mqueues(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 }
 
 static inline void *
-qla25xx_copy_mq(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
+qla25xx_copy_mq(struct qla_hw_data *ha, void *ptr, __be32 **last_chain)
 {
 	uint32_t cnt, que_idx;
 	uint8_t que_cnt;
@@ -737,7 +732,7 @@ qla2300_fw_dump(scsi_qla_host_t *vha)
 	uint32_t	cnt;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_2xxx __iomem *reg = &ha->iobase->isp;
-	uint16_t __iomem *dmp_reg;
+	__le16 __iomem *dmp_reg;
 	struct qla2300_fw_dump	*fw;
 	void		*nxt;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
@@ -894,7 +889,7 @@ qla2100_fw_dump(scsi_qla_host_t *vha)
 	uint16_t	mb0 = 0, mb2 = 0;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_2xxx __iomem *reg = &ha->iobase->isp;
-	uint16_t __iomem *dmp_reg;
+	__le16 __iomem *dmp_reg;
 	struct qla2100_fw_dump	*fw;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
@@ -1063,7 +1058,7 @@ qla2100_fw_dump(scsi_qla_host_t *vha)
 	}
 
 	if (rval == QLA_SUCCESS)
-		qla2xxx_copy_queues(ha, &fw->risc_ram[cnt]);
+		qla2xxx_copy_queues(ha, &fw->queue_dump[0]);
 
 	qla2xxx_dump_post_process(base_vha, rval);
 }
@@ -1075,13 +1070,13 @@ qla24xx_fw_dump(scsi_qla_host_t *vha)
 	uint32_t	cnt;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
-	uint32_t __iomem *dmp_reg;
-	uint32_t	*iter_reg;
-	uint16_t __iomem *mbx_reg;
+	__le32 __iomem *dmp_reg;
+	__be32		*iter_reg;
+	__le16 __iomem *mbx_reg;
 	struct qla24xx_fw_dump *fw;
 	void		*nxt;
 	void		*nxt_chain;
-	uint32_t	*last_chain = NULL;
+	__be32		*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
 	lockdep_assert_held(&ha->hardware_lock);
@@ -1321,12 +1316,12 @@ qla25xx_fw_dump(scsi_qla_host_t *vha)
 	uint32_t	cnt;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
-	uint32_t __iomem *dmp_reg;
-	uint32_t	*iter_reg;
-	uint16_t __iomem *mbx_reg;
+	__le32 __iomem *dmp_reg;
+	__be32		*iter_reg;
+	__le16 __iomem *mbx_reg;
 	struct qla25xx_fw_dump *fw;
 	void		*nxt, *nxt_chain;
-	uint32_t	*last_chain = NULL;
+	__be32		*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
 	lockdep_assert_held(&ha->hardware_lock);
@@ -1634,12 +1629,12 @@ qla81xx_fw_dump(scsi_qla_host_t *vha)
 	uint32_t	cnt;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
-	uint32_t __iomem *dmp_reg;
-	uint32_t	*iter_reg;
-	uint16_t __iomem *mbx_reg;
+	__le32 __iomem *dmp_reg;
+	__be32		*iter_reg;
+	__le16 __iomem *mbx_reg;
 	struct qla81xx_fw_dump *fw;
 	void		*nxt, *nxt_chain;
-	uint32_t	*last_chain = NULL;
+	__be32		*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
 	lockdep_assert_held(&ha->hardware_lock);
@@ -1949,12 +1944,12 @@ qla83xx_fw_dump(scsi_qla_host_t *vha)
 	uint32_t	cnt;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
-	uint32_t __iomem *dmp_reg;
-	uint32_t	*iter_reg;
-	uint16_t __iomem *mbx_reg;
+	__le32 __iomem *dmp_reg;
+	__be32		*iter_reg;
+	__le16 __iomem *mbx_reg;
 	struct qla83xx_fw_dump *fw;
 	void		*nxt, *nxt_chain;
-	uint32_t	*last_chain = NULL;
+	__be32		*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
 	lockdep_assert_held(&ha->hardware_lock);
@@ -2447,6 +2442,23 @@ qla83xx_fw_dump_failed_0:
 /*                         Driver Debug Functions.                          */
 /****************************************************************************/
 
+/* Write the debug message prefix into @pbuf. */
+static void ql_dbg_prefix(char *pbuf, int pbuf_size,
+			  const scsi_qla_host_t *vha, uint msg_id)
+{
+	if (vha) {
+		const struct pci_dev *pdev = vha->hw->pdev;
+
+		/* <module-name> [<dev-name>]-<msg-id>:<host>: */
+		snprintf(pbuf, pbuf_size, "%s [%s]-%04x:%lu: ", QL_MSGHDR,
+			 dev_name(&(pdev->dev)), msg_id, vha->host_no);
+	} else {
+		/* <module-name> [<dev-name>]-<msg-id>: : */
+		snprintf(pbuf, pbuf_size, "%s [%s]-%04x: : ", QL_MSGHDR,
+			 "0000:00:00.0", msg_id);
+	}
+}
+
 /*
  * This function is for formatting and logging debug information.
  * It is to be used when vha is available. It formats the message
@@ -2472,33 +2484,12 @@ ql_dbg(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
 	vaf.fmt = fmt;
 	vaf.va = &va;
 
-	if (!ql_mask_match(level)) {
-		if (vha != NULL) {
-			const struct pci_dev *pdev = vha->hw->pdev;
-			/* <module-name> <msg-id>:<host> Message */
-			snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x:%ld: ",
-			    QL_MSGHDR, dev_name(&(pdev->dev)), id,
-			    vha->host_no);
-		} else {
-			snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: : ",
-			    QL_MSGHDR, "0000:00:00.0", id);
-		}
-		pbuf[sizeof(pbuf) - 1] = 0;
-		trace_ql_dbg_log(pbuf, &vaf);
-		va_end(va);
-		return;
-	}
+	ql_dbg_prefix(pbuf, ARRAY_SIZE(pbuf), vha, id);
 
-	if (vha != NULL) {
-		const struct pci_dev *pdev = vha->hw->pdev;
-		/* <module-name> <pci-name> <msg-id>:<host> Message */
-		pr_warn("%s [%s]-%04x:%ld: %pV",
-			QL_MSGHDR, dev_name(&(pdev->dev)), id + ql_dbg_offset,
-			vha->host_no, &vaf);
-	} else {
-		pr_warn("%s [%s]-%04x: : %pV",
-			QL_MSGHDR, "0000:00:00.0", id + ql_dbg_offset, &vaf);
-	}
+	if (!ql_mask_match(level))
+		trace_ql_dbg_log(pbuf, &vaf);
+	else
+		pr_warn("%s%pV", pbuf, &vaf);
 
 	va_end(va);
 
@@ -2523,6 +2514,7 @@ ql_dbg_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
 {
 	va_list va;
 	struct va_format vaf;
+	char pbuf[128];
 
 	if (pdev == NULL)
 		return;
@@ -2534,9 +2526,8 @@ ql_dbg_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
 	vaf.fmt = fmt;
 	vaf.va = &va;
 
-	/* <module-name> <dev-name>:<msg-id> Message */
-	pr_warn("%s [%s]-%04x: : %pV",
-		QL_MSGHDR, dev_name(&(pdev->dev)), id + ql_dbg_offset, &vaf);
+	ql_dbg_prefix(pbuf, ARRAY_SIZE(pbuf), NULL, id + ql_dbg_offset);
+	pr_warn("%s%pV", pbuf, &vaf);
 
 	va_end(va);
 }
@@ -2564,16 +2555,7 @@ ql_log(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
 	if (level > ql_errlev)
 		return;
 
-	if (vha != NULL) {
-		const struct pci_dev *pdev = vha->hw->pdev;
-		/* <module-name> <msg-id>:<host> Message */
-		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x:%ld: ",
-			QL_MSGHDR, dev_name(&(pdev->dev)), id, vha->host_no);
-	} else {
-		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: : ",
-			QL_MSGHDR, "0000:00:00.0", id);
-	}
-	pbuf[sizeof(pbuf) - 1] = 0;
+	ql_dbg_prefix(pbuf, ARRAY_SIZE(pbuf), vha, id);
 
 	va_start(va, fmt);
 
@@ -2624,10 +2606,7 @@ ql_log_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
 	if (level > ql_errlev)
 		return;
 
-	/* <module-name> <dev-name>:<msg-id> Message */
-	snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: : ",
-		 QL_MSGHDR, dev_name(&(pdev->dev)), id);
-	pbuf[sizeof(pbuf) - 1] = 0;
+	ql_dbg_prefix(pbuf, ARRAY_SIZE(pbuf), NULL, id);
 
 	va_start(va, fmt);
 
@@ -2660,7 +2639,7 @@ ql_dump_regs(uint level, scsi_qla_host_t *vha, uint id)
 	struct device_reg_2xxx __iomem *reg = &ha->iobase->isp;
 	struct device_reg_24xx __iomem *reg24 = &ha->iobase->isp24;
 	struct device_reg_82xx __iomem *reg82 = &ha->iobase->isp82;
-	uint16_t __iomem *mbx_reg;
+	__le16 __iomem *mbx_reg;
 
 	if (!ql_mask_match(level))
 		return;
@@ -2677,7 +2656,6 @@ ql_dump_regs(uint level, scsi_qla_host_t *vha, uint id)
 		ql_dbg(level, vha, id,
 		    "mbox[%d] %#04x\n", i, rd_reg_word(mbx_reg));
 }
-
 
 void
 ql_dump_buffer(uint level, scsi_qla_host_t *vha, uint id, const void *buf,
@@ -2723,16 +2701,7 @@ ql_log_qp(uint32_t level, struct qla_qpair *qpair, int32_t id,
 	if (level > ql_errlev)
 		return;
 
-	if (qpair != NULL) {
-		const struct pci_dev *pdev = qpair->pdev;
-		/* <module-name> <msg-id>:<host> Message */
-		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: ",
-			QL_MSGHDR, dev_name(&(pdev->dev)), id);
-	} else {
-		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: : ",
-			QL_MSGHDR, "0000:00:00.0", id);
-	}
-	pbuf[sizeof(pbuf) - 1] = 0;
+	ql_dbg_prefix(pbuf, ARRAY_SIZE(pbuf), qpair ? qpair->vha : NULL, id);
 
 	va_start(va, fmt);
 
@@ -2776,6 +2745,7 @@ ql_dbg_qp(uint32_t level, struct qla_qpair *qpair, int32_t id,
 {
 	va_list va;
 	struct va_format vaf;
+	char pbuf[128];
 
 	if (!ql_mask_match(level))
 		return;
@@ -2785,16 +2755,9 @@ ql_dbg_qp(uint32_t level, struct qla_qpair *qpair, int32_t id,
 	vaf.fmt = fmt;
 	vaf.va = &va;
 
-	if (qpair != NULL) {
-		const struct pci_dev *pdev = qpair->pdev;
-		/* <module-name> <pci-name> <msg-id>:<host> Message */
-		pr_warn("%s [%s]-%04x: %pV",
-		    QL_MSGHDR, dev_name(&(pdev->dev)), id + ql_dbg_offset,
-		    &vaf);
-	} else {
-		pr_warn("%s [%s]-%04x: : %pV",
-			QL_MSGHDR, "0000:00:00.0", id + ql_dbg_offset, &vaf);
-	}
+	ql_dbg_prefix(pbuf, ARRAY_SIZE(pbuf), qpair ? qpair->vha : NULL,
+		      id + ql_dbg_offset);
+	pr_warn("%s%pV", pbuf, &vaf);
 
 	va_end(va);
 

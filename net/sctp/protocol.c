@@ -1248,13 +1248,13 @@ static int __net_init sctp_defaults_init(struct net *net)
 	net->sctp.max_burst			= SCTP_DEFAULT_MAX_BURST;
 
 	/* Disable of Primary Path Switchover by default */
-	net->sctp.ps_retrans = SCTP_PS_RETRANS_MAX;
+	net->sctp_ps_retrans = SCTP_PS_RETRANS_MAX;
 
 	/* Enable pf state by default */
 	net->sctp.pf_enable = 1;
 
 	/* Ignore pf exposure feature by default */
-	net->sctp.pf_expose = SCTP_PF_EXPOSE_UNSET;
+	net->sctp_pf_expose = SCTP_PF_EXPOSE_UNSET;
 
 	/* Association.Max.Retrans  - 10 attempts
 	 * Path.Max.Retrans         - 5  attempts (per destination address)
@@ -1393,7 +1393,7 @@ static __init int sctp_init(void)
 	int status = -EINVAL;
 	unsigned long goal;
 	unsigned long limit;
-	unsigned long nr_pages = totalram_pages;
+	unsigned long nr_pages = totalram_pages();
 	int max_share;
 	int order;
 	int num_entries;

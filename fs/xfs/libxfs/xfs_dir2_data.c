@@ -400,13 +400,13 @@ xfs_dir3_data_read(
 	struct xfs_trans	*tp,
 	struct xfs_inode	*dp,
 	xfs_dablk_t		bno,
-	xfs_daddr_t		mapped_bno,
+	unsigned int		flags,
 	struct xfs_buf		**bpp)
 {
 	int			err;
 
-	err = xfs_da_read_buf(tp, dp, bno, mapped_bno, bpp,
-				XFS_DATA_FORK, &xfs_dir3_data_buf_ops);
+	err = xfs_da_read_buf(tp, dp, bno, flags, bpp, XFS_DATA_FORK,
+			&xfs_dir3_data_buf_ops);
 	if (!err && tp && *bpp)
 		xfs_trans_buf_set_type(tp, *bpp, XFS_BLFT_DIR_DATA_BUF);
 	return err;
@@ -416,10 +416,10 @@ int
 xfs_dir3_data_readahead(
 	struct xfs_inode	*dp,
 	xfs_dablk_t		bno,
-	xfs_daddr_t		mapped_bno)
+	unsigned int		flags)
 {
-	return xfs_da_reada_buf(dp, bno, mapped_bno,
-				XFS_DATA_FORK, &xfs_dir3_data_reada_buf_ops);
+	return xfs_da_reada_buf(dp, bno, flags, XFS_DATA_FORK,
+				&xfs_dir3_data_reada_buf_ops);
 }
 
 /*
@@ -679,7 +679,7 @@ xfs_dir3_data_init(
 	 * Get the buffer set up for the block.
 	 */
 	error = xfs_da_get_buf(tp, dp, xfs_dir2_db_to_da(args->geo, blkno),
-			       -1, &bp, XFS_DATA_FORK);
+			       &bp, XFS_DATA_FORK);
 	if (error)
 		return error;
 	bp->b_ops = &xfs_dir3_data_buf_ops;

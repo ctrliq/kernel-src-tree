@@ -17,10 +17,6 @@
 #define TCP_INFINITE_SSTHRESH	0x7fffffff
 #define TCP_PINGPONG_THRESH	3
 
-#define fib_nh_dev		nh_common.nhc_dev
-#define fib_nh_gw_family	nh_common.nhc_gw_family
-#define fib_nh_gw6		nh_common.nhc_gw.ipv6
-
 #define inet_daddr		sk.__sk_common.skc_daddr
 #define inet_rcv_saddr		sk.__sk_common.skc_rcv_saddr
 #define inet_dport		sk.__sk_common.skc_dport

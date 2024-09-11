@@ -305,7 +305,7 @@ static int __init rxe_module_init(void)
 {
 	int err;
 
-	mark_tech_preview("Soft-RoCE Transport Driver", THIS_MODULE);
+	mark_driver_unsupported("Soft-RoCE Transport Driver");
 
 	/* initialize slab caches for managed objects */
 	err = rxe_cache_init();

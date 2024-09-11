@@ -135,7 +135,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_QP_CREATE)(
 	case IB_UVERBS_QPT_RAW_PACKET:
 		if (!capable(CAP_NET_RAW))
 			return -EPERM;
-		fallthrough;
+		/* fallthrough; */
 	case IB_UVERBS_QPT_RC:
 	case IB_UVERBS_QPT_UC:
 	case IB_UVERBS_QPT_UD:

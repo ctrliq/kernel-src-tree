@@ -89,6 +89,8 @@ void		nfsd_destroy(struct net *net);
 
 int get_nfsdfs(struct net *);
 
+bool		i_am_nfsd(void);
+
 struct nfsdfs_client {
 	struct kref cl_ref;
 	void (*cl_release)(struct kref *kref);

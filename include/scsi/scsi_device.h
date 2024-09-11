@@ -111,7 +111,6 @@ struct scsi_device {
 	atomic_t device_busy;		/* commands actually active on LLDD */
 	atomic_t device_blocked;	/* Device returned QUEUE_FULL. */
 
-	atomic_t restarts;
 	spinlock_t list_lock;
 	struct list_head cmd_list;	/* queue of in use SCSI Command structures */
 	struct list_head starved_entry;
@@ -241,7 +240,7 @@ struct scsi_device {
 	 */
 	RH_KABI_USE(1, struct scsi_vpd __rcu *vpd_pg0)
 	RH_KABI_USE(2, struct scsi_vpd __rcu *vpd_pg89)
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE(3, atomic_t restarts)
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)

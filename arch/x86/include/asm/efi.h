@@ -18,14 +18,7 @@
  *
  * This is the main reason why we're doing stable VA mappings for RT
  * services.
- *
- * This flag is used in conjunction with a chicken bit called
- * "efi=old_map" which can be used as a fallback to the old runtime
- * services mapping method in case there's some b0rkage with a
- * particular EFI implementation (haha, it is hard to hold up the
- * sarcasm here...).
  */
-#define EFI_OLD_MEMMAP		EFI_ARCH_1
 
 #define EFI32_LOADER_SIGNATURE	"EL32"
 #define EFI64_LOADER_SIGNATURE	"EL64"
@@ -83,9 +76,7 @@ struct efi_scratch {
 	preempt_disable();						\
 	__kernel_fpu_begin();						\
 	firmware_restrict_branch_speculation_start();			\
-									\
-	if (!efi_enabled(EFI_OLD_MEMMAP))				\
-		efi_switch_mm(&efi_mm);					\
+	efi_switch_mm(&efi_mm);						\
 })
 
 #define arch_efi_call_virt(p, f, args...)				\
@@ -93,9 +84,7 @@ struct efi_scratch {
 
 #define arch_efi_call_virt_teardown()					\
 ({									\
-	if (!efi_enabled(EFI_OLD_MEMMAP))				\
-		efi_switch_mm(efi_scratch.prev_mm);			\
-									\
+	efi_switch_mm(efi_scratch.prev_mm);				\
 	firmware_restrict_branch_speculation_end();			\
 	__kernel_fpu_end();						\
 	preempt_enable();						\
@@ -138,7 +127,6 @@ extern void efi_delete_dummy_variable(void);
 extern void efi_switch_mm(struct mm_struct *mm);
 extern void efi_recover_from_page_fault(unsigned long phys_addr);
 extern void efi_free_boot_services(void);
-extern void efi_reserve_boot_services(void);
 
 struct efi_setup_data {
 	u64 fw_vendor;
@@ -164,10 +152,7 @@ static inline bool efi_runtime_supported(void)
 	if (IS_ENABLED(CONFIG_X86_64) == efi_enabled(EFI_64BIT))
 		return true;
 
-	if (IS_ENABLED(CONFIG_EFI_MIXED) && !efi_enabled(EFI_OLD_MEMMAP))
-		return true;
-
-	return false;
+	return IS_ENABLED(CONFIG_EFI_MIXED);
 }
 
 extern struct console early_efi_console;
@@ -176,12 +161,6 @@ extern void parse_efi_setup(u64 phys_addr, u32 data_len);
 extern void efifb_setup_from_dmi(struct screen_info *si, const char *opt);
 
 extern void efi_thunk_runtime_setup(void);
-extern efi_status_t efi_thunk_set_virtual_address_map(
-	void *phys_set_virtual_address_map,
-	unsigned long memory_map_size,
-	unsigned long descriptor_size,
-	u32 descriptor_version,
-	efi_memory_desc_t *virtual_map);
 efi_status_t efi_set_virtual_address_map(unsigned long memory_map_size,
 					 unsigned long descriptor_size,
 					 u32 descriptor_version,
@@ -212,33 +191,64 @@ static inline bool efi_is_64bit(void)
 	return __efi_early()->is64;
 }
 
-#define efi_table_attr(table, attr, instance)				\
-	(efi_is_64bit() ?						\
-		((table##_64_t *)(unsigned long)instance)->attr :	\
-		((table##_32_t *)(unsigned long)instance)->attr)
+static inline bool efi_is_native(void)
+{
+	if (!IS_ENABLED(CONFIG_X86_64))
+		return true;
+	return efi_is_64bit();
+}
+
+#define efi_mixed_mode_cast(attr)					\
+	__builtin_choose_expr(						\
+		__builtin_types_compatible_p(u32, __typeof__(attr)),	\
+			(unsigned long)(attr), (attr))
+
+#define efi_table_attr(table, attr, instance) ({			\
+	__typeof__(((table##_t *)0)->attr) __ret;			\
+	if (efi_is_native()) {						\
+		__ret = ((table##_t *)(unsigned long)instance)->attr;	\
+	} else {							\
+		__ret = (__typeof__(__ret))efi_mixed_mode_cast(		\
+		((table##_t *)(unsigned long)instance)->mixed_mode.attr);\
+	}								\
+	__ret;								\
+})
 
 #define efi_call_proto(protocol, f, instance, ...)			\
-	__efi_early()->call(efi_table_attr(protocol, f, instance),	\
+	__efi_early()->call((unsigned long)				\
+				efi_table_attr(protocol, f, instance),	\
 		instance, ##__VA_ARGS__)
 
 #define efi_call_early(f, ...)						\
-	__efi_early()->call(efi_table_attr(efi_boot_services, f,	\
+	__efi_early()->call((unsigned long)				\
+				efi_table_attr(efi_boot_services, f,	\
 		__efi_early()->boot_services), __VA_ARGS__)
 
-#define __efi_call_early(f, ...)					\
-	__efi_early()->call((unsigned long)f, __VA_ARGS__);
-
 #define efi_call_runtime(f, ...)					\
-	__efi_early()->call(efi_table_attr(efi_runtime_services, f,	\
+	__efi_early()->call((unsigned long)				\
+				efi_table_attr(efi_runtime_services, f,	\
 		__efi_early()->runtime_services), __VA_ARGS__)
 
 extern bool efi_reboot_required(void);
+extern bool efi_is_table_address(unsigned long phys_addr);
 
+extern void efi_find_mirror(void);
+extern void efi_reserve_boot_services(void);
 #else
 static inline void parse_efi_setup(u64 phys_addr, u32 data_len) {}
 static inline bool efi_reboot_required(void)
 {
 	return false;
+}
+static inline  bool efi_is_table_address(unsigned long phys_addr)
+{
+	return false;
+}
+static inline void efi_find_mirror(void)
+{
+}
+static inline void efi_reserve_boot_services(void)
+{
 }
 #endif /* CONFIG_EFI */
 

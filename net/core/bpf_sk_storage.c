@@ -660,7 +660,7 @@ static int bpf_sk_storage_map_alloc_check(union bpf_attr *attr)
 	    !attr->btf_key_type_id || !attr->btf_value_type_id)
 		return -EINVAL;
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!bpf_capable())
 		return -EPERM;
 
 	if (attr->value_size > MAX_VALUE_SIZE)
@@ -920,6 +920,7 @@ BPF_CALL_2(bpf_sk_storage_delete, struct bpf_map *, map, struct sock *, sk)
 	return -ENOENT;
 }
 
+static int sk_storage_map_btf_id;
 const struct bpf_map_ops sk_storage_map_ops = {
 	.map_alloc_check = bpf_sk_storage_map_alloc_check,
 	.map_alloc = bpf_sk_storage_map_alloc,
@@ -929,6 +930,8 @@ const struct bpf_map_ops sk_storage_map_ops = {
 	.map_update_elem = bpf_fd_sk_storage_update_elem,
 	.map_delete_elem = bpf_fd_sk_storage_delete_elem,
 	.map_check_btf = bpf_sk_storage_map_check_btf,
+	.map_btf_name = "bpf_sk_storage_map",
+	.map_btf_id = &sk_storage_map_btf_id,
 };
 
 const struct bpf_func_proto bpf_sk_storage_get_proto = {
@@ -1022,7 +1025,7 @@ bpf_sk_storage_diag_alloc(const struct nlattr *nla_stgs)
 	/* bpf_sk_storage_map is currently limited to CAP_SYS_ADMIN as
 	 * the map_alloc_check() side also does.
 	 */
-	if (!capable(CAP_SYS_ADMIN))
+	if (!bpf_capable())
 		return ERR_PTR(-EPERM);
 
 	nla_for_each_nested(nla, nla_stgs, rem) {
@@ -1381,18 +1384,39 @@ static int bpf_iter_init_sk_storage_map(void *priv_data,
 	return 0;
 }
 
-static int bpf_iter_check_map(struct bpf_prog *prog,
-			      struct bpf_iter_aux_info *aux)
+static int bpf_iter_attach_map(struct bpf_prog *prog,
+			       union bpf_iter_link_info *linfo,
+			       struct bpf_iter_aux_info *aux)
 {
-	struct bpf_map *map = aux->map;
+	struct bpf_map *map;
+	int err = -EINVAL;
+
+	if (!linfo->map.map_fd)
+		return -EBADF;
+
+	map = bpf_map_get_with_uref(linfo->map.map_fd);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
 
 	if (map->map_type != BPF_MAP_TYPE_SK_STORAGE)
-		return -EINVAL;
+		goto put_map;
 
-	if (prog->aux->max_rdonly_access > map->value_size)
-		return -EACCES;
+	if (prog->aux->max_rdonly_access > map->value_size) {
+		err = -EACCES;
+		goto put_map;
+	}
 
+	aux->map = map;
 	return 0;
+
+put_map:
+	bpf_map_put_with_uref(map);
+	return err;
+}
+
+static void bpf_iter_detach_map(struct bpf_iter_aux_info *aux)
+{
+	bpf_map_put_with_uref(aux->map);
 }
 
 static const struct seq_operations bpf_sk_storage_map_seq_ops = {
@@ -1411,8 +1435,8 @@ static const struct bpf_iter_seq_info iter_seq_info = {
 
 static struct bpf_iter_reg bpf_sk_storage_map_reg_info = {
 	.target			= "bpf_sk_storage_map",
-	.check_target		= bpf_iter_check_map,
-	.req_linfo		= BPF_ITER_LINK_MAP_FD,
+	.attach_target		= bpf_iter_attach_map,
+	.detach_target		= bpf_iter_detach_map,
 	.ctx_arg_info_size	= 2,
 	.ctx_arg_info		= {
 		{ offsetof(struct bpf_iter__bpf_sk_storage_map, sk),

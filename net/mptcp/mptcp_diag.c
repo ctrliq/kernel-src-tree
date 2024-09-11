@@ -140,7 +140,7 @@ static void mptcp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
 	info->mptcpi_flags = flags;
 	info->mptcpi_token = READ_ONCE(msk->token);
 	info->mptcpi_write_seq = READ_ONCE(msk->write_seq);
-	info->mptcpi_snd_una = atomic64_read(&msk->snd_una);
+	info->mptcpi_snd_una = READ_ONCE(msk->snd_una);
 	info->mptcpi_rcv_nxt = READ_ONCE(msk->ack_seq);
 	unlock_sock_fast(sk, slow);
 }
@@ -149,7 +149,7 @@ static const struct inet_diag_handler mptcp_diag_handler = {
 	.dump		 = mptcp_diag_dump,
 	.dump_one	 = mptcp_diag_dump_one,
 	.idiag_get_info  = mptcp_diag_get_info,
-	.idiag_type	 = IPPROTO_MPTCP,
+	.idiag_type	 = IPPROTO_MPTCP_KERN,
 	.idiag_info_size = sizeof(struct mptcp_info),
 };
 
@@ -166,4 +166,4 @@ static void __exit mptcp_diag_exit(void)
 module_init(mptcp_diag_init);
 module_exit(mptcp_diag_exit);
 MODULE_LICENSE("GPL");
-MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_NETLINK, NETLINK_SOCK_DIAG, 2-262 /* AF_INET - IPPROTO_MPTCP */);
+MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_NETLINK, NETLINK_SOCK_DIAG, 2-66 /* AF_INET - IPPROTO_MPTCP_KERN */);

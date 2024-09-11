@@ -80,7 +80,7 @@ static inline void uobj_put_write(struct ib_uobject *uobj)
 static inline void uobj_alloc_abort(struct ib_uobject *uobj,
 				    struct uverbs_attr_bundle *attrs)
 {
-	rdma_alloc_abort_uobject(uobj, attrs);
+	rdma_alloc_abort_uobject(uobj, attrs, false);
 }
 
 static inline void uobj_finalize_uobj_create(struct ib_uobject *uobj,

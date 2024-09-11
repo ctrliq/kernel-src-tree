@@ -2719,12 +2719,19 @@ static int __mlxsw_core_port_init(struct mlxsw_core *mlxsw_core, u8 local_port,
 	struct mlxsw_core_port *mlxsw_core_port =
 					&mlxsw_core->ports[local_port];
 	struct devlink_port *devlink_port = &mlxsw_core_port->devlink_port;
+	struct devlink_port_attrs attrs = {};
 	int err;
 
+	attrs.split = split;
+	attrs.lanes = lanes;
+	attrs.splittable = splittable;
+	attrs.flavour = flavour;
+	attrs.phys.port_number = port_number;
+	attrs.phys.split_subport_number = split_port_subnumber;
+	memcpy(attrs.switch_id.id, switch_id, switch_id_len);
+	attrs.switch_id.id_len = switch_id_len;
 	mlxsw_core_port->local_port = local_port;
-	devlink_port_attrs_set(devlink_port, flavour, port_number,
-			       split, split_port_subnumber,
-			       switch_id, switch_id_len);
+	devlink_port_attrs_set(devlink_port, &attrs);
 	err = devlink_port_register(devlink, devlink_port, local_port);
 	if (err)
 		memset(mlxsw_core_port, 0, sizeof(*mlxsw_core_port));
@@ -2874,21 +2881,21 @@ int mlxsw_core_module_max_width(struct mlxsw_core *mlxsw_core, u8 module)
 	/* Here we need to get the module width according to the module type. */
 
 	switch (module_type) {
-	case MLXSW_REG_PMTM_MODULE_TYPE_C2C8X: /* fall through */
-	case MLXSW_REG_PMTM_MODULE_TYPE_QSFP_DD: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C8X:
+	case MLXSW_REG_PMTM_MODULE_TYPE_QSFP_DD:
 	case MLXSW_REG_PMTM_MODULE_TYPE_OSFP:
 		return 8;
-	case MLXSW_REG_PMTM_MODULE_TYPE_C2C4X: /* fall through */
-	case MLXSW_REG_PMTM_MODULE_TYPE_BP_4X: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C4X:
+	case MLXSW_REG_PMTM_MODULE_TYPE_BP_4X:
 	case MLXSW_REG_PMTM_MODULE_TYPE_QSFP:
 		return 4;
-	case MLXSW_REG_PMTM_MODULE_TYPE_C2C2X: /* fall through */
-	case MLXSW_REG_PMTM_MODULE_TYPE_BP_2X: /* fall through */
-	case MLXSW_REG_PMTM_MODULE_TYPE_SFP_DD: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C2X:
+	case MLXSW_REG_PMTM_MODULE_TYPE_BP_2X:
+	case MLXSW_REG_PMTM_MODULE_TYPE_SFP_DD:
 	case MLXSW_REG_PMTM_MODULE_TYPE_DSFP:
 		return 2;
-	case MLXSW_REG_PMTM_MODULE_TYPE_C2C1X: /* fall through */
-	case MLXSW_REG_PMTM_MODULE_TYPE_BP_1X: /* fall through */
+	case MLXSW_REG_PMTM_MODULE_TYPE_C2C1X:
+	case MLXSW_REG_PMTM_MODULE_TYPE_BP_1X:
 	case MLXSW_REG_PMTM_MODULE_TYPE_SFP:
 		return 1;
 	default:

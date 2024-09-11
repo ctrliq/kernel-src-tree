@@ -396,19 +396,13 @@ static inline void acerhdf_revert_to_bios_mode(void)
 {
 	acerhdf_change_fanstate(ACERHDF_FAN_AUTO);
 	kernelmode = 0;
-	if (thz_dev) {
-		thz_dev->mode = THERMAL_DEVICE_DISABLED;
-		thz_dev->polling_delay = 0;
-	}
+
 	pr_notice("kernel mode fan control OFF\n");
 }
 static inline void acerhdf_enable_kernelmode(void)
 {
 	kernelmode = 1;
-	thz_dev->mode = THERMAL_DEVICE_ENABLED;
 
-	thz_dev->polling_delay = interval*1000;
-	thermal_zone_device_update(thz_dev, THERMAL_EVENT_UNSPECIFIED);
 	pr_notice("kernel mode fan control ON\n");
 }
 
@@ -418,8 +412,8 @@ static inline void acerhdf_enable_kernelmode(void)
  *          the temperature and the fan.
  * disabled: the BIOS takes control of the fan.
  */
-static int acerhdf_set_mode(struct thermal_zone_device *thermal,
-			    enum thermal_device_mode mode)
+static int acerhdf_change_mode(struct thermal_zone_device *thermal,
+			       enum thermal_device_mode mode)
 {
 	if (mode == THERMAL_DEVICE_DISABLED && kernelmode)
 		acerhdf_revert_to_bios_mode();
@@ -478,7 +472,7 @@ static struct thermal_zone_device_ops acerhdf_dev_ops = {
 	.bind = acerhdf_bind,
 	.unbind = acerhdf_unbind,
 	.get_temp = acerhdf_get_ec_temp,
-	.set_mode = acerhdf_set_mode,
+	.change_mode = acerhdf_change_mode,
 	.get_trip_type = acerhdf_get_trip_type,
 	.get_trip_hyst = acerhdf_get_trip_hyst,
 	.get_trip_temp = acerhdf_get_trip_temp,
@@ -704,6 +698,8 @@ static void acerhdf_unregister_platform(void)
 
 static int acerhdf_register_thermal(void)
 {
+	int ret;
+
 	cl_dev = thermal_cooling_device_register("acerhdf-fan", NULL,
 						 &acerhdf_cooling_ops);
 
@@ -717,8 +713,12 @@ static int acerhdf_register_thermal(void)
 	if (IS_ERR(thz_dev))
 		return -EINVAL;
 
-	thz_dev->mode = kernelmode ?
-		THERMAL_DEVICE_ENABLED : THERMAL_DEVICE_DISABLED;
+	if (kernelmode)
+		ret = thermal_zone_device_enable(thz_dev);
+	else
+		ret = thermal_zone_device_disable(thz_dev);
+	if (ret)
+		return ret;
 
 	if (strcmp(thz_dev->governor->name,
 				acerhdf_zone_params.governor_name)) {

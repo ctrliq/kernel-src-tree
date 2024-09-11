@@ -13,6 +13,7 @@
 
 #include <linux/stmmac.h>
 #include "common.h"
+#include "dwmac4.h"
 #include "dwmac4_descs.h"
 
 static int dwmac4_wrback_get_tx_status(void *data, struct stmmac_extra_stats *x,
@@ -496,16 +497,23 @@ static void dwmac4_set_vlan(struct dma_desc *p, u32 type)
 	p->des2 |= cpu_to_le32(type & TDES2_VLAN_TAG_MASK);
 }
 
-static int dwmac4_get_rx_header_len(struct dma_desc *p, unsigned int *len)
+static void dwmac4_get_rx_header_len(struct dma_desc *p, unsigned int *len)
 {
 	*len = le32_to_cpu(p->des2) & RDES2_HL;
-	return 0;
 }
 
 static void dwmac4_set_sec_addr(struct dma_desc *p, dma_addr_t addr)
 {
 	p->des2 = cpu_to_le32(lower_32_bits(addr));
 	p->des3 = cpu_to_le32(upper_32_bits(addr) | RDES3_BUFFER2_VALID_ADDR);
+}
+
+static void dwmac4_set_tbs(struct dma_edesc *p, u32 sec, u32 nsec)
+{
+	p->des4 = cpu_to_le32((sec & TDES4_LT) | TDES4_LTV);
+	p->des5 = cpu_to_le32(nsec & TDES5_LT);
+	p->des6 = 0;
+	p->des7 = 0;
 }
 
 const struct stmmac_desc_ops dwmac4_desc_ops = {
@@ -537,6 +545,7 @@ const struct stmmac_desc_ops dwmac4_desc_ops = {
 	.set_vlan = dwmac4_set_vlan,
 	.get_rx_header_len = dwmac4_get_rx_header_len,
 	.set_sec_addr = dwmac4_set_sec_addr,
+	.set_tbs = dwmac4_set_tbs,
 };
 
 const struct stmmac_mode_ops dwmac4_ring_mode_ops = {

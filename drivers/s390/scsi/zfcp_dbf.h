@@ -43,7 +43,8 @@ struct zfcp_dbf_rec_trigger {
  * @fsf_req_id: request id for fsf requests
  * @rec_status: status of the fsf request
  * @rec_step: current step of the recovery action
- * rec_count: recovery counter
+ * @rec_action: ERP action type
+ * @rec_count: recoveries including retries for particular @rec_action
  */
 struct zfcp_dbf_rec_running {
 	u64 fsf_req_id;
@@ -73,6 +74,7 @@ enum zfcp_dbf_rec_id {
  * @adapter_status: current status of the adapter
  * @port_status: current status of the port
  * @lun_status: current status of the lun
+ * @u: record type specific data
  * @u.trig: structure zfcp_dbf_rec_trigger
  * @u.run: structure zfcp_dbf_rec_running
  */
@@ -127,6 +129,8 @@ struct zfcp_dbf_san {
  * @prot_status_qual: protocol status qualifier
  * @fsf_status: fsf status
  * @fsf_status_qual: fsf status qualifier
+ * @port_handle: handle for port
+ * @lun_handle: handle for LUN
  */
 struct zfcp_dbf_hba_res {
 	u64 req_issued;
@@ -178,6 +182,7 @@ struct zfcp_dbf_hba_fces {
  * @ZFCP_DBF_HBA_RES: response trace record
  * @ZFCP_DBF_HBA_USS: unsolicited status trace record
  * @ZFCP_DBF_HBA_BIT: bit error trace record
+ * @ZFCP_DBF_HBA_BASIC: basic adapter event, only trace tag, no other data
  * @ZFCP_DBF_HBA_FCES: FC Endpoint Security trace record
  */
 enum zfcp_dbf_hba_id {

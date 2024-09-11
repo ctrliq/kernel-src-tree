@@ -22,11 +22,14 @@
 
 /* debug flags */
 #define SOF_DBG_ENABLE_TRACE	BIT(0)
-#define SOF_DBG_REGS		BIT(1)
-#define SOF_DBG_MBOX		BIT(2)
-#define SOF_DBG_TEXT		BIT(3)
-#define SOF_DBG_PCI		BIT(4)
-#define SOF_DBG_RETAIN_CTX	BIT(5)	/* prevent DSP D3 on FW exception */
+#define SOF_DBG_RETAIN_CTX	BIT(1)	/* prevent DSP D3 on FW exception */
+
+#define SOF_DBG_DUMP_REGS		BIT(0)
+#define SOF_DBG_DUMP_MBOX		BIT(1)
+#define SOF_DBG_DUMP_TEXT		BIT(2)
+#define SOF_DBG_DUMP_PCI		BIT(3)
+#define SOF_DBG_DUMP_FORCE_ERR_LEVEL	BIT(4) /* used to dump dsp status with error log level */
+
 
 /* global debug state set by SOF_DBG_ flags */
 extern int sof_core_debug;
@@ -296,6 +299,7 @@ enum sof_debugfs_access_type {
 struct snd_sof_dfsentry {
 	struct dentry *dfsentry;
 	size_t size;
+	size_t buf_data_size;  /* length of buffered data for file read operation */
 	enum sof_dfsentry_type type;
 	/*
 	 * access_type specifies if the
@@ -529,6 +533,7 @@ void snd_sof_get_status(struct snd_sof_dev *sdev, u32 panic_code,
 			void *stack, size_t stack_words);
 int snd_sof_init_trace_ipc(struct snd_sof_dev *sdev);
 void snd_sof_handle_fw_exception(struct snd_sof_dev *sdev);
+int snd_sof_dbg_memory_info_init(struct snd_sof_dev *sdev);
 
 /*
  * Platform specific ops.

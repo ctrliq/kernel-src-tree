@@ -48,6 +48,7 @@
 #include <asm/realmode.h>
 #include <asm/time.h>
 #include <asm/pgalloc.h>
+#include <asm/sev-es.h>
 
 /*
  * We allocate runtime services regions top-down, starting from -4G, i.e.
@@ -56,134 +57,6 @@
 static u64 efi_va = EFI_VA_START;
 
 struct efi_scratch efi_scratch;
-
-static void __init early_code_mapping_set_exec(int executable)
-{
-	efi_memory_desc_t *md;
-
-	if (!(__supported_pte_mask & _PAGE_NX))
-		return;
-
-	/* Make EFI service code area executable */
-	for_each_efi_memory_desc(md) {
-		if (md->type == EFI_RUNTIME_SERVICES_CODE ||
-		    md->type == EFI_BOOT_SERVICES_CODE)
-			efi_set_executable(md, executable);
-	}
-}
-
-static void __init efi_old_memmap_phys_epilog(pgd_t *save_pgd);
-
-static pgd_t * __init efi_old_memmap_phys_prolog(void)
-{
-	unsigned long vaddr, addr_pgd, addr_p4d, addr_pud;
-	pgd_t *save_pgd, *pgd_k, *pgd_efi;
-	p4d_t *p4d, *p4d_k, *p4d_efi;
-	pud_t *pud;
-
-	int pgd;
-	int n_pgds, i, j;
-
-	early_code_mapping_set_exec(1);
-
-	n_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT), PGDIR_SIZE);
-	save_pgd = kmalloc_array(n_pgds, sizeof(*save_pgd), GFP_KERNEL);
-	if (!save_pgd)
-		return NULL;
-
-	/*
-	 * Build 1:1 identity mapping for efi=old_map usage. Note that
-	 * PAGE_OFFSET is PGDIR_SIZE aligned when KASLR is disabled, while
-	 * it is PUD_SIZE ALIGNED with KASLR enabled. So for a given physical
-	 * address X, the pud_index(X) != pud_index(__va(X)), we can only copy
-	 * PUD entry of __va(X) to fill in pud entry of X to build 1:1 mapping.
-	 * This means here we can only reuse the PMD tables of the direct mapping.
-	 */
-	for (pgd = 0; pgd < n_pgds; pgd++) {
-		addr_pgd = (unsigned long)(pgd * PGDIR_SIZE);
-		vaddr = (unsigned long)__va(pgd * PGDIR_SIZE);
-		pgd_efi = pgd_offset_k(addr_pgd);
-		save_pgd[pgd] = *pgd_efi;
-
-		p4d = p4d_alloc(&init_mm, pgd_efi, addr_pgd);
-		if (!p4d) {
-			pr_err("Failed to allocate p4d table!\n");
-			goto out;
-		}
-
-		for (i = 0; i < PTRS_PER_P4D; i++) {
-			addr_p4d = addr_pgd + i * P4D_SIZE;
-			p4d_efi = p4d + p4d_index(addr_p4d);
-
-			pud = pud_alloc(&init_mm, p4d_efi, addr_p4d);
-			if (!pud) {
-				pr_err("Failed to allocate pud table!\n");
-				goto out;
-			}
-
-			for (j = 0; j < PTRS_PER_PUD; j++) {
-				addr_pud = addr_p4d + j * PUD_SIZE;
-
-				if (addr_pud > (max_pfn << PAGE_SHIFT))
-					break;
-
-				vaddr = (unsigned long)__va(addr_pud);
-
-				pgd_k = pgd_offset_k(vaddr);
-				p4d_k = p4d_offset(pgd_k, vaddr);
-				pud[j] = *pud_offset(p4d_k, vaddr);
-			}
-		}
-		pgd_offset_k(pgd * PGDIR_SIZE)->pgd &= ~_PAGE_NX;
-	}
-
-	__flush_tlb_all();
-	return save_pgd;
-out:
-	efi_old_memmap_phys_epilog(save_pgd);
-	return NULL;
-}
-
-static void __init efi_old_memmap_phys_epilog(pgd_t *save_pgd)
-{
-	/*
-	 * After the lock is released, the original page table is restored.
-	 */
-	int pgd_idx, i;
-	int nr_pgds;
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-
-	nr_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT) , PGDIR_SIZE);
-
-	for (pgd_idx = 0; pgd_idx < nr_pgds; pgd_idx++) {
-		pgd = pgd_offset_k(pgd_idx * PGDIR_SIZE);
-		set_pgd(pgd_offset_k(pgd_idx * PGDIR_SIZE), save_pgd[pgd_idx]);
-
-		if (!pgd_present(*pgd))
-			continue;
-
-		for (i = 0; i < PTRS_PER_P4D; i++) {
-			p4d = p4d_offset(pgd,
-					 pgd_idx * PGDIR_SIZE + i * P4D_SIZE);
-
-			if (!p4d_present(*p4d))
-				continue;
-
-			pud = (pud_t *)p4d_page_vaddr(*p4d);
-			pud_free(&init_mm, pud);
-		}
-
-		p4d = (p4d_t *)pgd_page_vaddr(*pgd);
-		p4d_free(&init_mm, p4d);
-	}
-
-	kfree(save_pgd);
-
-	__flush_tlb_all();
-	early_code_mapping_set_exec(0);
-}
 
 EXPORT_SYMBOL_GPL(efi_mm);
 
@@ -202,9 +75,6 @@ int __init efi_alloc_page_tables(void)
 	p4d_t *p4d;
 	pud_t *pud;
 	gfp_t gfp_mask;
-
-	if (efi_enabled(EFI_OLD_MEMMAP))
-		return 0;
 
 	gfp_mask = GFP_KERNEL | __GFP_ZERO;
 	efi_pgd = (pgd_t *)__get_free_pages(gfp_mask, PGD_ALLOCATION_ORDER);
@@ -243,9 +113,6 @@ void efi_sync_low_kernel_mappings(void)
 	p4d_t *p4d_k, *p4d_efi;
 	pud_t *pud_k, *pud_efi;
 	pgd_t *efi_pgd = efi_mm.pgd;
-
-	if (efi_enabled(EFI_OLD_MEMMAP))
-		return;
 
 	/*
 	 * We can share all PGD entries apart from the one entry that
@@ -338,9 +205,6 @@ int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 	unsigned npages;
 	pgd_t *pgd = efi_mm.pgd;
 
-	if (efi_enabled(EFI_OLD_MEMMAP))
-		return 0;
-
 	/*
 	 * It can happen that the physical address of new_memmap lands in memory
 	 * which is not mapped in the EFI page table. Therefore we need to go
@@ -371,6 +235,15 @@ int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 
 	if (kernel_map_pages_in_pgd(pgd, 0x0, 0x0, 1, pf)) {
 		pr_err("Failed to create 1:1 mapping for the first page!\n");
+		return 1;
+	}
+
+	/*
+	 * When SEV-ES is active, the GHCB as set by the kernel will be used
+	 * by firmware. Create a 1:1 unencrypted mapping for each GHCB.
+	 */
+	if (sev_es_efi_map_ghcbs(pgd)) {
+		pr_err("Failed to create 1:1 mapping for the GHCBs!\n");
 		return 1;
 	}
 
@@ -426,9 +299,6 @@ void __init efi_map_region(efi_memory_desc_t *md)
 	unsigned long size = md->num_pages << PAGE_SHIFT;
 	u64 pa = md->phys_addr;
 
-	if (efi_enabled(EFI_OLD_MEMMAP))
-		return old_map_region(md);
-
 	/*
 	 * Make sure the 1:1 mappings are present as a catch-all for b0rked
 	 * firmware which doesn't update all internal pointers after switching
@@ -483,26 +353,6 @@ void __init efi_map_region_fixed(efi_memory_desc_t *md)
 	__map_region(md, md->virt_addr);
 }
 
-void __iomem *__init efi_ioremap(unsigned long phys_addr, unsigned long size,
-				 u32 type, u64 attribute)
-{
-	unsigned long last_map_pfn;
-
-	if (type == EFI_MEMORY_MAPPED_IO)
-		return ioremap(phys_addr, size);
-
-	last_map_pfn = init_memory_mapping(phys_addr, phys_addr + size);
-	if ((last_map_pfn << PAGE_SHIFT) < phys_addr + size) {
-		unsigned long top = last_map_pfn << PAGE_SHIFT;
-		efi_ioremap(top, size - (top - phys_addr), type, attribute);
-	}
-
-	if (!(attribute & EFI_MEMORY_WB))
-		efi_memory_uc((u64)(unsigned long)__va(phys_addr), size);
-
-	return (void __iomem *)__va(phys_addr);
-}
-
 void __init parse_efi_setup(u64 phys_addr, u32 data_len)
 {
 	efi_setup = phys_addr + sizeof(struct setup_data);
@@ -550,12 +400,6 @@ static int __init efi_update_mem_attr(struct mm_struct *mm, efi_memory_desc_t *m
 void __init efi_runtime_update_mappings(void)
 {
 	efi_memory_desc_t *md;
-
-	if (efi_enabled(EFI_OLD_MEMMAP)) {
-		if (__supported_pte_mask & _PAGE_NX)
-			runtime_code_page_mkexec();
-		return;
-	}
 
 	/*
 	 * Use the EFI Memory Attribute Table for mapping permissions if it
@@ -605,10 +449,7 @@ void __init efi_runtime_update_mappings(void)
 void __init efi_dump_pagetable(void)
 {
 #ifdef CONFIG_EFI_PGT_DUMP
-	if (efi_enabled(EFI_OLD_MEMMAP))
-		ptdump_walk_pgd_level(NULL, swapper_pg_dir);
-	else
-		ptdump_walk_pgd_level(NULL, efi_mm.pgd);
+	ptdump_walk_pgd_level(NULL, efi_mm.pgd);
 #endif
 }
 
@@ -628,63 +469,76 @@ void efi_switch_mm(struct mm_struct *mm)
 	task_unlock(current);
 }
 
-#ifdef CONFIG_EFI_MIXED
 extern efi_status_t efi64_thunk(u32, ...);
 
 static DEFINE_SPINLOCK(efi_runtime_lock);
 
-#define runtime_service32(func)						 \
-({									 \
-	u32 table = (u32)(unsigned long)efi.systab;			 \
-	u32 *rt, *___f;							 \
-									 \
-	rt = (u32 *)(table + offsetof(efi_system_table_32_t, runtime));	 \
-	___f = (u32 *)(*rt + offsetof(efi_runtime_services_32_t, func)); \
-	*___f;								 \
+/*
+ * DS and ES contain user values.  We need to save them.
+ * The 32-bit EFI code needs a valid DS, ES, and SS.  There's no
+ * need to save the old SS: __KERNEL_DS is always acceptable.
+ */
+#define __efi_thunk(func, ...)						\
+({									\
+	efi_runtime_services_32_t *__rt;				\
+	unsigned short __ds, __es;					\
+	efi_status_t ____s;						\
+									\
+	__rt = (void *)(unsigned long)efi.systab->mixed_mode.runtime;	\
+									\
+	savesegment(ds, __ds);						\
+	savesegment(es, __es);						\
+									\
+	loadsegment(ss, __KERNEL_DS);					\
+	loadsegment(ds, __KERNEL_DS);					\
+	loadsegment(es, __KERNEL_DS);					\
+									\
+	____s = efi64_thunk(__rt->func, __VA_ARGS__);			\
+									\
+	loadsegment(ds, __ds);						\
+	loadsegment(es, __es);						\
+									\
+	____s ^= (____s & BIT(31)) | (____s & BIT_ULL(31)) << 32;	\
+	____s;								\
 })
 
 /*
  * Switch to the EFI page tables early so that we can access the 1:1
  * runtime services mappings which are not mapped in any other page
- * tables. This function must be called before runtime_service32().
+ * tables.
  *
  * Also, disable interrupts because the IDT points to 64-bit handlers,
  * which aren't going to function correctly when we switch to 32-bit.
  */
-#define efi_thunk(f, ...)						\
+#define efi_thunk(func...)						\
 ({									\
 	efi_status_t __s;						\
-	u32 __func;							\
 									\
 	arch_efi_call_virt_setup();					\
 									\
-	__func = runtime_service32(f);					\
-	__s = efi64_thunk(__func, __VA_ARGS__);				\
+	__s = __efi_thunk(func);					\
 									\
 	arch_efi_call_virt_teardown();					\
 									\
 	__s;								\
 })
 
-efi_status_t efi_thunk_set_virtual_address_map(
-	void *phys_set_virtual_address_map,
-	unsigned long memory_map_size,
-	unsigned long descriptor_size,
-	u32 descriptor_version,
-	efi_memory_desc_t *virtual_map)
+static efi_status_t __init __no_sanitize_address
+efi_thunk_set_virtual_address_map(unsigned long memory_map_size,
+				  unsigned long descriptor_size,
+				  u32 descriptor_version,
+				  efi_memory_desc_t *virtual_map)
 {
 	efi_status_t status;
 	unsigned long flags;
-	u32 func;
 
 	efi_sync_low_kernel_mappings();
 	local_irq_save(flags);
 
 	efi_switch_mm(&efi_mm);
 
-	func = (u32)(unsigned long)phys_set_virtual_address_map;
-	status = efi64_thunk(func, memory_map_size, descriptor_size,
-			     descriptor_version, virtual_map);
+	status = __efi_thunk(set_virtual_address_map, memory_map_size,
+			     descriptor_size, descriptor_version, virtual_map);
 
 	efi_switch_mm(efi_scratch.prev_mm);
 	local_irq_restore(flags);
@@ -987,8 +841,11 @@ efi_thunk_query_capsule_caps(efi_capsule_header_t **capsules,
 	return EFI_UNSUPPORTED;
 }
 
-void efi_thunk_runtime_setup(void)
+void __init efi_thunk_runtime_setup(void)
 {
+	if (!IS_ENABLED(CONFIG_EFI_MIXED))
+		return;
+
 	efi.get_time = efi_thunk_get_time;
 	efi.set_time = efi_thunk_set_time;
 	efi.get_wakeup_time = efi_thunk_get_wakeup_time;
@@ -1004,24 +861,22 @@ void efi_thunk_runtime_setup(void)
 	efi.update_capsule = efi_thunk_update_capsule;
 	efi.query_capsule_caps = efi_thunk_query_capsule_caps;
 }
-#endif /* CONFIG_EFI_MIXED */
 
-efi_status_t __init efi_set_virtual_address_map(unsigned long memory_map_size,
-						unsigned long descriptor_size,
-						u32 descriptor_version,
-						efi_memory_desc_t *virtual_map)
+efi_status_t __init __no_sanitize_address
+efi_set_virtual_address_map(unsigned long memory_map_size,
+			    unsigned long descriptor_size,
+			    u32 descriptor_version,
+			    efi_memory_desc_t *virtual_map)
 {
 	efi_status_t status;
 	unsigned long flags;
-	pgd_t *save_pgd = NULL;
 
-	if (efi_enabled(EFI_OLD_MEMMAP)) {
-		save_pgd = efi_old_memmap_phys_prolog();
-		if (!save_pgd)
-			return EFI_ABORTED;
-	} else {
-		efi_switch_mm(&efi_mm);
-	}
+	if (efi_is_mixed())
+		return efi_thunk_set_virtual_address_map(memory_map_size,
+							 descriptor_size,
+							 descriptor_version,
+							 virtual_map);
+	efi_switch_mm(&efi_mm);
 
 	kernel_fpu_begin();
 
@@ -1034,10 +889,7 @@ efi_status_t __init efi_set_virtual_address_map(unsigned long memory_map_size,
 
 	kernel_fpu_end();
 
-	if (save_pgd)
-		efi_old_memmap_phys_epilog(save_pgd);
-	else
-		efi_switch_mm(efi_scratch.prev_mm);
+	efi_switch_mm(efi_scratch.prev_mm);
 
 	return status;
 }

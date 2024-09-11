@@ -7,7 +7,7 @@
 
 char _license[] SEC("license") = "GPL";
 
-static inline struct inode *SOCK_INODE(struct socket *socket)
+static __attribute__((noinline)) struct inode *SOCK_INODE(struct socket *socket)
 {
 	return &container_of(socket, struct socket_alloc, socket)->vfs_inode;
 }

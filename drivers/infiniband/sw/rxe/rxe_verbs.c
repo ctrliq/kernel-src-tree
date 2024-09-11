@@ -182,15 +182,16 @@ static void rxe_dealloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 	rxe_drop_ref(pd);
 }
 
-static int rxe_create_ah(struct ib_ah *ibah, struct rdma_ah_attr *attr,
-			 u32 flags, struct ib_udata *udata)
+static int rxe_create_ah(struct ib_ah *ibah,
+			 struct rdma_ah_init_attr *init_attr,
+			 struct ib_udata *udata)
 
 {
 	int err;
 	struct rxe_dev *rxe = to_rdev(ibah->device);
 	struct rxe_ah *ah = to_rah(ibah);
 
-	err = rxe_av_chk_attr(rxe, attr);
+	err = rxe_av_chk_attr(rxe, init_attr->ah_attr);
 	if (err)
 		return err;
 
@@ -198,7 +199,7 @@ static int rxe_create_ah(struct ib_ah *ibah, struct rdma_ah_attr *attr,
 	if (err)
 		return err;
 
-	rxe_init_av(attr, &ah->av);
+	rxe_init_av(init_attr->ah_attr, &ah->av);
 	return 0;
 }
 
@@ -950,7 +951,7 @@ static int rxe_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 }
 
 static struct ib_mr *rxe_alloc_mr(struct ib_pd *ibpd, enum ib_mr_type mr_type,
-				  u32 max_num_sg, struct ib_udata *udata)
+				  u32 max_num_sg)
 {
 	struct rxe_dev *rxe = to_rdev(ibpd->device);
 	struct rxe_pd *pd = to_rpd(ibpd);

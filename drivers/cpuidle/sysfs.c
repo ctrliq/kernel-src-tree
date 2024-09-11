@@ -426,7 +426,7 @@ static ssize_t cpuidle_state_show(struct kobject *kobj, struct attribute *attr,
 	struct cpuidle_state *state = kobj_to_state(kobj);
 	struct cpuidle_state_usage *state_usage = kobj_to_state_usage(kobj);
 	struct rh_cpuidle_state_usage *rh_state_usage = kobj_to_rh_state_usage(kobj);
-	struct cpuidle_state_attr * cattr = attr_to_stateattr(attr);
+	struct cpuidle_state_attr *cattr = attr_to_stateattr(attr);
 	struct rh_cpuidle_state_attr *rh_cattr = attr_to_rh_stateattr(attr);
 
 	if (cattr->show) {

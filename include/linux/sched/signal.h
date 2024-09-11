@@ -10,8 +10,8 @@
 #include <linux/cred.h>
 #include <linux/rh_kabi.h>
 #include <linux/posix-timers.h>
-#include <linux/mm_types.h>
-#include <asm/ptrace.h>
+#include RH_KABI_HIDE_INCLUDE(<linux/mm_types.h>)
+#include RH_KABI_HIDE_INCLUDE(<asm/ptrace.h>)
 
 /*
  * Types defining task->signal and task->sighand and APIs using them:
@@ -665,6 +665,8 @@ static inline int thread_group_empty(struct task_struct *p)
 
 #define delay_group_leader(p) \
 		(thread_group_leader(p) && !thread_group_empty(p))
+
+extern bool thread_group_exited(struct pid *pid);
 
 extern struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 							unsigned long *flags);

@@ -5,6 +5,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <generated/utsrelease.h>
 #include "ice.h"
 #include "ice_base.h"
 #include "ice_lib.h"
@@ -13,15 +14,7 @@
 #include "ice_dcb_nl.h"
 #include "ice_devlink.h"
 
-#define DRV_VERSION_MAJOR 0
-#define DRV_VERSION_MINOR 8
-#define DRV_VERSION_BUILD 2
-
-#define DRV_VERSION	__stringify(DRV_VERSION_MAJOR) "." \
-			__stringify(DRV_VERSION_MINOR) "." \
-			__stringify(DRV_VERSION_BUILD) "-k"
 #define DRV_SUMMARY	"Intel(R) Ethernet Connection E800 Series Linux Driver"
-const char ice_drv_ver[] = DRV_VERSION;
 static const char ice_driver_string[] = DRV_SUMMARY;
 static const char ice_copyright[] = "Copyright (c) 2018, Intel Corporation.";
 
@@ -32,7 +25,6 @@ static const char ice_copyright[] = "Copyright (c) 2018, Intel Corporation.";
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION(DRV_SUMMARY);
 MODULE_LICENSE("GPL v2");
-MODULE_VERSION(DRV_VERSION);
 MODULE_FIRMWARE(ICE_DDP_PKG_FILE);
 
 static int debug = -1;
@@ -377,6 +369,7 @@ static int ice_vsi_sync_fltr(struct ice_vsi *vsi)
 						~IFF_PROMISC;
 					goto out_promisc;
 				}
+				ice_cfg_vlan_pruning(vsi, false, false);
 			}
 		} else {
 			/* Clear Rx filter to remove traffic from wire */
@@ -389,6 +382,8 @@ static int ice_vsi_sync_fltr(struct ice_vsi *vsi)
 						IFF_PROMISC;
 					goto out_promisc;
 				}
+				if (vsi->num_vlan > 1)
+					ice_cfg_vlan_pruning(vsi, true, false);
 			}
 		}
 	}
@@ -1027,6 +1022,151 @@ ice_handle_link_event(struct ice_pf *pf, struct ice_rq_event_info *event)
 	return status;
 }
 
+enum ice_aq_task_state {
+	ICE_AQ_TASK_WAITING = 0,
+	ICE_AQ_TASK_COMPLETE,
+	ICE_AQ_TASK_CANCELED,
+};
+
+struct ice_aq_task {
+	struct hlist_node entry;
+
+	u16 opcode;
+	struct ice_rq_event_info *event;
+	enum ice_aq_task_state state;
+};
+
+/**
+ * ice_wait_for_aq_event - Wait for an AdminQ event from firmware
+ * @pf: pointer to the PF private structure
+ * @opcode: the opcode to wait for
+ * @timeout: how long to wait, in jiffies
+ * @event: storage for the event info
+ *
+ * Waits for a specific AdminQ completion event on the ARQ for a given PF. The
+ * current thread will be put to sleep until the specified event occurs or
+ * until the given timeout is reached.
+ *
+ * To obtain only the descriptor contents, pass an event without an allocated
+ * msg_buf. If the complete data buffer is desired, allocate the
+ * event->msg_buf with enough space ahead of time.
+ *
+ * Returns: zero on success, or a negative error code on failure.
+ */
+int ice_aq_wait_for_event(struct ice_pf *pf, u16 opcode, unsigned long timeout,
+			  struct ice_rq_event_info *event)
+{
+	struct ice_aq_task *task;
+	long ret;
+	int err;
+
+	task = kzalloc(sizeof(*task), GFP_KERNEL);
+	if (!task)
+		return -ENOMEM;
+
+	INIT_HLIST_NODE(&task->entry);
+	task->opcode = opcode;
+	task->event = event;
+	task->state = ICE_AQ_TASK_WAITING;
+
+	spin_lock_bh(&pf->aq_wait_lock);
+	hlist_add_head(&task->entry, &pf->aq_wait_list);
+	spin_unlock_bh(&pf->aq_wait_lock);
+
+	ret = wait_event_interruptible_timeout(pf->aq_wait_queue, task->state,
+					       timeout);
+	switch (task->state) {
+	case ICE_AQ_TASK_WAITING:
+		err = ret < 0 ? ret : -ETIMEDOUT;
+		break;
+	case ICE_AQ_TASK_CANCELED:
+		err = ret < 0 ? ret : -ECANCELED;
+		break;
+	case ICE_AQ_TASK_COMPLETE:
+		err = ret < 0 ? ret : 0;
+		break;
+	default:
+		WARN(1, "Unexpected AdminQ wait task state %u", task->state);
+		err = -EINVAL;
+		break;
+	}
+
+	spin_lock_bh(&pf->aq_wait_lock);
+	hlist_del(&task->entry);
+	spin_unlock_bh(&pf->aq_wait_lock);
+	kfree(task);
+
+	return err;
+}
+
+/**
+ * ice_aq_check_events - Check if any thread is waiting for an AdminQ event
+ * @pf: pointer to the PF private structure
+ * @opcode: the opcode of the event
+ * @event: the event to check
+ *
+ * Loops over the current list of pending threads waiting for an AdminQ event.
+ * For each matching task, copy the contents of the event into the task
+ * structure and wake up the thread.
+ *
+ * If multiple threads wait for the same opcode, they will all be woken up.
+ *
+ * Note that event->msg_buf will only be duplicated if the event has a buffer
+ * with enough space already allocated. Otherwise, only the descriptor and
+ * message length will be copied.
+ *
+ * Returns: true if an event was found, false otherwise
+ */
+static void ice_aq_check_events(struct ice_pf *pf, u16 opcode,
+				struct ice_rq_event_info *event)
+{
+	struct ice_aq_task *task;
+	bool found = false;
+
+	spin_lock_bh(&pf->aq_wait_lock);
+	hlist_for_each_entry(task, &pf->aq_wait_list, entry) {
+		if (task->state || task->opcode != opcode)
+			continue;
+
+		memcpy(&task->event->desc, &event->desc, sizeof(event->desc));
+		task->event->msg_len = event->msg_len;
+
+		/* Only copy the data buffer if a destination was set */
+		if (task->event->msg_buf &&
+		    task->event->buf_len > event->buf_len) {
+			memcpy(task->event->msg_buf, event->msg_buf,
+			       event->buf_len);
+			task->event->buf_len = event->buf_len;
+		}
+
+		task->state = ICE_AQ_TASK_COMPLETE;
+		found = true;
+	}
+	spin_unlock_bh(&pf->aq_wait_lock);
+
+	if (found)
+		wake_up(&pf->aq_wait_queue);
+}
+
+/**
+ * ice_aq_cancel_waiting_tasks - Immediately cancel all waiting tasks
+ * @pf: the PF private structure
+ *
+ * Set all waiting tasks to ICE_AQ_TASK_CANCELED, and wake up their threads.
+ * This will then cause ice_aq_wait_for_event to exit with -ECANCELED.
+ */
+static void ice_aq_cancel_waiting_tasks(struct ice_pf *pf)
+{
+	struct ice_aq_task *task;
+
+	spin_lock_bh(&pf->aq_wait_lock);
+	hlist_for_each_entry(task, &pf->aq_wait_list, entry)
+		task->state = ICE_AQ_TASK_CANCELED;
+	spin_unlock_bh(&pf->aq_wait_lock);
+
+	wake_up(&pf->aq_wait_queue);
+}
+
 /**
  * __ice_clean_ctrlq - helper function to clean controlq rings
  * @pf: ptr to struct ice_pf
@@ -1122,6 +1262,9 @@ static int __ice_clean_ctrlq(struct ice_pf *pf, enum ice_ctl_q q_type)
 		}
 
 		opcode = le16_to_cpu(event.desc.opcode);
+
+		/* Notify any thread that might be waiting for this event */
+		ice_aq_check_events(pf, opcode, &event);
 
 		switch (opcode) {
 		case ice_aqc_opc_get_link_status:
@@ -2405,9 +2548,6 @@ static int ice_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 	switch (xdp->command) {
 	case XDP_SETUP_PROG:
 		return ice_xdp_setup_prog(vsi, xdp->prog, xdp->extack);
-	case XDP_QUERY_PROG:
-		xdp->prog_id = vsi->xdp_prog ? vsi->xdp_prog->aux->id : 0;
-		return 0;
 	case XDP_SETUP_XSK_UMEM:
 		return ice_xsk_umem_setup(vsi, xdp->xsk.umem,
 					  xdp->xsk.queue_id);
@@ -2812,7 +2952,7 @@ static int ice_cfg_netdev(struct ice_vsi *vsi)
 	u8 mac_addr[ETH_ALEN];
 	int err;
 
-	err = ice_devlink_create_port(pf);
+	err = ice_devlink_create_port(vsi);
 	if (err)
 		return err;
 
@@ -2853,7 +2993,7 @@ static int ice_cfg_netdev(struct ice_vsi *vsi)
 	if (err)
 		goto err_free_netdev;
 
-	devlink_port_type_eth_set(&pf->devlink_port, vsi->netdev);
+	devlink_port_type_eth_set(&vsi->devlink_port, vsi->netdev);
 
 	netif_carrier_off(vsi->netdev);
 
@@ -2866,7 +3006,7 @@ err_free_netdev:
 	free_netdev(vsi->netdev);
 	vsi->netdev = NULL;
 err_destroy_devlink_port:
-	ice_devlink_destroy_port(pf);
+	ice_devlink_destroy_port(vsi);
 	return err;
 }
 
@@ -3194,6 +3334,10 @@ static int ice_init_pf(struct ice_pf *pf)
 
 	mutex_init(&pf->sw_mutex);
 	mutex_init(&pf->tc_mutex);
+
+	INIT_HLIST_HEAD(&pf->aq_wait_list);
+	spin_lock_init(&pf->aq_wait_lock);
+	init_waitqueue_head(&pf->aq_wait_queue);
 
 	/* setup service timer and periodic service task */
 	timer_setup(&pf->serv_tmr, ice_service_timer, 0);
@@ -3655,11 +3799,11 @@ static enum ice_status ice_send_version(struct ice_pf *pf)
 {
 	struct ice_driver_ver dv;
 
-	dv.major_ver = DRV_VERSION_MAJOR;
-	dv.minor_ver = DRV_VERSION_MINOR;
-	dv.build_ver = DRV_VERSION_BUILD;
+	dv.major_ver = 0xff;
+	dv.minor_ver = 0xff;
+	dv.build_ver = 0xff;
 	dv.subbuild_ver = 0;
-	strscpy((char *)dv.driver_string, DRV_VERSION,
+	strscpy((char *)dv.driver_string, UTS_RELEASE,
 		sizeof(dv.driver_string));
 	return ice_aq_send_driver_ver(&pf->hw, &dv, NULL);
 }
@@ -3975,8 +4119,8 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 	err = ice_send_version(pf);
 	if (err) {
 		dev_err(dev, "probe failed sending driver version %s. error: %d\n",
-			ice_drv_ver, err);
-		goto err_alloc_sw_unroll;
+			UTS_RELEASE, err);
+		goto err_send_version_unroll;
 	}
 
 	/* since everything is good, start the service timer */
@@ -3985,19 +4129,19 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 	err = ice_init_link_events(pf->hw.port_info);
 	if (err) {
 		dev_err(dev, "ice_init_link_events failed: %d\n", err);
-		goto err_alloc_sw_unroll;
+		goto err_send_version_unroll;
 	}
 
 	err = ice_init_nvm_phy_type(pf->hw.port_info);
 	if (err) {
 		dev_err(dev, "ice_init_nvm_phy_type failed: %d\n", err);
-		goto err_alloc_sw_unroll;
+		goto err_send_version_unroll;
 	}
 
 	err = ice_update_link_info(pf->hw.port_info);
 	if (err) {
 		dev_err(dev, "ice_update_link_info failed: %d\n", err);
-		goto err_alloc_sw_unroll;
+		goto err_send_version_unroll;
 	}
 
 	ice_init_link_dflt_override(pf->hw.port_info);
@@ -4008,7 +4152,7 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 		err = ice_init_phy_user_cfg(pf->hw.port_info);
 		if (err) {
 			dev_err(dev, "ice_init_phy_user_cfg failed: %d\n", err);
-			goto err_alloc_sw_unroll;
+			goto err_send_version_unroll;
 		}
 
 		if (!test_bit(ICE_FLAG_LINK_DOWN_ON_CLOSE_ENA, pf->flags)) {
@@ -4062,8 +4206,9 @@ probe_done:
 	clear_bit(__ICE_DOWN, pf->state);
 	return 0;
 
+err_send_version_unroll:
+	ice_vsi_release_all(pf);
 err_alloc_sw_unroll:
-	ice_devlink_destroy_port(pf);
 	set_bit(__ICE_SERVICE_DIS, pf->state);
 	set_bit(__ICE_DOWN, pf->state);
 	devm_kfree(dev, pf->first_sw);
@@ -4172,11 +4317,12 @@ static void ice_remove(struct pci_dev *pdev)
 	set_bit(__ICE_DOWN, pf->state);
 	ice_service_task_stop(pf);
 
+	ice_aq_cancel_waiting_tasks(pf);
+
 	mutex_destroy(&(&pf->hw)->fdir_fltr_lock);
 	if (!ice_is_safe_mode(pf))
 		ice_remove_arfs(pf);
 	ice_setup_mc_magic_wake(pf);
-	ice_devlink_destroy_port(pf);
 	ice_vsi_release_all(pf);
 	ice_set_wake(pf);
 	ice_free_irq_msix_misc(pf);
@@ -4623,7 +4769,7 @@ static int __init ice_module_init(void)
 {
 	int status;
 
-	pr_info("%s - version %s\n", ice_driver_string, ice_drv_ver);
+	pr_info("%s\n", ice_driver_string);
 	pr_info("%s\n", ice_copyright);
 
 	ice_wq = alloc_workqueue("%s", WQ_MEM_RECLAIM, 0, KBUILD_MODNAME);

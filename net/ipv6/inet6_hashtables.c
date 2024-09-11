@@ -204,19 +204,11 @@ struct sock *inet6_lookup_listener(struct net *net,
 {
 	unsigned int hash = inet_lhashfn(net, hnum);
 	struct inet_listen_hashbucket *ilb = &hashinfo->listening_hash[hash];
-	bool exact_dif = inet6_exact_dif_match(net, skb);
 	struct inet_listen_hashbucket *ilb2;
 	struct sock *sk, *result = NULL;
 	int score, hiscore = 0;
 	unsigned int hash2;
 	u32 phash = 0;
-
-	if (ilb->count <= 10 || !hashinfo->lhash2)
-		goto port_lookup;
-
-	/* Too many sk in the ilb bucket (which is hashed by port alone).
-	 * Try lhash2 (which is hashed by port and addr) instead.
-	 */
 
 	/* Lookup redirect from BPF */
 	if (static_branch_unlikely(&bpf_sk_lookup_enabled)) {
@@ -225,6 +217,13 @@ struct sock *inet6_lookup_listener(struct net *net,
 		if (result)
 			goto done;
 	}
+
+	if (ilb->count <= 10 || !hashinfo->lhash2)
+		goto port_lookup;
+
+	/* Too many sk in the ilb bucket (which is hashed by port alone).
+	 * Try lhash2 (which is hashed by port and addr) instead.
+	 */
 
 	hash2 = ipv6_portaddr_hash(net, daddr, hnum);
 	ilb2 = inet_lhash2_bucket(hashinfo, hash2);
@@ -251,7 +250,7 @@ struct sock *inet6_lookup_listener(struct net *net,
 
 port_lookup:
 	sk_for_each(sk, &ilb->head) {
-		score = compute_score(sk, net, hnum, daddr, dif, sdif, exact_dif);
+		score = compute_score(sk, net, hnum, daddr, dif, sdif);
 		if (score > hiscore) {
 			if (sk->sk_reuseport) {
 				phash = inet6_ehashfn(net, daddr, hnum,
@@ -266,7 +265,7 @@ port_lookup:
 		}
 	}
 done:
-	if (IS_ERR(result))
+	if (unlikely(IS_ERR(result)))
 		return NULL;
 	return result;
 }

@@ -37,6 +37,7 @@
 #include <asm/cpacf.h>
 
 DEFINE_STATIC_KEY_FALSE(s390_arch_random_available);
+EXPORT_SYMBOL(s390_arch_random_available);
 
 atomic64_t s390_arch_random_counter = ATOMIC64_INIT(0);
 EXPORT_SYMBOL(s390_arch_random_counter);
@@ -107,8 +108,8 @@ static void arch_rng_refill_buffer(struct work_struct *unused)
  * prepared in an 4K buffer which is filled from the NIST 800-90
  * compliant s390 drbg. By default the random long buffer is refilled
  * 256 times before the drbg itself needs a reseed. The reseed of the
- * drbg is done with 32 bytes fetched from the high quality (but slow)
- * trng which is assumed to deliver 100% entropy. So the 32 * 8 = 256
+ * drbg is done with 64 bytes fetched from the high quality (but slow)
+ * trng which is assumed to deliver 100% entropy. So the 64 * 8 = 512
  * bits of entropy are spread over 256 * 4KB = 1MB serving 131072
  * arch_get_random_long() invocations before reseeded.
  *
@@ -122,12 +123,12 @@ static void arch_rng_refill_buffer(struct work_struct *unused)
  * it is re-seeded by fresh entropy from the trng.
  * A value of 16 results in reseeding the drbg at every 16 * 4 KB = 64
  * KB with 32 bytes of fresh entropy pulled from the trng. So a value
- * of 16 would result in 256 bits entropy per 64 KB.
+ * of 16 would result in 512 bits entropy per 64 KB.
  * A value of 256 results in 1MB of drbg output before a reseed of the
- * drbg is done. So this would spread the 256 bits of entropy among 1MB.
+ * drbg is done. So this would spread the 512 bits of entropy among 1MB.
  * Setting this parameter to 0 forces the reseed to take place every
- * time the 4K buffer is depleted, so the entropy rises to 256 bits
- * entropy per 4K or 0.5 bit entropy per arch_get_random_long().  With
+ * time the 4K buffer is depleted, so the entropy rises to 512 bits
+ * entropy per 4K or 1 bit entropy per arch_get_random_long(). With
  * setting this parameter to negative values all this effort is
  * disabled, arch_get_random long() returns false and thus indicating
  * that the arch_get_random_long() feature is disabled at all.
@@ -148,7 +149,7 @@ static inline void refill_rndlong_buf(void)
 
 	if (--drbg_counter < 0) {
 		/* need to re-seed the drbg */
-		u8 seed[32];
+		u8 seed[64];
 
 		/* fetch seed from trng */
 		cpacf_trng(NULL, 0, seed, sizeof(seed));

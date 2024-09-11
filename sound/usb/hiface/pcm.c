@@ -159,7 +159,7 @@ static int hiface_pcm_set_rate(struct pcm_runtime *rt, unsigned int rate)
 	ret = usb_control_msg_send(device, 0,
 				   HIFACE_SET_RATE_REQUEST,
 				   USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_OTHER,
-				   rate_value, 0, NULL, 0, 100);
+				   rate_value, 0, NULL, 0, 100, GFP_KERNEL);
 	if (ret)
 		dev_err(&device->dev, "Error setting samplerate %d.\n", rate);
 

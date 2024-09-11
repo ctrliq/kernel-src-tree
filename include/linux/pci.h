@@ -379,6 +379,12 @@ struct pci_dev {
 						   Retrain Link bit manually */
 	RH_KABI_FILL_HOLE(unsigned int  skip_bus_pm:1)  /* Internal: Skip
 								bus-level PM */
+	/*
+	 * Info from the platform, e.g., ACPI or device tree, may mark a
+	 * device as "external-facing".  An external-facing device is
+	 * itself internal but devices downstream from it are external.
+	 */
+	RH_KABI_FILL_HOLE(unsigned int	external_facing:1)
 	unsigned int	d3_delay;	/* D3->D0 transition time in ms */
 	unsigned int	d3cold_delay;	/* D3cold->D0 transition time in ms */
 
@@ -454,6 +460,7 @@ struct pci_dev {
 #ifdef CONFIG_PCIE_DPC
 	RH_KABI_FILL_HOLE(unsigned int	dpc_rp_extensions:1)
 #endif
+        RH_KABI_FILL_HOLE(unsigned int  no_command_memory:1)    /* No PCI_COMMAND_MEMORY */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -1464,6 +1471,10 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
 const struct pci_device_id *pci_hw_vendor_status(
 						const struct pci_device_id *ids,
 						struct pci_dev *dev);
+void check_unsupported_pci_hardware(const struct pci_device_id *removed_ids,
+	struct pci_dev *dev);
+
+
 int pci_scan_bridge(struct pci_bus *bus, struct pci_dev *dev, int max,
 		    int pass);
 
@@ -2458,6 +2469,9 @@ void pci_uevent_ers(struct pci_dev *pdev, enum  pci_ers_result err_type);
 #define pci_notice(pdev, fmt, arg...)	dev_notice(&(pdev)->dev, fmt, ##arg)
 #define pci_info(pdev, fmt, arg...)	dev_info(&(pdev)->dev, fmt, ##arg)
 #define pci_dbg(pdev, fmt, arg...)	dev_dbg(&(pdev)->dev, fmt, ##arg)
+
+#define pci_notice_ratelimited(pdev, fmt, arg...) \
+	dev_notice_ratelimited(&(pdev)->dev, fmt, ##arg)
 
 #define pci_info_ratelimited(pdev, fmt, arg...) \
 	dev_info_ratelimited(&(pdev)->dev, fmt, ##arg)

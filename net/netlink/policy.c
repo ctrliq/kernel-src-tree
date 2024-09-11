@@ -251,7 +251,7 @@ send_attribute:
 	case NLA_BITFIELD32:
 		type = NL_ATTR_TYPE_BITFIELD32;
 		if (nla_put_u32(skb, NL_POLICY_TYPE_ATTR_BITFIELD32_MASK,
-				pt->bitfield32_valid))
+				*pt->bitfield32_valid_ptr))
 			goto nla_put_failure;
 		break;
 	case NLA_EXACT_LEN:

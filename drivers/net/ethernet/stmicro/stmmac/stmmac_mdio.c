@@ -1,10 +1,20 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*******************************************************************************
   STMMAC Ethernet Driver -- MDIO bus implementation
   Provides Bus interface for MII registers
 
   Copyright (C) 2007-2009  STMicroelectronics Ltd
 
+  This program is free software; you can redistribute it and/or modify it
+  under the terms and conditions of the GNU General Public License,
+  version 2, as published by the Free Software Foundation.
+
+  This program is distributed in the hope it will be useful, but WITHOUT
+  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+  more details.
+
+  The full GNU General Public License is included in this distribution in
+  the file called "COPYING".
 
   Author: Carl Shaw <carl.shaw@st.com>
   Maintainer: Giuseppe Cavallaro <peppe.cavallaro@st.com>
@@ -382,7 +392,17 @@ int stmmac_mdio_register(struct net_device *ndev)
 		max_addr = PHY_MAX_ADDR;
 	}
 
-	new_bus->reset = &stmmac_mdio_reset;
+	if (mdio_bus_data->has_xpcs) {
+		priv->hw->xpcs = mdio_xpcs_get_ops();
+		if (!priv->hw->xpcs) {
+			err = -ENODEV;
+			goto bus_register_fail;
+		}
+	}
+
+	if (mdio_bus_data->needs_reset)
+		new_bus->reset = &stmmac_mdio_reset;
+
 	snprintf(new_bus->id, MII_BUS_ID_SIZE, "%s-%x",
 		 new_bus->name, priv->plat->bus_id);
 	new_bus->priv = ndev;
@@ -429,6 +449,25 @@ int stmmac_mdio_register(struct net_device *ndev)
 
 		phy_attached_info(phydev);
 		found = 1;
+	}
+
+	/* Try to probe the XPCS by scanning all addresses. */
+	if (priv->hw->xpcs) {
+		struct mdio_xpcs_args *xpcs = &priv->hw->xpcs_args;
+		int ret, mode = priv->plat->phy_interface;
+		max_addr = PHY_MAX_ADDR;
+
+		xpcs->bus = new_bus;
+
+		for (addr = 0; addr < max_addr; addr++) {
+			xpcs->addr = addr;
+
+			ret = stmmac_xpcs_probe(priv, xpcs, mode);
+			if (!ret) {
+				found = 1;
+				break;
+			}
+		}
 	}
 
 	if (!found && !mdio_node) {

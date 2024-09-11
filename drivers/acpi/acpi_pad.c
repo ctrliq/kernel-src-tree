@@ -25,6 +25,7 @@
 #include <linux/cpu.h>
 #include <linux/tick.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 #include <linux/acpi.h>
 #include <asm/mwait.h>
 #include <xen/xen.h>
@@ -95,7 +96,7 @@ static void round_robin_cpu(unsigned int tsk_index)
 	cpumask_var_t tmp;
 	int cpu;
 	unsigned long min_weight = -1;
-	unsigned long preferred_cpu;
+	unsigned long preferred_cpu = (unsigned long)smp_processor_id() ;
 
 	if (!alloc_cpumask_var(&tmp, GFP_KERNEL))
 		return;

@@ -24,6 +24,7 @@
 #include <linux/mpage.h>
 #include <linux/user_namespace.h>
 #include <linux/seq_file.h>
+#include <linux/genhd.h>
 
 #include "isofs.h"
 #include "zisofs.h"

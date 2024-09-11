@@ -190,7 +190,7 @@ int mlx5e_tc_tun_create_header_ipv4(struct mlx5e_priv *priv,
 	const struct ip_tunnel_key *tun_key = &e->tun_info->key;
 	struct net_device *out_dev, *route_dev;
 	struct flowi4 fl4 = {};
-	struct neighbour *n;
+	struct neighbour *n = NULL;
 	int ipv4_encap_size;
 	char *encap_header;
 	u8 nud_state, ttl;
@@ -565,8 +565,8 @@ int mlx5e_tc_tun_parse(struct net_device *filter_dev,
 				 ntohl(match.key->dst));
 
 			key_basic.n_proto = htons(ETH_P_IP);
-			mlx5e_tc_set_ethertype(headers_c, headers_v,
-					       &match_basic);
+			mlx5e_tc_set_ethertype(priv->mdev, &match_basic, true,
+					       headers_c, headers_v);
 		} else if (addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
 			struct flow_match_ipv6_addrs match;
 
@@ -590,8 +590,8 @@ int mlx5e_tc_tun_parse(struct net_device *filter_dev,
 								  ipv6));
 
 			key_basic.n_proto = htons(ETH_P_IPV6);
-			mlx5e_tc_set_ethertype(headers_c, headers_v,
-					       &match_basic);
+			mlx5e_tc_set_ethertype(priv->mdev, &match_basic, true,
+					       headers_c, headers_v);
 		}
 	}
 

@@ -182,6 +182,7 @@ enum {
 	NLA_BITFIELD32,
 	NLA_REJECT,
 	NLA_EXACT_LEN,
+	NLA_EXACT_LEN_WARN,
 	NLA_MIN_LEN,
 	__NLA_TYPE_MAX,
 };
@@ -201,8 +202,11 @@ enum nla_policy_validation {
 	NLA_VALIDATE_RANGE,
 	NLA_VALIDATE_MIN,
 	NLA_VALIDATE_MAX,
-	NLA_VALIDATE_RANGE_PTR,
 	NLA_VALIDATE_FUNCTION,
+	/* RHEL: any new enumerants need to be placed at the end to preserve
+	 * KABI for older kernel modules.
+	*/
+	NLA_VALIDATE_RANGE_PTR,
 	NLA_VALIDATE_WARN_TOO_LONG,
 };
 
@@ -241,12 +245,15 @@ enum nla_policy_validation {
  *                         it is rejected or warned about, the latter happening
  *                         if and only if the `validation_type' is set to
  *                         NLA_VALIDATE_WARN_TOO_LONG.
+ *    NLA_EXACT_LEN_WARN   Deprecated, to preserve the numerical values
+ *                         of the successors in kabi.
  *    NLA_MIN_LEN          Minimum length of attribute payload
  *    All other            Minimum length of attribute payload
  *
  * Meaning of validation union:
  *    NLA_BITFIELD32       This is a 32-bit bitmap/bitselector attribute and
- *                         `bitfield32_valid' is the u32 value of valid flags
+ *                         `bitfield32_valid_ptr' points to u32 value of valid
+ *                         flags.
  *    NLA_REJECT           This attribute is always rejected and `reject_message'
  *                         may point to a string to report as the error instead
  *                         of the generic one in extended ACK.
@@ -310,7 +317,7 @@ enum nla_policy_validation {
  * 	[ATTR_FOO] = { .type = NLA_U16 },
  *	[ATTR_BAR] = { .type = NLA_STRING, .len = BARSIZ },
  *	[ATTR_BAZ] = { .type = NLA_EXACT_LEN, .len = sizeof(struct mystruct) },
- *	[ATTR_GOO] = NLA_POLICY_BITFIELD32(myvalidflags),
+ *	[ATTR_GOO] = NLA_POLICY_BITFIELD32_PTR(&myvalidflags),
  * };
  */
 struct nla_policy {
@@ -328,7 +335,12 @@ struct nla_policy {
 	void		*validation_data;
 #else
 	union {
-		const u32 bitfield32_valid;
+		/* RHEL: Older binary modules expected validation_data pointer.
+		 * To preserve backward compatibility we use u32*
+		 * bitfield32_valid_ptr instead of upstream u32
+		 * bitfield32_valid. Old modules can safe dereference it.
+		 */
+		const u32 *bitfield32_valid_ptr;
 		const char *reject_message;
 		const struct nla_policy *nested_policy;
 		struct netlink_range_validation *range;
@@ -364,7 +376,7 @@ struct nla_policy {
  * to the end of the struct, like the original field.
  */
 static_assert(offsetofend(struct nla_policy,
-			  validation_data) == sizeof(struct nla_policy),
+			  bitfield32_valid_ptr) == sizeof(struct nla_policy),
 	      "The size of struct nla_policy is fixed and cannot be changed");
 
 #define NLA_POLICY_EXACT_LEN(_len)	{ .type = NLA_EXACT_LEN, .len = _len }
@@ -384,8 +396,8 @@ static_assert(offsetofend(struct nla_policy,
 	_NLA_POLICY_NESTED(ARRAY_SIZE(policy) - 1, policy)
 #define NLA_POLICY_NESTED_ARRAY(policy) \
 	_NLA_POLICY_NESTED_ARRAY(ARRAY_SIZE(policy) - 1, policy)
-#define NLA_POLICY_BITFIELD32(valid) \
-	{ .type = NLA_BITFIELD32, .bitfield32_valid = valid }
+#define NLA_POLICY_BITFIELD32_PTR(valid) \
+	{ .type = NLA_BITFIELD32, .bitfield32_valid_ptr = valid }
 
 #define __NLA_ENSURE(condition) BUILD_BUG_ON_ZERO(!(condition))
 #define NLA_ENSURE_UINT_TYPE(tp)			\

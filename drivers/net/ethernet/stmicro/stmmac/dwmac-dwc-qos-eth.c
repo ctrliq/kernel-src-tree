@@ -344,6 +344,9 @@ static void *tegra_eqos_probe(struct platform_device *pdev,
 	usleep_range(2000, 4000);
 	gpiod_set_value(eqos->reset, 0);
 
+	/* MDIO bus was already reset just above */
+	data->mdio_bus_data->needs_reset = false;
+
 	eqos->rst = devm_reset_control_get(&pdev->dev, "eqos");
 	if (IS_ERR(eqos->rst)) {
 		err = PTR_ERR(eqos->rst);
@@ -439,13 +442,8 @@ static int dwc_eth_dwmac_probe(struct platform_device *pdev)
 	 * resource initialization is done in the glue logic.
 	 */
 	stmmac_res.irq = platform_get_irq(pdev, 0);
-	if (stmmac_res.irq < 0) {
-		if (stmmac_res.irq != -EPROBE_DEFER)
-			dev_err(&pdev->dev,
-				"IRQ configuration information not found\n");
-
+	if (stmmac_res.irq < 0)
 		return stmmac_res.irq;
-	}
 	stmmac_res.wol_irq = stmmac_res.irq;
 
 	stmmac_res.addr = devm_platform_ioremap_resource(pdev, 0);

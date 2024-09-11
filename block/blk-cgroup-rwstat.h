@@ -8,26 +8,6 @@
 
 #include <linux/blk-cgroup.h>
 
-enum blkg_rwstat_type {
-	BLKG_RWSTAT_READ,
-	BLKG_RWSTAT_WRITE,
-	BLKG_RWSTAT_SYNC,
-	BLKG_RWSTAT_ASYNC,
-	BLKG_RWSTAT_DISCARD,
-
-	BLKG_RWSTAT_NR,
-	BLKG_RWSTAT_TOTAL = BLKG_RWSTAT_NR,
-};
-
-/*
- * blkg_[rw]stat->aux_cnt is excluded for local stats but included for
- * recursive.  Used to carry stats of dead children.
- */
-struct blkg_rwstat {
-	struct percpu_counter		cpu_cnt[BLKG_RWSTAT_NR];
-	atomic64_t			aux_cnt[BLKG_RWSTAT_NR];
-};
-
 struct blkg_rwstat_sample {
 	u64				cnt[BLKG_RWSTAT_NR];
 };

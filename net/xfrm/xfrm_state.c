@@ -1410,7 +1410,8 @@ static struct xfrm_state *xfrm_state_clone(struct xfrm_state *orig,
 	}
 
 	memcpy(&x->mark, &orig->mark, sizeof(x->mark));
-	memcpy(&x->props.smark, &orig->props.smark, sizeof(x->props.smark));
+	x->props.output_mark = orig->props.output_mark;
+	x->output_mark_mask = orig->output_mark_mask;
 
 	if (xfrm_init_state(x) < 0)
 		goto error;

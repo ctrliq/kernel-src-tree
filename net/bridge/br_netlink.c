@@ -1171,13 +1171,8 @@ static int br_changelink(struct net_device *brdev, struct nlattr *tb[],
 		br_warn(br, "the hash_elasticity option has been deprecated and is always %u\n",
 			RHT_ELASTICITY);
 
-	if (data[IFLA_BR_MCAST_HASH_MAX]) {
-		u32 hash_max = nla_get_u32(data[IFLA_BR_MCAST_HASH_MAX]);
-
-		err = br_multicast_set_hash_max(br, hash_max);
-		if (err)
-			return err;
-	}
+	if (data[IFLA_BR_MCAST_HASH_MAX])
+		br->hash_max = nla_get_u32(data[IFLA_BR_MCAST_HASH_MAX]);
 
 	if (data[IFLA_BR_MCAST_LAST_MEMBER_CNT]) {
 		u32 val = nla_get_u32(data[IFLA_BR_MCAST_LAST_MEMBER_CNT]);

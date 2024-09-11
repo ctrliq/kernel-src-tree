@@ -11,6 +11,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/skbuff.h>
+#include <linux/rh_features.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_vlan.h>
 #include <net/netlink.h>
@@ -197,6 +198,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 			push_prio = nla_get_u8(tb[TCA_VLAN_PUSH_VLAN_PRIORITY]);
 		break;
 	case TCA_VLAN_ACT_POP_ETH:
+		rh_mark_used_feature("act_vlan/pop_eth");
 		break;
 	case TCA_VLAN_ACT_PUSH_ETH:
 		if (!tb[TCA_VLAN_PUSH_ETH_DST] || !tb[TCA_VLAN_PUSH_ETH_SRC]) {
@@ -206,6 +208,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 				tcf_idr_cleanup(tn, index);
 			return -EINVAL;
 		}
+		rh_mark_used_feature("act_vlan/push_eth");
 		break;
 	default:
 		if (exists)
@@ -344,13 +347,13 @@ static int tcf_vlan_walker(struct net *net, struct sk_buff *skb,
 	return tcf_generic_walker(tn, skb, cb, type, ops, extack);
 }
 
-static void tcf_vlan_stats_update(struct tc_action *a, u64 bytes, u32 packets,
-				  u64 lastuse, bool hw)
+static void tcf_vlan_stats_update(struct tc_action *a, u64 bytes, u64 packets,
+				  u64 drops, u64 lastuse, bool hw)
 {
 	struct tcf_vlan *v = to_vlan(a);
 	struct tcf_t *tm = &v->tcf_tm;
 
-	tcf_action_update_stats(a, bytes, packets, false, hw);
+	tcf_action_update_stats(a, bytes, packets, drops, hw);
 	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
 }
 

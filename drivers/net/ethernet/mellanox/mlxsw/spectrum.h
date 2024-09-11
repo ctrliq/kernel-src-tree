@@ -684,11 +684,11 @@ static inline unsigned int
 mlxsw_sp_kvdl_entry_size(enum mlxsw_sp_kvdl_entry_type type)
 {
 	switch (type) {
-	case MLXSW_SP_KVDL_ENTRY_TYPE_ADJ: /* fall through */
-	case MLXSW_SP_KVDL_ENTRY_TYPE_ACTSET: /* fall through */
-	case MLXSW_SP_KVDL_ENTRY_TYPE_PBS: /* fall through */
-	case MLXSW_SP_KVDL_ENTRY_TYPE_MCRIGR: /* fall through */
-	case MLXSW_SP_KVDL_ENTRY_TYPE_TNUMT: /* fall through */
+	case MLXSW_SP_KVDL_ENTRY_TYPE_ADJ:
+	case MLXSW_SP_KVDL_ENTRY_TYPE_ACTSET:
+	case MLXSW_SP_KVDL_ENTRY_TYPE_PBS:
+	case MLXSW_SP_KVDL_ENTRY_TYPE_MCRIGR:
+	case MLXSW_SP_KVDL_ENTRY_TYPE_TNUMT:
 	default:
 		return 1;
 	}
@@ -738,8 +738,10 @@ struct mlxsw_sp_acl_rule_info {
 	u8 action_created:1,
 	   ingress_bind_blocker:1,
 	   egress_bind_blocker:1,
-	   counter_valid:1;
+	   counter_valid:1,
+	   policer_index_valid:1;
 	unsigned int counter_index;
+	u16 policer_index;
 };
 
 /* spectrum_flow.c */
@@ -900,6 +902,10 @@ int mlxsw_sp_acl_rulei_act_mangle(struct mlxsw_sp *mlxsw_sp,
 				  enum flow_action_mangle_base htype,
 				  u32 offset, u32 mask, u32 val,
 				  struct netlink_ext_ack *extack);
+int mlxsw_sp_acl_rulei_act_police(struct mlxsw_sp *mlxsw_sp,
+				  struct mlxsw_sp_acl_rule_info *rulei,
+				  u32 index, u64 rate_bytes_ps,
+				  u32 burst, struct netlink_ext_ack *extack);
 int mlxsw_sp_acl_rulei_act_count(struct mlxsw_sp *mlxsw_sp,
 				 struct mlxsw_sp_acl_rule_info *rulei,
 				 struct netlink_ext_ack *extack);
@@ -932,7 +938,8 @@ struct mlxsw_sp_acl_rule_info *
 mlxsw_sp_acl_rule_rulei(struct mlxsw_sp_acl_rule *rule);
 int mlxsw_sp_acl_rule_get_stats(struct mlxsw_sp *mlxsw_sp,
 				struct mlxsw_sp_acl_rule *rule,
-				u64 *packets, u64 *bytes, u64 *last_use,
+				u64 *packets, u64 *bytes, u64 *drops,
+				u64 *last_use,
 				enum flow_action_hw_stats *used_hw_stats);
 
 struct mlxsw_sp_fid *mlxsw_sp_acl_dummy_fid(struct mlxsw_sp *mlxsw_sp);

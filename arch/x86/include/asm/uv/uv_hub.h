@@ -5,6 +5,7 @@
  *
  * SGI UV architectural definitions
  *
+ * (C) Copyright 2020 Hewlett Packard Enterprise Development LP
  * Copyright (C) 2007-2014 Silicon Graphics, Inc. All rights reserved.
  */
 
@@ -24,6 +25,7 @@
 #include <asm/uv/bios.h>
 #include <asm/irq_vectors.h>
 #include <asm/io_apic.h>
+#include <linux/rh_kabi.h>
 
 
 /*
@@ -129,6 +131,17 @@
  */
 #define UV_MAX_NASID_VALUE	(UV_MAX_NUMALINK_BLADES * 2)
 
+/* System Controller Interface Reg info */
+struct uv_scir_s {
+	struct timer_list timer;
+	unsigned long	offset;
+	unsigned long	last;
+	unsigned long	idle_on;
+	unsigned long	idle_off;
+	unsigned char	state;
+	unsigned char	enabled;
+};
+
 /* GAM (globally addressed memory) range table */
 struct uv_gam_range_s {
 	u32	limit;		/* PA bits 56:26 (GAM_RANGE_SHFT) */
@@ -182,7 +195,8 @@ struct uv_hub_info_s {
 struct uv_cpu_info_s {
 	void			*p_uv_hub_info;
 	unsigned char		blade_cpu_id;
-	void			*reserved;
+	RH_KABI_DEPRECATE(struct uv_scir_s,	scir)
+	RH_KABI_EXTEND(void	*reserved)
 };
 DECLARE_PER_CPU(struct uv_cpu_info_s, __uv_cpu_info);
 
@@ -733,19 +747,6 @@ extern void uv_nmi_setup_hubless(void);
 #define UVH_NMI_MMR_CLEAR	UVH_BIOS_KERNEL_MMR_ALIAS
 #define UVH_NMI_MMR_SHIFT	63
 #define UVH_NMI_MMR_TYPE	"SCRATCH5"
-
-/* Newer SMM NMI handler, not present in all systems */
-#define UVH_NMI_MMRX		UVH_EVENT_OCCURRED0
-#define UVH_NMI_MMRX_CLEAR	UVH_EVENT_OCCURRED0_ALIAS
-#define UVH_NMI_MMRX_SHIFT	UVH_EVENT_OCCURRED0_EXTIO_INT0_SHFT
-#define UVH_NMI_MMRX_TYPE	"EXTIO_INT0"
-
-/* Non-zero indicates newer SMM NMI handler present */
-#define UVH_NMI_MMRX_SUPPORTED	UVH_EXTIO_INT0_BROADCAST
-
-/* Indicates to BIOS that we want to use the newer SMM NMI handler */
-#define UVH_NMI_MMRX_REQ	UVH_BIOS_KERNEL_MMR_ALIAS_2
-#define UVH_NMI_MMRX_REQ_SHIFT	62
 
 struct uv_hub_nmi_s {
 	raw_spinlock_t	nmi_lock;

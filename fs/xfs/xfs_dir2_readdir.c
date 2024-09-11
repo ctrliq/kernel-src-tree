@@ -117,11 +117,10 @@ xfs_dir2_sf_getdents(
 		ino = xfs_dir2_sf_get_ino(mp, sfp, sfep);
 		filetype = xfs_dir2_sf_get_ftype(mp, sfep);
 		ctx->pos = off & 0x7fffffff;
-		if (!xfs_dir2_namecheck(sfep->name, sfep->namelen)) {
-			XFS_ERROR_REPORT(__func__, XFS_ERRLEVEL_LOW,
-					 dp->i_mount);
+		if (XFS_IS_CORRUPT(dp->i_mount,
+				   !xfs_dir2_namecheck(sfep->name,
+						       sfep->namelen)))
 			return -EFSCORRUPTED;
-		}
 		if (!dir_emit(ctx, (char *)sfep->name, sfep->namelen, ino,
 			    xfs_dir3_get_dtype(mp, filetype)))
 			return 0;
@@ -209,9 +208,9 @@ xfs_dir2_block_getdents(
 		/*
 		 * If it didn't fit, set the final offset to here & return.
 		 */
-		if (!xfs_dir2_namecheck(dep->name, dep->namelen)) {
-			XFS_ERROR_REPORT(__func__, XFS_ERRLEVEL_LOW,
-					 dp->i_mount);
+		if (XFS_IS_CORRUPT(dp->i_mount,
+				   !xfs_dir2_namecheck(dep->name,
+						       dep->namelen))) {
 			error = -EFSCORRUPTED;
 			goto out_rele;
 		}
@@ -282,7 +281,7 @@ xfs_dir2_leaf_readbuf(
 	new_off = xfs_dir2_da_to_byte(geo, map.br_startoff);
 	if (new_off > *cur_off)
 		*cur_off = new_off;
-	error = xfs_dir3_data_read(args->trans, dp, map.br_startoff, -1, &bp);
+	error = xfs_dir3_data_read(args->trans, dp, map.br_startoff, 0, &bp);
 	if (error)
 		goto out;
 
@@ -317,7 +316,8 @@ xfs_dir2_leaf_readbuf(
 				break;
 			}
 			if (next_ra > *ra_blk) {
-				xfs_dir3_data_readahead(dp, next_ra, -2);
+				xfs_dir3_data_readahead(dp, next_ra,
+							XFS_DABUF_MAP_HOLE_OK);
 				*ra_blk = next_ra;
 			}
 			ra_want -= geo->fsbcount;
@@ -461,9 +461,9 @@ xfs_dir2_leaf_getdents(
 		filetype = xfs_dir2_data_get_ftype(mp, dep);
 
 		ctx->pos = xfs_dir2_byte_to_dataptr(curoff) & 0x7fffffff;
-		if (!xfs_dir2_namecheck(dep->name, dep->namelen)) {
-			XFS_ERROR_REPORT(__func__, XFS_ERRLEVEL_LOW,
-					 dp->i_mount);
+		if (XFS_IS_CORRUPT(dp->i_mount,
+				   !xfs_dir2_namecheck(dep->name,
+						       dep->namelen))) {
 			error = -EFSCORRUPTED;
 			break;
 		}

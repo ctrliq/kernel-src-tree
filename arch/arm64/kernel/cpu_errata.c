@@ -22,6 +22,7 @@
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/cpufeature.h>
+#include <asm/kvm_asm.h>
 #include <asm/smp_plat.h>
 
 static bool __maybe_unused
@@ -124,9 +125,6 @@ atomic_t arm64_el2_vector_last_slot = ATOMIC_INIT(-1);
 DEFINE_PER_CPU_READ_MOSTLY(struct bp_hardening_data, bp_hardening_data);
 
 #ifdef CONFIG_KVM_INDIRECT_VECTORS
-extern char __smccc_workaround_1_smc_start[];
-extern char __smccc_workaround_1_smc_end[];
-
 static void __copy_hyp_vect_bpi(int slot, const char *hyp_vecs_start,
 				const char *hyp_vecs_end)
 {
@@ -174,9 +172,6 @@ static void install_bp_hardening_cb(bp_hardening_cb_t fn,
 	raw_spin_unlock(&bp_lock);
 }
 #else
-#define __smccc_workaround_1_smc_start		NULL
-#define __smccc_workaround_1_smc_end		NULL
-
 static void install_bp_hardening_cb(bp_hardening_cb_t fn,
 				      const char *hyp_vecs_start,
 				      const char *hyp_vecs_end)
@@ -252,8 +247,14 @@ static int detect_harden_bp_fw(void)
 
 	case SMCCC_CONDUIT_SMC:
 		cb = call_smc_arch_workaround_1;
-		smccc_start = __smccc_workaround_1_smc_start;
-		smccc_end = __smccc_workaround_1_smc_end;
+#if IS_ENABLED(CONFIG_KVM)
+		smccc_start = __smccc_workaround_1_smc;
+		smccc_end = __smccc_workaround_1_smc +
+			__SMCCC_WORKAROUND_1_SMC_SZ;
+#else
+		smccc_start = NULL;
+		smccc_end = NULL;
+#endif
 		break;
 
 	default:

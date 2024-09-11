@@ -56,11 +56,16 @@ struct perf_guest_info_callbacks {
 #include <linux/perf_regs.h>
 #include <linux/cgroup.h>
 #include <linux/refcount.h>
+#include <linux/security.h>
 #include <asm/local.h>
 
 struct perf_callchain_entry {
 	__u64				nr;
+#ifdef __GENKSYMS__
 	__u64				ip[0]; /* /proc/sys/kernel/perf_event_max_stack */
+#else
+	__u64				ip[]; /* /proc/sys/kernel/perf_event_max_stack */
+#endif /* __GENKSYMS__ */
 };
 
 struct perf_callchain_entry_ctx {
@@ -112,7 +117,11 @@ struct perf_raw_record {
 struct perf_branch_stack {
 	__u64				nr;
 	RH_KABI_BROKEN_INSERT(__u64				hw_idx)
+#ifdef __GENKSYMS__
 	struct perf_branch_entry	entries[0];
+#else
+	struct perf_branch_entry	entries[];
+#endif /* __GENKSYMS__ */
 };
 
 struct task_struct;
@@ -211,6 +220,7 @@ struct hw_perf_event {
 	 */
 	u64				sample_period;
 
+#ifndef __GENKSYMS__
 	union {
 		struct { /* Sampling */
 			/*
@@ -231,6 +241,19 @@ struct hw_perf_event {
 			u64				saved_slots;
 		};
 	};
+#else
+	/*
+	 * The period we started this sample with.
+	 */
+	u64				last_period;
+
+	/*
+	 * However much is left of the current period; note that this is
+	 * a full 64bit value and allows for generation of periods longer
+	 * than hardware might allow.
+	 */
+	local64_t			period_left;
+#endif /* __GENKSYMS__ */
 
 	/*
 	 * State for throttling the event, see __perf_event_overflow() and
@@ -427,11 +450,12 @@ struct pmu {
 	 */
 	void (*sched_task)		(struct perf_event_context *ctx,
 					bool sched_in);
+	RH_KABI_BROKEN_REMOVE(size_t				task_ctx_size)
 
 	/*
 	 * Kmem cache of PMU specific data
 	 */
-	struct kmem_cache		*task_ctx_cache;
+	RH_KABI_BROKEN_INSERT(struct kmem_cache		*task_ctx_cache)
 
 	/*
 	 * PMU specific parts of task perf event context (i.e. ctx->task_ctx_data)
@@ -717,7 +741,7 @@ struct perf_event {
 	struct mutex			mmap_mutex;
 	atomic_t			mmap_count;
 
-	struct perf_buffer		*rb;
+	RH_KABI_REPLACE(struct ring_buffer	*rb, struct perf_buffer	*rb)
 	struct list_head		rb_entry;
 	unsigned long			rcu_batches;
 	int				rcu_pending;
@@ -769,6 +793,9 @@ struct perf_event {
 	struct perf_cgroup		*cgrp; /* cgroup event is attach to */
 #endif
 
+#ifdef CONFIG_SECURITY
+	RH_KABI_BROKEN_INSERT(void *security)
+#endif
 	struct list_head		sb_list;
 #endif /* CONFIG_PERF_EVENTS */
 };
@@ -866,6 +893,7 @@ struct perf_cpu_context {
 	struct list_head		cgrp_cpuctx_entry;
 #endif
 
+	RH_KABI_BROKEN_REMOVE(struct list_head sched_cb_entry)
 	int				sched_cb_usage;
 
 	int				online;
@@ -882,7 +910,7 @@ struct perf_cpu_context {
 
 struct perf_output_handle {
 	struct perf_event		*event;
-	struct perf_buffer		*rb;
+	RH_KABI_REPLACE(struct ring_buffer	*rb, struct perf_buffer	*rb)
 	unsigned long			wakeup;
 	unsigned long			size;
 	u64				aux_flags;
@@ -1018,13 +1046,8 @@ struct perf_sample_data {
 	struct perf_callchain_entry	*callchain;
 	RH_KABI_BROKEN_INSERT(u64				aux_size)
 
-	/*
-	 * regs_user may point to task_pt_regs or to regs_user_copy, depending
-	 * on arch details.
-	 */
 	struct perf_regs		regs_user;
-	struct pt_regs			regs_user_copy;
-
+	RH_KABI_BROKEN_REMOVE(struct pt_regs          regs_user_copy)
 	struct perf_regs		regs_intr;
 	u64				stack_user_size;
 
@@ -1241,6 +1264,9 @@ extern void perf_event_exec(void);
 extern void perf_event_comm(struct task_struct *tsk, bool exec);
 extern void perf_event_namespaces(struct task_struct *tsk);
 extern void perf_event_fork(struct task_struct *tsk);
+extern void perf_event_text_poke(const void *addr,
+				 const void *old_bytes, size_t old_len,
+				 const void *new_bytes, size_t new_len);
 
 /* Callchains */
 DECLARE_PER_CPU(struct perf_callchain_entry, perf_callchain_entry);
@@ -1301,19 +1327,41 @@ extern int perf_cpu_time_max_percent_handler(struct ctl_table *table, int write,
 int perf_event_max_stack_handler(struct ctl_table *table, int write,
 				 void __user *buffer, size_t *lenp, loff_t *ppos);
 
-static inline bool perf_paranoid_tracepoint_raw(void)
+/* Access to perf_event_open(2) syscall. */
+#define PERF_SECURITY_OPEN		0
+
+/* Finer grained perf_event_open(2) access control. */
+#define PERF_SECURITY_CPU		1
+#define PERF_SECURITY_KERNEL		2
+#define PERF_SECURITY_TRACEPOINT	3
+
+static inline int perf_is_paranoid(void)
 {
 	return sysctl_perf_event_paranoid > -1;
 }
 
-static inline bool perf_paranoid_cpu(void)
+static inline int perf_allow_kernel(struct perf_event_attr *attr)
 {
-	return sysctl_perf_event_paranoid > 0;
+	if (sysctl_perf_event_paranoid > 1 && !perfmon_capable())
+		return -EACCES;
+
+	return security_perf_event_open(attr, PERF_SECURITY_KERNEL);
 }
 
-static inline bool perf_paranoid_kernel(void)
+static inline int perf_allow_cpu(struct perf_event_attr *attr)
 {
-	return sysctl_perf_event_paranoid > 1;
+	if (sysctl_perf_event_paranoid > 0 && !perfmon_capable())
+		return -EACCES;
+
+	return security_perf_event_open(attr, PERF_SECURITY_CPU);
+}
+
+static inline int perf_allow_tracepoint(struct perf_event_attr *attr)
+{
+	if (sysctl_perf_event_paranoid > -1 && !perfmon_capable())
+		return -EPERM;
+
+	return security_perf_event_open(attr, PERF_SECURITY_TRACEPOINT);
 }
 
 extern void perf_event_init(void);
@@ -1374,11 +1422,14 @@ perf_event_addr_filters(struct perf_event *event)
 extern void perf_event_addr_filters_sync(struct perf_event *event);
 
 extern int perf_output_begin(struct perf_output_handle *handle,
+			     struct perf_sample_data *data,
 			     struct perf_event *event, unsigned int size);
 extern int perf_output_begin_forward(struct perf_output_handle *handle,
-				    struct perf_event *event,
-				    unsigned int size);
+				     struct perf_sample_data *data,
+				     struct perf_event *event,
+				     unsigned int size);
 extern int perf_output_begin_backward(struct perf_output_handle *handle,
+				      struct perf_sample_data *data,
 				      struct perf_event *event,
 				      unsigned int size);
 
@@ -1471,6 +1522,11 @@ static inline void perf_event_exec(void)				{ }
 static inline void perf_event_comm(struct task_struct *tsk, bool exec)	{ }
 static inline void perf_event_namespaces(struct task_struct *tsk)	{ }
 static inline void perf_event_fork(struct task_struct *tsk)		{ }
+static inline void perf_event_text_poke(const void *addr,
+					const void *old_bytes,
+					size_t old_len,
+					const void *new_bytes,
+					size_t new_len)			{ }
 static inline void perf_event_init(void)				{ }
 static inline int  perf_swevent_get_recursion_context(void)		{ return -1; }
 static inline void perf_swevent_put_recursion_context(int rctx)		{ }

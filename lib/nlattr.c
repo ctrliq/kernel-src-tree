@@ -313,7 +313,12 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
 
 	BUG_ON(pt->type > NLA_TYPE_MAX);
 
+	/* RHEL: To preserve backward compatibility with older binary modules
+	 * we need to preserve NLA_EXACT_LEN_WARN type together with its
+	 * semantic.
+	*/
 	if ((nla_attr_len[pt->type] && attrlen != nla_attr_len[pt->type]) ||
+	    (pt->type == NLA_EXACT_LEN_WARN && attrlen != pt->len) ||
 	    (pt->type == NLA_EXACT_LEN &&
 	     pt->validation_type == NLA_VALIDATE_WARN_TOO_LONG &&
 	     attrlen != pt->len)) {
@@ -360,7 +365,7 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
 		if (attrlen != sizeof(struct nla_bitfield32))
 			goto out_err;
 
-		err = validate_nla_bitfield32(nla, pt->bitfield32_valid);
+		err = validate_nla_bitfield32(nla, *pt->bitfield32_valid_ptr);
 		if (err)
 			goto out_err;
 		break;

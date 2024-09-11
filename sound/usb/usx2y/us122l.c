@@ -88,7 +88,7 @@ static void pt_info_set(struct usb_device *dev, u8 v)
 
 	ret = usb_control_msg_send(dev, 0, 'I',
 				   USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-				   v, 0, NULL, 0, 1000);
+				   v, 0, NULL, 0, 1000, GFP_KERNEL);
 	snd_printdd(KERN_DEBUG "%i\n", ret);
 }
 
@@ -281,7 +281,7 @@ static int us122l_set_sample_rate(struct usb_device *dev, int rate)
 	err = usb_control_msg_send(dev, 0, UAC_SET_CUR,
 				   USB_TYPE_CLASS | USB_RECIP_ENDPOINT | USB_DIR_OUT,
 				   UAC_EP_CS_ATTR_SAMPLE_RATE << 8, ep, data, 3,
-				   1000);
+				   1000, GFP_KERNEL);
 	if (err)
 		snd_printk(KERN_ERR "%d: cannot set freq %d to ep 0x%x\n",
 			   dev->devnum, rate, ep);

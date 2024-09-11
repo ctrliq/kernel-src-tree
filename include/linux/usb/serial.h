@@ -278,8 +278,6 @@ struct usb_serial_driver {
 	int  (*write_room)(struct tty_struct *tty);
 	int  (*ioctl)(struct tty_struct *tty,
 		      unsigned int cmd, unsigned long arg);
-	int  (*get_serial)(struct tty_struct *tty, struct serial_struct *ss);
-	int  (*set_serial)(struct tty_struct *tty, struct serial_struct *ss);
 	void (*set_termios)(struct tty_struct *tty,
 			struct usb_serial_port *port, struct ktermios *old);
 	void (*break_ctl)(struct tty_struct *tty, int break_state);
@@ -311,6 +309,8 @@ struct usb_serial_driver {
 	/* Called by the generic write implementation */
 	int (*prepare_write_buffer)(struct usb_serial_port *port,
 						void *dest, size_t size);
+	RH_KABI_EXTEND(int  (*get_serial)(struct tty_struct *tty, struct serial_struct *ss))
+	RH_KABI_EXTEND(int  (*set_serial)(struct tty_struct *tty, struct serial_struct *ss))
 };
 #define to_usb_serial_driver(d) \
 	container_of(d, struct usb_serial_driver, driver)

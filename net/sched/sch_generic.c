@@ -799,6 +799,9 @@ struct Qdisc_ops pfifo_fast_ops __read_mostly = {
 };
 EXPORT_SYMBOL(pfifo_fast_ops);
 
+static struct lock_class_key qdisc_tx_busylock;
+static struct lock_class_key qdisc_running_key;
+
 struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
 			  const struct Qdisc_ops *ops,
 			  struct netlink_ext_ack *extack)
@@ -838,9 +841,17 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
 	}
 
 	spin_lock_init(&sch->busylock);
+	lockdep_set_class(&sch->busylock,
+			  dev->qdisc_tx_busylock ?: &qdisc_tx_busylock);
+
 	/* seqlock has the same scope of busylock, for NOLOCK qdisc */
 	spin_lock_init(&sch->seqlock);
+	lockdep_set_class(&sch->busylock,
+			  dev->qdisc_tx_busylock ?: &qdisc_tx_busylock);
+
 	seqcount_init(&sch->running);
+	lockdep_set_class(&sch->running,
+			  dev->qdisc_running_key ?: &qdisc_running_key);
 
 	sch->ops = ops;
 	sch->flags = ops->static_flags;
@@ -850,12 +861,6 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
 	sch->empty = true;
 	dev_hold(dev);
 	refcount_set(&sch->refcnt, 1);
-
-	if (sch != &noop_qdisc) {
-		lockdep_set_class(&sch->busylock, &dev->qdisc_tx_busylock_key);
-		lockdep_set_class(&sch->seqlock, &dev->qdisc_tx_busylock_key);
-		lockdep_set_class(&sch->running, &dev->qdisc_running_key);
-	}
 
 	return sch;
 errout1:
@@ -883,8 +888,10 @@ struct Qdisc *qdisc_create_dflt(struct netdev_queue *dev_queue,
 	}
 	sch->parent = parentid;
 
-	if (!ops->init || ops->init(sch, NULL, extack) == 0)
+	if (!ops->init || ops->init(sch, NULL, extack) == 0) {
+		trace_qdisc_create(ops, dev_queue->dev, parentid);
 		return sch;
+	}
 
 	qdisc_put(sch);
 	return NULL;
@@ -897,6 +904,8 @@ void qdisc_reset(struct Qdisc *qdisc)
 {
 	const struct Qdisc_ops *ops = qdisc->ops;
 	struct sk_buff *skb, *tmp;
+
+	trace_qdisc_reset(qdisc);
 
 	if (ops->reset)
 		ops->reset(qdisc);
@@ -951,6 +960,8 @@ static void qdisc_destroy(struct Qdisc *qdisc)
 
 	module_put(ops->owner);
 	dev_put(qdisc_dev(qdisc));
+
+	trace_qdisc_destroy(qdisc);
 
 	call_rcu(&qdisc->rcu, qdisc_free_cb);
 }

@@ -15,7 +15,6 @@
 #define QDIO_BUSY_BIT_PATIENCE		(100 << 12)	/* 100 microseconds */
 #define QDIO_BUSY_BIT_RETRY_DELAY	10		/* 10 milliseconds */
 #define QDIO_BUSY_BIT_RETRIES		1000		/* = 10s retry time */
-#define QDIO_INPUT_THRESHOLD		(500 << 12)	/* 500 microseconds */
 
 enum qdio_irq_states {
 	QDIO_IRQ_STATE_INACTIVE,
@@ -173,20 +172,14 @@ struct qdio_queue_perf_stat {
 	unsigned int nr_sbal_total;
 };
 
-enum qdio_queue_irq_states {
-	QDIO_QUEUE_IRQS_DISABLED,
+enum qdio_irq_poll_states {
+	QDIO_IRQ_DISABLED,
 };
 
 struct qdio_input_q {
 	/* Batch of SBALs that we processed while polling the queue: */
 	unsigned int batch_start;
 	unsigned int batch_count;
-	/* last time of noticing incoming data */
-	u64 timestamp;
-	/* upper-layer polling flag */
-	unsigned long queue_irq_state;
-	/* callback to start upper-layer polling */
-	void (*queue_start_poll) (struct ccw_device *, int, unsigned long);
 };
 
 struct qdio_output_q {
@@ -291,6 +284,9 @@ struct qdio_irq {
 	unsigned int max_input_qs;
 	unsigned int max_output_qs;
 
+	void (*irq_poll)(struct ccw_device *cdev, unsigned long data);
+	unsigned long poll_state;
+
 	debug_info_t *debug_area;
 	struct mutex setup_mutex;
 	struct qdio_dev_perf_stat perf_stat;
@@ -364,11 +360,8 @@ void qdio_shutdown_thinint(struct qdio_irq *irq_ptr);
 void tiqdio_add_device(struct qdio_irq *irq_ptr);
 void tiqdio_remove_device(struct qdio_irq *irq_ptr);
 void tiqdio_inbound_processing(unsigned long q);
-int tiqdio_allocate_memory(void);
-void tiqdio_free_memory(void);
-int tiqdio_register_thinints(void);
-void tiqdio_unregister_thinints(void);
-void clear_nonshared_ind(struct qdio_irq *);
+int qdio_thinint_init(void);
+void qdio_thinint_exit(void);
 int test_nonshared_ind(struct qdio_irq *);
 
 /* prototypes for setup */

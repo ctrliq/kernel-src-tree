@@ -23,6 +23,9 @@
  *
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
+
+#include <linux/rh_kabi.h>
+
 #include <acpi/pdc_intel.h>
 
 #include <asm/numa.h>
@@ -30,6 +33,7 @@
 #include <asm/processor.h>
 #include <asm/mmu.h>
 #include <asm/mpspec.h>
+#include RH_KABI_FAKE_INCLUDE(<asm/realmode.h>)
 #include <asm/x86_init.h>
 
 #ifdef CONFIG_ACPI_APEI

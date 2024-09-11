@@ -239,6 +239,7 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
 #define FGP_WRITE		0x00000008
 #define FGP_NOFS		0x00000010
 #define FGP_NOWAIT		0x00000020
+#define FGP_FOR_MMAP		0x00000040
 
 struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
 		int fgp_flags, gfp_t cache_gfp_mask);
@@ -330,6 +331,16 @@ static inline struct page *grab_cache_page_nowait(struct address_space *mapping,
 	return pagecache_get_page(mapping, index,
 			FGP_LOCK|FGP_CREAT|FGP_NOFS|FGP_NOWAIT,
 			mapping_gfp_mask(mapping));
+}
+
+static inline struct page *find_subpage(struct page *page, pgoff_t offset)
+{
+	if (PageHuge(page))
+		return page;
+
+	VM_BUG_ON_PAGE(PageTail(page), page);
+
+	return page + (offset & (compound_nr(page) - 1));
 }
 
 struct page *find_get_entry(struct address_space *mapping, pgoff_t offset);

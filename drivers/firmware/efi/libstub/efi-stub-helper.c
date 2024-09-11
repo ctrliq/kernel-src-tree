@@ -421,6 +421,32 @@ static efi_status_t efi_file_close(void *handle)
 	return efi_call_proto(efi_file_handle, close, handle);
 }
 
+static efi_status_t efi_open_volume(efi_system_table_t *sys_table_arg,
+				    efi_loaded_image_t *image,
+				    efi_file_handle_t **__fh)
+{
+	efi_file_io_interface_t *io;
+	efi_file_handle_t *fh;
+	efi_guid_t fs_proto = EFI_FILE_SYSTEM_GUID;
+	efi_status_t status;
+	void *handle = efi_table_attr(efi_loaded_image, device_handle, image);
+
+	status = efi_call_early(handle_protocol, handle,
+				&fs_proto, (void **)&io);
+	if (status != EFI_SUCCESS) {
+		efi_printk(sys_table_arg, "Failed to handle fs_proto\n");
+		return status;
+	}
+
+	status = efi_call_proto(efi_file_io_interface, open_volume, io, &fh);
+	if (status != EFI_SUCCESS)
+		efi_printk(sys_table_arg, "Failed to open volume\n");
+	else
+		*__fh = fh;
+
+	return status;
+}
+
 /*
  * Parse the ASCII string 'cmdline' for EFI options, denoted by the efi=
  * option, e.g. efi=nochunk.
@@ -577,8 +603,7 @@ efi_status_t handle_cmdline_files(efi_system_table_t *sys_table_arg,
 
 		/* Only open the volume once. */
 		if (!i) {
-			status = efi_open_volume(sys_table_arg, image,
-						 (void **)&fh);
+			status = efi_open_volume(sys_table_arg, image, &fh);
 			if (status != EFI_SUCCESS)
 				goto free_files;
 		}
@@ -908,33 +933,20 @@ fail:
 	return status;
 }
 
-#define GET_EFI_CONFIG_TABLE(bits)					\
-static void *get_efi_config_table##bits(efi_system_table_t *_sys_table,	\
-					efi_guid_t guid)		\
-{									\
-	efi_system_table_##bits##_t *sys_table;				\
-	efi_config_table_##bits##_t *tables;				\
-	int i;								\
-									\
-	sys_table = (typeof(sys_table))_sys_table;			\
-	tables = (typeof(tables))(unsigned long)sys_table->tables;	\
-									\
-	for (i = 0; i < sys_table->nr_tables; i++) {			\
-		if (efi_guidcmp(tables[i].guid, guid) != 0)		\
-			continue;					\
-									\
-		return (void *)(unsigned long)tables[i].table;		\
-	}								\
-									\
-	return NULL;							\
-}
-GET_EFI_CONFIG_TABLE(32)
-GET_EFI_CONFIG_TABLE(64)
-
 void *get_efi_config_table(efi_system_table_t *sys_table, efi_guid_t guid)
 {
-	if (efi_is_64bit())
-		return get_efi_config_table64(sys_table, guid);
-	else
-		return get_efi_config_table32(sys_table, guid);
+	unsigned long tables = efi_table_attr(efi_system_table, tables, sys_table);
+	int nr_tables = efi_table_attr(efi_system_table, nr_tables, sys_table);
+	int i;
+
+	for (i = 0; i < nr_tables; i++) {
+		efi_config_table_t *t = (void *)tables;
+
+		if (efi_guidcmp(t->guid, guid) == 0)
+			return efi_table_attr(efi_config_table, table, t);
+
+		tables += efi_is_native() ? sizeof(efi_config_table_t)
+					  : sizeof(efi_config_table_32_t);
+	}
+	return NULL;
 }

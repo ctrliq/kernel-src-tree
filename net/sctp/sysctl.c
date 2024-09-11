@@ -229,11 +229,11 @@ static struct ctl_table sctp_net_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
-		.extra2		= &init_net.sctp.ps_retrans,
+		.extra2		= &init_net.sctp_ps_retrans,
 	},
 	{
 		.procname	= "ps_retrans",
-		.data		= &init_net.sctp.ps_retrans,
+		.data		= &init_net.sctp_ps_retrans,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
@@ -346,7 +346,7 @@ static struct ctl_table sctp_net_table[] = {
 	},
 	{
 		.procname	= "pf_expose",
-		.data		= &init_net.sctp.pf_expose,
+		.data		= &init_net.sctp_pf_expose,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,

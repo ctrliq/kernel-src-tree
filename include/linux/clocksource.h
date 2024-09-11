@@ -23,9 +23,12 @@
 struct clocksource;
 struct module;
 
-#ifdef CONFIG_ARCH_CLOCKSOURCE_DATA
+#if defined(CONFIG_ARCH_CLOCKSOURCE_DATA) || \
+    defined(CONFIG_GENERIC_GETTIMEOFDAY)
 #include <asm/clocksource.h>
 #endif
+
+#include <vdso/clocksource.h>
 
 /**
  * struct clocksource - hardware abstraction for a free running counter
@@ -97,6 +100,7 @@ struct clocksource {
 	const char		*name;
 	struct list_head	list;
 	int			rating;
+	enum vdso_clock_mode	vdso_clock_mode;
 	unsigned long		flags;
 
 	int			(*enable)(struct clocksource *cs);

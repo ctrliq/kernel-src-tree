@@ -1,62 +1,8 @@
-/******************************************************************************
- *
- * This file is provided under a dual BSD/GPLv2 license.  When using or
- * redistributing this file, you may do so under either license.
- *
- * GPL LICENSE SUMMARY
- *
- * Copyright(c) 2015 - 2017 Intel Deutschland GmbH
- * Copyright (C) 2018 - 2020 Intel Corporation
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of version 2 of the GNU General Public License as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * The full GNU General Public License is included in this distribution
- * in the file called COPYING.
- *
- * Contact Information:
- * Intel Linux Wireless <linuxwifi@intel.com>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- *
- * BSD LICENSE
- *
- * Copyright(c) 2015 - 2017 Intel Deutschland GmbH
- * Copyright (C) 2018 - 2020 Intel Corporation
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *  * Neither the name Intel Corporation nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- *****************************************************************************/
+/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
+/*
+ * Copyright (C) 2015-2017 Intel Deutschland GmbH
+ * Copyright (C) 2018-2020 Intel Corporation
+ */
 #ifndef __iwl_fw_api_location_h__
 #define __iwl_fw_api_location_h__
 
@@ -321,11 +267,53 @@ struct iwl_tof_responder_config_cmd {
  *	data (if exists) follows, and then 0-padding again to complete a
  *	4-multiple long buffer.
  */
-struct iwl_tof_responder_dyn_config_cmd {
+struct iwl_tof_responder_dyn_config_cmd_v2 {
 	__le32 lci_len;
 	__le32 civic_len;
 	u8 lci_civic[];
 } __packed; /* TOF_RESPONDER_DYN_CONFIG_CMD_API_S_VER_2 */
+
+#define IWL_LCI_MAX_SIZE	160
+#define IWL_CIVIC_MAX_SIZE	160
+#define HLTK_11AZ_LEN	32
+
+/**
+ * enum iwl_responder_dyn_cfg_valid_flags - valid flags for dyn_config_cmd
+ * @IWL_RESPONDER_DYN_CFG_VALID_LCI: LCI data is valid
+ * @IWL_RESPONDER_DYN_CFG_VALID_CIVIC: Civic data is valid
+ * @IWL_RESPONDER_DYN_CFG_VALID_PASN_STA: the pasn_addr, HLTK and cipher fields
+ *	are valid.
+ */
+enum iwl_responder_dyn_cfg_valid_flags {
+	IWL_RESPONDER_DYN_CFG_VALID_LCI = BIT(0),
+	IWL_RESPONDER_DYN_CFG_VALID_CIVIC = BIT(1),
+	IWL_RESPONDER_DYN_CFG_VALID_PASN_STA = BIT(2),
+};
+
+/**
+ * struct iwl_tof_responder_dyn_config_cmd - Dynamic responder settings
+ * @cipher: The negotiated cipher. see &enum iwl_location_cipher.
+ * @valid_flags: flags indicating which fields in the command are valid. see
+ *	&enum iwl_responder_dyn_cfg_valid_flags.
+ * @lci_len: length of the LCI data in bytes
+ * @civic_len: length of the Civic data in bytes
+ * @lci_buf: the LCI buffer
+ * @civic_buf: the Civic buffer
+ * @hltk_buf: HLTK for secure LTF bits generation for the specified station
+ * @addr: mac address of the station for which to use the HLTK
+ * @reserved: for alignment
+ */
+struct iwl_tof_responder_dyn_config_cmd {
+	u8 cipher;
+	u8 valid_flags;
+	u8 lci_len;
+	u8 civic_len;
+	u8 lci_buf[IWL_LCI_MAX_SIZE];
+	u8 civic_buf[IWL_LCI_MAX_SIZE];
+	u8 hltk_buf[HLTK_11AZ_LEN];
+	u8 addr[ETH_ALEN];
+	u8 reserved[2];
+} __packed; /* TOF_RESPONDER_DYN_CONFIG_CMD_API_S_VER_3 */
 
 /**
  * struct iwl_tof_range_req_ext_cmd - extended range req for WLS
@@ -507,7 +495,6 @@ enum iwl_location_bw {
 	IWL_LOCATION_BW_80MHZ,
 };
 
-#define HLTK_11AZ_LEN	32
 #define TK_11AZ_LEN	32
 
 #define LOCATION_BW_POS	4

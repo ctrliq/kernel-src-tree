@@ -32,11 +32,13 @@
 #include <linux/time_namespace.h>
 #include <linux/timekeeper_internal.h>
 #include <linux/vmalloc.h>
+#include <vdso/datapage.h>
+#include <vdso/helpers.h>
+#include <vdso/vsyscall.h>
 
 #include <asm/cacheflush.h>
 #include <asm/signal32.h>
 #include <asm/vdso.h>
-#include <asm/vdso_datapage.h>
 
 extern char vdso_start[], vdso_end[];
 #ifdef CONFIG_COMPAT_VDSO
@@ -48,6 +50,12 @@ enum vdso_abi {
 #ifdef CONFIG_COMPAT_VDSO
 	VDSO_ABI_AA32,
 #endif /* CONFIG_COMPAT_VDSO */
+};
+
+enum vvar_pages {
+	VVAR_DATA_PAGE_OFFSET,
+	VVAR_TIMENS_PAGE_OFFSET,
+	VVAR_NR_PAGES,
 };
 
 struct vdso_abi_info {
@@ -80,10 +88,10 @@ static struct vdso_abi_info vdso_info[] __ro_after_init = {
  * The vDSO data page.
  */
 static union {
-	struct vdso_data	data;
+	struct vdso_data	data[CS_BASES];
 	u8			page[PAGE_SIZE];
 } vdso_data_store __page_aligned_data;
-struct vdso_data *vdso_data = &vdso_data_store.data;
+struct vdso_data *vdso_data = vdso_data_store.data;
 
 static int __vdso_remap(enum vdso_abi abi,
 			const struct vm_special_mapping *sm,
@@ -135,6 +143,11 @@ static int __vdso_init(enum vdso_abi abi)
 }
 
 #ifdef CONFIG_TIME_NS
+struct vdso_data *arch_get_vdso_data(void *vvar_page)
+{
+	return (struct vdso_data *)(vvar_page);
+}
+
 /*
  * The vvar mapping contains data for a specific time namespace, so when a task
  * changes namespace we must unmap its vvar data for the old namespace.
@@ -240,9 +253,11 @@ static int __setup_additional_pages(enum vdso_abi abi,
 	unsigned long vdso_base, vdso_text_len, vdso_mapping_len;
 	void *ret;
 
+	BUILD_BUG_ON(VVAR_NR_PAGES != __VVAR_PAGES);
+
 	vdso_text_len = vdso_info[abi].vdso_pages << PAGE_SHIFT;
 	/* Be sure to map the data page */
-	vdso_mapping_len = vdso_text_len + PAGE_SIZE;
+	vdso_mapping_len = vdso_text_len + VVAR_NR_PAGES * PAGE_SIZE;
 
 	vdso_base = get_unmapped_area(NULL, 0, vdso_mapping_len, 0, 0);
 	if (IS_ERR_VALUE(vdso_base)) {
@@ -250,13 +265,13 @@ static int __setup_additional_pages(enum vdso_abi abi,
 		goto up_fail;
 	}
 
-	ret = _install_special_mapping(mm, vdso_base, PAGE_SIZE,
+	ret = _install_special_mapping(mm, vdso_base, VVAR_NR_PAGES * PAGE_SIZE,
 				       VM_READ|VM_MAYREAD|VM_PFNMAP,
 				       vdso_info[abi].dm);
 	if (IS_ERR(ret))
 		goto up_fail;
 
-	vdso_base += PAGE_SIZE;
+	vdso_base += VVAR_NR_PAGES * PAGE_SIZE;
 	mm->context.vdso = (void *)vdso_base;
 	ret = _install_special_mapping(mm, vdso_base, vdso_text_len,
 				       VM_READ|VM_EXEC|
@@ -289,15 +304,12 @@ enum aarch32_map {
 #ifdef CONFIG_COMPAT_VDSO
 	AA32_MAP_VVAR,
 	AA32_MAP_VDSO,
-#else
-	AA32_MAP_SIGPAGE
 #endif
+	AA32_MAP_SIGPAGE
 };
 
 static struct page *aarch32_vectors_page __ro_after_init;
-#ifndef CONFIG_COMPAT_VDSO
 static struct page *aarch32_sig_page __ro_after_init;
-#endif
 
 static struct vm_special_mapping aarch32_vdso_maps[] = {
 	[AA32_MAP_VECTORS] = {
@@ -314,12 +326,11 @@ static struct vm_special_mapping aarch32_vdso_maps[] = {
 		.name = "[vdso]",
 		.mremap = aarch32_vdso_mremap,
 	},
-#else
+#endif /* CONFIG_COMPAT_VDSO */
 	[AA32_MAP_SIGPAGE] = {
 		.name	= "[sigpage]", /* ABI */
 		.pages	= &aarch32_sig_page,
 	},
-#endif /* CONFIG_COMPAT_VDSO */
 };
 
 static int aarch32_alloc_kuser_vdso_page(void)
@@ -339,27 +350,11 @@ static int aarch32_alloc_kuser_vdso_page(void)
 	return 0;
 }
 
-#ifdef CONFIG_COMPAT_VDSO
-static int __aarch32_alloc_vdso_pages(void)
-{
-	int ret;
-
-	vdso_info[VDSO_ABI_AA32].dm = &aarch32_vdso_maps[AA32_MAP_VVAR];
-	vdso_info[VDSO_ABI_AA32].cm = &aarch32_vdso_maps[AA32_MAP_VDSO];
-
-	ret = __vdso_init(VDSO_ABI_AA32);
-	if (ret)
-		return ret;
-
-	return aarch32_alloc_kuser_vdso_page();
-}
-#else
-static int __aarch32_alloc_vdso_pages(void)
+static int aarch32_alloc_sigpage(void)
 {
 	extern char __aarch32_sigret_code_start[], __aarch32_sigret_code_end[];
 	int sigret_sz = __aarch32_sigret_code_end - __aarch32_sigret_code_start;
 	unsigned long sigpage;
-	int ret;
 
 	sigpage = get_zeroed_page(GFP_ATOMIC);
 	if (!sigpage)
@@ -368,18 +363,34 @@ static int __aarch32_alloc_vdso_pages(void)
 	memcpy((void *)sigpage, __aarch32_sigret_code_start, sigret_sz);
 	aarch32_sig_page = virt_to_page(sigpage);
 	flush_dcache_page(aarch32_sig_page);
+	return 0;
+}
 
-	ret = aarch32_alloc_kuser_vdso_page();
-	if (ret)
-		free_page(sigpage);
+#ifdef CONFIG_COMPAT_VDSO
+static int __aarch32_alloc_vdso_pages(void)
+{
+	vdso_info[VDSO_ABI_AA32].dm = &aarch32_vdso_maps[AA32_MAP_VVAR];
+	vdso_info[VDSO_ABI_AA32].cm = &aarch32_vdso_maps[AA32_MAP_VDSO];
 
-	return ret;
+	return __vdso_init(VDSO_ABI_AA32);
 }
 #endif /* CONFIG_COMPAT_VDSO */
 
 static int __init aarch32_alloc_vdso_pages(void)
 {
-	return __aarch32_alloc_vdso_pages();
+	int ret;
+
+#ifdef CONFIG_COMPAT_VDSO
+	ret = __aarch32_alloc_vdso_pages();
+	if (ret)
+		return ret;
+#endif
+
+	ret = aarch32_alloc_sigpage();
+	if (ret)
+		return ret;
+
+	return aarch32_alloc_kuser_vdso_page();
 }
 arch_initcall(aarch32_alloc_vdso_pages);
 
@@ -399,7 +410,6 @@ static int aarch32_kuser_helpers_setup(struct mm_struct *mm)
 	return PTR_ERR_OR_ZERO(ret);
 }
 
-#ifndef CONFIG_COMPAT_VDSO
 static int aarch32_sigreturn_setup(struct mm_struct *mm)
 {
 	unsigned long addr;
@@ -422,12 +432,11 @@ static int aarch32_sigreturn_setup(struct mm_struct *mm)
 	if (IS_ERR(ret))
 		goto out;
 
-	mm->context.vdso = (void *)addr;
+	mm->context.sigpage = (void *)addr;
 
 out:
 	return PTR_ERR_OR_ZERO(ret);
 }
-#endif /* !CONFIG_COMPAT_VDSO */
 
 int aarch32_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 {
@@ -446,10 +455,11 @@ int aarch32_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 				       mm,
 				       bprm,
 				       uses_interp);
-#else
-	ret = aarch32_sigreturn_setup(mm);
+	if (ret)
+		goto out;
 #endif /* CONFIG_COMPAT_VDSO */
 
+	ret = aarch32_sigreturn_setup(mm);
 out:
 	up_write(&mm->mmap_sem);
 	return ret;
@@ -505,47 +515,4 @@ int arch_setup_additional_pages(struct linux_binprm *bprm,
 	up_write(&mm->mmap_sem);
 
 	return ret;
-}
-
-/*
- * Update the vDSO data page to keep in sync with kernel timekeeping.
- */
-void update_vsyscall(struct timekeeper *tk)
-{
-	u32 use_syscall = !tk->tkr_mono.clock->archdata.vdso_direct;
-
-	++vdso_data->tb_seq_count;
-	smp_wmb();
-
-	vdso_data->use_syscall			= use_syscall;
-	vdso_data->xtime_coarse_sec		= tk->xtime_sec;
-	vdso_data->xtime_coarse_nsec		= tk->tkr_mono.xtime_nsec >>
-							tk->tkr_mono.shift;
-	vdso_data->wtm_clock_sec		= tk->wall_to_monotonic.tv_sec;
-	vdso_data->wtm_clock_nsec		= tk->wall_to_monotonic.tv_nsec;
-
-	/* Read without the seqlock held by clock_getres() */
-	WRITE_ONCE(vdso_data->hrtimer_res, hrtimer_resolution);
-
-	if (!use_syscall) {
-		/* tkr_mono.cycle_last == tkr_raw.cycle_last */
-		vdso_data->cs_cycle_last	= tk->tkr_mono.cycle_last;
-		vdso_data->raw_time_sec         = tk->raw_sec;
-		vdso_data->raw_time_nsec        = tk->tkr_raw.xtime_nsec;
-		vdso_data->xtime_clock_sec	= tk->xtime_sec;
-		vdso_data->xtime_clock_nsec	= tk->tkr_mono.xtime_nsec;
-		vdso_data->cs_mono_mult		= tk->tkr_mono.mult;
-		vdso_data->cs_raw_mult		= tk->tkr_raw.mult;
-		/* tkr_mono.shift == tkr_raw.shift */
-		vdso_data->cs_shift		= tk->tkr_mono.shift;
-	}
-
-	smp_wmb();
-	++vdso_data->tb_seq_count;
-}
-
-void update_vsyscall_tz(void)
-{
-	vdso_data->tz_minuteswest	= sys_tz.tz_minuteswest;
-	vdso_data->tz_dsttime		= sys_tz.tz_dsttime;
 }

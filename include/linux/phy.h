@@ -29,6 +29,9 @@
 #include <linux/workqueue.h>
 #include <linux/mod_devicetable.h>
 #include <linux/u64_stats_sync.h>
+#include <linux/irqreturn.h>
+#include <linux/iopoll.h>
+#include <linux/refcount.h>
 
 #include <linux/atomic.h>
 
@@ -103,7 +106,6 @@ typedef enum {
 	PHY_INTERFACE_MODE_RTBI,
 	PHY_INTERFACE_MODE_SMII,
 	PHY_INTERFACE_MODE_XGMII,
-	PHY_INTERFACE_MODE_XLGMII,
 	PHY_INTERFACE_MODE_MOCA,
 	PHY_INTERFACE_MODE_QSGMII,
 	PHY_INTERFACE_MODE_TRGMII,
@@ -120,6 +122,9 @@ typedef enum {
         */
 #ifndef __GENKSYMS__
 	PHY_INTERFACE_MODE_USXGMII,
+	PHY_INTERFACE_MODE_XLGMII,
+	/* 10GBASE-R, XFI, SFI - single lane 10G Serdes */
+	PHY_INTERFACE_MODE_10GBASER,
 #endif
 	PHY_INTERFACE_MODE_MAX,
 } phy_interface_t;
@@ -196,10 +201,12 @@ static inline const char *phy_modes(phy_interface_t interface)
 		return "rxaui";
 	case PHY_INTERFACE_MODE_XAUI:
 		return "xaui";
-	case PHY_INTERFACE_MODE_10GKR:
-		return "10gbase-kr";
+	case PHY_INTERFACE_MODE_10GBASER:
+		return "10gbase-r";
 	case PHY_INTERFACE_MODE_USXGMII:
 		return "usxgmii";
+	case PHY_INTERFACE_MODE_10GKR:
+		return "10gbase-kr";
 	default:
 		return "unknown";
 	}
@@ -231,6 +238,29 @@ struct mdio_bus_stats {
 	struct u64_stats_sync syncp;
 };
 
+/* Represents a shared structure between different phydev's in the same
+ * package, for example a quad PHY. See phy_package_join() and
+ * phy_package_leave().
+ */
+struct phy_package_shared {
+	int addr;
+	refcount_t refcnt;
+	unsigned long flags;
+	size_t priv_size;
+
+	/* private data pointer */
+	/* note that this pointer is shared between different phydevs and
+	 * the user has to take care of appropriate locking. It is allocated
+	 * and freed automatically by phy_package_join() and
+	 * phy_package_leave().
+	 */
+	void *priv;
+};
+
+/* used as bit number in atomic bitops */
+#define PHY_SHARED_F_INIT_DONE  0
+#define PHY_SHARED_F_PROBE_DONE 1
+
 /*
  * The Bus class for PHYs.  Devices which provide access to
  * PHYs should register using this structure
@@ -245,8 +275,8 @@ struct mii_bus {
 	int (*reset)(struct mii_bus *bus);
 	RH_KABI_BROKEN_INSERT(struct mdio_bus_stats stats[PHY_MAX_ADDR])
 
-	unsigned int is_managed:1;	/* is device-managed */
-	unsigned int is_managed_registered:1;
+	RH_KABI_BROKEN_INSERT(unsigned int is_managed:1)	/* is device-managed */
+	RH_KABI_BROKEN_INSERT(unsigned int is_managed_registered:1)
 
 	/*
 	 * A lock to ensure that only one thing can read/write
@@ -281,9 +311,24 @@ struct mii_bus {
 	/* GPIO reset pulse width in microseconds */
 	int reset_delay_us;
 	/* GPIO reset deassert delay in microseconds */
-	int reset_post_delay_us;
+	RH_KABI_BROKEN_INSERT(int reset_post_delay_us)
 	/* RESET GPIO descriptor pointer */
 	struct gpio_desc *reset_gpiod;
+
+#ifndef __GENKSYMS__
+	/* bus capabilities, used for probing */
+	enum {
+		MDIOBUS_NO_CAP = 0,
+		MDIOBUS_C22,
+		MDIOBUS_C45,
+		MDIOBUS_C22_C45,
+	} probe_capabilities;
+#endif
+	/* protect access to the shared element */
+	RH_KABI_BROKEN_INSERT(struct mutex shared_lock)
+
+	/* shared state across different PHYs */
+	RH_KABI_BROKEN_INSERT(struct phy_package_shared *shared[PHY_MAX_ADDR])
 };
 #define to_mii_bus(d) container_of(d, struct mii_bus, dev)
 
@@ -400,8 +445,8 @@ enum phy_state {
  */
 struct phy_c45_device_ids {
 	u32 devices_in_package;
-	u32 mmds_present;
-	u32 device_ids[MDIO_MMD_NUM];
+	RH_KABI_BROKEN_INSERT(u32 mmds_present)
+	RH_KABI_BROKEN_REPLACE(u32 device_ids[8], u32 device_ids[MDIO_MMD_NUM])
 };
 
 /* phy_device: An instance of a PHY
@@ -456,7 +501,6 @@ struct phy_device {
 	unsigned suspended:1;
 	unsigned sysfs_links:1;
 	unsigned loopback_enabled:1;
-	unsigned downshifted_rate:1;
 
 	unsigned autoneg:1;
 	/* The most recently read link state */
@@ -467,8 +511,9 @@ struct phy_device {
 	/* Interrupts are enabled */
 	RH_KABI_FILL_HOLE(unsigned interrupts:1)
 	RH_KABI_FILL_HOLE(unsigned suspended_by_mdio_bus:1)
+	RH_KABI_FILL_HOLE(unsigned downshifted_rate:1)
 
-	/* 19 bits hole remain */
+	/* 18 bits hole remain */
 
 	enum phy_state state;
 
@@ -484,6 +529,11 @@ struct phy_device {
 	int duplex;
 	int pause;
 	int asym_pause;
+	RH_KABI_BROKEN_INSERT_BLOCK(
+	u8 master_slave_get;
+	u8 master_slave_set;
+	u8 master_slave_state;
+	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 
 	/* RHEL: changed to a bit flag with the same name */
 	RH_KABI_DEPRECATE(u32, interrupts)
@@ -517,6 +567,17 @@ struct phy_device {
 	/* private data pointer */
 	/* For use by PHYs to maintain extra state */
 	void *priv;
+
+	/* shared data pointer */
+	/* For use by PHYs inside the same package that need a shared state. */
+	RH_KABI_BROKEN_INSERT(struct phy_package_shared *shared)
+
+	RH_KABI_BROKEN_INSERT_BLOCK(
+	/* Reporting cable test results */
+	struct sk_buff *skb;
+	void *ehdr;
+	struct nlattr *nest;
+	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 
 	/* Interrupt and Polling infrastructure */
 	RH_KABI_DEPRECATE(struct work_struct, phy_queue)
@@ -552,11 +613,24 @@ struct phy_device {
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_old);
 	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 
-	void (*phy_link_change)(struct phy_device *, bool up, bool do_carrier);
+	RH_KABI_REPLACE(void (*phy_link_change)(struct phy_device *, bool up, bool do_carrier),
+			void (*phy_link_change)(struct phy_device *phydev, bool up))
 	void (*adjust_link)(struct net_device *dev);
 };
 #define to_phy_device(d) container_of(to_mdio_device(d), \
 				      struct phy_device, mdio)
+
+/* A structure containing possible configuration parameters
+ * for a TDR cable test. The driver does not need to implement
+ * all the parameters, but should report what is actually used.
+ */
+struct phy_tdr_config {
+	u32 first;
+	u32 last;
+	u32 step;
+	s8 pair;
+};
+#define PHY_PAIR_ALL -1
 
 /* struct phy_driver: Driver structure for a particular PHY type
  *
@@ -716,11 +790,16 @@ struct phy_driver {
 			     struct ethtool_eeprom *ee, u8 *data);
 
 	/* Start a cable test */
-	int (*cable_test_start)(struct phy_device *dev);
+	RH_KABI_BROKEN_INSERT(int (*cable_test_start)(struct phy_device *dev))
+
+	/* Start a raw TDR cable test */
+	RH_KABI_BROKEN_INSERT(int (*cable_test_tdr_start)(struct phy_device *dev,
+				    const struct phy_tdr_config *config))
+
 	/* Once per second, or on interrupt, request the status of the
 	 * test.
 	 */
-	int (*cable_test_get_status)(struct phy_device *dev, bool *finished);
+	RH_KABI_BROKEN_INSERT(int (*cable_test_get_status)(struct phy_device *dev, bool *finished))
 
 	/* Get statistics from the phy using ethtool */
 	int (*get_sset_count)(struct phy_device *dev);
@@ -743,7 +822,10 @@ struct phy_driver {
 	RH_KABI_BROKEN_INSERT(int (*get_features)(struct phy_device *phydev))
 
 	/* Override default interrupt handling */
-        RH_KABI_BROKEN_INSERT(int (*handle_interrupt)(struct phy_device *phydev))
+        RH_KABI_BROKEN_INSERT(irqreturn_t (*handle_interrupt)(struct phy_device *phydev))
+
+	RH_KABI_BROKEN_INSERT(int (*get_sqi)(struct phy_device *dev))
+	RH_KABI_BROKEN_INSERT(int (*get_sqi_max)(struct phy_device *dev))
 };
 #define to_phy_driver(d) container_of(to_mdio_common_driver(d),		\
 				      struct phy_driver, mdiodrv)
@@ -895,6 +977,19 @@ static inline int __phy_modify_changed(struct phy_device *phydev, u32 regnum,
  * Same rules as for phy_read();
  */
 int phy_read_mmd(struct phy_device *phydev, int devad, u32 regnum);
+
+#define phy_read_mmd_poll_timeout(phydev, devaddr, regnum, val, cond, \
+				  sleep_us, timeout_us, sleep_before_read) \
+({ \
+	int __ret = read_poll_timeout(phy_read_mmd, val, (cond) || val < 0, \
+				  sleep_us, timeout_us, sleep_before_read, \
+				  phydev, devaddr, regnum); \
+	if (val <  0) \
+		__ret = val; \
+	if (__ret) \
+		phydev_err(phydev, "%s failed: %d\n", __func__, __ret); \
+	__ret; \
+})
 
 /**
  * __phy_read_mmd - Convenience function for reading a register
@@ -1263,6 +1358,9 @@ int phy_reset_after_clk_enable(struct phy_device *phydev);
 #if IS_ENABLED(CONFIG_PHYLIB)
 int phy_start_cable_test(struct phy_device *phydev,
 			 struct netlink_ext_ack *extack);
+int phy_start_cable_test_tdr(struct phy_device *phydev,
+			     struct netlink_ext_ack *extack,
+			     const struct phy_tdr_config *config);
 #else
 static inline
 int phy_start_cable_test(struct phy_device *phydev,
@@ -1271,7 +1369,19 @@ int phy_start_cable_test(struct phy_device *phydev,
 	NL_SET_ERR_MSG(extack, "Kernel not compiled with PHYLIB support");
 	return -EOPNOTSUPP;
 }
+static inline
+int phy_start_cable_test_tdr(struct phy_device *phydev,
+			     struct netlink_ext_ack *extack,
+			     const struct phy_tdr_config *config)
+{
+	NL_SET_ERR_MSG(extack, "Kernel not compiled with PHYLIB support");
+	return -EOPNOTSUPP;
+}
 #endif
+
+int phy_cable_test_result(struct phy_device *phydev, u8 pair, u16 result);
+int phy_cable_test_fault_length(struct phy_device *phydev, u8 pair,
+				u16 cm);
 
 static inline void phy_device_reset(struct phy_device *phydev, int value)
 {
@@ -1389,9 +1499,9 @@ void phy_drivers_unregister(struct phy_driver *drv, int n);
  * hide checksum change and old driver loaded with new kernel will crash. We
  * need change phy_driver{s}_register
  */
-RH_KABI_FORCE_CHANGE(4)
+RH_KABI_FORCE_CHANGE(5)
 int phy_driver_register(struct phy_driver *new_driver, struct module *owner);
-RH_KABI_FORCE_CHANGE(4)
+RH_KABI_FORCE_CHANGE(5)
 int phy_drivers_register(struct phy_driver *new_driver, int n,
 			 struct module *owner);
 void phy_state_machine(struct work_struct *work);
@@ -1447,6 +1557,10 @@ int phy_ethtool_get_link_ksettings(struct net_device *ndev,
 int phy_ethtool_set_link_ksettings(struct net_device *ndev,
 				   const struct ethtool_link_ksettings *cmd);
 int phy_ethtool_nway_reset(struct net_device *ndev);
+int phy_package_join(struct phy_device *phydev, int addr, size_t priv_size);
+void phy_package_leave(struct phy_device *phydev);
+int devm_phy_package_join(struct device *dev, struct phy_device *phydev,
+			  int addr, size_t priv_size);
 
 #if IS_ENABLED(CONFIG_PHYLIB)
 int __init mdio_bus_init(void);
@@ -1497,6 +1611,69 @@ static inline int phy_ethtool_get_stats(struct phy_device *phydev,
 	mutex_unlock(&phydev->lock);
 
 	return 0;
+}
+
+static inline int phy_package_read(struct phy_device *phydev, u32 regnum)
+{
+	struct phy_package_shared *shared = phydev->shared;
+
+	if (!shared)
+		return -EIO;
+
+	return mdiobus_read(phydev->mdio.bus, shared->addr, regnum);
+}
+
+static inline int __phy_package_read(struct phy_device *phydev, u32 regnum)
+{
+	struct phy_package_shared *shared = phydev->shared;
+
+	if (!shared)
+		return -EIO;
+
+	return __mdiobus_read(phydev->mdio.bus, shared->addr, regnum);
+}
+
+static inline int phy_package_write(struct phy_device *phydev,
+				    u32 regnum, u16 val)
+{
+	struct phy_package_shared *shared = phydev->shared;
+
+	if (!shared)
+		return -EIO;
+
+	return mdiobus_write(phydev->mdio.bus, shared->addr, regnum, val);
+}
+
+static inline int __phy_package_write(struct phy_device *phydev,
+				      u32 regnum, u16 val)
+{
+	struct phy_package_shared *shared = phydev->shared;
+
+	if (!shared)
+		return -EIO;
+
+	return __mdiobus_write(phydev->mdio.bus, shared->addr, regnum, val);
+}
+
+static inline bool __phy_package_set_once(struct phy_device *phydev,
+					  unsigned int b)
+{
+	struct phy_package_shared *shared = phydev->shared;
+
+	if (!shared)
+		return false;
+
+	return !test_and_set_bit(b, &shared->flags);
+}
+
+static inline bool phy_package_init_once(struct phy_device *phydev)
+{
+	return __phy_package_set_once(phydev, PHY_SHARED_F_INIT_DONE);
+}
+
+static inline bool phy_package_probe_once(struct phy_device *phydev)
+{
+	return __phy_package_set_once(phydev, PHY_SHARED_F_PROBE_DONE);
 }
 
 extern struct bus_type mdio_bus_type;

@@ -184,7 +184,7 @@ irqreturn_t sdw_intel_thread(int irq, void *dev_id)
 	sdw_intel_enable_irq(ctx->mmio_base, true);
 	return IRQ_HANDLED;
 }
-EXPORT_SYMBOL_NS(sdw_intel_thread, SOUNDWIRE_INTEL_INIT);
+EXPORT_SYMBOL(sdw_intel_thread);
 
 static struct sdw_intel_ctx
 *sdw_intel_probe_controller(struct sdw_intel_res *res)
@@ -477,7 +477,7 @@ void sdw_intel_process_wakeen_event(struct sdw_intel_ctx *ctx)
 		intel_master_process_wakeen_event(link->pdev);
 	}
 }
-EXPORT_SYMBOL_NS(sdw_intel_process_wakeen_event, SOUNDWIRE_INTEL_INIT);
+EXPORT_SYMBOL(sdw_intel_process_wakeen_event);
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DESCRIPTION("Intel Soundwire Init Library");

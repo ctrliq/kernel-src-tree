@@ -36,7 +36,6 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/kprobes.h>
-#include <linux/debugfs.h>
 #include <linux/nmi.h>
 #include <linux/swait.h>
 #include <asm/timer.h>
@@ -51,6 +50,8 @@
 #include <asm/cpuidle_haltpoll.h>
 #include <asm/ptrace.h>
 #include <asm/svm.h>
+
+DEFINE_STATIC_KEY_FALSE(kvm_async_pf_enabled);
 
 static int kvmapf = 1;
 
@@ -90,7 +91,6 @@ struct kvm_task_sleep_node {
 	struct swait_queue_head wq;
 	u32 token;
 	int cpu;
-	bool halted;
 };
 
 static struct kvm_task_sleep_head {
@@ -113,77 +113,64 @@ static struct kvm_task_sleep_node *_find_apf_task(struct kvm_task_sleep_head *b,
 	return NULL;
 }
 
-/*
- * @interrupt_kernel: Is this called from a routine which interrupts the kernel
- * 		      (other than user space)?
- */
-void kvm_async_pf_task_wait(u32 token, int interrupt_kernel)
+static bool kvm_async_pf_queue_task(u32 token, struct kvm_task_sleep_node *n)
 {
 	u32 key = hash_32(token, KVM_TASK_SLEEP_HASHBITS);
 	struct kvm_task_sleep_head *b = &async_pf_sleepers[key];
-	struct kvm_task_sleep_node n, *e;
-	DECLARE_SWAITQUEUE(wait);
-
-	rcu_irq_enter();
+	struct kvm_task_sleep_node *e;
 
 	raw_spin_lock(&b->lock);
 	e = _find_apf_task(b, token);
 	if (e) {
 		/* dummy entry exist -> wake up was delivered ahead of PF */
 		hlist_del(&e->link);
-		kfree(e);
 		raw_spin_unlock(&b->lock);
-
-		rcu_irq_exit();
-		return;
+		kfree(e);
+		return false;
 	}
 
-	n.token = token;
-	n.cpu = smp_processor_id();
-	n.halted = is_idle_task(current) ||
-		   (IS_ENABLED(CONFIG_PREEMPT_COUNT)
-		    ? preempt_count() > 1 || rcu_preempt_depth()
-		    : interrupt_kernel);
-	init_swait_queue_head(&n.wq);
-	hlist_add_head(&n.link, &b->list);
+	n->token = token;
+	n->cpu = smp_processor_id();
+	init_swait_queue_head(&n->wq);
+	hlist_add_head(&n->link, &b->list);
 	raw_spin_unlock(&b->lock);
+	return true;
+}
+
+/*
+ * kvm_async_pf_task_wait_schedule - Wait for pagefault to be handled
+ * @token:	Token to identify the sleep node entry
+ *
+ * Invoked from the async pagefault handling code or from the VM exit page
+ * fault handler. In both cases RCU is watching.
+ */
+void kvm_async_pf_task_wait_schedule(u32 token)
+{
+	struct kvm_task_sleep_node n;
+	DECLARE_SWAITQUEUE(wait);
+
+	lockdep_assert_irqs_disabled();
+
+	if (!kvm_async_pf_queue_task(token, &n))
+		return;
 
 	for (;;) {
-		if (!n.halted)
-			prepare_to_swait_exclusive(&n.wq, &wait, TASK_UNINTERRUPTIBLE);
+		prepare_to_swait_exclusive(&n.wq, &wait, TASK_UNINTERRUPTIBLE);
 		if (hlist_unhashed(&n.link))
 			break;
 
-		rcu_irq_exit();
-
-		if (!n.halted) {
-			local_irq_enable();
-			schedule();
-			local_irq_disable();
-		} else {
-			/*
-			 * We cannot reschedule. So halt.
-			 */
-			native_safe_halt();
-			local_irq_disable();
-		}
-
-		rcu_irq_enter();
+		local_irq_enable();
+		schedule();
+		local_irq_disable();
 	}
-	if (!n.halted)
-		finish_swait(&n.wq, &wait);
-
-	rcu_irq_exit();
-	return;
+	finish_swait(&n.wq, &wait);
 }
-EXPORT_SYMBOL_GPL(kvm_async_pf_task_wait);
+EXPORT_SYMBOL_GPL(kvm_async_pf_task_wait_schedule);
 
 static void apf_task_wake_one(struct kvm_task_sleep_node *n)
 {
 	hlist_del_init(&n->link);
-	if (n->halted)
-		smp_send_reschedule(n->cpu);
-	else if (swq_has_sleeper(&n->wq))
+	if (swq_has_sleeper(&n->wq))
 		swake_up_one(&n->wq);
 }
 
@@ -192,12 +179,13 @@ static void apf_task_wake_all(void)
 	int i;
 
 	for (i = 0; i < KVM_TASK_SLEEP_HASHSIZE; i++) {
-		struct hlist_node *p, *next;
 		struct kvm_task_sleep_head *b = &async_pf_sleepers[i];
+		struct kvm_task_sleep_node *n;
+		struct hlist_node *p, *next;
+
 		raw_spin_lock(&b->lock);
 		hlist_for_each_safe(p, next, &b->list) {
-			struct kvm_task_sleep_node *n =
-				hlist_entry(p, typeof(*n), link);
+			n = hlist_entry(p, typeof(*n), link);
 			if (n->cpu == smp_processor_id())
 				apf_task_wake_one(n);
 		}
@@ -238,50 +226,75 @@ again:
 		n->cpu = smp_processor_id();
 		init_swait_queue_head(&n->wq);
 		hlist_add_head(&n->link, &b->list);
-	} else
+	} else {
 		apf_task_wake_one(n);
+	}
 	raw_spin_unlock(&b->lock);
 	return;
 }
 EXPORT_SYMBOL_GPL(kvm_async_pf_task_wake);
 
-u32 kvm_read_and_reset_pf_reason(void)
+u32 kvm_read_and_reset_apf_flags(void)
 {
-	u32 reason = 0;
+	u32 flags = 0;
 
 	if (__this_cpu_read(apf_reason.enabled)) {
-		reason = __this_cpu_read(apf_reason.reason);
-		__this_cpu_write(apf_reason.reason, 0);
+		flags = __this_cpu_read(apf_reason.flags);
+		__this_cpu_write(apf_reason.flags, 0);
 	}
 
-	return reason;
+	return flags;
 }
-EXPORT_SYMBOL_GPL(kvm_read_and_reset_pf_reason);
-NOKPROBE_SYMBOL(kvm_read_and_reset_pf_reason);
+EXPORT_SYMBOL_GPL(kvm_read_and_reset_apf_flags);
+NOKPROBE_SYMBOL(kvm_read_and_reset_apf_flags);
 
-dotraplinkage void
-do_async_page_fault(struct pt_regs *regs, unsigned long error_code)
+bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
 {
-	enum ctx_state prev_state;
+	u32 flags = kvm_read_and_reset_apf_flags();
 
-	switch (kvm_read_and_reset_pf_reason()) {
-	default:
-		do_page_fault(regs, error_code);
-		break;
-	case KVM_PV_REASON_PAGE_NOT_PRESENT:
-		/* page is swapped out by the host. */
-		prev_state = exception_enter();
-		kvm_async_pf_task_wait((u32)read_cr2(), !user_mode(regs));
-		exception_exit(prev_state);
-		break;
-	case KVM_PV_REASON_PAGE_READY:
-		rcu_irq_enter();
-		kvm_async_pf_task_wake((u32)read_cr2());
-		rcu_irq_exit();
-		break;
+	if (!flags)
+		return false;
+
+	/*
+	 * If the host managed to inject an async #PF into an interrupt
+	 * disabled region, then die hard as this is not going to end well
+	 * and the host side is seriously broken.
+	 */
+	if (unlikely(!(regs->flags & X86_EFLAGS_IF)))
+		panic("Host injected async #PF in interrupt disabled region\n");
+
+	if (flags & KVM_PV_REASON_PAGE_NOT_PRESENT) {
+		if (unlikely(!(user_mode(regs))))
+			panic("Host injected async #PF in kernel mode\n");
+		/* Page is swapped out by the host. */
+		kvm_async_pf_task_wait_schedule(token);
+		return true;
 	}
+
+	WARN_ONCE(1, "Unexpected async PF flags: %x\n", flags);
+	return true;
 }
-NOKPROBE_SYMBOL(do_async_page_fault);
+NOKPROBE_SYMBOL(__kvm_handle_async_pf);
+
+__visible void __irq_entry kvm_async_pf_intr(struct pt_regs *regs)
+{
+	u32 token;
+
+	entering_ack_irq();
+
+	inc_irq_stat(irq_hv_callback_count);
+
+	if (__this_cpu_read(apf_reason.enabled)) {
+		token = __this_cpu_read(apf_reason.token);
+		rcu_irq_enter();
+		kvm_async_pf_task_wake(token);
+		rcu_irq_exit();
+		__this_cpu_write(apf_reason.token, 0);
+		wrmsrl(MSR_KVM_ASYNC_PF_ACK, 1);
+	}
+
+	exiting_irq();
+}
 
 static void __init paravirt_ops_setup(void)
 {
@@ -326,25 +339,27 @@ static notrace void kvm_guest_apic_eoi_write(u32 reg, u32 val)
 
 static void kvm_guest_cpu_init(void)
 {
-	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF) && kvmapf) {
+	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
 		u64 pa = slow_virt_to_phys(this_cpu_ptr(&apf_reason));
 
-#ifdef CONFIG_PREEMPTION
-		pa |= KVM_ASYNC_PF_SEND_ALWAYS;
-#endif
-		pa |= KVM_ASYNC_PF_ENABLED;
+		WARN_ON_ONCE(!static_branch_likely(&kvm_async_pf_enabled));
+
+		pa = slow_virt_to_phys(this_cpu_ptr(&apf_reason));
+		pa |= KVM_ASYNC_PF_ENABLED | KVM_ASYNC_PF_DELIVERY_AS_INT;
 
 		if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_VMEXIT))
 			pa |= KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT;
 
+		wrmsrl(MSR_KVM_ASYNC_PF_INT, HYPERVISOR_CALLBACK_VECTOR);
+
 		wrmsrl(MSR_KVM_ASYNC_PF_EN, pa);
 		__this_cpu_write(apf_reason.enabled, 1);
-		printk(KERN_INFO"KVM setup async PF for cpu %d\n",
-		       smp_processor_id());
+		pr_info("KVM setup async PF for cpu %d\n", smp_processor_id());
 	}
 
 	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI)) {
 		unsigned long pa;
+
 		/* Size alignment is implied but just to make it explicit. */
 		BUILD_BUG_ON(__alignof__(kvm_apic_eoi) < 4);
 		__this_cpu_write(kvm_apic_eoi, 0);
@@ -365,8 +380,7 @@ static void kvm_pv_disable_apf(void)
 	wrmsrl(MSR_KVM_ASYNC_PF_EN, 0);
 	__this_cpu_write(apf_reason.enabled, 0);
 
-	printk(KERN_INFO"Unregister pv shared memory for cpu %d\n",
-	       smp_processor_id());
+	pr_info("Unregister pv shared memory for cpu %d\n", smp_processor_id());
 }
 
 static void kvm_pv_guest_cpu_reboot(void *unused)
@@ -608,12 +622,6 @@ static int kvm_cpu_down_prepare(unsigned int cpu)
 }
 #endif
 
-static void __init kvm_apf_trap_init(void)
-{
-	update_intr_gate(X86_TRAP_PF, async_page_fault);
-}
-
-
 static void kvm_flush_tlb_others(const struct cpumask *cpumask,
 			const struct flush_tlb_info *info)
 {
@@ -648,8 +656,6 @@ static void __init kvm_guest_init(void)
 	register_reboot_notifier(&kvm_pv_reboot_nb);
 	for (i = 0; i < KVM_TASK_SLEEP_HASHSIZE; i++)
 		raw_spin_lock_init(&async_pf_sleepers[i].lock);
-	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF))
-		x86_init.irqs.trap_init = kvm_apf_trap_init;
 
 	if (kvm_para_has_feature(KVM_FEATURE_STEAL_TIME)) {
 		has_steal_clock = 1;
@@ -664,6 +670,11 @@ static void __init kvm_guest_init(void)
 
 	if (kvm_para_has_feature(KVM_FEATURE_PV_EOI))
 		apic_set_eoi_write(kvm_guest_apic_eoi_write);
+
+	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_INT) && kvmapf) {
+		static_branch_enable(&kvm_async_pf_enabled);
+		alloc_intr_gate(HYPERVISOR_CALLBACK_VECTOR, kvm_async_pf_vector);
+	}
 
 #ifdef CONFIG_SMP
 	smp_ops.smp_prepare_boot_cpu = kvm_smp_prepare_boot_cpu;
@@ -772,8 +783,8 @@ const __initconst struct hypervisor_x86 x86_hyper_kvm = {
 	.type				= X86_HYPER_KVM,
 	.init.guest_late_init		= kvm_guest_init,
 	.init.x2apic_available		= kvm_para_available,
-	.init.msi_ext_dest_id		= kvm_msi_ext_dest_id,
 	.init.init_platform		= kvm_init_platform,
+	.init.msi_ext_dest_id           = kvm_msi_ext_dest_id,
 #if defined(CONFIG_AMD_MEM_ENCRYPT)
 	.runtime.sev_es_hcall_prepare	= kvm_sev_es_hcall_prepare,
 	.runtime.sev_es_hcall_finish	= kvm_sev_es_hcall_finish,

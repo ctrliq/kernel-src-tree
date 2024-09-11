@@ -111,7 +111,7 @@ static void nft_meta_get_eval(const struct nft_expr *expr,
 			goto err;
 		}
 
-		*dest =	from_kuid_munged(&init_user_ns,
+		*dest = from_kuid_munged(sock_net(sk)->user_ns,
 				sk->sk_socket->file->f_cred->fsuid);
 		read_unlock_bh(&sk->sk_callback_lock);
 		break;
@@ -127,7 +127,7 @@ static void nft_meta_get_eval(const struct nft_expr *expr,
 			read_unlock_bh(&sk->sk_callback_lock);
 			goto err;
 		}
-		*dest =	from_kgid_munged(&init_user_ns,
+		*dest =	from_kgid_munged(sock_net(sk)->user_ns,
 				 sk->sk_socket->file->f_cred->fsgid);
 		read_unlock_bh(&sk->sk_callback_lock);
 		break;

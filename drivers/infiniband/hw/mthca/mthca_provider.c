@@ -118,16 +118,6 @@ static int mthca_query_device(struct ib_device *ibdev, struct ib_device_attr *pr
 	props->max_mcast_qp_attach = MTHCA_QP_PER_MGM;
 	props->max_total_mcast_qp_attach = props->max_mcast_qp_attach *
 					   props->max_mcast_grp;
-	/*
-	 * If Sinai memory key optimization is being used, then only
-	 * the 8-bit key portion will change.  For other HCAs, the
-	 * unused index bits will also be used for FMR remapping.
-	 */
-	if (mdev->mthca_flags & MTHCA_FLAG_SINAI_OPT)
-		props->max_map_per_fmr = 255;
-	else
-		props->max_map_per_fmr =
-			(1 << (32 - ilog2(mdev->limits.num_mpts))) - 1;
 
 	err = 0;
  out:
@@ -388,14 +378,15 @@ static void mthca_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 	mthca_pd_free(to_mdev(pd->device), to_mpd(pd));
 }
 
-static int mthca_ah_create(struct ib_ah *ibah, struct rdma_ah_attr *ah_attr,
-			   u32 flags, struct ib_udata *udata)
+static int mthca_ah_create(struct ib_ah *ibah,
+			   struct rdma_ah_init_attr *init_attr,
+			   struct ib_udata *udata)
 
 {
 	struct mthca_ah *ah = to_mah(ibah);
 
-	return mthca_create_ah(to_mdev(ibah->device), to_mpd(ibah->pd), ah_attr,
-			       ah);
+	return mthca_create_ah(to_mdev(ibah->device), to_mpd(ibah->pd),
+			       init_attr->ah_attr, ah);
 }
 
 static void mthca_ah_destroy(struct ib_ah *ah, u32 flags)
@@ -561,7 +552,7 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
 	}
 	default:
 		/* Don't support raw QPs */
-		return ERR_PTR(-ENOSYS);
+		return ERR_PTR(-EOPNOTSUPP);
 	}
 
 	if (err) {

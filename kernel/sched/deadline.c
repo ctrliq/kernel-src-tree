@@ -46,7 +46,7 @@ static inline int on_dl_rq(struct sched_dl_entity *dl_se)
 #ifdef CONFIG_RT_MUTEXES
 static inline struct sched_dl_entity *pi_of(struct sched_dl_entity *dl_se)
 {
-	return dl_se->pi_se;
+	return dl_task_of(dl_se)->pi_se;
 }
 
 static inline bool is_dl_boosted(struct sched_dl_entity *dl_se)
@@ -2730,7 +2730,7 @@ void __dl_clear_params(struct task_struct *p)
 	dl_se->dl_overrun		= 0;
 
 #ifdef CONFIG_RT_MUTEXES
-	dl_se->pi_se			= dl_se;
+	p->pi_se			= dl_se;
 #endif
 }
 

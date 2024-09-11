@@ -288,8 +288,6 @@ struct tty_operations {
 	int (*set_termiox)(struct tty_struct *tty, struct termiox *tnew);
 	int (*get_icount)(struct tty_struct *tty,
 				struct serial_icounter_struct *icount);
-	int  (*get_serial)(struct tty_struct *tty, struct serial_struct *p);
-	int  (*set_serial)(struct tty_struct *tty, struct serial_struct *p);
 	void (*show_fdinfo)(struct tty_struct *tty, struct seq_file *m);
 #ifdef CONFIG_CONSOLE_POLL
 	int (*poll_init)(struct tty_driver *driver, int line, char *options);
@@ -297,6 +295,8 @@ struct tty_operations {
 	void (*poll_put_char)(struct tty_driver *driver, int line, char ch);
 #endif
 	int (*proc_show)(struct seq_file *, void *);
+	RH_KABI_EXTEND(int  (*get_serial)(struct tty_struct *tty, struct serial_struct *p))
+	RH_KABI_EXTEND(int  (*set_serial)(struct tty_struct *tty, struct serial_struct *p))
 } __randomize_layout;
 
 struct tty_driver {

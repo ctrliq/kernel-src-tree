@@ -12,6 +12,7 @@
 
 #include <linux/threads.h>
 #include <linux/cpumask.h>
+#include <linux/thread_info.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include <linux/ctype.h>

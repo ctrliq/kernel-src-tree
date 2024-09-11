@@ -19,7 +19,7 @@ static bool enable_multibuffer = true;
 module_param_named(datarouter, enable_multibuffer, bool, 0400);
 MODULE_PARM_DESC(datarouter, "Enable hardware data router support (default on)");
 
-static void zfcp_qdio_handler_error(struct zfcp_qdio *qdio, char *id,
+static void zfcp_qdio_handler_error(struct zfcp_qdio *qdio, char *dbftag,
 				    unsigned int qdio_err)
 {
 	struct zfcp_adapter *adapter = qdio->adapter;
@@ -28,12 +28,12 @@ static void zfcp_qdio_handler_error(struct zfcp_qdio *qdio, char *id,
 
 	if (qdio_err & QDIO_ERROR_SLSB_STATE) {
 		zfcp_qdio_siosl(adapter);
-		zfcp_erp_adapter_shutdown(adapter, 0, id);
+		zfcp_erp_adapter_shutdown(adapter, 0, dbftag);
 		return;
 	}
 	zfcp_erp_adapter_reopen(adapter,
 				ZFCP_STATUS_ADAPTER_LINK_UNPLUGGED |
-				ZFCP_STATUS_COMMON_ERP_FAILED, id);
+				ZFCP_STATUS_COMMON_ERP_FAILED, dbftag);
 }
 
 static void zfcp_qdio_zero_sbals(struct qdio_buffer *sbal[], int first, int cnt)
@@ -180,7 +180,6 @@ zfcp_qdio_sbale_next(struct zfcp_qdio *qdio, struct zfcp_qdio_req *q_req)
  * @qdio: pointer to struct zfcp_qdio
  * @q_req: pointer to struct zfcp_qdio_req
  * @sg: scatter-gather list
- * @max_sbals: upper bound for number of SBALs to be used
  * Returns: zero or -EINVAL on error
  */
 int zfcp_qdio_sbals_from_sg(struct zfcp_qdio *qdio, struct zfcp_qdio_req *q_req,
@@ -283,7 +282,7 @@ int zfcp_qdio_send(struct zfcp_qdio *qdio, struct zfcp_qdio_req *q_req)
 
 /**
  * zfcp_qdio_allocate - allocate queue memory and initialize QDIO data
- * @adapter: pointer to struct zfcp_adapter
+ * @qdio: pointer to struct zfcp_qdio
  * Returns: -ENOMEM on memory allocation error or return value from
  *          qdio_allocate
  */
@@ -365,6 +364,8 @@ void zfcp_qdio_shost_update(struct zfcp_adapter *const adapter,
  */
 int zfcp_qdio_open(struct zfcp_qdio *qdio)
 {
+	struct qdio_buffer **input_sbals[1] = {qdio->res_q};
+	struct qdio_buffer **output_sbals[1] = {qdio->req_q};
 	struct qdio_buffer_element *sbale;
 	struct qdio_initialize init_data = {0};
 	struct zfcp_adapter *adapter = qdio->adapter;
@@ -389,8 +390,8 @@ int zfcp_qdio_open(struct zfcp_qdio *qdio)
 	init_data.input_handler = zfcp_qdio_int_resp;
 	init_data.output_handler = zfcp_qdio_int_req;
 	init_data.int_parm = (unsigned long) qdio;
-	init_data.input_sbal_addr_array = qdio->res_q;
-	init_data.output_sbal_addr_array = qdio->req_q;
+	init_data.input_sbal_addr_array = input_sbals;
+	init_data.output_sbal_addr_array = output_sbals;
 	init_data.scan_threshold =
 		QDIO_MAX_BUFFERS_PER_Q - ZFCP_QDIO_MAX_SBALS_PER_REQ * 2;
 

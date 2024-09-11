@@ -4,7 +4,11 @@
 
 #include <linux/kobject.h>
 #include <linux/list.h>
+#ifdef CONFIG_X86_64
 #include <asm/msi.h>
+#else
+#include <asm-generic/msi.h>
+#endif
 
 /* Dummy shadow structures if an architecture does not define them */
 #ifndef arch_msi_msg_addr_lo
