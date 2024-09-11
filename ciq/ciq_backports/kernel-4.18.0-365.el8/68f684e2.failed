@@ -1,0 +1,174 @@
+bnxt_en: support multiple HWRM commands in flight
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Edwin Peer <edwin.peer@broadcom.com>
+commit 68f684e257d7f3a6303b0e838bfa982c74f2c8da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/68f684e2.failed
+
+Add infrastructure to maintain a pending list of HWRM commands awaiting
+completion and reduce the scope of the hwrm_cmd_lock mutex so that it
+protects only the request mailbox. The mailbox is free to use for one
+or more concurrent commands after receiving deferred response events.
+
+For uniformity and completeness, use the same pending list for
+collecting completions for commands that respond via a completion ring.
+These commands are only used for freeing rings and for IRQ test and
+we only support one such command in flight.
+
+Note deferred responses are also only supported on the main channel.
+The secondary channel (KONG) does not support deferred responses.
+
+	Signed-off-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 68f684e257d7f3a6303b0e838bfa982c74f2c8da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 8cfaddda9936,627f85ee3922..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -277,8 -277,11 +277,9 @@@ static const u16 bnxt_async_events_arr[
+  	ASYNC_EVENT_CMPL_EVENT_ID_RESET_NOTIFY,
+  	ASYNC_EVENT_CMPL_EVENT_ID_ERROR_RECOVERY,
+  	ASYNC_EVENT_CMPL_EVENT_ID_DEBUG_NOTIFICATION,
++ 	ASYNC_EVENT_CMPL_EVENT_ID_DEFERRED_RESPONSE,
+  	ASYNC_EVENT_CMPL_EVENT_ID_RING_MONITOR_MSG,
+  	ASYNC_EVENT_CMPL_EVENT_ID_ECHO_REQUEST,
+ -	ASYNC_EVENT_CMPL_EVENT_ID_PPS_TIMESTAMP,
+ -	ASYNC_EVENT_CMPL_EVENT_ID_ERROR_REPORT,
+  };
+  
+  static struct workqueue_struct *bnxt_pf_wq;
+@@@ -2246,6 -2262,20 +2247,23 @@@ static int bnxt_async_event_process(str
+  		}
+  		goto async_event_process_exit;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	case ASYNC_EVENT_CMPL_EVENT_ID_PPS_TIMESTAMP: {
++ 		bnxt_ptp_pps_event(bp, data1, data2);
++ 		goto async_event_process_exit;
++ 	}
++ 	case ASYNC_EVENT_CMPL_EVENT_ID_ERROR_REPORT: {
++ 		bnxt_event_error_report(bp, data1, data2);
++ 		goto async_event_process_exit;
++ 	}
++ 	case ASYNC_EVENT_CMPL_EVENT_ID_DEFERRED_RESPONSE: {
++ 		u16 seq_id = le32_to_cpu(cmpl->event_data2) & 0xffff;
++ 
++ 		hwrm_update_token(bp, seq_id, BNXT_HWRM_DEFERRED);
++ 		goto async_event_process_exit;
++ 	}
+++>>>>>>> 68f684e257d7 (bnxt_en: support multiple HWRM commands in flight)
+  	default:
+  		goto async_event_process_exit;
+  	}
+@@@ -3935,54 -3960,27 +3950,68 @@@ out
+  
+  static void bnxt_free_hwrm_resources(struct bnxt *bp)
+  {
+++<<<<<<< HEAD
+ +	struct pci_dev *pdev = bp->pdev;
+ +
+ +	if (bp->hwrm_cmd_resp_addr) {
+ +		dma_free_coherent(&pdev->dev, PAGE_SIZE, bp->hwrm_cmd_resp_addr,
+ +				  bp->hwrm_cmd_resp_dma_addr);
+ +		bp->hwrm_cmd_resp_addr = NULL;
+ +	}
+++=======
++ 	struct bnxt_hwrm_wait_token *token;
++ 
++ 	dma_pool_destroy(bp->hwrm_dma_pool);
++ 	bp->hwrm_dma_pool = NULL;
++ 
++ 	rcu_read_lock();
++ 	hlist_for_each_entry_rcu(token, &bp->hwrm_pending_list, node)
++ 		WRITE_ONCE(token->state, BNXT_HWRM_CANCELLED);
++ 	rcu_read_unlock();
+++>>>>>>> 68f684e257d7 (bnxt_en: support multiple HWRM commands in flight)
+  }
+  
+  static int bnxt_alloc_hwrm_resources(struct bnxt *bp)
+  {
+ -	bp->hwrm_dma_pool = dma_pool_create("bnxt_hwrm", &bp->pdev->dev,
+ -					    BNXT_HWRM_DMA_SIZE,
+ -					    BNXT_HWRM_DMA_ALIGN, 0);
+ -	if (!bp->hwrm_dma_pool)
+ +	struct pci_dev *pdev = bp->pdev;
+ +
+ +	bp->hwrm_cmd_resp_addr = dma_alloc_coherent(&pdev->dev, PAGE_SIZE,
+ +						   &bp->hwrm_cmd_resp_dma_addr,
+ +						   GFP_KERNEL);
+ +	if (!bp->hwrm_cmd_resp_addr)
+ +		return -ENOMEM;
+ +
+ +	return 0;
+ +}
+ +
+ +static void bnxt_free_hwrm_short_cmd_req(struct bnxt *bp)
+ +{
+ +	if (bp->hwrm_short_cmd_req_addr) {
+ +		struct pci_dev *pdev = bp->pdev;
+ +
+ +		dma_free_coherent(&pdev->dev, bp->hwrm_max_ext_req_len,
+ +				  bp->hwrm_short_cmd_req_addr,
+ +				  bp->hwrm_short_cmd_req_dma_addr);
+ +		bp->hwrm_short_cmd_req_addr = NULL;
+ +	}
+ +}
+ +
+ +static int bnxt_alloc_hwrm_short_cmd_req(struct bnxt *bp)
+ +{
+ +	struct pci_dev *pdev = bp->pdev;
+ +
+ +	if (bp->hwrm_short_cmd_req_addr)
+ +		return 0;
+ +
+ +	bp->hwrm_short_cmd_req_addr =
+ +		dma_alloc_coherent(&pdev->dev, bp->hwrm_max_ext_req_len,
+ +				   &bp->hwrm_short_cmd_req_dma_addr,
+ +				   GFP_KERNEL);
+ +	if (!bp->hwrm_short_cmd_req_addr)
+  		return -ENOMEM;
+  
++ 	INIT_HLIST_HEAD(&bp->hwrm_pending_list);
++ 
+  	return 0;
+  }
+  
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 50326e2ad60e,a8212dcdad5f..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1893,11 -1880,8 +1893,16 @@@ struct bnxt 
+  	u32			hwrm_spec_code;
+  	u16			hwrm_cmd_seq;
+  	u16                     hwrm_cmd_kong_seq;
+++<<<<<<< HEAD
+ +	u16			hwrm_intr_seq_id;
+ +	void			*hwrm_short_cmd_req_addr;
+ +	dma_addr_t		hwrm_short_cmd_req_dma_addr;
+ +	void			*hwrm_cmd_resp_addr;
+ +	dma_addr_t		hwrm_cmd_resp_dma_addr;
+++=======
++ 	struct dma_pool		*hwrm_dma_pool;
++ 	struct hlist_head	hwrm_pending_list;
+++>>>>>>> 68f684e257d7 (bnxt_en: support multiple HWRM commands in flight)
+  
+  	struct rtnl_link_stats64	net_stats_prev;
+  	struct bnxt_stats_mem	port_stats;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_hwrm.h
