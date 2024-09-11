@@ -1,0 +1,239 @@
+PM: sleep: Add dev_wakeup_path() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Patrice Chotard <patrice.chotard@st.com>
+commit 4e1d9a737d00f2cc811dc5654f82c92c7d80e98c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4e1d9a73.failed
+
+Add dev_wakeup_path() helper to avoid to spread
+dev->power.wakeup_path test in drivers.
+
+	Signed-off-by: Patrice Chotard <patrice.chotard@st.com>
+	Reviewed-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 4e1d9a737d00f2cc811dc5654f82c92c7d80e98c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/i2c/busses/i2c-stm32f7.c
+diff --cc drivers/i2c/busses/i2c-stm32f7.c
+index 62d023e737d9,9aa8e65b511e..000000000000
+--- a/drivers/i2c/busses/i2c-stm32f7.c
++++ b/drivers/i2c/busses/i2c-stm32f7.c
+@@@ -1942,8 -2236,137 +1942,139 @@@ static int stm32f7_i2c_remove(struct pl
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __maybe_unused stm32f7_i2c_runtime_suspend(struct device *dev)
++ {
++ 	struct stm32f7_i2c_dev *i2c_dev = dev_get_drvdata(dev);
++ 
++ 	if (!stm32f7_i2c_is_slave_registered(i2c_dev))
++ 		clk_disable_unprepare(i2c_dev->clk);
++ 
++ 	return 0;
++ }
++ 
++ static int __maybe_unused stm32f7_i2c_runtime_resume(struct device *dev)
++ {
++ 	struct stm32f7_i2c_dev *i2c_dev = dev_get_drvdata(dev);
++ 	int ret;
++ 
++ 	if (!stm32f7_i2c_is_slave_registered(i2c_dev)) {
++ 		ret = clk_prepare_enable(i2c_dev->clk);
++ 		if (ret) {
++ 			dev_err(dev, "failed to prepare_enable clock\n");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_PM_SLEEP
++ static int stm32f7_i2c_regs_backup(struct stm32f7_i2c_dev *i2c_dev)
++ {
++ 	int ret;
++ 	struct stm32f7_i2c_regs *backup_regs = &i2c_dev->backup_regs;
++ 
++ 	ret = pm_runtime_get_sync(i2c_dev->dev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	backup_regs->cr1 = readl_relaxed(i2c_dev->base + STM32F7_I2C_CR1);
++ 	backup_regs->cr2 = readl_relaxed(i2c_dev->base + STM32F7_I2C_CR2);
++ 	backup_regs->oar1 = readl_relaxed(i2c_dev->base + STM32F7_I2C_OAR1);
++ 	backup_regs->oar2 = readl_relaxed(i2c_dev->base + STM32F7_I2C_OAR2);
++ 	backup_regs->tmgr = readl_relaxed(i2c_dev->base + STM32F7_I2C_TIMINGR);
++ 	stm32f7_i2c_write_fm_plus_bits(i2c_dev, false);
++ 
++ 	pm_runtime_put_sync(i2c_dev->dev);
++ 
++ 	return ret;
++ }
++ 
++ static int stm32f7_i2c_regs_restore(struct stm32f7_i2c_dev *i2c_dev)
++ {
++ 	u32 cr1;
++ 	int ret;
++ 	struct stm32f7_i2c_regs *backup_regs = &i2c_dev->backup_regs;
++ 
++ 	ret = pm_runtime_get_sync(i2c_dev->dev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	cr1 = readl_relaxed(i2c_dev->base + STM32F7_I2C_CR1);
++ 	if (cr1 & STM32F7_I2C_CR1_PE)
++ 		stm32f7_i2c_clr_bits(i2c_dev->base + STM32F7_I2C_CR1,
++ 				     STM32F7_I2C_CR1_PE);
++ 
++ 	writel_relaxed(backup_regs->tmgr, i2c_dev->base + STM32F7_I2C_TIMINGR);
++ 	writel_relaxed(backup_regs->cr1 & ~STM32F7_I2C_CR1_PE,
++ 		       i2c_dev->base + STM32F7_I2C_CR1);
++ 	if (backup_regs->cr1 & STM32F7_I2C_CR1_PE)
++ 		stm32f7_i2c_set_bits(i2c_dev->base + STM32F7_I2C_CR1,
++ 				     STM32F7_I2C_CR1_PE);
++ 	writel_relaxed(backup_regs->cr2, i2c_dev->base + STM32F7_I2C_CR2);
++ 	writel_relaxed(backup_regs->oar1, i2c_dev->base + STM32F7_I2C_OAR1);
++ 	writel_relaxed(backup_regs->oar2, i2c_dev->base + STM32F7_I2C_OAR2);
++ 	stm32f7_i2c_write_fm_plus_bits(i2c_dev, true);
++ 
++ 	pm_runtime_put_sync(i2c_dev->dev);
++ 
++ 	return ret;
++ }
++ 
++ static int stm32f7_i2c_suspend(struct device *dev)
++ {
++ 	struct stm32f7_i2c_dev *i2c_dev = dev_get_drvdata(dev);
++ 	int ret;
++ 
++ 	i2c_mark_adapter_suspended(&i2c_dev->adap);
++ 
++ 	if (!device_may_wakeup(dev) && !device_wakeup_path(dev)) {
++ 		ret = stm32f7_i2c_regs_backup(i2c_dev);
++ 		if (ret < 0) {
++ 			i2c_mark_adapter_resumed(&i2c_dev->adap);
++ 			return ret;
++ 		}
++ 
++ 		pinctrl_pm_select_sleep_state(dev);
++ 		pm_runtime_force_suspend(dev);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int stm32f7_i2c_resume(struct device *dev)
++ {
++ 	struct stm32f7_i2c_dev *i2c_dev = dev_get_drvdata(dev);
++ 	int ret;
++ 
++ 	if (!device_may_wakeup(dev) && !device_wakeup_path(dev)) {
++ 		ret = pm_runtime_force_resume(dev);
++ 		if (ret < 0)
++ 			return ret;
++ 		pinctrl_pm_select_default_state(dev);
++ 
++ 		ret = stm32f7_i2c_regs_restore(i2c_dev);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	i2c_mark_adapter_resumed(&i2c_dev->adap);
++ 
++ 	return 0;
++ }
++ #endif
++ 
++ static const struct dev_pm_ops stm32f7_i2c_pm_ops = {
++ 	SET_RUNTIME_PM_OPS(stm32f7_i2c_runtime_suspend,
++ 			   stm32f7_i2c_runtime_resume, NULL)
++ 	SET_SYSTEM_SLEEP_PM_OPS(stm32f7_i2c_suspend, stm32f7_i2c_resume)
++ };
++ 
+++>>>>>>> 4e1d9a737d00 (PM: sleep: Add dev_wakeup_path() helper)
+  static const struct of_device_id stm32f7_i2c_match[] = {
+  	{ .compatible = "st,stm32f7-i2c", .data = &stm32f7_setup},
+ -	{ .compatible = "st,stm32mp15-i2c", .data = &stm32mp15_setup},
+  	{},
+  };
+  MODULE_DEVICE_TABLE(of, stm32f7_i2c_match);
+diff --git a/drivers/base/power/domain.c b/drivers/base/power/domain.c
+index 6559d19a1177..bfa59daa14b2 100644
+--- a/drivers/base/power/domain.c
++++ b/drivers/base/power/domain.c
+@@ -1165,7 +1165,7 @@ static int genpd_finish_suspend(struct device *dev, bool poweroff)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (dev->power.wakeup_path && genpd_is_active_wakeup(genpd))
++	if (device_wakeup_path(dev) && genpd_is_active_wakeup(genpd))
+ 		return 0;
+ 
+ 	if (genpd->dev_ops.stop && genpd->dev_ops.start &&
+@@ -1219,7 +1219,7 @@ static int genpd_resume_noirq(struct device *dev)
+ 	if (IS_ERR(genpd))
+ 		return -EINVAL;
+ 
+-	if (dev->power.wakeup_path && genpd_is_active_wakeup(genpd))
++	if (device_wakeup_path(dev) && genpd_is_active_wakeup(genpd))
+ 		return pm_generic_resume_noirq(dev);
+ 
+ 	genpd_lock(genpd);
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+index 50d4579b4174..e33a803a420e 100644
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -1361,7 +1361,7 @@ static void dpm_propagate_wakeup_to_parent(struct device *dev)
+ 
+ 	spin_lock_irq(&parent->power.lock);
+ 
+-	if (dev->power.wakeup_path && !parent->power.ignore_children)
++	if (device_wakeup_path(dev) && !parent->power.ignore_children)
+ 		parent->power.wakeup_path = true;
+ 
+ 	spin_unlock_irq(&parent->power.lock);
+@@ -1625,7 +1625,7 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
+ 		goto Complete;
+ 
+ 	/* Avoid direct_complete to let wakeup_path propagate. */
+-	if (device_may_wakeup(dev) || dev->power.wakeup_path)
++	if (device_may_wakeup(dev) || device_wakeup_path(dev))
+ 		dev->power.direct_complete = false;
+ 
+ 	if (dev->power.direct_complete) {
+* Unmerged path drivers/i2c/busses/i2c-stm32f7.c
+diff --git a/include/linux/pm_wakeup.h b/include/linux/pm_wakeup.h
+index f7366ef402e1..3119b564a5d3 100644
+--- a/include/linux/pm_wakeup.h
++++ b/include/linux/pm_wakeup.h
+@@ -94,6 +94,11 @@ static inline bool device_may_wakeup(struct device *dev)
+ 	return dev->power.can_wakeup && !!dev->power.wakeup;
+ }
+ 
++static inline bool device_wakeup_path(struct device *dev)
++{
++	return dev->power.wakeup_path;
++}
++
+ static inline void device_set_wakeup_path(struct device *dev)
+ {
+ 	dev->power.wakeup_path = true;
+@@ -180,6 +185,11 @@ static inline bool device_may_wakeup(struct device *dev)
+ 	return dev->power.can_wakeup && dev->power.should_wakeup;
+ }
+ 
++static inline bool device_wakeup_path(struct device *dev)
++{
++	return false;
++}
++
+ static inline void device_set_wakeup_path(struct device *dev) {}
+ 
+ static inline void __pm_stay_awake(struct wakeup_source *ws) {}
