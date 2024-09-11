@@ -1,0 +1,359 @@
+mm/vmalloc.c: keep track of free blocks for vmap allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit 68ad4a3304335358f95a417f2a2b0c909e5119c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/68ad4a33.failed
+
+Patch series "improve vmap allocation", v3.
+
+Objective
+---------
+
+Please have a look for the description at:
+
+  https://lkml.org/lkml/2018/10/19/786
+
+but let me also summarize it a bit here as well.
+
+The current implementation has O(N) complexity. Requests with different
+permissive parameters can lead to long allocation time. When i say
+"long" i mean milliseconds.
+
+Description
+-----------
+
+This approach organizes the KVA memory layout into free areas of the
+1-ULONG_MAX range, i.e.  an allocation is done over free areas lookups,
+instead of finding a hole between two busy blocks.  It allows to have
+lower number of objects which represent the free space, therefore to have
+less fragmented memory allocator.  Because free blocks are always as large
+as possible.
+
+It uses the augment tree where all free areas are sorted in ascending
+order of va->va_start address in pair with linked list that provides
+O(1) access to prev/next elements.
+
+Since the tree is augment, we also maintain the "subtree_max_size" of VA
+that reflects a maximum available free block in its left or right
+sub-tree.  Knowing that, we can easily traversal toward the lowest (left
+most path) free area.
+
+Allocation: ~O(log(N)) complexity.  It is sequential allocation method
+therefore tends to maximize locality.  The search is done until a first
+suitable block is large enough to encompass the requested parameters.
+Bigger areas are split.
+
+I copy paste here the description of how the area is split, since i
+described it in https://lkml.org/lkml/2018/10/19/786
+
+<snip>
+
+A free block can be split by three different ways.  Their names are
+FL_FIT_TYPE, LE_FIT_TYPE/RE_FIT_TYPE and NE_FIT_TYPE, i.e.  they
+correspond to how requested size and alignment fit to a free block.
+
+FL_FIT_TYPE - in this case a free block is just removed from the free
+list/tree because it fully fits.  Comparing with current design there is
+an extra work with rb-tree updating.
+
+LE_FIT_TYPE/RE_FIT_TYPE - left/right edges fit.  In this case what we do
+is just cutting a free block.  It is as fast as a current design.  Most of
+the vmalloc allocations just end up with this case, because the edge is
+always aligned to 1.
+
+NE_FIT_TYPE - Is much less common case.  Basically it happens when
+requested size and alignment does not fit left nor right edges, i.e.  it
+is between them.  In this case during splitting we have to build a
+remaining left free area and place it back to the free list/tree.
+
+Comparing with current design there are two extra steps.  First one is we
+have to allocate a new vmap_area structure.  Second one we have to insert
+that remaining free block to the address sorted list/tree.
+
+In order to optimize a first case there is a cache with free_vmap objects.
+Instead of allocating from slab we just take an object from the cache and
+reuse it.
+
+Second one is pretty optimized.  Since we know a start point in the tree
+we do not do a search from the top.  Instead a traversal begins from a
+rb-tree node we split.
+<snip>
+
+De-allocation.  ~O(log(N)) complexity.  An area is not inserted straight
+away to the tree/list, instead we identify the spot first, checking if it
+can be merged around neighbors.  The list provides O(1) access to
+prev/next, so it is pretty fast to check it.  Summarizing.  If merged then
+large coalesced areas are created, if not the area is just linked making
+more fragments.
+
+There is one more thing that i should mention here.  After modification of
+VA node, its subtree_max_size is updated if it was/is the biggest area in
+its left or right sub-tree.  Apart of that it can also be populated back
+to upper levels to fix the tree.  For more details please have a look at
+the __augment_tree_propagate_from() function and the description.
+
+Tests and stressing
+-------------------
+
+I use the "test_vmalloc.sh" test driver available under
+"tools/testing/selftests/vm/" since 5.1-rc1 kernel.  Just trigger "sudo
+./test_vmalloc.sh" to find out how to deal with it.
+
+Tested on different platforms including x86_64/i686/ARM64/x86_64_NUMA.
+Regarding last one, i do not have any physical access to NUMA system,
+therefore i emulated it.  The time of stressing is days.
+
+If you run the test driver in "stress mode", you also need the patch that
+is in Andrew's tree but not in Linux 5.1-rc1.  So, please apply it:
+
+http://git.cmpxchg.org/cgit.cgi/linux-mmotm.git/commit/?id=e0cf7749bade6da318e98e934a24d8b62fab512c
+
+After massive testing, i have not identified any problems like memory
+leaks, crashes or kernel panics.  I find it stable, but more testing would
+be good.
+
+Performance analysis
+--------------------
+
+I have used two systems to test.  One is i5-3320M CPU @ 2.60GHz and
+another is HiKey960(arm64) board.  i5-3320M runs on 4.20 kernel, whereas
+Hikey960 uses 4.15 kernel.  I have both system which could run on 5.1-rc1
+as well, but the results have not been ready by time i an writing this.
+
+Currently it consist of 8 tests.  There are three of them which correspond
+to different types of splitting(to compare with default).  We have 3
+ones(see above).  Another 5 do allocations in different conditions.
+
+a) sudo ./test_vmalloc.sh performance
+
+When the test driver is run in "performance" mode, it runs all available
+tests pinned to first online CPU with sequential execution test order.  We
+do it in order to get stable and repeatable results.  Take a look at time
+difference in "long_busy_list_alloc_test".  It is not surprising because
+the worst case is O(N).
+
+# i5-3320M
+How many cycles all tests took:
+CPU0=646919905370(default) cycles vs CPU0=193290498550(patched) cycles
+
+# See detailed table with results here:
+ftp://vps418301.ovh.net/incoming/vmap_test_results_v2/i5-3320M_performance_default.txt
+ftp://vps418301.ovh.net/incoming/vmap_test_results_v2/i5-3320M_performance_patched.txt
+
+# Hikey960 8x CPUs
+How many cycles all tests took:
+CPU0=3478683207 cycles vs CPU0=463767978 cycles
+
+# See detailed table with results here:
+ftp://vps418301.ovh.net/incoming/vmap_test_results_v2/HiKey960_performance_default.txt
+ftp://vps418301.ovh.net/incoming/vmap_test_results_v2/HiKey960_performance_patched.txt
+
+b) time sudo ./test_vmalloc.sh test_repeat_count=1
+
+With this configuration, all tests are run on all available online CPUs.
+Before running each CPU shuffles its tests execution order.  It gives
+random allocation behaviour.  So it is rough comparison, but it puts in
+the picture for sure.
+
+# i5-3320M
+<default>            vs            <patched>
+real    101m22.813s                real    0m56.805s
+user    0m0.011s                   user    0m0.015s
+sys     0m5.076s                   sys     0m0.023s
+
+# See detailed table with results here:
+ftp://vps418301.ovh.net/incoming/vmap_test_results_v2/i5-3320M_test_repeat_count_1_default.txt
+ftp://vps418301.ovh.net/incoming/vmap_test_results_v2/i5-3320M_test_repeat_count_1_patched.txt
+
+# Hikey960 8x CPUs
+<default>            vs            <patched>
+real    unknown                    real    4m25.214s
+user    unknown                    user    0m0.011s
+sys     unknown                    sys     0m0.670s
+
+I did not manage to complete this test on "default Hikey960" kernel
+version.  After 24 hours it was still running, therefore i had to cancel
+it.  That is why real/user/sys are "unknown".
+
+This patch (of 3):
+
+Currently an allocation of the new vmap area is done over busy list
+iteration(complexity O(n)) until a suitable hole is found between two busy
+areas.  Therefore each new allocation causes the list being grown.  Due to
+over fragmented list and different permissive parameters an allocation can
+take a long time.  For example on embedded devices it is milliseconds.
+
+This patch organizes the KVA memory layout into free areas of the
+1-ULONG_MAX range.  It uses an augment red-black tree that keeps blocks
+sorted by their offsets in pair with linked list keeping the free space in
+order of increasing addresses.
+
+Nodes are augmented with the size of the maximum available free block in
+its left or right sub-tree.  Thus, that allows to take a decision and
+traversal toward the block that will fit and will have the lowest start
+address, i.e.  it is sequential allocation.
+
+Allocation: to allocate a new block a search is done over the tree until a
+suitable lowest(left most) block is large enough to encompass: the
+requested size, alignment and vstart point.  If the block is bigger than
+requested size - it is split.
+
+De-allocation: when a busy vmap area is freed it can either be merged or
+inserted to the tree.  Red-black tree allows efficiently find a spot
+whereas a linked list provides a constant-time access to previous and next
+blocks to check if merging can be done.  In case of merging of
+de-allocated memory chunk a large coalesced area is created.
+
+Complexity: ~O(log(N))
+
+[urezki@gmail.com: v3]
+  Link: http://lkml.kernel.org/r/20190402162531.10888-2-urezki@gmail.com
+[urezki@gmail.com: v4]
+  Link: http://lkml.kernel.org/r/20190406183508.25273-2-urezki@gmail.com
+Link: http://lkml.kernel.org/r/20190321190327.11813-2-urezki@gmail.com
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Reviewed-by: Roman Gushchin <guro@fb.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Thomas Garnier <thgarnie@google.com>
+	Cc: Oleksiy Avramchenko <oleksiy.avramchenko@sonymobile.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Joel Fernandes <joelaf@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@elte.hu>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 68ad4a3304335358f95a417f2a2b0c909e5119c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmalloc.c
+diff --cc mm/vmalloc.c
+index c82a0db1aefc,f8f61ff3235b..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -32,7 -32,7 +32,11 @@@
+  #include <linux/compiler.h>
+  #include <linux/llist.h>
+  #include <linux/bitops.h>
+++<<<<<<< HEAD
+ +#include <linux/overflow.h>
+++=======
++ #include <linux/rbtree_augmented.h>
+++>>>>>>> 68ad4a330433 (mm/vmalloc.c: keep track of free blocks for vmap allocation)
+  
+  #include <linux/uaccess.h>
+  #include <asm/tlbflush.h>
+@@@ -433,76 -966,13 +972,77 @@@ static struct vmap_area *alloc_vmap_are
+  
+  retry:
+  	spin_lock(&vmap_area_lock);
++ 
+  	/*
+- 	 * Invalidate cache if we have more permissive parameters.
+- 	 * cached_hole_size notes the largest hole noticed _below_
+- 	 * the vmap_area cached in free_vmap_cache: if size fits
+- 	 * into that hole, we want to scan from vstart to reuse
+- 	 * the hole instead of allocating above free_vmap_cache.
+- 	 * Note that __free_vmap_area may update free_vmap_cache
+- 	 * without updating cached_hole_size or cached_align.
++ 	 * If an allocation fails, the "vend" address is
++ 	 * returned. Therefore trigger the overflow path.
+  	 */
+++<<<<<<< HEAD
+ +	if (!free_vmap_cache ||
+ +			size < cached_hole_size ||
+ +			vstart < cached_vstart ||
+ +			align < cached_align) {
+ +nocache:
+ +		cached_hole_size = 0;
+ +		free_vmap_cache = NULL;
+ +	}
+ +	/* record if we encounter less permissive parameters */
+ +	cached_vstart = vstart;
+ +	cached_align = align;
+ +
+ +	/* find starting point for our search */
+ +	if (free_vmap_cache) {
+ +		first = rb_entry(free_vmap_cache, struct vmap_area, rb_node);
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr < vstart)
+ +			goto nocache;
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +	} else {
+ +		addr = ALIGN(vstart, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +		n = vmap_area_root.rb_node;
+ +		first = NULL;
+ +
+ +		while (n) {
+ +			struct vmap_area *tmp;
+ +			tmp = rb_entry(n, struct vmap_area, rb_node);
+ +			if (tmp->va_end >= addr) {
+ +				first = tmp;
+ +				if (tmp->va_start <= addr)
+ +					break;
+ +				n = n->rb_left;
+ +			} else
+ +				n = n->rb_right;
+ +		}
+ +
+ +		if (!first)
+ +			goto found;
+ +	}
+ +
+ +	/* from the starting point, walk areas until a suitable hole is found */
+ +	while (addr + size > first->va_start && addr + size <= vend) {
+ +		if (addr + cached_hole_size < first->va_start)
+ +			cached_hole_size = first->va_start - addr;
+ +		addr = ALIGN(first->va_end, align);
+ +		if (addr + size < addr)
+ +			goto overflow;
+ +
+ +		if (list_is_last(&first->list, &vmap_area_list))
+ +			goto found;
+ +
+ +		first = list_next_entry(first, list);
+ +	}
+ +
+ +found:
+ +	if (addr + size > vend)
+++=======
++ 	addr = __alloc_vmap_area(size, align, vstart, vend, node);
++ 	if (unlikely(addr == vend))
+++>>>>>>> 68ad4a330433 (mm/vmalloc.c: keep track of free blocks for vmap allocation)
+  		goto overflow;
+  
+  	va->va_start = addr;
+diff --git a/include/linux/vmalloc.h b/include/linux/vmalloc.h
+index 54492b1d76f1..3c81d0c88a66 100644
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@ -52,12 +52,16 @@ struct vm_struct {
+ struct vmap_area {
+ 	unsigned long va_start;
+ 	unsigned long va_end;
++
++	/*
++	 * Largest available free size in subtree.
++	 */
++	unsigned long subtree_max_size;
+ 	unsigned long flags;
+ 	struct rb_node rb_node;         /* address sorted rbtree */
+ 	struct list_head list;          /* address sorted list */
+ 	struct llist_node purge_list;    /* "lazy purge" list */
+ 	struct vm_struct *vm;
+-	struct rcu_head rcu_head;
+ };
+ 
+ /*
+* Unmerged path mm/vmalloc.c
